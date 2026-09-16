@@ -1,0 +1,9 @@
+{
+  "source_log": "throughput-fix-2-relay-restored.log",
+  "source_log_sha256": "d5702eb11e3e9226555d70ca650e93fe8972fbff7d02408e414ec5816afdf606",
+  "outcome": "process passed",
+  "top_level_passed": 6,
+  "top_level_failed": 0,
+  "top_level_skipped": 0,
+  "note": "Raw log remains outside this archive. Outcomes contain only test names and result lines."
+}

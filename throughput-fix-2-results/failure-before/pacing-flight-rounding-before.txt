@@ -1,0 +1,6 @@
+=== RUN   TestWindowPacingPropagationIncludesOneMessageOfRounding
+    transfer_window_pacing_flight_test.go:56: 128 KiB is within one message of a 112 kB propagating flight
+--- FAIL: TestWindowPacingPropagationIncludesOneMessageOfRounding (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.707s

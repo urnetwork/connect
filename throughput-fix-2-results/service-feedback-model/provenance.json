@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-service-feedback-model.log",
+  "source_log_sha256": "a055867cf2876a6c8448013744870e9381984293c665cea992224f819e00afb9",
+  "note": "Stable feedback peak retention repaired long RTT; shared queue loss remained.",
+  "rows": 126,
+  "final": false,
+  "outcome": "passed"
+}

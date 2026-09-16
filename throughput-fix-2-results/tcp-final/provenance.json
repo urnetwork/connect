@@ -1,0 +1,12 @@
+{
+  "source_log": "run.log",
+  "source_log_sha256": "eec257073f63c7069acead34b3897aab163e458942ba75916f5239d3b5c37d9a",
+  "note": "Final source, fixed TCP warmup, three repetitions of both directions, 0.3/100 ms, one/eight flows and 10 ms compression; started immediately under host load.",
+  "rows": 168,
+  "final": true,
+  "outcome": "passed",
+  "outcome_excerpt": {
+    "raw_log_sha256": "eec257073f63c7069acead34b3897aab163e458942ba75916f5239d3b5c37d9a",
+    "note": "Only test names and outcomes are included. The original raw log remains outside the committed archive. This extraction does not establish build-source provenance."
+  }
+}

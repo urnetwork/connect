@@ -37,7 +37,7 @@ func TestWindowPacingRoundTripExcludesLocalWriteWait(t *testing.T) {
 		sequence.windowPacer = windowBurstPacer{service: service, rate: 1000000, rateUpdated: time.Now()}
 		defer sequence.windowPacer.close()
 		start := time.Now()
-		item := &sendItem{transferItem: transferItem{messageId: NewId(), sequenceNumber: 1}, sendTime: start, sendCount: 1, expectsAck: true, transferFrameBytes: MessagePoolGet(10000)}
+		item := &sendItem{transferItem: transferItem{messageId: NewId(), sequenceNumber: 1}, sendTime: start, sendCount: 1, expectsAck: true, transferFrameBytes: MessagePoolGet(20000)}
 		sequence.sendItems = append(sequence.sendItems, item)
 		sequence.resendQueue.Add(item)
 		defer func() {
@@ -48,7 +48,7 @@ func TestWindowPacingRoundTripExcludesLocalWriteWait(t *testing.T) {
 		if _, err := sequence.writeMaybeWrappedBytes(item.transferFrameBytes, TransferPath{}, true, item, false, false); err != nil {
 			t.Fatal(err)
 		}
-		if writer.writtenAt.Sub(start) != 10*time.Millisecond {
+		if writer.writtenAt.Sub(start) != 20*time.Millisecond {
 			t.Fatal("the write did not cross the intended pacing wait")
 		}
 		time.Sleep(100 * time.Millisecond)

@@ -1689,58 +1689,97 @@ func TestWebRtcNetworkPeerAdvertisesDedicatedReceiveWindow(t *testing.T) {
 	assertAdvertisedWindow("public peer reverse", remoteWindow(publicB), settingsA.ReceiveBufferSize)
 }
 
+// Admission must refuse while the reclaimed owner's bytes are still held and
+// succeed after their release; both active and passive setup use this budget.
 func TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	for _, active := range []bool{true, false} {
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 
-	settings := DefaultWebRtcSettings()
-	settings.Log = NewNoopLogger()
-	settings.IceServerUrls = nil
-	settings.ReceiveBufferSize = kib(128)
-	settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
-	settings.NetworkPeerReceiveBufferSize = mib(2)
-	settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
-	settings.MaxPeerConnectionCount = 0
-	manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
+			settings := DefaultWebRtcSettings()
+			settings.Log = NewNoopLogger()
+			settings.IceServerUrls = nil
+			settings.ReceiveBufferSize = kib(128)
+			settings.MemoryBudget = NewTransferMemoryBudget(settings.ReceiveBufferSize)
+			settings.NetworkPeerReceiveBufferSize = mib(2)
+			settings.NetworkPeerMemoryBudget = NewTransferMemoryBudget(settings.NetworkPeerReceiveBufferSize)
+			settings.MaxPeerConnectionCount = 0
+			manager := newTestWebRtcManager(t, ctx, &testing_noopSignalSender{}, settings)
+			newConn := manager.NewP2pConnActive
+			if !active {
+				newConn = manager.NewP2pConnPassive
+			}
 
-	firstPeerId := NewId()
-	manager.PrioritizePeer(firstPeerId)
-	first, err := manager.NewP2pConnActive(
-		ctx,
-		NewTransferPath(NewId(), firstPeerId, NewId()),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+			firstPeerId := NewId()
+			manager.PrioritizePeer(firstPeerId)
+			first, err := newConn(ctx, NewTransferPath(NewId(), firstPeerId, NewId()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstConn := first.(*peerConn)
+			// Prioritization cancels the old owner immediately. Hold physical
+			// teardown so its reservation cannot disappear before the refusal.
+			firstConn.pionLifecycleLock.Lock()
+			releaseTeardown := sync.OnceFunc(firstConn.pionLifecycleLock.Unlock)
+			defer releaseTeardown()
 
-	waitingPeerId := NewId()
-	manager.PrioritizePeer(waitingPeerId)
-	_, budgetNotify := manager.AdmissionNotify(waitingPeerId)
-	if budgetNotify == nil {
-		t.Fatal("network peer did not subscribe to its dedicated budget")
-	}
-	if _, err := manager.NewP2pConnActive(
-		ctx,
-		NewTransferPath(NewId(), waitingPeerId, NewId()),
-	); err == nil {
-		t.Fatal("network peer over-admitted its full dedicated budget")
-	} else {
-		var admissionErr *peerConnectionAdmissionError
-		if !errors.As(err, &admissionErr) {
-			t.Fatalf("full dedicated budget error = %v", err)
-		}
-	}
+			waitingPeerId := NewId()
+			waitingPath := NewTransferPath(NewId(), waitingPeerId, NewId())
+			manager.PrioritizePeer(waitingPeerId)
+			select {
+			case <-firstConn.ctx.Done():
+			case <-ctx.Done():
+				t.Fatalf("active=%t: priority did not cancel the dedicated budget owner", active)
+			}
+			_, budgetNotify := manager.AdmissionNotify(waitingPeerId)
+			if budgetNotify == nil || budgetNotify != settings.NetworkPeerMemoryBudget.CapacityNotify() {
+				t.Fatalf("active=%t: network peer did not subscribe to its dedicated budget", active)
+			}
+			if got := settings.NetworkPeerMemoryBudget.UsedByteCount(); got != settings.NetworkPeerReceiveBufferSize {
+				t.Fatalf("active=%t: held teardown reserved %d bytes, want %d", active, got, settings.NetworkPeerReceiveBufferSize)
+			}
+			if conn, err := newConn(ctx, waitingPath); err == nil {
+				conn.Close()
+				t.Fatalf("active=%t: network peer over-admitted its full dedicated budget", active)
+			} else {
+				var admissionErr *peerConnectionAdmissionError
+				if !errors.As(err, &admissionErr) || admissionErr.reason != peerConnectionAdmissionBudget {
+					t.Fatalf("active=%t: full dedicated budget error = %v", active, err)
+				}
+			}
+			select {
+			case <-budgetNotify:
+				t.Fatalf("active=%t: dedicated budget woke before physical teardown was released", active)
+			default:
+			}
 
-	// Releasing the network window must wake the exact budget channel captured
-	// before the failed admission. Previously AdmissionNotify always returned
-	// MemoryBudget, leaving this waiter asleep until its 30-second fallback.
-	if err := first.Close(); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-budgetNotify:
-	case <-ctx.Done():
-		t.Fatal("dedicated network-peer budget release did not wake admission")
+			// The captured channel must wake for this exact pool's release. The
+			// old public-budget subscription left it asleep until its fallback.
+			releaseTeardown()
+			select {
+			case <-budgetNotify:
+			case <-ctx.Done():
+				t.Fatalf("active=%t: dedicated budget release did not wake admission", active)
+			}
+			if got := settings.NetworkPeerMemoryBudget.UsedByteCount(); got != 0 {
+				t.Fatalf("active=%t: completed teardown retained %d dedicated bytes", active, got)
+			}
+			replacement, err := newConn(ctx, waitingPath)
+			if err != nil {
+				t.Fatalf("active=%t: released dedicated budget refused admission: %v", active, err)
+			}
+			defer replacement.Close()
+			if !replacement.(*peerConn).networkPeer {
+				t.Fatalf("active=%t: replacement used public admission", active)
+			}
+			if got := settings.NetworkPeerMemoryBudget.UsedByteCount(); got != settings.NetworkPeerReceiveBufferSize {
+				t.Fatalf("active=%t: replacement reserved %d dedicated bytes, want %d", active, got, settings.NetworkPeerReceiveBufferSize)
+			}
+			if got := settings.MemoryBudget.UsedByteCount(); got != 0 {
+				t.Fatalf("active=%t: dedicated admission consumed %d public bytes", active, got)
+			}
+		}()
 	}
 }
 

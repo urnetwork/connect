@@ -721,7 +721,7 @@ residences so a partial flight at an interval edge cannot dominate the result.
 The service and mismatch fixtures offer flows round-robin within each logical
 sequence; independent logical sequences retain separate producers.
 
-These controls already reproduced two defects:
+These controls reproduced the following defects:
 
 - A 256 KiB working floor overrode a peer advertising only 64 KiB, before and
   after delivery sampling. An explicit peer/deployment ceiling now bounds the
@@ -749,8 +749,9 @@ service estimate from 125,000 to 250,000 B/s, and a shared 1 Mb/s trial fell to
 0.717 Mb/s with recovery traffic. The estimator retains the conservative tail
 observation; queue evidence determines whether further capacity probing stops.
 
-The deterministic mismatch/model/race reruns, ACK benchmark and host TCP
-controls are complete. Preserve their manifests and failure-before logs. The
+The deterministic mismatch/model/race reruns and ACK benchmark passed. Host TCP
+controls completed, but the later audit found missing performance assertions
+and slow candidates; see §13. Preserve every reading and failure-before log. The
 configured server/connect and server/proxy integration tiers remain deferred
 until the local launcher and test resources agree on the PostgreSQL credential.
 
@@ -779,11 +780,214 @@ The adjacent tests are in `transfer_window_adjacent_test.go`. A large-target
 boundary control already passed and is not counted as a reproduced defect.
 Preserve the failure-before logs separately from passing controls.
 
-The full sweep also exposed an experimental lane-recovery completion-bound
-failure and a short-path host-throughput failure. These remain open until
-isolated; a model or process pass must not hide them. Complete the new model,
-race, host TCP and configured server checks against the final source before
-claiming validation.
+The earlier full sweep exposed an experimental lane-recovery completion-bound
+failure and a short-path host-throughput failure. They passed when isolated
+and in the final non-race root selection. Their failed earlier runs remain in
+the evidence. The scoped race and model checks passed; the separate host TCP
+performance acceptance gap below remains open. Configured server integrations
+retain the user's explicit deferral.
+
+## 13. Completion audit: host performance acceptance
+
+Inspecting the final-source ledger contradicted the earlier host summary.
+The host gate failed only zero-progress cells; it logged ratios without
+rejecting large regressions. Ten of 48 comparisons have candidates below 90%
+of their measured ceilings, including four with no calibration/A/A exclusion.
+The 48 MiB, eight-flow short-path download reached only 291–628 Mb/s. A default
+100 ms single-flow upload declined to 7.7 Mb/s in its final measured second.
+Zero relay drops and receive evictions do not establish an optimal rate.
+
+The new deterministic comparison tests restore the old comparison function
+and reproduce five failures: slow candidates, a capped fixture, drifting
+controls, an independently stronger matched control and delivery loss/stalls.
+The corrected gate enforces the declared ten-percent rate margin while keeping
+both failed results and instrumentation censor reasons. New manifests record
+build flags, start/end load averages and explicit concurrent-run context.
+
+Next, re-run the affected short-path download and long-path upload cells
+immediately under current host load. Resolve persistent regressions using
+controlled service/ACK schedules, and compare paced/unpaced arms and socket
+buffer limits before assigning the cause to pacing, TCP or host scheduling.
+Record every pair; a favorable repeat alone cannot close the negative result.
+
+## 14. Busy-path RTT changes and refreshed window residence
+
+A new deterministic change matrix exposed a second feedback loop: service RTT
+kept a historical minimum on a continuously busy path, so increased propagation
+was treated as queueing. Pacing and delivery-sized admission then shrank
+together. Changing 0.3 ms to 100 ms RTT produced 7.148 Mb/s on a 100 Mb/s service
+and 4.055 Mb/s on a 1 Gb/s service, without measured relay drops.
+
+The combined correction refreshes RTT from the first physical write following
+cumulative delivery of every sibling sequence's tail, and makes window sizing
+use that refreshed service minimum while its own older RTT samples age out.
+The ACK worker retains the earliest covering arrival before a newer head can
+absorb it. Actual successful H1 carrier confirmation, retransmission exclusion,
+per-sibling cumulative proof and cancellation cleanup bound this evidence.
+`transfer_window_pacing_probe_test.go` pins the state transitions; the four RTT
+change cells now match their 95.805/958.095 Mb/s references within rounding.
+Capacity-change and shared-service controls also pass. The complete mechanism
+and validation limits are documented in `THROUGHPUT-REPORT-PR2.md`.
+
+The adjacent fixture review found that a service-rate change overwrote queued
+frames' individually chosen propagation delays. A new combined rate/propagation
+test failed at 11.5/12 s instead of the required 11 s FIFO arrivals. Frames now
+retain their propagation delay during reserialization, and both increasing and
+decreasing delay controls pass.
+
+The user's time-bucket/zero-order-hold suggestion has seven deterministic
+primitive tests. Empty buckets hold the last measured bucket mean; measured
+zero, partial buckets, unknown startup, late updates and long idle expiry remain
+distinct. Using average RTT directly for the flight bound regressed shared
+services and was rejected. Further estimator integration must pass those
+controls as well as RTT changes and window mismatch.
+
+Remaining gates: run the full model and scoped race selection on the combined
+fix, retain focused failure-before mutations, repeat affected host comparisons,
+and review both server deterministic tiers. Database-backed server integration
+remains explicitly deferred by the user.
+
+## 15. Physical flight, queued reservations and message granularity
+
+The first post-RTT-fix host run reproduced a 75.856 Mb/s upload against its
+175.282 Mb/s reference, ending below 1 Mb/s. Deterministic follow-up found that
+queue detection counted pacing reservations before they reached the writer and
+did not allow for indivisible message sizes. The resulting false backlog could
+multiply an already low service estimate by the drain factor repeatedly.
+
+`transfer_window_pacing_flight_test.go` reproduces all three boundaries before
+the correction: one large message, two concurrent unsent reservations, and a
+message crossing the continuous residence bound by less than its own size.
+The corrected bound subtracts unsent reservations and permits one message in
+addition to rate times residence. Both backlog detection and sustained-service
+selection use it. Cancellation releases each reservation once while preserving
+its already incurred pacing debt. A previously single-message queue stimulus
+now uses four 50 kB messages, so its 200 kB flight is demonstrably beyond both
+propagation and one-message rounding.
+
+The new 32-cell large-message matrix covers 16/64 KiB payloads at four service
+rates, two RTTs and one/eight flows. It passed the first flight correction.
+Twelve targeted host comparisons also passed, with three capped-reference
+exclusions retained. The final source adds the explicit rounding boundary and
+is running the full model, complete host matrices, scoped race selection,
+root regression and environment-configured server deterministic tiers.
+
+## 16. Estimated burst limits and delayed timer dispatch
+
+The requested contract is one byte/time estimate: **B bytes over T time**.
+The burst byte ceiling is **B**; its duration ceiling is **k × T**, with the
+working candidate using `k = 2`. Neither a time multiplier nor a faster
+exploration refill rate multiplies an available byte estimate. A physical
+message establishes the minimum representable byte/time estimate. Both bounds
+belong to the shared service, including retransmissions and cancellation.
+
+The old two-millisecond expiry misclassified a three-millisecond scheduler
+delay as idle, reducing isolated admission to 41.1% of its configured rate.
+The end-to-end model compounded that error to 17.367 Mb/s against 993.657 Mb/s
+in four RTT/flow cells. The explicit burst candidate restores 99.7% in the
+isolated test and passes all eight delayed-wakeup cells. The adjacent review
+also reproduced combined timer releases exceeding the byte ceiling, a refill
+clock moving backward, and a startup probe enlarging a known byte estimate.
+These now have independent deterministic checks in
+`transfer_window_pacing_wakeup_test.go`.
+
+The first byte-meter checkpoint passed 126 focused race tests and six
+short-path host upload comparisons. The newer strict whole-message and flight
+bounds retain passing slow-rate, capacity-change, large-message, wake-delay and
+live-window-change controls, but expose two further hypotheses to resolve:
+
+1. **Continuously occupied flight never supplies a drained RTT probe.** The
+   100 Mb/s, 0.3-to-100 ms case retains its 0.514 ms baseline and falls to
+   3.809 Mb/s. Add a controlled baseline-refresh protocol that can obtain fresh
+   evidence without depending on an accidental idle gap. Test genuine queue
+   growth, propagation changes in both directions, lost probe replies and
+   cancellation separately. An increased queued RTT alone must not authorize
+   a larger standing queue.
+2. **Shared release fairness and ACK grouping on the slowest service.** The
+   1 Mb/s shared cell has a zero-progress flow despite aggregate capacity.
+   Deterministically hold an older reservation while later producers wake;
+   prove bounded progress and cancellation of a preceding waiter. Separately
+   replay the ACK timing that produces a 250 kB/s estimate on a 125 kB/s
+   serializer. Check whether time-bucket aggregation can remove grouping bias
+   while preserving capacity evidence across window-limited gaps.
+
+Reproduction diagnostics are opt-in with `CONNECT_WINDOW_PACING_TRACE=1` and
+`CONNECT_WINDOW_PACING_TRACE_CASE=rtt-growth` or `shared-slow`, running
+`TestWindowPathPacingStartupTrace`. The trace retains physical flight, pending
+reservations, applied and known-delivered bytes, RTT baselines, burst credit and
+serialization debt. A passing trace process is diagnostic output, not a
+throughput acceptance gate.
+
+The corrected burst-ring candidate passes the four RTT-change and three shared
+service performance pairs after the final admission and byte-debt corrections.
+After the adjacent reset-order correction, all 81 focused pacing/statistics
+tests and all 147 tests in the full correctness selection pass under the race
+detector on runner source SHA-256
+`fab6a0ab0f065bf4dd6a04d71976cdb5e4d5a4475508ebfa97601f06533a3d82`.
+Deterministic tests separately reproduce the stale
+RTT floor, sparse-head rate doubling, overtaking a delayed writer and phantom
+ACK credit at the admission/write handoff. The ring resets on newer burst
+evidence with the preceding burst mean held until completed new buckets take
+over; old burst IDs cannot replace it. A queued mean triggers a bounded drain
+experiment and does not itself raise the propagation floor.
+
+The handoff test uses the real send method and ACK coalescer with an explicit
+channel barrier. Adjacent failure-before tests cover reordered current-burst
+samples, dispatch epochs after delayed timers, changing byte limits and a late
+release crossing a nominal serialization deadline. Estimate changes preserve
+already spent bytes and their original serialization cost; they do not turn
+unissued credit into false debt. Missing replies, cancellation, reused FIFO
+waiters, duration overflow and partial/empty statistics buckets have separate
+deterministic controls. These run in the normal correctness selection.
+
+Four added large-message capacity-change pairs cover 16/64 KiB payloads at
+1↔10 Mb/s, 100 ms RTT, 10 ms compression and eight flows. Measurements cover
+at least 64 payloads to retain meaningful per-flow progress on the slowest
+case. All four initial pairs pass, with zero measured drops. These complement
+the 32 steady large-message pairs and small-frame capacity-change matrix.
+
+Do not accept the candidate or claim all cells optimal until these two cases,
+the full mismatch matrix and both host TCP buffer configurations pass on the
+same source. Database-backed server integrations remain deferred as requested.
+
+## 17. Preserve service evidence across a deliberate drain
+
+The broad burst-ring checkpoint exposed a separate deterministic failure at
+100 Mb/s, 400 ms RTT, eight flows and 50 ms compression: 66.847 Mb/s against
+95.826 Mb/s. Replaying its exact warmup and one-second measurement reproduced
+the loss. A controlled drain coalesced a large final ACK; when its preceding
+checkpoint expired, the next small probe over a 400 ms idle gap appeared to
+establish a service near 6.7 kB/s. That false measurement reserved another long
+wait which later ACK traffic could not undo.
+
+The correction records a new ACK-time service epoch only after a drained probe
+is confirmed. It holds the established pre-probe service until fresh checkpoints
+replace it, while late old ACKs still release delivered-byte ownership. The hold
+is captured before the probe is exposed so ACK-before-write-confirmation order
+cannot overwrite it with the invalid gap measurement. Direct and covering ACKs,
+changed carriers, missing replies, late old evidence and replacement by slower
+fresh service have separate deterministic tests. The isolated model now reaches
+95.846 Mb/s with zero measured drops.
+
+Six additional pairs measure twelve seconds at 0.3 ms RTT and 10 ms compression,
+crossing 16/64 KiB messages and 0/1/3 ms dispatch delays. They span more than two
+drain cooldown intervals and retain every one-second reading. They pass, but do
+not reproduce the older host-only download collapse. The optional trace now
+observes both data and TCP-feedback services during warmup and measurement,
+including drain deadlines and a copied ring mean; trace reads cannot advance
+the production ring.
+
+Final confirmation uses source SHA-256
+`b5b407364a99cbb0a022b5de897fc5eb8bade0593541ddd2e0b658636c692207`.
+The full correctness, model, root regression and both host TCP configurations
+start immediately under recorded concurrent load. Keep the earlier failed
+checkpoint and separate a proven model cause from an unproven host explanation.
+
+Adjacent review also confirmed that the largest-message floor may remain after
+that message is acknowledged while smaller traffic keeps the service occupied.
+It must cover older queued physical messages. No failing performance case has
+yet shown that this conservative retention needs a production change; a mixed
+large-then-small traffic experiment should precede any attempt to shrink it.
 
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md

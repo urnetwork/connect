@@ -1,0 +1,28 @@
+=== RUN   TestConnectH1
+--- PASS: TestConnectH1 (25.85s)
+=== RUN   TestConnectH3
+--- PASS: TestConnectH3 (49.04s)
+=== RUN   TestConnectH1Encrypted
+--- PASS: TestConnectH1Encrypted (25.33s)
+=== RUN   TestConnectH3Encrypted
+--- PASS: TestConnectH3Encrypted (56.53s)
+=== RUN   TestConnectH1EncryptedAllowFallback
+--- PASS: TestConnectH1EncryptedAllowFallback (55.26s)
+=== RUN   TestConnectH3EncryptedAllowFallback
+--- PASS: TestConnectH3EncryptedAllowFallback (76.65s)
+=== RUN   TestConnectMultiClientTcpDirectionalPerformance
+[mctcpdir]go=go1.26.7 cpus=10 gomaxprocs=10
+[mctcpdir]upload bytes=64MiB elapsed=4.90s goodput=13.06 MiB/s
+[mctcpdir]upload bytes=64MiB elapsed=0.58s goodput=110.45 MiB/s
+[mctcpdir]upload bytes=64MiB elapsed=0.61s goodput=105.75 MiB/s
+[mctcpdir]upload goodput=110.45 MiB/s (max of 3/3 completed runs)
+[mctcpdir]download bytes=64MiB elapsed=0.57s goodput=111.78 MiB/s
+[mctcpdir]download bytes=64MiB elapsed=0.59s goodput=109.14 MiB/s
+[mctcpdir]download bytes=64MiB elapsed=0.58s goodput=110.78 MiB/s
+[mctcpdir]download goodput=111.78 MiB/s (max of 3/3 completed runs)
+[mctcpdir]download cpu profile profile/mctcpdir_download_cpu.pprof
+[mctcpdir]==== summary ====
+[mctcpdir]upload=110.45 MiB/s download=111.78 MiB/s
+--- PASS: TestConnectMultiClientTcpDirectionalPerformance (12.64s)
+PASS
+ok  	github.com/urnetwork/server/connect	302.142s

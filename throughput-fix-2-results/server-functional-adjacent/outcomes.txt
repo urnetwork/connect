@@ -1,0 +1,15 @@
+=== RUN   TestExchangeRelayPoolBalance
+--- PASS: TestExchangeRelayPoolBalance (11.02s)
+=== RUN   TestConnectH1
+--- PASS: TestConnectH1 (26.57s)
+=== RUN   TestConnectH3
+--- PASS: TestConnectH3 (61.11s)
+=== RUN   TestConnectH1Encrypted
+--- PASS: TestConnectH1Encrypted (26.17s)
+=== RUN   TestConnectH3Encrypted
+--- PASS: TestConnectH3Encrypted (66.68s)
+=== RUN   TestConnectH1EncryptedAllowFallback
+--- PASS: TestConnectH1EncryptedAllowFallback (39.78s)
+=== RUN   TestConnectH3EncryptedAllowFallback
+--- PASS: TestConnectH3EncryptedAllowFallback (77.42s)
+PASS

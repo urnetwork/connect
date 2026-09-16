@@ -1,0 +1,6 @@
+=== RUN   TestWindowPacingRoundTripExcludesLocalWriteWait
+    transfer_window_adjacent_test.go:62: local send or receive wait entered service RTT: 110ms
+--- FAIL: TestWindowPacingRoundTripExcludesLocalWriteWait (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.594s

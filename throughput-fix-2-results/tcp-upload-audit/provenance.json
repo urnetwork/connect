@@ -1,0 +1,17 @@
+{
+  "input_sha256": {
+    "manifest.json": "842e2c9288c92798b0228cb2acda39fca5ea55c062caa685de011173dda1c5f7",
+    "status.json": "e55d0b92fc416ab2369f52e8e72897f12b426b35a6e6c9004e2d9bbdf3fc4e83",
+    "ledger.jsonl": "2f328648e83aad9fc568bd723353b64ac4613f74f656616e54e2d14742baacbf",
+    "run.log": "2cb92486bbeb747a6afa0ac20766424bccc92581f69963c35b10eb73d7e54361"
+  },
+  "outcome": "process passed",
+  "top_level_passed": 1,
+  "top_level_failed": 0,
+  "top_level_skipped": 0,
+  "host_performance_acceptance": "inconclusive",
+  "comparison_count": 6,
+  "failed_comparisons": 0,
+  "censored_comparisons": 3,
+  "note": "Raw run.log remains outside this archive; its hash is retained. Outcomes are an excerpt. Process success alone does not prove performance acceptance."
+}

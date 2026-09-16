@@ -20,22 +20,25 @@ import (
 // The finite relay queue counts only bytes/messages awaiting serialization;
 // already propagating messages are separately bounded by the flight limit.
 type windowPathLink struct {
-	rate            ByteCount
-	rateAfter       ByteCount
-	rateChangeAfter time.Duration
-	delay           time.Duration
-	queueCount      int
-	queueBytes      ByteCount
-	dropOnFull      bool
-	dropped         atomic.Int64
-	maxQueued       atomic.Int64
-	maxQueuedBytes  atomic.Int64
+	rate             ByteCount
+	rateAfter        ByteCount
+	rateChangeAfter  time.Duration
+	delay            time.Duration
+	delayAfter       time.Duration
+	delayChangeAfter time.Duration
+	queueCount       int
+	queueBytes       ByteCount
+	dropOnFull       bool
+	dropped          atomic.Int64
+	maxQueued        atomic.Int64
+	maxQueuedBytes   atomic.Int64
 }
 
 type windowPathFrame struct {
 	bytes  []byte
 	depart time.Time
 	arrive time.Time
+	delay  time.Duration
 }
 
 func (self *windowPathLink) run(ctx context.Context, from, to Route) {
@@ -44,6 +47,7 @@ func (self *windowPathLink) run(ctx context.Context, from, to Route) {
 	queuedBytes := ByteCount(0)
 	departure := time.Now()
 	changeAt := departure.Add(self.rateChangeAfter)
+	delayChangeAt := departure.Add(self.delayChangeAfter)
 	rate := self.rate
 	changed := self.rateAfter <= 0
 	timer := time.NewTimer(0)
@@ -75,7 +79,10 @@ func (self *windowPathLink) run(ctx context.Context, from, to Route) {
 			for ; index < len(queue); index++ {
 				departure = departure.Add(time.Duration(int64(len(queue[index].bytes)) * int64(time.Second) / int64(rate)))
 				queue[index].depart = departure
-				queue[index].arrive = departure.Add(self.delay)
+				queue[index].arrive = departure.Add(queue[index].delay)
+				if head < index && queue[index].arrive.Before(queue[index-1].arrive) {
+					queue[index].arrive = queue[index-1].arrive
+				}
 			}
 			changed = true
 		}
@@ -141,7 +148,17 @@ func (self *windowPathLink) run(ctx context.Context, from, to Route) {
 			if rate > 0 {
 				departure = departure.Add(time.Duration(int64(len(frame)) * int64(time.Second) / int64(rate)))
 			}
-			queue = append(queue, windowPathFrame{bytes: frame, depart: departure, arrive: departure.Add(self.delay)})
+			delay := self.delay
+			if self.delayAfter > 0 && !now.Before(delayChangeAt) {
+				delay = self.delayAfter
+			}
+			arrival := departure.Add(delay)
+			// A changed propagation path remains FIFO: frames already in
+			// flight retain their deadline, including across a shorter path.
+			if head < len(queue) && arrival.Before(queue[len(queue)-1].arrive) {
+				arrival = queue[len(queue)-1].arrive
+			}
+			queue = append(queue, windowPathFrame{bytes: frame, depart: departure, arrive: arrival, delay: delay})
 			queuedBytes += ByteCount(len(frame))
 			self.maxQueued.Store(max(self.maxQueued.Load(), int64(len(queue)-serviced)))
 			self.maxQueuedBytes.Store(max(self.maxQueuedBytes.Load(), int64(queuedBytes)))
@@ -195,8 +212,10 @@ func TestWindowPathFifoSeparatesQueueAndPropagation(t *testing.T) {
 }
 
 // Virtual-time goodput is a deterministic model outcome, not host throughput.
-// The control changes only the RTT multiplier; budgets, sampler, receiver,
-// framing and offered bytes stay identical in both arms.
+// Both arms use the FIFO's known physical RTT for sizing, so service residence
+// learned from compressed replies cannot silently restore the omitted term.
+// The control changes only that window term; service pacing still observes
+// the real receiver compression in both arms.
 func TestWindowCompressionResidenceRestoresShortPathCapacity(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	var old, fixed float64
@@ -204,17 +223,22 @@ func TestWindowCompressionResidenceRestoresShortPathCapacity(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			reading := measureWindowPathCell(t, windowPathCell{
 				Arm: arm, RoundTrip: 300 * time.Microsecond, Compression: 10 * time.Millisecond,
-				Flows: 1, Payload: 1280, Budget: mib(48), Rate: 125000000,
+				Flows: 1, Payload: 1280, Budget: mib(48), Rate: 125000000, KnownPathRoundTrip: true,
 			}, 100*time.Millisecond)
+			wantResidence := 10300 * time.Microsecond
 			if arm == "path-rtt-only" {
 				old = reading.Mbps
+				wantResidence = 300 * time.Microsecond
 			} else {
 				fixed = reading.Mbps
+			}
+			if reading.Window.RoundTrip != 300*time.Microsecond || reading.Window.WindowRoundTrip != wantResidence {
+				t.Fatalf("%s did not isolate the compression window term: %+v", arm, reading.Window)
 			}
 			t.Logf("%s: %.1f model Mb/s, window=%d reason=%s", arm, reading.Mbps, reading.Window.Window, reading.Window.Reason)
 		})
 	}
-	if old >= 400 || fixed < 850 {
+	if old <= 0 || old >= 400 || fixed < 850 {
 		t.Fatalf("short-path residence control: old=%.1f fixed=%.1f model Mb/s", old, fixed)
 	}
 }
@@ -298,27 +322,31 @@ func TestWindowPathSlowLinkKeepsCapacity(t *testing.T) {
 }
 
 type windowPathCell struct {
-	CalibrationWindow  ByteCount
-	SendWindow         ByteCount
-	ReceiveWindow      ByteCount
-	ReceiveWindowAfter ByteCount
-	WindowChangeAfter  time.Duration
-	Tcp                bool
-	Upload             bool
-	TcpBufferMax       ByteCount
-	Arm                string
-	RoundTrip          time.Duration
-	Compression        time.Duration
-	Flows              int
-	RoundRobinOffer    bool
-	Lanes              int
-	Payload            int
-	Budget             ByteCount
-	Drop               bool
-	Rate               ByteCount
-	RateAfter          ByteCount
-	RateChangeAfter    time.Duration
-	Warmup             time.Duration
+	CalibrationWindow    ByteCount
+	SendWindow           ByteCount
+	ReceiveWindow        ByteCount
+	ReceiveWindowAfter   ByteCount
+	WindowChangeAfter    time.Duration
+	Tcp                  bool
+	Upload               bool
+	TcpBufferMax         ByteCount
+	Arm                  string
+	RoundTrip            time.Duration
+	RoundTripAfter       time.Duration
+	RoundTripChangeAfter time.Duration
+	Compression          time.Duration
+	Flows                int
+	RoundRobinOffer      bool
+	Lanes                int
+	Payload              int
+	Budget               ByteCount
+	Drop                 bool
+	Rate                 ByteCount
+	RateAfter            ByteCount
+	RateChangeAfter      time.Duration
+	Warmup               time.Duration
+	PacingWakeDelay      time.Duration
+	KnownPathRoundTrip   bool
 }
 
 type windowPathReading struct {
@@ -357,6 +385,12 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		}
 		s.SendBufferSettings.ApplyWindowSizing()
 		s.SendBufferSettings.disableWindowPacingForTest = cell.Arm == "unpaced"
+		if cell.KnownPathRoundTrip {
+			s.SendBufferSettings.windowRoundTripOverrideForTest = &cell.RoundTrip
+		}
+		if cell.PacingWakeDelay > 0 {
+			s.SendBufferSettings.afterWindowPacingWaitForTest = func() { time.Sleep(cell.PacingWakeDelay) }
+		}
 		if cell.Arm == "path-rtt-only" {
 			zero := time.Duration(0)
 			s.SendBufferSettings.ackCompressionResidenceOverrideForTest = &zero
@@ -417,6 +451,10 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	}
 	dataLink := windowPathLink{rate: cell.Rate, rateAfter: cell.RateAfter, rateChangeAfter: cell.RateChangeAfter, delay: cell.RoundTrip / 2, queueCount: 4096, queueBytes: mib(8), dropOnFull: cell.Drop}
 	ackLink := windowPathLink{delay: cell.RoundTrip / 2, queueCount: 4096, queueBytes: mib(8)}
+	for _, link := range []*windowPathLink{&dataLink, &ackLink} {
+		link.delayAfter = cell.RoundTripAfter / 2
+		link.delayChangeAfter = cell.RoundTripChangeAfter
+	}
 	if cell.Upload {
 		dataLink.rate = 0
 		dataLink.rateAfter = 0
@@ -508,18 +546,76 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	}
 	if os.Getenv("CONNECT_WINDOW_PACING_TRACE") != "" {
 		traceStart := time.Now()
-		for time.Since(traceStart) < warmup {
-			time.Sleep(min(10*time.Millisecond, warmup-time.Since(traceStart)))
-			bytes := int64(0)
-			for i := range counts {
-				bytes += counts[i].Load()
+		// Trace both data and inner-TCP feedback through the measured interval.
+		// Copy statistics before reading their mean so tracing cannot advance
+		// the production ring or hold a service lock while writing test output.
+		workers.Go(func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
+				now := time.Now()
+				bytes := int64(0)
+				for i := range counts {
+					bytes += counts[i].Load()
+				}
+				phase := "warmup"
+				if now.Sub(traceStart) >= warmup {
+					phase = "measurement"
+				}
+				for _, direction := range []struct {
+					name        string
+					client      *Client
+					destination Id
+				}{
+					{name: "forward", client: sender, destination: receiver.ClientId()},
+					{name: "reverse", client: receiver, destination: sender.ClientId()},
+				} {
+					estimate := direction.client.DestinationSendStats(direction.destination).SendWindow
+					t.Logf("pacing-trace phase=%s direction=%s at=%s bytes=%d window=%d rate=%d service=%d backlog=%t rtt=%s sampled=%t", phase, direction.name, now.Sub(traceStart), bytes, estimate.Window, estimate.PacingByteRate, estimate.ServiceByteRate, estimate.ServiceBacklogged, estimate.RoundTrip, estimate.Sized)
+					var services []*windowPacingService
+					func() {
+						direction.client.sendBuffer.mutex.Lock()
+						defer direction.client.sendBuffer.mutex.Unlock()
+						for _, service := range direction.client.sendBuffer.windowPacingServices {
+							services = append(services, service)
+						}
+					}()
+					for _, service := range services {
+						var snapshot struct {
+							minimum, latest, compression, debt, drain, cooldown time.Duration
+							outstanding, bound, credit, mean                    float64
+							sent, applied, drained, reserved, limit             ByteCount
+							waits, tails, buckets                               int
+							burst                                               uint64
+						}
+						func() {
+							service.stateLock.Lock()
+							defer service.stateLock.Unlock()
+							snapshot.minimum, snapshot.latest, snapshot.compression = service.minRoundTrip, service.latestRoundTrip, service.compression
+							snapshot.outstanding, snapshot.bound = service.outstandingWithLock(), service.flightBoundWithLock(estimate.ServiceByteRate)
+							snapshot.sent, snapshot.applied, snapshot.drained, snapshot.reserved = service.sent, service.total, service.drainedSent, service.reservedByteCount
+							snapshot.waits, snapshot.tails, snapshot.limit, snapshot.credit = service.pacingReservations, service.pendingWrites, service.burstMeter.limit, service.burstMeter.available
+							snapshot.burst = service.dispatchBurst.number
+							snapshot.debt = max(0, service.next.Sub(now))
+							snapshot.drain, snapshot.cooldown = max(0, service.drainUntil.Sub(now)), max(0, service.drainCheckAt.Sub(now))
+							if ring := service.roundTripStats.ring; ring != nil {
+								copy := *ring
+								copy.buckets = append([]windowStatsBucket(nil), ring.buckets...)
+								snapshot.mean, snapshot.buckets = copy.mean(now)
+							}
+						}()
+						t.Logf("pacing-service phase=%s direction=%s at=%s minimum=%s latest=%s compression=%s outstanding=%.0f bound=%.0f sent=%d applied=%d drained=%d reserved=%d waits=%d tails=%d burst=%d burst-limit=%d credit=%.0f debt=%s drain=%s cooldown=%s ring-mean-ns=%.0f ring-buckets=%d",
+							phase, direction.name, now.Sub(traceStart), snapshot.minimum, snapshot.latest, snapshot.compression, snapshot.outstanding, snapshot.bound,
+							snapshot.sent, snapshot.applied, snapshot.drained, snapshot.reserved, snapshot.waits, snapshot.tails, snapshot.burst, snapshot.limit, snapshot.credit, snapshot.debt, snapshot.drain, snapshot.cooldown, snapshot.mean, snapshot.buckets)
+					}
+				}
 			}
-			estimate := sender.DestinationSendStats(receiver.ClientId()).SendWindow
-			t.Logf("pacing-trace at=%s bytes=%d window=%d rate=%d service=%d backlog=%t rtt=%s sampled=%t", time.Since(traceStart), bytes, estimate.Window, estimate.PacingByteRate, estimate.ServiceByteRate, estimate.ServiceBacklogged, estimate.RoundTrip, estimate.Sized)
-		}
-	} else {
-		time.Sleep(warmup)
+		})
 	}
+	time.Sleep(warmup)
 	dropsBefore := dataLink.dropped.Load()
 	if cell.Upload {
 		dropsBefore = ackLink.dropped.Load()
@@ -637,6 +733,9 @@ func testWindowPathPerformanceMatrix(t *testing.T, tcp bool, upload bool) {
 						t.Fatal(err)
 					}
 					t.Logf("comparison repetition=%d %s", repetition, encoded)
+					if len(comparison.FailureReasons) != 0 {
+						t.Errorf("performance comparison failed: %s", strings.Join(comparison.FailureReasons, "; "))
+					}
 				}
 			}
 		}
@@ -651,16 +750,21 @@ type windowPathComparison struct {
 	CeilingMbps         float64
 	DeliveryMbps        float64
 	DeliveryOfCeiling   float64
+	DeliveryOfMatched   float64
 	CensoredReasons     []string
+	FailureReasons      []string
 }
 
 // A/A drift and an unattained calibration ceiling prevent treating host load
 // or a capped fixture as evidence for a window-policy change. All raw runs
 // remain in the ledger, including censored and stalled observations.
 func compareWindowPathReadings(readings []windowPathReading) windowPathComparison {
+	if len(readings) == 0 {
+		return windowPathComparison{CensoredReasons: []string{"missing readings"}}
+	}
 	comparison := windowPathComparison{Cell: readings[0].Cell}
 	comparison.Cell.Arm = "comparison"
-	matched := 0
+	matched, ceilings, candidates := 0, 0, 0
 	for _, reading := range readings {
 		switch reading.Cell.Arm {
 		case "matched":
@@ -671,12 +775,24 @@ func compareWindowPathReadings(readings []windowPathReading) windowPathCompariso
 			matched++
 		case "ceiling":
 			comparison.CeilingMbps = reading.Mbps
+			ceilings++
 		case "delivery":
 			comparison.DeliveryMbps = reading.Mbps
+			candidates++
+			if reading.MeasurementRelayDrops != 0 || reading.NatRefused != 0 ||
+				reading.Receiver.ReceiveQueueEvictionCount != 0 || reading.SenderReceive.ReceiveQueueEvictionCount != 0 {
+				comparison.FailureReasons = append(comparison.FailureReasons, "candidate lost delivery at a measured admission boundary")
+			}
 		}
 		if reading.Bytes == 0 || reading.MinFlowMbps == 0 {
-			comparison.CensoredReasons = append(comparison.CensoredReasons, "stalled flow")
+			comparison.FailureReasons = append(comparison.FailureReasons, "stalled flow in "+reading.Cell.Arm)
 		}
+	}
+	if candidates != 1 {
+		comparison.CensoredReasons = append(comparison.CensoredReasons, "expected one candidate reading")
+	}
+	if ceilings != 1 {
+		comparison.CensoredReasons = append(comparison.CensoredReasons, "expected one ceiling reading")
 	}
 	if matched < 2 || min(comparison.MatchedFirstMbps, comparison.MatchedLastMbps) <= 0 {
 		comparison.CensoredReasons = append(comparison.CensoredReasons, "missing A/A repeat")
@@ -688,6 +804,17 @@ func compareWindowPathReadings(readings []windowPathReading) windowPathCompariso
 	}
 	if comparison.CeilingMbps > 0 {
 		comparison.DeliveryOfCeiling = comparison.DeliveryMbps / comparison.CeilingMbps
+		if candidates == 1 && ceilings == 1 && comparison.DeliveryOfCeiling < .9 {
+			comparison.FailureReasons = append(comparison.FailureReasons, "candidate below 90 percent of measured ceiling")
+		}
+	}
+	// Even an instrument capped below the link rate can expose a regression
+	// against its unchanged-window control. Censoring never erases that result.
+	if matched >= 2 && min(comparison.MatchedFirstMbps, comparison.MatchedLastMbps) > 0 {
+		comparison.DeliveryOfMatched = comparison.DeliveryMbps / min(comparison.MatchedFirstMbps, comparison.MatchedLastMbps)
+		if candidates == 1 && comparison.DeliveryOfMatched < .9 {
+			comparison.FailureReasons = append(comparison.FailureReasons, "candidate below 90 percent of both matched controls")
+		}
 	}
 	if comparison.CeilingMbps < .9*float64(comparison.Cell.Rate)*8/1e6 {
 		comparison.CensoredReasons = append(comparison.CensoredReasons, "calibration below 90 percent of link rate")

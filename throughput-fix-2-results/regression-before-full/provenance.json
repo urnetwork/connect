@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-regression-adjacent.log",
+  "source_log_sha256": "59c86ca0db7491a8f6631a10695b1d431f802026b6bfa3f00c6f257cd6865dda",
+  "note": "Final root regression partition before the full selection; model and two host-sensitive cases run separately.",
+  "rows": 0,
+  "final": false,
+  "outcome": "passed"
+}

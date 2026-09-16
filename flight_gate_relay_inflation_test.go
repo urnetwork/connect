@@ -21,17 +21,16 @@ type relayInflationResult struct {
 	stats       ClientSendRecoveryStatsSnapshot
 }
 
-// runRelayInflation offers the payload over a single reliable lane that
-// slows at stepAfter, sampling the resend queue while it runs.
-func runRelayInflation(
+// Builds the historical queue-depth control with the same configuration in
+// the traffic measurement and its deterministic precondition check.
+func newRelayInflationHarness(
 	t testing.TB,
-	messageCount int,
 	queueFrames int,
 	deferTimeoutResend bool,
 	boundOff bool,
-) relayInflationResult {
+) *mixedLaneGapHarness {
 	t.Helper()
-	harness := newMixedLaneHarnessWithOptions(t, mixedLaneOptions{
+	return newMixedLaneHarnessWithOptions(t, mixedLaneOptions{
 		slowLatency:                50 * time.Millisecond,
 		slowSerialization:          500 * time.Microsecond,
 		slowStepAfter:              time.Second,
@@ -40,7 +39,21 @@ func runRelayInflation(
 		directLaneDisabled:         true,
 		deferTimeoutResend:         deferTimeoutResend,
 		reliableAdmissionUnbounded: boundOff,
+		constantSendWindow:         true,
 	})
+}
+
+// Offers the payload over one reliable lane that slows mid-transfer,
+// sampling the resend queue while it runs.
+func runRelayInflation(
+	t testing.TB,
+	messageCount int,
+	queueFrames int,
+	deferTimeoutResend bool,
+	boundOff bool,
+) relayInflationResult {
+	t.Helper()
+	harness := newRelayInflationHarness(t, queueFrames, deferTimeoutResend, boundOff)
 	start := time.Now()
 	var peakQueue ByteCount
 	stop := make(chan struct{})
@@ -86,6 +99,50 @@ func runRelayInflation(
 		windows:     windows,
 		peakQueue:   peakQueue,
 		stats:       stats,
+	}
+}
+
+// The historical control requires a constant send window without newer
+// pacing. A delivery-sized default otherwise silently enables H1 pacing.
+func TestRelayInflationUsesConstantSendWindow(t *testing.T) {
+	defer SetWindowSizing(DefaultWindowSizing())
+	SetWindowSizing(WindowSizingFromDelivery)
+	for _, c := range []struct {
+		queueFrames        int
+		deferTimeoutResend bool
+	}{
+		{queueFrames: 64, deferTimeoutResend: true},
+		{queueFrames: 4096, deferTimeoutResend: false},
+		{queueFrames: 4096, deferTimeoutResend: true},
+	} {
+		harness := newRelayInflationHarness(t, c.queueFrames, c.deferTimeoutResend, true)
+		for _, endpoint := range []struct {
+			name   string
+			client *Client
+		}{
+			{name: "sender", client: harness.sender},
+			{name: "receiver", client: harness.receiver},
+		} {
+			settings := endpoint.client.settings.SendBufferSettings
+			if settings.WindowSizing != WindowSizingConstant ||
+				settings.DeliverySizedWindowScale != 0 ||
+				settings.TargetGoodputByteRate != 0 || settings.ResendQueueBudget != nil {
+				t.Errorf("queue=%d defer=%t %s: historical control uses policy=%d scale=%d target=%d budget=%v; delivery sizing and H1 pacing must be off",
+					c.queueFrames, c.deferTimeoutResend, endpoint.name, settings.WindowSizing,
+					settings.DeliverySizedWindowScale, settings.TargetGoodputByteRate, settings.ResendQueueBudget)
+			}
+			if settings.ReliableAdmissionBoundedByDelivery {
+				t.Errorf("queue=%d defer=%t %s: historical control enabled delivery-bounded admission",
+					c.queueFrames, c.deferTimeoutResend, endpoint.name)
+			}
+		}
+	}
+	if got := DefaultWindowSizing(); got != WindowSizingFromDelivery {
+		t.Fatalf("the historical control changed the process default to %d", got)
+	}
+	harness := newMixedLaneHarnessWithOptions(t, mixedLaneOptions{})
+	if got := harness.sender.settings.SendBufferSettings.WindowSizing; got != WindowSizingFromDelivery {
+		t.Fatalf("the ordinary mixed-lane fixture changed policy to %d", got)
 	}
 }
 

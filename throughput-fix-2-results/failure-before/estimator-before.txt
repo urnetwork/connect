@@ -1,0 +1,13 @@
+--- FAIL: TestWindowTargetIncludesAcknowledgementResidence (0.00s)
+    transfer_window_residence_test.go:28: target cannot carry one compressed acknowledgement cycle: {Window:262144 Sized:false Reason:no delivery rate samples DeliveredByteCount:0 Interval:0s RoundTrip:1ms SampleCount:0 Initial:2097152 Floor:262144 Ceiling:262144 Obtainable:67371008 TargetBound:true}
+--- FAIL: TestWindowDeliveryIncludesAcknowledgementResidence (0.00s)
+    transfer_window_residence_test.go:55: feedback collapses below an independently counted ACK burst: {Window:262144 Sized:true Reason:delivery DeliveredByteCount:4194304 Interval:40ms RoundTrip:1ms SampleCount:12 Initial:2097152 Floor:262144 Ceiling:33554432 Obtainable:67371008 TargetBound:false}
+--- FAIL: TestDeliveryRateUsesCheckpointTimes (0.00s)
+    transfer_window_residence_test.go:72: checkpoint includes future bytes: bytes=10000 span=10ms sampled=true
+--- FAIL: TestDeliveryRateWaitsForWholeHorizon (0.00s)
+    transfer_window_residence_test.go:85: accepted 30ms of evidence for a 100 ms horizon
+--- FAIL: TestDeliveryRateHistoryCoversDesignRoundTrip (0.00s)
+    transfer_window_residence_test.go:103: lost the design-point history: bytes=63000 span=630ms sampled=true
+FAIL
+FAIL	github.com/urnetwork/connect	0.664s
+FAIL

@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-window-mismatch-model.log",
+  "source_log_sha256": "18458b4f65a89fb20dcecbf0c3df466882523fbbe5b3daab29e0f88290077e0e",
+  "note": "Early mismatch calibration incorrectly allowed drop-on-full in the reference; diagnostic only.",
+  "rows": 228,
+  "final": false,
+  "outcome": "failed"
+}

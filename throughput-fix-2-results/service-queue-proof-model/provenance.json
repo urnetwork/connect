@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-service-queue-proof-model.log",
+  "source_log_sha256": "fcb613f9be7de9b76017001458f02c1397a6169fce44436ecc47dbf52d3866d5",
+  "note": "Propagation versus queue proof alone was insufficient.",
+  "rows": 126,
+  "final": false,
+  "outcome": "passed"
+}

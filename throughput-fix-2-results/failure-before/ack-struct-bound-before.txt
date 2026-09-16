@@ -1,0 +1,5 @@
+--- FAIL: TestAckCompressionEnforcesItsOwnResponseCountLimit (0.00s)
+    transfer_ack_compression_test.go:19: caller bypassed compression response limit: 100 ACKs, overflow=false
+FAIL
+FAIL	github.com/urnetwork/connect	0.648s
+FAIL

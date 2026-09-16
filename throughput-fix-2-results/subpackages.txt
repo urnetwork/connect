@@ -1,0 +1,8 @@
+ok  	github.com/urnetwork/connect/blocker	0.944s
+ok  	github.com/urnetwork/connect/connectctl	0.472s
+ok  	github.com/urnetwork/connect/emoji	1.634s
+ok  	github.com/urnetwork/connect/extender	14.904s
+ok  	github.com/urnetwork/connect/gossip	1.739s
+?   	github.com/urnetwork/connect/protocol	[no test files]
+ok  	github.com/urnetwork/connect/scripts/extender_spoof	1.951s
+ok  	github.com/urnetwork/connect/security	1.603s

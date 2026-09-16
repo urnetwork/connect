@@ -1,0 +1,5 @@
+--- FAIL: TestAckOverflowDoesNotAddCompressionIntervals (0.00s)
+    transfer_ack_bounds_test.go:130: bounded response chunks added compression residence: 25/100 ACKs after one interval
+FAIL
+FAIL	github.com/urnetwork/connect	0.701s
+FAIL

@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-upload-batched.log",
+  "source_log_sha256": "b1efc783d7e84aa717da983a2c79d623a298fa5c4bed646d60b705d2e5acd0ee",
+  "note": "NAT batches preserved; short warmup still included inner TCP startup.",
+  "rows": 10,
+  "final": false,
+  "outcome": "passed"
+}

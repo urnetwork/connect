@@ -1,0 +1,5 @@
+--- FAIL: TestWindowPacingBurstEpochFollowsActualDispatch (0.00s)
+    transfer_window_pacing_wakeup_test.go:29: one actual 800-byte burst used two reservation epochs: first=1 second=2
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.784s

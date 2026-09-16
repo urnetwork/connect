@@ -1,0 +1,5 @@
+--- FAIL: TestTcpSequenceCancelBeforeWritePublicationReturnsPacket (0.00s)
+    ip_tcp_sequence_ack_test.go:50: canceled socket writer abandoned a late upload packet
+FAIL
+FAIL	github.com/urnetwork/connect	0.728s
+FAIL

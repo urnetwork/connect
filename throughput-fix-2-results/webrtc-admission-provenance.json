@@ -1,0 +1,22 @@
+{
+  "source_sha256_at_recording": "f9915589ae4ae01185bef3073f1c3df2453a5b73e295f5c3cd56ae58f8877132",
+  "owned_file_sha256": {
+    "transport_p2p_webrtc_test.go": "e499dc3ec99af156ff73609b19801d781076b408aa3000d9fa5cc86049481907"
+  },
+  "failure_before": {
+    "source_log": "throughput-fix-2-webrtc-admission-before.log",
+    "source_log_sha256": "d4d6d9f4e88d85c925ddc3b79f5557256859306892288861a2cbeeb74b7e4dd7",
+    "top_level_passed": 0,
+    "top_level_failed": 3,
+    "top_level_skipped": 0
+  },
+  "restored_race": {
+    "source_log": "throughput-fix-2-webrtc-admission-restored.log",
+    "source_log_sha256": "c4c48dbfbf9531fe328e8cc167849d2bbeb9f316fd48b4bc7fb2a26c1627baf8",
+    "top_level_passed": 120,
+    "top_level_failed": 0,
+    "top_level_skipped": 0,
+    "repetitions": 20
+  },
+  "note": "Raw logs and the order patch remain outside this archive."
+}

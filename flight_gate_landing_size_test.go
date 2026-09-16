@@ -1,10 +1,8 @@
 package connect
 
-// FLIGHTGATEFIX §20.3. The landing's memory against merged's. Everything
-// this program added to the ack path is gone, so the two acknowledgement
-// structs are merged's to the byte. sendItem carries §13.5's per-item
-// deferral state and §34.3's per-item lane position, which are the two
-// mechanisms the landing keeps, and that state is what the extra bytes are.
+// FLIGHTGATEFIX §20.3. Account for each retained mechanism against merged's
+// exact struct sizes. Later receiver advertisements, ACK arrival timestamps
+// and pacing state have explicit byte costs; unaccounted growth still fails.
 
 import (
 	"testing"
@@ -43,6 +41,10 @@ const (
 	// Local arrival survives ACK handoff without retaining the wire message.
 	ackArrivalStateByteCount = 8
 	pacingWireStateByteCount = 16
+	// The actual first-release burst id survives until acknowledgement, so
+	// older in-flight bursts cannot reset the newer RTT measurement ring.
+	// This uint64 follows the two pacing words and adds no alignment padding.
+	pacingBurstStateByteCount = 8
 )
 
 func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
@@ -61,13 +63,14 @@ func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
 		)
 	}
 	want := uintptr(
-		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount + pacingWireStateByteCount)
+		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount + pacingWireStateByteCount + pacingBurstStateByteCount)
 	if got := unsafe.Sizeof(sendItem{}); got != want {
 		t.Errorf(
 			"sendItem is %d bytes, want merged's %d plus %d for the deferred retransmit's own state "+
-				"and %d for the lane position it last looked at, plus 16 for paced wire bytes and actual write time; "+
+				"and %d for the lane position it last looked at, plus %d for paced wire bytes and actual write time "+
+				"and %d for the actual burst epoch; "+
 				"anything else means a removed mechanism left a field behind",
-			got, mergedSendItemByteCount, deferStateByteCount, lanePositionStateByteCount,
+			got, mergedSendItemByteCount, deferStateByteCount, lanePositionStateByteCount, pacingWireStateByteCount, pacingBurstStateByteCount,
 		)
 	}
 }

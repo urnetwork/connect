@@ -1,0 +1,57 @@
+=== RUN   TestDrainCoordinatorCompletesWhenIdle
+--- PASS: TestDrainCoordinatorCompletesWhenIdle (0.70s)
+=== RUN   TestDrainCoordinatorGraceDeadline
+--- PASS: TestDrainCoordinatorGraceDeadline (0.30s)
+=== RUN   TestDrainCoordinatorDisabled
+--- PASS: TestDrainCoordinatorDisabled (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetKeepsThePerDeviceTarget
+--- PASS: TestProxyDeviceMemoryBudgetKeepsThePerDeviceTarget (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetNeverExceedsTheAggregate
+--- PASS: TestProxyDeviceMemoryBudgetNeverExceedsTheAggregate (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetRefusesWithoutConstructing
+--- PASS: TestProxyDeviceMemoryBudgetRefusesWithoutConstructing (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetReleasedOnConstructionFailure
+--- PASS: TestProxyDeviceMemoryBudgetReleasedOnConstructionFailure (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetReleasedOnDeviceClose
+--- PASS: TestProxyDeviceMemoryBudgetReleasedOnDeviceClose (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetDisabled
+--- PASS: TestProxyDeviceMemoryBudgetDisabled (0.00s)
+=== RUN   TestProxyDeviceWireGuardReturnWaitsForQueueCapacity
+--- PASS: TestProxyDeviceWireGuardReturnWaitsForQueueCapacity (0.00s)
+=== RUN   TestProxyDeviceTunDialDoesNotStealWireGuardReturn
+--- PASS: TestProxyDeviceTunDialDoesNotStealWireGuardReturn (0.00s)
+=== RUN   TestProxyDeviceManagerRetainsRetryingDeviceAcrossWindowLoss
+--- PASS: TestProxyDeviceManagerRetainsRetryingDeviceAcrossWindowLoss (0.00s)
+=== RUN   TestProxyDeviceManagerSharesOneNetworkSpaceLifetime
+--- PASS: TestProxyDeviceManagerSharesOneNetworkSpaceLifetime (0.00s)
+=== RUN   TestProxyDeviceManagerCloseAndWaitJoinsOwnedNetworkSpace
+--- PASS: TestProxyDeviceManagerCloseAndWaitJoinsOwnedNetworkSpace (0.00s)
+=== RUN   TestProxyDeviceManagerCloseJoinsAdmittedOpenAndRejectsLateOpen
+--- PASS: TestProxyDeviceManagerCloseJoinsAdmittedOpenAndRejectsLateOpen (0.00s)
+=== RUN   TestProxyDeviceManagerPreservesInjectedNetworkSpace
+--- PASS: TestProxyDeviceManagerPreservesInjectedNetworkSpace (0.00s)
+=== RUN   TestProxyDeviceSendBorrowedBatchCopiesBeforeReturn
+--- PASS: TestProxyDeviceSendBorrowedBatchCopiesBeforeReturn (0.00s)
+=== RUN   TestProxyDeviceSendBorrowedBatchReturnsRejectedCopies
+--- PASS: TestProxyDeviceSendBorrowedBatchReturnsRejectedCopies (0.00s)
+=== RUN   TestProxyIngressCollectorExportsCompleteBoundedLibrarySnapshots
+--- PASS: TestProxyIngressCollectorExportsCompleteBoundedLibrarySnapshots (0.00s)
+=== RUN   TestProxyConnectionMetricsPreserveDirectionalBytesAndCloseOnce
+--- PASS: TestProxyConnectionMetricsPreserveDirectionalBytesAndCloseOnce (0.00s)
+=== RUN   TestProxySessionMaximumResetsAtIntervalBoundary
+--- PASS: TestProxySessionMaximumResetsAtIntervalBoundary (0.00s)
+=== RUN   TestProxySessionDurationSummaryExportsExactSumCountWithoutBuckets
+--- PASS: TestProxySessionDurationSummaryExportsExactSumCountWithoutBuckets (0.00s)
+=== RUN   TestWireGuardPacketMetricsCountPayloadAfterOffset
+--- PASS: TestWireGuardPacketMetricsCountPayloadAfterOffset (0.00s)
+=== RUN   TestWgClientStackCloseAndWaitJoinsTCPDispatcher
+--- PASS: TestWgClientStackCloseAndWaitJoinsTCPDispatcher (0.00s)
+=== RUN   TestProxyLifecycleJoinCapabilityMetric
+--- PASS: TestProxyLifecycleJoinCapabilityMetric (0.00s)
+=== RUN   TestWindowIdentityRestoreGateProtectsLazyOpen
+--- PASS: TestWindowIdentityRestoreGateProtectsLazyOpen (0.00s)
+=== RUN   TestWindowIdentityRestoreGateJoinsConcurrentReleaseWrite
+--- PASS: TestWindowIdentityRestoreGateJoinsConcurrentReleaseWrite (0.00s)
+=== RUN   TestWindowIdentityRestoreGateKeepsNewestDeviceGeneration
+--- PASS: TestWindowIdentityRestoreGateKeepsNewestDeviceGeneration (0.00s)
+PASS

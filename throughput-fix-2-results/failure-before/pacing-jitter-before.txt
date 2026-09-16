@@ -1,0 +1,5 @@
+--- FAIL: TestWindowBurstPacingRetainsBoundedTimerLateness (0.00s)
+    transfer_window_pacing_test.go:68: bounded timer lateness reduced 300 kB at 10 MB/s: 35ms
+FAIL
+FAIL	github.com/urnetwork/connect	0.598s
+FAIL

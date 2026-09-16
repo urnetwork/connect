@@ -1,0 +1,6 @@
+=== RUN   TestWindowPacingDeliveredSiblingTailsAreNotWireFlight
+    transfer_window_pacing_flight_test.go:118: cumulatively delivered sibling tails still counted as relay flight
+--- FAIL: TestWindowPacingDeliveredSiblingTailsAreNotWireFlight (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.754s

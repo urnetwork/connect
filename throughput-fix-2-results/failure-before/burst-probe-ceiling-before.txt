@@ -1,0 +1,6 @@
+=== RUN   TestWindowPacingBurstBytesUseTheServiceEstimate
+    transfer_window_pacing_wakeup_test.go:86: the exploration rate enlarged the estimated byte ceiling
+--- FAIL: TestWindowPacingBurstBytesUseTheServiceEstimate (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.742s

@@ -10,6 +10,41 @@ import (
 	"time"
 )
 
+// A rate change must retain each waiting frame's own propagation delay,
+// including the FIFO constraint across an earlier propagation change.
+func TestWindowPathFifoCombinedServiceAndPropagationChange(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, delay := range []time.Duration{time.Second, 20 * time.Second} {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			from, to := make(Route), make(Route)
+			link := &windowPathLink{rate: 1000, rateAfter: 2000, rateChangeAfter: 500 * time.Millisecond,
+				delay: 10 * time.Second, delayAfter: delay, delayChangeAfter: 250 * time.Millisecond,
+				queueCount: 3, queueBytes: 3000}
+			done := make(chan struct{})
+			start := time.Now()
+			go func() { defer close(done); link.run(ctx, from, to) }()
+			defer func() { cancel(); <-done }()
+			for i := range 3 {
+				if i == 1 {
+					time.Sleep(250 * time.Millisecond)
+				}
+				frame := MessagePoolGet(1000)
+				frame[0] = byte(i)
+				from <- frame
+			}
+			for i, want := range []time.Duration{11 * time.Second, max(11*time.Second, 1500*time.Millisecond+delay), max(11*time.Second, 2*time.Second+delay)} {
+				frame := <-to
+				got := frame[0]
+				MessagePoolReturn(frame)
+				if got != byte(i) || time.Since(start) != want {
+					t.Errorf("delay=%s frame=%d identity=%d arrival=%s want=%s", delay, i, got, time.Since(start), want)
+				}
+			}
+		})
+	}
+}
+
 // Opt-in startup trace complements the steady-state ledger without changing
 // the ordinary matrix's measurement boundary.
 func TestWindowPathPacingStartupTrace(t *testing.T) {
@@ -18,7 +53,15 @@ func TestWindowPathPacingStartupTrace(t *testing.T) {
 	}
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		reading := measureWindowPathCell(t, windowPathCell{Arm: "delivery", RoundTrip: 400 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 1, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: 125000000, Drop: true}, time.Second)
+		cell := windowPathCell{Arm: "delivery", RoundTrip: 400 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 1, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: 125000000, Drop: true}
+		switch os.Getenv("CONNECT_WINDOW_PACING_TRACE_CASE") {
+		case "rtt-growth":
+			cell.RoundTrip, cell.RoundTripAfter, cell.RoundTripChangeAfter = 300*time.Microsecond, 100*time.Millisecond, 4*time.Second
+			cell.Rate, cell.Flows, cell.Warmup = 12500000, 8, 8*time.Second
+		case "shared-slow":
+			cell.RoundTrip, cell.Rate, cell.Flows, cell.Lanes, cell.Warmup = 100*time.Millisecond, 125000, 8, 4, 135*time.Second
+		}
+		reading := measureWindowPathCell(t, cell, time.Second)
 		logWindowServiceReading(t, reading)
 	})
 }
@@ -176,6 +219,40 @@ func TestWindowPathServiceCapacityChanges(t *testing.T) {
 	}
 }
 
+// TCP coalescing produces much larger physical messages than the original
+// small-packet model. Cover serialization quanta larger than a service BDP,
+// with enough measured messages to avoid one-packet sampling ambiguity.
+func TestWindowPathServiceLargeMessages(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, rate := range []ByteCount{125000, 1250000, 12500000, 125000000} {
+		for _, rtt := range []time.Duration{300 * time.Microsecond, 100 * time.Millisecond} {
+			for _, flows := range []int{1, 8} {
+				for _, payload := range []int{16 * 1024, 64 * 1024} {
+					var ceiling, fixed windowPathReading
+					warmup := max(300*time.Millisecond+5*rtt, time.Duration(2*int64(mib(2))*int64(time.Second)/int64(rate))+5*rtt)
+					measurement := max(2*time.Second, time.Duration(64*int64(payload)*int64(time.Second)/int64(rate)))
+					for _, arm := range []string{"ceiling", "delivery"} {
+						synctest.Test(t, func(t *testing.T) {
+							reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: rtt, Compression: 10 * time.Millisecond,
+								Flows: flows, RoundRobinOffer: true, Payload: payload, Budget: mib(48), Rate: rate, Drop: arm == "delivery", Warmup: warmup}, measurement)
+							logWindowServiceReading(t, reading)
+							if arm == "ceiling" {
+								ceiling = reading
+							} else {
+								fixed = reading
+							}
+						})
+					}
+					if ceiling.Mbps < .9*float64(rate)*8/1e6 || fixed.Mbps < .9*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 {
+						t.Errorf("large-message service rate=%d RTT=%s flows=%d payload=%d: ceiling=%.3f candidate=%.3f minimum=%.3f measured-drops=%d",
+							rate, rtt, flows, payload, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.MeasurementRelayDrops)
+					}
+				}
+			}
+		}
+	}
+}
+
 // Independent logical sequences compete for the same finite serializer and
 // shared memory budget. An eight-flow test on one sequence cannot cover this.
 func TestWindowPathServicesShareFiniteRelay(t *testing.T) {
@@ -202,5 +279,99 @@ func TestWindowPathServicesShareFiniteRelay(t *testing.T) {
 		if fixed.Mbps < .9*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 || fixed.MaxRelayQueued > 4096 || fixed.MaxRelayQueuedBytes > int64(mib(8)) {
 			t.Errorf("shared service underfilled, starved or exceeded a finite queue: %+v", fixed)
 		}
+	}
+}
+
+// A busy path can change propagation delay without losing serializer
+// capacity. Compare the settled candidate to an identical final path; an old
+// minimum RTT must not turn all new propagation into a permanent queue.
+func TestWindowPathServiceRoundTripChanges(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, rate := range []ByteCount{12500000, 125000000} {
+		for _, roundTrips := range [][2]time.Duration{
+			{300 * time.Microsecond, 100 * time.Millisecond},
+			{100 * time.Millisecond, 300 * time.Microsecond},
+		} {
+			var ceiling, fixed windowPathReading
+			for _, arm := range []string{"ceiling", "delivery"} {
+				synctest.Test(t, func(t *testing.T) {
+					cell := windowPathCell{Arm: arm, RoundTrip: roundTrips[1], Compression: 10 * time.Millisecond,
+						Flows: 8, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: rate, Warmup: 8 * time.Second}
+					if arm == "delivery" {
+						cell.RoundTrip, cell.RoundTripAfter, cell.RoundTripChangeAfter, cell.Drop = roundTrips[0], roundTrips[1], 4*time.Second, true
+					}
+					reading := measureWindowPathCell(t, cell, time.Second)
+					logWindowServiceReading(t, reading)
+					if arm == "ceiling" {
+						ceiling = reading
+					} else {
+						fixed = reading
+					}
+				})
+			}
+			if ceiling.Mbps < .9*float64(rate)*8/1e6 || fixed.Mbps < .9*ceiling.Mbps ||
+				fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 {
+				t.Errorf("rate=%d RTT=%s->%s: ceiling=%.3f candidate=%.3f min-flow=%.3f drops=%d window=%+v",
+					rate, roundTrips[0], roundTrips[1], ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.MeasurementRelayDrops, fixed.Window)
+			}
+		}
+	}
+}
+
+// Previously propagating frames keep their deadlines while new frames use
+// the changed path. A shorter delay cannot reorder a reliable FIFO.
+func TestWindowPathFifoPropagationChangePreservesOldFrames(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, delays := range [][2]time.Duration{
+		{100 * time.Millisecond, 10 * time.Millisecond},
+		{100 * time.Millisecond, 200 * time.Millisecond},
+	} {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			from, to := make(Route), make(Route, 2)
+			link := &windowPathLink{delay: delays[0], delayAfter: delays[1], delayChangeAfter: 50 * time.Millisecond,
+				queueCount: 2, queueBytes: 100}
+			done := make(chan struct{})
+			go func() { defer close(done); link.run(ctx, from, to) }()
+			defer func() { cancel(); <-done }()
+			first, second := MessagePoolGet(1), MessagePoolGet(1)
+			first[0], second[0] = 1, 2
+			from <- first
+			time.Sleep(50 * time.Millisecond)
+			from <- second
+			time.Sleep(49 * time.Millisecond)
+			synctest.Wait()
+			if len(to) != 0 {
+				t.Fatal("a propagation change moved the old frame's deadline")
+			}
+			time.Sleep(time.Millisecond)
+			synctest.Wait()
+			if len(to) == 0 {
+				t.Fatal("the old frame missed its original deadline")
+			}
+			frame := <-to
+			value := frame[0]
+			MessagePoolReturn(frame)
+			if value != 1 {
+				t.Fatal("a new frame overtook a propagating frame")
+			}
+			remaining := 50*time.Millisecond + delays[1] - delays[0]
+			if remaining > 0 {
+				if len(to) != 0 {
+					t.Fatal("new frame did not use the longer propagation delay")
+				}
+				time.Sleep(remaining)
+				synctest.Wait()
+			}
+			if len(to) != 1 {
+				t.Fatal("the new frame missed its changed propagation deadline")
+			}
+			frame = <-to
+			value = frame[0]
+			MessagePoolReturn(frame)
+			if value != 2 || link.dropped.Load() != 0 {
+				t.Fatal("propagation transition changed packet identity or dropped it")
+			}
+		})
 	}
 }

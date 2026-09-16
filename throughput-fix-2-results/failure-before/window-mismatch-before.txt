@@ -1,0 +1,110 @@
+--- FAIL: TestWindowMismatchRespectsBothEndpoints (0.00s)
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=65536/receive=65536 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=65536 window=262144 reason=no round trip samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=65536 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=32768 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=65536 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=65536/receive=262144 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=262144 window=262144 reason=no round trip samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=262144 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=262144 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=32768 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=262144 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=262144 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=262144 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=65536/receive=2097152 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=2097152 window=262144 reason=no round trip samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=2097152 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=2097152 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=32768 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=2097152 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=2097152 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=2097152 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=65536/receive=50331648 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=50331648 window=262144 reason=no round trip samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=50331648 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=50331648 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=32768 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=65536 receiver=50331648 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=65536 receiver=50331648 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=65536 receiver=50331648 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=262144/receive=65536 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=262144 receiver=65536 window=262144 reason=no round trip samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=262144 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=262144 receiver=65536 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=262144 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=262144 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=262144 receiver=32768 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=262144 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=262144 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=262144 receiver=65536 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=262144/receive=262144 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=262144 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=262144 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=262144 receiver=32768 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=262144/receive=2097152 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=262144 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=262144 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=262144 receiver=32768 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=262144/receive=50331648 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=262144 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=262144 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=262144 receiver=32768 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=2097152/receive=65536 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=2097152 receiver=65536 window=262144 reason=no round trip samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=2097152 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=2097152 receiver=65536 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=2097152 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=2097152 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=2097152 receiver=32768 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=2097152 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=2097152 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=2097152 receiver=65536 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=2097152/receive=262144 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=2097152 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=2097152 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=2097152 receiver=32768 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=2097152/receive=2097152 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=2097152 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=2097152 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=2097152 receiver=32768 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=2097152/receive=50331648 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=2097152 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=2097152 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=2097152 receiver=32768 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=50331648/receive=65536 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=50331648 receiver=65536 window=262144 reason=no round trip samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=50331648 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=50331648 receiver=65536 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=50331648 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=50331648 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=50331648 receiver=32768 window=262144 reason=delivery
+        transfer_window_mismatch_test.go:41: phase=0 sender=50331648 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=50331648 receiver=65536 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=50331648 receiver=65536 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=50331648/receive=262144 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=50331648 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=50331648 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=50331648 receiver=32768 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=50331648/receive=2097152 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=50331648 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=50331648 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=50331648 receiver=32768 window=262144 reason=delivery
+    --- FAIL: TestWindowMismatchRespectsBothEndpoints/send=50331648/receive=50331648 (0.00s)
+        transfer_window_mismatch_test.go:41: phase=0 sender=50331648 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=1 sender=50331648 receiver=32768 window=262144 reason=no delivery rate samples
+        transfer_window_mismatch_test.go:41: phase=2 sender=50331648 receiver=32768 window=262144 reason=delivery
+FAIL
+FAIL	github.com/urnetwork/connect	0.691s
+FAIL

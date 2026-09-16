@@ -61,7 +61,7 @@ func TestWindowPacingSlowServiceDeferralNeedsFreshProgress(t *testing.T) {
 	}
 }
 
-// Every prefix must fit the service performed so far plus one two-millisecond
+// Every prefix must fit the service performed so far plus one ten-millisecond
 // burst. Check mixed wire sizes and rates, not only the final average rate.
 func TestWindowPacingServiceByteEnvelope(t *testing.T) {
 	for _, rate := range []ByteCount{125000, 1250000, 12500000, 125000000, 137500000} {
@@ -82,7 +82,7 @@ func TestWindowPacingServiceByteEnvelope(t *testing.T) {
 					serviceTime := time.Duration(float64(bytes) / float64(rate) * float64(time.Second))
 					// A duration truncates by less than a nanosecond per write.
 					quantization := time.Duration(i+1) * time.Nanosecond
-					if elapsed+2*time.Millisecond+quantization < serviceTime || elapsed > serviceTime+quantization {
+					if elapsed+10*time.Millisecond+quantization < serviceTime || elapsed > serviceTime+quantization {
 						t.Fatalf("prefix=%d bytes=%d service=%s elapsed=%s", i+1, bytes, serviceTime, elapsed)
 					}
 				}
@@ -100,9 +100,11 @@ func TestWindowPacingServiceChangesPreserveDebt(t *testing.T) {
 		firstBytes, nextBytes int
 		want                  time.Duration
 	}{
-		{name: "down", firstRate: 10000000, nextRate: 1000000, firstBytes: 10000, nextBytes: 4000, want: 5 * time.Millisecond},
-		{name: "up", firstRate: 1000000, nextRate: 10000000, firstBytes: 1000, nextBytes: 40000, want: 5 * time.Millisecond},
-		{name: "small-step", firstRate: 1000000, nextRate: 2000000, firstBytes: 2000, nextBytes: 2000, want: 3 * time.Millisecond},
+		{name: "down", firstRate: 1000000, nextRate: 100000, firstBytes: 8000, nextBytes: 1000, want: 8 * time.Millisecond},
+		{name: "up", firstRate: 100000, nextRate: 1000000, firstBytes: 1000, nextBytes: 10000, want: 10 * time.Millisecond},
+		// Eight kB remain from the old allowance. The new 2 MB/s rate
+		// earns the remaining twelve kB in six ms, without free new credit.
+		{name: "small-step", firstRate: 1000000, nextRate: 2000000, firstBytes: 2000, nextBytes: 20000, want: 6 * time.Millisecond},
 	} {
 		t.Logf("case: %s", test.name)
 		synctest.Test(t, func(t *testing.T) {
@@ -139,16 +141,22 @@ func TestWindowPacingProbeBoundaryIdleAndIndependentSequences(t *testing.T) {
 			t.Fatal(err)
 		}
 		// 15 kB at 10 MB/s, then 5 kB at 1 MB/s, including the split message.
-		if time.Since(start) != 6500*time.Microsecond || pacer.probeSent != 15000 {
-			t.Fatalf("probe boundary: elapsed=%s probe=%d", time.Since(start), pacer.probeSent)
+		// The next full measured burst waits for that 6.5 ms serialization.
+		if err := pacer.waitForService(context.Background(), 10000); err != nil {
+			t.Fatal(err)
+		}
+		if time.Since(start) != 6500*time.Microsecond || pacer.service.probeSent != 15000 {
+			t.Fatalf("probe boundary: elapsed=%s probe=%d", time.Since(start), pacer.service.probeSent)
 		}
 		time.Sleep(time.Second)
 		pacer.rate = 2000000
 		start = time.Now()
-		if err := pacer.waitForService(context.Background(), 10000); err != nil {
-			t.Fatal(err)
+		for range 3 {
+			if err := pacer.waitForService(context.Background(), 10000); err != nil {
+				t.Fatal(err)
+			}
 		}
-		if time.Since(start) != 5*time.Millisecond || pacer.probeSent != 15000 {
+		if time.Since(start) != 10*time.Millisecond || pacer.service.probeSent != 15000 {
 			t.Fatal("idle or service update replenished the probe")
 		}
 		other := &windowBurstPacer{rate: 1000000, probeRate: 10000000, probeLimit: 15000}
@@ -157,7 +165,7 @@ func TestWindowPacingProbeBoundaryIdleAndIndependentSequences(t *testing.T) {
 		if err := other.waitForService(context.Background(), 10000); err != nil {
 			t.Fatal(err)
 		}
-		if time.Now() != start || other.probeSent != 10000 || pacer.probeSent != 15000 {
+		if time.Now() != start || other.service.probeSent != 10000 || pacer.service.probeSent != 15000 {
 			t.Fatal("one sequence spent another sequence's probe or service")
 		}
 	})
@@ -174,14 +182,14 @@ func TestWindowPacingCanceledSmallWrite(t *testing.T) {
 		if err := pacer.waitForService(ctx, 64); err != context.Canceled {
 			t.Fatalf("canceled short write admitted: %v", err)
 		}
-		if !pacer.next.IsZero() || pacer.probeSent != 0 {
+		if pacer.service != nil {
 			t.Fatal("canceled write consumed service")
 		}
 	})
 }
 
-// The probe may itself wait. Cancellation must join that timer without also
-// charging the remainder at the measured service rate.
+// An indivisible write crossing the probe boundary charges each portion at
+// its own rate. Cancellation joins the wait and retains that reservation debt.
 func TestWindowPacingCancellationDuringProbe(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -194,8 +202,8 @@ func TestWindowPacingCancellationDuringProbe(t *testing.T) {
 		if err := <-done; err != context.Canceled {
 			t.Fatalf("probe cancellation: %v", err)
 		}
-		if delay := pacer.next.Sub(time.Now()); delay != 10*time.Millisecond {
-			t.Fatalf("canceled probe charged its unsent remainder: %s", delay)
+		if delay := pacer.service.next.Sub(time.Now()); delay != 110*time.Millisecond {
+			t.Fatalf("canceled probe lost its reserved serialization: %s", delay)
 		}
 	})
 }
@@ -368,7 +376,7 @@ func TestWindowPacingSharedServiceEnvelopeAndCancellation(t *testing.T) {
 			for i := range 80 {
 				elapsed := (<-sent).Sub(start)
 				need := time.Duration(float64((i+1)*1250) * float64(time.Second) / float64(rate))
-				if elapsed+2*time.Millisecond+80*time.Nanosecond < need {
+				if elapsed+10*time.Millisecond+80*time.Nanosecond < need {
 					t.Fatalf("shared service multiplied its budget at packet %d: elapsed=%s need=%s", i+1, elapsed, need)
 				}
 			}
@@ -408,15 +416,17 @@ func TestWindowPacingSharedProbeAndServiceIsolation(t *testing.T) {
 			}
 			pacer.close()
 		}
-		if time.Since(start) != 26500*time.Microsecond || service.probeSent != 15000 {
+		if time.Since(start) != 16500*time.Microsecond || service.probeSent != 15000 {
 			t.Fatalf("shared probe spent more than 15 kB: elapsed=%s probe=%d", time.Since(start), service.probeSent)
 		}
 		time.Sleep(time.Second)
 		pacer := &windowBurstPacer{service: service, rate: 1000000, probeRate: 10000000, probeLimit: 15000}
 		defer pacer.close()
 		start = time.Now()
-		if err := pacer.waitForService(context.Background(), 10000); err != nil {
-			t.Fatal(err)
+		for range 2 {
+			if err := pacer.waitForService(context.Background(), 10000); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if time.Since(start) != 10*time.Millisecond {
 			t.Fatal("idle shared service replenished its probe")
@@ -603,6 +613,36 @@ func TestWindowPacingBackloggedServiceUsesSustainedDelivery(t *testing.T) {
 	}
 }
 
+// Compressed heads from sparse shared producers can leave gaps longer than
+// two buckets. With a proven outstanding queue those gaps belong to the same
+// service interval; discarding them turns a 125 kB/s serializer into 250 kB/s.
+func TestWindowPacingBackloggedSparseHeadsKeepTheirTime(t *testing.T) {
+	start := time.Unix(1700000000, 0)
+	for _, reverse := range []bool{false, true} {
+		service := &windowPacingService{}
+		service.observeRoundTrip(120*time.Millisecond, 10*time.Millisecond, start)
+		for i := range 42 {
+			index := i
+			if reverse {
+				index = 41 - i
+			}
+			at := start.Add(time.Duration(index/2) * 60 * time.Millisecond)
+			bytes := ByteCount(5000)
+			if index%2 != 0 {
+				at = at.Add(10 * time.Millisecond)
+				bytes = 2500
+			}
+			service.observe(bytes, at)
+		}
+		now := start.Add(1210 * time.Millisecond)
+		service.sent = service.total + 1000000
+		service.observeRoundTrip(time.Second, 10*time.Millisecond, now)
+		if rate, _, _ := service.measured(time.Second, now); rate != 125000 {
+			t.Errorf("reverse=%t: sparse heads measured %d B/s, want 125000", reverse, rate)
+		}
+	}
+}
+
 // Matching a noisy service estimate exactly can preserve a full queue. A
 // queued sender must leave drain capacity, then resume discovery when clear.
 func TestWindowPacingDrainsAQueueAtEachServiceRate(t *testing.T) {
@@ -640,8 +680,10 @@ func TestWindowPacingBacklogProbeAndCanceledOwnership(t *testing.T) {
 		start := time.Now()
 		service.observeRoundTrip(100*time.Millisecond, 10*time.Millisecond, start)
 		pacer := &windowBurstPacer{service: service, rate: 1000000}
-		if err := pacer.waitForService(context.Background(), 200000); err != nil {
-			t.Fatal(err)
+		for range 4 {
+			if err := pacer.waitForService(context.Background(), 50000); err != nil {
+				t.Fatal(err)
+			}
 		}
 		service.observeRoundTrip(250*time.Millisecond, 10*time.Millisecond, time.Now())
 		if !service.backlogged(1000000) {
@@ -765,17 +807,17 @@ func TestWindowBurstPacingBoundsBusyAndIdleWrites(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if elapsed := time.Since(start); elapsed < 18*time.Millisecond || elapsed > 20*time.Millisecond {
+		if elapsed := time.Since(start); elapsed != 10*time.Millisecond {
 			t.Fatalf("200 kB at 10 MB/s escaped its burst allowance: %s", elapsed)
 		}
 		time.Sleep(time.Second)
 		start = time.Now()
-		for range 3 {
+		for range 11 {
 			if err := pacer.wait(context.Background(), 10000, 10000000); err != nil {
 				t.Fatal(err)
 			}
 		}
-		if time.Since(start) != 3*time.Millisecond {
+		if time.Since(start) != 10*time.Millisecond {
 			t.Fatal("idle time accumulated an unbounded burst")
 		}
 	})
@@ -787,7 +829,7 @@ func TestWindowBurstPacingCancellationJoinsWait(t *testing.T) {
 		pacer := &windowBurstPacer{}
 		defer pacer.close()
 		done := make(chan error, 1)
-		go func() { done <- pacer.wait(ctx, 100000, 10000000) }()
+		go func() { done <- pacer.wait(ctx, 200000, 10000000) }()
 		synctest.Wait()
 		cancel()
 		if err := <-done; err != context.Canceled {
@@ -812,7 +854,7 @@ func TestWindowBurstPacingRetainsBoundedTimerLateness(t *testing.T) {
 			}
 			time.Sleep(500 * time.Microsecond)
 		}
-		if elapsed := time.Since(start); elapsed > 31*time.Millisecond || elapsed < 28*time.Millisecond {
+		if elapsed := time.Since(start); elapsed > 31*time.Millisecond || elapsed < 20*time.Millisecond {
 			t.Fatalf("bounded timer lateness reduced 300 kB at 10 MB/s: %s", elapsed)
 		}
 	})

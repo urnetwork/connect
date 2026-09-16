@@ -1,19 +1,54 @@
-# Throughput fix 2: final local validation report
+# Throughput fix 2: local validation report
 
 Date: 2026-09-15
 Branch: `throughput-fix-2`
-Connect source revision: `b51530f3a402cb1dd5fe5d1daae344302a1f3069`
-Connect source manifest: `034a8ba28c61e70407d050228067a342b36f49505ae915cb99a7824a19bd90ee`
+Original validation source revision: `b51530f3a402cb1dd5fe5d1daae344302a1f3069`
+Original validation source manifest: `034a8ba28c61e70407d050228067a342b36f49505ae915cb99a7824a19bd90ee`
 Server source revision reviewed: `77201554c49ec05bde83ec038bba6c600972892c`
 
-## Result
+The completion audit and combined RTT fix below are working-tree follow-ups.
+The original full-suite results do not validate those later production edits.
+
+## Current follow-up
+
+The burst-ring follow-up adds deterministic failure-before tests for sparse
+ACK timing, FIFO fairness, continuous-flight RTT changes, the production
+send/ACK handoff, burst epochs and byte debt across changing estimates.
+The committed follow-up passes all **152 tests under the race detector** in the
+full correctness selection on source SHA-256
+`b5b407364a99cbb0a022b5de897fc5eb8bade0593541ddd2e0b658636c692207`.
+Focused RTT, shared-service, long-feedback and large-message capacity controls
+also pass. The final full model, root regression and both TCP configurations
+are still running on this same source at commit time, under recorded concurrent
+load. Earlier checkpoints exposed the now-reproduced service-epoch defect and
+uncensored short-path host download failures. The latter remain unattributed,
+so host acceptance is still open. The sections below preserve source hashes,
+failed comparisons and the boundary between completed and pending validation.
+
+## Original checkpoint and acceptance audit
 
 The new window mechanism and its adjacent root causes now have deterministic
-coverage. The race-enabled correctness selection passed 89 top-level tests.
+coverage. The race-enabled correctness selection passed 90 top-level tests.
 The virtual FIFO model passed 213 paired cells (390 ledger rows), including
-window-size mismatch and live capacity changes. The host TCP matrix and the
-separate 48 MiB TCP-buffer control each passed 168 ledger rows. ACK compression
-tests and the allocation benchmark passed.
+window-size mismatch and live capacity changes. The full root regression
+selection passed 2,936 top-level tests without the race detector, with 24
+explicit skips. ACK compression tests and the allocation benchmark passed.
+
+**Host performance acceptance remains open.** The TCP matrix and separate
+48 MiB TCP-buffer control each completed 168 ledger rows, but their original
+gate checked only nonzero progress. Ten of their 48 paired comparisons contain
+a candidate below 90% of its measured ceiling. Four of those comparisons have
+no recorded calibration or A/A exclusion. Earlier process passes and report
+rate ranges did not establish that all host cells performed optimally.
+
+The comparison gate now checks throughput against the measured ceiling and
+both matched controls, along with stalls and measured delivery loss. Seven
+deterministic comparison tests pass under `-race`; restoring the original
+comparison reproduces five failures. Failed comparisons remain visible even
+when calibration or A/A drift also makes attribution uncertain. Targeted host
+repeats passed their new rate/loss gate before the RTT fix below; the earlier
+slow readings remain evidence. Three repeated single-flow upload comparisons
+remain inconclusive for line capacity because their references were capped.
 
 The missing native H1/TUN rig source and P37–P44 ledger were not available, so
 these results are local reproduction and regression evidence. They do not
@@ -42,12 +77,387 @@ establish behavior on the reporter's deployed relay or every host network.
   entry reservation, eviction metadata, deadlines, gap wake and cancellation
   drain are covered for both codecs and encrypted wrappers.
 
-## Deterministic coverage
+## Combined fix: refresh service RTT and use it for the window
+
+### Failure and causal chain
+
+A continuously busy path can change from 0.3 ms to 100 ms RTT without losing
+capacity. The service estimator retained its old minimum RTT until either a
+smaller observation arrived or ACK traffic stopped for a minute. On the longer
+path, bytes legitimately in transit exceeded the flight expected from that old
+minimum. The pacer treated them as a standing queue and reduced its rate. Lower
+delivery then reduced the window, which further reduced delivery.
+
+Two estimates needed correction. Refreshing only the service baseline left the
+window using the sequence's older RTT sample minimum. Those old samples age by
+sample count as well as time; a sender that has already slowed can retain them
+long enough to remain at the 256 KiB working floor.
+
+### The two changes
+
+1. **Refresh service RTT from the first write after a drained burst.** Track the
+   latest physical write for each logical sequence sharing the service. Every
+   sequence's tail must have a cumulative ACK, and its actual write must have
+   succeeded over H1, before the next new write becomes an RTT probe. Start its
+   clock after local pacing. The ACK worker preserves the earliest arrival that
+   covers the probe, even when the cumulative head names a later message. That
+   arrival can refresh an obsolete minimum upward. Ordinary queued RTT samples
+   retain their existing ability to lower the minimum.
+2. **Use the refreshed service minimum in window sizing.** The window uses the
+   larger of the sequence's sampled minimum and the service's current minimum,
+   then includes the advertised ACK-compression residence. Its target ceiling
+   and delivery horizon therefore use the newly observed propagation time while
+   the sequence's older RTT samples age out. Peer and memory ceilings continue
+   to bound admission.
+
+The first change supplies current path evidence; the second lets the sender
+admit the bytes that can be in transit on that path. Both are required to break
+the collapse. This is a refresh triggered by delivery of the preceding burst;
+a large average RTT alone cannot establish that the sender's queue drained.
+
+### Ordering and adjacent cases
+
+- A SACK for the newest message does not establish that its earlier messages
+  were cumulatively delivered. Sibling sequences must each clear their tail.
+- ACK arrival and write completion may be observed in either order. Both are
+  required before accepting H1 delivery evidence. A failed write or a different
+  actual carrier cannot establish the refreshed baseline.
+- Retransmitting the probe invalidates its sample because an ACK cannot identify
+  which physical copy arrived. This invalidation happens at the common write
+  boundary: an H1-to-H3 retry can bypass H1 pacing but still invalidates the
+  original probe. Wrong-sequence ACKs, older heads, SACKs above the probe,
+  duplicates and missing-contract replies cannot supply the missing proof.
+- Tracking retains one tail per live sequence and one probe per service. Closing
+  a sequence removes its tail and pending probe, including on repeated cleanup.
+  Cancellation cannot certify physical delivery: an older sibling ACK cannot
+  start a fresh probe until a write made after that cancellation is delivered.
+- The two physical write branches, plaintext and encrypted, both confirm the
+  actual carrier. RTT refresh happens before send-loop ACK compression can
+  replace the probe's arrival timestamp with a later head.
+
+Implementation: `transfer_window_pacing.go` owns shared probe state;
+`transfer.go` records write/ACK boundaries and applies the refreshed minimum in
+`sendWindowEstimate`. Focused tests are in
+`transfer_window_pacing_probe_test.go`.
+
+### Deterministic evidence and limits
+
+The virtual FIFO test changes RTT at 4 s, warms up to 8 s, then measures one
+second. It offers eight flows with 10 ms ACK compression and compares against
+a constant-window reference at the final RTT. Results are payload Mb/s:
+
+| Service capacity | RTT change | Before fix | Combined fix | Reference |
+|---|---|---:|---:|---:|
+| 100 Mb/s | 0.3 → 100 ms | 7.148 | 95.805 | 95.805 |
+| 1 Gb/s | 0.3 → 100 ms | 4.055 | 958.075 | 958.095 |
+
+Both reverse transitions also pass. All flows progress, with zero measured
+relay drops in all four cells. The hardened implementation also passes the six
+capacity-change controls and three shared-service controls. Five initial probe
+tests, seven zero-order-hold bucket tests and the FIFO fixture checks pass under
+the race detector. Disabling the two correction points reproduces three focused
+failures. An additional cancellation test reproduced false drain proof after
+releasing a sibling's unacknowledged tail; cleanup now requires fresh delivery
+before probing again. The completed broad checkpoint is recorded below;
+these results do not attribute every earlier slow host reading to this mechanism.
+
+An earlier experiment used rolling average RTT directly as the permitted
+in-flight residence. It fixed one RTT-change cell but regressed shared-service
+controls, including measured relay drops, and was removed. The separately
+tested bucket helper implements equal weighting of completed time buckets,
+zero-order hold for empty buckets, and a real zero when zero is measured. At
+this checkpoint it was not integrated. The burst-ring follow-up below uses
+that history to request a drain experiment; it still requires drained-write
+evidence before raising the propagation floor.
+
+## Follow-up: count physical flight and message granularity
+
+The RTT correction did not explain every slow host cell. Its first host rerun
+still produced a default-buffer, 100 ms single-flow upload of 75.856 Mb/s against
+a 175.282 Mb/s reference. The five measured intervals were 159.0, 183.2, 33.8,
+1.06 and 0.85 Mb/s. The final window was 256 KiB, with a service estimate near
+126 kB/s and a 120 kB/s pacing rate. A short-path download also had a brief
+242.7 Mb/s interval between intervals near 942 Mb/s. Both failures remain in
+the collected ledgers.
+
+Two additional counting errors can falsely establish a standing queue:
+
+1. A shared pacing reservation was charged to `sent` before its deadline, even
+   though its bytes had not reached the physical writer. Concurrent producers
+   waiting for future deadlines could therefore manufacture relay flight.
+   Outstanding physical flight now excludes those reserved bytes. Releasing a
+   reservation on success or cancellation preserves the existing pacing debt.
+2. A continuous rate-times-residence bound ignores that messages are indivisible.
+   One large message can exceed a small bandwidth-delay product. Even above that
+   size, sending the next message while the previous one still propagates can
+   cross the continuous bound by less than one message. Queue detection now
+   permits **rate × residence + one observed message**, and still detects excess
+   beyond that amount. The largest-message allowance resets with a fresh flight.
+
+The same helpers now govern both the backlog flag and the decision to replace
+compressed delivery peaks with a sustained rate. Otherwise those two decisions
+could disagree about whether a real queue exists. ACK arrival can also prove
+all sibling tails delivered before the pacing workers apply their byte credits.
+That proof now supplies a lower bound on delivered wire bytes, survives the
+next write, and ends the startup exemption for subsequent excess flight. Later
+ACK application catches up without counting delivery twice. Canceling an owner
+that changes the aggregate sent-byte coordinate invalidates the old lower bound.
+Five deterministic flight tests cover these cases, including blocked concurrent
+reservations and cancellation cleanup.
+
+New performance coverage crosses 16/64 KiB payloads, 1/10/100/1,000 Mb/s service,
+0.3/100 ms RTT and one/eight flows: 32 paired cells. The initial version of the
+flight correction passed all 32 cells and all 12 targeted host comparisons
+(six short-path downloads and six long-path uploads). Three upload comparisons
+remain inconclusive for line capacity because the single-flow references are
+capped. The completed broad checkpoint below includes the final one-message
+rounding refinement; the subsequent ACK-arrival and carrier-retry guards have
+focused validation and still require another full-source confirmation.
+
+Broader validation also exposed two separate test outcomes. The compression
+control reached about 474 Mb/s because refreshed service RTT already contains
+some compressed residence. Its gate now requires at least a 40% loss relative
+to the corrected arm while retaining the corrected arm's 850 Mb/s absolute
+minimum; the control is no longer treated as an exact replay of the older RTT
+estimator. A mixed-route attribution test failed once with more deferred direct
+than relay recoveries and passed an immediate focused repeat under concurrent
+load. That failed sweep remains evidence.
+
+### Completed checkpoint and delayed-wakeup reproduction
+
+The broad runs built source SHA-256
+`55132a4dc44dbc9fdb486d5f7288ba5579370a0cb751f957bb6d365fd0d319b1`.
+They started immediately with concurrent host work, without waiting for idle:
+
+| Selection | Outcome |
+|---|---|
+| Focused correctness, race detector | 113 top-level tests passed. |
+| Deterministic performance model | 16 top-level tests passed; 462 numerical ledger rows, including all 32 large-message and four RTT-change pairs. |
+| server/connect deterministic, race detector | 33 top-level tests passed with `server/test-env.sh`. |
+| server/proxy deterministic | 28 top-level tests passed with `server/test-env.sh`. |
+| Full root regression, non-race | 2,958 top-level passes; one failed advertisement timestamp assertion. |
+| Host TCP, default buffers | 24 comparisons; six failed the rate gate, 11 had instrument exclusions. |
+| Host TCP, 48 MiB maximum | 24 comparisons; seven failed the rate gate, 10 had instrument exclusions. |
+
+Failures and exclusions can overlap. Both host download selections passed their
+rate assertions; upload failures remain open. An uncensored short-path,
+single-flow upload reached 827.834 Mb/s against a 939.868 Mb/s ceiling with
+default buffers, and 833.757 against 942.050 Mb/s with the larger TCP maximum.
+These results do not establish that host contention caused the regressions.
+
+The root regression's timestamp assertion was obsolete after the earlier
+window-mismatch fix: a capacity increase deliberately starts a new delivery
+measurement epoch. The original test sometimes hid that difference by reading
+the same host clock tick twice. It now uses distinct virtual times and checks
+missing, unchanged, decreasing, zero and increasing advertisements separately.
+
+A new controlled pacing-wakeup test demonstrates a separate loss mechanism.
+With one millisecond of dispatch delay, the existing pacer admits 99.9% of its
+configured service; with three milliseconds, it admits only 41.1%. A delay
+beyond two milliseconds discards elapsed pacing credit as though it were idle.
+Feeding that delay into the end-to-end model then lowers the measured service
+and compounds the loss: all four three-millisecond cells reach 17.367 Mb/s
+against a 993.657 Mb/s reference, with zero measured relay drops. The matrix
+crosses 0.3/100 ms RTT and one/eight flows. This proves the mechanism in a
+controlled model; attributing the host failures still requires matching evidence.
+
+### Working candidate: separate burst byte and duration limits
+
+The working-tree pacer now follows the requested pair of limits. For an
+estimate of **B bytes over T time**, the maximum bytes per burst is **B** and
+the maximum burst duration is **2 × T**. The named multiplier is
+`windowPacingBurstTimeScale`. The time multiplier does not enlarge the byte
+ceiling. A burst ends when either bound is reached; the duration is an upper
+bound, not a mandatory sleep.
+
+The current estimate uses the service rate and its sampling interval, normally
+10 ms. The estimated pair has a minimum of one whole physical message and its
+serialization duration. This permits an indivisible message while charging
+every byte against the burst limit. Exploration can refill faster than the
+measured service; once a service estimate exists, its byte ceiling still applies
+during the remaining startup probe. The original finite startup byte allowance
+is not replenished by idle time.
+
+Both limits and the serialization schedule are shared across sibling sequences.
+An additional byte meter checks actual release after a timer wakes: reservation
+limits alone allowed a 15 ms dispatch delay to combine two 10 kB reservations
+into one 20 kB release. Estimate updates refill earlier elapsed time at the old
+rate, never rewind the refill clock, and retain already spent credit. A waiting
+large retransmission keeps the one-message minimum alive even though a retry
+does not add first-delivery flight. Queue detection now uses propagation plus
+the actual burst allowance; the allowance already includes packet quantization.
+
+The controlled three-millisecond wake now admits 99.7% of the configured rate
+instead of 41.1%. All eight delayed-wakeup performance cells passed the first
+byte-meter candidate. That checkpoint also passed 126 focused correctness tests
+under the race detector and all six short-path host upload comparisons, with
+no instrument exclusions: candidate rates were 888.58–939.54 Mb/s. These runs
+built source `38dca2f68b2050ac1a5807599980157e1661842c6497d936896d456bfb3b01d5`.
+They precede the subsequent full-message and flight-bound refinements.
+
+That checkpoint's completed root regression has 2,971 passes and 24 skips,
+with no failures. Its full model has 16 top-level passes and one failed
+compression-ablation control: the control's measured RTT had absorbed the
+receiver's compression delay, so its omitted term no longer isolated the
+original defect. The corrected paired fixture uses the known physical FIFO
+RTT in both arms and checks that only the window's explicit compression term
+differs. The receiver's real compression still informs service pacing in
+both arms. Under the race detector, the isolated control reaches 202.8 Mb/s
+and the corrected arm 958.3 Mb/s. The normal performance matrix continues to
+measure RTT from actual feedback.
+
+**Full acceptance remains open.** An intermediate whole-message and flight-bound
+candidate kept the service-rate matrix, capacity changes, large messages,
+delayed wakes and live window changes passing, but exposed two regressions:
+
+- A continuously busy 100 Mb/s path changing from 0.3 to 100 ms RTT can retain
+  its 0.514 ms service baseline because no complete tail drain occurs. The
+  intermediate candidate reached 3.809 Mb/s against 95.805 Mb/s. The trace
+  confirms that the opportunistic RTT probe never ran; a controlled baseline
+  refresh must also cover continuously occupied flight.
+- On the 1 Mb/s shared service, aggregate throughput can remain near capacity
+  while one flow makes no measured progress. The trace also shows estimates
+  switching between 125 kB/s and 250 kB/s while the physical service remains
+  125 kB/s. Separate deterministic tests below reproduce release overtaking
+  and sparse compressed heads doubling the measured rate. A finite shared
+  burst must preserve reservation order.
+
+Those failing runs are retained. The full model, root regression and host jobs
+for the earlier checkpoint are still useful regression evidence, but they do
+not validate the newer refinements. All-cell performance acceptance and the
+working-tree commit remain open.
+
+The corrected estimator resets its rolling ring for each newer burst,
+carrying the preceding burst's mean as the zero-order hold. Independent tests
+cover replacement by completed buckets, partial buckets, a measured zero,
+late older burst IDs and reordered observations within the current burst.
+The last case failed before preserving retained current-burst observations
+without rewinding the arrival clock.
+
+The ring is now integrated into the working candidate. Its recent residence
+can request a bounded pause to let outstanding sibling tails drain. The ring
+mean does not raise the propagation floor: only cumulative delivery of every
+tail, followed by a successful H1 write and its unambiguous ACK, can do that.
+This obtains fresh evidence even when an active producer never becomes idle.
+The pause has a deadline and a cooldown; loss or cancellation cannot strand
+the producer. The shared release meter now serves reservations in FIFO order.
+
+The final focused run passed all four RTT-change pairs and all three
+shared-service pairs after the admission-handoff and byte-debt corrections.
+The previously failing 100 Mb/s RTT increase reached
+95.805 Mb/s against 95.805 Mb/s; the 1 Mb/s shared service reached 0.963 Mb/s
+with a minimum flow rate of 0.118 Mb/s and zero measured drops. All 80 focused
+pacing and statistics tests passed under the race detector. Broader validation
+uses the canonical runner source hash and records host load; focused passes
+alone do not establish all-cell acceptance.
+
+### Burst-ring broad checkpoint
+
+The full model and both host TCP configurations built stable source SHA-256
+`2b40106a41c1b5fa93dd13ed5c3092dddc0e7510f4a36a233e180ceafdc6abf0`,
+before the subsequent ring-reset ordering correction. The simultaneous runs
+recorded the active host workload rather than waiting for idle.
+
+| Selection | Outcome |
+|---|---|
+| Focused correctness, race detector | 145 passes; the exact send-item size assertion failed until the additional eight-byte burst identity was explicitly accounted for. The later reset-corrected checkpoint passes all 147 tests. |
+| Full deterministic model | 17 top-level passes, one failure; 486 ledger rows. Window mismatch, large messages, capacity changes, shared relay and RTT changes passed. |
+| Full root regression, non-race | 2,988 passes, three failures and 24 skips. Failures: send-item size accounting, the historical relay-storm control and a WebRTC budget-admission assertion. |
+| TCP, default buffers | 24 comparisons, two failures and seven exclusions. |
+| TCP, 48 MiB maximum | 24 comparisons, two failures and two exclusions. |
+| Server deterministic tiers | Initial builds detected concurrent server-source changes; immediate retries stopped at PostgreSQL preflight. No valid new server result. |
+
+The model's failing cell is 100 Mb/s service, 400 ms RTT, eight flows and 50 ms
+ACK compression: 66.847 Mb/s against a 95.826 Mb/s reference, with no measured
+drops. The isolated current-source replay also fails at 66.806/95.846 Mb/s.
+Its trace identifies a known idle gap after a controlled drain being interpreted
+as a new service rate: one 2,671-byte probe ACK over 400 ms becomes 6,673 B/s,
+scheduling another roughly 400 ms wait despite a busy physical pipeline.
+The correction holds the preceding established service until fresh post-probe
+checkpoints can measure a rate. It captures that rate before exposing the probe
+so an ACK arriving before write confirmation cannot replace the hold with the
+idle-derived rate. Missing or ambiguous probes retain the existing sampling
+epoch. The isolated cell now passes at 95.846/95.826 Mb/s with zero measured
+drops; final broad confirmation remains required.
+
+Both host configurations have an uncensored short-path, single-flow download
+failure: 682.808/940.206 Mb/s with default buffers and 813.778/942.388 Mb/s with
+the larger maximum. The default run also has a long-path single-flow download
+below the rate gate with a capped reference. The larger-buffer run's other
+failure is a stalled flow in the upload reference; its candidate reached
+939.200 Mb/s against 929.527 Mb/s. Failures and exclusions can overlap, and an
+invalid reference is not evidence that the candidate is slow. All 168 ledger
+rows from each host run remain in the archive.
+
+### Deterministic tests for the new failure cases
+
+| Failure | Regression test and forced stimulus |
+|---|---|
+| Compressed sparse heads doubled 125 kB/s to 250 kB/s | `TestWindowPacingBackloggedSparseHeadsKeepTheirTime` replays exact byte/time pairs in both application orders. |
+| A newer writer overtook an older reservation | `TestWindowPacingWaitingWritersKeepReservationOrder` blocks the older writer's timer dispatch at a channel barrier before starting its successor. |
+| Continuously occupied flight retained a 1 ms RTT floor after a 100 ms change | `TestWindowPacingContinuousFlightRefreshesChangedRoundTrip` supplies explicit virtual-time feedback and cumulative tail delivery. |
+| An ACK credited 2,000 bytes when only 1,000 had been written | `TestWindowPacingAdmissionCannotCreditAnUnbegunWrite` holds the real `SendSequence.writeMaybeWrappedBytes` at a channel barrier and injects the ACK through `coalesceReceivedAck`. |
+| Resetting a burst ring discarded valid reordered samples | `TestWindowPacingBurstStatsAcceptRetainedCurrentBurst` supplies the same burst's samples out of order and checks the next burst's held mean. |
+| A later burst's reset timestamp rejected an earlier arrival from that same burst | `TestWindowPacingBurstStatsAcceptRetainedAfterReset` applies burst two's 12 ms sample before its 11 ms or 9 ms sample, then checks retained buckets and the next burst's held mean. |
+| Late timer dispatch split one physical burst across old reservation epochs | `TestWindowPacingBurstEpochFollowsActualDispatch` delays the timer by 30 ms, then checks a single 800-byte release and subsequent expiry. |
+| A smaller estimate forgot bytes already emitted at a delayed wake | `TestWindowPacingChangedEstimateRetainsActualBurstCharge` changes the estimate after 40 bytes have been emitted and checks that one extra byte cannot escape the remaining allowance. |
+| A nominal deadline forgave a late release before its bytes had serialized | `TestWindowPacingDecreasedEstimateCannotForgiveALateRelease` releases 8,000 bytes late, reduces the estimate and requires the original eight milliseconds of service before the next release. |
+| A confirmed drain's idle gap replaced established service with one probe's apparent rate | `TestWindowPacingDrainedProbeHoldsServiceUntilFreshEvidence` forces the old checkpoint to expire, checks direct and covering ACKs, then verifies that fresh slower service replaces the hold. |
+| Probe ACK processing outran confirmation of the physical write | `TestWindowPacingProbeAckBeforeWriteConfirmationHoldsService` observes and queries the ACK before confirming H1; unsuccessful confirmation retains the original sampling epoch. |
+
+Each case has a recorded failure-before run. The byte meter preserves actual
+spent bytes separately from credit withheld by an estimate increase. It also
+retains each release's original serialization cost, including writes split
+across the startup-probe boundary. Those timing checks pass alongside the new
+estimate-change tests; neither a new nominal burst nor a reduced rate may erase
+bytes released late.
+Adjacent tests cover canceled and reused FIFO waiters, missing/selective or
+changed-carrier tail replies, bounded drain deadlines, older burst IDs,
+partial buckets and replacement of the held value. All of these belong to
+the ordinary focused correctness selection, not an opt-in trace.
+
+The post-reset case was found during the adjacent review: the first reordering
+test had exercised only burst one, before a reset timestamp existed. Burst
+identity now admits retained samples from the verified current burst while
+ordinary timestamp-based ring callers still reject earlier-epoch data. The
+exact `sendItem` size guard also accounts for the new eight-byte burst identity:
+584 bytes total, with no change to the pool's item-count limit.
+
+The broad root suite also exposed drift in a historical relay-storm control:
+`reliableAdmissionUnbounded` disabled the old admission rule but still inherited
+the new delivery-sizing policy and H1 pacing. Its expected unpaced storm no
+longer followed from the settings. `TestRelayInflationUsesConstantSendWindow`
+now checks both endpoints of all three historical arms under a forced delivery
+default, and failed on all six before the fixture was corrected. Those arms
+explicitly select the constant policy; ordinary mixed-lane fixtures retain the
+shipping default. The existing storm gate remains at least 500 timeout resends
+and passed three loaded runs with 1,455, 1,545 and 1,438. This repairs the
+control's precondition; production pacing is unchanged.
+
+The WebRTC admission failure was another uncontrolled test ordering.
+Prioritizing the waiting network peer intentionally reclaims the first peer's
+dedicated reservation; admission is valid if teardown already released it.
+`TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget` now holds physical teardown
+at its lifecycle mutex, checks refusal at the exact full budget, then releases
+teardown and checks notification plus successful admission. It covers active
+and passive setup without relying on a short negative timeout. Forcing the
+released-before-admission ordering reproduced the old assertion three times;
+the corrected test and five adjacent cases pass 20 repetitions under `-race`.
+
+Four more performance pairs cross 16/64 KiB messages with 1↔10 Mb/s capacity
+changes, 100 ms RTT, 10 ms compression and eight flows. Their first run passed:
+the minimum candidate/reference ratio was 96.9%, every flow progressed and
+there were no measured drops. Each slow interval covers at least 64 payloads
+to avoid calling packet-sized serialization a stalled flow. These pairs now
+run in the regular model selection alongside the 32 steady large-message
+pairs and the small-frame capacity-change controls.
+
+## Original deterministic coverage
 
 | Area | Coverage and outcome |
 |---|---|
 | ACK coalescing | Head/SACK ordering, absorption, overflow, pacing, maximum serialized size, eviction notices and final drain; pass. |
-| Window arithmetic and ownership | 89 top-level tests under `go test -race`; pass. |
+| Window arithmetic and ownership | 90 top-level tests under `go test -race`; pass. |
 | RTT/flow/compression model | 36 cells; minimum candidate/reference ratio about 99.9%; pass. |
 | Service pacing | 54 service-rate cells, six rate changes and three shared-service cells; every cell passed the 90% acceptance threshold (the minimum paired delivery/ceiling ratio was 97.9%); zero measured relay drops. |
 | Window mismatch | 108 ordered sender/receiver pairs (256 KiB, 2 MiB and 48 MiB), crossed with 0.3/100/400 ms, 0/10 ms compression and one/eight flows; minimum ratio about 99.3%; pass. |
@@ -65,16 +475,34 @@ Both host runs used the loopback kernel socket origin, provider NAT, Transfer,
 gVisor TUN and H1, with three repetitions, three seconds of measured time after a
 two-second warmup, 0.3/100 ms RTT, one/eight flows and 10 ms ACK compression.
 They were started immediately while other host work was running; this context
-is retained in the manifests.
+was recorded during execution. The original manifests contain no host-load
+samples. The updated runner records load averages at the start and finish,
+build flags, and an explicit run-context note for new runs.
 
-The ordinary run reached roughly 938–942 Mb/s on 0.3 ms paths. At 100 ms, the
-default gVisor buffer capped single-flow arms near 148–166 Mb/s; the eight-flow
-delivery arms reached about 942 Mb/s while the matched 2 MiB reference remained
-near 148 Mb/s. The 48 MiB control removed that single-flow cap (about 936–942
-Mb/s in delivery arms), while its 100 ms eight-flow upload varied from about
-744–849 Mb/s under the active host load. No measured relay drops, NAT refusals
-or receive evictions occurred. These finite samples verify regressions and
-fixture behavior; they do not replace a native TUN or WAN campaign.
+The complete candidate ranges below come from the final-source ledgers, over
+three repetitions per cell. All rates are application payload Mb/s.
+
+| Direction | RTT, ms | Flows | Default TCP buffers | 48 MiB TCP maximum |
+|---|---:|---:|---:|---:|
+| Download | 0.3 | 1 | 924–940 | 669–923 |
+| Download | 0.3 | 8 | 907–942 | 291–628 |
+| Upload | 0.3 | 1 | 929–942 | 940–943 |
+| Upload | 0.3 | 8 | 794–941 | 910–928 |
+| Download | 100 | 1 | 161–164 | 797–933 |
+| Download | 100 | 8 | 863–938 | 942–942 |
+| Upload | 100 | 1 | 90–181 | 942–943 |
+| Upload | 100 | 8 | 448–747 | 750–805 |
+
+The default run has eight censored comparisons out of 24; the 48 MiB control
+has ten out of 24. Censoring limits causal interpretation, not the visibility
+of slow outcomes. In particular, a default 100 ms single-flow upload decayed
+from 167 to 96 to 7.7 Mb/s across its three measured seconds. Its final service
+estimate was about 294 kB/s. That deserves a controlled investigation of
+service sampling and pacing; host contention alone has not been proven causal.
+
+No measured relay drops, NAT refusals or receive evictions occurred. These
+finite samples do not replace a native TUN or WAN campaign, and a favorable
+rerun cannot erase their rate regressions.
 
 ## Server regression review
 
@@ -105,6 +533,7 @@ environment, complete logs, status and JSONL ledgers:
 ```sh
 tools/throughput-fix-2.sh correctness /tmp/window-correctness
 tools/throughput-fix-2.sh model /tmp/window-model
+tools/throughput-fix-2.sh regression /tmp/window-regression
 tools/throughput-fix-2.sh tcp /tmp/window-tcp
 CONNECT_WINDOW_TCP_BUFFER_MAX_MIB=48 tools/throughput-fix-2.sh tcp /tmp/window-tcp-48mib
 tools/throughput-fix-2.sh ack /tmp/window-ack
@@ -136,3 +565,6 @@ ledger is in [THROUGHPUT-PR2-RESULTS.md](THROUGHPUT-PR2-RESULTS.md).
    repeat that campaign with an equivalent published harness.
 3. Run longer actual-relay pressure, shard-collision, bidirectional and
    multiple-peer campaigns before making a deployment-wide pacing claim.
+4. Resolve the slow host cells against the new explicit comparison gate,
+   including the declining single-flow upload. Keep instrumentation limits,
+   shared host load and candidate performance effects independently testable.

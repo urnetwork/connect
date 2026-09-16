@@ -1,0 +1,8 @@
+{
+  "source_log": "run.log",
+  "source_log_sha256": "927415eeb5858ea336733bb23da892d95daaf500792a0f898966087d9f5cc090",
+  "note": "Before the adjacent review: immediate-ACK mismatch cells failed; retained as failed validation. Editing the shell runner during the first invocation caused a repeat; this is the complete retained repeat.",
+  "rows": 390,
+  "final": false,
+  "outcome": "failed"
+}

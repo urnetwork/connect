@@ -1,0 +1,5 @@
+--- FAIL: TestWindowPacingRetainsServiceUntilFeedbackCanReturn (0.00s)
+    transfer_window_pacing_test.go:583: service forgotten before feedback could return: 10000000 B/s
+FAIL
+FAIL	github.com/urnetwork/connect	0.765s
+FAIL

@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-service-queued-average-model.log",
+  "source_log_sha256": "f1e70240e03e643eee9e92c4ffba2878118177a5feb66309556fad6bf20cdd2b",
+  "note": "Sustained queue mean reduced but did not eliminate steady loss.",
+  "rows": 126,
+  "final": false,
+  "outcome": "failed"
+}

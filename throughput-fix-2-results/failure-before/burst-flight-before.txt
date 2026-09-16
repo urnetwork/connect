@@ -1,0 +1,6 @@
+=== RUN   TestWindowPacingFlightIncludesEstimatedBurstBytes
+    transfer_window_pacing_flight_test.go:21: a six kB burst plus 110 kB of propagation was called a standing queue
+--- FAIL: TestWindowPacingFlightIncludesEstimatedBurstBytes (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.735s

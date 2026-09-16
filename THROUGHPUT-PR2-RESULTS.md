@@ -4,9 +4,12 @@ Branch: `throughput-fix-2`, source revision `b51530f3a402cb1dd5fe5d1daae344302a1
 Date: 2026-09-15. The delivery-sized window remains enabled.
 
 Final evidence is summarized in [THROUGHPUT-REPORT-PR2.md](THROUGHPUT-REPORT-PR2.md).
-The deterministic and host-local runs completed; configured server integration
-is deferred because the running PostgreSQL credentials do not match the
-checked-in `server/test-env.sh` fallback.
+The deterministic and host-local runs completed. The completion audit found
+that host process success checked only nonzero progress and did not reject
+slow candidates. Host performance acceptance remains open under the corrected
+comparison gate; see the final report for all final-source rate ranges.
+Configured server integration is deferred because the running PostgreSQL
+credentials do not match the checked-in `server/test-env.sh` fallback.
 
 The independent tests confirm several mechanisms that the published report
 could not separate: missing ACK residence in the window calculation, loss
@@ -18,6 +21,42 @@ failure to a particular one of these mechanisms.
 
 The [peer review and research plan](THROUGHPUTFIX-PR2.md) preserves the source
 review, hypotheses, evidence limits and server follow-up work.
+
+### Burst follow-up checkpoint
+
+The committed follow-up's final correctness run passes 152 tests under `-race`
+on source SHA-256
+`b5b407364a99cbb0a022b5de897fc5eb8bade0593541ddd2e0b658636c692207`.
+Its full model, root regression and both host TCP configurations are running
+at commit time. The later report sections distinguish those pending results
+from the earlier checkpoints below; host acceptance remains open.
+
+The results below describe the original committed implementation. A later
+working-tree checkpoint, source SHA-256
+`38dca2f68b2050ac1a5807599980157e1661842c6497d936896d456bfb3b01d5`, completed:
+
+| Selection | Outcome |
+|---|---|
+| Focused correctness, race detector | 126 passes. |
+| Root regression, non-race | 2,971 passes, 24 skips, no failures. |
+| Deterministic performance model | 16 top-level passes, one failed compression-ablation control. |
+| Short-path host TCP uploads | Six comparisons passed; no exclusions. |
+
+These runs started under concurrent host work and are archived in
+`throughput-fix-2-results/{correctness-burst,regression-burst,model-burst,tcp-short-burst}`.
+They precede newer byte/flight refinements and do not validate those changes.
+The ablation now pins both arms to the known FIFO propagation time so that
+compression observed in service RTT cannot restore the omitted window term.
+The corrected focused comparison passes at 202.8 versus 958.3 model Mb/s.
+The subsequent burst-ring candidate fixes the continuous-flight RTT and slow
+shared-service reproductions. After an adjacent correction for reordered
+samples following a ring reset, source SHA-256
+`fab6a0ab0f065bf4dd6a04d71976cdb5e4d5a4475508ebfa97601f06533a3d82`
+passes all 147 tests in the full race-enabled correctness selection, including
+81 pacing/statistics tests. Focused models pass all four RTT-change pairs,
+all three shared-service pairs and four large-message capacity-change pairs. Broader
+validation and retained failure-before evidence are tracked in
+[the report](THROUGHPUT-REPORT-PR2.md#deterministic-tests-for-the-new-failure-cases).
 
 ## Changes and failure-before evidence
 
@@ -209,10 +248,10 @@ send item, bringing the tested size to **576 bytes**. ACK arrival timestamps
 remain local state and do not change the wire protocol.
 
 The focused correctness selection, including these adjacent cases, passed
-under the race detector (**89 top-level tests**). The final model selection
+under the race detector (**90 top-level tests**). The final model selection
 passed **213 paired cells** (**390 ledger rows**), including all **108 mismatch
 cells** and **six live receiver-capacity changes**. The lowest model
-candidate/reference ratio was **98.8%**; measured relay drops and receive
+candidate/reference ratio was **97.9%**; measured relay drops and receive
 evictions were zero. Two earlier host-sensitive regression failures
 (experimental lane recovery and a short-path throughput comparison) passed
 when isolated; their failed full-sweep readings remain in the evidence.
@@ -231,7 +270,9 @@ This changes the steady-state measurement boundary; it does not erase the
 startup difference or justify a claim about first-byte/finite-transfer latency.
 
 The unbudgeted default gVisor buffer range used here limits the 100 ms **single-flow** TCP cell to
-roughly 166 Mb/s in both delivery and ceiling arms. That is reported as an
+roughly 161–185 Mb/s in healthy delivery and ceiling arms. A final candidate
+upload also fell to 90.5 Mb/s and is retained as a regression to investigate,
+not explained away by that limit. The ceiling is reported as an
 instrument-capacity limit, with the window rule's effect unresolved above it.
 Larger TCP buffers are a separately labeled capacity control.
 The optional `CONNECT_WINDOW_TCP_BUFFER_MAX_MIB` control records an explicit
@@ -275,7 +316,9 @@ authentication because the checked-in fallback credential does not match the
 already-running container. The H1/H3 variants, pool-balance test and
 directional TCP test are deferred for a later environment-correct run.
 
-All three 64 MiB directional TCP trials are retained here, including startup:
+All three earlier 64 MiB directional TCP trials are retained here, including
+startup. Their source and environment differ from final validation; they are
+historical evidence and do not replace the deferred integration run:
 
 | Direction | Trial 1 | Trial 2 | Trial 3 |
 |---|---:|---:|---:|
@@ -335,8 +378,9 @@ The script writes a test-binary SHA-256, source SHA-256, revisions, Go/OS/CPU
 manifest, explicit experiment environment, complete run log, exit status and
 JSONL ledger. It records only experiment-related environment variables.
 Source hashes are checked again after compilation to reject a mixed-source run.
-The final host runs were started immediately under the existing host workload;
-their manifests retain the process context. They are useful regression
+The final host runs were started immediately under the existing host workload.
+The original manifests did not sample host load. New runs record start/end
+load averages, explicit run context and build flags. These are regression
 readings with contention noted, not isolated capacity claims.
 The Go toolchain changed externally from 1.26.3 to **1.26.7** during this work;
 the confirmation manifests pin 1.26.7 on Darwin/arm64.
@@ -352,3 +396,20 @@ control; its default value of zero retains the ordinary TUN settings.
 Full carrier/SDK/native-TUN confirmation, longer reliability runs, multiple
 peers, bidirectional saturation and actual resident queue competition remain
 the broader campaign described in the research plan.
+
+## Completion audit: host performance gate
+
+The original host sweep failed only zero-progress cells. It logged throughput
+ratios without asserting them, allowing a 291 Mb/s candidate beside a 937 Mb/s
+ceiling to finish with a process pass. Ten final-source comparisons fell below
+90% of their measured ceilings; four had no recorded instrument exclusion.
+`transfer_window_performance_comparison_test.go` now covers calibrated slow
+candidates, a capped fixture, drifting controls, independent matched controls,
+loss/stalls, the exact ten-percent margin and missing controls. Five tests
+fail with the original comparison function restored; all seven pass under
+the race detector after the gate fix. The host runner fails recorded rate or
+delivery regressions while retaining their censor reasons and all raw rows.
+
+The full root regression run was **non-race**, with 2,936 top-level passes and
+24 explicit skips. The focused correctness and server/connect selections used
+the race detector. The earlier claim of a full race regression was incorrect.

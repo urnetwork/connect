@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-service-short-train-model.log",
+  "source_log_sha256": "5c50f4460cc7cacfccaa4784c2fc19a8ef4be2b7c4d5a48c249d4dadf70f1936",
+  "note": "First-endpoint fix alone did not repair long-RTT compressed pacing.",
+  "rows": 18,
+  "final": false,
+  "outcome": "failed"
+}

@@ -218,6 +218,9 @@ type mixedLaneOptions struct {
 	// reliableAdmissionUnbounded turns off FLIGHTGATEFIX §22's delivery
 	// bound, which is the arm the reproduction measured before it existed.
 	reliableAdmissionUnbounded bool
+	// Historical queue-depth controls need a constant send window and no H1
+	// service pacing, independently of the process's shipping default.
+	constantSendWindow bool
 	// resendBudget overrides ResendQueueMaxByteCount; zero keeps the default.
 	resendBudget ByteCount
 	// deferredItemIsLateForTheScoreboard turns on FLIGHTGATEFIX §23.2's
@@ -321,6 +324,10 @@ func newMixedLaneHarnessWithOptions(
 	ctx, cancel := context.WithCancel(context.Background())
 	newSettings := func() *ClientSettings {
 		settings := DefaultClientSettings()
+		if options.constantSendWindow {
+			settings.SendBufferSettings.WindowSizing = WindowSizingConstant
+			settings.SendBufferSettings.ApplyWindowSizing()
+		}
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.SendBufferSettings.AckTimeout = 120 * time.Second
 		settings.SendBufferSettings.IdleTimeout = 120 * time.Second

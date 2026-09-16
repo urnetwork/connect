@@ -1,0 +1,10 @@
+{
+  "source_sha256_at_recording": "f9915589ae4ae01185bef3073f1c3df2453a5b73e295f5c3cd56ae58f8877132",
+  "owned_file_sha256": {
+    "transport_p2p_webrtc_test.go": "e499dc3ec99af156ff73609b19801d781076b408aa3000d9fa5cc86049481907"
+  },
+  "failed_before_repetitions": 3,
+  "restored_race_repetitions": 20,
+  "restored_top_level_passed": 120,
+  "outcome": "test fixture ordering restored"
+}

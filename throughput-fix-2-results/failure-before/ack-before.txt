@@ -1,0 +1,12 @@
+--- FAIL: TestGapWakeRepairsTheFirstCumulativeHead (0.00s)
+    transfer_receive_ack_progress_test.go:30: repair of initial Pack zero waited for compression because no prior head existed
+--- FAIL: TestGapWakeDoesNotReproveTheSameHeadEverySnapshot (0.00s)
+    transfer_receive_ack_progress_test.go:45: group 1 reproved unchanged missing head: wake=true
+--- FAIL: TestGapWakeCountsEvidenceAcrossSnapshots (0.00s)
+    transfer_receive_ack_progress_test.go:63: evidence at sequence 4: wake=false
+--- FAIL: TestGapWakeWorkerCompressesRepeatedProof (0.00s)
+    transfer_receive_ack_progress_test.go:105: same missing head bypassed compression again: 3 acknowledgements
+    transfer_receive_ack_gap_test.go:46: join gap ack test client: wait for client key publishers: context deadline exceeded
+FAIL
+FAIL	github.com/urnetwork/connect	0.870s
+FAIL

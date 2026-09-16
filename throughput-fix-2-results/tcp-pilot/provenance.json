@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-tcp-matrix.log",
+  "source_log_sha256": "ee8c77b391bfa3505d4efac3015536c1795cbc6a27694baf56a044a782cd1e19",
+  "note": "Before pure-ACK TUN handoff fix and batch-preserving NAT fixture. Includes upload stalls.",
+  "rows": 112,
+  "final": false,
+  "outcome": "failed"
+}

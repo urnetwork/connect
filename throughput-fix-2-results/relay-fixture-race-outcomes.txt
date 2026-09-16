@@ -1,0 +1,62 @@
+=== RUN   TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery
+--- PASS: TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery (0.01s)
+=== RUN   TestMixedLaneReliableEndpointLossIsAttributedToSlowLane
+--- PASS: TestMixedLaneReliableEndpointLossIsAttributedToSlowLane (0.00s)
+=== RUN   TestRelayInflationUsesConstantSendWindow
+--- PASS: TestRelayInflationUsesConstantSendWindow (0.01s)
+=== RUN   TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery
+--- PASS: TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery (0.00s)
+=== RUN   TestMixedLaneReliableEndpointLossIsAttributedToSlowLane
+--- PASS: TestMixedLaneReliableEndpointLossIsAttributedToSlowLane (0.00s)
+=== RUN   TestRelayInflationUsesConstantSendWindow
+--- PASS: TestRelayInflationUsesConstantSendWindow (0.01s)
+=== RUN   TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery
+--- PASS: TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery (0.00s)
+=== RUN   TestMixedLaneReliableEndpointLossIsAttributedToSlowLane
+--- PASS: TestMixedLaneReliableEndpointLossIsAttributedToSlowLane (0.00s)
+=== RUN   TestRelayInflationUsesConstantSendWindow
+--- PASS: TestRelayInflationUsesConstantSendWindow (0.01s)
+=== RUN   TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery
+--- PASS: TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery (0.00s)
+=== RUN   TestMixedLaneReliableEndpointLossIsAttributedToSlowLane
+--- PASS: TestMixedLaneReliableEndpointLossIsAttributedToSlowLane (0.00s)
+=== RUN   TestRelayInflationUsesConstantSendWindow
+--- PASS: TestRelayInflationUsesConstantSendWindow (0.01s)
+=== RUN   TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery
+--- PASS: TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery (0.01s)
+=== RUN   TestMixedLaneReliableEndpointLossIsAttributedToSlowLane
+--- PASS: TestMixedLaneReliableEndpointLossIsAttributedToSlowLane (0.00s)
+=== RUN   TestRelayInflationUsesConstantSendWindow
+--- PASS: TestRelayInflationUsesConstantSendWindow (0.01s)
+=== RUN   TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery
+--- PASS: TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery (0.00s)
+=== RUN   TestMixedLaneReliableEndpointLossIsAttributedToSlowLane
+--- PASS: TestMixedLaneReliableEndpointLossIsAttributedToSlowLane (0.00s)
+=== RUN   TestRelayInflationUsesConstantSendWindow
+--- PASS: TestRelayInflationUsesConstantSendWindow (0.01s)
+=== RUN   TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery
+--- PASS: TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery (0.00s)
+=== RUN   TestMixedLaneReliableEndpointLossIsAttributedToSlowLane
+--- PASS: TestMixedLaneReliableEndpointLossIsAttributedToSlowLane (0.01s)
+=== RUN   TestRelayInflationUsesConstantSendWindow
+--- PASS: TestRelayInflationUsesConstantSendWindow (0.01s)
+=== RUN   TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery
+--- PASS: TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery (0.00s)
+=== RUN   TestMixedLaneReliableEndpointLossIsAttributedToSlowLane
+--- PASS: TestMixedLaneReliableEndpointLossIsAttributedToSlowLane (0.00s)
+=== RUN   TestRelayInflationUsesConstantSendWindow
+--- PASS: TestRelayInflationUsesConstantSendWindow (0.01s)
+=== RUN   TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery
+--- PASS: TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery (0.01s)
+=== RUN   TestMixedLaneReliableEndpointLossIsAttributedToSlowLane
+--- PASS: TestMixedLaneReliableEndpointLossIsAttributedToSlowLane (0.00s)
+=== RUN   TestRelayInflationUsesConstantSendWindow
+--- PASS: TestRelayInflationUsesConstantSendWindow (0.01s)
+=== RUN   TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery
+--- PASS: TestMixedLaneReliableForwarderKeepsBlockedHeadAheadOfLaterDelivery (0.00s)
+=== RUN   TestMixedLaneReliableEndpointLossIsAttributedToSlowLane
+--- PASS: TestMixedLaneReliableEndpointLossIsAttributedToSlowLane (0.01s)
+=== RUN   TestRelayInflationUsesConstantSendWindow
+--- PASS: TestRelayInflationUsesConstantSendWindow (0.01s)
+PASS
+ok  	github.com/urnetwork/connect	2.060s

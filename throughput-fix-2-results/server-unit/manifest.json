@@ -1,0 +1,29 @@
+{
+  "created_utc": "2026-09-15T18:08:53.743069+00:00",
+  "mode": "server",
+  "test_pattern": "^(TestSendPooledReceive.*|TestReliableExchangeQueueSaturation.*|TestExchangeGenerationRetires.*|TestResidentTransportReceiveAdmission.*|TestProductionSocketReaders.*|TestResidentForwardCallback.*|TestResidentForwardIngress.*|TestResidentCloseAndWaitDrainsLateCallbackOwners|TestResidentCloseJoins.*|TestResidentNetworkPeerSendFailure.*|TestResidentControlCallback.*|TestResidentClientCallbacks.*|TestConnectH1(ReadyDrain|UserReadyBatch|WriteBatchForConn|WorkersJoin|BatchResponseWriter).*|TestConnectH3(InitialDatagram|TransferCarrier).*|TestResidentAdmitsMinimumMessageLenLimit|TestExchangeHeaderUnreliableTransferGobCompatibility|TestResidentTransportConstructorCarriesTransferProperties|TestExchangeOutboundBatchFormation)$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "8f30ab6a50664ad35ef685ccc2cfda65a540ddff",
+    "branch": "throughput-fix-2",
+    "source_sha256": "baad002e69fec8f93bd0f1dd6ac208470b0b097a6092aa5d68cc08bccd3d59df",
+    "dirty": true
+  },
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {},
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "server": {
+    "revision": "f156ad0086f9fd4fc0a5edfb9b110e5583f0665a",
+    "branch": "main",
+    "source_sha256": "905659e70194b60ca215adbf792582bcce48c1a15a464d6a728ffc69bc5aad0f",
+    "dirty": true
+  },
+  "binary_sha256": "a279bcc4852a98335b88624ed21a7d934b80062eb3d7e09e122425436f7030c4",
+  "sources_stable_during_build": true
+}

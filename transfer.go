@@ -4799,7 +4799,9 @@ func (self *Client) Flush() {
 type SendBufferSettings struct {
 	// Isolates path-RTT-only sizing in deterministic performance controls.
 	ackCompressionResidenceOverrideForTest *time.Duration
+	windowRoundTripOverrideForTest         *time.Duration
 	disableWindowPacingForTest             bool
+	afterWindowPacingWaitForTest           func()
 
 	CreateContractTimeout time.Duration
 	// CreateContractRetryInterval is the fast first retry interval.
@@ -5592,6 +5594,7 @@ func (self *SendBuffer) createSendSequence(id sendSequenceId, sendPack *SendPack
 		}
 		service.references++
 		sendSequence.windowPacer.service = service
+		sendSequence.windowPacer.serviceSequenceId = sendSequence.sequenceId
 	}
 	self.sendSequences[id] = sendSequence
 	self.wireSendSequences[wireId] = sendSequence
@@ -6295,10 +6298,9 @@ type SendSequence struct {
 	// the receiver's latest advertised hold (THROUGHPUTFIX §37.3)
 	receiveWindowByteCount atomic.Uint64
 	receiveWindowSet       atomic.Bool
-	// When the first advertisement arrived, which is when the window steps
-	// from the blind bet to the peer's capacity. The delivery cap is lagged
-	// against it: delivery measured before the step was measured at the
-	// smaller window and must not be allowed to drag the window back down
+	// The first advertisement or most recent capacity increase. The delivery
+	// cap is lagged against this step: delivery measured at the preceding
+	// smaller window must not be allowed to drag the larger window back down
 	// (THROUGHPUTFIX §37.21).
 	receiveWindowSetAtNanos atomic.Int64
 	// Encodes the latest advertised microseconds plus one, so immediate
@@ -6471,6 +6473,7 @@ func newSendSequenceWithLogicalLane(
 		flightController:               newSendFlightController(sendBufferSettings),
 		idleCondition:                  NewIdleCondition(),
 		rttWindow:                      rttWindow,
+		windowPacer:                    windowBurstPacer{afterWaitForTest: sendBufferSettings.afterWindowPacingWaitForTest},
 		contractSeqIndex:               0,
 	}
 	// Never encrypt control-plane traffic. A SendSequence's data source is
@@ -7143,6 +7146,13 @@ func (self *SendSequence) coalesceReceivedAck(
 		sequenceAck.missingContractId = ack.missingContractId
 		ackWindow.UpdateContractMissing(sequenceAck)
 		return
+	}
+	if service := self.windowPacer.service; service != nil {
+		at := time.Now()
+		if ack.receivedAtNanos != 0 {
+			at = time.Unix(0, ack.receivedAtNanos)
+		}
+		service.acknowledgeWrite(self.sequenceId, ack.messageId, sequenceNumber, ack.selective, self.ackCompressionResidence(), at)
 	}
 	ackWindow.Update(sequenceAck)
 	if self.sendBuffer != nil && self.sendBuffer.afterAckCoalescedForTest != nil {
@@ -10379,9 +10389,6 @@ func (self *SendSequence) observeReceiveWindowAdvertisement(ack receiveAckMessag
 // Receiver-owned delay is bounded independently of this sender's queue. Using
 // the raw mean RTT here would make a standing queue increase its own window.
 func (self *SendSequence) ackCompressionResidence() time.Duration {
-	if override := self.sendBufferSettings.ackCompressionResidenceOverrideForTest; override != nil {
-		return max(0, *override)
-	}
 	if encoded := self.receiveAckCompressMicros.Load(); encoded != 0 {
 		return time.Duration(encoded-1) * time.Microsecond
 	}
@@ -10829,8 +10836,17 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 		return estimate
 	}
 	estimate.RoundTrip = roundTrip.Min
+	if service := self.windowPacer.service; service != nil {
+		estimate.RoundTrip = max(estimate.RoundTrip, service.roundTrip())
+	}
+	if override := self.sendBufferSettings.windowRoundTripOverrideForTest; override != nil {
+		estimate.RoundTrip = max(0, *override)
+	}
 	estimate.AckCompressTimeout = self.ackCompressionResidence()
-	estimate.WindowRoundTrip = roundTrip.Min + estimate.AckCompressTimeout
+	if override := self.sendBufferSettings.ackCompressionResidenceOverrideForTest; override != nil {
+		estimate.AckCompressTimeout = max(0, *override)
+	}
+	estimate.WindowRoundTrip = estimate.RoundTrip + estimate.AckCompressTimeout
 	estimate.SampleCount = self.deliveredSampleCount()
 	service, serviceDelivered, latestService := self.deliveredServiceRate(max(2*estimate.WindowRoundTrip, 4*self.deliveredBytesSampleInterval()), now)
 	estimate.ServiceByteRate = service
@@ -11137,7 +11153,7 @@ func (self *SendSequence) receiveAckAt(
 	// the actual first write, and exclude ambiguous retransmitted copies.
 	if service := self.windowPacer.service; service != nil && item.pacingSentAtNanos != 0 &&
 		item.sendCount == 1 && !item.deliveryObserved && !item.unreliableCarrierObserved && !item.carrierChanged {
-		service.observeRoundTrip(deliveryTime.Sub(time.Unix(0, item.pacingSentAtNanos)), self.ackCompressionResidence(), deliveryTime)
+		service.observeBurstRoundTrip(item.pacingBurst, deliveryTime.Sub(time.Unix(0, item.pacingSentAtNanos)), self.ackCompressionResidence(), deliveryTime)
 	}
 
 	if selective {
@@ -11371,6 +11387,11 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 ) (transferWriteDisposition, error) {
 	writer := self.openContractMultiRouteWriter()
 	policy := self.transferFlightPolicy()
+	if service := self.windowPacer.service; service != nil && item != nil &&
+		(resend || item.pacingByteCount > 0 || item.deliveryObserved) {
+		service.invalidateProbe(self.sequenceId)
+	}
+	paced := false
 	paceWrite := func(byteCount int) error {
 		if item != nil && item.expectsAck && policy.h1Only &&
 			self.sendBufferSettings.DeliverySizedWindowScale > 0 &&
@@ -11379,6 +11400,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			if self.windowPacer.rateUpdated.IsZero() || now.Sub(self.windowPacer.rateUpdated) >= defaultAckCompressTimeout {
 				estimate := self.sendWindowEstimate(now)
 				self.windowPacer.rate = estimate.PacingByteRate
+				self.windowPacer.estimateRate = estimate.ServiceByteRate
 				self.windowPacer.probeRate = estimate.PacingProbeByteRate
 				self.windowPacer.probeLimit = estimate.PacingProbeByteCount
 				self.windowPacer.rateUpdated = now
@@ -11388,15 +11410,22 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 				if !alreadyCounted {
 					item.pacingByteCount = ByteCount(byteCount)
 				}
-				if err := self.windowPacer.waitForServiceWrite(self.ctx, byteCount, alreadyCounted); err != nil {
+				if err := self.windowPacer.waitForServiceMessage(self.ctx, byteCount, alreadyCounted, self.sequenceId, item.messageId, item.sequenceNumber); err != nil {
 					return err
 				}
 				if !alreadyCounted {
-					item.pacingSentAtNanos = time.Now().UnixNano()
+					item.pacingSentAtNanos = self.windowPacer.waiter.sentAt.UnixNano()
+					item.pacingBurst = self.windowPacer.waiter.burst
 				}
+				paced = true
 			}
 		}
 		return nil
+	}
+	finishPacedWrite := func(disposition transferWriteDisposition, err error) {
+		if paced {
+			self.windowPacer.service.finishWrite(self.sequenceId, item.messageId, err == nil && disposition.transportType == TransportTypeH1)
+		}
 	}
 	// A full unreliable flight must not stall this sequence while a reliable
 	// carrier is active: route the overflow reliable-only so it is neither
@@ -11454,6 +11483,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			self.writeTimeoutForPack(resend),
 			reliableOnly,
 		)
+		finishPacedWrite(disposition, err)
 		if err != nil {
 			// on failure (abort/timeout) no route consumer took the message, so
 			// ownership stays here: undo the consumer's share or the buffer can
@@ -11498,6 +11528,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		self.writeTimeoutForPack(resend),
 		reliableOnly,
 	)
+	finishPacedWrite(disposition, err)
 	if err != nil {
 		// see the plaintext branch: a failed write leaves ownership here
 		MessagePoolReturn(shared)
@@ -11810,6 +11841,7 @@ type sendItem struct {
 	// credited exactly once on delivery and released on sequence shutdown.
 	pacingByteCount   ByteCount
 	pacingSentAtNanos int64
+	pacingBurst       uint64
 	// selectiveAcked marks an item whose resend is paused by a selective ack
 	// (see receiveAck). selectiveGapRecovered and ackTailProbeCount bound receiver-
 	// paced data recovery per item. recoveryKind marks the scheduled attempt so it
@@ -11883,8 +11915,9 @@ type sendItem struct {
 // sendItem survives until the transfer acknowledgement, so it cannot be
 // stack-allocated. A process-wide bounded pool captures the steady in-flight
 // working set without multiplying retained objects by every window Client.
-// 1024 items cover the measured steady flight and retain less than 256 KiB of
-// metadata process-wide; bursts beyond the cap fall back to GC.
+// 1024 items cover the measured steady flight and bound retained struct data
+// to 584 KiB on 64-bit targets, as guarded by the exact landing size test.
+// Bursts beyond the cap fall back to GC.
 const sendItemPoolCapacity = 1024
 
 var sendItemPool = make(chan *sendItem, sendItemPoolCapacity)

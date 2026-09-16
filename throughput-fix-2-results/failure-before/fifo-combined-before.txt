@@ -1,0 +1,7 @@
+=== RUN   TestWindowPathFifoCombinedServiceAndPropagationChange
+    transfer_window_service_performance_test.go:41: delay=1s frame=1 identity=1 arrival=11.5s want=11s
+    transfer_window_service_performance_test.go:41: delay=1s frame=2 identity=2 arrival=12s want=11s
+--- FAIL: TestWindowPathFifoCombinedServiceAndPropagationChange (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.708s

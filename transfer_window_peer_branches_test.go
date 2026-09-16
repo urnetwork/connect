@@ -2,6 +2,7 @@ package connect
 
 import (
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -210,79 +211,96 @@ func TestTheBlindBetIsTheSmallerOfTheTwoConstants(t *testing.T) {
 // and collapses the window to its floor for the life of the sequence. The
 // arrangement that prevents it is one `return` and nothing asserted it.
 //
-// The step timestamp is asserted alongside, because it is the other thing that
-// must not move: `receiveWindowSetAtNanos` is written only on the FIRST
-// advertisement, and the delivery term refuses any delivery measured before it.
-// Rewriting it on a later acknowledgement would re-lag the delivery term and
-// discard evidence the sender had already earned.
+// Missing, unchanged and smaller advertisements preserve the delivery epoch.
+// A larger capacity starts a new epoch so delivery limited by the old capacity
+// cannot immediately shrink the new window. Distinct virtual times prevent
+// clock resolution from hiding an incorrect timestamp transition.
 func TestALegacyAcknowledgementCannotOverwriteAnAdvertisement(t *testing.T) {
-	restore := MemoryBudget()
-	t.Cleanup(func() { SetMemoryBudget(restore) })
-	SetMemoryBudget(0)
+	synctest.Test(t, func(t *testing.T) {
+		restore := MemoryBudget()
+		t.Cleanup(func() { SetMemoryBudget(restore) })
+		SetMemoryBudget(0)
 
-	const advertised = ByteCount(4 * 1024 * 1024)
-	sequence := newEstimatorFixture(t, func(settings *SendBufferSettings) {
-		settings.DeliverySizedWindowScale = deliverySizedWindowScale
-		settings.ResendQueueBudget = NewTransferMemoryBudget(mib(64))
+		const advertised = ByteCount(4 * 1024 * 1024)
+		sequence := newEstimatorFixture(t, func(settings *SendBufferSettings) {
+			settings.DeliverySizedWindowScale = deliverySizedWindowScale
+			settings.ResendQueueBudget = NewTransferMemoryBudget(mib(64))
+		})
+
+		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
+			receiveWindowSet:       true,
+			receiveWindowByteCount: uint32(advertised),
+		})
+		steppedAtNanos := sequence.receiveWindowSetAtNanos.Load()
+		if steppedAtNanos == 0 {
+			t.Fatal("the first advertisement did not mark the step, so the delivery term's lag has no anchor")
+		}
+
+		// an ordinary acknowledgement carrying no capacity, of the kind every
+		// acknowledgement from a peer that does not advertise is
+		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{receiveWindowSet: false})
+
+		held, ok := sequence.receivedWindowAdvertisement()
+		if !ok {
+			t.Fatal("an acknowledgement without the field cleared the peer's advertisement, so a single legacy-shaped ack retires a capacity the peer really stated")
+		}
+		if held != advertised {
+			t.Errorf(
+				"the peer's advertised capacity reads %d after an acknowledgement carrying no field, against the %d it advertised. Absent is not zero: an acknowledgement that does not carry the field says nothing about the receiver's capacity and must leave it exactly as it was",
+				held,
+				advertised,
+			)
+		}
+		estimate := sequence.sendWindowEstimate(time.Now())
+		if estimate.Window != advertised {
+			t.Errorf(
+				"the window is %d after a fieldless acknowledgement followed a %d byte advertisement; a zero written over a good capacity reads as a receiver with no room and pins the window at its floor for the life of the sequence",
+				estimate.Window,
+				advertised,
+			)
+		}
+		if now := sequence.receiveWindowSetAtNanos.Load(); now != steppedAtNanos {
+			t.Errorf(
+				"the step timestamp moved from %d to %d on a later acknowledgement. It marks the first advertisement, and the delivery term refuses delivery measured before it, so rewriting it discards evidence the sender had already earned and re-lags a window that had already stepped",
+				steppedAtNanos,
+				now,
+			)
+		}
+
+		for _, capacity := range []ByteCount{advertised, advertised / 2, 0} {
+			time.Sleep(time.Millisecond)
+			sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
+				receiveWindowSet: true, receiveWindowByteCount: uint32(capacity),
+			})
+			if held, _ := sequence.receivedWindowAdvertisement(); held != capacity {
+				t.Errorf("capacity=%d stored=%d", capacity, held)
+			}
+			if got := sequence.receiveWindowSetAtNanos.Load(); got != steppedAtNanos {
+				t.Errorf("unchanged or smaller capacity=%d moved delivery epoch from %d to %d", capacity, steppedAtNanos, got)
+			}
+		}
+
+		// A capacity increase deliberately restarts delivery's settling interval.
+		time.Sleep(time.Millisecond)
+		const raised = ByteCount(8 * 1024 * 1024)
+		raisedAtNanos := time.Now().UnixNano()
+		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
+			receiveWindowSet:       true,
+			receiveWindowByteCount: uint32(raised),
+		})
+		if held, _ := sequence.receivedWindowAdvertisement(); held != raised {
+			t.Errorf("a later advertisement of %d did not update the capacity, which reads %d", raised, held)
+		}
+		if got := sequence.receiveWindowSetAtNanos.Load(); got != raisedAtNanos {
+			t.Errorf("larger capacity retained delivery measured under the old bound: epoch=%d want=%d", got, raisedAtNanos)
+		}
+		time.Sleep(time.Millisecond)
+		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{})
+		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{receiveWindowSet: true, receiveWindowByteCount: uint32(raised)})
+		if got := sequence.receiveWindowSetAtNanos.Load(); got != raisedAtNanos {
+			t.Errorf("repeat or missing advertisement moved delivery epoch: got=%d want=%d", got, raisedAtNanos)
+		}
 	})
-
-	sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
-		receiveWindowSet:       true,
-		receiveWindowByteCount: uint32(advertised),
-	})
-	steppedAtNanos := sequence.receiveWindowSetAtNanos.Load()
-	if steppedAtNanos == 0 {
-		t.Fatal("the first advertisement did not mark the step, so the delivery term's lag has no anchor")
-	}
-
-	// an ordinary acknowledgement carrying no capacity, of the kind every
-	// acknowledgement from a peer that does not advertise is
-	sequence.observeReceiveWindowAdvertisement(receiveAckMessage{receiveWindowSet: false})
-
-	held, ok := sequence.receivedWindowAdvertisement()
-	if !ok {
-		t.Fatal("an acknowledgement without the field cleared the peer's advertisement, so a single legacy-shaped ack retires a capacity the peer really stated")
-	}
-	if held != advertised {
-		t.Errorf(
-			"the peer's advertised capacity reads %d after an acknowledgement carrying no field, against the %d it advertised. Absent is not zero: an acknowledgement that does not carry the field says nothing about the receiver's capacity and must leave it exactly as it was",
-			held,
-			advertised,
-		)
-	}
-	estimate := sequence.sendWindowEstimate(time.Now())
-	if estimate.Window != advertised {
-		t.Errorf(
-			"the window is %d after a fieldless acknowledgement followed a %d byte advertisement; a zero written over a good capacity reads as a receiver with no room and pins the window at its floor for the life of the sequence",
-			estimate.Window,
-			advertised,
-		)
-	}
-	if now := sequence.receiveWindowSetAtNanos.Load(); now != steppedAtNanos {
-		t.Errorf(
-			"the step timestamp moved from %d to %d on a later acknowledgement. It marks the first advertisement, and the delivery term refuses delivery measured before it, so rewriting it discards evidence the sender had already earned and re-lags a window that had already stepped",
-			steppedAtNanos,
-			now,
-		)
-	}
-
-	// a SECOND real advertisement updates the capacity and still does not move
-	// the step
-	const raised = ByteCount(8 * 1024 * 1024)
-	sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
-		receiveWindowSet:       true,
-		receiveWindowByteCount: uint32(raised),
-	})
-	if held, _ := sequence.receivedWindowAdvertisement(); held != raised {
-		t.Errorf("a later advertisement of %d did not update the capacity, which reads %d", raised, held)
-	}
-	if now := sequence.receiveWindowSetAtNanos.Load(); now != steppedAtNanos {
-		t.Errorf(
-			"the step timestamp moved from %d to %d on a second advertisement; the step happened once, when the sender stopped being blind",
-			steppedAtNanos,
-			now,
-		)
-	}
 }
 
 // Guard two: the wire field is optional, so ABSENT and ZERO are different

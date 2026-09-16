@@ -1,0 +1,8 @@
+--- FAIL: TestWindowPacingShortAndCompressedTrainEdges (0.00s)
+    --- FAIL: TestWindowPacingShortAndCompressedTrainEdges/compressed-partial-tail (0.00s)
+        transfer_window_pacing_test.go:515: measured=125000000 want=50000000 B/s
+    --- FAIL: TestWindowPacingShortAndCompressedTrainEdges/different-sized-slow-replies (0.00s)
+        transfer_window_pacing_test.go:515: measured=250000 want=125000 B/s
+FAIL
+FAIL	github.com/urnetwork/connect	0.694s
+FAIL

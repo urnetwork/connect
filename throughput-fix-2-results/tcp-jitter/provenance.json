@@ -1,0 +1,8 @@
+{
+  "source_log": "run.log",
+  "source_log_sha256": "5a50bf7b7c1f4c8d20d337b626e0a7ab99f160f8cdd07892578411bc18fbe3ad",
+  "note": "Bounded timer lateness retained; before adaptive service pacing and longer TCP warmup.",
+  "rows": 20,
+  "final": false,
+  "outcome": "passed"
+}

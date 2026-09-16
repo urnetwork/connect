@@ -1,0 +1,12 @@
+{
+  "source_log": "run.log",
+  "source_log_sha256": "6eac822d0db2cba7801b75a85665952d0aadbae5793d7552d31d18505de572c2",
+  "note": "Complete final-source model, service and window mismatch selection after adjacent root-cause fixes; started immediately under host load.",
+  "rows": 390,
+  "final": true,
+  "outcome": "passed",
+  "outcome_excerpt": {
+    "raw_log_sha256": "6eac822d0db2cba7801b75a85665952d0aadbae5793d7552d31d18505de572c2",
+    "note": "Only test names and outcomes are included. The original raw log remains outside the committed archive. This extraction does not establish build-source provenance."
+  }
+}

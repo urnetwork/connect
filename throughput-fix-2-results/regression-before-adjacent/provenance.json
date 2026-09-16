@@ -1,0 +1,8 @@
+{
+  "source_log": "run.log",
+  "source_log_sha256": "5b60177acd7e05f96a30af0725d49cd7c1c506736073ecd3854c0f81cf139628",
+  "note": "Full root regression before adjacent fixes. Three failing tests are retained; the runner itself also encountered a shell-offset error after an in-place script edit.",
+  "rows": 0,
+  "final": false,
+  "outcome": "failed"
+}

@@ -1,0 +1,11 @@
+{
+  "exit_code": 1,
+  "source_sha256": {
+    "transfer_window_pacing.go": "d36896268b690db4e340492bac1b9b1dafcd94259f7ffc05b36a8ae0029c296e",
+    "transfer.go": "d3a1570ae81c591e44e841589256b653bed9d48fbc5127ff30ed83dd8cbe65ab"
+  },
+  "mutated_sha256": {
+    "transfer_window_pacing.go": "7be8ed82da8e5f597c1ff567bc5a92db627af446d8fbd68656a8f341ebed1b87",
+    "transfer.go": "877618750c28e166c414f5b8cfb58c430d7fce1df1f9b2b2a34c50e5ad127afa"
+  }
+}

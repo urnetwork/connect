@@ -1,0 +1,28 @@
+--- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries (0.00s)
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=0/reverse=false (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=0/reverse=true (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=1/reverse=false (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=1/reverse=true (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=2/reverse=false (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=2/reverse=true (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=3/reverse=false (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=3/reverse=true (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=4/reverse=false (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=4/reverse=true (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=5/reverse=false (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+    --- FAIL: TestWindowPacingSharedShortTrainAcrossSampleBoundaries/phase=5/reverse=true (0.00s)
+        transfer_window_pacing_test.go:485: short fast train measured 4257246 B/s, want 125000000
+FAIL
+FAIL	github.com/urnetwork/connect	0.691s
+FAIL

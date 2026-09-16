@@ -1,0 +1,6 @@
+{
+  "outcome_excerpt": {
+    "raw_log_sha256": "2741f5876526a77439a343c1765a67fc14bdc826aa381863dec98914055b5bd8",
+    "note": "Only test names and outcomes are included. The original raw log remains outside the committed archive. This extraction does not establish build-source provenance."
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "created_utc": "2026-09-15T21:27:01.609176+00:00",
+  "mode": "server-connect-deterministic",
+  "test_pattern": "^(TestSendPooledReceive.*|TestReliableExchangeQueueSaturation.*|TestExchangeGenerationRetires.*|TestResident.*|TestProductionSocketReaders.*|TestConnectH1(ReadyDrain|UserReadyBatch|WriteBatchForConn|WorkersJoin|BatchResponseWriter).*|TestConnectH3(InitialDatagram|TransferCarrier).*|TestExchangeHeaderUnreliableTransferGobCompatibility|TestExchangeOutboundBatchFormation)$",
+  "run_flags": [
+    "-test.skip",
+    "^(TestResidentControllerReturnsDroppedResponseFrameOwnership|TestResidentRunJoinsStreamHopListenerCallback)$"
+  ],
+  "connect": {
+    "revision": "8b9002c927ffbf729da07e016d1ef23e3be2ef0f",
+    "branch": "throughput-fix-2",
+    "source_sha256": "55132a4dc44dbc9fdb486d5f7288ba5579370a0cb751f957bb6d365fd0d319b1",
+    "dirty": true
+  },
+  "package": "./connect",
+  "build_flags": [
+    "-race"
+  ],
+  "runner_sha256": "9dbf2c529874e0a0f2ca52a4d7c1225e2487286d839446ccc1481c0eee6fcfbb",
+  "host_load_average_at_start": [
+    26.89013671875,
+    36.53076171875,
+    32.197265625
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "Started immediately with server/test-env.sh variables alongside the connect model, regression, correctness and host matrices."
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "server": {
+    "revision": "4fb332879e2bb7fcc6d2df8b50a3e6a4fe60470c",
+    "branch": "main",
+    "source_sha256": "952d6f47149098b0b7719182bf2f3619657d910cf54c54db57127e0ff50f8927",
+    "dirty": true
+  },
+  "server_test_environment_source": "/Users/brien/urnetwork/server/test-env.sh",
+  "server_test_environment": {
+    "WARP_ENV": "local",
+    "WARP_SERVICE": "test",
+    "WARP_BLOCK": "test",
+    "WARP_VERSION": "0.0.0",
+    "WARP_TEST_ENV_FAIL_FAST": "1",
+    "WARP_TEST_ENV_USE_PORTABLE_RESOURCES": "1",
+    "WARP_TEST_ENV_ALLOW_UNMANAGED_PORTABLE_SERVICES": "1"
+  },
+  "binary_sha256": "30ac2f3fa1c63d5879a628945541ea41598ddaa2cea70cbbbf5591ca64b51c74",
+  "sources_stable_during_build": true
+}

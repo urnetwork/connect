@@ -1,0 +1,6 @@
+=== RUN   TestWindowDeliveryContractLeadDoesNotOverflow
+    transfer_window_adjacent_test.go:80: contract lead overflowed byte/time multiplication: 0, want 2097152
+--- FAIL: TestWindowDeliveryContractLeadDoesNotOverflow (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.666s

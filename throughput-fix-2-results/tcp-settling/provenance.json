@@ -1,0 +1,8 @@
+{
+  "source_log": "run.log",
+  "source_log_sha256": "4c37ebb2d3c908ad080057b632fecd03ca63dd4bc9170b65a9530b44abbf61d1",
+  "note": "Ten-second startup diagnostic. Interval readings show the ramp excluded by later steady-state warmup.",
+  "rows": 10,
+  "final": false,
+  "outcome": "passed"
+}

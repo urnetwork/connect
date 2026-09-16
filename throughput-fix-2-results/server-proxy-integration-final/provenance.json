@@ -1,0 +1,8 @@
+{
+  "source_log": "run.log",
+  "source_log_sha256": "fb3d10805b94b8ee93c898103dbe258396d1bfacd6f06f5edb8b4b32f9ec1651",
+  "note": "Configured server/proxy handoff attempt; database-backed handoff cases stopped at the same PostgreSQL authentication preflight.",
+  "rows": 0,
+  "final": true,
+  "outcome": "failed"
+}

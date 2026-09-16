@@ -20,6 +20,7 @@ run_flags=(-test.short=false)
 case "$mode" in
   correctness)
     pattern='^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$'
+    pattern="$pattern|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$"
     build_flags=(-race)
     ;;
   model)
@@ -42,6 +43,12 @@ case "$mode" in
     if [[ "$mode" == tcp ]]; then
       export CONNECT_WINDOW_TCP_MEASURE=1
       pattern='^TestWindowTcp(Download|Upload)PerformanceMatrix$'
+      case "${CONNECT_WINDOW_PATH_DIRECTION:-both}" in
+        both) ;;
+        download) pattern='^TestWindowTcpDownloadPerformanceMatrix$' ;;
+        upload) pattern='^TestWindowTcpUploadPerformanceMatrix$' ;;
+        *) printf 'Unknown TCP direction: %s\n' "$CONNECT_WINDOW_PATH_DIRECTION" >&2; exit 2 ;;
+      esac
     else
       export CONNECT_WINDOW_PATH_MEASURE=1
     fi
@@ -88,9 +95,14 @@ esac
 package=./
 if [[ "$mode" == server* ]]; then package=./connect; fi
 if [[ "$mode" == server-proxy ]]; then package=./proxy; fi
-python3 - "$repo" "$output" "$mode" "$pattern" "${run_flags[@]}" <<'PY'
+if [[ "$mode" == server* ]]; then
+  # Use the same environment bootstrap as server/connect/test.sh and
+  # server/test.sh. Their database-backed test selections remain separate.
+  source "$repo/../server/test-env.sh"
+fi
+python3 - "$repo" "$output" "$mode" "$pattern" "$package" "${build_flags[*]}" "${run_flags[@]}" <<'PY'
 import datetime, hashlib, json, os, pathlib, platform, subprocess, sys
-repo, output, mode, pattern, *run_flags = sys.argv[1:]
+repo, output, mode, pattern, package, build_flags, *run_flags = sys.argv[1:]
 def command(*args, cwd=None):
     return subprocess.check_output(args, cwd=cwd, text=True).strip()
 def source_manifest(root):
@@ -108,6 +120,9 @@ def source_manifest(root):
 manifest = {
     'created_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
     'mode': mode, 'test_pattern': pattern, 'run_flags': run_flags, 'connect': source_manifest(repo),
+    'package': package, 'build_flags': build_flags.split(),
+    'runner_sha256': hashlib.sha256(pathlib.Path(repo, 'tools/throughput-fix-2.sh').read_bytes()).hexdigest(),
+    'host_load_average_at_start': os.getloadavg(),
     'go': command('go', 'version'), 'os': platform.system(),
     'os_release': platform.release(), 'architecture': platform.machine(),
     'logical_cpus': os.cpu_count(),
@@ -117,6 +132,12 @@ manifest = {
 }
 if mode.startswith('server'):
     manifest['server'] = source_manifest(str(pathlib.Path(repo).parent / 'server'))
+    manifest['server_test_environment_source'] = str(pathlib.Path(repo).parent / 'server' / 'test-env.sh')
+    manifest['server_test_environment'] = {
+        key: os.environ[key] for key in (
+            'WARP_ENV', 'WARP_SERVICE', 'WARP_BLOCK', 'WARP_VERSION',
+            'WARP_TEST_ENV_FAIL_FAST', 'WARP_TEST_ENV_USE_PORTABLE_RESOURCES',
+            'WARP_TEST_ENV_ALLOW_UNMANAGED_PORTABLE_SERVICES') if key in os.environ}
 pathlib.Path(output, 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 PY
 
@@ -154,7 +175,7 @@ elif [[ "$mode" == server* ]]; then
 fi
 "$output/tests" -test.v -test.run "$pattern" "${run_flags[@]}" -test.count=1 -test.timeout=30m > "$output/run.log" 2>&1 || status=$?
 python3 - "$output" "$status" <<'PY'
-import json, pathlib, re, sys
+import datetime, json, os, pathlib, re, sys
 output = pathlib.Path(sys.argv[1])
 rows = []
 for line in (output / 'run.log').read_text().splitlines():
@@ -175,7 +196,15 @@ for line in (output / 'run.log').read_text().splitlines():
                          Compression=match[3], CeilingMbps=float(match[4]),
                          DeliveryMbps=float(match[5]), MinFlowMbps=float(match[6])))
 (output / 'ledger.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
-(output / 'status.json').write_text(json.dumps({'exit_code': int(sys.argv[2]), 'rows': len(rows)}) + '\n')
+comparisons = [row for row in rows if row.get('Kind') == 'comparison']
+(output / 'status.json').write_text(json.dumps({
+    'exit_code': int(sys.argv[2]), 'rows': len(rows),
+    'comparison_count': len(comparisons),
+    'failed_comparisons': sum(bool(row.get('FailureReasons')) for row in comparisons),
+    'censored_comparisons': sum(bool(row.get('CensoredReasons')) for row in comparisons),
+    'finished_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    'host_load_average_at_finish': os.getloadavg(),
+}) + '\n')
 PY
 printf 'Results: %s (exit %s)\n' "$output" "$status"
 exit "$status"

@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-perf-pilot2.log",
+  "source_log_sha256": "0616f56eed8a0f05a66e85590f7a3f9188b36debf46c3bbbc24d087bd0af4f58",
+  "note": "Early FIFO instrument diagnostic; not final capacity evidence.",
+  "rows": 5,
+  "final": false,
+  "outcome": "passed"
+}

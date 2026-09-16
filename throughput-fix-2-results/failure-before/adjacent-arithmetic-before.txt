@@ -1,0 +1,8 @@
+=== RUN   TestWindowMismatchLargeTargetCannotWrapItsBounds
+--- PASS: TestWindowMismatchLargeTargetCannotWrapItsBounds (0.00s)
+=== RUN   TestWindowPacingLocalHistoryRetainsStableFeedbackSpan
+    transfer_window_adjacent_test.go:73: standalone history forgot service before feedback: 10000000 B/s
+--- FAIL: TestWindowPacingLocalHistoryRetainsStableFeedbackSpan (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.655s

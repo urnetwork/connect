@@ -1,0 +1,5 @@
+--- FAIL: TestWindowPacingAdmissionCannotCreditAnUnbegunWrite (0.00s)
+    transfer_window_pacing_flight_test.go:30: the earlier tail credited an unbegun physical write: credited=2000 want<=1000
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.611s
