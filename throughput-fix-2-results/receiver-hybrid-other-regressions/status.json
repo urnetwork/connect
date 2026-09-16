@@ -1,0 +1,34 @@
+{
+  "archive_result": "complete_pinned_frozen_hybrid_other_regressions",
+  "elapsed_seconds": 367.04206116637215,
+  "exit_code": 1,
+  "host_load_average_at_end": [
+    11.34912109375,
+    13.67822265625,
+    12.43115234375
+  ],
+  "host_load_average_at_start": [
+    16.67724609375,
+    11.96435546875,
+    10.712890625
+  ],
+  "race_warnings": 0,
+  "service_readings": 234,
+  "top_level_outcomes": [
+    {
+      "duration": "343.23s",
+      "result": "FAIL",
+      "test": "TestWindowPathWindowMismatchMatrix"
+    },
+    {
+      "duration": "16.81s",
+      "result": "PASS",
+      "test": "TestWindowPathServiceAcrossRepeatedDrains"
+    },
+    {
+      "duration": "6.96s",
+      "result": "FAIL",
+      "test": "TestWindowPathServicesShareFiniteRelay"
+    }
+  ]
+}

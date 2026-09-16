@@ -1,0 +1,11 @@
+{
+  "bootstrap_exit_code": 1,
+  "database_tiers_deferred": true,
+  "no_test_or_binary_attempt": true,
+  "phase": "managed launcher attestation/preflight",
+  "raw_log_sha256": "5d150aa523d9e6df56fc6909b6753e5ffac0b0de0b646e725c5f6b73b0d31d2f",
+  "sanitized_message": "launcher-managed local services are not ready",
+  "schema": "throughput-fix-2/server-bootstrap-recheck-provenance-v1",
+  "server_head": "0522f3f6200b9d70b4b4fab0ddf791939ba772d0",
+  "source_status_sha256": "b4ea27e2ba3c5ae66810010c218d7d9db45ef6c1dc3404cb36c1cd6f689fa908"
+}

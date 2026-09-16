@@ -1,0 +1,29 @@
+{
+  "archive_kind": "small_window_feedback_root_evidence",
+  "attribution_limits": [
+    "The untraced original shrink run is the acceptance-relevant failure; trace and transition-trace rows are retained only as diagnostics because tracing can perturb scheduling.",
+    "The blanket gap/flight-size threshold is explicitly rejected: retain its 88 PASS/13 FAIL outcomes, including the stated aggregate of eleven established-behavior regressions plus two pre-hybrid API-expectation failures.",
+    "This is root evidence of an unresolved failure, not a fix or accepted optimum.",
+    "Raw traces, raw logs, source copies, binaries, and local paths are excluded. Hashes, normalized outcomes, and numerical rows are retained."
+  ],
+  "collection_time_utc": "2026-09-16T09:28:05.172121+00:00",
+  "findings": [
+    "Original shrink cell: 3.413 vs4.584 Mb/s, zero relay drops.",
+    "Three deterministic failures: held12,500,000B/s becomes605,181B/s after a cross-flight100ms gap substitutes for a10ms active train.",
+    "Reject blanket gap/flight-size threshold; preserve all88PASS/13FAIL outcomes. Two API-expectation failures are old receiver-timing tests copied before hybrid receiverWindowEstimate split; eleven remaining failures are actual established behavior regressions."
+  ],
+  "handoff_sha256": "bacf2f628c7d820a51d8e7b8f8eef2104cdc4017cb071cfe74ca51c203883faf",
+  "limitations": [
+    "Raw diagnostic logs and copied source stay local.",
+    "Trace output can perturb scheduling; acceptance derives from separate untraced run.",
+    "This handoff is evidence, not a claim of a fix or an accepted optimum."
+  ],
+  "redaction_policy": {
+    "ipv4_literals": "redacted if encountered",
+    "local_paths": "excluded",
+    "raw_logs": "excluded; sha256 only",
+    "source_binary": "excluded; sha256 only"
+  },
+  "schema_version": 1,
+  "status": "Unresolved root plus rejected counterfactual; no shared production fix."
+}

@@ -1,0 +1,12 @@
+{
+  "archive_kind": "static_mismatch_service_credit",
+  "file_count": 5,
+  "file_sha256": {
+    "outcomes.jsonl": "afe3f645a7e983352be5f2debc979ff44e93940f8c6236a36cd2709942347c02",
+    "provenance.json": "d5b05df2d29b3858fc5d28fca9f269fae7330d529b5f4874232495ee18918322",
+    "service-readings.jsonl": "698539b99d1c5ac60375d73bae26d3c175862d27201358f312709d3990d50e08",
+    "setup-only-precompilation-attempt.json": "43dcb4a80a86290fecbe26429ba7deb1d71c86e7ed25c0e200976ecde32b55e0",
+    "status.json": "4201429e7cb9c57d4eaafa4d2889c1eacc6dcc72fa38b510961bf372201984e8"
+  },
+  "schema_version": 1
+}

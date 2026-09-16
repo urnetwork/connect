@@ -1,0 +1,14 @@
+{
+  "archive_kind": "old_tail_receipt_oracle_design_evidence",
+  "file_count": 7,
+  "file_sha256": {
+    "oracle-outcomes.jsonl": "17e634053f19eac2731983c2cb0276ee10d98b18244afeee5adcf120379eddb1",
+    "oracle-readings.jsonl": "bf7a0127fd2657cac333eeab9aa813d93a291eb22c9e937e1a9ae1a9fc5be75f",
+    "provenance.json": "9de771bfadfe25819d3dd23ae08fea8d80cc271dec344b2c6212bbaba6f452bb",
+    "route-ownership-observations.jsonl": "0899aa568fc4109e5aa07391a8a515e691cf0295c2d8cd212ab1c847be1d9d34",
+    "route-ownership-outcomes.jsonl": "92781fd151456e7145b4d350df4142e5ed17479dc590174a8951826c8ea17ff5",
+    "source-pins.json": "80d6caf3262491c070c202ef705df8c1f6722a077c89cc5c8ec09fe1d113d89b",
+    "status.json": "f2c4c6b4fcaee4d8420ee673ae07555839db4b94971dd654506b8391a1edfa7b"
+  },
+  "schema_version": 1
+}

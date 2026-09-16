@@ -1,0 +1,128 @@
+{
+  "archive_result": "complete_pinned_legacy_v3_evidence",
+  "by_classification": {
+    "failure-before": {
+      "FAIL": 12,
+      "PASS": 3,
+      "SKIP": 0,
+      "readings": 0,
+      "runs": 2
+    },
+    "final-focused-after": {
+      "FAIL": 0,
+      "PASS": 534,
+      "SKIP": 0,
+      "readings": 0,
+      "runs": 1
+    },
+    "fixture-diagnostic": {
+      "FAIL": 13,
+      "PASS": 576,
+      "SKIP": 0,
+      "readings": 0,
+      "runs": 4
+    },
+    "focused-after": {
+      "FAIL": 0,
+      "PASS": 531,
+      "SKIP": 0,
+      "readings": 0,
+      "runs": 1
+    },
+    "performance-control": {
+      "FAIL": 0,
+      "PASS": 3,
+      "SKIP": 0,
+      "readings": 12,
+      "runs": 1
+    },
+    "root-after": {
+      "FAIL": 0,
+      "PASS": 51,
+      "SKIP": 0,
+      "readings": 0,
+      "runs": 1
+    }
+  },
+  "by_run": {
+    "before-locked-race": {
+      "FAIL": 9,
+      "PASS": 0,
+      "SKIP": 0,
+      "classification": "failure-before",
+      "readings": 0
+    },
+    "candidate-v1-focus-race": {
+      "FAIL": 0,
+      "PASS": 531,
+      "SKIP": 0,
+      "classification": "focused-after",
+      "readings": 0
+    },
+    "candidate-v1-lane-at-due-race": {
+      "FAIL": 0,
+      "PASS": 51,
+      "SKIP": 0,
+      "classification": "root-after",
+      "readings": 0
+    },
+    "candidate-v1-roots-race": {
+      "FAIL": 3,
+      "PASS": 45,
+      "SKIP": 0,
+      "classification": "fixture-diagnostic",
+      "readings": 0
+    },
+    "candidate-v2-focus-race": {
+      "FAIL": 6,
+      "PASS": 528,
+      "SKIP": 0,
+      "classification": "fixture-diagnostic",
+      "readings": 0
+    },
+    "candidate-v2-model-controls": {
+      "FAIL": 0,
+      "PASS": 3,
+      "SKIP": 0,
+      "classification": "performance-control",
+      "readings": 12
+    },
+    "candidate-v3-focus-race": {
+      "FAIL": 0,
+      "PASS": 534,
+      "SKIP": 0,
+      "classification": "final-focused-after",
+      "readings": 0
+    },
+    "lane-diagnostic": {
+      "FAIL": 1,
+      "PASS": 0,
+      "SKIP": 0,
+      "classification": "fixture-diagnostic",
+      "readings": 0
+    },
+    "lane-unsafe-at-due-race": {
+      "FAIL": 3,
+      "PASS": 3,
+      "SKIP": 0,
+      "classification": "failure-before",
+      "readings": 0
+    },
+    "lane-unsafe-before-race": {
+      "FAIL": 3,
+      "PASS": 3,
+      "SKIP": 0,
+      "classification": "fixture-diagnostic",
+      "readings": 0
+    }
+  },
+  "completed_runs": 10,
+  "fail_count": 25,
+  "numerical_reading_count": 12,
+  "outcomes": 1723,
+  "pass_count": 1698,
+  "performance_claim": "none",
+  "race_warning_blocks": 0,
+  "rejected_unexecuted_source_drift_build_count": 1,
+  "skip_count": 0
+}

@@ -1,0 +1,14 @@
+{
+  "associated_root": "TestWindowPacingConfiguredLongFlightDrainsBeforeProbe",
+  "classification": "race instrumentation failure; separate from the three retained legacy assertion-root failures",
+  "race_warning_blocks": 2,
+  "raw_log_sha256": "ed12e2f1fd39ca90b12a042b43bce44974d90e1e8b2486ce5c0d0a30179e133a",
+  "raw_trace": "retained locally; not copied into archive",
+  "retained_legacy_assertion_roots": [
+    "TestWindowPacingConfiguredLongFlightDrainsBeforeProbe",
+    "TestWindowPacingDrainCoversLatestLongResidence",
+    "TestWindowPacingDrainedProbeOutlivesStaleLaneTimer"
+  ],
+  "schema_version": 1,
+  "terminal_race_detection_records": 1
+}

@@ -223,8 +223,10 @@ func TestWindowCompressionResidenceRestoresShortPathCapacity(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			reading := measureWindowPathCell(t, windowPathCell{
 				Arm: arm, RoundTrip: 300 * time.Microsecond, Compression: 10 * time.Millisecond,
-				Flows: 1, Payload: 1280, Budget: mib(48), Rate: 125000000, KnownPathRoundTrip: true,
+				Flows: 1, Payload: 1280, Budget: mib(48), Rate: 125000000,
+				KnownPathRoundTrip: true, HoldFullAckCompression: true,
 			}, 100*time.Millisecond)
+			logWindowServiceReading(t, reading)
 			wantResidence := 10300 * time.Microsecond
 			if arm == "path-rtt-only" {
 				old = reading.Mbps
@@ -322,35 +324,37 @@ func TestWindowPathSlowLinkKeepsCapacity(t *testing.T) {
 }
 
 type windowPathCell struct {
-	SenderProfile        *windowPathEndpointProfile `json:",omitempty"`
-	ReceiverProfile      *windowPathEndpointProfile `json:",omitempty"`
-	ProfileFixtureSha256 string                     `json:",omitempty"`
-	Bidirectional        bool                       `json:",omitempty"`
-	CalibrationWindow    ByteCount
-	SendWindow           ByteCount
-	ReceiveWindow        ByteCount
-	ReceiveWindowAfter   ByteCount
-	WindowChangeAfter    time.Duration
-	Tcp                  bool
-	Upload               bool
-	TcpBufferMax         ByteCount
-	Arm                  string
-	RoundTrip            time.Duration
-	RoundTripAfter       time.Duration
-	RoundTripChangeAfter time.Duration
-	Compression          time.Duration
-	Flows                int
-	RoundRobinOffer      bool
-	Lanes                int
-	Payload              int
-	Budget               ByteCount
-	Drop                 bool
-	Rate                 ByteCount
-	RateAfter            ByteCount
-	RateChangeAfter      time.Duration
-	Warmup               time.Duration
-	PacingWakeDelay      time.Duration
-	KnownPathRoundTrip   bool
+	InitialLogicalAckRelease time.Duration              `json:",omitempty"`
+	HoldFullAckCompression   bool                       `json:",omitempty"`
+	SenderProfile            *windowPathEndpointProfile `json:",omitempty"`
+	ReceiverProfile          *windowPathEndpointProfile `json:",omitempty"`
+	ProfileFixtureSha256     string                     `json:",omitempty"`
+	Bidirectional            bool                       `json:",omitempty"`
+	CalibrationWindow        ByteCount
+	SendWindow               ByteCount
+	ReceiveWindow            ByteCount
+	ReceiveWindowAfter       ByteCount
+	WindowChangeAfter        time.Duration
+	Tcp                      bool
+	Upload                   bool
+	TcpBufferMax             ByteCount
+	Arm                      string
+	RoundTrip                time.Duration
+	RoundTripAfter           time.Duration
+	RoundTripChangeAfter     time.Duration
+	Compression              time.Duration
+	Flows                    int
+	RoundRobinOffer          bool
+	Lanes                    int
+	Payload                  int
+	Budget                   ByteCount
+	Drop                     bool
+	Rate                     ByteCount
+	RateAfter                ByteCount
+	RateChangeAfter          time.Duration
+	Warmup                   time.Duration
+	PacingWakeDelay          time.Duration
+	KnownPathRoundTrip       bool
 }
 
 type windowPathReading struct {
@@ -374,6 +378,44 @@ type windowPathReading struct {
 	ReverseWindow         SendWindowEstimate `json:",omitzero"`
 }
 
+// Isolates the window's compression-residence term by making both control
+// arms use the receiver's full advertised delay. Early H1 heads otherwise
+// change the counterfactual's feedback cadence as well as its window term.
+// Only this explicitly selected fixture holds a dedicated ACK worker.
+func holdWindowPathAckCompression(ctx context.Context, t *testing.T, settings *ReceiveBufferSettings) {
+	t.Helper()
+	compression := settings.AckCompressTimeout
+	if compression <= 0 {
+		t.Fatal("full-compression control requires a positive advertised interval")
+	}
+	var stateLock sync.Mutex
+	deadlineTimes := map[receiveSequenceId]time.Time{}
+	settings.afterAckWriteForTest = func(id receiveSequenceId) {
+		now := time.Now()
+		stateLock.Lock()
+		previous := deadlineTimes[id]
+		deadlineTimes[id] = now.Add(compression)
+		stateLock.Unlock()
+		if !previous.IsZero() && now.Before(previous) && ctx.Err() == nil {
+			t.Errorf("full-compression control wrote after %s, before its %s interval", now.Sub(previous.Add(-compression)), compression)
+		}
+	}
+	settings.beforeAckCompressWaitForTest = func(id receiveSequenceId) {
+		stateLock.Lock()
+		deadline := deadlineTimes[id]
+		stateLock.Unlock()
+		if deadline.IsZero() || !time.Now().Before(deadline) {
+			return
+		}
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+	}
+}
+
 // Measures receiver bytes over one common interval. Construction, warmup and
 // draining are outside the interval. This is a Transfer/FIFO instrument, not
 // a measurement of H1 sockets, a native kernel TUN, or provider TCP.
@@ -386,6 +428,8 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		t.Fatal("both endpoint profiles are required")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	fixtureStart := time.Now()
+	var firstAckLanes atomic.Uint32
 	settings := func(profile *windowPathEndpointProfile) *ClientSettings {
 		s := DefaultClientSettings()
 		s.Log = NewNoopLogger()
@@ -430,6 +474,40 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 			profile.apply(s)
 			if s.MinimumMessageLenLimit() != profile.MinimumMessageLimit {
 				t.Fatal("profile message limit differs from the constructor capture")
+			}
+		}
+		if cell.HoldFullAckCompression {
+			if cell.InitialLogicalAckRelease > 0 {
+				t.Fatal("full-compression control cannot also force an initial ACK release")
+			}
+			holdWindowPathAckCompression(ctx, t, s.ReceiveBufferSettings)
+		}
+		if cell.InitialLogicalAckRelease > 0 && profile != nil && profile.LogicalDataLanes == 0 {
+			release := fixtureStart.Add(cell.InitialLogicalAckRelease)
+			s.ReceiveBufferSettings.afterAckWriterOpenForTest = func(id receiveSequenceId, _ MultiRouteWriter) {
+				if id.LogicalLane == 0 {
+					return
+				}
+				if !time.Now().Before(release) {
+					t.Errorf("lane %d missed initial ACK barrier at %s", id.LogicalLane, time.Since(fixtureStart))
+					return
+				}
+				select {
+				case <-ctx.Done():
+				case <-time.After(time.Until(release)):
+				}
+			}
+			s.ReceiveBufferSettings.afterAckWriteForTest = func(id receiveSequenceId) {
+				if id.LogicalLane == 0 || id.LogicalLane > 8 {
+					return
+				}
+				bit := uint32(1) << (id.LogicalLane - 1)
+				if firstAckLanes.Or(bit)&bit != 0 {
+					return
+				}
+				if time.Now() != release {
+					t.Errorf("lane %d first ACK at %s, want %s", id.LogicalLane, time.Since(fixtureStart), cell.InitialLogicalAckRelease)
+				}
 			}
 		}
 		return s
@@ -477,7 +555,7 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		link.delayAfter = cell.RoundTripAfter / 2
 		link.delayChangeAfter = cell.RoundTripChangeAfter
 	}
-	if cell.Upload {
+	if cell.Upload && !cell.Bidirectional {
 		dataLink.rate = 0
 		dataLink.rateAfter = 0
 		dataLink.dropOnFull = false
@@ -720,6 +798,9 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		}
 	}
 	reading.MeasurementRelayDrops = reading.RelayDrops - dropsBefore
+	if cell.InitialLogicalAckRelease > 0 && firstAckLanes.Load() != 255 {
+		t.Errorf("initial feedback ordering missed logical lanes: mask=%02x", firstAckLanes.Load())
+	}
 	return reading
 }
 

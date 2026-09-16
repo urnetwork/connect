@@ -1,0 +1,30 @@
+{
+  "censored_comparisons": 0,
+  "comparison_count": 0,
+  "derived_service_readings": {
+    "archive_ledger_sha256": "f4f2049a721018ab425166af884df437cd9bcc9b637553d76bfd8910cd1c9e69",
+    "archive_manifest_sha256": "ca84189e232b6d8b9166a8fe5d2ea25a34380d833a9d41eed13e2c9a790d13e8",
+    "archive_readings_sha256": "b21338c77dad1b7ccb5a7d70ab2205826ec8ba234ad05b11810488a830240430",
+    "archive_status_sha256": "5d9fbc8e18fb7baef27e7e49565ca02cfa52c7fb4638c823ca2b05618ae1e31a",
+    "extracted_count": 6,
+    "ledger_kind": "model-service",
+    "source": "service-reading records from the retained raw run log",
+    "source_ledger_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_run_log_sha256": "39bc15ae3d3c2bd38b5ade4395cfabcb1abdf1e794d415c642e0ae1e4cf9051d",
+    "source_runner_rows_before_extraction": 0,
+    "source_status_sha256": "144732e652b73242b73a5aab8d5f9eef1c91d202ab409b8a36884e8312a3bd88"
+  },
+  "failed_comparisons": null,
+  "host_performance_acceptance": "no host comparisons in this selection",
+  "input_sha256": {
+    "ledger.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "manifest.json": "7064773abadcc3da9d2c3922bb2247656db27bf5c50b243e7ce43afe1daf7595",
+    "run.log": "39bc15ae3d3c2bd38b5ade4395cfabcb1abdf1e794d415c642e0ae1e4cf9051d",
+    "status.json": "144732e652b73242b73a5aab8d5f9eef1c91d202ab409b8a36884e8312a3bd88"
+  },
+  "note": "Raw run.log remains outside this archive; its hash is retained. Outcomes are an excerpt. Six service readings were derived from the retained raw log because the custom scoped runner wrote no ledger rows before collection.",
+  "outcome": "process passed",
+  "top_level_failed": 0,
+  "top_level_passed": 3,
+  "top_level_skipped": 0
+}

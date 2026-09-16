@@ -1,0 +1,37 @@
+{
+  "archive_files_sha256": {
+    "ledger.jsonl": "35f424ea4d03dec9c5cdecc8232e9535fa84e3b72e10d777f38288b04559685a",
+    "manifest.json": "9a4c33bb449b3c87d1d1a9731ccc199dca52c573d562cfbc2daf56df0d06ce16",
+    "outcomes.txt": "913810df9801e1275b151f4402bc6c35c348455314a5a081035ed7250dde3fee",
+    "status.json": "e65be1795402041dafe203997eecb57b6df62b28b0ac913d6d8105aeae79767d",
+    "summary.json": "df6be767ddf8fe58922c0b651f63312a89d3484522df4d84c74dc72d2659e14a"
+  },
+  "censored_comparisons": 0,
+  "comparison_count": 0,
+  "execution_completeness": {
+    "declared_cells_per_repetition": 4,
+    "declared_readings": 12,
+    "evidence": "Each test invocation has a terminal failure at upload=true, flows=1 direction 1 before any observed upload=true, flows=8 reading.",
+    "recorded_readings": 9,
+    "requested_repetitions": 3,
+    "unobserved_declared_cell": {
+      "expected_readings": 3,
+      "flows": 8,
+      "lanes": 8,
+      "upload": true
+    }
+  },
+  "failed_comparisons": null,
+  "host_performance_acceptance": "no host comparisons in this selection",
+  "input_sha256": {
+    "ledger.jsonl": "35f424ea4d03dec9c5cdecc8232e9535fa84e3b72e10d777f38288b04559685a",
+    "manifest.json": "2fc68cdaf50c5f91e00ae90d47034a47cee0502abdb57d033ca6f46310053998",
+    "run.log": "2314d692732b89f45b132afcea724a068af9e3c45743055d058d46eddec51e91",
+    "status.json": "4c362924f61ea386a441a1bd26e13bd892a2f93b70ff6b726d7bab2ad5ff585d"
+  },
+  "note": "Raw run.log remains outside this archive; its hash is retained. All observed service readings are retained in the numerical ledger. The declared fourth case did not produce a reading after each preceding terminal assertion failure; no rerun was performed.",
+  "outcome": "process failed",
+  "top_level_failed": 3,
+  "top_level_passed": 0,
+  "top_level_skipped": 0
+}

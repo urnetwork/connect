@@ -1,0 +1,13 @@
+=== RUN   TestWindowPerformanceDuplexBoundsBothDirections
+--- PASS: TestWindowPerformanceDuplexBoundsBothDirections (7.27s)
+=== RUN   TestWindowPerformanceDuplexBoundsRateChanges
+--- PASS: TestWindowPerformanceDuplexBoundsRateChanges (9.01s)
+=== RUN   TestWindowPerformanceDuplexBoundsBothDirections
+--- PASS: TestWindowPerformanceDuplexBoundsBothDirections (7.35s)
+=== RUN   TestWindowPerformanceDuplexBoundsRateChanges
+--- PASS: TestWindowPerformanceDuplexBoundsRateChanges (9.18s)
+=== RUN   TestWindowPerformanceDuplexBoundsBothDirections
+--- PASS: TestWindowPerformanceDuplexBoundsBothDirections (12.04s)
+=== RUN   TestWindowPerformanceDuplexBoundsRateChanges
+--- PASS: TestWindowPerformanceDuplexBoundsRateChanges (9.67s)
+PASS

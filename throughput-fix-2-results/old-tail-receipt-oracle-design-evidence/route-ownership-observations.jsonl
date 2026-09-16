@@ -1,0 +1,3 @@
+{"drained":false,"outcome":"FAIL","pending_physical_tail":1,"physical_retry_at_ms":400,"probe_exists":false,"recovery_items_after_logical_ack":0,"remaining_pause_ms":2310,"repetitions":3,"same_message":true,"same_tag":true,"test":"TestWindowPacingRetriedTailNeedsPhysicalAttemptEcho"}
+{"early_ack_certifies_held_retry":false,"later_logical_release_does_not_certify_tail":true,"outcome":"PASS","repetitions":3,"test":"TestWindowPacingOriginalAckCannotCertifyHeldPhysicalRetry"}
+{"drained":true,"other_route_logical_acks":2,"outcome":"FAIL","pending_physical_tail":0,"recovery_items":0,"repetitions":3,"test":"TestWindowPacingDifferentH1RouteTailCannotCertifyOlderCopy","unreceived_original_route_copies":1}

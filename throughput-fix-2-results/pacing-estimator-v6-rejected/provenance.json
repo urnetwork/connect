@@ -1,0 +1,34 @@
+{
+  "input_sha256": {
+    "manifest.json": "1297df784d51bbad9664a12f7d62a000e8a7d15e5773fe2b1dff28d5530ff702",
+    "status.json": "11dd70e0cb42a586ab919019978ee4eea1d7de341ff840b10eb36227cce9242a",
+    "ledger.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "run.log": "cbad5d8bde3940610c381410a4e3545e443f8bd781d6ffa372b1c1bb07832418"
+  },
+  "outcome": "process passed",
+  "top_level_passed": 0,
+  "top_level_failed": 0,
+  "top_level_skipped": 0,
+  "host_performance_acceptance": "no host comparisons in this selection",
+  "comparison_count": 0,
+  "failed_comparisons": null,
+  "censored_comparisons": 0,
+  "note": "Raw run.log remains outside this archive; its hash is retained. Outcomes are an excerpt. Process success alone does not prove performance acceptance.",
+  "derived_benchmark_rows": {
+    "benchmark_row_count": 3,
+    "input_raw_log_sha256": "cbad5d8bde3940610c381410a4e3545e443f8bd781d6ffa372b1c1bb07832418",
+    "parser": "terminal Go benchmark result rows; retains iterations, ns/op, estimated-B/s, B/op, and allocs/op",
+    "raw_log": "excluded"
+  },
+  "paired_baseline": {
+    "archive": "pacing-estimator-baseline",
+    "benchmark_rows_sha256": "29a056484713681dd374876d4e75edcc62837ac79927f5d1b9bc925b91698815",
+    "baseline_source_sha256": "1723893525a52cb8fff81c42f7c4ffd545fc055b96a1dca5e19d45cfcf935355"
+  },
+  "redaction": {
+    "raw_logs": "excluded",
+    "source_and_binary_contents": "excluded",
+    "local_paths": "excluded",
+    "external_local_replacement_locations": "redacted"
+  }
+}

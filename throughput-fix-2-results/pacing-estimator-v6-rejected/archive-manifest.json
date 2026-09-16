@@ -1,0 +1,21 @@
+{
+  "files": {
+    "benchmark-rows.jsonl": "dea45850fe9f8e5363c47f41be08b01fccc65cf414af1bc44ad90af2c25fb4bb",
+    "benchmark-summary.json": "fdf805588dad1b2d90d6b8ab416a53a858d54f5ed0b7ba00b672953d9fc247da",
+    "ledger.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "manifest.json": "1297df784d51bbad9664a12f7d62a000e8a7d15e5773fe2b1dff28d5530ff702",
+    "outcomes.txt": "c26de83abdc9496cd1301470918ec39ecca1cf389ef0ae1c6504da1800d1c431",
+    "paired-metrics.jsonl": "625433f87caaa8b9856c816b1d6f3db9438307fdcb499a39057674a749b640b7",
+    "provenance.json": "fb1de4c5be42ffc775ecf7d1a4d07b9f8ac8e00bb5cae7378a2f473a2e6faea8",
+    "status.json": "67db05906608c1b68bdd9844caf9fec466902be185769aeb9630b6543dc208d0"
+  },
+  "input_hashes_preserved_in": "provenance.json",
+  "redaction": {
+    "external_local_replacement_locations": "redacted",
+    "local_paths": "excluded",
+    "raw_logs": "excluded",
+    "source_and_binary_contents": "excluded"
+  },
+  "schema": "throughput-fix-2/pacing-estimator-v6-rejected-archive-manifest-v1",
+  "verification": "candidate source inventory equals the frozen baseline inventory except for the declared v6 pacing file; source inventory remains unchanged through compile and benchmark run"
+}

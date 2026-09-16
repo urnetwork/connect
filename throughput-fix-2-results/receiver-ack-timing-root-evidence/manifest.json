@@ -1,0 +1,12 @@
+{
+  "archive_kind": "receiver_ack_timing_root_evidence",
+  "file_count": 5,
+  "file_sha256": {
+    "excluded-fixture-diagnostic-outcomes.jsonl": "9476232f5fa370d9a866fa8943c817c76abd3eb56e50ee624ee065734e4bd17d",
+    "outcomes.jsonl": "346ce806f67027b049c0b3dcaa379549443b3ab1f8064957b5108f43c55ba662",
+    "provenance.json": "59a31ce2a20859601280821aaa7303da505c11492e4c37a5547fbbbe6f985561",
+    "readings-summary.json": "a5196abbe1d8e146fa491170c925412d16e0d1030e3e970310ac3504090bedb7",
+    "status.json": "ba397a7123b5de436baf2fafdc82ce861a2f463d893f21a856589c8a3b772bd8"
+  },
+  "schema_version": 1
+}

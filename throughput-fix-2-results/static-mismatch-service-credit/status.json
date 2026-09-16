@@ -1,0 +1,32 @@
+{
+  "archive_result": "complete_pinned_original_static_mismatch_matrix",
+  "normal_run": {
+    "compile_exit_code": 0,
+    "duration": "352.32s",
+    "host_load_average_at_compile_start": [
+      11.67626953125,
+      11.419921875,
+      11.77001953125
+    ],
+    "host_load_average_at_finish": [
+      11.19287109375,
+      14.38818359375,
+      13.67724609375
+    ],
+    "host_load_average_at_test_start": [
+      38.4921875,
+      17.58203125,
+      13.97021484375
+    ],
+    "race_warning_blocks": 0,
+    "service_readings": 216,
+    "test_exit_code": 0,
+    "top_level_fail": 0,
+    "top_level_pass": 1
+  },
+  "setup_only_attempt": {
+    "compile_exit_code": 1,
+    "service_readings": 0,
+    "test_started": false
+  }
+}

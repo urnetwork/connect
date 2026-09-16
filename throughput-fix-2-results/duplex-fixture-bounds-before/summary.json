@@ -1,0 +1,190 @@
+{
+  "binary_sha256": "6aed71ac77a2a33b38db47f5011e786676ce644df924a6b691fbb4bb5990f42d",
+  "declared_cells_per_repetition": 4,
+  "declared_readings": 12,
+  "failure": {
+    "direction": 1,
+    "flows": 1,
+    "limit_mbps": 101,
+    "observed_mbps": [
+      83.15904,
+      804.46464
+    ],
+    "upload": true
+  },
+  "limits": [
+    "All nine observed numerical rows are retained in ledger.jsonl.",
+    "No source, binary, raw log, command or local path is included.",
+    "This is a failure-before fixture result; it does not validate a repair or infer the unobserved fourth cell."
+  ],
+  "missing_declared_cell": {
+    "flows": 8,
+    "lanes": 8,
+    "reason": "No reading occurred after each invocation terminally failed at the preceding upload=true, flows=1 direction-limit assertion.",
+    "upload": true
+  },
+  "observed": [
+    {
+      "direction_mbps": [
+        12.8512,
+        95.71328
+      ],
+      "flows": 1,
+      "lanes": 1,
+      "measurement_relay_drops": 0,
+      "minimum_flow_mbps": 12.8512,
+      "nat_refused": 0,
+      "reading_index": 0,
+      "relay_drops": 0,
+      "total_mbps": 108.56448,
+      "upload": false
+    },
+    {
+      "direction_mbps": [
+        12.482560000000001,
+        95.31392000000001
+      ],
+      "flows": 8,
+      "lanes": 8,
+      "measurement_relay_drops": 0,
+      "minimum_flow_mbps": 0.50176,
+      "nat_refused": 0,
+      "reading_index": 1,
+      "relay_drops": 0,
+      "total_mbps": 107.79648,
+      "upload": false
+    },
+    {
+      "direction_mbps": [
+        83.15904,
+        804.46464
+      ],
+      "flows": 1,
+      "lanes": 1,
+      "measurement_relay_drops": 0,
+      "minimum_flow_mbps": 83.15904,
+      "nat_refused": 0,
+      "reading_index": 2,
+      "relay_drops": 0,
+      "total_mbps": 887.62368,
+      "upload": true
+    },
+    {
+      "direction_mbps": [
+        12.86144,
+        95.72352
+      ],
+      "flows": 1,
+      "lanes": 1,
+      "measurement_relay_drops": 0,
+      "minimum_flow_mbps": 12.86144,
+      "nat_refused": 0,
+      "reading_index": 3,
+      "relay_drops": 0,
+      "total_mbps": 108.58496,
+      "upload": false
+    },
+    {
+      "direction_mbps": [
+        12.595199999999998,
+        95.3344
+      ],
+      "flows": 8,
+      "lanes": 8,
+      "measurement_relay_drops": 0,
+      "minimum_flow_mbps": 0.52224,
+      "nat_refused": 0,
+      "reading_index": 4,
+      "relay_drops": 0,
+      "total_mbps": 107.9296,
+      "upload": false
+    },
+    {
+      "direction_mbps": [
+        83.2,
+        805.60128
+      ],
+      "flows": 1,
+      "lanes": 1,
+      "measurement_relay_drops": 0,
+      "minimum_flow_mbps": 83.2,
+      "nat_refused": 0,
+      "reading_index": 5,
+      "relay_drops": 0,
+      "total_mbps": 888.80128,
+      "upload": true
+    },
+    {
+      "direction_mbps": [
+        12.86144,
+        95.744
+      ],
+      "flows": 1,
+      "lanes": 1,
+      "measurement_relay_drops": 0,
+      "minimum_flow_mbps": 12.86144,
+      "nat_refused": 0,
+      "reading_index": 6,
+      "relay_drops": 0,
+      "total_mbps": 108.60544,
+      "upload": false
+    },
+    {
+      "direction_mbps": [
+        12.62592,
+        95.28320000000001
+      ],
+      "flows": 8,
+      "lanes": 8,
+      "measurement_relay_drops": 0,
+      "minimum_flow_mbps": 0.53248,
+      "nat_refused": 0,
+      "reading_index": 7,
+      "relay_drops": 0,
+      "total_mbps": 107.90912,
+      "upload": false
+    },
+    {
+      "direction_mbps": [
+        83.23072,
+        805.888
+      ],
+      "flows": 1,
+      "lanes": 1,
+      "measurement_relay_drops": 0,
+      "minimum_flow_mbps": 83.23072,
+      "nat_refused": 0,
+      "reading_index": 8,
+      "relay_drops": 0,
+      "total_mbps": 889.11872,
+      "upload": true
+    }
+  ],
+  "recorded_by_cell": [
+    {
+      "flows": 1,
+      "readings": 3,
+      "upload": false
+    },
+    {
+      "flows": 8,
+      "readings": 3,
+      "upload": false
+    },
+    {
+      "flows": 1,
+      "readings": 3,
+      "upload": true
+    },
+    {
+      "flows": 8,
+      "readings": 0,
+      "upload": true
+    }
+  ],
+  "recorded_readings": 9,
+  "requested_repetitions": 3,
+  "schema": "throughput-fix-2/duplex-fixture-bounds-before-summary-v1",
+  "source_sha256": "e55aff113c3715b98f2510202baa6b4d636e2319e68db6e5c51adc78fa663baa",
+  "status": "failure-before; fixture production unchanged"
+}

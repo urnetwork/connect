@@ -1,0 +1,96 @@
+{
+  "binary_sha256": "56a38d4b8b502ff6ea6fe5efbc359208d0606cedfbeec79f54b7d9857fc2894c",
+  "cells": [
+    {
+      "flows": 1,
+      "rate_after_bytes_per_second": 0,
+      "rate_bytes_per_second": 12500000,
+      "readings": 3,
+      "round_trip_after_ns": 0,
+      "upload": false
+    },
+    {
+      "flows": 8,
+      "rate_after_bytes_per_second": 12500000,
+      "rate_bytes_per_second": 6250000,
+      "readings": 3,
+      "round_trip_after_ns": 0,
+      "upload": false
+    },
+    {
+      "flows": 8,
+      "rate_after_bytes_per_second": 0,
+      "rate_bytes_per_second": 12500000,
+      "readings": 3,
+      "round_trip_after_ns": 0,
+      "upload": false
+    },
+    {
+      "flows": 8,
+      "rate_after_bytes_per_second": 6250000,
+      "rate_bytes_per_second": 12500000,
+      "readings": 3,
+      "round_trip_after_ns": 0,
+      "upload": false
+    },
+    {
+      "flows": 1,
+      "rate_after_bytes_per_second": 0,
+      "rate_bytes_per_second": 12500000,
+      "readings": 3,
+      "round_trip_after_ns": 0,
+      "upload": true
+    },
+    {
+      "flows": 8,
+      "rate_after_bytes_per_second": 12500000,
+      "rate_bytes_per_second": 6250000,
+      "readings": 3,
+      "round_trip_after_ns": 0,
+      "upload": true
+    },
+    {
+      "flows": 8,
+      "rate_after_bytes_per_second": 0,
+      "rate_bytes_per_second": 12500000,
+      "readings": 3,
+      "round_trip_after_ns": 0,
+      "upload": true
+    },
+    {
+      "flows": 8,
+      "rate_after_bytes_per_second": 6250000,
+      "rate_bytes_per_second": 12500000,
+      "readings": 3,
+      "round_trip_after_ns": 0,
+      "upload": true
+    }
+  ],
+  "declared_readings": 24,
+  "direction_bounds_mbps": {
+    "maximum": 95.72352,
+    "minimum": 6.1952,
+    "physical_limit": 101
+  },
+  "file_pins": {
+    "transfer_window_duplex_fixture_test.go": "ca9d25c539eaa766526a4cc674303fa63e9a02bf0736c53a61b4ca7934cbf566",
+    "transfer_window_path_performance_test.go": "32e4b4d276003ecfffc8622ccfc0e2f08626d26cb115137f33b8ff972cc2e6c6",
+    "transfer_window_sdk_performance_test.go": "1f814f19228996fb6f29146b4061c24bd3e4646ff0f48814a20b41beb4af2fb4"
+  },
+  "limits": [
+    "All 24 complete numerical service rows are retained in ledger.jsonl.",
+    "No raw source, binary, raw log, command or local path is included.",
+    "This scoped fixture validation does not replace the pending mismatch or long-drain investigations."
+  ],
+  "measurement_relay_drops": 0,
+  "readings": 24,
+  "schema": "throughput-fix-2/duplex-fixture-bounds-after-summary-v1",
+  "snapshot_input_sha256": "c10d0107a9c85e052a03222d42a674e3b1777c6278bee02fc9019366e9d959d8",
+  "source_sha256": "00093323fc8563a7d64f999f11787d9083b3b1f48e1cd67884f7bf3fdf317ec9",
+  "status": "passed; fixture serializer and SDK physical-rate calibration after control",
+  "top_level": {
+    "fail": 0,
+    "pass": 6,
+    "skip": 0
+  }
+}

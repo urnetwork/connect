@@ -1,0 +1,24 @@
+{
+  "archive_result": "complete_pinned_root_owned_mismatch_ledgers",
+  "by_variant": {
+    "broad-v1": {
+      "exit_status": 1,
+      "result": "FAIL",
+      "rows": 12
+    },
+    "hybrid-v1": {
+      "exit_status": 1,
+      "result": "FAIL",
+      "rows": 12
+    },
+    "legacy-consumer-v1": {
+      "exit_status": 1,
+      "result": "FAIL",
+      "rows": 12
+    }
+  },
+  "numerical_readings": 36,
+  "top_level_fail": 3,
+  "top_level_pass": 0,
+  "variants": 3
+}

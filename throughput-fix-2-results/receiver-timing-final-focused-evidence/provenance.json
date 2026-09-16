@@ -1,0 +1,196 @@
+{
+  "archive_kind": "receiver_timing_final_focused_evidence",
+  "attribution_limits": [
+    "Append to the previously archived receiver root checkpoint; do not relabel fixture diagnostics as production defects.",
+    "Final162PASS race executions include deterministic receiver/sender and local/shared timing, old rawRtt and ACK compression controls; no throughput claim comes from this block.",
+    "Field12 removes ingress-to-encoding receiver residence only. Forward/reverse queues, retry ambiguity and post-encoding queue time remain.",
+    "Known three absent-metadata legacy drain roots are not selected by this focused block and remain separately unresolved. No old drain/retry heuristic candidate is included.",
+    "Archive normalized numerical readings, outcome names, classification and hashes only. No raw logs, source, overlays, binaries, identifiers or local paths in repository evidence."
+  ],
+  "final_guarded_handoff": {
+    "name": "receiver-timing-final-handoff.json",
+    "sha256": "166cfbc3c335f3fc54b1462a9dc2865a1dd413abf16f9dce19ac30489e92ed91"
+  },
+  "handoff": {
+    "candidate_label": "receiver-timing-final-focused",
+    "name": "receiver-timing-final-evidence-handoff.json",
+    "sha256": "ed9cf5ec5f79010c57d586bd5957d1306933e0cfd58c6421accad68d92557bb6",
+    "status": "Parent guarded-integrated all15 files after review; parent moved cadence query before deliveredBytesMutex only. These isolated binaries retain exact handed-off production before that lock-order-only amendment. Full correctness/performance underway separately."
+  },
+  "runs": [
+    {
+      "binary_sha256": "c40ba4aa269ea64b933d2a6c0643e59a3eff9895cfd8381858614370ad4cde69",
+      "build_manifest_sha256": "d866492d6b9abdb79b1330f4eddcffe891f57a8967cf1ca47754b97c69f7dac5",
+      "classification": "fixture-diagnostic",
+      "complete": true,
+      "effective_input_sha256": "76f4b2203db7cb9f5ec988ca1dd58a7e544c2490708c8bebd24b021a38bca616",
+      "inputs_stable_during_build": true,
+      "note": "Cancellation fixture allowed a real successful buffered write. Its expectation of no sample was invalid; final fixture uses an unwritable route. No production defect attributed.",
+      "original_log_sha256": "d402599085fcf96db4fded9b5258050fd0ca0d9f44e60ad61f3f70193a8e45d5",
+      "outcome_count": 54,
+      "overlay_sha256": "6a8dcdb164e6c885098af0d7b9db4e28245f4a1a5ced3e24baf813717f951840",
+      "race_warning_count": 0,
+      "reading_count": 0,
+      "run_id": "sender-v3-focused-race"
+    },
+    {
+      "binary_sha256": "b63ea4586fa5b500d0ae8f7d4c06cc464f76c4673fc818fbe92e447e8a4557e9",
+      "build_manifest_sha256": "4110f0d15d48037ba5e7c08c137fa065656e0246edcca4d95f0a3d32d34df5a8",
+      "classification": "fixture-diagnostic",
+      "complete": true,
+      "effective_input_sha256": "ac0547eb7de272dda87aab0e3ffd2067c2baca9b4c79119825f775b1980af6f1",
+      "inputs_stable_during_build": true,
+      "note": "Mixed-order root correctly rejected the stale observation; the later assertion incorrectly ignored a still-retained valid300ms minimum. Final fixture retains that minimum.",
+      "original_log_sha256": "b799219e038ed11ae665f36e053bb4026451d6f6d2eec4d9532c94698bfa9298",
+      "outcome_count": 111,
+      "overlay_sha256": "bbcc846fda5e486ea7058f5b2eb984f42c092d1fb2717c830c02089f7ff7b5fd",
+      "race_warning_count": 0,
+      "reading_count": 15,
+      "run_id": "combined-v2-focused-race"
+    },
+    {
+      "binary_sha256": "4801f3076d66277a24e281efd0aa03302e30d79e57853f781ef56b70084b1dd1",
+      "build_manifest_sha256": "1c81a8540ee4f7de3015bef2ed86383c18f87997a332a8106693d9295fe60f60",
+      "classification": "deterministic-failure-before",
+      "complete": true,
+      "effective_input_sha256": "c83306a1ba8838bb3a0ff1fcae9410f19444aefedd6b9ddce855b3fb0870d994",
+      "inputs_stable_during_build": true,
+      "note": "After rejected actual write, byte application still enters legacy tag path and fabricates raw12ms. Final sender coalescing suppression closes this path.",
+      "original_log_sha256": "0288258136147f5834f55347cdefc068258f3b0bf771c3b7a9aba57183e944cf",
+      "outcome_count": 3,
+      "overlay_sha256": "427ecb588708044dd4fef13fd6b59642d9fdcb8a924bfd8384428883684b7116",
+      "race_warning_count": 0,
+      "reading_count": 3,
+      "run_id": "sender-v2-confirmation-before-race"
+    },
+    {
+      "binary_sha256": "2adb016db85a4b34aa6554921ca1c4b92b097622ae06cec9d9d2aab76fe4297c",
+      "build_manifest_sha256": "bebe6b243c04cf256602f9bbbdda1ea818d03be1fe168f15f8165d57f1f50798",
+      "classification": "historical-failure-before",
+      "complete": true,
+      "effective_input_sha256": "b72e679de80a857e0f079b8854f305425118a0815986d89702ef6ea547a17e78",
+      "inputs_stable_during_build": true,
+      "note": "Both roots fail at intended first invariant; later positive assertion still has fixture mistake. Corrected identical-first-invariant run below is authoritative.",
+      "original_log_sha256": "7e64465ae546855154aa77c7487257a6f4f90e6df9245b225488b77507aea27a",
+      "outcome_count": 6,
+      "overlay_sha256": "27f7d4f49f7c6b25c07d244b32d8917da6975205be088311360efdbe9a394416",
+      "race_warning_count": 0,
+      "reading_count": 6,
+      "run_id": "sender-v3-ordering-before-race"
+    },
+    {
+      "binary_sha256": "72c538aeadaa4fa191a28cc2f0064c7497cb63ee652203095342276eb0f48336",
+      "build_manifest_sha256": "1eaf82fa0e1ac0b53aec926c77ef5f98bb4defc079cabc97c29d03f87b9adc99",
+      "classification": "deterministic-failure-before",
+      "complete": true,
+      "effective_input_sha256": "352a63e504d3435e93ea21f358635bfaeb5a001c67e1c48fd40626796e1eac4d",
+      "inputs_stable_during_build": true,
+      "note": "Final tests against unchangedv3: interleaved legacy arrival permits stale1ms metadata; raw+advertised delay double-counts cadence41.935484ms instead of25.806452ms.",
+      "original_log_sha256": "bb737735fa87afdbc4a516c27dad118ab2b54b4cd03f2263c8856ed33e4e8d28",
+      "outcome_count": 6,
+      "overlay_sha256": "6329df82ef3b80bba4a71a79ed8c6bfd0fb1806ba9fe6693d7506444278e19a0",
+      "race_warning_count": 0,
+      "reading_count": 6,
+      "run_id": "sender-v3-ordering-corrected-before-race"
+    },
+    {
+      "binary_sha256": "bd7c982ff564fbf3898064dbb4fc0e086254d2ffea26f93a43f31f34ee10038a",
+      "build_manifest_sha256": "b853c9226977c3dc959d162e66e35f89e670aa5562c116f9aa749f0cc8cfb2ab",
+      "classification": "final-candidate-focused-after",
+      "complete": true,
+      "effective_input_sha256": "802bd87d7795c9a938b6b55a46450e81785a335b937d0e37d6bf9c5eecf69705",
+      "inputs_stable_during_build": true,
+      "note": "Final integrated receiver/sender/shared service timing;162 race executions pass including corrected roots and legacy Rtt/ACK-compression controls.",
+      "original_log_sha256": "8252d1b5480bc4593e964421ef6848e98834b73e233b1e166897f49b7e4c49e8",
+      "outcome_count": 162,
+      "overlay_sha256": "cddd41d4fe87dc569220b9baaea112c87655415337fe4268e46da875de4b9ab9",
+      "race_warning_count": 0,
+      "reading_count": 15,
+      "run_id": "combined-v3-focused-race"
+    }
+  ],
+  "sanitization": {
+    "local_paths_generated_ids_network_addresses": "removed from archive text",
+    "raw_logs": "retained locally; SHA-256 only",
+    "sources_overlays_binaries": "not copied; names and SHA-256 pins only"
+  },
+  "schema_version": 1,
+  "scope": {
+    "legacy_drain_roots": "not selected and remain separately unresolved",
+    "performance_acceptance": "not evaluated by focused block",
+    "source_time_boundary": "pre-lock-order-only cadence amendment; current integrated production must be validated separately",
+    "throughput_claim": "none"
+  },
+  "source_pins": {
+    "production": [
+      {
+        "name": "combined-v2-transfer.go",
+        "sha256": "dd5bf2f3037cd30f9ba913b478819b6b9b155da7aeb6d51f49774edeec2e88f6"
+      },
+      {
+        "name": "sender-v4-rtt.go",
+        "sha256": "3145e30033725bd46ed8cb122ea040ea404b52f69290996ad43377fddecc435f"
+      },
+      {
+        "name": "sender-v3-ack-compression.go",
+        "sha256": "e52e1598fe69cd3378908b48c66a13691e9001acc456332250ecb2f9b657f299"
+      },
+      {
+        "name": "receiver-timing.go",
+        "sha256": "45ae7042cf420ebe2b9dd46d9b7c454e45088073429bb244f5d8c19067e9e3ba"
+      },
+      {
+        "name": "sender-v3-service-timing.go",
+        "sha256": "2473d14f3b9e11c3f758293f6d3c343e17131207b584cb040b42c55e7e3279cc"
+      },
+      {
+        "name": "candidate-pacing.go",
+        "sha256": "cfd8d0e686a339e920200a56794c3e7c00f5fb42c8d567d5a24ec8a6bf60f2d0"
+      },
+      {
+        "name": "receiver-rtt.go",
+        "sha256": "b3ceb1f8c4598a2f1facc40e68bdcfa88fbb9e5100e0076babb37d34795f141e"
+      }
+    ],
+    "tests": [
+      {
+        "name": "receiver-root_test.go",
+        "sha256": "a2a23360bcb182119cb93eccc34ab2657e2b196f15a323bc2314816c79ab0348"
+      },
+      {
+        "name": "receiver-adjacent-v2_test.go",
+        "sha256": "33842f5ab70a3d56ba699411309877c7ba0de833ea5aba5b828a418bcc0564f1"
+      },
+      {
+        "name": "sender-root_test.go",
+        "sha256": "c06fea6667ffed37a50383c307848420791c167b3f4baf599b9cc7e71c4c54e4"
+      },
+      {
+        "name": "sender-confirmation-v2_test.go",
+        "sha256": "a7ca860187e8cb671b90da59244c06fdc4f821b51155c79e3a7e23da22d45991"
+      },
+      {
+        "name": "sender-adjacent-v2_test.go",
+        "sha256": "eef5ba110c47dc4d6c4d33acf9d4becab6ceff6c0ecd6e1d2d2c10c2aeb34763"
+      },
+      {
+        "name": "sender-ordering-residence-v2_test.go",
+        "sha256": "3ca25da3f83a017c4b6433a31ae758148d9ae2434831e4fac32bf47898caee19"
+      },
+      {
+        "name": "service-root_test.go",
+        "sha256": "32223f5eb0a7edd2af39b110bd0a09d5394bb9afb37edfb2fc21a0f383cacaf4"
+      },
+      {
+        "name": "service-adjacent_test.go",
+        "sha256": "ec916f0cd9d156e44161f2e41311d64a32e13bd488ad129529eb244e89a00cab"
+      }
+    ]
+  },
+  "verification": {
+    "all_build_inputs_stable": true,
+    "all_race_warning_count_zero": true,
+    "all_runs_complete": true,
+    "verified_file_pins": 40
+  }
+}

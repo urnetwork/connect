@@ -1,0 +1,10 @@
+{
+  "assertion_failure_row_count": 9,
+  "complete": true,
+  "fail_count": 6,
+  "go_test_execution_count": 9,
+  "pass_count": 3,
+  "schema": "throughput-fix-2/window-mismatch-v4-arrival-status-v1",
+  "skip_count": 0,
+  "status": "failure-before complete"
+}

@@ -1,0 +1,62 @@
+{
+  "checked_manifest_sha256": {
+    "applied-manifest.json": "7d6396ada88fb5c8bff5b624caf88fdb9ce44526a361d6fb7bc8dbf0a38af24a",
+    "final-manifest.json": "481281288e2d56ec7ddaee6ca606b30d55356aa0bd5be8b5e71d3b8ea11ebf2b",
+    "manifest.json": "4a1f9a6e4fe72cde40f0d79bb77eb358d3cb4426b7bdb98a4171cdead4c8b206",
+    "virtual-v2-manifest.json": "c315e1a8d767524970b9f2e3280341a0b8cf7ed3b2b1e413141b088790e77083",
+    "virtual-v3-manifest.json": "7b1637625e8e3b43aee6fb99134dad59b02a5968e88a8e167c23d9cdcc52a2c4"
+  },
+  "final_race": {
+    "binary_sha256": "f4504b602d2152728d836d78ddc1704cd4b52f324035b5d885d3f7888e6644d8",
+    "host_load_average_at_start": [
+      7.18212890625,
+      10.787109375,
+      12.27490234375
+    ],
+    "input_sha256": "42e70c0172983894b5bfa5c743898fa43c4cafd3d25500cbfdf91461b9487f36",
+    "log_sha256": "9aab2768672858da6b2e4ad2d9985bf89f1895d0f06f9fe82495f889bc58afe8",
+    "outcomes": {
+      "FAIL": 0,
+      "PASS": 9,
+      "SKIP": 0
+    },
+    "race_warnings": 0
+  },
+  "fixture": {
+    "candidate_sha256": "a518e7fa0aee6e1ad0fead1cdaf3f2fe11851db5ccb085ff6492895a6492bc97",
+    "current_shared_source_matches_candidate": true,
+    "preintegration_guard_sha256": "896220ef2cdeef7ac1fba41df11684d42f52134e29c54e037e985944aff5b5f9",
+    "target": "flight_gate_mixed_lane_gap_test.go"
+  },
+  "handoff_sha256": "99e14c8761bdf7382dc9ca33fd38aee552f2df0ae8d64187ad3fb6d2a0e17e82",
+  "virtual_controls": {
+    "virtual-constant": {
+      "binary_sha256": "1ea646c5e424a1583cdd6e9a57ce8c130360e3fd1e74798f664a4488e37ccd98",
+      "candidate_sha256": "8919c1932e3ebab6f2f288ed5dc09deb69d0d0bf5b9a9343f955c3300a60cbb1",
+      "copied_source_sha256": "8919c1932e3ebab6f2f288ed5dc09deb69d0d0bf5b9a9343f955c3300a60cbb1",
+      "elapsed_seconds": 2.2750868340954185,
+      "exit_status": 0,
+      "log_sha256": "028d5c2d1d5539ccc11c5215fb1e387ca27f9bb32c0de4aaf67e260f9635dbaa",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warnings": 0
+    },
+    "virtual-current": {
+      "binary_sha256": "d7b24a8d214f214943ba81c8f1634e4b3fb188aeee74a0f33ccfce4b0508b743",
+      "candidate_sha256": "10f7620fc704d08681b24ba7166d0e26ed41e151e5e95b19624be4a81f80c5e4",
+      "copied_source_sha256": "10f7620fc704d08681b24ba7166d0e26ed41e151e5e95b19624be4a81f80c5e4",
+      "elapsed_seconds": 0.9441684582270682,
+      "exit_status": 1,
+      "log_sha256": "8cb8f1372e9ef0e3d553d393f64ede3010760c81c9713b7eeea0725626fa3b04",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warnings": 0
+    }
+  }
+}

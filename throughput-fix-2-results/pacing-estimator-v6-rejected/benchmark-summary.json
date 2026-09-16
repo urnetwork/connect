@@ -1,0 +1,18 @@
+{
+  "accepted_as_performance_validation": false,
+  "baseline_archive": "pacing-estimator-baseline",
+  "baseline_benchmark_rows_sha256": "29a056484713681dd374876d4e75edcc62837ac79927f5d1b9bc925b91698815",
+  "baseline_canonical_source_sha256": "1723893525a52cb8fff81c42f7c4ffd545fc055b96a1dca5e19d45cfcf935355",
+  "benchmark_count": 3,
+  "benchmark_fixture_sha256": "2ee8b461e9aa5c08b463838eebb43db4ab17601e429bf6105c800df5048ec919",
+  "candidate_canonical_source_sha256": "952dcab24acbb58dada1fa744ecf371b1c54e4db41bdce98890bdef4de9e1e57",
+  "candidate_pacing_sha256": "fceaebe198fb2d58dd419adcd6e6bf2a9fa5f50c1812508a6e9112dd5da82452",
+  "candidate_status": "rejected correctness candidate; unlanded",
+  "cpu_cost_scope": "same frozen baseline source and fixture with only transfer_window_pacing.go replaced; non-race 500ms benchmark sample",
+  "rate_assertion_failures": 0,
+  "schema": "throughput-fix-2/pacing-estimator-v6-rejected-summary-v1",
+  "source_file_difference": [
+    "transfer_window_pacing.go"
+  ],
+  "status": "benchmark process passed; CPU/allocation comparison only, not throughput acceptance"
+}

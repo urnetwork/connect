@@ -1,0 +1,11 @@
+{
+  "archive_kind": "receiver_timing_final_focused_evidence",
+  "file_count": 4,
+  "file_sha256": {
+    "outcomes.jsonl": "985012a8534cf852ff3eba616e82f9f636d33e070ec356e2e69b03aa6c533578",
+    "provenance.json": "261187e986f1c7a0f4661d3064266c9899ac860859d6d978abfc43173b38ed85",
+    "readings.jsonl": "661029f44cf83178c42926879c71a25f5b05012449c4ae7603440b5e5297ac93",
+    "status.json": "07ee8d65732ca30ff60c5380412fe121a157e295e0c6d304fbbc0ddb8b15f7ca"
+  },
+  "schema_version": 1
+}

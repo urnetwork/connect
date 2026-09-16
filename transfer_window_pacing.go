@@ -25,6 +25,7 @@ type windowBurstPacer struct {
 	probeLimit            ByteCount
 	serviceSent           ByteCount
 	serviceAcked          ByteCount
+	serviceClosed         bool
 	afterWaitForTest      func()
 	afterAdmissionForTest func()
 	waiter                windowPacingWaiter
@@ -329,43 +330,58 @@ func (self *windowBurstPacer) waitUntilChanged(ctx context.Context, deadline tim
 // opening probe. References are protected by SendBuffer.mutex; all timing and
 // delivery methods below are safe for concurrent use.
 type windowPacingService struct {
-	stateLock           sync.Mutex
-	references          int
-	next                time.Time
-	burst               windowPacingBurst
-	dispatchBurst       windowPacingBurst
-	burstEstimateTime   time.Duration
-	burstMeter          windowPacingBurstMeter
-	waiterHead          *windowPacingWaiter
-	waiterTail          *windowPacingWaiter
-	probeSent           ByteCount
-	samples             [deliveredBytesRingSize]windowServiceSample
-	newestBucket        int64
-	hasSamples          bool
-	serviceEpochAt      time.Time
-	serviceHoldRate     ByteCount
-	total               ByteCount
-	sent                ByteCount
-	reservedByteCount   ByteCount
-	pacingReservations  int
-	maxMessageByteCount ByteCount
-	minRoundTrip        time.Duration
-	latestRoundTrip     time.Duration
-	compression         time.Duration
-	lastRoundTrip       time.Time
-	roundTripStats      windowBurstStats
-	drainCheckAt        time.Time
-	drainUntil          time.Time
-	drainWake           chan struct{}
-	drainServiceEpoch   bool
-	sourceIdleAt        time.Time
-	bucketInterval      time.Duration
-	writes              map[Id]windowPacingWrite
-	pendingWrites       int
-	drained             bool
-	drainedSent         ByteCount
-	drainGeneration     uint64
-	roundTripProbe      windowPacingRoundTripProbe
+	stateLock         sync.Mutex
+	references        int
+	next              time.Time
+	burst             windowPacingBurst
+	dispatchBurst     windowPacingBurst
+	burstEstimateTime time.Duration
+	burstMeter        windowPacingBurstMeter
+	waiterHead        *windowPacingWaiter
+	waiterTail        *windowPacingWaiter
+	probeSent         ByteCount
+	samples           [deliveredBytesRingSize]windowServiceSample
+	newestBucket      int64
+	hasSamples        bool
+	serviceEpochAt    time.Time
+	serviceHoldRate   ByteCount
+	// Fixed summaries survive ACK gaps longer than the timestamp ring.
+	// An incomplete cycle holds service; actual timestamps or fully applied
+	// proved delivery complete it, independently of the old byte rate.
+	feedbackAt           time.Time
+	feedbackCycleBefore  time.Time
+	feedbackCycle        windowServiceSample
+	feedbackComplete     windowServiceSample
+	feedbackFresh        windowServiceSample
+	feedbackPending      bool
+	feedbackInterval     time.Duration
+	feedbackDrainAt      time.Time
+	feedbackDrainPending ByteCount
+	total                ByteCount
+	sent                 ByteCount
+	reservedByteCount    ByteCount
+	pacingReservations   int
+	maxMessageByteCount  ByteCount
+	minRoundTrip         time.Duration
+	latestRoundTrip      time.Duration
+	compression          time.Duration
+	lastRoundTrip        time.Time
+	roundTripStats       windowBurstStats
+	receiverRoundTrips   *windowReceiverRoundTrips
+	drainMaximumTime     time.Duration
+	drainStartedAt       time.Time
+	drainCheckAt         time.Time
+	drainUntil           time.Time
+	drainWake            chan struct{}
+	drainServiceEpoch    bool
+	sourceIdleAt         time.Time
+	bucketInterval       time.Duration
+	writes               map[Id]windowPacingWrite
+	pendingWrites        int
+	drained              bool
+	drainedSent          ByteCount
+	drainGeneration      uint64
+	roundTripProbe       windowPacingRoundTripProbe
 }
 
 // One tail per live sequence bounds tracking independently of window size.
@@ -384,16 +400,19 @@ type windowPacingWrite struct {
 // measures the changed path. Keep its earliest covering ACK before send-loop
 // coalescing can absorb that timestamp into a later head.
 type windowPacingRoundTripProbe struct {
-	sequenceId       Id
-	messageId        Id
-	number           uint64
-	sentAt           time.Time
-	ackedAt          time.Time
-	compression      time.Duration
-	written          bool
-	serviceRate      ByteCount
-	resetService     bool
-	pendingByteCount ByteCount
+	sequenceId        Id
+	messageId         Id
+	number            uint64
+	sentAt            time.Time
+	ackedAt           time.Time
+	compression       time.Duration
+	written           bool
+	serviceRate       ByteCount
+	resetService      bool
+	pendingByteCount  ByteCount
+	receiverTiming    windowReceiverRoundTripSample
+	receiverTimingSet bool
+	observedRoundTrip time.Duration
 }
 
 // Records delivery while send workers are pacing. SACKs may complete the
@@ -438,6 +457,13 @@ func (self *windowPacingService) beginWrite(sequenceId, messageId Id, number uin
 // Enrollment shares the release lock in production. Confirmation still
 // comes from the actual writer, including its chosen carrier and any failure.
 func (self *windowPacingService) beginWriteWithLock(sequenceId, messageId Id, number uint64, at time.Time, resend bool) {
+	// A resumed write clears drained, but cannot erase the old flight's
+	// unapplied bytes. Newer ACKs cannot spend that earlier byte credit.
+	if self.feedbackPending && self.drained {
+		self.feedbackDrainAt = at
+		self.feedbackDrainPending = max(0, self.drainedSent-self.total)
+		self.feedbackFresh = windowServiceSample{}
+	}
 	unqueued := self.drained && !resend
 	self.drained = false
 	self.sourceIdleAt = time.Time{}
@@ -449,7 +475,7 @@ func (self *windowPacingService) beginWriteWithLock(sequenceId, messageId Id, nu
 	}
 	self.writes[sequenceId] = windowPacingWrite{messageId: messageId, unambiguous: !resend, pending: true, generation: self.drainGeneration}
 	if unqueued {
-		self.roundTripProbe = windowPacingRoundTripProbe{sequenceId: sequenceId, messageId: messageId, number: number, sentAt: at, serviceRate: self.serviceHoldRate, resetService: self.drainServiceEpoch, pendingByteCount: max(0, self.drainedSent-self.total)}
+		self.roundTripProbe = windowPacingRoundTripProbe{sequenceId: sequenceId, messageId: messageId, number: number, sentAt: at, serviceRate: self.serviceHoldRate, resetService: self.drainServiceEpoch, pendingByteCount: max(0, self.drainedSent-self.total), observedRoundTrip: self.latestRoundTrip}
 	} else if resend && self.roundTripProbe.messageId == messageId {
 		self.roundTripProbe = windowPacingRoundTripProbe{}
 	}
@@ -458,14 +484,40 @@ func (self *windowPacingService) beginWriteWithLock(sequenceId, messageId Id, nu
 	self.drainServiceEpoch = false
 }
 
+// Only the confirmed, unretried controlled probe borrows the residence
+// observed before dispatch. Its absolute deadline cannot move with later ACKs,
+// and the caller still enforces the configured recovery and delivery limits.
+func (self *windowPacingService) probeRecoveryDeadline(sequenceId, messageId Id, scale float32, maximum time.Duration) time.Time {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	probe := &self.roundTripProbe
+	if !probe.resetService || !probe.written || !probe.ackedAt.IsZero() ||
+		probe.sequenceId != sequenceId || probe.messageId != messageId ||
+		probe.observedRoundTrip <= 0 || maximum <= 0 {
+		return time.Time{}
+	}
+	interval := maximum
+	scaled := float64(probe.observedRoundTrip) * max(1, float64(scale))
+	if scaled < float64(maximum) {
+		interval = time.Duration(scaled)
+	}
+	return probe.sentAt.Add(interval)
+}
+
 // Recovery can bypass H1 pacing after a carrier change. Invalidate at the
 // common write boundary, before either copy can return an ambiguous ACK.
 func (self *windowPacingService) invalidateProbe(sequenceId Id) {
+	self.invalidateMessageProbe(sequenceId, Id{})
+}
+
+// A copied message invalidates its own probe. An unrelated retry still
+// invalidates sequence-tail drain proof but cannot duplicate the probe copy.
+func (self *windowPacingService) invalidateMessageProbe(sequenceId, messageId Id) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.drainServiceEpoch = false
 	self.sourceIdleAt = time.Time{}
-	if self.roundTripProbe.sequenceId == sequenceId {
+	if self.roundTripProbe.sequenceId == sequenceId && (messageId == (Id{}) || self.roundTripProbe.messageId == messageId) {
 		self.roundTripProbe = windowPacingRoundTripProbe{}
 	}
 	if write, ok := self.writes[sequenceId]; ok {
@@ -517,6 +569,12 @@ func (self *windowPacingService) applyRoundTripProbeWithLock() {
 		// the established rate until the resumed train measures service.
 		if probe.resetService {
 			self.serviceEpochAt, self.serviceHoldRate = probe.ackedAt, probe.serviceRate
+			self.feedbackAt, self.feedbackCycleBefore = probe.ackedAt, time.Time{}
+			self.feedbackCycle, self.feedbackComplete, self.feedbackFresh = windowServiceSample{}, windowServiceSample{}, windowServiceSample{}
+			self.feedbackPending, self.feedbackDrainAt, self.feedbackDrainPending, self.feedbackInterval = false, time.Time{}, 0, 0
+		}
+		if probe.receiverTimingSet {
+			self.receiverRoundTrips.confirmBaseline(probe.receiverTiming)
 		}
 		self.observeRoundTripWithLock(probe.ackedAt.Sub(probe.sentAt), probe.compression, probe.ackedAt, true)
 	}
@@ -665,20 +723,52 @@ func (self *windowPacingService) admitBurst(now time.Time, bytes ByteCount, rese
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if !resend {
-		if self.pendingWrites == 0 || !now.Before(self.drainUntil) {
+		timing := self.roundTripEvidenceWithLock(now)
+		maximum := self.drainMaximumTime
+		if maximum <= 0 {
+			maximum = windowPacingDrainMaximumTime
+		}
+		spanForResidence := func(residence float64) time.Duration {
+			if residence >= float64(maximum/2) {
+				return maximum
+			}
+			return min(maximum, max(4*deliverySizedWindowSampleInterval, 2*time.Duration(residence)))
+		}
+		setDeadline := func(span time.Duration) {
+			self.drainUntil = self.drainStartedAt.Add(span)
+			cooldown := time.Duration(math.MaxInt64)
+			if span <= time.Duration(math.MaxInt64/8) {
+				cooldown = max(windowPacingDrainMinimumInterval, 8*span)
+			}
+			self.drainCheckAt = self.drainStartedAt.Add(cooldown)
+		}
+		if self.pendingWrites == 0 {
 			self.drainUntil = time.Time{}
+		} else if !self.drainUntil.IsZero() {
+			// A new path sample can arrive while the older short pause is
+			// asleep. Extend that same pause from its original start; repeated
+			// evidence cannot renew the configured absolute lifetime.
+			span := spanForResidence(float64(self.latestRoundTrip))
+			if self.drainUntil.Before(self.drainStartedAt.Add(span)) {
+				setDeadline(span)
+			}
+			if !now.Before(self.drainUntil) {
+				self.drainUntil = time.Time{}
+			}
 		}
 		if self.drainUntil.IsZero() && self.pendingWrites > 0 && !now.Before(self.drainCheckAt) && self.roundTripStats.ring != nil {
 			mean, count := self.roundTripStats.ring.mean(now)
-			residence := time.Duration(min(float64(windowPacingDrainMaximumTime), mean))
 			threshold := float64(self.minRoundTrip) + float64(self.compression) + float64(max(2*time.Millisecond, self.minRoundTrip/4))
+			if timing.count > 0 {
+				mean, count = float64(timing.latest), timing.count
+				threshold = float64(timing.minimum) + float64(max(2*time.Millisecond, timing.minimum/4))
+			}
 			if count > 0 && mean > threshold {
 				// Residence is only a reason to test for a changed path.
 				// The cumulative tail ACK still has to prove an empty relay.
-				span := max(4*deliverySizedWindowSampleInterval, 2*min(windowPacingDrainMaximumTime/2, residence))
-				self.drainUntil = now.Add(span)
+				self.drainStartedAt = now
+				setDeadline(spanForResidence(max(mean, float64(self.latestRoundTrip))))
 				self.drainServiceEpoch = true
-				self.drainCheckAt = now.Add(max(windowPacingDrainMinimumInterval, 8*span))
 				if self.drainWake == nil {
 					self.drainWake = make(chan struct{}, 1)
 				}
@@ -724,14 +814,91 @@ func (self *windowPacingService) observe(bytes ByteCount, at time.Time) {
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if probe := &self.roundTripProbe; probe.resetService && !at.After(probe.sentAt) {
+	self.observeWithLock(bytes, at)
+}
+
+// Service publication and the publishing sequence's ownership move together.
+func (self *windowPacingService) observeWithLock(bytes ByteCount, at time.Time) {
+	if bytes <= 0 {
+		return
+	}
+	if probe := &self.roundTripProbe; !probe.sentAt.IsZero() && !at.After(probe.sentAt) {
 		// Only older arrivals complete the drained train's missing samples.
 		// Current delivery must not spend that older byte credit.
 		probe.pendingByteCount = max(0, probe.pendingByteCount-bytes)
 	}
+	if self.feedbackPending && !self.feedbackDrainAt.IsZero() && !at.After(self.feedbackDrainAt) {
+		self.feedbackDrainPending = max(0, self.feedbackDrainPending-bytes)
+	}
 	self.total += bytes
 	if at.Before(self.serviceEpochAt) {
 		return
+	}
+	// A gap beyond the continuous-feedback allowance starts a partial
+	// measurement turn. Keep every real byte and the original gap duration.
+	maximumGap := self.compression + 2*max(deliverySizedWindowSampleInterval, self.bucketInterval)
+	if !self.feedbackPending && !self.feedbackAt.IsZero() && at.Sub(self.feedbackAt) > maximumGap && self.serviceHoldRate > 0 && (self.outstandingWithLock() > 0 || self.drained) {
+		self.feedbackCycleBefore = self.feedbackAt
+		self.feedbackCycle, self.feedbackFresh = windowServiceSample{}, windowServiceSample{}
+		self.feedbackPending = true
+		self.feedbackInterval = max(time.Nanosecond, self.compression)
+		self.feedbackDrainAt, self.feedbackDrainPending = time.Time{}, 0
+		if probe := self.roundTripProbe; !probe.sentAt.IsZero() && at.After(self.feedbackCycleBefore) && !at.After(probe.sentAt) {
+			self.feedbackDrainAt, self.feedbackDrainPending = probe.sentAt, probe.pendingByteCount
+		}
+	}
+	// Independent workers may still apply this accepted interval in pieces.
+	// Keep its bounded summary until newer measured evidence supersedes it.
+	if !self.feedbackPending && self.feedbackComplete.bytes > 0 &&
+		(self.feedbackCycleBefore.IsZero() || at.After(self.feedbackCycleBefore)) {
+		complete := &self.feedbackComplete
+		if at.UnixNano() < complete.firstAtNanos {
+			complete.firstAtNanos, complete.firstBytes = at.UnixNano(), bytes
+		} else if at.UnixNano() == complete.firstAtNanos {
+			complete.firstBytes += bytes
+		}
+		complete.lastAtNanos = max(complete.lastAtNanos, at.UnixNano())
+		complete.bytes += bytes
+		self.feedbackInterval = max(self.feedbackInterval, self.compression)
+		self.feedbackCycle = *complete
+	}
+	// Keep the new side of a proved drain independently. Its slow pair may
+	// outlive the ring while a worker still owes old delivery accounting.
+	if self.feedbackPending && !self.feedbackDrainAt.IsZero() && at.After(self.feedbackDrainAt) {
+		fresh := &self.feedbackFresh
+		if fresh.bytes == 0 || at.UnixNano() < fresh.firstAtNanos {
+			fresh.firstAtNanos, fresh.firstBytes = at.UnixNano(), bytes
+		} else if at.UnixNano() == fresh.firstAtNanos {
+			fresh.firstBytes += bytes
+		}
+		fresh.lastAtNanos = max(fresh.lastAtNanos, at.UnixNano())
+		fresh.bytes += bytes
+	}
+	if self.feedbackPending && at.After(self.feedbackCycleBefore) {
+		self.feedbackInterval = max(self.feedbackInterval, self.compression)
+		cycle := &self.feedbackCycle
+		if cycle.bytes == 0 || at.UnixNano() < cycle.firstAtNanos {
+			cycle.firstAtNanos, cycle.firstBytes = at.UnixNano(), bytes
+		} else if at.UnixNano() == cycle.firstAtNanos {
+			cycle.firstBytes += bytes
+		}
+		cycle.lastAtNanos = max(cycle.lastAtNanos, at.UnixNano())
+		cycle.bytes += bytes
+		// Physical delivery and sample application are separate barriers.
+		// Two same-time partial ACKs cannot manufacture a completed interval.
+		completeDrain := self.drained && self.total >= self.drainedSent ||
+			!self.feedbackDrainAt.IsZero() && self.feedbackDrainPending == 0 && cycle.lastAtNanos <= self.feedbackDrainAt.UnixNano()
+		if completeDrain {
+			cycle.firstAtNanos, cycle.firstBytes = self.feedbackCycleBefore.UnixNano(), 0
+		}
+		waitingForDrainBytes := self.drained && self.total < self.drainedSent || self.feedbackDrainPending > 0
+		if !waitingForDrainBytes && cycle.lastAtNanos-cycle.firstAtNanos >= int64(self.feedbackInterval) {
+			self.feedbackPending = false
+			self.feedbackComplete = *cycle
+		}
+	}
+	if self.feedbackAt.Before(at) {
+		self.feedbackAt = at
 	}
 	bucket := at.UnixNano() / int64(max(deliverySizedWindowSampleInterval, self.bucketInterval))
 	if self.hasSamples && bucket <= self.newestBucket-int64(len(self.samples)) {
@@ -782,6 +949,11 @@ func (self *windowPacingService) measured(horizon time.Duration, now time.Time) 
 func (self *windowPacingService) measure(horizon time.Duration, now time.Time, retain bool) (ByteCount, ByteCount, ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	timing := self.roundTripEvidenceWithLock(now)
+	roundTripCompression := self.compression
+	if timing.count > 0 {
+		roundTripCompression = 0
+	}
 	rate, latest := ByteCount(0), ByteCount(0)
 	epochAt, hold := self.serviceEpochAt, self.serviceHoldRate
 	if probe := self.roundTripProbe; probe.resetService {
@@ -795,12 +967,52 @@ func (self *windowPacingService) measure(horizon time.Duration, now time.Time, r
 			epochAt, hold = boundary, probe.serviceRate
 		}
 	}
+	if self.feedbackPending && self.feedbackDrainPending > 0 {
+		boundary := self.feedbackDrainAt.Add(time.Nanosecond)
+		if epochAt.Before(boundary) {
+			epochAt = boundary
+		}
+	}
+	compression := self.compression
+	if self.feedbackCycle.bytes > 0 && self.feedbackAt.UnixNano() <= self.feedbackCycle.lastAtNanos {
+		compression = max(compression, self.feedbackInterval)
+	}
+	byteRate := func(bytes ByteCount, span int64) ByteCount {
+		value := float64(bytes) * float64(time.Second) / float64(span)
+		measured := ByteCount(math.MaxInt64)
+		if value < float64(math.MaxInt64) {
+			measured = ByteCount(value)
+		}
+		return measured
+	}
+	// An incomplete cycle cannot lower the hold or reinterpret an older
+	// train. Its new bytes across the full gap can prove a faster lower bound.
+	if self.feedbackPending && (epochAt.IsZero() || !self.feedbackCycleBefore.Before(epochAt)) {
+		cycle := self.feedbackCycle
+		span := cycle.lastAtNanos - self.feedbackCycleBefore.UnixNano()
+		if cycle.bytes > 0 && span >= int64(max(time.Nanosecond, compression, self.feedbackInterval)) {
+			measured := byteRate(cycle.bytes, span)
+			if measured > hold {
+				if retain {
+					self.serviceHoldRate = measured
+					if self.roundTripProbe.resetService {
+						self.roundTripProbe.serviceRate = measured
+					}
+				}
+				if horizon > 0 && cycle.lastAtNanos >= now.Add(-horizon).UnixNano() {
+					rate = measured
+				}
+				return rate, self.total, measured
+			}
+		}
+		return 0, self.total, hold
+	}
 	var samples [deliveredBytesRingSize]*windowServiceSample
 	count := 0
 	interval := max(deliverySizedWindowSampleInterval, self.bucketInterval)
 	// Preserve a rate long enough to receive feedback from sends using it.
 	// A queued RTT must not extend an old fast sample's life after a slowdown.
-	horizon = min(horizon, max(4*interval, self.minRoundTrip+self.compression+2*interval))
+	horizon = min(horizon, max(4*interval, timing.residence+2*interval))
 	cutoff := now.Add(-horizon).UnixNano()
 	for offset := int64(0); offset < int64(len(self.samples)); offset++ {
 		bucket := self.newestBucket - offset
@@ -812,15 +1024,7 @@ func (self *windowPacingService) measure(horizon time.Duration, now time.Time, r
 		samples[count] = sample
 		count++
 	}
-	minSpan := int64(self.compression)
-	byteRate := func(bytes ByteCount, span int64) ByteCount {
-		value := float64(bytes) * float64(time.Second) / float64(span)
-		measured := ByteCount(math.MaxInt64)
-		if value < float64(math.MaxInt64) {
-			measured = ByteCount(value)
-		}
-		return measured
-	}
+	minSpan := int64(compression)
 	observeRate := func(bytes ByteCount, span, atNanos int64) {
 		measured := byteRate(bytes, span)
 		if latest == 0 {
@@ -858,16 +1062,16 @@ func (self *windowPacingService) measure(horizon time.Duration, now time.Time, r
 	}
 	// Once residence proves a queue, average a full feedback interval and
 	// several compression turns. Repeated ACK peaks cannot drain that queue.
-	if count > 1 && self.minRoundTrip > 0 && self.latestRoundTrip > self.minRoundTrip+self.compression+2*time.Millisecond {
+	if count > 1 && timing.minimum > 0 && timing.latest > timing.minimum+roundTripCompression+2*time.Millisecond {
 		newer := samples[0]
 		bytes := newer.bytes
-		minSpan := int64(max(self.minRoundTrip, 4*self.compression, 4*interval))
-		queued := self.outstandingWithLock() > self.flightBoundWithLock(rate)
-		maximumGap := self.compression + 2*interval
+		minSpan := int64(max(timing.minimum, 4*compression, 4*interval))
+		queued := self.outstandingWithLock() > self.flightBoundAtWithLock(rate, timing.residence)
+		maximumGap := compression + 2*interval
 		if queued {
 			// Current flight alone cannot rewrite an earlier window idle.
 			// Excess residence must also cover a sparse serializer's gap.
-			maximumGap = max(maximumGap, self.latestRoundTrip-self.minRoundTrip-self.compression)
+			maximumGap = max(maximumGap, timing.latest-timing.minimum-roundTripCompression)
 		}
 		for j := 1; j < count; j++ {
 			// A window-limited gap cannot establish sustained service.
@@ -879,7 +1083,7 @@ func (self *windowPacingService) measure(horizon time.Duration, now time.Time, r
 			span := newer.lastAtNanos - samples[j].lastAtNanos
 			if span >= minSpan {
 				measured := byteRate(bytes, span)
-				if self.outstandingWithLock() > self.flightBoundWithLock(measured) {
+				if self.outstandingWithLock() > self.flightBoundAtWithLock(measured, timing.residence) {
 					latest = measured
 					if horizon > 0 && newer.lastAtNanos >= cutoff {
 						rate = measured
@@ -890,8 +1094,35 @@ func (self *windowPacingService) measure(horizon time.Duration, now time.Time, r
 			bytes += samples[j].bytes
 		}
 	}
+	completedFallback := false
+	if rate == 0 && latest == 0 {
+		for _, cycle := range []windowServiceSample{self.feedbackFresh, self.feedbackComplete} {
+			span := cycle.lastAtNanos - cycle.firstAtNanos
+			if cycle.bytes > cycle.firstBytes && span >= int64(max(time.Nanosecond, compression, self.feedbackInterval)) && (epochAt.IsZero() || cycle.firstAtNanos >= epochAt.UnixNano()) {
+				observeRate(cycle.bytes-cycle.firstBytes, span, cycle.lastAtNanos)
+				completedFallback = true
+				break
+			}
+		}
+	}
 	if rate > 0 || latest > 0 {
 		if retain {
+			// Only controller acceptance commits this fresh pair's boundary.
+			// Later old bytes still count delivery, but cannot re-enter its rate.
+			if self.feedbackPending && epochAt.After(self.feedbackCycleBefore) {
+				self.serviceEpochAt = epochAt
+				self.feedbackCycleBefore, self.feedbackDrainAt = time.Time{}, time.Time{}
+				// Preserve timing provenance for repeated reads of these same ACKs.
+				self.feedbackComplete = self.feedbackFresh
+				if self.feedbackFresh.bytes > 0 {
+					self.feedbackCycle = self.feedbackFresh
+				}
+				self.feedbackFresh = windowServiceSample{}
+				self.feedbackPending, self.feedbackDrainPending = false, 0
+			}
+			if !completedFallback && count > 0 && samples[0].lastAtNanos >= self.feedbackComplete.lastAtNanos {
+				self.feedbackComplete = windowServiceSample{}
+			}
 			self.serviceHoldRate = rate
 			if rate == 0 {
 				self.serviceHoldRate = latest
@@ -919,6 +1150,9 @@ func (self *windowPacingService) observeRoundTrip(roundTrip, compression time.Du
 func (self *windowPacingService) observeBurstRoundTrip(burst uint64, roundTrip, compression time.Duration, at time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if roundTrip > 0 && self.receiverRoundTrips != nil && !at.Before(self.lastRoundTrip) {
+		self.receiverRoundTrips.add(roundTrip, -1, compression, at)
+	}
 	if roundTrip > 0 {
 		if self.roundTripStats.ring == nil {
 			self.roundTripStats.ring = newWindowBucketStats(deliverySizedWindowSampleInterval, 4)
@@ -933,7 +1167,7 @@ func (self *windowPacingService) observeBurstRoundTrip(burst uint64, roundTrip, 
 func (self *windowPacingService) roundTrip() time.Duration {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.minRoundTrip
+	return self.roundTripEvidenceWithLock(time.Now()).minimum
 }
 
 // A write following an acknowledged burst can establish a larger propagation
@@ -952,7 +1186,12 @@ func (self *windowPacingService) observeRoundTripWithLock(roundTrip, compression
 	self.latestRoundTrip = roundTrip
 	self.compression = max(0, compression)
 	slots := time.Duration(len(self.samples) - 2)
-	interval := max(deliverySizedWindowSampleInterval, self.compression/4, (self.minRoundTrip+self.compression+slots-1)/slots)
+	timing := self.roundTripEvidenceWithLock(at)
+	residenceInterval := timing.residence / slots
+	if timing.residence%slots != 0 {
+		residenceInterval++
+	}
+	interval := max(deliverySizedWindowSampleInterval, self.compression/4, residenceInterval)
 	if interval != max(deliverySizedWindowSampleInterval, self.bucketInterval) {
 		// Bucket widths are bookkeeping. Preserve real ACK timestamps so
 		// a changed RTT cannot erase the pair that discovered new service.
@@ -997,13 +1236,24 @@ func (self *windowPacingService) observeRoundTripWithLock(roundTrip, compression
 // Before one service residence has been delivered, excess flight can still be
 // a fast opening train in propagation. Require queue-delay evidence then.
 func (self *windowPacingService) backlogged(rate ByteCount) bool {
+	return self.backloggedAt(rate, time.Now())
+}
+
+// Statistics and admission use the same caller clock without retiring RTT
+// samples. Receiver waiting is flight residence, not network queue delay.
+func (self *windowPacingService) backloggedAt(rate ByteCount, at time.Time) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if self.minRoundTrip <= 0 || rate <= 0 {
+	timing := self.roundTripEvidenceWithLock(at)
+	if timing.count == 0 && timing.minimum <= 0 || rate <= 0 {
 		return false
 	}
-	bound := self.flightBoundWithLock(rate)
-	if float64(max(self.total, self.drainedSent)) < bound && self.latestRoundTrip <= self.minRoundTrip+self.compression+2*time.Millisecond {
+	bound := self.flightBoundAtWithLock(rate, timing.residence)
+	compression := self.compression
+	if timing.count > 0 {
+		compression = 0
+	}
+	if float64(max(self.total, self.drainedSent)) < bound && timing.latest <= timing.minimum+compression+2*time.Millisecond {
 		return false
 	}
 	return self.outstandingWithLock() > bound
@@ -1020,11 +1270,17 @@ func (self *windowPacingService) outstandingWithLock() float64 {
 // allowance already includes the minimum of one indivisible message. Before
 // the first reservation, retain the original two-millisecond rate allowance.
 func (self *windowPacingService) flightBoundWithLock(rate ByteCount) float64 {
+	return self.flightBoundAtWithLock(rate, self.roundTripEvidenceWithLock(time.Now()).residence)
+}
+
+// The residence is either one complete receiver tuple or the unchanged
+// legacy minimum plus advertised compression.
+func (self *windowPacingService) flightBoundAtWithLock(rate ByteCount, residence time.Duration) float64 {
 	burst := float64(max(self.maxMessageByteCount, self.burstMeter.limit))
 	if self.burstMeter.limit <= 0 {
 		burst += float64(rate) * (2 * time.Millisecond).Seconds()
 	}
-	return burst + float64(rate)*(self.minRoundTrip+self.compression).Seconds()
+	return burst + float64(rate)*residence.Seconds()
 }
 
 func (self *windowBurstPacer) close() {
@@ -1033,6 +1289,11 @@ func (self *windowBurstPacer) close() {
 	}
 	if self.service != nil {
 		self.service.stateLock.Lock()
+		if self.serviceClosed {
+			self.service.stateLock.Unlock()
+			return
+		}
+		self.serviceClosed = true
 		released := max(0, self.serviceSent-self.serviceAcked)
 		self.service.sent -= released
 		if released > 0 {
@@ -1055,8 +1316,8 @@ func (self *windowBurstPacer) close() {
 			self.service.roundTripProbe = windowPacingRoundTripProbe{}
 		}
 		self.service.notifyDrainWithLock()
-		self.service.stateLock.Unlock()
 		self.serviceSent = 0
 		self.serviceAcked = 0
+		self.service.stateLock.Unlock()
 	}
 }

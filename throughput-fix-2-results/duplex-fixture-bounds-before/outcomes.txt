@@ -1,0 +1,7 @@
+=== RUN   TestWindowPerformanceDuplexBoundsBothDirections
+--- FAIL: TestWindowPerformanceDuplexBoundsBothDirections (15.10s)
+=== RUN   TestWindowPerformanceDuplexBoundsBothDirections
+--- FAIL: TestWindowPerformanceDuplexBoundsBothDirections (12.56s)
+=== RUN   TestWindowPerformanceDuplexBoundsBothDirections
+--- FAIL: TestWindowPerformanceDuplexBoundsBothDirections (12.44s)
+FAIL

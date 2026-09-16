@@ -1,0 +1,11 @@
+{
+  "file_sha256": {
+    "ledger.jsonl": "d49e5637a49a70af0a9b8ffa2ca0f2f145e4718bb29b7c889e842662dc5bd169",
+    "manifest.json": "00b98990b443e4873bae95b44745e1803a9209f73a40a8fa8869c12010878c3e",
+    "outcomes.txt": "8c67ea89b29056ab78a4edc6a9d060b934d224ae49a6d42ab3167680f9a2c935",
+    "provenance.json": "f21413e6d8d42758f91dd3bca7ae781ab07cb3fe5b709c9e027aa69c9a880c90",
+    "status.json": "b7efcd3b1f21762289f8d2e8a29dc5c00fa6e5c01b8152fe50b8cff15caa0710"
+  },
+  "purpose": "hashes of redacted archive payload files; original raw input hashes remain in provenance.json",
+  "schema_version": 1
+}

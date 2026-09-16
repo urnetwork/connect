@@ -1,0 +1,499 @@
+{
+  "additional_test_sources": [
+    {
+      "file": "probe-recovery-adjacent-barrier_test.go",
+      "sha256": "02a62f927cfd6e489ee416e1971121944931e8d0504917f3b0eba6b3498df7ea"
+    },
+    {
+      "file": "probe-other-message-barrier_test.go",
+      "sha256": "dbfbc5600bb34edadf2de58db70021d54360e44e67f5476bc4726c3adc80666e"
+    },
+    {
+      "file": "probe-identity-adjacent_test.go",
+      "sha256": "3b81c9577969b9f7b37937079e8da85540006563bc978ba449a17407259d6fff"
+    }
+  ],
+  "attribution_limits": [
+    "Effective baseline inputs retain pre-refactor ACK-credit record and original path fixture. Forced SDK case uses Upload=false and is unaffected by later duplex rate repair.",
+    "Candidate files remain overlays and must not overwrite shared transfer.go, whose independent ACK API changes are absent here.",
+    "Positive narrowed400ms runs cannot erase retained75.735Mb failure from broader-order control.",
+    "Same-message probe protection and different-message identity fixes do not close1.2s throughput; every completed long gate retained.",
+    "The v2 old fixture race is test synchronization evidence, not an observed production race. Corrected root reruns use explicit worker barriers and locked service reads.",
+    "Active-drain late-RTT investigation and v3 remain excluded from this frozen handoff.",
+    "Copy no raw logs, trace text, generated IDs, local paths, source, overlays or binaries into normalized numerical archive."
+  ],
+  "candidate": "long-drain-v2-bounded-recovery",
+  "corrected_permanent_root": {
+    "file": "permanent-root-barrier_test.go",
+    "sha256": "6c23a220f9ab24c7ed37c9cd290268f43ed125efa5822b4b607335fbb8451886",
+    "shared_file_verified": true
+  },
+  "input_handoff": {
+    "file": "v2-recovery-evidence-handoff.json",
+    "sha256": "35616dba1bf68360dcab239d03b62ff4a6e5c28de0d1ab98f9cdaaae06ad9ccb"
+  },
+  "prior_failure_handoff": {
+    "file": "failure-before-handoff.json",
+    "sha256": "8b7ecf1583c820999855a7ddcbba9d7078be361c9216c324dfdbecf5a9f3acad"
+  },
+  "production_source_overlays": [
+    {
+      "file": "candidate-v2-pacing.go",
+      "sha256": "8686d4729acdbf8db78a4d73b569d4b04bef3a6b5ae98c45eb5867a2a06cce34",
+      "unlanded": true
+    },
+    {
+      "file": "candidate-v2-transfer.go",
+      "sha256": "946b7973d2efa2c2e543524d553986e52eb37354a2022951630d61f667be71b8",
+      "unlanded": true
+    }
+  ],
+  "redaction": {
+    "generated_ids": "excluded",
+    "local_paths": "excluded",
+    "normalized_terminal_outcomes_and_full_numerical_readings": "retained",
+    "raw_logs_and_trace_text": "excluded",
+    "source_overlay_and_binary_contents": "excluded"
+  },
+  "runs": [
+    {
+      "binary_sha256": "ac11e04c12ac094e1e3893053227c9d410da256010191a7181e41686555f7969",
+      "build_manifest_file": "candidate-v1.manifest.json",
+      "build_manifest_sha256": "8d8546dc9260e72b8027b6079e73522bd415ed31d760f6d58d5b2bfeb986126d",
+      "classification": "candidate-or-control",
+      "complete": true,
+      "effective_input_sha256": "0401c56c53224653bf0702f81bbb0ad111dcb27a7b5654070ea0f238ba5b8aa3",
+      "id": "v1-forced-roots",
+      "inputs_stable_during_build": true,
+      "note": "All three forced roots pass before later-message review.",
+      "original_log_file": "candidate-v1-roots.log",
+      "original_log_sha256": "23e8f10a763051b731b39219ea8e9b4b6febd3748bb36c2e239507f5c4735da2",
+      "outcome_count": 9,
+      "outcome_counts": {
+        "fail": 0,
+        "pass": 9,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v1-overlay.json",
+      "overlay_sha256": "89956c7e9ecd1a846a9eeede288d393b09243b2e8e4ea42696a561af04fda170",
+      "race_warning_count": 0,
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "ac11e04c12ac094e1e3893053227c9d410da256010191a7181e41686555f7969",
+      "build_manifest_file": "candidate-v1.manifest.json",
+      "build_manifest_sha256": "8d8546dc9260e72b8027b6079e73522bd415ed31d760f6d58d5b2bfeb986126d",
+      "classification": "long-path-throughput-gate",
+      "complete": true,
+      "effective_input_sha256": "0401c56c53224653bf0702f81bbb0ad111dcb27a7b5654070ea0f238ba5b8aa3",
+      "id": "v1-long-model",
+      "inputs_stable_during_build": true,
+      "note": "All three long-path throughput gates fail; roots alone do not close model.",
+      "original_log_file": "candidate-v1-long-model.log",
+      "original_log_sha256": "7a39fb6365515aed910c969253c478e9dc8bdaa771c64e8d3bbe1b43bd459c84",
+      "outcome_count": 3,
+      "outcome_counts": {
+        "fail": 3,
+        "pass": 0,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v1-overlay.json",
+      "overlay_sha256": "89956c7e9ecd1a846a9eeede288d393b09243b2e8e4ea42696a561af04fda170",
+      "race_warning_count": 0,
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "2c542e2099780a5d3e8fe7a5bd2d6f638ddc7df03361e557e5f078eb47e7d96b",
+      "build_manifest_file": "candidate-v1-bounds-frozen.manifest.json",
+      "build_manifest_sha256": "da87ba2accb3557b0a083da24c3fc6395f2f976eb2cd4b8c648aa66f9fe0c110",
+      "classification": "candidate-or-control",
+      "complete": true,
+      "effective_input_sha256": "1d01558b1bb678c3177d59d07350bcd7d6c650df12110a65f6b589c561534a68",
+      "id": "v1-bounded-lifecycle",
+      "inputs_stable_during_build": true,
+      "note": "Normal lifecycle/bounds passes before explicit channel synchronization refinement.",
+      "original_log_file": "candidate-v1-bounds.log",
+      "original_log_sha256": "fdc3c614a50dcf223c8c0f31404b3dbf37d2734b493ea60a0f28153799bc46d3",
+      "outcome_count": 18,
+      "outcome_counts": {
+        "fail": 0,
+        "pass": 18,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v1-bounds-frozen-overlay.json",
+      "overlay_sha256": "cb4774d4c007ac8a1780a32d05a3e43016ce3841d1d89490b35ef9695a6fe29b",
+      "race_warning_count": 0,
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "2c542e2099780a5d3e8fe7a5bd2d6f638ddc7df03361e557e5f078eb47e7d96b",
+      "build_manifest_file": "candidate-v1-bounds-frozen.manifest.json",
+      "build_manifest_sha256": "da87ba2accb3557b0a083da24c3fc6395f2f976eb2cd4b8c648aa66f9fe0c110",
+      "classification": "candidate-focused-selection",
+      "complete": true,
+      "effective_input_sha256": "1d01558b1bb678c3177d59d07350bcd7d6c650df12110a65f6b589c561534a68",
+      "id": "v1-focus",
+      "inputs_stable_during_build": true,
+      "note": "Normal focused results; no race claim.",
+      "original_log_file": "candidate-v1-focused.log",
+      "original_log_sha256": "de441ed385eb72e3d8ff57cd47e7ca44ac8305c39e79736122ca5b04040dc1e6",
+      "outcome_count": 438,
+      "outcome_counts": {
+        "fail": 0,
+        "pass": 438,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v1-bounds-frozen-overlay.json",
+      "overlay_sha256": "cb4774d4c007ac8a1780a32d05a3e43016ce3841d1d89490b35ef9695a6fe29b",
+      "race_warning_count": 0,
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "f3e61b47af11c97f3b44b0918da57926e66800cf1591fbb3f01e8acb659c18d3",
+      "build_manifest_file": "candidate-v1-trace.manifest.json",
+      "build_manifest_sha256": "5bbad11d37588b50bbcf306789c4fde46862395d7edba1e58eeee10f8cdc9cff",
+      "classification": "diagnostic-trace-normalized-observations",
+      "complete": true,
+      "effective_input_sha256": "f199d2dbc93dd38be4988d83a4300082619dd4d430874952a72338aa584377a7",
+      "id": "v1-trace",
+      "inputs_stable_during_build": true,
+      "note": "Only existing operations logged; records confirmed physical probe, not a phase-independent throughput proof.",
+      "original_log_file": "candidate-v1-trace.log",
+      "original_log_sha256": "e3f23e856e237337378fcbbfccba4402036a1dbce6fe98a12cd7e8684ca4e98b",
+      "outcome_count": 1,
+      "outcome_counts": {
+        "fail": 1,
+        "pass": 0,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v1-trace-overlay.json",
+      "overlay_sha256": "97c2b568d0c6f5b6801da518fc6c416d0e0f01c2ca664eddecdef48b56afdb40",
+      "race_warning_count": 0,
+      "reading_count": 2
+    },
+    {
+      "binary_sha256": "797cd6efbf42f47e96360a48497f09bef19cfc8298097ebbc978686c0955b0ac",
+      "build_manifest_file": "candidate-v1-gap-v4.manifest.json",
+      "build_manifest_sha256": "52a5bada5cee3945e20af7fce154fe7be988cbf096ec93e643f824944df20854",
+      "classification": "long-path-throughput-gate",
+      "complete": true,
+      "effective_input_sha256": "f97dc8bb130f2c473b9d50cdd69f100739f71d6cea50f70f9f55d87e9551a9b4",
+      "id": "v1-plus-gap-v4-long",
+      "inputs_stable_during_build": true,
+      "note": "Isolated provisional sampler combination; all long gates fail.",
+      "original_log_file": "candidate-v1-gap-v4-long.log",
+      "original_log_sha256": "32b396168909e5296088d138ef33d64e3f4a9af9b50c16c1acd6f47d3d8bba54",
+      "outcome_count": 3,
+      "outcome_counts": {
+        "fail": 3,
+        "pass": 0,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v1-gap-v4-overlay.json",
+      "overlay_sha256": "b768c23edbee5827f909ee2b00661edc186b284f9538e344ebfe938613acaf6d",
+      "race_warning_count": 0,
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "eb23a23607ca1206b420c5b5abf84dc6cbb242f8941e0249fda7562eb077e05f",
+      "build_manifest_file": "candidate-v1-other-message-clean.manifest.json",
+      "build_manifest_sha256": "7fd4a5c419e7c5ea9f5441d94366b405f9de52e58b3d9ea83d3116c10908b63f",
+      "classification": "failure-before",
+      "complete": true,
+      "effective_input_sha256": "ecb2da0419c1bd2b675c2c9520d7d1a8ef06a2a63db8f519c2a9f7093d82999d",
+      "id": "different-message-before",
+      "inputs_stable_during_build": true,
+      "note": "Different-message root before exact identity change; refined synchronized proof below supersedes fixture.",
+      "original_log_file": "candidate-v1-other-message-clean-before.log",
+      "original_log_sha256": "4d1d7745830a7370789a072f3888353f73e08f7a8e99b1fbd91dcbe145370c44",
+      "outcome_count": 3,
+      "outcome_counts": {
+        "fail": 3,
+        "pass": 0,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v1-other-message-clean-overlay.json",
+      "overlay_sha256": "6263ad02a11ea56f353ca0aa1622802c484f68abd71caf77bbba24d8c62dd64f",
+      "race_warning_count": 0,
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "87fed2ec35bec2e207ac07b236ce6e060b4952f8302018556cbabbf58975fc3d",
+      "build_manifest_file": "candidate-v2.manifest.json",
+      "build_manifest_sha256": "627d6b9b35eab043d510beb41e3e94c9171662a2e3de54ff78c4f41135dcd9c5",
+      "classification": "candidate-focused-selection",
+      "complete": true,
+      "effective_input_sha256": "22620152e7b2107d34a80c9cbb483a7e35c7c09567c2031d10c2d1f1dfe6964d",
+      "id": "v2-focus-initial",
+      "inputs_stable_during_build": true,
+      "note": "Initial normal focus pass, prior to extra identity cases.",
+      "original_log_file": "candidate-v2-focused.log",
+      "original_log_sha256": "8d071ba99864acc990e741e2c3a8212a3ef0a2bcaaa9d3b67b9ffa8892c65bab",
+      "outcome_count": 441,
+      "outcome_counts": {
+        "fail": 0,
+        "pass": 441,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v2-overlay.json",
+      "overlay_sha256": "e01f38b69d46c048237e79f7e8a257630443bb4e77a517fdb89a8852a414fcdc",
+      "race_warning_count": 0,
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "87fed2ec35bec2e207ac07b236ce6e060b4952f8302018556cbabbf58975fc3d",
+      "build_manifest_file": "candidate-v2.manifest.json",
+      "build_manifest_sha256": "627d6b9b35eab043d510beb41e3e94c9171662a2e3de54ff78c4f41135dcd9c5",
+      "classification": "long-path-throughput-gate",
+      "complete": true,
+      "effective_input_sha256": "22620152e7b2107d34a80c9cbb483a7e35c7c09567c2031d10c2d1f1dfe6964d",
+      "id": "v2-long-model",
+      "inputs_stable_during_build": true,
+      "note": "One long-path gate passes and two fail; keep complete phase-sensitive outcomes.",
+      "original_log_file": "candidate-v2-long-model.log",
+      "original_log_sha256": "24974a22345cb5b4d27911f9dc7fd7549fb783bb3698dc41d70d39513298befa",
+      "outcome_count": 3,
+      "outcome_counts": {
+        "fail": 2,
+        "pass": 1,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v2-overlay.json",
+      "overlay_sha256": "e01f38b69d46c048237e79f7e8a257630443bb4e77a517fdb89a8852a414fcdc",
+      "race_warning_count": 0,
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "cb37341e4b545bc120e3945fec75eb5fa9d2f840d3d028df5bf9478eabdd8a12",
+      "build_manifest_file": "candidate-v2-final.manifest.json",
+      "build_manifest_sha256": "34fd2f90bd789af25a96a9696961f3776b666f53347c7beb0bc7840eb1c141d9",
+      "classification": "candidate-focused-selection",
+      "complete": true,
+      "effective_input_sha256": "7014fe649cf49552bbd0d936519490a17a0652f8e86e59d40b6063797226ac42",
+      "id": "v2-focus",
+      "inputs_stable_during_build": true,
+      "note": "444 normal focus passes; subsequent race run found test synchronization defect.",
+      "original_log_file": "candidate-v2-final-focused.log",
+      "original_log_sha256": "ba165877d2d097d5c08750ede7a4d73be9ab01b6e3db35b240422b2729c9f351",
+      "outcome_count": 444,
+      "outcome_counts": {
+        "fail": 0,
+        "pass": 444,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v2-final-overlay.json",
+      "overlay_sha256": "f273a5f614f109cb4ca1ffcab9e63ce56c2a1efc9f0ad61fbb6df1d8571406ed",
+      "race_warning_count": 0,
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "442a8b1f4a7299e1630e8241ce836a747cccee15c34e1db4721124c13fb942f4",
+      "build_manifest_file": "candidate-v2-final-race.manifest.json",
+      "build_manifest_sha256": "c73788892a715d162e203d80628920b086e9a27886adf5429d898434882433d3",
+      "classification": "historical-test-fixture-race-diagnostic",
+      "complete": true,
+      "effective_input_sha256": "7014fe649cf49552bbd0d936519490a17a0652f8e86e59d40b6063797226ac42",
+      "id": "v2-fixture-race-diagnostic",
+      "inputs_stable_during_build": true,
+      "note": "Historical fixture race: raw service probe reads and recoveryKind mutations used only one-way synctest synchronization. Corrected with locked snapshots and initial worker-release channels; this is not accepted race evidence.",
+      "original_log_file": "candidate-v2-final-race.log",
+      "original_log_sha256": "21f74f7ab96c4fe9722cb7870aa4b8c3daf159e370e062bed59c1351b60953bf",
+      "outcome_count": 444,
+      "outcome_counts": {
+        "fail": 6,
+        "pass": 438,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v2-final-overlay.json",
+      "overlay_sha256": "f273a5f614f109cb4ca1ffcab9e63ce56c2a1efc9f0ad61fbb6df1d8571406ed",
+      "race_warning_count": 8,
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "cb37341e4b545bc120e3945fec75eb5fa9d2f840d3d028df5bf9478eabdd8a12",
+      "build_manifest_file": "candidate-v2-final.manifest.json",
+      "build_manifest_sha256": "34fd2f90bd789af25a96a9696961f3776b666f53347c7beb0bc7840eb1c141d9",
+      "classification": "candidate-v2-declared-service-and-sdk-controls",
+      "complete": true,
+      "effective_input_sha256": "7014fe649cf49552bbd0d936519490a17a0652f8e86e59d40b6063797226ac42",
+      "id": "v2-declared-controls",
+      "inputs_stable_during_build": true,
+      "note": "Eight service/SDK controls pass;400ms/50ms control fails75.735 versus95.846Mb. Subsequent scoped passes do not erase failure.",
+      "original_log_file": "candidate-v2-final-controls.log",
+      "original_log_sha256": "eeec9b0ff206efaf7e040679d688acae4d893aa6ab900d3db460d36a11d61256",
+      "outcome_count": 9,
+      "outcome_counts": {
+        "fail": 1,
+        "pass": 8,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v2-final-overlay.json",
+      "overlay_sha256": "f273a5f614f109cb4ca1ffcab9e63ce56c2a1efc9f0ad61fbb6df1d8571406ed",
+      "race_warning_count": 0,
+      "reading_count": 58
+    },
+    {
+      "binary_sha256": "ae7eba79a96f3e8b1b088fa6b3f8c776ce1f9f1bf46deb631e4157e7d1320a9c",
+      "build_manifest_file": "candidate-v2-gap-v4.manifest.json",
+      "build_manifest_sha256": "944b778a193dee52bc82b72658777f97926b787174e0ac066dc0708e9301ed5d",
+      "classification": "long-path-throughput-gate",
+      "complete": true,
+      "effective_input_sha256": "02831afec821d1c6f25552da52fe44126331e5150677a00b752244a8793084d8",
+      "id": "v2-plus-gap-v4-long",
+      "inputs_stable_during_build": true,
+      "note": "All long gates fail under isolated provisional sampler combination.",
+      "original_log_file": "candidate-v2-gap-v4-long.log",
+      "original_log_sha256": "13d8d7002f903c26e8704fe185132fd4b56f6ccec6b7f65dcdb743d225eb0322",
+      "outcome_count": 3,
+      "outcome_counts": {
+        "fail": 3,
+        "pass": 0,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v2-gap-v4-overlay.json",
+      "overlay_sha256": "68f26a177504a20c43fd2e406524772561297ea3720c9052e9beccaf36e920a5",
+      "race_warning_count": 0,
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "2c542e2099780a5d3e8fe7a5bd2d6f638ddc7df03361e557e5f078eb47e7d96b",
+      "build_manifest_file": "candidate-v1-bounds-frozen.manifest.json",
+      "build_manifest_sha256": "da87ba2accb3557b0a083da24c3fc6395f2f976eb2cd4b8c648aa66f9fe0c110",
+      "classification": "scoped-400ms-control",
+      "complete": true,
+      "effective_input_sha256": "1d01558b1bb678c3177d59d07350bcd7d6c650df12110a65f6b589c561534a68",
+      "id": "v1-scoped-400ms",
+      "inputs_stable_during_build": true,
+      "note": "Three scoped400ms passes, separate from original failed broader-order reading.",
+      "original_log_file": "candidate-v1-400ms.log",
+      "original_log_sha256": "94494191d0333027ac874dc6d7c2975eaff4a5417f5711b127cb63d704e21105",
+      "outcome_count": 3,
+      "outcome_counts": {
+        "fail": 0,
+        "pass": 3,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v1-bounds-frozen-overlay.json",
+      "overlay_sha256": "cb4774d4c007ac8a1780a32d05a3e43016ce3841d1d89490b35ef9695a6fe29b",
+      "race_warning_count": 0,
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "cb37341e4b545bc120e3945fec75eb5fa9d2f840d3d028df5bf9478eabdd8a12",
+      "build_manifest_file": "candidate-v2-final.manifest.json",
+      "build_manifest_sha256": "34fd2f90bd789af25a96a9696961f3776b666f53347c7beb0bc7840eb1c141d9",
+      "classification": "scoped-400ms-control",
+      "complete": true,
+      "effective_input_sha256": "7014fe649cf49552bbd0d936519490a17a0652f8e86e59d40b6063797226ac42",
+      "id": "v2-scoped-400ms",
+      "inputs_stable_during_build": true,
+      "note": "Three scoped400ms passes, original broader-order failure remains open.",
+      "original_log_file": "candidate-v2-400ms.log",
+      "original_log_sha256": "061b40fc3e7f5ddde67cb713df7975d4cf14a1fa363588ef02138e179b13b2c6",
+      "outcome_count": 3,
+      "outcome_counts": {
+        "fail": 0,
+        "pass": 3,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v2-final-overlay.json",
+      "overlay_sha256": "f273a5f614f109cb4ca1ffcab9e63ce56c2a1efc9f0ad61fbb6df1d8571406ed",
+      "race_warning_count": 0,
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "ae7eba79a96f3e8b1b088fa6b3f8c776ce1f9f1bf46deb631e4157e7d1320a9c",
+      "build_manifest_file": "candidate-v2-gap-v4.manifest.json",
+      "build_manifest_sha256": "944b778a193dee52bc82b72658777f97926b787174e0ac066dc0708e9301ed5d",
+      "classification": "scoped-400ms-control",
+      "complete": true,
+      "effective_input_sha256": "02831afec821d1c6f25552da52fe44126331e5150677a00b752244a8793084d8",
+      "id": "v2-plus-gap-v4-scoped-400ms",
+      "inputs_stable_during_build": true,
+      "note": "Three scoped400ms passes, no claim of resolving phase-sensitive prior failure.",
+      "original_log_file": "candidate-v2-gap-v4-400ms.log",
+      "original_log_sha256": "a93bb47dcf2cbefb3580e260f233d0633ab36f759130e2f822af01cbf3bc890f",
+      "outcome_count": 3,
+      "outcome_counts": {
+        "fail": 0,
+        "pass": 3,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v2-gap-v4-overlay.json",
+      "overlay_sha256": "68f26a177504a20c43fd2e406524772561297ea3720c9052e9beccaf36e920a5",
+      "race_warning_count": 0,
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "10e434bb83ac7307630c53c0f7ca1120df29fd81ad0c4ebc7b486e68872166b7",
+      "build_manifest_file": "probe-retry-worker-barrier-before-race.manifest.json",
+      "build_manifest_sha256": "ab4b3fe153ac7d2cd36a8cadd60a4a9fb8b352d517797b88bbc96fc3d652ab35",
+      "classification": "corrected-locked-worker-root-failure-before",
+      "complete": true,
+      "effective_input_sha256": "ad714b430f59dd5533536370bb6999fe09a011e4f9768b34d8724b62fc18aff9",
+      "id": "corrected-worker-before-race",
+      "inputs_stable_during_build": true,
+      "note": "Unchanged v11 production, corrected explicit-channel worker fixture; three exact root failures with no race warnings.",
+      "original_log_file": "probe-retry-worker-barrier-before-race-complete.log",
+      "original_log_sha256": "1e4c38823aa7c1ca537b867f4f2775f4a5e345ffd383fce3c4b9f47a7aaef556",
+      "outcome_count": 3,
+      "outcome_counts": {
+        "fail": 3,
+        "pass": 0,
+        "skip": 0
+      },
+      "overlay_file": "probe-retry-worker-barrier-before-overlay.json",
+      "overlay_sha256": "ed9f6463ee43fd84f7625117c8c598fd01e7f5ea60ce9c66a8ff58a39cecf850",
+      "race_warning_count": 0,
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "f74f780ed529fc1a3863620646d86a77b71cad6478dd9af08440dd1b838f3ba9",
+      "build_manifest_file": "candidate-v2-barrier-race.manifest.json",
+      "build_manifest_sha256": "11054564a550507434e070c868cd73d03fd085cdb855869d9896d3ef39a596b3",
+      "classification": "corrected-locked-worker-candidate-v2-focus-race",
+      "complete": true,
+      "effective_input_sha256": "b64fd203d4bc2aca587a85f35aa62b2bc87b71566d3928a9efb6bf16f167c2c0",
+      "id": "corrected-v2-focus-race",
+      "inputs_stable_during_build": true,
+      "note": "444 focused race passes with explicit synchronization; long-path throughput still unresolved.",
+      "original_log_file": "candidate-v2-barrier-race.log",
+      "original_log_sha256": "137135e367378718e3499810079c4152d49d228dc43b3ea1aa28b98177c0fd08",
+      "outcome_count": 444,
+      "outcome_counts": {
+        "fail": 0,
+        "pass": 444,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v2-barrier-overlay.json",
+      "overlay_sha256": "41b7e4b27e15653969d5b496ae523ae9149fb125219e0d7cab42d217db5938e4",
+      "race_warning_count": 0,
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "54becc12a2dcccc507f27b185ee350fde2d9a20ded2a99e8664b333e8654630c",
+      "build_manifest_file": "candidate-v1-other-message-barrier-before-race.manifest.json",
+      "build_manifest_sha256": "d04b3e27f2d06b94939d3b7756a78b32ae8ecfd1477adcea6a8c3f71089b950d",
+      "classification": "corrected-locked-different-message-identity-failure-before",
+      "complete": true,
+      "effective_input_sha256": "2ab8cedcf81ae5aa00e48b23f44384d4de85ed7d141a542e1be61d6762c8e795",
+      "id": "corrected-different-message-before-race",
+      "inputs_stable_during_build": true,
+      "note": "Immediate before identity fix: v1 protects probe itself, later ordinary message retry still erases it. Three clean failures under race with explicit barriers.",
+      "original_log_file": "candidate-v1-other-message-barrier-before-race.log",
+      "original_log_sha256": "de234158229a4c0a143d375c2710635d51da9240041b9c839bf745a91c7f9b84",
+      "outcome_count": 3,
+      "outcome_counts": {
+        "fail": 3,
+        "pass": 0,
+        "skip": 0
+      },
+      "overlay_file": "candidate-v1-other-message-barrier-before-overlay.json",
+      "overlay_sha256": "a7d471aa80c2b8d47fe04082557d59a7cf24f068f2a71ee21fbab680823887f0",
+      "race_warning_count": 0,
+      "reading_count": 0
+    }
+  ],
+  "schema": "throughput-fix-2/long-drain-v2-recovery-provenance-v1",
+  "status": "unlanded; deterministic roots pass after isolated correction, throughput gates remain unresolved"
+}

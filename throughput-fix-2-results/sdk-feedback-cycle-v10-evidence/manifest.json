@@ -1,0 +1,35 @@
+{
+  "candidate": "ack-tail-v4-plus-feedback-cycle-v10",
+  "counts": {
+    "fail": 38,
+    "outcomes": 1663,
+    "pass": 1625,
+    "readings": 167,
+    "runs": 22,
+    "skip": 0
+  },
+  "files": {
+    "outcomes.jsonl": "b44720f46d6c7620513b68794e33f558e738dff47705d4fac473a11a42ea9f80",
+    "provenance.json": "6c9c0a6be6f4f16438201c1ad4975e346fbb9a9b9644fa5bf0ade44a57c8c789",
+    "readings-ack-only-long.jsonl": "5712247dc6be95488475511275746b6550013d1aeca443e4499bdc2ec8cc2683",
+    "readings-rejected-v9-long.jsonl": "b2afe71e8c9698c0807d70040ff494c167085dad4f66ff405d38e399bc0fcbb6",
+    "readings-rejected-v9-recovery.jsonl": "5860f3b36efbf809d8e24f83c6973d827e748e51f8fb655d7e8dbae28fbabcfe",
+    "readings-rejected-v9-service-controls.jsonl": "36198194adc8ab5f3fa7873e23535d625bf68f111f3edec80b0771773259e691",
+    "readings-unchanged-long.jsonl": "9645d984ddef1d6852b6865cb53cc36b6c7daae3069fd5d9343830e38b5c9cd0",
+    "readings-v10-early.jsonl": "56c2d0b34c79e2fbfb255427ea416abe46e7bd6a110b32d801b85472ff89d66e",
+    "readings-v10-late.jsonl": "89d0e58262289860902d4527b542d428d2561e2cfbe820a3f7144b2dee27670a",
+    "readings-v10-natural.jsonl": "0e9147b1d1d2220660ed4b4df11d961dbb1b762e11158913da8a8a2d383a6671",
+    "readings-v10-recovery.jsonl": "7609675ef6fe495cfa74bbf886a981f640d62f7dbcefa9a1a172feefea78d49b",
+    "readings-v10-service-controls.jsonl": "cdf024b01ffa024dab20f9277f7b0af7f7d77131db15231f1028cd1e067d8e03",
+    "summary.json": "88eac474c933353505096d49e85d1a272ff1ed0108f519b0dc1713a4a5508d6d"
+  },
+  "input_handoff_sha256": "56eafaf37ac939aa00ab10932d33c58229a4ebd25bf8e2b1456383d5b6ed1c75",
+  "redaction": {
+    "commands_and_local_paths": "excluded",
+    "full_numerical_readings_and_terminal_outcomes": "retained",
+    "raw_logs": "excluded",
+    "source_overlay_and_binary_contents": "excluded"
+  },
+  "schema": "throughput-fix-2/sdk-feedback-cycle-v10-evidence-manifest-v1",
+  "verification": "input hashes and counts verified before artifact creation"
+}

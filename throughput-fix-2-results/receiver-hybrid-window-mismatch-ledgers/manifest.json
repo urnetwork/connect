@@ -1,0 +1,11 @@
+{
+  "archive_kind": "receiver_hybrid_window_mismatch_ledgers",
+  "file_count": 4,
+  "file_sha256": {
+    "numerical-readings.jsonl": "610c38caca1731a66a521dee14853abcd78adcddc76338d5c81eea2caf61cab3",
+    "outcomes.jsonl": "b14391fb5271e9a52040f3490899ccb93b44cc004edf5fb7ad22223966e69a31",
+    "provenance.json": "c20ec8fca1537702124756cfc19be806708008373158fef1bdb99df5dab141bf",
+    "status.json": "1edb1a5210e865b9ebd6f56f32e2016396ce92c8a55072b4598888e1e18b2400"
+  },
+  "schema_version": 1
+}

@@ -1,0 +1,158 @@
+{
+  "archive_kind": "receiver_ack_timing_root_evidence",
+  "archive_scope": {
+    "candidate_landing_status": "unlanded; no provisional source was run by this monitor",
+    "not_run_by_monitor": true,
+    "selected_evidence": "completed pinned receiver wire failure-before/after and sender blocked-worker failure-before roots",
+    "selected_runs": [
+      "receiver-root-before",
+      "receiver-root-after",
+      "sender-root-before"
+    ]
+  },
+  "attribution_limits": [
+    "Receiver metadata reports Pack ingress through ACK encoding; post-encoding encryption/route/wire waits and forward/reverse queues remain in RTT.",
+    "No controlled-drain/retry heuristic candidate is included or landed. Existing1.2s retry ambiguity/floor failures remain unresolved.",
+    "Senderv2 after evidence is scoped to valid exact timing; subsequent invalid-metadata suppression, sample time guards and shared service integration are excluded.",
+    "The repeated-head fixture failure is missing an ACK notification stimulus, not a demonstrated production receiver defect. Preserve it as a fixture diagnostic.",
+    "Retain hashes and sanitized numerical/outcome data only. Copy no raw logs, traces, generated IDs, local paths, source, overlays or binaries into repository archive."
+  ],
+  "excluded_fixture_diagnostic": {
+    "binary_sha256": "ad97ed76964e25a83338c678d19c2c8feeded9618a399f8eedc7620b37c35b98",
+    "build_manifest_sha256": "cb82ec9ea576b968ead8af93af50960bbdb0c0b1cef770a5fedb1e0a3519e180",
+    "classification": "excluded_invalid_fixture_stimulus",
+    "complete": true,
+    "corrected_fixture_status": "not included in this checkpoint",
+    "effective_input_sha256": "22dcdc12df5665c658d48b687aaf45d64a16368c1424c4eee659ba5208070bc3",
+    "exclusion_reason": "The repeated-head fixture queues eviction only; notification intentionally waits for a next ACK. It lacks the duplicate-head wake required to exercise the asserted path, so its single failure is retained as a fixture diagnostic and is not evidence of a production receiver defect.",
+    "inputs_stable_during_build": true,
+    "note": "6pass/1fixturefail. Repeated-head test queued eviction only; noteEviction intentionally waits for next ACK. Corrected test triggers an actual duplicate-head wake; not yet included here.",
+    "original_log_sha256": "d605c657a1c4e513adca5e87760c23f9ff39a0f52b886bfaa223b1b8ed726448",
+    "outcome_count": 7,
+    "overlay_sha256": "78f567b3d8d976fa447bb765fe9fc1754b781b56bac49eeef9d16a76361776e4",
+    "race_warning_count": 0,
+    "reading_count": 0,
+    "run_id": "receiver-adjacent-first-fixture-diagnostic"
+  },
+  "excluded_provisional_after_run": {
+    "binary_sha256": "39cc9390f2b488c7cbfadc7dd4b1d3f60d30d8d10aac46a611b8a43a180a8aeb",
+    "build_manifest_sha256": "b9e3037196ee2b55e4fcd17654a6f3eb94cc5cd5643432532ca7bd68d85064ab",
+    "classification": "excluded_provisional_candidate",
+    "complete": true,
+    "effective_input_sha256": "51ab7e1b1e70a567c84abf7351ba233a7483064ba99a084cd7d0dca37ea6e788",
+    "exclusion_reason": "The v2 sender-after run is outside the requested root-evidence scope. Invalid-metadata suppression, sample-time guards, and shared-service integration remain under review.",
+    "inputs_stable_during_build": true,
+    "note": "Provisionalv2: coalescer records raw12ms, excluding40ms local pacing and15ms later application wait.3passes; unrelated invalid-metadata suppression still under review.",
+    "original_log_sha256": "b951b073dec1c6e49ee6f44ff4f88ccfc7dafbe1f871e1e3b1066a6df57bb8ce",
+    "outcome_count": 3,
+    "outcome_summary": {
+      "FAIL": 0,
+      "PASS": 3
+    },
+    "overlay_sha256": "dba4094d105145a22795fbc7c3fbd20dec4c352528381dccfa21d53b4b0b9a88",
+    "race_warning_count": 0,
+    "reading_count": 0,
+    "run_id": "sender-root-after-v2"
+  },
+  "handoff": {
+    "candidate_label": "receiver-timing-checkpoint",
+    "name": "receiver-checkpoint-handoff.json",
+    "sha256": "d627197957903d3671d97f6372e17597d0e28dd7106ce8f20f701341e55bf5d0",
+    "status": "Isolated unlanded receiver/sender timing prototype; codec field12 is shared; v3 invalid-timing suppression/shared-floor integration remain unfinished."
+  },
+  "redaction": {
+    "local_paths_generated_ids_and_network_addresses": "removed from archive text",
+    "raw_logs": "retained locally; represented only by original_log_sha256",
+    "source_overlay_binary_copies": "not copied; represented only by names and SHA-256 pins"
+  },
+  "schema_version": 1,
+  "selected_run_pins": [
+    {
+      "binary_sha256": "3510421d41b21485b6c725015c2f78636ae5249bbb9fec756e954214e0ffc0be",
+      "build_manifest_sha256": "e4d7e5cae257a148288489f3d737e07c1667985e6c9494c43231b6d6359a4d21",
+      "complete": true,
+      "effective_input_sha256": "4d7674e78ad04adde949edde883cf72a1d8d8fb68096ceb1953246f499e8b2d1",
+      "inputs_stable_during_build": true,
+      "note": "Codec-only baseline: missing25ms and exact-zero wire timing; both deterministic roots fail3times.",
+      "original_log_sha256": "1dbfa827abbf4d10751474eb90964f0bf3459964b2c561c5d5d2fcd0becf792a",
+      "outcome_count": 6,
+      "overlay_sha256": "d6d991a2759fecc79652ff924749bd0f61b0fd86bcf338763213a88c7b3e8bc1",
+      "race_warning_count": 0,
+      "reading_count": 0,
+      "run_id": "receiver-root-before"
+    },
+    {
+      "binary_sha256": "0c4ed46addb3285ed6a5bb273a544cdc5ed1c01e3852fd4c72af56b5a8a9e505",
+      "build_manifest_sha256": "d9d2c96462e83ae2d39f82916b2a09127e86e6bb61283036d3fd4f8843f3c7cb",
+      "complete": true,
+      "effective_input_sha256": "89a3897ab7a173ec6be3ef1dd3bd824cc8955f840c652cb1b7741b2908ce4f3e",
+      "inputs_stable_during_build": true,
+      "note": "Receiver integration only: both actual worker/wire roots pass3times each, both codecs within each test.",
+      "original_log_sha256": "25a8f9ceede3ef0becb12574e35c45dce7b94335a5dcee993e7f048d5cbfd2f8",
+      "outcome_count": 6,
+      "overlay_sha256": "73e068c565e1bcd3815d0414b2e9ab9088998ce94bd5d1944d1a9c205a76ef89",
+      "race_warning_count": 0,
+      "reading_count": 0,
+      "run_id": "receiver-root-after"
+    },
+    {
+      "binary_sha256": "ad614b8c269debc1d3107bd7682d8239fa566e2e76d6de49d83dfe15fd554bbe",
+      "build_manifest_sha256": "e3e05719155bbb4a165d2091f72cb206dd9f357f6431f6e418c7fa4ed7915f06",
+      "complete": true,
+      "effective_input_sha256": "1de8f16f3e9ffb203256794855e6cbfab8ee8776be8051bf51b19b911d37afe8",
+      "inputs_stable_during_build": true,
+      "note": "Actual sender remains behind post-write barrier; codec-only RTT remains unsampled although exact metadata ACK reached coalescer.",
+      "original_log_sha256": "417b786bb70c6c81648f0eb6134a5f1ec3e337790eff3f45fce9806e823fd9c6",
+      "outcome_count": 3,
+      "overlay_sha256": "7cb4d75bd5777b9c3a98ada8c1728cffc320e88678c2207a2c762ec7a0e1263c",
+      "race_warning_count": 0,
+      "reading_count": 0,
+      "run_id": "sender-root-before"
+    }
+  ],
+  "source_pins": {
+    "production": [
+      {
+        "name": "receiver-transfer.go",
+        "sha256": "e637fc184a664ed8e2b451fd0f77835ae3b3e58f5e9862bbdf4ef7fbececd259"
+      },
+      {
+        "name": "receiver-timing.go",
+        "sha256": "45ae7042cf420ebe2b9dd46d9b7c454e45088073429bb244f5d8c19067e9e3ba"
+      },
+      {
+        "name": "sender-v2-transfer.go",
+        "sha256": "c016c95bb55723f3b912b1c18b5b89b31ab5cbf8aa4e2322d1391fa4d8594d40"
+      },
+      {
+        "name": "sender-v2-rtt.go",
+        "sha256": "a6d80fa60134035b770efbdeafe3d1362506cec47c766a294e8797562fdc0648"
+      },
+      {
+        "name": "sender-v2-timing.go",
+        "sha256": "2fe52670f320c402c329abc2a47a1fa5c73634a8b4affacdfc056cdbda587631"
+      }
+    ],
+    "tests": [
+      {
+        "name": "receiver-root_test.go",
+        "sha256": "a2a23360bcb182119cb93eccc34ab2657e2b196f15a323bc2314816c79ab0348"
+      },
+      {
+        "name": "receiver-adjacent_test.go",
+        "sha256": "391ce4e0841450cbf8e685b5f4dacfe5a0394b99e6397f7171f96675dd271b83"
+      },
+      {
+        "name": "sender-root_test.go",
+        "sha256": "c06fea6667ffed37a50383c307848420791c167b3f4baf599b9cc7e71c4c54e4"
+      }
+    ]
+  },
+  "verification": {
+    "all_build_manifests_match_binary_and_effective_input_pins": true,
+    "all_runs_report_stable_inputs_during_build": true,
+    "all_runs_report_zero_race_warnings": true,
+    "verified_file_pins": 28,
+    "verified_handoff_digest": true
+  }
+}

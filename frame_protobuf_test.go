@@ -295,8 +295,14 @@ func buildEquivalentAckFrame(m *sendAckFrame) *protocol.TransferFrame {
 		value := m.ackCompressTimeoutMicros
 		compression = &value
 	}
+	var receiverDelay *uint32
+	if m.receiverAckDelaySet {
+		value := m.receiverAckDelayMicros
+		receiverDelay = &value
+	}
 	ack := &protocol.Ack{
 		AckCompressTimeoutMicros: compression,
+		ReceiverAckDelayMicros:   receiverDelay,
 		MessageId:                m.messageId.Bytes(),
 		SequenceId:               m.sequenceId.Bytes(),
 		Selective:                m.selective,
@@ -587,6 +593,8 @@ func TestAckCodecRandomized(t *testing.T) {
 		}
 		m.ackCompressTimeoutSet = mathrandv2.IntN(2) == 0
 		m.ackCompressTimeoutMicros = mathrandv2.Uint32()
+		m.receiverAckDelaySet = mathrandv2.IntN(2) == 0
+		m.receiverAckDelayMicros = mathrandv2.Uint32()
 		assertAckCodecMatches(t, m)
 	}
 }
@@ -1562,6 +1570,8 @@ func TestOwnedAckDecodeSteadyStateDoesNotAllocate(t *testing.T) {
 		receiveWindowByteCount:   1 << 20,
 		ackCompressTimeoutSet:    true,
 		ackCompressTimeoutMicros: 10000,
+		receiverAckDelaySet:      true,
+		receiverAckDelayMicros:   7500,
 	}
 	encoded := marshalSendAckTransferFrame(m)
 	defer MessagePoolReturn(encoded)

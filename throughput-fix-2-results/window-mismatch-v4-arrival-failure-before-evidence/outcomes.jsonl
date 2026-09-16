@@ -1,0 +1,9 @@
+{"failure_assertion_rows":2,"repetition":1,"result":"FAIL","schema":"throughput-fix-2/window-mismatch-v4-arrival-outcome-v1","test_group":"TestWindowPacing","test_suffix":"ShortFlightEligibilitySurvivesApplicationOrder"}
+{"failure_assertion_rows":2,"repetition":2,"result":"FAIL","schema":"throughput-fix-2/window-mismatch-v4-arrival-outcome-v1","test_group":"TestWindowPacing","test_suffix":"ShortFlightEligibilitySurvivesApplicationOrder"}
+{"failure_assertion_rows":2,"repetition":3,"result":"FAIL","schema":"throughput-fix-2/window-mismatch-v4-arrival-outcome-v1","test_group":"TestWindowPacing","test_suffix":"ShortFlightEligibilitySurvivesApplicationOrder"}
+{"failure_assertion_rows":1,"repetition":1,"result":"FAIL","schema":"throughput-fix-2/window-mismatch-v4-arrival-outcome-v1","test_group":"TestWindowPacing","test_suffix":"CompressionChangeKeepsObservationProvenance"}
+{"failure_assertion_rows":1,"repetition":2,"result":"FAIL","schema":"throughput-fix-2/window-mismatch-v4-arrival-outcome-v1","test_group":"TestWindowPacing","test_suffix":"CompressionChangeKeepsObservationProvenance"}
+{"failure_assertion_rows":1,"repetition":3,"result":"FAIL","schema":"throughput-fix-2/window-mismatch-v4-arrival-outcome-v1","test_group":"TestWindowPacing","test_suffix":"CompressionChangeKeepsObservationProvenance"}
+{"failure_assertion_rows":0,"repetition":1,"result":"PASS","schema":"throughput-fix-2/window-mismatch-v4-arrival-outcome-v1","test_group":"TestWindowPacing","test_suffix":"ShortFlightRejectsOlderResidence"}
+{"failure_assertion_rows":0,"repetition":2,"result":"PASS","schema":"throughput-fix-2/window-mismatch-v4-arrival-outcome-v1","test_group":"TestWindowPacing","test_suffix":"ShortFlightRejectsOlderResidence"}
+{"failure_assertion_rows":0,"repetition":3,"result":"PASS","schema":"throughput-fix-2/window-mismatch-v4-arrival-outcome-v1","test_group":"TestWindowPacing","test_suffix":"ShortFlightRejectsOlderResidence"}

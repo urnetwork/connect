@@ -1,0 +1,39 @@
+{
+  "accepted_as_performance_validation": false,
+  "archive_limits": [
+    "Contains normalized outcomes, numerical readings, source and binary hashes, and manifest hashes only.",
+    "Raw logs, source files, overlay files, binaries, commands, and local filesystem locations remain outside this archive.",
+    "The candidate remains unlanded and is not accepted SDK or physical-throughput validation."
+  ],
+  "attribution_limits": [
+    "All existing gates, warmups, budgets, fixtures and complete failed outcomes are preserved.",
+    "First-feedback barrier and primer timing are synthetic recovery/phase stimuli, not proof of the natural trigger.",
+    "Virtual FIFO SDK results do not attribute the historical host TCP failures.",
+    "TUN handoff deadlock is an independent cause/fix.",
+    "Versions v3/v4 of the cycle prototype used inconsistent drained-byte fixtures; only the consistent v5 original-root failures are accepted as the coalesced-accounting proof.",
+    "Earlier ACK v3 evidence is separately archived as unlanded/rejected; v4 differs in quiet-time ceiling division.",
+    "Full correctness/model and physical SDK validation remain root/monitor work after reviewed landing."
+  ],
+  "base": {
+    "canonical_shared_go_source_at_build": "c07140f78cac0dc84c22ec06ac8635de755e925471d3bb8a0dbacf0d7737262e",
+    "note": "Includes independent reviewed TUN change; production ACK/Transfer/pacing base matches 3ce605cb."
+  },
+  "candidate": "ack-tail-v4-plus-feedback-cycle-v10",
+  "fail_count": 38,
+  "negative_results_retained": true,
+  "outcome_count": 1663,
+  "pass_count": 1625,
+  "prior_rejected_ack_archive": "throughput-fix-2-results/sdk-ack-tail-v3-evidence",
+  "reading_count": 167,
+  "rejected_v9_run_ids": [
+    "rejected-v9-focus",
+    "rejected-v9-recovery",
+    "rejected-v9-service-controls",
+    "rejected-v9-race",
+    "rejected-v9-long"
+  ],
+  "run_count": 22,
+  "schema": "throughput-fix-2/sdk-feedback-cycle-v10-evidence-summary-v1",
+  "skip_count": 0,
+  "status": "unlanded; final focused, race, recovery and declared service/phase controls passed; awaiting root review and wider combined validation"
+}

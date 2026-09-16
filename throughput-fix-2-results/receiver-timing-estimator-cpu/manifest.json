@@ -1,0 +1,11 @@
+{
+  "archive_kind": "receiver_timing_estimator_cpu",
+  "file_count": 4,
+  "file_sha256": {
+    "benchmark-rows.jsonl": "c4e2d93f04d8dfd00b89ce2c0284502bee25f169fa09cdfaefd811a7e1da20a4",
+    "historical-baseline-context.json": "a53e99bb453699d2e83a6c5840a10c078c8bcd0210242151bafc6ffab1cfaffb",
+    "provenance.json": "df11eda1ebc97d6841a0de6f0d383832864ae174c2db9f3e7809166326112ea7",
+    "status.json": "57e6eb48914b803b1bc799a04cfc63402198cb1ec07218a2c2986908f0899be2"
+  },
+  "schema_version": 1
+}

@@ -1300,6 +1300,8 @@ const sendPackH1EstablishedMaxMessageByteCount = 3 * DefaultMtu
 const rawSendPackPoolCapacity = 8
 
 type ReceivePack struct {
+	// Client-relative monotonic ingress; zero means no timing provenance.
+	receivedAtNanos    int64
 	Source             TransferPath
 	SequenceId         Id
 	Pack               *protocol.Pack
@@ -1841,8 +1843,10 @@ type ClientSendRecoveryStatsSnapshot struct {
 // The Transfer endpoint. All callbacks are wrapped to check for nil and
 // recover from errors.
 type Client struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+	// Shared monotonic origin for compact local feedback timestamps.
+	feedbackTimeBase time.Time
+	ctx              context.Context
+	cancel           context.CancelFunc
 
 	clientId  Id
 	clientTag string
@@ -2078,6 +2082,7 @@ func NewClientWithTag(
 		}
 	}
 	client := &Client{
+		feedbackTimeBase:             time.Now(),
 		ctx:                          cancelCtx,
 		cancel:                       cancel,
 		clientId:                     clientId,
@@ -4167,6 +4172,9 @@ func (self *Client) run() {
 			continue
 		}
 
+		// Capture local ingress before decode, application handoff, and ACK compression.
+		receivedAtNanos := self.feedbackTimeNanos(time.Now())
+
 		// at this point, the route is expected to have already parsed the transfer frame
 		// and applied basic validation and source/destination checks
 		// because of this, errors in parsing the `FilteredTransferFrame` are not expected
@@ -4513,6 +4521,7 @@ func (self *Client) run() {
 						receivePack = &ReceivePack{}
 					}
 					*receivePack = ReceivePack{
+						receivedAtNanos:     receivedAtNanos,
 						Source:              source,
 						SequenceId:          sequenceId,
 						Pack:                pack,
@@ -5589,7 +5598,7 @@ func (self *SendBuffer) createSendSequence(id sendSequenceId, sendPack *SendPack
 		base := id.logicalLaneBase()
 		service := self.windowPacingServices[base]
 		if service == nil {
-			service = &windowPacingService{}
+			service = newWindowPacingService(self.sendBufferSettings)
 			self.windowPacingServices[base] = service
 		}
 		service.references++
@@ -6272,6 +6281,11 @@ type SendSequence struct {
 	idleCondition *IdleCondition
 
 	rttWindow *RttWindow
+	// At most one physical write per send worker; protected by resendQueue.stateLock.
+	pendingReceiverRtt pendingReceiverRtt
+	// The queue lock owns cumulative service publication independently of delivery.
+	serviceAckHeadNumber uint64
+	serviceAckHeadSet    bool
 	// lastHeadAckTime is when the cumulative (head) ACK last advanced.
 	lastHeadAckTime time.Time
 	// what this sequence has put on the wire: first writes and recovery
@@ -6932,9 +6946,11 @@ type receiveAckMessage struct {
 	// hold is never near four gibibytes, so this is the narrow type and packs
 	// against the tail rather than adding a word of its own.
 	receiveWindowSet         bool
+	ackCompressTimeoutSet    bool
+	receiverAckDelaySet      bool
 	receiveWindowByteCount   uint32
 	ackCompressTimeoutMicros uint32
-	ackCompressTimeoutSet    bool
+	receiverAckDelayMicros   uint32
 	// Set when the receiver removed items from its hold after acknowledging
 	// them. A pointer rather than a slice so this struct stays comparable and
 	// so the common case, which is every acknowledgement that evicts nothing,
@@ -6987,6 +7003,10 @@ func receiveAckMessageFromProtocol(ack *protocol.Ack) (receiveAckMessage, error)
 		receiveAck.ackCompressTimeoutMicros = *ack.AckCompressTimeoutMicros
 		receiveAck.ackCompressTimeoutSet = true
 	}
+	if ack.ReceiverAckDelayMicros != nil {
+		receiveAck.receiverAckDelayMicros = *ack.ReceiverAckDelayMicros
+		receiveAck.receiverAckDelaySet = true
+	}
 	if 0 < len(ack.EvictedSequenceNumbers) {
 		receiveAck.evictions = &ackEvictionNotice{
 			sequenceNumbers: ack.EvictedSequenceNumbers,
@@ -7023,7 +7043,7 @@ func (self *SendSequence) ackMessageDetailed(
 	ack receiveAckMessage,
 	timeout time.Duration,
 ) (receiveAckHandoffResult, error) {
-	ack.receivedAtNanos = time.Now().UnixNano()
+	ack.receivedAtNanos = self.client.feedbackArrivalNanos(time.Now())
 	self.ackMutex.Lock()
 	defer self.ackMutex.Unlock()
 
@@ -7140,6 +7160,7 @@ func (self *SendSequence) coalesceReceivedAck(
 		selective:                        ack.selective,
 		tag:                              ack.tag,
 		compactContractRecoverySupported: ack.compactContractRecoverySupported,
+		receiverTiming:                   ack.receiverAckDelaySet,
 	}
 	if ack.contractMissing {
 		sequenceAck.contractMissing = true
@@ -7147,12 +7168,14 @@ func (self *SendSequence) coalesceReceivedAck(
 		ackWindow.UpdateContractMissing(sequenceAck)
 		return
 	}
+	self.observeReceiverAckRtt(ack)
 	if service := self.windowPacer.service; service != nil {
 		at := time.Now()
 		if ack.receivedAtNanos != 0 {
 			at = time.Unix(0, ack.receivedAtNanos)
 		}
 		service.acknowledgeWrite(self.sequenceId, ack.messageId, sequenceNumber, ack.selective, self.ackCompressionResidence(), at)
+		self.publishAckServiceCredit(ack.messageId, ack.selective, at)
 	}
 	ackWindow.Update(sequenceAck)
 	if self.sendBuffer != nil && self.sendBuffer.afterAckCoalescedForTest != nil {
@@ -8128,21 +8151,23 @@ sendSequenceLoop:
 		ackUpdated := 0 < ackSnapshot.ackUpdateCount || 0 < len(ackSnapshot.selectiveAcks)
 		if 0 < ackSnapshot.ackUpdateCount {
 			self.lastHeadAckTime = time.Now()
-			self.receiveAckAt(
+			self.receiveAckFeedbackAt(
 				ackSnapshot.headAck.messageId,
 				false,
 				ackSnapshot.headAck.tag,
 				ackSnapshot.headAck.compactContractRecoverySupported,
 				ackSnapshot.headAck.receivedAtNanos,
+				ackSnapshot.headAck.receiverTiming,
 			)
 		}
 		for messageId, ack := range ackSnapshot.selectiveAcks {
-			self.receiveAckAt(
+			self.receiveAckFeedbackAt(
 				messageId,
 				true,
 				ack.tag,
 				ack.compactContractRecoverySupported,
 				ack.receivedAtNanos,
+				ack.receiverTiming,
 			)
 		}
 		for messageId, ack := range ackSnapshot.contractMissingAcks {
@@ -8249,6 +8274,34 @@ sendSequenceLoop:
 					self.client.ackPendingResendPreemptCount.Add(1)
 					continue sendSequenceLoop
 				}
+				laneVerdict := laneTimerNotApplicable
+				if item.recoveryKind == sendRecoveryNone {
+					laneVerdict = self.laneTimerVerdictFor(item)
+				}
+				// Confirmed raw H1 residence applies to an unproved ordinary
+				// timeout, anchored to this item's actual first physical write.
+				// Explicit recovery and a proved same-lane hole retain their
+				// own due boundary. Drained probes share the same fixed bound.
+				if service := self.windowPacer.service; service != nil &&
+					item.recoveryKind == sendRecoveryNone && laneVerdict != laneTimerEndpointDrop && item.sendCount == 1 &&
+					item.reliableCarrierObserved && !item.unreliableCarrierObserved &&
+					!item.carrierChanged && flightPolicy.h1Only {
+					deadline := service.probeRecoveryDeadline(self.sequenceId, item.messageId,
+						self.sendBufferSettings.RttScale, self.sendBufferSettings.MaxResendInterval)
+					if interval := self.sharedRawRecoveryInterval(item, sendTime); interval > 0 && item.pacingSentAtNanos != 0 {
+						physicalDeadline := time.Unix(0, item.pacingSentAtNanos).Add(max(interval, self.resendIntervalForItem(item, 1)))
+						if deadline.Before(physicalDeadline) {
+							deadline = physicalDeadline
+						}
+					}
+					if !retainPastAckTimeout && deadline.After(item.sendTime.Add(item.ackTimeout)) {
+						deadline = item.sendTime.Add(item.ackTimeout)
+					}
+					if sendTime.Before(deadline) {
+						self.setResendTime(item, deadline)
+						continue
+					}
+				}
 				self.preferH3AfterH1Timeout(item)
 				self.resendQueue.RemoveByMessageId(item.messageId)
 
@@ -8264,9 +8317,7 @@ sendSequenceLoop:
 				// means the lane is draining toward it, so wait; neither means
 				// write it if it is the lane's oldest unacknowledged item and
 				// otherwise ride that head.
-				laneVerdict := laneTimerNotApplicable
 				if recoveryKind == sendRecoveryNone {
-					laneVerdict = self.laneTimerVerdictFor(item)
 					if laneVerdict != laneTimerNotApplicable {
 						// this firing has now looked: the next one asks what
 						// moved on this lane since
@@ -9802,7 +9853,7 @@ func (self *SendSequence) sendWithSetContractRecords(
 			Frames:            legacyFrames,
 			ContractFrame:     contractFrame,
 			Nack:              !ack,
-			Tag:               self.rttWindow.OpenTag(),
+			Tag:               self.rttWindow.openTag(sendTime),
 			ForceStream:       self.forceStream,
 			CompanionContract: self.companionContract,
 			LogicalLane:       self.logicalLane,
@@ -9930,7 +9981,13 @@ func (self *SendSequence) sendWithSetContractRecords(
 	if ack {
 		if err == nil {
 			self.observeCarrierWrite(item, writeDisposition)
-			item.resendTime = sendTime.Add(self.resendIntervalForItem(item, 1))
+			recoveryStart := sendTime
+			if item.pacingByteCount > 0 && item.rttH1 && item.pacingSentAtNanos != 0 {
+				// Local pacing precedes the first physical attempt. It cannot
+				// consume that attempt's ordinary recovery interval.
+				recoveryStart = time.Unix(0, item.pacingSentAtNanos)
+			}
+			self.setResendTime(item, recoveryStart.Add(self.resendIntervalForItem(item, 1)))
 		}
 		if self.sendBuffer != nil && self.sendBuffer.afterInitialWriteQueuedForTest != nil {
 			self.sendBuffer.afterInitialWriteQueuedForTest(self.id(), sequenceNumber)
@@ -10226,19 +10283,21 @@ func (self *SendSequence) observeDeliveredBytes(byteCount ByteCount, at time.Tim
 // exactly once, including SACKs. Filling a hole must not credit the already
 // delivered suffix as a new, impossibly fast serialization burst.
 func (self *SendSequence) observeAckedBytes(cumulative, serviced ByteCount, at time.Time) {
+	self.observeAckedBytesWithServiceCredit(cumulative, serviced, windowServiceAckCredit{bytes: serviced}, at)
+}
+
+// Logical delivery remains worker-owned after physical service was published.
+func (self *SendSequence) observeAckedBytesWithServiceCredit(cumulative, serviced ByteCount, credit windowServiceAckCredit, at time.Time) {
 	if (cumulative <= 0 && serviced <= 0) || self.deliveredBytes == nil {
 		return
 	}
-	if service := self.windowPacer.service; service != nil {
-		self.windowPacer.serviceAcked += serviced
-		service.observe(serviced, at)
-	}
+	self.observePacingServiceCredit(credit, at)
+	interval := self.deliveredBytesSampleIntervalAt(at).Nanoseconds()
 	self.deliveredBytesMutex.Lock()
 	defer self.deliveredBytesMutex.Unlock()
 	self.deliveredByteTotal += cumulative
 	self.deliveredServiceByteTotal += serviced
 	atNanos := at.UnixNano()
-	interval := self.deliveredBytesSampleInterval().Nanoseconds()
 	if 0 < self.deliveredBytesCount {
 		newest := self.deliveredBytes[self.deliveredBytesHead]
 		if atNanos-newest.atNanos < interval {
@@ -10262,12 +10321,20 @@ func (self *SendSequence) observeAckedBytes(cumulative, serviced ByteCount, at t
 // to read a rate across a short round trip; the reliable-admission bound reads
 // a sum over a horizon and keeps the pacing-floor quarter it was built with.
 func (self *SendSequence) deliveredBytesSampleInterval() time.Duration {
+	return self.deliveredBytesSampleIntervalAt(time.Now())
+}
+
+// Timestamped callers keep feedback and its paired residence on one clock.
+func (self *SendSequence) deliveredBytesSampleIntervalAt(at time.Time) time.Duration {
 	if 0 < self.sendBufferSettings.DeliverySizedWindowScale {
 		interval := deliverySizedWindowSampleInterval
 		if self.rttWindow != nil {
 			// Keep two acknowledgement cycles in the fixed ring even at
 			// long RTTs. Leave two slots for checkpoint quantization.
-			residence := self.rttWindow.Estimate().Min + self.ackCompressionResidence()
+			_, residence, sampled := self.receiverWindowTiming(at)
+			if !sampled {
+				residence = self.rttWindow.estimate(at).Min + self.ackCompressionResidence()
+			}
 			slots := time.Duration(max(1, len(self.deliveredBytes)-2))
 			interval = max(interval, (2*residence+slots-1)/slots)
 		}
@@ -10325,10 +10392,13 @@ func (self *SendSequence) deliveryServiceEstimate(horizon time.Duration, now tim
 		return service.measure(horizon, now, retain)
 	}
 	if self.sendBufferSettings != nil {
-		interval := self.deliveredBytesSampleInterval()
-		residence := self.ackCompressionResidence()
-		if self.rttWindow != nil {
-			residence += self.rttWindow.Estimate().Min
+		interval := self.deliveredBytesSampleIntervalAt(now)
+		_, residence, sampled := self.receiverWindowTiming(now)
+		if !sampled {
+			residence = self.ackCompressionResidence()
+			if self.rttWindow != nil {
+				residence += self.rttWindow.estimate(now).Min
+			}
 		}
 		horizon = min(horizon, max(4*interval, residence+2*interval))
 	}
@@ -10707,7 +10777,7 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 					estimate.ServiceByteRate = latest
 				}
 				estimate.ServiceEstablished = true
-				estimate.ServiceBacklogged = service.backlogged(estimate.ServiceByteRate)
+				estimate.ServiceBacklogged = service.backloggedAt(estimate.ServiceByteRate, now)
 				estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingByteRate)
 			}
 		}
@@ -10847,15 +10917,19 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 	// window.
 	estimate.Window = max(ceiling, floor)
 
-	// The round trip it can see.
+	// A new sibling may already have shared receiver timing before its own
+	// first ACK. Read that evidence before the local cold-window decision.
+	adjustedRoundTrip, receiverResidence, receiverSampled := self.receiverWindowTiming(now)
 	roundTrip := self.rttWindow.estimate(now)
-	if !roundTrip.Sampled() {
+	if !roundTrip.Sampled() && !receiverSampled {
 		estimate.Reason = "no round trip samples"
 		return estimate
 	}
 	estimate.RoundTrip = roundTrip.Min
-	if service := self.windowPacer.service; service != nil {
-		estimate.RoundTrip = max(estimate.RoundTrip, service.roundTrip())
+	if receiverSampled {
+		estimate.RoundTrip = adjustedRoundTrip
+	} else if service := self.windowPacer.service; service != nil {
+		estimate.RoundTrip = max(estimate.RoundTrip, service.roundTripEvidence(now).minimum)
 	}
 	if override := self.sendBufferSettings.windowRoundTripOverrideForTest; override != nil {
 		estimate.RoundTrip = max(0, *override)
@@ -10865,8 +10939,13 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 		estimate.AckCompressTimeout = max(0, *override)
 	}
 	estimate.WindowRoundTrip = estimate.RoundTrip + estimate.AckCompressTimeout
+	if receiverSampled && self.sendBufferSettings.windowRoundTripOverrideForTest == nil && self.sendBufferSettings.ackCompressionResidenceOverrideForTest == nil {
+		// A measured receiver queue/application wait still occupies flight.
+		// Pinned per-sample compression reserves only residence not observed.
+		estimate.WindowRoundTrip = receiverResidence
+	}
 	estimate.SampleCount = self.deliveredSampleCount()
-	service, serviceDelivered, latestService := self.deliveryServiceEstimate(max(2*estimate.WindowRoundTrip, 4*self.deliveredBytesSampleInterval()), now, retainService)
+	service, serviceDelivered, latestService := self.deliveryServiceEstimate(max(2*estimate.WindowRoundTrip, 4*self.deliveredBytesSampleIntervalAt(now)), now, retainService)
 	estimate.ServiceByteRate = service
 	// A few complete data frames establish serialization even when the
 	// opening window takes seconds to drain on a slow link. Requiring that
@@ -10880,7 +10959,7 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 	}
 	if estimate.PacingByteRate > 0 {
 		if service := self.windowPacer.service; service != nil {
-			estimate.ServiceBacklogged = service.backlogged(estimate.ServiceByteRate)
+			estimate.ServiceBacklogged = service.backloggedAt(estimate.ServiceByteRate, now)
 		}
 		estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingProbeByteRate)
 	}
@@ -10905,7 +10984,7 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 	// of round trips where those are long
 	minSpan := max(
 		2*estimate.WindowRoundTrip,
-		4*self.deliveredBytesSampleInterval(),
+		4*self.deliveredBytesSampleIntervalAt(now),
 	)
 	delivered, span, spanStartNanos, ok := self.deliveredRate(minSpan)
 	if !ok {
@@ -11063,7 +11142,7 @@ func (self *SendSequence) reliableAdmissionAvailable(
 // resends per second while p2p is live). The unreliable lane has its own
 // bounded recovery policy and does not depend on this estimate.
 func (self *SendSequence) observeAckRtt(item *sendItem, tag sequenceTag) {
-	if !tag.set || item == nil || item.unreliableCarrierObserved {
+	if !tag.set || item == nil || item.unreliableCarrierObserved || self.receiverRttObserved(item) {
 		return
 	}
 	self.rttWindow.CloseSendTime(tag.sendTime)
@@ -11153,6 +11232,19 @@ func (self *SendSequence) receiveAckAt(
 	compactContractRecoverySupported bool,
 	receivedAtNanos int64,
 ) {
+	self.receiveAckFeedbackAt(messageId, selective, tag, compactContractRecoverySupported, receivedAtNanos, false)
+}
+
+// Explicit receiver timing is sampled before this worker applies delivery.
+// Rejected/ambiguous metadata must not re-enter through legacy RTT sampling.
+func (self *SendSequence) receiveAckFeedbackAt(
+	messageId Id,
+	selective bool,
+	tag sequenceTag,
+	compactContractRecoverySupported bool,
+	receivedAtNanos int64,
+	receiverTiming bool,
+) {
 	deliveryTime := time.Now()
 	if receivedAtNanos != 0 {
 		deliveryTime = time.Unix(0, receivedAtNanos)
@@ -11166,12 +11258,14 @@ func (self *SendSequence) receiveAckAt(
 		return
 	}
 
-	self.observeAckRtt(item, tag)
-	// The wire tag precedes local pacing. Measure service residence from
-	// the actual first write, and exclude ambiguous retransmitted copies.
-	if service := self.windowPacer.service; service != nil && item.pacingSentAtNanos != 0 &&
-		item.sendCount == 1 && !item.deliveryObserved && !item.unreliableCarrierObserved && !item.carrierChanged {
-		service.observeBurstRoundTrip(item.pacingBurst, deliveryTime.Sub(time.Unix(0, item.pacingSentAtNanos)), self.ackCompressionResidence(), deliveryTime)
+	if !receiverTiming {
+		self.observeAckRtt(item, tag)
+		// Legacy service residence starts at the physical write and excludes
+		// ambiguous copies; receiver metadata has its own confirmed path.
+		if service := self.windowPacer.service; service != nil && item.pacingByteCount > 0 && item.pacingSentAtNanos != 0 && !self.receiverRttObserved(item) &&
+			item.sendCount == 1 && !item.deliveryObserved && !item.unreliableCarrierObserved && !item.carrierChanged {
+			service.observeBurstRoundTrip(item.pacingBurst, deliveryTime.Sub(time.Unix(0, item.pacingSentAtNanos)), self.ackCompressionResidence(), deliveryTime)
+		}
 	}
 
 	if selective {
@@ -11180,7 +11274,8 @@ func (self *SendSequence) receiveAckAt(
 			if self.windowPacer.service != nil {
 				bytes = item.pacingByteCount
 			}
-			self.observeAckedBytes(0, bytes, deliveryTime)
+			credit := self.takePacingServiceCredit(item)
+			self.observeAckedBytesWithServiceCredit(0, bytes, credit, deliveryTime)
 			item.deliveryObserved = true
 		}
 		if self.log.V(1).Enabled() {
@@ -11228,6 +11323,7 @@ func (self *SendSequence) receiveAckAt(
 	// admission bound reads.
 	cumulativeByteCount := ByteCount(0)
 	serviceByteCount := ByteCount(0)
+	serviceCredit := windowServiceAckCredit{}
 	// §34.3: an acknowledgement is cumulative, so every lane it touches has
 	// had its oldest unacknowledged item acknowledged. Collect those lanes
 	// and promote their new heads once the acknowledged prefix is gone.
@@ -11265,6 +11361,7 @@ func (self *SendSequence) receiveAckAt(
 			} else {
 				serviceByteCount += implicitItem.MessageByteCount()
 			}
+			serviceCredit.add(self.takePacingServiceCredit(implicitItem))
 			implicitItem.deliveryObserved = true
 		}
 		self.observeLaneAck(implicitItem, self.lastCumulativeAckTime)
@@ -11313,7 +11410,7 @@ func (self *SendSequence) receiveAckAt(
 	if promoteLanes != 0 {
 		self.promoteLaneHeads(promoteLanes, self.lastCumulativeAckTime)
 	}
-	self.observeAckedBytes(cumulativeByteCount, serviceByteCount, deliveryTime)
+	self.observeAckedBytesWithServiceCredit(cumulativeByteCount, serviceByteCount, serviceCredit, deliveryTime)
 	if self.log.V(2).Enabled() {
 		a, b := self.resendQueue.QueueSize()
 		self.log.Infof("[s]ack %d/%d (stop %d %dB %d) %s->%s...%s s(%s)\n", ackSequenceNumber, self.nextSequenceNumber-1, a, b, len(self.sendItems), self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
@@ -11405,9 +11502,12 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 ) (transferWriteDisposition, error) {
 	writer := self.openContractMultiRouteWriter()
 	policy := self.transferFlightPolicy()
+	if resend {
+		self.invalidateReceiverRttWrite(item)
+	}
 	if service := self.windowPacer.service; service != nil && item != nil &&
 		(resend || item.pacingByteCount > 0 || item.deliveryObserved) {
-		service.invalidateProbe(self.sequenceId)
+		service.invalidateMessageProbe(self.sequenceId, item.messageId)
 	}
 	paced := false
 	paceWrite := func(byteCount int) error {
@@ -11426,13 +11526,14 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			if self.windowPacer.rate > 0 {
 				alreadyCounted := item.pacingByteCount > 0 || item.deliveryObserved
 				if !alreadyCounted {
+					self.resendQueue.stateLock.Lock()
 					item.pacingByteCount = ByteCount(byteCount)
+					self.resendQueue.stateLock.Unlock()
 				}
 				if err := self.windowPacer.waitForServiceMessage(self.ctx, byteCount, alreadyCounted, self.sequenceId, item.messageId, item.sequenceNumber); err != nil {
 					return err
 				}
 				if !alreadyCounted {
-					item.pacingSentAtNanos = self.windowPacer.waiter.sentAt.UnixNano()
 					item.pacingBurst = self.windowPacer.waiter.burst
 				}
 				paced = true
@@ -11441,6 +11542,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		return nil
 	}
 	finishPacedWrite := func(disposition transferWriteDisposition, err error) {
+		self.finishReceiverRttWrite(item, disposition, err)
 		if paced {
 			self.windowPacer.service.finishWrite(self.sequenceId, item.messageId, err == nil && disposition.transportType == TransportTypeH1)
 		}
@@ -11492,6 +11594,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		if err := paceWrite(len(bytes)); err != nil {
 			return transferWriteDisposition{}, err
 		}
+		self.beginReceiverRttWrite(item, resend)
 		self.observeTransferWireMessage(bytes, transferFrameBytes, item, resend)
 		shared := MessagePoolShareReadOnly(bytes)
 		disposition, err := writeMultiRouteWithCarrier(
@@ -11537,6 +11640,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	if err := paceWrite(len(wrapped)); err != nil {
 		return transferWriteDisposition{}, err
 	}
+	self.beginReceiverRttWrite(item, resend)
 	self.observeTransferWireMessage(wrapped, transferFrameBytes, item, resend)
 	shared := MessagePoolShareReadOnly(wrapped)
 	disposition, err := writeMultiRouteWithCarrier(
@@ -11855,8 +11959,9 @@ type sendItem struct {
 	sendCount          int
 	transferFrameBytes []byte
 	acks               sendAckSet
-	// The first paced wire envelope, including encryption/framing, is
-	// credited exactly once on delivery and released on sequence shutdown.
+	// The paced wire envelope is credited once on delivery. The first-write
+	// timestamp also serves receiver timing for unpaced acknowledged Packs;
+	// publication is protected by resendQueue.stateLock.
 	pacingByteCount   ByteCount
 	pacingSentAtNanos int64
 	pacingBurst       uint64
@@ -11866,7 +11971,12 @@ type sendItem struct {
 	// does not inflate ordinary timeout backoff and remains observable.
 	selectiveAcked bool
 	// Independent of recovery's SACK flag, which a resend can clear.
-	deliveryObserved      bool
+	deliveryObserved bool
+	// Service publication is independent of worker-owned logical delivery.
+	serviceCreditObserved bool
+	// Exact first-write timing state; protected by resendQueue.stateLock.
+	rttState              sendItemRttState
+	rttH1                 bool
 	selectiveGapRecovered bool
 	// deferralOutstanding is set while this item's own retransmit is waiting
 	// out a deferral and cleared when that retransmit is finally written. It
@@ -13535,6 +13645,8 @@ func (self *ReceiveSequence) Run() {
 		writeAck := func(sendAck sequenceAck, evictedSequenceNumbers []uint64) {
 			path := sendTransferPath(self.client.ClientId(), ackDestination)
 			ackCompressMicros := uint32(min(max(0, self.receiveBufferSettings.AckCompressTimeout.Microseconds()), math.MaxUint32))
+			receiverDelayMicros, receiverDelaySet := self.client.receiverAckDelayMicros(sendAck.receivedAtNanos, time.Now())
+			receiverDelaySet = receiverDelaySet && sendAck.tag.set && !sendAck.contractMissing
 
 			// what this receiver can still hold out of order, so the sender may
 			// clamp its window to it (THROUGHPUTFIX §37.3). A receiver that
@@ -13564,6 +13676,8 @@ func (self *ReceiveSequence) Run() {
 					receiveWindowSet:         advertiseReceiveWindow,
 					ackCompressTimeoutMicros: ackCompressMicros,
 					ackCompressTimeoutSet:    true,
+					receiverAckDelayMicros:   receiverDelayMicros,
+					receiverAckDelaySet:      receiverDelaySet,
 					evictedSequenceNumbers:   evictedSequenceNumbers,
 				}
 				if sendAck.contractMissing {
@@ -13580,6 +13694,9 @@ func (self *ReceiveSequence) Run() {
 					ContractAhead:            self.receiveBufferSettings.AcceptContractAhead,
 					LogicalLaneVersion:       transferLogicalLaneVersion,
 					AckCompressTimeoutMicros: &ackCompressMicros,
+				}
+				if receiverDelaySet {
+					ack.ReceiverAckDelayMicros = &receiverDelayMicros
 				}
 				if advertiseReceiveWindow {
 					ack.ReceiveWindowByteCount = &receiveWindowByteCount
@@ -13820,31 +13937,66 @@ func (self *ReceiveSequence) Run() {
 			}
 
 			// An idle sequence has no ACK traffic to compress, so publish its first
-			// cumulative ACK immediately. During a sustained stream, retain the
-			// same maximum ACK rate by waiting only until the previous write is one
-			// compression interval old. This removes a fixed 10 ms from sparse H1
-			// request/response turns without recreating one ACK per data Pack.
+			// cumulative ACK immediately. Full responses retain their compression
+			// deadline; a delivered H1 burst can publish only its head earlier
+			// under separate byte and quiet-time bounds.
 			ackCompressWait := time.Duration(0)
 			if timeout := self.receiveBufferSettings.AckCompressTimeout; 0 < timeout && !lastAckWriteTime.IsZero() && !continueResponse {
 				ackCompressWait = time.Until(lastAckWriteTime.Add(timeout))
 			}
+
+			headOnly := false
 			if 0 < ackCompressWait {
-				ackCompressTimer.Reset(ackCompressWait)
-				if self.receiveBufferSettings.beforeAckCompressWaitForTest != nil {
-					self.receiveBufferSettings.beforeAckCompressWaitForTest(self.id())
+				// A quiet tenth of the configured interval allows at most
+				// ten extra head turns per interval. The byte quantum bounds
+				// their encoded cost; tiny positive intervals still wait at
+				// least one nanosecond and the ordinary deadline wins ties.
+				quiet := self.receiveBufferSettings.AckCompressTimeout / 10
+				if self.receiveBufferSettings.AckCompressTimeout%10 != 0 {
+					quiet++
 				}
-				select {
-				case <-ctxDone:
-					drainCanceledSequence()
-				case <-ackWorkerStop:
-					drainAndStop()
-					return
-				case <-ackCompressTimer.C:
-				case <-self.ackWindow.GapNotify():
-					// a hole became provable or filled: the sender is waiting
-					// on exactly these acks, so do not hold them for the rest
-					// of the interval
+				compressDeadline := lastAckWriteTime.Add(self.receiveBufferSettings.AckCompressTimeout)
+			compressWait:
+				for {
+					now := time.Now()
+					if !now.Before(compressDeadline) {
+						break
+					}
+					ack, ready, quietDeadline := self.ackWindow.takeQuietHead(now, quiet)
+					if ready {
+						writeAck(ack, nil)
+						lastAck, hasLastAck = ack, true
+						lastHeadAck, hasLastHeadAck = ack, true
+						if self.receiveBufferSettings.afterAckWriteForTest != nil {
+							self.receiveBufferSettings.afterAckWriteForTest(self.id())
+						}
+						headOnly = true
+						break
+					}
+					deadline := compressDeadline
+					if !quietDeadline.IsZero() && quietDeadline.Before(deadline) {
+						deadline = quietDeadline
+					}
+					ackCompressTimer.Reset(time.Until(deadline))
+					if self.receiveBufferSettings.beforeAckCompressWaitForTest != nil {
+						self.receiveBufferSettings.beforeAckCompressWaitForTest(self.id())
+					}
+					select {
+					case <-ctxDone:
+						drainCanceledSequence()
+						break compressWait
+					case <-ackWorkerStop:
+						drainAndStop()
+						return
+					case <-ackCompressTimer.C:
+					case <-self.ackWindow.HeadQuietNotify():
+					case <-self.ackWindow.GapNotify():
+						break compressWait
+					}
 				}
+			}
+			if headOnly {
+				continue
 			}
 
 			writePending()
@@ -14040,7 +14192,21 @@ func (self *ReceiveSequence) sendAck(
 	unwrapped bool,
 	transportType TransportType,
 ) {
+	self.sendAckAt(sequenceNumber, messageId, selective, tag, unwrapped, transportType, 0)
+}
+
+// The ingress stamp and echoed tag name the same physical Pack copy.
+func (self *ReceiveSequence) sendAckAt(
+	sequenceNumber uint64,
+	messageId Id,
+	selective bool,
+	tag sequenceTag,
+	unwrapped bool,
+	transportType TransportType,
+	receivedAtNanos int64,
+) {
 	ack := sequenceAck{
+		receivedAtNanos:                  receivedAtNanos,
 		sequenceNumber:                   sequenceNumber,
 		messageId:                        messageId,
 		selective:                        selective,
@@ -14119,6 +14285,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 
 		contractId:         contractId,
 		receiveTime:        receiveTime,
+		receivedAtNanos:    receivePack.receivedAtNanos,
 		frames:             receivePack.Pack.Frames,
 		contractFrame:      receivePack.Pack.ContractFrame,
 		contractAhead:      receivePack.Pack.ContractAhead,
@@ -14299,13 +14466,14 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 				self.commitHeldPrefix()
 			} else {
 				item.committed = true
-				self.sendAck(
+				self.sendAckAt(
 					sequenceNumber,
 					messageId,
 					true,
 					item.tag,
 					item.unwrapped,
 					item.transportType,
+					item.receivedAtNanos,
 				)
 			}
 			return true, nil
@@ -14391,13 +14559,14 @@ func (self *ReceiveSequence) commitHeldPrefix() {
 func (self *ReceiveSequence) commitHeldItem(held *receiveItem) {
 	held.committed = true
 	self.client.receiveQueueCommitCount.Add(1)
-	self.sendAck(
+	self.sendAckAt(
 		held.sequenceNumber,
 		held.messageId,
 		true,
 		held.tag,
 		held.unwrapped,
 		held.transportType,
+		held.receivedAtNanos,
 	)
 }
 
@@ -14444,6 +14613,7 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 		},
 		contractId:         contractId,
 		receiveTime:        receiveTime,
+		receivedAtNanos:    receivePack.receivedAtNanos,
 		frames:             receivePack.Pack.Frames,
 		contractFrame:      receivePack.Pack.ContractFrame,
 		contractAhead:      receivePack.Pack.ContractAhead,
@@ -14627,14 +14797,15 @@ func (self *ReceiveSequence) flushDeliver() {
 	}
 	for _, item := range items {
 		if item.ack {
-			self.sendAck(
-				item.sequenceNumber,
-				item.messageId,
-				false,
-				item.tag,
-				item.unwrapped,
-				item.transportType,
-			)
+			self.ackWindow.UpdateDelivered(sequenceAck{
+				receivedAtNanos:                  item.receivedAtNanos,
+				sequenceNumber:                   item.sequenceNumber,
+				messageId:                        item.messageId,
+				tag:                              item.tag,
+				compactContractRecoverySupported: true,
+				unwrapped:                        item.unwrapped,
+				transportType:                    item.transportType,
+			}, item.messageByteCount)
 		}
 	}
 }
@@ -14998,11 +15169,13 @@ func (self *ReceiveSequence) WaitForExit() {
 type receiveItem struct {
 	transferItem
 
-	contractId    *Id
-	head          bool
-	receiveTime   time.Time
-	frames        []*protocol.Frame
-	contractFrame *protocol.Frame
+	contractId *Id
+	head       bool
+	// Ingress is independent of the existing reorder-gap timeout clock.
+	receivedAtNanos int64
+	receiveTime     time.Time
+	frames          []*protocol.Frame
+	contractFrame   *protocol.Frame
 	// The contract frame announces a successor rather than opening it
 	// (THROUGHPUTFIX §39.1): it is verified and stored, and the sequence does
 	// not switch to it.
@@ -15087,6 +15260,8 @@ func (tag *sequenceTag) protocol() *protocol.Tag {
 }
 
 type sequenceAck struct {
+	// Sender windows keep ACK arrival Unix nanos. Receiver windows keep the
+	// named Pack's client-relative monotonic ingress (elapsed nanos plus one).
 	receivedAtNanos int64
 	sequenceNumber  uint64
 	messageId       Id
@@ -15104,6 +15279,9 @@ type sequenceAck struct {
 	// ciphers haven't been established yet can read the ack. Cumulative
 	// head acks or-in the bit across every absorbed lower ack.
 	unwrapped bool
+	// Sender-only: metadata was handled at physical confirmation/coalescing,
+	// including rejected timing that must not fall back to legacy sampling.
+	receiverTiming bool
 }
 
 type sequenceContract struct {
@@ -15945,4 +16123,18 @@ func (self *SendSequence) addContractWaitTime(contractWaitTime time.Duration) {
 // contracts, and how many acquisitions that covers.
 func (self *SendSequence) ContractWaitTime() (time.Duration, int64) {
 	return time.Duration(self.contractWaitNanos.Load()), self.contractWaitCount.Load()
+}
+
+// Shared receiver evidence describes confirmed H1 delivery. Other current
+// carrier policies use this lane's paired samples without erasing H1 siblings.
+func (self *SendSequence) receiverWindowTiming(at time.Time) (time.Duration, time.Duration, bool) {
+	if service := self.windowPacer.service; service != nil && self.transferFlightPolicy().h1Only {
+		if adjusted, residence, sampled := service.receiverWindowEstimate(at); sampled {
+			return adjusted, residence, true
+		}
+	}
+	if self.rttWindow != nil {
+		return self.rttWindow.receiverWindowEstimate(at)
+	}
+	return 0, 0, false
 }

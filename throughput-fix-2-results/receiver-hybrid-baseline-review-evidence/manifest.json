@@ -1,0 +1,13 @@
+{
+  "archive_kind": "receiver_hybrid_baseline_review_evidence",
+  "file_count": 6,
+  "file_sha256": {
+    "memory.json": "b2c947ab634478580fed60508d835cee4532de7b93d77292768fe8606d4066c0",
+    "outcomes.jsonl": "e68aa3e22ba2909d411b7170da3663c4a3f6f25342944f750dc735d3f01cbebd",
+    "provenance.json": "9bee3aa37fee7d39ede6d812e36854cc9cfd768f28b3fbecdecbf7fff2c3f26a",
+    "service-readings.jsonl": "fab3af7db6745e3eeb6964230c6bfb7cbd9e1d6db22ddf6d30f0cf7872c95074",
+    "source-pins.json": "0fc588fbecda2bf13ced3360d035f3a857c8d6c6237e3dfd92a1cf462f19fe7c",
+    "status.json": "25086c36c081dbfb16df857f05889b99fa520ccfb5882d46a9ee43632fb91daa"
+  },
+  "schema_version": 1
+}

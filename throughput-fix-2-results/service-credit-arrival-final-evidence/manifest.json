@@ -1,0 +1,17 @@
+{
+  "archive_kind": "service_credit_arrival_final_evidence",
+  "file_count": 10,
+  "file_sha256": {
+    "benchmarks.jsonl": "bf0b393c6baf9292c0f439047161e44aa54af2793e359ecf02182efef43743ef",
+    "excluded-diagnostics.json": "a6e5f379841a6436b29ae81156c26e097a0687e491765d3ef1123d08549bfdfe",
+    "outcomes.jsonl": "2c21b9eb06850a664debde221a85039fe7101b09cb8b27a77f5cf360bccb72d1",
+    "provenance.json": "8504a58c355f9a72d9eec7d6415fa0beef295ae4be26e9667a9bac2667fdd1be",
+    "service-readings.jsonl": "a2e29e1db022912f0de125436da223865d66a2e64fc24fd0b808e1dda1a2e9d9",
+    "source-pins.json": "b035d466bf39c4ce191b9b9b3b84b27151b440f4055aff62408f0e9eee217371",
+    "static-credit-control-outcomes.jsonl": "b405c5dff89f737ffe92437a0c3515173b6e9d63bc2254e5dc78f35f16e4f013",
+    "static-credit-control-provenance.json": "533e878c5a44934de3aa3f649b3df89438264f3a4a8efa60456cff20e9fe35cf",
+    "static-credit-control-readings.jsonl": "4a918320bb8135adf1a55db0c7bfdd3812de9b165958ed3354baa6d7be43b712",
+    "status.json": "b4e107478ed2153ab564e97f5aa65de6b4e1ba16f47c21d2621a42f824cdfd71"
+  },
+  "schema_version": 1
+}

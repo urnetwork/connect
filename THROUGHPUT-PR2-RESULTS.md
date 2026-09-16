@@ -1,7 +1,7 @@
 # Window follow-up: implementation and local results
 
 Branch: `throughput-fix-2`, source revision `b51530f3a402cb1dd5fe5d1daae344302a1f3069`.
-Date: 2026-09-15. The delivery-sized window remains enabled.
+Date: 2026-09-16. The delivery-sized window remains enabled.
 
 Final evidence is summarized in [THROUGHPUT-REPORT-PR2.md](THROUGHPUT-REPORT-PR2.md).
 The deterministic and host-local runs completed. The completion audit found
@@ -33,8 +33,9 @@ change rates captured by later probes. The combined focused selection passes
 24 tests and 423 pairs, retaining all 810 rows. Separately forced SDK recovery
 failures remain open.
 
-The preceding `5605efa7` source passes the full 150-pair SDK matrix once, but
-separately reproduced bidirectional failures remain open. Its root regression
+The preceding `5605efa7` source records a full 150-pair SDK test pass, but later
+review finds an unlimited serializer in its nine reversed duplex pairs. Those
+pairs cannot establish capacity; separately reproduced failures remain open. Its root regression
 retains 3,011 passes, two failures and 24 skips. One failure read edited runtime
 source; the other exposed a miscalibrated real-clock serializer. Source snapshots
 and a calibrated virtual-time short-path test address those harness defects.
@@ -50,9 +51,42 @@ establishing a throughput gain. The legacy packet batching also exceeds actual
 H1's message cap in a separate physical-carrier test; these FIFO results do not
 validate physical H1. Evidence remains in `host-replay-confirmation`.
 
-The unlanded ACK-tail candidate improves forced SDK duplex recovery but fails
-the real 100 Mb/s RTT-growth control at 6.8608 versus 95.8054 Mb/s. SDK recovery
-and host throughput acceptance remain open.
+The first ACK-tail candidate improves forced SDK duplex recovery but fails
+the real 100 Mb/s RTT-growth control at 6.8608 versus 95.8054 Mb/s. Its complete
+failed evidence is retained. The reviewed combined ACK-tail/cycle correction
+on `914a2a72` now passes 393 focused and 393 race executions, nine recovery
+executions, six service controls and 18 SDK phase/control executions. It holds
+incomplete feedback, allows new bytes across the full gap to raise a low startup
+estimate, and requires completion before lowering it. Full combined correctness
+records 213 race passes and one eight-byte record-growth failure. Directly
+passing delivery bytes into the compressor now restores the original record
+layout and exact-size assertion; all 40 selected ACK/size tests pass under race.
+The full model finishes with 21 passes, five failing tests and all 814 readings
+retained. Adjacent review reproduces a same-timestamp partition defect beyond
+the ring. Its bounded v11 summary correction is now applied: five new roots,
+408 focused and 408 race executions pass. Three additional permanent drain and
+retry tests each fail three times before correction, including the real worker
+retrying a drained probe before its long-RTT ACK. The isolated candidate passes
+those roots but still fails the long-path performance control. Small-window
+sampling, long-path recovery and combined performance acceptance remain open.
+
+The next implementation uses receiver ACK timing to replace inference where
+possible. Optional actual receiver delay is now present in the codec; receiver
+stamping and adjusted RTT consumption remain under development. Sender-only
+rate/drain candidates are frozen for comparison. The existing one-head,
+bounded oldest-first SACK contract and original performance gates still apply;
+see research-plan section 28 for timing, compatibility and completion checks.
+
+The compression-residence control now holds both arms to their advertised
+compression interval, preserving its original residence and throughput gates.
+Three race executions pass; all six readings remain in
+`compression-residence-isolated-control`. Reversed duplex tests had also removed
+one direction's serializer. The failure-before test measures about 805 Mb/s on
+a declared 100 Mb/s link in all three attempts. The fixture now preserves both
+serializers and checks each SDK direction against the physical rate. Bounded
+orientation/rate-change validation passes six race executions and retains all
+24 readings in `duplex-fixture-bounds-after`. Historical affected rows
+remain available with this calibration limitation.
 
 ### Physical H1 fixture checkpoint
 
@@ -95,7 +129,8 @@ synchronous packet injection. Both root tests fail three times before the fix;
 payload or replay. All 182 correctness tests pass under race. Physical duplex
 completes but remains failed/excluded by reference calibration, reference drift
 and provider control-return refusals; all three readings are retained in
-`physical-h1-duplex-tun-fix`. Full root regression is running. These results do
+`physical-h1-duplex-tun-fix`. The copied-source root regression finishes with
+3,026 passes, zero failures and 25 skips. These results do
 not establish throughput acceptance.
 
 ### Burst follow-up checkpoint
@@ -133,8 +168,10 @@ or policy fields. The new Transfer matrix completes 150 paired cases: all
 provider's return-direction regression (428.41088 versus 587.20256 Mb/s, zero
 recorded drops). Its 300 readings are retained in `sdk-transfer-model-first`.
 That run predates the source-idle fix and stronger per-direction/calibration
-checks. The subsequent `sdk-transfer-source-idle` run passes all 150 pairs once;
-exact-cell failures and physical SDK/H1 coverage remain open.
+checks. The subsequent `sdk-transfer-source-idle` run records all 150 pairs
+passing once; its nine reversed duplex pairs later prove miscalibrated because
+one direction was unlimited. Exact-cell failures and physical SDK/H1 coverage
+remain open.
 
 The committed follow-up's final correctness run passes 152 tests under `-race`
 on source SHA-256
@@ -425,7 +462,7 @@ specifies the missing collision, reconnect and actual-relay experiments.
 The deterministic race-enabled `server/connect` selection passed. The full
 integration selection was attempted with the environment loaded by
 `server/connect/test.sh` and `server/test-env.sh`, fail-fast enabled, and the
-documented `10.213.0.1` endpoints. Its launcher readiness marker was absent;
+documented local endpoints. Its launcher readiness marker was absent;
 after the local override, every database-backed case stopped at PostgreSQL
 authentication because the checked-in fallback credential does not match the
 already-running container. The H1/H3 variants, pool-balance test and

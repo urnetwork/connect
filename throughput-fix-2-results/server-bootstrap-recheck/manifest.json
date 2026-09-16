@@ -1,0 +1,9 @@
+{
+  "files": {
+    "provenance.json": "81bd0314bbfba5801e6fb8b9f20310f60cf89408ac97efd5bc67a783c1256adc",
+    "summary.json": "e37b63c5ded2af340a696f306d25bc31eeca74df5ed1b81e1693ff3f2d7cfe2a"
+  },
+  "raw_log": "excluded; hash retained in provenance",
+  "schema": "throughput-fix-2/server-bootstrap-recheck-manifest-v1",
+  "verification": "server HEAD, raw log hash and bootstrap phase verified before artifact creation"
+}

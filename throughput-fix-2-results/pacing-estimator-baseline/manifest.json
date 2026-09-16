@@ -1,0 +1,60 @@
+{
+  "created_utc": "2026-09-16T05:33:15.074981+00:00",
+  "mode": "pacing",
+  "test_pattern": "^$",
+  "run_flags": [
+    "-test.bench",
+    "^BenchmarkWindowPacingService",
+    "-test.benchmem",
+    "-test.benchtime=500ms"
+  ],
+  "connect": {
+    "revision": "f55e5d41a120d26789b60ec0450daa63e6fa43df",
+    "branch": "throughput-fix-2",
+    "source_sha256": "1723893525a52cb8fff81c42f7c4ffd545fc055b96a1dca5e19d45cfcf935355",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "25939d8152e35ed053e75d2dd2a27ff4be341c44c72ad217bee1ccb434fca20f",
+  "host_load_average_at_start": [
+    18.2900390625,
+    25.14453125,
+    21.49072265625
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "concurrent relay candidate investigation; monitor archival work; no quiescence wait"
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 796,
+        "input_sha256": "54258ed3a3ea78029e8a7a42c7e9ebe4c484dc6b180fdcdbd4abf09627a0c466"
+      }
+    },
+    "external_local_replacements": [
+      {
+        "count": 1,
+        "kind": "external-local-replacement",
+        "location": "redacted; not captured input"
+      }
+    ],
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "binary_sha256": "063f74fc9b7b597ede9793916bc0c74c113ffa822e5321229f1e5c23b8574706",
+  "sources_stable_during_build": true,
+  "source_inspection_uses_build_snapshot": true,
+  "sanitization": {
+    "external_local_replacement_locations": "redacted; original runner manifest hash retained in provenance",
+    "schema": "throughput-fix-2/pacing-estimator-manifest-sanitization-v1"
+  }
+}

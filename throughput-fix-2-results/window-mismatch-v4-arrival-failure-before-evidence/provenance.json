@@ -1,0 +1,32 @@
+{
+  "archive_scope": "isolated v4 ordering/arrival failure-before evidence; no shared edits",
+  "base_source": {
+    "canonical_source_sha256": "914a2a724a7e0c1a5681301ded65e89447699ca80505772f9a9f454865ef2246",
+    "note": "Canonical base supplied by frozen handoff; this evidence does not claim validation of later shared source changes."
+  },
+  "candidate_parent_pacing_sha256": "fb150c9e4493ead750c2c7a9e2438432aecb99dc92274fc35602f869fa505600",
+  "effective_inputs": {
+    "arrival_eligibility_test_sha256": "97aa765aa79292ccc44d24cd6091df94a077b3af32e502eb1a01a3e8d5188ae2",
+    "candidate_v4_pacing_overlay_sha256": "08b0411253ec9820d491e5da33527f2953f1eff6a92a50d933e5aadc27cd490b",
+    "original_arrival_test_shape_sha256": "0ed8336583216052b67a7b71da48b765f664edaaca7a2ccd7f34ad22980c2648"
+  },
+  "input_handoff": {
+    "file": "v4-arrival-before-handoff.json",
+    "sha256": "aa4bf2a55743abd8d8d95e26994ee74ed4d0c0851d00c4076716a8674b953551"
+  },
+  "redaction": {
+    "commands": "excluded",
+    "local_paths": "excluded",
+    "normalized_numerical_observations_and_terminal_outcomes": "retained",
+    "raw_logs": "excluded",
+    "source_overlay_and_binary_contents": "excluded"
+  },
+  "run_pins": {
+    "binary_sha256": "f660403af8580859b852d7f50870669fa24ab1d8f330eb5b1441919caf42003c",
+    "build_overlay_sha256": "3f23e49b13b8270dd8eb584f959651db8fc643940f47acdd290c74607317b0a2",
+    "original_log_sha256": "434c8bcba104b9fce39f7a8b6c97badfc90d3d930327038345dcb2dc1c527a59"
+  },
+  "schema": "throughput-fix-2/window-mismatch-v4-arrival-provenance-v1",
+  "source_fidelity_limit": "The handoff provides hashes of the isolated v4 overlay and original test shape, not a canonical full-source digest for the overlay composition.",
+  "status": "immutable failure-before evidence; v4 candidate unlanded"
+}

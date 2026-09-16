@@ -1,0 +1,38 @@
+{
+  "accepted_as_performance_validation": false,
+  "all_negative_results_retained": true,
+  "archive_limits": [
+    "Contains normalized outcomes, numerical readings, and source, binary, overlay and build-manifest hashes only.",
+    "Raw logs, source files, overlay files, binaries, commands and local filesystem locations remain outside this archive.",
+    "The candidate remains unlanded; the declared 1.2-second long-path control is unresolved and is not a completed fix."
+  ],
+  "attribution_limits": [
+    "All effective source inputs were frozen before the independent ACK-credit record refactor; this handoff replaces only the pacing file and adds one normal summary test file. The new ACK plumbing still needs combined validation.",
+    "The 1.2-second control was declared before running; all six before/after failures and exact settings are retained. Its stale 15\u201318 ms RTT estimate and existing one-second drain cap motivate a separate forced investigation.",
+    "The frozen v10 full-model window-mismatch failures are independent open work owned by the pacing debugger; these summary results do not close them.",
+    "Primer timing and forced first-feedback barriers remain synthetic diagnostics, not attribution of natural host TCP failures."
+  ],
+  "candidate": "feedback-summary-v11",
+  "changes": [
+    "A retained completed cycle remains an eligible byte-accounting summary until newer measured evidence supersedes it.",
+    "Controller acceptance keeps the fresh summary while committing its epoch; excluded old bytes remain delivery accounting only.",
+    "The retained summary pins any larger advertised compression interval used by later observations.",
+    "No new fields, history growth, expected-rate completion quotas, admission or FIFO changes."
+  ],
+  "fail_count": 21,
+  "failing_run_ids": [
+    "compression-pin-before",
+    "final-recovery-and-new-long-cell",
+    "long-cell-v10-baseline",
+    "ordinary-and-retired-summary-roots",
+    "original-partition-root"
+  ],
+  "outcome_count": 1278,
+  "pass_count": 1257,
+  "prior_handoff_sha256": "56eafaf37ac939aa00ab10932d33c58229a4ebd25bf8e2b1456383d5b6ed1c75",
+  "reading_count": 111,
+  "run_count": 12,
+  "schema": "throughput-fix-2/sdk-feedback-cycle-v11-evidence-summary-v1",
+  "skip_count": 0,
+  "status": "unlanded; bounded summary roots and declared existing controls pass; new long-path control remains failing on v10 and v11"
+}

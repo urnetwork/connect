@@ -1,0 +1,3 @@
+{"classification":"performance-control","elapsed_seconds":0.66,"ordinal":1,"result":"PASS","run_id":"candidate-v2-model-controls","test_name":"TestWindowPathServiceLongCompressedFeedback"}
+{"classification":"performance-control","elapsed_seconds":4.18,"ordinal":2,"result":"PASS","run_id":"candidate-v2-model-controls","test_name":"TestWindowPathServiceRoundTripGrowthBeyondOldRing"}
+{"classification":"performance-control","elapsed_seconds":35.68,"ordinal":3,"result":"PASS","run_id":"candidate-v2-model-controls","test_name":"TestWindowPathServiceRoundTripChanges"}

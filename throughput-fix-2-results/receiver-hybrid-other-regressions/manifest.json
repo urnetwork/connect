@@ -1,0 +1,13 @@
+{
+  "archive_kind": "receiver_hybrid_other_regressions",
+  "file_count": 6,
+  "file_sha256": {
+    "failure-observations.jsonl": "4d0f30d9c0f06efda257196820681374b6bddc2a422061ea2accbb32c3da7d82",
+    "outcomes.jsonl": "86e68ea4d314c7c1384c7cac40f3864d5ff98661a40c9b7b6745cf4c28975548",
+    "provenance.json": "9b7b54d27e65a40582bf05526e9fd350de071e60810dd1f5df7927bcf4f2550a",
+    "service-readings.jsonl": "0b62bef6e8784d8c79afe27481362411ddce88958da3b517b82cbb123d5ea9b8",
+    "source-pins.json": "4ee4e7fe756b5ec932308525a1762123ff6a84ff340bf457965433fba43f24df",
+    "status.json": "585b3c97c5e6cb841f53569bad9a9cc2a2b5bd6d2d3e6a4a19d8e10d8ab1ade6"
+  },
+  "schema_version": 1
+}

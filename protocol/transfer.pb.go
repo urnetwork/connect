@@ -877,6 +877,17 @@ type Ack struct {
 	// Latest present value wins within the sequence; absent does not erase
 	// previously received evidence from a newer peer.
 	AckCompressTimeoutMicros *uint32 `protobuf:"varint,11,opt,name=ack_compress_timeout_micros,json=ackCompressTimeoutMicros,proto3,oneof" json:"ack_compress_timeout_micros,omitempty"`
+	// Actual receiver residence of message_id, from Pack ingress until this
+	// Ack is encoded. Includes receive handoff, ordering, application delivery
+	// and compression waits. This is an elapsed duration on the receiver's
+	// clock, not a timestamp to compare with the sender's clock. It does not
+	// include a later wait in the outgoing carrier.
+	//
+	// Zero is an immediate reply; absent means timing is unavailable, including
+	// legacy receivers. The sender may subtract this duration only from an
+	// unambiguous measurement of this exact message's physical first write.
+	// Missing-contract requests do not supply delivery timing.
+	ReceiverAckDelayMicros *uint32 `protobuf:"varint,12,opt,name=receiver_ack_delay_micros,json=receiverAckDelayMicros,proto3,oneof" json:"receiver_ack_delay_micros,omitempty"`
 	// Sequence numbers of items this receiver had acknowledged and then removed
 	// from its hold to admit an earlier arrival. A selective acknowledgement
 	// leases an item rather than releasing it: the sender keeps it in its
@@ -1004,6 +1015,13 @@ func (x *Ack) GetReceiveWindowByteCount() uint64 {
 func (x *Ack) GetAckCompressTimeoutMicros() uint32 {
 	if x != nil && x.AckCompressTimeoutMicros != nil {
 		return *x.AckCompressTimeoutMicros
+	}
+	return 0
+}
+
+func (x *Ack) GetReceiverAckDelayMicros() uint32 {
+	if x != nil && x.ReceiverAckDelayMicros != nil {
+		return *x.ReceiverAckDelayMicros
 	}
 	return 0
 }
@@ -2811,7 +2829,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\f_contract_id\"_\n" +
 	"\fFilteredPack\x12<\n" +
 	"\x0econtract_frame\x18\a \x01(\v2\x10.bringyour.FrameH\x00R\rcontractFrame\x88\x01\x01B\x11\n" +
-	"\x0f_contract_frame\"\xf0\x04\n" +
+	"\x0f_contract_frame\"\xce\x05\n" +
 	"\x03Ack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
@@ -2823,14 +2841,16 @@ const file_transfer_proto_rawDesc = "" +
 	"\x19compact_contract_recovery\x18\x06 \x01(\bR\x17compactContractRecovery\x120\n" +
 	"\x14logical_lane_version\x18\a \x01(\rR\x12logicalLaneVersion\x12>\n" +
 	"\x19receive_window_byte_count\x18\b \x01(\x04H\x02R\x16receiveWindowByteCount\x88\x01\x01\x12B\n" +
-	"\x1back_compress_timeout_micros\x18\v \x01(\rH\x03R\x18ackCompressTimeoutMicros\x88\x01\x01\x128\n" +
+	"\x1back_compress_timeout_micros\x18\v \x01(\rH\x03R\x18ackCompressTimeoutMicros\x88\x01\x01\x12>\n" +
+	"\x19receiver_ack_delay_micros\x18\f \x01(\rH\x04R\x16receiverAckDelayMicros\x88\x01\x01\x128\n" +
 	"\x18evicted_sequence_numbers\x18\t \x03(\x04R\x16evictedSequenceNumbers\x12%\n" +
 	"\x0econtract_ahead\x18\n" +
 	" \x01(\bR\rcontractAheadB\x06\n" +
 	"\x04_tagB\x16\n" +
 	"\x14_missing_contract_idB\x1c\n" +
 	"\x1a_receive_window_byte_countB\x1e\n" +
-	"\x1c_ack_compress_timeout_micros\"\"\n" +
+	"\x1c_ack_compress_timeout_microsB\x1c\n" +
+	"\x1a_receiver_ack_delay_micros\"\"\n" +
 	"\x03Tag\x12\x1b\n" +
 	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\xed\x01\n" +
 	"\x04Auth\x12\x15\n" +

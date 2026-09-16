@@ -1,0 +1,130 @@
+{
+  "accepted": {
+    "benchmarks": 3,
+    "race_warning_blocks": 0,
+    "service_readings": 38,
+    "top_level_fail": 10,
+    "top_level_pass": 1006,
+    "top_level_skip": 0
+  },
+  "accepted_with_supplemental": {
+    "benchmarks": 3,
+    "race_warning_blocks": 0,
+    "service_readings": 50,
+    "top_level_fail": 11,
+    "top_level_pass": 1006,
+    "top_level_skip": 0
+  },
+  "archive_result": "complete_pinned_service_credit_arrival_final_evidence",
+  "by_log": {
+    "before.log": {
+      "classification": "failure-before-untraced-slow-shared",
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "raw_log_sha256": "f841e6b7dd1ad8cd7dd4bb531ab6c205e9e4e8c89560bde38c884a900dd39048",
+      "service_readings": 2
+    },
+    "credit-before-roots.log": {
+      "classification": "failure-before-actual-worker-roots",
+      "outcomes": {
+        "FAIL": 9,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "raw_log_sha256": "2593e9d1a0e0bcc92963d3715109da0a3b5dcdd680c1b7194c69cd841ee7a02d",
+      "service_readings": 0
+    },
+    "credit-static.log": {
+      "classification": "final-v3-original-static-mismatch-replay",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 1,
+        "SKIP": 0
+      },
+      "raw_log_sha256": "5443549f575ae8bdcc297d7c47f92ff6159e328459d4583a61ea1e6763edb95d",
+      "service_readings": 12
+    },
+    "credit-v1-focus.log": {
+      "classification": "candidate-v1-focused-race",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 240,
+        "SKIP": 0
+      },
+      "raw_log_sha256": "f4761aa4d5b33767bb02424455c344d5ca086cebbf0a04da0b410e71c84927d4",
+      "service_readings": 0
+    },
+    "credit-v1-roots.log": {
+      "classification": "candidate-v1-actual-worker-roots",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 9,
+        "SKIP": 0
+      },
+      "raw_log_sha256": "64c071dcf8e67ce66158457158a4761df7fd0f044b697ee07b7180b47fa63282",
+      "service_readings": 0
+    },
+    "credit-v1-slow-race.log": {
+      "classification": "candidate-v1-slow-finite-relay-race",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "raw_log_sha256": "1991580edef21a325f14687ce51d5ac2245ae8ebc128679e5fa1c21b258234d8",
+      "service_readings": 6
+    },
+    "credit-v2-adjacent.log": {
+      "classification": "candidate-v2-adjacent-race",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 15,
+        "SKIP": 0
+      },
+      "raw_log_sha256": "19496bcf5d2ad70a627bf41b18066882183841603eccc5680a83d9412b71659c",
+      "service_readings": 0
+    },
+    "credit-v3.log": {
+      "classification": "final-v3-focused-race-and-finite-relay",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 738,
+        "SKIP": 0
+      },
+      "raw_log_sha256": "564d7b469cc561c1fd9f2c3c27f229dae84466a502217060f224f83f0ae84741",
+      "service_readings": 18
+    }
+  },
+  "excluded_diagnostics": [
+    {
+      "diagnostic_only": true,
+      "log": "trace.log",
+      "raw_log_sha256": "11ef4aa50deeecfc07badf6c7ad2f22064f85ebc1edfd1c454ac9e0cbdd8e0f5",
+      "reason": "Trace perturbs scheduling; retain only hash and exclusion.",
+      "service_readings_normalized": 0,
+      "top_level_outcomes": "not_normalized; raw_trace_excluded"
+    },
+    {
+      "diagnostic_only": true,
+      "log": "arrival.log",
+      "raw_log_sha256": "95a59336a542ca80f5091a5460893c48dc2d35fe1fd3b191bfa17fa2e7939238",
+      "reason": "O(n) per-item arrival candidate is explicitly diagnostic and unlanded; retain only hash and exclusion.",
+      "service_readings_normalized": 0,
+      "top_level_outcomes": {
+        "FAIL": 0,
+        "PASS": 1,
+        "SKIP": 0
+      }
+    }
+  ],
+  "supplemental_static_control": {
+    "paired_final_credit_static": "PASS",
+    "service_readings": 12,
+    "six_static_cells_without_credit": "FAIL",
+    "top_level_fail": 1,
+    "top_level_pass": 0
+  }
+}

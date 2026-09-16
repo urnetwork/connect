@@ -1,0 +1,24 @@
+{
+  "archive_files_sha256": {
+    "ledger.jsonl": "9f447931a167544faa73e079afbede5f4fc4a08f1599d2a3794e4926c7e0b7bf",
+    "manifest.json": "45925183759471abc0dea888983e2dbc3b4841b373eec358db7c2a4dc57b5310",
+    "outcomes.txt": "f8dbfbfac16acf010e143aecd159d397190dd21da8b9f27d0f2fc43bff33878b",
+    "status.json": "12b29f99082dd8ece50e093d01596e21585497a7b84958bac2c14ab8dc371b77",
+    "summary.json": "cad258edd9d9d83e81d8a137dfb94e984cf0934ee16cf8d146ee9e49d30cdc51"
+  },
+  "censored_comparisons": 0,
+  "comparison_count": 0,
+  "failed_comparisons": null,
+  "host_performance_acceptance": "no host comparisons in this selection",
+  "input_sha256": {
+    "ledger.jsonl": "9f447931a167544faa73e079afbede5f4fc4a08f1599d2a3794e4926c7e0b7bf",
+    "manifest.json": "d34015e0154ab6d0f7a150152e045d7da48c9f9260d55fcc5ffaae386340c6ba",
+    "run.log": "9738eafbd7c50cc6b82f0009e66b92fdb850141ca6ace40c09a24da7157394a3",
+    "status.json": "12b29f99082dd8ece50e093d01596e21585497a7b84958bac2c14ab8dc371b77"
+  },
+  "note": "Raw run.log remains outside this archive; its hash is retained. Outcomes are an excerpt. All 24 numerical service readings and file pins are retained in the ledger and summary.",
+  "outcome": "process passed",
+  "top_level_failed": 0,
+  "top_level_passed": 6,
+  "top_level_skipped": 0
+}

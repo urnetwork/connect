@@ -1,0 +1,19 @@
+{
+  "archive_kind": "receiver_hybrid_other_regressions",
+  "attribution_limits": [
+    "This is an immutable pre-common-bound hybrid binary scope, explicitly separate from the later paired-probe shared integration.",
+    "Repeated-drain control passes, while mismatch and finite-relay roots remain failed. Do not infer a repair or rerun the failed cells from this archive.",
+    "All 234 complete service readings are retained. Raw logs, source copies, overlays, binaries, local paths, and identifiers are excluded; hashes are retained."
+  ],
+  "collection_time_utc": "2026-09-16T09:30:12.446913+00:00",
+  "redaction_policy": {
+    "ipv4_literals": "redacted if encountered",
+    "local_paths": "excluded",
+    "raw_logs": "excluded; sha256 only",
+    "source_overlay_binary": "excluded; sha256 only"
+  },
+  "schema_version": 1,
+  "scope": "Original unchanged regression gates; isolated frozen hybrid before paired-probe correction; no quiescence wait.",
+  "test_pattern": "^TestWindowPath(WindowMismatchMatrix|ServiceAcrossRepeatedDrains|ServicesShareFiniteRelay)$",
+  "variant": "hybrid-v1"
+}

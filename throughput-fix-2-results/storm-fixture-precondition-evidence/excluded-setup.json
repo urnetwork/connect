@@ -1,0 +1,20 @@
+[
+  {
+    "classification": "excluded-setup-overlay-not-applied",
+    "manifest": "manifest.json",
+    "manifest_sha256": "4a1f9a6e4fe72cde40f0d79bb77eb358d3cb4426b7bdb98a4171cdead4c8b206",
+    "reason": "Overlay keys were not applied to the canonical copied package; identical binary; no candidate evidence."
+  },
+  {
+    "classification": "excluded-setup-deadline-in-synctest-panic",
+    "manifest": "applied-manifest.json",
+    "manifest_sha256": "7d6396ada88fb5c8bff5b624caf88fdb9ce44526a361d6fb7bc8dbf0a38af24a",
+    "reason": "Fixture panic when Deadline executed inside synctest; not a production failure."
+  },
+  {
+    "classification": "excluded-setup-lazy-pool-stats-teardown-panic",
+    "manifest": "virtual-v2-manifest.json",
+    "manifest_sha256": "c315e1a8d767524970b9f2e3280341a0b8cf7ed3b2b1e413141b088790e77083",
+    "reason": "Fixture teardown panic after lazy process-wide pool statistics started in the bubble; not a production failure."
+  }
+]

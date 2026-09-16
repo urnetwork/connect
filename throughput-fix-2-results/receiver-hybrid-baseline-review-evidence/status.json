@@ -1,0 +1,94 @@
+{
+  "archive_result": "complete_pinned_overlay_review_evidence",
+  "by_run": {
+    "baseline-order-after.log": {
+      "classification": "focused-after-ordering-correction",
+      "fail": 0,
+      "pass": 9,
+      "race_warnings": 0,
+      "raw_log_sha256": "51c04e596a2068904eed4deeba2b4546cc1b40f7e3bf19ad8db723e8ea874fc0",
+      "service_readings": 0
+    },
+    "baseline-order-before.log": {
+      "classification": "historical-rejected-baseline-v1-ordering",
+      "fail": 6,
+      "pass": 3,
+      "race_warnings": 0,
+      "raw_log_sha256": "e3a0fdec4322fc3dc053fc60c006984e2b691c942c7e7a7e52630a8e1f07efcc",
+      "service_readings": 0
+    },
+    "baseline-probe-final-before.log": {
+      "classification": "failure-before-probe-retirement-and-order",
+      "fail": 9,
+      "pass": 3,
+      "race_warnings": 0,
+      "raw_log_sha256": "bb841d8510251946e0dd60f5e93f30337d0b9e4ffb43be7168586ef2cb0f65f6",
+      "service_readings": 0
+    },
+    "broad-v1-long-rtt.log": {
+      "classification": "long-rtt-broad-control",
+      "fail": 0,
+      "pass": 1,
+      "race_warnings": 0,
+      "raw_log_sha256": "99a130a836e2b5e273c5229a6b4995150edfeba80103caaed0baeb11c8f3c520",
+      "service_readings": 2
+    },
+    "hybrid-common-bound-long-rtt.log": {
+      "classification": "long-rtt-common-bound-counterfactual-failure",
+      "fail": 1,
+      "pass": 0,
+      "race_warnings": 0,
+      "raw_log_sha256": "ff29cf896b6281c63d16587c37440298e9facbddb5c34549a6e6895c90e790b6",
+      "service_readings": 2
+    },
+    "hybrid-v1-focus.log": {
+      "classification": "final-focused-after",
+      "fail": 0,
+      "pass": 192,
+      "race_warnings": 0,
+      "raw_log_sha256": "1aa0bbe606769553420f5264d9e33cdbf4120b04a73bae20377935ba346bf354",
+      "service_readings": 0
+    },
+    "hybrid-v1-long-rtt.log": {
+      "classification": "long-rtt-hybrid-failure",
+      "fail": 1,
+      "pass": 0,
+      "race_warnings": 0,
+      "raw_log_sha256": "0f7fbdc4406e6f7f7a1b0808ba41bb5fd04ec7ef0ddb4dbc04ac7baa7d89afe6",
+      "service_readings": 2
+    },
+    "legacy-consumer-v1-long-rtt.log": {
+      "classification": "long-rtt-legacy-consumer-failure",
+      "fail": 1,
+      "pass": 0,
+      "race_warnings": 0,
+      "raw_log_sha256": "7631d8174e37f8818a00fcabb560eaf7abf02880d9165f2856884d4359888911",
+      "service_readings": 2
+    },
+    "queue-retirement-300us-before.log": {
+      "classification": "failure-before-300us-queue-retirement",
+      "fail": 3,
+      "pass": 0,
+      "race_warnings": 0,
+      "raw_log_sha256": "aec2ac1a146e37e8b0e37d8a2ca9c0642e556757861f866a29ec03bd92a457a1",
+      "service_readings": 0
+    },
+    "queue-retirement-v1-before.log": {
+      "classification": "failure-before-160ms-queue-retirement",
+      "fail": 3,
+      "pass": 0,
+      "race_warnings": 0,
+      "raw_log_sha256": "0d1ff8c995ae8c69597d44afab737dd3784d4d8eea396e31507c9f343b6bc438",
+      "service_readings": 0
+    }
+  },
+  "hand_off_scope_note": "Only the ten completed logs named in the immutable handoff are counted here.",
+  "listed_log_outcomes": {
+    "fail": 24,
+    "pass": 208,
+    "total": 232
+  },
+  "listed_race_warnings": 0,
+  "listed_runs": 10,
+  "listed_service_readings": 8
+}

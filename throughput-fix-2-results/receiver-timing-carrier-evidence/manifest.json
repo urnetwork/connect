@@ -1,0 +1,11 @@
+{
+  "archive_kind": "receiver_timing_carrier_evidence",
+  "file_count": 4,
+  "file_sha256": {
+    "numerical-summary.json": "84ae73d38acc44c28168c1a9c8961da81e9ccd9276cf1a950d0152cb20e4864a",
+    "outcomes.jsonl": "ff5b93c1284d6247b69c540e022ba36bca10f1911aca08604db6847ab1285895",
+    "provenance.json": "ff7afd184adc41c5b754a7aec49af5091a2e81002a2ac7a403c350a479f90ffb",
+    "status.json": "6318bed31cb188bb12d992096d4718f0c8f27aec97e24e520d8f56d5b2485632"
+  },
+  "schema_version": 1
+}

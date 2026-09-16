@@ -1,0 +1,243 @@
+{
+  "created_utc": "2026-09-16T05:50:34.093817+00:00",
+  "existing_runner_selections": {
+    "correctness": {
+      "build_flags": [
+        "-race"
+      ],
+      "mode": "correctness",
+      "pattern_fragments": [
+        "^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$",
+        "^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$|^TestWindowTcp(SocketBatch|CanceledBatch|WorkloadCancel).*$",
+        "^TestTun(DuplexDataHandoffDoesNotCycleThroughAdmission|FiniteTcpTailProgressesAfterEndpointOwnerReleases)$",
+        "^TestReceiveSequenceBurstTail.*$"
+      ],
+      "run_flags": [
+        "-test.short=false",
+        "-test.count=1",
+        "-test.timeout=30m"
+      ],
+      "test_pattern": "^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$|^TestWindowTcp(SocketBatch|CanceledBatch|WorkloadCancel).*$|^TestTun(DuplexDataHandoffDoesNotCycleThroughAdmission|FiniteTcpTailProgressesAfterEndpointOwnerReleases)$|^TestReceiveSequenceBurstTail.*$"
+    },
+    "model": {
+      "build_flags": [
+        "-race=false"
+      ],
+      "mode": "model",
+      "pattern_fragments": [
+        "^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*|TestWindowPathSdk.*|TestWindowPathAckTailRoundTripGrowthControl)$"
+      ],
+      "run_flags": [
+        "-test.short=false",
+        "-test.count=1",
+        "-test.timeout=30m"
+      ],
+      "test_pattern": "^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*|TestWindowPathSdk.*|TestWindowPathAckTailRoundTripGrowthControl)$"
+    },
+    "supplemental_strict_patterns": {
+      "current_landing_and_wire_guards": "^(TestLandingStructsMatchMergedLessTheDeferState|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestSequenceAckWindow.*|TestEvictionAcknowledgementsFitEveryCarrier|TestAckResponsesKeepOrderedOverflow|TestAckOverflowDoesNotAddCompressionIntervals|TestAckWorkerBoundsEveryResponseAndFinalDrain|TestAckCompressionWireHasOneHeadAndBoundedOldestSacks|TestReceiveSequenceBurstTailEncodedCostIncludesWrapping)$",
+      "legacy_zero_growth_separate_review": "^TestAckStructsGainNoBytes$",
+      "send_item_lifetime": "^(TestCumulativeAckBoundarySurvivesImmediateSendItemReuse|TestSendItemPoolIsBoundedAndClearsAckLifetimeState)$",
+      "wire_codec_if_serialized": "^(TestAckCodecEdgeCases|TestAckCodecRandomized|TestTheAckCodecKeepsAnAbsentAndAZeroCapacityApart|TestTheAckCodecRoundTripsAWholeEvictionGeneration)$"
+    }
+  },
+  "existing_supplemental_checks": {
+    "legacy_zero_growth_guard": {
+      "compatibility_note": "This legacy guard conflicts with the current landing guard values (584, 96, 104). Keep it as a separately reviewed historical guard; do not combine it with the current landing assertion as a presumed passing selection.",
+      "current_runner": "not selected",
+      "source": "flight_gate_ack_arrival_test.go",
+      "static_expected_bytes": {
+        "receiveAckMessage": 72,
+        "sendItem": 560,
+        "sequenceAck": 88
+      },
+      "test": "TestAckStructsGainNoBytes"
+    },
+    "send_item_lifetime": [
+      {
+        "current_runner": "not selected",
+        "source": "transfer_test.go",
+        "test": "TestCumulativeAckBoundarySurvivesImmediateSendItemReuse"
+      },
+      {
+        "current_runner": "not selected",
+        "source": "transfer_test.go",
+        "test": "TestSendItemPoolIsBoundedAndClearsAckLifetimeState"
+      }
+    ],
+    "wire_codec_if_metadata_is_serialized": [
+      {
+        "current_runner": "not selected",
+        "source": "frame_protobuf_test.go",
+        "test": "TestAckCodecEdgeCases"
+      },
+      {
+        "current_runner": "not selected",
+        "source": "frame_protobuf_test.go",
+        "test": "TestAckCodecRandomized"
+      },
+      {
+        "current_runner": "not selected",
+        "source": "frame_protobuf_test.go",
+        "test": "TestTheAckCodecKeepsAnAbsentAndAZeroCapacityApart"
+      },
+      {
+        "current_runner": "not selected",
+        "source": "frame_protobuf_test.go",
+        "test": "TestTheAckCodecRoundTripsAWholeEvictionGeneration"
+      }
+    ]
+  },
+  "limits": [
+    "This inventory records current source text only; it is not a frozen build manifest.",
+    "No tests, benchmarks, or source changes were made for this inventory.",
+    "If metadata is local-only, codec checks are conditional rather than implied requirements.",
+    "The legacy zero-growth guard has mutually incompatible static expectations with the current landing guard and is recorded separately."
+  ],
+  "purpose": "existing selection and strict-guard inventory for optional receiver ACK metadata compatibility; no implementation decision or acceptance claim",
+  "read_only": true,
+  "schema": "throughput-fix-2/ack-metadata-compatibility-inventory-v1",
+  "source_pins": [
+    {
+      "file": "transfer.go",
+      "sha256": "31a49dc031f41c21418db942ed8d516e0a506d229c0b076d5c3af8af06ba8f7e"
+    },
+    {
+      "file": "protocol/transfer.proto",
+      "sha256": "d8b162a1ad2d4a5204cee43c39343e8a44bef6402a0ca536da00545def061686"
+    },
+    {
+      "file": "protocol/transfer.pb.go",
+      "sha256": "c72f2f895263a017923970c65891f1bd7a50d6a31ae0da16b478793464fe718c"
+    },
+    {
+      "file": "flight_gate_landing_size_test.go",
+      "sha256": "27e2134eaf88b951dbe7a9c7be0685ef93fa9a7cece32ea7e3c48007617cc9be"
+    },
+    {
+      "file": "flight_gate_ack_arrival_test.go",
+      "sha256": "33e4aa4003811f4ef02beafa9f1c328f7ed8d2532be62324cbfda4195933a7f2"
+    },
+    {
+      "file": "transfer_test.go",
+      "sha256": "a9184670403480e2f5d8dc88fafc4008fd3ade92c3c639b2cb1e745cec01c6c4"
+    },
+    {
+      "file": "transfer_ack_window_test.go",
+      "sha256": "471578d3245e35fd5d6d8f040c36fde31ff6e2183000578f9f1a514b753316ea"
+    },
+    {
+      "file": "transfer_receive_ack_gap_test.go",
+      "sha256": "eeee92e6b85b8e81e1704328ccabe684cdbf1790ba5e3c5c3a2090f691eb7658"
+    },
+    {
+      "file": "transfer_receive_ack_progress_test.go",
+      "sha256": "0b8fb8d9c2e231f6d5423f13850e53d7abcc52001a32d2af10e7edab418de6b7"
+    },
+    {
+      "file": "transfer_ack_bounds_test.go",
+      "sha256": "5c945984e27eb59213e7a67fd2f15cb5897f9a1bae8fe746ec1bf18ac5a4181d"
+    },
+    {
+      "file": "transfer_ack_compression_test.go",
+      "sha256": "6d5a34a3d3301dd0dafa6065c9d1207049a863568f95ba934e17e4bf669530e9"
+    },
+    {
+      "file": "transfer_receive_ack_burst_tail_test.go",
+      "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+    },
+    {
+      "file": "frame_protobuf_test.go",
+      "sha256": "efe2a8c8780573386ea4110cc62c769c82cc8dd7cb99b7387da710eb78993cd3"
+    }
+  ],
+  "source_point_in_time": {
+    "canonical_source_sha256": "1723893525a52cb8fff81c42f7c4ffd545fc055b96a1dca5e19d45cfcf935355",
+    "dirty": true,
+    "git_head": "f55e5d41a120d26789b60ec0450daa63e6fa43df",
+    "runner_sha256": "25939d8152e35ed053e75d2dd2a27ff4be341c44c72ad217bee1ccb434fca20f"
+  },
+  "strict_checks_already_in_correctness": {
+    "encoded_response_bounds": [
+      {
+        "checks": "wrapped version-1 and version-2 ACK size against per-entry reservation and minimum carrier limit",
+        "current_runner": "correctness",
+        "source": "transfer_ack_bounds_test.go",
+        "test": "TestEvictionAcknowledgementsFitEveryCarrier"
+      },
+      {
+        "checks": "bounded ordered ACK response chunks",
+        "current_runner": "correctness",
+        "source": "transfer_ack_bounds_test.go",
+        "test": "TestAckResponsesKeepOrderedOverflow"
+      },
+      {
+        "checks": "overflow does not add ACK compression residence",
+        "current_runner": "correctness",
+        "source": "transfer_ack_bounds_test.go",
+        "test": "TestAckOverflowDoesNotAddCompressionIntervals"
+      },
+      {
+        "checks": "each response stays within ACK count and byte bounds, including final drain",
+        "current_runner": "correctness",
+        "source": "transfer_ack_bounds_test.go",
+        "test": "TestAckWorkerBoundsEveryResponseAndFinalDrain"
+      },
+      {
+        "checks": "wire response count and byte bounds with one ordered cumulative head",
+        "current_runner": "correctness",
+        "source": "transfer_ack_compression_test.go",
+        "test": "TestAckCompressionWireHasOneHeadAndBoundedOldestSacks"
+      },
+      {
+        "checks": "full encoded carrier including encryption and legacy wrapping, version 1/2",
+        "current_runner": "correctness",
+        "source": "transfer_receive_ack_burst_tail_test.go",
+        "test": "TestReceiveSequenceBurstTailEncodedCostIncludesWrapping"
+      }
+    ],
+    "layout_and_pool_caps": [
+      {
+        "constraints": {
+          "receiveAckMessage_exact_bytes": 104,
+          "sendItem_exact_bytes": 584,
+          "sequenceAck_exact_bytes": 96
+        },
+        "current_runner": "correctness",
+        "source": "flight_gate_landing_size_test.go",
+        "test": "TestLandingStructsMatchMergedLessTheDeferState"
+      },
+      {
+        "constraints": {
+          "decodedTransferFrame_max_bytes": 680,
+          "receiveAckMessage_max_bytes": 104
+        },
+        "current_runner": "correctness",
+        "source": "frame_protobuf_test.go",
+        "test": "TestDecodedTransferFramePoolRetainedSizeStaysSmall"
+      }
+    ],
+    "sequence_ack_window": [
+      {
+        "current_runner": "correctness",
+        "pattern": "TestSequenceAckWindow.*",
+        "sources": [
+          "transfer_ack_window_test.go",
+          "transfer_receive_ack_gap_test.go"
+        ],
+        "tests": [
+          "TestSequenceAckWindowCoalescesReusableNotification",
+          "TestSequenceAckWindowSteadyStateDoesNotAllocate",
+          "TestSequenceAckWindowPendingDoesNotCloneSelectiveAcks",
+          "TestSequenceAckWindowDueDispositionIgnoresUnrelatedProgress",
+          "TestSequenceAckWindowPreservesCompactRecoveryCapability",
+          "TestSequenceAckWindowTracksCarrierOfLatestAckTrigger",
+          "TestSequenceAckWindowGapWakeOncePerHead",
+          "TestSequenceAckWindowGapWakeDisabled",
+          "TestSequenceAckWindowGapWakeSteadyStateDoesNotAllocate"
+        ]
+      }
+    ]
+  },
+  "tests_executed": false
+}

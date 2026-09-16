@@ -1,0 +1,11 @@
+{
+  "allocations_per_op_all_zero": true,
+  "benchmark_rows": 7,
+  "bytes_per_op_all_zero": true,
+  "censored_count": 0,
+  "complete": true,
+  "fail_count": 0,
+  "historical_baseline_is_unpaired_context_only": true,
+  "pass_count": 7,
+  "service_estimated_bytes_per_second": 12500000
+}

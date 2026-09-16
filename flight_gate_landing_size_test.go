@@ -37,6 +37,8 @@ const (
 	// (THROUGHPUTFIX §37.16)
 	evictionNoticeStateByteCount = 8
 	// Optional receiver compression duration plus its presence bit/padding.
+	// Actual receiver ACK delay fits the same layout by grouping presence bits;
+	// the compact ACK still has no additional retained word for that field.
 	ackCompressionStateByteCount = 8
 	// Local arrival survives ACK handoff without retaining the wire message.
 	ackArrivalStateByteCount = 8

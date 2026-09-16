@@ -1,0 +1,17 @@
+{
+  "attempt_count": 1,
+  "binary_created": false,
+  "blocker": "launcher-managed local services are not ready",
+  "bootstrap_ready": false,
+  "database_tiers_attempted": false,
+  "limits": [
+    "Only a normal test-env bootstrap was attempted in a subshell.",
+    "No credentials, launcher state, hosts file, service policy, environment values, tests, binaries, local paths, or raw logs are retained."
+  ],
+  "phase": "managed launcher attestation/preflight",
+  "retry_policy": "No additional server bootstrap attempt without an external-state change or explicit user request.",
+  "schema": "throughput-fix-2/server-bootstrap-recheck-summary-v1",
+  "server_head": "0522f3f6200b9d70b4b4fab0ddf791939ba772d0",
+  "server_non_database_tiers_attempted": false,
+  "test_attempted": false
+}

@@ -1,0 +1,26 @@
+{
+  "baseline_comparison_log_sha256": "ff29cf896b6281c63d16587c37440298e9facbddb5c34549a6e6895c90e790b6",
+  "baseline_comparison_manifest_sha256": "9565c85590bef07ec39195ba08c1b598c2dec95c0b961d0347e2b2af03469648",
+  "oracle_base_input_sha256": "94b5e61a11934a15b4bb1003bf7d33e8cc7fd7446d886a66e1bce4184fa82f83",
+  "oracle_binary_sha256": "0a1b0e02f7fb2fbda440a6716d959f896e8a530867b1ba95dd4f6a2c34a069b7",
+  "oracle_effective_file_count": 749,
+  "oracle_log_sha256": "7068be36134d9d82dae30b47a78d2ad2c4689f39bf1d51b7aa226730fd921c51",
+  "oracle_manifest_sha256": "34bd82209696542e452b2e3e7400226d526a2c8a4261535ac8d1af6e7659defd",
+  "oracle_readings_sha256": "7e72a1cc48503edf0277657fc16c8718bd4e5a6ac36289577e8badcde96fd494",
+  "receipt_review_sha256": "a1030f9ebaff2e9303bd66f3da988c783c11309f4372831b501806569646e366",
+  "route_ownership_base_input_sha256": "94b5e61a11934a15b4bb1003bf7d33e8cc7fd7446d886a66e1bce4184fa82f83",
+  "route_ownership_binary_sha256": "ec157a80eff7041d2a5e94b687891f474c74be492f9857472522494d1fc96f49",
+  "route_ownership_effective_file_count": 751,
+  "route_ownership_log_sha256": "92fd1580519d69b347aac56c94b95f4758b33cb41c481886dff5056dd8ae3de4",
+  "route_ownership_manifest_sha256": "a0f6b1f556539dab3b0ad6d735bf4a1ed206ae157b61cf8a4bc0fbd397504e5f",
+  "route_ownership_test_inputs": [
+    {
+      "name": "old-tail_test.go",
+      "sha256": "056851d0c7dc4102b71e896f863960d4364ec398931823b77496adb9a89c3aed"
+    },
+    {
+      "name": "route-prefix_test.go",
+      "sha256": "f8f9522c4c9f884f5a9b9af6d4d8af02d73f51965f99fc4f188438e0db6126e9"
+    }
+  ]
+}

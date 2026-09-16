@@ -1,0 +1,15 @@
+{"classification":"causal_root_evidence","elapsed_seconds":0.01,"ordinal":1,"result":"FAIL","run_id":"receiver-root-before","scope":"selected_root","test_name":"TestReceiverAckTimingIncludesQueueAndDeliveryWait"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.0,"ordinal":2,"result":"FAIL","run_id":"receiver-root-before","scope":"selected_root","test_name":"TestReceiverAckTimingPreservesExactZeroDelay"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.0,"ordinal":3,"result":"FAIL","run_id":"receiver-root-before","scope":"selected_root","test_name":"TestReceiverAckTimingIncludesQueueAndDeliveryWait"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.0,"ordinal":4,"result":"FAIL","run_id":"receiver-root-before","scope":"selected_root","test_name":"TestReceiverAckTimingPreservesExactZeroDelay"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.0,"ordinal":5,"result":"FAIL","run_id":"receiver-root-before","scope":"selected_root","test_name":"TestReceiverAckTimingIncludesQueueAndDeliveryWait"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.0,"ordinal":6,"result":"FAIL","run_id":"receiver-root-before","scope":"selected_root","test_name":"TestReceiverAckTimingPreservesExactZeroDelay"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.01,"ordinal":1,"result":"PASS","run_id":"receiver-root-after","scope":"selected_root","test_name":"TestReceiverAckTimingIncludesQueueAndDeliveryWait"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.0,"ordinal":2,"result":"PASS","run_id":"receiver-root-after","scope":"selected_root","test_name":"TestReceiverAckTimingPreservesExactZeroDelay"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.0,"ordinal":3,"result":"PASS","run_id":"receiver-root-after","scope":"selected_root","test_name":"TestReceiverAckTimingIncludesQueueAndDeliveryWait"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.0,"ordinal":4,"result":"PASS","run_id":"receiver-root-after","scope":"selected_root","test_name":"TestReceiverAckTimingPreservesExactZeroDelay"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.0,"ordinal":5,"result":"PASS","run_id":"receiver-root-after","scope":"selected_root","test_name":"TestReceiverAckTimingIncludesQueueAndDeliveryWait"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.0,"ordinal":6,"result":"PASS","run_id":"receiver-root-after","scope":"selected_root","test_name":"TestReceiverAckTimingPreservesExactZeroDelay"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.02,"ordinal":1,"result":"FAIL","run_id":"sender-root-before","scope":"selected_root","test_name":"TestSenderReceiverTimingArrivesBeforeBlockedWorker"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.01,"ordinal":2,"result":"FAIL","run_id":"sender-root-before","scope":"selected_root","test_name":"TestSenderReceiverTimingArrivesBeforeBlockedWorker"}
+{"classification":"causal_root_evidence","elapsed_seconds":0.0,"ordinal":3,"result":"FAIL","run_id":"sender-root-before","scope":"selected_root","test_name":"TestSenderReceiverTimingArrivesBeforeBlockedWorker"}

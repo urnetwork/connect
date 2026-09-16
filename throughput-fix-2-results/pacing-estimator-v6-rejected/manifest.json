@@ -1,0 +1,70 @@
+{
+  "architecture": "arm64",
+  "baseline": {
+    "benchmark_fixture_sha256": "2ee8b461e9aa5c08b463838eebb43db4ab17601e429bf6105c800df5048ec919",
+    "canonical_source_sha256": "1723893525a52cb8fff81c42f7c4ffd545fc055b96a1dca5e19d45cfcf935355",
+    "pacing_sha256_before_overlay": "fb150c9e4493ead750c2c7a9e2438432aecb99dc92274fc35602f869fa505600",
+    "run": "pacing-estimator-baseline",
+    "snapshot_input_sha256": "54258ed3a3ea78029e8a7a42c7e9ebe4c484dc6b180fdcdbd4abf09627a0c466"
+  },
+  "binary_sha256": "b74cf9128c3c5302d0dd0e6beb15b3a20dfa95ced4d6c5698f10137313d04761",
+  "build_flags": [
+    "-race=false"
+  ],
+  "build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "candidate": {
+    "canonical_source_sha256": "952dcab24acbb58dada1fa744ecf371b1c54e4db41bdce98890bdef4de9e1e57",
+    "canonical_source_sha256_after_run": "952dcab24acbb58dada1fa744ecf371b1c54e4db41bdce98890bdef4de9e1e57",
+    "changed_files": [
+      "transfer_window_pacing.go"
+    ],
+    "file_count": 796,
+    "pacing_sha256": "fceaebe198fb2d58dd419adcd6e6bf2a9fa5f50c1812508a6e9112dd5da82452",
+    "source_inventory_verified_after_run": true
+  },
+  "collector_compatibility": {
+    "note": "benchmark mode emits terminal Go benchmark rows rather than generic service/comparison ledger rows",
+    "runner_ledger_rows": 0
+  },
+  "created_utc": "2026-09-16T05:43:55.046163+00:00",
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "concurrent relay candidate investigation; monitor archival work; rejected-v6 isolated estimator benchmark; no quiescence wait"
+  },
+  "go": "go version go1.26.7 darwin/arm64",
+  "host_load_average_at_build_start": [
+    9.85595703125,
+    12.9853515625,
+    16.87841796875
+  ],
+  "host_load_average_at_start": [
+    8.5546875,
+    13.09423828125,
+    17.0556640625
+  ],
+  "instrument": "CPU/allocation benchmark only; no throughput performance acceptance",
+  "logical_cpus": 10,
+  "mode": "pacing-estimator-v6-rejected",
+  "purpose": "isolated CPU/allocation comparison of rejected correctness candidate; not throughput acceptance",
+  "run_flags": [
+    "-test.v",
+    "-test.run",
+    "^$",
+    "-test.bench",
+    "^BenchmarkWindowPacingService",
+    "-test.benchmem",
+    "-test.benchtime=500ms",
+    "-test.count=1",
+    "-test.timeout=30m"
+  ],
+  "run_log_sha256": "cbad5d8bde3940610c381410a4e3545e443f8bd781d6ffa372b1c1bb07832418",
+  "schema": "throughput-fix-2/pacing-estimator-v6-rejected-run-manifest-v1",
+  "source_inspection_uses_build_snapshot": true,
+  "source_snapshot": {
+    "baseline_file_count": 796,
+    "candidate_file_count": 796,
+    "copied_from_frozen_baseline": true,
+    "external_local_replacements": "external-local-replacement; location redacted; not captured input",
+    "only_declared_overlay_changed": true
+  },
+  "sources_stable_during_build": true
+}

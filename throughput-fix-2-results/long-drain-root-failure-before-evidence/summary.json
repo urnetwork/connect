@@ -1,0 +1,48 @@
+{
+  "accepted_as_performance_validation": false,
+  "archive_limits": [
+    "Contains normalized terminal outcomes, full numerical readings, and source, overlay, binary and build-manifest hashes only.",
+    "Raw logs, source files, overlays, binaries, commands, local paths and diagnostic traces remain outside this archive.",
+    "The candidate is unlanded and long-path throughput remains unresolved."
+  ],
+  "attribution_limits": [
+    "All effective inputs frozen from v11 diagnostics before separate ACK-credit API refactor and path duplex fixture correction.",
+    "Configured-cap counterfactual is global60s only, not actual custom AckTimeout plumbing.",
+    "Long-path model remains failing; neither configured root nor successful-drain trace closes throughput gate.",
+    "Trace logs contain generated test IDs and local paths; archive only normalized numeric rows/outcomes and hashes.",
+    "Earlier invalid setup/cleanup fixtures remain in /tmp and are explicitly excluded as causal proof."
+  ],
+  "candidate": "long-drain-roots-before",
+  "fail_count": 23,
+  "failing_run_ids": [
+    "cap-only-model-counterfactual",
+    "configured-cap-only-counterfactual",
+    "configured-drain-roots-before",
+    "latest-residence-model-counterfactual",
+    "latest-residence-trace",
+    "probe-retry-worker-before",
+    "same-message-retry-trace",
+    "tail-drain-before"
+  ],
+  "outcome_count": 44,
+  "pass_count": 21,
+  "reading_count": 28,
+  "run_count": 9,
+  "schema": "throughput-fix-2/long-drain-root-failure-before-evidence-summary-v1",
+  "skip_count": 0,
+  "status": "immutable failure-before and diagnostic counterfactual evidence; candidate unlanded",
+  "tests": [
+    {
+      "sha256": "9f7d4c8193ce62be49a14a753e15ef10c4871595b8871ce329f6d1e5200ff27c",
+      "test_file": "observed-flight-v2_test.go"
+    },
+    {
+      "sha256": "22649482a319afcf5447b31dcaac701b6cdd9bafe1bda09c26c62ba75479fd9a",
+      "test_file": "configured-long-flight_test.go"
+    },
+    {
+      "sha256": "06e5ace70d25cdbc6d4be5aaa08097cb787d918ce6872903eff92753791ea280",
+      "test_file": "probe-retry-worker_test.go"
+    }
+  ]
+}

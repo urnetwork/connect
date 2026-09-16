@@ -1,0 +1,26 @@
+{
+  "accepted_as_performance_validation": false,
+  "benchmark_count": 3,
+  "benchmark_test_file_sha256": "2ee8b461e9aa5c08b463838eebb43db4ab17601e429bf6105c800df5048ec919",
+  "binary_sha256": "063f74fc9b7b597ede9793916bc0c74c113ffa822e5321229f1e5c23b8574706",
+  "build_snapshot_input_sha256": "54258ed3a3ea78029e8a7a42c7e9ebe4c484dc6b180fdcdbd4abf09627a0c466",
+  "estimated_bytes_per_second": [
+    12500000,
+    12500000,
+    12500000
+  ],
+  "mode": "pacing",
+  "schema": "throughput-fix-2/pacing-estimator-baseline-summary-v1",
+  "source_sha256": "1723893525a52cb8fff81c42f7c4ffd545fc055b96a1dca5e19d45cfcf935355",
+  "status": "completed baseline; use only for later same-mode estimator cost comparison",
+  "total_allocations_per_op": [
+    0,
+    0,
+    0
+  ],
+  "total_bytes_per_op": [
+    0,
+    0,
+    0
+  ]
+}

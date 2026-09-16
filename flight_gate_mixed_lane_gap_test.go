@@ -818,61 +818,88 @@ func TestSingleReliableLaneQueueInflatedRttDoesNotStorm(t *testing.T) {
 	if testing.Short() {
 		t.Skip("single-lane retransmit storm reproduction")
 	}
-	const messageCount = 300
-	measure := func(deferTimeoutResend bool) ClientSendRecoveryStatsSnapshot {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		const messageCount = 300
+		measure := func(deferTimeoutResend bool) ClientSendRecoveryStatsSnapshot {
+			// Keep the original queued-window precondition for both defer arms.
+			// The delivery-sized pacer independently prevents this backlog.
+			harness := newMixedLaneHarnessWithOptions(t, mixedLaneOptions{
+				constantSendWindow: true,
+				slowLatency:        20 * time.Millisecond,
+				slowSerialization:  12 * time.Millisecond,
+				directLaneDisabled: true,
+				deferTimeoutResend: deferTimeoutResend,
+			})
+			// Virtual time uses the fixed delivery bound, not a wall-clock deadline.
+			return harness.run(struct{ testing.TB }{TB: t}, messageCount)
+		}
+		report := func(name string, stats ClientSendRecoveryStatsSnapshot) {
+			t.Logf(
+				"%s: initial=%d rto=%d deferred=%d recent-progress=%d gap=%d tail-probe=%d cumulative-probe=%d",
+				name,
+				stats.InitialWriteCount,
+				stats.TimeoutResendWriteCount,
+				stats.TimeoutResendDeferCount,
+				stats.TimeoutResendWithRecentCumulativeProgress,
+				stats.SelectiveGapWriteCount,
+				stats.AckTailProbeWriteCount,
+				stats.CumulativeProbeWriteCount,
+			)
+		}
+		// the mechanism: without the defer the whole window is rewritten against
+		// a lane that is still delivering, and every one of those timeouts fires
+		// while the cumulative ack is advancing
+		off := measure(false)
+		report("defer off", off)
+		if off.TimeoutResendWriteCount == 0 {
+			t.Fatal("the harness no longer reproduces the retransmit storm")
+		}
+		// the tail of a run can time out after the last ack, so the claim is
+		// that the storm is overwhelmingly against a live lane, not every one
+		if live := 4 * off.TimeoutResendWithRecentCumulativeProgress; live < 3*off.TimeoutResendWriteCount {
+			t.Fatalf(
+				"only %d of %d timeout resends fired against a live cumulative ack, so the storm has another cause here",
+				off.TimeoutResendWithRecentCumulativeProgress,
+				off.TimeoutResendWriteCount,
+			)
+		}
+		// the contract: the shipped default keeps the storm to a rounding error
+		on := measure(true)
+		report("defer on ", on)
+		if bound := off.TimeoutResendWriteCount / 4; bound < on.TimeoutResendWriteCount {
+			t.Fatalf(
+				"the default settings still storm: %d timeout resends against %d with the defer off, over %d messages",
+				on.TimeoutResendWriteCount,
+				off.TimeoutResendWriteCount,
+				messageCount,
+			)
+		}
+		if on.SelectiveGapWriteCount > off.SelectiveGapWriteCount ||
+			on.AckTailProbeWriteCount > off.AckTailProbeWriteCount {
+			t.Fatalf("the defer moved recovery onto another mechanism: %+v against %+v", on, off)
+		}
+	})
+}
+
+// The default pacer bounds a slow reliable lane even with the older timeout
+// defer disabled. The queued-window control above separately tests that defer.
+func TestWindowPacingPreventsReliableLaneQueueStorm(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
 		harness := newMixedLaneHarnessWithOptions(t, mixedLaneOptions{
 			slowLatency:        20 * time.Millisecond,
 			slowSerialization:  12 * time.Millisecond,
 			directLaneDisabled: true,
-			deferTimeoutResend: deferTimeoutResend,
+			deferTimeoutResend: false,
 		})
-		return harness.run(t, messageCount)
-	}
-	report := func(name string, stats ClientSendRecoveryStatsSnapshot) {
-		t.Logf(
-			"%s: initial=%d rto=%d deferred=%d recent-progress=%d gap=%d tail-probe=%d cumulative-probe=%d",
-			name,
-			stats.InitialWriteCount,
-			stats.TimeoutResendWriteCount,
-			stats.TimeoutResendDeferCount,
-			stats.TimeoutResendWithRecentCumulativeProgress,
-			stats.SelectiveGapWriteCount,
-			stats.AckTailProbeWriteCount,
-			stats.CumulativeProbeWriteCount,
-		)
-	}
-	// the mechanism: without the defer the whole window is rewritten against
-	// a lane that is still delivering, and every one of those timeouts fires
-	// while the cumulative ack is advancing
-	off := measure(false)
-	report("defer off", off)
-	if off.TimeoutResendWriteCount == 0 {
-		t.Fatal("the harness no longer reproduces the retransmit storm")
-	}
-	// the tail of a run can time out after the last ack, so the claim is
-	// that the storm is overwhelmingly against a live lane, not every one
-	if live := 4 * off.TimeoutResendWithRecentCumulativeProgress; live < 3*off.TimeoutResendWriteCount {
-		t.Fatalf(
-			"only %d of %d timeout resends fired against a live cumulative ack, so the storm has another cause here",
-			off.TimeoutResendWithRecentCumulativeProgress,
-			off.TimeoutResendWriteCount,
-		)
-	}
-	// the contract: the shipped default keeps the storm to a rounding error
-	on := measure(true)
-	report("defer on ", on)
-	if bound := off.TimeoutResendWriteCount / 4; bound < on.TimeoutResendWriteCount {
-		t.Fatalf(
-			"the default settings still storm: %d timeout resends against %d with the defer off, over %d messages",
-			on.TimeoutResendWriteCount,
-			off.TimeoutResendWriteCount,
-			messageCount,
-		)
-	}
-	if on.SelectiveGapWriteCount > off.SelectiveGapWriteCount ||
-		on.AckTailProbeWriteCount > off.AckTailProbeWriteCount {
-		t.Fatalf("the defer moved recovery onto another mechanism: %+v against %+v", on, off)
-	}
+		// Keep the harness's fixed delivery bound inside virtual time.
+		stats := harness.run(struct{ testing.TB }{TB: t}, 300)
+		t.Logf("paced default: initial=%d retries=%d deferred=%d", stats.InitialWriteCount, stats.TimeoutResendWriteCount, stats.TimeoutResendDeferCount)
+		if stats.InitialWriteCount == 0 || stats.TimeoutResendWriteCount != 0 || stats.TimeoutResendDeferCount != 0 {
+			t.Fatalf("paced reliable delivery needed timeout recovery or hidden deferral: %+v", stats)
+		}
+	})
 }
 
 // The shipped defaults must carry the contract above, not only the

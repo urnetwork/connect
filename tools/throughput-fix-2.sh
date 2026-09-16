@@ -2,7 +2,7 @@
 # Reproduce the local window research without the PR author's native rig.
 # Usage: tools/throughput-fix-2.sh MODE [output-dir]
 # Use a fresh output directory outside the connect/server source checkouts.
-# Modes: correctness, model, sdk-model, regression, ack, packet, tcp, physical-h1, server,
+# Modes: correctness, model, sdk-model, regression, ack, pacing, packet, tcp, physical-h1, server,
 #        server-integration, server-functional, server-tcp, server-proxy,
 #        server-connect-deterministic.
 set -euo pipefail
@@ -23,10 +23,12 @@ case "$mode" in
     pattern='^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$'
     pattern="$pattern|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$|^TestWindowTcp(SocketBatch|CanceledBatch|WorkloadCancel).*$"
     pattern="$pattern|^TestTun(DuplexDataHandoffDoesNotCycleThroughAdmission|FiniteTcpTailProgressesAfterEndpointOwnerReleases)$"
+    pattern="$pattern|^TestReceiveSequenceBurstTail.*$"
+    pattern="$pattern|^Test(AckReceiverDelay|ReceiverAckTiming|SenderReceiverTiming|RttReceiverTiming).*$"
     build_flags=(-race)
     ;;
   model)
-    pattern='^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*|TestWindowPathSdk.*)$'
+    pattern='^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*|TestWindowPathSdk.*|TestWindowPathAckTailRoundTripGrowthControl)$'
     build_flags=(-race=false)
     ;;
   sdk-model)
@@ -47,6 +49,11 @@ case "$mode" in
   ack)
     pattern='^TestAckCompressionHeadDrainDoesNotAllocate$'
     run_flags=(-test.bench '^BenchmarkAckCompression' -test.benchmem -test.benchtime=250ms)
+    build_flags=(-race=false)
+    ;;
+  pacing)
+    pattern='^$'
+    run_flags=(-test.bench '^BenchmarkWindowPacing(Service|Receiver)' -test.benchmem -test.benchtime=500ms)
     build_flags=(-race=false)
     ;;
   packet|tcp)

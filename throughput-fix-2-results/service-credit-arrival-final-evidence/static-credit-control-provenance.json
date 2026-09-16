@@ -1,0 +1,19 @@
+{
+  "attribution": "Same diagnostic helper and gates as final credit-static replay: six static cells fail without service credit and pass after it.",
+  "control_base_source_sha256": "fffee01996b0d1d75fb8323f3554858b3b9e45ebdd969fb48e3664b714e72741",
+  "control_binary_sha256": "91da423d0b5f82102f07f84f84fd5f77a43add71278b235fe90b43ea21ea49ae",
+  "control_input_sha256": "872122e7b929e0dfd16c4dfa3725d26fbcac33174f7a0a34262bd99f43b7af5b",
+  "control_log_sha256": "e1f94f90f9dde6d403b24b8d91e25a0d087b09b54aad9f91afdeebd9769748d0",
+  "control_manifest_sha256": "ba4affae2dc7e7549b1c05a42f9a57a3372e58cd363cc97587a00b23fc1ff35e",
+  "control_service_readings": 12,
+  "control_top_level_outcome": {
+    "duration": "0.33s",
+    "result": "FAIL",
+    "test": "TestWindowStaticCreditDiagnostic"
+  },
+  "original_final_handoff_sha256": "5d8476d9d0757f1689466710d3384ce9f88a8c847aedbb90c2b56ad402292e43",
+  "raw_inputs_excluded": true,
+  "schema_version": 1,
+  "scope": "Additional causal control for six static mismatch cells, after final handoff. Same diagnostic helper/gates; before is integrated common-probe source fffee019, after is final credit production. All six fail without credit and pass with it.",
+  "supplemental_handoff_sha256": "7965ce81ec49a990dec0665d3c2304c5e10268a3398d5bce73e4547c439207c5"
+}

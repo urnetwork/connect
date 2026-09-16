@@ -230,6 +230,18 @@ message Ack {
     // previously received evidence from a newer peer.
     optional uint32 ack_compress_timeout_micros = 11;
 
+    // Actual receiver residence of message_id, from Pack ingress until this
+    // Ack is encoded. Includes receive handoff, ordering, application delivery
+    // and compression waits. This is an elapsed duration on the receiver's
+    // clock, not a timestamp to compare with the sender's clock. It does not
+    // include a later wait in the outgoing carrier.
+    //
+    // Zero is an immediate reply; absent means timing is unavailable, including
+    // legacy receivers. The sender may subtract this duration only from an
+    // unambiguous measurement of this exact message's physical first write.
+    // Missing-contract requests do not supply delivery timing.
+    optional uint32 receiver_ack_delay_micros = 12;
+
     // Sequence numbers of items this receiver had acknowledged and then removed
     // from its hold to admit an earlier arrival. A selective acknowledgement
     // leases an item rather than releasing it: the sender keeps it in its

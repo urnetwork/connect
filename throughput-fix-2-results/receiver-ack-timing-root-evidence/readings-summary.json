@@ -1,0 +1,5 @@
+{
+  "reading_count": 0,
+  "reason": "All five frozen runs declare an empty readings collection. These are deterministic receiver/sender timing-root tests; normalized top-level outcomes retain each reported elapsed_seconds value.",
+  "status": "no_numerical_readings_emitted"
+}

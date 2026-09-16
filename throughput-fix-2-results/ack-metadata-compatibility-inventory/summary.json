@@ -1,0 +1,19 @@
+{
+  "current_runner_modes": [
+    "correctness (-race)",
+    "model (-race=false)"
+  ],
+  "existing_strict_current_groups": [
+    "layout and decoder cap",
+    "sequenceAck window",
+    "encoded ACK response bounds"
+  ],
+  "schema": "throughput-fix-2/ack-metadata-compatibility-inventory-summary-v1",
+  "status": "read-only planning inventory; no implementation or validation result",
+  "supplemental_groups": [
+    "sendItem lifetime",
+    "wire codec if serialized",
+    "legacy zero-growth guard separate review"
+  ],
+  "tests_executed": false
+}

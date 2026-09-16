@@ -1,0 +1,46 @@
+{
+  "aggregate": {
+    "comparison_rows": 54,
+    "failure_observations": 8,
+    "runs": 3,
+    "service_readings": 108,
+    "top_level_fail": 2,
+    "top_level_pass": 1
+  },
+  "archive_load_average": [
+    10.43701171875,
+    11.36279296875,
+    10.1318359375
+  ],
+  "archive_load_is_not_a_test_launch_measurement": true,
+  "archive_result": "complete_pinned_frozen_hybrid_sdk_bidirectional_comparison",
+  "by_variant": {
+    "broad-v1": {
+      "comparisons": 18,
+      "fail": 1,
+      "failure_observations": 6,
+      "pass": 0,
+      "service_readings": 36,
+      "terminal_status": "FAIL",
+      "top_level_outcomes": 1
+    },
+    "hybrid-v1": {
+      "comparisons": 18,
+      "fail": 0,
+      "failure_observations": 0,
+      "pass": 1,
+      "service_readings": 36,
+      "terminal_status": "PASS",
+      "top_level_outcomes": 1
+    },
+    "legacy-consumer-v1": {
+      "comparisons": 18,
+      "fail": 1,
+      "failure_observations": 2,
+      "pass": 0,
+      "service_readings": 36,
+      "terminal_status": "FAIL",
+      "top_level_outcomes": 1
+    }
+  }
+}

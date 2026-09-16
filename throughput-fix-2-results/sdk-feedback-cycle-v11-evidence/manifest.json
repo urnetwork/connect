@@ -1,0 +1,31 @@
+{
+  "candidate": "feedback-summary-v11",
+  "counts": {
+    "fail": 21,
+    "outcomes": 1278,
+    "pass": 1257,
+    "readings": 111,
+    "runs": 12,
+    "skip": 0
+  },
+  "files": {
+    "outcomes.jsonl": "8c1c37d9ca8f05fd88a861c793e381cad642d1e21d04898b150be3849bbeebfc",
+    "provenance.json": "b9f65f8a073ab1a52ea4eaea2b21546738bcc1c86413a56027049f5718db990a",
+    "readings-final-early.jsonl": "7032f0e67aed1a499f4a5732aa84a5669ace02fd70ad15d05795a9f6e3f4bf6a",
+    "readings-final-late.jsonl": "bf6b3461a3f335bc92d9a4f19f5440e812ceefd2c8b1ca6d837e33bfcee88bd3",
+    "readings-final-natural.jsonl": "85c21a14c0827b2aa4765916e827a0dec0ac20fc9f92c8d7639cfc28de7ea5fa",
+    "readings-final-recovery-and-new-long-cell.jsonl": "3a1d822df2e5c3918eeeee72bb8de0903bb8ed3ab09e1422fd82f3f40cf8fcfb",
+    "readings-final-service-controls.jsonl": "7a27657b07285d6a14c2d64c32d5b0504f529a294aad06656b632ccbc29debc5",
+    "readings-long-cell-v10-baseline.jsonl": "433ddd676387116a2f6e7d1b69f87967469d8ab06094e39681b843ebb9f46676",
+    "summary.json": "b4c7ecab4242f3d90f01e40c8281df8adb7ef2237bbc9bce5c569203432b8fa9"
+  },
+  "input_handoff_sha256": "f045b79f06271d5468388c8edf935b0f5650546fc6d8ab66c0d77d7008d74c11",
+  "redaction": {
+    "commands_and_local_paths": "excluded",
+    "full_numerical_readings_and_terminal_outcomes": "retained",
+    "raw_logs": "excluded",
+    "source_overlay_and_binary_contents": "excluded"
+  },
+  "schema": "throughput-fix-2/sdk-feedback-cycle-v11-evidence-manifest-v1",
+  "verification": "all frozen input hashes and counts verified before artifact creation"
+}

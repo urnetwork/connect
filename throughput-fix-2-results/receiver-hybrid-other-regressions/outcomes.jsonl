@@ -1,0 +1,3 @@
+{"duration":"343.23s","result":"FAIL","test":"TestWindowPathWindowMismatchMatrix"}
+{"duration":"16.81s","result":"PASS","test":"TestWindowPathServiceAcrossRepeatedDrains"}
+{"duration":"6.96s","result":"FAIL","test":"TestWindowPathServicesShareFiniteRelay"}

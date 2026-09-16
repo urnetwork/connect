@@ -1,0 +1,27 @@
+{
+  "counts": {
+    "fail": 6,
+    "failure_assertion_rows": 9,
+    "go_test_executions": 9,
+    "numerical_observations": 3,
+    "pass": 3,
+    "skip": 0
+  },
+  "files": {
+    "numerical-observations.jsonl": "44ffaa8363f3a54786ad141b1c9917c20c56fa54c8bf375abf6ca16bfeaa4c2c",
+    "outcomes.jsonl": "c13865a2794eceab7542ab918268396d475f44f2149a1f38fc5b65a9687d8f36",
+    "provenance.json": "0a0cb2cab40920d5a9e92388174c142d7bdaf2a3fffc687302a39b5b95db84bf",
+    "status.json": "5248f4fe6411ad115845d483e9abf01cdb2aeada78447c31756f904a3cf5b922",
+    "summary.json": "efda05bd19d2867f573a2207d831b9e603176af575c2008eedd56a1c995dd314"
+  },
+  "input_handoff_sha256": "aa4bf2a55743abd8d8d95e26994ee74ed4d0c0851d00c4076716a8674b953551",
+  "redaction": {
+    "commands": "excluded",
+    "local_paths": "excluded",
+    "normalized_numerical_observations_and_terminal_outcomes": "retained",
+    "raw_logs": "excluded",
+    "source_overlay_and_binary_contents": "excluded"
+  },
+  "schema": "throughput-fix-2/window-mismatch-v4-arrival-manifest-v1",
+  "verification": "all source, overlay, test, binary, build-overlay, and raw-log hashes listed by the frozen handoff were verified before artifact creation"
+}

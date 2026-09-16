@@ -1,0 +1,49 @@
+{
+  "architecture": "arm64",
+  "binary_sha256": "e77ea73667eac5e2ae0c4734cc37746dc0d424fa5cb8b82eecc2799cff8c8660",
+  "build_flags": [
+    "-race"
+  ],
+  "connect": {
+    "branch": "throughput-fix-2",
+    "dirty": true,
+    "revision": "f55e5d41a120d26789b60ec0450daa63e6fa43df",
+    "source_sha256": "e5492734945d87efe82f02af0648320b44522987d966640f409f31b6283bd326"
+  },
+  "created_utc": "2026-09-16T04:35:00.004276+00:00",
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "concurrent v11/mismatch and long-drain overlay investigations; scoped compression-residence isolated control race; no quiescence wait"
+  },
+  "external_local_replacement_count": 1,
+  "external_local_replacements": "external local replacements are not frozen",
+  "go": "go version go1.26.7 darwin/arm64",
+  "host_load_average_at_start": [
+    11.91748046875,
+    14.83935546875,
+    17.14892578125
+  ],
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "logical_cpus": 10,
+  "mode": "compression-residence-isolated-control",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "package": "./",
+  "run_flags": [
+    "-test.short=false",
+    "-test.count=3"
+  ],
+  "runner_sha256": "b8cbdc5fef4a1b9c578bfd5815373af2f29f2024aa7292974e45bc43d3975b06",
+  "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+  "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175",
+  "source_inspection_uses_build_snapshot": true,
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 1454,
+        "input_sha256": "8045c0819e15172f9097f0405684f04a58708d089481666a83dc970f2dfa475c"
+      }
+    }
+  },
+  "sources_stable_during_build": true,
+  "test_pattern": "^TestWindowCompressionResidenceRestoresShortPathCapacity$"
+}

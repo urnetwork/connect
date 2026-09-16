@@ -1,0 +1,50 @@
+{
+  "comparison_policy": "The historical service-only baseline and this isolated receiver-timing prototype ran from different frozen sources and are separate host-load samples. No paired comparison, ratio, statistical result, or performance-acceptance conclusion is derived.",
+  "historical_archive": {
+    "archive_manifest_sha256": "913323a8dce5f3c5f7c2eb00c6f4dfc38f5076abb8ba452c422f61ee18055fca",
+    "archive_name": "pacing-estimator-baseline",
+    "benchmark_rows_sha256": "29a056484713681dd374876d4e75edcc62837ac79927f5d1b9bc925b91698815",
+    "binary_sha256": "063f74fc9b7b597ede9793916bc0c74c113ffa822e5321229f1e5c23b8574706",
+    "host_load_average_at_start": [
+      18.2900390625,
+      25.14453125,
+      21.49072265625
+    ],
+    "rows": [
+      {
+        "allocs_per_op": 0,
+        "benchmark": "BenchmarkWindowPacingServiceContinuous",
+        "bytes_per_op": 0,
+        "estimated_bytes_per_second": 12500000,
+        "iterations": 3170682,
+        "ns_per_op": 189.4,
+        "scenario": "continuous-full-ring",
+        "schema": "throughput-fix-2/pacing-estimator-benchmark-row-v1"
+      },
+      {
+        "allocs_per_op": 0,
+        "benchmark": "BenchmarkWindowPacingServiceHold",
+        "bytes_per_op": 0,
+        "estimated_bytes_per_second": 12500000,
+        "iterations": 3454038,
+        "ns_per_op": 173.9,
+        "scenario": "held-rate",
+        "schema": "throughput-fix-2/pacing-estimator-benchmark-row-v1"
+      },
+      {
+        "allocs_per_op": 0,
+        "benchmark": "BenchmarkWindowPacingServiceStatisticsHold",
+        "bytes_per_op": 0,
+        "estimated_bytes_per_second": 12500000,
+        "iterations": 3379191,
+        "ns_per_op": 175.4,
+        "scenario": "non-retaining-held-statistics",
+        "schema": "throughput-fix-2/pacing-estimator-benchmark-row-v1"
+      }
+    ],
+    "runner_sha256": "25939d8152e35ed053e75d2dd2a27ff4be341c44c72ad217bee1ccb434fca20f",
+    "source_sha256": "1723893525a52cb8fff81c42f7c4ffd545fc055b96a1dca5e19d45cfcf935355"
+  },
+  "purpose": "separate historical context only",
+  "schema_version": 1
+}

@@ -1,0 +1,38 @@
+{
+  "archive_kind": "old_tail_receipt_oracle_design_evidence",
+  "attribution_limits": [
+    "Route-ownership roots are diagnostic failure-before plus safety-control evidence; they do not implement a receipt protocol or establish a production fix.",
+    "The known-service oracle deliberately supplies fixture knowledge. Its failure is design evidence that does not validate a production estimator or throughput acceptance.",
+    "Logical delivery, exact observed RTT, and multi-route physical drain remain distinct review concepts.",
+    "Raw logs, source, overlays, binaries, local paths, and identifiers are excluded; normalized numerical rows, outcomes, and hash pins are retained."
+  ],
+  "collection_time_utc": "2026-09-16T09:34:29.238364+00:00",
+  "oracle_counterfactual": "On exact hybrid+common-bound, force measure() to return12500000B/s at or after the known4s propagation step. Readonly calls do not retain. Before4s behavior unchanged. Actual RTT, raw recovery, pacing contracts, windows, queues, losses and ACK policy unchanged.",
+  "oracle_limitations": [
+    "Known physical capacity is an oracle supplied by the fixture; no claim that existing feedback identifies it.",
+    "This is one same-input diagnostic comparison, not a repeat-until-pass campaign.",
+    "Cumulative recovery counters include warmup and cannot alone explain measurement-interval loss.",
+    "The original frozen average/minflow/measured-drop gates apply; stronger per-interval shared gate was not present in this copied fixture.",
+    "Receipt protocol remains review-only and no new timer exception is proposed."
+  ],
+  "oracle_scope": "known-service oracle diagnostic only; not a production estimator and no performance acceptance",
+  "production_changes": false,
+  "receipt_protocol_implemented": false,
+  "receipt_review_scope": "review-only measured observed RTT receipt; logical delivery is distinct from physical-prefix/drain proof",
+  "redaction_policy": {
+    "ipv4_literals": "redacted if encountered",
+    "local_paths": "excluded",
+    "raw_logs": "excluded; sha256 only",
+    "source_overlay_binary": "excluded; sha256 only"
+  },
+  "route_limits": [
+    "Actual client send workers, actual H1 route writes and production ACK coalescer; receiver ACKs are injected with current original/duplicate wire shapes.",
+    "Virtual time and barriers; no wall-clock sleep used as proof.",
+    "The early ACK during the retry write is allowed to be ignored because the resend queue temporarily omits that item.",
+    "Multi-route control explicitly leaves the original physical copy unconsumed in route A; a newer route B cumulative head is insufficient to certify route A.",
+    "No receipt protocol implemented; new identity alone cannot prove all physical routes drained.",
+    "All buffers and client worker lifecycles reconciled by assertMessagePoolOwnership."
+  ],
+  "route_ownership_scope": "diagnostic failure-before and safety control only; no production fix, nonce implementation or performance attribution",
+  "schema_version": 1
+}

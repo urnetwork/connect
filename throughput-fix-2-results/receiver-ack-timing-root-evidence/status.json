@@ -1,0 +1,19 @@
+{
+  "archive_result": "complete_with_expected_failure_before_and_excluded_fixture_diagnostic",
+  "excluded_fixture_diagnostic_fail_count": 1,
+  "excluded_fixture_diagnostic_outcomes": 7,
+  "excluded_fixture_diagnostic_pass_count": 6,
+  "excluded_fixture_diagnostic_runs": 1,
+  "excluded_provisional_after_outcomes": 3,
+  "excluded_provisional_after_runs": 1,
+  "handoff_total_completed_runs": 5,
+  "handoff_total_fail_count": 10,
+  "handoff_total_outcomes": 25,
+  "handoff_total_pass_count": 15,
+  "numerical_reading_count": 0,
+  "race_warning_count": 0,
+  "selected_root_fail_count": 9,
+  "selected_root_outcomes": 15,
+  "selected_root_pass_count": 6,
+  "selected_root_runs": 3
+}

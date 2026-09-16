@@ -218,6 +218,13 @@ func checkWindowSdkCell(t *testing.T, cell windowPathCell) {
 		if reading.Mbps <= 0 || reading.MinFlowMbps <= 0 || reading.MeasurementRelayDrops != 0 {
 			t.Errorf("SDK %s dropped traffic or stalled a flow", reading.Cell.Arm)
 		}
+		for direction, rate := range reading.DirectionMbps {
+			// A relative comparison cannot detect a missing serializer in both arms.
+			ceiling := 1.01 * float64(max(cell.Rate, cell.RateAfter)) * 8 / 1e6
+			if rate > ceiling {
+				t.Errorf("SDK %s direction %d exceeds the physical link: %.6f > %.6f Mb/s", reading.Cell.Arm, direction, rate, ceiling)
+			}
+		}
 		for _, receive := range []ClientReceiveStatsSnapshot{reading.Receiver, reading.SenderReceive} {
 			if receive.ReceiveQueueDropCount != 0 || receive.ReceiveQueueEvictionCount != 0 ||
 				receive.PackHandoffDropCount != 0 || receive.AckHandoffDropCount != 0 {
