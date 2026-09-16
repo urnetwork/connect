@@ -41,3 +41,14 @@ func (self *SendSequence) setResendTime(item *sendItem, at time.Time) {
 		heap.Fix(queue.maxHeap, item.MaxHeapIndex())
 	}
 }
+
+// The stored first-write timestamp is based on this client's monotonic elapsed
+// time. Reconstruct that same clock for deadline comparisons; synthetic clients
+// without a clock base keep the existing wall-time fallback.
+func (self *SendSequence) firstPhysicalRecoveryTime(item *sendItem) time.Time {
+	if self.client != nil && !self.client.feedbackTimeBase.IsZero() {
+		base := self.client.feedbackTimeBase
+		return base.Add(time.Duration(item.pacingSentAtNanos - base.UnixNano()))
+	}
+	return time.Unix(0, item.pacingSentAtNanos)
+}

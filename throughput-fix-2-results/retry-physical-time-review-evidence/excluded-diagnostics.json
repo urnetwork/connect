@@ -1,0 +1,46 @@
+[
+  {
+    "classification": "excluded-intermediate-outer-fatal-and-shared-route-fixture",
+    "name": "adjacent-after.log",
+    "outcomes": {
+      "FAIL": 6,
+      "PASS": 18,
+      "SKIP": 0
+    },
+    "raw_log_sha256": "5b3c893495dcf2ec0026fa9f42c1d49e0f90ada7d2cd708a64b7b08b22bcec64",
+    "reason": "Intermediate fixture assumptions: outer-test Fatal misuse plus shared physical channel/reliability/cancellation assumptions; excluded from production conclusions."
+  },
+  {
+    "classification": "excluded-intermediate-boundary-fixture",
+    "name": "adjacent-boundary-diagnostic.log",
+    "outcomes": {
+      "FAIL": 2,
+      "PASS": 0,
+      "SKIP": 0
+    },
+    "raw_log_sha256": "8eb55024719efbeb5348b153d55ce0df68cc4d239ad35fdfb0029fe85fa7607a",
+    "reason": "Corrected test ownership; cancellation due inspection was mistaken for a write; invalid shared-route carrier setup retained."
+  },
+  {
+    "classification": "excluded-invalid-shared-route-carrier-fixture",
+    "name": "adjacent-boundaries-after.log",
+    "outcomes": {
+      "FAIL": 3,
+      "PASS": 3,
+      "SKIP": 0
+    },
+    "raw_log_sha256": "61d4a4665919db4166f81e2ec7d609eb6a34a7e63484c15d87af1476381f5ce0",
+    "reason": "Cancellation physical ownership passes; invalid shared-route carrier setup still fails."
+  },
+  {
+    "classification": "excluded-carrier-reliability-fixture",
+    "name": "carrier-separate-route.log",
+    "outcomes": {
+      "FAIL": 3,
+      "PASS": 0,
+      "SKIP": 0
+    },
+    "raw_log_sha256": "5785cb3109af4493dc6f623596b8bfdf736dedb95ccf200fd3ec8e145584ffb2",
+    "reason": "Correct carrier timing observed, but fixture incorrectly assumed H3 type itself means DATAGRAM; fixed by explicit stream/DATAGRAM properties."
+  }
+]

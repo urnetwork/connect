@@ -8289,7 +8289,7 @@ sendSequenceLoop:
 					deadline := service.probeRecoveryDeadline(self.sequenceId, item.messageId,
 						self.sendBufferSettings.RttScale, self.sendBufferSettings.MaxResendInterval)
 					if interval := self.sharedRawRecoveryInterval(item, sendTime); interval > 0 && item.pacingSentAtNanos != 0 {
-						physicalDeadline := time.Unix(0, item.pacingSentAtNanos).Add(max(interval, self.resendIntervalForItem(item, 1)))
+						physicalDeadline := self.firstPhysicalRecoveryTime(item).Add(max(interval, self.resendIntervalForItem(item, 1)))
 						if deadline.Before(physicalDeadline) {
 							deadline = physicalDeadline
 						}
@@ -8464,6 +8464,7 @@ sendSequenceLoop:
 				resendPath := sendTransferPath(self.client.ClientId(), DestinationId(self.destination))
 				resendBytes := transferFrameBytes
 				resendForceUnwrapped := item.forceUnwrapped
+				previousPacedWrite := self.windowPacer.waiter.sentAt
 				var resendDisposition transferWriteDisposition
 				var resendErr error
 				c := func() error {
@@ -8540,10 +8541,17 @@ sendSequenceLoop:
 				// already answers that with a fact about position, and a fact
 				// beats a constant, so the cadence goes.
 				itemResendTimeout := self.resendIntervalForItem(item, item.sendCount)
-				if !retainPastAckTimeout && itemAckTimeout <= itemResendTimeout {
-					item.resendTime = sendTime.Add(itemAckTimeout)
-				} else {
-					item.resendTime = sendTime.Add(itemResendTimeout)
+				recoveryStart := sendTime
+				if resendErr == nil && resendDisposition.transportType == TransportTypeH1 &&
+					self.windowPacer.waiter.sentAt.After(previousPacedWrite) &&
+					self.windowPacer.waiter.sentAt.After(recoveryStart) {
+					// A paced retry starts its next backoff at the physical write.
+					// The reusable waiter is owned by this sequence worker.
+					recoveryStart = self.windowPacer.waiter.sentAt
+				}
+				item.resendTime = recoveryStart.Add(itemResendTimeout)
+				if !retainPastAckTimeout && item.resendTime.After(item.sendTime.Add(item.ackTimeout)) {
+					item.resendTime = item.sendTime.Add(item.ackTimeout)
 				}
 				self.addResendItem(item)
 				// A paced recovery write can take a complete service interval.
@@ -9985,7 +9993,7 @@ func (self *SendSequence) sendWithSetContractRecords(
 			if item.pacingByteCount > 0 && item.rttH1 && item.pacingSentAtNanos != 0 {
 				// Local pacing precedes the first physical attempt. It cannot
 				// consume that attempt's ordinary recovery interval.
-				recoveryStart = time.Unix(0, item.pacingSentAtNanos)
+				recoveryStart = self.firstPhysicalRecoveryTime(item)
 			}
 			self.setResendTime(item, recoveryStart.Add(self.resendIntervalForItem(item, 1)))
 		}

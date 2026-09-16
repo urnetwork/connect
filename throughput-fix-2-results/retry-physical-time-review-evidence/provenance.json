@@ -1,0 +1,33 @@
+{
+  "adjacent_controls": [
+    "Configured400ms maximum still yields physical1.2s plus400ms; explicit negative at1.6s-1ns and positive at1.6s.",
+    "Original1.5s item lifetime expires at1.5s even though the next physical backoff would end at1.8s.",
+    "An actual unpaced H1 retry at500ms ignores the previous0s waiter and retains its1.1s deadline.",
+    "A failed H1 route attempt after pacing retains its old900ms deadline; successful-write count stays0.",
+    "H1-to-H3 stream and DATAGRAM changes during the pacing wait retain their original900ms deadlines despite a fresh1.2s waiter. Each carrier owns a distinct route channel, and physical reliability is explicitly published.",
+    "Cancellation at1s joins the paced retry with zero physical copies, unchanged waiter and terminal retained ownership; canceled due-loop inspection is not counted as a write.",
+    "Real first-write deadline preserves the actual client monotonic reading as well as its exact300ms elapsed interval. No operating-system clock was changed.",
+    "Original first-copy, sibling raw residence, heap, finite maximum/lifetime, explicit loss, probe identity/cancellation, carrier and exact item-footprint tests all remain in the138 outcomes."
+  ],
+  "archive_kind": "retry_physical_time_review_evidence",
+  "artifact_exclusions": [
+    "Archive normalized numerical timing/outcomes/provenance only. Do not copy raw logs, source, overlays, binaries, runtime identities, process environment or packet data.",
+    "Intermediate fixture setup failures and their outer-test Goexit errors are retained and explicitly excluded as production-root evidence.",
+    "Monotonic root proves preserved elapsed-clock ownership, not an injected system wall-clock adjustment."
+  ],
+  "attribution_limits": [
+    "The final focused selection validates the named retry-clock and monotonic roots only; it is not a full performance campaign.",
+    "Intermediate fixture setup, shared-route, and carrier-reliability assumptions are retained but excluded from production conclusions.",
+    "The original virtual silent-lane integration remains three failures at message 1445 and is not repaired by this correction.",
+    "No receipt/attempt protocol, service-sampler change, long throughput campaign, or host campaign belongs to this evidence.",
+    "Raw logs, source, overlays, binaries, commands, environment material, local paths, and synthetic identities are excluded; normalized outcomes, timing, and hashes only are retained."
+  ],
+  "collection_time_utc": "2026-09-16T10:52:42.140969+00:00",
+  "handoff_sha256": "8968ec7e37ec94b88ed7db65ab7f85b40edbb954e871342f0703ad42560c413e",
+  "open_failures": [
+    "Original virtual silent-lane failure remains3/3 at message1445; root owns its separate ambiguous physical-tail/drain diagnosis.",
+    "No new long throughput or host campaign was run. Prior long measured-service failure remains open.",
+    "No receipt/attempt protocol or service-sampler change is part of this handoff."
+  ],
+  "scope": "Start the next existing retry backoff at this retry's successful paced H1 write registration. Require a fresh sequence-owned waiter timestamp plus actual H1 disposition. Preserve existing maximum interval, original absolute acknowledgement lifetime and other carrier/failed/unpaced contracts. Reconstruct the two previously changed first-copy deadlines through the client monotonic time base. No new retained state, timer constant, RTT sample, service estimator or wire field."
+}
