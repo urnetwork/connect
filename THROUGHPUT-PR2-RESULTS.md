@@ -37,13 +37,27 @@ completed `f60cf11d` model. Recovery-time differences and host acceptance remain
 open; see the report for retained failures and deterministic tests.
 The rebucketing source `56eec7b1968bac2214224b2d7975f849d0fe6efef53cd9322eb11a01b31bc6ef`
 passes 160 correctness tests under the race detector and 23 targeted performance
-pairs across seven tests; its full-model and host confirmation remain open.
+pairs across seven tests. Its subsequent full model completes 21 passes and
+one failure: slow shared-service throughput is 0.82944 versus 0.94720 Mb/s.
+All 510 readings remain in `model-burst-ring-rtt-resize`.
 
-The new SDK probe captures eight actual constructor profiles, with stable
-SDK/connect manifests and allowlisted numerical settings. Those observations
-prepare the missing SDK-budget performance cells; they do not replace them.
-The separate induced host feedback-idle failure now has a deterministic
-`TcpSequence.runReturnRecovery` reproduction, retained as an unfixed diagnostic.
+The source-idle correction now passes 169 race-enabled correctness tests on
+`5605efa750834abb352be42548f7c20cd55f56d154a2837dc5996e8b580180f7`.
+Its normal regression runs the real `TcpSequence.runReturnRecovery` worker:
+the resumed bulk write's virtual wait falls from 18.430482186 s to zero while
+service stays at 125 MB/s. Nine tests cover the root and adjacent confirmation,
+cancellation, queued demand and shared-lane boundaries. Six failure cases fail
+three times before the fix; 92 focused tests pass three times afterwards.
+Seven scoped model controls retain 50 readings. These passes do not resolve
+the separate shared-service failure or establish host acceptance.
+
+The SDK probe now captures 11 actual constructor profiles with 40 numerical
+or policy fields. The new Transfer matrix completes 150 paired cases: all
+132 one-way pairs pass, while the bidirectional test exposes the mobile H1
+provider's return-direction regression (428.41088 versus 587.20256 Mb/s, zero
+recorded drops). Its 300 readings are retained in `sdk-transfer-model-first`.
+That run predates the source-idle fix and stronger per-direction/calibration
+checks; the latest complete SDK matrix and physical SDK/H1 coverage remain open.
 
 The committed follow-up's final correctness run passes 152 tests under `-race`
 on source SHA-256

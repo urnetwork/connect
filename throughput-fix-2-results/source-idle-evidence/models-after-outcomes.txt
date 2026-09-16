@@ -1,0 +1,15 @@
+=== RUN   TestWindowPathServiceSettledLargeMessageCapacityChanges
+--- PASS: TestWindowPathServiceSettledLargeMessageCapacityChanges (0.81s)
+=== RUN   TestWindowPathServiceCapacityIncreaseRecovery
+--- PASS: TestWindowPathServiceCapacityIncreaseRecovery (0.11s)
+=== RUN   TestWindowPathServiceLongCompressedFeedback
+--- PASS: TestWindowPathServiceLongCompressedFeedback (0.83s)
+=== RUN   TestWindowPathServiceAcrossRepeatedDrains
+--- PASS: TestWindowPathServiceAcrossRepeatedDrains (23.61s)
+=== RUN   TestWindowPathServiceCapacityChanges
+--- PASS: TestWindowPathServiceCapacityChanges (8.56s)
+=== RUN   TestWindowPathServicesShareFiniteRelay
+--- PASS: TestWindowPathServicesShareFiniteRelay (10.38s)
+=== RUN   TestWindowPathServiceRoundTripChanges
+--- PASS: TestWindowPathServiceRoundTripChanges (51.06s)
+PASS

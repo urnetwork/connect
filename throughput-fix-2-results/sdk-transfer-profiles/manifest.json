@@ -1,0 +1,26 @@
+{
+  "before": {
+    "sdk": {
+      "revision": "7fe75c6983dcea213a6f58d9cb0e9220be8b6534",
+      "source_sha256": "9ad042aca94051b479d893e3e16d9af5d472db6340aaed26be5bf0f5c6dbe2ea"
+    },
+    "connect": {
+      "revision": "6ec6fae2fb41be2b7aafc9636b611ba37cd29933",
+      "source_sha256": "56eec7b1968bac2214224b2d7975f849d0fe6efef53cd9322eb11a01b31bc6ef"
+    }
+  },
+  "after": {
+    "sdk": {
+      "revision": "7fe75c6983dcea213a6f58d9cb0e9220be8b6534",
+      "source_sha256": "9ad042aca94051b479d893e3e16d9af5d472db6340aaed26be5bf0f5c6dbe2ea"
+    },
+    "connect": {
+      "revision": "6ec6fae2fb41be2b7aafc9636b611ba37cd29933",
+      "source_sha256": "56eec7b1968bac2214224b2d7975f849d0fe6efef53cd9322eb11a01b31bc6ef"
+    }
+  },
+  "sources_stable_during_build": true,
+  "binary_sha256": "dafd59978ad193f4d50b9bec5d278aeed9dd8e5339b6648146b7d3c5edb547d6",
+  "overlay_sha256": "544c90465b207502db43474aec5293231473ce20fffb889a9ad9e01e2677af15",
+  "scope": "SDK constructor and pure sizing helpers; host-selected mobile policy; no network client or mobile runtime claim"
+}

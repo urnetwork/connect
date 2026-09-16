@@ -1065,21 +1065,37 @@ That result does not validate the later rebucketing source.
 The existing 48 MiB performance fixture does not exercise actual SDK constructor
 budgets. `tools/throughput-fix-2-sdk-settings.py` captures the real constructors
 and sizing helpers through an overlay without creating network clients or
-changing the sibling SDK checkout. Eight profiles cover connect's zero/384 MiB
-process budgets and desktop/mobile device/provider defaults with providing on
-or off. Nil pools remain distinct from non-nil zero budgets.
+changing the sibling SDK checkout. The initial eight-profile capture is retained;
+the expanded capture has 11 profiles covering connect's zero/384 MiB process
+budgets, desktop/mobile device/provider defaults with providing on or off, and
+explicit mobile H1 policy. Nil pools remain distinct from non-nil zero budgets.
 
 The captured desktop device target is 20 MiB. The selected mobile profile uses
 a 24 MiB device target with a 32 MiB process budget, smaller queue bounds and
-retained receive accounting. The archive pins SDK revision `7fe75c69` and
-connect source `5f28f158`; this is host-selected policy observation, not evidence
-from a mobile runtime or application override.
+retained receive accounting. The expanded archive pins SDK revision `7fe75c69`
+and connect source `56eec7b1`; the earlier archive retains source `5f28f158`.
+Both are host-selected policy observations, not evidence from a mobile runtime
+or application override. Actual helper order matters: provider send/receive
+pools are independent, Pack budgets are shared with the device, and explicit
+mobile H1 selects eight lanes with divided count queues and unchanged byte caps.
+The performance fixture preserves these Transfer limits after policy selection.
 
-Next add bidirectional cells using the resolved profiles, including mixed peers,
-provider mode and shared pool pressure. Compare each against its attainable
-constant-window reference under the same explicit limits. Do not interpret
-a configured receive ceiling as a pacing defect or claim constructor capture
-supplies the missing performance evidence.
+Two new normal model tests use the pinned 40-field fixture. Every profile is
+paired with the 384 MiB server in both directions at 0.3/100/400 ms RTT and
+one/eight flows (132 pairs); explicit mobile H1 profiles add simultaneous
+bidirectional traffic (18 pairs). The first run passes the one-way test but
+fails the provider's 0.3 ms/eight-flow duplex cell: its reverse direction drops
+from 587.20256 to 428.41088 Mb/s with zero recorded drops. All 300 readings
+remain in `sdk-transfer-model-first` on source `3242678e`.
+
+The current gates check each direction against its own constrained reference,
+both arms' flow progress and receive refusals, the reference's window/feedback
+lower bound, and release of every attached pool at shutdown. They must be rerun
+on the final source. Investigate service sampling and shared-pool contention
+with forced ordering before changing production limits. Keep short-cell failures
+when adding longer diagnostics. Physical H1 priority queues, native TUN and
+multiple peers sharing SDK pools need separate coverage; the direct Route model
+does not exercise those boundaries.
 
 ## 21. Separate inner-TCP replay from sustained service evidence
 
@@ -1093,13 +1109,51 @@ An overlay regression using the real `TcpSequence.runReturnRecovery` worker
 reproduces the boundary three times under virtual time. A 1,100-byte replay
 reduces a 125 MB/s service estimate to 3,536 B/s; after inner ACK progress
 reopens the sender, its next 70 KiB write waits 18.430482186 s. Preserve this
-failure-before test as diagnostic source until a production correction passes
-it. The correction must distinguish application-limited gaps from valid sparse
-serialization and preserve zero-order hold and slower fresh evidence.
+failure-before evidence alongside the corrected normal test. The correction
+records locally observed idle only when all physical tails are ACKed and
+H1-confirmed and no pacing producer is reserved. A later reservation checks
+the gap before any timer/FIFO wait and marks the resumed service probe.
+Existing write/ACK confirmation commits the new epoch while preserving the
+last useful rate. Already-waiting demand retains natural serialization;
+fresh slower evidence must replace the hold.
+
+Nine normal tests now cover the real replay worker, both confirmation orders,
+failed H1, queued demand, head/interior/last cancellation, delayed drain
+observation, retry invalidation, a real Pack blocked before reservation, and
+all eight shared tails. Six boundaries fail three times each before the fix;
+92 focused tests pass three times afterwards. The replay retains 125 MB/s and
+the next 70 KiB write has no virtual pacing delay. Source `5605efa7` passes
+the full 169-test correctness selection under the race detector; seven scoped
+model controls also pass, retaining 50 readings.
 
 After the deterministic fix, rerun affected host comparisons with their controls
 under the current load. These induced diagnostics do not identify every earlier
 paired host failure, and a favorable rerun cannot erase those failed outcomes.
+
+## 22. Keep probe confirmation and service evidence ordered
+
+The full rebucketing model on `56eec7b1` completes 21 passes and one failure.
+Eight flows across four service lanes on a 1 Mb/s, 100 ms RTT, 10 ms compression
+path achieve 0.82944 Mb/s against 0.94720 Mb/s for the reference. An isolated
+repeat of the same immutable binary also fails, so another test's global state
+is not required. Preserve this failure separately from the source-idle root.
+
+Investigation has forced a related ordering: a resumed controlled-drain probe
+is physically confirmed but awaits its own ACK; old coalesced heads are applied
+first and reduce the service used for queued sibling reservations. Later probe
+confirmation restores the hold after those reservations have already slowed.
+Require a deterministic test at the actual pacing handoff before a correction
+is accepted. Review missing probe replies, natural drains, failed/retried writes,
+cancellation and fresh faster/slower service. A provisional hold must not hide
+a real RTT or capacity increase; retain those transition tests as independent
+performance gates.
+
+The SDK provider duplex failure also remains after the source-idle fix: one of
+three exact-cell repetitions reaches 542.57664 versus 620.00128 Mb/s in the
+return direction. Preserve all repetitions and diagnose before attributing it
+to the controlled-probe root. The optional path trace queries the estimator and
+can update its held service value, so traced passes alone cannot establish that
+ordinary untraced traffic is correct.
 
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md

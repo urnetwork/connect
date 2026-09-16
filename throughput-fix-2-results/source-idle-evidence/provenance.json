@@ -1,0 +1,50 @@
+{
+  "after": {
+    "failed_tests": 0,
+    "new_root_bulk_wait_seconds": 0,
+    "new_root_service_bytes_per_second": 125000000,
+    "test_executions": 276
+  },
+  "before": {
+    "fail_count": 18,
+    "replay_bulk_wait_seconds": 18.430482186,
+    "replay_service_bytes_per_second": 3536
+  },
+  "input_sha256": {
+    "after_race": "5014b4b195933f5b6aad58e8124d717a3318e4fc91bed26b07bb6a71bd699e62",
+    "before": "df6d73482b3316fb62faf9981fb12734a932f278391f75a1510e045cf2409175",
+    "handoff.json": "10003b5b54a47e288ec8f87f15bd4a028421852af9695b641d6279c60479607c",
+    "models_after": "1f433069b7345c0d057a8cda30daa5294b54170e4e1dd1d635ac42a5ec47b1da"
+  },
+  "models_after": {
+    "limits": [
+      "Scoped controls passed; the separate frozen56 low-rate shared-service failure remains unresolved.",
+      "No host paired/reference replay or historical failure attribution is claimed.",
+      "Model binary compiled with root optional SDK/path fixture additions; unselected options preserve ordinary one-way controls.",
+      "Production pacing overlay unchanged between model run and final deterministic tests."
+    ],
+    "service_readings": 50,
+    "tests": [
+      "TestWindowPathServiceSettledLargeMessageCapacityChanges",
+      "TestWindowPathServiceCapacityIncreaseRecovery",
+      "TestWindowPathServiceLongCompressedFeedback",
+      "TestWindowPathServiceAcrossRepeatedDrains",
+      "TestWindowPathServiceCapacityChanges",
+      "TestWindowPathServicesShareFiniteRelay",
+      "TestWindowPathServiceRoundTripChanges"
+    ]
+  },
+  "overlay_hashes": {
+    "after": "503717787827f5432ff982f2f92078d03eb4b5458dd141b16d92a182aee5fe47",
+    "before": "51e13e9b0114b9e9c3cba2d10f0093c47ef775bdc41434c95659d74030fb1324"
+  },
+  "purpose": "Sanitized evidence for the source-idle pacing correction. Raw logs, generated overlays, source copies, and test binaries remain outside this archive.",
+  "redaction": "Only test outcomes, assertions, numerical service-reading ledgers, and hashes are retained. No raw log, source, overlay JSON, or binary is copied.",
+  "source": {
+    "canonical_source_sha256": "5605efa750834abb352be42548f7c20cd55f56d154a2837dc5996e8b580180f7",
+    "parent_commit": "6ec6fae2",
+    "production_after_sha256": "c3aa8b115da61d1acc7ec90d572377301ab8f66f10ec6fb64f4217daea847592",
+    "production_before_sha256": "8ae252587008d23c35c0eab2c15fb395a4026849089cb178630bfdcd5477229b",
+    "test_sha256": "0b285e848633f07419f28fee4bd03e943d05e2ed7774fee3c8cb5a079673897c"
+  }
+}

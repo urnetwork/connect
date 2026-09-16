@@ -1,0 +1,67 @@
+{
+  "artifact": "sanitized source-idle host and exact SDK follow-up diagnostics",
+  "contents": [
+    {
+      "bytes": 2402,
+      "name": "host-bracket-status.json",
+      "sha256": "5d78a857d035e05c2ce713eb6bb6f82f961df3d1956cfa47958ed17aca9eda64"
+    },
+    {
+      "bytes": 2309,
+      "name": "host-comparisons.json",
+      "sha256": "16290ced967b1ec4e8e11d3a40f53ef30840c9f6bc6bf0a2def0e3838a11465d"
+    },
+    {
+      "bytes": 49897,
+      "name": "host-readings.jsonl",
+      "sha256": "0e79c00793a46b9b68d09deb7940722ef9bf2ff41c6d89235e81ffeb7f22c832"
+    },
+    {
+      "bytes": 2758,
+      "name": "host-summary.json",
+      "sha256": "af4998199f7cd3f57d4e916dd12e6dee49d9cc39c50ce98fbe5a62b1621b2063"
+    },
+    {
+      "bytes": 642,
+      "name": "outcomes.txt",
+      "sha256": "f6fefdf90226731526cad63fbde589cd38ed9855513f3737165b32182c16545a"
+    },
+    {
+      "bytes": 4838,
+      "name": "provenance.json",
+      "sha256": "ea1a4dcab480ec995cd12c9c841cfdb956a14013ee0ce98717d1948131ac3b0f"
+    },
+    {
+      "bytes": 4713,
+      "name": "sdk-duplex-comparisons.json",
+      "sha256": "e33ad6cd3a7faa74ef8f0ecdd6871dcf478fdebaeb6f1523c3ee7a69fcef4c93"
+    },
+    {
+      "bytes": 47948,
+      "name": "sdk-duplex-readings.jsonl",
+      "sha256": "d3dd1c750bafa0ecc07aad304260055911462dbccc45b1339c41d07d21ce80df"
+    },
+    {
+      "bytes": 768,
+      "name": "sdk-duplex-status.json",
+      "sha256": "4d49535e9a2dcb2daafde4ee4375e1cd892d6516a8d20101b5ed793bd546d0b1"
+    }
+  ],
+  "host": {
+    "censored_comparisons": 0,
+    "comparisons": 2,
+    "failed_comparisons": 0,
+    "intervals": 96,
+    "nat_replay_samples": "zero in every arm",
+    "passed_comparisons": 2,
+    "readings": 8
+  },
+  "schema": "throughput-fix-2/source-idle-followup-manifest-v1",
+  "sdk_provider_duplex": {
+    "executions": 3,
+    "failed_executions": 1,
+    "passed_executions": 2,
+    "raw_log_sha256": "0b447d0d5aa353a309dad5e4eb5d9defb3d91c573035dae3de248c39a1e293a3",
+    "readings": 6
+  }
+}

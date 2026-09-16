@@ -271,6 +271,9 @@ func (self *windowBurstPacer) waitForServiceWriteStarted(ctx context.Context, by
 	}
 	self.service.removeWaiterWithLock(&self.waiter)
 	self.service.pacingReservations--
+	if err != nil && self.service.drained && self.service.pacingReservations == 0 {
+		self.service.sourceIdleAt = time.Now()
+	}
 	if !resend {
 		self.service.reservedByteCount -= ByteCount(byteCount)
 	}
@@ -355,6 +358,7 @@ type windowPacingService struct {
 	drainUntil          time.Time
 	drainWake           chan struct{}
 	drainServiceEpoch   bool
+	sourceIdleAt        time.Time
 	bucketInterval      time.Duration
 	writes              map[Id]windowPacingWrite
 	pendingWrites       int
@@ -404,6 +408,9 @@ func (self *windowPacingService) acknowledgeWrite(sequenceId, messageId Id, numb
 			self.drained = self.pendingWrites == 0 && write.generation == self.drainGeneration
 			if self.drained {
 				self.drainedSent = self.sent - self.reservedByteCount
+				if self.pacingReservations == 0 {
+					self.sourceIdleAt = time.Now()
+				}
 			}
 		}
 		self.writes[sequenceId] = write
@@ -432,6 +439,7 @@ func (self *windowPacingService) beginWrite(sequenceId, messageId Id, number uin
 func (self *windowPacingService) beginWriteWithLock(sequenceId, messageId Id, number uint64, at time.Time, resend bool) {
 	unqueued := self.drained && !resend
 	self.drained = false
+	self.sourceIdleAt = time.Time{}
 	if self.writes == nil {
 		self.writes = map[Id]windowPacingWrite{}
 	}
@@ -455,6 +463,7 @@ func (self *windowPacingService) invalidateProbe(sequenceId Id) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.drainServiceEpoch = false
+	self.sourceIdleAt = time.Time{}
 	if self.roundTripProbe.sequenceId == sequenceId {
 		self.roundTripProbe = windowPacingRoundTripProbe{}
 	}
@@ -479,6 +488,9 @@ func (self *windowPacingService) finishWrite(sequenceId, messageId Id, h1 bool) 
 			self.drained = self.pendingWrites == 0 && write.generation == self.drainGeneration
 			if self.drained {
 				self.drainedSent = self.sent - self.reservedByteCount
+				if self.pacingReservations == 0 {
+					self.sourceIdleAt = time.Now()
+				}
 			}
 		}
 		self.writes[sequenceId] = write
@@ -500,7 +512,7 @@ func (self *windowPacingService) applyRoundTripProbeWithLock() {
 	probe := self.roundTripProbe
 	if probe.written && !probe.ackedAt.IsZero() {
 		self.roundTripProbe = windowPacingRoundTripProbe{}
-		// A requested drain contains local idle, not serialization. Keep
+		// A drained pause contains local idle, not serialization. Keep
 		// the established rate until the resumed train measures service.
 		if probe.resetService {
 			self.serviceEpochAt, self.serviceHoldRate = probe.ackedAt, probe.serviceRate
@@ -524,6 +536,14 @@ type windowServiceSample struct {
 func (self *windowPacingService) reserve(now time.Time, byteCount int, rate, estimateRate, probeRate, probeLimit ByteCount, resend bool, waiter *windowPacingWaiter) time.Time {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	// A source with no physical flight or pacing demand can pause for
+	// inner feedback. Its first isolated reply measures that local gap,
+	// not serialization. Observe demand before reservation/timer waits.
+	if !resend && self.drained && self.pacingReservations == 0 && !self.sourceIdleAt.IsZero() &&
+		now.Sub(self.sourceIdleAt) >= max(deliverySizedWindowSampleInterval, self.bucketInterval, self.compression) {
+		self.drainServiceEpoch = true
+	}
+	self.sourceIdleAt = time.Time{}
 	if waiter.ready == nil {
 		waiter.ready = make(chan struct{}, 1)
 	}
@@ -1001,6 +1021,7 @@ func (self *windowBurstPacer) close() {
 				// older sibling ACK cannot certify the canceled tail drained.
 				self.service.drainGeneration++
 				self.service.drained = false
+				self.service.sourceIdleAt = time.Time{}
 			}
 			delete(self.service.writes, self.serviceSequenceId)
 		}

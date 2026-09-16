@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reproduce the local window research without the PR author's native rig.
 # Usage: tools/throughput-fix-2.sh MODE [output-dir]
-# Modes: correctness, model, regression, ack, packet, tcp, server,
+# Modes: correctness, model, sdk-model, regression, ack, packet, tcp, server,
 #        server-integration, server-functional, server-tcp, server-proxy,
 #        server-connect-deterministic.
 set -euo pipefail
@@ -24,7 +24,11 @@ case "$mode" in
     build_flags=(-race)
     ;;
   model)
-    pattern='^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*)$'
+    pattern='^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*|TestWindowPathSdk.*)$'
+    build_flags=(-race=false)
+    ;;
+  sdk-model)
+    pattern='^TestWindowPathSdk.*$'
     build_flags=(-race=false)
     ;;
   regression)
@@ -107,7 +111,8 @@ def command(*args, cwd=None):
     return subprocess.check_output(args, cwd=cwd, text=True).strip()
 def source_manifest(root):
     names = command('git', 'ls-files', '--cached', '--others', '--exclude-standard',
-                    '--', '*.go', '*.proto', 'go.mod', 'go.sum', cwd=root).splitlines()
+                    '--', '*.go', '*.proto', 'go.mod', 'go.sum',
+                    'testdata/window_sdk_profiles.json', cwd=root).splitlines()
     digest = hashlib.sha256()
     for name in sorted(set(names)):
         path = pathlib.Path(root, name)
@@ -153,7 +158,8 @@ for name in ('connect', 'server'):
     root = repo if name == 'connect' else repo.parent / 'server'
     names = subprocess.check_output(
         ['git', 'ls-files', '--cached', '--others', '--exclude-standard',
-         '--', '*.go', '*.proto', 'go.mod', 'go.sum'], cwd=root, text=True).splitlines()
+         '--', '*.go', '*.proto', 'go.mod', 'go.sum',
+         'testdata/window_sdk_profiles.json'], cwd=root, text=True).splitlines()
     digest = hashlib.sha256()
     for filename in sorted(set(names)):
         path = root / filename

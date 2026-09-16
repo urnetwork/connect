@@ -49,6 +49,7 @@ Reproduce with [tools/throughput-fix-2.sh](../tools/throughput-fix-2.sh).
 It checks that Go/protobuf/module sources stay unchanged during compilation,
 records the binary hash and safe experiment environment, and preserves every
 reading and the test process's exit status.
+The source digest also includes the embedded SDK profile fixture.
 
 ## Burst and statistics follow-up
 
@@ -78,22 +79,43 @@ immediately under recorded concurrent host work.
 
 `correctness-burst-ring-rtt-resize` passes 160 race-enabled tests on source
 `56eec7b1`, after preserving delivery checkpoints across bucket-duration changes.
-The preceding full model does not validate this later source.
+Its `model-burst-ring-rtt-resize` full run completes 21 passing tests and one
+slow shared-service failure, with all 510 readings retained. The preceding
+passing model does not supersede this later failed result.
 `rtt-resize-evidence` retains the direct and intermediate failures, 93 focused
 race passes, 23 passing model pairs and the complete recovery comparison rows.
 
 `host-feedback-controlled-epoch` retains eight induced host readings and a
 three-run deterministic failure through the real inner-TCP replay worker.
-This root is explicitly unfixed. Its synthetic test source has a `.go.txt`
-extension so the diagnostic is reviewable without entering the normal passing
-suite. These single-arm diagnostics are not A/A-bracketed acceptance comparisons;
+The original synthetic test source retains its `.go.txt` extension; the corrected
+normal regression now lives in `transfer_window_host_feedback_test.go`.
+These single-arm diagnostics are not A/A-bracketed acceptance comparisons;
 their controls, scheduling limits and failed outcomes remain visible.
+
+`correctness-source-idle` passes 169 race-enabled tests on source `5605efa7`.
+`source-idle-evidence` retains 18 before failures, 276 passing focused race
+executions and 50 scoped model readings. The replay correction preserves the
+previous service across a proven source pause; fresh slower evidence still
+replaces that hold. Full model and host acceptance of this source remain open.
+`source-idle-followup` retains the complete before/after host brackets and exact
+SDK duplex repeats on separately pinned overlay binaries. Both host brackets
+pass but record zero sampled NAT replay events, so they do not prove repair of
+the replay root. One of three SDK repeats still fails after the correction.
 
 `sdk-settings-current` records eight constructor profiles through the sibling
 SDK's real sizing helpers. Its manifests pin SDK `7fe75c69` and connect source
 `5f28f158`; the capture includes a newer recovery test and is not represented as
 the `f60cf11d` model source. It verifies resolved settings on the host, including
 selected mobile policy, without making a mobile-runtime performance claim.
+
+`sdk-transfer-profiles` expands the capture to 11 profiles and 40 fields,
+including explicit mobile H1 queues and lanes. It pins SDK `7fe75c69` and
+connect source `56eec7b1`. The embedded test fixture carries its own digest.
+`sdk-transfer-model-first` retains all 300 readings from 150 paired Transfer
+cases on source `3242678e`: the one-way test passes and the bidirectional test
+fails in the mobile H1 provider's return direction. This run precedes the
+source-idle correction and stronger per-direction/calibration checks; it does
+not validate those later edits or physical H1/TUN behavior.
 
 Only numerical ledgers, manifests, provenance and outcome excerpts are part of
 the committed evidence. Raw logs and test binaries remain local. The collector

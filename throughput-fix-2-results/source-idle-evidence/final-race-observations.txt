@@ -1,0 +1,243 @@
+    transfer_window_host_feedback_test.go:102: replay retained service=125000000 B/s; next bulk write waited 0s
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:109: case: down
+    transfer_window_pacing_test.go:109: case: up
+    transfer_window_pacing_test.go:109: case: small-step
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=50ms
+    transfer_window_pacing_test.go:249: case: unknown
+    transfer_window_pacing_test.go:249: case: handshake
+    transfer_window_pacing_test.go:249: case: slow
+    transfer_window_pacing_test.go:249: case: target
+    transfer_window_pacing_test.go:249: case: tiny
+    transfer_window_pacing_test.go:249: case: overflow
+    transfer_window_pacing_test.go:355: case: rate=125000
+    transfer_window_pacing_test.go:355: case: rate=1250000
+    transfer_window_pacing_test.go:355: case: rate=12500000
+    transfer_window_pacing_test.go:355: case: rate=125000000
+    transfer_window_pacing_test.go:477: case: phase=0/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=0/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=1/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=1/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=2/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=2/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=3/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=3/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=4/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=4/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=5/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=5/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=6/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=6/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=7/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=7/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=8/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=8/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=9/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=9/reverse=true
+    transfer_window_pacing_test.go:512: case: immediate-half-millisecond
+    transfer_window_pacing_test.go:512: case: compressed-partial-tail
+    transfer_window_pacing_test.go:512: case: sparse-slow-service
+    transfer_window_pacing_test.go:512: case: different-sized-slow-replies
+    transfer_window_pacing_test.go:650: case: rate=125000
+    transfer_window_pacing_test.go:650: case: rate=1250000
+    transfer_window_pacing_test.go:650: case: rate=12500000
+    transfer_window_pacing_test.go:650: case: rate=125000000
+    transfer_window_pacing_wakeup_test.go:455: wake delay=1ms service fraction=0.999
+    transfer_window_pacing_wakeup_test.go:455: wake delay=3ms service fraction=0.997
+    transfer_window_host_feedback_test.go:102: replay retained service=125000000 B/s; next bulk write waited 0s
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:109: case: down
+    transfer_window_pacing_test.go:109: case: up
+    transfer_window_pacing_test.go:109: case: small-step
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=50ms
+    transfer_window_pacing_test.go:249: case: unknown
+    transfer_window_pacing_test.go:249: case: handshake
+    transfer_window_pacing_test.go:249: case: slow
+    transfer_window_pacing_test.go:249: case: target
+    transfer_window_pacing_test.go:249: case: tiny
+    transfer_window_pacing_test.go:249: case: overflow
+    transfer_window_pacing_test.go:355: case: rate=125000
+    transfer_window_pacing_test.go:355: case: rate=1250000
+    transfer_window_pacing_test.go:355: case: rate=12500000
+    transfer_window_pacing_test.go:355: case: rate=125000000
+    transfer_window_pacing_test.go:477: case: phase=0/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=0/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=1/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=1/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=2/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=2/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=3/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=3/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=4/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=4/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=5/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=5/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=6/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=6/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=7/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=7/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=8/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=8/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=9/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=9/reverse=true
+    transfer_window_pacing_test.go:512: case: immediate-half-millisecond
+    transfer_window_pacing_test.go:512: case: compressed-partial-tail
+    transfer_window_pacing_test.go:512: case: sparse-slow-service
+    transfer_window_pacing_test.go:512: case: different-sized-slow-replies
+    transfer_window_pacing_test.go:650: case: rate=125000
+    transfer_window_pacing_test.go:650: case: rate=1250000
+    transfer_window_pacing_test.go:650: case: rate=12500000
+    transfer_window_pacing_test.go:650: case: rate=125000000
+    transfer_window_pacing_wakeup_test.go:455: wake delay=1ms service fraction=0.999
+    transfer_window_pacing_wakeup_test.go:455: wake delay=3ms service fraction=0.997
+    transfer_window_host_feedback_test.go:102: replay retained service=125000000 B/s; next bulk write waited 0s
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:109: case: down
+    transfer_window_pacing_test.go:109: case: up
+    transfer_window_pacing_test.go:109: case: small-step
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=50ms
+    transfer_window_pacing_test.go:249: case: unknown
+    transfer_window_pacing_test.go:249: case: handshake
+    transfer_window_pacing_test.go:249: case: slow
+    transfer_window_pacing_test.go:249: case: target
+    transfer_window_pacing_test.go:249: case: tiny
+    transfer_window_pacing_test.go:249: case: overflow
+    transfer_window_pacing_test.go:355: case: rate=125000
+    transfer_window_pacing_test.go:355: case: rate=1250000
+    transfer_window_pacing_test.go:355: case: rate=12500000
+    transfer_window_pacing_test.go:355: case: rate=125000000
+    transfer_window_pacing_test.go:477: case: phase=0/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=0/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=1/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=1/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=2/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=2/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=3/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=3/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=4/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=4/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=5/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=5/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=6/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=6/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=7/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=7/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=8/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=8/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=9/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=9/reverse=true
+    transfer_window_pacing_test.go:512: case: immediate-half-millisecond
+    transfer_window_pacing_test.go:512: case: compressed-partial-tail
+    transfer_window_pacing_test.go:512: case: sparse-slow-service
+    transfer_window_pacing_test.go:512: case: different-sized-slow-replies
+    transfer_window_pacing_test.go:650: case: rate=125000
+    transfer_window_pacing_test.go:650: case: rate=1250000
+    transfer_window_pacing_test.go:650: case: rate=12500000
+    transfer_window_pacing_test.go:650: case: rate=125000000
+    transfer_window_pacing_wakeup_test.go:455: wake delay=1ms service fraction=0.999
+    transfer_window_pacing_wakeup_test.go:455: wake delay=3ms service fraction=0.997

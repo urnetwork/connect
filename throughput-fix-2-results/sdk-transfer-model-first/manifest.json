@@ -1,0 +1,35 @@
+{
+  "created_utc": "2026-09-16T01:14:05.572152+00:00",
+  "mode": "sdk-model",
+  "test_pattern": "^TestWindowPathSdk.*$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "6ec6fae2fb41be2b7aafc9636b611ba37cd29933",
+    "branch": "throughput-fix-2",
+    "source_sha256": "3242678e153855359b5c044d18b1dd1020184ee67c09b2b4db98cce0162a70ee",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "db3cfeac62e50c387873884078857be9fd510c5bf6e6048271abcf92224711c1",
+  "host_load_average_at_start": [
+    13.9970703125,
+    14.5205078125,
+    16.43896484375
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "SDK transfer-profile model validation started immediately while the frozen RTT-resize model, root fixture review, and peer work were active; no quiescence wait."
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "binary_sha256": "663a314bc423e898e23c5cdb6f7272ba48bba20d38a09ae7e4e01ef228a50550",
+  "sources_stable_during_build": true
+}

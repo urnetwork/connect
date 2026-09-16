@@ -322,6 +322,10 @@ func TestWindowPathSlowLinkKeepsCapacity(t *testing.T) {
 }
 
 type windowPathCell struct {
+	SenderProfile        *windowPathEndpointProfile `json:",omitempty"`
+	ReceiverProfile      *windowPathEndpointProfile `json:",omitempty"`
+	ProfileFixtureSha256 string                     `json:",omitempty"`
+	Bidirectional        bool                       `json:",omitempty"`
 	CalibrationWindow    ByteCount
 	SendWindow           ByteCount
 	ReceiveWindow        ByteCount
@@ -357,6 +361,7 @@ type windowPathReading struct {
 	Mbps                  float64
 	MinFlowMbps           float64
 	IntervalMbps          []float64
+	DirectionMbps         []float64 `json:",omitempty"`
 	RelayDrops            int64
 	MeasurementRelayDrops int64
 	NatRefused            int64
@@ -366,6 +371,7 @@ type windowPathReading struct {
 	Receiver              ClientReceiveStatsSnapshot
 	SenderReceive         ClientReceiveStatsSnapshot
 	Window                SendWindowEstimate
+	ReverseWindow         SendWindowEstimate `json:",omitzero"`
 }
 
 // Measures receiver bytes over one common interval. Construction, warmup and
@@ -373,8 +379,14 @@ type windowPathReading struct {
 // a measurement of H1 sockets, a native kernel TUN, or provider TCP.
 func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Duration) windowPathReading {
 	t.Helper()
+	if cell.Bidirectional && cell.Tcp {
+		t.Fatal("bidirectional fixture currently requires the raw Transfer workload")
+	}
+	if (cell.SenderProfile == nil) != (cell.ReceiverProfile == nil) {
+		t.Fatal("both endpoint profiles are required")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	settings := func() *ClientSettings {
+	settings := func(profile *windowPathEndpointProfile) *ClientSettings {
 		s := DefaultClientSettings()
 		s.Log = NewNoopLogger()
 		s.EncryptionSettings.Mode = EncryptionModeOff
@@ -414,9 +426,19 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 				s.SendBufferSettings.ResendQueueMaxByteCount = cell.CalibrationWindow
 			}
 		}
+		if profile != nil {
+			profile.apply(s)
+			if s.MinimumMessageLenLimit() != profile.MinimumMessageLimit {
+				t.Fatal("profile message limit differs from the constructor capture")
+			}
+		}
 		return s
 	}
-	senderSettings, receiverSettings := settings(), settings()
+	senderSettings, receiverSettings := settings(cell.SenderProfile), settings(cell.ReceiverProfile)
+	if cell.SenderProfile != nil && cell.Arm == "ceiling" {
+		senderSettings.SendBufferSettings.ResendQueueMaxByteCount = cell.SenderProfile.windowLimit(cell.ReceiverProfile)
+		receiverSettings.SendBufferSettings.ResendQueueMaxByteCount = cell.ReceiverProfile.windowLimit(cell.SenderProfile)
+	}
 	dataSenderSettings, dataReceiverSettings := senderSettings, receiverSettings
 	if cell.Upload {
 		dataSenderSettings, dataReceiverSettings = receiverSettings, senderSettings
@@ -464,55 +486,69 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		ackLink.rateChangeAfter = cell.RateChangeAfter
 		ackLink.dropOnFull = cell.Drop
 	}
+	if cell.Bidirectional {
+		ackLink.rate, ackLink.rateAfter, ackLink.rateChangeAfter = cell.Rate, cell.RateAfter, cell.RateChangeAfter
+		ackLink.dropOnFull = cell.Drop
+	}
 	workers.Go(func() { dataLink.run(ctx, sendOut, receiveIn) })
 	workers.Go(func() { ackLink.run(ctx, receiveOut, sendIn) })
-	counts := make([]atomic.Int64, cell.Flows)
+	directions := 1
+	if cell.Bidirectional {
+		directions = 2
+	}
+	counts := make([]atomic.Int64, directions*cell.Flows)
 	var natRefused atomic.Int64
 	cleanupWorkload := func() {}
 	if cell.Tcp {
 		cleanupWorkload = startWindowTcpWorkload(t, ctx, sender, receiver, counts, cell.Upload, &natRefused, cell.TcpBufferMax)
 	} else {
-		receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
-			for _, frame := range frames {
-				if len(frame.MessageBytes) != 0 {
-					flow := int(frame.MessageBytes[0])
-					if flow < len(counts) {
-						counts[flow].Add(int64(len(frame.MessageBytes)))
-					}
-				}
+		for direction := range directions {
+			source, destination, lanes := sender, receiver, senderSettings.SendBufferSettings.LogicalDataLaneCount
+			if cell.Upload != (direction == 1) {
+				source, destination, lanes = receiver, sender, receiverSettings.SendBufferSettings.LogicalDataLaneCount
 			}
-		})
-		producers := cell.Flows
-		if cell.RoundRobinOffer {
-			producers = max(1, min(cell.Lanes, cell.Flows))
-		}
-		for producer := range producers {
-			workers.Go(func() {
-				flow := producer
-				for ctx.Err() == nil {
-					payload := MessagePoolGet(cell.Payload)
-					clear(payload)
-					payload[0] = byte(flow)
-					frame := &protocol.Frame{MessageType: protocol.MessageType_IpIpPacketFromProvider, MessageBytes: payload, Raw: true}
-					key := TransferKey{}
-					if cell.Lanes > 0 {
-						key.LogicalLane = uint32(flow%cell.Lanes + 1)
-					}
-					if ok, err := sender.SendWithTimeoutDetailed(frame, receiver.ClientId(), nil, -1, key); !ok {
-						MessagePoolReturn(payload)
-						if ctx.Err() == nil {
-							t.Errorf("performance producer: %v", err)
-						}
-						return
-					}
-					if cell.RoundRobinOffer {
-						flow += producers
-						if flow >= cell.Flows {
-							flow = producer
+			destination.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
+				for _, frame := range frames {
+					if len(frame.MessageBytes) != 0 {
+						flow := int(frame.MessageBytes[0])
+						if flow < cell.Flows {
+							counts[direction*cell.Flows+flow].Add(int64(len(frame.MessageBytes)))
 						}
 					}
 				}
 			})
+			producers := cell.Flows
+			if cell.RoundRobinOffer {
+				producers = max(1, min(lanes, cell.Flows))
+			}
+			for producer := range producers {
+				workers.Go(func() {
+					flow := producer
+					for ctx.Err() == nil {
+						payload := MessagePoolGet(cell.Payload)
+						clear(payload)
+						payload[0] = byte(flow)
+						frame := &protocol.Frame{MessageType: protocol.MessageType_IpIpPacketFromProvider, MessageBytes: payload, Raw: true}
+						key := TransferKey{}
+						if lanes > 0 {
+							key.LogicalLane = uint32(flow%lanes + 1)
+						}
+						if ok, err := source.SendWithTimeoutDetailed(frame, destination.ClientId(), nil, -1, key); !ok {
+							MessagePoolReturn(payload)
+							if ctx.Err() == nil {
+								t.Errorf("performance producer: %v", err)
+							}
+							return
+						}
+						if cell.RoundRobinOffer {
+							flow += producers
+							if flow >= cell.Flows {
+								flow = producer
+							}
+						}
+					}
+				})
+			}
 		}
 	}
 	defer func() {
@@ -529,6 +565,14 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		for _, route := range []Route{sendOut, sendIn, receiveOut, receiveIn} {
 			for len(route) != 0 {
 				MessagePoolReturn(<-route)
+			}
+		}
+		for _, settings := range []*ClientSettings{senderSettings, receiverSettings} {
+			for _, budget := range []*TransferMemoryBudget{settings.SendBufferSettings.ResendQueueBudget,
+				settings.ReceiveBufferSettings.ReceiveQueueBudget, settings.ReceiveBufferSettings.PackQueueBudget} {
+				if budget != nil && budget.UsedByteCount() != 0 {
+					t.Errorf("performance endpoint retained %d budget bytes after close", budget.UsedByteCount())
+				}
 			}
 		}
 	}()
@@ -620,6 +664,9 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	if cell.Upload {
 		dropsBefore = ackLink.dropped.Load()
 	}
+	if cell.Bidirectional {
+		dropsBefore = dataLink.dropped.Load() + ackLink.dropped.Load()
+	}
 	before := make([]int64, len(counts))
 	for i := range counts {
 		before[i] = counts[i].Load()
@@ -639,11 +686,13 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		previousTime, previousBytes = now, delivered
 	}
 	elapsed := time.Since(start)
-	reading := windowPathReading{Cell: cell, WarmupSeconds: warmup.Seconds(), Seconds: elapsed.Seconds(), MinFlowMbps: 1e20, IntervalMbps: intervalMbps}
+	reading := windowPathReading{Cell: cell, WarmupSeconds: warmup.Seconds(), Seconds: elapsed.Seconds(), MinFlowMbps: 1e20, IntervalMbps: intervalMbps,
+		DirectionMbps: make([]float64, directions)}
 	for i := range counts {
 		delivered := counts[i].Load() - before[i]
 		reading.Bytes += delivered
 		reading.MinFlowMbps = min(reading.MinFlowMbps, float64(delivered)*8/elapsed.Seconds()/1e6)
+		reading.DirectionMbps[i/cell.Flows] += float64(delivered) * 8 / elapsed.Seconds() / 1e6
 	}
 	reading.Mbps = float64(reading.Bytes) * 8 / elapsed.Seconds() / 1e6
 	reading.NatRefused = natRefused.Load()
@@ -661,6 +710,15 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	reading.Receiver = receiver.ReceiveStats()
 	reading.SenderReceive = sender.ReceiveStats()
 	reading.Window = statsSource.DestinationSendStats(statsDestination).SendWindow
+	if cell.Bidirectional {
+		reading.RelayDrops = dataLink.dropped.Load() + ackLink.dropped.Load()
+		reading.MaxRelayQueued = max(dataLink.maxQueued.Load(), ackLink.maxQueued.Load())
+		reading.MaxRelayQueuedBytes = max(dataLink.maxQueuedBytes.Load(), ackLink.maxQueuedBytes.Load())
+		reading.ReverseWindow = receiver.DestinationSendStats(sender.ClientId()).SendWindow
+		if cell.Upload {
+			reading.ReverseWindow = sender.DestinationSendStats(receiver.ClientId()).SendWindow
+		}
+	}
 	reading.MeasurementRelayDrops = reading.RelayDrops - dropsBefore
 	return reading
 }

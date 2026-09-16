@@ -11,6 +11,23 @@ The original full-suite results do not validate those later production edits.
 
 ## Current follow-up
 
+The latest correction prevents a small inner-TCP replay after source idle from
+replacing established service with the apparent rate across that idle gap.
+Its source, `5605efa750834abb352be42548f7c20cd55f56d154a2837dc5996e8b580180f7`,
+passes **169 correctness tests under the race detector**. Nine normal regression
+tests cover the replay and adjacent ordering/cancellation boundaries; six
+failure cases fail three times each before the correction. Focused validation
+passes 92 tests three times and seven model controls with 50 retained readings.
+All runs started immediately under recorded concurrent work.
+
+**Performance acceptance remains open.** The preceding bucket-resize source's
+full model completed with 21 passing tests and one failure in slow shared-service
+traffic. The new SDK Transfer matrix completed 150 paired cases and exposed a
+mobile-provider bidirectional regression. Neither a passing focused rerun nor
+the source-idle correction establishes that these separate failures are fixed.
+The SDK gates now also check each direction and reference calibration; the full
+matrix has not been rerun with those strengthened checks on the latest source.
+
 The controlled-drain correction distinguishes naturally empty flights from
 deliberate pacing pauses. It passes **156 tests under the race detector** and
 the full deterministic model: **21 tests, 272 paired cases and 508 ledger rows**
@@ -21,8 +38,8 @@ A further recovery test found that changing the statistics bucket duration
 erased valid delivery evidence. The correction below preserves that evidence;
 it passes **160 race-enabled correctness tests and 23 targeted performance
 comparisons** on source `56eec7b1968bac2214224b2d7975f849d0fe6efef53cd9322eb11a01b31bc6ef`.
-That validation is separate from the completed controlled-drain matrix.
-Host performance acceptance remains open.
+Its later full-model failure is detailed below. These source checkpoints are
+separate from the latest source-idle correction and its validation.
 
 The burst-ring follow-up adds deterministic failure-before tests for sparse
 ACK timing, FIFO fairness, continuous-flight RTT changes, the production
@@ -523,8 +540,17 @@ feedback, capacity changes, shared service and RTT changes. Their 46 readings
 remain complete. In the original 10–13.3554432 s diagnostic, the corrected
 candidate reaches 10.000 Mb/s against its 10.000 Mb/s reference. The long-feedback
 control retains 95.857 Mb/s against 95.846 Mb/s. These runs started immediately
-under concurrent host work; full model and host confirmation of this source
-remain open.
+under concurrent host work.
+
+The subsequent full model on this same `56eec7b1` source completes **21 passing
+tests and one failure**, retaining all 510 rows (273 paired cases).
+`TestWindowPathServicesShareFiniteRelay` reaches 0.82944 Mb/s against a
+0.94720 Mb/s reference at 1 Mb/s link capacity, 100 ms RTT, 10 ms compression
+and eight flows across four lanes. Every flow progresses and recorded drops
+are zero, but 87.6% of the reference fails the unchanged 90% gate. Repeating
+the isolated test on the same immutable binary also produces a failure; this
+is not explained by another test mutating global state. The failed run remains
+in `model-burst-ring-rtt-resize`.
 
 ### Separate host feedback-idle failure
 
@@ -541,9 +567,82 @@ bytes of receive space, but the next 70,646-byte Transfer write waits about
 17 s. A deterministic test using the real `TcpSequence.runReturnRecovery`
 worker reproduces the same mechanism three times: a 1,100-byte replay replaces
 125 MB/s with 3,536 B/s and delays the next 70 KiB write by 18.430482186 s.
-The test and failed outcomes are retained as diagnostic evidence; the production
-correction and normal regression test remain open. This cause is distinct from
-bucket resizing and does not yet attribute all earlier host failures.
+The original test and failed outcomes remain in `host-feedback-controlled-epoch`.
+This cause is distinct from bucket resizing and does not attribute all earlier
+host failures.
+
+The correction records source idle only after every physical tail has both its
+cumulative ACK and successful H1 write confirmation, with no pacing reservation
+waiting. It uses the local observation time, so an old ACK timestamp cannot
+invent idle. The next producer checks that boundary before reserving or waiting;
+a gap of at least the sampling, bucket and ACK-compression intervals marks the
+next write as a service-epoch probe. Existing confirmation logic retains the
+last measured service until fresh evidence replaces it. Natural serialization
+with an already-waiting producer keeps its original measurement span.
+
+The replay regression now retains 125 MB/s and the resumed 70 KiB write waits
+zero virtual time. Adjacent tests force ACK-before-write confirmation, failed
+confirmation, head/interior/last reservation cancellation, delayed ACK handling,
+retry invalidation, all eight sibling tails, and real `SendSequence.Pack` waiting
+before its pacing reservation. A fresh slower train must replace the held value;
+the correction does not restart at an optimistic target. The normal source-idle
+tests and before/after evidence are in `transfer_window_host_feedback_test.go`
+and `source-idle-evidence`; the full 169-test race run is in
+`correctness-source-idle`.
+
+A separate ordering remains under investigation in the slow shared-service
+cell: after a controlled drain, coalesced old heads can lower the service used
+by sibling reservations before the resumed probe's own ACK confirms its new
+epoch. The source-idle correction does not cover that pre-confirmation interval.
+Host confirmation and the SDK duplex failure also remain separate gates.
+
+A subsequent matched host experiment uses identical 80 ms inner-ACK pauses and
+1.3 ms RTT overrides in every arm, with pacing-estimator tracing disabled.
+Both brackets pass: before, 934.41 Mb/s candidate versus 933.92 Mb/s ceiling;
+after, 929.87 versus 929.15 Mb/s. A/A drift is 3.34% and 1.53%, respectively.
+Every arm records zero sampled NAT replay events, so these checks did not
+trigger the replay root and cannot establish host repair. All eight readings,
+96 intervals and comparison outcomes are retained in `source-idle-followup`.
+
+### Resolved SDK Transfer profiles and bidirectional traffic
+
+The constructor capture now retains 11 profiles with 40 allowlisted fields,
+including explicit mobile H1 policy, lane counts, queue limits, handoff settings
+and independently allocated provider send/receive pools. The pinned fixture
+`testdata/window_sdk_profiles.json` is included in the runner's source digest.
+Profiles are applied after choosing the experimental policy, so the shared
+48 MiB baseline cannot overwrite a constrained endpoint's actual limits.
+
+`TestWindowPathSdkProfiles` compares every profile with the budgeted server in
+both directions, at 0.3/100/400 ms RTT and one/eight flows: 132 paired cases.
+`TestWindowPathSdkBidirectional` adds 18 pairs with both directions carrying
+data and compressed ACKs through their finite FIFO. Each arm retains its
+resolved settings, rates by direction, pool/queue limits and refusal counters.
+The reference obeys the same memory and advertised receive ceilings.
+
+The first complete run, source
+`3242678e153855359b5c044d18b1dd1020184ee67c09b2b4db98cce0162a70ee`,
+passes the one-way test and fails the bidirectional test. The mobile H1 provider
+at 0.3 ms/eight flows reaches 428.41088 Mb/s in its return direction against
+587.20256 Mb/s for the reference (73.0%). The forward direction remains about
+957.47 Mb/s and all recorded drop counters are zero. Total throughput is
+1385.88160 versus 1544.66304 Mb/s, also below the original aggregate gate.
+All 300 readings remain in `sdk-transfer-model-first`.
+
+Three exact-cell repeats after the source-idle correction still include one
+failed return direction: 542.57664 versus 620.00128 Mb/s (87.5%). The other
+two pass. These diagnostic repeats use an immutable overlay binary and retain
+their separate effective-source manifest in `source-idle-followup`; they do
+not replace the complete SDK campaign.
+
+The current test strengthens this to a 90% gate for each direction, checks
+both arms' progress and receive refusals, and calibrates the reference against
+its window/feedback bound, including opposing FIFO serialization. It also
+exercises reversed bidirectional stats and checks pool release after shutdown.
+These later checks compiled in the 169-test correctness binary, but that
+selection does not run SDK performance cells. A full rerun is still required.
+These fixtures cover Transfer settings on a host-selected SDK policy; they do
+not exercise physical H1 priority queues, native TUN, or a mobile runtime.
 
 ### Deterministic tests for the new failure cases
 
@@ -566,6 +665,8 @@ bucket resizing and does not yet attribute all earlier host failures.
 | A proposed cancellation clear discarded the successor's inherited pause | `TestWindowPacingCanceledHeadTransfersControlledDrain` forces two queued writers and a third sequence's tail, cancels the head, and completes the successor's real pacing handoff. |
 | A changed bucket duration discarded the ACK pair proving faster service | `TestWindowPacingShorterRoundTripKeepsFasterServiceEvidence` changes RTT between exact delivery checkpoints and checks the new rate and subsequent hold. |
 | Rebucketed aggregates could overlap, double-count first bytes or retain an old epoch | `TestWindowPacingResizedSamplesKeepFirstBytesAndReordering`, `TestWindowPacingResizedSamplesExpireRetainedTime` and `TestWindowPacingResizedSamplesRespectServiceEpoch` force those boundaries. |
+| A small inner replay priced source idle as physical serialization | `TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle` runs the real recovery worker, reopens the inner window, then measures the next bulk pacing wait. |
+| Source-idle confirmation, cancellation or shared-lane cleanup could discard held service | `TestWindowPacingSourceIdleRequiresConfirmationAndFreshEvidence`, `TestWindowPacingSourceIdleCancellationPreservesSuccessor`, `TestWindowPacingLastCanceledDemandStartsSourceIdle`, `TestWindowPacingPackWaitingBeforeReservationAcceptsFreshService` and `TestWindowPacingSharedSourceIdleRequiresEveryTail` force the adjacent boundaries. |
 
 Each case has a recorded failure-before run. The byte meter preserves actual
 spent bytes separately from credit withheld by an estimate increase. It also
@@ -689,24 +790,26 @@ external work.
 
 ## Reproduction and artifacts
 
-The SDK settings probe captures eight profiles through the sibling SDK's actual
+The SDK settings probe captures 11 profiles through the sibling SDK's actual
 constructors and sizing helpers: unbudgeted and 384 MiB connect defaults, plus
-desktop/mobile device and provider defaults with providing enabled or disabled.
+desktop/mobile device and provider defaults with providing enabled or disabled,
+including explicit mobile H1 policy.
 Desktop defaults use a 20 MiB device target; the selected mobile profile uses
 a 24 MiB target and 32 MiB process budget. Resolved send, receive and Pack pools,
-queue limits and receive accounting are retained in `sdk-settings-current`.
+queue limits and receive accounting are retained in `sdk-transfer-profiles`.
 This is constructor coverage on the host, not a mobile-runtime performance run.
-Performance cells using those resolved profiles remain to be added.
+The new Transfer performance cells use the pinned resolved profiles.
 
 ```sh
 python3 tools/throughput-fix-2-sdk-settings.py ../sdk /tmp/window-sdk-settings
 ```
 
 The capture pins SDK revision `7fe75c6983dcea213a6f58d9cb0e9220be8b6534` and
-connect source `5f28f1587548882900d65383a1ec176f5346df688c266366dcdf37d76e645c91`.
-The latter includes the added recovery test and is distinct from the earlier
-`f60cf11d` model source. Both checkouts were stable during the capture build;
-the overlay leaves SDK files unchanged.
+connect source `56eec7b1968bac2214224b2d7975f849d0fe6efef53cd9322eb11a01b31bc6ef`.
+It used an isolated SDK checkout at that revision because unrelated local SDK
+edits did not compile; the relevant constructor files were identical. Both
+sources were stable during compilation. The earlier eight-profile capture is
+preserved in `sdk-settings-current` with its own source manifest.
 
 The runner records source and binary hashes, revisions, Go/OS/CPU, selected
 environment, complete logs, status and JSONL ledgers:
@@ -714,6 +817,7 @@ environment, complete logs, status and JSONL ledgers:
 ```sh
 tools/throughput-fix-2.sh correctness /tmp/window-correctness
 tools/throughput-fix-2.sh model /tmp/window-model
+tools/throughput-fix-2.sh sdk-model /tmp/window-sdk-model
 tools/throughput-fix-2.sh regression /tmp/window-regression
 tools/throughput-fix-2.sh tcp /tmp/window-tcp
 CONNECT_WINDOW_TCP_BUFFER_MAX_MIB=48 tools/throughput-fix-2.sh tcp /tmp/window-tcp-48mib
@@ -731,8 +835,18 @@ Final collected evidence is under [throughput-fix-2-results](throughput-fix-2-re
   preserving delivery checkpoints across bucket-duration changes;
 - `rtt-resize-evidence` — direct and intermediate failures, 23 passing model
   comparisons and the separate recovery diagnostics;
-- `host-feedback-controlled-epoch` — induced host diagnostics and an unfixed
-  deterministic inner-TCP replay reproduction;
+- `model-burst-ring-rtt-resize` — completed full model, including its slow
+  shared-service failure and all 510 readings;
+- `correctness-source-idle` — 169 passing race-enabled tests on the latest source;
+- `source-idle-evidence` — 18 before failures, 276 focused race executions and
+  50 scoped model readings after the replay-idle correction;
+- `source-idle-followup` — host brackets that did not trigger replay, plus
+  three exact SDK duplex repeats including one failure after the correction;
+- `host-feedback-controlled-epoch` — original induced host diagnostics and
+  deterministic inner-TCP replay failure before its correction;
+- `sdk-transfer-profiles` — 11 pinned constructor profiles with 40 fields;
+- `sdk-transfer-model-first` — 150 SDK Transfer pairs, including the mobile
+  provider duplex failure; the current stronger gates require a rerun;
 - `sdk-settings-current` — eight pinned, sanitized constructor profiles;
 - `controlled-epoch-final` — focused passes, natural-drain and intermediate
   correction failures, settled-capacity ledgers and separate recovery diagnostics;
@@ -753,18 +867,20 @@ ledger is in [THROUGHPUT-PR2-RESULTS.md](THROUGHPUT-PR2-RESULTS.md).
 
 ## Remaining work
 
-1. Confirm the full matrix after the bucket-resize correction and investigate
-   the remaining recovery-time difference. The controlled-drain matrix is
-   complete; each later correction still needs its own source-pinned validation.
-2. Fix replay sampling across application idle, add its normal deterministic
-   regression, and resolve slow host cells against the explicit comparison gate. Keep
-   instrumentation limits, shared host load and candidate performance effects
-   independently testable; retain failed and excluded comparisons.
-3. The database-backed `server/connect` and `server/proxy` integration tiers
+1. Fix the slow shared-service failure with a deterministic reproduction of
+   probe-confirmation ordering, then repeat the full model on the resulting
+   source. Keep the separate recovery-time difference under investigation.
+2. Resolve the mobile H1 provider's bidirectional regression and run the entire
+   SDK matrix with the strengthened per-direction and calibration gates.
+3. Confirm the source-idle fix in controlled host comparisons and resolve the
+   older host failures. Tracing that calls the service estimator can update its
+   held value; separate that observer effect from ordinary untraced behavior.
+   Retain failed and excluded comparisons under the current host load.
+4. The database-backed `server/connect` and `server/proxy` integration tiers
    are deferred by the user for a later environment-correct run through
    `server/test.sh`. Local credential repair is outside this run.
-4. Resolved SDK-budget performance cells, longer actual-relay pressure,
-   shard-collision, bidirectional and multiple-peer campaigns remain necessary
+5. Physical SDK/H1/native-TUN confirmation, longer actual-relay pressure,
+   shard-collision and multiple-peer campaigns remain necessary
    before a deployment-wide claim. Continue with
    our own published fixtures as requested; obtaining the reporter's missing
    native rig is not a prerequisite for this work. Its missing traces still

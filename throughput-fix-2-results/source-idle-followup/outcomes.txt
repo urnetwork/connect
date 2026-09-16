@@ -1,0 +1,7 @@
+host before bracket: PASS (exit 0; 4 readings; 48 intervals; comparison passed)
+host after bracket: PASS (exit 0; 4 readings; 48 intervals; comparison passed)
+host total: 8 readings; 96 intervals; 2 comparisons passed; 0 failures; 0 censors
+host limitation: every arm sampled zero NAT replay events, so this archive makes no replay reproduction or host-repair claim
+SDK provider duplex after: FAIL (exit 1; 3 execution comparisons; 2 passed; 1 failed)
+SDK failing reverse direction: candidate 542.57664 Mbps / reference 620.00128 Mbps (0.8751218062001421)
+SDK raw-log SHA-256: 0b447d0d5aa353a309dad5e4eb5d9defb3d91c573035dae3de248c39a1e293a3

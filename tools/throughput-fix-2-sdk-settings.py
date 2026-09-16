@@ -28,20 +28,33 @@ func TestThroughputFix2SdkWindowSettings(t *testing.T) {
         if budget == nil { return nil }
         return budget.TotalByteCount()
     }
-    record := func(name string, settings *connect.ClientSettings, target connect.ByteCount, active bool) {
+    record := func(name string, settings *connect.ClientSettings, target connect.ByteCount, active, explicitH1 bool) {
         send, receive := settings.SendBufferSettings, settings.ReceiveBufferSettings
         row := map[string]any{
             "Name": name, "MobilePolicy": mobileRuntime(), "ProcessBudget": connect.MemoryBudget(),
             "DeviceTarget": target, "Providing": active, "WindowSizing": send.WindowSizing,
+            "ExplicitH1": explicitH1, "ClientSendQueueCount": settings.SendBufferSize,
+            "SendQueueCount": send.SequenceBufferSize, "AckQueueCount": send.AckBufferSize,
             "SendPool": pool(send.ResendQueueBudget), "ReceivePool": pool(receive.ReceiveQueueBudget),
             "PackPool": pool(receive.PackQueueBudget), "SendInitial": send.ResendQueueMaxByteCount,
             "SendMinimum": send.ResendQueueMinByteCount, "WindowScale": send.DeliverySizedWindowScale,
+            "TargetGoodputByteRate": send.TargetGoodputByteRate, "LaneFloor": send.LaneFloorByteCount,
             "WindowCeiling": send.DeliverySizedWindowCeilingByteCount,
             "ReceiveMaximum": receive.ReceiveQueueMaxByteCount, "ReceiveMinimum": receive.ReceiveQueueMinByteCount,
             "RetainedReceiveAccounting": receive.ReceiveQueueRetainedByteAccounting,
+            "RetainedPackAccounting": receive.PackQueueRetainedByteAccounting,
             "AdvertiseReceiveWindow": receive.AdvertiseReceiveWindow,
             "AckCompressionNs": receive.AckCompressTimeout, "LogicalDataLanes": send.LogicalDataLaneCount,
             "H1QueueCount": receive.H1SequenceBufferSize, "H1QueueBytes": receive.H1SequenceBufferByteCount,
+            "H1QueueAdaptiveCount": receive.H1SequenceBufferAdaptiveMaxSize,
+            "H1QueueAdaptiveStepCount": receive.H1SequenceBufferAdaptiveStepSize,
+            "H1QueueAdaptiveThreshold": receive.H1SequenceBufferAdaptiveSaturationThreshold,
+            "H1QueueAdaptiveWindowNs": receive.H1SequenceBufferAdaptiveSaturationWindow,
+            "H1QueueAdaptiveBytes": receive.H1SequenceBufferAdaptiveMaxByteCount,
+            "H1QueueAdaptiveStepBytes": receive.H1SequenceBufferAdaptiveStepByteCount,
+            "H1PackHandoffTimeoutNs": receive.H1PackHandoffTimeout,
+            "ReliablePackHandoffTimeoutNs": receive.ReliablePackHandoffTimeout,
+            "H1AckHandoffTimeoutNs": receive.H1AckHandoffTimeout,
             "ReceiveQueueCount": receive.SequenceBufferSize, "ReceiveQueueBytes": receive.SequenceBufferByteCount,
             "MinimumMessageLimit": settings.MinimumMessageLenLimit(),
         }
@@ -51,7 +64,7 @@ func TestThroughputFix2SdkWindowSettings(t *testing.T) {
     }
     for _, process := range []connect.ByteCount{0, 384 * 1024 * 1024} {
         connect.SetMemoryBudget(process)
-        record("connect-process-default", connect.DefaultClientSettings(), 0, false)
+        record("connect-process-default", connect.DefaultClientSettings(), 0, false, false)
     }
     for _, mobile := range []bool{false, true} {
         throughputWindowSettingsMobile = &mobile
@@ -63,13 +76,32 @@ func TestThroughputFix2SdkWindowSettings(t *testing.T) {
             applyMobileLowMemoryClientSettings(&settings.ClientSettings, settings.MemoryTargetByteCount)
             device := &DeviceLocal{settings: settings}
             device.applyProvideMemorySharesWithLock(active)
-            record("sdk-device-default", &settings.ClientSettings, settings.MemoryTargetByteCount, active)
+            destination := newDeviceClientSettings(connect.DefaultClientSettingsWithBufferSize(settings.SequenceBufferSize), "https://api.example", nil)
+            destination.SendBufferSettings.ResendQueueBudget = settings.SendBufferSettings.ResendQueueBudget
+            destination.ReceiveBufferSettings.ReceiveQueueBudget = settings.ReceiveBufferSettings.ReceiveQueueBudget
+            destination.ReceiveBufferSettings.PackQueueBudget = settings.ReceiveBufferSettings.PackQueueBudget
+            applyMobileLowMemoryClientSettings(destination, settings.MemoryTargetByteCount)
+            record("sdk-device-default", destination, settings.MemoryTargetByteCount, active, false)
+            if mobile {
+                applyMobileH1PerformanceClientSettings(destination, settings.MemoryTargetByteCount, true)
+                record("sdk-device-h1", destination, settings.MemoryTargetByteCount, active, true)
+            }
             if active {
-                provider := DefaultDeviceLocalSettings()
-                applyMobileLowMemoryClientSettings(&provider.ClientSettings, provider.MemoryTargetByteCount)
-                _, _, _, share := deviceMemoryShares(provider)
-                configureDeviceLocalProviderMemory(&provider.ClientSettings, share)
-                record("sdk-provider-default", &provider.ClientSettings, provider.MemoryTargetByteCount, true)
+                provider := newDeviceClientSettings(&settings.ClientSettings, "https://api.example", nil)
+                _, _, _, share := deviceMemoryShares(settings)
+                configureDeviceLocalProviderMemory(provider, share)
+                record("sdk-provider-default", provider, settings.MemoryTargetByteCount, true, false)
+                if mobile {
+                    provider = newDeviceClientSettings(&settings.ClientSettings, "https://api.example", nil)
+                    applyMobileH1PerformanceClientSettings(provider, settings.MemoryTargetByteCount, true)
+                    configureDeviceLocalProviderMemory(provider, share)
+                    record("sdk-provider-h1", provider, settings.MemoryTargetByteCount, true, true)
+                }
+                if provider.SendBufferSettings.ResendQueueBudget == settings.SendBufferSettings.ResendQueueBudget ||
+                    provider.ReceiveBufferSettings.ReceiveQueueBudget == settings.ReceiveBufferSettings.ReceiveQueueBudget ||
+                    provider.ReceiveBufferSettings.PackQueueBudget != settings.ReceiveBufferSettings.PackQueueBudget {
+                    t.Fatal("provider must own its transfer pair and share the device Pack budget")
+                }
             }
         }
     }
@@ -82,7 +114,8 @@ def source_manifest(repo):
     def git(*args):
         return subprocess.check_output(['git', *args], cwd=repo, text=True).strip()
     names = git('ls-files', '--cached', '--others', '--exclude-standard', '--',
-                '*.go', '*.proto', 'go.mod', 'go.sum').splitlines()
+                '*.go', '*.proto', 'go.mod', 'go.sum',
+                'testdata/window_sdk_profiles.json').splitlines()
     digest = hashlib.sha256()
     for name in sorted(set(names)):
         path = repo / name
