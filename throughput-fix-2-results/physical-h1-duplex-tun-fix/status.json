@@ -1,0 +1,13 @@
+{
+  "censored_comparisons": 1,
+  "comparison_count": 1,
+  "failed_comparisons": 1,
+  "ledger_parser_correction": "A post-test parser recognized the fixture-specific physical-h1-duplex prefixes. It changed only local result extraction: source snapshot and binary remained unchanged.",
+  "process_exit_code": 1,
+  "reported_rows": 4,
+  "schema": "throughput-fix-2/physical-h1-duplex-tun-fix-status-v1",
+  "terminal_state": "completed_with_censored_failed_comparison",
+  "top_level_failed": 1,
+  "top_level_passed": 0,
+  "top_level_skipped": 0
+}

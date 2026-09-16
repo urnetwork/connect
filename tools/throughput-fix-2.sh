@@ -22,6 +22,7 @@ case "$mode" in
   correctness)
     pattern='^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$'
     pattern="$pattern|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$|^TestWindowTcp(SocketBatch|CanceledBatch|WorkloadCancel).*$"
+    pattern="$pattern|^TestTun(DuplexDataHandoffDoesNotCycleThroughAdmission|FiniteTcpTailProgressesAfterEndpointOwnerReleases)$"
     build_flags=(-race)
     ;;
   model)

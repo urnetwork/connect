@@ -88,8 +88,15 @@ fail and are excluded by their controls, including stalled reference arms.
 All six readings and an earlier cleanup interruption are retained in
 `physical-h1-duplex-diagnostics`. A fresh-process reference also exposes a TUN
 endpoint-lock dependency involving data carrying ACKs, extending the earlier
-pure-ACK case. Its deterministic reproduction and correction remain in progress;
-these diagnostic runs do not establish physical or SDK throughput acceptance.
+pure-ACK case. Source `c07140f7` now removes that redundant endpoint lock after
+synchronous packet injection. Both root tests fail three times before the fix;
+19 corrected tests pass three times under the race detector. A real finite
+2,000-byte TCP tail is acknowledged before the checking `Read`, without a later
+payload or replay. All 182 correctness tests pass under race. Physical duplex
+completes but remains failed/excluded by reference calibration, reference drift
+and provider control-return refusals; all three readings are retained in
+`physical-h1-duplex-tun-fix`. Full root regression is running. These results do
+not establish throughput acceptance.
 
 ### Burst follow-up checkpoint
 

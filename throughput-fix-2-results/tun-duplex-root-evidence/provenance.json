@@ -1,0 +1,81 @@
+{
+  "environment": {
+    "GOFLAGS": null,
+    "GOMAXPROCS": null,
+    "GOTOOLCHAIN": null
+  },
+  "failure_schedule": "One-slot outbound queue and one-slot real SendSequence Pack admission form a forced dependency. Only the test disables the NIC timeout to remove packet-loss escape. ACK-only controls pass; four data+ACK cases fail before and pass after.",
+  "final_root_manifest_sha256": "bc6b6022dabcca6a626f0f78e931cd748c93b2b6f1cf5dfa95caf68d71343d9a",
+  "fix": "Injection/GRO Flush already transfers segments to the gVisor dispatcher. Clear bounded producer bookkeeping without acquiring endpoint ownership. Keep shard ordering, GRO flush, producer yields, fixed queues and wait timeout unchanged.",
+  "gvisor_module": "v0.0.0-20260909230408-9b1144b679cb",
+  "handoff_file_pins": [
+    {
+      "after_sha256": "ef8a323c939a4570c996d05072d15ca8837e0ef705270bbb9b8ac9b5c2efac96",
+      "before_exists": true,
+      "before_sha256": "61bedc3e5e3662633e6c711a7a665c86398aea38d4cdf8c63d72fd1e8dafcf8f",
+      "file": "tun.go"
+    },
+    {
+      "after_sha256": "b98248a8adba00e4a6e0d0dd3647277afbc22e45dd65b6b79d14c5a9dda668a8",
+      "before_exists": false,
+      "before_sha256": null,
+      "file": "tun_duplex_handoff_test.go"
+    },
+    {
+      "after_sha256": "f80cfa6325d340da4baec1da302b77a552e9eed26826268a949fd6f6b668a4e4",
+      "before_exists": true,
+      "before_sha256": "9e0364db9bbb036147b69c35c25adbed7918b242bb7bed65b6a36795a99ff90b",
+      "file": "tun_test.go"
+    }
+  ],
+  "isolated_final_source_sha256": "57bc4cdc7dc16a0798642518738a72d3b8d82460aead58b08b6a7eef1640bb19",
+  "lifecycle": "Each row cancels and joins its workers, waits for gVisor stack shutdown, and returns captured pool roots after injection workers finish. Final focused selection includes bounded/unbounded outbound wait, cancel/close wake, ACK-only, IPv4/IPv6, cadence, and PacketBuffer release guards.",
+  "observable_progress": "Established gVisor TCP connection emits the cumulative ACK for its only 2000-byte tail before application Read, then returns exactly those bytes. Both Write and two-segment WriteBatch cover user-owned and processor-owned endpoints, with no later payload injected.",
+  "physical_diagnostics": "Frozen physical duplex A/B/A remains censored and interrupted outcomes are retained separately. Fresh-process first-arm stall excludes prior-arm fixed-port state as a prerequisite. No post-fix physical throughput claim is made by these root tests.",
+  "raw_stack_policy": "stacks.txt is local diagnostic data; archive sanitized causal/numerical summary instead of raw pointer/path stack dump.",
+  "retention": "Raw logs, source and overlay contents, binaries, commands, absolute paths, and stacks remain outside this sanitized archive. Only hashes and normalized outcomes are retained.",
+  "root_cause": "Post-injection endpoint LockUser waits behind endpoint-owned outbound writes. Outbound queue draining can wait for Transfer Pack admission that needs a carrier ACK behind the blocked receive callback. ACK-only bypass leaves data+ACK affected.",
+  "runs": [
+    {
+      "binary_sha256": "b33705f1f35a67c50a0026791dbf3c08ebd9b3d283f2ace1f350bee88bf30f01",
+      "compile_exit": 0,
+      "effective_source_sha256": "0c23ca75b0f47973c270e8246808a789ff8f0c491bf13da348c88d7907f2cde1",
+      "fail_count": 6,
+      "label": "before",
+      "sources_stable_after_run": true,
+      "pass_count": 0,
+      "race_warning_count": 0,
+      "raw_log_sha256": "3e8deb0c21f6f239b680bf28420c6c0a863c1e5fa8f30028b6a7865d30e7b5b9",
+      "skip_count": 0,
+      "sources_stable_during_build": true,
+      "test_exit": 1,
+      "test_selection": "two deterministic TUN roots; count=3; race enabled",
+      "test_sha256": "b98248a8adba00e4a6e0d0dd3647277afbc22e45dd65b6b79d14c5a9dda668a8",
+      "tun_sha256": "61bedc3e5e3662633e6c711a7a665c86398aea38d4cdf8c63d72fd1e8dafcf8f"
+    },
+    {
+      "binary_sha256": "312e6d60b0706a3fb83029ca178d2100762e4075127bd6ea6405af26f72c6718",
+      "compile_exit": 0,
+      "effective_source_sha256": "57bc4cdc7dc16a0798642518738a72d3b8d82460aead58b08b6a7eef1640bb19",
+      "fail_count": 0,
+      "label": "after-race",
+      "sources_stable_after_run": true,
+      "pass_count": 57,
+      "race_warning_count": 0,
+      "raw_log_sha256": "11dca31a29f303c551ea8610ac0ce1de9eff290ec9ade9490977e36ef46f658e",
+      "skip_count": 0,
+      "sources_stable_during_build": true,
+      "test_exit": 0,
+      "test_selection": "19 focused TUN roots; count=3; race enabled",
+      "test_sha256": "b98248a8adba00e4a6e0d0dd3647277afbc22e45dd65b6b79d14c5a9dda668a8",
+      "tun_sha256": "ef8a323c939a4570c996d05072d15ca8837e0ef705270bbb9b8ac9b5c2efac96"
+    }
+  ],
+  "schema": "throughput-fix-2/tun-duplex-root-evidence-provenance-v1",
+  "scope": "Only tun.go lock removal, two deterministic root tests, and comment-only existing TUN test clarification are proposed for shared source. Physical duplex diagnostic fixture changes are excluded.",
+  "shared_base_canonical_source_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+  "source_handoff_sha256": "caf4c4bd90300b15ff445f8000442c1110aa5cf5b8d72217a6ed942938132238",
+  "source_handoff_status": "reviewed isolated fix; shared source unmodified; final exact root failures retained; final race selection passed",
+  "source_sha256_algorithm": "SHA256 of json.dumps(sorted file path to SHA256 map, sort_keys=True) over isolated connect and copied local glog inputs; before differs only by tun.go overlay. Not the ordinary runner canonical manifest algorithm.",
+  "source_stability": true
+}

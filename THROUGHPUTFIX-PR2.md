@@ -1249,6 +1249,17 @@ retire older incomplete evidence, so delayed old bytes cannot restore an old
 rate. Force these orderings, epoch resets, read-only statistics, changed
 compression intervals and cycles longer than the bounded ring before landing.
 
+The wider controls expose a startup limit in that hold rule: a 400 ms RTT,
+50 ms compression cell reaches 79.299 Mb/s against 95.826 Mb/s for its reference.
+The trace holds an early 7,232 B/s control-message estimate even after
+4,998,818 newly observed bytes over 400 ms supply much larger service evidence.
+Test whether an incomplete cycle may raise the held rate using its bytes divided
+by the complete elapsed interval, including the gap. It must still require a
+completed cycle before decreasing the estimate, preserve the old-accounting
+exclusion boundary, and leave statistics reads non-mutating. Preserve the
+failed startup controls separately from the passing RTT-growth and SDK recovery
+checks; this candidate remains unlanded.
+
 The induced host replay experiment now records one actual NAT replay per arm.
 Disabling only the source-idle delimiter drops the candidate's service estimate
 from 116,086,811 to 19,038 B/s; the corrected arm holds its preceding rate.
@@ -1321,6 +1332,27 @@ cannot silently reintroduce the original short-response failure. Update stale
 comments that assume the NAT has no return replay. After deterministic checks,
 repeat the same physical duplex controls with unchanged memory limits and
 per-direction calibration; preserve every interrupted and excluded attempt.
+
+The minimal correction is now applied on source `c07140f7`: remove the redundant
+endpoint lock after synchronous injection/flush, retaining the existing queues,
+flow ordering and producer cadence. Two final-shape root tests fail three times
+each before the correction; 19 corrected tests pass three times under the race
+detector. The established 2,000-byte finite-tail test observes the cumulative
+TCP ACK before calling `Read`, so the checking syscall cannot supply the wake.
+The regular correctness selection includes both roots and passes all 182 tests
+under race. The unchanged physical duplex A/B/A now completes, but all three
+arms refuse 52-byte provider return controls; the after-reference also records
+nine gVisor outbound drops. Reference calibration and A/A consistency both fail.
+All readings and failures are retained; no physical throughput improvement is
+claimed. The full root regression is running.
+
+The next bounded investigation is control admission during full duplex. Shared
+provider callbacks enqueue controls without waiting, and the control worker's
+zero-timeout send can refuse while socket-owned data occupies H1 admission.
+Force that ordering and observe a real sender's cumulative progress and RTO
+before attributing the physical deficit. Review adjacent control types and
+preserve nonblocking callbacks, fixed memory bounds and all calibration gates.
+Whole-arm refusal counters alone do not prove measurement-interval starvation.
 
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md

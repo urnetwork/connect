@@ -184,6 +184,16 @@ not an accepted pacing comparison. It uses an owned unauthenticated relay,
 userspace TUN and disabled Transfer encryption; the final attempt uses one
 actual provider dispatcher and fixed synthetic flow ports.
 
+`tun-duplex-root-evidence` retains six expected failures before removing the
+redundant TUN endpoint lock, followed by 57 focused race passes. The finite-tail
+test observes a real cumulative TCP ACK before reading the delivered bytes.
+`correctness-tun-duplex` passes all 182 correctness tests under race on source
+`c07140f7`. `physical-h1-duplex-tun-fix` retains all three readings from the
+unchanged duplex A/B/A after that correction. It remains failed and excluded:
+reference calibration/drift and provider return-control refusals invalidate
+acceptance. Complete counters and one invalid pre-compilation setup attempt
+are retained; no throughput gain is claimed.
+
 `sdk-ack-tail-v3-evidence` retains 14 complete diagnostic runs, all 122 numerical
 readings and 170 normalized outcomes. The candidate remains unlanded/rejected:
 improved SDK feedback recovery comes with a real RTT-growth regression. Passing

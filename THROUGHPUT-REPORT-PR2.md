@@ -11,7 +11,14 @@ The original full-suite results do not validate those later production edits.
 
 ## Current follow-up
 
-The latest production corrections, committed in `3ce605cb`, preserve service while old ACK bytes are
+The latest TUN correction removes an endpoint-lock dependency from incoming
+TCP data. Both deterministic roots fail three times against the preceding
+code; the corrected selection passes 57 race executions, and the full
+correctness selection passes all 182 tests under race. Physical duplex now
+progresses but fails its calibration and lifecycle gates; the full root
+regression is running. Details and retained failed readings are below.
+
+The earlier pacing corrections, committed in `3ce605cb`, preserve service while old ACK bytes are
 still being applied, and make public statistics reads independent of pacing
 state. Source
 `538e6248fb744795d9e829e97e503744ed70284d107ebad10da646b56bf6e460`
@@ -811,6 +818,17 @@ bytes still acknowledge delivery immediately. Any such rule must preserve
 zero hold for incomplete evidence while accepting genuinely slower completed
 cycles; the research plan records the symmetric gap/cycle and ACK-partition
 controls. No production estimator change for this case has been accepted.
+
+A later isolated cycle candidate provides actual zero-order hold: incomplete
+feedback cannot recalculate an old mean using changed flight or RTT. Its final
+focused block passes 129 tests three times, and both RTT growth and forced SDK
+recovery pass three times. The wider 400 ms RTT/50 ms compression control still
+fails at 79.299 versus 95.826 Mb/s, with further failures preserved. Startup
+tracing finds a 7,232 B/s control-message estimate held despite 4,998,818 bytes
+observed across 400 ms. The next hypothesis lets that complete elapsed-interval
+lower bound raise an estimate while retaining cycle completion for decreases.
+It remains an experiment; the passing focused checks do not close acceptance.
+
 The rejected ACK-tail candidate's complete 14-run evidence, including all 122
 numerical readings and the passing unchanged-production RTT controls, is in
 `sdk-ack-tail-v3-evidence`.
@@ -885,7 +903,44 @@ data; that endpoint's processor waits for outbound TUN space; the TUN drainer
 waits for Transfer admission whose release feedback is behind blocked receive
 work. The pure-ACK bypass does not cover data carrying ACKs. Deterministic
 reproduction and the gVisor handoff review are tracked in research-plan §26.
-No TUN correction for this case has been accepted yet.
+
+The correction removes the extra `LockUser`/`UnlockUser` pair after injection.
+gVisor already queues arriving segments, schedules processor-owned endpoints,
+and requeues work when a user releases its endpoint. Synchronous injection and
+GRO flushing still publish the complete batch before returning. Same-flow
+ordering, fixed outbound queues, borrowed-buffer ownership and the existing
+producer yield cadence remain in place; no new worker or queue is added.
+
+`TestTunDuplexDataHandoffDoesNotCycleThroughAdmission` holds one outbound slot,
+the real Transfer admission gate and an endpoint owner to force the dependency
+for single and batch writes. Pure ACKs provide the control. The separate
+`TestTunFiniteTcpTailProgressesAfterEndpointOwnerReleases` establishes a real
+TCP connection, captures its final 2,000-byte response and injects no subsequent
+payload or replay. The stack must emit its cumulative ACK before the test calls
+`Read`, then deliver the exact bytes. Both tests cover user-owned and
+processor-owned endpoint locks. Older shard-counter tests remain bookkeeping
+checks, not evidence that a synthetic endpoint lock is required for progress.
+
+The final test shape fails both roots three times with the old TUN code:
+six expected failures, no race warnings. The corrected 19-test selection passes
+three times: 57 race executions, including cancellation, outbound-close and
+retained-reference controls. Frozen binaries are `b33705f1` before and
+`312e6d60` after; their effective diagnostic source hashes are retained in the
+TUN handoff evidence. Main source after applying the three guarded files is
+`c07140f78cac0dc84c22ec06ac8635de755e925471d3bb8a0dbacf0d7737262e`.
+The copied-source correctness selection passes all 182 tests under race.
+The unchanged physical duplex A/B/A completes all three readings, but remains
+failed and excluded: both directions miss calibration and exceed the 10%
+reference-drift limit. Candidate aggregate throughput is 833.397 Mb/s against
+662.786 Mb/s for the reference average; that ratio is not an accepted gain.
+Every arm refuses provider return controls: queue/send packet counts are
+1,231/17,196 before, 3,591/27,972 in delivery, and 7,249/18,919 after. All are
+52-byte inner TCP controls; the after-reference also drops nine gVisor outbound
+packets. H1 and Transfer receive drops/refusals remain zero and budgets balance
+after close. These whole-arm counters do not isolate measurement-interval loss.
+The full root regression is running. Evidence is retained in
+`tun-duplex-root-evidence`, `correctness-tun-duplex` and
+`physical-h1-duplex-tun-fix`, including an invalid pre-compilation setup attempt.
 
 ### Generic TCP matrix after correcting packet groups
 
@@ -927,6 +982,8 @@ close the older host failures or the broader confirmation campaign.
 
 | Failure | Regression test and forced stimulus |
 |---|---|
+| Duplex data injection waited on an endpoint whose output needed a later Transfer ACK | `TestTunDuplexDataHandoffDoesNotCycleThroughAdmission` fixes the outbound slot, admission credit and endpoint ownership for single/batch writes and pure-ACK controls. |
+| Removing an endpoint handoff could strand a finite response | `TestTunFiniteTcpTailProgressesAfterEndpointOwnerReleases` requires a real 2,000-byte TCP tail to be cumulatively ACKed before `Read`, with no later payload or replay. |
 | A host socket batch exceeded the physical H1 message cap | `TestWindowTcpSocketBatchFitsPhysicalH1` sends 16 packets as one logical group through the actual TLS/WebSocket writer with an asserted 8,192-byte cap. |
 | Rejected fixture admission could lose borrowed packet ownership | `TestWindowTcpCanceledBatchReturnsShares` closes the client before group admission and reconciles caller buffers and retained shares. |
 | Workload cancellation left fixture admission waiting on a live client | `TestWindowTcpWorkloadCancelUnblocksGroupAdmission` holds the consumer before a zero-slot handoff, cancels only the workload and checks immediate release under virtual time. |
@@ -1142,6 +1199,10 @@ Final collected evidence is under [throughput-fix-2-results](throughput-fix-2-re
   and passing A/B/A comparison on `b6abfa4e`;
 - `physical-h1-fixture-evidence` — deterministic message-cap and cancellation
   failures, the guarded handoff and 12 valid copied-source race passes;
+- `tun-duplex-root-evidence` and `correctness-tun-duplex` — six pre-fix
+  failures, 57 focused race passes and 182 full correctness race passes;
+- `physical-h1-duplex-tun-fix` — all three TUN-corrected duplex readings,
+  failed calibration/lifecycle gates and complete return-control counters;
 - `sdk-ack-tail-v3-evidence` — the rejected ACK-tail experiment's complete
   14-run record, with 122 numerical readings and its real-RTT regressions;
 - `sdk-transfer-source-idle` — all 150 SDK pairs pass once with the stronger

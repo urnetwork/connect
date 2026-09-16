@@ -1,0 +1,43 @@
+{
+  "artifact": "sanitized final TUN duplex root evidence",
+  "contents": [
+    {
+      "bytes": 10944,
+      "name": "outcomes.jsonl",
+      "sha256": "cb8be0fd72094574429af358fcb03713a04910855c8331ac6144d6d01b7baa28"
+    },
+    {
+      "bytes": 5594,
+      "name": "provenance.json",
+      "sha256": "a396345bb3cfc913b593bd133023db156dae1ef7bf5c2507ddd56a83460ef649"
+    },
+    {
+      "bytes": 1807,
+      "name": "summary.json",
+      "sha256": "7433409e517501f8c0d85689f25f7a8a0db1d30dc7c64f988f9e0faddac7ca4c"
+    }
+  ],
+  "counts": {
+    "after_race_failures": 0,
+    "after_race_passes": 57,
+    "after_race_root_tests": 19,
+    "after_race_skips": 0,
+    "after_race_warnings": 0,
+    "before_expected_failures": 6,
+    "race_iterations": 3
+  },
+  "final_root_manifest_sha256": "bc6b6022dabcca6a626f0f78e931cd748c93b2b6f1cf5dfa95caf68d71343d9a",
+  "redaction": "No raw logs, source or overlay contents, binaries, commands, absolute paths, or stack traces are copied. Hashes and normalized outcomes are retained.",
+  "schema": "throughput-fix-2/tun-duplex-root-evidence-manifest-v1",
+  "source_handoff_sha256": "caf4c4bd90300b15ff445f8000442c1110aa5cf5b8d72217a6ed942938132238",
+  "status": "isolated deterministic TUN handoff evidence; expected before failures retained and after race selection passed",
+  "verification": {
+    "all_fifty_seven_after_race_passes_retained": true,
+    "all_six_expected_before_failures_retained": true,
+    "before_and_after_source_binary_test_and_tun_pins_retained": true,
+    "final_root_manifest_sha256_matches": true,
+    "handoff_sha256_matches": true,
+    "raw_stack_policy_retained": true,
+    "redaction_scan_passed": true
+  }
+}

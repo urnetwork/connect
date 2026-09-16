@@ -1,0 +1,154 @@
+{
+  "artifact": "sanitized physical-H1 duplex c071 TUN-only counterfactual",
+  "comparison": {
+    "AggregateCandidateMbps": 833.39713564819,
+    "AggregateRatio": 1.2574153587820114,
+    "AggregateReferenceMbps": 662.7858724864436,
+    "Calibrated": false,
+    "CandidateMbps": [
+      243.3891663805352,
+      590.0079692676549
+    ],
+    "CensoredReasons": [
+      "direction0 reference below90% of constrained window/feedback calibration",
+      "direction0 reference below90% nominal1Gb/s",
+      "direction0 A/A drift above10%",
+      "direction1 reference below90% of constrained window/feedback calibration",
+      "direction1 reference below90% nominal1Gb/s",
+      "direction1 A/A drift above10%"
+    ],
+    "FailureReasons": [
+      "fixture, carrier or lifecycle gate failed"
+    ],
+    "Ratio": [
+      1.0717472953615228,
+      1.3541914901624899
+    ],
+    "ReferenceDrift": [
+      0.5172275761576778,
+      0.5104081868892307
+    ],
+    "ReferenceMbps": [
+      227.09566651944283,
+      435.69020596700074
+    ]
+  },
+  "counts": {
+    "accepted_comparisons": 0,
+    "censored_comparisons": 1,
+    "comparisons": 1,
+    "compiled_test_attempts": 1,
+    "failed_comparisons": 1,
+    "full_numerical_readings": 3,
+    "invalid_pre_compilation_setup_attempts": 1,
+    "top_level_failed": 1
+  },
+  "decision": "Preserved for root-cause review. No retry occurred after the failed comparison.",
+  "identity_redaction": {
+    "cross_arm_address_equality_retained": true,
+    "generated_tun_address": "abstracted in all three readings as the same generated TUN address"
+  },
+  "limits": [
+    "Actual-provider physical duplex fixture only; no native TUN, authenticated server/connect, database tier, ACK-tail candidate, or estimator candidate.",
+    "The fixture uses a fixed-port bind in place of the literal Tun.DialContext race wrapper.",
+    "Provider control-return drops make every arm fail the NAT/TUN lifecycle gate; H1 and Transfer receive drops/refusals remain zero."
+  ],
+  "provider_control_return_counters": [
+    {
+      "arm": "ceiling-before",
+      "gvisor_outbound_drop_count": 0,
+      "h1_control_refusal_counts": [
+        0,
+        0
+      ],
+      "h1_queue_drop_message_counts": [
+        0,
+        0
+      ],
+      "return_queue_byte_count": 64012,
+      "return_queue_packet_count": 1231,
+      "return_send_byte_count": 894192,
+      "return_send_packet_count": 17196,
+      "transfer_budget_after_close": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "arm": "delivery",
+      "gvisor_outbound_drop_count": 0,
+      "h1_control_refusal_counts": [
+        0,
+        0
+      ],
+      "h1_queue_drop_message_counts": [
+        0,
+        0
+      ],
+      "return_queue_byte_count": 186732,
+      "return_queue_packet_count": 3591,
+      "return_send_byte_count": 1454544,
+      "return_send_packet_count": 27972,
+      "transfer_budget_after_close": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "arm": "ceiling-after",
+      "gvisor_outbound_drop_count": 9,
+      "h1_control_refusal_counts": [
+        0,
+        0
+      ],
+      "h1_queue_drop_message_counts": [
+        0,
+        0
+      ],
+      "return_queue_byte_count": 376948,
+      "return_queue_packet_count": 7249,
+      "return_send_byte_count": 983788,
+      "return_send_packet_count": 18919,
+      "transfer_budget_after_close": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ]
+    }
+  ],
+  "redaction": "No raw logs, source or overlay contents, binaries, commands, absolute paths, or stack traces are copied. Numerical ledgers, normalized outcomes, settings, and hashes are retained.",
+  "schema": "throughput-fix-2/physical-h1-duplex-tun-fix-summary-v1",
+  "scope": "Current c071 production TUN fix with only two frozen isolated H1 fixture test files replaced or added. No ACK-tail, estimator, or later single-arm stack-dump fixture input.",
+  "source_fidelity": {
+    "base_connect_canonical_source_sha256": "c07140f78cac0dc84c22ec06ac8635de755e925471d3bb8a0dbacf0d7737262e",
+    "binary_sha256": "3d59a7006079cc088f7a7d261fedb0c60b7da4e16919698a7b169da56fb4acd2",
+    "effective_fixture_source_sha256": "228bb760c46323df42a000037ee366f693a9607a788d4610df6bafb915832baa",
+    "fixture_base_source_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+    "sources_stable_after_run": true,
+    "sources_stable_during_build": true
+  },
+  "status": "failed and censored diagnostic; no accepted physical-H1 or SDK throughput conclusion"
+}

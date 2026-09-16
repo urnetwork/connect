@@ -188,11 +188,9 @@ func TestTunTcpInboundShardHandoffCadenceIsBounded(t *testing.T) {
 	}
 }
 
-// A small origin response often consists of one returned TCP packet. Raw Write
-// must complete its gVisor handoff before it returns: a shared deferred worker
-// can be blocked by unrelated traffic and leave the H1/TLS ACK tail stranded.
-// One P prevents an asynchronous handoff from running between Write's return
-// and this assertion, making the old deferred-worker failure deterministic.
+// Raw Write clears finite-burst producer metadata before returning while
+// retaining its packet counter. One P makes this a synchronous bookkeeping
+// assertion; established-endpoint delivery is covered separately.
 func TestTunWriteCompletesFiniteTcpInboundHandoffBeforeReturn(t *testing.T) {
 	previousProcs := runtime.GOMAXPROCS(1)
 	runtime.LockOSThread()
@@ -232,7 +230,7 @@ func TestTunWriteCompletesFiniteTcpInboundHandoffBeforeReturn(t *testing.T) {
 	}
 }
 
-// Immediate endpoint handoff must not erase the bounded scheduler-yield
+// Clearing finite-burst metadata must not erase the bounded scheduler-yield
 // cadence shared by consecutive one-packet callbacks on the same flow.
 func TestTunWriteRetainsTcpInboundYieldCadence(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -270,9 +268,9 @@ func TestTunWriteRetainsTcpInboundYieldCadence(t *testing.T) {
 	}
 }
 
-// WriteBatch may touch several TCP endpoints and end below the mid-batch
-// cadence on every one. Its return is the lossless boundary: no touched shard
-// may retain state that assumes another callback will arrive to wake it.
+// WriteBatch may end below the producer quantum on several shards. This
+// counter assertion verifies every touched shard is cleared before return;
+// established-endpoint delivery is covered separately.
 func TestTunWriteBatchFinishesEveryTcpInboundHandoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
