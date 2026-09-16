@@ -70,31 +70,35 @@ func TestTheWindowHasOneOwner(t *testing.T) {
 		"DeliverySizedWindowCeilingByteCount": {
 			"ApplyWindowSizing",
 			"DefaultSendBufferSettingsWithBufferSize",
-			"sendWindowEstimate",
+			"estimateSendWindow",
 		},
 		"TargetGoodputByteRate": {
 			"ApplyWindowSizing",
 			"DefaultSendBufferSettingsWithBufferSize",
-			"sendWindowEstimate",
+			"estimateSendWindow",
 			"bindingTerm",
 		},
 		"LendableByteCount": {
-			"sendWindowEstimate",
+			"estimateSendWindow",
 			"bindingTerm",
 			"LendableByteCount",
 		},
 		"receivedWindowAdvertisement": {
-			"sendWindowEstimate",
+			"estimateSendWindow",
 			"bindingTerm",
 			"receivedWindowAdvertisement",
 		},
 		"deliveredRate": {
-			"sendWindowEstimate",
+			"estimateSendWindow",
 			"deliveredRate",
 		},
 		"deliveredServiceRate": {
-			"sendWindowEstimate",
 			"deliveredServiceRate",
+		},
+		"deliveryServiceEstimate": {
+			"estimateSendWindow",
+			"deliveredServiceRate",
+			"deliveryServiceEstimate",
 		},
 	}
 
@@ -134,16 +138,16 @@ func TestTheWindowHasOneOwner(t *testing.T) {
 	// that need a window, admission and the stats snapshot
 	consumers := map[string]bool{}
 	for i, line := range lines {
-		if strings.Contains(line, "sendWindowEstimate(") &&
+		if strings.Contains(line, "estimateSendWindow(") &&
 			!strings.HasPrefix(strings.TrimSpace(line), "//") &&
-			enclosing[i] != "sendWindowEstimate" {
+			enclosing[i] != "estimateSendWindow" {
 			consumers[enclosing[i]] = true
 		}
 	}
 	t.Logf("window consumers: %v", consumers)
-	if len(consumers) < 2 {
+	if len(consumers) != 2 || !consumers["sendWindowEstimate"] || !consumers["sendWindowSnapshot"] {
 		t.Errorf(
-			"only %d function reads the window estimate; admission and the stats snapshot both need it, so a count below two means one of them found another way to a number",
+			"%d functions reach the window arithmetic; admission and the read-only stats snapshot must each use its sole owner",
 			len(consumers),
 		)
 	}

@@ -1,0 +1,35 @@
+{
+  "created_utc": "2026-09-16T02:00:08.372563+00:00",
+  "mode": "model",
+  "test_pattern": "^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*|TestWindowPathSdk.*)$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "1bf11158c107b978a21eca5c9df0ad1ecf613985",
+    "branch": "throughput-fix-2",
+    "source_sha256": "538e6248fb744795d9e829e97e503744ed70284d107ebad10da646b56bf6e460",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "db3cfeac62e50c387873884078857be9fd510c5bf6e6048271abcf92224711c1",
+  "host_load_average_at_start": [
+    16.76708984375,
+    16.35888671875,
+    18.1015625
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "validation-monitor: full model launched immediately after 177-pass correctness under active immutable baseline regression; no quiescence wait; pending-probe-observer source frozen during compilation"
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "binary_sha256": "2aa39f3caf7eaeb3934d19f4da2eac1d97c34faeefdadd72417f9d0fd5275e84",
+  "sources_stable_during_build": true
+}

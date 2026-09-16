@@ -1,0 +1,97 @@
+{
+  "artifact": "sanitized pending controlled-probe and observer evidence",
+  "contents": [
+    {
+      "bytes": 36405,
+      "name": "combined-focused-outcomes.jsonl",
+      "sha256": "f764fe70875e207f15e14a7644d56c504b4903f5be433dfe4bfc8a6ce380fa34"
+    },
+    {
+      "bytes": 1758,
+      "name": "combined-focused-provenance.json",
+      "sha256": "1a1177c92f6b5cb17fad6d07d459e3eca3ab6315e2c07c217fba4914188c2133"
+    },
+    {
+      "bytes": 6816,
+      "name": "failure-before-observations.jsonl",
+      "sha256": "f9a2815bc06bd148a53dffc8bef97052f84c0033724799971b3bb2b373d10533"
+    },
+    {
+      "bytes": 2832,
+      "name": "failure-before-outcomes.jsonl",
+      "sha256": "cb1d18a2da0dcd6e6c1b2afd8fa6d93471e612910f43ad3465132c48a91d08a8"
+    },
+    {
+      "bytes": 1189,
+      "name": "failure-before-provenance.json",
+      "sha256": "869552c8cd004e596a5e6aae11bfd70bcef5bf96fc9c09fa3dbcc767e5009bac"
+    },
+    {
+      "bytes": 504,
+      "name": "outcomes.txt",
+      "sha256": "b4dad7995137d8db3e3a3730be3641d9f7c381ebe291a75359065620871e7c25"
+    },
+    {
+      "bytes": 15533,
+      "name": "scoped-after-provenance.json",
+      "sha256": "72d032eae874210153efbcb3ed57cba69f510078103831a23de668e649b39fd7"
+    },
+    {
+      "bytes": 951,
+      "name": "scoped-controls-outcomes.jsonl",
+      "sha256": "0caf2fcb88cf4bdce895866e31bf612565d387f182e888f24548ffe4ef78f5eb"
+    },
+    {
+      "bytes": 55933,
+      "name": "scoped-controls-pairs-01.jsonl",
+      "sha256": "04986a5bde9f8360f2b32dfe14541e1a37ef92da3560ee13e257b78ef3e8f0ca"
+    },
+    {
+      "bytes": 56260,
+      "name": "scoped-controls-pairs-02.jsonl",
+      "sha256": "c2e1159323ef2511ee3ebe429c62f486bbdd4802515969e4b48134d28af4246c"
+    },
+    {
+      "bytes": 56260,
+      "name": "scoped-controls-pairs-03.jsonl",
+      "sha256": "fa8468d2b4ceeee4e41fdf570d28e8f049a8535ec24936a2311bb6783308a3a4"
+    },
+    {
+      "bytes": 55342,
+      "name": "scoped-controls-pairs-04.jsonl",
+      "sha256": "e0a8df608dfe6e72533764c4e59d3cbd675436d5b9d2be975dce85f93b8dacb9"
+    },
+    {
+      "bytes": 55075,
+      "name": "scoped-controls-pairs-05.jsonl",
+      "sha256": "990ec6186f35e50ea2ab521be1d5f634e4db1774a39384f7b66dc7e4616d58a1"
+    },
+    {
+      "bytes": 54962,
+      "name": "scoped-controls-pairs-06.jsonl",
+      "sha256": "a96766d12087d52828671848e733a1c7f04fe113dbadff6c09cfb7f13e5ce899"
+    },
+    {
+      "bytes": 55040,
+      "name": "scoped-controls-pairs-07.jsonl",
+      "sha256": "fe96f118776b1adcf96637826d4382d7967c60cb56ff36f375334153284eb4d6"
+    },
+    {
+      "bytes": 22003,
+      "name": "scoped-controls-pairs-08.jsonl",
+      "sha256": "93be8443de87b570b440cf10457df9a43fd88f26eca954dae8ddd863e37a9ccc"
+    }
+  ],
+  "counts": {
+    "combined_focused_executions": 321,
+    "combined_focused_passed": 321,
+    "failure_before_executions": 24,
+    "failure_before_failed": 24,
+    "scoped_control_pairs": 37,
+    "scoped_control_passed": 9,
+    "scoped_control_readings": 74,
+    "scoped_control_tests": 9
+  },
+  "redaction": "No raw logs, overlay content, source content, binaries, commands, or absolute paths are included.",
+  "schema": "throughput-fix-2/pending-probe-observer-evidence-manifest-v1"
+}

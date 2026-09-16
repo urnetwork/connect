@@ -384,15 +384,16 @@ type windowPacingWrite struct {
 // measures the changed path. Keep its earliest covering ACK before send-loop
 // coalescing can absorb that timestamp into a later head.
 type windowPacingRoundTripProbe struct {
-	sequenceId   Id
-	messageId    Id
-	number       uint64
-	sentAt       time.Time
-	ackedAt      time.Time
-	compression  time.Duration
-	written      bool
-	serviceRate  ByteCount
-	resetService bool
+	sequenceId       Id
+	messageId        Id
+	number           uint64
+	sentAt           time.Time
+	ackedAt          time.Time
+	compression      time.Duration
+	written          bool
+	serviceRate      ByteCount
+	resetService     bool
+	pendingByteCount ByteCount
 }
 
 // Records delivery while send workers are pacing. SACKs may complete the
@@ -448,7 +449,7 @@ func (self *windowPacingService) beginWriteWithLock(sequenceId, messageId Id, nu
 	}
 	self.writes[sequenceId] = windowPacingWrite{messageId: messageId, unambiguous: !resend, pending: true, generation: self.drainGeneration}
 	if unqueued {
-		self.roundTripProbe = windowPacingRoundTripProbe{sequenceId: sequenceId, messageId: messageId, number: number, sentAt: at, serviceRate: self.serviceHoldRate, resetService: self.drainServiceEpoch}
+		self.roundTripProbe = windowPacingRoundTripProbe{sequenceId: sequenceId, messageId: messageId, number: number, sentAt: at, serviceRate: self.serviceHoldRate, resetService: self.drainServiceEpoch, pendingByteCount: max(0, self.drainedSent-self.total)}
 	} else if resend && self.roundTripProbe.messageId == messageId {
 		self.roundTripProbe = windowPacingRoundTripProbe{}
 	}
@@ -723,6 +724,11 @@ func (self *windowPacingService) observe(bytes ByteCount, at time.Time) {
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if probe := &self.roundTripProbe; probe.resetService && !at.After(probe.sentAt) {
+		// Only older arrivals complete the drained train's missing samples.
+		// Current delivery must not spend that older byte credit.
+		probe.pendingByteCount = max(0, probe.pendingByteCount-bytes)
+	}
 	self.total += bytes
 	if at.Before(self.serviceEpochAt) {
 		return
@@ -768,14 +774,26 @@ func (self *windowPacingService) observe(bytes ByteCount, at time.Time) {
 // The bounded peak excludes idle gaps; the latest positive sample is a
 // conservative fallback when no recent delivery can refresh the estimate.
 func (self *windowPacingService) measured(horizon time.Duration, now time.Time) (ByteCount, ByteCount, ByteCount) {
+	return self.measure(horizon, now, true)
+}
+
+// A statistics reader computes the same estimate without advancing the hold
+// later captured by physical probes. Only controller reads retain evidence.
+func (self *windowPacingService) measure(horizon time.Duration, now time.Time, retain bool) (ByteCount, ByteCount, ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	rate, latest := ByteCount(0), ByteCount(0)
 	epochAt, hold := self.serviceEpochAt, self.serviceHoldRate
-	if probe := self.roundTripProbe; probe.resetService && epochAt.Before(probe.ackedAt) {
-		// A synchronous ACK may precede write confirmation. Exclude
-		// its idle gap provisionally without discarding the old epoch.
-		epochAt, hold = probe.ackedAt, probe.serviceRate
+	if probe := self.roundTripProbe; probe.resetService {
+		// Tail ACKs can prove delivery before their coalesced bytes apply.
+		// A partial old train cannot replace its held service during that gap.
+		boundary := probe.ackedAt
+		if boundary.IsZero() && probe.pendingByteCount > 0 {
+			boundary = probe.sentAt.Add(time.Nanosecond)
+		}
+		if epochAt.Before(boundary) {
+			epochAt, hold = boundary, probe.serviceRate
+		}
 	}
 	var samples [deliveredBytesRingSize]*windowServiceSample
 	count := 0
@@ -872,10 +890,18 @@ func (self *windowPacingService) measured(horizon time.Duration, now time.Time) 
 			bytes += samples[j].bytes
 		}
 	}
-	if rate > 0 {
-		self.serviceHoldRate = rate
-	} else if latest > 0 {
-		self.serviceHoldRate = latest
+	if rate > 0 || latest > 0 {
+		if retain {
+			self.serviceHoldRate = rate
+			if rate == 0 {
+				self.serviceHoldRate = latest
+			}
+			if self.roundTripProbe.resetService {
+				// A sibling may deliver fresh service before this probe's ACK.
+				// Later confirmation cannot restore the superseded held rate.
+				self.roundTripProbe.serviceRate = self.serviceHoldRate
+			}
+		}
 	} else {
 		latest = hold
 	}

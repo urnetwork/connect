@@ -1,0 +1,22 @@
+{
+  "binary_sha256": "c2b568af31b83faaf94c70800e2d303e7304d8514d47fc84b03733fc3ce935f1",
+  "effective_source_sha256": "4b5fa01b9a32401a9dac32fc16c155c8d8236a0be4c3eb40ed1d07dfb695118d",
+  "exit_code": 1,
+  "outcomes": {
+    "FAIL": 24,
+    "PASS": 0,
+    "SKIP": 0,
+    "unique_tests": 8
+  },
+  "production_before_commit": "1bf11158c107b978a21eca5c9df0ad1ecf613985",
+  "purpose": "Final normal regression tests against pre-fix production files; all other build inputs use source538e6248",
+  "raw_log_sha256": "05bc9f3b81666a95719f1edd99a40aae3aac17580eef2b4aa22dd677476ea6b6",
+  "redaction": "Raw log, overlay content, source content, and binary are excluded; hashes plus sanitized outcomes and observations are retained.",
+  "repetitions": 3,
+  "schema": "throughput-fix-2/pending-probe-observer-failure-before-provenance-v1",
+  "test_pattern": "^TestWindowPacing(DestinationStats|PendingControlledProbe|PendingProbe|PendingNewBytes)",
+  "test_sha256": {
+    "transfer_window_pacing_pending_test.go": "b048c45ba996b8615df8c89ce2d8d14d43155c49b4c519846ea161c5be6d1f4b",
+    "transfer_window_stats_observer_test.go": "9b6862b2225a276423b965911ee8a78604b2adec64656ffa46093a235a907a2d"
+  }
+}

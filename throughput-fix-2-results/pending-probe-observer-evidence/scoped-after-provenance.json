@@ -1,0 +1,310 @@
+{
+  "acceptance_summary": {
+    "capacity_recovery_seconds": 13,
+    "long_feedback_mbps": 95.85664,
+    "long_feedback_reference_mbps": 95.8464,
+    "rtt_growth_100mb_mbps": 95.80544,
+    "rtt_growth_1gb_mbps": 958.0544,
+    "slow_shared_mbps": 0.96256,
+    "slow_shared_min_flow_mbps": 0.11776,
+    "slow_shared_reference_mbps": 0.9472
+  },
+  "adjacent_contracts": [
+    "Failed H1, retry, changed carrier, cancellation and missing reply do not commit a service epoch.",
+    "A natural probe keeps old usable service evidence.",
+    "Fresh sibling service can supersede the held rate before the probe ACK and must survive later confirmation.",
+    "A fully applied old train remains eligible before the probe reply.",
+    "New bytes cannot numerically close an old ACK application gap."
+  ],
+  "artifact_pins": {
+    "idle-before-pacing.go": {
+      "bytes": 39571,
+      "sha256": "c3aa8b115da61d1acc7ec90d572377301ab8f66f10ec6fb64f4217daea847592"
+    },
+    "pending-before-overlay.json": {
+      "bytes": 282,
+      "sha256": "eb5fc430818474b45c2018f5448d21beabcfc3e2de85798a333ff2fa10cab30d"
+    },
+    "pending-counted-overlay.json": {
+      "bytes": 286,
+      "sha256": "c1c06030f35dd24f38761a5cfc7511e906c2af18fcbf9759111f826939187ac2"
+    },
+    "pending-counted-pacing.go": {
+      "bytes": 40368,
+      "sha256": "d358c597cf7c115827100ede4fd16a679b7f359e01001a21796ad985cec07f08"
+    },
+    "pending-counted-short-model-overlay.json": {
+      "bytes": 432,
+      "sha256": "3069215ad4619def5e4ea79335d0e5256b435a1d7c2dedf0459ef2427251f94f"
+    },
+    "pending-gap-overlay.json": {
+      "bytes": 282,
+      "sha256": "a16e401e3249f1256989e80ed28317a96747fb0bb0af002dad54db5627916ae9"
+    },
+    "pending-gap-pacing.go": {
+      "bytes": 39970,
+      "sha256": "92a7de1bb81121db76fcde15ea1378274d7bd14dd55f04a580bb4d89c0e6b541"
+    },
+    "pending-probe-test.go": {
+      "bytes": 12948,
+      "sha256": "88c2283c52db4c341cb2dd9e28d998b453b7269c10b5b997b3b187e84fc0a442"
+    },
+    "rtt-only-service-test.go": {
+      "bytes": 16887,
+      "sha256": "4bb546a8d3ca857831a392909bd410cb627dca184a21cbc0d2f57c5f3caae8d8"
+    }
+  },
+  "baseline": {
+    "canonical_source_sha256_reconstructed_from_commit": "5605efa750834abb352be42548f7c20cd55f56d154a2837dc5996e8b580180f7",
+    "commit": "1bf11158c107b978a21eca5c9df0ad1ecf613985",
+    "pacing_sha256": "c3aa8b115da61d1acc7ec90d572377301ab8f66f10ec6fb64f4217daea847592"
+  },
+  "overlay_effective_source_sha256_reconstructed_at_handoff": {
+    "pending-before-overlay.json": "64915fceb9b4d51fd8c60c12f6ac2c97a5e66a3c368e5d4c6867450b7f52b823",
+    "pending-counted-overlay.json": "13578fc0889769a06fd8ee50ae8ed02c11837b32615c49c049fa14464bc8a477",
+    "pending-counted-short-model-overlay.json": "4ec3123d60d6d3ff78e4cf29c28c0deafe574d00fe938c48e59571d3cde8e760",
+    "pending-gap-overlay.json": "8d0ca115fb1f54bdca358de550434effcdb1ab471e69c7f30fc1a464035d9fee"
+  },
+  "provenance_limits": [
+    "These are completed ad hoc go test -overlay runs, not throughput runner checkpoints.",
+    "Source/overlay/file hashes were recorded at handoff after the tests; no before/after frozen-build manifest was captured for these runs.",
+    "The shared source remained on committed 1bf11158 during these final runs. Root subsequently landed the combined observer correction before this provenance file was written.",
+    "Effective source hashes are reconstructed from committed baseline blobs plus the retained overlay files, not captured build manifests.",
+    "No host TCP or SDK duplex result is attributed to this correction. Raw transition traces are diagnostic and excluded from this handoff."
+  ],
+  "redaction": "Commands, absolute paths, raw logs, overlay contents, source contents, and binaries are excluded. Only outcomes, numerical rows, hashes, and stated limits are retained.",
+  "root_effect": {
+    "after_expected_sibling_release_ns": 18181819,
+    "before_sibling_release_ns": 47274172,
+    "held_service_bytes_per_second": 125000,
+    "mechanism": "ACKs prove the old physical tails drained before every old delivery byte reaches the sample ring. Partial old evidence must not price a sibling reservation while the resumed controlled probe remains unconfirmed. Count only missing old ACK bytes; fresh current bytes cannot finish that old count.",
+    "rate_before_bytes_per_second": 48076
+  },
+  "runs": [
+    {
+      "expected_exit_code": 1,
+      "kind": "deterministic_failure_before",
+      "log": {
+        "bytes": 7026,
+        "outcomes": {
+          "FAIL": 15,
+          "PASS": 0,
+          "SKIP": 0
+        },
+        "package_result_lines": [
+          "FAIL\tgithub.com/urnetwork/connect\t1.328s"
+        ],
+        "service_readings": 0,
+        "sha256": "68efcbcc825f3f528469977009830712f3e7fc924f780222fadf9d19f220a058",
+        "test_names": [
+          "TestWindowPacingPendingControlledProbeKeepsSiblingRate",
+          "TestWindowPacingPendingNewBytesCannotFinishOldTrain",
+          "TestWindowPacingPendingProbeAcceptsCompleteDrainedTrain",
+          "TestWindowPacingPendingProbeAcceptsFreshSiblingEvidence",
+          "TestWindowPacingPendingProbeInvalidationRestoresSamples"
+        ]
+      },
+      "recorded_exit_code": 1
+    },
+    {
+      "kind": "focused_race_after",
+      "log": {
+        "bytes": 19277,
+        "outcomes": {
+          "FAIL": 0,
+          "PASS": 105,
+          "SKIP": 0
+        },
+        "package_result_lines": [
+          "ok  \tgithub.com/urnetwork/connect\t1.979s"
+        ],
+        "service_readings": 0,
+        "sha256": "3ea1fad7cb47409da5d0fbdbe7dea64d2c6dd74ce6a1119b6ee8093f74f17dba",
+        "test_names": [
+          "TestWindowBucketStatsAcceptsRetainedOutOfOrderMeasurements",
+          "TestWindowBucketStatsExactBoundaries",
+          "TestWindowBucketStatsExpirationCannotOverwriteTheHold",
+          "TestWindowBucketStatsLeadingUnknownAndLateHold",
+          "TestWindowBucketStatsPartialAfterIdleKeepsCompletedHold",
+          "TestWindowBucketStatsResetCarriesBurstUntilNewEvidence",
+          "TestWindowBucketStatsResetRejectsEarlierEpoch",
+          "TestWindowBucketStatsWeightsCompletedBucketsEqually",
+          "TestWindowBucketStatsZeroOrderHoldDistinguishesMeasuredZero",
+          "TestWindowBurstPacingBoundsBusyAndIdleWrites",
+          "TestWindowBurstPacingCancellationJoinsWait",
+          "TestWindowBurstPacingRetainsBoundedTimerLateness",
+          "TestWindowPacingAbandonedDrainCannotResetLaterService",
+          "TestWindowPacingAdmissionCannotCreditAnUnbegunWrite",
+          "TestWindowPacingAmbiguousDeliveryCannotSetRelayRoundTrip",
+          "TestWindowPacingBacklogProbeAndCanceledOwnership",
+          "TestWindowPacingBackloggedServiceUsesSustainedDelivery",
+          "TestWindowPacingBackloggedSparseHeadsKeepTheirTime",
+          "TestWindowPacingBurstAccountsFullLargeMessages",
+          "TestWindowPacingBurstBytesUseTheServiceEstimate",
+          "TestWindowPacingBurstEpochFollowsActualDispatch",
+          "TestWindowPacingBurstEstimateChanges",
+          "TestWindowPacingBurstLimitsAreIndependent",
+          "TestWindowPacingBurstMeterCreditAndEstimateChanges",
+          "TestWindowPacingBurstMeterEstimateRoundTripRetainsOnlyRealDebt",
+          "TestWindowPacingBurstMeterOutOfOrderUpdates",
+          "TestWindowPacingBurstStatsAcceptRetainedAfterReset",
+          "TestWindowPacingBurstStatsAcceptRetainedCurrentBurst",
+          "TestWindowPacingBurstStatsRejectLateOlderBursts",
+          "TestWindowPacingBurstStatsResetOnEachBurst",
+          "TestWindowPacingBurstTimeBoundCannotOverflow",
+          "TestWindowPacingCanceledDeliveredTailCannotHideNewFlight",
+          "TestWindowPacingCanceledHeadTransfersControlledDrain",
+          "TestWindowPacingCanceledSmallWrite",
+          "TestWindowPacingCanceledTailNeedsFreshDelivery",
+          "TestWindowPacingCanceledWaitersPreserveTheirSuccessors",
+          "TestWindowPacingCancellationDuringProbe",
+          "TestWindowPacingCancellationDuringTimerDispatch",
+          "TestWindowPacingCarrierChangeInvalidatesProbeBeforeUnpacedRetry",
+          "TestWindowPacingChangedEstimateRetainsActualBurstCharge",
+          "TestWindowPacingCoalescerPreservesDrainedProbeArrival",
+          "TestWindowPacingContinuousFlightRefreshesChangedRoundTrip",
+          "TestWindowPacingCreditsTheFirstWireEnvelope",
+          "TestWindowPacingDecreasedEstimateCannotForgiveALateRelease",
+          "TestWindowPacingDelayedDrainObservationKeepsSerialization",
+          "TestWindowPacingDelayedWakeKeepsService",
+          "TestWindowPacingDeliveredSiblingTailsAreNotWireFlight",
+          "TestWindowPacingDrainDurationCannotOverflow",
+          "TestWindowPacingDrainNeedsDeliveryAndHasDeadline",
+          "TestWindowPacingDrainedProbeHoldsServiceUntilFreshEvidence",
+          "TestWindowPacingDrainedProbeRejectsAmbiguousEvidence",
+          "TestWindowPacingDrainedProbeRequiresEverySibling",
+          "TestWindowPacingDrainedProbeSurvivesHeadCompression",
+          "TestWindowPacingDrainsAQueueAtEachServiceRate",
+          "TestWindowPacingFlightIncludesEstimatedBurstBytes",
+          "TestWindowPacingLastCanceledDemandStartsSourceIdle",
+          "TestWindowPacingLateDispatchKeepsSuccessfulDrainEpoch",
+          "TestWindowPacingLocalHistoryRetainsStableFeedbackSpan",
+          "TestWindowPacingMissingProbeKeepsFreshServiceEvidence",
+          "TestWindowPacingNaturalProbePreservesSerializationEvidence",
+          "TestWindowPacingOneMessageIsNotAStandingQueue",
+          "TestWindowPacingOpeningProbeCoversBoundedCompression",
+          "TestWindowPacingPackWaitingBeforeReservationAcceptsFreshService",
+          "TestWindowPacingPendingControlledProbeKeepsSiblingRate",
+          "TestWindowPacingPendingNewBytesCannotFinishOldTrain",
+          "TestWindowPacingPendingProbeAcceptsCompleteDrainedTrain",
+          "TestWindowPacingPendingProbeAcceptsFreshSiblingEvidence",
+          "TestWindowPacingPendingProbeInvalidationRestoresSamples",
+          "TestWindowPacingProbeAckBeforeWriteConfirmationHoldsService",
+          "TestWindowPacingProbeBoundaryIdleAndIndependentSequences",
+          "TestWindowPacingProbeNeedsQueueDelayEvidence",
+          "TestWindowPacingPropagationIncludesOneMessageOfRounding",
+          "TestWindowPacingQueueEstimateDoesNotIncludeWindowLimitedIdle",
+          "TestWindowPacingQueuedDemandPreservesNaturalSerialization",
+          "TestWindowPacingRateBoundsAndHandshake",
+          "TestWindowPacingRecoveryCannotCarrySourceIdleToLaterWrites",
+          "TestWindowPacingResizedSamplesExpireRetainedTime",
+          "TestWindowPacingResizedSamplesKeepFirstBytesAndReordering",
+          "TestWindowPacingResizedSamplesRespectServiceEpoch",
+          "TestWindowPacingRetainsServiceUntilFeedbackCanReturn",
+          "TestWindowPacingRoundTripExcludesLocalWriteWait",
+          "TestWindowPacingSerializationCannotOverflow",
+          "TestWindowPacingServiceByteEnvelope",
+          "TestWindowPacingServiceChangesPreserveDebt",
+          "TestWindowPacingServiceCountsSacksOnce",
+          "TestWindowPacingServiceMeasurementAcrossAckCompression",
+          "TestWindowPacingServiceMeasurementExcludesWindowIdleAndExpires",
+          "TestWindowPacingServiceUsesAckArrival",
+          "TestWindowPacingSharedBurstsBoundActualDispatch",
+          "TestWindowPacingSharedCompressionUsesAWholeAckInterval",
+          "TestWindowPacingSharedProbeAndServiceIsolation",
+          "TestWindowPacingSharedServiceEnvelopeAndCancellation",
+          "TestWindowPacingSharedShortTrainAcrossSampleBoundaries",
+          "TestWindowPacingSharedSourceIdleRequiresEveryTail",
+          "TestWindowPacingShortAndCompressedTrainEdges",
+          "TestWindowPacingShorterRoundTripKeepsFasterServiceEvidence",
+          "TestWindowPacingSlowServiceDeferralNeedsFreshProgress",
+          "TestWindowPacingSlowerServiceSupersedesFastHistory",
+          "TestWindowPacingSourceIdleCancellationPreservesSuccessor",
+          "TestWindowPacingSourceIdleRequiresConfirmationAndFreshEvidence",
+          "TestWindowPacingUsesDeliveryBeforeTheConfiguredTarget",
+          "TestWindowPacingWaitingReservationsAreNotWireFlight",
+          "TestWindowPacingWaitingRetryRetainsMessageFloor",
+          "TestWindowPacingWaitingWritersKeepReservationOrder",
+          "TestWindowPacingWindowUsesRefreshedServiceResidence"
+        ]
+      },
+      "recorded_exit_code": 0
+    },
+    {
+      "kind": "affected_model_controls_after",
+      "log": {
+        "bytes": 419724,
+        "outcomes": {
+          "FAIL": 0,
+          "PASS": 9,
+          "SKIP": 0
+        },
+        "package_result_lines": [
+          "ok  \tgithub.com/urnetwork/connect\t113.238s"
+        ],
+        "service_readings": 74,
+        "sha256": "d6a425fb84d114261976051d82dd64b6c4ae166fe008b7beaed14001d7d2ba3a",
+        "test_names": [
+          "TestWindowPathServiceAcrossRepeatedDrains",
+          "TestWindowPathServiceCapacityChanges",
+          "TestWindowPathServiceCapacityIncreaseRecovery",
+          "TestWindowPathServiceDelayedPacingWake",
+          "TestWindowPathServiceLargeMessageCapacityChanges",
+          "TestWindowPathServiceLongCompressedFeedback",
+          "TestWindowPathServiceRoundTripChanges",
+          "TestWindowPathServiceSettledLargeMessageCapacityChanges",
+          "TestWindowPathServicesShareFiniteRelay"
+        ]
+      },
+      "paired_readings": 37,
+      "recorded_exit_code": 0
+    },
+    {
+      "kind": "short_exact_controls_after",
+      "log": {
+        "bytes": 68101,
+        "outcomes": {
+          "FAIL": 0,
+          "PASS": 6,
+          "SKIP": 0
+        },
+        "package_result_lines": [
+          "ok  \tgithub.com/urnetwork/connect\t7.401s"
+        ],
+        "service_readings": 12,
+        "sha256": "f273c711869f51431423f3e08138808e3b07d96215085ae942e1bef31ab6cc83",
+        "test_names": [
+          "TestWindowPathServiceRoundTripChanges",
+          "TestWindowPathServicesShareFiniteRelay"
+        ]
+      },
+      "recorded_exit_code": 0
+    },
+    {
+      "expected_exit_code": 1,
+      "failure": "A global total-versus-drainedSent comparison lets one new 20,000-byte checkpoint falsely complete old evidence, reporting 142857 B/s instead of holding125000 B/s; it also hides the later fresh50000 B/s pair.",
+      "kind": "counterfactual_global_total_gap_failure",
+      "log": {
+        "bytes": 1137,
+        "outcomes": {
+          "FAIL": 3,
+          "PASS": 0,
+          "SKIP": 0
+        },
+        "package_result_lines": [
+          "FAIL\tgithub.com/urnetwork/connect\t0.780s"
+        ],
+        "service_readings": 0,
+        "sha256": "55a0a63b3e73bbb4796a9cee99280dd71913537749be8c0ec0e7f9397ed87bf4",
+        "test_names": [
+          "TestWindowPacingPendingNewBytesCannotFinishOldTrain"
+        ]
+      },
+      "provenance_note": "This historical counterfactual log used a preceding test-file revision: its assertion lines are nine lines earlier than the retained final file. The final five-test failure-before and focused-after logs above use the retained final test. The counterfactual production file is retained and pinned here.",
+      "recorded_exit_code": 1
+    }
+  ],
+  "schema": "throughput-fix-2/pending-probe-observer-scoped-overlay-provenance-v1",
+  "scope": "Pending controlled-probe service measurement and sibling pacing correction; observer changes are not included in these results.",
+  "shared_source_sha256_at_handoff": "538e6248fb744795d9e829e97e503744ed70284d107ebad10da646b56bf6e460"
+}

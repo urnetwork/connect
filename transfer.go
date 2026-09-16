@@ -5957,7 +5957,7 @@ func (self *SendBuffer) DestinationSendStats(destinationId Id) SendDestinationSt
 		// the window's own lock is a leaf, and the buffer lock above is
 		// already released
 		// the largest window any of them computed, with its evidence
-		if windowEstimate := sequence.sendWindowEstimate(now); stats.SendWindow.Window < windowEstimate.Window ||
+		if windowEstimate := sequence.sendWindowSnapshot(now); stats.SendWindow.Window < windowEstimate.Window ||
 			(windowEstimate.Sized && !stats.SendWindow.Sized) {
 			stats.SendWindow = windowEstimate
 		}
@@ -10315,8 +10315,14 @@ func (self *SendSequence) deliveredRate(minSpan time.Duration) (ByteCount, time.
 // feedback interval and uses a sustained rate when queue residence is observed.
 // Isolated checkpoint fixtures use the bounded local history below.
 func (self *SendSequence) deliveredServiceRate(horizon time.Duration, now time.Time) (ByteCount, ByteCount, ByteCount) {
+	return self.deliveryServiceEstimate(horizon, now, true)
+}
+
+// Reading statistics must not advance the service hold used by the sender.
+// Standalone sequence histories already have no read-side mutation.
+func (self *SendSequence) deliveryServiceEstimate(horizon time.Duration, now time.Time, retain bool) (ByteCount, ByteCount, ByteCount) {
 	if service := self.windowPacer.service; service != nil {
-		return service.measured(horizon, now)
+		return service.measure(horizon, now, retain)
 	}
 	if self.sendBufferSettings != nil {
 		interval := self.deliveredBytesSampleInterval()
@@ -10640,6 +10646,18 @@ type SendWindowEstimate struct {
 // estimate with samples for the round trip. That makes the safe configuration
 // the default and the unsafe one unreachable, rather than documented.
 func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
+	return self.estimateSendWindow(now, true)
+}
+
+// Report current evidence without allowing a statistics consumer to change
+// which service rate a later physical drain probe will preserve.
+func (self *SendSequence) sendWindowSnapshot(now time.Time) SendWindowEstimate {
+	return self.estimateSendWindow(now, false)
+}
+
+// Admission and statistics share one window rule. Only admission retains
+// measured service for a later no-evidence interval.
+func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) SendWindowEstimate {
 	// The initial size is the value before the estimate has samples, and
 	// nothing after it. It is a bet, and a bet that cannot be walked back is
 	// not a bet: as the rule's lower clamp a wide-area initial would stand as
@@ -10682,7 +10700,7 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 		// Another logical sequence may already have measured this shared
 		// service before this sequence has its first RTT sample.
 		if service := self.windowPacer.service; service != nil {
-			rate, total, latest := service.measured(time.Second, now)
+			rate, total, latest := service.measure(time.Second, now, retainService)
 			if total >= kib(4) {
 				estimate.ServiceByteRate = rate
 				if rate == 0 {
@@ -10848,7 +10866,7 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 	}
 	estimate.WindowRoundTrip = estimate.RoundTrip + estimate.AckCompressTimeout
 	estimate.SampleCount = self.deliveredSampleCount()
-	service, serviceDelivered, latestService := self.deliveredServiceRate(max(2*estimate.WindowRoundTrip, 4*self.deliveredBytesSampleInterval()), now)
+	service, serviceDelivered, latestService := self.deliveryServiceEstimate(max(2*estimate.WindowRoundTrip, 4*self.deliveredBytesSampleInterval()), now, retainService)
 	estimate.ServiceByteRate = service
 	// A few complete data frames establish serialization even when the
 	// opening window takes seconds to drain on a slow link. Requiring that

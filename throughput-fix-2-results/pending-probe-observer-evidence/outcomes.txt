@@ -1,0 +1,5 @@
+failure-before: 24 expected failures; 8 tests × 3 repetitions; pre-fix production commit 1bf11158
+combined focused after: 321 race passes; 107 tests × 3 repetitions
+scoped controls after: 9 tests passed; 74 full numerical service readings grouped as 37 ceiling/delivery pairs
+scoped short exact controls after: 6 passes; counterfactual global-total gap: 3 expected failures
+limits: scoped overlay evidence is not a throughput-runner checkpoint; reconstructed hashes are identified in scoped provenance
