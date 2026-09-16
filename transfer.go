@@ -11014,6 +11014,9 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 	// reads twice that and the cap does not bind, while a path carrying less
 	// comes down on its own evidence. The protection against oversizing is
 	// intact and it only ever acts downward.
+	if service := self.windowPacer.service; service != nil && self.transferFlightPolicy().h1Only {
+		stepAtNanos = max(stepAtNanos, service.windowDeliveryStep())
+	}
 	if spanStartNanos < stepAtNanos {
 		estimate.Reason = "delivery measured before the window stepped"
 		return estimate

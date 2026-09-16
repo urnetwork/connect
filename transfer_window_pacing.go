@@ -330,21 +330,22 @@ func (self *windowBurstPacer) waitUntilChanged(ctx context.Context, deadline tim
 // opening probe. References are protected by SendBuffer.mutex; all timing and
 // delivery methods below are safe for concurrent use.
 type windowPacingService struct {
-	stateLock         sync.Mutex
-	references        int
-	next              time.Time
-	burst             windowPacingBurst
-	dispatchBurst     windowPacingBurst
-	burstEstimateTime time.Duration
-	burstMeter        windowPacingBurstMeter
-	waiterHead        *windowPacingWaiter
-	waiterTail        *windowPacingWaiter
-	probeSent         ByteCount
-	samples           [deliveredBytesRingSize]windowServiceSample
-	newestBucket      int64
-	hasSamples        bool
-	serviceEpochAt    time.Time
-	serviceHoldRate   ByteCount
+	stateLock                sync.Mutex
+	references               int
+	next                     time.Time
+	burst                    windowPacingBurst
+	dispatchBurst            windowPacingBurst
+	burstEstimateTime        time.Duration
+	burstMeter               windowPacingBurstMeter
+	waiterHead               *windowPacingWaiter
+	waiterTail               *windowPacingWaiter
+	probeSent                ByteCount
+	samples                  [deliveredBytesRingSize]windowServiceSample
+	newestBucket             int64
+	hasSamples               bool
+	serviceEpochAt           time.Time
+	serviceHoldRate          ByteCount
+	windowDeliveryAfterNanos int64
 	// Fixed summaries survive ACK gaps longer than the timestamp ring.
 	// An incomplete cycle holds service; actual timestamps or fully applied
 	// proved delivery complete it, independently of the old byte rate.
@@ -573,10 +574,19 @@ func (self *windowPacingService) applyRoundTripProbeWithLock() {
 			self.feedbackCycle, self.feedbackComplete, self.feedbackFresh = windowServiceSample{}, windowServiceSample{}, windowServiceSample{}
 			self.feedbackPending, self.feedbackDrainAt, self.feedbackDrainPending, self.feedbackInterval = false, time.Time{}, 0, 0
 		}
+		evidenceAt := probe.ackedAt
+		if self.lastRoundTrip.After(evidenceAt) {
+			evidenceAt = self.lastRoundTrip
+		}
+		previousPath := self.roundTripEvidenceWithLock(evidenceAt).minimum
 		if probe.receiverTimingSet {
 			self.receiverRoundTrips.confirmBaseline(probe.receiverTiming)
 		}
 		self.observeRoundTripWithLock(probe.ackedAt.Sub(probe.sentAt), probe.compression, probe.ackedAt, true)
+		if currentPath := self.roundTripEvidenceWithLock(evidenceAt).minimum; previousPath > 0 && currentPath > previousPath {
+			// Delivery from the old, smaller flight cannot qualify the new path.
+			self.windowDeliveryAfterNanos = max(self.windowDeliveryAfterNanos, probe.ackedAt.UnixNano())
+		}
 	}
 }
 
@@ -1320,4 +1330,12 @@ func (self *windowBurstPacer) close() {
 		self.serviceAcked = 0
 		self.service.stateLock.Unlock()
 	}
+}
+
+// A physically proved path increase shares one bounded history boundary.
+// Statistics only read it; ordinary queued observations cannot advance it.
+func (self *windowPacingService) windowDeliveryStep() int64 {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.windowDeliveryAfterNanos
 }

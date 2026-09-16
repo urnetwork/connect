@@ -1,0 +1,32 @@
+{
+  "after_current_correctness_selector": {
+    "fail": 0,
+    "pass": 338,
+    "race_warnings": 0,
+    "skip": 0
+  },
+  "after_full_correctness_binary_sha256": "dde59a3a0e37627fcd396f655e357cb7011b9dc982075594add0fa0c8b0eba27",
+  "after_full_correctness_loadavg_end": [
+    15.22119140625,
+    11.6298828125,
+    11.380859375
+  ],
+  "after_full_correctness_loadavg_start": [
+    10.2607421875,
+    10.4677734375,
+    10.9765625
+  ],
+  "after_full_correctness_source_input_sha256": "4219e5c5d1c34acc008eb42a1c7886935dddaa322214f3cb20ca6bc64f005bdd",
+  "after_scoped_roots": {
+    "fail": 0,
+    "pass": 33,
+    "race_warnings": 0
+  },
+  "before_scoped_roots": {
+    "fail": 18,
+    "pass": 15,
+    "race_warnings": 0
+  },
+  "classification": "semantic/correctness evidence for the reviewed proof port; no performance acceptance claim",
+  "no_quiescence_wait": true
+}

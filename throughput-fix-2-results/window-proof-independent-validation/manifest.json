@@ -1,0 +1,8 @@
+{
+  "archive": "window-proof-independent-validation",
+  "payload_sha256": {
+    "outcomes.jsonl": "7f8769ae16467392050763b16fb892d57fc8510d68e3ce3b1a4ba1bb4f9ac138",
+    "source-pins.json": "62ebbf39700ccab15c03baa6c7b0b24e3f8a4639103c7dbe140c54c1279584cc",
+    "status.json": "612c1d7228266a1088d473d30e50a3f3a9f3f4d51915a902fe45013482f888fb"
+  }
+}
