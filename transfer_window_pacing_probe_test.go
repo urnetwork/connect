@@ -23,6 +23,10 @@ func TestWindowPacingDrainedProbeHoldsServiceUntilFreshEvidence(t *testing.T) {
 		service.beginWrite(sequenceId, tail, 1, start, false)
 		service.finishWrite(sequenceId, tail, true)
 		service.observe(2671, start)
+		service.observeRoundTrip(2*time.Second, 50*time.Millisecond, start.Add(100*time.Millisecond))
+		if delay, _ := service.admitBurst(start.Add(110*time.Millisecond), 2671, false, &windowPacingWaiter{}); delay <= 0 {
+			t.Fatal("the service did not request a controlled drain")
+		}
 		drainedAt := start.Add(550 * time.Millisecond)
 		service.acknowledgeWrite(sequenceId, tail, 1, false, 50*time.Millisecond, drainedAt)
 		service.observe(6875000, drainedAt)
@@ -54,6 +58,15 @@ func TestWindowPacingDrainedProbeHoldsServiceUntilFreshEvidence(t *testing.T) {
 		if rate, _, _ := service.measured(time.Second, resumedAt.Add(100*time.Millisecond)); rate != 1250000 {
 			t.Errorf("covering=%t: fresh slower service did not replace the hold: %d B/s", covering, rate)
 		}
+		at := resumedAt.Add(100 * time.Millisecond)
+		service.acknowledgeWrite(sequenceId, probe, 2, false, 50*time.Millisecond, at)
+		natural := NewId()
+		service.beginWrite(sequenceId, natural, 3, at, false)
+		service.finishWrite(sequenceId, natural, true)
+		service.acknowledgeWrite(sequenceId, natural, 3, false, 50*time.Millisecond, at.Add(50*time.Millisecond))
+		if service.serviceEpochAt != resumedAt {
+			t.Errorf("covering=%t: a later natural probe reused the controlled drain: epoch=%s want=%s", covering, service.serviceEpochAt, resumedAt)
+		}
 	}
 }
 
@@ -69,6 +82,10 @@ func TestWindowPacingProbeAckBeforeWriteConfirmationHoldsService(t *testing.T) {
 		service.beginWrite(sequenceId, tail, 1, start, false)
 		service.finishWrite(sequenceId, tail, true)
 		service.observe(2671, start)
+		service.observeRoundTrip(2*time.Second, 50*time.Millisecond, start.Add(100*time.Millisecond))
+		if delay, _ := service.admitBurst(start.Add(110*time.Millisecond), 2671, false, &windowPacingWaiter{}); delay <= 0 {
+			t.Fatal("the service did not request a controlled drain")
+		}
 		drainedAt := start.Add(550 * time.Millisecond)
 		service.acknowledgeWrite(sequenceId, tail, 1, false, 50*time.Millisecond, drainedAt)
 		service.observe(6875000, drainedAt)
@@ -91,6 +108,179 @@ func TestWindowPacingProbeAckBeforeWriteConfirmationHoldsService(t *testing.T) {
 			t.Errorf("h1=%t: write confirmation left the wrong sample epoch: rate=%d latest=%d want=%d", h1, rate, latest, want)
 		}
 	}
+}
+
+// A packet can finish before its paced successor is released. That natural
+// empty flight still supplies the serialization interval needed to discover
+// added capacity, including when its ACK precedes write confirmation.
+func TestWindowPacingNaturalProbePreservesSerializationEvidence(t *testing.T) {
+	for _, ackFirst := range []bool{false, true} {
+		start := time.Unix(1700000000, 0)
+		service := &windowPacingService{}
+		sequenceId, tail, probe := NewId(), NewId(), NewId()
+		service.observeRoundTrip(100*time.Millisecond, 10*time.Millisecond, start)
+		service.beginWrite(sequenceId, tail, 1, start, false)
+		service.finishWrite(sequenceId, tail, true)
+		service.observe(100000, start)
+		at := start.Add(100 * time.Millisecond)
+		service.acknowledgeWrite(sequenceId, tail, 1, false, 10*time.Millisecond, at)
+		service.observe(100000, at)
+		if rate, _, _ := service.measured(time.Second, at); rate != 1000000 {
+			t.Fatalf("ack-first=%t: initial service=%d", ackFirst, rate)
+		}
+		service.beginWrite(sequenceId, probe, 2, at, false)
+		if !ackFirst {
+			service.finishWrite(sequenceId, probe, true)
+		}
+		at = at.Add(50 * time.Millisecond)
+		service.acknowledgeWrite(sequenceId, probe, 2, false, 10*time.Millisecond, at)
+		service.observe(100000, at)
+		if rate, _, latest := service.measured(time.Second, at); rate != 2000000 {
+			t.Errorf("ack-first=%t: natural empty flight lost faster serialization: rate=%d latest=%d", ackFirst, rate, latest)
+		}
+		if ackFirst {
+			service.finishWrite(sequenceId, probe, true)
+		}
+		if !service.serviceEpochAt.IsZero() || service.roundTrip() != 50*time.Millisecond {
+			t.Errorf("ack-first=%t: natural probe changed service epoch or lost RTT: epoch=%s rtt=%s", ackFirst, service.serviceEpochAt, service.roundTrip())
+		}
+	}
+}
+
+// A controlled pause marks only its first resumed physical write. Timeout,
+// retry, carrier change and cancellation cannot tag a later natural probe.
+func TestWindowPacingAbandonedDrainCannotResetLaterService(t *testing.T) {
+	for _, outcome := range []string{"timeout", "retry", "carrier-change", "cancel"} {
+		start := time.Unix(1700000000, 0)
+		service := &windowPacingService{}
+		sequenceId, tail, resumed := NewId(), NewId(), NewId()
+		service.observeRoundTrip(time.Millisecond, 0, start)
+		service.beginWrite(sequenceId, tail, 1, start, false)
+		service.finishWrite(sequenceId, tail, true)
+		service.observeRoundTrip(100*time.Millisecond, 0, start.Add(time.Millisecond))
+		if delay, _ := service.admitBurst(start.Add(10*time.Millisecond), 1000, false, &windowPacingWaiter{}); delay <= 0 {
+			t.Fatalf("%s: controlled drain was not armed", outcome)
+		}
+		at := start.Add(250 * time.Millisecond)
+		switch outcome {
+		case "timeout":
+			// The first resumed write still has an earlier unacked tail.
+			service.beginWrite(sequenceId, resumed, 2, at, false)
+			service.finishWrite(sequenceId, resumed, true)
+		case "retry":
+			service.acknowledgeWrite(sequenceId, tail, 1, false, 0, at)
+			service.beginWrite(sequenceId, resumed, 2, at, true)
+			service.finishWrite(sequenceId, resumed, true)
+			service.beginWrite(sequenceId, resumed, 2, at, false)
+			service.finishWrite(sequenceId, resumed, true)
+		case "carrier-change":
+			service.acknowledgeWrite(sequenceId, tail, 1, false, 0, at)
+			service.invalidateProbe(sequenceId)
+			service.beginWrite(sequenceId, resumed, 2, at, false)
+			service.finishWrite(sequenceId, resumed, true)
+		case "cancel":
+			pacer := &windowBurstPacer{service: service, serviceSequenceId: sequenceId}
+			pacer.close()
+			sequenceId = NewId()
+			service.beginWrite(sequenceId, resumed, 2, at, false)
+			service.finishWrite(sequenceId, resumed, true)
+		}
+		at = at.Add(time.Millisecond)
+		service.acknowledgeWrite(sequenceId, resumed, 2, false, 0, at)
+		probe := NewId()
+		service.beginWrite(sequenceId, probe, 3, at, false)
+		service.finishWrite(sequenceId, probe, true)
+		at = at.Add(100 * time.Millisecond)
+		service.acknowledgeWrite(sequenceId, probe, 3, false, 0, at)
+		if !service.serviceEpochAt.IsZero() || service.roundTrip() != 100*time.Millisecond {
+			t.Errorf("%s: abandoned drain marked a later natural probe: epoch=%s rtt=%s", outcome, service.serviceEpochAt, service.roundTrip())
+		}
+	}
+}
+
+// A successful tail ACK ends the controlled gap even if its waiting writer
+// is dispatched after the original deadline. No intervening physical write
+// means that timer lateness cannot turn this into a natural serialization gap.
+func TestWindowPacingLateDispatchKeepsSuccessfulDrainEpoch(t *testing.T) {
+	start := time.Unix(1700000000, 0)
+	service := &windowPacingService{}
+	sequenceId, tail, probe := NewId(), NewId(), NewId()
+	service.observeRoundTrip(time.Millisecond, 0, start)
+	service.beginWrite(sequenceId, tail, 1, start, false)
+	service.finishWrite(sequenceId, tail, true)
+	pausedAt := start.Add(20 * time.Millisecond)
+	service.observeRoundTrip(100*time.Millisecond, 0, pausedAt.Add(-10*time.Millisecond))
+	waiter := &windowPacingWaiter{}
+	service.reserve(pausedAt, 1000, 1000000, 1000000, 0, 0, false, waiter)
+	delay, _ := service.admitBurst(pausedAt, 1000, false, waiter)
+	if delay <= 0 {
+		t.Fatal("the controlled drain was not armed")
+	}
+	service.acknowledgeWrite(sequenceId, tail, 1, false, 0, pausedAt.Add(time.Millisecond))
+	resumedAt := pausedAt.Add(delay + time.Millisecond)
+	if delay, _ := service.admitBurst(resumedAt, 1000, false, waiter); delay != 0 {
+		t.Fatalf("successful drain did not release late dispatch: %s", delay)
+	}
+	service.beginWrite(sequenceId, probe, 2, resumedAt, false)
+	service.finishWrite(sequenceId, probe, true)
+	ackedAt := resumedAt.Add(100 * time.Millisecond)
+	service.acknowledgeWrite(sequenceId, probe, 2, false, 0, ackedAt)
+	if service.serviceEpochAt != ackedAt {
+		t.Fatalf("late dispatch lost the successful drain: epoch=%s want=%s", service.serviceEpochAt, ackedAt)
+	}
+}
+
+// Canceling the first waiting producer transfers the same service pause to
+// its FIFO successor. The tail's later ACK still proves a controlled gap;
+// cancellation of a writer that never started cannot discard that evidence.
+func TestWindowPacingCanceledHeadTransfersControlledDrain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		service := &windowPacingService{}
+		tailSequence, tail := NewId(), NewId()
+		service.observeRoundTrip(time.Millisecond, 0, time.Now())
+		service.beginWrite(tailSequence, tail, 1, time.Now(), false)
+		service.finishWrite(tailSequence, tail, true)
+		service.observeRoundTrip(100*time.Millisecond, 0, time.Now())
+		time.Sleep(20 * time.Millisecond)
+		headCtx, cancelHead := context.WithCancel(context.Background())
+		defer cancelHead()
+		head := &windowBurstPacer{service: service, serviceSequenceId: NewId(), rate: 1000000}
+		next := &windowBurstPacer{service: service, serviceSequenceId: NewId(), rate: 1000000}
+		defer head.close()
+		defer next.close()
+		headDone, nextDone := make(chan error, 1), make(chan error, 1)
+		go func() {
+			headDone <- head.waitForServiceMessage(headCtx, 1000, false, head.serviceSequenceId, NewId(), 1)
+		}()
+		synctest.Wait()
+		probe := NewId()
+		go func() {
+			nextDone <- next.waitForServiceMessage(context.Background(), 1000, false, next.serviceSequenceId, probe, 1)
+		}()
+		synctest.Wait()
+		service.stateLock.Lock()
+		armed := !service.drainUntil.IsZero() && service.waiterHead == &head.waiter && service.waiterTail == &next.waiter
+		service.stateLock.Unlock()
+		if !armed {
+			t.Fatal("both producers did not enter the shared controlled pause")
+		}
+		cancelHead()
+		if err := <-headDone; err != context.Canceled {
+			t.Fatalf("head cancellation returned %v", err)
+		}
+		synctest.Wait()
+		service.acknowledgeWrite(tailSequence, tail, 1, false, 0, time.Now())
+		if err := <-nextDone; err != nil {
+			t.Fatal(err)
+		}
+		service.finishWrite(next.serviceSequenceId, probe, true)
+		time.Sleep(100 * time.Millisecond)
+		ackedAt := time.Now()
+		service.acknowledgeWrite(next.serviceSequenceId, probe, 1, false, 0, ackedAt)
+		if service.serviceEpochAt != ackedAt {
+			t.Fatalf("head cancellation discarded its successor's controlled gap: epoch=%s want=%s", service.serviceEpochAt, ackedAt)
+		}
+	})
 }
 
 // Sending a probe is not a sampling barrier. A lost or unconfirmed reply

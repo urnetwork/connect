@@ -1,0 +1,21 @@
+=== RUN   TestWindowPacingDrainedProbeHoldsServiceUntilFreshEvidence
+    transfer_window_pacing_probe_test.go:68: covering=false: a later natural probe reused the controlled drain: epoch=2023-11-14 16:13:21.1 -0600 CST want=2023-11-14 16:13:20.95 -0600 CST
+    transfer_window_pacing_probe_test.go:68: covering=true: a later natural probe reused the controlled drain: epoch=2023-11-14 16:13:21.1 -0600 CST want=2023-11-14 16:13:20.95 -0600 CST
+--- FAIL: TestWindowPacingDrainedProbeHoldsServiceUntilFreshEvidence (0.00s)
+=== RUN   TestWindowPacingProbeAckBeforeWriteConfirmationHoldsService
+--- PASS: TestWindowPacingProbeAckBeforeWriteConfirmationHoldsService (0.00s)
+=== RUN   TestWindowPacingNaturalProbePreservesSerializationEvidence
+    transfer_window_pacing_probe_test.go:139: ack-first=false: natural empty flight lost faster serialization: rate=0 latest=1000000
+    transfer_window_pacing_probe_test.go:145: ack-first=false: natural probe changed service epoch or lost RTT: epoch=2023-11-14 16:13:20.15 -0600 CST rtt=50ms
+    transfer_window_pacing_probe_test.go:139: ack-first=true: natural empty flight lost faster serialization: rate=0 latest=1000000
+    transfer_window_pacing_probe_test.go:145: ack-first=true: natural probe changed service epoch or lost RTT: epoch=2023-11-14 16:13:20.15 -0600 CST rtt=50ms
+--- FAIL: TestWindowPacingNaturalProbePreservesSerializationEvidence (0.00s)
+=== RUN   TestWindowPacingAbandonedDrainCannotResetLaterService
+    transfer_window_pacing_probe_test.go:196: timeout: abandoned drain marked a later natural probe: epoch=2023-11-14 16:13:20.351 -0600 CST rtt=100ms
+    transfer_window_pacing_probe_test.go:196: retry: abandoned drain marked a later natural probe: epoch=2023-11-14 16:13:20.351 -0600 CST rtt=100ms
+    transfer_window_pacing_probe_test.go:196: carrier-change: abandoned drain marked a later natural probe: epoch=2023-11-14 16:13:20.351 -0600 CST rtt=100ms
+    transfer_window_pacing_probe_test.go:196: cancel: abandoned drain marked a later natural probe: epoch=2023-11-14 16:13:20.351 -0600 CST rtt=100ms
+--- FAIL: TestWindowPacingAbandonedDrainCannotResetLaterService (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	2.012s

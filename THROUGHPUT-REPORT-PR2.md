@@ -6,10 +6,19 @@ Original validation source revision: `b51530f3a402cb1dd5fe5d1daae344302a1f3069`
 Original validation source manifest: `034a8ba28c61e70407d050228067a342b36f49505ae915cb99a7824a19bd90ee`
 Server source revision reviewed: `77201554c49ec05bde83ec038bba6c600972892c`
 
-The completion audit and combined RTT fix below are working-tree follow-ups.
+The completion audit and combined RTT fix below were committed in `5a2f8a02`.
 The original full-suite results do not validate those later production edits.
 
 ## Current follow-up
+
+The latest correction distinguishes naturally empty flights from deliberate
+pacing pauses. It passes **156 tests under the race detector** and nine focused
+performance pairs on source SHA-256
+`f60cf11db4f0c7a928144ad78d1b9cebe96bbf8916fa620d1b58d01598fc613a`.
+The settled 64 KiB capacity-increase failure improves from 1.094 to 10.000 Mb/s.
+Full matrix confirmation on this source, convergence speed and host performance
+acceptance remain open. The completed broader checkpoint below tested the
+preceding source.
 
 The burst-ring follow-up adds deterministic failure-before tests for sparse
 ACK timing, FIFO fairness, continuous-flight RTT changes, the production
@@ -17,10 +26,12 @@ send/ACK handoff, burst epochs and byte debt across changing estimates.
 The committed follow-up passes all **152 tests under the race detector** in the
 full correctness selection on source SHA-256
 `b5b407364a99cbb0a022b5de897fc5eb8bade0593541ddd2e0b658636c692207`.
-Focused RTT, shared-service, long-feedback and large-message capacity controls
-also pass. The final full model, root regression and both TCP configurations
-are still running on this same source at commit time, under recorded concurrent
-load. Earlier checkpoints exposed the now-reproduced service-epoch defect and
+The full model also passes: **20 top-level tests, 268 paired cases and 500 ledger
+rows**. The default and 48 MiB TCP runs completed with two and four failed
+comparisons respectively, each also excluded by its controls. Root regression
+passes 2,996 tests with 24 skips and no failures. These runs share the same
+source and record concurrent host load. Earlier checkpoints exposed the
+now-reproduced service-epoch defect and
 uncensored short-path host download failures. The latter remain unattributed,
 so host acceptance is still open. The sections below preserve source hashes,
 failed comparisons and the boundary between completed and pending validation.
@@ -261,9 +272,9 @@ against a 993.657 Mb/s reference, with zero measured relay drops. The matrix
 crosses 0.3/100 ms RTT and one/eight flows. This proves the mechanism in a
 controlled model; attributing the host failures still requires matching evidence.
 
-### Working candidate: separate burst byte and duration limits
+### Separate burst byte and duration limits
 
-The working-tree pacer now follows the requested pair of limits. For an
+The pacer committed in `5a2f8a02` follows the requested pair of limits. For an
 estimate of **B bytes over T time**, the maximum bytes per burst is **B** and
 the maximum burst duration is **2 × T**. The named multiplier is
 `windowPacingBurstTimeScale`. The time multiplier does not enlarge the byte
@@ -324,8 +335,8 @@ delayed wakes and live window changes passing, but exposed two regressions:
 
 Those failing runs are retained. The full model, root regression and host jobs
 for the earlier checkpoint are still useful regression evidence, but they do
-not validate the newer refinements. All-cell performance acceptance and the
-working-tree commit remain open.
+not validate the newer refinements. The refinements are committed in
+`5a2f8a02`; all-cell performance acceptance remains open.
 
 The corrected estimator resets its rolling ring for each newer burst,
 carrying the preceding burst's mean as the zero-order hold. Independent tests
@@ -389,6 +400,86 @@ failure is a stalled flow in the upload reference; its candidate reached
 invalid reference is not evidence that the candidate is slow. All 168 ledger
 rows from each host run remain in the archive.
 
+### Committed service-epoch checkpoint
+
+Source SHA-256
+`b5b407364a99cbb0a022b5de897fc5eb8bade0593541ddd2e0b658636c692207`
+is committed in `5a2f8a02`. The race-enabled correctness selection passes all
+152 tests. The full deterministic model passes 20 tests and 268 paired cases,
+with all 500 ledger rows retained. These results precede the adjacent correction
+for naturally drained sparse traffic described below.
+
+Both host configurations completed 24 comparisons and retained 168 ledger rows
+each. Default buffers have two failed comparisons and ten exclusions; the
+48 MiB maximum has four failed comparisons and seven exclusions. Every failed
+comparison also has a control exclusion. These are failed performance gates
+with uncertain attribution, not passing capacity results.
+
+All failures are uploads with 10 ms ACK compression:
+
+| TCP buffer maximum | RTT | Flows | Repetition | Candidate / ceiling, Mb/s | Control exclusion |
+|---|---:|---:|---:|---:|---|
+| Default | 0.3 ms | 1 | 2 | 600.483 / 937.515 | A/A drift |
+| Default | 0.3 ms | 8 | 0 | 46.489 / 644.708 | A/A drift and low calibration |
+| 48 MiB | 0.3 ms | 1 | 2 | 766.441 / 942.192 | A/A drift |
+| 48 MiB | 0.3 ms | 8 | 0 | 403.946 / 663.407 | A/A drift and low calibration |
+| 48 MiB | 100 ms | 8 | 0 | 755.906 / 852.429 | Low calibration |
+| 48 MiB | 100 ms | 8 | 2 | 248.559 / 853.864 | Low calibration |
+
+The runs started immediately under recorded concurrent workload. The manifest,
+complete ledger, outcome excerpt and raw-log hash are retained in each
+`*-burst-ring-final-service-epoch` archive. Root regression passes 2,996 tests
+with 24 skips and no failures. A later correction needs its own validation; these completed
+binaries continue to identify the source they actually tested.
+
+### Adjacent fix: distinguish natural drains from deliberate pauses
+
+Resetting the service history on every drained probe also discarded useful
+serialization evidence from sparse large messages. After a settled 1→10 Mb/s
+capacity increase, 64 KiB messages remained near 1.1 Mb/s, with no measured
+progress for one of eight flows. The earlier capacity-change matrix switched
+at 4 s, while the slow opening train could still be draining, so it missed this
+established-sender case.
+
+The correction marks only the first physical write after a deliberate pacing
+pause for a service-history reset. Natural probes still refresh RTT, and their
+adjacent ACKs can establish a faster service rate. Both confirmed and
+ACK-before-write-completion reads follow that distinction.
+
+The added four-cell matrix moves the capacity change from 4 s to 40 s and the
+measurement forward by the same 36 s. It retains the original post-change
+settling allowance, 16/64 KiB payloads, both rate directions, eight flows,
+100 ms RTT, 10 ms compression, minimum 64-message sample and 90% reference
+gate. Its earlier ten-second-after-change diagnostic remains separate recovery
+evidence; passing after settling does not establish identical adaptation speed.
+
+Review of the correction also caught two ways to discard a valid pause: a
+late timer dispatch and cancellation of the first waiting writer. The marker
+belongs to the shared service pause and survives both. Any intervening physical
+write consumes it, while failed, retried or canceled-tail delivery cannot
+certify a drained probe. These transitions have deterministic tests, including
+the real FIFO cancellation handoff under virtual time.
+
+The corrected source SHA-256 is
+`f60cf11db4f0c7a928144ad78d1b9cebe96bbf8916fa620d1b58d01598fc613a`.
+All 89 focused pacing/statistics tests pass under the race detector. The four
+new settled pairs, four original large-message change pairs and exact
+400 ms RTT/50 ms compression pair pass, with no measured relay drops. The
+previously failing settled 64 KiB increase reaches **10.000 Mb/s**, with every
+flow at 1.250 Mb/s, against the 10.000 Mb/s reference. The long-feedback case
+retains 95.846 Mb/s against 95.846 Mb/s. Full correctness passes all **156 tests
+under the race detector** on this source; the earlier full model and root runs remain attributed to
+`b5b40736`, not this later correction.
+
+Recovery speed remains a separate open measurement. In the retained diagnostic
+covering 10–13.3554432 s after the increase, the pre-service-epoch control reaches
+9.53125 Mb/s and the initial controlled-only correction reaches 7.34375 Mb/s.
+The latter's complete one-second intervals are 4.194304, 7.864320 and
+8.912896 Mb/s. Its service estimate reaches the full rate at 11.41 s after the
+change; that does not establish sustained 90% goodput at that time. The final
+settled test begins 34.05432 s after the change. Its pass closes the permanently
+held-rate failure while leaving convergence speed for a dedicated comparison.
+
 ### Deterministic tests for the new failure cases
 
 | Failure | Regression test and forced stimulus |
@@ -404,6 +495,10 @@ rows from each host run remain in the archive.
 | A nominal deadline forgave a late release before its bytes had serialized | `TestWindowPacingDecreasedEstimateCannotForgiveALateRelease` releases 8,000 bytes late, reduces the estimate and requires the original eight milliseconds of service before the next release. |
 | A confirmed drain's idle gap replaced established service with one probe's apparent rate | `TestWindowPacingDrainedProbeHoldsServiceUntilFreshEvidence` forces the old checkpoint to expire, checks direct and covering ACKs, then verifies that fresh slower service replaces the hold. |
 | Probe ACK processing outran confirmation of the physical write | `TestWindowPacingProbeAckBeforeWriteConfirmationHoldsService` observes and queries the ACK before confirming H1; unsuccessful confirmation retains the original sampling epoch. |
+| Naturally empty flights repeatedly discarded faster serialization evidence | `TestWindowPacingNaturalProbePreservesSerializationEvidence` doubles observed service with direct and ACK-before-write-completion orders while retaining the RTT refresh. |
+| An earlier drain could affect a later unrelated probe | `TestWindowPacingAbandonedDrainCannotResetLaterService` covers timeout, retry, carrier change and cancellation; the existing hold test also checks one-shot consumption. |
+| A proposed deadline clear discarded a successful drain after a late wake | `TestWindowPacingLateDispatchKeepsSuccessfulDrainEpoch` ACKs the tail within the pause, then explicitly calls admission beyond its deadline. |
+| A proposed cancellation clear discarded the successor's inherited pause | `TestWindowPacingCanceledHeadTransfersControlledDrain` forces two queued writers and a third sequence's tail, cancels the head, and completes the successor's real pacing handoff. |
 
 Each case has a recorded failure-before run. The byte meter preserves actual
 spent bytes separately from credit withheld by an estimate increase. It also
@@ -543,6 +638,12 @@ tools/throughput-fix-2.sh server-proxy /tmp/window-server-proxy
 
 Final collected evidence is under [throughput-fix-2-results](throughput-fix-2-results):
 
+- `correctness-burst-ring-final-controlled-epoch` — 156 passing race-enabled
+  correctness tests on the controlled-drain source;
+- `controlled-epoch-final` — focused passes, natural-drain and intermediate
+  correction failures, settled-capacity ledgers and separate recovery diagnostics;
+- `*-burst-ring-final-service-epoch` — the preceding source's complete
+  correctness, model, root regression and host TCP campaign;
 - `model-final` — deterministic model ledger and manifest;
 - `tcp-final` and `tcp-capacity` — host TCP ledgers;
 - `ack-final` — ACK benchmark and head-drain test;
@@ -558,13 +659,17 @@ ledger is in [THROUGHPUT-PR2-RESULTS.md](THROUGHPUT-PR2-RESULTS.md).
 
 ## Remaining work
 
-1. Reconcile the local launcher/container PostgreSQL credential and rerun the
-   deferred `server/connect` and `server/proxy` integration selections through
-   `server/test.sh`.
-2. Obtain the native H1/TUN rig source, complete ledger and packet traces, or
-   repeat that campaign with an equivalent published harness.
-3. Run longer actual-relay pressure, shard-collision, bidirectional and
-   multiple-peer campaigns before making a deployment-wide pacing claim.
-4. Resolve the slow host cells against the new explicit comparison gate,
-   including the declining single-flow upload. Keep instrumentation limits,
-   shared host load and candidate performance effects independently testable.
+1. Confirm the full matrix on the controlled-drain source and measure capacity
+   recovery speed as well as settled throughput. Keep each correction separate
+   from the source tested by an earlier binary.
+2. Resolve slow host cells against the explicit comparison gate. Keep
+   instrumentation limits, shared host load and candidate performance effects
+   independently testable; retain failed and excluded comparisons.
+3. The database-backed `server/connect` and `server/proxy` integration tiers
+   are deferred by the user for a later environment-correct run through
+   `server/test.sh`. Local credential repair is outside this run.
+4. Longer actual-relay pressure, shard-collision, bidirectional and multiple-peer
+   campaigns remain necessary before a deployment-wide claim. Continue with
+   our own published fixtures as requested; obtaining the reporter's missing
+   native rig is not a prerequisite for this work. Its missing traces still
+   limit attribution of the reporter's specific failures.

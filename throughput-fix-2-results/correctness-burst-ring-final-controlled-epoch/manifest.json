@@ -1,0 +1,35 @@
+{
+  "created_utc": "2026-09-16T00:24:29.309188+00:00",
+  "mode": "correctness",
+  "test_pattern": "^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "5a2f8a02b9fa51af9563c8699327baa433d3bf21",
+    "branch": "throughput-fix-2",
+    "source_sha256": "f60cf11db4f0c7a928144ad78d1b9cebe96bbf8916fa620d1b58d01598fc613a",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race"
+  ],
+  "runner_sha256": "6af611e430a6efe1820dad4649d52cb06bb6edbd0215218523bba11957eff293",
+  "host_load_average_at_start": [
+    16.12353515625,
+    21.12353515625,
+    26.9951171875
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "Controlled-drain follow-up correctness started immediately while concurrent root documentation, profiling, monitor tests, and peer work were active; no quiescence wait."
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "binary_sha256": "09602911a7e5f6cd433dcb766348d81d70852c1264ea8ec725ea962417b170e5",
+  "sources_stable_during_build": true
+}

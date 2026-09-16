@@ -24,12 +24,23 @@ review, hypotheses, evidence limits and server follow-up work.
 
 ### Burst follow-up checkpoint
 
+The latest controlled-drain correction passes 156 race-enabled correctness tests
+and nine focused performance pairs on source SHA-256
+`f60cf11db4f0c7a928144ad78d1b9cebe96bbf8916fa620d1b58d01598fc613a`.
+It preserves serialization evidence across natural drains and fixes the settled
+64 KiB capacity increase from 1.094 to 10.000 Mb/s. Full matrix confirmation,
+recovery speed and host acceptance remain open; see the report for the retained
+diagnostics and deterministic failure-before tests.
+
 The committed follow-up's final correctness run passes 152 tests under `-race`
 on source SHA-256
 `b5b407364a99cbb0a022b5de897fc5eb8bade0593541ddd2e0b658636c692207`.
-Its full model, root regression and both host TCP configurations are running
-at commit time. The later report sections distinguish those pending results
-from the earlier checkpoints below; host acceptance remains open.
+Its full model passes 20 top-level tests and 268 paired cases, retaining all
+500 ledger rows. Both host configurations completed with failed comparisons
+that also have control exclusions; root regression passes 2,996 tests with
+24 skips and no failures. The report
+distinguishes these results from earlier checkpoints; host acceptance remains
+open.
 
 The results below describe the original committed implementation. A later
 working-tree checkpoint, source SHA-256

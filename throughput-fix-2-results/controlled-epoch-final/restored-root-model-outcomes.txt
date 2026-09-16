@@ -1,0 +1,8 @@
+=== RUN   TestWindowPathServiceLargeMessageCapacityChanges
+--- PASS: TestWindowPathServiceLargeMessageCapacityChanges (0.41s)
+=== RUN   TestWindowPathServiceSettledLargeMessageCapacityChanges
+--- PASS: TestWindowPathServiceSettledLargeMessageCapacityChanges (0.89s)
+=== RUN   TestWindowPathServiceLongCompressedFeedback
+--- PASS: TestWindowPathServiceLongCompressedFeedback (0.62s)
+PASS
+ok  	github.com/urnetwork/connect	2.693s

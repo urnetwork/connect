@@ -65,6 +65,14 @@ reproductions to their failed outcomes and current test names. Final confirmatio
 results and source boundaries belong in the report, including any later fix
 for reordered samples after a ring reset.
 
+The completed `*-burst-ring-final-service-epoch` archives retain the full
+`b5b40736` campaign: passing correctness, model and root regression, plus failed
+host comparisons with control exclusions. The subsequent `controlled-epoch-final`
+archive records the natural-drain correction, its deterministic failures and
+nine passing focused model pairs. Its adaptation diagnostics remain separate
+from settled-throughput acceptance. `correctness-burst-ring-final-controlled-epoch`
+passes all 156 tests under the race detector on source `f60cf11d`.
+
 Only numerical ledgers, manifests, provenance and outcome excerpts are part of
 the committed evidence. Raw logs and test binaries remain local. The collector
 keeps raw-log hashes and copies complete comparison ledgers; it does not remove

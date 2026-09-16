@@ -354,6 +354,7 @@ type windowPacingService struct {
 	drainCheckAt        time.Time
 	drainUntil          time.Time
 	drainWake           chan struct{}
+	drainServiceEpoch   bool
 	bucketInterval      time.Duration
 	writes              map[Id]windowPacingWrite
 	pendingWrites       int
@@ -379,14 +380,15 @@ type windowPacingWrite struct {
 // measures the changed path. Keep its earliest covering ACK before send-loop
 // coalescing can absorb that timestamp into a later head.
 type windowPacingRoundTripProbe struct {
-	sequenceId  Id
-	messageId   Id
-	number      uint64
-	sentAt      time.Time
-	ackedAt     time.Time
-	compression time.Duration
-	written     bool
-	serviceRate ByteCount
+	sequenceId   Id
+	messageId    Id
+	number       uint64
+	sentAt       time.Time
+	ackedAt      time.Time
+	compression  time.Duration
+	written      bool
+	serviceRate  ByteCount
+	resetService bool
 }
 
 // Records delivery while send workers are pacing. SACKs may complete the
@@ -438,10 +440,13 @@ func (self *windowPacingService) beginWriteWithLock(sequenceId, messageId Id, nu
 	}
 	self.writes[sequenceId] = windowPacingWrite{messageId: messageId, unambiguous: !resend, pending: true, generation: self.drainGeneration}
 	if unqueued {
-		self.roundTripProbe = windowPacingRoundTripProbe{sequenceId: sequenceId, messageId: messageId, number: number, sentAt: at, serviceRate: self.serviceHoldRate}
+		self.roundTripProbe = windowPacingRoundTripProbe{sequenceId: sequenceId, messageId: messageId, number: number, sentAt: at, serviceRate: self.serviceHoldRate, resetService: self.drainServiceEpoch}
 	} else if resend && self.roundTripProbe.messageId == messageId {
 		self.roundTripProbe = windowPacingRoundTripProbe{}
 	}
+	// The pause belongs to this first resumed write, including retries.
+	// A later naturally empty flight must retain its serialization samples.
+	self.drainServiceEpoch = false
 }
 
 // Recovery can bypass H1 pacing after a carrier change. Invalidate at the
@@ -449,6 +454,7 @@ func (self *windowPacingService) beginWriteWithLock(sequenceId, messageId Id, nu
 func (self *windowPacingService) invalidateProbe(sequenceId Id) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.drainServiceEpoch = false
 	if self.roundTripProbe.sequenceId == sequenceId {
 		self.roundTripProbe = windowPacingRoundTripProbe{}
 	}
@@ -494,9 +500,11 @@ func (self *windowPacingService) applyRoundTripProbeWithLock() {
 	probe := self.roundTripProbe
 	if probe.written && !probe.ackedAt.IsZero() {
 		self.roundTripProbe = windowPacingRoundTripProbe{}
-		// The drained gap contains local idle, not serialization. Keep
+		// A requested drain contains local idle, not serialization. Keep
 		// the established rate until the resumed train measures service.
-		self.serviceEpochAt, self.serviceHoldRate = probe.ackedAt, probe.serviceRate
+		if probe.resetService {
+			self.serviceEpochAt, self.serviceHoldRate = probe.ackedAt, probe.serviceRate
+		}
 		self.observeRoundTripWithLock(probe.ackedAt.Sub(probe.sentAt), probe.compression, probe.ackedAt, true)
 	}
 }
@@ -648,6 +656,7 @@ func (self *windowPacingService) admitBurst(now time.Time, bytes ByteCount, rese
 				// The cumulative tail ACK still has to prove an empty relay.
 				span := max(4*deliverySizedWindowSampleInterval, 2*min(windowPacingDrainMaximumTime/2, residence))
 				self.drainUntil = now.Add(span)
+				self.drainServiceEpoch = true
 				self.drainCheckAt = now.Add(max(windowPacingDrainMinimumInterval, 8*span))
 				if self.drainWake == nil {
 					self.drainWake = make(chan struct{}, 1)
@@ -730,7 +739,7 @@ func (self *windowPacingService) measured(horizon time.Duration, now time.Time) 
 	defer self.stateLock.Unlock()
 	rate, latest := ByteCount(0), ByteCount(0)
 	epochAt, hold := self.serviceEpochAt, self.serviceHoldRate
-	if probe := self.roundTripProbe; epochAt.Before(probe.ackedAt) {
+	if probe := self.roundTripProbe; probe.resetService && epochAt.Before(probe.ackedAt) {
 		// A synchronous ACK may precede write confirmation. Exclude
 		// its idle gap provisionally without discarding the old epoch.
 		epochAt, hold = probe.ackedAt, probe.serviceRate

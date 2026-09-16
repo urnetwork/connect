@@ -1,0 +1,25 @@
+{
+  "initial_controlled_only_overlay_trace": {
+    "category": "diagnostic intermediate source",
+    "input_sha256": "5b9268c932bfad3ad8fc879d8f697924621de830668426731e27ae8a88e87f62",
+    "source_note": "Initial controlled-only overlay trace; no raw trace lines are archived and it is not asserted equivalent to the final frozen source.",
+    "structured_service_reading_count": 2
+  },
+  "measurement_comparison": {
+    "initial_controlled_overlay_candidate_mbps": 7.34375,
+    "measurement_window_after_change_seconds": {
+      "end": 13.3554432,
+      "start": 10
+    },
+    "pre_service_epoch_baseline_candidate_mbps": 9.53125,
+    "rate_change_after_seconds": 40,
+    "statement": "The differing diagnostic measurements do not claim identical recovery speed."
+  },
+  "pre_service_epoch_control": {
+    "category": "adaptation control",
+    "input_sha256": "b7c06eed7d289dad496a6995bb6c8706a525fbc9aefd98461b7d04b0c6f80fd2",
+    "source_note": "Pre-service-epoch baseline supplied for comparison.",
+    "structured_service_reading_count": 8
+  },
+  "purpose": "Numerical-ledger-only adaptation diagnostics. Raw trace lines are deliberately excluded."
+}

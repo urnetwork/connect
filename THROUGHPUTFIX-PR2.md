@@ -960,8 +960,8 @@ checkpoint expired, the next small probe over a 400 ms idle gap appeared to
 establish a service near 6.7 kB/s. That false measurement reserved another long
 wait which later ACK traffic could not undo.
 
-The correction records a new ACK-time service epoch only after a drained probe
-is confirmed. It holds the established pre-probe service until fresh checkpoints
+The correction records a new ACK-time service epoch only after a probe from a
+deliberate pacing drain is confirmed. It holds the established pre-probe service until fresh checkpoints
 replace it, while late old ACKs still release delivered-byte ownership. The hold
 is captured before the probe is exposed so ACK-before-write-confirmation order
 cannot overwrite it with the invalid gap measurement. Direct and covering ACKs,
@@ -988,6 +988,41 @@ that message is acknowledged while smaller traffic keeps the service occupied.
 It must cover older queued physical messages. No failing performance case has
 yet shown that this conservative retention needs a production change; a mixed
 large-then-small traffic experiment should precede any attempt to shrink it.
+
+## 18. Preserve natural serialization while excluding deliberate pauses
+
+The adjacent review found that the first service-epoch correction also reset
+history on naturally empty flights. An established sparse sender then repeatedly
+discarded the two ACK checkpoints needed to discover a faster service. With
+64 KiB messages, eight flows, 100 ms RTT and 10 ms compression, a settled
+1→10 Mb/s change remained near 1.1 Mb/s and one flow made no measured progress.
+The pre-epoch implementation reached 9.531 Mb/s in the same diagnostic interval.
+
+The original large-message matrix changed capacity at 4 s, during a slow
+opening train that can last about 33 s. Add a separate matrix with the change at
+40 s. Move its measurement forward by the same 36 s so the post-change settling
+allowance, minimum 64-message sample, reference and 90% gate remain identical.
+Retain the earlier ten-second-after-change diagnostic as adaptation evidence;
+steady-state acceptance must not imply identical recovery speed.
+
+Only a deliberate pacing pause marks the next physical write for a service
+epoch reset. Natural probes still refresh RTT and preserve their serialization
+checkpoints. The marker must follow the service pause across a late dispatch
+or cancellation of a waiting writer. The first physical write consumes it;
+retry, ambiguous delivery and canceled tail ownership cannot certify a drain.
+Test both ACK/write-completion orders, slower fresh evidence, successful delayed
+dispatch, abandoned drains and FIFO-head cancellation before accepting the fix.
+
+The corrected source `f60cf11db4f0c7a928144ad78d1b9cebe96bbf8916fa620d1b58d01598fc613a`
+passes 89 focused race-enabled tests and all nine focused performance pairs.
+The full correctness selection also passes all 156 tests under the race detector.
+The settled 64 KiB increase now reaches 10.000 Mb/s, with 1.250 Mb/s per flow;
+the 400 ms RTT/50 ms compression case retains 95.846 Mb/s. Preserve the
+committed-source and intermediate-correction failure-before evidence separately.
+The shorter recovery diagnostic reaches 7.34375 Mb/s with the initial
+controlled-only correction versus 9.53125 Mb/s before service epochs. Reaching
+the full service estimate at 11.41 s does not prove full goodput then; a separate
+convergence comparison must retain the lower interval readings.
 
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md
