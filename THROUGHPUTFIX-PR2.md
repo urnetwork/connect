@@ -1272,5 +1272,14 @@ cell with the server-budget peer and constrained H1 provider. Keep each
 direction's acceptance gate and make the actual-carrier, userspace-TUN,
 unauthenticated-relay and disabled-Transfer-encryption scope explicit.
 
+The corrected generic TCP matrix now retains eight comparisons on `b6abfa4e`:
+six accepted, two one-flow/100 ms reference-calibration exclusions, and no
+candidate failures. A separate 48 MiB TCP-buffer control accepts both of those
+configured cells with 12 seconds per arm. Keep all default and capacity-control
+readings in `tcp-grouped-fixture` and `tcp-grouped-capacity`. The control changes
+both the TCP buffer maximum and measurement duration, so it does not by itself
+attribute default underfill to either setting. These generic FIFO/userspace-TUN
+campaigns do not close physical SDK duplex or broader host confirmation.
+
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md

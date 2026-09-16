@@ -73,6 +73,16 @@ open. The rejected ACK-tail candidate's complete diagnostic evidence remains
 in `sdk-ack-tail-v3-evidence`.
 See the report for failure-before evidence, source boundaries and remaining work.
 
+The corrected generic TCP matrix on `b6abfa4e` retains 32 readings and eight
+comparisons: six accepted, two excluded by reference calibration, no failed
+candidate comparisons. The exclusions are one-flow, 100 ms cells in each
+direction. A separate 48 MiB TCP-buffer control, measured for 12 seconds per
+arm instead of three, accepts both configured cells at 916.489 Mb/s download
+and 908.583 Mb/s upload. Its eight readings and two comparisons are retained
+separately; it does not replace the default-buffer exclusions or isolate the
+effect of the buffer change from measurement duration. Both campaigns ran
+under recorded concurrent work using the generic FIFO/userspace-TUN fixture.
+
 ### Burst follow-up checkpoint
 
 The controlled-drain correction passes 156 race-enabled correctness tests

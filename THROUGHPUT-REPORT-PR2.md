@@ -33,6 +33,13 @@ owned TLS/WebSockets reaches 91.469 Mb/s against a 91.550 Mb/s A/A reference.
 This uses a real TCP origin and userspace gVisor TUN. The new fixture/root tests
 are described below; production remains unchanged from `538e6248`.
 
+The corrected generic TCP matrix on the same source records eight comparisons:
+six accepted and two inconclusive because the one-flow, 100 ms references do
+not reach the link calibration threshold. No candidate fails its relative gate.
+A separate, longer 48 MiB TCP-buffer control accepts both of those configured
+cells, at 916.489 Mb/s download and 908.583 Mb/s upload. These FIFO/userspace-TUN
+results and their distinct buffer and duration settings are preserved below.
+
 The preceding source-idle correction, committed in `1bf11158`, retains measured
 service across a proven sender pause. Its deterministic replay keeps 125 MB/s
 and reduces the next write's virtual pacing delay from 18.430482186 s to zero.
@@ -857,6 +864,42 @@ arm, an owned unauthenticated relay, Transfer encryption disabled and userspace
 TUN. It does not complete native-TUN, actual-server, 1 Gb/s, bidirectional,
 multiple-peer or long-duration acceptance. Physical reproduction of the
 affected eight-flow SDK duplex cell is the next carrier experiment.
+
+### Generic TCP matrix after correcting packet groups
+
+Frozen source `b6abfa4e`, binary `04930b13`, runs download and upload at 0.3 ms
+and 100 ms RTT with one and eight flows, 10 ms ACK compression and three seconds
+of measurement per arm. Each cell retains the matched/ceiling/delivery/matched
+order. All 32 readings and eight comparisons remain in `tcp-grouped-fixture`.
+Both top-level tests pass; six comparisons are accepted, two are inconclusive,
+and none fails the candidate/reference gate.
+
+| Direction | RTT | Flows | Ceiling Mb/s | Delivery Mb/s | Result |
+|---|---:|---:|---:|---:|---|
+| Download | 0.3 ms | 1 | 909.931 | 914.517 | Accepted |
+| Download | 0.3 ms | 8 | 917.346 | 917.351 | Accepted |
+| Download | 100 ms | 1 | 161.847 | 161.890 | Reference below link calibration |
+| Download | 100 ms | 8 | 909.819 | 916.601 | Accepted |
+| Upload | 0.3 ms | 1 | 915.755 | 914.731 | Accepted |
+| Upload | 0.3 ms | 8 | 907.433 | 914.180 | Accepted |
+| Upload | 100 ms | 1 | 177.884 | 174.705 | Reference below link calibration |
+| Upload | 100 ms | 8 | 916.522 | 917.711 | Accepted |
+
+The separate capacity control uses `CONNECT_WINDOW_TCP_BUFFER_MAX_MIB=48`
+for the one-flow, 100 ms cells, with 12 seconds per arm and unchanged Transfer
+budgets and acceptance gates. Binary `d1ff0199` on the same source records
+917.344/916.489 Mb/s ceiling/delivery download and 916.338/908.583 Mb/s upload.
+Both comparisons pass with no exclusions; all eight readings and two
+comparisons remain in `tcp-grouped-capacity`. This establishes capacity for
+that buffer/duration configuration. Since both settings differ from the short
+default-buffer run, it does not isolate buffer size as the sole cause of the
+earlier underfill or erase those inconclusive comparisons.
+
+Both campaigns ran immediately alongside the sampler and physical-duplex
+experiments. Their manifests record host load and verified source snapshots.
+They use the generic FIFO, userspace TUN and owned TCP origin, not the constrained
+mobile SDK profile or a physical H1 carrier. These single repetitions do not
+close the older host failures or the broader confirmation campaign.
 
 ### Deterministic tests for the new failure cases
 

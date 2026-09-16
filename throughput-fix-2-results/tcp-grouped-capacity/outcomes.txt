@@ -1,0 +1,5 @@
+=== RUN   TestWindowTcpDownloadPerformanceMatrix
+--- PASS: TestWindowTcpDownloadPerformanceMatrix (59.22s)
+=== RUN   TestWindowTcpUploadPerformanceMatrix
+--- PASS: TestWindowTcpUploadPerformanceMatrix (59.22s)
+PASS
