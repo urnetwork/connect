@@ -11,40 +11,31 @@ The original full-suite results do not validate those later production edits.
 
 ## Current follow-up
 
-**Current experiment: validate grow-only window sizing and adaptive pacing
-before adding network-quality events.**
+**The grow-only window, adaptive pacer and network-quality phase are now
+implemented together.** Ordinary evidence may grow the learned byte window but
+cannot shrink it. `NetworkQualityChanged` opens one bounded remeasurement
+generation in which qualified fresh service and RTT evidence may replace the
+retained window. Pacing continues to adapt without a notification. A hard
+`NetworkChanged` also invalidates quality once while retaining its transport
+recovery behavior.
 
-**Core validation passes on the current source.** The live source includes the
-discovery floor, held pacing rate and exact-head receiver-timing correction.
-Current scoped SDK checks pass the constrained 400 ms cells; a matched
-prefix-only comparison also changes both retained device short-duplex roles
-from repeated failures to mostly passing results under their original per-direction
-throughput gate. The pinned after comparison still fails once at 855.296 Mb/s
-versus 957.2352 Mb/s reference. The exact-head checkpoint passes the full core
-model (35 definitions, 842 readings), combined correctness and root regression
-(25 expected skips). A later pacing candidate preserves the held pace through
-one permitted reverse burst. It passes the fresh full core model (36
-definitions, 846 readings) and combined race correctness (512 definitions).
-The matched root comparison changes 12 passes/three failures to 15 passes;
-both matched SDK arms pass five repetitions, which does not establish a
-throughput improvement. The final root regression passes 3,345 tests with 25
-existing skips and no failures. Scoped server regression passes 35 connect
-race tests and 28 proxy nonrace tests with the exact reviewed environment
-configuration. Older experimental
-full-model failures remain historical evidence. Caller cancellation and the
-physical policy-test correction are adopted and race-tested. Network-quality
-event wiring and the deferred server database integrations remain later steps.
+The public call is wired through the SDK and Android, Apple, Windows and Linux
+hosts. A client applies a local event to all of its estimators and sends a
+24-byte reliable reserved-subprotocol notification to known peers. A received
+event is source scoped, deduplicated and never echoed. Provider receive-only
+peers are included, so one `DeviceLocal` event reaches its local client and the
+clients using that provider. A refused zero-wait notification remains queued
+for bounded retry. Listener, peer and generation state all have
+deterministic lifecycle and memory-bound tests.
 
-**Notified path changes are a separate phase.** The user authorized deferring
-legitimate connection-quality-change tests until `NetworkQualityChanged` is
-implemented and then invoked by those tests. The new `model-core` runner mode
-records and excludes three explicit propagation-switch performance tests;
-the historical `model` mode remains intact. Static long-RTT recovery, ordinary
-congestion, ACK scheduling, window mismatch and ownership stay in core
-validation. See [the exact phase inventory](THROUGHPUTFIX-PR2.md#31-separate-notified-path-changes-from-core-pacing-validation).
-The [runner audit](throughput-fix-2-results/model-core-deferral-v1) verifies
-27 retained tests, exactly three deferrals, shell syntax and manifest recording.
-That selection audit is not a new performance run.
+The three formerly deferred path-change models now call the quality signal at
+their programmed switch and run in both `model` and the compatibility
+`model-core` mode. Their latest frozen checkpoint passes, as do all 18 core
+quality/drain roots, the 12-cell correctness matrix and the full model's 858
+rows. The final combined-source correctness, model and regression archive also
+passes and is recorded below. Earlier experiment and deferral passages in
+this report are chronological evidence and are superseded by the implementation
+sections near the end.
 
 The [shared-pacing review](throughput-fix-2-results/window-cumulative-shared-reserve-root-v3)
 now has a deterministic consumer reproduction:
@@ -514,7 +505,7 @@ working changes; their functional passes do not establish performance acceptance
 | Experimental receiver-clock hybrid | Narrower discovery handoff passes all 27 model tests and retains all 818 readings on effective inputs `b7e1d4b8`; the preceding version failed static mismatch and SDK bidirectional |
 | Experimental receive-queue safeguard | Full model passes all 27 tests and 818 readings; new upstream-buffer roots still fail |
 | New production failure cases | 33 tests repeated three times on `17780670`: 39 passes, 60 failures, no races; all twenty failing cases reproduce every time |
-| Full server database integration | Deferred as authorized |
+| Full server database integration | Deferred at this checkpoint; completed in the final server section below |
 
 The complete static matrix retains all 216 readings. Its source precedes the
 latest recovery correction; final combined regression and performance results
@@ -2932,12 +2923,270 @@ The peer review and research plan remain in
 [THROUGHPUTFIX-PR2.md](THROUGHPUTFIX-PR2.md), and the implementation/results
 ledger is in [THROUGHPUT-PR2-RESULTS.md](THROUGHPUT-PR2-RESULTS.md).
 
+## Network-quality estimator: bounded remeasurement and fresh evidence
+
+The estimator part of `NetworkQualityChanged` is implemented. A quality event
+starts a five-second remeasurement interval. It preserves the learned byte
+window and last valid service/RTT estimates provisionally; the event alone
+does not shrink a window. During that interval, admission may replace the
+learned window only after both service and RTT have fresh evidence from the
+new generation. After five seconds, the window returns to grow-only behavior.
+Ordinary sustained feedback still changes pacing without any notification.
+Reading statistics cannot commit a window change.
+
+The shared physical service owns the generation and coalesces notifications.
+Another event within five seconds of the previous notification does not open
+a new interval; continuous listener noise cannot keep shrinking enabled.
+A new generation requires five seconds of quiet. New sibling sequences inherit
+the service's original cutoff and expiry, so joining later cannot renew the
+permission. A generation check also rejects an old sizing computation that
+was already in progress when another sibling reset the shared service; it
+cannot publish either learned bytes or an old held pacing rate afterward.
+
+Physical first-write time decides which generation owns feedback. Old replies,
+late ACK-worker publication, pending receiver metadata and cumulative prefixes
+containing old writes still retire delivery and repay physical service credit,
+but cannot seed the new service or RTT measurements. Legacy echoed wall-clock
+tags cannot relabel an old physical write after a clock change. Reset preserves
+queued messages, pending writes, FIFO reservations, byte/burst bounds and their
+ownership; it adds no send allowance. The cumulative head/SACK representation
+and ACK message-size limits are unchanged.
+
+### Transition recovery and a queue that is already draining
+
+A short-to-long path transition exposed an adjacent deadline problem. The old
+300 ms recovery floor retried a first new-path write before its 1.2-second reply
+arrived, making the otherwise useful RTT ambiguous. While new-generation RTT
+is pending, recovery uses the configured cold floor, capped by the existing
+maximum. The narrow physical-service override applies only to a first reliable
+write in the new generation. Its deadline remains anchored to the physical
+write; repeated signals cannot extend it. Old, copied, unknown, unreliable or
+changed-carrier writes do not borrow that override. Fresh RTT restores ordinary
+sampled recovery.
+
+Removing those copies then revealed a separate throughput loss: an obligatory
+empty-flight RTT probe stopped service even though the existing queue was
+already draining. The cold-recovery candidate's long-path model averaged
+86.207147 Mb/s against 95.771307 Mb/s reference; its first interval delivered
+67.072 versus 95.764480 Mb/s. It had no measurement drops or timeout copies.
+The earlier retries had invalidated the drain proof and concealed this pause.
+
+The pacer now compares physical outstanding bytes over a complete feedback
+turn, at least 40 ms. A decline larger than one already permitted burst grants
+one more turn for natural draining. A stall, increase or burst-sized fluctuation
+cannot renew that grace, so the existing compulsory drain becomes eligible
+again. This changes when a drain starts; it preserves its cooldown, absolute
+deadline and physical proof. The deterministic pre-fix fixture starts a
+3.4-second stop with 26 MB outstanding and falling; the corrected fixture keeps
+service running, then restores the ordinary drain when repayment stalls.
+
+### Deterministic and changed-path evidence
+
+The core selection contains 18 deterministic top-level tests:
+
+| Coverage | Root tests |
+| --- | --- |
+| Fresh evidence, expiry and ordinary grow-only behavior | `TestWindowQualityShrinkNeedsFreshEvidenceAndExpires`, `TestWindowQualityLearnedWindowShrinksOnlyDuringFreshRemeasurement` |
+| Noise, shared ownership and sibling creation | `TestWindowQualityNoisyEventsNeedQuietBeforeNewGeneration`, `TestWindowQualityPeerScopeResetsSiblingServiceOnce`, `TestWindowQualityFreshSharedServiceResizesIdleSibling`, `TestWindowQualityNewSiblingCannotRenewSharedRemeasurement` |
+| Stale RTT, receiver metadata and wall-clock ordering | `TestWindowQualityRttOldRepliesCannotSeedNewGeneration`, `TestWindowQualityPendingReceiverAckCannotCrossConfirmation`, `TestWindowQualityLegacyWallClockCannotRelabelOldFirstWrite` |
+| Old/mixed credit and delayed publication | `TestWindowQualityOldAndMixedServiceCreditRepaysWithoutSampling`, `TestWindowQualityDelayedCreditKeepsOriginalGeneration`, `TestWindowQualityLogicalCreditRejectsOldWorkerAndMixedPrefix` |
+| Physical ownership and an in-progress sibling computation | `TestWindowQualityPreservesPacingAndLifetimeOwnership`, `TestWindowQualitySiblingResetRejectsInProgressOldEstimate` |
+| First new-path recovery and exclusions | `TestWindowQualityFirstNewPathReplyUsesColdRecoveryFloor`, `TestWindowQualityColdRecoveryIsOnlyForNewReliableFirstWrites` |
+| Natural drain and its congestion control | `TestWindowPacingNaturalQueueDrainDoesNotStopService`, `TestWindowPacingBurstNoiseCannotSuppressDrainProbe` |
+
+The complete selection passes three repetitions with `-race` in 1.814 seconds:
+
+```sh
+env CGO_ENABLED=0 GOCACHE=/tmp/codex-go-cache go test -race -count=3 \
+  -run '^(TestWindowQuality.*|TestWindowPacing(NaturalQueueDrainDoesNotStopService|BurstNoiseCannotSuppressDrainProbe))$' .
+```
+
+The three formerly deferred models now invoke the estimator signal at the
+programmed path switch: `TestWindowPathAckTailRoundTripGrowthControl`,
+`TestWindowPathServiceRoundTripChanges` and
+`TestWindowPathServiceRoundTripGrowthBeyondOldRing`. Their owned, cancellable
+fixture worker signals both endpoints at that boundary. Static-path and
+unnotified congestion/capacity controls receive no signal. The model uses the
+estimator entry directly; public notification and peer propagation are separate
+contracts, not extra traffic inserted into this fixed-capacity comparison.
+
+All three models passed the frozen natural-drain checkpoint. The long-path
+case delivered 95.771307 Mb/s versus 95.778133 Mb/s reference, with minimum
+flow 11.898880 Mb/s, no measurement drops and the original interval gates.
+Its local log is
+`/tmp/throughput-fix-2-terra-quality-natural-drain-1789612075/run.log`, SHA-256
+`972ccefc957ebe95aa264d2bbbc8d9c8820cced0fb59b7cb92c7a2a499456608`.
+The earlier two-of-three cold-recovery result remains at
+`/tmp/throughput-fix-2-terra-quality-core-candidate-v2-1789611632/run.log`, SHA-256
+`5ede224314a7d75c5742aecafa6363817a41578f7548171ac6fb534920e3240e`.
+The natural-drain checkpoint preceded the final two adjacent sibling-generation
+guards. The 18-root race result covers those guards. These checkpoint logs do
+not replace the combined validation below.
+
+### Final combined local validation
+
+The frozen v3 snapshot passes the corrected focused race selection, all three
+changed-path models, the 12-row correctness ledger, the 858-row full model and
+the broad regression. The first focused invocation contained an extra closing
+parenthesis in its test regular expression and exited before running a test;
+the retained `focused-rerun.log` is the corrected passing invocation. The
+production source from this snapshot is committed as `5cb64f2b`; the adjacent
+P2P fixture synchronization is `14aecd8f`.
+
+| Gate | Final result |
+| --- | --- |
+| Focused quality, subprotocol and P2P roots | Pass; corrected log SHA-256 `a09f5bedd01f0d6bd4e5cda87edb3eaf86da3d93ed3a2f1723271db1f429f583`. |
+| Three exact changed-path models | Pass in 1.42 s, 2.97 s and 37.31 s; log SHA-256 `4c49afc66fa2f9b21cfd9358ff7735c6d00fd239dfccbe768f7ee78ff6e34dd5`. |
+| Correctness | Pass, 12 rows; manifest SHA-256 `3d8df45214b7d1b6ac47be9f0500ae80e27edf5fa23a54c46cb30344bde0f11c`. |
+| Full model | Pass, 858 rows; manifest SHA-256 `0877825a09de397dbe3a17cc92413f0b8e493af6065ba864c6a2d22a52c1bee9`. |
+| Broad regression | Pass, 12 ledger rows and no failed or censored comparisons; manifest SHA-256 `0a394ec2ef18a97eac768875691a1db972d67f031c8a1cea97201c54302b3769`. |
+
+The archive is
+`/tmp/throughput-fix-2-terra-final-v3-1789614907`. It records starting load
+averages of 6.26, 7.08 and 9.62; the model finished at 11.94, 11.02 and 10.65,
+and the regression at 5.39, 8.90 and 9.86. Tests ran immediately under that
+concurrent load rather than waiting for quiescence.
+
+The only later source change was the callback-storm test described below. The
+v4 final-source quality selection passes three times under `-race`, including
+that root. Its log is
+`/tmp/throughput-fix-2-terra-v4-focused-1789616840/run.log`, SHA-256
+`18acdd7a58804ac8357ef44320d2418bc6b744a1c40ec5c4cd78220b9472b9e4`.
+It started at load 15.71, 21.64 and 17.63 and finished at 15.39, 20.98 and
+17.55. Because the addition is test-only, the v3 model and regression exercise
+the same production source now committed on the branch.
+
+## Public propagation and platform notification hooks
+
+`NetworkQualityChanged` is a distinct public signal. Its listeners enqueue work
+and never reconnect a healthy transport. `NetworkChanged` invokes that quality
+signal exactly once before its existing hard-network listeners. Each `Client`
+owns one worker and one reserved subprotocol callback for its lifetime; close
+unregisters both and joins the worker.
+
+Repeated callbacks are inherently idempotent. A client admits only one local
+generation until the listener has been quiet for five seconds, the shared
+physical service accepts that generation once, and the single client worker
+serializes estimator resets. Exact or older peer instance/generation messages
+are discarded before they reach the worker. The deterministic callback-storm
+root holds a live `DestinationSendStats` snapshot across reset, dispatches 128
+concurrent notifications and reads 32 public statistics snapshots. It requires
+one applied generation, valid snapshots under the race detector, and exactly
+one later generation after the quiet boundary. Three race repetitions pass;
+frequent cell-bar, cell-type, Wi-Fi-bar or link callbacks therefore do not
+repeatedly clear measurement history or race statistics readers.
+
+The peer message uses reserved subprotocol 1 and contains only a 16-byte client
+instance id and an eight-byte generation. It is carried by reliable Transfer
+with ACKs enabled. Local notification fanout includes send sequences and peers
+observed only on receive, which covers a provider serving remote clients. The
+receiver applies the hint only to the authenticated source peer. Instance and
+generation ordering removes duplicates and stale restarts, and a received hint
+is never broadcast again. Known peers, remote generations and pending sends
+are each bounded to 1,024 entries. A zero-timeout send refusal retains the
+pending generation and retries from the client worker after 100 ms.
+
+Adding that internal registration exposed an adjacent API leak:
+`QuerySubprotocols` returned reserved id 1 to applications. Public query
+answers and received query results now filter every id below 1,024, while the
+internal registry still retains them for wire dispatch. Registration, decoded
+query and end-to-end query tests cover both directions of the boundary.
+
+The broad regression also exposed an unrelated observation race in an existing
+three-hop P2P test. Queue delivery can precede receive accounting, and peer
+delivery can precede send accounting. The production P2P files involved were
+unchanged from checkpoint `f6bd8662`; the quality path was not involved. Three
+forced-order roots now prove both publication edges and the owned-connection
+lifecycle. P2P fixtures stop their forwarders, join send workers, close their
+owned receive peer, join receivers, and only then read final counters. The
+three roots plus five real fast/legacy tests pass all five race repetitions
+(40 executions, 11.496 seconds). Production behavior changes only by a nil
+test barrier.
+
+### Host call sites
+
+| Host | Quality input and behavior | Local validation |
+| --- | --- | --- |
+| SDK | `DeviceLocal.NetworkQualityChanged` calls the connect signal; generated Go/C/C++ and gomobile bindings expose it. | Focused SDK tests pass; generated Android and Objective-C APIs contain the method. |
+| Android | Same-default-network Wi-Fi bars and power-of-two link bands, plus independent cellular bar and displayed-type callbacks. Stale callbacks cannot change the current cellular state. | Tracker roots and the actual Github debug unit-test target pass. |
+| Apple | Active cellular radio type, path flags and five Wi-Fi bars. Wi-Fi is sampled every five seconds because Apple exposes a snapshot rather than a bar-change listener; the first value is a baseline. Inactive cellular subscriptions cannot perturb a Wi-Fi path. | Modified Swift parses; an iOS 17 typecheck validates the native APIs and timer. Full Xcode build remains a native-CI gate on this host. |
+| Windows | Native WLAN MSM signal notifications, reduced to five bars and coalesced on the watchdog SDK thread. The first sample is a baseline; teardown clears the callback before moving its owner. | Deterministic bucket/baseline roots and MinGW syntax compilation of `EgressMonitor.cpp` pass. Full MSVC/Windows execution remains a native-CI gate. |
+| Linux | One-second physical-default polling, excluding the tunnel; carrier/interface changes call the hard signal, while five Wi-Fi bars and power-of-two link speed call the quality signal. | Five dependency-free parser/classifier roots pass. Full daemon execution remains a native-Linux gate. |
+
+Apple's public APIs do not provide cellular signal bars to this extension, so
+that host uses cellular radio type plus its available path and Wi-Fi signals.
+Windows and Linux currently report the native radio/link information exposed
+by their existing service architecture. Transport feedback remains mandatory
+on every host: a missing OS notification cannot freeze pacing or make a partial
+ACK sample reliable.
+
+## Final configured server integration
+
+The running local PostgreSQL and Redis environment was exercised through the
+checked-in Bash environment owner with the direct Xcode compiler wrappers
+needed on this host. Tests started immediately under the recorded host load.
+No credential, endpoint or service override was used.
+
+Every legitimate `server/connect` directory selected by the official top-level
+harness passed. The configured package run reported:
+
+- `github.com/urnetwork/server/connect`: pass in 3,772.499 seconds;
+- `github.com/urnetwork/server/connect/perfvar`: pass in 1,402.138 seconds;
+- `github.com/urnetwork/server/connect/sim-latency`: pass in 35.928 seconds;
+- the `resource-bomb` test package: three tests pass under `-race`; and
+- the immutable sim-latency baseline manifest: pass.
+
+The package-local `connect/test.sh` returned 1 only after those first three
+packages passed because its unrestricted discovery entered an immutable
+baseline validation fixture. The baseline README requires that evidence tree
+to remain outside repository test discovery, and the official top-level
+`server/test-dirs.sh` excludes it. The verifier and the one legitimate package
+that followed it in the official selection were run separately. This completes
+the product and fixture coverage while retaining the package-local discovery
+defect as a harness improvement. The main log is
+`/tmp/throughput-fix-2-terra-server-integration-1789614340/retry-direct/connect.log`,
+SHA-256 `30f239b098aeae9755f2f515c77297142789493c0f2ddb6d221beb291a94211a`.
+It started at load 5.06, 7.02 and 9.76 and finished at 10.32, 10.59 and
+11.75. Baseline and resource logs have SHA-256
+`fb9006c5b441d37e42e754ec19ecd5276ae075db7450e94bde548537da9d6906`
+and `9bf011559b43dfefd4e74ef371b286b5031f6f63751c6adf4d0d0bf3d0c9014e`.
+
+The first full `server/proxy/test.sh` run passed the product package in
+403.868 seconds, then exposed a pre-existing acceptance-wrapper regression.
+A later server commit had replaced the wrapper's owned logger and join path
+with a foreground `timeout | tee` pipeline while retaining the two signal
+roots. Process-group INT or TERM could therefore close logging and delete the
+credential file before the controlled runner completed cleanup.
+
+Server branch `throughput-fix-2`, commit `fda6ae9a`, restores an owned FIFO
+logger, cancellation forwarding, interrupted-wait retry and joined cleanup.
+A wrapper-only INT is normalized to TERM because a Bash background child may
+inherit ignored INT; the wrapper still returns 130. Nine deterministic roots
+cover group and wrapper-only INT/TERM, repeated termination, normal completion,
+runner failure, logger failure and combined failure. All 27 race executions
+pass. The sibling scan found no other wrapper with the same foreground-tee
+ownership pattern.
+
+The final official proxy run passes both packages:
+
+| Package | Result |
+| --- | --- |
+| `github.com/urnetwork/server/proxy` | Pass in 316.690 seconds, including the formerly blocked database-backed handoff tests. |
+| `github.com/urnetwork/server/proxy/acceptance` | Pass in 5.958 seconds. |
+
+The 332-second artifact is
+`/tmp/throughput-fix-2-terra-server-proxy-final-1789622033`; its log SHA-256 is
+`3409fa1f46440b3e9eff31d935bb6baf8fcb5e7e3e0f85b2932dd11ade3ce31a`.
+Load changed from 7.13, 8.14 and 8.99 to 5.02, 7.39 and 8.58. The server main
+worktree was restored after the isolated commit and retains only its unrelated
+controller changes.
+
 ## Remaining work
 
-The core model, race correctness, root regression and scoped server tiers pass.
-Preserve their immutable archives and the earlier short-duplex failure. If
-that end-to-end deficit recurs, force its physical ordering before attributing
-it; the matched hold-policy SDK pair passes both arms and establishes no uplift.
+The core design and the platform call sites are implemented. Preserve the
+immutable archives and the earlier short-duplex failure. If that end-to-end
+deficit recurs, force its physical ordering before attributing it; the matched
+hold-policy SDK pair passes both arms and establishes no uplift.
 
 1. Expand host comparisons with the corrected packet grouping beyond the
    passing physical H1 smoke. The induced source-idle replay
@@ -2949,18 +3198,11 @@ it; the matched hold-policy SDK pair passes both arms and establishes no uplift.
    permit a newer cumulative ACK to cover pending progress, and evaluate any
    bounded cancellable ownership fix against the physical comparison. Keep the
    original gates and all failed/excluded comparisons under current host load.
-2. Add `NetworkQualityChanged`, then call it at the programmed path switches in
-   the three deferred tests and restore their acceptance run. Preserve the
-   unnotified-congestion controls and test delayed old ACKs and pending writes
-   across the event. Event wiring remains a separate phase after the core test.
-3. The database-backed `server/connect` and `server/proxy` integration tiers
-   are deferred by the user for a later environment-correct run through
-   `server/test.sh`. Local credential repair is outside this run. The current
-   full preflight also requires launcher readiness that this host could not
-   attest. The separately audited non-database tiers pass through the exact
-   configuration-only path; their success is not an integration result.
-   No credentials, host configuration or launcher policy were changed.
-4. Broader physical SDK/H1 and native-TUN confirmation, longer actual-relay pressure,
+2. Run the Apple, Windows and Linux changes on their native CI hosts. Local
+   checks cover the owned classification rules and API shape, but do not replace
+   a signed extension build, an MSVC service build or a Linux daemon run with
+   real radio/path changes.
+3. Broader physical SDK/H1 and native-TUN confirmation, longer actual-relay pressure,
    shard-collision and multiple-peer campaigns remain necessary
    before a deployment-wide claim. Continue with
    our own published fixtures as requested; obtaining the reporter's missing

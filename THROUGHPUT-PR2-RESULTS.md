@@ -1,15 +1,19 @@
 # Window follow-up: implementation and local results
 
-Branch: `throughput-fix-2`, source revision `b51530f3a402cb1dd5fe5d1daae344302a1f3069`.
-Date: 2026-09-16. The delivery-sized window remains enabled.
+Branch: `throughput-fix-2`; final production commits `5cb64f2b` and `14aecd8f`.
+Date: 2026-09-16 through 2026-09-17. The delivery-sized window remains enabled.
 
 Final evidence is summarized in [THROUGHPUT-REPORT-PR2.md](THROUGHPUT-REPORT-PR2.md).
 The deterministic and host-local runs completed. The completion audit found
 that host process success checked only nonzero progress and did not reject
 slow candidates. Host performance acceptance remains open under the corrected
 comparison gate; see the final report for all final-source rate ranges.
-Configured server integration is deferred because the running PostgreSQL
-credentials do not match the checked-in `server/test-env.sh` fallback.
+The configured local server integration is complete. Every legitimate
+`server/connect` package selected by the repository harness passed, as did the
+baseline verifier. The full `server/proxy` package and its acceptance package
+pass after fixing a pre-existing signal-cleanup regression in the acceptance
+wrapper. Both runs used the checked-in environment owner and ran immediately
+under recorded host load.
 
 The independent tests confirm several mechanisms that the published report
 could not separate: missing ACK residence in the window calculation, loss
@@ -21,6 +25,30 @@ failure to a particular one of these mechanisms.
 
 The [peer review and research plan](THROUGHPUTFIX-PR2.md) preserves the source
 review, hypotheses, evidence limits and server follow-up work.
+
+### Final network-quality phase
+
+Ordinary qualified feedback can grow the learned byte window but cannot shrink
+it. `NetworkQualityChanged` opens one bounded five-second generation in which a
+fresh service and RTT pair may replace it. Adaptive pacing continues between
+signals. Repeated local callbacks coalesce until five seconds of listener
+quiet, and exact or older provider generations are discarded. A deterministic
+storm of 128 callbacks overlaps 32 public statistics reads and applies exactly
+one generation; the final quality selection passes three times under `-race`.
+
+The frozen combined source passes all three changed-path models, the 12-row
+correctness ledger, the 858-row full model and broad regression. The v3 archive
+is `/tmp/throughput-fix-2-terra-final-v3-1789614907`; the test-only callback
+addition passes in `/tmp/throughput-fix-2-terra-v4-focused-1789616840/run.log`
+with SHA-256
+`18acdd7a58804ac8357ef44320d2418bc6b744a1c40ec5c4cd78220b9472b9e4`.
+Both were run immediately under recorded concurrent host load.
+
+The public signal propagates through the SDK and a reliable, source-scoped,
+non-echoed 24-byte peer message. Android, Apple, Windows and Linux call it for
+the native quality observations available on each host. ACK compression keeps
+its original contract: one cumulative head, bounded oldest-first SACKs above
+the head, absorption at or below the head, and a fixed maximum carrier size.
 
 ### Pending ACK and statistics follow-up
 
@@ -459,18 +487,38 @@ the latter mechanism; it does not prove which boundary failed on the remote
 relay. The [server review](THROUGHPUTFIX-PR2.md#9-serverconnect-regression-review)
 specifies the missing collision, reconnect and actual-relay experiments.
 
-The deterministic race-enabled `server/connect` selection passed. The full
-integration selection was attempted with the environment loaded by
-`server/connect/test.sh` and `server/test-env.sh`, fail-fast enabled, and the
-documented local endpoints. Its launcher readiness marker was absent;
-after the local override, every database-backed case stopped at PostgreSQL
-authentication because the checked-in fallback credential does not match the
-already-running container. The H1/H3 variants, pool-balance test and
-directional TCP test are deferred for a later environment-correct run.
+The deterministic race-enabled `server/connect` selection passed. The final
+configured run used `server/connect/test.sh` and its `server/test-env.sh`
+environment against the running local PostgreSQL and Redis services. The real
+packages all passed: `server/connect` in 3,772.499 seconds,
+`server/connect/perfvar` in 1,402.138 seconds and
+`server/connect/sim-latency` in 35.928 seconds. This includes the H1/H3,
+pool-balance, directional TCP and database-backed cases that the earlier
+preflight could not start.
+
+The package-local script then returned 1 because its unrestricted `find`
+entered `sim-latency/baseline/v1/independent-references/validation`. That tree
+is immutable evidence with its own minimal module; its README explicitly says
+repository test discovery must exclude it, and the official top-level
+`server/test-dirs.sh` does. This was a runner-discovery failure after all three
+real packages had passed. The official baseline verifier passed, and the one
+remaining legitimate directory selected by `server/test-dirs.sh`, the
+`resource-bomb` fixture, passed all three tests under `-race`.
+
+The connect log is
+`/tmp/throughput-fix-2-terra-server-integration-1789614340/retry-direct/connect.log`,
+SHA-256 `30f239b098aeae9755f2f515c77297142789493c0f2ddb6d221beb291a94211a`.
+It started at load 5.06, 7.02 and 9.76 and finished at 10.32, 10.59 and
+11.75. Baseline verification is in
+`/tmp/throughput-fix-2-terra-server-integration-remaining-1789620455/baseline.log`,
+SHA-256 `fb9006c5b441d37e42e754ec19ecd5276ae075db7450e94bde548537da9d6906`.
+The resource fixture log is
+`/tmp/throughput-fix-2-terra-server-integration-bash-1789620755/resource-bomb.log`,
+SHA-256 `9bf011559b43dfefd4e74ef371b286b5031f6f63751c6adf4d0d0bf3d0c9014e`.
 
 All three earlier 64 MiB directional TCP trials are retained here, including
 startup. Their source and environment differ from final validation; they are
-historical evidence and do not replace the deferred integration run:
+historical evidence and do not replace the final configured integration run:
 
 | Direction | Trial 1 | Trial 2 | Trial 3 |
 |---|---:|---:|---:|
@@ -486,20 +534,34 @@ for upload and explicitly fixes its carrier to H1.
 The pool-balance fixture also uses blocking forward admission, so it does not
 measure production's drop-on-full queue under sustained pressure.
 
-The sibling server checkout remains dirty from external work and was not
-modified by this task. The failed integration logs are retained under
+The sibling server main worktree remains dirty from unrelated controller work;
+those files were neither staged nor changed by this task. The proxy wrapper fix
+is isolated in the server commit identified below. Earlier failed preflight
+logs remain historical evidence under
 `throughput-fix-2-results/server-functional-final` and
 `throughput-fix-2-results/server-connect-full-final`.
 
 ### `server/proxy`
 
-The deterministic proxy tier covers memory admission, borrowed packet
-ownership, WireGuard/TUN handoff, manager close/join, drain coordination,
-lifecycle metrics, window identity restore and bounded traffic metrics. It
-passed in the non-race mode required by `server/test.sh`; reproduce it with
-`tools/throughput-fix-2.sh server-proxy`. Its two database-backed handoff
-tests were deferred at the same PostgreSQL preflight and are retained as
-`throughput-fix-2-results/server-proxy-integration-final`.
+The full proxy package passed in 316.690 seconds, including the two formerly
+blocked database-backed handoff tests. Its package-local script then exposed a
+pre-existing acceptance-wrapper regression: a terminal INT or TERM killed the
+foreground `tee`/wrapper before the controlled runner completed cleanup. The
+two existing deterministic roots failed before the fix. Server commit
+`fda6ae9a` on its `throughput-fix-2` branch restores an owned FIFO logger,
+forwards cancellation, joins runner and logger, and deletes credentials only
+after both finish. A direct wrapper INT is normalized to TERM because Bash
+background children inherit ignored INT; the wrapper still returns 130.
+
+Nine deterministic signal, normal-exit, runner-failure and logger-failure roots
+pass three times under `-race` (27/27). No sibling wrapper has the same
+foreground-tee pattern. The final official `server/proxy/test.sh` run passes
+both `github.com/urnetwork/server/proxy` in 316.690 seconds and
+`github.com/urnetwork/server/proxy/acceptance` in 5.958 seconds. Its 332-second
+artifact is `/tmp/throughput-fix-2-terra-server-proxy-final-1789622033`; the
+log SHA-256 is
+`3409fa1f46440b3e9eff31d935bb6baf8fcb5e7e3e0f85b2932dd11ade3ce31a`.
+Load changed from 7.13, 8.14 and 8.99 to 5.02, 7.39 and 8.58.
 
 ## Reproduction
 
@@ -522,9 +584,10 @@ cd ../server/connect
 ./test.sh -run '^(TestConnectH[13](Encrypted(AllowFallback)?)?|TestExchangeRelayPoolBalance|TestConnectMultiClientTcpDirectionalPerformance)$' -count=1
 ```
 
-The endpoint and credential mismatch observed on this machine is recorded in
-the server section above; the configured integration tier is deferred rather
-than silently bypassing `server/test.sh`'s preflight.
+The final runs used the checked-in preflight and the running local services.
+On this host, source `server/test-env.sh` only from Bash: an exploratory zsh
+invocation left `BASH_REMATCH` empty and produced a false invalid-authority
+error. The checked-in runners already use Bash.
 
 The script writes a test-binary SHA-256, source SHA-256, revisions, Go/OS/CPU
 manifest, explicit experiment environment, complete run log, exit status and

@@ -2734,5 +2734,172 @@ the frozen parser remains the owner. All five snapshot tests and all five
 server-environment adapter tests pass; their evidence is retained with the
 final core regression.
 
+## 38. Bound quality remeasurement and reject old-generation evidence
+
+The core quality-event implementation now permits the previously planned
+exception to grow-only window sizing. A notification starts a five-second
+remeasurement interval; only a qualified fresh-generation service estimate
+and RTT may replace the retained byte window during admission. The previous
+window and estimates remain provisional until that evidence arrives. At the
+fixed expiry, normal grow-only sizing resumes. Sustained congestion/capacity
+feedback continues to adapt pacing without a signal, and statistics reads
+remain non-mutating.
+
+The physical service owns the generation for all its sibling sequences.
+Notifications separated by at most five seconds are coalesced, including
+notifications to a newly joined sibling. They do not extend the accepted
+generation's shrink interval. A further generation requires five seconds of
+quiet. A sizing calculation paused before commit must recheck the shared
+generation before publishing learned bytes or held pacing; otherwise a sibling
+reset could immediately be overwritten by old evidence.
+
+Use the immutable physical first-write timestamp to classify ACKs, not arrival
+time, delayed worker execution or the echoed wall clock. Old and mixed-prefix
+ACKs must still retire messages and repay physical credit while contributing
+no new-generation measurement. Reset preserves delivery ownership, pending
+reservations, FIFO order and all physical byte/burst limits. Pending receiver
+RTT metadata, legacy RTT tags and delayed service-credit publication each have
+an explicit root test. No ACK encoding or compression allowance changes.
+
+### Adjacent recovery and drain roots
+
+The changed-path review found two interacting failures. First, an old short
+recovery floor retried new-path writes before a long-path RTT could arrive.
+Pending remeasurement now uses the existing configured cold recovery floor,
+within the configured maximum, until fresh RTT qualifies. The physical
+override is restricted to the first reliable write in the new generation;
+the deadline stays anchored to that write and excludes old, copied, unknown,
+unreliable and changed-carrier cases.
+
+Second, eliminating the spurious retries exposed an unnecessary full-flight
+drain during genuine queue recovery. The queue was already falling, but the
+probe stopped writes and left the 1.2-second link idle a propagation turn
+later. The deterministic root reproduces a 3.4-second stop while 26 MB of
+flight is still declining. Compare complete feedback turns, at least 40 ms,
+and grant one further turn only when physical flight falls by more than one
+permitted burst. A stalled/growing queue or burst-sized variation cannot keep
+the grace alive. Existing drain deadlines, cooldowns and proof remain intact.
+
+### Source-specific validation
+
+All 16 `TestWindowQuality*` roots plus the two natural-drain roots pass
+`-race -count=3` (1.814 seconds). They cover finite shrink permission, quiet
+coalescing, peer scope, sibling inheritance, old/mixed credit, delayed worker
+and metadata ordering, wall-clock changes, ownership preservation, recovery
+exclusions, and an explicitly paused sizing commit across a sibling reset.
+The full names and command are in the
+[core report](THROUGHPUT-REPORT-PR2.md#network-quality-estimator-bounded-remeasurement-and-fresh-evidence).
+
+The three changed-path models from section 31 now signal at their programmed
+switch, while static paths and unnotified congestion controls remain unchanged.
+The initial cold-recovery checkpoint passed two of three: the 1.2-second growth
+case delivered 86.207147 versus 95.771307 Mb/s, with its first interval at
+67.072 versus 95.764480 Mb/s and zero timeout copies. After the natural-drain
+correction all three passed; the long case reached 95.771307 versus 95.778133
+Mb/s, minimum flow 11.898880 Mb/s, with zero measurement drops and unchanged
+interval gates. The report records both complete local log paths and hashes.
+That model snapshot predates the last two sibling-generation guards; the
+18-root race run includes them. Keep final combined-source model/correctness/
+regression results distinct from these checkpoint results. No source-specific
+pass permits weakening a throughput or physical bound.
+
+The three earlier quality-event deferrals describe the pre-event phase and
+are superseded by these signaled model tests. Public API, peer propagation,
+platform call sites and their lifecycle review are a separate part of the
+same implementation and require their own validation record.
+
+## 39. Propagate quality changes through clients, providers and native hosts
+
+The public signal is deliberately smaller than hard network recovery.
+`NetworkQualityChanged` enqueues estimator work; it does not tear down a
+working transport. `NetworkChanged` calls the same quality invalidation once
+and then performs its existing hard recovery. `DeviceLocal` exposes both
+operations so host code can select the correct boundary.
+
+Callback frequency is not a new measurement clock. The client state admits a
+single generation until five seconds of listener quiet, and its one worker
+serializes the reset. The shared service and every sequence independently
+recognize that generation, so duplicate local fanout remains harmless. Remote
+instance/generation ordering removes duplicate or stale provider messages
+before estimator work is queued. A deterministic root holds a public window
+statistics read across the reset while 128 notifications arrive concurrently;
+it requires one generation, 32 valid snapshots under `-race`, and one new
+generation only after the quiet boundary.
+
+Each `Client` registers one process callback and one internal wire callback.
+A local event resets that client's estimator generations and queues a reliable,
+ACKed 24-byte message for every known destination. Peer discovery includes
+ordinary send sequences and authenticated receive-only peers, so a provider
+can notify the clients currently using it even if it has not created a return
+sequence yet. One client-owned worker performs estimator and send work outside
+OS and receive callbacks. Zero-timeout refusal retains the newest generation
+for retry instead of blocking the shared callback.
+
+The receiver validates a reserved-subprotocol payload containing the sender's
+instance id and generation. It deduplicates monotonically within an instance,
+accepts a newer instance after restart, rejects older instances, and applies
+the event only to sequences for the authenticated source. It never echoes a
+received hint. All remembered-peer, pending-send and remote-generation maps
+have the same 1,024-entry bound and deterministic oldest-entry eviction.
+Closing a client unregisters both callbacks, cancels the worker and joins it.
+
+The internal registration found an adjacent discovery bug: reserved protocol
+ids were included in the public subprotocol query. The registry now has an
+explicit application-id view, and both outgoing answers and incoming results
+filter ids below `SubprotocolReservedLimit`. Tests cover internal dispatch,
+public discovery and a peer returning reserved ids.
+
+Native hosts classify the available signals before calling the SDK:
+
+- Android uses stable Wi-Fi bars, power-of-two link-rate bands, cellular bars
+  and displayed cellular type. Separate baselines prevent the first telephony
+  callback from acting like a change, and stale capabilities cannot change the
+  current-network cellular gate.
+- Apple uses active cellular radio type, path properties and Wi-Fi bars. Since
+  the public Wi-Fi API is a snapshot, the extension samples it every five
+  seconds. The first successful value is a baseline. Apple exposes no public
+  cellular-bar API to this extension.
+- Windows consumes native WLAN MSM signal-quality notifications, converts them
+  to five bars and hands them to the existing watchdog thread. The first value
+  is a baseline and teardown clears the callback before the monitor can outlive
+  its controller.
+- Linux polls the physical default path once per existing reaper tick. An
+  interface/carrier transition uses hard recovery; a Wi-Fi bar or link-speed
+  band transition uses quality remeasurement. The tunnel interface is excluded.
+
+Platform signals are hints. Sustained qualified feedback must still adapt when
+the remote path changes without an OS notification, and a hint cannot qualify
+compressed, partial or old-generation ACK evidence. The detailed roots,
+platform validation and native-CI limits are in the
+[report](THROUGHPUT-REPORT-PR2.md#public-propagation-and-platform-notification-hooks).
+
+## 40. Complete configured server integration
+
+The local PostgreSQL and Redis services became available, so the earlier
+environment deferral is closed. Using the checked-in Bash environment owner,
+all legitimate `server/connect` directories pass: connect in 3,772.499 seconds,
+perfvar in 1,402.138 seconds, sim-latency in 35.928 seconds, the three-test
+resource fixture under `-race`, and the immutable baseline verifier. The
+package-local connect script returned 1 only because its broad `find` entered
+an immutable baseline fixture that the official top-level directory selector
+excludes. Retain that as a harness-discovery improvement; it is not a failed
+server or connect test.
+
+The full proxy product package passes its configured integration in 316.690
+seconds. Its first wrapper run then reproduced an independent server regression:
+INT or TERM could terminate the foreground logger before the acceptance runner
+finished cleanup. The retained deterministic signal tests failed on the
+checked-in wrapper. Server branch `throughput-fix-2`, commit `fda6ae9a`, restores
+owned logging, signal forwarding and joined cleanup, and adds adjacent direct
+signal, repeated signal, normal-exit, runner-failure and logger-failure roots.
+All nine roots pass three race repetitions. No sibling wrapper contains the
+same foreground-tee pattern.
+
+The official proxy script then passes end to end: the product package in
+316.690 seconds and acceptance in 5.958 seconds. The final log SHA-256 is
+`3409fa1f46440b3e9eff31d935bb6baf8fcb5e7e3e0f85b2932dd11ade3ce31a`.
+The exact paths, connect hashes and host loads are recorded in
+[the final report](THROUGHPUT-REPORT-PR2.md#final-configured-server-integration).
+
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md
