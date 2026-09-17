@@ -763,6 +763,28 @@ func (self *PlatformTransport) openH3PacketConn(ctx context.Context, ptMode Tran
 		packetConn, err := self.settings.H3PacketConnFactory(ctx)
 		return packetConn, false, err
 	}
+	// An extender-only strategy has no direct path, so reach the destination
+	// through the extender instead of binding a local socket. The extender
+	// carrier is a reliable stream and quic needs datagrams, so the datagrams
+	// are framed on it and become real udp at the far end
+	// (net_extender_datagram.go). Without this an h3-pinned client had no
+	// extender path at all.
+	//
+	// Nothing is egress pinned: the socket that leaves this host belongs to
+	// the extender dial, and pinning is that dial's business rather than ours.
+	if extenderConfig := self.clientStrategy.H3ExtenderConfig(); extenderConfig != nil {
+		udpNetwork, _ := udpWildcardForFamily(udpAddrFamily(udpAddr))
+		packetConn, err := NewExtenderPacketDialContext(
+			self.clientStrategy.ConnectSettings(), extenderConfig,
+		)(ctx, udpNetwork, udpAddr.String())
+		if err != nil {
+			if packetConn != nil {
+				packetConn.Close()
+			}
+			return nil, false, err
+		}
+		return packetConn, false, nil
+	}
 	udpNetwork, wildcard := udpWildcardForFamily(udpAddrFamily(udpAddr))
 	udpConn, err := net.ListenUDP(udpNetwork, wildcard)
 	if err != nil {
