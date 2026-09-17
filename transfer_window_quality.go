@@ -84,6 +84,7 @@ func (self *windowPacingService) networkQualityChanged(at time.Time) time.Time {
 	self.serviceEpochAt = at
 	self.windowDeliveryAfterNanos = at.UnixNano()
 	clear(self.samples[:])
+	self.aggregate = windowServiceDeliveryRing{}
 	self.hasSamples, self.newestBucket = false, 0
 	self.feedbackAt, self.feedbackCycleBefore = time.Time{}, time.Time{}
 	self.feedbackCycle, self.feedbackComplete, self.feedbackFresh = windowServiceSample{}, windowServiceSample{}, windowServiceSample{}

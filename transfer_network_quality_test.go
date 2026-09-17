@@ -108,7 +108,10 @@ func TestClientNetworkQualityCallbackIsNonblockingAndQuietCoalesced(t *testing.T
 // snapshot and the next quiet-interval generation usable.
 func TestClientNetworkQualityFrequentCallbacksAreIdempotentWithStatistics(t *testing.T) {
 	client := newNetworkQualityTestClient(t)
-	destinationId := NewId()
+	// Keep this statistics/reset root independent of peer notification sends.
+	// A local loopback destination is included in estimator resets and public
+	// snapshots, but must never receive a redundant wire quality hint.
+	destinationId := client.clientId
 	sequence := newEstimatorFixture(t, func(settings *SendBufferSettings) {
 		settings.DeliverySizedWindowScale = 2
 		settings.ResendQueueBudget = NewTransferMemoryBudget(16 * 1024 * 1024)
@@ -118,6 +121,9 @@ func TestClientNetworkQualityFrequentCallbacksAreIdempotentWithStatistics(t *tes
 	client.sendBuffer.mutex.Lock()
 	client.sendBuffer.sendSequences[sendSequenceId{Destination: destinationId}] = sequence
 	client.sendBuffer.mutex.Unlock()
+	if peers := client.sendBuffer.networkQualityPeers(); len(peers) != 0 {
+		t.Fatalf("local loopback entered quality fanout: %v", peers)
+	}
 	defer func() {
 		client.sendBuffer.mutex.Lock()
 		delete(client.sendBuffer.sendSequences, sendSequenceId{Destination: destinationId})

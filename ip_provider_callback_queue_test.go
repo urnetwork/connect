@@ -301,9 +301,10 @@ func TestRemoteUserNatProviderUdpReturnWorkerDoesNotWaitForClientSend(t *testing
 	}
 }
 
-// A dedicated socket reader retains its consumed bytes across failed attempts,
-// and synthesized control can be regenerated after a shared sender's zero-wait
-// refusal. An arbitrary public callback makes neither ownership promise.
+// A dedicated socket reader retains its consumed bytes across failed attempts.
+// A per-flow pure-ACK worker can retain one regenerable control through bounded
+// admission, while shared synthesized controls still use zero-wait refusal. An
+// arbitrary public callback makes neither ownership promise.
 func TestRemoteUserNatProviderReturnRecoveryOptionClassifiesOwnedRecovery(t *testing.T) {
 	provider := &RemoteUserNatProvider{}
 	for _, testCase := range []struct {
@@ -318,6 +319,11 @@ func TestRemoteUserNatProviderReturnRecoveryOptionClassifiesOwnedRecovery(t *tes
 		{
 			name:            "dedicated socket",
 			recoveryMode:    receiveRecoveryModeTcpSocket,
+			wantRecoverable: true,
+		},
+		{
+			name:            "dedicated TCP control",
+			recoveryMode:    receiveRecoveryModeDedicatedTcpControl,
 			wantRecoverable: true,
 		},
 		{

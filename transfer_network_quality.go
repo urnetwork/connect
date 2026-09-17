@@ -355,7 +355,8 @@ func (self *SendBuffer) networkQualityPeers() map[Id]networkQualityPeer {
 	self.mutex.Lock()
 	if !self.closed {
 		for id, sequence := range self.sendSequences {
-			if id.Destination == (Id{}) || id.Destination == ControlId {
+			if id.Destination == (Id{}) || id.Destination == ControlId ||
+				id.Destination == self.client.clientId {
 				continue
 			}
 			if _, found := peers[id.Destination]; found && id.LogicalLane != 0 {

@@ -81,7 +81,7 @@ func TestWindowQualityOldAndMixedServiceCreditRepaysWithoutSampling(t *testing.T
 	fixture.sequence.networkQualityChanged(change)
 	fresh := fixture.write(1, 1000, change.Add(time.Millisecond))
 	fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(fresh, change.Add(10*time.Millisecond), 0))
-	if fixture.service.total != 2000 || fixture.sequence.windowPacer.serviceAcked != 2000 || fixture.service.hasSamples {
+	if fixture.service.total != 2000 || fixture.sequence.windowPacer.serviceAcked != 2000 || fixture.service.hasSamples || fixture.service.aggregate.hasSamples {
 		t.Fatalf("mixed prefix seeded a rate or lost ownership: total=%d samples=%t", fixture.service.total, fixture.service.hasSamples)
 	}
 	fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(old, change.Add(20*time.Millisecond), 0))

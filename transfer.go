@@ -10737,6 +10737,9 @@ type SendWindowEstimate struct {
 	// A fresh, qualified cumulative interval can guide cold pacing before a
 	// serialization pair exists. This rate is never derived from retained bytes.
 	DeliveryByteRate ByteCount
+	// Once-only delivery across this H1 service prices its common pacing
+	// clock. Logical delivery and learned window sizing remain per sequence.
+	AggregateDeliveryByteRate ByteCount
 	// The same owner computes pacing from recently serialized delivery, so
 	// writers consume its result without interpreting the target themselves.
 	ServiceByteRate      ByteCount
@@ -10807,6 +10810,9 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 		}
 		estimate.PacingProbeByteRate = estimate.PacingByteRate
 		estimate.PacingProbeByteCount = max(0, initial)
+		// Every return uses the common pacing scope, including a new sibling
+		// with no local RTT or cumulative sizing history.
+		defer self.finalizeWindowPacing(now, retainService, serviceGeneration, &estimate)
 		// Two compressed ACK intervals can measure one complete service
 		// interval even when the first and last replies are partial. Bound
 		// discovery to twice the ordinary opening window on slow services.
@@ -10831,15 +10837,6 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 				}
 				estimate.ServiceEstablished = true
 				estimate.ServiceBacklogged = service.backloggedAt(estimate.ServiceByteRate, now)
-				// Other carriers never consume the pace, so their estimates keep the service-relative value.
-				paced := self.transferFlightPolicy().h1Only
-				if paced {
-					estimate.PacingDiscovery, estimate.PacingHeldByteRate = service.pacingHold()
-				}
-				estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingByteRate)
-				if paced && retainService && estimate.WindowRoundTrip > 0 {
-					service.holdPacingForGeneration(estimate.PacingByteRate, serviceGeneration)
-				}
 			}
 		}
 	}
@@ -11003,23 +11000,6 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 			}
 		} else if serviceCandidateChosen && estimate.Window == ceiling {
 			estimate.Reason = estimate.bindingTerm(self, configuredCeiling)
-		}
-		// Cumulative qualification occurs after service sampling. Finalize once
-		// both are known, without treating a retained window as a rate sample.
-		// The pace is computed after the admitted window is final because the
-		// discovery floor releases exactly that window over one residence.
-		if estimate.PacingProbeByteRate > 0 {
-			service := self.windowPacer.service
-			// Other carriers never consume the pace, so their estimates keep the service-relative value.
-			paced := service != nil && self.transferFlightPolicy().h1Only
-			if paced {
-				estimate.PacingDiscovery, estimate.PacingHeldByteRate = service.pacingHold()
-			}
-			estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingProbeByteRate)
-			// A blind read has no residence to hold a pace against.
-			if paced && retainService && estimate.WindowRoundTrip > 0 {
-				service.holdPacingForGeneration(estimate.PacingByteRate, serviceGeneration)
-			}
 		}
 	}()
 

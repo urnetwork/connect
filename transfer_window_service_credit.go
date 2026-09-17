@@ -144,5 +144,6 @@ func (self *SendSequence) observePacingServiceCredit(credit windowServiceAckCred
 		service.completeFeedbackCycleWithLock()
 		return
 	}
+	service.observeAggregateDeliveryWithLock(credit, at)
 	service.observeAckWithLock(credit.bytes, at, credit.receiverTiming)
 }

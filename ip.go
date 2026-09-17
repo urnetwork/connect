@@ -93,11 +93,27 @@ type receiveRecoveryMode int
 const (
 	receiveRecoveryModeNonblocking receiveRecoveryMode = iota
 	receiveRecoveryModeTcpSocket
+	// A per-flow TCP worker may wait for bounded Transfer admission without
+	// blocking a shared receive callback. Its control is regenerable, so it
+	// does not retain data ownership past the ordinary ACK lifetime.
+	receiveRecoveryModeDedicatedTcpControl
 	// A synthesized ACK, reset, or unreachable response is safe to refuse
 	// without blocking its producer: the peer's retry elicits another response.
 	// Keep that promise distinct from arbitrary public callbacks.
 	receiveRecoveryModeRegenerableControl
 )
+
+// Only a producer dedicated to one TCP flow may propagate bounded Transfer
+// admission pressure. Keeping this classification in one place prevents a new
+// producer from gaining a blocking callback merely because its packet is TCP.
+func (self receiveRecoveryMode) waitsForProviderReturnAdmission() bool {
+	return self == receiveRecoveryModeTcpSocket || self == receiveRecoveryModeDedicatedTcpControl
+}
+
+// These owners can recover a refused send without treating it as delivered.
+func (self receiveRecoveryMode) providerReturnUpstreamRecoverable() bool {
+	return self.waitsForProviderReturnAdmission() || self == receiveRecoveryModeRegenerableControl
+}
 
 // Internal provider delivery retains the receiver-visible transfer identity
 // and recovery ownership while the public callback stays source-compatible.
@@ -5570,7 +5586,7 @@ func (self *TcpSequence) Run() {
 			default:
 			}
 
-			self.receivePacket(packet, receiveRecoveryModeRegenerableControl)
+			self.receivePacket(packet, receiveRecoveryModeDedicatedTcpControl)
 
 			if 0 < self.tcpBufferSettings.AckCompressTimeout {
 				// coalesce acks up to the timeout.
@@ -7100,10 +7116,11 @@ type RemoteUserNatProvider struct {
 	packetStatsStarted bool
 
 	// Nonblocking callbacks share borrowed packets into bounded sender shards
-	// and drop when their shard is full. Only actual upstream socket returns
-	// bypass those queues and retry synchronously on their dedicated TCP flow
-	// reader. Packet protocol alone never grants synchronous recovery ownership.
-	// Identical source/flow tuples always select the same worker.
+	// and drop when their shard is full. Actual upstream socket returns and the
+	// per-flow pure-ACK worker bypass those queues and retry synchronously on
+	// their dedicated TCP goroutine. Packet protocol alone never grants
+	// synchronous recovery ownership. Identical source/flow tuples always
+	// select the same worker.
 	returnStateLock  sync.RWMutex
 	returnClosed     bool
 	returnSendQueues []chan *providerReturnItem
@@ -7811,9 +7828,10 @@ func providerReturnSendShard(
 	return int((shard + sourceHash) % uint32(shardCount))
 }
 
-// Admits one provider return without blocking shared receive pumps. Only a
-// dedicated TCP socket reader may request synchronous recovery after upstream
-// bytes were consumed; synthesized controls and public callbacks use the
+// Admits one provider return without blocking shared receive pumps. A
+// dedicated TCP socket reader may recover consumed upstream bytes, and one
+// TCP flow's pure-ACK worker may retain its regenerable control until bounded
+// Transfer admission. Other synthesized controls and public callbacks use the
 // bounded nonblocking shards regardless of their IP protocol. Admission under
 // the read lock lets shutdown stop and join every registered decision without
 // holding a state lock across a synchronous send.
@@ -7826,7 +7844,7 @@ func (self *RemoteUserNatProvider) enqueueReturnItem(item *providerReturnItem) b
 		return false
 	}
 	item.sourceLifecycle = sourceLifecycle
-	if item.recoveryMode == receiveRecoveryModeTcpSocket {
+	if item.recoveryMode.waitsForProviderReturnAdmission() {
 		admitted := false
 		self.returnStateLock.RLock()
 		if !self.returnClosed {
@@ -8155,12 +8173,12 @@ func providerReturnIpTransferOptions(
 const providerReturnBatchMaxFrames = 16
 const providerReturnBatchMaxBytes = 24 * 1024
 
-// Retries caller-owned socket-return data until Transfer accepts it, the
-// provider closes, or the source has been silent for ReturnSendAbandonTimeout
-// (abandonSilentSource). Every non-owned callback has one downstream
-// disposition, even for a synthesized or public TCP packet. Failed owned
-// attempts wait a strict pacing floor, including immediate no-route and
-// full-buffer failures.
+// Retries caller-owned socket-return data or one per-flow pure ACK until
+// Transfer accepts it, the provider closes, or the source has been silent for
+// ReturnSendAbandonTimeout (abandonSilentSource). Every shared callback has one
+// downstream disposition, even for a synthesized or public TCP packet. Failed
+// dedicated attempts wait a strict pacing floor, including immediate no-route
+// and full-buffer failures.
 func (self *RemoteUserNatProvider) retryReturnSend(
 	item *providerReturnItem,
 	packetCount int,
@@ -8190,7 +8208,7 @@ func (self *RemoteUserNatProvider) retryReturnSend(
 			}
 			return true
 		}
-		if item.recoveryMode != receiveRecoveryModeTcpSocket {
+		if !item.recoveryMode.waitsForProviderReturnAdmission() {
 			return false
 		}
 		sendCtx := item.sendContext(self.ctx)
@@ -8212,12 +8230,13 @@ func (self *RemoteUserNatProvider) retryReturnSend(
 	}
 }
 
-// only one dedicated TCP socket reader can retain consumed upstream bytes
-// while Transfer admission waits. Datagram and shared callback workers serve
-// unrelated flows, so one full destination must receive a zero-wait refusal
-// instead of parking that worker for the provider-wide write timeout.
+// A dedicated TCP socket reader can retain consumed upstream bytes while
+// Transfer admission waits. The per-flow pure-ACK worker can likewise retain
+// one regenerable control. Datagram and shared callback workers serve unrelated
+// flows, so one full destination must receive a zero-wait refusal instead of
+// parking that worker for the provider-wide write timeout.
 func (self *RemoteUserNatProvider) returnWriteTimeout(item *providerReturnItem) time.Duration {
-	if item.recoveryMode == receiveRecoveryModeTcpSocket {
+	if item.recoveryMode.waitsForProviderReturnAdmission() {
 		return self.settings.WriteTimeout
 	}
 	return 0
@@ -8225,14 +8244,15 @@ func (self *RemoteUserNatProvider) returnWriteTimeout(item *providerReturnItem) 
 
 // A dedicated TCP socket reader retains the exact consumed bytes until
 // Transfer admission. Admission moves the only recoverable copy into the
-// bounded resend queue, which must keep retrying past the ordinary Ack timeout.
-// Synthesized controls remain regenerable by the peer and need no such lease.
+// bounded resend queue, which must keep retrying past the ordinary ACK timeout.
+// A dedicated pure ACK is recoverable but remains regenerable, so it uses the
+// ordinary ACK lifetime after admission. Other synthesized controls remain
+// regenerable by the peer and need no admission wait or extended lease.
 func (self *RemoteUserNatProvider) returnSendRecoveryOption(
 	item *providerReturnItem,
 ) sendPackRecoveryOption {
 	return sendPackRecoveryOption{
-		upstreamRecoverable: item.recoveryMode == receiveRecoveryModeTcpSocket ||
-			item.recoveryMode == receiveRecoveryModeRegenerableControl,
+		upstreamRecoverable:   item.recoveryMode.providerReturnUpstreamRecoverable(),
 		retainAfterAckTimeout: item.recoveryMode == receiveRecoveryModeTcpSocket,
 	}
 }

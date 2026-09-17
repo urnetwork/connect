@@ -31,6 +31,8 @@ case "$mode" in
     pattern="$pattern|^Test(NetworkQuality|ClientNetworkQuality|WindowQuality).*$"
     pattern="$pattern|^Test(Send|Forward)Buffer(CallerCancel.*|ClosedSequenceStillRecreatesForLiveCaller)$"
     pattern="$pattern|^TestWindowPhysicalH1PolicyGate.*$"
+    pattern="$pattern|^TestWindow(PacingSharedDelivery|ServiceDelivery).*$"
+    pattern="$pattern|^TestWindowPhysicalH1Provider(PureAck.*|PublicAckStillRefusesAtCapacity)$|^TestRemoteUserNatProviderReturnRecoveryOptionClassifiesOwnedRecovery$"
     # This wall-clock occupancy assertion originally ran only in nonrace
     # regression. Its retained-policy rename also matched the prefix above;
     # race instrumentation limits offered throughput below its opening window.
@@ -71,7 +73,7 @@ case "$mode" in
     ;;
   pacing)
     pattern='^$'
-    run_flags=(-test.bench '^(BenchmarkWindowPacing(Service|Receiver|DrainEligibility|TailLifecycle)|BenchmarkAckLifetime|BenchmarkSendSequence(SelectiveAckRecoveryNoEvidence|RouteStallUnchanged))' -test.benchmem -test.benchtime=500ms)
+    run_flags=(-test.bench '^(BenchmarkWindowPacing(Service|Receiver|SharedDelivery|DrainEligibility|TailLifecycle)|BenchmarkAckLifetime|BenchmarkSendSequence(SelectiveAckRecoveryNoEvidence|RouteStallUnchanged))' -test.benchmem -test.benchtime=500ms)
     build_flags=(-race=false)
     ;;
   packet|tcp)

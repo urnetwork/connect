@@ -217,15 +217,21 @@ func (self *windowPacingBurstMeter) paidReservation(now, deadline time.Time) {
 // read has granted a pace, that pace is held until a backlogged read or a
 // recovery write supplies congestion evidence.
 func windowPacingRate(estimate SendWindowEstimate, target ByteCount) ByteCount {
-	if estimate.WindowRoundTrip <= 0 && estimate.ServiceByteRate <= 0 {
+	if estimate.WindowRoundTrip <= 0 && estimate.ServiceByteRate <= 0 && estimate.AggregateDeliveryByteRate <= 0 {
 		return target
 	}
 	rate := float64(target)
 	if estimate.WindowRoundTrip > 0 {
 		rate = float64(estimate.Initial) / estimate.WindowRoundTrip.Seconds()
 	}
-	if estimate.ServiceByteRate <= 0 && estimate.DeliveryByteRate > 0 {
-		rate = 1.1 * float64(estimate.DeliveryByteRate)
+	if estimate.ServiceByteRate <= 0 {
+		deliveryRate := estimate.AggregateDeliveryByteRate
+		if deliveryRate <= 0 {
+			deliveryRate = estimate.DeliveryByteRate
+		}
+		if deliveryRate > 0 {
+			rate = 1.1 * float64(deliveryRate)
+		}
 	}
 	if estimate.ServiceByteRate > 0 {
 		serviceRate := float64(estimate.ServiceByteRate)
@@ -428,6 +434,7 @@ type windowPacingService struct {
 	waiterTail               *windowPacingWaiter
 	probeSent                ByteCount
 	samples                  [deliveredBytesRingSize]windowServiceSample
+	aggregate                windowServiceDeliveryRing
 	newestBucket             int64
 	hasSamples               bool
 	serviceEpochAt           time.Time

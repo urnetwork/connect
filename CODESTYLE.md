@@ -95,6 +95,8 @@ Send and receive sit on opposite sides of the backpressure contract. **Senders b
 
 The device-side tun write is one deliberate callback exception, documented at its call site: its synchronous handoff provides flow control; provider TCP replay is a bounded recovery backstop for loss after Transfer delivery. The provider's local-NAT TCP return callback is another: it runs on one flow's socket-reader or recovery goroutine, with origin bytes retained until the inner TCP acknowledges them. It may retry Transfer admission synchronously on that dedicated flow goroutine to propagate pressure without manufacturing retransmissions. The exact reliable-carrier and Pack waits above are the other documented exceptions; both retain fixed ownership and end at capacity or lifecycle cancellation. Do not put these waits behind a shared callback worker, extend them to UDP/ICMP/datagram lanes, or infer them from a transport family. An exception must be argued like these — in a comment, from the specific loss model — not assumed.
 
+The provider TCP sequence's pure-acknowledgement worker is also per flow. It may retain its single regenerable acknowledgement while bounded Transfer admission waits, because refusing it after construction can stall the peer behind a full send window. Provider or flow cancellation joins that wait and returns the pooled packet. This exception does not apply to duplicate resets, unreachables, arbitrary synthesized controls, or public receive callbacks; those still use zero-wait refusal on the shared workers.
+
 ## Concurrency and goroutine safety
 
 - By default, package-level functions are assumed safe for concurrent use, and a type's methods are assumed NOT safe unless the type documents otherwise.
