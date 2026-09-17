@@ -472,12 +472,14 @@ detector for frame limits, carrier compatibility, reliable receive pressure,
 resident ingress retirement, H1 bounded batching/order/ownership and H3 ACK
 reserve configuration.
 
-The sibling checkout also contains independently edited resident lifecycle
-changes. The regression review includes those working-tree changes: lazy
+At that review checkpoint, the sibling checkout also contained independently
+edited resident lifecycle changes. The regression review included those
+working-tree changes: lazy
 forward-shard allocation, worker registration while a producer is admitted,
 and a final drain after callback owners join. Their three new deterministic
 tests passed in the expanded server race selection. The build manifest records
-the dirty source hash; this task has not modified the server checkout.
+that checkpoint's dirty source hash. The later configured integration and
+harness fixes are isolated on the server `throughput-fix-2` branch below.
 
 There are two distinct server pressure boundaries: **256 callback-ingress
 entries per destination shard**, which retire a full resident generation, and
@@ -496,7 +498,7 @@ packages all passed: `server/connect` in 3,772.499 seconds,
 pool-balance, directional TCP and database-backed cases that the earlier
 preflight could not start.
 
-The package-local script then returned 1 because its unrestricted `find`
+The first package-local script run then returned 1 because its unrestricted `find`
 entered `sim-latency/baseline/v1/independent-references/validation`. That tree
 is immutable evidence with its own minimal module; its README explicitly says
 repository test discovery must exclude it, and the official top-level
@@ -504,6 +506,20 @@ repository test discovery must exclude it, and the official top-level
 real packages had passed. The official baseline verifier passed, and the one
 remaining legitimate directory selected by `server/test-dirs.sh`, the
 `resource-bomb` fixture, passed all three tests under `-race`.
+
+Server commit `21acdcb5` replaces the package-local `find` with the canonical
+top-level selector, limits it to the exact connect subtree, propagates selector
+failures before running a partial selection and preserves caller arguments.
+Three deterministic roots failed before the fix. The final rebased branch
+passes 21/21 race executions and its official no-test traversal selects exactly
+`connect`, `connect/perfvar`, `connect/sim-latency` and `resource-bomb`, without
+entering baseline or evaluator artifacts. That final validation is
+`/tmp/throughput-fix-2-terra-server-rebase-final-1789623466`; the harness and
+traversal log SHA-256 values are
+`cf9ecead3960400f0ace275aa2570c2119f49e32ac2a6aa7d1c7143950110963` and
+`6f5b7dc78c12d4a2abd271e6bd8ff32c4067c05139edfa1c75589759fa5c2bc8`.
+The multi-hour payload was not repeated after this harness-only change; its
+four legitimate packages had already passed against the same product source.
 
 The connect log is
 `/tmp/throughput-fix-2-terra-server-integration-1789614340/retry-direct/connect.log`,
@@ -534,10 +550,8 @@ for upload and explicitly fixes its carrier to H1.
 The pool-balance fixture also uses blocking forward admission, so it does not
 measure production's drop-on-full queue under sustained pressure.
 
-The sibling server main worktree remains dirty from unrelated controller work;
-those files were neither staged nor changed by this task. The proxy wrapper fix
-is isolated in the server commit identified below. Earlier failed preflight
-logs remain historical evidence under
+The server fixes are isolated on branch `throughput-fix-2`, rebased onto clean
+server main revision `3a3cc698`. Earlier failed preflight logs remain historical evidence under
 `throughput-fix-2-results/server-functional-final` and
 `throughput-fix-2-results/server-connect-full-final`.
 
@@ -548,13 +562,15 @@ blocked database-backed handoff tests. Its package-local script then exposed a
 pre-existing acceptance-wrapper regression: a terminal INT or TERM killed the
 foreground `tee`/wrapper before the controlled runner completed cleanup. The
 two existing deterministic roots failed before the fix. Server commit
-`fda6ae9a` on its `throughput-fix-2` branch restores an owned FIFO logger,
+`7e19ae5d` on its `throughput-fix-2` branch restores an owned FIFO logger,
 forwards cancellation, joins runner and logger, and deletes credentials only
 after both finish. A direct wrapper INT is normalized to TERM because Bash
 background children inherit ignored INT; the wrapper still returns 130.
 
 Nine deterministic signal, normal-exit, runner-failure and logger-failure roots
-pass three times under `-race` (27/27). No sibling wrapper has the same
+pass three times under `-race` (27/27). The rebased-branch rerun log SHA-256 is
+`52ec43d33e6134d07c6462ee190fe574f114dddac5c0d99a7d5d8399e5742d89`.
+No sibling wrapper has the same
 foreground-tee pattern. The final official `server/proxy/test.sh` run passes
 both `github.com/urnetwork/server/proxy` in 316.690 seconds and
 `github.com/urnetwork/server/proxy/acceptance` in 5.958 seconds. Its 332-second

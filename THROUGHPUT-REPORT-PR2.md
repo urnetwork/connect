@@ -3136,14 +3136,29 @@ harness passed. The configured package run reported:
 - the `resource-bomb` test package: three tests pass under `-race`; and
 - the immutable sim-latency baseline manifest: pass.
 
-The package-local `connect/test.sh` returned 1 only after those first three
+The first package-local `connect/test.sh` returned 1 only after those first three
 packages passed because its unrestricted discovery entered an immutable
 baseline validation fixture. The baseline README requires that evidence tree
 to remain outside repository test discovery, and the official top-level
 `server/test-dirs.sh` excludes it. The verifier and the one legitimate package
-that followed it in the official selection were run separately. This completes
-the product and fixture coverage while retaining the package-local discovery
-defect as a harness improvement. The main log is
+that followed it in the official selection were run separately.
+
+Server commit `21acdcb5` corrects the package runner by using the canonical
+selector, filtering the exact connect subtree, preserving portable caller
+arguments and propagating selector failure before any partial run. Three
+deterministic roots failed before the correction. On the final rebased branch,
+seven harness roots pass three times under `-race` (21/21), and the official
+no-test traversal compiles exactly `connect`, `connect/perfvar`,
+`connect/sim-latency` and `resource-bomb`. It does not enter baseline,
+evaluator, build/profile, acceptance or sibling package trees. The final
+branch-validation artifact is
+`/tmp/throughput-fix-2-terra-server-rebase-final-1789623466`; harness and
+traversal SHA-256 values are
+`cf9ecead3960400f0ace275aa2570c2119f49e32ac2a6aa7d1c7143950110963` and
+`6f5b7dc78c12d4a2abd271e6bd8ff32c4067c05139edfa1c75589759fa5c2bc8`.
+The multi-hour payload was not repeated after this harness-only change because
+all four legitimate packages had already passed against the same product
+source. The main payload log is
 `/tmp/throughput-fix-2-terra-server-integration-1789614340/retry-direct/connect.log`,
 SHA-256 `30f239b098aeae9755f2f515c77297142789493c0f2ddb6d221beb291a94211a`.
 It started at load 5.06, 7.02 and 9.76 and finished at 10.32, 10.59 and
@@ -3158,14 +3173,16 @@ with a foreground `timeout | tee` pipeline while retaining the two signal
 roots. Process-group INT or TERM could therefore close logging and delete the
 credential file before the controlled runner completed cleanup.
 
-Server branch `throughput-fix-2`, commit `fda6ae9a`, restores an owned FIFO
+Server branch `throughput-fix-2`, commit `7e19ae5d`, restores an owned FIFO
 logger, cancellation forwarding, interrupted-wait retry and joined cleanup.
 A wrapper-only INT is normalized to TERM because a Bash background child may
 inherit ignored INT; the wrapper still returns 130. Nine deterministic roots
 cover group and wrapper-only INT/TERM, repeated termination, normal completion,
 runner failure, logger failure and combined failure. All 27 race executions
-pass. The sibling scan found no other wrapper with the same foreground-tee
-ownership pattern.
+pass. The final rebased-branch log SHA-256 is
+`52ec43d33e6134d07c6462ee190fe574f114dddac5c0d99a7d5d8399e5742d89`.
+The sibling scan found no other wrapper with the same foreground-tee ownership
+pattern.
 
 The final official proxy run passes both packages:
 
@@ -3178,8 +3195,8 @@ The 332-second artifact is
 `/tmp/throughput-fix-2-terra-server-proxy-final-1789622033`; its log SHA-256 is
 `3409fa1f46440b3e9eff31d935bb6baf8fcb5e7e3e0f85b2932dd11ade3ce31a`.
 Load changed from 7.13, 8.14 and 8.99 to 5.02, 7.39 and 8.58. The server main
-worktree was restored after the isolated commit and retains only its unrelated
-controller changes.
+worktree is clean at `3a3cc698`. Both server fixes are isolated on the rebased
+`throughput-fix-2` branch, whose final revision is `21acdcb5`.
 
 ## Remaining work
 

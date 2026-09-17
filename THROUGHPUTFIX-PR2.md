@@ -2879,17 +2879,21 @@ The local PostgreSQL and Redis services became available, so the earlier
 environment deferral is closed. Using the checked-in Bash environment owner,
 all legitimate `server/connect` directories pass: connect in 3,772.499 seconds,
 perfvar in 1,402.138 seconds, sim-latency in 35.928 seconds, the three-test
-resource fixture under `-race`, and the immutable baseline verifier. The
+resource fixture under `-race`, and the immutable baseline verifier. The first
 package-local connect script returned 1 only because its broad `find` entered
 an immutable baseline fixture that the official top-level directory selector
-excludes. Retain that as a harness-discovery improvement; it is not a failed
-server or connect test.
+excludes. Server commit `21acdcb5` now uses that canonical selector, preserves
+caller arguments and stops on selector failure. Its three deterministic roots
+pass 21/21 race executions, and the final official no-test traversal selects
+exactly the four legitimate packages without entering baseline or evaluator
+artifacts. The full product payload was already green against the same source
+and was not repeated after this harness-only correction.
 
 The full proxy product package passes its configured integration in 316.690
 seconds. Its first wrapper run then reproduced an independent server regression:
 INT or TERM could terminate the foreground logger before the acceptance runner
 finished cleanup. The retained deterministic signal tests failed on the
-checked-in wrapper. Server branch `throughput-fix-2`, commit `fda6ae9a`, restores
+checked-in wrapper. Server branch `throughput-fix-2`, commit `7e19ae5d`, restores
 owned logging, signal forwarding and joined cleanup, and adds adjacent direct
 signal, repeated signal, normal-exit, runner-failure and logger-failure roots.
 All nine roots pass three race repetitions. No sibling wrapper contains the
@@ -2900,6 +2904,8 @@ The official proxy script then passes end to end: the product package in
 `3409fa1f46440b3e9eff31d935bb6baf8fcb5e7e3e0f85b2932dd11ade3ce31a`.
 The exact paths, connect hashes and host loads are recorded in
 [the final report](THROUGHPUT-REPORT-PR2.md#final-configured-server-integration).
+Both server fixes are rebased onto clean server main revision `3a3cc698`; the
+final server branch revision is `21acdcb5`.
 
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md

@@ -84,11 +84,16 @@ toolchain without changing host state.
 - `server/proxy` passes in 316.690 seconds and `server/proxy/acceptance` passes
   in 5.958 seconds in the final official-script run.
 
-The connect package-local runner returns 1 after its real packages pass because
-it discovers an immutable baseline fixture that the official top-level harness
-excludes. The proxy run exposed a separate pre-existing signal-cleanup bug.
-Server branch `throughput-fix-2`, commit `fda6ae9a`, fixes that wrapper and adds
-nine deterministic lifecycle roots; 27/27 race executions pass. The final
+The first connect package-local run exposed an unrestricted-discovery defect
+after its real packages passed. Server commit `21acdcb5` now uses the canonical
+top-level selector and covers exact subtree selection, caller arguments and
+selector failure with deterministic tests. The rebased branch passes 21/21
+harness race executions and the official no-test traversal selects exactly the
+four intended packages. The proxy run exposed a separate pre-existing
+signal-cleanup bug. Server commit `7e19ae5d` fixes that wrapper and adds nine
+deterministic lifecycle roots; its rebased validation passes 27/27 race
+executions. The final branch-validation artifact is
+`/tmp/throughput-fix-2-terra-server-rebase-final-1789623466`. The final full
 proxy log is
 `/tmp/throughput-fix-2-terra-server-proxy-final-1789622033/proxy.log`, SHA-256
 `3409fa1f46440b3e9eff31d935bb6baf8fcb5e7e3e0f85b2932dd11ade3ce31a`.
@@ -97,9 +102,9 @@ proxy log is
 
 Task code is committed separately in each repository. The many untracked
 connect evidence directories remain intentionally uncommitted. SDK and all
-platform worktrees retain unrelated pre-existing changes. The server wrapper
-is commit `fda6ae9a` on branch `throughput-fix-2`; its main worktree retains
-only unrelated controller edits.
+platform worktrees retain unrelated pre-existing changes. Server branch
+`throughput-fix-2` contains wrapper commit `7e19ae5d` and connect-runner commit
+`21acdcb5`, rebased onto clean server main revision `3a3cc698`.
 
 ## Remaining gates
 
@@ -107,8 +112,6 @@ only unrelated controller edits.
    replace their native signed-extension, MSVC-service and Linux-daemon builds.
 2. Broader native TUN/H1 and actual-relay campaigns remain follow-up evidence;
    the unavailable PR #213 rig is not a prerequisite for this implementation.
-3. Align package-local `server/connect/test.sh` discovery with the official
-   top-level selector so it cannot enter immutable baseline evidence.
 
 Platform/SDK commits: SDK `0dd2943`, Android `80b4afad`, Apple `280f6678`,
 Windows `960a2d9`, Linux `b97c90c`.
