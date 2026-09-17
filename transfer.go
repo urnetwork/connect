@@ -2678,18 +2678,23 @@ func (self *SendSequence) observeRouteStall(now time.Time) {
 	if oldest == nil {
 		return
 	}
+	unacknowledged := now.Sub(oldest.sendTime)
+	if lastAck, ok := self.laneLastAck(oldest.carrierRoute); ok {
+		unacknowledged = now.Sub(lastAck)
+	}
+	// The retained count is published only with a new silence record. Avoid
+	// rescanning a deep flight on every healthy send and acknowledgement.
+	if unacknowledged <= 0 || uint64(unacknowledged) <= self.client.routeUnacknowledgedNanos.Load() {
+		return
+	}
+	if self.beforeRouteRetainedCountForTest != nil {
+		self.beforeRouteRetainedCountForTest()
+	}
 	retained := 0
 	for _, item := range self.sendItems {
 		if item != nil && item.carrierRoute == oldest.carrierRoute {
 			retained += 1
 		}
-	}
-	unacknowledged := now.Sub(oldest.sendTime)
-	if lastAck, ok := self.laneLastAck(oldest.carrierRoute); ok {
-		unacknowledged = now.Sub(lastAck)
-	}
-	if unacknowledged <= 0 {
-		return
 	}
 	for {
 		current := self.client.routeUnacknowledgedNanos.Load()
@@ -6352,6 +6357,9 @@ type SendSequence struct {
 	// estimate (FLIGHTGATEFIX §26.2).
 	laneAcks          [laneAckSlotCount]laneAckSlot
 	laneAckGeneration uint64
+	// Nil in production; counts full-flight diagnostic scans without a
+	// host-dependent timing assertion.
+	beforeRouteRetainedCountForTest func()
 	// The reliable lane's silence, exported for the campaign (§27.1). The
 	// stallOnset fields hold the reading taken at the first firing of the
 	// current silence; it is committed when that silence ends and proves to

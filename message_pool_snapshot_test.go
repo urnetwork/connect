@@ -92,11 +92,25 @@ func TestMessagePoolSnapshotRequiresExclusiveProcessOwnership(t *testing.T) {
 		if !errors.As(err, &exit) || exit.ExitCode() != 1 || !strings.Contains(string(output), control.literal) || !strings.Contains(string(output), "--- FAIL: "+messagePoolPacketSnapshotTestRoot) {
 			t.Fatalf("foreign %s did not reproduce the exact global-delta failure: %v\n%s", control.mode, err, output)
 		}
-		t.Logf("expected foreign %s failure after joined transition:\n%s", control.mode, output)
+		t.Logf("foreign %s reproduced the expected ownership failure after the joined transition", control.mode)
 		output, err = runMessagePoolSnapshotChild(t, messagePoolPacketSnapshotTestRoot, control.mode, false)
 		if err != nil || !strings.Contains(string(output), "--- PASS: "+messagePoolPacketSnapshotTestRoot) || !strings.Contains(string(output), "exclusive pool snapshot child:") {
 			t.Fatalf("exclusive dispatch with foreign %s did not preserve the real accounting assertions: %v\n%s", control.mode, err, output)
 		}
 		t.Logf("exclusive dispatch with joined foreign %s owner:\n%s", control.mode, output)
+	}
+}
+
+// A passing control must contain its expected child failures. Suite auditors
+// cannot distinguish leaked synthetic signatures from swallowed real failures.
+func TestMessagePoolSnapshotControlsContainExpectedFailures(t *testing.T) {
+	const root = "TestMessagePoolSnapshotRequiresExclusiveProcessOwnership"
+	output, err := runMessagePoolSnapshotChild(t, root, "", true)
+	if err != nil || !strings.Contains(string(output), "--- PASS: "+root) {
+		t.Fatalf("pool snapshot controls did not pass: %v\n%s", err, output)
+	}
+	failure := regexp.MustCompile(`(?m)^\s*(--- FAIL:|FAIL(?:\s|$)|panic:|fatal error:|WARNING: DATA RACE|\[flaky\]test failed iteration\[)`)
+	if signature := failure.Find(output); signature != nil {
+		t.Fatalf("passing pool snapshot controls leaked a child failure signature %q", strings.TrimSpace(string(signature)))
 	}
 }

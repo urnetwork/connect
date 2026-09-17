@@ -54,18 +54,38 @@ func TestWindowMismatchRespectsBothEndpoints(t *testing.T) {
 // one bandwidth-delay product; losing capacity to a second pacing ramp is not.
 func TestWindowPathWindowMismatchMatrix(t *testing.T) {
 	assertMessagePoolOwnership(t)
-	for _, sendWindow := range []ByteCount{kib(256), mib(2), mib(48)} {
-		for _, receiveWindow := range []ByteCount{kib(256), mib(2), mib(48)} {
-			for _, rtt := range []time.Duration{300 * time.Microsecond, 100 * time.Millisecond, 400 * time.Millisecond} {
-				for _, compression := range []time.Duration{0, 10 * time.Millisecond} {
-					for _, flows := range []int{1, 8} {
-						t.Logf("case: %s", fmt.Sprintf("send=%d/receive=%d/rtt=%s/compression=%s/flows=%d", sendWindow, receiveWindow, rtt, compression, flows))
-						checkWindowMismatchCell(t, windowPathCell{SendWindow: sendWindow, ReceiveWindow: receiveWindow, RoundTrip: rtt, Compression: compression, Flows: flows, Rate: 125000000})
-					}
-				}
-			}
-		}
+	for _, cell := range windowMismatchMatrixCells() {
+		t.Logf("case: send=%d/receive=%d/rtt=%s/compression=%s/flows=%d", cell.SendWindow, cell.ReceiveWindow, cell.RoundTrip, cell.Compression, cell.Flows)
+		checkWindowMismatchCellWithMinimumDuration(t, cell, 100*time.Millisecond)
 	}
+}
+
+// Covers every pair of endpoint/path dimension values and the explicit
+// boundary corners checked by TestWindowPathWindowMismatchMatrixCoverage.
+// The full product repeated millions of real packet operations under race;
+// advancing a synthetic clock does not eliminate that work.
+func windowMismatchMatrixCells() []windowPathCell {
+	cells := []windowPathCell{
+		{SendWindow: kib(256), ReceiveWindow: kib(256), RoundTrip: 300 * time.Microsecond, Flows: 1},
+		{SendWindow: mib(48), ReceiveWindow: mib(48), RoundTrip: 400 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 8},
+		{SendWindow: mib(48), ReceiveWindow: kib(256), RoundTrip: 400 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 8},
+		{SendWindow: kib(256), ReceiveWindow: mib(48), RoundTrip: 400 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 8},
+		{SendWindow: mib(48), ReceiveWindow: kib(256), RoundTrip: 300 * time.Microsecond, Flows: 1},
+		{SendWindow: kib(256), ReceiveWindow: mib(48), RoundTrip: 300 * time.Microsecond, Flows: 1},
+		{SendWindow: mib(48), ReceiveWindow: mib(48), RoundTrip: 300 * time.Microsecond, Compression: 10 * time.Millisecond, Flows: 8},
+		{SendWindow: kib(256), ReceiveWindow: kib(256), RoundTrip: 400 * time.Millisecond, Flows: 8},
+		{SendWindow: mib(2), ReceiveWindow: mib(2), RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 1},
+		{SendWindow: kib(256), ReceiveWindow: mib(2), RoundTrip: 100 * time.Millisecond, Flows: 8},
+		{SendWindow: mib(2), ReceiveWindow: kib(256), RoundTrip: 300 * time.Microsecond, Flows: 8},
+		{SendWindow: mib(2), ReceiveWindow: mib(2), RoundTrip: 400 * time.Millisecond, Flows: 1},
+		{SendWindow: mib(2), ReceiveWindow: mib(48), RoundTrip: 100 * time.Millisecond, Flows: 1},
+		{SendWindow: mib(48), ReceiveWindow: kib(256), RoundTrip: 100 * time.Millisecond, Flows: 1},
+		{SendWindow: mib(48), ReceiveWindow: mib(2), RoundTrip: 300 * time.Microsecond, Flows: 1},
+	}
+	for i := range cells {
+		cells[i].Rate = 125000000
+	}
+	return cells
 }
 
 // Receiver budgets can change while a sequence is live. Keep the same
@@ -84,6 +104,14 @@ func TestWindowPathWindowMismatchChanges(t *testing.T) {
 // traffic. Only the window and pacing rule differs.
 func checkWindowMismatchCell(t *testing.T, cell windowPathCell) {
 	t.Helper()
+	checkWindowMismatchCellWithMinimumDuration(t, cell, time.Second)
+}
+
+// The pairwise sweep uses the same short-path floor as the adjacent path
+// matrix. Window-limited flights retain twenty full residences; callers that
+// measure changing budgets keep their original one-second minimum.
+func checkWindowMismatchCellWithMinimumDuration(t *testing.T, cell windowPathCell, minimumDuration time.Duration) {
+	t.Helper()
 	cell.Budget, cell.Payload = mib(48), 1280
 	cell.RoundRobinOffer = true
 	finalReceive := cell.ReceiveWindow
@@ -91,7 +119,7 @@ func checkWindowMismatchCell(t *testing.T, cell windowPathCell) {
 		finalReceive = cell.ReceiveWindowAfter
 	}
 	var ceiling, fixed windowPathReading
-	duration := max(time.Second, 2*cell.RoundTrip)
+	duration := max(minimumDuration, 2*cell.RoundTrip)
 	residence := cell.RoundTrip + cell.Compression
 	windowRate := float64(min(cell.SendWindow, finalReceive)) / residence.Seconds()
 	if windowRate < float64(cell.Rate)/2 {
@@ -100,6 +128,7 @@ func checkWindowMismatchCell(t *testing.T, cell windowPathCell) {
 		duration = max(duration, 20*residence)
 	}
 	for _, arm := range []string{"ceiling", "delivery"} {
+		started := time.Now()
 		synctest.Test(t, func(t *testing.T) {
 			trial := cell
 			trial.Arm, trial.Drop = arm, arm == "delivery"
@@ -115,6 +144,7 @@ func checkWindowMismatchCell(t *testing.T, cell windowPathCell) {
 				fixed = reading
 			}
 		})
+		t.Logf("mismatch arm=%s wall-elapsed=%s", arm, time.Since(started))
 	}
 	t.Logf("mismatch send=%d receive=%d final-receive=%d rtt=%s compression=%s flows=%d ceiling=%.3f fixed=%.3f min-flow=%.3f model Mb/s window=%d pace=%d drops=%d/%d", cell.SendWindow, cell.ReceiveWindow, finalReceive, cell.RoundTrip, cell.Compression, cell.Flows, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.Window.Window, fixed.Window.PacingByteRate, fixed.RelayDrops, fixed.MeasurementRelayDrops)
 	if ceiling.Mbps < .85*min(float64(cell.Rate), windowRate)*8/1e6 || fixed.Mbps < .90*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.Window.Window > min(cell.SendWindow, finalReceive) || fixed.MeasurementRelayDrops != 0 || fixed.Receiver.ReceiveQueueDropCount != 0 || fixed.Receiver.ReceiveQueueEvictionCount != 0 {

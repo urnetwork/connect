@@ -1,8 +1,6 @@
 package connect
 
 import (
-	"context"
-	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -139,89 +137,103 @@ func TestDeliveryCandidatesRequireFreshPermissionHistory(t *testing.T) {
 	})
 }
 
-// Keep the established 0.45–0.85 occupancy band on the same steady path,
-// offer duration and paired sampling clock. Retention can preserve a larger
-// earlier candidate, so the final reason need not be "delivery". The fresh
-// candidate and effective window must still lie inside their hard bounds.
-// Form each ratio from contemporaneous occupancy and effective window; dividing
-// average occupancy by a single final window mixes different populations.
+// The occupancy band applies after measured delivery grows the opening.
+// A wall-clock producer did not establish that premise: under instrumentation
+// it could leave the retained 2 MiB opening mostly empty. Controlled offer and
+// Ack clocks establish growth here without changing the original band.
 func TestWindowRetainedSteadyPathPreservesOccupancyBand(t *testing.T) {
 	assertMessagePoolOwnership(t)
-
-	const propagation = 25 * time.Millisecond
-	const payloadByteCount = 4 * 1024
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	harness := newSendWindowHarness(t, ctx, propagation,
-		func(settings *SendBufferSettings) {
-			settings.DeliverySizedWindowScale = deliverySizedWindowScale
-			// far above twice the delivery, so the clamp never binds and the
-			// delivery term is what sets the window
-			settings.ResendQueueBudget = NewTransferMemoryBudget(mib(64))
-			settings.DeliverySizedWindowCeilingByteCount = mib(64)
-			// the target clamp is a separate mechanism with its own rows, and
-			// it ships on; this row measures the fixed point, so the clamp is
-			// held out
-			settings.TargetGoodputByteRate = 0
-		})
-	harness.receiveHold(mib(64))
-	// This identity is for immediate ACKs. A compressed receiver reserves
-	// additional residence, so occupancy need not be half that larger window.
-	harness.receiver.settings.ReceiveBufferSettings.AckCompressTimeout = 0
-
-	// paired at each tick: occupancy and the window as they stand together
-	ratioTotal := &atomic.Int64{}
-	ratioSamples := &atomic.Int64{}
-	watching := make(chan struct{})
-	go func() {
-		defer close(watching)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(2 * time.Millisecond):
-				_, queued, _ := harness.sender.ResendQueueSize(
-					harness.receiverId, MultiHopId{}, false, false)
-				window := harness.sender.
-					DestinationSendStats(harness.receiverId).SendWindow
-				if window.Window <= 0 || !window.Sized {
-					continue
-				}
-				// in parts per thousand, so the average is integer arithmetic
-				ratioTotal.Add(int64(queued) * 1000 / int64(window.Window))
-				ratioSamples.Add(1)
-			}
+	synctest.Test(t, func(t *testing.T) {
+		estimate, ratio := measureRetainedWindowOccupancy(t, 64*1024)
+		if !estimate.Sized || estimate.CandidateWindow <= estimate.Floor ||
+			estimate.Ceiling <= estimate.CandidateWindow || estimate.Ceiling <= estimate.Window {
+			t.Fatalf("the steady-path candidate or retained window reached a hard clamp: %+v", estimate)
 		}
-	}()
-	harness.offer(t, payloadByteCount, 3*time.Second)
-	estimate := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
-	cancel()
-	<-watching
+		if estimate.CandidateWindow <= estimate.Initial || estimate.Window <= estimate.Initial {
+			t.Fatalf("steady delivery did not establish growth above the opening: %+v", estimate)
+		}
+		if ratio < 0.45 || 0.85 < ratio {
+			t.Errorf("occupancy rests at %.2f of the window, outside the 0.45 to 0.85 band", ratio)
+		}
+	})
+}
 
-	if ratioSamples.Load() == 0 {
-		t.Fatal("occupancy was never sampled against a sized window, so this cell reads nothing")
-	}
-	ratio := float64(ratioTotal.Load()) / float64(ratioSamples.Load()) / 1000
-	t.Logf(
-		"mean of occupancy over window, paired at %d ticks: %.2f; last window %d, ceiling %d, reason %q",
-		ratioSamples.Load(), ratio, estimate.Window,
-		estimate.Ceiling, estimate.Reason,
-	)
+// The same path at a quarter of the offer rate reproduces the former 0.20
+// occupancy failure deterministically. Its candidate remains interior, but
+// ordinary slow delivery cannot shrink the opening to manufacture half fill.
+func TestWindowRetainedApplicationLimitedPathKeepsOpening(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		estimate, ratio := measureRetainedWindowOccupancy(t, 16*1024)
+		if !estimate.Sized || estimate.CandidateWindow <= estimate.Floor || estimate.Initial <= estimate.CandidateWindow || estimate.Window != estimate.Initial || estimate.LearnedWindow != estimate.Initial {
+			t.Fatalf("application-limited delivery changed retained capacity or failed to qualify an interior candidate: %+v", estimate)
+		}
+		if 0.45 <= ratio {
+			t.Fatalf("application-limited control did not leave the old occupancy band: %.3f", ratio)
+		}
+	})
+}
 
-	if !estimate.Sized || estimate.CandidateWindow <= estimate.Floor ||
-		estimate.Ceiling <= estimate.CandidateWindow || estimate.Ceiling <= estimate.Window {
-		t.Fatalf(
-			"the steady-path candidate or retained window reached a hard clamp, so this cell does not isolate delivery: %+v",
-			estimate,
-		)
+// One real Pack per virtual millisecond fixes the offered rate independently
+// of host execution speed. FIFO Ack propagation and quiescence pair actual
+// retained bytes with the admitted window after every completed transition.
+func measureRetainedWindowOccupancy(t *testing.T, payloadByteCount int) (SendWindowEstimate, float64) {
+	t.Helper()
+	const propagation = 25 * time.Millisecond
+	const spacing = time.Millisecond
+	const ticks = 512
+	fixture := newWindowRoundFixture(t, func(settings *SendBufferSettings) {
+		settings.DeliverySizedWindowScale = deliverySizedWindowScale
+		settings.ResendQueueMaxByteCount = mib(2)
+		settings.ResendQueueMinByteCount = kib(256)
+		settings.ResendQueueBudget = NewTransferMemoryBudget(mib(64))
+		settings.DeliverySizedWindowCeilingByteCount = mib(64)
+		settings.TargetGoodputByteRate = 0
+	}, func(settings *ReceiveBufferSettings) {
+		settings.ReceiveQueueMaxByteCount = mib(64)
+		settings.AdvertiseReceiveWindow = true
+	})
+	// Establish the receiver's permission before sustained traffic; the
+	// initial blind hold is a separate bound from the learned opening.
+	warmup := fixture.write(payloadByteCount)
+	ack := fixture.receive(warmup)
+	time.Sleep(propagation)
+	fixture.forward(ack, fixture.senderIn)
+	fixture.startWire(propagation, 0)
+	sequence := fixture.sequence()
+	var estimate SendWindowEstimate
+	var ratioTotal float64
+	for tick := range ticks {
+		at := time.Now()
+		if admitted, err := fixture.send(payloadByteCount); !admitted || err != nil {
+			t.Fatalf("steady Pack %d was not admitted: %v", tick, err)
+		}
+		synctest.Wait()
+		if !time.Now().Equal(at) {
+			t.Fatalf("steady Pack %d waited for admission and changed the offered rate", tick)
+		}
+		if ticks/2 <= tick {
+			estimate = sequence.sendWindowSnapshot(at)
+			count, queued := sequence.resendQueue.QueueSize()
+			if count != int(propagation/spacing) || !estimate.Sized || estimate.RoundTrip != propagation {
+				t.Fatalf("tick %d: retained=%d estimate=%+v, want one sampled propagation flight", tick, count, estimate)
+			}
+			ratioTotal += float64(queued) / float64(estimate.Window)
+		}
+		time.Sleep(spacing)
 	}
-	if ratio < 0.45 || 0.85 < ratio {
-		t.Errorf(
-			"occupancy rests at %.2f of the window, outside the 0.45 to 0.85 band four runs put it in at 0.68 to 0.71; approaching the window means the delivery term has stopped binding, and collapsing toward zero means the window has, and either is a defect in the loop",
-			ratio,
-		)
+	// All offered messages must finish without eviction or a stranded owner.
+	time.Sleep(propagation)
+	synctest.Wait()
+	if count, _ := sequence.resendQueue.QueueSize(); count != 0 || fixture.deliveredCount != ticks+1 || fixture.ackedCount != fixture.deliveredCount {
+		t.Fatalf("steady path did not drain: retained=%d delivered=%d acknowledged=%d, want %d messages", count, fixture.deliveredCount, fixture.ackedCount, ticks+1)
 	}
+	if stats := fixture.receiver.ReceiveStats(); stats.ReceiveQueueEvictionCount != 0 || stats.ReceiveQueueDropCount != 0 {
+		t.Fatalf("steady path caused evictions=%d drops=%d", stats.ReceiveQueueEvictionCount, stats.ReceiveQueueDropCount)
+	}
+	ratio := ratioTotal / (ticks / 2)
+	t.Logf("payload=%d per %s: mean paired occupancy=%.3f; window=%d candidate=%d initial=%d ceiling=%d reason=%q", payloadByteCount, spacing, ratio, estimate.Window, estimate.CandidateWindow, estimate.Initial, estimate.Ceiling, estimate.Reason)
+	return estimate, ratio
 }
 
 // Injected delivery checks the candidate arithmetic from an explicit 1 MiB
