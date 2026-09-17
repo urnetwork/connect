@@ -406,6 +406,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 			priority:           100,
 			dialTlsContext:     newExtenderDialTlsContext(&settings.ConnectSettings, &copiedConfig, clientWebSocketNextProtos),
 			httpDialTlsContext: newExtenderDialTlsContext(&settings.ConnectSettings, &copiedConfig, clientHttpNextProtos),
+			dialContext:        newExtenderDialContext(&settings.ConnectSettings, &copiedConfig),
 			extenderConfig:     &copiedConfig,
 			settings:           settings,
 		}
@@ -528,6 +529,35 @@ func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]
 // ExtenderDirectory is the directory this strategy draws extenders from, nil
 // when discovery is disabled. The platform transport reads it to report the
 // live connections through each address (K4).
+// H3ExtenderConfig returns an extender for the h3 carrier to reach the
+// destination through, or nil to bind an ordinary udp socket.
+//
+// It answers non-nil only when this strategy has NO direct path: both the
+// normal and the resilient strategies off, and at least one configured
+// extender. That is deliberately narrow. A client with a direct path keeps
+// dialing h3 exactly as before, so nothing here can regress an ordinary
+// client; what it fixes is the case that had no answer at all, a client
+// pinned to h3 whose only way out is an extender.
+//
+// Racing a direct h3 dial against an extender one, the way the stream dialers
+// race, would be the fuller answer and is not what this does.
+func (self *ClientStrategy) H3ExtenderConfig() *ExtenderConfig {
+	if self.settings.EnableNormal || self.settings.EnableResilient {
+		return nil
+	}
+	for _, extenderConfig := range self.settings.ExtenderConfigs {
+		if extenderConfig != nil {
+			return extenderConfig
+		}
+	}
+	return nil
+}
+
+// ConnectSettings is the dial boundary this strategy was configured with.
+func (self *ClientStrategy) ConnectSettings() *ConnectSettings {
+	return &self.settings.ConnectSettings
+}
+
 func (self *ClientStrategy) ExtenderDirectory() *ExtenderDirectory {
 	if self == nil {
 		return nil
@@ -1792,6 +1822,12 @@ type clientDialer struct {
 	// speak.
 	dialTlsContext     DialTlsContextFunction
 	httpDialTlsContext DialTlsContextFunction
+	// dialContext, when set, is this dialer's PLAIN dial, for the schemes that
+	// have no tls dialer to reach a strategy through: http:// and ws://.
+	// Without it those schemes fall back to the shared ConnectSettings dial,
+	// which ignores the dialer entirely -- so an extender-only strategy
+	// silently dialed the destination directly and looked like it worked.
+	dialContext DialContextFunction
 	// httpClientFactory, when set, builds the api client of this dialer
 	// instead of the default http.Transport over httpDialTlsContext. The alt
 	// dialers use it for an http3 round tripper (L4). A dialer that carries
@@ -1903,7 +1939,15 @@ func (self *clientDialer) HttpClient() *http.Client {
 		// authoritative and, without one, the configured resolver, family policy,
 		// proxy, and address race still apply. https:// uses the dialTlsContext
 		// chain above, which reaches the same ConnectSettings.DialContext boundary.
-		transport.DialContext = self.settings.ConnectSettings.DialContext
+		//
+		// A dialer with its own plain dial -- an extender -- uses that instead.
+		// The shared settings dial goes straight to the destination, which for
+		// an extender dialer is the one thing it must not do.
+		if self.dialContext != nil {
+			transport.DialContext = self.dialContext
+		} else {
+			transport.DialContext = self.settings.ConnectSettings.DialContext
+		}
 		self.httpClient = &http.Client{
 			Transport: transport,
 			Timeout:   self.settings.RequestTimeout,
@@ -1948,12 +1992,23 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 		// authoritative and, without one, the configured resolver, family policy,
 		// proxy, and address race still apply. wss:// uses the dialTlsContext chain
 		// above, which reaches the same ConnectSettings.DialContext boundary.
+		//
+		// A dialer with its own plain dial -- an extender -- uses that instead,
+		// with the same control-dial evidence the tls path records. The shared
+		// settings dial reaches the destination directly, which is precisely
+		// what an extender dialer exists to avoid.
+		plainDialContext := settings.ConnectSettings.DialContext
+		if self.dialContext != nil {
+			plainDialContext = wrapControlDial(
+				"platform", settings.ConnectSettings.Log, true, self.dialContext,
+			)
+		}
 		self.websocketDialer.NetDialContext = func(
 			ctx context.Context,
 			network string,
 			address string,
 		) (net.Conn, error) {
-			conn, err := settings.ConnectSettings.DialContext(ctx, network, address)
+			conn, err := plainDialContext(ctx, network, address)
 			if err != nil {
 				return nil, err
 			}

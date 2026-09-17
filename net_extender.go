@@ -164,27 +164,35 @@ type ExtenderDial struct {
 	Challenge []byte
 	// 0 forward, 1 gossip, 2 feed. DestinationHost is ignored when set.
 	Service uint32
+	// Datagram asks the extender to relay udp datagrams to the destination
+	// rather than a stream. The carrier is still one reliable byte stream; the
+	// datagrams are framed on it (net_extender_datagram.go).
+	Datagram bool
 }
 
-// create a tls connect to (destinationHost, destinationPort) on the connection
-// returned by this
-// the returned connection is not a tls connection
-func NewExtenderDialTlsContext(
+// NewExtenderDialContext returns a PLAIN dial through the extender: the raw
+// stream the extender relays to (destinationHost, destinationPort), with no
+// inner TLS on top.
+//
+// The extender passes the inner stream through verbatim, so a caller that does
+// not want TLS to the destination -- plain http:// or ws://, which have no tls
+// dialer to reach this layer through -- gets an ordinary net.Conn here and
+// speaks whatever it likes over it. Without this, those schemes silently
+// bypassed every extender and dialed the destination directly.
+func NewExtenderDialContext(
 	connectSettings *ConnectSettings,
 	extenderConfig *ExtenderConfig,
-) DialTlsContextFunction {
-	return newExtenderDialTlsContext(connectSettings, extenderConfig, nil)
+) DialContextFunction {
+	return newExtenderDialContext(connectSettings, extenderConfig)
 }
 
-func newExtenderDialTlsContext(
+func newExtenderDialContext(
 	connectSettings *ConnectSettings,
 	extenderConfig *ExtenderConfig,
-	nextProtos []string,
-) DialTlsContextFunction {
+) DialContextFunction {
 	// one outer config per dialer, so its session cache is not shared with
 	// any other egress path
 	extenderTlsConfig := newExtenderTlsConfig(extenderConfig)
-	innerBaseTlsConfig := newClientTlsConfig(connectSettings.TlsConfig, nextProtos)
 	return func(
 		ctx context.Context,
 		network string,
@@ -217,6 +225,44 @@ func newExtenderDialTlsContext(
 			},
 			extenderTlsConfig,
 		)
+		if err != nil {
+			return nil, err
+		}
+		return serverConn, nil
+	}
+}
+
+// create a tls connect to (destinationHost, destinationPort) on the connection
+// returned by this
+// the returned connection is not a tls connection
+func NewExtenderDialTlsContext(
+	connectSettings *ConnectSettings,
+	extenderConfig *ExtenderConfig,
+) DialTlsContextFunction {
+	return newExtenderDialTlsContext(connectSettings, extenderConfig, nil)
+}
+
+// The tls dial is the plain dial with the inner handshake on top: the extender
+// relays the inner stream verbatim, so there is nothing tls-specific about
+// reaching the destination, only about what is spoken once it is reached.
+func newExtenderDialTlsContext(
+	connectSettings *ConnectSettings,
+	extenderConfig *ExtenderConfig,
+	nextProtos []string,
+) DialTlsContextFunction {
+	dialContext := newExtenderDialContext(connectSettings, extenderConfig)
+	innerBaseTlsConfig := newClientTlsConfig(connectSettings.TlsConfig, nextProtos)
+	return func(
+		ctx context.Context,
+		network string,
+		address string,
+	) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			panic(err)
+		}
+
+		serverConn, err := dialContext(ctx, network, address)
 		if err != nil {
 			return nil, err
 		}
@@ -350,6 +396,7 @@ func extenderRequestHeaderBytes(
 		Timestamp:       uint64(time.Now().UnixMilli()),
 		Challenge:       extenderDial.Challenge,
 		Service:         extenderDial.Service,
+		Datagram:        extenderDial.Datagram,
 	}
 	if extenderConfig.Secret != "" {
 		nonce := NewId()
@@ -820,4 +867,63 @@ func (self *streamConn) SetReadDeadline(t time.Time) error {
 
 func (self *streamConn) SetWriteDeadline(t time.Time) error {
 	return self.stream.SetWriteDeadline(t)
+}
+
+// NewExtenderPacketDialContext returns a dial that yields a net.PacketConn
+// reaching (destinationHost, destinationPort) through the extender.
+//
+// This is the h3 path. An extender relays one reliable byte stream and cannot
+// see inside the inner tls, so it cannot reframe a quic stream into anything;
+// the datagrams are framed explicitly instead and the extender turns them back
+// into udp at the far end. See net_extender_datagram.go for what that
+// preserves and what it costs.
+func NewExtenderPacketDialContext(
+	connectSettings *ConnectSettings,
+	extenderConfig *ExtenderConfig,
+) DialPacketContextFunction {
+	extenderTlsConfig := newExtenderTlsConfig(extenderConfig)
+	return func(
+		ctx context.Context,
+		network string,
+		address string,
+	) (net.PacketConn, error) {
+		switch network {
+		case "udp", "udp4", "udp6":
+		default:
+			return nil, fmt.Errorf("extender packet dial supports udp, not %s", network)
+		}
+
+		host, portStr, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, err
+		}
+
+		serverConn, _, err := dialExtenderStream(
+			ctx,
+			connectSettings,
+			extenderConfig,
+			&ExtenderDial{
+				DestinationHost: host,
+				DestinationPort: port,
+				Datagram:        true,
+			},
+			extenderTlsConfig,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		remote, err := net.ResolveUDPAddr("udp", address)
+		if err != nil {
+			// Informational only: the extender already holds the destination
+			// from the header it accepted. An unresolvable name is still a
+			// usable relay, so report the address we were given.
+			remote = &net.UDPAddr{Port: port}
+		}
+		return newExtenderPacketConn(serverConn, remote), nil
+	}
 }

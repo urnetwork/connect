@@ -15,6 +15,11 @@ import (
 type DialContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
 type DialTlsContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
 
+// DialPacketContextFunction opens a packet connection to addr. The extender
+// packet dial returns one of these so quic can run over a carrier that is
+// itself a reliable stream (net_extender_datagram.go).
+type DialPacketContextFunction = func(ctx context.Context, network string, addr string) (net.PacketConn, error)
+
 // withConnWritePhaseDeadline bounds a synchronous connection write phase by
 // the earlier of the caller deadline and its phase budget. Context cancellation
 // alone cannot interrupt a net.Conn.Write already in progress.
