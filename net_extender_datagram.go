@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -45,6 +46,25 @@ const extenderDatagramMaxSize = 2048
 const extenderDatagramLenSize = 2
 
 var errExtenderDatagramTooLarge = errors.New("extender datagram exceeds the maximum size")
+
+// extenderDatagramAddr retains an unresolved destination name for ReadFrom.
+// The address is descriptive only: the extender already received the actual
+// destination in its header, so resolving it again would add an unaudited
+// network operation on the client.
+type extenderDatagramAddr struct {
+	network string
+	address string
+}
+
+func (self extenderDatagramAddr) Network() string { return self.network }
+func (self extenderDatagramAddr) String() string  { return self.address }
+
+func newExtenderDatagramAddr(network string, address string) net.Addr {
+	if addrPort, err := netip.ParseAddrPort(address); err == nil {
+		return net.UDPAddrFromAddrPort(addrPort)
+	}
+	return extenderDatagramAddr{network: network, address: address}
+}
 
 // WriteExtenderDatagram writes one length-prefixed datagram.
 //

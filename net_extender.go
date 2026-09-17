@@ -917,13 +917,11 @@ func NewExtenderPacketDialContext(
 			return nil, err
 		}
 
-		remote, err := net.ResolveUDPAddr("udp", address)
-		if err != nil {
-			// Informational only: the extender already holds the destination
-			// from the header it accepted. An unresolvable name is still a
-			// usable relay, so report the address we were given.
-			remote = &net.UDPAddr{Port: port}
-		}
+		// ReadFrom's address is informational: the extender already owns the
+		// destination from the accepted header. Construct it without resolving
+		// the hostname here; an unbound resolver would bypass the egress path
+		// and can recurse into the tunnel on Windows.
+		remote := newExtenderDatagramAddr(network, address)
 		return newExtenderPacketConn(serverConn, remote), nil
 	}
 }
