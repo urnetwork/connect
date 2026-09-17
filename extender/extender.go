@@ -192,6 +192,13 @@ type ExtenderSettings struct {
 	// integration tests use it for the extender-to-connect segment. Nil
 	// retains forwardDialer. The extender owns and closes returned connections.
 	DialContext connect.DialContextFunction
+	// DialPacketContext is DialContext for the datagram relay: it opens the
+	// udp socket to the destination when a client asked for datagrams
+	// (extender_datagram.go). Kept separate from DialContext so a test can
+	// observe or simulate the two egress kinds independently, and so a
+	// userspace TUN can supply udp without also claiming tcp. Nil retains
+	// forwardDialer.
+	DialPacketContext connect.DialContextFunction
 	// ErrorHandler, when set, receives connection-stage failures. Measurement
 	// tests use it to make an otherwise client-visible timeout attributable.
 	// It runs synchronously and must not block. Nil retains the silent
@@ -1287,6 +1294,20 @@ func (self *ExtenderServer) handleV1Connection(
 	}
 	if !self.IsAllowedHost(header.DestinationHost) {
 		self.reportError("destination authorization", fmt.Errorf("host %q is not allowed", header.DestinationHost))
+		return
+	}
+
+	if header.Datagram {
+		// The carrier stays one reliable byte stream; the datagrams framed on
+		// it become real udp packets here. This is the only way quic reaches a
+		// destination through an extender: the inner tls is opaque to us, so
+		// there is nothing to reframe and the boundaries have to be carried
+		// explicitly.
+		if err := clientConn.SetDeadline(time.Time{}); err != nil {
+			self.reportError("relay", err)
+			return
+		}
+		self.relayDatagram(ctx, cancel, clientConn, header)
 		return
 	}
 

@@ -14,6 +14,22 @@ message ExtenderHeader {
     bytes Challenge = 6;
     // 0 forward, 1 gossip, 2 feed
     uint32 Service = 7;
+    // Relay DATAGRAMS to the destination instead of a stream.
+    //
+    // The carrier is still one reliable byte stream; each datagram is carried
+    // on it with a two byte big endian length prefix, and the extender turns
+    // those frames back into real udp packets at the far end. It exists for
+    // quic: an extender cannot decode the inner tls, so it cannot reframe a
+    // quic stream into anything, and without this a client pinned to an h3
+    // carrier has no extender path at all.
+    //
+    // Datagram boundaries are preserved, and ONLY the boundaries. The carrier
+    // is reliable and ordered, so a datagram cannot be lost or reordered
+    // between client and extender the way a real udp path would allow, and
+    // loss past the extender is not signalled. Quic tolerates both: it is
+    // carrying its own loss recovery, and a reliable underlay simply never
+    // exercises it on that leg.
+    bool Datagram = 8;
 }
 
 message ExtenderResponse {

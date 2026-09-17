@@ -118,6 +118,16 @@ func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 		return
 	}
 
+	if header.Datagram {
+		// The carrier stays one reliable byte stream; the datagrams framed on
+		// it become real udp packets here. This is how quic reaches a
+		// destination through an extender: the inner tls is opaque to us, so
+		// there is nothing to reframe and the boundaries have to be carried
+		// explicitly (extender_datagram.go).
+		server.relayDatagram(handleCtx, handleCancel, clientConn, header)
+		return
+	}
+
 	forwardConn, err := server.dialForward(handleCtx, req.RemoteAddr, header)
 	if err != nil {
 		return
