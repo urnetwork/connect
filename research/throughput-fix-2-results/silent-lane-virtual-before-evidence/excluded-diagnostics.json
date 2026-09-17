@@ -1,0 +1,13 @@
+[
+  {
+    "classification": "excluded-trace-compile-only-failure",
+    "pins": {
+      "base_manifest_sha256": "d08bfc1678de38ccf495e83485f26d1129e91e69aab9a9f2afb9612f1f632a89",
+      "build_exit_status": 1,
+      "build_log_sha256": "40d0dbca89a09e8f0b13f1500456af36b5a861f884ab073887661dc70759983f",
+      "manifest_sha256": "e485c922f95fee13953bb771aa675c76c86d9a13027d24897a8abad428e86f73",
+      "test_source_sha256": "7b5405868ade87fbc9df2a740e0735f443fcdd6b5b0492a764b2f275cfa41c42"
+    },
+    "reason": "The initial trace build did not produce a runnable test binary; it is not a test outcome."
+  }
+]

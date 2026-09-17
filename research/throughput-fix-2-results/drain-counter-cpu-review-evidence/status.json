@@ -1,0 +1,14 @@
+{
+  "all_allocs_per_op_zero": true,
+  "all_bytes_per_op_zero": true,
+  "benchmark_process_fail_count": 0,
+  "benchmark_process_pass_count": 5,
+  "complete": true,
+  "final_paired_rows": 60,
+  "initial_diagnostic_rows": 24,
+  "input_pins_verified": 25,
+  "paired_summary_count": 10,
+  "race": false,
+  "retained_numeric_rows": 84,
+  "scope": "CPU/allocation comparison only; not throughput or performance acceptance"
+}

@@ -1,0 +1,82 @@
+{
+  "censored_comparisons": 0,
+  "comparison_count": 0,
+  "failures": [
+    {
+      "cells": [
+        {
+          "ceiling_megabits_per_second": 4.56,
+          "compression_milliseconds": 50,
+          "delivery_floor_megabits_per_second": 4.104,
+          "delivery_megabits_per_second": 3.413,
+          "flows": 8,
+          "measurement_relay_drops": 0,
+          "minimum_flow_megabits_per_second": 0.427,
+          "receive_window_after_bytes": 65536,
+          "round_trip_milliseconds": 100,
+          "send_window_bytes": 2097152
+        }
+      ],
+      "reason": "delivery below the 90 percent matched-ceiling floor after a receive-window shrink",
+      "test": "TestWindowPathWindowMismatchChanges"
+    },
+    {
+      "candidate_interval_megabits_per_second": [
+        0.4096,
+        0.43008,
+        0.47104
+      ],
+      "candidate_megabits_per_second": 0.436907,
+      "measurement_relay_drops": 0,
+      "minimum_flow_megabits_per_second": 0.054613,
+      "reason": "service capacity did not sustain after long RTT growth",
+      "reference_interval_megabits_per_second": [
+        95.76448,
+        95.78496,
+        95.76448
+      ],
+      "reference_megabits_per_second": 95.771307,
+      "test": "TestWindowPathServiceRoundTripGrowthBeyondOldRing"
+    },
+    {
+      "cells": [
+        {
+          "ceiling_megabits_per_second": 9.58464,
+          "compression_milliseconds": 50,
+          "delivery_floor_megabits_per_second": 8.626176,
+          "delivery_megabits_per_second": 8.12032,
+          "flows": 1,
+          "max_relay_queued": 1922,
+          "max_relay_queued_bytes": 5132267,
+          "measurement_relay_drops": 0,
+          "minimum_flow_megabits_per_second": 8.12032,
+          "round_trip_microseconds": 300,
+          "service_rate_bytes_per_second": 1250000
+        },
+        {
+          "ceiling_megabits_per_second": 9.58464,
+          "compression_milliseconds": 50,
+          "delivery_floor_megabits_per_second": 8.626176,
+          "delivery_megabits_per_second": 8.17152,
+          "flows": 8,
+          "max_relay_queued": 1922,
+          "max_relay_queued_bytes": 5133557,
+          "measurement_relay_drops": 0,
+          "minimum_flow_megabits_per_second": 1.01376,
+          "round_trip_microseconds": 300,
+          "service_rate_bytes_per_second": 1250000
+        }
+      ],
+      "reason": "delivery below the 90 percent matched-ceiling floor",
+      "test": "TestWindowPathServicePerformanceMatrix"
+    }
+  ],
+  "ledger_rows": 818,
+  "note": "All terminal model-service rows, including the failed-cell rows, remain in ledger.jsonl. This summary derives only normalized terminal assertions from the raw log.",
+  "top_level": {
+    "failed": 3,
+    "passed": 24,
+    "race_warnings": 0,
+    "skipped": 0
+  }
+}

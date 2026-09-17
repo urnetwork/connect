@@ -1,0 +1,23 @@
+{
+  "fixture_sha256": "abfe63e2ee1a7d5a323011163d9e63397181d4d68857bf4e66985ede0b3b4d47",
+  "runs": [
+    {
+      "binary_sha256": "21dc3ac1983f4103cde491956fb4844ed7d7ac02364e229295003abc4e1c43ff",
+      "race_blocks": 0,
+      "raw_run_log_sha256": "24baafccd71c835734606ac02b7a5c7ca5839209ebdfcc1765e222160e407ac6",
+      "run_manifest_sha256": "19f319f238109ad74a6de919ccc9baeba7a6b42228c898c87ef0f0fbe8ffc2c7",
+      "source_sha256": "2874c8d1808443b0a94b5cc50a0a3320fe6c792b7b3581434feb4a76120edce5",
+      "variant": "current"
+    },
+    {
+      "binary_sha256": "1595fc87064bc6677e4a9e35ee666016f836b17da47379e87218b698ea60afb0",
+      "race_blocks": 0,
+      "raw_run_log_sha256": "5f19c61c68e4fd83e6de65d8b5e95f9eecc6c03bfe0de8d324099b175d7879cf",
+      "run_manifest_sha256": "62511eb26cd475583dc792448dca3e53d8a0f613b69b9a01cef8eec096c61644",
+      "source_sha256": "aa840eb8c430cca52b06418ea40b1aa20bc58f5275b882c3567822881933b9eb",
+      "variant": "pre-physical-anchor"
+    }
+  ],
+  "source_inputs_sha256": "b1e958a56b7e326935417d74e64a6a741ccf3eaee0cead906aa5d0a83d43e613",
+  "unique_input_pins_verified": 8
+}

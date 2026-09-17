@@ -1,0 +1,18 @@
+{
+  "artifact_exclusions": [
+    "No raw log, source, overlay, binary, source inventory, or raw event rows in the archive. Normalize only numerical summary/outcomes and provenance hashes.",
+    "No controller polling added by trace; existing controller reads alone determine hold. Instrumentation still affects host execution and goroutine scheduling, so traced throughput is diagnostic, not acceptance.",
+    "Initial trace capture begins3.5s after first service event; absence of abort is only asserted for captured interval.",
+    "No gate changes, no production fix, no claimed full closure of long throughput failure."
+  ],
+  "bounded_trace_policy": "Aggregate event counts and a finite scalar causal excerpt are retained. Raw event rows, detailed trace contexts, source, overlays, binaries, manifests, and logs remain local.",
+  "classification": "failure/design diagnostic evidence; no production candidate, performance acceptance, or closure claim",
+  "created_utc": "2026-09-16T11:54:09.888750+00:00",
+  "input_handoff_sha256": "9a648856c7339f5c84de360faa922a922359a461e89e2b8ac1b6081a16dda848",
+  "numeric_summary_sha256": "0da88192e02d5c4ae46f427956379354f5a6b394e3cfd93185d0c19d05bfa289",
+  "pin_validation": {
+    "checked": 39,
+    "mismatches": 0
+  },
+  "scope": "Numerical diagnostic trace plus deterministic sampler failure-before; no production fix or performance acceptance."
+}

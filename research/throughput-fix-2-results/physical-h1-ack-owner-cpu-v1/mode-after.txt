@@ -1,0 +1,10 @@
+// A fixture adapter publishes this version's exact private pure-ACK recovery
+// value once, as its existing TCP worker does. No timed allocation occurs here.
+package connect
+
+import "context"
+
+// The isolated source variant supplies the corresponding production capability.
+func benchmarkPureAckRecovery(ctx context.Context) receiveRecoveryMode {
+	return &tcpAckReturnOwner{ctx: ctx}
+}

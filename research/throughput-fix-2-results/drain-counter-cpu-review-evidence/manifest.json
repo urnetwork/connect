@@ -1,0 +1,13 @@
+{
+  "archive_kind": "drain_counter_cpu_review_evidence",
+  "file_count": 6,
+  "file_sha256": {
+    "benchmark-rows.jsonl": "18952c5e67af1a7909240c4bd2068b0d7b23c305f83b8df64cc32b9614c39f6b",
+    "outcomes.jsonl": "21836ae187e556670b2dc9185e64225316da0518b449180caa9b5e008e43a628",
+    "paired-metrics.jsonl": "e3440b3969a09c20e86161c7c8e23cd0a6430336820bfc1793bc8a310138c411",
+    "provenance.json": "79b7037f739a981bee588efc2bcf7bc7c65cb04b33b5ac8e8af06336374d199c",
+    "source-pins.json": "18f004c2d6d078858a300a973c855d7c151767bc0df3736c6dec44ca97dafb78",
+    "status.json": "2d246207b9cda448ce3df5f35cd74ecd79e80fa49bc1fbce63a97d3ee4d7efdc"
+  },
+  "schema_version": 1
+}

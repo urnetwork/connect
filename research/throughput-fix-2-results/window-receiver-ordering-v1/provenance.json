@@ -1,0 +1,18 @@
+{
+  "candidate_sampler_sha256": "6f429c18e0c0abed6f755e1f49a82eef3d6651990f3c4981ebab530cbcf96d9b",
+  "comparison": "Same actual-coalescer stimuli. Only receiver endpoint eligibility, a shared byte-preserving sample accumulator and ring/rebucket consumers change. Raw arrival timestamps, first-byte exclusion ownership, byte totals and physical drain behavior remain unchanged.",
+  "controls": "Six failure cases: interior receiver endpoint outside raw first/last corrected span; unequal earliest bytes; equal corrected checkpoints; delayed/reverse owner publication; widening/narrowing buckets; warm service. Ordered forward/reverse physical10MB/s delivery is the positive control. Every root asserts total credit, per-sibling credit and physical completion.",
+  "event_plumbing": false,
+  "helper_sha256": "9957d25565150b961d3590034e1c491b0c7a6dd0408d0647bb00375abca63a9d",
+  "ordering_patch_sha256": "51b6b5dd000a9f2b1c749818edcad4a10511223b88bc1d73499e897ea5f7e858",
+  "performance_gates_changed": false,
+  "production_adopted": false,
+  "race": true,
+  "remaining_review": "A subsequently added independent later-pair control finds that this initial rejection timestamp is too broad. The corrective recovery proof is separate; this candidate is not the accepted final implementation.",
+  "repetitions": 3,
+  "source_base": {
+    "sampler_sha256": "474b63d672f6d51b1ab02630de17bd1ed1b43cfd2efdbf90231e031f4b3a10df",
+    "snapshot": "sdk-cold-qualification-after-pinned"
+  },
+  "test_execution_owner": "test_monitor_medium"
+}

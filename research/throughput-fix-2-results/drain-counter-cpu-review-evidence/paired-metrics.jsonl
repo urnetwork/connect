@@ -1,0 +1,10 @@
+{"counter_median_ns_per_op":51.03,"counter_minus_scan_ns_per_op":-26.620000000000005,"counter_over_scan":0.6571796522858983,"name":"BenchmarkWindowPacingDrainEligibilityReject1","scan_median_ns_per_op":77.65}
+{"counter_median_ns_per_op":41.95,"counter_minus_scan_ns_per_op":0.7900000000000063,"counter_over_scan":1.0191933916423714,"name":"BenchmarkWindowPacingDrainEligibilityTypical1","scan_median_ns_per_op":41.16}
+{"counter_median_ns_per_op":51.32,"counter_minus_scan_ns_per_op":-132.18,"counter_over_scan":0.2796730245231608,"name":"BenchmarkWindowPacingDrainEligibilityReject32","scan_median_ns_per_op":183.5}
+{"counter_median_ns_per_op":45.55,"counter_minus_scan_ns_per_op":4.649999999999999,"counter_over_scan":1.1136919315403422,"name":"BenchmarkWindowPacingDrainEligibilityTypical32","scan_median_ns_per_op":40.9}
+{"counter_median_ns_per_op":49.77,"counter_minus_scan_ns_per_op":-1967.23,"counter_over_scan":0.02467526028755578,"name":"BenchmarkWindowPacingDrainEligibilityReject512","scan_median_ns_per_op":2017.0}
+{"counter_median_ns_per_op":40.72,"counter_minus_scan_ns_per_op":-0.6499999999999986,"counter_over_scan":0.9842881314962534,"name":"BenchmarkWindowPacingDrainEligibilityTypical512","scan_median_ns_per_op":41.37}
+{"counter_median_ns_per_op":49.55,"counter_minus_scan_ns_per_op":-3975.45,"counter_over_scan":0.01231055900621118,"name":"BenchmarkWindowPacingDrainEligibilityReject1024","scan_median_ns_per_op":4025.0}
+{"counter_median_ns_per_op":41.75,"counter_minus_scan_ns_per_op":0.38000000000000256,"counter_over_scan":1.0091854000483442,"name":"BenchmarkWindowPacingDrainEligibilityTypical1024","scan_median_ns_per_op":41.37}
+{"counter_median_ns_per_op":110.8,"counter_minus_scan_ns_per_op":38.36,"counter_over_scan":1.5295416896742131,"name":"BenchmarkWindowPacingTailLifecycleOriginal","scan_median_ns_per_op":72.44}
+{"counter_median_ns_per_op":299.8,"counter_minus_scan_ns_per_op":90.80000000000001,"counter_over_scan":1.4344497607655502,"name":"BenchmarkWindowPacingTailLifecycleRetryFresh","scan_median_ns_per_op":209.0}

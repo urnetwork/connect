@@ -1,0 +1,4 @@
+{"classification":"failure-before-virtual-silent-lane","duration":"0.34s","outcome":"FAIL","source_log":"run.log","test":"TestSilentLaneLongerThanTheProbeCadenceStillDrains"}
+{"classification":"failure-before-virtual-silent-lane","duration":"0.34s","outcome":"FAIL","source_log":"run.log","test":"TestSilentLaneLongerThanTheProbeCadenceStillDrains"}
+{"classification":"failure-before-virtual-silent-lane","duration":"0.34s","outcome":"FAIL","source_log":"run.log","test":"TestSilentLaneLongerThanTheProbeCadenceStillDrains"}
+{"classification":"diagnostic-trace-v2-terminal-state","duration":"0.36s","outcome":"FAIL","source_log":"trace-v2.log","test":"TestSilentLaneLongerThanTheProbeCadenceStillDrains"}

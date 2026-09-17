@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "76300c50015d0051aafa88f01cfe2d19526e54ca55e347bb32cefdbaefa3feef",
+  "binary_sha256": "a7d6122a467e02443cf01aee2e1a7a70dfd02ef9aca1665029804f20bdb99c7e",
+  "effective_inputs_sha256": "3aa36b0a8dd5c3290a4e894f75d9eb5c63e4bfbd4b9fb5cc45446b26b8078483",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiver(Owned|SustainedPacingEscapesSlowHold$|BatchedSplitPacingEscapesSlowHold$)",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as build; absolute relationship pinned by original status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:55:13.328349+00:00",
+  "loadavg_start": [
+    13.89208984375,
+    13.35400390625,
+    14.2177734375
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 6.453252749983221,
+  "loadavg_end": [
+    13.580078125,
+    13.2978515625,
+    14.19287109375
+  ],
+  "ended_utc": "2026-09-16T20:55:19.781773+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "5e77228249cdfefdc604115e27c455fc479a06c8257fe87bc209f69f6238ee48",
+  "pass": 12,
+  "fail": 3,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "12P3F: proposed per-sequence corrected-prefix intervals do not fix the lawful root. Further review rejects destination-FIFO inference from sequence monotonicity or a local H1 route; no adoption.",
+  "rows": 54
+}

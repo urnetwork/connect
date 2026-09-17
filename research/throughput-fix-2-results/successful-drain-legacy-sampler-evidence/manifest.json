@@ -1,0 +1,11 @@
+{
+  "archive": "successful-drain-legacy-sampler-evidence",
+  "payload_sha256": {
+    "conclusions.json": "5457b93f0b660b6347f67cf5e559a390237bfbe83392f369c34b423b2713745b",
+    "numeric-readings.jsonl": "e4e9f74cecec99deacbdb0f252456b90b14db8ff2a3adbe870a4d3067fda3ea5",
+    "outcomes.jsonl": "db1071f19e703a7f372a857268f9978484786ee210286f3d00eaadb49533cd17",
+    "provenance.json": "540cc3fd8e8064d2deff3e4806ccad746b5a7fbaa7727f274774d4846161ce22",
+    "source-pins.json": "1349dfe81dc8b85824abeb68d119ce861ee01b865df89f482e8ababcb0f70643",
+    "status.json": "25f54199b1ea13200a6ce7bea6ec2a4d32eb4fe8099b4339ecdd4db06cd1ac1c"
+  }
+}

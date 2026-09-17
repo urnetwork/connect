@@ -1,0 +1,85 @@
+{
+  "input_handoff_sha256": "e79fad510bab30e22ff340cb9e6547f32e752dd71de310412007d6d4a42b98ab",
+  "numeric_summary_sha256": "c12f48fb3b80646f666f4cbd6b143c6b615b2efe94022f1314f95cdf484f1bd1",
+  "prior_metadata_handoff_sha256": "9a648856c7339f5c84de360faa922a922359a461e89e2b8ac1b6081a16dda848",
+  "raw_log_and_manifest_pins": [
+    {
+      "classification": "excluded fixture precondition failure: new raw RTT was only in incomplete bucket; no drain entered",
+      "raw_log_sha256": "5d83ee0f5baa6245dd0e760ba83bd5bea5088b8ceed1a8ffe70363c48df8ea8f",
+      "run_manifest_sha256": "74b44e6d1f7b3c5d168cfea2cfd368f5b3054fb88c3ae8d79cb9657954a16a1e"
+    },
+    {
+      "classification": "excluded fixture precondition failure: new raw RTT was only in incomplete bucket; no drain entered",
+      "raw_log_sha256": "5d83ee0f5baa6245dd0e760ba83bd5bea5088b8ceed1a8ffe70363c48df8ea8f",
+      "run_manifest_sha256": "3a085eb8992e5a9b77916e6f19145df6c2f2d4f8921801289584a7dfd4f39a78"
+    },
+    {
+      "classification": "valid forced legacy failure-before plus no-read and readonly controls",
+      "raw_log_sha256": "eb498844e12a60f7259aeb2d2a6845aca7e2c4a8ad94920a5611f89cb44ac744",
+      "run_manifest_sha256": "47d2f73e6d62bb532d5e2ac2568a526a3ab6ebb1758c663efc3ef07bed1f90a4"
+    },
+    {
+      "classification": "valid forced legacy failure-before plus no-read and readonly controls",
+      "raw_log_sha256": "eb498844e12a60f7259aeb2d2a6845aca7e2c4a8ad94920a5611f89cb44ac744",
+      "run_manifest_sha256": "d81b163cd43d1195859d23063f846c49548689d5f488d4c5118def32b3fa61ec"
+    }
+  ],
+  "root_fixture_landing_status": "isolated failure-before only; no shared landing authorized",
+  "root_fixture_source_sha256": "7e6dc8ea29b1863961fdda3a8f1cb80e38ebf9aa6072854467605e7d574bb5f4",
+  "supplied_file_sha256s": [
+    "74b44e6d1f7b3c5d168cfea2cfd368f5b3054fb88c3ae8d79cb9657954a16a1e",
+    "da597b3a6b62615fc03f6ef9ac105e717b970945f6ca5464fec917f9ba7112fc",
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "5d83ee0f5baa6245dd0e760ba83bd5bea5088b8ceed1a8ffe70363c48df8ea8f",
+    "b502f919afaf8c2b45b3e2f1bc55074857b257d79dc938f5b141c0a9c8c72b04",
+    "3a085eb8992e5a9b77916e6f19145df6c2f2d4f8921801289584a7dfd4f39a78",
+    "64ab79d0f64ec4ee57e474182627249218215b1c29ea76add5e424993bd47ac5",
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "5d83ee0f5baa6245dd0e760ba83bd5bea5088b8ceed1a8ffe70363c48df8ea8f",
+    "a797fa2567d207540ce318c8398cf1cb2302dcd24536ad6bb23865918a59fb9b",
+    "47d2f73e6d62bb532d5e2ac2568a526a3ab6ebb1758c663efc3ef07bed1f90a4",
+    "7c11ddd4f1ba49f134d356a24d87e8708a7077fa15a5347b76fe7fffe54dc042",
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "eb498844e12a60f7259aeb2d2a6845aca7e2c4a8ad94920a5611f89cb44ac744",
+    "ed352645b9396c96a6ba0edbb5f978dffe96294aea6d0a74b2bb8008924bb705",
+    "d81b163cd43d1195859d23063f846c49548689d5f488d4c5118def32b3fa61ec",
+    "00f7c3223797e74f1cc019b9e3d76a6435807f201f9f8a40c046b1548e36932e",
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "eb498844e12a60f7259aeb2d2a6845aca7e2c4a8ad94920a5611f89cb44ac744",
+    "a499ebd7da81d768328cd826b0e0ff6ef10208d64afb5e0635c1232485bd5249",
+    "c12f48fb3b80646f666f4cbd6b143c6b615b2efe94022f1314f95cdf484f1bd1",
+    "176116a79a2f2295a7ff399be3fd3b4dc29ba2f885ddc2cd1cd1ad1f560ffa53",
+    "7e6dc8ea29b1863961fdda3a8f1cb80e38ebf9aa6072854467605e7d574bb5f4"
+  ],
+  "validated_pin_count": 34,
+  "variants": [
+    {
+      "binary_sha256": "b502f919afaf8c2b45b3e2f1bc55074857b257d79dc938f5b141c0a9c8c72b04",
+      "classification": "excluded fixture precondition failure: new raw RTT was only in incomplete bucket; no drain entered",
+      "race_blocks": 0,
+      "source_sha256": "916ffea9f8bc3296703549eb21b1060a0f8bd42a6d7c8df645d0609b78274210",
+      "variant": "root-v2-f9"
+    },
+    {
+      "binary_sha256": "a797fa2567d207540ce318c8398cf1cb2302dcd24536ad6bb23865918a59fb9b",
+      "classification": "excluded fixture precondition failure: new raw RTT was only in incomplete bucket; no drain entered",
+      "race_blocks": 0,
+      "source_sha256": "dfb3130da7d367483edc2c72b835dc1d0f2583cf2c886cab16af3a5915211089",
+      "variant": "root-v2-retry-only"
+    },
+    {
+      "binary_sha256": "ed352645b9396c96a6ba0edbb5f978dffe96294aea6d0a74b2bb8008924bb705",
+      "classification": "valid forced legacy failure-before plus no-read and readonly controls",
+      "race_blocks": 0,
+      "source_sha256": "ef12d6f7496b32c01426471125abcfa9fc6607c760d6f7541b15e9590c2bc8d4",
+      "variant": "root-v3-f9"
+    },
+    {
+      "binary_sha256": "a499ebd7da81d768328cd826b0e0ff6ef10208d64afb5e0635c1232485bd5249",
+      "classification": "valid forced legacy failure-before plus no-read and readonly controls",
+      "race_blocks": 0,
+      "source_sha256": "80d8d72eb42d7d6e9764b28a05919c76b00b336048182c681209dc8df8a23b80",
+      "variant": "root-v3-retry-only"
+    }
+  ]
+}

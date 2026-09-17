@@ -1,0 +1,9 @@
+=== RUN   TestReceiverBudgetDropsDoNotWedgeEitherArm
+    flight_gate_receiver_budget_test.go:163: rule off: 7.331s, 36 dropped, rto=32 deferred=31 probes=0 rides=0 promo=0 gap=12
+    flight_gate_receiver_budget_test.go:168: rule on : 1m5.649s, 26 dropped, rto=46 deferred=116 probes=14 rides=91 promo=7 gap=1
+--- PASS: TestReceiverBudgetDropsDoNotWedgeEitherArm (72.98s)
+=== RUN   TestTheWindowRuleIsInertOnAShortPath
+    transfer_window_sizing_switch_test.go:495: constant window 2097152: 10.0 MB/s; sized window 1615792 (ceiling 2097152, reason "delivery"): 10.0 MB/s (1.00x)
+--- PASS: TestTheWindowRuleIsInertOnAShortPath (6.01s)
+PASS
+ok  	github.com/urnetwork/connect	79.677s

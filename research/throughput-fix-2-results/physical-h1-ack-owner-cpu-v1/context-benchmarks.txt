@@ -1,0 +1,59 @@
+// Isolate only the optional candidate's context-join cost. There is no wait
+// duration or host timing threshold; callback results force its branch.
+package connect
+
+import (
+	"context"
+	"testing"
+	"time"
+)
+
+// Successful initial admission should allocate no combined context.
+func BenchmarkProviderOwnedAckContextAvailable(b *testing.B) {
+	benchmarkProviderOwnedAckContext(b, false)
+}
+
+// One initial refusal forces exactly one flow/source context join and cleanup.
+// This reports the cost of correct cancellation, not a comparable old success.
+func BenchmarkProviderOwnedAckContextWait(b *testing.B) {
+	benchmarkProviderOwnedAckContext(b, true)
+}
+
+// The owner and source lifetimes are established outside the timed section;
+// every per-item join and its terminal release are included in the result.
+func benchmarkProviderOwnedAckContext(b *testing.B, initialRefusal bool) {
+	sourceCtx, sourceCancel := context.WithCancel(context.Background())
+	defer sourceCancel()
+	flowCtx, flowCancel := context.WithCancel(context.Background())
+	defer flowCancel()
+	provider := &RemoteUserNatProvider{ctx: sourceCtx, settings: DefaultRemoteUserNatProviderSettings()}
+	owner := &tcpAckReturnOwner{ctx: flowCtx}
+	var calls, joins, success int
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		item := providerReturnItem{recoveryMode: owner}
+		attempts := 0
+		if provider.admitReturnPacket(&item, func(_ time.Duration, _ context.Context) bool {
+			attempts++
+			return !initialRefusal || 1 < attempts
+		}) {
+			success++
+		}
+		calls += attempts
+		if item.releaseOwnedSendContext != nil {
+			joins++
+			item.releaseOwnedSendContext()
+		}
+	}
+	b.StopTimer()
+	wantCalls, wantJoins := b.N, 0
+	if initialRefusal {
+		wantCalls *= 2
+		wantJoins = b.N
+	}
+	if success != b.N || calls != wantCalls || joins != wantJoins || flowCtx.Err() != nil || sourceCtx.Err() != nil {
+		b.Fatalf("context lifecycle changed: success=%d calls=%d joins=%d", success, calls, joins)
+	}
+	b.ReportMetric(float64(joins)/float64(b.N), "context-joins/op")
+}

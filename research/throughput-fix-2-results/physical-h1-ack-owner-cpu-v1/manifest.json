@@ -1,0 +1,16 @@
+{
+  "archive": "physical-h1-ack-owner-cpu-v1",
+  "payload_sha256": {
+    "admission-benchmark.txt": "e6a59a50db7c97aff0e9ca05c34f4574b48cb0d005778d84a6843c3ed6373984",
+    "context-benchmarks.txt": "b2cb0233e85df668f00550402f6f5e9012497d6497b4651a53348623ccdf8d43",
+    "ledger.jsonl": "ca260f8088441585e2952ce27437b826c4ea32a99c257736681f843859a3df4f",
+    "mode-after.txt": "6d463ce31cbca1199fe1390b95ae595e77d12f723665c74464af3a896a402cb6",
+    "mode-before.txt": "48a4f99a5d984b413ba6f558a9f850f1ba0d4b55b49ec654bc804b408d6f4f0b",
+    "outcomes.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "provenance.json": "d3f40169d64046d04ed95af9a9aef7fb2fd89a5ae85089d0d2ee6056d29434f2",
+    "source-manifest-after.json": "1d32ec7358553f1922f2a3bdc827e65ddb145ff9defc7e3fcd714b83087c23f7",
+    "source-manifest-before.json": "7621c53e3b86f5607ba1609664febc822a12ac2e935044513247f1febf4862cd",
+    "source-pins.json": "4672d82d50b58750be198bf2739ce57927db7b21851c099f9963b80b695e0b31",
+    "status.json": "193eb038e30d612260ec248908fba64abdfb509d041b0ef90b614929ac275731"
+  }
+}

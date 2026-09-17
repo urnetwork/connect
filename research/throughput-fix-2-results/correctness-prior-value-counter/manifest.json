@@ -1,0 +1,50 @@
+{
+  "architecture": "arm64",
+  "binary_sha256": "fed48d9de2bffa91a31876518c5b9a8f8e908b64efabbb3b31ebb787f93d31a7",
+  "build_flags": [
+    "-race"
+  ],
+  "connect": {
+    "branch": "throughput-fix-2",
+    "dirty": true,
+    "revision": "8cda0523e5ef5602d28001ea0752edeae573f51e",
+    "source_sha256": "7c0a2f4f14d40be4a35afbbe1e46a299fe9218114b59914d953ea51e411b2bc0"
+  },
+  "created_utc": "2026-09-16T11:17:25.835524+00:00",
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "current-load; final prior-value drain-counter lookup optimization; concurrent prior-source model and regression; no-quiescence run"
+  },
+  "go": "go version go1.26.7 darwin/arm64",
+  "host_load_average_at_start": [
+    12.4755859375,
+    13.2138671875,
+    14.2646484375
+  ],
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "logical_cpus": 10,
+  "mode": "correctness",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "package": "./",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "runner_sha256": "ed081db85eb36c53543c4c31253c5b2f9ea43ab5cb4bb4a5a2966dd5edc20f06",
+  "source_inspection_uses_build_snapshot": true,
+  "source_snapshot": {
+    "external_local_replacements": [
+      "external-local-replacement"
+    ],
+    "external_local_replacements_are_not_frozen_inputs": true,
+    "repositories": {
+      "connect": {
+        "file_count": 838,
+        "input_sha256": "57ca097413ca923a897f37e515047c307ae7ac7274b874032aef39cdc7a7d5ea"
+      }
+    },
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "sources_stable_during_build": true,
+  "test_pattern": "^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$|^TestWindowTcp(SocketBatch|CanceledBatch|WorkloadCancel).*$|^TestTun(DuplexDataHandoffDoesNotCycleThroughAdmission|FiniteTcpTailProgressesAfterEndpointOwnerReleases)$|^TestReceiveSequenceBurstTail.*$|^Test(AckReceiverDelay|ReceiverAckTiming|SenderReceiverTiming|RttReceiverTiming).*$|^Test(SilentLaneLongerThanTheProbeCadenceStillDrains|SingleReliableLaneQueueInflatedRttDoesNotStorm)$"
+}

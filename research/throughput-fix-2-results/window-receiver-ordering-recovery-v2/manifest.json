@@ -1,0 +1,15 @@
+{
+  "archive": "window-receiver-ordering-recovery-v2",
+  "payload_sha256": {
+    "candidate.patch": "853d17984b19866b85b8536df8a98f4c1d1e1ff23f8dbee89689c436dfc5ee62",
+    "combined-ordering.patch": "245f7882f37e89e21ab3356823d5a06ead326351e6166fe65744c436137e141a",
+    "outcomes.jsonl": "eea1db3a7e589ea2bc99547108c9355d8214ef083f0c1a937cfc3a0595ae579e",
+    "provenance.json": "ed5a92c969e9e12f803e5e423067ba646873fd611b9eaf7de35cb9f8297cbc50",
+    "root-control.patch": "266506c8bf18a2e75f91f2c34cad4011be20bd2fd06b38e30899ccd5c2d22eb4",
+    "source-manifest-after-adjacent.json": "53422fb5b2e14608314d88365b299d71ba8a4600009d9995bd30a920efd3aad5",
+    "source-manifest-after-roots.json": "76cfb3ef417d2edec89e5f18887e290789439083800f6cd53b936ba686d3014e",
+    "source-manifest-before-roots.json": "1a747c75dd4423699e43c8da1c224a6db09558e22b4f1999de8ec10ad241c7df",
+    "source-pins.json": "b4740c2bb9caf539b843c5cb7aa79351f4a626d2e0ad730f4a083b90617b9bba",
+    "status.json": "0f36ddd72c31d6ab168bcc2cfbc8f921934310bbf020c4d45f5cf7df8522b7e2"
+  }
+}

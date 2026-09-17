@@ -1,0 +1,14 @@
+{
+  "all_cpu_allocs_per_op_zero": true,
+  "all_cpu_bytes_per_op_zero": true,
+  "complete": true,
+  "cpu_exit_code": 0,
+  "cpu_rows": 12,
+  "focused_race_data_race_blocks": 0,
+  "focused_race_fail_count": 0,
+  "focused_race_pass_count": 24,
+  "focused_race_skip_count": 0,
+  "optimized_cpu_rows": 6,
+  "reference_before_rows": 6,
+  "source_pins_verified": 12
+}

@@ -1,0 +1,3 @@
+=== RUN   TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold
+--- FAIL: TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold (0.53s)
+FAIL

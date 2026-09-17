@@ -1,0 +1,11 @@
+=== RUN   TestAckCompressionHeadDrainDoesNotAllocate
+--- PASS: TestAckCompressionHeadDrainDoesNotAllocate (0.00s)
+goos: darwin
+goarch: arm64
+pkg: github.com/urnetwork/connect
+cpu: Apple M1 Max
+BenchmarkAckCompressionHead
+BenchmarkAckCompressionHead-10        	 4339102	        74.08 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAckCompressionGapBurst
+BenchmarkAckCompressionGapBurst-10    	      19	  15147840 ns/op	      4096 acks/op	  103896 B/op	       2 allocs/op
+PASS

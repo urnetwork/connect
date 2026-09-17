@@ -1,0 +1,11 @@
+{
+  "payload_sha256": {
+    "failure-summary.json": "80fc41814a775c47a61c2c483b0bce63b340199f1abdc4b75c4c2f61c5d71351",
+    "ledger.jsonl": "ed267489028e4887b10f0c1af1b143f783da4409a6598bfef9e9a868b37988e1",
+    "manifest.json": "c5c05d8f127d5606a174d88630ce6498de3eae770c4d3790b7b7b7401ac05d41",
+    "outcomes.txt": "522181a688e1fad4d6902dc2276b180d2c5cd475fc8206fc82760f9e2805b97b",
+    "provenance.json": "d12152d2be78eb9b239919b9dd869c41b0df8308cc68aab4d46f38f98748c62e",
+    "status.json": "a47f1c12cfca617e40f1314b2f3ca45de9c1172707c247e2e6f34d5e379b614b"
+  },
+  "schema_version": 1
+}

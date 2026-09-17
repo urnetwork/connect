@@ -1,0 +1,13 @@
+{
+  "archive_kind": "drain_counter_prior_value_review_evidence",
+  "file_count": 6,
+  "file_sha256": {
+    "benchmark-rows.jsonl": "7c468619de7cdbd3202303a5f1763ec96a1eb9bbb3ab1227634298d35616b007",
+    "focused-race-outcomes.jsonl": "5aacc7a86990e80e2cd0c027a953446a88f1601a2072c2a8de6cfbf2a5aa8735",
+    "paired-summary.json": "e776dcb5bfb4e2714ab6a8e157dbb1afab252a7ad27c1215a9f4625b95782dd9",
+    "provenance.json": "0a201d3f3df6b68e625e441d3170c961491dc8aa96069723baafb3959a12df91",
+    "source-pins.json": "4a5d2a3a59489f2b555cd0401a29c1f3546ed30acc38124a758daaec8d73e1c5",
+    "status.json": "8577586864ae5ff19a1a2334464833dca8534f1be8241f19053241d89e685745"
+  },
+  "schema_version": 1
+}

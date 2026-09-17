@@ -1,0 +1,12 @@
+{
+  "archive_kind": "virtual_silent_lane_before_evidence",
+  "attribution_limits": [
+    "The original virtual reproduction fails three times with the original 20-second/3000-message gates. It is failure-before evidence only; no production edit is represented.",
+    "Trace-v2 retains terminal snapshots only and makes no estimator or controller reads. It is a separate diagnostic, not a causal repair or performance result.",
+    "The trace compile-only failure is excluded from test claims. The unfinished trace-v3 variant is not frozen or included.",
+    "Raw logs, source files, binaries, compiler commands, local paths, and identifiers are excluded; normalized outcomes, terminal snapshots, and checksums are retained."
+  ],
+  "collection_time_utc": "2026-09-16T10:50:10.678585+00:00",
+  "scope": "Original silent-lane test, same20s stall,3000 messages and recovery gates, inside synctest; pool initialized outside bubble and existing fixed delivery bound used. Current integrated credit+recovery source; no production edits.",
+  "trace_v2_scope": "Diagnostic-only terminal state after synctest barrier; no estimator reads. Dedicated trace source; original before source restored and hash-verified."
+}

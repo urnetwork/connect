@@ -1,0 +1,48 @@
+--- a/transfer_window_pacing.go
++++ b/transfer_window_pacing.go
+@@ -1291,7 +1291,10 @@
+ 		bytes := newer.bytes
+ 		queued := newer.queued
+ 		receiverTimed := newer.receiverBytes == newer.bytes
+-		receiverInvalid := newer.receiverInvalid
++		receiverInvalidAt := int64(0)
++		if newer.receiverInvalid {
++			receiverInvalidAt = newer.lastAtNanos
++		}
+ 		for j := i + 1; j < count; j++ {
+ 			if !initialBoundaryAt.IsZero() && newer.firstAtNanos > initialBoundaryAt.UnixNano() && samples[j].lastAtNanos <= initialBoundaryAt.UnixNano() {
+ 				// Preserve real pairs on either side, including late old
+@@ -1300,7 +1303,12 @@
+ 			}
+ 			span := newer.lastAtNanos - samples[j].lastAtNanos
+ 			receiverTimed = receiverTimed && samples[j].receiverBytes == samples[j].bytes
+-			receiverInvalid = receiverInvalid || samples[j].receiverInvalid || samples[j].receiverLastAtNanos >= samples[j-1].receiverFirstAtNanos
++			if samples[j].receiverInvalid {
++				receiverInvalidAt = max(receiverInvalidAt, samples[j].lastAtNanos)
++			}
++			if samples[j].receiverLastAtNanos >= samples[j-1].receiverFirstAtNanos {
++				receiverInvalidAt = max(receiverInvalidAt, samples[j-1].firstAtNanos)
++			}
+ 			receiverSpan := newer.receiverLastAtNanos - samples[j].receiverLastAtNanos
+ 			firstQueued := samples[j].lastQueued
+ 			candidateBytes := bytes
+@@ -1315,12 +1323,17 @@
+ 			if span > 0 && (span >= minSpan || hold == 0 && receiverTimed) {
+ 				if receiverTimed {
+ 					span = receiverSpan
+-					if receiverInvalid {
++					if receiverInvalidAt > 0 {
+ 						span = 0
+ 					}
+ 				}
+ 				if span <= 0 {
+-					invalidReceiverAt = max(invalidReceiverAt, newer.lastAtNanos)
++					// Keep rejection attached to the contradictory checkpoint.
++					// A later independent pair can supersede that old evidence.
++					if receiverInvalidAt == 0 {
++						receiverInvalidAt = newer.lastAtNanos
++					}
++					invalidReceiverAt = max(invalidReceiverAt, receiverInvalidAt)
+ 				} else if observeRate(candidateBytes, span, newer.lastAtNanos, queued || samples[j].queued, firstQueued) {
+ 					break
+ 				}

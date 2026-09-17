@@ -1,0 +1,191 @@
+--- /dev/null
++++ b/transfer_window_receiver_ordering_test.go
+@@ -0,0 +1,188 @@
++// Exact receiver waits can reorder sibling checkpoints. A bounded aggregate
++// must not count bytes outside its corrected endpoints or lose raw ownership.
++package connect
++
++import (
++	"testing"
++	"time"
++)
++
++// Each sibling supplies one confirmed physical head and its own ACK wait.
++type windowReceiverOrderingPoint struct {
++	bytes     ByteCount
++	delivered time.Duration
++	wait      time.Duration
++}
++
++// Coalescing follows an explicit publication order, independently of the raw
++// arrival timestamps. No controller read can accept a partial prefix early.
++func windowReceiverOrderingService(t *testing.T, phase, compression time.Duration, points []windowReceiverOrderingPoint, order []int, heldRate ByteCount) (*windowPacingService, time.Time) {
++	t.Helper()
++	start := time.Unix(1700000000, 0).Add(phase)
++	service := newWindowPacingService(DefaultSendBufferSettings())
++	service.serviceHoldRate = heldRate
++	fixtures := make([]*windowReceiverCreditFixture, len(points))
++	items := make([]*sendItem, len(points))
++	var total ByteCount
++	lastAt := start
++	for index, point := range points {
++		fixtures[index] = newWindowReceiverCreditFixture(t, service, start, compression)
++		items[index] = fixtures[index].write(0, point.bytes, start)
++		total += point.bytes
++		if at := start.Add(point.delivered + point.wait); at.After(lastAt) {
++			lastAt = at
++		}
++	}
++	for _, index := range order {
++		point, fixture := points[index], fixtures[index]
++		at := start.Add(point.delivered + point.wait)
++		fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(items[index], at, point.wait))
++	}
++	if service.total != total || !service.drained || service.outstandingWithLock() != 0 {
++		t.Fatalf("raw ownership changed: bytes=%d want=%d drained=%t outstanding=%g", service.total, total, service.drained, service.outstandingWithLock())
++	}
++	for index, fixture := range fixtures {
++		if fixture.sequence.windowPacer.serviceAcked != points[index].bytes || !items[index].serviceCreditObserved {
++			t.Fatalf("sibling %d lost or repeated credit: acked=%d want=%d observed=%t", index, fixture.sequence.windowPacer.serviceAcked, points[index].bytes, items[index].serviceCreditObserved)
++		}
++	}
++	windowReceiverOrderingBytes(t, service, total)
++	return service, lastAt
++}
++
++// Ring storage must keep every delivered byte even when timing is unqualified.
++func windowReceiverOrderingBytes(t *testing.T, service *windowPacingService, expected ByteCount) {
++	t.Helper()
++	var stored ByteCount
++	for _, sample := range service.samples {
++		stored += sample.bytes
++	}
++	if stored != expected || service.total != expected {
++		t.Fatalf("timing qualification changed byte totals: stored=%d total=%d want=%d", stored, service.total, expected)
++	}
++}
++
++// The physical serializer delivers 1000, 4000 and 12000 bytes at 4 MB/s.
++// The middle sibling waits 4 ms; its raw-last reply is an interior delivery.
++func TestWindowPacingReceiverOrderingInteriorReplyCannotRaiseCapacity(t *testing.T) {
++	points := []windowReceiverOrderingPoint{
++		{bytes: 1000, delivered: 100250 * time.Microsecond},
++		{bytes: 4000, delivered: 101250 * time.Microsecond, wait: 4 * time.Millisecond},
++		{bytes: 12000, delivered: 104250 * time.Microsecond},
++	}
++	for _, phase := range []time.Duration{0, 6 * time.Millisecond} {
++		service, at := windowReceiverOrderingService(t, phase, 10*time.Millisecond, points, []int{0, 2, 1}, 0)
++		rate, _, latest := service.measured(time.Second, at)
++		if measured := max(rate, latest); measured > 4000000 {
++			t.Errorf("phase=%s: interior receiver point inflated physical4MB/s to %d", phase, measured)
++		}
++	}
++}
++
++// A raw-first 4000-byte head is not the earliest corrected 1000-byte head.
++// Reusing its exclusion with a different endpoint overcounts serialization.
++func TestWindowPacingReceiverOrderingEarliestBytesStayWithTheirEndpoint(t *testing.T) {
++	points := []windowReceiverOrderingPoint{
++		{bytes: 1000, delivered: 100250 * time.Microsecond, wait: 6 * time.Millisecond},
++		{bytes: 4000, delivered: 101250 * time.Microsecond},
++		{bytes: 12000, delivered: 104250 * time.Microsecond, wait: 4 * time.Millisecond},
++	}
++	for _, phase := range []time.Duration{0, 6 * time.Millisecond} {
++		service, at := windowReceiverOrderingService(t, phase, 10*time.Millisecond, points, []int{1, 0, 2}, 0)
++		rate, _, latest := service.measured(time.Second, at)
++		if measured := max(rate, latest); measured > 4000000 {
++			t.Errorf("phase=%s: excluded bytes moved to a different receiver endpoint: %d", phase, measured)
++		}
++	}
++}
++
++// Two equal corrected checkpoints have no measured interval between them.
++// Both earliest byte groups must be excluded, or the pair must stay unproved.
++func TestWindowPacingReceiverOrderingEqualCheckpointCannotCountEarlierBytes(t *testing.T) {
++	points := []windowReceiverOrderingPoint{
++		{bytes: 1000, delivered: 100 * time.Millisecond},
++		{bytes: 4000, delivered: 100 * time.Millisecond, wait: 2 * time.Millisecond},
++		{bytes: 12000, delivered: 104 * time.Millisecond},
++	}
++	for _, phase := range []time.Duration{0, 8 * time.Millisecond} {
++		service, at := windowReceiverOrderingService(t, phase, 10*time.Millisecond, points, []int{0, 1, 2}, 0)
++		rate, _, latest := service.measured(time.Second, at)
++		if measured := max(rate, latest); measured > 3000000 {
++			t.Errorf("phase=%s: tied receiver checkpoint was counted inside later4ms interval: %d", phase, measured)
++		}
++	}
++}
++
++// A delayed owner may publish an earlier raw ACK after both newer siblings.
++// Publication order cannot make the same reversed physical evidence faster.
++func TestWindowPacingReceiverOrderingDelayedCreditCannotHideReversal(t *testing.T) {
++	points := []windowReceiverOrderingPoint{
++		{bytes: 1000, delivered: 100250 * time.Microsecond},
++		{bytes: 4000, delivered: 101250 * time.Microsecond, wait: 4 * time.Millisecond},
++		{bytes: 12000, delivered: 104250 * time.Microsecond},
++	}
++	for _, order := range [][]int{{1, 2, 0}, {1, 0, 2}, {2, 0, 1}} {
++		service, at := windowReceiverOrderingService(t, 0, 10*time.Millisecond, points, order, 0)
++		rate, _, latest := service.measured(time.Second, at)
++		if measured := max(rate, latest); measured > 4000000 {
++			t.Errorf("publication=%v: delayed credit hid interior reversal: %d", order, measured)
++		}
++	}
++}
++
++// RTT/compression rebucketing may merge an already reversed pair of buckets.
++// Increasing and then reducing storage width must preserve its uncertainty.
++func TestWindowPacingReceiverOrderingResizeCannotRestoreInvalidInterval(t *testing.T) {
++	points := []windowReceiverOrderingPoint{
++		{bytes: 1000, delivered: 100250 * time.Microsecond},
++		{bytes: 4000, delivered: 101250 * time.Microsecond, wait: 4 * time.Millisecond},
++		{bytes: 12000, delivered: 104250 * time.Microsecond},
++	}
++	service, at := windowReceiverOrderingService(t, 6*time.Millisecond, 10*time.Millisecond, points, []int{0, 2, 1}, 0)
++	for index, compression := range []time.Duration{80 * time.Millisecond, 10 * time.Millisecond} {
++		at = at.Add(time.Nanosecond)
++		service.observeRoundTrip(100*time.Millisecond, compression, at)
++		if service.bucketInterval != max(deliverySizedWindowSampleInterval, compression/4) {
++			t.Fatalf("resize %d did not exercise the expected bucket width: %s", index, service.bucketInterval)
++		}
++		windowReceiverOrderingBytes(t, service, 17000)
++		rate, _, latest := service.measured(time.Second, at)
++		if measured := max(rate, latest); measured > 4000000 {
++			t.Errorf("resize %d: merged receiver endpoints restored false capacity: %d", index, measured)
++		}
++	}
++}
++
++// The same missing interior bound affects warm service after the raw timer.
++// Small propagation differences keep this case independent of queue gating.
++func TestWindowPacingReceiverOrderingWarmIntervalCannotRaiseCapacity(t *testing.T) {
++	points := []windowReceiverOrderingPoint{
++		{bytes: 1000, delivered: 100250 * time.Microsecond},
++		{bytes: 1000, delivered: 100500 * time.Microsecond, wait: time.Millisecond},
++		{bytes: 3000, delivered: 101250 * time.Microsecond},
++	}
++	service, at := windowReceiverOrderingService(t, 0, time.Millisecond, points, []int{0, 2, 1}, 1000000)
++	rate, _, latest := service.measured(time.Second, at)
++	if measured := max(rate, latest); measured > 4000000 {
++		t.Fatalf("warm interval inflated physical4MB/s to %d", measured)
++	}
++}
++
++// Ordered physical delivery retains its rate across bucket boundaries and
++// reverse worker publication when the aggregate can prove endpoint order.
++func TestWindowPacingReceiverOrderingMonotoneDeliveryKeepsCapacity(t *testing.T) {
++	points := []windowReceiverOrderingPoint{
++		{bytes: 1000, delivered: 100100 * time.Microsecond},
++		{bytes: 4000, delivered: 100500 * time.Microsecond},
++		{bytes: 12000, delivered: 101700 * time.Microsecond},
++	}
++	for _, phase := range []time.Duration{0, 9 * time.Millisecond} {
++		for _, order := range [][]int{{0, 1, 2}, {2, 1, 0}} {
++			service, at := windowReceiverOrderingService(t, phase, 10*time.Millisecond, points, order, 0)
++			rate, _, latest := service.measured(time.Second, at)
++			if measured := max(rate, latest); measured != 10000000 {
++				t.Errorf("phase=%s publication=%v: ordered physical10MB/s became %d", phase, order, measured)
++			}
++		}
++	}
++}

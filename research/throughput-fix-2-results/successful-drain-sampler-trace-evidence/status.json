@@ -1,0 +1,15 @@
+{
+  "accepted_performance_result": false,
+  "captured_event_rows_excluded": 48592,
+  "diagnostic_model_fail": 2,
+  "diagnostic_model_outcomes": 2,
+  "diagnostic_model_service_readings": 4,
+  "omitted_event_rows": 0,
+  "production_fix_claimed": false,
+  "root_fail": 6,
+  "root_numerical_readings": 18,
+  "root_outcomes": 36,
+  "root_pass": 30,
+  "root_race_blocks": 0,
+  "status": "forced sampler defect remains open; no shared edits or production candidate"
+}

@@ -1,0 +1,11 @@
+{
+  "conclusions": [
+    "The final legacy fixture verifies receiver timing history count remains zero.",
+    "On both a320 and f9, one retaining partial query changes12500000B/s to62248B/s and the exact successful probe retains62248B/s.",
+    "The identical no-read and non-retaining controls retain12500000B/s on both sources.",
+    "The excluded first legacy attempt failed to enter the controlled drain because legacy RTT uses completed10ms buckets. Final version adds one earlier completed raw RTT observation without changing byte/ACK/read timing or expected rates.",
+    "No timer, sampler, production, gate, or wire change is proposed."
+  ],
+  "retained_result_boundary": "Both final valid variants reproduce the retaining-read sampler defect. No-read and readonly controls preserve the initial rate. The excluded precondition attempts did not enter a drain and are retained only as excluded fixture evidence.",
+  "scope": "Legacy/no-field12 extension only, original paired-metadata results remain separately frozen."
+}

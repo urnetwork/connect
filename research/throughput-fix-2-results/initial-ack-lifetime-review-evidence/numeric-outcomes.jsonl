@@ -1,0 +1,4 @@
+{"callback_ms":500,"lifetime_ms":500,"outcome":"PASS","physical_ms":400,"repetitions":3,"retained_recovery_ms":700,"variant":"current"}
+{"callback_ms":900,"first_retry_ms":700,"lifetime_ms":900,"outcome":"PASS","physical_ms":400,"repetitions":3,"variant":"current"}
+{"callback_ms":600,"lifetime_ms":500,"outcome":"FAIL","physical_ms":600,"physical_write_count":1,"repetitions":3,"retained_recovery_ms":900,"variant":"current"}
+{"callback_ms":600,"lifetime_ms":500,"outcome":"FAIL","physical_ms":600,"physical_write_count":1,"repetitions":3,"retained_recovery_ms":300,"variant":"pre-physical-anchor"}

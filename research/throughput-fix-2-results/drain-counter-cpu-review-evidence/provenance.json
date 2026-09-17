@@ -1,0 +1,163 @@
+{
+  "archive_kind": "drain_counter_cpu_review_evidence",
+  "audit": {
+    "conclusion": "No remaining lifecycle defect found in the isolated scan or constant-count candidate. The derived count covers every production tail-state mutation and keeps abort separate from physical drained proof.",
+    "count_invariant": "unprovableWriteCount equals the number of current map entries with pending && (!unambiguous || generation != drainGeneration). Four stores compare old/new predicate; pending cancellation decrements pendingWrites, increments generation, then sets count=pendingWrites before deleting the canceled entry.",
+    "memory_change": {
+      "bytes_on_tested_arm64": 8,
+      "per_ack_record_bytes_added": 0,
+      "per_send_item_bytes_added": 0,
+      "per_service_int_fields_added": 1
+    },
+    "recommendation": "The counter removes measured growth in repeated rejected-drain admission (77.65 to 4025 ns for 1 to 1024 entries becomes roughly 50 ns) at the cost of ordinary callback maintenance (72.44 to 110.8 ns median for original write/confirmation/ACK). Retain the constant-cost counter with its lifecycle roots and both benchmark groups.",
+    "reviewed_paths": [
+      "ACK before physical confirmation",
+      "physical confirmation before ACK",
+      "repeated invalidation",
+      "fresh tail replacing ambiguous or stale tail",
+      "old-message confirmation after replacement",
+      "pending sequence cancellation and generation increment",
+      "completed sequence deletion",
+      "preserving an unrelated active RTT probe",
+      "nonblocking wakeup while retaining existing cooldown"
+    ]
+  },
+  "classification": "bounded_cpu_and_lifecycle_audit_only",
+  "execution_context": [
+    {
+      "benchmark_finished_utc": "2026-09-16T11:06:03.973199+00:00",
+      "benchmark_started_utc": "2026-09-16T11:05:54.478913+00:00",
+      "created_utc": "2026-09-16T11:04:37.389429+00:00",
+      "host_load_average_after_benchmark": [
+        42.74462890625,
+        23.52783203125,
+        14.98681640625
+      ],
+      "host_load_average_after_build": [
+        40.30224609375,
+        19.998046875,
+        13.3427734375
+      ],
+      "host_load_average_before_benchmark": [
+        44.77685546875,
+        23.25634765625,
+        14.7919921875
+      ],
+      "host_load_average_before_build": [
+        34.93798828125,
+        16.5927734375,
+        11.896484375
+      ],
+      "run_id": "final_drain_scan",
+      "sources_stable_after_benchmark": true,
+      "sources_stable_during_build": true
+    },
+    {
+      "benchmark_finished_utc": "2026-09-16T11:06:13.578341+00:00",
+      "benchmark_started_utc": "2026-09-16T11:06:04.107217+00:00",
+      "created_utc": "2026-09-16T11:04:37.392032+00:00",
+      "host_load_average_after_benchmark": [
+        43.5966796875,
+        24.33544921875,
+        15.37255859375
+      ],
+      "host_load_average_after_build": [
+        42.412109375,
+        21.478515625,
+        13.9873046875
+      ],
+      "host_load_average_before_benchmark": [
+        42.74462890625,
+        23.52783203125,
+        14.98681640625
+      ],
+      "host_load_average_before_build": [
+        34.93798828125,
+        16.5927734375,
+        11.896484375
+      ],
+      "run_id": "final_drain_counter",
+      "sources_stable_after_benchmark": true,
+      "sources_stable_during_build": true
+    },
+    {
+      "benchmark_finished_utc": "2026-09-16T11:08:39.239818+00:00",
+      "benchmark_started_utc": "2026-09-16T11:08:36.230105+00:00",
+      "created_utc": "2026-09-16T11:08:13.361800+00:00",
+      "host_load_average_after_benchmark": [
+        24.90771484375,
+        26.2841796875,
+        17.73828125
+      ],
+      "host_load_average_after_build": [
+        28.583984375,
+        27.0205078125,
+        17.84130859375
+      ],
+      "host_load_average_before_benchmark": [
+        26.3798828125,
+        26.59326171875,
+        17.7958984375
+      ],
+      "host_load_average_before_build": [
+        31.298828125,
+        27.48046875,
+        17.89306640625
+      ],
+      "run_id": "final_lifecycle_scan",
+      "sources_stable_after_benchmark": true,
+      "sources_stable_during_build": true
+    },
+    {
+      "benchmark_finished_utc": "2026-09-16T11:08:42.333218+00:00",
+      "benchmark_started_utc": "2026-09-16T11:08:39.381958+00:00",
+      "created_utc": "2026-09-16T11:08:24.778353+00:00",
+      "host_load_average_after_benchmark": [
+        23.7138671875,
+        26.013671875,
+        17.69287109375
+      ],
+      "host_load_average_after_build": [
+        26.3798828125,
+        26.59326171875,
+        17.7958984375
+      ],
+      "host_load_average_before_benchmark": [
+        24.90771484375,
+        26.2841796875,
+        17.73828125
+      ],
+      "host_load_average_before_build": [
+        28.583984375,
+        27.0205078125,
+        17.84130859375
+      ],
+      "run_id": "final_lifecycle_counter",
+      "sources_stable_after_benchmark": true,
+      "sources_stable_during_build": true
+    }
+  ],
+  "input_handoff_pin_verification": {
+    "all_pins_verified_at_handoff": true,
+    "result": "PASS",
+    "unique_path_hash_pins_verified": 25
+  },
+  "input_handoff_sha256": "030975572878d3a22ff4f8ff15393c1c85d3eb890f6839bbe80cbb9423021e74",
+  "paired_comparison_limitations": [
+    "The 512/1024-entry points are explicit stress fixtures, not evidence that an ordinary current logical-service lane set reaches that size.",
+    "CPU observations ran under current host load, with all three samples retained; lifecycle counter samples show timing variance.",
+    "These are sequential CPU comparisons, not an interleaved statistical experiment or a physical throughput claim.",
+    "Tail lifecycle includes real service locks and map operations but no network serialization.",
+    "Existing single-tail/multiple-route drain-proof limitations are not repaired or newly certified by this change."
+  ],
+  "performance_acceptance": "not evaluated",
+  "sanitization": {
+    "input_manifests": "not copied; normalized numeric facts and SHA-256 pins retained",
+    "local_paths_network_addresses_and_generated_ids": "excluded",
+    "raw_logs": "excluded; SHA-256 retained only",
+    "source_files_overlays_and_binaries": "excluded; SHA-256 retained only"
+  },
+  "schema_version": 1,
+  "scope": "Independent read-only lifecycle audit plus bounded CPU microbenchmarks; no shared source edits, physical throughput campaign, or acceptance-gate change.",
+  "throughput_acceptance": "not evaluated"
+}

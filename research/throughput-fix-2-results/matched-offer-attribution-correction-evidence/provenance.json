@@ -1,0 +1,21 @@
+{
+  "artifact_exclusions": [
+    "Normalize numerical rows/outcomes/correction/pins only. Exclude all raw source, log, overlay, binary, inventory and raw event rows.",
+    "Keep prior archives immutable; attach this correction rather than deleting the earlier attribution.",
+    "This is a diagnostic trace and deterministic sampler/credit root, not a physical-network performance acceptance result or production fix."
+  ],
+  "classification": "attribution correction and failure/design diagnostic; no production candidate or performance acceptance",
+  "created_utc": "2026-09-16T12:09:18.900168+00:00",
+  "input_handoff_sha256": "91f5ecf8ac6af93088eaee7d3b6c67486ff19b835d09ae08663dca23e5f8c65d",
+  "numeric_summary_sha256": "59f47fbe3a0ff7cb2e9fb68aa1282502548d9bab1ccf75c0f11bb6ca5895ef3f",
+  "pin_validation": {
+    "checked": 22,
+    "mismatches": 0
+  },
+  "prior_archive_boundary": "Earlier sampler handoffs are preserved unchanged; this archive adds a correction rather than replacing them.",
+  "prior_handoff_sha256s": [
+    "9a648856c7339f5c84de360faa922a922359a461e89e2b8ac1b6081a16dda848",
+    "e79fad510bab30e22ff340cb9e6547f32e752dd71de310412007d6d4a42b98ab"
+  ],
+  "scope": "Additional matched physical-credit provenance; corrects the earlier causal inference from contemporaneous no-write gaps. No fix proposed."
+}

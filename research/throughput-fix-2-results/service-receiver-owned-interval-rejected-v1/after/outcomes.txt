@@ -1,0 +1,31 @@
+=== RUN   TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold
+--- FAIL: TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold (0.54s)
+=== RUN   TestWindowPacingReceiverOwnedFirstPrefixCannotBorrowSiblingStart
+--- PASS: TestWindowPacingReceiverOwnedFirstPrefixCannotBorrowSiblingStart (0.00s)
+=== RUN   TestWindowPacingReceiverOwnedCausalReversalCannotBorrowSiblingSpan
+--- PASS: TestWindowPacingReceiverOwnedCausalReversalCannotBorrowSiblingSpan (0.00s)
+=== RUN   TestWindowPacingReceiverOwnedTiesKeepTheirBytesAcrossPublicationOrder
+--- PASS: TestWindowPacingReceiverOwnedTiesKeepTheirBytesAcrossPublicationOrder (0.00s)
+=== RUN   TestWindowPacingReceiverSustainedPacingEscapesSlowHold
+--- PASS: TestWindowPacingReceiverSustainedPacingEscapesSlowHold (1.01s)
+=== RUN   TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold
+--- FAIL: TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold (0.53s)
+=== RUN   TestWindowPacingReceiverOwnedFirstPrefixCannotBorrowSiblingStart
+--- PASS: TestWindowPacingReceiverOwnedFirstPrefixCannotBorrowSiblingStart (0.00s)
+=== RUN   TestWindowPacingReceiverOwnedCausalReversalCannotBorrowSiblingSpan
+--- PASS: TestWindowPacingReceiverOwnedCausalReversalCannotBorrowSiblingSpan (0.00s)
+=== RUN   TestWindowPacingReceiverOwnedTiesKeepTheirBytesAcrossPublicationOrder
+--- PASS: TestWindowPacingReceiverOwnedTiesKeepTheirBytesAcrossPublicationOrder (0.00s)
+=== RUN   TestWindowPacingReceiverSustainedPacingEscapesSlowHold
+--- PASS: TestWindowPacingReceiverSustainedPacingEscapesSlowHold (1.01s)
+=== RUN   TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold
+--- FAIL: TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold (0.54s)
+=== RUN   TestWindowPacingReceiverOwnedFirstPrefixCannotBorrowSiblingStart
+--- PASS: TestWindowPacingReceiverOwnedFirstPrefixCannotBorrowSiblingStart (0.00s)
+=== RUN   TestWindowPacingReceiverOwnedCausalReversalCannotBorrowSiblingSpan
+--- PASS: TestWindowPacingReceiverOwnedCausalReversalCannotBorrowSiblingSpan (0.00s)
+=== RUN   TestWindowPacingReceiverOwnedTiesKeepTheirBytesAcrossPublicationOrder
+--- PASS: TestWindowPacingReceiverOwnedTiesKeepTheirBytesAcrossPublicationOrder (0.00s)
+=== RUN   TestWindowPacingReceiverSustainedPacingEscapesSlowHold
+--- PASS: TestWindowPacingReceiverSustainedPacingEscapesSlowHold (1.00s)
+FAIL
