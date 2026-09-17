@@ -1,0 +1,11 @@
+{"outcome": "FAIL", "seconds": "2.35s", "test": "TestWindowPathWindowMismatchChanges", "variant": "initial-five-selector"}
+{"outcome": "PASS", "seconds": "0.57s", "test": "TestWindowPathServiceSettledLargeMessageCapacityChanges", "variant": "initial-five-selector"}
+{"outcome": "PASS", "seconds": "0.07s", "test": "TestWindowPathServiceCapacityIncreaseRecovery", "variant": "initial-five-selector"}
+{"outcome": "FAIL", "seconds": "1.83s", "test": "TestWindowPathRetainedSdkCumulativePacingLong", "variant": "initial-five-selector"}
+{"outcome": "PASS", "seconds": "2.64s", "test": "TestWindowPathServiceRoundTripGrowthBeyondOldRing", "variant": "initial-five-selector"}
+{"outcome": "FAIL", "seconds": "2.33s", "test": "TestWindowPathWindowMismatchChanges", "variant": "corrected-six-selector"}
+{"outcome": "PASS", "seconds": "0.57s", "test": "TestWindowPathServiceSettledLargeMessageCapacityChanges", "variant": "corrected-six-selector"}
+{"outcome": "PASS", "seconds": "0.07s", "test": "TestWindowPathServiceCapacityIncreaseRecovery", "variant": "corrected-six-selector"}
+{"outcome": "FAIL", "seconds": "1.81s", "test": "TestWindowPathRetainedSdkCumulativePacingLong", "variant": "corrected-six-selector"}
+{"outcome": "PASS", "seconds": "0.19s", "test": "TestWindowPacingShortCompressedServiceKeepsMeasuredCapacity", "variant": "corrected-six-selector"}
+{"outcome": "PASS", "seconds": "2.44s", "test": "TestWindowPathServiceRoundTripGrowthBeyondOldRing", "variant": "corrected-six-selector"}

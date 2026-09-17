@@ -1,0 +1,6 @@
+{
+  "classification": "Four original shrink/bootstrap/reason assertions failed on retained core; exact subset of the preserved full nonrace regression, not a performance comparison.",
+  "outcomes": 4,
+  "readings": 0,
+  "worker_readings": 0
+}

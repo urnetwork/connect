@@ -1,0 +1,6 @@
+{
+  "classification": "Full model26P4F on the receiver-consumer snapshot that omitted accepted cumulative pacing. All four failing families and numerical readings retained.",
+  "outcomes": 30,
+  "readings": 824,
+  "worker_readings": 0
+}

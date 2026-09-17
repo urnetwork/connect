@@ -1,0 +1,137 @@
+[env]glog not configured from command line. Using default configuration.
+I0916 20:36:48.653690    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [settings.yml]
+I0916 20:36:48.654642    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [settings.yml]
+I0916 20:36:48.654968    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [settings.yml]
+I0916 20:36:48.655953    5445 env.go:861] [env]try /Users/brien/urnetwork/site, [settings.yml]
+I0916 20:36:48.655969    5445 env.go:78] [env]settings = map[]
+=== RUN   TestDrainCoordinatorCompletesWhenIdle
+I0916 20:36:48.660419    5445 drain.go:133] [proxy]drain start (3 active, grace 5s)
+I0916 20:36:48.862412    5445 drain.go:167] [proxy]drain complete in 0s
+--- PASS: TestDrainCoordinatorCompletesWhenIdle (0.20s)
+=== RUN   TestDrainCoordinatorGraceDeadline
+I0916 20:36:48.862581    5445 drain.go:133] [proxy]drain start (1 active, grace 300ms)
+I0916 20:36:49.164226    5445 drain.go:169] [proxy]drain deadline with 1 active in 0s
+--- PASS: TestDrainCoordinatorGraceDeadline (0.30s)
+=== RUN   TestDrainCoordinatorDisabled
+I0916 20:36:49.164363    5445 drain.go:121] [proxy]drain disabled; shutting down immediately
+--- PASS: TestDrainCoordinatorDisabled (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetKeepsThePerDeviceTarget
+I0916 20:36:49.165110    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.165594    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.165641    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+I0916 20:36:49.165695    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.165732    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.165768    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+--- PASS: TestProxyDeviceMemoryBudgetKeepsThePerDeviceTarget (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetNeverExceedsTheAggregate
+I0916 20:36:49.165853    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.165886    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.165917    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+I0916 20:36:49.165966    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.165999    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.166027    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+--- PASS: TestProxyDeviceMemoryBudgetNeverExceedsTheAggregate (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetRefusesWithoutConstructing
+I0916 20:36:49.166123    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.166154    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.166183    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+I0916 20:36:49.166224    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.166255    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.166312    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+--- PASS: TestProxyDeviceMemoryBudgetRefusesWithoutConstructing (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetReleasedOnConstructionFailure
+I0916 20:36:49.166453    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.166500    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.166536    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+I0916 20:36:49.166580    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.166615    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.166647    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+--- PASS: TestProxyDeviceMemoryBudgetReleasedOnConstructionFailure (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetReleasedOnDeviceClose
+I0916 20:36:49.166765    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.166799    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.166831    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+I0916 20:36:49.166874    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.166908    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.166940    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+--- PASS: TestProxyDeviceMemoryBudgetReleasedOnDeviceClose (0.00s)
+=== RUN   TestProxyDeviceMemoryBudgetDisabled
+I0916 20:36:49.167321    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.167360    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.167388    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+I0916 20:36:49.167426    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.167461    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.167462    5445 trace.go:51] Unexpected error: {"error":"runtime.errorString=runtime error: invalid memory address or nil pointer dereference","stack":["goroutine 228 [running]:","runtime/debug.Stack()","/usr/local/go/src/runtime/debug/stack.go:26 +0x64","github.com/urnetwork/server.HandleError.func1()","/tmp/throughput-fix-2-terra-server-proxy-final-cgo0/source/server/trace.go:51 +0x68","panic({0x104d25e20?, 0x10559e410?})","/usr/local/go/src/runtime/panic.go:860 +0x12c","github.com/urnetwork/sdk.(*DeviceLocal).AddReceivePacketsCallback(0x0, 0x100a12488?)","/tmp/throughput-fix-2-terra-server-proxy-final-cgo0/source/sdk/device_local.go:5072 +0x1c","github.com/urnetwork/server/proxy.(*ProxyDevice).Run(0x657fd6de6000)","/tmp/throughput-fix-2-terra-server-proxy-final-cgo0/source/server/proxy/proxy_device.go:1023 +0x80","github.com/urnetwork/server/proxy.(*ProxyDeviceManager).startProxyDevice.func1()","/tmp/throughput-fix-2-terra-server-proxy-final-cgo0/source/server/proxy/proxy_device.go:499 +0x84","github.com/urnetwork/server.HandleError(0x105267c80?, {0x0?, 0x0?, 0x0?})","/tmp/throughput-fix-2-terra-server-proxy-final-cgo0/source/server/trace.go:78 +0x5c","created by github.com/urnetwork/server/proxy.(*ProxyDeviceManager).startProxyDevice in goroutine 227","/tmp/throughput-fix-2-terra-server-proxy-final-cgo0/source/server/proxy/proxy_device.go:470 +0xd0",""]}
+I0916 20:36:49.167503    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+--- PASS: TestProxyDeviceMemoryBudgetDisabled (0.00s)
+=== RUN   TestProxyDeviceWireGuardReturnWaitsForQueueCapacity
+--- PASS: TestProxyDeviceWireGuardReturnWaitsForQueueCapacity (0.00s)
+=== RUN   TestProxyDeviceTunDialDoesNotStealWireGuardReturn
+--- PASS: TestProxyDeviceTunDialDoesNotStealWireGuardReturn (0.00s)
+=== RUN   TestProxyDeviceManagerRetainsRetryingDeviceAcrossWindowLoss
+I0916 20:36:49.168770    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.168818    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.168850    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+I0916 20:36:49.168895    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.168932    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.168966    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+--- PASS: TestProxyDeviceManagerRetainsRetryingDeviceAcrossWindowLoss (0.00s)
+=== RUN   TestProxyDeviceManagerSharesOneNetworkSpaceLifetime
+I0916 20:36:49.169064    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.169101    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.169133    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+I0916 20:36:49.169193    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.169232    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.169261    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+--- PASS: TestProxyDeviceManagerSharesOneNetworkSpaceLifetime (0.00s)
+=== RUN   TestProxyDeviceManagerCloseAndWaitJoinsOwnedNetworkSpace
+I0916 20:36:49.169537    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.169614    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.169654    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+I0916 20:36:49.169706    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.169742    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.169780    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+--- PASS: TestProxyDeviceManagerCloseAndWaitJoinsOwnedNetworkSpace (0.00s)
+=== RUN   TestProxyDeviceManagerCloseJoinsAdmittedOpenAndRejectsLateOpen
+I0916 20:36:49.169877    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.169919    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.169953    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+I0916 20:36:49.170045    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.170104    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.170142    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+--- PASS: TestProxyDeviceManagerCloseJoinsAdmittedOpenAndRejectsLateOpen (0.00s)
+=== RUN   TestProxyDeviceManagerPreservesInjectedNetworkSpace
+I0916 20:36:49.170359    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.170434    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.170484    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+I0916 20:36:49.170554    5445 env.go:861] [env]try /Users/brien/urnetwork/config, [proxy.yml]
+I0916 20:36:49.170600    5445 env.go:861] [env]try /Users/brien/urnetwork/config/local, [proxy.yml]
+I0916 20:36:49.170647    5445 env.go:861] [env]try /Users/brien/urnetwork/config/all, [proxy.yml]
+--- PASS: TestProxyDeviceManagerPreservesInjectedNetworkSpace (0.00s)
+=== RUN   TestProxyDeviceSendBorrowedBatchCopiesBeforeReturn
+--- PASS: TestProxyDeviceSendBorrowedBatchCopiesBeforeReturn (0.00s)
+=== RUN   TestProxyDeviceSendBorrowedBatchReturnsRejectedCopies
+--- PASS: TestProxyDeviceSendBorrowedBatchReturnsRejectedCopies (0.00s)
+=== RUN   TestProxyIngressCollectorExportsCompleteBoundedLibrarySnapshots
+--- PASS: TestProxyIngressCollectorExportsCompleteBoundedLibrarySnapshots (0.00s)
+=== RUN   TestProxyConnectionMetricsPreserveDirectionalBytesAndCloseOnce
+--- PASS: TestProxyConnectionMetricsPreserveDirectionalBytesAndCloseOnce (0.00s)
+=== RUN   TestProxySessionMaximumResetsAtIntervalBoundary
+--- PASS: TestProxySessionMaximumResetsAtIntervalBoundary (0.00s)
+=== RUN   TestProxySessionDurationSummaryExportsExactSumCountWithoutBuckets
+--- PASS: TestProxySessionDurationSummaryExportsExactSumCountWithoutBuckets (0.00s)
+=== RUN   TestWireGuardPacketMetricsCountPayloadAfterOffset
+--- PASS: TestWireGuardPacketMetricsCountPayloadAfterOffset (0.00s)
+=== RUN   TestWgClientStackCloseAndWaitJoinsTCPDispatcher
+--- PASS: TestWgClientStackCloseAndWaitJoinsTCPDispatcher (0.00s)
+=== RUN   TestProxyLifecycleJoinCapabilityMetric
+--- PASS: TestProxyLifecycleJoinCapabilityMetric (0.00s)
+=== RUN   TestWindowIdentityRestoreGateProtectsLazyOpen
+I0916 20:36:49.171792    5445 window_identity.go:193] [pd][01a0ad02-6013-618b-ff3c-04a42bcec067]window identity restore held until drain completion
+I0916 20:36:49.171831    5445 window_identity.go:223] [pd][01a0ad02-6013-618b-ff3c-04a42bcec067]window identity restore: 1 identities
+--- PASS: TestWindowIdentityRestoreGateProtectsLazyOpen (0.00s)
+=== RUN   TestWindowIdentityRestoreGateJoinsConcurrentReleaseWrite
+--- PASS: TestWindowIdentityRestoreGateJoinsConcurrentReleaseWrite (0.00s)
+=== RUN   TestWindowIdentityRestoreGateKeepsNewestDeviceGeneration
+--- PASS: TestWindowIdentityRestoreGateKeepsNewestDeviceGeneration (0.00s)
+PASS

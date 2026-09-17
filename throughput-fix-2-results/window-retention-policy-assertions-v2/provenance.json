@@ -1,0 +1,17 @@
+{
+  "event_plumbing": false,
+  "race": true,
+  "renamed_tests": {
+    "TestADeliveryLimitedWindowCanCrossTheMemoryClamp": "TestALearnedWindowSurvivesTheMemoryClamp",
+    "TestADeliveryLimitedWindowRemainsBelowTheSmallMemoryShare": "TestDeliveryGrowthRemainsBelowTheSmallMemoryShare",
+    "TestTheDeliveryCapIsOneSidedAndLagged": "TestDeliveryCandidatesRequireFreshPermissionHistory",
+    "TestTheThreePeerBranchesAreThreeDifferentWindows": "TestTheThreePeerBranchesHaveDifferentPermissionCeilings",
+    "TestTheWindowStepsToTheAdvertisedCapacity": "TestAdvertisementRaisesPermissionWithoutLearningCapacity",
+    "TestWindowPacingNewPathProofRequalifiesOldDelivery": "TestWindowPacingNewPathProofRequiresFreshDeliveryCandidates",
+    "TestWindowPacingQueuedPathObservationKeepsDeliveryClamp": "TestWindowPacingQueuedPathObservationKeepsDeliveryCandidate",
+    "TestWindowPacingWindowProofAcceptsFreshSlowDelivery": "TestWindowPacingWindowProofAcceptsFreshSlowCandidateWithoutShrinking",
+    "TestWindowPacingWindowProofPreservesFixedBounds": "TestWindowPacingWindowProofPreservesHardBoundsAndRetainedCapacity"
+  },
+  "repetitions": 3,
+  "scope": "Fourteen revised policy assertions and three unchanged arithmetic/fixture controls on retained-window v2 without the later measured-service growth change."
+}

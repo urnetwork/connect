@@ -1,0 +1,33 @@
+{
+  "calibration": "Both reference directions remain below nominal90%1Gb/s. Download also fails constrained calibration; after download A/A drift37.85% exceeds10%. Raw rates are observations, not accepted gain estimates.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "fixture_source": {
+    "artifact": "physical-h1-duplex-tun-fix-final",
+    "duplex_sha256": "c4754456f27ee4f9eea9ea4050b9b3ad5141158188313c46b11fa270e0f71918",
+    "physical_sha256": "bc7b10c6690c60bf0b6a7d583668caeb45a7c8e0f99b3f7ec7f0ac5080729fae"
+  },
+  "lifecycle_audit": "The generic fixture/carrier/lifecycle failure label is triggered by three NAT/TUN-refusal errors on each side; no separate close/join/pool failure is reported. All6 arms release Transfer/carrier/replay budgets to zero, replay reserved equals released, retain one connection/direction and report zero reliable-carrier/receive/TUN/stack drops.",
+  "limits": "Sub-reference delivered rates remain observed performance failures. Uncalibrated references and drift prevent declaring throughput closure or assigning a precise improvement causally to ACK retention. All refusal and window-policy failures remain in raw outcomes.",
+  "live_optional_policy_adoption": false,
+  "network_quality_events": false,
+  "outcomes": "0P2F, six physical arms and two comparisons preserved; accepted throughput readings0.",
+  "policy_semantics": "The old physical gate equates current cumulative Sized with policy enabled. Failed candidate directions have Sized=false but ServiceSized=true and retained learned capacity/positive service. This point-in-time boolean does not prove policy misconfiguration. Original failure retained.",
+  "production_comparison": "Corresponding isolated v3 before/after. After includes the optional dedicated ACK owner plus separately validated SendBuffer/ForwardBuffer caller guards. Sampler remains the same experimental anchor. No claim separates their physical effects.",
+  "race": false,
+  "raw_rates": "Before delivery13.8733/1.19791Mb/s versus174.848/684.816 matched reference (aggregate15.0712/859.664). After44.5645/404.693 versus247.006/632.103 (aggregate449.257/879.110).",
+  "refusal_semantics": "Zero provider ReturnSend/ReturnQueue refusal includes recoverable TCP controls and can reject legal well-performing recovery. Every observed aggregate is52B per refused packet, consistent with this control class, but these runs do not capture each packet type. No universal correctness failure is inferred from that counter.",
+  "repetitions": 1,
+  "retention": "Original full source, binaries, manifests and logs remain immutable outside Git, represented by hashes.",
+  "sources": {
+    "after": {
+      "artifact": "throughput-fix-2-physical-h1-ack-policy-after-v1",
+      "inventory_sha256": "d531c929cb52c22a84445d12b4e2a23de1acecc5a0d9bbc105591066dfd4fc90"
+    },
+    "before": {
+      "artifact": "throughput-fix-2-physical-h1-ack-policy-before-v1",
+      "inventory_sha256": "3c3f9d676d8ce6f25711c3df95398636d5f5eb8607d3a172d9ddddf390bb4836"
+    }
+  },
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "unchanged_scope": "Original constant/delivery/constant A/B/A, eight full-duplex TCP flows, real TLS/WebSocket H1 and gVisor/kernel origin,1Gb/s per direction,300us addedRTT,2.5s warmup,5s measurement. No workload, queue, cap, window, serializer, calibration or acceptance gate changed."
+}

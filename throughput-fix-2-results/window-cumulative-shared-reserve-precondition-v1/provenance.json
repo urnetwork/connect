@@ -1,0 +1,29 @@
+{
+  "classification": "Initial fixture did not reach zero service for multiple lanes; failures are precondition-only, not fallback utilization evidence.",
+  "consumer_scope": "Actual waitForService reservation and shared burst dispatch consume each final qualified lane estimate. Three prior flight amounts remain below all effective byte windows and within the freshness interval. Probe was spent by real preceding reservations/confirmed writes and bounded ACKed flights.",
+  "contract_split": "Byte ownership, target/window bounds, finite startup allowance and evidence scope are hard controls. Completing the next aggregate work within its observed prior delivery duration is the stated utilization objective, not a protocol correctness invariant or exact serialization-rate oracle.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "experimental_sampler_sha256": "3294610224c983316fc09191818e13f59bc964dcff6af76ab9db793cf8ad4f3a",
+  "fixture_revision": "v1 inherits immediate-ACK compression0; short ordered raw pairs produce positive service, so multi-lane zero-service precondition fails.",
+  "limits": "No production fix, broad model acceptance, physical throughput or attribution to existing SDK failures is claimed.",
+  "outcomes": "42P6F0S; race=true, no warnings.",
+  "production_changes": [],
+  "race": true,
+  "repetitions": 3,
+  "scope_controls": "Actual-consumer idle/stale references and independent-service evidence controls pass.",
+  "source_base": {
+    "artifact": "throughput-fix-2-cumulative-shared-reserve-before-pinned",
+    "snapshot_inputs_sha256": "925e5780447d2e9a974466076915605212ae37c9cbf84791ad9bffc96e81c5c5"
+  },
+  "table_failure_propagation": true,
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "test_sha256": "0a6684635a79b994e577d887824c16546c9bed18cb1f64ab2685546fc1506c7a",
+  "training_scope": "Prescribed complete H1 flights and raw ACK times bypass the pacing timer during training. Messages\u22648KiB, flights\u2264effective opening, aggregate offered rate below125MB/s, exact service/sequence byte totals and complete tail drains. This is not closed-loop throughput reachability.",
+  "transfer_sha256": "16fb5b507169f93e6ce22b67696fbdb82a4e9c4e18deed0caeb868335293407a",
+  "unchanged_original_controls": "All12 original TestWindowPacingCumulative roots pass, including single reply, tiny replies, missing/stale history, permission step, genuine slower service, target/byte caps, wrong carrier, sibling ownership and standalone behavior.",
+  "unexecuted_cases_are_not_go_test_skips": true,
+  "unexecuted_table_cases": [
+    "four equal lanes",
+    "four unequal lanes [8192,8192,16384,32768]"
+  ]
+}

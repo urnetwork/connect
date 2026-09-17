@@ -1,0 +1,8 @@
+{
+  "top_level": {
+    "PASS": 3345,
+    "FAIL": 0,
+    "SKIP": 25
+  },
+  "normalization": "Remove only the known leading s from the named packet-scramble test outcome; raw run.log is unchanged."
+}

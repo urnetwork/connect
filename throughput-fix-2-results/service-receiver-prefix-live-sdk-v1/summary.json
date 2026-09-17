@@ -1,0 +1,248 @@
+{
+  "scope": "Prefix-only production change; all test definitions and gates identical in both arms.",
+  "no_quiescence_wait": true,
+  "arms": {
+    "before": {
+      "roots": {
+        "exit_code": 1,
+        "rows": 0,
+        "passed": 45,
+        "failed": 15,
+        "skipped": 0,
+        "run_log_sha256": "155fbfcdd3d74edee6b22e560412dfd8e33a3312f90f9ebc52879245b7e2721c",
+        "sources_stable_during_build_and_run": true,
+        "finished_utc": "2026-09-17T00:47:15.588144+00:00",
+        "host_load_average_at_finish": [
+          5.9677734375,
+          8.099609375,
+          9.2236328125
+        ],
+        "no_quiescence_wait": true
+      },
+      "sdk": {
+        "exit_code": 1,
+        "rows": 12,
+        "passed": 0,
+        "failed": 3,
+        "skipped": 0,
+        "run_log_sha256": "ab6d5ae21bf13f9759dbb92d41d1a585563a2e2a98a2f6801f8a59e9043225a9",
+        "sources_stable_during_build_and_run": true,
+        "finished_utc": "2026-09-17T00:47:42.970861+00:00",
+        "host_load_average_at_finish": [
+          7.26025390625,
+          8.24658203125,
+          9.24462890625
+        ],
+        "no_quiescence_wait": true
+      },
+      "sdk_role_comparisons": [
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.17536,
+            957.2352
+          ],
+          "candidate_direction_mbps": [
+            736.5632,
+            803.79904
+          ],
+          "passes_per_direction_gate": false,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.2848,
+            957.21472
+          ],
+          "candidate_direction_mbps": [
+            765.09184,
+            842.12736
+          ],
+          "passes_per_direction_gate": false,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.1856,
+            957.24544
+          ],
+          "candidate_direction_mbps": [
+            773.39648,
+            811.07968
+          ],
+          "passes_per_direction_gate": false,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.22336,
+            957.22496
+          ],
+          "candidate_direction_mbps": [
+            770.63168,
+            912.10752
+          ],
+          "passes_per_direction_gate": true,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            209.01888,
+            957.25568
+          ],
+          "candidate_direction_mbps": [
+            763.51488,
+            811.18208
+          ],
+          "passes_per_direction_gate": false,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.3872,
+            957.21472
+          ],
+          "candidate_direction_mbps": [
+            743.18848,
+            866.22208
+          ],
+          "passes_per_direction_gate": true,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        }
+      ],
+      "sdk_role_comparison_failures": 4
+    },
+    "after": {
+      "roots": {
+        "exit_code": 0,
+        "rows": 0,
+        "passed": 60,
+        "failed": 0,
+        "skipped": 0,
+        "run_log_sha256": "4a2b96765b99db5312f69c543a4a0fbefd2cccecd36f499d98941f341270f159",
+        "sources_stable_during_build_and_run": true,
+        "finished_utc": "2026-09-17T00:48:08.680961+00:00",
+        "host_load_average_at_finish": [
+          8.0068359375,
+          8.2685546875,
+          9.2138671875
+        ],
+        "no_quiescence_wait": true
+      },
+      "sdk": {
+        "exit_code": 1,
+        "rows": 12,
+        "passed": 2,
+        "failed": 1,
+        "skipped": 0,
+        "run_log_sha256": "3d0b03be8acadba0dff3debcbbf8d534ae0dc43831f468b49e502dc87b83b07b",
+        "sources_stable_during_build_and_run": true,
+        "finished_utc": "2026-09-17T00:48:36.079906+00:00",
+        "host_load_average_at_finish": [
+          6.90478515625,
+          7.98828125,
+          9.0849609375
+        ],
+        "no_quiescence_wait": true
+      },
+      "sdk_role_comparisons": [
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.2368,
+            957.2352
+          ],
+          "candidate_direction_mbps": [
+            808.01792,
+            911.1552
+          ],
+          "passes_per_direction_gate": true,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.2848,
+            957.22496
+          ],
+          "candidate_direction_mbps": [
+            766.26944,
+            874.48576
+          ],
+          "passes_per_direction_gate": true,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.26752,
+            957.21472
+          ],
+          "candidate_direction_mbps": [
+            809.53344,
+            910.66368
+          ],
+          "passes_per_direction_gate": true,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.32576,
+            957.21472
+          ],
+          "candidate_direction_mbps": [
+            794.04032,
+            906.07616
+          ],
+          "passes_per_direction_gate": true,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.22656,
+            957.2352
+          ],
+          "candidate_direction_mbps": [
+            735.20128,
+            855.296
+          ],
+          "passes_per_direction_gate": false,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.336,
+            957.20448
+          ],
+          "candidate_direction_mbps": [
+            787.21024,
+            899.54304
+          ],
+          "passes_per_direction_gate": true,
+          "relay_drops": 0,
+          "measurement_relay_drops": 0
+        }
+      ],
+      "sdk_role_comparison_failures": 1
+    }
+  }
+}

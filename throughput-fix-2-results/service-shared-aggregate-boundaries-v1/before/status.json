@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "9796a4f8173850b3fe10c349d294adc2de023ccd58701abbe62befba1efbcba9",
+  "binary_sha256": "4641aea0ae3cfce63cc47fc501d2709827c0f522ae284d4ec9d86a7ba5cb0d67",
+  "effective_inputs_sha256": "cc6850c603aded39c6d8e0b17f5800f59d8fcc45b354b04931ec8c2d0589a2b3",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingAggregate(DeliveryPreservesTiesAndOldestOffer|DeliveryUsesRecentFreshInterval|DeliveryRejectsIncompleteOffers|DeliveryRejectsRetiredModuloSlot|OfferedBoundExpiresFastHistory|OfferedBoundRespectsPendingDrain)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as build; absolute relationship pinned by original status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T21:35:37.841484+00:00",
+  "loadavg_start": [
+    21.0400390625,
+    12.6552734375,
+    10.0068359375
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 0.9660922079347074,
+  "loadavg_end": [
+    20.07568359375,
+    12.59423828125,
+    10.00048828125
+  ],
+  "ended_utc": "2026-09-16T21:35:38.807835+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "193615111b2bddc6cb3d9228c902861db0567ded3858735cd58ff7fb830afc2f",
+  "pass": 15,
+  "fail": 3,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "15P3F: five arithmetic/history controls pass; pending feedbackDrainAt and resetInitialService can borrow pre-drain warm offers.",
+  "rows": 0
+}

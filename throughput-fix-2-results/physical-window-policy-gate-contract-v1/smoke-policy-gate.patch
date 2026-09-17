@@ -1,0 +1,274 @@
+--- a/transfer_window_h1_physical_test.go
++++ b/transfer_window_h1_physical_test.go
+@@ -213,6 +213,7 @@
+ 	Receiver                 [2]ClientReceiveStatsSnapshot
+ 	Recovery                 [2]ClientSendRecoveryStatsSnapshot
+ 	Window                   [2]SendWindowEstimate
++	Policy                   [2]windowPhysicalH1PolicyReading
+ 	MaxRelayQueued           [2]int64
+ 	MaxRelayQueuedBytes      [2]int64
+ 	Nat                      windowPhysicalH1Nat
+@@ -560,6 +561,7 @@
+ 		reading.CarrierReceive[i] = transports[i].ReceiveStats()
+ 		reading.Receiver[i], reading.Recovery[i] = clients[i].ReceiveStats(), clients[i].SendRecoveryStats()
+ 		reading.Window[i] = clients[i].DestinationSendStats(clients[1-i].ClientId()).SendWindow
++		reading.Policy[i] = windowPhysicalH1PolicySnapshot(clients[i], clients[1-i].ClientId())
+ 	}
+ 	return reading
+ }
+@@ -612,7 +614,7 @@
+ 			}
+ 		}
+ 	}
+-	if !readings[1].Window[0].Sized || readings[0].Window[0].Sized || readings[2].Window[0].Sized {
++	if !windowPhysicalH1ArmPolicyMatches("delivery", readings[1], 0) || !windowPhysicalH1ArmPolicyMatches("ceiling-before", readings[0], 0) || !windowPhysicalH1ArmPolicyMatches("ceiling-after", readings[2], 0) {
+ 		t.Error("physical H1 arms did not select the intended window policy")
+ 	}
+ 	reference := (readings[0].DownloadMbps + readings[2].DownloadMbps) / 2
+--- /dev/null
++++ b/transfer_window_h1_policy_gate_test.go
+@@ -0,0 +1,87 @@
++// Physical A/B/A policy identity comes from the resolved configuration and
++// actual destination sequences. Fresh evidence is an independent diagnostic.
++package connect
++
++// An effective scale of zero records a disabled rule even when its enum or
++// configured scale still asks for delivery sizing.
++type windowPhysicalH1ResolvedPolicy struct {
++	WindowSizing       WindowSizingPolicyKind
++	Scale              int
++	EffectiveScale     int
++	HasMemoryBudget    bool
++	HasDeliveryHistory bool
++}
++
++// Capture both construction and actual sequence owners, without treating a
++// momentary missing service/cumulative sample as a different policy.
++type windowPhysicalH1PolicyReading struct {
++	Constructor windowPhysicalH1ResolvedPolicy
++	Sequences   []windowPhysicalH1ResolvedPolicy
++}
++
++// Constructor settings and instrument allocation are immutable after owner
++// creation. Copy the map's owners under its lock; inspect them after release.
++func windowPhysicalH1PolicySnapshot(client *Client, destination Id) windowPhysicalH1PolicyReading {
++	buffer := client.sendBuffer
++	settings := buffer.sendBufferSettings
++	reading := windowPhysicalH1PolicyReading{Constructor: windowPhysicalH1ResolvedPolicy{
++		WindowSizing: settings.WindowSizing, Scale: settings.DeliverySizedWindowScale,
++		HasMemoryBudget: settings.ResendQueueBudget != nil,
++	}}
++	if settings.WindowSizingActive() {
++		reading.Constructor.EffectiveScale = settings.DeliverySizedWindowScale
++	}
++	var sequences []*SendSequence
++	func() {
++		buffer.mutex.Lock()
++		defer buffer.mutex.Unlock()
++		for id, sequence := range buffer.sendSequences {
++			if id.Destination == destination {
++				sequences = append(sequences, sequence)
++			}
++		}
++	}()
++	for _, sequence := range sequences {
++		settings := sequence.sendBufferSettings
++		resolved := windowPhysicalH1ResolvedPolicy{WindowSizing: settings.WindowSizing, Scale: settings.DeliverySizedWindowScale, HasDeliveryHistory: sequence.deliveredBytes != nil, HasMemoryBudget: sequence.resendQueue != nil && sequence.resendQueue.Budget() != nil}
++		if 0 < resolved.Scale && resolved.HasDeliveryHistory && resolved.HasMemoryBudget && !settings.ReliableAdmissionBoundedByDelivery {
++			resolved.EffectiveScale = resolved.Scale
++		}
++		reading.Sequences = append(reading.Sequences, resolved)
++	}
++	return reading
++}
++
++// Check the declared arm against resolved owners. Neither Sized nor
++// ServiceSized is policy identity: either can age out on a valid retained arm.
++func windowPhysicalH1ArmPolicyMatches(arm string, reading windowPhysicalH1Reading, direction int) bool {
++	policy := reading.Policy[direction]
++	if len(policy.Sequences) == 0 {
++		return false
++	}
++	wanted := WindowSizingConstant
++	switch arm {
++	case "delivery":
++		wanted = WindowSizingFromDelivery
++	case "ceiling-before", "ceiling-after":
++	default:
++		return false
++	}
++	constructor := policy.Constructor
++	if constructor.WindowSizing != wanted {
++		return false
++	}
++	if wanted == WindowSizingFromDelivery {
++		if constructor.Scale <= 0 || constructor.EffectiveScale != constructor.Scale {
++			return false
++		}
++	} else if constructor.Scale != 0 || constructor.EffectiveScale != 0 {
++		return false
++	}
++	for _, sequence := range policy.Sequences {
++		if sequence.WindowSizing != wanted || sequence.Scale != constructor.Scale || sequence.EffectiveScale != constructor.EffectiveScale {
++			return false
++		}
++	}
++	return true
++}
+--- /dev/null
++++ b/transfer_window_h1_policy_contract_test.go
+@@ -0,0 +1,154 @@
++// The physical fixture's policy gate accepts valid evidence states while
++// rejecting incorrect actual arm configuration. No carrier or timer is used.
++package connect
++
++import "testing"
++
++// Build exact constructor/sequence owners with explicit budgets and delivery
++// instruments. The snapshot reads real fields, independently of diagnostics.
++func newWindowPhysicalH1PolicyContract() (*Client, Id, *SendSequence) {
++	settings := DefaultSendBufferSettings()
++	settings.WindowSizing = WindowSizingFromDelivery
++	settings.ReliableAdmissionBoundedByDelivery = false
++	settings.ApplyWindowSizing()
++	settings.ResendQueueBudget = NewTransferMemoryBudget(8 * 1024 * 1024)
++	destination := NewId()
++	sequenceSettings := *settings
++	sequence := &SendSequence{
++		destination: destination, sendBufferSettings: &sequenceSettings,
++		deliveredBytes: make([]deliveredBytesSample, deliveredBytesRingSize),
++		resendQueue:    newResendQueue(sequenceSettings.ResendQueueBudget, 0),
++	}
++	client := &Client{sendBuffer: &SendBuffer{
++		sendBufferSettings: settings,
++		sendSequences:      map[sendSequenceId]*SendSequence{{Destination: destination}: sequence},
++	}}
++	return client, destination, sequence
++}
++
++// Service can size a valid configured arm without a fresh cumulative interval.
++func TestWindowPhysicalH1PolicyGateAcceptsServiceQualified(t *testing.T) {
++	client, destination, _ := newWindowPhysicalH1PolicyContract()
++	reading := windowPhysicalH1Reading{}
++	reading.Policy[0] = windowPhysicalH1PolicySnapshot(client, destination)
++	reading.Window[0] = SendWindowEstimate{Sized: false, ServiceSized: true, ServiceByteRate: 12500000, Window: 4 * 1024 * 1024, LearnedWindow: 4 * 1024 * 1024}
++	if !windowPhysicalH1ArmPolicyMatches("delivery", reading, 0) {
++		t.Fatal("configured delivery arm was rejected solely because its current evidence is service-qualified")
++	}
++}
++
++// Retained byte capacity remains delivery policy when both current proofs age.
++func TestWindowPhysicalH1PolicyGateAcceptsAgedRetainedWindow(t *testing.T) {
++	client, destination, _ := newWindowPhysicalH1PolicyContract()
++	reading := windowPhysicalH1Reading{}
++	reading.Policy[0] = windowPhysicalH1PolicySnapshot(client, destination)
++	reading.Window[0] = SendWindowEstimate{Initial: 512 * 1024, Window: 4 * 1024 * 1024, LearnedWindow: 4 * 1024 * 1024}
++	if !windowPhysicalH1ArmPolicyMatches("delivery", reading, 0) {
++		t.Fatal("aged evidence changed the fixture's identity of a configured retained delivery arm")
++	}
++}
++
++// A configured constant must be rejected in the delivery arm even when a
++// diagnostic happens to carry a previously qualified sample.
++func TestWindowPhysicalH1PolicyGateRejectsWrongArmWithFreshEvidence(t *testing.T) {
++	client, destination, sequence := newWindowPhysicalH1PolicyContract()
++	client.sendBuffer.sendBufferSettings.WindowSizing = WindowSizingConstant
++	client.sendBuffer.sendBufferSettings.ApplyWindowSizing()
++	sequence.sendBufferSettings.WindowSizing = WindowSizingConstant
++	sequence.sendBufferSettings.ApplyWindowSizing()
++	reading := windowPhysicalH1Reading{}
++	reading.Policy[0] = windowPhysicalH1PolicySnapshot(client, destination)
++	reading.Window[0] = SendWindowEstimate{Sized: true, ServiceSized: true, LearnedWindow: 4 * 1024 * 1024}
++	if windowPhysicalH1ArmPolicyMatches("delivery", reading, 0) {
++		t.Fatal("fresh evidence hid an actual constant-policy constructor")
++	}
++	if !windowPhysicalH1ArmPolicyMatches("ceiling-before", reading, 0) || !windowPhysicalH1ArmPolicyMatches("ceiling-after", reading, 0) {
++		t.Fatal("stale diagnostic evidence hid the correctly configured constant arms")
++	}
++}
++
++// The enum alone cannot certify a rule disabled by scale, budget, or competing
++// admission. These are configuration failures regardless of current evidence.
++func TestWindowPhysicalH1PolicyGateRejectsDisabledConstructor(t *testing.T) {
++	for _, disable := range []func(*SendBufferSettings){
++		func(settings *SendBufferSettings) { settings.DeliverySizedWindowScale = 0 },
++		func(settings *SendBufferSettings) { settings.ResendQueueBudget = nil },
++		func(settings *SendBufferSettings) { settings.ReliableAdmissionBoundedByDelivery = true },
++	} {
++		client, destination, _ := newWindowPhysicalH1PolicyContract()
++		disable(client.sendBuffer.sendBufferSettings)
++		reading := windowPhysicalH1Reading{}
++		reading.Policy[0] = windowPhysicalH1PolicySnapshot(client, destination)
++		reading.Window[0] = SendWindowEstimate{Sized: true}
++		if windowPhysicalH1ArmPolicyMatches("delivery", reading, 0) {
++			t.Fatal("fresh evidence hid a disabled constructor rule")
++		}
++	}
++}
++
++// Real sequence state must agree with construction; a disabled, absent, or
++// differently configured owner cannot be masked by a positive statistics field.
++func TestWindowPhysicalH1PolicyGateRejectsWrongSequenceConfiguration(t *testing.T) {
++	for _, change := range []func(*SendSequence){
++		func(sequence *SendSequence) { sequence.sendBufferSettings.WindowSizing = WindowSizingConstant },
++		func(sequence *SendSequence) { sequence.sendBufferSettings.DeliverySizedWindowScale = 0 },
++		func(sequence *SendSequence) { sequence.sendBufferSettings.DeliverySizedWindowScale++ },
++		func(sequence *SendSequence) { sequence.deliveredBytes = nil },
++		func(sequence *SendSequence) { sequence.resendQueue = newResendQueue(nil, 0) },
++		func(sequence *SendSequence) { sequence.sendBufferSettings.ReliableAdmissionBoundedByDelivery = true },
++	} {
++		client, destination, sequence := newWindowPhysicalH1PolicyContract()
++		change(sequence)
++		reading := windowPhysicalH1Reading{}
++		reading.Policy[0] = windowPhysicalH1PolicySnapshot(client, destination)
++		reading.Window[0] = SendWindowEstimate{Sized: true}
++		if windowPhysicalH1ArmPolicyMatches("delivery", reading, 0) {
++			t.Fatal("constructor and statistics hid a differently configured actual sequence")
++		}
++	}
++}
++
++// An unrelated destination cannot stand in for the actual arm's absent owner.
++func TestWindowPhysicalH1PolicyGateScopesActualDestination(t *testing.T) {
++	client, _, _ := newWindowPhysicalH1PolicyContract()
++	reading := windowPhysicalH1Reading{}
++	reading.Policy[0] = windowPhysicalH1PolicySnapshot(client, NewId())
++	reading.Window[0] = SendWindowEstimate{Sized: true}
++	if windowPhysicalH1ArmPolicyMatches("delivery", reading, 0) {
++		t.Fatal("another destination certified a missing actual send sequence")
++	}
++}
++
++// A complete cumulative proof remains a positive control in either direction.
++func TestWindowPhysicalH1PolicyGateKeepsQualifiedPositiveControl(t *testing.T) {
++	client, destination, _ := newWindowPhysicalH1PolicyContract()
++	reading := windowPhysicalH1Reading{}
++	for direction := range 2 {
++		reading.Policy[direction] = windowPhysicalH1PolicySnapshot(client, destination)
++		reading.Window[direction] = SendWindowEstimate{Sized: true}
++		if !windowPhysicalH1ArmPolicyMatches("delivery", reading, direction) {
++			t.Fatalf("qualified configured direction%d was rejected", direction)
++		}
++	}
++	client.sendBuffer.sendBufferSettings.WindowSizing = WindowSizingConstant
++	client.sendBuffer.sendBufferSettings.ApplyWindowSizing()
++	for _, sequence := range client.sendBuffer.sendSequences {
++		sequence.sendBufferSettings.WindowSizing = WindowSizingConstant
++		sequence.sendBufferSettings.ApplyWindowSizing()
++	}
++	reading.Policy[0] = windowPhysicalH1PolicySnapshot(client, destination)
++	reading.Window[0] = SendWindowEstimate{}
++	if !windowPhysicalH1ArmPolicyMatches("ceiling-before", reading, 0) || !windowPhysicalH1ArmPolicyMatches("ceiling-after", reading, 0) {
++		t.Fatal("configured constant positive controls were rejected")
++	}
++}
++
++// An unrecognized arm cannot silently inherit the constant reference policy.
++func TestWindowPhysicalH1PolicyGateRejectsUnknownArm(t *testing.T) {
++	client, destination, _ := newWindowPhysicalH1PolicyContract()
++	reading := windowPhysicalH1Reading{}
++	reading.Policy[0] = windowPhysicalH1PolicySnapshot(client, destination)
++	if windowPhysicalH1ArmPolicyMatches("undeclared-arm", reading, 0) {
++		t.Fatal("unknown arm silently passed as constant")
++	}
++}

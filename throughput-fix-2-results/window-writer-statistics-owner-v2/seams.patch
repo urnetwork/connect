@@ -1,0 +1,45 @@
+--- a/transfer.go
++++ b/transfer.go
+@@ -6280,6 +6280,9 @@
+ 	resendWriteByteCount atomic.Uint64
+ 
+ 	contractMultiRouteWriter MultiRouteWriter
++	// Nil in production; tests rendezvous at the handle access after external
++	// selector effects, without holding the publication lock.
++	beforeContractWriterAccessForTest func(publish bool)
+ 	// Delivery checkpoints pair time, cumulative release and first-delivered
+ 	// service totals. The 64-entry ring costs 1,536 bytes, allocated only for
+ 	// a delivery-sized window or delivery-bounded reliable admission.
+@@ -7542,6 +7545,9 @@
+ // opens a selector, or for a custom writer without policy support, admission is
+ // intentionally unchanged.
+ func (self *SendSequence) transferFlightPolicy() transferFlightPolicySnapshot {
++	if before := self.beforeContractWriterAccessForTest; before != nil {
++		before(false)
++	}
+ 	if provider, ok := self.contractMultiRouteWriter.(transferFlightPolicyProvider); ok {
+ 		return provider.transferFlightPolicy()
+ 	}
+@@ -11929,7 +11935,11 @@
+ 		if self.contractMultiRouteWriter != nil {
+ 			self.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)
+ 		}
+-		self.contractMultiRouteWriter = self.client.RouteManager().OpenMultiRouteWriter(destination)
++		writer := self.client.RouteManager().OpenMultiRouteWriter(destination)
++		if before := self.beforeContractWriterAccessForTest; before != nil {
++			before(true)
++		}
++		self.contractMultiRouteWriter = writer
+ 		self.contractMultiRouteWriterDestination = destination
+ 
+ 		// associate the destination with this sequence to receive acks
+@@ -11973,6 +11983,9 @@
+ 	if self.contractMultiRouteWriter != nil {
+ 		self.retireNoAckFastPath()
+ 		self.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)
++		if before := self.beforeContractWriterAccessForTest; before != nil {
++			before(true)
++		}
+ 		self.contractMultiRouteWriter = nil
+ 		self.contractMultiRouteWriterDestination = TransferPath{}
+ 	}

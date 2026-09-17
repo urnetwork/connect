@@ -1,0 +1,222 @@
+[
+  {
+    "binary_sha256": "e2222ecf0c4077887e0e7dde643c15e6798b3c258156070883f40d61f3190e97",
+    "build_flags": [
+      "-race"
+    ],
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "b67340d6a985de7461e7c28beb188c81de7c78d9b72553f97aaf40379cacacf4",
+    "effective_inputs_sha256": "ce0624f9cebad480805187eb0499327ba2075731bd147361dcf91c5f37aac81f",
+    "inputs_match_at_archive": true,
+    "name": "before",
+    "outcome_scope": "complete raw invocation",
+    "outcomes": {
+      "FAIL": 18,
+      "PASS": 6,
+      "SKIP": 0
+    },
+    "race": true,
+    "race_instrumentation_verified_by": "compile argv and immutable binary metadata",
+    "race_warnings": 0,
+    "raw_log_sha256": "491fe5a6a469ec2f070d911d3eb9cac8be82c223aa00e44e5b2e9376f253a5a2",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "e2222ecf0c4077887e0e7dde643c15e6798b3c258156070883f40d61f3190e97",
+      "cwd": {
+        "artifact": "throughput-fix-2-caller-isolation-standalone-before-v2",
+        "path": "source/connect"
+      },
+      "cwd_source": "effective Go module snapshot",
+      "effective_inputs_sha256": "ce0624f9cebad480805187eb0499327ba2075731bd147361dcf91c5f37aac81f",
+      "elapsed_seconds": 1.1179644586518407,
+      "ended_utc": "2026-09-16T20:12:57.278693+00:00",
+      "exit_status": 1,
+      "fail": 18,
+      "loadavg_end": [
+        22.435546875,
+        16.19189453125,
+        14.03759765625
+      ],
+      "loadavg_start": [
+        22.435546875,
+        16.19189453125,
+        14.03759765625
+      ],
+      "manifest_sha256": "b67340d6a985de7461e7c28beb188c81de7c78d9b72553f97aaf40379cacacf4",
+      "no_quiescence_wait": true,
+      "pass": 6,
+      "race_warnings": 0,
+      "raw_log_sha256": "491fe5a6a469ec2f070d911d3eb9cac8be82c223aa00e44e5b2e9376f253a5a2",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T20:12:56.160223+00:00"
+    },
+    "selected_tests": [
+      "TestForwardBufferCallerCancelDuringAdmissionKeepsSiblings",
+      "TestForwardBufferCallerCancelKeepsAcceptedPackOwned",
+      "TestForwardBufferCallerCancelPreservesSharedAdmission",
+      "TestForwardBufferClosedSequenceStillRecreatesForLiveCaller",
+      "TestSendBufferCallerCancelDuringAdmissionKeepsSiblings",
+      "TestSendBufferCallerCancelKeepsAcceptedPackOwned",
+      "TestSendBufferCallerCancelPreservesSharedAdmission",
+      "TestSendBufferClosedSequenceStillRecreatesForLiveCaller"
+    ],
+    "source_content_sha256": "ed8a91f3d2a53bb696baba1165a32d2e78161c9ea5c13c399df918b7f6d4b958",
+    "test_pattern": "^(TestSendBufferCallerCancel.*|TestSendBufferClosedSequenceStillRecreatesForLiveCaller|TestForwardBufferCallerCancel.*|TestForwardBufferClosedSequenceStillRecreatesForLiveCaller)$"
+  },
+  {
+    "binary_sha256": "286dd256c7ad15ed651ac55cfd21a2db2f19d510b60c58a458d79f7bc5314cba",
+    "build_flags": [
+      "-race"
+    ],
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "27333e92788f5fb714b8747e77e65c154ab5fe36f18edeb95c23a348fcf2871a",
+    "effective_inputs_sha256": "89010552e04eb1476301a9b68a2b1122a2be04ed1b87e61be9087b3d3cad4b12",
+    "inputs_match_at_archive": true,
+    "name": "after",
+    "outcome_scope": "complete raw invocation",
+    "outcomes": {
+      "FAIL": 0,
+      "PASS": 24,
+      "SKIP": 0
+    },
+    "race": true,
+    "race_instrumentation_verified_by": "compile argv and immutable binary metadata",
+    "race_warnings": 0,
+    "raw_log_sha256": "89f5e866d97f83e287f04f43f2dee3902bc71a7903715eec9ab1c7b048a1f111",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "286dd256c7ad15ed651ac55cfd21a2db2f19d510b60c58a458d79f7bc5314cba",
+      "cwd": {
+        "artifact": "throughput-fix-2-caller-isolation-standalone-after-v2",
+        "path": "source/connect"
+      },
+      "cwd_source": "effective Go module snapshot",
+      "effective_inputs_sha256": "89010552e04eb1476301a9b68a2b1122a2be04ed1b87e61be9087b3d3cad4b12",
+      "elapsed_seconds": 2.9625310418196023,
+      "ended_utc": "2026-09-16T20:12:59.123261+00:00",
+      "exit_status": 0,
+      "fail": 0,
+      "loadavg_end": [
+        22.435546875,
+        16.19189453125,
+        14.03759765625
+      ],
+      "loadavg_start": [
+        22.435546875,
+        16.19189453125,
+        14.03759765625
+      ],
+      "manifest_sha256": "27333e92788f5fb714b8747e77e65c154ab5fe36f18edeb95c23a348fcf2871a",
+      "no_quiescence_wait": true,
+      "pass": 24,
+      "race_warnings": 0,
+      "raw_log_sha256": "89f5e866d97f83e287f04f43f2dee3902bc71a7903715eec9ab1c7b048a1f111",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T20:12:56.159709+00:00"
+    },
+    "selected_tests": [
+      "TestForwardBufferCallerCancelDuringAdmissionKeepsSiblings",
+      "TestForwardBufferCallerCancelKeepsAcceptedPackOwned",
+      "TestForwardBufferCallerCancelPreservesSharedAdmission",
+      "TestForwardBufferClosedSequenceStillRecreatesForLiveCaller",
+      "TestSendBufferCallerCancelDuringAdmissionKeepsSiblings",
+      "TestSendBufferCallerCancelKeepsAcceptedPackOwned",
+      "TestSendBufferCallerCancelPreservesSharedAdmission",
+      "TestSendBufferClosedSequenceStillRecreatesForLiveCaller"
+    ],
+    "source_content_sha256": "6d790f81d3ed2608e31e3971383d8d0d7046dd86952603b2c6103172849ea437",
+    "test_pattern": "^(TestSendBufferCallerCancel.*|TestSendBufferClosedSequenceStillRecreatesForLiveCaller|TestForwardBufferCallerCancel.*|TestForwardBufferClosedSequenceStillRecreatesForLiveCaller)$"
+  },
+  {
+    "binary_sha256": "286dd256c7ad15ed651ac55cfd21a2db2f19d510b60c58a458d79f7bc5314cba",
+    "build_flags": [
+      "-race"
+    ],
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "27333e92788f5fb714b8747e77e65c154ab5fe36f18edeb95c23a348fcf2871a",
+    "effective_inputs_sha256": "89010552e04eb1476301a9b68a2b1122a2be04ed1b87e61be9087b3d3cad4b12",
+    "inputs_match_at_archive": true,
+    "name": "after-adjacent",
+    "outcome_scope": "complete raw invocation",
+    "outcomes": {
+      "FAIL": 0,
+      "PASS": 24,
+      "SKIP": 0
+    },
+    "race": true,
+    "race_instrumentation_verified_by": "compile argv and immutable binary metadata",
+    "race_warnings": 0,
+    "raw_log_sha256": "4c8d6368a2ca48a15767398be6f3c1094ed2d30f7a9991ba8914f364c77c6c63",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "286dd256c7ad15ed651ac55cfd21a2db2f19d510b60c58a458d79f7bc5314cba",
+      "cwd": {
+        "artifact": "throughput-fix-2-caller-isolation-standalone-after-v2",
+        "path": "source/connect"
+      },
+      "cwd_source": "effective Go module snapshot",
+      "effective_inputs_sha256": "89010552e04eb1476301a9b68a2b1122a2be04ed1b87e61be9087b3d3cad4b12",
+      "elapsed_seconds": 2.457175666000694,
+      "ended_utc": "2026-09-16T20:13:06.993870+00:00",
+      "exit_status": 0,
+      "fail": 0,
+      "loadavg_end": [
+        27.291015625,
+        17.44970703125,
+        14.50927734375
+      ],
+      "loadavg_start": [
+        27.291015625,
+        17.44970703125,
+        14.50927734375
+      ],
+      "manifest_sha256": "27333e92788f5fb714b8747e77e65c154ab5fe36f18edeb95c23a348fcf2871a",
+      "no_quiescence_wait": true,
+      "pass": 24,
+      "race_warnings": 0,
+      "raw_log_sha256": "4c8d6368a2ca48a15767398be6f3c1094ed2d30f7a9991ba8914f364c77c6c63",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T20:13:04.535440+00:00"
+    },
+    "selected_tests": [
+      "TestClientCloseAndWaitJoinsClientKeyPublisher",
+      "TestClientCloseAndWaitJoinsContractManagerWorkers",
+      "TestClientCloseAndWaitJoinsContractStatusCallback",
+      "TestClientCloseAndWaitJoinsEncryptedKeyPublisher",
+      "TestClientCloseAndWaitJoinsEncryptionSessionSupervisor",
+      "TestClientCloseAndWaitJoinsHeldForwardSequence",
+      "TestClientCloseAndWaitJoinsHeldLoopbackRelease",
+      "TestClientCloseAndWaitJoinsHeldReceiveSequence",
+      "TestClientCloseAndWaitJoinsHeldSendSequence",
+      "TestClientCloseAndWaitJoinsIntermediaryStreamChildren",
+      "TestClientCloseAndWaitJoinsPausedStreamOpen",
+      "TestClientCloseAndWaitJoinsSignalCompatibilityDelivery",
+      "TestClientCloseAndWaitPrefersCompletedLifecycleOverCanceledWaitContext",
+      "TestEveryPoolBufferEntryPointDeclaresItsOwnership",
+      "TestForwardBufferCallerCancelDuringAdmissionKeepsSiblings",
+      "TestForwardBufferCallerCancelKeepsAcceptedPackOwned",
+      "TestForwardBufferCallerCancelPreservesSharedAdmission",
+      "TestForwardBufferClosedSequenceStillRecreatesForLiveCaller",
+      "TestSendBufferCallerCancelDuringAdmissionKeepsSiblings",
+      "TestSendBufferCallerCancelKeepsAcceptedPackOwned",
+      "TestSendBufferCallerCancelPreservesSharedAdmission",
+      "TestSendBufferClosedSequenceStillRecreatesForLiveCaller",
+      "TestSendBufferSharesSequenceAcrossLocalRoutes",
+      "TestSendBufferSharesWireIdentityAcrossLocalRoutes"
+    ],
+    "source_content_sha256": "6d790f81d3ed2608e31e3971383d8d0d7046dd86952603b2c6103172849ea437",
+    "test_pattern": "^(TestClientCloseAndWait.*|TestSendBuffer.*|TestForwardBuffer.*|TestSendEncryptedControl.*|TestEveryPoolBufferEntryPointDeclaresItsOwnership)$"
+  }
+]

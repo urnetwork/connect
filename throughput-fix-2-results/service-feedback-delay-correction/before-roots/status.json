@@ -1,0 +1,38 @@
+{
+  "manifest_sha256": "d0bbf10c8bc93c5f911a8d901b1330c201551fa453b97c932a7726f7eafc11ac",
+  "binary_sha256": "57254af29ed1e6e295d8bd306d5cfe4e8c313493eba54254e516568735b72e7c",
+  "effective_inputs_sha256": "09ae9e2736a0b6f097d874683f44f67fdef20ef751558e8bb78e04332c245f92",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingLimitedFlight(LegacyTurnUsesOwnDelay|ReceiverHeldTurnUsesOwnDelay|DelayedAccountingUsesArrivalDelay|MetadataAfterLegacyUsesPairedDelay)$",
+    "-test.count=3",
+    "-test.timeout=90s"
+  ],
+  "started_utc": "2026-09-16T18:01:17.068083+00:00",
+  "loadavg_start": [
+    11.1826171875,
+    8.76318359375,
+    10.22314453125
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent retained-window implementation and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 1.7142026252113283,
+  "loadavg_end": [
+    11.1826171875,
+    8.76318359375,
+    10.22314453125
+  ],
+  "ended_utc": "2026-09-16T18:01:18.782556+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "abe6df2738e55ef6ae75e47f57f4eafbb2b2e5367d542551df9d30c1fbf05f94",
+  "pass": 9,
+  "fail": 3,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "rows": 3
+}

@@ -1,0 +1,10 @@
+{
+  "reason": "User deferred explicit connection-quality-change performance tests until NetworkQualityChanged is implemented and invoked at the modeled path switch.",
+  "tests": [
+    "TestWindowPathAckTailRoundTripGrowthControl",
+    "TestWindowPathServiceRoundTripChanges",
+    "TestWindowPathServiceRoundTripGrowthBeyondOldRing"
+  ],
+  "retained_core_coverage": "Static paths, cold and warm pacing recovery, sustained congestion, window changes, ACK scheduling, ownership and FIFO fixture correctness.",
+  "complete_historical_mode": "model"
+}

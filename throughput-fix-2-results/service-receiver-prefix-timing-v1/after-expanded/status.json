@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "28aeac8bafe0c5544529f9916ad8f03b48c3dc48a0862d81513f0f2bc91b4039",
+  "binary_sha256": "bd0504ad6e01e411f8af622270563c3e6c8def6f36bdd31c22ef8f7493f2a5e3",
+  "effective_inputs_sha256": "0236726ebda478b0c4a4fc6c19fbe4f59aac1f287c6907f64563ef8bb50e9a81",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacing(Receiver(EarlyIngressHeadCannotRetimePrefix|EarlyIngressSackKeepsPrefixRaw|OrderedIngressPrefixControl|PrefixZeroWaitKeepsRawClock|SackedPrefixKeepsNewHeadTiming|Credit.*|Ordering.*|WaitPreservesPhysicalSerialization|WaitStillDiscoversCorrectedSlowSerialization)|EqualReceiverWaitsDiscoverSlowSerialization|SdkCold.*)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as build; absolute relationship pinned by original status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T21:30:17.922240+00:00",
+  "loadavg_start": [
+    8.15185546875,
+    7.4892578125,
+    8.1796875
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 1.216139417141676,
+  "loadavg_end": [
+    8.15185546875,
+    7.4892578125,
+    8.1796875
+  ],
+  "ended_utc": "2026-09-16T21:30:19.138918+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "7f7768dc49915e4d8034a31ab62dec4924c44168e6af6c6813cf4228f94b5b4c",
+  "pass": 81,
+  "fail": 6,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "81P6F: early-ingress safety root fixed;27definitions pass. Two unchanged SDK cold exact-rate definitions fail because multi-envelope nonzero-wait prefix no longer supplies an exact receiver interval. Those policy/observation assumptions are disputed; no functional/static performance threshold changed.",
+  "rows": 24
+}

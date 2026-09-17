@@ -1,0 +1,33 @@
+[
+  {
+    "build_id": "worker-race",
+    "classification": "excluded-fixture-or-harness-diagnostic",
+    "raw_log_sha256": "904b405e26ea5d58b4e73d1d0eee76e4115d6ff7bd5c162e94f5a8c4f0462744",
+    "run_id": "worker",
+    "scope": "Excluded fixture diagnostic: producer blocked filling its queue before releasing the worker; terminated with SIGQUIT.",
+    "service_readings": 0,
+    "status": "excluded_fixture_or_harness_diagnostic"
+  },
+  {
+    "build_id": "receiver-counter-offer-filter-race",
+    "classification": "excluded-fixture-or-harness-diagnostic",
+    "raw_log_sha256": "db3961c81ec848d670dbce8bfb44e111b29f709d125f9c9cc72eb078294b5cc4",
+    "run_id": "receiver-counter-offer-filter",
+    "scope": "Excluded compile/launch diagnostic: wrong capacity test symbol; no test binary existed.",
+    "service_readings": 0,
+    "status": "excluded_fixture_or_harness_diagnostic"
+  },
+  {
+    "build_id": "receiver-counter-offer-filter-fixed-race",
+    "classification": "excluded-fixture-or-harness-diagnostic",
+    "raw_log_sha256": "dfec72c6b35dbde1b65fc9fd67208076fdac8930c6d7c5112130767689b57a5d",
+    "run_id": "receiver-counter-offer-filter-fixed-capacity",
+    "scope": "Excluded incomplete 60 s wall-time timeout; retains two completed upward model pairs, not a full pass.",
+    "service_readings": 4,
+    "status": "excluded_fixture_or_harness_diagnostic"
+  },
+  {
+    "classification": "excluded-compile-or-incomplete-artifact",
+    "reason": "Compile-only, nonexistent-binary, deadlock, or wall-time-incomplete material is excluded from successful test claims; its artifact pin remains in artifact-inventory-pins.json."
+  }
+]

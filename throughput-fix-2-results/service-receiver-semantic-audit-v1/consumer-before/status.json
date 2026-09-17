@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "c7afefd4c57aad9adbd1716fe3fc98a1b03685c832e64d6d7f2abe34f08588d8",
+  "binary_sha256": "b1a946a7bc4c1f5fe5f639e8c64986f22f7d60c205087f5ea6482b5ec174710d",
+  "effective_inputs_sha256": "b22c37362ada4fdcf794b4a0994dec28819e7a06b3554b497019baddafc1a557",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiverSustainedPacing",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied module as build; original absolute relationship is pinned by original status/manifest hashes",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:19:24.213327+00:00",
+  "loadavg_start": [
+    16.77978515625,
+    20.83203125,
+    18.28466796875
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 9.85483408300206,
+  "loadavg_end": [
+    17.4443359375,
+    20.8505859375,
+    18.3212890625
+  ],
+  "ended_utc": "2026-09-16T20:19:34.069607+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "4a341456b2c87721677bff45a12c99091b2a3215b19fab7657e0e0e59afdc63b",
+  "pass": 15,
+  "fail": 3,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "Historical open-loop estimate-consumer fixture: opening 64 times 12,000 bytes exceeds the largest lane 512 KiB permission, and each 12,000-byte item exceeds the 8 KiB physical limit. This is unreachable input evidence, not a demonstrated production failure. Legal v3 changes the opening, frame grouping and controller read frequency; see its separate passing result.",
+  "rows": 324
+}

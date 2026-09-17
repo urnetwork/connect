@@ -1,0 +1,11 @@
+{
+  "archive": "window-cumulative-pacing-carrier-scope-v2",
+  "payload_sha256": {
+    "outcomes.jsonl": "ae6fe20ab94805ad13e59dfd85fd703147190e87fd431f5b39b21a9715fff482",
+    "provenance.json": "8c1cbfda09c4423e72906c5efc529cb054562bcbaeccbb5c59f88a64df5454d3",
+    "source-manifest-after.json": "8b397c44d9a971ff71f131a7002eaaac6855d749632167ca85463593369b2298",
+    "source-manifest-before.json": "3dc2ca62bcd8f2753ea69e45b482046a5c9344cb3c95e1a298bd5d4ffdde9560",
+    "source-pins.json": "9375d2edd7ce4964be20b8e2d44cfb22209ea37cdb7dfa8ed8696d85eeaf8aa8",
+    "status.json": "84048d7e161b8c311fa5793117caf11b62c1f22cee81fb3dea5204d9bdfbfe33"
+  }
+}

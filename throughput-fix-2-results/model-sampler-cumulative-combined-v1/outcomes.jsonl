@@ -1,0 +1,17 @@
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingCumulativeGrowthRaisesColdRate", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingCumulativeSingleReplyKeepsBootstrap", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingCumulativeTinyRepliesKeepBootstrap", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingCumulativeMissingHistoryKeepsRetainedWindow", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingCumulativeStaleHistoryCannotReprice", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingCumulativePermissionStepRejectsOldRate", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingCumulativeSlowDeliveryLowersOnlyRate", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingCumulativeRateDefersToSlowService", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingCumulativeRatePreservesHardBounds", "variant": "candidate"}
+{"outcome": "FAIL", "seconds": "2.52s", "test": "TestWindowPathWindowMismatchChanges", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "0.65s", "test": "TestWindowPathServiceSettledLargeMessageCapacityChanges", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "0.08s", "test": "TestWindowPathServiceCapacityIncreaseRecovery", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "13.26s", "test": "TestWindowPathRetainedSdkCumulativePacingShort", "variant": "candidate"}
+{"outcome": "FAIL", "seconds": "2.02s", "test": "TestWindowPathRetainedSdkCumulativePacingLong", "variant": "candidate"}
+{"outcome": "FAIL", "seconds": "204.44s", "test": "TestWindowPathSdkProfiles", "variant": "candidate"}
+{"outcome": "PASS", "seconds": "0.20s", "test": "TestWindowPacingShortCompressedServiceKeepsMeasuredCapacity", "variant": "candidate"}
+{"outcome": "FAIL", "seconds": "2.19s", "test": "TestWindowPathServiceRoundTripGrowthBeyondOldRing", "variant": "candidate"}

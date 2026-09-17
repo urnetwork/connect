@@ -1,0 +1,36 @@
+{
+  "original_test_messages": [
+    {
+      "message": "transfer_window_h1_duplex_test.go:402: ceiling-before NAT/TUN refused or dropped traffic",
+      "variant": "before"
+    },
+    {
+      "message": "transfer_window_h1_duplex_test.go:402: delivery NAT/TUN refused or dropped traffic",
+      "variant": "before"
+    },
+    {
+      "message": "transfer_window_h1_duplex_test.go:402: ceiling-after NAT/TUN refused or dropped traffic",
+      "variant": "before"
+    },
+    {
+      "message": "transfer_window_h1_duplex_test.go:470: physical H1 duplex failures=[fixture, carrier or lifecycle gate failed direction0 candidate below90% matched reference direction0 wrong window policy direction1 candidate below90% matched reference aggregate candidate below90% matched reference] censors=[direction0 reference below90% of constrained window/feedback calibration direction0 reference below90% nominal1Gb/s direction1 reference below90% nominal1Gb/s]",
+      "variant": "before"
+    },
+    {
+      "message": "transfer_window_h1_duplex_test.go:402: ceiling-before NAT/TUN refused or dropped traffic",
+      "variant": "after"
+    },
+    {
+      "message": "transfer_window_h1_duplex_test.go:402: delivery NAT/TUN refused or dropped traffic",
+      "variant": "after"
+    },
+    {
+      "message": "transfer_window_h1_duplex_test.go:402: ceiling-after NAT/TUN refused or dropped traffic",
+      "variant": "after"
+    },
+    {
+      "message": "transfer_window_h1_duplex_test.go:470: physical H1 duplex failures=[fixture, carrier or lifecycle gate failed direction0 candidate below90% matched reference direction1 candidate below90% matched reference direction1 wrong window policy aggregate candidate below90% matched reference] censors=[direction0 reference below90% of constrained window/feedback calibration direction0 reference below90% nominal1Gb/s direction0 A/A drift above10% direction1 reference below90% nominal1Gb/s]",
+      "variant": "after"
+    }
+  ]
+}

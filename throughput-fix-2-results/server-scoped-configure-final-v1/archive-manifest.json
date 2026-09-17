@@ -1,0 +1,29 @@
+{
+  "created_utc": "2026-09-17T01:38:42.532429+00:00",
+  "scope": "Final audited non-database connect and proxy selections only.",
+  "file_sha256": {
+    "README.md": "363ea1546361b5f25311fa032666034b1def06ab10d9c8415ca2671a23df0646",
+    "connect/ledger.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "connect/manifest.json": "ac10c84d070c02dc73f73043a26a1ddc140d450ac99c77d2614e38e54dcc5a07",
+    "connect/outcomes.txt": "dfc47f9bee433ea794a726679f6a5a4de26c1cd9a30f79828a80b23c60924fd6",
+    "connect/run.log": "fb0fb34adf26b2f90ec24fc06411908a868b6516c73ea7f421d39a9aa0fe3349",
+    "connect/server-test-configure.sh.txt": "88e44acf15cb05ba630d83957665b68c26919504a50a3cd5386177710d684645",
+    "connect/server-test-environment.json": "f7d4ad37371ca5e7c44e0cef832f18b4574205978c3e783fd40f234f261a2ce8",
+    "connect/server-test-pattern.txt": "51358451d54b6d8a199970789ce67fb9b8c3a1ddd7a7c12efb17c45d00bfae09",
+    "connect/snapshot-inputs.json": "6a48ada1cc4539c8adcc4a0d9fc1a1cc679c7b93f55ab3d651e8991938f61d91",
+    "connect/status.json": "84f44870cfad3b38dff51d3fd9b64a768bdae6e1f92f2dd4b74e026d21319207",
+    "proxy/ledger.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "proxy/manifest.json": "522d55c931e41e10c72752807d012eff143796918aac63211f6eb12382e89b7c",
+    "proxy/outcomes.txt": "b3285cb7bb8e05c8afd2704505788e62283482e29b828cb726a04417edb33908",
+    "proxy/run.log": "9d73d1c83eccba88ba772d6cb208c6baa8f3260710ff61e29ece7a3b44b5d6e8",
+    "proxy/server-test-configure.sh.txt": "88e44acf15cb05ba630d83957665b68c26919504a50a3cd5386177710d684645",
+    "proxy/server-test-environment.json": "44393d882eca91041f56ee2960aafaacbd7a7c3c09242767d73785282fab6b6c",
+    "proxy/server-test-pattern.txt": "f33b17e135c864abeb167f4c58dde51fe5d1d727b0c9be36d276779559daf4f4",
+    "proxy/snapshot-inputs.json": "6a48ada1cc4539c8adcc4a0d9fc1a1cc679c7b93f55ab3d651e8991938f61d91",
+    "proxy/status.json": "e902623953905c0884e4e716d7ff54f6664a4a8b601fce42eba1d2ff77b20171",
+    "runner/throughput-fix-2-server-env-test.py.txt": "d24280ec74a92b362bf7b57bdea5ca5193c07bb11d8b9c60df56c202912f4ea8",
+    "runner/throughput-fix-2-server-env.py.txt": "371fcad122cfafba91620a2846776c4c5c1a4ca72e658b755f985b80344c14b7",
+    "runner/throughput-fix-2-server-tests.json.txt": "4b6d087ef7cc37e72f0dabdeee93fdec197004eea442064847863ab6606a9dc8",
+    "runner/throughput-fix-2.sh.txt": "80565912ce0e724922397cf6c8be6bc713bf9fb69cb1abaa4daf3c4f185ac524"
+  }
+}

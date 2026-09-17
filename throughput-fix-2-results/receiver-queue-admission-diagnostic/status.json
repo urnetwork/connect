@@ -1,0 +1,6 @@
+{
+  "classification": "Experimental actual queued-read endpoint omission:6pass3fail before,9pass then75focuspass after; no broad/wire acceptance",
+  "outcomes": 93,
+  "readings": 0,
+  "worker_readings": 27
+}

@@ -1,0 +1,382 @@
+// Qualified lane delivery is consumed by the real shared pacing clock. The
+// utilization checks below are policy objectives; byte/probe ownership and
+// exclusion of unrelated evidence are independent hard invariants.
+package connect
+
+import (
+	"context"
+	"testing"
+	"testing/synctest"
+	"time"
+)
+
+// Every physical write fits 8 KiB. A cumulative head may cover several such
+// writes, and its complete flight remains within the actual opening window.
+const windowCumulativeSharedMessageBytes = ByteCount(8 * 1024)
+
+// No sockets or background source are needed: explicit confirmed write tails,
+// complete ACKs and virtual clock events drive the same service ownership.
+type windowCumulativeSharedFixture struct {
+	sequences []*SendSequence
+	numbers   []uint64
+	published map[*windowPacingService]ByteCount
+	period    time.Duration
+}
+
+// Groups identify independent destination services. Members of one group
+// include idle references, so reference count is never a capacity multiplier.
+func newWindowCumulativeSharedFixture(t *testing.T, groups []int) *windowCumulativeSharedFixture {
+	t.Helper()
+	fixture := &windowCumulativeSharedFixture{
+		numbers: make([]uint64, len(groups)), published: map[*windowPacingService]ByteCount{},
+	}
+	services := map[int]*windowPacingService{}
+	for _, group := range groups {
+		sequence, _ := newWindowCumulativePacingFixture(t)
+		sequence.receiveWindowSetAtNanos.Store(time.Now().UnixNano())
+		service := services[group]
+		if service == nil {
+			service = sequence.windowPacer.service
+			services[group] = service
+		}
+		service.references++
+		sequence.windowPacer.service = service
+		sequence.windowPacer.serviceSequenceId = sequence.sequenceId
+		fixture.sequences = append(fixture.sequences, sequence)
+	}
+	t.Cleanup(func() {
+		for _, sequence := range fixture.sequences {
+			sequence.windowPacer.close()
+		}
+		for service, published := range fixture.published {
+			if service.sent != published || service.total != published || service.pacingReservations != 0 ||
+				service.reservedByteCount != 0 || service.waiterHead != nil || service.waiterTail != nil {
+				t.Errorf("shared reservation cleanup lost byte ownership: sent=%d total=%d published=%d reservations=%d reserved=%d",
+					service.sent, service.total, published, service.pacingReservations, service.reservedByteCount)
+			}
+		}
+	})
+	return fixture
+}
+
+// Spend each service's opening allowance through actual reservations and
+// confirmed writes, then ACK that bounded flight. No counter is injected to
+// disable discovery, and an idle sibling never receives another allowance.
+func (self *windowCumulativeSharedFixture) spendProbe(t *testing.T) {
+	t.Helper()
+	seen := map[*windowPacingService]bool{}
+	for index, sequence := range self.sequences {
+		service := sequence.windowPacer.service
+		if seen[service] {
+			continue
+		}
+		seen[service] = true
+		estimate := sequence.sendWindowEstimate(time.Now())
+		if estimate.PacingProbeByteCount <= 0 || estimate.PacingProbeByteCount > estimate.Window {
+			t.Fatalf("opening probe exceeded admitted flight: %+v", estimate)
+		}
+		pacer := &sequence.windowPacer
+		pacer.rate, pacer.estimateRate = estimate.PacingByteRate, estimate.ServiceByteRate
+		pacer.probeRate, pacer.probeLimit = estimate.PacingProbeByteRate, estimate.PacingProbeByteCount
+		started := time.Now()
+		var head Id
+		for remaining := estimate.PacingProbeByteCount; remaining > 0; {
+			bytes := min(remaining, windowCumulativeSharedMessageBytes)
+			self.numbers[index]++
+			head = NewId()
+			if err := pacer.waitForServiceMessage(context.Background(), int(bytes), false,
+				sequence.sequenceId, head, self.numbers[index]); err != nil {
+				t.Fatal(err)
+			}
+			service.finishWrite(sequence.sequenceId, head, true)
+			remaining -= bytes
+		}
+		// This explicit feedback event allows a 125 MB/s serializer more
+		// than enough time for the complete 512 KiB opening.
+		time.Sleep(10 * time.Millisecond)
+		at := time.Now()
+		sequence.rttWindow.closeSendTime(uint64(started.UnixMilli()), at)
+		service.acknowledgeWrite(sequence.sequenceId, head, self.numbers[index], false, 0, at)
+		service.observe(estimate.PacingProbeByteCount, at)
+		sequence.observeAckedBytesWithServiceCredit(estimate.PacingProbeByteCount, 0, windowServiceAckCredit{}, at)
+		pacer.serviceAcked += estimate.PacingProbeByteCount
+		self.published[service] += estimate.PacingProbeByteCount
+		if service.probeSent != estimate.PacingProbeByteCount {
+			t.Fatalf("real opening reservations did not spend the probe: %d/%d", service.probeSent, estimate.PacingProbeByteCount)
+		}
+	}
+}
+
+// Eight complete flights leave contemporaneous multi-RTT logical intervals.
+// Sibling ACKs are ordered 10 us apart, shorter than a raw service interval;
+// a fully drained turn therefore supplies no serialization-capacity pair.
+func (self *windowCumulativeSharedFixture) deliver(t *testing.T, flights []ByteCount) {
+	t.Helper()
+	active := 0
+	for _, bytes := range flights {
+		if bytes > 0 {
+			active++
+		}
+	}
+	if len(flights) != len(self.sequences) || active == 0 {
+		t.Fatal("invalid explicit delivery schedule")
+	}
+	self.period = 10*time.Millisecond + time.Duration(active-1)*10*time.Microsecond
+	for range 8 {
+		started := time.Now()
+		heads := make([]Id, len(self.sequences))
+		groupBytes := map[*windowPacingService]ByteCount{}
+		for index, sequence := range self.sequences {
+			bytes := flights[index]
+			if bytes == 0 {
+				continue
+			}
+			if bytes > sequence.sendWindowEstimate(started).Window {
+				t.Fatal("a complete training flight exceeded its effective window")
+			}
+			service := sequence.windowPacer.service
+			groupBytes[service] += bytes
+			for remaining := bytes; remaining > 0; {
+				messageBytes := min(remaining, windowCumulativeSharedMessageBytes)
+				self.numbers[index]++
+				heads[index] = NewId()
+				service.sent += messageBytes
+				sequence.windowPacer.serviceSent += messageBytes
+				service.beginWrite(sequence.sequenceId, heads[index], self.numbers[index], started, false)
+				service.finishWrite(sequence.sequenceId, heads[index], true)
+				remaining -= messageBytes
+			}
+		}
+		for _, bytes := range groupBytes {
+			if float64(bytes)/self.period.Seconds() >= 125000000 {
+				t.Fatal("training schedule exceeded the independent serializer or configured target")
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		first := true
+		for index, sequence := range self.sequences {
+			bytes := flights[index]
+			if bytes == 0 {
+				continue
+			}
+			if !first {
+				time.Sleep(10 * time.Microsecond)
+			}
+			first = false
+			at := time.Now()
+			service := sequence.windowPacer.service
+			sequence.rttWindow.closeSendTime(uint64(started.UnixMilli()), at)
+			service.acknowledgeWrite(sequence.sequenceId, heads[index], self.numbers[index], false, 0, at)
+			service.observe(bytes, at)
+			sequence.observeAckedBytesWithServiceCredit(bytes, 0, windowServiceAckCredit{}, at)
+			sequence.windowPacer.serviceAcked += bytes
+			self.published[service] += bytes
+		}
+		for service := range groupBytes {
+			rate, _, held := service.measured(time.Second, time.Now())
+			if rate != 0 || held != 0 || !service.drained || service.pendingWrites != 0 ||
+				service.sent != self.published[service] || service.total != self.published[service] {
+				t.Fatalf("cold complete flights changed service or ownership: rate=%d held=%d drained=%t pending=%d sent=%d total=%d published=%d",
+					rate, held, service.drained, service.pendingWrites, service.sent, service.total, self.published[service])
+			}
+		}
+	}
+}
+
+// One fixed, still-fresh estimate controls at most three earlier flight
+// amounts. The virtual deadline is their observed delivery duration, not a
+// host-time performance threshold or an exact required estimator output.
+type windowCumulativeSharedRelease struct {
+	elapsed   time.Duration
+	released  ByteCount
+	requested ByteCount
+	complete  bool
+}
+
+// Exercise both reservation and dispatch; summing reported lane rates would
+// miss their consumption of one global timeline and one shared burst meter.
+func (self *windowCumulativeSharedFixture) consume(t *testing.T, flights []ByteCount) windowCumulativeSharedRelease {
+	t.Helper()
+	started := time.Now()
+	span := 3 * self.period
+	ctx, cancel := context.WithDeadline(context.Background(), started.Add(span))
+	defer cancel()
+	remaining := make([]ByteCount, len(flights))
+	probes := map[*windowPacingService]ByteCount{}
+	offered := map[*windowPacingService]ByteCount{}
+	result := windowCumulativeSharedRelease{complete: true}
+	for index, sequence := range self.sequences {
+		if flights[index] == 0 {
+			continue
+		}
+		estimate := sequence.sendWindowEstimate(started)
+		if !estimate.Sized || estimate.DeliveryByteRate <= 0 || estimate.ServiceByteRate != 0 ||
+			3*flights[index] > estimate.Window || estimate.Window > estimate.Ceiling ||
+			estimate.PacingByteRate > estimate.PacingProbeByteRate {
+			t.Fatalf("consumer lost qualified cold evidence or bounds: lane=%d %+v", index, estimate)
+		}
+		if span+time.Duration(len(flights))*10*time.Microsecond > max(2*estimate.WindowRoundTrip, 4*sequence.deliveredBytesSampleIntervalAt(started)) {
+			t.Fatal("consumer decision would outlive its evidence freshness")
+		}
+		pacer := &sequence.windowPacer
+		pacer.rate, pacer.estimateRate = estimate.PacingByteRate, estimate.ServiceByteRate
+		pacer.probeRate, pacer.probeLimit = estimate.PacingProbeByteRate, estimate.PacingProbeByteCount
+		probes[pacer.service] = pacer.service.probeSent
+		if pacer.service.probeSent < pacer.probeLimit {
+			t.Fatal("consumer still has an unspent opening probe")
+		}
+		remaining[index] = 3 * flights[index]
+		result.requested += remaining[index]
+	}
+	for result.released < result.requested && result.complete {
+		for index, sequence := range self.sequences {
+			if remaining[index] == 0 {
+				continue
+			}
+			bytes := min(remaining[index], ByteCount(1024))
+			service := sequence.windowPacer.service
+			offered[service] += bytes
+			if err := sequence.windowPacer.waitForService(ctx, int(bytes)); err != nil {
+				if err != context.DeadlineExceeded {
+					t.Fatal(err)
+				}
+				result.complete = false
+				break
+			}
+			remaining[index] -= bytes
+			result.released += bytes
+		}
+	}
+	result.elapsed = time.Since(started)
+	for service, published := range self.published {
+		if service.sent != published+offered[service] || service.total != published || service.pacingReservations != 0 ||
+			service.reservedByteCount != 0 || service.waiterHead != nil || service.waiterTail != nil {
+			t.Fatal("consumer lost exact offered-byte ownership or retained a waiter")
+		}
+		if probe, used := probes[service]; used && service.probeSent != probe {
+			t.Fatal("a sibling replenished the spent opening probe")
+		}
+	}
+	for index, sequence := range self.sequences {
+		if flights[index] > 0 && sequence.sendWindowSnapshot(time.Now()).DeliveryByteRate <= 0 {
+			t.Fatal("consumer result depended on stale cumulative evidence")
+		}
+	}
+	return result
+}
+
+// Splitting contemporaneous delivered work into logical lanes must not divide
+// the next aggregate pacing allowance by that lane count. Zero service itself
+// is valid; the assertion concerns the resulting shared release target.
+func TestWindowPacingCumulativeSharedReservePreservesAggregateDelivery(t *testing.T) {
+	for _, lanes := range []int{1, 2, 4} {
+		synctest.Test(t, func(t *testing.T) {
+			groups, flights := make([]int, lanes), make([]ByteCount, lanes)
+			for index := range flights {
+				flights[index] = 8 * 1024
+			}
+			fixture := newWindowCumulativeSharedFixture(t, groups)
+			fixture.spendProbe(t)
+			fixture.deliver(t, flights)
+			result := fixture.consume(t, flights)
+			t.Logf("lanes=%d result=%+v observed-round=%s", lanes, result, fixture.period)
+			if !result.complete {
+				t.Errorf("qualified lane rates underfilled the shared delivery target: lanes=%d result=%+v", lanes, result)
+			}
+		})
+	}
+}
+
+// Unequal shares also describe one aggregate observation; equal-flow count
+// multiplication is not a general interpretation of their evidence.
+func TestWindowPacingCumulativeSharedReservePreservesUnequalDelivery(t *testing.T) {
+	for _, flights := range [][]ByteCount{{8 * 1024, 24 * 1024}, {8 * 1024, 8 * 1024, 16 * 1024, 32 * 1024}} {
+		synctest.Test(t, func(t *testing.T) {
+			fixture := newWindowCumulativeSharedFixture(t, make([]int, len(flights)))
+			fixture.spendProbe(t)
+			fixture.deliver(t, flights)
+			result := fixture.consume(t, flights)
+			t.Logf("flights=%v result=%+v observed-round=%s", flights, result, fixture.period)
+			if !result.complete {
+				t.Errorf("unequal qualified shares underfilled their aggregate delivery target: flights=%v result=%+v", flights, result)
+			}
+		})
+	}
+}
+
+// Idle references and an expired earlier lane cannot multiply the fresh
+// lane's release. Compare the real consumer against the same one-lane input.
+func TestWindowPacingCumulativeSharedReserveExcludesIdleAndStale(t *testing.T) {
+	var baseline windowCumulativeSharedRelease
+	for _, extras := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			groups := []int{0}
+			if extras {
+				groups = []int{0, 0, 0}
+			}
+			fixture := newWindowCumulativeSharedFixture(t, groups)
+			fixture.spendProbe(t)
+			if extras {
+				fixture.deliver(t, []ByteCount{0, 128 * 1024, 0})
+			}
+			flights := make([]ByteCount, len(groups))
+			flights[0] = 8 * 1024
+			fixture.deliver(t, flights)
+			if extras {
+				for _, index := range []int{1, 2} {
+					if estimate := fixture.sequences[index].sendWindowEstimate(time.Now()); estimate.DeliveryByteRate != 0 {
+						t.Fatalf("idle/stale control unexpectedly has fresh delivery: lane=%d %+v", index, estimate)
+					}
+				}
+			}
+			result := fixture.consume(t, flights)
+			if !result.complete {
+				t.Fatalf("single fresh lane failed its positive release control: %+v", result)
+			}
+			if !extras {
+				baseline = result
+			} else if result != baseline {
+				t.Errorf("idle/stale siblings repriced fresh release: baseline=%+v extras=%+v", baseline, result)
+			}
+		})
+	}
+}
+
+// Fresh fast delivery from another destination service cannot reprice this
+// service. Both are trained at the same times, so this is not a stale guard.
+func TestWindowPacingCumulativeSharedReserveKeepsServicesIndependent(t *testing.T) {
+	var baseline windowCumulativeSharedRelease
+	for _, foreign := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			groups, training := []int{0}, []ByteCount{8 * 1024}
+			if foreign {
+				groups, training = []int{0, 1}, []ByteCount{8 * 1024, 128 * 1024}
+			}
+			fixture := newWindowCumulativeSharedFixture(t, groups)
+			fixture.spendProbe(t)
+			fixture.deliver(t, training)
+			if foreign {
+				own := fixture.sequences[0].sendWindowEstimate(time.Now())
+				other := fixture.sequences[1].sendWindowEstimate(time.Now())
+				if other.ServiceByteRate != 0 || other.DeliveryByteRate <= 8*own.DeliveryByteRate ||
+					fixture.sequences[0].windowPacer.service == fixture.sequences[1].windowPacer.service {
+					t.Fatal("independent service control lost fresh faster evidence")
+				}
+			}
+			flights := make([]ByteCount, len(groups))
+			flights[0] = 8 * 1024
+			result := fixture.consume(t, flights)
+			if !result.complete {
+				t.Fatalf("single destination failed its positive release control: %+v", result)
+			}
+			if !foreign {
+				baseline = result
+			} else if result.released != baseline.released || result.requested != baseline.requested ||
+				result.elapsed < baseline.elapsed {
+				// The second reply adds 10 us to the common training period;
+				// that can only make the own measured rate slightly lower.
+				t.Errorf("another service made own release faster: baseline=%+v foreign=%+v", baseline, result)
+			}
+		})
+	}
+}

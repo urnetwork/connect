@@ -1,0 +1,5 @@
+{
+  "comparison": "before retained-window behavior versus v1 retained admission sizing.",
+  "raw_logs": "Retained outside the archive; hashes, terminal outcomes, numerical readings, worker rows, source pins, and load context are preserved here.",
+  "scope": "Full original throughput model pattern, count=1, independently frozen before/after sources."
+}

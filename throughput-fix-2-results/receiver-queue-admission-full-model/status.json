@@ -1,0 +1,6 @@
+{
+  "classification": "Full original model passes with queued-endpoint omission; separately rejected by upstream buffering roots",
+  "outcomes": 27,
+  "readings": 818,
+  "worker_readings": 0
+}

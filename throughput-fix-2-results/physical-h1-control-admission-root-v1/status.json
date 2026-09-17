@@ -1,0 +1,6 @@
+{
+  "classification": "Deterministic open regression: a dedicated TCP acknowledgement is lost at temporary H1 count admission; positive capacity and shared-callback refusal controls pass.",
+  "outcomes": 9,
+  "readings": 0,
+  "worker_readings": 0
+}

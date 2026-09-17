@@ -1,0 +1,25 @@
+=== RUN   TestWindowPacingLimitedFlightLegacyTurnUsesOwnDelay
+--- PASS: TestWindowPacingLimitedFlightLegacyTurnUsesOwnDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightReceiverHeldTurnUsesOwnDelay
+--- PASS: TestWindowPacingLimitedFlightReceiverHeldTurnUsesOwnDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightDelayedAccountingUsesArrivalDelay
+--- PASS: TestWindowPacingLimitedFlightDelayedAccountingUsesArrivalDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightMetadataAfterLegacyUsesPairedDelay
+--- PASS: TestWindowPacingLimitedFlightMetadataAfterLegacyUsesPairedDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightLegacyTurnUsesOwnDelay
+--- PASS: TestWindowPacingLimitedFlightLegacyTurnUsesOwnDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightReceiverHeldTurnUsesOwnDelay
+--- PASS: TestWindowPacingLimitedFlightReceiverHeldTurnUsesOwnDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightDelayedAccountingUsesArrivalDelay
+--- PASS: TestWindowPacingLimitedFlightDelayedAccountingUsesArrivalDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightMetadataAfterLegacyUsesPairedDelay
+--- PASS: TestWindowPacingLimitedFlightMetadataAfterLegacyUsesPairedDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightLegacyTurnUsesOwnDelay
+--- PASS: TestWindowPacingLimitedFlightLegacyTurnUsesOwnDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightReceiverHeldTurnUsesOwnDelay
+--- PASS: TestWindowPacingLimitedFlightReceiverHeldTurnUsesOwnDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightDelayedAccountingUsesArrivalDelay
+--- PASS: TestWindowPacingLimitedFlightDelayedAccountingUsesArrivalDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightMetadataAfterLegacyUsesPairedDelay
+--- PASS: TestWindowPacingLimitedFlightMetadataAfterLegacyUsesPairedDelay (0.00s)
+PASS

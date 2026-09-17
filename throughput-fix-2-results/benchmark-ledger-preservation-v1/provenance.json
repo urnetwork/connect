@@ -1,0 +1,10 @@
+{
+  "new_extracted_program_sha256": "defa00bcdc9527bdaa1f21b89070e1f1d680571d1145685cb397806fd691f3ee",
+  "old_extracted_program_sha256": "61170a280af833acefe269be8b86c79d3db563bddd86ed1e7ec94502c1994783",
+  "outcome": "The old collector omitted all nine measurements. The corrected copied-source parser preserves all five metrics in each row and keeps every repetition.",
+  "production_change": false,
+  "raw_logs": "Remain local; only numerical readings and hashes are exported.",
+  "row_completeness": "Metric validity applies only to emitted rows. Complete fixture preservation also requires all nine rows, so the empty old ledger explicitly fails completeness.",
+  "scope": "Execute the actual old and corrected runner ledger programs against one identical completed nine-row benchmark log. No benchmark workload is repeated.",
+  "test_source_sha256": "9c533eaa2933aa013aad4ff0576d301ef94c590fa4b0c24973010c11233fefef"
+}

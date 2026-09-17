@@ -1,0 +1,175 @@
+=== RUN   TestWindowPacingReceiverCreditRejectsUnprovedHeads
+--- PASS: TestWindowPacingReceiverCreditRejectsUnprovedHeads (0.00s)
+=== RUN   TestWindowPacingReceiverCreditMixedPrefixKeepsRawInterval
+--- PASS: TestWindowPacingReceiverCreditMixedPrefixKeepsRawInterval (0.00s)
+=== RUN   TestWindowPacingReceiverCreditSiblingCannotRetimeLegacyHead
+--- PASS: TestWindowPacingReceiverCreditSiblingCannotRetimeLegacyHead (0.00s)
+=== RUN   TestWindowPacingReceiverCreditDelayedAccountingKeepsOwnWait
+--- PASS: TestWindowPacingReceiverCreditDelayedAccountingKeepsOwnWait (0.00s)
+=== RUN   TestWindowPacingReceiverCreditSackedHeadKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverCreditSackedHeadKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverCreditNonpositiveIntervalCannotGrantCapacity
+--- PASS: TestWindowPacingReceiverCreditNonpositiveIntervalCannotGrantCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingInteriorReplyCannotRaiseCapacity
+--- PASS: TestWindowPacingReceiverOrderingInteriorReplyCannotRaiseCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingEarliestBytesStayWithTheirEndpoint
+--- PASS: TestWindowPacingReceiverOrderingEarliestBytesStayWithTheirEndpoint (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingEqualCheckpointCannotCountEarlierBytes
+--- PASS: TestWindowPacingReceiverOrderingEqualCheckpointCannotCountEarlierBytes (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingDelayedCreditCannotHideReversal
+--- PASS: TestWindowPacingReceiverOrderingDelayedCreditCannotHideReversal (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingResizeCannotRestoreInvalidInterval
+--- PASS: TestWindowPacingReceiverOrderingResizeCannotRestoreInvalidInterval (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingWarmIntervalCannotRaiseCapacity
+--- PASS: TestWindowPacingReceiverOrderingWarmIntervalCannotRaiseCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingMonotoneDeliveryKeepsCapacity
+--- PASS: TestWindowPacingReceiverOrderingMonotoneDeliveryKeepsCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingLaterPairSupersedesInvalidHistory
+--- PASS: TestWindowPacingReceiverOrderingLaterPairSupersedesInvalidHistory (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix
+--- PASS: TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedIngressPrefixControl
+--- PASS: TestWindowPacingReceiverOrderedIngressPrefixControl (0.00s)
+=== RUN   TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock
+--- PASS: TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock (0.00s)
+=== RUN   TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming
+--- PASS: TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming (0.00s)
+=== RUN   TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain
+--- FAIL: TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain (0.00s)
+=== RUN   TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound
+--- PASS: TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound (0.00s)
+=== RUN   TestWindowPacingSdkColdEqualWaitsDiscoverSlowService
+--- PASS: TestWindowPacingSdkColdEqualWaitsDiscoverSlowService (0.00s)
+=== RUN   TestWindowPacingSdkColdDrainedTrainUsesExactPair
+--- FAIL: TestWindowPacingSdkColdDrainedTrainUsesExactPair (0.00s)
+=== RUN   TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured
+--- PASS: TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured (0.00s)
+=== RUN   TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved
+--- PASS: TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved (0.03s)
+=== RUN   TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity
+--- PASS: TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity (0.01s)
+=== RUN   TestWindowPacingReceiverWaitPreservesPhysicalSerialization
+--- PASS: TestWindowPacingReceiverWaitPreservesPhysicalSerialization (0.00s)
+=== RUN   TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization
+--- PASS: TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization
+--- PASS: TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverCreditRejectsUnprovedHeads
+--- PASS: TestWindowPacingReceiverCreditRejectsUnprovedHeads (0.00s)
+=== RUN   TestWindowPacingReceiverCreditMixedPrefixKeepsRawInterval
+--- PASS: TestWindowPacingReceiverCreditMixedPrefixKeepsRawInterval (0.00s)
+=== RUN   TestWindowPacingReceiverCreditSiblingCannotRetimeLegacyHead
+--- PASS: TestWindowPacingReceiverCreditSiblingCannotRetimeLegacyHead (0.00s)
+=== RUN   TestWindowPacingReceiverCreditDelayedAccountingKeepsOwnWait
+--- PASS: TestWindowPacingReceiverCreditDelayedAccountingKeepsOwnWait (0.00s)
+=== RUN   TestWindowPacingReceiverCreditSackedHeadKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverCreditSackedHeadKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverCreditNonpositiveIntervalCannotGrantCapacity
+--- PASS: TestWindowPacingReceiverCreditNonpositiveIntervalCannotGrantCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingInteriorReplyCannotRaiseCapacity
+--- PASS: TestWindowPacingReceiverOrderingInteriorReplyCannotRaiseCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingEarliestBytesStayWithTheirEndpoint
+--- PASS: TestWindowPacingReceiverOrderingEarliestBytesStayWithTheirEndpoint (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingEqualCheckpointCannotCountEarlierBytes
+--- PASS: TestWindowPacingReceiverOrderingEqualCheckpointCannotCountEarlierBytes (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingDelayedCreditCannotHideReversal
+--- PASS: TestWindowPacingReceiverOrderingDelayedCreditCannotHideReversal (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingResizeCannotRestoreInvalidInterval
+--- PASS: TestWindowPacingReceiverOrderingResizeCannotRestoreInvalidInterval (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingWarmIntervalCannotRaiseCapacity
+--- PASS: TestWindowPacingReceiverOrderingWarmIntervalCannotRaiseCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingMonotoneDeliveryKeepsCapacity
+--- PASS: TestWindowPacingReceiverOrderingMonotoneDeliveryKeepsCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingLaterPairSupersedesInvalidHistory
+--- PASS: TestWindowPacingReceiverOrderingLaterPairSupersedesInvalidHistory (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix
+--- PASS: TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedIngressPrefixControl
+--- PASS: TestWindowPacingReceiverOrderedIngressPrefixControl (0.00s)
+=== RUN   TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock
+--- PASS: TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock (0.00s)
+=== RUN   TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming
+--- PASS: TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming (0.00s)
+=== RUN   TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain
+--- FAIL: TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain (0.02s)
+=== RUN   TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound
+--- PASS: TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound (0.00s)
+=== RUN   TestWindowPacingSdkColdEqualWaitsDiscoverSlowService
+--- PASS: TestWindowPacingSdkColdEqualWaitsDiscoverSlowService (0.00s)
+=== RUN   TestWindowPacingSdkColdDrainedTrainUsesExactPair
+--- FAIL: TestWindowPacingSdkColdDrainedTrainUsesExactPair (0.00s)
+=== RUN   TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured
+--- PASS: TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured (0.00s)
+=== RUN   TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved
+--- PASS: TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved (0.02s)
+=== RUN   TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity
+--- PASS: TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity (0.01s)
+=== RUN   TestWindowPacingReceiverWaitPreservesPhysicalSerialization
+--- PASS: TestWindowPacingReceiverWaitPreservesPhysicalSerialization (0.00s)
+=== RUN   TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization
+--- PASS: TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization
+--- PASS: TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverCreditRejectsUnprovedHeads
+--- PASS: TestWindowPacingReceiverCreditRejectsUnprovedHeads (0.00s)
+=== RUN   TestWindowPacingReceiverCreditMixedPrefixKeepsRawInterval
+--- PASS: TestWindowPacingReceiverCreditMixedPrefixKeepsRawInterval (0.00s)
+=== RUN   TestWindowPacingReceiverCreditSiblingCannotRetimeLegacyHead
+--- PASS: TestWindowPacingReceiverCreditSiblingCannotRetimeLegacyHead (0.00s)
+=== RUN   TestWindowPacingReceiverCreditDelayedAccountingKeepsOwnWait
+--- PASS: TestWindowPacingReceiverCreditDelayedAccountingKeepsOwnWait (0.00s)
+=== RUN   TestWindowPacingReceiverCreditSackedHeadKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverCreditSackedHeadKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverCreditNonpositiveIntervalCannotGrantCapacity
+--- PASS: TestWindowPacingReceiverCreditNonpositiveIntervalCannotGrantCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingInteriorReplyCannotRaiseCapacity
+--- PASS: TestWindowPacingReceiverOrderingInteriorReplyCannotRaiseCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingEarliestBytesStayWithTheirEndpoint
+--- PASS: TestWindowPacingReceiverOrderingEarliestBytesStayWithTheirEndpoint (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingEqualCheckpointCannotCountEarlierBytes
+--- PASS: TestWindowPacingReceiverOrderingEqualCheckpointCannotCountEarlierBytes (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingDelayedCreditCannotHideReversal
+--- PASS: TestWindowPacingReceiverOrderingDelayedCreditCannotHideReversal (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingResizeCannotRestoreInvalidInterval
+--- PASS: TestWindowPacingReceiverOrderingResizeCannotRestoreInvalidInterval (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingWarmIntervalCannotRaiseCapacity
+--- PASS: TestWindowPacingReceiverOrderingWarmIntervalCannotRaiseCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingMonotoneDeliveryKeepsCapacity
+--- PASS: TestWindowPacingReceiverOrderingMonotoneDeliveryKeepsCapacity (0.00s)
+=== RUN   TestWindowPacingReceiverOrderingLaterPairSupersedesInvalidHistory
+--- PASS: TestWindowPacingReceiverOrderingLaterPairSupersedesInvalidHistory (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix
+--- PASS: TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedIngressPrefixControl
+--- PASS: TestWindowPacingReceiverOrderedIngressPrefixControl (0.00s)
+=== RUN   TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock
+--- PASS: TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock (0.00s)
+=== RUN   TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming
+--- PASS: TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming (0.00s)
+=== RUN   TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain
+--- FAIL: TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain (0.00s)
+=== RUN   TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound
+--- PASS: TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound (0.00s)
+=== RUN   TestWindowPacingSdkColdEqualWaitsDiscoverSlowService
+--- PASS: TestWindowPacingSdkColdEqualWaitsDiscoverSlowService (0.00s)
+=== RUN   TestWindowPacingSdkColdDrainedTrainUsesExactPair
+--- FAIL: TestWindowPacingSdkColdDrainedTrainUsesExactPair (0.00s)
+=== RUN   TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured
+--- PASS: TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured (0.00s)
+=== RUN   TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved
+--- PASS: TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved (0.02s)
+=== RUN   TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity
+--- PASS: TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity (0.01s)
+=== RUN   TestWindowPacingReceiverWaitPreservesPhysicalSerialization
+--- PASS: TestWindowPacingReceiverWaitPreservesPhysicalSerialization (0.00s)
+=== RUN   TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization
+--- PASS: TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization
+--- PASS: TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization (0.00s)
+FAIL

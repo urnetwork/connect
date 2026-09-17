@@ -1,0 +1,6 @@
+{
+  "classification": "Experimental queue endpoint exclusion: eight affected performance tests pass; full model and wire validation remain separate",
+  "outcomes": 8,
+  "readings": 38,
+  "worker_readings": 0
+}

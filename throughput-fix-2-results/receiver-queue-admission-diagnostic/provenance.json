@@ -1,0 +1,8 @@
+{
+  "limitations": [
+    "Test-only receiver lookup; no wire schema",
+    "Does not identify prior kernel/socket buffering",
+    "Fixture pair-count precondition applies only to positive unqueued controls in both before/after; service/burst bounds unchanged"
+  ],
+  "scope": "MultiRouteSelector first-pass nonblocking read reports alreadyqueued; Client still counts physical bytes and withholds that named receiver endpoint"
+}

@@ -1,0 +1,121 @@
+=== RUN   TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix
+--- PASS: TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedIngressPrefixControl
+--- PASS: TestWindowPacingReceiverOrderedIngressPrefixControl (0.00s)
+=== RUN   TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock
+--- PASS: TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock (0.00s)
+=== RUN   TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming
+--- PASS: TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming (0.00s)
+=== RUN   TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo
+--- PASS: TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo (0.00s)
+=== RUN   TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded
+--- PASS: TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded (0.00s)
+=== RUN   TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound
+--- PASS: TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound (0.00s)
+=== RUN   TestWindowPacingSdkColdEqualWaitsDiscoverSlowService
+--- PASS: TestWindowPacingSdkColdEqualWaitsDiscoverSlowService (0.00s)
+=== RUN   TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks
+--- PASS: TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks (0.00s)
+=== RUN   TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured
+--- PASS: TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured (0.00s)
+=== RUN   TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved
+--- PASS: TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved (0.03s)
+=== RUN   TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity
+--- PASS: TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity (0.01s)
+=== RUN   TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization
+--- PASS: TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryPreservesTiesAndOldestOffer
+--- PASS: TestWindowPacingAggregateDeliveryPreservesTiesAndOldestOffer (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryUsesRecentFreshInterval
+--- PASS: TestWindowPacingAggregateDeliveryUsesRecentFreshInterval (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryRejectsIncompleteOffers
+--- PASS: TestWindowPacingAggregateDeliveryRejectsIncompleteOffers (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryRejectsRetiredModuloSlot
+--- PASS: TestWindowPacingAggregateDeliveryRejectsRetiredModuloSlot (0.00s)
+=== RUN   TestWindowPacingAggregateOfferedBoundExpiresFastHistory
+--- PASS: TestWindowPacingAggregateOfferedBoundExpiresFastHistory (0.00s)
+=== RUN   TestWindowPacingAggregateOfferedBoundRespectsPendingDrain
+--- PASS: TestWindowPacingAggregateOfferedBoundRespectsPendingDrain (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix
+--- PASS: TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedIngressPrefixControl
+--- PASS: TestWindowPacingReceiverOrderedIngressPrefixControl (0.00s)
+=== RUN   TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock
+--- PASS: TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock (0.00s)
+=== RUN   TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming
+--- PASS: TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming (0.00s)
+=== RUN   TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo
+--- PASS: TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo (0.00s)
+=== RUN   TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded
+--- PASS: TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded (0.00s)
+=== RUN   TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound
+--- PASS: TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound (0.00s)
+=== RUN   TestWindowPacingSdkColdEqualWaitsDiscoverSlowService
+--- PASS: TestWindowPacingSdkColdEqualWaitsDiscoverSlowService (0.00s)
+=== RUN   TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks
+--- PASS: TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks (0.00s)
+=== RUN   TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured
+--- PASS: TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured (0.00s)
+=== RUN   TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved
+--- PASS: TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved (0.02s)
+=== RUN   TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity
+--- PASS: TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity (0.01s)
+=== RUN   TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization
+--- PASS: TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryPreservesTiesAndOldestOffer
+--- PASS: TestWindowPacingAggregateDeliveryPreservesTiesAndOldestOffer (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryUsesRecentFreshInterval
+--- PASS: TestWindowPacingAggregateDeliveryUsesRecentFreshInterval (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryRejectsIncompleteOffers
+--- PASS: TestWindowPacingAggregateDeliveryRejectsIncompleteOffers (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryRejectsRetiredModuloSlot
+--- PASS: TestWindowPacingAggregateDeliveryRejectsRetiredModuloSlot (0.00s)
+=== RUN   TestWindowPacingAggregateOfferedBoundExpiresFastHistory
+--- PASS: TestWindowPacingAggregateOfferedBoundExpiresFastHistory (0.00s)
+=== RUN   TestWindowPacingAggregateOfferedBoundRespectsPendingDrain
+--- PASS: TestWindowPacingAggregateOfferedBoundRespectsPendingDrain (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix
+--- PASS: TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedIngressPrefixControl
+--- PASS: TestWindowPacingReceiverOrderedIngressPrefixControl (0.00s)
+=== RUN   TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock
+--- PASS: TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock (0.00s)
+=== RUN   TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming
+--- PASS: TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming (0.00s)
+=== RUN   TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo
+--- PASS: TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo (0.00s)
+=== RUN   TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded
+--- PASS: TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded (0.00s)
+=== RUN   TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound
+--- PASS: TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound (0.00s)
+=== RUN   TestWindowPacingSdkColdEqualWaitsDiscoverSlowService
+--- PASS: TestWindowPacingSdkColdEqualWaitsDiscoverSlowService (0.00s)
+=== RUN   TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks
+--- PASS: TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks (0.00s)
+=== RUN   TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured
+--- PASS: TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured (0.00s)
+=== RUN   TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved
+--- PASS: TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved (0.02s)
+=== RUN   TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity
+--- PASS: TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity (0.01s)
+=== RUN   TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization
+--- PASS: TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryPreservesTiesAndOldestOffer
+--- PASS: TestWindowPacingAggregateDeliveryPreservesTiesAndOldestOffer (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryUsesRecentFreshInterval
+--- PASS: TestWindowPacingAggregateDeliveryUsesRecentFreshInterval (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryRejectsIncompleteOffers
+--- PASS: TestWindowPacingAggregateDeliveryRejectsIncompleteOffers (0.00s)
+=== RUN   TestWindowPacingAggregateDeliveryRejectsRetiredModuloSlot
+--- PASS: TestWindowPacingAggregateDeliveryRejectsRetiredModuloSlot (0.00s)
+=== RUN   TestWindowPacingAggregateOfferedBoundExpiresFastHistory
+--- PASS: TestWindowPacingAggregateOfferedBoundExpiresFastHistory (0.00s)
+=== RUN   TestWindowPacingAggregateOfferedBoundRespectsPendingDrain
+--- PASS: TestWindowPacingAggregateOfferedBoundRespectsPendingDrain (0.00s)
+PASS

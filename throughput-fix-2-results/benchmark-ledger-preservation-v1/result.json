@@ -1,0 +1,24 @@
+{
+  "current_runner_sha256": "8106252011626c6706beb54665e63aaebe0b49c954198eec05c77fb085688dea",
+  "expected_fixture_rows": 9,
+  "fixture_sha256": "5c519a1fdd360428f48c4137ef5c45c95330849c5e3ad9814e2d5850987ce08f",
+  "old_runner_sha256": "3572a310533934eb889f1a8ce051a59112580c3c68d211e5a1d3e5c7d38cf05c",
+  "original_result_sha256": "5287c62df41be9ce0415c01037394679bed6a8dd6c96eb70bafaa75770a88623",
+  "parser_sha256": "8ac19a15aa11729f561e2eb555e9fa5d9ee8c4da1b402c0ad8439bfb12b9806c",
+  "rows": {
+    "current": {
+      "benchmark_rows": 9,
+      "complete_fixture_preserved": true,
+      "emitted_row_metrics_valid": true,
+      "ledger_sha256": "3691cff69136d68c57b8d97dd4bd093c2e8ac9b3cb9ad22006433684d4aebd2e",
+      "rows": 9
+    },
+    "old": {
+      "benchmark_rows": 0,
+      "complete_fixture_preserved": false,
+      "emitted_row_metrics_valid": true,
+      "ledger_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "rows": 0
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "accepted_throughput_readings": 0,
+  "classification": "Both original physical A/B/A runs fail and are uncalibrated. Optional ACK retention is not adopted; no throughput acceptance.",
+  "outcomes": 2,
+  "physical_arms": 6,
+  "physical_comparisons": 2,
+  "readings": 0,
+  "uncalibrated_comparisons": 2,
+  "worker_readings": 0
+}

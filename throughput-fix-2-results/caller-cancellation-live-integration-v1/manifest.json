@@ -1,0 +1,14 @@
+{
+  "archive": "caller-cancellation-live-integration-v1",
+  "payload_sha256": {
+    "caller-isolation.patch": "00b16d01ea1634c230ccfe928d3e96f82978047b132d28c90f9457bf357797e9",
+    "outcomes.jsonl": "ac4de6062b42e24139d8f92dcec4d83cd248b08a7eda188d1f00cc18942cf00e",
+    "provenance.json": "026193a3e608f36e9f6a7e3ec508d45ec57f560351f6094f57d2f9d8e70a12a4",
+    "source-manifest-after-adjacent.json": "dd7f99f2e8cbca054c7826a526025c091dbfd2a929a469a7293c78d04218756e",
+    "source-manifest-after.json": "f4facf96832d316d0bb23e5f6babf4357a0b202b666a572706df1e704da4675a",
+    "source-manifest-before.json": "d37d45ca3f0ea60ed9470126aa6b5f06e303ecd8c92eb24825d2a98b66c6eb81",
+    "source-pins.json": "297ba33c54ef14639ca09b31675f90898935746ba21265c57fad1e312886a493",
+    "status.json": "af4257f3d3075ce98594167f511c9d1a142bf291024c00645c5c231f879c477c",
+    "tests.patch": "b55fb374510aa0e6e6da81091775a04c6b10f593072b6fec76f04b5a0c51fa0d"
+  }
+}

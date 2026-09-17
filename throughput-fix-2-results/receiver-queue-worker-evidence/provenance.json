@@ -1,0 +1,8 @@
+{
+  "limitations": [
+    "No kernel/socket buffering reproduction",
+    "No wire schema; named receiver snapshots travel through test-only lookup",
+    "Serializer timestamps assert preconditions only, never estimator inputs"
+  ],
+  "scope": "Two real Clients, production reliable offerReceive and fixed32messagecarrierqueues;24messageFIFOserializedtrain with explicit Client barrier and virtual clock"
+}

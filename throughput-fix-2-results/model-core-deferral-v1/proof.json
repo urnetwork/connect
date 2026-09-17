@@ -1,0 +1,19 @@
+{
+  "runner": "/Users/brien/urnetwork/connect/tools/throughput-fix-2.sh",
+  "runner_sha256": "dc704cfabe709830dac33c702ad21e68ca407976b87b05a0f50f422c223b03b7",
+  "bash_n": "passed",
+  "model_pattern": "^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*|TestWindowPathSdk.*|TestWindowPathAckTailRoundTripGrowthControl)$",
+  "model_core_skip_regex": "^(TestWindowPathAckTailRoundTripGrowthControl|TestWindowPathServiceRoundTripChanges|TestWindowPathServiceRoundTripGrowthBeyondOldRing)$",
+  "selected_count": 30,
+  "deferred_tests": [
+    "TestWindowPathAckTailRoundTripGrowthControl",
+    "TestWindowPathServiceRoundTripChanges",
+    "TestWindowPathServiceRoundTripGrowthBeyondOldRing"
+  ],
+  "deferred_exact_expected": true,
+  "kept_count": 27,
+  "kept_static_fifo": true,
+  "kept_deterministic_matrix": true,
+  "kept_window_mismatch": true,
+  "embedded_manifest_records_deferred": true
+}

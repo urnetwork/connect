@@ -1,0 +1,38 @@
+{
+  "manifest_sha256": "2ef26b00657b37f45dcac71e8d10ac89cdae00355a19aa0f90b0e702dd561af6",
+  "binary_sha256": "f6de1dbaa4e0b186c61885528ae098d9da3ad828fb3717e88be331ecee1e6104",
+  "effective_inputs_sha256": "da22da5215f64bd938010fed7bf84d0a1c7c1cf9ef94c997dc828c71b3a2ecf3",
+  "argv": [
+    "/private/tmp/throughput-fix-2-service-gap-after-pinned/tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacing(LimitedFlightModestQueueKeepsSerialization|FreshTrainRejectsPriorPropagationGap|FreshTrainBelowEndpointAllowanceLowersService|FreshTrainSustainedSlowdownReplacesHold|LimitedFlightAcceptsContinuousSlowPair|LimitedFlightAcceptsQueuedSlowService|LimitedFlightRepeatedSlowRefillAdapts|FeedbackCycleKeepsFullGap|FeedbackCycleCompletesAtPhysicalTail|CompressedFlightsKeepMeasuredSerialization)$",
+    "-test.count=3",
+    "-test.timeout=90s"
+  ],
+  "started_utc": "2026-09-16T17:28:20.812332+00:00",
+  "loadavg_start": [
+    13.458984375,
+    13.24853515625,
+    12.86279296875
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent retained-window implementation and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 2.0100139160640538,
+  "loadavg_end": [
+    13.458984375,
+    13.24853515625,
+    12.86279296875
+  ],
+  "ended_utc": "2026-09-16T17:28:22.822875+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "4aa157f9480ff012c9bee6063f62fccaf94cacb9113185601aa7473e1f664f56",
+  "pass": 30,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "rows": 0
+}

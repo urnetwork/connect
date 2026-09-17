@@ -1,0 +1,11 @@
+{
+  "archive": "window-retention-service-binding",
+  "payload_sha256": {
+    "outcomes.jsonl": "b8ed2078a3492926988d632c8876e3ec6c9b297452947a7d1dffb27331421f54",
+    "provenance.json": "a0fef54b13ac5f20ce64b90c5e2366ce120d505b7b1564c88516d5595a59a4cc",
+    "source-manifest-after.json": "6fbbdf4f4dc6666806390901dbc09b697a04e71839338c0b55498bd869f47a9a",
+    "source-manifest-before.json": "13647c5dd0423c252eaf352fb45ab67b50cafbd4e5c74bcfeaf6ea630d4a6433",
+    "source-pins.json": "3de8248127ec634678f3adee84ab271488cc7a5b6500a873260773d8a0407abb",
+    "status.json": "4caa027e61cf7ade01fa99a19309bf6e0c0506431cd1865334bb5dbcb3ed3a2a"
+  }
+}

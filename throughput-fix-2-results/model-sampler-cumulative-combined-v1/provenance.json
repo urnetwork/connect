@@ -1,0 +1,6 @@
+{
+  "interpretation": "Terminal failing validation: four failed tests cover changing receiver windows, SDK long paths and RTT growth. The focused long SDK test repeats cells from the original complete SDK profile test.",
+  "no_quiescence_wait": true,
+  "scope": "Focused combined performance/cumulative-root selection; all original cell gates unchanged.",
+  "source_boundary": "Retained/service growth and owner correction, sampler 008e9d38, fresh cumulative pacing fallback; before queued-bucket horizon and cumulative carrier-scope guards."
+}

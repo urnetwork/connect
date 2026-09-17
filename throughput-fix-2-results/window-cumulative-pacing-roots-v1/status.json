@@ -1,0 +1,6 @@
+{
+  "classification": "Deterministic causal pacing regression and controls; no broad correctness or throughput acceptance.",
+  "outcomes": 54,
+  "readings": 0,
+  "worker_readings": 0
+}

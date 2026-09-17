@@ -1,0 +1,22 @@
+{
+  "archive_limits": "Normalize proposal status, numerical wire rows/layouts and hashes only; do not copy raw code, logs, binaries, source manifests or overlays.",
+  "effective_input_validation": {
+    "checked": 837,
+    "mismatches": 0
+  },
+  "exclusions": [
+    "No real new schema or decoder is implemented",
+    "No receiver consumer eligibility or restart behavior is proven by this wire test",
+    "Proposed struct layouts beyond current measured sizes are unverified",
+    "Client ingress and matched sender offers can both be queue-compressed",
+    "Prior diagnostic has zero modeled metadata wire cost"
+  ],
+  "input_handoff_sha256": "21f08eead2d5b2b6a0cc391d47444b95d74aea88367003e1c79e2861e7d6a29f",
+  "named_pin_validation": {
+    "checked": 9,
+    "mismatches": 0
+  },
+  "sanitized_review_copied": true,
+  "scope": "Read-only receiver service ACK tuple/lifecycle design plus isolated hypothetical unknown-field wire size experiment; no shared source/proto edits or performance acceptance",
+  "wire_experiment_boundary": "Hypothetical unknown fields in a frozen test overlay measured reservation/layout only; no decoder, lifecycle, consumer eligibility, schema, or throughput behavior was accepted."
+}

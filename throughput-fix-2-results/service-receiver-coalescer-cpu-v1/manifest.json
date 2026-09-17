@@ -1,0 +1,10 @@
+{
+  "archive": "service-receiver-coalescer-cpu-v1",
+  "payload_sha256": {
+    "fixture-failures.jsonl": "747521fe846ee0edcbd3f0b63a552f4fd048ef27caab562ef9342f75431a30b4",
+    "provenance.json": "1f6793144918003f3d38886f4bc98b35d9b2b6740eede7a760a1dfc1cb06db5a",
+    "readings.jsonl": "a2dc519625f71b66168107e47840326e33f84e61fc1a36c92de48a7eeeaadc99",
+    "source-pins.json": "0a216863ea50354c96210309c102d8d4f1ab247d4db9a91492500deb1124ad98",
+    "status.json": "a1dccfaf26b4750b7fc69ee4eb4f0504b8b1b0ea392679ed890e81159e3c53f1"
+  }
+}

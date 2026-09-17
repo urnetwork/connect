@@ -1,0 +1,145 @@
+{
+  "created_utc": "2026-09-17T01:35:12.879228+00:00",
+  "mode": "server-connect-deterministic",
+  "test_pattern": "^(TestConnectH1BatchResponseWriterPassesThroughUpgradeWrites|TestConnectH1ReadyDrainBalancesAcksAndPayloadBytes|TestConnectH1UserReadyBatchBoundsDrainAndPreservesFifo|TestConnectH1UserReadyBatchFlushErrorReturnsOwnership|TestConnectH1UserReadyBatchFrameErrorReturnsOwnership|TestConnectH1UserReadyBatchUnwrappedFallbackStaysSingleton|TestConnectH1WorkersJoinHeldReadyBatchOwnership|TestConnectH1WriteBatchForConnRejectsTypedNil|TestConnectH3InitialDatagramPathByteCountUsesQuicLimit|TestConnectH3TransferCarrierEnablesBoundedAckReserve|TestExchangeGenerationRetiresAfterAnyUndeliveredFrame|TestExchangeHeaderUnreliableTransferGobCompatibility|TestExchangeOutboundBatchFormation|TestProductionSocketReadersDeclareExactReceiveLanes|TestReliableExchangeQueueSaturationPreservesFramedOrder|TestResidentAddForwardCloseJoinsConsumerAndDrainsQueue|TestResidentAdmitsMinimumMessageLenLimit|TestResidentClientCallbacksContainOnlyZeroWaitIngressWork|TestResidentCloseAndWaitDrainsLateCallbackOwners|TestResidentCloseJoinsDelayedProducer|TestResidentContractManagerCanceledLookupReturnsInactive|TestResidentControlCallbackRefusesAndRetiresFullIngressWithoutWaiting|TestResidentForwardCallbackRetiresFullIngressWithoutWaiting|TestResidentForwardIngressStartsLazilyWithStableCapacity|TestResidentForwardIngressWorkerRegistrationIsJoinedByClose|TestResidentLazyForwardIngressCapabilityMetric|TestResidentNetworkPeerSendFailureReturnsFrameOwnership|TestResidentRuntimeDiagnosticGaugesAreIdentityFree|TestResidentTransportCloseDrainsQueuedSendOwnership|TestResidentTransportConstructorCarriesTransferProperties|TestResidentTransportReceiveAdmissionUsesExactLane|TestResidentUnreliableTransportPublishesTransferFlightPolicy|TestSendPooledReceiveReliableCancellationReturnsOwnership|TestSendPooledReceiveReliableWaitsThenDelivers|TestSendPooledReceiveUnreliableRefusesWithOwnership)$",
+  "run_flags": [
+    "-test.skip",
+    "^(TestResidentControllerReturnsDroppedResponseFrameOwnership|TestResidentRunJoinsStreamHopListenerCallback)$"
+  ],
+  "connect": {
+    "revision": "f903f59a96e629f8b1dfa5849d7a3198aaef9920",
+    "branch": "throughput-fix-2",
+    "source_sha256": "a36793a9871306b3acbb87e2f0ddeb1d79cecaebf26c795c518acdf1ae27c04b",
+    "dirty": true
+  },
+  "package": "./connect",
+  "build_flags": [
+    "-race"
+  ],
+  "runner_sha256": "80565912ce0e724922397cf6c8be6bc713bf9fb69cb1abaa4daf3c4f185ac524",
+  "benchmark_ledger_parser_sha256": "566ed53eb6762d5daea23b5dac1492d279c25c1e8fbee9b6d52c0ffda1fb9585",
+  "host_load_average_at_start": [
+    6.642578125,
+    7.77392578125,
+    7.96533203125
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CGO_ENABLED": "0"
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "server": {
+    "revision": "8ebcf6b0f76dc988fa1b0b62f34215d3c4f4d708",
+    "branch": "main",
+    "source_sha256": "7f4a4a85cf3b3063547cda485eb9413a4d165a9a57d2bd0e049de837a2ef1026",
+    "dirty": false
+  },
+  "server_test_environment_source": "/Users/brien/urnetwork/server/test-env.sh",
+  "server_test_environment": {
+    "WARP_ENV": "local",
+    "WARP_SERVICE": "test",
+    "WARP_DOMAIN": "bringyour.com",
+    "WARP_BLOCK": "test",
+    "WARP_VERSION": "0.0.0",
+    "WARP_VAULT_HOME": "/Users/brien/urnetwork/vault",
+    "WARP_CONFIG_HOME": "/Users/brien/urnetwork/config"
+  },
+  "server_test_environment_scope": {
+    "scope": "configuration only for audited non-database tests",
+    "mode": "server-connect-deterministic",
+    "race_instrumented": true,
+    "configuration_function": "test_env_configure",
+    "environment_source": "/Users/brien/urnetwork/server/test-env.sh",
+    "environment_sha256": "317b889ff56b6639a94f8b3cf3af3ef3dca88bac9ebf8cdd8b939557cac95ded",
+    "launcher_helper_sha256": "7c93f5c17eb91ba18e545bc30dc621d3791354e366bee79dc689988b52355700",
+    "generated_configuration_sha256": "88e44acf15cb05ba630d83957665b68c26919504a50a3cd5386177710d684645",
+    "service_preflight_ran": false,
+    "reason": "Selected tests use owned synthetic fixtures; they do not require launcher, PostgreSQL or Redis readiness.",
+    "tests": {
+      "TestSendPooledReceiveUnreliableRefusesWithOwnership": "connect/receive_queue_policy_test.go",
+      "TestSendPooledReceiveReliableWaitsThenDelivers": "connect/receive_queue_policy_test.go",
+      "TestSendPooledReceiveReliableCancellationReturnsOwnership": "connect/receive_queue_policy_test.go",
+      "TestReliableExchangeQueueSaturationPreservesFramedOrder": "connect/receive_queue_policy_test.go",
+      "TestExchangeGenerationRetiresAfterAnyUndeliveredFrame": "connect/receive_queue_policy_test.go",
+      "TestResidentTransportReceiveAdmissionUsesExactLane": "connect/receive_queue_policy_test.go",
+      "TestProductionSocketReadersDeclareExactReceiveLanes": "connect/receive_queue_policy_test.go",
+      "TestResidentForwardCallbackRetiresFullIngressWithoutWaiting": "connect/receive_queue_policy_test.go",
+      "TestResidentControlCallbackRefusesAndRetiresFullIngressWithoutWaiting": "connect/receive_queue_policy_test.go",
+      "TestResidentClientCallbacksContainOnlyZeroWaitIngressWork": "connect/receive_queue_policy_test.go",
+      "TestResidentLazyForwardIngressCapabilityMetric": "connect/resident_capability_test.go",
+      "TestResidentRuntimeDiagnosticGaugesAreIdentityFree": "connect/resident_capability_test.go",
+      "TestResidentContractManagerCanceledLookupReturnsInactive": "connect/resident_contract_manager_test.go",
+      "TestExchangeOutboundBatchFormation": "connect/resident_exchange_io_benchmark_test.go",
+      "TestResidentAdmitsMinimumMessageLenLimit": "connect/resident_message_len_test.go",
+      "TestResidentNetworkPeerSendFailureReturnsFrameOwnership": "connect/resident_pool_ownership_test.go",
+      "TestResidentTransportCloseDrainsQueuedSendOwnership": "connect/resident_pool_ownership_test.go",
+      "TestResidentCloseJoinsDelayedProducer": "connect/resident_pool_ownership_test.go",
+      "TestResidentForwardIngressStartsLazilyWithStableCapacity": "connect/resident_pool_ownership_test.go",
+      "TestResidentForwardIngressWorkerRegistrationIsJoinedByClose": "connect/resident_pool_ownership_test.go",
+      "TestResidentCloseAndWaitDrainsLateCallbackOwners": "connect/resident_pool_ownership_test.go",
+      "TestResidentAddForwardCloseJoinsConsumerAndDrainsQueue": "connect/resident_pool_ownership_test.go",
+      "TestExchangeHeaderUnreliableTransferGobCompatibility": "connect/resident_transfer_carrier_test.go",
+      "TestResidentTransportConstructorCarriesTransferProperties": "connect/resident_transfer_carrier_test.go",
+      "TestResidentUnreliableTransportPublishesTransferFlightPolicy": "connect/resident_transfer_carrier_test.go",
+      "TestConnectH1ReadyDrainBalancesAcksAndPayloadBytes": "connect/transport_h1_batch_test.go",
+      "TestConnectH1UserReadyBatchBoundsDrainAndPreservesFifo": "connect/transport_h1_batch_test.go",
+      "TestConnectH1UserReadyBatchUnwrappedFallbackStaysSingleton": "connect/transport_h1_batch_test.go",
+      "TestConnectH1WriteBatchForConnRejectsTypedNil": "connect/transport_h1_batch_test.go",
+      "TestConnectH1UserReadyBatchFlushErrorReturnsOwnership": "connect/transport_h1_batch_test.go",
+      "TestConnectH1UserReadyBatchFrameErrorReturnsOwnership": "connect/transport_h1_batch_test.go",
+      "TestConnectH1WorkersJoinHeldReadyBatchOwnership": "connect/transport_h1_batch_test.go",
+      "TestConnectH1BatchResponseWriterPassesThroughUpgradeWrites": "connect/transport_h1_batch_test.go",
+      "TestConnectH3InitialDatagramPathByteCountUsesQuicLimit": "connect/transport_h3_config_test.go",
+      "TestConnectH3TransferCarrierEnablesBoundedAckReserve": "connect/transport_h3_config_test.go"
+    },
+    "test_file_sha256": {
+      "connect/receive_queue_policy_test.go": "e2f49eccd9216181369343f663d986b2abe25968d077b4b0a15a809e75373499",
+      "connect/resident_capability_test.go": "913d685fe983681918eae93328a76357beda57984029742c3bd7dbc89cc7da94",
+      "connect/resident_contract_manager_test.go": "e3e6bdf9abff822851bf2b3e4e84a23d59caae3aae276e2b7fbc8f088189bfd1",
+      "connect/resident_exchange_io_benchmark_test.go": "de4213fc0f209130fb9ebf00ce10dec51933cbfff1003ef21a077ebb72b2dbe7",
+      "connect/resident_message_len_test.go": "db435406436e43c0990e1eea513f594c226d4cd2ef73028f54a827456c7a2d67",
+      "connect/resident_pool_ownership_test.go": "0d09afef67096103a270cba86add4927a5aea32589e0c011c7eefcb8f8a517e9",
+      "connect/resident_transfer_carrier_test.go": "c4645d9e00b228441336c00a9530120cf3a885bdfc2a9f3eb9d029fd4bd51882",
+      "connect/transport_h1_batch_test.go": "667c4ccbc0abcd62f398445dca10bd7360ce8d41a2279c3e276f510c92f7503e",
+      "connect/transport_h3_config_test.go": "a4105b3058b75688960535f8dfeaedc519ef5dca4e37d7b64f6bf6b3adbba8f3"
+    },
+    "excluded_database_tests": [
+      "TestResidentControllerReturnsDroppedResponseFrameOwnership",
+      "TestResidentRunJoinsStreamHopListenerCallback"
+    ],
+    "reviewed_selection_sha256": "ac11c1083d7ac2800d13bf81f23131b737d57e4d68b7afa1535a5c46c7802738"
+  },
+  "server_test_environment_scope_sha256": "f7d4ad37371ca5e7c44e0cef832f18b4574205978c3e783fd40f234f261a2ce8",
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 920,
+        "input_sha256": "45f7bedbf1f8c3a00f970c8bb0743a936d8a0577aff769d3a2c9df5f35cfba66"
+      },
+      "server": {
+        "file_count": 4264,
+        "input_sha256": "e703648644cd184c7eb5dd2beb5057c66a2c6cbbf05ae35cffe32776eff5f639"
+      }
+    },
+    "external_local_replacements": [
+      "/Users/brien/urnetwork/glog",
+      "/Users/brien/urnetwork/goidenticons",
+      "/Users/brien/urnetwork/operator-proxy",
+      "/Users/brien/urnetwork/proxy",
+      "/Users/brien/urnetwork/sdk",
+      "/Users/brien/urnetwork/sn",
+      "/Users/brien/urnetwork/userwireguard",
+      "/Users/brien/urnetwork/warp"
+    ],
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "binary_sha256": "011cbcc6df42d751332e72c2b2a0db4c2837253d555d8036a49ebd5db9a0d480",
+  "binary_build_info": "/tmp/throughput-fix-2-terra-server-connect-final-cgo0/tests: go1.26.7\n\tpath\tgithub.com/urnetwork/server/connect.test\n\tmod\tgithub.com/urnetwork/server\t(devel)\t\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-race=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOOS=darwin\n\tbuild\tGOARM64=v8.0\n",
+  "sources_stable_during_build": true,
+  "source_inspection_uses_build_snapshot": true
+}

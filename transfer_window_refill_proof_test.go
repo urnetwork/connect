@@ -1,5 +1,5 @@
-// A newly proved path length must not inherit a window from delivery measured
-// while the old flight limit starved that path. Fixed permission bounds remain.
+// A newly proved path length invalidates older delivery candidates while
+// retaining learned capacity and obeying current hard permission limits.
 package connect
 
 import (
@@ -72,29 +72,76 @@ func completeWindowRefillProbe(t *testing.T, sequence *SendSequence, service *wi
 	return at
 }
 
-// Existing low logical delivery cannot undo a newly proved larger flight
-// requirement before any complete delivery interval on that path exists.
-func TestWindowPacingNewPathProofRequalifiesOldDelivery(t *testing.T) {
+// Every logical checkpoint contributes exactly 4 KiB per 50 ms. This known
+// rate remains observable even when history eligibility or shared service
+// determines the selected candidate and effective window.
+func assertWindowRefillLogicalRate(t *testing.T, estimate SendWindowEstimate) {
+	t.Helper()
+	if estimate.Interval < 2*estimate.WindowRoundTrip || estimate.Interval%(50*time.Millisecond) != 0 || estimate.DeliveredByteCount != 4096*ByteCount(estimate.Interval/(50*time.Millisecond)) {
+		t.Fatalf("logical sizing lost its exact 4 KiB per 50 ms interval: %+v", estimate)
+	}
+}
+
+// A confirmed longer path invalidates every sibling's older cumulative
+// interval. Independent service can grow the window before fresh logical
+// delivery qualifies again, without turning old delivery into current proof.
+func TestWindowPacingNewPathProofRequiresFreshCumulativeDelivery(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		for _, metadata := range []bool{false, true} {
 			for _, lanes := range []int{1, 8} {
 				sequences, service := newWindowRefillProofFixture(t, lanes, metadata)
+				before := make([]SendWindowEstimate, lanes)
+				for lane, sequence := range sequences {
+					before[lane] = sequence.sendWindowEstimate(time.Now())
+					if !before[lane].Sized || !before[lane].ServiceSized || before[lane].Window != before[lane].Initial {
+						t.Fatalf("metadata=%t lanes=%d lane=%d fixture has no qualified old delivery: %+v", metadata, lanes, lane, before[lane])
+					}
+					assertWindowRefillLogicalRate(t, before[lane])
+				}
 				at := completeWindowRefillProbe(t, sequences[0], service, metadata, 1210*time.Millisecond)
+				wantRoundTrip := 1210 * time.Millisecond
+				if metadata {
+					wantRoundTrip -= 10 * time.Millisecond
+				}
+				wantWindow := ByteCount(30500000)
+				if metadata {
+					wantWindow = 30250000
+				}
+				if service.windowDeliveryStep() != at.UnixNano() || service.roundTripEvidence(at).minimum != wantRoundTrip {
+					t.Fatalf("metadata=%t lanes=%d exact physical proof did not establish the new path: step=%d timing=%+v", metadata, lanes, service.windowDeliveryStep(), service.roundTripEvidence(at))
+				}
 				for lane, sequence := range sequences {
 					estimate := sequence.sendWindowEstimate(at)
 					t.Logf("metadata=%t lanes=%d lane=%d window=%d ceiling=%d delivered=%d span=%s residence=%s reason=%q", metadata, lanes, lane, estimate.Window, estimate.Ceiling, estimate.DeliveredByteCount, estimate.Interval, estimate.WindowRoundTrip, estimate.Reason)
-					if estimate.Window != estimate.Ceiling {
-						t.Errorf("metadata=%t lanes=%d lane=%d old flight-limited delivery reduced the newly proved path: window=%d ceiling=%d", metadata, lanes, lane, estimate.Window, estimate.Ceiling)
+					if estimate.Sized || !estimate.ServiceSized || estimate.Window != wantWindow || estimate.CandidateWindow != wantWindow || estimate.LearnedWindow != wantWindow || estimate.Ceiling != before[lane].Ceiling {
+						t.Errorf("metadata=%t lanes=%d lane=%d old cumulative delivery qualified or independent service growth changed: %+v", metadata, lanes, lane, estimate)
 					}
+					if estimate.RoundTrip != wantRoundTrip || estimate.WindowRoundTrip != wantRoundTrip+10*time.Millisecond {
+						t.Errorf("metadata=%t lanes=%d lane=%d sibling lost the confirmed path: %+v", metadata, lanes, lane, estimate)
+					}
+					assertWindowRefillLogicalRate(t, estimate)
+				}
+				for range 80 {
+					time.Sleep(50 * time.Millisecond)
+					for _, sequence := range sequences {
+						sequence.observeAckedBytesWithServiceCredit(4096, 0, windowServiceAckCredit{}, time.Now())
+					}
+				}
+				for lane, sequence := range sequences {
+					estimate := sequence.sendWindowEstimate(time.Now())
+					if !estimate.Sized || !estimate.ServiceSized || estimate.CandidateWindow != wantWindow || estimate.Window != wantWindow || estimate.LearnedWindow != wantWindow || service.windowDeliveryStep() != at.UnixNano() {
+						t.Errorf("metadata=%t lanes=%d lane=%d fresh delivery failed to qualify without shrinking: %+v", metadata, lanes, lane, estimate)
+					}
+					assertWindowRefillLogicalRate(t, estimate)
 				}
 			}
 		}
 	})
 }
 
-// A queued ordinary sample is not proof of propagation growth and must not
-// discard valid low delivery evidence or bypass a fixed peer permission.
-func TestWindowPacingQueuedPathObservationKeepsDeliveryClamp(t *testing.T) {
+// Ordinary queued timing cannot change the propagation baseline, invalidate
+// a qualified delivery candidate, or alter retained capacity and permission.
+func TestWindowPacingQueuedPathObservationKeepsDeliveryCandidate(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		for _, metadata := range []bool{false, true} {
 			sequences, service := newWindowRefillProofFixture(t, 1, metadata)
@@ -106,8 +153,13 @@ func TestWindowPacingQueuedPathObservationKeepsDeliveryClamp(t *testing.T) {
 				service.observeRoundTrip(1210*time.Millisecond, 10*time.Millisecond, time.Now())
 			}
 			after := sequence.sendWindowEstimate(time.Now())
-			if before.Window != before.Floor || after.Window != before.Window {
+			if !before.Sized || !after.Sized || !before.ServiceSized || !after.ServiceSized || after.CandidateWindow != before.CandidateWindow || after.Window != before.Window || after.LearnedWindow != before.LearnedWindow || after.Ceiling != before.Ceiling {
 				t.Errorf("metadata=%t ordinary queue growth bypassed valid delivery: before=%+v after=%+v", metadata, before, after)
+			}
+			assertWindowRefillLogicalRate(t, before)
+			assertWindowRefillLogicalRate(t, after)
+			if service.windowDeliveryStep() != 0 || after.RoundTrip != before.RoundTrip || after.WindowRoundTrip != before.WindowRoundTrip {
+				t.Errorf("metadata=%t queued observation changed the unproved path: step=%d before=%+v after=%+v", metadata, service.windowDeliveryStep(), before, after)
 			}
 		}
 	})

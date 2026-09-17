@@ -1,0 +1,7 @@
+{
+  "limitations": [
+    "Test-only receiver tuples add zero wire cost.",
+    "Upstream carrier-buffer and bucket-phase roots still fail; this is not production acceptance."
+  ],
+  "scope": "All 27 original model tests and 818 readings with queued Client endpoints omitted"
+}

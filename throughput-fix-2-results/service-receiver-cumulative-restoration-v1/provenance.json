@@ -1,0 +1,13 @@
+{
+  "comparison": "The sole production delta restores the previously accepted windowPacingRate fallback and its comment. Twelve unchanged tests repeat three times. Both runs use their own copied build directory as working directory.",
+  "failed_roots": [
+    "TestWindowPacingCumulativeGrowthRaisesColdRate",
+    "TestWindowPacingCumulativeSlowDeliveryLowersOnlyRate",
+    "TestWindowPacingCumulativeH1SiblingOwnsItsFallback",
+    "TestWindowPacingCumulativeStandaloneRateStillWorks"
+  ],
+  "interpretation": "The previously reported six-gate pass on source f305b789 omitted accepted behavior. Its evidence remains recorded, but that source is not eligible for adoption. Restoring the behavior is required even though broader timing validation remains incomplete.",
+  "no_quiescence_wait": true,
+  "outcome": "All four failures reproduce three times before restoration; all36 executions pass after. Subsequent normal six-gate run passes five tests and fails RTT growth. No thresholds or assertions changed.",
+  "role": "Integration audit of receiver timing work against already accepted cumulative-delivery startup pacing."
+}

@@ -1,0 +1,13 @@
+=== RUN   TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold
+--- FAIL: TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold (0.51s)
+=== RUN   TestWindowPacingReceiverSustainedPacingEscapesSlowHold
+--- PASS: TestWindowPacingReceiverSustainedPacingEscapesSlowHold (0.94s)
+=== RUN   TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold
+--- FAIL: TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold (0.50s)
+=== RUN   TestWindowPacingReceiverSustainedPacingEscapesSlowHold
+--- PASS: TestWindowPacingReceiverSustainedPacingEscapesSlowHold (0.95s)
+=== RUN   TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold
+--- FAIL: TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold (0.50s)
+=== RUN   TestWindowPacingReceiverSustainedPacingEscapesSlowHold
+--- PASS: TestWindowPacingReceiverSustainedPacingEscapesSlowHold (0.94s)
+FAIL

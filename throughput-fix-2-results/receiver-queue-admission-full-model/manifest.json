@@ -1,0 +1,10 @@
+{
+  "archive": "receiver-queue-admission-full-model",
+  "payload_sha256": {
+    "ledger.jsonl": "3fca80c2f070a82cd2b72fd673aa0543f784e226da8ac4eda10537f51b95ab66",
+    "outcomes.jsonl": "c59497d3db6c2ea3571706b3759d04b25cb57467de74a9f8f6e7785db3384cee",
+    "provenance.json": "bf3de63e92f843b216722e40e1e5de6cf4bc4a8021c8f94985869c5c56a19547",
+    "source-pins.json": "8c5d155c4954f0890e437fff9c6d3cad021a42f69485e338a65fbc66cf2028d1",
+    "status.json": "ddd3110debcccff9695e8697e44e5b47259994070c163755a2383d6212cebd99"
+  }
+}

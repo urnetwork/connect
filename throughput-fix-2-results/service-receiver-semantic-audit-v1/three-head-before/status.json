@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "29a83ba306b950ac15cba34afc86e3231e5fda2f5d8d22ffc0607b389f0316eb",
+  "binary_sha256": "195cd3dd7c769c500e425b3764b852ff434d5a576b7dfe3b0a18156c17eeb707",
+  "effective_inputs_sha256": "882e1a8bf5f9322f3fe61227fde20a3e22e0760225d643fc08e644fa5d2619e4",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiver(LateSibling.*|OrderedColdSiblingsKeepSerialization|OrderedEpochSiblingsKeepSerialization)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied module as build; original absolute relationship is pinned by original status/manifest hashes",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T19:51:47.849502+00:00",
+  "loadavg_start": [
+    6.98583984375,
+    9.615234375,
+    14.48388671875
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 0.9674959578551352,
+  "loadavg_end": [
+    6.82666015625,
+    9.53857421875,
+    14.42822265625
+  ],
+  "ended_utc": "2026-09-16T19:51:48.817287+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "b1c4af8a3a2c90afa0c01bd74d28a4529f62a35e6508d262f21ffaf0fc15ca15",
+  "pass": 6,
+  "fail": 9,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "Exact immediate estimator equalities are historical chosen-policy diagnostics. Exact ownership passes; bounded recovery alternatives remain valid.",
+  "rows": 0
+}

@@ -1,0 +1,31 @@
+{
+  "archive_kind": "small_window_ingress_comparison_evidence",
+  "attribution_limits": [
+    "All variants are isolated diagnostics. No estimator, receiver metadata, or ingress candidate is accepted or landed.",
+    "Passing shrink or capacity cells do not override the retained physically valid reverse-compression rejection or long-path failure.",
+    "No wire schema changed. Receiver diagnostics model zero additional encoded metadata bytes and are information-only optimistic bounds.",
+    "Raw logs, traces, source, overlays, binaries, commands, environment, local paths, and synthetic identities are excluded; normalized readings, outcomes, and hashes only are retained."
+  ],
+  "collection_time_utc": "2026-09-16T10:35:12.976160+00:00",
+  "findings": [
+    "Safe ACK-arrival service credit alone does not close the shrinking 64 KiB cell. Root separately fixed static 256 KiB cells and low-rate shared feedback; those are different experiments.",
+    "First-offer rollover fixes its direct partial-train root, but both v1 and v2 fail the unchanged shrink model. A blanket low-flight/gap guard was previously rejected and is not revived here.",
+    "Receiver-local ingress timestamps still include source-limited gaps between ACK-selected checkpoints. A pair-specific offered-rate eligibility filter was needed for this prototype's shrink success.",
+    "With the same pair consumer and eligibility filter, receiver-ingress timing and sender ACK timing minus field12 both pass shrink and the six original capacity transitions. Raw ACK timing does not.",
+    "Corrected-ACK timing is rejected: an actual-worker, physically possible reverse-compression schedule with 50 ms propagation in each direction produces 64.38 GB/s. max(corrected span, matched offer span) is already applied and cannot help when the source offered the whole flight at one timestamp.",
+    "The same stronger reverse fixture passes with the ordinary sampler and with receiver-local ingress pairs, for both zero and 50 ms receiver delay.",
+    "Receiver ingress plus integrated recovery v3 still fails the unchanged 1.2 s growth gate: 85.2036267 versus 95.7781333 Mb/s, intervals 88.96512/85.01248/81.63328, zero total and measured drops. No full long-path fix is claimed."
+  ],
+  "handoff_sha256": "1777590012da3ff747e2091050d62bfd2bb2072a855a02099608fbd3edbf781d",
+  "protocol_and_attribution_limits": [
+    "No wire schema changed. Receiver ingress diagnostics model zero extra encoded metadata bytes; results are optimistic information-only bounds, not a production wire-performance estimate.",
+    "Receiver ledger snapshots are delivered only by an actual ACK for the named message; no live receiver lookup or capacity oracle feeds the consumer. Original outer encoded length is captured before decryption/decoding.",
+    "Receiver ledger and pair history are bounded test-only prototypes. Production reset/dedup lifetime, stale metadata, encryption overhead, mixed carrier and multi-lane reorder contracts are not fully validated.",
+    "The original alias fixture uses variable nonnegative reverse residence, not two realizations of the fixed finite-link model. The stronger reverse fixture explicitly satisfies 50 ms propagation lower bounds in both directions.",
+    "The offered-rate eligibility rule is still provisional. Passing six capacity changes does not establish all genuine slow-path, source-idle, compression or hold invariants.",
+    "Historical host, duplex, long-tail retry and separate shared-feedback failures are not attributed to this small-window root.",
+    "Original gates, warmup, measurement periods, budgets, per-flow and drop checks remain unchanged. Every failed model and excluded fixture/harness diagnostic is retained."
+  ],
+  "scope": "Small shrinking-window feedback sampling, actual sender/receiver timing ambiguity, offered-rate eligibility, and unchanged capacity/long-RTT controls.",
+  "status_from_handoff": "Frozen isolated diagnostics only. No estimator or receiver metadata candidate is accepted or landed."
+}

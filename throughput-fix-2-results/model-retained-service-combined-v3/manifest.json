@@ -1,0 +1,47 @@
+{
+  "created_utc": "2026-09-16T16:27:43.362954+00:00",
+  "mode": "model",
+  "test_pattern": "^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*|TestWindowPathSdk.*|TestWindowPathAckTailRoundTripGrowthControl|TestWindowPathRetainedGrowth.*)$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "f903f59a96e629f8b1dfa5849d7a3198aaef9920",
+    "branch": "throughput-fix-2",
+    "source_sha256": "46d3ffd51df13d69651cf7bc9dd5695276d185cb396f817cdfe1f9b5326f24bd",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "01190379279d7bfedb64b1f8dd8805c7e91464e10b849a446203e9459bbc40cd",
+  "host_load_average_at_start": [
+    12.40283203125,
+    14.662109375,
+    17.0224609375
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {},
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 883,
+        "input_sha256": "61cf3b4fcdb483c0d49a9bf1f0d3fb8491f24a4e7caadc47d2f8fc902688a770"
+      }
+    },
+    "external_local_replacements": [
+      "/Users/brien/urnetwork/glog"
+    ],
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "binary_sha256": "60b17b6add962503668c7cfa48c7ba5f4724ed71c5d6adee180d28685dfa0697",
+  "sources_stable_during_build": true,
+  "source_inspection_uses_build_snapshot": true
+}

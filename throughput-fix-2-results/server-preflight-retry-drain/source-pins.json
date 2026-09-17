@@ -1,0 +1,11 @@
+{
+  "connect_revision": "8cda0523e5ef5602d28001ea0752edeae573f51e",
+  "manifest_sha256": "7fa57e4b5bdda4f58417ea35df086fd3cc15dcb57fd683ce5a38f18dba67a9b8",
+  "script_sha256": {
+    "connect_runner": "79bc2ec3c3f2bf9634b0383f035dd1f4db78599222f4ecd1b86ef0b5704aaa31",
+    "server_connect_test": "69d47e517643d89cc096d730721e75eee244c52726abc3322077b19e7061e0fe",
+    "server_test": "897732fa60d48f4d9050485eb6ec3c890089f8b163ec7ce0adf32177c8dec0e4",
+    "server_test_environment": "317b889ff56b6639a94f8b3cf3af3ef3dca88bac9ebf8cdd8b939557cac95ded"
+  },
+  "server_revision": "0522f3f6200b9d70b4b4fab0ddf791939ba772d0"
+}

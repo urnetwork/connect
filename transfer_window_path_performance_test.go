@@ -215,8 +215,9 @@ func TestWindowPathFifoSeparatesQueueAndPropagation(t *testing.T) {
 // Both arms use the FIFO's known physical RTT for sizing, so service residence
 // learned from compressed replies cannot silently restore the omitted term.
 // The control changes only that window term; service pacing still observes
-// the real receiver compression in both arms.
-func TestWindowCompressionResidenceRestoresShortPathCapacity(t *testing.T) {
+// the real receiver compression in both arms. A 256 KiB opening requires
+// measured growth to cover compression; a retained 2 MiB opening already fits.
+func TestWindowCompressionResidenceGrowsSmallOpening(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	var old, fixed float64
 	for _, arm := range []string{"path-rtt-only", "delivery"} {
@@ -225,6 +226,7 @@ func TestWindowCompressionResidenceRestoresShortPathCapacity(t *testing.T) {
 				Arm: arm, RoundTrip: 300 * time.Microsecond, Compression: 10 * time.Millisecond,
 				Flows: 1, Payload: 1280, Budget: mib(48), Rate: 125000000,
 				KnownPathRoundTrip: true, HoldFullAckCompression: true,
+				BootstrapWindow: 256 * 1024,
 			}, 100*time.Millisecond)
 			logWindowServiceReading(t, reading)
 			wantResidence := 10300 * time.Microsecond
@@ -234,7 +236,7 @@ func TestWindowCompressionResidenceRestoresShortPathCapacity(t *testing.T) {
 			} else {
 				fixed = reading.Mbps
 			}
-			if reading.Window.RoundTrip != 300*time.Microsecond || reading.Window.WindowRoundTrip != wantResidence {
+			if reading.Window.Initial != 256*1024 || reading.Window.RoundTrip != 300*time.Microsecond || reading.Window.WindowRoundTrip != wantResidence {
 				t.Fatalf("%s did not isolate the compression window term: %+v", arm, reading.Window)
 			}
 			t.Logf("%s: %.1f model Mb/s, window=%d reason=%s", arm, reading.Mbps, reading.Window.Window, reading.Window.Reason)
@@ -275,15 +277,18 @@ func TestWindowPathDeterministicPerformanceMatrix(t *testing.T) {
 	}
 }
 
-// A relay may accept a reliable-carrier message and then refuse it at its
-// finite forwarding queue. Pin recovery and sustained delivery at that exact
-// boundary, where carrier reliability cannot recover the discarded Pack.
+// A large configured opening creates pressure at the finite forwarding queue.
+// Both arms use that same opening and startup allowance; only pacing differs.
+// Carrier reliability cannot recover a Pack discarded after its first hop.
 func TestWindowPathBoundsBurstsAtFiniteRelay(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, flows := range []int{1, 8} {
 		for _, arm := range []string{"unpaced", "delivery"} {
 			synctest.Test(t, func(t *testing.T) {
-				reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: flows, Payload: 1280, Budget: mib(48), Rate: 125000000, Drop: true}, time.Second)
+				reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: flows, Payload: 1280, Budget: mib(48), BootstrapWindow: mib(48), Rate: 125000000, Drop: true}, time.Second)
+				if reading.Window.Initial != mib(48) {
+					t.Fatal("finite relay control did not use the same large opening")
+				}
 				t.Logf("%s flows=%d goodput=%.1f min-flow=%.1f model Mb/s relay-drops=%d gap-repairs=%d", arm, flows, reading.Mbps, reading.MinFlowMbps, reading.RelayDrops, reading.Recovery.SelectiveGapWriteCount)
 				if arm == "unpaced" {
 					if reading.RelayDrops == 0 || reading.Recovery.SelectiveGapWriteCount == 0 {
@@ -324,6 +329,9 @@ func TestWindowPathSlowLinkKeepsCapacity(t *testing.T) {
 }
 
 type windowPathCell struct {
+	// Optional explicit opening for a controlled comparison. It does not
+	// change byte permissions, the serializer, or measurement duration.
+	BootstrapWindow          ByteCount                  `json:",omitempty"`
 	InitialLogicalAckRelease time.Duration              `json:",omitempty"`
 	HoldFullAckCompression   bool                       `json:",omitempty"`
 	SenderProfile            *windowPathEndpointProfile `json:",omitempty"`
@@ -475,6 +483,12 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 			if s.MinimumMessageLenLimit() != profile.MinimumMessageLimit {
 				t.Fatal("profile message limit differs from the constructor capture")
 			}
+		}
+		if cell.BootstrapWindow > 0 {
+			if profile != nil {
+				t.Fatal("explicit opening cannot overwrite a captured SDK profile")
+			}
+			s.SendBufferSettings.ResendQueueMaxByteCount = cell.BootstrapWindow
 		}
 		if cell.HoldFullAckCompression {
 			if cell.InitialLogicalAckRelease > 0 {
@@ -696,7 +710,7 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 					{name: "reverse", client: receiver, destination: sender.ClientId()},
 				} {
 					estimate := direction.client.DestinationSendStats(direction.destination).SendWindow
-					t.Logf("pacing-trace phase=%s direction=%s at=%s bytes=%d window=%d rate=%d service=%d backlog=%t rtt=%s sampled=%t", phase, direction.name, now.Sub(traceStart), bytes, estimate.Window, estimate.PacingByteRate, estimate.ServiceByteRate, estimate.ServiceBacklogged, estimate.RoundTrip, estimate.Sized)
+					t.Logf("pacing-trace arm=%s configured-rtt=%s phase=%s direction=%s at=%s bytes=%d window=%d learned=%d candidate=%d initial=%d floor=%d ceiling=%d obtainable=%d rate=%d service=%d delivery=%d backlog=%t rtt=%s residence=%s sampled=%t service-sized=%t established=%t probe-rate=%d probe-bytes=%d reason=%q", cell.Arm, cell.RoundTrip, phase, direction.name, now.Sub(traceStart), bytes, estimate.Window, estimate.LearnedWindow, estimate.CandidateWindow, estimate.Initial, estimate.Floor, estimate.Ceiling, estimate.Obtainable, estimate.PacingByteRate, estimate.ServiceByteRate, estimate.DeliveryByteRate, estimate.ServiceBacklogged, estimate.RoundTrip, estimate.WindowRoundTrip, estimate.Sized, estimate.ServiceSized, estimate.ServiceEstablished, estimate.PacingProbeByteRate, estimate.PacingProbeByteCount, estimate.Reason)
 					var services []*windowPacingService
 					func() {
 						direction.client.sendBuffer.mutex.Lock()
@@ -729,8 +743,8 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 								snapshot.mean, snapshot.buckets = copy.mean(now)
 							}
 						}()
-						t.Logf("pacing-service phase=%s direction=%s at=%s minimum=%s latest=%s compression=%s outstanding=%.0f bound=%.0f sent=%d applied=%d drained=%d reserved=%d waits=%d tails=%d burst=%d burst-limit=%d credit=%.0f debt=%s drain=%s cooldown=%s ring-mean-ns=%.0f ring-buckets=%d",
-							phase, direction.name, now.Sub(traceStart), snapshot.minimum, snapshot.latest, snapshot.compression, snapshot.outstanding, snapshot.bound,
+						t.Logf("pacing-service arm=%s configured-rtt=%s phase=%s direction=%s at=%s minimum=%s latest=%s compression=%s outstanding=%.0f bound=%.0f sent=%d applied=%d drained=%d reserved=%d waits=%d tails=%d burst=%d burst-limit=%d credit=%.0f debt=%s drain=%s cooldown=%s ring-mean-ns=%.0f ring-buckets=%d",
+							cell.Arm, cell.RoundTrip, phase, direction.name, now.Sub(traceStart), snapshot.minimum, snapshot.latest, snapshot.compression, snapshot.outstanding, snapshot.bound,
 							snapshot.sent, snapshot.applied, snapshot.drained, snapshot.reserved, snapshot.waits, snapshot.tails, snapshot.burst, snapshot.limit, snapshot.credit, snapshot.debt, snapshot.drain, snapshot.cooldown, snapshot.mean, snapshot.buckets)
 					}
 				}
@@ -798,8 +812,11 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		}
 	}
 	reading.MeasurementRelayDrops = reading.RelayDrops - dropsBefore
-	if cell.InitialLogicalAckRelease > 0 && firstAckLanes.Load() != 255 {
-		t.Errorf("initial feedback ordering missed logical lanes: mask=%02x", firstAckLanes.Load())
+	// The barrier supports up to eight logical lanes; a single-flow cell
+	// must prove its one initial ACK without requiring seven inactive lanes.
+	expectedFirstAckLanes := uint32(1<<min(cell.Flows, 8)) - 1
+	if cell.InitialLogicalAckRelease > 0 && firstAckLanes.Load() != expectedFirstAckLanes {
+		t.Errorf("initial feedback ordering missed logical lanes: mask=%02x want=%02x", firstAckLanes.Load(), expectedFirstAckLanes)
 	}
 	return reading
 }

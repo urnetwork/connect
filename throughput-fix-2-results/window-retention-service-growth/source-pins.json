@@ -1,0 +1,90 @@
+[
+  {
+    "binary_sha256": "199b64ac652ec4c3aadd04bc8d28f487f591b33cc7dda006e5bd6c8389623966",
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "86278a3a652dddca84db14f64f683984a71eebc83ba14d7aab731a4882ffa1b6",
+    "effective_inputs_sha256": "479d69212830435dcf1b10fa3392f9177fb9f0fe202ebe91ff48bd89884dc051",
+    "inputs_match_at_archive": true,
+    "name": "before",
+    "outcomes": {
+      "FAIL": 3,
+      "PASS": 30,
+      "SKIP": 0
+    },
+    "race_warnings": 0,
+    "raw_log_sha256": "e93a8338d88518c69f084867141a378baa71deced39afa8262017f0fced95ac5",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "199b64ac652ec4c3aadd04bc8d28f487f591b33cc7dda006e5bd6c8389623966",
+      "effective_inputs_sha256": "479d69212830435dcf1b10fa3392f9177fb9f0fe202ebe91ff48bd89884dc051",
+      "elapsed_seconds": 1.9038019170984626,
+      "ended_utc": "2026-09-16T16:11:55.259647+00:00",
+      "exit_status": 1,
+      "fail": 3,
+      "loadavg_end": [
+        15.59033203125,
+        24.80712890625,
+        20.2109375
+      ],
+      "loadavg_start": [
+        15.5546875,
+        24.9560546875,
+        20.23583984375
+      ],
+      "manifest_sha256": "86278a3a652dddca84db14f64f683984a71eebc83ba14d7aab731a4882ffa1b6",
+      "no_quiescence_wait": true,
+      "pass": 30,
+      "race_warnings": 0,
+      "raw_log_sha256": "e93a8338d88518c69f084867141a378baa71deced39afa8262017f0fced95ac5",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T16:11:53.353926+00:00"
+    }
+  },
+  {
+    "binary_sha256": "e6d7876da10b7a39a349ad42136760d0a420beefcc0db91635c55b502b422584",
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "6931b71c3f5d5324bb765a842d268a739507a4da8bc7729d565a3d7a9a13a573",
+    "effective_inputs_sha256": "1631816175b3516fd6d80c9ecd3b3e1853198c1bde7b99630bf6c2dfd93d9d59",
+    "inputs_match_at_archive": true,
+    "name": "after",
+    "outcomes": {
+      "FAIL": 0,
+      "PASS": 33,
+      "SKIP": 0
+    },
+    "race_warnings": 0,
+    "raw_log_sha256": "11b8bbf05ef5e4a9d63a539ec865ee961c8cf42f6823e64f5cb756f0dbf41353",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "e6d7876da10b7a39a349ad42136760d0a420beefcc0db91635c55b502b422584",
+      "effective_inputs_sha256": "1631816175b3516fd6d80c9ecd3b3e1853198c1bde7b99630bf6c2dfd93d9d59",
+      "elapsed_seconds": 2.0618217922747135,
+      "ended_utc": "2026-09-16T16:11:55.417704+00:00",
+      "exit_status": 0,
+      "fail": 0,
+      "loadavg_end": [
+        15.59033203125,
+        24.80712890625,
+        20.2109375
+      ],
+      "loadavg_start": [
+        15.5546875,
+        24.9560546875,
+        20.23583984375
+      ],
+      "manifest_sha256": "6931b71c3f5d5324bb765a842d268a739507a4da8bc7729d565a3d7a9a13a573",
+      "no_quiescence_wait": true,
+      "pass": 33,
+      "race_warnings": 0,
+      "raw_log_sha256": "11b8bbf05ef5e4a9d63a539ec865ee961c8cf42f6823e64f5cb756f0dbf41353",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T16:11:53.354601+00:00"
+    }
+  }
+]

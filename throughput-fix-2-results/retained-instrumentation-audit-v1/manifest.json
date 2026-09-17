@@ -1,0 +1,7 @@
+{
+  "archive": "retained-instrumentation-audit-v1",
+  "payload_sha256": {
+    "provenance.json": "ba8a90794dd5c2ab5ea3805955032184ddc7d75f9812872565d27db973f8ac92",
+    "variants.json": "85031beae2f701be02db42e689de2f1bdd2dd50787332b9c17783f150889bc7a"
+  }
+}

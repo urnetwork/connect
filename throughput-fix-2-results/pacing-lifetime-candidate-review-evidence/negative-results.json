@@ -1,0 +1,7 @@
+{
+  "candidate_status": "unaccepted",
+  "fixture_race_record": "Initial after23PASS1FAIL1race is an unlocked FIFO precondition fixture read; final fixture uses service lock. Originalbefore12PASS12FAIL0race retained.",
+  "full_selector_limit": "334 PASS2 FAIL0 race; both failures construct sendItem with sendTime but no ackTimeout, unlike real producer. They need explicit real lifetime before interpreting as policy regressions. No correction rerun yet.",
+  "older_record_schedule_root": "Older item sent0 expires500ms; younger item sent100ms waits600ms with own lifetime600ms. Both baseline and current candidate miss older500ms callback,3/3 each. This remains open and candidate is not complete.",
+  "scope_boundary": "No shared production change or integration follows from this evidence."
+}

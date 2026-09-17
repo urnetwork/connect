@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "47620e552cade2d7a0d11b0df10ac41ca15143fc46ee3646977efd99317c02c3",
+  "binary_sha256": "5f33787d4517217c298218d9c21624c5cce4f92b2b1064a823cc2ea54a363e13",
+  "effective_inputs_sha256": "f63962e1e0104cd63189b6db0054cb789879fe16b3863ee90abac421cb0c34af",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiver(SustainedPacingEscapesSlowHold|BatchedSplitPacingEscapesSlowHold|LegalRollingQueueReducesFastHold|LegalRollingQueueLegacyControl|LegalRollingQueueMixedControl|LegalSharedPositiveServiceBudget|OwnedFirstPrefixCannotBorrowSiblingStart|OwnedCausalReversalCannotBorrowSiblingSpan|OwnedTiesKeepTheirBytesAcrossPublicationOrder)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as build; absolute relationship pinned by original status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T21:22:01.921930+00:00",
+  "loadavg_start": [
+    4.46728515625,
+    5.9755859375,
+    8.484375
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 24.550089583266526,
+  "loadavg_end": [
+    4.72216796875,
+    5.912109375,
+    8.38818359375
+  ],
+  "ended_utc": "2026-09-16T21:22:26.472857+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "e296f4e06f07f06ca645f9b9c815ec164f286ede70d0a09a97881bceba8f150c",
+  "pass": 24,
+  "fail": 3,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "24P3F: lawful batched read-order component root fails; all eight ownership/slowdown/frequent-read controls pass. No actual closed-loop claim.",
+  "rows": 438
+}

@@ -1,0 +1,61 @@
+{
+  "created_utc": "2026-09-16T23:36:29.827018+00:00",
+  "mode": "model-core",
+  "test_pattern": "^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*|TestWindowPathSdk.*|TestWindowPathAckTailRoundTripGrowthControl)$",
+  "run_flags": [
+    "-test.short=false",
+    "-test.skip",
+    "^(TestWindowPathAckTailRoundTripGrowthControl|TestWindowPathServiceRoundTripChanges|TestWindowPathServiceRoundTripGrowthBeyondOldRing)$"
+  ],
+  "connect": {
+    "revision": "f903f59a96e629f8b1dfa5849d7a3198aaef9920",
+    "branch": "throughput-fix-2",
+    "source_sha256": "9d37f91caa3adc8948ae65b6b92144dd676be0d6f133d873c1e1c6816cf97090",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "dc704cfabe709830dac33c702ad21e68ca407976b87b05a0f50f422c223b03b7",
+  "benchmark_ledger_parser_sha256": "566ed53eb6762d5daea23b5dac1492d279c25c1e8fbee9b6d52c0ffda1fb9585",
+  "host_load_average_at_start": [
+    9.78759765625,
+    6.9697265625,
+    6.43310546875
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {},
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "deferred_tests": {
+    "reason": "User deferred explicit connection-quality-change performance tests until NetworkQualityChanged is implemented and invoked at the modeled path switch.",
+    "tests": [
+      "TestWindowPathAckTailRoundTripGrowthControl",
+      "TestWindowPathServiceRoundTripChanges",
+      "TestWindowPathServiceRoundTripGrowthBeyondOldRing"
+    ],
+    "retained_core_coverage": "Static paths, cold and warm pacing recovery, sustained congestion, window changes, ACK scheduling, ownership and FIFO fixture correctness.",
+    "complete_historical_mode": "model"
+  },
+  "deferred_tests_sha256": "9b44cca05105b10c1fb67b970b807f783311992a2dacde1b4b50c94143f26ad8",
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 906,
+        "input_sha256": "f6f8a9c98ac64e49df14aadf2a743cd14e1790d3d29bea7268c6794bc49af38c"
+      }
+    },
+    "external_local_replacements": [
+      "/Users/brien/urnetwork/glog"
+    ],
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "binary_sha256": "3c6699c5280c4afd85d0b2d4575660245087026f0b6b9e1145d7e21599e27108",
+  "sources_stable_during_build": true,
+  "source_inspection_uses_build_snapshot": true
+}

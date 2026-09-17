@@ -1,0 +1,38 @@
+mismatch send=50331648 receive=2097152 final-receive=65536 rtt=100ms compression=10ms flows=8 ceiling=4.669 fixed=4.659 min-flow=0.582 model Mb/s window=65536 pace=2938100 drops=0/0
+mismatch send=50331648 receive=2097152 final-receive=65536 rtt=100ms compression=50ms flows=8 ceiling=4.598 fixed=3.543 min-flow=0.440 model Mb/s window=65536 pace=587620 drops=0/0
+SDK sender=connect-process-default/402653184/false/false receiver=sdk-provider-h1/33554432/true/true rtt=300µs flows=8 both=true reference=1708.052480 candidate=1692.364800 direction=[956.85632 751.19616]/[956.84608 735.51872]
+SDK sender=sdk-device-h1/33554432/true/false receiver=connect-process-default/402653184/false/false rtt=400ms flows=1 both=false reference=130.945873 candidate=59.606790 direction=[130.94587317073172]/[59.606790243902445]
+SDK direction 0 reference=130.945873 candidate=59.606790
+SDK sender=sdk-device-h1/33554432/true/false receiver=connect-process-default/402653184/false/false rtt=400ms flows=1 both=false reference=130.933385 candidate=132.483122 direction=[130.93338536585367]/[132.48312195121952]
+--
+SDK sender=sdk-device-default/33554432/true/false receiver=connect-process-default/402653184/false/false rtt=100ms flows=1 both=false reference=483.840000 candidate=98.529280 direction=[483.84]/[98.52928]
+SDK direction 0 reference=483.840000 candidate=98.529280
+SDK sender=sdk-device-default/33554432/true/false receiver=connect-process-default/402653184/false/false rtt=100ms flows=8 both=false reference=483.891200 candidate=96.952320 direction=[483.8912]/[96.95232000000001]
+SDK direction 0 reference=483.891200 candidate=96.952320
+SDK sender=sdk-device-default/33554432/true/false receiver=connect-process-default/402653184/false/false rtt=400ms flows=1 both=false reference=131.042029 candidate=51.614595 direction=[131.0420292682927]/[51.614595121951226]
+SDK direction 0 reference=131.042029 candidate=51.614595
+SDK sender=sdk-device-default/33554432/true/false receiver=connect-process-default/402653184/false/false rtt=400ms flows=8 both=false reference=131.047024 candidate=52.511220 direction=[131.0470243902439]/[52.511219512195126]
+SDK direction 0 reference=131.047024 candidate=52.511220
+SDK sender=connect-process-default/402653184/false/false receiver=sdk-device-h1/33554432/true/false rtt=300µs flows=1 both=false reference=958.095360 candidate=958.095360 direction=[958.09536]/[958.09536]
+--
+SDK sender=sdk-device-h1/33554432/true/false receiver=connect-process-default/402653184/false/false rtt=100ms flows=1 both=false reference=483.379200 candidate=430.161920 direction=[483.3792]/[430.16192]
+SDK direction 0 reference=483.379200 candidate=430.161920
+SDK sender=sdk-device-h1/33554432/true/false receiver=connect-process-default/402653184/false/false rtt=100ms flows=8 both=false reference=517.201920 candidate=528.353280 direction=[517.20192]/[528.35328]
+--
+SDK sender=sdk-device-default/33554432/true/true receiver=connect-process-default/402653184/false/false rtt=100ms flows=1 both=false reference=338.394764 candidate=179.954036 direction=[338.3947636363636]/[179.95403636363633]
+SDK direction 0 reference=338.394764 candidate=179.954036
+SDK sender=sdk-device-default/33554432/true/true receiver=connect-process-default/402653184/false/false rtt=100ms flows=8 both=false reference=338.404073 candidate=180.037818 direction=[338.4040727272727]/[180.03781818181818]
+SDK direction 0 reference=338.404073 candidate=180.037818
+SDK sender=sdk-device-default/33554432/true/true receiver=connect-process-default/402653184/false/false rtt=400ms flows=1 both=false reference=90.761366 candidate=49.440468 direction=[90.76136585365855]/[49.44046829268293]
+SDK direction 0 reference=90.761366 candidate=49.440468
+SDK sender=sdk-device-default/33554432/true/true receiver=connect-process-default/402653184/false/false rtt=400ms flows=8 both=false reference=90.753873 candidate=49.439220 direction=[90.75387317073171]/[49.43921951219512]
+SDK direction 0 reference=90.753873 candidate=49.439220
+SDK sender=connect-process-default/402653184/false/false receiver=sdk-device-h1/33554432/true/true rtt=300µs flows=1 both=false reference=958.105600 candidate=958.095360 direction=[958.1056]/[958.09536]
+--
+SDK sender=connect-process-default/402653184/false/false receiver=sdk-device-h1/33554432/true/false rtt=100ms flows=1 both=true reference=566.621091 candidate=321.065891 direction=[107.48276363636363 459.1383272727272]/[114.31563636363636 206.75025454545454]
+SDK direction 1 reference=459.138327 candidate=206.750255
+SDK sender=connect-process-default/402653184/false/false receiver=sdk-device-h1/33554432/true/false rtt=100ms flows=8 both=true reference=645.948509 candidate=625.542982 direction=[524.9024 121.04610909090907]/[515.5374545454545 110.00552727272728]
+--
+SDK sender=connect-process-default/402653184/false/false receiver=sdk-device-h1/33554432/true/true rtt=100ms flows=1 both=true reference=448.288582 candidate=319.157527 direction=[109.67039999999999 338.6181818181818]/[110.96436363636363 208.19316363636364]
+SDK direction 1 reference=338.618182 candidate=208.193164
+SDK sender=connect-process-default/402653184/false/false receiver=sdk-device-h1/33554432/true/true rtt=100ms flows=8 both=true reference=458.500655 candidate=485.026909 direction=[353.4010181818182 105.09963636363636]/[366.9597090909091 118.0672]

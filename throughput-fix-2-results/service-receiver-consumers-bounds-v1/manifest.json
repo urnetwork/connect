@@ -1,0 +1,11 @@
+{
+  "archive": "service-receiver-consumers-bounds-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "a0dbe6c7e9bf439156469693fe29738fbd972fc9d037299de57f3a76d2844f6d",
+    "outcomes.jsonl": "a6d27dde150c5ecc536ae64cb11bd694e0b4969e6bcc5a468912dc4439ef8009",
+    "provenance.json": "cdc93dc4109eac861c3b2eb8ca18aeb0c1dd96569794dca1975071750df4e94d",
+    "source-pins.json": "45f7c38a069dc1481a7ca54de43f2f0a458af998a3f393f140689f9f9850f3be",
+    "status.json": "fc6eb33e9d8a5ab2734aa6d76784ceeb29579ca7f02283845871311c6f1f68b8",
+    "worker-readings.jsonl": "5cf66a3af44ef4a7838eb8a966e793fe5b8092e249c7256881da5419b41fc9e4"
+  }
+}

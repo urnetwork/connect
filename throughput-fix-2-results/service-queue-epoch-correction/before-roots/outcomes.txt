@@ -1,0 +1,25 @@
+=== RUN   TestWindowPacingAbandonedDrainCannotResetLaterService
+--- PASS: TestWindowPacingAbandonedDrainCannotResetLaterService (0.00s)
+=== RUN   TestWindowPacingFirstQueuedTimingAfterEpochKeepsProvenance
+--- FAIL: TestWindowPacingFirstQueuedTimingAfterEpochKeepsProvenance (0.00s)
+=== RUN   TestWindowPacingPostDrainFirstBytesKeepQueueProvenance
+--- PASS: TestWindowPacingPostDrainFirstBytesKeepQueueProvenance (0.00s)
+=== RUN   TestWindowPacingColdQueuedTimingDoesNotInventDelivery
+--- PASS: TestWindowPacingColdQueuedTimingDoesNotInventDelivery (0.00s)
+=== RUN   TestWindowPacingAbandonedDrainCannotResetLaterService
+--- PASS: TestWindowPacingAbandonedDrainCannotResetLaterService (0.00s)
+=== RUN   TestWindowPacingFirstQueuedTimingAfterEpochKeepsProvenance
+--- FAIL: TestWindowPacingFirstQueuedTimingAfterEpochKeepsProvenance (0.00s)
+=== RUN   TestWindowPacingPostDrainFirstBytesKeepQueueProvenance
+--- PASS: TestWindowPacingPostDrainFirstBytesKeepQueueProvenance (0.00s)
+=== RUN   TestWindowPacingColdQueuedTimingDoesNotInventDelivery
+--- PASS: TestWindowPacingColdQueuedTimingDoesNotInventDelivery (0.00s)
+=== RUN   TestWindowPacingAbandonedDrainCannotResetLaterService
+--- PASS: TestWindowPacingAbandonedDrainCannotResetLaterService (0.00s)
+=== RUN   TestWindowPacingFirstQueuedTimingAfterEpochKeepsProvenance
+--- FAIL: TestWindowPacingFirstQueuedTimingAfterEpochKeepsProvenance (0.00s)
+=== RUN   TestWindowPacingPostDrainFirstBytesKeepQueueProvenance
+--- PASS: TestWindowPacingPostDrainFirstBytesKeepQueueProvenance (0.00s)
+=== RUN   TestWindowPacingColdQueuedTimingDoesNotInventDelivery
+--- PASS: TestWindowPacingColdQueuedTimingDoesNotInventDelivery (0.00s)
+FAIL

@@ -1,0 +1,6 @@
+{
+  "classification": "Initial joined shared-ring/cold-consumer candidate passes four utilization roots but newly written early-return test incorrectly requires initial rather than retained window. This original failed control is preserved, not production acceptance.",
+  "outcomes": 144,
+  "readings": 30,
+  "worker_readings": 0
+}

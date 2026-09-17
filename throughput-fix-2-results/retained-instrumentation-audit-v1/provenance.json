@@ -1,0 +1,11 @@
+{
+  "archive_instrumentation_claim_mismatches": 0,
+  "audited_variants": 56,
+  "classification": "Read-only build instrumentation audit, not a new test execution.",
+  "corrected_report_claim": "The 12 retained-policy adjacent passes were nonrace. Archive provenance already said false; report prose has been corrected.",
+  "invalid_occupancy_comparison": "Race v4 and nonrace older sampler cannot establish source causality. Matching race instrumentation reproduces failure with the older sampler as well. Every original outcome remains retained.",
+  "method": "Match each archived compile-manifest digest to the original frozen compile manifest and confirm binary digest. If the older manifest omits build flags, verify the pinned binary SHA and inspect its go version -m race setting.",
+  "nonrace_variants": 14,
+  "race_variants": 42,
+  "unresolved_variants": 0
+}

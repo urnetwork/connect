@@ -1,0 +1,11 @@
+{
+  "binary_sha256": "430978bc787e05cd0a49a8f2caaf82ff2e23f939c8f8550e344a4992a0c2c88a",
+  "interpretation": "Virtual-time model evidence only. Isolated phase-root causality is in service-flight-phase-correction; this combined checkpoint includes other individually proved changes.",
+  "no_quiescence_wait": true,
+  "outcome": "Both runs fail changing receiver windows and long SDK profiles. The corrected six-test run has four passes and two failures. RTT growth, both capacity controls and ShortCompressed pass.",
+  "race": false,
+  "role": "Actual-worker follow-through after isolated ACK-phase correction.",
+  "selector_correction": "The first expression selected five tests because ShortCompressed has a different prefix. A second run on the same binary uses the corrected six-test expression. Both terminal runs are preserved; they are not an isolated before/after comparison.",
+  "source_inputs_sha256": "430b893dae7c0fc4265e0ee5ba33d6896c586eb76b1b3860e7a4141e9dc5a4f0",
+  "source_scope": "Includes retained sizing, cumulative carrier scope, writer synchronization, queue-epoch and ACK-phase sampler corrections. Excludes later mixed-feedback eligibility and proposed receiver-wait delivery intervals."
+}

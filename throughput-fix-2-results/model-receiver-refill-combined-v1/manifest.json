@@ -1,0 +1,10 @@
+{
+  "archive": "model-receiver-refill-combined-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "a363e37543772ad595cd78760c5dbd84b7e948c43f8daa6da8ecbf3fc9fe86b5",
+    "outcomes.jsonl": "a1dedd7fed2b6cbc3530238b05ed3f2247c977744ac12011120ed5bbf8f60200",
+    "provenance.json": "fdaac19d182e6b91d20519d19b85d84f8b97da05225da085a88bba67f8161d48",
+    "source-pins.json": "e18e0020ec389398c5dafea41a8011d74babb6b781d3bcb0a06160a22052739c",
+    "status.json": "59ecc2c35216ef6c86c0ab24ddfcf7978479f4ebf89c7158c6afa6888550af05"
+  }
+}

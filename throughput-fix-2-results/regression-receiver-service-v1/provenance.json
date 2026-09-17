@@ -1,0 +1,9 @@
+{
+  "interpretation": "No other root-package regression failure is observed on this source. The bounded slowdown correction has separate before/after proof and507 scoped race passes; this pre-fix full regression does not validate that later source.",
+  "no_quiescence_wait": true,
+  "outcome": "3334 passes, one failure and25 skips. InterleavedSlowdownAdaptsWithInvalidRing keeps12.5MB/s while the actual queued serializer supplies4MB/s in both callback orders and phases.",
+  "race": false,
+  "role": "Complete regression over current copied root-package tests, excluding the separately running model prefix.",
+  "source_scope": "Includes restored cumulative pacing, every current earlier root and coalescer benchmark, plus all receiver consumer and ordering roots. No network-quality event plumbing.",
+  "working_directory": "Exact copied Go module used at build; source pins and compiled binary verified."
+}

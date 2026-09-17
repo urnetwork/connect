@@ -1,0 +1,30 @@
+{
+  "all_pins_verified_at_handoff": true,
+  "archive_kind": "recovery_drain_ablation_evidence",
+  "classification": "matched_diagnostic_ablation_not_performance_acceptance",
+  "findings": [
+    "Both10Mb/s short/compressed failures exist on8cda production with current frozen test inputs:8.17152Mb/s versus9.58464Mb/s reference. They also fail after retry-only and retry+drain, so they predate these two corrections.",
+    "The long cell already fails on8cda (5.270187Mb/s). Retry-clock-only is similar (5.249707Mb/s); adding unprovable-drain eligibility/abort accounting produces the extra collapse (0.389120Mb/s) under this matched input. The original full f9 campaign failure is preserved separately; no run is discarded.",
+    "All long variants learn approximately1.200s RTT, retain262144B windows and have zero measured/total relay drops. Final service byte rates are1993137,1980322and56786B/s. This locates the remaining throughput problem beyond mere RTT-floor discovery but does not yet prove a specific service sample transition.",
+    "All11 direct unprovable-drain liveness roots remain passing on f9. No liveness gate was removed and no production rollback or timer/sampler fix is proposed by this ablation."
+  ],
+  "fixture_filter": "Skip all matrix rows except1250000B/s,300usRTT,50mscompression,flows1and8. Original warmup, duration, measured arms, thresholds and queue/drop checks are unchanged. Same fixture in all variants.",
+  "input_handoff_sha256": "6836221294ec8558ecc5336d09877c90c8d6c66f1dba4e7d148793f54565b27d",
+  "input_pins_verified": 19,
+  "limitations": [
+    "One predeclared execution per variant under current load; all outcomes and intervals retained.",
+    "This identifies the drain change set as the additional long-path degradation in the matched experiment; it does not isolate start eligibility versus active abort versus estimator interaction.",
+    "The filtered matrix intentionally omits52other configurations; their original full-campaign outcomes remain independently preserved.",
+    "The three variants share a separately frozen glog copy; the origin full campaign declared its local replacement external.",
+    "No speculative tuning, production mutation, queue increase or acceptance-gate change."
+  ],
+  "sanitization": {
+    "all_eighteen_numeric_readings_and_nine_failed_comparisons": "retained",
+    "local_paths_network_addresses_and_generated_ids": "excluded",
+    "original_full_campaign": "separate immutable evidence; not relabeled or replaced by the filter",
+    "raw_sources_logs_overlays_and_binaries": "excluded; SHA-256 pins retained only"
+  },
+  "schema_version": 1,
+  "scope": "Matched three-production ablation on immutable model inputs. Identical fixture filter selects only two originally failed service-matrix rows; original warmup/duration/gates unchanged. Original long-RTT test unchanged.",
+  "throughput_acceptance": "not evaluated"
+}

@@ -1,0 +1,38 @@
+{
+  "go_version": "go1.26.7 darwin/arm64",
+  "no_quiescence_wait": true,
+  "sources": {
+    "before": {
+      "transfer.go": "5518f94a846c7472ed5b74f3cf20f4775cd6425e3bd73007ccb32be6f7c20096",
+      "transfer_window_pacing.go": "345b06a0f1fa96dcf6135f1451c371e162ec295e7b8cabe090e0f247d1fe92b5",
+      "note": "transfer.go already carries the two inert SendWindowEstimate fields; no behavior change yet"
+    },
+    "after": {
+      "transfer.go": "3e035b5e3d517d9cb0af36b4d596e6bbe01b58ff88261c9d062364ac4f11d4cf",
+      "transfer_window_pacing.go": "f912f618e1ded60c7a79cb7b0d39b42d9da4b888a14fcaaddd23fac1934ee128"
+    },
+    "after_repin_v2": {
+      "transfer.go": "21e9ca9ebbc189f1e127eda3d3136b5c4bc33e9b900030760cda6b540bbdc466",
+      "transfer_window_pacing.go": "b89a193284894bb004931792d92ecee52bb65e2b3938e921921722fe85d5a773",
+      "transfer_window_cumulative_pacing_test.go": "5c0b2bac6677b7714395cf525b4ddd1265b707188ce20244db1ce4bdf47cd3e9",
+      "transfer_window_pacing_discovery_state_test.go": "452eb01e20152e503ceaea37152d0907fdb46bbb6b4f3ee95741a0e0eb4cd2f9",
+      "note": "hold release on every queued observation, H1-only gating of the discovery/hold reads, and the re-pinned cumulative contract"
+    }
+  },
+  "logs": {
+    "before.log": "862852d0f90f9579c062fe3415e43d7067e7c2746f0e7f56170460cb803bb0a8",
+    "after.log": "ec76f5b1e741a2b4606fc6a38742b0964f4894505404a5d3527ddd8d2d25ebe8",
+    "sdk-after.log": "27fd4c192410fdeb3fa9f8f9fc253dd5f8a5056852d8bf27e36612ab16644129",
+    "repin-v2.log": "5270ed87ffcc6853dbfa28e6c55c14b3807981330f1afa8d48c335b4e487f785",
+    "sdk-v2.log": "4d91ce5d8933d893d7e32a0f7a28b616ff59a8acea8ce2ba23d6f0b3e5838d25"
+  },
+  "uptime": {
+    "before.log": "18:45  up 28 days,  2:02, 8 users, load averages: 10.28 7.79 6.86",
+    "after.log": "18:48  up 28 days,  2:04, 8 users, load averages: 10.14 8.08 7.10",
+    "sdk-after.log": "18:48  up 28 days,  2:05, 8 users, load averages: 10.22 8.27 7.19",
+    "correctness": "18:49  up 28 days,  2:05, 8 users, load averages: 9.55 8.37 7.28",
+    "repin-v2.log": "19:08  up 28 days,  2:25, 8 users, load averages: 6.55 6.78 6.66",
+    "sdk-v2.log": "19:08  up 28 days,  2:25, 8 users, load averages: 6.32 6.72 6.64",
+    "correctness-v2": "19:09  up 28 days,  2:26, 8 users, load averages: 5.35 6.42 6.54"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "changes_from_prior_combined_selection": "Identical transfer.go; sampler adds queued-bucket horizon and gap qualification corrections, with their two root-test files. Excludes later cumulative carrier-scope, writer synchronization and empty-ring provenance changes.",
+  "excluded_build_attempt": "An initial invocation rejected an unsupported build argument before compilation; its raw build diagnostic remains outside the archive and is not a test outcome.",
+  "interpretation": "These are virtual-time throughput tests, not host-clock capacity acceptance. Race and nonrace binaries use identical immutable effective inputs. Preserve both runs; they are not independent before/after sources.",
+  "no_quiescence_wait": true,
+  "race_by_variant": {
+    "nonrace": false,
+    "race": true
+  },
+  "result": "Each variant has four passes and two failures. RTT-growth, settled capacity changes, capacity-increase recovery and short compression pass. Changing receive windows and long SDK profiles still fail.",
+  "role": "Frozen six-gate actual-worker follow-through for isolated horizon and gap-qualification sampler corrections.",
+  "run_pattern": "^(TestWindowPath(WindowMismatchChanges|ServiceRoundTripGrowthBeyondOldRing|RetainedSdkCumulativePacingLong|ServiceCapacityIncreaseRecovery|ServiceSettledLargeMessageCapacityChanges)|TestWindowPacingShortCompressedServiceKeepsMeasuredCapacity)$",
+  "source_boundary": {
+    "effective_inputs_sha256": "0bb47657f2fcdc21e35e2e7e28475e969b9b3ca4720b8a440f54b8cb95017a20",
+    "transfer_go_sha256": "f89becf4e04e371c2c32d4e4da0bf01544745fc294314dfa5ce4aa01d675f930",
+    "transfer_window_pacing_go_sha256": "ba5df237317e9a3e9771b7b2efec89bc25df9f7a837b47828ff2e76589eb4d15"
+  },
+  "test_count": 1
+}

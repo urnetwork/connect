@@ -4905,27 +4905,13 @@ type SendBufferSettings struct {
 	// `ResendQueueBudget` is set: below it admission never consults the
 	// shared budget, so every sequence progresses on floor capacity alone
 	ResendQueueMinByteCount ByteCount
-	// DeliverySizedWindowScale turns the send window from a constant into a
-	// measurement of the path: the window becomes what this lane delivered
-	// over the last acknowledgement round trip, multiplied by this, clamped
-	// between `ResendQueueMaxByteCount` as the floor and the ceiling below.
-	//
-	// Why a multiple of delivery. A window-limited flow delivers exactly its
-	// window per round trip by definition, so a scale of two doubles the
-	// window each round trip until the flow is no longer window-limited and
-	// then holds. From a 2 MiB floor to a 16 MiB ceiling is three round trips,
-	// under a tenth of a second at 25 ms, and the converging phase is never
-	// worse than today's constant because the floor is today's constant.
-	//
-	// The estimate's errors are asymmetric and both bounded. Too short a round
-	// trip shrinks the delivered count and the window, which is today's
-	// behaviour. Too long grows it toward the ceiling, costing memory and at
-	// most one round trip of extra queueing for the client's other flows,
-	// which is why the scale should not exceed two.
-	//
-	// Zero, the shipping default, keeps the constant. The before and after are
-	// then the same binary with one field changed, which is what measuring a
-	// multiple on one cell needs.
+	// Positive values grow the configured opening from qualified rate times
+	// window residence. Cumulative delivery needs a multi-RTT history; measured
+	// serialization can authorize earlier growth when the opening is too small
+	// to fill that history. Shared H1 evidence applies only to current H1 lanes.
+	// Ordinary feedback retains the largest learned capacity while pacing
+	// adapts both ways. Peer, memory and configured-byte permissions still
+	// clamp effective admission. Zero keeps the configured constant.
 	DeliverySizedWindowScale int
 	// CarrierChangeVoidsSelectiveAck lets the retired-carrier recovery move
 	// selectively acknowledged items too (THROUGHPUTFIX §37.17 guard two).
@@ -4934,9 +4920,9 @@ type SendBufferSettings struct {
 	// from-delivery derives the scale, the ceiling, the budget and the initial
 	// bet and turns the rule on (THROUGHPUTFIX §37.4).
 	WindowSizing WindowSizingPolicyKind
-	// TargetGoodputByteRate caps the window at the target's bandwidth-delay
-	// product, so a path faster than the target does not take more than the
-	// target. Zero leaves the target term out.
+	// Caps pacing and new window candidates at the target's rate and
+	// bandwidth-delay product. A lower target does not erase learned capacity.
+	// Zero leaves the target terms out.
 	TargetGoodputByteRate ByteCount
 	// The ceiling for the rule above. It is a share of a budget rather than a
 	// per-sequence constant: forty simultaneous downloaders at 16 MiB would
@@ -5739,6 +5725,11 @@ func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, e
 		if success, err = sendSequence.Pack(sendPack, timeout); err == nil {
 			return success, nil
 		}
+		if sendPack.Ctx.Err() != nil {
+			// This caller still owns an unadmitted Pack. Its cancellation
+			// says nothing about the shared sequence or accepted siblings.
+			return false, err
+		}
 		if errors.Is(err, ErrEncryptionRequiredNotEstablished) {
 			// Not a sequence problem: the Required entry gate refused the
 			// send. Retrying on a recreated sequence would wait the same
@@ -5756,10 +5747,10 @@ func (self *SendBuffer) Pack(sendPack *SendPack, timeout time.Duration) (bool, e
 // destination's ReceiveSequence intercepts these frames into the per-peer
 // session.
 //
-// `ctx` gates whether the spawned goroutine may enqueue (it bails if done). The
-// pack uses the SendBuffer's ctx — the session ctx must not propagate into
-// `SendPack.Ctx`, since SendBuffer.Pack treats a canceled `SendPack.Ctx` as a
-// sequence problem and cancels the SendSequence.
+// `ctx` gates entry and retries. Each admission attempt uses the SendBuffer's
+// lifetime, so session cancellation does not retract an attempt already in
+// progress. Successful admission transfers its bytes to the sequence's ordinary
+// delivery lifetime.
 func (self *SendBuffer) SendEncryptedControl(
 	ctx context.Context,
 	peerId Id,
@@ -5965,11 +5956,7 @@ func (self *SendBuffer) DestinationSendStats(destinationId Id) SendDestinationSt
 		stats.ResendWriteByteCount += sequence.resendWriteByteCount.Load()
 		// the window's own lock is a leaf, and the buffer lock above is
 		// already released
-		// the largest window any of them computed, with its evidence
-		if windowEstimate := sequence.sendWindowSnapshot(now); stats.SendWindow.Window < windowEstimate.Window ||
-			(windowEstimate.Sized && !stats.SendWindow.Sized) {
-			stats.SendWindow = windowEstimate
-		}
+		stats.observeWindowEstimate(sequence.sendWindowSnapshot(now))
 		if estimate := sequence.rttWindow.Estimate(); estimate.Sampled() {
 			meanRttTotal += estimate.Mean
 			stats.Rtt.SampleCount += estimate.SampleCount
@@ -6297,7 +6284,13 @@ type SendSequence struct {
 	resendWriteCount     atomic.Uint64
 	resendWriteByteCount atomic.Uint64
 
+	// The send worker owns replacement and all direct uses. Statistics copy
+	// the handle under this leaf lock before reading its concurrent policy.
+	contractWriterStateLock  sync.Mutex
 	contractMultiRouteWriter MultiRouteWriter
+	// Nil in production; tests rendezvous at the handle access after external
+	// selector effects, without holding the publication lock.
+	beforeContractWriterAccessForTest func(publish bool)
 	// Delivery checkpoints pair time, cumulative release and first-delivered
 	// service totals. The 64-entry ring costs 1,536 bytes, allocated only for
 	// a delivery-sized window or delivery-bounded reliable admission.
@@ -6310,6 +6303,8 @@ type SendSequence struct {
 	deliveredBytesCount       int
 	deliveredByteTotal        ByteCount
 	deliveredServiceByteTotal ByteCount
+	// Admission retains capacity independently of the adaptive service rate.
+	windowSize sendWindowSizeState
 	// the receiver's latest advertised hold (THROUGHPUTFIX §37.3)
 	receiveWindowByteCount atomic.Uint64
 	receiveWindowSet       atomic.Bool
@@ -7169,14 +7164,14 @@ func (self *SendSequence) coalesceReceivedAck(
 		ackWindow.UpdateContractMissing(sequenceAck)
 		return
 	}
-	self.observeReceiverAckRtt(ack)
+	receiverTiming := self.observeReceiverAckRtt(ack)
 	if service := self.windowPacer.service; service != nil {
 		at := time.Now()
 		if ack.receivedAtNanos != 0 {
 			at = time.Unix(0, ack.receivedAtNanos)
 		}
 		service.acknowledgeWrite(self.sequenceId, ack.messageId, sequenceNumber, ack.selective, self.ackCompressionResidence(), at)
-		self.publishAckServiceCredit(ack.messageId, ack.selective, at)
+		self.publishAckServiceCreditWithTiming(ack.messageId, ack.selective, at, receiverTiming)
 	}
 	ackWindow.Update(sequenceAck)
 	if self.sendBuffer != nil && self.sendBuffer.afterAckCoalescedForTest != nil {
@@ -7554,11 +7549,19 @@ type transferFlightPolicyProvider interface {
 	transferFlightPolicy() transferFlightPolicySnapshot
 }
 
-// Reads the current immutable route generation. Before the first route write
-// opens a selector, or for a custom writer without policy support, admission is
-// intentionally unchanged.
+// Copies the worker-published handle before reading the immutable route
+// generation. The provider call holds no sequence lock. An unopened selector
+// or custom writer without policy support leaves admission unchanged.
 func (self *SendSequence) transferFlightPolicy() transferFlightPolicySnapshot {
-	if provider, ok := self.contractMultiRouteWriter.(transferFlightPolicyProvider); ok {
+	if before := self.beforeContractWriterAccessForTest; before != nil {
+		before(false)
+	}
+	writer := func() MultiRouteWriter {
+		self.contractWriterStateLock.Lock()
+		defer self.contractWriterStateLock.Unlock()
+		return self.contractMultiRouteWriter
+	}()
+	if provider, ok := writer.(transferFlightPolicyProvider); ok {
 		return provider.transferFlightPolicy()
 	}
 	return transferFlightPolicySnapshot{}
@@ -10670,12 +10673,19 @@ type SendWindowEstimate struct {
 	// what the sequence may hold unacknowledged, which is the initial size
 	// when the rule is off or holding
 	Window ByteCount
-	// Sized is whether the rule is on and had every bound it needs. False
-	// means Window is the initial size, which is a different fact from a
-	// measured window that happens to equal it, and Reason says which bound
-	// was missing.
+	// Retained capacity before current hard permission limits, and the latest
+	// sizing candidate. Sized and ServiceSized distinguish qualified evidence
+	// from bootstrap, independently of whether retention admits the candidate.
+	// Only admission can learn the candidate.
+	LearnedWindow   ByteCount
+	CandidateWindow ByteCount
+	// Whether the current candidate has qualified delivery and RTT evidence.
+	// Missing evidence preserves the last learned window; Reason names the gap.
 	Sized  bool
 	Reason string
+	// Serialization can qualify growth before a small opening has delivered
+	// enough whole flights for the cumulative-rate history to qualify Sized.
+	ServiceSized bool
 	// the rate the window was computed from: bytes acknowledged over the span
 	// they were acknowledged in. The delivery bound multiplies that rate by
 	// WindowRoundTrip and the configured scale.
@@ -10687,10 +10697,9 @@ type SendWindowEstimate struct {
 	WindowRoundTrip    time.Duration
 	AckCompressTimeout time.Duration
 	SampleCount        int
-	// The bounds. Initial is a starting value the rule climbs away from and is
-	// never a bound. Floor is the guaranteed working minimum. Ceiling is the
-	// share — what the queue's pool would lend it at full demand — narrowed by
-	// any configured ceiling, the peer's advertised capacity and the target.
+	// The opening, minimum working allowance, and current hard byte permission.
+	// The target's RTT-dependent sizing passes through retention rather than
+	// narrowing Ceiling and silently shrinking a previously learned window.
 	Initial ByteCount
 	Floor   ByteCount
 	Ceiling ByteCount
@@ -10698,12 +10707,13 @@ type SendWindowEstimate struct {
 	// has already borrowed, plus what is unreserved right now. Reported for
 	// diagnosis and never used as a clamp, because it is a transient.
 	Obtainable ByteCount
-	// TargetBound is whether the target's own bandwidth-delay product is what
-	// narrowed the ceiling. It is reported separately because a comparison
-	// between two target-clamped arms cannot show a window effect — both arms
-	// are measuring the target — and a reader has no other way to tell such a
-	// comparison from a meaningful one.
-	TargetBound bool
+	// Distinguish an effective target bound from a lower qualified candidate
+	// that retention did not admit. Campaigns must not conflate these cases.
+	TargetBound          bool
+	CandidateTargetBound bool
+	// A fresh, qualified cumulative interval can guide cold pacing before a
+	// serialization pair exists. This rate is never derived from retained bytes.
+	DeliveryByteRate ByteCount
 	// The same owner computes pacing from recently serialized delivery, so
 	// writers consume its result without interpreting the target themselves.
 	ServiceByteRate      ByteCount
@@ -10712,37 +10722,25 @@ type SendWindowEstimate struct {
 	ServiceBacklogged    bool
 	PacingProbeByteRate  ByteCount
 	PacingProbeByteCount ByteCount
+	// Until the shared service observes queueing, measured delivery only
+	// bounds capacity from below, so pacing may release the admitted window
+	// over one residence. The held rate is the pace last granted by
+	// admission; without congestion evidence the pace does not fall below it.
+	PacingDiscovery    bool
+	PacingHeldByteRate ByteCount
 }
 
-// sendWindowEstimate is the window this sequence may hold unacknowledged, and
-// the evidence behind it.
+// Admission retains qualified growth from cumulative delivery or measured
+// serialization: scale times rate times window residence, limited by target
+// sizing. An advertisement alone grants no learned capacity. Ordinary slow or
+// missing evidence preserves the learned window while the pacer remains
+// adaptive. Hard peer, shared-memory and configured-byte permissions clamp the
+// effective window without erasing the learned value.
 //
-// The form is `scale × rate × (minimum RTT + receiver compression)`, clamped.
-// Receiver compression reserves residence for a full acknowledgement cycle,
-// even when the fastest tag measured none of that delay.
-//
-// The multiplier is the minimum round trip and not the mean. The sender stamps
-// its tag ahead of the writer, so the mean contains the queue the window
-// itself creates: on a path bound below this sequence a window sized from the
-// mean feeds back on its own output and converges to its ceiling rather than
-// to the path. The minimum is the sample that queued least, which is the only
-// one that describes the path (THROUGHPUTFIX §36.7).
-//
-// The delivery term is a rate and not a sum over a horizon, for the reason
-// `deliveredRate` gives.
-//
-// A consequence worth stating because it removes a feature rather than adding
-// one: the plateau is this rule's fixed point without any detector. A window
-// larger than the path can carry produces no more delivery, so the rate stops
-// rising and the window stops with it, at the scale times the path's delivery
-// per round trip. The ceiling is then the backstop it was designed as, and a
-// well-behaved path never reaches it.
-//
-// The policy for what happens when a bound is missing is one sentence: the
-// sender sizes only against a bound it can see, and holds the initial size
-// where it cannot. A budget for memory, an advertisement for the receiver, an
-// estimate with samples for the round trip. That makes the safe configuration
-// the default and the unsafe one unreachable, rather than documented.
+// Residence includes a measured path RTT and receiver wait/compression. The
+// minimum and exact unloaded probes avoid treating the sender's own queue as
+// propagation; the mean raw RTT also contains that queue. Without a memory
+// budget the configured constant is retained within known byte limits.
 func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 	return self.estimateSendWindow(now, true)
 }
@@ -10755,31 +10753,29 @@ func (self *SendSequence) sendWindowSnapshot(now time.Time) SendWindowEstimate {
 
 // Admission and statistics share one window rule. Only admission retains
 // measured service for a later no-evidence interval.
-func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) SendWindowEstimate {
-	// The initial size is the value before the estimate has samples, and
-	// nothing after it. It is a bet, and a bet that cannot be walked back is
-	// not a bet: as the rule's lower clamp a wide-area initial would stand as
-	// a second of queue on a slow last mile for the life of the sequence
-	// (THROUGHPUTFIX §37.13). Once sampled the rule may shrink to what the
-	// path shows, and the only floor under it is the working minimum that
-	// reliable admission already uses.
-	//
-	// `initial` here is this sender's own constant window, which is what a
-	// peer that answers without the advertisement gets. The blind bet is the
-	// receive hold's floor and is applied below.
+func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) (estimate SendWindowEstimate) {
+	// Bootstrap from the configured opening. Ordinary feedback may grow it;
+	// only a future explicit quality remeasurement may authorize a reduction.
+	// Pacing remains continuously adaptive and hard byte bounds apply below.
 	initial := self.sendBufferSettings.ResendQueueMaxByteCount
 	floor := self.sendBufferSettings.ResendQueueMinByteCount
 	if floor <= 0 {
 		floor = initial
 	}
-	estimate := SendWindowEstimate{Window: initial, Initial: initial, Floor: floor}
+	estimate = SendWindowEstimate{Window: initial, Initial: initial, Floor: floor}
 	scale := self.sendBufferSettings.DeliverySizedWindowScale
 	if scale <= 0 || self.deliveredBytes == nil {
 		estimate.Reason = "the rule is off"
 		return estimate
 	}
 	if self.sendBufferSettings.TargetGoodputByteRate > 0 {
-		estimate.PacingByteRate = ByteCount(float64(self.sendBufferSettings.TargetGoodputByteRate) / goodputFactor)
+		// Floating conversion outside the integer range is architecture
+		// dependent. Saturate before converting both target-derived values.
+		targetRate := float64(self.sendBufferSettings.TargetGoodputByteRate) / goodputFactor
+		estimate.PacingByteRate = ByteCount(math.MaxInt64)
+		if targetRate < float64(math.MaxInt64) {
+			estimate.PacingByteRate = ByteCount(targetRate)
+		}
 		estimate.PacingProbeByteRate = estimate.PacingByteRate
 		estimate.PacingProbeByteCount = max(0, initial)
 		// Two compressed ACK intervals can measure one complete service
@@ -10806,7 +10802,15 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 				}
 				estimate.ServiceEstablished = true
 				estimate.ServiceBacklogged = service.backloggedAt(estimate.ServiceByteRate, now)
+				// Other carriers never consume the pace, so their estimates keep the service-relative value.
+				paced := self.transferFlightPolicy().h1Only
+				if paced {
+					estimate.PacingDiscovery, estimate.PacingHeldByteRate = service.pacingHold()
+				}
 				estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingByteRate)
+				if paced && retainService && estimate.WindowRoundTrip > 0 {
+					service.holdPacing(estimate.PacingByteRate)
+				}
 			}
 		}
 	}
@@ -10860,19 +10864,17 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 		ceiling = budget.TotalByteCount()
 	}
 	ceiling = max(ceiling, floor)
-	if configured := self.sendBufferSettings.DeliverySizedWindowCeilingByteCount; 0 < configured {
-		ceiling = min(ceiling, configured)
+	configuredCeiling := self.sendBufferSettings.DeliverySizedWindowCeilingByteCount
+	if 0 < configuredCeiling {
+		ceiling = min(ceiling, configuredCeiling)
 	}
 	estimate.Obtainable = self.resendQueue.ObtainableByteCount()
 
 	// The receiver it can see, and the three cases are different facts
 	// (THROUGHPUTFIX §37.21).
 	//
-	// Advertised: the peer's capacity is the largest harmless window, because
-	// permission is not occupancy and the one harm of an oversized window is
-	// the overrun the advertisement bounds. The window steps to it the moment
-	// it is learned rather than climbing toward it, or the derivation buys
-	// nothing.
+	// Advertised: capacity grants permission but does not measure delivery.
+	// The learned window starts small and grows within that permission.
 	//
 	// Answered without the field: a peer that does not advertise gets today's
 	// window at this sender's own scale. Not the shipping hold constant, which
@@ -10894,10 +10896,7 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 	// it, once per sequence, and it pays one round trip rather than a ramp.
 	stepAtNanos := int64(0)
 	if advertised, ok := self.receivedWindowAdvertisement(); ok {
-		// The peer's capacity is the window, stepped to the moment it is
-		// learned rather than climbed toward. It is the largest harmless one:
-		// permission is not occupancy, and the one harm of an oversized window
-		// is the overrun the advertisement bounds.
+		// An advertisement limits admission independently of learned capacity.
 		ceiling = min(ceiling, advertised)
 		stepAtNanos = self.receiveWindowSetAtNanos.Load()
 	} else if self.ackSeen.Load() {
@@ -10935,15 +10934,53 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 	// §37.4's configuration surface: the bet is what a layer believes about a
 	// path it has not measured, and a bound its peer has stated is not a
 	// belief. Clamp the bet, not only the estimate.
-	// The window is the ceiling until delivery lowers it. Each of the three
-	// cases above has already folded its own bet into the ceiling — the peer's
-	// capacity, this sender's constant, or the blind floor — so there is
-	// nothing left to take a minimum against. Taking one against the constant
-	// here was a defect: it capped the window at the initial size and left
-	// only the one-sided delivery term, so the step to the peer's capacity
-	// could never happen and a 16 MiB advertised hold still produced a 2 MiB
-	// window.
-	estimate.Window = max(ceiling, floor)
+	estimate.Window = min(max(initial, floor), ceiling)
+	serviceCandidate := ByteCount(0)
+	serviceTargetBound := false
+	// Candidate computation below never teaches an advertised maximum on its
+	// own. Statistics report the last admitted value without learning growth.
+	defer func() {
+		candidate := estimate.Window
+		candidateTargetBound := estimate.Sized && estimate.TargetBound && estimate.Reason == "target"
+		serviceCandidateChosen := estimate.ServiceSized && (!estimate.Sized || candidate < serviceCandidate)
+		if serviceCandidateChosen {
+			candidate, candidateTargetBound = serviceCandidate, serviceTargetBound
+			estimate.Reason = "measured service"
+			if candidateTargetBound {
+				estimate.Reason = "target"
+			}
+		}
+		learned := self.windowSize.estimate(max(initial, floor), candidate, estimate.Sized || estimate.ServiceSized, retainService)
+		estimate.LearnedWindow, estimate.CandidateWindow = learned, candidate
+		estimate.Window = min(max(learned, floor), ceiling)
+		estimate.CandidateTargetBound = candidateTargetBound
+		estimate.TargetBound = candidateTargetBound && estimate.Window == candidate
+		if estimate.Window != candidate {
+			estimate.Reason = "retained window"
+			if estimate.Window == ceiling {
+				estimate.Reason = estimate.bindingTerm(self, configuredCeiling)
+			}
+		} else if serviceCandidateChosen && estimate.Window == ceiling {
+			estimate.Reason = estimate.bindingTerm(self, configuredCeiling)
+		}
+		// Cumulative qualification occurs after service sampling. Finalize once
+		// both are known, without treating a retained window as a rate sample.
+		// The pace is computed after the admitted window is final because the
+		// discovery floor releases exactly that window over one residence.
+		if estimate.PacingProbeByteRate > 0 {
+			service := self.windowPacer.service
+			// Other carriers never consume the pace, so their estimates keep the service-relative value.
+			paced := service != nil && self.transferFlightPolicy().h1Only
+			if paced {
+				estimate.PacingDiscovery, estimate.PacingHeldByteRate = service.pacingHold()
+			}
+			estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingProbeByteRate)
+			// A blind read has no residence to hold a pace against.
+			if paced && retainService && estimate.WindowRoundTrip > 0 {
+				service.holdPacing(estimate.PacingByteRate)
+			}
+		}
+	}()
 
 	// A new sibling may already have shared receiver timing before its own
 	// first ACK. Read that evidence before the local cold-window decision.
@@ -10989,23 +11026,37 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 		if service := self.windowPacer.service; service != nil {
 			estimate.ServiceBacklogged = service.backloggedAt(estimate.ServiceByteRate, now)
 		}
-		estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingProbeByteRate)
 	}
 
 	// The target's own bandwidth-delay product, so a path faster than the
 	// target does not take more than the target (§37.4). Framed bytes, so the
 	// goodput target divides by the factor §36.3 derives.
+	sizingCeiling := ceiling
 	if 0 < self.sendBufferSettings.TargetGoodputByteRate {
-		targetWindow := ByteCount(
-			float64(self.sendBufferSettings.TargetGoodputByteRate) *
-				estimate.WindowRoundTrip.Seconds() / goodputFactor,
-		)
-		if bounded := max(targetWindow, floor); bounded < ceiling {
-			ceiling = bounded
+		targetBytes := float64(self.sendBufferSettings.TargetGoodputByteRate) * estimate.WindowRoundTrip.Seconds() / goodputFactor
+		targetWindow := ByteCount(math.MaxInt64)
+		if targetBytes < float64(math.MaxInt64) {
+			targetWindow = ByteCount(max(0, targetBytes))
+		}
+		if bounded := max(targetWindow, floor); bounded < sizingCeiling {
+			sizingCeiling = bounded
 			estimate.TargetBound = true
 		}
-		estimate.Ceiling = ceiling
-		estimate.Window = max(ceiling, floor)
+	}
+	// A window-limited opening cannot fill a multi-RTT delivery history at
+	// the measured serialization rate. That independent service observation
+	// can already size its required flight; an advertisement or one reply
+	// alone supplies no positive measured rate and cannot take this path.
+	if estimate.ServiceEstablished && estimate.ServiceByteRate > 0 && estimate.WindowRoundTrip > 0 &&
+		(self.windowPacer.service == nil || self.transferFlightPolicy().h1Only) {
+		serviceBytes := float64(estimate.ServiceByteRate) * estimate.WindowRoundTrip.Seconds() * float64(scale)
+		serviceCandidate = ByteCount(math.MaxInt64)
+		if serviceBytes < float64(math.MaxInt64) {
+			serviceCandidate = ByteCount(serviceBytes)
+		}
+		serviceCandidate = min(max(serviceCandidate, floor), sizingCeiling)
+		estimate.ServiceSized = true
+		serviceTargetBound = estimate.TargetBound && serviceCandidate == sizingCeiling
 	}
 
 	// the rate must span several acknowledgement bursts, and at least a couple
@@ -11022,18 +11073,8 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 	estimate.DeliveredByteCount = delivered
 	estimate.Interval = span
 
-	// The delivery term, one-sided and lagged.
-	//
-	// One-sided: it may lower the window below the peer's capacity but never
-	// raise it above what the peer said it can hold. Lagged: it acts only on
-	// delivery measured wholly after the window stepped to that capacity.
-	// Both are needed together. After the step, the delivery measured during
-	// the blind round trip is small, and a two-sided cap reading it would drag
-	// the window straight back down and reimpose the ramp the step exists to
-	// remove. With the lag, a path carrying the full capacity per round trip
-	// reads twice that and the cap does not bind, while a path carrying less
-	// comes down on its own evidence. The protection against oversizing is
-	// intact and it only ever acts downward.
+	// Delivery must belong to the current receiver permission and proved RTT
+	// history. Its candidate is separate from the retained admission window.
 	if service := self.windowPacer.service; service != nil && self.transferFlightPolicy().h1Only {
 		stepAtNanos = max(stepAtNanos, service.windowDeliveryStep())
 	}
@@ -11042,11 +11083,28 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 		return estimate
 	}
 	estimate.Sized = true
+	// A current whole-flight interval is a conservative pacing fallback, not
+	// physical serialization evidence. Tiny control traffic and old endpoints
+	// cannot reprice data; positive service remains authoritative in the pacer.
+	latestDelivery := time.Unix(0, spanStartNanos).Add(span)
+	if delivered > 0 && min(initial, kib(4)) <= delivered &&
+		!now.Before(latestDelivery) && now.Sub(latestDelivery) <= minSpan &&
+		(self.windowPacer.service == nil || self.transferFlightPolicy().h1Only) {
+		deliveryRate := float64(delivered) / span.Seconds()
+		estimate.DeliveryByteRate = ByteCount(math.MaxInt64)
+		if deliveryRate < float64(math.MaxInt64) {
+			estimate.DeliveryByteRate = ByteCount(deliveryRate)
+		}
+	}
+	estimate.Window = sizingCeiling
 	// The optional peer delay can be minutes. Multiply at 128-bit precision
 	// before dividing, so a valid large residence cannot wrap a busy window.
 	hi, lo := bits.Mul64(uint64(delivered), uint64(estimate.WindowRoundTrip))
 	perRoundTrip, _ := bits.Div64(hi, lo, uint64(span)) // span >= 2 * residence
-	estimate.Reason = estimate.bindingTerm(self)
+	estimate.Reason = estimate.bindingTerm(self, configuredCeiling)
+	if estimate.TargetBound {
+		estimate.Reason = "target"
+	}
 	if perRoundTrip <= uint64(estimate.Window)/uint64(scale) {
 		capped := ByteCount(uint64(scale) * perRoundTrip)
 		if capped < estimate.Window {
@@ -11062,7 +11120,7 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 // visibility is the difference between this rule and the constants it
 // replaces: a phone on a long path is bound by its advertised capacity and
 // says so, where before it was bound by a constant and said nothing.
-func (self SendWindowEstimate) bindingTerm(sequence *SendSequence) string {
+func (self SendWindowEstimate) bindingTerm(sequence *SendSequence, configuredCeiling ByteCount) string {
 	if self.Window <= self.Floor {
 		return "floor"
 	}
@@ -11084,6 +11142,9 @@ func (self SendWindowEstimate) bindingTerm(sequence *SendSequence) string {
 	if advertised, ok := sequence.receivedWindowAdvertisement(); ok &&
 		advertised <= self.Ceiling {
 		return "the peer's advertised capacity"
+	}
+	if configuredCeiling > 0 && configuredCeiling <= self.Ceiling {
+		return "the configured byte ceiling"
 	}
 	if share := sequence.resendQueue.LendableByteCount(); 0 < share &&
 		share <= self.Ceiling {
@@ -11913,7 +11974,15 @@ func (self *SendSequence) openContractMultiRouteWriter() MultiRouteWriter {
 		if self.contractMultiRouteWriter != nil {
 			self.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)
 		}
-		self.contractMultiRouteWriter = self.client.RouteManager().OpenMultiRouteWriter(destination)
+		writer := self.client.RouteManager().OpenMultiRouteWriter(destination)
+		if before := self.beforeContractWriterAccessForTest; before != nil {
+			before(true)
+		}
+		func() {
+			self.contractWriterStateLock.Lock()
+			defer self.contractWriterStateLock.Unlock()
+			self.contractMultiRouteWriter = writer
+		}()
 		self.contractMultiRouteWriterDestination = destination
 
 		// associate the destination with this sequence to receive acks
@@ -11957,7 +12026,14 @@ func (self *SendSequence) closeContractMultiRouteWriter() {
 	if self.contractMultiRouteWriter != nil {
 		self.retireNoAckFastPath()
 		self.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)
-		self.contractMultiRouteWriter = nil
+		if before := self.beforeContractWriterAccessForTest; before != nil {
+			before(true)
+		}
+		func() {
+			self.contractWriterStateLock.Lock()
+			defer self.contractWriterStateLock.Unlock()
+			self.contractMultiRouteWriter = nil
+		}()
 		self.contractMultiRouteWriterDestination = TransferPath{}
 	}
 }
@@ -15667,6 +15743,11 @@ func (self *ForwardBuffer) Pack(forwardPack *ForwardPack, timeout time.Duration)
 		}
 		if success, err = forwardSequence.Pack(forwardPack, timeout); err == nil {
 			return success, nil
+		}
+		if forwardPack.Ctx.Err() != nil {
+			// A canceled caller still owns this unadmitted frame; accepted
+			// siblings belong to the healthy shared forward sequence.
+			return false, err
 		}
 		// sequence closed
 	}

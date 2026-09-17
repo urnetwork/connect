@@ -1,0 +1,10 @@
+{
+  "archive": "model-flight-phase-combined-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "67a7cadb3f15392dd111c468d49fbb0dcd102db4caef1ae13925bf82417080ea",
+    "outcomes.jsonl": "6276b24e20a9bfc3597a1232d95233e12b9f4dfc939b1ce1b3b77b9eae02a1cc",
+    "provenance.json": "f1108a5626b2e8bfd7a7b085364438e3eb6179731a004fa9d80eaef8c9163867",
+    "source-pins.json": "6fc4997755b7640eae3604897e1b2846e893170ffacedd11aa478b04bd297823",
+    "status.json": "a229000816b33902bab5b769b3573c7d2a36fde7c07791e4a26002413fdfae8a"
+  }
+}

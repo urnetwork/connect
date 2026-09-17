@@ -4,31 +4,954 @@ Date: 2026-09-16
 Branch: `throughput-fix-2`
 Original validation source revision: `b51530f3a402cb1dd5fe5d1daae344302a1f3069`
 Original validation source manifest: `034a8ba28c61e70407d050228067a342b36f49505ae915cb99a7824a19bd90ee`
-Server source revision reviewed: `77201554c49ec05bde83ec038bba6c600972892c`
+Original server source revision reviewed: `77201554c49ec05bde83ec038bba6c600972892c`
 
 The completion audit and combined RTT fix below were committed in `5a2f8a02`.
 The original full-suite results do not validate those later production edits.
 
 ## Current follow-up
 
+**Current experiment: validate grow-only window sizing and adaptive pacing
+before adding network-quality events.**
+
+**Core validation passes on the current source.** The live source includes the
+discovery floor, held pacing rate and exact-head receiver-timing correction.
+Current scoped SDK checks pass the constrained 400 ms cells; a matched
+prefix-only comparison also changes both retained device short-duplex roles
+from repeated failures to mostly passing results under their original per-direction
+throughput gate. The pinned after comparison still fails once at 855.296 Mb/s
+versus 957.2352 Mb/s reference. The exact-head checkpoint passes the full core
+model (35 definitions, 842 readings), combined correctness and root regression
+(25 expected skips). A later pacing candidate preserves the held pace through
+one permitted reverse burst. It passes the fresh full core model (36
+definitions, 846 readings) and combined race correctness (512 definitions).
+The matched root comparison changes 12 passes/three failures to 15 passes;
+both matched SDK arms pass five repetitions, which does not establish a
+throughput improvement. The final root regression passes 3,345 tests with 25
+existing skips and no failures. Scoped server regression passes 35 connect
+race tests and 28 proxy nonrace tests with the exact reviewed environment
+configuration. Older experimental
+full-model failures remain historical evidence. Caller cancellation and the
+physical policy-test correction are adopted and race-tested. Network-quality
+event wiring and the deferred server database integrations remain later steps.
+
+**Notified path changes are a separate phase.** The user authorized deferring
+legitimate connection-quality-change tests until `NetworkQualityChanged` is
+implemented and then invoked by those tests. The new `model-core` runner mode
+records and excludes three explicit propagation-switch performance tests;
+the historical `model` mode remains intact. Static long-RTT recovery, ordinary
+congestion, ACK scheduling, window mismatch and ownership stay in core
+validation. See [the exact phase inventory](THROUGHPUTFIX-PR2.md#31-separate-notified-path-changes-from-core-pacing-validation).
+The [runner audit](throughput-fix-2-results/model-core-deferral-v1) verifies
+27 retained tests, exactly three deferrals, shell syntax and manifest recording.
+That selection audit is not a new performance run.
+
+The [shared-pacing review](throughput-fix-2-results/window-cumulative-shared-reserve-root-v3)
+now has a deterministic consumer reproduction:
+two- and four-lane cases underfill one common reservation clock when each lane
+supplies its own cumulative delivery rate. Equal and unequal shares fail all
+12 repeated utilization checks; the single-lane, idle/stale, independent-service
+and original cumulative controls pass (45 passes total, no race warnings).
+The fixture supplies bounded training feedback and then runs the actual pacing
+waits and dispatch budget. It establishes the rate-scope mismatch, not a
+closed-loop path-throughput result. No aggregate correction is adopted yet.
+
+The production-credit version repeats the same 45 passes/12 failures using
+real queued send items, cumulative heads, repeated heads and late SACKs; see
+[the attribution proof](throughput-fix-2-results/window-cumulative-shared-credit-root-v4).
+The [common delivery candidate](throughput-fix-2-results/window-cumulative-shared-delivery-cold-v2)
+then improves the expanded matched selection
+from 57 passes/15 failures to 72 passes, without race warnings. All four actual
+shared-reservation cases and early-return, carrier-policy, stale, permission
+and statistics controls pass. Its first new missing-history test incorrectly
+required resetting an already learned window to the initial value. The corrected
+test preserves the prior learned value; production and utilization thresholds
+are unchanged, and the [original oracle failure](throughput-fix-2-results/window-cumulative-shared-delivery-oracle-v1)
+is retained separately. These remain component proofs with prescribed training.
+The corrected shared consumer releases all requested bytes in about 19.2–19.9 ms
+against the original 30.03–30.09 ms deadlines; the single-lane control remains
+about 18.18 ms. This measures the reservation/dispatch rule after training.
+
+The [adjacent prefix review](throughput-fix-2-results/service-receiver-prefix-timing-v1/contract-audit.md)
+finds a separate timing defect: the newest sequence
+number can arrive before a missing earlier message. Its ACK delay describes
+that head alone; subtracting the delay from the entire newly credited prefix
+can invent service capacity. A lawful two-route fixture reports 16 MB/s against
+a 0.2 MB/s serializer, failing three repetitions while ordered and prior-SACK
+controls pass six. The proposed correction keeps raw once-only delivery credit
+and limits the nonzero receiver-wait correction to credit for the head itself.
+The expanded matched comparison changes from 84 passes/three failures to
+81 passes/six failures: the ingress defect is fixed, while two unchanged SDK
+tests demand an immediate exact rate from insufficient cumulative-head timing.
+Their original failures and raw refill readings are preserved. Valid single-head
+timing, physical credit and eventual pacing remain required.
+The [corrected contract proposal](throughput-fix-2-results/service-receiver-prefix-contract-correction-v3)
+passes 60 race checks: the two cumulative-prefix
+tests retain byte/drain/raw-clock bounds, and a new attributable single-head
+test still requires exact short serialization. A [same-local-hop reorder proof](throughput-fix-2-results/service-receiver-prefix-local-hop-v2)
+separately improves from 12 passes/six failures to 18 passes. These are isolated
+source results. The exact-head restriction and accepted receiver-interval
+contracts are now in the live tree. Six permanent prefix roots reproduce the
+16 MB/s versus 0.2 MB/s overestimate before correction, including downstream
+reorder behind a known local H1 route. The zero-delay cumulative-prefix control
+requires the exact raw-clock rate. The 20 prefix, cold-refill, queued-timing and SDK timing
+definitions pass three race repetitions, and 40 adjacent ACK compression and
+metadata definitions pass a separate race run.
+
+The matched live-source comparison isolates the same restriction at the
+remaining 300-microsecond retained H1 device duplex cell. With the original
+warmup and 90% per-direction reference gate, three exploratory runs per role
+change device upload from 810.639–814.152 to 886.344–918.241 Mb/s and the
+providing role from 837.734–851.077 to 864.901–931.840 Mb/s, against about
+957.2 Mb/s reference. All six role comparisons fail before and pass afterward,
+with no relay drops. A new permanent affected-cell test covers both roles.
+The [complete source/build archive](throughput-fix-2-results/service-receiver-prefix-live-sdk-v1)
+also retains a later pinned comparison: 45 race passes/15 failures become
+60 passes, but the SDK selection changes from three failures to two passes
+and one failure. The third non-providing after run reaches 855.296 Mb/s versus
+957.2352 Mb/s reference. The six exploratory passes cannot replace this pinned
+failure, which remains in the immutable archive.
+
+The failing direction had no forward backlog, yet its held pace had fallen to
+111.22 MB/s from a 101.11 MB/s service reading. The next candidate keeps a held
+pace through RTT inflation that fits within one already permitted burst.
+Blind discovery still ends at the original queue margin; physical backlog,
+recovery and a queue beyond the burst duration still permit a decrease. An
+explicit-clock root reproduces the prior drop from 137.5 to 111.22 MB/s after
+one lawful 10 ms reverse burst. Adjacent controls require a longer queue and
+excess forward flight to lower pacing. Five repeated SDK/congestion selections
+pass. The [matched component and combined validation archive](throughput-fix-2-results/service-pacing-burst-hold-v1)
+records 12 race passes/three failures before versus 15 passes after. Both SDK
+arms pass all five repetitions, so this pair does not prove throughput uplift
+or deterministically explain the whole earlier intermittent SDK observation.
+The fresh candidate full core model passes 36 definitions and 846 readings;
+its isolated device upload ratios are 95.97% and 92.24% in the two roles.
+Combined correctness passes 512 race definitions. See
+[the hold-release review](THROUGHPUTFIX-PR2.md#36-keep-held-pacing-through-one-permitted-reverse-burst).
+
+The [final core regression and runner contracts](throughput-fix-2-results/core-regression-burst-hold-final-v1)
+record 3,345 root passes, 25 existing skips and no failures, plus five passing
+snapshot contracts and five passing server-environment contracts. The
+[final scoped server archive](throughput-fix-2-results/server-scoped-configure-final-v1)
+records 35 connect race passes and 28 proxy nonrace passes. The two audited
+non-database modes use the original configuration function and default cgo
+off; binary metadata confirms connect's race flag remains enabled. Full server
+integration preflight and its user-authorized deferral remain unchanged.
+
+Two cold-refill assertions had also equated observed service with pacing on
+an unloaded path. They now require the exact 267,000 B/s service result and
+adequate pacing while allowing the accepted discovery floor to send faster.
+The unsupported-gap and genuine-slowdown assertions and all SDK performance
+thresholds are unchanged. See [the live integration review](THROUGHPUTFIX-PR2.md#35-adopt-exact-head-receiver-timing-and-retest-short-duplex).
+
+The [common-ring boundary review](throughput-fix-2-results/service-shared-aggregate-boundaries-v1)
+also finds old physical offers leaking across a pending-drain boundary into
+the warm offer bound. The narrow guard changes 15 passes/three failures to
+18 passes while preserving all 27 warm controls. Cold raw history keeps its
+independent qualification rules.
+
+The [joined prefix/common-delivery source](throughput-fix-2-results/window-cumulative-shared-prefix-sdk-v1)
+passed the unchanged short SDK selection; its long selection failed the
+400 ms device-default cell at 51.607 versus 131.046 Mb/s. Its intervals rise
+from 15.483 to 126.566 Mb/s, showing a prolonged ramp in this particular run.
+The original 2.3-second warmup and throughput gate are unchanged.
+
+A later [matched pacing experiment](throughput-fix-2-results/window-cumulative-shared-warm-pacing-v2)
+includes the corrected contracts and drain guards in both arms. Taking the
+greater of positive service and common delivery passes 183 race checks in
+each arm, but both failed the unchanged long SDK selection at fixed
+100 ms and 400 ms RTT. At 400 ms the candidate delivers 51.622 versus
+131.035 Mb/s after the change. This maximum alone is not a startup fix and
+has not been adopted. The following diagnostic isolated the startup pacing
+limit addressed by the discovery policy in research plan section 34.
+
+The [common-ring cost comparison](throughput-fix-2-results/window-cumulative-shared-delivery-cpu-v1)
+records zero allocations in all 54 benchmark readings. It adds 3,608 inline
+bytes per service. Median real-head processing rises from 1,068 to 1,444 ns,
+and estimation from 1,465 to 1,838 ns. Runs used the recorded concurrent host
+load; these costs remain part of candidate review.
+
+Two new [static long-path controls](throughput-fix-2-results/model-static-long-recovery-v1)
+pass using real sender/ACK workers and pacing with a 512 KiB opening. Fixed
+400 ms and 1.2-second paths reach about 30.636 Mb/s against equally fast
+references, with zero measured drops or timeout resends. Their predeclared
+26.24-/77.44-second warmups establish settled performance. They do not replace
+the original SDK recovery gate or establish an isolated warm-bound cause.
+
+The SDK model groups use SDK constructor settings with synthetic Transfer
+traffic. They do not execute the provider's dedicated TCP ACK worker, so the
+optional ACK-retention change cannot be credited with fixing those failures.
+
+**Test-contract review is now part of the acceptance work.** Two concrete
+assertions are too narrow: a global old-rate cap excludes an independently
+qualified increase, and a new TCP-control test requires two ACKs even when one
+newer cumulative ACK covers both. Exact rate responses after a few sibling
+heads and the one-second RTT-growth gates also encode response-policy choices.
+The audit in [research plan section 30](THROUGHPUTFIX-PR2.md#30-audit-test-contracts-before-further-estimator-changes)
+separates these from byte ownership, protocol bounds, cancellation and the
+agreed retained-window policy. Frozen proofs remain intact; performance
+thresholds have not been changed.
+The review also found two concrete test-fixture bugs: a provider-cancel test
+shares its cancel function with the client while asserting independent
+lifecycle, and a new test installs a worker hook after client workers start,
+creating its own race. Correct their setup before attributing those failures
+to production. The original failed/racy comparisons remain preserved.
+After correcting only fixture construction, the ownership comparison changes
+from 24 passes/27 failures before to 51 passes after, with no races. Its hard
+caller-isolation fix has been validated independently of optional ACK retention.
+The standalone comparison now passes all 24 repeated roots and 24 adjacent
+checks after six passes/18 failures before. Only its shared send/forward caller
+cancellation guards and standalone tests have been applied to the working tree.
+A separate [frozen live-source comparison](throughput-fix-2-results/caller-cancellation-live-integration-v1)
+gives the same six passes/18 failures
+before, 24 passes after and 24 adjacent passes, without race warnings.
+The [measurement-window review](throughput-fix-2-results/model-rtt-measurement-policy-review-v1)
+also confirms that one borderline RTT run passes two-/three-second aggregation
+while failing the original one-second gate; the severe losses fail either form.
+
+The [expanded semantic audit](throughput-fix-2-results/service-receiver-semantic-audit-v1/semantic-audit.md)
+also changes the interpretation of a suspected cold-estimator
+failure. Zero service is valid when cumulative delivery supplies the pace.
+The v2 sustained fixture passes that case; its sole repeated failure is a
+held positive rate that overrides fresh own delivery and keeps pacing at
+950,000 B/s versus 2,823,529 B/s observed delivery through 384 cycles. All three
+repetitions reproduce the warm hold, while cold, fast, ordered, legacy and
+mixed-feedback controls pass. However, v2 exceeds one lane's opening window
+and models an oversized physical item. The v3 correction also consumes an
+admission estimate before every offer; it gives 18 race passes without changing
+production. The oversized v2 observation is withdrawn as production proof.
+Legal single-frame controls also pass. A subsequent matched legal cumulative
+group test isolates read ordering: three per-refill-read controls pass, while
+three batched-read cases retain the same 1 MB/s service and 950,000 B/s pace.
+The [common bounded delivery candidate](throughput-fix-2-results/service-shared-aggregate-warm-v1)
+fixes that narrow case: its matched
+selection changes from 24 passes/three failures to 27 passes without races.
+These are estimate-consumer tests with prescribed input, not closed-loop
+throughput. Their per-lane passing
+criterion also needs an aggregate-service check: 3.157 MB/s pacing can exceed
+each lane's share while still using only 79% of a shared 4 MB/s serializer.
+An earlier consumer fixture lacked the required cumulative history and is
+retained as invalid precondition evidence.
+
+The first isolated per-sequence interval candidate does not yet fix the legal
+batched case: the corrected matched selection remains 12 passes/three failures
+before and after. Its prefix, causal-order and tied-clock controls pass. A
+separately proposed old-rate cap was rejected because its input also permits a
+genuinely faster path and preconfirms a future write; that failed proposal is
+preserved without changing production to satisfy it.
+
+The same [semantic audit](throughput-fix-2-results/service-receiver-semantic-audit-v1/semantic-audit.md)
+now includes a legal rolling-flight slowdown comparison: nine passes/three
+failures before, 12 passes after, with no race warnings. It uses legal physical
+messages and checks each current admission window. After spending the shared
+startup probe, an actual reservation/release diagnostic changes the batched
+case from about 13.75 MB/s to 3.831 MB/s against 4 MB/s delivery. This supports
+the isolated decrease correction; prescribed feedback still does not certify
+closed-loop throughput or the combined implementation.
+
+The latest [physical ACK-policy experiment](throughput-fix-2-results/physical-h1-ack-policy-experiment-v1)
+also exposes a stale test assumption: final `Sized=false` does not mean the
+configured policy is wrong when service evidence or retained capacity applies.
+Its generic failure label includes recoverable provider-control refusals; no
+separate teardown failure appears. Both physical runs remain uncalibrated and
+underperform their references. This audit does not establish throughput closure
+or justify adopting the optional ACK policy.
+The smoke fixture's policy assertion is now corrected to inspect resolved
+constructor and actual sequence settings. Eight deterministic contract tests
+accept service-qualified and aged retained states while rejecting misconfigured
+arms. The [isolated comparison](throughput-fix-2-results/physical-window-policy-gate-contract-v1)
+improves from three passes/21 failures to 24 race passes. On the
+[adopted live source](throughput-fix-2-results/physical-window-policy-live-integration-v1),
+policy/caller integration passes 16 checks
+and repeated policy coverage passes another 24; physical goodput has not been
+revalidated by those unit checks.
+
+**The sustained-slowdown correction passes 507 scoped race checks; core
+performance acceptance remains open. Explicit RTT changes await the signal
+phase.** Interleaved
+receiver waits can invalidate all 64 exact intervals while a real standing
+queue delivers 4 MB/s. The correction bounds service over a full continuous
+feedback interval using its raw span minus the largest validated receiver wait,
+counting every byte. This conservative bound can lower an established rate;
+it cannot establish cold service or raise capacity. The corrected matched
+comparison improves from 18 passes/three failures to 21 passes, with unchanged
+short, unqueued, refill and buffered-peak controls. The original invalid
+fast-control fixture remains separately recorded in
+[the slowdown correction](throughput-fix-2-results/service-receiver-invalid-slowdown-v1).
+The complete earlier candidate has 502 scoped passes/one failure, the same
+slowdown root, in [the full scoped baseline](throughput-fix-2-results/correctness-receiver-service-v1).
+Its complete nonrace regression ends with **3,334 passes, one failure and
+25 skips**; the sole failure is again that slowdown root. Preserve all outcomes
+in [the complete regression baseline](throughput-fix-2-results/regression-receiver-service-v1).
+The corrected candidate's focused RTT-growth run loses throughput at **48.995
+versus 95.771 Mb/s**. Its full model is now terminal: **25 passes/five failures**,
+retaining all 824 readings in
+[the complete slowdown-candidate model](throughput-fix-2-results/model-receiver-invalid-slowdown-full-v1).
+The failures are SDK initial-feedback duplex recovery, SDK profiles, SDK duplex,
+RTT growth and shared finite relay. Full-run RTT growth is 5.612/95.771 Mb/s;
+the shared-relay 100 Mb/s cell is 72.684/95.616 Mb/s without drops or retries.
+These are isolated sources, not an accepted combined fix.
+
+An [offline endpoint review](throughput-fix-2-results/model-endpoint-pacing-review-v1/review.md)
+finds positive service in all 18 directions below their paired reference gate,
+and in the severe RTT-growth failure. The shared cold fallback fix therefore
+needs separate warm-hold recovery work and full affected-cell validation;
+the final snapshots alone do not establish each failure's cause.
+
+Integration review also found an
+accidentally omitted cumulative-delivery pacing fallback. Its twelve unchanged
+roots, repeated three times, improve from 24 passes/12 failures to 36 passes
+after restoring that previously accepted behavior. The restored source
+`28e69ad2` has five passes/one RTT-growth failure in the targeted model; the
+fallback remains restored. Preserve this comparison in
+[the cumulative fallback restoration](throughput-fix-2-results/service-receiver-cumulative-restoration-v1).
+Separately, the actual-coalescer slowdown test keeps 12.5 MB/s while a queued
+serializer supplies 4 MB/s: all 64 paired intervals become invalid and fresh
+evidence never replaces the held value. It fails three times; the identical
+legacy and mixed-metadata controls pass six times. This independent root is in
+[the interleaved slowdown proof](throughput-fix-2-results/window-receiver-interleaved-slowdown-root-v1).
+
+The preceding consumer correction on frozen source `f305b789` passes all six targeted
+nonrace throughput tests. Its matched race comparison improves ten roots,
+repeated three times, from 12 passes/18 failures to 30 passes; the wider
+selection improves from 194 passes/six failures to 200 passes. The correction
+keeps receiver-adjusted intervals through cycle start, pending rate changes,
+queued averaging and retained cycle summaries. Both comparison arms include
+the same corrected-endpoint bounds helper. Results and the initial incomplete
+root selector are preserved in
+[the receiver-clock consumer comparison](throughput-fix-2-results/service-receiver-consumers-bounds-v1).
+Four earlier mixed-feedback tests were absent from both copied sources; their
+separate supplement now passes all twelve executions in each arm, retained in
+[the mixed-feedback supplement](throughput-fix-2-results/service-receiver-mixed-supplement-v1).
+That source's full model is terminal: **26 passes/four failures**, retaining
+all 824 numerical readings in
+[the full receiver-consumer checkpoint](throughput-fix-2-results/model-receiver-consumers-full-v1).
+Failures cover SDK first-feedback duplex recovery, SDK profile and per-direction
+duplex sweeps, and RTT growth (**19.558 versus 95.771 Mb/s**). Its omitted
+cumulative fallback also prevents adoption. The restored complete-source
+baseline finishes with **27 passes/three failures**: SDK profiles, SDK duplex
+and RTT growth. Its RTT total is 91.655 versus 95.771 Mb/s, but the first
+measurement interval fails at 83.415 versus 95.764 Mb/s. Severe SDK directional
+losses remain, including 16.343 versus 749.855 Mb/s in the provider-H1
+300 microsecond/eight-flow cell. All 824 readings are preserved in
+[the restored full model](throughput-fix-2-results/model-receiver-restored-full-v1).
+The slowdown correction's complete model above remains separate; the focused
+six-gate pass does not establish consistency.
+
+Physical H1 duplex now has a deterministic admission root. A dedicated TCP
+worker generates a 52-byte pure ACK while both pre-sequence admission slots
+are occupied and resend capacity remains open. After a slot returns, the ACK
+never reaches Transfer without another inner TCP event. Both constant and
+delivery sizing reproduce this in each of three repetitions; available-slot
+and public zero-wait controls pass (six passes/three failures). See
+[the admission proof](throughput-fix-2-results/physical-h1-control-admission-root-v1)
+and [the bounded first-refusal trace](throughput-fix-2-results/physical-h1-first-refusal-diagnostic-v1).
+Retaining bounded ownership on that dedicated ACK worker is a proposed liveness
+improvement and must honor its flow cancellation. Ordinary TCP can recover
+a refused control ACK; this result does not prove stream corruption or turn
+the failed physical calibration arms into usable throughput comparisons.
+
+The preceding source `ddef3374` also passes the six targeted gates, but its
+completed full nonrace model has **28 passes and two failures**, with all
+824 numerical readings retained in
+[the full receiver-refill checkpoint](throughput-fix-2-results/model-receiver-refill-full-v1).
+The 50 ms-compression window-reduction cell delivers **3.953 versus
+4.543 Mb/s**, with zero drops. The 300 microsecond, single-flow SDK duplex
+cell delivers **804.833 versus 957.235 Mb/s in one direction**, despite higher
+aggregate throughput. Its RTT-growth test passes at 95.771 Mb/s for both
+arms. The separate focused pass retains all 32 readings in
+[the combined receiver-refill checkpoint](throughput-fix-2-results/model-receiver-refill-combined-v1);
+it is insufficient for acceptance.
+
+The preceding warm-only receiver-delay candidate records four passes and two
+failures on frozen source `626dc7af`. The 50 ms compressed-ACK
+receiver-window reduction delivers **3.618 versus 4.516 Mb/s**. Long SDK startup
+delivers **92.959 versus 483.891 Mb/s** at 100 ms RTT and **33.677 versus
+131.045 Mb/s** at 400 ms RTT. RTT growth, both capacity-change controls and
+short compression pass. All 32 readings are retained in
+[the combined receiver-interval checkpoint](throughput-fix-2-results/model-receiver-interval-combined-v1).
+
+Receiver ACK metadata helps: subtracting the change in receiver waiting time
+from ACK arrival spacing fixes the new warm serialization roots (three passes/
+six failures before, nine passes after under race). Exact timing-credit controls
+also improve from 18 passes/nine failures to 24 passes/three failures; the
+remaining repeated failure is the short cold SDK train. These local proofs do
+not resolve the full-path failures. A later trace finds that the corrected warm
+pair expires while cycle-start and cycle-completion rules use different delay
+allowances. Its new rolling-refill comparison changes three passes/three
+failures to six race passes; the genuine slow-serializer control still adapts.
+
+A subsequent isolated cold qualification candidate passes the affected short
+SDK sweep and the 100/400 ms long-path cells, plus 39 repeated root checks and
+93 adjacent race checks on inputs `231b6d23`. The combined candidates above
+include this correction and the rolling-refill change. The subsequent ordering
+review covers sibling replies that reorder corrected endpoints within one
+raw bucket, including delayed interior points that remain valid. Broader
+validation must preserve both rejection of invalid intervals and recovery from
+later valid evidence.
+
+The first retained-only version fails
+the full model: 25 passing / 5 failing tests before, 20 passing / 10 failing
+after. In particular, an opening limited to 2 MiB cannot supply a long enough
+cumulative-delivery history to grow promptly on a 400 ms path. Merely preventing
+shrinkage is insufficient.
+
+The revised candidate also permits growth from qualified serialization rate
+and window residence. A receiver advertisement remains permission, not a
+capacity measurement. Its isolated growth root changes from three failures
+to three passes; all 33 retained-policy executions pass. The combined candidate
+passes all 108 static window-mismatch comparisons and the 36-cell deterministic
+performance matrix. The unchanged long
+compressed-feedback cell improves from 71.619 to 95.846 Mb/s, matching the
+95.846 Mb/s reference. The first full combined model is terminal: **28 passing
+tests, 3 failing tests, 832 numerical rows**. Its failures are changing receiver
+windows, SDK profiles and the 1.2-second RTT-growth case. Independent
+cold-start and successful-drain sampler corrections pass their root/control
+comparisons. A subsequent isolated qualification correction also passes all 42
+focused executions for compressed window gaps, buffered carrier reads and
+adjacent conditions. Its broader selection improves from 146 passes/8 failures
+to 153 passes/1 failure; the remaining short-compression failure uses the older
+sizing core. Combined throughput validation remains open.
+The subsequent combined sampler/cumulative-pacing selection records **13
+passes, four failures and 312 numerical rows**. Four failing tests cover three
+remaining model families: changing receiver windows, longer SDK paths and RTT
+growth; the focused long SDK test repeats cells from the original SDK sweep.
+No `NetworkQualityChanged` API, wire message or device hook is included.
+
+The earlier gap-qualified six-gate selection improves RTT growth: **95.771 versus
+95.778 Mb/s** without race instrumentation, and **94.816 versus 95.778 Mb/s**
+under race. Every measurement interval passes. Both variants record four
+passes and two failures on identical frozen inputs `0bb47657`: the remaining
+failures are the 50 ms compressed-ACK window reduction and long-path SDK
+profiles. Capacity-change and short-compression controls pass. All 64 readings
+are retained in `model-service-gap-combined-v1`. This source precedes the
+writer synchronization and empty-ring provenance follow-ups below; it does
+not establish full combined acceptance.
+
+The independent stats/writer synchronization correction has deterministic
+before/after proof: both pointer races fail in each of three fresh processes,
+then all nine corrected checks and 60 adjacent checks pass. The new empty-ring
+queue-provenance correction passes all 12 repeated roots/controls, including
+the abandoned-drain case that rejected its first version. Its isolated wider
+selection records 162 passes and one known older-core failure. Full combined
+validation of these later edits remains open.
+
+The subsequent combined correctness checkpoint is terminal: **459 passes,
+two failures, no race warnings** on source `a02246e3`. It includes the newly
+completed ACK-phase root before that root's correction. The other failure is
+the retained-window occupancy assertion, reproduced three times at a 0.20
+ratio. The initial comparison used an earlier nonrace binary and was invalid
+for source attribution. With race instrumentation matched, the earlier sampler
+also fails three times at 0.21; no sampler regression is established by that
+comparison. This wall-clock fixture's placement in the scoped race selection
+was accidental: its policy rename added it to the retained-root prefix. The
+matched four-arm comparison gives three failures for each race binary and
+three passes for each nonrace binary; current nonrace occupancy is 0.47–0.48.
+The runner restores this unchanged performance assertion to its original
+nonrace regression scope. No threshold or production code changes for this
+fixture. `correctness-retained-sampler-v4` preserves every original outcome and
+all 12 service readings. The complete instrument-controlled comparison is in
+[`occupancy-instrumentation-matrix-v1`](throughput-fix-2-results/occupancy-instrumentation-matrix-v1);
+a new combined correctness result is still required.
+
+The first combined race selection records 416 passes and three failures: the
+two known sampler roots and the static single-owner check. The latter found a
+diagnostic helper reading a window-setting ingredient outside its estimator
+owner. Its correction passes the already-read limit into that helper; the
+ownership assertion is unchanged. The corrected comparison remains separate
+from this frozen failing run (`correctness-retained-service-v3`).
+The source-pinned ownership follow-up records 81 passes/3 failures before and
+84 passes after across the same 28 tests repeated three times under race.
+Only `transfer.go` changes; the ownership test and allowed-owner lists remain
+identical. Full root regression on that tested source is terminal: **3,252
+passes, six failures and 25 skips**. Two failures are the sampler roots already
+present in this older snapshot. Four assert the superseded shrink policy or
+equate the effective retained window with its instantaneous candidate; their
+arithmetic, clamp and numerical occupancy controls are preserved by the
+revised assertions, which pass all 12 repeated nonrace executions on the same
+production source. An intermediate added pacing assertion failed because its
+gateway fixture uses an unknown carrier and never invokes the H1 pacer; that
+failed attempt is retained, and this fixture is not pacing evidence. These
+results do not include the later sampler or SDK fallback fixes.
+`regression-retained-service-v3` retains all 3,283 outcomes and its numerical
+readings on the original source.
+
+The combined model includes one additional four-cell growth test that duplicates
+cells from the complete mismatch matrix. Future full runs use the complete
+matrix once; the smaller test remains available for focused comparisons. Two
+negative controls use the explicit bootstrap conditions described below. This
+combined run is not an isolated comparison of the sizing change alone.
+
 The hybrid keeps exact receiver ACK-delay measurements, a separately proved
 unloaded RTT baseline, and the existing pacing/recovery limits. Service bytes
 now reach the estimator at ACK arrival, even while a sender waits in the pacer.
 The first retry clock starts at physical dispatch; confirmed shared raw RTT
 may extend an ordinary timeout only after proven-loss checks.
+These hybrid, service-credit and first-copy recovery changes are committed in
+`8cda0523`. The independent follow-up in `272f95e5` also starts each successful
+paced H1 retry's next backoff at that retry's physical write, preserving the
+original lifetime. Commit `17780670` independently retires pre-proof delivery
+history after an exact unloaded-RTT increase; its 11 roots pass three times
+under race on top of `272f95e5`, without the experimental drain changes.
+Drain and service-estimator investigations remain separate
+working changes; their functional passes do not establish performance acceptance.
 
 | Gate | Latest recorded result |
 | --- | --- |
 | Static window mismatch | All 108 comparisons pass on service-credit source `8802ba4b` |
 | Finite shared relay | 1, 100 and 1,000 Mb/s cells pass three times under race |
-| Full correctness | 305 race passes on recovery source `44459e42`; later storm test-only correction passes nine focused executions |
+| Earlier full correctness | 338 race passes with the proved-RTT window-history correction on effective inputs `4219e5c5`, before the new failure assertions |
+| Expanded correctness, lifetime v6 | 371 race passes and five service-root failures; this snapshot precedes the final contract-renewal correction |
+| Expanded correctness, lifetime v7 | 377 race passes and six service-root failures, including the deterministic SDK cold-service root; no network-quality or retained-window change in this snapshot |
+| Expanded root regression, lifetime v3 | 3,203 top-level passes, five service-root failures and 25 skips; this snapshot precedes the final route-write and cancellation corrections |
 | Scoped recovery correction | 99 focused race passes; original loss and lifetime bounds retained |
-| Shrinking window and 1.2 s RTT growth | Still failing; experimental estimators remain isolated |
+| Retry clock follow-up | 138 focused race passes; four deterministic before failures each reproduced three times |
+| Unprovable drain correction | Integrated after 621 focused race passes; original silent-lane case passes three times |
+| Full performance model, original sampler | 24 passes and three failing tests; all 818 readings retained after the window-history correction on source `922fd96d` |
+| Latest scoped correctness | Complete receiver-clock source has 502 race passes/one slowdown failure; the bounded slowdown correction has 507 race passes, no failures |
+| Latest root regression | Complete restored receiver-clock baseline: 3,334 passes/one known slowdown failure/25 skips; this precedes the bounded slowdown correction |
+| Latest combined performance | Complete slowdown candidate has 25 passes/five failures; restored baseline has 27 passes/three failures. All 824 readings per run retained; test-contract audit underway |
+| Experimental receiver-clock hybrid | Narrower discovery handoff passes all 27 model tests and retains all 818 readings on effective inputs `b7e1d4b8`; the preceding version failed static mismatch and SDK bidirectional |
+| Experimental receive-queue safeguard | Full model passes all 27 tests and 818 readings; new upstream-buffer roots still fail |
+| New production failure cases | 33 tests repeated three times on `17780670`: 39 passes, 60 failures, no races; all twenty failing cases reproduce every time |
 | Full server database integration | Deferred as authorized |
 
 The complete static matrix retains all 216 readings. Its source precedes the
 latest recovery correction; final combined regression and performance results
 must be attributed to a new source snapshot.
+
+The narrower hybrid preserves the full model's previously passing behavior.
+It combines receiver service
+observations with the existing unloaded-RTT proof and pacing limits, and retires
+old delivery history only after a proved RTT increase. The scoped long-path
+test matches its 95.77 Mb/s reference in every measured interval. The prior
+prototype declared receiver evidence available after only one endpoint, which
+froze ordinary discovery without a measured receiver rate. Waiting for a valid
+pair restores the six 256 KiB-send-window cells and the affected SDK direction;
+the complete original model now passes. It ran immediately under concurrent
+work in 1,166.64 seconds, without a quiescence wait.
+
+This remains an experimental result. Receiver observations travel through a
+test-only lookup with zero added wire cost. An actual stalled Client can make
+local queue drainage look like increased capacity. Withholding endpoints found
+already queued fixes that deterministic root and passes eight affected model
+tests, but its full matrix is separate. Buffering before the carrier reader,
+bounded feedback ownership and real wire overhead remain acceptance gates.
+
+### Root cases for every remaining failure condition
+
+The new [failure-condition inventory](testdata/throughput_root_cases/README.md)
+maps the observed failures to runnable tests and their positive controls.
+Seven package files add 33 production tests. They reproduce compressed-flight
+mispricing, a partial read poisoning a successful drain, initial/retry/older
+record lifetime overruns, FIFO/drain/late-wake expiry, carrier-buffer bucket
+placement, both short compressed-service cells, and drain liveness when retry,
+carrier change or cancellation invalidates physical delivery proof. Their frozen
+run on `17780670` plus tests records 39 passes and 60 failures over three
+repetitions; all twenty failing tests fail each time, with no race warnings.
+The working drain correction is excluded from that baseline. These failures
+are open defects, not passing assertions that merely document a bad value.
+
+The first expanded full correctness run, before the final worker-adjacent and
+short-cell tests were added, records 348 passes and seven newly exposed failures.
+Its earlier 338-pass result does not include the newly exposed conditions.
+The earlier 22-case baseline remains archived with 33 passes and 33 failures;
+the final inventory also includes the eleven previously uncommitted drain roots.
+
+Experimental receiver failures are also checked in as a pinned replay suite.
+Four variants run 432 root/control executions under race: 354 passes and 78
+failures, no skips or races. They preserve the early-handoff regression,
+forward-delay and peak-expiry failures, Client/carrier buffering, bucket phase,
+and the rejected sender-confirmed increase's cold-start and genuine-increase
+failures. The queued-endpoint variant also passes the full model, confirming
+why model throughput alone is insufficient. No experimental receiver-service
+consumer is accepted by these results.
+
+### Additional lifetime roots and the SDK startup failure
+
+The lifetime correction committed in `f903f59a` gives the send worker an independent index of
+ACK deadlines. Recovery order, a younger message, service FIFO waiting and a
+full route queue can no longer hide an older expiry. A queued reply can finish
+or renew lifetime ownership without rewriting the original RTT tag timestamp.
+An unissued retry keeps its ACK lookup published, so a reply to the first copy
+can cancel that duplicate before physical dispatch. Route waits retain their
+original writer timeout budget across an ACK-lifetime wake.
+
+Adjacent tests exposed two more issues. Cancellation between pacing admission
+and route publication could still write; the corrected boundary checks
+cancellation again. Independently coalesced SACK and missing-contract replies
+could hide the newer valid receipt; renewal now uses the latest applicable
+receipt while preserving exact contract identity, once-only renewal and the
+distinction between a recovery request and delivery.
+
+The independent lifetime v6 comparison, excluding the working drain change,
+records 45 passes/54 failures before and 99 passes afterward across three race
+repetitions. Adding the contract-order root exposes three failures in v6;
+the v7 correction passes all 111 focused executions with no races. These
+results establish the lifetime correction's behavior, not service-rate or
+full performance acceptance. Intermediate timestamp and equal-deadline
+failures remain in `lifetime-owner-evolution`.
+
+The broader model also exposed a 400 ms RTT, one-flow constrained H1 SDK
+sender delivering 68.90 Mb/s against a 130.95 Mb/s reference. Separate frozen
+before/current comparisons both reproduce that loss, so the lifetime changes
+are not established as its cause. The first-ACK phase fixture forces a reply
+at 205 ms and preserves the original gates, but the race run has two failures
+and one pass; it is still an affected-cell reproduction, not a deterministic
+root proof. The 220 ms control passes three times and the existing eight-lane
+barrier control still passes. Retain all outcomes in
+`sdk-initial-feedback-isolation` and `sdk-initial-feedback-roots`.
+
+The v1 full model has 23 passing tests and four failing tests. Its ledger
+contains **782 service-reading JSON records plus 36 compact model summaries**.
+The SDK test exits early, so 818 total ledger rows must not be described as a
+complete service-reading sweep.
+
+The SDK startup failure now also has a deterministic sampler/pacer root.
+A physically confirmed 328,656-byte opening drains at 405 ms. Its first
+1,384-byte resumed reply arrives 400.011072 ms later; the sampler incorrectly
+prices that turnaround as 3,459 B/s and imposes a 626 ms next-write delay.
+The independent pre-fix comparison repeats this failure three times while
+continuous-outstanding and fresh-pair slow-service controls pass six times.
+`sdk-initial-service-root-before` preserves all nine outcomes and source pins.
+
+### The six outstanding service-estimation assertions at lifetime v7
+
+| Failure | Observed result |
+| --- | --- |
+| Compressed, window-limited flights | A window gap replaces 12.5 MB/s serialization with 0.605 MB/s |
+| Buffered carrier reads across sampler buckets | A 12.5 MB/s path becomes 214.6 MB/s, increasing the burst from 125,000 to 2,146,000 bytes |
+| Short paths with 50 ms ACK compression | One/eight flows each deliver 8.17 Mb/s against a 9.58 Mb/s reference; estimated service falls to 106,840 B/s on a 1,250,000 B/s serializer |
+| Intermediate controller read during a successful drain | The held 12.5 MB/s becomes 62,248 B/s and survives the later exact RTT proof |
+| The same successful-drain case with legacy ACKs | The same 62,248 B/s collapse without receiver timing metadata |
+| Cold SDK opening drains before the resumed train | One resumed ACK invents a 3,459 B/s service estimate and 626 ms pacing delay |
+
+All six have deterministic assertions in the failure inventory. The agreed `NetworkQualityChanged`
+policy is now in the research plan: the learned window grows but never shrinks
+between notifications; pacing still adapts both ways. A notification permits
+qualified fresh measurements to shrink the window and requests faster rate/RTT
+remeasurement. Receiver and memory bounds still limit effective admission.
+Cell bars, cellular type and Wi-Fi signal bars use this soft notification.
+The existing hard `NetworkChanged` hook reconnects transports and should also
+request remeasurement. Provider egress changes must notify their consumers too.
+A `DeviceLocal` serving both roles must affect its local clients and the
+connected clients using its provider. Received hints stay peer scoped and are
+never rebroadcast. Event plumbing is deferred until the core experiment passes.
+
+### Core retained-window experiment, before event plumbing
+
+The first candidate separates learned capacity from effective admission:
+
+```text
+cumulative sizing    = scale × delivered rate × window residence
+serialization sizing = scale × measured service × window residence
+qualified sizing = max(qualified cumulative sizing, qualified serialization sizing)
+qualified sizing = min(qualified sizing, target rate × residence)
+learned window   = max(previous learned window, qualified sizing)
+effective window = min(learned window, peer / memory / configured byte limits)
+pacing rate      = continuously measured service, capped by the target rate
+```
+
+The learned value begins at the configured bootstrap. A large advertisement
+does not teach the full ceiling. Only admission learns growth; statistics are
+observational. A temporary hard limit does not erase the learned value. The
+RTT-derived target sizing term cannot silently shrink it. No quality API,
+remote event propagation, or authorized-shrink episode is implemented in this
+first comparison.
+
+Six new deterministic policy tests fail 18/18 on the preceding code and pass
+18/18 on the candidate under race. The unchanged short-path 50 ms compression
+failure also now passes: one/eight flows each deliver 9.58464 Mb/s. The other
+five sampler roots still fail. This does not establish the complete approach.
+
+The separate unchanged 289-test comparison records 267 passes/22 failures
+before and 259 passes/30 failures afterward. Fifteen newly failing assertions
+encode the superseded shrink/advertisement policy. Their original outcomes
+are preserved; replacements keep the exact candidate arithmetic, proof
+timestamps, history qualification and hard limits while asserting retained
+admission. Both variants deliberately
+exclude the separate working drain correction. `window-retention-policy-v1`
+contains the complete race comparison. The original full model comparison is
+terminal: 25 passes/5 failures before and 20 passes/10 failures after. Six gates
+newly fail and one previously failing SDK bidirectional gate passes. This
+rejects retained-only sizing as a complete solution.
+
+#### Growth must not depend on already having a large window
+
+At 125 MB/s and 400 ms RTT, the 2 MiB opening produces a valid 16.8 ms
+serialization train. It cannot fill the cumulative estimator's 800 ms
+minimum history. The revised candidate can use that independently measured
+service to grow within the existing peer, memory, configured-byte and target
+sizing limits. A single reply supplies no rate pair and cannot authorize this
+growth. Shared H1 service can qualify only current H1 lanes; unknown, H3, P2P
+and mixed policies must not multiply an unrelated H1 rate by their local RTT.
+Pacing continues using current service even when the learned byte window holds.
+
+Two negative controls needed explicit starting conditions after removing the
+old immediate jump to the advertised maximum. The compression-residence
+comparison now starts both arms at 256 KiB: its RTT-only control delivers
+202.55 Mb/s and the residence-aware arm 958.36 Mb/s. The finite-relay comparison
+starts both arms at a configured 48 MiB opening, restoring actual overflow in
+the unpaced arm; the paced arm delivers 958.1 Mb/s with no relay drops for one
+and eight flows. Both tests pass before and after the service-growth change.
+Their original warmup, duration, throughput and queue thresholds are unchanged.
+The latter tests a large configured opening, including its larger startup
+discovery allowance; it does not claim to measure a learned 48 MiB window with
+the normal 2 MiB discovery allowance. The original failed stimuli remain archived.
+
+The isolated race performance pair reached its 30-minute timeout during the
+four long-RTT growth cells. Before completion it records 0 passes/3 failures
+before and 1 pass/2 failures after; these are incomplete runs, not successful
+full comparisons. The original compression and finite-relay negative stimuli
+account for two failures in both variants. The combined non-race model
+independently passes the complete static mismatch and deterministic matrices.
+A process sample points to full-flight recovery/statistics scans as a host-CPU
+concern on large windows; the research plan keeps this separate from virtual
+throughput and from the sampler defects.
+
+`send-scan-cost-v1` records 36 explicit-clock benchmark readings at 32, 1,024
+and 16,384 retained messages. At 16,384 messages, healthy cumulative-only
+recovery scanning costs 146–150 µs per call without race instrumentation and
+1.25–1.33 ms with it. Repeating an unchanged route-stall observation costs
+30.6–32.7 µs and 393.6–394.8 µs respectively. All runs allocate zero bytes per
+operation and preserve recovery/diagnostic state. These functions are unchanged
+from `f903f59a`; the measurements establish existing scaling cost, not a new
+retention regression or a host throughput acceptance result.
+
+The separate `service-qualification-cpu-v1` comparison retains 36 nonrace
+microbenchmark readings for sampler `54b36054` versus `008e9d38`. All report
+zero allocations. Full-ring estimator reads cost about 226–259 ns before and
+240–270 ns after. Single-ACK publication in the 512-item fixture changes from
+54.4–54.7 ns to 74.5–75.1 ns; its 8,192-item counterpart changes from
+75.5–93.8 ns to 112.7–121.9 ns. The 32-message batch ranges overlap. These runs
+started immediately under recorded concurrent load. The ACK publication fixture
+does not populate receiver RTT history, so this comparison does not establish
+that additional path's cost or full host throughput.
+
+`service-receiver-credit-cpu-v1` fills that measurement gap with three new
+benchmarks. Each measured operation refreshes a full 128-tuple receiver history
+before publishing its ACK bytes, and checks exact cumulative credit afterward.
+The 18 before/after readings retain zero allocations. Single-message publication
+costs 448–451 ns before versus 795–802 ns after at 512 retained items; at 8,192
+items it costs 493–498 ns versus 856–861 ns. A 32-message head costs 857–956 ns
+versus 1,218–1,433 ns. This is a visible cost of the qualification change under
+recorded concurrent load, not a host throughput result. The regular `pacing`
+runner includes these cases.
+
+The newer `service-receiver-coalescer-cpu-v1` comparison uses the real
+`coalesceReceivedAck` entry point, including exact initial-H1 timing validation
+and once-only delivery credit. All 27 readings allocate zero bytes, with
+128 active RTT observations throughout. Current live production costs
+1.004–1.027 µs for a single head over 512 retained envelopes, versus
+1.053–1.164 µs for the warm receiver-delay candidate. For a 32-message head
+over 8,192 envelopes, the ranges are 1.405–1.476 µs and 1.587–1.903 µs.
+A third arm keeps the new timing-credit plumbing with inert sampler handling
+to separate those two changes. These measurements ran under concurrent load;
+they do not establish a host throughput result. Six initial fixture failures
+are retained: their expected residence omitted the advertised compression
+allowance; the corrected fixture separately checks raw and adjusted RTT.
+
+The regular runner now saves these CPU measurements in its numerical ledger.
+Its preceding collector omitted Go benchmark output even when the workload
+ran successfully. `benchmark-ledger-preservation-v1` executes the old and new
+collector programs against the same nine-row output: zero readings before,
+all nine and every metric after. Four parser tests cover counters, repeated
+rows, headers and malformed metrics; shell syntax also passes. The runner
+copies the parser with the source and records its digest.
+
+The full-ring supplement adds controller and statistics reads over the same
+reordered receiver-clock inputs and valid, mixed and legacy controls.
+`service-receiver-ring-cpu-v1` retains 48 complete comparison readings, all
+with zero allocations and 64 populated slots. Invalid-ring median controller
+cost is 8.611 µs before and 9.082 µs after the conservative slowdown correction;
+valid-ring reads are about 0.78 µs. The returned invalid-ring rate changes
+from 12.5 to 4.021 MB/s. These measurements ran alongside other work; direct
+benchmark runs lack a separate per-run load/time manifest. The original empty
+selector, two fixture failures and 18 partial readings remain preserved.
+The internal `receiverInvalid` classification is a representation detail;
+future implementations must be compared on the same physical inputs without
+requiring them to keep that flag set.
+
+The physical ledger had a second omission: its pattern recognized H1 smoke
+rows but skipped the `physical-h1-duplex` prefix. Replaying one failed physical
+log now retains all three arms and their censored comparison, zero rows before
+and four after. `physical-duplex-ledger-preservation-v1` preserves the proof.
+The extended parser has six passing tests and a passing shell syntax check;
+exporting failed calibration does not make that calibration pass.
+
+The first combined model checkpoint fails three performance gates. A receiver permission
+decrease from 2 MiB to 64 KiB with 50 ms ACK compression delivers 3.413 Mb/s.
+Nineteen SDK-profile cells fail their existing gates. In a short-path example,
+the 512 KiB opening grows to about 1.43 MiB from cumulative delivery while
+serialization is still unqualified; fallback pacing remains `Initial / residence`
+at 50.8 MB/s, yielding 389 Mb/s against a 958 Mb/s reference. This is a separate
+bootstrap dependency to test and correct without turning an advertisement or
+one reply into measured capacity. In the long-growth case RTT has correctly
+updated to 1.2002 s, but service falls to 765,123 B/s: throughput is 5.134 Mb/s
+against 95.771 Mb/s. The three measured intervals all fail, so the aggregate
+does not hide a successful sustained result. No original acceptance threshold
+is relaxed for these failures.
+
+#### Sampler corrections remain independently testable
+
+The cold-start correction recognizes an actually drained opening even before
+the controller has retained a service rate. One resumed ACK cannot price the
+whole feedback gap as serialization. Valid unread pairs, ACK-before-write
+confirmation, sibling ordering and genuinely slow fresh pairs remain controls.
+The pinned comparison records 12 passes/12 failures before and 24 passes after.
+
+The successful-drain correction preserves qualified service while a bounded
+drain is unresolved and across the proof-to-dispatch handoff. A faster measured
+prefix can raise it; timeout, abandonment and a fresh slow pair still permit
+slowing down. Retired cycle summaries cannot resurrect an older rate. Twenty
+targeted tests repeated three times improve from 51 passes/9 failures to 60
+passes. The independent 126-test affected selection improves from 123 passes/3
+failures to 125 passes/1 failure; its remaining short-compression performance
+failure is addressed separately by retained-window sizing. All these runs use
+stable copied sources under race, with no race warnings or skips.
+
+The next correction distinguishes two misleading observations. An underfilled
+rolling flight cannot price the gap before its refill as serialization. A
+carrier reader draining already queued bytes cannot use its short timestamp
+peak to raise service. Continuous slow pairs, queued slow serialization and
+repeated slower refills still lower pacing without a notification or a global
+drain. A queued increase qualifies after a complete sampler/compression
+interval; genuine fast delivery can supersede the held rate.
+
+Queue provenance is recorded at ACK arrival, before worker accounting. A later
+clear-queue observation or timing-ring rotation cannot relabel the old queued
+bytes as a clean fast train. Nine adjacent tests cover reordered accounting,
+queue clearing, same-bucket holds, delayed accounting and both directions of
+real service change. Together with five existing roots/controls, the pinned
+race comparison improves from 21 passes/21 failures to **42 passes**. The wider
+154-test selection improves from 146 passes/8 failures to **153 passes/1
+failure**. Only `transfer_window_pacing.go` differs among the 820 copied inputs;
+`service-qualification-correction` retains both sides. Its sampler hash is
+`008e9d380488eda2912ca1eed937020df4bb143cfbb9c22c1a37cd583d9ce268`.
+This comparison keeps the preceding sizing core, so its remaining
+`ShortCompressedServiceKeepsMeasuredCapacity` failure is not a combined result.
+
+An earlier qualification candidate rejected buffered peaks but also delayed
+genuine capacity recovery. The final isolated comparison preserves the
+original capacity-increase and settled-large-message controls and passes them.
+The SDK fallback and old-bucket insertion corrections have separate proofs
+below. The qualification comparison does not validate those later edits or
+their combined throughput.
+
+The old-bucket boundary now has an independent correction. A legacy worker may
+publish an old queued RTT after newer ACK bytes have advanced the service ring.
+Without the same retention check used for bytes, the modulo insertion erases
+a current slot. The correction keeps the valid RTT observation but discards
+its retired service-bucket marker. Exact 64/65-bucket eviction edges and the
+63-bucket retained control run in both timing modes. The pinned race comparison
+changes from three passes/three failures to six passes; the wider 156-test
+selection changes from 154 passes/two failures to 155 passes/one failure.
+Only the older-core short-compression failure remains. Evidence is in
+`service-queue-horizon-correction`; combined performance remains separate.
+
+#### Separate fresh serialization from propagation and refill gaps
+
+Two actual-worker traces exposed adjacent qualification errors. After RTT
+growth, a fresh fast train was averaged together with the preceding propagation
+silence because the new residence enlarged the allowed gap. With a reduced
+receive window, a modest queue indication disabled the limited-flight guard,
+allowing a refill gap to masquerade as slow serialization.
+
+The correction first checks whether a contiguous fresh train already supports
+the held service before crossing an older silence. Inclusive endpoint bytes
+provide only a phase-tolerant upper bound for that decision; the published
+rate still excludes the first endpoint. Flight occupancy remains independent
+of a modest queue indication. Sustained slower trains and genuinely queued
+slow refills still lower service without a notification.
+
+Ten roots and controls repeated three times improve from **24 passes/six
+failures to 30 passes**. The isolated 160-test selection improves from 157
+passes/three failures to **159 passes/one failure**; its remaining
+short-compression failure uses the older sizing core. The unchanged capacity
+recovery controls pass. `service-gap-qualification-correction` retains the
+complete comparison.
+
+The combined follow-through uses both race and nonrace binaries from the same
+frozen inputs. RTT-growth throughput recovers to the reference in all three
+intervals. The window-reduction cell still delivers 3.413 Mb/s against a
+4.588 Mb/s nonrace reference. The 100 ms SDK cell delivers 97.260 versus
+483.912 Mb/s; the 400 ms cell delivers 51.607 versus 131.048 Mb/s. These
+remaining failures prevent acceptance. The first lost sample is now protected;
+that does not prove every later feedback ordering is correct.
+
+#### Synchronize writer publication with statistics
+
+An actual-worker diagnostic also exposed a pre-existing race: statistics copy
+the route-writer interface while the send worker publishes or clears it.
+A leaf mutex now protects that copy and those stores. Route opening, closing
+and policy calls execute outside the mutex, so a retained route writer cannot
+hold statistics behind external retirement.
+
+The tests rendezvous immediately before the conflicting accesses, after the
+external selector operations. Both before and after sources contain identical
+nil-by-default test hooks. In three fresh processes, both original races fail
+every time: **three passes/six failures before, nine passes after**, with no
+after race warnings. Another 60 related checks pass. The retirement control
+holds a real writer reference until statistics complete. The earlier broad
+start barrier missed one teardown reproduction and remains archived as an
+insufficient deterministic proof in `window-writer-statistics-owner-v1`.
+`window-writer-statistics-owner-v2` records the corrected proof.
+
+Source comparison finds the same unprotected publication and policy methods
+in committed `f903f59a`; no historical binary was tested for this attribution.
+These results validate writer ownership only, not throughput acceptance.
+
+#### Keep queue provenance when an RTT reset empties the byte ring
+
+A confirmed drained probe can retire every old byte bucket while retaining
+the measured service rate. If new queued RTT observations arrive before byte
+accounting, the empty ring previously discarded their queue markers. Later
+clear RTT tuples could then evict the evidence before the corresponding bytes
+were applied, inflating a 12.5 MB/s service to 200 MB/s despite exact byte
+accounting. The deterministic root covers legacy and receiver timing.
+
+The first queued timing now initializes its marker even in an empty ring.
+A marker alone is not byte evidence for a cold-start reset: that decision
+also requires credited delivery or physically proved bytes still awaiting
+accounting. Without this distinction, the first candidate incorrectly let an
+abandoned drain affect a later unrelated probe. The unchanged abandoned-drain
+test rejects that candidate.
+
+The expanded four-test comparison records **nine passes/three failures before,
+nine passes/three different failures on the rejected version, then 12 passes**.
+The wider 163-test comparison records 161 passes/two failures, the same totals
+with the substituted regression, then **162 passes/one failure**. Only the
+known older-core short-compression failure remains. All six race runs and the
+rejected candidate are retained in `service-queue-epoch-correction`.
+
+#### Qualified cumulative delivery can replace cold pacing
+
+The short SDK failure has a separate cause: cumulative delivery qualifies
+window growth, but no physical serialization pair exists after fully drained
+flights. Continuing to use `Initial / residence` then caps pacing at the small
+opening despite fresh rate evidence. The candidate publishes a separate
+`DeliveryByteRate` from the qualified cumulative interval and finalizes pacing
+after that interval is known. It applies the existing ten-percent discovery
+margin and target cap. A positive service measurement remains authoritative.
+Retained bytes, advertisements, one reply, tiny control traffic and stale or
+pre-permission-change checkpoints cannot supply this fallback.
+
+Nine deterministic tests repeated three times improve from **21 passes/six
+failures to 27 passes**. In a separate unchanged SDK subset, all eight affected
+short-path cells now pass; the long-path test still fails. Both sides use the
+preceding `54b36054` sampler, isolating this fallback change. The longer failures
+already have positive service and need their own correction.
+`window-cumulative-pacing-roots-v1` and `window-cumulative-pacing-sdk-v1` retain
+the causal proof and all 40 before/after SDK readings.
+
+The separate carrier-scope correction permits this fallback only for an
+independent local service or a currently H1-only route policy. Unknown, H3,
+P2P and mixed policies cannot contribute their logical delivery rate to the
+shared H1 fallback. Twelve roots repeated three times improve from **33
+passes/three failures to 36 passes** on the same preceding sampler. Positive
+shared service remains authoritative, and each H1 sibling owns only its own
+cold cumulative fallback. `window-cumulative-pacing-carrier-scope-v2` preserves
+this attribution proof; it is not an actual non-H1 throughput measurement.
 
 ### Evidence and remaining investigations
 
@@ -247,10 +1170,123 @@ retries from 457 to 137 but does not repair service-estimate collapse. The
 analogous retry re-arming clock now has a separate actual-worker root: a retry
 due at 300 ms waits in pacing until 1.2 s, but its next 600 ms backoff is already
 due at 900 ms. It fails three times before correction. A narrow fix using the
-existing physical waiter timestamp is under test, including unpaced/carrier-
-change provenance and the original lifetime/backoff limits. The integrated
+existing physical waiter timestamp is now integrated after 138 focused race
+passes. It requires a fresh timestamp owned by this sequence and a successful
+actual H1 write; unpaced, failed and changed-carrier attempts retain their
+existing policy. The next 600 ms interval now expires at 1.8 s in that root.
+The configured maximum and the message's original absolute ACK lifetime remain
+unchanged. Two first-copy deadline sites also reconstruct the client's
+monotonic clock instead of losing it through a wall-time conversion. The final
+before selection records 12 passes and 12 failures, with no races. The
+integrated
 first-copy correction separately passes all 305 correctness checks under race
 on source `44459e42`.
+
+An adjacent lifetime check confirms that an initial physical write at 400 ms
+still expires at its original 500 ms ACK lifetime, even with recovery scheduled
+at 700 ms: the send loop has an independent lifetime wakeup. No additional
+initial-recovery clamp is needed. A separate older defect remains open: when
+pacing itself lasts 600 ms against a 500 ms lifetime, both current and
+pre-physical-anchor sources write and retire at 600 ms. Each fails three forced
+executions; the in-lifetime controls pass six. Any correction must bound the
+local wait while preserving reliable-lane recovery exceptions and avoiding
+per-write timer/context allocation.
+
+An isolated timer-reuse candidate fixes the current message's initial, FIFO,
+controlled-drain, retry and late-dispatch waits. Those roots fail fifteen times
+before; 129 focused race executions pass after. The required adjacent review
+keeps it unaccepted: a younger message sent at 100 ms can occupy the worker
+until 600 ms, hiding an older record's 500 ms deadline. Both baseline and
+candidate fail that schedule three times. Its full correctness selection has
+334 passes and two failures in manual fixtures that omit the real producer's
+`ackTimeout`; those fixture preconditions also need completion. The initial
+unlocked FIFO-test read produced one race and is retained separately from the
+corrected fixture. No lifetime-candidate source is integrated; all results are
+archived in `pacing-lifetime-candidate-review-evidence`.
+
+The silent-lane failure now has a virtual-time reproduction with the original
+20-second impairment, 3,000-message workload and acceptance checks. The
+checkpoint and the retry-clock follow-up each fail three times at message
+1,445. A terminal-only trace shows the logical byte balance already delivered,
+but one retransmitted physical tail remains ambiguous. The pacer starts a
+40.512-second drain which that tail's ACK cannot prove complete; the caller's
+30-second admission limit expires first. An isolated correction abandons
+unprovable measurements without marking the relay drained or raising the RTT
+floor. It passes the original case three times, recovering in 5.13 seconds
+after the stall. The integrated implementation passes 621 focused race checks,
+including eleven new tests for retry/carrier/cancellation transitions, fresh
+proof, repeated invalidation and an unrelated live probe. The final before
+selection records nine passes and 33 failures, including the original silent
+case. Missing replies and SACK-only tails still wait for the original bound;
+an existing carrier-change test now expects early abandonment and retains its
+unchanged RTT-floor check. Initial eligibility scanning costs about 4 µs at
+1,024 retained sequences. A count maintained at the existing tail mutations
+replaces that scan: one integer per service, no new per-message or wire state.
+Paired CPU measurements reduce rejected-candidate admission at 1,024 sequences
+from 4,025 ns to 49.55 ns, with zero allocations. The fresh full correctness
+selection passes all 327 race checks on source `23fb1ed0`; full regression and
+model validation are recorded separately below. Maintaining the first counter implementation
+raises ordinary tail-lifecycle CPU from 72.44 ns to 110.8 ns. Reusing the prior
+tail value already read under the lock reduces that to 82.77 ns; a retry/fresh
+cycle costs 241.1 ns against the original scan implementation's 209.0 ns.
+This measured tradeoff removes the per-admission scan and adds one integer per
+service. The lookup refinement passes 24 focused race checks and adds no
+allocations. Its fresh full correctness run passes all 327 race checks on
+source `7c0a2f4f`, separately from the `23fb1ed0` model/regression
+campaign.
+The original failures and intermediate scan candidate remain separate evidence.
+
+The full root regression on `23fb1ed0` finishes with 3,963 passes, no failures
+and 27 skips. Its full model finishes with 24 passes and three failing tests,
+retaining all 818 readings. The 100 ms RTT/50 ms compression shrink cell reaches
+3.413 Mb/s against 4.560 Mb/s. The long-RTT transition reaches only 0.437 Mb/s
+against 95.771 Mb/s, with all three measured intervals below 0.472 Mb/s.
+Two service-matrix cells also miss their delivery floor: 10 Mb/s service,
+300 µs RTT and 50 ms compression deliver 8.120 and 8.172 Mb/s for one/eight
+flows against a 9.585 Mb/s reference. Both have zero measured drops; the other
+52 service-matrix cells pass. These performance failures remain acceptance
+blockers. A subsequent matched comparison isolates an additional long-path
+regression to the drain change, while the two short compressed cells already
+fail on the committed checkpoint:
+
+| Frozen production variant | Long-RTT delivery | 10 Mb/s, 300 µs RTT, 50 ms compression |
+| --- | --- | --- |
+| `8cda0523` checkpoint | 5.270 Mb/s | Both one/eight-flow cells fail |
+| Checkpoint plus physical retry clock | 5.250 Mb/s | Both cells fail |
+| Retry clock plus unprovable-drain change | 0.389 Mb/s | Both cells fail |
+
+Long-path references remain approximately 95.77 Mb/s, measured drops are zero,
+and the final RTT is correctly about 1.2 seconds in every arm. The final service
+estimate falls from about 1.99 MB/s in the first two arms to 56,786 B/s with the
+drain change. All 11 drain-liveness roots pass in that third arm. The short
+cells deliver approximately 8.11–8.17 Mb/s against 9.585 Mb/s in all three.
+The comparison retains all 18 readings and nine failed pairs in
+`recovery-drain-ablation-evidence`. The long test and thresholds are unchanged;
+an identical two-cell filter removes only unrelated service-matrix work.
+The next hybrid must preserve physical retry timing and drain liveness while
+separating known local supply pauses from capacity evidence. A bounded trace
+finds no active-drain abort in the captured interval. The drain starts at
+5.22199168 s and completes by ACK at 6.43654832 s, but service falls from
+8,795,996 to 62,248 B/s at 5.23049480 s during that pause. A queue average divides
+37,422 bytes by 601.17008 ms; the later successful probe captures the already
+depressed hold. Only 8.50312 ms of that measured span overlaps the controlled
+pause. A later trace matches ACK credit to its actual original physical writes:
+the older checkpoint covers writes at 3.997722926–3.999416510 s and the newer
+37,422-byte credit covers 4.000122755–4.010011118 s. Those offers are continuous
+across the path-delay change, while their ACK endpoints span 603.394 ms. The
+later contemporaneous sender idle is not the offer interval for these bytes.
+In this schedule the first service collapse even precedes drain admission.
+The estimator prices the propagation discontinuity into serialization; sender
+idle classification alone cannot reject that pair correctly.
+
+The forced sampling schedule fails three times on both the old pacer and the
+drain correction. One retaining controller read during partial replies changes
+a 12.5 MB/s hold to 62,248 B/s, which the later exact 1.2-second drained probe
+preserves. The same physical/ACK schedule with no intermediate read, or a
+read-only statistics read, retains 12.5 MB/s; both controls pass three times on
+each source. This is a pre-existing sampling/read-order defect exposed by the
+liveness change, not premature abort-marker clearing. Genuine slowdown and
+completed-gap controls remain passing. A production correction is still open.
 
 The small-window investigation rejects both a blanket gap filter and a later
 first-offer rollover candidate: the latter passes its isolated short-train root
@@ -267,11 +1303,163 @@ Receiver-local ingress snapshots are being evaluated as an optimistic
 information-only comparison, with no extra modeled wire bytes. No additional
 service-feedback wire schema has been added.
 
+Further receiver diagnostics separate physical serialization from logical
+credit: retry copies consume link capacity even though their ACKs must not add
+delivery credit twice. Using physical receiver bytes/time fixes that isolated
+root, and avoids capping receiver evidence by the sender's own paced rate.
+It still fails the complete shrinking-window cell. Requiring offered rate to
+reach the held estimate also fails a genuine capacity decrease when the sender
+offers at its existing 0.95 pacing factor; that rule is rejected.
+
+Receiver-local 10 ms occupied buckets are also insufficient on their own.
+They fix a 10.12832 ms window-idle gap at all forty tested bucket phases, but
+a 2 ms source pause inside a bucket lowers a 12.5 MB/s physical burst to
+9.270764 MB/s at fourteen phases. Empty-bucket zero hold does not remove idle
+time inside a nonempty bucket. The candidate retains low-capacity and reverse
+ACK-compression controls but remains a rejected diagnostic. The next question
+is whether actual source/window wait boundaries can identify usable receiver
+samples even when logical flight never reaches zero. Bucket width and rate
+threshold changes do not establish that distinction.
+
+A worker trace identifies such a boundary in the original shrink cell. A
+2,671-byte write is followed by a 10.12832 ms resend-window capacity wait,
+despite twenty-four queued Packs. The resumed train writes 64,104 bytes and
+produces one named ACK observation. Pairing that observation with the previous
+train includes 15.04296 ms of receiver elapsed time and incorrectly reports
+4.261395 MB/s. The complete-flight drain epoch does not change. Test zero hold
+across this actual window wait, genuinely slow trains with multiple ACK turns,
+and cold startup without an established estimate before selecting a consumer.
+
+A receiver-clock diagnostic that pairs observations only within a continuously
+supplied train now passes shrink, including the 0.95-paced genuine-decrease
+controls. A sender-only reset using the original ACK clock still fails the
+complete shrink cell in all three runs, despite passing its isolated roots.
+The stronger receiver diagnostic was then applied to the frozen drain source,
+with a separate boundary for an actual controlled pause, including one whose
+RTT proof is later abandoned. That boundary changes rate-sample eligibility;
+it does not create empty-flight or RTT proof.
+
+On that source the isolated candidate passes all 99 focused race executions,
+including all eleven unchanged drain-liveness roots. Shrink delivers
+4.683/4.547 Mb/s; both short 10 Mb/s compressed cells deliver
+9.15456/9.58464 Mb/s. The six capacity transitions and cold 64 KiB control also
+pass. Long RTT improves to 89.23477 Mb/s, with a 12.5 MB/s held service estimate
+and zero drops, but its intervals are 91.04384, 80.87552 and 95.78496 Mb/s.
+The middle interval fails the unchanged sustained-throughput gate. This remains
+an unaccepted information experiment. The prototype captures the receiver's
+`Client.run` ingress clock and complete outer-message length before decoding,
+then records eligible H1 Packs. The sender obtains the exact named observation
+through a test-only lookup. That transfer adds no modeled wire overhead and
+has no production wire schema or final lifecycle/memory design. Preserve that
+limitation when comparing it with the production sampler.
+
+A buffered trace of the residual long-path failure keeps the service estimate
+at 12.5 MB/s and the unloaded RTT at about 1.2 seconds. Its final controlled
+pause ends near 6.433 s, before measurement, and it records no retries in
+11.5–15 s. An expanded trace identifies all eight lanes at 12.214–12.268 s:
+delivery-history windows are 1.55–1.66 MB while the peer and configured ceilings
+are 50.33 MB and obtainable memory is 39.2–40.1 MB. Their delivery samples hold
+only 1.73–1.85 MB over 2.82–2.88 seconds.
+Aggregate physical writes then stop for two 100 ms trace buckets. Receiver
+delivery slows after the roughly 600 ms forward delay. Pre-proof delivery
+history is limiting refill after the path becomes longer, despite correct
+service and path timing.
+
+The isolated correction applies the existing delivery-history step rule when
+an exact physical probe proves an increased unloaded RTT. It preserves peer,
+configured, target and memory bounds; it does not assign the entire shared
+service rate to every lane. The first candidate passes the long gate at
+95.771307 Mb/s, equal to its reference, with intervals of 95.76448, 95.78496 and
+95.76448 Mb/s and zero drops. Review then forces a delayed-confirmation case:
+a newer ordinary ACK equal to the old RTT floor can already own the current
+baseline. Comparing at the earlier probe ACK time incorrectly opens a new
+window generation. Comparing against the latest observed evidence fixes that
+ordering. The corrected selection passes 174 focused race executions, including
+fixed bounds, fresh slower delivery, first unknown baseline, stale observations,
+read-only statistics and repeated confirmation controls.
+
+This small window-history correction is now independently integrated with the
+original service sampler and the optimized drain accounting. Eleven deterministic
+roots include a current-non-H1 carrier control. The unchanged behavior fails
+18 of 33 executions; the corrected behavior passes all 33. The full correctness
+selector then passes 338 tests under race on the same binary. Before compilation
+adds only a zero-returning observation getter so the roots can run, with no
+behavioral correction. `window-proof-port-evidence` retains both controls and
+the exact source/binary identities. Production performance validation is running
+separately; this pass does not include receiver service feedback.
+
+The corrected hybrid's full matrix finishes with 25 passes and two failing
+tests. The first new failure
+affects all six 256 KiB send-window / 300 µs RTT / 10 ms compression cells:
+one/eight flows and 256 KiB, 2 MiB or 48 MiB peer windows. Delivery falls to
+194.55–194.56 Mb/s against 594.36–594.41 Mb/s references, with zero drops and
+a final service estimate near 25.398 MB/s. The isolated static trace has zero
+eligible receiver pairs, 133 source resets, six window boundaries and one
+controlled pause. The diagnostic nevertheless reports receiver evidence as
+available and freezes an earlier legacy startup estimate. This is premature
+estimator ownership, not a newly measured slow receiver rate. Test a narrow
+handoff that preserves ordinary discovery until a usable receiver pair exists,
+then retains established receiver evidence through later single-head trains.
+Scoped shrink and long-path passes do not supersede the full-matrix failures.
+The other failure is the mobile/providing SDK device H1 bidirectional,
+300 µs, one-flow comparison (`Upload=false`): direction 1 delivers
+768.01024 Mb/s against 957.19424 Mb/s. Its
+combined throughput is higher, which is why the per-direction gate matters.
+That second loss needs separate attribution before claiming the startup
+handoff explains both failures.
+
+The narrower ownership change now passes the six static cells and both the
+ordinary/receiver SDK controls in all three repetitions: nine top-level passes,
+48 readings, on effective inputs `0bdf52d0`. The SDK reverse direction recovers
+to about 957.1 Mb/s. Its isolated before receiver arm fails three times while
+the ordinary arm passes. This supports the ownership correction for the
+observed SDK regression too; it does not establish complete performance
+acceptance. The original full matrix is now running on that narrower hybrid.
+
+Receiver timing also has two distinct limits. A forward propagation change can
+stretch an otherwise continuously offered pair; forced old/new-path controls
+must cover recovery, real slower capacity and controller-read order. Separately,
+`Client.run` timestamps observations after the buffered carrier handoff. A
+stalled client can drain that queue quickly and inflate an apparent receiver
+rate. Moving the timestamp before that handoff may remove the local queue, but
+does not by itself remove buffering before the socket reader. Test those
+boundaries before interpreting an observation interval as physical service.
+The first sampler-level queue controls retain all outcomes: the unbounded
+receiver-clock candidate has 15 passes and six failures; taking the larger
+matched sender/receiver interval gives 18 passes and three failures, all under
+race with three repetitions. It fixes the continuously paced queue case and
+preserves own-pacing, true slowdown and rate-increase controls, but buffered
+original offers plus a compressed receiver drain still inflate 12.5 MB/s to
+250 MB/s. That candidate is insufficient. These explicit-clock sampler controls
+are not an actual forced `Client` queue/worker reproduction.
+
+The subsequent real-worker root uses two Clients, the production reliable
+carrier handoff, a fixed 32-message queue and an explicit Client barrier. A
+24-message train contains 49,358 measured bytes over 3.94864 ms of serialization;
+23 frames accumulate behind the barrier. The receiver-clock candidate then
+retains 2.146 GB/s and raises its burst from 125,000 to 21,460,000 bytes. The
+max-span variant still retains 214.6 MB/s and a 2,146,000-byte burst. Each arm
+fails the root three times and passes six unstalled/faster-path controls under
+race, with no drops or retries. These are actual worker/controller failures,
+separate from the earlier scalar sampler controls.
+
+A narrower diagnostic reports whether the selected route already had the
+message queued at its first nonblocking read. The receiver still counts those
+physical bytes, but withholds the queued message as a rate endpoint. The same
+worker roots pass nine executions and the expanded receiver/reverse-compression
+selection passes 75 under race. Performance validation is pending. This proves
+only the local carrier-to-Client queue boundary; earlier socket/kernel buffering
+remains outside the observation and no production schema has been added.
+
 A read-only review of sibling `server/connect` and `server/proxy` finds no direct
 consumer or reconstruction of `protocol.Ack` in their production code. This is
 a compatibility review, not a new integration-test pass. Their full database
 integration tiers remain deferred as authorized; the sibling checkout and its
-local database configuration are unchanged.
+local database configuration are unchanged. Fresh deterministic server/connect
+and server/proxy runner attempts after the retry/drain correction stop before
+Go compilation: the default bootstrap lacks a readable local launcher owner,
+and the supported unmanaged portable-resource mode cannot reach PostgreSQL.
+These four setup-only attempts do not establish new server test results.
 
 The working ACK-tail and feedback-cycle changes remain provisional. The full
 v10 model on `914a2a724a7e0c1a5681301ded65e89447699ca80505772f9a9f454865ef2246`
@@ -1602,6 +2790,15 @@ direction, those integration runs are deferred for a later environment-correct
 run. The sibling server checkout was not modified; it remains dirty from
 external work.
 
+The retained-window follow-up also reviews all 205 Go files in `server/connect`
+and `server/proxy` at `154f575c`. Neither package directly consumes the new
+window/rate diagnostic fields or owns the sizing implementation; the relevant
+search matches are existing ACK-compression test settings and a performance
+comment. The reviewed files remained stable during this read-only audit.
+`server-retained-window-source-review` pins every reviewed file. This finds no
+required server call-site update, but does not establish a new server build or
+runtime result. The previously deferred integration tiers remain deferred.
+
 ## Reproduction and artifacts
 
 The SDK settings probe captures 11 profiles through the sibling SDK's actual
@@ -1737,33 +2934,33 @@ ledger is in [THROUGHPUT-PR2-RESULTS.md](THROUGHPUT-PR2-RESULTS.md).
 
 ## Remaining work
 
-1. Finish deterministic root fixes for small-window sampling and long-RTT drain
-   recovery, preserving genuine slowdown and retry-ambiguity controls. Earlier
-   forced SDK recovery and RTT-growth passes do not close the broader failures.
-   Retain all rejected candidates and the separate recovery-time difference.
-2. Expand host comparisons with the corrected packet grouping beyond the
+The core model, race correctness, root regression and scoped server tiers pass.
+Preserve their immutable archives and the earlier short-duplex failure. If
+that end-to-end deficit recurs, force its physical ordering before attributing
+it; the matched hold-policy SDK pair passes both arms and establishes no uplift.
+
+1. Expand host comparisons with the corrected packet grouping beyond the
    passing physical H1 smoke. The induced source-idle replay
    confirms the estimator effect, but both throughput brackets pass and the
    older host failures remain unattributed. The TUN-corrected physical duplex
-   reference still fails calibration and records many refused inner TCP
-   controls; force the admission ordering before assigning a cause. Keep the
+   reference still fails calibration. The forced admission ordering now proves
+   a dedicated pure TCP ACK is refused when both admission slots are occupied.
+   Audit the zero-refusal objective separately from TCP recovery correctness,
+   permit a newer cumulative ACK to cover pending progress, and evaluate any
+   bounded cancellable ownership fix against the physical comparison. Keep the
    original gates and all failed/excluded comparisons under current host load.
-3. Validate accepted production changes with the complete SDK/model matrix,
-   scoped race selection and root regression. Prior checkpoints passed all
-   three; the combined ACK/estimator source needs fresh validation after its
-   remaining corrections. The TUN-only checkpoint has 182 race passes and
-   3,026 root passes with zero failures and 25 skips.
-4. The database-backed `server/connect` and `server/proxy` integration tiers
+2. Add `NetworkQualityChanged`, then call it at the programmed path switches in
+   the three deferred tests and restore their acceptance run. Preserve the
+   unnotified-congestion controls and test delayed old ACKs and pending writes
+   across the event. Event wiring remains a separate phase after the core test.
+3. The database-backed `server/connect` and `server/proxy` integration tiers
    are deferred by the user for a later environment-correct run through
-   `server/test.sh`. Local credential repair is outside this run. New attempts
-   at the non-database scoped tiers stopped even earlier: `server/test-env.sh`
-   requires a local launcher readiness attestation that was absent. No new
-   server test binary was built; earlier passing tiers do not validate this
-   later connect checkpoint. A fresh normal bootstrap on server `0522f3f6`
-   confirms the same readiness failure; `server-bootstrap-recheck` retains its
-   sanitized result. No credentials, host configuration or launcher policy
-   were changed. Further attempts await external-state change.
-5. Broader physical SDK/H1 and native-TUN confirmation, longer actual-relay pressure,
+   `server/test.sh`. Local credential repair is outside this run. The current
+   full preflight also requires launcher readiness that this host could not
+   attest. The separately audited non-database tiers pass through the exact
+   configuration-only path; their success is not an integration result.
+   No credentials, host configuration or launcher policy were changed.
+4. Broader physical SDK/H1 and native-TUN confirmation, longer actual-relay pressure,
    shard-collision and multiple-peer campaigns remain necessary
    before a deployment-wide claim. Continue with
    our own published fixtures as requested; obtaining the reporter's missing

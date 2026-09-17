@@ -1,0 +1,10 @@
+{
+  "fixture_correction": "Original valid fixture falsely demanded2endpoints in every populated slot and counted63. The newest slot has1point and is still scanned by production. Corrected fixture counts all nonempty slots, retains64invalid checks, byte ownership and all rate checks. Original failed/empty runs preserved.",
+  "interpretation": "All48 complete comparison readings allocate zero bytes. Invalid-ring median controller cost grows8.611us to9.082us; the returned rate changes12.5MB/s to4.020775MB/s. Valid/mixed/legacy rates remain near4MB/s. Concurrent-run timings are observations, not a host goodput or isolated CPU causality claim.",
+  "invalid_setup_attempt": {
+    "raw_log_sha256": "7196aac7fc9a9ae8f4239a8bf1274dd192a880f28b558d308ee6af519c2693a8",
+    "reason": "Initial build launcher ran before snapshot-inputs.json existed; successful later build is separately pinned."
+  },
+  "no_quiescence_wait": true,
+  "scope": "Full64slot receiver-clock estimator controller and statistics reads, actual coalescer head setup, standing5.44MB queued flight. Eight benchmark families repeated3times per arm. Correctness belongs to separate deterministic roots."
+}

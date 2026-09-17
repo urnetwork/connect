@@ -1,0 +1,8 @@
+{
+  "limitations": [
+    "All receiver feedback remains a test-only lookup",
+    "Before metadata retains build and terminal log; no distinct run/load manifest supplied",
+    "After includes sixstaticcells and ordinary/receiver SDK controls, count3"
+  ],
+  "scope": "Same physical cell and original SDK directional gates; receiver discovery stays inactive until one valid pair"
+}

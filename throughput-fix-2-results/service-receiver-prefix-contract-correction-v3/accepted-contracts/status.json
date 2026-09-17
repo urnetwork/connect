@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "0237dc2aed9735b3039318024fda780298c49227aa2fe578dea2d1a448e07970",
+  "binary_sha256": "f2aeff6c4776e2b12234966b9bf1f1cbb6ac4a2208c25a4426d4119c7efcc217",
+  "effective_inputs_sha256": "e928e40cc5dc3dc0ff52c8672a0be2dc61138fd24491f0cca3e562b4e7618bc9",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacing(SdkCold.*|Receiver(EarlyIngressHeadCannotRetimePrefix|EarlyIngressSackKeepsPrefixRaw|OrderedIngressPrefixControl|PrefixZeroWaitKeepsRawClock|SackedPrefixKeepsNewHeadTiming|RelayReorderCannotBorrowLocalFifo)|Aggregate(DeliveryPreservesTiesAndOldestOffer|DeliveryUsesRecentFreshInterval|DeliveryRejectsIncompleteOffers|DeliveryRejectsRetiredModuloSlot|OfferedBoundExpiresFastHistory|OfferedBoundRespectsPendingDrain))$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as build; absolute relationship pinned by original status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T21:44:44.696802+00:00",
+  "loadavg_start": [
+    5.4248046875,
+    7.6669921875,
+    8.6337890625
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 2.122606874909252,
+  "loadavg_end": [
+    5.4248046875,
+    7.6669921875,
+    8.6337890625
+  ],
+  "ended_utc": "2026-09-16T21:44:46.819665+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "433b38b78ce9ee127d6e3e15e8531722353540704aeb9d4b25c2d5b8c7e7d917",
+  "pass": 60,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "normalization_note": "60P0F:20definitions across accepted SDK attribution contracts, six prefix safety/ownership controls and six bounded-history contracts. This is a justified test-contract correction on combined candidate source, not a before/after production performance comparison. Original exact SDK failures are retained in service-receiver-prefix-timing-v1.",
+  "rows": 0
+}

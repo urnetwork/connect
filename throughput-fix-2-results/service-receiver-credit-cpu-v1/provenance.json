@@ -1,0 +1,10 @@
+{
+  "benchmark_source_sha256": "1dbfb989a61a29fa72e0e88a9ced1956203945a979e66c6125df0d78798988db",
+  "command": "go test binary -test.run ^$ -test.bench ^BenchmarkWindowPacingReceiverAck.*$ -test.benchtime=500ms -test.count=3 -test.benchmem",
+  "interpretation": "CPU microbenchmarks under recorded concurrent load, without a host timing gate. This fills the absent receiver-history path in service-qualification-cpu-v1; it is not host throughput acceptance.",
+  "invariants": "Exactly128 active RTT samples; correct per-message and cumulative-head byte accounting;1 or32 messages per operation; zero allocations.",
+  "no_quiescence_wait": true,
+  "raw_logs": "Excluded; numerical rows, exact source/binary hashes and safe run context are retained.",
+  "scope": "Three full-receiver-history timing-plus-credit publication benchmarks, three nonrace repetitions per immutable variant. Every iteration refreshes its paired timing; no timestamp ring expires during the measurement.",
+  "source_boundary": "Sampler qualification54b36054 versus008e9d38, with the same new benchmark file overlaid onto each copied source. Later queue-horizon, cumulative-pacing and writer-ownership corrections are excluded."
+}

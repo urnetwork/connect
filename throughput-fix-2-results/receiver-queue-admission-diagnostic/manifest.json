@@ -1,0 +1,10 @@
+{
+  "archive": "receiver-queue-admission-diagnostic",
+  "payload_sha256": {
+    "outcomes.jsonl": "84f28d94d5a31d54007b9185dc35b63ee7793bfe003b1ffbe21a2e2e7dcbb992",
+    "provenance.json": "9981d79f102975cb8a14f1f5ed12d912e3bdb59359179edf76f5917289fe22a4",
+    "source-pins.json": "e8b0b92647c309f6507fd5ad4b7b173ad367f2f6d956fedc2c79d444537cc373",
+    "status.json": "4daca70e77bb03e8da062069b77bf03f5ff0550f5d1e1998ae41fab3da3ef2d9",
+    "worker-readings.jsonl": "d77cac141ce1a3197fb8b9df8a9e0dbfbf0785da469fcb97a876c87df2eb3e55"
+  }
+}

@@ -1,0 +1,4 @@
+{"attempt":1,"exit_status":1,"mode":"server-connect-deterministic","outcome":"SETUP_BLOCKED","reason":"local launcher lock has no readable owner","tests_started":false}
+{"attempt":2,"exit_status":1,"mode":"server-connect-deterministic","outcome":"SETUP_BLOCKED","reason":"PostgreSQL TCP endpoint unreachable","tests_started":false}
+{"attempt":3,"exit_status":1,"mode":"server-proxy","outcome":"SETUP_BLOCKED","reason":"local launcher lock has no readable owner","tests_started":false}
+{"attempt":4,"exit_status":1,"mode":"server-proxy","outcome":"SETUP_BLOCKED","reason":"PostgreSQL TCP endpoint unreachable","tests_started":false}

@@ -1,0 +1,52 @@
+--- a/transfer_window_service_sample.go
++++ b/transfer_window_service_sample.go
+@@ -3,7 +3,8 @@
+ package connect
+ 
+ // Merge exact raw endpoints without sorting bytes onto a different clock.
+-// Overlapping interiors cannot prove receiver order from bounded summaries.
++// Each input bounds its own receiver points; the union must keep those bounds
++// and its first-byte count, including when an interior owner publishes late.
+ func (self *windowServiceSample) add(sample windowServiceSample) {
+ 	if sample.bytes <= 0 {
+ 		self.queued = self.queued || sample.queued
+@@ -18,17 +19,19 @@
+ 	}
+ 	self.receiverInvalid = self.receiverInvalid || sample.receiverInvalid
+ 	if self.receiverBytes == self.bytes && sample.receiverBytes == sample.bytes {
+-		switch {
+-		case sample.lastAtNanos < self.firstAtNanos:
+-			self.receiverInvalid = self.receiverInvalid || sample.receiverLastAtNanos >= self.receiverFirstAtNanos
+-		case self.lastAtNanos < sample.firstAtNanos:
+-			self.receiverInvalid = self.receiverInvalid || self.receiverLastAtNanos >= sample.receiverFirstAtNanos
+-		case sample.lastAtNanos == self.firstAtNanos:
+-			self.receiverInvalid = self.receiverInvalid || sample.receiverLastAtNanos != self.receiverFirstAtNanos
+-		case self.lastAtNanos == sample.firstAtNanos:
+-			self.receiverInvalid = self.receiverInvalid || self.receiverLastAtNanos != sample.receiverFirstAtNanos
+-		default:
+-			self.receiverInvalid = true
++		if sample.firstAtNanos < self.firstAtNanos {
++			self.receiverInvalid = self.receiverInvalid || sample.receiverFirstAtNanos >= self.receiverFirstAtNanos
++		} else if self.firstAtNanos < sample.firstAtNanos {
++			self.receiverInvalid = self.receiverInvalid || self.receiverFirstAtNanos >= sample.receiverFirstAtNanos
++		} else {
++			self.receiverInvalid = self.receiverInvalid || self.receiverFirstAtNanos != sample.receiverFirstAtNanos
++		}
++		if sample.lastAtNanos < self.lastAtNanos {
++			self.receiverInvalid = self.receiverInvalid || sample.receiverLastAtNanos > self.receiverLastAtNanos
++		} else if self.lastAtNanos < sample.lastAtNanos {
++			self.receiverInvalid = self.receiverInvalid || self.receiverLastAtNanos > sample.receiverLastAtNanos
++		} else {
++			self.receiverInvalid = self.receiverInvalid || self.receiverLastAtNanos != sample.receiverLastAtNanos
+ 		}
+ 	}
+ 	if sample.firstAtNanos < self.firstAtNanos {
+@@ -54,7 +57,7 @@
+ }
+ 
+ // A mixed or legacy aggregate retains its raw interval. A fully paired one
+-// needs ordered positive receiver endpoints attached to its first-byte count.
++// needs bounded positive receiver endpoints attached to its first-byte count.
+ func (self windowServiceSample) deliverySpan() (int64, bool) {
+ 	span := self.lastAtNanos - self.firstAtNanos
+ 	if self.receiverBytes == self.bytes {

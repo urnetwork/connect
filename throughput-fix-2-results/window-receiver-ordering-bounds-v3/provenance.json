@@ -1,0 +1,21 @@
+{
+  "before_failure_details": "At phase0 both publication[0,2,1] and[2,0,1] turn physical10MB/s into0. Both errors occur in each of the three failed root invocations. Other ten order/phase combinations and all original negative/recovery roots remain preserved.",
+  "bounds_patch_sha256": "db92b3dc3b5028c57a4a279a1f9e80ea37042f49421e197385066e5b7ba42107",
+  "candidate_helper_sha256": "e5c68bc9a04874ed2ac002d2cf4d68f71f9ccd8efd9cd99c8f456b46cdbbd01f",
+  "combined_ordering_patch_sha256": "3578359bfddd931d433d2a8398c0fbf7e2631ef059fc12d083664a6ce8995d7f",
+  "comparison": "Same eight actual-coalescer roots with positive monotone delivery expanded to all six publication permutations at two bucket phases. Only sample.add eligibility changes: validate union corrected first/last bounds and exact first-byte exclusion instead of rejecting every overlapping raw interior.",
+  "controls": "Interior endpoint escape, wrong earliest byte count, tied earliest checkpoints, delayed credit, resize, warm interval and later independent recovery retain unchanged assertions.",
+  "event_plumbing": false,
+  "fixed_root": "TestWindowPacingReceiverOrderingMonotoneDeliveryKeepsCapacity",
+  "performance_gates_changed": false,
+  "production_adopted": false,
+  "race": true,
+  "remaining_review": "The common actual-worker model with this guard still fails RTT growth (~74Mb/s vs96Mb/s); original refill source passes that RTT property. That separate combined qualification/regression remains under diagnosis. Deterministic isolated passes do not imply full-model acceptance.",
+  "repetitions": 3,
+  "source_base": {
+    "helper_sha256": "9957d25565150b961d3590034e1c491b0c7a6dd0408d0647bb00375abca63a9d",
+    "sampler_sha256": "79b4d545268382ae89e3ac7c7834b48e455ec0744bd5a4be011a56dc75e4c691",
+    "snapshot": "receiver-ordering-recovery-after-pinned"
+  },
+  "test_execution_owner": "test_monitor_medium"
+}

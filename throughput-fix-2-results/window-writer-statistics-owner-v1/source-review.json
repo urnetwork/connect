@@ -1,0 +1,83 @@
+{
+  "after_transfer_go_sha256": "8648dcb8d0930dc263d76aa6c8ad0c4ade4730bfed92ce38123edf44f6ec9035",
+  "attribution": "The four relevant publication/teardown/policy/receiver-timing methods are byte-identical between f903f59a and the retained-core pre-fix live transfer.go. f903 also reaches transferFlightPolicy from estimateSendWindow. The ownership defect is present at this pre-retention baseline; a historical f903 race binary has not been run.",
+  "base_commit": "f903f59a96e629f8b1dfa5849d7a3198aaef9920",
+  "base_transfer_go_sha256": "5e31f539451e8cbc4bb3682e3ad365c3b799264c58ff1a28ac9cd1e609bebd44",
+  "before_transfer_go_sha256": "fff603e9502ff119a54fcb850c57d844f8c0b5919db5b7dd19cf402710854335",
+  "fix": "A leaf mutex guards worker pointer stores and the copied handle in transferFlightPolicy. The worker remains sole lifecycle writer; all external RouteManager/provider calls run after the mutex is released.",
+  "methods": {
+    "closeContractMultiRouteWriter": {
+      "f903_equals_before": true,
+      "sha256": {
+        "after": "0e6601f71fa4a9608505401bdfca9ea6e67dd4f102c988b8008eb3a17613e3e4",
+        "before": "29a2b2183fa40fdb51cd0034d45487fb7e152a44add82467c07a1be2f89536bc",
+        "f903": "29a2b2183fa40fdb51cd0034d45487fb7e152a44add82467c07a1be2f89536bc"
+      },
+      "source": {
+        "after": "func (self *SendSequence) closeContractMultiRouteWriter() {\n\tif self.removeContractMultiRouteWriterAlias != nil {\n\t\tself.removeContractMultiRouteWriterAlias()\n\t\tself.removeContractMultiRouteWriterAlias = nil\n\t\tself.contractMultiRouteWriterAlias = TransferPath{}\n\t}\n\tif self.contractMultiRouteWriter != nil {\n\t\tself.retireNoAckFastPath()\n\t\tself.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)\n\t\tfunc() {\n\t\t\tself.contractWriterStateLock.Lock()\n\t\t\tdefer self.contractWriterStateLock.Unlock()\n\t\t\tself.contractMultiRouteWriter = nil\n\t\t}()\n\t\tself.contractMultiRouteWriterDestination = TransferPath{}\n\t}\n}",
+        "before": "func (self *SendSequence) closeContractMultiRouteWriter() {\n\tif self.removeContractMultiRouteWriterAlias != nil {\n\t\tself.removeContractMultiRouteWriterAlias()\n\t\tself.removeContractMultiRouteWriterAlias = nil\n\t\tself.contractMultiRouteWriterAlias = TransferPath{}\n\t}\n\tif self.contractMultiRouteWriter != nil {\n\t\tself.retireNoAckFastPath()\n\t\tself.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)\n\t\tself.contractMultiRouteWriter = nil\n\t\tself.contractMultiRouteWriterDestination = TransferPath{}\n\t}\n}",
+        "f903": "func (self *SendSequence) closeContractMultiRouteWriter() {\n\tif self.removeContractMultiRouteWriterAlias != nil {\n\t\tself.removeContractMultiRouteWriterAlias()\n\t\tself.removeContractMultiRouteWriterAlias = nil\n\t\tself.contractMultiRouteWriterAlias = TransferPath{}\n\t}\n\tif self.contractMultiRouteWriter != nil {\n\t\tself.retireNoAckFastPath()\n\t\tself.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)\n\t\tself.contractMultiRouteWriter = nil\n\t\tself.contractMultiRouteWriterDestination = TransferPath{}\n\t}\n}"
+      }
+    },
+    "openContractMultiRouteWriter": {
+      "f903_equals_before": true,
+      "sha256": {
+        "after": "9bba6b820dd3091c5bc49a7290bcc931e020fa9d0a86781e72e82e23729fcf1e",
+        "before": "eb42581d8fde3a1b809f7ce561aeba40b9f60af12e063ab62c4706962fbc9e57",
+        "f903": "eb42581d8fde3a1b809f7ce561aeba40b9f60af12e063ab62c4706962fbc9e57"
+      },
+      "source": {
+        "after": "func (self *SendSequence) openContractMultiRouteWriter() MultiRouteWriter {\n\tself.updateContractMultiRouteWriterAlias()\n\tdestination := DestinationId(self.destination)\n\tif self.contractMultiRouteWriter == nil || self.contractMultiRouteWriterDestination != destination {\n\t\tif self.contractMultiRouteWriter != nil {\n\t\t\tself.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)\n\t\t}\n\t\twriter := self.client.RouteManager().OpenMultiRouteWriter(destination)\n\t\tfunc() {\n\t\t\tself.contractWriterStateLock.Lock()\n\t\t\tdefer self.contractWriterStateLock.Unlock()\n\t\t\tself.contractMultiRouteWriter = writer\n\t\t}()\n\t\tself.contractMultiRouteWriterDestination = destination\n\n\t\t// associate the destination with this sequence to receive acks\n\t\tself.sendBuffer.AssociateDestination(self, self.destination)\n\t\t// a new writer handle is a new thing for a caller to write through\n\t\tself.publishNoAckFastPath()\n\t}\n\treturn self.contractMultiRouteWriter\n}",
+        "before": "func (self *SendSequence) openContractMultiRouteWriter() MultiRouteWriter {\n\tself.updateContractMultiRouteWriterAlias()\n\tdestination := DestinationId(self.destination)\n\tif self.contractMultiRouteWriter == nil || self.contractMultiRouteWriterDestination != destination {\n\t\tif self.contractMultiRouteWriter != nil {\n\t\t\tself.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)\n\t\t}\n\t\tself.contractMultiRouteWriter = self.client.RouteManager().OpenMultiRouteWriter(destination)\n\t\tself.contractMultiRouteWriterDestination = destination\n\n\t\t// associate the destination with this sequence to receive acks\n\t\tself.sendBuffer.AssociateDestination(self, self.destination)\n\t\t// a new writer handle is a new thing for a caller to write through\n\t\tself.publishNoAckFastPath()\n\t}\n\treturn self.contractMultiRouteWriter\n}",
+        "f903": "func (self *SendSequence) openContractMultiRouteWriter() MultiRouteWriter {\n\tself.updateContractMultiRouteWriterAlias()\n\tdestination := DestinationId(self.destination)\n\tif self.contractMultiRouteWriter == nil || self.contractMultiRouteWriterDestination != destination {\n\t\tif self.contractMultiRouteWriter != nil {\n\t\t\tself.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)\n\t\t}\n\t\tself.contractMultiRouteWriter = self.client.RouteManager().OpenMultiRouteWriter(destination)\n\t\tself.contractMultiRouteWriterDestination = destination\n\n\t\t// associate the destination with this sequence to receive acks\n\t\tself.sendBuffer.AssociateDestination(self, self.destination)\n\t\t// a new writer handle is a new thing for a caller to write through\n\t\tself.publishNoAckFastPath()\n\t}\n\treturn self.contractMultiRouteWriter\n}"
+      }
+    },
+    "receiverWindowTiming": {
+      "f903_equals_before": true,
+      "sha256": {
+        "after": "703cb7416fa026590c9235f11e2b295093606fff4136b9e37e2882be48e5a7db",
+        "before": "703cb7416fa026590c9235f11e2b295093606fff4136b9e37e2882be48e5a7db",
+        "f903": "703cb7416fa026590c9235f11e2b295093606fff4136b9e37e2882be48e5a7db"
+      },
+      "source": {
+        "after": "func (self *SendSequence) receiverWindowTiming(at time.Time) (time.Duration, time.Duration, bool) {\n\tif service := self.windowPacer.service; service != nil && self.transferFlightPolicy().h1Only {\n\t\tif adjusted, residence, sampled := service.receiverWindowEstimate(at); sampled {\n\t\t\treturn adjusted, residence, true\n\t\t}\n\t}\n\tif self.rttWindow != nil {\n\t\treturn self.rttWindow.receiverWindowEstimate(at)\n\t}\n\treturn 0, 0, false\n}",
+        "before": "func (self *SendSequence) receiverWindowTiming(at time.Time) (time.Duration, time.Duration, bool) {\n\tif service := self.windowPacer.service; service != nil && self.transferFlightPolicy().h1Only {\n\t\tif adjusted, residence, sampled := service.receiverWindowEstimate(at); sampled {\n\t\t\treturn adjusted, residence, true\n\t\t}\n\t}\n\tif self.rttWindow != nil {\n\t\treturn self.rttWindow.receiverWindowEstimate(at)\n\t}\n\treturn 0, 0, false\n}",
+        "f903": "func (self *SendSequence) receiverWindowTiming(at time.Time) (time.Duration, time.Duration, bool) {\n\tif service := self.windowPacer.service; service != nil && self.transferFlightPolicy().h1Only {\n\t\tif adjusted, residence, sampled := service.receiverWindowEstimate(at); sampled {\n\t\t\treturn adjusted, residence, true\n\t\t}\n\t}\n\tif self.rttWindow != nil {\n\t\treturn self.rttWindow.receiverWindowEstimate(at)\n\t}\n\treturn 0, 0, false\n}"
+      }
+    },
+    "transferFlightPolicy": {
+      "f903_equals_before": true,
+      "sha256": {
+        "after": "64d8bb905fef25c15a8de961ca1d74a93a8c3f4d2f7f79d8e7719dfc413e041a",
+        "before": "48680837e602a0e4c2a51e08c99e1b97f853458cada532063680ad0909877c34",
+        "f903": "48680837e602a0e4c2a51e08c99e1b97f853458cada532063680ad0909877c34"
+      },
+      "source": {
+        "after": "func (self *SendSequence) transferFlightPolicy() transferFlightPolicySnapshot {\n\twriter := func() MultiRouteWriter {\n\t\tself.contractWriterStateLock.Lock()\n\t\tdefer self.contractWriterStateLock.Unlock()\n\t\treturn self.contractMultiRouteWriter\n\t}()\n\tif provider, ok := writer.(transferFlightPolicyProvider); ok {\n\t\treturn provider.transferFlightPolicy()\n\t}\n\treturn transferFlightPolicySnapshot{}\n}",
+        "before": "func (self *SendSequence) transferFlightPolicy() transferFlightPolicySnapshot {\n\tif provider, ok := self.contractMultiRouteWriter.(transferFlightPolicyProvider); ok {\n\t\treturn provider.transferFlightPolicy()\n\t}\n\treturn transferFlightPolicySnapshot{}\n}",
+        "f903": "func (self *SendSequence) transferFlightPolicy() transferFlightPolicySnapshot {\n\tif provider, ok := self.contractMultiRouteWriter.(transferFlightPolicyProvider); ok {\n\t\treturn provider.transferFlightPolicy()\n\t}\n\treturn transferFlightPolicySnapshot{}\n}"
+      }
+    }
+  },
+  "new_network_api": false,
+  "new_test_file": "transfer_window_writer_stats_test.go",
+  "production_changed_files": [
+    "transfer.go"
+  ],
+  "reader_audit": {
+    "ack_worker": "coalesceReceivedAck validates/publishes service via queue and service locks. observeItemAck is reached from receiveAckFeedbackAt on the send worker, after the ack worker has coalesced messages; teardown joins the ack worker before closing the writer.",
+    "concurrent": "DestinationSendStats calls sendWindowSnapshot, which calls estimateSendWindow and receiverWindowTiming. Every external policy read is routed through transferFlightPolicy.",
+    "fast_path": "NoAck callers use their separately atomic noAckFastPath snapshot; they do not read contractMultiRouteWriter.",
+    "lifetime": "Production windowPacer.service is attached before the sequence is published and is not cleared during teardown; only its separately buffer-locked reference count changes.",
+    "send_worker_only": [
+      "processLogicalGroupChunk",
+      "scheduleRetiredReliableCarrierRecovery",
+      "preferH3AfterH1Timeout",
+      "publishNoAckFastPath",
+      "Run reliable capacity selector",
+      "observeItemAck",
+      "openContractMultiRouteWriter",
+      "closeContractMultiRouteWriter"
+    ]
+  }
+}

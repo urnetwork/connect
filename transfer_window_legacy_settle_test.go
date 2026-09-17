@@ -5,40 +5,13 @@ import (
 	"time"
 )
 
-// The property a modern client talking to an older client actually depends on,
-// which is not any single branch of the window consumer: against a peer that
-// never advertises, the window settles once and stays there.
-//
-// The failure it rules out is the cycle - grow, overrun the peer's hold,
-// provoke an eviction, retransmit, shrink, regrow. That cycle is worse than a
-// small window, because each turn of it costs a retransmission and, against a
-// legacy peer, the eviction is silent: `evicted_sequence_numbers` is how a
-// receiver confesses an eviction and a legacy receiver cannot send it, so the
-// sender holds a lease on bytes already discarded until its selective
-// acknowledgement timeout expires. Branch two is the mitigation for that, and
-// it is the load-bearing part: by clamping the window to this sender's own
-// shipping hold, the sender never offers more than a receiver of its own
-// generation can take, so the eviction is not provoked and the silence never
-// matters. Nothing pinned it.
-//
-// So the assertion is a bound over a trajectory rather than a value at a
-// point: driven with a delivery rate that rises past what the clamp permits,
-// no estimate at any point exceeds the clamp, the window is non-decreasing,
-// and once it reaches the clamp it stays. A tree that oscillates fails on the
-// monotonicity; a tree that lets the delivery term raise the window above the
-// peer branch fails on the bound; a tree that never reaches the clamp fails on
-// the last check and is the regression the legacy peer would feel as a
-// permanently small window.
-//
-// Deterministic in the strict sense: delivery is recorded at explicit
-// timestamps, every estimate is taken at an explicit time, the round trip is
-// sampled from explicit send and receive times, and nothing sleeps or races.
-// The round trip is 50 ms so that the shipped one-gigabit target clamp sits
-// well above the legacy clamp and the row reads the branch under test rather
-// than the target; `TargetBound` is asserted false at every step so that a
-// change to the target cannot silently turn this into a row about something
-// else.
-func TestAgainstALegacyPeerTheWindowSettlesOnceAndStays(t *testing.T) {
+// A legacy reply permits the configured bootstrap but does not advertise new
+// capacity. That bootstrap remains the effective and learned window throughout
+// a rising delivery trajectory; only the fresh candidate grows to its ceiling.
+// The candidate retains the exact delivery/RTT arithmetic, monotonic trajectory
+// and eventual saturation checks without requiring an implicit initial shrink.
+// Explicit timestamps keep the whole path independent of host scheduling.
+func TestWindowRetainedLegacyBootstrapBoundsGrowingCandidates(t *testing.T) {
 	restore := MemoryBudget()
 	t.Cleanup(func() { SetMemoryBudget(restore) })
 	SetMemoryBudget(0)
@@ -64,7 +37,7 @@ func TestAgainstALegacyPeerTheWindowSettlesOnceAndStays(t *testing.T) {
 	sequence.observeReceiveWindowAdvertisement(receiveAckMessage{receiveWindowSet: false})
 
 	// a whole second, so every millisecond conversion below is exact
-	base := time.Unix(time.Now().Unix(), 0)
+	base := time.Unix(1700000000, 0)
 	for i := range 8 {
 		receiveTime := base.Add(time.Duration(i) * time.Millisecond)
 		sequence.rttWindow.closeSendTime(
@@ -81,16 +54,15 @@ func TestAgainstALegacyPeerTheWindowSettlesOnceAndStays(t *testing.T) {
 	}
 
 	// A delivery rate that rises past what the clamp permits. At this round
-	// trip and sample interval the rate window reads ten samples, so the
-	// window the delivery term allows is ten times the per-sample bytes; the
-	// last three steps are above the clamp and are where a tree that lets
-	// delivery raise the window would show it.
+	// trip the receiver's default compression also reserves residence. Early
+	// candidates are interior or floor-bound; the final three exceed the
+	// legacy permission before clamping and must never raise effective bytes.
 	perSampleSteps := []ByteCount{
 		kib(8), kib(16), kib(32), kib(64), kib(128), kib(256), kib(512), mib(1),
 	}
 
 	at := base
-	windows := make([]ByteCount, 0, len(perSampleSteps))
+	candidates := make([]ByteCount, 0, len(perSampleSteps))
 	reachedAt := -1
 	for step, perSample := range perSampleSteps {
 		for range samplesPerStep {
@@ -98,10 +70,10 @@ func TestAgainstALegacyPeerTheWindowSettlesOnceAndStays(t *testing.T) {
 			sequence.observeDeliveredBytes(perSample, at)
 		}
 		estimate := sequence.sendWindowEstimate(at)
-		windows = append(windows, estimate.Window)
+		candidates = append(candidates, estimate.CandidateWindow)
 		t.Logf(
-			"step %d: %d per sample gives window %d ceiling %d reason %q targetBound %t sized %t",
-			step, perSample, estimate.Window, estimate.Ceiling,
+			"step %d: %d per sample gives window %d candidate %d ceiling %d reason %q targetBound %t sized %t",
+			step, perSample, estimate.Window, estimate.CandidateWindow, estimate.Ceiling,
 			estimate.Reason, estimate.TargetBound, estimate.Sized,
 		)
 
@@ -123,6 +95,18 @@ func TestAgainstALegacyPeerTheWindowSettlesOnceAndStays(t *testing.T) {
 				step, estimate.Ceiling, legacyClamp,
 			)
 		}
+		if estimate.Window != legacyClamp || estimate.LearnedWindow != legacyClamp ||
+			!sequence.ackSeen.Load() || sequence.receiveWindowSet.Load() {
+			t.Errorf("step %d changed the legacy opening or invented an advertisement: %+v", step, estimate)
+		}
+		if estimate.RoundTrip != roundTrip || estimate.WindowRoundTrip != roundTrip+defaultAckCompressTimeout ||
+			int64(estimate.DeliveredByteCount)*sampleInterval.Nanoseconds() != int64(perSample)*estimate.Interval.Nanoseconds() {
+			t.Errorf("step %d lost the exact current-phase delivery or RTT evidence: %+v", step, estimate)
+		}
+		wantCandidate := min(max(2*perSample*ByteCount((roundTrip+defaultAckCompressTimeout)/sampleInterval), floor), legacyClamp)
+		if estimate.CandidateWindow != wantCandidate {
+			t.Errorf("step %d candidate=%d want=%d from current delivery", step, estimate.CandidateWindow, wantCandidate)
+		}
 		// The bound, checked at every point and not only at the end. This is
 		// the mitigation: the sender never offers a legacy peer more than a
 		// receiver of its own generation can hold, so the eviction it could
@@ -136,40 +120,40 @@ func TestAgainstALegacyPeerTheWindowSettlesOnceAndStays(t *testing.T) {
 		if estimate.Window < floor {
 			t.Errorf("step %d is below the working floor: %d against %d", step, estimate.Window, floor)
 		}
-		if 0 < step && estimate.Window < windows[step-1] {
+		if 0 < step && estimate.CandidateWindow < candidates[step-1] {
 			t.Errorf(
-				"step %d shrank from %d to %d on a rising delivery rate. The window must settle once and stay: a grow-overrun-shrink-regrow cycle costs a retransmission per turn and is the failure the clamp exists to prevent",
-				step, windows[step-1], estimate.Window,
+				"step %d candidate shrank from %d to %d on a rising delivery rate",
+				step, candidates[step-1], estimate.CandidateWindow,
 			)
 		}
-		if reachedAt < 0 && estimate.Window == legacyClamp {
+		if reachedAt < 0 && estimate.CandidateWindow == legacyClamp {
 			reachedAt = step
 		}
-		if 0 <= reachedAt && estimate.Window != legacyClamp {
+		if 0 <= reachedAt && estimate.CandidateWindow != legacyClamp {
 			t.Errorf(
-				"step %d left the legacy clamp, reading %d against the %d it had settled at by step %d",
-				step, estimate.Window, legacyClamp, reachedAt,
+				"step %d candidate left the legacy clamp, reading %d against the %d it had reached at step %d",
+				step, estimate.CandidateWindow, legacyClamp, reachedAt,
 			)
 		}
 	}
 
 	if reachedAt < 0 {
 		t.Errorf(
-			"the window never reached the legacy clamp %d over a delivery rate rising to %d per sample; it ended at %d. A legacy peer that can hold the sender's own shipping hold must be offered it, or branch two is a regression rather than a status quo",
+			"the candidate never reached the legacy clamp %d over a delivery rate rising to %d per sample; it ended at %d",
 			legacyClamp,
 			perSampleSteps[len(perSampleSteps)-1],
-			windows[len(windows)-1],
+			candidates[len(candidates)-1],
 		)
 	} else {
 		t.Logf(
-			"settled at the legacy clamp %d from step %d of %d, and held it for the remaining %d steps",
+			"candidate reached the legacy clamp %d from step %d of %d, and held it for the remaining %d steps",
 			legacyClamp, reachedAt, len(perSampleSteps), len(perSampleSteps)-1-reachedAt,
 		)
 	}
-	if windows[0] >= legacyClamp {
+	if candidates[0] >= legacyClamp {
 		t.Errorf(
-			"the trajectory started at %d, already at or above the clamp %d, so it never rose and the settling this row asserts was not exercised",
-			windows[0], legacyClamp,
+			"the candidate trajectory started at %d, already at or above the clamp %d, so it never exercised delivery growth",
+			candidates[0], legacyClamp,
 		)
 	}
 }

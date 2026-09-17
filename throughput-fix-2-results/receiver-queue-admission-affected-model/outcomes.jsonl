@@ -1,0 +1,8 @@
+{"outcome": "PASS", "seconds": "5.66s", "test": "TestWindowPathReceiverHybridStaticShortWindows", "variant": "queue-admission-affected-model"}
+{"outcome": "PASS", "seconds": "3.20s", "test": "TestWindowPathReceiverHybridSdkDuplexOrdinary", "variant": "queue-admission-affected-model"}
+{"outcome": "PASS", "seconds": "3.24s", "test": "TestWindowPathReceiverHybridSdkDuplexDiagnostic", "variant": "queue-admission-affected-model"}
+{"outcome": "PASS", "seconds": "0.20s", "test": "TestWindowPathReceiverIngressCounterShrinkDiagnostic", "variant": "queue-admission-affected-model"}
+{"outcome": "PASS", "seconds": "9.28s", "test": "TestWindowPathReceiverIngressCounterRateChangesDiagnostic", "variant": "queue-admission-affected-model"}
+{"outcome": "PASS", "seconds": "4.04s", "test": "TestWindowPathReceiverIngressCounterLongRoundTripDiagnostic", "variant": "queue-admission-affected-model"}
+{"outcome": "PASS", "seconds": "0.22s", "test": "TestWindowPathReceiverOfferTrainShortServiceDiagnostic", "variant": "queue-admission-affected-model"}
+{"outcome": "PASS", "seconds": "0.05s", "test": "TestWindowPathReceiverOfferTrainColdSmallWindowDiagnostic", "variant": "queue-admission-affected-model"}

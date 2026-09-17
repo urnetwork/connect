@@ -1,0 +1,21 @@
+{
+  "archive": "window-writer-statistics-owner-v1",
+  "payload_sha256": {
+    "before-race-stacks.txt": "4998eea0596bb07d2520b31cc0cce95b400b09e2b5b639afe50d7e06e40bee0c",
+    "candidate.patch": "b4f2c14fcee8963ce778e02ad5684d9666934485a9f668ea4790890ab6f64c4f",
+    "outcomes.jsonl": "e2e650e254100c0b2a359b04b790c604d6f56992908468cf7e6044632fec2753",
+    "provenance.json": "d5e901dea6009c0d771e2b297034e4b434ae6d051273218778f9a753a77ead5a",
+    "source-manifest-after-adjacent.json": "16ae495ed1e1a213efb310525bfc22615b7abb612ee671453e14bcbdb4220f11",
+    "source-manifest-after-count3.json": "758ec876db967b080b83992f57511b94a0f78b36e3948d22fb2937e36a8c338b",
+    "source-manifest-after-fresh1.json": "68af9de0c8c0a55a9ae397a50ac1fe62e97efa0acff303a895c966c3cb43c6f9",
+    "source-manifest-after-fresh2.json": "821dce02cef8f29cf5c594b3f64908927bca4066e14d5b9796a1477de0443595",
+    "source-manifest-after-fresh3.json": "6b8b599aa6f1cffb3df2984709cbad01ec2519efce715230a9254ad48fe49127",
+    "source-manifest-before-count3.json": "195d65b529750c5e84fb86301c0d0f3d651abf349a2bc97fe31e516ff4e65eee",
+    "source-manifest-before-fresh1.json": "963cc7eeb2c3074c5ad9f7f5851b6e7dae89304e1aa07acfcaf02c37333d7c1e",
+    "source-manifest-before-fresh2.json": "74863c6c5b18822453fb9be2a28af14f2731f285addc247e18bc46e4db266227",
+    "source-manifest-before-fresh3.json": "ce33de1d085b9c168a08f645df8819d44a31ab46ec583e0b4755fe9eebaa329f",
+    "source-pins.json": "2b0d5a8e96b1618791e18b16c0a78ce5549836c6eff5a43d90f49b3a48ace867",
+    "source-review.json": "cb44479611184f69250054cbf5cccb804a42fc3319d5c18b8c3e8a4c780e6fd1",
+    "status.json": "2bc50d0aa854b67ba7c407207f83b02b9fc3f5fb8b9a7eef716ebb1005a88a5b"
+  }
+}

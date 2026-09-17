@@ -1,0 +1,250 @@
+--- a/transfer.go
++++ b/transfer.go
+@@ -6231,7 +6231,8 @@
+ 	// did: a bare SendSequence built by a cell, driven through its pack
+ 	// channel with no send loop to publish anything, refused every retry. A
+ 	// gate that nothing has published must fail open.
+-	resendCapacityUnavailable resendCapacityGate
++	resendCapacityUnavailable    resendCapacityGate
++	physicalH1CapacityDiagnostic atomic.Pointer[windowPhysicalH1CapacityDiagnostic]
+ 	// Published by Run after each route-policy snapshot so concurrent Pack
+ 	// callers never read the goroutine-owned multi-route writer directly.
+ 	flowIsolation atomic.Bool
+@@ -6857,12 +6858,14 @@
+ 	if sendPack.Ack {
+ 		admitted, err, capacityTimeout := self.awaitResendCapacity(sendPack, timeout)
+ 		if err != nil || !admitted {
++			windowPhysicalH1RecordPackRefusal(self, sendPack, timeout, "resend-capacity")
+ 			return false, err
+ 		}
+ 		timeout = capacityTimeout
+ 	}
+ 	admitted, err, timeout := self.acquirePackAdmission(sendPack, timeout)
+ 	if err != nil || !admitted {
++		windowPhysicalH1RecordPackRefusal(self, sendPack, timeout, "pack-admission")
+ 		return false, err
+ 	}
+ 	queued := false
+@@ -6900,6 +6903,7 @@
+ 			queued = true
+ 			return true, nil
+ 		default:
++			windowPhysicalH1RecordPackRefusal(self, sendPack, timeout, "pack-channel")
+ 			return false, nil
+ 		}
+ 	} else {
+@@ -8575,10 +8579,9 @@
+ 
+ 		checkpointId := self.idleCondition.Checkpoint()
+ 
+-		resendCapacity := self.resendQueue.CanAdd(
+-			0,
+-			self.sendWindowEstimate(sendTime).Window,
+-		)
++		diagnosticWindow := self.sendWindowEstimate(sendTime).Window
++		resendCapacity := self.resendQueue.CanAdd(0, diagnosticWindow)
++		diagnosticQueueCapacity := resendCapacity
+ 		self.observeRouteStall(sendTime)
+ 		// FLIGHTGATEFIX §22: a reliable lane may hold what it has shown it
+ 		// can carry. Beyond that the queue only adds delay, the scaled timer
+@@ -8596,6 +8599,7 @@
+ 			)
+ 			reliableAdmissionWaitStart = time.Time{}
+ 		}
++		windowPhysicalH1RecordCapacity(self, diagnosticWindow, diagnosticQueueCapacity, reliableAdmission)
+ 		resendCapacity = resendCapacity && reliableAdmission
+ 		self.resendCapacityUnavailable.Store(!resendCapacity)
+ 		// The unreliable flight only gates admission while no reliable carrier
+--- a/ip.go
++++ b/ip.go
+@@ -7873,6 +7873,7 @@
+ 		self.returnAdmissions.Done()
+ 	}
+ 	if !queued {
++		windowPhysicalH1RecordProviderRefusal(self, item, queue, shardIndex)
+ 		self.congestionDrops.addReturnQueue(item.packetCount(), item.packetByteCount)
+ 		self.releaseReturnItem(item)
+ 	}
+--- a/transfer_window_h1_physical_test.go
++++ b/transfer_window_h1_physical_test.go
+@@ -241,6 +241,8 @@
+ 	const roundTrip = 300 * time.Microsecond
+ 	const warmup = 2500 * time.Millisecond
+ 	const duration = 5 * time.Second
++	diagnostic := newWindowPhysicalH1RefusalDiagnostic(arm)
++	defer diagnostic.finish(t)
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	reading = windowPhysicalH1Reading{Arm: arm, ProfileSha256: digest, Profiles: profiles, Rate: rate, AddedRoundTrip: roundTrip, WarmupSeconds: warmup.Seconds(), Flows: cell.Flows, Duplex: cell.Duplex, DirectionNames: [2]string{"provider-to-server download", "server-to-provider upload"}}
+ 	var clients [2]*Client
+--- /dev/null
++++ b/transfer_window_h1_first_refusal_diagnostic.go
+@@ -0,0 +1,169 @@
++// Isolated diagnostic: bounded first-refusal records; no change to admission.
++package connect
++
++import (
++	"encoding/json"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/urnetwork/connect/protocol"
++)
++
++// One immutable send-owner publication explains a currently closed gate.
++type windowPhysicalH1CapacityDiagnostic struct {
++	Window            ByteCount
++	QueueCanAdd       bool
++	ReliableAdmission bool
++	ResendCount       int
++	ResendBytes       ByteCount
++}
++
++// Only scalar metadata survives the borrowed packet's lifetime.
++type windowPhysicalH1RefusalRecord struct {
++	Arm                    string
++	Cause                  string
++	SinceStart             time.Duration
++	PacketBytes            int
++	Flow                   int
++	PayloadBytes           int
++	Ack                    bool
++	Syn                    bool
++	Fin                    bool
++	Rst                    bool
++	Window                 uint16
++	AckRequired            bool
++	Recoverable            bool
++	RetainAfterTimeout     bool
++	LogicalLane            uint32
++	SequenceBufferCount    int
++	SequenceBufferCapacity int
++	AdmissionCount         int
++	AdmissionCapacity      int
++	ResendCount            int
++	ResendBytes            ByteCount
++	ResendGate             bool
++	GatePublication        *windowPhysicalH1CapacityDiagnostic
++	ProviderShard          int
++	ProviderQueueCount     int
++	ProviderQueueCapacity  int
++	ProviderRecoveryMode   receiveRecoveryMode
++	Closed                 bool
++}
++
++// Each arm owns four records, emitted only after its workers are joined.
++type windowPhysicalH1RefusalDiagnostic struct {
++	arm     string
++	start   time.Time
++	seen    [4]atomic.Bool
++	records chan windowPhysicalH1RefusalRecord
++}
++
++var windowPhysicalH1ActiveDiagnostic atomic.Pointer[windowPhysicalH1RefusalDiagnostic]
++
++// Begins before the original fixture starts any owner workers.
++func newWindowPhysicalH1RefusalDiagnostic(arm string) *windowPhysicalH1RefusalDiagnostic {
++	diagnostic := &windowPhysicalH1RefusalDiagnostic{arm: arm, start: time.Now(), records: make(chan windowPhysicalH1RefusalRecord, 4)}
++	windowPhysicalH1ActiveDiagnostic.Store(diagnostic)
++	return diagnostic
++}
++
++// Runs after the fixture's original cleanup and does no hot-path logging.
++func (self *windowPhysicalH1RefusalDiagnostic) finish(t *testing.T) {
++	windowPhysicalH1ActiveDiagnostic.CompareAndSwap(self, nil)
++	for {
++		select {
++		case record := <-self.records:
++			encoded, err := json.Marshal(record)
++			if err != nil {
++				t.Fatal(err)
++			}
++			t.Logf("physical-h1-first-refusal %s", encoded)
++		default:
++			return
++		}
++	}
++}
++
++// Snapshot only the first closed episode until its denial has been captured.
++func windowPhysicalH1RecordCapacity(sequence *SendSequence, window ByteCount, queueCanAdd, reliableAdmission bool) {
++	diagnostic := windowPhysicalH1ActiveDiagnostic.Load()
++	if diagnostic == nil || diagnostic.seen[0].Load() {
++		return
++	}
++	if queueCanAdd && reliableAdmission {
++		sequence.physicalH1CapacityDiagnostic.Store(nil)
++		return
++	}
++	if sequence.physicalH1CapacityDiagnostic.Load() != nil {
++		return
++	}
++	count, bytes := sequence.resendQueue.QueueSize()
++	sequence.physicalH1CapacityDiagnostic.Store(&windowPhysicalH1CapacityDiagnostic{Window: window, QueueCanAdd: queueCanAdd, ReliableAdmission: reliableAdmission, ResendCount: count, ResendBytes: bytes})
++}
++
++// Borrow a refused provider packet and retain only its synthetic TCP fields.
++func windowPhysicalH1FillRefusal(record *windowPhysicalH1RefusalRecord, packet []byte) {
++	record.PacketBytes = len(packet)
++	var path IpPath
++	if _, err := parseIpPathWithPayloadBorrowed(packet, &path); err == nil {
++		record.Flow = windowPhysicalH1Flow(&path)
++		record.PayloadBytes = path.TcpPayloadByteCount
++		record.Ack, record.Syn, record.Fin, record.Rst = path.Ack, path.Syn, path.Fin, path.Rst
++		record.Window = path.TcpWindowSize
++	}
++}
++
++// Called at the exact zero-timeout false return, before packet ownership ends.
++func windowPhysicalH1RecordPackRefusal(sequence *SendSequence, pack *SendPack, timeout time.Duration, cause string) {
++	diagnostic := windowPhysicalH1ActiveDiagnostic.Load()
++	if diagnostic == nil || timeout != 0 {
++		return
++	}
++	frame := pack.Frame
++	if frame == nil && len(pack.Frames) != 0 {
++		frame = pack.Frames[0]
++	}
++	if frame == nil || frame.MessageType != protocol.MessageType_IpIpPacketFromProvider {
++		return
++	}
++	index := 0
++	if cause == "pack-admission" {
++		index = 1
++	} else if cause == "pack-channel" {
++		index = 2
++	}
++	if !diagnostic.seen[index].CompareAndSwap(false, true) {
++		return
++	}
++	record := windowPhysicalH1RefusalRecord{Arm: diagnostic.arm, Cause: cause, SinceStart: time.Since(diagnostic.start), AckRequired: pack.Ack, Recoverable: pack.lifecycleUpstreamRecoverable, RetainAfterTimeout: pack.retainAfterAckTimeout, LogicalLane: pack.logicalLane, SequenceBufferCount: len(sequence.packs), SequenceBufferCapacity: cap(sequence.packs), ResendGate: sequence.resendCapacityUnavailable.Load(), GatePublication: sequence.physicalH1CapacityDiagnostic.Load(), Closed: pack.Ctx.Err() != nil || sequence.ctx.Err() != nil}
++	windowPhysicalH1FillRefusal(&record, frame.MessageBytes)
++	if admission := sequence.packAdmission; admission != nil {
++		func() {
++			admission.mutex.Lock()
++			defer admission.mutex.Unlock()
++			record.AdmissionCount, record.AdmissionCapacity = admission.count, admission.capacity
++		}()
++	}
++	if sequence.resendQueue != nil {
++		record.ResendCount, record.ResendBytes = sequence.resendQueue.QueueSize()
++	}
++	select {
++	case diagnostic.records <- record:
++	default:
++	}
++}
++
++// Capture queue refusal before release clears the exact return item.
++func windowPhysicalH1RecordProviderRefusal(provider *RemoteUserNatProvider, item *providerReturnItem, queue chan *providerReturnItem, shard int) {
++	diagnostic := windowPhysicalH1ActiveDiagnostic.Load()
++	if diagnostic == nil || !diagnostic.seen[3].CompareAndSwap(false, true) {
++		return
++	}
++	record := windowPhysicalH1RefusalRecord{Arm: diagnostic.arm, Cause: "provider-return-queue", SinceStart: time.Since(diagnostic.start), ProviderShard: shard, ProviderQueueCount: len(queue), ProviderQueueCapacity: cap(queue), ProviderRecoveryMode: item.recoveryMode, Closed: provider.ctx.Err() != nil}
++	windowPhysicalH1FillRefusal(&record, item.firstPacket())
++	select {
++	case diagnostic.records <- record:
++	default:
++	}
++}

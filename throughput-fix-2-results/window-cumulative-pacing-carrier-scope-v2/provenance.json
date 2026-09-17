@@ -1,0 +1,23 @@
+{
+  "archive_path_normalization": "External artifact lookup paths are represented by snapshot identifier and relative path. Raw logs and original compile manifests remain unmodified outside the repository; their original hashes are pinned. Race-stack extracts replace only frozen-source and Go-installation path prefixes, preserving line numbers and stack text.",
+  "before_failing_test": "TestWindowPacingCumulativeSharedServiceRejectsOtherCarriers",
+  "interpretation": "This is estimator attribution and pacing-result eligibility proof. The production physical H1 pacer does not run on non-H1 policies, so the root is not evidence of actual non-H1 throughput or writes.",
+  "new_network_api": false,
+  "performance_gates_changed": false,
+  "prior_causal_archives": [
+    "window-cumulative-pacing-roots-v1",
+    "window-cumulative-pacing-sdk-v1"
+  ],
+  "production_change": "One carrier eligibility condition on fresh DeliveryByteRate: standalone service or current H1-only route policy. No estimator arithmetic, positive service preference or sampler changes.",
+  "race": true,
+  "repetitions": 3,
+  "sampler": "accepted54b360 in both variants",
+  "sampler_changed": false,
+  "scope": "Twelve exact raw test names. Unknown, H3, P2P and mixed policies keep the H1 cold fallback; the qualified local sizing candidate remains valid. A current H1 sibling owns only its own cumulative fallback, an idle sibling remains bootstrap, positive shared slow service remains authoritative for both, and standalone service still uses local delivery. The original nine freshness/rate/one-reply/hard-bound controls remain.",
+  "source_base": {
+    "snapshot": "cumulative-pacing-after",
+    "source_content_sha256": "e2729ee2c6b801e06bc24a43b3cdf992cbd4b42e1a9f400b60515e2bff1677b0"
+  },
+  "test_execution_owner": "test_monitor_medium",
+  "test_file_sha256": "7d0ebcc5f263ec87846b03ea17576180c5711d2fab7c47af6a540fb386212347"
+}

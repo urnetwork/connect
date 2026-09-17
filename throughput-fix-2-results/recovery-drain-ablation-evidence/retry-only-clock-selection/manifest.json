@@ -1,0 +1,11 @@
+{
+  "archive_kind": "recovery_drain_ablation_retry_only_clock_selection_supplement",
+  "file_count": 4,
+  "file_sha256": {
+    "outcomes.jsonl": "f5961943814d9cf5def04c75ec4e12034d75f89e15cc1936d7306d4c062ea766",
+    "provenance.json": "a5e349795d3b4133833827ccc03bb0b3ff32391ec987f834980b8a3864d2c656",
+    "source-pins.json": "82d9ef1b98d2e2f237d1886be76a8b577a179072e5c3fcdcbac3c2fc76c1aa1c",
+    "status.json": "645316e069fb90def392a8921b47287ab30322226e993b604f227e442e4e8519"
+  },
+  "schema_version": 1
+}

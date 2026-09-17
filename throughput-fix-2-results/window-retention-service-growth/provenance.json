@@ -1,0 +1,6 @@
+{
+  "description": "A physically paced 2MiB opening and 512 serialized replies measure125MB/s on a400ms path. Cumulative history spans only16.8ms and cannot yet satisfy the two-RTT horizon. Measured service can qualify bounded growth; one reply cannot.",
+  "outcomes": "Eleven policy/physical-root assertions three times under race: before30 pass/3 fail; after33 pass. No races. The growth failure repeats identically.",
+  "scope": "Service-growth candidate still requires current-carrier attribution and original affected throughput gates. No quality API, shrink episode, or remote notification.",
+  "setup_correction": "An earlier fixture incorrectly required every opening write to occur at one instant. Both arms rejected that setup. The corrected identical fixture permits bounded pacing and verifies every initial write completes before the first reply. Earlier setup runs remain raw diagnostics, not root reproductions."
+}

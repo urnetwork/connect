@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "1baeb489d8c8984251b946fd681e185fd538e70852f9a35fba0f1839216745f4",
+  "binary_sha256": "8dae5f7a9cd22b263326b005d9cd7865c62a3cd5d5afe03101f3b679f9b45735",
+  "effective_inputs_sha256": "ac90fb3e4f00459f80801c2b2f2ffeb6bc733a9dbcd16190dc9299f49dde0788",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiver(EarlyIngressHeadCannotRetimePrefix|EarlyIngressSackKeepsPrefixRaw|OrderedIngressPrefixControl)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as build; absolute relationship pinned by original status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T21:24:42.277110+00:00",
+  "loadavg_start": [
+    8.6220703125,
+    6.75146484375,
+    8.33740234375
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 0.9773120833560824,
+  "loadavg_end": [
+    9.05224609375,
+    6.87158203125,
+    8.3701171875
+  ],
+  "ended_utc": "2026-09-16T21:24:43.254652+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "26a7505fcffd8f378065fcf0efbb33f33c9f77b1cb1147b4afaef5a9cc3aa18b",
+  "pass": 6,
+  "fail": 3,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "6P3F: baseline confirmed-H1 cumulative head retimes its later-arriving prefix into16MB/s against physical200kB/s; ordered and prior-SACK controls pass.",
+  "rows": 3
+}

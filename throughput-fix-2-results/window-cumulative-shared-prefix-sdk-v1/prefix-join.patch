@@ -1,0 +1,77 @@
+--- a/transfer_window_service_credit.go	2026-09-16 16:19:37
++++ b/transfer_window_service_credit.go	2026-09-16 16:33:51
+@@ -15,10 +15,10 @@
+ // Every credited envelope retains the earliest physical offer in its group.
+ // A missing timestamp stays explicit and cannot establish a flight boundary.
+ type windowServiceAckCredit struct {
+-	bytes                  ByteCount
+-	firstSentAtNanos       int64
+-	receiverTiming         windowServiceAckTiming
+-	receiverTimingEligible bool
++	bytes            ByteCount
++	firstSentAtNanos int64
++	receiverTiming   windowServiceAckTiming
++	initialH1        bool
+ }
+ 
+ // Merge only newly delivered envelopes, preserving incomplete offer evidence.
+@@ -27,9 +27,9 @@
+ 		return
+ 	}
+ 	if self.bytes == 0 {
+-		self.receiverTimingEligible = other.receiverTimingEligible
++		self.initialH1 = other.initialH1
+ 	} else {
+-		self.receiverTimingEligible = self.receiverTimingEligible && other.receiverTimingEligible
++		self.initialH1 = self.initialH1 && other.initialH1
+ 	}
+ 	if self.bytes == 0 || other.firstSentAtNanos < self.firstSentAtNanos {
+ 		self.firstSentAtNanos = other.firstSentAtNanos
+@@ -44,7 +44,7 @@
+ 	}
+ 	item.serviceCreditObserved = true
+ 	self.add(windowServiceAckCredit{bytes: item.pacingByteCount, firstSentAtNanos: item.pacingSentAtNanos,
+-		receiverTimingEligible: item.rttH1 && (item.rttState == sendItemRttWriteConfirmed || item.rttState == sendItemRttObserved)})
++		initialH1: item.rttH1 && (item.rttState == sendItemRttWriteConfirmed || item.rttState == sendItemRttObserved)})
+ }
+ 
+ // Worker fallback covers items temporarily outside the retry queue when the
+@@ -75,6 +75,7 @@
+ 	}
+ 	credit := windowServiceAckCredit{}
+ 	headCredited := false
++	headByteCount := ByteCount(0)
+ 	func() {
+ 		self.resendQueue.stateLock.Lock()
+ 		defer self.resendQueue.stateLock.Unlock()
+@@ -84,6 +85,7 @@
+ 			return
+ 		}
+ 		headCredited = !item.serviceCreditObserved && item.pacingByteCount > 0
++		headByteCount = item.pacingByteCount
+ 		if selective {
+ 			credit.addItemWithLock(item)
+ 			return
+@@ -113,7 +115,10 @@
+ 		}
+ 		self.serviceAckHeadNumber, self.serviceAckHeadSet = head, true
+ 	}()
+-	if headCredited && credit.receiverTimingEligible && timing.receivedAtNanos != 0 && timing.receivedAtNanos == at.UnixNano() {
++	// A relayed head can arrive before an earlier sequence hole. Its own
++	// wait cannot remove time spent receiving that newly credited prefix.
++	if headCredited && credit.initialH1 && (timing.receiverDelay == 0 || credit.bytes == headByteCount) &&
++		timing.receivedAtNanos != 0 && timing.receivedAtNanos == at.UnixNano() {
+ 		credit.receiverTiming = timing
+ 	}
+ 	self.observePacingServiceCredit(credit, at)
+--- a/transfer_window_service_delivery.go	2026-09-16 16:20:03
++++ b/transfer_window_service_delivery.go	2026-09-16 16:33:51
+@@ -186,7 +186,7 @@
+ 	self.aggregate.insert(windowServiceDeliverySample{
+ 		bytes: credit.bytes, firstBytes: credit.bytes, firstAtNanos: at.UnixNano(), lastAtNanos: at.UnixNano(),
+ 		firstSentAtNanos: credit.firstSentAtNanos,
+-		eligible:         credit.receiverTimingEligible && credit.firstSentAtNanos > 0 && credit.firstSentAtNanos <= at.UnixNano(),
++		eligible:         credit.initialH1 && credit.firstSentAtNanos > 0 && credit.firstSentAtNanos <= at.UnixNano(),
+ 	})
+ }
+ 

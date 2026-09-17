@@ -1,0 +1,10 @@
+{
+  "examples": "Provider-H1 300us/8 duplex totals1706.741760 versus973.824000Mb/s, with direction0 falling749.85472 to16.34304. Provider-H1400ms/8 duplex direction0 falls20.162810 to7.517659Mb/s. The824-row ledger contains all cells, not just these examples.",
+  "interpretation": "This source retains the accepted cumulative fallback. Focused passes do not override full-matrix failures. Scheduling-sensitive model readings are not by themselves matched before/after source-causality proof.",
+  "no_quiescence_wait": true,
+  "outcome": "27 passes and3 failures. SDK profiles and bidirectional directions lose capacity. RTT growth delivers91.654827 versus95.771307Mb/s overall but fails the unchanged first-interval gate at83.415040 versus95.764480Mb/s.",
+  "race": false,
+  "role": "Complete normal model over restored cumulative fallback and full current root inventory, before the bounded invalid-order slowdown fix.",
+  "source_scope": "Complete current copied source plus receiver clock consumers and endpoint bounds, with restored cumulative pacing and new invalid-ring slowdown roots. Network-quality event API remains out of scope.",
+  "working_directory": "Exact copied build module; binary and every copied input verified."
+}

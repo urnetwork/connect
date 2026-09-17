@@ -1,0 +1,10 @@
+{
+  "archive": "service-receiver-cumulative-restoration-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "874153911f3527fb3645c2f9bb51267642f156d5c3414c9668ccfb332b858bb5",
+    "outcomes.jsonl": "84ad31130f07cd04ed10367b2399b3b24a3e60210b4d322146884f4cad587460",
+    "provenance.json": "dc3d2eecfcf5f10fea1f175be1da95898b22455b8b9b1bb2c8ab0492f8ca14b9",
+    "source-pins.json": "7f57d8dd5416484479206a5c85cfb82bb2d99f34a151f7dd11688da211f0d81e",
+    "status.json": "880803eee1ea3000c5d2f0938407531fe987ec01fd2affe29e7d923c0f5498cf"
+  }
+}

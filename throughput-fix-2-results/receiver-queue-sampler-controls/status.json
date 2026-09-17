@@ -1,0 +1,20 @@
+{
+  "after": {
+    "fail": 3,
+    "paced_capacity_root_passed": "TestWindowReceiverQueueCompressionKeepsPacedCapacity",
+    "pass": 18,
+    "race_warnings": 0,
+    "remaining_failing_root": "TestWindowReceiverQueueCompressionDoesNotPriceBufferedBurst"
+  },
+  "all_other_selected_ingress_controls_passed_each_repetition": true,
+  "before": {
+    "expected_failing_roots": [
+      "TestWindowReceiverQueueCompressionKeepsPacedCapacity",
+      "TestWindowReceiverQueueCompressionDoesNotPriceBufferedBurst"
+    ],
+    "fail": 6,
+    "pass": 15,
+    "race_warnings": 0
+  },
+  "classification": "sampler-level diagnostic control only; not actual forced-Client queue integration and not performance acceptance"
+}

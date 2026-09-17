@@ -1,0 +1,6 @@
+{
+  "classification": "Complete copied scoped correctness502P1F, race=true, no warnings; sole failure is the newly added invalid-ring sustained-slowdown root.",
+  "outcomes": 503,
+  "readings": 12,
+  "worker_readings": 10
+}

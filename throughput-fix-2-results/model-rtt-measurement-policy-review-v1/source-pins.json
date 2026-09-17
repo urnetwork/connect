@@ -1,0 +1,32 @@
+[
+  {
+    "archive": "model-receiver-refill-full-v1",
+    "archive_manifest_sha256": "6962c8e078431ae533f247f5a9ddeb2731b12b3f2e83873645e319f572b415a9",
+    "ledger_sha256": "76a15260005ddbddff065df129385344c1f1b55a76bd90c2c721ef5aea491789",
+    "source_pins_sha256": "445a94d179ad06202d2d1d214ef279800fc0dd40a625aa9e74d64bf324ebce77"
+  },
+  {
+    "archive": "model-receiver-consumers-full-v1",
+    "archive_manifest_sha256": "3644d6b479349dca0230f9eb730a1d76dcd5f4c9813a29b4cb9cb89aca300bef",
+    "ledger_sha256": "4ba3b524bfab1eb72b2d1d2cdfe6dc910aca456baa2925653f0f81313dffbf5f",
+    "source_pins_sha256": "924a6ac7f2be6cd2b9dfa9f4ba2d80657b34b1d6f0219800c9b8ab5fb7024841"
+  },
+  {
+    "archive": "model-receiver-restored-full-v1",
+    "archive_manifest_sha256": "edbd3264e8b4c70daf7b80c029b752cf1ae30bc86df6fac85d01c3324df0384f",
+    "ledger_sha256": "252b7a4923124683df1c791b7fa38a8098b3cfc11d4788974ae24e1d7b40a8fa",
+    "source_pins_sha256": "fbbb95c2012d5e9b9bdc5df93b0e4eba4510f5bb6281577b8efd056f7ba0a36b"
+  },
+  {
+    "archive": "model-receiver-invalid-slowdown-full-v1",
+    "archive_manifest_sha256": "89a2631e604fc51c8ce0fc359800660e68dec127d04c8bb151862f74842a298f",
+    "ledger_sha256": "0395d6e43a9d648669034e9e8da1036e709f9de249ce0d1fbd58e7d11189a00b",
+    "source_pins_sha256": "5ac9065993e54c558dd1ce2423dc8361af0ebfe6c34b8edc1468ca6038344227"
+  },
+  {
+    "archive": "service-receiver-cumulative-restoration-v1",
+    "archive_manifest_sha256": "27695fd722481304961c5ecd79e9444900efb9694448ff96421d896e6f666cae",
+    "ledger_sha256": "874153911f3527fb3645c2f9bb51267642f156d5c3414c9668ccfb332b858bb5",
+    "source_pins_sha256": "7f57d8dd5416484479206a5c85cfb82bb2d99f34a151f7dd11688da211f0d81e"
+  }
+]

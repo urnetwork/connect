@@ -1,0 +1,8 @@
+{"encrypted_bytes":294,"evictions":0,"fixed64":false,"legacy":false,"plain_bytes":203,"reservation_bytes":320,"tuple_bytes":40}
+{"encrypted_bytes":5417,"evictions":512,"fixed64":false,"legacy":false,"plain_bytes":5326,"reservation_bytes":5440,"tuple_bytes":40}
+{"encrypted_bytes":297,"evictions":0,"fixed64":false,"legacy":true,"plain_bytes":206,"reservation_bytes":320,"tuple_bytes":40}
+{"encrypted_bytes":5420,"evictions":512,"fixed64":false,"legacy":true,"plain_bytes":5329,"reservation_bytes":5440,"tuple_bytes":40}
+{"encrypted_bytes":290,"evictions":0,"fixed64":true,"legacy":false,"plain_bytes":199,"reservation_bytes":320,"tuple_bytes":36}
+{"encrypted_bytes":5413,"evictions":512,"fixed64":true,"legacy":false,"plain_bytes":5322,"reservation_bytes":5440,"tuple_bytes":36}
+{"encrypted_bytes":293,"evictions":0,"fixed64":true,"legacy":true,"plain_bytes":202,"reservation_bytes":320,"tuple_bytes":36}
+{"encrypted_bytes":5416,"evictions":512,"fixed64":true,"legacy":true,"plain_bytes":5325,"reservation_bytes":5440,"tuple_bytes":36}

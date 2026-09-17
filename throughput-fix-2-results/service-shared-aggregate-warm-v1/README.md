@@ -1,0 +1,9 @@
+# Bounded shared delivery history: warm component proof
+
+The matched source pair is 24 pass / 3 fail before and 27 pass / 0 fail after under race instrumentation. The only before failure is the lawful batched split-prefix estimate-consumer case. Current frame/window limits, exact credit and per-sequence cumulative qualification pass; the old positive service hold keeps final shared pacing at 950,000 B/s despite a current lane delivering 2,823,529 B/s. The frequent-read control passes before and after.
+
+The candidate records exact once-only initial-H1 credit in a separate 64-bucket raw history. Original receipt times, earliest physical offers, unknown eligibility and all tied first-checkpoint bytes survive merging and resizing. Cold policy reads select a recent qualified interval; the warm lower bound includes all eligible retained bytes over earliest offer to latest raw ACK. No corrected receiver interval or destination FIFO is assumed. This proof does not yet include the cold consumer.
+
+The warm result proves recovery for these prescribed faster-delivery inputs. It does not establish closed-loop growth: at a paced steady state on a long RTT, the offer-to-ACK lower bound may remain below the old hold. The independent static actual-pacer test and unchanged static throughput gates remain necessary. A later audit also found missing pending-drain cutoffs in this first candidate; its before/after guard proof is kept separately.
+
+The eight controls cover frequent reads, lawful queued slowdown with legacy/mixed variants, actual positive shared-pacer reservation accounting, straddling cumulative prefix, causal reversal and tied receiver-clock publication. Their original fixtures and assertions remain unchanged in this pair. The normalized manifests pin the complete copied build/runtime source relationship and original raw evidence.

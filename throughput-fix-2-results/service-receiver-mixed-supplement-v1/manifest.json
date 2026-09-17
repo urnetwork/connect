@@ -1,0 +1,9 @@
+{
+  "archive": "service-receiver-mixed-supplement-v1",
+  "payload_sha256": {
+    "outcomes.jsonl": "ebff7d7f3905a0da503e9d42b4008c6a8d35517e8e781ddc3f765a38a13276b1",
+    "provenance.json": "c020248679b69b052b3b53ec15ea5c96b2de15080d0f0d5c838b7d712f69c958",
+    "source-pins.json": "35b47409c675038244b5572f36a5468579e3f51a969167e5588897f3d508d5aa",
+    "status.json": "01b95f66997667a56e22c434ee99568ec85e8d5bcf20d11e63341e042a516882"
+  }
+}

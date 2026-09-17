@@ -1,0 +1,9 @@
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingSdkInitialFreshPairDiscoversSlowService", "variant": "before"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingSdkInitialFreshPairDiscoversSlowService", "variant": "before"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingSdkInitialFreshPairDiscoversSlowService", "variant": "before"}

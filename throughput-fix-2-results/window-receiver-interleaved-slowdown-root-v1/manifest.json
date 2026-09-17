@@ -1,0 +1,11 @@
+{
+  "archive": "window-receiver-interleaved-slowdown-root-v1",
+  "payload_sha256": {
+    "outcomes.jsonl": "f8bdda9b3ed015818438e39e1d6f095284c8d7afe0ba6045f0d6c4ac509d88e6",
+    "provenance.json": "5038d5ae861abd00c6af639824bf6898ad51c3f7d0efb2d065bfa47d8f576d0f",
+    "root-control.patch": "d3020d4f0f7623726e9fb7f02754bb4a4f1d3ff5e25b1c31ac570706befe0665",
+    "source-manifest-before.json": "ac940562b66fae0d0917a7c4ec70bde8b56e543f36efa19e20569a43e5dec592",
+    "source-pins.json": "09bf0cc6d9f8559dbaa2f63d7f04157cb06365048b9de12888fe236398ebf7a8",
+    "status.json": "aa29cc38f0e67f177276f6214c351347ed3d1b30a4c8994c4164466e48058cbc"
+  }
+}

@@ -1,0 +1,2 @@
+{"failure": "transfer_window_service_receiver_ring_benchmark_test.go:116: fixture did not populate the whole ring: 63", "variant": "initial-two-endpoint-fixture"}
+{"failure": "transfer_window_service_receiver_ring_benchmark_test.go:116: fixture did not populate the whole ring: 63", "variant": "initial-two-endpoint-fixture"}

@@ -1,0 +1,10 @@
+{
+  "binary_sha256": "0b7d8ee0b6c3c19631b991e9010d1f3801f562ede9b6215e7c7815686e3662f6",
+  "interpretation": "The prior focused six-gate pass does not establish full performance acceptance. Preserve per-direction SDK gates and all individual readings; this source is isolated, not adopted.",
+  "no_quiescence_wait": true,
+  "outcome": "28 passes, two failures, zero skips and no race warnings. The changing receiver-window cell with 50 ms compression delivers 3.953 versus 4.543 Mb/s. The 300-microsecond single-flow non-provider SDK duplex cell loses capacity in one direction: 804.833 versus 957.235 Mb/s, despite aggregate improvement. RTT-growth passes at 95.771 Mb/s for both arms.",
+  "race": false,
+  "role": "Full virtual-time performance model for exact receiver-delay intervals, qualified cold short trains and receiver-aware cycle start.",
+  "source_inputs_sha256": "ddef3374b48fd37e29261dc52dcba08d4d8aef4688d520a19d0fff6548f7bd45",
+  "source_scope": "Same binary as model-receiver-refill-combined-v1; excludes the subsequent corrected-endpoint bounds and shared interval-consumer corrections."
+}

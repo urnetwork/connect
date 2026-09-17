@@ -1,0 +1,14 @@
+{
+  "archive": "window-cumulative-shared-prefix-sdk-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "d0f25694d6f46fd9c6c483dcbf04a99d9e052053463498cf40501c3d56dc776c",
+    "outcomes.jsonl": "3c2dd3f15b896611dd1722117cb8a8ae6b43502de46d02a6d345dc2e5a6b13ef",
+    "prefix-join.patch": "e33cb66adef8ddf3ff7a3e62df3a37e1e02efc5760a79e1cdef3d8bd9a2fdb39",
+    "prefix-root-source.txt": "9b66fe180f3563885cfdaf5f5fa7fa113c0afa795e8309c6e903b43c3a6efe05",
+    "provenance.json": "487acd996eebef05abe00b0ce7ded39b13bc6573c6789b03d7e96ae5644ab907",
+    "source-manifest-roots.json": "b9c33a60d4b7ba7d8dfa50160ab980cef44c209589436e0480ef013604709397",
+    "source-manifest-sdk.json": "2884f5a67e480692db91f38af7e9ba6028540c7fd51ef19b25b88840c0c6598e",
+    "source-pins.json": "a75b9667e8e807dee55e1fae0d095f01d94da7b5d2b107df723dd2ce74f1b413",
+    "status.json": "c1bddcdf088df249bcb9f63e619ed41d09926596b95936ecae04dd627129f13b"
+  }
+}

@@ -1,0 +1,322 @@
+[
+  {
+    "aggregate_ratio": 1.0,
+    "aggregation": [
+      {
+        "all_at_least_90_percent": true,
+        "candidate_mbps": [
+          95.76448,
+          95.78496,
+          95.76448
+        ],
+        "longer_than_configured_feedback": false,
+        "minimum_ratio": 0.9997861877271756,
+        "ratios": [
+          0.9997861877271756,
+          1.000213857998289,
+          1.0
+        ],
+        "reference_mbps": [
+          95.78496,
+          95.76448,
+          95.76448
+        ],
+        "seconds": 1
+      },
+      {
+        "all_at_least_90_percent": true,
+        "candidate_mbps": [
+          95.77472,
+          95.77472
+        ],
+        "longer_than_configured_feedback": true,
+        "minimum_ratio": 1.0,
+        "ratios": [
+          1.0,
+          1.0001069289991444
+        ],
+        "reference_mbps": [
+          95.77472,
+          95.76448
+        ],
+        "seconds": 2
+      },
+      {
+        "all_at_least_90_percent": true,
+        "candidate_mbps": [
+          95.77130666666667
+        ],
+        "longer_than_configured_feedback": true,
+        "minimum_ratio": 1.0,
+        "ratios": [
+          1.0
+        ],
+        "reference_mbps": [
+          95.77130666666667
+        ],
+        "seconds": 3
+      }
+    ],
+    "candidate_mbps": 95.77130666666667,
+    "configured_feedback_seconds": 1.21,
+    "reference_mbps": 95.77130666666667,
+    "source_archive": "model-receiver-refill-full-v1",
+    "variant": "full-model-nonrace"
+  },
+  {
+    "aggregate_ratio": 0.2042198303514149,
+    "aggregation": [
+      {
+        "all_at_least_90_percent": false,
+        "candidate_mbps": [
+          21.54496,
+          20.23424,
+          16.896
+        ],
+        "longer_than_configured_feedback": false,
+        "minimum_ratio": 0.17643284858853722,
+        "ratios": [
+          0.22493051101133205,
+          0.21129170230966637,
+          0.17643284858853722
+        ],
+        "reference_mbps": [
+          95.78496,
+          95.76448,
+          95.76448
+        ],
+        "seconds": 1
+      },
+      {
+        "all_at_least_90_percent": false,
+        "candidate_mbps": [
+          20.8896,
+          18.56512
+        ],
+        "longer_than_configured_feedback": true,
+        "minimum_ratio": 0.19386227544910178,
+        "ratios": [
+          0.2181118357746178,
+          0.19386227544910178
+        ],
+        "reference_mbps": [
+          95.77472,
+          95.76448
+        ],
+        "seconds": 2
+      },
+      {
+        "all_at_least_90_percent": false,
+        "candidate_mbps": [
+          19.5584
+        ],
+        "longer_than_configured_feedback": true,
+        "minimum_ratio": 0.2042198303514149,
+        "ratios": [
+          0.2042198303514149
+        ],
+        "reference_mbps": [
+          95.77130666666667
+        ],
+        "seconds": 3
+      }
+    ],
+    "candidate_mbps": 19.5584,
+    "configured_feedback_seconds": 1.21,
+    "reference_mbps": 95.77130666666667,
+    "source_archive": "model-receiver-consumers-full-v1",
+    "variant": "full-model-nonrace"
+  },
+  {
+    "aggregate_ratio": 0.9570176063867701,
+    "aggregation": [
+      {
+        "all_at_least_90_percent": false,
+        "candidate_mbps": [
+          83.41504,
+          95.76448,
+          95.78496
+        ],
+        "longer_than_configured_feedback": false,
+        "minimum_ratio": 0.871043627031651,
+        "ratios": [
+          0.871043627031651,
+          0.9997861877271756,
+          1.000213857998289
+        ],
+        "reference_mbps": [
+          95.76448,
+          95.78496,
+          95.76448
+        ],
+        "seconds": 1
+      },
+      {
+        "all_at_least_90_percent": true,
+        "candidate_mbps": [
+          89.58976000000001,
+          95.77472
+        ],
+        "longer_than_configured_feedback": true,
+        "minimum_ratio": 0.9354217898000643,
+        "ratios": [
+          0.9354217898000643,
+          1.0
+        ],
+        "reference_mbps": [
+          95.77472,
+          95.77472
+        ],
+        "seconds": 2
+      },
+      {
+        "all_at_least_90_percent": true,
+        "candidate_mbps": [
+          91.65482666666666
+        ],
+        "longer_than_configured_feedback": true,
+        "minimum_ratio": 0.9570176063867701,
+        "ratios": [
+          0.9570176063867701
+        ],
+        "reference_mbps": [
+          95.77130666666667
+        ],
+        "seconds": 3
+      }
+    ],
+    "candidate_mbps": 91.65482666666666,
+    "configured_feedback_seconds": 1.21,
+    "reference_mbps": 95.77130666666667,
+    "source_archive": "model-receiver-restored-full-v1",
+    "variant": "complete-restored-source"
+  },
+  {
+    "aggregate_ratio": 0.05859291467674103,
+    "aggregation": [
+      {
+        "all_at_least_90_percent": false,
+        "candidate_mbps": [
+          5.05856,
+          5.59104,
+          6.18496
+        ],
+        "longer_than_configured_feedback": false,
+        "minimum_ratio": 0.05282292557741659,
+        "ratios": [
+          0.05282292557741659,
+          0.05837075048107761,
+          0.06458511548331908
+        ],
+        "reference_mbps": [
+          95.76448,
+          95.78496,
+          95.76448
+        ],
+        "seconds": 1
+      },
+      {
+        "all_at_least_90_percent": false,
+        "candidate_mbps": [
+          5.3248,
+          5.888
+        ],
+        "longer_than_configured_feedback": true,
+        "minimum_ratio": 0.05559713460921629,
+        "ratios": [
+          0.05559713460921629,
+          0.061477600769806476
+        ],
+        "reference_mbps": [
+          95.77472,
+          95.77472
+        ],
+        "seconds": 2
+      },
+      {
+        "all_at_least_90_percent": false,
+        "candidate_mbps": [
+          5.61152
+        ],
+        "longer_than_configured_feedback": true,
+        "minimum_ratio": 0.05859291467674103,
+        "ratios": [
+          0.05859291467674103
+        ],
+        "reference_mbps": [
+          95.77130666666667
+        ],
+        "seconds": 3
+      }
+    ],
+    "candidate_mbps": 5.61152,
+    "configured_feedback_seconds": 1.21,
+    "reference_mbps": 95.77130666666667,
+    "source_archive": "model-receiver-invalid-slowdown-full-v1",
+    "variant": "bounded-slowdown-after"
+  },
+  {
+    "aggregate_ratio": 0.2844108632119181,
+    "aggregation": [
+      {
+        "all_at_least_90_percent": false,
+        "candidate_mbps": [
+          26.7264,
+          27.42272,
+          27.56608
+        ],
+        "longer_than_configured_feedback": false,
+        "minimum_ratio": 0.2790250160359205,
+        "ratios": [
+          0.2790250160359205,
+          0.2863558597091531,
+          0.28785286569717705
+        ],
+        "reference_mbps": [
+          95.78496,
+          95.76448,
+          95.76448
+        ],
+        "seconds": 1
+      },
+      {
+        "all_at_least_90_percent": false,
+        "candidate_mbps": [
+          27.07456,
+          27.4944
+        ],
+        "longer_than_configured_feedback": true,
+        "minimum_ratio": 0.2826900459745536,
+        "ratios": [
+          0.2826900459745536,
+          0.2871043627031651
+        ],
+        "reference_mbps": [
+          95.77472,
+          95.76448
+        ],
+        "seconds": 2
+      },
+      {
+        "all_at_least_90_percent": false,
+        "candidate_mbps": [
+          27.238400000000002
+        ],
+        "longer_than_configured_feedback": true,
+        "minimum_ratio": 0.28441086321191816,
+        "ratios": [
+          0.28441086321191816
+        ],
+        "reference_mbps": [
+          95.77130666666667
+        ],
+        "seconds": 3
+      }
+    ],
+    "candidate_mbps": 27.2384,
+    "configured_feedback_seconds": 1.21,
+    "reference_mbps": 95.77130666666667,
+    "source_archive": "service-receiver-cumulative-restoration-v1",
+    "variant": "after-six-gates"
+  }
+]

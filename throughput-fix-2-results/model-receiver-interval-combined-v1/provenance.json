@@ -1,0 +1,10 @@
+{
+  "binary_sha256": "250a691c3041c56e1443abe587a53d37d242657289a490d03487d0d202d02269",
+  "interpretation": "The candidate fixes warm deterministic receiver-wait roots but does not close the actual-worker failures. It remains isolated from the working implementation. Virtual-time model evidence does not establish host throughput acceptance.",
+  "no_quiescence_wait": true,
+  "outcome": "Four passes and two failures: changing receiver windows and long SDK. RTT growth, both capacity change controls and ShortCompressed pass.",
+  "race": false,
+  "role": "Actual-worker follow-through after exact ACK timing-credit attribution and warm corrected delivery intervals.",
+  "source_inputs_sha256": "626dc7af07e8f1df362569119d186ffc6bc68d3764639a838ac7ed6de825f85d",
+  "source_scope": "Combined retained sizing, cumulative carrier scope, writer synchronization, queue epoch, ACK phase and mixed metadata eligibility plus isolated exact timing-credit plumbing and warm receiver-delay sampler. Excludes subsequent SDK cold qualification work."
+}

@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "5cb708893b8c93af8a3be537b963c6ac00537d968adde8ec3dde7adb87545489",
+  "binary_sha256": "1169b2eb6e4da8d39a15fb6366e9dd84e99d3ee7e820685d4497ad45e34c608f",
+  "effective_inputs_sha256": "f883e43c5a06bdb298467b03d84963a082474d9579709ae8d774b77a4fa922e6",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPathServicesShareFiniteRelay$",
+    "-test.count=1",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied module as build; original absolute relationship is pinned by original status/manifest hashes",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:02:29.648146+00:00",
+  "loadavg_start": [
+    6.41748046875,
+    6.29345703125,
+    9.955078125
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 1.5346497502177954,
+  "loadavg_end": [
+    6.41748046875,
+    6.29345703125,
+    9.955078125
+  ],
+  "ended_utc": "2026-09-16T20:02:31.183352+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "9c9550668ea61f58996e57e14ac38930d6c05f7b29c41f06cfc0010dcfada46c",
+  "pass": 1,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "normalization_note": "Copied diagnostic selects existing12.5MB/s finite-relay gate and captures bounded state without changing math. Passing schedule does not reproduce or close original full-model72.68352/95.616failure; instrumentation forbids causal throughput comparison.",
+  "rows": 2
+}

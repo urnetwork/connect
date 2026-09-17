@@ -1,0 +1,13 @@
+--- a/transfer_window_pacing.go	2026-09-16 16:22:37
++++ b/transfer_window_pacing.go	2026-09-16 16:45:25
+@@ -228,7 +228,9 @@
+ 		}
+ 	}
+ 	if estimate.ServiceByteRate > 0 {
+-		serviceRate := float64(estimate.ServiceByteRate)
++		// Fresh shared delivery can guide pacing above a conservative
++		// serialization hold without relabeling that physical measurement.
++		serviceRate := float64(max(estimate.ServiceByteRate, estimate.AggregateDeliveryByteRate))
+ 		if estimate.ServiceBacklogged {
+ 			// Leave service for draining an observed queue. Matching a
+ 			// noisy estimate exactly can preserve it indefinitely.

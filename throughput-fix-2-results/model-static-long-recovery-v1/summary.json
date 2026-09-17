@@ -1,0 +1,30 @@
+[
+  {
+    "test": "TestWindowPathServiceStaticLongRoundTripSmallOpening",
+    "rtt_ms": 400.0,
+    "lanes": 1,
+    "warmup_seconds": 26.24,
+    "measurement_seconds": 3.2800000000000002,
+    "reference_mbps": 30.632585365853657,
+    "candidate_mbps": 30.63882926829268,
+    "minimum_lane_mbps": 30.63882926829268,
+    "candidate_timeout_resends": 0,
+    "candidate_measurement_drops": 0,
+    "initial_window": 524288,
+    "final_window": 3406739
+  },
+  {
+    "test": "TestWindowPathServiceStaticLongRoundTripSharedOpening",
+    "rtt_ms": 1200.0,
+    "lanes": 3,
+    "warmup_seconds": 77.44,
+    "measurement_seconds": 9.68,
+    "reference_mbps": 30.635371900826446,
+    "candidate_mbps": 30.636429752066118,
+    "minimum_lane_mbps": 10.034776859504131,
+    "candidate_timeout_resends": 0,
+    "candidate_measurement_drops": 0,
+    "initial_window": 524288,
+    "final_window": 13832931
+  }
+]

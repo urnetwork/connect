@@ -1,0 +1,12 @@
+{
+  "commands": [
+    "go test -c -race (pinned frozen inputs)",
+    "tests.test -test.v -test.run ^TestWindowPacingSdkInitial -test.count=3 -test.timeout=30m"
+  ],
+  "host_context": "Runs started immediately with concurrent work; load and no-quiescence flag are retained in source-pins.",
+  "outcome": "Root fails identically three times (3459 B/s, 626 ms next-write delay); two slow-service controls pass three times each. No data races.",
+  "performance_limit": "Deterministic sampler/pacer assertions; these are not affected-cell throughput measurements.",
+  "prediction": "An opening flight proved fully drained cannot price one resumed ACK across the idle feedback gap as measured capacity. Continuous outstanding sparse service and a fresh post-drain ACK pair must still discover slow capacity.",
+  "production_base": "f903f59a96e629f8b1dfa5849d7a3198aaef9920",
+  "source_scope": "Frozen independent lifetime v7 sources plus SDK initial-service tests; excludes the working unprovable-drain correction."
+}

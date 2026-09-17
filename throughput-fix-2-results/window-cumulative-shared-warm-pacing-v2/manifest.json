@@ -1,0 +1,18 @@
+{
+  "archive": "window-cumulative-shared-warm-pacing-v2",
+  "payload_sha256": {
+    "README.md": "dc6e41327701167e3a7965a788aec7446ac3002a4013194edf8fa022a510d8f3",
+    "candidate.patch": "e6fc685d97ed16280953c803ae0d3d4e90111772ec31925fd5a2b3c3f4396db4",
+    "ledger.jsonl": "9a365a402ae4158d6a1f2ca542f5604e88c5d8b46270d89e3a9cdd05aa132b1d",
+    "outcomes.jsonl": "0ce51b72673a82173fef297b29dc3d14a1ba0ecc962be26348a73886993068c9",
+    "provenance.json": "ef8b1b72cae63a03ee33630122b7b64b34d6becea2ace67c00735b10ccb5b66a",
+    "root-diagnostics-after.txt": "3a7fa514d6f57295523cf35608ed596a0f9c3cef14b0444fb8ced9cbf72823aa",
+    "root-diagnostics-before.txt": "7b8eacfad2e925e3918618c551c350c484f4f9df1ec0f8522f87909d4c02fc11",
+    "source-manifest-after-roots.json": "cb62241271d2afb39f9168671def8f0a3d23251a0b29177c8d883a4718b7ab11",
+    "source-manifest-after-sdk.json": "9c1f8355c001e26f9788402404c9aa87bcd999ddda3e00bc9c74bb3989e0e6f0",
+    "source-manifest-before-roots.json": "99b3ca3f7191d15fe6b0efc624f3661f1d7166aa132d292649cc23e8f103a9ec",
+    "source-manifest-before-sdk.json": "523f9c43feac9ffd663ea19736f795db73adc2dab5be0945f52d463a956d736e",
+    "source-pins.json": "bb21035501fb0a3d0628a81f7e85fe224cd3fd66943dbf0587bd51d0d8242a77",
+    "status.json": "0741c0c304152455ba2c64131eb916f23a15fd0a466473e013bc06c8b62926f3"
+  }
+}

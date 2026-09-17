@@ -1,0 +1,9 @@
+{
+  "archive": "window-retention-target-diagnostic",
+  "payload_sha256": {
+    "outcomes.jsonl": "3ad7e12048ae3fe8b6c1f604dc7a5c96b1c627592d7ba23610f6aef8dc5410f5",
+    "provenance.json": "6b3cf3a36b646b767c686155442798421aa2a4a3f2bb9d41f1de205e0978cfe5",
+    "source-pins.json": "a22f3ed26aa94e113b4fc3300db348a7585a88671e29283752a260e2e4935c3b",
+    "status.json": "aed84eaf19f69efc87513660f57e8fa1878c9ffe8422ad2caab7e5ae4ea053c0"
+  }
+}

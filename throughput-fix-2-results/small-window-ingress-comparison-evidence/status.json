@@ -1,0 +1,650 @@
+{
+  "all_normalized_outcomes": {
+    "FAIL": 63,
+    "PASS": 354,
+    "SKIP": 0,
+    "race_warning_blocks": 0
+  },
+  "all_runs": 37,
+  "archive_result": "complete_frozen_small_window_comparison_diagnostics_no_candidate_accepted",
+  "by_run": [
+    {
+      "build_id": "evidence-race",
+      "classification": "baseline-or-direct-diagnostic",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 15,
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 6,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "95ada64aad9b53602d2e59ef329f069942b400d4ef885b1c2578b02a71d1e4b1",
+      "run_id": "evidence",
+      "scope": "Direct compressed-flight failure and two synthetic information-bound controls.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "worker-race",
+      "classification": "excluded-fixture-or-harness-diagnostic",
+      "excluded_fixture_or_harness_diagnostic": true,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "904b405e26ea5d58b4e73d1d0eee76e4115d6ff7bd5c162e94f5a8c4f0462744",
+      "run_id": "worker",
+      "scope": "Excluded fixture diagnostic: producer blocked filling its queue before releasing the worker; terminated with SIGQUIT.",
+      "service_readings": 0,
+      "status": "excluded_fixture_or_harness_diagnostic"
+    },
+    {
+      "build_id": "worker-v2-race",
+      "classification": "baseline-or-direct-diagnostic",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 6,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "0220e62baa02b53a22acab546ea6c128deaae7815179e0bf7c890748ce14c761",
+      "run_id": "worker-v2",
+      "scope": "Corrected actual-worker full-window sender alias with explicit offer/write barriers.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "model-before",
+      "classification": "baseline-or-direct-diagnostic",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 6,
+      "outcomes": {
+        "FAIL": 6,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "c6b0391c5c49f53b1f00c66e1a90d5c178bbe239b6d71655a752ef2bf4bbb303",
+      "run_id": "model-before",
+      "scope": "Original sampler: alias, direct compressed-flight root, and unchanged shrink model.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "model-arrival",
+      "classification": "baseline-or-direct-diagnostic",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 6,
+      "outcomes": {
+        "FAIL": 6,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "c8ef36ea385a8981c8da9ad1bf79de030e1ac9b09962d1cd38b6a97a85f757b3",
+      "run_id": "model-arrival",
+      "scope": "Unsafe initial arrival-credit diagnostic only; same root and model selection.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "offered-before-race",
+      "classification": "provisional-offered-rate-eligibility-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 6,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "f79433a6ad07c81075f4896df997f5542a82d82c12718a7859770f5d0aea1fff",
+      "run_id": "offered-before-roots",
+      "scope": "First-offer rollover roots before the proposed rollover.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "offered-after-race",
+      "classification": "provisional-offered-rate-eligibility-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 9,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "e1e5351a71694f36918f912d1bbbcf8244ce2d138d7b76da1c860c15344be6a2",
+      "run_id": "offered-after-roots",
+      "scope": "First-offer rollover v1 roots, including real slower bytes and accounting barrier.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "offered-after-race",
+      "classification": "provisional-offered-rate-eligibility-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 129,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "3ce245af5f4f8c977b690121494657373d51bdddbfc5cd0322e1e155e52323f8",
+      "run_id": "offered-after-focus",
+      "scope": "First-offer rollover v1 focused service controls.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "offered-after-race",
+      "classification": "provisional-offered-rate-eligibility-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 6,
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "46e75209d4072ede1da10657124f2397aaa576d72a06c1b35ef6628de58a6cad",
+      "run_id": "offered-after-model",
+      "scope": "First-offer rollover v1 unchanged shrink model remains failing.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "offered-trace",
+      "classification": "baseline-or-direct-diagnostic",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "a6614180a2233b59a6594cec3bd33fc858ef9ee1f80644b28cdeee457256d96d",
+      "run_id": "offered-trace",
+      "scope": "Trace-only first-offer v1 shrink diagnostic; ordinary controller reads only.",
+      "service_readings": 2,
+      "status": "completed"
+    },
+    {
+      "build_id": "offered-v2-before-race",
+      "classification": "provisional-offered-rate-eligibility-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 6,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "0699d099b634211a6a13df5058ce5f9a5df57be61ff08f9c8632873b845350b6",
+      "run_id": "offered-v2-before-roots",
+      "scope": "First-offer v2 phase variants before rollover.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "offered-v2-after-race",
+      "classification": "provisional-offered-rate-eligibility-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 129,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "3ce245af5f4f8c977b690121494657373d51bdddbfc5cd0322e1e155e52323f8",
+      "run_id": "offered-v2-after-focus",
+      "scope": "First-offer v2 phase roots and focused service controls.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "offered-v2-after-race",
+      "classification": "provisional-offered-rate-eligibility-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 6,
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "1ae0ba85bb9e9c83f337dd461c347df4ed3aa4b431d04fd440950ab3b01e8721",
+      "run_id": "offered-v2-after-model",
+      "scope": "First-offer rollover v2 unchanged shrink model remains failing.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "offered-v2-trace",
+      "classification": "provisional-offered-rate-eligibility-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "a5b1bdca9ee537aebb6b0fccc77511840960f20ae96a8945123498b738def85b",
+      "run_id": "offered-v2-trace",
+      "scope": "Trace-only v2 shrink diagnostic, including later completed-span collapse.",
+      "service_readings": 2,
+      "status": "completed"
+    },
+    {
+      "build_id": "offered-safe-before-race",
+      "classification": "rejected-safe-offered-rate-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 6,
+        "PASS": 6,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "96b4f452177027ec3b03a699099db1ac62a2f106cd0fc63058d68e75a8038f32",
+      "run_id": "offered-safe-before",
+      "scope": "Safe one-time arrival credit with unchanged sampler: roots and shrink model.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "offered-safe-after-race",
+      "classification": "rejected-safe-offered-rate-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 9,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "358fc143a87d28b8ee89c256befbfc771a18804c84fab5f58bfcc9ad9ef1427b",
+      "run_id": "offered-safe-after",
+      "scope": "Safe arrival credit plus first-offer v2: roots pass, shrink still fails.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "completed-safe-before-race",
+      "classification": "completed-pair-history-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 6,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "7f2889f57d5502deca9ebe04967670d9d32dcc6663d21276602e1d791f9eccf9",
+      "run_id": "completed-safe-before",
+      "scope": "Actual-worker completed 50 ms feedback span; hidden ingress schedules remain aliased.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "completed-measured-delay-after",
+      "classification": "completed-pair-history-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 6,
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "f69d57e82a5dfe7cb8545c02d2b5d0b2fe112342eb36f6a84872ebe38b80e969",
+      "run_id": "completed-measured-delay-after",
+      "scope": "Subtract existing field12 delay only from sampler observation time; shrink still fails.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "receiver-counter-diagnostic-race",
+      "classification": "receiver-ingress-information-only-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 3,
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "91ba0ee34087618a56ee167131dc7970916e0d48df17750d4f8683d6d7c9e1c6",
+      "run_id": "receiver-counter-diagnostic",
+      "scope": "Receiver ingress pair consumer before offered-rate eligibility; shrink still fails.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "receiver-counter-trace",
+      "classification": "receiver-ingress-information-only-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 1,
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "5e78f29b96d18c762848775198b6de065b2d31ecd1a18e1b5a7a3ed6fdeb0c4f",
+      "run_id": "receiver-counter-trace",
+      "scope": "Trace-only receiver pair diagnostic, showing source gaps remain in selected receiver pairs.",
+      "service_readings": 2,
+      "status": "completed"
+    },
+    {
+      "build_id": "receiver-counter-offer-filter-race",
+      "classification": "excluded-fixture-or-harness-diagnostic",
+      "excluded_fixture_or_harness_diagnostic": true,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "db3961c81ec848d670dbce8bfb44e111b29f709d125f9c9cc72eb078294b5cc4",
+      "run_id": "receiver-counter-offer-filter",
+      "scope": "Excluded compile/launch diagnostic: wrong capacity test symbol; no test binary existed.",
+      "service_readings": 0,
+      "status": "excluded_fixture_or_harness_diagnostic"
+    },
+    {
+      "build_id": "receiver-counter-offer-filter-fixed-race",
+      "classification": "receiver-ingress-information-only-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 3,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "2d1b6bd20514130af24f07372fe56ac9ff67f0f3c03249804a71fd558a119362",
+      "run_id": "receiver-counter-offer-filter-fixed-shrink",
+      "scope": "Receiver ingress pair plus offered-rate eligibility; unchanged shrink 3/3 passes.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "receiver-counter-offer-filter-fixed-race",
+      "classification": "excluded-fixture-or-harness-diagnostic",
+      "excluded_fixture_or_harness_diagnostic": true,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "dfec72c6b35dbde1b65fc9fd67208076fdac8930c6d7c5112130767689b57a5d",
+      "run_id": "receiver-counter-offer-filter-fixed-capacity",
+      "scope": "Excluded incomplete 60 s wall-time timeout; retains two completed upward model pairs, not a full pass.",
+      "service_readings": 4,
+      "status": "excluded_fixture_or_harness_diagnostic"
+    },
+    {
+      "build_id": "receiver-counter-offer-filter-fixed",
+      "classification": "receiver-ingress-information-only-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 1,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 1,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "6a18aa688ffaff8d2f34dbe8a6510bf96cd369f65ac82aeef5680f0d787ffea5",
+      "run_id": "receiver-counter-offer-filter-fixed-capacity-normal",
+      "scope": "Receiver ingress pairs: all six original 10-to-100 and 100-to-10 Mb/s capacity transitions.",
+      "service_readings": 12,
+      "status": "completed"
+    },
+    {
+      "build_id": "sender-only-offer-filter",
+      "classification": "baseline-or-direct-diagnostic",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 9,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "f4220e5144a29d6e1cef7c35d7fe6d973722c1f59d356042c38f873df48808e3",
+      "run_id": "sender-only-offer-filter-shrink",
+      "scope": "Last credited group's offered-rate guard only; unchanged shrink still fails.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "sender-only-offer-filter",
+      "classification": "baseline-or-direct-diagnostic",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 0,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 1,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "41f729efb519c3728816c907b335c0ddb3214e1f35bbe1c14ee5cf7545f3c6be",
+      "run_id": "sender-only-offer-filter-capacity",
+      "scope": "Last-group sender guard retains all six original capacity transitions.",
+      "service_readings": 12,
+      "status": "completed"
+    },
+    {
+      "build_id": "sender-ack-counter-raw",
+      "classification": "rejected-corrected-ack-timing-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 3,
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "02c15ca386b66ba584f97c40f849f79cc8d4f57aeaf32d0b9d5bd53b8e6cbe15",
+      "run_id": "sender-ack-counter-raw-shrink",
+      "scope": "Fair same pair consumer using own service credit counter and raw ACK arrival times; shrink fails.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "sender-ack-counter-corrected",
+      "classification": "rejected-corrected-ack-timing-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 3,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "9350f6e954d14cbc4ae55535b0e32c5c5cf518ff9adb29e90cb7b96df4d1e4b6",
+      "run_id": "sender-ack-counter-corrected-shrink",
+      "scope": "Fair same pair consumer using own counter and ACK arrival minus existing field12; shrink 3/3 passes.",
+      "service_readings": 6,
+      "status": "completed"
+    },
+    {
+      "build_id": "sender-ack-counter-corrected",
+      "classification": "rejected-corrected-ack-timing-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 1,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 1,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "f2f21784037b63e180dde8dd6d256919091bc97603680d69652ac4f093b870cd",
+      "run_id": "sender-ack-counter-corrected-capacity",
+      "scope": "Corrected-ACK pair consumer retains all six original capacity transitions.",
+      "service_readings": 12,
+      "status": "completed"
+    },
+    {
+      "build_id": "sender-ack-counter-reverse-before-race",
+      "classification": "rejected-corrected-ack-timing-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 9,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "4e64104a4f32448e9de7b4e995b2002c7bfdb6f711daadfe9b6fcac21a5aa697",
+      "run_id": "sender-ack-counter-reverse-before",
+      "scope": "Initial actual-worker reverse compression control with ordinary sampler.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "sender-ack-counter-reverse-after-race",
+      "classification": "rejected-corrected-ack-timing-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 6,
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "78df60ffa895e76647eee6910284c272177c285396078129ab6ea064e289d084",
+      "run_id": "sender-ack-counter-reverse-after",
+      "scope": "Initial reverse compression rejects corrected-ACK pair sampler at 64.38 GB/s.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "sender-ack-counter-reverse-after",
+      "classification": "rejected-corrected-ack-timing-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 1,
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "b0dc4864d9aae02e3da12492c61116b3ffb1e944f4ce6b9c1a7e79e7df69d257",
+      "run_id": "sender-ack-counter-corrected-long",
+      "scope": "Rejected corrected-ACK pair consumer, unchanged 1.2 s RTT-growth gate, old recovery.",
+      "service_readings": 2,
+      "status": "completed"
+    },
+    {
+      "build_id": "reverse-fixed-before-race",
+      "classification": "physical-reverse-compression-control",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 18,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 6,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "3a73e73321956035955837e2baf39f93d8a15fbbecffc40892ee184b727f2147",
+      "run_id": "reverse-fixed-before",
+      "scope": "Stronger reverse fixture: 50 ms propagation each direction, zero/50 ms measured delay; ordinary sampler.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "reverse-fixed-after-race",
+      "classification": "physical-reverse-compression-control",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 12,
+      "outcomes": {
+        "FAIL": 6,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "3ab9e50c095d1276da3b9235ef5f2fce9b35a1b48d9f2637c14e1b0baca3eed0",
+      "run_id": "reverse-fixed-after",
+      "scope": "Same stronger reverse fixture rejects corrected-ACK pair consumer, including max offer-span denominator.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "reverse-fixed-receiver-race",
+      "classification": "physical-reverse-compression-control",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 18,
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 6,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "ac90aaaafdeac1605c23b0fc5517555a30b20cd427e8619408a6f4fd3fca3600",
+      "run_id": "reverse-fixed-receiver",
+      "scope": "Same stronger reverse fixture with receiver ingress pair consumer stays bounded.",
+      "service_readings": 0,
+      "status": "completed"
+    },
+    {
+      "build_id": "reverse-fixed-receiver",
+      "classification": "receiver-ingress-information-only-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 1,
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "1c99168c8c88fa04faa940f63343df33e09a8d6602a152e786b58606b52af654",
+      "run_id": "receiver-counter-before-recovery-long",
+      "scope": "Receiver ingress pair consumer, unchanged 1.2 s RTT-growth gate, old recovery.",
+      "service_readings": 2,
+      "status": "completed"
+    },
+    {
+      "build_id": "receiver-counter-recovery-v3",
+      "classification": "receiver-ingress-information-only-prototype",
+      "excluded_fixture_or_harness_diagnostic": false,
+      "fixture_observations": 1,
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "31ada0d81e41b08f1f23085f07f19548df20ee60a401e2186a326318f149d895",
+      "run_id": "receiver-counter-recovery-v3-long",
+      "scope": "Receiver ingress pair consumer plus exact integrated recovery v3, unchanged long gate still fails.",
+      "service_readings": 2,
+      "status": "completed"
+    }
+  ],
+  "completed_runs": 34,
+  "distinct_builds_used": 31,
+  "excluded_diagnostic_runs": 3,
+  "fixture_observations": 138,
+  "key_rejections": [
+    "Corrected ACK timing is rejected: the physically valid reverse-compression schedule produces 64.38 GB/s.",
+    "Receiver-ingress information-only prototype still fails the unchanged long gate after recovery v3: 85.2036267 versus 95.7781333 Mb/s; intervals 88.96512, 85.01248, 81.63328; zero total and measured drops."
+  ],
+  "service_readings": 124
+}

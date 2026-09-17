@@ -1,0 +1,10 @@
+[
+  {
+    "test": "TestWindowPathServiceStaticLongRoundTripSmallOpening",
+    "outcome": "PASS"
+  },
+  {
+    "test": "TestWindowPathServiceStaticLongRoundTripSharedOpening",
+    "outcome": "PASS"
+  }
+]

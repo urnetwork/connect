@@ -1,0 +1,1245 @@
+=== RUN   TestLandingStructsMatchMergedLessTheDeferState
+--- PASS: TestLandingStructsMatchMergedLessTheDeferState (0.00s)
+=== RUN   TestSilentLaneLongerThanTheProbeCadenceStillDrains
+    flight_gate_lane_probe_test.go:370: per item: 24.484s rto=388 deferred=96
+    flight_gate_lane_probe_test.go:372: per lane: 25.13s rto=8 deferred=96 probes=8 held=380
+--- PASS: TestSilentLaneLongerThanTheProbeCadenceStillDrains (0.50s)
+=== RUN   TestSingleReliableLaneQueueInflatedRttDoesNotStorm
+    flight_gate_mixed_lane_gap_test.go:838: defer off: initial=101 rto=31 deferred=0 recent-progress=31 gap=0 tail-probe=0 cumulative-probe=0
+    flight_gate_mixed_lane_gap_test.go:838: defer on : initial=101 rto=0 deferred=41 recent-progress=41 gap=0 tail-probe=0 cumulative-probe=0
+--- PASS: TestSingleReliableLaneQueueInflatedRttDoesNotStorm (0.06s)
+=== RUN   TestWindowPacingPreventsReliableLaneQueueStorm
+    flight_gate_mixed_lane_gap_test.go:898: paced default: initial=101 retries=0 deferred=0
+--- PASS: TestWindowPacingPreventsReliableLaneQueueStorm (0.03s)
+=== RUN   TestRelayInflationUsesConstantSendWindow
+--- PASS: TestRelayInflationUsesConstantSendWindow (0.01s)
+=== RUN   TestDecodedTransferFramePoolRetainedSizeStaysSmall
+    frame_protobuf_test.go:1601: decoded TransferFrame owner=680 bytes; exact pool ceiling=174080 bytes
+    frame_protobuf_test.go:1610: compact receive ACK=104 bytes
+--- PASS: TestDecodedTransferFramePoolRetainedSizeStaysSmall (0.00s)
+=== RUN   TestAckCompressionStaysUnderTheRetransmissionFloor
+    ip_tcp_ack_compression_floor_test.go:77: compression timeout 50ms against tcp.MinRTO 200ms, the fleet floor 200ms, and our tun's floor 0s
+--- PASS: TestAckCompressionStaysUnderTheRetransmissionFloor (0.00s)
+=== RUN   TestAckCompressionIsTheOnlyClockBelowHalfAWindowRung
+    ip_tcp_ack_starvation_test.go:123: 102 segments of 1400 bytes over 603.834833ms drew 52 acknowledgements, one per 11.612208ms, against a 50ms compression timer and a 1048576 byte rung whose half was never reached
+--- PASS: TestAckCompressionIsTheOnlyClockBelowHalfAWindowRung (0.60s)
+=== RUN   TestTcpReturnRecoversLostMiddleAfterTransferDelivery
+--- PASS: TestTcpReturnRecoversLostMiddleAfterTransferDelivery (0.00s)
+=== RUN   TestTcpReturnRecoversLostTailWithoutLaterData
+--- PASS: TestTcpReturnRecoversLostTailWithoutLaterData (0.00s)
+=== RUN   TestTcpReturnRecoveryCrossesSequenceWrap
+--- PASS: TestTcpReturnRecoveryCrossesSequenceWrap (0.00s)
+=== RUN   TestTcpReturnKeepsRecoveryAfterOriginEof
+--- PASS: TestTcpReturnKeepsRecoveryAfterOriginEof (0.00s)
+=== RUN   TestTcpReturnHealthyPathDoesNotReplay
+--- PASS: TestTcpReturnHealthyPathDoesNotReplay (0.00s)
+=== RUN   TestTcpReturnRecoveryIpv6
+--- PASS: TestTcpReturnRecoveryIpv6 (0.00s)
+=== RUN   TestTcpReturnCacheSharesAnExactBudgetAcrossFlows
+--- PASS: TestTcpReturnCacheSharesAnExactBudgetAcrossFlows (0.00s)
+=== RUN   TestTcpReturnCacheCancellationReleasesAWaiter
+--- PASS: TestTcpReturnCacheCancellationReleasesAWaiter (0.00s)
+=== RUN   TestTcpReturnCacheSkipsAlreadyAcknowledgedReadAhead
+--- PASS: TestTcpReturnCacheSkipsAlreadyAcknowledgedReadAhead (0.00s)
+=== RUN   TestTcpSequenceCancelBeforeWritePublicationReturnsPacket
+--- PASS: TestTcpSequenceCancelBeforeWritePublicationReturnsPacket (0.00s)
+=== RUN   TestEvictionAcknowledgementsFitEveryCarrier
+--- PASS: TestEvictionAcknowledgementsFitEveryCarrier (0.00s)
+=== RUN   TestAckResponsesKeepOrderedOverflow
+--- PASS: TestAckResponsesKeepOrderedOverflow (0.10s)
+=== RUN   TestAckOverflowDoesNotAddCompressionIntervals
+--- PASS: TestAckOverflowDoesNotAddCompressionIntervals (0.00s)
+=== RUN   TestAckWorkerBoundsEveryResponseAndFinalDrain
+--- PASS: TestAckWorkerBoundsEveryResponseAndFinalDrain (0.01s)
+=== RUN   TestAckCompressionEnforcesItsOwnResponseCountLimit
+--- PASS: TestAckCompressionEnforcesItsOwnResponseCountLimit (0.00s)
+=== RUN   TestAckCompressionHeadDrainDoesNotAllocate
+--- PASS: TestAckCompressionHeadDrainDoesNotAllocate (0.00s)
+=== RUN   TestAckCompressionOneHeadThenOldestSacksAboveHead
+--- PASS: TestAckCompressionOneHeadThenOldestSacksAboveHead (0.00s)
+=== RUN   TestAckCompressionAdvancingHeadAbsorbsUnsentSacks
+--- PASS: TestAckCompressionAdvancingHeadAbsorbsUnsentSacks (0.00s)
+=== RUN   TestAckCompressionPacesSacksAtCompressionDeadlines
+--- PASS: TestAckCompressionPacesSacksAtCompressionDeadlines (0.00s)
+=== RUN   TestAckCompressionPacesEvictionOnlyHeadCarriers
+--- PASS: TestAckCompressionPacesEvictionOnlyHeadCarriers (0.00s)
+=== RUN   TestAckCompressionEvictionAfterSackRepeatsTheHead
+--- PASS: TestAckCompressionEvictionAfterSackRepeatsTheHead (0.00s)
+=== RUN   TestAckCompressionWireHasOneHeadAndBoundedOldestSacks
+--- PASS: TestAckCompressionWireHasOneHeadAndBoundedOldestSacks (0.00s)
+=== RUN   TestAckReceiverDelayCodecPreservesPresenceAndLifetime
+--- PASS: TestAckReceiverDelayCodecPreservesPresenceAndLifetime (0.00s)
+=== RUN   TestAckReceiverDelayIsOptionalForLegacyPeer
+--- PASS: TestAckReceiverDelayIsOptionalForLegacyPeer (0.00s)
+=== RUN   TestAckReceiverDelayRejectsMalformedAndPreservesLastValue
+--- PASS: TestAckReceiverDelayRejectsMalformedAndPreservesLastValue (0.00s)
+=== RUN   TestAckReceiverDelayFitsEncodedEntryReservation
+--- PASS: TestAckReceiverDelayFitsEncodedEntryReservation (0.00s)
+=== RUN   TestSequenceAckWindowCoalescesReusableNotification
+--- PASS: TestSequenceAckWindowCoalescesReusableNotification (0.00s)
+=== RUN   TestSequenceAckWindowSteadyStateDoesNotAllocate
+--- PASS: TestSequenceAckWindowSteadyStateDoesNotAllocate (0.00s)
+=== RUN   TestSequenceAckWindowPendingDoesNotCloneSelectiveAcks
+--- PASS: TestSequenceAckWindowPendingDoesNotCloneSelectiveAcks (0.00s)
+=== RUN   TestSequenceAckWindowDueDispositionIgnoresUnrelatedProgress
+--- PASS: TestSequenceAckWindowDueDispositionIgnoresUnrelatedProgress (0.00s)
+=== RUN   TestSequenceAckWindowPreservesCompactRecoveryCapability
+--- PASS: TestSequenceAckWindowPreservesCompactRecoveryCapability (0.00s)
+=== RUN   TestSequenceAckWindowTracksCarrierOfLatestAckTrigger
+--- PASS: TestSequenceAckWindowTracksCarrierOfLatestAckTrigger (0.00s)
+=== RUN   TestResendCapacityReleaseWakesAdmissionImmediately
+--- PASS: TestResendCapacityReleaseWakesAdmissionImmediately (0.00s)
+=== RUN   TestForwardBufferCallerCancelPreservesSharedAdmission
+--- PASS: TestForwardBufferCallerCancelPreservesSharedAdmission (0.00s)
+=== RUN   TestForwardBufferCallerCancelDuringAdmissionKeepsSiblings
+--- PASS: TestForwardBufferCallerCancelDuringAdmissionKeepsSiblings (0.00s)
+=== RUN   TestForwardBufferCallerCancelKeepsAcceptedPackOwned
+--- PASS: TestForwardBufferCallerCancelKeepsAcceptedPackOwned (0.00s)
+=== RUN   TestForwardBufferClosedSequenceStillRecreatesForLiveCaller
+--- PASS: TestForwardBufferClosedSequenceStillRecreatesForLiveCaller (0.00s)
+=== RUN   TestSendBufferCallerCancelPreservesSharedAdmission
+--- PASS: TestSendBufferCallerCancelPreservesSharedAdmission (0.00s)
+=== RUN   TestSendBufferCallerCancelDuringAdmissionKeepsSiblings
+--- PASS: TestSendBufferCallerCancelDuringAdmissionKeepsSiblings (0.00s)
+=== RUN   TestSendBufferCallerCancelKeepsAcceptedPackOwned
+--- PASS: TestSendBufferCallerCancelKeepsAcceptedPackOwned (0.00s)
+=== RUN   TestSendBufferClosedSequenceStillRecreatesForLiveCaller
+--- PASS: TestSendBufferClosedSequenceStillRecreatesForLiveCaller (0.00s)
+=== RUN   TestReceiveSequenceBurstTailPreservesFeedbackDeadline
+--- PASS: TestReceiveSequenceBurstTailPreservesFeedbackDeadline (0.00s)
+=== RUN   TestReceiveSequenceBurstTailSpendsOnlyNewBytes
+--- PASS: TestReceiveSequenceBurstTailSpendsOnlyNewBytes (0.00s)
+=== RUN   TestReceiveSequenceBurstTailContinuousProgressKeepsDeadline
+--- PASS: TestReceiveSequenceBurstTailContinuousProgressKeepsDeadline (0.00s)
+=== RUN   TestReceiveSequenceBurstTailCountsGroupedH1DeliveryOnce
+--- PASS: TestReceiveSequenceBurstTailCountsGroupedH1DeliveryOnce (0.00s)
+=== RUN   TestReceiveSequenceBurstTailCompressionSettingBoundaries
+--- PASS: TestReceiveSequenceBurstTailCompressionSettingBoundaries (0.00s)
+=== RUN   TestReceiveSequenceBurstTailEncodedCostIncludesWrapping
+--- PASS: TestReceiveSequenceBurstTailEncodedCostIncludesWrapping (0.00s)
+=== RUN   TestReceiveSequenceBurstTailIdleDoesNotReuseCredit
+--- PASS: TestReceiveSequenceBurstTailIdleDoesNotReuseCredit (0.00s)
+=== RUN   TestReceiveSequenceBurstTailCancellationDrainsPendingHead
+--- PASS: TestReceiveSequenceBurstTailCancellationDrainsPendingHead (0.00s)
+=== RUN   TestReceiveSequenceBurstTailPreservesPlaintextCumulativeHead
+--- PASS: TestReceiveSequenceBurstTailPreservesPlaintextCumulativeHead (0.00s)
+=== RUN   TestReceiveSequenceBurstTailHeadDoesNotWaitForCompression
+--- PASS: TestReceiveSequenceBurstTailHeadDoesNotWaitForCompression (0.00s)
+=== RUN   TestSequenceAckWindowGapWakeOncePerHead
+--- PASS: TestSequenceAckWindowGapWakeOncePerHead (0.00s)
+=== RUN   TestSequenceAckWindowGapWakeDisabled
+--- PASS: TestSequenceAckWindowGapWakeDisabled (0.00s)
+=== RUN   TestSequenceAckWindowGapWakeSteadyStateDoesNotAllocate
+--- PASS: TestSequenceAckWindowGapWakeSteadyStateDoesNotAllocate (0.00s)
+=== RUN   TestGapWakeRepairsTheFirstCumulativeHead
+--- PASS: TestGapWakeRepairsTheFirstCumulativeHead (0.00s)
+=== RUN   TestGapWakeDoesNotReproveTheSameHeadEverySnapshot
+--- PASS: TestGapWakeDoesNotReproveTheSameHeadEverySnapshot (0.00s)
+=== RUN   TestGapWakeCountsEvidenceAcrossSnapshots
+--- PASS: TestGapWakeCountsEvidenceAcrossSnapshots (0.00s)
+=== RUN   TestGapWakeWorkerCompressesRepeatedProof
+--- PASS: TestGapWakeWorkerCompressesRepeatedProof (0.00s)
+=== RUN   TestReceiveSequenceBurstTailSmallIntervalTurnBound
+--- PASS: TestReceiveSequenceBurstTailSmallIntervalTurnBound (0.00s)
+=== RUN   TestReceiverAckTimingDurationBounds
+--- PASS: TestReceiverAckTimingDurationBounds (0.00s)
+=== RUN   TestReceiverAckTimingCoalescesExactHeadAndSelectiveIdentity
+--- PASS: TestReceiverAckTimingCoalescesExactHeadAndSelectiveIdentity (0.00s)
+=== RUN   TestReceiverAckTimingWrappersAndUntaggedRecovery
+--- PASS: TestReceiverAckTimingWrappersAndUntaggedRecovery (0.00s)
+=== RUN   TestReceiverAckTimingRepeatedHeadUsesCurrentEncodingTime
+--- PASS: TestReceiverAckTimingRepeatedHeadUsesCurrentEncodingTime (0.00s)
+=== RUN   TestReceiverAckTimingIncludesQueueAndDeliveryWait
+--- PASS: TestReceiverAckTimingIncludesQueueAndDeliveryWait (0.00s)
+=== RUN   TestReceiverAckTimingPreservesExactZeroDelay
+--- PASS: TestReceiverAckTimingPreservesExactZeroDelay (0.00s)
+=== RUN   TestRttReceiverTimingRejectsMixedLegacyReordering
+--- PASS: TestRttReceiverTimingRejectsMixedLegacyReordering (0.00s)
+=== RUN   TestRttReceiverTimingBoundsSamplingWithPairedResidence
+--- PASS: TestRttReceiverTimingBoundsSamplingWithPairedResidence (0.00s)
+=== RUN   TestWindowRetainedCandidateUsesMeasuredRoundTrip
+    transfer_send_window_test.go:762: window 3243956 candidate 2397240 from 2405970 bytes over 70.368958ms at a 25.056833ms round trip, floor 262144 ceiling 16515072, reason "retained window"
+--- PASS: TestWindowRetainedCandidateUsesMeasuredRoundTrip (2.03s)
+=== RUN   TestWindowRetainedSlowPathLowersCandidateWithoutShrinking
+    transfer_send_window_test.go:847: at 2500000 B/s window 2097152 candidate 1134208 pacing 9247028 (1150252 bytes over 460ms, round trip 216.792ms); at 312500 B/s window 2097152 candidate 215210 pacing 6090423 (218296 bytes over 698.5472ms, round trip 334.336ms)
+--- PASS: TestWindowRetainedSlowPathLowersCandidateWithoutShrinking (0.60s)
+=== RUN   TestRttReceiverTimingKeepsRawRecoveryAndPairedWindowResidence
+--- PASS: TestRttReceiverTimingKeepsRawRecoveryAndPairedWindowResidence (0.00s)
+=== RUN   TestRttReceiverTimingPinsCompressionAndReadOnlySampleCutoffs
+--- PASS: TestRttReceiverTimingPinsCompressionAndReadOnlySampleCutoffs (0.00s)
+=== RUN   TestRttReceiverTimingRollingSamplesTrackLongRoundTripGrowth
+--- PASS: TestRttReceiverTimingRollingSamplesTrackLongRoundTripGrowth (0.00s)
+=== RUN   TestSenderReceiverTimingRejectsInvalidTupleWithoutConsumingWrite
+--- PASS: TestSenderReceiverTimingRejectsInvalidTupleWithoutConsumingWrite (0.00s)
+=== RUN   TestSenderReceiverTimingInvalidatesRetryAndUnreliableCopies
+--- PASS: TestSenderReceiverTimingInvalidatesRetryAndUnreliableCopies (0.00s)
+=== RUN   TestSenderReceiverTimingKeepsConfirmedAndPendingMessagesSeparate
+--- PASS: TestSenderReceiverTimingKeepsConfirmedAndPendingMessagesSeparate (0.00s)
+=== RUN   TestSenderReceiverTimingSuppressionSurvivesAckCoalescing
+--- PASS: TestSenderReceiverTimingSuppressionSurvivesAckCoalescing (0.00s)
+=== RUN   TestSenderReceiverTimingWaitsForPhysicalConfirmation
+--- PASS: TestSenderReceiverTimingWaitsForPhysicalConfirmation (0.00s)
+=== RUN   TestSenderReceiverTimingRejectsFailedPhysicalWrite
+--- PASS: TestSenderReceiverTimingRejectsFailedPhysicalWrite (0.00s)
+=== RUN   TestSenderReceiverTimingCancelDropsUnconfirmedReply
+--- PASS: TestSenderReceiverTimingCancelDropsUnconfirmedReply (0.00s)
+=== RUN   TestSenderReceiverTimingObservedMessageStaysConsumedAfterRetry
+--- PASS: TestSenderReceiverTimingObservedMessageStaysConsumedAfterRetry (0.00s)
+=== RUN   TestSenderReceiverTimingArrivesBeforeBlockedWorker
+--- PASS: TestSenderReceiverTimingArrivesBeforeBlockedWorker (0.00s)
+=== RUN   TestWindowPacingRoundTripExcludesLocalWriteWait
+--- PASS: TestWindowPacingRoundTripExcludesLocalWriteWait (0.00s)
+=== RUN   TestWindowPacingAmbiguousDeliveryCannotSetRelayRoundTrip
+--- PASS: TestWindowPacingAmbiguousDeliveryCannotSetRelayRoundTrip (0.00s)
+=== RUN   TestWindowMismatchUnbudgetedSenderRespectsKnownLimits
+--- PASS: TestWindowMismatchUnbudgetedSenderRespectsKnownLimits (0.00s)
+=== RUN   TestWindowMismatchZeroHoldKeepsOneItemProgress
+--- PASS: TestWindowMismatchZeroHoldKeepsOneItemProgress (0.00s)
+=== RUN   TestWindowMismatchLargeTargetCannotWrapItsBounds
+--- PASS: TestWindowMismatchLargeTargetCannotWrapItsBounds (0.00s)
+=== RUN   TestWindowDeliveryContractLeadDoesNotOverflow
+--- PASS: TestWindowDeliveryContractLeadDoesNotOverflow (0.00s)
+=== RUN   TestWindowPacingLocalHistoryRetainsStableFeedbackSpan
+--- PASS: TestWindowPacingLocalHistoryRetainsStableFeedbackSpan (0.00s)
+=== RUN   TestWindowMismatchCapacityIncreaseStartsFreshDeliveryEvidence
+--- PASS: TestWindowMismatchCapacityIncreaseStartsFreshDeliveryEvidence (0.00s)
+=== RUN   TestWindowPacingQueueEstimateDoesNotIncludeWindowLimitedIdle
+--- PASS: TestWindowPacingQueueEstimateDoesNotIncludeWindowLimitedIdle (0.00s)
+=== RUN   TestWindowBucketStatsLeadingUnknownAndLateHold
+--- PASS: TestWindowBucketStatsLeadingUnknownAndLateHold (0.00s)
+=== RUN   TestWindowBucketStatsPartialAfterIdleKeepsCompletedHold
+--- PASS: TestWindowBucketStatsPartialAfterIdleKeepsCompletedHold (0.00s)
+=== RUN   TestWindowBucketStatsWeightsCompletedBucketsEqually
+--- PASS: TestWindowBucketStatsWeightsCompletedBucketsEqually (0.00s)
+=== RUN   TestWindowBucketStatsZeroOrderHoldDistinguishesMeasuredZero
+--- PASS: TestWindowBucketStatsZeroOrderHoldDistinguishesMeasuredZero (0.00s)
+=== RUN   TestWindowBucketStatsExactBoundaries
+--- PASS: TestWindowBucketStatsExactBoundaries (0.00s)
+=== RUN   TestWindowBucketStatsAcceptsRetainedOutOfOrderMeasurements
+--- PASS: TestWindowBucketStatsAcceptsRetainedOutOfOrderMeasurements (0.00s)
+=== RUN   TestWindowBucketStatsExpirationCannotOverwriteTheHold
+--- PASS: TestWindowBucketStatsExpirationCannotOverwriteTheHold (0.00s)
+=== RUN   TestWindowBucketStatsResetCarriesBurstUntilNewEvidence
+--- PASS: TestWindowBucketStatsResetCarriesBurstUntilNewEvidence (0.00s)
+=== RUN   TestWindowBucketStatsResetRejectsEarlierEpoch
+--- PASS: TestWindowBucketStatsResetRejectsEarlierEpoch (0.00s)
+=== RUN   TestWindowPacingBurstStatsResetOnEachBurst
+--- PASS: TestWindowPacingBurstStatsResetOnEachBurst (0.00s)
+=== RUN   TestWindowPacingBurstStatsRejectLateOlderBursts
+--- PASS: TestWindowPacingBurstStatsRejectLateOlderBursts (0.00s)
+=== RUN   TestWindowPacingBurstStatsAcceptRetainedCurrentBurst
+--- PASS: TestWindowPacingBurstStatsAcceptRetainedCurrentBurst (0.00s)
+=== RUN   TestWindowPacingBurstStatsAcceptRetainedAfterReset
+--- PASS: TestWindowPacingBurstStatsAcceptRetainedAfterReset (0.00s)
+=== RUN   TestAClampedWindowReportsTheMemoryShare
+--- PASS: TestAClampedWindowReportsTheMemoryShare (0.00s)
+=== RUN   TestALearnedWindowSurvivesTheMemoryClamp
+--- PASS: TestALearnedWindowSurvivesTheMemoryClamp (0.00s)
+=== RUN   TestDeliveryGrowthRemainsBelowTheSmallMemoryShare
+--- PASS: TestDeliveryGrowthRemainsBelowTheSmallMemoryShare (0.00s)
+=== RUN   TestAConfiguredCeilingDoesNotReportTheMemoryShare
+--- PASS: TestAConfiguredCeilingDoesNotReportTheMemoryShare (0.00s)
+=== RUN   TestWindowPacingColdRefillKeepsSupportedPacing
+--- PASS: TestWindowPacingColdRefillKeepsSupportedPacing (0.00s)
+=== RUN   TestWindowPacingColdPreofferedTrainKeepsSlowPacing
+--- PASS: TestWindowPacingColdPreofferedTrainKeepsSlowPacing (0.00s)
+=== RUN   TestWindowPacingColdRefillFreshSlowPairLowersPacing
+--- PASS: TestWindowPacingColdRefillFreshSlowPairLowersPacing (0.00s)
+=== RUN   TestWindowPacingColdRefillFreshFasterPairMeasuresService
+--- PASS: TestWindowPacingColdRefillFreshFasterPairMeasuresService (0.00s)
+=== RUN   TestWindowPacingColdContiguousRefillKeepsPair
+--- PASS: TestWindowPacingColdContiguousRefillKeepsPair (0.00s)
+=== RUN   TestWindowPacingCompressedFlightsKeepMeasuredSerialization
+--- PASS: TestWindowPacingCompressedFlightsKeepMeasuredSerialization (0.00s)
+=== RUN   TestWindowPacingCumulativeGrowthRaisesColdRate
+--- PASS: TestWindowPacingCumulativeGrowthRaisesColdRate (0.00s)
+=== RUN   TestWindowPacingCumulativeSingleReplyKeepsBootstrap
+--- PASS: TestWindowPacingCumulativeSingleReplyKeepsBootstrap (0.00s)
+=== RUN   TestWindowPacingCumulativeTinyRepliesKeepBootstrap
+--- PASS: TestWindowPacingCumulativeTinyRepliesKeepBootstrap (0.00s)
+=== RUN   TestWindowPacingCumulativeMissingHistoryKeepsRetainedWindow
+--- PASS: TestWindowPacingCumulativeMissingHistoryKeepsRetainedWindow (0.00s)
+=== RUN   TestWindowPacingCumulativeStaleHistoryCannotReprice
+--- PASS: TestWindowPacingCumulativeStaleHistoryCannotReprice (0.00s)
+=== RUN   TestWindowPacingCumulativePermissionStepRejectsOldRate
+--- PASS: TestWindowPacingCumulativePermissionStepRejectsOldRate (0.00s)
+=== RUN   TestWindowPacingCumulativeSlowUnqueuedDeliveryKeepsPace
+--- PASS: TestWindowPacingCumulativeSlowUnqueuedDeliveryKeepsPace (0.00s)
+=== RUN   TestWindowPacingCumulativeSlowQueuedDeliveryLowersOnlyRate
+--- PASS: TestWindowPacingCumulativeSlowQueuedDeliveryLowersOnlyRate (0.00s)
+=== RUN   TestWindowPacingCumulativeRateDefersToSlowService
+--- PASS: TestWindowPacingCumulativeRateDefersToSlowService (0.00s)
+=== RUN   TestWindowPacingCumulativeUnqueuedSlowServiceStillDiscovers
+--- PASS: TestWindowPacingCumulativeUnqueuedSlowServiceStillDiscovers (0.00s)
+=== RUN   TestWindowPacingCumulativeRatePreservesHardBounds
+--- PASS: TestWindowPacingCumulativeRatePreservesHardBounds (0.00s)
+=== RUN   TestWindowPacingCumulativeSharedServiceRejectsOtherCarriers
+--- PASS: TestWindowPacingCumulativeSharedServiceRejectsOtherCarriers (0.00s)
+=== RUN   TestWindowPacingCumulativeH1SiblingOwnsItsFallback
+--- PASS: TestWindowPacingCumulativeH1SiblingOwnsItsFallback (0.00s)
+=== RUN   TestWindowPacingCumulativeStandaloneRateStillWorks
+--- PASS: TestWindowPacingCumulativeStandaloneRateStillWorks (0.00s)
+=== RUN   TestWindowPerformanceDuplexBoundsBothDirections
+    transfer_window_duplex_fixture_test.go:24: service-reading {"Cell":{"Bidirectional":true,"CalibrationWindow":0,"SendWindow":65536,"ReceiveWindow":65536,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":false,"TcpBufferMax":0,"Arm":"ceiling","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":10000000,"Flows":1,"RoundRobinOffer":true,"Lanes":1,"Payload":1280,"Budget":524288,"Drop":false,"Rate":12500000,"RateAfter":0,"RateChangeAfter":0,"Warmup":1000000000,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":1,"Seconds":1,"Bytes":13569280,"Mbps":108.55424,"MinFlowMbps":12.81024,"IntervalMbps":[108.55424],"DirectionMbps":[12.81024,95.744],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":199,"MaxRelayQueuedBytes":526453,"Recovery":{"InitialWriteCount":1252,"InitialFrameCount":2502,"InitialMessageByteCount":3202560,"TimeoutResendWriteCount":0,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":0,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":98,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":0,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":0,"RouteRetainedItemCount":0,"ReliableLaneLongestAckGap":40210080,"ReliableLaneStallOnsetInterval":0,"ReliableLaneStallOnsetOutstanding":0,"ReliableLaneStallOnsetOffset":0,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2673,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":100,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":100},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2673,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":200,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":200},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"Window":{"Window":65536,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":65536,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0},"ReverseWindow":{"Window":524288,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":524288,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+    transfer_window_duplex_fixture_test.go:24: service-reading {"Cell":{"Bidirectional":true,"CalibrationWindow":0,"SendWindow":65536,"ReceiveWindow":65536,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":false,"TcpBufferMax":0,"Arm":"ceiling","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":10000000,"Flows":8,"RoundRobinOffer":true,"Lanes":8,"Payload":1280,"Budget":524288,"Drop":false,"Rate":12500000,"RateAfter":0,"RateChangeAfter":0,"Warmup":1000000000,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":1,"Seconds":1,"Bytes":13497600,"Mbps":107.9808,"MinFlowMbps":0.53248,"IntervalMbps":[107.9808],"DirectionMbps":[12.67712,95.30368],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":222,"MaxRelayQueuedBytes":530806,"Recovery":{"InitialWriteCount":1250,"InitialFrameCount":2490,"InitialMessageByteCount":3187200,"TimeoutResendWriteCount":0,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":0,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":1140,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":0,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":0,"RouteRetainedItemCount":0,"ReliableLaneLongestAckGap":41886800,"ReliableLaneStallOnsetInterval":0,"ReliableLaneStallOnsetOutstanding":0,"ReliableLaneStallOnsetOffset":0,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2674,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":1164,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":1164},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2673,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":1625,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":1625},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"Window":{"Window":65536,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":65536,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0},"ReverseWindow":{"Window":524288,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":524288,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+    transfer_window_duplex_fixture_test.go:24: service-reading {"Cell":{"Bidirectional":true,"CalibrationWindow":0,"SendWindow":65536,"ReceiveWindow":65536,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":true,"TcpBufferMax":0,"Arm":"ceiling","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":10000000,"Flows":1,"RoundRobinOffer":true,"Lanes":1,"Payload":1280,"Budget":524288,"Drop":false,"Rate":12500000,"RateAfter":0,"RateChangeAfter":0,"Warmup":1000000000,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":1,"Seconds":1,"Bytes":13570560,"Mbps":108.56448,"MinFlowMbps":12.82048,"IntervalMbps":[108.56448],"DirectionMbps":[12.82048,95.744],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":198,"MaxRelayQueuedBytes":526453,"Recovery":{"InitialWriteCount":1254,"InitialFrameCount":2504,"InitialMessageByteCount":3205120,"TimeoutResendWriteCount":0,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":0,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":98,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":0,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":0,"RouteRetainedItemCount":0,"ReliableLaneLongestAckGap":40210080,"ReliableLaneStallOnsetInterval":0,"ReliableLaneStallOnsetOutstanding":0,"ReliableLaneStallOnsetOffset":0,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2673,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":200,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":200},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2673,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":100,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":100},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"Window":{"Window":65536,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":65536,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0},"ReverseWindow":{"Window":524288,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":524288,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+    transfer_window_duplex_fixture_test.go:24: service-reading {"Cell":{"Bidirectional":true,"CalibrationWindow":0,"SendWindow":65536,"ReceiveWindow":65536,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":true,"TcpBufferMax":0,"Arm":"ceiling","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":10000000,"Flows":8,"RoundRobinOffer":true,"Lanes":8,"Payload":1280,"Budget":524288,"Drop":false,"Rate":12500000,"RateAfter":0,"RateChangeAfter":0,"Warmup":1000000000,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":1,"Seconds":1,"Bytes":13491200,"Mbps":107.9296,"MinFlowMbps":0.512,"IntervalMbps":[107.9296],"DirectionMbps":[12.5952,95.3344],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":219,"MaxRelayQueuedBytes":540204,"Recovery":{"InitialWriteCount":1241,"InitialFrameCount":2473,"InitialMessageByteCount":3165440,"TimeoutResendWriteCount":0,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":0,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":1088,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":0,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":0,"RouteRetainedItemCount":0,"ReliableLaneLongestAckGap":41412320,"ReliableLaneStallOnsetInterval":0,"ReliableLaneStallOnsetOutstanding":0,"ReliableLaneStallOnsetOffset":0,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2673,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":1627,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":1627},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2674,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":1110,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":1110},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"Window":{"Window":65536,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":65536,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0},"ReverseWindow":{"Window":524288,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":524288,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+--- PASS: TestWindowPerformanceDuplexBoundsBothDirections (6.82s)
+=== RUN   TestWindowPerformanceDuplexBoundsRateChanges
+    transfer_window_duplex_fixture_test.go:55: service-reading {"Cell":{"Bidirectional":true,"CalibrationWindow":0,"SendWindow":65536,"ReceiveWindow":65536,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":false,"TcpBufferMax":0,"Arm":"ceiling","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":10000000,"Flows":8,"RoundRobinOffer":true,"Lanes":8,"Payload":1280,"Budget":524288,"Drop":true,"Rate":6250000,"RateAfter":12500000,"RateChangeAfter":500000000,"Warmup":2000000000,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":2,"Seconds":1,"Bytes":13510400,"Mbps":108.0832,"MinFlowMbps":0.512,"IntervalMbps":[108.0832],"DirectionMbps":[12.75904,95.32416],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":223,"MaxRelayQueuedBytes":530898,"Recovery":{"InitialWriteCount":1724,"InitialFrameCount":3437,"InitialMessageByteCount":4399360,"TimeoutResendWriteCount":0,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":0,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":1548,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":0,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":0,"RouteRetainedItemCount":0,"ReliableLaneLongestAckGap":84013440,"ReliableLaneStallOnsetInterval":0,"ReliableLaneStallOnsetOutstanding":0,"ReliableLaneStallOnsetOffset":0,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2674,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":1571,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":1571},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2673,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":2415,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":2415},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"Window":{"Window":65536,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":65536,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0},"ReverseWindow":{"Window":524288,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":524288,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+    transfer_window_duplex_fixture_test.go:55: service-reading {"Cell":{"Bidirectional":true,"CalibrationWindow":0,"SendWindow":65536,"ReceiveWindow":65536,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":false,"TcpBufferMax":0,"Arm":"ceiling","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":10000000,"Flows":8,"RoundRobinOffer":true,"Lanes":8,"Payload":1280,"Budget":524288,"Drop":true,"Rate":12500000,"RateAfter":6250000,"RateChangeAfter":500000000,"Warmup":2000000000,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":2,"Seconds":1,"Bytes":6755840,"Mbps":54.04672,"MinFlowMbps":0.24576,"IntervalMbps":[54.04672],"DirectionMbps":[6.389760000000001,47.65696],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":224,"MaxRelayQueuedBytes":536150,"Recovery":{"InitialWriteCount":1094,"InitialFrameCount":2178,"InitialMessageByteCount":2787840,"TimeoutResendWriteCount":0,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":0,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":1015,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":0,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":0,"RouteRetainedItemCount":0,"ReliableLaneLongestAckGap":83378560,"ReliableLaneStallOnsetInterval":0,"ReliableLaneStallOnsetOutstanding":0,"ReliableLaneStallOnsetOffset":0,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2674,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":1040,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":1040},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2673,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":2326,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":2326},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"Window":{"Window":65536,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":65536,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0},"ReverseWindow":{"Window":524288,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":524288,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+    transfer_window_duplex_fixture_test.go:55: service-reading {"Cell":{"Bidirectional":true,"CalibrationWindow":0,"SendWindow":65536,"ReceiveWindow":65536,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":true,"TcpBufferMax":0,"Arm":"ceiling","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":10000000,"Flows":8,"RoundRobinOffer":true,"Lanes":8,"Payload":1280,"Budget":524288,"Drop":true,"Rate":6250000,"RateAfter":12500000,"RateChangeAfter":500000000,"Warmup":2000000000,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":2,"Seconds":1,"Bytes":13493760,"Mbps":107.95008,"MinFlowMbps":0.54272,"IntervalMbps":[107.95008],"DirectionMbps":[12.666879999999999,95.28320000000001],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":223,"MaxRelayQueuedBytes":532188,"Recovery":{"InitialWriteCount":1719,"InitialFrameCount":3424,"InitialMessageByteCount":4382720,"TimeoutResendWriteCount":0,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":0,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":1603,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":0,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":0,"RouteRetainedItemCount":0,"ReliableLaneLongestAckGap":83250240,"ReliableLaneStallOnsetInterval":0,"ReliableLaneStallOnsetOutstanding":0,"ReliableLaneStallOnsetOffset":0,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2673,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":2432,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":2432},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2674,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":1626,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":1626},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"Window":{"Window":65536,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":65536,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0},"ReverseWindow":{"Window":524288,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":524288,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+    transfer_window_duplex_fixture_test.go:55: service-reading {"Cell":{"Bidirectional":true,"CalibrationWindow":0,"SendWindow":65536,"ReceiveWindow":65536,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":true,"TcpBufferMax":0,"Arm":"ceiling","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":10000000,"Flows":8,"RoundRobinOffer":true,"Lanes":8,"Payload":1280,"Budget":524288,"Drop":true,"Rate":12500000,"RateAfter":6250000,"RateChangeAfter":500000000,"Warmup":2000000000,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":2,"Seconds":1,"Bytes":6740480,"Mbps":53.92384,"MinFlowMbps":0.49152,"IntervalMbps":[53.92384],"DirectionMbps":[6.277120000000001,47.64672],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":224,"MaxRelayQueuedBytes":533754,"Recovery":{"InitialWriteCount":1087,"InitialFrameCount":2169,"InitialMessageByteCount":2776320,"TimeoutResendWriteCount":0,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":0,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":1024,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":0,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":0,"RouteRetainedItemCount":0,"ReliableLaneLongestAckGap":58788000,"ReliableLaneStallOnsetInterval":0,"ReliableLaneStallOnsetOutstanding":0,"ReliableLaneStallOnsetOffset":0,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2673,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":2301,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":2301},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2674,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":1049,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":1049},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"Window":{"Window":65536,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":65536,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0},"ReverseWindow":{"Window":524288,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":524288,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+--- PASS: TestWindowPerformanceDuplexBoundsRateChanges (8.51s)
+=== RUN   TestWindowPacingPartialCycleRaisesOnlyFromNewDelivery
+--- PASS: TestWindowPacingPartialCycleRaisesOnlyFromNewDelivery (0.00s)
+=== RUN   TestWindowPacingPartialCycleIncreaseKeepsCompressionGap
+--- PASS: TestWindowPacingPartialCycleIncreaseKeepsCompressionGap (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleAllowsRepeatedSlowGaps
+--- PASS: TestWindowPacingFeedbackCycleAllowsRepeatedSlowGaps (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleKeepsFullGap
+--- PASS: TestWindowPacingFeedbackCycleKeepsFullGap (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleCompletesAtPhysicalTail
+--- PASS: TestWindowPacingFeedbackCycleCompletesAtPhysicalTail (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleDoesNotPromoteCompressedPartials
+--- PASS: TestWindowPacingFeedbackCycleDoesNotPromoteCompressedPartials (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleSurvivesResizeAndStatistics
+--- PASS: TestWindowPacingFeedbackCycleSurvivesResizeAndStatistics (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleWithoutEvidenceHoldsZero
+--- PASS: TestWindowPacingFeedbackCycleWithoutEvidenceHoldsZero (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleOutlivesRing
+--- PASS: TestWindowPacingFeedbackCycleOutlivesRing (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleCannotRestoreSupersededEvidence
+--- PASS: TestWindowPacingFeedbackCycleCannotRestoreSupersededEvidence (0.00s)
+=== RUN   TestWindowPacingFeedbackCyclePhysicalTailOutlivesRing
+--- PASS: TestWindowPacingFeedbackCyclePhysicalTailOutlivesRing (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleWaitsForDrainedAccounting
+--- PASS: TestWindowPacingFeedbackCycleWaitsForDrainedAccounting (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleAcceptsFreshEvidenceBeforeOldAccounting
+--- PASS: TestWindowPacingFeedbackCycleAcceptsFreshEvidenceBeforeOldAccounting (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleHoldIgnoresFlightAndReadMode
+--- PASS: TestWindowPacingFeedbackCycleHoldIgnoresFlightAndReadMode (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleCompressionChanges
+--- PASS: TestWindowPacingFeedbackCycleCompressionChanges (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleConfirmedEpochRetiresOldPartial
+--- PASS: TestWindowPacingFeedbackCycleConfirmedEpochRetiresOldPartial (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleStatisticsCannotRetireOldEvidence
+--- PASS: TestWindowPacingFeedbackCycleStatisticsCannotRetireOldEvidence (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleFreshSlowPairOutlivesOldAccounting
+--- PASS: TestWindowPacingFeedbackCycleFreshSlowPairOutlivesOldAccounting (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleRetirementPreservesCompressionEvidence
+--- PASS: TestWindowPacingFeedbackCycleRetirementPreservesCompressionEvidence (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleRepeatedDrainReanchorsFreshEvidence
+--- PASS: TestWindowPacingFeedbackCycleRepeatedDrainReanchorsFreshEvidence (0.00s)
+=== RUN   TestWindowPacingCompletedCycleRetainsEligibleLateBytes
+--- PASS: TestWindowPacingCompletedCycleRetainsEligibleLateBytes (0.00s)
+=== RUN   TestWindowPacingRetiredFreshCycleRetainsEligibleLateBytes
+--- PASS: TestWindowPacingRetiredFreshCycleRetainsEligibleLateBytes (0.00s)
+=== RUN   TestWindowPacingSupersededCycleCannotReturnThroughLateBytes
+--- PASS: TestWindowPacingSupersededCycleCannotReturnThroughLateBytes (0.00s)
+=== RUN   TestWindowPacingCompletedCycleExtendsThroughCompressedSuffix
+--- PASS: TestWindowPacingCompletedCycleExtendsThroughCompressedSuffix (0.00s)
+=== RUN   TestWindowPacingRetainedSummaryPinsLaterCompression
+--- PASS: TestWindowPacingRetainedSummaryPinsLaterCompression (0.00s)
+=== RUN   TestWindowPhysicalH1PolicyGateAcceptsServiceQualified
+--- PASS: TestWindowPhysicalH1PolicyGateAcceptsServiceQualified (0.00s)
+=== RUN   TestWindowPhysicalH1PolicyGateAcceptsAgedRetainedWindow
+--- PASS: TestWindowPhysicalH1PolicyGateAcceptsAgedRetainedWindow (0.00s)
+=== RUN   TestWindowPhysicalH1PolicyGateRejectsWrongArmWithFreshEvidence
+--- PASS: TestWindowPhysicalH1PolicyGateRejectsWrongArmWithFreshEvidence (0.00s)
+=== RUN   TestWindowPhysicalH1PolicyGateRejectsDisabledConstructor
+--- PASS: TestWindowPhysicalH1PolicyGateRejectsDisabledConstructor (0.00s)
+=== RUN   TestWindowPhysicalH1PolicyGateRejectsWrongSequenceConfiguration
+--- PASS: TestWindowPhysicalH1PolicyGateRejectsWrongSequenceConfiguration (0.00s)
+=== RUN   TestWindowPhysicalH1PolicyGateScopesActualDestination
+--- PASS: TestWindowPhysicalH1PolicyGateScopesActualDestination (0.00s)
+=== RUN   TestWindowPhysicalH1PolicyGateKeepsQualifiedPositiveControl
+--- PASS: TestWindowPhysicalH1PolicyGateKeepsQualifiedPositiveControl (0.00s)
+=== RUN   TestWindowPhysicalH1PolicyGateRejectsUnknownArm
+--- PASS: TestWindowPhysicalH1PolicyGateRejectsUnknownArm (0.00s)
+=== RUN   TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle
+    transfer_window_host_feedback_test.go:102: replay retained service=125000000 B/s; next bulk write waited 0s
+--- PASS: TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle (0.00s)
+=== RUN   TestWindowPacingSourceIdleRequiresConfirmationAndFreshEvidence
+--- PASS: TestWindowPacingSourceIdleRequiresConfirmationAndFreshEvidence (0.00s)
+=== RUN   TestWindowPacingQueuedDemandPreservesNaturalSerialization
+--- PASS: TestWindowPacingQueuedDemandPreservesNaturalSerialization (0.00s)
+=== RUN   TestWindowPacingSourceIdleCancellationPreservesSuccessor
+--- PASS: TestWindowPacingSourceIdleCancellationPreservesSuccessor (0.00s)
+=== RUN   TestWindowPacingLastCanceledDemandStartsSourceIdle
+--- PASS: TestWindowPacingLastCanceledDemandStartsSourceIdle (0.00s)
+=== RUN   TestWindowPacingDelayedDrainObservationKeepsSerialization
+--- PASS: TestWindowPacingDelayedDrainObservationKeepsSerialization (0.00s)
+=== RUN   TestWindowPacingRecoveryCannotCarrySourceIdleToLaterWrites
+--- PASS: TestWindowPacingRecoveryCannotCarrySourceIdleToLaterWrites (0.00s)
+=== RUN   TestWindowPacingPackWaitingBeforeReservationAcceptsFreshService
+--- PASS: TestWindowPacingPackWaitingBeforeReservationAcceptsFreshService (0.00s)
+=== RUN   TestWindowPacingSharedSourceIdleRequiresEveryTail
+--- PASS: TestWindowPacingSharedSourceIdleRequiresEveryTail (0.00s)
+=== RUN   TestWindowPacingInitialWriteKeepsOriginalAckLifetime
+    transfer_window_initial_lifetime_test.go:146: offer=0 physical=400ms retained-recovery=700ms lifetime=500ms callback=500ms
+--- PASS: TestWindowPacingInitialWriteKeepsOriginalAckLifetime (0.00s)
+=== RUN   TestWindowPacingInitialRecoveryPrecedesLongerAckLifetime
+    transfer_window_initial_lifetime_test.go:189: offer=0 physical=400ms first-recovery=700ms lifetime=900ms callback=900ms
+--- PASS: TestWindowPacingInitialRecoveryPrecedesLongerAckLifetime (0.00s)
+=== RUN   TestWindowPacingInitialWaitCannotOutliveAckLifetime
+    transfer_window_initial_lifetime_test.go:214: callback-at-lifetime=500ms
+    transfer_window_initial_lifetime_test.go:217: at-lifetime=500ms callback=true physical-writes=0
+--- PASS: TestWindowPacingInitialWaitCannotOutliveAckLifetime (0.00s)
+=== RUN   TestWindowPacingInitialWaitRetainsNonRegenerableBytes
+--- PASS: TestWindowPacingInitialWaitRetainsNonRegenerableBytes (0.00s)
+=== RUN   TestWindowRetainedLegacyBootstrapBoundsGrowingCandidates
+    transfer_window_legacy_settle_test.go:74: step 0: 8192 per sample gives window 2097152 candidate 262144 ceiling 2097152 reason "sized" targetBound false sized true
+    transfer_window_legacy_settle_test.go:74: step 1: 16384 per sample gives window 2097152 candidate 262144 ceiling 2097152 reason "sized" targetBound false sized true
+    transfer_window_legacy_settle_test.go:74: step 2: 32768 per sample gives window 2097152 candidate 393216 ceiling 2097152 reason "sized" targetBound false sized true
+    transfer_window_legacy_settle_test.go:74: step 3: 65536 per sample gives window 2097152 candidate 786432 ceiling 2097152 reason "sized" targetBound false sized true
+    transfer_window_legacy_settle_test.go:74: step 4: 131072 per sample gives window 2097152 candidate 1572864 ceiling 2097152 reason "sized" targetBound false sized true
+    transfer_window_legacy_settle_test.go:74: step 5: 262144 per sample gives window 2097152 candidate 2097152 ceiling 2097152 reason "sized" targetBound false sized true
+    transfer_window_legacy_settle_test.go:74: step 6: 524288 per sample gives window 2097152 candidate 2097152 ceiling 2097152 reason "sized" targetBound false sized true
+    transfer_window_legacy_settle_test.go:74: step 7: 1048576 per sample gives window 2097152 candidate 2097152 ceiling 2097152 reason "sized" targetBound false sized true
+    transfer_window_legacy_settle_test.go:148: candidate reached the legacy clamp 2097152 from step 5 of 8, and held it for the remaining 2 steps
+--- PASS: TestWindowRetainedLegacyBootstrapBoundsGrowingCandidates (0.00s)
+=== RUN   TestWindowMismatchRespectsBothEndpoints
+    transfer_window_mismatch_test.go:15: case: send=65536/receive=65536
+    transfer_window_mismatch_test.go:15: case: send=65536/receive=262144
+    transfer_window_mismatch_test.go:15: case: send=65536/receive=2097152
+    transfer_window_mismatch_test.go:15: case: send=65536/receive=50331648
+    transfer_window_mismatch_test.go:15: case: send=262144/receive=65536
+    transfer_window_mismatch_test.go:15: case: send=262144/receive=262144
+    transfer_window_mismatch_test.go:15: case: send=262144/receive=2097152
+    transfer_window_mismatch_test.go:15: case: send=262144/receive=50331648
+    transfer_window_mismatch_test.go:15: case: send=2097152/receive=65536
+    transfer_window_mismatch_test.go:15: case: send=2097152/receive=262144
+    transfer_window_mismatch_test.go:15: case: send=2097152/receive=2097152
+    transfer_window_mismatch_test.go:15: case: send=2097152/receive=50331648
+    transfer_window_mismatch_test.go:15: case: send=50331648/receive=65536
+    transfer_window_mismatch_test.go:15: case: send=50331648/receive=262144
+    transfer_window_mismatch_test.go:15: case: send=50331648/receive=2097152
+    transfer_window_mismatch_test.go:15: case: send=50331648/receive=50331648
+--- PASS: TestWindowMismatchRespectsBothEndpoints (0.01s)
+=== RUN   TestWindowPacingOnePermittedBurstKeepsHeldRate
+--- PASS: TestWindowPacingOnePermittedBurstKeepsHeldRate (0.00s)
+=== RUN   TestWindowPacingQueueBeyondBurstReleasesHeldRate
+--- PASS: TestWindowPacingQueueBeyondBurstReleasesHeldRate (0.00s)
+=== RUN   TestWindowPacingPermittedBurstDoesNotMaskForwardBacklog
+--- PASS: TestWindowPacingPermittedBurstDoesNotMaskForwardBacklog (0.00s)
+=== RUN   TestWindowPacingShorterRoundTripKeepsFasterServiceEvidence
+--- PASS: TestWindowPacingShorterRoundTripKeepsFasterServiceEvidence (0.00s)
+=== RUN   TestWindowPacingCarrierBufferedReadsDoNotInflateServiceBurst
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:12500000 serviceRate:12500000 pacingRate:147928994 initialBurst:125000 resultBurst:125000 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingCarrierBufferedReadsDoNotInflateServiceBurst (0.01s)
+=== RUN   TestWindowPacingCarrierUnqueuedTrainPreservesCapacity
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=false evidence={physicalRate:12500000 priorRate:12500000 serviceRate:12500000 pacingRate:147928994 initialBurst:125000 resultBurst:125000 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:0 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingCarrierUnqueuedTrainPreservesCapacity (0.01s)
+=== RUN   TestWindowPacingCarrierFasterTrainRaisesMeasuredCapacity
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=false evidence={physicalRate:125000000 priorRate:12500000 serviceRate:124697360 pacingRate:147928994 initialBurst:125000 resultBurst:1246973 physicalBytes:49358 physicalSpan:394864 offerSpan:230000 maxQueued:0 maxCarrierQueued:0 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingCarrierFasterTrainRaisesMeasuredCapacity (0.01s)
+=== RUN   TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:12500000 serviceRate:12500000 pacingRate:147928994 initialBurst:125000 resultBurst:125000 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:12500000 serviceRate:12500000 pacingRate:147928994 initialBurst:125000 resultBurst:125000 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:12500000 serviceRate:12500000 pacingRate:13750000 initialBurst:125000 resultBurst:125000 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:12500000 serviceRate:12500000 pacingRate:13750000 initialBurst:125000 resultBurst:125000 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets (0.05s)
+=== RUN   TestWindowPacingServiceObservesQueueOnce
+--- PASS: TestWindowPacingServiceObservesQueueOnce (0.00s)
+=== RUN   TestWindowPacingDiscoveryReleasesRetainedWindow
+    transfer_window_pacing_discovery_test.go:57: case: crawl
+    transfer_window_pacing_discovery_test.go:57: case: discovery
+    transfer_window_pacing_discovery_test.go:57: case: discovery backlogged
+    transfer_window_pacing_discovery_test.go:57: case: discovery capped
+    transfer_window_pacing_discovery_test.go:57: case: discovery without residence
+    transfer_window_pacing_discovery_test.go:57: case: discovery before service
+--- PASS: TestWindowPacingDiscoveryReleasesRetainedWindow (0.00s)
+=== RUN   TestWindowPacingHeldRateFallsOnlyWithCongestion
+    transfer_window_pacing_discovery_test.go:100: case: held
+    transfer_window_pacing_discovery_test.go:100: case: backlogged
+    transfer_window_pacing_discovery_test.go:100: case: held above target
+    transfer_window_pacing_discovery_test.go:100: case: held before service
+    transfer_window_pacing_discovery_test.go:100: case: held below bootstrap
+--- PASS: TestWindowPacingHeldRateFallsOnlyWithCongestion (0.00s)
+=== RUN   TestWindowPacingDrainExtensionOrdersExpiryAndDelivery
+--- PASS: TestWindowPacingDrainExtensionOrdersExpiryAndDelivery (0.00s)
+=== RUN   TestWindowPacingRepeatedDrainEvidenceCannotRenewLifetime
+--- PASS: TestWindowPacingRepeatedDrainEvidenceCannotRenewLifetime (0.00s)
+=== RUN   TestWindowPacingLongResidenceArrivesDuringControlledDrain
+--- PASS: TestWindowPacingLongResidenceArrivesDuringControlledDrain (0.00s)
+=== RUN   TestWindowPacingConfiguredLongFlightDrainsBeforeProbe
+--- PASS: TestWindowPacingConfiguredLongFlightDrainsBeforeProbe (0.00s)
+=== RUN   TestWindowPacingDrainCoversLatestLongResidence
+--- PASS: TestWindowPacingDrainCoversLatestLongResidence (0.00s)
+=== RUN   TestWindowPacingDrainedProbeOutlivesStaleLaneTimer
+--- PASS: TestWindowPacingDrainedProbeOutlivesStaleLaneTimer (0.00s)
+=== RUN   TestWindowPacingAdmissionCannotCreditAnUnbegunWrite
+--- PASS: TestWindowPacingAdmissionCannotCreditAnUnbegunWrite (0.00s)
+=== RUN   TestWindowPacingFlightIncludesEstimatedBurstBytes
+--- PASS: TestWindowPacingFlightIncludesEstimatedBurstBytes (0.00s)
+=== RUN   TestWindowPacingOneMessageIsNotAStandingQueue
+--- PASS: TestWindowPacingOneMessageIsNotAStandingQueue (0.00s)
+=== RUN   TestWindowPacingPropagationIncludesOneMessageOfRounding
+--- PASS: TestWindowPacingPropagationIncludesOneMessageOfRounding (0.00s)
+=== RUN   TestWindowPacingWaitingReservationsAreNotWireFlight
+--- PASS: TestWindowPacingWaitingReservationsAreNotWireFlight (0.00s)
+=== RUN   TestWindowPacingDeliveredSiblingTailsAreNotWireFlight
+--- PASS: TestWindowPacingDeliveredSiblingTailsAreNotWireFlight (0.00s)
+=== RUN   TestWindowPacingCanceledDeliveredTailCannotHideNewFlight
+--- PASS: TestWindowPacingCanceledDeliveredTailCannotHideNewFlight (0.00s)
+=== RUN   TestWindowPacingLifetimeAcknowledgedPrefixSurvivesYoungerExpiry
+--- PASS: TestWindowPacingLifetimeAcknowledgedPrefixSurvivesYoungerExpiry (0.00s)
+=== RUN   TestWindowPacingLifetimeTimelyHeadSurvivesDelayedAdmission
+--- PASS: TestWindowPacingLifetimeTimelyHeadSurvivesDelayedAdmission (0.00s)
+=== RUN   TestWindowPacingLifetimeTimelySackSurvivesDelayedAdmission
+--- PASS: TestWindowPacingLifetimeTimelySackSurvivesDelayedAdmission (0.00s)
+=== RUN   TestWindowPacingLifetimeLateHeadSuppressesDelayedRetry
+--- PASS: TestWindowPacingLifetimeLateHeadSuppressesDelayedRetry (0.00s)
+=== RUN   TestWindowPacingLifetimeLateSackSuppressesDelayedRetry
+--- PASS: TestWindowPacingLifetimeLateSackSuppressesDelayedRetry (0.00s)
+=== RUN   TestWindowPacingLifetimeCancellationAfterAdmissionCannotDispatch
+--- PASS: TestWindowPacingLifetimeCancellationAfterAdmissionCannotDispatch (0.00s)
+=== RUN   TestWindowPacingLifetimeStandaloneCancellationAfterAdmission
+--- PASS: TestWindowPacingLifetimeStandaloneCancellationAfterAdmission (0.00s)
+=== RUN   TestWindowPacingLifetimeNewerContractRequestPreservesRenewal
+--- PASS: TestWindowPacingLifetimeNewerContractRequestPreservesRenewal (0.00s)
+=== RUN   TestWindowPacingLifetimeWrongContractCannotExtendRenewal
+--- PASS: TestWindowPacingLifetimeWrongContractCannotExtendRenewal (0.00s)
+=== RUN   TestWindowPacingLifetimeFullProofCannotExtendRenewal
+--- PASS: TestWindowPacingLifetimeFullProofCannotExtendRenewal (0.00s)
+=== RUN   TestWindowPacingLifetimeContractRequestRenewsOnlyOnce
+--- PASS: TestWindowPacingLifetimeContractRequestRenewsOnlyOnce (0.00s)
+=== RUN   TestWindowPacingLifetimePendingHeadPreservesYoungerWrite
+--- PASS: TestWindowPacingLifetimePendingHeadPreservesYoungerWrite (0.00s)
+=== RUN   TestWindowPacingLifetimePendingSackPreservesYoungerWrite
+--- PASS: TestWindowPacingLifetimePendingSackPreservesYoungerWrite (0.00s)
+=== RUN   TestWindowPacingLifetimeLateAdmissionCannotDispatch
+--- PASS: TestWindowPacingLifetimeLateAdmissionCannotDispatch (0.00s)
+=== RUN   TestWindowPacingLifetimeRetryWaitKeepsAckIdentity
+--- PASS: TestWindowPacingLifetimeRetryWaitKeepsAckIdentity (0.00s)
+=== RUN   TestWindowPacingLifetimeIdleWaitKeepsOlderDeadline
+--- PASS: TestWindowPacingLifetimeIdleWaitKeepsOlderDeadline (0.00s)
+=== RUN   TestWindowPacingLifetimeEqualPacingDeadlineExpiresFirst
+--- PASS: TestWindowPacingLifetimeEqualPacingDeadlineExpiresFirst (0.00s)
+=== RUN   TestWindowPacingLifetimeFullRouteKeepsOriginalDeadline
+--- PASS: TestWindowPacingLifetimeFullRouteKeepsOriginalDeadline (0.00s)
+=== RUN   TestWindowPacingLifetimeRouteRecoveryBeforeExpiry
+--- PASS: TestWindowPacingLifetimeRouteRecoveryBeforeExpiry (0.00s)
+=== RUN   TestWindowPacingLifetimeRouteWakePreservesWriterBudget
+--- PASS: TestWindowPacingLifetimeRouteWakePreservesWriterBudget (0.00s)
+=== RUN   TestWindowPacingPairedProbeRecoveryCannotExtendAckLifetime
+--- PASS: TestWindowPacingPairedProbeRecoveryCannotExtendAckLifetime (0.00s)
+=== RUN   TestWindowPacingPairedProbeRecoveryCancellationConsumesEvidence
+--- PASS: TestWindowPacingPairedProbeRecoveryCancellationConsumesEvidence (0.00s)
+=== RUN   TestWindowPacingPairedProbeRecoveryMatchesOnlyItsLiveEvidence
+--- PASS: TestWindowPacingPairedProbeRecoveryMatchesOnlyItsLiveEvidence (0.00s)
+=== RUN   TestWindowPacingPairedProbeRecoveryPreservesProvenLaneLoss
+    transfer_window_pacing_paired_probe_lane_test.go:25: lane proof generation: prepare=0 due=2
+--- PASS: TestWindowPacingPairedProbeRecoveryPreservesProvenLaneLoss (0.00s)
+=== RUN   TestWindowPacingPairedProbeRecoveryIgnoresUnrelatedLaneAck
+--- PASS: TestWindowPacingPairedProbeRecoveryIgnoresUnrelatedLaneAck (0.00s)
+=== RUN   TestWindowPacingPairedProbeOutlivesStaleLaneTimer
+    transfer_window_pacing_paired_probe_worker_test.go:181: selective=false same-message-retries=0 adjusted-baseline=1.2s raw-samples=2 raw-mean=605.5ms
+--- PASS: TestWindowPacingPairedProbeOutlivesStaleLaneTimer (0.00s)
+=== RUN   TestWindowPacingPairedProbeSelectiveReplyOutlivesStaleLaneTimer
+    transfer_window_pacing_paired_probe_worker_test.go:181: selective=true same-message-retries=0 adjusted-baseline=1.2s raw-samples=2 raw-mean=605.5ms
+--- PASS: TestWindowPacingPairedProbeSelectiveReplyOutlivesStaleLaneTimer (0.00s)
+=== RUN   TestWindowPacingPairedProbeNoReplyHasFiniteDeadline
+--- PASS: TestWindowPacingPairedProbeNoReplyHasFiniteDeadline (0.00s)
+=== RUN   TestWindowPacingPendingControlledProbeKeepsSiblingRate
+--- PASS: TestWindowPacingPendingControlledProbeKeepsSiblingRate (0.00s)
+=== RUN   TestWindowPacingPendingProbeInvalidationRestoresSamples
+--- PASS: TestWindowPacingPendingProbeInvalidationRestoresSamples (0.00s)
+=== RUN   TestWindowPacingPendingProbeAcceptsFreshSiblingEvidence
+--- PASS: TestWindowPacingPendingProbeAcceptsFreshSiblingEvidence (0.00s)
+=== RUN   TestWindowPacingPendingProbeAcceptsCompleteDrainedTrain
+--- PASS: TestWindowPacingPendingProbeAcceptsCompleteDrainedTrain (0.00s)
+=== RUN   TestWindowPacingPendingNewBytesCannotFinishOldTrain
+--- PASS: TestWindowPacingPendingNewBytesCannotFinishOldTrain (0.00s)
+=== RUN   TestWindowPacingProbeIdentitySurvivesUnrelatedRecovery
+--- PASS: TestWindowPacingProbeIdentitySurvivesUnrelatedRecovery (0.00s)
+=== RUN   TestWindowPacingProbeRecoveryPreservesProvenLaneLoss
+    transfer_window_pacing_probe_lane_test.go:25: lane proof generation: prepare=0 due=2
+--- PASS: TestWindowPacingProbeRecoveryPreservesProvenLaneLoss (0.00s)
+=== RUN   TestWindowPacingProbeRecoveryIgnoresUnrelatedLaneAck
+--- PASS: TestWindowPacingProbeRecoveryIgnoresUnrelatedLaneAck (0.00s)
+=== RUN   TestWindowPacingLaterMessageRetryPreservesUnretriedProbe
+--- PASS: TestWindowPacingLaterMessageRetryPreservesUnretriedProbe (0.00s)
+=== RUN   TestWindowPacingProbeRecoveryHasFiniteConfiguredDeadline
+--- PASS: TestWindowPacingProbeRecoveryHasFiniteConfiguredDeadline (0.00s)
+=== RUN   TestWindowPacingProbeRecoveryCannotExtendAckLifetime
+--- PASS: TestWindowPacingProbeRecoveryCannotExtendAckLifetime (0.00s)
+=== RUN   TestWindowPacingProbeRecoveryPreservesExplicitRecovery
+--- PASS: TestWindowPacingProbeRecoveryPreservesExplicitRecovery (0.01s)
+=== RUN   TestWindowPacingProbeRecoveryCancellationConsumesEvidence
+--- PASS: TestWindowPacingProbeRecoveryCancellationConsumesEvidence (0.00s)
+=== RUN   TestWindowPacingProbeRecoveryMatchesOnlyItsLiveEvidence
+--- PASS: TestWindowPacingProbeRecoveryMatchesOnlyItsLiveEvidence (0.00s)
+=== RUN   TestWindowPacingDrainBoundsAndCooldownCannotOverflow
+--- PASS: TestWindowPacingDrainBoundsAndCooldownCannotOverflow (0.00s)
+=== RUN   TestWindowPacingDrainedProbeHoldsServiceUntilFreshEvidence
+--- PASS: TestWindowPacingDrainedProbeHoldsServiceUntilFreshEvidence (0.00s)
+=== RUN   TestWindowPacingProbeAckBeforeWriteConfirmationHoldsService
+--- PASS: TestWindowPacingProbeAckBeforeWriteConfirmationHoldsService (0.00s)
+=== RUN   TestWindowPacingNaturalProbePreservesSerializationEvidence
+--- PASS: TestWindowPacingNaturalProbePreservesSerializationEvidence (0.00s)
+=== RUN   TestWindowPacingAbandonedDrainCannotResetLaterService
+--- PASS: TestWindowPacingAbandonedDrainCannotResetLaterService (0.00s)
+=== RUN   TestWindowPacingLateDispatchKeepsSuccessfulDrainEpoch
+--- PASS: TestWindowPacingLateDispatchKeepsSuccessfulDrainEpoch (0.00s)
+=== RUN   TestWindowPacingCanceledHeadTransfersControlledDrain
+--- PASS: TestWindowPacingCanceledHeadTransfersControlledDrain (0.00s)
+=== RUN   TestWindowPacingMissingProbeKeepsFreshServiceEvidence
+--- PASS: TestWindowPacingMissingProbeKeepsFreshServiceEvidence (0.00s)
+=== RUN   TestWindowPacingDrainDurationCannotOverflow
+--- PASS: TestWindowPacingDrainDurationCannotOverflow (0.00s)
+=== RUN   TestWindowPacingContinuousFlightRefreshesChangedRoundTrip
+--- PASS: TestWindowPacingContinuousFlightRefreshesChangedRoundTrip (0.00s)
+=== RUN   TestWindowPacingDrainNeedsDeliveryAndHasDeadline
+--- PASS: TestWindowPacingDrainNeedsDeliveryAndHasDeadline (0.00s)
+=== RUN   TestWindowPacingCarrierChangeInvalidatesProbeBeforeUnpacedRetry
+--- PASS: TestWindowPacingCarrierChangeInvalidatesProbeBeforeUnpacedRetry (0.00s)
+=== RUN   TestWindowPacingDrainedProbeSurvivesHeadCompression
+--- PASS: TestWindowPacingDrainedProbeSurvivesHeadCompression (0.00s)
+=== RUN   TestWindowPacingDrainedProbeRequiresEverySibling
+--- PASS: TestWindowPacingDrainedProbeRequiresEverySibling (0.00s)
+=== RUN   TestWindowPacingCanceledTailNeedsFreshDelivery
+--- PASS: TestWindowPacingCanceledTailNeedsFreshDelivery (0.00s)
+=== RUN   TestWindowPacingDrainedProbeRejectsAmbiguousEvidence
+--- PASS: TestWindowPacingDrainedProbeRejectsAmbiguousEvidence (0.00s)
+=== RUN   TestWindowPacingWindowUsesRefreshedServiceResidence
+--- PASS: TestWindowPacingWindowUsesRefreshedServiceResidence (0.00s)
+=== RUN   TestWindowPacingCoalescerPreservesDrainedProbeArrival
+--- PASS: TestWindowPacingCoalescerPreservesDrainedProbeArrival (0.00s)
+=== RUN   TestWindowPacingResizedSamplesKeepFirstBytesAndReordering
+--- PASS: TestWindowPacingResizedSamplesKeepFirstBytesAndReordering (0.00s)
+=== RUN   TestWindowPacingResizedSamplesExpireRetainedTime
+--- PASS: TestWindowPacingResizedSamplesExpireRetainedTime (0.00s)
+=== RUN   TestWindowPacingResizedSamplesRespectServiceEpoch
+--- PASS: TestWindowPacingResizedSamplesRespectServiceEpoch (0.00s)
+=== RUN   TestWindowPacingSlowServiceDeferralNeedsFreshProgress
+--- PASS: TestWindowPacingSlowServiceDeferralNeedsFreshProgress (0.00s)
+=== RUN   TestWindowPacingServiceByteEnvelope
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=125000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=1250000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=12500000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=125000000/sizes=[64 1280 8192 65536]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[64]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[1280]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[8192]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[65536]
+    transfer_window_pacing_test.go:69: case: rate=137500000/sizes=[64 1280 8192 65536]
+--- PASS: TestWindowPacingServiceByteEnvelope (0.03s)
+=== RUN   TestWindowPacingServiceChangesPreserveDebt
+    transfer_window_pacing_test.go:109: case: down
+    transfer_window_pacing_test.go:109: case: up
+    transfer_window_pacing_test.go:109: case: small-step
+--- PASS: TestWindowPacingServiceChangesPreserveDebt (0.00s)
+=== RUN   TestWindowPacingProbeBoundaryIdleAndIndependentSequences
+--- PASS: TestWindowPacingProbeBoundaryIdleAndIndependentSequences (0.00s)
+=== RUN   TestWindowPacingCanceledSmallWrite
+--- PASS: TestWindowPacingCanceledSmallWrite (0.00s)
+=== RUN   TestWindowPacingCancellationDuringProbe
+--- PASS: TestWindowPacingCancellationDuringProbe (0.00s)
+=== RUN   TestWindowPacingServiceMeasurementAcrossAckCompression
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=125000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=1250000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=12500000/compression=50ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=1ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=10ms
+    transfer_window_pacing_test.go:216: case: rate=125000000/compression=50ms
+--- PASS: TestWindowPacingServiceMeasurementAcrossAckCompression (0.00s)
+=== RUN   TestWindowPacingRateBoundsAndHandshake
+    transfer_window_pacing_test.go:249: case: unknown
+    transfer_window_pacing_test.go:249: case: handshake
+    transfer_window_pacing_test.go:249: case: slow
+    transfer_window_pacing_test.go:249: case: target
+    transfer_window_pacing_test.go:249: case: tiny
+    transfer_window_pacing_test.go:249: case: overflow
+--- PASS: TestWindowPacingRateBoundsAndHandshake (0.00s)
+=== RUN   TestWindowPacingServiceUsesAckArrival
+--- PASS: TestWindowPacingServiceUsesAckArrival (0.00s)
+=== RUN   TestWindowPacingServiceCountsSacksOnce
+--- PASS: TestWindowPacingServiceCountsSacksOnce (0.00s)
+=== RUN   TestWindowPacingSlowerServiceSupersedesFastHistory
+--- PASS: TestWindowPacingSlowerServiceSupersedesFastHistory (0.00s)
+=== RUN   TestWindowPacingSharedServiceEnvelopeAndCancellation
+    transfer_window_pacing_test.go:355: case: rate=125000
+    transfer_window_pacing_test.go:355: case: rate=1250000
+    transfer_window_pacing_test.go:355: case: rate=12500000
+    transfer_window_pacing_test.go:355: case: rate=125000000
+--- PASS: TestWindowPacingSharedServiceEnvelopeAndCancellation (0.00s)
+=== RUN   TestWindowPacingSharedProbeAndServiceIsolation
+--- PASS: TestWindowPacingSharedProbeAndServiceIsolation (0.00s)
+=== RUN   TestWindowPacingSharedCompressionUsesAWholeAckInterval
+--- PASS: TestWindowPacingSharedCompressionUsesAWholeAckInterval (0.00s)
+=== RUN   TestWindowPacingSharedShortTrainAcrossSampleBoundaries
+    transfer_window_pacing_test.go:477: case: phase=0/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=0/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=1/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=1/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=2/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=2/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=3/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=3/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=4/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=4/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=5/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=5/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=6/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=6/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=7/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=7/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=8/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=8/reverse=true
+    transfer_window_pacing_test.go:477: case: phase=9/reverse=false
+    transfer_window_pacing_test.go:477: case: phase=9/reverse=true
+--- PASS: TestWindowPacingSharedShortTrainAcrossSampleBoundaries (0.00s)
+=== RUN   TestWindowPacingShortAndCompressedTrainEdges
+    transfer_window_pacing_test.go:512: case: immediate-half-millisecond
+    transfer_window_pacing_test.go:512: case: compressed-partial-tail
+    transfer_window_pacing_test.go:512: case: sparse-slow-service
+    transfer_window_pacing_test.go:512: case: different-sized-slow-replies
+--- PASS: TestWindowPacingShortAndCompressedTrainEdges (0.00s)
+=== RUN   TestWindowPacingProbeNeedsQueueDelayEvidence
+--- PASS: TestWindowPacingProbeNeedsQueueDelayEvidence (0.00s)
+=== RUN   TestWindowPacingOpeningProbeCoversBoundedCompression
+--- PASS: TestWindowPacingOpeningProbeCoversBoundedCompression (0.00s)
+=== RUN   TestWindowPacingRetainsServiceUntilFeedbackCanReturn
+--- PASS: TestWindowPacingRetainsServiceUntilFeedbackCanReturn (0.00s)
+=== RUN   TestWindowPacingBackloggedServiceUsesSustainedDelivery
+--- PASS: TestWindowPacingBackloggedServiceUsesSustainedDelivery (0.00s)
+=== RUN   TestWindowPacingBackloggedSparseHeadsKeepTheirTime
+--- PASS: TestWindowPacingBackloggedSparseHeadsKeepTheirTime (0.00s)
+=== RUN   TestWindowPacingDrainsAQueueAtEachServiceRate
+    transfer_window_pacing_test.go:650: case: rate=125000
+    transfer_window_pacing_test.go:650: case: rate=1250000
+    transfer_window_pacing_test.go:650: case: rate=12500000
+    transfer_window_pacing_test.go:650: case: rate=125000000
+--- PASS: TestWindowPacingDrainsAQueueAtEachServiceRate (0.00s)
+=== RUN   TestWindowPacingBacklogProbeAndCanceledOwnership
+--- PASS: TestWindowPacingBacklogProbeAndCanceledOwnership (0.00s)
+=== RUN   TestWindowPacingCreditsTheFirstWireEnvelope
+--- PASS: TestWindowPacingCreditsTheFirstWireEnvelope (0.00s)
+=== RUN   TestWindowPacingUsesDeliveryBeforeTheConfiguredTarget
+--- PASS: TestWindowPacingUsesDeliveryBeforeTheConfiguredTarget (0.00s)
+=== RUN   TestWindowPacingServiceMeasurementExcludesWindowIdleAndExpires
+--- PASS: TestWindowPacingServiceMeasurementExcludesWindowIdleAndExpires (0.00s)
+=== RUN   TestWindowBurstPacingBoundsBusyAndIdleWrites
+--- PASS: TestWindowBurstPacingBoundsBusyAndIdleWrites (0.00s)
+=== RUN   TestWindowBurstPacingCancellationJoinsWait
+--- PASS: TestWindowBurstPacingCancellationJoinsWait (0.00s)
+=== RUN   TestWindowBurstPacingRetainsBoundedTimerLateness
+--- PASS: TestWindowBurstPacingRetainsBoundedTimerLateness (0.00s)
+=== RUN   TestWindowPacingRetriedTailCannotStartDrain
+--- PASS: TestWindowPacingRetriedTailCannotStartDrain (0.00s)
+=== RUN   TestWindowPacingRetriedTailWakesDrain
+--- PASS: TestWindowPacingRetriedTailWakesDrain (0.00s)
+=== RUN   TestWindowPacingInvalidatedTailCannotStartDrain
+--- PASS: TestWindowPacingInvalidatedTailCannotStartDrain (0.00s)
+=== RUN   TestWindowPacingInvalidatedTailWakesDrain
+--- PASS: TestWindowPacingInvalidatedTailWakesDrain (0.00s)
+=== RUN   TestWindowPacingUnconfirmedCarrierCannotStartDrain
+--- PASS: TestWindowPacingUnconfirmedCarrierCannotStartDrain (0.00s)
+=== RUN   TestWindowPacingUnconfirmedCarrierWakesDrain
+--- PASS: TestWindowPacingUnconfirmedCarrierWakesDrain (0.00s)
+=== RUN   TestWindowPacingCanceledTailCannotStartDrain
+--- PASS: TestWindowPacingCanceledTailCannotStartDrain (0.00s)
+=== RUN   TestWindowPacingCanceledTailWakesDrain
+--- PASS: TestWindowPacingCanceledTailWakesDrain (0.00s)
+=== RUN   TestWindowPacingFreshTailRestoresDrainedProbe
+--- PASS: TestWindowPacingFreshTailRestoresDrainedProbe (0.00s)
+=== RUN   TestWindowPacingAbortedDrainPreservesUnrelatedProbe
+--- PASS: TestWindowPacingAbortedDrainPreservesUnrelatedProbe (0.00s)
+=== RUN   TestWindowPacingRepeatedTailInvalidationAllowsFreshDrain
+--- PASS: TestWindowPacingRepeatedTailInvalidationAllowsFreshDrain (0.00s)
+=== RUN   TestWindowPacingBurstEpochFollowsActualDispatch
+--- PASS: TestWindowPacingBurstEpochFollowsActualDispatch (0.00s)
+=== RUN   TestWindowPacingChangedEstimateRetainsActualBurstCharge
+--- PASS: TestWindowPacingChangedEstimateRetainsActualBurstCharge (0.00s)
+=== RUN   TestWindowPacingBurstMeterEstimateRoundTripRetainsOnlyRealDebt
+--- PASS: TestWindowPacingBurstMeterEstimateRoundTripRetainsOnlyRealDebt (0.00s)
+=== RUN   TestWindowPacingDecreasedEstimateCannotForgiveALateRelease
+--- PASS: TestWindowPacingDecreasedEstimateCannotForgiveALateRelease (0.00s)
+=== RUN   TestWindowPacingWaitingWritersKeepReservationOrder
+--- PASS: TestWindowPacingWaitingWritersKeepReservationOrder (0.00s)
+=== RUN   TestWindowPacingCanceledWaitersPreserveTheirSuccessors
+--- PASS: TestWindowPacingCanceledWaitersPreserveTheirSuccessors (0.00s)
+=== RUN   TestWindowPacingBurstAccountsFullLargeMessages
+--- PASS: TestWindowPacingBurstAccountsFullLargeMessages (0.00s)
+=== RUN   TestWindowPacingWaitingRetryRetainsMessageFloor
+--- PASS: TestWindowPacingWaitingRetryRetainsMessageFloor (0.00s)
+=== RUN   TestWindowPacingSerializationCannotOverflow
+--- PASS: TestWindowPacingSerializationCannotOverflow (0.00s)
+=== RUN   TestWindowPacingBurstMeterCreditAndEstimateChanges
+--- PASS: TestWindowPacingBurstMeterCreditAndEstimateChanges (0.00s)
+=== RUN   TestWindowPacingBurstMeterOutOfOrderUpdates
+--- PASS: TestWindowPacingBurstMeterOutOfOrderUpdates (0.00s)
+=== RUN   TestWindowPacingBurstTimeBoundCannotOverflow
+--- PASS: TestWindowPacingBurstTimeBoundCannotOverflow (0.00s)
+=== RUN   TestWindowPacingBurstBytesUseTheServiceEstimate
+--- PASS: TestWindowPacingBurstBytesUseTheServiceEstimate (0.00s)
+=== RUN   TestWindowPacingCancellationDuringTimerDispatch
+--- PASS: TestWindowPacingCancellationDuringTimerDispatch (0.00s)
+=== RUN   TestWindowPacingBurstLimitsAreIndependent
+--- PASS: TestWindowPacingBurstLimitsAreIndependent (0.00s)
+=== RUN   TestWindowPacingBurstEstimateChanges
+--- PASS: TestWindowPacingBurstEstimateChanges (0.00s)
+=== RUN   TestWindowPacingSharedBurstsBoundActualDispatch
+--- PASS: TestWindowPacingSharedBurstsBoundActualDispatch (0.01s)
+=== RUN   TestWindowPacingDelayedWakeKeepsService
+    transfer_window_pacing_wakeup_test.go:455: wake delay=1ms service fraction=0.999
+    transfer_window_pacing_wakeup_test.go:455: wake delay=3ms service fraction=0.997
+--- PASS: TestWindowPacingDelayedWakeKeepsService (0.06s)
+=== RUN   TestWindowPacingLifetimeWorkerExpiresBehindFifoHead
+--- PASS: TestWindowPacingLifetimeWorkerExpiresBehindFifoHead (0.00s)
+=== RUN   TestWindowPacingLifetimeWorkerExpiresInsideControlledDrain
+--- PASS: TestWindowPacingLifetimeWorkerExpiresInsideControlledDrain (0.00s)
+=== RUN   TestWindowPacingLifetimeWorkerRejectsLateTimerRelease
+--- PASS: TestWindowPacingLifetimeWorkerRejectsLateTimerRelease (0.00s)
+=== RUN   TestWindowPacingLifetimeWorkerPreservesCancellation
+--- PASS: TestWindowPacingLifetimeWorkerPreservesCancellation (0.00s)
+=== RUN   TestWindowPacingLifetimeBoundsRetryWait
+--- PASS: TestWindowPacingLifetimeBoundsRetryWait (0.00s)
+=== RUN   TestWindowPacingLifetimeWaitPreservesOlderRecordDeadline
+--- PASS: TestWindowPacingLifetimeWaitPreservesOlderRecordDeadline (0.00s)
+=== RUN   TestWindowPacingPartialFeedbackGapPreservesEstablishedService
+--- PASS: TestWindowPacingPartialFeedbackGapPreservesEstablishedService (0.00s)
+=== RUN   TestTheThreePeerBranchesHaveDifferentPermissionCeilings
+    transfer_window_peer_branches_test.go:55: windows silent=327680 legacy=2097152 advertised=2097152; ceilings=327680/2097152/4194304; initial=2097152 blind=327680
+--- PASS: TestTheThreePeerBranchesHaveDifferentPermissionCeilings (0.00s)
+=== RUN   TestALegacyAcknowledgementCannotOverwriteAnAdvertisement
+--- PASS: TestALegacyAcknowledgementCannotOverwriteAnAdvertisement (0.00s)
+=== RUN   TestWindowPerformanceRejectsSlowCandidate
+--- PASS: TestWindowPerformanceRejectsSlowCandidate (0.00s)
+=== RUN   TestWindowPerformanceCappedFixtureCannotHideRegression
+--- PASS: TestWindowPerformanceCappedFixtureCannotHideRegression (0.00s)
+=== RUN   TestWindowPerformanceDriftCannotEraseSlowReading
+--- PASS: TestWindowPerformanceDriftCannotEraseSlowReading (0.00s)
+=== RUN   TestWindowPerformanceChecksMatchedControlsIndependently
+--- PASS: TestWindowPerformanceChecksMatchedControlsIndependently (0.00s)
+=== RUN   TestWindowPerformanceRejectsDeliveryLossAndStalls
+--- PASS: TestWindowPerformanceRejectsDeliveryLossAndStalls (0.00s)
+=== RUN   TestWindowPerformanceAcceptsItsDeclaredMargin
+--- PASS: TestWindowPerformanceAcceptsItsDeclaredMargin (0.00s)
+=== RUN   TestWindowPerformanceMissingControlsStayInconclusive
+--- PASS: TestWindowPerformanceMissingControlsStayInconclusive (0.00s)
+=== RUN   TestWindowPacingOrdinaryRecoveryStartsAtPhysicalWrite
+    transfer_window_physical_anchor_test.go:92: offer=0s physical=600ms scheduled-retry=900ms configured-rto=300ms
+--- PASS: TestWindowPacingOrdinaryRecoveryStartsAtPhysicalWrite (0.00s)
+=== RUN   TestAdvertisementRaisesPermissionWithoutLearningCapacity
+    transfer_window_properties_test.go:75: blind 327680, then advertised 4194304 gives window 2097152 ceiling 4194304 reason "no round trip samples"
+--- PASS: TestAdvertisementRaisesPermissionWithoutLearningCapacity (0.00s)
+=== RUN   TestDeliveryCandidatesRequireFreshPermissionHistory
+    transfer_window_properties_test.go:112: with delivery from before the step: window 2097152, reason "retained window"
+    transfer_window_properties_test.go:132: with delivery from after the step: window 2097152 candidate 262144 reason "retained window"
+--- PASS: TestDeliveryCandidatesRequireFreshPermissionHistory (0.00s)
+=== RUN   TestWindowPacingReceiverBaselineReadDoesNotUseFutureObservation
+--- PASS: TestWindowPacingReceiverBaselineReadDoesNotUseFutureObservation (0.00s)
+=== RUN   TestWindowPacingReceiverBaselineLateProbeKeepsNewerEvidence
+--- PASS: TestWindowPacingReceiverBaselineLateProbeKeepsNewerEvidence (0.00s)
+=== RUN   TestWindowPacingReceiverBaselineExpiredMetadataKeepsRawFallbackExplicit
+--- PASS: TestWindowPacingReceiverBaselineExpiredMetadataKeepsRawFallbackExplicit (0.00s)
+=== RUN   TestWindowPacingReceiverTimingConfirmedProbeRefreshesBaseline
+    transfer_window_receiver_baseline_probe_test.go:55: ACK-before-write=false succeeds=false baseline=300µs want=300µs
+    transfer_window_receiver_baseline_probe_test.go:55: ACK-before-write=false succeeds=true baseline=1.2s want=1.2s
+    transfer_window_receiver_baseline_probe_test.go:55: ACK-before-write=true succeeds=false baseline=300µs want=300µs
+    transfer_window_receiver_baseline_probe_test.go:55: ACK-before-write=true succeeds=true baseline=1.2s want=1.2s
+--- PASS: TestWindowPacingReceiverTimingConfirmedProbeRefreshesBaseline (0.00s)
+=== RUN   TestWindowPacingReceiverTimingQueueStillPermitsDrainProbe
+--- PASS: TestWindowPacingReceiverTimingQueueStillPermitsDrainProbe (0.00s)
+=== RUN   TestWindowPacingReceiverTimingCoveringHeadCannotSupplyProbeDelay
+--- PASS: TestWindowPacingReceiverTimingCoveringHeadCannotSupplyProbeDelay (0.00s)
+=== RUN   TestWindowPacingReceiverTimingQueuedExpiryDoesNotGrowBurst
+    transfer_window_receiver_baseline_probe_test.go:153: age=false baseline=300µs observed=650.3ms residence=660.3ms rate=12500000 paced=11875000 burst=125000 interval=10ms
+    transfer_window_receiver_baseline_probe_test.go:153: age=true baseline=300µs observed=650.3ms residence=660.3ms rate=12500000 paced=11875000 burst=125000 interval=10ms
+--- PASS: TestWindowPacingReceiverTimingQueuedExpiryDoesNotGrowBurst (0.00s)
+=== RUN   TestWindowPacingReceiverTimingFollowsCurrentCarrier
+    transfer_window_receiver_carrier_test.go:60: mixed=true network=100ms residence=110ms window=2097152
+    transfer_window_receiver_carrier_test.go:60: mixed=false network=100ms residence=110ms window=2097152
+--- PASS: TestWindowPacingReceiverTimingFollowsCurrentCarrier (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix
+--- PASS: TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedIngressPrefixControl
+--- PASS: TestWindowPacingReceiverOrderedIngressPrefixControl (0.00s)
+=== RUN   TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock
+--- PASS: TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock (0.00s)
+=== RUN   TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming
+--- PASS: TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming (0.00s)
+=== RUN   TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo
+--- PASS: TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo (0.00s)
+=== RUN   TestWindowPacingReceiverTimingQueueRetirementDoesNotRepriceBytes
+    transfer_window_receiver_queue_retirement_test.go:39: same delivered=12625000/12625000 service=12500000->12500000 backlog=true->true paced=11875000 ring=128
+--- PASS: TestWindowPacingReceiverTimingQueueRetirementDoesNotRepriceBytes (0.00s)
+=== RUN   TestWindowPacingReceiverTimingPinsCompressionToItsSample
+--- PASS: TestWindowPacingReceiverTimingPinsCompressionToItsSample (0.00s)
+=== RUN   TestWindowPacingReceiverTimingExpiresWithoutModeState
+--- PASS: TestWindowPacingReceiverTimingExpiresWithoutModeState (0.00s)
+=== RUN   TestWindowPacingReceiverTimingAgesDuringContinuousLegacyFeedback
+--- PASS: TestWindowPacingReceiverTimingAgesDuringContinuousLegacyFeedback (0.00s)
+=== RUN   TestWindowPacingReceiverTimingValidatesPairsAndSaturates
+--- PASS: TestWindowPacingReceiverTimingValidatesPairsAndSaturates (0.00s)
+=== RUN   TestWindowPacingReceiverTimingHasFixedStorageAndNoHotAllocations
+    transfer_window_receiver_rtt_adjacent_test.go:128: service=5752 history=112 sample=32 ring=4096 sendItem=584 sequenceAck=96
+--- PASS: TestWindowPacingReceiverTimingHasFixedStorageAndNoHotAllocations (0.02s)
+=== RUN   TestWindowPacingReceiverTimingExpiryRestoresLegacyDrain
+--- PASS: TestWindowPacingReceiverTimingExpiryRestoresLegacyDrain (0.00s)
+=== RUN   TestWindowPacingReceiverTimingOwnsWindowResidence
+    transfer_window_receiver_rtt_test.go:40: compression raw=10.3ms adjusted=300µs effective=10.3ms window=2097152
+    transfer_window_receiver_rtt_test.go:40: application raw=25.3ms adjusted=300µs effective=25.3ms window=2097152
+    transfer_window_receiver_rtt_test.go:40: combined raw=25.3ms adjusted=300µs effective=25.3ms window=2097152
+    transfer_window_receiver_rtt_test.go:40: early head raw=5.3ms adjusted=300µs effective=10.3ms window=2097152
+--- PASS: TestWindowPacingReceiverTimingOwnsWindowResidence (0.00s)
+=== RUN   TestWindowPacingReceiverTimingRetiresOldMinimum
+--- PASS: TestWindowPacingReceiverTimingRetiresOldMinimum (0.00s)
+=== RUN   TestWindowPacingReceiverTimingSeparatesQueueEvidence
+--- PASS: TestWindowPacingReceiverTimingSeparatesQueueEvidence (0.00s)
+=== RUN   TestWindowPacingReceiverTimingSurvivesRawProbe
+--- PASS: TestWindowPacingReceiverTimingSurvivesRawProbe (0.00s)
+=== RUN   TestWindowPacingReceiverTimingRejectsStaleApplication
+--- PASS: TestWindowPacingReceiverTimingRejectsStaleApplication (0.00s)
+=== RUN   TestWindowPacingReceiverTimingNeedsNoRawDrain
+--- PASS: TestWindowPacingReceiverTimingNeedsNoRawDrain (0.00s)
+=== RUN   TestWindowPacingReceiverTimingReachesUnsampledSibling
+--- PASS: TestWindowPacingReceiverTimingReachesUnsampledSibling (0.00s)
+=== RUN   TestWindowPacingPhysicalDeadlineKeepsOlderRecoveryFirst
+    transfer_window_recovery_heap_test.go:108: at=600ms first=0/500ms last=1/900ms retained=2/2756
+--- PASS: TestWindowPacingPhysicalDeadlineKeepsOlderRecoveryFirst (0.00s)
+=== RUN   TestWindowPacingPhysicalRecoveryKeepsMonotonicClock
+--- PASS: TestWindowPacingPhysicalRecoveryKeepsMonotonicClock (0.00s)
+=== RUN   TestWindowPacingSharedRawResidencePreservesProvenEndpointLoss
+    transfer_window_recovery_proven_loss_test.go:127: proof=100ms local-rto=300ms shared-raw=1.2s scheduled=300ms
+--- PASS: TestWindowPacingSharedRawResidencePreservesProvenEndpointLoss (0.00s)
+=== RUN   TestWindowPacingWindowProofPreservesHardBoundsAndRetainedCapacity
+--- PASS: TestWindowPacingWindowProofPreservesHardBoundsAndRetainedCapacity (0.00s)
+=== RUN   TestWindowPacingWindowProofAcceptsFreshSlowDeliveryWithoutShrinking
+--- PASS: TestWindowPacingWindowProofAcceptsFreshSlowDeliveryWithoutShrinking (0.00s)
+=== RUN   TestWindowPacingWindowProofWaitsForPhysicalConfirmation
+--- PASS: TestWindowPacingWindowProofWaitsForPhysicalConfirmation (0.00s)
+=== RUN   TestWindowPacingWindowProofIgnoresLowerPath
+--- PASS: TestWindowPacingWindowProofIgnoresLowerPath (0.00s)
+=== RUN   TestWindowPacingWindowProofRejectsDelayedOldAck
+--- PASS: TestWindowPacingWindowProofRejectsDelayedOldAck (0.00s)
+=== RUN   TestWindowPacingWindowProofPreservesOtherCarrierHistory
+--- PASS: TestWindowPacingWindowProofPreservesOtherCarrierHistory (0.00s)
+=== RUN   TestWindowPacingWindowProofKeepsNewerShortObservation
+    transfer_window_refill_order_test.go:44: smaller current-floor=100µs proof-step=0 want-step=0
+    transfer_window_refill_order_test.go:44: equal old current-floor=300µs proof-step=0 want-step=0
+    transfer_window_refill_order_test.go:44: equal probe current-floor=1.2s proof-step=946684812784000000 want-step=946684812784000000
+    transfer_window_refill_order_test.go:44: larger current-floor=1.2s proof-step=946684817046000000 want-step=946684817046000000
+--- PASS: TestWindowPacingWindowProofKeepsNewerShortObservation (0.00s)
+=== RUN   TestWindowPacingWindowProofFirstUnknownSampleHasNoOldGeneration
+--- PASS: TestWindowPacingWindowProofFirstUnknownSampleHasNoOldGeneration (0.00s)
+=== RUN   TestWindowPacingWindowProofConsumedOnce
+--- PASS: TestWindowPacingWindowProofConsumedOnce (0.00s)
+=== RUN   TestWindowPacingNewPathProofRequiresFreshCumulativeDelivery
+    transfer_window_refill_proof_test.go:115: metadata=false lanes=1 lane=0 window=30500000 ceiling=50331648 delivered=200704 span=2.45s residence=1.22s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=false lanes=8 lane=0 window=30500000 ceiling=48496640 delivered=200704 span=2.45s residence=1.22s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=false lanes=8 lane=1 window=30500000 ceiling=48496640 delivered=200704 span=2.45s residence=1.22s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=false lanes=8 lane=2 window=30500000 ceiling=48496640 delivered=200704 span=2.45s residence=1.22s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=false lanes=8 lane=3 window=30500000 ceiling=48496640 delivered=200704 span=2.45s residence=1.22s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=false lanes=8 lane=4 window=30500000 ceiling=48496640 delivered=200704 span=2.45s residence=1.22s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=false lanes=8 lane=5 window=30500000 ceiling=48496640 delivered=200704 span=2.45s residence=1.22s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=false lanes=8 lane=6 window=30500000 ceiling=48496640 delivered=200704 span=2.45s residence=1.22s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=false lanes=8 lane=7 window=30500000 ceiling=48496640 delivered=200704 span=2.45s residence=1.22s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=true lanes=1 lane=0 window=30250000 ceiling=50331648 delivered=200704 span=2.45s residence=1.21s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=true lanes=8 lane=0 window=30250000 ceiling=48496640 delivered=200704 span=2.45s residence=1.21s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=true lanes=8 lane=1 window=30250000 ceiling=48496640 delivered=200704 span=2.45s residence=1.21s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=true lanes=8 lane=2 window=30250000 ceiling=48496640 delivered=200704 span=2.45s residence=1.21s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=true lanes=8 lane=3 window=30250000 ceiling=48496640 delivered=200704 span=2.45s residence=1.21s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=true lanes=8 lane=4 window=30250000 ceiling=48496640 delivered=200704 span=2.45s residence=1.21s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=true lanes=8 lane=5 window=30250000 ceiling=48496640 delivered=200704 span=2.45s residence=1.21s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=true lanes=8 lane=6 window=30250000 ceiling=48496640 delivered=200704 span=2.45s residence=1.21s reason="measured service"
+    transfer_window_refill_proof_test.go:115: metadata=true lanes=8 lane=7 window=30250000 ceiling=48496640 delivered=200704 span=2.45s residence=1.21s reason="measured service"
+--- PASS: TestWindowPacingNewPathProofRequiresFreshCumulativeDelivery (0.01s)
+=== RUN   TestWindowPacingQueuedPathObservationKeepsDeliveryCandidate
+--- PASS: TestWindowPacingQueuedPathObservationKeepsDeliveryCandidate (0.00s)
+=== RUN   TestAckCompressionAdvertisementPreservesPresence
+--- PASS: TestAckCompressionAdvertisementPreservesPresence (0.00s)
+=== RUN   TestWindowTargetIncludesAcknowledgementResidence
+--- PASS: TestWindowTargetIncludesAcknowledgementResidence (0.00s)
+=== RUN   TestWindowDeliveryIncludesAcknowledgementResidence
+--- PASS: TestWindowDeliveryIncludesAcknowledgementResidence (0.00s)
+=== RUN   TestDeliveryRateUsesCheckpointTimes
+--- PASS: TestDeliveryRateUsesCheckpointTimes (0.00s)
+=== RUN   TestDeliveryRateWaitsForWholeHorizon
+--- PASS: TestDeliveryRateWaitsForWholeHorizon (0.00s)
+=== RUN   TestDeliveryRateHistoryCoversDesignRoundTrip
+--- PASS: TestDeliveryRateHistoryCoversDesignRoundTrip (0.00s)
+=== RUN   TestWindowDeliveryLargeResidenceDoesNotOverflow
+--- PASS: TestWindowDeliveryLargeResidenceDoesNotOverflow (0.00s)
+=== RUN   TestWindowRetainedMeasuredServiceCanGrowConstrainedFlight
+--- PASS: TestWindowRetainedMeasuredServiceCanGrowConstrainedFlight (0.01s)
+=== RUN   TestWindowRetainedSingleReplyCannotAuthorizeServiceGrowth
+--- PASS: TestWindowRetainedSingleReplyCannotAuthorizeServiceGrowth (0.00s)
+=== RUN   TestWindowRetainedCampaignAcceptsServiceQualification
+--- PASS: TestWindowRetainedCampaignAcceptsServiceQualification (0.00s)
+=== RUN   TestWindowRetainedServiceGrowthReportsHardBound
+--- PASS: TestWindowRetainedServiceGrowthReportsHardBound (0.04s)
+=== RUN   TestWindowRetainedServiceGrowthReportsTargetBound
+--- PASS: TestWindowRetainedServiceGrowthReportsTargetBound (0.01s)
+=== RUN   TestWindowRetainedServiceGrowthReportsServiceBelowBounds
+--- PASS: TestWindowRetainedServiceGrowthReportsServiceBelowBounds (0.01s)
+=== RUN   TestWindowRetainedSharedServiceCannotGrowOtherCarriers
+--- PASS: TestWindowRetainedSharedServiceCannotGrowOtherCarriers (0.01s)
+=== RUN   TestWindowRetainedSharedServiceGrowsH1Sibling
+--- PASS: TestWindowRetainedSharedServiceGrowsH1Sibling (0.01s)
+=== RUN   TestWindowRetainedLocalServiceCanGrowWithoutH1Policy
+--- PASS: TestWindowRetainedLocalServiceCanGrowWithoutH1Policy (0.00s)
+=== RUN   TestWindowRetainedAdvertisementDoesNotLearnMaximum
+--- PASS: TestWindowRetainedAdvertisementDoesNotLearnMaximum (0.00s)
+=== RUN   TestWindowRetainedSlowFeedbackLowersPacingOnly
+--- PASS: TestWindowRetainedSlowFeedbackLowersPacingOnly (0.00s)
+=== RUN   TestWindowRetainedHardBoundsPreserveLearnedCapacity
+--- PASS: TestWindowRetainedHardBoundsPreserveLearnedCapacity (0.00s)
+=== RUN   TestWindowRetainedTargetChangeDoesNotShrink
+--- PASS: TestWindowRetainedTargetChangeDoesNotShrink (0.00s)
+=== RUN   TestWindowRetainedMissingEvidenceHoldsCapacity
+--- PASS: TestWindowRetainedMissingEvidenceHoldsCapacity (0.00s)
+=== RUN   TestWindowRetainedStatisticsCannotLearnCapacity
+--- PASS: TestWindowRetainedStatisticsCannotLearnCapacity (0.00s)
+=== RUN   TestWindowRetainedTargetMetadataNamesActualBound
+--- PASS: TestWindowRetainedTargetMetadataNamesActualBound (0.00s)
+=== RUN   TestWindowRetainedTargetMetadataNeedsQualifiedDelivery
+--- PASS: TestWindowRetainedTargetMetadataNeedsQualifiedDelivery (0.00s)
+=== RUN   TestWindowRetainedTargetMetadataReportsQualifiedBound
+--- PASS: TestWindowRetainedTargetMetadataReportsQualifiedBound (0.00s)
+=== RUN   TestWindowPacingRetryPhysicalClockKeepsMaximum
+--- PASS: TestWindowPacingRetryPhysicalClockKeepsMaximum (0.00s)
+=== RUN   TestWindowPacingRetryPhysicalClockKeepsAckLifetime
+--- PASS: TestWindowPacingRetryPhysicalClockKeepsAckLifetime (0.00s)
+=== RUN   TestWindowPacingUnpacedRetryIgnoresPreviousWaiter
+--- PASS: TestWindowPacingUnpacedRetryIgnoresPreviousWaiter (0.00s)
+=== RUN   TestWindowPacingFailedRetryIgnoresWaiter
+--- PASS: TestWindowPacingFailedRetryIgnoresWaiter (0.00s)
+=== RUN   TestWindowPacingChangedCarrierRetryIgnoresH1Waiter
+    transfer_window_retry_physical_adjacent_test.go:261: physical=1.2s deadline=900ms due=1.2s changed=true unreliable=false
+    transfer_window_retry_physical_adjacent_test.go:261: physical=1.2s deadline=900ms due=1.2s changed=true unreliable=true
+--- PASS: TestWindowPacingChangedCarrierRetryIgnoresH1Waiter (0.00s)
+=== RUN   TestWindowPacingRetryPhysicalWaitCancellation
+--- PASS: TestWindowPacingRetryPhysicalWaitCancellation (0.00s)
+=== RUN   TestWindowPacingRetryStartsItsNextRecoveryAtPhysicalWrite
+    transfer_window_retry_physical_time_test.go:128: first-retry-due=300ms first-retry-physical=1.2s next-deadline=1.8s next-firing=1.8s copies=2
+--- PASS: TestWindowPacingRetryStartsItsNextRecoveryAtPhysicalWrite (0.00s)
+=== RUN   TestWindowPacingSdkInitialAckBeforeWriteConfirmation
+--- PASS: TestWindowPacingSdkInitialAckBeforeWriteConfirmation (0.00s)
+=== RUN   TestWindowPacingSdkInitialDelayedOpeningAccounting
+--- PASS: TestWindowPacingSdkInitialDelayedOpeningAccounting (0.00s)
+=== RUN   TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain
+--- PASS: TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain (0.00s)
+=== RUN   TestWindowPacingSdkInitialUnreadPairPreservesService
+--- PASS: TestWindowPacingSdkInitialUnreadPairPreservesService (0.00s)
+=== RUN   TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence
+--- PASS: TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence (0.00s)
+=== RUN   TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService
+    transfer_window_sdk_initial_service_test.go:128: opening=328656 ack=405ms resumed=1384 ack=805.011072ms service=0 next-write-wait=0s
+--- PASS: TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService (0.00s)
+=== RUN   TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSdkInitialFreshPairDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialFreshPairDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded
+--- PASS: TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded (0.00s)
+=== RUN   TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound
+--- PASS: TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound (0.00s)
+=== RUN   TestWindowPacingSdkColdEqualWaitsDiscoverSlowService
+--- PASS: TestWindowPacingSdkColdEqualWaitsDiscoverSlowService (0.00s)
+=== RUN   TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks
+--- PASS: TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks (0.00s)
+=== RUN   TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured
+--- PASS: TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured (0.00s)
+=== RUN   TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:0 serviceRate:0 pacingRate:147928994 initialBurst:1479289 resultBurst:1479289 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:0 serviceRate:0 pacingRate:147928994 initialBurst:1479289 resultBurst:1479289 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved (0.02s)
+=== RUN   TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=false evidence={physicalRate:12500000 priorRate:0 serviceRate:12500000 pacingRate:147928994 initialBurst:1479289 resultBurst:125000 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:0 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity (0.01s)
+=== RUN   TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization
+--- PASS: TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization (0.00s)
+=== RUN   TestWindowPacingServiceAckArrivalPrecedesPausedWorker
+--- PASS: TestWindowPacingServiceAckArrivalPrecedesPausedWorker (0.00s)
+=== RUN   TestWindowPacingServiceSelectiveArrivalPrecedesPausedWorker
+--- PASS: TestWindowPacingServiceSelectiveArrivalPrecedesPausedWorker (0.00s)
+=== RUN   TestWindowPacingServiceAckArrivalThenCancelBalancesOwnership
+--- PASS: TestWindowPacingServiceAckArrivalThenCancelBalancesOwnership (0.00s)
+=== RUN   TestWindowPacingServiceCreditDeduplicatesHeadAndSelective
+--- PASS: TestWindowPacingServiceCreditDeduplicatesHeadAndSelective (0.00s)
+=== RUN   TestWindowPacingServiceCreditWorkerFillsRemovedRetry
+--- PASS: TestWindowPacingServiceCreditWorkerFillsRemovedRetry (0.00s)
+=== RUN   TestWindowPacingServiceCreditBoundsSparseAndMaximumHeads
+--- PASS: TestWindowPacingServiceCreditBoundsSparseAndMaximumHeads (0.00s)
+=== RUN   TestWindowPacingServiceCreditCloseRejectsLatePublication
+--- PASS: TestWindowPacingServiceCreditCloseRejectsLatePublication (0.00s)
+=== RUN   TestWindowPacingServiceCreditRetainsEarliestPhysicalOffer
+--- PASS: TestWindowPacingServiceCreditRetainsEarliestPhysicalOffer (0.00s)
+=== RUN   TestWindowPacingShortCompressedServiceKeepsMeasuredCapacity
+    transfer_window_service_failure_cells_test.go:29: service-reading {"Cell":{"CalibrationWindow":0,"SendWindow":0,"ReceiveWindow":0,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":false,"TcpBufferMax":0,"Arm":"ceiling","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":50000000,"Flows":1,"RoundRobinOffer":true,"Lanes":0,"Payload":1280,"Budget":50331648,"Drop":false,"Rate":1250000,"RateAfter":0,"RateChangeAfter":0,"Warmup":3356943200,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":3.3569432,"Seconds":1,"Bytes":1198080,"Mbps":9.58464,"MinFlowMbps":9.58464,"IntervalMbps":[9.58464],"DirectionMbps":[9.58464],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":3141,"MaxRelayQueuedBytes":8389611,"Recovery":{"InitialWriteCount":5125,"InitialFrameCount":10250,"InitialMessageByteCount":13120000,"TimeoutResendWriteCount":183,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":5276,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":88,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":5459,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":49146400,"RouteRetainedItemCount":3293,"ReliableLaneLongestAckGap":51283200,"ReliableLaneStallOnsetInterval":354000000,"ReliableLaneStallOnsetOutstanding":3270,"ReliableLaneStallOnsetOffset":352619600,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2671,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":88,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":88},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":0,"PackHandoffMaxByteCount":0,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":0,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":null,"AckRouteWriteWaitByTransport":null,"AckRouteWriteTimeoutByTransport":null},"Window":{"Window":50331648,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":50331648,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+    transfer_window_service_failure_cells_test.go:29: service-reading {"Cell":{"CalibrationWindow":0,"SendWindow":0,"ReceiveWindow":0,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":false,"TcpBufferMax":0,"Arm":"delivery","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":50000000,"Flows":1,"RoundRobinOffer":true,"Lanes":0,"Payload":1280,"Budget":50331648,"Drop":true,"Rate":1250000,"RateAfter":0,"RateChangeAfter":0,"Warmup":3356943200,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":3.3569432,"Seconds":1,"Bytes":1198080,"Mbps":9.58464,"MinFlowMbps":9.58464,"IntervalMbps":[9.58464],"DirectionMbps":[9.58464],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":782,"MaxRelayQueuedBytes":2088722,"Recovery":{"InitialWriteCount":2740,"InitialFrameCount":5480,"InitialMessageByteCount":7014400,"TimeoutResendWriteCount":0,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":0,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":89,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":0,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":45766580,"RouteRetainedItemCount":784,"ReliableLaneLongestAckGap":1634423200,"ReliableLaneStallOnsetInterval":0,"ReliableLaneStallOnsetOutstanding":0,"ReliableLaneStallOnsetOffset":0,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2671,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":89,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":89},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":0,"PackHandoffMaxByteCount":0,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":0,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":null,"AckRouteWriteWaitByTransport":null,"AckRouteWriteTimeoutByTransport":null},"Window":{"Window":2097152,"LearnedWindow":2097152,"CandidateWindow":262144,"Sized":true,"Reason":"retained window","ServiceSized":true,"DeliveredByteCount":186970,"Interval":150000000,"RoundTrip":2436000,"WindowRoundTrip":52436000,"AckCompressTimeout":50000000,"SampleCount":56,"Initial":2097152,"Floor":262144,"Ceiling":50331648,"Obtainable":50593792,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":1246466,"ServiceByteRate":1255370,"PacingByteRate":1192601,"ServiceEstablished":true,"ServiceBacklogged":true,"PacingProbeByteRate":147928994,"PacingProbeByteCount":4194304,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+    transfer_window_service_failure_cells_test.go:29: service-reading {"Cell":{"CalibrationWindow":0,"SendWindow":0,"ReceiveWindow":0,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":false,"TcpBufferMax":0,"Arm":"ceiling","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":50000000,"Flows":8,"RoundRobinOffer":true,"Lanes":0,"Payload":1280,"Budget":50331648,"Drop":false,"Rate":1250000,"RateAfter":0,"RateChangeAfter":0,"Warmup":3356943200,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":3.3569432,"Seconds":1,"Bytes":1198080,"Mbps":9.58464,"MinFlowMbps":1.19808,"IntervalMbps":[9.58464],"DirectionMbps":[9.58464],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":3141,"MaxRelayQueuedBytes":8389611,"Recovery":{"InitialWriteCount":5125,"InitialFrameCount":10250,"InitialMessageByteCount":13120000,"TimeoutResendWriteCount":183,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":5276,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":88,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":5459,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":49146400,"RouteRetainedItemCount":3293,"ReliableLaneLongestAckGap":51283200,"ReliableLaneStallOnsetInterval":354000000,"ReliableLaneStallOnsetOutstanding":3270,"ReliableLaneStallOnsetOffset":352619600,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2671,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":88,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":88},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":0,"PackHandoffMaxByteCount":0,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":0,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":null,"AckRouteWriteWaitByTransport":null,"AckRouteWriteTimeoutByTransport":null},"Window":{"Window":50331648,"LearnedWindow":0,"CandidateWindow":0,"Sized":false,"Reason":"the rule is off","ServiceSized":false,"DeliveredByteCount":0,"Interval":0,"RoundTrip":0,"WindowRoundTrip":0,"AckCompressTimeout":0,"SampleCount":0,"Initial":50331648,"Floor":262144,"Ceiling":0,"Obtainable":0,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":0,"ServiceByteRate":0,"PacingByteRate":0,"ServiceEstablished":false,"ServiceBacklogged":false,"PacingProbeByteRate":0,"PacingProbeByteCount":0,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+    transfer_window_service_failure_cells_test.go:29: service-reading {"Cell":{"CalibrationWindow":0,"SendWindow":0,"ReceiveWindow":0,"ReceiveWindowAfter":0,"WindowChangeAfter":0,"Tcp":false,"Upload":false,"TcpBufferMax":0,"Arm":"delivery","RoundTrip":300000,"RoundTripAfter":0,"RoundTripChangeAfter":0,"Compression":50000000,"Flows":8,"RoundRobinOffer":true,"Lanes":0,"Payload":1280,"Budget":50331648,"Drop":true,"Rate":1250000,"RateAfter":0,"RateChangeAfter":0,"Warmup":3356943200,"PacingWakeDelay":0,"KnownPathRoundTrip":false},"WarmupSeconds":3.3569432,"Seconds":1,"Bytes":1198080,"Mbps":9.58464,"MinFlowMbps":1.19808,"IntervalMbps":[9.58464],"DirectionMbps":[9.58464],"RelayDrops":0,"MeasurementRelayDrops":0,"NatRefused":0,"MaxRelayQueued":782,"MaxRelayQueuedBytes":2088722,"Recovery":{"InitialWriteCount":2740,"InitialFrameCount":5480,"InitialMessageByteCount":7014400,"TimeoutResendWriteCount":0,"AckPendingResendPreemptCount":0,"TimeoutResendDeferCount":0,"CarrierChangeWriteCount":0,"CarrierChangeSelectiveAckVoidCount":0,"SendEvictionResendCount":0,"ContractAheadAnnounceCount":0,"ContractAheadAcknowledgedCount":0,"ContractAheadSwitchCount":0,"ContractAheadUnacknowledgedSwitchCount":0,"SelectiveGapWriteCount":0,"AckTailProbeWriteCount":0,"CumulativeProbeWriteCount":0,"RecoveryWriteErrorCount":0,"MissingContractWriteCount":0,"MissingContractRequestCount":0,"CompactRecoveryAckCount":89,"CompactRecoveryContractCount":0,"UnreliableFlowIsolationBypassCount":0,"UnreliableNoAckAdmissionBypassCount":0,"UnreliableFlowReserveSelectionCount":0,"UnreliableFlowReserveUseCount":0,"UnreliableFlightWaitCount":0,"UnreliableFlightWaitDuration":0,"UnreliableFlightMaximumWaitDuration":0,"UnreliableFlightGapCount":0,"UnreliableFlightTimeoutCount":0,"UnreliableFlightReductionCount":0,"UnreliableFlightMaximumByteCount":0,"UnreliableFlightMaximumLimitByteCount":0,"UnreliableFlightMaximumMessageCount":0,"UnreliableFlightMaximumMessageLimit":0,"UnreliableFlightBlockedWithReliableCapacity":0,"UnreliableFlightGapReorderSuspected":0,"TimeoutResendWithRecentCumulativeProgress":0,"SelectiveGapWritesOfDeferredItems":[0,0],"RouteGenerationChangeCount":0,"LaneProbeWriteCount":0,"LaneProbeRideCount":0,"LaneProvenTimeoutWriteCount":0,"LaneHeadPromotionCount":0,"RouteUnacknowledgedDuration":45766580,"RouteRetainedItemCount":784,"ReliableLaneLongestAckGap":1634423200,"ReliableLaneStallOnsetInterval":0,"ReliableLaneStallOnsetOutstanding":0,"ReliableLaneStallOnsetOffset":0,"ReliableAdmissionWaitCount":0,"ReliableAdmissionWaitDuration":0,"ReliableAdmissionByteLimitMinimum":0,"UnreliableCarrierLastAckAge":0},"Receiver":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":1,"PackHandoffMaxByteCount":2671,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":89,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":{"h1":89},"AckRouteWriteWaitByTransport":{"h1":0},"AckRouteWriteTimeoutByTransport":{"h1":0}},"SenderReceive":{"PackHandoffDropCount":0,"PackHandoffDropByteCount":0,"PackHandoffWaitCount":0,"PackHandoffWaitSuccess":0,"PackHandoffMaxCount":0,"PackHandoffMaxByteCount":0,"PackHandoffSaturationCount":0,"PackHandoffDepthGrowCount":0,"PackHandoffDeepenedFlows":0,"PackHandoffAdaptiveMaxDepth":0,"PackHandoffAdaptiveMaxByteCount":0,"ReceiveQueueDropCount":0,"ReceiveQueueDropByteCount":0,"ReceiveQueueEvictionCount":0,"ReceiveQueueEvictionByteCount":0,"ReceiveQueueTentativeEvictionCount":0,"ReceiveQueueTentativeEvictionByteCount":0,"ReceiveQueueCommitCount":0,"SendNoAckOfferedCount":0,"SendNoAckWriteCount":0,"SendNoAckRefusedCount":0,"SendNoAckDiscardCount":0,"SendNoAckFastPathWriteCount":0,"SendPackDeadlineDropCount":0,"ResendQueueUnackedItemCount":0,"ReceiveQueueEvictionNoticeOverflow":0,"SendEvictionResendCount":0,"AckHandoffDropCount":0,"AckHandoffQueueFullCount":0,"AckHandoffMissCount":0,"AckHandoffWaitCount":0,"AckHandoffWaitSuccess":0,"AckRouteWriteCount":0,"AckRoutePriorityWriteCount":0,"AckRouteWriteBlockedCount":0,"AckRouteWriteErrorCount":0,"AckRouteWriteWaitDuration":0,"AckRouteWriteMaxWait":0,"AckRouteWriteCountByTransport":null,"AckRouteWriteWaitByTransport":null,"AckRouteWriteTimeoutByTransport":null},"Window":{"Window":2097152,"LearnedWindow":2097152,"CandidateWindow":262144,"Sized":true,"Reason":"retained window","ServiceSized":true,"DeliveredByteCount":186970,"Interval":150000000,"RoundTrip":2436000,"WindowRoundTrip":52436000,"AckCompressTimeout":50000000,"SampleCount":56,"Initial":2097152,"Floor":262144,"Ceiling":50331648,"Obtainable":50593792,"TargetBound":false,"CandidateTargetBound":false,"DeliveryByteRate":1246466,"ServiceByteRate":1255370,"PacingByteRate":1192601,"ServiceEstablished":true,"ServiceBacklogged":true,"PacingProbeByteRate":147928994,"PacingProbeByteCount":4194304,"PacingDiscovery":false,"PacingHeldByteRate":0}}
+--- PASS: TestWindowPacingShortCompressedServiceKeepsMeasuredCapacity (3.22s)
+=== RUN   TestWindowPacingLimitedFlightLegacyTurnUsesOwnDelay
+--- PASS: TestWindowPacingLimitedFlightLegacyTurnUsesOwnDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightReceiverHeldTurnUsesOwnDelay
+--- PASS: TestWindowPacingLimitedFlightReceiverHeldTurnUsesOwnDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightDelayedAccountingUsesArrivalDelay
+--- PASS: TestWindowPacingLimitedFlightDelayedAccountingUsesArrivalDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightMetadataAfterLegacyUsesPairedDelay
+--- PASS: TestWindowPacingLimitedFlightMetadataAfterLegacyUsesPairedDelay (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAckPhaseDoesNotCompleteService
+--- PASS: TestWindowPacingLimitedFlightAckPhaseDoesNotCompleteService (0.00s)
+=== RUN   TestWindowPacingLimitedFlightModestQueueKeepsSerialization
+--- PASS: TestWindowPacingLimitedFlightModestQueueKeepsSerialization (0.00s)
+=== RUN   TestWindowPacingFreshTrainRejectsPriorPropagationGap
+--- PASS: TestWindowPacingFreshTrainRejectsPriorPropagationGap (0.00s)
+=== RUN   TestWindowPacingFreshTrainBelowEndpointAllowanceLowersService
+--- PASS: TestWindowPacingFreshTrainBelowEndpointAllowanceLowersService (0.00s)
+=== RUN   TestWindowPacingFreshTrainSustainedSlowdownReplacesHold
+--- PASS: TestWindowPacingFreshTrainSustainedSlowdownReplacesHold (0.00s)
+=== RUN   TestWindowPathGapDeadline
+--- PASS: TestWindowPathGapDeadline (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsContinuousSlowPair
+--- PASS: TestWindowPacingLimitedFlightAcceptsContinuousSlowPair (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsQueuedSlowService
+--- PASS: TestWindowPacingLimitedFlightAcceptsQueuedSlowService (0.00s)
+=== RUN   TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts
+--- PASS: TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts (0.00s)
+=== RUN   TestWindowPacingLimitedFlightReorderedAccountingKeepsService
+--- PASS: TestWindowPacingLimitedFlightReorderedAccountingKeepsService (0.00s)
+=== RUN   TestWindowPacingCarrierPeakStaysUnqualifiedAfterQueueClears
+--- PASS: TestWindowPacingCarrierPeakStaysUnqualifiedAfterQueueClears (0.00s)
+=== RUN   TestWindowPacingCarrierFreshFastPairSupersedesRejectedPeak
+--- PASS: TestWindowPacingCarrierFreshFastPairSupersedesRejectedPeak (0.00s)
+=== RUN   TestWindowPacingCarrierSameBucketHoldEndsAtFreshTrain
+--- PASS: TestWindowPacingCarrierSameBucketHoldEndsAtFreshTrain (0.00s)
+=== RUN   TestWindowPacingCarrierLateAccountingRetainsQueueProvenance
+--- PASS: TestWindowPacingCarrierLateAccountingRetainsQueueProvenance (0.00s)
+=== RUN   TestWindowPacingCarrierSustainedQueuedIncreaseRaisesService
+--- PASS: TestWindowPacingCarrierSustainedQueuedIncreaseRaisesService (0.00s)
+=== RUN   TestWindowPacingFirstQueuedTimingAfterEpochKeepsProvenance
+--- PASS: TestWindowPacingFirstQueuedTimingAfterEpochKeepsProvenance (0.00s)
+=== RUN   TestWindowPacingPostDrainFirstBytesKeepQueueProvenance
+--- PASS: TestWindowPacingPostDrainFirstBytesKeepQueueProvenance (0.00s)
+=== RUN   TestWindowPacingColdQueuedTimingDoesNotInventDelivery
+--- PASS: TestWindowPacingColdQueuedTimingDoesNotInventDelivery (0.00s)
+=== RUN   TestWindowPacingLateQueuedTimingCannotEvictRecentDelivery
+--- PASS: TestWindowPacingLateQueuedTimingCannotEvictRecentDelivery (0.00s)
+=== RUN   TestWindowPacingOldestRetainedQueuedTimingStillQualifiesDelivery
+--- PASS: TestWindowPacingOldestRetainedQueuedTimingStillQualifiesDelivery (0.00s)
+=== RUN   TestWindowPacingReceiverWaitPreservesPhysicalSerialization
+--- PASS: TestWindowPacingReceiverWaitPreservesPhysicalSerialization (0.00s)
+=== RUN   TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization
+--- PASS: TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization
+--- PASS: TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitRefillPreservesSerialization
+--- PASS: TestWindowPacingReceiverWaitRefillPreservesSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitRefillDiscoversSlowSerialization
+--- PASS: TestWindowPacingReceiverWaitRefillDiscoversSlowSerialization (0.00s)
+=== RUN   TestTheWindowHasOneOwner
+    transfer_window_single_owner_test.go:147: window consumers: map[sendWindowEstimate:true sendWindowSnapshot:true]
+--- PASS: TestTheWindowHasOneOwner (0.01s)
+=== RUN   TestWindowPacingOrdinaryRecoveryUsesConfirmedSiblingRawResidence
+    transfer_window_stale_sibling_test.go:161: case=reply at=1.21s confirmed-shared-raw=1.21s local-raw=1ms local-scaled=300ms ordinary-physical-retries=0 probe=false
+--- PASS: TestWindowPacingOrdinaryRecoveryUsesConfirmedSiblingRawResidence (0.00s)
+=== RUN   TestWindowPacingSharedRawRecoveryHasFiniteConfiguredDeadline
+    transfer_window_stale_sibling_test.go:161: case=no reply at=1.21s confirmed-shared-raw=1.21s local-raw=1ms local-scaled=300ms ordinary-physical-retries=0 probe=false
+    transfer_window_stale_sibling_test.go:213: case=no reply maximum=4s lifetime=0s physical=900ms fixed-deadline=3.32s expired=false
+    transfer_window_stale_sibling_test.go:161: case=no reply at=1.21s confirmed-shared-raw=1.21s local-raw=1ms local-scaled=300ms ordinary-physical-retries=0 probe=false
+    transfer_window_stale_sibling_test.go:213: case=no reply maximum=600ms lifetime=0s physical=900ms fixed-deadline=1.5s expired=false
+--- PASS: TestWindowPacingSharedRawRecoveryHasFiniteConfiguredDeadline (0.00s)
+=== RUN   TestWindowPacingSharedRawRecoveryCannotExtendAckLifetime
+    transfer_window_stale_sibling_test.go:161: case=lifetime at=1.21s confirmed-shared-raw=1.21s local-raw=1ms local-scaled=300ms ordinary-physical-retries=0 probe=false
+    transfer_window_stale_sibling_test.go:213: case=lifetime maximum=0s lifetime=500ms physical=900ms fixed-deadline=1.4s expired=true
+--- PASS: TestWindowPacingSharedRawRecoveryCannotExtendAckLifetime (0.00s)
+=== RUN   TestWindowPacingDestinationStatsDoNotUpdateServiceHold
+--- PASS: TestWindowPacingDestinationStatsDoNotUpdateServiceHold (0.00s)
+=== RUN   TestWindowPacingDestinationStatsCannotRepriceConfirmedProbe
+--- PASS: TestWindowPacingDestinationStatsCannotRepriceConfirmedProbe (0.00s)
+=== RUN   TestWindowPacingDestinationStatsKeepSharedServiceEvidence
+--- PASS: TestWindowPacingDestinationStatsKeepSharedServiceEvidence (0.00s)
+=== RUN   TestWindowDestinationStatsKeepsLargestEffectiveWindow
+--- PASS: TestWindowDestinationStatsKeepsLargestEffectiveWindow (0.00s)
+=== RUN   TestWindowDestinationStatsKeepsLargestQualifiedWindow
+--- PASS: TestWindowDestinationStatsKeepsLargestQualifiedWindow (0.00s)
+=== RUN   TestWindowDestinationStatsEqualWindowsPreferCumulativeEvidence
+--- PASS: TestWindowDestinationStatsEqualWindowsPreferCumulativeEvidence (0.00s)
+=== RUN   TestWindowDestinationStatsEqualEvidenceKeepsFirstEstimate
+--- PASS: TestWindowDestinationStatsEqualEvidenceKeepsFirstEstimate (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainReadBetweenProofAndDispatch
+--- PASS: TestWindowPacingSuccessfulDrainReadBetweenProofAndDispatch (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainTimeoutAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainTimeoutAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainAbandonmentAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainAbandonmentAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialDeliveryCanRaiseService
+--- PASS: TestWindowPacingSuccessfulDrainPartialDeliveryCanRaiseService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainConfirmedProbeAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainConfirmedProbeAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainCannotRestoreRetiredCycle
+--- PASS: TestWindowPacingSuccessfulDrainCannotRestoreRetiredCycle (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialReadKeepsService
+    transfer_window_successful_drain_feedback_test.go:160: successful-drain metadata=true read=true retain=true initial=12500000 during=12500000 probe=12500000 confirmed=12500000 total=2261378 pause=602.66696ms first-read=611.17008ms resumed=1.2103s
+--- PASS: TestWindowPacingSuccessfulDrainPartialReadKeepsService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainWithoutPartialReadControl
+    transfer_window_successful_drain_feedback_test.go:169: successful-drain metadata=true read=false retain=true initial=12500000 during=12500000 probe=12500000 confirmed=12500000 total=2261378 pause=602.66696ms first-read=611.17008ms resumed=1.2103s
+--- PASS: TestWindowPacingSuccessfulDrainWithoutPartialReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialStatsReadControl
+    transfer_window_successful_drain_feedback_test.go:178: successful-drain metadata=true read=true retain=false initial=12500000 during=12500000 probe=12500000 confirmed=12500000 total=2261378 pause=602.66696ms first-read=611.17008ms resumed=1.2103s
+--- PASS: TestWindowPacingSuccessfulDrainPartialStatsReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyPartialReadKeepsService
+    transfer_window_successful_drain_feedback_test.go:187: successful-drain metadata=false read=true retain=true initial=12500000 during=12500000 probe=12500000 confirmed=12500000 total=2261378 pause=602.66696ms first-read=611.17008ms resumed=1.2103s
+--- PASS: TestWindowPacingSuccessfulDrainLegacyPartialReadKeepsService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyWithoutPartialReadControl
+    transfer_window_successful_drain_feedback_test.go:195: successful-drain metadata=false read=false retain=true initial=12500000 during=12500000 probe=12500000 confirmed=12500000 total=2261378 pause=602.66696ms first-read=611.17008ms resumed=1.2103s
+--- PASS: TestWindowPacingSuccessfulDrainLegacyWithoutPartialReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyPartialStatsReadControl
+    transfer_window_successful_drain_feedback_test.go:203: successful-drain metadata=false read=true retain=false initial=12500000 during=12500000 probe=12500000 confirmed=12500000 total=2261378 pause=602.66696ms first-read=611.17008ms resumed=1.2103s
+--- PASS: TestWindowPacingSuccessfulDrainLegacyPartialStatsReadControl (0.00s)
+=== RUN   TestWindowTcpSocketBatchFitsPhysicalH1
+    transfer_window_tcp_h1_group_test.go:159: socket-batch packets=16 messages=6 max-message=3420 limit=8192
+--- PASS: TestWindowTcpSocketBatchFitsPhysicalH1 (0.01s)
+=== RUN   TestWindowTcpCanceledBatchReturnsShares
+--- PASS: TestWindowTcpCanceledBatchReturnsShares (0.00s)
+=== RUN   TestWindowTcpWorkloadCancelUnblocksGroupAdmission
+--- PASS: TestWindowTcpWorkloadCancelUnblocksGroupAdmission (0.00s)
+=== RUN   TestWindowStatsConcurrentWriterTeardown
+--- PASS: TestWindowStatsConcurrentWriterTeardown (0.00s)
+=== RUN   TestWindowStatsConcurrentWriterPublication
+--- PASS: TestWindowStatsConcurrentWriterPublication (0.00s)
+=== RUN   TestWindowStatsWriterRetirementDoesNotBlockSnapshot
+--- PASS: TestWindowStatsWriterRetirementDoesNotBlockSnapshot (0.00s)
+=== RUN   TestFamilyStandbyTracksChangingDialEvidence
+--- PASS: TestFamilyStandbyTracksChangingDialEvidence (0.00s)
+=== RUN   TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget
+--- PASS: TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget (0.00s)
+=== RUN   TestTunAckHandoffClassifiesOnlyAcknowledgements
+--- PASS: TestTunAckHandoffClassifiesOnlyAcknowledgements (0.00s)
+=== RUN   TestTunAckHandoffDoesNotWaitForBusyTcpEndpoint
+--- PASS: TestTunAckHandoffDoesNotWaitForBusyTcpEndpoint (0.00s)
+=== RUN   TestTunDuplexDataHandoffDoesNotCycleThroughAdmission
+--- PASS: TestTunDuplexDataHandoffDoesNotCycleThroughAdmission (0.01s)
+=== RUN   TestTunFiniteTcpTailProgressesAfterEndpointOwnerReleases
+--- PASS: TestTunFiniteTcpTailProgressesAfterEndpointOwnerReleases (0.01s)
+PASS

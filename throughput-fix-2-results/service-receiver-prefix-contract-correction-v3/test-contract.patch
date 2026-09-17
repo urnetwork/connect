@@ -1,0 +1,105 @@
+--- original/transfer_window_sdk_receiver_interval_test.go
++++ accepted/transfer_window_sdk_receiver_interval_test.go
+@@ -75,9 +75,10 @@
+ 	return max(rate, latest)
+ }
+ 
+-// The original sdk trace has 123 confirmed 2670-byte envelopes. The first ACK
+-// has no receiver wait and the cumulative tail waits 1 ms, below its 10 ms cap.
+-func TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain(t *testing.T) {
++// The original sdk trace has 123 confirmed 2670-byte envelopes. A tail wait
++// names only that head; these fields cannot prove that its entire newly
++// credited prefix arrived before it. Exact serialization may remain unknown.
++func TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded(t *testing.T) {
+ 	for _, path := range []time.Duration{100 * time.Millisecond, 400 * time.Millisecond} {
+ 		for _, phase := range []time.Duration{0, 8 * time.Millisecond} {
+ 			start := time.Unix(1700000000, 0).Add(phase)
+@@ -99,16 +100,20 @@
+ 			if fixture.service.drained || fixture.service.total != 328410 || fixture.service.latestRoundTrip != lastAt.Sub(start) {
+ 				t.Fatalf("path=%s phase=%s: raw timing or physical credit changed: drained=%t bytes=%d raw=%s", path, phase, fixture.service.drained, fixture.service.total, fixture.service.latestRoundTrip)
+ 			}
+-			if rate := fixture.measured(lastAt); rate != 125000000 {
+-				t.Errorf("path=%s phase=%s: cold receiver wait hid physical125MB/s: service=%d", path, phase, rate)
+-			}
+-			// One isolated point from the next window cannot price the long
+-			// gap between otherwise fast trains as a serialization slowdown.
++			if rate := fixture.measured(lastAt); rate > 125000000 {
++				t.Errorf("path=%s phase=%s: ambiguous prefix exceeded physical125MB/s: service=%d", path, phase, rate)
++			}
++			// One later head cannot repair the missing destination-order proof
++			// for the preceding prefix. Final pacing recovery is tested by the
++			// unchanged static sdk and shared-pacer throughput fixtures.
+ 			refillAt := firstAt.Add(path + 21360*time.Nanosecond)
+ 			fixture.write(124, 2670, lastAt)
+ 			fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(refill, refillAt, 0))
+-			if rate := fixture.measured(refillAt); rate != 125000000 {
+-				t.Errorf("path=%s phase=%s: first refill reply replaced measured serialization: %d", path, phase, rate)
++			if rate := fixture.measured(refillAt); rate > 125000000 {
++				t.Errorf("path=%s phase=%s: refill exceeded physical125MB/s: %d", path, phase, rate)
++			}
++			if fixture.service.drained || fixture.service.total != 331080 || fixture.service.latestRoundTrip != refillAt.Sub(firstAt) {
++				t.Fatalf("path=%s phase=%s: refill changed physical credit or raw timing: drained=%t bytes=%d raw=%s", path, phase, fixture.service.drained, fixture.service.total, fixture.service.latestRoundTrip)
+ 			}
+ 		}
+ 	}
+@@ -155,9 +160,10 @@
+ 	}
+ }
+ 
+-// A complete cold flight still has two exact checkpoints. The byte-drain
+-// boundary cannot erase its short, physically measured serialization pair.
+-func TestWindowPacingSdkColdDrainedTrainUsesExactPair(t *testing.T) {
++// A complete cold flight proves byte delivery and the raw physical drain.
++// It does not prove that the original ingress of a cumulative head encloses
++// every earlier envelope released with it.
++func TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks(t *testing.T) {
+ 	start := time.Unix(1700000000, 0)
+ 	fixture := newWindowReceiverCreditFixture(t, nil, start, 10*time.Millisecond)
+ 	var opening [123]*sendItem
+@@ -168,11 +174,11 @@
+ 	fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(opening[0], firstAt, 0))
+ 	lastAt := start.Add(403627280 * time.Nanosecond)
+ 	fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(opening[122], lastAt, time.Millisecond))
+-	if !fixture.service.drained || fixture.service.total != 328410 {
+-		t.Fatal("the complete cold opening did not physically drain")
+-	}
+-	if got := fixture.measured(lastAt); got != 125000000 {
+-		t.Fatalf("a drained cold pair lost its measured125MB/s: %d", got)
++	if !fixture.service.drained || fixture.service.total != 328410 || fixture.service.latestRoundTrip != lastAt.Sub(start) {
++		t.Fatal("the complete cold opening changed physical drain, credit or raw timing")
++	}
++	if got := fixture.measured(lastAt); got > 125000000 {
++		t.Fatalf("a drained ambiguous prefix exceeded physical125MB/s: %d", got)
+ 	}
+ }
+ 
+@@ -212,3 +218,29 @@
+ 		t.Fatalf("cold unqueued physical train lost capacity: %+v", evidence)
+ 	}
+ }
++
++// A newly credited single physical head owns all the bytes whose receiver
++// wait is removed. No cumulative prefix or inferred destination FIFO is used.
++func TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization(t *testing.T) {
++	for _, path := range []time.Duration{100 * time.Millisecond, 400 * time.Millisecond} {
++		for _, phase := range []time.Duration{0, 8 * time.Millisecond} {
++			start := time.Unix(1700000000, 0).Add(phase)
++			fixture := newWindowReceiverCreditFixture(t, nil, start, 10*time.Millisecond)
++			first := fixture.write(0, 2670, start)
++			head := fixture.write(1, 2670, start)
++			firstAt := start.Add(path + 21360*time.Nanosecond)
++			fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(first, firstAt, 0))
++			if got := fixture.measured(firstAt); got != 0 {
++				t.Fatalf("one checkpoint granted service=%d", got)
++			}
++			at := firstAt.Add(21360*time.Nanosecond + time.Millisecond)
++			fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(head, at, time.Millisecond))
++			if fixture.service.total != 5340 || !fixture.service.drained || fixture.service.latestRoundTrip != at.Sub(start) {
++				t.Fatal("single-head timing changed physical credit or raw drain clock")
++			}
++			if got := fixture.measured(at); got != 125000000 {
++				t.Errorf("path=%s phase=%s: exact head's own wait hid short serialization=%d", path, phase, got)
++			}
++		}
++	}
++}

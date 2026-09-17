@@ -1,0 +1,377 @@
+--- a/transfer.go	2026-09-16 13:13:02
++++ b/transfer.go	2026-09-16 16:22:37
+@@ -10709,6 +10709,9 @@
+ 	// A fresh, qualified cumulative interval can guide cold pacing before a
+ 	// serialization pair exists. This rate is never derived from retained bytes.
+ 	DeliveryByteRate ByteCount
++	// Fresh once-only H1 delivery over one common service interval. This
++	// guides shared pacing without changing this sequence's sizing evidence.
++	AggregateDeliveryByteRate ByteCount
+ 	// The same owner computes pacing from recently serialized delivery, so
+ 	// writers consume its result without interpreting the target themselves.
+ 	ServiceByteRate      ByteCount
+@@ -10767,6 +10770,9 @@
+ 		}
+ 		estimate.PacingProbeByteRate = estimate.PacingByteRate
+ 		estimate.PacingProbeByteCount = max(0, initial)
++		// Finalize after every evidence path, including shared-service early
++		// returns that have no local cumulative sizing interval.
++		defer self.finalizeWindowPacing(now, &estimate)
+ 		// Two compressed ACK intervals can measure one complete service
+ 		// interval even when the first and last replies are partial. Bound
+ 		// discovery to twice the ordinary opening window on slow services.
+@@ -10791,7 +10797,6 @@
+ 				}
+ 				estimate.ServiceEstablished = true
+ 				estimate.ServiceBacklogged = service.backloggedAt(estimate.ServiceByteRate, now)
+-				estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingByteRate)
+ 			}
+ 		}
+ 	}
+@@ -10921,11 +10926,6 @@
+ 	// Candidate computation below never teaches an advertised maximum on its
+ 	// own. Statistics report the last admitted value without learning growth.
+ 	defer func() {
+-		// Cumulative qualification occurs after service sampling. Finalize once
+-		// both are known, without treating a retained window as a rate sample.
+-		if estimate.PacingProbeByteRate > 0 {
+-			estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingProbeByteRate)
+-		}
+ 		candidate := estimate.Window
+ 		candidateTargetBound := estimate.Sized && estimate.TargetBound && estimate.Reason == "target"
+ 		serviceCandidateChosen := estimate.ServiceSized && (!estimate.Sized || candidate < serviceCandidate)
+--- a/transfer_window_pacing.go	2026-09-16 14:26:20
++++ b/transfer_window_pacing.go	2026-09-16 16:22:37
+@@ -210,15 +210,22 @@
+ // until physical service is known. Ten percent above recent delivery discovers
+ // spare capacity; queued service leaves a drain margin. The target caps both.
+ func windowPacingRate(estimate SendWindowEstimate, target ByteCount) ByteCount {
+-	if estimate.WindowRoundTrip <= 0 && estimate.ServiceByteRate <= 0 {
++	if estimate.WindowRoundTrip <= 0 && estimate.ServiceByteRate <= 0 &&
++		estimate.AggregateDeliveryByteRate <= 0 {
+ 		return target
+ 	}
+ 	rate := float64(target)
+ 	if estimate.WindowRoundTrip > 0 {
+ 		rate = float64(estimate.Initial) / estimate.WindowRoundTrip.Seconds()
+ 	}
+-	if estimate.ServiceByteRate <= 0 && estimate.DeliveryByteRate > 0 {
+-		rate = 1.1 * float64(estimate.DeliveryByteRate)
++	if estimate.ServiceByteRate <= 0 {
++		deliveryRate := estimate.AggregateDeliveryByteRate
++		if deliveryRate <= 0 {
++			deliveryRate = estimate.DeliveryByteRate
++		}
++		if deliveryRate > 0 {
++			rate = 1.1 * float64(deliveryRate)
++		}
+ 	}
+ 	if estimate.ServiceByteRate > 0 {
+ 		serviceRate := float64(estimate.ServiceByteRate)
+@@ -408,6 +415,7 @@
+ 	waiterTail               *windowPacingWaiter
+ 	probeSent                ByteCount
+ 	samples                  [deliveredBytesRingSize]windowServiceSample
++	aggregate                windowServiceDeliveryRing
+ 	newestBucket             int64
+ 	hasSamples               bool
+ 	serviceEpochAt           time.Time
+@@ -1176,6 +1184,33 @@
+ // Probe enrollment and confirmation inspect the same timestamp evidence as
+ // controller reads, without turning an unread valid pair into a cold start.
+ func (self *windowPacingService) measureWithLock(horizon time.Duration, now time.Time, retain bool) (ByteCount, ByteCount, ByteCount) {
++	hold := self.serviceHoldRate
++	rate, total, latest := self.measureSerializationWithLock(horizon, now, retain)
++	if hold <= 0 {
++		return rate, total, latest
++	}
++	evidence := self.aggregateOfferedDeliveryWithLock(now)
++	if evidence.bytes-evidence.firstBytes < kib(4) || evidence.offerByteRate <= max(rate, latest) {
++		return rate, total, latest
++	}
++	// Every included byte was physically offered inside this conservative
++	// interval. This independent proof does not borrow receiver ordering.
++	latest = evidence.offerByteRate
++	if horizon > 0 && evidence.lastAtNanos >= now.Add(-horizon).UnixNano() {
++		rate = latest
++	}
++	if retain {
++		self.serviceHoldRate = latest
++		if self.roundTripProbe.resetService || self.roundTripProbe.resetInitialService {
++			self.roundTripProbe.serviceRate = latest
++		}
++	}
++	return rate, total, latest
++}
++
++// Receiver endpoint qualification remains independent of the shared raw
++// delivery history and its conservative physical-offer lower bound.
++func (self *windowPacingService) measureSerializationWithLock(horizon time.Duration, now time.Time, retain bool) (ByteCount, ByteCount, ByteCount) {
+ 	timing := self.roundTripEvidenceWithLock(now)
+ 	roundTripCompression := self.compression
+ 	if timing.count > 0 {
+--- /dev/null	2026-09-16 16:28:59
++++ b/transfer_window_pacing_delivery.go	2026-09-16 16:22:37
+@@ -0,0 +1,29 @@
++// Shared pacing consumes a service-wide rate even when its logical senders
++// retain separate cumulative sizing histories. This reader never learns bytes.
++package connect
++
++import "time"
++
++// Current H1 evidence may guide every early-return path with pacing enabled.
++// Serialization stays authoritative; missing aggregate history keeps the own
++// cumulative fallback. Snapshot reads do not mutate either measurement owner.
++func (self *SendSequence) finalizeWindowPacing(at time.Time, estimate *SendWindowEstimate) {
++	if estimate.PacingProbeByteRate <= 0 {
++		return
++	}
++	if service := self.windowPacer.service; service != nil && self.transferFlightPolicy().h1Only {
++		residence := estimate.WindowRoundTrip
++		if residence <= 0 {
++			residence = service.roundTripEvidence(at).residence
++		}
++		if residence > 0 {
++			minimumSpan := max(windowServiceDeliveryMinimumSpan(residence), 4*self.deliveredBytesSampleIntervalAt(at))
++			afterNanos := max(self.receiveWindowSetAtNanos.Load(), service.windowDeliveryStep())
++			delivery := service.aggregateDelivery(at, minimumSpan, afterNanos)
++			if delivery.arrivalByteRate > 0 && min(estimate.Initial, kib(4)) <= delivery.bytes-delivery.firstBytes {
++				estimate.AggregateDeliveryByteRate = delivery.arrivalByteRate
++			}
++		}
++	}
++	estimate.PacingByteRate = windowPacingRate(*estimate, estimate.PacingProbeByteRate)
++}
+--- a/transfer_window_service_credit.go	2026-09-16 13:15:23
++++ b/transfer_window_service_credit.go	2026-09-16 16:19:37
+@@ -132,5 +132,6 @@
+ 		return
+ 	}
+ 	self.windowPacer.serviceAcked += credit.bytes
++	service.observeAggregateDeliveryWithLock(credit, at)
+ 	service.observeAckWithLock(credit.bytes, at, credit.receiverTiming)
+ }
+--- /dev/null	2026-09-16 16:28:59
++++ b/transfer_window_service_delivery.go	2026-09-16 16:20:03
+@@ -0,0 +1,221 @@
++// Shared delivery history retains exact credited bytes across short drained
++// trains. Raw arrival rates are policy observations; offer-to-ack rates are
++// conservative lower bounds. Neither requires destination ingress ordering.
++package connect
++
++import (
++	"math"
++	"time"
++)
++
++// All clocks are local sender clocks. Every byte belongs to one confirmed
++// initial H1 write; unknown or copied offers make a selected interval unusable.
++// The first raw checkpoint's entire tied group is excluded from arrival rates.
++type windowServiceDeliverySample struct {
++	bucket           int64
++	bytes            ByteCount
++	firstBytes       ByteCount
++	firstAtNanos     int64
++	lastAtNanos      int64
++	firstSentAtNanos int64
++	eligible         bool
++}
++
++// Merging preserves original endpoints and the earliest offer, including an
++// unknown zero offer. Rebinning cannot move credited bytes onto a newer clock.
++func (self *windowServiceDeliverySample) add(other windowServiceDeliverySample) {
++	if other.bytes <= 0 {
++		return
++	}
++	if self.bytes == 0 {
++		bucket := self.bucket
++		*self = other
++		self.bucket = bucket
++		return
++	}
++	if other.firstAtNanos < self.firstAtNanos {
++		self.firstAtNanos, self.firstBytes = other.firstAtNanos, other.firstBytes
++	} else if other.firstAtNanos == self.firstAtNanos {
++		self.firstBytes += other.firstBytes
++	}
++	self.lastAtNanos = max(self.lastAtNanos, other.lastAtNanos)
++	self.firstSentAtNanos = min(self.firstSentAtNanos, other.firstSentAtNanos)
++	self.bytes += other.bytes
++	self.eligible = self.eligible && other.eligible
++}
++
++// One fixed ring retains at least two current residences. A cold serializer's
++// train boundaries do not erase this separate cumulative delivery history.
++// The owning service's state lock protects insertion, resizing and reads.
++type windowServiceDeliveryRing struct {
++	samples      [deliveredBytesRingSize]windowServiceDeliverySample
++	interval     time.Duration
++	newestBucket int64
++	hasSamples   bool
++}
++
++// Old modulo slots cannot overwrite recent credit, including the exact
++// eviction boundary. Original timestamps survive any bucket-width change.
++func (self *windowServiceDeliveryRing) insert(sample windowServiceDeliverySample) {
++	interval := max(deliverySizedWindowSampleInterval, self.interval)
++	bucket := sample.lastAtNanos / int64(interval)
++	if self.hasSamples && bucket <= self.newestBucket-int64(len(self.samples)) {
++		return
++	}
++	if !self.hasSamples || self.newestBucket < bucket {
++		self.newestBucket, self.hasSamples = bucket, true
++	}
++	index := (bucket%int64(len(self.samples)) + int64(len(self.samples))) % int64(len(self.samples))
++	destination := &self.samples[index]
++	if destination.bytes == 0 || destination.bucket != bucket {
++		*destination = windowServiceDeliverySample{bucket: bucket}
++	}
++	destination.add(sample)
++}
++
++// A larger RTT changes retention, not the actual interval represented by any
++// credited byte. Shrinking the ring discards only complete retired aggregates.
++func (self *windowServiceDeliveryRing) resize(interval time.Duration) {
++	interval = max(deliverySizedWindowSampleInterval, interval)
++	if interval == max(deliverySizedWindowSampleInterval, self.interval) {
++		return
++	}
++	previous, newest := self.samples, self.newestBucket
++	clear(self.samples[:])
++	self.newestBucket, self.hasSamples, self.interval = 0, false, interval
++	for offset := int64(0); offset < int64(len(previous)); offset++ {
++		bucket := newest - offset
++		index := (bucket%int64(len(previous)) + int64(len(previous))) % int64(len(previous))
++		sample := previous[index]
++		if sample.bytes > 0 && sample.bucket == bucket {
++			self.insert(sample)
++		}
++	}
++}
++
++// Factual endpoints accompany the two differently qualified observations.
++// Arrival rate excludes the first completion; the offer bound includes every
++// byte because all of its writes begin at or after that interval's origin.
++type windowServiceDeliveryEstimate struct {
++	bytes            ByteCount
++	firstBytes       ByteCount
++	firstAtNanos     int64
++	lastAtNanos      int64
++	firstSentAtNanos int64
++	arrivalByteRate  ByteCount
++	offerByteRate    ByteCount
++}
++
++// Saturation keeps a valid long residence from wrapping into a short history.
++func windowServiceDeliveryMinimumSpan(residence time.Duration) time.Duration {
++	if residence > time.Duration(math.MaxInt64/2) {
++		return time.Duration(math.MaxInt64)
++	}
++	return 2 * max(0, residence)
++}
++
++// Byte counts and clocks remain exact; only the final rate conversion rounds.
++func windowServiceDeliveryByteRate(bytes ByteCount, span int64) ByteCount {
++	if bytes <= 0 || span <= 0 {
++		return 0
++	}
++	rate := float64(bytes) * float64(time.Second) / float64(span)
++	if rate >= float64(math.MaxInt64) {
++		return ByteCount(math.MaxInt64)
++	}
++	return ByteCount(rate)
++}
++
++// The newest complete interval is used for ordinary policy reads. A warm
++// offer bound may explicitly inspect all retained history, without retaining
++// that bound as a permanent high-water measurement.
++func (self *windowServiceDeliveryRing) estimate(at time.Time, minimumSpan time.Duration, afterNanos int64, all bool) windowServiceDeliveryEstimate {
++	interval := max(deliverySizedWindowSampleInterval, self.interval)
++	minimumSpan = max(minimumSpan, 4*interval)
++	horizon := time.Duration(math.MaxInt64)
++	if interval <= time.Duration(math.MaxInt64/int64(len(self.samples))) {
++		horizon = interval * time.Duration(len(self.samples))
++	}
++	selected := windowServiceDeliverySample{}
++	for offset := int64(0); offset < int64(len(self.samples)); offset++ {
++		bucket := self.newestBucket - offset
++		index := (bucket%int64(len(self.samples)) + int64(len(self.samples))) % int64(len(self.samples))
++		sample := self.samples[index]
++		if sample.bytes <= 0 || sample.bucket != bucket || sample.lastAtNanos > at.UnixNano() ||
++			sample.firstAtNanos < afterNanos || sample.lastAtNanos < at.Add(-horizon).UnixNano() {
++			continue
++		}
++		selected.add(sample)
++		if !all && selected.lastAtNanos-selected.firstAtNanos >= int64(minimumSpan) {
++			break
++		}
++	}
++	if !selected.eligible || selected.bytes <= selected.firstBytes || selected.firstSentAtNanos <= 0 ||
++		selected.firstSentAtNanos < afterNanos || selected.firstSentAtNanos > selected.firstAtNanos ||
++		selected.lastAtNanos-selected.firstAtNanos < int64(minimumSpan) ||
++		at.UnixNano()-selected.lastAtNanos > int64(minimumSpan) {
++		return windowServiceDeliveryEstimate{}
++	}
++	return windowServiceDeliveryEstimate{
++		bytes: selected.bytes, firstBytes: selected.firstBytes,
++		firstAtNanos: selected.firstAtNanos, lastAtNanos: selected.lastAtNanos,
++		firstSentAtNanos: selected.firstSentAtNanos,
++		arrivalByteRate:  windowServiceDeliveryByteRate(selected.bytes-selected.firstBytes, selected.lastAtNanos-selected.firstAtNanos),
++		offerByteRate:    windowServiceDeliveryByteRate(selected.bytes, selected.lastAtNanos-selected.firstSentAtNanos),
++	}
++}
++
++// Exact once-only credit reaches this history before serialization epochs can
++// discard its older arrival. Pending, copied and non-H1 writes stay explicit.
++func (self *windowPacingService) observeAggregateDeliveryWithLock(credit windowServiceAckCredit, at time.Time) {
++	if credit.bytes <= 0 {
++		return
++	}
++	timingAt := at
++	if self.lastRoundTrip.After(timingAt) {
++		timingAt = self.lastRoundTrip
++	}
++	residence := self.roundTripEvidenceWithLock(timingAt).residence
++	span := windowServiceDeliveryMinimumSpan(residence)
++	slots := time.Duration(len(self.aggregate.samples) - 2)
++	interval := span / slots
++	if span%slots != 0 {
++		interval++
++	}
++	self.aggregate.resize(max(deliverySizedWindowSampleInterval, interval))
++	self.aggregate.insert(windowServiceDeliverySample{
++		bytes: credit.bytes, firstBytes: credit.bytes, firstAtNanos: at.UnixNano(), lastAtNanos: at.UnixNano(),
++		firstSentAtNanos: credit.firstSentAtNanos,
++		eligible:         credit.receiverTimingEligible && credit.firstSentAtNanos > 0 && credit.firstSentAtNanos <= at.UnixNano(),
++	})
++}
++
++// The shared policy reader uses its current permission cutoff. It cannot
++// borrow another service or an interval from before a proved path change.
++func (self *windowPacingService) aggregateDelivery(at time.Time, minimumSpan time.Duration, afterNanos int64) windowServiceDeliveryEstimate {
++	self.stateLock.Lock()
++	defer self.stateLock.Unlock()
++	return self.aggregateDeliveryWithLock(at, minimumSpan, afterNanos)
++}
++
++// Match cumulative qualification over several feedback turns; stats reads
++// use the same facts without changing history or accepted service.
++func (self *windowPacingService) aggregateDeliveryWithLock(at time.Time, minimumSpan time.Duration, afterNanos int64) windowServiceDeliveryEstimate {
++	minimumSpan = max(minimumSpan, windowServiceDeliveryMinimumSpan(self.roundTripEvidenceWithLock(at).residence))
++	return self.aggregate.estimate(at, minimumSpan, max(afterNanos, self.windowDeliveryAfterNanos), false)
++}
++
++// An established service can be raised by wholly newer physical offers.
++// All retained credit makes this lower bound useful despite propagation;
++// the finite ring still expires old fast delivery after genuine slowdown.
++func (self *windowPacingService) aggregateOfferedDeliveryWithLock(at time.Time) windowServiceDeliveryEstimate {
++	afterNanos := self.windowDeliveryAfterNanos
++	if !self.serviceEpochAt.IsZero() {
++		afterNanos = max(afterNanos, self.serviceEpochAt.UnixNano())
++	}
++	if probe := self.roundTripProbe; probe.resetService {
++		afterNanos = max(afterNanos, probe.sentAt.UnixNano())
++	}
++	minimumSpan := windowServiceDeliveryMinimumSpan(self.roundTripEvidenceWithLock(at).residence)
++	return self.aggregate.estimate(at, minimumSpan, afterNanos, true)
++}

@@ -1,0 +1,34 @@
+{
+  "archive_kind": "recovery_drain_ablation_retry_only_clock_selection_supplement",
+  "classification": "supporting_preexisting_matched_binary_evidence_not_fresh_whole_commit_build",
+  "original_ablation_manifest_sha256": "5e07aadd585d767a295d195cb257af5fb1275fd9fd4e4b14b1b5896f615256c6",
+  "preflight": {
+    "action": "not used for execution; fresh exact effective-source copy prepared",
+    "base_files_differing_from_effective_overlay": 2,
+    "expected_reason": "the two files are declared retry-only overlay destinations in the parent manifest",
+    "files": [
+      "transfer_window_pacing.go",
+      "transfer_window_service_performance_test.go"
+    ],
+    "test_started": false
+  },
+  "prior_138_race_evidence": "remains separate and is not relabeled by this normal-binary selection",
+  "relationship_to_original_ablation": "Supplemental normal-binary retry-clock selection. The original recovery-drain ablation manifest and payload remain immutable and are not modified by this supplement.",
+  "run_context": "current-load; frozen retry-only matched binary; reconstructed exact declared source cwd; narrow retry-clock supporting selection; no-quiescence run",
+  "sanitization": {
+    "local_paths_network_addresses_and_generated_ids": "excluded",
+    "raw_run_log_source_copies_and_binary": "excluded; SHA-256 pins and normalized outcomes retained only"
+  },
+  "schema_version": 1,
+  "scope": "Narrow normal-binary retry-clock selection against frozen matched retry-only binary. The copied base cwd retains the base versions of two declared overlay destinations, while the effective manifest includes their pinned retry-only replacements; a fresh runtime copy was constructed with exactly those replacements and fully verified before and after execution.",
+  "selector_regex": "^TestWindowPacing(RetryStartsItsNextRecoveryAtPhysicalWrite|RetryPhysical.*|UnpacedRetryIgnoresPreviousWaiter|FailedRetryIgnoresWaiter|ChangedCarrierRetryIgnoresH1Waiter|PhysicalRecoveryKeepsMonotonicClock)$",
+  "test_argv": [
+    "frozen-retry-only.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacing(RetryStartsItsNextRecoveryAtPhysicalWrite|RetryPhysical.*|UnpacedRetryIgnoresPreviousWaiter|FailedRetryIgnoresWaiter|ChangedCarrierRetryIgnoresH1Waiter|PhysicalRecoveryKeepsMonotonicClock)$",
+    "-test.short=false",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ]
+}

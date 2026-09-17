@@ -1,0 +1,10 @@
+{
+  "archive": "window-retention-policy-service-v3",
+  "payload_sha256": {
+    "outcomes.jsonl": "18e7b83a6f026336fa40f2990a4c419c57cafc443d3722e2d2db14948e6dc05c",
+    "provenance.json": "fd6db0801a14e2f3b506a2e0cfe1c962f211b14354d980200ed261859fa7fc4f",
+    "source-manifest-after.json": "6fbbdf4f4dc6666806390901dbc09b697a04e71839338c0b55498bd869f47a9a",
+    "source-pins.json": "e9b5e2f5b02af257046c1c93e83409aa981d97863ed27f885737047b626297a9",
+    "status.json": "e4f149766a8bd09d57a2f33d5d8d1855c309ee10de9b8e4b48ff7b4fe1a1a2fd"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "archive": "physical-h1-ack-policy-experiment-v1",
+  "payload_sha256": {
+    "caller-isolation.patch": "00b16d01ea1634c230ccfe928d3e96f82978047b132d28c90f9457bf357797e9",
+    "failure-witnesses.json": "d6893a5cf97b8b7c8e813711ea5b852b17d1f2471a95d4506dde52fdcd980ec9",
+    "lifecycle-and-policy-audit.json": "2a5936ad0946475009d854770055bdd7a4bbc22ab116ae409b76b8fd0e32118a",
+    "outcomes.jsonl": "3ab431eccae21d8c679cd74300659e6b75a9ff3256636017230b39c71375779c",
+    "owned-ack.patch": "d6631f9e16664d95ee091706d4ab75fa2453bbffbc975e6569bb7156050abe9c",
+    "physical-readings.jsonl": "65d060f7ec9c044084a228565141f946bf108b3e761cae1d0d413fd8a72a4917",
+    "provenance.json": "d2d8ea3515432719e7687f2a996fc8cbcbb25389991acfb728c5b1d7e0a730e3",
+    "source-manifest-after.json": "dea5219c6d6c1913849c3c2ee25476645cdfbfb84e5c2551a9e65f1b836fb00d",
+    "source-manifest-before.json": "ec84fcb521e84076c9cfd461510e8cdb21cc1cb2d670d3c906a0b493c4904d00",
+    "source-pins.json": "80cbe9c87f0f97bec90453a0e0a6844fcb66331db8ca915a88c00660b1460101",
+    "status.json": "6442edbe1529e83abb58fd7ce34b37dd00c5d2ac7dc2f931abbe29a3687d901d"
+  }
+}

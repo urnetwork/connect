@@ -1,0 +1,6 @@
+{
+  "classification": "Experimental join preserves cold common-consumer roots and fixes relayed prefix timing ownership, while unchanged SDK Short passes and Long still fails. No overall sampler/throughput or live acceptance.",
+  "outcomes": 95,
+  "readings": 20,
+  "worker_readings": 0
+}

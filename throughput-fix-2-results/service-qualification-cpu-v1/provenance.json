@@ -1,0 +1,8 @@
+{
+  "command": "go test binary -test.run ^$ -test.bench ^BenchmarkWindowPacingService(Continuous|Hold|StatisticsHold|AckArrival|AckArrivalLargeWindow|AckBatchArrival)$ -test.benchtime=500ms -test.count=3 -test.benchmem -test.timeout=2m",
+  "interpretation": "CPU and allocation observations under recorded concurrent load; not host throughput acceptance. Estimator reads retain12.5MB/s. The ACK publication fixture measures retained-flight work, without populating receiver RTT history.",
+  "no_quiescence_wait": true,
+  "raw_logs": "Excluded; only numerical benchmark rows, source/binary hashes and safe run context are retained.",
+  "scope": "Six existing nonrace service-estimator/ACK publication microbenchmarks, three repetitions per immutable variant; no host timing threshold.",
+  "source_boundary": "Same sampler qualification before/after sources as service-qualification-correction: 54b36054 versus008e9d38. Later horizon and cumulative-pacing edits are excluded."
+}

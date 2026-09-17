@@ -1,0 +1,37 @@
+=== RUN   TestWindowPacingReceiverSustainedSiblingsDiscoverColdService
+--- FAIL: TestWindowPacingReceiverSustainedSiblingsDiscoverColdService (0.25s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsRaiseSlowHold
+--- FAIL: TestWindowPacingReceiverSustainedSiblingsRaiseSlowHold (0.24s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsLowerFastHold
+--- PASS: TestWindowPacingReceiverSustainedSiblingsLowerFastHold (0.24s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsAlignedControl
+--- PASS: TestWindowPacingReceiverSustainedSiblingsAlignedControl (0.18s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsLegacyControl
+--- PASS: TestWindowPacingReceiverSustainedSiblingsLegacyControl (0.17s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsMixedControl
+--- PASS: TestWindowPacingReceiverSustainedSiblingsMixedControl (0.18s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsDiscoverColdService
+--- FAIL: TestWindowPacingReceiverSustainedSiblingsDiscoverColdService (0.24s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsRaiseSlowHold
+--- FAIL: TestWindowPacingReceiverSustainedSiblingsRaiseSlowHold (0.25s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsLowerFastHold
+--- PASS: TestWindowPacingReceiverSustainedSiblingsLowerFastHold (0.24s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsAlignedControl
+--- PASS: TestWindowPacingReceiverSustainedSiblingsAlignedControl (0.18s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsLegacyControl
+--- PASS: TestWindowPacingReceiverSustainedSiblingsLegacyControl (0.17s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsMixedControl
+--- PASS: TestWindowPacingReceiverSustainedSiblingsMixedControl (0.18s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsDiscoverColdService
+--- FAIL: TestWindowPacingReceiverSustainedSiblingsDiscoverColdService (0.24s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsRaiseSlowHold
+--- FAIL: TestWindowPacingReceiverSustainedSiblingsRaiseSlowHold (0.24s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsLowerFastHold
+--- PASS: TestWindowPacingReceiverSustainedSiblingsLowerFastHold (0.24s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsAlignedControl
+--- PASS: TestWindowPacingReceiverSustainedSiblingsAlignedControl (0.18s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsLegacyControl
+--- PASS: TestWindowPacingReceiverSustainedSiblingsLegacyControl (0.17s)
+=== RUN   TestWindowPacingReceiverSustainedSiblingsMixedControl
+--- PASS: TestWindowPacingReceiverSustainedSiblingsMixedControl (0.18s)
+FAIL

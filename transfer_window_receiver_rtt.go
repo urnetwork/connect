@@ -39,6 +39,7 @@ type windowReceiverRoundTripEstimate struct {
 	count             int
 	receiverResidence time.Duration
 	latestRaw         time.Duration
+	feedbackPaired    bool
 }
 
 // Every sibling uses the same existing settings; no additional lifetime or
@@ -106,7 +107,13 @@ func (self *windowReceiverRoundTrips) estimate(at time.Time) windowReceiverRound
 	cutoff, atNanos := at.Add(-self.windowTimeout).UnixNano(), at.UnixNano()
 	for offset := 0; offset < self.count; offset++ {
 		sample := self.samples[(self.tail+offset)%len(self.samples)]
-		if sample.adjusted < 0 || sample.atNanos < cutoff || atNanos < sample.atNanos {
+		if sample.atNanos < cutoff || atNanos < sample.atNanos {
+			continue
+		}
+		// Baseline metadata survives newer legacy replies, but a feedback
+		// turn may use measured receiver wait only from its newest reply.
+		estimate.feedbackPaired = sample.adjusted >= 0
+		if sample.adjusted < 0 {
 			continue
 		}
 		residence := windowReceiverRoundTripResidence(sample.raw, sample.adjusted, sample.compression)

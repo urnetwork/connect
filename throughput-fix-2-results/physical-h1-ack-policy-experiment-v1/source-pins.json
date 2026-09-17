@@ -1,0 +1,130 @@
+[
+  {
+    "binary_sha256": "8f9985274d85a2f7dee13fe6bdcdaa0553d299de12cca7f6f632400f93679b27",
+    "build_flags": [
+      "-race=false"
+    ],
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "221f313bebc04ee68c9d0ed93d7d6f795bc03356132418e24a20d51686d3df95",
+    "effective_inputs_sha256": "ba5150d52ccbc004c9906ade0d0ff6b7094ccf869bcbb34e32b99f096fe6f2eb",
+    "inputs_match_at_archive": true,
+    "name": "before",
+    "outcome_scope": "complete raw invocation",
+    "outcomes": {
+      "FAIL": 1,
+      "PASS": 0,
+      "SKIP": 0
+    },
+    "race": false,
+    "race_instrumentation_verified_by": "compile argv and immutable binary build metadata",
+    "race_warnings": 0,
+    "raw_log_sha256": "c82d1dfb88c81cf93fcc6d3f95968c85b9e08d24d5ea7330acf8c366485bc23c",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "8f9985274d85a2f7dee13fe6bdcdaa0553d299de12cca7f6f632400f93679b27",
+      "cwd": {
+        "artifact": "throughput-fix-2-physical-h1-ack-policy-before-v1",
+        "path": "source/connect"
+      },
+      "cwd_source": "effective Go module snapshot",
+      "effective_inputs_sha256": "ba5150d52ccbc004c9906ade0d0ff6b7094ccf869bcbb34e32b99f096fe6f2eb",
+      "elapsed_seconds": 23.36877733375877,
+      "ended_utc": "2026-09-16T20:16:33.498820+00:00",
+      "environment": {
+        "CONNECT_WINDOW_H1_MEASURE": "1"
+      },
+      "exit_status": 1,
+      "fail": 1,
+      "loadavg_end": [
+        20.58740234375,
+        25.234375,
+        19.04150390625
+      ],
+      "loadavg_start": [
+        24.4677734375,
+        26.23828125,
+        19.2392578125
+      ],
+      "manifest_sha256": "221f313bebc04ee68c9d0ed93d7d6f795bc03356132418e24a20d51686d3df95",
+      "no_quiescence_wait": true,
+      "pass": 0,
+      "race_warnings": 0,
+      "raw_log_sha256": "c82d1dfb88c81cf93fcc6d3f95968c85b9e08d24d5ea7330acf8c366485bc23c",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "runner_sha256": "5156911eaa092de99bdc659af6c36f137c81579cccfc794ada161a9d3f58db75",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T20:16:10.129709+00:00"
+    },
+    "selected_tests": [
+      "TestWindowPhysicalH1SdkDuplex"
+    ],
+    "source_content_sha256": "2fb336a6b99ed2da49e96f9fa00429e77b9a62d172d1058c9630bec5fe7f962e",
+    "test_pattern": "^TestWindowPhysicalH1SdkDuplex$"
+  },
+  {
+    "binary_sha256": "2de1fff851024bf50a07cafd188a675ac125ab201e59b8453c025824406ce621",
+    "build_flags": [
+      "-race=false"
+    ],
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "77a03bf3ce41c2c45d424efff0b920ad929595e1b35831ede1199a469c6c5ac1",
+    "effective_inputs_sha256": "a1e94eec30d414ce4378d00da23be6da51458be9146490a8b39bb13a3f61798a",
+    "inputs_match_at_archive": true,
+    "name": "after",
+    "outcome_scope": "complete raw invocation",
+    "outcomes": {
+      "FAIL": 1,
+      "PASS": 0,
+      "SKIP": 0
+    },
+    "race": false,
+    "race_instrumentation_verified_by": "compile argv and immutable binary build metadata",
+    "race_warnings": 0,
+    "raw_log_sha256": "7f57f3f2efc72a92aaa124cab3fdf6281bb746a1669d27567bab61d751309800",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "2de1fff851024bf50a07cafd188a675ac125ab201e59b8453c025824406ce621",
+      "cwd": {
+        "artifact": "throughput-fix-2-physical-h1-ack-policy-after-v1",
+        "path": "source/connect"
+      },
+      "cwd_source": "effective Go module snapshot",
+      "effective_inputs_sha256": "a1e94eec30d414ce4378d00da23be6da51458be9146490a8b39bb13a3f61798a",
+      "elapsed_seconds": 23.376094915904105,
+      "ended_utc": "2026-09-16T20:17:07.869212+00:00",
+      "environment": {
+        "CONNECT_WINDOW_H1_MEASURE": "1"
+      },
+      "exit_status": 1,
+      "fail": 1,
+      "loadavg_end": [
+        18.5546875,
+        24.18798828125,
+        18.90673828125
+      ],
+      "loadavg_start": [
+        19.52587890625,
+        24.84912109375,
+        18.9765625
+      ],
+      "manifest_sha256": "77a03bf3ce41c2c45d424efff0b920ad929595e1b35831ede1199a469c6c5ac1",
+      "no_quiescence_wait": true,
+      "pass": 0,
+      "race_warnings": 0,
+      "raw_log_sha256": "7f57f3f2efc72a92aaa124cab3fdf6281bb746a1669d27567bab61d751309800",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "runner_sha256": "5156911eaa092de99bdc659af6c36f137c81579cccfc794ada161a9d3f58db75",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T20:16:44.492889+00:00"
+    },
+    "selected_tests": [
+      "TestWindowPhysicalH1SdkDuplex"
+    ],
+    "source_content_sha256": "142a806726f5d2c654ecd5167fdf7c2e48a4375b4a527bd839ec114a90cd4475",
+    "test_pattern": "^TestWindowPhysicalH1SdkDuplex$"
+  }
+]

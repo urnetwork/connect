@@ -1,0 +1,5 @@
+{
+  "description": "TargetBound names effective admission; CandidateTargetBound separately describes a qualified target-limited candidate. Cold unqualified timing is not a target-bound window.",
+  "outcomes": "Nine policy assertions three times under race: before21 pass/6 fail; after27 pass. No races. The extra assertions isolate two reporting defects and preserve one positive target-bound control.",
+  "scope": "Core policy diagnostic correction only; no quality API or network control. These are not full performance acceptance results."
+}

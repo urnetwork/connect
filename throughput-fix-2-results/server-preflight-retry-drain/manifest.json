@@ -1,0 +1,11 @@
+{
+  "archive_kind": "server_preflight_retry_drain",
+  "file_count": 4,
+  "file_sha256": {
+    "attempts.jsonl": "efbce951ba836f2fec566da3376759c2f9d403ad2eed0ce2e9171714a8c3598f",
+    "provenance.json": "2408b82d3d93c060d61b65174568bfd5ec13df8b0f4e42a212f6303362da965b",
+    "source-pins.json": "5e9ecd3d0f5707824ff04b8f3addf13ae44450ff50b8263f8f5e0feef5588c30",
+    "status.json": "95e4c163141f01d74a7c38949e61973334057f36f7c42b3d68a412b8eb0b00cb"
+  },
+  "schema_version": 1
+}

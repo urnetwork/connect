@@ -1,0 +1,12 @@
+{
+  "complete": true,
+  "exit_code": 0,
+  "fail": 0,
+  "pass": 24,
+  "race": false,
+  "race_warnings": 0,
+  "skip": 0,
+  "source_inventory_matches_after": true,
+  "source_inventory_matches_before": true,
+  "sources_unchanged_during_run": true
+}

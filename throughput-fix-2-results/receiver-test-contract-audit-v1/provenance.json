@@ -1,0 +1,8 @@
+{
+  "interpretation": "The failures establish behavior under the chosen immediate-response policy. They do not alone establish a protocol defect or permanent inability to adapt. Sustained convergence and exact measurement arithmetic need separate assertions.",
+  "no_quiescence_wait": true,
+  "outcome": "6race passes/9failures. Three exact final-rate assertions fail; hard byte credit, timing identity, queue and epoch preconditions pass.",
+  "race": true,
+  "role": "Frozen5test/3repeat receiver sibling comparison, reviewed after user requested alternative valid interpretations.",
+  "source_scope": "Bounded slowdown candidate329461 with accepted cumulative fallback and test-only sibling supplement. No production adoption."
+}

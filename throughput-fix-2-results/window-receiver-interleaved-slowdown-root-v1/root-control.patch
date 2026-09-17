@@ -1,0 +1,158 @@
+--- /dev/null
++++ b/transfer_window_receiver_interleaved_slowdown_test.go
+@@ -0,0 +1,155 @@
++// Sustained physical queueing must still lower service when interleaved
++// sibling receiver waits leave ordinary corrected ring endpoints unqualified.
++package connect
++
++import (
++	"testing"
++	"time"
++)
++
++// The final sixteen explicit controller reads must agree on the slower rate.
++type windowReceiverInterleavedSlowdownReading struct {
++	minimumRate ByteCount
++	maximumRate ByteCount
++	invalid     int
++	intervals   int
++}
++
++// Three confirmed siblings share one continuously busy 4 MB/s serializer.
++// Their physical offer order is independent of ACK waiting and publication.
++func windowReceiverInterleavedSlowdown(t *testing.T, metadata string, phase time.Duration, order []int) windowReceiverInterleavedSlowdownReading {
++	t.Helper()
++	const physicalRate ByteCount = 4000000
++	const offeredCycles = 512
++	const deliveredCycles = 192
++	const initialRate ByteCount = 12500000
++	service, start := newWindowQualifiedServiceFixture(t, initialRate, 10*time.Millisecond, 100*time.Millisecond)
++	start = start.Add(phase)
++	initialBytes, initialSent := service.total, service.sent
++	bytes := [3]ByteCount{1000, 4000, 12000}
++	waits := [3]time.Duration{0, 4 * time.Millisecond, 0}
++	var fixtures [3]*windowReceiverCreditFixture
++	var items [3][offeredCycles]*sendItem
++	for lane := range fixtures {
++		fixtures[lane] = newWindowReceiverCreditFixture(t, service, start, 10*time.Millisecond)
++	}
++	for number := range offeredCycles {
++		for lane, fixture := range fixtures {
++			items[lane][number] = fixture.write(uint64(number), bytes[lane], start)
++		}
++	}
++	physicalAt := start.Add(100 * time.Millisecond)
++	reading := windowReceiverInterleavedSlowdownReading{}
++	for number := range deliveredCycles {
++		var arrivals [3]time.Time
++		for lane := range fixtures {
++			physicalAt = physicalAt.Add(time.Duration(bytes[lane]) * time.Second / time.Duration(physicalRate))
++			arrivals[lane] = physicalAt.Add(waits[lane])
++		}
++		measurementAt := arrivals[0]
++		for _, at := range arrivals {
++			if measurementAt.Before(at) {
++				measurementAt = at
++			}
++		}
++		for _, lane := range order {
++			fixture, at := fixtures[lane], arrivals[lane]
++			ack := fixture.ack(items[lane][number], at, waits[lane])
++			if metadata == "legacy" || metadata == "mixed" && lane == 1 {
++				ack.receiverAckDelaySet = false
++			}
++			fixture.sequence.coalesceReceivedAck(fixture.ackWindow, ack)
++			if !ack.receiverAckDelaySet {
++				// The legacy send owner publishes this head's raw residence.
++				// There is no exact receiver clock to lend to its byte credit.
++				service.observeRoundTrip(at.Sub(start), fixture.compression, at)
++			}
++		}
++		rate, _, latest := service.measured(time.Second, measurementAt)
++		if number >= deliveredCycles-16 {
++			measured := max(rate, latest)
++			if number == deliveredCycles-16 || measured < reading.minimumRate {
++				reading.minimumRate = measured
++			}
++			reading.maximumRate = max(reading.maximumRate, measured)
++		}
++	}
++	const cycleBytes ByteCount = 17000
++	if service.total != initialBytes+deliveredCycles*cycleBytes || service.sent != initialSent+offeredCycles*cycleBytes {
++		t.Fatalf("metadata=%s phase=%s publication=%v: delivered/offered bytes changed: total=%d sent=%d", metadata, phase, order, service.total, service.sent)
++	}
++	for lane, fixture := range fixtures {
++		if credited := fixture.sequence.windowPacer.serviceAcked; credited != deliveredCycles*bytes[lane] {
++			t.Fatalf("metadata=%s lane=%d lost or repeated credit: %d", metadata, lane, credited)
++		}
++	}
++	if service.drained || service.pendingWrites != len(fixtures) || service.outstandingWithLock() != float64((offeredCycles-deliveredCycles)*cycleBytes) {
++		t.Fatalf("metadata=%s: the physical serializer lost its standing queue: drained=%t tails=%d outstanding=%g", metadata, service.drained, service.pendingWrites, service.outstandingWithLock())
++	}
++	for _, sample := range service.samples {
++		if sample.bytes <= sample.firstBytes || sample.firstAtNanos < start.UnixNano() {
++			continue
++		}
++		reading.intervals++
++		if sample.receiverInvalid {
++			reading.invalid++
++		}
++		switch metadata {
++		case "paired":
++			if sample.receiverBytes != sample.bytes || !sample.receiverInvalid {
++				t.Fatalf("phase=%s publication=%v: paired fixture left an ordinary qualified interval: %+v", phase, order, sample)
++			}
++		case "legacy":
++			if sample.receiverBytes != 0 {
++				t.Fatalf("legacy fixture acquired receiver credit: %+v", sample)
++			}
++		case "mixed":
++			if sample.receiverBytes == 0 || sample.receiverBytes == sample.bytes {
++				t.Fatalf("mixed fixture lost its partial metadata: %+v", sample)
++			}
++		}
++	}
++	if reading.intervals < 48 {
++		t.Fatalf("metadata=%s phase=%s publication=%v: insufficient sustained history: %+v", metadata, phase, order, reading)
++	}
++	return reading
++}
++
++// Repeating exact but interleaved waits may invalidate every short interval.
++// A standing physical queue still proves that the earlier fast rate must fall.
++func TestWindowPacingReceiverInterleavedSlowdownAdaptsWithInvalidRing(t *testing.T) {
++	for _, phase := range []time.Duration{0, 6 * time.Millisecond} {
++		for _, order := range [][]int{{0, 2, 1}, {2, 0, 1}} {
++			reading := windowReceiverInterleavedSlowdown(t, "paired", phase, order)
++			if reading.minimumRate < 3600000 || reading.maximumRate > 4400000 {
++				t.Errorf("phase=%s publication=%v: sustained physical4MB/s did not replace12.5MB/s hold: %+v", phase, order, reading)
++			}
++		}
++	}
++}
++
++// Without paired waits, identical physical delivery keeps the established raw
++// full-interval fallback and must converge within the same bounded tolerance.
++func TestWindowPacingReceiverInterleavedSlowdownLegacyControl(t *testing.T) {
++	for _, phase := range []time.Duration{0, 6 * time.Millisecond} {
++		for _, order := range [][]int{{0, 2, 1}, {2, 0, 1}} {
++			reading := windowReceiverInterleavedSlowdown(t, "legacy", phase, order)
++			if reading.minimumRate < 3600000 || reading.maximumRate > 4400000 {
++				t.Errorf("phase=%s publication=%v: legacy physical4MB/s lost adaptation: %+v", phase, order, reading)
++			}
++		}
++	}
++}
++
++// One legacy sibling prevents corrected endpoints from being borrowed across
++// the mixed interval. Its exact same bytes still qualify the real slowdown.
++func TestWindowPacingReceiverInterleavedSlowdownMixedControl(t *testing.T) {
++	for _, phase := range []time.Duration{0, 6 * time.Millisecond} {
++		for _, order := range [][]int{{0, 2, 1}, {2, 0, 1}} {
++			reading := windowReceiverInterleavedSlowdown(t, "mixed", phase, order)
++			if reading.minimumRate < 3600000 || reading.maximumRate > 4400000 {
++				t.Errorf("phase=%s publication=%v: mixed physical4MB/s lost adaptation: %+v", phase, order, reading)
++			}
++		}
++	}
++}

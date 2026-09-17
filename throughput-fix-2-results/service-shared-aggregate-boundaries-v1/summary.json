@@ -1,0 +1,44 @@
+[
+  {
+    "selection": "before",
+    "pass": 15,
+    "fail": 3,
+    "skip": 0,
+    "race_warnings": 0,
+    "race_instrumented": true,
+    "effective_inputs_sha256": "cc6850c603aded39c6d8e0b17f5800f59d8fcc45b354b04931ec8c2d0589a2b3",
+    "binary_sha256": "4641aea0ae3cfce63cc47fc501d2709827c0f522ae284d4ec9d86a7ba5cb0d67",
+    "original_manifest_sha256": "9796a4f8173850b3fe10c349d294adc2de023ccd58701abbe62befba1efbcba9",
+    "original_status_sha256": "42c2ac5d7b1192c0f6d68ae45419e65da58d085421ad7c00e46f1399ab479607",
+    "raw_log_sha256": "193615111b2bddc6cb3d9228c902861db0567ded3858735cd58ff7fb830afc2f",
+    "note": "15P3F: five arithmetic/history controls pass; pending feedbackDrainAt and resetInitialService can borrow pre-drain warm offers."
+  },
+  {
+    "selection": "after",
+    "pass": 18,
+    "fail": 0,
+    "skip": 0,
+    "race_warnings": 0,
+    "race_instrumented": true,
+    "effective_inputs_sha256": "e5522f74325d882e4208448047daff5dd7e980a8efdaf1db5eb6772e583a6977",
+    "binary_sha256": "e6f764e9c91fdbdf62bddaffd78ea600c593d8bcda66eae98946204275bac4d2",
+    "original_manifest_sha256": "241c22b3f555ad573acfd3333f72ae8abad24422ac2318fe7324e9d0f31c94fa",
+    "original_status_sha256": "f474ac5c7e317a1e5c093510de456e0f4d75bb1234740233aec9e804e8e1b6dd",
+    "raw_log_sha256": "7ec437774499b0fb581ef041db372d1e7446ea8c0d85be0499e4accc521946a2",
+    "note": "18P0F: add only pending feedback and initial-probe offer cutoffs. Cold raw cumulative history remains independent of these ordinary train boundaries."
+  },
+  {
+    "selection": "warm-controls",
+    "pass": 27,
+    "fail": 0,
+    "skip": 0,
+    "race_warnings": 0,
+    "race_instrumented": true,
+    "effective_inputs_sha256": "e5522f74325d882e4208448047daff5dd7e980a8efdaf1db5eb6772e583a6977",
+    "binary_sha256": "e6f764e9c91fdbdf62bddaffd78ea600c593d8bcda66eae98946204275bac4d2",
+    "original_manifest_sha256": "241c22b3f555ad573acfd3333f72ae8abad24422ac2318fe7324e9d0f31c94fa",
+    "original_status_sha256": "e5360e1f85b7818eeb6e62522ffa57ec0d4740c4212e57847fc9df6674e48fd4",
+    "raw_log_sha256": "a531a11fb7526ec5ad1daac220ba5ad38beef37bd48b666d6205fd22f8d5c1eb",
+    "note": "27P0F unchanged warm component, lawful slowdown and identity controls on the same guarded binary; no actual closed-loop throughput claim."
+  }
+]

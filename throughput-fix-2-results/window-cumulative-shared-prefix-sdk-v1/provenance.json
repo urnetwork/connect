@@ -1,0 +1,55 @@
+{
+  "classification": "Experimental join preserves cold common-consumer roots and fixes relayed prefix timing ownership, while unchanged SDK Short passes and Long still fails. No overall sampler/throughput or live acceptance.",
+  "debugging_owners": [
+    "network_quality_design (Astra max)",
+    "lifetime_root_review (Astra max)"
+  ],
+  "disputed_original_tests": [
+    "TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain",
+    "TestWindowPacingSdkColdDrainedTrainUsesExactPair"
+  ],
+  "event_plumbing": false,
+  "join": "Cold shared-delivery v2 plus exact-head prefix timing correction. Common aggregate keeps all confirmed initial-H1 raw credit; nonzero receiver wait applies only to the exact newly credited head. Raw offer history never assumes relay ingress FIFO.",
+  "live_adoption": false,
+  "model_scope": "Original TestWindowPathRetainedSdkCumulativePacingShort and Long; unchanged fixture, SDK constructors, serializers, warmup, durations, capacity/refusal/direction thresholds. Normal1P1F: Shortpasses; Longdevice-default/connect-default400ms1flow candidate51.607102 vsreference131.045776Mb/s.",
+  "open_work": "Producer mixed/late/unknown/rebucket/long-RTT guard tests and warm closed-loop capacity proof remain separate. Shared cold fallback does not establish correction of a positive low service hold.",
+  "original_test_sources_preserved": true,
+  "performance_gates_changed": false,
+  "race_scope": "31 named roots\u00d73,87P6F; all29 cumulative/prefix roots pass. The two original exact multi-envelope corrected-rate SDK assertions fail all3 and remain explicit timing-contract review outcomes.",
+  "source_base": {
+    "artifact": "throughput-fix-2-cumulative-shared-prefix-joined-v1-pinned",
+    "snapshot_inputs_sha256": "a715126492cf0fa7595fbe6288dc4626bc8c43332fdb17e9039a4b0cca9bfc5a"
+  },
+  "source_inventory": {
+    "changed_files": [
+      "connect/transfer_window_receiver_prefix_ingress_test.go",
+      "connect/transfer_window_service_credit.go",
+      "connect/transfer_window_service_delivery.go"
+    ],
+    "known_disputed_timing_contract_tests": [
+      "TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain",
+      "TestWindowPacingSdkColdDrainedTrainUsesExactPair"
+    ],
+    "new_prefix_test_sha256": "9b66fe180f3563885cfdaf5f5fa7fa113c0afa795e8309c6e903b43c3a6efe05",
+    "prefix_credit_sha256": "aa6cdf317d4f0f0160b2fe60d482d00ba5b2b614951286b8bfccf27f4e68c5c0",
+    "prefix_source": "throughput-fix-2-receiver-prefix-ingress-after-pinned",
+    "preservation": "Disputed original exact multi-prefix corrected-rate assertions retained verbatim and included in focused race selection. All throughput/warmup/serializer/refusal gates unchanged. No current producer helper guard supplement exists yet; lifetime owns it separately. No hard caller/optional ACK overlays.",
+    "production_sha256": {
+      "transfer.go": "fcadd43bf1b92464e760bfe306b5591d40b6f1bc996754facd3e01df41e022cc",
+      "transfer_window_pacing.go": "30eaf2913f00de39c9835d92de4c29f7f26083855a40f27c8c6ec0fd15393118",
+      "transfer_window_pacing_delivery.go": "9644e8932e3fafa866ac5dfa699ca7930d83ea7a065fd267946a18e2a9494cf4",
+      "transfer_window_service_credit.go": "fb4e1c0e7e5fc2d5978e8768d7f8492ac5b006a507954c5b15787f66d1956e31",
+      "transfer_window_service_delivery.go": "74bcaea214f4bcad789c73a011d5ecaea5cb40c00e3839769cd02365a504bd1f"
+    },
+    "source_base": "throughput-fix-2-cumulative-shared-delivery-after-v2-pinned",
+    "source_base_snapshot_sha256": "63705ac8884f549c2291eceaebbfb3c817aa5fbdb3b31b63b91124c79e0c55b1",
+    "unchanged_test_sha256": {
+      "transfer_window_cumulative_pacing_test.go": "7d0ebcc5f263ec87846b03ea17576180c5711d2fab7c47af6a540fb386212347",
+      "transfer_window_cumulative_shared_policy_test.go": "f1a720bf440a5444db6087fe4b9d7ca2231bdbd6f78d55dbe35a19dbfdd687c4",
+      "transfer_window_cumulative_shared_reserve_test.go": "d4d50030910391cf7fa8a33960a9548afdfa076fe444f29964ca32a28ce94ca9",
+      "transfer_window_sdk_cumulative_pacing_test.go": "dbab643158d5c7fc506780e7b8b4f62a369c88c990e7901c864dfff720b4c366",
+      "transfer_window_sdk_receiver_interval_test.go": "68c5d1ec7e24711c9ca25307b6aa6e6ef57b7a0633f5f7238aeb23d6ce58645a"
+    }
+  },
+  "test_execution_owner": "test_monitor_medium (Terra medium)"
+}

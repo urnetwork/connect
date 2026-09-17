@@ -1,0 +1,110 @@
+--- a/transfer_window_cumulative_shared_reserve_test.go	2026-09-16 16:00:32
++++ b/transfer_window_cumulative_shared_reserve_test.go	2026-09-16 16:15:25
+@@ -14,8 +14,8 @@
+ // writes, and its complete flight remains within the actual opening window.
+ const windowCumulativeSharedMessageBytes = ByteCount(8 * 1024)
+ 
+-// No sockets or background source are needed: explicit confirmed write tails,
+-// complete ACKs and virtual clock events drive the same service ownership.
++// No sockets or background source are needed: confirmed initial H1 items,
++// once-only cumulative credit and virtual clock events drive service ownership.
+ type windowCumulativeSharedFixture struct {
+ 	sequences []*SendSequence
+ 	numbers   []uint64
+@@ -61,6 +61,56 @@
+ 		}
+ 	})
+ 	return fixture
++}
++
++// Each physical write has a real retained item before carrier confirmation.
++// Its frame allocation makes the existing resend queue own the same bytes.
++func (self *windowCumulativeSharedFixture) recordWrite(t *testing.T, index int, messageId Id, bytes ByteCount, at time.Time) {
++	t.Helper()
++	sequence := self.sequences[index]
++	item := &sendItem{
++		transferItem: transferItem{messageId: messageId, sequenceNumber: self.numbers[index]},
++		sendTime:     at, sendCount: 1, expectsAck: true, transferFrameBytes: make([]byte, int(bytes)),
++		pacingByteCount: bytes, pacingSentAtNanos: at.UnixNano(), rttState: sendItemRttWritePending,
++	}
++	sequence.resendQueue.Add(item)
++	sequence.finishReceiverRttWrite(item, transferWriteDisposition{transportType: TransportTypeH1, reliable: true}, nil)
++	if !item.rttH1 || item.rttState != sendItemRttWriteConfirmed {
++		t.Fatal("physical H1 write did not retain confirmed offer provenance")
++	}
++	if _, queued := sequence.resendQueue.QueueSize(); queued > sequence.sendBufferSettings.ResendQueueMaxByteCount {
++		t.Fatal("retained physical items exceeded their current byte permission")
++	}
++}
++
++// Cumulative publication traverses the real once-only credit owner. A repeated
++// cumulative head and late SACK cannot contribute another byte to either ring.
++func (self *windowCumulativeSharedFixture) publish(t *testing.T, index int, head Id, bytes ByteCount, at time.Time) {
++	t.Helper()
++	sequence := self.sequences[index]
++	before := sequence.windowPacer.serviceAcked
++	sequence.publishAckServiceCredit(head, false, at)
++	sequence.publishAckServiceCredit(head, false, at)
++	sequence.publishAckServiceCredit(head, true, at)
++	if sequence.windowPacer.serviceAcked-before != bytes {
++		t.Fatal("cumulative/repeated/SACK credit did not preserve exact physical bytes")
++	}
++	var removed ByteCount
++	for {
++		item := sequence.resendQueue.RemoveFirst()
++		if item == nil {
++			break
++		}
++		if !item.serviceCreditObserved {
++			t.Fatal("uncredited physical item escaped the cumulative owner")
++		}
++		removed += item.pacingByteCount
++	}
++	if removed != bytes {
++		t.Fatal("the cumulative flight did not release its exact retained frames")
++	}
++	sequence.observeAckedBytesWithServiceCredit(bytes, 0, windowServiceAckCredit{}, at)
++	self.published[sequence.windowPacer.service] += bytes
+ }
+ 
+ // Spend each service's opening allowance through actual reservations and
+@@ -96,6 +146,7 @@
+ 					sequence.sequenceId, head, self.numbers[index]); err != nil {
+ 					t.Fatal(err)
+ 				}
++				self.recordWrite(t, index, head, bytes, time.Now())
+ 				service.finishWrite(sequence.sequenceId, head, true)
+ 				remaining -= bytes
+ 			}
+@@ -105,10 +156,7 @@
+ 			at := time.Now()
+ 			sequence.rttWindow.closeSendTime(uint64(started.UnixMilli()), at)
+ 			service.acknowledgeWrite(sequence.sequenceId, head, self.numbers[index], false, 10*time.Millisecond, at)
+-			service.observe(flight, at)
+-			sequence.observeAckedBytesWithServiceCredit(flight, 0, windowServiceAckCredit{}, at)
+-			pacer.serviceAcked += flight
+-			self.published[service] += flight
++			self.publish(t, index, head, flight, at)
+ 		}
+ 		if service.probeSent != probeLimit {
+ 			t.Fatalf("real opening reservations did not spend the probe: %d/%d", service.probeSent, probeLimit)
+@@ -152,6 +200,7 @@
+ 				service.sent += messageBytes
+ 				sequence.windowPacer.serviceSent += messageBytes
+ 				service.beginWrite(sequence.sequenceId, heads[index], self.numbers[index], started, false)
++				self.recordWrite(t, index, heads[index], messageBytes, started)
+ 				service.finishWrite(sequence.sequenceId, heads[index], true)
+ 				remaining -= messageBytes
+ 			}
+@@ -176,10 +225,7 @@
+ 			service := sequence.windowPacer.service
+ 			sequence.rttWindow.closeSendTime(uint64(started.UnixMilli()), at)
+ 			service.acknowledgeWrite(sequence.sequenceId, heads[index], self.numbers[index], false, 10*time.Millisecond, at)
+-			service.observe(bytes, at)
+-			sequence.observeAckedBytesWithServiceCredit(bytes, 0, windowServiceAckCredit{}, at)
+-			sequence.windowPacer.serviceAcked += bytes
+-			self.published[service] += bytes
++			self.publish(t, index, heads[index], bytes, at)
+ 		}
+ 		for service := range groupBytes {
+ 			rate, _, held := service.measured(time.Second, time.Now())

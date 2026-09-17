@@ -1,0 +1,13 @@
+{
+  "after_invocation_root_count": 27,
+  "event_plumbing": false,
+  "performance_gates_changed": false,
+  "race": true,
+  "repetitions": 3,
+  "scope": "Service-qualified growth reports peer, memory, configured-byte or floor binding correctly without changing sizing arithmetic. Target-bound and below-bound service controls remain unchanged. After outcomes are the exact three-root subset of the 27-root combined run; the full invocation status remains in source pins. The later structural owner violation is separately retained and fixed in window-retention-binding-owner.",
+  "selected_tests": [
+    "TestWindowRetainedServiceGrowthReportsHardBound",
+    "TestWindowRetainedServiceGrowthReportsTargetBound",
+    "TestWindowRetainedServiceGrowthReportsServiceBelowBounds"
+  ]
+}

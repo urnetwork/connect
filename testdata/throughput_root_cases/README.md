@@ -3,6 +3,77 @@
 These are regression assertions, including failures that still need fixes.
 They use explicit worker barriers, virtual time or exact timestamp sequences.
 No failing case is skipped or converted into an expected-pass wrapper.
+The separate model performance runner defers only three explicit path-change
+tests until the user-requested quality signal is available; see
+[the phase inventory](../../THROUGHPUTFIX-PR2.md#31-separate-notified-path-changes-from-core-pacing-validation).
+That deferral does not apply to these deterministic ownership/timing roots.
+
+## Pacing discovery roots
+
+The remaining static-path losses were the pace owner reading its own
+release rate as the path's limit; see
+[research plan section 34](../../THROUGHPUTFIX-PR2.md#34-the-pacer-measures-its-own-limit-discovery-and-held-pace).
+`transfer_window_pacing_discovery_test.go` and
+`transfer_window_pacing_discovery_state_test.go` hold the pure rate
+contracts, the service-state root and the closed-loop cells; the
+`TestWindowPacingCumulative*` contracts were re-pinned to the discovery floor
+with queued and unqueued variants of the slow cases. The live correctness
+selection runs all of them under race instrumentation.
+
+## Test contract review
+
+See [research plan section 30](../../THROUGHPUTFIX-PR2.md#30-audit-test-contracts-before-further-estimator-changes)
+before interpreting a failed assertion as a production defect. Exact byte
+ownership, ACK coverage and bounds remain invariants. Immediate estimator
+responses, internal ring flags and throughput recovery deadlines describe
+separate implementation or performance choices. A cold service estimate may
+abstain when qualified cumulative delivery supplies the actual pacing rate;
+assert that observable behavior rather than requiring every intermediate
+estimate to be positive. Frozen original comparisons remain available.
+
+`transfer_window_h1_policy_contract_test.go` checks the physical fixture's
+configuration assertion independently of throughput. A valid configured arm
+may have only service evidence or retain its learned window after both current
+proofs expire. Constructor and actual destination sequence mode, scale and
+instruments still have to agree. Eight roots also reject disabled settings,
+missing destination owners and unknown arms. The live correctness selection
+includes them; physical throughput/refusal/calibration gates remain separate.
+
+The [receiver semantic audit](../../throughput-fix-2-results/service-receiver-semantic-audit-v1/semantic-audit.md)
+keeps research fixtures separate from live package coverage. Oversized or
+over-permission inputs are not production failure proof. Corrected cumulative
+groups use two legal 6,000-byte messages and a bounded rolling opening. They
+still expose a repeated difference between per-refill and batched estimator
+reads, with exact credit and window limits preserved. The legal slowdown
+comparison also reproduces excessive global pacing before the conservative
+decrease correction. Per-lane passing rates do not certify aggregate utilization;
+actual shared reservation cost and full-path performance remain separate gates.
+
+The [shared cumulative consumer proof](../../throughput-fix-2-results/window-cumulative-shared-reserve-root-v3)
+adds separate equal and unequal two-/four-lane utilization cases. All four fail
+three repetitions while the single-lane, idle/stale, independent-service and
+twelve original cumulative controls pass. It supplies legal training feedback,
+then exercises the real shared reservation and dispatch budget; the training
+itself does not run a closed-loop pacer. The research source is archived and
+is not yet part of the live correctness selector. The
+[attributed-credit fixture](../../throughput-fix-2-results/window-cumulative-shared-credit-root-v4)
+now reproduces the same four defects through real queued send items. The common
+delivery candidate passes its corrected 72-check selection, but a static warm
+long-RTT recovery control and actual performance are still required.
+
+## Caller cancellation ownership
+
+`transfer_pack_context_owner_test.go` and
+`transfer_forward_pack_context_owner_test.go` cover cancellation before and
+during bounded admission, already accepted siblings, cancellation after
+acceptance, and recreation after genuine shared-sequence closure. Constructor
+hooks and `synctest.Wait` force the ordering without sockets or polling. Failed
+admission retains caller ownership; accepted bytes retain sequence ownership.
+The standalone matched comparison records six passes/18 failures before and
+24 passes after under race, plus 24 adjacent passes. The canonical correctness
+selector includes all eight roots. A separate frozen live-source comparison
+repeats the same six passes/18 failures before, 24 passes after and 24 adjacent
+passes, without races; the live sampler remains unchanged.
 
 ## Production cases
 
@@ -34,6 +105,167 @@ delayed physical confirmation, read ordering, fixed bounds and other carriers.
 The working drain correction passes its eleven liveness roots, but that
 correction is excluded from the committed-source baseline above. Its wider
 performance acceptance remains open.
+
+## Lifetime and initial-feedback follow-up
+
+The next cases extend the inventory when the lifetime candidate and broader
+model exposed additional conditions. They remain ordinary assertions; a
+performance failure is not converted into a passing reproduction wrapper.
+
+| Failure condition | Executable coverage |
+| --- | --- |
+| A paced retry temporarily loses the original copy's ACK identity | `TestWindowPacingLifetimeRetryWaitKeepsAckIdentity` |
+| Recovery order hides an earlier lifetime during an ordinary idle wait | `TestWindowPacingLifetimeIdleWaitKeepsOlderDeadline` |
+| Queued head/SACK feedback protects an older message while a younger one waits | `TestWindowPacingLifetimePendingHeadPreservesYoungerWrite`, `TestWindowPacingLifetimePendingSackPreservesYoungerWrite`; also preserve the original RTT tag timestamp |
+| Equal timer deadlines or a delayed admission allow expired data to dispatch | `TestWindowPacingLifetimeEqualPacingDeadlineExpiresFirst`, `TestWindowPacingLifetimeLateAdmissionCannotDispatch` |
+| Route backpressure hides expiry after pacing has finished | `TestWindowPacingLifetimeFullRouteKeepsOriginalDeadline`, with `RouteRecoveryBeforeExpiry` and `RouteWakePreservesWriterBudget` controls |
+| Cleanup of an expired younger message loses the older prefix's received ACK | `TestWindowPacingLifetimeAcknowledgedPrefixSurvivesYoungerExpiry` |
+| Delivery arrives while an admitted retry is held | `TimelyHeadSurvivesDelayedAdmission`, `TimelySackSurvivesDelayedAdmission`, `LateHeadSuppressesDelayedRetry`, `LateSackSuppressesDelayedRetry` in `transfer_window_pacing_lifetime_adjacent_test.go` |
+| Cancellation after pacing admission still publishes data | `TestWindowPacingLifetimeCancellationAfterAdmissionCannotDispatch`, `TestWindowPacingLifetimeStandaloneCancellationAfterAdmission` |
+| An older SACK hides a newer valid compact-contract recovery request | `TestWindowPacingLifetimeNewerContractRequestPreservesRenewal`, with wrong-contract, full-proof and once-only renewal controls in `transfer_window_pacing_lifetime_contract_test.go` |
+| The constrained H1 SDK sender loses capacity after its first feedback | `TestWindowPathSdkConstrainedInitialFeedback`, with `ConstrainedLaterFeedbackControl` and the original unforced `ConstrainedLongWindow` cell |
+| A fully drained SDK opening prices one resumed ACK across its turnaround as service | `TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService`, with `InitialOutstandingFlightDiscoversSlowService` and `InitialFreshPairDiscoversSlowService` controls |
+
+ACKs already received when the worker resumes retain the existing delivery-
+before-expiry ordering. The late-ACK controls require suppressing the unissued
+duplicate and preserving cumulative/selective results; they do not introduce
+a new rule that converts received delivery into a timeout.
+
+The SDK test forces the first ACK at 205 ms on the existing 400 ms RTT,
+one-flow constrained-device cell. A 220 ms first ACK is its positive control.
+The unchanged serializer, warmup, duration, finite bounds and 90% capacity gate
+apply to both. The forced cell still has a mixed race result (two failures and
+one pass); its first-ACK barrier alone is not a deterministic root proof. The
+later control passes all three repetitions. The intermittent original cell
+also fails on the source without the lifetime correction, so it is not
+attributed to that correction. The
+first-feedback barrier verifies the actual active lane mask, including the
+original eight-lane duplex control.
+
+The separate cold-service root is deterministic: a confirmed empty opening
+followed by one resumed ACK yields 3,459 B/s and a 626 ms pacing delay. It fails
+three times on independent lifetime-corrected sources, while both slow-service
+controls pass three times each. All nine results are retained in
+`throughput-fix-2-results/sdk-initial-service-root-before`.
+
+The experimental retained-window policy has six additional deterministic tests
+in `transfer_window_retained_test.go`. They exercise evidence-based growth,
+adaptive pacing during slowdown, temporary hard bounds, target changes, missing
+evidence and observational statistics. All 18 repeated assertions fail before
+and pass after the isolated sizing change; the complete existing-root comparison
+is retained in `throughput-fix-2-results/window-retention-policy-v1`. This is a
+policy feasibility experiment with event plumbing deferred, not a replacement
+for the sampler failure assertions or performance gates.
+
+### Retained-window and sampler controls
+
+| Condition | Executable coverage and evidence |
+| --- | --- |
+| A healthy serialization train cannot grow a window before cumulative history spans multiple RTTs | `TestWindowRetainedMeasuredServiceCanGrowConstrainedFlight`; a single-reply negative control and four actual-worker 400 ms cells live in `transfer_window_retained_growth_test.go` |
+| An unrelated shared H1 rate grows an unknown, H3, P2P or mixed lane | `transfer_window_retained_service_scope_test.go`; actual route publications, H1 sibling and independent local-service controls |
+| The target narrows a candidate but does not actually bind retained admission | Three `TestWindowRetainedTargetMetadata*` assertions; `window-retention-target-diagnostic` retains six before failures and 27 after passes |
+| Campaign output labels qualified serialization growth as unsized | `TestWindowRetainedCampaignAcceptsServiceQualification`; cumulative-only, service-only, both and unqualified cases; three failures before and three passes after |
+| A cold drained opening resumes before physical confirmation or complete logical accounting | `transfer_window_sdk_initial_service_order_test.go`; ACK-before-confirmation, delayed accounting, sibling-first feedback, unread valid pairs and late old-flight pairs |
+| A successful drain is read between proof and resumed dispatch | `TestWindowPacingSuccessfulDrainReadBetweenProofAndDispatch`; receiver metadata and legacy cases |
+| A drain hold masks real slower or faster service | `SuccessfulDrainTimeoutAcceptsSlowService`, `SuccessfulDrainAbandonmentAcceptsSlowService`, `SuccessfulDrainPartialDeliveryCanRaiseService`, `SuccessfulDrainConfirmedProbeAcceptsSlowService` |
+| A later drain revives a retired measurement cycle | `TestWindowPacingSuccessfulDrainCannotRestoreRetiredCycle`; the first candidate fails three times and the corrected candidate passes |
+| Rolling limited flights join their refill gaps into a false slow sample | `TestWindowPacingCompressedFlightsKeepMeasuredSerialization` and `TestWindowPacingLimitedFlightReorderedAccountingKeepsService` |
+| Protecting limited flights masks genuine slower service | `TestWindowPacingLimitedFlightAcceptsContinuousSlowPair`, `TestWindowPacingLimitedFlightAcceptsQueuedSlowService`, `TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts`; the repeated-refill control has no global drain or quality signal |
+| Buffered carrier reads look faster after queue evidence clears or rotates out | `TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets`, `TestWindowPacingCarrierPeakStaysUnqualifiedAfterQueueClears`, `TestWindowPacingCarrierLateAccountingRetainsQueueProvenance` |
+| Rejecting a queued peak prevents a later genuine increase | `TestWindowPacingCarrierFreshFastPairSupersedesRejectedPeak`, `TestWindowPacingCarrierSameBucketHoldEndsAtFreshTrain`, `TestWindowPacingCarrierSustainedQueuedIncreaseRaisesService`; original capacity-recovery controls remain unchanged |
+| Delayed queued RTT overwrites a newer delivery bucket at the same ring index | `TestWindowPacingLateQueuedTimingCannotEvictRecentDelivery`; exact 64/65-bucket boundaries, legacy and receiver timing, with the valid RTT observation preserved |
+| Dropping old timing markers also drops one that is still inside the service ring | `TestWindowPacingOldestRetainedQueuedTimingStillQualifiesDelivery`; the 63-bucket control still prevents a buffered peak after newer timing replaces the original tuples |
+| Modest queue evidence lets a limited-flight refill gap reprice service | `TestWindowPacingLimitedFlightModestQueueKeepsSerialization`; actual physical tails keep the service occupied, while slower continuous, queued and repeated-refill controls still adapt |
+| A new RTT admits old propagation silence into a fresh fast train | `TestWindowPacingFreshTrainRejectsPriorPropagationGap`; the below-allowance and sustained-slowdown tests preserve downward adaptation |
+| A drained RTT probe empties the ring before the first queued byte accounting | `TestWindowPacingFirstQueuedTimingAfterEpochKeepsProvenance`; exact physical probe/tail identities, legacy/receiver timing and later timing eviction, with prompt-accounting and cold-empty controls |
+| Timing-only queue markers revive an abandoned drain's reset | The unchanged `TestWindowPacingAbandonedDrainCannotResetLaterService` rejects the initial empty-ring fix; the corrected candidate requires actual delivery evidence |
+| Statistics race with route-writer publication or retirement | `TestWindowStatsConcurrentWriterTeardown`, `TestWindowStatsConcurrentWriterPublication`; explicit access barriers reproduce both original races in three fresh processes |
+| Synchronizing the writer blocks statistics behind external retirement | `TestWindowStatsWriterRetirementDoesNotBlockSnapshot`; a real retained route reference is released only after the statistics read completes |
+| A cold pacer ignores qualified cumulative delivery, or borrows another carrier's rate | `transfer_window_cumulative_pacing_test.go`; one reply, tiny/stale/pre-permission history, hard bounds, positive service precedence, current H1-only policy and sibling/local ownership |
+| An advertised ACK timer makes a refill gap complete a limited-flight cycle | `TestWindowPacingLimitedFlightAckPhaseDoesNotCompleteService`; actual receiver waiting, rolling physical tails and existing slow-service controls |
+| Newer legacy timing borrows an older receiver delay | `transfer_window_service_feedback_delay_test.go`; both equal-timestamp orders, actual held feedback and delayed byte accounting |
+| Changing receiver waits stretch a fast delivery interval into a false slow sample | `transfer_window_service_receiver_interval_test.go`; real coalescer, exact first H1 writes, overlapping flight, equal-wait slow service and corrected slower service |
+| A qualified pair expires while cycle start and completion use different receiver-delay allowances | `transfer_window_service_refill_interval_test.go`; two siblings with callback-driven FIFO refills preserve physical overlap, while a 125 ms serializer must adapt to 10 kB/s |
+
+The cold-start comparison passes all 24 repeated root/control executions after
+12 passes/12 failures before. The subsequent drain comparison passes all 60
+executions after 51 passes/9 failures before. These sampler-only comparisons
+retain the preceding production sizing policy, so their 126-test affected
+selection still exposes the separate short-compression window failure.
+`sdk-initial-sampler-correction` and `successful-drain-sampler-correction`
+retain the normalized evidence. The combined model is a separate acceptance
+gate; no notification is used to make these roots pass.
+
+The subsequent `service-qualification-correction` comparison repeats 14 roots
+and controls three times: 21 passes/21 failures before, 42 passes after. The
+154-test affected selection records 146 passes/8 failures before and 153
+passes/1 failure after. The one remaining short-compression failure uses the
+preceding sizing core. These results isolate one sampler-file change; they
+do not establish combined throughput or validate later edits.
+
+The separate `service-queue-horizon-correction` comparison records three
+passes/three failures before and six passes after under race. Its affected
+selection records 154 passes/two failures before and 155 passes/one failure
+after. The remaining failure again belongs to the preceding sizing core.
+
+`service-gap-qualification-correction` adds the traced gap conditions and
+unchanged slow/fast controls: 24 passes/six failures before, 30 passes after.
+The broader selection improves from 157 passes/three failures to 159 passes/one
+older-core failure. Its combined six-gate model follow-through restores RTT
+growth, but changing receiver windows and long SDK paths still fail.
+
+`service-queue-epoch-correction` preserves the original, rejected and corrected
+variants. Its four repeated roots record nine passes/three failures, nine
+passes/three different failures, then 12 passes. The wider 163-test selection
+ends at 162 passes/one older-core failure. Byte totals, physical drain proof
+and the abandoned-drain invariant remain unchanged.
+
+`window-writer-statistics-owner-v2` uses identical immediate-access barriers
+in both variants. Each of three fresh before processes fails both race roots
+and passes the retirement control; each after process passes all three. The
+adjacent after selection adds 60 passes. The v1 archive retains the earlier
+start barrier and its missed teardown reproduction.
+
+The initial nine cumulative-pacing roots improve from 21 passes/six failures
+to 27 passes. With carrier and sibling controls added, the separate scope
+correction improves from 33 passes/three failures to 36 passes. These comparisons
+use identical preceding samplers and preserve candidate arithmetic; actual
+SDK throughput is recorded separately.
+
+The ACK-phase correction improves 21 passes/three failures to 24 passes; the
+mixed-feedback correction improves nine passes/three failures to 12 passes.
+Both are repeated race comparisons. The new receiver-interval roots improve
+three passes/six failures to nine passes on an isolated warm candidate, whose
+actual six-gate throughput selection still has four passes/two failures.
+`window-receiver-credit-attribution-v1` separately retains 18 passes/nine
+failures before and 24 passes/three failures after: invalid identities, mixed
+carriers/prefixes, sibling timing, delayed accounting, SACK replay and
+nonpositive corrected clocks are covered; the cold short-train root still fails.
+These candidate proofs do not establish full combined acceptance.
+
+`service-receiver-refill-correction` records three passes/three failures before
+and six passes after under race. `window-sdk-cold-receiver-qualification-v1`
+retains the isolated cold proof: 30 passes/nine failures become 39 passes, with
+93 adjacent race passes. Buffered readers and one cumulative reply cannot
+create a cold capacity sample; a fully qualified short pair can. The combined
+six-gate candidate then passes all targeted throughput tests, while endpoint
+ordering and retained-summary consumers still need their own acceptance proofs.
+
+The intermediate lifetime fixes are preserved in
+`throughput-fix-2-results/lifetime-owner-evolution`: timestamp mutation and the
+equal-deadline error each have a failing earlier candidate. The full v3
+regression reports 3,203 passes, five service-root failures and 25 skips. Its
+five failures map to the production table above. The separate v1 model has
+23 passes/four failures, 782 service-reading JSON records and 36 compact model
+summaries; SDK early exit prevents a claim that it measured the complete sweep.
+
+Run the added lifetime family under race, and the affected SDK controls
+separately:
+
+```sh
+go test -race -count=3 -run '^TestWindowPacingLifetime' .
+go test -race -count=3 -run '^TestWindowPathSdkConstrained(InitialFeedback|LaterFeedbackControl)$' .
+```
 
 ## Existing root and adjacent coverage
 

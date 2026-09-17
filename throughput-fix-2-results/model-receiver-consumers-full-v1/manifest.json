@@ -1,0 +1,10 @@
+{
+  "archive": "model-receiver-consumers-full-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "4ba3b524bfab1eb72b2d1d2cdfe6dc910aca456baa2925653f0f81313dffbf5f",
+    "outcomes.jsonl": "e55830704dced2c543b0cf713fbfdbe6b7ffc5727caa762d164a55e39c6f8ba7",
+    "provenance.json": "45c9e03901d675b09ac1124e829882fd92f5be22dec05c7f7d47644e74a4e27a",
+    "source-pins.json": "924a6ac7f2be6cd2b9dfa9f4ba2d80657b34b1d6f0219800c9b8ab5fb7024841",
+    "status.json": "ec51799af78bab5a0aeaf6f41269d865cbe312930c46f3b3e5567678e980cfeb"
+  }
+}

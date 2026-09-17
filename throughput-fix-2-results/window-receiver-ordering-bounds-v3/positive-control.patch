@@ -1,0 +1,11 @@
+--- a/transfer_window_receiver_ordering_test.go
++++ b/transfer_window_receiver_ordering_test.go
+@@ -178,7 +178,7 @@
+ 		{bytes: 12000, delivered: 101700 * time.Microsecond},
+ 	}
+ 	for _, phase := range []time.Duration{0, 9 * time.Millisecond} {
+-		for _, order := range [][]int{{0, 1, 2}, {2, 1, 0}} {
++		for _, order := range [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}} {
+ 			service, at := windowReceiverOrderingService(t, phase, 10*time.Millisecond, points, order, 0)
+ 			rate, _, latest := service.measured(time.Second, at)
+ 			if measured := max(rate, latest); measured != 10000000 {

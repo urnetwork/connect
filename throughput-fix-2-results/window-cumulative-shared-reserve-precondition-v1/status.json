@@ -1,0 +1,6 @@
+{
+  "classification": "Initial fixture did not reach zero service for multiple lanes; failures are precondition-only, not fallback utilization evidence.",
+  "outcomes": 48,
+  "readings": 3,
+  "worker_readings": 0
+}

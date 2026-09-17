@@ -1,0 +1,38 @@
+{
+  "manifest_sha256": "74e1e38eca598ede5ba01be29cd0a47414134a4dd815a4776808070be8b68845",
+  "binary_sha256": "f5bfabd76aa5819adcbd3a8089ddb347c5ded093bfe5de8492140d5d172b39ef",
+  "effective_inputs_sha256": "da31f0e87fbe6c0f7c034d140d3a0804ca104b6bc65577690bf906f1ac8a9c43",
+  "argv": [
+    "/private/tmp/throughput-fix-2-sdk-initial-sampler-before-pinned/tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingSdkInitial(DrainedReplyDoesNotEstablishService|OutstandingFlightDiscoversSlowService|FreshPairDiscoversSlowService|AckBeforeWriteConfirmation|DelayedOpeningAccounting|SiblingFeedbackStartsFreshTrain|UnreadPairPreservesService|LateOpeningPairRemainsEvidence)$",
+    "-test.count=3",
+    "-test.timeout=90s"
+  ],
+  "started_utc": "2026-09-16T16:04:17.686946+00:00",
+  "loadavg_start": [
+    38.65380859375,
+    24.34326171875,
+    14.92236328125
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent retained-window implementation and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 1.0734680839814246,
+  "loadavg_end": [
+    40.04248046875,
+    24.86865234375,
+    15.16259765625
+  ],
+  "ended_utc": "2026-09-16T16:04:18.760885+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "87b837f0e6ced9d97e813dc31e73682e004e0c9f076f1d033efd8f9be6d6d251",
+  "pass": 12,
+  "fail": 12,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "rows": 3
+}

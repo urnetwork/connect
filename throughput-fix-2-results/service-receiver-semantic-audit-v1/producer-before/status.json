@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "9822ede193c142a416eef5d3f6c2d5360a1f9186b2be909ac5dd72370a7368f4",
+  "binary_sha256": "8667c561f19425b3790c2c4dcaba7a9470ceff42c6a0e0de3c6199cf52f6800c",
+  "effective_inputs_sha256": "39e800f6aaaa3ac90476d9f84a0092dc1b194a3c9129dd1d6b3ccf31b831013f",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiverSustainedSiblings",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied module as build; original absolute relationship is pinned by original status/manifest hashes",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:07:16.464285+00:00",
+  "loadavg_start": [
+    36.0380859375,
+    19.7294921875,
+    14.41357421875
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 4.631991332862526,
+  "loadavg_end": [
+    35.23388671875,
+    19.83349609375,
+    14.4814453125
+  ],
+  "ended_utc": "2026-09-16T20:07:21.096779+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "3b19d2ccaa060072d4c8852a4a863de6c701ff094043f4745966e56e1c621b7d",
+  "pass": 12,
+  "fail": 6,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "Private producer convergence policy: cold0 and old1M remain flat through384cycles. Cold0 is not by itself a final pacing failure; see consumer-before.",
+  "rows": 450
+}

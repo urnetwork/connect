@@ -408,8 +408,14 @@ func TestWindowPacingDrainNeedsDeliveryAndHasDeadline(t *testing.T) {
 					t.Fatalf("drain cancellation: err=%v elapsed=%s", err, time.Since(start))
 				}
 			} else {
-				if err != nil || time.Since(start) != 200*time.Millisecond {
-					t.Fatalf("%s tail defeated the drain deadline: err=%v elapsed=%s", outcome, err, time.Since(start))
+				wait := 200 * time.Millisecond
+				if outcome == "carrier-change" {
+					// Lost physical proof abandons the measurement; it does not
+					// certify an empty relay or grant a new RTT floor below.
+					wait = 20 * time.Millisecond
+				}
+				if err != nil || time.Since(start) != wait {
+					t.Fatalf("%s tail drain: err=%v elapsed=%s, want=%s", outcome, err, time.Since(start), wait)
 				}
 				probe := NewId()
 				service.beginWrite(sequenceId, probe, 2, time.Now(), false)
@@ -606,8 +612,8 @@ func TestWindowPacingDrainedProbeRejectsAmbiguousEvidence(t *testing.T) {
 	}
 }
 
-// Refreshing the service alone leaves a sequence's old sample minimum below
-// the new propagation time. The window must use the same refreshed floor.
+// A stale sequence minimum cannot suppress growth earned after the shared
+// service discovers a longer path. A timing observation alone is not growth.
 func TestWindowPacingWindowUsesRefreshedServiceResidence(t *testing.T) {
 	start := time.Unix(1700000000, 0)
 	sequence := newEstimatorFixture(t, func(settings *SendBufferSettings) {
@@ -615,12 +621,23 @@ func TestWindowPacingWindowUsesRefreshedServiceResidence(t *testing.T) {
 		settings.ResendQueueBudget = NewTransferMemoryBudget(mib(48))
 		settings.TargetGoodputByteRate = 125000000
 	})
+	t.Cleanup(func() { sequence.resendQueue.Clear() })
 	sequence.rttWindow.closeSendTime(uint64(start.Add(-time.Millisecond).UnixMilli()), start)
 	sequence.observeReceiveWindowAdvertisement(receiveAckMessage{receiveWindowSet: true, receiveWindowByteCount: uint32(mib(48)), ackCompressTimeoutSet: true, ackCompressTimeoutMicros: 10000})
+	sequence.receiveWindowSetAtNanos.Store(start.UnixNano())
 	sequence.windowPacer.service = &windowPacingService{minRoundTrip: 100 * time.Millisecond}
 	estimate := sequence.sendWindowEstimate(start)
-	if estimate.RoundTrip != 100*time.Millisecond || estimate.WindowRoundTrip != 110*time.Millisecond || estimate.Window < 12500000 {
-		t.Fatalf("the stale sequence minimum still shrank a newly longer path: %+v", estimate)
+	if estimate.RoundTrip != 100*time.Millisecond || estimate.WindowRoundTrip != 110*time.Millisecond || estimate.Window != estimate.Initial {
+		t.Fatalf("timing observation changed the cold window or lost the service residence: %+v", estimate)
+	}
+	at := start
+	for range 40 {
+		at = at.Add(10 * time.Millisecond)
+		sequence.observeDeliveredBytes(1024*1024, at)
+	}
+	estimate = sequence.sendWindowEstimate(at)
+	if !estimate.Sized || estimate.RoundTrip != 100*time.Millisecond || estimate.WindowRoundTrip != 110*time.Millisecond || estimate.Window < 12500000 {
+		t.Fatalf("stale sequence timing suppressed qualified growth on the longer path: %+v", estimate)
 	}
 }
 

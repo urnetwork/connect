@@ -1,0 +1,8 @@
+{
+  "outcome": "PASS",
+  "performance_runs": 0,
+  "seconds": "0.00s",
+  "test": "TestReceiverServiceTupleWireBudgetDesign",
+  "tests_failed": 0,
+  "tests_passed": 1
+}

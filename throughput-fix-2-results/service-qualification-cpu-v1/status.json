@@ -1,0 +1,6 @@
+{
+  "benchmark_readings": 36,
+  "process_failures": 0,
+  "race_instrumented": false,
+  "zero_allocations": true
+}

@@ -1,0 +1,67 @@
+{
+  "build_script_sha256": "8c555db57115dc5da38747533d1124229b879b7bb742660d0a6fdfd5300a905b",
+  "count": 3,
+  "fixture_test_file_sha256s": {
+    "max_span_diagnostic": "38463acffcbfc670ad7288f1940d15dad8740c302d8841107a66f0367925b4d1",
+    "receiver_queue_roots": "9b01aa99335add4e4ff0667ca48391bea2156eccd7152e32d344c5fce0c987f9"
+  },
+  "selector": "^(TestWindowReceiverQueueCompression.*|TestWindowReceiverIngressClockDoesNotMeasureOwnPacing|TestWindowReceiverIngressPacedOfferCannotLowerCapacity|TestWindowReceiverIngressAcceptsGenuineSlowerSerialization|TestWindowReceiverIngressSlowerServiceBelowContinuouslyPacedOffer)$",
+  "variants": [
+    {
+      "binary_sha256": "53c0678ca8cf58f4c4f9b125aa4022beda0d80916958d2b2be80e6559f6ae8ac",
+      "compile_inputs_stable": true,
+      "compile_manifest_sha256": "3c4adea1e0efa7e225d908f733b59d17c94e5427c02c12c0d9546934cacd1fd1",
+      "effective_input_file_count": 776,
+      "effective_input_sha256": "d57377abf0f3475baa3dcd771a9f26859a8b2f990d040aec432112bf087bf402",
+      "fail": 6,
+      "loadavg_end": [
+        12.28271484375,
+        11.58837890625,
+        11.60986328125
+      ],
+      "loadavg_start": [
+        12.65576171875,
+        11.6494140625,
+        11.63134765625
+      ],
+      "monitor_status_sha256": "f43027ea9bb82bb1821dd17506dabf602df94d9d12f2cd08c1bcec1035cf3b86",
+      "overlay_sha256": "c5b3420fbc0846e8f119680c7225e374f60ce3ad4cb866ba4ab684567011362b",
+      "pass": 15,
+      "race_warning": false,
+      "raw_log_sha256": "074fda9793681a3a602ac335d7eaee197db5573e74475c487c44cc8b1b00cede",
+      "run_context": "receiver-queue-review; concurrent-workload=relay-full-model; no-quiescence-wait",
+      "run_exit_code": 1,
+      "run_inputs_stable_after": true,
+      "run_inputs_stable_before": true,
+      "variant": "before"
+    },
+    {
+      "binary_sha256": "b7372dafb0e4d5d4ac7a18e218ed86e7d66dbae4dffb7e706a0faf07e939855a",
+      "compile_inputs_stable": true,
+      "compile_manifest_sha256": "1ef4e189468f6b1f41b7ac6a67ab9123fdab9c4b7f0c9d19343d6458b28f58c5",
+      "effective_input_file_count": 776,
+      "effective_input_sha256": "32b57efe5ebedd8f4902b1d88d3f75568e1f23efea1c4903e264813f21f88d2e",
+      "fail": 3,
+      "loadavg_end": [
+        11.779296875,
+        11.4951171875,
+        11.57666015625
+      ],
+      "loadavg_start": [
+        11.779296875,
+        11.4951171875,
+        11.57666015625
+      ],
+      "monitor_status_sha256": "10a78ae2647d8e337c6be5840615d7dc9b298556cdb48ba0f2a1d0f4ae9eae82",
+      "overlay_sha256": "6f33f384a807ef4d291e430701bf84f026484d5607e01d5594d74f19ac286e13",
+      "pass": 18,
+      "race_warning": false,
+      "raw_log_sha256": "03a76b12ea8afc5c46206ac8da869fa4b9531d258998ec0941e4011761ebffea",
+      "run_context": "receiver-queue-review; concurrent-workload=relay-full-model; no-quiescence-wait",
+      "run_exit_code": 1,
+      "run_inputs_stable_after": true,
+      "run_inputs_stable_before": true,
+      "variant": "after"
+    }
+  ]
+}

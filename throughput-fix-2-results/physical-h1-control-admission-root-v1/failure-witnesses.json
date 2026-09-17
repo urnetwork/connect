@@ -1,0 +1,17 @@
+{
+  "constant_and_delivery_fail_in_all_repetitions": true,
+  "witnesses": [
+    "sizing=0: released H1 slot did not deliver the owned52B ACK without retransmission: acks=[] drops={IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}",
+    "sizing=0: transient bounded admission lost control: {IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}",
+    "sizing=1: released H1 slot did not deliver the owned52B ACK without retransmission: acks=[] drops={IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}",
+    "sizing=1: transient bounded admission lost control: {IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}",
+    "sizing=0: released H1 slot did not deliver the owned52B ACK without retransmission: acks=[] drops={IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}",
+    "sizing=0: transient bounded admission lost control: {IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}",
+    "sizing=1: released H1 slot did not deliver the owned52B ACK without retransmission: acks=[] drops={IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}",
+    "sizing=1: transient bounded admission lost control: {IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}",
+    "sizing=0: released H1 slot did not deliver the owned52B ACK without retransmission: acks=[] drops={IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}",
+    "sizing=0: transient bounded admission lost control: {IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}",
+    "sizing=1: released H1 slot did not deliver the owned52B ACK without retransmission: acks=[] drops={IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}",
+    "sizing=1: transient bounded admission lost control: {IngressNatPacketCount:0 IngressNatByteCount:0 ReturnQueuePacketCount:0 ReturnQueueByteCount:0 ReturnSendPacketCount:1 ReturnSendByteCount:52}"
+  ]
+}

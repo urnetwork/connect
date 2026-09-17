@@ -1,0 +1,72 @@
+{
+  "event_plumbing": false,
+  "partitions": {
+    "bounds": {
+      "passes": 9,
+      "tests": [
+        "TestWindowRetainedServiceGrowthReportsHardBound",
+        "TestWindowRetainedServiceGrowthReportsTargetBound",
+        "TestWindowRetainedServiceGrowthReportsServiceBelowBounds"
+      ]
+    },
+    "controls": {
+      "passes": 18,
+      "tests": [
+        "TestAClampedWindowReportsTheMemoryShare",
+        "TestAConfiguredCeilingDoesNotReportTheMemoryShare",
+        "TestAClampedWindowFollowsItsShareDownAndUp",
+        "TestWindowPacingDestinationStatsDoNotUpdateServiceHold",
+        "TestWindowPacingDestinationStatsCannotRepriceConfirmedProbe",
+        "TestWindowPacingDestinationStatsKeepSharedServiceEvidence"
+      ]
+    },
+    "policy": {
+      "passes": 42,
+      "tests": [
+        "TestWindowMismatchCapacityIncreaseStartsFreshDeliveryEvidence",
+        "TestALearnedWindowSurvivesTheMemoryClamp",
+        "TestDeliveryGrowthRemainsBelowTheSmallMemoryShare",
+        "TestTheThreePeerBranchesHaveDifferentPermissionCeilings",
+        "TestAdvertisementRaisesPermissionWithoutLearningCapacity",
+        "TestDeliveryCandidatesRequireFreshPermissionHistory",
+        "TestGrowthDoublesFromAFullWindowAndStallsFromAHalfFilledOne",
+        "TestWindowPacingWindowProofPreservesHardBoundsAndRetainedCapacity",
+        "TestWindowPacingWindowProofAcceptsFreshSlowDeliveryWithoutShrinking",
+        "TestWindowPacingWindowProofWaitsForPhysicalConfirmation",
+        "TestWindowPacingWindowProofPreservesOtherCarrierHistory",
+        "TestWindowPacingNewPathProofRequiresFreshCumulativeDelivery",
+        "TestWindowPacingQueuedPathObservationKeepsDeliveryCandidate",
+        "TestALegacyAcknowledgementCannotOverwriteAnAdvertisement"
+      ]
+    },
+    "selection": {
+      "passes": 12,
+      "tests": [
+        "TestWindowDestinationStatsKeepsLargestEffectiveWindow",
+        "TestWindowDestinationStatsKeepsLargestQualifiedWindow",
+        "TestWindowDestinationStatsEqualWindowsPreferCumulativeEvidence",
+        "TestWindowDestinationStatsEqualEvidenceKeepsFirstEstimate"
+      ]
+    }
+  },
+  "performance_gates_changed": false,
+  "prior_policy_renamed_tests": {
+    "TestADeliveryLimitedWindowCanCrossTheMemoryClamp": "TestALearnedWindowSurvivesTheMemoryClamp",
+    "TestADeliveryLimitedWindowRemainsBelowTheSmallMemoryShare": "TestDeliveryGrowthRemainsBelowTheSmallMemoryShare",
+    "TestTheDeliveryCapIsOneSidedAndLagged": "TestDeliveryCandidatesRequireFreshPermissionHistory",
+    "TestTheThreePeerBranchesAreThreeDifferentWindows": "TestTheThreePeerBranchesHaveDifferentPermissionCeilings",
+    "TestTheWindowStepsToTheAdvertisedCapacity": "TestAdvertisementRaisesPermissionWithoutLearningCapacity",
+    "TestWindowPacingNewPathProofRequalifiesOldDelivery": "TestWindowPacingNewPathProofRequiresFreshDeliveryCandidates",
+    "TestWindowPacingQueuedPathObservationKeepsDeliveryClamp": "TestWindowPacingQueuedPathObservationKeepsDeliveryCandidate",
+    "TestWindowPacingWindowProofAcceptsFreshSlowDelivery": "TestWindowPacingWindowProofAcceptsFreshSlowCandidateWithoutShrinking",
+    "TestWindowPacingWindowProofPreservesFixedBounds": "TestWindowPacingWindowProofPreservesHardBoundsAndRetainedCapacity"
+  },
+  "race": true,
+  "renamed_tests": {
+    "TestWindowPacingNewPathProofRequiresFreshDeliveryCandidates": "TestWindowPacingNewPathProofRequiresFreshCumulativeDelivery",
+    "TestWindowPacingWindowProofAcceptsFreshSlowCandidateWithoutShrinking": "TestWindowPacingWindowProofAcceptsFreshSlowDeliveryWithoutShrinking"
+  },
+  "repetitions": 3,
+  "scope": "Actual 27-root combined invocation: 14 retained-policy roots, four statistics selection roots, three binding-reason roots and six observational/hard-bound controls. Physical RTT/proof, fresh cumulative interval, stale-history and hard-cap assertions are retained; ServiceSized growth is distinct from cumulative Sized qualification. Ownership checking was outside this selection and subsequently failed; that failure and fix are separately archived. This is an after-only assertion-verification run, not an invented paired counterfactual.",
+  "test_names_in_outcomes": "Exact names from each raw run; no retroactive renaming."
+}

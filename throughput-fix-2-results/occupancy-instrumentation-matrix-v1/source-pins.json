@@ -1,0 +1,162 @@
+[
+  {
+    "binary_sha256": "f4392af59bc8b60b9d1aaad2b6c64aa120799062da5000d904bc417254eb4a14",
+    "compile_manifest_sha256": "f2ff68f63197beed5654e9786b8854b9309a4e16b50a632505d2513f1d37bf22",
+    "instrumentation_evidence": "Verified binary SHA and go version -m.",
+    "outcomes": {
+      "fail": 3,
+      "pass": 0
+    },
+    "race": true,
+    "race_warnings": 0,
+    "raw_log_sha256": "d022ff751659d58e58e144085fb966b23fd10f2f31d8a556a5c1c760440b0d29",
+    "run_context": {
+      "loadavg_end": [
+        9.392578125,
+        11.53173828125,
+        12.58642578125
+      ],
+      "no_quiescence_wait": true,
+      "started_utc": "2026-09-16T17:51:33Z"
+    },
+    "run_status_sha256": "16f4a50edacc1091d6ff5940bcad713f471dfe08a39ea7ebd38b226ee8c592d0",
+    "source_digest": "a02246e3d7a4d857982fbf7fb5ddd34576adbf8be9ae8df540a221a33153e726",
+    "variant": "current-race"
+  },
+  {
+    "binary_sha256": "d115d1fb9abb1d7279c037fba5321de3de11b184fee797387a7d9e7de01fcfba",
+    "compile_manifest_sha256": "7af599a0110bfaa517d71b78f4c54cc7dd9da3192f3caeda5c4d90a62859588c",
+    "instrumentation_evidence": "Verified binary SHA and go version -m.",
+    "outcomes": {
+      "fail": 3,
+      "pass": 0
+    },
+    "race": true,
+    "race_warnings": 0,
+    "raw_log_sha256": "13e7c5fad6d555998fb3fa3b5f02514d04461e4e42e25f0338345af9bdf5ecc0",
+    "run_context": {
+      "ended_utc": "2026-09-16T18:01:49.985619+00:00",
+      "loadavg_end": [
+        9.33935546875,
+        8.55859375,
+        10.09814453125
+      ],
+      "loadavg_start": [
+        9.94677734375,
+        8.64599609375,
+        10.14697265625
+      ],
+      "no_quiescence_wait": true,
+      "started_utc": "2026-09-16T18:01:40.008741+00:00"
+    },
+    "run_status_sha256": "5ec0c1661afe70bac0a5b97829ba99cf5b11f79ea1e7ad7c0dbfe5337fe0110e",
+    "source_digest": "482afc858b0de4b7e421c1ebb4c9ea1ac864da2b622896aa669b34f58eda79e2",
+    "variant": "older-race"
+  },
+  {
+    "binary_sha256": "b6421ad38742e19a892a7954d021647d30902c7e68a7c6ed84e309bc0eb3509e",
+    "compile_manifest_sha256": "deb1bb5d8103c8135ddaf8a7fff05bf658c878567646fc996de3555e93e2f302",
+    "instrumentation_evidence": "Verified binary SHA and go version -m.",
+    "outcomes": {
+      "fail": 0,
+      "pass": 3
+    },
+    "race": false,
+    "race_warnings": 0,
+    "raw_log_sha256": "61750d3dd49483147fd07cc39b1c0997ae7a0ebaf52bd4a9c9a47335f93ffe9a",
+    "run_context": {
+      "loadavg_end": [
+        7.57373046875,
+        8.31494140625,
+        9.72119140625
+      ],
+      "no_quiescence_wait": true,
+      "started_utc": "2026-09-16T18:11:28Z"
+    },
+    "run_status_sha256": "fb84ff01a395be3a40de68d44b0073af85996580252bbaa69b8395ee6131d7cd",
+    "source_digest": "a02246e3d7a4d857982fbf7fb5ddd34576adbf8be9ae8df540a221a33153e726",
+    "variant": "current-nonrace"
+  },
+  {
+    "binary_sha256": "88da2b4aaf9962f190d3fa34a1ab64ae107907202b75f586c70e5ee5b92a56f7",
+    "compile_manifest_sha256": "41ea539f3a32ea9a98b3ac5a6919694410ad51b971505150bf651af1adaf3fa5",
+    "instrumentation_evidence": "Verified binary SHA and go version -m.",
+    "outcomes": {
+      "fail": 0,
+      "pass": 3
+    },
+    "race": false,
+    "race_warnings": 0,
+    "raw_log_sha256": "2dc146e54ba785be77049ac32b6858481c82858dadf427b1ee19498092fc782b",
+    "run_context": {
+      "ended_utc": "2026-09-16T17:58:19.844294+00:00",
+      "loadavg_end": [
+        4.81982421875,
+        7.5087890625,
+        10.28564453125
+      ],
+      "loadavg_start": [
+        5.24560546875,
+        7.68017578125,
+        10.37841796875
+      ],
+      "no_quiescence_wait": true,
+      "started_utc": "2026-09-16T17:58:09.935382+00:00"
+    },
+    "run_status_sha256": "f79dce7a7c323fc3d5641a8fa6982f51ca9cfff30a2c4dcf36ea4d1fa0fe3e43",
+    "source_digest": "482afc858b0de4b7e421c1ebb4c9ea1ac864da2b622896aa669b34f58eda79e2",
+    "variant": "older-nonrace"
+  },
+  {
+    "binary_sha256": "f4392af59bc8b60b9d1aaad2b6c64aa120799062da5000d904bc417254eb4a14",
+    "compile_manifest_sha256": "f2ff68f63197beed5654e9786b8854b9309a4e16b50a632505d2513f1d37bf22",
+    "cpu_profile_sha256": "7e4fd8b814e941fd1777f0446dbb33025b50c2d8777289157161511f48af3d9d",
+    "instrumentation_evidence": "Verified binary SHA and go version -m.",
+    "outcomes": {
+      "fail": 3,
+      "pass": 0
+    },
+    "profile_eligibility": "Unmatched instrumentation; not a source-performance comparison.",
+    "race": true,
+    "race_warnings": 0,
+    "raw_log_sha256": "3020babbf822110d5b18ec1e732657d99b4dd8d2d8020d8f08dc66ed46553c1b",
+    "run_context": {
+      "loadavg_end": [
+        7.00048828125,
+        7.44091796875,
+        10.015625
+      ],
+      "no_quiescence_wait": true,
+      "started_utc": "2026-09-16T17:59:22Z"
+    },
+    "run_status_sha256": "fad17879309b680ddda4dcebdea35539c9993d3e51050440772d76086619f6dd",
+    "source_digest": "a02246e3d7a4d857982fbf7fb5ddd34576adbf8be9ae8df540a221a33153e726",
+    "variant": "current-race-profile"
+  },
+  {
+    "binary_sha256": "88da2b4aaf9962f190d3fa34a1ab64ae107907202b75f586c70e5ee5b92a56f7",
+    "compile_manifest_sha256": "41ea539f3a32ea9a98b3ac5a6919694410ad51b971505150bf651af1adaf3fa5",
+    "cpu_profile_sha256": "e0b44fa08715452998e93b5f0234dce31b22529be788df16b1b4c4d5b487bb62",
+    "instrumentation_evidence": "Verified binary SHA and go version -m.",
+    "outcomes": {
+      "fail": 0,
+      "pass": 3
+    },
+    "profile_eligibility": "Unmatched instrumentation; not a source-performance comparison.",
+    "race": false,
+    "race_warnings": 0,
+    "raw_log_sha256": "f0ed23acc0570252647b6c90362209acdc483d915744afb2440aafa19a12ddfb",
+    "run_context": {
+      "loadavg_end": [
+        7.00048828125,
+        7.44091796875,
+        10.015625
+      ],
+      "no_quiescence_wait": true,
+      "started_utc": "2026-09-16T17:59:22Z"
+    },
+    "run_status_sha256": "7577a9937da6161ef2ff6f83162bdf406421ff05a82e6df73acb62d244474376",
+    "source_digest": "482afc858b0de4b7e421c1ebb4c9ea1ac864da2b622896aa669b34f58eda79e2",
+    "variant": "older-nonrace-profile"
+  }
+]

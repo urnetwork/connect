@@ -1,0 +1,11 @@
+{
+  "interpretation": "The restored baseline fails the historical per-second90% rule but passes both longer aggregations. The severe19.56,5.61and27.24Mb/s losses fail every aggregation; the95.77Mb/s checkpoint passes all. This exposes a policy distinction without proving either revised target should replace the original.",
+  "limitations": [
+    "Only existing aligned bins are available; arbitrary subsecond phase shifts cannot be reconstructed.",
+    "Configured1.21sfeedback is1.2spropagation plus10msACKcompression; queueing can lengthen actual feedback.",
+    "Different source/schedule readings are not an isolated before/after source-causality comparison.",
+    "Aggregation may hide a transient stall. A final latency/recovery objective must account for the permitted duration as well as average capacity."
+  ],
+  "method": "Existing measurements each have exactly3one-second bins; their mean is checked against the full rate. Compute every contiguous two-bin mean and the full three-bin mean, retaining reference and candidate for each.",
+  "scope": "Offline test-contract review using five preserved paired RTT-growth measurements. No source, binary, acceptance threshold or workload changed."
+}

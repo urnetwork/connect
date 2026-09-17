@@ -1,0 +1,564 @@
+{
+  "source": "../model-receiver-invalid-slowdown-full-v1",
+  "scope": "offline endpoint review of frozen experimental model; no new execution and no causal attribution",
+  "failed_groups": [
+    "TestWindowPathSdkBidirectional",
+    "TestWindowPathSdkDuplexRecoversAfterInitialFeedbackBarrier",
+    "TestWindowPathSdkProfiles",
+    "TestWindowPathServiceRoundTripGrowthBeyondOldRing",
+    "TestWindowPathServicesShareFiniteRelay"
+  ],
+  "directional_reference_deficits": 18,
+  "directional_deficits_with_positive_service": 18,
+  "long_rtt_endpoints": [
+    {
+      "test": "TestWindowPathServiceRoundTripGrowthBeyondOldRing",
+      "mbps": 5.61152,
+      "interval_mbps": [
+        5.05856,
+        5.59104,
+        6.18496
+      ],
+      "window": {
+        "DeliveryByteRate": 88537,
+        "ServiceByteRate": 836957,
+        "PacingByteRate": 920652,
+        "Window": 2283077,
+        "WindowRoundTrip": 1210213840,
+        "ServiceBacklogged": false
+      }
+    }
+  ],
+  "deficits": [
+    {
+      "test": "TestWindowPathSdkDuplexRecoversAfterInitialFeedbackBarrier",
+      "direction": 1,
+      "sender_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "sdk-provider-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": true
+      },
+      "upload": false,
+      "flows": 8,
+      "round_trip_ns": 300000,
+      "reference_mbps": 754.6470400000001,
+      "candidate_mbps": 13.537279999999997,
+      "ratio": 0.017938558402084234,
+      "endpoint_window": {
+        "DeliveryByteRate": 200450,
+        "ServiceByteRate": 1605801,
+        "PacingByteRate": 1766381,
+        "Window": 524288,
+        "WindowRoundTrip": 11552505,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathSdkProfiles",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "sdk-device-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "upload": false,
+      "flows": 8,
+      "round_trip_ns": 300000,
+      "reference_mbps": 957.25568,
+      "candidate_mbps": 616.2944000000001,
+      "ratio": 0.6438137823324278,
+      "endpoint_window": {
+        "DeliveryByteRate": 8431900,
+        "ServiceByteRate": 64063796,
+        "PacingByteRate": 70470175,
+        "Window": 1604917,
+        "WindowRoundTrip": 10342768,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathSdkProfiles",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "sdk-device-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "upload": false,
+      "flows": 8,
+      "round_trip_ns": 400000000,
+      "reference_mbps": 130.95336585365857,
+      "candidate_mbps": 19.62708292682927,
+      "ratio": 0.14987841510513517,
+      "endpoint_window": {
+        "DeliveryByteRate": 324578,
+        "ServiceByteRate": 2545748,
+        "PacingByteRate": 2800322,
+        "Window": 7010478,
+        "WindowRoundTrip": 410021443,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathSdkProfiles",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "sdk-device-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": true
+      },
+      "receiver_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "upload": false,
+      "flows": 8,
+      "round_trip_ns": 300000,
+      "reference_mbps": 957.2966400000003,
+      "candidate_mbps": 617.79968,
+      "ratio": 0.6453586633292684,
+      "endpoint_window": {
+        "DeliveryByteRate": 10878628,
+        "ServiceByteRate": 80556724,
+        "PacingByteRate": 88612396,
+        "Window": 1942983,
+        "WindowRoundTrip": 10321384,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathSdkProfiles",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "sdk-device-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": true
+      },
+      "receiver_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "upload": false,
+      "flows": 8,
+      "round_trip_ns": 100000000,
+      "reference_mbps": 360.63418181818173,
+      "candidate_mbps": 29.090909090909086,
+      "ratio": 0.08066597831698503,
+      "endpoint_window": {
+        "DeliveryByteRate": 476491,
+        "ServiceByteRate": 3459815,
+        "PacingByteRate": 3805796,
+        "Window": 4853408,
+        "WindowRoundTrip": 110021457,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathSdkProfiles",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "sdk-device-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": true
+      },
+      "receiver_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "upload": false,
+      "flows": 8,
+      "round_trip_ns": 400000000,
+      "reference_mbps": 90.668956097561,
+      "candidate_mbps": 18.886556097560977,
+      "ratio": 0.2083023441588849,
+      "endpoint_window": {
+        "DeliveryByteRate": 362764,
+        "ServiceByteRate": 2846852,
+        "PacingByteRate": 2704509,
+        "Window": 4853408,
+        "WindowRoundTrip": 410021508,
+        "ServiceBacklogged": true
+      }
+    },
+    {
+      "test": "TestWindowPathSdkProfiles",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "sdk-provider-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": true
+      },
+      "receiver_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "upload": false,
+      "flows": 8,
+      "round_trip_ns": 100000000,
+      "reference_mbps": 79.32276363636363,
+      "candidate_mbps": 53.17352727272726,
+      "ratio": 0.6703438563548878,
+      "endpoint_window": {
+        "DeliveryByteRate": 860008,
+        "ServiceByteRate": 6327852,
+        "PacingByteRate": 6011459,
+        "Window": 1078535,
+        "WindowRoundTrip": 110021390,
+        "ServiceBacklogged": true
+      }
+    },
+    {
+      "test": "TestWindowPathSdkProfiles",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "sdk-provider-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": true
+      },
+      "receiver_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "upload": false,
+      "flows": 8,
+      "round_trip_ns": 400000000,
+      "reference_mbps": 20.162809756097563,
+      "candidate_mbps": 17.405502439024392,
+      "ratio": 0.8632478632478633,
+      "endpoint_window": {
+        "DeliveryByteRate": 295939,
+        "ServiceByteRate": 2292452,
+        "PacingByteRate": 2521697,
+        "Window": 1078535,
+        "WindowRoundTrip": 410021389,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathSdkBidirectional",
+      "direction": 1,
+      "sender_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "sdk-device-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": false
+      },
+      "upload": false,
+      "flows": 1,
+      "round_trip_ns": 300000,
+      "reference_mbps": 957.24544,
+      "candidate_mbps": 795.63776,
+      "ratio": 0.8311742493126945,
+      "endpoint_window": {
+        "DeliveryByteRate": 124984300,
+        "ServiceByteRate": 124981175,
+        "PacingByteRate": 118732116,
+        "Window": 2683731,
+        "WindowRoundTrip": 13908646,
+        "ServiceBacklogged": true
+      }
+    },
+    {
+      "test": "TestWindowPathSdkBidirectional",
+      "direction": 1,
+      "sender_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "sdk-device-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": false
+      },
+      "upload": true,
+      "flows": 8,
+      "round_trip_ns": 300000,
+      "reference_mbps": 202.25024,
+      "candidate_mbps": 128.51199999999997,
+      "ratio": 0.6354108652726443,
+      "endpoint_window": {
+        "DeliveryByteRate": 13146958,
+        "ServiceByteRate": 12896756,
+        "PacingByteRate": 12251918,
+        "Window": 1635778,
+        "WindowRoundTrip": 37776168,
+        "ServiceBacklogged": true
+      }
+    },
+    {
+      "test": "TestWindowPathSdkBidirectional",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "sdk-device-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": false
+      },
+      "upload": true,
+      "flows": 8,
+      "round_trip_ns": 100000000,
+      "reference_mbps": 521.6069818181817,
+      "candidate_mbps": 127.2645818181818,
+      "ratio": 0.24398557966876072,
+      "endpoint_window": {
+        "DeliveryByteRate": 2080291,
+        "ServiceByteRate": 15248888,
+        "PacingByteRate": 16773776,
+        "Window": 7010478,
+        "WindowRoundTrip": 110022219,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathSdkBidirectional",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "sdk-device-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": false
+      },
+      "upload": true,
+      "flows": 8,
+      "round_trip_ns": 400000000,
+      "reference_mbps": 130.95586341463417,
+      "candidate_mbps": 18.47196097560976,
+      "ratio": 0.1410548599654801,
+      "endpoint_window": {
+        "DeliveryByteRate": 302303,
+        "ServiceByteRate": 2348726,
+        "PacingByteRate": 2583598,
+        "Window": 7010478,
+        "WindowRoundTrip": 410022216,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathSdkBidirectional",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "sdk-device-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": true
+      },
+      "upload": true,
+      "flows": 8,
+      "round_trip_ns": 100000000,
+      "reference_mbps": 353.05192727272726,
+      "candidate_mbps": 26.363345454545453,
+      "ratio": 0.07467271360957667,
+      "endpoint_window": {
+        "DeliveryByteRate": 430004,
+        "ServiceByteRate": 3154247,
+        "PacingByteRate": 3469671,
+        "Window": 4853408,
+        "WindowRoundTrip": 110022221,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathSdkBidirectional",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "sdk-device-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": true
+      },
+      "upload": true,
+      "flows": 8,
+      "round_trip_ns": 400000000,
+      "reference_mbps": 90.65896585365854,
+      "candidate_mbps": 19.513443902439025,
+      "ratio": 0.21524008925865726,
+      "endpoint_window": {
+        "DeliveryByteRate": 193690,
+        "ServiceByteRate": 1611511,
+        "PacingByteRate": 1530935,
+        "Window": 4853408,
+        "WindowRoundTrip": 410022208,
+        "ServiceBacklogged": true
+      }
+    },
+    {
+      "test": "TestWindowPathSdkBidirectional",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "sdk-provider-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": true
+      },
+      "upload": true,
+      "flows": 8,
+      "round_trip_ns": 300000,
+      "reference_mbps": 753.57184,
+      "candidate_mbps": 634.35776,
+      "ratio": 0.8418013072250683,
+      "endpoint_window": {
+        "DeliveryByteRate": 9350785,
+        "ServiceByteRate": 75183638,
+        "PacingByteRate": 82702001,
+        "Window": 1078535,
+        "WindowRoundTrip": 11638867,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathSdkBidirectional",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "sdk-provider-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": true
+      },
+      "upload": true,
+      "flows": 8,
+      "round_trip_ns": 100000000,
+      "reference_mbps": 76.59519999999999,
+      "candidate_mbps": 15.499636363636363,
+      "ratio": 0.20235780262518233,
+      "endpoint_window": {
+        "DeliveryByteRate": 395139,
+        "ServiceByteRate": 2918918,
+        "PacingByteRate": 3210809,
+        "Window": 1078535,
+        "WindowRoundTrip": 110022226,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathSdkBidirectional",
+      "direction": 0,
+      "sender_profile": {
+        "Name": "connect-process-default",
+        "ProcessBudget": 402653184,
+        "MobilePolicy": false,
+        "Providing": false
+      },
+      "receiver_profile": {
+        "Name": "sdk-provider-h1",
+        "ProcessBudget": 33554432,
+        "MobilePolicy": true,
+        "Providing": true
+      },
+      "upload": true,
+      "flows": 8,
+      "round_trip_ns": 400000000,
+      "reference_mbps": 20.16405853658537,
+      "candidate_mbps": 15.759609756097563,
+      "ratio": 0.7815693317644145,
+      "endpoint_window": {
+        "DeliveryByteRate": 293814,
+        "ServiceByteRate": 2074625,
+        "PacingByteRate": 2282087,
+        "Window": 1078535,
+        "WindowRoundTrip": 410022208,
+        "ServiceBacklogged": false
+      }
+    },
+    {
+      "test": "TestWindowPathServicesShareFiniteRelay",
+      "direction": 0,
+      "sender_profile": null,
+      "receiver_profile": null,
+      "upload": false,
+      "flows": 8,
+      "round_trip_ns": 100000000,
+      "reference_mbps": 95.616,
+      "candidate_mbps": 72.68352,
+      "ratio": 0.7601606425702812,
+      "endpoint_window": {
+        "DeliveryByteRate": 2765973,
+        "ServiceByteRate": 11094498,
+        "PacingByteRate": 12203947,
+        "Window": 3815096,
+        "WindowRoundTrip": 110214758,
+        "ServiceBacklogged": false
+      }
+    }
+  ]
+}

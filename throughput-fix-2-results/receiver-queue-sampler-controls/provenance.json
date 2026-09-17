@@ -1,0 +1,11 @@
+{
+  "exclusions": [
+    "Raw logs, source copies, overlays, binaries, and compile manifests remain local.",
+    "No actual forced-Client queue integration was exercised.",
+    "No production candidate, schema change, or throughput acceptance claim."
+  ],
+  "first_relative_overlay_attempt": "pre-compilation argument-resolution error; no binary or test result; excluded from comparison",
+  "no_quiescence_wait": true,
+  "overlay_comparison": "After resolves the max-span paced-capacity diagnostic but not the buffered-burst diagnostic.",
+  "scope": "Frozen before/after receiver-queue sampler-control overlays built against the f9 copied source."
+}

@@ -1,0 +1,137 @@
+// Common pacing evidence can serve a current H1 sender without becoming that
+// sender's window evidence. All clocks and physical credit belong to fixtures.
+package connect
+
+import (
+	"testing"
+	"testing/synctest"
+	"time"
+)
+
+// Early returns have the same shared pacing owner as ordinary sized lanes.
+// Fresh common evidence may price work but cannot invent local Sized history.
+func TestWindowPacingCumulativeSharedEarlyReturnsUseCommonRate(t *testing.T) {
+	for _, path := range []string{"no-local-rtt", "missing-history", "no-budget", "delivery-admission"} {
+		synctest.Test(t, func(t *testing.T) {
+			fixture := newWindowCumulativeSharedFixture(t, []int{0, 0, 0})
+			fixture.spendProbe(t)
+			fixture.deliver(t, []ByteCount{8 * 1024, 8 * 1024, 0})
+			at := time.Now()
+			reference := fixture.sequences[1].sendWindowEstimate(at)
+			sequence := fixture.sequences[2]
+			if path == "missing-history" {
+				sequence = fixture.sequences[0]
+			}
+			// A prior qualified interval may have grown this lane. Missing
+			// evidence preserves that admission rather than resetting it.
+			window := sequence.sendWindowSnapshot(at).Window
+			switch path {
+			case "missing-history":
+				sequence.deliveredBytesCount = 0
+			case "no-budget":
+				sequence.resendQueue.Clear()
+				sequence.resendQueue = newResendQueue(nil, 0)
+			case "delivery-admission":
+				sequence.sendBufferSettings.ReliableAdmissionBoundedByDelivery = true
+			}
+			estimate := sequence.sendWindowEstimate(at)
+			if !reference.Sized || reference.ServiceByteRate != 0 || estimate.Sized || estimate.ServiceSized ||
+				estimate.DeliveryByteRate != 0 || estimate.Window != window {
+				t.Fatalf("%s lost independent cold/shared/window premises: reference=%+v estimate=%+v", path, reference, estimate)
+			}
+			if estimate.PacingByteRate != reference.PacingByteRate {
+				t.Errorf("%s early return repriced the same shared service: reference=%+v estimate=%+v", path, reference, estimate)
+			}
+		})
+	}
+}
+
+// Existing H1 credit does not authorize a different current carrier, and an
+// explicitly disabled rule cannot start pacing from a sibling's history.
+func TestWindowPacingCumulativeSharedHistoryHonorsCurrentPolicy(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			fixture := newWindowCumulativeSharedFixture(t, []int{0, 0})
+			fixture.spendProbe(t)
+			fixture.deliver(t, []ByteCount{8 * 1024, 8 * 1024})
+			sequence := fixture.sequences[0]
+			service := sequence.windowPacer.service
+			if disabled {
+				sequence.sendBufferSettings.DeliverySizedWindowScale = 0
+			} else {
+				sequence.contractMultiRouteWriter = &windowPacingPolicyWriter{policy: transferFlightPolicySnapshot{}}
+			}
+			at := time.Now()
+			withHistory := sequence.sendWindowEstimate(at)
+			sequence.windowPacer.service = newWindowPacingService(sequence.sendBufferSettings)
+			withoutHistory := sequence.sendWindowEstimate(at)
+			sequence.windowPacer.service = service
+			if withHistory.PacingByteRate != withoutHistory.PacingByteRate || withHistory.Window != withoutHistory.Window ||
+				disabled && withHistory.PacingByteRate != 0 {
+				t.Fatalf("disabled=%t: unrelated common evidence changed current policy: with=%+v without=%+v", disabled, withHistory, withoutHistory)
+			}
+		})
+	}
+}
+
+// A fresh endpoint still predates a newly accepted permission boundary. The
+// unrelated sibling retains its rate while this caller waits for new history.
+func TestWindowPacingCumulativeSharedPermissionRejectsOlderOffers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newWindowCumulativeSharedFixture(t, []int{0, 0})
+		fixture.spendProbe(t)
+		fixture.deliver(t, []ByteCount{8 * 1024, 8 * 1024})
+		sequence, sibling := fixture.sequences[0], fixture.sequences[1]
+		service := sequence.windowPacer.service
+		at := time.Now()
+		before := sibling.sendWindowEstimate(at)
+		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{receiveWindowSet: true, receiveWindowByteCount: 16 * 1024 * 1024})
+		sequence.receiveWindowSetAtNanos.Store(at.Add(time.Nanosecond).UnixNano())
+		at = at.Add(time.Nanosecond)
+		withHistory := sequence.sendWindowEstimate(at)
+		sequence.windowPacer.service = newWindowPacingService(sequence.sendBufferSettings)
+		withoutHistory := sequence.sendWindowEstimate(at)
+		sequence.windowPacer.service = service
+		after := sibling.sendWindowEstimate(at)
+		if withHistory.Sized || withHistory.DeliveryByteRate != 0 || withHistory.PacingByteRate != withoutHistory.PacingByteRate ||
+			withHistory.Window != withoutHistory.Window || before.PacingByteRate != after.PacingByteRate {
+			t.Fatalf("permission cutoff borrowed older offers or reset a sibling: with=%+v without=%+v before=%+v after=%+v", withHistory, withoutHistory, before, after)
+		}
+	})
+}
+
+// Reading common pacing evidence does not commit learned bytes, service hold,
+// probe ownership or a new epoch. Own delivery diagnostics remain per sequence.
+func TestWindowPacingCumulativeSharedSnapshotsRemainObservational(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newWindowCumulativeSharedFixture(t, []int{0, 0})
+		fixture.spendProbe(t)
+		fixture.deliver(t, []ByteCount{8 * 1024, 24 * 1024})
+		sequence, sibling := fixture.sequences[0], fixture.sequences[1]
+		service := sequence.windowPacer.service
+		at := time.Now()
+		window, initialized := sequence.windowSize.window, sequence.windowSize.initialized
+		total, sent, probe := service.total, service.sent, service.probeSent
+		hold, epoch, deliveryStep := service.serviceHoldRate, service.serviceEpochAt, service.windowDeliveryAfterNanos
+		for range 4 {
+			own, other := sequence.sendWindowSnapshot(at), sibling.sendWindowSnapshot(at)
+			if own.DeliveryByteRate <= 0 || other.DeliveryByteRate < 2*own.DeliveryByteRate || own.ServiceByteRate != 0 || other.ServiceByteRate != 0 {
+				t.Fatal("shared pacing replaced own cumulative diagnostic meanings")
+			}
+		}
+		if sequence.windowSize.window != window || sequence.windowSize.initialized != initialized ||
+			service.total != total || service.sent != sent || service.probeSent != probe ||
+			service.serviceHoldRate != hold || service.serviceEpochAt != epoch || service.windowDeliveryAfterNanos != deliveryStep {
+			t.Fatal("statistics reads changed window, service or physical ownership")
+		}
+	})
+}
+
+// Own delivery without RTT remains an unrelated, unqualified input. Only the
+// separately proved shared evidence may bypass the original target fallback.
+func TestWindowPacingCumulativeOwnRateWithoutRttKeepsTarget(t *testing.T) {
+	estimate := SendWindowEstimate{Initial: 512 * 1024, DeliveryByteRate: 1000}
+	if got := windowPacingRate(estimate, 1000000); got != 1000000 {
+		t.Fatalf("own-only no-RTT input changed the established fallback: %d", got)
+	}
+}

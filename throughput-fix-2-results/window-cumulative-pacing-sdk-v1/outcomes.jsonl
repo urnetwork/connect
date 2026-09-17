@@ -1,0 +1,4 @@
+{"outcome": "FAIL", "seconds": "10.69s", "test": "TestWindowPathRetainedSdkCumulativePacingShort", "variant": "before"}
+{"outcome": "FAIL", "seconds": "1.94s", "test": "TestWindowPathRetainedSdkCumulativePacingLong", "variant": "before"}
+{"outcome": "PASS", "seconds": "13.76s", "test": "TestWindowPathRetainedSdkCumulativePacingShort", "variant": "after"}
+{"outcome": "FAIL", "seconds": "1.94s", "test": "TestWindowPathRetainedSdkCumulativePacingLong", "variant": "after"}

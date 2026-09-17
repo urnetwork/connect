@@ -1,0 +1,7 @@
+{
+  "classification": "CPU evidence only; isolated warm candidate still fails two actual-worker throughput gates.",
+  "fixture_failures": 6,
+  "nonrace_variants": 5,
+  "race_variants": 0,
+  "readings": 27
+}

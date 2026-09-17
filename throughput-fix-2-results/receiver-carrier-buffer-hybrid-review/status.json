@@ -1,0 +1,6 @@
+{
+  "classification": "Queue exclusion fails upstream reader buffering; original sampler and sender-confirmed rise controls pass worker roots; scope is experimental",
+  "outcomes": 45,
+  "readings": 0,
+  "worker_readings": 45
+}

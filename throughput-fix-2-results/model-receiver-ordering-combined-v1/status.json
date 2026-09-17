@@ -1,0 +1,6 @@
+{
+  "classification": "Ordering guard v1 has4P2F; refined endpoint bounds v2 has5P1F, with RTT growth still failing. Both ordering root runs pass24/24 under race.",
+  "outcomes": 60,
+  "readings": 64,
+  "worker_readings": 0
+}

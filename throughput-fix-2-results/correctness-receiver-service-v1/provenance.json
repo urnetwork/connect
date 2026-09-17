@@ -1,0 +1,9 @@
+{
+  "interpretation": "This complete correctness gate confirms one known open adaptation failure, not acceptance. Full root regression and restored-source full model are separate ongoing runs.",
+  "no_quiescence_wait": true,
+  "outcome": "502 passes and one failure under race, no warnings. InterleavedSlowdownAdaptsWithInvalidRing retains the old12.5 MB/s rate against a queued4 MB/s serializer. Existing cumulative, mixed-feedback, ACK bounds, pacing, ownership and lifecycle checks pass.",
+  "race": true,
+  "role": "Complete current live test inventory plus receiver timing/consumer/ordering changes, restored cumulative fallback and new sustained-slowdown roots.",
+  "source_scope": "Production matches the restored receiver consumer candidate. Current live benchmark input, all earlier mixed-feedback/cumulative roots and all new receiver roots are included. No network-quality API or event hooks.",
+  "working_directory": "Execution occurs in the exact copied module used by its compiler; all copied source files are pinned and checked."
+}

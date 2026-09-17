@@ -1,0 +1,4 @@
+{"outcome": "PASS", "seconds": "0.28s", "test": "TestWindowCompressionResidenceGrowsSmallOpening", "variant": "before"}
+{"outcome": "PASS", "seconds": "28.70s", "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.30s", "test": "TestWindowCompressionResidenceGrowsSmallOpening", "variant": "retained-growth-v2"}
+{"outcome": "PASS", "seconds": "28.05s", "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "retained-growth-v2"}

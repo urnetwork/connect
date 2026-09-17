@@ -1,0 +1,10 @@
+{
+  "archive": "receiver-hybrid-ownership-affected",
+  "payload_sha256": {
+    "ledger.jsonl": "0950fdd670b9312bb1f6fea2c19eb2e88ce563be2ffd06acd6811b35518007aa",
+    "outcomes.jsonl": "6e983201a65e0505452f0f90f4a2afdfd7f4cd6cdcb155eddf0c77ae42377ff2",
+    "provenance.json": "6e19d96750671e3a05d5fbcec2722b0fca8f25b6043903486633095e2827c6b8",
+    "source-pins.json": "082a1730bcbe2489414adad59e4d06f1b0c51083db90cceb7a44c05bbd40265b",
+    "status.json": "2404cdeb15f5c032f259dfa7ac2415f6e910253aeb7544c74fbdfc7fb6c006e6"
+  }
+}

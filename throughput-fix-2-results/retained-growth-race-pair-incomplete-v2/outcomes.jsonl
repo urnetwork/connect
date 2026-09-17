@@ -1,0 +1,6 @@
+{"outcome": "FAIL", "seconds": "9.00s", "test": "TestWindowPathServiceLongCompressedFeedback", "variant": "before"}
+{"outcome": "FAIL", "seconds": "8.09s", "test": "TestWindowCompressionResidenceRestoresShortPathCapacity", "variant": "before"}
+{"outcome": "FAIL", "seconds": "28.06s", "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "before"}
+{"outcome": "PASS", "seconds": "9.93s", "test": "TestWindowPathServiceLongCompressedFeedback", "variant": "after"}
+{"outcome": "FAIL", "seconds": "8.05s", "test": "TestWindowCompressionResidenceRestoresShortPathCapacity", "variant": "after"}
+{"outcome": "FAIL", "seconds": "28.18s", "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "after"}

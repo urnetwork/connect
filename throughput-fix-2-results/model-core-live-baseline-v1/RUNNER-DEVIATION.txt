@@ -1,0 +1,49 @@
+Runner invocation deviation for this run
+========================================
+
+Command intended:
+  cd /Users/brien/urnetwork/connect && tools/throughput-fix-2.sh model-core \
+    /tmp/throughput-fix-2-model-core-live-baseline-v1
+
+That command fails immediately in the current working tree with:
+  connect sources changed while snapshotting; rerun for a consistent manifest
+
+Cause (deterministic, not a concurrency race):
+  tools/throughput-fix-2.sh computes manifest.connect.source_sha256 over
+    git ls-files --cached --others --exclude-standard -- '*.go' '*.proto' go.mod go.sum testdata/window_sdk_profiles.json
+  run against the LIVE checkout (831 files), but snapshot_repository() excludes
+  the whole throughput-fix-2-results/ directory from the copied tree. The
+  working tree currently contains one untracked Go file under that directory:
+    throughput-fix-2-results/model-static-long-recovery-v1/transfer_window_static_long_recovery_test.go
+  It is counted by the live digest and absent from the snapshot, so the
+  post-snapshot re-digest (830 files) can never match and the run aborts.
+
+  Live digest (831 files):      025d7ce0984df0760deff501bf8b4132f0f480ab2264cb25e3516597e03913ae
+  Snapshot digest (830 files):  6bff4adb158ffd3cfdf7b0c2d8bdfe5aaa7952e321e5af99f07df8fd623e6566
+  The two differ by exactly that one file and nothing else.
+
+Workaround actually used (no repository files were edited, staged or committed):
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.excludesFile \
+  GIT_CONFIG_VALUE_0=<scratchpad>/runner-excludes \
+  tools/throughput-fix-2.sh model-core /tmp/throughput-fix-2-model-core-live-baseline-v1
+
+  where <scratchpad>/runner-excludes contains the single line:
+    throughput-fix-2-results/
+
+  This is process-scoped git config only. It makes git's untracked-file listing
+  skip throughput-fix-2-results/, so the manifest digest is taken over the same
+  830 files the snapshot contains.
+
+Effect on the evidence:
+  - Compiled and tested sources are byte-identical to the live working tree;
+    the excluded file lives in a results subdirectory and was never part of the
+    package under test.
+  - manifest.connect.source_sha256 in this run is the 830-file snapshot digest
+    (6bff4adb...), i.e. exactly what was compiled, not the 831-file live digest
+    (025d7ce0...) a default invocation would have recorded.
+  - Nothing else about the run differs from the documented invocation.
+
+Permanent fixes (either one makes the plain command work):
+  - move/rename that stray .go file out of throughput-fix-2-results/, or
+  - have source_manifest() in tools/throughput-fix-2.sh exclude the same paths
+    snapshot_repository() excludes.

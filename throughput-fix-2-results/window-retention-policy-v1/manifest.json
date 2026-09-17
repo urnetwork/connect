@@ -1,0 +1,11 @@
+{
+  "archive": "window-retention-policy-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "1896e2889bf8eee24de67067f1728c8c9b523a2d1477a6cd62ea2dfe985e0ba5",
+    "outcomes.jsonl": "e882fba51e4900742171ea2993d56eef41b427f9e606455cb2b05fc1aeeddb5e",
+    "provenance.json": "e62c7ed6ca9366a30fceb8fc2f0b0ff006394ada399a704e8d4120b3018de27a",
+    "source-pins.json": "fad2e65b59c38cafd71818cbcbb16647121502e8907dabd42fc94f987836da5e",
+    "status.json": "5e6f9ae5ba4c499af8efc0310ba5b654958dfb8efad53ece592a613413b54725",
+    "worker-readings.jsonl": "3046e041070661184c4ed09db517c8771bea4e78e050e07a693ef4b010ffc71f"
+  }
+}

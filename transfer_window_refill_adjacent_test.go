@@ -8,9 +8,10 @@ import (
 	"time"
 )
 
-// Peer, configured, target, and pool bounds still constrain the permission
-// used while delivery on the newly proved path is being remeasured.
-func TestWindowPacingWindowProofPreservesFixedBounds(t *testing.T) {
+// Peer, configured-byte, and pool limits still constrain admission after a
+// path proof. Existing measured service can size a target-rate candidate but
+// cannot erase retained capacity or turn that target into hard permission.
+func TestWindowPacingWindowProofPreservesHardBoundsAndRetainedCapacity(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		for _, test := range []struct {
 			name       string
@@ -18,11 +19,13 @@ func TestWindowPacingWindowProofPreservesFixedBounds(t *testing.T) {
 			configured ByteCount
 			target     ByteCount
 			budget     ByteCount
+			ceiling    ByteCount
+			window     ByteCount
 		}{
-			{name: "peer", peer: kib(32)},
-			{name: "configured", configured: kib(512)},
-			{name: "target", target: 1250000},
-			{name: "budget", budget: mib(1)},
+			{name: "peer", peer: kib(32), ceiling: kib(32), window: kib(32)},
+			{name: "configured", configured: kib(512), ceiling: kib(512), window: kib(512)},
+			{name: "target", target: 1250000, ceiling: mib(48), window: mib(2)},
+			{name: "budget", budget: mib(1), ceiling: mib(1), window: mib(1)},
 		} {
 			sequences, service := newWindowRefillProofFixture(t, 1, true)
 			sequence := sequences[0]
@@ -37,48 +40,67 @@ func TestWindowPacingWindowProofPreservesFixedBounds(t *testing.T) {
 			}
 			at := completeWindowRefillProbe(t, sequence, service, true, 1210*time.Millisecond)
 			estimate := sequence.sendWindowEstimate(at)
-			if estimate.Window != estimate.Ceiling || estimate.Ceiling >= mib(48) {
-				t.Errorf("%s proof ignored fixed permission: %+v", test.name, estimate)
+			if estimate.Window != test.window || estimate.Ceiling != test.ceiling || estimate.LearnedWindow != estimate.Initial {
+				t.Errorf("%s proof changed hard permission or learned capacity: %+v", test.name, estimate)
 			}
-			if test.peer > 0 && estimate.Window > test.peer || test.configured > 0 && estimate.Window > test.configured || test.budget > 0 && estimate.Window > test.budget || test.target > 0 && !estimate.TargetBound {
-				t.Errorf("%s permission changed after path proof: %+v", test.name, estimate)
+			if estimate.Sized || !estimate.ServiceSized || estimate.TargetBound || estimate.CandidateTargetBound != (test.target > 0) {
+				t.Errorf("%s proof confused cumulative and service qualification: %+v", test.name, estimate)
+			}
+			assertWindowRefillLogicalRate(t, estimate)
+			if service.windowDeliveryStep() != at.UnixNano() || estimate.RoundTrip != 1200*time.Millisecond || estimate.WindowRoundTrip != 1210*time.Millisecond {
+				t.Errorf("%s proof did not establish the exact new path: step=%d estimate=%+v", test.name, service.windowDeliveryStep(), estimate)
 			}
 		}
 	})
 }
 
-// Repeated statistics and controller reads do not move the proof. Once a
-// complete post-proof slow delivery interval exists it again lowers the window.
-func TestWindowPacingWindowProofAcceptsFreshSlowDelivery(t *testing.T) {
+// Repeated reads do not move the proof. Fresh slow cumulative delivery remains
+// qualified without erasing the window learned from independent service.
+func TestWindowPacingWindowProofAcceptsFreshSlowDeliveryWithoutShrinking(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		for _, metadata := range []bool{false, true} {
 			sequences, service := newWindowRefillProofFixture(t, 1, metadata)
 			sequence := sequences[0]
 			at := completeWindowRefillProbe(t, sequence, service, metadata, 1210*time.Millisecond)
 			step := service.windowDeliveryStep()
+			before := sequence.sendWindowEstimate(at)
+			wantWindow := ByteCount(30500000)
+			if metadata {
+				wantWindow = 30250000
+			}
+			if before.Sized || !before.ServiceSized || before.Window != wantWindow || before.CandidateWindow != wantWindow {
+				t.Fatalf("metadata=%t stale history qualified immediately after proof: %+v", metadata, before)
+			}
+			assertWindowRefillLogicalRate(t, before)
 			for range 8 {
-				sequence.sendWindowSnapshot(at)
-				sequence.sendWindowEstimate(at)
+				for _, estimate := range []SendWindowEstimate{sequence.sendWindowSnapshot(at), sequence.sendWindowEstimate(at)} {
+					if estimate.Sized || !estimate.ServiceSized || estimate.Window != before.Window || estimate.LearnedWindow != before.LearnedWindow || service.windowDeliveryStep() != step {
+						t.Fatalf("metadata=%t read moved proof or learned capacity: %+v", metadata, estimate)
+					}
+				}
 			}
 			for range 80 {
 				time.Sleep(50 * time.Millisecond)
 				sequence.observeAckedBytesWithServiceCredit(4096, 0, windowServiceAckCredit{}, time.Now())
 			}
 			estimate := sequence.sendWindowEstimate(time.Now())
-			if step != at.UnixNano() || service.windowDeliveryStep() != step || estimate.Window != estimate.Floor || estimate.Reason != "delivery" {
-				t.Errorf("metadata=%t proof moved or suppressed fresh slower delivery: step=%d now=%d estimate=%+v", metadata, step, service.windowDeliveryStep(), estimate)
+			if step != at.UnixNano() || service.windowDeliveryStep() != step || !estimate.Sized || !estimate.ServiceSized || estimate.CandidateWindow != before.CandidateWindow || estimate.Window != before.Window || estimate.LearnedWindow != before.LearnedWindow {
+				t.Errorf("metadata=%t proof moved, suppressed fresh delivery, or reduced learned capacity: step=%d now=%d estimate=%+v", metadata, step, service.windowDeliveryStep(), estimate)
 			}
+			assertWindowRefillLogicalRate(t, estimate)
 		}
 	})
 }
 
-// An ACK racing a writer's return cannot authorize a larger window before
-// successful physical confirmation; a failed carrier never supplies proof.
+// An ACK racing a writer's return cannot replace the RTT/history baseline
+// before successful physical confirmation. Confirmed timing can then combine
+// with independently established service to grow the required flight.
 func TestWindowPacingWindowProofWaitsForPhysicalConfirmation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		for _, succeeds := range []bool{false, true} {
 			sequences, service := newWindowRefillProofFixture(t, 1, true)
 			sequence := sequences[0]
+			before := sequence.sendWindowEstimate(time.Now())
 			messageId := NewId()
 			service.drained = true
 			service.beginWrite(sequence.sequenceId, messageId, 1, time.Now(), false)
@@ -89,11 +111,22 @@ func TestWindowPacingWindowProofWaitsForPhysicalConfirmation(t *testing.T) {
 			if service.windowDeliveryStep() != 0 {
 				t.Error("unconfirmed physical write changed window history")
 			}
+			if unconfirmed := sequence.sendWindowEstimate(at); !unconfirmed.Sized || unconfirmed.RoundTrip != before.RoundTrip || unconfirmed.CandidateWindow != before.CandidateWindow || unconfirmed.Window != before.Window {
+				t.Errorf("unconfirmed physical write changed sizing evidence: before=%+v after=%+v", before, unconfirmed)
+			}
 			service.finishWrite(sequence.sequenceId, messageId, succeeds)
 			estimate := sequence.sendWindowEstimate(at)
-			if succeeds && estimate.Window != estimate.Ceiling || !succeeds && service.windowDeliveryStep() != 0 {
-				t.Errorf("success=%t physical confirmation did not own window proof: %+v", succeeds, estimate)
+			if estimate.Ceiling != before.Ceiling || !estimate.ServiceSized {
+				t.Errorf("success=%t physical confirmation changed permission or lost valid service: %+v", succeeds, estimate)
 			}
+			if succeeds {
+				if service.windowDeliveryStep() != at.UnixNano() || estimate.RoundTrip != 1200*time.Millisecond || estimate.WindowRoundTrip != 1210*time.Millisecond || estimate.Sized || estimate.Window != 30250000 || estimate.LearnedWindow != estimate.Window || estimate.CandidateWindow != estimate.Window {
+					t.Errorf("confirmed physical write failed to replace old sizing evidence: step=%d estimate=%+v", service.windowDeliveryStep(), estimate)
+				}
+			} else if service.windowDeliveryStep() != 0 || !estimate.Sized || estimate.RoundTrip != before.RoundTrip || estimate.CandidateWindow != before.CandidateWindow || estimate.Window != before.Window || estimate.LearnedWindow != before.LearnedWindow {
+				t.Errorf("failed physical write changed sizing evidence: %+v", estimate)
+			}
+			assertWindowRefillLogicalRate(t, estimate)
 		}
 	})
 }

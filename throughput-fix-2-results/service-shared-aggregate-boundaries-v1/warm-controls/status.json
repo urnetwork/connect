@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "241c22b3f555ad573acfd3333f72ae8abad24422ac2318fe7324e9d0f31c94fa",
+  "binary_sha256": "e6f764e9c91fdbdf62bddaffd78ea600c593d8bcda66eae98946204275bac4d2",
+  "effective_inputs_sha256": "e5522f74325d882e4208448047daff5dd7e980a8efdaf1db5eb6772e583a6977",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiver(SustainedPacingEscapesSlowHold|BatchedSplitPacingEscapesSlowHold|LegalRollingQueueReducesFastHold|LegalRollingQueueLegacyControl|LegalRollingQueueMixedControl|LegalSharedPositiveServiceBudget|OwnedFirstPrefixCannotBorrowSiblingStart|OwnedCausalReversalCannotBorrowSiblingSpan|OwnedTiesKeepTheirBytesAcrossPublicationOrder)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as build; absolute relationship pinned by original status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T21:37:49.657079+00:00",
+  "loadavg_start": [
+    10.544921875,
+    11.15966796875,
+    9.76953125
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 27.132367125246674,
+  "loadavg_end": [
+    9.7626953125,
+    10.8955078125,
+    9.71240234375
+  ],
+  "ended_utc": "2026-09-16T21:38:16.789618+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "a531a11fb7526ec5ad1daac220ba5ad38beef37bd48b666d6205fd22f8d5c1eb",
+  "pass": 27,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "normalization_note": "27P0F unchanged warm component, lawful slowdown and identity controls on the same guarded binary; no actual closed-loop throughput claim.",
+  "rows": 438
+}

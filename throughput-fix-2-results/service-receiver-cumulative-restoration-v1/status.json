@@ -1,0 +1,6 @@
+{
+  "classification": "Restore accidentally omitted accepted cumulative-delivery fallback:24P12F to36P0F under race. After-only six-gate performance has5P1F (RTT growth).",
+  "outcomes": 78,
+  "readings": 32,
+  "worker_readings": 0
+}

@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "e02a360dbb5763a3db187b28f32dbe6173da94cb41c79352ff58255b52095206",
+  "binary_sha256": "a86a87055474a26d835796b4231d5626fa1a95a79e6adc8806591792d4f858bb",
+  "effective_inputs_sha256": "e48fb3b38cf90b2a60bc4b364af59d2350f7be3d417746cbad0f65c99bed416f",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiverLegal(RollingQueue|SharedPositiveService)",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied module as build; original absolute relationship is pinned by original status/manifest hashes",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:41:21.950887+00:00",
+  "loadavg_start": [
+    26.654296875,
+    23.1845703125,
+    18.90185546875
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 21.431229250039905,
+  "loadavg_end": [
+    21.4208984375,
+    22.2158203125,
+    18.6533203125
+  ],
+  "ended_utc": "2026-09-16T20:41:43.382490+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "fff2e12108b5548496032c7834d333be14a2d8f5eb3c637683f959dc20bf0063",
+  "pass": 12,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "normalization_note": "Matched legal audit after bounded decrease: 12P/0F. Same physical frames, current byte permission and exact credits. Batched shared pace falls to about 3.821 MB/s; three actual shared pacers naturally exhaust the 1 MiB probe and release 4,352,000 bytes over 1.135988122 s (about 3.831 MB/s including burst phase). Frequent-read release remains about 3.158 MB/s. This justifies the decrease on lawful component inputs, not a model-throughput claim.",
+  "rows": 396
+}

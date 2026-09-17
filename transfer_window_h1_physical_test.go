@@ -158,6 +158,7 @@ type windowPhysicalH1Reading struct {
 	Receiver                 [2]ClientReceiveStatsSnapshot
 	Recovery                 [2]ClientSendRecoveryStatsSnapshot
 	Window                   [2]SendWindowEstimate
+	Policy                   [2]windowPhysicalH1PolicyReading
 	MaxRelayQueued           [2]int64
 	MaxRelayQueuedBytes      [2]int64
 	Nat                      windowPhysicalH1Nat
@@ -413,6 +414,7 @@ func measureWindowPhysicalH1(t *testing.T, arm, digest string, profiles [2]windo
 		reading.CarrierReceive[i] = transports[i].ReceiveStats()
 		reading.Receiver[i], reading.Recovery[i] = clients[i].ReceiveStats(), clients[i].SendRecoveryStats()
 		reading.Window[i] = clients[i].DestinationSendStats(clients[1-i].ClientId()).SendWindow
+		reading.Policy[i] = windowPhysicalH1PolicySnapshot(clients[i], clients[1-i].ClientId())
 	}
 	return reading
 }
@@ -465,7 +467,7 @@ func TestWindowPhysicalH1SdkSmoke(t *testing.T) {
 			}
 		}
 	}
-	if !readings[1].Window[0].Sized || readings[0].Window[0].Sized || readings[2].Window[0].Sized {
+	if !windowPhysicalH1ArmPolicyMatches("delivery", readings[1], 0) || !windowPhysicalH1ArmPolicyMatches("ceiling-before", readings[0], 0) || !windowPhysicalH1ArmPolicyMatches("ceiling-after", readings[2], 0) {
 		t.Error("physical H1 arms did not select the intended window policy")
 	}
 	reference := (readings[0].DownloadMbps + readings[2].DownloadMbps) / 2

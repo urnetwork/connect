@@ -15,6 +15,7 @@ func newSampledShareWindowFixture(t *testing.T, perSample ByteCount) (*SendSeque
 	sequence := newEstimatorFixture(t, func(settings *SendBufferSettings) {
 		settings.DeliverySizedWindowScale = deliverySizedWindowScale
 		settings.ResendQueueBudget = budget
+		settings.ResendQueueMaxByteCount = 64 * 1024
 		settings.ResendQueueMinByteCount = 32 * 1024
 	})
 	t.Cleanup(func() { sequence.resendQueue.Clear() })
@@ -22,7 +23,7 @@ func newSampledShareWindowFixture(t *testing.T, perSample ByteCount) (*SendSeque
 		other := newResendQueue(budget, 32*1024)
 		t.Cleanup(func() { other.Clear() })
 	}
-	base := time.Unix(time.Now().Unix(), 0)
+	base := time.Unix(1700000000, 0)
 	for index := range 8 {
 		received := base.Add(time.Duration(index) * time.Millisecond)
 		sequence.rttWindow.closeSendTime(uint64(received.Add(-25*time.Millisecond).UnixMilli()), received)
@@ -55,10 +56,9 @@ func TestAClampedWindowReportsTheMemoryShare(t *testing.T) {
 	}
 }
 
-// The failed live fixture sampled this valid delivery limit and assumed it
-// was memory-clamped. A shrinking memory share may bind it; restoring memory
-// must restore the delivery limit, not force the window above its evidence.
-func TestADeliveryLimitedWindowCanCrossTheMemoryClamp(t *testing.T) {
+// Delivery grows the configured opening to 251300 bytes. A smaller memory
+// share limits admission temporarily without erasing that learned capacity.
+func TestALearnedWindowSurvivesTheMemoryClamp(t *testing.T) {
 	sequence, budget, at := newSampledShareWindowFixture(t, 50260)
 	for _, row := range []struct {
 		total  ByteCount
@@ -71,8 +71,11 @@ func TestADeliveryLimitedWindowCanCrossTheMemoryClamp(t *testing.T) {
 	} {
 		budget.SetTotalByteCount(row.total)
 		estimate := sequence.sendWindowEstimate(at)
-		if !estimate.Sized || estimate.Window != row.window || estimate.Reason != row.reason {
+		if !estimate.Sized || estimate.Window != row.window || estimate.CandidateWindow != row.window || estimate.Reason != row.reason {
 			t.Fatalf("total %d: estimate=%+v, want window %d bound by %q", row.total, estimate, row.window, row.reason)
+		}
+		if estimate.Initial != 64*1024 || estimate.LearnedWindow != 251300 {
+			t.Fatalf("total %d: memory clamp changed delivery-grown capacity: %+v", row.total, estimate)
 		}
 		if estimate.Ceiling != row.total-64*1024 {
 			t.Fatalf("total %d: ceiling=%d, want the share after two other floors", row.total, estimate.Ceiling)
@@ -80,14 +83,17 @@ func TestADeliveryLimitedWindowCanCrossTheMemoryClamp(t *testing.T) {
 	}
 }
 
-// Even the smaller live fixture's share can exceed valid measured delivery.
-// This reproduces its failed window without demanding that delivery fill it.
-func TestADeliveryLimitedWindowRemainsBelowTheSmallMemoryShare(t *testing.T) {
+// Qualified delivery can grow the opening while remaining below even the
+// smaller memory share. Permission alone does not teach the unused capacity.
+func TestDeliveryGrowthRemainsBelowTheSmallMemoryShare(t *testing.T) {
 	sequence, budget, at := newSampledShareWindowFixture(t, 24518)
 	budget.SetTotalByteCount(192 * 1024)
 	estimate := sequence.sendWindowEstimate(at)
-	if !estimate.Sized || estimate.Window != 122590 || estimate.Ceiling != 131072 || estimate.Reason != "delivery" {
+	if !estimate.Sized || estimate.Window != 122590 || estimate.CandidateWindow != 122590 || estimate.LearnedWindow != 122590 || estimate.Ceiling != 131072 || estimate.Reason != "delivery" {
 		t.Fatalf("small-share delivery estimate=%+v, want window 122590 below share 131072", estimate)
+	}
+	if estimate.Initial != 64*1024 || estimate.Window <= estimate.Initial {
+		t.Fatalf("delivery did not grow the configured opening: %+v", estimate)
 	}
 }
 

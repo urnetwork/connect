@@ -1,0 +1,19 @@
+{
+  "changed_input_files": [
+    "transfer_window_pacing.go"
+  ],
+  "classification": "The max of positive service and common delivery does not fix static SDK startup; not adopted.",
+  "common_source": "Both arms include the common raw ring, conservative offer bound, safe receiver-prefix restriction, pending-drain guards and the reviewed SDK prefix test contracts.",
+  "context": "Tests ran with concurrent host load and no quiescence wait. Exact load/context/timestamps remain in each run status.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "event_plumbing": false,
+  "interpretation": "Short buffered-feedback and finite component controls pass, but these do not prove arbitrary multi-RTT feedback safety or closed-loop optimality. In the failing SDK cells final positive service exceeds the common rate; this one-line maximum cannot improve that limiter.",
+  "live_adoption": false,
+  "next_step": "Trace the actual startup limiter before another controller change; retain original warmups, per-direction capacity, finite-queue and refusal gates.",
+  "performance_gates_changed": false,
+  "performance_scope": "The unchanged SDK Short passes and SDK Long fails in each arm. Long has failures in both the 100 ms and 400 ms device-default cells. All 40 service readings and 370 top-level outcomes are retained.",
+  "production_delta": "Use max(ServiceByteRate, AggregateDeliveryByteRate) for pacing before existing discovery/drain margins and target cap. No sizing or backlog-classification change.",
+  "race_scope": "61 named component definitions repeated three times: 183 passes in each arm; no race warnings.",
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "warmup_changed": false
+}

@@ -1,0 +1,11 @@
+{"classification":"f9_direct_drain_liveness","name":"TestWindowPacingRetriedTailCannotStartDrain","outcome":"PASS","seconds":0.0,"variant":"retry-drain-f9"}
+{"classification":"f9_direct_drain_liveness","name":"TestWindowPacingRetriedTailWakesDrain","outcome":"PASS","seconds":0.0,"variant":"retry-drain-f9"}
+{"classification":"f9_direct_drain_liveness","name":"TestWindowPacingInvalidatedTailCannotStartDrain","outcome":"PASS","seconds":0.0,"variant":"retry-drain-f9"}
+{"classification":"f9_direct_drain_liveness","name":"TestWindowPacingInvalidatedTailWakesDrain","outcome":"PASS","seconds":0.0,"variant":"retry-drain-f9"}
+{"classification":"f9_direct_drain_liveness","name":"TestWindowPacingUnconfirmedCarrierCannotStartDrain","outcome":"PASS","seconds":0.0,"variant":"retry-drain-f9"}
+{"classification":"f9_direct_drain_liveness","name":"TestWindowPacingUnconfirmedCarrierWakesDrain","outcome":"PASS","seconds":0.0,"variant":"retry-drain-f9"}
+{"classification":"f9_direct_drain_liveness","name":"TestWindowPacingCanceledTailCannotStartDrain","outcome":"PASS","seconds":0.0,"variant":"retry-drain-f9"}
+{"classification":"f9_direct_drain_liveness","name":"TestWindowPacingCanceledTailWakesDrain","outcome":"PASS","seconds":0.0,"variant":"retry-drain-f9"}
+{"classification":"f9_direct_drain_liveness","name":"TestWindowPacingFreshTailRestoresDrainedProbe","outcome":"PASS","seconds":0.0,"variant":"retry-drain-f9"}
+{"classification":"f9_direct_drain_liveness","name":"TestWindowPacingAbortedDrainPreservesUnrelatedProbe","outcome":"PASS","seconds":0.0,"variant":"retry-drain-f9"}
+{"classification":"f9_direct_drain_liveness","name":"TestWindowPacingRepeatedTailInvalidationAllowsFreshDrain","outcome":"PASS","seconds":0.0,"variant":"retry-drain-f9"}

@@ -1,0 +1,37 @@
+{
+  "candidate_sampler_sha256": "474b63d672f6d51b1ab02630de17bd1ed1b43cfd2efdbf90231e031f4b3a10df",
+  "cold_patch_sha256": "f2f2a549c835ea34c5825306683ef52b36c60e2f55db000392388321490cf372",
+  "comparison": "Identical exact receiver timing credit and corrected endpoint math. After changes only cold interval eligibility and queue provenance: fully timed cold pairs may qualify below the advertised timer; a pair already queued at its first checkpoint retains the original upward interval requirement. Positive held service retains that requirement. All tests, gates, physical stimuli and warmup are unchanged.",
+  "controls": "One cumulative head grants no rate; equal waits retain true slow service; legacy short trains retain the raw compression bound; an unqueued physical worker retains capacity; exact credit, sibling, partial, buffered, queue, compressed-flight and interval controls are preserved.",
+  "event_plumbing": false,
+  "fixed_roots": [
+    "TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain",
+    "TestWindowPacingSdkColdDrainedTrainUsesExactPair",
+    "TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved"
+  ],
+  "instrumentation": "Every source pin records the compile flag and matching embedded binary -race metadata. SDK throughput is normal, deterministic roots and adjacent controls are race builds.",
+  "long_sdk_mbps": {
+    "100ms": {
+      "candidate": 489.00096,
+      "reference": 483.90144
+    },
+    "400ms": {
+      "candidate": 131.057015,
+      "reference": 131.043278
+    }
+  },
+  "normal_sdk_repetitions": 1,
+  "performance_gates_changed": false,
+  "production_adopted": false,
+  "race_adjacent_repetitions": 3,
+  "race_roots_repetitions": 3,
+  "remaining_review": "Receiver-corrected interior ordering, tied endpoints and excluded-byte provenance remain an adjacent acceptance blocker. A separate combined cycle-start candidate passes the actual six gates; neither fact overrides this ordering review.",
+  "sdk_fixture_sha256": "44e0bf1b907dace14b09405ca48246ddf0d890a77afcfd751025b7ef3f57564a",
+  "sdk_scope": "After-only normal SDK subset: four constrained device/provider profiles at one/eight flows (eight short cells), plus default device100/400ms at one flow (two long cells). This archive does not claim a matched normal SDK before invocation. Earlier warm-candidate failure remains in the separately preserved actual-six model.",
+  "source_base": {
+    "sampler_sha256": "b74174452b9e4ba28df1b8dd28a1ecfefe8ad352c1343ae0b59711e275f40e6e",
+    "snapshot": "receiver-credit-warm-after-pinned"
+  },
+  "test_execution_owner": "test_monitor_medium",
+  "warmup_changed": false
+}

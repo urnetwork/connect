@@ -108,10 +108,10 @@ func (self *SendSequence) finishReceiverRttWrite(item *sendItem, disposition tra
 }
 
 // Observes the exact message and initial echoed tag while the item is still
-// retained. Only this bounded snapshot crosses into the RTT/service owners.
-func (self *SendSequence) observeReceiverAckRtt(ack receiveAckMessage) {
+// retained. Only a confirmed H1 head may pair its receiver wait with new credit.
+func (self *SendSequence) observeReceiverAckRtt(ack receiveAckMessage) windowServiceAckTiming {
 	if !ack.receiverAckDelaySet || !ack.tag.set || ack.contractMissing || self.resendQueue == nil {
-		return
+		return windowServiceAckTiming{}
 	}
 	var observation pendingReceiverRtt
 	var sentAtNanos int64
@@ -147,7 +147,11 @@ func (self *SendSequence) observeReceiverAckRtt(ack receiveAckMessage) {
 	}()
 	if observation.receivedAtNanos != 0 {
 		self.applyReceiverRtt(sentAtNanos, observation, burst, paced)
+		if paced {
+			return windowServiceAckTiming{receivedAtNanos: observation.receivedAtNanos, receiverDelay: time.Duration(observation.delayMicros) * time.Microsecond}
+		}
 	}
+	return windowServiceAckTiming{}
 }
 
 // Recovery keeps the complete physical residence. The optional adjusted value

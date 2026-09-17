@@ -1,0 +1,12 @@
+{
+  "archive": "window-cumulative-pacing-sdk-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "58ccdf89f7859e49528399cb4fd2399490f9c836ec705c7e4b4930fbf80fba2e",
+    "outcomes.jsonl": "efc1a509912a07c400a5519a56f064429c0358f24dc18db8fdd9ef4bd53df0b4",
+    "provenance.json": "b3fc401d81ea1d8e3b1deea73a999413dc9642965db80752c28662048053a4d7",
+    "source-manifest-after.json": "3778ddb01b125d70fd07a11739f1c6e928725de9dcf00d8c04de8e8c101651d2",
+    "source-manifest-before.json": "5a6d7939ca5a459990f89d84bafdd96f8ea20d00cd91f53cd0b75925175d527b",
+    "source-pins.json": "d2c721c8a2d37e170b58a3b3959d7c03d11d7959ab60e2081f382e4d09d9192d",
+    "status.json": "899fcdca1c4f3f63994a3faa60b8228dd7e8a6d719b050ef87fbf2062696c301"
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "after_outcomes": "72P0F0S",
+  "before_outcomes": "57P15F0S",
+  "classification": "Experimental shared cumulative producer and cold pacing consumer satisfy the prescribed-training actual shared-reserve utilization roots and adjacent policy contracts; no live or general sampler acceptance.",
+  "clock_ownership": "Cold common history selects the newest interval spanning at least2residences and4buckets, fresh within that qualification span, subject to current caller permission and windowDeliveryStep. Serialization drain/probe epochs alone do not erase cold cumulative history. Warm offer-bound use is a distinct pending contract.",
+  "consumer_scope": "Actual waitForService reservation and shared burst dispatch consume final qualified estimates for at most three observed flights, within measured freshness and effective byte limits. Startup allowance is spent through actual preceding reservations and bounded ACKed flights.",
+  "contract_split": "Exact byte ownership, finite probe, target/window limits, and evidence scope are hard invariants. Aggregate release within its measured prior duration is a utilization objective, not protocol correctness or an exact required serialization value.",
+  "credit_scope": "Every physical initial H1 write enrolls an actual retained frame, confirms its write, then publishes through publishAckServiceCredit. Duplicate cumulative heads and late SACK calls cannot add credit. Exactly acknowledged frames are removed before the next complete flight.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "event_plumbing": false,
+  "initial_build_invocation": "Final proof uses successful race compile manifests and stable binary/source checks; any earlier argument error is not a test or production outcome.",
+  "live_adoption": false,
+  "open_acceptance": "Common-ring mixed/late/unknown/long-RTT helper contracts and static warm closed-loop growth are owned by the sibling sampler review. Positive-service SDK/model failures are not attributed or claimed fixed. Prefix receiver-wait ingress-order defect is independent of this raw ring and remains separate research.",
+  "own_vs_shared": "DeliveryByteRate remains per sequence; AggregateDeliveryByteRate reports common fresh H1 credit. Common pacing does not set Sized/ServiceSized or change retained window math. Positive service remains authoritative; absent common proof preserves accepted own fallback.",
+  "performance_gates_changed": false,
+  "production_changes": [
+    "transfer.go",
+    "transfer_window_pacing.go",
+    "transfer_window_pacing_delivery.go",
+    "transfer_window_service_credit.go",
+    "transfer_window_service_delivery.go"
+  ],
+  "production_sha256": {
+    "after": {
+      "transfer.go": "fcadd43bf1b92464e760bfe306b5591d40b6f1bc996754facd3e01df41e022cc",
+      "transfer_window_pacing.go": "30eaf2913f00de39c9835d92de4c29f7f26083855a40f27c8c6ec0fd15393118",
+      "transfer_window_pacing_delivery.go": "9644e8932e3fafa866ac5dfa699ca7930d83ea7a065fd267946a18e2a9494cf4",
+      "transfer_window_service_credit.go": "78ec5c4d70f9062e2423ba9b040d64215f17652af11310e78b8461288758df9d",
+      "transfer_window_service_delivery.go": "289fc34c6b34a99f95ee8e94433a6761fd9b534e4580d672f49f88d63bbd422a"
+    },
+    "before": {
+      "transfer.go": "16fb5b507169f93e6ce22b67696fbdb82a4e9c4e18deed0caeb868335293407a",
+      "transfer_window_pacing.go": "3294610224c983316fc09191818e13f59bc964dcff6af76ab9db793cf8ad4f3a",
+      "transfer_window_service_credit.go": "039d01cf6becbd7d069dbb198c2ba76ad8003eff2ffca62ba0f3abd3402ad9dd"
+    }
+  },
+  "proof_scope": "24 named roots per variant, three repetitions. Four split-share utilization roots and one early-return policy root fail before; all pass after. Single/idle/stale/other-service, original12 cumulative controls, current/disabled policy, permission cutoff, observational snapshots and no-RTT own-only compatibility stay covered.",
+  "race": true,
+  "repetitions": 3,
+  "source_base": {
+    "after": "throughput-fix-2-cumulative-shared-delivery-after-v2-pinned",
+    "before": "throughput-fix-2-cumulative-shared-delivery-before-v2-pinned"
+  },
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "test_oracle_correction": "Compared with original failed v1, only the unaccepted missing-history premise changed: preserve the pre-clear effective retained window rather than require Initial. Production, utilization gates and all other assertions unchanged. V1 wrong-oracle evidence is separately archived.",
+  "test_sources_identical": true,
+  "training_scope": "Prescribed complete H1 flights and explicit raw ACK times bypass pacing during training. All physical frames are at most8KiB; each flight stays within effective window and aggregate training below125MB/s. This is not closed-loop throughput reachability.",
+  "unexecuted_after_table_cases": []
+}

@@ -1,0 +1,14 @@
+{
+  "classification": "read-only design and isolated unknown-field sizing experiment; proposal remains unimplemented",
+  "current_decoded_pack_owner_bytes": 1000,
+  "current_owner_charge_bytes": 1000,
+  "max_encrypted_legacy_bytes": 5420,
+  "max_encrypted_legacy_evictions_512_bytes": 5420,
+  "max_varint_tuple_bytes": 40,
+  "performance_acceptance_claimed": false,
+  "reservation_bytes_with_512_evictions": 5440,
+  "reservation_bytes_without_evictions": 320,
+  "schema_or_shared_source_changed": false,
+  "wire_rows": 8,
+  "wire_test_passed": true
+}

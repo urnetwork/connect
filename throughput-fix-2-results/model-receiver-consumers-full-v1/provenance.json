@@ -1,0 +1,15 @@
+{
+  "failed_tests": [
+    "TestWindowPathSdkDuplexRecoversAfterInitialFeedbackBarrier",
+    "TestWindowPathSdkProfiles",
+    "TestWindowPathSdkBidirectional",
+    "TestWindowPathServiceRoundTripGrowthBeyondOldRing"
+  ],
+  "interpretation": "The prior focused pass does not establish full model acceptance or consistent behavior across feedback phases.",
+  "no_quiescence_wait": true,
+  "outcome": "26 passes,4 failures,0 skips, no race instrumentation or warnings. Forced SDK feedback recovery delivers118.231 versus750.244 Mb/s in its failing direction. RTT growth delivers19.558 versus95.771 Mb/s. Multiple SDK directions fail their original capacity gates.",
+  "race": false,
+  "role": "Full virtual-time model following the six-gate receiver-consumer pass.",
+  "runtime_directory_caveat": "The temporary wrapper ran from the earlier combined-receiver-refill copied source, rather than its build module. The SDK fixture is embedded and byte-identical (44e0bf1b907dace14b09405ca48246ddf0d890a77afcfd751025b7ef3f57564a); none of the selected model tests invokes the package source-reading audits. No measurement invalidation was found in this review, but later runners explicitly derive and record their own copied build cwd.",
+  "source_limitation": "The later integration audit proves this source omitted accepted cumulative-delivery fallback behavior. It is preserved as diagnostic evidence and is not an adoptable candidate."
+}

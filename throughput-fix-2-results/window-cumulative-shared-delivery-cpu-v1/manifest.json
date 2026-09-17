@@ -1,0 +1,13 @@
+{
+  "archive": "window-cumulative-shared-delivery-cpu-v1",
+  "payload_sha256": {
+    "benchmark-source.txt": "acfa171a6b1ab8eb4f4615b73ac50180ac1ea4ccbdccad6d06007540b7d2e469",
+    "ledger.jsonl": "d6a2af77106087c6736889002cbf93d3c258e6e5686304a3caf1d0c019e88ad9",
+    "outcomes.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "provenance.json": "3ab2915c4d698e4f89103f3c3bc09972773851b40893644b1929a196eec0bcec",
+    "source-manifest-after.json": "d0519c666155db67ae63a5ead5aa22fee98584b30f54c00b3bba8b18c7fd5e6b",
+    "source-manifest-before.json": "e01e5707d8b81924b99990331adce74397010a10267e41e0adace2989810f7fb",
+    "source-pins.json": "c0e60e9f34793f94e61b13ce14ecbe61569c0fb936a6e0573cf7e4fe5c9caa9c",
+    "status.json": "29df36d0a0db8ebb402d3528526cd52ee8166a90bc0d047a0d82a2505ac09548"
+  }
+}

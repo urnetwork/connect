@@ -1,0 +1,3 @@
+=== RUN   TestWindowPathServicesShareFiniteRelay
+--- PASS: TestWindowPathServicesShareFiniteRelay (0.70s)
+PASS

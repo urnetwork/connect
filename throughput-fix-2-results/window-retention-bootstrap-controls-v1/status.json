@@ -1,0 +1,6 @@
+{
+  "classification": "Frozen controlled bootstrap comparison. TestWindowCompressionResidenceGrowsSmallOpening retains the 256 KiB small opening; TestWindowPathBoundsBurstsAtFiniteRelay retains the 48 MiB configured opening. Both use unchanged test thresholds.",
+  "outcomes": 4,
+  "readings": 4,
+  "worker_readings": 0
+}

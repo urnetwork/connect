@@ -1,0 +1,13 @@
+{
+  "binary_sha256_after": "3cf6445f0168f1472e75ba3263af48e3d1b91c005a8ad19cfe1b907872d1f50c",
+  "binary_sha256_before": "3cf6445f0168f1472e75ba3263af48e3d1b91c005a8ad19cfe1b907872d1f50c",
+  "declared_effective_overlay_files": {
+    "connect/transfer_window_pacing.go": "a320261b31a7d4f216a491be38766d6c89db19d01b1ce05d7f81531cbc27db76",
+    "connect/transfer_window_service_performance_test.go": "9d4ee21dbb28de83798b1e23e476e752753d53c8483cba599788656bf7ff3e73"
+  },
+  "effective_source_inventory_file_count": 836,
+  "effective_source_sha256": "f8efab79030b283e7c530b148c34ee72dc8fd0558b98790c4c05427cd73f819b",
+  "parent_base_manifest_sha256": "c8e7f15ad435c28131e5b05e0c391eff1edac04a6f7969acaabdb62eec9a0fe4",
+  "parent_retry_only_run_manifest_sha256": "bef76f94f94687f7348c31c60dc9a19a4ab3a0a6d9dda45875372baea8e05b27",
+  "raw_run_log_sha256": "97286021efb1e990459041a60b643f9c560679634b41514450c921d8d29b4106"
+}

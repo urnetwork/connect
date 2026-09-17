@@ -1,0 +1,8 @@
+{
+  "archive": "benchmark-ledger-preservation-v1",
+  "payload_sha256": {
+    "provenance.json": "a3bcb63dccf6531d411fedf3d7767ff7a3eaaba1dfc6721ae3f9d6f4901370c0",
+    "readings.jsonl": "3691cff69136d68c57b8d97dd4bd093c2e8ac9b3cb9ad22006433684d4aebd2e",
+    "result.json": "c42671c6d3a8e3b9701e0fb2bde65605ab35d9e706320c3e2b97523ccf550ddd"
+  }
+}

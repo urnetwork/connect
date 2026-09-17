@@ -1,0 +1,39 @@
+{
+  "created_utc": "2026-09-17T00:46:53.102339+00:00",
+  "arm": "before",
+  "selection": "roots",
+  "source_sha256": "49938042f7187e7090352abb4fa64ac2dcb04f42d4c070232fb60fd37a4ff5e0",
+  "input_sha256": "b481b5e8ae9eed659cff9946c0844143eb76bf80fc94501605e82c766742d4f9",
+  "source_manifest_sha256": "caa461c0523634b754bab512cae85a8978bc5ab98e5dc292ef94e1c139d82c4c",
+  "working_directory": "/tmp/throughput-fix-2-prefix-live-pinned-v1/before/source/connect",
+  "build_command": [
+    "go",
+    "test",
+    "-race=true",
+    "-c",
+    "-o",
+    "/tmp/throughput-fix-2-prefix-live-pinned-v1/before/tests-race",
+    "."
+  ],
+  "run_command": [
+    "/tmp/throughput-fix-2-prefix-live-pinned-v1/before/tests-race",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacing(Cold|SdkCold|Receiver(EarlyIngress|OrderedIngress|PrefixZero|SackedPrefix|RelayReorder))",
+    "-test.count=3",
+    "-test.timeout=15m"
+  ],
+  "host_load_average_at_start": [
+    6.34326171875,
+    8.31494140625,
+    9.32470703125
+  ],
+  "no_quiescence_wait": true,
+  "go_version": "go version go1.26.7 darwin/arm64",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "logical_cpus": 10,
+  "environment": {},
+  "run_script_sha256": "803edd3b5aeaf7ae0d8210fb28d01b79a26229214363343c86e3da99dafd02b3",
+  "binary_sha256": "212b8f6fb35b217e91081ae5466450b4ca447cd931716382a72dc429da5bf108",
+  "go_version_m": "/tmp/throughput-fix-2-prefix-live-pinned-v1/before/tests-race: go1.26.7\n\tpath\tgithub.com/urnetwork/connect.test\n\tmod\tgithub.com/urnetwork/connect\t(devel)\t\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-race=true\n\tbuild\tCGO_ENABLED=1\n\tbuild\tCGO_CFLAGS=\n\tbuild\tCGO_CPPFLAGS=\n\tbuild\tCGO_CXXFLAGS=\n\tbuild\tCGO_LDFLAGS=\n\tbuild\tGOARCH=arm64\n\tbuild\tGOOS=darwin\n\tbuild\tGOARM64=v8.0\n"
+}

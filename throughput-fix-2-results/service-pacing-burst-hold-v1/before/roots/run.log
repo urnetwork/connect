@@ -1,0 +1,49 @@
+=== RUN   TestWindowPacingOnePermittedBurstKeepsHeldRate
+    transfer_window_pacing_burst_queue_test.go:35: a permitted reverse burst repriced healthy forward service: held=0 rate=111219709
+--- FAIL: TestWindowPacingOnePermittedBurstKeepsHeldRate (0.00s)
+=== RUN   TestWindowPacingQueueBeyondBurstReleasesHeldRate
+--- PASS: TestWindowPacingQueueBeyondBurstReleasesHeldRate (0.00s)
+=== RUN   TestWindowPacingPermittedBurstDoesNotMaskForwardBacklog
+--- PASS: TestWindowPacingPermittedBurstDoesNotMaskForwardBacklog (0.00s)
+=== RUN   TestWindowPacingServiceObservesQueueOnce
+--- PASS: TestWindowPacingServiceObservesQueueOnce (0.00s)
+=== RUN   TestWindowPacingHeldRateFallsOnlyWithCongestion
+    transfer_window_pacing_discovery_test.go:100: case: held
+    transfer_window_pacing_discovery_test.go:100: case: backlogged
+    transfer_window_pacing_discovery_test.go:100: case: held above target
+    transfer_window_pacing_discovery_test.go:100: case: held before service
+    transfer_window_pacing_discovery_test.go:100: case: held below bootstrap
+--- PASS: TestWindowPacingHeldRateFallsOnlyWithCongestion (0.00s)
+=== RUN   TestWindowPacingOnePermittedBurstKeepsHeldRate
+    transfer_window_pacing_burst_queue_test.go:35: a permitted reverse burst repriced healthy forward service: held=0 rate=111219709
+--- FAIL: TestWindowPacingOnePermittedBurstKeepsHeldRate (0.00s)
+=== RUN   TestWindowPacingQueueBeyondBurstReleasesHeldRate
+--- PASS: TestWindowPacingQueueBeyondBurstReleasesHeldRate (0.00s)
+=== RUN   TestWindowPacingPermittedBurstDoesNotMaskForwardBacklog
+--- PASS: TestWindowPacingPermittedBurstDoesNotMaskForwardBacklog (0.00s)
+=== RUN   TestWindowPacingServiceObservesQueueOnce
+--- PASS: TestWindowPacingServiceObservesQueueOnce (0.00s)
+=== RUN   TestWindowPacingHeldRateFallsOnlyWithCongestion
+    transfer_window_pacing_discovery_test.go:100: case: held
+    transfer_window_pacing_discovery_test.go:100: case: backlogged
+    transfer_window_pacing_discovery_test.go:100: case: held above target
+    transfer_window_pacing_discovery_test.go:100: case: held before service
+    transfer_window_pacing_discovery_test.go:100: case: held below bootstrap
+--- PASS: TestWindowPacingHeldRateFallsOnlyWithCongestion (0.00s)
+=== RUN   TestWindowPacingOnePermittedBurstKeepsHeldRate
+    transfer_window_pacing_burst_queue_test.go:35: a permitted reverse burst repriced healthy forward service: held=0 rate=111219709
+--- FAIL: TestWindowPacingOnePermittedBurstKeepsHeldRate (0.00s)
+=== RUN   TestWindowPacingQueueBeyondBurstReleasesHeldRate
+--- PASS: TestWindowPacingQueueBeyondBurstReleasesHeldRate (0.00s)
+=== RUN   TestWindowPacingPermittedBurstDoesNotMaskForwardBacklog
+--- PASS: TestWindowPacingPermittedBurstDoesNotMaskForwardBacklog (0.00s)
+=== RUN   TestWindowPacingServiceObservesQueueOnce
+--- PASS: TestWindowPacingServiceObservesQueueOnce (0.00s)
+=== RUN   TestWindowPacingHeldRateFallsOnlyWithCongestion
+    transfer_window_pacing_discovery_test.go:100: case: held
+    transfer_window_pacing_discovery_test.go:100: case: backlogged
+    transfer_window_pacing_discovery_test.go:100: case: held above target
+    transfer_window_pacing_discovery_test.go:100: case: held before service
+    transfer_window_pacing_discovery_test.go:100: case: held below bootstrap
+--- PASS: TestWindowPacingHeldRateFallsOnlyWithCongestion (0.00s)
+FAIL

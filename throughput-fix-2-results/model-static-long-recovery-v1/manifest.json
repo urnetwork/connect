@@ -1,0 +1,16 @@
+{
+  "kind": "static-closed-loop-performance-control",
+  "file_sha256": {
+    "README.md": "5907ebf56b128d281783f544f4d80d3f5677024d8364824c3bafe182682568fa",
+    "build-manifest.json": "f827076262954260ab22636b4f22fd380764f8cc393480a7df04372f1fd56bc6",
+    "build.log": "7cd2c28e1bb63ae0ce92e4215cb0e28344d38921b6cb44ed2826483eeac41999",
+    "initial-overlay-argument-error.build.log": "e7299243fa1028d8d019b5d3751970d66ef2b6b6f464e406b9d5e491ca6f3694",
+    "outcomes.json": "dad16cbaf9e5af6347f123ff6134a5c9b0fb25749aef3c5de428fdde9d818ef9",
+    "readings.json": "b44cc01b541a809c5a525c5e9cc7fb2a187981fec9480681c8ee19e175084063",
+    "run.log": "76874a7ac0d0e5d4f65ee8a22a913b5b2d875b3ab7519736dcf7cebbbe6ec711",
+    "snapshot-inputs.json": "353274ab087436af4f324ecafcab70b41d54baaa5d3b69dd25651af3c8f74997",
+    "status.json": "ef47dc7fa2d5576a868056aeefc5a2ad87f5c432bff71c84c833a6c0d26feee2",
+    "summary.json": "c7f69a5f2df2f3172b8cc0e7e4e81ea5f43865821e553d390f45674054340fd5",
+    "transfer_window_static_long_recovery_test.go": "27958fb775ec82904d30b9ed9aa2ca86948abcb834b1ab2f4d4869e2e6a31289"
+  }
+}

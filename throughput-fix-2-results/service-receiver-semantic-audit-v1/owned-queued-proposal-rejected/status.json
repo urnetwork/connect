@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "0e694e83b30ac17e0c7bac9f17d9cde48ba9114806e9727e6e9a0834191c751f",
+  "binary_sha256": "85f0ea520def48cdc0eefc8228bdbb25798534a13900aa7fe0c25997a5bde93e",
+  "effective_inputs_sha256": "5d6c3495b1f1dd4be36fe478adbb720a29720b70ea9f010a43db457d9f36e983",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiver(Owned|SustainedPacingEscapesSlowHold$|BatchedSplitPacingEscapesSlowHold$)",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied module as build; original absolute relationship is pinned by original status/manifest hashes",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:50:22.984701+00:00",
+  "loadavg_start": [
+    23.44384765625,
+    13.95263671875,
+    14.6982421875
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 5.508827125187963,
+  "loadavg_end": [
+    23.248046875,
+    14.0693359375,
+    14.73486328125
+  ],
+  "ended_utc": "2026-09-16T20:50:28.494203+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "2cabfbdd27ddb0576948657a1175938ed6d5878d619bafbc04c8ef6b20b6ccb7",
+  "pass": 12,
+  "fail": 6,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "Proposed controls initially produced 12P/6F: lawful batched hold fails three and new queued-start cap fails three. The latter preconfirms a future write and allows a recovering fast path, so its old-rate cap is not a valid hard oracle. Original proof preserved; corrected suite removes only this newly proposed assertion and retains prefix/causality/tie controls plus established real buffered-carrier controls.",
+  "rows": 54
+}

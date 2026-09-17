@@ -1,0 +1,6 @@
+{
+  "classification": "Explicit legacy compression reaches cold zero-service and reproduces two-lane actual-consumer underfill. Four-lane table cases were not executed after earlier failures.",
+  "outcomes": 48,
+  "readings": 9,
+  "worker_readings": 0
+}

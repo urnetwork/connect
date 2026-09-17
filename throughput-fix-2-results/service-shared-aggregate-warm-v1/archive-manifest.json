@@ -1,0 +1,17 @@
+{
+  "scope": "Normalized copied proof, original raw/source/binary/status hashes preserved",
+  "file_sha256": {
+    "README.md": "9b80bbe2b9d1240c4773ef47a149e357ebaaff8570d67b253de32ff549a93ac5",
+    "after/ledger.jsonl": "cd2cc4461406576dfe19a496e81c72423ca799d6950c4ae268bea28b64c8a9de",
+    "after/manifest.json": "e9956804680727b4350bee5ad30e919d019b80b89666a1cf7669a171e50d0d7a",
+    "after/outcomes.txt": "8d6b2724e9d4dc51f8686cdd2807915f0b0a7d556c7b8ff84bc599a7778d7de8",
+    "after/provenance.json": "d1d146582dd3bd102b79edea307eab58dc079b25cc74ddb545297d7a42c9e5ee",
+    "after/status.json": "9d647d62498f02bff564c7800abd79a09d95f34f553d9f552b0e7593124dddad",
+    "before/ledger.jsonl": "78f5ca34ce35ac7f124fe44bb33f46853cfeb75518179bec9cb953a9d4bf358c",
+    "before/manifest.json": "87316432eb64f1ed2aa5723733cfc86e6c794be2f24e0921ba50ff2b0bcdf024",
+    "before/outcomes.txt": "b05b556eb7496041def963e9b914e8f78494d1150a1fa83868f32d30e8f5a481",
+    "before/provenance.json": "e460ee8c714b05ff976f0239dea48b5251dbb92908d4fbefbc1beb721f24553e",
+    "before/status.json": "72f441addeeaca3f70243a7a9b478a5e37e70f393947524a4d9c894caf61f6e5",
+    "summary.json": "6b421bdedac4dd95bc244f18beca41278c0d08275491f16a1714c43ce7508bf5"
+  }
+}

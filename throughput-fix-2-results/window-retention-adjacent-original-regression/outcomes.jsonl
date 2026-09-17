@@ -1,0 +1,4 @@
+{"outcome": "FAIL", "seconds": "2.03s", "test": "TestSizedWindowIsComputedFromTheMeasuredRoundTrip", "variant": "original"}
+{"outcome": "FAIL", "seconds": "0.05s", "test": "TestSizedWindowShrinksWhenThePathShrinks", "variant": "original"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestAgainstALegacyPeerTheWindowSettlesOnceAndStays", "variant": "original"}
+{"outcome": "FAIL", "seconds": "3.03s", "test": "TestAtEquilibriumOccupancyIsHalfTheWindow", "variant": "original"}

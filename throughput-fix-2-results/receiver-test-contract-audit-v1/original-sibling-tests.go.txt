@@ -1,0 +1,166 @@
+// Every sibling owns its bytes and receiver wait. Later credit must recover
+// serialization without pairing a raw-first exclusion to a different clock.
+package connect
+
+import (
+	"testing"
+	"time"
+)
+
+// Three contiguous 2673-byte envelopes serialize at 12.5 MB/s. The middle
+// sibling may wait longer, so the first controller read lacks its exact credit.
+func windowReceiverColdSiblingRate(t *testing.T, phase time.Duration, delayed bool) ByteCount {
+	t.Helper()
+	start := time.Unix(1700000000, 0).Add(phase)
+	service := newWindowPacingService(DefaultSendBufferSettings())
+	var fixtures [3]*windowReceiverCreditFixture
+	var items [3]*sendItem
+	var arrivals [3]time.Time
+	waits := [3]time.Duration{7 * time.Millisecond, 7 * time.Millisecond, 7 * time.Millisecond}
+	if delayed {
+		waits[1] = 10 * time.Millisecond
+	}
+	for lane := range fixtures {
+		fixtures[lane] = newWindowReceiverCreditFixture(t, service, start, 10*time.Millisecond)
+		items[lane] = fixtures[lane].write(0, 2673, start)
+		arrivals[lane] = start.Add(100*time.Millisecond + time.Duration(lane+1)*213840*time.Nanosecond + waits[lane])
+	}
+	order := []int{0, 1, 2}
+	if delayed {
+		order = []int{0, 2, 1}
+	}
+	for index, lane := range order {
+		fixture := fixtures[lane]
+		fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(items[lane], arrivals[lane], waits[lane]))
+		if index == 1 {
+			if service.total != 5346 || fixtures[order[2]].sequence.windowPacer.serviceAcked != 0 {
+				t.Fatal("the partial controller read already received the missing sibling's bytes")
+			}
+			t.Logf("cold delayed=%t phase=%s partial-service=%d", delayed, phase, fixture.measured(arrivals[lane]))
+		}
+	}
+	if service.total != 8019 || service.sent != 8019 || !service.drained || service.pendingWrites != 0 {
+		t.Fatalf("complete physical train changed credit: total=%d sent=%d drained=%t tails=%d", service.total, service.sent, service.drained, service.pendingWrites)
+	}
+	for _, fixture := range fixtures {
+		if fixture.sequence.windowPacer.serviceAcked != 2673 {
+			t.Fatal("an exact sibling head lost or repeated delivery credit")
+		}
+	}
+	return fixtures[0].measured(arrivals[order[2]])
+}
+
+// A later middle reply completes the same physical pair that initially
+// appeared to contain only half its bytes. Full ownership must restore it.
+func TestWindowPacingReceiverLateSiblingCompletesColdSerialization(t *testing.T) {
+	for _, phase := range []time.Duration{0, 3 * time.Millisecond} {
+		if rate := windowReceiverColdSiblingRate(t, phase, true); rate != 12500000 {
+			t.Errorf("phase=%s: complete physical12.5MB/s train kept partial service=%d", phase, rate)
+		}
+	}
+}
+
+// Equal waits keep raw and receiver order aligned, with identical ownership.
+func TestWindowPacingReceiverOrderedColdSiblingsKeepSerialization(t *testing.T) {
+	for _, phase := range []time.Duration{0, 3 * time.Millisecond} {
+		if rate := windowReceiverColdSiblingRate(t, phase, false); rate != 12500000 {
+			t.Errorf("phase=%s: ordered physical12.5MB/s train changed service=%d", phase, rate)
+		}
+	}
+}
+
+// An exact controlled probe starts the long-RTT epoch. Two confirmed sibling
+// prefixes follow on the serializer; an optional tail keeps the flight open.
+func windowReceiverEpochSiblingRate(t *testing.T, physicalRate ByteCount, delayed, rolling bool) ByteCount {
+	t.Helper()
+	fixture := newWindowDrainFeedbackFixture(t, true, 2131032)
+	service := fixture.service
+	service.measured(time.Second, fixture.partialAt)
+	dispatchAt := fixture.start.Add(1210300 * time.Microsecond)
+	fixture.complete(dispatchAt)
+	if delay, _ := service.admitBurst(dispatchAt, 2673, false, &fixture.waiter); delay != 0 {
+		t.Fatal("complete physical tails did not admit the controlled probe")
+	}
+	probeSequence, probeId := NewId(), NewId()
+	fixture.dispatch(probeSequence, probeId, dispatchAt)
+	bytes := physicalRate / 100
+	var siblings [2]*windowReceiverCreditFixture
+	var items [2]*sendItem
+	for lane := range siblings {
+		siblings[lane] = newWindowReceiverCreditFixture(t, service, dispatchAt, 10*time.Millisecond)
+		items[lane] = siblings[lane].write(0, bytes, dispatchAt.Add(time.Microsecond))
+	}
+	if rolling {
+		tail := newWindowReceiverCreditFixture(t, service, dispatchAt, 10*time.Millisecond)
+		tail.write(0, 1, dispatchAt.Add(time.Microsecond))
+	}
+	probeAt := dispatchAt.Add(1200 * time.Millisecond)
+	service.observeReceiverRoundTripForWrite(probeSequence, probeId, 0, 1200*time.Millisecond, 1200*time.Millisecond, 10*time.Millisecond, probeAt)
+	service.acknowledgeWrite(probeSequence, probeId, 1, false, 10*time.Millisecond, probeAt)
+	service.stateLock.Lock()
+	service.observeAckWithLock(2673, probeAt, windowServiceAckTiming{receivedAtNanos: probeAt.UnixNano()})
+	service.stateLock.Unlock()
+	if !service.serviceEpochAt.Equal(probeAt) || service.roundTripEvidence(probeAt).minimum != 1200*time.Millisecond {
+		t.Fatal("the confirmed physical probe did not establish the new epoch")
+	}
+	waits := [2]time.Duration{10 * time.Millisecond, 10 * time.Millisecond}
+	order := []int{0, 1}
+	if delayed {
+		waits[0] = 30 * time.Millisecond
+		order = []int{1, 0}
+	}
+	var at time.Time
+	for index, lane := range order {
+		at = probeAt.Add(time.Duration(lane+1)*10*time.Millisecond + waits[lane])
+		sibling := siblings[lane]
+		sibling.sequence.coalesceReceivedAck(sibling.ackWindow, sibling.ack(items[lane], at, waits[lane]))
+		if index == 0 {
+			if siblings[order[1]].sequence.windowPacer.serviceAcked != 0 {
+				t.Fatal("the partial epoch read borrowed the other sibling's credit")
+			}
+			t.Logf("epoch physical=%d delayed=%t rolling=%t partial-service=%d", physicalRate, delayed, rolling, sibling.measured(at))
+		}
+	}
+	wantOutstanding := ByteCount(0)
+	if rolling {
+		wantOutstanding = 1
+	}
+	if service.sent-service.total != wantOutstanding || service.drained == rolling {
+		t.Fatalf("the measured prefix changed its physical tail: sent=%d total=%d drained=%t", service.sent, service.total, service.drained)
+	}
+	for _, sibling := range siblings {
+		if sibling.sequence.windowPacer.serviceAcked != bytes {
+			t.Fatal("the sibling's exact prefix lost or repeated credit")
+		}
+	}
+	return siblings[0].measured(at)
+}
+
+// Complete accounting of the first post-epoch train must supersede its
+// partial sample, whether a separately offered tail is still outstanding.
+func TestWindowPacingReceiverLateSiblingCompletesEpochSerialization(t *testing.T) {
+	for _, rolling := range []bool{false, true} {
+		if rate := windowReceiverEpochSiblingRate(t, 12500000, true, rolling); rate != 12500000 {
+			t.Errorf("rolling=%t: owned epoch train kept partial service=%d", rolling, rate)
+		}
+	}
+}
+
+// Correct sibling ownership must also discover a genuinely slower serializer;
+// retaining the pre-probe fast rate cannot satisfy the same complete proof.
+func TestWindowPacingReceiverLateSiblingFindsSlowEpochSerialization(t *testing.T) {
+	for _, rolling := range []bool{false, true} {
+		if rate := windowReceiverEpochSiblingRate(t, 1000000, true, rolling); rate != 1000000 {
+			t.Errorf("rolling=%t: slow owned epoch train measured service=%d", rolling, rate)
+		}
+	}
+}
+
+// Aligned receiver waits preserve the same probe and exact sibling byte counts.
+func TestWindowPacingReceiverOrderedEpochSiblingsKeepSerialization(t *testing.T) {
+	for _, rolling := range []bool{false, true} {
+		if rate := windowReceiverEpochSiblingRate(t, 12500000, false, rolling); rate != 12500000 {
+			t.Errorf("rolling=%t: ordered epoch train changed service=%d", rolling, rate)
+		}
+	}
+}

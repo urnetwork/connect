@@ -1,0 +1,15 @@
+{"outcome": "PASS", "seconds": "2.77s", "test": "TestWindowPathReceiverHybridSdkDuplexOrdinary", "variant": "before-sdk"}
+{"outcome": "FAIL", "seconds": "2.84s", "test": "TestWindowPathReceiverHybridSdkDuplexDiagnostic", "variant": "before-sdk"}
+{"outcome": "PASS", "seconds": "3.30s", "test": "TestWindowPathReceiverHybridSdkDuplexOrdinary", "variant": "before-sdk"}
+{"outcome": "FAIL", "seconds": "3.08s", "test": "TestWindowPathReceiverHybridSdkDuplexDiagnostic", "variant": "before-sdk"}
+{"outcome": "PASS", "seconds": "2.76s", "test": "TestWindowPathReceiverHybridSdkDuplexOrdinary", "variant": "before-sdk"}
+{"outcome": "FAIL", "seconds": "2.77s", "test": "TestWindowPathReceiverHybridSdkDuplexDiagnostic", "variant": "before-sdk"}
+{"outcome": "PASS", "seconds": "4.96s", "test": "TestWindowPathReceiverHybridStaticShortWindows", "variant": "after-affected"}
+{"outcome": "PASS", "seconds": "3.40s", "test": "TestWindowPathReceiverHybridSdkDuplexOrdinary", "variant": "after-affected"}
+{"outcome": "PASS", "seconds": "3.19s", "test": "TestWindowPathReceiverHybridSdkDuplexDiagnostic", "variant": "after-affected"}
+{"outcome": "PASS", "seconds": "5.04s", "test": "TestWindowPathReceiverHybridStaticShortWindows", "variant": "after-affected"}
+{"outcome": "PASS", "seconds": "2.97s", "test": "TestWindowPathReceiverHybridSdkDuplexOrdinary", "variant": "after-affected"}
+{"outcome": "PASS", "seconds": "3.12s", "test": "TestWindowPathReceiverHybridSdkDuplexDiagnostic", "variant": "after-affected"}
+{"outcome": "PASS", "seconds": "5.06s", "test": "TestWindowPathReceiverHybridStaticShortWindows", "variant": "after-affected"}
+{"outcome": "PASS", "seconds": "2.95s", "test": "TestWindowPathReceiverHybridSdkDuplexOrdinary", "variant": "after-affected"}
+{"outcome": "PASS", "seconds": "3.13s", "test": "TestWindowPathReceiverHybridSdkDuplexDiagnostic", "variant": "after-affected"}

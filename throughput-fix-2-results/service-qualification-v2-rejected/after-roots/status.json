@@ -1,0 +1,38 @@
+{
+  "manifest_sha256": "f26f0c5ee15d47785f531db799b600d8a10de91f25836af431c657d821d2b2da",
+  "binary_sha256": "e9961cd22f31054131bd9d15117006d316819b4d7001623afeecc4fe5a577c54",
+  "effective_inputs_sha256": "c9dd7c25f4d0baae7d7baf584e3110cce2de934b3c0fa0ab8c7f752b0e0f397a",
+  "argv": [
+    "/private/tmp/throughput-fix-2-service-qualification-after-v2-pinned/tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacing(CompressedFlightsKeepMeasuredSerialization|CarrierBufferedReadsAcrossSamplerBuckets|CarrierBufferedReadsDoNotInflateServiceBurst|CarrierUnqueuedTrainPreservesCapacity|CarrierFasterTrainRaisesMeasuredCapacity|LimitedFlight.*|CarrierPeakStaysUnqualifiedAfterQueueClears|CarrierFreshFastPairSupersedesRejectedPeak|CarrierSustainedQueuedIncreaseRaisesService)$",
+    "-test.count=3",
+    "-test.timeout=90s"
+  ],
+  "started_utc": "2026-09-16T16:46:06.342679+00:00",
+  "loadavg_start": [
+    7.3369140625,
+    8.61083984375,
+    11.45751953125
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent retained-window implementation and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 3.052915374748409,
+  "loadavg_end": [
+    7.2294921875,
+    8.5673828125,
+    11.42529296875
+  ],
+  "ended_utc": "2026-09-16T16:46:09.395878+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "705a02b6a10514df17db2e2d3b78df302511a27ce3fa66e13cb64b03a12cf185",
+  "pass": 36,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "rows": 21
+}

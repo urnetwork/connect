@@ -1,0 +1,37 @@
+=== RUN   TestWindowPacingReceiverSingleFramePacingColdFallback
+--- PASS: TestWindowPacingReceiverSingleFramePacingColdFallback (1.39s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingEscapesSlowHold
+--- PASS: TestWindowPacingReceiverSingleFramePacingEscapesSlowHold (1.31s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingLowersFastHold
+--- PASS: TestWindowPacingReceiverSingleFramePacingLowersFastHold (1.32s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingAlignedControl
+--- PASS: TestWindowPacingReceiverSingleFramePacingAlignedControl (1.17s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingLegacyControl
+--- PASS: TestWindowPacingReceiverSingleFramePacingLegacyControl (1.48s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingMixedControl
+--- PASS: TestWindowPacingReceiverSingleFramePacingMixedControl (1.15s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingColdFallback
+--- PASS: TestWindowPacingReceiverSingleFramePacingColdFallback (1.39s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingEscapesSlowHold
+--- PASS: TestWindowPacingReceiverSingleFramePacingEscapesSlowHold (1.33s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingLowersFastHold
+--- PASS: TestWindowPacingReceiverSingleFramePacingLowersFastHold (1.32s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingAlignedControl
+--- PASS: TestWindowPacingReceiverSingleFramePacingAlignedControl (1.16s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingLegacyControl
+--- PASS: TestWindowPacingReceiverSingleFramePacingLegacyControl (1.46s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingMixedControl
+--- PASS: TestWindowPacingReceiverSingleFramePacingMixedControl (1.16s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingColdFallback
+--- PASS: TestWindowPacingReceiverSingleFramePacingColdFallback (1.39s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingEscapesSlowHold
+--- PASS: TestWindowPacingReceiverSingleFramePacingEscapesSlowHold (1.34s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingLowersFastHold
+--- PASS: TestWindowPacingReceiverSingleFramePacingLowersFastHold (1.33s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingAlignedControl
+--- PASS: TestWindowPacingReceiverSingleFramePacingAlignedControl (1.15s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingLegacyControl
+--- PASS: TestWindowPacingReceiverSingleFramePacingLegacyControl (1.48s)
+=== RUN   TestWindowPacingReceiverSingleFramePacingMixedControl
+--- PASS: TestWindowPacingReceiverSingleFramePacingMixedControl (1.17s)
+PASS

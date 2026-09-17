@@ -1,0 +1,11 @@
+{
+  "archive": "window-retention-bootstrap-controls-v1",
+  "payload_sha256": {
+    "finite-relay-readings.jsonl": "e5f040bc70389f3e2da8fd30a551d0dd4b317a0920591bbfae9e48996fd9eacc",
+    "ledger.jsonl": "4f0690c07ee60acefe80a02372b9b799698c4ba85d41bee6b09763b902f08b95",
+    "outcomes.jsonl": "33a3c2ee6697c9dab9807644c5b8ee085fee9b0ca8229287034520dd7fc202a7",
+    "provenance.json": "a5903180fcbb74696ac4ccf7303acdbee9639adffe3a5a32472bd4817727a04e",
+    "source-pins.json": "8752c51ac9ba25338be634912d71ae88560a418d2cf73443885bbb894beb1261",
+    "status.json": "858ccae82ef91059bc0e4d854e7273625c2bacdb1103de3d8bbef3c307d81a84"
+  }
+}

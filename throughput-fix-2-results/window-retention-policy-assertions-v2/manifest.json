@@ -1,0 +1,9 @@
+{
+  "archive": "window-retention-policy-assertions-v2",
+  "payload_sha256": {
+    "outcomes.jsonl": "ff1d409cb25a2825a0db4e62451f255eb42a2cc1da7b597fea5511ab3a740b92",
+    "provenance.json": "d6ecaeb3672d32a93fa3d9913e025defb30b8e61f987f35cffc82494449e1bed",
+    "source-pins.json": "d50e448d6176171d8fa9221e25ebc7c6a4c9e16244616aa661a5800fadc74bc6",
+    "status.json": "1cd2ed44045042f8a5d0fdb0a4798d237e8e98d9deb8383e8e3657dbdf942647"
+  }
+}

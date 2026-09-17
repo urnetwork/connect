@@ -1,0 +1,14 @@
+{
+  "after_invocation_root_count": 27,
+  "event_plumbing": false,
+  "performance_gates_changed": false,
+  "race": true,
+  "repetitions": 3,
+  "scope": "The largest effective Window owns the complete destination estimate. Equal effective windows preserve cumulative qualification preference and otherwise the first estimate. After outcomes are the exact four-root subset of the 27-root combined run; the full invocation status remains in source pins.",
+  "selected_tests": [
+    "TestWindowDestinationStatsKeepsLargestEffectiveWindow",
+    "TestWindowDestinationStatsKeepsLargestQualifiedWindow",
+    "TestWindowDestinationStatsEqualWindowsPreferCumulativeEvidence",
+    "TestWindowDestinationStatsEqualEvidenceKeepsFirstEstimate"
+  ]
+}

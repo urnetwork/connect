@@ -1,0 +1,145 @@
+=== RUN   TestWindowPacingColdRefillKeepsSupportedPacing
+    transfer_window_cold_refill_cohort_test.go:120: the ambiguous opening changed raw flight or acquired exact service: {Window:8388608 LearnedWindow:8388608 CandidateWindow:8388608 Sized:false Reason:the peer's advertised capacity ServiceSized:true DeliveredByteCount:0 Interval:0s RoundTrip:100.02136ms WindowRoundTrip:110.02136ms AckCompressTimeout:10ms SampleCount:1 Initial:524288 Floor:65536 Ceiling:8388608 Obtainable:16842752 TargetBound:false CandidateTargetBound:false DeliveryByteRate:0 ServiceByteRate:125000000 PacingByteRate:137500000 ServiceEstablished:true ServiceBacklogged:false PacingProbeByteRate:147928994 PacingProbeByteCount:1048576 PacingDiscovery:true PacingHeldByteRate:4765329}
+--- FAIL: TestWindowPacingColdRefillKeepsSupportedPacing (0.00s)
+=== RUN   TestWindowPacingColdPreofferedTrainKeepsSlowPacing
+--- PASS: TestWindowPacingColdPreofferedTrainKeepsSlowPacing (0.00s)
+=== RUN   TestWindowPacingColdRefillFreshSlowPairLowersPacing
+    transfer_window_cold_refill_cohort_test.go:151: the ambiguous opening changed raw flight or acquired exact service: {Window:8388608 LearnedWindow:8388608 CandidateWindow:8388608 Sized:false Reason:the peer's advertised capacity ServiceSized:true DeliveredByteCount:0 Interval:0s RoundTrip:100.02136ms WindowRoundTrip:110.02136ms AckCompressTimeout:10ms SampleCount:1 Initial:524288 Floor:65536 Ceiling:8388608 Obtainable:16842752 TargetBound:false CandidateTargetBound:false DeliveryByteRate:0 ServiceByteRate:125000000 PacingByteRate:137500000 ServiceEstablished:true ServiceBacklogged:false PacingProbeByteRate:147928994 PacingProbeByteCount:1048576 PacingDiscovery:true PacingHeldByteRate:4765329}
+--- FAIL: TestWindowPacingColdRefillFreshSlowPairLowersPacing (0.00s)
+=== RUN   TestWindowPacingColdRefillFreshFasterPairMeasuresService
+    transfer_window_cold_refill_cohort_test.go:166: the ambiguous opening changed raw flight or acquired exact service: {Window:8388608 LearnedWindow:8388608 CandidateWindow:8388608 Sized:false Reason:the peer's advertised capacity ServiceSized:true DeliveredByteCount:0 Interval:0s RoundTrip:100.02136ms WindowRoundTrip:110.02136ms AckCompressTimeout:10ms SampleCount:1 Initial:524288 Floor:65536 Ceiling:8388608 Obtainable:16842752 TargetBound:false CandidateTargetBound:false DeliveryByteRate:0 ServiceByteRate:125000000 PacingByteRate:137500000 ServiceEstablished:true ServiceBacklogged:false PacingProbeByteRate:147928994 PacingProbeByteCount:1048576 PacingDiscovery:true PacingHeldByteRate:4765329}
+--- FAIL: TestWindowPacingColdRefillFreshFasterPairMeasuresService (0.00s)
+=== RUN   TestWindowPacingColdContiguousRefillKeepsPair
+--- PASS: TestWindowPacingColdContiguousRefillKeepsPair (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix
+    transfer_window_receiver_prefix_ingress_test.go:93: one early head retimed its later prefix: reordered=true selective_first=false service=16000000/16000000 physical=200000
+--- FAIL: TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedIngressPrefixControl
+--- PASS: TestWindowPacingReceiverOrderedIngressPrefixControl (0.00s)
+=== RUN   TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock
+--- PASS: TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock (0.00s)
+=== RUN   TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming
+--- PASS: TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming (0.00s)
+=== RUN   TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo
+    transfer_window_receiver_prefix_ingress_test.go:149: one early head retimed its later prefix: reordered=true selective_first=false service=16000000/16000000 physical=200000
+--- FAIL: TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo (0.00s)
+=== RUN   TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded
+--- PASS: TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded (0.00s)
+=== RUN   TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound
+--- PASS: TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound (0.00s)
+=== RUN   TestWindowPacingSdkColdEqualWaitsDiscoverSlowService
+--- PASS: TestWindowPacingSdkColdEqualWaitsDiscoverSlowService (0.00s)
+=== RUN   TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks
+--- PASS: TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks (0.00s)
+=== RUN   TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured
+--- PASS: TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured (0.00s)
+=== RUN   TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:0 serviceRate:0 pacingRate:147928994 initialBurst:1479289 resultBurst:1479289 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:0 serviceRate:0 pacingRate:147928994 initialBurst:1479289 resultBurst:1479289 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved (0.03s)
+=== RUN   TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=false evidence={physicalRate:12500000 priorRate:0 serviceRate:12500000 pacingRate:13750000 initialBurst:1479289 resultBurst:125000 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:0 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity (0.01s)
+=== RUN   TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization
+--- PASS: TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization (0.00s)
+=== RUN   TestWindowPacingColdQueuedTimingDoesNotInventDelivery
+--- PASS: TestWindowPacingColdQueuedTimingDoesNotInventDelivery (0.00s)
+=== RUN   TestWindowPacingColdRefillKeepsSupportedPacing
+    transfer_window_cold_refill_cohort_test.go:120: the ambiguous opening changed raw flight or acquired exact service: {Window:8388608 LearnedWindow:8388608 CandidateWindow:8388608 Sized:false Reason:the peer's advertised capacity ServiceSized:true DeliveredByteCount:0 Interval:0s RoundTrip:100.02136ms WindowRoundTrip:110.02136ms AckCompressTimeout:10ms SampleCount:1 Initial:524288 Floor:65536 Ceiling:8388608 Obtainable:16842752 TargetBound:false CandidateTargetBound:false DeliveryByteRate:0 ServiceByteRate:125000000 PacingByteRate:137500000 ServiceEstablished:true ServiceBacklogged:false PacingProbeByteRate:147928994 PacingProbeByteCount:1048576 PacingDiscovery:true PacingHeldByteRate:4765329}
+--- FAIL: TestWindowPacingColdRefillKeepsSupportedPacing (0.00s)
+=== RUN   TestWindowPacingColdPreofferedTrainKeepsSlowPacing
+--- PASS: TestWindowPacingColdPreofferedTrainKeepsSlowPacing (0.00s)
+=== RUN   TestWindowPacingColdRefillFreshSlowPairLowersPacing
+    transfer_window_cold_refill_cohort_test.go:151: the ambiguous opening changed raw flight or acquired exact service: {Window:8388608 LearnedWindow:8388608 CandidateWindow:8388608 Sized:false Reason:the peer's advertised capacity ServiceSized:true DeliveredByteCount:0 Interval:0s RoundTrip:100.02136ms WindowRoundTrip:110.02136ms AckCompressTimeout:10ms SampleCount:1 Initial:524288 Floor:65536 Ceiling:8388608 Obtainable:16842752 TargetBound:false CandidateTargetBound:false DeliveryByteRate:0 ServiceByteRate:125000000 PacingByteRate:137500000 ServiceEstablished:true ServiceBacklogged:false PacingProbeByteRate:147928994 PacingProbeByteCount:1048576 PacingDiscovery:true PacingHeldByteRate:4765329}
+--- FAIL: TestWindowPacingColdRefillFreshSlowPairLowersPacing (0.00s)
+=== RUN   TestWindowPacingColdRefillFreshFasterPairMeasuresService
+    transfer_window_cold_refill_cohort_test.go:166: the ambiguous opening changed raw flight or acquired exact service: {Window:8388608 LearnedWindow:8388608 CandidateWindow:8388608 Sized:false Reason:the peer's advertised capacity ServiceSized:true DeliveredByteCount:0 Interval:0s RoundTrip:100.02136ms WindowRoundTrip:110.02136ms AckCompressTimeout:10ms SampleCount:1 Initial:524288 Floor:65536 Ceiling:8388608 Obtainable:16842752 TargetBound:false CandidateTargetBound:false DeliveryByteRate:0 ServiceByteRate:125000000 PacingByteRate:137500000 ServiceEstablished:true ServiceBacklogged:false PacingProbeByteRate:147928994 PacingProbeByteCount:1048576 PacingDiscovery:true PacingHeldByteRate:4765329}
+--- FAIL: TestWindowPacingColdRefillFreshFasterPairMeasuresService (0.00s)
+=== RUN   TestWindowPacingColdContiguousRefillKeepsPair
+--- PASS: TestWindowPacingColdContiguousRefillKeepsPair (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix
+    transfer_window_receiver_prefix_ingress_test.go:93: one early head retimed its later prefix: reordered=true selective_first=false service=16000000/16000000 physical=200000
+--- FAIL: TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedIngressPrefixControl
+--- PASS: TestWindowPacingReceiverOrderedIngressPrefixControl (0.00s)
+=== RUN   TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock
+--- PASS: TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock (0.00s)
+=== RUN   TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming
+--- PASS: TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming (0.00s)
+=== RUN   TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo
+    transfer_window_receiver_prefix_ingress_test.go:149: one early head retimed its later prefix: reordered=true selective_first=false service=16000000/16000000 physical=200000
+--- FAIL: TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo (0.00s)
+=== RUN   TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded
+--- PASS: TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded (0.00s)
+=== RUN   TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound
+--- PASS: TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound (0.00s)
+=== RUN   TestWindowPacingSdkColdEqualWaitsDiscoverSlowService
+--- PASS: TestWindowPacingSdkColdEqualWaitsDiscoverSlowService (0.00s)
+=== RUN   TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks
+--- PASS: TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks (0.00s)
+=== RUN   TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured
+--- PASS: TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured (0.00s)
+=== RUN   TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:0 serviceRate:0 pacingRate:147928994 initialBurst:1479289 resultBurst:1479289 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:0 serviceRate:0 pacingRate:147928994 initialBurst:1479289 resultBurst:1479289 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved (0.02s)
+=== RUN   TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=false evidence={physicalRate:12500000 priorRate:0 serviceRate:12500000 pacingRate:13750000 initialBurst:1479289 resultBurst:125000 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:0 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity (0.01s)
+=== RUN   TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization
+--- PASS: TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization (0.00s)
+=== RUN   TestWindowPacingColdQueuedTimingDoesNotInventDelivery
+--- PASS: TestWindowPacingColdQueuedTimingDoesNotInventDelivery (0.00s)
+=== RUN   TestWindowPacingColdRefillKeepsSupportedPacing
+    transfer_window_cold_refill_cohort_test.go:120: the ambiguous opening changed raw flight or acquired exact service: {Window:8388608 LearnedWindow:8388608 CandidateWindow:8388608 Sized:false Reason:the peer's advertised capacity ServiceSized:true DeliveredByteCount:0 Interval:0s RoundTrip:100.02136ms WindowRoundTrip:110.02136ms AckCompressTimeout:10ms SampleCount:1 Initial:524288 Floor:65536 Ceiling:8388608 Obtainable:16842752 TargetBound:false CandidateTargetBound:false DeliveryByteRate:0 ServiceByteRate:125000000 PacingByteRate:137500000 ServiceEstablished:true ServiceBacklogged:false PacingProbeByteRate:147928994 PacingProbeByteCount:1048576 PacingDiscovery:true PacingHeldByteRate:4765329}
+--- FAIL: TestWindowPacingColdRefillKeepsSupportedPacing (0.00s)
+=== RUN   TestWindowPacingColdPreofferedTrainKeepsSlowPacing
+--- PASS: TestWindowPacingColdPreofferedTrainKeepsSlowPacing (0.00s)
+=== RUN   TestWindowPacingColdRefillFreshSlowPairLowersPacing
+    transfer_window_cold_refill_cohort_test.go:151: the ambiguous opening changed raw flight or acquired exact service: {Window:8388608 LearnedWindow:8388608 CandidateWindow:8388608 Sized:false Reason:the peer's advertised capacity ServiceSized:true DeliveredByteCount:0 Interval:0s RoundTrip:100.02136ms WindowRoundTrip:110.02136ms AckCompressTimeout:10ms SampleCount:1 Initial:524288 Floor:65536 Ceiling:8388608 Obtainable:16842752 TargetBound:false CandidateTargetBound:false DeliveryByteRate:0 ServiceByteRate:125000000 PacingByteRate:137500000 ServiceEstablished:true ServiceBacklogged:false PacingProbeByteRate:147928994 PacingProbeByteCount:1048576 PacingDiscovery:true PacingHeldByteRate:4765329}
+--- FAIL: TestWindowPacingColdRefillFreshSlowPairLowersPacing (0.00s)
+=== RUN   TestWindowPacingColdRefillFreshFasterPairMeasuresService
+    transfer_window_cold_refill_cohort_test.go:166: the ambiguous opening changed raw flight or acquired exact service: {Window:8388608 LearnedWindow:8388608 CandidateWindow:8388608 Sized:false Reason:the peer's advertised capacity ServiceSized:true DeliveredByteCount:0 Interval:0s RoundTrip:100.02136ms WindowRoundTrip:110.02136ms AckCompressTimeout:10ms SampleCount:1 Initial:524288 Floor:65536 Ceiling:8388608 Obtainable:16842752 TargetBound:false CandidateTargetBound:false DeliveryByteRate:0 ServiceByteRate:125000000 PacingByteRate:137500000 ServiceEstablished:true ServiceBacklogged:false PacingProbeByteRate:147928994 PacingProbeByteCount:1048576 PacingDiscovery:true PacingHeldByteRate:4765329}
+--- FAIL: TestWindowPacingColdRefillFreshFasterPairMeasuresService (0.00s)
+=== RUN   TestWindowPacingColdContiguousRefillKeepsPair
+--- PASS: TestWindowPacingColdContiguousRefillKeepsPair (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix
+    transfer_window_receiver_prefix_ingress_test.go:93: one early head retimed its later prefix: reordered=true selective_first=false service=16000000/16000000 physical=200000
+--- FAIL: TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix (0.00s)
+=== RUN   TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw
+--- PASS: TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedIngressPrefixControl
+--- PASS: TestWindowPacingReceiverOrderedIngressPrefixControl (0.00s)
+=== RUN   TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock
+--- PASS: TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock (0.00s)
+=== RUN   TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming
+--- PASS: TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming (0.00s)
+=== RUN   TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo
+    transfer_window_receiver_prefix_ingress_test.go:149: one early head retimed its later prefix: reordered=true selective_first=false service=16000000/16000000 physical=200000
+--- FAIL: TestWindowPacingReceiverRelayReorderCannotBorrowLocalFifo (0.00s)
+=== RUN   TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded
+--- PASS: TestWindowPacingSdkColdReceiverWaitKeepsPrefixBounded (0.00s)
+=== RUN   TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound
+--- PASS: TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound (0.00s)
+=== RUN   TestWindowPacingSdkColdEqualWaitsDiscoverSlowService
+--- PASS: TestWindowPacingSdkColdEqualWaitsDiscoverSlowService (0.00s)
+=== RUN   TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks
+--- PASS: TestWindowPacingSdkColdDrainedPrefixKeepsRawClocks (0.00s)
+=== RUN   TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured
+--- PASS: TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured (0.00s)
+=== RUN   TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:0 serviceRate:0 pacingRate:147928994 initialBurst:1479289 resultBurst:1479289 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=true evidence={physicalRate:12500000 priorRate:0 serviceRate:0 pacingRate:147928994 initialBurst:1479289 resultBurst:1479289 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:24 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved (0.02s)
+=== RUN   TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity
+    transfer_window_pacing_carrier_buffer_test.go:336: pacing-carrier-buffer stall=false evidence={physicalRate:12500000 priorRate:0 serviceRate:12500000 pacingRate:13750000 initialBurst:1479289 resultBurst:125000 physicalBytes:49358 physicalSpan:3948640 offerSpan:230000 maxQueued:0 maxCarrierQueued:0 ackCount:25 logicalCredit:51504 physicalCopies:24 applicationByte:51200}
+--- PASS: TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity (0.01s)
+=== RUN   TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization
+--- PASS: TestWindowPacingSdkColdSingleHeadWaitMeasuresShortSerialization (0.00s)
+=== RUN   TestWindowPacingColdQueuedTimingDoesNotInventDelivery
+--- PASS: TestWindowPacingColdQueuedTimingDoesNotInventDelivery (0.00s)
+FAIL

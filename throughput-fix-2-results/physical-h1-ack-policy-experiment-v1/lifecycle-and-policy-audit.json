@@ -1,0 +1,324 @@
+{
+  "arms": [
+    {
+      "arm": "ceiling-before",
+      "carrier_used_after_close": [
+        0,
+        0
+      ],
+      "connections": [
+        1,
+        1
+      ],
+      "direction_mbps": [
+        183.87643791268215,
+        650.4159045546776
+      ],
+      "provider_refusals": {
+        "IngressNatByteCount": 0,
+        "IngressNatPacketCount": 0,
+        "ReturnQueueByteCount": 10816,
+        "ReturnQueuePacketCount": 208,
+        "ReturnSendByteCount": 549068,
+        "ReturnSendPacketCount": 10559
+      },
+      "replay_released_after_close": 167270040,
+      "replay_reserved_after_close": 167270040,
+      "replay_used_after_close": 0,
+      "transfer_after_close": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "variant": "before",
+      "window_qualification": [
+        {
+          "LearnedWindow": 0,
+          "ServiceSized": false,
+          "Sized": false,
+          "Window": 1078535
+        },
+        {
+          "LearnedWindow": 0,
+          "ServiceSized": false,
+          "Sized": false,
+          "Window": 1438046
+        }
+      ]
+    },
+    {
+      "arm": "delivery",
+      "carrier_used_after_close": [
+        0,
+        0
+      ],
+      "connections": [
+        1,
+        1
+      ],
+      "direction_mbps": [
+        13.873291895652642,
+        1.197907532956356
+      ],
+      "provider_refusals": {
+        "IngressNatByteCount": 0,
+        "IngressNatPacketCount": 0,
+        "ReturnQueueByteCount": 0,
+        "ReturnQueuePacketCount": 0,
+        "ReturnSendByteCount": 9360,
+        "ReturnSendPacketCount": 180
+      },
+      "replay_released_after_close": 12305860,
+      "replay_reserved_after_close": 12305860,
+      "replay_used_after_close": 0,
+      "transfer_after_close": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "variant": "before",
+      "window_qualification": [
+        {
+          "LearnedWindow": 524288,
+          "ServiceSized": true,
+          "Sized": false,
+          "Window": 524288
+        },
+        {
+          "LearnedWindow": 2097152,
+          "ServiceSized": true,
+          "Sized": true,
+          "Window": 1438046
+        }
+      ]
+    },
+    {
+      "arm": "ceiling-after",
+      "carrier_used_after_close": [
+        0,
+        0
+      ],
+      "connections": [
+        1,
+        1
+      ],
+      "direction_mbps": [
+        165.81874734500215,
+        719.2169222264622
+      ],
+      "provider_refusals": {
+        "IngressNatByteCount": 0,
+        "IngressNatPacketCount": 0,
+        "ReturnQueueByteCount": 15808,
+        "ReturnQueuePacketCount": 304,
+        "ReturnSendByteCount": 555620,
+        "ReturnSendPacketCount": 10685
+      },
+      "replay_released_after_close": 158666142,
+      "replay_reserved_after_close": 158666142,
+      "replay_used_after_close": 0,
+      "transfer_after_close": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "variant": "before",
+      "window_qualification": [
+        {
+          "LearnedWindow": 0,
+          "ServiceSized": false,
+          "Sized": false,
+          "Window": 1078535
+        },
+        {
+          "LearnedWindow": 0,
+          "ServiceSized": false,
+          "Sized": false,
+          "Window": 1438046
+        }
+      ]
+    },
+    {
+      "arm": "ceiling-before",
+      "carrier_used_after_close": [
+        0,
+        0
+      ],
+      "connections": [
+        1,
+        1
+      ],
+      "direction_mbps": [
+        189.34198219027002,
+        628.0594278331437
+      ],
+      "provider_refusals": {
+        "IngressNatByteCount": 0,
+        "IngressNatPacketCount": 0,
+        "ReturnQueueByteCount": 12376,
+        "ReturnQueuePacketCount": 238,
+        "ReturnSendByteCount": 533468,
+        "ReturnSendPacketCount": 10259
+      },
+      "replay_released_after_close": 180950260,
+      "replay_reserved_after_close": 180950260,
+      "replay_used_after_close": 0,
+      "transfer_after_close": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "variant": "after",
+      "window_qualification": [
+        {
+          "LearnedWindow": 0,
+          "ServiceSized": false,
+          "Sized": false,
+          "Window": 1078535
+        },
+        {
+          "LearnedWindow": 0,
+          "ServiceSized": false,
+          "Sized": false,
+          "Window": 1438046
+        }
+      ]
+    },
+    {
+      "arm": "delivery",
+      "carrier_used_after_close": [
+        0,
+        0
+      ],
+      "connections": [
+        1,
+        1
+      ],
+      "direction_mbps": [
+        44.564534772425304,
+        404.6926581090911
+      ],
+      "provider_refusals": {
+        "IngressNatByteCount": 0,
+        "IngressNatPacketCount": 0,
+        "ReturnQueueByteCount": 3120,
+        "ReturnQueuePacketCount": 60,
+        "ReturnSendByteCount": 1066832,
+        "ReturnSendPacketCount": 20516
+      },
+      "replay_released_after_close": 74511908,
+      "replay_reserved_after_close": 74511908,
+      "replay_used_after_close": 0,
+      "transfer_after_close": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "variant": "after",
+      "window_qualification": [
+        {
+          "LearnedWindow": 1012999,
+          "ServiceSized": true,
+          "Sized": true,
+          "Window": 1012999
+        },
+        {
+          "LearnedWindow": 2097152,
+          "ServiceSized": true,
+          "Sized": false,
+          "Window": 1438046
+        }
+      ]
+    },
+    {
+      "arm": "ceiling-after",
+      "carrier_used_after_close": [
+        0,
+        0
+      ],
+      "connections": [
+        1,
+        1
+      ],
+      "direction_mbps": [
+        304.6709194973996,
+        636.1473834299719
+      ],
+      "provider_refusals": {
+        "IngressNatByteCount": 0,
+        "IngressNatPacketCount": 0,
+        "ReturnQueueByteCount": 17316,
+        "ReturnQueuePacketCount": 333,
+        "ReturnSendByteCount": 534768,
+        "ReturnSendPacketCount": 10284
+      },
+      "replay_released_after_close": 258853392,
+      "replay_reserved_after_close": 258853392,
+      "replay_used_after_close": 0,
+      "transfer_after_close": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "variant": "after",
+      "window_qualification": [
+        {
+          "LearnedWindow": 0,
+          "ServiceSized": false,
+          "Sized": false,
+          "Window": 1078535
+        },
+        {
+          "LearnedWindow": 0,
+          "ServiceSized": false,
+          "Sized": false,
+          "Window": 1438046
+        }
+      ]
+    }
+  ],
+  "separate_reported_lifecycle_failures": 0,
+  "unchanged_raw_failures_preserved": true
+}

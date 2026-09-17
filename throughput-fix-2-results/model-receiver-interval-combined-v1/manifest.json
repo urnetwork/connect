@@ -1,0 +1,10 @@
+{
+  "archive": "model-receiver-interval-combined-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "361430bb236f351fd78b3ce3e3069b754ac4cfcdabad980c27f86402e6ce47e4",
+    "outcomes.jsonl": "f890d9c78473bbe8c573489b3d0628092dbbfad15e39373b967cd837c47725ee",
+    "provenance.json": "1c1a7bfc6d3e122e2343bbfba6871c3ce49cea9460852cbf89e7577cfcf0c507",
+    "source-pins.json": "cc32756b349cb2f2c3b9b0b01a93177bf87b4bef21a3fbb4a551dd392d771760",
+    "status.json": "11cdf59718732d0d0cd9605b68415499fe3acbf461e0ed9e83cd2bf23f428e50"
+  }
+}

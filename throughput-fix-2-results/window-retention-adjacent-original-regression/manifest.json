@@ -1,0 +1,10 @@
+{
+  "archive": "window-retention-adjacent-original-regression",
+  "payload_sha256": {
+    "outcomes.jsonl": "4c76126d05999b75b77238429e53483a833f209919a28202011a369ec1e2a209",
+    "provenance.json": "f61fc20c06137ae0de735bfe6818cb35f94e92e0b2ff63e7f55ed397520793e5",
+    "source-manifest-original.json": "c23e27930e9947dd11e58cb66e12c9a6b244763b4106648856cc55781c535516",
+    "source-pins.json": "7e9663ae39f7c39fef1cc8bb0a2e1198b3c48b4103c1aa13e1cded667ec56c95",
+    "status.json": "041cf72d7167a4c3c10c400c9d0581707fd09007337af6fd04ce65cefafc3c3d"
+  }
+}

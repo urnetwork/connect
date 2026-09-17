@@ -1,0 +1,9 @@
+{"outcome": "FAIL", "seconds": "0.17s", "test": "TestWindowPacingReceiverInterleavedSlowdownAdaptsWithInvalidRing", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.09s", "test": "TestWindowPacingReceiverInterleavedSlowdownLegacyControl", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.10s", "test": "TestWindowPacingReceiverInterleavedSlowdownMixedControl", "variant": "before"}
+{"outcome": "FAIL", "seconds": "0.16s", "test": "TestWindowPacingReceiverInterleavedSlowdownAdaptsWithInvalidRing", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.09s", "test": "TestWindowPacingReceiverInterleavedSlowdownLegacyControl", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.09s", "test": "TestWindowPacingReceiverInterleavedSlowdownMixedControl", "variant": "before"}
+{"outcome": "FAIL", "seconds": "0.17s", "test": "TestWindowPacingReceiverInterleavedSlowdownAdaptsWithInvalidRing", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.09s", "test": "TestWindowPacingReceiverInterleavedSlowdownLegacyControl", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.09s", "test": "TestWindowPacingReceiverInterleavedSlowdownMixedControl", "variant": "before"}

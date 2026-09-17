@@ -1,0 +1,15 @@
+{
+  "candidate_accepted": false,
+  "complete": true,
+  "final_focused_fail": 0,
+  "final_focused_pass": 129,
+  "final_full_selector_fail": 2,
+  "final_full_selector_pass": 334,
+  "final_full_selector_race_warnings": 0,
+  "input_pins_verified": 19,
+  "older_record_after_fail": 3,
+  "older_record_before_fail": 3,
+  "parsed_top_level_outcomes": 546,
+  "run_count": 7,
+  "superseded_fixture_race_warnings": 1
+}

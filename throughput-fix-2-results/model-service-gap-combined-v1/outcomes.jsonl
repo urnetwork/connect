@@ -1,0 +1,12 @@
+{"outcome": "FAIL", "seconds": "40.74s", "test": "TestWindowPathWindowMismatchChanges", "variant": "race"}
+{"outcome": "PASS", "seconds": "6.50s", "test": "TestWindowPathServiceSettledLargeMessageCapacityChanges", "variant": "race"}
+{"outcome": "PASS", "seconds": "0.69s", "test": "TestWindowPathServiceCapacityIncreaseRecovery", "variant": "race"}
+{"outcome": "FAIL", "seconds": "33.09s", "test": "TestWindowPathRetainedSdkCumulativePacingLong", "variant": "race"}
+{"outcome": "PASS", "seconds": "3.20s", "test": "TestWindowPacingShortCompressedServiceKeepsMeasuredCapacity", "variant": "race"}
+{"outcome": "PASS", "seconds": "33.32s", "test": "TestWindowPathServiceRoundTripGrowthBeyondOldRing", "variant": "race"}
+{"outcome": "FAIL", "seconds": "2.71s", "test": "TestWindowPathWindowMismatchChanges", "variant": "nonrace"}
+{"outcome": "PASS", "seconds": "0.65s", "test": "TestWindowPathServiceSettledLargeMessageCapacityChanges", "variant": "nonrace"}
+{"outcome": "PASS", "seconds": "0.09s", "test": "TestWindowPathServiceCapacityIncreaseRecovery", "variant": "nonrace"}
+{"outcome": "FAIL", "seconds": "2.15s", "test": "TestWindowPathRetainedSdkCumulativePacingLong", "variant": "nonrace"}
+{"outcome": "PASS", "seconds": "0.21s", "test": "TestWindowPacingShortCompressedServiceKeepsMeasuredCapacity", "variant": "nonrace"}
+{"outcome": "PASS", "seconds": "3.04s", "test": "TestWindowPathServiceRoundTripGrowthBeyondOldRing", "variant": "nonrace"}

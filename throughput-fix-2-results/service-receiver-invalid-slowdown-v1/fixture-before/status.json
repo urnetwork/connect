@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "4f999fffce3c0dfa4958af6f914f163fdcc568fc43a9d8fefd2a988600f92bbd",
+  "binary_sha256": "efc6e88b92585d9cf61b3858f94edf343ce18973be470abdb57dd47e1121d494",
+  "effective_inputs_sha256": "c27500b4f08a06b6c4976d70d686f9495ee5c6547cf202006d45acde41a216f2",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^(TestWindowPacingReceiverInterleavedSlowdown.*|TestWindowPacingReceiverInvalid.*)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as the effective build inputs; original absolute cwd retained by raw status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T19:25:57.221830+00:00",
+  "loadavg_start": [
+    31.1181640625,
+    28.91552734375,
+    22.1220703125
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 2.268293374683708,
+  "loadavg_end": [
+    30.7880859375,
+    28.88330078125,
+    22.150390625
+  ],
+  "ended_utc": "2026-09-16T19:25:59.490662+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "d7f3bb56a53e8f670e5daf48e578f5df01ede8c4962a08b1af915deaeb9b34bf",
+  "pass": 15,
+  "fail": 6,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "rows": 0,
+  "normalization_note": "The first new50ms fast control advanced controller time while withholding immediate sibling replies from later cycles. Its failure is a fixture issue, not evidence of a production slowdown; unchanged interleaved slowdown still failed. Preserved without rerun."
+}

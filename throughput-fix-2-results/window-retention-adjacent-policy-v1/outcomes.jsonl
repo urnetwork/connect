@@ -1,0 +1,12 @@
+{"outcome": "PASS", "seconds": "2.03s", "test": "TestWindowRetainedCandidateUsesMeasuredRoundTrip", "variant": "policy-v1"}
+{"outcome": "FAIL", "seconds": "0.05s", "test": "TestWindowRetainedSlowPathLowersCandidateAndPacing", "variant": "policy-v1"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowRetainedLegacyBootstrapBoundsGrowingCandidates", "variant": "policy-v1"}
+{"outcome": "PASS", "seconds": "3.02s", "test": "TestWindowRetainedSteadyPathPreservesOccupancyBand", "variant": "policy-v1"}
+{"outcome": "PASS", "seconds": "2.03s", "test": "TestWindowRetainedCandidateUsesMeasuredRoundTrip", "variant": "policy-v1"}
+{"outcome": "FAIL", "seconds": "0.05s", "test": "TestWindowRetainedSlowPathLowersCandidateAndPacing", "variant": "policy-v1"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowRetainedLegacyBootstrapBoundsGrowingCandidates", "variant": "policy-v1"}
+{"outcome": "PASS", "seconds": "3.02s", "test": "TestWindowRetainedSteadyPathPreservesOccupancyBand", "variant": "policy-v1"}
+{"outcome": "PASS", "seconds": "2.03s", "test": "TestWindowRetainedCandidateUsesMeasuredRoundTrip", "variant": "policy-v1"}
+{"outcome": "FAIL", "seconds": "0.05s", "test": "TestWindowRetainedSlowPathLowersCandidateAndPacing", "variant": "policy-v1"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowRetainedLegacyBootstrapBoundsGrowingCandidates", "variant": "policy-v1"}
+{"outcome": "PASS", "seconds": "3.03s", "test": "TestWindowRetainedSteadyPathPreservesOccupancyBand", "variant": "policy-v1"}

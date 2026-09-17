@@ -165,12 +165,21 @@ func TestWindowMismatchLargeTargetCannotWrapItsBounds(t *testing.T) {
 		settings.ResendQueueBudget = NewTransferMemoryBudget(mib(48))
 		settings.TargetGoodputByteRate = math.MaxInt64
 	})
-	sampleRoundTrip(sequence, time.Second)
+	t.Cleanup(func() { sequence.resendQueue.Clear() })
+	at := time.Unix(1700000000, 0)
+	sequence.rttWindow.closeSendTime(uint64(at.Add(-time.Second).UnixMilli()), at)
 	sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
 		receiveWindowSet: true, receiveWindowByteCount: uint32(mib(48)),
 	})
-	estimate := sequence.sendWindowEstimate(time.Now())
-	if estimate.Window != mib(48) || estimate.PacingByteRate <= 0 || estimate.PacingProbeByteRate <= 0 {
+	sequence.receiveWindowSetAtNanos.Store(at.UnixNano())
+	// Earn a full memory-share candidate; permission alone no longer grows
+	// the opening. A wrapped target product would now suppress this growth.
+	for range 64 {
+		at = at.Add(50 * time.Millisecond)
+		sequence.observeDeliveredBytes(4*1024*1024, at)
+	}
+	estimate := sequence.sendWindowEstimate(at)
+	if !estimate.Sized || estimate.Window != mib(48) || estimate.PacingByteRate <= 0 || estimate.PacingProbeByteRate != math.MaxInt64 {
 		t.Fatalf("positive target overflowed its bounds: %+v", estimate)
 	}
 }
@@ -230,8 +239,8 @@ func TestWindowPacingLocalHistoryRetainsStableFeedbackSpan(t *testing.T) {
 	}
 }
 
-// A later capacity increase needs the same evidence boundary as the first
-// advertisement. Repeating an unchanged value must still allow convergence.
+// Capacity changes bound admission independently of learned capacity. An
+// increase needs fresh cumulative history; measured service stays independent.
 func TestWindowMismatchCapacityIncreaseStartsFreshDeliveryEvidence(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		sequence := newEstimatorFixture(t, func(settings *SendBufferSettings) {
@@ -247,25 +256,30 @@ func TestWindowMismatchCapacityIncreaseStartsFreshDeliveryEvidence(t *testing.T)
 			})
 		}
 		advertise(kib(64))
+		opening := sequence.sendWindowEstimate(time.Now())
+		if opening.Window != kib(64) || opening.LearnedWindow != opening.Initial {
+			t.Fatalf("small peer capacity changed the configured bootstrap: %+v", opening)
+		}
 		for range 40 {
 			sequence.observeDeliveredBytes(kib(4), time.Now())
 			time.Sleep(10 * time.Millisecond)
 		}
 		advertise(mib(2))
-		if estimate := sequence.sendWindowEstimate(time.Now()); estimate.Window != mib(2) {
-			t.Fatalf("old constrained delivery undid a capacity increase: window=%d reason=%s", estimate.Window, estimate.Reason)
+		step := sequence.receiveWindowSetAtNanos.Load()
+		if estimate := sequence.sendWindowEstimate(time.Now()); estimate.Sized || !estimate.ServiceSized || estimate.Interval < 200*time.Millisecond || estimate.DeliveredByteCount == 0 || estimate.Window != opening.LearnedWindow || estimate.LearnedWindow != opening.LearnedWindow || estimate.Ceiling != mib(2) {
+			t.Fatalf("old constrained delivery qualified after a capacity increase: %+v", estimate)
 		}
 		for range 40 {
 			advertise(mib(2))
 			sequence.observeDeliveredBytes(kib(4), time.Now())
 			time.Sleep(10 * time.Millisecond)
 		}
-		if estimate := sequence.sendWindowEstimate(time.Now()); !estimate.Sized || estimate.Window >= mib(2) {
-			t.Fatalf("unchanged advertisements prevented delivery convergence: %+v", estimate)
+		if estimate := sequence.sendWindowEstimate(time.Now()); !estimate.Sized || estimate.CandidateWindow != estimate.Floor || estimate.Window != opening.LearnedWindow || estimate.LearnedWindow != opening.LearnedWindow || sequence.receiveWindowSetAtNanos.Load() != step {
+			t.Fatalf("unchanged advertisements lost fresh delivery or reduced learned capacity: %+v", estimate)
 		}
 		advertise(kib(32))
-		if estimate := sequence.sendWindowEstimate(time.Now()); estimate.Window != kib(32) {
-			t.Fatalf("capacity decrease waited for new delivery evidence: %+v", estimate)
+		if estimate := sequence.sendWindowEstimate(time.Now()); estimate.Window != kib(32) || estimate.Ceiling != kib(32) || estimate.LearnedWindow != opening.LearnedWindow || sequence.receiveWindowSetAtNanos.Load() != step {
+			t.Fatalf("capacity decrease failed to clamp admission while retaining learned capacity: %+v", estimate)
 		}
 	})
 }

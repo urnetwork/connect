@@ -1,0 +1,3 @@
+--- PASS: TestWindowPathSdkRetainedDeviceDuplexShort (5.41s)
+--- PASS: TestWindowPathSdkRetainedDeviceDuplexShort (5.61s)
+--- FAIL: TestWindowPathSdkRetainedDeviceDuplexShort (5.34s)

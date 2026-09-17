@@ -1,0 +1,41 @@
+--- a/transfer.go
++++ b/transfer.go
+@@ -5725,6 +5725,11 @@
+ 		if success, err = sendSequence.Pack(sendPack, timeout); err == nil {
+ 			return success, nil
+ 		}
++		if sendPack.Ctx.Err() != nil {
++			// This caller still owns an unadmitted Pack. Its cancellation
++			// says nothing about the shared sequence or accepted siblings.
++			return false, err
++		}
+ 		if errors.Is(err, ErrEncryptionRequiredNotEstablished) {
+ 			// Not a sequence problem: the Required entry gate refused the
+ 			// send. Retrying on a recreated sequence would wait the same
+@@ -5742,10 +5747,10 @@
+ // destination's ReceiveSequence intercepts these frames into the per-peer
+ // session.
+ //
+-// `ctx` gates whether the spawned goroutine may enqueue (it bails if done). The
+-// pack uses the SendBuffer's ctx — the session ctx must not propagate into
+-// `SendPack.Ctx`, since SendBuffer.Pack treats a canceled `SendPack.Ctx` as a
+-// sequence problem and cancels the SendSequence.
++// `ctx` gates entry and retries. Each admission attempt uses the SendBuffer's
++// lifetime, so session cancellation does not retract an attempt already in
++// progress. Successful admission transfers its bytes to the sequence's ordinary
++// delivery lifetime.
+ func (self *SendBuffer) SendEncryptedControl(
+ 	ctx context.Context,
+ 	peerId Id,
+@@ -15713,6 +15718,11 @@
+ 		if success, err = forwardSequence.Pack(forwardPack, timeout); err == nil {
+ 			return success, nil
+ 		}
++		if forwardPack.Ctx.Err() != nil {
++			// A canceled caller still owns this unadmitted frame; accepted
++			// siblings belong to the healthy shared forward sequence.
++			return false, err
++		}
+ 		// sequence closed
+ 	}
+ 	return success, err

@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "ec51e4f7dd4e69fe804257c6262ff55ceffc9eae4ee5087dbc3c5db4d9c65eab",
+  "binary_sha256": "a0e28e4276485c1281c68f6d6cdc41c171458775a2353c1b27f2f3ae7c198318",
+  "effective_inputs_sha256": "f36fe54c7629d0df2f1e4a5bc0a82988fcfb6dbaabb6c3918d0e2bf54b3cd918",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiver(SustainedPacingEscapesSlowHold|BatchedSplitPacingEscapesSlowHold|LegalRollingQueueReducesFastHold|LegalRollingQueueLegacyControl|LegalRollingQueueMixedControl|LegalSharedPositiveServiceBudget|OwnedFirstPrefixCannotBorrowSiblingStart|OwnedCausalReversalCannotBorrowSiblingSpan|OwnedTiesKeepTheirBytesAcrossPublicationOrder)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as build; absolute relationship pinned by original status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T21:22:01.921379+00:00",
+  "loadavg_start": [
+    4.46728515625,
+    5.9755859375,
+    8.484375
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 28.258624957874417,
+  "loadavg_end": [
+    4.583984375,
+    5.86328125,
+    8.3564453125
+  ],
+  "ended_utc": "2026-09-16T21:22:30.181299+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "cb4e7b9e67ed6c33efc11d75b15b3562a5eae8d26db149194e2f5a4bcb30f1ca",
+  "pass": 27,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "normalization_note": "27P0F: fixed64bucket raw-credit history and warm conservative offer-to-ACK bound repair the prescribed-input component root. Cold consumer is absent. Pending-drain guard audit and static long-RTT actual-pacer work remain separate.",
+  "rows": 438
+}

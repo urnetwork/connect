@@ -45,8 +45,8 @@ import (
 //     permission lifts it to the next binder at no measured cost.
 //   - Mechanism. The window is computed from the measured minimum round trip
 //     and the measured delivery rate rather than from a floored resend timer;
-//     it shrinks when the path shrinks; and it converges to what the path
-//     delivers rather than to whatever ceiling is configured.
+//     its candidate follows a slower path while learned capacity is
+//     retained; and byte permission remains independently bounded.
 //
 // The receive advertisement rows are step two, which §37.15 holds behind a
 // multi-route failover cell. They run with the setting turned on explicitly,
@@ -735,39 +735,12 @@ func TestReceiveAdvertisementStopsTheLossRetransmitStorm(t *testing.T) {
 	})
 }
 
-// THROUGHPUTFIX §37.15's mechanism claim, the first of two: the window is
-// computed from the round trip the path actually has, rather than from a resend
-// timer that has a floor.
-//
-// The defect from source. The rule as first built multiplied the delivery term
-// by `ScaledRtt`, which is the retransmit pacing estimate and is floored at
-// `RttMinResendInterval`, 300 ms. On a 25 ms path it therefore multiplied by
-// twelve times the round trip, and on a 6.7 ms path by forty-five. Measured on
-// three paths before the correction: 300 ms flat against real round trips of
-// 6.7, 27 and 102 ms, an overshoot of 2.9 to 44.8 times.
-//
-// This row does not claim a consequence for that overshoot. Both cells that
-// tried to measure one — TCP on a slow drain, UDP at 97 Mb/s into 20 — found
-// about 2 ms rather than the hundreds predicted, for the reasons in the file
-// header. A rule that multiplies a delivery rate by a resend timer is wrong on
-// its own terms, and that is what this asserts: the window equals the scale
-// times the measured delivery rate over the measured minimum round trip, from
-// the estimate's own evidence fields, to the byte.
-//
-// Prediction, recorded before the run: on a 25 ms path the reported window
-// equals scale x delivered x roundTrip / interval exactly, and the round trip
-// the rule used is close to the path's rather than at the 300 ms floor.
-//
-// Two corrections after earlier runs, kept on the record. At a 5 ms
-// propagation the computed value was 204,800 bytes, below the 262,144 floor, so
-// the row passed with the window clamped and would have gone on passing had the
-// rule read the resend timer. The path is 25 ms here and the row now fails if
-// the window lands on either clamp, because a cell that measures a clamp
-// measures nothing. And the receiver has to advertise a hold with room in it:
-// without an advertisement a sender takes its own constant as its ceiling and
-// can never exceed it, so the delivery term never binds and this row would be
-// measuring that clamp instead.
-func TestSizedWindowIsComputedFromTheMeasuredRoundTrip(t *testing.T) {
+// The fresh sizing candidate uses measured path residence, not the resend
+// timer's 300 ms floor. Recompute cumulative and, when qualified, service
+// candidates from their published evidence exactly. The effective window may
+// retain an earlier larger candidate, so its separate hard bounds are checked.
+// The original path, two-second offer and interior-clamp controls are retained.
+func TestWindowRetainedCandidateUsesMeasuredRoundTrip(t *testing.T) {
 	assertMessagePoolOwnership(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -787,8 +760,8 @@ func TestSizedWindowIsComputedFromTheMeasuredRoundTrip(t *testing.T) {
 	estimate := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
 
 	t.Logf(
-		"window %d from %d bytes over %s at a %s round trip, floor %d ceiling %d, reason %q",
-		estimate.Window, estimate.DeliveredByteCount, estimate.Interval,
+		"window %d candidate %d from %d bytes over %s at a %s round trip, floor %d ceiling %d, reason %q",
+		estimate.Window, estimate.CandidateWindow, estimate.DeliveredByteCount, estimate.Interval,
 		estimate.RoundTrip, estimate.Floor, estimate.Ceiling, estimate.Reason,
 	)
 
@@ -799,12 +772,19 @@ func TestSizedWindowIsComputedFromTheMeasuredRoundTrip(t *testing.T) {
 	want := ByteCount(int64(estimate.DeliveredByteCount) *
 		estimate.WindowRoundTrip.Nanoseconds() / estimate.Interval.Nanoseconds())
 	want = min(max(ByteCount(2)*want, estimate.Floor), estimate.Ceiling)
-	if estimate.Window != want {
+	if estimate.ServiceSized {
+		service := ByteCount(2 * float64(estimate.ServiceByteRate) * estimate.WindowRoundTrip.Seconds())
+		want = max(want, min(max(service, estimate.Floor), estimate.Ceiling))
+	}
+	if estimate.CandidateWindow != want {
 		t.Errorf(
-			"the window is %d but the evidence it reports gives %d; the rule and the number it publishes have to be the same rule",
-			estimate.Window,
+			"the current candidate is %d but its reported evidence gives %d",
+			estimate.CandidateWindow,
 			want,
 		)
+	}
+	if estimate.LearnedWindow < estimate.Initial || estimate.Window != min(max(estimate.LearnedWindow, estimate.Floor), estimate.Ceiling) {
+		t.Errorf("the effective window lost retained capacity or its hard bounds: %+v", estimate)
 	}
 	// the floored resend timer is 300 ms; a rule reading it would be here
 	if floor := DefaultSendBufferSettings().RttMinResendInterval; estimate.RoundTrip >= floor {
@@ -815,13 +795,13 @@ func TestSizedWindowIsComputedFromTheMeasuredRoundTrip(t *testing.T) {
 			floor,
 		)
 	}
-	if estimate.Window >= estimate.Ceiling {
+	if estimate.CandidateWindow >= estimate.Ceiling || estimate.Window >= estimate.Ceiling {
 		t.Errorf(
 			"the window reached its %d byte ceiling, so this cell measured the ceiling rather than the path; the rule is supposed to converge to what the path delivers",
 			estimate.Ceiling,
 		)
 	}
-	if estimate.Window <= estimate.Floor {
+	if estimate.CandidateWindow <= estimate.Floor {
 		t.Errorf(
 			"the window sits on its %d byte floor, so this cell measured a clamp and would pass with the rule reading a resend timer",
 			estimate.Floor,
@@ -829,19 +809,13 @@ func TestSizedWindowIsComputedFromTheMeasuredRoundTrip(t *testing.T) {
 	}
 }
 
-// THROUGHPUTFIX §37.15's mechanism claim, the second: a window sized from the
-// path follows the path down as well as up.
-//
-// The shallow carrier bounds queue inflation of the minimum round trip. A
-// deep relay buffer can instead increase the measured round trip as its drain
-// falls, damping the change in the window. The threefold shrink and interior
-// window assertions distinguish path tracking from either clamp.
-//
-// Virtual time drives the actual clients and paced carrier. Host scheduling
-// cannot reduce the configured drain, and sustained offers do not expire at a
-// 50 ms message deadline. Those expirations previously reduced measured slow
-// delivery to 39 KB/s on a 312.5 KB/s path and correctly floored the window.
-func TestSizedWindowShrinksWhenThePathShrinks(t *testing.T) {
+// An eightfold reduction in physical drain must lower the fresh candidate
+// while retaining learned bytes. The original threefold
+// response, measured-delivery tolerance, hard ceiling and interior floor
+// controls still distinguish path tracking from a clamp or expired offer.
+// Virtual time drives the same shallow carrier and sustained offer durations.
+// This harness publishes an unknown carrier; H1 pacing has separate controls.
+func TestWindowRetainedSlowPathLowersCandidateWithoutShrinking(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -871,9 +845,9 @@ func TestSizedWindowShrinksWhenThePathShrinks(t *testing.T) {
 		slow := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
 
 		t.Logf(
-			"at %d B/s window %d (%d bytes over %s, round trip %s); at %d B/s window %d (%d bytes over %s, round trip %s)",
-			fastBytesPerSecond, fast.Window, fast.DeliveredByteCount, fast.Interval, fast.RoundTrip,
-			slowBytesPerSecond, slow.Window, slow.DeliveredByteCount, slow.Interval, slow.RoundTrip,
+			"at %d B/s window %d candidate %d pacing %d (%d bytes over %s, round trip %s); at %d B/s window %d candidate %d pacing %d (%d bytes over %s, round trip %s)",
+			fastBytesPerSecond, fast.Window, fast.CandidateWindow, fast.PacingByteRate, fast.DeliveredByteCount, fast.Interval, fast.RoundTrip,
+			slowBytesPerSecond, slow.Window, slow.CandidateWindow, slow.PacingByteRate, slow.DeliveredByteCount, slow.Interval, slow.RoundTrip,
 		)
 
 		if !fast.Sized || !slow.Sized {
@@ -897,16 +871,19 @@ func TestSizedWindowShrinksWhenThePathShrinks(t *testing.T) {
 				t.Errorf("window %d reached ceiling %d on the %d B/s path", sample.estimate.Window, sample.estimate.Ceiling, sample.rate)
 			}
 		}
-		if 3*slow.Window > fast.Window {
+		if 3*slow.CandidateWindow > fast.CandidateWindow {
 			t.Errorf(
-				"the drain fell by eight and the window went from %d to %d; a window sized from the path has to follow the path down, which is the whole of what a constant cannot do",
-				fast.Window,
-				slow.Window,
+				"the drain fell by eight but the fresh candidate went from %d to %d",
+				fast.CandidateWindow,
+				slow.CandidateWindow,
 			)
 		}
-		if slow.Window <= slow.Floor {
+		if slow.Window < fast.Window || slow.LearnedWindow < fast.LearnedWindow {
+			t.Errorf("ordinary slower feedback shrank retained capacity: fast=%+v slow=%+v", fast, slow)
+		}
+		if slow.CandidateWindow <= slow.Floor {
 			t.Errorf(
-				"the window fell to its %d byte floor, so this cell cannot tell a rule that tracks the path from one that collapsed",
+				"the candidate fell to its %d byte floor, so this cell cannot distinguish measured slowdown from a collapsed estimate",
 				slow.Floor,
 			)
 		}

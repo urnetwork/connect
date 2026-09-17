@@ -1,0 +1,20 @@
+{
+  "candidate_status": "isolated experimental candidate; no live adoption",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "network_quality_events": false,
+  "outcomes": "Before20P31F with1race warning; after47P4F with1race warning.",
+  "performance_acceptance": false,
+  "provider_fixture_error": "The reused convenience helper assigns one ctx/cancel to provider and client. Provider.Close necessarily cancels client, contradicting the new test expectation. It fails on both production variants.",
+  "race": true,
+  "repetitions": 3,
+  "retention": "Original sources, binaries, logs, commands and local paths remain immutable outside Git, represented by hashes.",
+  "semantic_oracle_audit": "The unexecuted v1 updated-ACK experiment required exact old+latest, overconstraining valid latest-only coalescing. v2/v3 require monotone cumulative coverage and bounded pending ownership; either strategy is valid.",
+  "source_base": {
+    "artifact": "throughput-fix-2-receiver-service-validation-v1",
+    "candidate_source_sha256": "e6aaeb0801e4dc566dd66a9a4843c6a78d713722321a48e85312e4d7115d7790",
+    "inventory_sha256": "cb79e929de859509e52b7b821d40d5d2df8420858308ea94da39057f184e736d"
+  },
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "test_race": "The new closure control writes beforeRunSendSequenceForTest after NewClient starts its key-publisher worker, racing runSendSequence reading that test hook. Same race occurs before and after.",
+  "validity_limit": "No production bug is inferred from these four after failures. Exact raw failures and race stack are preserved; the clean comparison is v3."
+}

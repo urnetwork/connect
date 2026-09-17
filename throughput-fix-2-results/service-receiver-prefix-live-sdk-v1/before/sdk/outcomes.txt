@@ -1,0 +1,3 @@
+--- FAIL: TestWindowPathSdkRetainedDeviceDuplexShort (5.24s)
+--- FAIL: TestWindowPathSdkRetainedDeviceDuplexShort (5.30s)
+--- FAIL: TestWindowPathSdkRetainedDeviceDuplexShort (5.19s)

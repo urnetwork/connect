@@ -1,0 +1,7 @@
+{
+  "event_plumbing": false,
+  "performance_gates_changed": false,
+  "race": true,
+  "repetitions": 3,
+  "scope": "Shared H1 service cannot grow an unrelated current carrier window; H1 sibling and standalone per-sequence service remain valid growth controls. Both variants use the same three test bodies. After is the guarded frozen source used by the statistics-selection before run; all other source differences remain separately pinned."
+}

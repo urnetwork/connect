@@ -1,0 +1,8 @@
+{
+  "snapshot_command": "env CGO_ENABLED=0 python3 tools/throughput-fix-2-snapshot-test.py",
+  "server_env_command": "env CGO_ENABLED=0 python3 tools/throughput-fix-2-server-env-test.py",
+  "snapshot_exit_code": 0,
+  "server_env_exit_code": 0,
+  "working_directory": "/Users/brien/urnetwork/connect",
+  "no_quiescence_wait": true
+}

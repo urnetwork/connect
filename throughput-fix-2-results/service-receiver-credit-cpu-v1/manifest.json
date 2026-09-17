@@ -1,0 +1,9 @@
+{
+  "archive": "service-receiver-credit-cpu-v1",
+  "payload_sha256": {
+    "provenance.json": "c8e27ece3172d7800465ecd5f8279cc93e5454dce17f032b97e4b512b24dcf0f",
+    "readings.jsonl": "18e63a13bbda6758aa2950eafc8e7da06fbff42f58847d9e893bd931cb62f847",
+    "source-pins.json": "07403e4f1c852ab327be35679418dc2c10dee2af3b6ed509eab7eb0bc48c3b42",
+    "status.json": "9805dd57485e0730552b5c946b44ef87cbf89eab8d82b3dafec2b9224cfe3047"
+  }
+}

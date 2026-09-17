@@ -1,0 +1,60 @@
+--- a/transfer.go
++++ b/transfer.go
+@@ -6279,6 +6279,9 @@
+ 	resendWriteCount     atomic.Uint64
+ 	resendWriteByteCount atomic.Uint64
+ 
++	// The send worker owns replacement and all direct uses. Statistics copy
++	// the handle under this leaf lock before reading its concurrent policy.
++	contractWriterStateLock  sync.Mutex
+ 	contractMultiRouteWriter MultiRouteWriter
+ 	// Delivery checkpoints pair time, cumulative release and first-delivered
+ 	// service totals. The 64-entry ring costs 1,536 bytes, allocated only for
+@@ -7538,11 +7541,16 @@
+ 	transferFlightPolicy() transferFlightPolicySnapshot
+ }
+ 
+-// Reads the current immutable route generation. Before the first route write
+-// opens a selector, or for a custom writer without policy support, admission is
+-// intentionally unchanged.
++// Copies the worker-published handle before reading the immutable route
++// generation. The provider call holds no sequence lock. An unopened selector
++// or custom writer without policy support leaves admission unchanged.
+ func (self *SendSequence) transferFlightPolicy() transferFlightPolicySnapshot {
+-	if provider, ok := self.contractMultiRouteWriter.(transferFlightPolicyProvider); ok {
++	writer := func() MultiRouteWriter {
++		self.contractWriterStateLock.Lock()
++		defer self.contractWriterStateLock.Unlock()
++		return self.contractMultiRouteWriter
++	}()
++	if provider, ok := writer.(transferFlightPolicyProvider); ok {
+ 		return provider.transferFlightPolicy()
+ 	}
+ 	return transferFlightPolicySnapshot{}
+@@ -11929,7 +11937,12 @@
+ 		if self.contractMultiRouteWriter != nil {
+ 			self.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)
+ 		}
+-		self.contractMultiRouteWriter = self.client.RouteManager().OpenMultiRouteWriter(destination)
++		writer := self.client.RouteManager().OpenMultiRouteWriter(destination)
++		func() {
++			self.contractWriterStateLock.Lock()
++			defer self.contractWriterStateLock.Unlock()
++			self.contractMultiRouteWriter = writer
++		}()
+ 		self.contractMultiRouteWriterDestination = destination
+ 
+ 		// associate the destination with this sequence to receive acks
+@@ -11973,7 +11986,11 @@
+ 	if self.contractMultiRouteWriter != nil {
+ 		self.retireNoAckFastPath()
+ 		self.client.RouteManager().CloseMultiRouteWriter(self.contractMultiRouteWriter)
+-		self.contractMultiRouteWriter = nil
++		func() {
++			self.contractWriterStateLock.Lock()
++			defer self.contractWriterStateLock.Unlock()
++			self.contractMultiRouteWriter = nil
++		}()
+ 		self.contractMultiRouteWriterDestination = TransferPath{}
+ 	}
+ }

@@ -1,0 +1,6 @@
+{"classification":"matched_filtered_model","exit_code":1,"name":"TestWindowPathServiceRoundTripGrowthBeyondOldRing","outcome":"FAIL","outcome_index":1,"seconds":2.57,"variant":"checkpoint-8cda"}
+{"classification":"matched_filtered_model","exit_code":1,"name":"TestWindowPathServicePerformanceMatrix","outcome":"FAIL","outcome_index":2,"seconds":0.24,"variant":"checkpoint-8cda"}
+{"classification":"matched_filtered_model","exit_code":1,"name":"TestWindowPathServiceRoundTripGrowthBeyondOldRing","outcome":"FAIL","outcome_index":1,"seconds":2.86,"variant":"retry-only"}
+{"classification":"matched_filtered_model","exit_code":1,"name":"TestWindowPathServicePerformanceMatrix","outcome":"FAIL","outcome_index":2,"seconds":0.22,"variant":"retry-only"}
+{"classification":"matched_filtered_model","exit_code":1,"name":"TestWindowPathServiceRoundTripGrowthBeyondOldRing","outcome":"FAIL","outcome_index":1,"seconds":2.54,"variant":"retry-drain-f9"}
+{"classification":"matched_filtered_model","exit_code":1,"name":"TestWindowPathServicePerformanceMatrix","outcome":"FAIL","outcome_index":2,"seconds":0.17,"variant":"retry-drain-f9"}

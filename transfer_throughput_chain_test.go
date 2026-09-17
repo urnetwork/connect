@@ -1107,7 +1107,7 @@ func summarize(
 		if reading.window.TargetBound {
 			summary.targetBound = true
 		}
-		if arm.mode == WindowSizingFromDelivery && !reading.window.Sized {
+		if arm.mode == WindowSizingFromDelivery && !reading.window.Sized && !reading.window.ServiceSized {
 			summary.unsized = true
 		}
 		if contaminated[repetition] {

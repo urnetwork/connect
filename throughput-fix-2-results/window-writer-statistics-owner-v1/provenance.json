@@ -1,0 +1,24 @@
+{
+  "acceptance_limit": "This is preserved initial/rejected fixture evidence. The before fixture did not deterministically reproduce teardown across fresh processes, so it is not the final race gate. After synchronization and adjacent controls passed. No throughput/model or sampler acceptance is claimed.",
+  "adjacent_scope": "Same after binary, count3: ownership, statistics selection/service-read controls, original nine cumulative pacing roots and three retained service-attribution roots. Separate cumulative-scope comparison tests the three additional fallback-attribution controls.",
+  "archive_path_normalization": "External artifact lookup paths are represented by snapshot identifier and relative path. Raw logs and original compile manifests remain unmodified outside the repository; their original hashes are pinned. Race-stack extracts replace only frozen-source and Go-installation path prefixes, preserving line numbers and stack text.",
+  "attribution": "Exact relevant method bodies already exist at f903f59a, the pre-retention source baseline; see source-review.json. No historical f903 test binary was run.",
+  "candidate_patch_sha256": "b4f2c14fcee8963ce778e02ad5684d9666934485a9f668ea4790890ab6f64c4f",
+  "changed_source_paths": [
+    "transfer.go"
+  ],
+  "fresh_process_result": "Three separate count1 processes per variant reset detector deduplication. Before publication failed 3/3; teardown failed only 2/3 (fresh-2 passed). Before process outcomes were 1P2F, 2P1F, 1P2F with matching 2,1,2 race reports. After each process passed all three without races. The missed teardown race rejects this common-start fixture as the deterministic gate; the later access-barrier v2 proof is separate.",
+  "initial_count3_result": "Before 7 pass/2 fail with 2 race reports; after 9 pass/0 fail. Go race detector deduplicates repeated stack sites within one process, so later before passes in that invocation are not repeated absence evidence.",
+  "new_network_api": false,
+  "new_test_sha256": "f93aa754ff47b4ac6c0384eaa5dd4648c54a974e4e4d41d4bb2930277d32d52e",
+  "performance_gates_changed": false,
+  "positive_control": "A real acquired route snapshot writer reference holds external CloseMultiRouteWriter in retirement. Statistics must complete before that reference is released, proving the sequence publication lock does not span external lifecycle waits.",
+  "race": true,
+  "root_mechanism": "A common start barrier publishes initialized fixture state to independent reader/lifecycle workers without ordering their accesses to the handle. Teardown runs actual RouteManager retirement concurrently with DestinationSendStats. Opening runs actual RouteManager publication concurrently with the policy reader. No sleeps or retry/poll loops manufacture overlap.",
+  "sampler_changed": false,
+  "source_base": {
+    "snapshot": "combined-sampler-cumulative-v1",
+    "source_content_sha256": "f54b4a7046fc45238f129cb134cc14f6493f4e8ac418c171e6f35c6ac82e24e6"
+  },
+  "test_execution_owner": "test_monitor_medium"
+}

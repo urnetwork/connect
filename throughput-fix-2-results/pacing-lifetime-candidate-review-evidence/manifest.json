@@ -1,0 +1,13 @@
+{
+  "archive_kind": "pacing_lifetime_candidate_review_evidence",
+  "file_count": 6,
+  "file_sha256": {
+    "negative-results.json": "ee80274b20cd2568fca2645331fa16ff3387c984218eac347e70cb488a5a392b",
+    "outcomes.jsonl": "58aa0870b80a91284f915905c7053e63ec16af48601780915255dae6eb89f6d9",
+    "provenance.json": "15bbe843594258a4c5f1a5acf9100e846c6f0f64d699159cd2cc247723efc61d",
+    "run-summaries.jsonl": "942369559532087d8b6834d136a3de5d7fabf8f5ba1e32f632800b6593a906ad",
+    "source-pins.json": "40f11512d43ec9fb83606308dbca4d0d1342017795c7b2a0f0c185a608e052c3",
+    "status.json": "fb1c3602d76f5d92b31db18c93df449bdf024fe666887b03461fa54eac3a3a5b"
+  },
+  "schema_version": 1
+}

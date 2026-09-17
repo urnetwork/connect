@@ -1,0 +1,121 @@
+=== RUN   TestWindowPacingSdkInitialAckBeforeWriteConfirmation
+--- PASS: TestWindowPacingSdkInitialAckBeforeWriteConfirmation (0.00s)
+=== RUN   TestWindowPacingSdkInitialDelayedOpeningAccounting
+--- PASS: TestWindowPacingSdkInitialDelayedOpeningAccounting (0.00s)
+=== RUN   TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain
+--- PASS: TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain (0.00s)
+=== RUN   TestWindowPacingSdkInitialUnreadPairPreservesService
+--- PASS: TestWindowPacingSdkInitialUnreadPairPreservesService (0.00s)
+=== RUN   TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence
+--- PASS: TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence (0.00s)
+=== RUN   TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService
+--- PASS: TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService (0.00s)
+=== RUN   TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSdkInitialFreshPairDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialFreshPairDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainReadBetweenProofAndDispatch
+--- PASS: TestWindowPacingSuccessfulDrainReadBetweenProofAndDispatch (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainTimeoutAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainTimeoutAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainAbandonmentAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainAbandonmentAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialDeliveryCanRaiseService
+--- PASS: TestWindowPacingSuccessfulDrainPartialDeliveryCanRaiseService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainConfirmedProbeAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainConfirmedProbeAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainCannotRestoreRetiredCycle
+--- PASS: TestWindowPacingSuccessfulDrainCannotRestoreRetiredCycle (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialReadKeepsService
+--- PASS: TestWindowPacingSuccessfulDrainPartialReadKeepsService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainWithoutPartialReadControl
+--- PASS: TestWindowPacingSuccessfulDrainWithoutPartialReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialStatsReadControl
+--- PASS: TestWindowPacingSuccessfulDrainPartialStatsReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyPartialReadKeepsService
+--- PASS: TestWindowPacingSuccessfulDrainLegacyPartialReadKeepsService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyWithoutPartialReadControl
+--- PASS: TestWindowPacingSuccessfulDrainLegacyWithoutPartialReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyPartialStatsReadControl
+--- PASS: TestWindowPacingSuccessfulDrainLegacyPartialStatsReadControl (0.00s)
+=== RUN   TestWindowPacingSdkInitialAckBeforeWriteConfirmation
+--- PASS: TestWindowPacingSdkInitialAckBeforeWriteConfirmation (0.00s)
+=== RUN   TestWindowPacingSdkInitialDelayedOpeningAccounting
+--- PASS: TestWindowPacingSdkInitialDelayedOpeningAccounting (0.00s)
+=== RUN   TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain
+--- PASS: TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain (0.00s)
+=== RUN   TestWindowPacingSdkInitialUnreadPairPreservesService
+--- PASS: TestWindowPacingSdkInitialUnreadPairPreservesService (0.00s)
+=== RUN   TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence
+--- PASS: TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence (0.00s)
+=== RUN   TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService
+--- PASS: TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService (0.00s)
+=== RUN   TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSdkInitialFreshPairDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialFreshPairDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainReadBetweenProofAndDispatch
+--- PASS: TestWindowPacingSuccessfulDrainReadBetweenProofAndDispatch (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainTimeoutAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainTimeoutAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainAbandonmentAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainAbandonmentAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialDeliveryCanRaiseService
+--- PASS: TestWindowPacingSuccessfulDrainPartialDeliveryCanRaiseService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainConfirmedProbeAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainConfirmedProbeAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainCannotRestoreRetiredCycle
+--- PASS: TestWindowPacingSuccessfulDrainCannotRestoreRetiredCycle (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialReadKeepsService
+--- PASS: TestWindowPacingSuccessfulDrainPartialReadKeepsService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainWithoutPartialReadControl
+--- PASS: TestWindowPacingSuccessfulDrainWithoutPartialReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialStatsReadControl
+--- PASS: TestWindowPacingSuccessfulDrainPartialStatsReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyPartialReadKeepsService
+--- PASS: TestWindowPacingSuccessfulDrainLegacyPartialReadKeepsService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyWithoutPartialReadControl
+--- PASS: TestWindowPacingSuccessfulDrainLegacyWithoutPartialReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyPartialStatsReadControl
+--- PASS: TestWindowPacingSuccessfulDrainLegacyPartialStatsReadControl (0.00s)
+=== RUN   TestWindowPacingSdkInitialAckBeforeWriteConfirmation
+--- PASS: TestWindowPacingSdkInitialAckBeforeWriteConfirmation (0.00s)
+=== RUN   TestWindowPacingSdkInitialDelayedOpeningAccounting
+--- PASS: TestWindowPacingSdkInitialDelayedOpeningAccounting (0.00s)
+=== RUN   TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain
+--- PASS: TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain (0.00s)
+=== RUN   TestWindowPacingSdkInitialUnreadPairPreservesService
+--- PASS: TestWindowPacingSdkInitialUnreadPairPreservesService (0.00s)
+=== RUN   TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence
+--- PASS: TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence (0.00s)
+=== RUN   TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService
+--- PASS: TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService (0.00s)
+=== RUN   TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSdkInitialFreshPairDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialFreshPairDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainReadBetweenProofAndDispatch
+--- PASS: TestWindowPacingSuccessfulDrainReadBetweenProofAndDispatch (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainTimeoutAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainTimeoutAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainAbandonmentAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainAbandonmentAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialDeliveryCanRaiseService
+--- PASS: TestWindowPacingSuccessfulDrainPartialDeliveryCanRaiseService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainConfirmedProbeAcceptsSlowService
+--- PASS: TestWindowPacingSuccessfulDrainConfirmedProbeAcceptsSlowService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainCannotRestoreRetiredCycle
+--- PASS: TestWindowPacingSuccessfulDrainCannotRestoreRetiredCycle (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialReadKeepsService
+--- PASS: TestWindowPacingSuccessfulDrainPartialReadKeepsService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainWithoutPartialReadControl
+--- PASS: TestWindowPacingSuccessfulDrainWithoutPartialReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainPartialStatsReadControl
+--- PASS: TestWindowPacingSuccessfulDrainPartialStatsReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyPartialReadKeepsService
+--- PASS: TestWindowPacingSuccessfulDrainLegacyPartialReadKeepsService (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyWithoutPartialReadControl
+--- PASS: TestWindowPacingSuccessfulDrainLegacyWithoutPartialReadControl (0.00s)
+=== RUN   TestWindowPacingSuccessfulDrainLegacyPartialStatsReadControl
+--- PASS: TestWindowPacingSuccessfulDrainLegacyPartialStatsReadControl (0.00s)
+PASS

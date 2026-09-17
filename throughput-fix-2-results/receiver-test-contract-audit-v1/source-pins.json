@@ -1,0 +1,51 @@
+[
+  {
+    "binary_sha256": "195cd3dd7c769c500e425b3764b852ff434d5a576b7dfe3b0a18156c17eeb707",
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "29a83ba306b950ac15cba34afc86e3231e5fda2f5d8d22ffc0607b389f0316eb",
+    "effective_inputs_sha256": "882e1a8bf5f9322f3fe61227fde20a3e22e0760225d643fc08e644fa5d2619e4",
+    "inputs_match_at_archive": true,
+    "name": "original-exact-response-assertions",
+    "outcomes": {
+      "FAIL": 9,
+      "PASS": 6,
+      "SKIP": 0
+    },
+    "race": true,
+    "race_warnings": 0,
+    "raw_log_sha256": "b1c4af8a3a2c90afa0c01bd74d28a4529f62a35e6508d262f21ffaf0fc15ca15",
+    "raw_run_status_sha256": "40720fdab82959189a0528d4e07957e476f825d1cf6e9a0b0b7c8a634fe428fa",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "195cd3dd7c769c500e425b3764b852ff434d5a576b7dfe3b0a18156c17eeb707",
+      "cwd_matches_build_module": true,
+      "cwd_source": "effective Go module snapshot",
+      "effective_inputs_sha256": "882e1a8bf5f9322f3fe61227fde20a3e22e0760225d643fc08e644fa5d2619e4",
+      "elapsed_seconds": 0.9674959578551352,
+      "ended_utc": "2026-09-16T19:51:48.817287+00:00",
+      "exit_status": 1,
+      "fail": 9,
+      "loadavg_end": [
+        6.82666015625,
+        9.53857421875,
+        14.42822265625
+      ],
+      "loadavg_start": [
+        6.98583984375,
+        9.615234375,
+        14.48388671875
+      ],
+      "manifest_sha256": "29a83ba306b950ac15cba34afc86e3231e5fda2f5d8d22ffc0607b389f0316eb",
+      "no_quiescence_wait": true,
+      "pass": 6,
+      "race_warnings": 0,
+      "raw_log_sha256": "b1c4af8a3a2c90afa0c01bd74d28a4529f62a35e6508d262f21ffaf0fc15ca15",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T19:51:47.849502+00:00"
+    }
+  }
+]
