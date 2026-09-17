@@ -477,6 +477,7 @@ func (self *PlatformTransport) runFamilyHoldWatcher() {
 // helper narrows the network before resolution, and with the attempt observer
 // that classifies each dialer attempt's typed error (see noteDialError).
 func (self *PlatformTransport) dialContext(ctx context.Context) context.Context {
+	ctx = context.WithValue(ctx, extenderTransportSettingsContextKey{}, self.settings)
 	if !self.pinned() {
 		return ctx
 	}
@@ -736,6 +737,10 @@ type h3DialAttempt struct {
 	quicTransport *quic.Transport
 	conn          *quic.Conn
 	egressPinned  bool
+	// API alt dials own a separate carrier claim. Ordinary platform attempts
+	// use their long-lived transport's claim instead.
+	budgetReservation      *platformTransportBudgetReservation
+	translationReservation *platformTransportBudgetReservation
 }
 
 func (self *h3DialAttempt) close() {
@@ -751,10 +756,12 @@ func (self *h3DialAttempt) close() {
 	if self.packetConn != nil {
 		self.packetConn.Close()
 	}
+	self.budgetReservation.Release()
+	self.translationReservation.Release()
 }
 
-// openH3PacketConn is the socket for one H3 dial: the injected endpoint for a
-// plain H3 dial when a factory is set, else a host UDP socket bound to the
+// openH3PacketConn is the socket for one H3 dial: the injected endpoint for
+// any H3 mode when a factory is set, else a host UDP socket bound to the
 // wildcard of the destination's family and pinned to the physical egress
 // interface. The returned endpoint is owned by the caller on every non-nil
 // return, including one returned alongside an error.
@@ -764,7 +771,7 @@ func (self *PlatformTransport) openH3PacketConn(
 	serverName string,
 	udpAddr *net.UDPAddr,
 ) (net.PacketConn, net.Addr, bool, error) {
-	if ptMode == TransportModeH3 && self.settings.H3PacketConnFactory != nil {
+	if self.settings.H3PacketConnFactory != nil {
 		packetConn, err := self.settings.H3PacketConnFactory(ctx)
 		return packetConn, nil, false, err
 	}
@@ -789,9 +796,11 @@ func (self *PlatformTransport) openH3PacketConn(
 	}
 	if extenderConfig != nil {
 		udpNetwork, _ := udpWildcardForFamily(udpAddrFamily(udpAddr))
+		// Naming is delegated to the extender, but memory ownership stays
+		// with this transport's device child, not the standalone API root.
 		packetConn, err := NewExtenderPacketDialContext(
 			self.clientStrategy.ConnectSettings(), extenderConfig,
-		)(ctx, udpNetwork, extenderDestination)
+		)(self.dialContext(ctx), udpNetwork, extenderDestination)
 		if err != nil {
 			if packetConn != nil {
 				packetConn.Close()
@@ -1424,6 +1433,17 @@ func (self *PlatformTransport) h3ExtenderDestination(
 	return extenderConfig, net.JoinHostPort(host, strconv.Itoa(ports[0])), nil
 }
 
+type h3TranslationReservationContextKey struct{}
+
+func (self *PlatformTransport) acquireH3TranslationMemory(ctx context.Context) (*platformTransportBudgetReservation, error) {
+	_, byteCount := boundedQuicPacketTranslationSettings()
+	budget := self.settings.PlatformTransportBudget
+	if budget == nil {
+		budget = DefaultPlatformTransportBudget()
+	}
+	return (extenderQuicMemoryPolicy{budget: budget, byteCount: byteCount}).acquire(ctx)
+}
+
 // h3DialCandidates resolves the addresses one H3 connect attempt may dial, in
 // dial order, and how their sockets are wrapped. The dns modes translate one
 // socket and so dial one address. The plain mode dials one address when a
@@ -1436,18 +1456,39 @@ func (self *PlatformTransport) h3DialCandidates(ctx context.Context, ptMode Tran
 	}
 	translated := func(mode PacketTranslationMode, tld []byte) h3PacketConnWrapper {
 		return func(attemptCtx context.Context, packetConn net.PacketConn) (net.PacketConn, error) {
-			ptSettings := DefaultPacketTranslationSettings()
+			if err := attemptCtx.Err(); err != nil {
+				return nil, err
+			}
+			ptSettings, _ := boundedQuicPacketTranslationSettings()
 			ptSettings.DnsTlds = [][]byte{tld}
+			claim, preadmitted := attemptCtx.Value(h3TranslationReservationContextKey{}).(*platformTransportBudgetReservation)
+			if !preadmitted {
+				var err error
+				claim, err = self.acquireH3TranslationMemory(attemptCtx)
+				if err != nil {
+					return nil, err
+				}
+			}
 			// The connection cleanup owns the translated PacketConn. Keep its
 			// encoder alive while cancellation closes QUIC gracefully; otherwise
 			// the parent cancellation can discard the CONNECTION_CLOSE before
 			// CloseWithError reaches the wire and leave a stale server route.
-			return NewPacketTranslation(
+			translation, err := NewPacketTranslation(
 				context.WithoutCancel(attemptCtx),
 				mode,
 				packetConn,
 				ptSettings,
 			)
+			if err != nil {
+				if !preadmitted {
+					claim.Release()
+				}
+				return nil, err
+			}
+			if preadmitted {
+				return translation, nil
+			}
+			return &extenderBudgetPacketConn{PacketConn: translation, reservation: claim}, nil
 		}
 	}
 	host, ports, err := self.h3CarrierDestination(ptMode, serverName)
@@ -1562,6 +1603,21 @@ func (self *PlatformTransport) dialH3(
 	slowMultiple int,
 	confirm bool,
 ) (*h3DialAttempt, error) {
+	var translationClaim *platformTransportBudgetReservation
+	if ptMode == TransportModeH3Dns || ptMode == TransportModeH3DnsPump {
+		var err error
+		translationClaim, err = self.acquireH3TranslationMemory(ctx)
+		if err != nil {
+			return nil, err
+		}
+		ctx = context.WithValue(ctx, h3TranslationReservationContextKey{}, translationClaim)
+	}
+	claimTransferred := false
+	defer func() {
+		if !claimTransferred {
+			translationClaim.Release()
+		}
+	}()
 	packetConn, peerAddr, egressPinned, err := self.openH3PacketConn(ctx, ptMode, serverName, udpAddr)
 	if err != nil {
 		// A factory can return a usable endpoint together with an error.
@@ -1582,7 +1638,8 @@ func (self *PlatformTransport) dialH3(
 		peerAddr = udpAddr
 	}
 	attempt := &h3DialAttempt{
-		udpAddr: udpAddr,
+		udpAddr:                udpAddr,
+		translationReservation: translationClaim,
 		packetConn: capPlatformPacketConn(
 			packetConn,
 			self.h3SocketReadBufferByteCount(),
@@ -1590,6 +1647,7 @@ func (self *PlatformTransport) dialH3(
 		),
 		egressPinned: egressPinned,
 	}
+	claimTransferred = true
 	success := false
 	defer func() {
 		if !success {
@@ -1616,7 +1674,19 @@ func (self *PlatformTransport) dialH3(
 	if handshakeAttempt != nil {
 		attemptQuicConfig.Tracer = self.settings.H3QuicPacketStats.tracerForAttempt(handshakeAttempt)
 	}
-	conn, err := attempt.quicTransport.DialEarly(ctx, peerAddr, attemptTlsConfig, attemptQuicConfig)
+	if self.settings.h3RetainedByteAccounting {
+		installQuicSendFlight(attemptQuicConfig)
+	}
+	var conn *quic.Conn
+	if self.settings.h3RetainedByteAccounting {
+		// Allow0RTT is a server acceptance option, not a client-send switch.
+		// The retained-flight controller intentionally tracks only confirmed
+		// 1-RTT ownership; Dial (not DialEarly) also avoids Retry requeueing
+		// application roots outside that tracker on resumed connections.
+		conn, err = attempt.quicTransport.Dial(ctx, peerAddr, attemptTlsConfig, attemptQuicConfig)
+	} else {
+		conn, err = attempt.quicTransport.DialEarly(ctx, peerAddr, attemptTlsConfig, attemptQuicConfig)
+	}
 	if err != nil {
 		handshakeAttempt.finish(false)
 		if handshakeAttempt.sentWithoutResponse() {

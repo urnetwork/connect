@@ -39,9 +39,10 @@ func TestTheH3AndTunCeilingsMoveTogether(t *testing.T) {
 		tunMax   ByteCount
 	}
 	samples := []sample{}
-	// from 8 MiB up, which is where the H3 window's floor releases and both
-	// ceilings are on their draws
-	for _, budget := range []ByteCount{mib(8), mib(16), mib(32), mib(64), mib(128), mib(256), mib(1024)} {
+	// Mobile receive credit now shares a composed claim with send, socket,
+	// and queue ownership. The exact mobile ledger has its own regression;
+	// this proportional-growth guard covers the larger/server surface.
+	for _, budget := range []ByteCount{mib(64), mib(128), mib(256), mib(1024)} {
 		SetMemoryBudget(budget)
 		samples = append(samples, sample{
 			budget:   budget,
@@ -128,8 +129,9 @@ func TestTheH3WindowsAtTheShippedDeviceTargets(t *testing.T) {
 		stream     ByteCount
 		connection ByteCount
 	}{
-		{"the 20 MiB desktop device target", mib(20), kib(1920), kib(2560)},
-		{"the 24 MiB mobile device target", mib(24), kib(2304), kib(3072)},
+		{"the 20 MiB iOS device target", mib(20), kib(1104), kib(1472)},
+		{"the historical 24 MiB device target", mib(24), kib(1104), kib(1472)},
+		{"the 28 MiB Android device target", mib(28), kib(2688), kib(3584)},
 	} {
 		// the process budget must not reach the per-device surface: read the
 		// same target under a small and a large process budget
@@ -139,7 +141,7 @@ func TestTheH3WindowsAtTheShippedDeviceTargets(t *testing.T) {
 			if settings.H3MaxStreamReceiveWindowByteCount != c.stream ||
 				settings.H3MaxConnectionReceiveWindowByteCount != c.connection {
 				t.Errorf(
-					"%s under a %d byte process budget gives an H3 stream window of %d and connection window of %d rather than %d and %d; a shipped carrier is sized from the whole device target, so a smaller window here means it is being sized from the platform share, the floor, or the process budget",
+					"%s under a %d byte process budget gives H3 stream/connection credit %d/%d, want the device-target composed policy %d/%d",
 					c.name, processBudget,
 					settings.H3MaxStreamReceiveWindowByteCount, settings.H3MaxConnectionReceiveWindowByteCount,
 					c.stream, c.connection,

@@ -542,6 +542,10 @@ const (
 	// window. This is a verified disagreement, never a failure to obtain
 	// evidence — see DESIGNNOTES3 §5.3.
 	EncryptionEventKeyIdentityRejected
+	// EncryptionEventKeyIdentityStoreUnavailable is a local admission or
+	// persistence failure, not cryptographic evidence against the peer. The
+	// session withholds Cipher and does not set KeyIdentityRejected.
+	EncryptionEventKeyIdentityStoreUnavailable
 )
 
 // EncryptionEvent is a per-peer encryption lifecycle notification. Events are
@@ -2708,7 +2712,7 @@ func (self *peerEncryptionSession) Cipher() *sequenceCipher {
 	// for, or being accepted from, a peer whose key the platform may have
 	// chosen. A rejected resolution is terminal and never re-enters pending.
 	switch self.keyHistoryState {
-	case clientKeyHistoryPending, clientKeyHistoryRejected:
+	case clientKeyHistoryPending, clientKeyHistoryRejected, clientKeyHistoryStoreUnavailable:
 		if self.client.log.V(2).Enabled() {
 			self.client.log.V(2).Infof(
 				"[key]%s Cipher()=nil: signed identity %s\n", self.logTag, self.keyHistoryState,

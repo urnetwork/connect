@@ -82,13 +82,15 @@ type ipv6FragmentDatagram struct {
 }
 
 type ipv6FragmentReassembler struct {
+	maxRetainedBytes  int
 	datagrams         map[ipv6FragmentKey]*ipv6FragmentDatagram
 	retainedByteCount int
 }
 
 func newIpv6FragmentReassembler() *ipv6FragmentReassembler {
 	return &ipv6FragmentReassembler{
-		datagrams: make(map[ipv6FragmentKey]*ipv6FragmentDatagram),
+		maxRetainedBytes: ipv6FragmentReassemblyMaxRetainedBytes,
+		datagrams:        make(map[ipv6FragmentKey]*ipv6FragmentDatagram),
 	}
 }
 
@@ -143,6 +145,9 @@ func (self *ipv6FragmentReassembler) processResultAt(
 	}
 
 	self.expire(now)
+	if self.maxRetainedBytes <= 0 {
+		self.maxRetainedBytes = ipv6FragmentReassemblyMaxRetainedBytes
+	}
 
 	key := ipv6FragmentKey{
 		source:         source,
@@ -175,11 +180,11 @@ func (self *ipv6FragmentReassembler) processResultAt(
 	if datagram == nil {
 		self.makeDatagramRoom(now)
 		packetCost := cap(packet)
-		if ipv6FragmentReassemblyMaxRetainedBytes < packetCost {
+		if self.maxRetainedBytes < packetCost {
 			MessagePoolReturn(packet)
 			return ipFragmentProcessResult{fragment: true}
 		}
-		for self.retainedByteCount+packetCost > ipv6FragmentReassemblyMaxRetainedBytes {
+		for self.retainedByteCount+packetCost > self.maxRetainedBytes {
 			if !self.releaseOldestDatagram() {
 				MessagePoolReturn(packet)
 				return ipFragmentProcessResult{fragment: true}
@@ -191,7 +196,7 @@ func (self *ipv6FragmentReassembler) processResultAt(
 			finalPayloadByteCount: -1,
 		}
 		self.datagrams[key] = datagram
-	} else if self.retainedByteCount+cap(packet) > ipv6FragmentReassemblyMaxRetainedBytes {
+	} else if self.retainedByteCount+cap(packet) > self.maxRetainedBytes {
 		return drop()
 	}
 

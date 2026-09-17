@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -21,9 +22,12 @@ func main() {
 	url := flag.String("url", "http://cachefly.cachefly.net/200mb.test", "download URL")
 	streams := flag.Int("streams", 4, "parallel streams")
 	seconds := flag.Int("seconds", 180, "run duration")
-	flag.Parse()
-
 	dns := flag.String("dns", "1.1.1.1:53", "resolver, reached through the tunnel like the payload")
+	flag.Parse()
+	if *streams <= 0 || *seconds <= 0 {
+		fmt.Fprintln(os.Stderr, "streams and seconds must be positive")
+		os.Exit(2)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*seconds)*time.Second)
 	defer cancel()
 	// Android has no /etc/resolv.conf for the pure-Go resolver, so name the
@@ -48,8 +52,12 @@ func main() {
 	}
 	var total atomic.Int64
 	var errors atomic.Int64
+	var workers sync.WaitGroup
+	defer transport.CloseIdleConnections()
 	for i := 0; i < *streams; i++ {
+		workers.Add(1)
 		go func() {
+			defer workers.Done()
 			buffer := make([]byte, 64*1024)
 			for ctx.Err() == nil {
 				request, err := http.NewRequestWithContext(ctx, "GET", *url, nil)
@@ -57,7 +65,14 @@ func main() {
 					return
 				}
 				response, err := client.Do(request)
+				if err == nil && response.StatusCode != http.StatusOK {
+					response.Body.Close()
+					err = fmt.Errorf("unexpected HTTP status %d", response.StatusCode)
+				}
 				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
 					if errors.Load() < 3 {
 						fmt.Fprintf(os.Stderr, "error: %v\n", err)
 					}
@@ -86,6 +101,7 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
+			workers.Wait()
 			fmt.Fprintf(os.Stdout, "done total_bytes=%d errors=%d\n", total.Load(), errors.Load())
 			return
 		case <-ticker.C:

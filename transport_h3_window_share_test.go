@@ -58,7 +58,9 @@ func TestTheH3ReceiveWindowsAreADrawOnTheBudget(t *testing.T) {
 	// §44.2 constraint 1 states the property: the reservation's 3 MiB floor
 	// crosses at 24 MiB, so below that it is flat by design rather than by
 	// the defect. The floors themselves are asserted separately below.
-	for _, budget := range []ByteCount{mib(32), mib(64), mib(256), mib(1024)} {
+	// The constrained mobile surface now reserves additive send/socket/queue
+	// costs; TestPlatformH3MobileComposedLedger pins that envelope separately.
+	for _, budget := range []ByteCount{mib(64), mib(256), mib(1024)} {
 		SetMemoryBudget(budget)
 		settings := DefaultPlatformTransportSettings()
 		stream, connection := resolved(settings)
@@ -150,6 +152,12 @@ func TestTheH3ReceiveWindowsAreADrawOnTheBudget(t *testing.T) {
 		SetMemoryBudget(budget)
 		budgetSettings := DefaultPlatformTransportSettings()
 		budgetStream, budgetConnection := resolved(budgetSettings)
+		if budgetSettings.h3RetainedByteAccounting {
+			if budgetSettings.H3BudgetByteCount < budgetConnection+platformH3FixedMemoryByteCount() {
+				t.Fatalf("mobile receive window escaped composed claim at %d", budget)
+			}
+			continue
+		}
 		for _, expected := range []struct {
 			name    string
 			got     ByteCount

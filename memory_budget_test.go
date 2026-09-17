@@ -42,7 +42,8 @@ func TestMemoryBudgetUnsetDefaults(t *testing.T) {
 }
 
 func TestMemoryBudgetScaledSettings(t *testing.T) {
-	// half the reference budget scales the memory-dominant defaults by half
+	// Half the reference budget scales ordinary defaults by half; the finite
+	// H3 profile additionally accounts for its retained non-receive owners.
 	SetMemoryBudget(mib(32))
 	defer SetMemoryBudget(0)
 
@@ -100,9 +101,23 @@ func TestMemoryBudgetScaledSettings(t *testing.T) {
 		t.Fatal("platform settings did not use the current shared budget")
 	}
 	AssertEqual(t, platformSettings.H1BudgetByteCount, kib(256))
-	AssertEqual(t, platformSettings.H3BudgetByteCount, mib(4))
-	AssertEqual(t, platformSettings.H3SocketReadBufferByteCount, kib(512))
-	AssertEqual(t, platformSettings.H3SocketWriteBufferByteCount, kib(512))
+	// With no explicit owner, the process target selects the 32-MiB H3
+	// profile: 4 MiB of receive credit plus 1600 KiB of retained owners.
+	// An explicit 20-MiB DeviceLocal uses its separate 3-MiB inner claim.
+	AssertEqual(t, platformSettings.H3BudgetByteCount, kib(5696))
+	AssertEqual(t, platformSettings.H3SocketReadBufferByteCount, kib(64))
+	AssertEqual(t, platformSettings.H3SocketWriteBufferByteCount, kib(64))
+	quicConfig := newPlatformQuicConfig(platformSettings, 1)
+	AssertEqual(t, ByteCount(quicConfig.MaxConnectionReceiveWindow), mib(4))
+	AssertEqual(t, ByteCount(quicConfig.MaxStreamReceiveWindow), mib(3))
+	AssertEqual(t, ByteCount(quicConfig.InitialConnectionReceiveWindow), kib(256))
+	AssertEqual(t, ByteCount(quicConfig.InitialStreamReceiveWindow), kib(128))
+	AssertEqual(t, platformH3FixedMemoryByteCount(), kib(1600))
+	AssertEqual(t, platformSettings.H3BudgetByteCount,
+		ByteCount(quicConfig.MaxConnectionReceiveWindow)+platformH3FixedMemoryByteCount())
+	if !platformSettings.h3RetainedByteAccounting || quicConfig.Allow0RTT {
+		t.Fatal("finite H3 defaults bypassed retained-send accounting")
+	}
 	if platformStats.TotalByteCount <
 		platformSettings.H1BudgetByteCount+platformSettings.H3BudgetByteCount {
 		t.Fatal("32 MiB Auto budget cannot fit one H1 and one H3 carrier")

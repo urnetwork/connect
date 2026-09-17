@@ -360,6 +360,7 @@ type dmcaFlowShard struct {
 }
 
 type dmcaDetector struct {
+	runDone     chan struct{}
 	settings    *DmcaSecurityPolicySettings
 	web         *webStandardDetector
 	perShardCap int
@@ -375,6 +376,7 @@ func newDmcaDetector(ctx context.Context, settings *DmcaSecurityPolicySettings, 
 		}
 	}
 	self := &dmcaDetector{
+		runDone:     make(chan struct{}),
 		settings:    settings,
 		web:         web,
 		perShardCap: perShardCap,
@@ -387,7 +389,12 @@ func newDmcaDetector(ctx context.Context, settings *DmcaSecurityPolicySettings, 
 	// reclaim flows idle past FlowTtl. The capacity-LRU eviction (evictWithLock) still
 	// bounds memory under load; this adds prompt time-based reclamation when egress is quiet.
 	if ctx != nil && 0 < settings.FlowTtl {
-		go self.run(ctx)
+		go func() {
+			defer close(self.runDone)
+			self.run(ctx)
+		}()
+	} else {
+		close(self.runDone)
 	}
 	return self
 }

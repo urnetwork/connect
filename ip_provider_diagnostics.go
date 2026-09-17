@@ -98,6 +98,13 @@ func (self *RemoteUserNatProvider) ensureSourceDiagnosticsWithLock(sourceId Id) 
 	}
 	state := self.sourceDiagnostics[sourceId]
 	if state == nil {
+		if self.memoryBudget() != nil && len(self.sourceDiagnostics) >= self.sourceLifecycleMaxCount() {
+			// Advisory records can be evicted; authoritative tombstones cannot.
+			for id := range self.sourceDiagnostics {
+				delete(self.sourceDiagnostics, id)
+				break
+			}
+		}
 		// Sequence 1 publishes provider identity before any block occurs.
 		state = &providerSourceDiagnostics{sequence: 1}
 		self.sourceDiagnostics[sourceId] = state

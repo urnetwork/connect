@@ -968,7 +968,8 @@ func (self *SecurityDestination) String() string {
 
 // get current counts of outcomes per (protocol, destination port)
 type SecurityPolicyStatsCollector struct {
-	includeIp bool
+	includeIp                bool
+	maxDestinationsPerResult int
 
 	stateLock               sync.Mutex
 	resultDestinationCounts SecurityPolicyStats
@@ -1009,8 +1010,11 @@ func (self *SecurityPolicyStatsCollector) add(
 		destinationCounts = map[SecurityDestination]uint64{}
 		self.resultDestinationCounts[result] = destinationCounts
 	}
-	if _, ok := destinationCounts[destination]; !ok &&
-		securityPolicyStatsMaxDestinationsPerResult <= len(destinationCounts)+1 {
+	maxDestinations := self.maxDestinationsPerResult
+	if maxDestinations <= 0 {
+		maxDestinations = securityPolicyStatsMaxDestinationsPerResult
+	}
+	if _, ok := destinationCounts[destination]; !ok && maxDestinations <= len(destinationCounts)+1 {
 		// Reserve the final slot for all later destinations. A real IpPath has
 		// version 4 or 6, so the zero destination cannot collide with one.
 		destination = securityPolicyStatsOverflowDestination

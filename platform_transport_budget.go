@@ -7,16 +7,23 @@ import (
 )
 
 // PlatformTransportBudget bounds the aggregate retained capacity of platform
-// carriers and the number of PlatformTransports allowed to open sockets. H1
+// carriers and their logical carrier-graph slots. A slot can own multiple
+// physical sockets, whose retained buffers are covered by byte claims. H1
 // claims register before transport goroutines start and precede optional Auto
 // H3 when both do not fit. Optional H3 leases are revocable: an explicit H3
 // choice can reclaim one, and foreground client Auto H3 can reclaim a provider
 // lease, so construction order cannot permanently pin outbound traffic to H1.
 // A policy replacement with H1 on either side may also use one serialized
-// temporary handoff bounded to the H1 claim, preserving make-before-break
+// temporary handoff per limit bounded to the H1 claim, preserving make-before-break
 // without allowing two full H3 working sets to escape the aggregate limit.
 type PlatformTransportBudget struct {
 	mutex sync.Mutex
+	// The hierarchy is immutable after construction. Every budget and every
+	// reservation in it is guarded by root.mutex, so a claim either acquires
+	// all its limits or none. Children share the root's change notification;
+	// no forwarding goroutines or capacity held while waiting are needed.
+	parent *PlatformTransportBudget
+	root   *PlatformTransportBudget
 
 	totalByteCount     ByteCount
 	usedByteCount      ByteCount
@@ -29,7 +36,7 @@ type PlatformTransportBudget struct {
 	releasedByteCount  ByteCount
 	preemptedH3Count   uint64
 	// activeHandoff is the only reservation allowed to exceed the ordinary
-	// byte/socket ceiling while its paired carrier remains live. A handoff is
+	// byte/carrier-slot ceiling while its paired carrier remains live. A handoff is
 	// allowed only when one endpoint is H1, so the temporary overage is bounded
 	// by the H1 claim: old H1 while moving to H3, or new H1 while moving from H3.
 	// More than one replacement may wait, but admission serializes the overage.
@@ -45,6 +52,7 @@ const (
 	platformTransportBudgetH1 platformTransportBudgetClass = iota + 1
 	platformTransportBudgetH3Auto
 	platformTransportBudgetH3Explicit
+	platformTransportBudgetExtender
 
 	// Keep the old internal name for tests and callers that mean optional H3.
 	platformTransportBudgetH3 = platformTransportBudgetH3Auto
@@ -60,13 +68,15 @@ const (
 
 type platformTransportBudgetReservation struct {
 	budget    *PlatformTransportBudget
+	parent    *platformTransportBudgetReservation
+	owner     *platformTransportBudgetReservation
 	class     platformTransportBudgetClass
 	byteCount ByteCount
 	usesSlot  bool
 	priority  int
 	sequence  uint64
 
-	// Lifecycle and preemption state are guarded by budget.mutex. Keeping one
+	// Lifecycle and preemption state are guarded by budget.root.mutex. Keeping one
 	// lock lets admission inspect and revoke another reservation without a
 	// reservation-to-budget / budget-to-reservation lock inversion.
 	pending          bool
@@ -96,7 +106,38 @@ type PlatformTransportBudgetStats struct {
 	ActiveHandoffCount          int
 	ActiveHandoffByteCount      ByteCount
 	ActiveHandoffTransportCount int
-	HandoffAcquisitionCount     uint64
+	ActiveHandoffID             uint64
+	ActiveHandoffFromClass      string
+	ActiveHandoffToClass        string
+	// H1 endpoint bytes, or the smaller endpoint when both carriers are H1.
+	ActiveHandoffH1ByteCount ByteCount
+	HandoffAcquisitionCount  uint64
+}
+
+// PlatformTransportBudgetHandoffStats identifies the live replacement pair,
+// independently of which limit required its temporary loan. Owner is
+// "device", "other_device", or "process", relative to the sampled budget.
+type PlatformTransportBudgetHandoffStats struct {
+	ID             uint64
+	FromClass      string
+	ToClass        string
+	H1ByteCount    ByteCount
+	ByteCount      ByteCount
+	TransportCount int
+	Owner          string
+}
+
+type PlatformTransportBudgetHierarchyStats struct {
+	Budget        PlatformTransportBudgetStats
+	Root          PlatformTransportBudgetStats
+	BudgetHandoff PlatformTransportBudgetHandoffStats
+	RootHandoff   PlatformTransportBudgetHandoffStats
+	// Each level may lend to one pair independently. When two distinct loans
+	// overlap, retain the other level's pair as provenance too, without adding
+	// its overlap to this level's permitted overage. An ownerless root pair is
+	// never projected into a device that does not own it.
+	BudgetAdditionalHandoff PlatformTransportBudgetHandoffStats
+	RootAdditionalHandoff   PlatformTransportBudgetHandoffStats
 }
 
 // NewPlatformTransportBudget creates a byte budget with an optional aggregate
@@ -105,20 +146,136 @@ func NewPlatformTransportBudget(
 	totalByteCount ByteCount,
 	maxTransportCount int,
 ) *PlatformTransportBudget {
-	return &PlatformTransportBudget{
+	return newPlatformTransportBudget(totalByteCount, maxTransportCount, nil)
+}
+
+// newPlatformTransportBudget adds a local limit to an existing hierarchy.
+// Parent claims retain the child's class, priority, and carrier-slot charge so
+// direct process claims compete with device-owned carriers on equal terms.
+func newPlatformTransportBudget(
+	totalByteCount ByteCount,
+	maxTransportCount int,
+	parent *PlatformTransportBudget,
+) *PlatformTransportBudget {
+	budget := &PlatformTransportBudget{
 		totalByteCount:    max(0, totalByteCount),
 		maxTransportCount: max(0, maxTransportCount),
-		notify:            make(chan struct{}),
 		reservations:      map[*platformTransportBudgetReservation]bool{},
+		parent:            parent,
 	}
+	budget.root = budget
+	if parent != nil {
+		budget.root = parent.root
+	} else {
+		budget.notify = make(chan struct{})
+	}
+	return budget
 }
 
 func (self *PlatformTransportBudget) Stats() PlatformTransportBudgetStats {
 	if self == nil {
 		return PlatformTransportBudgetStats{}
 	}
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
+	self.root.mutex.Lock()
+	defer self.root.mutex.Unlock()
+	return self.statsLocked()
+}
+
+// StatsWithRoot samples both limits and their pair provenance under one lock.
+// A root-only loan owned by this device still reports the device's pair even
+// when its local limit needed no loan; child-only loans likewise expose the
+// same pair at the root without claiming the root borrowed capacity.
+func (self *PlatformTransportBudget) StatsWithRoot() PlatformTransportBudgetHierarchyStats {
+	if self == nil {
+		return PlatformTransportBudgetHierarchyStats{}
+	}
+	self.root.mutex.Lock()
+	defer self.root.mutex.Unlock()
+	snapshot := PlatformTransportBudgetHierarchyStats{
+		Budget: self.statsLocked(),
+		Root:   self.root.statsLocked(),
+	}
+	rootPair, devicePair := self.root.activeHandoff, self.activeHandoff
+	if rootPair == nil {
+		rootPair = devicePair
+	}
+	if devicePair == nil && rootPair != nil && rootPair.ownedByLocked(self) {
+		devicePair = rootPair
+	}
+	snapshot.BudgetHandoff = devicePair.handoffStatsLocked(self)
+	snapshot.RootHandoff = rootPair.handoffStatsLocked(self)
+	if rootPair != nil && devicePair != nil && rootPair.owner != devicePair.owner {
+		snapshot.RootAdditionalHandoff = devicePair.handoffStatsLocked(self)
+		if rootPair.ownedByLocked(self) {
+			snapshot.BudgetAdditionalHandoff = rootPair.handoffStatsLocked(self)
+		}
+	}
+	return snapshot
+}
+
+func (self *platformTransportBudgetReservation) ownedByLocked(budget *PlatformTransportBudget) bool {
+	for owner := self.owner.budget; owner != nil; owner = owner.parent {
+		if owner == budget {
+			return true
+		}
+	}
+	return false
+}
+
+func (self platformTransportBudgetClass) name() string {
+	switch self {
+	case platformTransportBudgetH1:
+		return "h1"
+	case platformTransportBudgetH3Auto:
+		return "h3_auto"
+	case platformTransportBudgetH3Explicit:
+		return "h3_explicit"
+	case platformTransportBudgetExtender:
+		return "extender"
+	default:
+		return ""
+	}
+}
+
+func (self *platformTransportBudgetReservation) handoffStatsLocked(
+	budget *PlatformTransportBudget,
+) PlatformTransportBudgetHandoffStats {
+	if self == nil || self.handoffFrom == nil {
+		return PlatformTransportBudgetHandoffStats{}
+	}
+	previous := self.handoffFrom
+	rootClaim := self
+	for rootClaim.parent != nil {
+		rootClaim = rootClaim.parent
+	}
+	stats := PlatformTransportBudgetHandoffStats{
+		ID:        rootClaim.sequence,
+		FromClass: previous.class.name(),
+		ToClass:   self.class.name(),
+		ByteCount: min(previous.byteCount, self.byteCount),
+		Owner:     "other_device",
+	}
+	if previous.class == platformTransportBudgetH1 {
+		stats.H1ByteCount = previous.byteCount
+	}
+	if self.class == platformTransportBudgetH1 {
+		stats.H1ByteCount = self.byteCount
+		if previous.class == platformTransportBudgetH1 {
+			stats.H1ByteCount = min(previous.byteCount, self.byteCount)
+		}
+	}
+	if self.usesSlot && previous.usesSlot {
+		stats.TransportCount = 1
+	}
+	if self.owner.budget == self.budget.root {
+		stats.Owner = "process"
+	} else if self.ownedByLocked(budget) {
+		stats.Owner = "device"
+	}
+	return stats
+}
+
+func (self *PlatformTransportBudget) statsLocked() PlatformTransportBudgetStats {
 	stats := PlatformTransportBudgetStats{
 		TotalByteCount:          self.totalByteCount,
 		UsedByteCount:           self.usedByteCount,
@@ -137,18 +294,33 @@ func (self *PlatformTransportBudget) Stats() PlatformTransportBudgetStats {
 		}
 	}
 	if active := self.activeHandoff; active != nil && active.handoffFrom != nil {
+		pair := active.handoffStatsLocked(self)
 		stats.ActiveHandoffCount = 1
-		stats.ActiveHandoffByteCount = min(active.byteCount, active.handoffFrom.byteCount)
-		if active.usesSlot && active.handoffFrom.usesSlot {
-			stats.ActiveHandoffTransportCount = 1
-		}
+		stats.ActiveHandoffByteCount = pair.ByteCount
+		stats.ActiveHandoffTransportCount = pair.TransportCount
+		stats.ActiveHandoffID = pair.ID
+		stats.ActiveHandoffFromClass = pair.FromClass
+		stats.ActiveHandoffToClass = pair.ToClass
+		stats.ActiveHandoffH1ByteCount = pair.H1ByteCount
 	}
 	return stats
 }
 
 func (self *PlatformTransportBudget) notifyChangedLocked() {
-	close(self.notify)
-	self.notify = make(chan struct{})
+	close(self.root.notify)
+	self.root.notify = make(chan struct{})
+}
+
+// CapacityNotify closes after any claim changes within this hierarchy. Read
+// it before testing admission to avoid missing a release by a sibling device
+// or by a process-owned carrier between the failed attempt and the wait.
+func (self *PlatformTransportBudget) CapacityNotify() <-chan struct{} {
+	if self == nil {
+		return nil
+	}
+	self.root.mutex.Lock()
+	defer self.root.mutex.Unlock()
+	return self.root.notify
 }
 
 func (self *PlatformTransportBudget) register(
@@ -173,8 +345,20 @@ func (self *PlatformTransportBudget) registerWithPriority(
 	if self == nil {
 		return nil
 	}
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
+	self.root.mutex.Lock()
+	defer self.root.mutex.Unlock()
+	reservation := self.registerLocked(class, byteCount, usesSlot, priority, nil)
+	self.notifyChangedLocked()
+	return reservation
+}
+
+func (self *PlatformTransportBudget) registerLocked(
+	class platformTransportBudgetClass,
+	byteCount ByteCount,
+	usesSlot bool,
+	priority int,
+	owner *platformTransportBudgetReservation,
+) *platformTransportBudgetReservation {
 	self.nextSequence += 1
 	reservation := &platformTransportBudgetReservation{
 		budget:    self,
@@ -184,7 +368,15 @@ func (self *PlatformTransportBudget) registerWithPriority(
 		priority:  priority,
 		sequence:  self.nextSequence,
 		pending:   true,
-		preempt:   make(chan struct{}),
+	}
+	if owner == nil {
+		owner = reservation
+		owner.preempt = make(chan struct{})
+	}
+	reservation.owner = owner
+	reservation.preempt = owner.preempt
+	if self.parent != nil {
+		reservation.parent = self.parent.registerLocked(class, byteCount, usesSlot, priority, owner)
 	}
 	self.reservations[reservation] = true
 	if class == platformTransportBudgetH1 {
@@ -193,7 +385,6 @@ func (self *PlatformTransportBudget) registerWithPriority(
 			self.pendingH1SlotCount += 1
 		}
 	}
-	self.notifyChangedLocked()
 	return reservation
 }
 
@@ -222,7 +413,7 @@ func (self *platformTransportBudgetReservation) higherPriorityPendingH3Locked() 
 
 // pendingH1CapacityLocked returns only the pending H1 capacity that could fit
 // alongside the already-counted transports. A slot-using H1 claim beyond the
-// aggregate socket cap cannot acquire until one of those transports leaves, so
+// aggregate carrier-slot cap cannot acquire until one of those transports leaves, so
 // reserving its bytes and slot against a slotless Auto-H3 claim creates a false
 // dependency: H1 -> Auto policy migration fills the cap with the old and new
 // H1 carriers, then H3 waits for a pending H1 that is itself unable to start.
@@ -278,11 +469,11 @@ func (self *platformTransportBudgetReservation) requiredCapacityLocked() (
 	if self.usesSlot {
 		transportCount += 1
 	}
-	if self.class == platformTransportBudgetH3Auto {
+	if self.class == platformTransportBudgetH3Auto || self.class == platformTransportBudgetExtender {
 		// H1 claims are registered at construction, before any carrier goroutine
 		// runs. Preserve the pending claims that can structurally fit alongside
 		// this claim, so required H1 remains ahead of optional Auto H3 without
-		// letting claims beyond the socket cap deadlock a slotless H3 migration.
+		// letting claims beyond the carrier-slot cap deadlock a slotless H3 migration.
 		pendingH1ByteCount, pendingH1TransportCount :=
 			self.pendingH1CapacityLocked(transportCount)
 		byteCount += pendingH1ByteCount
@@ -360,8 +551,17 @@ func (self *platformTransportBudgetReservation) canAcquireLocked() bool {
 	return canAcquire
 }
 
+func (self *platformTransportBudgetReservation) canAcquireHierarchyLocked() bool {
+	for claim := self; claim != nil; claim = claim.parent {
+		if !claim.canAcquireLocked() {
+			return false
+		}
+	}
+	return true
+}
+
 // AllowHandoffFrom pairs two replacement reservations when at least one is H1.
-// Multiple pairs may wait, but admission uses at most one pair at a time. This
+// Multiple pairs may wait, but each limit lends to at most one pair at a time. This
 // method never releases the old reservation; the migration owner closes it
 // only after the replacement has authenticated and published its routes.
 func (self *platformTransportBudgetReservation) AllowHandoffFrom(
@@ -372,9 +572,27 @@ func (self *platformTransportBudgetReservation) AllowHandoffFrom(
 		return false
 	}
 	budget := self.budget
-	budget.mutex.Lock()
-	defer budget.mutex.Unlock()
+	budget.root.mutex.Lock()
+	defer budget.root.mutex.Unlock()
 
+	// Pair every level before publishing any of them. Root admission must be
+	// able to discount exactly the same previous carrier as device admission.
+	for next, old := self, previous; next != nil; next, old = next.parent, old.parent {
+		if !next.canHandoffFromLocked(old) {
+			return false
+		}
+	}
+	for next, old := self, previous; next != nil; next, old = next.parent, old.parent {
+		next.handoffFrom = old
+		old.handoffTo = next
+	}
+	budget.notifyChangedLocked()
+	return true
+}
+
+func (self *platformTransportBudgetReservation) canHandoffFromLocked(
+	previous *platformTransportBudgetReservation,
+) bool {
 	if self.closed || self.acquired || !self.pending ||
 		previous.closed || !previous.acquired ||
 		(self.class != platformTransportBudgetH1 &&
@@ -387,9 +605,6 @@ func (self *platformTransportBudgetReservation) AllowHandoffFrom(
 	if previous.handoffTo != nil && previous.handoffTo != self {
 		return false
 	}
-	self.handoffFrom = previous
-	previous.handoffTo = self
-	budget.notifyChangedLocked()
 	return true
 }
 
@@ -440,6 +655,35 @@ func (self *platformTransportBudgetReservation) canPreemptLocked(
 // leases as can satisfy this claim's current byte/slot deficit. The lease
 // owner tears down its H3 sockets before yielding the accounting reservation.
 func (self *platformTransportBudgetReservation) requestPreemptionLocked() {
+	planned := map[*platformTransportBudgetReservation]bool{}
+	for claim := self; claim != nil; claim = claim.parent {
+		victims, sufficient := claim.preemptionPlanLocked(planned)
+		// A required H1 path must be possible at every level before tearing
+		// down any optional carrier. Otherwise a resolvable child byte limit
+		// could trigger preemption despite an unresolvable root carrier-slot cap,
+		// or root pressure could revoke a sibling for a locally blocked H1.
+		if self.class == platformTransportBudgetH1 && !sufficient {
+			return
+		}
+		for _, victim := range victims {
+			planned[victim.owner] = true
+		}
+	}
+	for victim := range planned {
+		// Any level may revoke a lease, but its socket owner receives exactly
+		// one signal. Mark every copy before closing the shared channel so a
+		// second deficit cannot preempt the same carrier again.
+		for claim := victim; claim != nil; claim = claim.parent {
+			claim.preemptRequested = true
+			claim.budget.preemptedH3Count += 1
+		}
+		close(victim.preempt)
+	}
+}
+
+func (self *platformTransportBudgetReservation) preemptionPlanLocked(
+	planned map[*platformTransportBudgetReservation]bool,
+) ([]*platformTransportBudgetReservation, bool) {
 	budget := self.budget
 	requiredBytes, requiredTransports := self.requiredCapacityLocked()
 	if handoffBytes, handoffTransports, ok := self.handoffCapacityLocked(); ok {
@@ -455,11 +699,21 @@ func (self *platformTransportBudgetReservation) requestPreemptionLocked() {
 		transportDeficit = max(0, requiredTransports-budget.maxTransportCount)
 	}
 	if byteDeficit == 0 && transportDeficit == 0 {
-		return
+		return nil, true
 	}
 
 	victims := []*platformTransportBudgetReservation{}
 	for candidate := range budget.reservations {
+		if candidate.acquired && (candidate.preemptRequested || planned[candidate.owner]) {
+			// A lower level or another waiter already requested this carrier's
+			// teardown. Its still-live bytes remain charged, but the same
+			// deficit must not revoke a second carrier while it drains.
+			byteDeficit -= candidate.byteCount
+			if candidate.usesSlot {
+				transportDeficit -= 1
+			}
+			continue
+		}
 		if self.canPreemptLocked(candidate) {
 			victims = append(victims, candidate)
 		}
@@ -493,23 +747,10 @@ func (self *platformTransportBudgetReservation) requestPreemptionLocked() {
 			transportDeficit -= 1
 		}
 	}
-	// Do not tear down a useful carrier for an H1 claim unless the complete
-	// selected set can make that claim admissible. In particular, a slotless
-	// Auto-H3 carrier can resolve a byte deficit but cannot resolve a simultaneous
-	// transport-count deficit. Partially preempting it lets it reacquire
-	// immediately, causing an endless yield/reacquire cycle while an over-cap H1
-	// claim remains pending. An H3 policy replacement may deliberately drain its
-	// old optional H3 carrier while it waits for an H1 slot to close, so retain
-	// that make-before-break behavior for the H3 classes.
-	if self.class == platformTransportBudgetH1 &&
-		(0 < byteDeficit || 0 < transportDeficit) {
-		return
-	}
-	for _, victim := range selectedVictims {
-		victim.preemptRequested = true
-		close(victim.preempt)
-		budget.preemptedH3Count += 1
-	}
+	// H1 requires a sufficient plan at every level. H3 policy replacements
+	// retain their existing ability to drain an optional H3 carrier while
+	// waiting for a nonpreemptible H1 carrier slot to close.
+	return selectedVictims, byteDeficit <= 0 && transportDeficit <= 0
 }
 
 func (self *platformTransportBudgetReservation) Acquire(ctx context.Context) bool {
@@ -518,50 +759,32 @@ func (self *platformTransportBudgetReservation) Acquire(ctx context.Context) boo
 	}
 	for {
 		budget := self.budget
-		budget.mutex.Lock()
+		budget.root.mutex.Lock()
 		if ctx.Err() != nil {
-			self.releaseLocked()
-			budget.mutex.Unlock()
+			self.releaseHierarchyLocked()
+			budget.root.mutex.Unlock()
 			return false
 		}
 		if self.closed {
-			budget.mutex.Unlock()
+			budget.root.mutex.Unlock()
 			return false
 		}
 		if self.acquired {
-			budget.mutex.Unlock()
+			budget.root.mutex.Unlock()
 			return true
 		}
-		if canAcquire, usesHandoff := self.admissionLocked(); canAcquire {
-			if self.class == platformTransportBudgetH1 && self.pending {
-				budget.pendingH1ByteCount -= self.byteCount
-				if self.usesSlot {
-					budget.pendingH1SlotCount -= 1
-				}
-			}
-			self.pending = false
-			self.acquired = true
-			if usesHandoff {
-				budget.activeHandoff = self
-				budget.handoffAcquisitionCount += 1
-			} else {
-				// Capacity became available without a loan between construction
-				// and admission. Drop the unused pair so another migration is not
-				// needlessly tied to the old carrier.
-				self.clearHandoffLocked()
-			}
-			budget.usedByteCount += self.byteCount
-			budget.reservedByteCount += self.byteCount
-			if self.usesSlot {
-				budget.usedTransportCount += 1
+		if self.canAcquireHierarchyLocked() {
+			for claim := self; claim != nil; claim = claim.parent {
+				_, usesHandoff := claim.admissionLocked()
+				claim.acquireLocked(usesHandoff)
 			}
 			budget.notifyChangedLocked()
-			budget.mutex.Unlock()
+			budget.root.mutex.Unlock()
 			return true
 		}
 		self.requestPreemptionLocked()
-		notify := budget.notify
-		budget.mutex.Unlock()
+		notify := budget.root.notify
+		budget.root.mutex.Unlock()
 
 		select {
 		case <-ctx.Done():
@@ -569,6 +792,59 @@ func (self *platformTransportBudgetReservation) Acquire(ctx context.Context) boo
 			return false
 		case <-notify:
 		}
+	}
+}
+
+// TryAcquire admits without waiting, preemption, or a handoff overdraft. An
+// extender dial already has an inner carrier reservation, so waiting for more
+// capacity here could wait on that same caller forever. A failed attempt is
+// left registered until its owner releases it.
+func (self *platformTransportBudgetReservation) TryAcquire() bool {
+	if self == nil {
+		return true
+	}
+	budget := self.budget
+	budget.root.mutex.Lock()
+	defer budget.root.mutex.Unlock()
+	if self.closed {
+		return false
+	}
+	if self.acquired {
+		return true
+	}
+	for claim := self; claim != nil; claim = claim.parent {
+		byteCount, transportCount := claim.requiredCapacityLocked()
+		if !claim.capacityFitsLocked(byteCount, transportCount) {
+			return false
+		}
+	}
+	for claim := self; claim != nil; claim = claim.parent {
+		claim.acquireLocked(false)
+	}
+	budget.notifyChangedLocked()
+	return true
+}
+
+func (self *platformTransportBudgetReservation) acquireLocked(usesHandoff bool) {
+	budget := self.budget
+	if self.class == platformTransportBudgetH1 && self.pending {
+		budget.pendingH1ByteCount -= self.byteCount
+		if self.usesSlot {
+			budget.pendingH1SlotCount -= 1
+		}
+	}
+	self.pending = false
+	self.acquired = true
+	if usesHandoff {
+		budget.activeHandoff = self
+		budget.handoffAcquisitionCount += 1
+	} else {
+		self.clearHandoffLocked()
+	}
+	budget.usedByteCount += self.byteCount
+	budget.reservedByteCount += self.byteCount
+	if self.usesSlot {
+		budget.usedTransportCount += 1
 	}
 }
 
@@ -581,12 +857,12 @@ func (self *platformTransportBudgetReservation) IsWaiting() bool {
 		return false
 	}
 	budget := self.budget
-	budget.mutex.Lock()
-	defer budget.mutex.Unlock()
+	budget.root.mutex.Lock()
+	defer budget.root.mutex.Unlock()
 	if self.closed || self.acquired || !self.pending {
 		return false
 	}
-	return !self.canAcquireLocked()
+	return !self.canAcquireHierarchyLocked()
 }
 
 // PreemptNotify closes when a higher-precedence claim needs this acquired,
@@ -596,8 +872,8 @@ func (self *platformTransportBudgetReservation) PreemptNotify() <-chan struct{} 
 		return nil
 	}
 	budget := self.budget
-	budget.mutex.Lock()
-	defer budget.mutex.Unlock()
+	budget.root.mutex.Lock()
+	defer budget.root.mutex.Unlock()
 	return self.preempt
 }
 
@@ -609,25 +885,28 @@ func (self *platformTransportBudgetReservation) Yield() bool {
 		return false
 	}
 	budget := self.budget
-	budget.mutex.Lock()
-	defer budget.mutex.Unlock()
+	budget.root.mutex.Lock()
+	defer budget.root.mutex.Unlock()
 	if self.closed || !self.acquired || self.class != platformTransportBudgetH3Auto {
 		return false
 	}
 	// Yield can occur while this optional Auto-H3 reservation is either side
 	// of a policy handoff. Returning its capacity must also return the loan;
 	// otherwise activeHandoff could remain pinned to a no-longer-acquired pair.
-	self.clearHandoffToLocked()
-	self.clearHandoffLocked()
-	budget.usedByteCount -= self.byteCount
-	budget.releasedByteCount += self.byteCount
-	if self.usesSlot {
-		budget.usedTransportCount -= 1
+	preempt := make(chan struct{})
+	for claim := self; claim != nil; claim = claim.parent {
+		claim.clearHandoffToLocked()
+		claim.clearHandoffLocked()
+		claim.budget.usedByteCount -= claim.byteCount
+		claim.budget.releasedByteCount += claim.byteCount
+		if claim.usesSlot {
+			claim.budget.usedTransportCount -= 1
+		}
+		claim.acquired = false
+		claim.pending = true
+		claim.preemptRequested = false
+		claim.preempt = preempt
 	}
-	self.acquired = false
-	self.pending = true
-	self.preemptRequested = false
-	self.preempt = make(chan struct{})
 	budget.notifyChangedLocked()
 	return true
 }
@@ -638,9 +917,19 @@ func (self *platformTransportBudgetReservation) Release() {
 		return
 	}
 	budget := self.budget
-	budget.mutex.Lock()
-	defer budget.mutex.Unlock()
-	self.releaseLocked()
+	budget.root.mutex.Lock()
+	defer budget.root.mutex.Unlock()
+	self.releaseHierarchyLocked()
+}
+
+func (self *platformTransportBudgetReservation) releaseHierarchyLocked() {
+	if self.closed {
+		return
+	}
+	for claim := self; claim != nil; claim = claim.parent {
+		claim.releaseLocked()
+	}
+	self.budget.notifyChangedLocked()
 }
 
 func (self *platformTransportBudgetReservation) releaseLocked() {
@@ -669,5 +958,4 @@ func (self *platformTransportBudgetReservation) releaseLocked() {
 	self.pending = false
 	self.acquired = false
 	delete(budget.reservations, self)
-	budget.notifyChangedLocked()
 }

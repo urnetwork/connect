@@ -586,8 +586,9 @@ type PlatformTransportSettings struct {
 
 	PtDnsSlowMultiple int
 
-	// H3PacketConnFactory, when set, creates the UDP endpoint for a plain H3
-	// dial. Tests use it to place QUIC below a userspace network model, while
+	// H3PacketConnFactory, when set, creates the raw UDP endpoint for any H3
+	// mode; DNS modes then apply their admitted packet translation. Tests use
+	// it to place QUIC below a userspace network model, while
 	// headless multi-provider hosts use it to preserve distinct source
 	// identities. Nil retains the host UDP socket and physical-egress binding
 	// path. The platform transport owns and closes every returned endpoint.
@@ -638,6 +639,9 @@ type PlatformTransportSettings struct {
 	// Nil outside package tests. Replaces plain-H3 name resolution so the
 	// family race can be driven against chosen addresses.
 	resolveH3AddrsForTest func(ctx context.Context, address string, ipFamily int) ([]*net.UDPAddr, error)
+	// The constrained mobile policy composes receive, send, socket, and queue
+	// ownership inside one carrier claim. H1 keeps its independent queue depth.
+	h3RetainedByteAccounting bool
 }
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
@@ -645,7 +649,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 	if err != nil {
 		panic(err)
 	}
-	return &PlatformTransportSettings{
+	settings := &PlatformTransportSettings{
 		HttpConnectTimeout:        15 * time.Second,
 		WsHandshakeTimeout:        15 * time.Second,
 		QuicConnectTimeout:        15 * time.Second,
@@ -690,6 +694,8 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		H3DatagramSettings:                        DefaultH3DatagramSettings(),
 		H3QuicPacketStats:                         &H3QuicPacketStats{},
 	}
+	applyPlatformH3MemoryPolicy(settings, MemoryBudget())
+	return settings
 }
 
 // DefaultPlatformTransportSettingsWithMemoryTarget returns platform carrier
@@ -726,6 +732,11 @@ func DefaultPlatformTransportSettingsWithMemoryTarget(
 		h3MaxStreamReceiveWindowByteCountForMemoryTarget(memoryTargetByteCount)
 	settings.H3MaxConnectionReceiveWindowByteCount =
 		h3MaxConnectionReceiveWindowByteCountForMemoryTarget(memoryTargetByteCount)
+	// DefaultPlatformTransportSettings may already have applied a constrained
+	// process policy. Initial credit belongs to the explicit owner too: reset
+	// the base values before applying that owner's policy below.
+	settings.H3InitialStreamReceiveWindowByteCount = kib(256)
+	settings.H3InitialConnectionReceiveWindowByteCount = kib(512)
 	if settings.H3DatagramSettings != nil {
 		settings.H3DatagramSettings.ProcessReassemblyByteCount = int64(
 			MemoryTargetScaledByteCount(
@@ -735,29 +746,25 @@ func DefaultPlatformTransportSettingsWithMemoryTarget(
 			),
 		)
 	}
+	applyPlatformH3MemoryPolicy(settings, memoryTargetByteCount)
 	return settings
 }
 
-// The fraction of the memory budget the H3 carrier draws, and the fractions of
-// that draw its stream and connection receive windows take.
+// The base H3 draw and receive-window fractions. The unbudgeted/server policy
+// retains these historical values. Finite targets through 32 MiB additionally
+// applyPlatformH3MemoryPolicy: receive credit and retained send/socket/queue
+// ownership are additive, so the base draw is not the whole mobile ledger.
 //
-// One eighth, which is 8 MiB at the 64 MiB reference: exactly what the carrier
-// reserved there before this was a draw, so the reservation moves on no host.
+// One eighth is 8 MiB at the 64 MiB reference.
 // The stream window takes six eighths of that draw and the connection window
 // the whole of it, keeping the 3:4 ratio the two have always had.
 //
-// The windows' fractions are §43.2's landing, the third of the download path's
-// four ceilings and the only one that is a row of §44's share table rather than
-// a new constant. What they replace is three eighths and four eighths, under
-// which the carrier's reservation was half idle by construction: a QUIC
-// connection may hold at most its connection receive window, so a reservation
-// of twice that was memory claimed against the aggregate that no connection
-// could ever occupy. The connection window at the whole draw is the tight form
-// of §44.2's second constraint -- what can be occupied at once is exactly what
-// was reserved -- and the stream window at three quarters keeps a stream under
-// the connection that carries it. That is a 6 MiB stream window at the 64 MiB
-// reference against 3, 1.875 MiB at a 20 MiB device target against 960 KiB,
-// and 24 MiB at 256 against 12: §43.2's 830 Mb/s at 200 ms against 415.
+// These are THROUGHPUTFIX §43.2's receive-credit fractions. Its old assertion
+// that connection credit must equal the entire reservation did not account
+// for concurrently retained non-receive owners. MEMSTEADY supersedes that
+// assertion on the constrained mobile surface: at a 20 MiB owner target the
+// 3 MiB claim covers 1472 KiB connection credit plus 1600 KiB of fixed owners,
+// with 1104 KiB of stream credit. Larger/server targets keep the base formula.
 //
 // Each window keeps its own floor rather than inheriting the reservation's, so
 // the raise reaches no small host (§44.2's third constraint, and the floor case
@@ -801,12 +808,11 @@ func h3BudgetShareByteCount(memoryTargetByteCount ByteCount) ByteCount {
 	return memoryTargetByteCount / h3BudgetShareDivisor
 }
 
-// h3BudgetByteCountForMemoryTarget is the carrier's reservation against the
+// h3BudgetByteCountForMemoryTarget is the base reservation against the
 // aggregate transport budget: the draw, floored at the working minimum that
 // lets one explicitly selected H3 carrier fit the smallest supported host (see
-// `newDefaultPlatformTransportBudget`). The draw is an eighth against that
-// aggregate's quarter, so one carrier's reservation stays under the aggregate
-// at every budget, which is the relationship it has at the reference today.
+// `newDefaultPlatformTransportBudget`). applyPlatformH3MemoryPolicy composes
+// the additional mobile owners before the settings are returned to a caller.
 func h3BudgetByteCountForMemoryTarget(memoryTargetByteCount ByteCount) ByteCount {
 	share := h3BudgetShareByteCount(memoryTargetByteCount)
 	if share <= 0 {
@@ -832,10 +838,9 @@ func defaultH3BudgetByteCount() ByteCount {
 // constant it replaced at and below the reference -- three eighths of `M/8` is
 // `3M/64`, which is `MemoryScaledByteCount(mib(3), kib(384))` exactly -- and
 // the change was inert on every shipped device, all of whose targets are below
-// the reference (§48.2). At six eighths the window is twice that constant at
-// every budget above its floor, which is the point: the landing has to reach
-// the 20 and 24 MiB targets that ship, not only the 256 MiB budget the reach
-// arithmetic is computed at.
+// the reference (§48.2). At six eighths the base window is twice that constant
+// above its floor. Constrained mobile constructors then apply the composed
+// ownership ledger; these helpers alone are not their final advertised credit.
 func h3MaxStreamReceiveWindowByteCountForMemoryTarget(
 	memoryTargetByteCount ByteCount,
 ) ByteCount {
@@ -1007,7 +1012,7 @@ func newPlatformQuicConfig(
 		// of the application writer, which can legitimately wait behind
 		// quic-go's bounded DATAGRAM queue on a constrained uplink.
 		KeepAlivePeriod:   settings.PingTimeout,
-		Allow0RTT:         true,
+		Allow0RTT:         !settings.h3RetainedByteAccounting,
 		InitialPacketSize: H3InitialPacketByteCount,
 		// Pin the receive windows and stream counts. The platform transport
 		// uses one bidirectional stream; the stream counts bound abuse.
@@ -2752,8 +2757,9 @@ func (self *PlatformTransport) runH3(
 		type ConnStream struct {
 			conn           *quic.Conn
 			stream         *quic.Stream
-			packetConn     net.PacketConn
-			quicTransport  *quic.Transport
+			streamWriter   h3StreamWriter
+			sendDatagram   func([]byte) error
+			attempt        *h3DialAttempt
 			useH3Datagrams bool
 		}
 
@@ -2804,6 +2810,14 @@ func (self *PlatformTransport) runH3(
 			var attempt *h3DialAttempt
 			if len(candidates) == 1 {
 				attempt, err = self.dialH3(attemptCtx, ptMode, serverName, candidates[0], wrapPacketConn, tlsConfig, quicConfig, slowMultiple, false)
+			} else if self.settings.h3RetainedByteAccounting {
+				budget := self.settings.PlatformTransportBudget
+				if budget == nil {
+					budget = DefaultPlatformTransportBudget()
+				}
+				attempt, err = raceH3DialWithMemory(attemptCtx, candidates, budget, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
+					return self.dialH3(dialCtx, ptMode, serverName, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
+				})
 			} else {
 				attempt, err = raceH3Dial(attemptCtx, candidates, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
 					return self.dialH3(dialCtx, ptMode, serverName, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
@@ -2813,8 +2827,6 @@ func (self *PlatformTransport) runH3(
 				return nil, err
 			}
 			conn := attempt.conn
-			packetConn := attempt.packetConn
-			quicTransport := attempt.quicTransport
 			defer func() {
 				if !success {
 					attempt.close()
@@ -2826,11 +2838,22 @@ func (self *PlatformTransport) runH3(
 				self.log.Infof("[c]h3 open stream err = %s\n", err)
 				return nil, err
 			}
+			var streamWriter h3StreamWriter = stream
+			sendDatagram := conn.SendDatagram
+			if self.settings.h3RetainedByteAccounting {
+				flight := quicSendFlightForConn(conn)
+				if flight == nil {
+					return nil, fmt.Errorf("missing H3 retained-send controller")
+				}
+				flight.bind(conn)
+				streamWriter = flight.newWriter(stream)
+				sendDatagram = func(payload []byte) error { return flight.trySendDatagram(conn.SendDatagram, payload) }
+			}
 
 			framer := NewFramer(self.framerSettings)
 
-			stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.AuthTimeout))
-			if err := framer.Write(stream, authBytes); err != nil {
+			streamWriter.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.AuthTimeout))
+			if err := framer.Write(streamWriter, authBytes); err != nil {
 				return nil, err
 			}
 			stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.AuthTimeout))
@@ -2864,8 +2887,9 @@ func (self *PlatformTransport) runH3(
 			return &ConnStream{
 				conn:           conn,
 				stream:         stream,
-				packetConn:     packetConn,
-				quicTransport:  quicTransport,
+				streamWriter:   streamWriter,
+				sendDatagram:   sendDatagram,
+				attempt:        attempt,
 				useH3Datagrams: useH3Datagrams,
 			}, nil
 		}
@@ -2963,11 +2987,13 @@ func (self *PlatformTransport) runH3(
 
 		conn := connStream.conn
 		stream := connStream.stream
+		streamWriter := connStream.streamWriter
 
 		c := func() {
-			defer connStream.packetConn.Close()
-			defer connStream.quicTransport.Close()
-			defer conn.CloseWithError(0, "")
+			// Keep the complete dial owner through success, including any
+			// pre-socket DNS lease; copying only its socket/QUIC fields would
+			// orphan the translation claim at this lifetime boundary.
+			defer connStream.attempt.close()
 
 			self.setModeAvailable(ptMode, true)
 			defer self.setModeAvailable(ptMode, false)
@@ -3037,18 +3063,18 @@ func (self *PlatformTransport) runH3(
 			maxDatagramByteCount.Store(
 				int64(initialH3DatagramPathByteCount(
 					self.h3DatagramSettings.TargetDatagramByteCount,
-					conn.SendDatagram,
+					connStream.sendDatagram,
 				)),
 			)
 
-			send := make(chan []byte, self.settings.TransportBufferSize)
-			// Stream-only H3 retains its historical bounded burst queue. Hybrid H3
+			send := make(chan []byte, self.h3TransportBufferSize())
+			// Stream-only H3 retains its bounded burst queue. Hybrid H3
 			// gives the existing bounded queue to DATAGRAM while the reliable stream
 			// route is unbuffered: its reader may retain exactly one already-read
 			// frame, so splitting lane metadata cannot double payload retention.
 			reliableReceiveBufferSize, unreliableReceiveBufferSize :=
 				platformH3ReceiveRouteBufferSizes(
-					self.settings.TransportBufferSize,
+					self.h3TransportBufferSize(),
 					connStream.useH3Datagrams,
 				)
 			reliableReceive := make(chan []byte, reliableReceiveBufferSize)
@@ -3159,7 +3185,7 @@ func (self *PlatformTransport) runH3(
 			if connStream.useH3Datagrams {
 				streamQueueMessageCount := min(
 					H3HybridStreamQueueMessageCount,
-					max(1, self.settings.TransportBufferSize),
+					max(1, self.h3TransportBufferSize()),
 				)
 				streamSend = make(chan []byte, streamQueueMessageCount)
 				streamSendBudget = NewH3HybridStreamSendBudget(
@@ -3211,7 +3237,7 @@ func (self *PlatformTransport) runH3(
 					}
 				}
 
-				stream.SetWriteDeadline(
+				streamWriter.SetWriteDeadline(
 					time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout),
 				)
 				if self.settings.beforeH3StreamWriteForTest != nil {
@@ -3221,7 +3247,7 @@ func (self *PlatformTransport) runH3(
 					writeBatchStorage = make([]byte, platformH3WriteBatchMaxByteCount)
 				}
 				err = framer.WriteBatchWithStorage(
-					stream,
+					streamWriter,
 					messages,
 					writeBatchStorage,
 				)
@@ -3247,7 +3273,7 @@ func (self *PlatformTransport) runH3(
 				useStream, nextMaxDatagramByteCount, sendErr = datagramFragmenter.SendHybrid(
 					message,
 					currentMaxDatagramByteCount,
-					conn.SendDatagram,
+					connStream.sendDatagram,
 				)
 				if nextMaxDatagramByteCount != currentMaxDatagramByteCount {
 					maxDatagramByteCount.Store(int64(nextMaxDatagramByteCount))
@@ -3310,8 +3336,8 @@ func (self *PlatformTransport) runH3(
 							}
 							message = nextMessage
 						case <-pingTimer.C:
-							stream.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
-							if err := framer.Write(stream, make([]byte, 0)); err != nil {
+							streamWriter.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
+							if err := framer.Write(streamWriter, make([]byte, 0)); err != nil {
 								return
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)

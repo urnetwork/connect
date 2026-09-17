@@ -25,6 +25,9 @@ type transferItem struct {
 	// the base MessageByteCount charge; sendItem supplies its encoded-frame
 	// override explicitly.
 	queueByteCount ByteCount
+	// Retained mobile owners keep their reservation while temporarily removed
+	// from a queue (retry, ordered delivery, or teardown).
+	memoryBudget   *TransferMemoryBudget
 	sequenceNumber uint64
 
 	// the index of the item in the heap
@@ -97,6 +100,7 @@ type transferQueue[T transferQueueItem] struct {
 	minByteCount      ByteCount
 	borrowedByteCount ByteCount
 	floorRegistered   bool
+	lifetimeBudget    bool
 
 	cmp TransferQueueCmpFunction[T]
 }
@@ -159,6 +163,13 @@ func (self *transferQueue[T]) setBudget(budget *TransferMemoryBudget, minByteCou
 	}
 }
 
+// The item, not its heap membership, owns exact retained admission. Per-flow
+// floors remain a window-sizing policy, never permission to overdraw memory.
+func (self *transferQueue[T]) setLifetimeBudget() {
+	self.setBudget(self.budget, 0)
+	self.lifetimeBudget = true
+}
+
 // LendableByteCount is what this queue's pool would lend it at full demand:
 // the pool less the floors guaranteed to the other queues attached to it. The
 // static permission ceiling, read now rather than frozen when settings were
@@ -186,6 +197,10 @@ func (self *transferQueue[T]) updateByteCountWithLock(
 	self.queueByteCount += deltaQueueByteCount
 	if self.budget != nil {
 		borrowTargetByteCount := max(0, self.queueByteCount-self.minByteCount)
+		if self.lifetimeBudget {
+			self.borrowedByteCount = borrowTargetByteCount
+			return
+		}
 		if borrowTargetByteCount < self.borrowedByteCount {
 			self.budget.Release(self.borrowedByteCount - borrowTargetByteCount)
 			self.borrowedByteCount = borrowTargetByteCount
@@ -220,7 +235,7 @@ func (self *transferQueue[T]) CanAddWithQueueByteCount(
 	defer self.stateLock.Unlock()
 
 	// always allow at least one item
-	if len(self.orderedItems) == 0 {
+	if len(self.orderedItems) == 0 && !self.lifetimeBudget {
 		return true
 	}
 	if maxByteCount <= self.byteCount+byteCount {

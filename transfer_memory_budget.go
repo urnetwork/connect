@@ -10,7 +10,7 @@ import (
 // the aggregate queue memory stays flat as the number of peers grows, while
 // a single fast peer can still borrow a deep queue.
 //
-// Queues reserve the bytes they hold above their guaranteed floor
+// Legacy queues reserve the bytes they hold above their guaranteed floor
 // (`ResendQueueMinByteCount`/`ReceiveQueueMinByteCount`) and release them as
 // items leave (see `transferQueue`). Admission gates on `Available` before a
 // queue grows above its floor, so `Reserve` may transiently overdraft the
@@ -18,8 +18,19 @@ import (
 // headroom. The floor keeps every sequence progressing when the pool is
 // empty, which makes cross-sequence deadlock impossible.
 //
-// All methods are safe for concurrent use.
+// Retained-byte owners instead use TryReserve. A parented budget composes
+// every admitted byte through its ancestors, with one admission/resize lock
+// for the whole tree. Child ceilings may overlap (idle shares can be lent),
+// but their live owners can never collectively overdraw the root.
+//
+// All methods are safe for concurrent use. Parent relationships are immutable.
 type TransferMemoryBudget struct {
+	// Exact admission and role-driven resize share one linearization boundary.
+	// A child uses its root's lock, never a second lock in the hierarchy.
+	admissionLock  sync.Mutex
+	parent         *TransferMemoryBudget
+	root           *TransferMemoryBudget
+	hasChildren    atomic.Bool
 	totalByteCount atomic.Int64
 	usedByteCount  atomic.Int64
 	// The sum of the guaranteed floors of every queue attached to this pool.
@@ -114,6 +125,34 @@ func NewTransferMemoryBudget(totalByteCount ByteCount) *TransferMemoryBudget {
 	return budget
 }
 
+// NewTransferMemoryBudgetWithParent creates an exact-admission child. Its
+// capacity is a ceiling, not an eager reservation: only live ownership is
+// charged to the child and every ancestor. Never reparent an existing pool,
+// because old generations may still own its reservations.
+func NewTransferMemoryBudgetWithParent(totalByteCount ByteCount, parent *TransferMemoryBudget) *TransferMemoryBudget {
+	budget := NewTransferMemoryBudget(totalByteCount)
+	if parent != nil {
+		budget.parent = parent
+		budget.root = parent.admissionRoot()
+		budget.root.admissionLock.Lock()
+		budget.root.hasChildren.Store(true)
+		budget.root.admissionLock.Unlock()
+	}
+	return budget
+}
+
+// Parent returns the immutable admission parent, or nil for a root/legacy pool.
+func (self *TransferMemoryBudget) Parent() *TransferMemoryBudget {
+	return self.parent
+}
+
+func (self *TransferMemoryBudget) admissionRoot() *TransferMemoryBudget {
+	if self.root != nil {
+		return self.root
+	}
+	return self
+}
+
 func (self *TransferMemoryBudget) TotalByteCount() ByteCount {
 	return self.totalByteCount.Load()
 }
@@ -123,7 +162,10 @@ func (self *TransferMemoryBudget) TotalByteCount() ByteCount {
 // not evict reserved bytes; the pool admits nothing new above the new total
 // until enough releases drain it.
 func (self *TransferMemoryBudget) SetTotalByteCount(totalByteCount ByteCount) {
+	root := self.admissionRoot()
+	root.admissionLock.Lock()
 	self.totalByteCount.Store(totalByteCount)
+	root.admissionLock.Unlock()
 	self.notifyCapacityChanged()
 }
 
@@ -153,51 +195,77 @@ func (self *TransferMemoryBudget) LendableByteCount(ownFloorByteCount ByteCount)
 
 // Available is the unreserved remainder of the budget
 func (self *TransferMemoryBudget) Available() ByteCount {
-	return max(0, self.totalByteCount.Load()-self.usedByteCount.Load())
+	available := max(0, self.totalByteCount.Load()-self.usedByteCount.Load())
+	for parent := self.parent; parent != nil; parent = parent.parent {
+		available = min(available, max(0, parent.totalByteCount.Load()-parent.usedByteCount.Load()))
+	}
+	return available
 }
 
 func (self *TransferMemoryBudget) UsedByteCount() ByteCount {
 	return self.usedByteCount.Load()
 }
 
-// Reserve takes bytes from the budget. It always succeeds (see the overdraft
-// note in the type doc); admission gates on `Available`.
+// Reserve preserves legacy standalone queue overdraft semantics. Hierarchies
+// require exact retained admission: callers must use TryReserve and handle
+// refusal before taking ownership. Reserve is permitted there only for an
+// already-proven fitting claim; violating that contract is a programming bug.
 func (self *TransferMemoryBudget) Reserve(byteCount ByteCount) {
+	root := self.admissionRoot()
+	root.admissionLock.Lock()
+	defer root.admissionLock.Unlock()
+	if self.root != nil || self.hasChildren.Load() {
+		if !self.tryReserveWithLock(byteCount) {
+			panic("TransferMemoryBudget.Reserve: exact hierarchy requires TryReserve")
+		}
+		return
+	}
 	self.usedByteCount.Add(byteCount)
 	self.reservedByteCount.Add(byteCount)
 }
 
 // TryReserve atomically reserves byteCount only when it fits within the
-// current total. Transfer queues deliberately use Reserve's bounded overdraft
-// semantics, but fixed-size lifetime owners (notably WebRTC peer connections)
-// need an exact admission ceiling shared across multiple managers.
+// current total. Mobile transfer owners and fixed-size lifetime owners use
+// this exact admission ceiling. Legacy transfer queues retain Reserve's
+// bounded-overdraft semantics until explicitly opting into retained accounting.
 func (self *TransferMemoryBudget) TryReserve(byteCount ByteCount) bool {
+	root := self.admissionRoot()
+	root.admissionLock.Lock()
+	defer root.admissionLock.Unlock()
+	return self.tryReserveWithLock(byteCount)
+}
+
+func (self *TransferMemoryBudget) tryReserveWithLock(byteCount ByteCount) bool {
 	if byteCount < 0 {
 		return false
 	}
-	for {
-		total := self.totalByteCount.Load()
-		used := self.usedByteCount.Load()
+	for budget := self; budget != nil; budget = budget.parent {
+		total := budget.totalByteCount.Load()
+		used := budget.usedByteCount.Load()
 		if total < byteCount || total-byteCount < used {
 			return false
 		}
-		if self.usedByteCount.CompareAndSwap(used, used+byteCount) {
-			self.reservedByteCount.Add(byteCount)
-			return true
-		}
 	}
+	for budget := self; budget != nil; budget = budget.parent {
+		budget.usedByteCount.Add(byteCount)
+		budget.reservedByteCount.Add(byteCount)
+	}
+	return true
 }
 
 // Release returns bytes to the budget
 func (self *TransferMemoryBudget) Release(byteCount ByteCount) {
-	used := self.usedByteCount.Add(-byteCount)
-	self.releasedByteCount.Add(byteCount)
-	if used < 0 {
-		// accounting bug: more released than reserved.
-		// log unconditionally so production sees it (tests see it as a
-		// negative used count breaking the balance assertions)
-		DefaultLogger().Errorf("[tmb]release below zero (%d)", used)
+	root := self.admissionRoot()
+	root.admissionLock.Lock()
+	for budget := self; budget != nil; budget = budget.parent {
+		used := budget.usedByteCount.Add(-byteCount)
+		budget.releasedByteCount.Add(byteCount)
+		if used < 0 {
+			// Keep the accounting error observable rather than masking it.
+			DefaultLogger().Errorf("[tmb]release below zero (%d)", used)
+		}
 	}
+	root.admissionLock.Unlock()
 	self.notifyCapacityChanged()
 }
 
@@ -205,6 +273,7 @@ func (self *TransferMemoryBudget) Release(byteCount ByteCount) {
 // may make admission possible. Capture it before TryReserve to avoid a lost
 // wakeup.
 func (self *TransferMemoryBudget) CapacityNotify() <-chan struct{} {
+	self = self.admissionRoot()
 	var candidate *transferMemoryBudgetNotify
 	for {
 		if notify := self.notify.Load(); notify != nil {
@@ -222,6 +291,10 @@ func (self *TransferMemoryBudget) CapacityNotify() <-chan struct{} {
 }
 
 func (self *TransferMemoryBudget) notifyCapacityChanged() {
+	// Sibling admission can be blocked only by a shared ancestor. Publishing
+	// and waking on the root prevents a release in one child being lost to a
+	// waiting owner in another, including across role/manager generations.
+	self = self.admissionRoot()
 	// Releases are on the packet path and normally have no waiter. Avoid a
 	// read-modify-write on the shared notification cache line in that case.
 	// A subscriber that publishes just after this load performs TryReserve
@@ -238,6 +311,7 @@ func (self *TransferMemoryBudget) notifyCapacityChanged() {
 func (self *TransferMemoryBudget) addCapacityWaiter(
 	waiter *transferMemoryBudgetWaiter,
 ) {
+	self = self.admissionRoot()
 	self.capacityWaitStateLock.Lock()
 	defer self.capacityWaitStateLock.Unlock()
 	if waiter.registered {
@@ -258,6 +332,7 @@ func (self *TransferMemoryBudget) addCapacityWaiter(
 func (self *TransferMemoryBudget) removeCapacityWaiter(
 	waiter *transferMemoryBudgetWaiter,
 ) {
+	self = self.admissionRoot()
 	self.capacityWaitStateLock.Lock()
 	defer self.capacityWaitStateLock.Unlock()
 	self.removeCapacityWaiterWithLock(waiter)
@@ -302,13 +377,24 @@ func (self *TransferMemoryBudget) notifyEligibleCapacityWaiters() {
 
 	self.capacityWaitStateLock.Lock()
 	defer self.capacityWaitStateLock.Unlock()
+	// Only the uncommon intrusive-waiter path needs this scratch map. Track
+	// grants per ancestor as well as at the root so a broad root does not wake
+	// every setup behind a single newly freed child receive window.
+	granted := make(map[*TransferMemoryBudget]ByteCount)
 	for waiter := self.capacityWaitHead; waiter != nil; {
 		nextWaiter := waiter.nextCapacityWaiter
-		if waiter.requiredByteCount <= availableByteCount {
+		eligible := waiter.requiredByteCount <= availableByteCount
+		for budget := waiter.budget; eligible && budget != nil; budget = budget.parent {
+			eligible = waiter.requiredByteCount <= max(0, budget.totalByteCount.Load()-budget.usedByteCount.Load()-granted[budget])
+		}
+		if eligible {
 			self.removeCapacityWaiterWithLock(waiter)
 			select {
 			case waiter.notify <- struct{}{}:
 				availableByteCount -= waiter.requiredByteCount
+				for budget := waiter.budget; budget != nil; budget = budget.parent {
+					granted[budget] += waiter.requiredByteCount
+				}
 			default:
 				// A pending token means this waiter already has a grant. Do
 				// not charge it twice; continue looking for another waiter.
@@ -324,4 +410,50 @@ func (self *TransferMemoryBudget) notifyEligibleCapacityWaiters() {
 // build/load/teardown cycle attributes a lost release.
 func (self *TransferMemoryBudget) Counts() (reservedByteCount ByteCount, releasedByteCount ByteCount) {
 	return self.reservedByteCount.Load(), self.releasedByteCount.Load()
+}
+
+// TransferMemoryBudgetStats is one coherent exact-admission sample. Root
+// counters already include descendants; never sum them with child counters.
+type TransferMemoryBudgetStats struct {
+	TotalByteCount    ByteCount
+	UsedByteCount     ByteCount
+	ReservedByteCount ByteCount
+	ReleasedByteCount ByteCount
+}
+
+func (self *TransferMemoryBudget) Stats() TransferMemoryBudgetStats {
+	root := self.admissionRoot()
+	root.admissionLock.Lock()
+	defer root.admissionLock.Unlock()
+	return self.statsWithLock()
+}
+
+// StatsWithDescendants samples this budget followed by the requested
+// descendants under one admission lock. The fixed-size SDK diagnostic call
+// uses this to compare role groups without inventing overlap between samples.
+// Every requested budget must belong to this admission tree.
+func (self *TransferMemoryBudget) StatsWithDescendants(descendants ...*TransferMemoryBudget) []TransferMemoryBudgetStats {
+	root := self.admissionRoot()
+	for _, budget := range descendants {
+		if budget == nil || budget.admissionRoot() != root {
+			panic("TransferMemoryBudget.StatsWithDescendants: unrelated budget")
+		}
+	}
+	stats := make([]TransferMemoryBudgetStats, 1+len(descendants))
+	root.admissionLock.Lock()
+	defer root.admissionLock.Unlock()
+	stats[0] = self.statsWithLock()
+	for i, budget := range descendants {
+		stats[i+1] = budget.statsWithLock()
+	}
+	return stats
+}
+
+func (self *TransferMemoryBudget) statsWithLock() TransferMemoryBudgetStats {
+	return TransferMemoryBudgetStats{
+		TotalByteCount:    self.totalByteCount.Load(),
+		UsedByteCount:     self.usedByteCount.Load(),
+		ReservedByteCount: self.reservedByteCount.Load(),
+		ReleasedByteCount: self.releasedByteCount.Load(),
+	}
 }

@@ -128,7 +128,7 @@ func (self *smtpEgressGuard) retireForOwner(ownerId Id, ipPath *IpPath) {
 		return
 	}
 	self.stateLock.Lock()
-	delete(self.flows, key)
+	self.deleteFlowWithLock(key)
 	self.stateLock.Unlock()
 }
 
@@ -152,7 +152,7 @@ func (self *smtpEgressGuard) retireOwner(ownerId Id) {
 	defer self.stateLock.Unlock()
 	for key := range self.flows {
 		if key.ownerId == ownerId {
-			delete(self.flows, key)
+			self.deleteFlowWithLock(key)
 		}
 	}
 }
@@ -165,6 +165,8 @@ const (
 )
 
 type smtpFlowState struct {
+	memory          natMemoryReservation
+	tlsScratch      *smtpTlsScratch
 	destinationPort int
 
 	synSeen bool
@@ -182,6 +184,14 @@ type smtpFlowState struct {
 	lastUsedTime time.Time
 }
 
+// A finite-profile flow owns TLS scratch on the heap for its whole charged
+// lifetime. Keeping the 8-KiB bitset here avoids permanently growing arbitrary
+// caller goroutine stacks after their short-lived packet admission is released.
+type smtpTlsScratch struct {
+	handshake      []byte
+	extensionTypes [1024]uint64
+}
+
 // smtpEgressGuard keeps only the bounded, pre-encryption prefix of each SMTP
 // flow. Once TLS is identified the prefix is discarded and all later sequence
 // space stays opaque. A fresh SYN replaces the marker on tuple reuse, while
@@ -191,6 +201,7 @@ type smtpFlowState struct {
 // and a single SMTP stream's packets are ordered through the lock. The map and
 // every field have useful zero values, which keeps fixture-built clients safe.
 type smtpEgressGuard struct {
+	memoryBudget     *TransferMemoryBudget
 	stateLock        sync.Mutex
 	flows            map[smtpFlowKey]*smtpFlowState
 	clock            uint64
@@ -239,13 +250,13 @@ func (self *smtpEgressGuard) inspectForOwnerResult(
 	now := self.currentTimeWithLock()
 	self.reapIdleFlowsWithLock(now)
 	if ipPath.Rst {
-		delete(self.flows, key)
+		self.deleteFlowWithLock(key)
 		return smtpEgressInspection{verdict: smtpEgressAllow}
 	}
 	if ipPath.Fin {
 		// A FIN may carry the last payload bytes, so inspect it before retiring
 		// the tuple. A retransmitted FIN also leaves no empty replacement state.
-		defer delete(self.flows, key)
+		defer self.deleteFlowWithLock(key)
 	}
 
 	flow := self.flows[key]
@@ -327,7 +338,7 @@ func (self *smtpEgressGuard) reapIdleFlowsWithLock(now time.Time) {
 	for key, flow := range self.flows {
 		if !flow.lastUsedTime.IsZero() &&
 			!now.Before(flow.lastUsedTime.Add(smtpFlowIdleTimeout)) {
-			delete(self.flows, key)
+			self.deleteFlowWithLock(key)
 		}
 	}
 	self.nextIdleReapTime = now.Add(smtpFlowIdleReapInterval)
@@ -361,12 +372,39 @@ func (self *smtpEgressGuard) newFlowWithLock(
 	if !replacing && smtpMaxFlowCount <= len(self.flows) {
 		return nil, false
 	}
+	memory, admitted := reserveNatMemory(self.memoryBudget, natSmtpFlowBytes)
+	if !admitted {
+		return nil, false
+	}
 	flow := &smtpFlowState{
+		memory:          memory,
 		destinationPort: destinationPort,
 		lastUsedTime:    now,
 	}
+	if memory.budget != nil {
+		flow.tlsScratch = &smtpTlsScratch{handshake: make([]byte, 0, smtpMaxTlsClientHelloWireBytes)}
+	}
+	self.deleteFlowWithLock(key)
 	self.flows[key] = flow
 	return flow, true
+}
+
+func (self *smtpEgressGuard) deleteFlowWithLock(key smtpFlowKey) {
+	if flow := self.flows[key]; flow != nil {
+		delete(self.flows, key)
+		flow.stream = nil
+		flow.tlsScratch = nil
+		flow.memory.release()
+	}
+}
+
+func (self *smtpEgressGuard) close() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	for key := range self.flows {
+		self.deleteFlowWithLock(key)
+	}
+	self.flows = nil
 }
 
 func (self *smtpFlowState) inspectPayload(sequence uint32, payload []byte) bool {
@@ -407,12 +445,19 @@ func (self *smtpFlowState) inspectPayload(sequence uint32, payload []byte) bool 
 	if remainingCapacity < len(retainedBytes) {
 		retainedBytes = retainedBytes[:remainingCapacity]
 	}
+	if self.memory.budget != nil && len(self.stream)+len(retainedBytes) > cap(self.stream) {
+		// The flow prepaid one complete prefix and parse scratch. Allocate the
+		// bounded prefix once, avoiding geometric old/new backing overlap.
+		stream := make([]byte, len(self.stream), limit)
+		copy(stream, self.stream)
+		self.stream = stream
+	}
 	self.stream = append(self.stream, retainedBytes...)
 
 	var valid bool
 	switch self.destinationPort {
 	case smtpImplicitTlsPort:
-		valid, self.secure = tlsClientHelloStream(self.stream)
+		valid, self.secure = tlsClientHelloStreamWithScratch(self.stream, self.tlsScratch)
 	case smtpStartTlsPort:
 		valid, self.secure = self.inspect587Stream()
 	default:
@@ -460,6 +505,11 @@ func tlsHandshakeRecordHeaderPrefix(header []byte) bool {
 // validTlsClientHelloBody validates every length-delimited field in a complete
 // ClientHello, including the extension vector and duplicate-extension rule.
 func validTlsClientHelloBody(body []byte) bool {
+	var extensionTypes [1024]uint64
+	return validTlsClientHelloBodyWithScratch(body, &extensionTypes)
+}
+
+func validTlsClientHelloBodyWithScratch(body []byte, extensionTypes *[1024]uint64) bool {
 	if len(body) < 41 || body[0] != 0x03 || body[1] < 0x01 || 0x03 < body[1] {
 		return false
 	}
@@ -493,7 +543,9 @@ func validTlsClientHelloBody(body []byte) bool {
 	if extensionBytes != len(body)-offset {
 		return false
 	}
-	extensionTypes := map[uint16]bool{}
+	// All extension types fit this exact 8-KiB bitset. An attacker can send
+	// thousands of zero-length extensions; a map scales with that count.
+	clear(extensionTypes[:])
 	for offset < len(body) {
 		if len(body) < offset+4 {
 			return false
@@ -501,10 +553,11 @@ func validTlsClientHelloBody(body []byte) bool {
 		extensionType := binary.BigEndian.Uint16(body[offset : offset+2])
 		extensionDataBytes := int(binary.BigEndian.Uint16(body[offset+2 : offset+4]))
 		offset += 4
-		if extensionTypes[extensionType] || len(body) < offset+extensionDataBytes {
+		word, bit := extensionType/64, uint64(1)<<(extensionType%64)
+		if extensionTypes[word]&bit != 0 || len(body) < offset+extensionDataBytes {
 			return false
 		}
-		extensionTypes[extensionType] = true
+		extensionTypes[word] |= bit
 		offset += extensionDataBytes
 	}
 	return true
@@ -514,10 +567,19 @@ func validTlsClientHelloBody(body []byte) bool {
 // structurally valid ClientHello has arrived. Handshake bytes may span records;
 // both logical and wire sizes are bounded before the flow can become secure.
 func tlsClientHelloStream(stream []byte) (valid bool, complete bool) {
+	return tlsClientHelloStreamWithScratch(stream, nil)
+}
+
+func tlsClientHelloStreamWithScratch(stream []byte, scratch *smtpTlsScratch) (valid bool, complete bool) {
 	if smtpMaxTlsClientHelloWireBytes < len(stream) {
 		return false, false
 	}
-	handshake := make([]byte, 0, min(len(stream), smtpMaxTlsClientHelloBodyBytes+smtpTlsHandshakeHeaderBytes))
+	var handshake []byte
+	if scratch != nil {
+		handshake = scratch.handshake[:0]
+	} else {
+		handshake = make([]byte, 0, len(stream))
+	}
 	for recordOffset := 0; ; {
 		remaining := stream[recordOffset:]
 		if len(remaining) < smtpTlsRecordHeaderBytes {
@@ -560,7 +622,14 @@ func tlsClientHelloStream(stream []byte) (valid bool, complete bool) {
 			}
 			handshakeEnd := smtpTlsHandshakeHeaderBytes + handshakeBodyBytes
 			if handshakeEnd <= len(handshake) {
-				if !validTlsClientHelloBody(handshake[smtpTlsHandshakeHeaderBytes:handshakeEnd]) {
+				body := handshake[smtpTlsHandshakeHeaderBytes:handshakeEnd]
+				var valid bool
+				if scratch != nil {
+					valid = validTlsClientHelloBodyWithScratch(body, &scratch.extensionTypes)
+				} else {
+					valid = validTlsClientHelloBody(body)
+				}
+				if !valid {
 					return false, false
 				}
 				return true, true
@@ -576,7 +645,7 @@ func tlsClientHelloStream(stream []byte) (valid bool, complete bool) {
 func (self *smtpFlowState) inspect587Stream() (valid bool, secure bool) {
 	for {
 		if self.phase587 == smtp587ExpectClientHello {
-			return tlsClientHelloStream(self.stream[self.parseOffset:])
+			return tlsClientHelloStreamWithScratch(self.stream[self.parseOffset:], self.tlsScratch)
 		}
 		if self.parseOffset == len(self.stream) {
 			return true, false

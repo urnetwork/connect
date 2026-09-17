@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -105,6 +106,7 @@ type icmpEgress interface {
 }
 
 type IcmpBufferSettings struct {
+	MemoryBudget *TransferMemoryBudget
 	// nil resolves to the local user nat `Log`
 	Log          Logger
 	ReadTimeout  time.Duration
@@ -385,12 +387,6 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 			}
 		}
 
-		sourceIpCopy := make(net.IP, len(icmp.sourceIp))
-		copy(sourceIpCopy, icmp.sourceIp)
-
-		destinationIpCopy := make(net.IP, len(icmp.destinationIp))
-		copy(destinationIpCopy, icmp.destinationIp)
-
 		sequence = newIcmpSequenceWithTransferKey(
 			self.ctx,
 			self.receiveCallback,
@@ -398,12 +394,17 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 			transferKey,
 			provideMode,
 			ipVersion,
-			sourceIpCopy,
+			icmp.sourceIp,
 			icmp.identifier,
-			destinationIpCopy,
+			icmp.destinationIp,
 			self.icmpBufferSettings,
 		)
+		if sequence == nil {
+			return nil
+		}
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
+		flowMemory := sequence.memory
+		sequence.memory = natMemoryReservation{}
 		self.sequences[bufferId] = sequence
 		sourceSequences := self.sourceSequences[source]
 		if sourceSequences == nil {
@@ -415,6 +416,7 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		go HandleError(func() {
 			defer self.sequenceWaitGroup.Done()
 			defer close(sequence.retirementDone)
+			defer flowMemory.release()
 			defer func() {
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
@@ -434,7 +436,18 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		return sequence
 	}
 
+	memory, admitted := reserveNatMemory(self.icmpBufferSettings.MemoryBudget, natPacketMemoryByteCount(ipPacket))
+	if !admitted {
+		return false, nil
+	}
+	accepted := false
+	defer func() {
+		if !accepted {
+			memory.release()
+		}
+	}()
 	sendItem := &IcmpSendItem{
+		memory:      memory,
 		source:      source,
 		transferKey: transferKey,
 		provideMode: provideMode,
@@ -446,6 +459,7 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		return false, nil
 	}
 	if success, err := sequence.send(sendItem, timeout); err == nil {
+		accepted = success
 		return success, nil
 	} else {
 		// sequence closed
@@ -453,7 +467,9 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		if sequence == nil {
 			return false, nil
 		}
-		return sequence.send(sendItem, timeout)
+		var err error
+		accepted, err = sequence.send(sendItem, timeout)
+		return accepted, err
 	}
 }
 
@@ -504,6 +520,7 @@ func (self *IcmpBuffer[BufferId]) setSourceRetired(
 }
 
 type IcmpSendItem struct {
+	memory      natMemoryReservation
 	source      TransferPath
 	transferKey TransferKey
 	provideMode protocol.ProvideMode
@@ -516,6 +533,7 @@ type IcmpSendItem struct {
 // identifier restored. transfer to this sequence is lossless and in order;
 // the backend is datagram best-effort like the network itself.
 type IcmpSequence struct {
+	memory                         natMemoryReservation
 	ctx                            context.Context
 	cancel                         context.CancelFunc
 	log                            Logger
@@ -586,9 +604,16 @@ func newIcmpSequenceWithTransferKey(
 	destinationIp net.IP,
 	icmpBufferSettings *IcmpBufferSettings,
 ) *IcmpSequence {
+	memory, admitted := reserveNatMemory(icmpBufferSettings.MemoryBudget, natIcmpFlowMemoryByteCount(icmpBufferSettings))
+	if !admitted {
+		return nil
+	}
+	sourceIp = slices.Clone(sourceIp)
+	destinationIp = slices.Clone(destinationIp)
 	source = source.LocalMask()
 	cancelCtx, cancel := context.WithCancel(ctx)
 	return &IcmpSequence{
+		memory:             memory,
 		ctx:                cancelCtx,
 		cancel:             cancel,
 		log:                loggerOrDefault(icmpBufferSettings.Log),
@@ -714,6 +739,7 @@ func (self *IcmpSequence) receivePacket(packet []byte) {
 }
 
 func (self *IcmpSequence) Run() {
+	defer self.memory.release()
 	var childWorkers sync.WaitGroup
 	defer childWorkers.Wait()
 	defer func() {
@@ -733,7 +759,7 @@ func (self *IcmpSequence) Run() {
 					if !ok {
 						return
 					}
-					MessagePoolReturn(sendItem.ipPacket)
+					sendItem.release()
 				default:
 					return
 				}
@@ -818,7 +844,7 @@ func (self *IcmpSequence) Run() {
 			} else if self.log.V(1).Enabled() {
 				self.log.Infof("[f%d]icmp forward error = %s\n", sendIter, err)
 			}
-			MessagePoolReturn(sendItem.ipPacket)
+			sendItem.release()
 			sendIter += 1
 			if err != nil {
 				return

@@ -5,6 +5,14 @@ import (
 	"time"
 )
 
+// MEMSTEADY supersedes the historical pure-fraction model below for H3 targets
+// through 32 MiB. Its reservation includes 1600 KiB of additive retained
+// ownership as well as receive credit. The finite profile is asserted against
+// an explicit ledger at every rung, while the server rows retain the original
+// proportional-growth guard. A small mobile receive window is not permission
+// to silently omit its send, socket, control, and queue owners from the table.
+// See share_table_h3_memory_test.go and MEMSTEADY's current carrier ledger.
+
 // THROUGHPUTFIX §44, the share table: every ceiling this program raised, as a
 // draw `max(floor, surface × fraction)` on a memory surface rather than as a
 // constant sized for one reference host. The rows exist in four files and were
@@ -138,6 +146,8 @@ type shareTableRow struct {
 	// a draw that is also capped by its surface (the carrier aggregate, which
 	// may never exceed the target it draws on)
 	cappedBySurface bool
+	// These three rows apply the composed mobile ledger after their base draw.
+	retainedH3 bool
 	// the round trip of the loop this row's window closes at the design point,
 	// zero for a row that is an admission claim rather than a window
 	loopRoundTrip time.Duration
@@ -284,6 +294,7 @@ func shareTableRows() []shareTableRow {
 		},
 		{
 			name:           "H3 reservation",
+			retainedH3:     true,
 			surface:        shareSurfaceDevice,
 			backing:        shareBackingHeap,
 			numerator:      1,
@@ -295,6 +306,7 @@ func shareTableRows() []shareTableRow {
 		},
 		{
 			name:           "H3 stream window",
+			retainedH3:     true,
 			surface:        shareSurfaceDevice,
 			backing:        shareBackingHeap,
 			numerator:      h3StreamReceiveWindowShareNumerator,
@@ -308,6 +320,7 @@ func shareTableRows() []shareTableRow {
 		},
 		{
 			name:           "H3 connection window",
+			retainedH3:     true,
 			surface:        shareSurfaceDevice,
 			backing:        shareBackingHeap,
 			numerator:      h3ConnectionReceiveWindowShareNumerator,
@@ -322,11 +335,24 @@ func shareTableRows() []shareTableRow {
 	}
 }
 
-// drawByteCount is what the row's declared fraction says it should be at this
-// value of its surface.
+// drawByteCount is the declared policy at this surface, including H3's
+// additive mobile ownership ledger rather than just its base fraction.
 func (self shareTableRow) drawByteCount(surfaceByteCount ByteCount) ByteCount {
 	if surfaceByteCount <= 0 {
 		return 0
+	}
+	if self.retainedH3 {
+		ledger := shareTableH3LedgerForTarget(surfaceByteCount)
+		switch self.name {
+		case "H3 reservation":
+			return ledger.reservation
+		case "H3 stream window":
+			return ledger.stream
+		case "H3 connection window":
+			return ledger.connection
+		default:
+			panic("unrecognized retained H3 share-table row")
+		}
 	}
 	draw := max(self.floorByteCount, surfaceByteCount*self.numerator/self.denominator)
 	if self.cappedBySurface {
@@ -347,7 +373,7 @@ func (self shareTableRow) floorCrossingByteCount() ByteCount {
 // be right only at the round numbers (§48.1)
 func shareTableSurfaceLadder() []ByteCount {
 	return []ByteCount{
-		mib(8), mib(16), mib(20), mib(24), mib(32), mib(48), mib(64),
+		mib(8), mib(16), mib(20), mib(24), mib(28), mib(32), mib(48), mib(64),
 		mib(128), mib(256), mib(512), mib(1024),
 	}
 }
@@ -372,8 +398,10 @@ func shareTableScalingFailure(
 	return 0, 0, 0, 0, false
 }
 
-// §44.2, constraint 1: every row doubles when its surface doubles above its
-// floor's crossing, and no row passes through `MemoryScaledByteCount`.
+// §44.2, constraint 1: every base fraction doubles above its floor's crossing,
+// and no server row passes through `MemoryScaledByteCount`. Finite H3 profiles
+// have the stronger exact composed-ledger equality below instead of pretending
+// their fixed retained owners scale as receive credit.
 //
 // This is the constraint the whole program rests on, applied to every row at
 // once rather than one row per branch. The per-layer rows
@@ -411,7 +439,10 @@ func TestEveryShareTableRowIsADrawOnItsOwnSurface(t *testing.T) {
 
 		scalingLadder := []ByteCount{}
 		for _, surface := range ladder {
-			if crossing <= surface {
+			// A fixed additive envelope is not proportional receive credit.
+			// Mobile rungs remain subject to exact policy equality below and
+			// the backing/explicit-boundary tests, not a skipped budget check.
+			if crossing <= surface && (!row.retainedH3 || mib(32) < surface) {
 				scalingLadder = append(scalingLadder, surface)
 			}
 		}
@@ -426,21 +457,21 @@ func TestEveryShareTableRowIsADrawOnItsOwnSurface(t *testing.T) {
 			)
 		}
 
-		// and the row is the fraction it declares, at every rung including the
-		// ones below the crossing where the floor holds it
+		// The full declared policy holds at every rung, including finite H3
+		// profiles and the values below the base fraction's floor crossing.
 		for _, surface := range ladder {
 			if got, want := row.resolve(surface), row.drawByteCount(surface); got != want {
 				t.Errorf(
-					"%s reads %d at a %d byte %s rather than the %d its declared fraction %d/%d with a %d floor gives; the table and the constructor have to be the same arithmetic or the table is describing a tree that does not exist",
+					"%s reads %d at a %d byte %s rather than its declared policy %d (base fraction %d/%d, floor %d); the table and constructor must describe the same retained ownership",
 					row.name, got, surface, row.surface, want,
 					row.numerator, row.denominator, row.floorByteCount,
 				)
 			}
 		}
 		t.Logf(
-			"%s: %d/%d of %s, floor %d, crossing at %d, %d at 64 MiB and %d at 256",
+			"%s: base %d/%d of %s, floor %d, crossing at %d, retained-mobile-overlay=%t, %d at 64 MiB and %d at 256",
 			row.name, row.numerator, row.denominator, row.surface,
-			row.floorByteCount, crossing, row.resolve(mib(64)), row.resolve(mib(256)),
+			row.floorByteCount, crossing, row.retainedH3, row.resolve(mib(64)), row.resolve(mib(256)),
 		)
 	}
 }
@@ -500,6 +531,7 @@ func TestTheShareTableIsBackedAtEveryLevel(t *testing.T) {
 		reservation := rows["H3 reservation"].resolve(surface)
 		stream := rows["H3 stream window"].resolve(surface)
 		connection := rows["H3 connection window"].resolve(surface)
+		fixed := shareTableH3LedgerForTarget(surface).fixed
 		h1 := DefaultPlatformTransportSettingsWithMemoryTarget(surface).H1BudgetByteCount
 		for _, nested := range []struct {
 			inner, outer         ByteCount
@@ -508,8 +540,8 @@ func TestTheShareTableIsBackedAtEveryLevel(t *testing.T) {
 		}{
 			{stream, connection, "H3 stream window", "H3 connection window",
 				"a connection's window bounds every stream sharing it, so a stream window above it is credit the connection can never honor"},
-			{connection, reservation, "H3 connection window", "H3 reservation",
-				"the reservation is what the carrier holds against the aggregate, and a connection may hold its whole connection window, so a window above the reservation is memory held outside what was admitted"},
+			{connection + fixed, reservation, "H3 connection window plus retained owners", "H3 reservation",
+				"receive credit and the mobile send/socket/control/queue envelope coexist; neither can spend the other's reservation"},
 			{reservation, aggregate, "H3 reservation", "carrier aggregate",
 				"a carrier whose reservation exceeds the aggregate it draws from can never be admitted, and an explicit H3 selection waits forever rather than failing"},
 		} {
@@ -522,11 +554,13 @@ func TestTheShareTableIsBackedAtEveryLevel(t *testing.T) {
 			}
 		}
 
-		// the tight form §43.2 landed: the reservation is not half idle. Above
-		// the reservation's floor crossing the connection window is the whole
-		// draw, so what one connection may occupy is exactly what was reserved
-		// for it.
-		if rows["H3 reservation"].floorCrossingByteCount() <= surface && connection != reservation {
+		// On the finite profile the difference is live non-receive ownership,
+		// not idle memory. Only legacy/server targets still use §43.2's
+		// receive-only reservation equality.
+		if fixed > 0 && reservation != max(mib(3), connection+fixed) {
+			t.Errorf("at target %d, H3 reservation %d does not exactly back receive %d plus fixed %d (3 MiB admission floor)",
+				surface, reservation, connection, fixed)
+		} else if fixed == 0 && rows["H3 reservation"].floorCrossingByteCount() <= surface && connection != reservation {
 			t.Errorf(
 				"at a %d byte device target the connection window is %d against a reservation of %d; §43.2 puts the connection window at the whole draw so that the reservation is occupiable rather than half idle, and a reservation of twice the window is memory claimed against the aggregate that no connection can use",
 				surface, connection, reservation,
@@ -576,8 +610,8 @@ func TestTheShareTableIsBackedAtEveryLevel(t *testing.T) {
 		}
 
 		t.Logf(
-			"%d: aggregate %d, reservation %d, connection %d, stream %d, H1 %d | largest admissible target %d, pools %d, client share %d against transfer %d+%d",
-			surface, aggregate, reservation, connection, stream, h1,
+			"%d: aggregate %d, reservation %d, connection %d, fixed retained %d, stream %d, H1 %d | largest admissible target %d, pools %d, client share %d against transfer %d+%d",
+			surface, aggregate, reservation, connection, fixed, stream, h1,
 			largestAdmissibleTarget, pools, clientShare, send, hold,
 		)
 	}

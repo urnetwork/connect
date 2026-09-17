@@ -59,7 +59,7 @@ func TestPlatformPacketConnClampsQuicRequestToDeviceMemoryTarget(t *testing.T) {
 	settings := DefaultPlatformTransportSettingsWithMemoryTarget(
 		deviceMemoryTargetByteCount,
 	)
-	wantBufferByteCount := kib(320)
+	wantBufferByteCount := kib(64)
 	if settings.H3SocketReadBufferByteCount != wantBufferByteCount ||
 		settings.H3SocketWriteBufferByteCount != wantBufferByteCount {
 		t.Fatalf(

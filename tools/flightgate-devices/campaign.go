@@ -252,12 +252,12 @@ func runCampaign(args []string) error {
 	return report([]string{*out})
 }
 
-func writeJson(path string, value any) {
+func writeJson(path string, value any) error {
 	b, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(path, b, 0o644)
+	return os.WriteFile(path, b, 0o644)
 }
 
 // glogRecordStart matches the prefix of a fresh glog record (severity,
@@ -269,6 +269,7 @@ var glogRecordStart = regexp.MustCompile(`^[IWEF][0-9]{4} `)
 type diagSample struct {
 	Millis  int64
 	Payload map[string]any
+	Parts   map[string]bool
 }
 
 // parseDiag reads every [flightgate] part line and rejoins the parts that
@@ -284,6 +285,7 @@ func parseDiag(path string) ([]diagSample, error) {
 	}
 	defer file.Close()
 	byMillis := map[int64]map[string]any{}
+	partsByMillis := map[int64]map[string]bool{}
 	windowsByMillis := map[int64]map[string]map[string]any{}
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 1024*1024), 8*1024*1024)
@@ -312,16 +314,22 @@ func parseDiag(path string) ([]diagSample, error) {
 			continue
 		}
 		pending = ""
-		millisValue, _ := part["unix_millis"].(float64)
-		millis := int64(millisValue)
+		millis, err := exactDiagInt(part, "unix_millis")
+		if err != nil {
+			return nil, fmt.Errorf("invalid diagnostic timestamp: %w", err)
+		}
 		payload := byMillis[millis]
 		if payload == nil {
 			payload = map[string]any{"windows": []any{}}
 			byMillis[millis] = payload
 		}
 		kind, _ := part["part"].(string)
+		if partsByMillis[millis] == nil {
+			partsByMillis[millis] = map[string]bool{}
+		}
+		partsByMillis[millis][kind] = true
 		switch kind {
-		case "state", "memory":
+		case "state", "memory", "memory_device_transport", "memory_device_transfer":
 			for k, v := range part {
 				if k != "part" {
 					payload[k] = v
@@ -364,7 +372,7 @@ func parseDiag(path string) ([]diagSample, error) {
 			windows = append(windows, window)
 		}
 		payload["windows"] = windows
-		samples = append(samples, diagSample{Millis: millis, Payload: payload})
+		samples = append(samples, diagSample{Millis: millis, Payload: payload, Parts: partsByMillis[millis]})
 	}
 	sort.Slice(samples, func(a, b int) bool { return samples[a].Millis < samples[b].Millis })
 	return samples, scanner.Err()
@@ -915,16 +923,27 @@ func seriesReport(args []string) error {
 
 // loadLogTotalBytes reads the helper's final "done total_bytes=N" line.
 func loadLogTotalBytes(path string) int64 {
+	bytes, _, _ := loadLogSummary(path)
+	return bytes
+}
+
+func loadLogSummary(path string) (int64, int64, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0
+		return 0, 0, err
 	}
+	var bytes, errorsCount int64
+	completed := 0
 	for _, line := range strings.Split(string(b), "\n") {
-		if _, rest, ok := strings.Cut(line, "done total_bytes="); ok {
-			value, _, _ := strings.Cut(rest, " ")
-			n, _ := strconv.ParseInt(value, 10, 64)
-			return n
+		if strings.HasPrefix(line, "done ") {
+			if n, err := fmt.Sscanf(line, "done total_bytes=%d errors=%d", &bytes, &errorsCount); n != 2 || err != nil || bytes < 0 || errorsCount < 0 {
+				return 0, 0, errors.New("malformed load completion record")
+			}
+			completed++
 		}
 	}
-	return 0
+	if completed != 1 {
+		return 0, 0, errors.New("expected one load completion record")
+	}
+	return bytes, errorsCount, nil
 }

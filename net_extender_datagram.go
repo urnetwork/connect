@@ -76,9 +76,31 @@ func WriteExtenderDatagram(w io.Writer, datagram []byte) error {
 		return fmt.Errorf("%w: %d > %d", errExtenderDatagramTooLarge, len(datagram), extenderDatagramMaxSize)
 	}
 	frame := make([]byte, extenderDatagramLenSize+len(datagram))
+	return writeExtenderDatagram(w, datagram, frame)
+}
+
+// ExtenderDatagramWriter owns one bounded frame scratch buffer for a carrier.
+// Its zero value is ready to use. Writes must be serialized, and the writer
+// must not be copied after use. Reuse avoids allocating a packet-sized frame
+// for every datagram on the mobile or server relay path.
+type ExtenderDatagramWriter struct {
+	frame [extenderDatagramLenSize + extenderDatagramMaxSize]byte
+}
+
+func (self *ExtenderDatagramWriter) Write(w io.Writer, datagram []byte) error {
+	if len(datagram) > extenderDatagramMaxSize {
+		return fmt.Errorf("%w: %d > %d", errExtenderDatagramTooLarge, len(datagram), extenderDatagramMaxSize)
+	}
+	return writeExtenderDatagram(w, datagram, self.frame[:extenderDatagramLenSize+len(datagram)])
+}
+
+func writeExtenderDatagram(w io.Writer, datagram []byte, frame []byte) error {
 	binary.BigEndian.PutUint16(frame[:extenderDatagramLenSize], uint16(len(datagram)))
 	copy(frame[extenderDatagramLenSize:], datagram)
-	_, err := w.Write(frame)
+	n, err := w.Write(frame)
+	if err == nil && n != len(frame) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -88,11 +110,22 @@ func WriteExtenderDatagram(w io.Writer, datagram []byte) error {
 // cannot be trusted to be in sync after it, so the only safe move is to end
 // the connection.
 func ReadExtenderDatagram(r io.Reader, buffer []byte) (int, error) {
-	var header [extenderDatagramLenSize]byte
-	if _, err := io.ReadFull(r, header[:]); err != nil {
+	var reader ExtenderDatagramReader
+	return reader.Read(r, buffer)
+}
+
+// ExtenderDatagramReader retains the small length header instead of letting
+// io.ReadFull's interface escape allocate it for every packet. Its zero value
+// is ready to use; reads must be serialized and it must not be copied after use.
+type ExtenderDatagramReader struct {
+	header [extenderDatagramLenSize]byte
+}
+
+func (self *ExtenderDatagramReader) Read(r io.Reader, buffer []byte) (int, error) {
+	if _, err := io.ReadFull(r, self.header[:]); err != nil {
 		return 0, err
 	}
-	size := int(binary.BigEndian.Uint16(header[:]))
+	size := int(binary.BigEndian.Uint16(self.header[:]))
 	if size > extenderDatagramMaxSize {
 		return 0, fmt.Errorf("%w: %d > %d", errExtenderDatagramTooLarge, size, extenderDatagramMaxSize)
 	}
@@ -124,6 +157,8 @@ type extenderPacketConn struct {
 
 	readMutex  sync.Mutex
 	writeMutex sync.Mutex
+	reader     ExtenderDatagramReader
+	writer     ExtenderDatagramWriter
 
 	closeOnce sync.Once
 	closeErr  error
@@ -145,7 +180,7 @@ func (self *extenderPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	defer self.readMutex.Unlock()
 
 	for {
-		n, err := ReadExtenderDatagram(self.conn, p)
+		n, err := self.reader.Read(self.conn, p)
 		if err == io.ErrShortBuffer {
 			// Oversized for this caller's buffer, already drained. A udp
 			// socket would truncate; quic sizes its buffers to its own
@@ -164,7 +199,7 @@ func (self *extenderPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	self.writeMutex.Lock()
 	defer self.writeMutex.Unlock()
 
-	if err := WriteExtenderDatagram(self.conn, p); err != nil {
+	if err := self.writer.Write(self.conn, p); err != nil {
 		return 0, err
 	}
 	return len(p), nil

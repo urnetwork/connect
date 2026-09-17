@@ -28,25 +28,41 @@ func init() {
 }
 
 func newDefaultPlatformTransportBudget(budgetByteCount ByteCount) *PlatformTransportBudget {
-	return NewPlatformTransportBudget(
+	return newDefaultPlatformTransportBudgetWithParent(budgetByteCount, nil)
+}
+
+func newDefaultPlatformTransportBudgetWithParent(
+	budgetByteCount ByteCount,
+	parent *PlatformTransportBudget,
+) *PlatformTransportBudget {
+	return newPlatformTransportBudget(
 		// Keep the normal share at one quarter, but leave room for one H3
 		// carrier at the supported low-memory floor. Without this matching
 		// floor, an explicit H3 selection on the 8 MiB legacy host target
 		// would wait forever on a 2 MiB aggregate budget for a 3 MiB claim.
 		min(budgetByteCount, max(mib(3), budgetByteCount/4)),
 		16,
+		parent,
 	)
 }
 
-// NewPlatformTransportBudgetForMemoryTarget creates an independently owned
-// carrier budget using the same sizing policy as the process default. A
-// nonpositive target preserves the legacy process-wide budget so callers that
-// explicitly disable per-owner memory sizing retain their prior behavior.
+// NewPlatformTransportBudgetForMemoryTarget creates a private carrier limit
+// using the same sizing policy as the process default. On memory-sized hosts it
+// also consumes the shared process budget: device windows and unowned API,
+// feed, or probe carriers cannot each spend a separate aggregate allowance.
+// Unsized hosts keep independent device budgets, and a nonpositive owner target
+// preserves the legacy process-wide budget.
 func NewPlatformTransportBudgetForMemoryTarget(
 	memoryTargetByteCount ByteCount,
 ) *PlatformTransportBudget {
 	if memoryTargetByteCount <= 0 {
 		return DefaultPlatformTransportBudget()
+	}
+	if 0 < MemoryBudget() {
+		return newDefaultPlatformTransportBudgetWithParent(
+			memoryTargetByteCount,
+			DefaultPlatformTransportBudget(),
+		)
 	}
 	return newDefaultPlatformTransportBudget(memoryTargetByteCount)
 }
@@ -70,7 +86,8 @@ func MemoryBudget() ByteCount {
 }
 
 // DefaultPlatformTransportBudget returns the process-wide budget sampled by
-// new PlatformTransport settings.
+// new PlatformTransport settings. At finite process targets its statistics
+// include both private device claims and unowned process carrier claims.
 func DefaultPlatformTransportBudget() *PlatformTransportBudget {
 	return defaultPlatformTransportBudget.Load()
 }

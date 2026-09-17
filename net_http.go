@@ -2035,6 +2035,12 @@ func (self *clientDialer) Weight() float32 {
 // removal policy of E1. The directory is an external object, so it is called
 // with no lock held.
 func (self *clientDialer) Update(handleCtx context.Context, err error) {
+	// Local admission pressure says nothing about the extender's reachability.
+	// In particular it must not put a healthy relay on directory hold merely
+	// because another carrier currently owns this device's remaining memory.
+	if errors.Is(err, errExtenderMemoryBudget) {
+		return
+	}
 	recorded := false
 	func() {
 		self.mutex.Lock()

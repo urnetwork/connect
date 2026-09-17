@@ -29,9 +29,10 @@ import (
 //
 // The addresses come from the strategy's own resolver -- the network space DoH
 // cache when the host is protected, the egress-aware resolver otherwise -- for
-// both families, and are raced happy eyeballs style by the same helper the
-// platform H3 dial uses. The whodis dialer races 53 before 4053, so a network
-// that passes public dns still reaches alt on the port the router forwards.
+// both families, and are raced happy eyeballs style when concurrent complete
+// carrier claims fit. Otherwise a fallback waits for the preceding attempt's
+// teardown. The whodis dialer races 53 before 4053, so a network that passes
+// public dns still reaches alt on the port the router forwards.
 
 // The dialer priorities of L4: alt h3 runs after the tcp dialers (0 to 50) and
 // before the extender carriers (100, 110, 120); alt whodis runs last, since it
@@ -88,6 +89,7 @@ func newAltHttpClient(
 	whodis bool,
 ) *http.Client {
 	transport := &http3.Transport{
+		MaxResponseHeaderBytes: altMaxHeaderBytes,
 		// ServerName is left empty so http3 fills it from the request host,
 		// which is the api name alt holds the certificate for (L1, L3)
 		TLSClientConfig: newClientTlsConfig(settings.TlsConfig, nil),
@@ -95,17 +97,18 @@ func newAltHttpClient(
 			HandshakeIdleTimeout: settings.ConnectTimeout + settings.TlsTimeout,
 			MaxIdleTimeout:       settings.IdleConnTimeout,
 		},
-		Dial: func(
-			ctx context.Context,
-			addr string,
-			tlsConfig *tls.Config,
-			quicConfig *quic.Config,
-		) (*quic.Conn, error) {
-			return clientStrategy.dialAltQuic(ctx, whodis, tlsConfig, quicConfig)
-		},
+	}
+	bounded := newAltQuicBoundedTransport(transport)
+	transport.Dial = func(
+		ctx context.Context,
+		_ string,
+		tlsConfig *tls.Config,
+		quicConfig *quic.Config,
+	) (*quic.Conn, error) {
+		return clientStrategy.dialAltQuic(ctx, whodis, tlsConfig, quicConfig)
 	}
 	return &http.Client{
-		Transport: transport,
+		Transport: bounded,
 		Timeout:   settings.RequestTimeout,
 	}
 }
@@ -120,6 +123,7 @@ func (self *ClientStrategy) dialAltQuic(
 	tlsConfig *tls.Config,
 	quicConfig *quic.Config,
 ) (*quic.Conn, error) {
+	policy := newExtenderQuicMemoryPolicy(ctx, &self.settings.ConnectSettings)
 	candidates, err := self.altDialCandidates(ctx, whodis)
 	if err != nil {
 		return nil, err
@@ -129,10 +133,10 @@ func (self *ClientStrategy) dialAltQuic(
 	}
 	if whodis {
 		tld := altDnsTld(self.settings)
+		ptSettings := policy.packetTranslationSettings()
+		ptSettings.Log = self.settings.ConnectSettings.Log
+		ptSettings.DnsTlds = [][]byte{tld}
 		wrap = func(attemptCtx context.Context, packetConn net.PacketConn) (net.PacketConn, error) {
-			ptSettings := DefaultPacketTranslationSettings()
-			ptSettings.Log = self.settings.ConnectSettings.Log
-			ptSettings.DnsTlds = [][]byte{tld}
 			// the cleanup owns the translation; keep its encoder alive while
 			// cancellation closes quic gracefully, exactly as the platform
 			// dns carrier does
@@ -152,13 +156,16 @@ func (self *ClientStrategy) dialAltQuic(
 			wrap,
 			tlsConfig,
 			quicConfig,
+			policy,
 		)
 	}
 	var attempt *h3DialAttempt
 	if len(candidates) == 1 {
 		attempt, err = dial(ctx, candidates[0])
 	} else {
-		attempt, err = raceH3Dial(ctx, candidates, dial)
+		attempt, err = raceAltQuicDial(ctx, candidates, policy, func(ctx context.Context, address *net.UDPAddr, claim *platformTransportBudgetReservation) (*h3DialAttempt, error) {
+			return dialAltQuicAttemptWithReservation(ctx, &self.settings.ConnectSettings, address, wrap, tlsConfig, quicConfig, policy, claim)
+		})
 	}
 	if err != nil {
 		return nil, err
@@ -240,6 +247,24 @@ func dialAltQuicAttempt(
 	wrap h3PacketConnWrapper,
 	tlsConfig *tls.Config,
 	quicConfig *quic.Config,
+	policy extenderQuicMemoryPolicy,
+) (*h3DialAttempt, error) {
+	reservation, err := policy.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return dialAltQuicAttemptWithReservation(ctx, connectSettings, udpAddr, wrap, tlsConfig, quicConfig, policy, reservation)
+}
+
+func dialAltQuicAttemptWithReservation(
+	ctx context.Context,
+	connectSettings *ConnectSettings,
+	udpAddr *net.UDPAddr,
+	wrap h3PacketConnWrapper,
+	tlsConfig *tls.Config,
+	quicConfig *quic.Config,
+	policy extenderQuicMemoryPolicy,
+	reservation *platformTransportBudgetReservation,
 ) (*h3DialAttempt, error) {
 	// the same endpoint policy the extender carriers use: an injected factory
 	// wins, so a headless host keeps one source identity, and otherwise the
@@ -251,14 +276,17 @@ func dialAltQuicAttempt(
 		if packetConn != nil {
 			packetConn.Close()
 		}
+		reservation.Release()
 		return nil, err
 	}
 	if packetConn == nil {
+		reservation.Release()
 		return nil, fmt.Errorf("alt packet connection factory returned nil")
 	}
 	attempt := &h3DialAttempt{
-		udpAddr:    udpAddr,
-		packetConn: packetConn,
+		udpAddr:           udpAddr,
+		packetConn:        packetConn,
+		budgetReservation: reservation,
 	}
 	success := false
 	defer func() {
@@ -281,6 +309,7 @@ func dialAltQuicAttempt(
 			)
 		}
 	}
+	attempt.packetConn = capPlatformPacketConn(packetConn, policy.readBufferByteCount, policy.writeBufferByteCount)
 	wrapped, err := wrap(ctx, attempt.packetConn)
 	if err != nil {
 		return nil, err
@@ -291,11 +320,15 @@ func dialAltQuicAttempt(
 		Conn: attempt.packetConn,
 	}
 	// per attempt: a race runs several dials against one config
-	conn, err := attempt.quicTransport.Dial(ctx, udpAddr, tlsConfig.Clone(), quicConfig.Clone())
+	boundedQuicConfig := quicConfig.Clone()
+	policy.boundReceiveConfig(boundedQuicConfig)
+	installQuicSendFlight(boundedQuicConfig)
+	conn, err := attempt.quicTransport.Dial(ctx, udpAddr, tlsConfig.Clone(), boundedQuicConfig)
 	if err != nil {
 		return nil, err
 	}
 	attempt.conn = conn
+	quicSendFlightForConn(conn).bind(conn)
 	success = true
 	return attempt, nil
 }

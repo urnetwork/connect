@@ -85,8 +85,9 @@ func (self *ExtenderServer) relayDatagram(
 		defer relayWorkers.Done()
 		defer relayCancel()
 		buffer := make([]byte, extenderDatagramReadBufferSize)
+		var reader connect.ExtenderDatagramReader
 		for {
-			n, err := connect.ReadExtenderDatagram(clientConn, buffer)
+			n, err := reader.Read(clientConn, buffer)
 			if err != nil {
 				self.reportError("datagram relay read client", err)
 				return
@@ -104,6 +105,7 @@ func (self *ExtenderServer) relayDatagram(
 		defer relayWorkers.Done()
 		defer relayCancel()
 		buffer := make([]byte, extenderDatagramReadBufferSize)
+		var writer connect.ExtenderDatagramWriter
 		for {
 			n, err := forwardConn.Read(buffer)
 			if err != nil {
@@ -111,7 +113,7 @@ func (self *ExtenderServer) relayDatagram(
 				return
 			}
 			touch()
-			if err := connect.WriteExtenderDatagram(clientConn, buffer[:n]); err != nil {
+			if err := writer.Write(clientConn, buffer[:n]); err != nil {
 				// An oversized reply is dropped rather than ending the relay:
 				// one bad packet from the destination must not take down a
 				// working connection, and quic will simply not see it.

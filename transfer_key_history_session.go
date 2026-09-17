@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -42,6 +43,9 @@ const (
 	// clientKeyHistoryRejected: signed evidence contradicts the contract key,
 	// or a downgrade was refused. Terminal — never re-enters pending.
 	clientKeyHistoryRejected
+	// Local persistence/admission failure is terminal for this session, but
+	// is not evidence against the peer and must not poison peer exclusion.
+	clientKeyHistoryStoreUnavailable
 )
 
 func (self clientKeyHistoryState) String() string {
@@ -52,6 +56,8 @@ func (self clientKeyHistoryState) String() string {
 		return "verified"
 	case clientKeyHistoryRejected:
 		return "rejected"
+	case clientKeyHistoryStoreUnavailable:
+		return "local pin store unavailable"
 	default:
 		return "not required"
 	}
@@ -79,6 +85,16 @@ type PeerClientKeyPinStore interface {
 	SignedHistorySeen() bool
 	// SetSignedHistorySeen latches the above.
 	SetSignedHistorySeen()
+}
+
+// CheckedPeerClientKeyPinStore makes durable admission part of opening the
+// Required cipher gate. Commit must atomically retain the pin and the global
+// signed-history latch, or return an error without dropping existing pins.
+// The optional interface preserves compatibility with legacy Go stores.
+type CheckedPeerClientKeyPinStore interface {
+	PeerClientKeyPinStore
+	GetPeerClientKeyPinChecked(Id) (ClientKeyPin, bool, error)
+	CommitPeerClientKeyPin(Id, ClientKeyPin) error
 }
 
 // keyHistoryRequiredWithLock reports whether this session gates `Cipher()` on
@@ -135,6 +151,14 @@ func (self *peerEncryptionSession) resolvePeerClientKeyHistory(contractPub ed255
 
 		encodedHistory, err := self.peerClientKeyHistoryFetcher(self.ctx)
 		if err != nil {
+			// A healthy store retains the existing network-availability policy.
+			// Local closed/corrupt storage cannot be bypassed by that fallback.
+			if store, ok := self.settings.PeerClientKeyPinStore.(CheckedPeerClientKeyPinStore); ok {
+				if _, _, storeErr := store.GetPeerClientKeyPinChecked(self.peerId); storeErr != nil {
+					self.blockKeyHistoryStore(storeErr)
+					return
+				}
+			}
 			// Availability failure, NOT evidence of substitution. Treating an
 			// unreachable platform API as a verified disagreement would
 			// exclude every provider for every Required client at once the
@@ -161,7 +185,14 @@ func (self *peerEncryptionSession) applyPeerClientKeyHistory(
 	store := self.settings.PeerClientKeyPinStore
 	var pin ClientKeyPin
 	pinned := false
-	if store != nil {
+	if checked, ok := store.(CheckedPeerClientKeyPinStore); ok {
+		var err error
+		pin, pinned, err = checked.GetPeerClientKeyPinChecked(self.peerId)
+		if err != nil {
+			self.blockKeyHistoryStore(err)
+			return
+		}
+	} else if store != nil {
 		pin, pinned = store.GetPeerClientKeyPin(self.peerId)
 	}
 
@@ -210,7 +241,12 @@ func (self *peerEncryptionSession) applyPeerClientKeyHistory(
 		return
 	}
 
-	if store != nil {
+	if checked, ok := store.(CheckedPeerClientKeyPinStore); ok {
+		if err := checked.CommitPeerClientKeyPin(self.peerId, nextPin); err != nil {
+			self.blockKeyHistoryStore(err)
+			return
+		}
+	} else if store != nil {
 		store.SetPeerClientKeyPin(self.peerId, nextPin)
 		store.SetSignedHistorySeen()
 	}
@@ -227,7 +263,7 @@ func (self *peerEncryptionSession) openKeyHistoryGate(state clientKeyHistoryStat
 	changed := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		if self.keyHistoryState == clientKeyHistoryRejected {
+		if self.keyHistoryState == clientKeyHistoryRejected || self.keyHistoryState == clientKeyHistoryStoreUnavailable {
 			return false
 		}
 		if self.keyHistoryState == state {
@@ -239,10 +275,9 @@ func (self *peerEncryptionSession) openKeyHistoryGate(state clientKeyHistoryStat
 	if !changed {
 		return
 	}
-	if state == clientKeyHistoryRejected {
-		// Tear the epoch down as well as withholding the cipher. Leaving a
-		// handshake running against a peer we have decided not to trust wastes
-		// work and keeps a session referenced that can never become usable.
+	if state == clientKeyHistoryRejected || state == clientKeyHistoryStoreUnavailable {
+		// Tear the epoch down as well as withholding the cipher. A handshake
+		// cannot make this terminal identity or local-store failure usable.
 		self.stateLock.Lock()
 		epoch := self.epoch
 		self.stateLock.Unlock()
@@ -250,14 +285,29 @@ func (self *peerEncryptionSession) openKeyHistoryGate(state clientKeyHistoryStat
 			epoch.cancel()
 		}
 		if self.manager != nil {
+			eventType := EncryptionEventKeyIdentityRejected
+			if state == clientKeyHistoryStoreUnavailable {
+				eventType = EncryptionEventKeyIdentityStoreUnavailable
+			}
 			self.manager.encryptionEvent(&EncryptionEvent{
 				PeerId: self.peerId,
-				Type:   EncryptionEventKeyIdentityRejected,
+				Type:   eventType,
 				Reason: reason,
 			})
 		}
 	}
 	self.notifyIdleStateChanged()
+}
+
+func (self *peerEncryptionSession) blockKeyHistoryStore(err error) {
+	// An external checked implementation may return a verbose error; retain
+	// only a bounded diagnostic, never arbitrary per-peer error payloads.
+	reason := err.Error()
+	// Clone even a short string: a custom error may itself return a small
+	// substring backed by a much larger allocation.
+	reason = strings.Clone(reason[:min(len(reason), 256)])
+	self.client.log.Errorf("[key]%s local identity pin store unavailable: %s\n", self.logTag, reason)
+	self.openKeyHistoryGate(clientKeyHistoryStoreUnavailable, reason)
 }
 
 func (self *peerEncryptionSession) rejectKeyHistory(reason string) {

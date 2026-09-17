@@ -47,6 +47,8 @@ const (
 	// older in-flight bursts cannot reset the newer RTT measurement ring.
 	// This uint64 follows the two pacing words and adds no alignment padding.
 	pacingBurstStateByteCount = 8
+	// Mobile retained admission follows an item through retries and teardown.
+	retainedBudgetOwnerByteCount = 8
 )
 
 func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
@@ -65,14 +67,14 @@ func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
 		)
 	}
 	want := uintptr(
-		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount + pacingWireStateByteCount + pacingBurstStateByteCount)
+		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount + pacingWireStateByteCount + pacingBurstStateByteCount + retainedBudgetOwnerByteCount)
 	if got := unsafe.Sizeof(sendItem{}); got != want {
 		t.Errorf(
 			"sendItem is %d bytes, want merged's %d plus %d for the deferred retransmit's own state "+
 				"and %d for the lane position it last looked at, plus %d for paced wire bytes and actual write time "+
-				"and %d for the actual burst epoch; "+
+				"and %d for the actual burst epoch plus %d for the lifetime budget owner; "+
 				"anything else means a removed mechanism left a field behind",
-			got, mergedSendItemByteCount, deferStateByteCount, lanePositionStateByteCount, pacingWireStateByteCount, pacingBurstStateByteCount,
+			got, mergedSendItemByteCount, deferStateByteCount, lanePositionStateByteCount, pacingWireStateByteCount, pacingBurstStateByteCount, retainedBudgetOwnerByteCount,
 		)
 	}
 }

@@ -263,6 +263,39 @@ func (self *sendPackScheduler) HasEligible(
 	return false
 }
 
+// NoAck data is explicitly unordered. A memory-blocked reliable head cannot
+// hold it behind retention capacity it never consumes, even in the same flow.
+// The caller restricts eligible to packets guaranteed to remain NoAck.
+func (self *sendPackScheduler) TakeUnorderedEligible(eligible func(*SendPack) bool) *SendPack {
+	for _, pack := range self.order {
+		if !eligible(pack) {
+			continue
+		}
+		flow := self.flows[pack.schedulingKey]
+		for i, candidate := range flow.packs {
+			if candidate == pack {
+				copy(flow.packs[i:], flow.packs[i+1:])
+				flow.packs[len(flow.packs)-1] = nil
+				flow.packs = flow.packs[:len(flow.packs)-1]
+				break
+			}
+		}
+		self.removeOrder(pack)
+		self.count--
+		if len(flow.packs) == 0 {
+			delete(self.flows, flow.key)
+			for i, candidate := range self.active {
+				if candidate == flow {
+					self.removeActive(i)
+					break
+				}
+			}
+		}
+		return pack
+	}
+	return nil
+}
+
 func (self *sendPackScheduler) Drain(dispose func(*SendPack)) {
 	for _, flow := range self.active {
 		for _, sendPack := range flow.packs {

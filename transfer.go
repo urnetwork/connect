@@ -4917,6 +4917,9 @@ type SendBufferSettings struct {
 	// `ResendQueueBudget` is set: below it admission never consults the
 	// shared budget, so every sequence progresses on floor capacity alone
 	ResendQueueMinByteCount ByteCount
+	// Charges pooled roots and retained owners with exact, shared lifetime
+	// admission. Floors and an empty sequence cannot overdraw this budget.
+	ResendQueueRetainedByteAccounting bool
 	// Positive values grow the configured opening from qualified rate times
 	// window residence. Cumulative delivery needs a multi-RTT history; measured
 	// serialization can authorize earlier growth when the opening is too small
@@ -6449,6 +6452,14 @@ func newSendSequenceWithLogicalLane(
 			resendQueueBudget = logicalLaneResendBudget
 		}
 	}
+	if resendQueueBudget != nil && resendQueueBudget.Parent() != nil && !sendBufferSettings.ResendQueueRetainedByteAccounting {
+		// A composed budget cannot use check-then-Reserve or an uncharged
+		// per-flow floor. Make parentage sufficient to select exact ownership
+		// even if a future settings copier forgets the optional policy flag.
+		copy := *sendBufferSettings
+		copy.ResendQueueRetainedByteAccounting = true
+		sendBufferSettings = &copy
+	}
 
 	rttWindow := NewRttWindow(
 		client.log,
@@ -6507,6 +6518,9 @@ func newSendSequenceWithLogicalLane(
 		rttWindow:                      rttWindow,
 		windowPacer:                    windowBurstPacer{afterWaitForTest: sendBufferSettings.afterWindowPacingWaitForTest},
 		contractSeqIndex:               0,
+	}
+	if sendBufferSettings.ResendQueueRetainedByteAccounting {
+		seq.resendQueue.setLifetimeBudget()
 	}
 	// Never encrypt control-plane traffic. A SendSequence's data source is
 	// always this client (sourceId == client.ClientId()) and its destination
@@ -8053,11 +8067,7 @@ func (self *SendSequence) Run() {
 
 		// Lifetime pointers must disappear before send-item pool ownership moves.
 		self.ackLifetimes.clear()
-		// drain the buffer, releasing any borrowed budget
-		for _, item := range self.resendQueue.Clear() {
-			item.acks.invoke(errors.New("Send sequence closed."))
-			item.messagePoolReturn()
-		}
+		self.releaseRetainedSendItems(errors.New("Send sequence closed."))
 
 		// flush queued contracts (used ids were closed above). Keyed by
 		// (EncryptionRole, EncryptionCompanion) so this exit-flush doesn't discard
@@ -8121,6 +8131,7 @@ func (self *SendSequence) Run() {
 	// FLIGHTGATEFIX §23.3: the route generation this sequence last saw, so a
 	// change is counted beside the carrier-change writes it produces.
 	lastRouteGeneration := uint64(0)
+	var memoryCapacityNotify <-chan struct{}
 	disposeScheduledPack := func(sendPack *SendPack) {
 		err := errors.New("Send sequence closed.")
 		sendPack.disposeUnsentGroup(err)
@@ -8602,8 +8613,21 @@ sendSequenceLoop:
 
 		checkpointId := self.idleCondition.Checkpoint()
 
-		resendCapacity := self.resendQueue.CanAdd(
+		if memoryCapacityNotify != nil {
+			select {
+			case <-memoryCapacityNotify:
+				memoryCapacityNotify = nil
+			default:
+			}
+		}
+		minimumRetainedByteCount := ByteCount(0)
+		if self.resendQueue.lifetimeBudget {
+			minimumRetainedByteCount = (&sendItem{}).retainedMemoryByteCount(
+				self.retainedSendFrameByteCount(0, 0), 0, self.sendBufferSettings.ProtocolVersion < 2)
+		}
+		resendCapacity := self.resendQueue.CanAddWithQueueByteCount(
 			0,
+			minimumRetainedByteCount,
 			self.sendWindowEstimate(sendTime).Window,
 		)
 		self.observeRouteStall(sendTime)
@@ -8638,6 +8662,7 @@ sendSequenceLoop:
 		sendEligible := func(sendPack *SendPack) bool {
 			return self.noAckPackCanBypassRecoveryAdmission(sendPack) ||
 				resendCapacity &&
+					self.retainedSendPackFits(sendPack) &&
 					(!flightGates || self.flightController.canSendForKey(sendPack.schedulingKey))
 		}
 		var sendPack *SendPack
@@ -8658,7 +8683,10 @@ sendSequenceLoop:
 				}
 			}
 		} else if resendCapacity {
-			sendPack = scheduler.TakeFifoEligible(flightEligible)
+			sendPack = scheduler.TakeFifoEligible(func(candidate *SendPack) bool {
+				return flightEligible(candidate) &&
+					(self.noAckPackCanBypassRecoveryAdmission(candidate) || self.retainedSendPackFits(candidate))
+			})
 		} else {
 			// Capacity is unavailable, and a no-acknowledgement pack does not
 			// need it: it will never enter the resend queue, so the bound it is
@@ -8671,6 +8699,12 @@ sendSequenceLoop:
 			sendPack = scheduler.TakeFifoEligible(func(candidate *SendPack) bool {
 				return self.noAckPackCanBypassRecoveryAdmission(candidate) &&
 					flightEligible(candidate)
+			})
+			bypassedRecoveryAdmission = sendPack != nil
+		}
+		if sendPack == nil && self.resendQueue.lifetimeBudget {
+			sendPack = scheduler.TakeUnorderedEligible(func(candidate *SendPack) bool {
+				return self.noAckPackCanBypassRecoveryAdmission(candidate) && flightEligible(candidate)
 			})
 			bypassedRecoveryAdmission = sendPack != nil
 		}
@@ -8779,6 +8813,16 @@ sendSequenceLoop:
 						frameCount+nextFrameCount <= maxFrames &&
 						nextMessageByteCount <= maxMessageByteCount &&
 						contractSafe
+					if compatible && self.resendQueue.lifetimeBudget && self.resendQueue.budget != nil {
+						probe := sendItem{}
+						if sendPackBatchMaxFrames < sendPackCount+1 {
+							// Charge the bounded callback overflow without allocating it.
+							probe.acks.overflow = &sendAckSetOverflow{}
+						}
+						compatible = probe.retainedMemoryByteCount(self.retainedSendFrameByteCount(
+							nextMessageByteCount, frameCount+nextFrameCount), frameCount+nextFrameCount,
+							self.sendBufferSettings.ProtocolVersion < 2) <= self.resendQueue.budget.Available()
+					}
 					if compatible {
 						sendPacks[sendPackCount] = nextSendPack
 						sendPackCount += 1
@@ -8895,14 +8939,27 @@ sendSequenceLoop:
 		if flightBlocked {
 			flightWaitStart = time.Now()
 		}
+		if self.resendQueue.lifetimeBudget && self.resendQueue.budget != nil &&
+			(!resendCapacity || scheduler.Len() > 0) && memoryCapacityNotify == nil {
+			// Arm only a blocked loop, then repeat eligibility after arming.
+			// This closes the sibling-release race without per-packet channels.
+			memoryCapacityNotify = self.resendQueue.budget.CapacityNotify()
+			continue sendSequenceLoop
+		}
 		packIngress := (<-chan *SendPack)(self.packs)
+		// Inspect one bounded ingress owner even when reliable retention is
+		// full. A cold no-contract NoAck has no fast-path writer yet and must
+		// reach selection to open one. The Pack keeps its original admission
+		// slot; no second queue or retained wire allocation is created here.
+		inspectRetainedIngress := self.resendQueue.lifetimeBudget &&
+			(self.packAdmission != nil || scheduler.Len() == 0)
 		if !flightPolicy.flowIsolation &&
-			(!resendCapacity || flightBlocked || 0 < scheduler.Len()) {
+			(!resendCapacity || flightBlocked || 0 < scheduler.Len()) && !inspectRetainedIngress {
 			// Preserve the historical channel boundary on P2P/H1. Producers may
 			// fill its fixed capacity, but this sequence does not hide those Packs
 			// in a second queue while it is waiting for an Ack.
 			packIngress = nil
-		} else if self.packAdmission == nil && (!resendCapacity || 0 < scheduler.Len()) {
+		} else if self.packAdmission == nil && (!resendCapacity || 0 < scheduler.Len()) && !inspectRetainedIngress {
 			// SequenceBufferSize == 0 is an explicit synchronous-admission
 			// contract used by callers and memory-budget tests. Do not turn
 			// that unbuffered handoff into a hidden scheduler queue while the
@@ -8927,6 +8984,7 @@ sendSequenceLoop:
 			}
 			return
 		case <-ackSnapshot.ackNotify:
+		case <-memoryCapacityNotify:
 		case <-flightPolicy.notify:
 		case nextSendPack, ok := <-packIngress:
 			if !ok {
@@ -9792,6 +9850,38 @@ func (self *SendSequence) sendWithSetContractRecords(
 		head = false
 		sequenceNumber = 0
 	}
+	item := takeSendItem()
+	*item = sendItem{acks: acks}
+	if ack && self.resendQueue.lifetimeBudget {
+		frameByteCount := self.retainedSendFrameByteCount(MessageByteCount(sendFrames), len(sendFrames))
+		if aheadContract != nil {
+			frameByteCount = addReceiveQueueByteCount(frameByteCount, ByteCount(proto.Size(aheadContract.contract)))
+		}
+		admissionErr := self.ctx.Err()
+		if admissionErr == nil && !item.reserveMemory(self.resendQueue.budget,
+			item.retainedMemoryByteCount(frameByteCount, len(sendFrames), self.sendBufferSettings.ProtocolVersion < 2)) {
+			admissionErr = ErrSendPackNotAdmitted
+		}
+		if admissionErr != nil {
+			// No frame has been allocated or published. A cross-flow loser
+			// returns every input and cannot leave a sequence/contract gap.
+			self.nextSequenceNumber--
+			if self.sendContract != nil {
+				self.sendContract.rollbackUnwritten(MessageByteCount(sendFrames))
+			}
+			for _, frame := range sendFrames {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+			item.acks.firstRouteWrite(admissionErr)
+			noAckSends.complete(admissionErr)
+			if noAckSends.count > 0 {
+				self.client.sendNoAckDiscardCount.Add(uint64(noAckSends.count))
+			}
+			item.acks.invoke(admissionErr)
+			item.messagePoolReturn()
+			return
+		}
+	}
 	compactContractHead := head && self.sendContract != nil &&
 		self.sendContractAcked && self.sendBufferSettings.CompactContractHead &&
 		self.sendContract.compactContractRecoverySupported &&
@@ -9945,12 +10035,13 @@ func (self *SendSequence) sendWithSetContractRecords(
 		MessagePoolReturn(frame.MessageBytes)
 	}
 
-	item := takeSendItem()
 	*item = sendItem{
 		transferItem: transferItem{
 			messageId:        messageId,
 			sequenceNumber:   sequenceNumber,
 			messageByteCount: messageByteCount,
+			memoryBudget:     item.memoryBudget,
+			queueByteCount:   item.queueByteCount,
 		},
 		contractId: contractId,
 		sendTime:   sendTime,
@@ -10119,6 +10210,9 @@ func (self *SendSequence) setHead(
 		transferFrame.Frame.MessageBytes = packBytes
 	}
 
+	if !item.reserveFrameRewrite(ByteCount(proto.Size(&transferFrame)), len(pack.Frames), self.sendBufferSettings.ProtocolVersion < 2) {
+		return nil, false, ErrSendPackNotAdmitted
+	}
 	transferFrameBytesWithHead, err := ProtoMarshal(&transferFrame)
 	if err != nil {
 		return nil, false, err
@@ -11560,6 +11654,24 @@ func (self *SendSequence) ackItem(item *sendItem) {
 	item.messagePoolReturn()
 }
 
+func (self *SendSequence) releaseRetainedSendItems(err error) {
+	// A retry can exit while its item is temporarily outside the heap. The
+	// acknowledgement identity list is the authoritative lifetime owner set.
+	for _, item := range self.sendItems {
+		if item != nil {
+			self.resendQueue.RemoveByMessageId(item.messageId)
+			item.acks.invoke(err)
+			item.messagePoolReturn()
+		}
+	}
+	self.sendItems = nil
+	// Also support direct/test queue construction without an identity list.
+	for _, item := range self.resendQueue.Clear() {
+		item.acks.invoke(err)
+		item.messagePoolReturn()
+	}
+}
+
 // writeMaybeWrappedBytes writes `transferFrameBytes` through the contract
 // multi-route writer. When the per-peer session has a cipher, the bytes are
 // outer-wrapped as `TransferFrame{TransferPath, encryptedTransferFrame:
@@ -12224,7 +12336,7 @@ type sendItem struct {
 // stack-allocated. A process-wide bounded pool captures the steady in-flight
 // working set without multiplying retained objects by every window Client.
 // 1024 items cover the measured steady flight and bound retained struct data
-// to 584 KiB on 64-bit targets, as guarded by the exact landing size test.
+// to 592 KiB on 64-bit targets, as guarded by the exact landing size test.
 // Bursts beyond the cap fall back to GC.
 const sendItemPoolCapacity = 1024
 
@@ -12269,6 +12381,7 @@ func clearSendItemPool() {
 
 func (self *sendItem) messagePoolReturn() {
 	MessagePoolReturn(self.transferFrameBytes)
+	self.releaseMemory()
 	*self = sendItem{}
 	select {
 	case sendItemPool <- self:
@@ -12296,6 +12409,9 @@ func (self *sendItem) MessageByteCount() ByteCount {
 // the retained-accounting method explicitly instead of silently charging the
 // base transferItem's (unused) messageByteCount field.
 func (self *sendItem) QueueByteCount() ByteCount {
+	if self.memoryBudget != nil {
+		return self.queueByteCount
+	}
 	return self.MessageByteCount()
 }
 
@@ -13348,6 +13464,11 @@ func newReceiveSequenceWithLogicalLaneBudget(
 			receiveQueueBudget = logicalLaneReceiveBudget
 		}
 	}
+	if receiveQueueBudget != nil && receiveQueueBudget.Parent() != nil && !receiveBufferSettings.ReceiveQueueRetainedByteAccounting {
+		copy := *receiveBufferSettings
+		copy.ReceiveQueueRetainedByteAccounting = true
+		receiveBufferSettings = &copy
+	}
 	source = source.LocalMask()
 	seq := &ReceiveSequence{
 		ctx:                             cancelCtx,
@@ -13380,6 +13501,9 @@ func newReceiveSequenceWithLogicalLaneBudget(
 		idleCondition:                   NewIdleCondition(),
 		ackWindow:                       newSequenceAckWindowWithGapWake(receiveBufferSettings.AckGapWakeSelectiveCount),
 		exit:                            make(chan struct{}),
+	}
+	if receiveBufferSettings.ReceiveQueueRetainedByteAccounting {
+		seq.receiveQueue.setLifetimeBudget()
 	}
 	// Never encrypt control-plane traffic. A ReceiveSequence's data source is
 	// the peer (source.SourceId) and its destination is always this client
@@ -14224,6 +14348,7 @@ func (self *ReceiveSequence) Run() {
 					// this item is the head of sequence
 					if err := self.registerContracts(item); err != nil {
 						self.log.Errorf("[r]%s<-%s s(%s) exit could not register contracts = %s\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, err)
+						item.messagePoolReturn()
 						return
 					}
 					if self.updateContract(item) {
@@ -14235,6 +14360,7 @@ func (self *ReceiveSequence) Run() {
 					} else {
 						// no valid contract. it should have been attached to the head
 						self.log.Errorf("[r]drop head no contract %s<-%s s(%s)\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
+						item.messagePoolReturn()
 						return
 					}
 				} else {
@@ -14509,6 +14635,25 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		// the head must have a contract frame to reset the contract
 	}
 
+	// A duplicate must not surrender a committed owner's exact reservation:
+	// another flow could take it before re-admission. Keep the original and
+	// repeat its selective ACK. An arriving ordered/head item still takes the
+	// direct-delivery path below and can drain a completely full hold.
+	if self.receiveQueue.lifetimeBudget && sequenceNumber > self.nextSequenceNumber {
+		held := self.receiveQueue.GetByMessageId(messageId)
+		if held == nil {
+			held = self.receiveQueue.GetBySequenceNumber(sequenceNumber)
+		}
+		if held != nil {
+			self.peerAudit.Update(func(a *PeerAudit) { a.resend(held.messageByteCount) })
+			if held.committed && held.ack {
+				self.sendAck(held.sequenceNumber, held.messageId, true,
+					held.tag, held.unwrapped, held.transportType)
+			}
+			return false, nil
+		}
+	}
+
 	if removedItem := self.receiveQueue.RemoveBySequenceNumber(sequenceNumber); removedItem != nil {
 		self.peerAudit.Update(func(a *PeerAudit) {
 			a.resend(removedItem.messageByteCount)
@@ -14635,7 +14780,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			}
 		}
 
-		if canQueue(item) {
+		if canQueue(item) && self.reserveHeldItem(item) {
 			// the largest frame seen is the conservative gap estimate:
 			// over-counting commits fewer items and costs churn at the
 			// boundary, under-counting commits an item that is later evicted,
@@ -15378,6 +15523,12 @@ type receiveItem struct {
 }
 
 func (self *receiveItem) messagePoolReturn() {
+	// The decoded owner embeds this item and may be recycled by release().
+	// Capture its claim first, then release only after all roots are returned.
+	if budget := self.memoryBudget; budget != nil {
+		self.memoryBudget = nil
+		defer budget.Release(self.queueByteCount)
+	}
 	// Like ReceivePack, the owned hot-path item is embedded in decodedOwner.
 	// Return the independent outer frame before releasing the owner so this
 	// method never touches storage that may already have been reused.
@@ -15645,6 +15796,18 @@ func (self *sequenceContract) update(byteCount ByteCount) bool {
 func (self *sequenceContract) canUpdate(byteCount ByteCount) bool {
 	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
 	return self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.effectiveTransferByteCount
+}
+
+// An admission failure before wire publication spends no contract capacity.
+func (self *sequenceContract) rollbackUnwritten(byteCount ByteCount) {
+	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
+	if self.unackedByteCount < effectiveByteCount {
+		panic("unwritten transfer contract debit missing")
+	}
+	self.unackedByteCount -= effectiveByteCount
+	if self.statsEntry != nil {
+		self.statsEntry.updateUsedByteCount(self.ackedByteCount + self.unackedByteCount)
+	}
 }
 
 // Charges bytes that are on the wire and will never be acknowledged: a

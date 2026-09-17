@@ -2,6 +2,7 @@ package connect
 
 import (
 	"time"
+	"unsafe"
 )
 
 // The origin socket and Transfer acknowledge different delivery boundaries.
@@ -14,6 +15,13 @@ type tcpReturnChunk struct {
 	payload []byte
 	charge  ByteCount
 	fin     bool
+}
+
+func (self *TcpSequence) returnMemoryBudget() *TransferMemoryBudget {
+	if self.tcpBufferSettings.MemoryBudget != nil {
+		return self.tcpBufferSettings.MemoryBudget
+	}
+	return self.tcpBufferSettings.ReturnQueueBudget
 }
 
 // retainReturnChunk borrows payload and keeps an owned copy. Only the socket
@@ -34,7 +42,7 @@ func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin boo
 		}
 		charge += ByteCount(capacity + MessagePoolMetaByteCount)
 	}
-	budget := self.tcpBufferSettings.ReturnQueueBudget
+	budget := self.returnMemoryBudget()
 	limit := self.tcpBufferSettings.ReturnQueueMaxByteCount
 	if limit <= 0 {
 		limit = max(ByteCount(self.tcpBufferSettings.MaxWindowSize), mib(1))
@@ -63,7 +71,16 @@ func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin boo
 			self.mutex.Unlock()
 			return true
 		}
-		if self.returnByteCount+charge <= limit && (budget == nil || budget.TryReserve(charge)) {
+		metadataCharge := ByteCount(0)
+		metadataCapacity := cap(self.returnChunks)
+		if self.tcpBufferSettings.MemoryBudget != nil && len(self.returnChunks) == cap(self.returnChunks) && self.returnHead != len(self.returnChunks) {
+			metadataCapacity = max(4, 2*cap(self.returnChunks))
+			metadataCharge = ByteCount(metadataCapacity) * ByteCount(unsafe.Sizeof(tcpReturnChunk{}))
+		} else if self.tcpBufferSettings.MemoryBudget != nil && cap(self.returnChunks) == 0 {
+			metadataCapacity = 4
+			metadataCharge = ByteCount(metadataCapacity) * ByteCount(unsafe.Sizeof(tcpReturnChunk{}))
+		}
+		if self.returnByteCount+charge <= limit && (budget == nil || budget.TryReserve(charge+metadataCharge)) {
 			var owned []byte
 			if len(payload) != 0 {
 				owned = MessagePoolCopy(payload)
@@ -72,6 +89,15 @@ func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin boo
 				self.returnChunks = self.returnChunks[:0]
 				self.returnHead = 0
 				self.returnProgressTime = time.Now()
+			}
+			if metadataCharge > 0 {
+				chunks := make([]tcpReturnChunk, len(self.returnChunks), metadataCapacity)
+				copy(chunks, self.returnChunks)
+				self.returnChunks = chunks
+				// Growth temporarily retains both arrays. Admission paid for the
+				// complete new backing before allocation; only now retire the old.
+				budget.Release(self.returnMetadataByteCount)
+				self.returnMetadataByteCount = metadataCharge
 			}
 			self.returnChunks = append(self.returnChunks, tcpReturnChunk{start: start, end: end, payload: owned, charge: charge, fin: fin})
 			self.returnByteCount += charge
@@ -112,7 +138,7 @@ func (self *TcpSequence) acknowledgeReturnWithLock(ack uint32) {
 			}
 			MessagePoolReturn(chunk.payload)
 			self.returnByteCount -= chunk.charge
-			if budget := self.tcpBufferSettings.ReturnQueueBudget; budget != nil {
+			if budget := self.returnMemoryBudget(); budget != nil {
 				budget.Release(chunk.charge)
 			}
 			*chunk = tcpReturnChunk{}
@@ -212,11 +238,15 @@ func (self *TcpSequence) releaseReturnChunks() {
 	defer self.mutex.Unlock()
 	for _, chunk := range self.returnChunks[self.returnHead:] {
 		MessagePoolReturn(chunk.payload)
-		if budget := self.tcpBufferSettings.ReturnQueueBudget; budget != nil {
+		if budget := self.returnMemoryBudget(); budget != nil {
 			budget.Release(chunk.charge)
 		}
 	}
 	self.returnChunks = nil
+	if self.returnMetadataByteCount != 0 {
+		self.returnMemoryBudget().Release(self.returnMetadataByteCount)
+		self.returnMetadataByteCount = 0
+	}
 	self.returnHead = 0
 	self.returnByteCount = 0
 }

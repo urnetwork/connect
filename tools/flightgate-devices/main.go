@@ -15,6 +15,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -42,6 +45,16 @@ func main() {
 	command := os.Args[1]
 	args := os.Args[2:]
 	var err error
+	// Validate both allowlisted devices before setup, not only when
+	// the operator remembers to invoke the standalone preflight command.
+	switch command {
+	case "profile", "install", "load-build", "login", "connect-peer",
+		"allow-direct", "defer-timeout-resend", "lane-rule", "run", "campaign":
+		if err := requireDeviceCohort(); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
+			os.Exit(1)
+		}
+	}
 	switch command {
 	case "preflight":
 		err = preflight(args)
@@ -110,6 +123,9 @@ func role(serial string) (string, error) {
 }
 
 func adb(serial string, args ...string) (string, error) {
+	if _, err := role(serial); err != nil {
+		return "", err
+	}
 	full := append([]string{"-s", serial}, args...)
 	out, err := exec.Command("adb", full...).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
@@ -119,45 +135,78 @@ func adbShell(serial string, command string) (string, error) {
 	return adb(serial, "shell", command)
 }
 
-// preflight lists the attached devices against the allowlist and reports each
-// authorized device's battery and network profile. Extra serials are reported
-// as a deviation (the PERFVAR block wants none) but do not fail the tool.
+// preflight requires both MEMSTEADY devices online. Per the audit owner's
+// override, other attached serials are ignored and never addressed.
 func preflight(args []string) error {
 	fs := flag.NewFlagSet("preflight", flag.ExitOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	out, err := exec.Command("adb", "devices").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("adb devices: %w", err)
+	if err := requireDeviceCohort(); err != nil {
+		return err
 	}
-	seen := map[string]string{}
-	for _, line := range strings.Split(string(out), "\n")[1:] {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 {
-			seen[fields[0]] = fields[1]
-		}
-	}
-	ok := true
-	for serial, r := range allowedDevices {
-		state, present := seen[serial]
-		if !present || state != "device" {
-			fmt.Printf("%s: MISSING or not in device state (%q)\n", r, state)
-			ok = false
-			continue
-		}
+	for _, serial := range allowedDeviceSerials() {
+		r := allowedDevices[serial]
 		fmt.Printf("%s: present\n", r)
 		fmt.Printf("  %s\n", deviceProfileLine(serial))
 	}
-	for serial := range seen {
-		if _, allowed := allowedDevices[serial]; !allowed {
-			fmt.Printf("deviation: an unlisted serial is attached (left untouched)\n")
+	return nil
+}
+
+func allowedDeviceSerials() []string {
+	serials := make([]string, 0, len(allowedDevices))
+	for serial := range allowedDevices {
+		serials = append(serials, serial)
+	}
+	sort.Slice(serials, func(i, j int) bool { return allowedDevices[serials[i]] < allowedDevices[serials[j]] })
+	return serials
+}
+
+func requireDeviceCohort() error {
+	out, err := exec.Command("adb", "devices", "-l").Output()
+	if err != nil {
+		return fmt.Errorf("adb devices -l: %w", err)
+	}
+	return validateDeviceCohort(string(out))
+}
+
+func validateDeviceCohort(out string) error {
+	seen := map[string]string{}
+	header := false
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "List of devices attached" {
+			header = true
+			continue
+		}
+		if line == "" || strings.HasPrefix(line, "* daemon ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if !header {
+			return errors.New("malformed adb devices -l output")
+		}
+		if _, allowed := allowedDevices[fields[0]]; !allowed {
+			continue
+		}
+		if len(fields) < 2 {
+			return errors.New("malformed allowlisted entry in adb devices -l")
+		}
+		if _, duplicate := seen[fields[0]]; duplicate {
+			return errors.New("duplicate device entry in adb devices -l")
+		}
+		seen[fields[0]] = fields[1]
+	}
+	if !header {
+		return errors.New("missing adb devices -l header")
+	}
+	failures := []error{}
+	for _, serial := range allowedDeviceSerials() {
+		if seen[serial] != "device" {
+			failures = append(failures, fmt.Errorf("%s missing or not in device state (%q)", allowedDevices[serial], seen[serial]))
 		}
 	}
-	if !ok {
-		return errors.New("authorized device set incomplete")
-	}
-	return nil
+	return errors.Join(failures...)
 }
 
 func deviceProfileLine(serial string) string {
@@ -256,31 +305,63 @@ func loadBuild(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	out := filepath.Join(os.TempDir(), "flightgate-load")
-	build := exec.Command("go", "build", "-o", out, "./load")
-	build.Env = append(os.Environ(), "GOOS=android", "GOARCH=arm64", "CGO_ENABLED=0")
-	if b, err := build.CombinedOutput(); err != nil {
-		return fmt.Errorf("build: %v: %s", err, b)
+	_, err := buildAndInstallLoad()
+	return err
+}
+
+func buildAndInstallLoad() (string, error) {
+	if err := requireDeviceCohort(); err != nil {
+		return "", err
 	}
-	for serial, r := range allowedDevices {
+	dir, err := os.MkdirTemp("", "flightgate-load-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(dir)
+	out := filepath.Join(dir, "flightgate-load")
+	build := loadBuildCommand(out)
+	if b, err := build.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("build: %v: %s", err, b)
+	}
+	hash, err := fileSHA256(out)
+	if err != nil {
+		return "", err
+	}
+	for _, serial := range allowedDeviceSerials() {
+		r := allowedDevices[serial]
 		if o, err := adb(serial, "push", out, loadBinary); err != nil {
-			return fmt.Errorf("%s: push: %v: %s", r, err, o)
+			return "", fmt.Errorf("%s: push: %v: %s", r, err, o)
 		}
 		if _, err := adbShell(serial, "chmod 755 "+loadBinary); err != nil {
-			return fmt.Errorf("%s: chmod: %w", r, err)
+			return "", fmt.Errorf("%s: chmod: %w", r, err)
 		}
-		fmt.Printf("%s: load helper installed\n", r)
+		if err := verifyDeviceFile(serial, loadBinary, hash); err != nil {
+			return "", fmt.Errorf("%s: load helper: %w", r, err)
+		}
+		fmt.Printf("%s: load helper installed (SHA-256 %s)\n", r, hash)
 	}
-	return nil
+	return hash, nil
+}
+
+func loadBuildCommand(out string) *exec.Cmd {
+	_, source, _, _ := runtime.Caller(0)
+	build := exec.Command("go", "build", "-o", out, "./load")
+	build.Dir = filepath.Dir(source)
+	build.Env = append(os.Environ(), "GOOS=android", "GOARCH=arm64", "CGO_ENABLED=0")
+	return build
 }
 
 // broadcast sends one receiver action and waits for its FlightGate result
 // line, returning that line.
 func broadcast(serial string, action string, extras map[string]string, want string, timeout time.Duration) (string, error) {
-	start, _ := adbShell(serial, "date +%s")
+	start, err := adbShell(serial, "date +%s.%N")
+	startSeconds, clockErr := strconv.ParseFloat(start, 64)
+	if err != nil || clockErr != nil {
+		return "", errors.New("cannot read device clock before broadcast")
+	}
 	cmd := []string{"am", "broadcast", "-a", "com.bringyour.network.debug." + action, "-n", receiver}
 	for k, v := range extras {
-		cmd = append(cmd, "--es", k, v)
+		cmd = append(cmd, "--es", shellQuote(k), shellQuote(v))
 	}
 	if _, err := adbShell(serial, strings.Join(cmd, " ")); err != nil {
 		return "", fmt.Errorf("broadcast %s: %w", action, err)
@@ -293,8 +374,9 @@ func broadcast(serial string, action string, extras map[string]string, want stri
 			continue
 		}
 		// only accept a line logged after the broadcast
-		if ts := strings.Fields(out); len(ts) > 0 && start != "" {
-			if strings.TrimLeft(ts[0], " ") < start {
+		if ts := strings.Fields(out); len(ts) > 0 {
+			seconds, err := strconv.ParseFloat(ts[0], 64)
+			if err != nil || seconds < startSeconds {
 				continue
 			}
 		}
@@ -362,6 +444,12 @@ func provide(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Teardown must remain usable when the other allowlisted phone goes away.
+	if *control != "never" {
+		if err := requireDeviceCohort(); err != nil {
+			return err
+		}
+	}
 	extras := map[string]string{}
 	if *control != "" {
 		extras["control"] = *control
@@ -374,6 +462,9 @@ func provide(args []string) error {
 		return err
 	}
 	fmt.Printf("%s: %s\n", r, tail(line))
+	if !strings.Contains(line, "ok=true") {
+		return errors.New("provide failed")
+	}
 	return nil
 }
 
@@ -381,6 +472,7 @@ func connectPeer(args []string) error {
 	fs := flag.NewFlagSet("connect-peer", flag.ExitOnError)
 	serial := fs.String("serial", "", "device serial")
 	name := fs.String("name", "", "peer device name substring")
+	peerID := fs.String("peer-id", "", "exact peer client ID (required by MEMSTEADY)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -388,11 +480,17 @@ func connectPeer(args []string) error {
 	if err != nil {
 		return err
 	}
-	line, err := broadcast(*serial, "FG_CONNECT_PEER", map[string]string{"name": *name}, "action=connect-peer", 20*time.Second)
+	if *name == "" && *peerID == "" {
+		return errors.New("--peer-id or legacy --name is required")
+	}
+	line, err := broadcast(*serial, "FG_CONNECT_PEER", map[string]string{"name": *name, "client_id": *peerID}, "action=connect-peer", 20*time.Second)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("%s: %s\n", r, tail(line))
+	if !strings.Contains(line, "ok=true") && !strings.Contains(line, "needs_consent=true") {
+		return errors.New("connect-peer failed")
+	}
 	if strings.Contains(line, "needs_consent=true") {
 		fmt.Printf("%s: VPN consent pending; opening the app so it can finish starting the tunnel\n", r)
 		_, _ = adbShell(*serial, "monkey -p "+appPackage+" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
@@ -442,6 +540,9 @@ func disconnect(args []string) error {
 		return err
 	}
 	fmt.Printf("%s: %s\n", r, tail(line))
+	if !strings.Contains(line, "ok=true") {
+		return errors.New("disconnect failed")
+	}
 	return nil
 }
 

@@ -733,6 +733,12 @@ func (self *H3DatagramFragmenter) SendHybrid(
 	if _, err = self.send(message, maxDatagramByteCount, send); err == nil {
 		return false, nextMaxDatagramByteCount, nil
 	}
+	if errors.Is(err, errQuicDatagramFlightFull) {
+		// This complete message has not entered quic-go. A full shared
+		// queued/sent-root allowance is local pressure, not a connection error;
+		// use the already bounded reliable lane without waiting on ACKs here.
+		return true, nextMaxDatagramByteCount, nil
+	}
 
 	var tooLargeErr *quic.DatagramTooLargeError
 	if !errors.As(err, &tooLargeErr) ||
@@ -749,6 +755,9 @@ func (self *H3DatagramFragmenter) SendHybrid(
 		return true, nextMaxDatagramByteCount, nil
 	}
 	_, err = self.send(message, nextMaxDatagramByteCount, send)
+	if errors.Is(err, errQuicDatagramFlightFull) {
+		return true, nextMaxDatagramByteCount, nil
+	}
 	if err != nil {
 		self.stats.sendErrorCount.Add(1)
 	}

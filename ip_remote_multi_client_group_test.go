@@ -539,13 +539,46 @@ func TestMultiClientRaceRegistersCandidatesBeforeSend(t *testing.T) {
 // runs; otherwise the first SYN-ACK is dropped even though no winner decision
 // is needed.
 func TestMultiClientOneCandidateRegistersBeforeSend(t *testing.T) {
+	t.Run("isolated", func(t *testing.T) {
+		testMultiClientOneCandidateRegistersBeforeSend(t, false)
+	})
+	t.Run("unrelated_pool_teardown", func(t *testing.T) {
+		testMultiClientOneCandidateRegistersBeforeSend(t, true)
+	})
+}
+
+func testMultiClientOneCandidateRegistersBeforeSend(t *testing.T, unrelatedPoolTeardown bool) {
+	t.Helper()
 	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
 	defer closeParent()
-	poolOutstandingBefore := groupTestPoolOutstanding()
+	var unrelatedPackets [][]byte
+	if unrelatedPoolTeardown {
+		// Earlier tests can finish asynchronous receive teardown while this
+		// synchronous send runs. Exercise that interleaving without timers.
+		unrelatedPackets = [][]byte{MessagePoolCopy([]byte{2}), MessagePoolCopy([]byte{3})}
+	}
+	defer func() {
+		for _, packet := range unrelatedPackets {
+			MessagePoolReturn(packet)
+		}
+	}()
+	// Hold a witness for each of this operation's roots: the outgoing SYN,
+	// the caller's response, and the buffered response copied by the race.
+	// Process-global pool counts can fall as an earlier test finishes async
+	// cleanup, or can hide one leaked owner behind an unrelated return.
+	var packets, witnesses [][]byte
+	witnessPacket := func(packet []byte) {
+		packets = append(packets, packet)
+		witnesses = append(witnesses, groupTestPacketWitnesses(t, [][]byte{packet})[0])
+	}
+	defer func() {
+		requireGroupTestWitnessesReleased(t, packets, witnesses)
+	}()
 
 	tcpPath := udpTestPath(4)
 	tcpPath.Protocol = IpProtocolTcp
 	packet := MessagePoolCopy(ipOosTcpPacketSequence(tcpPath, tcpFlagSyn, 1000, nil))
+	witnessPacket(packet)
 	group := requireGroupTestPacketGroup(t, packet)
 	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{
 		tcpPath.ToIp4Path(): update,
@@ -557,6 +590,7 @@ func TestMultiClientOneCandidateRegistersBeforeSend(t *testing.T) {
 		ipPath *IpPath,
 		packet []byte,
 	) {
+		witnessPacket(packet)
 		delivered.Add(1)
 	})
 
@@ -565,7 +599,14 @@ func TestMultiClientOneCandidateRegistersBeforeSend(t *testing.T) {
 		settings: parent.settings,
 	}
 	client.sendGroupForTest = func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+		for _, packet := range unrelatedPackets {
+			if !MessagePoolReturn(packet) {
+				t.Error("unrelated teardown did not return its final packet owner")
+			}
+		}
+		unrelatedPackets = nil
 		responsePacket := MessagePoolCopy([]byte{1})
+		witnessPacket(responsePacket)
 		parent.clientReceivePacketResolve(
 			client,
 			TransferPath{},
@@ -596,12 +637,8 @@ func TestMultiClientOneCandidateRegistersBeforeSend(t *testing.T) {
 	if got := delivered.Load(); got != 1 {
 		t.Errorf("delivered responses = %d, want 1", got)
 	}
-	if poolOutstandingAfter := groupTestPoolOutstanding(); poolOutstandingAfter != poolOutstandingBefore {
-		t.Errorf(
-			"one-candidate synchronous response pool ownership = %d, want %d",
-			poolOutstandingAfter,
-			poolOutstandingBefore,
-		)
+	if len(witnesses) != 3 {
+		t.Errorf("witnessed packet roots = %d, want SYN, source response, and buffered response", len(witnesses))
 	}
 }
 

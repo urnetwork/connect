@@ -67,6 +67,7 @@ type ipv4FragmentDatagram struct {
 }
 
 type ipv4FragmentReassembler struct {
+	maxRetainedBytes  int
 	datagrams         map[ipv4FragmentKey]*ipv4FragmentDatagram
 	retainedByteCount int
 }
@@ -91,9 +92,10 @@ type ipv4FragmentProcessResult = ipFragmentProcessResult
 // callers whose packet entry points may run concurrently. LocalUserNat uses
 // one cache per already-serialized send shard and does not pay this lock.
 type ipFragmentGate struct {
-	mutex        sync.Mutex
-	reassembler4 *ipv4FragmentReassembler
-	reassembler6 *ipv6FragmentReassembler
+	maxRetainedBytes int
+	mutex            sync.Mutex
+	reassembler4     *ipv4FragmentReassembler
+	reassembler6     *ipv6FragmentReassembler
 }
 
 // the pre-dual-stack name
@@ -113,6 +115,9 @@ func (self *ipFragmentGate) processOwned(
 	if 0 < len(packet) && packet[0]>>4 == 6 {
 		if self.reassembler6 == nil {
 			self.reassembler6 = newIpv6FragmentReassembler()
+			if self.maxRetainedBytes > 0 {
+				self.reassembler6.maxRetainedBytes = self.maxRetainedBytes
+			}
 		}
 		return self.reassembler6.processResultAt(
 			source,
@@ -125,6 +130,9 @@ func (self *ipFragmentGate) processOwned(
 	}
 	if self.reassembler4 == nil {
 		self.reassembler4 = newIpv4FragmentReassembler()
+		if self.maxRetainedBytes > 0 {
+			self.reassembler4.maxRetainedBytes = self.maxRetainedBytes
+		}
 	}
 	return self.reassembler4.processResultAt(
 		source,
@@ -151,7 +159,8 @@ func (self *ipFragmentGate) close() {
 
 func newIpv4FragmentReassembler() *ipv4FragmentReassembler {
 	return &ipv4FragmentReassembler{
-		datagrams: make(map[ipv4FragmentKey]*ipv4FragmentDatagram),
+		maxRetainedBytes: ipv4FragmentReassemblyMaxRetainedBytes,
+		datagrams:        make(map[ipv4FragmentKey]*ipv4FragmentDatagram),
 	}
 }
 
@@ -235,6 +244,9 @@ func (self *ipv4FragmentReassembler) processResultAt(
 	}
 
 	self.expire(now)
+	if self.maxRetainedBytes <= 0 {
+		self.maxRetainedBytes = ipv4FragmentReassemblyMaxRetainedBytes
+	}
 
 	key := ipv4FragmentKey{
 		source:         source,
@@ -277,11 +289,11 @@ func (self *ipv4FragmentReassembler) processResultAt(
 	if datagram == nil {
 		self.makeDatagramRoom(now)
 		packetCost := cap(packet)
-		if ipv4FragmentReassemblyMaxRetainedBytes < packetCost {
+		if self.maxRetainedBytes < packetCost {
 			MessagePoolReturn(packet)
 			return ipFragmentProcessResult{fragment: true}
 		}
-		for self.retainedByteCount+packetCost > ipv4FragmentReassemblyMaxRetainedBytes {
+		for self.retainedByteCount+packetCost > self.maxRetainedBytes {
 			if !self.releaseOldestDatagram(ipv4FragmentKey{}) {
 				MessagePoolReturn(packet)
 				return ipFragmentProcessResult{fragment: true}
@@ -293,7 +305,7 @@ func (self *ipv4FragmentReassembler) processResultAt(
 			finalPayloadByteCount: -1,
 		}
 		self.datagrams[key] = datagram
-	} else if self.retainedByteCount+cap(packet) > ipv4FragmentReassemblyMaxRetainedBytes {
+	} else if self.retainedByteCount+cap(packet) > self.maxRetainedBytes {
 		return drop()
 	}
 

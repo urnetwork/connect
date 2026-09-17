@@ -225,8 +225,8 @@ type shareTableMemoryPair struct {
 	deviceTarget ByteCount
 	// M, set through sdk.SetMemoryLimit and read here as the process budget
 	processBudget ByteCount
-	// the record's figure for the binding row at this target, in Mb/s of
-	// goodput (§51.3's table)
+	// The record's arithmetic binding rate, not a measured performance gate:
+	// MEMSTEADY's composed mobile ledger or the legacy §51.3 server table.
 	recordedMbps float64
 	// why this pair violates a constraint deliberately, empty for a pair that
 	// has to satisfy both. A declared exception is a kill-limit-bound host
@@ -265,17 +265,27 @@ func shareTableMemoryPairs() []shareTableMemoryPair {
 			name:          "iOS, a 20 MiB target in the extension's 32 MiB budget",
 			deviceTarget:  mib(20),
 			processBudget: mib(32),
-			// §51.3: a 1.875 MiB stream window at a 20 MiB target
-			recordedMbps: 66,
+			// MEMSTEADY: 1104 KiB stream credit after the fixed 1600 KiB
+			// retained-owner envelope, not §51.3's receive-only 1.875 MiB.
+			recordedMbps: 38.2,
 			exception:    "the packet tunnel provider is killed above 50 MiB and the Go runtime takes about 16 of it (§48.1), so neither number is a choice; the phone pays the continuous collection the collector constraint names and §48.6 step 0a has no memory to give it",
 		},
 		{
-			name:          "Android, a 24 MiB target in a 32 MiB budget",
+			name:          "historical Android, a 24 MiB target in a 32 MiB budget",
 			deviceTarget:  mib(24),
 			processBudget: mib(32),
-			// §51.3: a 2.25 MiB stream window at a 24 MiB target
-			recordedMbps: 80,
+			// The constrained claim branch also has 1104 KiB stream credit.
+			recordedMbps: 38.2,
 			exception:    "Android mirrors the iOS budget by decision rather than by platform limit (§48.6 step 0b), and sits further outside both bounds than iOS does; a raise is the product decision that step names, not a change to this table",
+		},
+		{
+			name:          "Android, a 28 MiB target in a 40 MiB budget",
+			deviceTarget:  mib(28),
+			processBudget: mib(40),
+			// The current Android profile retains 2688 KiB stream credit and
+			// admits the fixed owners in its larger 5184 KiB inner claim.
+			recordedMbps: 93.0,
+			exception:    "the normal Android profile is independently fixed at 28/40 MiB; it does not satisfy the historical three-times collector heuristic, and runtime acceptance remains a separate measured gate",
 		},
 		{
 			name:          "the desktop's first step, 128 MiB in 384",
@@ -409,11 +419,26 @@ func TestTheShareTableBinderIsTheH3StreamWindow(t *testing.T) {
 			)
 		}
 
-		// and the landing's own claim, which is a ratio rather than a rate:
+		// The composed mobile ledger supersedes the historical receive-only
+		// doubling claim. Keep an exact byte assertion rather than widening
+		// the rate tolerance to hide a changed window.
+		settings := DefaultPlatformTransportSettingsWithMemoryTarget(scenario.deviceTarget)
+		ledger := shareTableH3LedgerForTarget(scenario.deviceTarget)
+		if binderWindow != ledger.stream || settings.H3BudgetByteCount != ledger.reservation {
+			t.Errorf("%s: binder/claim %d/%d do not match declared retained ledger %+v",
+				scenario.name, binderWindow, settings.H3BudgetByteCount, ledger)
+		}
+		if ledger.fixed != 0 {
+			if ledger.connection+ledger.fixed > settings.H3BudgetByteCount {
+				t.Errorf("%s: receive and retained owners exceed the carrier claim", scenario.name)
+			}
+			continue
+		}
+
+		// The server landing's own claim is a ratio rather than a rate:
 		// §43.2 doubles the binder by taking the stream window from three
 		// eighths of the reservation to six. Computed from the shipping
 		// reservation so it cannot drift from the fractions.
-		settings := DefaultPlatformTransportSettingsWithMemoryTarget(scenario.deviceTarget)
 		reservationDraw := scenario.deviceTarget / h3BudgetShareDivisor
 		beforeTheLanding := reservationDraw * 3 / h3ReceiveWindowShareDenominator
 		if binderWindow != 2*beforeTheLanding {
@@ -423,12 +448,8 @@ func TestTheShareTableBinderIsTheH3StreamWindow(t *testing.T) {
 				float64(binderWindow)/float64(max(beforeTheLanding, 1)),
 			)
 		}
-		// the reservation is its draw wherever the draw clears the 3 MiB
-		// admission floor, which the phones' targets do not: at 20 MiB the
-		// eighth is 2.5 MiB and the reservation reads its floor, while the
-		// windows are fractions of the draw itself and keep their own floors
-		// (§51.1). So the figures above are the draw's at every pair, and this
-		// holds the reservation to it only where the floor is not what it reads.
+		// Outside the finite policy the legacy reservation is its draw once
+		// that draw clears the 3 MiB admission floor (§51.1).
 		if reservationDraw >= mib(3) && settings.H3BudgetByteCount != reservationDraw {
 			t.Errorf(
 				"%s: the reservation is %d rather than the %d its eighth gives; the binder arithmetic above is computed from the draw, and a floored reservation here would mean the figures belong to a different budget",

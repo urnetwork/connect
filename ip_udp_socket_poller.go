@@ -232,6 +232,12 @@ func drainReadyUdpSocket(fd int, sequence *UdpSequence, buffer []byte) error {
 	if sequence == nil || len(buffer) == 0 {
 		return syscall.EINVAL
 	}
+	// A cached readiness registration can race unregister/Close. Keep the
+	// flow's receive scratch allowance until packetization and handoff finish.
+	if !sequence.startRetirementOperation() {
+		return syscall.EBADF
+	}
+	defer sequence.finishRetirementOperation()
 	maxReads := max(1, sequence.udpBufferSettings.WriteBatchSize)
 	for range maxReads {
 		n, err := syscall.Read(SocketHandle(fd), buffer)
