@@ -366,6 +366,22 @@ func readAcceptanceManifest(path string) (acceptanceManifest, error) {
 	return manifest, nil
 }
 
+// Verify the bytes as well as the audit profile before allowing an acceptance
+// artifact to replace an installed app, including a newer version code.
+func verifyAcceptanceArtifact(apk, manifestPath string) (acceptanceManifest, error) {
+	manifest, err := readAcceptanceManifest(manifestPath)
+	if err != nil {
+		return manifest, err
+	}
+	hash, err := fileSHA256(apk)
+	if err != nil {
+		return manifest, fmt.Errorf("read acceptance APK: %w", err)
+	}
+	if hash != manifest.APKSHA256 {
+		return manifest, errors.New("APK does not match completed build manifest")
+	}
+	return manifest, nil
+}
 type memsteadyDeviceStatus struct {
 	ClientID                string `json:"client_id"`
 	MemoryProfile           string `json:"memory_profile"`

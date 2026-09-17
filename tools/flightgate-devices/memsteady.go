@@ -837,13 +837,8 @@ func runMemsteadySeries(args []string) error {
 			return fmt.Errorf("bad build spec %q", spec)
 		}
 		manifestPath := filepath.Join(filepath.Dir(apk), "build-manifest.json")
-		manifest, err := readAcceptanceManifest(manifestPath)
-		if err != nil {
-			return err
-		}
-		hash, err := fileSHA256(apk)
-		if err != nil || hash != manifest.APKSHA256 {
-			return fmt.Errorf("%s: APK does not match completed build manifest", label)
+		if _, err := verifyAcceptanceArtifact(apk, manifestPath); err != nil {
+			return fmt.Errorf("%s: %w", label, err)
 		}
 		specs = append(specs, buildSpec{label, apk, manifestPath})
 	}
@@ -886,7 +881,7 @@ func runMemsteadySeries(args []string) error {
 		if err := requireDeviceCohort(); err != nil {
 			return errors.Join(append(failures, err)...)
 		}
-		if err := install([]string{"--update", "--apk", spec.apk, *deviceA, *deviceB}); err != nil {
+		if err := install([]string{"--update", "--apk", spec.apk, "--build-manifest", spec.manifest, *deviceA, *deviceB}); err != nil {
 			return errors.Join(append(failures, err)...)
 		}
 		for _, serial := range []string{*deviceA, *deviceB} {

@@ -264,15 +264,34 @@ func profile(args []string) error {
 // APK. A differently signed build cannot be updated in place, so the existing
 // app is uninstalled first; the devices are test devices and this is authorized.
 func install(args []string) error {
+	return installWithADB(args, adb)
+}
+
+func installWithADB(args []string, runADB func(string, ...string) (string, error)) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	apk := fs.String("apk", "", "path to the debug APK")
 	update := fs.Bool("update", false, "update in place (same signature), keeping the app's data and session")
+	manifestPath := fs.String("build-manifest", "", "verified acceptance manifest; permits a lower version code with --update")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *apk == "" {
 		return errors.New("--apk is required")
 	}
+	installArgs := []string{"install", "-r", "-g"}
+	if *manifestPath != "" {
+		if !*update {
+			return errors.New("--build-manifest requires --update")
+		}
+		if _, err := verifyAcceptanceArtifact(*apk, *manifestPath); err != nil {
+			return err
+		}
+		// Audit source revisions can produce a lower version code than the
+		// installed app. Permit that only for this hash-verified acceptance
+		// artifact; keep ordinary installs/updates and signature checks intact.
+		installArgs = append(installArgs, "-d")
+	}
+	installArgs = append(installArgs, *apk)
 	serials := fs.Args()
 	if len(serials) == 0 {
 		for serial := range allowedDevices {
@@ -284,15 +303,15 @@ func install(args []string) error {
 		if err != nil {
 			return err
 		}
-		before, _ := adbShell(serial, "dumpsys package "+appPackage+" | grep -m1 versionName")
+		before, _ := runADB(serial, "shell", "dumpsys package "+appPackage+" | grep -m1 versionName")
 		if !*update {
-			_, _ = adb(serial, "uninstall", appPackage)
+			_, _ = runADB(serial, "uninstall", appPackage)
 		}
-		out, err := adb(serial, "install", "-r", "-g", *apk)
+		out, err := runADB(serial, installArgs...)
 		if err != nil {
 			return fmt.Errorf("%s: install: %v: %s", r, err, out)
 		}
-		after, _ := adbShell(serial, "dumpsys package "+appPackage+" | grep -m1 versionName")
+		after, _ := runADB(serial, "shell", "dumpsys package "+appPackage+" | grep -m1 versionName")
 		fmt.Printf("%s: %s -> %s\n", r, strings.TrimSpace(before), strings.TrimSpace(after))
 	}
 	return nil

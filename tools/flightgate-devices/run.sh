@@ -6,7 +6,9 @@
 #
 #   ./run.sh preflight
 #   ./run.sh profile --serial S --wifi on|off|keep --data on|off|keep
-#   ./run.sh install --apk app-github-debug.apk [--serial S ...]
+#   ./run.sh install --apk app-github-debug.apk [S ...]
+#   ./run.sh install --update --apk app-github-debug.apk --build-manifest build-manifest.json [S ...]
+#       verified acceptance updates permit a lower version code without clearing app data
 #   ./run.sh load-build                          build the on-device load helper (android/arm64)
 #   ./run.sh login --serial S --user-file F --pass-file F
 #   ./run.sh provide --serial S --control never|network|always --network wifi|all
