@@ -2803,10 +2803,10 @@ func (self *PlatformTransport) runH3(
 			}
 			var attempt *h3DialAttempt
 			if len(candidates) == 1 {
-				attempt, err = self.dialH3(attemptCtx, ptMode, candidates[0], wrapPacketConn, tlsConfig, quicConfig, slowMultiple, false)
+				attempt, err = self.dialH3(attemptCtx, ptMode, serverName, candidates[0], wrapPacketConn, tlsConfig, quicConfig, slowMultiple, false)
 			} else {
 				attempt, err = raceH3Dial(attemptCtx, candidates, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
-					return self.dialH3(dialCtx, ptMode, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
+					return self.dialH3(dialCtx, ptMode, serverName, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
 				})
 			}
 			if err != nil {

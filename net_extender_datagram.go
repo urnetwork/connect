@@ -199,3 +199,16 @@ func (self *extenderPacketConn) SetWriteDeadline(t time.Time) error {
 func IsExtenderDatagramTooLarge(err error) bool {
 	return errors.Is(err, errExtenderDatagramTooLarge)
 }
+
+// ExtenderPacketConnRemoteAddr is the peer a relayed packet connection reports,
+// or nil when the connection is not one.
+//
+// Quic dials a peer and then matches arriving packets against it, so a caller
+// that supplies its own idea of the address gets every packet discarded. An
+// extender connection knows the only peer it has.
+func ExtenderPacketConnRemoteAddr(packetConn net.PacketConn) net.Addr {
+	if extenderConn, ok := packetConn.(*extenderPacketConn); ok {
+		return extenderConn.remote
+	}
+	return nil
+}
