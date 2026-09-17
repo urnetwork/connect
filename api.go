@@ -474,6 +474,19 @@ type GetClientKeyResult struct {
 	PublicKey []byte `json:"public_key"`
 }
 
+// GetClientKeyHistoryResult is the response of the unauthenticated
+// `/key/<client_id>/history` API: the peer's signed registration chain,
+// generation 1 first.
+//
+// An empty history is a successful answer meaning "this client has no signed
+// evidence" — a legacy client, or an operator that does not run the signed
+// path. It is NOT an error, and the distinction is load-bearing: an error is
+// an availability signal and must never be read as evidence of substitution.
+// See `transfer_key_history_session.go` and DESIGNNOTES3 §5.3.
+type GetClientKeyHistoryResult struct {
+	History [][]byte `json:"history"`
+}
+
 // GetClientKey fetches a peer client's long-lived public identity key
 // from the unauthenticated `/key/<client_id>` API. Used as the
 // out-of-band cross-check against the

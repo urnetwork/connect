@@ -535,6 +535,13 @@ const (
 	// inbound plaintext application frames from the peer were discarded by
 	// the receive gate. Fired once per session until the session seals.
 	EncryptionEventRequiredReceiveDiscarded
+	// EncryptionEventKeyIdentityRejected: the peer's contract-supplied
+	// identity key was contradicted by signed evidence, or the signed
+	// evidence itself did not verify. Terminal for the session: the cipher is
+	// never exposed and the peer should be excluded from any candidate
+	// window. This is a verified disagreement, never a failure to obtain
+	// evidence — see DESIGNNOTES3 §5.3.
+	EncryptionEventKeyIdentityRejected
 )
 
 // EncryptionEvent is a per-peer encryption lifecycle notification. Events are
@@ -652,6 +659,38 @@ type EncryptionSettings struct {
 	// Leaving nil disables the cross-check entirely.
 	NewPeerClientPublicKeyFetcher func(peerId Id) func(ctx context.Context) ([]byte, error)
 
+	// NewPeerClientKeyHistoryFetcher, when non-nil, resolves a peer's SIGNED
+	// client-key registration history. Same per-session factory shape, and the
+	// same lifetime rationale, as `NewPeerClientPublicKeyFetcher`.
+	//
+	// This is the strong form of the cross-check above. The unsigned `/key`
+	// comparison only catches a platform inconsistent between two of its own
+	// channels; a signed history forces a substituting platform to sign the
+	// substitution, inside a hash chain it cannot fork without leaving two
+	// permanently attributable histories for one client id. See DESIGNNOTES3.
+	//
+	// An empty history (no error) means the peer has no signed registration —
+	// a legacy client, or a platform that does not run the signed path at all.
+	// That is tier P in DESIGNNOTES3 §2 and is handled by the ratchet, not by
+	// refusing outright. An ERROR means the evidence could not be obtained,
+	// which is an availability failure and must never be treated as evidence
+	// of substitution (DESIGNNOTES3 §5.3).
+	NewPeerClientKeyHistoryFetcher func(peerId Id) func(ctx context.Context) ([][]byte, error)
+
+	// TrustedClientKeySigners pins which (domain, signer) pairs may sign a
+	// registration. Empty leaves only the per-peer pin below, which means
+	// first contact with an unknown peer establishes rather than checks.
+	TrustedClientKeySigners []ClientKeyTrustedSigner
+
+	// PeerClientKeyPinStore persists the tier ratchet. Nil disables it, which
+	// permits an operator to downgrade a peer from signed to unsigned simply
+	// by withholding the history — cheaper and quieter than forging it. Nil is
+	// appropriate only for tests.
+	PeerClientKeyPinStore PeerClientKeyPinStore
+
+	// MaxClientKeyHistoryGenerations bounds an accepted chain.
+	MaxClientKeyHistoryGenerations int
+
 	// ProvideTlsCertificatePem, when set together with
 	// `ProvideTlsPrivateKeyPem`, loads the local sequence-level TLS server-role
 	// cert + private key instead of generating a fresh pair on construction.
@@ -739,6 +778,13 @@ func DefaultEncryptionSettings() *EncryptionSettings {
 		TlsInitialRetryMaxInterval:    5 * time.Minute,
 		RequiredCipherPollInterval:    20 * time.Millisecond,
 		EncryptionControlUseCompanion: true,
+		// Signed-identity chain bound. A peer's identity key rotates rarely —
+		// a provider persists its seed across restarts and only an explicit
+		// logout rotates it — so a real chain is a handful of generations.
+		// The bound exists to cap verification work on a hostile response,
+		// where each generation costs a signature recovery and a re-marshal,
+		// not to be a tight fit.
+		MaxClientKeyHistoryGenerations: 64,
 		// Undecryptable-wrap nack pacing (see EncryptedControlUnknownWrapNack
 		// in the proto): the emit interval bounds nack traffic against a
 		// sealing burst (one per interval per session, not per frame); the
@@ -1085,6 +1131,17 @@ type peerEncryptionSession struct {
 	// grows, and both old and new certs stay trusted. Per-peer: survives
 	// handshake resets.
 	trustedPeerCertPems map[string]bool
+
+	// peerClientKeyHistoryFetcher resolves the peer's signed registration
+	// history. Minted per session from the settings factory, like
+	// `peerClientPublicKeyFetcher`.
+	peerClientKeyHistoryFetcher func(ctx context.Context) ([][]byte, error)
+	// keyHistoryState gates `Cipher()` when the session is required to
+	// corroborate the contract-supplied identity key against signed evidence.
+	// See `resolvePeerClientKeyHistory`.
+	keyHistoryState         clientKeyHistoryState
+	keyHistoryFetchInFlight bool
+	nextKeyHistoryFetchTime time.Time
 }
 
 func newPeerEncryptionSession(
@@ -1129,6 +1186,9 @@ func newPeerEncryptionSession(
 	// across session boundaries.
 	if settings != nil && settings.NewPeerClientPublicKeyFetcher != nil {
 		s.peerClientPublicKeyFetcher = settings.NewPeerClientPublicKeyFetcher(peerId)
+	}
+	if settings != nil && settings.NewPeerClientKeyHistoryFetcher != nil {
+		s.peerClientKeyHistoryFetcher = settings.NewPeerClientKeyHistoryFetcher(peerId)
 	}
 	return s
 }
@@ -2063,6 +2123,12 @@ func (self *peerEncryptionSession) SetPeerClientPublicKey(pub ed25519.PublicKey)
 		defer self.stateLock.Unlock()
 		if len(self.peerClientPublicKey) == 0 {
 			self.peerClientPublicKey = append(ed25519.PublicKey(nil), pub...)
+			// Arm the signed-identity gate in the same critical section that
+			// commits the key, so there is no window in which the key is
+			// trusted and the gate is not yet armed.
+			if self.keyHistoryRequiredWithLock() {
+				self.keyHistoryState = clientKeyHistoryPending
+			}
 			return true
 		}
 		if !bytes.Equal(self.peerClientPublicKey, pub) {
@@ -2092,6 +2158,11 @@ func (self *peerEncryptionSession) SetPeerClientPublicKey(pub ed25519.PublicKey)
 				self.crossCheckPeerClientPublicKey(contractPub)
 			})
 		}
+		// Signed-identity resolution (DESIGNNOTES3). Unlike the cross-check
+		// above this is not advisory: under `EncryptionModeRequired` it holds
+		// the cipher until the contract-supplied key is corroborated, and a
+		// verified disagreement is terminal for the session.
+		self.resolvePeerClientKeyHistory(append(ed25519.PublicKey(nil), pub...))
 	}
 }
 
@@ -2625,6 +2696,26 @@ func (self *peerEncryptionSession) encryptionStateSnapshot() (
 func (self *peerEncryptionSession) Cipher() *sequenceCipher {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	// Signed-identity gate (DESIGNNOTES3 §5.1). Until the peer's identity key
+	// is corroborated against signed evidence, the cipher is withheld exactly
+	// as it is withheld before the identity proof verifies: to every caller an
+	// unresolved peer is indistinguishable from an unfinished handshake, and
+	// the Required send gate already parks application data on `Cipher()`.
+	//
+	// Withholding rather than tearing down is deliberate. The contract key is
+	// still committed internally, so the cert chain and the identity proof
+	// verify normally; what does not happen is any application byte leaving
+	// for, or being accepted from, a peer whose key the platform may have
+	// chosen. A rejected resolution is terminal and never re-enters pending.
+	switch self.keyHistoryState {
+	case clientKeyHistoryPending, clientKeyHistoryRejected:
+		if self.client.log.V(2).Enabled() {
+			self.client.log.V(2).Infof(
+				"[key]%s Cipher()=nil: signed identity %s\n", self.logTag, self.keyHistoryState,
+			)
+		}
+		return nil
+	}
 	if self.establishedEpoch == nil {
 		if self.client.log.V(2).Enabled() {
 			// V(2) only (called per send): trace the specific reason the
