@@ -752,8 +752,9 @@ observation; queue evidence determines whether further capacity probing stops.
 The deterministic mismatch/model/race reruns and ACK benchmark passed. Host TCP
 controls completed, but the later audit found missing performance assertions
 and slow candidates; see §13. Preserve every reading and failure-before log. The
-configured server/connect and server/proxy integration tiers remain deferred
-until the local launcher and test resources agree on the PostgreSQL credential.
+At this checkpoint, the configured server/connect and server/proxy integration
+tiers remained deferred until the local launcher and test resources agreed on
+the PostgreSQL credential. Section 40 closes that deferral.
 
 ## 12. Adjacent root-cause review and deterministic completion gate
 
@@ -948,7 +949,8 @@ the 32 steady large-message pairs and small-frame capacity-change matrix.
 
 Do not accept the candidate or claim all cells optimal until these two cases,
 the full mismatch matrix and both host TCP buffer configurations pass on the
-same source. Database-backed server integrations remain deferred as requested.
+same source. Database-backed server integrations remained deferred at this
+checkpoint as requested; section 40 records their later completion.
 
 ## 17. Preserve service evidence across a deliberate drain
 
@@ -1909,9 +1911,10 @@ the narrow fix or adding a per-message timer/heap scan before reviewing the
 worker's complete pending-deadline ownership.
 
 Repeat combined validation after independently proved corrections are
-integrated, without waiting for system quiescence. The database-backed server
-tiers remain deferred; fresh deterministic server runner attempts currently
-fail bootstrap before compilation and must not be reported as test passes.
+integrated, without waiting for system quiescence. At this checkpoint, the
+database-backed server tiers remained deferred; fresh deterministic server
+runner attempts failed bootstrap before compilation and could not be reported
+as test passes. Section 40 records the later configured runs.
 
 ### App-reported network changes and estimator stability
 
@@ -2887,7 +2890,8 @@ caller arguments and stops on selector failure. Its three deterministic roots
 pass 21/21 race executions, and the final official no-test traversal selects
 exactly the four legitimate packages without entering baseline or evaluator
 artifacts. The full product payload was already green against the same source
-and was not repeated after this harness-only correction.
+and was not repeated at that checkpoint. The later final-source campaign below
+repeats it.
 
 The full proxy product package passes its configured integration in 316.690
 seconds. Its first wrapper run then reproduced an independent server regression:
@@ -2899,13 +2903,138 @@ signal, repeated signal, normal-exit, runner-failure and logger-failure roots.
 All nine roots pass three race repetitions. No sibling wrapper contains the
 same foreground-tee pattern.
 
-The official proxy script then passes end to end: the product package in
-316.690 seconds and acceptance in 5.958 seconds. The final log SHA-256 is
+At that checkpoint, the official proxy script passed end to end: the product
+package in 316.690 seconds and acceptance in 5.958 seconds. Its log SHA-256 is
 `3409fa1f46440b3e9eff31d935bb6baf8fcb5e7e3e0f85b2932dd11ade3ce31a`.
 The exact paths, connect hashes and host loads are recorded in
 [the final report](THROUGHPUT-REPORT-PR2.md#final-configured-server-integration).
 Both server fixes are rebased onto clean server main revision `3a3cc698`; the
-final server branch revision is `21acdcb5`.
+server branch was then advanced by the test-fixture correction below.
+
+The full connect tier was repeated after final connect commit `f8261152`.
+All four official packages pass in 4,055.767, 1,437.994, 33.015 and 0.246
+seconds; the combined log SHA-256 is
+`b01672b716faf2039e3cbe55c4a22f93133b8d05df98c8a006203702ca479c24`.
+
+The frozen proxy build first exposed a repository-pair mismatch: server
+`23135c01` references six memory-telemetry fields present only in four
+pre-existing uncommitted SDK files. A clean detached SDK snapshot pins exactly
+that patch as commit `17a7a332`; its patch SHA-256 is
+`d2adcf17943a1338faaa1b65b233cd0e82b43510724e941017e127ddac9db48d`.
+Nine SDK and 12 proxy telemetry race executions pass.
+
+The first full proxy execution on that coherent pair returned zero but is not
+accepted: its log contains a recovered nil-pointer panic from an asynchronous
+worker leaked by `TestProxyDeviceMemoryBudgetReleasedOnDeviceClose`. The
+original fixture omitted its SDK device, TUN, initial activity and
+manager-owned context. The test falsely passed three times while producing
+three panics. New direct-run and activity roots fail 6/6 on that shape, and a
+wrong-parent control fails 3/3.
+
+Server commit `27b7dad9` replaces only that test fixture with initialized,
+lifecycle-realistic owners. The focused 22-test selection passes 220/220 under
+the race detector. The official proxy script then passes the product package
+in 334.528 seconds and acceptance in 6.132 seconds. The final log SHA-256 is
+`38395dac8dca9013c13480e7f5304a4ad6d393daa50acff0c62071472a29d73f`,
+with zero recovered panic, unexpected-error, nil-pointer, fatal, warning or
+race matches. Exact snapshots, loads and rejected evidence are recorded in
+[the final report](THROUGHPUT-REPORT-PR2.md#final-configured-server-integration).
+
+## 41. Close shared cold pacing and provider pure-ACK admission
+
+The final adjacent review found two independent losses after the retained
+window and quality-generation work.
+
+### One physical service needs one cold pacing rate
+
+Lane-local cumulative delivery is valid window-sizing evidence, but it cannot
+independently price several logical lanes that consume one physical H1 pacing
+clock. After `NetworkQualityChanged`, two or four lanes could each measure a
+healthy local rate while their shared pacer saw only one lane's rate. The
+deterministic consumer released 27,648 of 49,152 requested bytes by its
+30.03 ms deadline. Equal and unequal lane shares reproduced the same scope
+mismatch; a single lane and independent destinations were controls.
+
+The correction keeps a small service-owned history of exact, once-only H1
+delivery credit. It records original offer and ACK-arrival endpoints across
+logical lanes and serialization drains. A qualified interval spans at least
+the greater of two path residences and four sampling cadences. The first
+arrival group's bytes remain outside the numerator. Rebucketting preserves
+the raw endpoints, permission and quality-generation boundaries reject old
+offers, and idle expiry remains separate from endpoint retention. Retention is
+anchored to the newest non-future arrival, so a complete interval remains
+valid at its exact freshness boundary and expires immediately afterward.
+
+This common rate is a cold pacing fallback only when no positive physical
+serialization rate exists. A measured serializer remains authoritative.
+Logical delivery, learned window size, peer permission and memory accounting
+remain per sequence. A quality event clears the common measurement history
+without changing reservations, delivered-byte ownership or the already spent
+opening probe.
+
+Six fixed entries are sufficient for four measurement buckets plus both
+endpoint phases. The structure is 360 bytes and adds 3,248 bytes less per
+service than the reviewed 64-entry counterfactual. Both versions allocate
+zero bytes per operation. Under the recorded concurrent host load, the
+six-entry medians were 375.5 ns for publication, 450.0 ns for estimation and
+98.21 ns for rebucketing. The 64-entry overlay was 3.1%, 33.5% and 484.4%
+slower respectively.
+
+Permanent roots cover one, two and four lanes; equal and unequal shares; a new
+idle sibling; independent services; read-only statistics; permission,
+carrier and quality-generation boundaries; tied and reordered arrivals;
+cadence changes; worst endpoint phase; future/stale evidence; unknown offers;
+and the exact retention/freshness edges. The focused shared-delivery and
+quality selection passes 294/294 race executions.
+
+### A generated pure ACK needs its per-flow owner through admission
+
+The provider's exact 52-byte TCP pure ACK was generated on a dedicated flow
+worker, then classified like a shared regenerable control. When the pinned H1
+provider lane's two admission slots were full, the shared zero-wait path
+refused it. Releasing a slot could not recover the already discarded ACK, and
+the peer could remain stalled until it retransmitted. The failure reproduced
+under both constant and delivery-sized windows while the available-slot and
+public-callback controls passed.
+
+The ACK worker now has an explicit dedicated-control recovery mode. It may
+wait for bounded Transfer admission on that one flow's goroutine and is
+cancelled and joined with the provider. Once admitted, the control retains the
+ordinary regenerable ACK lifetime; only consumed socket data keeps the longer
+post-timeout replay lease. Shared public callbacks, resets, unreachables and
+other synthesized controls still receive immediate refusal when their bounded
+workers are full.
+
+If more TCP progress arrives during the wait, cumulative semantics remain the
+contract: the worker may deliver the retained head and then the newer head, or
+a future coalescer may replace it, but the newest cumulative byte must arrive
+once without retransmission. The deterministic roots also prove bounded
+cancellation, pool/admission reclamation, both window policies and unchanged
+zero-wait public behavior. The focused five-test group passes 50/50, and its
+adjacent provider recovery group passes 18/18 under the race detector.
+
+### Repeated quality callbacks are idempotent
+
+Platform listeners may report the same cell bar, cell type or Wi-Fi bar from
+many threads. One client worker serializes estimator resets. Notifications
+inside the five-second listener interval update the quiet boundary but do not
+open another generation; the shared physical service also accepts a generation
+only once. A local loopback destination participates in the local reset but is
+excluded from peer wire fanout.
+
+The permanent storm root runs 128 concurrent callbacks while 32 public
+statistics readers overlap the reset. It requires one applied generation,
+valid snapshots throughout, and exactly one later generation after the quiet
+boundary. Ten race repetitions pass with no panic, recovered error, nil
+dereference or race diagnostic. This bounds work and history replacement even
+when a native listener is noisy; sustained ordinary feedback still adapts
+without any notification.
+
+The final immutable `f8261152` campaign passes 566 race-enabled correctness
+tests, all 858 model rows, all 12 broad-regression rows, 43 allocation-free
+pacing benchmark rows and the calibrated physical H1 comparison. Every
+manifest records `dirty=false` and source digest
+`a22399024dd9b3547d0e82a8a6e217a2718ce5171f2bd82a8762dc9681bec850`.
 
 [pr213]: https://github.com/urnetwork/connect/pull/213
 [rig]: https://github.com/Ryanmello07/connect/blob/b54f9f72bec116c0986e6c51ed13cc2f01805bee/THROUGHPUT-RIG-REVIEW.md

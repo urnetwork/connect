@@ -1,6 +1,6 @@
 # Throughput fix 2: local validation report
 
-Date: 2026-09-16
+Date: 2026-09-17
 Branch: `throughput-fix-2`
 Original validation source revision: `b51530f3a402cb1dd5fe5d1daae344302a1f3069`
 Original validation source manifest: `034a8ba28c61e70407d050228067a342b36f49505ae915cb99a7824a19bd90ee`
@@ -38,30 +38,38 @@ this report are chronological evidence and are superseded by the implementation
 sections near the end.
 
 The [shared-pacing review](throughput-fix-2-results/window-cumulative-shared-reserve-root-v3)
-now has a deterministic consumer reproduction:
+provided the deterministic consumer reproduction:
 two- and four-lane cases underfill one common reservation clock when each lane
 supplies its own cumulative delivery rate. Equal and unequal shares fail all
 12 repeated utilization checks; the single-lane, idle/stale, independent-service
 and original cumulative controls pass (45 passes total, no race warnings).
 The fixture supplies bounded training feedback and then runs the actual pacing
 waits and dispatch budget. It establishes the rate-scope mismatch, not a
-closed-loop path-throughput result. No aggregate correction is adopted yet.
+closed-loop path-throughput result.
 
 The production-credit version repeats the same 45 passes/12 failures using
 real queued send items, cumulative heads, repeated heads and late SACKs; see
 [the attribution proof](throughput-fix-2-results/window-cumulative-shared-credit-root-v4).
-The [common delivery candidate](throughput-fix-2-results/window-cumulative-shared-delivery-cold-v2)
-then improves the expanded matched selection
+The [common delivery experiment](throughput-fix-2-results/window-cumulative-shared-delivery-cold-v2)
+then improved the expanded matched selection
 from 57 passes/15 failures to 72 passes, without race warnings. All four actual
 shared-reservation cases and early-return, carrier-policy, stale, permission
 and statistics controls pass. Its first new missing-history test incorrectly
 required resetting an already learned window to the initial value. The corrected
 test preserves the prior learned value; production and utilization thresholds
 are unchanged, and the [original oracle failure](throughput-fix-2-results/window-cumulative-shared-delivery-oracle-v1)
-is retained separately. These remain component proofs with prescribed training.
+is retained separately. These are component proofs with prescribed training.
 The corrected shared consumer releases all requested bytes in about 19.2–19.9 ms
 against the original 30.03–30.09 ms deadlines; the single-lane control remains
 about 18.18 ms. This measures the reservation/dispatch rule after training.
+
+The final implementation adopts that service scope with a six-entry exact
+endpoint ring rather than the experiment's 64 entries. It counts confirmed H1
+delivery once across sibling lanes and uses the result only when physical
+serialization has no positive rate. Logical window sizing remains per lane.
+The live equal/unequal, freshness, generation, read and policy roots are in the
+canonical correctness selector. The final design and cost comparison are
+reported in [Final shared cold pacing and pure-ACK admission](#final-shared-cold-pacing-and-pure-ack-admission).
 
 The [adjacent prefix review](throughput-fix-2-results/service-receiver-prefix-timing-v1/contract-audit.md)
 finds a separate timing defect: the newest sequence
@@ -156,11 +164,12 @@ each arm, but both failed the unchanged long SDK selection at fixed
 has not been adopted. The following diagnostic isolated the startup pacing
 limit addressed by the discovery policy in research plan section 34.
 
-The [common-ring cost comparison](throughput-fix-2-results/window-cumulative-shared-delivery-cpu-v1)
+The historical 64-entry [common-ring cost comparison](throughput-fix-2-results/window-cumulative-shared-delivery-cpu-v1)
 records zero allocations in all 54 benchmark readings. It adds 3,608 inline
 bytes per service. Median real-head processing rises from 1,068 to 1,444 ns,
 and estimation from 1,465 to 1,838 ns. Runs used the recorded concurrent host
-load; these costs remain part of candidate review.
+load. This rejected storage shape motivated the final six-entry ring; its
+matched structural and operation costs are reported near the end.
 
 Two new [static long-path controls](throughput-fix-2-results/model-static-long-recovery-v1)
 pass using real sender/ACK workers and pacing with a 512 KiB opening. Fixed
@@ -1444,9 +1453,10 @@ remains outside the observation and no production schema has been added.
 
 A read-only review of sibling `server/connect` and `server/proxy` finds no direct
 consumer or reconstruction of `protocol.Ack` in their production code. This is
-a compatibility review, not a new integration-test pass. Their full database
-integration tiers remain deferred as authorized; the sibling checkout and its
-local database configuration are unchanged. Fresh deterministic server/connect
+a compatibility review, not a new integration-test pass. At this checkpoint,
+their full database integration tiers remained deferred as authorized; the
+sibling checkout and its local database configuration were unchanged. Fresh
+deterministic server/connect
 and server/proxy runner attempts after the retry/drain correction stop before
 Go compilation: the default bootstrap lacks a readable local launcher owner,
 and the supported unmanaged portable-resource mode cannot reach PostgreSQL.
@@ -2788,7 +2798,8 @@ search matches are existing ACK-compression test settings and a performance
 comment. The reviewed files remained stable during this read-only audit.
 `server-retained-window-source-review` pins every reviewed file. This finds no
 required server call-site update, but does not establish a new server build or
-runtime result. The previously deferred integration tiers remain deferred.
+runtime result. The final configured server section records their later
+completion.
 
 ## Reproduction and artifacts
 
@@ -3120,6 +3131,128 @@ by their existing service architecture. Transport feedback remains mandatory
 on every host: a missing OS notification cannot freeze pacing or make a partial
 ACK sample reliable.
 
+## Final shared cold pacing and pure-ACK admission
+
+Commit `f8261152` closes the two remaining deterministic losses found by the
+post-quality review.
+
+### Shared cumulative delivery prices one physical clock
+
+The learned window is still owned by each logical sequence, but sibling H1
+lanes consume one service pacer. Before this correction, each lane could have
+a healthy cumulative rate while the common pacer selected only one lane's
+rate. In the controlled two-lane root, only 27,648 of 49,152 bytes were
+released by the 30.03 ms deadline. Equal and unequal two-/four-lane schedules
+failed in the same way after a quality reset; single-lane and independent
+service controls passed.
+
+The service now records exact once-only confirmed H1 delivery in a six-entry
+ring. Original offer and arrival endpoints survive cadence changes and drains.
+The first arrival group's bytes are excluded from the rate numerator, and a
+qualified interval spans at least `max(2 * residence, 4 * cadence)`. Permission,
+carrier and quality-generation boundaries reject old evidence. Endpoint
+retention is anchored to the newest non-future arrival, while a separate idle
+check expires the result immediately after its freshness allowance.
+
+This rate is used only when no positive serialization rate exists. A measured
+physical serializer still controls pacing. The common history never becomes a
+lane's delivered-byte history, learned window, peer permission or memory
+allowance. A quality reset clears the measurement but preserves reservations,
+delivered-byte ownership and the already spent opening probe.
+
+The permanent test set covers equal and unequal one/two/four-lane service,
+new siblings, independent services, statistics reads, carrier and permission
+changes, quality generations, tied/reordered arrivals, cadence changes, worst
+endpoint phase, unknown offers, future data and exact retention/freshness
+boundaries. The combined shared-delivery and quality selection passes 294/294
+race executions.
+
+The final fixed storage is 360 bytes per service rather than 3,608 bytes for
+the reviewed 64-entry shape. All measurements allocate zero bytes per
+operation:
+
+| Operation | Six entries, median | 64-entry overlay, median | Observed delta |
+| --- | ---: | ---: | ---: |
+| Publish confirmed delivery | 375.5 ns | 387.0 ns | +3.1% |
+| Estimate common rate | 450.0 ns | 600.6 ns | +33.5% |
+| Rebucket after cadence change | 98.21 ns | 573.9 ns | +484.4% |
+
+The live benchmark log is
+`/tmp/shared-delivery-live-ring6-bench-count5-20260917-013528.log`
+(`2749fb2ba89e3f624144f024dc7961bb18797d7a1dbdb9384c3a23c30a13da43`);
+the exact 64-entry overlay is
+`/tmp/shared-delivery-overlay-ring64-bench-count5-20260917-013550.log`
+(`6c5c653f563949cb534fe714fb357bbb63315679246d3116e72c77ba7d9e48bc`).
+They ran immediately under concurrent host load.
+Load rose during the overlay arm, so the CPU percentages are local screening
+evidence rather than a deployment prediction. The inline byte counts and zero
+allocation results are exact for these builds.
+
+### A per-flow pure ACK survives bounded admission pressure
+
+The provider's TCP worker generated the correct 52-byte pure ACK, but then sent
+it through the shared regenerable-control path. If both pinned H1 admission
+slots were occupied, that path refused the ACK immediately. Releasing one slot
+could not recover it; both constant and delivery-sized window roots failed,
+while the available-slot and public-callback controls passed.
+
+The ACK compressor's worker now uses an explicit dedicated TCP-control mode.
+It may retain its one regenerable ACK while bounded Transfer admission waits on
+that flow's goroutine. Provider cancellation interrupts and joins the wait and
+returns the pool object. After admission the ACK retains the ordinary control
+lifetime; consumed socket data alone receives the longer post-timeout replay
+lease. Public callbacks, resets, unreachables and other shared synthesized
+controls keep zero-wait refusal.
+
+Progress arriving during the wait remains cumulative. The current worker may
+send the retained head followed by its successor, or a later coalescer may
+replace the pending head, but the newest cumulative byte is delivered once
+without requiring an inner TCP retransmission. The five permanent roots pass
+50/50 focused executions, and 18/18 adjacent retry, callback and cancellation
+executions pass under the race detector. The failure-before log is
+`/tmp/throughput-pure-ack-current.Jxvqdv/run.log`; the focused after log is
+`/tmp/provider-pure-ack-count10-schedule-20260917-011645.log`
+(`1a4ee7960c9d69f4d4297f8989b9c691aa95c3d78942c1552565924d1d8fcfe7`).
+
+This changes provider admission ownership only. ACK compression still emits
+one cumulative head plus bounded oldest-first SACKs above it, absorbs pending
+SACKs at or below the head, paces SACK bursts and stays within the maximum
+serialized message size.
+
+### Frequent quality callbacks cannot churn statistics
+
+One client worker serializes reset work. Notifications inside the five-second
+listener interval extend the quiet boundary but do not create another
+generation; the shared service also accepts the generation only once. A local
+loopback sequence participates in the local reset and is excluded from
+redundant peer fanout.
+
+The deterministic storm root overlaps 128 concurrent notifications with 32
+public statistics readers. It requires one generation, valid snapshots and
+one later generation only after the quiet boundary. Ten race repetitions pass
+without a warning, recovered panic, nil dereference or race diagnostic. The
+log is `/tmp/network-quality-storm-loopback-race-count10-20260917-013457.log`
+(`53193e4728e4b5b614a2f7223aa93332ad73a4c4272521e8befec1eda0d558d2`).
+
+The final immutable campaign was built from clean commit `f8261152` with source
+digest
+`a22399024dd9b3547d0e82a8a6e217a2718ce5171f2bd82a8762dc9681bec850`.
+Every manifest records that revision, `dirty=false`, and the same digest:
+
+| Gate | Result | Artifact and run-log SHA-256 |
+| --- | --- | --- |
+| Correctness under `-race` | 566/566 pass; 12 rows; no failure, skip or diagnostic | `/tmp/throughput-fix-2-clean-correctness-1789630306`; `88122db98ed3132fa0e55f9b55211ff8b3f4d64c3f6d38f471c0a2077ecd0e8b` |
+| Full model | 39 top-level tests and all 858 rows pass | `/tmp/throughput-fix-2-clean-model-1789627905`; `b28b0ab439a3487d6fcac68dc4aba96b9f45c096f9fa69753e2d5dfc153a144e` |
+| Broad regression | 12 rows; zero failures or censored comparisons; 25 existing environment/candidate-gated skips | `/tmp/throughput-fix-2-clean-regression-1789628988`; `66463b8174cd28f23d5d593a0826ea78b830cd88419d5277d5d1417723eb67e7` |
+| Pacing benchmarks | 43 rows pass; every operation reports 0 B/op and 0 allocs/op | `/tmp/throughput-fix-2-clean-pacing-1789630209`; `808f64a8e659d8862c1cca7c8c7969a2a4eb0bbca1cc5630ba22d34cd7453fb9` |
+| Physical H1 smoke | Four rows and one calibrated comparison pass; 91.526 versus 91.552 Mb/s, ratio 0.99972 | `/tmp/throughput-fix-2-clean-physical-h1-final-1789630390`; `22a0b77f7a10180dc879ba7e67fa7aec5cd1d00ab039b71843999837c0e7febb` |
+
+The gates ran immediately under the existing load. Their start/finish load
+averages were 8.14/9.26/9.51 to 7.14/8.14/8.94 for the model,
+6.91/8.06/8.90 to 6.39/5.67/6.49 for regression, 4.61/5.30/6.31 to
+4.54/5.18/6.22 for pacing, 4.72/5.12/6.12 to 4.92/5.15/6.07 for correctness,
+and 4.53/5.03/5.99 to 4.85/5.07/5.98 for physical H1.
+
 ## Final configured server integration
 
 The running local PostgreSQL and Redis environment was exercised through the
@@ -3156,9 +3289,9 @@ branch-validation artifact is
 traversal SHA-256 values are
 `cf9ecead3960400f0ace275aa2570c2119f49e32ac2a6aa7d1c7143950110963` and
 `6f5b7dc78c12d4a2abd271e6bd8ff32c4067c05139edfa1c75589759fa5c2bc8`.
-The multi-hour payload was not repeated after this harness-only change because
-all four legitimate packages had already passed against the same product
-source. The main payload log is
+The multi-hour payload was not repeated at that checkpoint because all four
+legitimate packages had already passed against the same product source. The
+later final-source rerun below repeats it. The checkpoint payload log is
 `/tmp/throughput-fix-2-terra-server-integration-1789614340/retry-direct/connect.log`,
 SHA-256 `30f239b098aeae9755f2f515c77297142789493c0f2ddb6d221beb291a94211a`.
 It started at load 5.06, 7.02 and 9.76 and finished at 10.32, 10.59 and
@@ -3184,7 +3317,7 @@ pass. The final rebased-branch log SHA-256 is
 The sibling scan found no other wrapper with the same foreground-tee ownership
 pattern.
 
-The final official proxy run passes both packages:
+That checkpoint's official proxy run passed both packages:
 
 | Package | Result |
 | --- | --- |
@@ -3196,7 +3329,103 @@ The 332-second artifact is
 `3409fa1f46440b3e9eff31d935bb6baf8fcb5e7e3e0f85b2932dd11ade3ce31a`.
 Load changed from 7.13, 8.14 and 8.99 to 5.02, 7.39 and 8.58. The server main
 worktree is clean at `3a3cc698`. Both server fixes are isolated on the rebased
-`throughput-fix-2` branch, whose final revision is `21acdcb5`.
+`throughput-fix-2` branch. Its final revision after the diagnostic-cleanup
+fixture correction below is `27b7dad9`.
+
+### Final frozen-source rerun
+
+The complete server tiers were rerun after the final connect production commit,
+without waiting for host quiescence. The official `server/connect/test.sh`
+selection passed from clean connect commit `f8261152` and clean server commit
+`21acdcb5`:
+
+| Package | Result |
+| --- | --- |
+| `github.com/urnetwork/server/connect` | Pass in 4,055.767 seconds. |
+| `github.com/urnetwork/server/connect/perfvar` | Pass in 1,437.994 seconds. |
+| `github.com/urnetwork/server/connect/sim-latency` | Pass in 33.015 seconds. |
+| `github.com/urnetwork/server/connect/sim-latency/evaluator/container/testdata/resource-bomb` | Pass in 0.246 seconds. |
+
+The artifact is
+`/tmp/throughput-fix-2-final-server-integrations-complete.NsStqy`; the connect
+log SHA-256 is
+`b01672b716faf2039e3cbe55c4a22f93133b8d05df98c8a006203702ca479c24`.
+All ten frozen dependency worktrees were clean. The campaign began at load
+10.01/10.19/9.77 and its subsequent proxy compile check ended at
+11.37/7.03/6.04.
+
+That first frozen proxy check found a source-pair problem before running tests.
+Server commit `23135c01` reads six `DeviceLocalMemoryUsage` telemetry fields
+that have not been committed in the SDK repository. They existed in exactly
+four pre-existing tracked files in the live SDK checkout. SDK commit `0dd2943`
+therefore could not compile server `21acdcb5`; the failed build log is retained
+with SHA-256
+`2d74727becf3e38b0e1fdcd59e642d728b1419cb622bfdf33e81e18cfee28854`.
+
+For validation, those exact four diffs were applied to parent `0dd2943` in a
+clean detached snapshot. The resulting SDK commit is `17a7a332`, tree
+`7ba4bc886d5311a7389de05b7dcb273d46fe1985`, and patch SHA-256
+`d2adcf17943a1338faaa1b65b233cd0e82b43510724e941017e127ddac9db48d`.
+It did not move or modify the live SDK branch or index. Nine SDK memory and 12
+proxy aggregation race executions passed before the full run. The provenance
+manifest is
+`/tmp/throughput-fix-2-proxy-sdk-coherent-t00xfna4/manifest.json`, SHA-256
+`88bf2a1049b7f843dba381a2a0f7f57b28e2d64cebd15df8b044dee3d67de18d`.
+
+The first official `server/proxy/test.sh` execution returned zero from the
+clean server and SDK snapshots:
+
+| Package | Result |
+| --- | --- |
+| `github.com/urnetwork/server/proxy` | Pass in 337.806 seconds, including the database-backed handoff tests. |
+| `github.com/urnetwork/server/proxy/acceptance` | Pass in 6.003 seconds. |
+
+That execution is rejected as final evidence. Its retained log contains one
+recovered nil-pointer panic, even though both Go packages reported PASS. The
+record appears during `TestProxyClientReapSurvival`, but its stack belongs to
+an asynchronous worker leaked by the earlier
+`TestProxyDeviceMemoryBudgetReleasedOnDeviceClose`. That test published a
+partial `ProxyDevice` without an SDK device, TUN, initial activity or
+manager-owned context. `HandleError` recovered the worker panic and released
+the reservation, allowing the root test to report a false pass.
+
+The rejected artifact is
+`/tmp/throughput-fix-2-proxy-sdk-coherent-integration-bash.38eEWy`; its log
+SHA-256 is
+`29d08a6712766d086d6106b8defbfd01663d7cbae1f5427187e77aaddf5c9a74`.
+Load changed from 4.93/5.43/5.52 to 5.70/5.53/5.51. The checked-in environment
+owner supplied the running PostgreSQL and Redis configuration; no credential,
+endpoint or service override was used.
+
+The deterministic comparison makes the false pass explicit. The original
+test reports three passes while emitting three recovered nil panics. Two new
+fixture roots fail 6/6 with its incomplete shape, and a wrong-parent context
+control fails 3/3. The corrected fixture uses the existing initialized SDK
+helper, an in-memory TUN, a current activity timestamp and `manager.ctx`.
+Server commit `27b7dad9` changes only
+`proxy/proxy_device_memory_budget_test.go`; production code is unchanged. The
+22-test focused selection passes 220/220 under the race detector with no
+recovered panic or race. The patch SHA-256 is
+`742d2f9a1013c35d43bfcd921ea05b3244567e068cd7926dd03cc56e0c247d15`;
+the complete proof is
+`/tmp/throughput-fix-2-proxy-budget-fixture-xbmjfov6`.
+
+The corrected official proxy run is diagnostically clean:
+
+| Package | Result |
+| --- | --- |
+| `github.com/urnetwork/server/proxy` | Pass in 334.528 seconds, including the database-backed handoff tests. |
+| `github.com/urnetwork/server/proxy/acceptance` | Pass in 6.132 seconds. |
+
+It used clean server `27b7dad9`, SDK `17a7a332` and connect `f8261152`
+snapshots. The artifact is
+`/tmp/throughput-fix-2-proxy-budget-fixture-integration.pY4zuf`; its log
+SHA-256 is
+`38395dac8dca9013c13480e7f5304a4ad6d393daa50acff0c62071472a29d73f`.
+Load changed from 4.55/4.85/5.07 to 5.01/5.15/5.21. The complete log has zero
+recovered-panic, unexpected-error, nil-pointer, fatal, warning and race
+matches. The fixture manifest SHA-256 is
+`71d8ad6d629f38ffc370a80b566606b3d0d93e65da77bedbf0c27f1c2c2c5250`.
 
 ## Remaining work
 
@@ -3206,15 +3435,14 @@ deficit recurs, force its physical ordering before attributing it; the matched
 hold-policy SDK pair passes both arms and establishes no uplift.
 
 1. Expand host comparisons with the corrected packet grouping beyond the
-   passing physical H1 smoke. The induced source-idle replay
-   confirms the estimator effect, but both throughput brackets pass and the
-   older host failures remain unattributed. The TUN-corrected physical duplex
-   reference still fails calibration. The forced admission ordering now proves
-   a dedicated pure TCP ACK is refused when both admission slots are occupied.
-   Audit the zero-refusal objective separately from TCP recovery correctness,
-   permit a newer cumulative ACK to cover pending progress, and evaluate any
-   bounded cancellable ownership fix against the physical comparison. Keep the
-   original gates and all failed/excluded comparisons under current host load.
+   passing physical H1 smoke. The induced source-idle replay confirms the
+   estimator effect, but both throughput brackets pass and the older host
+   failures remain unattributed. The TUN-corrected physical duplex reference
+   still fails calibration. The deterministic full-admission root is fixed for
+   both window policies, including newer cumulative progress and bounded
+   cancellation; retain those invariants in any broader physical comparison.
+   Keep the original gates and all failed/excluded comparisons under current
+   host load.
 2. Run the Apple, Windows and Linux changes on their native CI hosts. Local
    checks cover the owned classification rules and API shape, but do not replace
    a signed extension build, an MSVC service build or a Linux daemon run with
@@ -3225,3 +3453,7 @@ hold-policy SDK pair passes both arms and establishes no uplift.
    our own published fixtures as requested; obtaining the reporter's missing
    native rig is not a prerequisite for this work. Its missing traces still
    limit attribution of the reporter's specific failures.
+4. Publish the six SDK memory-telemetry fields with server commit `23135c01`,
+   or remove that dependency before selecting SDK `0dd2943` in a clean release
+   pair. This campaign validates the exact four-file SDK patch, but does not
+   take ownership of or commit the pre-existing live SDK changes.

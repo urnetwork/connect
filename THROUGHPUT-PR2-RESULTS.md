@@ -1,6 +1,6 @@
 # Window follow-up: implementation and local results
 
-Branch: `throughput-fix-2`; final production commits `5cb64f2b` and `14aecd8f`.
+Branch: `throughput-fix-2`; latest production commit `f8261152`.
 Date: 2026-09-16 through 2026-09-17. The delivery-sized window remains enabled.
 
 Final evidence is summarized in [THROUGHPUT-REPORT-PR2.md](THROUGHPUT-REPORT-PR2.md).
@@ -12,8 +12,9 @@ The configured local server integration is complete. Every legitimate
 `server/connect` package selected by the repository harness passed, as did the
 baseline verifier. The full `server/proxy` package and its acceptance package
 pass after fixing a pre-existing signal-cleanup regression in the acceptance
-wrapper. Both runs used the checked-in environment owner and ran immediately
-under recorded host load.
+wrapper and an incomplete asynchronous test fixture. The final complete log is
+diagnostically clean. Both runs used the checked-in environment owner and ran
+immediately under recorded host load.
 
 The independent tests confirm several mechanisms that the published report
 could not separate: missing ACK residence in the window calculation, loss
@@ -26,6 +27,36 @@ failure to a particular one of these mechanisms.
 The [peer review and research plan](THROUGHPUTFIX-PR2.md) preserves the source
 review, hypotheses, evidence limits and server follow-up work.
 
+### Final shared-service and provider-ACK closeout
+
+The final adjacent review found two scope/ownership defects. Lane-local
+cumulative delivery could underprice the one service pacer shared by two or
+four active H1 lanes after a quality reset. Separately, the provider's
+per-flow compressor generated a 52-byte pure TCP ACK but sent it through a
+shared zero-wait callback; both H1 admission slots being occupied discarded
+the control before a released slot could accept it.
+
+Commit `f8261152` adds a six-entry service-owned raw-delivery history as a cold
+pacing fallback. It counts confirmed H1 credit once across lanes, preserves
+exact offer/arrival endpoints and never replaces a positive serialization
+rate or a lane's logical window history. The provider ACK worker now receives
+bounded, cancellable per-flow admission ownership while public and shared
+synthesized controls keep zero-wait refusal. A newer cumulative ACK covers
+progress that arrives during the wait.
+
+The shared-delivery/quality selection passes 294/294 race executions. The five
+pure-ACK roots pass 50/50, with 18/18 adjacent provider recovery executions.
+The canonical clean-commit correctness gate passes 566 race-enabled tests
+with no failure, skip or diagnostic. The six-entry structure is 360 bytes per
+service, versus 3,608 bytes for the 64-entry counterfactual; all benchmark
+operations allocate zero bytes and the smaller ring is faster for publication,
+estimation and rebucketing. Exact artifacts and hashes are in the final report.
+
+The final immutable `f8261152` campaign also passes all 858 model rows, all 12
+broad-regression rows, 43 pacing benchmark rows and the calibrated physical H1
+comparison. Every manifest records the clean commit and source digest
+`a22399024dd9b3547d0e82a8a6e217a2718ce5171f2bd82a8762dc9681bec850`.
+
 ### Final network-quality phase
 
 Ordinary qualified feedback can grow the learned byte window but cannot shrink
@@ -34,7 +65,8 @@ fresh service and RTT pair may replace it. Adaptive pacing continues between
 signals. Repeated local callbacks coalesce until five seconds of listener
 quiet, and exact or older provider generations are discarded. A deterministic
 storm of 128 callbacks overlaps 32 public statistics reads and applies exactly
-one generation; the final quality selection passes three times under `-race`.
+one generation. Ten final race repetitions also prove valid snapshots, one
+post-quiet generation and no panic, recovered error or race diagnostic.
 
 The frozen combined source passes all three changed-path models, the 12-row
 correctness ledger, the 858-row full model and broad regression. The v3 archive
@@ -50,7 +82,7 @@ the native quality observations available on each host. ACK compression keeps
 its original contract: one cumulative head, bounded oldest-first SACKs above
 the head, absorption at or below the head, and a fixed maximum carrier size.
 
-### Pending ACK and statistics follow-up
+### Earlier ACK and statistics follow-up
 
 Commit `3ce605cb`, source `538e6248fb744795d9e829e97e503744ed70284d107ebad10da646b56bf6e460`,
 passes 177 race-enabled correctness tests. Eight new tests fail 24 times before
@@ -518,8 +550,9 @@ entering baseline or evaluator artifacts. That final validation is
 traversal log SHA-256 values are
 `cf9ecead3960400f0ace275aa2570c2119f49e32ac2a6aa7d1c7143950110963` and
 `6f5b7dc78c12d4a2abd271e6bd8ff32c4067c05139edfa1c75589759fa5c2bc8`.
-The multi-hour payload was not repeated after this harness-only change; its
-four legitimate packages had already passed against the same product source.
+The multi-hour payload was not repeated at that checkpoint; its four legitimate
+packages had already passed against the same product source. The final-source
+campaign below repeats it.
 
 The connect log is
 `/tmp/throughput-fix-2-terra-server-integration-1789614340/retry-direct/connect.log`,
@@ -571,13 +604,46 @@ Nine deterministic signal, normal-exit, runner-failure and logger-failure roots
 pass three times under `-race` (27/27). The rebased-branch rerun log SHA-256 is
 `52ec43d33e6134d07c6462ee190fe574f114dddac5c0d99a7d5d8399e5742d89`.
 No sibling wrapper has the same
-foreground-tee pattern. The final official `server/proxy/test.sh` run passes
-both `github.com/urnetwork/server/proxy` in 316.690 seconds and
+foreground-tee pattern. That checkpoint's official `server/proxy/test.sh` run
+passed both `github.com/urnetwork/server/proxy` in 316.690 seconds and
 `github.com/urnetwork/server/proxy/acceptance` in 5.958 seconds. Its 332-second
 artifact is `/tmp/throughput-fix-2-terra-server-proxy-final-1789622033`; the
 log SHA-256 is
 `3409fa1f46440b3e9eff31d935bb6baf8fcb5e7e3e0f85b2932dd11ade3ce31a`.
 Load changed from 7.13, 8.14 and 8.99 to 5.02, 7.39 and 8.58.
+
+### Final-source server rerun
+
+The official connect tier was repeated against clean connect `f8261152` and
+server `21acdcb5` snapshots. Connect, perfvar, sim-latency and resource-bomb
+pass in 4,055.767, 1,437.994, 33.015 and 0.246 seconds. The artifact is
+`/tmp/throughput-fix-2-final-server-integrations-complete.NsStqy`; its connect
+log SHA-256 is
+`b01672b716faf2039e3cbe55c4a22f93133b8d05df98c8a006203702ca479c24`.
+
+Proxy initially could not compile because server `23135c01` reads six SDK
+telemetry fields absent from committed SDK `0dd2943`. A clean detached SDK
+snapshot contains exactly the four pre-existing tracked SDK diffs as commit
+`17a7a332`; patch SHA-256
+`d2adcf17943a1338faaa1b65b233cd0e82b43510724e941017e127ddac9db48d`.
+Its focused SDK/proxy telemetry selection passes 21 race executions.
+
+The first full run on that coherent pair returned zero but contained a
+recovered nil-pointer panic from an incomplete memory-budget test fixture. The
+old test reports three passes while emitting three panics. New fixture roots
+fail 6/6 against the old shape, and its wrong-parent control fails 3/3. Server
+commit `27b7dad9` fixes only the test fixture; its 22-test focused race
+selection passes 220/220 without a recovered panic or race.
+
+The corrected official `server/proxy/test.sh` passes the product package in
+334.528 seconds and acceptance in 6.132 seconds. The clean source pair is
+server `27b7dad9`, SDK `17a7a332` and connect `f8261152`. Artifact
+`/tmp/throughput-fix-2-proxy-budget-fixture-integration.pY4zuf` has log
+SHA-256
+`38395dac8dca9013c13480e7f5304a4ad6d393daa50acff0c62071472a29d73f`.
+Load changed from 4.55/4.85/5.07 to 5.01/5.15/5.21. The complete log has zero
+recovered-panic, unexpected-error, nil-pointer, fatal, warning and race
+matches. The live SDK checkout and its branch were not changed.
 
 ## Reproduction
 

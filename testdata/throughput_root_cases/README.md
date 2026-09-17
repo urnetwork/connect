@@ -3,10 +3,11 @@
 These are regression assertions, including failures that still need fixes.
 They use explicit worker barriers, virtual time or exact timestamp sequences.
 No failing case is skipped or converted into an expected-pass wrapper.
-The separate model performance runner defers only three explicit path-change
-tests until the user-requested quality signal is available; see
+The model performance runner now invokes `NetworkQualityChanged` at each of its
+three explicit path transitions; see
 [the phase inventory](../../THROUGHPUTFIX-PR2.md#31-separate-notified-path-changes-from-core-pacing-validation).
-That deferral does not apply to these deterministic ownership/timing roots.
+These deterministic ownership and timing roots remain independent of the
+end-to-end performance cells.
 
 ## Pacing discovery roots
 
@@ -50,16 +51,31 @@ decrease correction. Per-lane passing rates do not certify aggregate utilization
 actual shared reservation cost and full-path performance remain separate gates.
 
 The [shared cumulative consumer proof](../../throughput-fix-2-results/window-cumulative-shared-reserve-root-v3)
-adds separate equal and unequal two-/four-lane utilization cases. All four fail
-three repetitions while the single-lane, idle/stale, independent-service and
-twelve original cumulative controls pass. It supplies legal training feedback,
-then exercises the real shared reservation and dispatch budget; the training
-itself does not run a closed-loop pacer. The research source is archived and
-is not yet part of the live correctness selector. The
-[attributed-credit fixture](../../throughput-fix-2-results/window-cumulative-shared-credit-root-v4)
-now reproduces the same four defects through real queued send items. The common
-delivery candidate passes its corrected 72-check selection, but a static warm
-long-RTT recovery control and actual performance are still required.
+first isolated equal and unequal two-/four-lane utilization failures. The live
+`transfer_window_shared_delivery_test.go` fixture now drives the same shared
+reservation clock through real retained items, confirmed initial H1 writes,
+once-only cumulative heads, repeated heads and late SACKs. One-, two- and
+four-lane cases, idle siblings, independent destinations, carrier/permission
+boundaries and statistics reads are part of the canonical correctness
+selector. `transfer_window_service_delivery_test.go` owns the fixed-ring
+endpoint, rebucketing, generation, freshness and memory bounds. The common
+rate prices cold pacing only; positive serialization remains authoritative and
+logical window sizing remains per sequence.
+
+`ip_provider_pure_ack_admission_test.go` fills the pinned provider H1 lane's
+two count-admission slots and produces an exact 52-byte pure TCP ACK through
+the real per-flow compressor. It proves the ACK survives until one slot is
+released under both window policies, newer cumulative progress is covered,
+provider cancellation reclaims pool and admission ownership, and a public
+callback still receives the shared worker's zero-wait refusal. The pre-fix
+source loses the generated control in every full-admission arm.
+
+`TestClientNetworkQualityFrequentCallbacksAreIdempotentWithStatistics` overlaps
+128 concurrent native-style notifications with 32 public statistics readers.
+One worker and the five-second quiet rule admit one generation, preserve valid
+snapshots, then admit exactly one later generation. The local loopback is reset
+but excluded from redundant peer fanout. Ten race repetitions complete without
+warnings, recovered panics or race diagnostics.
 
 ## Caller cancellation ownership
 
@@ -282,8 +298,11 @@ their coverage rather than replacing their assertions.
 | Receiver timing identity, queued RTT versus unloaded RTT, delayed confirmation and long replies | `transfer_window_receiver_rtt_test.go`, `transfer_window_receiver_baseline_probe_test.go`, `transfer_window_receiver_baseline_order_test.go`, `transfer_window_pacing_paired_probe_worker_test.go` |
 | Proved RTT changes invalidating old window history, with carrier and fixed-bound controls | `transfer_window_refill_proof_test.go`, `transfer_window_refill_adjacent_test.go`, `transfer_window_refill_order_test.go`, `transfer_window_refill_carrier_test.go` |
 
-The broad model, TUN and server regression gates remain separate. Deferred
-database-backed server setup is not counted as a passing or failing Go test.
+The broad model, TUN and server regression gates remain separate. The final
+configured server campaign includes the database-backed connect and proxy
+packages. Its clean source pairing, rejected recovered-panic run and corrected
+diagnostic-clean rerun are recorded in the
+[final report](../../THROUGHPUT-REPORT-PR2.md#final-configured-server-integration).
 
 ## Experimental receiver cases
 
