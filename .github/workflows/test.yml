@@ -33,6 +33,16 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # The release SDK imports the root package for js/wasm. Exercise each
+      # socket-buffer descriptor implementation: native Linux selects unix,
+      # Windows selects its Handle implementation, and browser WASM selects
+      # the deliberate no-socket fallback.
+      - name: Build root package platform variants
+        run: |
+          GOOS=darwin GOARCH=arm64 go build .
+          GOOS=windows GOARCH=amd64 go build .
+          GOOS=js GOARCH=wasm GOEXPERIMENT=greenteagc go build .
+
       # -count=1 defeats the test result cache so a green run always means the
       # tests actually ran. the root package (the data path) takes ~9 min.
       - name: Test
