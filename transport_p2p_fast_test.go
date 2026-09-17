@@ -255,19 +255,20 @@ func TestP2pTransportFastPathComposesAcrossThreeHops(t *testing.T) {
 	defer testCancel()
 	sendRoutes := make([]chan<- []byte, hopCount)
 	receiveRoutes := make([]<-chan []byte, hopCount)
+	routeOwners := make([][]Transport, hopCount)
 	settings := make([]*P2pTransportSettings, hopCount)
 	for hopIndex, pair := range pairs {
 		settings[hopIndex] = DefaultP2pTransportSettings()
 		settings[hopIndex].DataPlaneMode = P2pDataPlaneModeFastOnly
 		settings[hopIndex].DataPlaneStats = &P2pDataPlaneStats{}
-		_, sendRoute := NewP2pSendTransport(
+		sendTransport, sendRoute := NewP2pSendTransport(
 			testCtx,
 			testCancel,
 			pair.active,
 			streamId,
 			settings[hopIndex],
 		)
-		_, receiveRoute := NewP2pReceiveTransport(
+		receiveTransport, receiveRoute := NewP2pReceiveTransport(
 			testCtx,
 			testCancel,
 			pair.passive,
@@ -276,6 +277,10 @@ func TestP2pTransportFastPathComposesAcrossThreeHops(t *testing.T) {
 		)
 		sendRoutes[hopIndex] = sendRoute
 		receiveRoutes[hopIndex] = receiveRoute
+		routeOwners[hopIndex] = []Transport{sendTransport, receiveTransport}
+		t.Cleanup(func() {
+			snapshotP2pFastPathTestRoutes(t, settings[hopIndex].DataPlaneStats, routeOwners[hopIndex]...)
+		})
 	}
 
 	var forwardWaitGroup sync.WaitGroup
@@ -324,8 +329,12 @@ func TestP2pTransportFastPathComposesAcrossThreeHops(t *testing.T) {
 		}
 		MessagePoolReturn(received)
 	}
+	// Delivery does not join the final producer's counter publication. Stop
+	// our external forwarders before joining every caller-owned route worker.
+	testCancel()
+	forwardWaitGroup.Wait()
 	for hopIndex, hopSettings := range settings {
-		stats := hopSettings.DataPlaneStats.Snapshot()
+		stats := snapshotP2pFastPathTestRoutes(t, hopSettings.DataPlaneStats, routeOwners[hopIndex]...)
 		if stats.FastSendMessageCount != 1 ||
 			stats.FastReceiveMessageCount != 1 ||
 			stats.LegacySendMessageCount != 0 ||
@@ -808,8 +817,9 @@ func TestP2pTransportFastOnlyUsesNoLegacyPayload(t *testing.T) {
 		pair.streamId,
 		settings,
 	)
-	_ = sendTransport
-	_ = receiveTransport
+	t.Cleanup(func() {
+		snapshotP2pFastPathTestRoutes(t, settings.DataPlaneStats, sendTransport, receiveTransport)
+	})
 	message := bytes.Repeat([]byte{0xc3}, 3*1024)
 	pooledMessage := MessagePoolCopy(message)
 	select {
@@ -828,13 +838,7 @@ func TestP2pTransportFastOnlyUsesNoLegacyPayload(t *testing.T) {
 		}
 		MessagePoolReturn(received)
 	}
-	for settings.DataPlaneStats.Snapshot().FastReceiveMessageCount != 1 {
-		if time.Now().After(deadline) {
-			t.Fatal("fast P2P receive counter did not advance")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	stats := settings.DataPlaneStats.Snapshot()
+	stats := snapshotP2pFastPathTestRoutes(t, settings.DataPlaneStats, sendTransport, receiveTransport)
 	if stats.FastSendMessageCount != 1 ||
 		stats.FastReceiveMessageCount != 1 ||
 		stats.LegacySendMessageCount != 0 ||
@@ -876,8 +880,9 @@ func TestP2pTransportAutoSelectsFastPathForCapablePeer(t *testing.T) {
 		pair.streamId,
 		settings,
 	)
-	_ = sendTransport
-	_ = receiveTransport
+	t.Cleanup(func() {
+		snapshotP2pFastPathTestRoutes(t, settings.DataPlaneStats, sendTransport, receiveTransport)
+	})
 	message := bytes.Repeat([]byte{0x7c}, 2*1024)
 	pooledMessage := MessagePoolCopy(message)
 	select {
@@ -896,13 +901,7 @@ func TestP2pTransportAutoSelectsFastPathForCapablePeer(t *testing.T) {
 		}
 		MessagePoolReturn(received)
 	}
-	for settings.DataPlaneStats.Snapshot().FastReceiveMessageCount != 1 {
-		if time.Now().After(deadline) {
-			t.Fatal("automatic fast receive counter did not advance")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	stats := settings.DataPlaneStats.Snapshot()
+	stats := snapshotP2pFastPathTestRoutes(t, settings.DataPlaneStats, sendTransport, receiveTransport)
 	if stats.FastSendMessageCount != 1 ||
 		stats.FastReceiveMessageCount != 1 ||
 		stats.LegacySendMessageCount != 0 ||
@@ -935,8 +934,9 @@ func TestP2pTransportAutoFallsBackToLegacyPeer(t *testing.T) {
 		pair.streamId,
 		settings,
 	)
-	_ = sendTransport
-	_ = receiveTransport
+	t.Cleanup(func() {
+		snapshotP2pFastPathTestRoutes(t, settings.DataPlaneStats, sendTransport, receiveTransport)
+	})
 	message := bytes.Repeat([]byte{0x8d}, 2*1024)
 	pooledMessage := MessagePoolCopy(message)
 	select {
@@ -955,14 +955,7 @@ func TestP2pTransportAutoFallsBackToLegacyPeer(t *testing.T) {
 		}
 		MessagePoolReturn(received)
 	}
-	deadline := time.Now().Add(time.Second)
-	for settings.DataPlaneStats.Snapshot().LegacyReceiveMessageCount != 1 {
-		if time.Now().After(deadline) {
-			t.Fatal("legacy receive counter did not advance")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	stats := settings.DataPlaneStats.Snapshot()
+	stats := snapshotP2pFastPathTestRoutes(t, settings.DataPlaneStats, sendTransport, receiveTransport)
 	if stats.FastSendMessageCount != 0 ||
 		stats.LegacySendMessageCount != 1 ||
 		stats.LegacyReceiveMessageCount != 1 ||
@@ -1039,8 +1032,9 @@ func TestP2pTransportAutoFallsBackAcrossFastPathWireVersions(t *testing.T) {
 		pair.streamId,
 		settings,
 	)
-	_ = sendTransport
-	_ = receiveTransport
+	t.Cleanup(func() {
+		snapshotP2pFastPathTestRoutes(t, settings.DataPlaneStats, sendTransport, receiveTransport)
+	})
 	message := bytes.Repeat([]byte{0x9e}, 2*1024)
 	pooledMessage := MessagePoolCopy(message)
 	select {
@@ -1059,14 +1053,7 @@ func TestP2pTransportAutoFallsBackAcrossFastPathWireVersions(t *testing.T) {
 		}
 		MessagePoolReturn(received)
 	}
-	deadline := time.Now().Add(time.Second)
-	for settings.DataPlaneStats.Snapshot().LegacyReceiveMessageCount != 1 {
-		if time.Now().After(deadline) {
-			t.Fatal("versioned legacy receive counter did not advance")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	stats := settings.DataPlaneStats.Snapshot()
+	stats := snapshotP2pFastPathTestRoutes(t, settings.DataPlaneStats, sendTransport, receiveTransport)
 	if stats.FastSendMessageCount != 0 ||
 		stats.LegacySendMessageCount != 1 ||
 		stats.LegacyReceiveMessageCount != 1 ||

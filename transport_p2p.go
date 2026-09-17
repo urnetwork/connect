@@ -1489,6 +1489,8 @@ type P2pReceiveTransport struct {
 	// Test-only barrier reached after reliable immediate admission finds a full
 	// route and before the cancellation-bounded wait begins.
 	beforeReliableReceiveWaitForTest func()
+	// Nil test barrier exposes queue publication before receive accounting.
+	afterFastReceiveEnqueueForTest func()
 	// Nil test barrier pauses after pooled receive drain and before done.
 	testingBeforeDoneForTest func()
 }
@@ -1658,6 +1660,9 @@ func (self *P2pReceiveTransport) offerReceive(
 		MessagePoolReturn(message)
 		return false
 	case self.pendingReceive <- message:
+		if self.afterFastReceiveEnqueueForTest != nil {
+			self.afterFastReceiveEnqueueForTest()
+		}
 		if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage && countDeliveredStats {
 			if fast {
 				stats.fastReceiveMessageCount.Add(1)
