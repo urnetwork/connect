@@ -343,11 +343,25 @@ func (self *subprotocolTable) clone() *subprotocolTable {
 	return &subprotocolTable{entries: entries}
 }
 
-// Every id with a codec or a raw listener, sorted.
+// Every id with a codec or a raw listener, including the network's reserved
+// protocols, sorted.
 func (self *subprotocolTable) ids() []SubprotocolId {
 	ids := make([]SubprotocolId, 0, len(self.entries))
 	for id := range self.entries {
 		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i int, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// Peer discovery is an application API. Internal network protocols remain
+// usable on the wire without changing the list returned to callers.
+func (self *subprotocolTable) applicationIds() []SubprotocolId {
+	ids := make([]SubprotocolId, 0, len(self.entries))
+	for id := range self.entries {
+		if SubprotocolReservedLimit <= id {
+			ids = append(ids, id)
+		}
 	}
 	sort.Slice(ids, func(i int, j int) bool { return ids[i] < ids[j] })
 	return ids
@@ -647,7 +661,7 @@ func (self *Client) answerSubprotocolsQuery(table *subprotocolTable, source Tran
 		registry.droppedDecode.Add(1)
 		return
 	}
-	ids := table.ids()
+	ids := table.applicationIds()
 	result := &protocol.SubprotocolsQueryResult{
 		QueryId:        query.QueryId,
 		SubprotocolIds: make([]uint32, 0, len(ids)),
@@ -698,7 +712,7 @@ func (self *Client) completeSubprotocolsQuery(frame *protocol.Frame) {
 	}
 	ids := make([]SubprotocolId, 0, len(result.SubprotocolIds))
 	for _, id := range result.SubprotocolIds {
-		if id == 0 || subprotocolIdMax < id {
+		if id < uint32(SubprotocolReservedLimit) || subprotocolIdMax < id {
 			continue
 		}
 		ids = append(ids, SubprotocolId(id))

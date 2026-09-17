@@ -16,6 +16,15 @@ func (self *SendSequence) sharedRawRecoveryInterval(item *sendItem, now time.Tim
 		item.carrierChanged || !self.transferFlightPolicy().h1Only {
 		return 0
 	}
+	// The previous path's short RTO cannot certify a new first write as
+	// lost before this generation has any RTT. Keep the configured cold
+	// floor, anchored to that physical write, without extending its lifetime.
+	if item.sendCount == 1 {
+		if interval := self.windowPacer.service.qualityRecoveryInterval(item.pacingSentAtNanos,
+			self.sendBufferSettings.MinResendInterval, self.sendBufferSettings.MaxResendInterval); interval > 0 {
+			return interval
+		}
+	}
 	timing := self.windowPacer.service.roundTripEvidence(now)
 	if timing.count == 0 || timing.latestRaw <= 0 {
 		return 0

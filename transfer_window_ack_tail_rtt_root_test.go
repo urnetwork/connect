@@ -16,6 +16,7 @@ func TestWindowPathAckTailRoundTripGrowthControl(t *testing.T) {
 			cell := windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond,
 				Flows: 8, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: 12500000, Warmup: 8 * time.Second}
 			if arm == "delivery" {
+				cell.QualityChanged = true
 				cell.RoundTrip, cell.RoundTripAfter, cell.RoundTripChangeAfter, cell.Drop = 300*time.Microsecond, 100*time.Millisecond, 4*time.Second, true
 			}
 			reading := measureWindowPathCell(t, cell, time.Second)

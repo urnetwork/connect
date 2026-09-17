@@ -147,6 +147,9 @@ func (self *windowPacingService) observeReceiverRoundTripForWrite(sequenceId, me
 	if rawResidence < 0 || adjustedRoundTrip < 0 || rawResidence < adjustedRoundTrip || at.Before(self.lastRoundTrip) {
 		return
 	}
+	if !self.acceptQualityRoundTripWithLock(rawResidence, at) {
+		return
+	}
 	if self.receiverRoundTrips == nil {
 		settings := DefaultSendBufferSettings()
 		self.receiverRoundTrips = &windowReceiverRoundTrips{windowSize: settings.RttWindowSize, windowTimeout: settings.RttWindowTimeout}

@@ -19,6 +19,7 @@ func TestWindowPathServiceRoundTripGrowthBeyondOldRing(t *testing.T) {
 				Compression: 10 * time.Millisecond, Flows: 8, Lanes: 8, RoundRobinOffer: true,
 				Payload: 1280, Budget: mib(48), Rate: 12500000, Warmup: 12 * time.Second}
 			if arm == "delivery" {
+				cell.QualityChanged = true
 				cell.RoundTrip, cell.RoundTripAfter, cell.RoundTripChangeAfter, cell.Drop = 300*time.Microsecond, 1200*time.Millisecond, 4*time.Second, true
 			}
 			reading := measureWindowPathCell(t, cell, 3*time.Second)

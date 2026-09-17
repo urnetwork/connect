@@ -155,6 +155,11 @@ func ShedMemory() {
 // seconds later.
 var networkChangeListeners = NewCallbackList[func()]()
 
+// networkQualityChangeListeners receive app-reported radio or path-quality
+// changes that do not require rebuilding a working transport. Callbacks must
+// only enqueue their work: the host may call this from an OS listener thread.
+var networkQualityChangeListeners = NewCallbackList[func()]()
+
 // AddNetworkChangeListener registers a callback invoked by NetworkChanged. It returns an
 // unregister closure; an owner must unregister when it closes.
 func AddNetworkChangeListener(listener func()) func() {
@@ -164,10 +169,32 @@ func AddNetworkChangeListener(listener func()) func() {
 	}
 }
 
+// AddNetworkQualityChangeListener registers a callback invoked by
+// NetworkQualityChanged. It returns an unregister closure; an owner must
+// unregister when it closes.
+func AddNetworkQualityChangeListener(listener func()) func() {
+	callbackId := networkQualityChangeListeners.Add(listener)
+	return func() {
+		networkQualityChangeListeners.Remove(callbackId)
+	}
+}
+
+// NetworkQualityChanged reports a change in cell signal bars, cellular type,
+// or Wi-Fi signal quality. It requests bounded estimator remeasurement without
+// reconnecting transports or resetting connection liveness.
+func NetworkQualityChanged() {
+	for _, listener := range networkQualityChangeListeners.Get() {
+		HandleError(listener)
+	}
+}
+
 // NetworkChanged invokes the registered network-change listeners. The host calls this on
 // its OS path-update signal (NWPathMonitor / ConnectivityManager); it is cheap and safe to
 // call on every update — listeners only tear down state bound to a possibly-dead path.
 func NetworkChanged() {
+	// A hard path switch also invalidates quality measurements. Keep this one
+	// canonical call so DeviceLocal does not need to emit both notifications.
+	NetworkQualityChanged()
 	for _, listener := range networkChangeListeners.Get() {
 		HandleError(listener)
 	}

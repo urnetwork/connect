@@ -28,6 +28,7 @@ case "$mode" in
     pattern="$pattern|^Test(SilentLaneLongerThanTheProbeCadenceStillDrains|SingleReliableLaneQueueInflatedRttDoesNotStorm)$"
     pattern="$pattern|^TestWindowRetained.*$|^Test(AdvertisementRaisesPermissionWithoutLearningCapacity|DeliveryCandidatesRequireFreshPermissionHistory|AClampedWindowReportsTheMemoryShare|ALearnedWindowSurvivesTheMemoryClamp|DeliveryGrowthRemainsBelowTheSmallMemoryShare|AConfiguredCeilingDoesNotReportTheMemoryShare|TheThreePeerBranchesHaveDifferentPermissionCeilings)$"
     pattern="$pattern|^TestWindowDestinationStats.*$|^TestWindowStats.*$"
+    pattern="$pattern|^Test(NetworkQuality|ClientNetworkQuality|WindowQuality).*$"
     pattern="$pattern|^Test(Send|Forward)Buffer(CallerCancel.*|ClosedSequenceStillRecreatesForLiveCaller)$"
     pattern="$pattern|^TestWindowPhysicalH1PolicyGate.*$"
     # This wall-clock occupancy assertion originally ran only in nonrace
@@ -43,23 +44,9 @@ case "$mode" in
     # The retained SDK, discovery, permission-shrink and capacity-drop cells
     # are the affected-cell performance roots added with the pacing fix.
     pattern='^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*|TestWindowPathSdk.*|TestWindowPathAckTailRoundTripGrowthControl|TestWindowPathRetainedSdk.*|TestWindowPathDiscovery.*|TestWindowPathPermissionShrinkKeepsPace|TestWindowPathCapacityDropStillLowersPace)$'
-    if [[ "$mode" == model-core ]]; then
-      # Explicit propagation switches will call NetworkQualityChanged once
-      # that signal is implemented. Keep the full historical model available.
-      run_flags+=(-test.skip '^(TestWindowPathAckTailRoundTripGrowthControl|TestWindowPathServiceRoundTripChanges|TestWindowPathServiceRoundTripGrowthBeyondOldRing)$')
-      cat > "$output/deferred-tests.json" <<'JSON'
-{
-  "reason": "User deferred explicit connection-quality-change performance tests until NetworkQualityChanged is implemented and invoked at the modeled path switch.",
-  "tests": [
-    "TestWindowPathAckTailRoundTripGrowthControl",
-    "TestWindowPathServiceRoundTripChanges",
-    "TestWindowPathServiceRoundTripGrowthBeyondOldRing"
-  ],
-  "retained_core_coverage": "Static paths, cold and warm pacing recovery, sustained congestion, window changes, ACK scheduling, ownership and FIFO fixture correctness.",
-  "complete_historical_mode": "model"
-}
-JSON
-    fi
+    # model-core remains as a compatibility alias. The three former path-change
+    # deferrals now signal NetworkQualityChanged at their programmed switch and
+    # run in both modes.
     build_flags=(-race=false)
     ;;
   sdk-model)

@@ -137,5 +137,12 @@ func (self *SendSequence) observePacingServiceCredit(credit windowServiceAckCred
 		return
 	}
 	self.windowPacer.serviceAcked += credit.bytes
+	if !service.qualityChangedAt.IsZero() && credit.firstSentAtNanos <= service.qualityChangedAt.UnixNano() {
+		// Old ACKs still repay physical ownership. They cannot supply a
+		// checkpoint or be paired with bytes from the new generation.
+		service.accountAckWithLock(credit.bytes, at)
+		service.completeFeedbackCycleWithLock()
+		return
+	}
 	service.observeAckWithLock(credit.bytes, at, credit.receiverTiming)
 }

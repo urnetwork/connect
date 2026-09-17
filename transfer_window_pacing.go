@@ -460,6 +460,9 @@ type windowPacingService struct {
 	drainMaximumTime     time.Duration
 	drainStartedAt       time.Time
 	drainCheckAt         time.Time
+	drainObservedAt      time.Time
+	drainObservedFlight  float64
+	drainProgressUntil   time.Time
 	drainUntil           time.Time
 	drainWake            chan struct{}
 	drainServiceEpoch    bool
@@ -476,8 +479,12 @@ type windowPacingService struct {
 	// then measured delivery is the pacer's own previous release and bounds
 	// capacity only from below. The held pace is the last pace admission
 	// granted, and it falls only with congestion evidence.
-	queueObservedAt time.Time
-	heldPacingRate  ByteCount
+	queueObservedAt         time.Time
+	heldPacingRate          ByteCount
+	qualityChangedAt        time.Time
+	qualityLastNotification time.Time
+	qualityRoundTripPending bool
+	qualityServiceMeasured  bool
 }
 
 // Admission and statistics read the same discovery state and held pace.
@@ -713,6 +720,10 @@ func (self *windowPacingService) finishWrite(sequenceId, messageId Id, h1 bool) 
 func (self *windowPacingService) applyRoundTripProbeWithLock() {
 	probe := self.roundTripProbe
 	if probe.written && !probe.ackedAt.IsZero() {
+		if !self.acceptQualityRoundTripWithLock(probe.ackedAt.Sub(probe.sentAt), probe.ackedAt) {
+			self.roundTripProbe = windowPacingRoundTripProbe{}
+			return
+		}
 		if probe.resetInitialService {
 			// Old accounting or a sibling may have supplied a valid pair
 			// since dispatch, even without an intervening controller read.
@@ -899,6 +910,7 @@ func (self *windowPacingService) admitBurst(now time.Time, bytes ByteCount, rese
 	defer self.stateLock.Unlock()
 	if !resend {
 		timing := self.roundTripEvidenceWithLock(now)
+		naturallyDraining := self.observeDrainProgressWithLock(now, max(4*deliverySizedWindowSampleInterval, timing.residence))
 		maximum := self.drainMaximumTime
 		if maximum <= 0 {
 			maximum = windowPacingDrainMaximumTime
@@ -931,7 +943,7 @@ func (self *windowPacingService) admitBurst(now time.Time, bytes ByteCount, rese
 				self.drainUntil = time.Time{}
 			}
 		}
-		if self.drainUntil.IsZero() && self.pendingWrites > 0 && !now.Before(self.drainCheckAt) && self.roundTripStats.ring != nil {
+		if self.drainUntil.IsZero() && self.pendingWrites > 0 && !naturallyDraining && !now.Before(self.drainCheckAt) && self.roundTripStats.ring != nil {
 			mean, count := self.roundTripStats.ring.mean(now)
 			threshold := float64(self.minRoundTrip) + float64(self.compression) + float64(max(2*time.Millisecond, self.minRoundTrip/4))
 			if timing.count > 0 {
@@ -1036,6 +1048,16 @@ func (self *windowPacingService) observeAckWithLock(bytes ByteCount, at time.Tim
 	if bytes <= 0 {
 		return
 	}
+	self.accountAckWithLock(bytes, at)
+	if at.Before(self.serviceEpochAt) {
+		return
+	}
+	self.observeAckSampleWithLock(bytes, at, receiverTiming)
+}
+
+// Repayment survives estimator generations, including delayed publication of
+// bytes already covered by a physically proved drain.
+func (self *windowPacingService) accountAckWithLock(bytes ByteCount, at time.Time) {
 	if probe := &self.roundTripProbe; !probe.sentAt.IsZero() && !at.After(probe.sentAt) {
 		// Only older arrivals complete the drained train's missing samples.
 		// Current delivery must not spend that older byte credit.
@@ -1045,9 +1067,10 @@ func (self *windowPacingService) observeAckWithLock(bytes ByteCount, at time.Tim
 		self.feedbackDrainPending = max(0, self.feedbackDrainPending-bytes)
 	}
 	self.total += bytes
-	if at.Before(self.serviceEpochAt) {
-		return
-	}
+}
+
+// Only eligible new-generation bytes reach serialization sampling.
+func (self *windowPacingService) observeAckSampleWithLock(bytes ByteCount, at time.Time, receiverTiming windowServiceAckTiming) {
 	timing := self.roundTripEvidenceWithLock(at)
 	roundTripCompression := self.compression
 	if timing.count > 0 {
@@ -1489,6 +1512,7 @@ func (self *windowPacingService) measureWithLock(horizon time.Duration, now time
 			return 0, self.total, hold
 		}
 		if retain && !heldAfterRejection {
+			self.qualityServiceMeasured = true
 			// Only controller acceptance commits this fresh pair's boundary.
 			// Later old bytes still count delivery, but cannot re-enter its rate.
 			if self.feedbackPending && epochAt.After(self.feedbackCycleBefore) {
@@ -1532,6 +1556,9 @@ func (self *windowPacingService) observeRoundTrip(roundTrip, compression time.Du
 func (self *windowPacingService) observeBurstRoundTrip(burst uint64, roundTrip, compression time.Duration, at time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if !self.acceptQualityRoundTripWithLock(roundTrip, at) {
+		return
+	}
 	if roundTrip > 0 && self.receiverRoundTrips != nil && !at.Before(self.lastRoundTrip) {
 		self.receiverRoundTrips.add(roundTrip, -1, compression, at)
 	}

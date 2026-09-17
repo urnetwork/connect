@@ -350,6 +350,7 @@ type windowPathCell struct {
 	RoundTrip                time.Duration
 	RoundTripAfter           time.Duration
 	RoundTripChangeAfter     time.Duration
+	QualityChanged           bool
 	Compression              time.Duration
 	Flows                    int
 	RoundRobinOffer          bool
@@ -584,6 +585,23 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	}
 	workers.Go(func() { dataLink.run(ctx, sendOut, receiveIn) })
 	workers.Go(func() { ackLink.run(ctx, receiveOut, sendIn) })
+	if cell.QualityChanged {
+		workers.Go(func() {
+			changeAfter := cell.RoundTripChangeAfter
+			if cell.RateChangeAfter > 0 && (changeAfter <= 0 || cell.RateChangeAfter < changeAfter) {
+				changeAfter = cell.RateChangeAfter
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(changeAfter):
+				// Both app endpoints observe this modeled interface change.
+				// Congestion-only cells deliberately receive no notification.
+				at := time.Now()
+				sender.sendBuffer.networkQualityChanged(Id{}, at)
+				receiver.sendBuffer.networkQualityChanged(Id{}, at)
+			}
+		})
+	}
 	directions := 1
 	if cell.Bidirectional {
 		directions = 2

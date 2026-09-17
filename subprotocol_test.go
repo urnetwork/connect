@@ -396,6 +396,10 @@ func TestSubprotocolRegistrationRules(t *testing.T) {
 	if len(ids) != 4 || ids[0] != 1 || ids[1] != 2 || ids[2] != 1024 || ids[3] != 65535 {
 		t.Fatalf("ids %v", ids)
 	}
+	applicationIds := client.subprotocols.table.Load().applicationIds()
+	if len(applicationIds) != 2 || applicationIds[0] != 1024 || applicationIds[1] != 65535 {
+		t.Fatalf("application ids exposed reserved protocols: %v", applicationIds)
+	}
 }
 
 func TestSubprotocolSendRules(t *testing.T) {
@@ -536,7 +540,7 @@ func TestSubprotocolQueryCompletion(t *testing.T) {
 	client.subprotocols.stateLock.Lock()
 	client.subprotocols.pendingQueries[queryId] = resultChan
 	client.subprotocols.stateLock.Unlock()
-	result := &protocol.SubprotocolsQueryResult{QueryId: queryId.Bytes(), SubprotocolIds: []uint32{9000, 2000, 2000, 0, 70000, 1500}}
+	result := &protocol.SubprotocolsQueryResult{QueryId: queryId.Bytes(), SubprotocolIds: []uint32{9000, 2000, 2000, 0, 1, 1023, 70000, 1500}}
 	frame, err := ToFrame(result, DefaultProtocolVersion)
 	if err != nil {
 		t.Fatal(err)

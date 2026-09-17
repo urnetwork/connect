@@ -299,6 +299,7 @@ func TestWindowPathServiceRoundTripChanges(t *testing.T) {
 						Flows: 8, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: rate, Warmup: 8 * time.Second}
 					if arm == "delivery" {
 						cell.RoundTrip, cell.RoundTripAfter, cell.RoundTripChangeAfter, cell.Drop = roundTrips[0], roundTrips[1], 4*time.Second, true
+						cell.QualityChanged = true
 					}
 					reading := measureWindowPathCell(t, cell, time.Second)
 					logWindowServiceReading(t, reading)

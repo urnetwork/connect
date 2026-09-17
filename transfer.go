@@ -1993,6 +1993,7 @@ type Client struct {
 	clientKeyManager         *ClientKeyManager
 	encryptionSessionManager *EncryptionSessionManager
 	signalDispatcher         *clientSignalDispatcher
+	networkQuality           *clientNetworkQualityState
 
 	// ready is closed by NewClientWithTag right before it returns, once every
 	// manager, buffer, callback, and the `run` loop are wired up. See
@@ -2132,6 +2133,7 @@ func NewClientWithTag(
 	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
 
 	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager, clientKeyManager, encryptionSessionManager)
+	client.networkQuality = newClientNetworkQualityState(client)
 
 	go func() {
 		defer close(client.runDone)
@@ -3877,6 +3879,7 @@ func (self *Client) SendMultiHop(
 
 // ReceiveFunction
 func (self *Client) receive(source TransferPath, frames []*protocol.Frame, peer Peer) {
+	self.observeNetworkQualityPeer(source, peer)
 	// subprotocol frames and queries are consumed here (subprotocol.go); the
 	// generic callbacks get the rest of the batch
 	// a batch made entirely of them is finished here; an empty batch handed
@@ -4658,6 +4661,7 @@ func (self *Client) Ctx() context.Context {
 // ContractManager.CloseAllContractStats and the multi-client channel teardown.
 func (self *Client) Close() {
 	self.cancel()
+	self.networkQuality.close()
 	self.webRtcManagerUnsub()
 
 	if self.streamManager != nil {
@@ -4709,6 +4713,9 @@ func (self *Client) CloseAndWait(ctx context.Context) error {
 	self.Close()
 
 	var result error
+	if err := self.networkQuality.wait(ctx); err != nil {
+		result = errors.Join(result, err)
+	}
 	if self.beforeRunDoneWaitForTest != nil {
 		self.beforeRunDoneWaitForTest()
 	}
@@ -6305,6 +6312,13 @@ type SendSequence struct {
 	deliveredServiceByteTotal ByteCount
 	// Admission retains capacity independently of the adaptive service rate.
 	windowSize sendWindowSizeState
+	// Quality reset excludes an in-flight estimate; ACK publication retains
+	// its own leaf-lock timestamp barrier instead of waiting on this lock.
+	windowQualityLock             sync.RWMutex
+	windowQualityLastNotification time.Time
+	beforeWindowRetentionForTest  func()
+	// Protected by deliveredBytesMutex with the generation's checkpoints.
+	windowQualityAfterNanos int64
 	// the receiver's latest advertised hold (THROUGHPUTFIX §37.3)
 	receiveWindowByteCount atomic.Uint64
 	receiveWindowSet       atomic.Bool
@@ -10319,6 +10333,12 @@ func (self *SendSequence) observeAckedBytes(cumulative, serviced ByteCount, at t
 
 // Logical delivery remains worker-owned after physical service was published.
 func (self *SendSequence) observeAckedBytesWithServiceCredit(cumulative, serviced ByteCount, credit windowServiceAckCredit, at time.Time) {
+	self.observeAckedBytesForWrite(cumulative, serviced, credit, at, credit.firstSentAtNanos)
+}
+
+// Cumulative prefixes carry their earliest first-write timestamp even when
+// every physical service byte was already credited by the ACK coalescer.
+func (self *SendSequence) observeAckedBytesForWrite(cumulative, serviced ByteCount, credit windowServiceAckCredit, at time.Time, firstSentAtNanos int64) {
 	if (cumulative <= 0 && serviced <= 0) || self.deliveredBytes == nil {
 		return
 	}
@@ -10326,6 +10346,9 @@ func (self *SendSequence) observeAckedBytesWithServiceCredit(cumulative, service
 	interval := self.deliveredBytesSampleIntervalAt(at).Nanoseconds()
 	self.deliveredBytesMutex.Lock()
 	defer self.deliveredBytesMutex.Unlock()
+	if self.windowQualityAfterNanos != 0 && firstSentAtNanos <= self.windowQualityAfterNanos {
+		return
+	}
 	self.deliveredByteTotal += cumulative
 	self.deliveredServiceByteTotal += serviced
 	atNanos := at.UnixNano()
@@ -10754,8 +10777,14 @@ func (self *SendSequence) sendWindowSnapshot(now time.Time) SendWindowEstimate {
 // Admission and statistics share one window rule. Only admission retains
 // measured service for a later no-evidence interval.
 func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) (estimate SendWindowEstimate) {
+	self.windowQualityLock.RLock()
+	defer self.windowQualityLock.RUnlock()
+	serviceGeneration := time.Time{}
+	if service := self.windowPacer.service; service != nil {
+		serviceGeneration = service.qualityGeneration()
+	}
 	// Bootstrap from the configured opening. Ordinary feedback may grow it;
-	// only a future explicit quality remeasurement may authorize a reduction.
+	// only an explicit quality remeasurement may authorize a reduction.
 	// Pacing remains continuously adaptive and hard byte bounds apply below.
 	initial := self.sendBufferSettings.ResendQueueMaxByteCount
 	floor := self.sendBufferSettings.ResendQueueMinByteCount
@@ -10809,7 +10838,7 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 				}
 				estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingByteRate)
 				if paced && retainService && estimate.WindowRoundTrip > 0 {
-					service.holdPacing(estimate.PacingByteRate)
+					service.holdPacingForGeneration(estimate.PacingByteRate, serviceGeneration)
 				}
 			}
 		}
@@ -10950,7 +10979,19 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 				estimate.Reason = "target"
 			}
 		}
-		learned := self.windowSize.estimate(max(initial, floor), candidate, estimate.Sized || estimate.ServiceSized, retainService)
+		if self.beforeWindowRetentionForTest != nil {
+			self.beforeWindowRetentionForTest()
+		}
+		qualified := estimate.Sized || estimate.ServiceSized
+		fresh := false
+		if service := self.windowPacer.service; service != nil && self.transferFlightPolicy().h1Only {
+			var current bool
+			current, fresh = service.qualityEstimateGeneration(serviceGeneration)
+			qualified = qualified && current
+		} else if self.rttWindow != nil && estimate.Sized {
+			fresh = self.rttWindow.freshQualityEstimate()
+		}
+		learned := self.windowSize.estimateAt(max(initial, floor), candidate, qualified, retainService, now, fresh)
 		estimate.LearnedWindow, estimate.CandidateWindow = learned, candidate
 		estimate.Window = min(max(learned, floor), ceiling)
 		estimate.CandidateTargetBound = candidateTargetBound
@@ -10977,7 +11018,7 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool) 
 			estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingProbeByteRate)
 			// A blind read has no residence to hold a pace against.
 			if paced && retainService && estimate.WindowRoundTrip > 0 {
-				service.holdPacing(estimate.PacingByteRate)
+				service.holdPacingForGeneration(estimate.PacingByteRate, serviceGeneration)
 			}
 		}
 	}()
@@ -11237,7 +11278,7 @@ func (self *SendSequence) observeAckRtt(item *sendItem, tag sequenceTag) {
 	if !tag.set || item == nil || item.unreliableCarrierObserved || self.receiverRttObserved(item) {
 		return
 	}
-	self.rttWindow.CloseSendTime(tag.sendTime)
+	self.rttWindow.closeSendTimeForWrite(tag.sendTime, time.Now(), item.pacingSentAtNanos)
 }
 
 func (self *SendSequence) unreliableFlightGates(
@@ -11367,7 +11408,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 				bytes = item.pacingByteCount
 			}
 			credit := self.takePacingServiceCredit(item)
-			self.observeAckedBytesWithServiceCredit(0, bytes, credit, deliveryTime)
+			self.observeAckedBytesForWrite(0, bytes, credit, deliveryTime, item.pacingSentAtNanos)
 			item.deliveryObserved = true
 		}
 		if self.log.V(1).Enabled() {
@@ -11416,6 +11457,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 	cumulativeByteCount := ByteCount(0)
 	serviceByteCount := ByteCount(0)
 	serviceCredit := windowServiceAckCredit{}
+	firstSentAtNanos := int64(math.MaxInt64)
 	// §34.3: an acknowledgement is cumulative, so every lane it touches has
 	// had its oldest unacknowledged item acknowledged. Collect those lanes
 	// and promote their new heads once the acknowledged prefix is gone.
@@ -11447,6 +11489,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		}
 
 		cumulativeByteCount += implicitItem.MessageByteCount()
+		firstSentAtNanos = min(firstSentAtNanos, implicitItem.pacingSentAtNanos)
 		if !implicitItem.deliveryObserved {
 			if self.windowPacer.service != nil {
 				serviceByteCount += implicitItem.pacingByteCount
@@ -11502,7 +11545,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 	if promoteLanes != 0 {
 		self.promoteLaneHeads(promoteLanes, self.lastCumulativeAckTime)
 	}
-	self.observeAckedBytesWithServiceCredit(cumulativeByteCount, serviceByteCount, serviceCredit, deliveryTime)
+	self.observeAckedBytesForWrite(cumulativeByteCount, serviceByteCount, serviceCredit, deliveryTime, firstSentAtNanos)
 	if self.log.V(2).Enabled() {
 		a, b := self.resendQueue.QueueSize()
 		self.log.Infof("[s]ack %d/%d (stop %d %dB %d) %s->%s...%s s(%s)\n", ackSequenceNumber, self.nextSequenceNumber-1, a, b, len(self.sendItems), self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)

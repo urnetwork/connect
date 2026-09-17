@@ -48,6 +48,8 @@ type RttWindow struct {
 	netRtt          time.Duration
 	// Legacy samples may apply late; new paired timing must never rewind.
 	latestObservedNanos int64
+	qualityAfterNanos   int64
+	qualityPending      bool
 
 	// minimums is a fixed-capacity monotonic deque. Keeping the smallest live
 	// RTT at its head avoids both the old per-Ack heap node allocation and an
@@ -155,13 +157,19 @@ func (self *RttWindow) CloseSendTime(sendTimeUnixMilli uint64) {
 }
 
 func (self *RttWindow) closeSendTime(sendTimeUnixMilli uint64, receiveTime time.Time) {
+	self.closeSendTimeForWrite(sendTimeUnixMilli, receiveTime, time.UnixMilli(int64(sendTimeUnixMilli)).UnixNano())
+}
+
+// Tags are legacy wall-clock values. Production supplies the immutable local
+// physical stamp separately so a wall-clock step cannot relabel a generation.
+func (self *RttWindow) closeSendTimeForWrite(sendTimeUnixMilli uint64, receiveTime time.Time, firstSentAtNanos int64) {
 	sendTime := time.UnixMilli(int64(sendTimeUnixMilli))
 	if receiveTime.Before(sendTime) {
 		// ignore
 		return
 	}
 
-	self.observeRoundTrip(receiveTime.Sub(sendTime), 0, 0, receiveTime, false)
+	self.observeRoundTripForWrite(receiveTime.Sub(sendTime), 0, 0, receiveTime, false, firstSentAtNanos)
 }
 
 // Receiver residence is optional and does not change raw recovery samples.
@@ -174,8 +182,26 @@ func (self *RttWindow) observeReceiverRoundTrip(roundTrip, receiverDelay time.Du
 
 // Both forms share the same bounded sample capacity and expiration policy.
 func (self *RttWindow) observeRoundTrip(roundTrip time.Duration, receiverAdjustedNanos int64, compressionMicros uint32, receiveTime time.Time, chronological bool) {
+	self.observeRoundTripForWrite(roundTrip, receiverAdjustedNanos, compressionMicros, receiveTime, chronological, receiveTime.Add(-roundTrip).UnixNano())
+}
+
+// The sample's measurement clock and its first-write generation are separate
+// facts for legacy tags; exact receiver timing carries both on the local clock.
+func (self *RttWindow) observeRoundTripForWrite(roundTrip time.Duration, receiverAdjustedNanos int64, compressionMicros uint32, receiveTime time.Time, chronological bool, firstSentAtNanos int64) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if self.qualityAfterNanos != 0 {
+		if firstSentAtNanos <= self.qualityAfterNanos {
+			return
+		}
+		if self.qualityPending {
+			clear(self.window)
+			clear(self.minimums)
+			self.windowTailIndex, self.windowCount, self.minimumHeadIndex, self.minimumCount = 0, 0, 0, 0
+			self.netRtt, self.rttVar, self.latestObservedNanos = 0, 0, 0
+			self.qualityPending = false
+		}
+	}
 	if chronological && self.nextSequence != 0 && receiveTime.UnixNano() < self.latestObservedNanos {
 		return
 	}
@@ -321,9 +347,13 @@ func (self *RttWindow) deviationRtt(sendTime time.Time) time.Duration {
 	}
 	mean := self.netRtt / time.Duration(self.windowCount)
 	margin := max(self.rttMinScaledRtt, 4*self.rttVar)
+	floor := self.rttMinScaledRtt
+	if self.qualityPending {
+		floor = max(floor, self.minScaledRtt)
+	}
 	self.stateLock.Unlock()
 
-	return min(max(mean+margin, self.rttMinScaledRtt), self.maxScaledRtt)
+	return min(max(mean+margin, floor), self.maxScaledRtt)
 }
 
 // clamp(mean rtt of window * scale, floor, overall max), where the floor is
@@ -345,6 +375,8 @@ func (self *RttWindow) scaledRtt(sendTime time.Time) time.Duration {
 	if useRtt == 0 {
 		// no samples: no evidence to be aggressive on
 		floor = self.minScaledRtt
+	} else if self.qualityPending {
+		floor = max(floor, self.minScaledRtt)
 	}
 	scaledRtt := min(
 		max(
@@ -383,6 +415,8 @@ func (self *RttWindow) probeRtt(probeTime time.Time) time.Duration {
 	floor := self.rttMinScaledRtt
 	if useRtt == 0 {
 		floor = self.minScaledRtt
+	} else if self.qualityPending {
+		floor = max(floor, self.minScaledRtt)
 	}
 	probeRtt := min(
 		max(
