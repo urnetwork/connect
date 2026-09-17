@@ -2,7 +2,9 @@ package connect
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	mathrand "math/rand"
 	"net"
 	"net/netip"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 // The extender network client (EXTENDER.md E3).
@@ -97,6 +100,10 @@ type ExtenderNetworkClientSettings struct {
 	// ResolveDns, when set, replaces the bootstrap resolution. Nil resolves A
 	// and AAAA over DoH with the system resolver as the fallback (E3).
 	ResolveDns func(ctx context.Context, name string) ([]netip.Addr, error)
+	// ResolveDnsTxt, when set, replaces the bootstrap TXT resolution. Nil
+	// resolves TXT over the strategy's DoH settings with the system resolver
+	// as the fallback, the same way ResolveDns does for addresses.
+	ResolveDnsTxt func(ctx context.Context, name string) ([]string, error)
 	// Hello, when set, replaces the hello fetch. Nil reads /hello through the
 	// client strategy.
 	Hello func(ctx context.Context) (*ExtenderHelloResult, error)
@@ -525,8 +532,19 @@ func (self *ExtenderNetworkClient) applyManualHosts() uint64 {
 	return version
 }
 
-// Resolves the extender dns name and adds every answer as an unverified
-// address with source dns (E3). A record naming one of these upgrades it.
+// Resolves the extender dns name (E3).
+//
+// The TXT answers come first. Each is a signed record, the same bytes the
+// operator gossips, and applying it verifies it under the root keys and lands
+// its addresses already verified. Only then are the A and AAAA answers added,
+// as unverified addresses with source dns, which is a no-op for an address a
+// record just named. The order is what makes dns a verified bootstrap rather
+// than an unverified one: dns itself is not trusted, the operator's signature
+// is, and dns is merely where it was fetched from.
+//
+// A TXT answer that does not verify is dropped and logged, never applied: a
+// poisoned resolver can hand out any bytes it likes, and the whole point is
+// that only the root key decides what counts.
 func (self *ExtenderNetworkClient) bootstrap() {
 	if self.settings.ExtenderDnsName == "" {
 		return
@@ -535,10 +553,37 @@ func (self *ExtenderNetworkClient) bootstrap() {
 	if resolve == nil {
 		resolve = self.resolveDns
 	}
+	resolveTxt := self.settings.ResolveDnsTxt
+	if resolveTxt == nil {
+		resolveTxt = self.resolveDnsTxt
+	}
 	// the resolution shares the hello budget: both are one short name-service
 	// round trip before anything can be dialed
 	ctx, cancel := context.WithTimeout(self.ctx, self.settings.HelloTimeout)
 	defer cancel()
+
+	txts, err := resolveTxt(ctx, self.settings.ExtenderDnsName)
+	if err != nil {
+		// not fatal: the address answers may still bootstrap, unverified
+		self.log.Infof("[extender]bootstrap txt err = %s\n", err)
+	}
+	applied := 0
+	for _, txt := range txts {
+		message, err := DecodeExtenderDnsRecord(txt)
+		if err != nil {
+			self.log.Infof("[extender]bootstrap txt record ignored: %s\n", err)
+			continue
+		}
+		if _, err := self.directory.ApplySource(message, ExtenderSourceDns); err != nil {
+			self.log.Infof("[extender]bootstrap txt record refused: %s\n", err)
+			continue
+		}
+		applied += 1
+	}
+	if 0 < len(txts) {
+		self.log.Infof("[extender]bootstrap applied %d of %d txt records\n", applied, len(txts))
+	}
+
 	ips, err := resolve(ctx, self.settings.ExtenderDnsName)
 	if err != nil {
 		self.log.Infof("[extender]bootstrap err = %s\n", err)
@@ -547,6 +592,59 @@ func (self *ExtenderNetworkClient) bootstrap() {
 	for _, ip := range ips {
 		self.directory.AddBootstrap(ip, ExtenderSourceDns)
 	}
+}
+
+// The default bootstrap TXT resolution: over the strategy's DoH settings, with
+// the system resolver as the fallback when DoH yields nothing, mirroring
+// resolveDns.
+func (self *ExtenderNetworkClient) resolveDnsTxt(
+	ctx context.Context,
+	name string,
+) ([]string, error) {
+	dohSettings := self.settings.DohSettings
+	if dohSettings == nil && self.clientStrategy != nil {
+		dohSettings = self.clientStrategy.settings.DohSettings
+	}
+	if dohSettings != nil {
+		if txts := DohQueryTxt(ctx, dohSettings, name); 0 < len(txts) {
+			return txts, nil
+		}
+	}
+	var customResolver *net.Resolver
+	if self.clientStrategy != nil {
+		customResolver = self.clientStrategy.settings.ConnectSettings.Resolver
+	}
+	return dialResolver(customResolver).LookupTXT(ctx, name)
+}
+
+// DecodeExtenderDnsRecord decodes one TXT value of the extender dns name: the
+// base64 of a serialized ExtenderGossipMessage, exactly the bytes the operator
+// gossips. Decoding is all this does; the signature is checked where the
+// message is applied, under the root keys the directory holds.
+func DecodeExtenderDnsRecord(txt string) (*protocol.ExtenderGossipMessage, error) {
+	txt = strings.TrimSpace(txt)
+	if txt == "" {
+		return nil, fmt.Errorf("extender dns record is empty")
+	}
+	data, err := base64.StdEncoding.DecodeString(txt)
+	if err != nil {
+		return nil, fmt.Errorf("extender dns record is not base64: %w", err)
+	}
+	message := &protocol.ExtenderGossipMessage{}
+	if err := proto.Unmarshal(data, message); err != nil {
+		return nil, fmt.Errorf("extender dns record is not a gossip message: %w", err)
+	}
+	return message, nil
+}
+
+// EncodeExtenderDnsRecord is the inverse, for the operator's publisher and for
+// tests: the TXT value that carries one gossip message.
+func EncodeExtenderDnsRecord(message *protocol.ExtenderGossipMessage) (string, error) {
+	data, err := proto.Marshal(message)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(data), nil
 }
 
 // The default bootstrap resolution: A and AAAA over the strategy's DoH

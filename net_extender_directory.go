@@ -901,6 +901,9 @@ func (self *ExtenderDirectory) Candidates(
 		if now.Before(address.holdUntilTime) {
 			continue
 		}
+		if !self.addressDialableWithLock(address) {
+			continue
+		}
 		if !self.addressActiveWithLock(address, now) {
 			continue
 		}
@@ -1034,6 +1037,26 @@ func (self *ExtenderDirectory) addressActiveWithLock(
 		return false
 	}
 	return !self.keyRecordExpiredWithLock(keyRecord, now)
+}
+
+// addressDialableWithLock is whether an address may be dialed at all, before
+// any question of whether its record is current.
+//
+// An address with no verified key is never dialed unless it was configured by
+// hand. A dns or import bootstrap entry holds no key until a signed record
+// names it, and dialing it before then means handing the extender request --
+// the destination, the shared secret -- to whoever answers at that address,
+// with nothing checked. Dns is where the address came from, and dns is not
+// trusted; the operator's signature is. With the TXT bootstrap a dns answer
+// arrives verified, so this costs a client nothing it should have had.
+//
+// A manual entry is the operator's own configuration, carries its secret, and
+// is the one case where the person configuring it is the trust anchor.
+func (self *ExtenderDirectory) addressDialableWithLock(address *extenderDirectoryAddress) bool {
+	if address.publicKeyHex != "" {
+		return true
+	}
+	return address.source == ExtenderSourceManual
 }
 
 // B5: a revocation at or after the record's issue time.
@@ -1216,6 +1239,11 @@ func (self *ExtenderDirectory) Snapshot() *ExtenderDirectorySnapshot {
 // The count of addresses whose key is active (B5), hold included. This is what
 // the low-water re-bootstrap reads: a held address is still a known extender,
 // and re-resolving dns would not produce a better one.
+//
+// An address with no key and no manual configuration does not count. It is
+// not dialable, so it is not an extender the client has; and re-resolving dns
+// is exactly what could produce a better one, since the TXT answers carry the
+// records that would verify it.
 func (self *ExtenderDirectory) ActiveCount(ipVersion int) int {
 	now := self.settings.Now()
 
@@ -1225,6 +1253,9 @@ func (self *ExtenderDirectory) ActiveCount(ipVersion int) int {
 	count := 0
 	for ip, address := range self.ipAddresses {
 		if ipVersion != 0 && addressIpVersion(ip) != ipVersion {
+			continue
+		}
+		if !self.addressDialableWithLock(address) {
 			continue
 		}
 		if self.addressActiveWithLock(address, now) {
@@ -1248,6 +1279,9 @@ func (self *ExtenderDirectory) UsableCount(ipVersion int) int {
 			continue
 		}
 		if now.Before(address.holdUntilTime) {
+			continue
+		}
+		if !self.addressDialableWithLock(address) {
 			continue
 		}
 		if self.addressActiveWithLock(address, now) {
@@ -1274,6 +1308,9 @@ func (self *ExtenderDirectory) AddressUsable(ip netip.Addr) bool {
 		return false
 	}
 	if now.Before(address.holdUntilTime) {
+		return false
+	}
+	if !self.addressDialableWithLock(address) {
 		return false
 	}
 	return self.addressActiveWithLock(address, now)

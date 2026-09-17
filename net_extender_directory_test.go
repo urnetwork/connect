@@ -203,7 +203,8 @@ func TestExtenderDirectoryHoldDoublesToTheCap(t *testing.T) {
 		settings.NeverSucceededRemoveTimeout = 1000 * 24 * time.Hour
 	})
 	ip := netip.MustParseAddr("192.0.2.10")
-	directory.AddBootstrap(ip, ExtenderSourceDns)
+	// manual: the hold is what is under test, and only a manual or verified address is dialable at all
+	directory.AddBootstrap(ip, ExtenderSourceManual)
 
 	expectHoldTimeouts := []time.Duration{
 		10 * time.Minute,
@@ -235,7 +236,8 @@ func TestExtenderDirectoryWarningAndSuccessClearsTheRun(t *testing.T) {
 	clock := newTestClock()
 	directory, _ := newTestExtenderDirectory(t, clock, nil)
 	ip := netip.MustParseAddr("192.0.2.11")
-	directory.AddBootstrap(ip, ExtenderSourceDns)
+	// manual: the hold is what is under test, and only a manual or verified address is dialable at all
+	directory.AddBootstrap(ip, ExtenderSourceManual)
 
 	if state := testDirectoryState(t, directory, ip); state != ExtenderStateUnverified {
 		t.Fatalf("state = %s, expected unverified", state)
@@ -581,14 +583,18 @@ func TestExtenderDirectoryCapEvictionOrder(t *testing.T) {
 }
 
 // Candidates are filtered by family and ordered verified first (E1, E2).
+//
+// The unverified candidate here is manual: a hand-configured address is the
+// one kind that is dialed without a record. A dns bootstrap address without
+// one is not a candidate at all, which the next test pins.
 func TestExtenderDirectoryCandidatesFilterFamilyAndPreferVerified(t *testing.T) {
 	clock := newTestClock()
 	directory, rootPrivateKey := newTestExtenderDirectory(t, clock, nil)
 
-	unverifiedIp := netip.MustParseAddr("192.0.2.40")
+	manualIp := netip.MustParseAddr("192.0.2.40")
 	verifiedIp := netip.MustParseAddr("192.0.2.41")
 	v6Ip := netip.MustParseAddr("2001:db8::41")
-	directory.AddBootstrap(unverifiedIp, ExtenderSourceDns)
+	directory.AddBootstrap(manualIp, ExtenderSourceManual)
 	record := signTestRecord(
 		t,
 		rootPrivateKey,
@@ -616,12 +622,78 @@ func TestExtenderDirectoryCandidatesFilterFamilyAndPreferVerified(t *testing.T) 
 	// a held address is not a candidate
 	directory.RecordFailure(verifiedIp, ExtenderConnectModeTcpTls)
 	heldCandidates := directory.Candidates(4, 8)
-	if len(heldCandidates) != 1 || heldCandidates[0].Ip != unverifiedIp {
+	if len(heldCandidates) != 1 || heldCandidates[0].Ip != manualIp {
 		t.Fatalf("candidates = %v, expected the held address to be skipped", heldCandidates)
 	}
 	// and an excluded one is not either
-	if excluded := directory.Candidates(4, 8, unverifiedIp); len(excluded) != 0 {
+	if excluded := directory.Candidates(4, 8, manualIp); len(excluded) != 0 {
 		t.Fatalf("candidates = %v, expected the exclusion to hold", excluded)
+	}
+}
+
+// An address that arrived from dns without a record is known but never dialed
+// (B3, E1): it is not a candidate, not usable, and does not count toward the
+// low-water mark, until a signed record names it. Dns is where it came from,
+// and dns is not trusted; only the operator's signature is. A manual address
+// is the one exception, since the person configuring it is its trust anchor.
+func TestExtenderDirectoryNeverDialsAnUnverifiedDnsAddress(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestExtenderDirectory(t, clock, nil)
+
+	dnsIp := netip.MustParseAddr("192.0.2.50")
+	manualIp := netip.MustParseAddr("192.0.2.51")
+	directory.AddBootstrap(dnsIp, ExtenderSourceDns)
+	directory.AddBootstrap(manualIp, ExtenderSourceManual)
+
+	// both are known, so a record can still upgrade the dns one
+	if snapshot := directory.Snapshot(); snapshot.KnownCount != 2 {
+		t.Fatalf("known = %d, expected both addresses to be kept", snapshot.KnownCount)
+	}
+	candidates := directory.Candidates(4, 8)
+	if len(candidates) != 1 || candidates[0].Ip != manualIp {
+		t.Fatalf("candidates = %v, expected only the manual address", candidates)
+	}
+	if directory.AddressUsable(dnsIp) {
+		t.Fatal("an unverified dns address must not be usable")
+	}
+	if !directory.AddressUsable(manualIp) {
+		t.Fatal("a manual address is usable without a record")
+	}
+	if count := directory.UsableCount(0); count != 1 {
+		t.Fatalf("usable = %d, expected the manual address alone", count)
+	}
+	if count := directory.ActiveCount(0); count != 1 {
+		t.Fatalf("active = %d, expected the unverified address not to satisfy the low-water mark", count)
+	}
+
+	// a signed record naming the dns address is what makes it dialable
+	record := signTestRecord(
+		t,
+		rootPrivateKey,
+		newTestExtenderKey(t),
+		clock.Now(),
+		clock.Now().Add(14*24*time.Hour),
+		testExtenderAddress(dnsIp.String()),
+	)
+	if _, err := directory.ApplyRecord(record, ExtenderSourceDns); err != nil {
+		t.Fatal(err)
+	}
+	candidates = directory.Candidates(4, 8)
+	if len(candidates) != 2 || candidates[0].Ip != dnsIp {
+		t.Fatalf("candidates = %v, expected the verified dns address first", candidates)
+	}
+	if !directory.AddressUsable(dnsIp) {
+		t.Fatal("the verified dns address must be usable")
+	}
+	if count := directory.UsableCount(0); count != 2 {
+		t.Fatalf("usable = %d, expected both", count)
+	}
+	if count := directory.ActiveCount(0); count != 2 {
+		t.Fatalf("active = %d, expected both", count)
+	}
+	// the origin is kept: this is still the address dns handed out
+	if entry := testDirectoryEntry(t, directory, dnsIp); entry.Source != ExtenderSourceDns {
+		t.Fatalf("source = %s, expected dns", entry.Source)
 	}
 }
 

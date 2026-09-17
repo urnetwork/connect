@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"net/url"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1182,6 +1183,35 @@ func DohQueryWithDefaults(ctx context.Context, recordType string, domains ...str
 	return DohQuery(ctx, 0, recordType, DefaultDohSettings(), domains...)
 }
 
+// DohQueryTxt is the one-shot TXT query: the joined value of every TXT
+// record of the name, over the settings' servers with the same hedging as an
+// address query. Nothing is cached, which is right for its one caller: the
+// extender bootstrap runs it once per pass and the value is a signed record
+// that carries its own expiry.
+func DohQueryTxt(ctx context.Context, settings *DohSettings, name string) []string {
+	lifecycle := newDohCacheLifecycle()
+	httpClient := httpClientWithDialer(
+		settings,
+		lifecycle.dialContext(wrapControlDial("doh", settings.Log, settings.DialContextSettings == nil, settings.DialContext)),
+		tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity),
+	)
+	c := &dohClient{
+		httpClient:    httpClient,
+		httpSem:       make(chan struct{}, maxConcurrentHttpRequests(settings)),
+		primarySem:    newDohPrimarySem(maxConcurrentHttpRequests(settings), settings.DohServerHedgeReserve),
+		activeQueries: &atomic.Int64{},
+		stats:         nil,
+		memoryTarget:  settings.MemoryTarget,
+		lifecycle:     lifecycle,
+		siblings:      dohServerSiblings(settings.DnsResolverSettings),
+	}
+	// both families' servers: a txt answer has no family of its own
+	txts := c.queryResult(ctx, remoteDohUrls(settings, 0), "TXT", settings, name).Txts
+	lifecycle.shutdown()
+	httpClient.CloseIdleConnections()
+	return txts
+}
+
 // return ip -> ttl (seconds)
 // use `ipVersion=0` to try all versions
 func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *DohSettings, domains ...string) map[netip.Addr]int {
@@ -1279,8 +1309,12 @@ func localDohUrls(settings *DohSettings, ipVersion int) []string {
 
 type dohQueryResult struct {
 	AddrTtls map[netip.Addr]int
-	Miss     bool
-	Route    *DohRoute
+	// Txts is the TXT answers of a TXT query, one entry per record with its
+	// character strings joined, which is how RFC 7208 and every consumer of
+	// a long TXT value reads them. Empty for an address query.
+	Txts  []string
+	Miss  bool
+	Route *DohRoute
 }
 
 func newDohQueryResult() *dohQueryResult {
@@ -1547,7 +1581,7 @@ func (self *dohClient) queryResult(
 	domains ...string,
 ) *dohQueryResult {
 	switch recordType {
-	case "A", "AAAA":
+	case "A", "AAAA", "TXT":
 	default:
 		return newDohQueryResult()
 	}
@@ -1668,7 +1702,7 @@ func (self *dohClient) queryResult(
 						// against it. The large stagger means the first wave is the usual winner, so a
 						// later wave is only launched — and only judged — when an earlier server was
 						// slow or failed.
-						self.stats.record(dohUrl, 0 < len(result.AddrTtls) || result.Miss)
+						self.stats.record(dohUrl, 0 < len(result.AddrTtls) || 0 < len(result.Txts) || result.Miss)
 						select {
 						case receiveResults <- result:
 						case <-queryCtx.Done():
@@ -1685,10 +1719,17 @@ func (self *dohClient) queryResult(
 		case <-queryCtx.Done():
 			return &dohQueryResult{
 				AddrTtls: mergedResult.AddrTtls,
+				Txts:     mergedResult.Txts,
 			}
 		case result := <-receiveResults:
 			maps.Copy(mergedResult.AddrTtls, result.AddrTtls)
-			if 0 < len(result.AddrTtls) && result.Route != nil {
+			for _, txt := range result.Txts {
+				if !slices.Contains(mergedResult.Txts, txt) {
+					mergedResult.Txts = append(mergedResult.Txts, txt)
+				}
+			}
+			answered := 0 < len(result.AddrTtls) || 0 < len(result.Txts)
+			if answered && result.Route != nil {
 				mergedResult.Route = result.Route
 			}
 			if result.Miss {
@@ -1698,16 +1739,17 @@ func (self *dohClient) queryResult(
 			// waiting for the rest, so a slow or dead server can't delay a successful lookup. an
 			// authoritative miss is not short-circuited — keep collecting so a filtering
 			// resolver's NXDOMAIN can't override a server that resolves the name.
-			if 0 < len(mergedResult.AddrTtls) {
+			if 0 < len(mergedResult.AddrTtls) || 0 < len(mergedResult.Txts) {
 				stopLaunching()
 				return &dohQueryResult{
 					AddrTtls: mergedResult.AddrTtls,
+					Txts:     mergedResult.Txts,
 					Route:    mergedResult.Route,
 				}
 			}
 		}
 	}
-	mergedResult.Miss = len(mergedResult.AddrTtls) == 0 && mergedResult.Miss
+	mergedResult.Miss = len(mergedResult.AddrTtls) == 0 && len(mergedResult.Txts) == 0 && mergedResult.Miss
 	return mergedResult
 }
 
@@ -1729,6 +1771,8 @@ func (self *dohClient) queryWireDetailed(ctx context.Context, dohUrl string, rec
 		qType = dnsmessage.TypeA
 	case "AAAA":
 		qType = dnsmessage.TypeAAAA
+	case "TXT":
+		qType = dnsmessage.TypeTXT
 	default:
 		return result, fmt.Errorf("unsupported record type %q", recordType)
 	}
@@ -2058,13 +2102,25 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 			}
 			ip := netip.AddrFrom16(r.AAAA)
 			result.AddrTtls[ip] = max(result.AddrTtls[ip], int(ah.TTL))
+		case ah.Type == dnsmessage.TypeTXT && qType == dnsmessage.TypeTXT:
+			r, err := p.TXTResource()
+			if err != nil {
+				return result
+			}
+			// one record is a sequence of character strings that together
+			// form one value; a value long enough to need splitting -- a
+			// base64 signed record is -- arrives as several
+			txt := strings.Join(r.TXT, "")
+			if txt != "" && !slices.Contains(result.Txts, txt) {
+				result.Txts = append(result.Txts, txt)
+			}
 		default:
 			if err := p.SkipAnswer(); err != nil {
 				return result
 			}
 		}
 	}
-	if len(result.AddrTtls) == 0 {
+	if len(result.AddrTtls) == 0 && len(result.Txts) == 0 {
 		result.Miss = true
 	}
 	return result

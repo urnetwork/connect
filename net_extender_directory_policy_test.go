@@ -302,7 +302,8 @@ func TestExtenderDirectoryHoldClampsToTheMaximum(t *testing.T) {
 		settings.MaxHoldTimeout = time.Minute
 	})
 	ip := netip.MustParseAddr("192.0.2.10")
-	directory.AddBootstrap(ip, ExtenderSourceDns)
+	// manual: the hold is what is under test, and only a manual or verified address is dialable at all
+	directory.AddBootstrap(ip, ExtenderSourceManual)
 
 	directory.RecordFailure(ip, ExtenderConnectModeTcpTls)
 	clock.advance(time.Minute)
@@ -495,8 +496,10 @@ func TestExtenderDirectoryCountsPerFamily(t *testing.T) {
 	})
 	v4 := netip.MustParseAddr("192.0.2.10")
 	v6 := netip.MustParseAddr("2001:db8::10")
-	directory.AddBootstrap(v4, ExtenderSourceDns)
-	directory.AddBootstrap(v6, ExtenderSourceDns)
+	// manual: the hold is what is under test, and only a manual or verified address is dialable at all
+	directory.AddBootstrap(v4, ExtenderSourceManual)
+	// manual: the hold is what is under test, and only a manual or verified address is dialable at all
+	directory.AddBootstrap(v6, ExtenderSourceManual)
 
 	cases := []struct {
 		ipVersion int
@@ -685,7 +688,8 @@ func TestExtenderDirectoryHoldAppliesToBothFamilies(t *testing.T) {
 			settings.MaxHoldTimeout = 6 * time.Hour
 		})
 		ip := netip.MustParseAddr(ipText)
-		directory.AddBootstrap(ip, ExtenderSourceDns)
+		// manual: the hold is what is under test, and only a manual or verified address is dialable at all
+		directory.AddBootstrap(ip, ExtenderSourceManual)
 
 		directory.RecordFailure(ip, ExtenderConnectModeTcpTls)
 		if directory.AddressUsable(ip) {

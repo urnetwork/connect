@@ -290,9 +290,14 @@ recently used evicted). This
 replaces the per-connection RSA-2048 `selfSign`. QUIC uses the same
 callback. A client that knows the extender's key from a record sets
 `VerifyPeerCertificate` to require that the leaf's signature verifies
-under that key, keeping `InsecureSkipVerify` so no roots are consulted; a
-client without a key skips verification as today. An extender without an
-identity key issues per-SNI self-signed leaves.
+under that key, keeping `InsecureSkipVerify` so no roots are consulted. A
+client never dials an address it has no key for unless that address was
+configured by hand (E1), so the only unverified outer handshake is a
+manual extender's, whose trust anchor is the person who configured it.
+Every address that arrived from dns is dialed only once a root-signed
+record names it, which the TXT bootstrap of C5 delivers in the same
+answer as the address. An extender without an identity key issues
+per-SNI self-signed leaves.
 
 B4. Root key distribution. The network space values carry
 `ExtenderRootPublicKeys` (hex) as the trust anchor before first contact,
@@ -408,9 +413,22 @@ NA, OC, SA and the default, each an A and an AAAA set at
 `extender.<host>` (env prefix rule of the network space for non-main
 envs), TTL 60, up to 8 addresses per set sampled at random from active
 addresses of that family in that continent and filled from the global set
-when short; the default set samples globally. All sets go in one
-`ChangeResourceRecordSets` UPSERT batch per tick; a set with no addresses
-is deleted. No Route 53 health checks. Continent from country through a
+when short; the default set samples globally. Beside each location's A
+and AAAA sets goes a TXT set, `extender-<location>-TXT`, holding one
+value per extender behind the addresses those sets answer with: the
+base64 of that extender's `ExtenderGossipMessage`, freshly signed for the
+tick with the root key of C2 in the record shape of the drip, so a record
+fetched from dns verifies exactly as one fetched from gossip. Each
+extender is signed once per tick however many locations answer with it,
+and a dual-stack extender is one value naming both families. A value is
+quoted and split into strings of at most 255 characters, which a
+resolver joins. All sets go in one `ChangeResourceRecordSets` UPSERT
+batch per tick; a set with no addresses is deleted, and a location's TXT
+set goes with its address sets. An operator with no root key publishes
+the address sets alone and logs why once per tick. A record is about 300
+characters, so a TXT answer of the largest set is under 3 KB, within
+EDNS0 and every DoH path; a larger `sample_count` would have to watch
+that bound. No Route 53 health checks. Continent from country through a
 static table in the server. Configuration in `extender.yml`:
 `dns: {enabled, hosted_zone_name, hosted_zone_id, record_name, ttl,
 sample_count, aws_region, aws_access_key_id, aws_secret_access_key}`. The
@@ -524,7 +542,13 @@ it hears, and nothing serves the full set.
 E1. Directory (`net_extender_directory.go`). Verified entries keyed by
 public key hold the newest record and revocation (B5). Unverified entries
 keyed by ip come from DNS bootstrap and manual configuration and hold no
-key; they upgrade to verified when a record listing that ip arrives. Each
+key; they upgrade to verified when a record listing that ip arrives. An
+unverified entry is dialable only when it is manual: a dns or imported
+address without a record is known and upgradable, but it is not a
+candidate, not usable, and does not count toward the low-water mark of
+E3, because dialing it would hand the extender request, destination and
+secret included, to whoever answers at an address nothing has vouched
+for. Each
 address carries local state: success and failure counts, last success,
 last failure, first failure, consecutive failures, hold-until, last use,
 in-use count. Policy, all settings: hold after a failure 10 minutes
@@ -557,15 +581,24 @@ extender still excludes every other dialer.
 
 E3. Network client (`net_extender_network.go`). Owns the refresh loop for
 one network space: load the store; bootstrap by resolving `ExtenderDnsName`
-A and AAAA over the strategy's DoH settings and adding the answers as
-unverified addresses with source dns, with the system resolver as the
-fallback when DoH fails; take a sample by dialing `Service` feed on a
+TXT, then A and AAAA, over the strategy's DoH settings with the system
+resolver as the fallback when DoH yields nothing -- each TXT value decodes
+to a signed gossip message (C5) and is applied with source dns, so the
+addresses it names land verified, while a value that does not decode or
+does not verify under the root keys is logged and dropped; the A and AAAA
+answers are then added as unverified addresses with source dns, which is
+a no-op for an address a record just named, and which are never dialed
+until a record does (E1); the order is what makes dns a verified
+bootstrap, since dns itself is not trusted and the operator's signature
+is; take a sample by dialing `Service` feed on a
 candidate, verified first, tcp then quic then dns carriers, with
 `SampleCount` 16 and `Subscribe` per role; apply the frames; mark the
 initial sample done. In the feed role it keeps the stream and reconnects
 through another candidate on failure with backoff 1 s doubling to 5
 minutes. It re-bootstraps over DNS every 6 hours and whenever fewer than 4
-active entries remain (held addresses count as active here; the startup
+active entries remain (held addresses count as active here, unverified
+non-manual ones do not, so a client whose operator publishes no TXT
+records keeps re-resolving on the backoff until one appears; the startup
 gate of E4 counts only usable ones), refreshes the root keys from hello
 every 6 hours, and reconnects on network change. A subscribed stream that
 is silent for 90 s, three keepalive intervals, is treated as gone. A
@@ -2567,6 +2600,12 @@ Phase 5b follows 4 because both touch the server.
   which the probe-back guarantees silently.
 - The spoof list ships empty until operations provide it, so extender
   dialers appear only after that.
+- A client that never dials an unverified dns address has no extender at
+  all on an operator whose `extender.<host>` carries no TXT records, since
+  the feed is reached through extenders and dns is the only bootstrap. The
+  taskworker that publishes the TXT sets therefore deploys before the
+  connect change reaches clients, and an operator that removes its root
+  key strands every client that has not stored a directory.
 
 ## 7. As built
 
@@ -2683,3 +2722,25 @@ is involved, and the rpc version is unchanged: an app newer than its
 device process hides the Extender row and the extender statistics until
 that process runs this sdk (N1, N2), and an older app never calls the
 new methods, so apps and daemons update in either order.
+
+Phase 13, the TXT bootstrap (B3, C5, E1, E3), is implemented in connect
+(this document) and the server as of 2026-09-17, uncommitted, together
+with the h3 hostname passthrough (the alt service as every h3 and dns
+carrier's destination, carried as a name in the extender header and
+resolved at the extender) of the same day. Server: the TXT sets of C5 in
+the geo dns publisher, `GetActiveNetworkExtenderForRecord` for the
+signer, and the Route 53 listing owning TXT sets under the `extender-`
+prefix; the publisher suite is green against the local environment.
+Connect: TXT over DoH (`DohQueryTxt`), `DecodeExtenderDnsRecord` and its
+inverse, the bootstrap applying TXT records before the address answers,
+and the directory's dialability rule in `Candidates`, `AddressUsable`,
+`UsableCount` and `ActiveCount`; the hold-policy tests moved to manual
+addresses since the hold is what they are about; the root, extender and
+gossip packages' extender selections are green.
+
+Operations for phase 13: deploy the taskworker first and confirm
+`dig TXT extender.<host>` answers with values that decode, then release
+the connect change in the sdk and the apps. In the other order, a new
+client on an old operator has no dialable extender until the TXT sets
+exist. An old client ignores the TXT sets. Nothing else changes: no
+migration, no services version, no rpc version.

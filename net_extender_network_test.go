@@ -3,12 +3,15 @@ package connect
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // Network client tests (EXTENDER.md E3). Every seam the loop touches is
@@ -83,6 +86,11 @@ func newTestExtenderNetworkClientWithDirectory(
 	settings.HelloTimeout = 2 * time.Second
 	settings.IpVersionSupported = func(ipVersion int) bool { return true }
 	settings.Hello = func(ctx context.Context) (*ExtenderHelloResult, error) {
+		return nil, nil
+	}
+	// no txt answers unless a test supplies them, so no test resolves for
+	// real; the real path is DoH and then the system resolver
+	settings.ResolveDnsTxt = func(ctx context.Context, name string) ([]string, error) {
 		return nil, nil
 	}
 	if configure != nil {
@@ -243,6 +251,10 @@ func TestExtenderNetworkClientDoesNotRebootstrapAboveTheLowWaterMark(t *testing.
 	clock := newTestClock()
 	var resolveCount atomic.Int64
 	var helloCount atomic.Int64
+	// the addresses count only once verified, which is what the txt answer
+	// does: it carries the operator-signed record that names them
+	rootPrivateKey, rootPublicKey := newTestRootKeyPair(t)
+	txt := testExtenderDnsRecordTxt(t, rootPrivateKey, clock, "192.0.2.220", "192.0.2.221", "192.0.2.222")
 	_, directory, _ := newTestExtenderNetworkClientWithDirectory(
 		t,
 		clock,
@@ -261,9 +273,14 @@ func TestExtenderNetworkClientDoesNotRebootstrapAboveTheLowWaterMark(t *testing.
 					netip.MustParseAddr("192.0.2.222"),
 				}, nil
 			}
+			settings.ResolveDnsTxt = func(ctx context.Context, name string) ([]string, error) {
+				return []string{txt}, nil
+			}
 			settings.Hello = func(ctx context.Context) (*ExtenderHelloResult, error) {
 				helloCount.Add(1)
-				return nil, nil
+				return &ExtenderHelloResult{
+					RootPublicKeyHexes: []string{ExtenderKeySeedHex(rootPublicKey)},
+				}, nil
 			}
 		},
 	)
@@ -536,6 +553,14 @@ func TestExtenderNetworkClientReportsConnectingWhileDialing(t *testing.T) {
 	settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
 		return []netip.Addr{netip.MustParseAddr("192.0.2.70")}, nil
 	}
+	// nothing is dialed without a record, so the txt answer vouches for the
+	// address; the keys are set before the loop starts, so nothing races
+	rootPrivateKey, rootPublicKey := newTestRootKeyPair(t)
+	directory.SetRootKeys(NewExtenderRootKeySet(rootPublicKey))
+	txt := testExtenderDnsRecordTxt(t, rootPrivateKey, clock, "192.0.2.70")
+	settings.ResolveDnsTxt = func(ctx context.Context, name string) ([]string, error) {
+		return []string{txt}, nil
+	}
 	networkClient := NewExtenderNetworkClient(
 		ctx,
 		newTestBlockingDialStrategy(t, ctx),
@@ -605,5 +630,174 @@ func TestExtenderGossipStateForBothRoles(t *testing.T) {
 				c.expect,
 			)
 		}
+	}
+}
+
+// newTestRootKeyPair is a fresh operator root key for a test that signs.
+func newTestRootKeyPair(t *testing.T) (ed25519.PrivateKey, ed25519.PublicKey) {
+	t.Helper()
+	rootSeed, err := NewExtenderKeySeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPrivateKey, err := ExtenderPrivateKeyFromSeed(rootSeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rootPrivateKey, rootPrivateKey.Public().(ed25519.PublicKey)
+}
+
+// testExtenderDnsRecordTxt is one TXT value of the extender dns name: a
+// record signed by rootPrivateKey, for a fresh extender key, naming ips (C5).
+func testExtenderDnsRecordTxt(
+	t *testing.T,
+	rootPrivateKey ed25519.PrivateKey,
+	clock *testClock,
+	ips ...string,
+) string {
+	t.Helper()
+	addresses := []*protocol.ExtenderAddress{}
+	for _, ip := range ips {
+		addresses = append(addresses, testExtenderAddress(ip))
+	}
+	record := signTestRecord(
+		t,
+		rootPrivateKey,
+		newTestExtenderKey(t),
+		clock.Now(),
+		clock.Now().Add(14*24*time.Hour),
+		addresses...,
+	)
+	txt, err := EncodeExtenderDnsRecord(&protocol.ExtenderGossipMessage{
+		Message: &protocol.ExtenderGossipMessage_Record{Record: record},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return txt
+}
+
+// The bootstrap applies the signed records in the TXT answers before it adds
+// the address answers (E3, C5): an address a record names lands verified,
+// with source dns; one no record names lands unverified and is not dialed;
+// and a TXT value that is not a record, or a record the root keys do not
+// vouch for, is dropped without touching anything.
+func TestExtenderNetworkClientBootstrapAppliesSignedTxtRecords(t *testing.T) {
+	clock := newTestClock()
+	rootPrivateKey, rootPublicKey := newTestRootKeyPair(t)
+	otherRootPrivateKey, _ := newTestRootKeyPair(t)
+
+	signedTxt := testExtenderDnsRecordTxt(t, rootPrivateKey, clock, "192.0.2.230", "2001:db8::230")
+	// signed by a root the client does not trust: a poisoned resolver's best
+	// attempt, and exactly what must not land
+	forgedTxt := testExtenderDnsRecordTxt(t, otherRootPrivateKey, clock, "192.0.2.232")
+
+	txtResolved := make(chan string, 16)
+	_, directory, _ := newTestExtenderNetworkClientWithDirectory(
+		t,
+		clock,
+		func(settings *ExtenderDirectorySettings) {
+			// the loop dials every candidate and fails here; with no hold the
+			// candidate list stays what verification made it
+			settings.HoldTimeout = 0
+			settings.MaxHoldTimeout = 0
+		},
+		func(settings *ExtenderNetworkClientSettings) {
+			settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
+				return []netip.Addr{
+					netip.MustParseAddr("192.0.2.230"),
+					netip.MustParseAddr("192.0.2.231"),
+					netip.MustParseAddr("192.0.2.232"),
+				}, nil
+			}
+			settings.ResolveDnsTxt = func(ctx context.Context, name string) ([]string, error) {
+				select {
+				case txtResolved <- name:
+				default:
+				}
+				return []string{signedTxt, "not a record at all", "bm90IGEgbWVzc2FnZQ==", forgedTxt}, nil
+			}
+			settings.Hello = func(ctx context.Context) (*ExtenderHelloResult, error) {
+				return &ExtenderHelloResult{
+					RootPublicKeyHexes: []string{ExtenderKeySeedHex(rootPublicKey)},
+				}, nil
+			}
+		},
+	)
+
+	select {
+	case name := <-txtResolved:
+		if name != "extender.space.example" {
+			t.Fatalf("resolved txt of %q, expected the configured name", name)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the bootstrap never resolved txt")
+	}
+
+	waitForDirectoryAddresses(t, directory, map[string]string{
+		"192.0.2.230":   ExtenderSourceDns,
+		"2001:db8::230": ExtenderSourceDns,
+		"192.0.2.231":   ExtenderSourceDns,
+		"192.0.2.232":   ExtenderSourceDns,
+	})
+
+	// the record's addresses carry its key: verified on arrival, from dns
+	for _, ip := range []string{"192.0.2.230", "2001:db8::230"} {
+		entry := testDirectoryEntry(t, directory, netip.MustParseAddr(ip))
+		if len(entry.PublicKey) == 0 {
+			t.Fatalf("%s carries no key, expected the txt record to verify it", ip)
+		}
+		if entry.Source != ExtenderSourceDns {
+			t.Fatalf("%s source = %s, expected dns", ip, entry.Source)
+		}
+	}
+	// the bare address answer is known and not dialable
+	for _, ip := range []string{"192.0.2.231", "192.0.2.232"} {
+		entry := testDirectoryEntry(t, directory, netip.MustParseAddr(ip))
+		if len(entry.PublicKey) != 0 {
+			t.Fatalf("%s carries a key, expected no record to have named it", ip)
+		}
+		if directory.AddressUsable(netip.MustParseAddr(ip)) {
+			t.Fatalf("%s is usable without a record", ip)
+		}
+	}
+	// only the verified addresses are drawn, in both families
+	for _, ipVersion := range []int{4, 6} {
+		candidates := directory.Candidates(ipVersion, 8)
+		if len(candidates) != 1 || len(candidates[0].PublicKey) == 0 {
+			t.Fatalf("v%d candidates = %v, expected the one verified address", ipVersion, candidates)
+		}
+	}
+}
+
+// The TXT value is the base64 of the gossip message, nothing more: what the
+// operator publishes decodes to what it signed, and anything else is refused
+// before it reaches the directory.
+func TestExtenderDnsRecordRoundTrip(t *testing.T) {
+	clock := newTestClock()
+	rootPrivateKey, rootPublicKey := newTestRootKeyPair(t)
+	txt := testExtenderDnsRecordTxt(t, rootPrivateKey, clock, "192.0.2.240")
+
+	message, err := DecodeExtenderDnsRecord("  " + txt + "\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := NewExtenderRootKeySet(rootPublicKey).VerifyRecord(message.GetRecord())
+	if err != nil {
+		t.Fatalf("the decoded record does not verify: %v", err)
+	}
+	if len(body.Addresses) != 1 || body.Addresses[0].Ip != "192.0.2.240" {
+		t.Fatalf("addresses = %v, expected the signed address", body.Addresses)
+	}
+
+	for _, txt := range []string{"", "   ", "not base64!", "bm90IGEgbWVzc2FnZQ=="} {
+		if _, err := DecodeExtenderDnsRecord(txt); err == nil {
+			t.Errorf("%q decoded, expected an error", txt)
+		}
+	}
+	// an empty message is well-formed base64 of nothing and must still be an
+	// error rather than a message with no record
+	if _, err := DecodeExtenderDnsRecord(base64.StdEncoding.EncodeToString(nil)); err == nil {
+		t.Error("an empty value decoded, expected an error")
 	}
 }
