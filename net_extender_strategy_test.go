@@ -156,20 +156,30 @@ func TestClientStrategyDialersUseTheRecordPorts(t *testing.T) {
 	}
 }
 
-// An unverified bootstrap address is dialable on the carrier defaults, which
-// is what makes a dns bootstrap useful before any record arrives (E2).
-func TestClientStrategyExpandsUnverifiedBootstrapAddresses(t *testing.T) {
+// A dns bootstrap address without a record expands no dialer at all: nothing
+// has vouched for it, and the extender request must not be handed to whoever
+// answers there (E1). A manual address is the one unverified kind that is
+// dialed, on the carrier defaults and without a key (E2).
+func TestClientStrategyExpandsOnlyManualUnverifiedAddresses(t *testing.T) {
 	clock := newTestClock()
 	clientStrategy, directory, _ := newTestExtenderStrategy(t, clock, nil)
 
-	ip := netip.MustParseAddr("192.0.2.102")
-	directory.AddBootstrap(ip, ExtenderSourceDns)
+	dnsIp := netip.MustParseAddr("192.0.2.102")
+	directory.AddBootstrap(dnsIp, ExtenderSourceDns)
+	if expandedDialers := clientStrategy.expandExtenderDialers(); len(expandedDialers) != 0 {
+		t.Fatalf("dialers = %d, expected none for a dns address without a record", len(expandedDialers))
+	}
 
+	manualIp := netip.MustParseAddr("192.0.2.108")
+	directory.AddBootstrap(manualIp, ExtenderSourceManual)
 	expandedDialers := clientStrategy.expandExtenderDialers()
 	if len(expandedDialers) != 3 {
-		t.Fatalf("dialers = %d, expected one per default carrier", len(expandedDialers))
+		t.Fatalf("dialers = %d, expected one per default carrier of the manual address", len(expandedDialers))
 	}
 	for _, dialer := range expandedDialers {
+		if dialer.extenderConfig.Ip != manualIp {
+			t.Fatalf("dialer ip = %s, expected only the manual address", dialer.extenderConfig.Ip)
+		}
 		if 0 < len(dialer.extenderConfig.PublicKey) {
 			t.Fatal("an unverified candidate produced a key-pinned dialer")
 		}
@@ -192,7 +202,8 @@ func TestClientStrategyDialerReportsOutcomesToTheDirectory(t *testing.T) {
 	clock := newTestClock()
 	clientStrategy, directory, _ := newTestExtenderStrategy(t, clock, nil)
 	ip := netip.MustParseAddr("192.0.2.103")
-	directory.AddBootstrap(ip, ExtenderSourceDns)
+	// manual: dialable without a record, which a dns address without one is not
+	directory.AddBootstrap(ip, ExtenderSourceManual)
 
 	expandedDialers := clientStrategy.expandExtenderDialers()
 	if len(expandedDialers) == 0 {
@@ -229,11 +240,24 @@ func TestClientStrategyDialerReportsOutcomesToTheDirectory(t *testing.T) {
 // drop timeout says (E2).
 func TestClientStrategyCollapseDropsRetiredAddresses(t *testing.T) {
 	clock := newTestClock()
-	clientStrategy, directory, _ := newTestExtenderStrategy(t, clock, nil)
+	clientStrategy, directory, rootPrivateKey := newTestExtenderStrategy(t, clock, nil)
 	heldIp := netip.MustParseAddr("192.0.2.104")
 	keptIp := netip.MustParseAddr("192.0.2.105")
-	directory.AddBootstrap(heldIp, ExtenderSourceDns)
-	directory.AddBootstrap(keptIp, ExtenderSourceDns)
+	// verified, one record each: only a verified or manual address is dialed,
+	// and a manual one is never retired, so the retirement needs records
+	for _, ip := range []netip.Addr{heldIp, keptIp} {
+		record := signTestRecord(
+			t,
+			rootPrivateKey,
+			newTestExtenderKey(t),
+			clock.Now(),
+			clock.Now().Add(14*24*time.Hour),
+			testExtenderAddress(ip.String()),
+		)
+		if _, err := directory.ApplyRecord(record, ExtenderSourceDns); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	ctx := context.Background()
 	clientStrategy.expandExtenderDialers()
@@ -286,11 +310,13 @@ func TestClientStrategyCollapseKeepsUntriedDialers(t *testing.T) {
 		settings.ExtenderDropTimeout = time.Minute
 	})
 
-	// more candidates than one parallel block launches
+	// more candidates than one parallel block launches; manual, since only a
+	// manual or verified address is dialed and the drop timeout is what is
+	// under test
 	for i := range 4 {
 		directory.AddBootstrap(
 			netip.MustParseAddr(fmt.Sprintf("192.0.2.%d", 120+i)),
-			ExtenderSourceDns,
+			ExtenderSourceManual,
 		)
 	}
 	expandedDialers := clientStrategy.expandExtenderDialers()
@@ -451,13 +477,46 @@ func TestClientStrategyStartupGateReleasesOnTheFirstAttempt(t *testing.T) {
 // A stored directory never waits: there is already something to dial (E4).
 func TestClientStrategyStartupGateSkipsWithAStoredDirectory(t *testing.T) {
 	clock := newTestClock()
-	clientStrategy, directory, _ := newTestExtenderStrategy(t, clock, func(settings *ClientStrategySettings) {
+	clientStrategy, directory, rootPrivateKey := newTestExtenderStrategy(t, clock, func(settings *ClientStrategySettings) {
 		settings.ExtenderInitialSampleTimeout = time.Hour
 	})
 	directory.SetInitialSamplePending()
-	directory.AddBootstrap(netip.MustParseAddr("192.0.2.107"), ExtenderSourceDns)
+	// what a stored directory holds that is dialable: a verified record
+	record := signTestRecord(
+		t,
+		rootPrivateKey,
+		newTestExtenderKey(t),
+		clock.Now(),
+		clock.Now().Add(14*24*time.Hour),
+		testExtenderAddress("192.0.2.107"),
+	)
+	if _, err := directory.ApplyRecord(record, ExtenderSourceFeed); err != nil {
+		t.Fatal(err)
+	}
 
 	requireStartupGateReturns(t, clientStrategy, "with a usable directory")
+}
+
+// A directory holding only dns addresses without records has nothing to dial,
+// so the gate waits for the first sample exactly as an empty one does (E1,
+// E4): releasing it would only let the strategy find no dialer at all.
+func TestClientStrategyStartupGateWaitsWithOnlyUnverifiedAddresses(t *testing.T) {
+	clock := newTestClock()
+	clientStrategy, directory, _ := newTestExtenderStrategy(t, clock, func(settings *ClientStrategySettings) {
+		settings.ExtenderInitialSampleTimeout = 200 * time.Millisecond
+	})
+	directory.SetInitialSamplePending()
+	directory.AddBootstrap(netip.MustParseAddr("192.0.2.109"), ExtenderSourceDns)
+
+	start := time.Now()
+	clientStrategy.waitForExtenderInitialSample(context.Background())
+	elapsed := time.Since(start)
+	if elapsed < 200*time.Millisecond {
+		t.Fatalf("the gate returned after %s, expected it to wait for the sample", elapsed)
+	}
+	if 5*time.Second <= elapsed {
+		t.Fatalf("the gate waited %s, expected at most the timeout", elapsed)
+	}
 }
 
 // A gate whose caller is already done returns at once rather than holding the

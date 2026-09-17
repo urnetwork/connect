@@ -566,9 +566,9 @@ addresses}`, saved coalesced at 1 s after a change.
 E2. Strategy. `ClientStrategySettings.ExtenderDirectory` replaces
 `ExtenderNetworks`, `ExtenderHostnames` and the profile enumeration, which
 are removed along with `net_extender_profiles.go`. `expandExtenderDialers`
-draws up to `ExpandExtenderProfileCount` candidates that are active and
-not on hold, preferring verified over unverified and addresses of a family
-the host has (`probeFamilySupport`), and creates one dialer per address
+draws up to `ExpandExtenderProfileCount` candidates that are active, not
+on hold and dialable -- verified, or manual (E1) -- preferring verified
+over manual and addresses of a family the host has (`probeFamilySupport`), and creates one dialer per address
 and carrier the record lists, priorities 100 tcp, 110 quic, 120 dns,
 minimum weight `ExtenderMinimumWeight`. `clientDialer.Update` reports to
 the directory. `collapseExtenderDialers` also drops dialers whose address

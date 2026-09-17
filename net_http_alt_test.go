@@ -297,7 +297,8 @@ func TestAltDialerPriorityOrder(t *testing.T) {
 	clientStrategy, directory, _ := newTestExtenderStrategy(t, clock, func(settings *ClientStrategySettings) {
 		settings.AltUrl = "https://alt.space.example"
 	})
-	directory.AddBootstrap(netip.MustParseAddr("192.0.2.111"), ExtenderSourceDns)
+	// manual: dialable without a record, which a dns address without one is not
+	directory.AddBootstrap(netip.MustParseAddr("192.0.2.111"), ExtenderSourceManual)
 	if expanded := clientStrategy.expandExtenderDialers(); len(expanded) == 0 {
 		t.Fatal("no extender dialers were expanded")
 	}
