@@ -175,6 +175,8 @@ reorder them.
 | `server/controller/extender_controller.go`, `extender_proximity_controller.go` | `ContinentCode` at signing; hint; latency ingest with signature verification, ownership check and nonce dedupe |
 | `server/db_migrations.go` | `network_extender_latency` |
 | `server/taskworker/work/extender_latency_work.go` | 30 day retention sweep |
+| `server/model/network_extender_activation_model.go` | activation history: one row per activation with the address hash and the city/region/country it resolved to, as a provider's connection keeps them, so a ping can later be placed against where its extender was |
+| `server/controller/stats_collector.go`, `grafana/dashboards/extenders.json` | provider ping gauges (pings, providers, extenders pinged over 24 h) and a per-extender pings counter, on the extenders dashboard |
 | `sdk/device_local.go` | install the attestor on provider start, clear on stop |
 | `connect/api/bringyour.yml` | the two new endpoints |
 
