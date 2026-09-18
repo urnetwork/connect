@@ -2827,7 +2827,7 @@ func (self *SendSequence) laneOldestOutstanding(route Route) *sendItem {
 // item is acknowledged and gone before its promoted firing arrives, so the
 // drain writes nothing.
 //
-// Only an acknowledgement of a retransmit promotes. That is what separates a
+// An acknowledgement promotes only after a retransmit. That separates a
 // batch being dragged forward one write at a time from a lane making its own
 // forward progress: in the first the acknowledgement exists because the
 // sender wrote the position again, and the next position needs the same
@@ -2838,6 +2838,11 @@ func (self *SendSequence) laneOldestOutstanding(route Route) *sendItem {
 // writes; a position the scoreboard recovered instead is not promoted, and
 // does not need to be, since the scoreboard writes every position it proves
 // in one round.
+// A head rewritten onto a different carrier also leaves this lane's
+// outstanding set. Promote its successor at that transition: the changed
+// carrier makes the head's eventual acknowledgement ambiguous, so it can no
+// longer promote through lane acknowledgement evidence. This schedules one
+// probe without crediting either lane with delivery.
 //
 // The firing is set to the round trip in both directions, never only pulled
 // in. A new lane head has usually been riding the old one and carries that
@@ -10309,11 +10314,22 @@ func (self *SendSequence) observeCarrierWrite(
 	item *sendItem,
 	disposition transferWriteDisposition,
 ) {
+	departedLane := uint32(0)
 	if item.carrierRoute != nil && item.carrierRoute != disposition.route {
+		// A changed-carrier item no longer owns its old lane's probe. Read
+		// that ownership before changing the route or setting the exclusion.
+		if self.laneProvenRecovery(item) && self.laneOldestOutstanding(item.carrierRoute) == item {
+			if slot := self.laneSlotFor(item.carrierRoute); 0 <= slot {
+				departedLane = uint32(1) << uint(slot)
+			}
+		}
 		item.carrierChanged = true
 	}
 	item.carrierRoute = disposition.route
 	self.observeLaneSend(item)
+	if departedLane != 0 {
+		self.promoteLaneHeads(departedLane, time.Now())
+	}
 	if !disposition.unreliable {
 		if disposition.reliable && !item.unreliableCarrierObserved {
 			item.reliableCarrierObserved = true
@@ -11544,7 +11560,6 @@ func (self *SendSequence) receiveAckFeedbackAt(
 	// had its oldest unacknowledged item acknowledged. Collect those lanes
 	// and promote their new heads once the acknowledged prefix is gone.
 	promoteLanes := uint32(0)
-	var promoteRoute Route
 	// acks are cumulative
 	// implicitly ack all earlier items in the sequence
 	i := 0
@@ -11583,15 +11598,10 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		}
 		self.observeLaneAck(implicitItem, self.lastCumulativeAckTime)
 		self.observeReliableLaneAck(implicitItem, self.lastCumulativeAckTime)
-		if implicitItem.carrierRoute != nil && !implicitItem.carrierChanged &&
-			implicitItem.carrierRoute != promoteRoute {
-			promoteRoute = implicitItem.carrierRoute
-			// this is the lane's oldest unacknowledged item, since the
-			// acknowledged items are a prefix of the sequence. Its send
-			// count is above one exactly when the sender had to write it
-			// again to get this acknowledgement.
-			if slot := self.laneSlotFor(promoteRoute); 0 <= slot &&
-				1 < implicitItem.sendCount {
+		if 1 < implicitItem.sendCount && implicitItem.carrierRoute != nil && !implicitItem.carrierChanged {
+			// Any recovered item in the prefix advances its lane. An earlier
+			// original write must not hide it; the mask deduplicates promotion.
+			if slot := self.laneSlotFor(implicitItem.carrierRoute); 0 <= slot {
 				promoteLanes |= uint32(1) << uint(slot)
 			}
 		}
