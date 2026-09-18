@@ -57,39 +57,40 @@ type memsteadyByteBudget struct {
 }
 
 type memsteadySide struct {
-	Role                               string              `json:"role"`
-	Burst                              memsteadyPhase      `json:"burst"`
-	Quiet                              memsteadyPhase      `json:"quiet"`
-	WindowClientsBase                  int                 `json:"window_clients_before_burst"`
-	WindowClientsBurst                 int                 `json:"window_clients_burst_max"`
-	WindowClientsEnd                   int                 `json:"window_clients_end"`
-	PoolOutstandingEnd                 int64               `json:"pool_outstanding_end"`
-	TransportBudgetTotalBytes          int64               `json:"transport_budget_total_bytes"`
-	TransportBudgetMaxUsedBytes        int64               `json:"transport_budget_max_used_bytes"`
-	TransportBudgetBaselineBytes       int64               `json:"transport_budget_baseline_used_bytes"`
-	TransportBudgetEndBytes            int64               `json:"transport_budget_end_used_bytes"`
-	TransportBudgetMaxCount            int64               `json:"transport_budget_max_count"`
-	TransportBudgetPeakCount           int64               `json:"transport_budget_peak_used_count"`
-	TransportBudgetBaselineCount       int64               `json:"transport_budget_baseline_used_count"`
-	TransportBudgetEndCount            int64               `json:"transport_budget_end_used_count"`
-	TransportBudgetHandoffBytes        int64               `json:"transport_budget_max_handoff_bytes"`
-	DeviceTransportBudgetTotalBytes    int64               `json:"device_transport_budget_total_bytes"`
-	DeviceTransportBudgetMaxUsedBytes  int64               `json:"device_transport_budget_max_used_bytes"`
-	DeviceTransportBudgetBaselineBytes int64               `json:"device_transport_budget_baseline_used_bytes"`
-	DeviceTransportBudgetEndBytes      int64               `json:"device_transport_budget_end_used_bytes"`
-	DeviceTransportBudgetMaxCount      int64               `json:"device_transport_budget_max_count"`
-	DeviceTransportBudgetPeakCount     int64               `json:"device_transport_budget_peak_used_count"`
-	DeviceTransportBudgetBaselineCount int64               `json:"device_transport_budget_baseline_used_count"`
-	DeviceTransportBudgetEndCount      int64               `json:"device_transport_budget_end_used_count"`
-	DeviceTransportBudgetHandoffBytes  int64               `json:"device_transport_budget_max_handoff_bytes"`
-	TransferRootBudget                 memsteadyByteBudget `json:"transfer_root_budget"`
-	ClientTransferBudget               memsteadyByteBudget `json:"client_transfer_budget"`
-	ProviderTransferBudget             memsteadyByteBudget `json:"provider_transfer_budget"`
-	NatBudget                          memsteadyByteBudget `json:"nat_budget"`
-	PackQueueBudget                    memsteadyByteBudget `json:"pack_queue_budget"`
-	PeerPinBudget                      memsteadyByteBudget `json:"peer_pin_budget"`
-	Pass                               bool                `json:"pass"`
-	Failures                           []string            `json:"failures"`
+	Role                               string                    `json:"role"`
+	Burst                              memsteadyPhase            `json:"burst"`
+	Quiet                              memsteadyPhase            `json:"quiet"`
+	WindowClientsBase                  int                       `json:"window_clients_before_burst"`
+	WindowClientsBurst                 int                       `json:"window_clients_burst_max"`
+	WindowClientsEnd                   int                       `json:"window_clients_end"`
+	PoolOutstandingEnd                 int64                     `json:"pool_outstanding_end"`
+	TransportBudgetTotalBytes          int64                     `json:"transport_budget_total_bytes"`
+	TransportBudgetMaxUsedBytes        int64                     `json:"transport_budget_max_used_bytes"`
+	TransportBudgetBaselineBytes       int64                     `json:"transport_budget_baseline_used_bytes"`
+	TransportBudgetEndBytes            int64                     `json:"transport_budget_end_used_bytes"`
+	TransportBudgetMaxCount            int64                     `json:"transport_budget_max_count"`
+	TransportBudgetPeakCount           int64                     `json:"transport_budget_peak_used_count"`
+	TransportBudgetBaselineCount       int64                     `json:"transport_budget_baseline_used_count"`
+	TransportBudgetEndCount            int64                     `json:"transport_budget_end_used_count"`
+	TransportBudgetHandoffBytes        int64                     `json:"transport_budget_max_handoff_bytes"`
+	DeviceTransportBudgetTotalBytes    int64                     `json:"device_transport_budget_total_bytes"`
+	DeviceTransportBudgetMaxUsedBytes  int64                     `json:"device_transport_budget_max_used_bytes"`
+	DeviceTransportBudgetBaselineBytes int64                     `json:"device_transport_budget_baseline_used_bytes"`
+	DeviceTransportBudgetEndBytes      int64                     `json:"device_transport_budget_end_used_bytes"`
+	DeviceTransportBudgetMaxCount      int64                     `json:"device_transport_budget_max_count"`
+	DeviceTransportBudgetPeakCount     int64                     `json:"device_transport_budget_peak_used_count"`
+	DeviceTransportBudgetBaselineCount int64                     `json:"device_transport_budget_baseline_used_count"`
+	DeviceTransportBudgetEndCount      int64                     `json:"device_transport_budget_end_used_count"`
+	DeviceTransportBudgetHandoffBytes  int64                     `json:"device_transport_budget_max_handoff_bytes"`
+	TransferRootBudget                 memsteadyByteBudget       `json:"transfer_root_budget"`
+	ClientTransferBudget               memsteadyByteBudget       `json:"client_transfer_budget"`
+	ProviderTransferBudget             memsteadyByteBudget       `json:"provider_transfer_budget"`
+	NatBudget                          memsteadyByteBudget       `json:"nat_budget"`
+	PackQueueBudget                    memsteadyByteBudget       `json:"pack_queue_budget"`
+	PeerPinBudget                      memsteadyByteBudget       `json:"peer_pin_budget"`
+	TransferRecovery                   memsteadyTransferRecovery `json:"transfer_recovery"`
+	Pass                               bool                      `json:"pass"`
+	Failures                           []string                  `json:"failures"`
 }
 
 type memsteadySummary struct {
@@ -532,6 +533,7 @@ func memsteadyReport(args []string) error {
 		s := memsteadySide{Failures: []string{}, Pass: true}
 		carrierBaselineSeen, carrierEndSeen := false, false
 		transferBaselineSeen, transferEndSeen := false, false
+		var transferSamples []memsteadyTransferBudgetAt
 		lastCarrierHandoffCount := int64(0)
 		lastDeviceCarrierHandoffCount := int64(0)
 		if parseErr != nil {
@@ -564,6 +566,7 @@ func memsteadyReport(args []string) error {
 			} else if transferErr != nil {
 				s.Failures = append(s.Failures, "transfer budget hierarchy: "+transferErr.Error())
 			} else {
+				transferSamples = append(transferSamples, memsteadyTransferBudgetAt{Millis: sample.Millis, Budget: transfer})
 				baseline := meta.BaselineStart <= sample.Millis && sample.Millis < meta.StartMillis
 				transferBaselineSeen = transferBaselineSeen || baseline
 				transferEndSeen = true
@@ -736,6 +739,11 @@ func memsteadyReport(args []string) error {
 		if !transferBaselineSeen || !transferEndSeen {
 			s.Failures = append(s.Failures, "missing transfer-budget baseline or final evidence")
 		} else {
+			var recoveryErr error
+			s.TransferRecovery, recoveryErr = verifyMemsteadyTransferRecovery(transferSamples, meta)
+			if recoveryErr != nil {
+				s.Failures = append(s.Failures, "transfer budget recovery: "+recoveryErr.Error())
+			}
 			for _, budget := range []struct {
 				name    string
 				summary memsteadyByteBudget
@@ -745,6 +753,9 @@ func memsteadyReport(args []string) error {
 				{"Pack queue", s.PackQueueBudget},
 			} {
 				if budget.summary.EndBytes > budget.summary.BaselineBytes {
+					if (budget.name == "transfer root" || budget.name == "NAT") && s.TransferRecovery.LateNatAdmissionAccepted {
+						continue
+					}
 					s.Failures = append(s.Failures, budget.name+" bytes did not return to the pre-burst baseline")
 				}
 			}

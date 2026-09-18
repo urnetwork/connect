@@ -415,8 +415,26 @@ larger surrogate. For every row assert all of the following:
    each stays within its cap and cumulative reserved minus released bytes
    equals current use. Every child stays within its own cap and root usage;
    child values are not added together or to the root a second time. Report
-   baseline/peak/end use for all five budgets and require each to return to
-   its pre-burst baseline at quiet-window end. The deterministic gate repeats this at the normal
+   baseline/peak/end use for all five budgets. Client, provider and Pack use
+   must return to the pre-burst baseline at quiet-window end. For NAT and its
+   parent root, also report the quiet minima and a timestamped recovery
+   witness: a continuous interval of at least 20 seconds beginning no earlier
+   than 30 seconds into quiet, with root and NAT strictly below their
+   pre-burst baselines and every other transfer child at or below baseline.
+   Diagnostic gaps over 20 seconds break the witness. An end value above
+   baseline is accepted only after such a witness, with monotone balanced
+   reserve/release counters proving new NAT admissions afterward and at least
+   as many new reserved bytes at the root. Root excess cannot exceed NAT
+   excess. Record the witness, post-witness reserve/release deltas and actual
+   endpoint values; do not label them zero or discard later runtime samples.
+   This distinguishes demonstrated aggregate burst recovery followed by new
+   connected traffic from monotonically retained burst ownership. It does
+   not identify individual flows: raw flow logs provide attribution, and the
+   deterministic ownership/lifecycle gates remain required. A pre-burst,
+   drain-only, early-quiet or single-sample dip cannot justify late growth.
+   All-sample runtime/admission caps, carrier end checks, temporary-client
+   release, traffic and five-minute coverage gates remain unchanged.
+   The deterministic gate repeats this at the normal
    Android 28-MiB target, where the same ratios scale the root to 18.2 MiB and
    the NAT child to 2.8 MiB.
 
