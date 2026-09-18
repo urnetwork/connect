@@ -649,6 +649,7 @@ func (self *ExtenderDirectory) SampleRecords(
 
 	var ownRecord *protocol.ExtenderRecord
 	records := []*protocol.ExtenderRecord{}
+	recordBodies := map[*protocol.ExtenderRecord]*protocol.ExtenderRecordBody{}
 	for keyHex, keyRecord := range self.keyHexRecords {
 		if keyRecord.record == nil || keyRecord.recordBody == nil {
 			continue
@@ -661,10 +662,9 @@ func (self *ExtenderDirectory) SampleRecords(
 			continue
 		}
 		records = append(records, keyRecord.record)
+		recordBodies[keyRecord.record] = keyRecord.recordBody
 	}
-	mathrand.Shuffle(len(records), func(i int, j int) {
-		records[i], records[j] = records[j], records[i]
-	})
+	records = balanceRecordsByIpFamily(records, recordBodies)
 	if ownRecord != nil {
 		records = append([]*protocol.ExtenderRecord{ownRecord}, records...)
 	}
@@ -679,6 +679,102 @@ func (self *ExtenderDirectory) SampleRecords(
 		})
 	}
 	return messages
+}
+
+// balanceRecordsByIpFamily orders records so that taking a prefix of any length
+// yields as close to an equal number of v4-reachable and v6-reachable extenders
+// as the directory can supply.
+//
+// A plain shuffle does not do this. A directory that is mostly v4 -- which is
+// the normal case, since v4 addresses are easier to come by -- hands a v6-only
+// client a sample it cannot dial, and the client has no way to ask for more.
+//
+// Reachability, not exclusivity: a dual-stack extender is in both buckets and
+// can satisfy either side of the interleave. That is deliberate. The point of
+// the balance is that a client of either family finds something it can reach,
+// and a dual-stack extender serves both, so it should never be held back in
+// favour of a single-family one.
+//
+// The interleave starts with v6 because it is the scarcer family: when the
+// count is odd, the extra slot goes to the side more likely to be short.
+func balanceRecordsByIpFamily(
+	records []*protocol.ExtenderRecord,
+	recordBodies map[*protocol.ExtenderRecord]*protocol.ExtenderRecordBody,
+) []*protocol.ExtenderRecord {
+	if len(records) <= 1 {
+		return records
+	}
+
+	ipv4Capable := []*protocol.ExtenderRecord{}
+	ipv6Capable := []*protocol.ExtenderRecord{}
+	unreachable := []*protocol.ExtenderRecord{}
+	for _, record := range records {
+		hasIpv4, hasIpv6 := recordIpFamilies(recordBodies[record])
+		if hasIpv4 {
+			ipv4Capable = append(ipv4Capable, record)
+		}
+		if hasIpv6 {
+			ipv6Capable = append(ipv6Capable, record)
+		}
+		if !hasIpv4 && !hasIpv6 {
+			// No usable address. Kept rather than dropped, so what the caller
+			// reports as available does not change -- but held in its own list
+			// so it cannot displace a record a client could actually dial.
+			unreachable = append(unreachable, record)
+		}
+	}
+	shuffle := func(pool []*protocol.ExtenderRecord) {
+		mathrand.Shuffle(len(pool), func(i int, j int) {
+			pool[i], pool[j] = pool[j], pool[i]
+		})
+	}
+	shuffle(ipv4Capable)
+	shuffle(ipv6Capable)
+
+	balanced := make([]*protocol.ExtenderRecord, 0, len(records))
+	taken := map[*protocol.ExtenderRecord]bool{}
+	take := func(pool []*protocol.ExtenderRecord, from int) int {
+		for i := from; i < len(pool); i += 1 {
+			if taken[pool[i]] {
+				continue
+			}
+			taken[pool[i]] = true
+			balanced = append(balanced, pool[i])
+			return i + 1
+		}
+		return len(pool)
+	}
+	ipv4Next, ipv6Next := 0, 0
+	for len(balanced) < len(records) {
+		before := len(balanced)
+		ipv6Next = take(ipv6Capable, ipv6Next)
+		ipv4Next = take(ipv4Capable, ipv4Next)
+		if len(balanced) == before {
+			// both pools are exhausted of un-taken records
+			break
+		}
+	}
+	return append(balanced, unreachable...)
+}
+
+// recordIpFamilies reports which families a record lists an address for. A
+// record that fails to name any parseable address is reachable over neither.
+func recordIpFamilies(body *protocol.ExtenderRecordBody) (hasIpv4 bool, hasIpv6 bool) {
+	if body == nil {
+		return false, false
+	}
+	for _, recordAddress := range body.Addresses {
+		ip, err := netip.ParseAddr(recordAddress.Ip)
+		if err != nil {
+			continue
+		}
+		if ip.Unmap().Is4() {
+			hasIpv4 = true
+		} else {
+			hasIpv6 = true
+		}
+	}
+	return hasIpv4, hasIpv6
 }
 
 // Adds an address learned outside the signed path: a dns bootstrap answer or a
