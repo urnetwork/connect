@@ -7277,6 +7277,7 @@ type RemoteUserNatProvider struct {
 	memory                   natMemoryReservation
 	retainedMemoryBudget     *TransferMemoryBudget
 	tcpReturnMemory          *TransferMemoryBudget
+	ingressControlMemory     *TransferMemoryBudget
 	memoryOperations         *lifecycleAdmission
 	fixedMemoryOwners        atomic.Int64
 	packetStatsWorkers       sync.WaitGroup
@@ -7502,6 +7503,7 @@ func newAdmittedRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat
 	userNatProvider.fixedMemoryOwners.Store(1)
 	if memory.budget != nil {
 		userNatProvider.tcpReturnMemory = NewTransferMemoryBudget(kib(64))
+		userNatProvider.ingressControlMemory = NewTransferMemoryBudget(natProviderControlBytes)
 		userNatProvider.smtpIngressGuard.memoryBudget = memory.budget
 		userNatProvider.ingressIpv4Fragments.maxRetainedBytes = natProviderFragmentBytes
 		userNatProvider.egressIpv4Fragments.maxRetainedBytes = natProviderFragmentBytes
@@ -9283,9 +9285,16 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	memory, admitted := self.startMemoryOperation(providerFrameOperationBytes(frames))
 	if !admitted {
+		self.receiveControlFrames(source, frames, peer)
 		return
 	}
 	defer self.finishMemoryOperation(&memory)
+	self.clientReceiveAdmitted(source, frames, peer)
+}
+
+// Both ordinary admission and the independently prepaid control fallback
+// retain the provider graph and callback workspace before entering here.
+func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	// receive functions should be non-blocking
 	// clients should manage their own congestion protocols on top to avoid overflowing the sequence queues
 	if source.IsControlSource() {
@@ -9498,9 +9507,13 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 					switch r {
 					case SecurityPolicyResultAllow:
 						var packet []byte
-						if frame.Raw {
+						if frame.Raw && (self.memoryBudget() == nil || !smallNatControlPacket(packetBytes)) {
 							packet = MessagePoolShareReadOnly(packetBytes)
 						} else {
+							// A small control must retain a small root even when
+							// Transfer lent it from a larger raw Pack. Otherwise
+							// scratch admission can succeed but leave too little
+							// data capacity for the ACK to reach the NAT.
 							packet = MessagePoolCopy(packetBytes)
 						}
 						if !appendIpPacketGroup(
@@ -9538,13 +9551,17 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 	for _, packetGroup := range packetGroups {
 		c := func() bool {
 			dropPacketGroup := func() {
-				self.congestionDrops.addIngressNat(
-					len(packetGroup.packets),
-					packetGroup.byteCount,
-				)
+				var count int
+				var bytes ByteCount
 				for _, packet := range packetGroup.packets {
+					if packet == nil {
+						continue
+					}
+					count++
+					bytes += ByteCount(len(packet))
 					MessagePoolReturn(packet)
 				}
+				self.congestionDrops.addIngressNat(count, bytes)
 			}
 			// Extend the exact-source admission through LocalUserNat queue and
 			// shard disposition. The outer callback admission alone ends when
@@ -9577,6 +9594,25 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 					packetGroup.byteCount,
 				)
 			} else {
+				// A flow group can contain both upload data and the ACKs
+				// needed to release its download replay owners. If the data
+				// admission refused the group, offer each small control to
+				// the prepaid NAT control partition before discarding it.
+				// Each successful handoff owns its packet and source gate.
+				if self.memoryBudget() != nil {
+					for i, packet := range packetGroup.packets {
+						if !smallNatControlPacket(packet) || !sourceLifecycle.admissions.start() {
+							continue
+						}
+						if self.localUserNat.sendTransferPacketsWithTimeout(
+							source, transferKey, provideMode, [][]byte{packet}, 0,
+							func() { self.releaseSourceLifecycle(source.SourceId, sourceLifecycle) },
+						) {
+							self.packetStatsCounters.recordRemoteIngress(peer.TransportType, 1, ByteCount(len(packet)))
+							packetGroup.packets[i] = nil
+						}
+					}
+				}
 				dropPacketGroup()
 			}
 			return success

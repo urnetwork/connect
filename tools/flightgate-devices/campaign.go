@@ -291,21 +291,39 @@ func parseDiag(path string) ([]diagSample, error) {
 	scanner.Buffer(make([]byte, 1024*1024), 8*1024*1024)
 	// gomobile's stdout bridge splits one glog record into 1,024-byte logcat
 	// entries; a record's continuation is the next GoLog entry that does not
-	// itself start a glog record. Join until the JSON parses.
+	// itself start a glog record. Other Android tags can occur between those
+	// entries, even inside a JSON field name, so only join the same GoLog
+	// process stream. Join until the JSON parses.
 	pending := ""
+	pendingSource := ""
 	for scanner.Scan() {
 		line := scanner.Text()
 		message := line
+		source := ""
 		if i := strings.Index(line, "GoLog   : "); i >= 0 {
 			message = line[i+len("GoLog   : "):]
+			source = "GoLog"
+			// Both epoch and threadtime logcat prefixes end in PID TID
+			// severity. The bridge can move threads between chunks, but
+			// another process's GoLog output is never our continuation.
+			fields := strings.Fields(line[:i])
+			if len(fields) >= 3 {
+				if _, err := strconv.Atoi(fields[len(fields)-3]); err == nil {
+					source += ":" + fields[len(fields)-3]
+				}
+			}
 		}
 		var body string
 		if i := strings.Index(message, "[flightgate] "); i >= 0 {
 			body = message[i+len("[flightgate] "):]
 			pending = ""
-		} else if pending != "" && !glogRecordStart.MatchString(message) {
+			pendingSource = source
+		} else if pending != "" && source != "" && source == pendingSource && !glogRecordStart.MatchString(message) {
 			body = pending + message
 		} else {
+			if source == pendingSource && glogRecordStart.MatchString(message) {
+				pending = ""
+			}
 			continue
 		}
 		var part map[string]any

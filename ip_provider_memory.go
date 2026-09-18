@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/urnetwork/connect/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 // NatMemoryPolicyError is permanent configuration incompatibility, not a
@@ -21,21 +22,23 @@ var ErrNatMemoryPolicy = &NatMemoryPolicyError{}
 const (
 	natProviderSourceLimit             = 16
 	natProviderFragmentBytes           = 8 * 1024
-	natProviderFixedBytes    ByteCount = 448 * 1024
+	natProviderFixedBytes    ByteCount = 480 * 1024
 	natProviderSourceBytes   ByteCount = 4 * 1024
+	natProviderControlBytes  ByteCount = 32 * 1024
 	natSmtpFlowBytes         ByteCount = 160 * 1024
 )
 
-// A provider prepays 448 KiB + 4 KiB/source (at most 512 KiB):
+// A provider prepays 480 KiB + 4 KiB/source (at most 544 KiB):
 // 128 KiB four fragment caches, geometric metadata and reconstruction;
 // 96 KiB built-in DPI (64 flows), stats (32 destinations/result) and clones;
 // 96 KiB workers/channels/registrations and primary/transient retirement maps;
 // 64 KiB precharged synchronous TCP callback/item workspace (two 32-KiB slots);
+// 32 KiB ingress ACK/RST decoding/grouping workspace (one nonblocking slot);
 // 64 KiB allocator/map growth slack. The per-source row covers lifecycle,
 // evidence, diagnostics, mode/priority maps and six leaf tombstones.
 // SMTP, callback scratch and return roots are separately admitted dynamically.
 // With the required 1-KiB stats registration per provider, two providers plus
-// fallback/old/new NATs cost 1794 KiB, leaving 254 KiB of the shared 2-MiB
+// fallback/old/new NATs cost 1858 KiB, leaving 190 KiB of the shared 2-MiB
 // child for useful traffic during generation overlap.
 func natProviderMemoryByteCount(sourceCount int) ByteCount {
 	return natProviderFixedBytes + ByteCount(sourceCount)*natProviderSourceBytes
@@ -149,6 +152,68 @@ func (self *RemoteUserNatProvider) finishMemoryOperation(memory *natMemoryReserv
 	if self.memoryOperations != nil {
 		self.memoryOperations.finish()
 	}
+}
+
+// Ingress ACKs release socket replay owners, so their admission must not
+// depend on those owners leaving data-budget capacity. The workspace is a
+// prepaid partition of the provider's fixed claim, independent of both data
+// admission and synchronous return callbacks. One small frame is decoded and
+// dispatched at a time; mixed or large Packs cannot multiply this workspace.
+func (self *RemoteUserNatProvider) receiveControlFrames(source TransferPath, frames []*protocol.Frame, peer Peer) {
+	if self.ingressControlMemory == nil {
+		return
+	}
+	for _, frame := range frames {
+		if frame == nil || len(frame.MessageBytes) > 512 {
+			continue
+		}
+		if source.IsControlSource() {
+			if frame.MessageType != protocol.MessageType_TransferNetworkPeersUpdate {
+				continue
+			}
+		} else if frame.MessageType != protocol.MessageType_IpIpPacketToProvider {
+			continue
+		}
+		self.receiveControlFrame(source, frame, peer)
+	}
+}
+
+func (self *RemoteUserNatProvider) receiveControlFrame(source TransferPath, frame *protocol.Frame, peer Peer) {
+	if !self.memoryOperations.start() {
+		return
+	}
+	memory, admitted := reserveNatMemory(self.ingressControlMemory, natProviderControlBytes)
+	if !admitted {
+		self.memoryOperations.finish()
+		return
+	}
+	defer self.finishMemoryOperation(&memory)
+	if source.IsControlSource() {
+		self.retireDisconnectedSenders([]*protocol.Frame{frame})
+		return
+	}
+	packet := frame.MessageBytes
+	if !frame.Raw {
+		var message protocol.IpPacketToProvider
+		if err := proto.Unmarshal(frame.MessageBytes, &message); err != nil || message.IpPacket == nil {
+			return
+		}
+		packet = message.IpPacket.PacketBytes
+	}
+	if !smallNatControlPacket(packet) {
+		return
+	}
+	// Transfer may lend an ACK slice backed by an entire received Pack. The
+	// NAT's prepaid control queue must own a small packet, not retain that
+	// potentially large parent through a read-only share.
+	packet = MessagePoolCopy(packet)
+	defer MessagePoolReturn(packet)
+	control := protocol.Frame{MessageType: protocol.MessageType_IpIpPacketToProvider, Raw: true, MessageBytes: packet}
+	self.clientReceiveAdmitted(source, []*protocol.Frame{&control}, peer)
+}
+
+func smallNatControlPacket(packet []byte) bool {
+	return len(packet) <= smallPacketPoolSize && natControlPackets([][]byte{packet[:len(packet):len(packet)]})
 }
 
 // Dedicated TCP return producers must still make progress when replay owners

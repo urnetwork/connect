@@ -189,8 +189,8 @@ require post-Close logging; host lifecycle tests prove joined release balance.
 The NAT child now admits the provider's complete bounded topology, not only
 its socket flows. Each budgeted `LocalUserNat` prepays 256 KiB before creating
 contexts, maps, protocol buffers or workers. A budgeted provider prepays
-448 KiB plus 4 KiB for each supported source, capped at 16 sources per
-generation (512 KiB at the mobile default):
+480 KiB plus 4 KiB for each supported source, capped at 16 sources per
+generation (544 KiB at the mobile default):
 
 | Provider envelope partition | Prepaid bytes |
 | --- | ---: |
@@ -198,14 +198,15 @@ generation (512 KiB at the mobile default):
 | Built-in DPI (64 flows), security stats (32 destinations per result), bounded snapshot copies | 96 KiB |
 | Workers, channels, registrations, primary/transient source-retirement maps | 96 KiB |
 | Two synchronous TCP return-callback/item workspaces | 64 KiB |
+| Independent nonblocking ingress ACK/RST decode/group workspace | 32 KiB |
 | Allocator/map-growth margin | 64 KiB |
 | Lifecycle, ACK evidence, diagnostics, mode/priority maps and six protocol-leaf tombstones, 16 × 4 KiB | 64 KiB |
 | Required SDK packet-stats registration, atomically admitted with the provider | 1 KiB |
 
 Thus the supported worst overlap is one fallback NAT, one retiring provider's
 local NAT, one replacement provider's local NAT, and both old/new providers
-with their required stats subscriptions: **3 × 256 + 2 × (512 + 1) = 1794 KiB**.
-It leaves **254 KiB** in the 2-MiB child for actual packet/flow admission.
+with their required stats subscriptions: **3 × 256 + 2 × (544 + 1) = 1858 KiB**.
+It leaves **190 KiB** in the 2-MiB child for actual packet/flow admission.
 The deterministic tests keep this graph live and complete a real UDP echo;
 the SDK repeats the same graph and progress at the 20-MiB and 28-MiB targets
 (the latter has a 2.8-MiB NAT child). These are overlapping claims against the
@@ -217,9 +218,12 @@ admitted before their allocations. Each SMTP inspection flow prepays 160 KiB
 for its bounded prefix, reusable TLS handshake buffer, heap-owned 8-KiB
 extension bitset and metadata; concurrent inspectors cannot grow uncharged
 caller stacks or allocate another flow after refusal. The NAT's 16-KiB
-ACK/RST partition and provider's 64-KiB synchronous TCP return partition are
-already included in their fixed claims, so replay pressure cannot consume
-the capacity needed to free replay owners. Additional stats registrations
+ACK/RST partition, provider's 64-KiB synchronous TCP return partition, and
+independent 32-KiB ingress control workspace are already included in their fixed
+claims, so replay pressure cannot consume the capacity needed to free replay
+owners. The ingress workspace decodes one bounded ACK/RST frame at a time,
+including controls in mixed Packs; a small owned copy prevents an ACK slice
+from retaining its larger borrowed Transfer backing root. Additional stats registrations
 claim 1 KiB each and remain charged through a captured callback after
 unsubscribe.
 

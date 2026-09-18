@@ -353,6 +353,15 @@ func TestNatMemoryUdpCallbackRetainsFlowThroughClose(t *testing.T) {
 }
 
 func TestNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T) {
+	testNatMemoryTcpAckProgressAtFullDataBudget(t, 0)
+}
+
+func TestNatProviderMemoryTcpAckProgressAtFullDataBudget(t *testing.T) {
+	t.Run("legacy", func(t *testing.T) { testNatMemoryTcpAckProgressAtFullDataBudget(t, 1) })
+	t.Run("raw", func(t *testing.T) { testNatMemoryTcpAckProgressAtFullDataBudget(t, 2) })
+}
+
+func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolVersion int) {
 	assertMessagePoolOwnership(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
@@ -367,7 +376,36 @@ func TestNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var provider *RemoteUserNatProvider
+	if providerProtocolVersion != 0 {
+		provider = newNatProviderMemory(t, newNatProviderMemoryClient(t), nat, func(settings *RemoteUserNatProviderSettings) {
+			settings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
+		})
+		// The callback below is the receiving TCP peer. Exercise real provider
+		// ingress and NAT replay ownership without an unrelated Transfer rig.
+		provider.localUserNatUnsub()
+	}
 	source := SourceId(NewId())
+	sendPacket := func(packet []byte) bool {
+		if provider == nil {
+			return nat.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
+		}
+		frame, err := ipPacketToProviderFrame(packet, providerProtocolVersion)
+		if err != nil {
+			t.Error(err)
+			return false
+		}
+		before := provider.packetStatsCounters.remoteIngressPacketCount.Load()
+		provider.ClientReceive(source, []*protocol.Frame{frame}, Peer{ProvideMode: protocol.ProvideMode_Network})
+		if !frame.Raw {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		accepted := before < provider.packetStatsCounters.remoteIngressPacketCount.Load()
+		if accepted {
+			MessagePoolReturn(packet) // ClientReceive borrowed the caller's root.
+		}
+		return accepted
+	}
 	path := &IpPath{Version: 4, Protocol: IpProtocolTcp, SourceIp: net.IPv4(10, 0, 0, 1).To4(), SourcePort: 40000,
 		DestinationIp: net.IPv4(203, 0, 113, 1).To4(), DestinationPort: 443}
 	handshake, firstData, allowAck, complete := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
@@ -409,7 +447,7 @@ func TestNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T) {
 		state := ConnectionState{ipVersion: 4, sourceIp: path.DestinationIp, sourcePort: uint16(path.DestinationPort),
 			destinationIp: path.SourceIp, destinationPort: uint16(path.SourcePort), sendSeq: ackNumber, windowSize: 65535}
 		ack := state.tcpPacket(tcpFlagAck, 101, nil)
-		if !nat.SendPacket(source, protocol.ProvideMode_Network, ack, 0) {
+		if !sendPacket(ack) {
 			MessagePoolReturn(ack)
 			if ctx.Err() == nil {
 				t.Error("full data budget refused a releasing TCP ACK")
@@ -426,7 +464,7 @@ func TestNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T) {
 		}
 	})
 	syn := MessagePoolCopy(ipOosTcpPacketSequence(path, tcpFlagSyn, 100, nil))
-	if !nat.SendPacket(source, protocol.ProvideMode_Network, syn, 0) {
+	if !sendPacket(syn) {
 		MessagePoolReturn(syn)
 		t.Fatal("SYN rejected")
 	}
