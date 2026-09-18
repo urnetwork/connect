@@ -53,35 +53,75 @@ tun_throughput_filter='TestTunTCPThroughput'
 skip_filter="$pt_filter|$webrtc_filter|$tun_throughput_filter"
 
 # run the WebRTC tests first, in their own process
-match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
+match="/${PWD##*/}/\\S*\.go\|^\\S*_test.go"
 GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$webrtc_filter" "$@" | grep --binary-files=text --line-buffered --color=always -e "^" -e "$match"
 pipeline_status=("${pipestatus[@]}")
 test_pipeline_status "${pipeline_status[1]}" "${pipeline_status[2]}" || exit $?
 
 # run the packet-translation tests next, in their own process
-match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
+match="/${PWD##*/}/\\S*\.go\|^\\S*_test.go"
 GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$pt_filter" "$@" | grep --binary-files=text --line-buffered --color=always -e "^" -e "$match"
 pipeline_status=("${pipestatus[@]}")
 test_pipeline_status "${pipeline_status[1]}" "${pipeline_status[2]}" || exit $?
 
 # run the tun throughput measurement next, in its own process
-match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
+match="/${PWD##*/}/\\S*\.go\|^\\S*_test.go"
 GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$tun_throughput_filter" "$@" | grep --binary-files=text --line-buffered --color=always -e "^" -e "$match"
 pipeline_status=("${pipestatus[@]}")
 test_pipeline_status "${pipeline_status[1]}" "${pipeline_status[2]}" || exit $?
 
-for d in `find . -iname '*_test.go' | xargs -n 1 dirname | sort | uniq | paste -sd ' ' -`; do
+# Match package discovery to the test command's race/build flags. Consume test
+# flag values so a pattern such as `-run -tags` is not mistaken for a build flag.
+# Go applies GOFLAGS itself, including test-only flags ignored by go list.
+list_args=(-race)
+for ((arg_index = 1; arg_index <= $#; arg_index++)); do
+    argument=$argv[arg_index]
+    option=${argument%%=*}
+    option=${option/#--/-}
+    option=${option/#-test./-}
+    case "$option" in
+        -race|-msan|-asan)
+            list_args+=("$argument")
+            ;;
+        -tags|-mod|-modfile|-overlay|-compiler|-buildmode|-installsuffix)
+            list_args+=("$argument")
+            if [[ "$argument" != *=* ]]; then
+                ((arg_index++))
+                list_args+=("$argv[arg_index]")
+            fi
+            ;;
+        -args) break ;;
+        -run|-skip|-list|-bench|-benchtime|-count|-cpu|-parallel|-timeout|-shuffle|\
+        -fuzz|-fuzztime|-fuzzminimizetime|\
+        -blockprofile|-blockprofilerate|-coverprofile|-covermode|-coverpkg|\
+        -cpuprofile|-memprofile|-memprofilerate|-mutexprofile|-mutexprofilefraction|\
+        -outputdir|-trace|-vet|-o|-p|-asmflags|-gcflags|-gccgoflags|-ldflags|-pgo|-toolexec)
+            if [[ "$argument" != *=* ]]; then
+                ((arg_index++))
+            fi
+            ;;
+    esac
+done
+
+# testdata contains pinned replay inputs that need a different root package;
+# they are not standalone packages. Go also honors target/build constraints,
+# hidden/vendor directories and nested module boundaries. Discovery errors
+# must stop the suite before a partial package list can appear successful.
+test_directories=$(go list "${list_args[@]}" \
+    -f '{{if or .TestGoFiles .XTestGoFiles}}{{.Dir}}{{end}}' ./...) || exit $?
+while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
     # if [[ $1 == "" || $1 == `basename $d` ]]; then
-        pushd $d
+        pushd "$d" || exit $?
         # highlight source files in this dir
-        match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
+        match="/${PWD##*/}/\\S*\.go\|^\\S*_test.go"
         GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -skip "$skip_filter" -cpuprofile profile/cpu -memprofile profile/memory "$@" | grep --binary-files=text --line-buffered --color=always -e "^" -e "$match"
         # -trace profile/trace -coverprofile profile/cover
         pipeline_status=("${pipestatus[@]}")
         test_pipeline_status "${pipeline_status[1]}" "${pipeline_status[2]}" || exit $?
         popd
     # fi
-done
+done <<< "$test_directories"
 # stdbuf -i0 -o0 -e0
 
 # to turn on logging e.g.
