@@ -31,7 +31,7 @@ func assertSendSequenceScanItems(
 	}
 }
 
-// A healthy cumulative ACK round still visits the scoreboard with no selective
+// A healthy cumulative reply bypasses the scoreboard without selective
 // evidence. Keep that no-op branch fixed as retained flight size changes.
 func benchmarkSendSequenceSelectiveAckRecoveryNoEvidence(b *testing.B, itemCount int) {
 	sendTime := time.Unix(1700000000, 0)
@@ -42,7 +42,7 @@ func benchmarkSendSequenceSelectiveAckRecoveryNoEvidence(b *testing.B, itemCount
 	var scheduled bool
 	b.ReportAllocs()
 	for b.Loop() {
-		scheduled = sequence.scheduleSelectiveAckRecovery(now) || scheduled
+		scheduled = sequence.scheduleSelectiveAckRecoveryAfterFeedback(now) || scheduled
 	}
 	if scheduled || sequence.client.routeUnacknowledgedNanos.Load() != 0 ||
 		sequence.client.routeRetainedItemCount.Load() != 0 {

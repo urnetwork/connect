@@ -252,27 +252,26 @@ func TestWindowCompressionResidenceGrowsSmallOpening(t *testing.T) {
 // receiver bounds calibrates the fixture's attainable payload rate per cell.
 func TestWindowPathDeterministicPerformanceMatrix(t *testing.T) {
 	assertMessagePoolOwnership(t)
-	for _, rtt := range envDurations(t, "CONNECT_WINDOW_MODEL_RTT_US", time.Microsecond, []time.Duration{300 * time.Microsecond, time.Millisecond, 2 * time.Millisecond, 5 * time.Millisecond, 10 * time.Millisecond, 25 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}) {
-		for _, flows := range []int{1, 8} {
-			for _, compression := range []time.Duration{0, 10 * time.Millisecond} {
-				var ceiling, fixed windowPathReading
-				for _, arm := range []string{"ceiling", "delivery"} {
-					synctest.Test(t, func(t *testing.T) {
-						reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: rtt, Compression: compression, Flows: flows, Payload: 1280, Budget: mib(48), Rate: 125000000}, max(100*time.Millisecond, 2*rtt))
-						if arm == "ceiling" {
-							ceiling = reading
-						} else {
-							fixed = reading
-						}
-					})
+	roundTrips := envDurations(t, "CONNECT_WINDOW_MODEL_RTT_US", time.Microsecond, windowDeterministicRoundTrips())
+	for _, cell := range windowDeterministicPerformanceCells(roundTrips, os.Getenv("CONNECT_WINDOW_MODEL_RTT_US") != "") {
+		var ceiling, fixed windowPathReading
+		for _, arm := range []string{"ceiling", "delivery"} {
+			synctest.Test(t, func(t *testing.T) {
+				trial := cell
+				trial.Arm = arm
+				reading := measureWindowPathCell(t, trial, max(100*time.Millisecond, 2*cell.RoundTrip))
+				if arm == "ceiling" {
+					ceiling = reading
+				} else {
+					fixed = reading
 				}
-				t.Logf("rtt=%s flows=%d compression=%s ceiling=%.1f fixed=%.1f min-flow=%.1f model Mb/s", rtt, flows, compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps)
-				if ceiling.Mbps < 500 || fixed.Mbps < .85*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.RelayDrops != 0 {
-					t.Errorf("uncalibrated or underperforming model cell: rtt=%s flows=%d compression=%s ceiling=%.1f fixed=%.1f min-flow=%.1f drops=%d", rtt, flows, compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops)
-					encoded, _ := json.Marshal(fixed)
-					t.Log(string(encoded))
-				}
-			}
+			})
+		}
+		t.Logf("rtt=%s flows=%d compression=%s ceiling=%.1f fixed=%.1f min-flow=%.1f model Mb/s", cell.RoundTrip, cell.Flows, cell.Compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps)
+		if ceiling.Mbps < 500 || fixed.Mbps < .85*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.RelayDrops != 0 {
+			t.Errorf("uncalibrated or underperforming model cell: rtt=%s flows=%d compression=%s ceiling=%.1f fixed=%.1f min-flow=%.1f drops=%d", cell.RoundTrip, cell.Flows, cell.Compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops)
+			encoded, _ := json.Marshal(fixed)
+			t.Log(string(encoded))
 		}
 	}
 }

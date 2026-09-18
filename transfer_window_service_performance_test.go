@@ -159,30 +159,25 @@ func TestWindowPathFifoServiceChange(t *testing.T) {
 // links, then require sustained capacity with all startup drops retained.
 func TestWindowPathServicePerformanceMatrix(t *testing.T) {
 	assertMessagePoolOwnership(t)
-	for _, rate := range []ByteCount{125000, 1250000, 12500000} {
-		for _, rtt := range []time.Duration{300 * time.Microsecond, 100 * time.Millisecond, 400 * time.Millisecond} {
-			for _, flows := range []int{1, 8} {
-				for _, compression := range []time.Duration{0, 10 * time.Millisecond, 50 * time.Millisecond} {
-					t.Logf("case: %s", fmt.Sprintf("rate=%d/rtt=%s/flows=%d/compression=%s", rate, rtt, flows, compression))
-					var ceiling, fixed windowPathReading
-					warmup := max(300*time.Millisecond+5*rtt, time.Duration(2*int64(mib(2))*int64(time.Second)/int64(rate))+5*rtt)
-					for _, arm := range []string{"ceiling", "delivery"} {
-						synctest.Test(t, func(t *testing.T) {
-							reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: rtt, Compression: compression, Flows: flows, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: rate, Drop: arm == "delivery", Warmup: warmup}, max(time.Second, 2*rtt+4*compression))
-							logWindowServiceReading(t, reading)
-							if arm == "ceiling" {
-								ceiling = reading
-							} else {
-								fixed = reading
-							}
-						})
-					}
-					t.Logf("service=%d rtt=%s flows=%d compression=%s ceiling=%.3f fixed=%.3f min-flow=%.3f model Mb/s drops=%d queue=%d/%d", rate, rtt, flows, compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops, fixed.MaxRelayQueued, fixed.MaxRelayQueuedBytes)
-					if ceiling.Mbps < .90*float64(rate)*8/1e6 || fixed.Mbps < .90*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 || fixed.MaxRelayQueued > 4096 || fixed.MaxRelayQueuedBytes > int64(mib(8)) {
-						t.Errorf("service pacing underfilled, stalled or exceeded a finite queue: %+v", fixed)
-					}
+	for _, cell := range windowServicePerformanceCells() {
+		t.Logf("case: rate=%d/rtt=%s/flows=%d/compression=%s", cell.Rate, cell.RoundTrip, cell.Flows, cell.Compression)
+		var ceiling, fixed windowPathReading
+		for _, arm := range []string{"ceiling", "delivery"} {
+			synctest.Test(t, func(t *testing.T) {
+				trial := cell
+				trial.Arm, trial.Drop = arm, arm == "delivery"
+				reading := measureWindowPathCell(t, trial, max(time.Second, 2*cell.RoundTrip+4*cell.Compression))
+				logWindowServiceReading(t, reading)
+				if arm == "ceiling" {
+					ceiling = reading
+				} else {
+					fixed = reading
 				}
-			}
+			})
+		}
+		t.Logf("service=%d rtt=%s flows=%d compression=%s ceiling=%.3f fixed=%.3f min-flow=%.3f model Mb/s drops=%d queue=%d/%d", cell.Rate, cell.RoundTrip, cell.Flows, cell.Compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops, fixed.MaxRelayQueued, fixed.MaxRelayQueuedBytes)
+		if ceiling.Mbps < .90*float64(cell.Rate)*8/1e6 || fixed.Mbps < .90*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 || fixed.MaxRelayQueued > 4096 || fixed.MaxRelayQueuedBytes > int64(mib(8)) {
+			t.Errorf("service pacing underfilled, stalled or exceeded a finite queue: %+v", fixed)
 		}
 	}
 }

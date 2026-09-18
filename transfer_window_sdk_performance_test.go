@@ -134,27 +134,14 @@ func windowSdkProfiles(t *testing.T) ([]windowPathEndpointProfile, string) {
 	return fixture.Profiles, fmt.Sprintf("%x", sha256.Sum256(windowSdkProfileBytes))
 }
 
-// Cross every constructor profile with the budgeted server in both directions.
-// Short, medium and long feedback paths expose queue and memory binders; one
-// and eight flows distinguish a single data lane from shared lane contention.
+// Cover every three-way interaction of constructor, direction, feedback delay
+// and sharing, plus all explicit h1 senders and constrained startup boundaries.
+// Each row runs its full constrained ceiling and delivery-paced worker arms.
 func TestWindowPathSdkProfiles(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	profiles, digest := windowSdkProfiles(t)
-	server := &profiles[1]
-	for i := range profiles {
-		for _, reverse := range []bool{false, true} {
-			for _, roundTrip := range []time.Duration{300 * time.Microsecond, 100 * time.Millisecond, 400 * time.Millisecond} {
-				for _, flows := range []int{1, 8} {
-					sender, receiver := server, &profiles[i]
-					if reverse {
-						sender, receiver = receiver, sender
-					}
-					checkWindowSdkCell(t, windowPathCell{SenderProfile: sender, ReceiverProfile: receiver,
-						ProfileFixtureSha256: digest, RoundTrip: roundTrip, Flows: flows,
-						RoundRobinOffer: true, Payload: 1280, Rate: 125000000})
-				}
-			}
-		}
+	for _, cell := range windowSdkProfileCells(profiles, digest) {
+		checkWindowSdkCell(t, cell)
 	}
 }
 

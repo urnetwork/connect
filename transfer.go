@@ -6276,6 +6276,11 @@ type SendSequence struct {
 	// Set only after three-later-ACK evidence proves this sequence has holes.
 	// Tail probing stays off for reliable ordered carriers that show no gap.
 	selectiveGapRecoveryActive bool
+	// Owned by the send worker. Once applied, selective evidence stays known
+	// for the sequence lifetime even after cumulative progress clears it.
+	selectiveAckObserved bool
+	// Nil in production; deterministically observes full-flight recovery work.
+	beforeSelectiveAckRecoveryForTest func()
 
 	// contract acquisition blocks this sequence, so track how much of its life
 	// goes into waiting for one. atomics so stats can be read without taking
@@ -7317,6 +7322,9 @@ func (self *SendSequence) processLogicalGroupChunk(
 // acknowledged, one RTT-paced duplicate solicits the cumulative ACK that may
 // have been lost.
 func (self *SendSequence) scheduleSelectiveAckRecovery(currentTime time.Time) bool {
+	if self.beforeSelectiveAckRecoveryForTest != nil {
+		self.beforeSelectiveAckRecoveryForTest()
+	}
 	reschedule := func(item *sendItem, resendTime time.Time, recoveryKind sendRecoveryKind) {
 		removed := self.resendQueue.RemoveByMessageId(item.messageId)
 		if removed != item {
@@ -8233,7 +8241,7 @@ sendSequenceLoop:
 		if flightPolicyChanged {
 			self.scheduleRetiredReliableCarrierRecovery(sendTime)
 		}
-		if ackUpdated && self.scheduleSelectiveAckRecovery(sendTime) {
+		if ackUpdated && self.scheduleSelectiveAckRecoveryAfterFeedback(sendTime) {
 			self.client.unreliableFlightGapCount.Add(1)
 			if self.flightController.reduceForLoss() {
 				self.client.unreliableFlightReductionCount.Add(1)
@@ -11500,6 +11508,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 	}
 
 	if selective {
+		self.selectiveAckObserved = true
 		if !item.deliveryObserved {
 			bytes := item.MessageByteCount()
 			if self.windowPacer.service != nil {
