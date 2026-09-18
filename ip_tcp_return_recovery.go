@@ -131,6 +131,10 @@ func (self *TcpSequence) acknowledgeReturnWithLock(ack uint32) {
 		self.returnDuplicateAcks = 0
 		self.returnAttempts = 0
 		self.returnProgressTime = time.Now()
+		if self.returnRecoveryActive {
+			self.returnRecoveryReady = int32(ack-self.returnRecoveryEnd) < 0
+			self.returnRecoveryActive = self.returnRecoveryReady
+		}
 		for self.returnHead < len(self.returnChunks) {
 			chunk := &self.returnChunks[self.returnHead]
 			if int32(ack-chunk.end) < 0 {
@@ -164,10 +168,11 @@ func (self *TcpSequence) acknowledgeReturnWithLock(ack uint32) {
 	}
 }
 
-// One oldest-segment replay on three duplicate ACKs or a timer is enough to
-// solicit the source's cumulative frontier. Backoff bounds a silent peer's
-// traffic; new ACK progress re-arms recovery. This worker never holds the flow
-// mutex while calling the potentially blocking return callback.
+// Three duplicate ACKs or the resend timer start recovery of the current
+// flight. Each advancing partial ACK permits the next oldest-segment replay;
+// waiting for a fresh timer at each hole makes a lost burst repair one segment
+// per second. A fixed frontier excludes newly issued data, and a silent peer
+// retains exponential backoff. The return callback runs outside the flow mutex.
 func (self *TcpSequence) runReturnRecovery() {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
@@ -185,7 +190,12 @@ func (self *TcpSequence) runReturnRecovery() {
 			}
 			delay = min(30*time.Second, min(delay, 30*time.Second)*time.Duration(1<<min(self.returnAttempts, 5)))
 			remaining := time.Until(self.returnProgressTime.Add(delay))
-			if remaining <= 0 || self.returnDuplicateAcks == 3 {
+			if remaining <= 0 || self.returnDuplicateAcks == 3 || self.returnRecoveryReady {
+				if !self.returnRecoveryActive {
+					self.returnRecoveryEnd = self.receiveSeq
+					self.returnRecoveryActive = true
+				}
+				self.returnRecoveryReady = false
 				chunk := &self.returnChunks[self.returnHead]
 				seq := chunk.start
 				if int32(self.receiveSeqAck-seq) > 0 {

@@ -4718,8 +4718,13 @@ type TcpSequence struct {
 	returnDuplicateAcks     int
 	returnAttempts          int
 	returnProgressTime      time.Time
-	returnWake              chan struct{}
-	returnCapacity          chan struct{}
+	// Recovery keeps the original flight's frontier fixed. A partial ACK
+	// permits one next replay; newly issued bytes retain their normal timer.
+	returnRecoveryEnd    uint32
+	returnRecoveryActive bool
+	returnRecoveryReady  bool
+	returnWake           chan struct{}
+	returnCapacity       chan struct{}
 
 	sendMutex sync.Mutex
 	sendItems chan *TcpSendItem
