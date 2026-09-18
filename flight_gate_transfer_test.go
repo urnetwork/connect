@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -546,47 +547,81 @@ func TestSendSequenceReorderingAcrossCarriersIsNotLoss(t *testing.T) {
 	}
 }
 
-// M4. Acknowledgements from the unreliable lane arrive in ~20 ms and from the
-// reliable lane in ~200 ms. The sequence's scaled RTT must describe the
-// reliable lane, since that is the lane whose RTO it drives. Expected red on
-// the tree this was written against: one window averages both lanes and
-// lands on its floor.
+// M4. Only the reliable lane contributes recovery timing. A delayed last
+// write and coalesced replies keep the measured round trip tied to that
+// packet's echoed tag, independently of batch preparation and scheduling.
 func TestSendSequenceRttWindowDescribesReliableLane(t *testing.T) {
-	client, peerId, fromPeer, _ := newFlightGateSender(t, flightGateSettings(kib(64)))
-	_, unreliable := addFlightGateRoute(t, client, TransportTypeP2p, 8, true)
-	var unreliablePacks []*protocol.Pack
-	for index := 0; index < 4; index += 1 {
-		sendFlightGateMessage(t, client, peerId, index)
-		unreliablePacks = append(unreliablePacks, takeFlightGatePack(t, unreliable, 5*time.Second))
-	}
-	// the direct lane answers in tens of milliseconds
-	time.Sleep(20 * time.Millisecond)
-	for _, pack := range unreliablePacks {
-		ackFlightGatePack(t, client, peerId, fromPeer, pack, true)
-	}
-	fillFlightGateRoute(unreliable)
-	_, reliable := addFlightGateRoute(t, client, TransportTypeH1, 16, false)
-	var reliablePacks []*protocol.Pack
-	sentAt := time.Now()
-	for index := 4; index < 8; index += 1 {
-		sendFlightGateMessage(t, client, peerId, index)
-		reliablePacks = append(reliablePacks, takeFlightGatePack(t, reliable, 5*time.Second))
-	}
-	// the relay lane answers in a couple of hundred milliseconds
-	time.Sleep(200*time.Millisecond - time.Since(sentAt))
-	for _, pack := range reliablePacks[:3] {
-		ackFlightGatePack(t, client, peerId, fromPeer, pack, true)
-	}
-	ackFlightGatePack(t, client, peerId, fromPeer, reliablePacks[3], false)
-	time.Sleep(100 * time.Millisecond)
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		settings := flightGateSettings(kib(64))
+		queued, releaseWorker := make(chan struct{}), make(chan struct{})
+		// Hold the sender while its independent ack worker coalesces the
+		// reliable replies into the last packet's cumulative acknowledgement.
+		settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(_ sendSequenceId, number uint64) {
+			if number == 7 {
+				close(queued)
+				<-releaseWorker
+			}
+		}
+		client, peerId, fromPeer, _ := newFlightGateSender(t, settings)
+		t.Cleanup(func() {
+			select {
+			case <-releaseWorker:
+			default:
+				close(releaseWorker)
+			}
+		})
+		_, unreliable := addFlightGateRoute(t, client, TransportTypeP2p, 8, true)
+		var unreliablePacks []*protocol.Pack
+		for index := 0; index < 4; index += 1 {
+			sendFlightGateMessage(t, client, peerId, index)
+			unreliablePacks = append(unreliablePacks, takeFlightGatePack(t, unreliable, 5*time.Second))
+		}
+		time.Sleep(20 * time.Millisecond)
+		for _, pack := range unreliablePacks {
+			ackFlightGatePack(t, client, peerId, fromPeer, pack, true)
+		}
+		synctest.Wait()
+		sequence := flightGateSendSequence(t, client, peerId)
+		if estimate := sequence.rttWindow.Estimate(); estimate.SampleCount != 0 {
+			t.Fatalf("unreliable lane contributed RTT samples: %+v", estimate)
+		}
+		fillFlightGateRoute(unreliable)
+		_, reliable := addFlightGateRoute(t, client, TransportTypeH1, 16, false)
+		var reliablePacks []*protocol.Pack
+		for index := 4; index < 8; index += 1 {
+			if index == 7 {
+				// Preparation of a later packet cannot consume its own RTT.
+				time.Sleep(12 * time.Millisecond)
+			}
+			sendFlightGateMessage(t, client, peerId, index)
+			reliablePacks = append(reliablePacks, takeFlightGatePack(t, reliable, 5*time.Second))
+		}
+		<-queued
+		const reliableRtt = 200 * time.Millisecond
+		last := reliablePacks[len(reliablePacks)-1]
+		ackAt := time.UnixMilli(int64(last.Tag.SendTime)).Add(reliableRtt)
+		time.Sleep(time.Until(ackAt))
+		for _, pack := range reliablePacks[:3] {
+			ackFlightGatePack(t, client, peerId, fromPeer, pack, true)
+		}
+		ackFlightGatePack(t, client, peerId, fromPeer, last, false)
+		synctest.Wait()
+		close(releaseWorker)
+		synctest.Wait()
 
-	sequence := flightGateSendSequence(t, client, peerId)
-	scaled := sequence.rttWindow.ScaledRtt()
-	minimum := time.Duration(float64(200*time.Millisecond) * 0.95 *
-		float64(client.settings.SendBufferSettings.RttScale))
-	if scaled < minimum {
-		t.Fatalf("scaled RTT %s describes a blend of both lanes; want at least %s for the reliable lane", scaled, minimum)
-	}
+		estimate := sequence.rttWindow.Estimate()
+		if estimate.SampleCount != 1 || estimate.Mean != reliableRtt || estimate.Min != reliableRtt {
+			t.Fatalf("coalesced reliable acknowledgement RTT: %+v; want one %s sample", estimate, reliableRtt)
+		}
+		scaled := sequence.rttWindow.ScaledRtt()
+		want := time.Duration(float64(reliableRtt) *
+			float64(client.settings.SendBufferSettings.RttScale))
+		if scaled != want {
+			t.Fatalf("scaled RTT %s; want %s for the reliable lane", scaled, want)
+		}
+		t.Logf("reliable batch span=%s estimate=%+v scaled=%s", time.Duration(last.Tag.SendTime-reliablePacks[0].Tag.SendTime)*time.Millisecond, estimate, scaled)
+	})
 }
 
 // M4 (F12 contract). Acknowledgements on a single reliable lane keep
