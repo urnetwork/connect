@@ -83,6 +83,24 @@ type ExtenderNetworkClientSettings struct {
 	// subscription would never reconnect, because nothing else ends the read.
 	SubscribeIdleTimeout time.Duration
 
+	// The latency probe pass (DESIGNNOTES4.md §4). ProbeWindowCount is m:
+	// the pass stops once this many usable extenders of a family measure
+	// close enough. 0 disables probing.
+	ProbeWindowCount int
+	// ProbeCountPerExtender is n: the probes one extender gets in a pass, of
+	// which the lowest rtt is kept.
+	ProbeCountPerExtender int
+	// The most extenders one pass probes, so a pass over a large directory
+	// with nothing close still ends.
+	ProbeMaxCandidateCount int
+	// Budget of one probe.
+	ProbeTimeout time.Duration
+	// Close enough is within ProbeCloseFactor of the best rtt measured, or
+	// under ProbeCloseFloor, whichever admits more, so a badly connected
+	// region still fills its window.
+	ProbeCloseFactor float64
+	ProbeCloseFloor  time.Duration
+
 	// ManualHosts are hostnames or ip literals configured by hand (K6). An ip
 	// literal is added as a manual address at start; a hostname is resolved
 	// through the resolver seam below at start and on every rebootstrap, and
@@ -110,20 +128,38 @@ type ExtenderNetworkClientSettings struct {
 	// IpVersionSupported, when set, replaces the host family probe. Nil uses
 	// probeFamilySupport, which is what the strategy also dials by.
 	IpVersionSupported func(ipVersion int) bool
+	// Probe, when set, replaces the probe dial of one candidate
+	// (DESIGNNOTES4.md). Nil dials the candidate's carriers in order with
+	// ProbeExtenderLatency. It returns the rtt and whether it was attested.
+	Probe func(
+		ctx context.Context,
+		candidate *ExtenderCandidate,
+		attestor *ExtenderProbeAttestor,
+	) (time.Duration, bool, error)
+	// Hint, when set, replaces the continent hint fetch. Nil reads
+	// /network/extender-hint through the client strategy. An empty answer
+	// with no error is an operator that cannot place the caller.
+	Hint func(ctx context.Context) (string, error)
 }
 
 func DefaultExtenderNetworkClientSettings() *ExtenderNetworkClientSettings {
 	return &ExtenderNetworkClientSettings{
-		Subscribe:            true,
-		SampleCount:          DefaultExtenderFeedSampleCount,
-		MinBackoff:           1 * time.Second,
-		MaxBackoff:           5 * time.Minute,
-		RebootstrapTimeout:   6 * time.Hour,
-		LowWaterCount:        4,
-		DialTimeout:          30 * time.Second,
-		HelloTimeout:         30 * time.Second,
-		SubscribeIdleTimeout: 90 * time.Second,
-		Now:                  time.Now,
+		Subscribe:              true,
+		SampleCount:            DefaultExtenderFeedSampleCount,
+		MinBackoff:             1 * time.Second,
+		MaxBackoff:             5 * time.Minute,
+		RebootstrapTimeout:     6 * time.Hour,
+		LowWaterCount:          4,
+		DialTimeout:            30 * time.Second,
+		HelloTimeout:           30 * time.Second,
+		SubscribeIdleTimeout:   90 * time.Second,
+		ProbeWindowCount:       4,
+		ProbeCountPerExtender:  2,
+		ProbeMaxCandidateCount: 16,
+		ProbeTimeout:           5 * time.Second,
+		ProbeCloseFactor:       2.0,
+		ProbeCloseFloor:        50 * time.Millisecond,
+		Now:                    time.Now,
 	}
 }
 
@@ -145,6 +181,13 @@ type ExtenderNetworkClientStatus struct {
 	// the operator serves one (C6, D3). The member role's node dials the
 	// operator only once this is known.
 	GossipPeerId string
+	// The continent the candidate order prefers: the operator's hint, else
+	// the one inferred from the dns bootstrap; empty when neither has said
+	// (DESIGNNOTES4.md §4).
+	ContinentHint string
+	// When the last probe pass that measured something ended, zero when
+	// there has been none.
+	LastProbeTime time.Time
 }
 
 // The state of the gossip network as the app's status dot shows it (K4, K5).
@@ -210,6 +253,16 @@ type ExtenderNetworkClient struct {
 	// the next tick (K6)
 	manualHosts        []string
 	manualHostsVersion uint64
+
+	// the probe pass goroutine's join and wake (DESIGNNOTES4.md §4)
+	probeDone chan struct{}
+	probeWake *Monitor
+	// the attesting provider, nil for a client that only ranks. Installed
+	// by the provider role and cleared when it stops.
+	probeAttestor *ExtenderProbeAttestor
+	// true once the operator's hint has been applied, which the dns
+	// inference then defers to
+	operatorHintApplied bool
 }
 
 // The client is running when this returns: the directory has been told a first
@@ -240,6 +293,8 @@ func NewExtenderNetworkClient(
 		statusMonitor:  NewMonitorValue[ExtenderNetworkClientStatus](ExtenderNetworkClientStatus{}),
 		wakeMonitor:    NewMonitor(),
 		manualHosts:    slices.Clone(settings.ManualHosts),
+		probeDone:      make(chan struct{}),
+		probeWake:      NewMonitor(),
 	}
 	directory.SetInitialSamplePending()
 	// a path change invalidates the feed connection and the addresses that
@@ -248,6 +303,13 @@ func NewExtenderNetworkClient(
 	go HandleError(func() {
 		defer close(self.done)
 		self.run()
+	}, cancel)
+	// the probe pass has its own loop: in the feed role the refresh loop is
+	// parked on the subscription for as long as it lives, and records that
+	// arrive over it must still be measured (DESIGNNOTES4.md §4)
+	go HandleError(func() {
+		defer close(self.probeDone)
+		self.runProbes()
 	}, cancel)
 	return self
 }
@@ -292,6 +354,7 @@ func (self *ExtenderNetworkClient) Close() {
 		}
 		self.cancel()
 		<-self.done
+		<-self.probeDone
 	})
 }
 
@@ -321,6 +384,7 @@ func (self *ExtenderNetworkClient) run() {
 	backoff := self.settings.MinBackoff
 	var lastBootstrapTime time.Time
 	var lastHelloTime time.Time
+	var lastHintTime time.Time
 	var lastManualTime time.Time
 	// the manual host list this loop has already applied; a reconfiguration
 	// changes the version and re-resolves at once (K6)
@@ -341,6 +405,13 @@ func (self *ExtenderNetworkClient) run() {
 		if lastHelloTime.IsZero() || self.settings.RebootstrapTimeout <= now.Sub(lastHelloTime) {
 			if self.refreshRootKeys() {
 				lastHelloTime = now
+			}
+		}
+		// the hint before the bootstrap, so the dns inference below knows
+		// whether the operator has already said (DESIGNNOTES4.md §4)
+		if lastHintTime.IsZero() || self.settings.RebootstrapTimeout <= now.Sub(lastHintTime) {
+			if self.refreshHint() {
+				lastHintTime = now
 			}
 		}
 		if lastBootstrapTime.IsZero() ||
@@ -568,6 +639,10 @@ func (self *ExtenderNetworkClient) bootstrap() {
 		self.log.Infof("[extender]bootstrap txt err = %s\n", err)
 	}
 	applied := 0
+	// the continents of the records that verified: the geo dns answered the
+	// set of the caller's continent, so they are the caller's continent as
+	// the operator judges it (DESIGNNOTES4.md §4)
+	continentCounts := map[string]int{}
 	for _, txt := range txts {
 		message, err := DecodeExtenderDnsRecord(txt)
 		if err != nil {
@@ -579,10 +654,14 @@ func (self *ExtenderNetworkClient) bootstrap() {
 			continue
 		}
 		applied += 1
+		if continentCode := extenderRecordContinentCode(message); continentCode != "" {
+			continentCounts[continentCode] += 1
+		}
 	}
 	if 0 < len(txts) {
 		self.log.Infof("[extender]bootstrap applied %d of %d txt records\n", applied, len(txts))
 	}
+	self.inferContinentHint(continentCounts)
 
 	ips, err := resolve(ctx, self.settings.ExtenderDnsName)
 	if err != nil {
@@ -592,6 +671,8 @@ func (self *ExtenderNetworkClient) bootstrap() {
 	for _, ip := range ips {
 		self.directory.AddBootstrap(ip, ExtenderSourceDns)
 	}
+	// what the bootstrap verified is what the probe pass measures first
+	self.probeWake.NotifyAll()
 }
 
 // The default bootstrap TXT resolution: over the strategy's DoH settings, with
@@ -880,6 +961,8 @@ func (self *ExtenderNetworkClient) runFeed(
 				status.LastError = ""
 			})
 			self.markInitialAttemptDone()
+			// the sample is in the directory; measure it (DESIGNNOTES4.md)
+			self.probeWake.NotifyAll()
 			if !self.settings.Subscribe {
 				return true, nil
 			}
@@ -936,4 +1019,299 @@ func extenderFeedConfig(
 		Ip:        candidate.Ip,
 		PublicKey: candidate.PublicKey,
 	}
+}
+
+// The continent hint (DESIGNNOTES4.md §4).
+
+// Reads the operator's continent hint and applies it to the directory. An
+// empty answer is an operator that cannot place this client, which leaves
+// whatever the dns inference said. Reports whether the fetch completed.
+func (self *ExtenderNetworkClient) refreshHint() bool {
+	hint := self.settings.Hint
+	if hint == nil {
+		if self.settings.ApiUrl == "" || self.clientStrategy == nil {
+			return false
+		}
+		hint = self.hint
+	}
+	ctx, cancel := context.WithTimeout(self.ctx, self.settings.HelloTimeout)
+	defer cancel()
+	continentCode, err := hint(ctx)
+	if err != nil {
+		self.log.Infof("[extender]hint err = %s\n", err)
+		return false
+	}
+	continentCode = strings.ToUpper(strings.TrimSpace(continentCode))
+	if continentCode == "" {
+		return true
+	}
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.operatorHintApplied = true
+	}()
+	self.applyContinentHint(continentCode, "operator")
+	return true
+}
+
+func (self *ExtenderNetworkClient) hint(ctx context.Context) (string, error) {
+	return GetExtenderHint(ctx, self.clientStrategy, self.settings.ApiUrl)
+}
+
+// Applies the continent the dns bootstrap implied: the one continent its
+// records agree on. A split answer is not a hint, and the operator's own hint,
+// once applied, is not overridden -- it judged this client's address directly,
+// where the dns judged the resolver's.
+func (self *ExtenderNetworkClient) inferContinentHint(continentCounts map[string]int) {
+	if len(continentCounts) == 0 {
+		return
+	}
+	best := ""
+	bestCount := 0
+	total := 0
+	for continentCode, count := range continentCounts {
+		total += count
+		if bestCount < count || (bestCount == count && continentCode < best) {
+			best = continentCode
+			bestCount = count
+		}
+	}
+	if bestCount*2 <= total {
+		return
+	}
+	operatorHintApplied := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		return self.operatorHintApplied
+	}()
+	if operatorHintApplied {
+		return
+	}
+	self.applyContinentHint(best, "dns")
+}
+
+func (self *ExtenderNetworkClient) applyContinentHint(continentCode string, source string) {
+	if self.directory.SetContinentHint(continentCode) {
+		self.log.Infof("[extender]continent hint %s (%s)\n", continentCode, source)
+		// the order changed; what the pass should measure first may have too
+		self.probeWake.NotifyAll()
+	}
+	self.updateStatus(func(status *ExtenderNetworkClientStatus) {
+		status.ContinentHint = continentCode
+	})
+}
+
+// The continent a signed record carries, upper case, empty when it predates
+// the field or is not a record.
+func extenderRecordContinentCode(message *protocol.ExtenderGossipMessage) string {
+	record := message.GetRecord()
+	if record == nil {
+		return ""
+	}
+	body := &protocol.ExtenderRecordBody{}
+	if err := proto.Unmarshal(record.Body, body); err != nil {
+		return ""
+	}
+	return strings.ToUpper(strings.TrimSpace(body.ContinentCode))
+}
+
+// The latency probe pass (DESIGNNOTES4.md §4).
+
+// SetProbeAttestor installs the attesting provider, or clears it with nil.
+// Only the provider role calls this, when it starts and when it stops: a
+// consumer client never identifies itself to an extender. An install wakes
+// the pass, so a provider that just started attests without waiting for the
+// next tick.
+func (self *ExtenderNetworkClient) SetProbeAttestor(attestor *ExtenderProbeAttestor) {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.probeAttestor = attestor
+	}()
+	self.probeWake.NotifyAll()
+}
+
+func (self *ExtenderNetworkClient) probeAttestorValue() *ExtenderProbeAttestor {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.probeAttestor
+}
+
+// The probe loop: one pass on every wake -- a bootstrap, a completed sample,
+// a hint, an attestor -- and on the refresh cadence. A pass only measures
+// what has no current sample, so a burst of wakes costs little.
+func (self *ExtenderNetworkClient) runProbes() {
+	if self.settings.ProbeWindowCount <= 0 {
+		<-self.ctx.Done()
+		return
+	}
+	for {
+		// subscribe before the pass, so a wake that lands while it runs is
+		// carried into the next wait instead of being lost
+		wake := self.probeWake.NotifyChannel()
+		self.probePass()
+
+		wait := self.settings.RebootstrapTimeout
+		if wait <= 0 {
+			wait = DefaultExtenderNetworkClientSettings().RebootstrapTimeout
+		}
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-wake:
+		case <-time.After(wait):
+		}
+	}
+}
+
+// One pass over every family this host has.
+func (self *ExtenderNetworkClient) probePass() {
+	attestor := self.probeAttestorValue()
+	probed := false
+	for _, ipVersion := range []int{4, 6} {
+		if !self.ipVersionSupported(ipVersion) {
+			continue
+		}
+		if self.probeFamily(ipVersion, attestor) {
+			probed = true
+		}
+	}
+	if probed {
+		probeTime := self.settings.Now()
+		self.updateStatus(func(status *ExtenderNetworkClientStatus) {
+			status.LastProbeTime = probeTime
+		})
+	}
+}
+
+// Measures the candidates of one family that have no current sample, hinted
+// continent first, until the window holds enough close extenders
+// (DESIGNNOTES4.md §4). With an attestor a sample counts only once attested,
+// so a provider that just started measures -- and attests -- what a ranking
+// pass already measured. Reports whether anything was probed.
+func (self *ExtenderNetworkClient) probeFamily(ipVersion int, attestor *ExtenderProbeAttestor) (probed bool) {
+	attesting := attestor != nil
+	closeCount := func() int {
+		return extenderCloseCount(
+			self.directory.MeasuredLatencies(ipVersion, attesting),
+			self.settings.ProbeCloseFactor,
+			self.settings.ProbeCloseFloor,
+		)
+	}
+	if self.settings.ProbeWindowCount <= closeCount() {
+		return false
+	}
+	candidates := self.directory.ProbeCandidates(ipVersion, self.settings.ProbeMaxCandidateCount, attesting)
+	for _, candidate := range candidates {
+		select {
+		case <-self.ctx.Done():
+			return probed
+		default:
+		}
+		if self.settings.ProbeWindowCount <= closeCount() {
+			return probed
+		}
+		if 0 < candidate.Latency && (!attesting || candidate.LatencyAttested) {
+			// a current sample; the pass is for what has none
+			continue
+		}
+		probed = true
+		rtt, attested, err := self.probeCandidate(candidate, attestor)
+		if err != nil {
+			self.log.Infof("[extender]probe %s err = %s\n", candidate.Ip, err)
+			continue
+		}
+		self.directory.RecordLatency(candidate.Ip, rtt, attested)
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[extender]probe %s rtt=%s attested=%t\n", candidate.Ip, rtt, attested)
+		}
+	}
+	return probed
+}
+
+// Probes one candidate: its carriers in order until one answers, and on that
+// carrier up to n probes of which the lowest rtt is kept. A carrier that does
+// not answer is a failed dial of that carrier, exactly as a feed dial records
+// it, and a carrier that does clears the hold.
+func (self *ExtenderNetworkClient) probeCandidate(
+	candidate *ExtenderCandidate,
+	attestor *ExtenderProbeAttestor,
+) (time.Duration, bool, error) {
+	if self.settings.Probe != nil {
+		ctx, cancel := context.WithTimeout(self.ctx, self.settings.ProbeTimeout)
+		defer cancel()
+		return self.settings.Probe(ctx, candidate, attestor)
+	}
+	connectSettings := DefaultConnectSettings()
+	if self.clientStrategy != nil {
+		connectSettings = &self.clientStrategy.settings.ConnectSettings
+	}
+	count := max(1, self.settings.ProbeCountPerExtender)
+	var resultErr error
+	for _, carrier := range orderedExtenderCarriers(candidate.Carriers) {
+		connectMode, ok := ExtenderConnectModeForCarrier(carrier)
+		if !ok {
+			continue
+		}
+		extenderConfig := extenderFeedConfig(candidate, connectMode)
+		if extenderConfig == nil {
+			continue
+		}
+		var best time.Duration
+		attested := false
+		for i := 0; i < count; i += 1 {
+			select {
+			case <-self.ctx.Done():
+				return 0, false, self.ctx.Err()
+			default:
+			}
+			probe, err := func() (*ExtenderLatencyProbe, error) {
+				ctx, cancel := context.WithTimeout(self.ctx, self.settings.ProbeTimeout)
+				defer cancel()
+				return ProbeExtenderLatency(ctx, connectSettings, extenderConfig, attestor)
+			}()
+			if err != nil {
+				resultErr = err
+				break
+			}
+			if best == 0 || probe.Rtt < best {
+				best = probe.Rtt
+			}
+			if probe.Attested {
+				attested = true
+			}
+		}
+		if 0 < best {
+			self.directory.RecordSuccess(candidate.Ip, connectMode)
+			return best, attested, nil
+		}
+		self.directory.RecordFailure(candidate.Ip, connectMode)
+	}
+	if resultErr == nil {
+		resultErr = fmt.Errorf("no carrier to probe")
+	}
+	return 0, false, resultErr
+}
+
+// How many of the latencies are close enough (DESIGNNOTES4.md §4): within
+// `factor` of the best, or under `floor`, whichever admits more.
+func extenderCloseCount(latencies []time.Duration, factor float64, floor time.Duration) int {
+	if len(latencies) == 0 {
+		return 0
+	}
+	if factor < 1 {
+		factor = 1
+	}
+	best := slices.Min(latencies)
+	limit := time.Duration(float64(best) * factor)
+	if limit < floor {
+		limit = floor
+	}
+	count := 0
+	for _, latency := range latencies {
+		if latency <= limit {
+			count += 1
+		}
+	}
+	return count
 }

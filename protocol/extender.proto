@@ -12,7 +12,7 @@ message ExtenderHeader {
     bytes Signature = 5;
     // 32 random bytes set by a prober; the response carries the signature over it
     bytes Challenge = 6;
-    // 0 forward, 1 gossip, 2 feed
+    // 0 forward, 1 gossip, 2 feed, 3 probe
     uint32 Service = 7;
     // Relay DATAGRAMS to the destination instead of a stream.
     //
@@ -30,6 +30,11 @@ message ExtenderHeader {
     // carrying its own loss recovery, and a reliable underlay simply never
     // exercises it on that leg.
     bool Datagram = 8;
+    // Probe only. The 16 byte client id of a PROVIDER that will attest its
+    // measured rtt; its presence asks the extender for a ProbeNonce. A client
+    // that only ranks by latency leaves it empty and identifies itself to the
+    // extender no more than a forward does.
+    bytes ProbeClientId = 9;
 }
 
 message ExtenderResponse {
@@ -39,6 +44,28 @@ message ExtenderResponse {
     bytes ChallengeSignature = 2;
     // tcp, quic, dns
     repeated string Carriers = 3;
+    // Probe only, when ProbeClientId was set: a short lived nonce the
+    // attestation must echo. Derived, not stored, so the extender keeps no
+    // per probe state.
+    bytes ProbeNonce = 4;
+}
+
+// Sent by an attesting provider as one length prefixed frame after the
+// ExtenderResponse, on the same stream. The rtt is the PROVIDER's own
+// measurement under the provider's signature: the extender compares it with
+// the interval it observed and either forwards or refuses the frame, but it
+// cannot change the number.
+message ExtenderProbeAttestation {
+    bytes ProbeClientId = 1;
+    // binds the claim to the extender it was measured against
+    bytes ExtenderPublicKey = 2;
+    // echoed from the response
+    bytes ProbeNonce = 3;
+    uint32 RttMs = 4;
+    uint64 TimestampMs = 5;
+    // ed25519 by the provider client key over
+    // "ur-extender-probe-v1" || serialized attestation with Signature empty
+    bytes Signature = 6;
 }
 
 message ExtenderAddress {
@@ -62,6 +89,10 @@ message ExtenderRecordBody {
     // every dns port that passed the activation probe, dialed in ascending
     // order so 53 is tried before 4053
     repeated uint32 DnsPorts = 11;
+    // Upper case two letter continent code the operator derived from
+    // CountryCode at signing, the same mapping the geo dns uses. Empty on
+    // records that predate it.
+    string ContinentCode = 12;
 }
 
 message ExtenderRecord {

@@ -59,6 +59,7 @@ func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 	}
 
 	var serviceConnHandler func(conn net.Conn)
+	var probe *extenderProbe
 	switch header.Service {
 	case connect.ExtenderServiceForward:
 		if !server.IsAllowedHost(header.DestinationHost) {
@@ -69,11 +70,21 @@ func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 		serviceConnHandler = server.settings.GossipConnHandler
 	case connect.ExtenderServiceFeed:
 		serviceConnHandler = server.settings.FeedConnHandler
+	case connect.ExtenderServiceProbe:
+		// always served: a probe is answered by the response itself, and a
+		// nonce is added only for a provider this extender can report
+		// (DESIGNNOTES4.md)
+		if probe, err = server.beginProbe(header, req.RemoteAddr); err != nil {
+			self.refuse(w, req, "probe", err)
+			return
+		}
 	default:
 		self.refuse(w, req, "service", fmt.Errorf("service %d is not known", header.Service))
 		return
 	}
-	if header.Service != connect.ExtenderServiceForward && serviceConnHandler == nil {
+	if header.Service != connect.ExtenderServiceForward &&
+		header.Service != connect.ExtenderServiceProbe &&
+		serviceConnHandler == nil {
 		self.refuse(w, req, "service", fmt.Errorf("service %d is not available", header.Service))
 		return
 	}
@@ -82,6 +93,7 @@ func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 		PublicKey:          server.PublicKey(),
 		ChallengeSignature: server.SignChallenge(header.Challenge),
 		Carriers:           server.Carriers(),
+		ProbeNonce:         probe.nonceBytes(),
 	})
 	if err != nil {
 		self.refuse(w, req, "response", err)
@@ -111,6 +123,13 @@ func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 
 	handleCtx, handleCancel := context.WithCancel(req.Context())
 	defer handleCancel()
+
+	if probe != nil {
+		// the response was flushed by the take over; the interval the gate
+		// judges against starts now (DESIGNNOTES4.md §3)
+		server.serveProbe(handleCtx, clientConn, probe)
+		return
+	}
 
 	if serviceConnHandler != nil {
 		// the service owns the stream until it returns (A8)

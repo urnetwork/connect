@@ -1164,6 +1164,81 @@ paths:
         "401":
           description: Missing or invalid client bearer token.
 
+  /network/extender-hint:
+    get:
+      tags: [extenders]
+      summary: The continent to try extenders on first
+      description: |
+        The continent the operator places the caller's address on
+        (connect/DESIGNNOTES4.md §4), upper case, from the same mapping the
+        extender geo dns and the `continent_code` tag on signed extender
+        records use -- so a client can order the records it holds by "on my
+        continent" before it has measured anything.
+
+        No credential. The answer is derived from the address this request
+        arrived from, which the operator sees on every request anyway, and a
+        client needs it before it has logged in. NEVER call it through an
+        extender: the address placed is the address the request arrived
+        from. An empty `continent_code` is an address the operator cannot
+        place, which a client treats as no hint rather than as a continent.
+      operationId: Extender Hint
+      security: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderHintResult"
+
+  /network/extender-latency:
+    post:
+      tags: [extenders]
+      summary: Forward provider latency attestations
+      description: |
+        Forward the latency attestations providers made to this client's
+        extenders (connect/DESIGNNOTES4.md §3).
+
+        A provider that probes an extender puts its client id in the probe;
+        the extender answers with a fresh nonce; the provider sends back its
+        measured round trip under its own client key signature, over the
+        nonce, the extender's identity key, its client id and a timestamp.
+        The extender forwards the claim only when it is no lower than the
+        interval the extender itself observed between its response and the
+        provider's frame, less a tolerance -- so the provider cannot claim to
+        be closer than it was seen to be, and the extender cannot change what
+        the provider signed. Only a provider attests; a consumer client
+        probes without identifying itself.
+
+        Requires a CLIENT jwt: every attestation must name, by identity key,
+        an extender the calling client activated, and the report is rate
+        limited per user (240 per hour). The operator verifies each
+        attestation's signature against the provider's registered client key
+        and stores what verifies. An attestation that does not decode, does
+        not verify, names an extender the caller does not own, names the
+        extender's own client as the provider, or repeats one already stored
+        (same extender, provider and nonce) is counted in `rejected` and not
+        named. A report of more than 256 attestations is refused whole.
+      operationId: Extender Latency Report
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtenderLatencyReportArgs"
+      responses:
+        "200":
+          description: |
+            The report outcome. A refused report is a 200 with `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderLatencyReportResult"
+        "401":
+          description: Missing or invalid client bearer token.
+
   /network/clients:
     get:
       description: |
@@ -3073,6 +3148,44 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetClientKeyResult"
+
+  /key/{clientId}/history:
+    get:
+      description: |
+        Fetch the operator-signed registration history of a client's public
+        key: the ordered signed registrations, generation 1 first, each an
+        opaque serialized registration exactly as the operator signed it. A
+        peer verifies the chain itself -- every entry must be signed by a
+        trusted signer under the deployment domain, generations must be
+        contiguous and each entry must commit to the hash of the one before
+        -- and compares the key it ends on with the one the platform
+        attached to a contract, which is what turns the platform's key
+        distribution from something a peer must trust into something it can
+        check (connect/DESIGNNOTES3.md).
+
+        Unauthenticated by design, matching `GET /key/{clientId}`: every byte
+        returned is already-published signed evidence. A client with no
+        signed history -- a legacy client, or an operator that does not run
+        the signed path -- answers `{"history": []}` with HTTP 200, never an
+        error: an error is an availability signal, and a consumer must not
+        confuse the two. At most 64 registrations, and at most 1 MiB, are
+        returned.
+      operationId: Get Client Key History
+      security: []
+      parameters:
+        - in: path
+          name: clientId
+          schema:
+            type: string
+          required: true
+          description: udid. The client id to look up.
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetClientKeyHistoryResult"
 
   /hello:
     get:
@@ -10167,6 +10280,18 @@ components:
             null when the client has never published a key.
           type: [string, "null"]
 
+    GetClientKeyHistoryResult:
+      type: object
+      properties:
+        history:
+          description: |
+            The ordered signed registrations, generation 1 first, each the
+            base64 of one opaque serialized registration. Empty when the
+            client has no signed history.
+          type: array
+          items:
+            type: string
+
     MyIPInfoResult:
       type: object
       properties:
@@ -10865,6 +10990,73 @@ components:
           type: array
           items:
             type: string
+
+    ExtenderHintResult:
+      type: object
+      properties:
+        continent_code:
+          description: |
+            The continent of the caller's address, upper case: one of AF, AN,
+            AS, EU, NA, OC, SA. Empty when the operator cannot place the
+            caller.
+          type: string
+
+    ExtenderLatencyAttestation:
+      type: object
+      description: |
+        One provider's signed claim of its round trip to one extender
+        (connect/DESIGNNOTES4.md §2). The signature is ed25519 by the
+        provider's client key over `ur-extender-probe-v1` followed by the
+        client id (16 bytes), the extender public key (32), the nonce (32),
+        `rtt_ms` (4 bytes big-endian) and `timestamp_ms` (8 bytes
+        big-endian).
+      properties:
+        client_id:
+          description: The provider's client id.
+          type: string
+        extender_public_key_hex:
+          description: The identity key of the extender the round trip was measured to, hex.
+          type: string
+        probe_nonce:
+          description: The 32 byte nonce the extender issued for this probe, base64.
+          type: string
+        rtt_ms:
+          description: The provider's measured round trip, whole milliseconds rounded up.
+          type: integer
+        timestamp_ms:
+          description: The provider's clock when it signed, unix milliseconds.
+          type: integer
+        signature:
+          description: The provider's ed25519 signature, base64.
+          type: string
+
+    ExtenderLatencyReportArgs:
+      type: object
+      properties:
+        attestations:
+          description: At most 256.
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtenderLatencyAttestation"
+
+    ExtenderLatencyReportResult:
+      type: object
+      description: |
+        A refusal of the whole report is a normal 200 with `error`; nothing is
+        stored.
+      properties:
+        accepted:
+          description: Attestations that verified and were stored.
+          type: integer
+        rejected:
+          description: |
+            Attestations that did not decode, did not verify, named an
+            extender the caller does not own or its own client as the
+            provider, or repeated one already stored.
+          type: integer
+        error:
+          description: Why the report was refused whole; empty otherwise.
+          type: string
 
     # ----- provider probing -----
 

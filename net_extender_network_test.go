@@ -85,6 +85,10 @@ func newTestExtenderNetworkClientWithDirectory(
 	settings.DialTimeout = 2 * time.Second
 	settings.HelloTimeout = 2 * time.Second
 	settings.IpVersionSupported = func(ipVersion int) bool { return true }
+	// no probe pass unless a test asks for one: against the dead dial
+	// strategy every probe would fail and hold the addresses these tests
+	// assert on
+	settings.ProbeWindowCount = 0
 	settings.Hello = func(ctx context.Context) (*ExtenderHelloResult, error) {
 		return nil, nil
 	}

@@ -41,7 +41,7 @@ func TestExtenderQuicChargesH1OwnerBeforeOpeningSocket(t *testing.T) {
 	}
 	_, _, err := dialExtenderQuic(ctx, connectSettings, &ExtenderConfig{
 		Ip: netip.MustParseAddr("192.0.2.1"),
-	}, &tls.Config{}, nil)
+	}, &tls.Config{}, nil, nil)
 	if !errors.Is(err, marker) || opened != 1 {
 		t.Fatalf("dial = %v, socket opens = %d", err, opened)
 	}
@@ -319,7 +319,7 @@ func TestExtenderQuicRefusesFullH1OwnerWithoutOpeningSocket(t *testing.T) {
 	// because the caller already holds the H1 bytes it would be waiting on.
 	_, _, err := dialExtenderQuic(transport.dialContext(context.Background()), connectSettings, &ExtenderConfig{
 		Ip: netip.MustParseAddr("192.0.2.1"),
-	}, &tls.Config{}, nil)
+	}, &tls.Config{}, nil, nil)
 	if err == nil || opened != 0 {
 		t.Fatalf("full-budget dial = %v, socket opens = %d", err, opened)
 	}

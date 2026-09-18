@@ -151,14 +151,15 @@ type extenderRun struct {
 	apiHost     string
 	networkHost string
 
-	clientStrategy *connect.ClientStrategy
-	directory      *connect.ExtenderDirectory
-	networkClient  *connect.ExtenderNetworkClient
-	listener       *gossip.InProcessListener
-	feedServer     *gossip.FeedServer
-	node           *gossip.Node
-	server         *extender.ExtenderServer
-	activator      *connect.ExtenderActivator
+	clientStrategy  *connect.ClientStrategy
+	directory       *connect.ExtenderDirectory
+	networkClient   *connect.ExtenderNetworkClient
+	listener        *gossip.InProcessListener
+	feedServer      *gossip.FeedServer
+	node            *gossip.Node
+	server          *extender.ExtenderServer
+	activator       *connect.ExtenderActivator
+	latencyReporter *connect.ExtenderLatencyReporter
 
 	serveDone chan error
 	closers   []func()
@@ -264,10 +265,21 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	}
 	run.closers = append(run.closers, run.node.Close)
 
+	// what this extender measured of each attesting provider goes to the
+	// operator in batches, under the same client credential the activation
+	// uses (DESIGNNOTES4.md §3)
+	reporterSettings := connect.DefaultExtenderLatencyReporterSettings()
+	reporterSettings.ApiUrl = options.apiUrl
+	reporterSettings.ByJwt = func() string { return options.jwt }
+	reporterSettings.ClientStrategy = run.clientStrategy
+	run.latencyReporter = connect.NewExtenderLatencyReporter(ctx, reporterSettings)
+	run.closers = append(run.closers, run.latencyReporter.Close)
+
 	serverSettings := extender.DefaultExtenderSettings()
 	serverSettings.IdentityKeySeed = keySeed
 	serverSettings.GossipConnHandler = run.listener.Handle
 	serverSettings.FeedConnHandler = run.feedServer.Serve
+	serverSettings.ProbeAttestationHandler = run.latencyReporter.Report
 	serverSettings.ListenErrorHandler = func(carrier string, err error) {
 		Err.Printf("extender %s carrier is not listening: %s", carrier, err)
 	}

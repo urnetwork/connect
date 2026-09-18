@@ -94,6 +94,11 @@ const (
 	ExtenderServiceForward uint32 = 0
 	ExtenderServiceGossip  uint32 = 1
 	ExtenderServiceFeed    uint32 = 2
+	// A latency probe (DESIGNNOTES4.md). The response is the ordinary one,
+	// with a nonce when the client identified itself as an attesting
+	// provider; the stream then carries at most one attestation frame and
+	// is closed. Nothing is forwarded.
+	ExtenderServiceProbe uint32 = 3
 )
 
 // Content type of both the extender request and its response (A3).
@@ -162,12 +167,51 @@ type ExtenderDial struct {
 	// 32 random bytes; the response carries the signature over it. Probes and
 	// activation set it, an ordinary dial leaves it empty.
 	Challenge []byte
-	// 0 forward, 1 gossip, 2 feed. DestinationHost is ignored when set.
+	// 0 forward, 1 gossip, 2 feed, 3 probe. DestinationHost is ignored when
+	// set.
 	Service uint32
 	// Datagram asks the extender to relay udp datagrams to the destination
 	// rather than a stream. The carrier is still one reliable byte stream; the
 	// datagrams are framed on it (net_extender_datagram.go).
 	Datagram bool
+	// Probe only: the 16 byte client id of an attesting PROVIDER, which asks
+	// the extender for a nonce (DESIGNNOTES4.md). Empty for a ranking probe,
+	// which identifies itself to the extender no more than a forward does.
+	ProbeClientId []byte
+	// RoundTrip, when set, receives the send time of the request and the
+	// receive time of the response. Every dial leaves it nil but a probe.
+	RoundTrip *ExtenderRoundTrip
+}
+
+// The timing of one extender request over an established carrier: the
+// request is written after the outer handshake and the response is the first
+// thing read after it, so the two marks bracket exactly one round trip plus
+// the extender's handling of the header. A probe reads its rtt from here
+// (DESIGNNOTES4.md).
+type ExtenderRoundTrip struct {
+	SendTime    time.Time
+	ReceiveTime time.Time
+}
+
+func (self *ExtenderRoundTrip) markSend() {
+	if self != nil {
+		self.SendTime = time.Now()
+	}
+}
+
+func (self *ExtenderRoundTrip) markReceive() {
+	if self != nil {
+		self.ReceiveTime = time.Now()
+	}
+}
+
+// Rtt is the measured round trip, zero until both marks are set. The marks
+// carry the monotonic clock, so a wall clock step cannot make it negative.
+func (self *ExtenderRoundTrip) Rtt() time.Duration {
+	if self == nil || self.SendTime.IsZero() || self.ReceiveTime.IsZero() {
+		return 0
+	}
+	return self.ReceiveTime.Sub(self.SendTime)
 }
 
 // NewExtenderDialContext returns a PLAIN dial through the extender: the raw
@@ -376,9 +420,9 @@ func dialExtenderStream(
 
 	switch extenderConfig.Profile.ConnectMode {
 	case ExtenderConnectModeTcpTls:
-		return dialExtenderTcp(ctx, connectSettings, extenderConfig, extenderTlsConfig, headerBytes)
+		return dialExtenderTcp(ctx, connectSettings, extenderConfig, extenderTlsConfig, headerBytes, extenderDial.RoundTrip)
 	case ExtenderConnectModeQuic, ExtenderConnectModeDns:
-		return dialExtenderQuic(ctx, connectSettings, extenderConfig, extenderTlsConfig, headerBytes)
+		return dialExtenderQuic(ctx, connectSettings, extenderConfig, extenderTlsConfig, headerBytes, extenderDial.RoundTrip)
 	default:
 		return nil, nil, fmt.Errorf("bad connect mode %s", extenderConfig.Profile.ConnectMode)
 	}
@@ -397,6 +441,7 @@ func extenderRequestHeaderBytes(
 		Challenge:       extenderDial.Challenge,
 		Service:         extenderDial.Service,
 		Datagram:        extenderDial.Datagram,
+		ProbeClientId:   extenderDial.ProbeClientId,
 	}
 	if extenderConfig.Secret != "" {
 		nonce := NewId()
@@ -465,6 +510,7 @@ func dialExtenderTcp(
 	extenderConfig *ExtenderConfig,
 	extenderTlsConfig *tls.Config,
 	headerBytes []byte,
+	roundTrip *ExtenderRoundTrip,
 ) (net.Conn, *protocol.ExtenderResponse, error) {
 	reservation, err := acquireExtenderTcpMemory(ctx)
 	if err != nil {
@@ -543,6 +589,7 @@ func dialExtenderTcp(
 		io.NopCloser(bytes.NewReader(headerBytes)),
 	)
 	if err := withConnWritePhaseDeadline(ctx, serverConn, connectSettings.ConnectTimeout, func() error {
+		roundTrip.markSend()
 		return request.Write(serverConn)
 	}); err != nil {
 		return nil, nil, err
@@ -570,6 +617,9 @@ func dialExtenderTcp(
 		}
 		defer httpResponse.Body.Close()
 		response, err = ReadExtenderResponseFrame(httpResponse.Body)
+		if err == nil {
+			roundTrip.markReceive()
+		}
 		return err
 	}); err != nil {
 		return nil, nil, err
@@ -592,6 +642,7 @@ func dialExtenderQuic(
 	extenderConfig *ExtenderConfig,
 	extenderTlsConfig *tls.Config,
 	headerBytes []byte,
+	roundTrip *ExtenderRoundTrip,
 ) (net.Conn, *protocol.ExtenderResponse, error) {
 	if !extenderConfig.Ip.IsValid() {
 		return nil, nil, fmt.Errorf("extender address is not valid")
@@ -702,6 +753,7 @@ func dialExtenderQuic(
 	if err := writer.SetWriteDeadline(deadline); err != nil {
 		return nil, nil, err
 	}
+	roundTrip.markSend()
 	if err := stream.SendRequestHeader(request); err != nil {
 		return nil, nil, err
 	}
@@ -719,6 +771,7 @@ func dialExtenderQuic(
 	if err != nil {
 		return nil, nil, err
 	}
+	roundTrip.markReceive()
 	if err := stream.SetDeadline(time.Time{}); err != nil {
 		return nil, nil, err
 	}

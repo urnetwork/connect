@@ -89,6 +89,11 @@ func DefaultExtenderSettings() *ExtenderSettings {
 		DnsForwardTimeout:         5 * time.Second,
 
 		DnsTlds: []string{connect.DefaultExtenderDnsTld},
+
+		ProbeRttTolerance:       20 * time.Millisecond,
+		ProbeAttestationTimeout: 5 * time.Second,
+		ProbeMaxRatePerSource:   1,
+		ProbeMaxBurstPerSource:  10,
 	}
 }
 
@@ -179,6 +184,24 @@ type ExtenderSettings struct {
 	GossipConnHandler func(conn net.Conn)
 	// FeedConnHandler is the same for the feed service (A8).
 	FeedConnHandler func(conn net.Conn)
+
+	// ProbeAttestationHandler receives every latency attestation that passed
+	// the gate (DESIGNNOTES4.md §3). Nil serves ranking probes only and
+	// issues no nonce, so a provider is never asked to sign for nothing. It
+	// runs on the request goroutine and must not block.
+	ProbeAttestationHandler func(attestation *protocol.ExtenderProbeAttestation)
+	// How far a claimed rtt may fall below the interval this extender
+	// observed before the claim is refused, which is also the most a
+	// provider can deflate its claim by. It absorbs the ordinary jitter
+	// between the two round trips; a refused honest sample costs one probe.
+	ProbeRttTolerance time.Duration
+	// How long the extender waits for the attestation frame after its
+	// response before closing the stream.
+	ProbeAttestationTimeout time.Duration
+	// Probes admitted per source address per second, and the burst. <= 0
+	// disables the limit.
+	ProbeMaxRatePerSource  float64
+	ProbeMaxBurstPerSource int
 
 	// Listen, when set, binds the outer TLS listener. Userspace integration
 	// tests use it to place the production extender on a simulated TUN. Nil
@@ -271,6 +294,8 @@ type ExtenderServer struct {
 	certificates    *extenderCertificates
 	certificatesErr error
 
+	probeLimiter *extenderProbeLimiter
+
 	proxy *extenderProxy
 
 	httpServer  *http.Server
@@ -339,6 +364,7 @@ func NewExtenderServer(
 		carrierListenErrs:      map[string]error{},
 		forwardDialer:          forwardDialer,
 		listening:              make(chan struct{}),
+		probeLimiter:           newExtenderProbeLimiter(),
 		settings:               settings,
 	}
 

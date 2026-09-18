@@ -107,7 +107,7 @@ func TestExtenderOuterResponseHeadersFailBoundedAndReleaseClaim(t *testing.T) {
 					}
 					io.WriteString(peer, "HTTP/1.1 200 OK\r\n"+header)
 				}()
-				conn, _, dialErr = dialExtenderTcp(ctx, connectSettings, config, tlsConfig, nil)
+				conn, _, dialErr = dialExtenderTcp(ctx, connectSettings, config, tlsConfig, nil, nil)
 				listener.Close()
 				<-done
 			} else {
@@ -127,7 +127,7 @@ func TestExtenderOuterResponseHeadersFailBoundedAndReleaseClaim(t *testing.T) {
 				go func() { done <- server.ServeListener(listener) }()
 				config.Profile.Port = listener.Addr().(*net.UDPAddr).Port
 				config.Profile.ConnectMode = ExtenderConnectModeQuic
-				conn, _, dialErr = dialExtenderQuic(ctx, connectSettings, config, tlsConfig, nil)
+				conn, _, dialErr = dialExtenderQuic(ctx, connectSettings, config, tlsConfig, nil, nil)
 				server.Close()
 				listener.Close()
 				<-done

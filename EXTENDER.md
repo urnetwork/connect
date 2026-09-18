@@ -162,7 +162,7 @@ v2 only, so a manual extender on an old binary must upgrade.
 A4. Header v2. `ExtenderHeader` keeps `DestinationHost`, `DestinationPort`,
 `Timestamp`, `Nonce` and `Signature` (the HMAC over timestamp and nonce for
 private extenders with `allowedSecrets`) and gains `Challenge` (32 random
-bytes, set by probes) and `Service` (0 forward, 1 gossip, 2 feed). The
+bytes, set by probes) and `Service` (0 forward, 1 gossip, 2 feed, 3 probe). The
 response is `ExtenderResponse{PublicKey, ChallengeSignature, Carriers}`:
 the extender's ed25519 public key or empty when it has none, the signature
 over `"ur-extender-challenge-v1" || Challenge` when a challenge was given,
@@ -217,7 +217,11 @@ request; the client moves to another extender.
 A8. Reserved services. `Service` 1 (gossip) hands the taken-over stream to
 the in-process gossip listener (D2). `Service` 2 (feed) hands it to the
 feed server (D4). An extender without a gossip node refuses both with 403.
-`DestinationHost` is ignored when `Service` is set. The handlers are
+`DestinationHost` is ignored when `Service` is set. `Service` 3 (probe) is
+answered by the response itself -- with a `ProbeNonce` for an attesting
+provider -- and the stream then carries at most one attestation frame before
+it is closed; it is the latency probe of DESIGNNOTES4.md, and no handler is
+needed to serve it. The handlers are
 settings callbacks that own the stream for the duration of the call; the
 extender closes the stream when the callback returns and keeps it in its
 shutdown set meanwhile, so a listener implementation blocks in the
