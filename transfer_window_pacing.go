@@ -462,6 +462,7 @@ type windowPacingService struct {
 	latestRoundTrip      time.Duration
 	compression          time.Duration
 	lastRoundTrip        time.Time
+	lastRecoveryWriteAt  time.Time
 	roundTripStats       windowBurstStats
 	receiverRoundTrips   *windowReceiverRoundTrips
 	drainMaximumTime     time.Duration
@@ -627,6 +628,7 @@ func (self *windowPacingService) beginWriteWithLock(sequenceId, messageId Id, nu
 	}
 	self.storeWriteWithLock(sequenceId, previous, windowPacingWrite{messageId: messageId, unambiguous: !resend, pending: true, generation: self.drainGeneration})
 	if resend {
+		self.lastRecoveryWriteAt = at
 		self.abortDrainWithLock()
 	}
 	if unqueued {
@@ -1714,6 +1716,13 @@ func (self *windowPacingService) backlogged(rate ByteCount) bool {
 func (self *windowPacingService) backloggedAt(rate ByteCount, at time.Time) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	// An unacknowledged original may have been lost, not queued. Recovery
+	// ACKs retain byte credit but cannot provide an unambiguous RTT. Require
+	// fresh timing before repeatedly pricing their own paced cadence below
+	// service; otherwise missing flight creates a multiplicative slowdown.
+	if !self.lastRecoveryWriteAt.IsZero() && !self.lastRoundTrip.After(self.lastRecoveryWriteAt) {
+		return false
+	}
 	timing := self.roundTripEvidenceWithLock(at)
 	if timing.count == 0 && timing.minimum <= 0 || rate <= 0 {
 		return false
