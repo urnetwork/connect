@@ -4422,7 +4422,7 @@ func TestClientSignalSenderFailedSendReturnsMessageBytes(t *testing.T) {
 	if !MessagePoolReturn(witness) {
 		t.Fatal("rejected signal retained its exact pooled message ownership")
 	}
-	if len(log.info) != 1 || log.info[0] != "[signal]send failed mode=sender reason=canceled-or-closed\n" {
+	if len(log.info) != 1 || log.info[0] != "[signal]send failed mode=sender reason=canceled-or-closed boundary=unknown kind=unknown reset=unknown\n" {
 		t.Fatalf("rejected signal log = %q", log.info)
 	}
 	if strings.Contains(log.info[0], destinationId.String()) {
@@ -4459,7 +4459,7 @@ func TestClientSignalSenderReportsNonblockingAdmissionRefusal(t *testing.T) {
 	if !MessagePoolReturn(witness) {
 		t.Fatal("nonblocking refusal retained its exact pooled message ownership")
 	}
-	if len(log.info) != 1 || log.info[0] != "[signal]send failed mode=receive-reply reason=not-admitted\n" {
+	if len(log.info) != 1 || log.info[0] != "[signal]send failed mode=receive-reply reason=not-admitted boundary=loopback kind=unknown reset=unknown\n" {
 		t.Fatalf("nonblocking refusal log = %q", log.info)
 	}
 	if strings.Contains(log.info[0], destinationId.String()) {

@@ -121,10 +121,11 @@ func NewClientSignalSender(client *Client) *ClientSignalSender {
 // path (a peer's inbound signal producing a response). Per the receive
 // contract (CODESTYLE: receive callbacks must not block), such sends use
 // timeout 0 — enqueue if there is room, drop otherwise — instead of the
-// sender-context default of blocking for backpressure. A dropped response is
-// recovered by the signaling retry machinery (offer replay on
-// WaitingForSdpOffer, candidate re-flush, transport reconnect), while a
-// blocked receive path can wedge signal delivery for every peer.
+// sender-context default of blocking for backpressure. Recovery depends on
+// kind: an offer may replay on WaitingForSdpOffer, while a refused answer or
+// flushed candidate may need the outer transport's generation reconnect.
+// A refusal alone does not establish recovery or usable exchange fallback.
+// Blocking here can wedge signal delivery for every peer.
 type signalSendNonBlocking struct{}
 
 // Reduces the detailed send result to a bounded diagnostic vocabulary. The
@@ -144,6 +145,55 @@ func signalSendFailureReason(err error) string {
 	return "other"
 }
 
+// Borrows only a refused frame, while its caller still owns the pooled bytes.
+// Decode work and output are bounded; payloads, peer/generation ids and raw
+// decode errors never leave this helper. Unknown also covers oversized input.
+func signalSendFrameKind(signal *protocol.Frame) (kind string, reset string) {
+	if signal == nil || signal.MessageType != protocol.MessageType_TransferExchangeSignals ||
+		64*1024 < len(signal.MessageBytes) {
+		return "unknown", "unknown"
+	}
+	message, err := FromFrame(signal)
+	if err != nil {
+		return "unknown", "unknown"
+	}
+	signals, ok := message.(*protocol.ExchangeSignals)
+	if !ok || 64 < len(signals.Signals) {
+		return "unknown", "unknown"
+	}
+	reset = "false"
+	if signals.ResetSignals {
+		reset = "true"
+	}
+	kind = "none"
+	for i, signalValue := range signals.Signals {
+		if signalValue == nil {
+			return "unknown", reset
+		}
+		var nextKind string
+		switch signalValue.SignalType {
+		case protocol.SignalType_NoSignal:
+			nextKind = "none"
+		case protocol.SignalType_SdpOffer:
+			nextKind = "offer"
+		case protocol.SignalType_SdpAnswer:
+			nextKind = "answer"
+		case protocol.SignalType_IceCandidate:
+			nextKind = "candidate"
+		case protocol.SignalType_WaitingForSdpOffer:
+			nextKind = "waiting"
+		default:
+			return "unknown", reset
+		}
+		if i == 0 {
+			kind = nextKind
+		} else if kind != nextKind {
+			kind = "mixed"
+		}
+	}
+	return kind, reset
+}
+
 // Uses normal sender backpressure unless a receive-originated reply explicitly
 // requests a nonblocking handoff. The supplied frame is consumed in all cases.
 func (self *ClientSignalSender) SendSignal(destinationId Id, signal *protocol.Frame, opts ...any) {
@@ -158,17 +208,23 @@ func (self *ClientSignalSender) SendSignal(destinationId Id, signal *protocol.Fr
 		}
 		sendOpts = append(sendOpts, opt)
 	}
-	success, err := self.client.SendWithTimeoutDetailed(signal, destinationId, nil, timeout, sendOpts...)
+	success, err, boundary := self.client.sendWithTimeoutAdmissionDetailed(
+		signal, destinationId, MultiHopId{}, nil, timeout, sendOpts...,
+	)
 	// A failed signal delays p2p setup until transport retry, so keep it loud.
 	// Preserve SendWithTimeout's success-and-no-error contract exactly. The
 	// V(1) positive is the send-side half of the signal delivery trace.
 	if !success || err != nil {
+		kind, reset := signalSendFrameKind(signal)
 		MessagePoolReturn(signal.MessageBytes)
 		signal.MessageBytes = nil
 		self.client.log.Infof(
-			"[signal]send failed mode=%s reason=%s\n",
+			"[signal]send failed mode=%s reason=%s boundary=%s kind=%s reset=%s\n",
 			mode,
 			signalSendFailureReason(err),
+			boundary,
+			kind,
+			reset,
 		)
 	} else if self.client.log.V(1).Enabled() {
 		self.client.log.Infof("[signal]send mode=%s\n", mode)

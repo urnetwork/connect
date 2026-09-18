@@ -70,6 +70,7 @@ func TestEveryPoolBufferEntryPointDeclaresItsOwnership(t *testing.T) {
 		{"LocalUserNat.SendPackets", takesOnSuccess},
 		{"Client.SendWithTimeout", takesOnSuccess},
 		{"Client.SendWithTimeoutDetailed", takesOnSuccess},
+		{name: "Client.sendWithTimeoutAdmissionDetailed", rule: takesOnSuccess},
 	}
 
 	docs := packageDocComments(t)

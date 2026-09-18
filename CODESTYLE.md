@@ -207,6 +207,7 @@ leaves it with the caller, who must return it.
 
 - `LocalUserNat.SendPacket`, `SendPacketWithTimeout`, `SendPackets`
 - `Client.SendWithTimeout`, `SendWithTimeoutDetailed`
+- `Client.sendWithTimeoutAdmissionDetailed` (internal admission diagnostics)
 
 A batch entry's true return reads as a transfer and means delivered; the
 per-buffer ownership is the heading it sits under, not what the boolean

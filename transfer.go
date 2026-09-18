@@ -1148,6 +1148,9 @@ type SendPack struct {
 	// the peer may not have completed its half of the handshake even after our
 	// local cipher is established.
 	ForceUnwrapped bool
+	// Written only by synchronous admission before an unsuccessful return.
+	// Successful ownership transfer forbids the caller from inspecting it.
+	admissionFailure sendAdmissionBoundary
 	// EncryptionRole selects which per-peer session this pack uses, keying the
 	// SendSequence so the roles run as distinct sequences: client (the default —
 	// the client's own outbound data, whose handshake it initiates/restarts) or
@@ -3489,6 +3492,8 @@ func (self *Client) sendGroupToWithTimeoutDetailed(
 	return self.enqueueSendPack(sendPack, timeout)
 }
 
+// Preserves the public send result while the internal path retains its refusal
+// gate. Takes the frame's pool buffer on success only.
 func (self *Client) sendWithTimeoutDetailed(
 	frame *protocol.Frame,
 	destinationId Id,
@@ -3497,9 +3502,25 @@ func (self *Client) sendWithTimeoutDetailed(
 	timeout time.Duration,
 	opts ...any,
 ) (bool, error) {
+	success, err, _ := self.sendWithTimeoutAdmissionDetailed(
+		frame, destinationId, intermediaryIds, ackCallback, timeout, opts...,
+	)
+	return success, err
+}
+
+// Takes the frame's pool buffer on success only. The extra local diagnostic
+// identifies a synchronous false/nil refusal without changing the public result.
+func (self *Client) sendWithTimeoutAdmissionDetailed(
+	frame *protocol.Frame,
+	destinationId Id,
+	intermediaryIds MultiHopId,
+	ackCallback AckFunction,
+	timeout time.Duration,
+	opts ...any,
+) (bool, error, sendAdmissionBoundary) {
 	select {
 	case <-self.ctx.Done():
-		return false, errors.New("Done")
+		return false, errors.New("Done"), sendAdmissionUnknown
 	default:
 	}
 
@@ -3537,7 +3558,11 @@ func (self *Client) sendWithTimeoutDetailed(
 	if noAck && !(success && err == nil) {
 		self.sendNoAckRefusedCount.Add(1)
 	}
-	return success, err
+	if !success && err == nil {
+		return false, nil, sendPack.admissionFailure
+	}
+	// A successful consumer may already have returned or reused the Pack.
+	return success, err, sendAdmissionUnknown
 }
 
 // The fully resolved values shared by single, batch, and raw sends.
@@ -3730,6 +3755,7 @@ func (self *Client) sendRawToWithTimeoutDetailed(
 }
 
 func (self *Client) enqueueSendPack(sendPack *SendPack, timeout time.Duration) (bool, error) {
+	sendPack.admissionFailure = sendAdmissionUnknown
 	ctx := sendPack.Ctx
 	if sendPack.Destination == self.clientId {
 		// loopback
@@ -3758,6 +3784,7 @@ func (self *Client) enqueueSendPack(sendPack *SendPack, timeout time.Duration) (
 			case self.loopback <- sendPack:
 				return true, nil
 			default:
+				sendPack.admissionFailure = sendAdmissionLoopback
 				return false, nil
 			}
 		} else {
@@ -3769,6 +3796,7 @@ func (self *Client) enqueueSendPack(sendPack *SendPack, timeout time.Duration) (
 			case self.loopback <- sendPack:
 				return true, nil
 			case <-time.After(timeout):
+				sendPack.admissionFailure = sendAdmissionLoopback
 				return false, nil
 			}
 		}
@@ -6761,6 +6789,7 @@ func (self *SendSequence) acquirePackAdmission(
 func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool, error) {
 	self.packMutex.RLock()
 	defer self.packMutex.RUnlock()
+	sendPack.admissionFailure = sendAdmissionUnknown
 
 	select {
 	case <-sendPack.Ctx.Done():
@@ -6908,12 +6937,18 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 	if sendPack.Ack {
 		admitted, err, capacityTimeout := self.awaitResendCapacity(sendPack, timeout)
 		if err != nil || !admitted {
+			if err == nil {
+				sendPack.admissionFailure = sendAdmissionResendCapacity
+			}
 			return false, err
 		}
 		timeout = capacityTimeout
 	}
 	admitted, err, timeout := self.acquirePackAdmission(sendPack, timeout)
 	if err != nil || !admitted {
+		if err == nil {
+			sendPack.admissionFailure = sendAdmissionPack
+		}
 		return false, err
 	}
 	queued := false
@@ -6951,6 +6986,7 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			queued = true
 			return true, nil
 		default:
+			sendPack.admissionFailure = sendAdmissionHandoff
 			return false, nil
 		}
 	} else {
@@ -6963,6 +6999,7 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			queued = true
 			return true, nil
 		case <-time.After(timeout):
+			sendPack.admissionFailure = sendAdmissionHandoff
 			return false, nil
 		}
 	}
