@@ -1413,6 +1413,9 @@ type RemoteUserNatMultiClient struct {
 	sendPolicyDropCount       atomic.Uint64
 	sendSmtpDropCount         atomic.Uint64
 	sendIcmpDisabledDropCount atomic.Uint64
+	// Redundant TCP packets are deliberately refused before admission. Count
+	// packets, not send calls, so singular and grouped sends reconcile alike.
+	tcpCollapseDropCount atomic.Uint64
 	// Best-effort removal-generated packets are delivered by one isolated
 	// worker. A permanently blocked downstream therefore cannot wedge the
 	// maintenance paths; the fixed queue caps retained packets and memory.
@@ -6528,6 +6531,13 @@ func (self *RemoteUserNatMultiClient) PacketStats() *PacketStats {
 	return self.packetStatsCounters.snapshot()
 }
 
+// Reports lifetime packet refusals caused only by TCP collapse prevention.
+// These are already-covered sequence/ack/window states, not security blocks
+// or admission failures. Safe to read concurrently with sends.
+func (self *RemoteUserNatMultiClient) TcpCollapseDropCount() uint64 {
+	return self.tcpCollapseDropCount.Load()
+}
+
 // AddPacketStatsCallback registers a listener fired on the event epoch when the
 // packet stats change
 func (self *RemoteUserNatMultiClient) AddPacketStatsCallback(packetStatsCallback PacketStatsFunction) func() {
@@ -6628,6 +6638,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 	self.sendClientPath(ipPath, sendPacketGroup.pin, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
 		sentUpdate = update
 		if !self.canSendPacketGroup(sendPacketGroup, update, currentClient) {
+			self.tcpCollapseDropCount.Add(uint64(len(sendPacketGroup.packets)))
 			return
 		}
 		// Preserve the singular path's pre-admission control semantics. In
