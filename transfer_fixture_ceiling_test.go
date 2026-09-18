@@ -26,9 +26,9 @@ import (
 //
 // The payload sweep is what identifies the binder. If the ceiling is flat in
 // bytes per second it is copy or serialisation bandwidth; if it is flat in
-// frames per second it is per-frame plumbing, which for this fixture is the
-// goroutine it spawns per frame in the delay pump. Those are different findings
-// and only the second is an instrument defect.
+// frames per second it is per-frame plumbing. The delay pump now uses one FIFO
+// scheduler rather than a goroutine per frame; the measurement still includes
+// the host cost of the client and fixture workers, not only the modeled path.
 //
 // Derived rather than counted, and named as such: the frame rate below is
 // delivered bytes divided by the payload size, not a count of frames on the

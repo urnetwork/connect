@@ -43,8 +43,8 @@ import (
 // both readings were first written down as properties of the tree. The
 // in-process fixture's was the larger: a believed ~50 Mb/s byte ceiling that no
 // window could move turned out to be a frame ceiling, about 7,800 frames a
-// second whatever the payload, which is this fixture's goroutine-per-frame delay
-// pump and not a stage in anything. Doubling two buffer depths moved 16 KiB
+// second whatever the payload, traced to the fixture's former goroutine-per-frame
+// delay pump and not a stage in anything. Doubling two buffer depths moved 16 KiB
 // payloads from 509 to 1,313 Mb/s.
 //
 // So the rule: a throughput assertion is meaningful only below the instrument's
@@ -64,7 +64,7 @@ import (
 // It contains exactly one row of the share table: the transfer send window and
 // the receive hold, which are the two rows that read the process budget M
 // through `transferBudgetShareByteCount` (§51.2). A sender `Client` and a
-// receiver `Client` joined by four Go channels, with a goroutine-per-frame pump
+// receiver `Client` joined by four Go channels, with a bounded FIFO scheduler
 // imposing the delay on the acknowledgement half. That covers the send window,
 // the resend queue, the receive hold, the acknowledgement compression timer, the
 // round-trip estimator and the rule that sizes the window from delivery.
@@ -471,15 +471,16 @@ func (self chainArm) key() string {
 //
 // Not a zero delay and not a 64 MiB window, though §50.4's words are "the delay
 // element at zero" and "seeded past any bound", and the departure is worth the
-// paragraph because it is itself an instrument finding. The harness's data half
-// spawns a goroutine per frame and those goroutines race to write into the route
-// channel, so the reorder distance is whatever the window allows to be in flight
+// paragraph because it is itself an instrument finding. The harness's former data
+// pump spawned a goroutine per frame and those goroutines raced to write into the
+// route channel, so the reorder distance was whatever the window allowed in flight
 // at once. At 64 MiB and zero delay that is four thousand frames, the receive
 // sequence spends the run filling gaps, and what gets measured is a retransmit
 // storm: the first run of this cell read the 16 KiB ceiling as zero, and with
 // the hold raised as well it read 2,476, then 1,660, then 1,912 Mb/s across
-// three repetitions of the same configuration. A 4 MiB window bounds the flight
-// to 256 frames at 16 KiB and the reordering with it.
+// three repetitions of the same configuration. A 4 MiB window bounded the flight
+// to 256 frames at 16 KiB and the reordering with it. The pump is now FIFO; retain
+// the same ceiling control and measure its headroom on the current instrument.
 //
 // So the seeding rule that matters is kept and the literal one is not: the
 // window over the delay must permit far more than the instrument can carry, and

@@ -28,8 +28,8 @@ import (
 //
 // The carrier is paced well above what the window permits, so the carrier is
 // not the binder. That trap has caught this program twice: an unpaced
-// in-process carrier rewards permission far past the bandwidth-delay product
-// because it runs a goroutine per frame, and a deep route channel scores a
+// in-process carrier can reward permission past a physical bandwidth-delay
+// product because it has no byte-rate limit, and a deep route channel scores a
 // larger window higher while delivering the same bytes. Here the pace is three
 // times the permitted rate and delivery is counted at the receiver.
 //

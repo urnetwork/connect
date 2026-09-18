@@ -178,18 +178,18 @@ func newPacedSendWindowHarnessWithClient(
 	senderIn := make(Route, deepCarrierFrameCapacity)
 	receiverIn := make(Route, deepCarrierFrameCapacity)
 	receiverOut := make(Route, deepCarrierFrameCapacity)
+	// These lossless links retain complete frames under receive backpressure.
+	// Leave the carrier family unspecified so this fixture does not enable
+	// transport-specific pacing, but identify each reliable physical lane.
+	carrier := TransferCarrierProperties{ReceiveReliability: CarrierReliabilityReliable}
 	sender.RouteManager().UpdateTransport(NewSendGatewayTransport(), []Route{senderOut})
-	sender.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{senderIn})
-	receiver.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{receiverIn})
+	sender.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransport(), []Route{senderIn}, carrier)
+	receiver.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransport(), []Route{receiverIn}, carrier)
 	receiver.RouteManager().UpdateTransport(NewSendGatewayTransport(), []Route{receiverOut})
 	receiver.AddReceiveCallback(func(TransferPath, []*protocol.Frame, Peer) {})
 
-	// every frame in flight is owned by its own goroutine, so cleanup joins
-	// them before draining: a frame still sleeping when the loop exits is a
-	// leaked pool root, which the ownership assertion catches
-	var framesInFlight sync.WaitGroup
-	// per frame, concurrently: a pump that sleeps in its own loop is a serial
-	// line and would bound the measurement rather than the window
+	// Each pump owns its queued frames until delivery or cancellation. Join
+	// both before draining route buffers so no in-flight pool roots survive.
 	pumpsDone := []chan struct{}{}
 	rate := &atomic.Int64{}
 	rate.Store(int64(bytesPerSecond))
@@ -233,27 +233,12 @@ func newPacedSendWindowHarnessWithClient(
 	pump := func(from Route, to Route, delay time.Duration) {
 		done := make(chan struct{})
 		pumpsDone = append(pumpsDone, done)
+		// Propagation overlaps without reordering frames on timer wakeups or
+		// introducing a host-dependent goroutine-per-frame ceiling.
+		link := windowPathLink{delay: delay, queueCount: deepCarrierFrameCapacity, queueBytes: mib(64)}
 		go func() {
 			defer close(done)
-			for {
-				select {
-				case transferFrameBytes := <-from:
-					framesInFlight.Add(1)
-					go func(transferFrameBytes []byte) {
-						defer framesInFlight.Done()
-						if 0 < delay {
-							time.Sleep(delay)
-						}
-						select {
-						case to <- transferFrameBytes:
-						case <-ctx.Done():
-							MessagePoolReturn(transferFrameBytes)
-						}
-					}(transferFrameBytes)
-				case <-ctx.Done():
-					return
-				}
-			}
+			link.run(ctx, from, to)
 		}()
 	}
 	if 0 < bytesPerSecond {
@@ -266,7 +251,6 @@ func newPacedSendWindowHarnessWithClient(
 		for _, done := range pumpsDone {
 			<-done
 		}
-		framesInFlight.Wait()
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer closeCancel()
 		if err := sender.CloseAndWait(closeCtx); err != nil {
@@ -954,56 +938,74 @@ func TestSendWindowStatsAreSafeToReadWhileTheSequenceRuns(t *testing.T) {
 //
 // The third arm is why step two is coupled to this result rather than
 // independent of it. A sender with no advertisement from its peer cannot know
-// the peer's hold, so it assumes the shipped 2.5 MiB and clamps there; a
-// ceiling raised above that moves nothing until either the peer advertises or
-// the hold itself rises. 2.5 MiB over 200 ms is 105 Mb/s framed, 89 goodput,
-// which is within a few per cent of the 109 Mb/s the H3 stream window binds at,
-// so on the production path the two ceilings arrive together or neither does.
+// the peer's hold, so it keeps its own constant-window ceiling. A larger
+// configured ceiling grants nothing until the peer advertises its capacity.
 //
 // Predictions, recorded before the run: the constant 2 MiB arm delivers about
 // the window over the round trip; the sized arm with a 16 MiB hold advertised
 // delivers at least 1.7 times that; and the sized arm with no advertisement
 // lands between them and below 1.5 times, held by the assumed hold.
 //
-// All three met, four runs: the constant arm 9.8 to 10.1 MB/s against the
-// 10.5 MB/s its window over the round trip predicts; the advertised arm 2.46 to
-// 2.73 times, above the campaign's 1.7 to 2.3 because nothing else binds here;
-// the assumed arm 1.21 to 1.24 times with its ceiling at 2,621,440 exactly.
+// This is a modeled path, not a host throughput benchmark: virtual time makes
+// all arms see the same propagation and offer interval even under race or host
+// load. Count delivered payload at the receiver, not admission into the carrier,
+// and assert the lossless preconditions before comparing window permission.
 func TestALargerWindowIsFasterAtALongRoundTrip(t *testing.T) {
 	assertMessagePoolOwnership(t)
 
 	const propagation = 200 * time.Millisecond
 	const ceiling = ByteCount(16 * 1024 * 1024)
 	const offerWindow = 6 * time.Second
+	const payloadByteCount = 4 * 1024
 
 	goodput := func(sized bool, advertise bool) (float64, SendWindowEstimate) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		harness := newSendWindowHarness(t, ctx, propagation, func(settings *SendBufferSettings) {
-			if sized {
-				settings.DeliverySizedWindowScale = 2
-				settings.DeliverySizedWindowCeilingByteCount = ceiling
-				settings.ResendQueueBudget = NewTransferMemoryBudget(ceiling)
+		var rate float64
+		var estimate SendWindowEstimate
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			harness := newSendWindowHarnessWithClient(t, ctx, propagation,
+				func(settings *SendBufferSettings) {
+					settings.WindowSizing = WindowSizingConstant
+					if sized {
+						settings.WindowSizing = WindowSizingFromDelivery
+						settings.DeliverySizedWindowScale = 2
+						settings.DeliverySizedWindowCeilingByteCount = ceiling
+						settings.ResendQueueBudget = NewTransferMemoryBudget(ceiling)
+					}
+				}, func(settings *ClientSettings) {
+					settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+				})
+			if advertise {
+				harness.receiveHold(ceiling)
+			} else {
+				// The advertisement ships on, so a legacy-peer arm must disable
+				// it explicitly rather than inherit the fixture's 64 MiB hold.
+				harness.receiveNoAdvertisement()
 			}
+			var delivered atomic.Int64
+			harness.receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
+				delivered.Add(int64(len(frames)) * payloadByteCount)
+			})
+			start := time.Now()
+			harness.offer(t, payloadByteCount, offerWindow)
+			synctest.Wait()
+			elapsed := time.Since(start)
+			if elapsed != offerWindow || delivered.Load() == 0 {
+				t.Fatalf("modeled offer delivered %d payload bytes over %s, want positive delivery over %s", delivered.Load(), elapsed, offerWindow)
+			}
+			stats := harness.sender.DestinationSendStats(harness.receiverId)
+			receiveStats := harness.receiver.ReceiveStats()
+			if receiveStats.PackHandoffDropCount != 0 || receiveStats.ReceiveQueueDropCount != 0 || receiveStats.ReceiveQueueEvictionCount != 0 {
+				t.Fatalf("lossless fixture dropped %d Packs at handoff, refused %d arrivals, and evicted %d", receiveStats.PackHandoffDropCount, receiveStats.ReceiveQueueDropCount, receiveStats.ReceiveQueueEvictionCount)
+			}
+			if stats.ResendWriteByteCount != 0 || harness.sender.ReceiveStats().SendPackDeadlineDropCount != 0 {
+				t.Fatalf("fixture recovered or expired accepted Packs: resends=%d bytes, deadline drops=%d", stats.ResendWriteByteCount, harness.sender.ReceiveStats().SendPackDeadlineDropCount)
+			}
+			rate = float64(delivered.Load()) / elapsed.Seconds()
+			estimate = stats.SendWindow
 		})
-		if advertise {
-			harness.receiveHold(ceiling)
-		} else {
-			// Asked for explicitly since the rule ships on: without this the
-			// "no advertisement" arm gets a receiver advertising the harness's
-			// own 64 MiB hold, the sender takes the peer-capacity branch, and
-			// the arm measures a modern peer while claiming to measure a
-			// legacy one. The ceiling it then reported, 16515072, is the
-			// sender's own budget less another queue's floor — the
-			// advertisement branch, not a hole in the legacy clamp.
-			harness.receiveNoAdvertisement()
-		}
-		start := time.Now()
-		harness.offer(t, 4*1024, offerWindow)
-		elapsed := time.Since(start)
-		stats := harness.sender.DestinationSendStats(harness.receiverId)
-		delivered := stats.WriteByteCount - stats.ResendWriteByteCount
-		return float64(delivered) / elapsed.Seconds(), stats.SendWindow
+		return rate, estimate
 	}
 
 	constantRate, constantEstimate := goodput(false, false)
