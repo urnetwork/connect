@@ -11,6 +11,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -113,7 +114,28 @@ func TestPlatformTransportPublishesTheExtenderOfItsConnection(t *testing.T) {
 
 	fixture := newExtenderFixture(t, "127.0.0.1", nil)
 
+	// Observe the exact directory write boundary on the connection goroutine.
+	// Route generation arms the first observation after the dial has finished;
+	// the directory has no store or other worker that could read this clock.
+	// This makes premature publication visible without racing a monitor wake.
+	type publicationState struct {
+		connected bool
+		ips       []netip.Addr
+	}
+	var transport *connect.PlatformTransport
+	transportReady := make(chan struct{})
+	var observeInUse atomic.Bool
+	inUseStates := make(chan publicationState, 1)
 	directorySettings := connect.DefaultExtenderDirectorySettings()
+	directorySettings.Now = func() time.Time {
+		if observeInUse.Swap(false) {
+			inUseStates <- publicationState{
+				connected: transport.IsConnected(),
+				ips:       transport.ExtenderIps(),
+			}
+		}
+		return time.Now()
+	}
 	directory := connect.NewExtenderDirectory(ctx, directorySettings)
 	t.Cleanup(directory.Close)
 	// the in-use count is per known address, so the address the configured
@@ -123,7 +145,13 @@ func TestPlatformTransportPublishesTheExtenderOfItsConnection(t *testing.T) {
 	clientStrategy := newExtenderTestStrategy(t, ctx, fixture, directory)
 	transportSettings := connect.DefaultPlatformTransportSettings()
 	transportSettings.ReconnectTimeout = 50 * time.Millisecond
-	transport := connect.NewPlatformTransportWithTargetMode(
+	transportSettings.TransportGenerator = func() (connect.Transport, connect.Transport) {
+		<-transportReady
+		observeInUse.Store(true)
+		return connect.NewSendGatewayTransportWithType(connect.TransportTypeH1),
+			connect.NewReceiveGatewayTransportWithType(connect.TransportTypeH1)
+	}
+	transport = connect.NewPlatformTransportWithTargetMode(
 		ctx,
 		clientStrategy,
 		connect.NewRouteManager(ctx, "extender-test"),
@@ -136,8 +164,25 @@ func TestPlatformTransportPublishesTheExtenderOfItsConnection(t *testing.T) {
 		connect.TransportModeH1,
 		transportSettings,
 	)
+	close(transportReady)
 	t.Cleanup(transport.Close)
 
+	waitForInUseState := func() publicationState {
+		select {
+		case state := <-inUseStates:
+			return state
+		case <-time.After(60 * time.Second):
+			t.Fatal("the connection never updated its extender's in-use count")
+			return publicationState{}
+		}
+	}
+	acquiring := waitForInUseState()
+	if acquiring.connected {
+		t.Error("the transport published connected before acquiring its extender")
+	}
+	if len(acquiring.ips) != 0 {
+		t.Errorf("extender ips before acquiring the directory hold = %v, want none", acquiring.ips)
+	}
 	waitForTransport(t, transport, "the transport never connected through the extender", func() bool {
 		return transport.IsConnected()
 	})
@@ -150,8 +195,16 @@ func TestPlatformTransportPublishesTheExtenderOfItsConnection(t *testing.T) {
 
 	// the platform goes away for good, so the connection ends and the
 	// reconnect cannot restore it
+	observeInUse.Store(true)
 	fixture.destination.refuseWebSockets()
 
+	releasing := waitForInUseState()
+	if releasing.connected {
+		t.Error("the transport remained connected while releasing its extender")
+	}
+	if len(releasing.ips) != 1 || releasing.ips[0] != fixture.ip {
+		t.Errorf("extender ips before releasing the directory hold = %v, want [%v]", releasing.ips, fixture.ip)
+	}
 	waitForTransport(t, transport, "the extender was never released", func() bool {
 		return len(transport.ExtenderIps()) == 0
 	})

@@ -1144,15 +1144,17 @@ func (self *PlatformTransport) holdExtenderIp(ip netip.Addr) func() {
 	}
 	ip = ip.Unmap()
 	directory := self.clientStrategy.ExtenderDirectory()
-	self.changeExtenderIp(ip, 1)
+	// Complete the directory hold before waking extender-set observers on
+	// either edge, so a published set never leads its in-use accounting.
 	if directory != nil {
 		directory.SetInUse(ip, 1)
 	}
+	self.changeExtenderIp(ip, 1)
 	return func() {
-		self.changeExtenderIp(ip, -1)
 		if directory != nil {
 			directory.SetInUse(ip, -1)
 		}
+		self.changeExtenderIp(ip, -1)
 	}
 }
 
@@ -2263,11 +2265,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					ReceiveReliability: CarrierReliabilityReliable,
 				},
 			)
-			self.setRegistered(true)
 			// the extender carrying this connection is published for exactly
 			// its lifetime, so the ips and the directory's in-use count follow
-			// the connection rather than the dial (K1, K4)
+			// the connection rather than the dial (K1, K4). Acquire both before
+			// announcing readiness; withdraw readiness before releasing them.
 			releaseExtenderIp := self.holdExtenderIp(dialExtenderIp)
+			self.setRegistered(true)
 
 			defer func() {
 				self.setRegistered(false)
