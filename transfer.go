@@ -7503,6 +7503,9 @@ func (self *SendSequence) scheduleSelectiveAckRecovery(currentTime time.Time) bo
 			reschedule(item, currentTime, sendRecoverySelectiveGap)
 			gapRecoveryCount += 1
 			unreliableGapRecovery = unreliableGapRecovery || item.unreliableFlightTracked
+			if item.unreliableFlightTracked {
+				self.observeUnreliableFlightLoss(item)
+			}
 		}
 	}
 	if 0 < gapRecoveryCount {
@@ -7674,7 +7677,7 @@ func (self *SendSequence) ackTimeoutForPolicy(
 
 // resendIntervalForPolicy applies the existing per-item exponential backoff,
 // with a lower ceiling only when the active route includes an unreliable
-// payload carrier. Flight admission contracts independently on each timeout,
+// payload carrier. Flight admission contracts once for each newly lost flight,
 // which bounds duplicate queue pressure while this ceiling bounds silence.
 func (self *SendSequence) resendIntervalForPolicy(
 	policy transferFlightPolicySnapshot,
@@ -8285,9 +8288,6 @@ sendSequenceLoop:
 		}
 		if ackUpdated && self.scheduleSelectiveAckRecoveryAfterFeedback(sendTime) {
 			self.client.unreliableFlightGapCount.Add(1)
-			if self.flightController.reduceForLoss() {
-				self.client.unreliableFlightReductionCount.Add(1)
-			}
 			self.client.observeUnreliableFlight(self.flightController)
 		}
 		var timeout time.Duration
@@ -11465,15 +11465,24 @@ func (self *SendSequence) observeUnreliableResendTimeout(
 	policy transferFlightPolicySnapshot,
 ) bool {
 	self.client.unreliableFlightTimeoutCount.Add(1)
-	if self.flightController.reduceForLoss() {
-		self.client.unreliableFlightReductionCount.Add(1)
-	}
+	self.observeUnreliableFlightLoss(item)
 	if !policy.reliableRouteAvailable {
 		self.client.observeUnreliableFlight(self.flightController)
 		return false
 	}
 	self.forgetUnreliableFlight(item)
 	return true
+}
+
+// A timeout burst and selective gaps can describe the same original flight.
+// Share their loss boundary so successive recovery passes cannot compound the
+// congestion response before any newly admitted packet has itself been lost.
+func (self *SendSequence) observeUnreliableFlightLoss(item *sendItem) {
+	if self.flightController != nil &&
+		self.flightController.reduceForSequenceLoss(item.sequenceNumber, self.nextSequenceNumber) &&
+		self.client != nil {
+		self.client.unreliableFlightReductionCount.Add(1)
+	}
 }
 
 // forgetUnreliableFlight drops a timed-out item from the unreliable flight

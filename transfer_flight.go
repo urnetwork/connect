@@ -42,6 +42,9 @@ type sendFlightController struct {
 	slowStartIncreaseRemainder ByteCount
 	additiveMessageRemainder   int
 	slowStartMessageRemainder  int
+	// A loss response covers every original packet already issued. More
+	// losses from that flight must not repeatedly halve its admission window.
+	lossSequenceNumberLimit uint64
 }
 
 // Normalizes optional settings once so the packet path has no configuration
@@ -120,6 +123,7 @@ func (self *sendFlightController) applyPolicy(policy transferFlightPolicySnapsho
 	self.slowStartIncreaseRemainder = 0
 	self.additiveMessageRemainder = 0
 	self.slowStartMessageRemainder = 0
+	self.lossSequenceNumberLimit = 0
 	if limited {
 		self.activeMaximumByteCount = self.maximumByteCount
 		if 0 < policy.byteLimit {
@@ -297,7 +301,19 @@ func (self *sendFlightController) acknowledgeForKey(
 	}
 }
 
-// Reacts to one Transfer-level loss signal: either a receiver-proven gap or an
+// Contracts admission once for the original flight containing a lost packet.
+// A later original packet can prove a new loss episode; retries and multiple
+// gaps from the same flight retain their recovery cadence without contracting
+// the window again. The sender owns both sequence numbers.
+func (self *sendFlightController) reduceForSequenceLoss(sequenceNumber, nextSequenceNumber uint64) bool {
+	if !self.limited || sequenceNumber < self.lossSequenceNumberLimit {
+		return false
+	}
+	self.lossSequenceNumberLimit = max(sequenceNumber+1, nextSequenceNumber)
+	return self.reduceForLoss()
+}
+
+// Reacts to one Transfer-level loss episode: either a receiver-proven gap or an
 // acknowledgement timeout. Returning true means this event reduced at least
 // one limit; false still leaves slow start disabled at the configured floors.
 // A timeout must participate because a lost tail or lost cumulative Ack has no
