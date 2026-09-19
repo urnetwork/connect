@@ -9,8 +9,8 @@ import "time"
 func (self *SendSequence) finalizeWindowPacing(at time.Time, retain bool, generation time.Time, estimate *SendWindowEstimate) {
 	service := self.windowPacer.service
 	paced := service != nil && self.transferFlightPolicy().h1Only
+	residence := estimate.WindowRoundTrip
 	if paced {
-		residence := estimate.WindowRoundTrip
 		if residence <= 0 {
 			residence = service.roundTripEvidence(at).residence
 		}
@@ -22,10 +22,15 @@ func (self *SendSequence) finalizeWindowPacing(at time.Time, retain bool, genera
 		}
 		estimate.PacingDiscovery, estimate.PacingHeldByteRate = service.pacingHold()
 	}
-	estimate.PacingByteRate = windowPacingRate(*estimate, estimate.PacingProbeByteRate)
-	// A blind read has no local residence to hold a pace against. A sibling
-	// reset cannot let an earlier estimate reinstate a retired generation.
-	if paced && retain && estimate.WindowRoundTrip > 0 {
+	// Fixed-window providers return before local sizing obtains an RTT.
+	// Their physical H1 residence still qualifies discovery and retention;
+	// use it for pacing without inventing logical window-sizing evidence.
+	pacingEstimate := *estimate
+	pacingEstimate.WindowRoundTrip = residence
+	estimate.PacingByteRate = windowPacingRate(pacingEstimate, estimate.PacingProbeByteRate)
+	// A blind service cannot publish a hold, and a sibling reset cannot let
+	// an earlier estimate reinstate a retired generation.
+	if paced && retain && residence > 0 {
 		service.holdPacingForGeneration(estimate.PacingByteRate, generation)
 	}
 }
