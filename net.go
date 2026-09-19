@@ -195,6 +195,8 @@ type ConnectSettings struct {
 // PacketConnFactory into transports which own an unconnected UDP endpoint.
 type DialContextSettings struct {
 	DialContext DialContextFunction
+	// Only Tun sets this diagnostic marker; other supplied dialers stay caller.
+	dohTun bool
 	// PacketConnFactory creates one unconnected UDP endpoint per carrier dial.
 	// The caller owns and closes every non-nil endpoint, including one returned
 	// alongside an error. Nil retains the platform's ordinary wildcard socket.

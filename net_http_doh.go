@@ -499,6 +499,7 @@ type dohFlight struct {
 	done          chan struct{}
 	addrs         []netip.Addr
 	authoritative bool
+	stale         bool
 }
 
 func dnsResolverAddrs(settings *DohSettings, remote bool, network string) []string {
@@ -624,8 +625,8 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	// (localClient) must never be redeemed through the tunnel (remoteClient) — ticket reuse
 	// across paths would let the DoH server link the host address with the tunnel egress.
 	// Within a path, resumption saves a handshake round trip on every re-dial.
-	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapControlDial("doh", settings.Log, remoteBound, settings.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
-	localHttpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapControlDial("doh", settings.Log, true, netDialer.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	localHttpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapDohDial(settings.Log, dohPathHost, netDialer.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
 	// one in-flight-request semaphore and one stats table shared across the remote + local clients,
 	// so the cap bounds the cache's total concurrent DoH requests
 	httpConcurrency := maxConcurrentHttpRequests(settings)
@@ -894,7 +895,17 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 // NXDOMAIN/NODATA) is never overridden by stale data; it also overwrites the retained entry
 // through the normal resolve() caching. The stale entry never suppresses the resolution attempt
 // itself — every expired-entry query still resolves (or joins the in-flight resolution) first.
-func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain string) ([]netip.Addr, bool) {
+func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain string) (addrs []netip.Addr, authoritative bool) {
+	callerCtx := ctx
+	ctx, observation := newDohResolverObservation(ctx, dohRemoteDialPath(self.settings), dohScopeAddress)
+	stale := false
+	defer func() {
+		resultCtx := callerCtx
+		if resultCtx.Err() == nil && self.lifecycle.ctx.Err() != nil {
+			resultCtx = self.lifecycle.ctx
+		}
+		observation.finish(self.log, dohFinalResolverOutcome(resultCtx, 0 < len(addrs), authoritative, stale))
+	}()
 	if self.lifecycle.retired.Load() {
 		return nil, false
 	}
@@ -943,6 +954,7 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 	// stale serve, naming the domain — the field signal that failover leaned on the cache) and
 	// counts, so neither can drift from the other.
 	serveStale := func() ([]netip.Addr, bool) {
+		stale = true
 		self.staleServeCount.Add(1)
 		// loggerOrDefault: nil-safe against a literally-constructed cache (NewDohCache always
 		// sets log, but a panic in the DNS fallback path is never acceptable)
@@ -955,6 +967,7 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 		// duplicate, bounded by this caller's own ctx and cache lifetime.
 		select {
 		case <-fl.done:
+			stale = fl.stale
 			return fl.addrs, fl.authoritative
 		case <-ctx.Done():
 			if 0 < len(staleAddrs) {
@@ -968,6 +981,7 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 
 	// leader: resolve once, publish to any waiters, and drop the in-flight entry
 	defer func() {
+		fl.stale = stale
 		self.stateLock.Lock()
 		delete(self.inflight, q)
 		self.stateLock.Unlock()
@@ -1012,7 +1026,17 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 // for record types the cache forwards opaquely rather than parsing into
 // addresses. It follows the cache's configured path order (remote/tunnel DoH,
 // then local DoH) and is not cached—the client stub caches by record TTL.
-func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain string) ([]byte, bool) {
+func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain string) (response []byte, usable bool) {
+	callerCtx := ctx
+	ctx, observation := newDohResolverObservation(ctx, dohRemoteDialPath(self.settings), dohScopeForward)
+	defer func() {
+		// Opaque forwarding promises a usable response, not an address answer.
+		resultCtx := callerCtx
+		if resultCtx.Err() == nil && self.lifecycle.ctx.Err() != nil {
+			resultCtx = self.lifecycle.ctx
+		}
+		observation.finish(self.log, dohFinalResolverOutcome(resultCtx, usable, false, false))
+	}()
 	if self.lifecycle.retired.Load() {
 		return nil, false
 	}
@@ -1189,10 +1213,12 @@ func DohQueryWithDefaults(ctx context.Context, recordType string, domains ...str
 // extender bootstrap runs it once per pass and the value is a signed record
 // that carries its own expiry.
 func DohQueryTxt(ctx context.Context, settings *DohSettings, name string) []string {
+	callerCtx := ctx
+	ctx, observation := newDohResolverObservation(ctx, dohRemoteDialPath(settings), dohScopeOneShot)
 	lifecycle := newDohCacheLifecycle()
 	httpClient := httpClientWithDialer(
 		settings,
-		lifecycle.dialContext(wrapControlDial("doh", settings.Log, settings.DialContextSettings == nil, settings.DialContext)),
+		lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)),
 		tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity),
 	)
 	c := &dohClient{
@@ -1206,7 +1232,9 @@ func DohQueryTxt(ctx context.Context, settings *DohSettings, name string) []stri
 		siblings:      dohServerSiblings(settings.DnsResolverSettings),
 	}
 	// both families' servers: a txt answer has no family of its own
-	txts := c.queryResult(ctx, remoteDohUrls(settings, 0), "TXT", settings, name).Txts
+	result := c.queryResult(ctx, remoteDohUrls(settings, 0), "TXT", settings, name)
+	txts := result.Txts
+	observation.finish(settings.Log, dohFinalResolverOutcome(callerCtx, 0 < len(txts), result.Miss, false))
 	lifecycle.shutdown()
 	httpClient.CloseIdleConnections()
 	return txts
@@ -1224,7 +1252,7 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 	lifecycle := newDohCacheLifecycle()
 	httpClient := httpClientWithDialer(
 		settings,
-		lifecycle.dialContext(wrapControlDial("doh", settings.Log, settings.DialContextSettings == nil, settings.DialContext)),
+		lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)),
 		tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity),
 	)
 	result := dohQueryWithClient(
@@ -1269,6 +1297,13 @@ func dohQueryWithClient(
 	lifecycle *dohCacheLifecycle,
 	domains ...string,
 ) map[netip.Addr]int {
+	callerCtx := ctx
+	path := dohRemoteDialPath(settings)
+	if lifecycle == nil {
+		// An externally supplied HTTP client need not use the settings' dialer.
+		path = dohPathUnknown
+	}
+	ctx, observation := newDohResolverObservation(ctx, path, dohScopeOneShot)
 	// a one-shot client: bound its in-flight requests, but keep no persistent per-server stats
 	// (nil stats -> uniform-random fan-out order)
 	c := &dohClient{
@@ -1281,7 +1316,9 @@ func dohQueryWithClient(
 		lifecycle:     lifecycle,
 		siblings:      dohServerSiblings(settings.DnsResolverSettings),
 	}
-	return c.queryResult(ctx, remoteDohUrls(settings, ipVersion), recordType, settings, domains...).AddrTtls
+	result := c.queryResult(ctx, remoteDohUrls(settings, ipVersion), recordType, settings, domains...)
+	observation.finish(settings.Log, dohFinalResolverOutcome(callerCtx, 0 < len(result.AddrTtls), result.Miss, false))
+	return result.AddrTtls
 }
 
 func dohUrlsFor(ipv4 []string, ipv6 []string, ipVersion int) []string {

@@ -1014,9 +1014,23 @@ func (self *Tun) buildDohCache(dnsResolverSettings *DnsResolverSettings, request
 	dohSettings.TlsTimeout = 30 * time.Second
 	dohSettings.DialContextSettings = &DialContextSettings{
 		DialContext: self.DialContext,
+		dohTun:      true,
 	}
 	if dnsResolverSettings != nil {
 		dohSettings.DnsResolverSettings = dnsResolverSettings
+	}
+	if !self.ipv6Enabled {
+		// Only the remote paths traverse this tun. Keep host-side fallback and
+		// explicit resolver choices intact; never mutate the caller's settings.
+		resolverSettings := *dohSettings.DnsResolverSettings
+		resolverSettings.RemoteDohUrlsIpv6 = nil
+		resolverSettings.RemoteDnsIpv6 = nil
+		if dohSettings.IpVersion == 6 {
+			// Plain DNS normally falls back to its other server family when
+			// one list is empty. An explicit IPv6 choice must stay unsupported.
+			resolverSettings.RemoteDnsIpv4 = nil
+		}
+		dohSettings.DnsResolverSettings = &resolverSettings
 	}
 	return NewDohCache(dohSettings)
 }
