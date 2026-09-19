@@ -5114,6 +5114,9 @@ type SendBufferSettings struct {
 	beforeEncryptedControlPackForTest    func([]byte)
 	beforeContractFailureClassifyForTest func(sendSequenceId)
 	beforeTakeContractForTest            func(sendSequenceId)
+	// Nil observers pin admission across an idle check without scheduler timing.
+	beforeRequiredEncryptionWaitForTest func(sendSequenceId)
+	afterIdleCloseForTest               func(sendSequenceId, bool)
 	// Runs after the caller-side no-acknowledgement stage decided, with
 	// whether an immediate write was attempted, whether it succeeded, and the
 	// timeout the pack then carries into admission (THROUGHPUTFIX §38.12).
@@ -6237,11 +6240,10 @@ type SendSequence struct {
 	// where it switches today. Owned by the sequence goroutine.
 	sendContractFrameDue bool
 
-	// packMutex protects packs from Close and coordinates the idle-close
-	// checkpoint. Pack only needs a read lock: multiple callers must be able
-	// to wait on the bounded queue independently. With an exclusive lock, one
-	// application send using an infinite timeout could hold the mutex while
-	// the queue was full, preventing a finite-time liveness probe behind it
+	// packMutex protects packs from Close. Pack only needs a read lock so
+	// multiple callers can wait on the bounded queue independently. An
+	// application send using an infinite timeout could hold an exclusive lock
+	// while the queue was full, preventing a finite-time liveness probe behind it
 	// from observing its own timeout. That hid a route-full condition
 	// indefinitely. Close takes the write lock after canceling the sequence,
 	// which wakes every blocked Pack before the channel is closed.
@@ -6825,6 +6827,9 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 	// waiting keeps the sequence (and the session it references) alive through
 	// the establishment it is waiting on.
 	if !sendPack.ForceUnwrapped && self.session != nil && self.session.RequireEncryption() {
+		if self.sendBufferSettings.beforeRequiredEncryptionWaitForTest != nil {
+			self.sendBufferSettings.beforeRequiredEncryptionWaitForTest(self.id())
+		}
 		enterTime := time.Now()
 		blockedNotified := false
 		for self.session.Cipher() == nil {
@@ -9044,14 +9049,13 @@ sendSequenceLoop:
 			}
 		case <-idleTimer.C:
 			if self.resendQueue.Len() == 0 && scheduler.Len() == 0 {
-				done := false
-				func() {
-					self.packMutex.Lock()
-					defer self.packMutex.Unlock()
-					if self.idleCondition.Close(checkpointId) {
-						done = true
-					}
-				}()
+				// IdleCondition atomically rejects retirement while Pack is open.
+				// Waiting for packMutex here would strand Required application
+				// admission and exclude the controls needed to finish its handshake.
+				done := self.idleCondition.Close(checkpointId)
+				if self.sendBufferSettings.afterIdleCloseForTest != nil {
+					self.sendBufferSettings.afterIdleCloseForTest(self.id(), done)
+				}
 				if done {
 					if self.log.V(1).Enabled() {
 						self.log.Infof("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
@@ -12676,6 +12680,8 @@ type ReceiveBufferSettings struct {
 	beforeAckWorkerStopForTest         func(receiveSequenceId)
 	afterAckWriterOpenForTest          func(receiveSequenceId, MultiRouteWriter)
 	afterAckWritesCanceledForTest      func(receiveSequenceId)
+	// Nil observer exposes an idle check while producer admission is held.
+	afterIdleCloseForTest func(receiveSequenceId, bool)
 }
 
 func (self *ReceiveBufferSettings) packHandoffTimeout(
@@ -14524,16 +14530,12 @@ func (self *ReceiveSequence) Run() {
 			}
 		case <-idleTimer.C:
 			if 0 == self.receiveQueue.Len() {
-				done := false
-				func() {
-					self.packMutex.Lock()
-					defer self.packMutex.Unlock()
-					// idle timeout
-					if self.idleCondition.Close(checkpointId) {
-						done = true
-					}
-					// else there are pending updates
-				}()
+				// An open Pack can be waiting for this worker to receive; its idle
+				// reservation, not its producer mutex, serializes retirement.
+				done := self.idleCondition.Close(checkpointId)
+				if self.receiveBufferSettings.afterIdleCloseForTest != nil {
+					self.receiveBufferSettings.afterIdleCloseForTest(self.id(), done)
+				}
 				if done {
 					// close the sequence
 					if self.log.V(1).Enabled() {
@@ -15905,6 +15907,8 @@ type ForwardBufferSettings struct {
 	beforeRunForwardSequenceForTest    func(TransferPath)
 	beforeCloseWaitForTest             func(TransferPath)
 	afterRunForwardSequenceForTest     func(TransferPath)
+	// Nil observer exposes an idle check while producer admission is held.
+	afterIdleCloseForTest func(TransferPath, bool)
 }
 
 type ForwardBuffer struct {
@@ -16272,16 +16276,12 @@ func (self *ForwardSequence) Run() {
 				return
 			}
 		case <-idleTimer.C:
-			done := false
-			func() {
-				self.packMutex.Lock()
-				defer self.packMutex.Unlock()
-				// idle timeout
-				if self.idleCondition.Close(checkpointId) {
-					done = true
-				}
-				// else there are pending updates
-			}()
+			// An open Pack can be waiting for this worker to receive; its idle
+			// reservation, not its producer mutex, serializes retirement.
+			done := self.idleCondition.Close(checkpointId)
+			if self.forwardBufferSettings.afterIdleCloseForTest != nil {
+				self.forwardBufferSettings.afterIdleCloseForTest(self.destination, done)
+			}
 			if done {
 				// close the sequence
 				if self.log.V(1).Enabled() {
