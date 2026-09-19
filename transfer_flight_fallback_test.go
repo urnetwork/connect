@@ -317,8 +317,8 @@ func TestSelectiveAckGapSkipsReliableItemsNotYetLateInMixedLanes(t *testing.T) {
 // since-last-deferral term as settings, and the backoff of §24. The
 // behaviour main asserted is preserved here: a timed-out reliable-carried
 // item waits while cumulative acknowledgements are still advancing, is
-// re-sent at once when they have stalled, and is never deferred when it
-// rode the unreliable lane.
+// re-sent at once when they have stalled, and does not apply this reliable
+// backoff policy to an unreliable lane's cumulative-silence timer.
 func TestSendSequenceDefersTimeoutResendWhileAcksProgress(t *testing.T) {
 	settings := DefaultSendBufferSettings()
 	sequence := testUnreliableRecoverySequence(settings)

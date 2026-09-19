@@ -102,6 +102,14 @@ func (self *sequenceAckWindow) Pending() bool {
 		0 < len(self.contractMissingAcks)
 }
 
+// Only an advancing cumulative head restarts the sender's silence clock.
+// Duplicate heads and selective feedback cannot indefinitely defer a hole.
+func (self *sequenceAckWindow) PendingCumulativeProgress() bool {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+	return 0 < self.ackUpdateCount
+}
+
 // PendingDispositionFor reports whether the not-yet-snapshotted window can
 // retire or materially rewrite one exact due item. Unrelated ACK progress must
 // not postpone its recovery: on a busy sequence, duplicate/newer selective

@@ -1730,8 +1730,8 @@ type ClientSendRecoveryStatsSnapshot struct {
 	InitialMessageByteCount      uint64
 	TimeoutResendWriteCount      uint64
 	AckPendingResendPreemptCount uint64
-	// RTO resends of reliable-carried items deferred by one scaled RTT
-	// because the cumulative ack was still advancing (FLIGHTGATEFIX §13.5).
+	// Ordinary timeout firings rearmed while cumulative delivery advances:
+	// reliable-lane deferrals and the unreliable flight's silence clock.
 	TimeoutResendDeferCount uint64
 	CarrierChangeWriteCount uint64
 	// selective acknowledgements voided because the route that earned them was
@@ -2918,8 +2918,9 @@ func (self *SendSequence) shouldDeferTimeoutResend(
 ) bool {
 	// A paced H1-only path can spend many timeout intervals draining its
 	// initial window. Each deferral still requires new cumulative progress;
-	// a lost head stops that progress and gets its ordinary timeout. The
-	// mixed/unreliable paths retain their existing bounded deferral policy.
+	// a lost head stops that progress and gets its ordinary timeout.
+	// Mixed reliable lanes retain their bounded deferral policy. Unreliable
+	// flights use the cumulative-silence deadline in the send loop instead.
 	pacedFifo := self.sendBufferSettings.DeliverySizedWindowScale > 0 &&
 		item.reliableCarrierObserved && !item.carrierChanged &&
 		self.transferFlightPolicy().h1Only
@@ -8368,9 +8369,24 @@ sendSequenceLoop:
 				// recovery write; otherwise a busy sender can emit one spurious
 				// retransmit for every snapshot/arrival race. The lock is paid only
 				// on the due-recovery path, never for an ordinary initial write.
-				if ackWindow.PendingDispositionFor(item.sequenceNumber, item.messageId) {
+				unreliableTimeout := item.recoveryKind == sendRecoveryNone && item.unreliableFlightTracked
+				if ackWindow.PendingDispositionFor(item.sequenceNumber, item.messageId) ||
+					unreliableTimeout && ackWindow.PendingCumulativeProgress() {
 					self.client.ackPendingResendPreemptCount.Add(1)
 					continue sendSequenceLoop
+				}
+				if unreliableTimeout && !self.lastCumulativeAckTime.IsZero() {
+					// A draining prefix is not silence: restart the ordinary
+					// datagram timer on cumulative progress. Per-item age alone
+					// retransmits and contracts an entire healthy delayed flight.
+					// Selective gaps still recover immediately, and the existing
+					// interval bounds a tail once cumulative progress stops.
+					deadline := self.lastCumulativeAckTime.Add(self.resendIntervalForItem(item, item.sendCount))
+					if sendTime.Before(deadline) {
+						self.setResendTime(item, deadline)
+						self.client.timeoutResendDeferCount.Add(1)
+						continue
+					}
 				}
 				laneVerdict := laneTimerNotApplicable
 				if item.recoveryKind == sendRecoveryNone {
