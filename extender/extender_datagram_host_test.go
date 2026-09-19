@@ -2,9 +2,9 @@ package extender
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -60,12 +60,18 @@ func newHostCaptureExtender(
 		t.Fatalf("listen: %v", err)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
-		t.Fatalf("release probe listener: %v", err)
-	}
+	t.Cleanup(func() { listener.Close() })
 
 	capture := &hostCapture{}
 	settings := DefaultExtenderSettings()
+	// Transfer the live loopback listener; releasing a probe port before a
+	// wildcard rebind lets an unrelated socket take the carrier's address.
+	settings.Listen = func(network string, address string) (net.Listener, error) {
+		if network != "tcp" || address != fmt.Sprintf(":%d", port) {
+			return nil, fmt.Errorf("unexpected extender listen %s %s", network, address)
+		}
+		return listener, nil
+	}
 	// Stand in for the extender's own resolver and egress. Recording the
 	// address it was handed is the whole assertion: a client that resolved
 	// first would show an ip here.
@@ -85,13 +91,24 @@ func newHostCaptureExtender(
 		&net.Dialer{},
 		settings,
 	)
-	go func() {
-		_ = server.ListenAndServe()
-	}()
-	t.Cleanup(func() { server.Close() })
-	// ListenAndServe binds asynchronously, so dialing straight after it is a
-	// race the client loses by connection-refused. Wait for the carrier.
-	waitForExtenderCarrier(t, port)
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.ListenAndServe() }()
+	t.Cleanup(func() {
+		server.CloseAndWait()
+		if err := <-serveDone; err != nil {
+			t.Errorf("extender serve: %v", err)
+		}
+	})
+	select {
+	case <-server.Listening():
+	case <-ctx.Done():
+		t.Fatalf("extender startup: %v", ctx.Err())
+	case <-time.After(10 * time.Second):
+		t.Fatal("extender did not finish binding")
+	}
+	if carriers := server.Carriers(); len(carriers) != 1 || carriers[0] != connect.ExtenderCarrierTcp {
+		t.Fatalf("extender served carriers = %v, errors=%v", carriers, server.ListenErrors())
+	}
 
 	return &connect.ExtenderConfig{
 		Profile: connect.ExtenderProfile{
@@ -174,21 +191,4 @@ func TestExtenderWhitelistRefusesAResolvedAddress(t *testing.T) {
 			t.Errorf("%q is an address, not an operator name, and must be refused", refused)
 		}
 	}
-}
-
-// waitForExtenderCarrier blocks until the tcp carrier accepts, so a test dial
-// cannot arrive before the bind.
-func waitForExtenderCarrier(t *testing.T, port int) {
-	t.Helper()
-	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp4", address, time.Second)
-		if err == nil {
-			conn.Close()
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("extender carrier on %s never accepted", address)
 }
