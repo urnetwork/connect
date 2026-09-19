@@ -9,7 +9,9 @@ package connect
 // H3, H3-over-DNS, and H3-over-DNS-pump share one H3 reservation. When H1 is
 // also configured, H1's reservation has precedence and every H3-family mode is
 // eligible only if the budget can hold H1 and that shared H3 reservation
-// together. With no H1 in the Auto policy, H3 can use the budget by itself.
+// together, including translation capacity when a DNS mode is configured.
+// With no H1 in the Auto policy, H3 can use the budget by itself. This settings-
+// only view cannot include an outer extender chosen by a caller's strategy.
 func PlatformTransportAutoEligibility(
 	settings *PlatformTransportSettings,
 ) map[TransportMode]bool {
@@ -45,7 +47,12 @@ func PlatformTransportAutoEligibility(
 		eligible[TransportModeH1] = true
 	}
 
-	h3GroupByteCount := h3ByteCount
+	transport := &PlatformTransport{
+		settings:        settings,
+		targetMode:      TransportModeAuto,
+		modePreferences: preferences,
+	}
+	h3GroupByteCount := h3ByteCount + transport.h3NestedMemoryByteCount()
 	if h1Configured {
 		// run waits for H1 admission before it starts the H3 mode group, so an
 		// H1 claim that cannot fit prevents every Auto runner from starting.

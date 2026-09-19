@@ -12,8 +12,9 @@ import (
 // connection receive credit cannot auto-grow beyond its initial 256 KiB.
 // The extra 1408-KiB lease covers that credit + 512 KiB TLS/QUIC/control/tracker
 // state + two 64-KiB sockets + 352 KiB for negotiated DATAGRAM receive queues,
-// with 160 KiB slack. DNS translation and an outer
-// extender acquire their own additive leases before allocating those graphs.
+// with 160 KiB slack. Unsized carriers retain their larger base working set.
+// Include any prepaid nested graph in the same speculative claim so a port
+// fallback cannot open QUIC and then lose admission for its DNS translation.
 //
 // Preserve Happy Eyeballs when the extra lease fits. When it does not, retain
 // the candidate and start it after the preceding owner has completely closed;
@@ -22,6 +23,8 @@ func raceH3DialWithMemory(
 	ctx context.Context,
 	candidates []*net.UDPAddr,
 	budget *PlatformTransportBudget,
+	extraByteCount ByteCount,
+	nestedByteCount ByteCount,
 	dial func(context.Context, *net.UDPAddr) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
 	if len(candidates) == 0 {
@@ -37,14 +40,18 @@ func raceH3DialWithMemory(
 	launched, pending := 0, 0
 	launch := func() bool {
 		var claim *platformTransportBudgetReservation
+		dialCtx := ctx
 		if pending != 0 {
 			var err error
-			claim, err = (extenderQuicMemoryPolicy{budget: budget, byteCount: platformH3DialTransientByteCount}).acquire(ctx)
+			claim, err = (extenderQuicMemoryPolicy{budget: budget, byteCount: extraByteCount + nestedByteCount}).acquire(ctx)
 			if err != nil {
 				return false
 			}
+			if 0 < nestedByteCount {
+				dialCtx = context.WithValue(dialCtx, platformTransportNestedBudgetContextKey{}, NewPlatformTransportBudget(nestedByteCount, 0))
+			}
 		}
-		attemptCtx, cancel := context.WithCancel(ctx)
+		attemptCtx, cancel := context.WithCancel(dialCtx)
 		cancels = append(cancels, cancel)
 		address := candidates[launched]
 		launched++

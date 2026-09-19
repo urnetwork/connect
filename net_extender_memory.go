@@ -36,6 +36,9 @@ func acquireExtenderTcpMemory(ctx context.Context) (*platformTransportBudgetRese
 	if budget == nil {
 		budget = DefaultPlatformTransportBudget()
 	}
+	if nested, _ := ctx.Value(platformTransportNestedBudgetContextKey{}).(*PlatformTransportBudget); nested != nil {
+		budget = nested
+	}
 	byteCount := transport.h1BudgetByteCount()
 	if !owned {
 		// A standalone HTTPS API call also owns the inner TLS graph. Device
@@ -122,6 +125,9 @@ func newExtenderQuicMemoryPolicy(ctx context.Context, connectSettings *ConnectSe
 	budget := settings.PlatformTransportBudget
 	if budget == nil {
 		budget = DefaultPlatformTransportBudget()
+	}
+	if nested, _ := ctx.Value(platformTransportNestedBudgetContextKey{}).(*PlatformTransportBudget); nested != nil {
+		budget = nested
 	}
 	readBufferByteCount := min(transport.h3SocketReadBufferByteCount(), kib(64))
 	writeBufferByteCount := min(transport.h3SocketWriteBufferByteCount(), kib(64))

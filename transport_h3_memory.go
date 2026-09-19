@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"context"
 	"io"
 	"time"
 )
@@ -12,7 +13,7 @@ type h3StreamWriter interface {
 
 // All figures describe simultaneously retained ownership, not interchangeable
 // alternatives to the receive window. DNS translation and any outer extender
-// have separate additive claims against the same child and process root.
+// add to the carrier's atomic claim against the same child and process root.
 const (
 	platformH3SocketByteCount        ByteCount = 64 * 1024
 	platformH3DatagramQueueBytes     ByteCount = 352 * 1024
@@ -22,6 +23,39 @@ const (
 	platformH3MemoryQueueCount                 = 4
 	platformH3DialTransientByteCount ByteCount = 1408 * 1024
 )
+
+// Nested owners spend capacity already reserved with their inner carrier.
+// The local allocator enforces the subdivision; it is not another allowance
+// against the process. Its sockets are joined before the outer claim releases.
+type platformTransportNestedBudgetContextKey struct{}
+
+// Reserve one complete graph before starting its runners. Acquiring only the
+// inner QUIC claim can fill the aggregate with carriers that all still need
+// translation/outer memory, while pending explicit peers block those additions.
+// Auto serializes its H3 modes, so one largest nested graph covers every mode.
+func (self *PlatformTransport) h3NestedMemoryByteCount() ByteCount {
+	byteCount := ByteCount(0)
+	if self.targetMode == TransportModeH3Dns || self.targetMode == TransportModeH3DnsPump ||
+		(self.targetMode == TransportModeAuto &&
+			(self.modePreference(TransportModeH3Dns) != modePreferenceNone ||
+				self.modePreference(TransportModeH3DnsPump) != modePreferenceNone)) {
+		_, byteCount = boundedQuicPacketTranslationSettings()
+	}
+	if self.clientStrategy != nil && self.settings.H3PacketConnFactory == nil {
+		if extender := self.clientStrategy.H3ExtenderConfig(); extender != nil {
+			if extender.Profile.ConnectMode == ExtenderConnectModeTcpTls {
+				byteCount += self.h1BudgetByteCount()
+			} else {
+				policy := newExtenderQuicMemoryPolicy(self.dialContext(context.Background()), self.clientStrategy.ConnectSettings())
+				if extender.Profile.ConnectMode == ExtenderConnectModeDns {
+					policy.packetTranslationSettings()
+				}
+				byteCount += policy.byteCount
+			}
+		}
+	}
+	return byteCount
+}
 
 func platformH3FixedMemoryByteCount() ByteCount {
 	return 2*platformH3SocketByteCount + extenderQuicSendMemoryByteCount +

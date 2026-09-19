@@ -1441,6 +1441,9 @@ func (self *PlatformTransport) acquireH3TranslationMemory(ctx context.Context) (
 	if budget == nil {
 		budget = DefaultPlatformTransportBudget()
 	}
+	if nested, _ := ctx.Value(platformTransportNestedBudgetContextKey{}).(*PlatformTransportBudget); nested != nil {
+		budget = nested
+	}
 	return (extenderQuicMemoryPolicy{budget: budget, byteCount: byteCount}).acquire(ctx)
 }
 

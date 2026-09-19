@@ -525,6 +525,8 @@ type PlatformTransportSettings struct {
 	// remain held through reconnects so socket churn cannot escape the cap.
 	PlatformTransportBudget *PlatformTransportBudget
 	// Non-positive carrier/socket values resolve to the memory-scaled defaults.
+	// H3BudgetByteCount covers the inner carrier; admission also reserves any
+	// required DNS translation and selected outer extender as one complete graph.
 	H1BudgetByteCount                         ByteCount
 	H3BudgetByteCount                         ByteCount
 	H3SocketReadBufferByteCount               ByteCount
@@ -913,7 +915,10 @@ type PlatformTransport struct {
 	// goroutines start, so pending H1 demand is visible to every H3 admission.
 	h1BudgetReservation *platformTransportBudgetReservation
 	h3BudgetReservation *platformTransportBudgetReservation
-	h3Gate              *platformH3Gate
+	// DNS translation and a selected outer extender draw from this bounded
+	// subdivision of h3BudgetReservation, never from unreserved process space.
+	h3NestedBudget *PlatformTransportBudget
+	h3Gate         *platformH3Gate
 
 	stateLock sync.Mutex
 	// notified when availableModes changes. availableModes is a map, so it
@@ -1425,13 +1430,17 @@ func NewPlatformTransportWithTargetMode(
 			)
 		}
 		if h3Enabled {
+			nestedByteCount := transport.h3NestedMemoryByteCount()
+			if 0 < nestedByteCount {
+				transport.h3NestedBudget = NewPlatformTransportBudget(nestedByteCount, 0)
+			}
 			h3BudgetClass := platformTransportBudgetH3Explicit
 			if targetMode == TransportModeAuto {
 				h3BudgetClass = platformTransportBudgetH3Auto
 			}
 			transport.h3BudgetReservation = settings.PlatformTransportBudget.registerWithPriority(
 				h3BudgetClass,
-				transport.h3BudgetByteCount(),
+				transport.h3BudgetByteCount()+nestedByteCount,
 				!h1Enabled,
 				settings.PlatformTransportBudgetPriority,
 			)
@@ -1652,6 +1661,9 @@ func (self *PlatformTransport) startH3ModeGroup(modes []TransportMode, auto bool
 			}
 
 			groupCtx, cancelGroup := context.WithCancel(self.ctx)
+			if self.h3NestedBudget != nil {
+				groupCtx = context.WithValue(groupCtx, platformTransportNestedBudgetContextKey{}, self.h3NestedBudget)
+			}
 			var waitGroup sync.WaitGroup
 			for _, mode := range modes {
 				mode := mode
@@ -2813,12 +2825,17 @@ func (self *PlatformTransport) runH3(
 			var attempt *h3DialAttempt
 			if len(candidates) == 1 {
 				attempt, err = self.dialH3(attemptCtx, ptMode, serverName, candidates[0], wrapPacketConn, tlsConfig, quicConfig, slowMultiple, false)
-			} else if self.settings.h3RetainedByteAccounting {
+			} else if self.settings.h3RetainedByteAccounting || self.h3NestedBudget != nil {
 				budget := self.settings.PlatformTransportBudget
 				if budget == nil {
 					budget = DefaultPlatformTransportBudget()
 				}
-				attempt, err = raceH3DialWithMemory(attemptCtx, candidates, budget, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
+				extraByteCount := platformH3DialTransientByteCount
+				if !self.settings.h3RetainedByteAccounting {
+					extraByteCount = self.h3BudgetByteCount()
+				}
+				nestedByteCount := self.h3NestedBudget.Stats().TotalByteCount
+				attempt, err = raceH3DialWithMemory(attemptCtx, candidates, budget, extraByteCount, nestedByteCount, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
 					return self.dialH3(dialCtx, ptMode, serverName, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
 				})
 			} else {
