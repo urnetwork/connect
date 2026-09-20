@@ -4216,6 +4216,10 @@ func (self *Client) run() {
 
 		// Capture local ingress before decode, application handoff, and ACK compression.
 		receivedAtNanos := self.feedbackTimeNanos(time.Now())
+		progressObserver := self.settings.ReceiveBufferSettings.ProgressObserver
+		progress := beginTransferProgress(progressObserver, TransferProgressEvent{
+			Stage: "receive_wire", ClientId: self.clientId, TransportType: transportType,
+		}, transferFrameBytes)
 
 		// at this point, the route is expected to have already parsed the transfer frame
 		// and applied basic validation and source/destination checks
@@ -4443,6 +4447,15 @@ func (self *Client) run() {
 						self.recordReceiveAckHandoffDrop()
 						return false
 					}
+					ackProgress := progress
+					if progressObserver != nil {
+						ackProgress.Stage = "receive_ack_begin"
+						ackProgress.PeerId = source.SourceId
+						ackProgress.SequenceId, _ = IdFromBytes(ack.SequenceId)
+						ackProgress.MessageId = receiveAck.messageId
+						ackProgress.Selective = receiveAck.selective
+						ackProgress = beginTransferProgress(progressObserver, ackProgress, nil)
+					}
 					ackHandoffTimeout := self.settings.ReceiveBufferSettings.
 						ackHandoffTimeout(transportType)
 					result := self.sendBuffer.ackMessageDetailed(
@@ -4451,6 +4464,11 @@ func (self *Client) run() {
 						ackHandoffTimeout,
 					)
 					self.recordReceiveAckHandoff(result)
+					if progressObserver != nil {
+						ackProgress.Outcome = transferProgressAckOutcome(result)
+					}
+					endTransferProgress(progressObserver, ackProgress, "receive_ack_end",
+						result == receiveAckHandoffAccepted || result == receiveAckHandoffAcceptedAfterWait, nil)
 					return result == receiveAckHandoffAccepted ||
 						result == receiveAckHandoffAcceptedAfterWait
 				}
@@ -4578,7 +4596,18 @@ func (self *Client) run() {
 					}
 					handoffTimeout := self.settings.ReceiveBufferSettings.
 						packHandoffTimeout(transportType, carrierReliability)
+					packProgress := progress
+					if progressObserver != nil {
+						packProgress.Stage = "receive_pack_begin"
+						packProgress.PeerId = source.SourceId
+						packProgress.SequenceId = sequenceId
+						packProgress.MessageId, _ = IdFromBytes(pack.MessageId)
+						packProgress.SequenceNumber = pack.SequenceNumber
+						packProgress.NoAck = pack.Nack
+						packProgress = beginTransferProgress(progressObserver, packProgress, nil)
+					}
 					success, err := self.receiveBuffer.Pack(receivePack, handoffTimeout)
+					endTransferProgress(progressObserver, packProgress, "receive_pack_end", success && err == nil, err)
 					if !success {
 						if err == nil {
 							self.recordReceivePackHandoffDrop(messageByteCount)
@@ -5095,6 +5124,8 @@ type SendBufferSettings struct {
 	// TransferFrameBytes is the corresponding plaintext Transfer frame. The
 	// callback must not retain either slice or block; a panic is recovered.
 	TransferWireMessageObserver func(TransferWireMessageObservation)
+	// Nil by default. Metadata-only diagnostic trace; must not block.
+	ProgressObserver func(TransferProgressEvent)
 
 	// Nil test barriers are copied into SendBuffer during construction. Tests
 	// set them before NewClient starts lifecycle goroutines, which keeps the
@@ -5229,6 +5260,11 @@ type TransferWireMessageObservation struct {
 // ErrSendPackNotAdmitted completes lifecycle observation when bounded
 // admission returns false without a more specific error.
 var ErrSendPackNotAdmitted = errors.New("send Pack was not admitted")
+
+// This marker is emitted only before a queued Pack reaches serialization or
+// consumes a sequence number. ErrSendPackNotAdmitted alone is not that proof:
+// it can also describe a failed head rewrite of an already-written item.
+var errSendPackExpiredUnwritten = fmt.Errorf("queued Pack expired before serialization: %w", ErrSendPackNotAdmitted)
 
 // NoAckSendPhase makes event pairing explicit at asynchronous observers.
 type NoAckSendPhase uint8
@@ -6193,7 +6229,9 @@ type SendSequence struct {
 
 	companionContract bool
 	forceStream       bool
-	logicalLane       uint32
+	// Written only by the send owner, before terminal callbacks can cancel peers.
+	exitDiagnosticWritten bool
+	logicalLane           uint32
 	// An implicitly negotiated data lane holds one IdleCondition reference on
 	// the exact lane-zero generation that advertised support. closeSendSequence
 	// releases it exactly once after removing the data lane from public indexes.
@@ -8089,6 +8127,7 @@ func (self *SendSequence) Run() {
 	defer self.windowPacer.close()
 	ackWorkerDone := make(chan struct{})
 	ackWorkerStarted := false
+	var ackWorkerExited atomic.Bool
 	defer func() {
 		if r := recover(); r != nil {
 			self.log.Errorf("[s]%s->%s...%s s(%s) abnormal exit =  %s\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId, r)
@@ -8161,7 +8200,14 @@ func (self *SendSequence) Run() {
 	go func() {
 		defer close(ackWorkerDone)
 		HandleError(func() {
-			defer self.cancel()
+			defer func() {
+				// Publish the worker cause before its cancellation wakes Run.
+				// Ordinary parent/owner cancellation is not a worker failure.
+				if self.ctx.Err() == nil {
+					ackWorkerExited.Store(true)
+				}
+				self.cancel()
+			}()
 
 			for {
 				select {
@@ -8206,6 +8252,22 @@ func (self *SendSequence) Run() {
 		}
 	}()
 	packsClosed := false
+	defer func() {
+		// This defer runs before scheduler/retained callbacks and before the
+		// cleanup cancellation. More specific owner paths record their cause
+		// at the decision itself, including expiry during a blocked write.
+		reason := "run_return"
+		if packsClosed {
+			reason = "packs_closed"
+		}
+		if self.ctx.Err() != nil {
+			reason = "context"
+		}
+		if ackWorkerExited.Load() {
+			reason = "ack_worker_exit"
+		}
+		self.recordSendSequenceExit(reason, nil, time.Time{}, nil)
+	}()
 	drainPacks := func() {
 		for !packsClosed {
 			select {
@@ -8322,6 +8384,7 @@ sendSequenceLoop:
 				if itemAckTimeout <= 0 && !retainPastAckTimeout {
 					// message took too long to ack
 					// close the sequence
+					self.recordSendSequenceExit("ack_lifetime", item, item.sendTime.Add(item.ackTimeout), context.DeadlineExceeded)
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[s]%s->%s...%s s(%s) exit ack timeout (%s) seq=%d sends=%d head=%t full_contract=%t compact_contract=%t promoted=%t selective=%t recovery=%d policy_limited=%t flight_limited=%t transport_write=%t pending=%d\n",
@@ -8557,6 +8620,7 @@ sendSequenceLoop:
 					transferFrameBytes, hasContractFrame, err = self.setHead(item, false)
 					if err != nil {
 						self.log.Errorf("[s]%s->%s...%s s(%s) exit could not set head = %s\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId, err)
+						self.recordSendSequenceExit("head_rewrite", item, time.Time{}, err)
 						return
 					}
 					MessagePoolReturn(item.transferFrameBytes)
@@ -8790,9 +8854,14 @@ sendSequenceLoop:
 				if !sendPack.Ack {
 					self.client.sendNoAckDiscardCount.Add(1)
 				}
-				sendPack.completeLifecycleFirstRouteWrite(ErrSendPackNotAdmitted)
-				sendPack.completeNoAck(ErrSendPackNotAdmitted)
-				sendPack.invokeAck(ErrSendPackNotAdmitted)
+				expiryErr := ErrSendPackNotAdmitted
+				if !sendPack.logicalGroup {
+					// Only a singleton proves that no earlier chunk was sent.
+					expiryErr = errSendPackExpiredUnwritten
+				}
+				sendPack.completeLifecycleFirstRouteWrite(expiryErr)
+				sendPack.completeNoAck(expiryErr)
+				sendPack.invokeAck(expiryErr)
 				sendPack.returnFrames()
 				sendPack.releaseRaw()
 				continue
@@ -9073,6 +9142,7 @@ sendSequenceLoop:
 					self.sendBufferSettings.afterIdleCloseForTest(self.id(), done)
 				}
 				if done {
+					self.recordSendSequenceExit("idle", nil, time.Time{}, nil)
 					if self.log.V(1).Enabled() {
 						self.log.Infof("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
 					}
@@ -9096,6 +9166,7 @@ func (self *SendSequence) classifyContractCreationFailure(err error) error {
 		self.sendBuffer.beforeContractFailureClassifyForTest(self.id())
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		self.recordSendSequenceExit("contract_canceled", nil, time.Time{}, err)
 		if self.log.V(1).Enabled() {
 			self.log.Infof(
 				"[s]%s->%s...%s s(%s) exit contract creation canceled = %s\n",
@@ -9112,6 +9183,7 @@ func (self *SendSequence) classifyContractCreationFailure(err error) error {
 	if err == nil {
 		err = errors.New("No contract")
 	}
+	self.recordSendSequenceExit("contract_creation", nil, time.Time{}, err)
 	self.log.Errorf(
 		"[s]%s->%s...%s s(%s) exit could not create contract.\n",
 		self.client.ClientTag(),
@@ -12028,6 +12100,13 @@ func (self *SendSequence) observeTransferWireMessage(
 	item *sendItem,
 	resend bool,
 ) {
+	if progressObserver := self.sendBufferSettings.ProgressObserver; progressObserver != nil {
+		beginTransferProgress(progressObserver, TransferProgressEvent{
+			Stage: "send_attempt", ClientId: self.client.ClientId(), PeerId: self.destination,
+			SequenceId: self.sequenceId, MessageId: item.messageId, SequenceNumber: item.sequenceNumber,
+			NoAck: !item.expectsAck,
+		}, wireMessageBytes)
+	}
 	observer := self.sendBufferSettings.TransferWireMessageObserver
 	if observer == nil {
 		return
@@ -12545,8 +12624,10 @@ const (
 )
 
 type ReceiveBufferSettings struct {
-	GapTimeout  time.Duration
-	IdleTimeout time.Duration
+	// Nil by default. Metadata-only diagnostic trace; must not block.
+	ProgressObserver func(TransferProgressEvent)
+	GapTimeout       time.Duration
+	IdleTimeout      time.Duration
 
 	SequenceBufferSize int
 	// H1SequenceBufferSize optionally gives reliable H1 arrivals more burst
@@ -12656,6 +12737,12 @@ type ReceiveBufferSettings struct {
 	// cell has yet run, and the shipping window is under the hold by an
 	// accident of ordering rather than by design.
 	AdvertiseReceiveWindow bool
+	// SuppressAckTimingAdvertisement omits ACK compression and
+	// receiver-residence fields. Its zero value preserves the historical and
+	// shipping behavior: advertise timing. True is wire-compatible with a
+	// provider predating paced-transfer feedback; local compression remains
+	// unchanged.
+	SuppressAckTimingAdvertisement bool
 	// AcceptContractAhead advertises on every acknowledgement that this
 	// receiver registers a successor contract announced ahead of its data
 	// (THROUGHPUTFIX §39.1). On by default, because the receive side of the
@@ -14033,11 +14120,12 @@ func (self *ReceiveSequence) Run() {
 			)
 		}
 
-		writeAck := func(sendAck sequenceAck, evictedSequenceNumbers []uint64) {
+		writeAck := func(sendAck sequenceAck, evictedSequenceNumbers []uint64) error {
 			path := sendTransferPath(self.client.ClientId(), ackDestination)
 			ackCompressMicros := uint32(min(max(0, self.receiveBufferSettings.AckCompressTimeout.Microseconds()), math.MaxUint32))
+			advertiseAckTiming := !self.receiveBufferSettings.SuppressAckTimingAdvertisement
 			receiverDelayMicros, receiverDelaySet := self.client.receiverAckDelayMicros(sendAck.receivedAtNanos, time.Now())
-			receiverDelaySet = receiverDelaySet && sendAck.tag.set && !sendAck.contractMissing
+			receiverDelaySet = advertiseAckTiming && receiverDelaySet && sendAck.tag.set && !sendAck.contractMissing
 
 			// what this receiver can still hold out of order, so the sender may
 			// clamp its window to it (THROUGHPUTFIX §37.3). A receiver that
@@ -14066,7 +14154,7 @@ func (self *ReceiveSequence) Run() {
 					receiveWindowByteCount:   receiveWindowByteCount,
 					receiveWindowSet:         advertiseReceiveWindow,
 					ackCompressTimeoutMicros: ackCompressMicros,
-					ackCompressTimeoutSet:    true,
+					ackCompressTimeoutSet:    advertiseAckTiming,
 					receiverAckDelayMicros:   receiverDelayMicros,
 					receiverAckDelaySet:      receiverDelaySet,
 					evictedSequenceNumbers:   evictedSequenceNumbers,
@@ -14077,14 +14165,16 @@ func (self *ReceiveSequence) Run() {
 				transferFrameBytes = marshalSendAckTransferFrame(&saf)
 			} else {
 				ack := &protocol.Ack{
-					MessageId:                sendAck.messageId.Bytes(),
-					SequenceId:               self.sequenceId.Bytes(),
-					Selective:                sendAck.selective,
-					Tag:                      sendAck.tag.protocol(),
-					CompactContractRecovery:  sendAck.compactContractRecoverySupported,
-					ContractAhead:            self.receiveBufferSettings.AcceptContractAhead,
-					LogicalLaneVersion:       transferLogicalLaneVersion,
-					AckCompressTimeoutMicros: &ackCompressMicros,
+					MessageId:               sendAck.messageId.Bytes(),
+					SequenceId:              self.sequenceId.Bytes(),
+					Selective:               sendAck.selective,
+					Tag:                     sendAck.tag.protocol(),
+					CompactContractRecovery: sendAck.compactContractRecoverySupported,
+					ContractAhead:           self.receiveBufferSettings.AcceptContractAhead,
+					LogicalLaneVersion:      transferLogicalLaneVersion,
+				}
+				if advertiseAckTiming {
+					ack.AckCompressTimeoutMicros = &ackCompressMicros
 				}
 				if receiverDelaySet {
 					ack.ReceiverAckDelayMicros = &receiverDelayMicros
@@ -14113,6 +14203,12 @@ func (self *ReceiveSequence) Run() {
 					self.cancel()
 					return fmt.Errorf("acknowledgement exceeds reserved response size: %d", len(frameBytes))
 				}
+				progressObserver := self.receiveBufferSettings.ProgressObserver
+				progress := beginTransferProgress(progressObserver, TransferProgressEvent{
+					Stage: "ack_write_begin", ClientId: self.client.ClientId(), PeerId: self.source.SourceId,
+					SequenceId: self.sequenceId, MessageId: sendAck.messageId, SequenceNumber: sendAck.sequenceNumber,
+					Selective: sendAck.selective, TransportType: sendAck.transportType,
+				}, frameBytes)
 				shared := MessagePoolShareReadOnly(frameBytes)
 				var writeErr error
 				blocked := false
@@ -14167,6 +14263,8 @@ func (self *ReceiveSequence) Run() {
 					priority,
 					writeErr,
 				)
+				progress.TransportType = writtenTransportType
+				endTransferProgress(progressObserver, progress, "ack_write_end", writeErr == nil, writeErr)
 				if writeErr != nil {
 					// A failed write leaves ownership here: undo the consumer's share.
 					MessagePoolReturn(shared)
@@ -14200,8 +14298,9 @@ func (self *ReceiveSequence) Run() {
 				defer MessagePoolReturn(wrapped)
 				return writeFrame(wrapped)
 			}
+			var writeErr error
 			if self.log.V(2).Enabled() {
-				TraceWithReturn(
+				writeErr = TraceWithReturn(
 					fmt.Sprintf(
 						"[r]multi route write (ack %d) %s->%s s(%s)",
 						sendAck.sequenceNumber,
@@ -14212,19 +14311,20 @@ func (self *ReceiveSequence) Run() {
 					c,
 				)
 			} else {
-				err := c()
-				if err != nil {
+				writeErr = c()
+				if writeErr != nil {
 					if ok, suppressed := shouldLogDropErr(); ok {
 						if suppressed > 0 {
-							self.log.Infof("[r]drop = %s (%d suppressed)", err, suppressed)
+							self.log.Infof("[r]drop = %s (%d suppressed)", writeErr, suppressed)
 						} else {
-							self.log.Infof("[r]drop = %s", err)
+							self.log.Infof("[r]drop = %s", writeErr)
 						}
 					} else if v := self.log.V(1); v.Enabled() {
-						v.Infof("[r]drop = %s", err)
+						v.Infof("[r]drop = %s", writeErr)
 					}
 				}
 			}
+			return writeErr
 		}
 
 		// reusable ack-compress timer (avoids a per-iteration time.After alloc on
@@ -14239,6 +14339,25 @@ func (self *ReceiveSequence) Run() {
 		var lastHeadAck sequenceAck
 		hasLastHeadAck := false
 		continueResponse := false
+		stopping := false
+		retryNotBefore := time.Time{}
+		restoreUnwrittenResponse := func(acks []sequenceAck, evicted []uint64, err error) bool {
+			if !errors.Is(err, errTransferRouteWriteTimeout) || stopping ||
+				self.ctx.Err() != nil || ackWriteCtx.Err() != nil {
+				return false
+			}
+			// No carrier owns a timed-out local write. Return only unsent
+			// feedback to the existing bounded compressor; newer cumulative
+			// progress absorbs it without replaying stale heads or payload.
+			self.ackWindow.Restore(acks)
+			for _, sequenceNumber := range evicted {
+				self.noteEviction(sequenceNumber)
+			}
+			// A configured zero-wait writer must not spin on a full route.
+			// Reuse the worker's timer; there is no new queue or payload owner.
+			retryNotBefore = time.Now().Add(max(time.Millisecond, self.receiveBufferSettings.AckCompressTimeout))
+			return true
+		}
 		writePending := func() bool {
 			var evicted []uint64
 			if self.receiveBufferSettings.EvictionNotice && (hasLastAck || self.ackWindow.Pending()) {
@@ -14264,11 +14383,18 @@ func (self *ReceiveSequence) Run() {
 				}
 			}
 			for i, ack := range acks {
+				var writeErr error
 				if i == 0 {
-					writeAck(ack, evicted)
+					writeErr = writeAck(ack, evicted)
 				} else {
-					writeAck(ack, nil)
+					writeErr = writeAck(ack, nil)
 				}
+				if writeErr != nil && restoreUnwrittenResponse(acks[i:], evicted, writeErr) {
+					continueResponse = false
+					lastAckWriteTime = time.Now()
+					return true
+				}
+				evicted = nil
 				lastAck, hasLastAck = ack, true
 				if !ack.selective && !ack.contractMissing {
 					lastHeadAck, hasLastHeadAck = ack, true
@@ -14292,6 +14418,7 @@ func (self *ReceiveSequence) Run() {
 			return hasLastAck && self.receiveBufferSettings.EvictionNotice && len(self.evictedSequenceNumbers) != 0
 		}
 		drainAndStop := func() {
+			stopping = true
 			for writePending() {
 			}
 		}
@@ -14313,6 +14440,22 @@ func (self *ReceiveSequence) Run() {
 				drainAndStop()
 				return
 			default:
+			}
+
+			if !retryNotBefore.IsZero() {
+				if wait := time.Until(retryNotBefore); wait > 0 {
+					ackCompressTimer.Reset(wait)
+					select {
+					case <-ctxDone:
+						drainCanceledSequence()
+					case <-ackWorkerStop:
+						drainAndStop()
+						return
+					case <-ackCompressTimer.C:
+					}
+					continue
+				}
+				retryNotBefore = time.Time{}
 			}
 
 			if !pending() {
@@ -14355,7 +14498,10 @@ func (self *ReceiveSequence) Run() {
 					}
 					ack, ready, quietDeadline := self.ackWindow.takeQuietHead(now, quiet)
 					if ready {
-						writeAck(ack, nil)
+						writeErr := writeAck(ack, nil)
+						if writeErr != nil {
+							restoreUnwrittenResponse([]sequenceAck{ack}, nil, writeErr)
+						}
 						lastAck, hasLastAck = ack, true
 						lastHeadAck, hasLastHeadAck = ack, true
 						if self.receiveBufferSettings.afterAckWriteForTest != nil {
@@ -15183,6 +15329,16 @@ func (self *ReceiveSequence) flushDeliver() {
 	items := slices.Clone(self.deliverItems)
 	frames := slices.Clone(self.deliverFrames)
 	peer := self.deliverPeer
+	progressObserver := self.receiveBufferSettings.ProgressObserver
+	var progress TransferProgressEvent
+	if progressObserver != nil {
+		first := items[0]
+		progress = beginTransferProgress(progressObserver, TransferProgressEvent{
+			Stage: "deliver_begin", ClientId: self.client.ClientId(), PeerId: self.source.SourceId,
+			SequenceId: self.sequenceId, MessageId: first.messageId, SequenceNumber: first.sequenceNumber,
+			NoAck: !first.ack, TransportType: first.transportType, ByteCount: int(MessageByteCount(frames)),
+		}, nil)
+	}
 	clear(self.deliverItems)
 	self.deliverItems = self.deliverItems[:0]
 	clear(self.deliverFrames)
@@ -15203,6 +15359,7 @@ func (self *ReceiveSequence) flushDeliver() {
 			peer,
 		)
 	}
+	endTransferProgress(progressObserver, progress, "deliver_end", true, nil)
 	for _, item := range items {
 		if item.ack {
 			self.ackWindow.UpdateDelivered(sequenceAck{

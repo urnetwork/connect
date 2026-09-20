@@ -17,7 +17,7 @@ func TestReceiverAckTimingIncludesQueueAndDeliveryWait(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, version := range []int{1, 2} {
 		synctest.Test(t, func(t *testing.T) {
-			ack := receiveTimedPackTest(t, version, 20*time.Millisecond, 5*time.Millisecond)
+			ack := receiveTimedPackTest(t, version, true, 20*time.Millisecond, 5*time.Millisecond)
 			if ack.ReceiverAckDelayMicros == nil || *ack.ReceiverAckDelayMicros != 25000 {
 				t.Fatalf("version %d: receiver delay = %v, want exact ingress-to-encoding 25000 microseconds", version, ack.ReceiverAckDelayMicros)
 			}
@@ -31,9 +31,23 @@ func TestReceiverAckTimingPreservesExactZeroDelay(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, version := range []int{1, 2} {
 		synctest.Test(t, func(t *testing.T) {
-			ack := receiveTimedPackTest(t, version, 0, 0)
+			ack := receiveTimedPackTest(t, version, true, 0, 0)
 			if ack.ReceiverAckDelayMicros == nil || *ack.ReceiverAckDelayMicros != 0 {
 				t.Fatalf("version %d: zero-delay ACK did not retain explicit timing presence", version)
+			}
+		})
+	}
+}
+
+// An older receiver did not send either pacing-feedback field. This is
+// distinct from a measured zero, whose explicit presence is covered above.
+func TestReceiverAckTimingLegacyCompatibilityOmitsFeedback(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, version := range []int{1, 2} {
+		synctest.Test(t, func(t *testing.T) {
+			ack := receiveTimedPackTest(t, version, false, 0, 0)
+			if ack.ReceiverAckDelayMicros != nil || ack.AckCompressTimeoutMicros != nil {
+				t.Fatalf("version %d: legacy ACK published pacing feedback: %+v", version, ack)
 			}
 		})
 	}
@@ -42,7 +56,7 @@ func TestReceiverAckTimingPreservesExactZeroDelay(t *testing.T) {
 // A synthetic peer offers one ordinary tagged Pack to the real Client route.
 // No timestamp helper or added state is referenced, so the same proof runs
 // against the codec-only implementation before receiver timing is integrated.
-func receiveTimedPackTest(t *testing.T, version int, queueWait, deliveryWait time.Duration) *protocol.Ack {
+func receiveTimedPackTest(t *testing.T, version int, advertiseTiming bool, queueWait, deliveryWait time.Duration) *protocol.Ack {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	settings := DefaultClientSettings()
@@ -50,6 +64,7 @@ func receiveTimedPackTest(t *testing.T, version int, queueWait, deliveryWait tim
 	settings.EncryptionSettings.Mode = EncryptionModeOff
 	settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 	settings.ReceiveBufferSettings.ProtocolVersion = version
+	settings.ReceiveBufferSettings.SuppressAckTimingAdvertisement = !advertiseTiming
 	settings.ReceiveBufferSettings.AckCompressTimeout = 0
 	settings.ReceiveBufferSettings.IdleTimeout = time.Hour
 	queued := make(chan struct{})

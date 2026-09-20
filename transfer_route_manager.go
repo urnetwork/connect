@@ -2951,6 +2951,12 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicy(
 		}
 	}
 	initialSnapshot.releaseWriter()
+	// An immediate NoAck caller shares this selector with reliable writes.
+	// Refuse before their timer lock so a congested destination cannot park
+	// a shared provider UDP worker behind a blocking reliable write.
+	if timeout == 0 {
+		return false, transferWriteDisposition{}, nil
+	}
 
 	self.writeMutex.Lock()
 	defer self.writeMutex.Unlock()

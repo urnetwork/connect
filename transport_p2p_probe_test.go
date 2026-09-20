@@ -233,16 +233,17 @@ func newStoppedP2pStreamProbe(
 		timeout = 2 * interval
 	}
 	return &p2pStreamProbe{
-		ctx:          probeCtx,
-		cancel:       cancel,
-		routeManager: routeManager,
-		streamId:     streamId,
-		interval:     interval,
-		timeout:      timeout,
-		observer:     settings.EndToEndProbeObserver,
-		routeUpdate:  NewMonitor(),
-		responses:    make(chan Id, 1),
-		done:         make(chan struct{}),
+		ctx:              probeCtx,
+		cancel:           cancel,
+		routeManager:     routeManager,
+		streamId:         streamId,
+		interval:         interval,
+		timeout:          timeout,
+		observer:         settings.EndToEndProbeObserver,
+		progressObserver: settings.ProgressObserver,
+		routeUpdate:      NewMonitor(),
+		responses:        make(chan Id, 1),
+		done:             make(chan struct{}),
 	}
 }
 

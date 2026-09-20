@@ -157,11 +157,12 @@ type p2pStreamProbe struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	routeManager *RouteManager
-	streamId     Id
-	interval     time.Duration
-	timeout      time.Duration
-	observer     func(P2pStreamProbeEvent)
+	routeManager     *RouteManager
+	streamId         Id
+	interval         time.Duration
+	timeout          time.Duration
+	observer         func(P2pStreamProbeEvent)
+	progressObserver func(TransferProgressEvent)
 
 	// routeLifecycleLock serializes detach/join/remove/install transitions.
 	// Direct producers never acquire it, and stateLock is released before joins
@@ -213,16 +214,17 @@ func newP2pStreamProbe(
 		timeout = 2 * interval
 	}
 	probe := &p2pStreamProbe{
-		ctx:          probeCtx,
-		cancel:       cancel,
-		routeManager: routeManager,
-		streamId:     streamId,
-		interval:     interval,
-		timeout:      timeout,
-		observer:     settings.EndToEndProbeObserver,
-		routeUpdate:  NewMonitor(),
-		responses:    make(chan Id, 1),
-		done:         make(chan struct{}),
+		ctx:              probeCtx,
+		cancel:           cancel,
+		routeManager:     routeManager,
+		streamId:         streamId,
+		interval:         interval,
+		timeout:          timeout,
+		observer:         settings.EndToEndProbeObserver,
+		progressObserver: settings.ProgressObserver,
+		routeUpdate:      NewMonitor(),
+		responses:        make(chan Id, 1),
+		done:             make(chan struct{}),
 	}
 	go HandleError(probe.run, cancel)
 	return probe
@@ -396,12 +398,25 @@ func (self *p2pStreamProbe) sendProbeMessage(
 		return false
 	}
 
+	sendRoute := generation.route
+	if p2pSendTransport != nil && generation.route == p2pSendTransport.send && len(message) == p2pStreamProbeByteCount {
+		switch messageType {
+		case p2pStreamProbeRequestType:
+			if p2pSendTransport.probeRequests != nil {
+				sendRoute = p2pSendTransport.probeRequests
+			}
+		case p2pStreamProbeResponseType:
+			if p2pSendTransport.probeResponses != nil {
+				sendRoute = p2pSendTransport.probeResponses
+			}
+		}
+	}
 	select {
 	case <-self.ctx.Done():
 		MessagePoolReturn(message)
 		self.observe(droppedEvent, nonce, generation.epoch)
 		return false
-	case generation.route <- message:
+	case sendRoute <- message:
 		self.observe(queuedEvent, nonce, generation.epoch)
 		return true
 	default:
@@ -452,6 +467,12 @@ func (self *p2pStreamProbe) handle(message []byte) bool {
 
 // Emits one optional diagnostic without allocating when observation is off.
 func (self *p2pStreamProbe) observe(eventType string, nonce Id, routeEpoch uint64) {
+	if self.progressObserver != nil {
+		beginTransferProgress(self.progressObserver, TransferProgressEvent{
+			Stage: "p2p_probe_" + eventType, SequenceId: self.streamId,
+			MessageId: nonce, SequenceNumber: routeEpoch,
+		}, nil)
+	}
 	if self.observer != nil {
 		defaultP2pStreamProbeObserverDispatcher.dispatch(self.observer, P2pStreamProbeEvent{
 			Type:       eventType,

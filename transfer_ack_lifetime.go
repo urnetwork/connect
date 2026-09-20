@@ -149,6 +149,9 @@ func (self *SendSequence) nextAckLifetime(now time.Time) (time.Time, error) {
 				}
 			}
 		}
+		// Record the due identity here, including when a paced/route write
+		// will cancel this sequence before Run gets control back.
+		self.recordSendSequenceExit("ack_lifetime", item, deadline, context.DeadlineExceeded)
 		return deadline, context.DeadlineExceeded
 	}
 	return time.Time{}, nil

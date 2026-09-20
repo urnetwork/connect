@@ -49,14 +49,17 @@ LOWBAR physical validation uses exactly these two devices:
 | `device-a` | `3B161FDJG001KT` | Pixel 8 Pro |
 | `device-b` | `R5CX21FY6ND` | Galaxy S24 Ultra |
 
-Preflight must find both serials in `adb devices -l` with state `device` and no
-other serial. Drivers receive the serial explicitly; missing, unauthorized, or
-offline devices invalidate the physical block rather than being substituted.
-Public notes use the opaque roles, while the private run manifest keeps serials
-for identity and reproducibility.
+Preflight must find both allowlisted serials in `adb devices -l` with state
+`device`. Ignore all other entries, including unauthorized or offline devices;
+they are outside this performance cohort and cannot be substituted. Drivers
+receive an allowlisted serial explicitly; a missing, unauthorized, or offline
+allowlisted device invalidates the physical block. Public notes use the opaque
+roles, while the private run manifest keeps serials for identity and
+reproducibility.
 
-Verified 2026-09-04 with `adb devices -l`: exactly these two serials were
-attached and online; no third device was admitted to the performance cohort.
+Verified 2026-09-04 with `adb devices -l`: both allowlisted serials were online.
+The earlier exact-fleet requirement was superseded on 2026-09-19; additional
+ADB devices are ignored and are never admitted to the performance cohort.
 
 ## Decisions
 

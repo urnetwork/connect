@@ -14996,11 +14996,12 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 
 // Records the terminal disposition of one packet admitted to Transfer.
 //
-// For an Ack-required packet, a terminal error means the reliable Transfer
-// sequence failed and remains hard evidence against the provider. For a NoAck
+// A confirmed pre-serialization expiry has no peer or sequence failure: the
+// enclosing IP transport can retry, and only this packet's accounting retires.
+// Other Ack-required errors remain hard evidence against the provider. For a NoAck
 // packet, the callback is only the initial route-write disposition: a timeout
-// means this datagram was dropped under transient carrier backpressure, not
-// that the provider failed. Poisoning endErr in that case removes the whole
+// or queue-admission expiry drops this datagram under local backpressure and
+// does not show that the provider failed. Poisoning endErr removes the whole
 // provider channel and resets unrelated TCP flows that share it. A successful
 // NoAck write retires its outstanding accounting but cannot contribute RTT:
 // no peer acknowledgement completed a round trip.
@@ -15017,11 +15018,65 @@ func (self *multiClientChannel) observePacketTransferCompletion(
 		}
 		return
 	}
-	if ack || !errors.Is(err, errTransferRouteWriteTimeout) {
+	if packetTransferExpiredUnwritten(err) {
+		self.addSendAbandoned(packetByteCount)
+		return
+	}
+	if ack || !packetLocalTransferFailure(err) {
 		self.addError(err)
 		return
 	}
 	self.addSendAbandoned(packetByteCount)
+}
+
+// Every joined chunk must carry the explicit pre-serialization proof. An
+// ambiguous admission error, a write timeout, or a structural sibling must
+// not be hidden by errors.Is finding one local expiry elsewhere in the tree.
+func packetTransferExpiredUnwritten(err error) bool {
+	if err == errSendPackExpiredUnwritten {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !packetTransferExpiredUnwritten(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return packetTransferExpiredUnwritten(wrapped.Unwrap())
+	}
+	return false
+}
+
+// A logical group's completion can join failures from several chunks. Every
+// cause must be packet-local; errors.Is alone would hide a structural failure
+// whenever another chunk also expired or timed out.
+func packetLocalTransferFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := joined.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if !packetLocalTransferFailure(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return packetLocalTransferFailure(wrapped.Unwrap())
+	}
+	return errors.Is(err, errTransferRouteWriteTimeout) || errors.Is(err, ErrSendPackNotAdmitted)
 }
 
 // Returns the packet completion clock. Production uses the monotonic wall
@@ -15035,7 +15090,7 @@ func (self *multiClientChannel) packetTransferNow() time.Time {
 
 // Applies the same reliable-vs-datagram failure boundary to a logical packet
 // group. One failed NoAck group is retired packet-accurately without giving a
-// transient route-write timeout provider-wide shared fate.
+// local admission expiry or route-write timeout provider-wide shared fate.
 func (self *multiClientChannel) observePacketGroupTransferCompletion(
 	sendPacketGroup *parsedPacketGroup,
 	ack bool,
@@ -15045,7 +15100,11 @@ func (self *multiClientChannel) observePacketGroupTransferCompletion(
 		self.addSendAckGroup(sendPacketGroup)
 		return
 	}
-	if ack || !errors.Is(err, errTransferRouteWriteTimeout) {
+	if packetTransferExpiredUnwritten(err) {
+		self.addSendAbandonedGroup(sendPacketGroup)
+		return
+	}
+	if ack || !packetLocalTransferFailure(err) {
 		self.addError(err)
 		return
 	}
@@ -16050,6 +16109,12 @@ func (self *multiClientChannel) ping() {
 					return
 				case err := <-pingDone:
 					if err != nil {
+						if packetTransferExpiredUnwritten(err) {
+							// No ping reached the peer. Local queue expiry ends
+							// this optional monitor, not its shared provider.
+							self.log.Infof("[multi]cping %s expired before write: ping loop ended, channel remains\n", self.args.Destination)
+							return
+						}
 						self.addError(err)
 						self.cancel()
 						return

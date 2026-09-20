@@ -136,6 +136,10 @@ func (self *sequenceAckWindow) PendingDispositionFor(
 func (self *sequenceAckWindow) UpdateContractMissing(ack sequenceAck) {
 	self.ackLock.Lock()
 	defer self.ackLock.Unlock()
+	self.updateContractMissingWithLock(ack)
+}
+
+func (self *sequenceAckWindow) updateContractMissingWithLock(ack sequenceAck) {
 	if prior, ok := self.contractMissingAcks[ack.messageId]; ok {
 		if prior.unwrapped {
 			ack.unwrapped = true
@@ -172,6 +176,41 @@ func (self *sequenceAckWindow) UpdateDelivered(ack sequenceAck, deliveredByteCou
 func (self *sequenceAckWindow) update(ack sequenceAck, deliveredByteCount ByteCount) {
 	self.ackLock.Lock()
 	defer self.ackLock.Unlock()
+	self.updateWithLock(ack, deliveredByteCount)
+}
+
+// Restore returns a locally unwritten response without rolling feedback back
+// over an update received while its route write was blocked. No delivery credit
+// is recreated; existing response bounds and cumulative absorption still apply.
+func (self *sequenceAckWindow) Restore(acks []sequenceAck) {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+	for _, ack := range acks {
+		var newer sequenceAck
+		var exists bool
+		if ack.contractMissing {
+			newer, exists = self.contractMissingAcks[ack.messageId]
+		} else if ack.selective {
+			newer, exists = self.selectiveAcks[ack.messageId]
+		}
+		if exists {
+			newer.unwrapped = newer.unwrapped || ack.unwrapped
+			newer.receiverTiming = newer.receiverTiming || ack.receiverTiming
+			newer.compactContractRecoverySupported = newer.compactContractRecoverySupported || ack.compactContractRecoverySupported
+			if newer.transportType == TransportTypeUnknown {
+				newer.transportType = ack.transportType
+			}
+			ack = newer
+		}
+		if ack.contractMissing {
+			self.updateContractMissingWithLock(ack)
+		} else {
+			self.updateWithLock(ack, 0)
+		}
+	}
+}
+
+func (self *sequenceAckWindow) updateWithLock(ack sequenceAck, deliveredByteCount ByteCount) {
 
 	if !self.hasHeadAck || self.headAck.sequenceNumber < ack.sequenceNumber {
 		if ack.selective {

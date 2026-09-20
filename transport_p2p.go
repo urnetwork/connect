@@ -285,6 +285,8 @@ type P2pTransportSettings struct {
 	// stream readiness. A fixed worker shard invokes it out of band; events are
 	// dropped when that bounded shard queue is saturated.
 	EndToEndProbeObserver func(P2pStreamProbeEvent)
+	// Nil by default. Metadata-only carrier progress trace; must not block.
+	ProgressObserver func(TransferProgressEvent)
 	// Nil test barrier pauses one association after route cleanup but before its
 	// done publication.
 	beforeRunDoneForTest func(Id, PeerType)
@@ -1149,14 +1151,19 @@ var (
 type P2pSendTransport struct {
 	transportId Id
 
-	ctx       context.Context
-	cancel    context.CancelFunc
-	conn      net.Conn
-	peerId    Id
-	streamId  Id
-	send      chan []byte
-	done      chan struct{}
-	closeOnce sync.Once
+	ctx      context.Context
+	cancel   context.CancelFunc
+	conn     net.Conn
+	peerId   Id
+	streamId Id
+	send     chan []byte
+	// Endpoint readiness requests and replies must not compete for admission
+	// with a saturated application route. One fixed-size envelope per class
+	// is sufficient; the existing physical writer consumes both queues.
+	probeRequests  chan []byte
+	probeResponses chan []byte
+	done           chan struct{}
+	closeOnce      sync.Once
 
 	endToEndReadinessRequired bool
 	endToEndReady             atomic.Bool
@@ -1246,6 +1253,10 @@ func newP2pSendTransportForPeer(
 		settings:                  settings,
 	}
 	p2pSendTransport.probeSendAdmission.open = true
+	if endToEndReadinessRequired {
+		p2pSendTransport.probeRequests = make(chan []byte, 1)
+		p2pSendTransport.probeResponses = make(chan []byte, 1)
+	}
 	if !endToEndReadinessRequired {
 		p2pSendTransport.endToEndReady.Store(true)
 	}
@@ -1272,6 +1283,63 @@ func (self *P2pSendTransport) CloseAndWait(ctx context.Context) error {
 	return waitForLifecycleDone(ctx, self.done, "P2P send transport")
 }
 
+// At most two control messages may precede a ready ordinary message. The
+// tiny per-class queues are only installed on endpoint-probed generations;
+// standalone and relay transports retain the original single-route select.
+func (self *P2pSendTransport) nextSend(probeBurst *int) ([]byte, bool) {
+	if self.probeRequests == nil && self.probeResponses == nil {
+		select {
+		case <-self.ctx.Done():
+			return nil, false
+		case message, ok := <-self.send:
+			return message, ok
+		}
+	}
+	select {
+	case <-self.ctx.Done():
+		return nil, false
+	default:
+	}
+	if 2 <= *probeBurst {
+		select {
+		case message, ok := <-self.send:
+			*probeBurst = 0
+			return message, ok
+		default:
+		}
+		*probeBurst = 0
+	}
+	firstProbe, secondProbe := self.probeResponses, self.probeRequests
+	if *probeBurst == 1 {
+		firstProbe, secondProbe = secondProbe, firstProbe
+	}
+	select {
+	case message := <-firstProbe:
+		*probeBurst++
+		return message, true
+	default:
+	}
+	select {
+	case message := <-secondProbe:
+		*probeBurst++
+		return message, true
+	default:
+	}
+	select {
+	case <-self.ctx.Done():
+		return nil, false
+	case message := <-self.probeResponses:
+		*probeBurst++
+		return message, true
+	case message := <-self.probeRequests:
+		*probeBurst++
+		return message, true
+	case message, ok := <-self.send:
+		*probeBurst = 0
+		return message, ok
+	}
+}
+
 func (self *P2pSendTransport) run() {
 	defer close(self.done)
 	defer func() {
@@ -1292,16 +1360,18 @@ func (self *P2pSendTransport) run() {
 		}
 		// Drain any pooled bytes the route manager or an admitted endpoint probe
 		// already enqueued before teardown closed both admission paths.
-	drainProbeRoute:
-		for {
-			select {
-			case b, ok := <-self.send:
-				if !ok {
+		for _, route := range []chan []byte{self.send, self.probeRequests, self.probeResponses} {
+		drainProbeRoute:
+			for {
+				select {
+				case b, ok := <-route:
+					if !ok {
+						break drainProbeRoute
+					}
+					MessagePoolReturn(b)
+				default:
 					break drainProbeRoute
 				}
-				MessagePoolReturn(b)
-			default:
-				break drainProbeRoute
 			}
 		}
 		if self.testingAfterProbeSendDrain != nil {
@@ -1310,14 +1380,13 @@ func (self *P2pSendTransport) run() {
 	}()
 
 	pairRecorded := false
+	probeBurst := 0
 	for {
-		select {
-		case <-self.ctx.Done():
+		transferFrameBytes, ok := self.nextSend(&probeBurst)
+		if !ok {
 			return
-		case transferFrameBytes, ok := <-self.send:
-			if !ok {
-				return
-			}
+		}
+		{
 
 			// The detached WebRTC data channel is message-oriented: one Write
 			// becomes one whole SCTP user message the peer reads back whole, so
@@ -1372,12 +1441,18 @@ func (self *P2pSendTransport) run() {
 				}
 			}
 
+			progressObserver := self.settings.ProgressObserver
+			progress := beginTransferProgress(progressObserver, TransferProgressEvent{
+				Stage: "p2p_write_begin", PeerId: self.transportId, SequenceId: self.streamId,
+				TransportType: TransportTypeP2p, QueueLength: len(self.send), QueueCapacity: cap(self.send),
+			}, transferFrameBytes)
 			self.conn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 			nw, err := self.conn.Write(transferFrameBytes)
 			MessagePoolReturn(transferFrameBytes)
 			if nw < messageByteCount && err == nil {
 				err = io.ErrShortWrite
 			}
+			endTransferProgress(progressObserver, progress, "p2p_write_end", err == nil, err)
 			if err != nil {
 				DefaultLogger().V(1).Infof("[p2p]s(%s) send write err = %s\n", self.streamId, err)
 				return
@@ -1611,7 +1686,26 @@ func (self *P2pReceiveTransport) offerReceive(
 	fragmentCount int,
 	probeMessage bool,
 	countDeliveredStats bool,
-) bool {
+) (success bool) {
+	progressObserver := self.settings.ProgressObserver
+	// This trace follows the reliable lane's actual handoff. Fast-lane
+	// success also means a deliberate queue drop; do not label that delivery.
+	if fast {
+		progressObserver = nil
+	}
+	progress := beginTransferProgress(progressObserver, TransferProgressEvent{
+		Stage: "p2p_receive_begin", PeerId: self.transportId, SequenceId: self.streamId,
+		TransportType: TransportTypeP2p,
+	}, message)
+	if progressObserver != nil {
+		defer func() {
+			var err error
+			if !success {
+				err = self.ctx.Err()
+			}
+			endTransferProgress(progressObserver, progress, "p2p_receive_end", success, err)
+		}()
+	}
 	if !fast {
 		// Keep the ready path nonblocking and give tests an exact full-route
 		// barrier. The second select is the only cancellation-bounded wait.
