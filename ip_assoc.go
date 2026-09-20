@@ -221,10 +221,11 @@ type IpAssoc struct {
 
 	clusters atomic.Pointer[ipAssocClusters]
 
-	// scratch is the reusable aggregation/clustering workspace, owned exclusively by
-	// the clustering pass (the run goroutine; tests with a long ClusterEpoch drive
-	// updateClusters directly instead)
-	scratch ipAssocScratch
+	// scratchLock serializes clustering with pressure release, not packet activity.
+	// Never wait for it while holding stateLock: a running pass needs stateLock to
+	// check its generation before publishing.
+	scratchLock sync.Mutex
+	scratch     ipAssocScratch
 }
 
 // indirection so a nil interface can be stored/cleared atomically
@@ -427,12 +428,10 @@ func (self *IpAssoc) blockWithLock(now time.Time) *ipAssocBlock {
 func (self *IpAssoc) run() {
 	defer self.cancel()
 	// teardown (Close or parent ctx cancel): a stopped assoc must not hold the
-	// matrix or stay registered for memory shedding. the scratch is owned by this
-	// goroutine, so it is released here too.
+	// matrix or stay registered for memory shedding. ShedMemory releases scratch too.
 	defer func() {
 		self.unregisterShed()
 		self.ShedMemory()
-		self.scratch = ipAssocScratch{}
 	}()
 
 	for {
@@ -446,28 +445,37 @@ func (self *IpAssoc) run() {
 	}
 }
 
-// ShedMemory drops the association matrix — blocks, activity, the name cache, and the
-// published clusters — under host memory pressure (or at teardown). The signal rebuilds
+// ShedMemory drops the association matrix, published clusters, and reusable workspace
+// under host memory pressure (or at teardown). The signal rebuilds
 // from live traffic; consumers see empty clusters rather than stale members.
 func (self *IpAssoc) ShedMemory() {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
 
-	self.blocks = nil
-	clear(self.lastActive)
-	clear(self.baseNames)
-	self.dirty = false
-	self.generation += 1
-	previous := self.clusters.Load()
-	if 0 < len(previous.members) {
-		self.clusters.Store(&ipAssocClusters{
-			version: previous.version + 1,
-			members: map[netip.Addr][]netip.Addr{},
-		})
-	}
+		self.blocks = nil
+		clear(self.lastActive)
+		clear(self.baseNames)
+		self.dirty = false
+		self.generation += 1
+		previous := self.clusters.Load()
+		if 0 < len(previous.members) {
+			self.clusters.Store(&ipAssocClusters{
+				version: previous.version + 1,
+				members: map[netip.Addr][]netip.Addr{},
+			})
+		}
+	}()
+	// Invalidate the in-flight generation first, then wait without stateLock so
+	// that pass can finish. No reusable backing arrays remain after shedding.
+	self.scratchLock.Lock()
+	self.scratch = ipAssocScratch{}
+	self.scratchLock.Unlock()
 }
 
 func (self *IpAssoc) updateClusters() {
+	self.scratchLock.Lock()
+	defer self.scratchLock.Unlock()
 	scratch := &self.scratch
 	var generation uint64
 	dirty := func() bool {
@@ -510,8 +518,11 @@ func (self *IpAssoc) updateClusters() {
 		return
 	}
 
+	// Coalescing history and merging same-site addresses compact pairs in place.
+	// The next pass still needs the raw input capacity, not that smaller output.
+	rawPairCount := len(scratch.pairs)
 	members := clusterIpAssocScratch(self.ctx, scratch, self.settings.MinMeanAssociation, self.maxComponentNodes())
-	scratch.finishPass()
+	scratch.finishPass(rawPairCount)
 	if members == nil {
 		// aborted by teardown
 		return
@@ -609,7 +620,7 @@ func (self *ipAssocScratch) index(addr netip.Addr) uint32 {
 // finishPass tracks fill high water and shrinks storage whose fill collapsed well
 // below it (a cleared map keeps its buckets and a truncated slice its backing array,
 // which would otherwise pin a burst's peak footprint).
-func (self *ipAssocScratch) finishPass() {
+func (self *ipAssocScratch) finishPass(rawPairCount int) {
 	if self.entityHighWater < len(self.indexes) {
 		self.entityHighWater = len(self.indexes)
 	}
@@ -621,8 +632,8 @@ func (self *ipAssocScratch) finishPass() {
 		self.indexes = fresh
 		self.entityHighWater = len(self.indexes)
 	}
-	if ipAssocScratchShrinkMin <= cap(self.pairs) && len(self.pairs)*4 < cap(self.pairs) {
-		self.pairs = make([]ipAssocAggPair, 0, len(self.pairs))
+	if ipAssocScratchShrinkMin <= cap(self.pairs) && rawPairCount*4 < cap(self.pairs) {
+		self.pairs = make([]ipAssocAggPair, 0, rawPairCount)
 	}
 }
 
