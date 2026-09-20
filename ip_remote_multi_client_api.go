@@ -416,7 +416,8 @@ func (self *ApiMultiClientGenerator) SetIdentityStore(store MultiClientIdentityS
 }
 
 // CloseTransportCreationAndWait prevents later window or migration transports
-// and joins every creator that entered before this call. PlatformTransportCreated
+// and joins every creator that entered before this call, including retirement
+// of carriers a migration unlinked or discarded. PlatformTransportCreated
 // has therefore returned for every generated transport when this returns.
 func (self *ApiMultiClientGenerator) CloseTransportCreationAndWait(ctx context.Context) error {
 	return self.transportCreation.closeAndWait(ctx)
@@ -870,6 +871,17 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 			defer retirements.finish()
 		}
 		<-client.Done()
+		// The generator, not Client, owns this external carrier. Route removal
+		// and Close only cancel it; its socket/receive workers may still retain
+		// pooled frames (even after the admission claim ends). Join outside
+		// every generator lock before publishing retirement completion. Like provider teardown,
+		// this asynchronous owner remains until the carrier is actually done;
+		// CloseAndWait's caller context bounds waiting, not resource ownership.
+		if joiningTransport, ok := transport.(interface {
+			CloseAndWait(context.Context) error
+		}); ok {
+			_ = joiningTransport.CloseAndWait(context.Background())
+		}
 		retireTimeout := self.clientStrategy.settings.RequestTimeout
 		if retireTimeout < 30*time.Second {
 			retireTimeout = 30 * time.Second
@@ -1069,6 +1081,22 @@ func (self *ApiMultiClientGenerator) createPlatformTransport(
 	return transport, targetMode, policyVersion
 }
 
+// A migration owns the carrier it unlinks, not just its indexed replacement.
+// Close cancels socket workers but does not prove their buffers and callbacks
+// have unwound. Keep that retirement in the already-admitted migration worker
+// so generator/DeviceLocal joins cannot overlook an old generation. Call only
+// outside transport/policy locks. Make-before-break publishes its replacement
+// before retiring the old carrier; failed replacements are simply discarded.
+// The join caller's deadline never abandons resource ownership.
+func closeApiWindowPlatformTransportAndWait(transport apiWindowPlatformTransport) {
+	transport.Close()
+	if joining, ok := transport.(interface {
+		CloseAndWait(context.Context) error
+	}); ok {
+		_ = joining.CloseAndWait(context.Background())
+	}
+}
+
 // MigrateClientTransport implements MultiClientGeneratorTransportMigrator.
 // The call is deliberately non-blocking: server jitter, connect waiting, and
 // handoff happen off the receive path. A duplicate frame while one migration
@@ -1155,10 +1183,10 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 				stillCurrent := self.transports[client] == state && state.current == current
 				self.transportLock.Unlock()
 				if !stillCurrent {
-					next.Close()
+					closeApiWindowPlatformTransportAndWait(next)
 					return
 				}
-				current.Close()
+				closeApiWindowPlatformTransportAndWait(current)
 				brokeBeforeMake = true
 			}
 		}
@@ -1177,7 +1205,7 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 			}
 			select {
 			case <-client.Ctx().Done():
-				next.Close()
+				closeApiWindowPlatformTransportAndWait(next)
 				return
 			case <-notify:
 			case <-connectTimer.C:
@@ -1196,7 +1224,7 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 					}
 					self.transportLock.Unlock()
 					if !swapped {
-						next.Close()
+						closeApiWindowPlatformTransportAndWait(next)
 						return
 					}
 					state.noteExtenderIpsChanged()
@@ -1219,7 +1247,7 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 						state.migrating = false
 					}
 				}()
-				next.Close()
+				closeApiWindowPlatformTransportAndWait(next)
 				return
 			}
 		}
@@ -1233,7 +1261,7 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 		}
 		self.transportLock.Unlock()
 		if !swapped {
-			next.Close()
+			closeApiWindowPlatformTransportAndWait(next)
 			return
 		}
 		// the addresses a watcher reads come from the current transport, so
@@ -1242,7 +1270,7 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 		// Only now break the old route. For the interval between next becoming
 		// connected and this close, RouteManager can carry traffic over both.
 		if !brokeBeforeMake {
-			current.Close()
+			closeApiWindowPlatformTransportAndWait(current)
 		}
 	})
 }

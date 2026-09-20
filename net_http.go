@@ -233,6 +233,7 @@ type ClientStrategy struct {
 	cancel             context.CancelFunc
 	closeOnce          sync.Once
 	unsubNetworkChange func()
+	unsubMemoryShed    func()
 	log                Logger
 
 	settings *ClientStrategySettings
@@ -468,6 +469,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 	// timeout. Clients rebuild lazily on next use. Unsubscribe rides ctx.
 	unsubNetworkChange := AddNetworkChangeListener(clientStrategy.networkChanged)
 	clientStrategy.unsubNetworkChange = unsubNetworkChange
+	clientStrategy.unsubMemoryShed = AddMemoryShedder(clientStrategy.shedMemory)
 	go HandleError(func() {
 		<-strategyCtx.Done()
 		clientStrategy.Close()
@@ -489,6 +491,20 @@ func (self *ClientStrategy) CloseIdleConnections() {
 	}
 }
 
+// Pressure releases idle API socket graphs, not active responses or the
+// reusable transport owner. Keeping that owner also preserves path-local TLS
+// tickets and lets the next sweep find streams that were active in this one.
+func (self *ClientStrategy) shedMemory() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	for dialer := range self.dialers {
+		dialer.shedMemory()
+	}
+	if self.internalDohResolver != nil {
+		self.internalDohResolver.CloseIdleConnections()
+	}
+}
+
 // Ends discovery and releases pooled HTTP connections. APIs and transports
 // sharing the strategy must be closed first; repeated calls are safe.
 func (self *ClientStrategy) Close() {
@@ -498,6 +514,9 @@ func (self *ClientStrategy) Close() {
 		}
 		if self.unsubNetworkChange != nil {
 			self.unsubNetworkChange()
+		}
+		if self.unsubMemoryShed != nil {
+			self.unsubMemoryShed()
 		}
 		self.CloseIdleConnections()
 		if self.internalDohResolver != nil {
@@ -2121,6 +2140,14 @@ func (self *clientDialer) Close() {
 	if self.httpClient != nil {
 		self.httpClient.CloseIdleConnections()
 		self.httpClient = nil
+	}
+}
+
+func (self *clientDialer) shedMemory() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.httpClient != nil {
+		self.httpClient.CloseIdleConnections()
 	}
 }
 

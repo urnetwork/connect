@@ -1926,6 +1926,64 @@ artifact was removed after its arm.
 
 ## Experiment queue
 
+### Rejected packet-allocation candidate (2026-09-20)
+
+The `appendIpPacketGroupBounded` ownership deferral and bounded
+`WindowStats` source-count scratch reuse were tested together. They improved
+their deterministic microbenchmarks (multi-packet grouping avoided discarded
+canonical-path allocations; repeated 64/256-destination stats reads avoided
+temporary count slices), and focused normal/race tests passed. The required
+fresh physical H1 iOS-profile arm did not validate the direction: the full
+20/32-MiB profile and 315-second quiet window peaked at 26,517,536 bytes,
+above the absolute 24-MiB barrier and 1.3% higher than the 26,177,568-byte
+owner-fix replay. Its Fast.com displays were 0.79/28/31 Mbps, not a speed win.
+
+Do not retain or retune this pair on the basis of allocation microbenchmarks.
+The result reinforces that the active excess is retained runtime/span/stack or
+traffic-lifecycle memory outside these short-lived packet/stat scratch objects.
+Future candidates must first attribute the physical peak by Go runtime class
+and traffic phase, then prove an improvement against the same guarded
+collector/workload/quiet protocol.
+
+### Idle API ownership; rejected stack experiment (2026-09-20)
+
+The two valid H1 artifacts above peaked at 26,177,568 and 26,517,536 bytes.
+At those samples, packet/TUN roots and tracked Transfer queues were empty;
+free packet/large-object pools held only 442,368 and 385,024 bytes. The newer
+peak contained 10,513,960 bytes of heap objects, 5,648,856 bytes of occupied-span
+slack, 770,048 free heap bytes, 3,178,496 stack bytes, and 6,406,176 other runtime
+bytes. Lower allocation rate alone does not clear this retained-memory floor.
+
+`ClientStrategy` did not subscribe to memory shedding, leaving idle API HTTP,
+alt-QUIC and internal-DoH socket graphs outside the existing SDK reclaim pass.
+The scoped fix registers/unregisters with owner lifetime and closes only idle
+connections. It preserves active responses, the reusable HTTP transport and
+path-local TLS tickets; H1 data carriers, budgets and reclaim timing are unchanged.
+
+Deterministic loopback tests cover global dispatch, idle/native HTTP and QUIC,
+active-response protection, registration/cancellation races, and TLS resumption.
+A four-idle-QUIC-owner sample released all 6,815,744 **reserved** transport-budget
+bytes, 48 goroutines and 188,400 heap bytes, versus no closed carriers and
+23,728 heap bytes reclaimed on baseline. Both loopback endpoints are in-process:
+these are not predictions of device heap savings, and reserved bytes are not
+physical memory. Six paired/reverse-order benchmark repetitions kept allocations
+unchanged; warm API latency changed -0.22%, resumed re-dial +0.50%, and H1
+saturated/ACK-sized/sparse latency medians -0.60% to +0.82%. Focused normal/race
+tests and vet pass. Re-dial still has a cost after genuine pressure; do not turn
+this cleanup into a per-request or periodic forced pool reset.
+
+Separately, removing blank admission-owner stack temporaries reduced the local
+ARM64 `SendSequence.Run` frame from 4,640 to 4,048 bytes; extracting its cold
+timeout log reduced it to 3,872. Neither changed the fresh-process retained-stack
+measurement: 64 real idle sequence/ACK-worker pairs used 1,277,952 incremental
+stack bytes in every arm. Both production refactors were rejected.
+
+The API cleanup is a locally verified resource-lifecycle fix, **not a physical
+24-MiB pass**. No physical arm or baseline promotion was performed for it.
+The next qualifying arm must retain full active/quiet coverage, the absolute
+24-MiB ceiling and unchanged Fast.com/page performance gates. Aggregate evidence
+and exact commands are retained privately in the retained-owner analysis report.
+
 Run one change at a time where practical, then combine only independently
 useful changes. The search covers the whole H1 path rather than assuming that
 every slow result is a queue-size problem:
@@ -1987,6 +2045,515 @@ every slow result is a queue-size problem:
     29.48-MiB crest.
 
 ## Notes and pitfalls
+
+### 2026-09-20: on-demand owner census for the attested H1 breach
+
+The fully attested native H1 arm still failed the absolute 24-MiB barrier:
+29,900,832 bytes (28.52 MiB), while Fast.com completed at 65/35/65 Mbit/s.
+The peak sample was 274,324 ms into `connect-h1`, with 11,594,104 heap-object
+bytes, 6,805,128 bytes of in-use span slack, 1,851,392 free-but-unreleased heap
+bytes, 3,244,032 stack bytes, 243 goroutines, and 201 client flows. Returned
+pool retention was only 557,056 bytes; live packet roots and tracked transfer
+queues were zero at that sample. Admission claims were 2,097,152 bytes across
+eight slots, **not** an estimate of the underlying heap. This is not the older
+unattested arm's allocation-class breakdown, even though the total peak
+coincided. No cap, queue budget, reclaimer threshold, or baseline is changed.
+
+New opt-in diagnostics read existing owners: active Transfer workers including
+canceled/index-detached workers; channel capacities and pacing services;
+flow/affinity/cache counts; IpAssoc raw scratch; API pools/connections; DNS
+caches; bounded Transfer free lists; and claims by transport class. The SDK's
+non-iOS `DeviceLocal.WriteMemoryOwnerCensus` exclusively creates an aggregate
+mode-0600 JSON file with before/after runtime values and allocator size classes.
+There is no packet hook, registry, background sampler, forced GC, or cache
+release. Known struct/slice bytes are intentionally incomplete ownership
+accounting, not a heap total or a span-slack attribution. Native HTTP/TLS/QUIC
+object graphs still require paired private profiles.
+The census scopes current indexed device owners; already-unlinked client
+generations and other NetworkSpaces are not discoverable without those
+profiles. Zero current-owner counts therefore do not prove a process-wide
+absence of leaks.
+
+Deterministic tests cover workers remaining after index removal and reaching
+zero only after joined teardown; receive workers; canceled flow reaping while
+preserving live TCP; scratch capacity and pressure release; API active/idle
+and closed-but-rooted discrimination; actual automatic closed-API retirement;
+DNS shared-cache deduplication and release; transport claim classes; bounded
+topology truncation; privacy/exclusive files; and concurrent reads/teardown.
+The actual API close callback released its pool entry: this is negative leak
+evidence, not justification for additional connection churn.
+
+Local Apple M4 Pro / Go 1.26.7 measurements: a 400-flow census took a median
+2.62 microseconds (10 runs); an empty-device primitive census 52–56 ns; a
+runtime-plus-owner report 43.9–45.9 microseconds (five runs). All three measured
+0 B/op and 0 allocs/op after existing-owner initialization. File/JSON writing
+is excluded and deliberately diagnostic-only. Focused normal repetitions,
+race tests, vet, Android helper unit tests, and acceptance Kotlin compilation
+passed. These are overhead/lifecycle checks, **not** a physical 24-MiB pass.
+
+Next diagnostic protocol: explicitly rebuild and attest SDK/AAR/native/APKs
+with iOS profile and startup heap sampling 65536; require the owner-census
+capability preflight, then pair pre-GC owner census, heap profile, post-GC
+census, and last-of-all private goroutine stacks at idle/post-traffic/quiet
+boundaries. See `android/app/scripts/PHYSICAL_LOWBAR.md` for exact command and
+privacy rules. Raw profiles/stacks never leave private artifacts; report
+aggregate allocation/function/state owners only. Keep this diagnostic arm
+separate from unprofiled performance acceptance. No additional physical arm
+has been run for the census, and no concrete remaining allocator owner has
+yet been proven causal.
+
+### Owner-census physical diagnostic — 2026-09-20
+
+A fresh, private Android diagnostic arm used the pinned Pixel 8 Pro with the
+iOS-audit profile (20-MiB admission / 32-MiB runtime limit), 64-KiB profile
+sampling, matching freshly built SDK AAR / app APK arm64 native-library digests,
+and a successful schema-1 owner-census preflight. The diagnostic artifacts,
+including raw pprof and goroutine stacks, are private mode-0600 evidence. This
+was intentionally a profiled attribution arm, not a qualifying 24-MiB or
+throughput run.
+
+The native runtime was 17.36 MB at no-traffic preflight, 20.90 MB shortly
+after H1 connect, 30.91 MB after the joined real-site workload, 29.33 MB after
+the explicitly forced heap-profile collection, and 27.99 MB after 180 seconds
+of still-connected quiet. Thus it remains above the absolute 24-MiB ceiling
+even after natural release; no baseline or budget changes are justified.
+
+The census materially narrows the hypothesis. Live client flows rose from 6
+after connect to 225 after traffic, then fell to 3 at the quiet boundary;
+reverse-DNS entries fell from 300 to 11. Transfer queues were empty at every
+post-traffic census, and pool known-retained structs fell from 53.6 KiB to
+15.4 KiB. The quiet sample still had 8.96 MB heap objects, 6.29 MB in-use heap
+slack, and 3.15 MB stacks. Consequently, neither pooled packets nor unreaped
+flow/reverse-DNS maps explain the remaining steady runtime by themselves.
+
+The private post-traffic heap profile had 9.43 MB sampled live heap. Its
+largest aggregate allocations were buffered writers (0.85 MB), source-event
+buckets (0.67 MB), message-pool warm storage (0.32 MB), and message-pool
+construction (0.23 MB); these are incomplete sampled heap attribution, not
+permission to tune a pool. The large residual is allocator span slack plus
+stack/runtime overhead. A privacy-safe aggregate of the private stack capture
+counted 230 goroutines (107 plain `select`, 16 poll waits, and most remaining
+tops in Connect); it did not reveal one unexpectedly rooted post-traffic
+worker class. The next accepted research step is therefore a stack-size-class
+and allocation-lifetime comparison around the 180-second flow-release boundary,
+then a deterministic release test for any concrete owner that remains high.
+Do not trim, close active H1 sessions, or lower packet/sequence budgets until
+that causal release test demonstrates a steady-memory reduction without page
+or Fast.com regression.
+
+The same diagnostic workload recorded Fast.com 16/32/54 Mbps and observed
+both requested media probes without clock progress; both media child exits
+were retained. Because profiling perturbs the run and the host collector's
+external VPN eligibility was invalid for this arm, these are diagnostic
+observations only—not performance, provider, or video-regression verdicts.
+
+### H1 destination retirement: missing carrier join — 2026-09-20
+
+A deterministic actual-H1 test found a narrower lifecycle defect, not yet an
+explanation for the still-connected memory peak. The SDK already joins its
+retired multi-client and owned API generator. However, generator retirement
+only canceled the external `PlatformTransport`; `Client.CloseAndWait` does
+not own that carrier. Holding the H1 teardown after route removal therefore
+allowed generator `CloseAndWait` to return success while carrier workers
+were still alive. `TestApiMultiClientGeneratorJoinsActualH1Transport` fails on
+the old code and passes after joining the carrier in the existing asynchronous
+retirement worker, outside generator locks. Caller cancellation remains
+bounded; ownership continues until actual teardown, and a later join succeeds.
+Identity removal remains after joined carrier/client/OOB cleanup. No active
+H1 path, queue, timeout, admission budget, or memory ceiling changed.
+
+The SDK `TestDeviceLocalH1OwnerLifecycle` uses local auth/discovery, a real H1
+websocket and API generator, eight echoed packet flows, and production
+`DeviceLocal.CloseAndWait`. In 20 healthy repetitions per arm, cold traffic
+median was 205.139 → 205.142 ms and close median 0.575 → 0.576 ms (p95
+0.872 → 0.857 ms). Both arms cleared current flows/clients and generated
+send/receive/pacing owners; there was no observed meaningful healthy-close
+regression. Normal/race repetitions and Connect/SDK vet passed. These local
+latencies are not Fast.com or physical-device performance measurements.
+
+Immediate process-wide heap snapshots did not demonstrate heap reclamation:
+the fixture deliberately retains closed clients for owner assertions and
+keeps its server/provider alive, and identity cleanup itself allocates.
+Likewise, the H1 admission claim can reach zero before the carrier's `Done`
+edge; it is not proof that socket workers or buffers have finished. The fix
+repairs false teardown completion, but does not establish a leak among the
+five expected live H1 exits or a physical 24-MiB pass. Keep connected-owner
+allocation/stack attribution and transport-budget release ordering as
+separate research questions. Local evidence is retained in the private
+`urnetwork-h1-carrier-join.CFVklV` artifact; no device arm or baseline change
+was made for this fix.
+
+### Block-action history: release verified, policy change rejected — 2026-09-20
+
+The owner-diagnostic post-traffic heap profile attributed approximately
+0.94 MiB to `blockActionCollector.flush` → SDK row conversion, principally
+IP strings and exported-list storage. That call stack identifies allocation
+origin, not a collector-owned leak. The physical SDK history fell from
+1024 rows / 1183 slots to 35 / 60; its later sample was about 363 seconds after
+the pre-GC post-traffic sample, beyond the existing 300-second history window.
+Runtime still measured 27,990,296 bytes, 2,824,472 above the absolute ceiling.
+
+New deterministic tests keep production policy unchanged: Connect's collector
+flush releases both epoch aggregates and unretained emitted actions; SDK
+expiry releases every old row, shrinks backing storage, preserves surviving
+decisions/counts, and releases all slots when empty. A consumer-held snapshot
+correctly retains its rows only until that snapshot is released. Tests use
+weak references and virtual time, not sleeps or shortened production windows.
+
+Five fresh-process release trials (1024 rows, 16 IPs and one synthetic host
+per row) measured median full-history live heap of 856,160 bytes above empty.
+Expiring to 35 rows released 826,760 bytes, leaving 29,400 bytes of live heap
+and 90,112 in-use heap bytes above empty; expiring all left only 320 live-heap
+bytes above the initial diagnostic snapshot. Process runtime stayed higher
+and variable despite released owners, demonstrating why runtime alone is not
+proof of retained action rows. Forced GC/scavenging here is test-only, not a
+proposed production remedy or a physical-memory pass.
+
+A 64-row history update with 16 IPs/row measured a median 43.079 microseconds,
+94,264 B/op and 2,244 allocations/op (five benchmarks, Apple M4 Pro / Go
+1.26.7). Conversion/trim churn is real, but no experiment yet ties it to the
+remaining multi-megabyte quiet excess. No cap/window/security or production
+code change is retained. Connect normal x10/race x3, SDK release normal
+x5/race x5, and both vets passed. Evidence:
+`urnetwork-block-action-retention.e0MzEc/REPORT.md`.
+
+Remaining question: cross-owner span fragmentation or a separately held UI
+snapshot requires a paired quiet heap profile and controlled allocation-layout
+experiment. These isolated release tests do not rule those out. The Android
+projection caches Kotlin value rows rather than Go BlockAction wrappers;
+that read-only source observation is not a JNI-lifetime measurement. Lowering
+history retention without that causal evidence would reduce observability
+without establishing a 24-MiB fix.
+
+### Go soft limit 24 versus 32 MiB: blanket change rejected — 2026-09-20
+
+Ten fresh-process, alternating local H1 arms compared **only** the runtime
+soft limit: five at 32 MiB and five at 24 MiB. Device admission stayed 20 MiB,
+Connect process sizing stayed 32 MiB, GOGC stayed 25, and mobile pool/queue
+policy stayed identical. An explicit test-only platform overlay enabled the
+mobile branches on the darwin host. A real DeviceLocal/API generator and H1
+WebSocket carried 16,384 echoed 1200-byte payloads per arm through the Auto
+four-quality-plus-one-speed topology. All ten arms retained five clients and
+72 indexed flows and passed correctness. No public endpoint/device was used.
+
+| Median measurement | 32-MiB soft limit | 24-MiB soft limit |
+| --- | ---: | ---: |
+| Sampled traffic runtime peak | 25,976,598 B | 23,609,110 B |
+| Natural connected quiet runtime | 24,510,230 B | 23,314,198 B |
+| Quiet heap / in-use span slack | 7,288,664 / 4,480,836 B | 6,493,584 / 4,280,624 B |
+| Quiet stack bytes | 3,080,192 B | 3,244,032 B |
+| Connected runtime after diagnostic GC | 22,454,038 B | 21,794,598 B |
+| Local payload echo rate | 280.20 Mbit/s | 180.67 Mbit/s |
+| Packet RTT p50 / p95 | 1.489 / 6.426 ms | 2.228 / 12.629 ms |
+| Traffic GC cycles / summed pauses | 177 / 26.183 ms | 357 / 39.410 ms |
+| Traffic GC CPU / mark-assist CPU | 0.880 / 0.113 s | 1.735 / 0.433 s |
+
+The quiet-runtime median improved by 1,196,032 bytes (1.14 MiB), but natural
+quiet ranges overlapped: 23,306,006–25,562,902 B at 32 versus
+23,002,902–23,469,846 B at 24. Throughput regressed 35.5%; every 24-MiB sample
+(174.67–225.98 Mbit/s) was below every 32-MiB sample (251.07–347.78 Mbit/s).
+The lower limit roughly doubled collections and GC CPU and raised mark-assist
+CPU 3.84-fold for the same useful traffic. It primarily reduces allocation
+float/free heap, with only a small median slack reduction—not a demonstrated
+resolution of the physical arm's 6.29-MB span slack.
+
+**Rejected as a blanket production change** under the requirement to preserve
+H1 performance. Keep the existing 20-MiB target / 32-MiB soft-limit policy;
+this does not accept its known physical breach of the absolute 24-MiB barrier.
+Only reusable tests and research evidence are retained. Exact per-arm JSON,
+statuses, commands and ranges: `urnetwork-h1-softlimit.n4sTod/REPORT.md` and
+`results.jsonl`. SDK lifecycle normal x5/race x3, the opt-in experiment under
+race, vet and diff checks passed.
+
+Scope: 12 seconds of natural quiet (last six samples summarized), then three
+explicit diagnostic GCs and one diagnostic scavenge. Flows did not expire;
+this is not the physical five-minute quiet gate. Loopback providers/server
+share the measured process; the carrier is local `ws`, not upstream TLS, and
+echoed UDP packets do not model browser TCP congestion. These rates are not
+Fast.com speeds or a prediction of the phone's regression. No physical iOS,
+Android, absolute-peak, or release-readiness claim follows from this test.
+
+Follow-up fixture caveat (same date): the local provider relay used an untyped
+gateway with unknown receive reliability. A deterministic queue-saturation
+test now proves that this permits a Pack handoff drop, whereas an explicitly
+reliable H1 relay backpressures and preserves the packet. The ten historical
+soft-limit arms completed, but did not collect this provider-side drop guard.
+Keep those numbers as historical surrogate observations, not a complete
+bidirectional production-H1 validation or proof that 24 MiB cannot work with
+other allocation changes. No soft-limit policy change was made.
+
+### Live H1 topology 4+1 / 3+1 / 2+1: not retained — 2026-09-20
+
+The opt-in SDK `TestDeviceLocalH1TopologyExperiment` varies only the number
+of quality slots through test overlays. Speed stays one, process sizing and
+soft limit stay 32 MiB, device target stays 20 MiB, GOGC stays 25, and all
+mobile pools/queues and reliability timeouts remain unchanged. The real
+DeviceLocal/API generator/H1/Transfer path carries equal useful echo traffic
+on quality-first port 443 and speed-first port 123. Five local provider
+fixtures exist in every arm. Before traffic, exact owner count **and** Added
+provider count must match the requested topology.
+
+The first partial cohort used unknown provider carrier metadata and is
+`INVALID_FIXTURE`, preserved separately as `urnetwork-h1-topology.LfDvS7`.
+`TestH1OwnerFixtureReliableProviderHandoff` reproduces its saturation failure:
+the old relay drops one of three packets; the corrected H1/reliable relay
+waits and delivers all three in order. This is a test-only relay repair,
+not a production transport change. Normal x5 and race x3 passed.
+
+The corrected balanced cohort completed all 15 process-level records. Every
+row had zero provider/client Pack handoff drops, but traffic correctness was
+only **3/5, 2/5, 2/5** respectively: baseline and candidates had intermittent
+mid-flow echo timeouts or packet-admission refusals. Do not discard failed
+rows, rank survivor-only medians as a clean A/B, or update a baseline.
+
+| Observed measurement | 4 quality + 1 speed | 3 quality + 1 speed | 2 quality + 1 speed |
+| --- | ---: | ---: | ---: |
+| Connected goroutines, all five arms, median | 265 | 236 | 210 |
+| Connected runtime, all five arms, median | 18,120,470 B | 17,497,878 B | 17,612,566 B |
+| Completed traffic/recovery arms | 3/5 | 2/5 | 2/5 |
+| Quiet runtime, completed arms only | 29,069,094 B | 27,316,006 B | 26,562,326 B |
+| Quiet allocated heap / span slack, completed only | 11,294,928 / 3,753,776 B | 9,785,096 / 4,219,128 B | 7,928,896 / 4,924,352 B |
+| Quiet stack bytes, completed only | 3,604,480 B | 3,088,384 B | 3,096,576 B |
+| Quality / speed echo Mbit/s, completed only | 642.80 / 412.13 | 425.34 / 348.90 | 598.46 / 408.24 |
+| Quality packet RTT p50 / p95, completed only | 0.739 / 1.680 ms | 1.069 / 3.420 ms | 0.832 / 1.831 ms |
+| Provider blackhole removal, completed only | 30.18–30.93 s | 30.18–31.43 s | 30.17–30.67 s |
+
+Even the lowest completed natural-quiet runtime was 26,287,894 B, above
+25,165,824 B (24 MiB). The completed 2+1 arms show fewer owners and about
+0.48 MiB less stack space, but span slack increases; reducing client count
+does not itself resolve allocator slack. Survivor-only quality throughput
+also falls (~6.9% at 2+1, ~33.8% at 3+1). These are observations, **not**
+statistically established deltas given the incomplete traffic cohorts.
+No smaller production topology is retained.
+
+One predeclared bounded baseline discriminator subsequently passed with zero
+SDK pressure drops, NoAck refused/discard, prewire expiry, receive-queue drops,
+and ACK/Pack handoff drops. It did not reproduce the remaining failures;
+their source boundary remains open. The opt-in test retains those primitive
+counters for the next failing capture. Do not infer a root cause or relax
+timeouts from a passing diagnostic. No further diagnostic/device arm ran.
+
+Scope: 64 concurrent flows x 1,024 x 1,200-byte echoes per traffic phase
+(157,286,400 useful outbound bytes total), 12 seconds connected quiet, then
+test-only GC/scavenge and a single-provider blackhole. All seven completed
+arms removed that unavailable provider under unchanged production timers
+and delivered 1,024 fresh recovery packets. Co-resident providers, plaintext
+local `ws`, synthetic UDP payloads and retained 136 flows differ from phone
+TCP/TLS/fast.com and five-minute quiet. These are not website TTFB, physical
+speed, iOS footprint, absolute-peak acceptance, or WAN-diversity guarantees.
+Raw per-arm GC/pause/traffic/heap data and statuses:
+`urnetwork-h1-topology-reliable.RDM5c1/{REPORT.md,results.jsonl}`.
+
+### UDP SCTP ACK scheduling: insufficient for the cold source gate — 2026-09-20
+
+Retained deterministic research only; no production or memory-policy change.
+`TestProviderUdpSctpImmediateAckCannotRemoveColdRttRefusal` connects the actual
+provider/Transfer/P2P writer to the pinned SCTP with its existing blocking,
+reliable-unordered semantics and unchanged 32/four-slot queues. A lossless
+virtual-time wire isolates constant RTT from jitter, link serialization,
+ICE/DTLS, encryption, and device scheduling. The source offers 468 distinct
+1,000-byte UDP payloads at 3.75 Mbit/s after a fully ACKed setup packet.
+
+| Ten normal repetitions | 2-ms RTT control | 120-ms RTT | 120-ms immediate-SACK upper bound |
+| --- | ---: | ---: | ---: |
+| Source admitted / refused | 468 / 0 | 300 / 168 | 317 / 151 |
+| Refused before first possible returned ACK | 0 | 16 | 16 |
+| First refusal | none | 87.467 ms | 87.467 ms |
+| First returned SACK | 4.133 ms | 122.133 ms | 120.000 ms |
+| SACKs, median (range) | 234 (234–234) | 95.5 (93–98) | 199.5 (197–203) |
+| DATA retransmits / lost admitted identities | 0 / 0 | 0 / 0 | 0 / 0 |
+
+At both high-RTT first-refusal edges, three DATA chunks have been written,
+cwnd is still 4,380 B, SCTP pending/inflight is 4,536 B, and the route is 4/4.
+The receive window stays at least 432,434 B in the normal cohort. The limiting
+boundary is the **cold congestion window plus the round trip**, before any
+ACK policy can return progress. This is separate from the previously fixed
+shared UDP writer-lock blockage and from loss/retransmission stalls.
+
+The test-only I-bit arm requests immediate SCTP ACKs on test-owned packet
+copies. It admits 17 more later offers but approximately doubles SACK traffic
+and cannot pass the frozen all-source-admitted gate. There is no production
+Pion setting for this experiment; no dependency was patched. Do not infer a
+safe network throughput improvement from a lossless wire without reverse
+bandwidth limits. Race-mode later counts vary with ACK coalescing; the
+pre-first-ACK failure boundary remains invariant.
+
+Adjacent review ruled out the userspace UDP batching queue for legacy SCTP:
+DTLS/SCTP uses `writeDirect`; only SRTP is queued. Earlier ready-drain batching
+reduced post-stall writes but not source refusals, and wider frames increase
+per-slot roots. Do not disable blocking SCTP, make public UDP callbacks wait,
+increase cwnd/queues, or relabel source refusals to force a green result.
+No eligible production candidate survived, so no new fixture/device A/B ran;
+the current-source PERFVAR UDP failure and absolute 24-MiB gate remain open.
+
+Normal ×10, race ×10 and vet pass. Exact commands, primitive per-repetition
+results, preserved initial test-race failures and source boundaries are in
+`urnetwork-udp-sctp-ack.5UikD8/REPORT.md`; campaign notes are in
+`tests/PERFVAR-MEASUREMENTS.md`. This is not a physical memory measurement,
+website speed measurement, or baseline promotion.
+
+### Ordinary UDP coalescing: the pre-write ownership boundary — 2026-09-20
+
+The follow-up uses actual SCTP rather than the earlier fixed writer-barrier
+model. `TestProviderUdpSctpReadyDrainKeepsColdAdmissionBoundary` exercises the
+existing larger H1 envelope through a **test-only** carrier adapter, while
+keeping the physical legacy P2P writer, 32/four-slot queues, zero-wait provider
+callbacks, and the same 468-packet offer. This is not a production P2P policy.
+
+| Ten normal repetitions, median (range) | Production envelope | Wider ready-drain upper bound |
+| --- | ---: | ---: |
+| Admitted / refused | 300 / 168 (298–300 / 168–170) | 310 / 158 |
+| Admitted / refused before the first possible ACK | 41 / 16 | 41 / 16 |
+| Physical writes | 300 (298–300) | 234 (231–234) |
+| Sampled outstanding pooled-root peak | 77,824 B | 88,064 B |
+| DATA retransmits / lost admitted identities | 0 / 0 | 0 / 0 |
+
+First refusal remains 87.467 ms, before the first returned SACK at 122.133 ms.
+Larger ready-drain calls therefore improve later service only, leaving the
+cold admission failure intact. The pooled-root peak rises **13.2%** despite
+unchanged queue slot counts; this does not count Go metadata or SCTP internals
+and must not be reported as the complete runtime footprint. A fresh six-run
+encoder benchmark improves median time from 1.5085 to 0.8861 microseconds per
+30 already-ready packets, zero allocations/op in both arms, but its wire root
+grows from 2 to 4 KiB. CPU savings alone do not qualify this change.
+
+Source review places the missing operation **before** the sequence parks in
+`route.Write`: a ready-only drain cannot consume later source arrivals while
+that owner is blocked. A dedicated compact admission batch was considered
+but **not implemented or qualified**. It needs a new bounded owner covering
+the compact arena, every original callback/lifecycle record, and any overlap
+with frozen/serialized copies. Existing logical groups do not provide that
+ownership transfer for independently admitted callbacks; simply merging or
+releasing their slots would hide a payload-capacity increase. Pooled arena
+subviews also cannot be treated as independently returnable packet roots.
+No safe minimal candidate with a demonstrated memory-neutral cap emerged;
+this is a scoped rejection, not proof that all compact-queue designs fail.
+
+Normal and race tests ×10, vet, and the encoder benchmark pass. The earlier
+synthetic test's assertion of equal **post-release** sampled peaks was too
+strong: a preserved race-mode repetition observes 81,920 versus 77,824 B.
+It now asserts equal **pre-release** ownership only and records the later
+peak as a measurement. No acceptance/memory threshold was relaxed.
+
+Retained changes are tests and research notes only. No new fixture/device A/B
+ran because no eligible production candidate reached that stage. The frozen
+PERFVAR source gate, absolute 24-MiB ceiling, and baselines remain unchanged.
+Current helper hashes, all repetitions, failed draft assertion, and commands:
+`urnetwork-udp-sctp-batch.0C7JHL/REPORT.md` (private 0700 directory).
+
+### Unlinked H1 migration owners — 2026-09-20
+
+The current-owner census cannot rule out a retiring, already-unlinked carrier.
+An actual H1 regression test now demonstrates a distinct teardown gap after
+the earlier current-carrier removal join: `MigrateClientTransport` published
+its replacement, called `Close` on the old carrier, and ended its creation
+owner without joining old socket/receive cleanup. The pre-fix generator join
+returned success with zero indexed clients/workers while an old H1 writer
+still held a **16,384-byte** batch buffer. The healthy replacement delivered
+traffic during that barrier. This is premature lifecycle completion, not
+proof that five healthy connected exits are a leak.
+
+The narrow repair joins every unlinked or discarded migration carrier in the
+existing admitted migration worker, outside transport/policy locks. It adds
+no worker, queue, budget, timeout, or packet-path operation. Caller deadlines
+bound their wait without abandoning retirement ownership. Deterministic
+tests cover blocked actual H1 writer and receive cleanup, a healthy
+replacement, failed-replacement timeout/cancellation/lost-generation paths,
+and SDK `DeviceLocal.CloseAndWait` after an actual H1 migration. At final
+completion all captured carrier `Done` channels are closed, the held write
+buffer is released, and carrier admission claims are zero.
+
+Five fresh loopback processes per arm each performed eight migrations with
+eight distinct payloads; all 80 payloads arrived and all final claims were
+zero. Both arms measure full old-carrier completion, so the old early return
+is not counted as a speed advantage. Process-median migration times span
+425.86–724.34 ms before and 520.47–770.97 ms after (medians 570.20 and
+625.63 ms), dominated by unchanged 100–1000 ms startup jitter. The pooled
+nested median is 612.18 → 613.67 ms but is **not** 40 independent samples.
+These results do not establish statistical speed equivalence or improvement.
+Healthy final generator close medians are 1.657 → 1.280 ms. Three fresh SDK
+processes per arm give eight-echo traffic medians 204.053 → 203.969 ms and
+close medians 0.917 → 1.111 ms, with overlapping close ranges. No hot-path
+regression was observed; public Fast.com/TTFB has not been remeasured.
+
+Focused Connect normal ×10, race ×5, opt-in timing under race, SDK migration
+normal ×5, SDK lifecycle/migration race ×5, and both package vets pass.
+Private evidence, raw per-process timing/resource samples, source hashes,
+commands, and invalid draft-fixture attempts are preserved in
+`urnetwork-h1-retired-carrier.W4YZai/REPORT.md`.
+
+This validates lifecycle correctness and release of a known buffer, **not** a
+multi-MiB steady-memory saving. The immediate fixture heap snapshots retain
+test-owned closed clients for assertions and are not post-GC retention
+measurements. Existing physical heap evidence has roughly 74 KiB of H1 batch
+buffers at each boundary, consistent with healthy active exits. A newly
+native-attested, 65,536-byte-rate owner diagnostic is the next attribution
+step; it cannot qualify the absolute **24-MiB** gate or promote a baseline.
+No memory policy or acceptance threshold changed.
+
+### Fresh iOS-profile burst versus quiet, and an independent history-owner fix — 2026-09-20
+
+The native-attested `urnetwork-cleanarm.kqVGmc` H1 arm still **fails the
+absolute 24-MiB gate**: its whole-run peak is **26,353,696 B (25.13 MiB)**,
+1,187,872 B over the limit. All three over-limit samples precede quiet.
+The valid 339,574-ms quiet boundary contains 22 samples spanning 315,002 ms,
+with **zero quiet breaches**, peak **24,723,488 B (23.58 MiB)**, median
+23,486,496 B, and final 22,904,864 B (21.84 MiB). The second offline
+“quiet-teardown” evaluation uses the same original interval and global peak;
+it is not an independent quiet period or evidence of `DeviceLocal.Close`.
+The host gate now reports separate whole-run/quiet peaks and breach counts,
+with a deterministic regression preserving the global failure even when
+every quiet sample passes. No acceptance rule has been relaxed.
+
+At the **349,469-ms** global peak, schema-13 primitives identify 10,566,744 B
+of heap objects, 5,252,008 B of in-use span slack, 1,048,576 B of free
+unreleased heap, 3,342,336 B of stacks, and 6,137,677 B of other runtime
+classes (plus 6,355 B of profiling buckets). There are 257 goroutines,
+4 quality + 1 speed clients, and 164 flows, but zero outstanding packet/pool
+owners and zero tracked/resend/receive/Pack bytes. The 344,064 B returned
+pool is already part of heap, not an additional category. The peak follows
+video-site flow fanout and is about 23 seconds after joined browser cleanup.
+The next sampled reclaim reports 26,353,696 → 23,470,112 B, a 2,883,584-B
+reduction; no later sample breaches the cap. This supports investigating
+post-burst object/span lifetime, not an established queued-packet leak.
+There is no paired heap profile/census in this rate-zero arm, so its exact
+heap owners are still unproven. Five active exits are not post-close residue.
+
+A separate deterministic source audit **does** prove long-session retention
+in `IpAssoc.blockWithLock`: slicing off expired blocks left their pointers
+in the backing array, keeping matrices reachable outside the visible history.
+Clearing only that dropped prefix before advancing the slice releases these
+owners without changing retained history, affinity/scoring, memory policy,
+queues, or the packet hot path. Default eight 300-second blocks mean first
+eviction is around 40 minutes: **this cannot explain the fresh arm's 349-s
+peak and is not a fix for its remaining 24-MiB failure**.
+
+The regression uses unchanged production bounds (2,048 entities / 16,384
+associations per block), an injected block clock, and weak-owner/GC checks.
+Before the fix, eight logically expired matrices remain reachable; after,
+none do, while live matrices/names and pressure release remain correct.
+Three fresh processes per arm show retained heap deltas **4,271,016–4,276,336 B
+→ -1,880–3,440 B** after test-only GC/scavenge (about **4.07 MiB** released;
+small signed residuals are baseline noise). Runtime deltas are
+5,480,448–5,701,632 → 868,352–1,236,992 B, not a physical-memory measurement.
+Five rare-rotation microbenchmarks give median **93.58 → 104.10 ns/op**,
+207–208 B/op and 3 allocations/op in both arms: +10.52 ns on block rotation,
+normally once per 300 seconds, not a packet-path or H1 throughput claim.
+
+Connect normal ×10, race ×5 and vet; SDK lifecycle/reclaimer normal ×3,
+race ×2 and vet; and all **219** Android host tests pass. Raw local repetitions,
+source hashes and commands are in `urnetwork-cleanarm-memory.yC94iJ/REPORT.md`.
+The observed Fast.com displays were **71 / 59 / 19 Mbps**, all completed;
+there is no paired control or baseline promotion. CNN's child exit 2 remains
+a remote/media nondeterministic result pending reproduction, not evidence
+for a TLS/403 interpretation or a tunnel repair.
+
+Next attribution needs a separately authorized native-attested diagnostic
+with 65,536-byte heap sampling and paired owner census before video, after
+video, and after joined browser cleanup, including pre/post-reclaim
+boundaries. That diagnostic cannot qualify the memory gate. No new build,
+device action, policy change, baseline promotion, or commit was performed
+for this analysis. The **whole-run 24-MiB barrier remains unresolved**.
 
 - A low live heap with a high runtime value usually means retained spans,
   stacks, or pool capacity, not a leak. Track `goHeapLiveBytes`,

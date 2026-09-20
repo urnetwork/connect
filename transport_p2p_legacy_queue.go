@@ -1,0 +1,272 @@
+package connect
+
+import (
+	"context"
+	"encoding/binary"
+	"sync"
+	"time"
+	"unsafe"
+)
+
+const (
+	p2pLegacySendSlabByteCount   = 8192
+	p2pLegacySendHeaderByteCount = 10
+	// Reserve the fixed entry table, queue state and one worker's initial stack
+	// before construction. Packet roots have independent live reservations.
+	p2pLegacySendQueueOwnerByteCount ByteCount = 8 * 1024
+	// A lightly loaded carrier transfers existing roots without copying. Only
+	// a sustained backlog needs compact slab storage.
+	p2pLegacySendRawEntryCount = 4
+)
+
+type p2pLegacySendMemoryBudget interface {
+	legacySendMemoryBudget() *TransferMemoryBudget
+}
+
+func (self *peerConn) legacySendMemoryBudget() *TransferMemoryBudget {
+	return self.admissionBudget
+}
+
+// One producer (P2pSendTransport.run) owns admission. The worker serializes all
+// physical SCTP writes. Every accepted root is charged until its final write,
+// including the root borrowed by the currently blocked SCTP call.
+type p2pLegacySendQueue struct {
+	ctx          context.Context
+	cancel       context.CancelFunc
+	write        func([]byte, time.Time) error
+	budget       *TransferMemoryBudget
+	ownerCharge  ByteCount
+	limit        ByteCount
+	epoch        time.Time
+	mutex        sync.Mutex
+	entries      []p2pLegacySendEntry
+	head, count  int
+	retained     ByteCount
+	peakRetained ByteCount
+	closed       bool
+	err          error
+	ready        chan struct{}
+	capacity     chan struct{}
+	done         chan struct{}
+	ownerRelease sync.Once
+}
+
+type p2pLegacySendEntry struct {
+	bytes         []byte
+	read, written int
+	deadline      time.Time
+	charge        ByteCount
+	compact       bool
+}
+
+func newP2pLegacySendQueue(ctx context.Context, cancel context.CancelFunc, write func([]byte, time.Time) error, limit ByteCount, budget *TransferMemoryBudget) *p2pLegacySendQueue {
+	if limit < p2pLegacySendSlabByteCount+MessagePoolMetaByteCount {
+		return nil
+	}
+	entryCount := int(limit/p2pLegacySendSlabByteCount) + p2pLegacySendRawEntryCount
+	ownerCharge := p2pLegacySendQueueOwnerByteCount + ByteCount(entryCount)*ByteCount(unsafe.Sizeof(p2pLegacySendEntry{}))
+	if budget != nil && !budget.TryReserve(ownerCharge) {
+		return nil
+	}
+	q := &p2pLegacySendQueue{
+		ctx: ctx, cancel: cancel, write: write, budget: budget, limit: limit, ownerCharge: ownerCharge,
+		epoch:   time.Now(),
+		entries: make([]p2pLegacySendEntry, entryCount),
+		ready:   make(chan struct{}, 1), capacity: make(chan struct{}, 1), done: make(chan struct{}),
+	}
+	go q.run()
+	return q
+}
+
+func (q *p2pLegacySendQueue) reserveWithLock(charge ByteCount) bool {
+	if q.limit-q.retained < charge || (q.budget != nil && !q.budget.TryReserve(charge)) {
+		return false
+	}
+	q.retained += charge
+	q.peakRetained = max(q.peakRetained, q.retained)
+	return true
+}
+
+func (q *p2pLegacySendQueue) releaseEntryWithLock(entry *p2pLegacySendEntry) {
+	MessagePoolReturn(entry.bytes)
+	q.retained -= entry.charge
+	if q.budget != nil {
+		q.budget.Release(entry.charge)
+	}
+	*entry = p2pLegacySendEntry{}
+}
+
+func notifyP2pLegacySendQueue(channel chan struct{}) {
+	select {
+	case channel <- struct{}{}:
+	default:
+	}
+}
+
+// enqueue consumes wire on every outcome. Control/large messages drain all
+// earlier writes and complete synchronously. A budget refusal has the same
+// synchronous fallback, so memory pressure never makes an empty carrier wait
+// for some unrelated connection to release its reservation.
+func (q *p2pLegacySendQueue) enqueue(wire []byte, deadline time.Time, synchronous bool) error {
+	if synchronous || len(wire)+p2pLegacySendHeaderByteCount > p2pLegacySendSlabByteCount {
+		defer MessagePoolReturn(wire)
+		if err := q.flush(); err != nil {
+			return err
+		}
+		return q.write(wire, deadline)
+	}
+	q.mutex.Lock()
+	if q.closed || q.ctx.Err() != nil {
+		q.mutex.Unlock()
+		MessagePoolReturn(wire)
+		return context.Canceled
+	}
+	var tail *p2pLegacySendEntry
+	if q.count > 0 {
+		tail = &q.entries[(q.head+q.count-1)%len(q.entries)]
+	}
+	if tail != nil && tail.compact && len(tail.bytes)-tail.written >= len(wire)+p2pLegacySendHeaderByteCount {
+		q.appendCompactWithLock(tail, wire, deadline)
+		q.mutex.Unlock()
+		MessagePoolReturn(wire)
+		return nil
+	}
+	if q.count < len(q.entries) {
+		compact := q.count >= p2pLegacySendRawEntryCount
+		charge := ByteCount(cap(wire))
+		if compact {
+			charge = p2pLegacySendSlabByteCount + MessagePoolMetaByteCount
+		}
+		if q.reserveWithLock(charge) {
+			entry := &q.entries[(q.head+q.count)%len(q.entries)]
+			if compact {
+				*entry = p2pLegacySendEntry{bytes: MessagePoolGet(p2pLegacySendSlabByteCount), charge: charge, compact: true}
+				q.appendCompactWithLock(entry, wire, deadline)
+				MessagePoolReturn(wire)
+			} else {
+				*entry = p2pLegacySendEntry{bytes: wire, charge: charge, deadline: deadline}
+			}
+			q.count++
+			q.mutex.Unlock()
+			notifyP2pLegacySendQueue(q.ready)
+			return nil
+		}
+	}
+	q.mutex.Unlock()
+	defer MessagePoolReturn(wire)
+	if err := q.flush(); err != nil {
+		return err
+	}
+	return q.write(wire, deadline)
+}
+
+func (q *p2pLegacySendQueue) appendCompactWithLock(entry *p2pLegacySendEntry, wire []byte, deadline time.Time) {
+	buffer := entry.bytes[entry.written:]
+	binary.BigEndian.PutUint16(buffer, uint16(len(wire)))
+	// Offset from a local monotonic-bearing Time retains deadline semantics
+	// without storing a 24-byte Time per compact packet or using wall time.
+	offset := int64(-1)
+	if !deadline.IsZero() {
+		offset = int64(deadline.Sub(q.epoch))
+	}
+	binary.BigEndian.PutUint64(buffer[2:], uint64(offset))
+	copy(buffer[p2pLegacySendHeaderByteCount:], wire)
+	entry.written += p2pLegacySendHeaderByteCount + len(wire)
+}
+
+func (q *p2pLegacySendQueue) flush() error {
+	for {
+		q.mutex.Lock()
+		closed, err, count := q.closed, q.err, q.count
+		q.mutex.Unlock()
+		if closed || q.ctx.Err() != nil {
+			if err != nil {
+				return err
+			}
+			return context.Canceled
+		}
+		if count == 0 {
+			return nil
+		}
+		select {
+		case <-q.ctx.Done():
+			return context.Canceled
+		case <-q.capacity:
+		}
+	}
+}
+
+// The single producer calls this only after its final enqueue/direct write
+// has returned. Worker cancellation alone cannot release metadata still held
+// by a synchronous no-budget write on that producer.
+func (q *p2pLegacySendQueue) stopAndWait() {
+	q.cancel()
+	<-q.done
+	q.ownerRelease.Do(func() {
+		if q.budget != nil {
+			q.budget.Release(q.ownerCharge)
+		}
+	})
+}
+
+func (q *p2pLegacySendQueue) run() {
+	defer close(q.done)
+	defer func() {
+		q.mutex.Lock()
+		q.closed = true
+		for index := range q.entries {
+			if q.entries[index].bytes != nil {
+				q.releaseEntryWithLock(&q.entries[index])
+			}
+		}
+		q.count = 0
+		q.mutex.Unlock()
+		notifyP2pLegacySendQueue(q.capacity)
+	}()
+	for {
+		if q.ctx.Err() != nil {
+			return
+		}
+		q.mutex.Lock()
+		if q.count == 0 {
+			q.mutex.Unlock()
+			select {
+			case <-q.ctx.Done():
+				return
+			case <-q.ready:
+			}
+			continue
+		}
+		entry := &q.entries[q.head]
+		wire, deadline := entry.bytes, entry.deadline
+		if entry.compact {
+			buffer := entry.bytes[entry.read:]
+			length := int(binary.BigEndian.Uint16(buffer))
+			offset := int64(binary.BigEndian.Uint64(buffer[2:]))
+			if offset != -1 {
+				deadline = q.epoch.Add(time.Duration(offset))
+			}
+			wire = buffer[p2pLegacySendHeaderByteCount : p2pLegacySendHeaderByteCount+length]
+		}
+		q.mutex.Unlock()
+		err := q.write(wire, deadline)
+		q.mutex.Lock()
+		if err != nil {
+			q.err = err
+			q.closed = true
+			q.mutex.Unlock()
+			q.cancel()
+			return
+		}
+		if entry.compact {
+			entry.read += len(wire) + p2pLegacySendHeaderByteCount
+		}
+		if !entry.compact || entry.read == entry.written {
+			q.releaseEntryWithLock(entry)
+			q.head = (q.head + 1) % len(q.entries)
+			q.count--
+		}
+		q.mutex.Unlock()
+		notifyP2pLegacySendQueue(q.capacity)
+	}
+}

@@ -408,7 +408,12 @@ func (self *IpAssoc) blockWithLock(now time.Time) *ipAssocBlock {
 	block := newIpAssocBlock(now.Add(self.settings.AssociationBlockDuration))
 	self.blocks = append(self.blocks, block)
 	if self.settings.AssociationBlockCount < len(self.blocks) {
-		self.blocks = self.blocks[len(self.blocks)-self.settings.AssociationBlockCount:]
+		dropCount := len(self.blocks) - self.settings.AssociationBlockCount
+		// An interior slice still keeps its whole backing array alive. Clear
+		// the expired owners before advancing so discarded matrices cannot
+		// survive outside the visible history until the next slice growth.
+		clear(self.blocks[:dropCount])
+		self.blocks = self.blocks[dropCount:]
 		// prune base names for entities no longer in any block
 		liveAddrs := map[netip.Addr]bool{}
 		for _, block := range self.blocks {

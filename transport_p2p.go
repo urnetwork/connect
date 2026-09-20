@@ -173,6 +173,11 @@ func DefaultP2pTransportSettings() *P2pTransportSettings {
 		// measurement sustained the same 53-54 MiB/s at depths 1/4/8/32.
 		// Receive handoff has independent count and byte limits below.
 		ChannelBufferSize: 4,
+		// A cold SCTP congestion window can take several RTTs to catch a fixed
+		// datagram offer. Compact only the legacy writer's sustained backlog,
+		// with separately charged live roots; H1 and the native fast lane do
+		// not enter this queue.
+		LegacySendQueueByteCount: kib(256),
 		// The carrier readers hand off without waiting. Count and bytes are
 		// independent: 256 slots absorb concurrent data, ACK, contract, and
 		// probe sequence bursts, while the separate byte bound still permits at
@@ -252,6 +257,11 @@ type P2pTransportSettings struct {
 	// responses stop crossing the complete path.
 	EndToEndProbeTimeout time.Duration
 	ChannelBufferSize    int
+	// LegacySendQueueByteCount caps live packet roots in the compact SCTP
+	// writer. Each root and its fixed worker owner reserve from the actual
+	// peer connection's shared WebRTC budget. No-budget writes fall back to
+	// synchronous carrier backpressure; nonpositive disables the queue.
+	LegacySendQueueByteCount ByteCount
 	// ReceiveQueueMessageCount bounds complete messages waiting between the
 	// SCTP/SRTP readers and the RouteManager, including the one currently held
 	// by the forwarding worker. ReceiveQueueByteCount is the hard retained
@@ -1341,6 +1351,7 @@ func (self *P2pSendTransport) nextSend(probeBurst *int) ([]byte, bool) {
 }
 
 func (self *P2pSendTransport) run() {
+	var legacyQueue *p2pLegacySendQueue
 	defer close(self.done)
 	defer func() {
 		self.probeSendAdmission.close()
@@ -1349,6 +1360,9 @@ func (self *P2pSendTransport) run() {
 		}
 		self.cancel()
 		self.probeSendAdmission.wait()
+		if legacyQueue != nil {
+			legacyQueue.stopAndWait()
+		}
 		if self.routeRetired != nil {
 			if self.testingBeforeRouteRetirementWait != nil {
 				self.testingBeforeRouteRetirementWait()
@@ -1379,7 +1393,32 @@ func (self *P2pSendTransport) run() {
 		}
 	}()
 
-	pairRecorded := false
+	var pairRecorded atomic.Bool
+	writeLegacy := func(transferFrameBytes []byte, deadline time.Time) error {
+		progressObserver := self.settings.ProgressObserver
+		progress := beginTransferProgress(progressObserver, TransferProgressEvent{
+			Stage: "p2p_write_begin", PeerId: self.transportId, SequenceId: self.streamId,
+			TransportType: TransportTypeP2p, QueueLength: len(self.send), QueueCapacity: cap(self.send),
+		}, transferFrameBytes)
+		self.conn.SetWriteDeadline(deadline)
+		nw, err := self.conn.Write(transferFrameBytes)
+		if nw < len(transferFrameBytes) && err == nil {
+			err = io.ErrShortWrite
+		}
+		endTransferProgress(progressObserver, progress, "p2p_write_end", err == nil, err)
+		if err != nil {
+			DefaultLogger().V(1).Infof("[p2p]s(%s) send write err = %s\n", self.streamId, err)
+			return err
+		}
+		if stats := self.settings.DataPlaneStats; stats != nil && !isP2pStreamProbe(transferFrameBytes) {
+			if pairRecorded.CompareAndSwap(false, true) {
+				recordP2pSelectedPair(stats, self.conn)
+			}
+			stats.legacySendMessageCount.Add(1)
+			stats.legacySendByteCount.Add(uint64(len(transferFrameBytes)))
+		}
+		return nil
+	}
 	probeBurst := 0
 	for {
 		transferFrameBytes, ok := self.nextSend(&probeBurst)
@@ -1407,12 +1446,17 @@ func (self *P2pSendTransport) run() {
 					fastConn.WaitFastPathReady(self.ctx, self.settings.ConnectTimeout)
 				}
 				if supportsFastPath && fastConn.FastPathReady() {
+					if legacyQueue != nil {
+						if err := legacyQueue.flush(); err != nil {
+							MessagePoolReturn(transferFrameBytes)
+							return
+						}
+					}
 					fragmentCount, err := fastConn.WriteFastPathMessage(transferFrameBytes)
 					if err == nil {
 						if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
-							if !pairRecorded {
+							if pairRecorded.CompareAndSwap(false, true) {
 								recordP2pSelectedPair(stats, self.conn)
-								pairRecorded = true
 							}
 							stats.fastSendMessageCount.Add(1)
 							stats.fastSendByteCount.Add(uint64(messageByteCount))
@@ -1441,29 +1485,23 @@ func (self *P2pSendTransport) run() {
 				}
 			}
 
-			progressObserver := self.settings.ProgressObserver
-			progress := beginTransferProgress(progressObserver, TransferProgressEvent{
-				Stage: "p2p_write_begin", PeerId: self.transportId, SequenceId: self.streamId,
-				TransportType: TransportTypeP2p, QueueLength: len(self.send), QueueCapacity: cap(self.send),
-			}, transferFrameBytes)
-			self.conn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
-			nw, err := self.conn.Write(transferFrameBytes)
-			MessagePoolReturn(transferFrameBytes)
-			if nw < messageByteCount && err == nil {
-				err = io.ErrShortWrite
-			}
-			endTransferProgress(progressObserver, progress, "p2p_write_end", err == nil, err)
-			if err != nil {
-				DefaultLogger().V(1).Infof("[p2p]s(%s) send write err = %s\n", self.streamId, err)
-				return
-			}
-			if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
-				if !pairRecorded {
-					recordP2pSelectedPair(stats, self.conn)
-					pairRecorded = true
+			if legacyQueue == nil && self.settings.LegacySendQueueByteCount > 0 {
+				var budget *TransferMemoryBudget
+				if owner, ok := self.conn.(p2pLegacySendMemoryBudget); ok {
+					budget = owner.legacySendMemoryBudget()
 				}
-				stats.legacySendMessageCount.Add(1)
-				stats.legacySendByteCount.Add(uint64(messageByteCount))
+				legacyQueue = newP2pLegacySendQueue(self.ctx, self.cancel, writeLegacy, self.settings.LegacySendQueueByteCount, budget)
+			}
+			deadline := time.Now().Add(self.settings.WriteTimeout)
+			var err error
+			if legacyQueue != nil {
+				err = legacyQueue.enqueue(transferFrameBytes, deadline, probeMessage)
+			} else {
+				err = writeLegacy(transferFrameBytes, deadline)
+				MessagePoolReturn(transferFrameBytes)
+			}
+			if err != nil {
+				return
 			}
 		}
 	}
