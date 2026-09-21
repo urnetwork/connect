@@ -93,4 +93,4 @@ retract v0.2.0 // retract self
 
 replace github.com/urnetwork/glog => ../glog
 
-replace github.com/pion/sctp => ./third_party/sctp
+replace github.com/pion/sctp => ./sctp

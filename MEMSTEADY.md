@@ -2523,7 +2523,7 @@ not a hidden success. The loss regression now asserts exactly one retransmit
 per deliberately dropped single-DATA packet; no spurious retransmits are
 allowed on the lossless reverse path.
 
-The measured candidate is now tracked as `third_party/sctp`, pinned to the
+The measured candidate is now tracked as `sctp`, pinned to the
 complete upstream v1.11.1 source with only the flight-state repair and its
 tests. Explicit replacements in Connect, SDK main/build/cgo/js, server,
 proxy, operator-proxy, and sn prevent Go's non-inherited-replacement rule from
@@ -2775,3 +2775,48 @@ legacy SCTP lane or inject 120-ms RTT, so it does not replace the deterministic
 120-ms service cohort; that cohort admits 468/468 offers in ten normal runs
 with zero refusal/retransmission. It is also not evidence about public H1
 TTFB, Fast.com, or the unresolved short-lived iOS-profile burst.
+
+### Scoped H1 diagnostic profile versus rate-zero qualification — 2026-09-21
+
+The freshly native-attested `urnetwork-iosscoped-aapt.paZ8U8` Wikipedia and
+three-Fast.com H1 arm used the correct 20-MiB admission / 32-MiB runtime policy,
+but **all 45 primitive samples had heap-profile rate 65,536**. Native
+before/writer/after provenance and the initial live status agree on that rate:
+this was a diagnostic configuration, not a propagation failure or rate-zero
+qualification. The old profile preflight validated only the two budgets and
+incorrectly allowed the diagnostic build into the qualification sequence.
+
+The measured maximum remains **25,442,584 B (24.264 MiB)**, 276,760 B above the
+absolute cap, with four over-limit samples. All four are inside this arm's
+quiet boundary (23 samples spanning 330,002 ms). The peak at 499,474 ms has
+8,513,768 B allocated heap, 4,355,864 B in-use span slack, 1,089,536 B free
+unreleased heap, 3,309,568 B stacks, **1,850,363 B profiling buckets**, and
+6,323,485 B other runtime classes. Returned pools account for 164,096 B within
+heap; outstanding pooled roots are 114,432 B and tracked transfer memory is
+1,318,612 B. These categories are not additive to heap a second time.
+The retained session produced no paired heap profile/owner-census artifacts,
+so individual live-heap owners at the peak remain unproven.
+
+The profiling-bucket cost alone exceeds the overshoot, but subtracting it from
+runtime is **not** a valid production measurement or permission to claim a
+pass. Sampling also affects allocation timing and GC, while the historical
+rate-zero breach remains unresolved. Neither the 24-MiB limit nor production
+queue/pool/GC policy changed for this finding.
+
+`physical_memory_profile.mjs` now defaults to qualification and requires the
+live numeric rate to be zero before traffic. Explicit diagnostic mode requires
+65,536 and always reports `qualificationEligible=false`. The quiet gate
+independently requires rate zero at both status boundaries and in every active,
+quiet, and teardown sample; missing/string rates fail rather than defaulting to
+zero. A memory breach stays visible with its original byte count even when
+the profile is invalid. Deterministic tests reproduce this 20/32/65,536
+misclassification, diagnostic opt-in, rate changes outside quiet, missing
+evidence, and the absolute gate without subtracting profiling buckets.
+
+For the next qualification, freeze `NATIVE_PROFILE_RATE=0`, pass matching zero
+to native and app/test builds, and require the updated ready gate before the
+unchanged workload. A future owner diagnostic instead needs fresh paired
+pre-GC census, heap profile, post-GC census, and last-of-all private stacks at
+matched idle, post-burst, and quiet boundaries. A completed session cannot
+retroactively provide peak-owner evidence. Public-egress video remains outside
+this scoped arm; no physical performance baseline is promoted by this result.
