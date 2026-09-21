@@ -2820,3 +2820,56 @@ pre-GC census, heap profile, post-GC census, and last-of-all private stacks at
 matched idle, post-burst, and quiet boundaries. A completed session cannot
 retroactively provide peak-owner evidence. Public-egress video remains outside
 this scoped arm; no physical performance baseline is promoted by this result.
+
+### Valid rate-zero scoped H1 arm: post-traffic burst remains — 2026-09-21
+
+The canonical `physical_h1_arm.mjs` arm `VtKzNI` completed on the allowlisted
+Pixel over Wi-Fi with providing disabled, explicit H1, freshly attested native
+and APK inputs, the 20-MiB device admission target, 32-MiB Go soft limit, and
+heap-profile rate **zero**. All four workload children and browser cleanup
+joined successfully. Five cache-disabled Wikipedia loads measured **450.6 ms
+median load / 176.6 ms median TTFB**. The three canonical Fast.com displays
+were **90 / 54 / 41 Mbps**, median **54 Mbps**, with all three at least 40 Mbps.
+The 384 radio/thermal collector samples were eligible. This is one valid
+observation, not a paired performance comparison or a new baseline.
+
+The absolute memory gate **fails**: 2 of 27 primitive samples exceed
+25,165,824 B. Both are inside the 21-sample connected quiet interval spanning
+300,002 ms. The whole-run and quiet maxima are **29,405,216 B (28.043 MiB)**,
+**4,239,392 B above the cap**. The peak occurs at 94,362 ms, **3,617 ms after
+joined Chrome cleanup**; calling that phase quiet does not imply all VPN work
+has drained. At that instant the components are:
+
+| Runtime class | Bytes |
+|---|---:|
+| Allocated heap objects | 12,178,752 |
+| Unused space inside occupied heap spans | 5,941,952 |
+| Free heap pages not yet released | 1,351,680 |
+| In-use goroutine stacks | 3,276,800 |
+| Other runtime classes, including 6,355 B profiling buckets | 6,656,032 |
+| **Go runtime total** | **29,405,216** |
+
+The last GC marked 11,447,120 B live. There are 279 goroutines and 101 indexed
+flows. Returned message buffers retain only 373,248 B, outstanding packet roots
+account for 240,640 B, and tracked resend ownership is 1,433,844 B; receive and
+Pack handoff queues are empty. These owner counters overlap heap objects and
+are not additive runtime classes. Nine platform claims total 3,801,088 B;
+claims describe reserved permission, not measured allocations.
+
+At the next sample, tracked queues have drained and packet roots fall to 256 B,
+but runtime still reaches 25,268,256 B. Occupied-span slack has risen to
+6,527,224 B as objects die. The sole automatic reclaim subsequently reports
+25,333,792 -> 22,982,688 B. The remaining 19 quiet samples range from
+23,474,208 to 24,064,032 B, and the final sample is 23,646,240 B. Recovery
+after a breach cannot satisfy an absolute gate; further free-list trimming
+alone cannot reclaim space inside still-occupied allocator spans.
+
+This rate-zero arm has no paired heap profiles or owner censuses. It proves
+the unresolved burst exists in the Wikipedia/Fast.com scope without public
+video or profiling overhead; it does not identify the allocations pinning
+those spans. Preserve this failure and collect the separate diagnostic
+boundaries described above, then use an owner-specific lifetime/allocation
+reproduction before retaining a production remedy. Queue/window sizes,
+timeouts, GC settings and all acceptance thresholds remain unchanged.
+Normal finish and joined cleanup released all five created clients and their
+five markers, removed the staged credentials, and left the target app stopped.
