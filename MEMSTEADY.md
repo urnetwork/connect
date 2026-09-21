@@ -2941,3 +2941,90 @@ now retain an exclusive mode-0600 sanitized failure receipt with fixed operation
 HTTP/known transport classification and partial counts; no raw exception text,
 client identifiers, credentials or endpoints are published. The original arm
 remains non-qualifying and its failed terminal record is not rewritten.
+
+### Rate-zero repeat variance and mobile logging retention — 2026-09-21
+
+Two fresh allowlisted Pixel/Wi-Fi, provider-off H1 arms used the same
+`2db4f81e` packet-allocation build, 20-MiB admission target, 32-MiB Go soft
+limit and profile rate zero. They must be recorded together:
+
+| Metric | Arm A (`Ujt2U0`) | Immediate repeat (`hABWOK`) |
+| --- | ---: | ---: |
+| Whole-run runtime maximum | 24,891,424 B | 25,235,488 B |
+| Margin below 25,165,824-B cap | 274,400 B | **−69,664 B** |
+| Samples above cap / primitive samples | 0 / 27 | **1 / 34** |
+| Quiet runtime maximum | 24,563,744 B | **25,235,488 B** |
+| Final runtime sample | 23,973,920 B | 24,047,648 B |
+| Wikipedia median load / TTFB | 540.8 / 209.1 ms | Not qualified |
+| Fast.com median / runs ≥40 Mbps | **24 Mbps / 0 of 3** | Not qualified |
+| Workload/qualification | Valid; sampled memory passes | One workload child failed; memory fails |
+| Session cleanup | Complete | Complete |
+
+Arm A does not establish the 40-Mbps speed goal or justify baseline promotion.
+The repeat's workload failure makes its throughput comparison invalid, but
+does not erase the independently observed memory breach. Its maximum occurs
+3,805 ms after joined browser cleanup, with 43 indexed flows and 273
+goroutines. At that sample returned pools retain only 278,528 B, packet roots
+1,280 B, and tracked resend/receive/Pack ownership zero. At the next sample
+runtime falls to 24,703,008 B without an idle trim. No threshold is relaxed,
+quiet sample excluded, or forced collection inserted to claim a pass.
+
+The repeat peak is 344,064 B above arm A's peak, despite fewer flows and less
+allocated heap. The exact non-overlapping class comparison is:
+
+| Runtime class | Arm A peak B | Repeat peak B | Repeat minus A B |
+| --- | ---: | ---: | ---: |
+| Allocated heap objects | 9,458,688 | 9,117,872 | −340,816 |
+| Unused space in occupied spans | 5,229,568 | 5,316,432 | +86,864 |
+| Free unreleased heap pages | 1,261,568 | 1,327,104 | +65,536 |
+| In-use goroutine stacks | 3,080,192 | 3,342,336 | +262,144 |
+| Other runtime classes | 5,861,408 | 6,131,744 | +270,336 |
+| **Total** | **24,891,424** | **25,235,488** | **+344,064** |
+
+These peaks occur at different traffic/lifetime points. The counters identify
+insufficient runtime/allocator headroom, not a newly proven retained-object
+leak, and do not justify shrinking H1 windows. In particular, rate-zero
+counters cannot assign the stack/runtime delta to one production allocation.
+
+The earlier paired owner diagnostic does establish a separate removable fixed
+owner: INFO, WARNING and ERROR each retain a 256-KiB `glog` file buffer after
+the first ERROR opens the latter two. `glog_file.go` now selects **32 KiB only
+for Android and iOS** from immutable `runtime.GOOS`; Darwin desktop, Windows,
+Linux/server and other platforms remain at **256 KiB**. Three open severity
+buffers retain 98,304 instead of 786,432 B: an exact **688,128-B (672-KiB)
+capacity reduction**. This is not an equal-sized guarantee of a sampled
+Go-runtime reduction: span reuse and scavenging determine when physical
+runtime pages change. No logging severity, routing, flush interval, immediate
+high-severity flush request, disk-sync behavior, queue/window or GC policy is
+changed. Large entries continue through the writer without growing its buffer.
+Filling a smaller buffer can issue an underlying write sooner; the continuous
+benchmark below deliberately includes that cost.
+
+Host arm64 real-file fixtures, five 200-ms repeats with `GOMAXPROCS=10`, used
+256-B log lines and bounded temporary files. Median costs, not phone speeds:
+
+| Fixture | 256-KiB default ns/line | 32-KiB mobile ns/line | Mobile extra ns/line |
+| --- | ---: | ---: | ---: |
+| Buffer only; flush each 32 lines | 26.40 | 28.01 | +1.61 |
+| Buffer only; continuous logging | 11.37 | 13.29 | +1.92 |
+| Complete file sink; flush each 32 lines | 58.91 | 59.16 | +0.25 |
+| Complete file sink; continuous logging | 43.54 | 46.13 | +2.59 |
+
+All fixtures measured zero B/op and zero allocs/op. Continuous file-sink
+logging is about 5.9% slower in this deliberately saturated microbenchmark;
+the memory saving is not presented as a logging speedup. Phone disk-write
+latency, application TTFB and Fast.com impact still require a fresh arm.
+The complete-sink fixture includes locking, existing-file checks, severity
+routing and the rotation check, but excludes message formatting and fsync;
+neither of those excluded operations was changed.
+
+`glog_buffer_test.go` reproduces the old mobile budget failure and guards
+unchanged desktop/server capacities, INFO-through-FATAL fan-out/flush requests,
+large ERROR contents, unchanged buffer capacity after large writes, rotation
+and pending-byte preservation/old-file closure, and zero-allocation steady
+ERROR delivery. Normal and race suites pass; repeat the focused cases with
+`go test -race -run '^Test(LogFileBuffer|MobileFileSink|LogFileRotation)' -count=5`.
+Run both cost fixtures with
+`go test -run '^$' -bench '^(BenchmarkLogFileBufferPolicy|BenchmarkFileSinkBufferPolicy)$' -benchmem -benchtime=200ms -count=5`.
+This source fix remains **device-peak unqualified pending a fresh rate-zero
+arm**, with the same absolute 24-MiB gate and unchanged workloads.
