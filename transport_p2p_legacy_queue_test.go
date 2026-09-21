@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -18,6 +19,43 @@ func legacyQueueTestPacket(identity uint32, size int) []byte {
 	}
 	binary.BigEndian.PutUint32(packet, identity)
 	return packet
+}
+
+type p2pLegacyQueueBudgetTestConn struct {
+	net.Conn
+	budget *TransferMemoryBudget
+}
+
+func (self *p2pLegacyQueueBudgetTestConn) legacySendMemoryBudget() *TransferMemoryBudget {
+	return self.budget
+}
+
+func TestP2pLegacySmallControlKeepsSynchronousOwner(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		budget := NewTransferMemoryBudget(kib(512))
+		conn := &p2pProbePressureConn{ctx: ctx}
+		written := make(chan struct{}, 1)
+		conn.onWire = func([]byte) {
+			if budget.UsedByteCount() != 0 {
+				t.Error("small control allocated a compact queue owner")
+			}
+			written <- struct{}{}
+		}
+		settings := DefaultP2pTransportSettings()
+		settings.DataPlaneMode = P2pDataPlaneModeLegacyOnly
+		transport, route := newP2pSendTransportForPeer(ctx, cancel, &p2pLegacyQueueBudgetTestConn{Conn: conn, budget: budget}, NewId(), NewId(), settings, false, nil)
+		route <- MessagePoolCopy([]byte{1})
+		<-written
+		if err := transport.(P2pRouteLifecycle).CloseAndWait(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if stats := budget.Stats(); stats.ReservedByteCount != 0 {
+			t.Fatalf("control-only generation used queue memory: %+v", stats)
+		}
+	})
 }
 
 func TestP2pLegacySendQueueSharedBudgetRetainsBlockedOwnerUntilJoin(t *testing.T) {
@@ -212,6 +250,50 @@ func TestP2pLegacySendQueueErrorCancelsAndReturnsAllRoots(t *testing.T) {
 		q.stopAndWait()
 		if budget.UsedByteCount() != 0 {
 			t.Fatal("error drain retained budget")
+		}
+	})
+}
+
+func TestP2pLegacySendQueueRefillsAfterOneRelease(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		budget := NewTransferMemoryBudget(kib(64))
+		permit := make(chan struct{})
+		started := make(chan struct{}, 8)
+		q := newP2pLegacySendQueue(ctx, cancel, func([]byte, time.Time) error {
+			started <- struct{}{}
+			<-permit
+			return nil
+		}, 4*(packetPoolSize+MessagePoolMetaByteCount), budget)
+		defer func() { cancel(); close(permit); q.stopAndWait() }()
+		for index := range 4 {
+			if err := q.enqueue(legacyQueueTestPacket(uint32(index), 1134), time.Time{}, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		<-started
+		completed := make(chan error, 1)
+		go func() { completed <- q.enqueue(legacyQueueTestPacket(4, 1134), time.Time{}, false) }()
+		synctest.Wait()
+		select {
+		case <-completed:
+			t.Fatal("full byte budget admitted an extra root")
+		default:
+		}
+		permit <- struct{}{}
+		<-started // second old write is now held; only one root was released
+		synctest.Wait()
+		select {
+		case err := <-completed:
+			if err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatal("one released root did not reopen admission; enqueue drained the whole backlog")
+		}
+		if budget.UsedByteCount() != q.ownerCharge+q.limit {
+			t.Fatal("incremental admission changed the exact byte ceiling")
 		}
 	})
 }

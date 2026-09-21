@@ -40,3 +40,28 @@ func TestProviderUdpSctpCompactQueueExhaustedBudgetPreservesBoundedRefusal(t *te
 	}
 	budget.Release(kib(64))
 }
+
+// A tiny physical service cost must not make a continuously backlogged
+// application appear idle to SCTP congestion control. This is an independent
+// deterministic control for the failure exposed by race instrumentation.
+func TestProviderUdpSctpCompactQueueServiceCostPreservesFixedOffer(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, delay := range []time.Duration{50 * time.Microsecond, time.Millisecond} {
+		t.Run(delay.String(), func(t *testing.T) {
+			budget := NewTransferMemoryBudget(kib(768))
+			if !budget.TryReserve(kib(512)) {
+				t.Fatal("existing SCTP owner admission failed")
+			}
+			result := runProviderUdpSctpQueueExperiment(t, 120*time.Millisecond, false, false, 4, 0,
+				udpSctpProductionQueueExperimentSettings{enabled: true, budget: budget, traceWindow: true, writeDelay: delay})
+			t.Logf("%+v", result)
+			if result.admitted != 468 || result.refused != 0 || result.retransmits != 0 {
+				t.Fatalf("bounded slow service lost the full fixed offer: %+v", result)
+			}
+			if budget.UsedByteCount() != kib(512) || result.peakSharedBudgetBytes > kib(768) {
+				t.Fatalf("slow service leaked or exceeded shared budget: %+v", result)
+			}
+			budget.Release(kib(512))
+		})
+	}
+}

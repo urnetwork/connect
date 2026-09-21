@@ -104,9 +104,10 @@ func notifyP2pLegacySendQueue(channel chan struct{}) {
 }
 
 // enqueue consumes wire on every outcome. Control/large messages drain all
-// earlier writes and complete synchronously. A budget refusal has the same
-// synchronous fallback, so memory pressure never makes an empty carrier wait
-// for some unrelated connection to release its reservation.
+// earlier writes and complete synchronously. A full queue waits only for the
+// next released entry, keeping its existing backlog moving. An empty queue
+// uses synchronous fallback when no byte budget is available, so unrelated
+// connections cannot stop an otherwise writable carrier.
 func (q *p2pLegacySendQueue) enqueue(wire []byte, deadline time.Time, synchronous bool) error {
 	if synchronous || len(wire)+p2pLegacySendHeaderByteCount > p2pLegacySendSlabByteCount {
 		defer MessagePoolReturn(wire)
@@ -115,49 +116,57 @@ func (q *p2pLegacySendQueue) enqueue(wire []byte, deadline time.Time, synchronou
 		}
 		return q.write(wire, deadline)
 	}
-	q.mutex.Lock()
-	if q.closed || q.ctx.Err() != nil {
-		q.mutex.Unlock()
-		MessagePoolReturn(wire)
-		return context.Canceled
-	}
-	var tail *p2pLegacySendEntry
-	if q.count > 0 {
-		tail = &q.entries[(q.head+q.count-1)%len(q.entries)]
-	}
-	if tail != nil && tail.compact && len(tail.bytes)-tail.written >= len(wire)+p2pLegacySendHeaderByteCount {
-		q.appendCompactWithLock(tail, wire, deadline)
-		q.mutex.Unlock()
-		MessagePoolReturn(wire)
-		return nil
-	}
-	if q.count < len(q.entries) {
-		compact := q.count >= p2pLegacySendRawEntryCount
-		charge := ByteCount(cap(wire))
-		if compact {
-			charge = p2pLegacySendSlabByteCount + MessagePoolMetaByteCount
-		}
-		if q.reserveWithLock(charge) {
-			entry := &q.entries[(q.head+q.count)%len(q.entries)]
-			if compact {
-				*entry = p2pLegacySendEntry{bytes: MessagePoolGet(p2pLegacySendSlabByteCount), charge: charge, compact: true}
-				q.appendCompactWithLock(entry, wire, deadline)
-				MessagePoolReturn(wire)
-			} else {
-				*entry = p2pLegacySendEntry{bytes: wire, charge: charge, deadline: deadline}
-			}
-			q.count++
+	for {
+		q.mutex.Lock()
+		if q.closed || q.ctx.Err() != nil {
 			q.mutex.Unlock()
-			notifyP2pLegacySendQueue(q.ready)
+			MessagePoolReturn(wire)
+			return context.Canceled
+		}
+		var tail *p2pLegacySendEntry
+		if q.count > 0 {
+			tail = &q.entries[(q.head+q.count-1)%len(q.entries)]
+		}
+		if tail != nil && tail.compact && len(tail.bytes)-tail.written >= len(wire)+p2pLegacySendHeaderByteCount {
+			q.appendCompactWithLock(tail, wire, deadline)
+			q.mutex.Unlock()
+			MessagePoolReturn(wire)
 			return nil
 		}
+		if q.count < len(q.entries) {
+			compact := q.count >= p2pLegacySendRawEntryCount
+			charge := ByteCount(cap(wire))
+			if compact {
+				charge = p2pLegacySendSlabByteCount + MessagePoolMetaByteCount
+			}
+			if q.reserveWithLock(charge) {
+				entry := &q.entries[(q.head+q.count)%len(q.entries)]
+				if compact {
+					*entry = p2pLegacySendEntry{bytes: MessagePoolGet(p2pLegacySendSlabByteCount), charge: charge, compact: true}
+					q.appendCompactWithLock(entry, wire, deadline)
+					MessagePoolReturn(wire)
+				} else {
+					*entry = p2pLegacySendEntry{bytes: wire, charge: charge, deadline: deadline}
+				}
+				q.count++
+				q.mutex.Unlock()
+				notifyP2pLegacySendQueue(q.ready)
+				return nil
+			}
+		}
+		empty := q.count == 0
+		q.mutex.Unlock()
+		if empty {
+			defer MessagePoolReturn(wire)
+			return q.write(wire, deadline)
+		}
+		select {
+		case <-q.ctx.Done():
+			MessagePoolReturn(wire)
+			return context.Canceled
+		case <-q.capacity:
+		}
 	}
-	q.mutex.Unlock()
-	defer MessagePoolReturn(wire)
-	if err := q.flush(); err != nil {
-		return err
-	}
-	return q.write(wire, deadline)
 }
 
 func (q *p2pLegacySendQueue) appendCompactWithLock(entry *p2pLegacySendEntry, wire []byte, deadline time.Time) {

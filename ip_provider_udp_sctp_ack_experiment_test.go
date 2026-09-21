@@ -9,6 +9,7 @@ import (
 	"hash/crc32"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -31,19 +32,20 @@ type udpSctpAckExperimentPacket struct {
 }
 
 type udpSctpAckExperimentConn struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	incoming  chan udpSctpAckExperimentPacket
-	peer      *udpSctpAckExperimentConn
-	delay     atomic.Int64
-	immediate bool
-	lock      sync.Mutex
-	measuring bool
-	firstAck  time.Time
-	dataTsns  map[uint32]bool
-	dataCount int
-	repeated  int
-	sackCount int
+	ctx                                       context.Context
+	cancel                                    context.CancelFunc
+	incoming                                  chan udpSctpAckExperimentPacket
+	peer                                      *udpSctpAckExperimentConn
+	delay                                     atomic.Int64
+	immediate                                 bool
+	lock                                      sync.Mutex
+	measuring                                 bool
+	firstAck                                  time.Time
+	dataTsns                                  map[uint32]bool
+	dataCount                                 int
+	repeated                                  int
+	sackCount                                 int
+	dropEvery, dropFirst, dataWrites, dropped int
 }
 
 func udpSctpAckExperimentChunks(packet []byte, visit func(byte, []byte)) error {
@@ -67,8 +69,10 @@ func udpSctpAckExperimentChunks(packet []byte, visit func(byte, []byte)) error {
 func (c *udpSctpAckExperimentConn) Write(packet []byte) (int, error) {
 	owned := append([]byte(nil), packet...)
 	c.lock.Lock()
+	hasData := false
 	err := udpSctpAckExperimentChunks(owned, func(kind byte, chunk []byte) {
 		if kind == 0 || kind == 64 { // DATA and I-DATA
+			hasData = true
 			if c.immediate {
 				chunk[1] |= 0x08 // RFC immediate-SACK request, checksum below.
 			}
@@ -84,9 +88,20 @@ func (c *udpSctpAckExperimentConn) Write(packet []byte) (int, error) {
 			c.sackCount++
 		}
 	})
+	drop := false
+	if c.measuring && hasData {
+		c.dataWrites++
+		drop = c.dataWrites <= c.dropFirst || (c.dropEvery > 0 && c.dataWrites%c.dropEvery == 0)
+		if drop {
+			c.dropped++
+		}
+	}
 	c.lock.Unlock()
 	if err != nil {
 		return 0, err
+	}
+	if drop {
+		return len(packet), nil
 	}
 	if c.immediate {
 		clear(owned[8:12])
@@ -141,21 +156,58 @@ func (*udpSctpAckExperimentConn) SetWriteDeadline(time.Time) error { return nil 
 // surface that the production peerConn presents to P2pSendTransport.
 type udpSctpAckExperimentStream struct {
 	*sctp.Stream
-	writes      atomic.Int64
-	wireBytes   atomic.Int64
-	sampleRoots func()
-	budget      *TransferMemoryBudget
+	writes           atomic.Int64
+	wireBytes        atomic.Int64
+	sampleRoots      func()
+	budget           *TransferMemoryBudget
+	yieldBeforeWrite bool
+	writeDelay       atomic.Int64
+	ctx              context.Context
+	serviceLimit     uint64
+	serviceWake      chan struct{}
+	dynamicService   *udpSctpDynamicServiceExperiment
 }
 
 func (s *udpSctpAckExperimentStream) legacySendMemoryBudget() *TransferMemoryBudget { return s.budget }
 
 func (s *udpSctpAckExperimentStream) Write(packet []byte) (int, error) {
+	if delay := time.Duration(s.writeDelay.Load()); delay > 0 {
+		time.Sleep(delay)
+	}
+	if s.yieldBeforeWrite {
+		runtime.Gosched()
+	}
+	if s.dynamicService != nil {
+		if err := s.dynamicService.admit(len(packet)); err != nil {
+			return 0, err
+		}
+	} else if s.serviceLimit > 0 {
+		if s.serviceLimit < uint64(len(packet)) {
+			return 0, io.ErrShortBuffer
+		}
+		threshold := s.serviceLimit - uint64(len(packet))
+		s.Stream.SetBufferedAmountLowThreshold(threshold)
+		for s.Stream.BufferedAmount() > threshold {
+			select {
+			case <-s.ctx.Done():
+				return 0, net.ErrClosed
+			case <-s.serviceWake:
+			}
+		}
+	}
 	if s.sampleRoots != nil {
 		s.sampleRoots()
 	}
 	s.writes.Add(1)
 	s.wireBytes.Add(int64(len(packet)))
-	return s.Stream.Write(packet)
+	n, err := s.Stream.Write(packet)
+	if s.dynamicService != nil {
+		s.dynamicService.finishWrite()
+	}
+	if s.sampleRoots != nil {
+		s.sampleRoots()
+	}
+	return n, err
 }
 
 func (*udpSctpAckExperimentStream) LocalAddr() net.Addr  { return &net.IPAddr{} }
@@ -169,6 +221,11 @@ type udpSctpAckExperimentResult struct {
 	firstRefusal, firstAck, drain                     time.Duration
 	initialCwnd, finalCwnd, minReceiverWindow         uint32
 	wireWrites, wireBytes, peakPoolBytes              int64
+	cwndGrowthCount, cwndSkippedBacklogged            int64
+	peakSctpBufferedBytes, peakPoolAndSctpBytes       int64
+	serviceWindowCharge                               ByteCount
+	peakServiceCharge, peakSharedBudgetBytes          ByteCount
+	injectedLossPackets                               int
 }
 
 func runProviderUdpSctpAckExperiment(t *testing.T, roundTrip time.Duration, immediate bool) (result udpSctpAckExperimentResult) {
@@ -184,8 +241,14 @@ func runProviderUdpSctpCapacityExperiment(t *testing.T, roundTrip time.Duration,
 }
 
 type udpSctpProductionQueueExperimentSettings struct {
-	enabled bool
-	budget  *TransferMemoryBudget
+	enabled                                   bool
+	budget                                    *TransferMemoryBudget
+	traceWindow                               bool
+	yieldBeforeWrite                          bool
+	writeDelay                                time.Duration
+	serviceWindowByteCount                    ByteCount
+	dynamicServiceCharge                      bool
+	dropEveryDataPacket, dropFirstDataPackets int
 }
 
 func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, immediate bool, streamEnvelope bool, carrierSlots, compactByteLimit int, production ...udpSctpProductionQueueExperimentSettings) (result udpSctpAckExperimentResult) {
@@ -193,19 +256,44 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+		if len(production) > 0 && production[0].serviceWindowByteCount > 0 {
+			// The candidate pre-reserves twice its strict SCTP payload window,
+			// plus 8 KiB for chunk/queue metadata. This is test-only conservative
+			// accounting, not a claim about measured runtime span ownership.
+			result.serviceWindowCharge = 2*production[0].serviceWindowByteCount + kib(8)
+			if production[0].dynamicServiceCharge {
+				result.serviceWindowCharge = kib(8)
+			}
+			if production[0].budget == nil || !production[0].budget.TryReserve(result.serviceWindowCharge) {
+				t.Fatal("bounded SCTP service-window reservation failed")
+			}
+			defer production[0].budget.Release(result.serviceWindowCharge)
+		}
 		left := &udpSctpAckExperimentConn{ctx: ctx, cancel: cancel, incoming: make(chan udpSctpAckExperimentPacket, 1024), immediate: immediate, dataTsns: map[uint32]bool{}}
 		right := &udpSctpAckExperimentConn{ctx: ctx, cancel: cancel, incoming: make(chan udpSctpAckExperimentPacket, 1024), dataTsns: map[uint32]bool{}}
 		left.peer, right.peer = right, left
+		if len(production) > 0 {
+			left.dropEvery = production[0].dropEveryDataPacket
+			left.dropFirst = production[0].dropFirstDataPackets
+		}
 		type associationResult struct {
 			association *sctp.Association
 			err         error
 		}
 		opened := make(chan associationResult, 1)
 		settings := DefaultWebRtcSettings()
+		windowTrace := newUdpSctpWindowExperimentLogger()
 		config := func(conn net.Conn) sctp.Config {
-			return sctp.Config{NetConn: conn, BlockWrite: true, MTU: 1191,
+			configuration := sctp.Config{NetConn: conn, BlockWrite: true, MTU: 1191,
 				MaxReceiveBufferSize: uint32(settings.ReceiveBufferSize), MaxMessageSize: uint32(settings.MaxMessageSize),
 				MinCwnd: settings.SctpMinCwnd, FastRtxWnd: settings.SctpFastRtxWnd, CwndCAStep: settings.SctpCwndCAStep}
+			if conn == left && len(production) > 0 && production[0].traceWindow {
+				configuration.LoggerFactory = windowTrace
+			}
+			if conn == left && len(production) > 0 && production[0].serviceWindowByteCount > 0 {
+				configuration.BlockWrite = false
+			}
+			return configuration
 		}
 		go func() {
 			association, err := sctp.ServerWithOptions(config(right))
@@ -247,12 +335,33 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 			p2pSettings.LegacySendQueueByteCount = 0
 		}
 		var rootsBaseline, peakRoots atomic.Int64
+		var peakSctpBuffered, peakPoolAndSctp atomic.Int64
+		var peakSharedBudget atomic.Int64
 		var measuring atomic.Bool
 		sampleRoots := func() {
 			if !measuring.Load() {
 				return
 			}
 			value := int64(MessagePoolOutstandingByteCount()) - rootsBaseline.Load()
+			if len(production) > 0 && production[0].budget != nil {
+				used := int64(production[0].budget.UsedByteCount())
+				for prior := peakSharedBudget.Load(); prior < used; prior = peakSharedBudget.Load() {
+					if peakSharedBudget.CompareAndSwap(prior, used) {
+						break
+					}
+				}
+			}
+			sctpBuffered := int64(leftAssociation.BufferedAmount())
+			for prior := peakSctpBuffered.Load(); prior < sctpBuffered; prior = peakSctpBuffered.Load() {
+				if peakSctpBuffered.CompareAndSwap(prior, sctpBuffered) {
+					break
+				}
+			}
+			for prior := peakPoolAndSctp.Load(); prior < value+sctpBuffered; prior = peakPoolAndSctp.Load() {
+				if peakPoolAndSctp.CompareAndSwap(prior, value+sctpBuffered) {
+					break
+				}
+			}
 			for prior := peakRoots.Load(); prior < value; prior = peakRoots.Load() {
 				if peakRoots.CompareAndSwap(prior, value) {
 					break
@@ -260,9 +369,26 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 			}
 		}
 		physicalStream := &udpSctpAckExperimentStream{Stream: leftStream, sampleRoots: sampleRoots}
+		physicalStream.ctx = ctx
 		if len(production) > 0 {
 			physicalStream.budget = production[0].budget
+			physicalStream.yieldBeforeWrite = production[0].yieldBeforeWrite
+			physicalStream.serviceLimit = uint64(production[0].serviceWindowByteCount)
+			if physicalStream.serviceLimit > 0 {
+				physicalStream.serviceWake = make(chan struct{}, 1)
+				if production[0].dynamicServiceCharge {
+					physicalStream.dynamicService = &udpSctpDynamicServiceExperiment{stream: physicalStream}
+					leftStream.OnBufferedAmountLow(physicalStream.dynamicService.releaseAcknowledged)
+					defer func() {
+						_ = leftAssociation.Close()
+						physicalStream.dynamicService.close()
+					}()
+				} else {
+					leftStream.OnBufferedAmountLow(func() { notifyP2pLegacySendQueue(physicalStream.serviceWake) })
+				}
+			}
 		}
+		windowTrace.physicalWrites.Store(&physicalStream.writes)
 		var sendConn net.Conn = physicalStream
 		var compactQueue *udpSctpCompactQueueExperiment
 		if compactByteLimit > 0 {
@@ -347,6 +473,9 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 					t.Fatalf("changed nonblocking source contract: elapsed=%s completion=%+v", time.Since(before), completion)
 				}
 				source[index] = completion.sent
+				if completion.sent {
+					windowTrace.admitted.Add(1)
+				}
 				return completion.sent
 			default:
 				t.Fatal("source did not publish a terminal result without waiting")
@@ -368,7 +497,11 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 		result.minReceiverWindow = leftAssociation.RWND()
 		rootsBaseline.Store(int64(MessagePoolOutstandingByteCount()))
 		measuring.Store(true)
+		windowTrace.measuring.Store(true)
 		initialWrites, initialWireBytes := physicalStream.writes.Load(), physicalStream.wireBytes.Load()
+		if len(production) > 0 {
+			physicalStream.writeDelay.Store(int64(production[0].writeDelay))
+		}
 		left.delay.Store(int64(roundTrip / 2))
 		right.delay.Store(int64(roundTrip / 2))
 		left.lock.Lock()
@@ -423,6 +556,7 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 		}
 		left.lock.Lock()
 		result.firstAck, result.dataChunks, result.retransmits = left.firstAck.Sub(start), left.dataCount, left.repeated
+		result.injectedLossPackets = left.dropped
 		left.lock.Unlock()
 		right.lock.Lock()
 		result.sacks = right.sackCount
@@ -431,6 +565,15 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 		result.wireWrites = physicalStream.writes.Load() - initialWrites
 		result.wireBytes = physicalStream.wireBytes.Load() - initialWireBytes
 		result.peakPoolBytes = peakRoots.Load()
+		result.cwndGrowthCount = windowTrace.growth.Load()
+		result.cwndSkippedBacklogged = windowTrace.skippedBacklogged.Load()
+		result.peakSctpBufferedBytes = peakSctpBuffered.Load()
+		result.peakPoolAndSctpBytes = peakPoolAndSctp.Load()
+		result.peakSharedBudgetBytes = ByteCount(peakSharedBudget.Load())
+		result.peakServiceCharge = result.serviceWindowCharge
+		if physicalStream.dynamicService != nil {
+			result.peakServiceCharge += ByteCount(physicalStream.dynamicService.peakCharge.Load())
+		}
 	})
 	return
 }

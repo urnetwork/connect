@@ -2441,6 +2441,124 @@ PERFVAR source gate, absolute 24-MiB ceiling, and baselines remain unchanged.
 Current helper hashes, all repetitions, failed draft assertion, and commands:
 `urnetwork-udp-sctp-batch.0C7JHL/REPORT.md` (private 0700 directory).
 
+### Legacy SCTP compact backlog and blocked-flight service research — 2026-09-20
+
+The 256-KiB compact legacy send queue added in `018e56d9` is **not yet
+qualified by physical/profile or unchanged PERFVAR replay**. It reserves its
+fixed owner before creation, charges every retained root against the peer's
+shared WebRTC budget, keeps small controls/probes synchronous, and joins its
+physical writer before returning the fixed reservation. H1 and the negotiated
+native fast lane do not use this backlog. The separate absolute **24-MiB
+iOS-profile** gate remains mandatory; none of the following pool measurements
+is whole-runtime or iOS physical-footprint evidence.
+
+Repetition exposed two deterministic adjacent defects. A full queue previously
+flushed the entire backlog instead of admitting again after one root was
+released; `TestP2pLegacySendQueueRefillsAfterOneRelease` fails before the repair
+and passes after it without increasing any cap. Async ownership also consumed
+an extra readiness probe behind a held small control write. Queue creation now
+waits for a bulk message greater than 256 bytes, and small controls remain
+synchronous even after bulk use. The existing probe-pressure assertions and
+`TestP2pLegacySmallControlKeepsSynchronousOwner` preserve the original bounds.
+Broader P2P/WebRTC race validation passes (11.723 s); H1/legacy lifecycle
+isolation race ×3 passes (2.281 s).
+
+The unchanged 468-packet/3.75-Mbit/s, 120-ms-RTT fixture revealed a second
+limiter after the refill fix. Normal compact arms admit all 468 packets, but
+race instrumentation admits only 411–468 in a ten-run untraced cohort. The
+pinned SCTP checks whether its *internal pending queue is nonempty* when a SACK
+advances cumulative progress. With one-message blocking writes, that queue can
+be momentarily empty despite a saturated application backlog. A test-only
+logger observes 42–86 skipped-growth ACKs under race versus 0–5 normally.
+Yielding the writer does not fix the gate (425–468 admissions under race).
+
+This is not merely a race-detector artifact: a deterministic **50-µs per-write
+service cost**, more than 42 times faster than the source's 2.133-ms interval,
+reproduces 369–383 admissions and 126–131 skipped-growth ACKs in three normal
+runs. Later instrumentation controls measure 376–418 admissions. Offered
+traffic and terminal refusals are unchanged; every admitted identity arrives
+once, with zero DATA retransmits. Do not infer statistical improvement by
+comparing these separate instrumented cohorts.
+
+| Candidate, 120-ms RTT + 50-µs service | Admission / 468, three normal repetitions | Decision |
+| --- | ---: | --- |
+| Fixed SCTP windows 16 / 32 / 64 / 96 KiB | 307 / 344 / 389 / 363 | Reject: up-front service reservations steal cold backlog capacity. |
+| Dynamically charged windows 64 / 96 / 128 KiB | 338 / 377 / 368 | Reject: lower retained ownership, but still fails full offer. |
+| Instantaneous pre-SACK full-flight proxy | 390–418 | Reject: ACKs arriving after a service gap still lose the growth signal. |
+| Flight-scoped record of an actual cwnd-blocked send | 468 in every run | Promising isolated dependency candidate; loss/protocol and integration validation pending. |
+
+Both service-window sweeps use the *same* 256-KiB free shared budget. Fixed
+windows reserve twice their payload cap plus an 8-KiB owner; the dynamic arm
+charges twice each live single-fragment payload plus that owner and releases
+on acknowledgement. This is conservative test accounting, not a production
+fragmented-message ownership proof. Dynamic shared claims stay at or below
+786,344 B versus 786,432 B total, and return exactly to the preexisting 512-KiB
+owner. No nonblocking SCTP policy or service-window increase was retained.
+
+The flight-scoped experiment records the last TSN actually sent when another
+pending DATA chunk is blocked by cwnd, retains eligibility only through that
+flight's cumulative acknowledgement, and clears it on a congestion decrease.
+It does not set a cwnd floor or alter ACK generation, reliability or loss
+timers. In the initial isolated fork, normal ×3 and race ×10 admit **468/468**
+at all tested 0 / 50 / 200 / 500 / 1,000-µs service costs, with no retransmits.
+At 50 µs under race, pooled roots peak at 245,760–266,240 B and concurrent
+pool + SCTP payload at 313,038–320,350 B, versus later blocking controls'
+323,584-B pool and 365,542–382,552-B combined peaks. SCTP chunk metadata,
+runtime spans, and device memory are not included in that combined number.
+The protocol tests cover app-limited/expired-flight no-growth,
+fast-recovery suppression, receiver-window versus cwnd marking, TSN wrap,
+and clearing eligibility on congestion reduction. Final tracked tests pass
+race ×20 (1.251 s). Full upstream SCTP short tests pass normal (38.000 s)
+and race (37.824 s). Initial draft protocol fixtures omitted timer teardown;
+their preserved failures were repaired with owned pipe/timer cleanup before
+these full-suite runs, not waived as harmless leaks.
+
+Loss controls at 2 / 50 / 120 ms, normal and race ×3, preserve exact identity
+and byte-budget accounting. At 120 ms with 1% deterministic loss, the candidate
+admits all 468 offers and retransmits exactly the four dropped DATA packets.
+Dropping the entire initial three-packet flight still gives 248 admitted /
+220 refused in both arms, then exactly three retransmits and complete delivery
+of admitted identities. That no-ACK interval remains a bounded source refusal,
+not a hidden success. The loss regression now asserts exactly one retransmit
+per deliberately dropped single-DATA packet; no spurious retransmits are
+allowed on the lossless reverse path.
+
+The measured candidate is now tracked as `third_party/sctp`, pinned to the
+complete upstream v1.11.1 source with only the flight-state repair and its
+tests. Explicit replacements in Connect, SDK main/build/cgo/js, server,
+proxy, operator-proxy, and sn prevent Go's non-inherited-replacement rule from
+silently selecting different implementations. All nine main modules resolve
+to this same source. The unchanged upstream cache is not patched. A release
+outside this workspace needs an upstream/maintained-fork pin or an equivalent
+explicit consumer replacement; installing a new receiver alone does not fix
+an older remote sender's congestion controller.
+
+`TestProviderUdpSctpCompactQueueServiceCostPreservesFixedOffer` is red against
+unmodified v1.11.1: 383/468 at 50 µs, 422/468 at 1 ms. Integrated focused
+normal ×10 PASS (4.515 s), race ×10 PASS (68.050 s); final strict loss,
+H1/legacy lifecycle race ×3 PASS (7.566 s); broad P2P/WebRTC race PASS
+(10.079 s). SDK memory/P2P/H1/lifecycle normal ×3 PASS (10.918 s), race ×3
+PASS (13.931 s), Connect/SDK vet PASS. Server connect/perfvar, SDK build/cgo,
+proxy/operator-proxy, and Connect under sn compile checks pass; SDK JS passes
+wasm cross-compilation (not a browser runtime test). The operator-proxy check
+also required recording the already-used secp256k1 v4.4.1 checksum/indirect
+dependency; no dependency version was upgraded. Physical/unchanged PERFVAR
+replay may now start against this exact tree, but it has not run here and
+neither a baseline nor the iOS-profile 24-MiB gate is promoted.
+
+Reproduce controls with `TestProviderUdpSctpServiceSchedulingExperiment`,
+`TestProviderUdpSctpServiceDelayExperiment`,
+`TestProviderUdpSctpBoundedServiceWindowExperiment`, and
+`TestProviderUdpSctpDynamicServiceWindowExperiment`, using `GOMAXPROCS=4`,
+`-p=1`, normal and `-race` repetitions. Keep the existing
+`TestProviderUdpSctpCompactQueueAdmitsColdHighRttFixedOffer` assertion unchanged.
+Loss/RTT comparisons use `TestProviderUdpSctpGrowthLossSafetyExperiment` and
+must report physical retransmits separately from source refusals. Initial
+service/lifecycle artifacts are in `urnetwork-p2p-legacy-compact.BBojQF`;
+the isolated dependency, modfile, protocol tests, final integrated report and
+before/after outputs are in `urnetwork-p2p-sctp-growth.krgD0Z`. Installed module
+cache, physical devices, memory policy and baselines are unchanged.
+
 ### Unlinked H1 migration owners — 2026-09-20
 
 The current-owner census cannot rule out a retiring, already-unlinked carrier.
@@ -2576,3 +2694,68 @@ for this analysis. The **whole-run 24-MiB barrier remains unresolved**.
   `phys_footprint`/jetsam pass remains mandatory.
 - Do not hide route variance by retrying a failed sample. Alternate controls
   and candidates, preserve failures, and use medians plus tails.
+
+### iOS burst attribution, scoped measurement plan — 2026-09-20
+
+The `kqVGmc` receipt/sample join places the three absolute-cap breaches at
+319,471 / 334,468 / 349,469 ms. Browser cleanup completed at 326,655 ms, so
+the last peak was **22,814 ms after cleanup**. Fast.com had completed at
+244,056 ms; its last nearby sample was 22,986,784 B. Subsequent flow fanout
+reached 301 flows. The profile had a 32-MiB soft Go limit and startup heap
+sampling disabled, consistent with the existing iOS audit profile; that soft
+limit does not enforce the separate 24-MiB absolute acceptance ceiling.
+
+At the three breach samples, residual runtime classes stay within 8 KiB
+(6,129,485–6,137,677 B), and stacks fall from 3,440,640 to 3,342,336 B.
+Heap objects, in-use span slack and unreleased free pages carry the excess.
+Allocation continues at 263,447 B/s in the final 15-second pre-reclaim sample
+interval despite browser cleanup, with three natural GCs. This is cumulative
+allocation rate, not an equal increase in retained memory. The existing
+15-second quiet debounce begins reclamation only after traffic settles and
+runtime exceeds its target; recovery after a breach cannot satisfy the
+absolute-cap requirement. Reducing windows or forcing GC earlier is not yet
+an attributed fix.
+
+Historical, non-qualifying `arm.DHKCh0` pprof callgraph inspection narrows
+three candidates for fresh paired attribution. Of 868,708 B sampled under
+`bufio.NewWriterSize`, **801,103 B belong to glog file writers**, not H1
+carrier buffers. The current logger reserves 256 KiB per opened severity;
+first ERROR logging can open INFO/WARNING/ERROR writers and retain 768 KiB.
+A mobile-specific smaller logging buffer is therefore a candidate that does
+not spend the packet/sequence window. The profile also attributes 593,802 B
+of exported string-list backing to `DeviceLocal.updateBlockActions`, 416,600 B
+to gomobile reference tracking from `NewStringList`, and 688,349 B to
+`multiClientChannel.addSourceToEventBucketWithLock`. These are historical
+sampled owners, not proof of the current breach. Event-bucket retirement
+already clears removed pointers. Current paired profiles must establish each
+owner's growth/release before retaining a remediation.
+
+The next diagnostic uses only the in-scope Wikipedia/Fast.com H1 workload;
+public-egress media, including CNN, is excluded. P2P playback remains a
+separate device role/workload. No new host runner is required: the retained
+workload owner supports an explicit `wiki,fast-1,fast-2,fast-3` child list plus
+verified Chrome cleanup. Build/attest a fresh native 65,536-byte-rate iOS
+diagnostic, keep the existing continuous collector and owner receipts, and:
+
+1. Require schema-1 census preflight, then pair idle pre-GC census, heap
+   profile, post-GC census and last-of-all private stacks.
+2. Run the existing Wikipedia five-load and three Fast.com commands. During
+   traffic, collect at most one census-only `active-highwater` when a primitive
+   sample first reaches 23 MiB or 128 flows; do not force GC or restart work.
+3. At joined browser-cleanup +0 / +15 / +30 seconds collect census only,
+   preserving the original +23-second peak window and automatic reclaim.
+   Record command times, sample/GC counts and reclaim counters throughout.
+4. After +35 seconds collect the full paired `post-burst` boundary; repeat
+   at +180 seconds of connected quiet. These interventions are diagnostic
+   and cannot qualify the cap or promote performance measurements.
+5. Disconnect the route, await the exact command completion, collect a full
+   pair after 15 seconds, then finish/join the owners. This command confirms
+   route disconnect, **not** `DeviceLocal.CloseAndWait`; avoid a false
+   process-wide teardown inference.
+
+Publish aggregate owner/size-class/function deltas only; keep profiles/stacks
+private. A breach before intervention remains failure evidence. Absence of a
+breach in this narrower diagnostic does not repair the historical failure.
+Any retained candidate needs an owner-specific deterministic test, measured
+allocation/lifetime improvement, and a fresh rate-zero physical comparison
+preserving H1 TTFB/Fast.com performance and every sample ≤25,165,824 B.

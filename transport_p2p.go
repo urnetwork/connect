@@ -1485,7 +1485,9 @@ func (self *P2pSendTransport) run() {
 				}
 			}
 
-			if legacyQueue == nil && self.settings.LegacySendQueueByteCount > 0 {
+			if legacyQueue == nil && self.settings.LegacySendQueueByteCount > 0 &&
+				!probeMessage && smallPacketPoolSize < messageByteCount &&
+				messageByteCount+p2pLegacySendHeaderByteCount <= p2pLegacySendSlabByteCount {
 				var budget *TransferMemoryBudget
 				if owner, ok := self.conn.(p2pLegacySendMemoryBudget); ok {
 					budget = owner.legacySendMemoryBudget()
@@ -1495,7 +1497,7 @@ func (self *P2pSendTransport) run() {
 			deadline := time.Now().Add(self.settings.WriteTimeout)
 			var err error
 			if legacyQueue != nil {
-				err = legacyQueue.enqueue(transferFrameBytes, deadline, probeMessage)
+				err = legacyQueue.enqueue(transferFrameBytes, deadline, probeMessage || messageByteCount <= smallPacketPoolSize)
 			} else {
 				err = writeLegacy(transferFrameBytes, deadline)
 				MessagePoolReturn(transferFrameBytes)
