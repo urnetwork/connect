@@ -2873,3 +2873,71 @@ reproduction before retaining a production remedy. Queue/window sizes,
 timeouts, GC settings and all acceptance thresholds remain unchanged.
 Normal finish and joined cleanup released all five created clients and their
 five markers, removed the staged credentials, and left the target app stopped.
+
+### Canonical owner attribution and packet-allocation corrections — 2026-09-21
+
+A separate native-attested 65,536-byte-rate diagnostic completed the scoped
+H1/Wi-Fi Wikipedia/five-load and three-Fast workload on the allowlisted Pixel,
+with connected-idle and immediate-post-cleanup pre-GC census → heap profile →
+post-GC census → stacks, followed by 45 seconds of retained connected observation.
+It is not rate-zero qualification. Wikipedia median load/TTFB was
+429.5/164.4 ms; Fast.com displayed 51/85/7.5 Mbps, median 51 (2/3 ≥40).
+Primitive sampling observed 26,765,592 B maximum and five samples above
+25,165,824 B; profiling overhead remains included and must not be subtracted
+to qualify the result. The slow third Fast sample must not disappear behind
+the median, nor may this profiled run promote a performance baseline.
+
+Matched post-GC censuses increased runtime from 22,915,352 to 26,446,104 B,
+heap objects from 7,777,800 to 9,467,872 B, occupied-span slack from 3,248,632
+to 4,827,168 B, and stacks from 2,949,120 to 3,276,800 B. Goroutines increased
+236→249. The post-traffic census retained 76 application flows, 34 DNS cache
+entries and 37 IpAssoc entities. Receive slots stayed at 640; the eight H1
+claims remained a 2-MiB reservation, not additional live heap. The sampled Pack
+queue peak was only 23,816 B and packet-pressure drops remained zero. Do not
+reduce these throughput windows to explain unrelated allocation/span growth.
+
+The matched private allocation-space profile identified repeated raw protobuf
+wrappers (`FromFrame`), reverse-path objects and canonical packet-group address
+copies. Current production had reusable raw-byte/value helpers, but these three
+call sites still allocated per packet. Narrow corrections now:
+
+- Read raw provider-frame bytes directly through the existing compatible
+  helper; keep legacy protobuf decoding unchanged.
+- Use a stack value for committed-flow reverse lookup; retain a separately
+  owned reverse path on the queued/unknown-flow fallback.
+- Copy canonical group addresses only when starting a new group. Appending
+  another packet preserves the already-owned group path and all ordering/caps.
+
+Host arm64 microbenchmarks (`GOMAXPROCS=10`, five repeats, 200 ms each) measured
+the same fixtures before and after; times below are medians, not phone speeds:
+
+| Operation | Before ns/op | After ns/op | Before→after B/op | Before→after allocs/op |
+| --- | ---: | ---: | ---: | ---: |
+| Existing-group append | 49.33 | 23.88 | 136→0 | 2→0 |
+| Committed single-packet batch | 138.0 | 127.0 | 152→24 | 2→1 |
+| Raw channel receive | 193.9 | 169.3 | 280→168 | 6→4 |
+
+`ip_packet_memory_regression_test.go` failed all three exact allocation guards
+on the old implementation. It covers raw/legacy/malformed delivery, rare-flow
+ownership, and IPv4/IPv6 TCP reset delivery before shared-reaper retirement.
+Reproduce the performance guard with
+`go test -run '^$' -bench '^BenchmarkPacketMemoryRegression$' -benchmem -count=5`.
+These measured local improvements do not yet establish a lower device peak,
+unchanged Fast.com performance, or passage of the absolute iOS-profile gate.
+
+Other retained owners remain research candidates, not fixes: the current
+profile corroborates three glog file buffers of 256 KiB each (first ERROR
+opens two additional severity writers); full-table provider probes temporarily
+added hundreds of path entries; the decoded-owner pool grew to its bounded
+working set. These need separate measured remedies rather than a blanket
+flow/window reduction. Post-profile Go GC/scavenging and the background probes
+also prevent treating census differences as an isolated live-object leak.
+
+The arm's only terminal harness failure was retained-client cleanup. A separately
+authorized cleanup replay released all six remaining clients and removed their
+six markers. Original API/transport details had been discarded, so the failure
+cannot honestly be assigned a specific remote cause. The cleanup helper/runner
+now retain an exclusive mode-0600 sanitized failure receipt with fixed operation,
+HTTP/known transport classification and partial counts; no raw exception text,
+client identifiers, credentials or endpoints are published. The original arm
+remains non-qualifying and its failed terminal record is not rewritten.

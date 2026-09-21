@@ -7839,9 +7839,12 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 			self.ipAssoc.AddIngressPacket(ipPath)
 		}
 		tcpControl := tcpControlFromIpPath(ipPath)
-		ipPath = ipPath.Reverse()
+		// The committed-flow lookup is synchronous and does not retain its
+		// key. Keep the reversed value on the stack; only the rare resolution
+		// tail below needs a separately owned path for queued race packets.
+		reversed := ipPath.ReverseValue()
 
-		if update := self.receiveUpdate(ipPath); update != nil && update.client.Load() == sourceClient {
+		if update := self.receiveUpdate(&reversed); update != nil && update.client.Load() == sourceClient {
 			// committed-flow fast path: batch. the first-inbound mark still
 			// runs per packet -- it gates the dial-failure re-race and resets
 			// the dial-strike window, exactly as on the per-packet path.
@@ -7860,7 +7863,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 		// relative to the batch by flushing first, then reuse the resolve
 		// tail from its post-accounting point
 		flush()
-		self.clientReceivePacketResolve(sourceClient, source, provideMode, ipPath, packet, tcpControl)
+		self.clientReceivePacketResolve(sourceClient, source, provideMode, ipPath.Reverse(), packet, tcpControl)
 	}
 	flush()
 	for _, update := range completedUpdates {
@@ -16922,10 +16925,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 				time.UnixMilli(int64(residentMigrate.MigrateTime)),
 			)
 		case protocol.MessageType_IpIpPacketFromProvider:
-			if ipPacketFromProvider_, err := FromFrame(frame); err == nil {
-				ipPacketFromProvider := ipPacketFromProvider_.(*protocol.IpPacketFromProvider)
-
-				packet := ipPacketFromProvider.IpPacket.PacketBytes
+			if packet, err := ipPacketFromProviderBytes(frame); err == nil {
 				if isIpFragmentPacket(packet) {
 					result := self.ingressIpv4Fragments.processOwned(
 						source,

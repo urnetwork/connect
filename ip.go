@@ -330,7 +330,7 @@ func appendIpPacketGroupBounded(
 	maxPacketCount int,
 	maxByteCount ByteCount,
 ) bool {
-	key, ownedIpPath, ok := ownIpPacketFlow(ipPath)
+	key, ok := ipPacketFlowKeyFromPath(ipPath)
 	if !ok {
 		return false
 	}
@@ -342,6 +342,12 @@ func appendIpPacketGroupBounded(
 		group = nil
 	}
 	if group == nil {
+		// An existing group already owns its canonical addresses. Copy them
+		// only at a new group boundary, not once for every appended packet.
+		_, ownedIpPath, ok := ownIpPacketFlow(ipPath)
+		if !ok {
+			return false
+		}
 		group = &ipPacketGroup{
 			ipPath:   ownedIpPath,
 			packets:  [][]byte{packet},
