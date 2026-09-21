@@ -2759,3 +2759,19 @@ breach in this narrower diagnostic does not repair the historical failure.
 Any retained candidate needs an owner-specific deterministic test, measured
 allocation/lifetime improvement, and a fresh rate-zero physical comparison
 preserving H1 TTFB/Fast.com performance and every sample ≤25,165,824 B.
+
+### Clean physical P2P fixed-offer replay — 2026-09-20
+
+A fresh native-attested P2P arm on the allowlisted Pixel 8 Pro and Galaxy S24
+Ultra completed provider start, exact-peer H1 connection, bidirectional client
+probe, provider proof, and joined teardown without retries. Both devices used
+the iOS-memory-audit profile. The client recorded 19 samples with a maximum
+Go runtime of 20,086,816 B; the provider recorded 21 samples with a maximum of
+18,546,720 B. Neither had a sample above 24 MiB or a packet-pressure drop.
+
+This keeps the P2P fixed-offer queue remedy compatible with the mobile memory
+envelope on the clean-LAN role split. The device harness cannot force the
+legacy SCTP lane or inject 120-ms RTT, so it does not replace the deterministic
+120-ms service cohort; that cohort admits 468/468 offers in ten normal runs
+with zero refusal/retransmission. It is also not evidence about public H1
+TTFB, Fast.com, or the unresolved short-lived iOS-profile burst.
