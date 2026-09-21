@@ -1166,9 +1166,12 @@ paths:
 
   /network/extender-hint:
     get:
+      x-status: planned
       tags: [extenders]
       summary: The continent to try extenders on first
       description: |
+        Planned operation; the server does not currently expose this route.
+
         The continent the operator places the caller's address on
         (connect/DESIGNNOTES4.md §4), upper case, from the same mapping the
         extender geo dns and the `continent_code` tag on signed extender
@@ -1193,9 +1196,12 @@ paths:
 
   /network/extender-latency:
     post:
+      x-status: planned
       tags: [extenders]
       summary: Forward provider latency attestations
       description: |
+        Planned operation; the server does not currently expose this route.
+
         Forward the latency attestations providers made to this client's
         extenders (connect/DESIGNNOTES4.md §3).
 
