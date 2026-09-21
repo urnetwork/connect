@@ -3018,6 +3018,39 @@ The complete-sink fixture includes locking, existing-file checks, severity
 routing and the rotation check, but excludes message formatting and fsync;
 neither of those excluded operations was changed.
 
+### Post-glog rate-zero scoped H1 qualification — 2026-09-21
+
+A fresh canonical, provider-off H1-over-Wi-Fi qualification on an allowlisted
+Android phone rebuilt and attested the `glog` mobile-buffer change
+(`80a11b4`) together with the Connect documentation/state change
+(`325e952a`). It used the unchanged 20-MiB mobile admission target, 32-MiB Go
+soft limit, rate zero, five Wikipedia loads, three Fast.com loads, and the
+five-minute quiet window. It is the first post-glog physical result; its raw
+artifacts, device identity, credentials, profiles, and logs remain private.
+
+| Evidence | Result |
+| --- | ---: |
+| Primitive samples / profile rate | 28 / 0 |
+| Whole-run Go-runtime maximum | 23,646,240 B (22.55 MiB) |
+| Absolute 24-MiB margin / samples above cap | 1,519,584 B / 0 |
+| Connect-phase maximum | 23,646,240 B across six samples |
+| Quiet maximum / final quiet sample | 23,466,016 B / 22,695,968 B across 21 samples |
+| Peak live heap / stack in-use | 8,720,192 B / 3,178,496 B |
+| Wikipedia load / TTFB median | 355.3 / 127.7 ms (five samples) |
+| Fast.com | median 40 Mbps; 3/3 met the 40-Mbps policy |
+| Packet pressure, H1 receive drops, ACK drops, Pack drops | 0 / 0 / 0 / 0 |
+| H1 backpressures / timeout resends | 5,057 / 24 |
+| Cleanup / terminal class | complete / `SCOPED_H1_COMPLETE` |
+
+This clears the absolute iOS-profile memory gate for this scoped observation:
+every primitive sample, including connect and quiet samples, is at or below
+24 MiB. It also meets this arm's Fast.com policy. Compared with the preceding
+packet-allocation arm A (24,891,424-B maximum, 24-Mbps Fast median) and its
+invalid repeat (25,235,488-B maximum plus a workload failure), the maximum is
+1,245,184 B lower than arm A and 1,589,248 B lower than the repeat. This is
+evidence that the fixed logging capacity supplied meaningful headroom; it is
+not a statistical baseline promotion or a claim about a public exit fleet.
+
 `glog_buffer_test.go` reproduces the old mobile budget failure and guards
 unchanged desktop/server capacities, INFO-through-FATAL fan-out/flush requests,
 large ERROR contents, unchanged buffer capacity after large writes, rotation
