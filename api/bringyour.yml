@@ -8883,6 +8883,9 @@ components:
         bonus_period_seconds:
           description: The bonus grant period in seconds (24h = 86400). 0 when unknown.
           type: integer
+        has_referral_network:
+          description: True when this network is linked to a referrer and earns the referred bonus.
+          type: boolean
 
     TransferStatsResult:
       type: object
