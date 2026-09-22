@@ -525,6 +525,9 @@ type PlatformTransportSettings struct {
 	// compact custom upgrade. False preserves ordinary WebSocket rollout.
 	EnableH1Plus bool
 	H1PlusStats  *H1PlusStats
+	// H1ConnectionStats reports the currently negotiated H1 carriers. Unlike
+	// H1PlusStats, these are live gauges, scoped by the owner of this collector.
+	H1ConnectionStats *H1ConnectionStats
 	// PlatformTransportBudget is shared across window transports. Reservations
 	// remain held through reconnects so socket churn cannot escape the cap.
 	PlatformTransportBudget *PlatformTransportBudget
@@ -2289,10 +2292,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// the connection rather than the dial (K1, K4). Acquire both before
 			// announcing readiness; withdraw readiness before releasing them.
 			releaseExtenderIp := self.holdExtenderIp(dialExtenderIp)
+			releaseH1ConnectionStats := self.settings.H1ConnectionStats.connected(ws)
 			self.setRegistered(true)
 
 			defer func() {
 				self.setRegistered(false)
+				releaseH1ConnectionStats()
 				releaseExtenderIp()
 				// Stop new priority admissions before retiring the public route.
 				// RemoveTransport then joins any writer that already acquired the

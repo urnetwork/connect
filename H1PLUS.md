@@ -876,3 +876,39 @@ cross-protocol, resource-limit, and intermediary threat review.
 No TLS removal, unauthenticated raw TCP tunnel, weakened WS validation, packet
 transport framing change, H3/DNS redesign, ACK policy change, egress affinity
 change, or promised 40-Mb/s fast.com result is part of this design.
+
+## Active H1 carrier statistics
+
+The SDK preserves the `h1` transport type, selection policy, packet accounting,
+and wire signature for both carriers. `TransportPacketStats` and the H1
+`TransportShare` expose additive `H1WebSocketConnectionCount` and
+`H1PlusConnectionCount` fields. These are current registered connections, not
+cumulative upgrade successes or traffic totals over the chart window. Client
+and provider roles own separate collectors; overlapping reconnect generations
+and mixed old/new provider windows report their respective live counts.
+
+Only a completed, validated custom upgrade followed by route registration adds
+an H1+ connection. A pending/rejected/mismatched upgrade adds none. Fresh
+WebSocket fallback is plain H1, and route withdrawal clears its live count.
+There is no per-packet accounting work for these gauges. SDK RPC/Gob, gomobile,
+the C++ JSON ABI, and JS/WASM preserve the fields; older peer snapshots default
+them to zero.
+
+Apple, Android, Windows, Linux, and ur.io display `H1+` while the H1 share has at
+least one live H1+ connection, otherwise `H1`. In a mixed window both counts are
+available to diagnostics and the shared H1 label indicates H1+ availability.
+The label follows the device whose transport stats are shown, including a
+native device controlled by browser RPC. A browser's own WebSocket does not
+determine the remote device's label. Polling, idle notification, and UI snapshot
+deduplication retain negotiation/fallback changes even when traffic is idle.
+
+Deterministic coverage: `TestPlatformTransportH1ConnectionStatsNegotiationAndFallback`
+uses real HTTP upgrade connections and the production transport loop, holding
+the first upgrade pending, completing H1+, forcing old-provider and mismatched
+`101` fallbacks, then joining close and requiring zero live counts. The mixed
+generation test covers make-before-break counts. SDK `TestH1ConnectionStats*`
+covers Gob compatibility, live selection, idle updates, and stats loss;
+`TestTransportDistributionWasmPreservesH1Selection` and
+`make -C sdk/cgo smoke_transport_stats_json` pin the JS and desktop binding
+fields. Platform UI tests cover label/snapshot transitions without changing the
+stable transport identity or its traffic totals.
