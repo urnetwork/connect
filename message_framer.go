@@ -9,17 +9,12 @@ import (
 	// "github.com/urnetwork/connect"
 )
 
-// a message framer that optimizes memory copies to reduce cpu+memory usage
-// on a typical connection, writing into the connection buffer will trigger a packet send
-// and incur some fixed overhead
-// to avoid small packets and excessive write calls, this framer approach breaks
-// messages above a threshold into exactly two writes, resulting in an effective
-// halving of the packet size on the wire
-// the benefit of this approach is the framing can be done with zero additional memory allocation
-// and a small constant memory copies before handing the message to the connection
-// versus allocating and copying into a new framed message buffer,
-// this approach is ~2x more cpu+memory efficient to send framed messages on a tcp/udp connection
-// the framer read/write op is called billions of times in a typical user hour
+// Framer preserves message boundaries on a byte stream. Write splits larger
+// messages into two stream writes to avoid copying the second half into a
+// temporary pooled frame. Where stream handoffs are more expensive than that
+// copy, WriteBatchWithStorage coalesces ready messages (including a singleton)
+// into one write using bounded caller-owned scratch. Neither framing path is
+// appropriate for a packet transport whose individual Write boundaries matter.
 
 type FramerSettings struct {
 	// Log, when set, is used by the framer. nil resolves to `DefaultLogger()`.
@@ -52,7 +47,8 @@ func DefaultFramerSettings(maxMessageLen int) *FramerSettings {
 	}
 }
 
-// Read and Write must be called from a single goroutine each
+// One reader and one writer may use a Framer concurrently. Each direction must
+// have a single owner: simultaneous reads or simultaneous writes are unsupported.
 type Framer struct {
 	// maxFrameLen is the maximum on-wire frame length the framer reads or
 	// writes: the configured max message (payload) length plus the 4-byte
@@ -177,8 +173,11 @@ func (self *Framer) WriteBatch(w io.Writer, messages [][]byte) error {
 
 // WriteBatchWithStorage emits the same wire batch using caller-owned scratch
 // storage. The caller must provide exclusive storage for the duration of the
-// call and may reuse it after return. Message ownership always stays with the
-// caller. An undersized buffer is rejected before any stream byte is written.
+// call and may reuse it after return. The storage must not overlap any message;
+// messages may share backing with each other. Message ownership always stays
+// with the caller. For a singleton, insufficient storage retains Write's legacy
+// split-copy fallback. An undersized multi-message batch is rejected before
+// any stream byte is written.
 func (self *Framer) WriteBatchWithStorage(
 	w io.Writer,
 	messages [][]byte,
@@ -187,7 +186,10 @@ func (self *Framer) WriteBatchWithStorage(
 	if len(messages) == 0 {
 		return nil
 	}
-	if len(messages) == 1 {
+	// Preserve the legacy singleton fallback when no sufficiently large
+	// caller-owned scratch buffer was supplied. Otherwise, use the same
+	// one-copy, one-write path as a ready batch.
+	if len(messages) == 1 && len(storage) < len(messages[0])+4 {
 		return self.Write(w, messages[0])
 	}
 	totalByteCount, err := self.writeBatchByteCount(messages)

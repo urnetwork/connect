@@ -3357,7 +3357,9 @@ func (self *PlatformTransport) runH3(
 							message = nextMessage
 						case <-pingTimer.C:
 							streamWriter.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
-							if err := framer.Write(streamWriter, make([]byte, 0)); err != nil {
+							// Reuse the reliable writer's scratch if already allocated;
+							// heartbeat-only hybrid lanes keep their lazy memory shape.
+							if err := framer.WriteBatchWithStorage(streamWriter, [][]byte{nil}, writeBatchStorage); err != nil {
 								return
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
