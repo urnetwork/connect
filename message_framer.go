@@ -66,10 +66,13 @@ func NewFramer(settings *FramerSettings) *Framer {
 	}
 }
 
-func (self *Framer) Read(r io.Reader) ([]byte, error) {
+// ReadHeader validates the next payload length before allocation. It is also
+// used by streaming message carriers, whose caller consumes exactly this many
+// bytes before requesting the next frame. The legacy split hint is ignored.
+func (self *Framer) ReadHeader(r io.Reader) (int, error) {
 	var h [4]byte
 	if _, err := io.ReadFull(r, h[:]); err != nil {
-		return nil, err
+		return 0, err
 	}
 
 	messageLen := int(binary.BigEndian.Uint16(h[0:2]))
@@ -82,9 +85,16 @@ func (self *Framer) Read(r io.Reader) ([]byte, error) {
 			"[framer][reject]read messageLen=%d > MaxMessageLen=%d (maxFrameLen=%d)\n",
 			messageLen, self.settings.MaxMessageLen, self.maxFrameLen,
 		)
-		return nil, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
+		return 0, fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
 	}
+	return messageLen, nil
+}
 
+func (self *Framer) Read(r io.Reader) ([]byte, error) {
+	messageLen, err := self.ReadHeader(r)
+	if err != nil {
+		return nil, err
+	}
 	message := MessagePoolGet(messageLen)
 
 	if _, err := io.ReadFull(r, message); err != nil {

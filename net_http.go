@@ -764,9 +764,11 @@ type httpResult struct {
 }
 
 type evalResult struct {
-	dialer *clientDialer
-	wsConn *websocket.Conn
-	err    error
+	dialer   *clientDialer
+	wsConn   *websocket.Conn
+	h1Conn   H1MessageConn
+	terminal bool
+	err      error
 	// materialize is run only for the selected HTTP response. A canceled
 	// parallel HTTP response is released by its attempt context instead.
 	materialize func() error
@@ -858,7 +860,10 @@ func (self *evalResult) Selected() *evalResult {
 // discardAfterContextCancellation because their transport already owns cleanup.
 func (self *evalResult) Close() {
 	self.materialize = nil
-	if self.wsConn != nil {
+	if self.h1Conn != nil {
+		self.h1Conn.Close()
+		self.h1Conn = nil
+	} else if self.wsConn != nil {
 		wsConn := self.wsConn
 		self.wsConn = nil
 		wsConn.Close()
@@ -879,6 +884,10 @@ func (self *evalResult) Close() {
 // DialContext returns, so it still needs an explicit close.
 func (self *evalResult) discardAfterContextCancellation() {
 	self.materialize = nil
+	if self.h1Conn != nil {
+		self.h1Conn.Close()
+		self.h1Conn = nil
+	}
 	if self.wsConn != nil {
 		wsConn := self.wsConn
 		self.wsConn = nil
@@ -1046,7 +1055,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, webSocketOnly bool
 				result := eval(attemptCtx, dialer)
 				if result != nil {
 					result.dialer = dialer
-					if result.Selected().err == nil {
+					if result.Selected().err == nil || result.terminal {
 						attemptCancel()
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[net][p]select: %s\n", dialer.String())
@@ -1083,7 +1092,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, webSocketOnly bool
 					return nil
 				case result := <-out:
 					if result != nil {
-						if result.Selected().err == nil {
+						if result.Selected().err == nil || result.terminal {
 							if self.log.V(2).Enabled() {
 								self.log.Infof("[net][p]select: %s\n", result.dialer.String())
 							}
@@ -1115,7 +1124,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, webSocketOnly bool
 					return nil
 				case result := <-out:
 					if result != nil {
-						if result.Selected().err == nil {
+						if result.Selected().err == nil || result.terminal {
 							if self.log.V(2).Enabled() {
 								self.log.Infof("[net][p]select: %s\n", result.dialer.String())
 							}
@@ -1139,7 +1148,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, webSocketOnly bool
 				return nil
 			case result := <-out:
 				if result != nil {
-					if result.Selected().err == nil {
+					if result.Selected().err == nil || result.terminal {
 						return result
 					}
 					result.releaseAfterUse(handleCtx)
@@ -1219,7 +1228,7 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 			result := eval(attemptCtx, dialer)
 			if result != nil {
 				result.dialer = dialer
-				if result.Selected().err == nil {
+				if result.Selected().err == nil || result.terminal {
 					attemptCancel()
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[net][s]select: %s\n", dialer.String())
@@ -1509,6 +1518,36 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 		return nil, nil, nil, fmt.Errorf("Timeout.")
 	}
 	return result.wsConn, result.response, result.dialer.Info(), result.err
+}
+
+// H1DialContextWithDialer keeps custom-upgrade negotiation and its fresh WS
+// fallback inside each existing strategy attempt, so a capability miss never
+// affects the route/extender's health or adds another overall retry deadline.
+func (self *ClientStrategy) H1DialContextWithDialer(ctx context.Context, address string, requestHeader http.Header, maximum int, enabled bool, stats *H1PlusStats) (H1MessageConn, *DialerInfo, error) {
+	if len(self.settings.ExtraHeaders) != 0 {
+		requestHeader = requestHeader.Clone()
+		if requestHeader == nil {
+			requestHeader = http.Header{}
+		}
+		self.applyExtraHeaders(requestHeader)
+	}
+	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		conn, err := DialH1Messages(handleCtx, address, requestHeader, dialer.WsDialer(self.settings), H1FramerProtocol, maximum, enabled, stats)
+		var upgradeErr *HTTPUpgradeError
+		terminal := errors.As(err, &upgradeErr) && upgradeErr.Terminal
+		// An authorization denial is not an unhealthy extender. It is terminal
+		// for this logical dial and must not be retried across every strategy.
+		if !terminal {
+			dialer.Update(handleCtx, err)
+			observeDialAttempt(handleCtx, err)
+		}
+		return &evalResult{h1Conn: conn, err: err, terminal: terminal}
+	}
+	result := self.parallelEval(ctx, true, eval)
+	if result == nil {
+		return nil, nil, fmt.Errorf("Timeout.")
+	}
+	return result.h1Conn, result.dialer.Info(), result.err
 }
 
 func (self *ClientStrategy) collapseExtenderDialers() {

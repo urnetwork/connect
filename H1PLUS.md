@@ -1,9 +1,11 @@
 # H1+: authenticated HTTP/1.1 upgrade to URnetwork Framer
 
-Status: design and measured prototype, 2026-09-22. H1+ is **not implemented or
-enabled in production**. The separate, general `Framer.WriteBatchWithStorage`
-singleton improvement and its existing-carrier call-site changes do not enable
-H1+. This document distinguishes those changes from the proposed transport.
+Status: implemented, opt-in and **disabled by default**, 2026-09-22. Native H1
+and native RPC can negotiate the two authenticated custom carriers below;
+Connect and proxy RPC servers accept them when their independent setting is
+enabled. Deterministic, real server, RPC, PERFVAR and real NGINX qualification is
+recorded below. Device performance, deployed ingress and the iOS-profile
+24-MiB absolute gate still gate broader rollout.
 
 ## Purpose and scope
 
@@ -55,7 +57,7 @@ There is no `Sec-WebSocket-Key`, `Sec-WebSocket-Accept`, WebSocket opcode, mask,
 or compression negotiation on this custom path. HTTP Upgrade is a general
 mechanism, not exclusive to WebSocket. [RFC 9110, Upgrade](https://www.rfc-editor.org/rfc/rfc9110.html#section-7.8)
 
-Requirements for production implementation:
+Implemented negotiation requirements:
 
 - Require HTTP/1.1, GET, one supported Upgrade selection, a valid Connection
   upgrade token, no request body or ambiguous framing, bounded headers, and
@@ -79,9 +81,11 @@ Requirements for production implementation:
   handing the socket to Framer. Reject missing, unexpected, or ambiguous
   selection. Do not follow cross-origin redirects with credentials.
 
-The private benchmark and nginx seam test use a fixed synthetic
+The original private benchmark and nginx seam test use a fixed synthetic
 `X-UR-Network-Auth` value solely to verify the pre-101 gate. They do not test
-production JWT, revocation, or signed proxy-id authentication.
+production JWT, revocation, or signed proxy-id authentication. The new
+`TestConnectH1PlusAuthenticationBefore101` and `TestProxyDeviceRpcH1Plus` use
+the production endpoint gates and validate those independently.
 
 ## Native fallback and compatibility
 
@@ -103,8 +107,11 @@ generates masking keys and performs normal server-handshake validation.
 Old servers may return 400, 404, 426, a normal 200 page, or a mismatched upgrade;
 these are capability failures, not data-path blackholes. Make one bounded custom
 attempt, close the connection on failure, and use a fresh WS connection. A
-temporary, bounded per-origin capability cache should avoid an extra RTT on
-every reconnect to known-old servers. Keep capability misses distinct from
+five-minute, at-most-256-origin capability cache avoids an extra RTT on
+every reconnect to known-old servers. Cache keys exclude credentials and paths
+and are capped at 512 bytes. Only explicit capability responses or invalid
+selections are cached; EOF, timeout, 429/503, cancellation, auth and TLS failures
+do not suppress a later probe. Capability misses remain distinct from
 unhealthy-exit reputation and preserve the original overall connect deadline.
 Do not downgrade certificate/hostname failures, use plaintext, or accept a 101
 with a different protocol as fallback. Test a rejected authenticated custom
@@ -163,13 +170,13 @@ control messages become necessary, define them explicitly in a later version.
 
 ## Components and the RPC size incompatibility
 
-| Component | Proposed H1+ integration | Current Framer audit |
+| Component | Implemented H1+ integration | Framer integration |
 | --- | --- | --- |
-| `connect/transport.go` | Native H1 dial/receive/send carrier branch, fresh WS fallback, shared coalescer and cancellation | H3 data already uses storage; heartbeat now reuses it; one-shot H3 auth keeps `Write` |
-| `server/connect/transport.go` | Accept both Upgrade names; authenticate custom path before 101; share resident lifecycle | H3 data already uses storage; heartbeat reuses it; one-shot auth replies keep `Write` |
+| `connect/transport.go` | Native, V2-header-auth H1 dial/receive/send branch, fresh WS fallback, shared ready limits and cancellation | Compact Framer pooled reads and `WriteBatchWithStorage`; existing H3 paths retain their storage |
+| `server/connect/transport.go` | Accept WS and compact Upgrade; authenticate custom path before 101; share resident lifecycle | Ready compact data and heartbeats use bounded writer storage |
 | `server/connect/resident.go` | No H1+ negotiation here: internal Exchange TCP remains Framer | Singleton writes now lazily reuse at most 2 KiB; ready multi-message batches retain existing TCP `writev`; one-shot header keeps `Write` |
-| `sdk/device_rpc_*` | Native RPC offers `urnetwork-framerxl/1`, otherwise fresh WS; browser stays WS | No current Framer call sites |
-| `server/proxy/device_rpc_handler.go` | Accept `urnetwork-framerxl/1` and `websocket` after the same signed-id/device admission gate; preserve session diagnostics | No current Framer call sites |
+| `sdk/device_rpc_*` | Native hosted RPC offers XL; pinned-mTLS local RPC also supports XL; fresh WS fallback; browser stays WS | Shared FramedMessageConn, direct pooled reads, ready-only writes and existing independent mux budgets |
+| `server/proxy/device_rpc_handler.go` | Accept XL and WS after the same signed-id/device admission gate; preserve session diagnostics | Same XL carrier; observation wrapper forwards pooled reads and ready batches |
 | standalone `proxy` repository | No current Framer migration needed | No current Framer call sites |
 
 RPC is **not** a drop-in Framer substitution. `deviceRpcSettings` currently permits
@@ -182,28 +189,28 @@ Changing a site-local `MaxMessageLen` setting alone cannot solve this: current
 Framer encodes the length as uint16 and explicitly rejects larger writes. A
 site-local cap is necessary for admission but cannot change the wire format.
 
-The RPC direction is **`FramerXl`, a separate implementation and wire type**,
+RPC uses **`FramerXl`, a separate implementation and wire type**,
 with the exact custom Upgrade token **`urnetwork-framerxl/1`**:
 
 | Type | Exact header | Configured payload cap |
 | --- | --- | --- |
 | Current `Framer` / `urnetwork-framer/1` | `[uint16 big-endian length][uint16 split hint]` (4 bytes total) | Explicit site limit, at most 65,535 bytes |
-| Proposed `FramerXl` / `urnetwork-framerxl/1` | `[uint32 big-endian payload length]` (exactly 4 bytes total) | Independent explicit site limit, at most uint32; RPC initially keeps its existing 3-MiB cap |
+| `FramerXl` / `urnetwork-framerxl/1` | `[uint32 big-endian payload length]` (exactly 4 bytes total) | Independent explicit site limit, safely representable on the host; RPC keeps its existing 3-MiB cap |
 
 FramerXl has no split-hint field. The headers have the same total size but are
 not compatible and require distinct parsers/encoders selected by the successful
 upgrade. Never sniff length bytes, silently change v1, or interpret missing
 negotiation as XL. Normal connect H1+ attempts only `urnetwork-framer/1`.
-Native SDK RPC offers `urnetwork-framerxl/1`; server/proxy's RPC endpoint should
-accept it in addition to `websocket` after the same authorization gate. An
+Native SDK RPC offers `urnetwork-framerxl/1`; server/proxy's RPC endpoint
+accepts it in addition to `websocket` after the same authorization gate. An
 unsupported native attempt uses fresh standard WS fallback; browser/JS directly
-uses WS. These are design requirements, not enabled production behavior. Future
+uses WS. Both native paths require explicit opt-in. Future
 incompatible XL changes need a separately negotiated token/capability; do not
 change the meaning of `urnetwork-framerxl/1` silently. The `/1` is the protocol
 version in HTTP Upgrade's protocol-name/version syntax.
 
-FramerXl should provide the same `Read`, `Write`, `WriteBatch`, and
-`WriteBatchWithStorage` API/ownership model, including one reader and one writer
+FramerXl provides `ReadHeader`, `Read`, `Write`, `WriteBatch`, and
+`WriteBatchWithStorage`, including one reader and one writer
 concurrently, single ownership in each direction, exclusive non-overlapping
 scratch, pooled-read ownership, short-write/error handling, and checked batch
 size arithmetic. Convert wire lengths safely on all supported integer widths;
@@ -214,25 +221,75 @@ allocate 4 GiB. Do not allocate maximum-frame-sized scratch for every idle socke
 use bounded storage with a measured large-frame path. RPC framing size and
 memory admission stay endpoint-specific, not a global memory-limit increase.
 
-Compared with FramerXl, v1 chunking avoids a new wire type and
-keeps individual carrier buffers small, but adds per-chunk framing and requires
-proof that tagged gob-stream readers do not depend on original message
-boundaries. If whole-message reassembly is necessary, it also needs a bounded
-envelope and explicit memory accounting. FramerXl preserves the existing
-RPC message boundaries more directly, but can retain larger buffers unless
-reading/consumption and queue budgets are deliberately bounded. Measure both
-before choosing the implementation.
+The chosen XL implementation preserves complete existing RPC message boundaries,
+so it adds no fragmentation or reassembly protocol. A connection lazily retains
+at most 16 KiB of writer storage. A fitting frame or ready batch uses
+`WriteBatchWithStorage` and one stream write. When a singleton exceeds supplied
+storage, `FramerXl.Write` obtains its own complete four-byte-header-plus-payload
+temporary buffer, copies once, performs one write, and releases the buffer on
+success, short write, or error. Existing pool size classes retain only small
+temporaries (up to 8 KiB in the measured configuration); larger frames are
+frame-local allocations available to GC after the call. Neither the Framer nor
+the connection grows its retained scratch to the maximum RPC frame size.
 
-Stage transport H1+ on existing v1 first; leave RPC on WS until FramerXl and its
-limits are implemented and qualified separately. FramerXl needs its own boundary,
-malformed-length, overflow, ownership, duplex race, cancellation, and memory-bound
-tests plus small/large-message benchmarks; this document does not implement it.
+This follows the requested full-frame temporary-buffer policy and replaces the
+initial 2-KiB-prefix/direct-tail prototype. A maximum RPC write temporarily owns
+an additional 3 MiB + 4 bytes while it runs. The original pooled send message is
+released by the mux only after the synchronous write completes. Send/receive
+queue budgets still apply independently; they do not make this temporary copy
+free or constitute an iOS memory qualification. A weak-reference regression
+test proves the full-size temporary is reclaimable while the connection and
+original input remain live; short-write/error tests prove one terminal write
+without retry or reuse of undersized scratch.
+
+Both compact and XL paths are implemented with independent enable settings.
+FramerXl has boundary, malformed-length, overflow, ownership, duplex race,
+cancellation and memory-retention tests plus small/large-message benchmarks.
 Never silently truncate RPC or lower its 3-MiB application limit. Browser/JS
 continues to use WS with either native design. Keep separate send/receive byte
 budgets and queue ownership to avoid bidirectional RPC deadlocks. Keep the
 gomobile-bindable `DeviceRpcWs` interface and its richer companion separation,
-or introduce a carefully compatible message-carrier interface rather than
-pretending custom framing implements WebSocket control semantics.
+and the richer companion separation. The historical `DeviceRpcWs` name now
+admits the binary FramerXl carrier; the mux uses serialized empty binary
+heartbeats. FramerXl rejects WebSocket control writes and implements no masking,
+compression, ping/pong or opcode protocol.
+
+## Implementation controls and diagnostics
+
+All enable settings default to false. Use independent controls for deployment:
+
+| Scope | Control |
+| --- | --- |
+| Native Connect H1 client | `PlatformTransportSettings.EnableH1Plus`; also requires `V2H1Auth` and a compact-compatible site cap |
+| Connect server | `ConnectHandlerSettings.EnableH1Plus` |
+| Native SDK RPC client and local mTLS listener | `deviceRpcSettings.EnableH1Plus`; the bindable `sdk.SetDeviceRpcH1PlusEnabled` sets the default for subsequently created sessions |
+| Hosted proxy RPC endpoint | `ProxySettings.EnableDeviceRpcH1Plus` |
+| Process-wide emergency off | `connect.SetH1PlusDisabled(true)`; overrides all enabled endpoints/clients on future negotiations |
+| Browser/JS | Always skips custom upgrade regardless of settings |
+
+The SDK's local custom RPC carrier is available only with the existing pinned
+mutual-TLS identity. Plain local RPC continues using its existing WS path.
+Native hosted RPC now uses Authorization for both XL and WS; browser query
+credentials remain supported. A configured HTTP proxy in Gorilla's dialer uses
+the ordinary WS path rather than bypassing the proxy. Extender strategy tests
+cover the existing H1 TLS/socket boundary with the custom carrier enabled.
+
+Shared `DialFramedUpgrade`/`AcceptFramedUpgrade` preserve prefetched bytes;
+`DialH1Messages` owns one custom attempt and a fresh WS fallback. The custom
+handshake uses at most five seconds and at most half the remaining caller
+deadline; both attempts share the original total deadline. Terminal 401/403,
+redirects, certificate/hostname failures and outer cancellation do not downgrade.
+The capability cache is distinct from provider/exit reputation.
+
+`H1PlusStats.Snapshot` records bounded numeric selection, fallback-reason,
+handshake-duration, payload, flush, actual stream-write and error counters.
+`H1PlusStats` fields on client/server settings can isolate a test/cohort. Default
+server collectors publish `urnetwork_connect_h1plus_*_total` and
+`urnetwork_proxy_h1plus_*_total` with only the constant negotiated `protocol`
+label. Existing queue-pressure/reconnect/transport diagnostics remain applicable.
+CPU per byte is measured by the benchmark/profiler, not attributed from a
+wall-clock packet timer. No credential, origin, URL or device identity becomes
+a metric label.
 
 ## Nginx proxy contract and real-process tests
 
@@ -270,13 +327,15 @@ frontend and load-balancer path; a direct Go loopback benchmark does not qualify
 that deployment. Other intermediaries can reject unknown tokens, which is why
 the WS fallback remains mandatory.
 
-`server/connect/transport_h1plus_nginx_test.go` is a real-process protocol-seam
+`server/connect/transport_h1plus_nginx_test.go` is the original real-process protocol-seam
 fixture, not a production H1+ endpoint. It starts an isolated nginx with a
 minimal local authorized backend and checks custom frames in both directions,
 the standard WS control, auth failure before 101, rejection/mismatch fallback,
-and prefetched payload preservation. Add the exact `urnetwork-framerxl/1` token
-and RPC-sized bidirectional frames to that seam matrix when FramerXl exists;
-do not use the uint16 parser for that token. Use `NGINX_H1PLUS_BINARY` to explicitly
+and prefetched payload preservation. The additional
+`transport_h1plus_helpers_nginx_test.go` uses the production shared helpers for
+both exact tokens, including bidirectional 3-MiB XL frames and compact limits.
+It covers real NGINX preservation of buffered bytes, auth-before-101 and fresh
+WS fallback. The XL token uses the uint32 parser. Use `NGINX_H1PLUS_BINARY` to explicitly
 select a native build; invalid explicitly configured binaries fail. The test
 skips only when its default pinned binaries are absent; a discovered but
 unrunnable or incorrectly versioned build fails with an actionable prerequisite
@@ -300,6 +359,73 @@ NGINX_H1PLUS_BINARY=/path/to/pinned/native/nginx \
 ```
 
 ## Measurements: continuous 1,200-byte packet stream
+
+### Implemented production helper cohort, 2026-09-22
+
+The committed `BenchmarkH1PlusTLS1200` in
+`transport_h1plus_benchmark_test.go` measures the production negotiation and
+message-carrier implementations over real localhost TLS. Host: Apple M4 Pro,
+darwin/arm64, Go 1.26.7, `GOMAXPROCS=3`; client WS buffers 2 KiB and server WS
+buffers 4 KiB. H1+ retains the same inactive client batching wrapper supplied
+by the actual strategy. Both modes have 16-KiB output scratch and identical
+eleven-message ready batches. Handshake/warmup are outside the measured interval.
+
+Ten fresh-process paired blocks alternate mode order; every direction sends
+300,000 packets per arm (600,000 aggregate in duplex). All **60/60** observations
+pass exact payload/order/boundary validation and the same **0.09091 TLS writes
+per packet**. Percentage changes below are medians of paired ratios, with
+20,000-resample paired bootstrap 95% intervals; absolute rates are separate
+medians, so their ratios need not equal the paired estimates.
+
+| Direction | WS median Mb/s | H1+ median Mb/s | Throughput improvement, 95% CI | CPU reduction, 95% CI |
+| --- | ---: | ---: | --- | --- |
+| Upload | 11,388.68 | 15,343.40 | +32.35% [32.01%, 43.04%] | 24.35% [23.40%, 30.90%] |
+| Download | 13,875.60 | 16,265.00 | +18.68% [13.73%, 23.20%] | 16.78% [11.97%, 20.86%] |
+| Full duplex, aggregate | 21,374.16 | 29,009.96 | +36.31% [32.50%, 37.71%] | 22.56% [20.93%, 22.78%] |
+
+Process CPU medians, both endpoints: WS 1,662.5 / 1,369.0 / 1,251.5 ns per
+packet; H1+ 1,231.5 / 1,157.0 / 973.95. Allocations per packet fall from
+3 / 2 / 2.5 to 1 / 1 / 1; allocated bytes fall from 82 / 34 / 57 to 6 / 5 / 5.
+Duplex benchmark operations contain two packets, so `B/op` and `allocs/op` are
+divided by two for these figures. CPU includes both endpoints and payload
+verification. These are carrier efficiency measurements, not Android energy,
+Internet throughput, fast.com, or application TTFB measurements.
+
+Reproduce the durable benchmark (use alternating fresh processes for paired
+comparisons; a single `-count` command always retains the same mode order):
+
+```sh
+GOTOOLCHAIN=go1.26.7 GOMAXPROCS=3 go test -run '^$' \
+  -bench '^BenchmarkH1PlusTLS1200$' -benchtime=300000x -count=1
+```
+
+The raw 60 observations, mode ordering, bootstrap method/seed, exact build
+SHA-256 and result summary are in
+`/private/tmp/urnetwork-h1plus-production-bench.PAZLCY/results.json` on this host.
+This is a new production implementation cohort; the earlier private prototype
+below used a different Go version/core count and is not its performance baseline.
+
+### Large RPC frame policy measurement
+
+`BenchmarkFramerXlTLSWrite` compares the initial bounded-prefix/direct-tail
+prototype with the requested one-write full-frame temporary policy. Both arms
+decode and verify every payload over localhost TLS; receive allocation is
+included in both. Initial host medians: 64-KiB frame 25.831 to 28.355 microseconds
+(9.8% more time); 3-MiB frame 0.9874 to 1.1322 milliseconds (14.7% more time).
+Stream writes fall from two to one, but allocated bytes approximately double:
+73.8 to 147.6 kB per 64-KiB frame and 3.158 to 6.312 MB per 3-MiB frame,
+including the shared receive cost. This is a pilot, not a paired statistical
+performance claim. The full-frame policy is retained as requested; fewer writes
+do not offset its extra large-copy/allocation cost in this measured TLS case.
+
+Large frames are not retained in a global pool or per-connection scratch, but
+their allocation can increase transient runtime memory and GC pressure before
+reclamation. RPC XL remains independently opt-in; real-device peak-memory and
+large-RPC workload qualification must account for this cost. Fitting caller
+storage remains allocation-free on the write side. The compact 1,200-byte H1+
+cohort does not use this large XL fallback and is unaffected by the policy.
+
+### Earlier private prototype
 
 Private fixture: Go 1.27.1, darwin/arm64 Apple M4 Pro, `GOMAXPROCS=4`, real
 loopback TCP/TLS 1.3, Gorilla WebSocket 1.5.3, local connect Framer and production
@@ -391,7 +517,67 @@ promote the fixture and durable raw measurements before baselining CI.
 
 ## Deterministic qualification and rollout
 
-Required test matrix before production activation:
+Implemented coverage and observed results (2026-09-22):
+
+- Shared upgrade/carrier tests pass normally and under race, including malformed
+  selection/body/header bounds, cancellation, prefetched bytes on both sides,
+  terminal auth/TLS handling, fresh masked WS fallback, bounded cache and transient
+  failure retry. Real TLS tests verify HTTP/1.1 ALPN and certificate failure.
+- Framer/XL tests cover empty through 3-MiB messages, truncated/malformed lengths,
+  checked arithmetic, ownership, full/short/error writes, undersized storage and
+  concurrent one-reader/one-writer use. Large XL lifetime tests prove the full
+  temporary can be reclaimed while the original message and connection are live.
+- Client custom ready-batch tests assert eight-ACK/ordinary fairness, the
+  32-message and 12-KiB drain bounds, immediate sparse writes, closed/canceled
+  lanes, control filtering and exact pool ownership on errors. Existing H1
+  lifecycle, receive-backpressure and strategy race tests also pass.
+- Actual Connect JWT admission rejects missing, malformed, user-only and removed
+  client credentials before 101; an authorized client succeeds. Encrypted
+  Transfer/resident exchange, transport reform, old-provider WS fallback and H1
+  extenders pass the existing stress fixture (three custom/fallback cases,
+  101.344 seconds total). Focused server H1 lifecycle/admission race cohort passes.
+- Actual proxy TLS endpoint rejects bad signed IDs, accepts XL and WS, and serves
+  the native hosted forward RPC and reverse event over XL. RPC tests additionally
+  cover simultaneous forward/reverse large values, exact 3-MiB envelopes,
+  over-limit disconnect/reconnect, mTLS/local compatibility, queue-byte-budget
+  cancellation and heartbeat liveness. SDK native tests pass under race and on
+  Go 1.26.7; the browser skip test runs under Node/Wasm.
+- `TestFullTunH1PlusCorrectnessAndOldProvider` passes the full PERFVAR TUN/IP
+  stack/Connect/exchange/provider path in both custom and old-provider modes:
+  exact 256-KiB upload and download, actual carrier selection and **zero**
+  timeout/carrier-change/selective-gap/tail/cumulative recovery writes in each
+  measured workload (4.568 seconds total). This is a correctness gate, not a
+  statistical full-VPN throughput comparison.
+- Both original and production-helper real NGINX suites pass under race using
+  the pinned native 1.31.4 build (2.022 seconds); XL bidirectional 3-MiB frames are
+  included. No Go-proxy substitution or skipped NGINX prerequisite was counted.
+
+Repeat scoped checks from the owning repositories. Server integration tests
+require the live `server/local/run-local.sh` stack and sourced `test-env.sh`:
+
+```sh
+# connect
+GOTOOLCHAIN=go1.27.1 GOMAXPROCS=3 go test -race . \
+  -run 'Test(Framer|Framed|ReadH1|ValidateFramed|IsFramed|DialFramed|AcceptFramed|H1Plus|DialH1|WriteH1Framed)'
+
+# sdk
+GOTOOLCHAIN=go1.27.1 GOMAXPROCS=3 go test -race . \
+  -run '^TestDeviceRpcH1Plus'
+
+# server
+source ./test-env.sh
+GOTOOLCHAIN=go1.27.1 GOMAXPROCS=3 go test -race ./connect \
+  -run '^TestConnectH1Plus|^TestConnectH1(User|Workers|Ready)'
+GOTOOLCHAIN=go1.27.1 GOMAXPROCS=3 go test -race ./proxy \
+  -run '^TestProxyDeviceRpcH1Plus$|^TestDeviceRpcObserved|^TestDeviceRpcHandlerAuth$'
+GOTOOLCHAIN=go1.27.1 GOMAXPROCS=4 go test ./connect/perfvar \
+  -run '^TestFullTunH1PlusCorrectnessAndOldProvider$'
+NGINX_H1PLUS_BINARY=/path/to/pinned/native/nginx \
+  GOTOOLCHAIN=go1.27.1 GOMAXPROCS=3 go test -race ./connect \
+  -run '^TestH1Plus(ProductionHelpersThroughNginx|NginxUpgradeAndFreshWebSocketFallback)$'
+```
+
+Required matrix for later deployment/device activation:
 
 - Supported/old/denied/malformed/mismatched upgrades, Connection-token parsing,
   auth state failure before 101, no cross-origin credential forwarding, bounded
@@ -412,9 +598,10 @@ Required test matrix before production activation:
   ordinary WS control and unknown-Upgrade rejection. A skipped binary prerequisite
   is not passing qualification.
 
-Initial rollout: production code disabled by default; land negotiation and
-deterministic tests first, then server support, a small native cohort, and only
-then broaden. Keep independent global/client/server kill switches that force
+Initial rollout: code and deterministic/server support are implemented and
+disabled by default. Enable server support, then a measured native cohort, then
+broaden only after the remaining device/deployment gates. Independent
+global/client/server kill switches force
 ordinary WS. Record bounded-cardinality carrier, selection result, fallback
 reason, handshake latency, write calls, messages/bytes per flush, CPU per byte,
 queue pressure, reconnects, and protocol/read/write failure classes. Never label

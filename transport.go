@@ -521,6 +521,10 @@ type PlatformTransportSettings struct {
 	// H1MaxMessageByteCount caps each complete WebSocket message before it can
 	// grow a pooled buffer. A non-positive value resolves to the framer limit.
 	H1MaxMessageByteCount int64
+	// EnableH1Plus opts native, header-authenticated H1 connections into the
+	// compact custom upgrade. False preserves ordinary WebSocket rollout.
+	EnableH1Plus bool
+	H1PlusStats  *H1PlusStats
 	// PlatformTransportBudget is shared across window transports. Reservations
 	// remain held through reconnects so socket churn cannot escape the cap.
 	PlatformTransportBudget *PlatformTransportBudget
@@ -2006,7 +2010,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// Written by the single dial below and read by the connection it
 		// produced, both on this goroutine.
 		var dialExtenderIp netip.Addr
-		connect := func() (*websocket.Conn, error) {
+		connect := func() (H1MessageConn, error) {
 			header := http.Header{}
 			if self.settings.V2H1Auth {
 				header.Add("Authorization", fmt.Sprintf("Bearer %s", auth.ByJwt))
@@ -2016,10 +2020,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				self.applyIntentHeader(header)
 			}
 
-			ws, _, dialerInfo, err := self.clientStrategy.WsDialContextWithDialer(
+			ws, dialerInfo, err := self.clientStrategy.H1DialContextWithDialer(
 				self.dialContext(self.ctx),
 				self.platformUrl,
 				header,
+				int(self.h1MaxMessageByteCount()),
+				self.settings.EnableH1Plus && self.settings.V2H1Auth && self.h1MaxMessageByteCount() <= math.MaxUint16,
+				self.settings.H1PlusStats,
 			)
 			if err != nil {
 				return nil, err
@@ -2099,7 +2106,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			}
 		}
 
-		var ws *websocket.Conn
+		var ws H1MessageConn
 		var err error
 		if self.log.V(2).Enabled() {
 			ws, err = TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), connect)
@@ -2382,6 +2389,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					firstMessage []byte,
 					firstPriority bool,
 				) (sendOpen bool, err error) {
+					if framed, ok := ws.(*FramedMessageConn); ok {
+						return writeH1FramedReadyBatch(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, self.settings.WriteTimeout, func() { writeCounter.Add(1) })
+					}
 					if writeBatchConn == nil {
 						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
 						return true, writeSendMessage(firstMessage)
@@ -2592,7 +2602,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					}
 
 					ws.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
-					messageType, r, err := ws.NextReader()
+					messageType, message, err := ReadH1PooledMessage(ws, self.h1MaxMessageByteCount())
 					if err != nil {
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
@@ -2602,14 +2612,6 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 					switch messageType {
 					case websocket.BinaryMessage:
-
-						message, err := MessagePoolReadAllLimit(r, self.h1MaxMessageByteCount())
-						if err != nil {
-							if self.log.V(2).Enabled() {
-								self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
-							}
-							return
-						}
 
 						if len(message) <= 16 {
 							if len(message) == 0 {
