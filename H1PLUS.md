@@ -425,6 +425,257 @@ large-RPC workload qualification must account for this cost. Fitting caller
 storage remains allocation-free on the write side. The compact 1,200-byte H1+
 cohort does not use this large XL fallback and is unaffected by the policy.
 
+### Device RPC: actual native mux over pinned mutual TLS
+
+The durable SDK fixture is
+[`device_rpc_h1plus_benchmark_test.go`](../sdk/device_rpc_h1plus_benchmark_test.go),
+introduced by SDK `e64735ec`. It uses the production local native dialer,
+pinned server/client certificates, local listener upgrade handler, actual
+`deviceRpcMux`, and forward/reverse gob `net/rpc` calls over real loopback
+TLS 1.3. This is not a bare Framer timing or an application method shortcut.
+One request and one reply each contain the indicated payload; the receiver
+checks every byte and the monotonically ordered sequence in both directions.
+Carrier selection, unchanged admission limits, and joined/fully drained
+teardown are asserted. Synthetic echo application work is intentionally small.
+
+Every arm allows one outstanding call per logical stream, with the same
+production queue/deadline settings. Duplex has two independent logical calls;
+there is no synthetic batching, larger queue, added waiting, or bulk wrapper.
+Matched arms must have exactly equal logical gob/mux frame counts and bytes.
+The existing carrier's ready-only behavior remains in effect, so **physical
+TLS write counts need not be equal**: that difference is part of the measured
+RPC implementation. Counters below TLS count encrypted socket `Write` calls,
+including TLS record splitting, **not** `tls.Conn.Write` API calls.
+
+The 2026-09-22 pre-collector-fix cohort used Go 1.26.7, darwin/arm64 Apple M4
+Pro, 14 logical cores, `GOMAXPROCS=3`, SDK production `1bf8a0a1` and Connect
+`c74d6acb`. Only the now-committed benchmark files were untracked at build time.
+Ten fresh-process paired blocks alternate carrier order and rotate case order.
+Per direction, 256/1,200-B arms run 12,000 RPCs, 64-KiB arms 2,000, and
+near-3-MiB arms 120. Setup, authentication, 16 warmup calls per active direction,
+and teardown are excluded. All **220 timing observations** passed, comprising
+1,042,400 complete RPCs per carrier. CPU, allocation and throughput include
+both endpoints, gob, mux, TLS, verification and instrumentation. Throughput
+counts request **plus reply** payload bytes, not one-way VPN goodput.
+
+These are medians of independent arm results. Percentage effects are medians
+of same-block paired ratios with 20,000-resample bootstrap 95% intervals,
+seed `0x481beef`; ratios of absolute medians need not equal paired effects.
+Intervals are exploratory per-metric intervals, not multiplicity-adjusted
+product-release or battery claims. A positive CPU-reduction value is better.
+
+| Payload / direction | Median p50 µs, WS → XL | Median p95 µs, WS → XL | Median payload Mb/s, WS → XL | Throughput change %, 95% CI | CPU reduction %, 95% CI |
+| --- | ---: | ---: | ---: | --- | --- |
+| 256 B forward | 31.31 → 31.27 | 40.02 → 39.92 | 125.6 → 125.3 | −0.57 [−3.57, 1.51] | 0.47 [−4.65, 2.36] |
+| 256 B reverse | 31.08 → 31.23 | 39.83 → 40.15 | 126.2 → 125.0 | −0.46 [−1.56, 0.68] | −0.09 [−0.91, 1.66] |
+| 256 B duplex | 35.88 → 36.04 | 50.56 → 50.65 | 219.3 → 216.9 | −1.03 [−1.73, 0.19] | −1.51 [−2.39, −0.98] |
+| 1,200 B forward | 33.10 → 32.63 | 41.73 → 41.62 | 552.7 → 557.5 | 0.38 [−0.56, 1.95] | 2.63 [−1.32, 5.01] |
+| 1,200 B reverse | 33.19 → 32.96 | 41.79 → 42.15 | 551.9 → 553.3 | 0.44 [−1.75, 1.91] | 1.72 [−1.01, 2.80] |
+| 1,200 B duplex | 38.23 → 38.31 | 54.65 → 54.88 | 956.6 → 950.3 | 0.40 [−1.22, 1.61] | −0.20 [−2.16, 0.69] |
+| 64 KiB forward | 142.00 → 107.00 | 304.40 → 242.83 | 5,977.6 → 8,015.0 | 32.31 [31.46, 34.20] | 26.37 [25.59, 27.49] |
+| 64 KiB reverse | 143.50 → 106.63 | 314.88 → 245.44 | 5,951.8 → 7,932.5 | 35.79 [33.19, 36.21] | 27.66 [26.54, 28.19] |
+| 64 KiB duplex | 193.00 → 124.83 | 499.60 → 388.17 | 8,387.8 → 11,535.0 | 36.69 [34.55, 39.56] | 28.04 [26.51, 28.93] |
+| 3,141,632 B forward | 4,793.42 → 3,391.85 | 5,758.69 → 3,996.54 | 10,288.2 → 14,680.6 | 43.73 [38.95, 45.43] | 34.95 [32.86, 35.60] |
+| 3,141,632 B reverse | 4,754.04 → 3,377.96 | 5,499.58 → 3,922.73 | 10,464.6 → 14,675.4 | 41.18 [38.73, 43.14] | 33.17 [32.49, 34.33] |
+
+The first cohort is **mixed, not a blanket win**. Large RPCs improve clearly;
+small-call p50/p95/throughput intervals include no change. The 256-B duplex CPU
+cost increases by 1.51% [0.98%, 2.39%] in the per-metric interval, and small
+calls allocate more bytes even though their allocation count falls by one.
+Go escape analysis identifies the 768-byte `[32][]byte` ready-collector array
+as a heap allocation on every interface `WriteMessages` call. That is a
+specific small-control optimization target; it is not masking cost.
+
+Two additional fresh-process memory pairs per case produced **44 diagnostic
+observations**, separate from all timing confidence intervals. Sampling uses
+`runtime/metrics` every millisecond and after every completed RPC. Runtime
+memory is `Sys - HeapReleased`; sampled maxima are lower bounds, not absolute
+peak proofs. GC counts below are medians of the uninstrumented timed arms;
+duplex arms complete twice as many RPCs. Detailed allocation counts, process
+CPU/RPC, p99, GC pauses, heap/object peaks, initial/post-close states and whole-
+process peak RSS remain in the raw records.
+
+| Payload / direction | Allocated B/RPC, WS → XL | TLS socket writes/RPC, WS → XL | Median sampled runtime peak MiB, WS → XL | GC cycles/arm, WS → XL |
+| --- | ---: | ---: | ---: | ---: |
+| 256 B forward / reverse | 1,920 → 3,608 | 2 → 2 | 16.82 / 16.65 → 16.72 / 16.87 | 3 → 6 |
+| 256 B duplex | 1,912 → 3,558 | 2 → 1.953 | 17.15 → 17.73 | 6 → 11 |
+| 1,200 B forward / reverse | 5,953 → 7,641 | 2 → 2 | 17.04 / 17.12 → 17.18 / 16.80 | 10 → 13 |
+| 1,200 B duplex | 5,945 → 7,600 | 2 → 1.962 | 17.82 → 17.86 | 20 → 25 |
+| 64 KiB forward | 860,499 → 674,742 | 25 → 10 | 25.16 → 25.24 | 156 → 118.5 |
+| 64 KiB reverse | 860,519 → 674,743 | 25 → 10 | 25.13 → 25.29 | 156 → 119 |
+| 64 KiB duplex | 860,664 → 674,807 | 25 → 9.982 | 28.26 → 28.44 | 286 → 222 |
+| 3,141,632 B forward | 52,374,835 → 31,485,596 | 964 → 386 | 82.56 → 73.91 | 193.5 → 121 |
+| 3,141,632 B reverse | 52,373,576 → 31,485,837 | 964 → 386 | 87.23 → 73.68 | 177.5 → 121 |
+
+Source inspection explains why actual large RPC can improve despite the extra
+full-frame XL temporary: XL's exact-length pooled read avoids WebSocket's
+geometrically growing `MessagePoolReadAllLimit` receive buffer, and native WS
+fragments/masks through its default 4-KiB writer while XL writes a complete
+frame. Logical gob/mux framing is unchanged: two frames per small RPC and four
+per large RPC in both arms. This attributes likely mechanisms, not measured
+isolated shares of each copy/mask. Near-limit workloads still allocate about
+30 MiB per complete XL RPC across both endpoints. Post-close GC reduces heap
+to approximately 1.5–1.7 MiB, while allocator/runtime pages can remain high.
+No iOS-profile 24-MiB qualification, phone energy, public-provider latency,
+hosted proxy ingress, or baseline promotion follows from these host values.
+
+#### Retained small-RPC collector fix
+
+SDK `fe372d81` replaces the per-flush local descriptor array with one fixed
+`deviceRpcMux.writeMessages` array, exclusively owned by that mux's serialized
+writer. On 64-bit hosts the array is 768 bytes per mux, not a growing queue or
+payload buffer. Every borrowed slice is cleared before returning its pooled
+message and byte reservation, including cancellation, deadline failure and
+partial/failed writes. Independent muxes never share this storage; reader and
+writer still run in parallel. The 32-message/12-KiB ready-only drain policy,
+forward/reverse FIFO order, deadlines and queue budgets are unchanged.
+
+`TestDeviceRpcReadyBatchNoPerFlushDescriptorAllocation` measures singleton,
+11-message and 32-message flushes. Restoring the original local-array behavior
+fails all three cases at **exactly one allocation per flush**; reusable storage
+passes at **zero**. Compiler escape analysis no longer reports a per-call
+`messages` allocation; it borrows the already-heap-owned mux. Deterministic
+tests assert storage identity, repeated use, both stream tags in FIFO order,
+immediate sparse flush, message/byte bounds, cleared references, and exact pool
+ownership on success, pre-cancellation, failed deadline, write error and a
+blocked writer canceled with queued messages. Existing Connect ACK/ordinary
+fairness tests also pass; Device RPC itself has no ACK-priority lane.
+Final combined SDK ready-batch/mux/byte-budget/H1+ race tests pass twice on
+Go 1.27.1 (14.791 seconds); the Go 1.26.7 race run passes in 7.784 seconds and
+Connect's unchanged ACK-fairness/cancellation race controls pass in 1.663 seconds.
+
+A new contemporaneous cohort compares current WS, pinned pre-fix XL, and fixed
+XL. Twelve fresh-process blocks cycle all six arm orderings twice per case;
+two separate memory blocks retain the same sampling method. All **462/462**
+observations pass payload/order, carrier, logical-frame/byte equality and
+teardown controls (396 timing, 66 memory). Same host/toolchain/core count,
+payloads, iterations and bootstrap method as above. The old binary is the exact
+pre-fix binary fingerprint recorded below, not a re-created approximate
+baseline. Concurrent additive transport-stat/UI edits in the shared tree do
+not enter this RPC echo path; the manifest preserves their source/dirty hashes.
+
+Effects in this table compare **fixed XL against pre-fix XL**, not WS:
+
+| Payload / direction | p50 µs, before → fixed | p95 µs, before → fixed | Throughput change %, 95% CI | CPU reduction %, 95% CI |
+| --- | ---: | ---: | --- | --- |
+| 256 B forward | 30.48 → 30.21 | 40.06 → 39.35 | 1.56 [0.95, 2.98] | 2.42 [−0.31, 4.72] |
+| 256 B reverse | 30.44 → 30.44 | 39.35 → 39.35 | 1.12 [0.48, 2.52] | 0.97 [−1.49, 2.33] |
+| 256 B duplex | 35.88 → 35.33 | 50.87 → 49.96 | 1.65 [0.25, 2.69] | 2.27 [0.83, 3.41] |
+| 1,200 B forward | 32.33 → 31.69 | 42.73 → 41.15 | 2.16 [0.87, 4.47] | 3.47 [1.13, 4.78] |
+| 1,200 B reverse | 32.21 → 31.83 | 41.15 → 41.35 | 0.51 [−0.36, 1.77] | 0.33 [−0.63, 2.07] |
+| 1,200 B duplex | 37.90 → 37.83 | 54.63 → 54.44 | 1.05 [0.01, 1.70] | 1.39 [0.52, 2.25] |
+| 64 KiB forward | 103.69 → 102.85 | 243.85 → 242.65 | −0.03 [−0.68, 1.03] | −0.13 [−0.65, 0.75] |
+| 64 KiB reverse | 103.19 → 103.96 | 242.73 → 240.52 | −0.08 [−1.87, 0.79] | −0.56 [−2.06, 0.75] |
+| 64 KiB duplex | 127.65 → 125.08 | 384.79 → 380.96 | 0.35 [−0.74, 2.56] | 0.08 [−0.62, 2.18] |
+| 3,141,632 B forward | 3,293.19 → 3,315.33 | 3,953.79 → 3,940.77 | −0.21 [−1.91, 1.48] | 0.07 [−2.33, 1.74] |
+| 3,141,632 B reverse | 3,477.33 → 3,363.94 | 4,590.52 → 4,224.00 | 5.60 [−3.31, 8.28] | 5.14 [−4.01, 7.41] |
+
+The fix is retained: it removes the targeted allocation and improves several
+small-RPC cases without a detected medium/large throughput, CPU or p95
+regression. All medium/large paired p95 intervals include zero; this is not
+proof of exact equivalence. Preserve all outlying arms: the near-limit reverse
+case is visibly noisy and its apparent extra gain is not established.
+
+For 256-B forward/reverse RPCs, allocated bytes fall **3,608 → 1,816 B/RPC**,
+28 → 26 allocations/RPC, and timed GC cycles 6 → 3. For 1,200-B RPCs they fall
+**7,641 → 5,849 B/RPC**, 28 → 26 allocations, GC 13 → 10. Duplex removes about
+1,750–1,758 B/RPC and almost two allocations; ready coalescing explains the
+fractional per-RPC counts. Fixed XL is now below the contemporaneous WS
+allocation volume: about 1,920 B/29 allocations and 5,953 B/29 allocations for
+those two sizes. Small runtime-peak samples remain around 16.6–17.8 MiB across
+both endpoints; no absolute-memory or material sampled-peak reduction is
+claimed from only two memory pairs.
+
+Against contemporaneous WS, 256-B speed/CPU remains mostly indistinguishable.
+At 1,200 B, fixed XL throughput improves 1.95% [1.09%, 3.28%] forward,
+1.79% [0.10%, 3.21%] reverse and 1.76% [0.94%, 2.84%] duplex; CPU reductions
+are 2.91% [0.31%, 4.36%], 1.69% [0.50%, 3.03%] and 1.35% [0.65%, 2.47%].
+Large-RPC gains over WS remain about 34–41% throughput and 27–34% CPU.
+The earlier per-flush regression is not erased from the record, and all H1+
+rollout defaults remain off. The large-frame temporary policy and shared
+near-limit duplex admission restriction are unchanged.
+
+Reproduce the three-arm comparison with an attested pre-fix binary:
+
+```sh
+GOTOOLCHAIN=go1.26.7 node build/bench-device-rpc.mjs \
+  --pairs=12 --memory-pairs=2 --gomaxprocs=3 \
+  --baseline-binary=/path/to/pre-fix/sdk-device-rpc.test
+GOMAXPROCS=3 go test -race . -run '^TestDeviceRpc(ReadyBatch|Mux|ByteBudget|H1Plus)'
+# Compiler evidence: no new local descriptor array moved to heap per call.
+go test . -run '^$' -gcflags='github.com/urnetwork/sdk=-m=2'
+```
+
+Retained-fix cohort locator is sibling `urnetwork-device-rpc-xfs34Y` under
+the temporary artifact directory below. Raw 462-record JSONL SHA-256:
+`9ef1f91ca30446301e28c4e4bc1e76e7761cb6a293d4e828413d4ca62af59567`;
+results/manifest summary SHA-256:
+`4916d506b6070346123a4030cd160887f77742298b757643490f9b3e272702d7`;
+candidate binary SHA-256:
+`f826c467f34c5d689915462e6cd42e6c339afc09d9d7682117e553270a6c63fb`.
+
+#### Near-limit duplex is an explicit admission negative case
+
+The original 12-case campaign stopped on observation 23: near-limit XL duplex
+returned `reading body unexpected EOF` after 0.57 seconds. A 500-call-per-stream
+reproduction stopped after 0.65 seconds with
+`[mux]receive byte budget full; closing rpc generation`. A WS 500-call run
+happened to pass; active-consumer scheduling affects whether this limit is hit.
+Do not discard the failed case or infer that only XL has a finite receive cap.
+
+Each frame is individually below 3,145,728 bytes including its stream tag, but
+the per-endpoint shared receive budget is 4,194,304 bytes. An incoming request
+on one logical stream and reply on the other can each hold about 3 MiB before
+the consumer releases the first. `tryAcquire` intentionally refuses the
+second and closes the generation; waiting on that shared reader could starve
+the other stream. The budget bounds admitted queued/in-flight frames, not all
+gob buffers or the next frame already being read.
+`TestDeviceRpcH1PlusBenchmarkLargeDuplexAdmission` deterministically sends two
+valid near-limit frames over real pinned mTLS without a consuming reader and
+asserts **both WS and XL** close for this exact diagnostic and release every
+byte reservation. No budget is raised and no automatic reconnect is hidden in
+a successful timing. Revised cohorts retain forward/reverse near-limit cases
+and duplex through 64 KiB; near-limit duplex is not a qualified performance
+case. A later application admission/chunking design is needed to guarantee it.
+
+#### Reproduction and retained evidence
+
+From `sdk`, run the checked-in serial fresh-process runner; raw results stay
+local and privacy-safe aggregates go in `tests/PERFVAR-MEASUREMENTS.md`:
+
+```sh
+GOMAXPROCS=3 go test -race . -run '^TestDeviceRpcH1PlusBenchmark'
+node build/bench-device-rpc.mjs --self-test
+GOTOOLCHAIN=go1.26.7 node build/bench-device-rpc.mjs \
+  --pairs=10 --memory-pairs=2 --gomaxprocs=3
+# A quick standard benchmark is also available; this is not a paired cohort.
+GOMAXPROCS=3 go test . -run '^$' -bench '^BenchmarkDeviceRpcH1PlusMTLS$' \
+  -benchtime=100x -count=1
+```
+
+The runner refuses to average a failed arm, validates equal logical inputs,
+records source/dirty/build identities and saves failures separately. Its
+`--baseline-binary` option adds a pinned older XL binary as a third arm with
+rotating carrier order. `--analyze=/path/to/observations.jsonl` recomputes the
+summary without rerunning. Never overlap these CPU measurements with other
+host benchmark campaigns. The normal/race matrix, corruption/order/duplicate
+guards and explicit saturation test pass; full SDK H1+ race tests passed twice
+on Go 1.27.1 (14.589 seconds) before the collector optimization.
+
+Pre-fix valid cohort retention locator:
+`/var/folders/w4/86p_lsq50w1_4vw3xwvr4tbw0000gn/T/urnetwork-device-rpc-hgRetT`.
+Raw 264-record JSONL SHA-256:
+`f6864d96ad28e224018f383e5c962e68de5db0e67b4736c6177f836c3224b6de`;
+result/manifest summary SHA-256:
+`8b6a2e0e03c189e9912ad0994c432a8f8bba36a988d76780d499e16d7b59bde4`;
+measured binary SHA-256:
+`140d5fd66371112091f307e915adf6b524d73939f8d833a9dd20fd5fae1a1d71`.
+The initial failed cohort is retained separately at sibling
+`urnetwork-device-rpc-QI4JNA`: raw 22-record JSONL SHA-256
+`e84d5138639000d3226160f22700302f8c187129fa102d2ad261855bc6a1add8`,
+failure-note SHA-256
+`1a3e9f0e7363a86b1b2ade3353609ca26dd8aae1ee0da5e70d84ff5a6ce71763`.
+
 ### Earlier private prototype
 
 Private fixture: Go 1.27.1, darwin/arm64 Apple M4 Pro, `GOMAXPROCS=4`, real
