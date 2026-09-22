@@ -813,9 +813,10 @@ extender's color. The connect grid's default cell is 16 pt, which holds
 one full-size ring; apple drops rings that cannot fit and dashes the last
 drawn one, android scales stroke and gap down together once the fill would
 fall below a quarter of the dot radius so the count is preserved, both
-pinned by tests. The drawer's ip family histogram draws the same dots and
-the same rings at its dot size, and the grid signature includes the
-extender ips and the ip family so a change in either republishes the grid.
+pinned by tests. The drawer's ip family section drew the same dots and
+rings at its dot size until it became the text-only status row on every
+app (IPV6.md D2, 2026-09-21), and the grid signature includes the extender
+ips and the ip family so a change in either republishes the grid.
 The panel is hidden while there are no extenders at all.
 
 K3. Extender color. One color per extender ip, computed once in the sdk

@@ -242,12 +242,26 @@ cgo header regeneration; the three JS marshallers in `sdk/js`; the iOS RPC
 bridge in `device_rpc.go`.
 
 D2. UI. Under the transport distribution bar in each app's client-statistics
-card: three wrapping rows labeled Both, v4, v6, one dot per provider, dot
-diameter equal to the connect widget's live cell size (canvas width over grid
-width). Provider rows show the category label. Apps: android
-`ConnectStatsSections.kt`, apple `ConnectStatsSections.swift` with `FlowRow`,
-windows `ConnectPage.cpp` with a new host under `TransportBarHost`, linux
-`ConnectDrawer.cpp`, mmm `ConnectStats.jsx`.
+card: one row of three equal columns, Dualstack, IPv4, IPv6, top aligned,
+with no section title. The columns are the provider categories (a dualstack
+provider counts once, under Dualstack), never capabilities. Each column is its
+label in the pixel face (PP NeueBit bold, 16) over its status in the panel
+text face: "n connected" (Added) then "m connecting" (InEvaluation), each line
+only when its count is not zero, or "disconnected" alone; failed, not-added
+and removed providers count as nothing. The families rank dualstack first,
+IPv4 and IPv6 tied: the best-ranked column with a connected provider is the
+theme's text color (shared on a tie), any other column with something
+connected or connecting is the muted color, and a column with nothing is the
+faint color; the whole column takes its tier. A column that is only connecting
+is never best. The row reserves a label plus two status lines so it never
+reflows; counts roll with the numeric transition and colors tween with the
+app's 1s tween where the platform animates. Provider rows keep the Both /
+v4 / v6 category tag. This replaced the original dot histogram (three
+wrapping rows of widget-sized dots) on 2026-09-21 on every app. Apps: android
+`ui/stats/IpFamilyStatusRow.kt`, apple `IpFamilyStatusRow.swift`, windows
+`IpFamilyStatusRow.cpp` (pure logic in `IpFamilyStatus.cpp`) hosted by
+`ConnectPage.cpp`, linux `IpFamilyStatusRow.cpp` (`IpFamilyStatus.hpp`) in
+`ConnectDrawer.cpp`, mmm `IpFamilyStatusRow.jsx` (`providerGrid.js`).
 
 D3. Tests. A shared dual-stack helper runs a test body for v4 and v6 and
 requires IPv6 loopback; a host without it fails loudly. Tests run on
