@@ -17,7 +17,7 @@ import (
 )
 
 // Force an indivisible 17,600-byte socket batch through the actual H1 writer.
-// The server's production 8-KiB read cap rejects SendMulti's single raw Pack;
+// The server's production 16-KiB read cap rejects SendMulti's single raw Pack;
 // production logical grouping must deliver every packet through bounded Packs.
 func TestWindowTcpSocketBatchFitsPhysicalH1(t *testing.T) {
 	assertMessagePoolOwnership(t)
@@ -32,7 +32,7 @@ func TestWindowTcpSocketBatchFitsPhysicalH1(t *testing.T) {
 	carrier := DefaultPlatformTransportSettingsWithMemoryTarget(24 * 1024 * 1024)
 	carrier.Log = NewNoopLogger()
 	carrier.PingTimeout = 30 * time.Second
-	if carrier.H1MaxMessageByteCount != 8192 {
+	if carrier.H1MaxMessageByteCount != 16*1024 {
 		t.Fatalf("production H1 message cap changed: %d", carrier.H1MaxMessageByteCount)
 	}
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)

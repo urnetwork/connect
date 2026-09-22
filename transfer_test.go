@@ -808,7 +808,7 @@ func pemEncodeCertificate(der []byte) []byte {
 }
 
 // TestMinimumMessageLenLimitFitsWorstCaseHandshake preserves the measured
-// full-carrier regression and its deliberate 8-KiB safety boundary. Every H1
+// full-carrier regression and its deliberate 16-KiB safety boundary. Every H1
 // receive cap and framer must admit the largest current
 // `EncryptedControl{Handshake}` carrier; otherwise retransmission repeats the
 // same rejected message and silently deadlocks the handshake.
@@ -816,19 +816,22 @@ func TestMinimumMessageLenLimitFitsWorstCaseHandshake(t *testing.T) {
 	settings := DefaultClientSettings()
 	limit := settings.MinimumMessageLenLimit()
 
-	const observedRuntimeHandshakeCarrierByteCount = ByteCount(4950)
-	if limit < observedRuntimeHandshakeCarrierByteCount {
+	// Use a synthetic carrier larger than the observed integrated envelope. A
+	// component-only TLS size estimate previously selected an 8-KiB cap that
+	// rejected the real carrier.
+	const syntheticHandshakeCarrierByteCount = ByteCount(10 * 1024)
+	if limit < syntheticHandshakeCarrierByteCount {
 		t.Fatalf(
-			"MinimumMessageLenLimit %d < observed runtime handshake carrier %d",
+			"MinimumMessageLenLimit %d < synthetic handshake carrier %d",
 			limit,
-			observedRuntimeHandshakeCarrierByteCount,
+			syntheticHandshakeCarrierByteCount,
 		)
 	}
 
-	const requiredSafetyBoundary = ByteCount(8 * 1024)
+	const requiredSafetyBoundary = ByteCount(16 * 1024)
 	if limit != requiredSafetyBoundary {
 		t.Fatalf(
-			"MinimumMessageLenLimit %d, want bounded 8-KiB safety boundary %d",
+			"MinimumMessageLenLimit %d, want bounded 16-KiB safety boundary %d",
 			limit,
 			requiredSafetyBoundary,
 		)

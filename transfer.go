@@ -1588,14 +1588,16 @@ type ClientSettings struct {
 // integrated carrier measurement is the admission baseline; component-only
 // TLS estimates do not include every byte emitted by the current sender.
 //
-// Round up to the existing 8 KiB message-pool class. This leaves more than
-// 3 KiB for ASN.1 cert-size jitter, a future larger post-quantum key share, and
-// protobuf field-tag drift. Tests and embedded callers should plumb it through
-// their framer caps (and matching receive-side limits):
+// Production captured a 9,124-byte carrier after the original 8-KiB floor was
+// deployed. Keep the ordinary H1 data class at 4 KiB, but admit handshakes at
+// the bounded 16-KiB transport ceiling. Messages above the 8-KiB pool class
+// remain unpooled, so this admission floor does not permanently multiply the
+// ordinary message-pool footprint. Tests and embedded callers should plumb it
+// through their framer caps (and matching receive-side limits):
 //
 //	settings.FramerSettings.MaxMessageLen = max(yourValue, int(client.MinimumMessageLenLimit()))
 func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
-	return ByteCount(8 * 1024)
+	return ByteCount(16 * 1024)
 }
 
 // An immutable, lock-free view of receive-pump admission loss. Pack bytes are

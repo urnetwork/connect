@@ -1,14 +1,50 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	mathrand "math/rand"
 	"net"
 	"time"
 
 	"testing"
 )
+
+// TestFramerObservedHandshakeCarrierAdmission preserves the production
+// handshake-carrier regression with a larger synthetic carrier. The former
+// 8-KiB cap rejected the observed envelope, causing the sender to retransmit the same
+// immutable carrier while the receiver had already closed the stream. The
+// bounded 16-KiB default must admit and preserve it; this is not a license to
+// make ordinary data framing unbounded.
+func TestFramerObservedHandshakeCarrierAdmission(t *testing.T) {
+	const syntheticHandshakeCarrierByteCount = 10 * 1024
+	carrier := bytes.Repeat([]byte{0xa5}, syntheticHandshakeCarrierByteCount)
+
+	legacy := NewFramer(DefaultFramerSettings(8 * 1024))
+	if err := legacy.Write(io.Discard, carrier); err == nil {
+		t.Fatalf("former 8-KiB cap admitted %d-byte carrier", len(carrier))
+	}
+
+	limit := int(DefaultClientSettings().MinimumMessageLenLimit())
+	if limit != 16*1024 {
+		t.Fatalf("handshake admission limit %d, want bounded 16 KiB", limit)
+	}
+	current := NewFramer(DefaultFramerSettings(limit))
+	var wire bytes.Buffer
+	if err := current.Write(&wire, carrier); err != nil {
+		t.Fatalf("16-KiB cap rejected observed %d-byte carrier: %s", len(carrier), err)
+	}
+	received, err := current.Read(&wire)
+	if err != nil {
+		t.Fatalf("read admitted carrier: %s", err)
+	}
+	defer MessagePoolReturn(received)
+	if !bytes.Equal(received, carrier) {
+		t.Fatalf("admitted carrier changed during framing")
+	}
+}
 
 func TestFramerWriteRead(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
