@@ -3061,3 +3061,134 @@ Run both cost fixtures with
 `go test -run '^$' -bench '^(BenchmarkLogFileBufferPolicy|BenchmarkFileSinkBufferPolicy)$' -benchmem -benchtime=200ms -count=5`.
 This source fix remains **device-peak unqualified pending a fresh rate-zero
 arm**, with the same absolute 24-MiB gate and unchanged workloads.
+
+### Go 1.27 portable-SIMD research: H1 masking and CPU work — 2026-09-22
+
+**Research only; no production source, module version, buffer/window setting,
+or baseline was changed.** Connect `2201b2cc` / server `d8cc7a28` were measured
+on Darwin/arm64, Apple M4 Pro (14 logical cores), `GOMAXPROCS=10`.
+`GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd` built and ran the portable API with
+native 128-bit vectors; disassembly confirms NEON XOR. Both comparison arms
+used that same toolchain/experiment. A private workspace and overlays replaced
+only Gorilla's mask loop in the candidate; the dependency cache was untouched.
+Candidate mask-source SHA-256:
+`a19e51b27d89fee7ee9191903952b4a92f65c8f3e1173b96bef3931ef3c2d56a`.
+The [portable API](https://pkg.go.dev/simd) remains experimental; see the
+[Go 1.27 release notes](https://go.dev/doc/go1.27).
+
+CRC32C is not an unoptimized byte loop: Go's canonical Castagnoli table already
+dispatches to hardware CRC on supported ARM64/x86 CPUs. The existing SCTP
+checksum's 128/1280/16384-B medians were 10.87/103.0/1385 ns under Go 1.27,
+zero allocations. A private outgoing-only one-pass version measured
+5.993/100.8/1387 ns; it cannot replace immutable incoming verification and
+showed no bulk advantage. Negotiated SCTP zero-checksum avoids the work on
+compatible DTLS peers. No CRC change is retained. Profiled SHA work was the
+fixture's content verification; SACK interval processing is not a contiguous
+SIMD kernel. Neither justifies a new product SIMD loop.
+
+#### What H1 masking covers
+
+Gorilla masks client-to-server data/control writes and unmasks server reads;
+server-to-client frames are unmasked. Thus an application's upload masks on
+the device and unmasks at exchange; its download masks on the provider and
+unmasks at exchange. The downloading device masks returning ACK/control
+traffic, not the bulk download. These are H1 roles, not H3/P2P payload paths.
+Large TLS batches do not imply one large mask call: with the measured 4-KiB
+WebSocket buffer, 12/16-KiB messages make three/four 4-KiB client mask calls.
+Server reads can split these further. Mobile buffer/profile choices still
+need their own measurement.
+
+#### Forced-mask, high-volume production H1 socket fixture
+
+The fixture uses the production client WebSocket → ready-batch → TLS → real
+TCP path, checks every payload byte and framing/completion, and exercises
+1280/12288/16384-B messages. Ten fresh alternating A/B process pairs per size,
+two-second timed samples, delivered 31.36/41.08/35.32 GB in the scalar arms
+and 32.50/41.25/35.47 GB in the SIMD arms, excluding benchmark calibration.
+CPU is whole-process user+system time for both endpoints, not kernel-loop time
+or measured battery energy. Point estimates below use paired median log
+ratios; CIs are 20,000 paired-bootstrap resamples, initial seed `20260922`.
+CPU reduction means `1 - candidate/control`, positive is less work.
+
+| Message bytes | Throughput MB/s scalar → SIMD | Paired throughput gain, 95% CI | CPU ns/message scalar → SIMD | Paired CPU reduction, 95% CI |
+| --- | ---: | ---: | ---: | ---: |
+| 1280 | 1310.045 → 1355.200 | +3.52% [2.01, 4.36] | 2650 → 2581 | +2.67% [2.11, 3.21] |
+| 12288 | 1694.755 → 1719.205 | +1.69% [1.16, 2.24] | 20738.5 → 20466.5 | +1.52% [0.98, 2.10] |
+| 16384 | 1474.855 → 1500.635 | +1.55% [−0.89, 2.47] | 30496 → 30065.5 | +1.39% [−0.49, 2.03] |
+
+CPU ns/delivered byte were 2.0703→2.0164, 1.6877→1.6656 and
+1.8613→1.8351 respectively. Normalizing that same whole-process work by the
+two mask/unmask passes gives 1.0352→1.0082, 0.8439→0.8328 and
+0.9307→0.9175 ns/masked byte; these are **not mask-kernel-only costs**.
+CPU fell in all ten 1280-B and all ten 12-KiB pairs. The conservative exact
+sign-permutation test of the median statistic gives raw throughput p-values
+0.03125/0.03125/0.13672; Holm-adjusted across the three payloads:
+0.09375/0.09375/0.13672. CPU raw values are 0.03125/0.03125/0.125
+(adjusted 0.09375/0.09375/0.125). This is a small CPU-efficiency research
+signal, not a promoted statistically/practically qualified product gain.
+
+All 60 final size/arm/process observations passed, at unchanged **57 B/op and
+3 allocs/op**. The mask kernel itself remains zero-allocation. Maximum sampled
+host runtime (`Sys-HeapReleased`, both endpoints) was 20,860,637 B scalar /
+20,815,565 B SIMD; no statistically established memory increase was observed.
+This is not an iOS-profile device qualification. Separate 1-in-256 call timing
+and exact byte/count instrumentation reconciled masked/unmasked bytes and
+estimated 6.3–7.1% mask-loop share of this fixture's process CPU. That estimate
+includes timer overhead and is not a hardware-cycle measurement.
+
+#### Unchanged complete PERFVAR result and guardrails
+
+With the attested local test environment, five fresh processes per side each
+ran five 32-MiB `exchange-h1/clean-lan/tcp` repetitions in both directions,
+one hop, no extenders, `mobile-surrogate`, seed `20260810`. All 100 runs were
+payload-correct; all measured timeout, carrier-change, selective-gap, tail and
+cumulative recovery writes were zero, and pool outstanding ended at zero.
+Preserve calibration-invalid downloads: scalar **7/25**, SIMD **2/25** failed
+the unchanged requirement that underlay be at least 10% faster. No invalid
+numeric throughput was included; all 50 uploads were valid.
+
+| Direction | Median process goodput Mbps scalar → SIMD | Paired effect, 95% CI |
+| --- | ---: | ---: |
+| Download | 805.995 → 807.683 | −0.219% [−0.960, +0.618] |
+| Upload | 478.449 → 478.432 | −0.193% [−0.360, +0.096] |
+
+The full-stack throughput result is **indistinguishable**, not a speed win.
+All-endpoint simulator heap+stack peaks were 143,925,248/144,547,840 B and
+both arms recorded 100 samples above the existing 24-MiB counter. Preserve
+those observations: fixture memory is not a phone/extension memory value and
+cannot qualify the absolute iOS gate. Allocation and host-memory comparisons
+did not establish a regression, but neither arm is a memory qualification.
+A separate instrumented complete run counted 476,392 mask/unmask calls and
+743,198,518 masked bytes. Sample extrapolation was 44.54 ms of mask time versus
+38.63 s process CPU, about **0.115%**, including timer overhead and full
+setup/calibration. This attribution helps explain the flat full-stack result;
+it does not assert every real workload has the same share.
+
+Actual overlaid Gorilla bounds/alignment/key-position/fragment-continuation,
+framing/control/EOF and zero-allocation tests pass normally and under race
+three times. Its entire upstream suite has a pre-existing Go 1.27
+`rand.Seed` no-op incompatibility in `TestPreparedMessage`, reproduced with
+unmodified control; both full suites pass with test-only
+`GODEBUG=randseednop=0`. Timing arms did not use that override. Android/arm64
+and iOS/arm64 candidate library cross-builds pass (`CGO_ENABLED=0`); this is
+not a gomobile/app release build. A bounded scalar `xctrace` CPU Counters
+capture completed but spent over two minutes finalizing; no paired
+instruction/cycle or energy result is claimed. All raw artifacts stay private.
+
+#### Next: Android CPU/energy qualification, not production adoption yet
+
+First resolve the SDK's documented gomobile/Go 1.27 `gotypesalias=0` toolchain
+boundary; keep SIMD helpers out of exported bindings. Use only the existing
+two serial-allowlisted phones, with identical attested Go 1.27 builds differing
+only in masking. Predeclare CPU/energy metrics, practical margins and cohort
+size from pilot variance, then run order-balanced paired sessions on each
+Wi-Fi/cell underlay. Separate device upload, device download and provider H1
+roles; measure both fixed offered rate (including 40 Mbps) and saturation.
+Match useful bytes, TLS/frame distribution, thermal state, charge state,
+display/background load and radio conditions. Collect scoped app CPU time
+per delivered byte, cycles/instructions where available, and per-app/rail
+energy only where attribution is reliable; otherwise label CPU an energy
+proxy, not a battery claim. Keep all correctness/recovery/TTFB/Fast.com gates
+and the **unchanged 25,165,824-B absolute iOS-profile gate**. A repeatable CPU
+or energy saving can justify further work even below 5% wall-time improvement,
+but this host result alone does not authorize a production change.
