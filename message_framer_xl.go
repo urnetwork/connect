@@ -9,7 +9,6 @@ import (
 
 const (
 	framerXlHeaderLen       = 4
-	framerXlWritePrefixLen  = 2 * 1024
 	framerXlDefaultBatchLen = 16 * 1024
 )
 
@@ -30,7 +29,7 @@ type FramerXlSettings struct {
 	// batch, including every four-byte header. It must be at least four.
 	// It bounds WriteBatch's temporary allocation independently of the
 	// maximum message size; it is not a per-message limit. A large singleton
-	// uses Write's bounded-prefix path, or caller-owned storage if supplied.
+	// uses Write's frame-local buffer, or caller-owned storage if supplied.
 	MaxBatchLen int
 }
 
@@ -122,13 +121,15 @@ func (f *FramerXl) Read(r io.Reader) ([]byte, error) {
 	return message, nil
 }
 
-// Write emits one frame. It copies at most 2 KiB (including the header) into a
-// temporary pooled prefix; any remaining payload is passed directly to the
-// writer in a second write. This bounds scratch independently of message size.
-// WriteBatchWithStorage can avoid that second stream handoff when sufficiently
-// large caller-owned storage is already available. Neither method takes
-// ownership of message or changes its bytes. These APIs are for byte streams,
-// not packet transports whose individual Write boundaries carry meaning.
+// Write emits a complete header and payload in one stream write. Small frames
+// reuse the existing message pool; frames above its largest retained size class
+// use a frame-local allocation that is released when the write returns, including
+// on errors. No large scratch buffer is retained by the framer or added to a
+// pool. The endpoint must account for one additional framed payload while a
+// large Write is in progress. WriteBatchWithStorage avoids this allocation when
+// sufficiently large caller-owned storage is already available. Neither method
+// takes ownership of message or changes its bytes. These APIs are for byte
+// streams, not packet transports whose Write boundaries carry meaning.
 //
 // A short write or any write error is terminal, even with full byte progress;
 // the caller must close the stream, not retry a partially emitted frame.
@@ -136,18 +137,11 @@ func (f *FramerXl) Write(w io.Writer, message []byte) error {
 	if err := f.validateMessageLen(len(message)); err != nil {
 		return err
 	}
-	prefixLen := min(framerXlWritePrefixLen, len(message)+framerXlHeaderLen)
-	prefix := MessagePoolGet(prefixLen)
-	defer MessagePoolReturn(prefix)
-	binary.BigEndian.PutUint32(prefix[:framerXlHeaderLen], uint32(len(message)))
-	copy(prefix[framerXlHeaderLen:], message)
-	if err := writeFramerXlBytes(w, prefix); err != nil {
-		return err
-	}
-	if copied := prefixLen - framerXlHeaderLen; copied < len(message) {
-		return writeFramerXlBytes(w, message[copied:])
-	}
-	return nil
+	frame := MessagePoolGet(len(message) + framerXlHeaderLen)
+	defer MessagePoolReturn(frame)
+	binary.BigEndian.PutUint32(frame[:framerXlHeaderLen], uint32(len(message)))
+	copy(frame[framerXlHeaderLen:], message)
+	return writeFramerXlBytes(w, frame)
 }
 
 // WriteBatch validates the entire batch before emitting bytes. Multiple frames
@@ -178,7 +172,7 @@ func (f *FramerXl) WriteBatch(w io.Writer, messages [][]byte) error {
 // scratch and performs one stream write. Storage must not overlap any input
 // message and must remain exclusive until the call returns; input messages may
 // share read-only backing with each other. The framer retains neither.
-// Insufficient singleton scratch falls back to Write's bounded prefix; an
+// Insufficient singleton scratch falls back to Write's frame-local buffer; an
 // undersized multi-message batch fails before any output. MaxBatchLen applies
 // to multi-message batches even when the caller supplies larger storage.
 func (f *FramerXl) WriteBatchWithStorage(w io.Writer, messages [][]byte, storage []byte) error {

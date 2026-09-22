@@ -1,17 +1,23 @@
 package connect
 
 import (
+	"bufio"
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
+	"weak"
 )
 
 const framerXlTestRPCLimit = 3 * 1024 * 1024
@@ -59,12 +65,8 @@ func TestFramerXlWireAndMessageBoundaries(t *testing.T) {
 				if got := w.Bytes(); len(got) != n+4 || binary.BigEndian.Uint32(got[:4]) != uint32(n) || !bytes.Equal(got[4:], p) {
 					t.Fatal("uint32 frame header or payload changed")
 				}
-				wantWrites := 1
-				if mode != "storage-singleton" && n+4 > framerXlWritePrefixLen {
-					wantWrites = 2
-				}
-				if len(w.writes) != wantWrites {
-					t.Fatalf("writes=%v, want %d writes", w.writes, wantWrites)
+				if len(w.writes) != 1 {
+					t.Fatalf("writes=%v, want exactly one complete-frame write", w.writes)
 				}
 				got, err := f.Read(&w.Buffer)
 				if err != nil {
@@ -372,7 +374,7 @@ func (w *framerXlFailWriter) Write(p []byte) (int, error) {
 func TestFramerXlWriteFailureIsTerminal(t *testing.T) {
 	injected := errors.New("injected write failure")
 	f := NewFramerXl(DefaultFramerXlSettings(framerXlTestRPCLimit))
-	for _, mode := range []string{"small", "large-prefix", "large-tail", "singleton-storage", "batch", "batch-storage"} {
+	for _, mode := range []string{"small", "large-frame", "singleton-storage", "batch", "batch-storage"} {
 		for _, tc := range []struct {
 			progress  int
 			err, want error
@@ -390,10 +392,7 @@ func TestFramerXlWriteFailureIsTerminal(t *testing.T) {
 			switch mode {
 			case "small":
 				err = f.Write(w, p[:64])
-			case "large-prefix":
-				err = f.Write(w, p)
-			case "large-tail":
-				w.failCall = 2
+			case "large-frame":
 				err = f.Write(w, p)
 			case "singleton-storage":
 				err = f.WriteBatchWithStorage(w, [][]byte{p}, make([]byte, len(p)+4))
@@ -506,7 +505,7 @@ func TestFramerXlCancellationUnblocksWrite(t *testing.T) {
 		done <- f.Write(left, make([]byte, framerXlTestRPCLimit))
 	}()
 	// Reading just one byte guarantees that Write started but cannot finish
-	// its bounded prefix until the stream is closed.
+	// the complete frame until the stream is closed.
 	var first [1]byte
 	if _, err := io.ReadFull(right, first[:]); err != nil {
 		t.Fatal(err)
@@ -545,13 +544,13 @@ func TestFramerXlStorageDoesNotAllocate(t *testing.T) {
 	}
 }
 
-func TestFramerXlPoolOwnershipAndBoundedScratch(t *testing.T) {
+func TestFramerXlPoolOwnershipAndFrameLocalScratch(t *testing.T) {
 	if messagePoolSnapshotInFreshProcess(t) {
 		return
 	}
 	f := NewFramerXl(DefaultFramerXlSettings(framerXlTestRPCLimit))
 	beforeTaken, beforeReturned, _ := MessagePoolCounts()
-	beforeUnpooled, _ := MessagePoolUnpooledCounts()
+	beforeUnpooled, beforeUnpooledBytes := MessagePoolUnpooledCounts()
 	for _, wire := range [][]byte{{0, 0, 4, 0, 1}, {0xff, 0xff, 0xff, 0xff}} {
 		if p, err := f.Read(bytes.NewReader(wire)); p != nil || err == nil {
 			MessagePoolReturn(p)
@@ -576,9 +575,12 @@ func TestFramerXlPoolOwnershipAndBoundedScratch(t *testing.T) {
 	}
 	MessagePoolReturn(got)
 	MessagePoolReturn(p)
+	if afterUnpooled, _ := MessagePoolUnpooledCounts(); afterUnpooled != beforeUnpooled {
+		t.Fatal("small frames or invalid lengths allocated large scratch")
+	}
 	large := framerXlTestPayload(framerXlTestRPCLimit)
 	for _, mode := range []string{"write", "batch-singleton", "small-storage"} {
-		w := &framerXlTailWriter{payload: large}
+		w := &framerXlFrameLocalWriter{payload: large}
 		var err error
 		switch mode {
 		case "write":
@@ -588,18 +590,20 @@ func TestFramerXlPoolOwnershipAndBoundedScratch(t *testing.T) {
 		case "small-storage":
 			err = f.WriteBatchWithStorage(w, [][]byte{large}, make([]byte, 2048))
 		}
-		if err != nil || w.calls != 2 || !w.directTail {
-			t.Fatalf("%s: large frame did not use bounded prefix/direct tail: %v", mode, err)
+		if err != nil || w.calls != 1 {
+			t.Fatalf("%s: large frame did not use one frame-local write: %v", mode, err)
 		}
+		assertFramerXlFrameNotRetained(t, f, w)
 	}
-	for _, failCall := range []int{1, 2} {
-		w := &framerXlFailWriter{failCall: failCall, err: errors.New("write failure")}
-		if err := f.Write(w, large); err == nil {
-			t.Fatal("injected failure accepted")
+	for _, injected := range []error{io.ErrClosedPipe, io.ErrShortWrite} {
+		w := &framerXlFrameLocalWriter{payload: large, err: injected}
+		if err := f.Write(w, large); !errors.Is(err, injected) || w.calls != 1 {
+			t.Fatalf("injected failure changed or retried: %v", err)
 		}
+		assertFramerXlFrameNotRetained(t, f, w)
 	}
-	if afterUnpooled, _ := MessagePoolUnpooledCounts(); afterUnpooled != beforeUnpooled {
-		t.Fatal("large writes or invalid lengths allocated message-sized scratch")
+	if count, byteCount := MessagePoolUnpooledCounts(); count-beforeUnpooled != 5 || byteCount-beforeUnpooledBytes != uint64(5*(len(large)+4)) {
+		t.Fatalf("large writes allocated count=%d bytes=%d, want five exact framed allocations", count-beforeUnpooled, byteCount-beforeUnpooledBytes)
 	}
 	afterTaken, afterReturned, _ := MessagePoolCounts()
 	if afterTaken-beforeTaken != afterReturned-beforeReturned {
@@ -619,33 +623,92 @@ func TestFramerXlPoolOwnershipAndBoundedScratch(t *testing.T) {
 	if MessagePoolReturn(largeRead) {
 		t.Fatal("large frame was retained after release")
 	}
-	if afterUnpooled, _ := MessagePoolUnpooledCounts(); afterUnpooled-beforeUnpooled != 1 {
-		t.Fatalf("large read allocation count=%d want=1", afterUnpooled-beforeUnpooled)
+	if afterUnpooled, _ := MessagePoolUnpooledCounts(); afterUnpooled-beforeUnpooled != 6 {
+		t.Fatalf("large read and write allocation count=%d want=6", afterUnpooled-beforeUnpooled)
 	}
 }
 
-type framerXlTailWriter struct {
-	payload    []byte
-	calls      int
-	directTail bool
+func TestFramerXlFrameLocalPoolRetentionBoundary(t *testing.T) {
+	if messagePoolSnapshotInFreshProcess(t) {
+		return
+	}
+	pools := orderedMessagePools()
+	largest := pools[len(pools)-1].size
+	f := NewFramerXl(DefaultFramerXlSettings(largest + 1))
+	for _, size := range []int{2044, 2045, largest - 4, largest - 3} {
+		w := &framerXlPoolBoundaryWriter{}
+		before, _ := MessagePoolUnpooledCounts()
+		if err := f.Write(w, framerXlTestPayload(size)); err != nil {
+			t.Fatal(err)
+		}
+		after, _ := MessagePoolUnpooledCounts()
+		pooled := size+4 <= largest
+		if w.calls != 1 || w.pooled != pooled {
+			t.Fatalf("payload=%d: writes=%d pooled=%t want pooled=%t", size, w.calls, w.pooled, pooled)
+		}
+		if pooled {
+			if before != after || !MessagePoolReturn(w.observed) {
+				t.Fatal("pooled frame-local owner was not released immediately")
+			}
+		} else if after-before != 1 {
+			t.Fatal("frame above existing retention threshold entered a pool")
+		}
+	}
 }
 
-func (w *framerXlTailWriter) Write(p []byte) (int, error) {
+type framerXlPoolBoundaryWriter struct {
+	calls    int
+	pooled   bool
+	observed []byte
+}
+
+func (w *framerXlPoolBoundaryWriter) Write(p []byte) (int, error) {
 	w.calls++
-	if w.calls == 1 {
-		if len(p) != framerXlWritePrefixLen || binary.BigEndian.Uint32(p[:4]) != uint32(len(w.payload)) || !bytes.Equal(p[4:], w.payload[:len(p)-4]) {
-			return 0, fmt.Errorf("unbounded or incorrect large-frame prefix")
-		}
-	} else if w.calls == 2 {
-		want := w.payload[framerXlWritePrefixLen-4:]
-		w.directTail = len(p) == len(want) && &p[0] == &want[0]
+	w.pooled, _ = MessagePoolCheck(p)
+	if w.pooled {
+		w.observed = MessagePoolShareReadOnly(p)
 	}
 	return len(p), nil
 }
 
+type framerXlFrameLocalWriter struct {
+	payload []byte
+	calls   int
+	err     error
+	frame   weak.Pointer[byte]
+}
+
+func (w *framerXlFrameLocalWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if len(p) != len(w.payload)+4 || binary.BigEndian.Uint32(p[:4]) != uint32(len(w.payload)) || !bytes.Equal(p[4:], w.payload) || &p[4] == &w.payload[0] {
+		return 0, fmt.Errorf("incorrect complete frame or borrowed input")
+	}
+	if pooled, _ := MessagePoolCheck(p); pooled {
+		return 0, fmt.Errorf("large frame entered a retained pool class")
+	}
+	w.frame = weak.Make(&p[0])
+	if errors.Is(w.err, io.ErrShortWrite) {
+		return len(p) - 1, nil
+	}
+	return len(p), w.err
+}
+
+func assertFramerXlFrameNotRetained(t *testing.T, f *FramerXl, w *framerXlFrameLocalWriter) {
+	t.Helper()
+	// The large backing is not a tiny object, so weak pointer collection is
+	// deterministic after GC. Keep the framer, writer and caller payload live:
+	// this detects accidental retention by either the framer or a pool.
+	runtime.GC()
+	if w.frame.Value() != nil {
+		t.Fatal("completed large frame is still retained")
+	}
+	runtime.KeepAlive(f)
+	runtime.KeepAlive(w)
+}
+
 func BenchmarkFramerXlWrite(b *testing.B) {
 	for _, size := range []int{64, 1200, 65536, framerXlTestRPCLimit} {
-		for _, mode := range []string{"bounded-prefix", "storage"} {
+		for _, mode := range []string{"frame-local", "storage", "legacy-prefix"} {
 			b.Run(fmt.Sprintf("%s/%d", mode, size), func(b *testing.B) {
 				f := NewFramerXl(DefaultFramerXlSettings(framerXlTestRPCLimit))
 				p := make([]byte, size)
@@ -658,8 +721,10 @@ func BenchmarkFramerXlWrite(b *testing.B) {
 					var err error
 					if mode == "storage" {
 						err = f.WriteBatchWithStorage(io.Discard, messages, storage)
-					} else {
+					} else if mode == "frame-local" {
 						err = f.Write(io.Discard, p)
+					} else {
+						err = framerXlLegacyPrefixWrite(f, io.Discard, p)
 					}
 					if err != nil {
 						b.Fatal(err)
@@ -668,4 +733,144 @@ func BenchmarkFramerXlWrite(b *testing.B) {
 			})
 		}
 	}
+}
+
+// Benchmark-only control preserves the previous two-handoff large-write
+// behavior. Production always emits a large frame in one stream Write.
+func framerXlLegacyPrefixWrite(f *FramerXl, w io.Writer, message []byte) error {
+	if err := f.validateMessageLen(len(message)); err != nil {
+		return err
+	}
+	prefixLen := min(2*1024, len(message)+4)
+	prefix := MessagePoolGet(prefixLen)
+	defer MessagePoolReturn(prefix)
+	binary.BigEndian.PutUint32(prefix[:4], uint32(len(message)))
+	copy(prefix[4:], message)
+	if err := writeFramerXlBytes(w, prefix); err != nil {
+		return err
+	}
+	if copied := prefixLen - 4; copied < len(message) {
+		return writeFramerXlBytes(w, message[copied:])
+	}
+	return nil
+}
+
+// This benchmark includes both endpoints over real localhost TCP/TLS, verifies
+// every decoded payload, and reports writes above TLS. A single large TLS Write
+// still emits multiple TLS records. Large receive allocations are common to
+// both arms; frame-local additionally allocates the complete outbound frame.
+// Setup and 16 warm frames are excluded. No VPN, network RTT, or mobile memory
+// profile is modeled here.
+func BenchmarkFramerXlTLSWrite(b *testing.B) {
+	for _, size := range []int{1200, 65536, framerXlTestRPCLimit} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			for _, mode := range []string{"legacy-prefix", "frame-local"} {
+				b.Run(mode, func(b *testing.B) { benchmarkFramerXlTLSWrite(b, size, mode) })
+			}
+		})
+	}
+}
+
+type framerXlBenchmarkWriter struct {
+	io.Writer
+	writes int
+}
+
+func (w *framerXlBenchmarkWriter) Write(p []byte) (int, error) {
+	w.writes++
+	return w.Writer.Write(p)
+}
+
+func benchmarkFramerXlTLSWrite(b *testing.B, size int, mode string) {
+	b.StopTimer()
+	f := NewFramerXl(DefaultFramerXlSettings(size))
+	payload := framerXlTestPayload(size)
+	finished := make(chan error, 1)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, buffered, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			finished <- err
+			return
+		}
+		defer raw.Close()
+		if err := raw.SetDeadline(time.Now().Add(time.Minute)); err != nil {
+			finished <- err
+			return
+		}
+		_, err = buffered.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: urnetwork-framerxl/1\r\n\r\n")
+		if err == nil {
+			err = buffered.Flush()
+		}
+		if err != nil {
+			finished <- err
+			return
+		}
+		for i := range b.N + 16 {
+			p, err := f.Read(buffered.Reader)
+			correct := err == nil && bytes.Equal(p, payload)
+			MessagePoolReturn(p)
+			if !correct {
+				finished <- fmt.Errorf("frame %d payload or read error: %v", i, err)
+				return
+			}
+			if i == 15 {
+				if _, err := raw.Write([]byte{1}); err != nil {
+					finished <- err
+					return
+				}
+			}
+		}
+		finished <- nil
+	}))
+	defer server.Close()
+	config := server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	config.MinVersion = tls.VersionTLS13
+	config.NextProtos = []string{"http/1.1"}
+	conn, err := tls.Dial("tcp", server.Listener.Addr().String(), config)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer conn.Close()
+	if err = conn.SetDeadline(time.Now().Add(time.Minute)); err != nil {
+		b.Fatal(err)
+	}
+	if _, err = fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: urnetwork-framerxl/1\r\n\r\n"); err != nil {
+		b.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	response, err := http.ReadResponse(reader, nil)
+	if err != nil || response.StatusCode != http.StatusSwitchingProtocols {
+		b.Fatalf("benchmark upgrade failed: %v", err)
+	}
+	writer := &framerXlBenchmarkWriter{Writer: conn}
+	write := func() error {
+		if mode == "legacy-prefix" {
+			return framerXlLegacyPrefixWrite(f, writer, payload)
+		}
+		return f.Write(writer, payload)
+	}
+	for range 16 {
+		if err := write(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	var ready [1]byte
+	if _, err := io.ReadFull(reader, ready[:]); err != nil || ready[0] != 1 {
+		b.Fatalf("benchmark warmup failed: %v", err)
+	}
+	writer.writes = 0
+	b.ReportAllocs()
+	b.SetBytes(int64(size))
+	b.ResetTimer()
+	b.StartTimer()
+	for range b.N {
+		if err := write(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := <-finished; err != nil {
+		b.Fatal(err)
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(writer.writes)/float64(b.N), "TLS-writes/frame")
 }
