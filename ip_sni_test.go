@@ -220,6 +220,36 @@ func TestSniSnifferSplitSegments(t *testing.T) {
 	}
 }
 
+// A padded modern ClientHello can exceed the old 8-KiB reassembly ceiling.
+// SNI observation remains enrichment only, but losing it makes hostname-based
+// routing policy needlessly fall back to the destination address.
+func TestSniSnifferReassemblesPaddedClientHello(t *testing.T) {
+	var captured []string
+	sniffer := newSniSniffer(func(dstAddr netip.Addr, serverName string) {
+		captured = append(captured, serverName)
+	})
+
+	padding := make([]byte, 10*1024)
+	extraExtension := []byte{0x12, 0x34, byte(len(padding) >> 8), byte(len(padding))}
+	extraExtension = append(extraExtension, padding...)
+	hello := buildClientHelloWithExtraExtensions("padded.example", extraExtension)
+	if len(hello) <= 8*1024 || sniMaxClientHelloBytes < len(hello) {
+		t.Fatalf("synthetic ClientHello length=%d, cap=%d; want 8 KiB < length <= cap", len(hello), sniMaxClientHelloBytes)
+	}
+
+	first := len(hello) / 3
+	second := first * 2
+	for _, segment := range [][]byte{hello[:first], hello[first:second], hello[second:]} {
+		sniffer.observe(tls443Packet(t, "192.0.2.10", "198.51.100.20", 40012, segment))
+	}
+	if !slices.Equal(captured, []string{"padded.example"}) {
+		t.Fatalf("captured = %v, want [padded.example]", captured)
+	}
+	if sniffer.partialCount.Load() != 0 {
+		t.Fatalf("partials leaked after padded ClientHello: %d", sniffer.partialCount.Load())
+	}
+}
+
 func TestSniSnifferIgnores(t *testing.T) {
 	captured := 0
 	sniffer := newSniSniffer(func(netip.Addr, string) { captured++ })

@@ -36,10 +36,10 @@ const (
 	tlsSniTypeHostName               = 0x00
 
 	// sniMaxClientHelloBytes caps the bytes buffered per flow while reassembling a
-	// split ClientHello. A TLS record can be up to 16KB, but a real ClientHello —
-	// even with post-quantum key shares + ECH — is a few KB; cap below the record
-	// max so a malformed/hostile length can't buffer unbounded.
-	sniMaxClientHelloBytes = 8 * 1024
+	// split ClientHello. A TLS record can be up to 16 KiB, and modern padded or
+	// post-quantum ClientHellos can legitimately exceed 8 KiB. Keep the complete
+	// record ceiling while preserving a fixed bound for malformed input.
+	sniMaxClientHelloBytes = 16*1024 + 5
 	// sniMaxFlows hard-caps concurrent partial-ClientHello reassemblies (the memory
 	// bound: sniMaxFlows * sniMaxClientHelloBytes worst case). Partials are transient
 	// (a ClientHello completes within a round trip), so this is a DoS ceiling, not a
