@@ -2765,12 +2765,8 @@ func (self *peerEncryptionSession) cipherWithLock() *sequenceCipher {
 	// resend time — a bounded delivery delay (establishment + a resend
 	// interval) traded for never downgrading to plaintext mid-rekey.
 	//
-	// History: this branch used to return nil (plaintext fallback) so the
-	// contract-open ride-along would always open in the clear during a
-	// restart. That rationale is obsolete: the contract-open is now pinned
-	// ForceUnwrapped at queue time when the cipher is down and queued unpinned
-	// (wrapping normally) when it is up, so it no longer depends on this
-	// branch leaking plaintext.
+	// Contract-only controls have their own plaintext bootstrap pin, including
+	// during rekey. They cannot rely on a retained cipher the peer may have lost.
 	return self.establishedEpoch.derivedTlsCipher
 }
 
@@ -2798,6 +2794,19 @@ func (self *peerEncryptionSession) notifyRequiredCipherChangedWithLock() {
 		close(self.requiredCipherChanged)
 		self.requiredCipherChanged = make(chan struct{})
 	}
+}
+
+// Contract-only controls precede handshake bytes in the reliable sequence.
+// A retained application cipher cannot bootstrap a peer that lost that cipher.
+func (self *peerEncryptionSession) contractControlNeedsPlaintext() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	switch self.keyHistoryState {
+	case clientKeyHistoryPending, clientKeyHistoryRejected, clientKeyHistoryStoreUnavailable:
+		return true
+	}
+	return self.establishedEpoch == nil || self.establishedEpoch.derivedTlsCipher == nil ||
+		self.handshakeInFlightLocked()
 }
 
 // decryptCiphers returns the candidate ciphers for unwrapping an inbound

@@ -9415,19 +9415,10 @@ func (self *SendSequence) updateContractWithAckPromotion(
 			if nextSendContract.update(0) && nextSendContract.update(messageByteCount) {
 				self.setContract(nextSendContract, metadata.generation)
 
-				// Append the contract to the sequence. The contract-open
-				// ride-along carries only the contract frame — no application
-				// payload — so pre-cipher it is pinned plaintext
-				// (ForceUnwrapped, sticky across resends like the handshake
-				// controls): under EncryptionModeRequired the fail-closed
-				// write path would otherwise refuse it, and a refused open
-				// gaps the sequence ahead of the handshake controls and
-				// wedges establishment. The pin also keeps a pre-cipher open
-				// legible on resend after the local cipher comes up while the
-				// peer's has not (the EC-frame rationale). Once the cipher is
-				// up the open pack is queued unpinned and wraps normally,
-				// re-sealed per write like any other frame.
-				forceUnwrapped := self.session != nil && self.session.Cipher() == nil
+				// A contract-only head must precede the plaintext handshake,
+				// even during rekey when the application cipher stays available.
+				// Keep its bootstrap pin across resends and local establishment.
+				forceUnwrapped := self.session != nil && self.session.contractControlNeedsPlaintext()
 				self.sendWithSetContract(
 					nil,
 					self.contractOpenAckCallback(nextSendContract),
@@ -9979,7 +9970,7 @@ func (self *SendSequence) sendContractAheadAnnouncement(
 		noAckSendSet{},
 		true,
 		false,
-		self.session != nil && self.session.Cipher() == nil,
+		self.session != nil && self.session.contractControlNeedsPlaintext(),
 		sendSchedulingKey{},
 		aheadContract,
 	)
@@ -10276,6 +10267,7 @@ func (self *SendSequence) sendWithSetContractRecords(
 		transferFrameBytes: transferFrameBytes,
 		acks:               acks,
 		forceUnwrapped:     forceUnwrapped,
+		contractControl:    len(sendFrames) == 0 && (setContract || aheadContract != nil),
 		schedulingKey:      schedulingKey,
 	}
 	self.client.initialSendWriteCount.Add(1)
@@ -12085,6 +12077,15 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			}
 		}
 	}
+	// A rekey may begin after this contract-only item was queued or first
+	// written. Pin at the writer too, so an unreadable retained head cannot
+	// strand the replacement handshake behind a sequence gap. Data-bearing
+	// contract heads never receive this exemption, even for an empty payload.
+	if !forceUnwrapped && item != nil && item.contractControl && self.session != nil &&
+		self.session.contractControlNeedsPlaintext() {
+		item.forceUnwrapped = true
+		forceUnwrapped = true
+	}
 	var cipher *sequenceCipher
 	if self.session != nil && !forceUnwrapped {
 		cipher = self.session.Cipher()
@@ -12536,6 +12537,7 @@ type sendItem struct {
 	// outer wrap is skipped even if the per-peer cipher becomes available
 	// between the initial send and a retransmit.
 	forceUnwrapped                bool
+	contractControl               bool
 	transportWriteObserved        bool
 	unreliableCarrierObserved     bool
 	reliableCarrierObserved       bool
