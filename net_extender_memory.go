@@ -147,9 +147,10 @@ func newExtenderQuicMemoryPolicy(ctx context.Context, connectSettings *ConnectSe
 		readBufferByteCount:  readBufferByteCount,
 		writeBufferByteCount: writeBufferByteCount,
 		quicConfig:           config,
-		// Shared NetworkSpace API/feed strategies acquire against the process
-		// root, which also owns mobile child claims. They are not assigned to
-		// an arbitrary device and cannot create an additive private allowance.
+		// Untagged API/feed/probe dials have independent lifecycle owners;
+		// MemoryBudget sizes those owners but is not a shared admission root.
+		// Explicit caller/nested ownership above remains authoritative. Keep
+		// the historical unbudgeted behavior only for an unscaled, unowned dial.
 		unbudgeted: !owned && MemoryBudget() <= 0,
 	}
 }
