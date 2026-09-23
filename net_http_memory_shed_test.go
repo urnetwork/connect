@@ -320,6 +320,8 @@ func BenchmarkClientStrategyApiLoopback(b *testing.B) {
 // Diagnostic only: isolate one or four complete idle API graphs in a fresh
 // process. The loopback server is in this process, so runtime deltas include
 // both ends; the client carrier reservation and connection counts are exact.
+// Retain each request's actual independent owner; constructing another default
+// budget at sampling time would silently report zero for a live connection.
 func TestClientStrategyMemoryShedFootprintSample(t *testing.T) {
 	value := os.Getenv("URNETWORK_API_MEMORY_SAMPLE")
 	if value == "" {
@@ -334,15 +336,19 @@ func TestClientStrategyMemoryShedFootprintSample(t *testing.T) {
 	defer SetMemoryBudget(previousBudget)
 	server := newTestAltServer(t, false)
 	clients := make([]*http.Client, 0, count)
+	budgets := make([]*PlatformTransportBudget, 0, count)
 	for range count {
 		strategy := newTestAltStrategy(t, server)
 		dialer := testAltDialer(t, strategy, "alt h3")
-		if testAltGet(t, dialer) != testAltBodyText {
+		budget := DefaultPlatformTransportBudget()
+		ctx := context.WithValue(t.Context(), platformTransportNestedBudgetContextKey{}, budget)
+		if testAltGetWithContext(t, ctx, dialer) != testAltBodyText {
 			t.Fatal("loopback response")
 		}
 		client := dialer.HttpClient()
 		waitAltMemorySlot(t, client)
 		clients = append(clients, client)
+		budgets = append(budgets, budget)
 	}
 	sample := func() runtime.MemStats {
 		debug.FreeOSMemory()
@@ -351,7 +357,11 @@ func TestClientStrategyMemoryShedFootprintSample(t *testing.T) {
 		return stats
 	}
 	before := sample()
-	beforeClaims := DefaultPlatformTransportBudget().Stats()
+	beforeClaims := testAltMemoryClaimSnapshot(budgets)
+	wantClaim := kib(512 + 512 + 256 + 128 + 256)
+	if beforeClaims.UsedByteCount != ByteCount(count)*wantClaim || beforeClaims.UsedTransportCount != count {
+		t.Fatalf("footprint sample lost live API owners: %+v; want %d claims of %d bytes", beforeClaims, count, wantClaim)
+	}
 	beforeGoroutines := runtime.NumGoroutine()
 	started := time.Now()
 	ShedMemory()
@@ -367,12 +377,16 @@ func TestClientStrategyMemoryShedFootprintSample(t *testing.T) {
 	}
 	if closed != 0 {
 		deadline := time.Now().Add(2 * time.Second)
-		for DefaultPlatformTransportBudget().Stats().UsedTransportCount != 0 && time.Now().Before(deadline) {
+		for testAltMemoryClaimSnapshot(budgets).UsedTransportCount != count-closed && time.Now().Before(deadline) {
 			time.Sleep(time.Millisecond)
 		}
 	}
 	after := sample()
-	afterClaims := DefaultPlatformTransportBudget().Stats()
+	afterClaims := testAltMemoryClaimSnapshot(budgets)
+	if afterClaims.UsedByteCount != ByteCount(count-closed)*wantClaim || afterClaims.UsedTransportCount != count-closed ||
+		afterClaims.ReservedByteCount-afterClaims.ReleasedByteCount != afterClaims.UsedByteCount {
+		t.Fatalf("footprint sample lost closed API ownership: closed=%d stats=%+v", closed, afterClaims)
+	}
 	result := struct {
 		Count, Closed, BeforeGoroutines, AfterGoroutines                           int
 		BeforeClaims, AfterClaims, HeapReclaimed, StackReclaimed, RuntimeReclaimed int64
@@ -386,4 +400,49 @@ func TestClientStrategyMemoryShedFootprintSample(t *testing.T) {
 		t.Fatal(err)
 	}
 	fmt.Printf("API_MEMORY_SAMPLE %s\n", encoded)
+}
+
+// Aggregate only the owners retained by this sample, never a freshly allocated
+// default budget or an unrelated device's admission root.
+func testAltMemoryClaimSnapshot(budgets []*PlatformTransportBudget) PlatformTransportBudgetStats {
+	var total PlatformTransportBudgetStats
+	for _, budget := range budgets {
+		stats := budget.Stats()
+		total.UsedByteCount += stats.UsedByteCount
+		total.UsedTransportCount += stats.UsedTransportCount
+		total.ReservedByteCount += stats.ReservedByteCount
+		total.ReleasedByteCount += stats.ReleasedByteCount
+	}
+	return total
+}
+
+func TestClientStrategyMemoryShedFootprintCountsOwnedClaims(t *testing.T) {
+	first, second := NewPlatformTransportBudget(10, 1), NewPlatformTransportBudget(20, 1)
+	firstClaim := first.register(platformTransportBudgetExtender, 3, true)
+	secondClaim := second.register(platformTransportBudgetExtender, 7, true)
+	defer firstClaim.Release()
+	defer secondClaim.Release()
+	if !firstClaim.TryAcquire() || !secondClaim.TryAcquire() {
+		t.Fatal("could not acquire independent sample claims")
+	}
+	budgets := []*PlatformTransportBudget{first, second}
+	if got := testAltMemoryClaimSnapshot(budgets); got.UsedByteCount != 10 || got.UsedTransportCount != 2 ||
+		got.ReservedByteCount != 10 || got.ReleasedByteCount != 0 {
+		t.Fatalf("sample omitted live owners: %+v", got)
+	}
+	// This was the old sample's false-zero observation, not a legitimate view
+	// of either established carrier. Keep it as a distinct negative control.
+	if unrelated := testAltMemoryClaimSnapshot([]*PlatformTransportBudget{DefaultPlatformTransportBudget()}); unrelated.UsedByteCount != 0 {
+		t.Fatalf("unrelated default unexpectedly observed live sample claims: %+v", unrelated)
+	}
+	firstClaim.Release()
+	if got := testAltMemoryClaimSnapshot(budgets); got.UsedByteCount != 7 || got.UsedTransportCount != 1 ||
+		got.ReservedByteCount != 10 || got.ReleasedByteCount != 3 {
+		t.Fatalf("partial sample teardown lost the remaining owner: %+v", got)
+	}
+	secondClaim.Release()
+	if got := testAltMemoryClaimSnapshot(budgets); got.UsedByteCount != 0 || got.UsedTransportCount != 0 ||
+		got.ReservedByteCount != 10 || got.ReleasedByteCount != 10 {
+		t.Fatalf("sample teardown retained a claim: %+v", got)
+	}
 }

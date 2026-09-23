@@ -278,7 +278,11 @@ func TestPlatformMobileLiveH3DnsPumpBidirectionalAndTeardown(t *testing.T) {
 					streamCount++
 				}
 			}
-			budget, root := settings.PlatformTransportBudget, DefaultPlatformTransportBudget()
+			budget := settings.PlatformTransportBudget
+			root := budget.root
+			if root != budget || root.Stats().TotalByteCount != mib(5) {
+				t.Fatal("default device carrier budget is not an independent 5 MiB owner")
+			}
 			base := root.Stats().UsedByteCount
 			strategy := NewClientStrategyWithDefaults(ctx)
 			defer strategy.Close()

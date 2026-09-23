@@ -30,7 +30,10 @@ func TestPlatformH3MemoryRaceAdmitsEveryConcurrentSocketAndClosesLoser(t *testin
 			settings.AltUrl = "https://127.0.0.1:443"
 			transport := newTestAltTransport(t, settings)
 			budget := settings.PlatformTransportBudget
-			root := DefaultPlatformTransportBudget()
+			root := budget.root
+			if root != budget || root.Stats().TotalByteCount != mib(5) {
+				t.Fatal("default device carrier budget is not an independent 5 MiB owner")
+			}
 			base := root.Stats().UsedByteCount
 			inner := budget.register(platformTransportBudgetH3Explicit, settings.H3BudgetByteCount, true)
 			if !inner.TryAcquire() {

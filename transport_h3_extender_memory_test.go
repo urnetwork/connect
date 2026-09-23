@@ -19,6 +19,11 @@ func TestPlatformH3ExtenderPacketConnPreservesMemoryOwner(t *testing.T) {
 		for _, carrier := range []ExtenderConnectMode{ExtenderConnectModeTcpTls, ExtenderConnectModeQuic, ExtenderConnectModeDns} {
 			t.Run(string(mode)+"/"+ExtenderCarrierForConnectMode(carrier), func(t *testing.T) {
 				settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+				// Defaults deliberately have independent owners. This regression
+				// needs an explicit hierarchy: filling the 5 MiB child must not
+				// permit an outer carrier to escape into the 8 MiB parent.
+				root := newDefaultPlatformTransportBudget(mib(32))
+				settings.PlatformTransportBudget = newDefaultPlatformTransportBudgetWithParent(mib(20), root)
 				settings.AltUrl = "https://alt.invalid:4443"
 				settings.DnsPumpHost = "pump.invalid"
 				budget := settings.PlatformTransportBudget
@@ -101,7 +106,7 @@ func TestPlatformH3ExtenderPacketConnPreservesMemoryOwner(t *testing.T) {
 					}
 					return err
 				}
-				// Exhaust only the 5 MiB device child. The process still has
+				// Exhaust only the 5 MiB device child. The explicit parent still has
 				// room even for the incorrect root-only outer + 256 KiB claim.
 				filler := budget.register(platformTransportBudgetExtender, mib(5)-innerBytes, false)
 				if !filler.TryAcquire() {

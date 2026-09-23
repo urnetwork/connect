@@ -117,7 +117,10 @@ func TestPlatformMobileNestedCarrierAdmissionMatrix(t *testing.T) {
 					transport := newTestAltTransport(t, settings)
 					ctx := transport.dialContext(t.Context())
 					budget := settings.PlatformTransportBudget
-					root := DefaultPlatformTransportBudget()
+					root := budget.root
+					if root != budget || root.Stats().TotalByteCount != profile.target/4 {
+						t.Fatal("default carrier budget did not retain its independent owner target")
+					}
 					base := root.Stats().UsedByteCount
 					class, innerBytes := platformTransportBudgetH3, settings.H3BudgetByteCount
 					if mode == TransportModeH1 {
@@ -167,7 +170,7 @@ func TestPlatformMobileNestedCarrierAdmissionMatrix(t *testing.T) {
 					}
 					stats := budget.Stats()
 					if stats.TotalByteCount < stats.UsedByteCount || root.Stats().UsedByteCount != base+stats.UsedByteCount {
-						t.Fatalf("child/process accounting mismatch: child=%+v root=%+v", stats, root.Stats())
+						t.Fatalf("carrier/owner accounting mismatch: carrier=%+v root=%+v", stats, root.Stats())
 					}
 					if (mode == TransportModeH3Dns || mode == TransportModeH3DnsPump) && carrier == ExtenderCarrierDns {
 						wantSlack := kib(96)
@@ -289,31 +292,98 @@ func TestMobileAltApiCoexistsWithDeviceCarrierAndReleases(t *testing.T) {
 				t.Fatal("device admission")
 			}
 			defer inner.Release()
-			root := DefaultPlatformTransportBudget()
-			base := root.Stats().UsedByteCount
+			deviceBefore := settings.PlatformTransportBudget.StatsWithRoot()
+			// An API request has its own lifecycle owner, not an implicit
+			// process parent shared with the device. Use the existing request
+			// budget seam so this real dial's claim is directly observable.
+			apiBudget := DefaultPlatformTransportBudget()
+			if apiBudget == settings.PlatformTransportBudget || apiBudget.root != apiBudget {
+				t.Fatal("API and device unexpectedly share their default admission owner")
+			}
+			ctx := context.WithValue(t.Context(), platformTransportNestedBudgetContextKey{}, apiBudget)
 			server := newTestAltServer(t, whodis)
 			strategy := newTestAltStrategy(t, server)
 			name := "alt h3"
 			if whodis {
 				name = "alt whodis"
 			}
-			if body := testAltGet(t, testAltDialer(t, strategy, name)); body != testAltBodyText {
+			if body := testAltGetWithContext(t, ctx, testAltDialer(t, strategy, name)); body != testAltBodyText {
 				t.Fatal(body)
 			}
-			policy := newExtenderQuicMemoryPolicy(t.Context(), DefaultConnectSettings())
+			policy := newExtenderQuicMemoryPolicy(ctx, DefaultConnectSettings())
 			if whodis {
 				policy.packetTranslationSettings()
 			}
-			if got := root.Stats().UsedByteCount; got != base+policy.byteCount {
-				t.Fatalf("live %s claim=%d want=%d", name, got, base+policy.byteCount)
+			if policy.budget != apiBudget || !policy.usesSlot || policy.unbudgeted {
+				t.Fatal("standalone API policy lost its explicit owner, inner TLS charge, or carrier slot")
+			}
+			if got := apiBudget.Stats(); got.UsedByteCount != policy.byteCount || got.UsedTransportCount != 1 {
+				t.Fatalf("live %s claim=%+v want=%d bytes and one slot", name, got, policy.byteCount)
+			}
+			if got := settings.PlatformTransportBudget.StatsWithRoot(); got != deviceBefore {
+				t.Fatalf("API request changed the independent device owner: before=%+v after=%+v", deviceBefore, got)
 			}
 			strategy.Close()
 			deadline := time.Now().Add(5 * time.Second)
-			for root.Stats().UsedByteCount != base && time.Now().Before(deadline) {
+			for apiBudget.Stats().UsedByteCount != 0 && time.Now().Before(deadline) {
 				time.Sleep(time.Millisecond)
 			}
-			if root.Stats().UsedByteCount != base {
-				t.Fatalf("alt close leaked process claim: %+v", root.Stats())
+			if got := apiBudget.Stats(); got.UsedByteCount != 0 || got.UsedTransportCount != 0 || got.ReservedByteCount != got.ReleasedByteCount {
+				t.Fatalf("alt close leaked API owner claim: %+v", got)
+			}
+			if got := settings.PlatformTransportBudget.StatsWithRoot(); got != deviceBefore {
+				t.Fatalf("API teardown changed the independent device owner: before=%+v after=%+v", deviceBefore, got)
+			}
+		})
+	}
+}
+
+// An untagged API dial deliberately creates one independent policy owner.
+// Filling one such owner must neither consume nor provide capacity to another.
+func TestMobileAltApiDefaultDialBudgetsAreIndependent(t *testing.T) {
+	old := MemoryBudget()
+	SetMemoryBudget(mib(32))
+	defer SetMemoryBudget(old)
+	for _, whodis := range []bool{false, true} {
+		t.Run(fmt.Sprint(whodis), func(t *testing.T) {
+			first := newExtenderQuicMemoryPolicy(t.Context(), DefaultConnectSettings())
+			second := newExtenderQuicMemoryPolicy(t.Context(), DefaultConnectSettings())
+			if whodis {
+				first.packetTranslationSettings()
+				second.packetTranslationSettings()
+			}
+			if first.budget == second.budget || first.budget.root != first.budget || second.budget.root != second.budget ||
+				first.budget.Stats().TotalByteCount != mib(8) || second.budget.Stats().TotalByteCount != mib(8) ||
+				!first.usesSlot || !second.usesSlot || first.unbudgeted || second.unbudgeted {
+				t.Fatal("default standalone API policies share or omit their admission owner")
+			}
+			filler := first.budget.register(platformTransportBudgetExtender, mib(8), true)
+			defer filler.Release()
+			if !filler.TryAcquire() {
+				t.Fatal("could not fill the first API owner")
+			}
+			claim, err := first.acquire(t.Context())
+			claim.Release()
+			if !errors.Is(err, errExtenderMemoryBudget) {
+				t.Fatalf("full API owner admitted another claim: %v", err)
+			}
+			claim, err = second.acquire(t.Context())
+			if err != nil {
+				t.Fatalf("another API owner's saturation prevented admission: %v", err)
+			}
+			defer claim.Release()
+			if got := second.budget.Stats(); got.UsedByteCount != second.byteCount || got.UsedTransportCount != 1 {
+				t.Fatalf("independent API claim=%+v want=%d bytes and one slot", got, second.byteCount)
+			}
+			claim.Release()
+			if got := first.budget.Stats().UsedByteCount; got != mib(8) {
+				t.Fatalf("second owner's release changed first owner: %d", got)
+			}
+			filler.Release()
+			for _, budget := range []*PlatformTransportBudget{first.budget, second.budget} {
+				if got := budget.Stats(); got.UsedByteCount != 0 || got.UsedTransportCount != 0 || got.ReservedByteCount != got.ReleasedByteCount {
+					t.Fatalf("independent API owner teardown retained a claim: %+v", got)
+				}
 			}
 		})
 	}

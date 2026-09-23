@@ -201,7 +201,12 @@ func testAltDialer(t *testing.T, clientStrategy *ClientStrategy, description str
 // Performs one GET through one dialer and returns the body.
 func testAltGet(t *testing.T, dialer *clientDialer) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return testAltGetWithContext(t, context.Background(), dialer)
+}
+
+func testAltGetWithContext(t *testing.T, ctx context.Context, dialer *clientDialer) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	request, err := http.NewRequestWithContext(
 		ctx, http.MethodGet, fmt.Sprintf("https://%s/hello", testAltApiHost), nil)

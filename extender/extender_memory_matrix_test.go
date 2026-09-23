@@ -81,8 +81,16 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 						}
 					}
 				}
-				budget, root := settings.PlatformTransportBudget, connect.DefaultPlatformTransportBudget()
-				base := root.Stats()
+				budget := settings.PlatformTransportBudget
+				base := budget.StatsWithRoot().Root
+				// The process target sizes defaults; it is not a shared admission
+				// parent. A separately constructed 8 MiB owner must stay untouched
+				// while this explicit 20 MiB target uses its own 5 MiB allowance.
+				unrelated := connect.DefaultPlatformTransportBudget()
+				unrelatedBase := unrelated.StatsWithRoot()
+				if unrelated == budget || unrelatedBase.Root.TotalByteCount != 8*1024*1024 {
+					t.Fatal("default construction did not produce an independent owner")
+				}
 				routeManager := connect.NewRouteManager(ctx, "extender-memory-matrix")
 				reader := routeManager.OpenMultiRouteReader(connect.DestinationId(connect.NewId()))
 				defer routeManager.CloseMultiRouteReader(reader)
@@ -122,10 +130,13 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 				assertClaim := func() {
 					t.Helper()
 					stats := budget.StatsWithRoot()
-					if stats.Budget.TotalByteCount != 5*1024*1024 || stats.Root.TotalByteCount != 8*1024*1024 ||
+					if stats.Budget.TotalByteCount != 5*1024*1024 || stats.Root != stats.Budget ||
 						stats.Budget.UsedByteCount != want || stats.Root.UsedByteCount != base.UsedByteCount+want ||
 						stats.Budget.UsedTransportCount != 1 || stats.Root.UsedTransportCount != base.UsedTransportCount+1 {
 						t.Fatalf("composed live ownership: want=%d child/root=%+v", want, stats)
+					}
+					if got := unrelated.StatsWithRoot(); got != unrelatedBase {
+						t.Fatalf("composed carrier charged an unrelated owner: before=%+v after=%+v", unrelatedBase, got)
 					}
 				}
 				assertClaim()
@@ -166,7 +177,8 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 				}
 				stats := budget.StatsWithRoot()
 				if stats.Budget.UsedByteCount != 0 || stats.Budget.UsedTransportCount != 0 || stats.Budget.ReservedByteCount != stats.Budget.ReleasedByteCount ||
-					stats.Root.UsedByteCount != base.UsedByteCount || stats.Root.UsedTransportCount != base.UsedTransportCount {
+					stats.Root.UsedByteCount != base.UsedByteCount || stats.Root.UsedTransportCount != base.UsedTransportCount ||
+					stats.Root != stats.Budget || unrelated.StatsWithRoot() != unrelatedBase {
 					t.Fatalf("composed teardown retained ownership: %+v", stats)
 				}
 				t.Logf("live child/root peak=%d/%d bytes; four bidirectional payloads; joined cleanup", want, base.UsedByteCount+want)
