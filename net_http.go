@@ -1532,7 +1532,7 @@ func (self *ClientStrategy) H1DialContextWithDialer(ctx context.Context, address
 		self.applyExtraHeaders(requestHeader)
 	}
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
-		conn, err := DialH1Messages(handleCtx, address, requestHeader, dialer.WsDialer(self.settings), H1FramerProtocol, maximum, enabled, stats)
+		conn, err := dialH1MessagesWithinDeadline(handleCtx, address, requestHeader, dialer.WsDialer(self.settings), H1FramerProtocol, maximum, enabled, stats)
 		var upgradeErr *HTTPUpgradeError
 		terminal := errors.As(err, &upgradeErr) && upgradeErr.Terminal
 		// An authorization denial is not an unhealthy extender. It is terminal

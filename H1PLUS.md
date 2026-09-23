@@ -279,8 +279,18 @@ cover the existing H1 TLS/socket boundary with the custom carrier enabled.
 
 Shared `DialFramedUpgrade`/`AcceptFramedUpgrade` preserve prefetched bytes;
 `DialH1Messages` owns one custom attempt and a fresh WS fallback. The custom
-handshake uses at most five seconds and at most half the remaining caller
-deadline; both attempts share the original total deadline. Terminal 401/403,
+handshake uses its native handshake budget, capped at five seconds and by the
+caller deadline. After TCP/TLS, the HTTP exchange also has a short probe cap
+(at most half the native handshake timeout and half the original remaining
+caller budget), retaining prompt fallback for low-RTT peers that ignore H1+.
+TCP/TLS is not charged against this phase cap: three healthy 1000ms RTTs must
+fit in a five-second handshake. Strategy negotiation shares the existing total
+request/preferred-route deadline (15 seconds per request by default), with a
+native handshake budget for each fresh custom or WS attempt. The standalone
+`DialH1Messages` entry point still treats `HandshakeTimeout` as the total bound
+across both attempts, preserving RPC connect deadlines (30 seconds by default).
+No attempt extends an earlier caller deadline; cancellation closes and joins
+an in-progress handshake, not a successfully transferred connection. Terminal 401/403,
 redirects, certificate/hostname failures and outer cancellation do not downgrade.
 The capability cache is distinct from provider/exit reputation.
 

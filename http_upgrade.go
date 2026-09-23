@@ -208,9 +208,17 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 	if 0 < dialer.HandshakeTimeout {
 		timeout = min(timeout, dialer.HandshakeTimeout)
 	}
-	// Leave time for a fresh fallback within the existing overall deadline.
+	// TCP/TLS and the upgrade together need the native handshake budget. In
+	// particular, halving it before TCP/TLS prevents three healthy 1s RTTs
+	// from fitting in the default 5s handshake timeout. Keep the shorter
+	// capability-probe budget for the HTTP exchange AFTER TCP/TLS instead,
+	// so a low-RTT peer that ignores custom upgrades still falls back quickly.
+	responseTimeout := timeout
+	if 0 < dialer.HandshakeTimeout {
+		responseTimeout = min(responseTimeout, dialer.HandshakeTimeout/2)
+	}
 	if deadline, ok := ctx.Deadline(); ok {
-		timeout = min(timeout, time.Until(deadline)/2)
+		responseTimeout = min(responseTimeout, time.Until(deadline)/2)
 	}
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -251,6 +259,8 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 		}
 		return nil, err
 	}
+	responseCtx, responseCancel := context.WithTimeout(attemptCtx, responseTimeout)
+	defer responseCancel()
 	success := false
 	defer func() {
 		if !success {
@@ -258,14 +268,14 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 		}
 	}()
 	canceled := make(chan struct{})
-	stop := context.AfterFunc(attemptCtx, func() { conn.Close(); close(canceled) })
+	stop := context.AfterFunc(responseCtx, func() { conn.Close(); close(canceled) })
 	disarmed := false
 	defer func() {
 		if !disarmed && !stop() {
 			<-canceled
 		}
 	}()
-	if deadline, ok := attemptCtx.Deadline(); ok {
+	if deadline, ok := responseCtx.Deadline(); ok {
 		if err = conn.SetDeadline(deadline); err != nil {
 			return nil, err
 		}
@@ -289,7 +299,7 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 			return nil, ctx.Err()
 		}
 		var networkError net.Error
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &networkError) {
+		if responseCtx.Err() != nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &networkError) {
 			// An intermediary may close an unknown upgrade, so allow one fresh
 			// WS attempt. This is not persistent protocol-capability evidence.
 			return nil, &HTTPUpgradeError{Reason: "response-io"}
@@ -309,7 +319,7 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 	if !stop() {
 		<-canceled
 		disarmed = true
-		return nil, attemptCtx.Err()
+		return nil, responseCtx.Err()
 	}
 	disarmed = true
 	if err = conn.SetDeadline(time.Time{}); err != nil {
@@ -322,8 +332,9 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 
 // DialH1Messages tries the authenticated custom carrier once and falls back to
 // a newly dialed, normally validated masked WebSocket only on capability
-// failure. The common deadline bounds both attempts. Application bytes are
-// never replayed, and auth/TLS failures never trigger downgrade.
+// failure. HandshakeTimeout is also the common total bound for this standalone
+// entry point (including RPC callers with only a cancelable parent context).
+// Application bytes are never replayed, and auth/TLS failures never downgrade.
 func DialH1Messages(ctx context.Context, address string, header http.Header, dialer *websocket.Dialer, protocol string, maximum int, enabled bool, stats *H1PlusStats) (H1MessageConn, error) {
 	if dialer == nil {
 		return nil, errors.New("missing H1 dialer")
@@ -332,6 +343,17 @@ func DialH1Messages(ctx context.Context, address string, header http.Header, dia
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, dialer.HandshakeTimeout)
 		defer cancel()
+	}
+	return dialH1MessagesWithinDeadline(ctx, address, header, dialer, protocol, maximum, enabled, stats)
+}
+
+// The strategy already owns the total request/preferred-route deadline. Do
+// not shrink it to one handshake's budget: a supported provider takes one
+// handshake, but an old provider needs a full new WS handshake after rejection.
+// Each native handshake remains bounded and neither can outlive ctx.
+func dialH1MessagesWithinDeadline(ctx context.Context, address string, header http.Header, dialer *websocket.Dialer, protocol string, maximum int, enabled bool, stats *H1PlusStats) (H1MessageConn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if enabled && FramedUpgradePermitted(address, protocol) {
 		start := time.Now()
@@ -349,7 +371,7 @@ func DialH1Messages(ctx context.Context, address string, header http.Header, dia
 		}
 		RecordFramedUpgradeFailure(address, protocol, err)
 	}
-	ws, response, err := dialer.DialContext(ctx, address, header)
+	ws, response, err := dialH1WebSocket(ctx, address, header, dialer)
 	if err != nil {
 		if response != nil && response.Body != nil {
 			response.Body.Close()
@@ -361,6 +383,53 @@ func DialH1Messages(ctx context.Context, address string, header http.Header, dia
 		stats.webSocketSelected.Add(1)
 	}
 	return ws, nil
+}
+
+// Gorilla applies context deadlines to handshake I/O, but an earlier manual
+// cancellation does not interrupt its HTTP response read. Guard the actual
+// socket until ownership transfers to the caller, including proxy negotiation
+// and TLS when Gorilla performs them. Only copy the dialer: strategy dialers
+// are cached and may be used concurrently by other attempts.
+func dialH1WebSocket(ctx context.Context, address string, header http.Header, dialer *websocket.Dialer) (*websocket.Conn, *http.Response, error) {
+	attempt := *dialer
+	var stop func() bool
+	var canceled <-chan struct{}
+	guard := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+		return func(dialCtx context.Context, network, address string) (net.Conn, error) {
+			conn, err := dial(dialCtx, network, address)
+			if err != nil {
+				return conn, err
+			}
+			done := make(chan struct{})
+			canceled = done
+			// Use the outer ctx, not Gorilla's private handshake context,
+			// which it cancels before returning even on a successful 101.
+			stop = context.AfterFunc(ctx, func() { conn.Close(); close(done) })
+			return conn, nil
+		}
+	}
+	plainDial := dialer.NetDialContext
+	if plainDial == nil {
+		plainDial = (&net.Dialer{}).DialContext
+		if dialer.NetDial != nil {
+			plainDial = func(_ context.Context, network, address string) (net.Conn, error) {
+				return dialer.NetDial(network, address)
+			}
+		}
+	}
+	attempt.NetDialContext = guard(plainDial)
+	if dialer.NetDialTLSContext != nil {
+		attempt.NetDialTLSContext = guard(dialer.NetDialTLSContext)
+	}
+	conn, response, err := attempt.DialContext(ctx, address, header)
+	if stop != nil && !stop() {
+		<-canceled
+		if conn != nil {
+			conn.Close()
+		}
+		return nil, response, ctx.Err()
+	}
+	return conn, response, err
 }
 
 // Only unsupported protocol evidence is cached. Authentication, certificate,
