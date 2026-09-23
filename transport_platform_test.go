@@ -178,6 +178,10 @@ func testingPlatformTransportSettings() *PlatformTransportSettings {
 	// keep the client's own keepalive out of the way; it is written directly to
 	// the socket and is not counted as activity either way
 	settings.PingTimeout = 30 * time.Second
+	// the testing platform server speaks only WebSocket, and these tests wrap
+	// and count its sockets one dial per connection. H1+ is on by default; its
+	// negotiation and fallback have their own tests, which opt back in
+	settings.EnableH1Plus = false
 	return settings
 }
 

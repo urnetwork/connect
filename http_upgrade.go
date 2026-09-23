@@ -28,8 +28,9 @@ const (
 
 var h1PlusDisabled atomic.Bool
 
-// SetH1PlusDisabled is the process-wide emergency switch. Enabling a client or
-// server still requires its own explicit setting; the default remains off.
+// SetH1PlusDisabled is the process-wide emergency switch. It forces ordinary
+// WebSocket whatever the client and server settings, which enable H1+ by
+// default.
 func SetH1PlusDisabled(disabled bool) { h1PlusDisabled.Store(disabled) }
 
 func H1PlusAvailable() bool { return runtime.GOOS != "js" && !h1PlusDisabled.Load() }

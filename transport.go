@@ -521,8 +521,9 @@ type PlatformTransportSettings struct {
 	// H1MaxMessageByteCount caps each complete WebSocket message before it can
 	// grow a pooled buffer. A non-positive value resolves to the framer limit.
 	H1MaxMessageByteCount int64
-	// EnableH1Plus opts native, header-authenticated H1 connections into the
-	// compact custom upgrade. False preserves ordinary WebSocket rollout.
+	// EnableH1Plus lets native, header-authenticated H1 connections try the
+	// compact custom upgrade, with a fresh WebSocket fallback. On in the
+	// default settings; false opts out to ordinary WebSocket.
 	EnableH1Plus bool
 	H1PlusStats  *H1PlusStats
 	// H1ConnectionStats reports the currently negotiated H1 carriers. Unlike
@@ -685,6 +686,8 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		DnsTlds: [][]byte{[]byte("ur.xyz.")},
 		// servers are migrated on 2025-06-12. We can remove this and always use true.
 		V2H1Auth: true,
+		// H1+ is opt-out (H1PLUS.md)
+		EnableH1Plus: true,
 		// the platform transport must carry the per-peer encryption handshake,
 		// so its framer max is the connect runtime minimum message length
 		FramerSettings:                            DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit())),

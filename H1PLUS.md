@@ -1,11 +1,13 @@
 # H1+: authenticated HTTP/1.1 upgrade to URnetwork Framer
 
-Status: implemented, opt-in and **disabled by default**, 2026-09-22. Native H1
-and native RPC can negotiate the two authenticated custom carriers below;
-Connect and proxy RPC servers accept them when their independent setting is
-enabled. Deterministic, real server, RPC, PERFVAR and real NGINX qualification is
-recorded below. Device performance, deployed ingress and the iOS-profile
-24-MiB absolute gate still gate broader rollout.
+Status: implemented 2026-09-22; opt-out and **enabled by default** since
+2026-09-23 (it shipped opt-in). Native H1 and native RPC negotiate the two
+authenticated custom carriers below, and Connect and proxy RPC servers accept
+them, unless their independent setting opts out. A refused or failed upgrade
+falls back to a fresh WebSocket. Deterministic, real server, RPC, PERFVAR and
+real NGINX qualification is recorded below. Device performance, deployed ingress
+and the iOS-profile 24-MiB absolute gate are still to be measured on the default
+path.
 
 ## Purpose and scope
 
@@ -204,7 +206,7 @@ negotiation as XL. Normal connect H1+ attempts only `urnetwork-framer/1`.
 Native SDK RPC offers `urnetwork-framerxl/1`; server/proxy's RPC endpoint
 accepts it in addition to `websocket` after the same authorization gate. An
 unsupported native attempt uses fresh standard WS fallback; browser/JS directly
-uses WS. Both native paths require explicit opt-in. Future
+uses WS. Both native paths are on by default and opt out independently. Future
 incompatible XL changes need a separately negotiated token/capability; do not
 change the meaning of `urnetwork-framerxl/1` silently. The `/1` is the protocol
 version in HTTP Upgrade's protocol-name/version syntax.
@@ -256,14 +258,15 @@ compression, ping/pong or opcode protocol.
 
 ## Implementation controls and diagnostics
 
-All enable settings default to false. Use independent controls for deployment:
+H1+ is opt-out: every enable setting is true in its default settings, and each
+scope opts out independently:
 
 | Scope | Control |
 | --- | --- |
-| Native Connect H1 client | `PlatformTransportSettings.EnableH1Plus`; also requires `V2H1Auth` and a compact-compatible site cap |
-| Connect server | `ConnectHandlerSettings.EnableH1Plus` |
-| Native SDK RPC client and local mTLS listener | `deviceRpcSettings.EnableH1Plus`; the bindable `sdk.SetDeviceRpcH1PlusEnabled` sets the default for subsequently created sessions |
-| Hosted proxy RPC endpoint | `ProxySettings.EnableDeviceRpcH1Plus` |
+| Native Connect H1 client | `PlatformTransportSettings.EnableH1Plus`, true in `DefaultPlatformTransportSettings`; also requires `V2H1Auth` and a compact-compatible site cap |
+| Connect server | `ConnectHandlerSettings.EnableH1Plus`, true in `DefaultConnectHandlerSettings` |
+| Native SDK RPC client and local mTLS listener | `deviceRpcSettings.EnableH1Plus`; the bindable `sdk.SetDeviceRpcH1PlusEnabled` (default true) sets it for subsequently created sessions |
+| Hosted proxy RPC endpoint | `ProxySettings.EnableDeviceRpcH1Plus`, true in `DefaultProxySettings` |
 | Process-wide emergency off | `connect.SetH1PlusDisabled(true)`; overrides all enabled endpoints/clients on future negotiations |
 | Browser/JS | Always skips custom upgrade regardless of settings |
 
@@ -420,7 +423,7 @@ do not offset its extra large-copy/allocation cost in this measured TLS case.
 
 Large frames are not retained in a global pool or per-connection scratch, but
 their allocation can increase transient runtime memory and GC pressure before
-reclamation. RPC XL remains independently opt-in; real-device peak-memory and
+reclamation. RPC XL is on by default and opts out independently; real-device peak-memory and
 large-RPC workload qualification must account for this cost. Fitting caller
 storage remains allocation-free on the write side. The compact 1,200-byte H1+
 cohort does not use this large XL fallback and is unaffected by the policy.
@@ -592,7 +595,7 @@ At 1,200 B, fixed XL throughput improves 1.95% [1.09%, 3.28%] forward,
 are 2.91% [0.31%, 4.36%], 1.69% [0.50%, 3.03%] and 1.35% [0.65%, 2.47%].
 Large-RPC gains over WS remain about 34–41% throughput and 27–34% CPU.
 The earlier per-flush regression is not erased from the record, and all H1+
-rollout defaults remain off. The large-frame temporary policy and shared
+rollout defaults remained off at the time (they are on since 2026-09-23). The large-frame temporary policy and shared
 near-limit duplex admission restriction are unchanged.
 
 Reproduce the three-arm comparison with an attested pre-fix binary:
@@ -849,10 +852,11 @@ Required matrix for later deployment/device activation:
   ordinary WS control and unknown-Upgrade rejection. A skipped binary prerequisite
   is not passing qualification.
 
-Initial rollout: code and deterministic/server support are implemented and
-disabled by default. Enable server support, then a measured native cohort, then
-broaden only after the remaining device/deployment gates. Independent
-global/client/server kill switches force
+Rollout: code and deterministic/server support are implemented and, since
+2026-09-23, enabled by default (opt-out) on native clients, Connect servers and
+RPC endpoints. A client that reaches a server or ingress that refuses the
+upgrade falls back to a fresh WebSocket and caches the refusal per endpoint for
+five minutes. Independent global/client/server kill switches force
 ordinary WS. Record bounded-cardinality carrier, selection result, fallback
 reason, handshake latency, write calls, messages/bytes per flush, CPU per byte,
 queue pressure, reconnects, and protocol/read/write failure classes. Never label

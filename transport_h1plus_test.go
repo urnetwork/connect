@@ -188,3 +188,14 @@ func TestWriteH1FramedReadyBatchCancellationFailureAndClosedLane(t *testing.T) {
 		})
 	}
 }
+
+// H1+ is opt-out: the default platform settings try the custom upgrade, with
+// or without an explicit owner memory target.
+func TestDefaultPlatformTransportSettingsEnableH1Plus(t *testing.T) {
+	if !DefaultPlatformTransportSettings().EnableH1Plus {
+		t.Fatal("default platform settings opted out of H1+")
+	}
+	if !DefaultPlatformTransportSettingsWithMemoryTarget(mib(64)).EnableH1Plus {
+		t.Fatal("memory-targeted platform settings opted out of H1+")
+	}
+}
