@@ -49,6 +49,15 @@ type p2pLegacySendQueue struct {
 	capacity     chan struct{}
 	done         chan struct{}
 	ownerRelease sync.Once
+	// Endpoint probes bypass the bulk backlog at the physical writer, including
+	// when the producer is blocked on capacity or an ordinary FIFO barrier.
+	probeSender *P2pSendTransport
+	probe       p2pLegacySendProbe
+}
+
+type p2pLegacySendProbe struct {
+	bytes    []byte
+	deadline time.Time
 }
 
 type p2pLegacySendEntry struct {
@@ -60,6 +69,10 @@ type p2pLegacySendEntry struct {
 }
 
 func newP2pLegacySendQueue(ctx context.Context, cancel context.CancelFunc, write func([]byte, time.Time) error, limit ByteCount, budget *TransferMemoryBudget) *p2pLegacySendQueue {
+	return newP2pLegacySendQueueWithProbes(ctx, cancel, write, limit, budget, nil)
+}
+
+func newP2pLegacySendQueueWithProbes(ctx context.Context, cancel context.CancelFunc, write func([]byte, time.Time) error, limit ByteCount, budget *TransferMemoryBudget, probeSender *P2pSendTransport) *p2pLegacySendQueue {
 	if limit < p2pLegacySendSlabByteCount+MessagePoolMetaByteCount {
 		return nil
 	}
@@ -73,9 +86,39 @@ func newP2pLegacySendQueue(ctx context.Context, cancel context.CancelFunc, write
 		epoch:   time.Now(),
 		entries: make([]p2pLegacySendEntry, entryCount),
 		ready:   make(chan struct{}, 1), capacity: make(chan struct{}, 1), done: make(chan struct{}),
+		probeSender: probeSender,
 	}
 	go q.run()
 	return q
+}
+
+// The sole producer retains this root until the worker has finished borrowing
+// it. This is the same one-message ownership as a synchronous physical write;
+// no extra probe queue or packet budget is introduced.
+func (q *p2pLegacySendQueue) enqueueProbe(wire []byte, deadline time.Time) error {
+	defer MessagePoolReturn(wire)
+	q.mutex.Lock()
+	if q.closed || q.ctx.Err() != nil {
+		q.mutex.Unlock()
+		return context.Canceled
+	}
+	q.probe = p2pLegacySendProbe{bytes: wire, deadline: deadline}
+	q.mutex.Unlock()
+	notifyP2pLegacySendQueue(q.ready)
+	// Cancellation must still join a physical write borrowing this root. The
+	// worker clears it and wakes the existing capacity signal on every exit.
+	for {
+		q.mutex.Lock()
+		pending, closed, err := q.probe.bytes != nil, q.closed, q.err
+		q.mutex.Unlock()
+		if !pending {
+			if closed && err == nil {
+				return context.Canceled
+			}
+			return err
+		}
+		<-q.capacity
+	}
 }
 
 func (q *p2pLegacySendQueue) reserveWithLock(charge ByteCount) bool {
@@ -229,14 +272,34 @@ func (q *p2pLegacySendQueue) run() {
 			}
 		}
 		q.count = 0
+		q.probe = p2pLegacySendProbe{}
 		q.mutex.Unlock()
 		notifyP2pLegacySendQueue(q.capacity)
 	}()
+	probeBurst := 0
 	for {
 		if q.ctx.Err() != nil {
 			return
 		}
 		q.mutex.Lock()
+		if (q.count == 0 || probeBurst < 2) && q.probe.bytes != nil {
+			probe := q.probe
+			q.mutex.Unlock()
+			err := q.write(probe.bytes, probe.deadline)
+			q.mutex.Lock()
+			q.probe = p2pLegacySendProbe{}
+			if err != nil {
+				q.err, q.closed = err, true
+			}
+			q.mutex.Unlock()
+			notifyP2pLegacySendQueue(q.capacity)
+			if err != nil {
+				q.cancel()
+				return
+			}
+			probeBurst++
+			continue
+		}
 		if q.count == 0 {
 			q.mutex.Unlock()
 			select {
@@ -245,6 +308,24 @@ func (q *p2pLegacySendQueue) run() {
 			case <-q.ready:
 			}
 			continue
+		}
+		if probeBurst < 2 && q.probeSender != nil {
+			if probe := q.probeSender.takePendingProbe(probeBurst); probe != nil {
+				// A bulk entry stays counted while this control is written, so
+				// flush cannot let the producer start a concurrent SCTP write.
+				q.mutex.Unlock()
+				err := q.write(probe, time.Time{})
+				MessagePoolReturn(probe)
+				if err != nil {
+					q.mutex.Lock()
+					q.err, q.closed = err, true
+					q.mutex.Unlock()
+					q.cancel()
+					return
+				}
+				probeBurst++
+				continue
+			}
 		}
 		entry := &q.entries[q.head]
 		wire, deadline := entry.bytes, entry.deadline
@@ -259,6 +340,7 @@ func (q *p2pLegacySendQueue) run() {
 		}
 		q.mutex.Unlock()
 		err := q.write(wire, deadline)
+		probeBurst = 0
 		q.mutex.Lock()
 		if err != nil {
 			q.err = err

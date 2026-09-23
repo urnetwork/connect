@@ -1319,21 +1319,9 @@ func (self *P2pSendTransport) nextSend(probeBurst *int) ([]byte, bool) {
 		}
 		*probeBurst = 0
 	}
-	firstProbe, secondProbe := self.probeResponses, self.probeRequests
-	if *probeBurst == 1 {
-		firstProbe, secondProbe = secondProbe, firstProbe
-	}
-	select {
-	case message := <-firstProbe:
+	if message := self.takePendingProbe(*probeBurst); message != nil {
 		*probeBurst++
 		return message, true
-	default:
-	}
-	select {
-	case message := <-secondProbe:
-		*probeBurst++
-		return message, true
-	default:
 	}
 	select {
 	case <-self.ctx.Done():
@@ -1347,6 +1335,27 @@ func (self *P2pSendTransport) nextSend(probeBurst *int) ([]byte, bool) {
 	case message, ok := <-self.send:
 		*probeBurst = 0
 		return message, ok
+	}
+}
+
+// Both the route consumer and compact legacy writer use the same bounded
+// request/response queues. The writer also checks them while bulk admission
+// has parked the route consumer; each writer serves at most two before data.
+func (self *P2pSendTransport) takePendingProbe(probeBurst int) []byte {
+	first, second := self.probeResponses, self.probeRequests
+	if probeBurst == 1 {
+		first, second = second, first
+	}
+	select {
+	case message := <-first:
+		return message
+	default:
+	}
+	select {
+	case message := <-second:
+		return message
+	default:
+		return nil
 	}
 }
 
@@ -1395,6 +1404,9 @@ func (self *P2pSendTransport) run() {
 
 	var pairRecorded atomic.Bool
 	writeLegacy := func(transferFrameBytes []byte, deadline time.Time) error {
+		if deadline.IsZero() {
+			deadline = time.Now().Add(self.settings.WriteTimeout)
+		}
 		progressObserver := self.settings.ProgressObserver
 		progress := beginTransferProgress(progressObserver, TransferProgressEvent{
 			Stage: "p2p_write_begin", PeerId: self.transportId, SequenceId: self.streamId,
@@ -1492,12 +1504,20 @@ func (self *P2pSendTransport) run() {
 				if owner, ok := self.conn.(p2pLegacySendMemoryBudget); ok {
 					budget = owner.legacySendMemoryBudget()
 				}
-				legacyQueue = newP2pLegacySendQueue(self.ctx, self.cancel, writeLegacy, self.settings.LegacySendQueueByteCount, budget)
+				var probeSender *P2pSendTransport
+				if self.probeRequests != nil || self.probeResponses != nil {
+					probeSender = self
+				}
+				legacyQueue = newP2pLegacySendQueueWithProbes(self.ctx, self.cancel, writeLegacy, self.settings.LegacySendQueueByteCount, budget, probeSender)
 			}
 			deadline := time.Now().Add(self.settings.WriteTimeout)
 			var err error
 			if legacyQueue != nil {
-				err = legacyQueue.enqueue(transferFrameBytes, deadline, probeMessage || messageByteCount <= smallPacketPoolSize)
+				if probeMessage {
+					err = legacyQueue.enqueueProbe(transferFrameBytes, deadline)
+				} else {
+					err = legacyQueue.enqueue(transferFrameBytes, deadline, messageByteCount <= smallPacketPoolSize)
+				}
 			} else {
 				err = writeLegacy(transferFrameBytes, deadline)
 				MessagePoolReturn(transferFrameBytes)
