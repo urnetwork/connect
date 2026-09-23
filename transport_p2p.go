@@ -1513,8 +1513,8 @@ func (self *P2pSendTransport) run() {
 			deadline := time.Now().Add(self.settings.WriteTimeout)
 			var err error
 			if legacyQueue != nil {
-				if probeMessage {
-					err = legacyQueue.enqueueProbe(transferFrameBytes, deadline)
+				if probeMessage || messagePoolIsSmallUnordered(transferFrameBytes) {
+					err = legacyQueue.enqueuePriority(transferFrameBytes, deadline)
 				} else {
 					err = legacyQueue.enqueue(transferFrameBytes, deadline, messageByteCount <= smallPacketPoolSize)
 				}

@@ -8067,6 +8067,7 @@ func (self *SendSequence) writeNoAckFastPath(
 		wrapped = sealed
 		wireBytes = wrapped
 	}
+	messagePoolMarkSmallUnordered(wireBytes)
 	shared := MessagePoolShareReadOnly(wireBytes)
 	disposition, err := writeMultiRouteWithCarrier(snapshot.writer, self.ctx, shared, 0, false)
 	if err != nil {
@@ -11958,6 +11959,9 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	// Takes the share on success. A lifetime wake that received valid feedback
 	// retries the same unconsumed share within the original writer time budget.
 	writeWithLifetime := func(bytes []byte) (transferWriteDisposition, error) {
+		if item != nil && !item.expectsAck && len(bytes) <= smallPacketPoolSize {
+			messagePoolMarkSmallUnordered(bytes)
+		}
 		budget := self.writeTimeoutForPack(resend)
 		var until time.Time
 		if budget >= 0 {
@@ -14212,6 +14216,9 @@ func (self *ReceiveSequence) Run() {
 					SequenceId: self.sequenceId, MessageId: sendAck.messageId, SequenceNumber: sendAck.sequenceNumber,
 					Selective: sendAck.selective, TransportType: sendAck.transportType,
 				}, frameBytes)
+				// Classify the final outer root before publication, including an
+				// encrypted ACK whose type the physical carrier cannot inspect.
+				messagePoolMarkSmallUnordered(frameBytes)
 				shared := MessagePoolShareReadOnly(frameBytes)
 				var writeErr error
 				blocked := false

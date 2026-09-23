@@ -52,10 +52,10 @@ type p2pLegacySendQueue struct {
 	// Endpoint probes bypass the bulk backlog at the physical writer, including
 	// when the producer is blocked on capacity or an ordinary FIFO barrier.
 	probeSender *P2pSendTransport
-	probe       p2pLegacySendProbe
+	priority    p2pLegacyPriorityWrite
 }
 
-type p2pLegacySendProbe struct {
+type p2pLegacyPriorityWrite struct {
 	bytes    []byte
 	deadline time.Time
 }
@@ -94,22 +94,23 @@ func newP2pLegacySendQueueWithProbes(ctx context.Context, cancel context.CancelF
 
 // The sole producer retains this root until the worker has finished borrowing
 // it. This is the same one-message ownership as a synchronous physical write;
-// no extra probe queue or packet budget is introduced.
-func (q *p2pLegacySendQueue) enqueueProbe(wire []byte, deadline time.Time) error {
+// no extra priority queue or packet budget is introduced. Endpoint probes and
+// locally classified small no-ack/ACK messages share a two-before-bulk allowance.
+func (q *p2pLegacySendQueue) enqueuePriority(wire []byte, deadline time.Time) error {
 	defer MessagePoolReturn(wire)
 	q.mutex.Lock()
 	if q.closed || q.ctx.Err() != nil {
 		q.mutex.Unlock()
 		return context.Canceled
 	}
-	q.probe = p2pLegacySendProbe{bytes: wire, deadline: deadline}
+	q.priority = p2pLegacyPriorityWrite{bytes: wire, deadline: deadline}
 	q.mutex.Unlock()
 	notifyP2pLegacySendQueue(q.ready)
 	// Cancellation must still join a physical write borrowing this root. The
 	// worker clears it and wakes the existing capacity signal on every exit.
 	for {
 		q.mutex.Lock()
-		pending, closed, err := q.probe.bytes != nil, q.closed, q.err
+		pending, closed, err := q.priority.bytes != nil, q.closed, q.err
 		q.mutex.Unlock()
 		if !pending {
 			if closed && err == nil {
@@ -272,22 +273,22 @@ func (q *p2pLegacySendQueue) run() {
 			}
 		}
 		q.count = 0
-		q.probe = p2pLegacySendProbe{}
+		q.priority = p2pLegacyPriorityWrite{}
 		q.mutex.Unlock()
 		notifyP2pLegacySendQueue(q.capacity)
 	}()
-	probeBurst := 0
+	priorityBurst := 0
 	for {
 		if q.ctx.Err() != nil {
 			return
 		}
 		q.mutex.Lock()
-		if (q.count == 0 || probeBurst < 2) && q.probe.bytes != nil {
-			probe := q.probe
+		if (q.count == 0 || priorityBurst < 2) && q.priority.bytes != nil {
+			priority := q.priority
 			q.mutex.Unlock()
-			err := q.write(probe.bytes, probe.deadline)
+			err := q.write(priority.bytes, priority.deadline)
 			q.mutex.Lock()
-			q.probe = p2pLegacySendProbe{}
+			q.priority = p2pLegacyPriorityWrite{}
 			if err != nil {
 				q.err, q.closed = err, true
 			}
@@ -297,7 +298,7 @@ func (q *p2pLegacySendQueue) run() {
 				q.cancel()
 				return
 			}
-			probeBurst++
+			priorityBurst++
 			continue
 		}
 		if q.count == 0 {
@@ -309,8 +310,8 @@ func (q *p2pLegacySendQueue) run() {
 			}
 			continue
 		}
-		if probeBurst < 2 && q.probeSender != nil {
-			if probe := q.probeSender.takePendingProbe(probeBurst); probe != nil {
+		if priorityBurst < 2 && q.probeSender != nil {
+			if probe := q.probeSender.takePendingProbe(priorityBurst); probe != nil {
 				// A bulk entry stays counted while this control is written, so
 				// flush cannot let the producer start a concurrent SCTP write.
 				q.mutex.Unlock()
@@ -323,7 +324,7 @@ func (q *p2pLegacySendQueue) run() {
 					q.cancel()
 					return
 				}
-				probeBurst++
+				priorityBurst++
 				continue
 			}
 		}
@@ -340,7 +341,7 @@ func (q *p2pLegacySendQueue) run() {
 		}
 		q.mutex.Unlock()
 		err := q.write(wire, deadline)
-		probeBurst = 0
+		priorityBurst = 0
 		q.mutex.Lock()
 		if err != nil {
 			q.err = err

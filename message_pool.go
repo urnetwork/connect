@@ -42,6 +42,7 @@ const MessagePoolMetaByteCount = 12
 const (
 	MessagePoolFlagShared          = uint8(0x01)
 	messagePoolFlagDeviceTunEgress = uint8(0x02)
+	messagePoolFlagSmallUnordered  = uint8(0x04)
 )
 
 // InitialMessagePoolByteCount is the initial total free-list byte budget. One
@@ -878,6 +879,39 @@ func MessagePoolRootByteCount(message []byte) ByteCount {
 	default:
 		return ByteCount(len(message))
 	}
+}
+
+// This local scheduling hint is set only by the send owner, after optional
+// encryption and before route publication. It never enters the wire format.
+// Small no-ack messages and explicit ACKs may overtake a bulk FIFO: neither
+// enters the receiver's ordered Pack queue. Unknown, reliable Packs and larger
+// messages retain ordinary ordering. The pool clears all flags on reuse.
+func messagePoolMarkSmallUnordered(message []byte) {
+	if len(message) > smallPacketPoolSize || cap(message) != smallPacketPoolSize+MessagePoolMetaByteCount {
+		return
+	}
+	pool := orderedMessagePools()[0]
+	root := message[:cap(message)]
+	shard, _ := pool.shardFor(root)
+	shard.stateLock.Lock()
+	if binary.BigEndian.Uint16(root[pool.size+10:]) != 0 {
+		root[pool.size+9] |= messagePoolFlagSmallUnordered
+	}
+	shard.stateLock.Unlock()
+}
+
+func messagePoolIsSmallUnordered(message []byte) bool {
+	if len(message) > smallPacketPoolSize || cap(message) != smallPacketPoolSize+MessagePoolMetaByteCount {
+		return false
+	}
+	pool := orderedMessagePools()[0]
+	root := message[:cap(message)]
+	shard, _ := pool.shardFor(root)
+	shard.stateLock.Lock()
+	marked := root[pool.size+9]&messagePoolFlagSmallUnordered != 0 &&
+		binary.BigEndian.Uint16(root[pool.size+10:]) != 0
+	shard.stateLock.Unlock()
+	return marked
 }
 
 // Marks a packet root as originating at the device TUN. The classification is

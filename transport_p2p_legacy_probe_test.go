@@ -223,7 +223,7 @@ func TestP2pLegacyProbeCancellationJoinsBorrowedWrite(t *testing.T) {
 		}, kib(16), budget)
 		done := make(chan error, 1)
 		go func() {
-			done <- q.enqueueProbe(encodeP2pStreamProbe(p2pStreamProbeRequestType, NewId(), NewId()), time.Time{})
+			done <- q.enqueuePriority(encodeP2pStreamProbe(p2pStreamProbeRequestType, NewId(), NewId()), time.Time{})
 		}()
 		<-entered
 		cancel()
