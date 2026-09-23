@@ -500,6 +500,7 @@ type dohFlight struct {
 	addrs         []netip.Addr
 	authoritative bool
 	stale         bool
+	ownerCanceled bool
 }
 
 func dnsResolverAddrs(settings *DohSettings, remote bool, network string) []string {
@@ -906,11 +907,45 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 		}
 		observation.finish(self.log, dohFinalResolverOutcome(resultCtx, 0 < len(addrs), authoritative, stale))
 	}()
-	if self.lifecycle.retired.Load() {
-		return nil, false
-	}
 
 	q := NewDohKey(recordType, domain)
+	retryDeadline := time.Now().Add(self.settings.RequestTimeout)
+	var retry bool
+	addrs, authoritative, stale, retry = self.queryResult(ctx, q)
+	if !retry || ctx.Err() != nil || self.lifecycle.retired.Load() || self.settings.RequestTimeout <= 0 {
+		return addrs, authoritative
+	}
+
+	// One remaining-budget owner covers every handoff, never one deferred
+	// cancel per generation. The first replacement may start immediately.
+	retryCtx, retryCancel := context.WithDeadline(ctx, retryDeadline)
+	defer retryCancel()
+	for {
+		if retryCtx.Err() != nil || self.lifecycle.retired.Load() {
+			return nil, false
+		}
+		reconnect := NewPacedReconnect(DefaultDialFallbackDelay)
+		addrs, authoritative, stale, retry = self.queryResult(retryCtx, q)
+		if !retry {
+			return addrs, authoritative
+		}
+		// Repeated foreign cancellation cannot spin or replenish the budget.
+		select {
+		case <-retryCtx.Done():
+			return nil, false
+		case <-self.lifecycle.ctx.Done():
+			return nil, false
+		case <-reconnect.After():
+		}
+	}
+}
+
+// Resolves or joins one generation; only an empty canceled owner permits retry.
+func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.Addr, authoritative bool, stale bool, retry bool) {
+	callerCtx := ctx
+	if self.lifecycle.retired.Load() {
+		return nil, false, false, false
+	}
 	now := time.Now()
 
 	var fl *dohFlight
@@ -947,7 +982,7 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 	}()
 	if hit {
 		// a cached entry (records or an authoritative miss) is itself authoritative
-		return hitAddrs, true
+		return hitAddrs, true, false, false
 	}
 
 	// serveStale is the one place a stale answer leaves this method: it logs (one line per
@@ -967,21 +1002,28 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 		// duplicate, bounded by this caller's own ctx and cache lifetime.
 		select {
 		case <-fl.done:
+			if fl.ownerCanceled && !fl.authoritative && len(fl.addrs) == 0 && ctx.Err() == nil {
+				return nil, false, false, true
+			}
 			stale = fl.stale
-			return fl.addrs, fl.authoritative
+			return fl.addrs, fl.authoritative, stale, false
 		case <-ctx.Done():
 			if 0 < len(staleAddrs) {
-				return serveStale()
+				addrs, authoritative = serveStale()
+				return addrs, authoritative, stale, false
 			}
-			return nil, false
+			return nil, false, false, false
 		case <-self.lifecycle.ctx.Done():
-			return nil, false
+			return nil, false, false, false
 		}
 	}
 
 	// leader: resolve once, publish to any waiters, and drop the in-flight entry
 	defer func() {
 		fl.stale = stale
+		// Cleanup cancels resolveCtx before this defer; only the original
+		// owner's context can authorize a foreign waiter's new generation.
+		fl.ownerCanceled = callerCtx.Err() != nil && !fl.authoritative && len(fl.addrs) == 0
 		self.stateLock.Lock()
 		delete(self.inflight, q)
 		self.stateLock.Unlock()
@@ -993,7 +1035,7 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 	// Close and keep using the retired tunnel generation.
 	resolveCtx, resolveDone, ok := self.lifecycle.context(ctx)
 	if !ok {
-		return nil, false
+		return nil, false, false, false
 	}
 	defer resolveDone()
 	ctx = resolveCtx
@@ -1007,9 +1049,9 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 	case <-ctx.Done():
 		if 0 < len(staleAddrs) {
 			fl.addrs, fl.authoritative = serveStale()
-			return fl.addrs, fl.authoritative
+			return fl.addrs, fl.authoritative, stale, false
 		}
-		return nil, false
+		return nil, false, false, false
 	}
 	fl.addrs, fl.authoritative = self.resolve(ctx, q, now)
 	if !fl.authoritative && len(fl.addrs) == 0 && 0 < len(staleAddrs) {
@@ -1019,7 +1061,7 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 		// back authoritative=true and is deliberately NOT overridden.
 		fl.addrs, fl.authoritative = serveStale()
 	}
-	return fl.addrs, fl.authoritative
+	return fl.addrs, fl.authoritative, stale, false
 }
 
 // Forward resolves qType for domain and returns the raw RFC 8484 response wire
