@@ -127,69 +127,90 @@ func TestDohLaunchStaggerCancellationAtTimerBoundary(t *testing.T) {
 	}
 }
 
+// A real wire-format endpoint supplies deterministic addresses and record TTLs.
 func TestDohQuery(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-
+	firstAddr := netip.MustParseAddr("192.0.2.31")
+	secondAddr := netip.MustParseAddr("198.51.100.31")
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		writeDohWire(writer, request, []netip.Addr{firstAddr, secondAddr}, 60, false)
+	}))
+	defer server.Close()
 	settings := DefaultDohSettings()
-
-	testIp1, err := netip.ParseAddr("1.1.1.1")
-	AssertEqual(t, err, nil)
-	testIp2, err := netip.ParseAddr("10.10.10.10")
-	AssertEqual(t, err, nil)
-
-	for range 10 {
-		ips := DohQuery(ctx, 4, "A", settings, "test1.bringyour.com")
-		if len(ips) == 0 {
-			// timeout, try again
-			fmt.Printf("[doh]timeout. Will wait 1s and try again ...\n")
-			select {
-			case <-time.After(1 * time.Second):
-				continue
-			}
-		}
-		AssertEqual(t, len(ips), 2)
-		ttl1 := ips[testIp1]
-		AssertNotEqual(t, ttl1, 0)
-		ttl2 := ips[testIp2]
-		AssertNotEqual(t, ttl2, 0)
+	settings.RequestTimeout = 5 * time.Second
+	settings.DnsResolverSettings = &DnsResolverSettings{
+		EnableRemoteDoh:   true,
+		RemoteDohUrlsIpv4: []string{server.URL},
 	}
-
+	for range 10 {
+		addrs := DohQuery(ctx, 4, "A", settings, "answer.example")
+		if len(addrs) != 2 || addrs[firstAddr] != 60 || addrs[secondAddr] != 60 {
+			t.Fatalf("wire query returned addresses/TTLs=%v, want both synthetic records with TTL60", addrs)
+		}
+	}
+	if requests.Load() != 10 {
+		t.Fatalf("one-shot queries=%d, want10 independently completed requests", requests.Load())
+	}
 }
 
+// Positive and authoritative-empty answers are cached without another request.
 func TestDohCache(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-
-	settings := DefaultDohSettings()
-
-	dohCache := NewDohCache(settings)
-
-	testIp1, err := netip.ParseAddr("1.1.1.1")
-	AssertEqual(t, err, nil)
-	testIp2, err := netip.ParseAddr("10.10.10.10")
-	AssertEqual(t, err, nil)
-
-	for range 10 {
-		ips := dohCache.Query(ctx, "A", "test1.bringyour.com")
-		if len(ips) == 0 {
-			// timeout, try again
-			fmt.Printf("[doh]timeout. Will wait 1s and try again ...\n")
-			select {
-			case <-time.After(1 * time.Second):
-				continue
-			}
+	firstAddr := netip.MustParseAddr("192.0.2.32")
+	secondAddr := netip.MustParseAddr("198.51.100.32")
+	var positiveRequests, emptyRequests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		wire, err := base64.RawURLEncoding.DecodeString(request.URL.Query().Get("dns"))
+		if err != nil {
+			t.Error(err)
+			writer.WriteHeader(http.StatusBadRequest)
+			return
 		}
-		AssertEqual(t, len(ips), 2)
-		AssertEqual(t, slices.Contains(ips, testIp1), true)
-		AssertEqual(t, slices.Contains(ips, testIp2), true)
+		var message dnsmessage.Message
+		if err := message.Unpack(wire); err != nil || len(message.Questions) != 1 {
+			t.Error("malformed test wire query")
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		switch message.Questions[0].Name.String() {
+		case "answer.example.":
+			positiveRequests.Add(1)
+			writeDohWire(writer, request, []netip.Addr{firstAddr, secondAddr}, 60, false)
+		case "missing.example.":
+			emptyRequests.Add(1)
+			writeDohWire(writer, request, nil, 60, true)
+		default:
+			t.Error("unexpected synthetic query name")
+			writer.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	settings := DefaultDohSettings()
+	settings.RequestTimeout = 5 * time.Second
+	settings.DnsResolverSettings = &DnsResolverSettings{
+		EnableRemoteDoh:   true,
+		RemoteDohUrlsIpv4: []string{server.URL},
 	}
-
+	cache := NewDohCache(settings)
+	defer cache.Close()
 	for range 10 {
-		ips := dohCache.Query(ctx, "A", "test-local.bringyour.com")
-		AssertEqual(t, len(ips), 0)
+		addrs := cache.Query(ctx, "A", "answer.example")
+		if len(addrs) != 2 || !slices.Contains(addrs, firstAddr) || !slices.Contains(addrs, secondAddr) {
+			t.Fatalf("cached addresses=%v, want both synthetic records", addrs)
+		}
 	}
-
+	for range 10 {
+		if addrs := cache.Query(ctx, "A", "missing.example"); len(addrs) != 0 {
+			t.Fatalf("authoritative empty answer=%v, want none", addrs)
+		}
+	}
+	if positiveRequests.Load() != 1 || emptyRequests.Load() != 1 {
+		t.Fatalf("wire requests positive=%d empty=%d, want one per cached name", positiveRequests.Load(), emptyRequests.Load())
+	}
 }
 
 func TestDohCacheCachesMiss(t *testing.T) {

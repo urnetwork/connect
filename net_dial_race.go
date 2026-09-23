@@ -5,13 +5,13 @@ package connect
 // internal DoH resolver's protected-name path, and the gVisor tun's internal
 // dialer (IPV6.md C6).
 //
-// The shape is RFC 8305 without the resolution-side tricks. The caller
-// resolves A and AAAA concurrently, or only the family a narrowed network
-// names; orderDialAddrs interleaves the families v6-first; dialAddrsRace then
-// launches one attempt per address with a fixed fallback delay between
-// launches. A definitive failure launches the next address at once, the first
-// success cancels the rest, and every losing connection is closed. IP
-// literals never reach the race: they have no family choice left in them.
+// DoH stream dials feed each completed A or AAAA answer into the TCP race,
+// so one pending family cannot strand the other. A narrowed network still
+// resolves only its permitted family, and explicit net.Resolver callers keep
+// their configured lookup behavior. Ready addresses alternate IPv6-first,
+// with one fallback delay between attempts. A definitive failure launches
+// the next address at once; the first success cancels the rest and every
+// losing connection is closed. IP literals need no resolution.
 //
 // Only stream dials race. A UDP "dial" is a local socket operation that
 // succeeds for any family the host has an address in, so a race would always
@@ -28,6 +28,7 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -148,6 +149,7 @@ func resolveDialAddrs(ctx context.Context, resolver *net.Resolver, network strin
 
 // dohDialQueryResult is one record type's answer inside resolveDohDialAddrs.
 type dohDialQueryResult struct {
+	ipv6          bool
 	addrs         []netip.Addr
 	authoritative bool
 }
@@ -158,13 +160,7 @@ type dohDialQueryResult struct {
 // racing. "No such host" is reported only when every queried record type was
 // answered authoritatively empty; a failed query is temporary.
 func resolveDohDialAddrs(ctx context.Context, cache *DohCache, network string, host string) ([]netip.Addr, error) {
-	recordTypes := make([]string, 0, 2)
-	if !strings.HasSuffix(network, "4") {
-		recordTypes = append(recordTypes, "AAAA")
-	}
-	if !strings.HasSuffix(network, "6") {
-		recordTypes = append(recordTypes, "A")
-	}
+	recordTypes := dohDialRecordTypes(network)
 	if len(recordTypes) == 0 {
 		return nil, fmt.Errorf("resolve %s: ipv4 and ipv6 are both disabled", host)
 	}
@@ -198,6 +194,69 @@ func resolveDohDialAddrs(ctx context.Context, cache *DohCache, network string, h
 	return nil, &net.DNSError{Err: "DoH resolution failed", Name: host, IsTemporary: true}
 }
 
+// Selects only the record families the caller's network permits.
+func dohDialRecordTypes(network string) []string {
+	recordTypes := make([]string, 0, 2)
+	if !strings.HasSuffix(network, "4") {
+		recordTypes = append(recordTypes, "AAAA")
+	}
+	if !strings.HasSuffix(network, "6") {
+		recordTypes = append(recordTypes, "A")
+	}
+	return recordTypes
+}
+
+// Resolves each permitted family concurrently and feeds completed answers to
+// the existing address race. IPv4 waits at most the existing fallback delay
+// for pending IPv6 resolution; a failed first TCP path retains the pending
+// family. The caller's configured cache remains the only resolver authority.
+func dialDohAddrsRace(
+	ctx context.Context,
+	cache *DohCache,
+	network string,
+	host string,
+	fallbackDelay time.Duration,
+	dial dialAddrFunction,
+) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	raceCtx, raceCancel := context.WithCancel(ctx)
+	recordTypes := dohDialRecordTypes(network)
+	results := make(chan dohDialQueryResult, len(recordTypes))
+	var queryWorkers sync.WaitGroup
+	defer func() {
+		raceCancel()
+		queryWorkers.Wait()
+	}()
+	for _, recordType := range recordTypes {
+		queryWorkers.Add(1)
+		go func() {
+			defer queryWorkers.Done()
+			addrs, authoritative := cache.QueryResult(raceCtx, recordType, host)
+			results <- dohDialQueryResult{
+				ipv6:          recordType == "AAAA",
+				addrs:         dialAddrsMatchNetwork(network, addrs),
+				authoritative: authoritative,
+			}
+		}()
+	}
+	return dialAddrsRaceWithResolution(raceCtx, nil, fallbackDelay, dial, &dialAddrResolution{
+		results:     results,
+		pending:     len(recordTypes),
+		ipv6Pending: !strings.HasSuffix(network, "4"),
+		host:        host,
+	})
+}
+
+// Carries only the bounded family queries owned by one stream dial.
+type dialAddrResolution struct {
+	results     <-chan dohDialQueryResult
+	pending     int
+	ipv6Pending bool
+	host        string
+}
+
 // dialRaceResult is one attempt's outcome inside dialAddrsRace.
 type dialRaceResult struct {
 	conn net.Conn
@@ -215,23 +274,90 @@ func dialAddrsRace(
 	fallbackDelay time.Duration,
 	dial dialAddrFunction,
 ) (net.Conn, error) {
-	if len(addrs) == 0 {
+	return dialAddrsRaceWithResolution(ctx, addrs, fallbackDelay, dial, nil)
+}
+
+// The same TCP race accepts late DNS-family answers without waiting for an
+// unrelated query. Static callers retain their supplied address order. A
+// progressive caller cancels and joins every launched TCP worker before return.
+func dialAddrsRaceWithResolution(
+	ctx context.Context,
+	addrs []netip.Addr,
+	fallbackDelay time.Duration,
+	dial dialAddrFunction,
+	resolution *dialAddrResolution,
+) (net.Conn, error) {
+	if len(addrs) == 0 && resolution == nil {
 		return nil, errors.New("dial race: no addresses")
 	}
 	raceCtx, raceCancel := context.WithCancel(ctx)
-	defer raceCancel()
+	var dialWorkers sync.WaitGroup
+	defer func() {
+		raceCancel()
+		if resolution != nil {
+			dialWorkers.Wait()
+		}
+	}()
 
-	// unbuffered on purpose: exactly one success transfers ownership to this
-	// caller; after return raceCancel makes every other success close itself
-	// instead of sitting in a queue nobody drains
+	// Only the selected receiver takes a successful connection. Cancellation
+	// closes every other result before its worker can finish.
 	results := make(chan dialRaceResult)
+	pendingAddrs := append([]netip.Addr(nil), addrs...)
+	var seenAddrs map[netip.Addr]bool
+	var queryResults <-chan dohDialQueryResult
+	queryPending := 0
+	ipv6Pending := false
+	if resolution != nil {
+		seenAddrs = map[netip.Addr]bool{}
+		for _, addr := range addrs {
+			seenAddrs[addr.Unmap()] = true
+		}
+		queryResults = resolution.results
+		queryPending = resolution.pending
+		ipv6Pending = resolution.ipv6Pending
+	}
+	authoritativeCount := 0
 	launched := 0
 	completed := 0
 	errs := make([]error, 0, len(addrs))
+	preferIpv6 := true
+	launchReady := true
+	preferenceWaitExpired := fallbackDelay <= 0
+
+	var fallbackC <-chan time.Time
+	var fallbackTimer *time.Timer
+	stopFallback := func() {
+		if fallbackTimer != nil {
+			fallbackTimer.Stop()
+			fallbackTimer = nil
+		}
+		fallbackC = nil
+	}
+	defer stopFallback()
+	armFallback := func() {
+		stopFallback()
+		if 0 < fallbackDelay && (0 < len(pendingAddrs) || 0 < queryPending) {
+			fallbackTimer = time.NewTimer(fallbackDelay)
+			fallbackC = fallbackTimer.C
+		}
+	}
 	launch := func() {
-		addr := addrs[launched]
+		index := 0
+		if resolution != nil {
+			for candidate, addr := range pendingAddrs {
+				if addr.Is6() == preferIpv6 {
+					index = candidate
+					break
+				}
+			}
+		}
+		addr := pendingAddrs[index]
+		pendingAddrs = append(pendingAddrs[:index], pendingAddrs[index+1:]...)
+		preferIpv6 = !addr.Is6()
 		launched++
+		dialWorkers.Add(1)
 		go HandleError(func() {
+			defer dialWorkers.Done()
 			conn, err := dial(raceCtx, addr)
 			select {
 			case results <- dialRaceResult{conn: conn, err: err}:
@@ -241,45 +367,60 @@ func dialAddrsRace(
 				}
 			}
 		})
+		launchReady = fallbackDelay <= 0
+		armFallback()
 	}
-
-	launch()
-	if fallbackDelay <= 0 {
-		for launched < len(addrs) {
-			launch()
-		}
-	}
-
-	// Go 1.23+ timer channels are synchronous, so a fresh timer per wait is
-	// the only shape that cannot strand a launch behind a drained-but-armed
-	// timer (see waitDohLaunchStagger for the same reasoning)
-	var fallbackC <-chan time.Time
-	var fallbackTimer *time.Timer
-	armFallback := func() {
-		if fallbackTimer != nil {
-			fallbackTimer.Stop()
-			fallbackTimer = nil
-		}
-		fallbackC = nil
-		if launched < len(addrs) && 0 < fallbackDelay {
-			fallbackTimer = time.NewTimer(fallbackDelay)
-			fallbackC = fallbackTimer.C
-		}
-	}
-	defer func() {
-		if fallbackTimer != nil {
-			fallbackTimer.Stop()
-		}
-	}()
-	armFallback()
 
 	for {
+		for launchReady && 0 < len(pendingAddrs) {
+			// A completed IPv4 answer must not forfeit IPv6 preference just
+			// because the other resolver goroutine has not published yet.
+			if launched == 0 && ipv6Pending && !preferenceWaitExpired {
+				if fallbackC == nil {
+					armFallback()
+				}
+				break
+			}
+			launch()
+		}
+		if queryPending == 0 && len(pendingAddrs) == 0 && completed == launched {
+			if 0 < len(errs) {
+				return nil, errors.Join(errs...)
+			}
+			if resolution != nil {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if authoritativeCount == resolution.pending {
+					return nil, &net.DNSError{Err: "no such host", Name: resolution.host, IsNotFound: true}
+				}
+				return nil, &net.DNSError{Err: "DoH resolution failed", Name: resolution.host, IsTemporary: true}
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-fallbackC:
-			launch()
-			armFallback()
+			stopFallback()
+			preferenceWaitExpired = true
+			launchReady = true
+		case result := <-queryResults:
+			queryPending--
+			if result.ipv6 {
+				ipv6Pending = false
+			}
+			if result.authoritative {
+				authoritativeCount++
+			}
+			for _, addr := range orderDialAddrs(result.addrs) {
+				if !seenAddrs[addr] {
+					seenAddrs[addr] = true
+					pendingAddrs = append(pendingAddrs, addr)
+				}
+			}
+			if queryPending == 0 {
+				queryResults = nil
+			}
 		case result := <-results:
 			completed++
 			if result.err == nil && result.conn != nil {
@@ -292,15 +433,10 @@ func dialAddrsRace(
 				result.err = errors.New("dial returned no connection")
 			}
 			errs = append(errs, result.err)
-			if completed == len(addrs) {
-				return nil, errors.Join(errs...)
-			}
-			// a definitive failure is a stronger signal than the stagger:
-			// launch the next address now rather than adding avoidable latency
-			if launched < len(addrs) {
-				launch()
-				armFallback()
-			}
+			// A definitive failure advances immediately, including when
+			// the next family is still resolving and arrives later.
+			preferenceWaitExpired = true
+			launchReady = true
 		}
 	}
 }

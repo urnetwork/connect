@@ -1563,6 +1563,11 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 			// an IPv4-only tun must not resolve an address it cannot dial
 			resolveNetwork = strings.TrimRight(network, "46") + "4"
 		}
+		if stream {
+			return dialDohAddrsRace(dialCtx, self.DohCache(), resolveNetwork, host, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+				return self.dialTcpAddr(ctx, host, netip.AddrPortFrom(addr, uint16(port)))
+			})
+		}
 		addrs, err = resolveDohDialAddrs(dialCtx, self.DohCache(), resolveNetwork, host)
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[tun]query doh (%s) found %v err=%v\n", host, addrs, err)

@@ -164,6 +164,11 @@ func (self *internalDohResolver) wrapDialContext(dialContext DialContextFunction
 		if err != nil || !self.matches(host) {
 			return dialContext(ctx, network, address)
 		}
+		if isRaceableDialNetwork(network) {
+			return dialDohAddrsRace(ctx, self.cache, network, host, internalDohDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+				return dialContext(ctx, familyDialNetwork(network, addr), net.JoinHostPort(addr.String(), port))
+			})
+		}
 		addrs, err := self.resolve(ctx, network, host)
 		if err != nil {
 			return nil, err
