@@ -1194,12 +1194,19 @@ func (self *multiClientChannel) sendProbe(parsedPacket *parsedPacket, timeout ti
 	// to it. This is also how the exclusion tests model a never-answering exit
 	// without a transport.
 	if self.stalled.Load() {
+		if !frame.Raw {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		MessagePoolReturn(parsedPacket.packet)
 		return true
 	}
 
 	// bare fixture channels have no underlying client; refuse rather than
 	// panic, the same convention ClientId and Tier follow
 	if self.client == nil {
+		if !frame.Raw {
+			MessagePoolReturn(frame.MessageBytes)
+		}
 		return false
 	}
 
