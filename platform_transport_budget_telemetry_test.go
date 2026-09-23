@@ -121,7 +121,9 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 	SetMemoryBudget(mib(32))
 	defer SetMemoryBudget(previousMemoryBudget)
 	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
-	child, root := settings.PlatformTransportBudget, DefaultPlatformTransportBudget()
+	root := NewPlatformTransportBudget(mib(8), 16)
+	child := newPlatformTransportBudget(mib(5), 16, root)
+	settings.PlatformTransportBudget = child
 	t.Cleanup(func() { requirePlatformHierarchyBalanced(t, root, child) })
 	if settings.H1BudgetByteCount != kib(256) || settings.H3BudgetByteCount != mib(3) {
 		t.Fatal("regression requires the actual 20/32-MiB carrier profile")
@@ -191,9 +193,10 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 	fillers[1].h1BudgetReservation.Release()
 	// These are the actual standalone API/feed QUIC policy claims, not fake
 	// unowned H1 transports: each is 1,664 KiB and never borrows itself.
-	policy := newExtenderQuicMemoryPolicy(t.Context(), DefaultConnectSettings())
+	ownerlessContext := context.WithValue(t.Context(), platformTransportNestedBudgetContextKey{}, root)
+	policy := newExtenderQuicMemoryPolicy(ownerlessContext, DefaultConnectSettings())
 	for range 2 {
-		claim, err := policy.acquire(t.Context())
+		claim, err := policy.acquire(ownerlessContext)
 		if err != nil {
 			t.Fatal(err)
 		}

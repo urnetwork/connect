@@ -4,15 +4,15 @@ import (
 	"sync/atomic"
 )
 
-// a process-wide memory budget that scales the default settings whose values
-// dominate the per-connection and per-peer memory ceilings (queue caps,
-// receive windows, socket buffers, cache bounds). The budget is advisory
-// sizing state, separate from the go runtime soft memory limit; hosts set
-// both together through the sdk (see sdk.SetMemoryLimit).
+// An advisory process-wide default SIZING TARGET, not an admission budget.
+// Constructors copy its current value into new per-instance queue, receive,
+// socket and cache limits. Independent instances never share a mutable
+// admission root through this target. It is separate from the Go runtime soft
+// memory limit; hosts set both through sdk.SetMemoryLimit.
 //
-// A zero budget (the default) leaves every setting at its unscaled default.
-// Settings sample the budget when a Default*Settings constructor runs, so the
-// budget must be set before constructing the objects it should size. The
+// A zero target (the default) leaves every setting at its unscaled default.
+// Settings sample it when a Default*Settings constructor runs, so it must be
+// set before constructing the objects it should size. The
 // mobile hosts set it at process start, before any device exists.
 
 // budgets at or above the reference use the unscaled defaults; smaller
@@ -21,11 +21,6 @@ import (
 var referenceMemoryBudgetByteCount = mib(64)
 
 var memoryBudgetByteCount atomic.Int64
-var defaultPlatformTransportBudget atomic.Pointer[PlatformTransportBudget]
-
-func init() {
-	defaultPlatformTransportBudget.Store(newDefaultPlatformTransportBudget(referenceMemoryBudgetByteCount))
-}
 
 func newDefaultPlatformTransportBudget(budgetByteCount ByteCount) *PlatformTransportBudget {
 	return newDefaultPlatformTransportBudgetWithParent(budgetByteCount, nil)
@@ -46,50 +41,39 @@ func newDefaultPlatformTransportBudgetWithParent(
 	)
 }
 
-// NewPlatformTransportBudgetForMemoryTarget creates a private carrier limit
-// using the same sizing policy as the process default. On memory-sized hosts it
-// also consumes the shared process budget: device windows and unowned API,
-// feed, or probe carriers cannot each spend a separate aggregate allowance.
-// Unsized hosts keep independent device budgets, and a nonpositive owner target
-// preserves the legacy process-wide budget.
+// NewPlatformTransportBudgetForMemoryTarget creates an independent carrier
+// limit for one lifecycle owner. The owner passes the returned pointer to its
+// descendant transports. A nonpositive target uses the unscaled default
+// values, never a process-shared admission root.
 func NewPlatformTransportBudgetForMemoryTarget(
 	memoryTargetByteCount ByteCount,
 ) *PlatformTransportBudget {
 	if memoryTargetByteCount <= 0 {
 		return DefaultPlatformTransportBudget()
 	}
-	if 0 < MemoryBudget() {
-		return newDefaultPlatformTransportBudgetWithParent(
-			memoryTargetByteCount,
-			DefaultPlatformTransportBudget(),
-		)
-	}
 	return newDefaultPlatformTransportBudget(memoryTargetByteCount)
 }
 
-// SetMemoryBudget sets the process-wide memory budget that scales the
-// memory-dominant default settings. 0 (the default) disables scaling.
+// SetMemoryBudget sets only the process-wide default sizing target. It never
+// creates or changes a shared admission budget. Zero disables scaling.
 func SetMemoryBudget(budgetByteCount ByteCount) {
 	memoryBudgetByteCount.Store(budgetByteCount)
-	if budgetByteCount <= 0 {
-		budgetByteCount = referenceMemoryBudgetByteCount
-	}
-	// Platform carriers normally share one quarter of the process target, with
-	// the single-H3 working floor applied above. A separate count cap throttles
-	// cold multi-client candidate expansion even when H1's byte reservation
-	// alone would allow every candidate to dial at once.
-	defaultPlatformTransportBudget.Store(newDefaultPlatformTransportBudget(budgetByteCount))
 }
 
 func MemoryBudget() ByteCount {
 	return memoryBudgetByteCount.Load()
 }
 
-// DefaultPlatformTransportBudget returns the process-wide budget sampled by
-// new PlatformTransport settings. At finite process targets its statistics
-// include both private device claims and unowned process carrier claims.
+// DefaultPlatformTransportBudget returns a fresh budget with default limit
+// values. Callers that construct multiple transports for one lifecycle owner
+// must retain and pass this pointer explicitly; separate calls never share
+// admission capacity.
 func DefaultPlatformTransportBudget() *PlatformTransportBudget {
-	return defaultPlatformTransportBudget.Load()
+	budgetByteCount := MemoryBudget()
+	if budgetByteCount <= 0 {
+		budgetByteCount = referenceMemoryBudgetByteCount
+	}
+	return newDefaultPlatformTransportBudget(budgetByteCount)
 }
 
 // memoryScale returns the budget scale in (0, 1]

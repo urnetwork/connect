@@ -29,8 +29,8 @@ func TestMemoryBudgetUnsetDefaults(t *testing.T) {
 	AssertEqual(t, platformBudget.Stats().MaxTransportCount, 16)
 	firstPlatformBudget := DefaultPlatformTransportSettings().PlatformTransportBudget
 	secondPlatformBudget := DefaultPlatformTransportSettings().PlatformTransportBudget
-	if firstPlatformBudget != secondPlatformBudget {
-		t.Fatal("default platform settings did not share one process budget")
+	if firstPlatformBudget == secondPlatformBudget || firstPlatformBudget.root != firstPlatformBudget || secondPlatformBudget.root != secondPlatformBudget {
+		t.Fatal("default platform settings share an admission budget")
 	}
 	AssertEqual(t, DefaultMultiClientSettings().EvaluationPoolMultiple, 2)
 	tunSettings := DefaultTunSettings()
@@ -91,14 +91,14 @@ func TestMemoryBudgetScaledSettings(t *testing.T) {
 	AssertEqual(t, httpTransport.HTTP2.MaxReceiveBufferPerConnection, int(kib(512)))
 	platformBudget := DefaultPlatformTransportBudget()
 	if platformBudget == nil {
-		t.Fatal("scaled process budget did not create a shared platform transport budget")
+		t.Fatal("scaled defaults did not create a platform transport budget")
 	}
 	platformStats := platformBudget.Stats()
 	AssertEqual(t, platformStats.TotalByteCount, mib(8))
 	AssertEqual(t, platformStats.MaxTransportCount, 16)
 	platformSettings := DefaultPlatformTransportSettings()
-	if platformSettings.PlatformTransportBudget != platformBudget {
-		t.Fatal("platform settings did not use the current shared budget")
+	if platformSettings.PlatformTransportBudget == platformBudget || platformSettings.PlatformTransportBudget.Stats().TotalByteCount != platformStats.TotalByteCount {
+		t.Fatal("platform settings did not copy the current limit into an independent budget")
 	}
 	AssertEqual(t, platformSettings.H1BudgetByteCount, kib(256))
 	// With no explicit owner, the process target selects the 32-MiB H3

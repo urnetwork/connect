@@ -60,9 +60,9 @@ func requirePlatformHierarchyBounded(t *testing.T, budget *PlatformTransportBudg
 	}
 }
 
-// Actual mobile settings retain their private limit while both devices and an
-// API/feed/probe carrier draw from the same process allowance.
-func TestPlatformTransportBudgetHierarchyMobileDevicesAndProcessShareCeiling(t *testing.T) {
+// Mobile devices and unrelated API work copy default limits, but have
+// independent admission roots. A full device cannot stall another owner.
+func TestPlatformTransportBudgetHierarchyMobileDevicesHaveIndependentCeilings(t *testing.T) {
 	previousTarget := MemoryBudget()
 	defer SetMemoryBudget(previousTarget)
 	SetMemoryBudget(mib(32))
@@ -70,8 +70,8 @@ func TestPlatformTransportBudgetHierarchyMobileDevicesAndProcessShareCeiling(t *
 	firstSettings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 	secondSettings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 	first, second := firstSettings.PlatformTransportBudget, secondSettings.PlatformTransportBudget
-	if first == second || first.parent != root || second.parent != root {
-		t.Fatal("mobile devices did not retain distinct limits on the same process root")
+	if first == second || first.parent != nil || second.parent != nil || root.parent != nil {
+		t.Fatal("mobile devices or unrelated API work share an admission root")
 	}
 	if root.Stats().TotalByteCount != mib(8) || root.Stats().MaxTransportCount != 16 ||
 		first.Stats().TotalByteCount != mib(5) || second.Stats().TotalByteCount != mib(5) {
@@ -83,43 +83,34 @@ func TestPlatformTransportBudgetHierarchyMobileDevicesAndProcessShareCeiling(t *
 			claim.Release()
 		}
 	}()
-	for _, settings := range []*PlatformTransportSettings{firstSettings, secondSettings} {
-		h1 := settings.PlatformTransportBudget.register(platformTransportBudgetH1, settings.H1BudgetByteCount, true)
-		requirePlatformHierarchyAcquire(t, h1)
-		outer := settings.PlatformTransportBudget.register(platformTransportBudgetExtender, mib(2), false)
-		requirePlatformHierarchyAcquire(t, outer)
-		claims = append(claims, h1, outer)
-	}
-	unowned := root.register(platformTransportBudgetExtender, mib(3)+kib(512), true)
-	claims = append(claims, unowned)
-	requirePlatformHierarchyAcquire(t, unowned)
-	if stats := root.Stats(); stats.UsedByteCount != mib(8) || stats.UsedTransportCount != 3 {
-		t.Fatalf("process root did not include both devices and unowned carrier: %+v", stats)
-	}
-	if first.Stats().UsedByteCount != mib(2)+kib(256) || second.Stats().UsedByteCount != mib(2)+kib(256) {
-		t.Fatal("root claims were charged to an unrelated private device")
-	}
-
+	full := first.register(platformTransportBudgetExtender, mib(5), true)
+	requirePlatformHierarchyAcquire(t, full)
+	claims = append(claims, full)
 	blocked := first.register(platformTransportBudgetH1, firstSettings.H1BudgetByteCount, true)
 	claims = append(claims, blocked)
-	before := first.Stats()
 	if blocked.TryAcquire() || !blocked.IsWaiting() {
-		t.Fatal("private headroom bypassed the process ceiling")
+		t.Fatal("device bypassed its own ceiling")
 	}
-	if after := first.Stats(); after.UsedByteCount != before.UsedByteCount || after.ReservedByteCount != before.ReservedByteCount {
-		t.Fatalf("failed composed admission retained partial child capacity: before=%+v after=%+v", before, after)
+	peer := second.register(platformTransportBudgetH1, secondSettings.H1BudgetByteCount, true)
+	requirePlatformHierarchyAcquire(t, peer)
+	claims = append(claims, peer)
+	unowned := root.register(platformTransportBudgetExtender, mib(3)+kib(512), true)
+	requirePlatformHierarchyAcquire(t, unowned)
+	claims = append(claims, unowned)
+	if root.Stats().UsedByteCount != mib(3)+kib(512) {
+		t.Fatal("unrelated owners were charged to API root")
 	}
 	wake := first.CapacityNotify()
-	if wake != root.CapacityNotify() || wake != second.CapacityNotify() {
-		t.Fatal("hierarchy capacity notifications do not share root changes")
+	if wake == root.CapacityNotify() || wake == second.CapacityNotify() {
+		t.Fatal("unrelated owners share capacity notifications")
 	}
 	acquired := make(chan bool, 1)
 	go func() { acquired <- blocked.Acquire(t.Context()) }()
-	unowned.Release()
+	full.Release()
 	select {
 	case <-wake:
 	default:
-		t.Fatal("unowned release did not wake child capacity subscribers")
+		t.Fatal("owner release did not wake its capacity subscribers")
 	}
 	waitPlatformHierarchyAcquire(t, acquired)
 	for _, claim := range claims {
@@ -149,16 +140,16 @@ func TestPlatformTransportBudgetHierarchyPreservesProductionOwnership(t *testing
 			if root.Stats().UsedByteCount != 0 {
 				t.Fatal("normal private device claims changed legacy process accounting")
 			}
-			if NewPlatformTransportBudgetForMemoryTarget(0) != root || NewPlatformTransportBudgetForMemoryTarget(-1) != root {
-				t.Fatal("disabled owner sizing did not retain the process default")
+			zero, negative := NewPlatformTransportBudgetForMemoryTarget(0), NewPlatformTransportBudgetForMemoryTarget(-1)
+			if zero == root || negative == root || zero == negative || zero.parent != nil || negative.parent != nil {
+				t.Fatal("disabled owner sizing unexpectedly shared process admission")
 			}
 		})
 	}
 }
 
-// The tighter Android validation profile and the ordinary Android profile
-// use identical admission. Raising the process target must not turn hierarchy
-// accounting off and permit a separate API budget beside private devices.
+// The tighter Android validation profile and ordinary profile both preserve
+// per-owner limits without a hidden shared process ceiling.
 func TestPlatformTransportBudgetHierarchyAllFiniteProcessProfiles(t *testing.T) {
 	previousTarget := MemoryBudget()
 	defer SetMemoryBudget(previousTarget)
@@ -170,36 +161,29 @@ func TestPlatformTransportBudgetHierarchyAllFiniteProcessProfiles(t *testing.T) 
 		{mib(28), mib(40)},
 		{mib(32), mib(64)},
 	} {
-		t.Run(fmt.Sprintf("device_%d_process_%d", profile.deviceTarget, profile.processTarget), func(t *testing.T) {
-			SetMemoryBudget(profile.processTarget)
-			root := DefaultPlatformTransportBudget()
-			first := NewPlatformTransportBudgetForMemoryTarget(profile.deviceTarget)
-			second := NewPlatformTransportBudgetForMemoryTarget(profile.deviceTarget)
-			if first.parent != root || second.parent != root || first == second {
-				t.Fatal("finite device budgets escaped the shared process root")
-			}
-			if root.Stats().TotalByteCount != profile.processTarget/4 ||
-				first.Stats().TotalByteCount != profile.deviceTarget/4 {
-				t.Fatal("hierarchy changed the configured carrier shares")
-			}
-			for _, budget := range []*PlatformTransportBudget{first, second} {
-				claim := budget.register(platformTransportBudgetExtender, profile.deviceTarget/8, true)
-				requirePlatformHierarchyAcquire(t, claim)
-				defer claim.Release()
-			}
-			remaining := (profile.processTarget - profile.deviceTarget) / 4
-			unowned := root.register(platformTransportBudgetExtender, remaining, true)
-			requirePlatformHierarchyAcquire(t, unowned)
-			defer unowned.Release()
-			if root.Stats().UsedByteCount != profile.processTarget/4 {
-				t.Fatal("owned and unowned claims were not aggregated at the process ceiling")
-			}
-			blocked := second.register(platformTransportBudgetExtender, 1, false)
-			defer blocked.Release()
-			if blocked.TryAcquire() {
-				t.Fatal("finite device admission exceeded the shared process ceiling")
-			}
-		})
+		SetMemoryBudget(profile.processTarget)
+		root := DefaultPlatformTransportBudget()
+		first := NewPlatformTransportBudgetForMemoryTarget(profile.deviceTarget)
+		second := NewPlatformTransportBudgetForMemoryTarget(profile.deviceTarget)
+		if first.parent != nil || second.parent != nil || first == second {
+			t.Fatalf("profile %+v shares an admission root", profile)
+		}
+		if root.Stats().TotalByteCount != profile.processTarget/4 || first.Stats().TotalByteCount != profile.deviceTarget/4 {
+			t.Fatalf("profile %+v changed configured carrier shares", profile)
+		}
+		firstClaim := first.register(platformTransportBudgetExtender, first.Stats().TotalByteCount, true)
+		requirePlatformHierarchyAcquire(t, firstClaim)
+		secondClaim := second.register(platformTransportBudgetExtender, profile.deviceTarget/8, true)
+		requirePlatformHierarchyAcquire(t, secondClaim)
+		rootClaim := root.register(platformTransportBudgetExtender, root.Stats().TotalByteCount, true)
+		requirePlatformHierarchyAcquire(t, rootClaim)
+		if first.Stats().UsedByteCount != first.Stats().TotalByteCount || root.Stats().UsedByteCount != root.Stats().TotalByteCount {
+			t.Fatalf("profile %+v accounting mixed unrelated owners", profile)
+		}
+		firstClaim.Release()
+		secondClaim.Release()
+		rootClaim.Release()
+		requirePlatformHierarchyBalanced(t, first, second, root)
 	}
 }
 

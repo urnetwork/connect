@@ -80,9 +80,8 @@ func TestTheShareTableH3RetainedPolicyBoundaries(t *testing.T) {
 				if want.reservation != row.reservation || want.connection != row.connection || want.stream != row.stream {
 					t.Fatalf("share-table oracle differs from pinned boundary: %+v, row %+v", want, row)
 				}
-				if settings.PlatformTransportBudget.parent != nil && settings.PlatformTransportBudget.parent != DefaultPlatformTransportBudget() ||
-					(process > 0) != (settings.PlatformTransportBudget.parent != nil) {
-					t.Fatal("explicit owner carrier lost its process-root parent")
+				if settings.PlatformTransportBudget.parent != nil || settings.PlatformTransportBudget.root != settings.PlatformTransportBudget {
+					t.Fatal("explicit owner carrier unexpectedly shares an admission root")
 				}
 			})
 		}

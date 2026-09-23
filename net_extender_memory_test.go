@@ -197,14 +197,14 @@ func TestAltQuicCapsSocketAndKeepsClaimThroughFailureCleanup(t *testing.T) {
 	}
 }
 
-func TestUnownedMobileQuicUsesTheProcessRoot(t *testing.T) {
+func TestUnownedMobileQuicHasIndependentCarrierBudget(t *testing.T) {
 	oldBudget := MemoryBudget()
 	defer SetMemoryBudget(oldBudget)
 	SetMemoryBudget(mib(32))
 	policy := newExtenderQuicMemoryPolicy(context.Background(), DefaultConnectSettings())
 	claim, err := policy.acquire(context.Background())
-	if err != nil || claim == nil || claim.budget != DefaultPlatformTransportBudget() {
-		t.Fatalf("unowned mobile carrier did not acquire the process root: %v, %v", claim, err)
+	if err != nil || claim == nil || claim.budget == nil || claim.budget.parent != nil || claim.budget.root != claim.budget {
+		t.Fatalf("unowned mobile carrier did not acquire an independent budget: %v, %v", claim, err)
 	}
 	defer claim.Release()
 	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
@@ -277,13 +277,13 @@ func TestExtenderTcpSharesOwnerAndReleasesAfterSocket(t *testing.T) {
 	}
 }
 
-func TestExtenderTcpUnownedMobileUsesTheProcessRoot(t *testing.T) {
+func TestExtenderTcpUnownedMobileHasIndependentCarrierBudget(t *testing.T) {
 	oldBudget := MemoryBudget()
 	defer SetMemoryBudget(oldBudget)
 	SetMemoryBudget(mib(32))
 	claim, err := acquireExtenderTcpMemory(context.Background())
-	if err != nil || claim == nil || claim.budget != DefaultPlatformTransportBudget() {
-		t.Fatalf("unowned mobile TCP did not acquire the process root: %v %v", claim, err)
+	if err != nil || claim == nil || claim.budget == nil || claim.budget.parent != nil || claim.budget.root != claim.budget {
+		t.Fatalf("unowned mobile TCP did not acquire an independent budget: %v %v", claim, err)
 	}
 	claim.Release()
 	ctx, cancel := context.WithCancel(context.Background())

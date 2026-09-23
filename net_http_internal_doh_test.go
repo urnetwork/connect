@@ -15,6 +15,29 @@ import (
 	"time"
 )
 
+func TestClientStrategiesOwnIndependentControlLimits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultClientStrategySettings()
+	settings.InternalDohDomains = []string{"service.example.test"}
+	first := NewClientStrategy(ctx, settings)
+	defer first.Close()
+	second := NewClientStrategy(ctx, settings)
+	defer second.Close()
+	if first.internalDohResolver == nil || second.internalDohResolver == nil {
+		t.Fatal("protected-domain DoH controls were not created")
+	}
+	if first.internalDohResolver.cache == second.internalDohResolver.cache ||
+		first.internalDohResolver.cache.resolveSem == second.internalDohResolver.cache.resolveSem ||
+		first.internalDohResolver.cache.localClient.httpSem == second.internalDohResolver.cache.localClient.httpSem {
+		t.Fatal("unrelated strategies shared DoH concurrency admission")
+	}
+	first.NextConnectTime()
+	if second.nextConnectTime != (time.Time{}) {
+		t.Fatal("one strategy's dial pacing advanced another strategy")
+	}
+}
+
 // TestInternalDohBypassesPoisonedDefaultResolution is the field regression:
 // the device/network DNS middleware never answers api.<domain>. The same HTTPS
 // request succeeds when the NetworkSpace domain rule resolves over DoH and

@@ -223,6 +223,9 @@ type ApiMultiClientGenerator struct {
 	sourceClientId          *Id
 	clientSettingsGenerator func() *ClientSettings
 	settings                *ApiMultiClientGeneratorSettings
+	// Window carriers created without an explicit caller budget all belong to
+	// this generator. Separate generators never contend through a package root.
+	defaultPlatformTransportBudget *PlatformTransportBudget
 
 	transportPolicyLock        sync.RWMutex
 	platformTransportMode      TransportMode
@@ -316,27 +319,28 @@ func NewApiMultiClientGenerator(
 		runtimeExcludeClientMaxCount = defaultApiRuntimeExcludeClientMaxCount()
 	}
 	return &ApiMultiClientGenerator{
-		ctx:                          generatorCtx,
-		cancel:                       generatorCancel,
-		specs:                        specs,
-		clientStrategy:               clientStrategy,
-		excludeClientIds:             cloneUniqueApiExcludeClientIds(excludeClientIds),
-		runtimeExcludeClientMaxCount: runtimeExcludeClientMaxCount,
-		apiUrl:                       apiUrl,
-		platformUrl:                  platformUrl,
-		deviceDescription:            deviceDescription,
-		deviceSpec:                   deviceSpec,
-		appVersion:                   appVersion,
-		sourceClientId:               sourceClientId,
-		clientSettingsGenerator:      clientSettingsGenerator,
-		settings:                     settings,
-		platformTransportMode:        platformTransportMode,
-		platformModePreferences:      maps.Clone(settings.PlatformTransportModePreferences),
-		platformTransportPolicyVer:   1,
-		api:                          api,
-		identityState:                newWindowIdentityState(generatorCtx, nil),
-		transports:                   map[*Client]*apiWindowClientTransport{},
-		transportIdle:                transportIdle,
+		ctx:                            generatorCtx,
+		cancel:                         generatorCancel,
+		specs:                          specs,
+		clientStrategy:                 clientStrategy,
+		excludeClientIds:               cloneUniqueApiExcludeClientIds(excludeClientIds),
+		runtimeExcludeClientMaxCount:   runtimeExcludeClientMaxCount,
+		apiUrl:                         apiUrl,
+		platformUrl:                    platformUrl,
+		deviceDescription:              deviceDescription,
+		deviceSpec:                     deviceSpec,
+		appVersion:                     appVersion,
+		sourceClientId:                 sourceClientId,
+		clientSettingsGenerator:        clientSettingsGenerator,
+		settings:                       settings,
+		defaultPlatformTransportBudget: DefaultPlatformTransportBudget(),
+		platformTransportMode:          platformTransportMode,
+		platformModePreferences:        maps.Clone(settings.PlatformTransportModePreferences),
+		platformTransportPolicyVer:     1,
+		api:                            api,
+		identityState:                  newWindowIdentityState(generatorCtx, nil),
+		transports:                     map[*Client]*apiWindowClientTransport{},
+		transportIdle:                  transportIdle,
 	}
 }
 
@@ -927,16 +931,7 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 	defer self.transportCreation.end()
 	clientOob := NewApiOutOfBandControl(ctx, self.clientStrategy, args.ClientAuth.ByJwt, self.apiUrl)
 	client := NewClient(ctx, args.ClientId, clientOob, clientSettings)
-	generatedSettings := DefaultPlatformTransportSettings()
-	if self.settings.PlatformTransportSettingsGenerator != nil {
-		if candidateSettings := self.settings.PlatformTransportSettingsGenerator(); candidateSettings != nil {
-			generatedSettings = candidateSettings
-		}
-	}
-	// The generator may return shared fixture state. Window-specific logger and
-	// control-only changes must not mutate it or race another window.
-	settingsValue := *generatedSettings
-	settings := &settingsValue
+	settings := self.newPlatformTransportSettings()
 	// propagate so the client-level logger covers the platform transport
 	settings.Log = client.Log()
 	if args.P2pOnly {
@@ -1046,6 +1041,22 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 		self.MigrateClientTransport(client, nil, time.Now())
 	}
 	return client, nil
+}
+
+func (self *ApiMultiClientGenerator) newPlatformTransportSettings() *PlatformTransportSettings {
+	generatedSettings := DefaultPlatformTransportSettings()
+	if self.settings.PlatformTransportSettingsGenerator != nil {
+		if candidate := self.settings.PlatformTransportSettingsGenerator(); candidate != nil {
+			generatedSettings = candidate
+		}
+	}
+	// The generator may return shared fixture state. Window-specific changes
+	// must not mutate it or race another window.
+	value := *generatedSettings
+	if self.settings.PlatformTransportSettingsGenerator == nil || value.PlatformTransportBudget == nil {
+		value.PlatformTransportBudget = self.defaultPlatformTransportBudget
+	}
+	return &value
 }
 
 func (self *ApiMultiClientGenerator) createPlatformTransport(
