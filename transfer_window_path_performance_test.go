@@ -480,8 +480,8 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		}
 		if profile != nil {
 			profile.apply(s)
-			if s.MinimumMessageLenLimit() != profile.MinimumMessageLimit {
-				t.Fatal("profile message limit differs from the constructor capture")
+			if current := s.MinimumMessageLenLimit(); current != profile.MinimumMessageLimit {
+				t.Fatalf("profile %s captured message limit %d differs from current constructor %d; recapture testdata/window_sdk_profiles.json", profile.Name, profile.MinimumMessageLimit, current)
 			}
 		}
 		if cell.BootstrapWindow > 0 {

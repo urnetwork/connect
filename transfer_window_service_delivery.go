@@ -181,7 +181,7 @@ func (self *windowPacingService) observeAggregateDeliveryWithLock(credit windowS
 	self.aggregate.insert(windowServiceDeliverySample{
 		bytes: credit.bytes, firstBytes: credit.bytes,
 		firstAtNanos: at.UnixNano(), lastAtNanos: at.UnixNano(), firstSentAtNanos: credit.firstSentAtNanos,
-		eligible: credit.receiverTimingEligible && credit.firstSentAtNanos > 0 && credit.firstSentAtNanos <= at.UnixNano(),
+		eligible: credit.receiverTimingEligible && !credit.receiverHeldPrefix && credit.firstSentAtNanos > 0 && credit.firstSentAtNanos <= at.UnixNano(),
 	})
 }
 

@@ -134,6 +134,23 @@ func windowSdkProfiles(t *testing.T) ([]windowPathEndpointProfile, string) {
 	return fixture.Profiles, fmt.Sprintf("%x", sha256.Sum256(windowSdkProfileBytes))
 }
 
+// The profile capture is evidence, not a second runtime policy. Detect an
+// admission-policy change directly, before dozens of measured cells fail at
+// setup. Refresh through the real SDK constructor capture; never edit the
+// production handshake bound or silently substitute a live value in a cell.
+func TestWindowSdkProfileMessageAdmission(t *testing.T) {
+	profiles, _ := windowSdkProfiles(t)
+	for index, profile := range profiles {
+		t.Run(fmt.Sprintf("%02d-%s", index, profile.Name), func(t *testing.T) {
+			settings := DefaultClientSettings()
+			profile.apply(settings)
+			if current := settings.MinimumMessageLenLimit(); current != profile.MinimumMessageLimit {
+				t.Fatalf("captured message admission %d differs from current constructor %d; recapture testdata/window_sdk_profiles.json with tools/throughput-fix-2-sdk-settings.py", profile.MinimumMessageLimit, current)
+			}
+		})
+	}
+}
+
 // Cover every three-way interaction of constructor, direction, feedback delay
 // and sharing, plus all explicit h1 senders and constrained startup boundaries.
 // Each row runs its full constrained ceiling and delivery-paced worker arms.
@@ -156,9 +173,11 @@ func TestWindowPathSdkBidirectional(t *testing.T) {
 		}
 		for _, roundTrip := range []time.Duration{300 * time.Microsecond, 100 * time.Millisecond, 400 * time.Millisecond} {
 			for _, flows := range []int{1, 8} {
-				checkWindowSdkCell(t, windowPathCell{SenderProfile: &profiles[1], ReceiverProfile: &profile,
-					ProfileFixtureSha256: digest, Bidirectional: true, RoundTrip: roundTrip,
-					Upload: flows == 8, Flows: flows, RoundRobinOffer: true, Payload: 1280, Rate: 125000000})
+				t.Run(fmt.Sprintf("%s/providing=%t/rtt=%s/flows=%d", profile.Name, profile.Providing, roundTrip, flows), func(t *testing.T) {
+					checkWindowSdkCell(t, windowPathCell{SenderProfile: &profiles[1], ReceiverProfile: &profile,
+						ProfileFixtureSha256: digest, Bidirectional: true, RoundTrip: roundTrip,
+						Upload: flows == 8, Flows: flows, RoundRobinOffer: true, Payload: 1280, Rate: 125000000})
+				})
 			}
 		}
 	}
@@ -242,8 +261,9 @@ func checkWindowSdkCell(t *testing.T, cell windowPathCell) {
 		windowRate := float64(peer[0].windowLimit(peer[1])) / feedbackSeconds
 		// Allow framing and interval-edge losses in the instrument, while
 		// rejecting an underfilled constant-window reference as calibration.
-		if rate < .85*min(float64(cell.Rate), windowRate)*8/1e6 || candidate.DirectionMbps[i] < .9*rate {
-			t.Errorf("SDK direction %d reference=%.6f candidate=%.6f", i, rate, candidate.DirectionMbps[i])
+		minimumReference := .85 * min(float64(cell.Rate), windowRate) * 8 / 1e6
+		if rate < minimumReference || candidate.DirectionMbps[i] < .9*rate {
+			t.Errorf("SDK direction %d reference=%.6f (minimum %.6f) candidate=%.6f (minimum %.6f)", i, rate, minimumReference, candidate.DirectionMbps[i], .9*rate)
 		}
 	}
 	if candidate.Window.Window > sender.windowLimit(receiver) ||

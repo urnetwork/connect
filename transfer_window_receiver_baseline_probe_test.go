@@ -154,7 +154,7 @@ func TestWindowPacingReceiverTimingQueuedExpiryDoesNotGrowBurst(t *testing.T) {
 		if !set || observed != 650300*time.Microsecond || residence != 660300*time.Microsecond {
 			t.Errorf("age=%t did not retain actual observed receiver tuple", byAge)
 		}
-		if baseline != 300*time.Microsecond || rate != 12500000 || !backlog || paced > 12500000 || service.burstMeter.limit > 125000 || service.burstEstimateTime != 10*time.Millisecond {
+		if baseline != 300*time.Microsecond || rate != 12500000 || !backlog || paced > 12500000 || service.burstMeter.limit > 31250 || service.burstEstimateTime != 2500*time.Microsecond || service.bucketInterval != 10*time.Millisecond {
 			t.Errorf("age=%t queued observations grew physical pacing allowance", byAge)
 		}
 	}

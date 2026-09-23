@@ -3192,3 +3192,176 @@ proxy, not a battery claim. Keep all correctness/recovery/TTFB/Fast.com gates
 and the **unchanged 25,165,824-B absolute iOS-profile gate**. A repeatable CPU
 or energy saving can justify further work even below 5% wall-time improvement,
 but this host result alone does not authorize a production change.
+
+### 2026-09-23: short-H1 duplex burst scheduling, without larger windows
+
+The eight-core SDK replay exposed a real edge at 300 us RTT: one direction
+delivered 861.337600 Mbps against the unchanged 861.428736-Mbps gate (90% of
+its 957.143040-Mbps constant-window control). This is `synctest` virtual
+goodput, not a host CPU-speed measurement. Both directions share ordinary
+data/ACK FIFOs. The reverse window was full in 82/100 traced samples and below
+the existing pacing flight allowance in all 100; no controlled drain, drop,
+or retransmit explained the interval. A ten-millisecond measurement bucket
+also admitted a ten-millisecond physical burst, delaying opposing ACKs.
+
+The candidate separates measurement from physical dispatch. An adequately
+provisioned H1 flow releases at most one quarter of the measurement interval
+on short paths (2.5 ms), scaling up with one quarter of measured path RTT
+without exceeding the old burst. Measurement qualification, ACK protocol,
+window retention, peer permission, shared memory limits and serialization
+payment remain unchanged. The old feedback-jitter allowance is retained:
+smaller local bursts do not prove that an opposing sender has also shortened
+its bursts. Tight hard windows below one configured-target ACK-compression
+interval keep their original batching; splitting those batches can starve
+per-lane cumulative ACK credit. Unknown permission/timing also keeps the old
+behavior. The quantum is cached on feedback, with no per-packet ring scan,
+new timer, payload allocation or per-lane multiplication of burst permission.
+
+Broad testing exposed another necessary bound: fine dispatch cannot assume
+better timer precision than the host supplies. With forced 3-ms timer
+lateness, a fixed 2.5-ms quantum reduced measured service until an indivisible
+frame waited on every late wake (42.13 Mbps at 16 KiB, 152.22 Mbps at 64 KiB).
+The candidate now amortizes actual pacing-timer lateness with a decaying peak,
+at most the original burst horizon. ACK, route and FIFO waits are not inputs,
+and punctual wakes restore fine dispatch. The same twelve-second tests then
+delivered 993.03 and 997.85 Mbps, respectively, with all per-second intervals
+healthy. A deterministic direct test covers recovery, the old burst cap and
+indivisible-frame progress; existing delayed-wake/debt tests remain intact.
+
+Rejected counterfactuals were important: adding a full burst to retained
+windows restored reverse speed but reduced forward/aggregate goodput;
+continuous early head ACKs inflated retained queue residence, and using a
+proved unloaded residence did not recover the fixed-phase aggregate. A
+uniform 1-ms release regressed a constrained eight-flow upload, while uniform
+2.5-ms releases regressed constrained provider duplex. Hard-window scoping
+preserves those cases; even scoped 1-ms release missed one forced-phase gate.
+No ACK-format, ACK-timer, RTT-sizing or window-budget change was retained.
+
+Pilot measurements on Go 1.26.7, darwin/arm64 (M4 Pro), `GOMAXPROCS=8`, use
+the original 1,280-byte packet stream, 300-us RTT, one-second measurement and
+unchanged warmup. Five declared initial-ACK phases expose startup coupling;
+these are ordered before/after observations, not independent repetitions or
+a statistical superiority result. Aggregate modeled Mbps for SDK device H1
+with providing disabled, one flow each direction:
+
+| Initial ACK release | Old burst | Scoped quarter burst |
+| --- | ---: | ---: |
+| Unforced | 1,667.13 | 1,829.43 |
+| 205 ms | 1,499.17 | 1,718.01 |
+| 207.5 ms | 1,462.84 | 1,718.06 |
+| 210 ms | 1,763.51 | 1,691.20 |
+| 212.5 ms | 1,410.73 | 1,760.84 |
+
+The five-phase median increased 14.6% (1,499.17 to 1,718.06 Mbps), with one
+phase 4.1% slower. Candidate reverse directions ranged 925.21–957.31 Mbps;
+all unchanged per-direction/aggregate gates passed. The candidate forward
+permission stayed 1,635,778 B, reverse retained windows 1,966,786–2,301,257 B,
+and maximum FIFO occupancy 1,148,525–1,515,073 B, below the unchanged 8-MiB
+queue cap. All five recorded zero drops and timeout retransmissions. Adjacent
+constrained SDK provider H1 eight-flow upload delivered 957.35 Mbps and
+bidirectional traffic 754.49/956.75 Mbps; all five provider startup phases
+passed. This does not establish physical Fast.com speed or iOS qualification.
+
+Deterministic regression coverage now checks shared one/eight-writer prefix
+envelopes, hard-window eligibility boundaries, unchanged feedback-flight
+tolerance, preserved payment when a quantum shrinks, and indivisible frames.
+`TestWindowPathSdkDuplexShortDispatchPhases` keeps both the device and
+constrained-provider five-phase cohorts under the original gates. Run it
+alongside `TestWindowPacing*`, `TestWindowPathSdkBidirectional` and
+`TestWindowPathRetainedSdkCumulativePacingShort`, with `GOMAXPROCS=8`,
+`-count=1` and race separately; never select a lucky repeat or extend warmup.
+
+The complete-policy SDK provider memory cohort passed all three fresh two-core
+processes: sampled Go runtime peaks 28.039, 28.035 and 29.207 MiB. The earlier
+scoped-quarter cohort, before timer-lateness adaptation, also passed at
+27.648, 27.562 and 26.769 MiB; this is not a paired memory-impact comparison.
+Each
+completed 4,718,592 TCP bytes and 192 UDP round trips under unchanged GOGC=10,
+32-MiB soft limit, 20-ms sampling and 31-MiB synthetic Darwin peak gate.
+This process includes six local peers and is **not** an iOS extension
+footprint or a waiver of its absolute 24-MiB gate. No H1+ memory/energy
+attribution follows from this result. Broad normal/race and isolated
+reservation CPU/allocation checks must also pass for this candidate.
+
+An isolated reservation microbenchmark (same host/Go version,
+`GOMAXPROCS=2`, five 300-ms repetitions per arm) measured median 49.12 ns/op
+before and 50.16 ns/op after, a 1.04-ns increase; both were 0 B/op and
+0 allocs/op. These are ordered pilot runs, not a statistically established
+CPU regression or saving. The benchmark excludes the timer callback and
+whole-stack packet processing; virtual goodput is not an energy measurement.
+The extra policy state is bounded per existing service/waiter, not per packet.
+Qualification is not complete. The final broad normal run retained one
+failure in `TestWindowPathServiceRoundTripGrowthBeyondOldRing`: after a
+300-us to 1.2-s RTT change, its three measurement intervals were
+4.98/380.66/66.79 Mbps against approximately 95.77 Mbps per control interval.
+The aggregate therefore hid a real sustained-delivery gap. Five focused
+candidate runs, ten old-burst counterfactual runs and a declared three-cohort,
+eight-change-phase probe all passed; none erases that failure or proves its
+attribution. Quality-change/recovery triage and the affected/adjacent race
+suite remain open. Do not declare release readiness from the short-path win.
+
+The follow-up isolated a concrete estimator defect, rather than explaining
+the bad interval as host load. `TestWindowPacingRecoveredPrefixCannotRaiseService`
+supplies eight lanes with one MiB each, independently serialized at
+12.5 MB/s, loses each lane's first identity, changes path quality, then releases
+the repaired cumulative prefixes 20 ms apart. The cumulative heads retain
+validated receiver waits of 1.13–1.27 s, far beyond the advertised 10-ms ACK
+compression. Previously the estimator correctly refused to retime the entire
+prefix using only its head's wait, but then discarded the evidence of that
+wait. Raw release arrivals falsely raised shared service to **52.4288 MB/s**.
+All eight MiB were credited exactly once; the error was capacity inference,
+not duplicate ownership. This is a deterministic estimator reproduction, not
+proof that every detail of the earlier intermittent worker failure is identical.
+
+The narrow repair keeps a fixed-size provenance boundary for a newly credited
+multi-item prefix whose validated head wait exceeds ordinary compression.
+Its bytes still repay ownership and keep their raw arrival clocks, but an
+interval touching that release cannot raise service; the same ambiguous bytes
+cannot seed the shared aggregate sizing fallback. Independent later pairs can
+raise capacity, and measured slowdowns remain valid. The regression now holds
+12.5 MB/s through all eight repaired prefixes and then accepts a fresh
+25-MB/s serialized train. Controls preserve ordinary compression, zero wait,
+legacy peers without metadata, unvalidated tags, selective-only credit,
+already-SACKed prefixes, prior-generation filtering and reordered callbacks.
+No ACK format/timer, loss gate, window ceiling, memory budget or warmup changed.
+
+On this candidate the complete normal window/ACK selection passed in 267.168 s
+at `GOMAXPROCS=8`. The original short duplex cell delivered 884.43/942.17 Mbps
+(1,826.60 aggregate), and the long-RTT worker case delivered
+95.76/95.78/95.76 Mbps against approximately 95.77-Mbps control intervals,
+with zero measurement drops. A bounded unit/adjacent race selection covering
+`TestWindowPacing*`, `TestWindowQuality*`, ACK compression, burst tails and
+receiver timing passed in 4.442 s. The earlier overbroad race attempt was
+explicitly stopped after approximately fourteen minutes: it is **incomplete,
+not a passing run**. The replacement bounded worker race selection passed in
+147.644 s: the exact short-duplex cell, long-RTT growth, delayed pacing wakes,
+and constrained initial/later-feedback cases. Runner-owned three fresh
+confirmations and the complete parent campaign remain required; no physical
+speed or iOS memory qualification is implied by these virtual-time results.
+
+Reproduce the prefix mechanism directly, then retain actual-worker qualification:
+
+```sh
+GOWORK=off GOMAXPROCS=8 go test -count=1 -run '^TestWindowPacingRecoveredPrefix' .
+GOWORK=off GOMAXPROCS=8 go test -count=1 -run '^(TestWindowPathServiceRoundTripGrowthBeyondOldRing|TestWindowPathDispatchQualityPhaseProbe)$' .
+```
+
+The final three-process SDK memory cohort also passed: runtime peaks
+28.109/28.531/28.152 MiB, 4,718,592 TCP bytes and 192 UDP round trips in every
+child, fixed two cores, GOGC=10 and unchanged 31-MiB synthetic ceiling. The
+20-ms sampler's largest TCP gaps were 20.34/20.50/21.20 ms. These runs overlapped
+bounded validation work, not paired idle-host energy measurements. A separate
+five-by-300-ms, two-core microbenchmark after those connect/runner tests ended
+reported medians of 50.23 ns for dispatch reservation, 179.7 ns for service
+estimation, 898.8 ns for one-head coalescing and 1,273 ns for a 32-envelope
+head. All four were **0 B/op, 0 allocs/op**. The coalescing/estimation figures
+are candidate-only measurements, not a before/after CPU claim. Provenance adds
+one timestamp per existing shared service, not payload storage or a new queue.
+An additional full-history rejection benchmark measured the guard while every
+candidate interval is ambiguous: median 5.602 us/read, still 0 B/op and
+0 allocs/op (same five-by-300-ms protocol). This bounded recovery scan is more
+expensive than ordinary estimation and must not be described as a CPU saving;
+it does not add an unbounded history or move estimation into every packet write.
+The fresh SDK memory cohort and its telemetry helpers also passed with the
+race detector (13.854 s); instrumented memory values are diagnostic, not an
+alternative to the normal-build ceiling.

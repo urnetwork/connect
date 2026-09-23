@@ -11921,6 +11921,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 				self.windowPacer.estimateRate = estimate.ServiceByteRate
 				self.windowPacer.probeRate = estimate.PacingProbeByteRate
 				self.windowPacer.probeLimit = estimate.PacingProbeByteCount
+				self.windowPacer.waiter.holdCompressionBurst = windowPacingHoldCompressionBurst(estimate, self.ackCompressionResidence())
 				self.windowPacer.rateUpdated = now
 			}
 			if self.windowPacer.rate > 0 {

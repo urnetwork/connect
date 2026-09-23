@@ -41,6 +41,21 @@ type windowPacingWaiter struct {
 	sentAt        time.Time
 	deadline      time.Time
 	serialization time.Duration
+	// A window smaller than a full target-rate compressed feedback interval
+	// relies on coalescing to earn timely cumulative ACKs. Keep its existing
+	// burst; only better-provisioned flows can smooth release independently.
+	holdCompressionBurst bool
+}
+
+func windowPacingHoldCompressionBurst(estimate SendWindowEstimate, compression time.Duration) bool {
+	ceiling := estimate.Ceiling
+	if ceiling <= 0 {
+		ceiling = estimate.Window
+	}
+	if ceiling <= 0 || estimate.PacingProbeByteRate <= 0 || compression <= 0 {
+		return true
+	}
+	return float64(ceiling) < float64(estimate.PacingProbeByteRate)*compression.Seconds()
 }
 
 // Production writes register identity during the locked pacing handoff.
@@ -68,6 +83,12 @@ func (self *windowPacingWriteStart) lifetime(now time.Time) (time.Time, error) {
 // A burst may take longer than the measurement it came from while service
 // changes. Its byte allowance is never multiplied along with that duration.
 const windowPacingBurstTimeScale = 2
+
+// A short-RTT service must not turn the 10 ms measurement bucket into a
+// 10 ms FIFO release: reverse-direction ACKs would sit behind that whole
+// burst. One quarter of the measurement bucket bounds timer overhead while
+// preserving useful batches; one quarter of longer RTTs permits larger ones.
+const windowPacingMinimumBurstTime = deliverySizedWindowSampleInterval / 4
 
 // A residence change may pause new writes briefly to obtain a drained probe.
 // Loss cannot extend that pause indefinitely or trigger it on every write.
@@ -416,6 +437,9 @@ func (self *windowBurstPacer) waitUntilChangedForWrite(ctx context.Context, dead
 		if wake == deadline && self.afterWaitForTest != nil {
 			self.afterWaitForTest()
 		}
+		if wake == deadline && self.service != nil {
+			self.service.observePacingTimerWake(time.Now().Sub(deadline))
+		}
 	}
 }
 
@@ -429,6 +453,9 @@ type windowPacingService struct {
 	burst                    windowPacingBurst
 	dispatchBurst            windowPacingBurst
 	burstEstimateTime        time.Duration
+	dispatchInterval         time.Duration
+	timerWakeDelay           time.Duration
+	feedbackBurstByteCount   ByteCount
 	burstMeter               windowPacingBurstMeter
 	waiterHead               *windowPacingWaiter
 	waiterTail               *windowPacingWaiter
@@ -440,6 +467,9 @@ type windowPacingService struct {
 	serviceEpochAt           time.Time
 	serviceHoldRate          ByteCount
 	windowDeliveryAfterNanos int64
+	// A proved receiver-held cumulative prefix keeps its raw delivery clock,
+	// but intervals crossing that release cannot authorize faster service.
+	receiverHeldPrefixAtNanos int64
 	// Fixed summaries survive ACK gaps longer than the timestamp ring.
 	// An incomplete cycle holds service; actual timestamps or fully applied
 	// proved delivery complete it, independently of the old byte rate.
@@ -826,7 +856,11 @@ func (self *windowPacingService) reserve(now time.Time, byteCount int, rate, est
 		self.sent += ByteCount(byteCount)
 		self.reservedByteCount += ByteCount(byteCount)
 	}
-	interval := max(deliverySizedWindowSampleInterval, self.bucketInterval)
+	maximumInterval := max(deliverySizedWindowSampleInterval, self.bucketInterval)
+	interval := maximumInterval
+	if self.dispatchInterval > 0 && !waiter.holdCompressionBurst {
+		interval = min(interval, max(self.dispatchInterval, 2*self.timerWakeDelay))
+	}
 	messageBytes := ByteCount(byteCount)
 	probe := min(ByteCount(byteCount), max(0, probeLimit-self.probeSent))
 	hasEstimate := estimateRate > 0
@@ -839,6 +873,14 @@ func (self *windowPacingService) reserve(now time.Time, byteCount int, rate, est
 			estimateRate = probeRate
 		}
 		refillRate = probeRate
+	}
+	// Smoothing physical releases must not tighten the existing feedback
+	// jitter allowance. An opposing service can still hold our ACK behind
+	// its own permitted burst, even when our individual release is smaller.
+	feedbackBytes := float64(estimateRate) * maximumInterval.Seconds()
+	self.feedbackBurstByteCount = ByteCount(math.MaxInt64)
+	if feedbackBytes < float64(math.MaxInt64) {
+		self.feedbackBurstByteCount = max(self.maxMessageByteCount, ByteCount(feedbackBytes))
 	}
 	bytes := float64(estimateRate) * interval.Seconds()
 	estimateBytes := ByteCount(math.MaxInt64)
@@ -910,6 +952,17 @@ func (self *windowPacingService) removeWaiterWithLock(waiter *windowPacingWaiter
 		}
 	}
 	waiter.previous, waiter.next = nil, nil
+}
+
+// Fine releases require a scheduler that can actually wake at that cadence.
+// Amortize observed timer lateness without growing beyond the old byte/time
+// allowance. A decaying peak adapts immediately to load and returns toward
+// fine dispatch after timely wakes; ACK, FIFO and route waits do not feed it.
+func (self *windowPacingService) observePacingTimerWake(late time.Duration) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	maximum := max(deliverySizedWindowSampleInterval, self.bucketInterval) / 2
+	self.timerWakeDelay = max(min(max(0, late), maximum), self.timerWakeDelay-self.timerWakeDelay/8)
 }
 
 // The lock is released before waiting, so siblings and ACK delivery continue
@@ -1322,6 +1375,13 @@ func (self *windowPacingService) measureWithLock(horizon time.Duration, now time
 		}
 		return measured
 	}
+	heldPrefixIncrease := func(measured ByteCount, span, atNanos int64) bool {
+		// A validated held prefix owns real delivery, not a faster serializer.
+		// Growth requires an independent interval after its release; lower
+		// service evidence remains useful even while a prefix is recovering.
+		after := self.receiverHeldPrefixAtNanos
+		return measured > hold && after != 0 && (atNanos <= after || span >= atNanos-after)
+	}
 	// A bounded drain has not yet distinguished queueing from propagation.
 	// Preserve qualified service through its physical proof and write handoff;
 	// expiry or abandonment ends the hold, while new bytes may raise it.
@@ -1333,7 +1393,7 @@ func (self *windowPacingService) measureWithLock(horizon time.Duration, now time
 		span := cycle.lastAtNanos - self.feedbackCycleBefore.UnixNano()
 		if eligibleCycle && self.feedbackAt.UnixNano() <= cycle.lastAtNanos && cycle.bytes > 0 && span >= int64(max(time.Nanosecond, compression, self.feedbackInterval)) {
 			measured := byteRate(cycle.bytes, span)
-			if measured > hold {
+			if measured > hold && !heldPrefixIncrease(measured, span, cycle.lastAtNanos) {
 				if retain {
 					self.serviceHoldRate = measured
 					if self.roundTripProbe.resetService || self.roundTripProbe.resetInitialService {
@@ -1375,10 +1435,10 @@ func (self *windowPacingService) measureWithLock(horizon time.Duration, now time
 	invalidReceiverAt := int64(0)
 	observeRate := func(bytes ByteCount, span, atNanos int64, queued, firstQueued bool) bool {
 		measured := byteRate(bytes, span)
-		if measured > hold && queued && span < increaseSpan && (hold > 0 || firstQueued) {
-			// A carrier reader can empty a completed flight at memory speed.
-			// Its queue-delayed peak needs a full feedback interval before it
-			// can raise service, even after the outstanding count reaches zero.
+		if heldPrefixIncrease(measured, span, atNanos) || measured > hold && queued && span < increaseSpan && (hold > 0 || firstQueued) {
+			// A retained prefix or carrier reader can empty a completed flight
+			// at memory speed. Preserve its delivery without letting that release
+			// cadence prove more physical service, even after flight reaches zero.
 			rejectedIncreaseAt = max(rejectedIncreaseAt, atNanos)
 			return false
 		}
@@ -1490,7 +1550,7 @@ func (self *windowPacingService) measureWithLock(horizon time.Duration, now time
 			span := newer.lastAtNanos - samples[j].lastAtNanos
 			if span >= minSpan {
 				measured := byteRate(bytes, span)
-				if self.outstandingWithLock() > self.flightBoundAtWithLock(measured, timing.residence) {
+				if !heldPrefixIncrease(measured, span, newer.lastAtNanos) && self.outstandingWithLock() > self.flightBoundAtWithLock(measured, timing.residence) {
 					heldAfterRejection = false
 					latest = measured
 					if horizon > 0 && newer.lastAtNanos >= cutoff {
@@ -1615,6 +1675,10 @@ func (self *windowPacingService) observeRoundTripWithLock(roundTrip, compression
 		residenceInterval++
 	}
 	interval := max(deliverySizedWindowSampleInterval, self.compression/4, residenceInterval)
+	// Cache on feedback, not on each packet reservation: timing already
+	// owns the bounded receiver-ring scan here. Measurement buckets and
+	// their ACK-compression qualification remain completely unchanged.
+	self.dispatchInterval = min(interval, max(windowPacingMinimumBurstTime, timing.minimum/4))
 	if interval != max(deliverySizedWindowSampleInterval, self.bucketInterval) {
 		// Bucket widths are bookkeeping. Preserve real ACK timestamps so
 		// a changed RTT cannot erase the pair that discovered new service.
@@ -1755,7 +1819,7 @@ func (self *windowPacingService) flightBoundWithLock(rate ByteCount) float64 {
 // The residence is either one complete receiver tuple or the unchanged
 // legacy minimum plus advertised compression.
 func (self *windowPacingService) flightBoundAtWithLock(rate ByteCount, residence time.Duration) float64 {
-	burst := float64(max(self.maxMessageByteCount, self.burstMeter.limit))
+	burst := float64(max(self.maxMessageByteCount, self.burstMeter.limit, self.feedbackBurstByteCount))
 	if self.burstMeter.limit <= 0 {
 		burst += float64(rate) * (2 * time.Millisecond).Seconds()
 	}

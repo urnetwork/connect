@@ -19,6 +19,7 @@ type windowServiceAckCredit struct {
 	firstSentAtNanos       int64
 	receiverTiming         windowServiceAckTiming
 	receiverTimingEligible bool
+	receiverHeldPrefix     bool
 }
 
 // Merge only newly delivered envelopes, preserving incomplete offer evidence.
@@ -34,6 +35,7 @@ func (self *windowServiceAckCredit) add(other windowServiceAckCredit) {
 	if self.bytes == 0 || other.firstSentAtNanos < self.firstSentAtNanos {
 		self.firstSentAtNanos = other.firstSentAtNanos
 	}
+	self.receiverHeldPrefix = self.receiverHeldPrefix || other.receiverHeldPrefix
 	self.bytes += other.bytes
 }
 
@@ -121,6 +123,12 @@ func (self *SendSequence) publishAckServiceCreditWithTiming(messageId Id, select
 		timing.receivedAtNanos != 0 && timing.receivedAtNanos == at.UnixNano() {
 		credit.receiverTiming = timing
 	}
+	// Refusing to retime a multi-item prefix must not discard evidence that
+	// it was held behind a hole or receiver backpressure. Its raw release is
+	// valid delivery, but cannot by itself prove faster physical service.
+	credit.receiverHeldPrefix = headCredited && credit.bytes > headByteCount &&
+		timing.receivedAtNanos != 0 && timing.receivedAtNanos == at.UnixNano() &&
+		timing.receiverDelay > self.ackCompressionResidence()
 	self.observePacingServiceCredit(credit, at)
 }
 
@@ -143,6 +151,9 @@ func (self *SendSequence) observePacingServiceCredit(credit windowServiceAckCred
 		service.accountAckWithLock(credit.bytes, at)
 		service.completeFeedbackCycleWithLock()
 		return
+	}
+	if credit.receiverHeldPrefix {
+		service.receiverHeldPrefixAtNanos = max(service.receiverHeldPrefixAtNanos, at.UnixNano())
 	}
 	service.observeAggregateDeliveryWithLock(credit, at)
 	service.observeAckWithLock(credit.bytes, at, credit.receiverTiming)
