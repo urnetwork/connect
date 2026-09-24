@@ -3564,7 +3564,9 @@ func (self *UdpSequence) Run() {
 			}
 
 			readTimeout := time.Now().Add(self.udpBufferSettings.ReadTimeout)
-			socket.SetReadDeadline(readTimeout)
+			if err := socket.SetReadDeadline(readTimeout); err != nil {
+				return
+			}
 			n, err := socket.Read(buffer)
 
 			if err != nil {
@@ -3649,8 +3651,7 @@ func (self *UdpSequence) Run() {
 			}
 		}
 
-		socket.SetWriteDeadline(time.Now().Add(self.udpBufferSettings.WriteTimeout))
-		var writeErr error
+		writeErr := socket.SetWriteDeadline(time.Now().Add(self.udpBufferSettings.WriteTimeout))
 		for _, sendItem := range writeBatch {
 			payload := sendItem.udp.payload
 			if writeErr == nil && 0 < len(payload) {
@@ -4665,7 +4666,9 @@ func writeWithProgressDeadline(
 ) (int64, error) {
 	n := int64(0)
 	for {
-		socket.SetWriteDeadline(time.Now().Add(timeout))
+		if err := socket.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+			return n, err
+		}
 		wn, err := buffers.WriteTo(socket)
 		n += wn
 		if err == nil {
@@ -5598,7 +5601,9 @@ func (self *TcpSequence) Run() {
 			}
 
 			readTimeout := time.Now().Add(self.tcpBufferSettings.ReadTimeout)
-			socket.SetReadDeadline(readTimeout)
+			if err := socket.SetReadDeadline(readTimeout); err != nil {
+				return
+			}
 
 			n, err := socket.Read(buffer)
 
