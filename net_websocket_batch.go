@@ -6,10 +6,17 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const webSocketWriteBatchMaxByteCount = 16 * 1024
+
+// A rejected liveness bound is terminal even when the WebSocket dependency
+// ignores its setter result. The first error remains authoritative.
+type webSocketDeadlineError struct {
+	err error
+}
 
 // WebSocketWriteBatchConn preserves the WebSocket byte stream while allowing
 // one transport writer to combine several already-queued messages into one
@@ -22,10 +29,11 @@ const webSocketWriteBatchMaxByteCount = 16 * 1024
 // byte-stream batch in arrival order. Read, deadlines, and Close retain
 // net.Conn's concurrent contract and can interrupt a blocked delegated write.
 type WebSocketWriteBatchConn struct {
-	conn        net.Conn
-	stateLock   sync.Mutex
-	writeBuffer []byte
-	batching    bool
+	conn          net.Conn
+	stateLock     sync.Mutex
+	writeBuffer   []byte
+	batching      bool
+	deadlineError atomic.Pointer[webSocketDeadlineError]
 
 	// Tests place batch activation and a concurrent control write at one exact
 	// boundary. Nil in production.
@@ -49,6 +57,11 @@ func (self *WebSocketWriteBatchConn) BeginWriteBatch() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if self.deadlineError.Load() != nil {
+		self.batching = false
+		self.writeBuffer = self.writeBuffer[:0]
+		return
+	}
 	if self.batching {
 		panic("websocket write batch already active")
 	}
@@ -72,6 +85,10 @@ func (self *WebSocketWriteBatchConn) AbortWriteBatch() {
 // Writes retained bytes while the state lock keeps concurrent control writes
 // from interleaving with the delegated stream write.
 func (self *WebSocketWriteBatchConn) flushWriteBufferWithLock() error {
+	if failure := self.deadlineError.Load(); failure != nil {
+		self.writeBuffer = self.writeBuffer[:0]
+		return failure.err
+	}
 	if len(self.writeBuffer) == 0 {
 		return nil
 	}
@@ -89,6 +106,11 @@ func (self *WebSocketWriteBatchConn) FlushWriteBatch() error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if failure := self.deadlineError.Load(); failure != nil {
+		self.batching = false
+		self.writeBuffer = self.writeBuffer[:0]
+		return failure.err
+	}
 	if !self.batching {
 		return nil
 	}
@@ -98,6 +120,9 @@ func (self *WebSocketWriteBatchConn) FlushWriteBatch() error {
 
 // Delegates reads without sharing the single-writer batching state.
 func (self *WebSocketWriteBatchConn) Read(buffer []byte) (int, error) {
+	if failure := self.deadlineError.Load(); failure != nil {
+		return 0, failure.err
+	}
 	return self.conn.Read(buffer)
 }
 
@@ -109,6 +134,10 @@ func (self *WebSocketWriteBatchConn) Write(buffer []byte) (int, error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if failure := self.deadlineError.Load(); failure != nil {
+		self.writeBuffer = self.writeBuffer[:0]
+		return 0, failure.err
+	}
 	if !self.batching {
 		return self.conn.Write(buffer)
 	}
@@ -139,17 +168,38 @@ func (self *WebSocketWriteBatchConn) RemoteAddr() net.Addr {
 	return self.conn.RemoteAddr()
 }
 
-// Sets the delegated read and write deadlines.
+// Closes the owned socket on the first rejected bound without taking the
+// writer lock: a concurrent delegated Write may need this close to return.
+func (self *WebSocketWriteBatchConn) observeDeadlineError(err error) error {
+	if err != nil && self.deadlineError.CompareAndSwap(nil, &webSocketDeadlineError{err: err}) {
+		self.conn.Close()
+	}
+	if failure := self.deadlineError.Load(); failure != nil {
+		return failure.err
+	}
+	return nil
+}
+
+// Sets both deadlines, preserving any earlier terminal installation failure.
 func (self *WebSocketWriteBatchConn) SetDeadline(deadline time.Time) error {
-	return self.conn.SetDeadline(deadline)
+	if failure := self.deadlineError.Load(); failure != nil {
+		return failure.err
+	}
+	return self.observeDeadlineError(self.conn.SetDeadline(deadline))
 }
 
-// Sets the delegated read deadline.
+// A rejected read bound closes this owned full-duplex connection.
 func (self *WebSocketWriteBatchConn) SetReadDeadline(deadline time.Time) error {
-	return self.conn.SetReadDeadline(deadline)
+	if failure := self.deadlineError.Load(); failure != nil {
+		return failure.err
+	}
+	return self.observeDeadlineError(self.conn.SetReadDeadline(deadline))
 }
 
-// Sets the delegated write deadline.
+// Gorilla ignores this result; the terminal latch also prevents its next Write.
 func (self *WebSocketWriteBatchConn) SetWriteDeadline(deadline time.Time) error {
-	return self.conn.SetWriteDeadline(deadline)
+	if failure := self.deadlineError.Load(); failure != nil {
+		return failure.err
+	}
+	return self.observeDeadlineError(self.conn.SetWriteDeadline(deadline))
 }
