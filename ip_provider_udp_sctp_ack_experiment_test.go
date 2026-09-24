@@ -3,6 +3,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -46,6 +48,7 @@ type udpSctpAckExperimentConn struct {
 	repeated                                  int
 	sackCount                                 int
 	dropEvery, dropFirst, dataWrites, dropped int
+	ledgerLink                                *udpSctpLedgerLink
 }
 
 func udpSctpAckExperimentChunks(packet []byte, visit func(byte, []byte)) error {
@@ -106,6 +109,9 @@ func (c *udpSctpAckExperimentConn) Write(packet []byte) (int, error) {
 	if c.immediate {
 		clear(owned[8:12])
 		binary.LittleEndian.PutUint32(owned[8:12], crc32.Checksum(owned, crc32.MakeTable(crc32.Castagnoli)))
+	}
+	if c.ledgerLink != nil {
+		return c.ledgerLink.submit(owned)
 	}
 	select {
 	case <-c.ctx.Done():
@@ -226,6 +232,8 @@ type udpSctpAckExperimentResult struct {
 	serviceWindowCharge                               ByteCount
 	peakServiceCharge, peakSharedBudgetBytes          ByteCount
 	injectedLossPackets                               int
+	finalSctpStreamBytes                              uint64
+	finalSctpAssociationBytes                         int
 }
 
 func runProviderUdpSctpAckExperiment(t *testing.T, roundTrip time.Duration, immediate bool) (result udpSctpAckExperimentResult) {
@@ -249,6 +257,11 @@ type udpSctpProductionQueueExperimentSettings struct {
 	serviceWindowByteCount                    ByteCount
 	dynamicServiceCharge                      bool
 	dropEveryDataPacket, dropFirstDataPackets int
+	ledgerProfile                             *udpSctpLedgerProfile
+	ledgerSeed                                int64
+	settledLedger                             func(udpSctpLedgerPoint)
+	closedLedgerLinks                         func(udpSctpLedgerLinkStats, udpSctpLedgerLinkStats)
+	frozenEnvelope                            bool
 }
 
 func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, immediate bool, streamEnvelope bool, carrierSlots, compactByteLimit int, production ...udpSctpProductionQueueExperimentSettings) (result udpSctpAckExperimentResult) {
@@ -322,6 +335,10 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 
 		clientSettings := DefaultClientSettings()
 		clientSettings.EncryptionSettings.Mode = EncryptionModeOff
+		if len(production) > 0 && production[0].frozenEnvelope {
+			clientSettings.DefaultTransferOpts.Ack = false
+			clientSettings.Log = NewNoopLogger()
+		}
 		provider, client, _ := newProviderTransferKeyTestFixtureWithClientSettings(t, DefaultRemoteUserNatProviderSettings(), clientSettings)
 		defer closeTransferGroupTestClient(t, client)
 		defer provider.Close()
@@ -412,10 +429,13 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 				t.Error(err)
 			}
 		}()
-		const offeredBitRate = 3_750_000
-		const interval = time.Duration(8 * 1000 * int64(time.Second) / offeredBitRate)
-		const offerCount = int(time.Second / interval)
-		var source, received [offerCount + 1]bool
+		offeredBitRate := int64(3_750_000)
+		if len(production) > 0 && production[0].ledgerProfile != nil {
+			offeredBitRate = production[0].ledgerProfile.downRate * 3 / 4
+		}
+		interval := time.Duration(8 * 1000 * int64(time.Second) / offeredBitRate)
+		offerCount := int(time.Second / interval)
+		source, received := make([]bool, offerCount+1), make([]bool, offerCount+1)
 		receivedCount := 0
 		var receivedLock sync.Mutex
 		receivedPacketCount := func() int {
@@ -423,6 +443,7 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 			defer receivedLock.Unlock()
 			return receivedCount
 		}
+		template := craftSecurityPacket(IpProtocolUdp, net.ParseIP("203.0.113.7"), 8080, net.ParseIP("10.0.0.9"), 42001, false, make([]byte, 1000))
 		readerDone := make(chan struct{})
 		go func() {
 			defer close(readerDone)
@@ -439,6 +460,9 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 				receivedLock.Lock()
 				for _, frame := range pack.Frames {
 					packet := frame.MessageBytes
+					if len(production) > 0 && production[0].frozenEnvelope && (len(packet) != len(template) || !bytes.Equal(packet[:len(packet)-4], template[:len(template)-4])) {
+						t.Error("frozen UDP payload/header changed")
+					}
 					index := int(binary.BigEndian.Uint32(packet[len(packet)-4:]))
 					if index < 0 || len(received) <= index || received[index] {
 						t.Errorf("invalid/duplicate identity %d", index)
@@ -453,12 +477,14 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 		defer func() { cancel(); _ = rightResult.association.Close(); <-readerDone }()
 		completed := make(chan providerReturnSendResult, 1)
 		provider.afterReturnSendForTest = func(value providerReturnSendResult) { completed <- value }
-		template := craftSecurityPacket(IpProtocolUdp, net.ParseIP("203.0.113.7"), 8080, net.ParseIP("10.0.0.9"), 42001, false, make([]byte, 1000))
 		ipPath, err := ParseIpPath(template)
 		if err != nil {
 			t.Fatal(err)
 		}
 		key := TransferKey{ForceStream: true, EncryptionRole: protocol.SequenceRole_SequenceRoleServer}
+		if len(production) > 0 && production[0].frozenEnvelope {
+			key.ForceStream = false
+		}
 		offer := func(index int) bool {
 			packet := MessagePoolCopy(template)
 			binary.BigEndian.PutUint32(packet[len(packet)-4:], uint32(index))
@@ -496,6 +522,7 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 		result.initialCwnd = leftAssociation.CWND()
 		result.minReceiverWindow = leftAssociation.RWND()
 		rootsBaseline.Store(int64(MessagePoolOutstandingByteCount()))
+		rootCountBaseline := MessagePoolOutstandingCount()
 		measuring.Store(true)
 		windowTrace.measuring.Store(true)
 		initialWrites, initialWireBytes := physicalStream.writes.Load(), physicalStream.wireBytes.Load()
@@ -511,7 +538,23 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 		right.measuring = true
 		right.lock.Unlock()
 		start := time.Now()
+		if len(production) > 0 && production[0].ledgerProfile != nil {
+			profile := production[0].ledgerProfile
+			left.ledgerLink = newUdpSctpLedgerLink(ctx, *profile, true, production[0].ledgerSeed, right.incoming)
+			right.ledgerLink = newUdpSctpLedgerLink(ctx, *profile, false, production[0].ledgerSeed+1, left.incoming)
+			defer func() {
+				cancel()
+				<-left.ledgerLink.done
+				<-right.ledgerLink.done
+				if production[0].closedLedgerLinks != nil {
+					production[0].closedLedgerLinks(left.ledgerLink.snapshot(), right.ledgerLink.snapshot())
+				}
+			}()
+		}
 		for index := range offerCount {
+			if want := start.Add(time.Duration(index) * interval); !time.Now().Equal(want) {
+				t.Fatalf("changed fixed offer schedule: got=%s want=%s", time.Since(start), want.Sub(start))
+			}
 			beforeFirstAck := time.Since(start) < roundTrip
 			if offer(index + 1) {
 				result.admitted++
@@ -533,19 +576,57 @@ func runProviderUdpSctpQueueExperiment(t *testing.T, roundTrip time.Duration, im
 				}
 			}
 			result.minReceiverWindow = min(result.minReceiverWindow, leftAssociation.RWND())
+			if len(production) > 0 && production[0].settledLedger != nil {
+				point := udpSctpLedgerPoint{
+					At: time.Since(start), Offered: index + 1, Admitted: result.admitted, Refused: result.refused,
+					PoolBytes:       ByteCount(MessagePoolOutstandingByteCount()) - ByteCount(rootsBaseline.Load()),
+					PoolRoots:       MessagePoolOutstandingCount() - rootCountBaseline,
+					SctpStreamBytes: leftStream.BufferedAmount(), SctpAssociationBytes: leftAssociation.BufferedAmount(),
+					Cwnd: leftAssociation.CWND(), Rwnd: leftAssociation.RWND(), Route: len(route),
+					PhysicalWrites: physicalStream.writes.Load() - initialWrites,
+				}
+				if production[0].budget != nil {
+					point.QueueBudget = production[0].budget.UsedByteCount()
+				}
+				client.sendBuffer.mutex.Lock()
+				for _, sequence := range client.sendBuffer.sendSequences {
+					if sequence.destination == peerId && sequence.packAdmission != nil {
+						sequence.packAdmission.mutex.Lock()
+						point.PackAdmission = sequence.packAdmission.count
+						sequence.packAdmission.mutex.Unlock()
+						point.PackChannel = len(sequence.packs)
+					}
+				}
+				client.sendBuffer.mutex.Unlock()
+				production[0].settledLedger(point)
+			}
 			time.Sleep(interval)
 		}
 		synctest.Wait()
-		for deadline := time.Now().Add(10 * time.Second); receivedPacketCount() != 1+result.admitted && time.Now().Before(deadline); {
+		terminal := func() bool {
+			if receivedPacketCount() != 1+result.admitted {
+				return false
+			}
+			if len(production) > 0 && production[0].ledgerProfile != nil {
+				return leftStream.BufferedAmount() == 0 && leftAssociation.BufferedAmount() == 0
+			}
+			return true
+		}
+		for deadline := time.Now().Add(10 * time.Second); !terminal() && time.Now().Before(deadline); {
 			time.Sleep(10 * time.Millisecond)
 			synctest.Wait()
 		}
 		synctest.Wait()
+		if !terminal() {
+			t.Fatal("SCTP delivery/owner drain exceeded unchanged 10s deadline")
+		}
+		result.finalSctpStreamBytes = leftStream.BufferedAmount()
+		result.finalSctpAssociationBytes = leftAssociation.BufferedAmount()
 		result.drain = time.Since(start)
 		receivedLock.Lock()
-		receivedSnapshot := received
+		receivedSnapshot := slices.Clone(received)
 		receivedLock.Unlock()
-		if source != receivedSnapshot {
+		if !slices.Equal(source, receivedSnapshot) {
 			t.Fatalf("SCTP lost/corrupted admitted datagrams: admitted=%d received=%d", result.admitted, receivedPacketCount()-1)
 		}
 		if client.ctx.Err() != nil {
