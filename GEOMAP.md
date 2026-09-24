@@ -2127,15 +2127,19 @@ share the recurring task:
   One failed check makes the provider dark for up to three hours, including
   after it reconnects.
 
-### 11.2 Why half the fleet reads dark (measured on main, 2026-09-23)
+### 11.2 Historical dark-cohort observation (main, 2026-09-23)
 
 45 689 of the 93 945 providers checked in three hours were recorded dark,
 every one of them "all destinations failed" over a tunnel that had opened.
-The verdicts are false for most of them:
+These observations motivated the cold-start and retry changes. They do not
+join each failed check to its exact provider connection, route, and deployed
+artifact, so they do not prove most individual verdicts false or establish
+the same cause for a later dark cohort:
 
-- 98 % of the dark providers (39 523 of 40 138) carried real traffic on the
-  very connection that was checked — throughput samples exist for it — and
-  every connected provider's connection was under six hours old, after a
+-  98 % of the selected dark cohort (39 523 of 40 138) also had throughput
+  samples for an observed connection in the inspected window; those samples
+  are not joined to the failed probe attempt. Every connected provider's
+  observed connection was under six hours old, after a
   platform restart between 21:00 and 24:00 UTC.
 - The rate is uniform across all four edge hosts and every block, so the
   platform side is not the variable. It rises with distance — Vietnam 86 %,
@@ -2147,7 +2151,7 @@ The verdicts are false for most of them:
   so three independent failures should be near zero, not half the fleet.
   Real clients reported no provider dark in 24 hours.
 
-The mechanism is in the check, not the exits: the tunnel's open returns
+One plausible mechanism is in the check: the tunnel's open returns
 before any path to the provider exists, so the 15 s budget of the first and
 only attempt must cover the provider window, the contract, the in-tunnel DNS
 resolution and the TLS handshake, under 208 concurrent tunnels per prober
@@ -2155,8 +2159,9 @@ host — and the day's changes (per-tunnel transport and DNS state in the
 prober, per-instance carrier limits and the H1+ default in connect) all
 lengthen that cold start. A provider whose connection was mid-restart when
 its check ran fails every attempt by construction. One attempt, no retry,
-and a verdict that outlives the connection turn a slow cold start into
-three hours of exclusion for half the fleet.
+and a verdict that outlives a connection could turn a slow cold start into
+a long-lived exclusion. Confirm an incident with attempt-level evidence,
+deployment ancestry, and a matching causal test before assigning this cause.
 
 ### 11.3 The rules (D24)
 
@@ -2348,21 +2353,123 @@ code, and a task keeps it representative:
   and the candidate list must answer. And quality is bounded by coverage: a provider nobody has
   probed within seven days is unprobed, whatever it would score.
 
-### 11.5 Order and tests
+### 11.5 Country-specific site sample
+
+The 26 scored `site` loads in a full quality run are split evenly: 13
+uniformly sampled from the general active site pool and 13 uniformly sampled
+from the active list for the provider's **published** ISO 3166-1 alpha-2
+country. DNS, connectivity, and CDN sample sizes do not change. The `/ip`
+echo still independently checks the observed country; a mismatch does not
+authorize silently switching to another country's list after the sample was
+chosen. General and country lists have disjoint destination names and hostnames,
+and a destination excluded for the provider's country or region is not eligible
+in either half. Sampling uses one per-run random source, without replacement
+within each half. A site in the country half is scored by the same load,
+retry, canary, probation, and healthy-exit rules as a general site; list
+membership does not make an inaccessible site a provider fault by itself.
+The global and each country pool target 100 distinct, verified, active site
+URLs, so both halves sample from comparable populations. The tunnel's
+allowed-host set must include the selected global and country destinations
+plus the `/ip` echo before the loads start; an omitted country host is a
+prober configuration failure, not a provider failure.
+
+`config/all/egress-sites.yml` carries a versioned country-list manifest,
+separate from the ordinary refresh candidates. Each country record has its
+country code, source identity and source period, curation and verification
+timestamps, and a target of 100 distinct eligible site contracts. The source must support
+the claimed *country-specific popularity*; a global top-site list, a regional
+proxy, or a list inferred from a country's ccTLD is not evidence of that.
+Curators exclude shared-pool hostnames, duplicate registrable domains,
+malware/adult/piracy destinations, captive-portal or login-only pages, and
+sites whose bounded GET contract fails independently from a normal host.
+They retain source provenance and note any excluded ranking entries rather
+than filling a short list with invented sites. An automated import may
+propose candidates, but cannot declare them verified or score-bearing. The
+ordinary refresh may retire or replace country sites only with verified
+candidates for that *same* country and restore the 100-site target. A
+country with fewer than 100 verified websites remains explicitly underfilled;
+it is never padded with infrastructure domains or invented URLs.
+
+The initial source survey (2026-09-24) found 249 country/territory codes in
+the checked-in GeoLite2 export and 238 directories in the public country
+CrUX cache, covering 237 of those codes. The missing codes are `aq`, `bv`,
+`cc`, `gs`, `hm`, `nu`, `pn`, `tf`, `tk`, `um`, `va`, and `wf`. This is a research
+gap, not permission to use a neighboring country's ranking. Google's CrUX
+popularity field is a coarse rank *bucket*, not an exact ordinal order, and
+CrUX excludes destinations with insufficient eligible Chrome traffic.
+The [CrUX dataset](https://developer.chrome.com/docs/crux/bigquery),
+[ranking definition](https://developer.chrome.com/docs/crux/methodology/metrics),
+and [public country cache](https://github.com/InternetHealthReport/crux-top-lists-country)
+are candidate evidence, not load verification. Cloudflare Radar publishes
+ordered per-country top-100 lists through an authenticated
+[API](https://developers.cloudflare.com/radar/investigate/domain-ranking-datasets/);
+the dedicated local `vault/cf-radar.yml` token was confirmed to authenticate a
+read-only country top-list request on 2026-09-24. Radar ranks **DNS domains**,
+not verified browser-loadable websites: its top results include CDN,
+telemetry, and update infrastructure. The curated list must therefore
+cross-check a candidate against country CrUX website origins and perform an
+independent bounded page-load verification. Even a high Radar rank is not a
+safety or load-success guarantee. Never copy the token, an Authorization
+header, or raw API responses into the repository or alert ledger.
+Build each 100-site list from verified Radar top-100 websites first, then
+verified origins in that country's current CrUX top bucket as needed to fill
+the target. Preserve each entry's source and rank or rank bucket; a CrUX
+bucket must never be presented as an exact ordinal rank. Where both sources
+lack 100 safe, loadable, country-observed sites, report the shortage and
+leave the country underfilled. A country absent from CrUX may still be
+curated from Radar only if 100 websites pass the same checks.
+The first dedicated-token Radar sweep returned a valid response for all 249
+GeoLite2 codes: 227 lists had 100 entries, Montserrat (`ms`) had 106, and 21
+had no ranked domains. Eleven of the empty Radar countries also lack a CrUX
+country list (`aq`, `bv`, `cc`, `gs`, `hm`, `nu`, `pn`, `tf`, `tk`, `um`, `va`),
+so they are explicitly source-unavailable until a defensible source exists.
+`wf` has Radar data despite no CrUX directory. These are source-coverage
+counts, not counts of verified website URLs or score-bearing pools.
+
+The GeoLite2 export defines the coverage universe. The pool publisher joins
+its country codes with the manifest and reports each country as `ready`,
+`underfilled`, `stale`, or `unavailable` with a reason. `ready` requires 100
+current, independently verified websites, at least 100 compatible active
+sites in that country and a comparable 100-site global pool, a
+recent source period, and a successful publisher refresh. If a country is
+not ready, a full run does **not** backfill its 13 country slots with general
+sites, report a 26-site score, or mark the provider dark because the list is
+missing. It records a distinct country-coverage gap, leaves the provider's
+previous quality evidence to age normally, and continues blackhole checks
+and any independently useful unscored general loads. This is a monitoring and
+curation failure, not a negative verdict about the provider. Existing
+general-only pools retain their old 26-site behavior until this feature is
+explicitly enabled and the country manifest is served. A 249-country
+manifest with approximately 25,000 entries must use a bounded per-country
+fetch or equivalently bounded authenticated delivery; never expand the
+existing 4 MiB response cap by accident. A mixed old/new
+rollout must not silently change score denominators.
+
+`server/monitor/SIGNALS.md` §2.19d watches the manifest source age, verification
+age, counts and overlap, active compatible capacity by country, publisher
+generation and fetch errors, country-half sample counts, and the share of
+full runs skipped for missing coverage. An empty or unreadable source is
+`unobservable`, never a healthy zero. Tests use synthetic countries and
+reserved example domains: exact 13/13 sampling, disjointness, exclusions,
+source staleness, missing/partial lists, old-pool compatibility, and a
+provider that passes general sites but cannot obtain country coverage.
+
+### 11.6 Order and tests
 
 Ship the check rules (spaced retries, browser-shaped requests, consecutive
-failures, connection binding, guard, concurrency) first and alone: they are
+provider-wide failures, guard, concurrency) first and alone: they are
 what turns half the fleet back on. Then the site-only full run with `/ip`
 geolocation and the pool as data with its refresh task and §2.19b, then the
 column drops with §10's.
 
 Tests, pure: a load that fails twice and passes once is a pass; a provider
 that fails two checks and passes one is not dark; three failures under the
-minimum span are not dark; a reconnect clears a count of two; the guard
+minimum span are not dark; a reconnect does not clear a provider-wide count
+but a passing check does; the guard
 discards a 30 % batch and keeps a 10 % one; the `/ip` answer maps to a
 probed location with the right confidence. Database: the check rows carry
-the count and the connection; the current-dark set honours the threshold,
-the span, the max age and the connection; the health counts store
+the provider-wide count; the current-dark set honours the threshold,
+the span, the max age and a passing-row override; the health counts store
 after-retry outcomes; the index and the 90 % rule read them. Integration,
 against the local stack with a fake provider: the warm-up precedes the first
 scored load.
