@@ -160,14 +160,18 @@ func dnsSkipName(payload []byte, offset int) (int, bool) {
 // probeSampleWidth is how many health hosts a pass asks about: the
 // ProbeSampleHostCount setting when positive, else the ENTIRE table. Every
 // sampled hostname is resolved -- a pass owes a dial question to each host it
-// sampled, and the resolution stage is one small udp datagram per name, all in
-// flight together, so width costs bytes, never wall time.
+// sampled. The resolution stage sends one small UDP datagram per name through
+// one shared resolver flow instead of one idle socket per name.
 func probeSampleWidth(reliabilitySettings *ReliabilitySettings) int {
 	if reliabilitySettings != nil && 0 < reliabilitySettings.ProbeSampleHostCount {
 		return reliabilitySettings.ProbeSampleHostCount
 	}
 	return len(probeHostNames)
 }
+
+// Preserve the original per-resolver port ceiling as an explicit question
+// bound. It is well below the 16-bit DNS id space, including a wrapping base.
+const probeResolverMaxQuestions = probeSourcePortMax - probeSourcePortMin + 1
 
 // probeResolveNames resolves names by asking resolverIp over udp/53 THROUGH
 // the probed channel, one address query per name (A over a v4 resolver,
@@ -209,28 +213,41 @@ func (self *RemoteUserNatMultiClient) probeResolveNames(
 		name  string
 		probe *probeFlow
 	}
-	resolutions := []resolution{}
-	for _, name := range names {
-		target := probeResolverTarget(resolverIp, name)
-		// the answer payload is what this stage exists for; see probeFlow
-		target.CaptureAnswer = true
-		probe, ok := self.registerProbeFlow(client, target)
+	// One resolver socket per pass, not per name. Even answered UDP questions
+	// otherwise retain a provider NAT owner until its 60s idle reap, long after
+	// this 4s stage: 124 names used almost 4 MiB before ordinary traffic. DNS
+	// transaction ids already provide the necessary reply demultiplexing.
+	// Preserve the old reserved-port ceiling for unusually large callers.
+	names = names[:min(len(names), probeResolverMaxQuestions)]
+	anchor, ok := self.registerProbeFlow(client, probeResolverTarget(resolverIp, names[0]), names...)
+	if !ok {
+		return
+	}
+	defer self.unregisterProbeFlows([]*probeFlow{anchor})
+	resolutions := make([]resolution, 0, len(names))
+	for i, name := range names {
+		id := uint16(anchor.synSequence) + uint16(i)
+		resolutions = append(resolutions, resolution{name: name, probe: anchor.dnsQueries[id]})
+	}
+
+	sent := resolutions[:0]
+	for _, r := range resolutions {
+		probe := r.probe
+		packet, ok := probePacket(probe.ipPath, probe.target, probe.synSequence)
 		if !ok {
-			continue
-		}
-		packet, ok := probePacket(probe.ipPath, target, probe.synSequence)
-		if !ok {
-			self.unregisterProbeFlows([]*probeFlow{probe})
+			probe.complete(false)
 			continue
 		}
 		if !client.sendProbe(&parsedPacket{packet: packet, ipPath: probe.ipPath}, probeSendTimeout) {
 			// the question was never asked; not counted, not held against anyone
-			self.unregisterProbeFlows([]*probeFlow{probe})
+			MessagePoolReturn(packet)
+			probe.complete(false)
 			continue
 		}
 		self.reliabilityMetrics.probeSent()
-		resolutions = append(resolutions, resolution{name: name, probe: probe})
+		sent = append(sent, r)
 	}
+	resolutions = sent
 	if len(resolutions) == 0 {
 		return
 	}
@@ -259,9 +276,7 @@ waiting:
 		}
 	}
 
-	probes := []*probeFlow{}
 	for _, r := range resolutions {
-		probes = append(probes, r.probe)
 		if !r.probe.answered.Load() {
 			continue
 		}
@@ -276,7 +291,6 @@ waiting:
 			resolved[r.name] = ips
 		}
 	}
-	self.unregisterProbeFlows(probes)
 	return
 }
 

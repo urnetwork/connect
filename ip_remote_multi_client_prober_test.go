@@ -134,14 +134,23 @@ func probeFlowsOfProtocol(parent *RemoteUserNatMultiClient, protocol IpProtocol)
 	parent.stateLock.Lock()
 	defer parent.stateLock.Unlock()
 	probes := []*probeFlow{}
+	appendProbe := func(probe *probeFlow) {
+		if probe.dnsQueries == nil {
+			probes = append(probes, probe)
+		} else {
+			for _, question := range probe.dnsQueries {
+				probes = append(probes, question)
+			}
+		}
+	}
 	for _, update := range parent.ip4PathUpdates {
 		if update.isProbe() && update.probe.ipPath.Protocol == protocol {
-			probes = append(probes, update.probe)
+			appendProbe(update.probe)
 		}
 	}
 	for _, update := range parent.ip6PathUpdates {
 		if update.isProbe() && update.probe.ipPath.Protocol == protocol {
-			probes = append(probes, update.probe)
+			appendProbe(update.probe)
 		}
 	}
 	return probes
