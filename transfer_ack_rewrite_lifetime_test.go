@@ -50,7 +50,7 @@ func (self ackRewriteBarrierVerbose) Infof(format string, args ...any) {
 
 // Both ends run the real wire decoder, Transfer workers and cumulative ACK
 // path. Only the physical H1 legs are replaced with bounded reliable routes.
-func newAckRetirementFixture(t *testing.T, carrier TransportType, version int, logger Logger) (*windowRoundFixture, *sendGatewayTransport, *sendGatewayTransport) {
+func newAckRetirementFixture(t *testing.T, carrier TransportType, version int, logger Logger, configure ...func(*ClientSettings)) (*windowRoundFixture, *sendGatewayTransport, *sendGatewayTransport) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	newSettings := func() *ClientSettings {
@@ -66,6 +66,9 @@ func newAckRetirementFixture(t *testing.T, carrier TransportType, version int, l
 		settings.ReceiveBufferSettings.ApplyWindowSizing()
 		settings.ReceiveBufferSettings.AckCompressTimeout = 0
 		settings.ReceiveBufferSettings.ProtocolVersion = version
+		for _, apply := range configure {
+			apply(settings)
+		}
 		return settings
 	}
 	fixture := &windowRoundFixture{
