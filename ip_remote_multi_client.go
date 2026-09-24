@@ -1306,8 +1306,10 @@ type PerformanceProfile struct {
 	WindowSize  WindowSizeSettings
 	AllowDirect bool
 	// enable the per-peer e2e encryption sessions (post-quantum key
-	// exchange) on the window clients. Opportunistic: a provider that does
-	// not support the sessions falls back to plaintext at this layer.
+	// exchange) on the window clients. Required when set: a provider that
+	// cannot seal the session is skipped, never used in plaintext at this
+	// layer. Unset, the shipping default, the window clients keep
+	// DefaultEncryptionSettings and open no session at all.
 	PostQuantumEncryption bool
 }
 
