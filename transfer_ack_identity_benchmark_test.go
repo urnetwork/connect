@@ -1,6 +1,8 @@
 package connect
 
 import (
+	"fmt"
+	"runtime"
 	"testing"
 	"unsafe"
 )
@@ -23,4 +25,24 @@ func BenchmarkRetainedAckHeadCoalescing(b *testing.B) {
 	}
 	b.ReportMetric(float64(unsafe.Sizeof(SendSequence{})), "sequence-B")
 	b.ReportMetric(float64(unsafe.Sizeof(sendItem{})), "item-B")
+}
+
+// Allocate only the sequence envelope, with all owners kept live together.
+// This separates allocator size-class cost from unchanged routes, queues and
+// retained messages; it is not a complete-client memory qualification.
+func BenchmarkRetainedAckSequenceFanout(b *testing.B) {
+	for _, count := range []int{1, 64, 1024} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			owners := make([]*SendSequence, count)
+			b.ReportAllocs()
+			for b.Loop() {
+				for i := range owners {
+					owners[i] = &SendSequence{}
+				}
+			}
+			runtime.KeepAlive(owners)
+			b.ReportMetric(float64(unsafe.Sizeof(SendSequence{}))*float64(count), "live-owner-B")
+			b.ReportMetric(float64(count), "owners/op")
+		})
+	}
 }
