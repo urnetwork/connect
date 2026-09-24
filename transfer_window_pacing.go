@@ -1433,9 +1433,9 @@ func (self *windowPacingService) measureWithLock(horizon time.Duration, now time
 	increaseSpan := int64(max(compression, interval))
 	rejectedIncreaseAt, qualifiedAt := int64(0), int64(0)
 	invalidReceiverAt := int64(0)
-	observeRate := func(bytes ByteCount, span, atNanos int64, queued, firstQueued bool) bool {
+	observeRate := func(bytes ByteCount, span, atNanos int64, intervalLimited, firstQueued bool) bool {
 		measured := byteRate(bytes, span)
-		if heldPrefixIncrease(measured, span, atNanos) || measured > hold && queued && span < increaseSpan && (hold > 0 || firstQueued) {
+		if heldPrefixIncrease(measured, span, atNanos) || measured > hold && intervalLimited && span < increaseSpan && (hold > 0 || firstQueued) {
 			// A retained prefix or carrier reader can empty a completed flight
 			// at memory speed. Preserve its delivery without letting that release
 			// cadence prove more physical service, even after flight reaches zero.
@@ -1461,12 +1461,16 @@ func (self *windowPacingService) measureWithLock(horizon time.Duration, now time
 		// Exact receiver endpoints already remove their own ACK waiting.
 		// A cold pair can discover service before the advertised timer;
 		// a train queued from its first checkpoint still needs a full turn.
+		// Compressed cumulative prefixes can have independently phased heads:
+		// removing one first checkpoint does not remove every lane's leading
+		// compressed bytes. Without exact receiver timing, require the same
+		// full sampler turn for growth even before residence proves a queue.
 		if span := newer.lastAtNanos - newer.firstAtNanos; span > 0 && (span >= minSpan || hold == 0 && newer.receiverBytes == newer.bytes) {
 			if newer.receiverBytes == newer.bytes {
 				span = newer.receiverLastAtNanos - newer.receiverFirstAtNanos
 			}
 			if span > 0 {
-				observeRate(newer.bytes-newer.firstBytes, span, newer.lastAtNanos, newer.queued, newer.firstQueued)
+				observeRate(newer.bytes-newer.firstBytes, span, newer.lastAtNanos, newer.queued || compression > 0 && newer.receiverBytes != newer.bytes, newer.firstQueued)
 			} else {
 				invalidReceiverAt = max(invalidReceiverAt, newer.lastAtNanos)
 			}
@@ -1499,7 +1503,7 @@ func (self *windowPacingService) measureWithLock(horizon time.Duration, now time
 				}
 				if span <= 0 {
 					invalidReceiverAt = max(invalidReceiverAt, newer.lastAtNanos)
-				} else if observeRate(candidateBytes, span, newer.lastAtNanos, queued || samples[j].queued, firstQueued) {
+				} else if observeRate(candidateBytes, span, newer.lastAtNanos, queued || samples[j].queued || compression > 0 && !receiverTimed, firstQueued) {
 					break
 				}
 			}

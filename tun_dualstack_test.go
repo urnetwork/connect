@@ -415,8 +415,8 @@ func TestTunDialContextLiteralsAndNetworks(t *testing.T) {
 
 // A name resolves through the tun's DoH cache to both families and the
 // stream dial races them: with one family black-holed by the bridge, the
-// other wins, and a dead v6 costs exactly the fallback delay before v4 is
-// launched.
+// other wins. Either DNS family can finish first, so the live path may
+// connect immediately or require an address fallback.
 func TestTunDialContextResolvesBothFamiliesAndRaces(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, deadVersion int) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -504,9 +504,6 @@ func TestTunDialContextResolvesBothFamiliesAndRaces(t *testing.T) {
 		}
 		if (wantVersion == 4) != remote.Addr().Unmap().Is4() {
 			t.Fatalf("connected to %s, want the live v%d listener", conn.RemoteAddr(), wantVersion)
-		}
-		if deadVersion == 6 && elapsed < DefaultDialFallbackDelay {
-			t.Fatalf("v4 won after %s, before the v6 fallback delay %s: v6 was not tried first", elapsed, DefaultDialFallbackDelay)
 		}
 		if elapsed > 5*time.Second {
 			t.Fatalf("race took %s", elapsed)

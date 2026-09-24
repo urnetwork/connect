@@ -250,15 +250,18 @@ func TestExtenderNetworkClientRebootstrapsBelowTheLowWaterMark(t *testing.T) {
 // The pass barrier is the directory's change counter: this fixture never holds
 // a failed address, so every pass dials every candidate again and records the
 // failures, and waiting for that counter proves the passes ran without timing
-// deciding it.
+// deciding it. The synchronous TXT step counts bootstrap passes; address DNS
+// may still be pending after those feed passes complete.
 func TestExtenderNetworkClientDoesNotRebootstrapAboveTheLowWaterMark(t *testing.T) {
 	clock := newTestClock()
-	var resolveCount atomic.Int64
+	var bootstrapCount atomic.Int64
 	var helloCount atomic.Int64
 	// the addresses count only once verified, which is what the txt answer
 	// does: it carries the operator-signed record that names them
 	rootPrivateKey, rootPublicKey := newTestRootKeyPair(t)
 	txt := testExtenderDnsRecordTxt(t, rootPrivateKey, clock, "192.0.2.220", "192.0.2.221", "192.0.2.222")
+	releaseDns := make(chan struct{})
+	defer close(releaseDns)
 	_, directory, _ := newTestExtenderNetworkClientWithDirectory(
 		t,
 		clock,
@@ -270,7 +273,6 @@ func TestExtenderNetworkClientDoesNotRebootstrapAboveTheLowWaterMark(t *testing.
 		func(settings *ExtenderNetworkClientSettings) {
 			settings.LowWaterCount = 2
 			settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
-				resolveCount.Add(1)
 				return []netip.Addr{
 					netip.MustParseAddr("192.0.2.220"),
 					netip.MustParseAddr("192.0.2.221"),
@@ -278,6 +280,7 @@ func TestExtenderNetworkClientDoesNotRebootstrapAboveTheLowWaterMark(t *testing.
 				}, nil
 			}
 			settings.ResolveDnsTxt = func(ctx context.Context, name string) ([]string, error) {
+				bootstrapCount.Add(1)
 				return []string{txt}, nil
 			}
 			settings.Hello = func(ctx context.Context) (*ExtenderHelloResult, error) {
@@ -286,6 +289,17 @@ func TestExtenderNetworkClientDoesNotRebootstrapAboveTheLowWaterMark(t *testing.
 					RootPublicKeyHexes: []string{ExtenderKeySeedHex(rootPublicKey)},
 				}, nil
 			}
+			// Signed TXT candidates let feed passes finish with address DNS pending.
+			// Hold the original callback until after the bootstrap count assertion.
+			resolveDns := settings.ResolveDns
+			settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
+				select {
+				case <-releaseDns:
+					return resolveDns(ctx, name)
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
 		},
 	)
 
@@ -293,7 +307,7 @@ func TestExtenderNetworkClientDoesNotRebootstrapAboveTheLowWaterMark(t *testing.
 	// one failure per candidate and carrier, so this is several whole passes
 	waitForDirectoryChanges(t, directory, 48)
 
-	if count := resolveCount.Load(); count != 1 {
+	if count := bootstrapCount.Load(); count != 1 {
 		t.Fatalf("the bootstrap ran %d times, expected once above the low-water mark", count)
 	}
 	if count := helloCount.Load(); count != 1 {

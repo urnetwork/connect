@@ -381,8 +381,9 @@ func TestClientStrategyLimitsAManualExtenderOnItsDialer(t *testing.T) {
 }
 
 // A network client over a directory the test has already filled, with no
-// probe pass and nothing resolved for real, counting its passes by the dns
-// bootstrap every pass makes below the low-water mark.
+// probe pass and nothing resolved for real, counting its passes by the
+// synchronous TXT bootstrap every pass makes below the low-water mark.
+// Address resolution may still be pending when the pass reaches its wait.
 func newTestLimitedNetworkClient(
 	t *testing.T,
 	clock *testClock,
@@ -406,12 +407,12 @@ func newTestLimitedNetworkClient(
 		return nil, nil
 	}
 	settings.ResolveDnsTxt = func(ctx context.Context, name string) ([]string, error) {
-		return nil, nil
-	}
-	settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
 		resolveLock.Lock()
 		defer resolveLock.Unlock()
 		resolveCount += 1
+		return nil, nil
+	}
+	settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
 		return nil, nil
 	}
 	for _, configure := range configures {
@@ -475,7 +476,21 @@ func TestExtenderNetworkClientWaitsWhenEveryCandidateIsLimited(t *testing.T) {
 	// fires them, so no pass follows the one that found every candidate
 	// limited
 	waits := make(chan time.Duration, 16)
+	// Keep address resolution behind the pass assertion. Existing candidates
+	// let the feed reach its wait while DNS is pending, so resolver execution
+	// cannot serve as a pass counter. Cleanup releases the held worker.
+	releaseDns := make(chan struct{})
+	defer close(releaseDns)
 	networkClient, passCount := newTestLimitedNetworkClient(t, clock, directory, func(settings *ExtenderNetworkClientSettings) {
+		resolveDns := settings.ResolveDns
+		settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
+			select {
+			case <-releaseDns:
+				return resolveDns(ctx, name)
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 		settings.PassAfter = func(wait time.Duration) <-chan time.Time {
 			waits <- wait
 			return make(chan time.Time)
