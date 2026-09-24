@@ -41,14 +41,24 @@ func (self *SendSequence) sharedRawRecoveryInterval(item *sendItem, now time.Tim
 // continuous ACK lookup/budget ownership. The send worker owns the deadline;
 // queue readers are excluded until all ordering indices agree again.
 func (self *SendSequence) setResendTime(item *sendItem, at time.Time) {
+	if !self.setResendTimeIfRetained(item, at) {
+		item.resendTime = at
+	}
+}
+
+// A promoted lane head can be absent while another recovery is in progress.
+// Repairing its heap position must not temporarily withdraw its ACK identity.
+func (self *SendSequence) setResendTimeIfRetained(item *sendItem, at time.Time) bool {
 	queue := self.resendQueue
 	queue.stateLock.Lock()
 	defer queue.stateLock.Unlock()
-	item.resendTime = at
 	if queue.messageIdItems[item.messageId] == item {
+		item.resendTime = at
 		heap.Fix(queue, item.HeapIndex())
 		heap.Fix(queue.maxHeap, item.MaxHeapIndex())
+		return true
 	}
+	return false
 }
 
 // The stored first-write timestamp is based on this client's monotonic elapsed

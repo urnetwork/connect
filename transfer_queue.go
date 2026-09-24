@@ -299,7 +299,12 @@ func (self *transferQueue[T]) QueueSizeAndSummary(summaryf func(T) any) (int, By
 func (self *transferQueue[T]) Add(item T) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.add(item)
+}
 
+// The caller owns stateLock, including when a send owner restores the ACK
+// identity of an item which was temporarily detached for a rewrite.
+func (self *transferQueue[T]) add(item T) {
 	self.messageIdItems[item.MessageId()] = item
 	self.sequenceNumberItems[item.SequenceNumber()] = item
 	heap.Push(self, item)

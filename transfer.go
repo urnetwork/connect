@@ -2874,12 +2874,10 @@ func (self *SendSequence) promoteLaneHeads(lanes uint32, at time.Time) {
 		if head == nil || !self.laneProvenRecovery(head) {
 			continue
 		}
-		if self.resendQueue.RemoveByMessageId(head.messageId) == nil {
+		if !self.setResendTimeIfRetained(head, promoteTime) {
 			continue
 		}
 		head.laneAckedAtLastFiring = slot.highestAckedSequenceNumber
-		head.resendTime = promoteTime
-		self.resendQueue.Add(head)
 		self.client.laneHeadPromotionCount.Add(1)
 	}
 }
@@ -6340,6 +6338,7 @@ type SendSequence struct {
 	ackWindow *sequenceAckWindow
 
 	resendQueue        *resendQueue
+	detachedAck        sendAckIdentity
 	ackLifetimes       sendAckLifetimes
 	sendItems          []*sendItem
 	nextSequenceNumber uint64
@@ -7264,7 +7263,7 @@ func (self *SendSequence) coalesceReceivedAck(
 	// has already released.
 	self.observeEvictions(ack)
 	self.observeContractAheadCapability(ack)
-	sequenceNumber, ok := self.resendQueue.ContainsMessageId(ack.messageId)
+	sequenceNumber, ok := self.retainedAckSequenceNumber(ack.messageId)
 	if !ok {
 		return
 	}
@@ -7409,7 +7408,7 @@ func (self *SendSequence) scheduleSelectiveAckRecovery(currentTime time.Time) bo
 		self.beforeSelectiveAckRecoveryForTest()
 	}
 	reschedule := func(item *sendItem, resendTime time.Time, recoveryKind sendRecoveryKind) {
-		removed := self.resendQueue.RemoveByMessageId(item.messageId)
+		removed := self.detachResendItem(item.messageId)
 		if removed != item {
 			panic(errors.New("Missing selective recovery item"))
 		}
@@ -7618,7 +7617,7 @@ func (self *SendSequence) scheduleRetiredReliableCarrierRecovery(
 			continue
 		}
 
-		removed := self.resendQueue.RemoveByMessageId(item.messageId)
+		removed := self.detachResendItem(item.messageId)
 		if removed != item {
 			panic(errors.New("Missing retired-carrier recovery item"))
 		}
@@ -8483,7 +8482,7 @@ sendSequenceLoop:
 					}
 				}
 				self.preferH3AfterH1Timeout(item)
-				self.resendQueue.RemoveByMessageId(item.messageId)
+				self.detachResendItem(item.messageId)
 
 				// A selective recovery is receiver-paced evidence rather than an
 				// RTO. Consume its marker before the write and do not increase the
@@ -8686,7 +8685,7 @@ sendSequenceLoop:
 				if errors.Is(resendErr, errWindowPacingAcknowledged) {
 					continue sendSequenceLoop
 				}
-				self.resendQueue.RemoveByMessageId(item.messageId)
+				self.detachResendItem(item.messageId)
 				if resendErr == nil {
 					if !item.transportWriteObserved {
 						item.transportWriteObserved = true
@@ -10379,7 +10378,7 @@ func (self *SendSequence) receiveContractMissing(
 		*item.contractId != missingContractId || item.hasContractFrame {
 		return false
 	}
-	removed := self.resendQueue.RemoveByMessageId(messageId)
+	removed := self.detachResendItem(messageId)
 	if removed != item {
 		panic(errors.New("Missing item"))
 	}
@@ -10833,7 +10832,7 @@ func (self *SendSequence) resendEvicted(evictedSequenceNumbers []uint64) {
 			// already released, already resent, or never ours
 			continue
 		}
-		removed := self.resendQueue.RemoveBySequenceNumber(sequenceNumber)
+		removed := self.detachResendItem(item.messageId)
 		if removed != item {
 			panic(errors.New("Missing evicted item"))
 		}
@@ -11662,7 +11661,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[s]ack selective %s->%s...%s s(%s)\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
 		}
-		removed := self.resendQueue.RemoveByMessageId(messageId)
+		removed := self.detachResendItem(messageId)
 		if removed == nil {
 			panic(errors.New("Missing item"))
 		}
@@ -11815,6 +11814,9 @@ func (self *SendSequence) ackItem(item *sendItem) {
 }
 
 func (self *SendSequence) releaseRetainedSendItems(err error) {
+	self.resendQueue.stateLock.Lock()
+	self.detachedAck = sendAckIdentity{}
+	self.resendQueue.stateLock.Unlock()
 	// A retry can exit while its item is temporarily outside the heap. The
 	// acknowledgement identity list is the authoritative lifetime owner set.
 	for _, item := range self.sendItems {
@@ -11871,7 +11873,12 @@ func (self *SendSequence) addResendItem(item *sendItem) {
 	if !item.expectsAck && self.client != nil {
 		self.client.resendQueueUnackedItemCount.Add(1)
 	}
-	self.resendQueue.Add(item)
+	self.resendQueue.stateLock.Lock()
+	self.resendQueue.add(item)
+	if self.detachedAck.active && self.detachedAck.messageId == item.messageId {
+		self.detachedAck = sendAckIdentity{}
+	}
+	self.resendQueue.stateLock.Unlock()
 	self.ackLifetimes.update(item)
 }
 
