@@ -53,6 +53,16 @@ type ExtenderHeader struct {
 	// that only ranks by latency leaves it empty and identifies itself to the
 	// extender no more than a forward does.
 	ProbeClientId []byte `protobuf:"bytes,9,opt,name=ProbeClientId,proto3" json:"ProbeClientId,omitempty"`
+	// Probe only. The 32 byte identity key of an EXTENDER that will attest
+	// its measured rtt to a peer (GEOMAP §2.2), which asks for a ProbeNonce
+	// exactly as ProbeClientId does. At most one of the two is set; a header
+	// with both is refused.
+	ProbeExtenderPublicKey []byte `protobuf:"bytes,10,opt,name=ProbeExtenderPublicKey,proto3" json:"ProbeExtenderPublicKey,omitempty"`
+	// How many extenders this request has already crossed: 0 from a client,
+	// and one more on every header an NLayer extender sends to its next layer
+	// (EXTENDER.md A11). An extender refuses a request that would make it
+	// deeper than its bound, which is what ends a chain that loops.
+	HopCount      uint32 `protobuf:"varint,11,opt,name=HopCount,proto3" json:"HopCount,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -150,6 +160,20 @@ func (x *ExtenderHeader) GetProbeClientId() []byte {
 	return nil
 }
 
+func (x *ExtenderHeader) GetProbeExtenderPublicKey() []byte {
+	if x != nil {
+		return x.ProbeExtenderPublicKey
+	}
+	return nil
+}
+
+func (x *ExtenderHeader) GetHopCount() uint32 {
+	if x != nil {
+		return x.HopCount
+	}
+	return 0
+}
+
 type ExtenderResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// the extender identity key, empty when the extender has none
@@ -158,12 +182,21 @@ type ExtenderResponse struct {
 	ChallengeSignature []byte `protobuf:"bytes,2,opt,name=ChallengeSignature,proto3" json:"ChallengeSignature,omitempty"`
 	// tcp, quic, dns
 	Carriers []string `protobuf:"bytes,3,rep,name=Carriers,proto3" json:"Carriers,omitempty"`
-	// Probe only, when ProbeClientId was set: a short lived nonce the
-	// attestation must echo. Derived, not stored, so the extender keeps no
-	// per probe state.
-	ProbeNonce    []byte `protobuf:"bytes,4,opt,name=ProbeNonce,proto3" json:"ProbeNonce,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Probe only, when ProbeClientId or ProbeExtenderPublicKey was set: a
+	// short lived nonce the attestation must echo. Fresh random bytes held
+	// for the life of the stream, so the extender keeps no per probe state.
+	ProbeNonce []byte `protobuf:"bytes,4,opt,name=ProbeNonce,proto3" json:"ProbeNonce,omitempty"`
+	// Probe only. The HopCount of the header the extender that answered the
+	// probe itself received: 0 for a direct probe, the depth of the chain's
+	// end for a probe an NLayer extender relayed (GEOMAP §2.9). Set by the
+	// end and copied back by every relay.
+	HopCount uint32 `protobuf:"varint,5,opt,name=HopCount,proto3" json:"HopCount,omitempty"`
+	// Probe only. The identity key of the end of the chain a relayed probe
+	// was answered by, which is the key the attestation names and the
+	// verdict is co-signed under; empty for a direct probe (GEOMAP §2.9).
+	ChainEndPublicKey []byte `protobuf:"bytes,6,opt,name=ChainEndPublicKey,proto3" json:"ChainEndPublicKey,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *ExtenderResponse) Reset() {
@@ -224,25 +257,45 @@ func (x *ExtenderResponse) GetProbeNonce() []byte {
 	return nil
 }
 
-// Sent by an attesting provider as one length prefixed frame after the
-// ExtenderResponse, on the same stream. The rtt is the PROVIDER's own
-// measurement under the provider's signature: the extender compares it with
-// the interval it observed and either forwards or refuses the frame, but it
-// cannot change the number.
+func (x *ExtenderResponse) GetHopCount() uint32 {
+	if x != nil {
+		return x.HopCount
+	}
+	return 0
+}
+
+func (x *ExtenderResponse) GetChainEndPublicKey() []byte {
+	if x != nil {
+		return x.ChainEndPublicKey
+	}
+	return nil
+}
+
+// Sent by an attesting pinger -- a provider or an extender -- as one length
+// prefixed frame after the ExtenderResponse, on the same stream. The rtt is
+// the PINGER's own measurement under the pinger's signature: the target
+// compares it with the interval it observed and accepts or refuses it in an
+// ExtenderProbeVerdict, but it cannot change the number. Exactly one of
+// ProbeClientId and PingerExtenderPublicKey is set.
 type ExtenderProbeAttestation struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ProbeClientId []byte                 `protobuf:"bytes,1,opt,name=ProbeClientId,proto3" json:"ProbeClientId,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// the provider's client id, empty for an extender pinger
+	ProbeClientId []byte `protobuf:"bytes,1,opt,name=ProbeClientId,proto3" json:"ProbeClientId,omitempty"`
 	// binds the claim to the extender it was measured against
 	ExtenderPublicKey []byte `protobuf:"bytes,2,opt,name=ExtenderPublicKey,proto3" json:"ExtenderPublicKey,omitempty"`
 	// echoed from the response
 	ProbeNonce  []byte `protobuf:"bytes,3,opt,name=ProbeNonce,proto3" json:"ProbeNonce,omitempty"`
 	RttMs       uint32 `protobuf:"varint,4,opt,name=RttMs,proto3" json:"RttMs,omitempty"`
 	TimestampMs uint64 `protobuf:"varint,5,opt,name=TimestampMs,proto3" json:"TimestampMs,omitempty"`
-	// ed25519 by the provider client key over
-	// "ur-extender-probe-v1" || serialized attestation with Signature empty
-	Signature     []byte `protobuf:"bytes,6,opt,name=Signature,proto3" json:"Signature,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// ed25519 over fixed width signing bytes: by the provider client key
+	// under "ur-extender-probe-v1" with the client id, or by the pinging
+	// extender's identity key under "ur-extender-peer-probe-v1" with its key
+	// in the client id's place (GEOMAP §2.2)
+	Signature []byte `protobuf:"bytes,6,opt,name=Signature,proto3" json:"Signature,omitempty"`
+	// the pinging extender's identity key, empty for a provider pinger
+	PingerExtenderPublicKey []byte `protobuf:"bytes,7,opt,name=PingerExtenderPublicKey,proto3" json:"PingerExtenderPublicKey,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *ExtenderProbeAttestation) Reset() {
@@ -317,6 +370,82 @@ func (x *ExtenderProbeAttestation) GetSignature() []byte {
 	return nil
 }
 
+func (x *ExtenderProbeAttestation) GetPingerExtenderPublicKey() []byte {
+	if x != nil {
+		return x.PingerExtenderPublicKey
+	}
+	return nil
+}
+
+// The target's answer to an attestation, one length prefixed frame on the
+// same stream, written whether it accepts or refuses (GEOMAP §2.3). A pinger
+// that reads none -- an old target, a close, a timeout -- records the ping as
+// unknown.
+type ExtenderProbeVerdict struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Accepted bool                   `protobuf:"varint,1,opt,name=Accepted,proto3" json:"Accepted,omitempty"`
+	// 0 ok; 1 rtt below observed; 2 nonce; 3 wrong extender; 4 unknown
+	// pinger; 5 bad signature; 6 rate limited
+	Reason uint32 `protobuf:"varint,2,opt,name=Reason,proto3" json:"Reason,omitempty"`
+	// Accepted only. ed25519 by the TARGET's identity key over
+	// "ur-extender-probe-cosign-v1" || the attestation's signing bytes
+	// (domain included) || the pinger's signature
+	Cosignature   []byte `protobuf:"bytes,3,opt,name=Cosignature,proto3" json:"Cosignature,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExtenderProbeVerdict) Reset() {
+	*x = ExtenderProbeVerdict{}
+	mi := &file_extender_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExtenderProbeVerdict) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExtenderProbeVerdict) ProtoMessage() {}
+
+func (x *ExtenderProbeVerdict) ProtoReflect() protoreflect.Message {
+	mi := &file_extender_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExtenderProbeVerdict.ProtoReflect.Descriptor instead.
+func (*ExtenderProbeVerdict) Descriptor() ([]byte, []int) {
+	return file_extender_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *ExtenderProbeVerdict) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
+func (x *ExtenderProbeVerdict) GetReason() uint32 {
+	if x != nil {
+		return x.Reason
+	}
+	return 0
+}
+
+func (x *ExtenderProbeVerdict) GetCosignature() []byte {
+	if x != nil {
+		return x.Cosignature
+	}
+	return nil
+}
+
 type ExtenderAddress struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Ip            string                 `protobuf:"bytes,1,opt,name=Ip,proto3" json:"Ip,omitempty"`
@@ -328,7 +457,7 @@ type ExtenderAddress struct {
 
 func (x *ExtenderAddress) Reset() {
 	*x = ExtenderAddress{}
-	mi := &file_extender_proto_msgTypes[3]
+	mi := &file_extender_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -340,7 +469,7 @@ func (x *ExtenderAddress) String() string {
 func (*ExtenderAddress) ProtoMessage() {}
 
 func (x *ExtenderAddress) ProtoReflect() protoreflect.Message {
-	mi := &file_extender_proto_msgTypes[3]
+	mi := &file_extender_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -353,7 +482,7 @@ func (x *ExtenderAddress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtenderAddress.ProtoReflect.Descriptor instead.
 func (*ExtenderAddress) Descriptor() ([]byte, []int) {
-	return file_extender_proto_rawDescGZIP(), []int{3}
+	return file_extender_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ExtenderAddress) GetIp() string {
@@ -403,7 +532,7 @@ type ExtenderRecordBody struct {
 
 func (x *ExtenderRecordBody) Reset() {
 	*x = ExtenderRecordBody{}
-	mi := &file_extender_proto_msgTypes[4]
+	mi := &file_extender_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -415,7 +544,7 @@ func (x *ExtenderRecordBody) String() string {
 func (*ExtenderRecordBody) ProtoMessage() {}
 
 func (x *ExtenderRecordBody) ProtoReflect() protoreflect.Message {
-	mi := &file_extender_proto_msgTypes[4]
+	mi := &file_extender_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -428,7 +557,7 @@ func (x *ExtenderRecordBody) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtenderRecordBody.ProtoReflect.Descriptor instead.
 func (*ExtenderRecordBody) Descriptor() ([]byte, []int) {
-	return file_extender_proto_rawDescGZIP(), []int{4}
+	return file_extender_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ExtenderRecordBody) GetPublicKey() []byte {
@@ -529,7 +658,7 @@ type ExtenderRecord struct {
 
 func (x *ExtenderRecord) Reset() {
 	*x = ExtenderRecord{}
-	mi := &file_extender_proto_msgTypes[5]
+	mi := &file_extender_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -541,7 +670,7 @@ func (x *ExtenderRecord) String() string {
 func (*ExtenderRecord) ProtoMessage() {}
 
 func (x *ExtenderRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_extender_proto_msgTypes[5]
+	mi := &file_extender_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -554,7 +683,7 @@ func (x *ExtenderRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtenderRecord.ProtoReflect.Descriptor instead.
 func (*ExtenderRecord) Descriptor() ([]byte, []int) {
-	return file_extender_proto_rawDescGZIP(), []int{5}
+	return file_extender_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ExtenderRecord) GetBody() []byte {
@@ -589,7 +718,7 @@ type ExtenderRevocationBody struct {
 
 func (x *ExtenderRevocationBody) Reset() {
 	*x = ExtenderRevocationBody{}
-	mi := &file_extender_proto_msgTypes[6]
+	mi := &file_extender_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -601,7 +730,7 @@ func (x *ExtenderRevocationBody) String() string {
 func (*ExtenderRevocationBody) ProtoMessage() {}
 
 func (x *ExtenderRevocationBody) ProtoReflect() protoreflect.Message {
-	mi := &file_extender_proto_msgTypes[6]
+	mi := &file_extender_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -614,7 +743,7 @@ func (x *ExtenderRevocationBody) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtenderRevocationBody.ProtoReflect.Descriptor instead.
 func (*ExtenderRevocationBody) Descriptor() ([]byte, []int) {
-	return file_extender_proto_rawDescGZIP(), []int{6}
+	return file_extender_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ExtenderRevocationBody) GetPublicKey() []byte {
@@ -651,7 +780,7 @@ type ExtenderRevocation struct {
 
 func (x *ExtenderRevocation) Reset() {
 	*x = ExtenderRevocation{}
-	mi := &file_extender_proto_msgTypes[7]
+	mi := &file_extender_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -663,7 +792,7 @@ func (x *ExtenderRevocation) String() string {
 func (*ExtenderRevocation) ProtoMessage() {}
 
 func (x *ExtenderRevocation) ProtoReflect() protoreflect.Message {
-	mi := &file_extender_proto_msgTypes[7]
+	mi := &file_extender_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -676,7 +805,7 @@ func (x *ExtenderRevocation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtenderRevocation.ProtoReflect.Descriptor instead.
 func (*ExtenderRevocation) Descriptor() ([]byte, []int) {
-	return file_extender_proto_rawDescGZIP(), []int{7}
+	return file_extender_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ExtenderRevocation) GetBody() []byte {
@@ -713,7 +842,7 @@ type ExtenderGossipMessage struct {
 
 func (x *ExtenderGossipMessage) Reset() {
 	*x = ExtenderGossipMessage{}
-	mi := &file_extender_proto_msgTypes[8]
+	mi := &file_extender_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -725,7 +854,7 @@ func (x *ExtenderGossipMessage) String() string {
 func (*ExtenderGossipMessage) ProtoMessage() {}
 
 func (x *ExtenderGossipMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_extender_proto_msgTypes[8]
+	mi := &file_extender_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -738,7 +867,7 @@ func (x *ExtenderGossipMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtenderGossipMessage.ProtoReflect.Descriptor instead.
 func (*ExtenderGossipMessage) Descriptor() ([]byte, []int) {
-	return file_extender_proto_rawDescGZIP(), []int{8}
+	return file_extender_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ExtenderGossipMessage) GetMessage() isExtenderGossipMessage_Message {
@@ -792,7 +921,7 @@ type ExtenderFeedRequest struct {
 
 func (x *ExtenderFeedRequest) Reset() {
 	*x = ExtenderFeedRequest{}
-	mi := &file_extender_proto_msgTypes[9]
+	mi := &file_extender_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -804,7 +933,7 @@ func (x *ExtenderFeedRequest) String() string {
 func (*ExtenderFeedRequest) ProtoMessage() {}
 
 func (x *ExtenderFeedRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_extender_proto_msgTypes[9]
+	mi := &file_extender_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -817,7 +946,7 @@ func (x *ExtenderFeedRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtenderFeedRequest.ProtoReflect.Descriptor instead.
 func (*ExtenderFeedRequest) Descriptor() ([]byte, []int) {
-	return file_extender_proto_rawDescGZIP(), []int{9}
+	return file_extender_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ExtenderFeedRequest) GetSampleCount() uint32 {
@@ -849,7 +978,7 @@ type ExtenderFeedFrame struct {
 
 func (x *ExtenderFeedFrame) Reset() {
 	*x = ExtenderFeedFrame{}
-	mi := &file_extender_proto_msgTypes[10]
+	mi := &file_extender_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -861,7 +990,7 @@ func (x *ExtenderFeedFrame) String() string {
 func (*ExtenderFeedFrame) ProtoMessage() {}
 
 func (x *ExtenderFeedFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_extender_proto_msgTypes[10]
+	mi := &file_extender_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -874,7 +1003,7 @@ func (x *ExtenderFeedFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtenderFeedFrame.ProtoReflect.Descriptor instead.
 func (*ExtenderFeedFrame) Descriptor() ([]byte, []int) {
-	return file_extender_proto_rawDescGZIP(), []int{10}
+	return file_extender_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ExtenderFeedFrame) GetFrame() isExtenderFeedFrame_Frame {
@@ -962,7 +1091,7 @@ type ExtenderShareSettings struct {
 
 func (x *ExtenderShareSettings) Reset() {
 	*x = ExtenderShareSettings{}
-	mi := &file_extender_proto_msgTypes[11]
+	mi := &file_extender_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -974,7 +1103,7 @@ func (x *ExtenderShareSettings) String() string {
 func (*ExtenderShareSettings) ProtoMessage() {}
 
 func (x *ExtenderShareSettings) ProtoReflect() protoreflect.Message {
-	mi := &file_extender_proto_msgTypes[11]
+	mi := &file_extender_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -987,7 +1116,7 @@ func (x *ExtenderShareSettings) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtenderShareSettings.ProtoReflect.Descriptor instead.
 func (*ExtenderShareSettings) Descriptor() ([]byte, []int) {
-	return file_extender_proto_rawDescGZIP(), []int{11}
+	return file_extender_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ExtenderShareSettings) GetDnsName() string {
@@ -1028,7 +1157,7 @@ type ExtenderShare struct {
 
 func (x *ExtenderShare) Reset() {
 	*x = ExtenderShare{}
-	mi := &file_extender_proto_msgTypes[12]
+	mi := &file_extender_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1040,7 +1169,7 @@ func (x *ExtenderShare) String() string {
 func (*ExtenderShare) ProtoMessage() {}
 
 func (x *ExtenderShare) ProtoReflect() protoreflect.Message {
-	mi := &file_extender_proto_msgTypes[12]
+	mi := &file_extender_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1053,7 +1182,7 @@ func (x *ExtenderShare) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtenderShare.ProtoReflect.Descriptor instead.
 func (*ExtenderShare) Descriptor() ([]byte, []int) {
-	return file_extender_proto_rawDescGZIP(), []int{12}
+	return file_extender_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ExtenderShare) GetVersion() uint32 {
@@ -1088,7 +1217,7 @@ var File_extender_proto protoreflect.FileDescriptor
 
 const file_extender_proto_rawDesc = "" +
 	"\n" +
-	"\x0eextender.proto\x12\tbringyour\"\xb0\x02\n" +
+	"\x0eextender.proto\x12\tbringyour\"\x84\x03\n" +
 	"\x0eExtenderHeader\x12(\n" +
 	"\x0fDestinationHost\x18\x01 \x01(\tR\x0fDestinationHost\x12(\n" +
 	"\x0fDestinationPort\x18\x02 \x01(\rR\x0fDestinationPort\x12\x1c\n" +
@@ -1098,14 +1227,19 @@ const file_extender_proto_rawDesc = "" +
 	"\tChallenge\x18\x06 \x01(\fR\tChallenge\x12\x18\n" +
 	"\aService\x18\a \x01(\rR\aService\x12\x1a\n" +
 	"\bDatagram\x18\b \x01(\bR\bDatagram\x12$\n" +
-	"\rProbeClientId\x18\t \x01(\fR\rProbeClientId\"\x9c\x01\n" +
+	"\rProbeClientId\x18\t \x01(\fR\rProbeClientId\x126\n" +
+	"\x16ProbeExtenderPublicKey\x18\n" +
+	" \x01(\fR\x16ProbeExtenderPublicKey\x12\x1a\n" +
+	"\bHopCount\x18\v \x01(\rR\bHopCount\"\xe6\x01\n" +
 	"\x10ExtenderResponse\x12\x1c\n" +
 	"\tPublicKey\x18\x01 \x01(\fR\tPublicKey\x12.\n" +
 	"\x12ChallengeSignature\x18\x02 \x01(\fR\x12ChallengeSignature\x12\x1a\n" +
 	"\bCarriers\x18\x03 \x03(\tR\bCarriers\x12\x1e\n" +
 	"\n" +
 	"ProbeNonce\x18\x04 \x01(\fR\n" +
-	"ProbeNonce\"\xe4\x01\n" +
+	"ProbeNonce\x12\x1a\n" +
+	"\bHopCount\x18\x05 \x01(\rR\bHopCount\x12,\n" +
+	"\x11ChainEndPublicKey\x18\x06 \x01(\fR\x11ChainEndPublicKey\"\x9e\x02\n" +
 	"\x18ExtenderProbeAttestation\x12$\n" +
 	"\rProbeClientId\x18\x01 \x01(\fR\rProbeClientId\x12,\n" +
 	"\x11ExtenderPublicKey\x18\x02 \x01(\fR\x11ExtenderPublicKey\x12\x1e\n" +
@@ -1114,7 +1248,12 @@ const file_extender_proto_rawDesc = "" +
 	"ProbeNonce\x12\x14\n" +
 	"\x05RttMs\x18\x04 \x01(\rR\x05RttMs\x12 \n" +
 	"\vTimestampMs\x18\x05 \x01(\x04R\vTimestampMs\x12\x1c\n" +
-	"\tSignature\x18\x06 \x01(\fR\tSignature\"[\n" +
+	"\tSignature\x18\x06 \x01(\fR\tSignature\x128\n" +
+	"\x17PingerExtenderPublicKey\x18\a \x01(\fR\x17PingerExtenderPublicKey\"l\n" +
+	"\x14ExtenderProbeVerdict\x12\x1a\n" +
+	"\bAccepted\x18\x01 \x01(\bR\bAccepted\x12\x16\n" +
+	"\x06Reason\x18\x02 \x01(\rR\x06Reason\x12 \n" +
+	"\vCosignature\x18\x03 \x01(\fR\vCosignature\"[\n" +
 	"\x0fExtenderAddress\x12\x0e\n" +
 	"\x02Ip\x18\x01 \x01(\tR\x02Ip\x12\x1c\n" +
 	"\tIpVersion\x18\x02 \x01(\rR\tIpVersion\x12\x1a\n" +
@@ -1184,29 +1323,30 @@ func file_extender_proto_rawDescGZIP() []byte {
 	return file_extender_proto_rawDescData
 }
 
-var file_extender_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_extender_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_extender_proto_goTypes = []any{
 	(*ExtenderHeader)(nil),           // 0: bringyour.ExtenderHeader
 	(*ExtenderResponse)(nil),         // 1: bringyour.ExtenderResponse
 	(*ExtenderProbeAttestation)(nil), // 2: bringyour.ExtenderProbeAttestation
-	(*ExtenderAddress)(nil),          // 3: bringyour.ExtenderAddress
-	(*ExtenderRecordBody)(nil),       // 4: bringyour.ExtenderRecordBody
-	(*ExtenderRecord)(nil),           // 5: bringyour.ExtenderRecord
-	(*ExtenderRevocationBody)(nil),   // 6: bringyour.ExtenderRevocationBody
-	(*ExtenderRevocation)(nil),       // 7: bringyour.ExtenderRevocation
-	(*ExtenderGossipMessage)(nil),    // 8: bringyour.ExtenderGossipMessage
-	(*ExtenderFeedRequest)(nil),      // 9: bringyour.ExtenderFeedRequest
-	(*ExtenderFeedFrame)(nil),        // 10: bringyour.ExtenderFeedFrame
-	(*ExtenderShareSettings)(nil),    // 11: bringyour.ExtenderShareSettings
-	(*ExtenderShare)(nil),            // 12: bringyour.ExtenderShare
+	(*ExtenderProbeVerdict)(nil),     // 3: bringyour.ExtenderProbeVerdict
+	(*ExtenderAddress)(nil),          // 4: bringyour.ExtenderAddress
+	(*ExtenderRecordBody)(nil),       // 5: bringyour.ExtenderRecordBody
+	(*ExtenderRecord)(nil),           // 6: bringyour.ExtenderRecord
+	(*ExtenderRevocationBody)(nil),   // 7: bringyour.ExtenderRevocationBody
+	(*ExtenderRevocation)(nil),       // 8: bringyour.ExtenderRevocation
+	(*ExtenderGossipMessage)(nil),    // 9: bringyour.ExtenderGossipMessage
+	(*ExtenderFeedRequest)(nil),      // 10: bringyour.ExtenderFeedRequest
+	(*ExtenderFeedFrame)(nil),        // 11: bringyour.ExtenderFeedFrame
+	(*ExtenderShareSettings)(nil),    // 12: bringyour.ExtenderShareSettings
+	(*ExtenderShare)(nil),            // 13: bringyour.ExtenderShare
 }
 var file_extender_proto_depIdxs = []int32{
-	3,  // 0: bringyour.ExtenderRecordBody.Addresses:type_name -> bringyour.ExtenderAddress
-	5,  // 1: bringyour.ExtenderGossipMessage.Record:type_name -> bringyour.ExtenderRecord
-	7,  // 2: bringyour.ExtenderGossipMessage.Revocation:type_name -> bringyour.ExtenderRevocation
-	5,  // 3: bringyour.ExtenderFeedFrame.Record:type_name -> bringyour.ExtenderRecord
-	7,  // 4: bringyour.ExtenderFeedFrame.Revocation:type_name -> bringyour.ExtenderRevocation
-	11, // 5: bringyour.ExtenderShare.Settings:type_name -> bringyour.ExtenderShareSettings
+	4,  // 0: bringyour.ExtenderRecordBody.Addresses:type_name -> bringyour.ExtenderAddress
+	6,  // 1: bringyour.ExtenderGossipMessage.Record:type_name -> bringyour.ExtenderRecord
+	8,  // 2: bringyour.ExtenderGossipMessage.Revocation:type_name -> bringyour.ExtenderRevocation
+	6,  // 3: bringyour.ExtenderFeedFrame.Record:type_name -> bringyour.ExtenderRecord
+	8,  // 4: bringyour.ExtenderFeedFrame.Revocation:type_name -> bringyour.ExtenderRevocation
+	12, // 5: bringyour.ExtenderShare.Settings:type_name -> bringyour.ExtenderShareSettings
 	6,  // [6:6] is the sub-list for method output_type
 	6,  // [6:6] is the sub-list for method input_type
 	6,  // [6:6] is the sub-list for extension type_name
@@ -1219,11 +1359,11 @@ func file_extender_proto_init() {
 	if File_extender_proto != nil {
 		return
 	}
-	file_extender_proto_msgTypes[8].OneofWrappers = []any{
+	file_extender_proto_msgTypes[9].OneofWrappers = []any{
 		(*ExtenderGossipMessage_Record)(nil),
 		(*ExtenderGossipMessage_Revocation)(nil),
 	}
-	file_extender_proto_msgTypes[10].OneofWrappers = []any{
+	file_extender_proto_msgTypes[11].OneofWrappers = []any{
 		(*ExtenderFeedFrame_Record)(nil),
 		(*ExtenderFeedFrame_Revocation)(nil),
 		(*ExtenderFeedFrame_EndOfSample)(nil),
@@ -1235,7 +1375,7 @@ func file_extender_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_extender_proto_rawDesc), len(file_extender_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   13,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

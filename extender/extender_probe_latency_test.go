@@ -1,12 +1,16 @@
 package extender
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"io"
+	"net"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,8 +19,9 @@ import (
 )
 
 // The latency probe end to end against the in-process extender
-// (DESIGNNOTES4.md): a ranking client measures and identifies nothing, a
-// provider attests and the gate holds.
+// (DESIGNNOTES4.md, GEOMAP §2): a ranking client measures and identifies
+// nothing, a provider or a peer extender attests, the gate holds, and every
+// claim is answered with a verdict.
 
 // A provider's attestor over a fresh client key, and the key the operator
 // would verify with.
@@ -26,75 +31,71 @@ func newTestProviderAttestor(t *testing.T) (*connect.ExtenderProbeAttestor, ed25
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &connect.ExtenderProbeAttestor{
-		ClientId: connect.NewId(),
-		Sign: func(data []byte) []byte {
-			return ed25519.Sign(privateKey, data)
-		},
-	}, publicKey
+	return connect.NewExtenderProbeProviderAttestor(connect.NewId(), func(data []byte) []byte {
+		return ed25519.Sign(privateKey, data)
+	}), publicKey
 }
 
-// The attestations an extender's handler received.
-type testAttestations struct {
-	received chan *protocol.ExtenderProbeAttestation
-}
-
-func newTestAttestations() *testAttestations {
-	return &testAttestations{
-		received: make(chan *protocol.ExtenderProbeAttestation, 64),
-	}
-}
-
-func (self *testAttestations) handle(attestation *protocol.ExtenderProbeAttestation) {
-	self.received <- attestation
-}
-
-func (self *testAttestations) next(t *testing.T) *protocol.ExtenderProbeAttestation {
+// A peer extender's attestor over a fresh identity key, signing as an
+// extender does, and the key.
+func newTestPeerAttestor(t *testing.T) (*connect.ExtenderProbeAttestor, ed25519.PublicKey, ed25519.PrivateKey) {
 	t.Helper()
-	select {
-	case attestation := <-self.received:
-		return attestation
-	case <-time.After(10 * time.Second):
-		t.Fatal("no attestation reached the handler")
-		return nil
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return connect.NewExtenderProbeExtenderAttestor(publicKey, connect.NewExtenderPeerProbeSigner(privateKey)), publicKey, privateKey
 }
 
-func (self *testAttestations) none(t *testing.T) {
-	t.Helper()
-	select {
-	case attestation := <-self.received:
-		t.Fatalf("an attestation reached the handler: %v", attestation)
-	case <-time.After(300 * time.Millisecond):
-	}
+// The peer verifier of a fixture: the keys it vouches for, and every key it
+// was asked about.
+type testPeerVerifier struct {
+	stateLock sync.Mutex
+	active    [][]byte
+	asked     [][]byte
 }
 
-// An open extender with an identity and a handler, and the client config of
-// one of its carriers pinned to that identity.
+// Whether the key is one the verifier vouches for, recording the ask.
+func (self *testPeerVerifier) verify(publicKey []byte) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.asked = append(self.asked, slices.Clone(publicKey))
+	for _, active := range self.active {
+		if bytes.Equal(active, publicKey) {
+			return true
+		}
+	}
+	return false
+}
+
+// Every key asked about so far, as a copy.
+func (self *testPeerVerifier) askedValue() [][]byte {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return slices.Clone(self.asked)
+}
+
+// An open extender with an identity, and the identity's key pair.
 func newTestProbeFixture(
 	t *testing.T,
-	attestations *testAttestations,
 	configure func(settings *ExtenderSettings),
-) (*extenderFixture, ed25519.PublicKey) {
+) (*extenderFixture, ed25519.PublicKey, ed25519.PrivateKey) {
 	t.Helper()
 	seed, err := connect.NewExtenderKeySeed()
 	if err != nil {
 		t.Fatal(err)
 	}
-	publicKey, err := connect.ExtenderPublicKeyFromSeed(seed)
+	privateKey, err := connect.ExtenderPrivateKeyFromSeed(seed)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fixture := newExtenderFixtureWithSecrets(t, "127.0.0.1", nil, func(settings *ExtenderSettings) {
 		settings.IdentityKeySeed = seed
-		if attestations != nil {
-			settings.ProbeAttestationHandler = attestations.handle
-		}
 		if configure != nil {
 			configure(settings)
 		}
 	})
-	return fixture, publicKey
+	return fixture, privateKey.Public().(ed25519.PublicKey), privateKey
 }
 
 func testProbeConfig(fixture *extenderFixture, carrier string, publicKey []byte) *connect.ExtenderConfig {
@@ -122,24 +123,54 @@ func waitForFixtureError(t *testing.T, fixture *extenderFixture, stage string) e
 	}
 }
 
-// A ranking probe measures a round trip on every carrier, gets no nonce, and
-// never reaches the handler.
-func TestProbeExtenderLatencyRanksWithoutIdentifying(t *testing.T) {
-	attestations := newTestAttestations()
-	fixture, publicKey := newTestProbeFixture(t, attestations, nil)
+// Every fixture error reported so far, without waiting.
+func drainFixtureErrors(fixture *extenderFixture) []error {
+	errs := []error{}
+	for {
+		select {
+		case err := <-fixture.errors:
+			errs = append(errs, err)
+		default:
+			return errs
+		}
+	}
+}
 
-	for _, carrier := range []string{connect.ExtenderCarrierTcp, connect.ExtenderCarrierQuic, connect.ExtenderCarrierDns} {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		probe, err := connect.ProbeExtenderLatency(ctx, fixture.connectSettings(), testProbeConfig(fixture, carrier, publicKey), nil)
-		cancel()
-		if err != nil {
-			t.Fatalf("%s: %v", carrier, err)
-		}
-		if probe.Rtt <= 0 {
-			t.Fatalf("%s: rtt = %s", carrier, probe.Rtt)
-		}
-		if probe.Attested || probe.AttestErr != nil {
+// Probes the fixture once over the carrier with the attestor, failing the test
+// on an error.
+func probeTestFixture(
+	t *testing.T,
+	fixture *extenderFixture,
+	carrier string,
+	publicKey []byte,
+	attestor *connect.ExtenderProbeAttestor,
+) *connect.ExtenderLatencyProbe {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	probe, err := connect.ProbeExtenderLatency(ctx, fixture.connectSettings(), testProbeConfig(fixture, carrier, publicKey), attestor)
+	if err != nil {
+		t.Fatalf("%s: %v", carrier, err)
+	}
+	if probe.Rtt <= 0 {
+		t.Fatalf("%s: rtt = %s", carrier, probe.Rtt)
+	}
+	return probe
+}
+
+var testProbeCarriers = []string{connect.ExtenderCarrierTcp, connect.ExtenderCarrierQuic, connect.ExtenderCarrierDns}
+
+// A ranking probe measures a round trip on every carrier, gets no nonce, and
+// neither sends nor waits for anything more.
+func TestProbeExtenderLatencyRanksWithoutIdentifying(t *testing.T) {
+	fixture, publicKey, _ := newTestProbeFixture(t, nil)
+	for _, carrier := range testProbeCarriers {
+		probe := probeTestFixture(t, fixture, carrier, publicKey, nil)
+		if probe.Attested || probe.AttestErr != nil || probe.Outcome != connect.ExtenderPingUnattested {
 			t.Fatalf("%s: a ranking probe attested (%v)", carrier, probe.AttestErr)
+		}
+		if probe.Verdict != nil || probe.Attestation != nil {
+			t.Fatalf("%s: a ranking probe carries a claim or a verdict", carrier)
 		}
 		if len(probe.Response.ProbeNonce) != 0 {
 			t.Fatalf("%s: a ranking probe was issued a nonce", carrier)
@@ -148,102 +179,204 @@ func TestProbeExtenderLatencyRanksWithoutIdentifying(t *testing.T) {
 			t.Fatalf("%s: the response names another key", carrier)
 		}
 	}
-	attestations.none(t)
+	for _, err := range drainFixtureErrors(fixture) {
+		if strings.HasPrefix(err.Error(), "probe") {
+			t.Fatalf("a ranking probe reached the gate: %v", err)
+		}
+	}
 }
 
-// A provider's probe is issued a nonce, attests on every carrier, and what
-// reaches the handler verifies under the provider's key with the fields the
-// provider signed.
-func TestProbeExtenderLatencyAttestsForAProvider(t *testing.T) {
-	attestations := newTestAttestations()
-	fixture, publicKey := newTestProbeFixture(t, attestations, nil)
+// A provider's probe is issued a nonce and attests on every carrier; the
+// extender accepts it and answers with its co-signature, which verifies under
+// the extender's key over exactly the claim the provider signed.
+func TestProbeExtenderLatencyCosignsForAProvider(t *testing.T) {
+	fixture, publicKey, _ := newTestProbeFixture(t, nil)
 	attestor, providerPublicKey := newTestProviderAttestor(t)
 
-	for _, carrier := range []string{connect.ExtenderCarrierTcp, connect.ExtenderCarrierQuic, connect.ExtenderCarrierDns} {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		probe, err := connect.ProbeExtenderLatency(ctx, fixture.connectSettings(), testProbeConfig(fixture, carrier, publicKey), attestor)
-		cancel()
-		if err != nil {
-			t.Fatalf("%s: %v", carrier, err)
-		}
-		if !probe.Attested {
-			t.Fatalf("%s: not attested: %v", carrier, probe.AttestErr)
+	for _, carrier := range testProbeCarriers {
+		probe := probeTestFixture(t, fixture, carrier, publicKey, attestor)
+		if !probe.Attested || probe.Outcome != connect.ExtenderPingCosigned || !probe.Cosigned {
+			t.Fatalf("%s: outcome %q attested %t: %v / %v", carrier, probe.Outcome, probe.Attested, probe.AttestErr, probe.VerdictErr)
 		}
 		if len(probe.Response.ProbeNonce) != connect.ExtenderProbeNonceByteCount {
 			t.Fatalf("%s: nonce is %d bytes", carrier, len(probe.Response.ProbeNonce))
 		}
-
-		attestation := attestations.next(t)
-		if !slices.Equal(attestation.ProbeClientId, attestor.ClientId.Bytes()) {
-			t.Fatalf("%s: the attestation names another client", carrier)
+		attestation := probe.Attestation
+		if !slices.Equal(attestation.ProbeClientId, attestor.ClientId.Bytes()) || 0 < len(attestation.PingerExtenderPublicKey) {
+			t.Fatalf("%s: the claim names another pinger", carrier)
 		}
-		if !slices.Equal(attestation.ExtenderPublicKey, publicKey) {
-			t.Fatalf("%s: the attestation names another extender", carrier)
-		}
-		if !slices.Equal(attestation.ProbeNonce, probe.Response.ProbeNonce) {
-			t.Fatalf("%s: the attestation echoes another nonce", carrier)
+		if !slices.Equal(attestation.ExtenderPublicKey, publicKey) || !slices.Equal(attestation.ProbeNonce, probe.Response.ProbeNonce) {
+			t.Fatalf("%s: the claim names another extender or nonce", carrier)
 		}
 		if attestation.RttMs == 0 {
-			t.Fatalf("%s: the attestation claims no rtt", carrier)
+			t.Fatalf("%s: the claim is of no rtt", carrier)
 		}
 		if !connect.VerifyExtenderProbeAttestation(providerPublicKey, attestation) {
-			t.Fatalf("%s: the attestation does not verify under the provider's key", carrier)
+			t.Fatalf("%s: the claim does not verify under the provider's key", carrier)
+		}
+		if !probe.Verdict.Accepted || probe.Verdict.Reason != connect.ExtenderProbeVerdictReasonOk {
+			t.Fatalf("%s: verdict = %v", carrier, probe.Verdict)
+		}
+		if !connect.VerifyExtenderProbeVerdict(publicKey, attestation, probe.Verdict) {
+			t.Fatalf("%s: the co-signature does not verify under the extender's key", carrier)
 		}
 	}
 }
 
-// An extender without an identity has nothing to bind a claim to, and one
-// without a handler has nowhere to send it: neither issues a nonce, and the
-// provider's probe still measures.
-func TestProbeExtenderLatencyIssuesNoNonceWithoutIdentityOrHandler(t *testing.T) {
-	attestor, _ := newTestProviderAttestor(t)
-
-	attestations := newTestAttestations()
-	noIdentity := newExtenderFixtureWithSecrets(t, "127.0.0.1", nil, func(settings *ExtenderSettings) {
-		settings.ProbeAttestationHandler = attestations.handle
+// A peer extender the verifier vouches for is co-signed on every carrier, and
+// the verifier is asked about exactly its key.
+func TestProbeExtenderLatencyCosignsAnActivePeer(t *testing.T) {
+	attestor, pingerPublicKey, _ := newTestPeerAttestor(t)
+	verifier := &testPeerVerifier{active: [][]byte{pingerPublicKey}}
+	fixture, publicKey, _ := newTestProbeFixture(t, func(settings *ExtenderSettings) {
+		settings.ProbePeerVerifier = verifier.verify
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	probe, err := connect.ProbeExtenderLatency(ctx, noIdentity.connectSettings(), testProbeConfig(noIdentity, connect.ExtenderCarrierTcp, nil), attestor)
-	cancel()
-	if err != nil {
-		t.Fatal(err)
+	for _, carrier := range testProbeCarriers {
+		probe := probeTestFixture(t, fixture, carrier, publicKey, attestor)
+		if probe.Outcome != connect.ExtenderPingCosigned || !probe.Cosigned {
+			t.Fatalf("%s: outcome %q: %v / %v / %v", carrier, probe.Outcome, probe.AttestErr, probe.VerdictErr, probe.Verdict)
+		}
+		attestation := probe.Attestation
+		if !slices.Equal(attestation.PingerExtenderPublicKey, pingerPublicKey) || 0 < len(attestation.ProbeClientId) {
+			t.Fatalf("%s: the claim names another pinger", carrier)
+		}
+		if !connect.VerifyExtenderProbeAttestation(pingerPublicKey, attestation) {
+			t.Fatalf("%s: the claim does not verify under the pinger's key", carrier)
+		}
+		if !connect.VerifyExtenderProbeVerdict(publicKey, attestation, probe.Verdict) {
+			t.Fatalf("%s: the co-signature does not verify under the extender's key", carrier)
+		}
+		// the co-signature is the target's and only the target's
+		if connect.VerifyExtenderProbeVerdict(pingerPublicKey, attestation, probe.Verdict) {
+			t.Fatalf("%s: the co-signature verifies under the pinger's key", carrier)
+		}
 	}
-	if probe.Attested || len(probe.Response.ProbeNonce) != 0 || probe.Rtt <= 0 {
-		t.Fatalf("no identity: attested=%t nonce=%d rtt=%s", probe.Attested, len(probe.Response.ProbeNonce), probe.Rtt)
+	asked := verifier.askedValue()
+	if len(asked) != len(testProbeCarriers) {
+		t.Fatalf("the verifier was asked %d times, expected once per probe", len(asked))
 	}
-	attestations.none(t)
-
-	noHandler, publicKey := newTestProbeFixture(t, nil, nil)
-	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
-	probe, err = connect.ProbeExtenderLatency(ctx, noHandler.connectSettings(), testProbeConfig(noHandler, connect.ExtenderCarrierTcp, publicKey), attestor)
-	cancel()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if probe.Attested || len(probe.Response.ProbeNonce) != 0 || probe.Rtt <= 0 {
-		t.Fatalf("no handler: attested=%t nonce=%d rtt=%s", probe.Attested, len(probe.Response.ProbeNonce), probe.Rtt)
+	for _, key := range asked {
+		if !bytes.Equal(key, pingerPublicKey) {
+			t.Fatal("the verifier was asked about another key")
+		}
 	}
 }
 
-// Dials a probe as an attesting provider and returns the stream, positioned
-// after the response, with the nonce it was issued.
-func dialTestAttestingProbe(
-	t *testing.T,
-	fixture *extenderFixture,
-	publicKey []byte,
-	attestor *connect.ExtenderProbeAttestor,
-) (*connect.ExtenderRoundTrip, []byte, func([]byte) error, func()) {
-	t.Helper()
+// A peer the verifier does not vouch for, or any peer with no verifier at
+// all, is refused as an unknown pinger -- with a verdict, not silence.
+func TestProbeExtenderLatencyRefusesAnUnknownPeer(t *testing.T) {
+	attestor, _, _ := newTestPeerAttestor(t)
+	_, otherPublicKey, _ := newTestPeerAttestor(t)
+	for name, configure := range map[string]func(settings *ExtenderSettings){
+		"verifier refuses": func(settings *ExtenderSettings) {
+			settings.ProbePeerVerifier = (&testPeerVerifier{active: [][]byte{otherPublicKey}}).verify
+		},
+		"no verifier": nil,
+	} {
+		fixture, publicKey, _ := newTestProbeFixture(t, configure)
+		for _, carrier := range []string{connect.ExtenderCarrierTcp, connect.ExtenderCarrierQuic} {
+			probe := probeTestFixture(t, fixture, carrier, publicKey, attestor)
+			if len(probe.Response.ProbeNonce) != connect.ExtenderProbeNonceByteCount {
+				t.Fatalf("%s, %s: an extender pinger was issued no nonce", name, carrier)
+			}
+			if probe.Outcome != connect.ExtenderPingRejected || probe.Cosigned {
+				t.Fatalf("%s, %s: outcome %q", name, carrier, probe.Outcome)
+			}
+			if probe.Verdict == nil || probe.Verdict.Accepted || probe.Reason != connect.ExtenderProbeVerdictReasonUnknownPinger {
+				t.Fatalf("%s, %s: verdict = %v", name, carrier, probe.Verdict)
+			}
+			if 0 < len(probe.Verdict.Cosignature) {
+				t.Fatalf("%s, %s: a refusal carries a co-signature", name, carrier)
+			}
+			if err := waitForFixtureError(t, fixture, "probe gate"); !strings.Contains(err.Error(), "not an active peer") {
+				t.Fatalf("%s, %s: refused for %v", name, carrier, err)
+			}
+		}
+	}
+}
+
+// A provider needs no verifier: the operator verifies it, and a verifier that
+// vouches for nobody changes nothing for a provider.
+func TestProbeExtenderLatencyAsksNoVerifierOfAProvider(t *testing.T) {
+	verifier := &testPeerVerifier{}
+	fixture, publicKey, _ := newTestProbeFixture(t, func(settings *ExtenderSettings) {
+		settings.ProbePeerVerifier = verifier.verify
+	})
+	attestor, _ := newTestProviderAttestor(t)
+	probe := probeTestFixture(t, fixture, connect.ExtenderCarrierTcp, publicKey, attestor)
+	if probe.Outcome != connect.ExtenderPingCosigned {
+		t.Fatalf("outcome %q", probe.Outcome)
+	}
+	if asked := verifier.askedValue(); len(asked) != 0 {
+		t.Fatalf("the verifier was asked about a provider: %d", len(asked))
+	}
+}
+
+// An extender without an identity has nothing to bind a claim to: it issues
+// no nonce to either kind of pinger, and the probe still measures.
+func TestProbeExtenderLatencyIssuesNoNonceWithoutIdentity(t *testing.T) {
+	provider, _ := newTestProviderAttestor(t)
+	extender, _, _ := newTestPeerAttestor(t)
+	noIdentity := newExtenderFixtureWithSecrets(t, "127.0.0.1", nil, func(settings *ExtenderSettings) {
+		settings.ProbePeerVerifier = func(publicKey []byte) bool { return true }
+	})
+	for _, attestor := range []*connect.ExtenderProbeAttestor{provider, extender} {
+		probe := probeTestFixture(t, noIdentity, connect.ExtenderCarrierTcp, nil, attestor)
+		if probe.Attested || len(probe.Response.ProbeNonce) != 0 || probe.Outcome != connect.ExtenderPingUnattested {
+			t.Fatalf("%s: attested=%t nonce=%d outcome=%q", attestor.Kind(), probe.Attested, len(probe.Response.ProbeNonce), probe.Outcome)
+		}
+	}
+}
+
+// A header that names both a provider and an extender is refused outright.
+func TestExtenderProbeRefusesBothIdentities(t *testing.T) {
+	fixture, publicKey, _ := newTestProbeFixture(t, func(settings *ExtenderSettings) {
+		settings.ProbePeerVerifier = func(publicKey []byte) bool { return true }
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	roundTrip := &connect.ExtenderRoundTrip{}
-	conn, response, err := connect.DialExtender(
+	defer cancel()
+	conn, _, err := connect.DialExtender(
 		ctx,
 		fixture.connectSettings(),
 		testProbeConfig(fixture, connect.ExtenderCarrierTcp, publicKey),
 		&connect.ExtenderDial{
-			Service:       connect.ExtenderServiceProbe,
-			ProbeClientId: attestor.ClientId.Bytes(),
-			RoundTrip:     roundTrip,
+			Service:                connect.ExtenderServiceProbe,
+			ProbeClientId:          connect.NewId().Bytes(),
+			ProbeExtenderPublicKey: bytes.Repeat([]byte{7}, ed25519.PublicKeySize),
+		},
+	)
+	if conn != nil {
+		conn.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("a probe naming both was not refused: %v", err)
+	}
+	if err := waitForFixtureError(t, fixture, "probe"); !strings.Contains(err.Error(), "both") {
+		t.Fatalf("refused for %v", err)
+	}
+}
+
+// Dials a probe that names one pinger, and returns the stream positioned
+// after the response, with the nonce it was issued.
+func dialTestAttestingProbe(
+	t *testing.T,
+	fixture *extenderFixture,
+	carrier string,
+	publicKey []byte,
+	clientId []byte,
+	pingerPublicKey []byte,
+) (net.Conn, []byte, func()) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	conn, response, err := connect.DialExtender(
+		ctx,
+		fixture.connectSettings(),
+		testProbeConfig(fixture, carrier, publicKey),
+		&connect.ExtenderDial{
+			Service:                connect.ExtenderServiceProbe,
+			ProbeClientId:          clientId,
+			ProbeExtenderPublicKey: pingerPublicKey,
+			RoundTrip:              &connect.ExtenderRoundTrip{},
 		},
 	)
 	if err != nil {
@@ -255,26 +388,58 @@ func dialTestAttestingProbe(
 		cancel()
 		t.Fatalf("nonce is %d bytes", len(response.ProbeNonce))
 	}
-	write := func(frameBytes []byte) error {
-		_, err := conn.Write(frameBytes)
-		return err
-	}
-	return roundTrip, response.ProbeNonce, write, func() {
+	return conn, response.ProbeNonce, func() {
 		conn.Close()
 		cancel()
 	}
 }
 
-// The gate (DESIGNNOTES4.md §3): a claim below what the extender observed is
-// refused, one above is accepted, and a claim that does not echo this probe's
-// nonce, client id or extender key is refused whatever it says.
+// Reads the one verdict the extender answers a claim with.
+func readTestVerdict(t *testing.T, conn net.Conn) *protocol.ExtenderProbeVerdict {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	verdict, err := connect.ReadExtenderProbeVerdictFrame(conn)
+	if err != nil {
+		t.Fatalf("no verdict: %v", err)
+	}
+	return verdict
+}
+
+// Writes one attestation frame on the probe's stream.
+func writeTestAttestation(t *testing.T, conn net.Conn, attestation *protocol.ExtenderProbeAttestation) {
+	t.Helper()
+	frameBytes, err := connect.ExtenderProbeAttestationFrame(attestation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(frameBytes); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The gate (DESIGNNOTES4.md §3, GEOMAP §2.4) for both kinds of pinger: a
+// claim below what the extender observed is refused, one above accepted; a
+// claim that does not echo this probe's nonce, name this extender, name the
+// pinger the header named, or carry a signature the extender can check is
+// refused whatever it says -- and every one of them is answered with its
+// reason.
 func TestExtenderProbeGate(t *testing.T) {
-	attestations := newTestAttestations()
-	fixture, publicKey := newTestProbeFixture(t, attestations, func(settings *ExtenderSettings) {
+	peerAttestor, peerPublicKey, _ := newTestPeerAttestor(t)
+	otherPeerAttestor, otherPeerPublicKey, _ := newTestPeerAttestor(t)
+	unknownPeerAttestor, _, _ := newTestPeerAttestor(t)
+	verifier := &testPeerVerifier{active: [][]byte{peerPublicKey, otherPeerPublicKey}}
+	fixture, publicKey, privateKey := newTestProbeFixture(t, func(settings *ExtenderSettings) {
 		settings.ProbeRttTolerance = 20 * time.Millisecond
+		settings.ProbePeerVerifier = verifier.verify
+		// every case probes from the one loopback source
+		settings.ProbeMaxRatePerSource = 0
 	})
-	attestor, _ := newTestProviderAttestor(t)
-	otherAttestor, _ := newTestProviderAttestor(t)
+	// this extender's own key, as an attestor, for a claim of a ping to itself
+	selfAttestor := connect.NewExtenderProbeExtenderAttestor(publicKey, connect.NewExtenderPeerProbeSigner(privateKey))
+	provider, _ := newTestProviderAttestor(t)
+	otherProvider, _ := newTestProviderAttestor(t)
 	otherExtenderKey := func() []byte {
 		seed, err := connect.NewExtenderKeySeed()
 		if err != nil {
@@ -286,91 +451,153 @@ func TestExtenderProbeGate(t *testing.T) {
 		}
 		return key
 	}()
+	verifier.stateLock.Lock()
+	verifier.active = append(verifier.active, slices.Clone(publicKey))
+	verifier.stateLock.Unlock()
 
 	cases := []struct {
-		name string
+		name     string
+		attestor *connect.ExtenderProbeAttestor
 		// how long to hold the attestation before sending it, which is what
 		// the extender observes
 		hold time.Duration
 		// the claimed rtt
-		rttMs    uint32
-		mutate   func(a *protocol.ExtenderProbeAttestation)
-		accepted bool
-		reason   string
+		rttMs uint32
+		// before the signature, or after it
+		mutate      func(a *protocol.ExtenderProbeAttestation)
+		mutateAfter func(a *protocol.ExtenderProbeAttestation)
+		reason      uint32
+		message     string
 	}{
-		{name: "deflated", hold: 150 * time.Millisecond, rttMs: 1, accepted: false, reason: "below the observed"},
-		{name: "just under the tolerance", hold: 150 * time.Millisecond, rttMs: 100, accepted: false, reason: "below the observed"},
-		{name: "honest", hold: 100 * time.Millisecond, rttMs: 100, accepted: true},
-		{name: "inflated", hold: 0, rttMs: 5000, accepted: true},
-		{name: "another nonce", hold: 0, rttMs: 5000, accepted: false, reason: "nonce", mutate: func(a *protocol.ExtenderProbeAttestation) {
+		{name: "provider deflated", attestor: provider, hold: 150 * time.Millisecond, rttMs: 1, reason: connect.ExtenderProbeVerdictReasonRttBelowObserved, message: "below the observed"},
+		{name: "provider just under the tolerance", attestor: provider, hold: 150 * time.Millisecond, rttMs: 100, reason: connect.ExtenderProbeVerdictReasonRttBelowObserved, message: "below the observed"},
+		{name: "provider honest", attestor: provider, hold: 100 * time.Millisecond, rttMs: 100},
+		{name: "provider inflated", attestor: provider, rttMs: 5000},
+		{name: "provider another nonce", attestor: provider, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonNonce, message: "nonce", mutateAfter: func(a *protocol.ExtenderProbeAttestation) {
 			nonce, _ := connect.NewExtenderProbeNonce()
 			a.ProbeNonce = nonce
 		}},
-		{name: "another client id", hold: 0, rttMs: 5000, accepted: false, reason: "client id", mutate: func(a *protocol.ExtenderProbeAttestation) {
-			a.ProbeClientId = otherAttestor.ClientId.Bytes()
+		{name: "provider another client id", attestor: provider, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonUnknownPinger, message: "client id", mutateAfter: func(a *protocol.ExtenderProbeAttestation) {
+			a.ProbeClientId = otherProvider.ClientId.Bytes()
 		}},
-		{name: "another extender", hold: 0, rttMs: 5000, accepted: false, reason: "another extender", mutate: func(a *protocol.ExtenderProbeAttestation) {
+		{name: "provider also names a pinger key", attestor: provider, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonUnknownPinger, message: "client id", mutateAfter: func(a *protocol.ExtenderProbeAttestation) {
+			a.PingerExtenderPublicKey = slices.Clone(peerPublicKey)
+		}},
+		{name: "provider another extender", attestor: provider, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonWrongExtender, message: "another extender", mutateAfter: func(a *protocol.ExtenderProbeAttestation) {
 			a.ExtenderPublicKey = otherExtenderKey
 		}},
-		{name: "no signature", hold: 0, rttMs: 5000, accepted: false, reason: "signature", mutate: func(a *protocol.ExtenderProbeAttestation) {
+		{name: "provider no signature", attestor: provider, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonBadSignature, message: "signature", mutateAfter: func(a *protocol.ExtenderProbeAttestation) {
 			a.Signature = nil
 		}},
+		{name: "peer honest", attestor: peerAttestor, rttMs: 100},
+		{name: "peer inflated", attestor: peerAttestor, rttMs: 5000},
+		{name: "peer deflated", attestor: peerAttestor, hold: 150 * time.Millisecond, rttMs: 1, reason: connect.ExtenderProbeVerdictReasonRttBelowObserved, message: "below the observed"},
+		{name: "peer another nonce", attestor: peerAttestor, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonNonce, message: "nonce", mutate: func(a *protocol.ExtenderProbeAttestation) {
+			nonce, _ := connect.NewExtenderProbeNonce()
+			a.ProbeNonce = nonce
+		}},
+		{name: "peer another extender", attestor: peerAttestor, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonWrongExtender, message: "another extender", mutate: func(a *protocol.ExtenderProbeAttestation) {
+			a.ExtenderPublicKey = otherExtenderKey
+		}},
+		{name: "peer wrong signature", attestor: peerAttestor, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonBadSignature, message: "does not verify", mutateAfter: func(a *protocol.ExtenderProbeAttestation) {
+			// signed by another active peer, over this claim
+			other := &protocol.ExtenderProbeAttestation{
+				PingerExtenderPublicKey: slices.Clone(otherPeerPublicKey),
+				ExtenderPublicKey:       a.ExtenderPublicKey,
+				ProbeNonce:              a.ProbeNonce,
+				RttMs:                   a.RttMs,
+				TimestampMs:             a.TimestampMs,
+			}
+			if err := connect.SignExtenderProbeAttestation(otherPeerAttestor, other); err != nil {
+				panic(err)
+			}
+			a.Signature = other.Signature
+		}},
+		{name: "peer rtt changed after signing", attestor: peerAttestor, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonBadSignature, message: "does not verify", mutateAfter: func(a *protocol.ExtenderProbeAttestation) {
+			a.RttMs += 1
+		}},
+		{name: "peer no signature", attestor: peerAttestor, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonBadSignature, message: "does not verify", mutateAfter: func(a *protocol.ExtenderProbeAttestation) {
+			a.Signature = nil
+		}},
+		{name: "peer names another pinger", attestor: otherPeerAttestor, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonUnknownPinger, message: "another pinger extender"},
+		{name: "peer also names a client id", attestor: peerAttestor, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonUnknownPinger, message: "another pinger extender", mutateAfter: func(a *protocol.ExtenderProbeAttestation) {
+			a.ProbeClientId = provider.ClientId.Bytes()
+		}},
+		{name: "peer the verifier does not know", attestor: unknownPeerAttestor, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonUnknownPinger, message: "not an active peer"},
+		{name: "a ping of itself", attestor: selfAttestor, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonUnknownPinger, message: "this extender"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, nonce, write, closeProbe := dialTestAttestingProbe(t, fixture, publicKey, attestor)
+			var clientId, pingerPublicKey []byte
+			switch c.attestor.Kind() {
+			case connect.ExtenderPingerKindProvider:
+				clientId = c.attestor.ClientId.Bytes()
+			case connect.ExtenderPingerKindExtender:
+				pingerPublicKey = slices.Clone(c.attestor.ExtenderPublicKey)
+				if c.attestor == otherPeerAttestor {
+					// the header names one peer and the claim another
+					pingerPublicKey = slices.Clone(peerPublicKey)
+				}
+			}
+			conn, nonce, closeProbe := dialTestAttestingProbe(t, fixture, connect.ExtenderCarrierTcp, publicKey, clientId, pingerPublicKey)
 			defer closeProbe()
 
 			attestation := &protocol.ExtenderProbeAttestation{
-				ProbeClientId:     attestor.ClientId.Bytes(),
 				ExtenderPublicKey: publicKey,
 				ProbeNonce:        nonce,
 				RttMs:             c.rttMs,
 				TimestampMs:       uint64(time.Now().UnixMilli()),
 			}
-			if err := connect.SignExtenderProbeAttestation(attestor, attestation); err != nil {
-				t.Fatal(err)
+			switch c.attestor.Kind() {
+			case connect.ExtenderPingerKindProvider:
+				attestation.ProbeClientId = c.attestor.ClientId.Bytes()
+			case connect.ExtenderPingerKindExtender:
+				attestation.PingerExtenderPublicKey = slices.Clone(c.attestor.ExtenderPublicKey)
 			}
 			if c.mutate != nil {
 				c.mutate(attestation)
 			}
-			frameBytes, err := connect.ExtenderProbeAttestationFrame(attestation)
-			if err != nil {
+			if err := connect.SignExtenderProbeAttestation(c.attestor, attestation); err != nil {
 				t.Fatal(err)
+			}
+			if c.mutateAfter != nil {
+				c.mutateAfter(attestation)
 			}
 			if 0 < c.hold {
 				time.Sleep(c.hold)
 			}
-			if err := write(frameBytes); err != nil {
-				t.Fatal(err)
-			}
+			writeTestAttestation(t, conn, attestation)
+			verdict := readTestVerdict(t, conn)
 
-			if c.accepted {
-				received := attestations.next(t)
-				if received.RttMs != c.rttMs {
-					t.Fatalf("the handler received rtt %d, expected %d", received.RttMs, c.rttMs)
+			if c.reason == connect.ExtenderProbeVerdictReasonOk && c.message == "" {
+				if !verdict.Accepted || verdict.Reason != connect.ExtenderProbeVerdictReasonOk {
+					t.Fatalf("refused: %v", verdict)
+				}
+				if !connect.VerifyExtenderProbeVerdict(publicKey, attestation, verdict) {
+					t.Fatal("the acceptance's co-signature does not verify")
 				}
 				return
 			}
-			err = waitForFixtureError(t, fixture, "probe gate")
-			if !strings.Contains(err.Error(), c.reason) {
-				t.Fatalf("refused for %q, expected %q", err, c.reason)
+			if verdict.Accepted || verdict.Reason != c.reason || 0 < len(verdict.Cosignature) {
+				t.Fatalf("verdict = %v, expected a refusal with reason %d", verdict, c.reason)
 			}
-			attestations.none(t)
+			err := waitForFixtureError(t, fixture, "probe gate")
+			if !strings.Contains(err.Error(), c.message) {
+				t.Fatalf("refused for %q, expected %q", err, c.message)
+			}
 		})
 	}
 }
 
 // The extender waits a bounded time for the attestation frame and closes the
-// stream; a provider that never sends one costs it nothing more.
+// stream with no verdict: there was no claim to judge.
 func TestExtenderProbeAttestationTimeout(t *testing.T) {
-	attestations := newTestAttestations()
-	fixture, publicKey := newTestProbeFixture(t, attestations, func(settings *ExtenderSettings) {
+	fixture, publicKey, _ := newTestProbeFixture(t, func(settings *ExtenderSettings) {
 		settings.ProbeAttestationTimeout = 200 * time.Millisecond
 	})
 	attestor, _ := newTestProviderAttestor(t)
 
-	_, _, _, closeProbe := dialTestAttestingProbe(t, fixture, publicKey, attestor)
+	conn, _, closeProbe := dialTestAttestingProbe(t, fixture, connect.ExtenderCarrierTcp, publicKey, attestor.ClientId.Bytes(), nil)
 	defer closeProbe()
 
 	err := waitForFixtureError(t, fixture, "probe attestation")
@@ -378,13 +605,94 @@ func TestExtenderProbeAttestationTimeout(t *testing.T) {
 	if !errors.As(err, &netErr) || !netErr.Timeout() {
 		t.Fatalf("the read ended with %v, expected a timeout", err)
 	}
-	attestations.none(t)
+	// the stream ends with nothing written after the response
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := io.Copy(io.Discard, conn); n != 0 {
+		t.Fatalf("the extender wrote %d bytes after a missing claim", n)
+	}
+}
+
+// A provider built before the verdict closes its side right after its frame,
+// or reads one byte and closes. The extender still judges the claim -- the
+// refusal is reported like any other -- a failed verdict write costs it
+// nothing, and it keeps serving.
+func TestExtenderProbeOldProviderClosesFirst(t *testing.T) {
+	fixture, publicKey, _ := newTestProbeFixture(t, func(settings *ExtenderSettings) {
+		// every case probes from the one loopback source
+		settings.ProbeMaxRatePerSource = 0
+	})
+	attestor, _ := newTestProviderAttestor(t)
+
+	for _, c := range []struct {
+		name string
+		// after the frame: close at once, or read the one byte the old
+		// provider waited for
+		readOne bool
+		// claim a deflated rtt, so the judgement is visible as a refusal
+		deflate bool
+	}{
+		{name: "closes, deflated", deflate: true},
+		{name: "reads one byte, deflated", readOne: true, deflate: true},
+		{name: "closes, honest"},
+		{name: "reads one byte, honest", readOne: true},
+	} {
+		drainFixtureErrors(fixture)
+		conn, nonce, closeProbe := dialTestAttestingProbe(t, fixture, connect.ExtenderCarrierTcp, publicKey, attestor.ClientId.Bytes(), nil)
+		rttMs := uint32(5000)
+		if c.deflate {
+			rttMs = 1
+			// holding the frame is the rtt the extender observes: it cannot
+			// arrive before it is written, so the interval is at least this
+			// whatever the scheduler does
+			time.Sleep(150 * time.Millisecond)
+		}
+		attestation := &protocol.ExtenderProbeAttestation{
+			ProbeClientId:     attestor.ClientId.Bytes(),
+			ExtenderPublicKey: publicKey,
+			ProbeNonce:        nonce,
+			RttMs:             rttMs,
+			TimestampMs:       uint64(time.Now().UnixMilli()),
+		}
+		if err := connect.SignExtenderProbeAttestation(attestor, attestation); err != nil {
+			t.Fatal(err)
+		}
+		writeTestAttestation(t, conn, attestation)
+		if c.readOne {
+			if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			io.Copy(io.Discard, io.LimitReader(conn, 1))
+		}
+		closeProbe()
+
+		if c.deflate {
+			if err := waitForFixtureError(t, fixture, "probe gate"); !strings.Contains(err.Error(), "below the observed") {
+				t.Fatalf("%s: refused for %v", c.name, err)
+			}
+		}
+		// the extender serves the next probe as if nothing happened, and the
+		// stages it reported are the gate's and, at most, the write of a
+		// verdict nobody read
+		probe := probeTestFixture(t, fixture, connect.ExtenderCarrierTcp, publicKey, attestor)
+		if probe.Outcome != connect.ExtenderPingCosigned {
+			t.Fatalf("%s: the next probe came to %q", c.name, probe.Outcome)
+		}
+		for _, err := range drainFixtureErrors(fixture) {
+			switch {
+			case strings.HasPrefix(err.Error(), "probe verdict:"):
+			case strings.HasPrefix(err.Error(), "probe gate:") && c.deflate:
+			default:
+				t.Fatalf("%s: an old provider's close was reported as %v", c.name, err)
+			}
+		}
+	}
 }
 
 // A source over its probe rate is refused before any of the above.
 func TestExtenderProbeRateLimitRefusesAFlood(t *testing.T) {
-	attestations := newTestAttestations()
-	fixture, publicKey := newTestProbeFixture(t, attestations, func(settings *ExtenderSettings) {
+	fixture, publicKey, _ := newTestProbeFixture(t, func(settings *ExtenderSettings) {
 		settings.ProbeMaxRatePerSource = 0.001
 		settings.ProbeMaxBurstPerSource = 2
 	})
@@ -417,7 +725,7 @@ func TestExtenderProbeRateLimitRefusesAFlood(t *testing.T) {
 // established carrier, not the handshake: it is small on loopback, and it is
 // set on every carrier.
 func TestExtenderProbeRoundTripBracketsTheRequest(t *testing.T) {
-	fixture, publicKey := newTestProbeFixture(t, nil, nil)
+	fixture, publicKey, _ := newTestProbeFixture(t, nil)
 	for _, carrier := range []string{connect.ExtenderCarrierTcp, connect.ExtenderCarrierQuic} {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		roundTrip := &connect.ExtenderRoundTrip{}
@@ -443,5 +751,41 @@ func TestExtenderProbeRoundTripBracketsTheRequest(t *testing.T) {
 		if !roundTrip.SendTime.After(start) {
 			t.Fatalf("%s: the request was marked sent before the dial began", carrier)
 		}
+	}
+}
+
+// The identity key signs co-signatures only under their domain: the same key
+// signs challenges and the certificate authority.
+func TestExtenderCertificatesSignOnlyCosignatures(t *testing.T) {
+	seed, err := connect.NewExtenderKeySeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificates, err := newExtenderCertificates(seed, DefaultExtenderSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cosignBytes := append([]byte(connect.ExtenderProbeCosignDomain), make([]byte, 176)...)
+	signature := certificates.SignProbeCosign(cosignBytes)
+	if !ed25519.Verify(certificates.PublicKey(), cosignBytes, signature) {
+		t.Fatal("the co-signature does not verify under the identity key")
+	}
+	for _, data := range [][]byte{
+		append([]byte(connect.ExtenderChallengeSignatureDomain), make([]byte, 32)...),
+		append([]byte(connect.ExtenderPeerProbeSignatureDomain), make([]byte, 108)...),
+		append([]byte(connect.ExtenderProbeSignatureDomain), make([]byte, 92)...),
+		{0x30, 0x82},
+		nil,
+	} {
+		if signature := certificates.SignProbeCosign(data); signature != nil {
+			t.Fatalf("the identity key signed %q as a co-signature", data)
+		}
+	}
+	anonymous, err := newExtenderCertificates(nil, DefaultExtenderSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signature := anonymous.SignProbeCosign(cosignBytes); signature != nil {
+		t.Fatal("an extender without an identity co-signed")
 	}
 }

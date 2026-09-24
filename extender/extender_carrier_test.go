@@ -10,6 +10,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -281,6 +282,18 @@ func TestExtenderCertificatesIssueForAnEmptyServerName(t *testing.T) {
 // serialized header, then the inner tls straight away.
 func newV1ExtenderDialTlsContext(t *testing.T, fixture *extenderFixture) func(context.Context, string, string) (net.Conn, error) {
 	t.Helper()
+	return newV1ExtenderDialTlsContextWithRoots(t, fixture, fixture.destination.rootCas)
+}
+
+// The same, with the inner tls verified against rootCas rather than the
+// fixture's own destination, which is what a chain of NLayer extenders ends at
+// (A11).
+func newV1ExtenderDialTlsContextWithRoots(
+	t *testing.T,
+	fixture *extenderFixture,
+	rootCas *x509.CertPool,
+) func(context.Context, string, string) (net.Conn, error) {
+	t.Helper()
 	return func(ctx context.Context, network string, address string) (net.Conn, error) {
 		host, portStr, err := net.SplitHostPort(address)
 		if err != nil {
@@ -323,7 +336,7 @@ func newV1ExtenderDialTlsContext(t *testing.T, fixture *extenderFixture) func(co
 
 		innerConn := tls.Client(outerConn, &tls.Config{
 			ServerName: host,
-			RootCAs:    fixture.destination.rootCAs,
+			RootCAs:    rootCas,
 		})
 		if err := innerConn.HandshakeContext(ctx); err != nil {
 			return nil, err

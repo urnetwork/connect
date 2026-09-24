@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -121,10 +122,38 @@ type ExtenderDirectorySettings struct {
 	RemoveConsecutiveFailureCount int
 	// Clock skew allowed against a record expiry.
 	RecordExpireSkew time.Duration
-	// Cap on known addresses. Over the cap the eviction order is expired,
-	// then never succeeded oldest first, then oldest last success. Manual
-	// addresses are never evicted.
+	// Cap on known addresses, the backstop beneath MaxActiveRecordCount: the
+	// default leaves room for the addresses of every active record of either
+	// family, the held, the retained expired and the bootstrap ones. Over the
+	// cap the eviction order is revoked, then expired beyond the retained ones
+	// oldest expiry first, then never succeeded oldest first, then oldest last
+	// success. Manual addresses and the addresses of the retained expired
+	// identities are never evicted. <= 0 keeps every address.
 	MaxAddressCount int
+	// The expired verified identities kept past their expiry, newest expiry
+	// first, with their addresses and local evidence. A record lives a day,
+	// so a client that loses every path to the operator would otherwise lose
+	// every extender it knew within a day. What is kept is the last tier of
+	// the candidate order and nothing more: never sampled into a feed or
+	// gossip, never counted as active or usable, dialed only after every
+	// current address. Beyond this many, `Expire` evicts the oldest expiry
+	// first. <= 0 keeps none.
+	MaxExpiredRecordCount int
+	// The active verified identities kept (GEOMAP §2.1, D26): the records of
+	// an active key with an address that is not held for failure, which is
+	// what a phone can hold and what a feed sample, the gossip mesh and a
+	// peer pinger draw from. The records on the hinted continent are
+	// preferred, then the measured ones, then a random sample of the rest:
+	// past the cap a new record from gossip or the feed evicts a random one
+	// of the rest -- possibly itself -- and only once there is none of the
+	// rest the oldest applied measured one, then the oldest applied one on
+	// the hinted continent. A held record and an expired one are never
+	// evicted by it, since their tiers keep their own bounds (MaxAddressCount
+	// and the removal policy, MaxExpiredRecordCount), nor are this extender's
+	// own record (KeepPublicKey) and a record with a manual address.
+	// SetMaxActiveRecordCount replaces it at run time. <= 0 keeps every
+	// record.
+	MaxActiveRecordCount int
 	// A change is saved this long after it lands, so a burst costs one write.
 	SaveTimeout time.Duration
 	// The trailing window the applied-record and applied-revocation rate is
@@ -133,12 +162,24 @@ type ExtenderDirectorySettings struct {
 	EventWindowTimeout time.Duration
 	// A latency sample older than this counts as never measured
 	// (DESIGNNOTES4.md §4): the ordering stops trusting it and a probe pass
-	// measures the address again. <= 0 keeps a sample for the life of the
-	// process.
+	// measures the address again. The default is half the day the operator
+	// keeps pings for, so a provider's attested pings are renewed before the
+	// previous ones age out of what each derivation reads (GEOMAP §2.1). <= 0
+	// keeps a sample for the life of the process.
 	LatencyMaxAge time.Duration
+	// How long an address that answered 429 with no Retry-After is left alone
+	// before the jitter, which is the same +-50 % a Retry-After gets (A12). A
+	// limited address is never a failure: it orders after every healthy one
+	// until its backoff passes, and the probe pass and the feed dial skip it.
+	ExtenderLimitedBackoff time.Duration
 
 	// The only clock the policy reads. Tests install a fake one.
 	Now func() time.Time
+	// When set, draws the uniform [0, 1) the active cap picks a random record
+	// to evict by, and a peer pinger its random slice. Nil is math/rand.
+	// Tests pin both with it. It is only ever called with the directory's
+	// state lock held.
+	Random func() float64
 }
 
 func DefaultExtenderDirectorySettings() *ExtenderDirectorySettings {
@@ -150,10 +191,13 @@ func DefaultExtenderDirectorySettings() *ExtenderDirectorySettings {
 		StaleSuccessRemoveTimeout:      7 * 24 * time.Hour,
 		RemoveConsecutiveFailureCount:  3,
 		RecordExpireSkew:               5 * time.Minute,
-		MaxAddressCount:                512,
+		MaxAddressCount:                2048,
+		MaxExpiredRecordCount:          64,
+		MaxActiveRecordCount:           512,
 		SaveTimeout:                    1 * time.Second,
 		EventWindowTimeout:             60 * time.Second,
-		LatencyMaxAge:                  24 * time.Hour,
+		LatencyMaxAge:                  12 * time.Hour,
+		ExtenderLimitedBackoff:         30 * time.Second,
 		Now:                            time.Now,
 	}
 }
@@ -169,6 +213,19 @@ type extenderDirectoryRecord struct {
 
 	revocation     *protocol.ExtenderRevocation
 	revocationBody *protocol.ExtenderRevocationBody
+
+	// every address a record of this key has listed, parsed, in the order
+	// first listed; one another key has claimed since, or that the directory
+	// dropped, is skipped wherever it is read and forgotten by a rebuild of
+	// the tier index
+	ips []netip.Addr
+	// the order the records were applied in, which is the order the active
+	// cap evicts a preferred record in, the oldest first
+	applySerial uint64
+	// the pool of the active tier index the key is in, and its index there
+	// (net_extender_directory_tier.go)
+	tierPool  extenderTierPool
+	tierIndex int
 }
 
 // The local evidence about one address. `publicKeyHex` is empty while the
@@ -188,10 +245,13 @@ type extenderDirectoryAddress struct {
 	holdUntilTime           time.Time
 	lastUseTime             time.Time
 	inUseCount              int
+	// the address answered 429 and is left alone until then (A12); per
+	// process, never stored, and never a failure
+	limitedUntilTime time.Time
 
 	// the latest latency sample (DESIGNNOTES4.md): the lowest rtt of one
-	// probe pass, when it was taken and whether that pass attested it to
-	// the operator. Per process; never stored.
+	// probe pass, when it was taken and whether the target co-signed a claim
+	// of that pass (GEOMAP §2.3). Per process; never stored.
 	latency         time.Duration
 	latencyTime     time.Time
 	latencyAttested bool
@@ -225,11 +285,19 @@ type ExtenderCandidate struct {
 	ContinentCode string
 	// The current latency sample, zero when there is none (DESIGNNOTES4.md).
 	Latency time.Duration
-	// Whether the sample was attested to the operator, which a provider's
-	// probe pass reads to find what it has not attested yet.
+	// Whether the target co-signed a claim of the pass that took the sample
+	// (GEOMAP §2.3), which a provider's probe pass reads to find what it has
+	// no co-signed measurement of yet.
 	LatencyAttested bool
 	Source          string
 	Verified        bool
+	// Whether the record has expired: the candidate is one of the retained
+	// expired identities (MaxExpiredRecordCount), which only the last tier of
+	// Candidates carries.
+	Expired bool
+	// When the address stops being limited (A12), zero when it is not: it
+	// answered 429, and a caller leaves it alone until then.
+	LimitedUntil time.Time
 }
 
 // The dns carrier ports of one candidate in dial order (L2). DnsPorts when it
@@ -262,6 +330,8 @@ type ExtenderDirectoryEntry struct {
 	FailureCount    int
 	InUse           int
 	ExpireTime      time.Time
+	// When the address stops being limited (A12), zero when it is not.
+	LimitedUntil time.Time
 }
 
 // The whole directory as the status reads it, with the counts the sdk exposes
@@ -296,10 +366,13 @@ type ExtenderDirectory struct {
 	stateLock  sync.Mutex
 	rootKeySet *ExtenderRootKeySet
 	// The apply times of the records and revocations that arrived over the
-	// feed or the mesh, oldest first, pruned to the event window (K4). Only
-	// those two sources count: a stored record loaded at start and an address
-	// added by hand are not network events.
+	// feed or the mesh, oldest first from eventHead, pruned to the event
+	// window (K4). Only those two sources count: a stored record loaded at
+	// start and an address added by hand are not network events. The pruned
+	// prefix before eventHead is reclaimed once it is half the slice, so a
+	// flood of applies costs each one constant time.
 	eventTimes []time.Time
+	eventHead  int
 	// the continent the candidate order prefers, upper case, empty until the
 	// network client learns one (DESIGNNOTES4.md §4)
 	continentHint string
@@ -312,6 +385,20 @@ type ExtenderDirectory struct {
 	// the live subscriptions of Subscribe, which the feed server of phase 5a
 	// streams from
 	subscriptions map[*extenderDirectorySubscription]bool
+
+	// the active tier index (net_extender_directory_tier.go): the keys of
+	// each pool, the earliest time a pooled record changes pool with the
+	// clock alone, zero when none will, and the version of the near pool
+	tierPoolKeyHexes [extenderTierPoolCount][]string
+	tierSweepTime    time.Time
+	tierNearVersion  uint64
+	// the keys whose records the active cap never evicts (KeepPublicKey)
+	keptKeyHexes map[string]bool
+	// the active cap in force: MaxActiveRecordCount, until
+	// SetMaxActiveRecordCount replaces it
+	maxActiveRecordCount int
+	// the serial the next applied record takes
+	nextApplySerial uint64
 }
 
 // One live subscription to the applied messages (D4). The channel is the
@@ -354,6 +441,8 @@ func NewExtenderDirectory(
 		keyHexRecords:        map[string]*extenderDirectoryRecord{},
 		ipAddresses:          map[netip.Addr]*extenderDirectoryAddress{},
 		subscriptions:        map[*extenderDirectorySubscription]bool{},
+		keptKeyHexes:         map[string]bool{},
+		maxActiveRecordCount: settings.MaxActiveRecordCount,
 	}
 	self.load()
 	// arm the save loop's subscription here, not inside the goroutine: a
@@ -431,7 +520,7 @@ func (self *ExtenderDirectory) SetRootKeys(keySet *ExtenderRootKeySet) {
 				}
 			}
 			if keyRecord.record == nil && keyRecord.revocation == nil {
-				delete(self.keyHexRecords, keyHex)
+				self.deleteKeyRecordWithLock(keyHex)
 				// the addresses that record produced become unverified rather
 				// than disappearing: the local evidence about them is still
 				// evidence, and a later record can claim them again
@@ -443,6 +532,7 @@ func (self *ExtenderDirectory) SetRootKeys(keySet *ExtenderRootKeySet) {
 			}
 		}
 		if changed {
+			self.tierRebuildWithLock(self.settings.Now())
 			self.changedWithLock()
 		}
 	}()
@@ -481,7 +571,9 @@ func (self *ExtenderDirectory) ApplySource(
 
 // Applies one signed record. A record older than the one already held for the
 // key changes nothing, which is what makes the newest-wins rule of B5 order
-// independent.
+// independent. A record new to a directory at MaxActiveRecordCount evicts one
+// it prefers less -- a random one off the hinted continent and unmeasured,
+// possibly this one -- and is published to the subscribers either way.
 func (self *ExtenderDirectory) ApplyRecord(
 	record *protocol.ExtenderRecord,
 	source string,
@@ -497,10 +589,34 @@ func (self *ExtenderDirectory) ApplyRecord(
 	if len(body.PublicKey) == 0 {
 		return false, fmt.Errorf("extender record carries no public key")
 	}
+	return self.applyVerifiedRecord(record, body, source), nil
+}
+
+// Applies one record whose body has been verified and whose network host is
+// allowed: what ApplyRecord does once the signature holds. Past
+// MaxActiveRecordCount a record new to the directory evicts one the directory
+// prefers less, which may be this one; the record is published to the
+// subscribers either way, whose own caps judge it.
+func (self *ExtenderDirectory) applyVerifiedRecord(
+	record *protocol.ExtenderRecord,
+	body *protocol.ExtenderRecordBody,
+	source string,
+) (changed bool) {
 	if source == "" {
 		source = ExtenderSourceFeed
 	}
 	keyHex := hex.EncodeToString(body.PublicKey)
+	// the addresses are parsed before the lock is taken, each once
+	ips := make([]netip.Addr, 0, len(body.Addresses))
+	for _, recordAddress := range body.Addresses {
+		ip, parseErr := netip.ParseAddr(recordAddress.Ip)
+		if parseErr != nil || !ip.IsValid() {
+			continue
+		}
+		if ip = ip.Unmap(); !slices.Contains(ips, ip) {
+			ips = append(ips, ip)
+		}
+	}
 	now := self.settings.Now()
 
 	self.stateLock.Lock()
@@ -508,23 +624,27 @@ func (self *ExtenderDirectory) ApplyRecord(
 
 	keyRecord := self.keyHexRecords[keyHex]
 	if keyRecord == nil {
+		// the body is kept as the record's for as long as the key is, so its
+		// key is the record's own
 		keyRecord = &extenderDirectoryRecord{
-			publicKey: slices.Clone(body.PublicKey),
+			publicKey: body.PublicKey,
 		}
 		self.keyHexRecords[keyHex] = keyRecord
 	} else if keyRecord.recordBody != nil && body.IssueTimeMs <= keyRecord.recordBody.IssueTimeMs {
 		// an older or identical record; the newest one already held wins
-		return false, nil
+		return false
 	}
 	keyRecord.record = record
 	keyRecord.recordBody = body
+	keyRecord.applySerial = self.nextApplySerial
+	self.nextApplySerial += 1
+	if keyRecord.ips == nil {
+		// a key new to the directory takes the parsed addresses as they are,
+		// and the loop below finds each one already listed
+		keyRecord.ips = ips
+	}
 
-	for _, recordAddress := range body.Addresses {
-		ip, parseErr := netip.ParseAddr(recordAddress.Ip)
-		if parseErr != nil || !ip.IsValid() {
-			continue
-		}
-		ip = ip.Unmap()
+	for _, ip := range ips {
 		address := self.ipAddresses[ip]
 		if address == nil {
 			address = &extenderDirectoryAddress{
@@ -535,16 +655,30 @@ func (self *ExtenderDirectory) ApplyRecord(
 			self.ipAddresses[ip] = address
 		}
 		// an unverified bootstrap address upgrades here, keeping the local
-		// evidence it collected before any record named it
+		// evidence it collected before any record named it; an address
+		// another key held moves to this one
+		previousKeyHex := address.publicKeyHex
 		address.publicKeyHex = keyHex
+		if previousKeyHex != "" && previousKeyHex != keyHex {
+			self.tierUpdateWithLock(previousKeyHex, now)
+		}
+		if !slices.Contains(keyRecord.ips, ip) {
+			keyRecord.ips = append(keyRecord.ips, ip)
+		}
 	}
+	self.tierUpdateWithLock(keyHex, now)
+	self.enforceActiveRecordCapWithLock(now)
 	self.enforceAddressCapWithLock(now)
 	self.noteEventWithLock(source, now)
-	self.publishWithLock(&protocol.ExtenderGossipMessage{
-		Message: &protocol.ExtenderGossipMessage_Record{Record: record},
-	})
+	// the message is built only for a subscriber, since a directory fed a
+	// record a millisecond pays for everything it builds per record
+	if 0 < len(self.subscriptions) {
+		self.publishWithLock(&protocol.ExtenderGossipMessage{
+			Message: &protocol.ExtenderGossipMessage_Record{Record: record},
+		})
+	}
 	self.changedWithLock()
-	return true, nil
+	return true
 }
 
 // Applies one signed revocation that arrived over the feed, which is what
@@ -591,10 +725,14 @@ func (self *ExtenderDirectory) ApplyRevocationSource(
 	}
 	keyRecord.revocation = revocation
 	keyRecord.revocationBody = body
-	self.noteEventWithLock(source, self.settings.Now())
-	self.publishWithLock(&protocol.ExtenderGossipMessage{
-		Message: &protocol.ExtenderGossipMessage_Revocation{Revocation: revocation},
-	})
+	now := self.settings.Now()
+	self.tierUpdateWithLock(keyHex, now)
+	self.noteEventWithLock(source, now)
+	if 0 < len(self.subscriptions) {
+		self.publishWithLock(&protocol.ExtenderGossipMessage{
+			Message: &protocol.ExtenderGossipMessage_Revocation{Revocation: revocation},
+		})
+	}
 	self.changedWithLock()
 	return true, nil
 }
@@ -853,6 +991,8 @@ func (self *ExtenderDirectory) AddManual(ip netip.Addr) (changed bool) {
 			return false
 		}
 		address.source = ExtenderSourceManual
+		// a record with a manual address is kept by the active cap
+		self.tierUpdateAddressWithLock(address, now)
 		self.changedWithLock()
 		return true
 	}
@@ -891,6 +1031,7 @@ func (self *ExtenderDirectory) RecordSuccess(ip netip.Addr, connectMode Extender
 	if self.log.V(2).Enabled() {
 		self.log.Infof("[extender]success %s %s\n", ip, connectMode)
 	}
+	self.tierUpdateAddressWithLock(address, now)
 	self.changedWithLock()
 }
 
@@ -925,7 +1066,62 @@ func (self *ExtenderDirectory) RecordFailure(ip netip.Addr, connectMode Extender
 		delete(self.ipAddresses, ip)
 		self.pruneKeyRecordsWithLock()
 	}
+	self.tierUpdateAddressWithLock(address, now)
 	self.changedWithLock()
+}
+
+// Records a 429 from an address (A12): it is left alone until the Retry-After
+// it answered with, or ExtenderLimitedBackoff when it gave none, jittered by
+// +-50 % and never past MaxHoldTimeout. A limit is not a failure: no failure
+// count, no hold, nothing toward removal. A later backoff is never shortened
+// by an earlier one. Returns when the address stops being limited, zero for an
+// address the directory does not know, which it records nothing for.
+func (self *ExtenderDirectory) RecordLimited(ip netip.Addr, retryAfter time.Duration) time.Time {
+	if !ip.IsValid() {
+		return time.Time{}
+	}
+	ip = ip.Unmap()
+	now := self.settings.Now()
+	backoff := min(
+		JitterExtenderLimitedBackoff(retryAfter, self.settings.ExtenderLimitedBackoff),
+		self.settings.MaxHoldTimeout,
+	)
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	address := self.ipAddresses[ip]
+	if address == nil {
+		return time.Time{}
+	}
+	address.lastUseTime = now
+	if limitedUntilTime := now.Add(backoff); address.limitedUntilTime.Before(limitedUntilTime) {
+		address.limitedUntilTime = limitedUntilTime
+	}
+	if self.log.V(2).Enabled() {
+		self.log.Infof("[extender]limited %s until %s\n", ip, address.limitedUntilTime)
+	}
+	self.changedWithLock()
+	return address.limitedUntilTime
+}
+
+// When one address stops being limited, zero when it is not limited now or
+// is not known (A12).
+func (self *ExtenderDirectory) AddressLimitedUntil(ip netip.Addr) time.Time {
+	if !ip.IsValid() {
+		return time.Time{}
+	}
+	ip = ip.Unmap()
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	address := self.ipAddresses[ip]
+	if address == nil || !now.Before(address.limitedUntilTime) {
+		return time.Time{}
+	}
+	return address.limitedUntilTime
 }
 
 // Adjusts the in-use count of one address, which the status reports. A
@@ -964,6 +1160,8 @@ func (self *ExtenderDirectory) SetContinentHint(continentCode string) (changed b
 		return false
 	}
 	self.continentHint = continentCode
+	// every record's preference follows the hint
+	self.tierRebuildWithLock(self.settings.Now())
 	self.changedWithLock()
 	return true
 }
@@ -976,9 +1174,11 @@ func (self *ExtenderDirectory) ContinentHint() string {
 }
 
 // RecordLatency stores the outcome of one probe pass over an address: the
-// lowest rtt it measured and whether that pass attested it to the operator
-// (DESIGNNOTES4.md). The sample is per process and ages out after
-// LatencyMaxAge; it is never stored, because yesterday's path is not today's.
+// lowest rtt it measured and whether the target co-signed a claim of that
+// pass (DESIGNNOTES4.md, GEOMAP §2.3) -- a claim merely sent, refused or left
+// without a verdict does not count. The sample is per process and ages out
+// after LatencyMaxAge; it is never stored, because yesterday's path is not
+// today's.
 func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, attested bool) {
 	if !ip.IsValid() || rtt <= 0 {
 		return
@@ -1000,6 +1200,8 @@ func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, a
 	if self.log.V(2).Enabled() {
 		self.log.Infof("[extender]latency %s %s attested=%t\n", ip, rtt, attested)
 	}
+	// a measured record is preferred by the active cap
+	self.tierUpdateAddressWithLock(address, now)
 	self.changedWithLock()
 }
 
@@ -1020,8 +1222,9 @@ func (self *ExtenderDirectory) holdTimeout(consecutiveFailureCount int) time.Dur
 	return min(holdTimeout, self.settings.MaxHoldTimeout)
 }
 
-// Applies the removal policy and the address cap. The network client calls it
-// on its refresh tick, so a directory that is only read still ages.
+// Applies the removal policy, the expired retention and the address cap. The
+// network client calls it on its refresh tick, so a directory that is only
+// read still ages.
 func (self *ExtenderDirectory) Expire(now time.Time) (changed bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -1032,10 +1235,19 @@ func (self *ExtenderDirectory) Expire(now time.Time) (changed bool) {
 			changed = true
 		}
 	}
+	if self.evictExpiredWithLock(now) {
+		changed = true
+	}
 	if self.enforceAddressCapWithLock(now) {
 		changed = true
 	}
 	if self.pruneKeyRecordsWithLock() {
+		changed = true
+	}
+	// the tick is also where the index is rebuilt from scratch, whatever it
+	// has missed, and the active cap met again
+	self.tierRebuildWithLock(now)
+	if self.enforceActiveRecordCapWithLock(now) {
 		changed = true
 	}
 	if changed {
@@ -1052,6 +1264,12 @@ func (self *ExtenderDirectory) Expire(now time.Time) (changed bool) {
 // because the strategy does its own weighting on top and a stable order makes
 // the policy testable. With no hint and no samples it is the order it always
 // was.
+//
+// After every active address and every manual one comes the last tier: the
+// unheld addresses of the retained expired identities (MaxExpiredRecordCount),
+// the newest expiry first and then the same order, so a client that has lost
+// every current path can still try the extenders it last knew. They fill only
+// what `count` leaves.
 func (self *ExtenderDirectory) Candidates(
 	ipVersion int,
 	count int,
@@ -1069,35 +1287,133 @@ func (self *ExtenderDirectory) Candidates(
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	addresses := self.usableAddressesWithLock(ipVersion, now, excludeIps)
-	slices.SortFunc(addresses, func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
+	compareUsable := func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
 		if c := compareExtenderVerified(a, b); c != 0 {
 			return c
 		}
-		if c := self.compareProximityWithLock(a, b, now, false, false); c != 0 {
+		return self.compareCandidateWithLock(a, b, now)
+	}
+	compareExpired := func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
+		if c := compareExpiredKeyRecords(
+			a.publicKeyHex,
+			self.keyHexRecords[a.publicKeyHex],
+			b.publicKeyHex,
+			self.keyHexRecords[b.publicKeyHex],
+		); c != 0 {
 			return c
 		}
-		if a.consecutiveFailureCount != b.consecutiveFailureCount {
-			return a.consecutiveFailureCount - b.consecutiveFailureCount
-		}
-		if !a.lastSuccessTime.Equal(b.lastSuccessTime) {
-			// the most recent success first
-			if a.lastSuccessTime.After(b.lastSuccessTime) {
-				return -1
+		return self.compareCandidateWithLock(a, b, now)
+	}
+	// a limited address comes after every healthy one, whatever its latency
+	// or continent, and the one whose backoff ends first leads them (A12)
+	compareLimited := func(compare func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int) func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
+		return func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
+			if c := a.limitedUntilTime.Compare(b.limitedUntilTime); c != 0 {
+				return c
 			}
-			return 1
+			return compare(a, b)
 		}
-		return strings.Compare(a.ip.String(), b.ip.String())
-	})
+	}
+	usableAddresses, limitedUsableAddresses := splitExtenderLimitedAddresses(
+		self.usableAddressesWithLock(ipVersion, now, excludeIps),
+		now,
+	)
+	expiredAddresses, limitedExpiredAddresses := splitExtenderLimitedAddresses(
+		self.retainedExpiredAddressesWithLock(ipVersion, now, excludeIps),
+		now,
+	)
+	tiers := []struct {
+		addresses []*extenderDirectoryAddress
+		compare   func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int
+	}{
+		{addresses: usableAddresses, compare: compareUsable},
+		{addresses: expiredAddresses, compare: compareExpired},
+		{addresses: limitedUsableAddresses, compare: compareLimited(compareUsable)},
+		{addresses: limitedExpiredAddresses, compare: compareLimited(compareExpired)},
+	}
 
 	candidates := []*ExtenderCandidate{}
-	for _, address := range addresses {
-		if count <= len(candidates) {
-			break
+	for _, tier := range tiers {
+		slices.SortFunc(tier.addresses, tier.compare)
+		for _, address := range tier.addresses {
+			if count <= len(candidates) {
+				return candidates
+			}
+			candidates = append(candidates, self.candidateWithLock(address, now))
 		}
-		candidates = append(candidates, self.candidateWithLock(address, now))
 	}
 	return candidates
+}
+
+// The addresses that are not limited now, and those that are (A12), each in
+// the order given.
+func splitExtenderLimitedAddresses(
+	addresses []*extenderDirectoryAddress,
+	now time.Time,
+) ([]*extenderDirectoryAddress, []*extenderDirectoryAddress) {
+	healthyAddresses := []*extenderDirectoryAddress{}
+	limitedAddresses := []*extenderDirectoryAddress{}
+	for _, address := range addresses {
+		if now.Before(address.limitedUntilTime) {
+			limitedAddresses = append(limitedAddresses, address)
+		} else {
+			healthyAddresses = append(healthyAddresses, address)
+		}
+	}
+	return healthyAddresses, limitedAddresses
+}
+
+// The candidate order after the tier: proximity, then fewest consecutive
+// failures, then the most recent success, then the address.
+func (self *ExtenderDirectory) compareCandidateWithLock(
+	a *extenderDirectoryAddress,
+	b *extenderDirectoryAddress,
+	now time.Time,
+) int {
+	if c := self.compareProximityWithLock(a, b, now, false, false); c != 0 {
+		return c
+	}
+	if a.consecutiveFailureCount != b.consecutiveFailureCount {
+		return a.consecutiveFailureCount - b.consecutiveFailureCount
+	}
+	if !a.lastSuccessTime.Equal(b.lastSuccessTime) {
+		// the most recent success first
+		if a.lastSuccessTime.After(b.lastSuccessTime) {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(a.ip.String(), b.ip.String())
+}
+
+// The unheld addresses of one family whose identity is one of the retained
+// expired ones. `excludeIps` may be nil.
+func (self *ExtenderDirectory) retainedExpiredAddressesWithLock(
+	ipVersion int,
+	now time.Time,
+	excludeIps map[netip.Addr]bool,
+) []*extenderDirectoryAddress {
+	retained, _ := self.retainedExpiredKeyHexesWithLock(now)
+	addresses := []*extenderDirectoryAddress{}
+	if len(retained) == 0 {
+		return addresses
+	}
+	for ip, address := range self.ipAddresses {
+		if excludeIps[ip] {
+			continue
+		}
+		if ipVersion != 0 && addressIpVersion(ip) != ipVersion {
+			continue
+		}
+		if now.Before(address.holdUntilTime) {
+			continue
+		}
+		if !retained[address.publicKeyHex] {
+			continue
+		}
+		addresses = append(addresses, address)
+	}
+	return addresses
 }
 
 // The usable addresses of one family: not held, dialable, key active. The
@@ -1181,21 +1497,7 @@ func (self *ExtenderDirectory) compareProximityWithLock(
 // address, or a record that predates the continent field. With no hint every
 // address is tier 0, which leaves the order what it was.
 func (self *ExtenderDirectory) continentTierWithLock(address *extenderDirectoryAddress) int {
-	if self.continentHint == "" {
-		return 0
-	}
-	keyRecord := self.keyHexRecords[address.publicKeyHex]
-	if keyRecord == nil || keyRecord.recordBody == nil {
-		return 2
-	}
-	switch continentCode := strings.ToUpper(strings.TrimSpace(keyRecord.recordBody.ContinentCode)); continentCode {
-	case "":
-		return 2
-	case self.continentHint:
-		return 0
-	default:
-		return 1
-	}
+	return self.continentTierOfRecordWithLock(self.keyHexRecords[address.publicKeyHex])
 }
 
 // The current latency sample of an address, and whether there is one: a sample
@@ -1221,7 +1523,9 @@ func (self *ExtenderDirectory) latencyWithLock(
 // (DESIGNNOTES4.md §4): the hinted continent first, and within a tier the
 // addresses with no current sample before those with one, so the prior saves
 // probes rather than merely reordering them. `attesting` treats an unattested
-// sample as none, which is what a provider's pass has yet to do.
+// sample as none, which is what a provider's pass has yet to do. A limited
+// address is left out until its backoff passes (A12): a probe of it would be
+// turned away again, and a limit is never a measurement.
 func (self *ExtenderDirectory) ProbeCandidates(
 	ipVersion int,
 	count int,
@@ -1235,7 +1539,7 @@ func (self *ExtenderDirectory) ProbeCandidates(
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	addresses := self.usableAddressesWithLock(ipVersion, now, nil)
+	addresses, _ := splitExtenderLimitedAddresses(self.usableAddressesWithLock(ipVersion, now, nil), now)
 	slices.SortFunc(addresses, func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
 		if c := compareExtenderVerified(a, b); c != 0 {
 			return c
@@ -1293,6 +1597,9 @@ func (self *ExtenderDirectory) candidateWithLock(
 		DnsTld:    DefaultExtenderDnsTld,
 		Source:    address.source,
 	}
+	if now.Before(address.limitedUntilTime) {
+		candidate.LimitedUntil = address.limitedUntilTime
+	}
 	if latency, measured := self.latencyWithLock(address, now, false); measured {
 		candidate.Latency = latency
 		candidate.LatencyAttested = address.latencyAttested
@@ -1303,6 +1610,7 @@ func (self *ExtenderDirectory) candidateWithLock(
 	}
 	body := keyRecord.recordBody
 	candidate.Verified = true
+	candidate.Expired = self.keyRecordExpiredWithLock(keyRecord, now)
 	candidate.PublicKey = slices.Clone(keyRecord.publicKey)
 	candidate.CountryCode = body.CountryCode
 	candidate.ContinentCode = strings.ToUpper(strings.TrimSpace(body.ContinentCode))
@@ -1429,6 +1737,119 @@ func (self *ExtenderDirectory) keyRecordExpiredWithLock(
 	return expireTime.Before(now)
 }
 
+// Whether an identity is merely expired: a verified record, not revoked, past
+// its expiry. That is the only kind the directory retains past its record
+// (MaxExpiredRecordCount); a revoked key is never a last resort.
+func (self *ExtenderDirectory) keyRecordLapsedWithLock(
+	keyRecord *extenderDirectoryRecord,
+	now time.Time,
+) bool {
+	if keyRecord == nil || keyRecord.recordBody == nil {
+		return false
+	}
+	if self.keyRecordRevokedWithLock(keyRecord) {
+		return false
+	}
+	return self.keyRecordExpiredWithLock(keyRecord, now)
+}
+
+// The order the expired identities are retained in: the newest expiry first,
+// the key breaking a tie so the order is total and the retained set stable.
+// Both records must be lapsed.
+func compareExpiredKeyRecords(
+	aKeyHex string,
+	a *extenderDirectoryRecord,
+	bKeyHex string,
+	b *extenderDirectoryRecord,
+) int {
+	aExpireTimeMs := a.recordBody.ExpireTimeMs
+	bExpireTimeMs := b.recordBody.ExpireTimeMs
+	if aExpireTimeMs != bExpireTimeMs {
+		if bExpireTimeMs < aExpireTimeMs {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(aKeyHex, bKeyHex)
+}
+
+// The retained expired identities -- the newest MaxExpiredRecordCount of the
+// lapsed ones -- and the rest, oldest expiry first, which is the order the
+// policy evicts them in.
+func (self *ExtenderDirectory) retainedExpiredKeyHexesWithLock(
+	now time.Time,
+) (retained map[string]bool, evictable []string) {
+	keyHexes := []string{}
+	for keyHex, keyRecord := range self.keyHexRecords {
+		if self.keyRecordLapsedWithLock(keyRecord, now) {
+			keyHexes = append(keyHexes, keyHex)
+		}
+	}
+	slices.SortFunc(keyHexes, func(a string, b string) int {
+		return compareExpiredKeyRecords(a, self.keyHexRecords[a], b, self.keyHexRecords[b])
+	})
+	retainCount := min(len(keyHexes), max(0, self.settings.MaxExpiredRecordCount))
+	retained = map[string]bool{}
+	for _, keyHex := range keyHexes[0:retainCount] {
+		retained[keyHex] = true
+	}
+	evictable = slices.Clone(keyHexes[retainCount:])
+	slices.Reverse(evictable)
+	return retained, evictable
+}
+
+// Whether one identity is among the retained expired ones, without building
+// the whole set: it is lapsed and fewer than MaxExpiredRecordCount lapsed
+// identities come before it.
+func (self *ExtenderDirectory) keyRetainedExpiredWithLock(keyHex string, now time.Time) bool {
+	keyRecord := self.keyHexRecords[keyHex]
+	if !self.keyRecordLapsedWithLock(keyRecord, now) {
+		return false
+	}
+	newerCount := 0
+	for otherKeyHex, otherKeyRecord := range self.keyHexRecords {
+		if otherKeyHex == keyHex || !self.keyRecordLapsedWithLock(otherKeyRecord, now) {
+			continue
+		}
+		if compareExpiredKeyRecords(otherKeyHex, otherKeyRecord, keyHex, keyRecord) < 0 {
+			newerCount += 1
+			if self.settings.MaxExpiredRecordCount <= newerCount {
+				return false
+			}
+		}
+	}
+	return newerCount < self.settings.MaxExpiredRecordCount
+}
+
+// Evicts the expired identities beyond the retained count, oldest expiry
+// first, with their addresses. A manual address outlives its identity as an
+// unverified manual entry, as it does a root key rotation, and a revocation
+// the identity carried is kept so a replayed record cannot bring the key back.
+func (self *ExtenderDirectory) evictExpiredWithLock(now time.Time) (changed bool) {
+	_, evictable := self.retainedExpiredKeyHexesWithLock(now)
+	for _, keyHex := range evictable {
+		keyRecord := self.keyHexRecords[keyHex]
+		keyRecord.record = nil
+		keyRecord.recordBody = nil
+		self.tierRemoveWithLock(keyHex, keyRecord)
+		if keyRecord.revocation == nil {
+			self.deleteKeyRecordWithLock(keyHex)
+		}
+		for ip, address := range self.ipAddresses {
+			if address.publicKeyHex != keyHex {
+				continue
+			}
+			if address.source == ExtenderSourceManual {
+				address.publicKeyHex = ""
+				continue
+			}
+			delete(self.ipAddresses, ip)
+		}
+		changed = true
+	}
+	return changed
+}
+
 // The removal policy of E1. A manual address is never removed by policy: it
 // was configured by hand and only a reconfiguration takes it away.
 func (self *ExtenderDirectory) shouldRemoveWithLock(
@@ -1448,16 +1869,23 @@ func (self *ExtenderDirectory) shouldRemoveWithLock(
 		self.settings.RemoveConsecutiveFailureCount <= address.consecutiveFailureCount
 }
 
-// Evicts down to the address cap: expired first, then never succeeded oldest
-// first, then oldest last success. Manual addresses are never evicted, so a
-// cap smaller than the manual set simply holds more than the cap.
+// Evicts down to the address cap: revoked first, then expired beyond the
+// retained identities oldest expiry first, then never succeeded oldest first,
+// then oldest last success. Manual addresses and the addresses of the
+// retained expired identities are never evicted, so a cap smaller than those
+// simply holds more than the cap.
 func (self *ExtenderDirectory) enforceAddressCapWithLock(now time.Time) (changed bool) {
 	if self.settings.MaxAddressCount <= 0 || len(self.ipAddresses) <= self.settings.MaxAddressCount {
 		return false
 	}
+	retained, _ := self.retainedExpiredKeyHexesWithLock(now)
 	evictable := []*extenderDirectoryAddress{}
 	for _, address := range self.ipAddresses {
 		if address.source == ExtenderSourceManual {
+			continue
+		}
+		if retained[address.publicKeyHex] {
+			// the last resort of a client that lost every current path
 			continue
 		}
 		evictable = append(evictable, address)
@@ -1471,12 +1899,28 @@ func (self *ExtenderDirectory) enforceAddressCapWithLock(now time.Time) (changed
 		}
 		return 2
 	}
+	// within the inactive tier a revoked key goes before an expired one, and
+	// the expired go oldest expiry first
+	expireTimeMs := func(address *extenderDirectoryAddress) uint64 {
+		keyRecord := self.keyHexRecords[address.publicKeyHex]
+		if !self.keyRecordLapsedWithLock(keyRecord, now) {
+			return 0
+		}
+		return keyRecord.recordBody.ExpireTimeMs
+	}
 	slices.SortFunc(evictable, func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
 		aTier, bTier := tier(a), tier(b)
 		if aTier != bTier {
 			return aTier - bTier
 		}
 		switch aTier {
+		case 0:
+			if aExpireTimeMs, bExpireTimeMs := expireTimeMs(a), expireTimeMs(b); aExpireTimeMs != bExpireTimeMs {
+				if aExpireTimeMs < bExpireTimeMs {
+					return -1
+				}
+				return 1
+			}
 		case 1:
 			// the oldest known first
 			if !a.addTime.Equal(b.addTime) {
@@ -1505,13 +1949,17 @@ func (self *ExtenderDirectory) enforceAddressCapWithLock(now time.Time) (changed
 	}
 	if changed {
 		self.pruneKeyRecordsWithLock()
+		// a record that lost an address may be in another pool now
+		self.tierRebuildWithLock(now)
 	}
 	return changed
 }
 
 // Drops identities that no longer describe anything: no address and no
-// revocation to enforce.
+// revocation to enforce. A retained expired identity is kept either way; it is
+// evicted only once it falls beyond the retained count, by `Expire`.
 func (self *ExtenderDirectory) pruneKeyRecordsWithLock() (changed bool) {
+	retained, _ := self.retainedExpiredKeyHexesWithLock(self.settings.Now())
 	referencedKeyHexes := map[string]bool{}
 	for _, address := range self.ipAddresses {
 		if address.publicKeyHex != "" {
@@ -1519,10 +1967,10 @@ func (self *ExtenderDirectory) pruneKeyRecordsWithLock() (changed bool) {
 		}
 	}
 	for keyHex, keyRecord := range self.keyHexRecords {
-		if referencedKeyHexes[keyHex] || keyRecord.revocation != nil {
+		if referencedKeyHexes[keyHex] || keyRecord.revocation != nil || retained[keyHex] {
 			continue
 		}
-		delete(self.keyHexRecords, keyHex)
+		self.deleteKeyRecordWithLock(keyHex)
 		changed = true
 	}
 	return changed
@@ -1556,6 +2004,7 @@ func (self *ExtenderDirectory) Snapshot() *ExtenderDirectorySnapshot {
 			SuccessCount:    address.successCount,
 			FailureCount:    address.failureCount,
 			InUse:           address.inUseCount,
+			LimitedUntil:    candidate.LimitedUntil,
 		}
 		if keyRecord := self.keyHexRecords[address.publicKeyHex]; keyRecord != nil && keyRecord.recordBody != nil {
 			if 0 < keyRecord.recordBody.ExpireTimeMs {
@@ -1637,8 +2086,35 @@ func (self *ExtenderDirectory) UsableCount(ipVersion int) int {
 	return count
 }
 
+// Whether the directory holds an active record for this identity key: verified under the root keys, not revoked and not expired
+// (B5). Local dial evidence plays no part -- a held address is still an
+// extender the operator vouched for. It is what an extender asks of a pinger
+// that names itself by its key (GEOMAP §2.4).
+func (self *ExtenderDirectory) IsActiveKey(publicKey []byte) bool {
+	if len(publicKey) != ed25519.PublicKeySize {
+		return false
+	}
+	keyHex := hex.EncodeToString(publicKey)
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	keyRecord := self.keyHexRecords[keyHex]
+	if keyRecord == nil || keyRecord.recordBody == nil {
+		return false
+	}
+	if self.keyRecordRevokedWithLock(keyRecord) {
+		return false
+	}
+	return !self.keyRecordExpiredWithLock(keyRecord, now)
+}
+
 // Reports whether this address may still be dialed: it is known, not held and
-// its key is active. The strategy drops the dialers of everything else.
+// its key is active -- or it is one of the retained expired identities, the
+// last tier of Candidates, so an established dialer to it is kept rather than
+// dropped the moment its record lapses. The strategy drops the dialers of
+// everything else.
 func (self *ExtenderDirectory) AddressUsable(ip netip.Addr) bool {
 	if !ip.IsValid() {
 		return false
@@ -1659,7 +2135,10 @@ func (self *ExtenderDirectory) AddressUsable(ip netip.Addr) bool {
 	if !self.addressDialableWithLock(address) {
 		return false
 	}
-	return self.addressActiveWithLock(address, now)
+	if self.addressActiveWithLock(address, now) {
+		return true
+	}
+	return self.keyRetainedExpiredWithLock(address.publicKeyHex, now)
 }
 
 func (self *ExtenderDirectory) addressStateWithLock(
@@ -1716,22 +2195,22 @@ func (self *ExtenderDirectory) noteEventWithLock(source string, now time.Time) {
 }
 
 // Drops the apply times that have aged out of the window, and anything beyond
-// the ring cap.
+// the ring cap, by moving the head past them; the dropped prefix is reclaimed
+// once it is at least half the slice, so a drop costs constant time however
+// full the ring is.
 func (self *ExtenderDirectory) pruneEventsWithLock(now time.Time) {
 	windowStartTime := now.Add(-self.eventWindowTimeout())
-	i := 0
-	for i < len(self.eventTimes) && self.eventTimes[i].Before(windowStartTime) {
-		i += 1
+	for self.eventHead < len(self.eventTimes) && self.eventTimes[self.eventHead].Before(windowStartTime) {
+		self.eventHead += 1
 	}
-	if 0 < i {
-		self.eventTimes = slices.Delete(self.eventTimes, 0, i)
+	if ExtenderDirectoryEventRingCount < len(self.eventTimes)-self.eventHead {
+		self.eventHead = len(self.eventTimes) - ExtenderDirectoryEventRingCount
 	}
-	if ExtenderDirectoryEventRingCount < len(self.eventTimes) {
-		self.eventTimes = slices.Delete(
-			self.eventTimes,
-			0,
-			len(self.eventTimes)-ExtenderDirectoryEventRingCount,
-		)
+	if 0 < self.eventHead && len(self.eventTimes) <= 2*self.eventHead {
+		keptCount := copy(self.eventTimes, self.eventTimes[self.eventHead:])
+		clear(self.eventTimes[keptCount:])
+		self.eventTimes = self.eventTimes[:keptCount]
+		self.eventHead = 0
 	}
 }
 
@@ -1746,7 +2225,7 @@ func (self *ExtenderDirectory) EventCountSince(since time.Time) int {
 
 	self.pruneEventsWithLock(now)
 	count := 0
-	for _, eventTime := range self.eventTimes {
+	for _, eventTime := range self.eventTimes[self.eventHead:] {
 		if !eventTime.Before(since) {
 			count += 1
 		}
@@ -1954,6 +2433,13 @@ func (self *ExtenderDirectory) load() {
 				proto.Unmarshal(record.Body, body) == nil {
 				keyRecord.record = record
 				keyRecord.recordBody = body
+				keyRecord.applySerial = self.nextApplySerial
+				self.nextApplySerial += 1
+				for _, recordAddress := range body.Addresses {
+					if ip, err := netip.ParseAddr(recordAddress.Ip); err == nil && ip.IsValid() {
+						keyRecord.ips = append(keyRecord.ips, ip.Unmap())
+					}
+				}
 			}
 		}
 		if 0 < len(storeRecord.Revocation) {
@@ -2000,11 +2486,22 @@ func (self *ExtenderDirectory) load() {
 			holdUntilTime:           extenderTimeFromMs(storeAddress.HoldUntilTimeMs),
 			lastUseTime:             extenderTimeFromMs(storeAddress.LastUseTimeMs),
 		}
+		if keyRecord := self.keyHexRecords[publicKeyHex]; keyRecord != nil && !slices.Contains(keyRecord.ips, ip) {
+			// an address the key held beyond what its newest record lists
+			keyRecord.ips = append(keyRecord.ips, ip)
+		}
 	}
 	self.pruneKeyRecordsWithLock()
 	// a load is the state the store already holds, so it is not a change to
 	// save back
 	self.savedVersion = self.version
+	// but a store written under a larger cap is brought within this one, and
+	// that is saved with the next change or the close
+	now := self.settings.Now()
+	self.tierRebuildWithLock(now)
+	if self.enforceActiveRecordCapWithLock(now) {
+		self.changedWithLock()
+	}
 }
 
 // 4 or 6 for an address, 0 for an invalid one.

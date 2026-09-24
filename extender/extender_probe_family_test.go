@@ -39,7 +39,7 @@ func TestProbeExtenderForwardReturnsTheHelloClientAddressOverIpv6(t *testing.T) 
 		testServerName,
 		publicKey,
 		"https://dest.example",
-		&tls.Config{RootCAs: fixture.destination.rootCAs},
+		&tls.Config{RootCAs: fixture.destination.rootCas},
 	)
 	if err != nil {
 		t.Fatal(err)

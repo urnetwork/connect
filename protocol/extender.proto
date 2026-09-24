@@ -35,6 +35,16 @@ message ExtenderHeader {
     // that only ranks by latency leaves it empty and identifies itself to the
     // extender no more than a forward does.
     bytes ProbeClientId = 9;
+    // Probe only. The 32 byte identity key of an EXTENDER that will attest
+    // its measured rtt to a peer (GEOMAP §2.2), which asks for a ProbeNonce
+    // exactly as ProbeClientId does. At most one of the two is set; a header
+    // with both is refused.
+    bytes ProbeExtenderPublicKey = 10;
+    // How many extenders this request has already crossed: 0 from a client,
+    // and one more on every header an NLayer extender sends to its next layer
+    // (EXTENDER.md A11). An extender refuses a request that would make it
+    // deeper than its bound, which is what ends a chain that loops.
+    uint32 HopCount = 11;
 }
 
 message ExtenderResponse {
@@ -44,18 +54,29 @@ message ExtenderResponse {
     bytes ChallengeSignature = 2;
     // tcp, quic, dns
     repeated string Carriers = 3;
-    // Probe only, when ProbeClientId was set: a short lived nonce the
-    // attestation must echo. Derived, not stored, so the extender keeps no
-    // per probe state.
+    // Probe only, when ProbeClientId or ProbeExtenderPublicKey was set: a
+    // short lived nonce the attestation must echo. Fresh random bytes held
+    // for the life of the stream, so the extender keeps no per probe state.
     bytes ProbeNonce = 4;
+    // Probe only. The HopCount of the header the extender that answered the
+    // probe itself received: 0 for a direct probe, the depth of the chain's
+    // end for a probe an NLayer extender relayed (GEOMAP §2.9). Set by the
+    // end and copied back by every relay.
+    uint32 HopCount = 5;
+    // Probe only. The identity key of the end of the chain a relayed probe
+    // was answered by, which is the key the attestation names and the
+    // verdict is co-signed under; empty for a direct probe (GEOMAP §2.9).
+    bytes ChainEndPublicKey = 6;
 }
 
-// Sent by an attesting provider as one length prefixed frame after the
-// ExtenderResponse, on the same stream. The rtt is the PROVIDER's own
-// measurement under the provider's signature: the extender compares it with
-// the interval it observed and either forwards or refuses the frame, but it
-// cannot change the number.
+// Sent by an attesting pinger -- a provider or an extender -- as one length
+// prefixed frame after the ExtenderResponse, on the same stream. The rtt is
+// the PINGER's own measurement under the pinger's signature: the target
+// compares it with the interval it observed and accepts or refuses it in an
+// ExtenderProbeVerdict, but it cannot change the number. Exactly one of
+// ProbeClientId and PingerExtenderPublicKey is set.
 message ExtenderProbeAttestation {
+    // the provider's client id, empty for an extender pinger
     bytes ProbeClientId = 1;
     // binds the claim to the extender it was measured against
     bytes ExtenderPublicKey = 2;
@@ -63,9 +84,28 @@ message ExtenderProbeAttestation {
     bytes ProbeNonce = 3;
     uint32 RttMs = 4;
     uint64 TimestampMs = 5;
-    // ed25519 by the provider client key over
-    // "ur-extender-probe-v1" || serialized attestation with Signature empty
+    // ed25519 over fixed width signing bytes: by the provider client key
+    // under "ur-extender-probe-v1" with the client id, or by the pinging
+    // extender's identity key under "ur-extender-peer-probe-v1" with its key
+    // in the client id's place (GEOMAP §2.2)
     bytes Signature = 6;
+    // the pinging extender's identity key, empty for a provider pinger
+    bytes PingerExtenderPublicKey = 7;
+}
+
+// The target's answer to an attestation, one length prefixed frame on the
+// same stream, written whether it accepts or refuses (GEOMAP §2.3). A pinger
+// that reads none -- an old target, a close, a timeout -- records the ping as
+// unknown.
+message ExtenderProbeVerdict {
+    bool Accepted = 1;
+    // 0 ok; 1 rtt below observed; 2 nonce; 3 wrong extender; 4 unknown
+    // pinger; 5 bad signature; 6 rate limited
+    uint32 Reason = 2;
+    // Accepted only. ed25519 by the TARGET's identity key over
+    // "ur-extender-probe-cosign-v1" || the attestation's signing bytes
+    // (domain included) || the pinger's signature
+    bytes Cosignature = 3;
 }
 
 message ExtenderAddress {

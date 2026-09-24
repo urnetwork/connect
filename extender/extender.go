@@ -57,6 +57,9 @@ import (
 // is resolved and answered (A6). A prober therefore sees a working site and a
 // working resolver, and the extender protocol stays inside the outer tls.
 //
+// An NLayer extender (A11, extender_nlayer.go) relays an accepted forward to
+// one of a preset list of other extenders instead of to its destination.
+//
 // The server is safe for concurrent use. Close interrupts every listener and
 // connection it owns; CloseAndWait also joins their goroutines.
 
@@ -94,6 +97,22 @@ func DefaultExtenderSettings() *ExtenderSettings {
 		ProbeAttestationTimeout: 5 * time.Second,
 		ProbeMaxRatePerSource:   1,
 		ProbeMaxBurstPerSource:  10,
+
+		NLayerMaxDepth:           4,
+		NLayerDialTimeout:        10 * time.Second,
+		NLayerHoldTimeout:        30 * time.Second,
+		NLayerAttempts:           2,
+		NLayerClientHelloTimeout: 2 * time.Second,
+		NLayerLimitedBackoff:     30 * time.Second,
+
+		AdmissionSubnetsPerMinute:           1000,
+		AdmissionActionsPerSubnetPerMinute:  8,
+		AdmissionRefusalsPerSubnetPerMinute: 8,
+		AdmissionRetryAfterMin:              15 * time.Second,
+		AdmissionRetryAfterMax:              60 * time.Second,
+		AdmissionIpv4PrefixBitCount:         29,
+		AdmissionIpv6PrefixBitCount:         56,
+		AdmissionMinSubnetCount:             4096,
 	}
 }
 
@@ -185,23 +204,100 @@ type ExtenderSettings struct {
 	// FeedConnHandler is the same for the feed service (A8).
 	FeedConnHandler func(conn net.Conn)
 
-	// ProbeAttestationHandler receives every latency attestation that passed
-	// the gate (DESIGNNOTES4.md §3). Nil serves ranking probes only and
-	// issues no nonce, so a provider is never asked to sign for nothing. It
-	// runs on the request goroutine and must not block.
-	ProbeAttestationHandler func(attestation *protocol.ExtenderProbeAttestation)
+	// ProbePeerVerifier reports whether an extender pinger's identity key is
+	// an active record this extender knows (GEOMAP §2.4) -- the directory's
+	// IsActiveKey, which holds only what the operator's root key vouched
+	// for. Nil admits no extender pinger: its claims are refused as an
+	// unknown pinger. A provider pinger is never asked, since the operator
+	// verifies it. It runs on the request goroutine and must not block.
+	ProbePeerVerifier func(publicKey []byte) bool
 	// How far a claimed rtt may fall below the interval this extender
-	// observed before the claim is refused, which is also the most a
-	// provider can deflate its claim by. It absorbs the ordinary jitter
-	// between the two round trips; a refused honest sample costs one probe.
+	// observed before the claim is refused, which is also the most a pinger
+	// can deflate its claim by. It absorbs the ordinary jitter between the
+	// two round trips; a refused honest sample costs one probe.
 	ProbeRttTolerance time.Duration
 	// How long the extender waits for the attestation frame after its
-	// response before closing the stream.
+	// response before closing the stream, and then for its verdict to be
+	// written.
 	ProbeAttestationTimeout time.Duration
 	// Probes admitted per source address per second, and the burst. <= 0
 	// disables the limit.
 	ProbeMaxRatePerSource  float64
 	ProbeMaxBurstPerSource int
+
+	// NLayerHops, when set, makes this an NLayer extender (A11): a forward
+	// request is relayed, as an extender client, to one of these other
+	// extenders instead of to its destination, and so is a probe, to the end
+	// of the chain (GEOMAP §2.9). Empty forwards to the destination and
+	// answers probes as every extender does. The gossip and feed services are
+	// served here either way.
+	NLayerHops []*connect.ExtenderConfig
+	// The most extenders a chain may hold (A11). A forward request whose
+	// HopCount says this extender would be deeper is refused with 403, whether
+	// or not NLayerHops is set, which is what ends a chain that loops. <= 0
+	// disables the bound.
+	NLayerMaxDepth int
+	// Budget of one NLayer hop dial, from its carrier to its response. <= 0
+	// leaves the connect defaults.
+	NLayerDialTimeout time.Duration
+	// How long an NLayer hop whose dial failed is skipped. A hop that answered
+	// with a refusal is not held, since the refusal can be about the request,
+	// and neither is one this host's memory budget had no room to dial. <= 0
+	// holds nothing.
+	NLayerHoldTimeout time.Duration
+	// NLayer hops tried for one connection before it is given up, each a
+	// different hop. <= 0 tries one.
+	NLayerAttempts int
+	// How long an NLayer extender waits for the first inner record of a
+	// stream, whose tls client random is the loop check (A11). <= 0 disables
+	// the check and leaves loops to the depth bound.
+	NLayerClientHelloTimeout time.Duration
+	// NLayerHoldHandler, when set, receives every change of an NLayer hop's
+	// hold, by the hop's index in NLayerHops: held with the dial error that
+	// caused it, and released with a nil error when the hold is next consulted
+	// after it ran out. connectctl logs it. It runs synchronously and must not
+	// block.
+	NLayerHoldHandler func(index int, held bool, err error)
+	// How long an NLayer hop that answered 429 with no Retry-After is left
+	// alone before the +-50 % jitter a Retry-After gets too (A12). A limited
+	// hop is not held: the other hops are preferred until its backoff passes.
+	NLayerLimitedBackoff time.Duration
+
+	// The admission limits of this instance (A12), each a rate per minute
+	// with a burst of the rate. AdmissionSubnetsPerMinute bounds the distinct
+	// source subnets admitted in any one minute, which bounds the whole
+	// extender; AdmissionActionsPerSubnetPerMinute bounds the actions -- a
+	// forward, a gossip or feed stream, a probe -- of one subnet, which a
+	// header signed with one of this extender's secrets is exempt from. An
+	// action over either is answered 429 with a Retry-After drawn between
+	// AdmissionRetryAfterMin and AdmissionRetryAfterMax, and a subnet answered
+	// so more than AdmissionRefusalsPerSubnetPerMinute times in a minute is
+	// closed at accept, before its handshake. <= 0 disables each.
+	AdmissionSubnetsPerMinute           int
+	AdmissionActionsPerSubnetPerMinute  int
+	AdmissionRefusalsPerSubnetPerMinute int
+	AdmissionRetryAfterMin              time.Duration
+	AdmissionRetryAfterMax              time.Duration
+	// The prefix a source's subnet is taken at, for each family: the /29 of
+	// v4 and the /56 of v6 the platform's address hash keys on. The v4 width
+	// is the knob for a large nat, which puts many users behind one /29
+	// (A12). Outside the family's range, the default.
+	AdmissionIpv4PrefixBitCount int
+	AdmissionIpv6PrefixBitCount int
+	// The least the subnet table holds; a larger per-instance limit widens it
+	// to four times the limit, since a minute of admitted subnets must fit
+	// with room for the refused ones the refusal cap counts. <= 0 is the
+	// default.
+	AdmissionMinSubnetCount int
+	// Source prefixes exempt from both limits, matched on the source address
+	// before it is hashed and never retained: an NLayer hop lists its fronts
+	// here, since a front is one subnet to it and rate-limits its own clients
+	// under its own limits (A11, A12). Copied at construction. Empty exempts
+	// nothing.
+	AdmissionUnlimitedSources []netip.Prefix
+	// When set, the only clock the admission limits read. Tests slide the
+	// windows with it. Nil is time.Now.
+	AdmissionNow func() time.Time
 
 	// Listen, when set, binds the outer TLS listener. Userspace integration
 	// tests use it to place the production extender on a simulated TUN. Nil
@@ -239,6 +335,11 @@ type ExtenderSettings struct {
 	// what a dial presented; an empty name is a ClientHello that carried no sni
 	// at all (A10). It runs synchronously and must not block.
 	CertificateHandler func(serverName string)
+	// HeaderHandler, when set, receives every extender header this extender
+	// accepted, just before its stream is served. Tests use it to observe what
+	// a chain of NLayer extenders delivered to its last layer (A11). It runs
+	// synchronously, must not block, and must not keep or change the header.
+	HeaderHandler func(header *protocol.ExtenderHeader)
 }
 
 type ExtenderServer struct {
@@ -296,6 +397,23 @@ type ExtenderServer struct {
 
 	probeLimiter *extenderProbeLimiter
 
+	// the NLayer hops of A11 in the order of NLayerHops, copied at
+	// construction; their hold state and counts are guarded by stateLock
+	nlayerHops []*extenderNLayerHop
+	// the inner tls client randoms this extender is relaying now, one count
+	// per connection holding each, which is the loop check of A11. Bounded by
+	// the connections in flight.
+	nlayerClientRandomCounts map[[32]byte]int
+	// the pinger identities with a probe this extender is relaying now, at
+	// most one each, which is the loop check of a relayed probe (GEOMAP
+	// §2.9). Bounded by the connections in flight.
+	nlayerProbeSources map[nlayerProbeSource]bool
+	// the settings of every hop dial, nil when there is no hop
+	nlayerConnectSettings *connect.ConnectSettings
+
+	// the admission limits of A12, under their own lock
+	admission *extenderAdmission
+
 	proxy *extenderProxy
 
 	httpServer  *http.Server
@@ -350,22 +468,29 @@ func NewExtenderServer(
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	self := &ExtenderServer{
-		ctx:                    cancelCtx,
-		cancel:                 cancel,
-		listeners:              map[*extenderOwnedListener]bool{},
-		connections:            map[*extenderOwnedConnection]bool{},
-		closers:                map[*extenderOwnedCloser]bool{},
-		sourceConnectionCounts: map[string]int{},
-		allowedSecrets:         allowedSecrets,
-		allowedHosts:           allowedHosts,
-		ports:                  ports,
-		carriers:               []string{},
-		dnsPorts:               []int{},
-		carrierListenErrs:      map[string]error{},
-		forwardDialer:          forwardDialer,
-		listening:              make(chan struct{}),
-		probeLimiter:           newExtenderProbeLimiter(),
-		settings:               settings,
+		ctx:                      cancelCtx,
+		cancel:                   cancel,
+		listeners:                map[*extenderOwnedListener]bool{},
+		connections:              map[*extenderOwnedConnection]bool{},
+		closers:                  map[*extenderOwnedCloser]bool{},
+		sourceConnectionCounts:   map[string]int{},
+		allowedSecrets:           allowedSecrets,
+		allowedHosts:             allowedHosts,
+		ports:                    ports,
+		carriers:                 []string{},
+		dnsPorts:                 []int{},
+		carrierListenErrs:        map[string]error{},
+		forwardDialer:            forwardDialer,
+		listening:                make(chan struct{}),
+		probeLimiter:             newExtenderProbeLimiter(),
+		nlayerHops:               newExtenderNLayerHops(settings.NLayerHops),
+		nlayerClientRandomCounts: map[[32]byte]int{},
+		nlayerProbeSources:       map[nlayerProbeSource]bool{},
+		admission:                newExtenderAdmission(settings),
+		settings:                 settings,
+	}
+	if 0 < len(self.nlayerHops) {
+		self.nlayerConnectSettings = self.newNLayerConnectSettings()
 	}
 
 	// A certificate failure is reported when serving starts, so the
@@ -558,6 +683,11 @@ func connectionSourceAddress(address string) string {
 
 // Runs a connection handler whose socket is interrupted and joined at Close.
 func (self *ExtenderServer) startConnection(connection net.Conn) {
+	if self.closedAtAccept(connection.RemoteAddr()) {
+		// a subnet past its refusals is not worth a handshake (A12)
+		connection.Close()
+		return
+	}
 	if !self.beginConnection(connection.RemoteAddr()) {
 		connection.Close()
 		return
@@ -985,6 +1115,14 @@ func (self *ExtenderServer) serveQuicCarrier(
 	quicConfig := &quic.Config{
 		MaxIdleTimeout: self.settings.QuicIdleTimeout,
 	}
+	// a subnet past its refusals is refused on its Initial packet, before the
+	// handshake (A12)
+	quicConfig.GetConfigForClient = func(info *quic.ClientInfo) (*quic.Config, error) {
+		if self.closedAtAccept(info.RemoteAddr) {
+			return nil, fmt.Errorf("%s is past its admission refusals", connectionSource(info.RemoteAddr))
+		}
+		return quicConfig, nil
+	}
 	listener, err := quicTransport.Listen(tlsConfig, quicConfig)
 	if err != nil {
 		return err
@@ -1134,6 +1272,16 @@ func (self *ExtenderServer) SignChallenge(challenge []byte) []byte {
 		return nil
 	}
 	return self.certificates.SignChallenge(challenge)
+}
+
+// Signs the co-signature of an accepted latency claim with the identity key,
+// or returns nil when the extender has none or the bytes are not under the
+// co-signature domain (GEOMAP §2.3).
+func (self *ExtenderServer) SignProbeCosign(cosignBytes []byte) []byte {
+	if self.certificates == nil {
+		return nil
+	}
+	return self.certificates.SignProbeCosign(cosignBytes)
 }
 
 // The carrier names this extender is listening on (A4, G2). Empty until the
@@ -1318,8 +1466,33 @@ func (self *ExtenderServer) handleV1Connection(
 		self.reportError("header authorization", fmt.Errorf("secret signature is not allowed"))
 		return
 	}
+	// a v1 header is an action like any other (A12), refused by the close
+	// since v1 has no status to answer with
+	if limit, _ := self.admitAction(remoteAddressString(clientConn.RemoteAddr()), 0 < len(self.allowedSecrets)); limit != extenderAdmitted {
+		self.reportError(extenderAdmissionStage(limit), fmt.Errorf("the source is over its admission limit"))
+		return
+	}
+	// v1 has no refusal but the close, and a v1 header is always a forward
+	if err := self.checkNLayerDepth(header); err != nil {
+		self.reportError("hop count", err)
+		return
+	}
 	if !self.IsAllowedHost(header.DestinationHost) {
 		self.reportError("destination authorization", fmt.Errorf("host %q is not allowed", header.DestinationHost))
+		return
+	}
+	if self.settings.HeaderHandler != nil {
+		self.settings.HeaderHandler(header)
+	}
+
+	if 0 < len(self.nlayerHops) {
+		// an NLayer extender relays the inner stream to another extender,
+		// datagram framing and all (A11)
+		if err := clientConn.SetDeadline(time.Time{}); err != nil {
+			self.reportError("relay", err)
+			return
+		}
+		self.serveNLayer(ctx, cancel, clientConn, remoteAddressString(clientConn.RemoteAddr()), header)
 		return
 	}
 

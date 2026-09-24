@@ -32,13 +32,17 @@ func lifecycleResidueStacks() []byte {
 	}
 }
 
-// Every dns forward worker and every relay direction of every test must have
-// been joined before the package qualifies.
+// Every dns forward worker, every relay direction and every NLayer forward or
+// relayed probe of every test -- its loop check, its hop dial and its relay
+// (A11, GEOMAP §2.9) -- must have been joined before the package qualifies.
 func TestZZZNoExtenderLifecycleResidue(t *testing.T) {
 	signatures := []string{
 		"(*extenderDnsForwarder).run(",
 		"(*ExtenderServer).relay(",
 		"(*ExtenderServer).serveQuicCarrier(",
+		"(*ExtenderServer).serveNLayer(",
+		"(*ExtenderServer).dialNLayerHop(",
+		"(*extenderHandler).serveNLayerProbe(",
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {

@@ -129,6 +129,10 @@ Usage:
         [--listen_dns=<port>]
         [--dns_privileged_port]
         [--allowed_host=<host>]...
+        [--nlayer-hop=<spec>]...
+        [--admission_subnets_per_minute=<count>]
+        [--admission_actions_per_subnet_per_minute=<count>]
+        [--admission_unlimited_source=<cidr>]...
         [--state_dir=<dir>]
     
 Options:
@@ -151,6 +155,18 @@ Options:
     --listen_dns=<port>              Extender dns carrier port (default 4053).
     --dns_privileged_port            Also bind the extender dns carrier on 53.
     --allowed_host=<host>            Extra host the extender may forward to. Repeatable.
+    --nlayer-hop=<spec>              Another extender to relay every forward to, which makes
+                                     this an NLayer extender. Repeatable; forwards are balanced
+                                     over the hops. The spec is
+                                     [tcp|quic|dns://]<ip>[:<port>][?key=<hex>&secret_file=<path>&sni=<name>&tld=<tld>&fragment&reorder].
+                                     A private hop's secret is read from the file secret_file names,
+                                     never given in the spec.
+    --admission_subnets_per_minute=<count>
+                                     Distinct source subnets the extender admits a minute (default 1000, 0 disables).
+    --admission_actions_per_subnet_per_minute=<count>
+                                     Actions one source subnet may take a minute (default 8, 0 disables).
+    --admission_unlimited_source=<cidr>
+                                     A source prefix exempt from both limits, such as an NLayer front. Repeatable.
     --state_dir=<dir>                Directory for the extender key and the known extenders.`,
 		DefaultApiUrl,
 		DefaultConnectUrl,

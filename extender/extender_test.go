@@ -109,11 +109,11 @@ func TestExtender(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rootCAs := x509.NewCertPool()
-	rootCAs.AddCert(certificate.Leaf)
+	rootCas := x509.NewCertPool()
+	rootCas.AddCert(certificate.Leaf)
 	connectSettings := connect.DefaultConnectSettings()
 	connectSettings.TlsConfig = &tls.Config{
-		RootCAs: rootCAs,
+		RootCAs: rootCas,
 	}
 
 	client := connect.NewExtenderHttpClient(

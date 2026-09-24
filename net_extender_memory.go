@@ -16,6 +16,15 @@ type extenderTransportSettingsContextKey struct{}
 
 var errExtenderMemoryBudget = errors.New("extender carrier memory budget is full")
 
+// Whether an extender dial failed because this host's memory budget refused
+// the carrier's claim. That is a local
+// condition, which says nothing about the extender being dialed: a caller
+// that holds or demotes an extender for a failed dial leaves it alone (E1,
+// A11).
+func IsExtenderMemoryBudgetError(err error) bool {
+	return errors.Is(err, errExtenderMemoryBudget)
+}
+
 // A TCP extender adds one TLS/socket graph beneath the destination's existing
 // TLS carrier. Charge another H1-sized claim to that owner as well; the inner
 // H1 claim alone describes only the direct path.

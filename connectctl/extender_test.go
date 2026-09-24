@@ -403,6 +403,11 @@ func extenderCommandServesAndActivates(t *testing.T, loopbackIp string) {
 		t.Fatal("the feed did not serve this extender's own record first")
 	}
 
+	// a peer is judged against this extender's directory (GEOMAP §2.4): one
+	// whose record the operator signed is co-signed, one it never did is
+	// refused as an unknown pinger
+	extenderPeerProbes(t, run, operator, loopbackIp, tcpPort, extenderPublicKey)
+
 	cancel()
 	select {
 	case err := <-runDone:
@@ -411,5 +416,124 @@ func extenderCommandServesAndActivates(t *testing.T, loopbackIp string) {
 		}
 	case <-time.After(60 * time.Second):
 		t.Fatal("the extender did not stop")
+	}
+}
+
+// Probes the running extender as two peers: one with an operator-signed
+// record in the extender's directory, and one without.
+func extenderPeerProbes(
+	t *testing.T,
+	run *extenderRun,
+	operator *testExtenderOperator,
+	loopbackIp string,
+	tcpPort int,
+	extenderPublicKey ed25519.PublicKey,
+) {
+	t.Helper()
+	if run.peerPinger == nil {
+		t.Fatal("the extender runs no peer pinger")
+	}
+	newPeer := func() *connect.ExtenderProbeAttestor {
+		seed, err := connect.NewExtenderKeySeed()
+		if err != nil {
+			t.Fatal(err)
+		}
+		privateKey, err := connect.ExtenderPrivateKeyFromSeed(seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return connect.NewExtenderProbeExtenderAttestor(
+			privateKey.Public().(ed25519.PublicKey),
+			connect.NewExtenderPeerProbeSigner(privateKey),
+		)
+	}
+	knownPeer := newPeer()
+	unknownPeer := newPeer()
+	record, err := connect.SignExtenderRecord(operator.rootPrivateKey, &protocol.ExtenderRecordBody{
+		PublicKey: knownPeer.ExtenderPublicKey,
+		Addresses: []*protocol.ExtenderAddress{
+			{Ip: "203.0.113.9", IpVersion: 4, Carriers: []string{connect.ExtenderCarrierTcp}},
+		},
+		TcpPort:      443,
+		CountryCode:  "zz",
+		IssueTimeMs:  uint64(time.Now().UnixMilli()),
+		ExpireTimeMs: uint64(time.Now().Add(24 * time.Hour).UnixMilli()),
+		NetworkHost:  testExtenderNetworkHost,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run.directory.ApplyRecord(record, connect.ExtenderSourceGossip); err != nil {
+		t.Fatal(err)
+	}
+
+	probe := func(attestor *connect.ExtenderProbeAttestor) *connect.ExtenderLatencyProbe {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		probe, err := connect.ProbeExtenderLatency(
+			ctx,
+			connect.DefaultConnectSettings(),
+			&connect.ExtenderConfig{
+				Profile: connect.ExtenderProfile{
+					ConnectMode: connect.ExtenderConnectModeTcpTls,
+					Port:        tcpPort,
+				},
+				Ip:        netip.MustParseAddr(loopbackIp),
+				PublicKey: extenderPublicKey,
+			},
+			attestor,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return probe
+	}
+	known := probe(knownPeer)
+	if known.Outcome != connect.ExtenderPingCosigned ||
+		!connect.VerifyExtenderProbeVerdict(extenderPublicKey, known.Attestation, known.Verdict) {
+		t.Fatalf("the known peer came to %q (%v, %v)", known.Outcome, known.Verdict, known.VerdictErr)
+	}
+	unknown := probe(unknownPeer)
+	if unknown.Outcome != connect.ExtenderPingRejected || unknown.Reason != connect.ExtenderProbeVerdictReasonUnknownPinger {
+		t.Fatalf("the unknown peer came to %q reason %d", unknown.Outcome, unknown.Reason)
+	}
+
+	// the pinger schedules the known peer, and never this extender
+	deadline := time.After(60 * time.Second)
+	for {
+		status, change := run.peerPinger.StatusMonitor().Get()
+		if status.PeerCount == 1 {
+			break
+		}
+		select {
+		case <-change:
+		case <-deadline:
+			t.Fatalf("the pinger never scheduled the peer: %+v", status)
+		}
+	}
+	if line := extenderPeerPingerStatusLine(run.peerPinger.Status()); !strings.HasPrefix(line, "extender peer pings: 1 peers") {
+		t.Fatalf("status line = %q", line)
+	}
+}
+
+// The status line is empty until the pinger has a peer, and counts every
+// outcome once it does.
+func TestExtenderPeerPingerStatusLine(t *testing.T) {
+	if line := extenderPeerPingerStatusLine(connect.ExtenderPeerPingerStatus{}); line != "" {
+		t.Fatalf("an idle pinger printed %q", line)
+	}
+	line := extenderPeerPingerStatusLine(connect.ExtenderPeerPingerStatus{
+		PeerCount:       3,
+		PingCount:       9,
+		CosignedCount:   4,
+		RejectedCount:   2,
+		UnknownCount:    1,
+		UnattestedCount: 1,
+		FailedCount:     1,
+	})
+	expected := "extender peer pings: 3 peers, 9 pings (4 cosigned, 2 rejected, 1 unknown, 1 unattested, 1 failed)"
+	if line != expected {
+		t.Fatalf("line = %q, expected %q", line, expected)
 	}
 }

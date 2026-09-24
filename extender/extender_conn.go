@@ -1,7 +1,6 @@
 package extender
 
 import (
-	"bufio"
 	"net"
 	"sync"
 	"time"
@@ -15,6 +14,8 @@ import (
 // The tcp carrier reads four bytes to tell a v1 length-prefixed header from an
 // http request (A3); when it is an http request those bytes belong to the
 // request line or the h2 preface and must be seen by the server that follows.
+// The same puts back what a hijack had already buffered past the request, and
+// what the loop check of an NLayer extender read of the inner stream (A11).
 //
 // It also carries the server name of the terminated connection, which is the
 // only place the requested name survives once the connection is no longer a
@@ -69,25 +70,6 @@ func (self *connWithInitialBytes) Close() error {
 // server it handed the connection to.
 func (self *connWithInitialBytes) Closed() <-chan struct{} {
 	return self.closed
-}
-
-// connWithReader reads through a buffered reader that already holds bytes from
-// the connection. An http server hands back such a reader when a handler
-// hijacks, and it may already hold the first inner bytes.
-type connWithReader struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func newConnWithReader(conn net.Conn, reader *bufio.Reader) *connWithReader {
-	return &connWithReader{
-		Conn:   conn,
-		reader: reader,
-	}
-}
-
-func (self *connWithReader) Read(b []byte) (int, error) {
-	return self.reader.Read(b)
 }
 
 // singleConnListener hands one already-accepted connection to an http server

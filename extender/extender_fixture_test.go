@@ -26,6 +26,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 
 	"github.com/urnetwork/connect"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // The caller address the fixture site reports from /hello.
@@ -63,7 +64,7 @@ const testRedirectLocation = "https://moved.example/elsewhere"
 // family can reach.
 type destination struct {
 	certificate     *tls.Certificate
-	rootCAs         *x509.CertPool
+	rootCas         *x509.CertPool
 	familyAddresses map[string]string
 	requestCount    atomicCount
 	// held, when set, blocks every /hold request until it is closed, which is
@@ -111,6 +112,34 @@ func (self *atomicCount) get() int {
 	return self.count
 }
 
+// Every value a seam reports, in order, for a test that counts or reads them
+// after the fact.
+type recordedValues[T any] struct {
+	stateLock sync.Mutex
+	values    []T
+}
+
+// Records one value.
+func (self *recordedValues[T]) add(value T) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.values = append(self.values, value)
+}
+
+// The values so far, as a copy.
+func (self *recordedValues[T]) snapshot() []T {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return append([]T(nil), self.values...)
+}
+
+// The number of values so far.
+func (self *recordedValues[T]) count() int {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return len(self.values)
+}
+
 // Runs the destination on 127.0.0.1 and on ::1, returning the addresses keyed
 // by dial network.
 func newDestination(t *testing.T) *destination {
@@ -124,12 +153,12 @@ func newDestination(t *testing.T) *destination {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rootCAs := x509.NewCertPool()
-	rootCAs.AddCert(certificate.Leaf)
+	rootCas := x509.NewCertPool()
+	rootCas.AddCert(certificate.Leaf)
 
 	dest := &destination{
 		certificate:     certificate,
-		rootCAs:         rootCAs,
+		rootCas:         rootCas,
 		familyAddresses: map[string]string{},
 		held:            make(chan struct{}),
 	}
@@ -287,6 +316,14 @@ type extenderFixture struct {
 	quicPort        int
 	dnsPort         int
 	forwardNetworks chan string
+	// every forward dial, counted, where forwardNetworks keeps only a buffer's
+	// worth
+	forwardDialCount *atomicCount
+	// every NLayer hop dial this extender made through its egress seam, by
+	// address: a destination is always a name, so an address is a hop (A11)
+	hopDialAddresses *recordedValues[string]
+	// the HopCount of every header this extender accepted (A11)
+	acceptedHopCounts *recordedValues[uint32]
 	// the outer sni of every handshake the extender terminated, so a test can
 	// prove what a dial presented -- an empty entry is a ClientHello with no
 	// sni at all (A10)
@@ -336,25 +373,32 @@ func newExtenderFixtureWithSecrets(
 		t.Fatal(err)
 	}
 	fixture := &extenderFixture{
-		t:               t,
-		destination:     dest,
-		ip:              ip,
-		tcpPort:         tcpListener.Addr().(*net.TCPAddr).Port,
-		quicPort:        quicPacketConn.LocalAddr().(*net.UDPAddr).Port,
-		dnsPort:         dnsPacketConn.LocalAddr().(*net.UDPAddr).Port,
-		forwardNetworks: make(chan string, 64),
-		serverNames:     make(chan string, 64),
-		errors:          make(chan error, 64),
+		t:                 t,
+		destination:       dest,
+		ip:                ip,
+		tcpPort:           tcpListener.Addr().(*net.TCPAddr).Port,
+		quicPort:          quicPacketConn.LocalAddr().(*net.UDPAddr).Port,
+		dnsPort:           dnsPacketConn.LocalAddr().(*net.UDPAddr).Port,
+		forwardNetworks:   make(chan string, 64),
+		forwardDialCount:  &atomicCount{},
+		hopDialAddresses:  &recordedValues[string]{},
+		acceptedHopCounts: &recordedValues[uint32]{},
+		serverNames:       make(chan string, 64),
+		errors:            make(chan error, 64),
 	}
 
 	settings := DefaultExtenderSettings()
 	settings.DnsTlds = []string{testDnsTld}
 	settings.HeaderTimeout = 5 * time.Second
+	// every client of a test is one loopback subnet, which the per-subnet
+	// limit would count as one flooding client; the admission tests set their
+	// own limits (A12)
+	settings.AdmissionActionsPerSubnetPerMinute = 0
 	// the whitelist is the synthetic spoof list plus the operator patterns, and
 	// the reverse proxy verifies the fixture site normally (A5)
 	settings.SpoofDomains = []string{testSpoofName}
 	settings.ProxyTlsConfig = &tls.Config{
-		RootCAs: dest.rootCAs,
+		RootCAs: dest.rootCas,
 	}
 	settings.Listen = func(network string, address string) (net.Listener, error) {
 		if address != fmt.Sprintf(":%d", fixture.tcpPort) {
@@ -373,13 +417,20 @@ func newExtenderFixtureWithSecrets(
 		}
 	}
 	settings.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		select {
-		case fixture.forwardNetworks <- network:
-		default:
-		}
 		host, _, err := net.SplitHostPort(address)
 		if err != nil {
 			return nil, err
+		}
+		if _, err := netip.ParseAddr(host); err == nil {
+			// the whitelist admits only names, so an address is the dial of an
+			// NLayer hop, which is another extender on loopback (A11)
+			fixture.hopDialAddresses.add(address)
+			return (&net.Dialer{}).DialContext(ctx, network, address)
+		}
+		fixture.forwardDialCount.add()
+		select {
+		case fixture.forwardNetworks <- network:
+		default:
 		}
 		familyAddress, ok := dest.addressesForHost(host)[network]
 		if !ok {
@@ -398,6 +449,9 @@ func newExtenderFixtureWithSecrets(
 		case fixture.serverNames <- serverName:
 		default:
 		}
+	}
+	settings.HeaderHandler = func(header *protocol.ExtenderHeader) {
+		fixture.acceptedHopCounts.add(header.HopCount)
 	}
 	if configure != nil {
 		configure(settings)
@@ -473,7 +527,7 @@ func (self *extenderFixture) extenderConfig(carrier string) *connect.ExtenderCon
 func (self *extenderFixture) connectSettings() *connect.ConnectSettings {
 	connectSettings := connect.DefaultConnectSettings()
 	connectSettings.TlsConfig = &tls.Config{
-		RootCAs: self.destination.rootCAs,
+		RootCAs: self.destination.rootCas,
 	}
 	connectSettings.ConnectTimeout = 10 * time.Second
 	connectSettings.TlsTimeout = 10 * time.Second

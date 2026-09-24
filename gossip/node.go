@@ -736,6 +736,11 @@ func (self *Node) extenderPeers() []peer.AddrInfo {
 		if !candidate.Verified || len(candidate.PublicKey) == 0 {
 			continue
 		}
+		// a retained expired identity is a client's last resort, not a
+		// current member of the mesh
+		if candidate.Expired {
+			continue
+		}
 		if bytes.Equal(candidate.PublicKey, self.publicKey) {
 			continue
 		}

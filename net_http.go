@@ -729,28 +729,53 @@ func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
 // The weight of each dialer an eval may use. `webSocketOnly` drops the
 // api-only dialers, which is every dialer with no websocket dialer (L4).
 func (self *ClientStrategy) dialerWeights(webSocketOnly bool) map[*clientDialer]float32 {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
+	weights, _ := self.dialerWeightsUnlimited(webSocketOnly)
+	return weights
+}
 
-	weights := map[*clientDialer]float32{}
+// The weights of dialerWeights with every limited extender dialer left out
+// (A12), which a dial would only be turned away by again, and the earliest
+// time one of those stops being limited, zero when none is.
+func (self *ClientStrategy) dialerWeightsUnlimited(webSocketOnly bool) (map[*clientDialer]float32, time.Time) {
+	weights := func() map[*clientDialer]float32 {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
 
-	if len(self.extenderIpSecrets) == 0 {
-		for dialer, _ := range self.dialers {
-			if webSocketOnly && !dialer.supportsWebSocket() {
-				continue
+		weights := map[*clientDialer]float32{}
+
+		if len(self.extenderIpSecrets) == 0 {
+			for dialer, _ := range self.dialers {
+				if webSocketOnly && !dialer.supportsWebSocket() {
+					continue
+				}
+				w := dialer.Weight()
+				weights[dialer] = w
 			}
-			w := dialer.Weight()
-			weights[dialer] = w
+		} else {
+			for dialer, _ := range self.dialers {
+				if dialer.IsExtender() {
+					weights[dialer] = 1.0
+				}
+			}
 		}
-	} else {
-		for dialer, _ := range self.dialers {
-			if dialer.IsExtender() {
-				weights[dialer] = 1.0
+		return weights
+	}()
+
+	// the directory is an external object, so the limits are read with no
+	// lock held
+	var limitedUntil time.Time
+	for dialer := range weights {
+		if !dialer.IsExtender() {
+			continue
+		}
+		if dialerLimitedUntil := dialer.LimitedUntil(); !dialerLimitedUntil.IsZero() {
+			delete(weights, dialer)
+			if limitedUntil.IsZero() || dialerLimitedUntil.Before(limitedUntil) {
+				limitedUntil = dialerLimitedUntil
 			}
 		}
 	}
-
-	return weights
+	return weights, limitedUntil
 }
 
 type httpResult struct {
@@ -1020,7 +1045,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, webSocketOnly bool
 		// the number of runs with pending out
 		p := 0
 
-		dialerWeights := self.dialerWeights(webSocketOnly)
+		dialerWeights, limitedUntil := self.dialerWeightsUnlimited(webSocketOnly)
 
 		if 0 < len(dialerWeights) {
 			serialDialers := []*clientDialer{}
@@ -1162,6 +1187,15 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, webSocketOnly bool
 		case <-handleCtx.Done():
 			return nil
 		case <-reconnect.After():
+		}
+		if len(dialerWeights) == 0 && p == 0 && !limitedUntil.IsZero() {
+			// every dialer there was is a limited extender: nothing is dialed
+			// again before the first backoff passes (A12)
+			select {
+			case <-handleCtx.Done():
+				return nil
+			case <-time.After(time.Until(limitedUntil)):
+			}
 		}
 	}
 
@@ -1709,6 +1743,11 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			for _, candidates := range familyCandidates {
 				if i < len(candidates) {
 					taken = true
+					if !candidates[i].LimitedUntil.IsZero() {
+						// a limited address is expanded once its backoff
+						// passes, not dialed only to be turned away (A12)
+						continue
+					}
 					extenderConfigs = append(
 						extenderConfigs,
 						extenderConfigsForCandidate(candidates[i], "")...,
@@ -1899,6 +1938,10 @@ type clientDialer struct {
 	errorCount      uint64
 	lastSuccessTime time.Time
 	lastErrorTime   time.Time
+	// the extender answered this dialer 429 and is left alone until then
+	// (A12), which is not an error. The directory keeps the same for its
+	// address; this is what a manual extender, which it does not know, has.
+	limitedUntil time.Time
 
 	httpClient      *http.Client
 	websocketDialer *websocket.Dialer
@@ -2099,6 +2142,15 @@ func (self *clientDialer) Update(handleCtx context.Context, err error) {
 	if errors.Is(err, errExtenderMemoryBudget) {
 		return
 	}
+	// Neither does the extender's own admission limit (A12): a 429 is a
+	// backoff, never a failure, so nothing is counted against the dialer and
+	// the directory holds nothing. The address is left alone until the
+	// backoff passes.
+	var limitedErr *ExtenderLimitedError
+	if self.extenderConfig != nil && errors.As(err, &limitedErr) {
+		self.limit(limitedErr.RetryAfter)
+		return
+	}
 	recorded := false
 	func() {
 		self.mutex.Lock()
@@ -2131,6 +2183,52 @@ func (self *clientDialer) Update(handleCtx context.Context, err error) {
 	} else {
 		directory.RecordFailure(self.extenderConfig.Ip, self.extenderConfig.Profile.ConnectMode)
 	}
+}
+
+// Leaves a limited extender alone for its backoff (A12). The directory keeps
+// the backoff of an address it knows, which is what LimitedUntil reads; the
+// dialer keeps its own only for an address the directory does not know, such
+// as a manual extender's, with the directory's bounds.
+func (self *clientDialer) limit(retryAfter time.Duration) {
+	directorySettings := DefaultExtenderDirectorySettings()
+	if self.settings != nil && self.settings.ExtenderDirectory != nil {
+		directory := self.settings.ExtenderDirectory
+		if !directory.RecordLimited(self.extenderConfig.Ip, retryAfter).IsZero() {
+			return
+		}
+		directorySettings = directory.settings
+	}
+	backoff := min(
+		JitterExtenderLimitedBackoff(retryAfter, directorySettings.ExtenderLimitedBackoff),
+		directorySettings.MaxHoldTimeout,
+	)
+	limitedUntil := time.Now().Add(backoff)
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.limitedUntil.Before(limitedUntil) {
+		self.limitedUntil = limitedUntil
+	}
+}
+
+// When this dialer stops being limited (A12): the later of its own backoff and
+// its address's in the directory, zero when neither is limited now.
+func (self *clientDialer) LimitedUntil() time.Time {
+	var limitedUntil time.Time
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		if time.Now().Before(self.limitedUntil) {
+			limitedUntil = self.limitedUntil
+		}
+	}()
+	if self.extenderConfig == nil || self.settings == nil || self.settings.ExtenderDirectory == nil {
+		return limitedUntil
+	}
+	// the directory is an external object, asked with no lock held
+	if addressLimitedUntil := self.settings.ExtenderDirectory.AddressLimitedUntil(self.extenderConfig.Ip); limitedUntil.Before(addressLimitedUntil) {
+		limitedUntil = addressLimitedUntil
+	}
+	return limitedUntil
 }
 
 // Reports whether this dialer can carry a websocket dial. An api-only dialer

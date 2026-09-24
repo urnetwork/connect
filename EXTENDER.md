@@ -251,6 +251,190 @@ translation first. Then A3, then the inner TLS as today. The quic and dns
 carriers adapt the request stream to `net.Conn` (the commented
 `streamConn`, revived).
 
+A11. NLayer extenders. An NLayer extender relays a forward to one of a
+preset list of other extenders, its hops, instead of to the destination;
+the extenders a request crosses are its layers. The list is
+`ExtenderSettings.NLayerHops`, which connectctl takes as a repeatable
+`--nlayer-hop=<spec>`, `[tcp|quic|dns://]<ip>[:<port>]` with optional
+`key`, `secret_file`, `sni`, `tld`, `fragment` and `reorder` parameters
+(G4); an empty list is an ordinary extender. A private hop's secret is the
+trimmed content of the file `secret_file` names, read once at start and
+kept in memory only: a process's arguments are readable by every user of
+the host, so a spec that carries a secret in its address is refused, and
+no error repeats the spec or the file's content. For each accepted forward the NLayer
+extender is an extender client of one hop: a fresh outer TLS on the hop's
+own carrier, with the outer name of the hop's configuration and the hop's
+identity leaf pinned when the configuration names its key (B3), then a new
+`ExtenderHeader` with the same `DestinationHost`, `DestinationPort` and
+`Datagram`, service forward, the hop's secret when the hop is private (A4),
+and `HopCount` one more than the header it received. Once the hop's
+response frame is read, the inner bytes are relayed both ways by the plain
+stream relay of A9. The client's inner TLS to the destination stays end to
+end and opaque at every layer, and nothing is reframed: the framing of a
+datagram request passes through untouched, and only the last layer, an
+ordinary extender, turns the frames into udp. A tcp hop dial leaves through
+the forward egress of A7.
+
+What is not relayed. The gossip and feed services of A8 are served by the
+NLayer extender itself, so their requests never leave it; a probe is
+relayed, below. The response to every request, a forward's and a probe's
+included, is the extender's own, so the identity a chain shows its client
+is the first layer's key, and a record or a pin covers the first layer
+only. Every layer applies its own whitelist (A5), the first before any hop
+is dialed. The response to a forward is written before the hop dial, as it
+is before a forward dial, so a hop that cannot be reached closes the stream
+after the 200, which the client sees as a forward that failed.
+
+Probes (GEOMAP §2.9, D22). An NLayer extender never answers a probe
+itself: it relays it to the end of its chain, so the round trip a pinger
+measures is the path a client of the front would use, and the extender
+that judges and co-signs the claim is the one that terminates the chain.
+The front admits the probe as any extender does -- the per-source probe
+limiter (GEOMAP §2.1), one pinger at most -- dials a hop with the same pinger
+identity, service probe and `HopCount` one more, through the hop rules
+above, and waits for the hop's response before it answers. A hop dial that
+fails is a 403, so the pinger, which has had no response, probes again.
+The answer carries the front's own key, its signature over the client's
+challenge and its carriers, and three fields of the end's:
+`ExtenderResponse.ProbeNonce`, `HopCount` (field 5), which the end sets to
+the `HopCount` it received, 0 for a direct probe, and `ChainEndPublicKey`
+(field 6), the hop's `ChainEndPublicKey` when it relayed further, else the
+hop's own key, and empty on a direct probe. From there the bytes are
+relayed both ways, the attestation to the end and the verdict back, until
+the streams close. The pinger measures header to response as before, which
+through a chain is the whole chain, binds its claim to the chain end's key
+and verifies the co-signature under it, and records the sample against the
+address it dialed, the front's; its ping report carries `hop_count`. The
+depth is copied back unsigned, so a response that names a chain end other
+than the extender dialed counts as at least one hop whatever it says, and a
+relay cannot pass for a direct ping. There is no inner TLS in a probe for
+the loop check to read. A front instead holds one relayed probe per signed
+source at a time -- `ProbeClientId` for a provider, `ProbeExtenderPublicKey`
+for an extender -- and refuses another from that source with 403 while one
+is in flight: a probe that comes back around carries the same source. The
+identity in the header is unsigned when the front reads it, but it is the
+one the attestation must be signed by at the end, so a spoofed header buys a
+refused claim. Its limit is stated plainly: anyone can occupy a source's one
+slot through a front for the life of one probe, which the end's attestation
+timeout bounds. A ranking probe names no source and gets no entry; the
+depth bound is its loop guard. The end judges every relayed probe from the
+front's address, so the end's per-source probe rate applies to all of a
+front's pingers together.
+
+Hop selection. A connection picks a hop at random among those not held and
+not yet tried by it, preferring hops of its own family, so a chain egresses
+on the family its client reached the first layer on (A7), and falls back to
+the other family only when none of its own is left. A hop whose dial fails
+-- unreachable, a handshake or pin that fails, or past `NLayerDialTimeout`,
+10 s -- is held for `NLayerHoldTimeout`, 30 s, and the connection tries
+another hop, up to `NLayerAttempts`, 2; every connection skips a held hop
+until its hold runs out. A hop that answers with a refusal is not held,
+since a refusal can be about the request, its destination or its depth,
+rather than about the hop. `NLayerStats()` reports per hop the connections
+relayed, the refusals, the failed dials and the hold; each hold, and its
+release when the hold is next consulted after it ran out, reaches
+`NLayerHoldHandler`, which connectctl logs.
+
+Depth bound. `HopCount`, field 11 of the header, is how many extenders a
+request has already crossed: 0 from a client, one more at each layer. Every
+extender, NLayer or not, refuses a forward whose `HopCount` + 1 is past
+`NLayerMaxDepth`, 4, with 403 and before its whitelist (v1: with the
+close), so a chain holds at most that many extenders. Without it a chain
+whose hops lead back into it relays one request forever, each traversal a
+new connection holding a slot on every layer it crosses until the limits of
+A9 refuse it.
+
+Loop check. An NLayer extender also refuses a stream that has come back to
+it. After the response and before the hop dial it reads the first inner
+record, only through the ClientHello's random and within
+`NLayerClientHelloTimeout`, 2 s, and closes the stream when another of its
+connections is relaying the same random. A random is held for the life of
+its relay, so the set is bounded by the connections in flight, and a loop
+A -> B -> A ends at A's second entry after two hop dials rather than at the
+depth bound. A HelloRetryRequest repeats the random on its own connection,
+which is never read twice. A datagram request is not read ahead at all,
+since its stream carries frames rather than an inner TLS, and a stream that
+does not start with a ClientHello -- a plain inner stream, a client that
+sends nothing within the timeout -- is relayed unchanged, with what was
+read in front. Both are left to the depth bound, which is the backstop for
+every request. An extender with no hops never forwards to another extender,
+so it cannot be inside a loop, and it does not read ahead.
+
+Limits. A hop counts every connection a layer relays to it against one
+source address, so a hop behind a busy layer needs a per-source bound above
+the 64 of A9. A hop dial is also a carrier claim on a host with a memory
+budget; a claim the budget refuses is this host's condition, so the
+connection is refused and the hop is neither held nor counted, as a client
+dialer leaves an extender alone for the same refusal (E1). An extender that predates `HopCount` ignores it; it cannot be
+an NLayer extender, so it only ever ends a chain, one layer past the bound
+the layers before it enforce. An NLayer extender activates as any other
+does (C2): the forward probe arrives from its last layer, on the family the
+family preference kept.
+
+A12. Admission limits. An extender admits every connection, on every
+carrier, by the source's subnet hash — the same /29 (v4) and /56 (v6) prefix
+the platform's address hash keys on, hashed with a pepper drawn at process
+start, so the extender's tables hold no address — under two limits that are
+extender configuration values per instance (`ExtenderSettings`, connectctl
+`--admission_subnets_per_minute` and `--admission_actions_per_subnet_per_minute`,
+the same fields on the sdk's native role): `AdmissionSubnetsPerMinute`
+(default 1000), the distinct subnet hashes admitted in any one minute, which
+bounds the whole extender; and `AdmissionActionsPerSubnetPerMinute`
+(default 8), the actions from one subnet hash in any one minute, which stops
+one client flooding it. An action is anything the extender does work for: a
+forward, a gossip or feed stream, a probe (a ping is an action like any
+other). Both are sliding windows, token buckets refilled at the limit per
+minute with a burst of the limit, so a quiet minute does not bank credit.
+A connection whose header is signed with an allowed secret — a client's or
+a private hop's (A11) — is exempt from the per-subnet limit, because the
+secret is the trust and an NLayer hop otherwise sees its whole front as one
+subnet; it still counts toward the per-instance limit. Over either limit the
+extender answers **429**, no body, with a `Retry-After` drawn at random
+between `AdmissionRetryAfterMin` (15 s) and `AdmissionRetryAfterMax`
+(60 s), then closes the connection. A 429 is the ordinary answer any
+rate-limited site gives, so it adds no fingerprint; everything else stays
+403 (A4). Answering costs a TLS handshake, so a subnet that keeps coming
+past `AdmissionRefusalsPerSubnetPerMinute` (default 8) further refusals in
+the same minute is closed at accept without one. The concurrent-connection
+caps (`MaxConnectionCountPerSource`, `MaxConnectionCount`) and the probe
+service's own per-source bucket stay beneath these. Two consequences of the
+defaults, stated plainly: a large NAT — a carrier's CGNAT pool, a campus —
+puts many users behind one /29, and eight actions a minute among them is
+tight, so `LimitedBySourceCount` is the number to watch after the first
+deploy and the per-subnet limit or the v4 prefix width are the knobs; and
+an NLayer hop counts its whole front as one subnet, so a hop lists its
+fronts in `AdmissionUnlimitedSources` — a per-instance list of source
+prefixes (connectctl `--admission_unlimited_source=<cidr>`, repeatable; the
+same field on the sdk's native role) that are exempt from both limits,
+matched on the source address at accept before it is hashed and never
+retained. An unlimited source is trusted to rate-limit its own clients, and
+the trust is recursive: a front rate-limits under its own A12 settings and
+may in turn list sources it trusts, each layer answering for the one
+before it. The operator's own probes need no exemption at today's cadence —
+the liveness probe dials each address once every five minutes and
+activation dials each carrier once — and if that cadence ever grows, the
+activation response is the place to hand an extender the operator's prober
+prefixes as unlimited sources, since the extender already trusts what that
+response signs. The status counts
+refusals by limit (`LimitedBySubnetsCount`, `LimitedBySourceCount`) and the
+provide status carries them.
+
+On the client (E), a 429 is `connect.ExtenderLimitedError` with the
+`Retry-After` it carried, and it is not a failure: no failure count, no hold.
+The directory marks the address limited until now plus a backoff — the
+`Retry-After` jittered uniformly by ±50 %, or `ExtenderLimitedBackoff`
+(30 s) jittered the same way when none came — and orders limited candidates
+after every healthy one, whatever their latency or continent, until the
+backoff passes; the probe pass and the feed dial skip a limited candidate,
+and when every candidate is limited the dialer waits for the earliest
+backoff to pass rather than retrying at once. An NLayer front treats a
+hop's 429 the same way: the hop is limited, not held, other hops are
+preferred, and when every hop is limited the front answers its own client
+429 with the shortest remaining backoff, so a limit propagates back to the
+client as a limit and not as a refusal. A pinger limited by a target
+records no verdict for that probe (it is a retry, not a refusal, and never
+evidence in connect/GEOMAP.md §5.5).
+
 ### B. Identity, records and trust
 
 B1. Keys. Ed25519 everywhere. An extender generates its identity key once;
@@ -560,7 +744,8 @@ doubling per consecutive failure to 6 hours; warning means consecutive
 failures at least 1; removal when never succeeded and the first failure
 is older than 24 hours, or when the last success is older than 7 days and
 consecutive failures reach 3; expiry per record with 5 minutes skew;
-revocation immediate; cap 512 entries, evicting expired, then
+revocation immediate; cap 2048 addresses (`MaxAddressCount`), the backstop
+beneath the active records' cap of E6, evicting expired, then
 never-succeeded oldest first, then oldest last success. Manual entries are
 never removed by policy. A `MonitorValue` publishes change; `Snapshot`
 serves status. Persistence goes through a store interface `Load() ([]byte,
@@ -620,6 +805,28 @@ still on its first attempt, for at most `ExtenderInitialSampleTimeout`
 
 E5. Outer verification. A dialer built from a verified record passes the
 key into `ExtenderConfig.PublicKey` (B3).
+
+E6. Active records (GEOMAP §2.1, D26). The directory keeps at most
+`MaxActiveRecordCount` (512) active verified records -- an active key with
+an address that is not held -- which is what a phone can hold and what a
+feed sample, the gossip mesh and a peer pinger (G5) draw from, so the
+directory is linear in nothing but its cap however large the fleet. The
+records on the hinted continent are preferred, then those with a current
+latency sample, then a random sample of the rest: a record new to a full
+directory, from gossip or the feed alike, evicts a random one of the rest,
+possibly itself, and only once none of the rest is left the oldest applied
+measured one, then the oldest applied one on the hinted continent. A held
+record and an expired one are never evicted by it, since their tiers keep
+their own bounds (the address cap and the removal policy of E1,
+`MaxExpiredRecordCount`), nor are the extender's own record, which the
+activator and the pinger keep (`KeepPublicKey`), and a record with a manual
+address. An evicted record takes its addresses with it and comes back as a
+new record when it arrives again; a record the cap takes on arrival is still
+published to the directory's subscribers, whose own caps judge it. The
+records sit in an index of pools (`net_extender_directory_tier.go`), so an
+apply, an eviction and a draw each take constant time, and a store written
+under a larger cap loads within the current one. `SetMaxActiveRecordCount`
+replaces the cap at run time; `<= 0` keeps every record.
 
 ### F. SDK surface and network space
 
@@ -711,13 +918,21 @@ one hello for both families and compares the address, not the port.
 
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,
-`--allowed_host` repeated, `--state_dir`, running G2 and G3 without a
-provider. It derives the network host from the api host by dropping the
+`--allowed_host` repeated, `--nlayer-hop` repeated (A11), `--state_dir`,
+running G2 and G3 without a provider. It derives the network host from the api host by dropping the
 service label and the extender dns name by replacing it, keeping an env
 prefix, takes its whitelist from the api host patterns plus the flags,
 does one synchronous hello at start to seed the root keys, and keeps its
 key at the state directory when no key file is given or runs with an
 ephemeral identity when there is neither.
+
+G5. Peer pinger (GEOMAP §2.1). The role and connectctl's extender run an
+`ExtenderPeerPinger` over the space's directory, which pings at most
+`PeerSampleSize` (64) peers: the nearest by the continent hint first, and the
+rest a random slice of the others drawn again every refresh, so one day's
+pinging is linear in the fleet while over days a source's pings spread
+across it; a member keeps its schedule until it is rotated out, and `<= 0`
+pings every peer.
 
 ### H. Packages and dependencies
 
@@ -2439,6 +2654,28 @@ with the database.
 | `sdk.Device` | `GetExtenderStats` added; mirrored on `DeviceRemote` |
 | `sdk.ContractViewController` | `GetExtenderThroughputPoints`, `GetExtenderStats` added |
 | localization keys | the statistics strings of O6 |
+| `protocol.ExtenderHeader` | `HopCount` added (A11) |
+| `connect.ExtenderDial` | `HopCount` added; `connect.ExtenderRefusedError` for a non-200 answer and `connect.IsExtenderMemoryBudgetError` for a local budget refusal (A11) |
+| `extender.ExtenderSettings` | `NLayerHops`, `NLayerMaxDepth`, `NLayerDialTimeout`, `NLayerHoldTimeout`, `NLayerAttempts`, `NLayerClientHelloTimeout`, `NLayerHoldHandler`, and the test seam `HeaderHandler` added (A11) |
+| `extender.ExtenderServer` | `NLayerStats()` and `ExtenderNLayerHopStats` (A11) |
+| `protocol.ExtenderResponse` | `HopCount` and `ChainEndPublicKey` added (A11, GEOMAP §2.9) |
+| `connect.ExtenderLatencyProbe` | `HopCount` and `ChainEndPublicKey` added; `connect.ExtenderPingReport` gains `hop_count` (A11, GEOMAP §2.9) |
+| `connectctl extender` | repeatable `--nlayer-hop=<spec>` (A11) |
+| extender carriers | 429 with no body and a `Retry-After` for an action over an admission limit; a subnet past its refusals is closed at accept, before TLS (A12) |
+| `extender.ExtenderSettings` | `AdmissionSubnetsPerMinute`, `AdmissionActionsPerSubnetPerMinute`, `AdmissionRefusalsPerSubnetPerMinute`, `AdmissionRetryAfterMin`, `AdmissionRetryAfterMax`, `AdmissionIpv4PrefixBitCount`, `AdmissionIpv6PrefixBitCount`, `AdmissionMinSubnetCount`, `AdmissionUnlimitedSources`, `NLayerLimitedBackoff`, and the test seam `AdmissionNow` added (A12) |
+| `extender.ExtenderServer` | `AdmissionStats()` and `ExtenderAdmissionStats` (A12) |
+| `extender.ExtenderNLayerHopStats` | `LimitedCount`, `LimitedUntil` added (A12) |
+| `connect.ExtenderLimitedError` | new, for a 429, with the `RetryAfter` it carried; `connect.JitterExtenderLimitedBackoff` (A12) |
+| `connect.ExtenderDirectorySettings` | `ExtenderLimitedBackoff` added (A12) |
+| `connect.ExtenderDirectory` | `RecordLimited`, `AddressLimitedUntil` added; `ExtenderCandidate` and `ExtenderDirectoryEntry` gain `LimitedUntil` (A12) |
+| `connectctl extender` | `--admission_subnets_per_minute=<count>`, `--admission_actions_per_subnet_per_minute=<count>`, repeatable `--admission_unlimited_source=<cidr>` (A12) |
+| sdk native extender role | `AdmissionSubnetsPerMinute`, `AdmissionActionsPerSubnetPerMinute`, `AdmissionUnlimitedSources` on its settings (A12) |
+| `sdk.ExtenderProvideStatus` | `LimitedBySubnetsCount`, `LimitedBySourceCount` added (A12) |
+| `connect.ExtenderDirectorySettings` | `MaxActiveRecordCount` (512) and the test seam `Random` added; the default `MaxAddressCount` is 2048, was 512 (E6, D26) |
+| `connect.ExtenderDirectory` | `KeepPublicKey`, `SetMaxActiveRecordCount`, `MaxActiveRecordCount`, `ActiveRecordCount` added (E6, D26) |
+| `connect.ExtenderPeerPingerSettings` | `PeerSampleSize` (64) added (G5, GEOMAP §2.1) |
+| `connect.ExtenderPeerPingerStatus` | `SampleSize`, `SampledPeerCount` added; `ExtenderPeerPinger.SampledPeers` (G5) |
+| sdk native extender role | `PeerSampleSize`, `MaxActiveRecordCount` on its settings (G5, E6) |
 
 Old clients keep working: the header's new fields are optional, the hello
 field is additive, the tables are new, and a v1 extender client still
@@ -2749,3 +2986,27 @@ the connect change in the sdk and the apps. In the other order, a new
 client on an old operator has no dialable extender until the TXT sets
 exist. An old client ignores the TXT sets. Nothing else changes: no
 migration, no services version, no rpc version.
+
+- **A12, admission limits (2026-09-23).** `extender/extender_admission.go`:
+  peppered /29·/56 subnet hashes, two per-instance token buckets refilled at
+  the limit per minute with the limit as burst (a subnet takes an instance
+  token once per window; the table holds max(4096, 4 × the subnet limit)
+  and a full table refuses new subnets), admission after the header and
+  secret check and before the service switch — a bad secret stays an
+  uncounted 403, a whitelist refusal counts — signed headers exempt from
+  the per-subnet limit, `AdmissionUnlimitedSources` matched masked at
+  accept, 429 with a random `Retry-After` closing the connection (a stream
+  on h3), the refusal cap closing before TLS on tcp and refusing the QUIC
+  Initial. Client: `ExtenderLimitedError`, `RecordLimited` in the
+  directory, limited candidates after every unlimited one earliest-expiring
+  first, the probe pass and feed dial skipping them, a network client that
+  waits for the earliest limit when all are limited and does not grow its
+  backoff, a limited peer re-pinged when its limit ends, `Retry-After`
+  capped at a day and the jittered backoff at the hold maximum; NLayer hops
+  limited rather than held, with `NLayerLimitedBackoff` (30 s), a front
+  answering 429 while its response is not yet written. connectctl flags
+  with underscores, refusing a non-CIDR value without repeating it; the
+  sdk's native role passes the limits through (0 = connect's default,
+  negative = off) and publishes the counts. Known-failing at HEAD and
+  unrelated: the root package's mobile memory-accounting test that the
+  `Admission` test pattern also selects.

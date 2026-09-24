@@ -739,9 +739,12 @@ func TestExtenderDirectoryDefaultSettings(t *testing.T) {
 		{name: "StaleSuccessRemoveTimeout", got: settings.StaleSuccessRemoveTimeout, want: 7 * 24 * time.Hour},
 		{name: "RemoveConsecutiveFailureCount", got: settings.RemoveConsecutiveFailureCount, want: 3},
 		{name: "RecordExpireSkew", got: settings.RecordExpireSkew, want: 5 * time.Minute},
-		{name: "MaxAddressCount", got: settings.MaxAddressCount, want: 512},
+		{name: "MaxAddressCount", got: settings.MaxAddressCount, want: 2048},
+		{name: "MaxExpiredRecordCount", got: settings.MaxExpiredRecordCount, want: 64},
+		{name: "MaxActiveRecordCount", got: settings.MaxActiveRecordCount, want: 512},
 		{name: "SaveTimeout", got: settings.SaveTimeout, want: time.Second},
 		{name: "EventWindowTimeout", got: settings.EventWindowTimeout, want: time.Minute},
+		{name: "LatencyMaxAge", got: settings.LatencyMaxAge, want: 12 * time.Hour},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -753,6 +756,9 @@ func TestExtenderDirectoryDefaultSettings(t *testing.T) {
 	}
 	if settings.Now == nil {
 		t.Error("the default directory carries no clock")
+	}
+	if settings.Random != nil {
+		t.Error("the default directory replaces the random draw")
 	}
 	if 0 < len(settings.NetworkHosts) {
 		t.Errorf("the default directory accepts %v", settings.NetworkHosts)

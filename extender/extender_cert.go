@@ -1,6 +1,7 @@
 package extender
 
 import (
+	"bytes"
 	"container/list"
 	"crypto"
 	"crypto/ecdsa"
@@ -120,6 +121,17 @@ func (self *extenderCertificates) SignChallenge(challenge []byte) []byte {
 		return nil
 	}
 	return connect.SignExtenderChallenge(self.identityPrivateKey, challenge)
+}
+
+// Signs the co-signature of an accepted latency claim (GEOMAP §2.3), or
+// returns nil without an identity key. The same key signs challenges and the
+// certificate authority, so it signs nothing through here but bytes under the
+// co-signature domain, whoever builds them.
+func (self *extenderCertificates) SignProbeCosign(cosignBytes []byte) []byte {
+	if self.identityPrivateKey == nil || !bytes.HasPrefix(cosignBytes, []byte(connect.ExtenderProbeCosignDomain)) {
+		return nil
+	}
+	return ed25519.Sign(self.identityPrivateKey, cosignBytes)
 }
 
 // The tls callback for every carrier. A name is issued once and reused.

@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -54,7 +55,7 @@ func (self *testProbeLog) probe(
 	ctx context.Context,
 	candidate *ExtenderCandidate,
 	attestor *ExtenderProbeAttestor,
-) (time.Duration, bool, error) {
+) (time.Duration, ExtenderPingOutcome, error) {
 	self.stateLock.Lock()
 	self.ips = append(self.ips, candidate.Ip.String())
 	self.attested = append(self.attested, attestor != nil)
@@ -65,9 +66,13 @@ func (self *testProbeLog) probe(
 	default:
 	}
 	if !ok {
-		return 0, false, fmt.Errorf("no route to %s in this test", candidate.Ip)
+		return 0, ExtenderPingUnattested, fmt.Errorf("no route to %s in this test", candidate.Ip)
 	}
-	return rtt, attestor != nil, nil
+	// an attesting probe of this seam is one the target co-signed
+	if attestor != nil {
+		return rtt, ExtenderPingCosigned, nil
+	}
+	return rtt, ExtenderPingUnattested, nil
 }
 
 func (self *testProbeLog) count() int {
@@ -83,9 +88,24 @@ func (self *testProbeLog) waitForProbes(t *testing.T, count int) {
 		select {
 		case <-self.probed:
 		case <-deadline:
-			t.Fatalf("probes = %v, expected %d", self.ips, count)
+			t.Fatalf("probe count = %d, expected %d", self.count(), count)
 		}
 	}
+}
+
+// Probe hooks advance the fake clock before publishing their arrival. Only
+// the status monitor proves that the pass containing that hook has finished.
+func (self *testProbeLog) waitForPass(
+	t *testing.T,
+	networkClient *ExtenderNetworkClient,
+	clock *testClock,
+	count int,
+) ExtenderNetworkClientStatus {
+	t.Helper()
+	self.waitForProbes(t, count)
+	return waitForExtenderNetworkStatus(t, networkClient, "completed probe pass", func(status ExtenderNetworkClientStatus) bool {
+		return status.LastProbeTime.Equal(clock.Now())
+	})
 }
 
 // A client on EU with two EU extenders and two NA ones: the hinted continent
@@ -123,7 +143,10 @@ func TestExtenderNetworkClientProbesTheHintedContinentFirstAndStops(t *testing.T
 			settings.ProbeCountPerExtender = 1
 			settings.ProbeCloseFactor = 2
 			settings.ProbeCloseFloor = 10 * time.Millisecond
-			settings.Probe = probes.probe
+			settings.Probe = func(ctx context.Context, candidate *ExtenderCandidate, attestor *ExtenderProbeAttestor) (time.Duration, ExtenderPingOutcome, error) {
+				clock.advance(time.Second)
+				return probes.probe(ctx, candidate, attestor)
+			}
 			settings.Hint = func(ctx context.Context) (string, error) {
 				return "eu", nil
 			}
@@ -141,15 +164,11 @@ func TestExtenderNetworkClientProbesTheHintedContinentFirstAndStops(t *testing.T
 		},
 	)
 
-	probes.waitForProbes(t, 2)
-	// both EU extenders are close enough (within 10 ms or 2x the best 20 ms),
-	// so the window is full and nothing else is probed
-	select {
-	case <-probes.probed:
-	case <-time.After(300 * time.Millisecond):
-	}
+	status := probes.waitForPass(t, networkClient, clock, 2)
+	// Both close EU samples and their completed pass are now published.
 	probes.stateLock.Lock()
 	ips := append([]string(nil), probes.ips...)
+	attested := append([]bool(nil), probes.attested...)
 	probes.stateLock.Unlock()
 	if len(ips) != 2 {
 		t.Fatalf("probes = %v, expected exactly the two EU extenders", ips)
@@ -160,7 +179,7 @@ func TestExtenderNetworkClientProbesTheHintedContinentFirstAndStops(t *testing.T
 		}
 	}
 	// a ranking client attests nothing
-	for _, attested := range probes.attested {
+	for _, attested := range attested {
 		if attested {
 			t.Fatal("a ranking probe carried an attestor")
 		}
@@ -169,7 +188,6 @@ func TestExtenderNetworkClientProbesTheHintedContinentFirstAndStops(t *testing.T
 	if directory.ContinentHint() != "EU" {
 		t.Fatalf("hint = %q, expected the operator's EU", directory.ContinentHint())
 	}
-	status := networkClient.Status()
 	if status.ContinentHint != "EU" {
 		t.Fatalf("status hint = %q", status.ContinentHint)
 	}
@@ -208,7 +226,10 @@ func TestExtenderNetworkClientAttestsWhenTheProviderStarts(t *testing.T) {
 			settings.ProbeWindowCount = 2
 			settings.ProbeMaxCandidateCount = 8
 			settings.ProbeCountPerExtender = 1
-			settings.Probe = probes.probe
+			settings.Probe = func(ctx context.Context, candidate *ExtenderCandidate, attestor *ExtenderProbeAttestor) (time.Duration, ExtenderPingOutcome, error) {
+				clock.advance(time.Second)
+				return probes.probe(ctx, candidate, attestor)
+			}
 			settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
 				return nil, nil
 			}
@@ -222,7 +243,7 @@ func TestExtenderNetworkClientAttestsWhenTheProviderStarts(t *testing.T) {
 			}
 		},
 	)
-	probes.waitForProbes(t, 2)
+	probes.waitForPass(t, networkClient, clock, 2)
 	for _, candidate := range directory.Candidates(4, 8) {
 		if candidate.LatencyAttested {
 			t.Fatal("a ranking sample is attested")
@@ -230,8 +251,8 @@ func TestExtenderNetworkClientAttestsWhenTheProviderStarts(t *testing.T) {
 	}
 
 	attestor, _ := newTestProbeAttestor(t)
-	networkClient.SetProbeAttestor(attestor)
-	probes.waitForProbes(t, 4)
+	networkClient.SetProbeAttestor(attestor, nil)
+	probes.waitForPass(t, networkClient, clock, 4)
 	probes.stateLock.Lock()
 	attested := append([]bool(nil), probes.attested...)
 	probes.stateLock.Unlock()
@@ -244,13 +265,119 @@ func TestExtenderNetworkClientAttestsWhenTheProviderStarts(t *testing.T) {
 		}
 	}
 
-	// the provider stops: every sample is current for a ranking pass, so
-	// nothing more is probed
-	before := probes.count()
-	networkClient.SetProbeAttestor(nil)
-	time.Sleep(200 * time.Millisecond)
-	if after := probes.count(); after != before {
-		t.Fatalf("clearing the attestor probed again: %d -> %d", before, after)
+}
+
+// Own the pass directly, without feed/bootstrap goroutines or network I/O.
+func newTestOwnedExtenderProbeClient(t *testing.T, clock *testClock, probes *testProbeLog) *ExtenderNetworkClient {
+	t.Helper()
+	directory, _ := newTestExtenderDirectory(t, clock, nil)
+	for _, ip := range []string{"192.0.2.10", "192.0.2.11"} {
+		directory.AddManual(netip.MustParseAddr(ip))
+	}
+	settings := DefaultExtenderNetworkClientSettings()
+	settings.Now = clock.Now
+	settings.ProbeWindowCount = 2
+	settings.ProbeCountPerExtender = 1
+	settings.ProbeCloseFactor = 2
+	settings.ProbeCloseFloor = 10 * time.Millisecond
+	settings.IpVersionSupported = func(ipVersion int) bool { return ipVersion == 4 }
+	settings.Probe = func(ctx context.Context, candidate *ExtenderCandidate, attestor *ExtenderProbeAttestor) (time.Duration, ExtenderPingOutcome, error) {
+		clock.advance(time.Second)
+		return probes.probe(ctx, candidate, attestor)
+	}
+	return &ExtenderNetworkClient{
+		ctx:           t.Context(),
+		log:           NewNoopLogger(),
+		directory:     directory,
+		settings:      settings,
+		statusMonitor: NewMonitorValue[ExtenderNetworkClientStatus](ExtenderNetworkClientStatus{}),
+		probeWake:     NewMonitor(),
+	}
+}
+
+// The last hook has arrived, but cannot publish its sample or completed-pass
+// status until released. Hook count must not satisfy the completion waiter.
+func TestExtenderProbeCompletionWaitsForPublishedStatus(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clock := newTestClock()
+		probes := newTestProbeLog(map[string]time.Duration{
+			"192.0.2.10": 20 * time.Millisecond,
+			"192.0.2.11": 25 * time.Millisecond,
+		})
+		networkClient := newTestOwnedExtenderProbeClient(t, clock, probes)
+		probe := networkClient.settings.Probe
+		held := make(chan struct{})
+		release := make(chan struct{})
+		releaseProbe := sync.OnceFunc(func() { close(release) })
+		networkClient.settings.Probe = func(ctx context.Context, candidate *ExtenderCandidate, attestor *ExtenderProbeAttestor) (time.Duration, ExtenderPingOutcome, error) {
+			rtt, outcome, err := probe(ctx, candidate, attestor)
+			if probes.count() == 2 {
+				close(held)
+				<-release
+			}
+			return rtt, outcome, err
+		}
+		passDone := make(chan struct{})
+		go func() {
+			defer close(passDone)
+			networkClient.probePass()
+		}()
+		defer func() {
+			releaseProbe()
+			<-passDone
+		}()
+		<-held
+		if probes.count() != 2 || !networkClient.Status().LastProbeTime.IsZero() {
+			t.Fatal("held final hook did not establish the pre-publication boundary")
+		}
+		completed := make(chan ExtenderNetworkClientStatus, 1)
+		go func() { completed <- probes.waitForPass(t, networkClient, clock, 2) }()
+		synctest.Wait()
+		var status ExtenderNetworkClientStatus
+		returnedEarly := false
+		select {
+		case status = <-completed:
+			returnedEarly = true
+			t.Error("probe callback count completed the wait before LastProbeTime publication")
+		default:
+		}
+		releaseProbe()
+		if !returnedEarly {
+			status = <-completed
+		}
+		<-passDone
+		if !returnedEarly && !status.LastProbeTime.Equal(clock.Now()) {
+			t.Error("completed waiter lost the final probe generation")
+		}
+		if !networkClient.Status().LastProbeTime.Equal(clock.Now()) {
+			t.Fatal("released pass did not publish its completion time")
+		}
+		if got := len(networkClient.directory.MeasuredLatencies(4, false)); got != 2 {
+			t.Fatalf("released pass published %d measured latencies, want 2", got)
+		}
+	})
+}
+
+// A synchronous pass after clearing the attestor needs no new sample. This
+// proves the no-reprobe policy without a negative wall-clock sleep.
+func TestExtenderProbeClearedAttestorDoesNotReprobe(t *testing.T) {
+	clock := newTestClock()
+	probes := newTestProbeLog(map[string]time.Duration{
+		"192.0.2.10": 20 * time.Millisecond,
+		"192.0.2.11": 25 * time.Millisecond,
+	})
+	networkClient := newTestOwnedExtenderProbeClient(t, clock, probes)
+	attestor, _ := newTestProbeAttestor(t)
+	networkClient.SetProbeAttestor(attestor, nil)
+	networkClient.probePass()
+	if probes.count() != 2 || len(networkClient.directory.MeasuredLatencies(4, true)) != 2 {
+		t.Fatal("attested control did not record both samples")
+	}
+	before := networkClient.Status().LastProbeTime
+	networkClient.SetProbeAttestor(nil, nil)
+	networkClient.probePass()
+	if probes.count() != 2 || !networkClient.Status().LastProbeTime.Equal(before) {
+		t.Fatal("clearing the attestor remeasured already-current samples")
 	}
 }
 
@@ -373,13 +500,13 @@ func TestExtenderNetworkClientProbeTimeoutBoundsTheSeam(t *testing.T) {
 		func(settings *ExtenderNetworkClientSettings) {
 			settings.ProbeWindowCount = 1
 			settings.ProbeTimeout = 123 * time.Millisecond
-			settings.Probe = func(ctx context.Context, candidate *ExtenderCandidate, attestor *ExtenderProbeAttestor) (time.Duration, bool, error) {
+			settings.Probe = func(ctx context.Context, candidate *ExtenderCandidate, attestor *ExtenderProbeAttestor) (time.Duration, ExtenderPingOutcome, error) {
 				_, hasDeadline := ctx.Deadline()
 				select {
 				case deadlines <- hasDeadline:
 				default:
 				}
-				return 10 * time.Millisecond, false, nil
+				return 10 * time.Millisecond, ExtenderPingUnattested, nil
 			}
 			settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
 				return nil, nil

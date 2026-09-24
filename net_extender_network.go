@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	mathrand "math/rand"
 	"net"
@@ -115,6 +116,10 @@ type ExtenderNetworkClientSettings struct {
 
 	// The only clock this client reads. Tests install a fake one.
 	Now func() time.Time
+	// When set, replaces time.After as the wait between two passes of the
+	// refresh loop. Tests read the wait the loop chose through it, and hold
+	// the loop on it without a sleep.
+	PassAfter func(wait time.Duration) <-chan time.Time
 	// ResolveDns, when set, replaces the bootstrap resolution. Nil resolves A
 	// and AAAA over DoH with the system resolver as the fallback (E3).
 	ResolveDns func(ctx context.Context, name string) ([]netip.Addr, error)
@@ -128,14 +133,26 @@ type ExtenderNetworkClientSettings struct {
 	// IpVersionSupported, when set, replaces the host family probe. Nil uses
 	// probeFamilySupport, which is what the strategy also dials by.
 	IpVersionSupported func(ipVersion int) bool
-	// Probe, when set, replaces the probe dial of one candidate
-	// (DESIGNNOTES4.md). Nil dials the candidate's carriers in order with
-	// ProbeExtenderLatency. It returns the rtt and whether it was attested.
+	// Probe, when set, replaces the whole probe of one candidate
+	// (DESIGNNOTES4.md): the carrier walk and every probe on it. Nil walks
+	// the candidate's carriers in order with ProbeLatency. It returns the
+	// lowest rtt and what became of the attestation, of which only
+	// ExtenderPingCosigned marks the sample attested. It hands back no claim,
+	// so nothing is reported for a probe it made.
 	Probe func(
 		ctx context.Context,
 		candidate *ExtenderCandidate,
 		attestor *ExtenderProbeAttestor,
-	) (time.Duration, bool, error)
+	) (time.Duration, ExtenderPingOutcome, error)
+	// ProbeLatency, when set, replaces one probe of one carrier inside the
+	// carrier walk. Nil is ProbeExtenderLatency over the strategy's connect
+	// settings. Tests drive the attestation and the verdict through it, and
+	// what it returns is reported exactly as a real probe is.
+	ProbeLatency func(
+		ctx context.Context,
+		extenderConfig *ExtenderConfig,
+		attestor *ExtenderProbeAttestor,
+	) (*ExtenderLatencyProbe, error)
 	// Hint, when set, replaces the continent hint fetch. Nil reads
 	// /network/extender-hint through the client strategy. An empty answer
 	// with no error is an operator that cannot place the caller.
@@ -260,6 +277,9 @@ type ExtenderNetworkClient struct {
 	// the attesting provider, nil for a client that only ranks. Installed
 	// by the provider role and cleared when it stops.
 	probeAttestor *ExtenderProbeAttestor
+	// where the attesting provider's pings are reported, nil for nowhere
+	// (GEOMAP §2.5)
+	probeReporter *ExtenderPingReporter
 	// true once the operator's hint has been applied, which the dns
 	// inference then defers to
 	operatorHintApplied bool
@@ -432,7 +452,7 @@ func (self *ExtenderNetworkClient) run() {
 		// first attempt is marked done from inside, as soon as the sample
 		// completes
 		passStartTime := self.settings.Now()
-		sampled := self.sample()
+		sampled, limitedUntil := self.sample()
 		// the first attempt is complete either way; the startup gate must not
 		// wait on an attempt that has already failed
 		self.markInitialAttemptDone()
@@ -455,6 +475,10 @@ func (self *ExtenderNetworkClient) run() {
 			}
 			wait = backoff
 			backoff = min(2*backoff, self.settings.MaxBackoff)
+		case !limitedUntil.IsZero():
+			// every candidate is limited: wait for the first backoff to pass
+			// rather than dialing again at once (A12)
+			wait = max(backoff, limitedUntil.Sub(self.settings.Now()))
 		default:
 			wait = backoff
 			backoff = min(2*backoff, self.settings.MaxBackoff)
@@ -463,11 +487,15 @@ func (self *ExtenderNetworkClient) run() {
 			wait = self.settings.MinBackoff
 		}
 
+		passAfter := self.settings.PassAfter
+		if passAfter == nil {
+			passAfter = time.After
+		}
 		select {
 		case <-self.ctx.Done():
 			return
 		case <-wake:
-		case <-time.After(wait):
+		case <-passAfter(wait):
 		}
 	}
 }
@@ -785,19 +813,25 @@ func (self *ExtenderNetworkClient) ipVersionSupported(ipVersion int) bool {
 }
 
 // Takes one sample from the best candidate that answers, applying every frame.
-// It reports whether a sample completed. In the feed role the same stream is
-// then read until it ends, which is what makes a pass long lived.
-func (self *ExtenderNetworkClient) sample() bool {
-	candidates := self.candidates()
+// It reports whether a sample completed, and when nothing was dialed because
+// every candidate is limited, the earliest time one stops being (A12). In the
+// feed role the same stream is then read until it ends, which is what makes a
+// pass long lived.
+func (self *ExtenderNetworkClient) sample() (bool, time.Time) {
+	candidates, limitedUntil := self.feedCandidates()
 	if len(candidates) == 0 {
 		// nothing to dial is not connecting, it is disconnected (K4)
+		lastError := "no extender candidate"
+		if !limitedUntil.IsZero() {
+			lastError = "every extender candidate is limited"
+		}
 		self.updateStatus(func(status *ExtenderNetworkClientStatus) {
 			status.FeedConnected = false
 			status.Connecting = false
 			status.FeedIp = netip.Addr{}
-			status.LastError = "no extender candidate"
+			status.LastError = lastError
 		})
-		return false
+		return false, limitedUntil
 	}
 
 	// the whole pass is the connecting state, from the first dial to the last
@@ -813,12 +847,12 @@ func (self *ExtenderNetworkClient) sample() bool {
 	for _, candidate := range candidates {
 		select {
 		case <-self.ctx.Done():
-			return false
+			return false, time.Time{}
 		default:
 		}
 		sampled, err := self.sampleCandidate(candidate)
 		if sampled {
-			return true
+			return true, time.Time{}
 		}
 		if err != nil {
 			self.log.Infof("[extender]feed %s err = %s\n", candidate.Ip, err)
@@ -829,7 +863,7 @@ func (self *ExtenderNetworkClient) sample() bool {
 			})
 		}
 	}
-	return false
+	return false, time.Time{}
 }
 
 // Every candidate of a family this host has, verified first (E3).
@@ -845,6 +879,24 @@ func (self *ExtenderNetworkClient) candidates() []*ExtenderCandidate {
 		)
 	}
 	return candidates
+}
+
+// The candidates the feed dials: every candidate but the limited ones (A12),
+// and the earliest time one of those stops being limited, zero when none is.
+func (self *ExtenderNetworkClient) feedCandidates() ([]*ExtenderCandidate, time.Time) {
+	candidates := []*ExtenderCandidate{}
+	var limitedUntil time.Time
+	for _, candidate := range self.candidates() {
+		// the directory sets the time only while the address is limited
+		if !candidate.LimitedUntil.IsZero() {
+			if limitedUntil.IsZero() || candidate.LimitedUntil.Before(limitedUntil) {
+				limitedUntil = candidate.LimitedUntil
+			}
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, limitedUntil
 }
 
 // Tries the carriers of one candidate in order -- tcp, then quic, then dns --
@@ -873,6 +925,13 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 		sampled, err := self.runFeed(connectSettings, extenderConfig)
 		if sampled {
 			return true, nil
+		}
+		var limitedErr *ExtenderLimitedError
+		if errors.As(err, &limitedErr) {
+			// over the extender's admission limits (A12): a backoff, never a
+			// failure, and its other carriers are limited the same way
+			self.directory.RecordLimited(candidate.Ip, limitedErr.RetryAfter)
+			return false, err
 		}
 		resultErr = err
 		self.directory.RecordFailure(candidate.Ip, connectMode)
@@ -1117,24 +1176,48 @@ func extenderRecordContinentCode(message *protocol.ExtenderGossipMessage) string
 
 // The latency probe pass (DESIGNNOTES4.md §4).
 
-// SetProbeAttestor installs the attesting provider, or clears it with nil.
-// Only the provider role calls this, when it starts and when it stops: a
-// consumer client never identifies itself to an extender. An install wakes
-// the pass, so a provider that just started attests without waiting for the
-// next tick.
-func (self *ExtenderNetworkClient) SetProbeAttestor(attestor *ExtenderProbeAttestor) {
+// Installs the attesting provider and the reporter its pings go to, or clears
+// both with a nil attestor. Only the provider role calls this, when it starts
+// and when it stops: a consumer client never identifies itself to an
+// extender. The pinger reports its own pings, whatever the target
+// answered (GEOMAP §2.5); with a nil reporter it attests and reports nothing.
+// An attestor that does not name exactly one identity is refused, which
+// leaves the client ranking. An install wakes the pass, so a provider that
+// just started attests without waiting for the next tick.
+func (self *ExtenderNetworkClient) SetProbeAttestor(
+	attestor *ExtenderProbeAttestor,
+	reporter *ExtenderPingReporter,
+) {
+	if attestor != nil && attestor.Kind() == "" {
+		self.log.Infof("[extender]probe attestor names no single identity; probes rank only\n")
+		attestor = nil
+	}
+	if attestor == nil {
+		// nothing is attested, so there is nothing to report
+		reporter = nil
+	}
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.probeAttestor = attestor
+		self.probeReporter = reporter
 	}()
 	self.probeWake.NotifyAll()
 }
 
-func (self *ExtenderNetworkClient) probeAttestorValue() *ExtenderProbeAttestor {
+// The attestor and reporter the probe pass uses now.
+func (self *ExtenderNetworkClient) probeAttestorValue() (*ExtenderProbeAttestor, *ExtenderPingReporter) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.probeAttestor
+	return self.probeAttestor, self.probeReporter
+}
+
+// The attestor and reporter SetProbeAttestor installed, nil for a client that
+// only ranks. An embedder that installs the pair on behalf
+// of a provider reads it back through this rather than through the client's
+// fields, so what it verifies is what the probe pass uses.
+func (self *ExtenderNetworkClient) ProbeAttestor() (*ExtenderProbeAttestor, *ExtenderPingReporter) {
+	return self.probeAttestorValue()
 }
 
 // The probe loop: one pass on every wake -- a bootstrap, a completed sample,
@@ -1166,13 +1249,13 @@ func (self *ExtenderNetworkClient) runProbes() {
 
 // One pass over every family this host has.
 func (self *ExtenderNetworkClient) probePass() {
-	attestor := self.probeAttestorValue()
+	attestor, reporter := self.probeAttestorValue()
 	probed := false
 	for _, ipVersion := range []int{4, 6} {
 		if !self.ipVersionSupported(ipVersion) {
 			continue
 		}
-		if self.probeFamily(ipVersion, attestor) {
+		if self.probeFamily(ipVersion, attestor, reporter) {
 			probed = true
 		}
 	}
@@ -1186,10 +1269,16 @@ func (self *ExtenderNetworkClient) probePass() {
 
 // Measures the candidates of one family that have no current sample, hinted
 // continent first, until the window holds enough close extenders
-// (DESIGNNOTES4.md §4). With an attestor a sample counts only once attested,
-// so a provider that just started measures -- and attests -- what a ranking
-// pass already measured. Reports whether anything was probed.
-func (self *ExtenderNetworkClient) probeFamily(ipVersion int, attestor *ExtenderProbeAttestor) (probed bool) {
+// (DESIGNNOTES4.md §4). With an attestor a sample counts only once the target
+// co-signed it (GEOMAP §2.3), so a provider that just started measures -- and
+// attests -- what a ranking pass already measured, and a target that refused
+// or sent no verdict is measured again on the next pass. Reports whether
+// anything was probed.
+func (self *ExtenderNetworkClient) probeFamily(
+	ipVersion int,
+	attestor *ExtenderProbeAttestor,
+	reporter *ExtenderPingReporter,
+) (probed bool) {
 	attesting := attestor != nil
 	closeCount := func() int {
 		return extenderCloseCount(
@@ -1216,37 +1305,118 @@ func (self *ExtenderNetworkClient) probeFamily(ipVersion int, attestor *Extender
 			continue
 		}
 		probed = true
-		rtt, attested, err := self.probeCandidate(candidate, attestor)
+		rtt, outcome, err := self.probeCandidate(candidate, attestor, reporter)
 		if err != nil {
 			self.log.Infof("[extender]probe %s err = %s\n", candidate.Ip, err)
 			continue
 		}
-		self.directory.RecordLatency(candidate.Ip, rtt, attested)
+		self.directory.RecordLatency(candidate.Ip, rtt, outcome == ExtenderPingCosigned)
 		if self.log.V(1).Enabled() {
-			self.log.Infof("[extender]probe %s rtt=%s attested=%t\n", candidate.Ip, rtt, attested)
+			self.log.Infof("[extender]probe %s rtt=%s outcome=%q\n", candidate.Ip, rtt, outcome)
 		}
 	}
 	return probed
 }
 
-// Probes one candidate: its carriers in order until one answers, and on that
-// carrier up to n probes of which the lowest rtt is kept. A carrier that does
-// not answer is a failed dial of that carrier, exactly as a feed dial records
-// it, and a carrier that does clears the hold.
+// Probes one candidate through the shared carrier walk and reports every
+// probe that attested, whatever the target answered (GEOMAP §2.5). The outcome
+// is what the probes amount to, of which only co-signed marks the sample.
 func (self *ExtenderNetworkClient) probeCandidate(
 	candidate *ExtenderCandidate,
 	attestor *ExtenderProbeAttestor,
-) (time.Duration, bool, error) {
+	reporter *ExtenderPingReporter,
+) (time.Duration, ExtenderPingOutcome, error) {
 	if self.settings.Probe != nil {
 		ctx, cancel := context.WithTimeout(self.ctx, self.settings.ProbeTimeout)
 		defer cancel()
 		return self.settings.Probe(ctx, candidate, attestor)
 	}
-	connectSettings := DefaultConnectSettings()
-	if self.clientStrategy != nil {
-		connectSettings = &self.clientStrategy.settings.ConnectSettings
+	probeLatency := self.settings.ProbeLatency
+	if probeLatency == nil {
+		connectSettings := DefaultConnectSettings()
+		if self.clientStrategy != nil {
+			connectSettings = &self.clientStrategy.settings.ConnectSettings
+		}
+		probeLatency = func(
+			ctx context.Context,
+			extenderConfig *ExtenderConfig,
+			attestor *ExtenderProbeAttestor,
+		) (*ExtenderLatencyProbe, error) {
+			return ProbeExtenderLatency(ctx, connectSettings, extenderConfig, attestor)
+		}
 	}
-	count := max(1, self.settings.ProbeCountPerExtender)
+	candidateProbe, err := probeExtenderCandidate(
+		self.ctx,
+		self.directory,
+		candidate,
+		self.settings.ProbeCountPerExtender,
+		self.settings.ProbeTimeout,
+		func(ctx context.Context, extenderConfig *ExtenderConfig) (*ExtenderLatencyProbe, error) {
+			return probeLatency(ctx, extenderConfig, attestor)
+		},
+	)
+	if err != nil {
+		return 0, ExtenderPingUnattested, err
+	}
+	if reporter != nil {
+		for _, probe := range candidateProbe.probes {
+			reporter.Report(ExtenderPingReportFromProbe(probe))
+		}
+	}
+	outcome, _ := candidateProbe.outcome()
+	return candidateProbe.rtt, outcome, nil
+}
+
+// The outcome of probing one candidate: the lowest rtt measured on the first
+// carrier that answered, and every probe made there, which is what a pass
+// reports (GEOMAP §2.5).
+type extenderCandidateProbe struct {
+	connectMode ExtenderConnectMode
+	rtt         time.Duration
+	// in the order they were made
+	probes []*ExtenderLatencyProbe
+}
+
+// What the candidate's probes amount to: co-signed when any was, since the
+// target then vouched for a claim of this pinger at least once; else rejected
+// when any was refused, with the first refusal's reason; else unknown when any
+// attested; else unattested.
+func (self *extenderCandidateProbe) outcome() (ExtenderPingOutcome, uint32) {
+	outcome := ExtenderPingUnattested
+	var reason uint32
+	for _, probe := range self.probes {
+		switch probe.Outcome {
+		case ExtenderPingCosigned:
+			return ExtenderPingCosigned, probe.Reason
+		case ExtenderPingRejected:
+			if outcome != ExtenderPingRejected {
+				outcome = ExtenderPingRejected
+				reason = probe.Reason
+			}
+		case ExtenderPingUnknown:
+			if outcome == ExtenderPingUnattested {
+				outcome = ExtenderPingUnknown
+			}
+		}
+	}
+	return outcome, reason
+}
+
+// Probes one candidate: its carriers in order until one answers, and on that carrier up to `count` probes, of which the lowest rtt
+// is kept. A carrier that does not answer is a failed dial of that carrier,
+// exactly as a feed dial records it, and a carrier that does clears the hold.
+// Both probe passes walk carriers here -- the network client's
+// (DESIGNNOTES4.md §4) and the extender's peer pinger (GEOMAP §2.1) -- so the
+// two can never disagree about what a ping of one extender is.
+func probeExtenderCandidate(
+	ctx context.Context,
+	directory *ExtenderDirectory,
+	candidate *ExtenderCandidate,
+	count int,
+	probeTimeout time.Duration,
+	probeLatency func(ctx context.Context, extenderConfig *ExtenderConfig) (*ExtenderLatencyProbe, error),
+) (*extenderCandidateProbe, error) {
+	count = max(1, count)
 	var resultErr error
 	for _, carrier := range orderedExtenderCarriers(candidate.Carriers) {
 		connectMode, ok := ExtenderConnectModeForCarrier(carrier)
@@ -1257,40 +1427,56 @@ func (self *ExtenderNetworkClient) probeCandidate(
 		if extenderConfig == nil {
 			continue
 		}
-		var best time.Duration
-		attested := false
+		candidateProbe := &extenderCandidateProbe{
+			connectMode: connectMode,
+			probes:      []*ExtenderLatencyProbe{},
+		}
 		for i := 0; i < count; i += 1 {
 			select {
-			case <-self.ctx.Done():
-				return 0, false, self.ctx.Err()
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			default:
 			}
 			probe, err := func() (*ExtenderLatencyProbe, error) {
-				ctx, cancel := context.WithTimeout(self.ctx, self.settings.ProbeTimeout)
+				probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 				defer cancel()
-				return ProbeExtenderLatency(ctx, connectSettings, extenderConfig, attestor)
+				return probeLatency(probeCtx, extenderConfig)
 			}()
+			if err == nil && probe == nil {
+				err = fmt.Errorf("extender probe returned no result")
+			}
 			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					// the pass is ending, which says nothing about the
+					// extender: no failure is recorded against it
+					return nil, ctxErr
+				}
+				var limitedErr *ExtenderLimitedError
+				if errors.As(err, &limitedErr) {
+					// over the extender's admission limits (A12): a backoff,
+					// never a failure and never a measurement, and another
+					// carrier of the same extender is limited the same way
+					directory.RecordLimited(candidate.Ip, limitedErr.RetryAfter)
+					return nil, err
+				}
 				resultErr = err
 				break
 			}
-			if best == 0 || probe.Rtt < best {
-				best = probe.Rtt
-			}
-			if probe.Attested {
-				attested = true
+			candidateProbe.probes = append(candidateProbe.probes, probe)
+			if 0 < probe.Rtt && (candidateProbe.rtt == 0 || probe.Rtt < candidateProbe.rtt) {
+				candidateProbe.rtt = probe.Rtt
 			}
 		}
-		if 0 < best {
-			self.directory.RecordSuccess(candidate.Ip, connectMode)
-			return best, attested, nil
+		if 0 < candidateProbe.rtt {
+			directory.RecordSuccess(candidate.Ip, connectMode)
+			return candidateProbe, nil
 		}
-		self.directory.RecordFailure(candidate.Ip, connectMode)
+		directory.RecordFailure(candidate.Ip, connectMode)
 	}
 	if resultErr == nil {
 		resultErr = fmt.Errorf("no carrier to probe")
 	}
-	return 0, false, resultErr
+	return nil, resultErr
 }
 
 // How many of the latencies are close enough (DESIGNNOTES4.md §4): within

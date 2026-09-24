@@ -7,11 +7,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	mathrand "math/rand"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -94,10 +96,11 @@ const (
 	ExtenderServiceForward uint32 = 0
 	ExtenderServiceGossip  uint32 = 1
 	ExtenderServiceFeed    uint32 = 2
-	// A latency probe (DESIGNNOTES4.md). The response is the ordinary one,
-	// with a nonce when the client identified itself as an attesting
-	// provider; the stream then carries at most one attestation frame and
-	// is closed. Nothing is forwarded.
+	// A latency probe (DESIGNNOTES4.md, GEOMAP §2). The response is the
+	// ordinary one, with a nonce when the client identified itself as an
+	// attesting provider or extender; the stream then carries at most one
+	// attestation frame, which the extender answers with one verdict frame
+	// before it closes. Nothing is forwarded.
 	ExtenderServiceProbe uint32 = 3
 )
 
@@ -178,6 +181,14 @@ type ExtenderDial struct {
 	// the extender for a nonce (DESIGNNOTES4.md). Empty for a ranking probe,
 	// which identifies itself to the extender no more than a forward does.
 	ProbeClientId []byte
+	// Probe only: the 32 byte identity key of an attesting EXTENDER, which
+	// asks for a nonce the same way (GEOMAP §2.2). At most one of the two is
+	// set; the extender refuses a header that names both.
+	ProbeExtenderPublicKey []byte
+	// How many extenders the request has already crossed (A11). A client
+	// leaves it 0; an NLayer extender sends one more than the header it
+	// received.
+	HopCount uint32
 	// RoundTrip, when set, receives the send time of the request and the
 	// receive time of the response. Every dial leaves it nil but a probe.
 	RoundTrip *ExtenderRoundTrip
@@ -435,13 +446,15 @@ func extenderRequestHeaderBytes(
 	extenderDial *ExtenderDial,
 ) ([]byte, error) {
 	header := &protocol.ExtenderHeader{
-		DestinationHost: extenderDial.DestinationHost,
-		DestinationPort: uint32(extenderDial.DestinationPort),
-		Timestamp:       uint64(time.Now().UnixMilli()),
-		Challenge:       extenderDial.Challenge,
-		Service:         extenderDial.Service,
-		Datagram:        extenderDial.Datagram,
-		ProbeClientId:   extenderDial.ProbeClientId,
+		DestinationHost:        extenderDial.DestinationHost,
+		DestinationPort:        uint32(extenderDial.DestinationPort),
+		Timestamp:              uint64(time.Now().UnixMilli()),
+		Challenge:              extenderDial.Challenge,
+		Service:                extenderDial.Service,
+		Datagram:               extenderDial.Datagram,
+		ProbeClientId:          extenderDial.ProbeClientId,
+		ProbeExtenderPublicKey: extenderDial.ProbeExtenderPublicKey,
+		HopCount:               extenderDial.HopCount,
 	}
 	if extenderConfig.Secret != "" {
 		nonce := NewId()
@@ -606,8 +619,11 @@ func dialExtenderTcp(
 			return err
 		}
 		headerReader.remaining = -1
+		if httpResponse.StatusCode == http.StatusTooManyRequests {
+			return &ExtenderLimitedError{RetryAfter: extenderRetryAfter(httpResponse.Header, time.Now())}
+		}
 		if httpResponse.StatusCode != http.StatusOK {
-			return fmt.Errorf("extender refused the request with status %d", httpResponse.StatusCode)
+			return &ExtenderRefusedError{StatusCode: httpResponse.StatusCode}
 		}
 		// A TCP extender sends exactly one bounded, length-delimited frame
 		// before handing the connection over. Reject chunked bodies/trailers:
@@ -764,8 +780,11 @@ func dialExtenderQuic(
 	if err != nil {
 		return nil, nil, err
 	}
+	if httpResponse.StatusCode == http.StatusTooManyRequests {
+		return nil, nil, &ExtenderLimitedError{RetryAfter: extenderRetryAfter(httpResponse.Header, time.Now())}
+	}
 	if httpResponse.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("extender refused the request with status %d", httpResponse.StatusCode)
+		return nil, nil, &ExtenderRefusedError{StatusCode: httpResponse.StatusCode}
 	}
 	response, err := ReadExtenderResponseFrame(stream)
 	if err != nil {
@@ -787,6 +806,74 @@ func dialExtenderQuic(
 		udpAddr,
 		closers,
 	), response, nil
+}
+
+// An extender that answered the request with a status other than 200 (A4):
+// it was reached and would not carry this request, which
+// is a different fact from an extender that could not be reached at all. An
+// NLayer extender holds a hop only for the second (A11), since a refusal can
+// be about the request -- its destination or its depth -- rather than the
+// extender.
+type ExtenderRefusedError struct {
+	StatusCode int
+}
+
+// Implements error.
+func (self *ExtenderRefusedError) Error() string {
+	return fmt.Sprintf("extender refused the request with status %d", self.StatusCode)
+}
+
+// An extender that answered 429: it is over one of its admission limits (A12)
+// and will take the request later. It is not a failure
+// of the extender -- no failure count, no hold -- but a backoff: the caller
+// leaves the address alone for about RetryAfter and tries other extenders
+// first.
+type ExtenderLimitedError struct {
+	// The Retry-After the answer carried, zero when it carried none.
+	RetryAfter time.Duration
+}
+
+// Implements error.
+func (self *ExtenderLimitedError) Error() string {
+	if self.RetryAfter <= 0 {
+		return "extender limited the request"
+	}
+	return fmt.Sprintf("extender limited the request; retry after %s", self.RetryAfter)
+}
+
+// The Retry-After of a 429, in either form RFC 9110 allows -- seconds, or a
+// date -- and zero when there is none or it does not parse, or has passed.
+func extenderRetryAfter(header http.Header, now time.Time) time.Duration {
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		// a day is past any backoff this client would keep, and bounds the
+		// arithmetic of a hostile value
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(min(seconds, int64(24*60*60))) * time.Second
+	}
+	if date, err := http.ParseTime(value); err == nil {
+		return max(0, min(date.Sub(now), 24*time.Hour))
+	}
+	return 0
+}
+
+// How long to leave a limited extender alone (A12): the Retry-After it
+// answered with, or defaultBackoff when it gave none, jittered uniformly by
+// +-50 %, so the clients one limit turned away do not all come back at once.
+func JitterExtenderLimitedBackoff(retryAfter time.Duration, defaultBackoff time.Duration) time.Duration {
+	backoff := retryAfter
+	if backoff <= 0 {
+		backoff = defaultBackoff
+	}
+	if backoff <= 0 {
+		return 0
+	}
+	return backoff/2 + time.Duration(mathrand.Int63n(int64(backoff)+1))
 }
 
 // Limit bytes supplied to http.ReadResponse, not just its bufio read-ahead:

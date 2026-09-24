@@ -764,6 +764,9 @@ func (self *ExtenderActivator) applyRecords(result *ExtenderActivateResult) {
 	if self.settings.Directory == nil {
 		return
 	}
+	// this extender's own record is one the directory's cap never evicts: its
+	// peers judge its pings by it, and its feed serves it first (D26)
+	self.settings.Directory.KeepPublicKey(self.settings.PublicKey)
 	apply := func(recordBase64 string) {
 		recordBytes, err := base64.StdEncoding.DecodeString(recordBase64)
 		if err != nil {

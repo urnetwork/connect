@@ -1166,12 +1166,9 @@ paths:
 
   /network/extender-hint:
     get:
-      x-status: planned
       tags: [extenders]
       summary: The continent to try extenders on first
       description: |
-        Planned operation; the server does not currently expose this route.
-
         The continent the operator places the caller's address on
         (connect/DESIGNNOTES4.md §4), upper case, from the same mapping the
         extender geo dns and the `continent_code` tag on signed extender
@@ -1196,14 +1193,14 @@ paths:
 
   /network/extender-latency:
     post:
-      x-status: planned
       tags: [extenders]
       summary: Forward provider latency attestations
       description: |
-        Planned operation; the server does not currently expose this route.
-
         Forward the latency attestations providers made to this client's
-        extenders (connect/DESIGNNOTES4.md §3).
+        extenders (connect/DESIGNNOTES4.md §3). Accepted for one release for
+        extenders on the previous binary, and superseded by
+        `/network/ping-report`, where the pinger reports its own pings with
+        the target's co-signature (connect/GEOMAP.md D14).
 
         A provider that probes an extender puts its client id in the probe;
         the extender answers with a fresh nonce; the provider sends back its
@@ -1222,9 +1219,11 @@ paths:
         attestation's signature against the provider's registered client key
         and stores what verifies. An attestation that does not decode, does
         not verify, names an extender the caller does not own, names the
-        extender's own client as the provider, or repeats one already stored
-        (same extender, provider and nonce) is counted in `rejected` and not
-        named. A report of more than 256 attestations is refused whole.
+        extender's own client as the provider, carries a timestamp more than
+        a day from the operator's clock or a round trip no column can hold,
+        or repeats one already stored (same extender, provider and nonce) is
+        counted in `rejected` and not named. A report of more than 256
+        attestations is refused whole.
       operationId: Extender Latency Report
       security:
         - BearerAuth: []
@@ -1242,6 +1241,63 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ExtenderLatencyReportResult"
+        "401":
+          description: Missing or invalid client bearer token.
+
+  /network/ping-report:
+    post:
+      tags: [extenders]
+      summary: Report the pings this client measured
+      description: |
+        Report the pings this client measured of extenders, and what each
+        target answered (connect/GEOMAP.md §2.5). The PINGER reports: a
+        provider over its client credential, an extender over its activation
+        credential. Both kinds share one report and one attestation, and sign
+        under different domains (see `ExtenderPing`).
+
+        A probe that identifies its pinger is answered with a fresh nonce; the
+        pinger sends back its measured round trip under its own signature; the
+        target accepts the claim only when it is no lower than the interval it
+        observed itself, less a tolerance, and answers every claim with one
+        verdict: an acceptance carrying the target's co-signature over the
+        exact claim, or a refusal with its reason. The pinger reports the
+        claim and what became of it, whatever that was.
+
+        Requires a CLIENT jwt, and every ping must name the calling client as
+        its pinger: a provider ping by the caller's client id, an extender
+        ping by the identity key of an extender the caller activated. The
+        target must be an extender the operator has activated, active or not,
+        and not one the caller activated itself. The operator verifies the
+        pinger's signature under the key it holds for the pinger -- the
+        provider's registered client key, or the extender's stored identity
+        key -- and RECOMPUTES the verdict under the target's stored identity
+        key: a ping is stored as co-signed only when its co-signature
+        verifies, whatever `outcome` says. A ping without a verifying
+        co-signature is the pinger's claim only, never a measurement; at most
+        64 of them are accepted from one report and the rest are rejected. A
+        ping that does not decode, names another pinger, names an unknown
+        target or the caller's own, does not verify, carries a timestamp more
+        than a day from the operator's clock, or repeats one already stored
+        (same target, pinger and nonce) is counted in `rejected` and not
+        named. A report of more than 256 pings is refused whole, and reports
+        are rate limited per user (240 per hour).
+      operationId: extenderPingReport
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtenderPingReportArgs"
+      responses:
+        "200":
+          description: |
+            The report outcome. A refused report is a 200 with `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderPingReportResult"
         "401":
           description: Missing or invalid client bearer token.
 
@@ -1675,11 +1731,19 @@ paths:
       tags: [provider probing]
       summary: Which providers are due an egress-location probe
       description: |
-        The providers to probe next: those whose stored egress location has
-        gone stale and those never probed at all, oldest first. A provider is
-        skipped while it has a fresh success, a recent failed attempt (a much
-        shorter backoff, so a provider that cannot be probed does not starve
-        the queue), or a current explicit blackhole failure.
+        The providers to probe next: those whose stored egress location or
+        health run has gone stale and those never probed at all, oldest
+        deadline first. A provider is skipped while it has a fresh success, a
+        recent failed attempt (a much shorter backoff, so a provider that
+        cannot be probed does not starve the queue), or a current dark
+        verdict -- consecutive failed blackhole checks spanning a minimum
+        time, not a single failed check (connect/GEOMAP.md §11.3). A batch
+        the prober's run guard held back (attempt class `run_batch_guard`) is
+        offered again after the first dark-backoff step.
+
+        Each provider carries the country and region it is published under,
+        so the prober draws its sample only from the destinations compatible
+        with that place.
       operationId: Provider Egress Location Due
       security:
         - OperatorSecret: []
@@ -1712,7 +1776,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProviderClientIdsResult"
+                $ref: "#/components/schemas/ProviderEgressDueResult"
         "400":
           description: A limit or shard parameter is not usable.
         "401":
@@ -1723,10 +1787,18 @@ paths:
       tags: [provider probing]
       summary: Submit a probed provider egress location
       description: |
-        Store the egress location the prober measured THROUGH a provider's own
-        tunnel, which the server then prefers over its built-in mmdb lookup
-        against the provider's control-connection address. The body is capped
-        at 16 KiB.
+        Store where a provider's traffic exits: `exit_ip`, the address the
+        operator's own `/my-ip-info` echo saw the probe come from THROUGH the
+        provider's tunnel. The server places it with its own GeoLite2 (the
+        location row, the country, and `city_confident` when GeoLite2's
+        accuracy radius is within the configured city radius) and prefers it
+        over the lookup on the provider's control-connection address. The
+        address itself is never stored, and no ip-intelligence verdict is
+        recorded (connect/GEOMAP.md §11.3, D24).
+
+        A submission without `exit_ip` -- the retired vendor-consensus shape
+        -- is refused with a 400; the legacy fields are accepted and ignored
+        for one release. The body is capped at 16 KiB.
       operationId: Provider Egress Location Submit
       security:
         - OperatorSecret: []
@@ -1744,7 +1816,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/SubmitProviderEgressLocationResult"
         "400":
-          description: The body is malformed or the submission was rejected.
+          description: |
+            The body is malformed, has no `exit_ip`, carries an address
+            GeoLite2 places in no country, or was rejected (unknown client, an
+            observation too old or in the future).
         "401":
           description: Missing or wrong operator secret.
         "413":
@@ -1788,10 +1863,14 @@ paths:
       tags: [provider probing]
       summary: Which providers are due a blackhole check
       description: |
-        The blackhole sweep queue: never-checked providers first, then least
-        recently checked. A blackhole check is one request through a tunnel
-        the prober already has, so the batches are much larger than the
-        egress-location ones.
+        The blackhole sweep queue: every provider whose next check has come
+        due -- a backoff step after a failed or unmeasured check, the
+        ordinary due age after a pass -- oldest due first, before any
+        provider never checked, so a failing provider's retry is never pushed
+        out of a batch by first checks (connect/GEOMAP.md §11.3). Each
+        provider carries the place it is published under. A check is three
+        small loads through the provider's tunnel, so the batches are much
+        larger than the egress-location ones.
       operationId: Provider Blackhole Check Due
       security:
         - OperatorSecret: []
@@ -1818,7 +1897,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProviderClientIdsResult"
+                $ref: "#/components/schemas/ProviderEgressDueResult"
         "400":
           description: A limit or shard parameter is not usable.
         "401":
@@ -1836,6 +1915,15 @@ paths:
         fabricated server-side (an "as of now" stamp would defeat the
         freshness bound the gate depends on) and may not be in the future; a
         failed check must name a failure class of at most 64 characters.
+        Unknown fields are rejected.
+
+        A failed check is a failure, not a verdict: the server keeps each
+        provider's run of consecutive failures, and the provider is dark only
+        once the run reaches the configured count over the configured span
+        (connect/GEOMAP.md §11.3); a TLS-authentication failure is dark at
+        once. A check marked `not_measured` -- its tunnel was gone and could
+        not be re-created -- counts nothing and only reschedules the
+        provider.
       operationId: Submit Provider Blackhole Checks
       security:
         - OperatorSecret: []
@@ -1980,9 +2068,14 @@ paths:
       tags: [provider probing]
       summary: Submit an egress-health run
       description: |
-        Store one egress-health run: over the tunnel the geolocation probe
-        already opened, how many of the sampled destinations each class
-        reached. The row is an upsert keyed on client_id, so a bad submission
+        Store one egress-health run: over the provider's tunnel, how many of
+        the sampled loads of each class passed after their retries -- a load
+        fails only when every attempt failed (connect/GEOMAP.md §11.3). Loads
+        whose tunnel could not be re-created, and canaries, are in no count
+        and are named apart. A failed load of a site on probation, or of one
+        marked incompatible with the provider's place, is taken out of the
+        counts by the server and named in the stored row's
+        `unscored_failed_names`. The row is an upsert keyed on client_id, so a bad submission
         does not sit beside the good one -- it destroys the last good
         measurement. Everything is therefore validated before anything is
         stored, and unknown fields are rejected outright (a misspelled field
@@ -1991,11 +2084,11 @@ paths:
 
         `class_results` must sum EXACTLY to `ok_count`/`total_count`: the
         classes are the score, and a total that does not decompose into them
-        means the two halves came from different runs. Reputation is not
-        health -- `reputation_ok`/`reputation_total` are stored beside the
-        health figures and never inside them, and a `reputation` key inside
-        `class_results` is refused, because nearly every honest hosted
-        provider fails most of that class precisely by being hosted.
+        means the two halves came from different runs. The reputation class
+        dissolved into the sites: `reputation_ok`, `reputation_total` and
+        `reputation_failed_names` are accepted, always zero from a current
+        prober, and ignored, and a `reputation` key inside `class_results` is
+        still refused.
       operationId: Provider Egress Health Result
       security:
         - OperatorSecret: []
@@ -2018,6 +2111,38 @@ paths:
           description: Missing or wrong operator secret.
         "413":
           description: The body is over 16 KiB.
+
+  /network/provider-egress-destinations:
+    get:
+      tags: [provider probing]
+      summary: The prober's destination pool
+      description: |
+        The sites the prober loads (connect/GEOMAP.md §11.4): the active
+        destinations per class with their load contracts, the pool version,
+        when it was generated, and the request profile to load them with --
+        the prober module's own Pool shape. The prober fetches it at the start
+        of every pass and probes its built-in table when it cannot. A site on
+        probation is served and loaded like the rest; what it may not do is
+        count, which the health ingest decides. A destination marked
+        incompatible with places is served with `canary` set in a small share
+        of fetches, asking for it to be loaded there anyway, unscored.
+
+        The first request seeds an empty pool from the prober's built-in
+        table, so the route never serves nothing for want of a refresh.
+      operationId: Provider Egress Destinations
+      security:
+        - OperatorSecret: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderEgressDestinationPool"
+        "401":
+          description: Missing or wrong operator secret, or the deployment has none configured.
+        "500":
+          description: The pool cannot be served (a stored destination the prober could not run); the prober falls back to its built-in table.
 
   /network/provider-verdict:
     post:
@@ -2088,6 +2213,13 @@ paths:
       tags: [provider probing]
       summary: Certificate pins for the geolocation source hosts
       description: |
+        Retired with the geolocation sources (connect/GEOMAP.md D24): the
+        server no longer observes new pins, and the rows already stored are
+        for hosts no probe dials, which the prober drops before it opens a
+        tunnel. Every host a probe loads, the operator's `/my-ip-info` echo
+        included, is verified by WebPKI. The route stays one release, because
+        the prober fetches it every pass.
+
         The certificate pins this server observed DIRECTLY for the geolocation
         source hosts, on its own network, with no provider in the path and
         full chain validation. The prober fetches them here instead of
@@ -3221,14 +3353,13 @@ paths:
   /my-ip-info:
     get:
       description: |
-        Information about the caller's IP as seen by the platform:
-        geolocation, privacy/VPN classification, whether the IP is currently
-        connected to the network, and expected round-trip times to nearby
-        landmarks.
+        Information about the caller's IP as seen by the platform: its
+        geolocation, and whether the IP is currently connected to the network.
 
-        `landmarks` is served by the separate whereami service in front of this
-        route, not by the api handler, so a request answered by the api alone
-        carries `info` and `connected_to_network` only.
+        The location comes from MaxMind GeoLite2 City. This product includes
+        GeoLite2 data created by MaxMind, available from
+        https://www.maxmind.com. The database has no privacy/VPN
+        classification, so none is returned.
       operationId: My IP Info
       security: []
       responses:
@@ -6761,6 +6892,10 @@ components:
         enable_max_distance_fraction:
           type: boolean
         rank_mode:
+          description: |
+            The bucket whose supply decides whether a location is listed as
+            stable: `quality`, the default, or `speed`, as `rank_mode` of
+            `FindProviders2Args` describes them.
           type: string
 
     FindLocationsResult:
@@ -6884,6 +7019,25 @@ components:
               description: udid
               type: string
         rank_mode:
+          description: |
+            The bucket to draw from and rank in. Every bucket leaves out,
+            always, a provider with a current blackhole verdict or a
+            TLS-authentication failure, a provider named by `client_id`
+            included, and, unless `force_minimum` is set, a provider a fresh
+            egress probe observed exiting in a country other than the one it
+            is listed in. `quality`, the default, is the probed providers
+            whose latest egress health run passed at least nine in ten of its
+            real-site loads, ordered by the egress index and then by latency
+            and throughput. `speed` is every probed provider, whatever its
+            probe found, ordered by latency and throughput alone. A bucket
+            short of `count` is filled from the others: `quality` from the
+            providers `speed` holds that it does not, `speed` from the quality
+            providers its latency and throughput cutoffs excluded, and both
+            last from the online bucket, which no request names: the unprobed
+            providers that pass the reliability and performance minimums the
+            other buckets apply, so a provider no client has measured is not
+            among them. The borrowed rank behind every native provider
+            through `tier`.
           type: string
           enum: [quality, speed]
           default: quality
@@ -6956,6 +7110,27 @@ components:
               has_estimated_bytes_per_second:
                 type: boolean
               tier:
+                description: |
+                  The provider's band in the requested `rank_mode`, 0 best,
+                  one tier per 20 points of score. In `quality` the score is
+                  20 times the egress index -- the real-site loads of the
+                  provider's latest health run that failed every retry,
+                  weighted and capped -- plus the latency and throughput
+                  adjustment; in `speed` it is the adjustment alone. A missing
+                  latency or throughput test costs two tiers. A provider of the
+                  requested bucket within its latency and throughput cutoffs
+                  carries 0 to 2, and 0 means nothing was found against it and
+                  it is fast. A provider borrowed from another bucket because
+                  the requested one came up short carries its tier there plus
+                  an offset, 11 by default and never under 3, and one borrowed
+                  from the online bucket twice the offset. The default leaves
+                  room for the largest demerit a client adds to a tier (7), so
+                  every native provider ranks ahead of every borrowed one, and
+                  every borrowed one ahead of the online bucket, however the
+                  client demerits them, and the borrowed keep their order; a
+                  tier has no upper bound and a larger one only ranks later. A
+                  provider named by `client_id` carries 0, since it bypasses
+                  discovery.
                 type: integer
               intermediary_ids:
                 type: array
@@ -10310,6 +10485,9 @@ components:
             ip:
               type: string
             location:
+              description: |
+                `city` and `region` are left out when the IP is not located
+                that precisely, e.g. only to its country.
               type: object
               properties:
                 coordinates:
@@ -10322,59 +10500,27 @@ components:
                 city:
                   type: string
                 region:
+                  description: The largest subdivision, e.g. a state.
                   type: string
                 country:
                   type: object
                   properties:
                     code:
+                      description: ISO 3166-1 alpha-2, lowercase.
                       type: string
                     name:
-                      type: string
-                    flag_url:
                       type: string
                 continent:
                   type: object
                   properties:
                     code:
+                      description: Two-letter continent code, lowercase.
                       type: string
                     name:
                       type: string
                 timezone:
+                  description: IANA time zone, e.g. `Europe/London`.
                   type: string
-            privacy:
-              type: object
-              properties:
-                vpn:
-                  type: boolean
-                proxy:
-                  type: boolean
-                tor:
-                  type: boolean
-                relay:
-                  type: boolean
-                hosting:
-                  type: boolean
-                service:
-                  type: string
-        landmarks:
-          type: array
-          items:
-            type: object
-            properties:
-              name:
-                type: string
-              ip:
-                type: string
-              url:
-                type: string
-              rtt:
-                type: number
-              ws_url:
-                type: string
-              coordinates:
-                type: array
-                items:
-                  type: number
         connected_to_network:
           type: boolean
 
@@ -10980,7 +11126,10 @@ components:
             carrier failed so it can fix its own binding.
           type: string
         expire_time:
-          description: When the signed record expires (14 days from issue).
+          description: |
+            When the signed record expires, 24 hours from issue. The operator
+            re-releases every active extender's record within 12 hours
+            (connect/GEOMAP.md §2.8).
           type: string
           format: date-time
         allowed_hosts:
@@ -11061,7 +11210,124 @@ components:
           description: |
             Attestations that did not decode, did not verify, named an
             extender the caller does not own or its own client as the
-            provider, or repeated one already stored.
+            provider, were out of the time window or unstorable, or repeated
+            one already stored.
+          type: integer
+        error:
+          description: Why the report was refused whole; empty otherwise.
+          type: string
+
+    ExtenderPing:
+      type: object
+      description: |
+        One ping as its pinger reports it: the fields of the pinger's signed
+        claim, from which the operator rebuilds the signing bytes, and the
+        pinger's account of the target's verdict. Exactly one pinger identity
+        is set, and the kind decides the signature domain, so a provider claim
+        can never be read as an extender claim or the reverse:
+
+        - provider: ed25519 by the provider's client key over
+          `ur-extender-probe-v1` followed by the client id (16 bytes), the
+          target key (32), the nonce (32), `rtt_ms` (4 bytes big-endian) and
+          `timestamp_ms` (8 bytes big-endian) -- the format providers already
+          attest in.
+        - extender: ed25519 by the pinging extender's identity key over
+          `ur-extender-peer-probe-v1` followed by the pinger key (32 bytes),
+          the target key (32), the nonce (32), `rtt_ms` (4 bytes big-endian)
+          and `timestamp_ms` (8 bytes big-endian).
+
+        The target's co-signature is ed25519 by the target's identity key over
+        `ur-extender-probe-cosign-v1` followed by the claim's signing bytes
+        (domain included) and the pinger's signature, so a co-signature
+        belongs to exactly one claim.
+      properties:
+        pinger_kind:
+          description: Who pinged.
+          type: string
+          enum: [provider, extender]
+        pinger_client_id:
+          description: The provider's client id; empty for an extender pinger.
+          type: string
+        pinger_extender_public_key_hex:
+          description: The pinging extender's identity key, hex; empty for a provider pinger.
+          type: string
+        target_extender_public_key_hex:
+          description: |
+            The identity key, hex, of the extender the claim names: the one
+            that judged and co-signed it, which for a probe relayed through an
+            NLayer chain is the chain end.
+          type: string
+        probe_nonce:
+          description: The 32 byte nonce the target issued for this probe, base64.
+          type: string
+        rtt_ms:
+          description: The pinger's measured round trip, whole milliseconds rounded up.
+          type: integer
+        timestamp_ms:
+          description: |
+            The pinger's clock when it signed, unix milliseconds. It must be
+            within a day of the operator's clock.
+          type: integer
+        signature:
+          description: The pinger's ed25519 signature over the claim, base64.
+          type: string
+        outcome:
+          description: |
+            What the pinger recorded of the target's verdict. `cosigned`: the
+            target accepted, and its co-signature verified under its key.
+            `rejected`: the target refused, with `reason` -- or accepted with
+            a co-signature that did not verify, which the pinger records as
+            the refusal it amounts to. `unknown`: no verdict arrived (a close,
+            a timeout, a target that predates the verdict), which is kept
+            apart from a refusal so a flaky path is not read as a refusing
+            extender. The operator recomputes the stored verdict from
+            `cosignature` under the target's stored key and never trusts
+            this field: a claimed `cosigned` whose co-signature does not
+            verify is stored as rejected with reason 5.
+          type: string
+          enum: [cosigned, rejected, unknown]
+        reason:
+          description: |
+            The target's refusal reason, 0 without a verdict: 0 ok, 1 round
+            trip below what the target observed, 2 nonce, 3 wrong extender,
+            4 unknown pinger, 5 bad signature, 6 rate limited.
+          type: integer
+        cosignature:
+          description: The target's co-signature, base64; empty unless `cosigned`.
+          type: string
+        hop_count:
+          description: |
+            The NLayer relays the probe crossed to reach the chain end the
+            claim names, 0 for a direct ping (connect/GEOMAP.md §2.9); a
+            relayed ping is stored and counted but is never a location
+            measurement, since its round trip includes the detour through
+            the front.
+          type: integer
+
+    ExtenderPingReportArgs:
+      type: object
+      properties:
+        pings:
+          description: At most 256.
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtenderPing"
+
+    ExtenderPingReportResult:
+      type: object
+      description: |
+        A refusal of the whole report is a normal 200 with `error`; nothing is
+        stored.
+      properties:
+        accepted:
+          description: Pings that verified and were stored, co-signed or not.
+          type: integer
+        rejected:
+          description: |
+            Pings that did not decode, named another pinger, an unknown
+            target or the caller's own, did not verify, were out of the time
+            window or unstorable, were past the 64 uncosigned pings one
+            report may carry, or repeated one already stored.
           type: integer
         error:
           description: Why the report was refused whole; empty otherwise.
@@ -11069,46 +11335,161 @@ components:
 
     # ----- provider probing -----
 
-    ProviderClientIdsResult:
+    ProviderEgressDueProvider:
       type: object
-      properties:
-        client_ids:
-          type: array
-          items:
-            description: udid
-            type: string
-
-    SubmitProviderEgressLocationArgs:
-      type: object
+      description: One due provider and the place it is published under.
       properties:
         client_id:
           description: udid
           type: string
         country_code:
+          description: Lowercase alpha-2; absent when the provider has not been placed.
           type: string
+        region:
+          description: The region's name, as incompatible places name it; absent when unknown.
+          type: string
+
+    ProviderEgressDueResult:
+      type: object
+      properties:
+        providers:
+          description: In due order.
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderEgressDueProvider"
+
+    ProviderEgressDestinationVerify:
+      type: object
+      description: A body check that proves the answer is what the destination serves.
+      properties:
+        kind:
+          type: string
+          enum: [dns_json, ip_text, contains]
+        text:
+          description: What `contains` looks for.
+          type: string
+
+    ProviderEgressDestinationPlace:
+      type: object
+      description: A place a destination is known not to work from; without a region, the whole country.
+      properties:
         country:
+          description: Lowercase alpha-2.
           type: string
         region:
           type: string
-        city:
+
+    ProviderEgressDestination:
+      type: object
+      description: One destination and its load contract, as the prober runs it.
+      properties:
+        name:
           type: string
-        asn:
+        class:
+          type: string
+          enum: [dns, connectivity, cdn, site]
+        url:
+          description: https on port 443.
+          type: string
+        headers:
+          description: Sent over the request profile; Range and Accept-Encoding are never sent.
+          type: object
+          additionalProperties:
+            type: string
+        expect:
+          description: body (a 2xx with a body), status (exactly `status`), or reachable (any 2xx or 3xx, sites only).
+          type: string
+          enum: [body, status, reachable]
+        status:
           type: integer
-        org:
+        max_bytes:
+          description: The body read cap; at most 1024.
+          type: integer
+        verify:
+          $ref: "#/components/schemas/ProviderEgressDestinationVerify"
+        incompatible:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderEgressDestinationPlace"
+        canary:
+          description: Load this destination, unscored, from the places it is incompatible with.
+          type: boolean
+
+    ProviderEgressRequestProfile:
+      type: object
+      description: The browser navigation every request carries.
+      properties:
+        user_agent:
           type: string
-        hosting:
-          type: boolean
-        proxy:
-          type: boolean
-        mobile:
-          type: boolean
-        country_confident:
-          type: boolean
-        city_confident:
-          type: boolean
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+
+    ProviderEgressDestinationPool:
+      type: object
+      properties:
+        version:
+          description: Identifies the pool's contents.
+          type: integer
+        generated_at:
+          type: string
+          format: date-time
+        destinations:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderEgressDestination"
+        profile:
+          $ref: "#/components/schemas/ProviderEgressRequestProfile"
+
+    SubmitProviderEgressLocationArgs:
+      type: object
+      description: |
+        The exit address and when it was observed. The remaining fields are
+        the retired vendor consensus's, accepted and ignored for one release.
+      properties:
+        client_id:
+          description: udid
+          type: string
+        exit_ip:
+          description: Required. The address the operator's /my-ip-info echo saw through the provider's tunnel, in canonical form.
+          type: string
         observed_at:
           type: string
           format: date-time
+        country_code:
+          description: Ignored.
+          type: string
+        country:
+          description: Ignored.
+          type: string
+        region:
+          description: Ignored.
+          type: string
+        city:
+          description: Ignored.
+          type: string
+        asn:
+          description: Ignored.
+          type: integer
+        org:
+          description: Ignored.
+          type: string
+        hosting:
+          description: Ignored.
+          type: boolean
+        proxy:
+          description: Ignored.
+          type: boolean
+        mobile:
+          description: Ignored.
+          type: boolean
+        country_confident:
+          description: Ignored.
+          type: boolean
+        city_confident:
+          description: Ignored.
+          type: boolean
 
     SubmitProviderEgressLocationResult:
       type: object
@@ -11126,7 +11507,8 @@ components:
         probe_failure:
           description: |
             Empty when the attempt succeeded, otherwise a short failure class
-            (`contract_failed`, `tunnel_failed`, `no_consensus`, ...).
+            (`tunnel_failed`, `health_not_run`, `run_not_measured`,
+            `no_exit_ip`, `submit_failed`, `run_batch_guard`, ...).
           type: string
 
     RecordProviderEgressProbeAttemptResult:
@@ -11149,9 +11531,16 @@ components:
         failure:
           description: |
             A short failure class when `ok` is false (`tunnel_failed`,
-            `all_destinations_failed`, ...), at most 64 characters. Required
-            when `ok` is false; ignored when it is true.
+            `all_destinations_failed`, `tls_authentication_failed`,
+            `not_measured`, ...), at most 64 characters. Required when `ok` is
+            false; ignored when it is true.
           type: string
+        not_measured:
+          description: |
+            None of the check's loads could be measured (its tunnel was gone
+            and could not be re-created): not a verdict either way. The check
+            counts nothing against the provider and only reschedules it.
+          type: boolean
         checked_at:
           description: Required, never fabricated server-side, and never in the future.
           type: string
@@ -11226,9 +11615,10 @@ components:
           description: udid
           type: string
         ok_count:
-          description: The SCORED classes only. Reputation is never part of this.
+          description: Scored loads that passed on some attempt; loads not measured and canaries are in neither count.
           type: integer
         total_count:
+          description: Scored loads measured.
           type: integer
         class_results:
           description: |
@@ -11240,14 +11630,16 @@ components:
             x-additionalPropertiesName: class
             $ref: "#/components/schemas/ProviderEgressHealthClassResult"
         reputation_ok:
-          description: Stored beside the health figures and never inside them.
+          description: Always zero; accepted and ignored since the reputation class dissolved into the sites.
           type: integer
         reputation_total:
+          description: Always zero; accepted and ignored.
           type: integer
         failed_names:
-          description: The joined names of the scored destinations that failed.
+          description: The comma-joined names of the scored loads that failed every attempt.
           type: string
         reputation_failed_names:
+          description: Always empty; accepted and ignored.
           type: string
         tls_authentication_failure:
           description: |
@@ -11255,6 +11647,21 @@ components:
             requested HTTPS host is a hard integrity failure even when the
             counts look healthy.
           type: boolean
+        not_measured_count:
+          description: Loads whose tunnel was gone and could not be re-created in time; in no count.
+          type: integer
+        not_measured_names:
+          description: Their comma-joined names.
+          type: string
+        canary_passed_names:
+          description: Comma-joined canaries (unscored loads from a place their site is marked incompatible with) that passed.
+          type: string
+        canary_failed_names:
+          description: Comma-joined canaries that failed.
+          type: string
+        short_classes:
+          description: Comma-joined classes too thin, for the provider's place, to fill their sample.
+          type: string
 
     SubmitProviderClientVerdictArgs:
       type: object

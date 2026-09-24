@@ -340,8 +340,25 @@ func TestExtenderDirectoryRecordExpiryUsesTheSkew(t *testing.T) {
 	if state := testDirectoryState(t, directory, ip); state != ExtenderStateExpired {
 		t.Fatalf("state = %s, expected expired", state)
 	}
-	if directory.AddressUsable(ip) {
-		t.Fatal("an expired address was still usable")
+	// past the skew the address is no longer active: it does not count, and
+	// no probe pass measures it
+	if count := directory.ActiveCount(0); count != 0 {
+		t.Fatalf("active count = %d with the record expired", count)
+	}
+	if count := directory.UsableCount(0); count != 0 {
+		t.Fatalf("usable count = %d with the record expired", count)
+	}
+	if candidates := directory.ProbeCandidates(0, 8, false); len(candidates) != 0 {
+		t.Fatalf("an expired address is a probe candidate: %v", candidateIps(candidates))
+	}
+	// it is kept as the last resort (MaxExpiredRecordCount), which is all it
+	// is still usable for
+	if !directory.AddressUsable(ip) {
+		t.Fatal("a retained expired address was not usable")
+	}
+	candidates := directory.Candidates(0, 8)
+	if len(candidates) != 1 || candidates[0].Ip != ip || !candidates[0].Expired {
+		t.Fatalf("candidates = %v, expected the retained expired address", candidateIps(candidates))
 	}
 }
 
@@ -517,10 +534,14 @@ func TestExtenderDirectoryManualIsNeverRemoved(t *testing.T) {
 
 // Over the cap the eviction order is expired, then never succeeded oldest
 // first, then oldest last success; manual entries are never evicted (E1).
+// Nothing expired is retained here, so the expired address is beyond the
+// retained ones and goes first; the retained ones are
+// net_extender_directory_expired_test.go's.
 func TestExtenderDirectoryCapEvictionOrder(t *testing.T) {
 	clock := newTestClock()
 	directory, rootPrivateKey := newTestExtenderDirectory(t, clock, func(settings *ExtenderDirectorySettings) {
 		settings.MaxAddressCount = 5
+		settings.MaxExpiredRecordCount = 0
 	})
 
 	manualIp := netip.MustParseAddr("192.0.2.30")
