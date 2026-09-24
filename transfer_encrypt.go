@@ -710,11 +710,10 @@ type EncryptionSettings struct {
 	ProvideTlsCertificatePem []byte
 	ProvideTlsPrivateKeyPem  []byte
 
-	// RequiredCipherPollInterval is how often a send blocked by the
-	// EncryptionModeRequired entry gate (`SendSequence.Pack`) re-checks the
-	// per-peer cipher. Establishment is a rare, bounded window (TlsTimeout),
-	// so a coarse poll keeps the gate free of subscription plumbing on the
-	// enqueue path. Zero or negative falls back to the default interval.
+	// RequiredCipherPollInterval is retained as the retry floor when an
+	// initial handshake fails with its explicit retry cooldown disabled.
+	// Cipher readiness is event-driven; this interval never delays a usable
+	// cipher. Zero or negative falls back to the default retry floor.
 	RequiredCipherPollInterval time.Duration
 
 	// UnknownWrapNackMinInterval is the minimum interval between
@@ -1087,6 +1086,10 @@ type peerEncryptionSession struct {
 	// per-poll timer churn while a session is referenced and per-notification
 	// allocations on bursty sequence reform.
 	idleStateChanged chan struct{}
+	// Required application senders share a broadcast, not the idle reaper's
+	// single-consumer token. Read/subscribe and every readiness/retry mutation
+	// are paired under stateLock. Nil means no sender has subscribed yet.
+	requiredCipherChanged chan struct{}
 	// Pre-establishment failure backoff is session-local and checked only when
 	// a later send sequence asks to restart the client-role handshake. It owns
 	// no timer/goroutine and is cleared on the first established cipher.
@@ -1388,6 +1391,7 @@ func (self *peerEncryptionSession) recordInitialHandshakeFailureWithLock(
 	if self.establishedEpoch != nil || self.settings == nil {
 		return
 	}
+	defer self.notifyRequiredCipherChangedWithLock()
 	// A duration needs at most 63 doublings to reach its representation
 	// ceiling. Saturating also keeps adversarially long-lived sessions from
 	// overflowing the counter.
@@ -1484,6 +1488,7 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 			close(e.handshakeDone)
 			close(e.establishmentDone)
 			self.epoch = e
+			self.notifyRequiredCipherChangedWithLock()
 			self.notifyIdleStateChanged()
 			return
 		}
@@ -1498,6 +1503,7 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 		e.tlsConn = tls.Server(e.transport, tlsCfg)
 	}
 	self.epoch = e
+	self.notifyRequiredCipherChangedWithLock()
 
 	// drain TLS outbox → outbound EncryptedControl
 	self.startWorker("TLS outbox", func() { self.outboxLoop(e) }, e.cancel)
@@ -2132,6 +2138,7 @@ func (self *peerEncryptionSession) SetPeerClientPublicKey(pub ed25519.PublicKey)
 			// trusted and the gate is not yet armed.
 			if self.keyHistoryRequiredWithLock() {
 				self.keyHistoryState = clientKeyHistoryPending
+				self.notifyRequiredCipherChangedWithLock()
 			}
 			return true
 		}
@@ -2595,10 +2602,8 @@ func (self *peerEncryptionSession) RequireEncryption() bool {
 	return self.settings != nil && self.settings.Mode == EncryptionModeRequired
 }
 
-// RequiredCipherPollInterval returns the interval at which a send blocked by
-// the EncryptionModeRequired entry gate re-checks `Cipher()`. An unset
-// (zero/negative) setting falls back to the `DefaultEncryptionSettings` value
-// rather than zero, which would spin the gate hot.
+// Returns the compatibility retry floor for failed initial handshakes with
+// no configured cooldown. Readiness notifications do not wait for this timer.
 func (self *peerEncryptionSession) RequiredCipherPollInterval() time.Duration {
 	if self.settings != nil && 0 < self.settings.RequiredCipherPollInterval {
 		return self.settings.RequiredCipherPollInterval
@@ -2700,6 +2705,12 @@ func (self *peerEncryptionSession) encryptionStateSnapshot() (
 func (self *peerEncryptionSession) Cipher() *sequenceCipher {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.cipherWithLock()
+}
+
+// Returns the cipher while the caller holds stateLock, so a required sender
+// can subscribe and read the same readiness generation atomically.
+func (self *peerEncryptionSession) cipherWithLock() *sequenceCipher {
 	// Signed-identity gate (DESIGNNOTES3 §5.1). Until the peer's identity key
 	// is corroborated against signed evidence, the cipher is withheld exactly
 	// as it is withheld before the identity proof verifies: to every caller an
@@ -2763,6 +2774,32 @@ func (self *peerEncryptionSession) Cipher() *sequenceCipher {
 	return self.establishedEpoch.derivedTlsCipher
 }
 
+// Snapshots the complete Required gate and its next state edge. Only client
+// sessions without a usable epoch may drive an initial retry. Terminal signed
+// identity failures cannot be repaired by repeatedly starting TLS workers.
+func (self *peerEncryptionSession) requiredCipherState() (*sequenceCipher, <-chan struct{}, bool, time.Time) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.requiredCipherChanged == nil {
+		self.requiredCipherChanged = make(chan struct{})
+	}
+	changed := self.requiredCipherChanged
+	cipher := self.cipherWithLock()
+	retry := self.establishedEpoch == nil && !self.handshakeInFlightLocked() &&
+		self.keyHistoryState != clientKeyHistoryRejected &&
+		self.keyHistoryState != clientKeyHistoryStoreUnavailable
+	return cipher, changed, retry, self.nextInitialHandshakeRetryTime
+}
+
+// Wakes every Required sender, but owns no worker and never consumes the
+// reaper's notification. Call only with stateLock held after a state change.
+func (self *peerEncryptionSession) notifyRequiredCipherChangedWithLock() {
+	if self.requiredCipherChanged != nil {
+		close(self.requiredCipherChanged)
+		self.requiredCipherChanged = make(chan struct{})
+	}
+}
+
 // decryptCiphers returns the candidate ciphers for unwrapping an inbound
 // frame: the established cipher and, briefly after a rekey, the prior
 // established cipher (a peer may still send under the old key until it swaps
@@ -2796,6 +2833,7 @@ func (self *peerEncryptionSession) markEstablishedWithLock(e *tlsHandshakeEpoch)
 	self.priorEstablishedEpoch = self.establishedEpoch
 	self.establishedEpoch = e
 	self.clearInitialHandshakeFailureWithLock()
+	self.notifyRequiredCipherChangedWithLock()
 }
 
 // IsAwaitingClientFinished reports whether this session is in the narrow

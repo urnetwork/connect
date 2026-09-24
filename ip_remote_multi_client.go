@@ -190,8 +190,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 			},
 		},
 		SendRetryTimeout: 2000 * time.Millisecond,
-		// while the window has no clients at all, poll for the first one
-		// quickly so the first packets leave moments after it lands
+		// Fallback rescan for time-expiring filters; a newly published offer
+		// wakes the empty-window send immediately.
 		FormationPollTimeout:          200 * time.Millisecond,
 		EncryptionCapabilityPrefilter: true,
 		PingWriteTimeout:              5 * time.Second,
@@ -480,16 +480,11 @@ type MultiClientSettings struct {
 	// SendTimeout time.Duration
 	// WriteTimeout time.Duration
 	SendRetryTimeout time.Duration
-	// FormationPollTimeout is how often a flow with NO candidate clients at
-	// all re-checks the window while it forms. Distinct from the ordinary
-	// SendRetryTimeout retry (which paces re-races against candidates that
-	// exist, including our benched fallback): while the window is empty there
-	// is nothing to race and nothing to pace — only the wait for the first
-	// client to land. Polling that wait at SendRetryTimeout (2s) meant the
-	// first DNS+SYN of a fresh connect could sit up to 2s AFTER the first
-	// client was already usable. 0 falls back to SendRetryTimeout, the
-	// pre-change behavior. Ported as a concept from upstream main e05ecee's
-	// formation fast-poll.
+	// FormationPollTimeout bounds a rescan when no candidate is selectable
+	// and a time-expiring filter changes without a window notification.
+	// Published offers wake immediately. Failed attempts against an existing
+	// offer retain SendRetryTimeout pacing. Zero uses SendRetryTimeout for
+	// the fallback rescan; it does not disable readiness notifications.
 	FormationPollTimeout time.Duration
 	// EncryptionCapabilityPrefilter, when true (default), fails a window
 	// candidate immediately when the local client requires encryption
@@ -3405,9 +3400,9 @@ func (self *RemoteUserNatMultiClient) underFlowCap(clients []*multiClientChannel
 // recovers through the dial-failure and send-error re-race paths.
 // ipVersion is the flow's ip version: every list source is narrowed to the
 // exits that can carry it (IPV6.md B3).
-func (self *RemoteUserNatMultiClient) raceCandidates(window *multiClientWindow, ipVersion int) []*multiClientChannel {
+func (self *RemoteUserNatMultiClient) raceCandidates(window *multiClientWindow, ipVersion int, changed ...*<-chan struct{}) []*multiClientChannel {
 	return self.raceCandidatesFrom(
-		func() []*multiClientChannel { return window.OrderedClientsForIpVersion(ipVersion) },
+		func() []*multiClientChannel { return window.orderedClients(false, ipVersion, changed...) },
 		func() []*multiClientChannel { return window.orderedClientsCrossTierForIpVersion(ipVersion) },
 		func() []*multiClientChannel { return window.lastResortClientsForIpVersion(ipVersion) },
 	)
@@ -7045,13 +7040,23 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 			}
 		}
 
+		var qualityOfferChanged, speedOfferChanged <-chan struct{}
 		coalesceOrderedClients := func() []*multiClientChannel {
+			// Re-arm only the windows selected by this flow on each read.
+			qualityOfferChanged, speedOfferChanged = nil, nil
 			if self.groupRaceCandidatesForTest != nil {
 				return self.groupRaceCandidatesForTest(sendPacketGroup)
 			}
 			for _, windowType := range self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId) {
 				if window, ok := self.windows[windowType]; ok {
-					orderedClients := self.raceCandidates(window, ipPath.Version)
+					var offerChanged *<-chan struct{}
+					switch windowType {
+					case WindowTypeQuality:
+						offerChanged = &qualityOfferChanged
+					case WindowTypeSpeed:
+						offerChanged = &speedOfferChanged
+					}
+					orderedClients := self.raceCandidates(window, ipPath.Version, offerChanged)
 					// A destination+port failure is narrower than the
 					// window's rank. Widen across healthy tiers before
 					// filtering so a rejected SMTP endpoint actually gets a
@@ -7123,7 +7128,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 				// v6, a v6 flow is answered with no-route and dropped, so the
 				// application fails fast (and falls back to v4) instead of
 				// retrying into a blackhole. While the windows are still
-				// forming a v6 flow waits on the formation poll like a v4 one:
+				// forming a v6 flow waits on offer readiness like a v4 one:
 				// the dualstack-first fill may land a v6-capable exit any
 				// moment, and answering no-route then would push every
 				// dual-stack application onto v4 for the session.
@@ -7131,22 +7136,18 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 					self.replyIpv6NoRoute(ipPath)
 					return
 				}
-				// formation fast-poll (ported as a concept from upstream main
-				// e05ecee): the window has no offer AT ALL — distinct from the
-				// benched fallback, which still returns candidates to race.
-				// There is nothing to send to and nothing to pace, so poll for
-				// the first client at FormationPollTimeout instead of sitting
-				// out SendRetryTimeout: on a fresh connect the first DNS+SYN
-				// then leaves moments after the first client lands. Bounded to
-				// while-empty only; once candidates exist the ordinary retry
-				// pacing below applies. 0 keeps the pre-change SendRetryTimeout
-				// pacing (retryTimeout is already remaining-bounded above).
+				// No attempted send needs pacing here. Window publication wakes
+				// immediately; retain a bounded rescan for filters whose expiry
+				// changes selection without mutating the window. Once an offer
+				// exists, failed-send pacing below is deliberately unchanged.
 				if formationPoll := self.reliabilitySettings().FormationPollTimeout; 0 < formationPoll {
 					retryTimeout = min(retryTimeout, formationPoll)
 				}
 				select {
 				case <-update.ctx.Done():
 					return
+				case <-qualityOfferChanged:
+				case <-speedOfferChanged:
 				case <-time.After(retryTimeout):
 				}
 				continue
@@ -10199,7 +10200,13 @@ func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *Perform
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if performanceProfilesEqual(self.performanceProfile, performanceProfile) {
+		return
+	}
 	self.performanceProfile = performanceProfile
+	if self.resizeMonitor != nil {
+		self.resizeMonitor.NotifyAll()
+	}
 }
 
 // generatorCallResult carries one generator call's result across the deadline
@@ -10506,6 +10513,9 @@ func (self *multiClientWindow) resize() {
 				// new client.
 				if self.clients[client.ClientId()] == client {
 					delete(self.clients, client.ClientId())
+					if self.resizeMonitor != nil {
+						self.resizeMonitor.NotifyAll()
+					}
 					removed = true
 				}
 			}()
@@ -11376,6 +11386,9 @@ func (self *multiClientWindow) expand(
 			// above and here can never leak an uncancelled channel
 			replacedClient = self.clients[clientId]
 			self.clients[clientId] = client
+			if self.resizeMonitor != nil {
+				self.resizeMonitor.NotifyAll()
+			}
 		}()
 		if client.IpFamily().SupportsIpv6() {
 			admittedIpv6Capable += 1
@@ -12301,11 +12314,21 @@ func (self *multiClientWindow) orderedClientsCrossTierForIpVersion(ipVersion int
 // that version (IPV6.md B3); 0 keeps every exit. The narrowing runs before
 // the weighting and the rank gate, so a v6 flow sees the best rank among
 // the exits that can actually carry it.
-func (self *multiClientWindow) orderedClients(crossTier bool, ipVersion int) []*multiClientChannel {
+func (self *multiClientWindow) orderedClients(crossTier bool, ipVersion int, changed ...*<-chan struct{}) []*multiClientChannel {
 	var windowSize WindowSizeSettings
+	var offeredClients []*multiClientChannel
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
+		// Subscribe and snapshot under the same lock used for publication.
+		// Ranking below holds no window lock while consulting channel state.
+		if len(changed) != 0 && changed[0] != nil {
+			*changed[0] = nil
+			if self.resizeMonitor != nil {
+				*changed[0] = self.resizeMonitor.NotifyChannel()
+			}
+		}
+		offeredClients = slices.Collect(maps.Values(self.clients))
 		if _, profileWindowSize, ok := self.performanceProfile.FixedWindow(); ok {
 			windowSize = profileWindowSize
 		} else {
@@ -12317,7 +12340,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, ipVersion int) []*
 	lruTimes := map[*multiClientChannel]time.Time{}
 	weights := map[*multiClientChannel]float32{}
 
-	for _, client := range self.unorderedClients() {
+	for _, client := range offeredClients {
 		if !client.supportsIpVersion(ipVersion) {
 			continue
 		}
@@ -12340,7 +12363,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, ipVersion int) []*
 		// exit").
 		if self.generator != nil {
 			if _, fixed := self.generator.FixedDestinationSize(); fixed {
-				for _, client := range self.unorderedClients() {
+				for _, client := range offeredClients {
 					if !client.supportsIpVersion(ipVersion) {
 						continue
 					}
@@ -12489,7 +12512,12 @@ func (self *multiClientWindow) Close() {
 			// client.Close()
 			removedClients = append(removedClients, client)
 		}
-		clear(self.clients)
+		if len(self.clients) != 0 {
+			clear(self.clients)
+			if self.resizeMonitor != nil {
+				self.resizeMonitor.NotifyAll()
+			}
+		}
 	}()
 	for _, client := range removedClients {
 		client.Close()

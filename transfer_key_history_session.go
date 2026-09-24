@@ -270,6 +270,7 @@ func (self *peerEncryptionSession) openKeyHistoryGate(state clientKeyHistoryStat
 			return false
 		}
 		self.keyHistoryState = state
+		self.notifyRequiredCipherChangedWithLock()
 		return true
 	}()
 	if !changed {

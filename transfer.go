@@ -6872,7 +6872,22 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 		}
 		enterTime := time.Now()
 		blockedNotified := false
-		for self.session.Cipher() == nil {
+		var nextUnpacedRetry time.Time
+		for {
+			select {
+			case <-sendPack.Ctx.Done():
+				return false, errors.New("Done.")
+			case <-self.ctx.Done():
+				return false, errors.New("Done.")
+			case <-self.session.ctx.Done():
+				return false, errors.New("Done.")
+			default:
+			}
+			cipher, changed, retryNeeded, retryAt := self.session.requiredCipherState()
+			if cipher != nil {
+				break
+			}
+			now := time.Now()
 			if timeout == 0 {
 				// non-blocking contract: refuse rather than wait. The typed
 				// error lets callers distinguish "encryption not established"
@@ -6882,7 +6897,7 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 				)
 				return false, ErrEncryptionRequiredNotEstablished
 			}
-			if 0 < timeout && timeout <= time.Since(enterTime) {
+			if 0 < timeout && !now.Before(enterTime.Add(timeout)) {
 				self.session.NotifyRequiredSendBlocked(fmt.Sprintf(
 					"application send refused: session not established within %s",
 					timeout,
@@ -6894,8 +6909,8 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			// past TlsTimeout the establishment attempts are failing and
 			// retrying on cooldowns, which an operator watching events should
 			// see without waiting for the caller to give up.
-			if tlsTimeout := self.session.TlsTimeoutSetting(); !blockedNotified &&
-				0 < tlsTimeout && tlsTimeout <= time.Since(enterTime) {
+			tlsTimeout := self.session.TlsTimeoutSetting()
+			if !blockedNotified && 0 < tlsTimeout && !now.Before(enterTime.Add(tlsTimeout)) {
 				blockedNotified = true
 				self.session.NotifyRequiredSendBlocked(fmt.Sprintf(
 					"application send waiting past establishment bound %s",
@@ -6911,16 +6926,47 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			// is in flight or the initial-retry cooldown holds — and only the
 			// client role may initiate (the server role follows the peer's
 			// ClientHello).
-			if self.encryptionRole == sequenceTlsRoleClient {
-				self.session.restartHandshake()
+			retryNeeded = retryNeeded && self.encryptionRole == sequenceTlsRoleClient
+			if retryNeeded {
+				if retryAt.IsZero() {
+					// With explicit retry backoff disabled, keep the old poll's
+					// anti-spin floor between failed attempts, never before a
+					// readiness edge or the first establishment attempt.
+					retryAt = nextUnpacedRetry
+				}
+				if !now.Before(retryAt) {
+					nextUnpacedRetry = now.Add(self.session.RequiredCipherPollInterval())
+					self.session.restartHandshake()
+					continue
+				}
+			}
+			// Timers represent real deadlines only. The cipher/history edge
+			// wakes immediately even when every such deadline is far away.
+			var deadline time.Time
+			if 0 < timeout {
+				deadline = enterTime.Add(timeout)
+			}
+			if !blockedNotified && 0 < tlsTimeout {
+				if reportAt := enterTime.Add(tlsTimeout); deadline.IsZero() || reportAt.Before(deadline) {
+					deadline = reportAt
+				}
+			}
+			if retryNeeded && (deadline.IsZero() || retryAt.Before(deadline)) {
+				deadline = retryAt
+			}
+			var deadlineReached <-chan time.Time
+			if !deadline.IsZero() {
+				deadlineReached = time.After(time.Until(deadline))
 			}
 			select {
 			case <-sendPack.Ctx.Done():
 				return false, errors.New("Done.")
 			case <-self.ctx.Done():
 				return false, errors.New("Done.")
-			case <-time.After(self.session.RequiredCipherPollInterval()):
-				// re-check the cipher; establishment is bounded by TlsTimeout
+			case <-self.session.ctx.Done():
+				return false, errors.New("Done.")
+			case <-changed:
+			case <-deadlineReached:
 			}
 		}
 		if 0 < timeout {
