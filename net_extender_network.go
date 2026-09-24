@@ -1297,6 +1297,13 @@ func (self *ExtenderNetworkClient) probeFamily(
 			return probed
 		default:
 		}
+		// an attestor installed or cleared under the pass ends it: the change
+		// woke the next pass, which probes as the change says, so a provider
+		// that stops providing attests no further candidate (DESIGNNOTES4.md
+		// §1)
+		if currentAttestor, _ := self.probeAttestorValue(); currentAttestor != attestor {
+			return probed
+		}
 		if self.settings.ProbeWindowCount <= closeCount() {
 			return probed
 		}

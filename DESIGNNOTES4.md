@@ -51,8 +51,12 @@ which gives the operator a latency map of its public infrastructure.
    key is already durable and public (§9.2), and provider↔extender latency is
    operational data about public infrastructure. So: every client may *rank*
    by latency; only a provider *attests*. This is enforced in code — the
-   attestor is installed by `DeviceLocal` when the provider role starts and
-   removed when it stops — not left to callers.
+   device's provider installs the attestor when its provide mode leaves
+   `ProvideModeNone` and removes it when the mode returns to none or the
+   provider closes, so a device built with a provider that provides in no
+   mode, which is every app build, probes to rank only; a pass under way when
+   the attestor changes ends at its next candidate; a hosted device never
+   attests — not left to callers.
 3. **Neither party alone controls the number.** The provider signs the RTT;
    the extender gates it against its own observation. See §3.
 4. **Bounded cost at the extender.** A probe must be cheap, stateless per
@@ -177,7 +181,7 @@ reorder them.
 | `server/taskworker/work/extender_latency_work.go` | 30 day retention sweep |
 | `server/model/network_extender_activation_model.go` | activation history: one row per activation with the address hash and the city/region/country it resolved to, as a provider's connection keeps them, so a ping can later be placed against where its extender was |
 | `server/controller/stats_collector.go`, `grafana/dashboards/extenders.json` | provider ping gauges (pings, providers, extenders pinged over 24 h) and a per-extender pings counter, on the extenders dashboard |
-| `sdk/device_local.go` | install the attestor on provider start, clear on stop |
+| `sdk/device_local_provider.go`, `sdk/device_local.go` | the provider installs the attestor when its provide mode leaves none and clears it when the mode returns to none or it closes; the device lets a provider attest unless it is hosted, and hands it the provide mode as it is now |
 | `connect/api/bringyour.yml` | the two new endpoints |
 
 ## 6. Limits stated plainly

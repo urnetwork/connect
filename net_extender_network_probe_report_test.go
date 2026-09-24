@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -426,6 +427,85 @@ func TestExtenderNetworkClientProbeSeamOutcome(t *testing.T) {
 		}
 		if reporter.PendingCount() != 0 || reporter.PostCount() != 0 {
 			t.Fatalf("%q: the candidate seam reported", c.outcome)
+		}
+	}
+}
+
+// An attestor cleared under a pass ends the pass at the next candidate: the
+// candidate in flight is probed as its probes began, no further candidate is
+// attested, and the pass the clear wakes probes the rest to rank only, so a
+// provider that stops providing stops attesting (DESIGNNOTES4.md §1).
+func TestExtenderNetworkClientPassEndsWhenTheAttestorIsCleared(t *testing.T) {
+	probes := &testLatencyProbes{
+		outcomes: map[string][]ExtenderPingOutcome{
+			"192.0.2.10": {ExtenderPingUnattested},
+			"192.0.2.11": {ExtenderPingUnattested},
+		},
+	}
+	networkClient, _, _ := newTestReportingProbeClient(t, probes, "192.0.2.10", "192.0.2.11")
+	// the first probe holds the pass until the test has cleared the attestor
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var gateOnce sync.Once
+	networkClient.settings.ProbeLatency = func(
+		ctx context.Context,
+		extenderConfig *ExtenderConfig,
+		attestor *ExtenderProbeAttestor,
+	) (*ExtenderLatencyProbe, error) {
+		gateOnce.Do(func() {
+			close(started)
+			<-release
+		})
+		return probes.probe(ctx, extenderConfig, attestor)
+	}
+	attestor, _ := newTestProbeAttestor(t)
+	networkClient.SetProbeAttestor(attestor, nil)
+
+	passDone := make(chan struct{})
+	go func() {
+		defer close(passDone)
+		networkClient.probePass()
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pass probed nothing")
+	}
+	networkClient.SetProbeAttestor(nil, nil)
+	close(release)
+	select {
+	case <-passDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pass did not end")
+	}
+
+	probeValues := func() ([]string, []*ExtenderProbeAttestor) {
+		probes.stateLock.Lock()
+		defer probes.stateLock.Unlock()
+		return slices.Clone(probes.calls), slices.Clone(probes.attestors)
+	}
+	calls, attestors := probeValues()
+	if len(calls) == 0 {
+		t.Fatal("the pass made no probe")
+	}
+	for i, call := range calls {
+		if !strings.HasPrefix(call, "192.0.2.10/") {
+			t.Fatalf("the pass went on to %s after the attestor was cleared", call)
+		}
+		if attestors[i] != attestor {
+			t.Fatalf("probe %d of the candidate in flight carried %p, expected the attestor it began with", i, attestors[i])
+		}
+	}
+
+	// the pass the clear woke ranks the rest only
+	networkClient.probePass()
+	laterCalls, laterAttestors := probeValues()
+	if len(laterCalls) <= len(calls) {
+		t.Fatal("the next pass probed nothing")
+	}
+	for i := len(calls); i < len(laterCalls); i += 1 {
+		if !strings.HasPrefix(laterCalls[i], "192.0.2.11/") || laterAttestors[i] != nil {
+			t.Fatalf("the next pass made %s with attestor %p, expected the rest ranked only", laterCalls[i], laterAttestors[i])
 		}
 	}
 }
