@@ -2254,9 +2254,12 @@ func (self *peerEncryptionSession) DeliverEncryptedControl(ec *protocol.Encrypte
 	// pre-epoch peer, which keeps the legacy behavior for that control.
 	var epochId Id
 	if raw := ec.GetEpochId(); 0 < len(raw) {
-		if parsed, err := IdFromBytes(raw); err == nil {
-			epochId = parsed
+		parsed, err := IdFromBytes(raw)
+		if err != nil {
+			// A malformed named generation is not a legacy unset control.
+			return
 		}
+		epochId = parsed
 	}
 	switch ec.ControlType {
 	case protocol.EncryptedControlType_EncryptedControlHandshake:
@@ -2491,11 +2494,9 @@ func (self *peerEncryptionSession) receivePeerIdentityProofForEpoch(payload []by
 // wrapped app-data frames in the immediately-following reads find the cipher
 // already set rather than being dropped.
 //
-// Gated on `IsAwaitingClientFinished` so it's a no-op outside the narrow
-// TLS-server window where it pays off (and where the just-arrived EC frame is,
-// by construction, the expected client second flight). Once the handshake
-// completes, `IsAwaitingClientFinished` returns false and subsequent calls do
-// nothing.
+// This compatibility entry accepts only an unnamed legacy epoch. Named wire
+// controls use the generation-aware entry below; the in-order path owns
+// convergence and any legacy control received during a named generation.
 //
 // Called from the single-threaded receive loop, so it must not block:
 // `transport.Deliver` just appends to the inbox under a quick lock and notifies
@@ -2507,15 +2508,10 @@ func (self *peerEncryptionSession) receivePeerIdentityProofForEpoch(payload []by
 // race window where both paths deliver the same bytes just leaves a few KB in
 // the inbox — bounded by the client second flight size.
 //
-// Retransmit filter: the transfer layer already validates the pack source
-// (every hop verifies source), so the only way stale handshake bytes reach us
-// is a sender-side resend of an earlier handshake message — practically, a
-// ClientHello retransmit from before our server flight went out (the sender's
-// resend timer for the ClientHello pack fired before our ack got back). We
-// can't dedupe by (sequenceId, sequenceNumber) here without reaching into the
-// ReceiveSequence's state, so we use a one-byte structural check on the TLS
-// record header. In TLS 1.3 the legitimate client second flight starts with
-// either:
+// Within the exact generation, a retransmitted ClientHello must still wait
+// for ordered deduplication. A record prefix alone cannot distinguish an old
+// generation's Finished, so the structural and epoch checks are both required.
+// In TLS 1.3 the legitimate client second flight starts with either:
 //   - record type 20 (legacy `ChangeCipherSpec`, sent for middlebox
 //     compatibility), or
 //   - record type 23 (encrypted `application_data`, how post-handshake-secrets
@@ -2528,15 +2524,13 @@ func (self *peerEncryptionSession) receivePeerIdentityProofForEpoch(payload []by
 // duplicate, applies correctly if new — its sequence-number bookkeeping is what
 // makes feeding bytes to the TLS state machine safe).
 func (self *peerEncryptionSession) OptimisticallyDeliverHandshake(payload []byte) {
-	if !self.IsAwaitingClientFinished() {
-		if self.client.log.V(2).Enabled() {
-			self.client.log.Infof(
-				"[tls]%s OptimisticallyDeliverHandshake skipped: not awaiting client Finished\n",
-				self.logTag,
-			)
-		}
-		return
-	}
+	self.optimisticallyDeliverHandshakeForEpoch(payload, Id{})
+}
+
+// Delivers only to the exact already-started generation named by the control.
+// Capture the epoch and all eligibility under one lock, so a concurrent reset
+// cannot redirect an older Finished into the replacement's TLS state.
+func (self *peerEncryptionSession) optimisticallyDeliverHandshakeForEpoch(payload []byte, epochId Id) {
 	// isClientSecondFlightPrefix: the first byte of `payload` is a TLS 1.3
 	// record content type that can start a legitimate client second flight: 20
 	// (legacy ChangeCipherSpec) or 23 (encrypted application_data carrying
@@ -2568,22 +2562,28 @@ func (self *peerEncryptionSession) OptimisticallyDeliverHandshake(payload []byte
 		}
 		return
 	}
+	e := func() *tlsHandshakeEpoch {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		e := self.epoch
+		if self.role != sequenceTlsRoleServer || e == nil || e.transport == nil ||
+			!e.serverFlightSent || isClosed(e.handshakeDone) || e.epochId != epochId {
+			return nil
+		}
+		return e
+	}()
+	if e == nil {
+		return
+	}
 	if self.client.log.V(1).Enabled() {
 		self.client.log.Infof(
 			"[tls]%s OptimisticallyDeliverHandshake: feeding %d bytes (record type 0x%02x) to TLS state\n",
 			self.logTag, len(payload), payload[0],
 		)
 	}
-	// Only complete an already in-flight handshake; never create or restart an
-	// epoch from the optimistic path. This runs on every EC frame the receive
-	// loop sees — including stale, reordered, and retransmitted ones — so it
-	// must not mutate epoch lifecycle state. IsAwaitingClientFinished already
-	// established that a current in-flight epoch (server flight sent, handshake
-	// not yet done) exists; deliver the client second flight to it and nothing
-	// more.
-	if e := self.currentEpoch(); e != nil && e.transport != nil && !isClosed(e.handshakeDone) {
-		e.transport.Deliver(payload)
-	}
+	// A later reset can retire this captured epoch, but cannot change which
+	// transport receives the bytes. The normal ordered path owns convergence.
+	e.transport.Deliver(payload)
 }
 
 // RequireEncryption reports whether this session runs in

@@ -4537,11 +4537,17 @@ func (self *Client) run() {
 						if session == nil {
 							continue
 						}
+						var controlEpochId Id
+						if raw := ec.GetEpochId(); 0 < len(raw) {
+							parsed, err := IdFromBytes(raw)
+							if err != nil {
+								continue
+							}
+							controlEpochId = parsed
+						}
 						switch ec.ControlType {
 						case protocol.EncryptedControlType_EncryptedControlHandshake:
-							if session.IsAwaitingClientFinished() {
-								session.OptimisticallyDeliverHandshake(ec.Payload)
-							}
+							session.optimisticallyDeliverHandshakeForEpoch(ec.Payload, controlEpochId)
 						case protocol.EncryptedControlType_EncryptedControlIdentityProof:
 							// Optimistic path must not create epoch state from a
 							// stale/reordered/retransmitted proof; only deliver
@@ -4560,13 +4566,7 @@ func (self *Client) run() {
 							// fails, and terminally tombstones a session the peer
 							// is still encrypting into (a permanent stall).
 							if session.currentEpoch() != nil {
-								var proofEpochId Id
-								if raw := ec.GetEpochId(); 0 < len(raw) {
-									if parsed, err := IdFromBytes(raw); err == nil {
-										proofEpochId = parsed
-									}
-								}
-								session.receivePeerIdentityProofForEpoch(ec.Payload, proofEpochId)
+								session.receivePeerIdentityProofForEpoch(ec.Payload, controlEpochId)
 							}
 						}
 					}
