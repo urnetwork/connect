@@ -198,9 +198,12 @@ has had none — the pinger could submit anything, so an uncosigned report is
 **never a measurement**. It is stored as the pinger's *claim* that the target
 refused (with the reason the target gave, or `unknown` for no verdict), and
 on its own it is not evidence against the target either, since the pinger's
-word is all it is. It becomes evidence only in aggregate, through the
-two-sided reputation of §5.5: many otherwise-consistent pingers refused by
-one target, or one pinger refused by many otherwise-consistent targets.
+word is all it is. Current aggregate target-refusal counts are diagnostic
+only: they do not lower the target's reputation or exclude it. A future
+target penalty requires independently identified, otherwise-consistent
+reporters and an explicit corroboration policy; aggregate totals cannot
+establish that independence. Reporter-side refusal evidence remains usable
+alongside geometric consistency (§5.5).
 Uncosigned reports are rate-limited per reporter at ingest, so nobody can
 flood a smear.
 
@@ -818,12 +821,12 @@ statistics, each expressed as a z-score against the population mean:
 - **refusal rate as pinger** — the share of its attestations that came back
   refused;
 - **refusal rate as target** (extenders) — the share of attestations it
-  refused.
+  allegedly refused, recorded as diagnostic evidence only.
 
 The node's weight is `q_s = 1 / (1 + z_max²)`, clamped to `[q_min, 1]`
 (`q_min` 0.05): a node that looks like the mean keeps full weight, a node two
 sigma out keeps a fifth, and a node past `ExcludeZ` (default 4) on scatter,
-bias or a refusal rate is left out of the solve entirely and listed on the
+bias or a reporter-side refusal rate is left out of the solve entirely and listed on the
 dashboard. Three readings fix the arithmetic: only the bad side of a
 statistic counts (a source with *less* scatter or *fewer* refusals than the
 mean is not unlike it), except bias, which counts both ways; **coverage
@@ -856,12 +859,13 @@ interval (reason 1), a bad nonce (2), a claim bound to the wrong extender
 probe refused for rate (6) say nothing about either party — the first is
 usually a directory that has not caught up, the second the shared address
 of an NLayer front (§2.9) — and are excluded from both refusal rates.
-Refusals are read two-sided on purpose, and always against the population,
-never against the counterparty. A pinger refused by many targets that
-co-sign everyone else is a bad pinger; a target that refuses many pingers
-that everyone else co-signs is a bad target. One refusal between one bad
-pinger and one good target moves only the pinger's score, because the
-target's refusal rate stays at the population mean.
+Refusal rates are reported for both sides, but only the reporter-side rate
+can currently affect weight or exclusion. A pinger reporting refusals from
+many targets may be penalized; one pinger cannot make a target appear bad by
+concentrating uncosigned claims against it. Even a high target-side rate
+remains diagnostic until per-pair evidence, independently identified peers,
+and a corroboration policy are implemented. Population normalization of an
+aggregate target count alone is not corroboration.
 
 Reputation is recomputed from scratch on every run from the window's pings.
 Nothing accumulates, so a node that stops misbehaving returns to full weight
