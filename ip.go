@@ -7289,6 +7289,7 @@ type RemoteUserNatProvider struct {
 	retainedMemoryBudget     *TransferMemoryBudget
 	tcpReturnMemory          *TransferMemoryBudget
 	ingressControlMemory     *TransferMemoryBudget
+	ingressMemory            *TransferMemoryBudget
 	memoryOperations         *lifecycleAdmission
 	fixedMemoryOwners        atomic.Int64
 	packetStatsWorkers       sync.WaitGroup
@@ -7515,6 +7516,7 @@ func newAdmittedRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat
 	if memory.budget != nil {
 		userNatProvider.tcpReturnMemory = NewTransferMemoryBudget(kib(64))
 		userNatProvider.ingressControlMemory = NewTransferMemoryBudget(natProviderControlBytes)
+		userNatProvider.ingressMemory = NewTransferMemoryBudget(natProviderIngressBytes)
 		userNatProvider.smtpIngressGuard.memoryBudget = memory.budget
 		userNatProvider.ingressIpv4Fragments.maxRetainedBytes = natProviderFragmentBytes
 		userNatProvider.egressIpv4Fragments.maxRetainedBytes = natProviderFragmentBytes
@@ -9297,6 +9299,7 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 	memory, admitted := self.startMemoryOperation(providerFrameOperationBytes(frames))
 	if !admitted {
 		self.receiveControlFrames(source, frames, peer)
+		self.receiveIngressFrames(source, frames, peer)
 		return
 	}
 	defer self.finishMemoryOperation(&memory)

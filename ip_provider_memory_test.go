@@ -128,7 +128,7 @@ func TestNatProviderMemoryWorstOverlapMakesUdpProgress(t *testing.T) {
 	oldProvider, oldUnsubscribe := create(oldNat)
 	newProvider, newUnsubscribe := create(newNat)
 	want := 3*natMemoryFixedBytes + 2*(natProviderMemoryByteCount(natProviderSourceLimit)+kib(1))
-	if want != kib(1858) || budget.UsedByteCount() != want || root.UsedByteCount() != want || budget.Available() != kib(190) {
+	if want != kib(1922) || budget.UsedByteCount() != want || root.UsedByteCount() != want || budget.Available() != kib(126) {
 		t.Fatalf("fallback + old/new NAT/provider ledger = %d, want %d", budget.UsedByteCount(), want)
 	}
 	if oldProvider.settings.MaxSourceCount != 16 || newProvider.settings.MaxSourceCount != 16 {

@@ -22,23 +22,25 @@ var ErrNatMemoryPolicy = &NatMemoryPolicyError{}
 const (
 	natProviderSourceLimit             = 16
 	natProviderFragmentBytes           = 8 * 1024
-	natProviderFixedBytes    ByteCount = 480 * 1024
+	natProviderFixedBytes    ByteCount = 512 * 1024
 	natProviderSourceBytes   ByteCount = 4 * 1024
 	natProviderControlBytes  ByteCount = 32 * 1024
+	natProviderIngressBytes  ByteCount = 32 * 1024
 	natSmtpFlowBytes         ByteCount = 160 * 1024
 )
 
-// A provider prepays 480 KiB + 4 KiB/source (at most 544 KiB):
+// A provider prepays 512 KiB + 4 KiB/source (at most 576 KiB):
 // 128 KiB four fragment caches, geometric metadata and reconstruction;
 // 96 KiB built-in DPI (64 flows), stats (32 destinations/result) and clones;
 // 96 KiB workers/channels/registrations and primary/transient retirement maps;
 // 64 KiB precharged synchronous TCP callback/item workspace (two 32-KiB slots);
 // 32 KiB ingress ACK/RST decoding/grouping workspace (one nonblocking slot);
+// 32 KiB ordinary ingress decoding/grouping workspace (one nonblocking slot);
 // 64 KiB allocator/map growth slack. The per-source row covers lifecycle,
 // evidence, diagnostics, mode/priority maps and six leaf tombstones.
-// SMTP, callback scratch and return roots are separately admitted dynamically.
+// SMTP, bulk callback scratch and return roots are separately admitted dynamically.
 // With the required 1-KiB stats registration per provider, two providers plus
-// fallback/old/new NATs cost 1858 KiB, leaving 190 KiB of the shared 2-MiB
+// fallback/old/new NATs cost 1922 KiB, leaving 126 KiB of the shared 2-MiB
 // child for useful traffic during generation overlap.
 func natProviderMemoryByteCount(sourceCount int) ByteCount {
 	return natProviderFixedBytes + ByteCount(sourceCount)*natProviderSourceBytes
@@ -214,6 +216,61 @@ func (self *RemoteUserNatProvider) receiveControlFrame(source TransferPath, fram
 
 func smallNatControlPacket(packet []byte) bool {
 	return len(packet) <= smallPacketPoolSize && natControlPackets([][]byte{packet[:len(packet):len(packet)]})
+}
+
+// Retained flow/replay owners can leave enough space for an MTU-sized packet
+// but less than the ordinary callback's 24-KiB scratch floor. Without a
+// separately admitted workspace, an established flow then drops every input
+// before decoding it, even when its socket is ready to drain that input.
+// Process one small frame at a time under a prepaid slot. The NAT still must
+// reserve the complete queued packet/flow lifetime from the original child;
+// this is not uncharged packet capacity and cannot create a flow at a full
+// budget. ACKs have a different slot, so data cannot consume their reserve.
+func (self *RemoteUserNatProvider) receiveIngressFrames(source TransferPath, frames []*protocol.Frame, peer Peer) {
+	if self.ingressMemory == nil || source.IsControlSource() {
+		return
+	}
+	for _, frame := range frames {
+		if frame == nil || len(frame.MessageBytes) > packetPoolSize || frame.MessageType != protocol.MessageType_IpIpPacketToProvider {
+			continue
+		}
+		// The ACK-only fallback already handled these. Avoid allocating or
+		// contending on the ordinary slot for the common raw control path.
+		if frame.Raw && smallNatControlPacket(frame.MessageBytes) {
+			continue
+		}
+		self.receiveIngressFrame(source, frame, peer)
+	}
+}
+
+func (self *RemoteUserNatProvider) receiveIngressFrame(source TransferPath, frame *protocol.Frame, peer Peer) {
+	if !self.memoryOperations.start() {
+		return
+	}
+	memory, admitted := reserveNatMemory(self.ingressMemory, natProviderIngressBytes)
+	if !admitted {
+		self.memoryOperations.finish()
+		return
+	}
+	defer self.finishMemoryOperation(&memory)
+	packet := frame.MessageBytes
+	if !frame.Raw {
+		var message protocol.IpPacketToProvider
+		if err := proto.Unmarshal(frame.MessageBytes, &message); err != nil || message.IpPacket == nil {
+			return
+		}
+		packet = message.IpPacket.PacketBytes
+	}
+	if smallNatControlPacket(packet) {
+		return
+	}
+	// A raw frame may borrow an entire large Pack root. Normalize its owner
+	// before the asynchronous NAT handoff; the slot covers two rounded roots
+	// plus the ordinary per-frame scratch/metadata bound (at most 30,744 B).
+	packet = MessagePoolCopy(packet)
+	defer MessagePoolReturn(packet)
+	owned := protocol.Frame{MessageType: protocol.MessageType_IpIpPacketToProvider, Raw: true, MessageBytes: packet}
+	self.clientReceiveAdmitted(source, []*protocol.Frame{&owned}, peer)
 }
 
 // Dedicated TCP return producers must still make progress when replay owners
