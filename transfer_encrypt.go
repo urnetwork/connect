@@ -2761,6 +2761,8 @@ func (self *peerEncryptionSession) Cipher() *sequenceCipher {
 
 // Contract-only controls precede handshake bytes in the reliable sequence.
 // A retained application cipher cannot bootstrap a peer that lost that cipher.
+// An unsuccessful replacement is still unresolved; its timeout must not make
+// a later control depend on the same old cipher again.
 func (self *peerEncryptionSession) contractControlNeedsPlaintext() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -2769,7 +2771,7 @@ func (self *peerEncryptionSession) contractControlNeedsPlaintext() bool {
 		return true
 	}
 	return self.establishedEpoch == nil || self.establishedEpoch.derivedTlsCipher == nil ||
-		self.handshakeInFlightLocked()
+		self.epoch != self.establishedEpoch
 }
 
 // decryptCiphers returns the candidate ciphers for unwrapping an inbound
