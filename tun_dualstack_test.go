@@ -413,102 +413,112 @@ func TestTunDialContextLiteralsAndNetworks(t *testing.T) {
 	conn.Close()
 }
 
-// A name resolves through the tun's DoH cache to both families and the
-// stream dial races them: with one family black-holed by the bridge, the
-// other wins. Either DNS family can finish first, so the live path may
-// connect immediately or require an address fallback.
-func TestTunDialContextResolvesBothFamiliesAndRaces(t *testing.T) {
-	forEachIpVersion(t, func(t *testing.T, deadVersion int) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		right, err := CreateTun(ctx, tunTestSettings(6))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer right.Close()
-		right4 := tunTestLocalAddress(t, right, 4)
-		right6 := tunTestLocalAddress(t, right, 6)
+// A name resolves through the TUN's DoH cache to both families. Either DNS
+// answer may arrive first; the live socket must win even if its sibling drops.
+// Held-family first-answer ordering is proved by TestDohFirstAnswerTcp and
+// TestTunDohProgress, not a wall-clock IPv6-preference lower bound here.
+func checkTunDialContextResolvesBothFamiliesAndRaces(t *testing.T, deadVersion int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	right, err := CreateTun(ctx, tunTestSettings(6))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Close()
+	right4 := tunTestLocalAddress(t, right, 4)
+	right6 := tunTestLocalAddress(t, right, 6)
 
-		// the DoH server answers every name with the right tun's addresses;
-		// it is a host-dialed local DoH endpoint, so it needs no tunnel
-		dohServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeDohWire(w, r, []netip.Addr{right4, right6}, 60, false)
-		}))
-		defer dohServer.Close()
-		left, err := CreateTunWithResolver(ctx, tunTestSettings(6), &DnsResolverSettings{
-			EnableLocalDoh:    true,
-			LocalDohUrlsIpv4:  []string{dohServer.URL},
-			EnableRemoteDoh:   false,
-			EnableLocalDns:    false,
-			RemoteDohUrlsIpv4: nil,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer left.Close()
-
-		// the bridge black-holes one family in both directions
-		keep := func(packet []byte) bool { return packetIpVersion(packet) != deadVersion }
-		bridgeTunFilter(ctx, right, left, keep)
-		bridgeTunFilter(ctx, left, right, keep)
-
-		listeners := map[int]*net.TCPAddr{}
-		for _, ipVersion := range []int{4, 6} {
-			ln, err := right.ListenTCP(&net.TCPAddr{IP: net.IP(tunTestLocalAddress(t, right, ipVersion).AsSlice()), Port: 0})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer ln.Close()
-			go func() {
-				for {
-					conn, err := ln.Accept()
-					if err != nil {
-						return
-					}
-					conn.Close()
-				}
-			}()
-			listeners[ipVersion] = ln.Addr().(*net.TCPAddr)
-		}
-		// both listeners must share a port for one name:port to reach either
-		port := listeners[4].Port
-		if listeners[6].Port != port {
-			// rebind the v6 listener on the v4 port
-			ln, err := right.ListenTCP(&net.TCPAddr{IP: net.IP(right6.AsSlice()), Port: port})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer ln.Close()
-			go func() {
-				for {
-					conn, err := ln.Accept()
-					if err != nil {
-						return
-					}
-					conn.Close()
-				}
-			}()
-		}
-
-		started := time.Now()
-		conn, err := left.dialContext(ctx, "tcp", net.JoinHostPort("peer.tun.test", itoa(port)))
-		if err != nil {
-			t.Fatalf("dial with v%d black-holed: %v", deadVersion, err)
-		}
-		defer conn.Close()
-		elapsed := time.Since(started)
-		remote, _ := netip.ParseAddrPort(conn.RemoteAddr().String())
-		wantVersion := 4
-		if deadVersion == 4 {
-			wantVersion = 6
-		}
-		if (wantVersion == 4) != remote.Addr().Unmap().Is4() {
-			t.Fatalf("connected to %s, want the live v%d listener", conn.RemoteAddr(), wantVersion)
-		}
-		if elapsed > 5*time.Second {
-			t.Fatalf("race took %s", elapsed)
-		}
+	// the DoH server answers every name with the right tun's addresses;
+	// it is a host-dialed local DoH endpoint, so it needs no tunnel
+	dohServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeDohWire(w, r, []netip.Addr{right4, right6}, 60, false)
+	}))
+	defer dohServer.Close()
+	left, err := CreateTunWithResolver(ctx, tunTestSettings(6), &DnsResolverSettings{
+		EnableLocalDoh:    true,
+		LocalDohUrlsIpv4:  []string{dohServer.URL},
+		EnableRemoteDoh:   false,
+		EnableLocalDns:    false,
+		RemoteDohUrlsIpv4: nil,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+
+	// the bridge black-holes one family in both directions
+	keep := func(packet []byte) bool { return packetIpVersion(packet) != deadVersion }
+	bridgeTunFilter(ctx, right, left, keep)
+	bridgeTunFilter(ctx, left, right, keep)
+
+	listeners := map[int]*net.TCPAddr{}
+	for _, ipVersion := range []int{4, 6} {
+		ln, err := right.ListenTCP(&net.TCPAddr{IP: net.IP(tunTestLocalAddress(t, right, ipVersion).AsSlice()), Port: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				conn.Close()
+			}
+		}()
+		listeners[ipVersion] = ln.Addr().(*net.TCPAddr)
+	}
+	// both listeners must share a port for one name:port to reach either
+	port := listeners[4].Port
+	if listeners[6].Port != port {
+		// rebind the v6 listener on the v4 port
+		ln, err := right.ListenTCP(&net.TCPAddr{IP: net.IP(right6.AsSlice()), Port: port})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				conn.Close()
+			}
+		}()
+	}
+
+	started := time.Now()
+	conn, err := left.dialContext(ctx, "tcp", net.JoinHostPort("peer.tun.test", itoa(port)))
+	if err != nil {
+		t.Fatalf("dial with v%d black-holed: %v", deadVersion, err)
+	}
+	defer conn.Close()
+	elapsed := time.Since(started)
+	remote, _ := netip.ParseAddrPort(conn.RemoteAddr().String())
+	wantVersion := 4
+	if deadVersion == 4 {
+		wantVersion = 6
+	}
+	if (wantVersion == 4) != remote.Addr().Unmap().Is4() {
+		t.Fatalf("connected to %s, want the live v%d listener", conn.RemoteAddr(), wantVersion)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("race took %s", elapsed)
+	}
+}
+
+// A blackholed IPv4 route must leave the IPv6 listener usable.
+func TestTunDialContextResolvesBothFamiliesAndRacesIpv4Blackhole(t *testing.T) {
+	checkTunDialContextResolvesBothFamiliesAndRaces(t, 4)
+}
+
+// Ready IPv4 may win immediately; a pending/failed IPv6 path cannot impose a
+// preference wait before the first usable DNS answer starts socket work.
+func TestTunDialContextResolvesBothFamiliesAndRacesIpv6Blackhole(t *testing.T) {
+	checkTunDialContextResolvesBothFamiliesAndRaces(t, 6)
 }
 
 // A datagram dial cannot race: it takes the first v4 address when there is
