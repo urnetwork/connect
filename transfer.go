@@ -7258,6 +7258,17 @@ func (self *SendSequence) coalesceReceivedAck(
 	ackWindow *sequenceAckWindow,
 	ack receiveAckMessage,
 ) {
+	var progressObserver func(TransferProgressEvent)
+	var progress TransferProgressEvent
+	if ackLineageTraceEnabled && self.sendBufferSettings != nil {
+		progressObserver = self.sendBufferSettings.ProgressObserver
+	}
+	if ackLineageTraceEnabled && progressObserver != nil {
+		progress = beginTransferProgress(progressObserver, TransferProgressEvent{
+			Stage: "ack_coalesce_begin", ClientId: self.client.ClientId(), PeerId: self.destination,
+			SequenceId: self.sequenceId, MessageId: ack.messageId, Selective: ack.selective,
+		}, nil)
+	}
 	// Before the pending check: an eviction notice rides whatever
 	// acknowledgement is next, which may be one whose own message this sender
 	// has already released.
@@ -7265,7 +7276,14 @@ func (self *SendSequence) coalesceReceivedAck(
 	self.observeContractAheadCapability(ack)
 	sequenceNumber, ok := self.retainedAckSequenceNumber(ack.messageId)
 	if !ok {
+		if ackLineageTraceEnabled && progressObserver != nil {
+			progress.Outcome = "message_not_retained"
+			endTransferProgress(progressObserver, progress, "ack_coalesce_end", false, nil)
+		}
 		return
+	}
+	if ackLineageTraceEnabled && progressObserver != nil {
+		progress.SequenceNumber = sequenceNumber
 	}
 	if self.sendBuffer != nil {
 		self.sendBuffer.observeLogicalLaneVersion(
@@ -7290,6 +7308,10 @@ func (self *SendSequence) coalesceReceivedAck(
 		sequenceAck.contractMissing = true
 		sequenceAck.missingContractId = ack.missingContractId
 		ackWindow.UpdateContractMissing(sequenceAck)
+		if ackLineageTraceEnabled && progressObserver != nil {
+			progress.Outcome = "contract_request"
+			endTransferProgress(progressObserver, progress, "ack_coalesce_end", true, nil)
+		}
 		return
 	}
 	receiverTiming := self.observeReceiverAckRtt(ack)
@@ -7302,6 +7324,13 @@ func (self *SendSequence) coalesceReceivedAck(
 		self.publishAckServiceCreditWithTiming(ack.messageId, ack.selective, at, receiverTiming)
 	}
 	ackWindow.Update(sequenceAck)
+	if ackLineageTraceEnabled && progressObserver != nil {
+		progress.Outcome = "cumulative"
+		if ack.selective {
+			progress.Outcome = "selective"
+		}
+		endTransferProgress(progressObserver, progress, "ack_coalesce_end", true, nil)
+	}
 	if self.sendBuffer != nil && self.sendBuffer.afterAckCoalescedForTest != nil {
 		self.sendBuffer.afterAckCoalescedForTest(self.id(), sequenceNumber)
 	}
@@ -15378,6 +15407,15 @@ func (self *ReceiveSequence) flushDeliver() {
 	}
 	endTransferProgress(progressObserver, progress, "deliver_end", true, nil)
 	for _, item := range items {
+		if ackLineageTraceEnabled && progressObserver != nil {
+			// Batch events name only the first item. Preserve each identity
+			// after callback return, before cumulative ACK compression.
+			beginTransferProgress(progressObserver, TransferProgressEvent{
+				Stage: "deliver_item", ClientId: self.client.ClientId(), PeerId: self.source.SourceId,
+				SequenceId: self.sequenceId, MessageId: item.messageId, SequenceNumber: item.sequenceNumber,
+				NoAck: !item.ack, TransportType: item.transportType, ByteCount: int(item.messageByteCount), Success: true,
+			}, nil)
+		}
 		if item.ack {
 			self.ackWindow.UpdateDelivered(sequenceAck{
 				receivedAtNanos:                  item.receivedAtNanos,
