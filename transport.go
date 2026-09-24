@@ -2064,11 +2064,15 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					self.settings.AuthFrameObserver(authBytes)
 				}
 
-				ws.SetWriteDeadline(time.Now().Add(self.settings.AuthTimeout))
+				if err := ws.SetWriteDeadline(time.Now().Add(self.settings.AuthTimeout)); err != nil {
+					return nil, err
+				}
 				if err := ws.WriteMessage(websocket.BinaryMessage, authBytes); err != nil {
 					return nil, err
 				}
-				ws.SetReadDeadline(time.Now().Add(self.settings.AuthTimeout))
+				if err := ws.SetReadDeadline(time.Now().Add(self.settings.AuthTimeout)); err != nil {
+					return nil, err
+				}
 				if messageType, message, err := ws.ReadMessage(); err != nil {
 					return nil, err
 				} else {
@@ -2368,7 +2372,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					return nil
 				}
 				write := func(message []byte) error {
-					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+					if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+						MessagePoolReturn(message)
+						return err
+					}
 					return writeMessage(message)
 				}
 				writePayload := func(message []byte) error {
@@ -2401,11 +2408,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						return writeH1FramedReadyBatch(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, self.settings.WriteTimeout, func() { writeCounter.Add(1) })
 					}
 					if writeBatchConn == nil {
-						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+						if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+							MessagePoolReturn(firstMessage)
+							return true, err
+						}
 						return true, writeSendMessage(firstMessage)
 					}
 
-					ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+					if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+						MessagePoolReturn(firstMessage)
+						return true, err
+					}
 					writeBatchConn.BeginWriteBatch()
 					if err = writeSendMessage(firstMessage); err != nil {
 						writeBatchConn.AbortWriteBatch()
@@ -2499,7 +2512,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						case <-handleCtx.Done():
 							return
 						case <-pingTimer.C:
-							ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+							if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+								return
+							}
 							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
 								// note that for websocket a dealine timeout cannot be recovered
 								return
@@ -2563,7 +2578,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case <-pingTimer.C:
-							ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
+							if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+								return
+							}
 							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
 								// note that for websocket a dealine timeout cannot be recovered
 								return
@@ -2609,7 +2626,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					default:
 					}
 
-					ws.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout))
+					if err := ws.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout)); err != nil {
+						return
+					}
 					messageType, message, err := ReadH1PooledMessage(ws, self.h1MaxMessageByteCount())
 					if err != nil {
 						if self.log.V(2).Enabled() {
