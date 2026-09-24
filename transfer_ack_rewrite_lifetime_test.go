@@ -50,12 +50,12 @@ func (self ackRewriteBarrierVerbose) Infof(format string, args ...any) {
 
 // Both ends run the real wire decoder, Transfer workers and cumulative ACK
 // path. Only the physical H1 legs are replaced with bounded reliable routes.
-func newAckRetirementFixture(t *testing.T, carrier TransportType, version int) (*windowRoundFixture, *sendGatewayTransport, *sendGatewayTransport) {
+func newAckRetirementFixture(t *testing.T, carrier TransportType, version int, logger Logger) (*windowRoundFixture, *sendGatewayTransport, *sendGatewayTransport) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	newSettings := func() *ClientSettings {
 		settings := DefaultClientSettings()
-		settings.Log = NewNoopLogger()
+		settings.Log = logger
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		settings.SendBufferSettings.WindowSizing = WindowSizingConstant
@@ -129,11 +129,20 @@ func TestTransferAckDuringHeadRewriteRejectsOtherIdentity(t *testing.T) {
 	}
 }
 
-func runTransferAckDuringHeadRewrite(t *testing.T, carrier TransportType, version int, ackKind string) {
+func runTransferAckDuringHeadRewrite(t *testing.T, carrier TransportType, version int, ackKind string) *SendSequence {
 	t.Helper()
 	assertMessagePoolOwnership(t)
+	var sequence *SendSequence
 	synctest.Test(t, func(t *testing.T) {
-		fixture, _, _ := newAckRetirementFixture(t, carrier, version)
+		release := make(chan struct{})
+		released := false
+		defer func() {
+			if !released {
+				close(release)
+			}
+		}()
+		logger := &ackRewriteBarrierLogger{Logger: NewNoopLogger(), reached: make(chan struct{}), release: release}
+		fixture, _, _ := newAckRetirementFixture(t, carrier, version, logger)
 		first := fixture.write(64)
 		type terminalResult struct {
 			err error
@@ -152,7 +161,7 @@ func runTransferAckDuringHeadRewrite(t *testing.T, carrier TransportType, versio
 		if second.pack.Head {
 			t.Fatal("second initial Pack must need promotion after cumulative progress")
 		}
-		sequence := fixture.sequence()
+		sequence = fixture.sequence()
 		messageId := RequireIdFromBytes(second.pack.MessageId)
 		item := sequence.resendQueue.GetByMessageId(messageId)
 		started := item.sendTime
@@ -164,19 +173,15 @@ func runTransferAckDuringHeadRewrite(t *testing.T, carrier TransportType, versio
 		if fixture.deliveredCount != 2 || fixture.ackedCount != 1 || len(terminal) != 0 {
 			t.Fatal("fixture did not deliver both originals while retaining only the second ACK")
 		}
-		release := make(chan struct{})
-		released := false
-		defer func() {
-			if !released {
-				close(release)
-			}
-		}()
-		logger := &ackRewriteBarrierLogger{Logger: NewNoopLogger(), reached: make(chan struct{}), release: release}
-		sequence.log = logger
 		<-logger.reached
 		lookupDuringRewrite := sequence.resendQueue.GetByMessageId(messageId) != nil
 		time.Sleep(time.Until(started.Add(29 * time.Second)))
-		if ackKind == "exact" {
+		if ackKind == "cancel" {
+			sequence.cancel()
+		} else if ackKind == "rewrite_error" {
+			MessagePoolReturn(item.transferFrameBytes)
+			item.transferFrameBytes = MessagePoolCopy([]byte{0xff})
+		} else if ackKind == "exact" {
 			fixture.forward(secondAck, fixture.senderIn)
 		} else {
 			ack := secondAck.ack
@@ -218,6 +223,10 @@ func runTransferAckDuringHeadRewrite(t *testing.T, carrier TransportType, versio
 			if retryWrites != 0 {
 				t.Error("acknowledged head rewrite emitted a redundant retry")
 			}
+		} else if ackKind == "cancel" || ackKind == "rewrite_error" {
+			if pending || result.err == nil || result.at != started.Add(29*time.Second) || retryWrites != 0 {
+				t.Error("rewrite exit retained or dispatched its canceled owner")
+			}
 		} else if pending || result.err == nil || result.at != started.Add(30*time.Second) {
 			t.Error("another ACK identity borrowed the detached message's retained lifetime")
 		}
@@ -225,4 +234,5 @@ func runTransferAckDuringHeadRewrite(t *testing.T, carrier TransportType, versio
 			t.Error("head rewrite duplicated delivery or retained recovery ownership")
 		}
 	})
+	return sequence
 }
