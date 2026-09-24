@@ -35,6 +35,8 @@ func TestPlatformH3MemoryRaceAdmitsEveryConcurrentSocketAndClosesLoser(t *testin
 				t.Fatal("default device carrier budget is not an independent 5 MiB owner")
 			}
 			base := root.Stats().UsedByteCount
+			isolated := DefaultPlatformTransportBudget()
+			isolatedBase := isolated.Stats().UsedByteCount
 			inner := budget.register(platformTransportBudgetH3Explicit, settings.H3BudgetByteCount, true)
 			if !inner.TryAcquire() {
 				t.Fatal("inner admission")
@@ -97,13 +99,13 @@ func TestPlatformH3MemoryRaceAdmitsEveryConcurrentSocketAndClosesLoser(t *testin
 				wantPeak += 2 * kib(144)
 				wantLive += kib(144)
 			}
-			if peakBytes.Load() != int64(wantPeak) || budget.Stats().UsedByteCount != wantLive || root.Stats().UsedByteCount != base+wantLive {
-				t.Fatalf("race peak=%d live=%+v root=%+v", peakBytes.Load(), budget.Stats(), root.Stats())
+			if peakBytes.Load() != int64(wantPeak) || budget.Stats().UsedByteCount != wantLive || root.Stats().UsedByteCount != base+wantLive || isolated.Stats().UsedByteCount != isolatedBase {
+				t.Fatalf("race peak=%d live=%+v isolated=%+v", peakBytes.Load(), budget.Stats(), isolated.Stats())
 			}
 			winner.close()
 			inner.Release()
 			sibling.Release()
-			if sockets.Load() != 0 || budget.Stats().UsedByteCount != 0 || root.Stats().UsedByteCount != base {
+			if sockets.Load() != 0 || budget.Stats().UsedByteCount != 0 || root.Stats().UsedByteCount != base || isolated.Stats().UsedByteCount != isolatedBase {
 				t.Fatal("race teardown leaked socket/claim")
 			}
 		})

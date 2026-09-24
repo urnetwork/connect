@@ -283,6 +283,12 @@ type ExtenderNetworkClient struct {
 	// true once the operator's hint has been applied, which the dns
 	// inference then defers to
 	operatorHintApplied bool
+
+	// Resolver publications share this client's lifetime, never process state.
+	// stateLock guards registration and closure before dnsWorkers is joined.
+	dnsPublicationKVs map[string]*extenderDnsPublication
+	dnsWorkers        sync.WaitGroup
+	dnsClosed         bool
 }
 
 // The client is running when this returns: the directory has been told a first
@@ -372,9 +378,15 @@ func (self *ExtenderNetworkClient) Close() {
 		if self.unsubNetworkChange != nil {
 			self.unsubNetworkChange()
 		}
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			self.dnsClosed = true
+		}()
 		self.cancel()
 		<-self.done
 		<-self.probeDone
+		self.dnsWorkers.Wait()
 	})
 }
 
@@ -573,9 +585,12 @@ func (self *ExtenderNetworkClient) SetManualHosts(hosts []string) {
 	// and a reconfiguration must not wait that out. It is bounded by the
 	// client context, and the loop's own apply of the same version is
 	// idempotent, so the overlap costs at most one resolution.
-	go HandleError(func() {
-		self.applyManualHosts()
-	})
+	if self.startDnsWorker() {
+		go HandleError(func() {
+			defer self.dnsWorkers.Done()
+			self.applyManualHosts()
+		})
+	}
 	self.wakeMonitor.NotifyAll()
 }
 
@@ -598,37 +613,9 @@ func (self *ExtenderNetworkClient) manualHostsVersionValue() uint64 {
 // a host that configured DoH resolves manual hosts over DoH too. Every answer
 // becomes a manual address, which the removal policy never takes away, and
 // unions with the dns bootstrap and with everything the feed and the mesh
-// deliver. Returns the version applied.
+// deliver. Returns after the first usable publication; the client owns the tail.
 func (self *ExtenderNetworkClient) applyManualHosts() uint64 {
-	hosts, version := self.manualHostsValue()
-	if len(hosts) == 0 {
-		return version
-	}
-	resolve := self.settings.ResolveDns
-	if resolve == nil {
-		resolve = self.resolveDns
-	}
-	ctx, cancel := context.WithTimeout(self.ctx, self.settings.HelloTimeout)
-	defer cancel()
-	for _, host := range hosts {
-		host = strings.TrimSpace(host)
-		if host == "" {
-			continue
-		}
-		if ip, err := netip.ParseAddr(host); err == nil {
-			self.directory.AddManual(ip)
-			continue
-		}
-		ips, err := resolve(ctx, host)
-		if err != nil {
-			self.log.Infof("[extender]manual host %s err = %s\n", host, err)
-			continue
-		}
-		for _, ip := range ips {
-			self.directory.AddManual(ip)
-		}
-	}
-	return version
+	return self.applyManualHostsProgressive()
 }
 
 // Resolves the extender dns name (E3).
@@ -647,10 +634,6 @@ func (self *ExtenderNetworkClient) applyManualHosts() uint64 {
 func (self *ExtenderNetworkClient) bootstrap() {
 	if self.settings.ExtenderDnsName == "" {
 		return
-	}
-	resolve := self.settings.ResolveDns
-	if resolve == nil {
-		resolve = self.resolveDns
 	}
 	resolveTxt := self.settings.ResolveDnsTxt
 	if resolveTxt == nil {
@@ -691,16 +674,9 @@ func (self *ExtenderNetworkClient) bootstrap() {
 	}
 	self.inferContinentHint(continentCounts)
 
-	ips, err := resolve(ctx, self.settings.ExtenderDnsName)
-	if err != nil {
-		self.log.Infof("[extender]bootstrap err = %s\n", err)
-		return
-	}
-	for _, ip := range ips {
-		self.directory.AddBootstrap(ip, ExtenderSourceDns)
-	}
-	// what the bootstrap verified is what the probe pass measures first
-	self.probeWake.NotifyAll()
+	// The TXT trust/hint step is complete. Address families continue under
+	// this client's joined owner; one usable publication releases sampling.
+	self.bootstrapDnsAddresses(ctx)
 }
 
 // The default bootstrap TXT resolution: over the strategy's DoH settings, with
@@ -762,47 +738,7 @@ func (self *ExtenderNetworkClient) resolveDns(
 	ctx context.Context,
 	name string,
 ) ([]netip.Addr, error) {
-	dohSettings := self.settings.DohSettings
-	if dohSettings == nil && self.clientStrategy != nil {
-		dohSettings = self.clientStrategy.settings.DohSettings
-	}
-	ips := []netip.Addr{}
-	if dohSettings != nil {
-		for _, query := range []struct {
-			ipVersion  int
-			recordType string
-		}{
-			{ipVersion: 4, recordType: "A"},
-			{ipVersion: 6, recordType: "AAAA"},
-		} {
-			if !self.ipVersionSupported(query.ipVersion) {
-				continue
-			}
-			for ip := range DohQuery(ctx, query.ipVersion, query.recordType, dohSettings, name) {
-				ips = append(ips, ip.Unmap())
-			}
-		}
-	}
-	if 0 < len(ips) {
-		return ips, nil
-	}
-	// the fallback is the ordinary resolver, which is all a host with a
-	// hostile or blocked DoH path has left. It goes through dialResolver so a
-	// configured resolver wins and, on a host steering its own sockets around
-	// the tunnel it provides, the egress-bound resolver is used instead of the
-	// OS one (egress_dial.go).
-	var customResolver *net.Resolver
-	if self.clientStrategy != nil {
-		customResolver = self.clientStrategy.settings.ConnectSettings.Resolver
-	}
-	netIps, err := dialResolver(customResolver).LookupNetIP(ctx, "ip", name)
-	if err != nil {
-		return nil, err
-	}
-	for _, ip := range netIps {
-		ips = append(ips, ip.Unmap())
-	}
-	return ips, nil
+	return self.resolveDnsProgress(ctx, name, nil)
 }
 
 func (self *ExtenderNetworkClient) ipVersionSupported(ipVersion int) bool {

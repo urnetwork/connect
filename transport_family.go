@@ -844,6 +844,19 @@ func raceH3Dial(
 	candidates []*net.UDPAddr,
 	dial func(ctx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
+	return raceH3DialProgressive(ctx, candidates, nil, dial)
+}
+
+// The first family starts the existing confirmed-handshake race. DNS workers
+// are joined on return; late candidates retain the ordinary fallback stagger.
+func raceH3DialProgressive(
+	ctx context.Context,
+	candidates []*net.UDPAddr,
+	source *udpDialCandidateSource,
+	dial func(ctx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error),
+) (*h3DialAttempt, error) {
+	defer source.close()
+	resolution := source.resultChannel()
 	if len(candidates) == 0 {
 		return nil, errors.New("h3 race: no candidates")
 	}
@@ -881,6 +894,7 @@ func raceH3Dial(
 	launch()
 	pending := 1
 	var firstErr error
+	staggerReady := false
 	stagger := time.NewTimer(platformH3FamilyRaceStagger)
 	defer stagger.Stop()
 	for {
@@ -897,15 +911,29 @@ func raceH3Dial(
 			if launched < len(candidates) {
 				launch()
 				pending += 1
+				staggerReady = false
 				stagger.Reset(platformH3FamilyRaceStagger)
-			} else if pending == 0 {
+			} else if pending == 0 && resolution == nil {
 				return nil, firstErr
 			}
 		case <-stagger.C:
+			staggerReady = true
 			if launched < len(candidates) {
 				launch()
 				pending += 1
+				staggerReady = false
 				stagger.Reset(platformH3FamilyRaceStagger)
+			}
+		case resolved := <-resolution:
+			candidates = source.appendReady(candidates, resolved)
+			resolution = source.resultChannel()
+			if launched < len(candidates) && (pending == 0 || staggerReady) {
+				launch()
+				pending++
+				staggerReady = false
+				stagger.Reset(platformH3FamilyRaceStagger)
+			} else if pending == 0 && resolution == nil {
+				return nil, firstErr
 			}
 		case <-ctx.Done():
 			finish(pending)
@@ -1454,6 +1482,33 @@ func (self *PlatformTransport) acquireH3TranslationMemory(ctx context.Context) (
 // address: the pinned family only for a pinned transport, both families
 // interleaved v6 first for a family-agnostic one (C6).
 func (self *PlatformTransport) h3DialCandidates(ctx context.Context, ptMode TransportMode, serverName string) ([]*net.UDPAddr, h3PacketConnWrapper, error) {
+	return self.h3DialCandidatesWithResolver(ctx, ptMode, serverName, self.clientStrategy.resolveControlUDPAddrs)
+}
+
+// The runtime dialer consumes this progressive plan. The static list form
+// remains for callers which explicitly need the complete inventory.
+func (self *PlatformTransport) h3DialCandidatesProgressive(ctx context.Context, ptMode TransportMode, serverName string) ([]*net.UDPAddr, h3PacketConnWrapper, *udpDialCandidateSource, error) {
+	var source *udpDialCandidateSource
+	candidates, wrap, err := self.h3DialCandidatesWithResolver(ctx, ptMode, serverName,
+		func(ctx context.Context, address string, ipFamily int) ([]*net.UDPAddr, error) {
+			addrs, pending, err := self.clientStrategy.startControlUdpCandidates(ctx, address, ipFamily)
+			source = pending
+			return addrs, err
+		})
+	if err != nil {
+		source.close()
+		return nil, nil, nil, err
+	}
+	return candidates, wrap, source, nil
+}
+
+// Both forms share carrier, pin, injected endpoint and wrapper policy.
+func (self *PlatformTransport) h3DialCandidatesWithResolver(
+	ctx context.Context,
+	ptMode TransportMode,
+	serverName string,
+	resolve func(context.Context, string, int) ([]*net.UDPAddr, error),
+) ([]*net.UDPAddr, h3PacketConnWrapper, error) {
 	plain := func(_ context.Context, packetConn net.PacketConn) (net.PacketConn, error) {
 		return packetConn, nil
 	}
@@ -1549,7 +1604,7 @@ func (self *PlatformTransport) h3DialCandidates(ctx context.Context, ptMode Tran
 			}
 			return []*net.UDPAddr{udpAddr}, plain, nil
 		}
-		udpAddrs, err := self.clientStrategy.resolveControlUDPAddrs(ctx, address, self.ipFamily)
+		udpAddrs, err := resolve(ctx, address, self.ipFamily)
 		if err != nil {
 			return nil, nil, err
 		}

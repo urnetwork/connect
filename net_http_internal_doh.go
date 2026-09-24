@@ -169,7 +169,7 @@ func (self *internalDohResolver) wrapDialContext(dialContext DialContextFunction
 				return dialContext(ctx, familyDialNetwork(network, addr), net.JoinHostPort(addr.String(), port))
 			})
 		}
-		addrs, err := self.resolve(ctx, network, host)
+		addrs, err := resolveFirstDohDialAddrs(ctx, self.cache, network, host)
 		if err != nil {
 			return nil, err
 		}
@@ -213,7 +213,7 @@ func (self *internalDohResolver) resolveUDPAddr(ctx context.Context, address str
 	if err != nil {
 		return nil, err
 	}
-	addrs, err := self.resolve(ctx, network, host)
+	addrs, err := resolveFirstDohDialAddrs(ctx, self.cache, network, host)
 	if err != nil {
 		return nil, err
 	}

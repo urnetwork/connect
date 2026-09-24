@@ -124,7 +124,7 @@ func (self *ClientStrategy) dialAltQuic(
 	quicConfig *quic.Config,
 ) (*quic.Conn, error) {
 	policy := newExtenderQuicMemoryPolicy(ctx, &self.settings.ConnectSettings)
-	candidates, err := self.altDialCandidates(ctx, whodis)
+	candidates, source, err := self.altDialCandidatesProgressive(ctx, whodis)
 	if err != nil {
 		return nil, err
 	}
@@ -160,10 +160,10 @@ func (self *ClientStrategy) dialAltQuic(
 		)
 	}
 	var attempt *h3DialAttempt
-	if len(candidates) == 1 {
+	if len(candidates) == 1 && source == nil {
 		attempt, err = dial(ctx, candidates[0])
 	} else {
-		attempt, err = raceAltQuicDial(ctx, candidates, policy, func(ctx context.Context, address *net.UDPAddr, claim *platformTransportBudgetReservation) (*h3DialAttempt, error) {
+		attempt, err = raceAltQuicDialProgressive(ctx, candidates, source, policy, func(ctx context.Context, address *net.UDPAddr, claim *platformTransportBudgetReservation) (*h3DialAttempt, error) {
 			return dialAltQuicAttemptWithReservation(ctx, &self.settings.ConnectSettings, address, wrap, tlsConfig, quicConfig, policy, claim)
 		})
 	}
@@ -189,6 +189,45 @@ func (self *ClientStrategy) altDialCandidates(
 	ctx context.Context,
 	whodis bool,
 ) ([]*net.UDPAddr, error) {
+	return self.altDialCandidatesWithResolver(ctx, whodis, self.resolveControlUDPAddrs)
+}
+
+// A runtime dial retains late-family candidates without holding its first
+// socket. Each family expands over the same configured carrier-port order.
+func (self *ClientStrategy) altDialCandidatesProgressive(
+	ctx context.Context,
+	whodis bool,
+) ([]*net.UDPAddr, *udpDialCandidateSource, error) {
+	var source *udpDialCandidateSource
+	candidates, err := self.altDialCandidatesWithResolver(ctx, whodis,
+		func(ctx context.Context, address string, ipFamily int) ([]*net.UDPAddr, error) {
+			addrs, pending, err := self.startControlUdpCandidates(ctx, address, ipFamily)
+			source = pending
+			return addrs, err
+		})
+	if err != nil {
+		source.close()
+		return nil, nil, err
+	}
+	if source != nil {
+		source.ports = nil
+		seen := map[int]bool{}
+		for _, candidate := range candidates {
+			if !seen[candidate.Port] {
+				seen[candidate.Port] = true
+				source.ports = append(source.ports, candidate.Port)
+			}
+		}
+	}
+	return candidates, source, nil
+}
+
+// Shared destination/pin/port policy for complete-list and progressive callers.
+func (self *ClientStrategy) altDialCandidatesWithResolver(
+	ctx context.Context,
+	whodis bool,
+	resolve func(context.Context, string, int) ([]*net.UDPAddr, error),
+) ([]*net.UDPAddr, error) {
 	altHost, altPort := altUrlHostPort(self.settings.AltUrl)
 	if altHost == "" {
 		return nil, fmt.Errorf("the alt url names no host")
@@ -201,7 +240,7 @@ func (self *ClientStrategy) altDialCandidates(
 	}
 	// a family-pinned strategy dials alt on its family only: an api call that
 	// crossed the other family would prove the wrong address to the operator
-	udpAddrs, err := self.resolveControlUDPAddrs(
+	udpAddrs, err := resolve(
 		ctx,
 		net.JoinHostPort(altHost, strconv.Itoa(ports[0])),
 		self.settings.ipFamily,

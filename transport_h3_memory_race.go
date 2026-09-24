@@ -27,6 +27,22 @@ func raceH3DialWithMemory(
 	nestedByteCount ByteCount,
 	dial func(context.Context, *net.UDPAddr) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
+	return raceH3DialWithMemoryProgressive(ctx, candidates, nil, budget, extraByteCount, nestedByteCount, dial)
+}
+
+// Pending DNS is another source of candidates, not an admission bypass. A
+// refused candidate still waits for complete prior teardown before launching.
+func raceH3DialWithMemoryProgressive(
+	ctx context.Context,
+	candidates []*net.UDPAddr,
+	source *udpDialCandidateSource,
+	budget *PlatformTransportBudget,
+	extraByteCount ByteCount,
+	nestedByteCount ByteCount,
+	dial func(context.Context, *net.UDPAddr) (*h3DialAttempt, error),
+) (*h3DialAttempt, error) {
+	defer source.close()
+	resolution := source.resultChannel()
 	if len(candidates) == 0 {
 		return nil, errors.New("h3 race: no candidates")
 	}
@@ -92,6 +108,7 @@ func raceH3DialWithMemory(
 	stagger := time.NewTimer(platformH3FamilyRaceStagger)
 	defer stagger.Stop()
 	var firstErr error
+	staggerReady := false
 	for {
 		select {
 		case completed := <-results:
@@ -108,15 +125,29 @@ func raceH3DialWithMemory(
 			}
 			if launched < len(candidates) {
 				advance()
+				staggerReady = false
 				stagger.Reset(platformH3FamilyRaceStagger)
-			} else if pending == 0 {
+			} else if pending == 0 && resolution == nil {
 				finish()
 				return nil, firstErr
 			}
 		case <-stagger.C:
+			staggerReady = true
 			if launched < len(candidates) {
 				advance()
+				staggerReady = false
 				stagger.Reset(platformH3FamilyRaceStagger)
+			}
+		case resolved := <-resolution:
+			candidates = source.appendReady(candidates, resolved)
+			resolution = source.resultChannel()
+			if launched < len(candidates) && (pending == 0 || staggerReady) {
+				advance()
+				staggerReady = false
+				stagger.Reset(platformH3FamilyRaceStagger)
+			} else if pending == 0 && resolution == nil {
+				finish()
+				return nil, firstErr
 			}
 		case <-ctx.Done():
 			finish()

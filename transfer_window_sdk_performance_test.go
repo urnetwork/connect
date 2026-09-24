@@ -134,20 +134,18 @@ func windowSdkProfiles(t *testing.T) ([]windowPathEndpointProfile, string) {
 	return fixture.Profiles, fmt.Sprintf("%x", sha256.Sum256(windowSdkProfileBytes))
 }
 
-// The profile capture is evidence, not a second runtime policy. Detect an
-// admission-policy change directly, before dozens of measured cells fail at
-// setup. Refresh through the real SDK constructor capture; never edit the
-// production handshake bound or silently substitute a live value in a cell.
-func TestWindowSdkProfileMessageAdmission(t *testing.T) {
+// Check the captured transport floor without starting a performance cell.
+// A constructor change requires a fresh SDK capture, not a weaker guard.
+func TestWindowSdkProfilesMatchConstructorMessageLimit(t *testing.T) {
 	profiles, _ := windowSdkProfiles(t)
-	for index, profile := range profiles {
-		t.Run(fmt.Sprintf("%02d-%s", index, profile.Name), func(t *testing.T) {
-			settings := DefaultClientSettings()
-			profile.apply(settings)
-			if current := settings.MinimumMessageLenLimit(); current != profile.MinimumMessageLimit {
-				t.Fatalf("captured message admission %d differs from current constructor %d; recapture testdata/window_sdk_profiles.json with tools/throughput-fix-2-sdk-settings.py", profile.MinimumMessageLimit, current)
-			}
-		})
+	for _, profile := range profiles {
+		settings := DefaultClientSettings()
+		profile.apply(settings)
+		if limit := settings.MinimumMessageLenLimit(); limit != profile.MinimumMessageLimit {
+			t.Errorf("profile=%s process=%d mobile=%t providing=%t h1=%t captured message limit=%d constructor=%d; refresh tools/throughput-fix-2-sdk-settings.py",
+				profile.Name, profile.ProcessBudget, profile.MobilePolicy, profile.Providing, profile.ExplicitH1,
+				profile.MinimumMessageLimit, limit)
+		}
 	}
 }
 

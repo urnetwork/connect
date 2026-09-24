@@ -118,26 +118,26 @@ func TestDohDialProgressRetainsPendingFamilyAfterTcpFailure(t *testing.T) {
 	}
 }
 
-// Both already-published answers must retain IPv6 priority even if A is the
-// first buffered result. A long stagger is only a watchdog discriminator.
-func TestDohDialProgressReadyPairPrefersIpv6WithoutExtraDelay(t *testing.T) {
+// Buffered answers retain publication order for the first attempt. An
+// already-published A must not wait for, or be displaced by, later AAAA.
+func TestDohDialProgressReadyPairUsesFirstPublishedFamily(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	ipv4 := netip.MustParseAddr("192.0.2.82")
 	ipv6 := netip.MustParseAddr("2001:db8::82")
 	results := make(chan dohDialQueryResult, 2)
-	results <- dohDialQueryResult{ipv6: false, addrs: []netip.Addr{ipv4}, authoritative: true}
-	results <- dohDialQueryResult{ipv6: true, addrs: []netip.Addr{ipv6}, authoritative: true}
+	results <- dohDialQueryResult{addrs: []netip.Addr{ipv4}, authoritative: true}
+	results <- dohDialQueryResult{addrs: []netip.Addr{ipv6}, authoritative: true}
 	var dials atomic.Int64
 	conn, err := dialAddrsRaceWithResolution(ctx, nil, time.Hour, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 		dials.Add(1)
-		if addr != ipv6 {
-			return nil, errors.New("IPv4 displaced an already-ready IPv6 answer")
+		if addr != ipv4 {
+			return nil, errors.New("later IPv6 displaced the first published IPv4 answer")
 		}
 		client, peer := net.Pipe()
 		_ = peer.Close()
 		return client, nil
-	}, &dialAddrResolution{results: results, pending: 2, ipv6Pending: true, host: "ready.example"})
+	}, &dialAddrResolution{results: results, pending: 2, host: "ready.example"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,8 +147,8 @@ func TestDohDialProgressReadyPairPrefersIpv6WithoutExtraDelay(t *testing.T) {
 	}
 }
 
-// Cache hits keep the same IPv6 preference and issue no redundant query.
-func TestDohDialProgressCachedPairKeepsIpv6AndResolver(t *testing.T) {
+// Concurrent cache hits use their first completed family without re-querying.
+func TestDohDialProgressCachedPairKeepsResolver(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	ipv4 := netip.MustParseAddr("192.0.2.83")
@@ -166,8 +166,8 @@ func TestDohDialProgressCachedPairKeepsIpv6AndResolver(t *testing.T) {
 	}
 	conn, err := dialDohAddrsRace(ctx, cache, "tcp", "cached.example", time.Hour, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 		dials.Add(1)
-		if addr != ipv6 {
-			return nil, errors.New("cached IPv6 did not retain priority")
+		if addr != ipv4 && addr != ipv6 {
+			return nil, errors.New("cached dial did not use either configured answer")
 		}
 		client, peer := net.Pipe()
 		_ = peer.Close()
@@ -271,9 +271,10 @@ func TestDohDialProgressClosesLateSuccessfulLoserBeforeReturn(t *testing.T) {
 	}
 	firstEntered := make(chan struct{})
 	loserPeer := make(chan net.Conn, 1)
+	var dials atomic.Int64
 	conn, err := dialDohAddrsRace(ctx, cache, "tcp", "loser.example", DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 		client, peer := net.Pipe()
-		if addr == ipv6 {
+		if dials.Add(1) == 1 {
 			loserPeer <- peer
 			close(firstEntered)
 			<-ctx.Done()

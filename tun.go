@@ -1510,10 +1510,10 @@ func raceTunDialContext(
 // dialContext is one attempt of the stream/datagram dial through this tun's
 // stack (raceTunDialContext may run several). A name resolves through the
 // tun's DoH cache for the families the network permits, A and AAAA
-// concurrently, and a stream dial races the addresses v6-first with the
-// package fallback delay (net_dial_race.go). A datagram dial cannot be raced
-// (connect always succeeds) and takes the first v4 address, else the first
-// address. Family-specific networks and literals are honored: a v6 target on
+// concurrently. A stream starts the first usable answer immediately and
+// staggers later addresses (net_dial_race.go). A datagram dial uses the first
+// usable answer and cancels/joins the pending family; its socket success is
+// not remote path proof. Family-specific networks and literals are honored: a v6 target on
 // an IPv4-only tun is EAFNOSUPPORT.
 //
 // safe to call from multiple goroutines
@@ -1568,7 +1568,7 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 				return self.dialTcpAddr(ctx, host, netip.AddrPortFrom(addr, uint16(port)))
 			})
 		}
-		addrs, err = resolveDohDialAddrs(dialCtx, self.DohCache(), resolveNetwork, host)
+		addrs, err = resolveFirstDohDialAddrs(dialCtx, self.DohCache(), resolveNetwork, host)
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[tun]query doh (%s) found %v err=%v\n", host, addrs, err)
 		}

@@ -17,6 +17,20 @@ func raceAltQuicDial(
 	policy extenderQuicMemoryPolicy,
 	dial func(context.Context, *net.UDPAddr, *platformTransportBudgetReservation) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
+	return raceAltQuicDialProgressive(ctx, candidates, nil, policy, dial)
+}
+
+// The first usable family starts immediately. Later results join the same
+// budgeted race; exhaustion requires both attempts and resolution to finish.
+func raceAltQuicDialProgressive(
+	ctx context.Context,
+	candidates []*net.UDPAddr,
+	source *udpDialCandidateSource,
+	policy extenderQuicMemoryPolicy,
+	dial func(context.Context, *net.UDPAddr, *platformTransportBudgetReservation) (*h3DialAttempt, error),
+) (*h3DialAttempt, error) {
+	defer source.close()
+	resolution := source.resultChannel()
 	if len(candidates) == 0 {
 		return nil, errors.New("alt QUIC race: no candidates")
 	}
@@ -73,6 +87,7 @@ func raceAltQuicDial(
 	stagger := time.NewTimer(platformH3FamilyRaceStagger)
 	defer stagger.Stop()
 	var firstErr error
+	staggerReady := false
 	for {
 		select {
 		case completed := <-results:
@@ -91,19 +106,37 @@ func raceAltQuicDial(
 				if err := advance(); err != nil {
 					return nil, err
 				}
+				staggerReady = false
 				stagger.Reset(platformH3FamilyRaceStagger)
-			} else if pending == 0 {
+			} else if pending == 0 && resolution == nil {
 				if firstErr == nil {
 					firstErr = context.Canceled
 				}
 				return nil, firstErr
 			}
 		case <-stagger.C:
+			staggerReady = true
 			if launched < len(candidates) {
 				if err := advance(); err != nil {
 					return nil, err
 				}
+				staggerReady = false
 				stagger.Reset(platformH3FamilyRaceStagger)
+			}
+		case resolved := <-resolution:
+			candidates = source.appendReady(candidates, resolved)
+			resolution = source.resultChannel()
+			if launched < len(candidates) && (pending == 0 || staggerReady) {
+				if err := advance(); err != nil {
+					return nil, err
+				}
+				staggerReady = false
+				stagger.Reset(platformH3FamilyRaceStagger)
+			} else if pending == 0 && resolution == nil {
+				if firstErr == nil {
+					firstErr = context.Canceled
+				}
+				return nil, firstErr
 			}
 		case <-ctx.Done():
 			return nil, ctx.Err()

@@ -2826,14 +2826,14 @@ func (self *PlatformTransport) runH3(
 			tlsConfig.ServerName = serverName
 
 			// the candidate addresses in dial order, and how each socket is
-			// wrapped for the mode. One candidate is dialed directly; several
-			// race, v6 first with a stagger (see raceH3Dial).
-			candidates, wrapPacketConn, err := self.h3DialCandidates(attemptCtx, ptMode, serverName)
+			// wrapped for the mode. A pending family requires a confirmed
+			// handshake race even when only one address is ready so far.
+			candidates, wrapPacketConn, source, err := self.h3DialCandidatesProgressive(attemptCtx, ptMode, serverName)
 			if err != nil {
 				return nil, err
 			}
 			var attempt *h3DialAttempt
-			if len(candidates) == 1 {
+			if len(candidates) == 1 && source == nil {
 				attempt, err = self.dialH3(attemptCtx, ptMode, serverName, candidates[0], wrapPacketConn, tlsConfig, quicConfig, slowMultiple, false)
 			} else if self.settings.h3RetainedByteAccounting || self.h3NestedBudget != nil {
 				budget := self.settings.PlatformTransportBudget
@@ -2845,11 +2845,11 @@ func (self *PlatformTransport) runH3(
 					extraByteCount = self.h3BudgetByteCount()
 				}
 				nestedByteCount := self.h3NestedBudget.Stats().TotalByteCount
-				attempt, err = raceH3DialWithMemory(attemptCtx, candidates, budget, extraByteCount, nestedByteCount, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
+				attempt, err = raceH3DialWithMemoryProgressive(attemptCtx, candidates, source, budget, extraByteCount, nestedByteCount, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
 					return self.dialH3(dialCtx, ptMode, serverName, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
 				})
 			} else {
-				attempt, err = raceH3Dial(attemptCtx, candidates, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
+				attempt, err = raceH3DialProgressive(attemptCtx, candidates, source, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
 					return self.dialH3(dialCtx, ptMode, serverName, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
 				})
 			}
