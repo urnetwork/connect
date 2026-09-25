@@ -12883,6 +12883,8 @@ type ReceiveBufferSettings struct {
 	afterAckWritesCanceledForTest      func(receiveSequenceId)
 	// Nil observer exposes an idle check while producer admission is held.
 	afterIdleCloseForTest func(receiveSequenceId, bool)
+	// Nil by default. Exposes the fixed handoff census without changing admission.
+	afterGapHandoffSnapshotForTest func(receiveSequenceId, int)
 }
 
 func (self *ReceiveBufferSettings) packHandoffTimeout(
@@ -14638,13 +14640,24 @@ func (self *ReceiveSequence) Run() {
 	idleTimer := time.NewTimer(0)
 	defer idleTimer.Stop()
 
+	// A timed-out hole may already have its predecessor in the local handoff
+	// queue. Reconcile only the prefix present at first expiry, never replenish
+	// it for newer traffic or duplicate arrivals that keep the same hole open.
+	var gapHandoff struct {
+		active     bool
+		next       uint64
+		receivedAt time.Time
+		remaining  int
+	}
 	for {
 		if self.ctx.Err() != nil {
 			return
 		}
 		var timeout time.Duration
+		var expiredGap *receiveItem
 
 		if queueSize, _ := self.receiveQueue.QueueSize(); 0 == queueSize {
+			gapHandoff.active = false
 			timeout = self.receiveBufferSettings.IdleTimeout
 		} else {
 			timeout = self.receiveBufferSettings.GapTimeout
@@ -14660,13 +14673,24 @@ func (self *ReceiveSequence) Run() {
 				if self.nextSequenceNumber < item.sequenceNumber {
 					// Only a still-missing predecessor owns a gap deadline. Local
 					// stalls cannot expire an item that is ready or already delivered.
+					if gapHandoff.active && gapHandoff.next != self.nextSequenceNumber {
+						gapHandoff.active = false
+					}
 					itemGapTimeout := time.Until(item.receiveTime.Add(self.receiveBufferSettings.GapTimeout))
-					if itemGapTimeout <= 0 {
-						if self.ctx.Err() != nil {
-							return
+					if itemGapTimeout <= 0 || gapHandoff.active {
+						if !gapHandoff.active {
+							gapHandoff.active = true
+							gapHandoff.next = self.nextSequenceNumber
+							gapHandoff.receivedAt = item.receiveTime
+							// An empty channel also gets one nonblocking rendezvous;
+							// an unbuffered ready producer otherwise has no census.
+							gapHandoff.remaining = max(1, len(self.packs))
+							if self.receiveBufferSettings.afterGapHandoffSnapshotForTest != nil {
+								self.receiveBufferSettings.afterGapHandoffSnapshotForTest(self.id(), gapHandoff.remaining)
+							}
 						}
-						self.log.Errorf("[r]%s<-%s s(%s) exit gap timeout expected=%d queued=%d age=%s budget=%s\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, self.nextSequenceNumber, item.sequenceNumber, time.Since(item.receiveTime), self.receiveBufferSettings.GapTimeout)
-						return
+						expiredGap = item
+						break
 					}
 					if itemGapTimeout < timeout {
 						timeout = itemGapTimeout
@@ -14770,6 +14794,31 @@ func (self *ReceiveSequence) Run() {
 				}
 			}
 			return true
+		}
+
+		if expiredGap != nil {
+			if self.ctx.Err() != nil {
+				return
+			}
+			if 0 < gapHandoff.remaining {
+				select {
+				case <-self.ctx.Done():
+					return
+				case receivePack, ok := <-self.packs:
+					gapHandoff.remaining--
+					self.releasePackQueue(receivePack)
+					if !processPack(receivePack, ok) {
+						return
+					}
+					continue
+				default:
+				}
+			}
+			if self.ctx.Err() != nil {
+				return
+			}
+			self.log.Errorf("[r]%s<-%s s(%s) exit gap timeout expected=%d queued=%d age=%s budget=%s\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, self.nextSequenceNumber, expiredGap.sequenceNumber, time.Since(gapHandoff.receivedAt), self.receiveBufferSettings.GapTimeout)
+			return
 		}
 
 		// fast path without arming a timer
