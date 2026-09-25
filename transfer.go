@@ -14639,7 +14639,9 @@ func (self *ReceiveSequence) Run() {
 	defer idleTimer.Stop()
 
 	for {
-		receiveTime := time.Now()
+		if self.ctx.Err() != nil {
+			return
+		}
 		var timeout time.Duration
 
 		if queueSize, _ := self.receiveQueue.QueueSize(); 0 == queueSize {
@@ -14647,19 +14649,25 @@ func (self *ReceiveSequence) Run() {
 		} else {
 			timeout = self.receiveBufferSettings.GapTimeout
 			for {
+				if self.ctx.Err() != nil {
+					return
+				}
 				item := self.receiveQueue.PeekFirst()
 				if item == nil {
 					break
 				}
 
-				itemGapTimeout := item.receiveTime.Add(self.receiveBufferSettings.GapTimeout).Sub(receiveTime)
-				if itemGapTimeout <= 0 {
-					self.log.Errorf("[r]%s<-%s s(%s) exit gap timeout\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
-					// did not receive a preceding message in time
-					return
-				}
-
 				if self.nextSequenceNumber < item.sequenceNumber {
+					// Only a still-missing predecessor owns a gap deadline. Local
+					// stalls cannot expire an item that is ready or already delivered.
+					itemGapTimeout := time.Until(item.receiveTime.Add(self.receiveBufferSettings.GapTimeout))
+					if itemGapTimeout <= 0 {
+						if self.ctx.Err() != nil {
+							return
+						}
+						self.log.Errorf("[r]%s<-%s s(%s) exit gap timeout expected=%d queued=%d age=%s budget=%s\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, self.nextSequenceNumber, item.sequenceNumber, time.Since(item.receiveTime), self.receiveBufferSettings.GapTimeout)
+						return
+					}
 					if itemGapTimeout < timeout {
 						timeout = itemGapTimeout
 					}
