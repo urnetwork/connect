@@ -442,6 +442,10 @@ paths:
         else's until it opts in: the caller sees what everyone sees, and the
         apps only highlight that row.
       operationId: Stats Points Leaderboard
+      # optional auth: anonymous callers get the list, a bearer adds `me`
+      security:
+        - {}
+        - BearerAuth: []
       requestBody:
         required: true
         content:
@@ -755,6 +759,8 @@ paths:
       tags: [auth]
       summary: Sign in with Apple return for android, windows and linux
       operationId: authAppleCallback
+      # a browser redirect from the identity provider; no bearer
+      security: []
       description: |
         Apple has no SDK for android, windows or linux, so those apps open
         Apple's authorize page in the system browser (a Custom Tab on android)
@@ -816,6 +822,8 @@ paths:
       tags: [auth]
       summary: Sign in with Apple return (query form, for manual testing)
       operationId: authAppleCallbackGet
+      # a browser redirect from the identity provider; no bearer
+      security: []
       parameters:
         - in: query
           name: state
@@ -848,6 +856,8 @@ paths:
       tags: [auth]
       summary: Sign in with Google return for windows and linux
       operationId: authGoogleCallback
+      # a browser redirect from the identity provider; no bearer
+      security: []
       description: |
         Windows and Linux have no native Google sign-in, so those apps open
         Google's authorize page in the system browser with `client_id` = the
@@ -1939,7 +1949,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/SubmitProviderBlackholeChecksResult"
         "400":
           description: The batch is empty, too large, or one of its checks is invalid.
         "401":
@@ -2055,7 +2065,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/SubmitProviderBandwidthResult"
         "400":
           description: Missing client id, non-positive figures, or an unsubmittable source.
         "401":
@@ -2104,7 +2114,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/SubmitProviderEgressHealthResult"
         "400":
           description: An unknown field, a negative or inconsistent count, or a `reputation` class.
         "401":
@@ -2892,7 +2902,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/AppleNotificationResult"
         "400":
           description: The envelope is malformed, or the notification failed verification.
         "413":
@@ -4323,7 +4333,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/SnPayoutArtifact"
         "400":
           description: The hash is missing or not a canonical content key.
         "502":
@@ -4442,7 +4452,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/SnAttemptMetadata"
             application/x-ndjson:
               schema:
                 type: string
@@ -5483,6 +5493,12 @@ paths:
                         guardrails:
                           refund_rate: 0.06
                         min_exposures: 3000
+                        active: true
+                        variant_states: []
+                    results:
+                      min_exposures: 3000
+                      rollup_days: 35
+                      guardrail_days: 7
         "401":
           description: Missing or invalid bearer token.
         "403":
@@ -5733,6 +5749,7 @@ paths:
           application/x-www-form-urlencoded:
             schema:
               type: object
+              required: []
               properties:
                 token:
                   type: string
@@ -5939,6 +5956,23 @@ components:
 
     ProxyClient:
       type: object
+      required:
+        - create_time
+        - proxy_id
+        - client_id
+        - api_base_url
+        - block
+        - api_port
+        - http_proxy_url
+        - https_proxy_url
+        - socks_proxy_url
+        - auth_token
+        - instance_id
+        - proxy_host
+        - socks_proxy_port
+        - http_proxy_port
+        - https_proxy_port
+        - wg_config
       properties:
         change_id:
           type: integer
@@ -5977,7 +6011,14 @@ components:
         https_proxy_port:
           type: integer
         wg_config:
-          type: object
+          type: [object, "null"]
+          required:
+            - wg_proxy_port
+            - client_private_key
+            - client_public_key
+            - client_ipv4
+            - proxy_public_key
+            - config
           properties:
             wg_proxy_port:
               type: integer
@@ -5995,6 +6036,24 @@ components:
 
     StatsResult:
       type: object
+      required:
+        - lookback
+        - created_time
+        - all_transfer_data
+        - all_transfer_summary
+        - all_transfer_summary_rate
+        - providers_data
+        - providers_summary
+        - countries_data
+        - countries_summary
+        - regions_data
+        - regions_summary
+        - cities_data
+        - cities_summary
+        - networks_data
+        - networks_summary
+        - devices_data
+        - devices_summary
       properties:
         lookback:
           type: integer
@@ -6062,6 +6121,7 @@ components:
 
     AuthLoginArgs:
       type: object
+      required: []
       properties:
         user_auth:
           description: email or phone number
@@ -6081,6 +6141,7 @@ components:
 
     AuthLoginResult:
       type: object
+      required: []
       properties:
         user_name:
           type: string
@@ -6103,6 +6164,8 @@ components:
               - seedphrase
         error:
           type: object
+          required:
+            - message
           properties:
             suggested_user_auth:
               type: string
@@ -6114,6 +6177,8 @@ components:
               type: string
         network:
           type: object
+          required:
+            - by_jwt
           properties:
             by_jwt:
               type: string
@@ -6122,6 +6187,9 @@ components:
 
     AuthLoginWithPasswordArgs:
       type: object
+      required:
+        - user_auth
+        - password
       properties:
         user_auth:
           description: email or phone number
@@ -6133,15 +6201,19 @@ components:
 
     AuthLoginWithPasswordResult:
       type: object
+      required: []
       properties:
         verification_required:
           type: object
+          required:
+            - user_auth
           properties:
             user_auth:
               description: email or phone number
               type: string
         network:
           type: object
+          required: []
           properties:
             by_jwt:
               type: string
@@ -6149,12 +6221,17 @@ components:
               type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     AuthVerifyArgs:
       type: object
+      required:
+        - user_auth
+        - verify_code
       properties:
         user_auth:
           description: email or phone number
@@ -6164,20 +6241,27 @@ components:
 
     AuthVerifyResult:
       type: object
+      required: []
       properties:
         network:
           type: object
+          required:
+            - by_jwt
           properties:
             by_jwt:
               type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     AuthVerifySendArgs:
       type: object
+      required:
+        - user_auth
       properties:
         user_auth:
           description: email or phone number
@@ -6188,6 +6272,8 @@ components:
 
     AuthVerifySendResult:
       type: object
+      required:
+        - user_auth
       properties:
         user_auth:
           description: email or phone number
@@ -6195,6 +6281,8 @@ components:
 
     AuthPasswordResetArgs:
       type: object
+      required:
+        - user_auth
       properties:
         user_auth:
           description: email or phone number
@@ -6202,6 +6290,8 @@ components:
 
     AuthPasswordResetResult:
       type: object
+      required:
+        - user_auth
       properties:
         user_auth:
           description: email or phone number
@@ -6209,6 +6299,9 @@ components:
 
     AuthPasswordSetArgs:
       type: object
+      required:
+        - reset_code
+        - password
       properties:
         reset_code:
           type: string
@@ -6217,22 +6310,28 @@ components:
 
     AuthPasswordSetResult:
       type: object
+      required: []
       properties: {}
 
     NetworkCheckArgs:
       type: object
+      required: []
       properties:
         network_name:
           type: string
 
     NetworkCheckResult:
       type: object
+      required:
+        - available
       properties:
         available:
           type: boolean
 
     NetworkCreateArgs:
       type: object
+      required:
+        - terms
       properties:
         user_name:
           type: string
@@ -6275,9 +6374,12 @@ components:
 
     NetworkCreateResult:
       type: object
+      required: []
       properties:
         network:
           type: object
+          required:
+            - network_id
           properties:
             by_jwt:
               type: string
@@ -6300,27 +6402,35 @@ components:
           type: boolean
         verification_required:
           type: object
+          required:
+            - user_auth
           properties:
             user_auth:
               description: email or phone number
               type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     NetworkDeleteResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     AuthCodeCreateArgs:
       type: object
+      required: []
       properties:
         duration_minutes:
           type: number
@@ -6341,6 +6451,7 @@ components:
 
     AuthCodeCreateResult:
       type: object
+      required: []
       properties:
         auth_code:
           type: string
@@ -6350,6 +6461,7 @@ components:
           type: integer
         error:
           type: object
+          required: []
           properties:
             auth_code_limit_exceeded:
               type: boolean
@@ -6358,23 +6470,28 @@ components:
 
     AuthCodeLoginArgs:
       type: object
+      required:
+        - auth_code
       properties:
         auth_code:
           type: string
 
     AuthCodeLoginResult:
       type: object
+      required: []
       properties:
         by_jwt:
           type: string
         error:
           type: object
+          required: []
           properties:
             message:
               type: string
 
     AuthNetworkClientArgs:
       type: object
+      required: []
       properties:
         client_id:
           description: udid. Optional. If this is given, it must currently exist in the network. Omit this to assign a new client id.
@@ -6420,6 +6537,7 @@ components:
             Set if the intended use case of the client is cloud proxy. |
             Note local traffic is not allowed on the cloud proxy. A destination must be set via the SDK.
           type: object
+          required: []
           properties:
             lock_caller_ip:
               description: Optional. |
@@ -6446,6 +6564,7 @@ components:
                 To configure the device beyond the initial state, the SDK ProxyDevice must be used.
                 Note that the SDK ProxyDevice must reconfigure the device each time it receives a change notice.
               type: object
+              required: []
               properties:
                 country_code:
                   description: Optional. Use one of country_code or location
@@ -6453,9 +6572,11 @@ components:
                 location:
                   description: Optional. Use one of country_code or location
                   type: object
+                  required: []
                   properties:
                     connect_location_id:
                       type: object
+                      required: []
                       properties:
                         client_id:
                           description: udid. Optional.
@@ -6516,6 +6637,7 @@ components:
                       type: boolean
                 performance_profile:
                   type: object
+                  required: []
                   properties:
                     allow_direct:
                       description: Setting this exposes the real source IP to the provider.
@@ -6536,6 +6658,7 @@ components:
                           const: speed
                     window_size:
                       type: object
+                      required: []
                       properties:
                         window_size_min:
                           type: integer
@@ -6566,6 +6689,7 @@ components:
                     queried as RFC 8484 wire format, and each must present an
                     IP-SAN certificate when addressed by IP.
                   type: object
+                  required: []
                   properties:
                     enable_remote_doh:
                       type: boolean
@@ -6616,6 +6740,7 @@ components:
 
     AuthNetworkClientResult:
       type: object
+      required: []
       properties:
         by_client_jwt:
           type: string
@@ -6635,6 +6760,8 @@ components:
             | wg://<proxy_host>:<wg_proxy_port> | use `wg_config.config` as the full WireGuard config file content, which contains all the necessary keys |
           allOf:
             - type: object
+              required:
+                - keepalive_seconds
               properties:
                 keepalive_seconds:
                   description: |
@@ -6649,6 +6776,9 @@ components:
 
         error:
           type: object
+          required:
+            - client_limit_exceeded
+            - message
           properties:
             client_limit_exceeded:
               description: A hard cap or a rate limit was hit.
@@ -6665,6 +6795,8 @@ components:
 
     RemoveNetworkClientArgs:
       type: object
+      required:
+        - client_id
       properties:
         client_id:
           description: udid
@@ -6672,20 +6804,34 @@ components:
 
     RemoveNetworkClientResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     NetworkClientsResult:
       type: object
+      required:
+        - clients
       properties:
         clients:
           type: array
           items:
             type: object
+            required:
+              - client_id
+              - device_id
+              - network_id
+              - description
+              - device_name
+              - device_spec
+              - create_time
+              - auth_time
             properties:
               client_id:
                 description: udid
@@ -6721,32 +6867,17 @@ components:
                 $ref: "#/components/schemas/ProvideMode"
               proxy_client:
                 $ref: "#/components/schemas/ProxyClient"
-              resident:
-                type: object
-                properties:
-                  client_id:
-                    description: udid
-                    type: string
-                  instance_id:
-                    description: udid
-                    type: string
-                  resident_id:
-                    description: udid
-                    type: string
-                  resident_host:
-                    type: string
-                  resident_service:
-                    type: string
-                  resident_block:
-                    type: string
-                  resident_internal_ports:
-                    type: array
-                    items:
-                      type: integer
               connections:
                 type: array
                 items:
                   type: object
+                  required:
+                    - client_id
+                    - connection_id
+                    - connect_time
+                    - connection_host
+                    - connection_service
+                    - connection_block
                   properties:
                     client_id:
                       description: udid
@@ -6767,6 +6898,8 @@ components:
 
     NetworkPeer:
       type: object
+      required:
+        - client_id
       properties:
         client_id:
           description: udid
@@ -6794,10 +6927,13 @@ components:
 
     NetworkPeersResult:
       type: object
+      required:
+        - peers
+        - disconnected_count
       properties:
         peers:
           description: connected peers
-          type: array
+          type: [array, "null"]
           items:
             $ref: "#/components/schemas/NetworkPeer"
         disconnected:
@@ -6809,31 +6945,39 @@ components:
           type: integer
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     PreferencesSetArgs:
       type: object
+      required: []
       properties:
         product_updates:
           type: boolean
 
     PreferencesSetResult:
       type: object
+      required: []
       properties: {}
 
     PreferencesGetResult:
       type: object
+      required:
+        - product_updates
       properties:
         product_updates:
           type: boolean
 
     FeedbackSendArgs:
       type: object
+      required: []
       properties:
         uses:
           type: object
+          required: []
           properties:
             personal:
               type: boolean
@@ -6841,6 +6985,7 @@ components:
               type: boolean
         needs:
           type: object
+          required: []
           properties:
             private:
               type: boolean
@@ -6877,6 +7022,8 @@ components:
 
     FeedbackSendResult:
       type: object
+      required:
+        - feedback_id
       properties:
         feedback_id:
           description: udid
@@ -6884,6 +7031,7 @@ components:
 
     FindLocationsArgs:
       type: object
+      required: []
       properties:
         query:
           type: string
@@ -6900,11 +7048,23 @@ components:
 
     FindLocationsResult:
       type: object
+      required:
+        - groups
+        - locations
+        - devices
+        - country_count
+        - region_count
+        - city_count
+        - stable_count
+        - strong_privacy_count
       properties:
         groups:
           type: array
           items:
             type: object
+            required:
+              - location_group_id
+              - name
             properties:
               location_group_id:
                 description: udid
@@ -6921,6 +7081,13 @@ components:
           type: array
           items:
             type: object
+            required:
+              - location_id
+              - location_type
+              - name
+              - country_code
+              - stable
+              - strong_privacy
             properties:
               location_id:
                 description: udid
@@ -6962,6 +7129,9 @@ components:
           type: array
           items:
             type: object
+            required:
+              - client_id
+              - device_name
             properties:
               client_id:
                 description: udid
@@ -6981,6 +7151,7 @@ components:
 
     ProviderSpec:
       type: object
+      required: []
       properties:
         location_id:
           description: udid
@@ -6996,6 +7167,7 @@ components:
 
     FindProviders2Args:
       type: object
+      required: []
       properties:
         # specs are unioned (or)
         specs:
@@ -7057,6 +7229,9 @@ components:
         A wgs84 point. Zero is a valid coordinate — absence is expressed by
         omitting the containing object, never by (0, 0).
       type: object
+      required:
+        - lat
+        - lon
       properties:
         lat:
           type: number
@@ -7070,6 +7245,7 @@ components:
         coordinates are the region centroid and city coordinates are the
         city centroid.
       type: object
+      required: []
       properties:
         country:
           type: string
@@ -7096,11 +7272,18 @@ components:
 
     FindProviders2Result:
       type: object
+      required:
+        - providers
       properties:
         providers:
           type: array
           items:
             type: object
+            required:
+              - client_id
+              - estimated_bytes_per_second
+              - has_estimated_bytes_per_second
+              - tier
             properties:
               client_id:
                 description: udid
@@ -7133,6 +7316,10 @@ components:
                   discovery.
                 type: integer
               intermediary_ids:
+                description: |
+                  Reserved for future multi-hop routes: the intermediaries to
+                  reach `client_id` through, in order. Find-providers never
+                  returns multi-hop routes today, so this is always absent.
                 type: array
                 items:
                   description: udid
@@ -7158,9 +7345,18 @@ components:
 
     WalletBalanceResult:
       type: object
+      required: []
       properties:
         wallet_info:
           type: object
+          required:
+            - wallet_id
+            - token_id
+            - blockchain
+            - blockchain_symbol
+            - create_date
+            - balance_usdc_nano_cents
+            - address
           properties:
             wallet_id:
               type: string
@@ -7179,6 +7375,9 @@ components:
 
     WalletValidateAddressArgs:
       type: object
+      required:
+        - address
+        - chain
       properties:
         address:
           type: string
@@ -7194,15 +7393,20 @@ components:
 
     WalletValidateAddressResult:
       type: object
+      required: []
       properties:
         valid:
           type: boolean
 
     WalletCircleInitResult:
       type: object
+      required: []
       properties:
         user_token:
           type: object
+          required:
+            - user_token
+            - encryption_key
           properties:
             user_token:
               type: string
@@ -7212,12 +7416,16 @@ components:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     WalletCircleTransferOutArgs:
       type: object
+      required:
+        - terms
       properties:
         to_address:
           type: string
@@ -7229,9 +7437,13 @@ components:
 
     WalletCircleTransferOutResult:
       type: object
+      required: []
       properties:
         user_token:
           type: object
+          required:
+            - user_token
+            - encryption_key
           properties:
             user_token:
               type: string
@@ -7241,12 +7453,21 @@ components:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     SubscriptionBalanceResult:
       type: object
+      required:
+        - start_balance_byte_count
+        - balance_byte_count
+        - open_transfer_byte_count
+        - pending_payout_usd_nano_cents
+        - update_time
+        - onboarding_offer
       properties:
         start_balance_byte_count:
           type: integer
@@ -7279,6 +7500,14 @@ components:
           type: array
           items:
             type: object
+            required:
+              - balance_id
+              - network_id
+              - start_time
+              - end_time
+              - start_balance_byte_count
+              - net_revenue_nano_cents
+              - balance_byte_count
             properties:
               balance_id:
                 description: udid
@@ -7336,6 +7565,10 @@ components:
 
     Subscription:
       type: object
+      required:
+        - subscription_id
+        - store
+        - plan
       properties:
         subscription_id:
           description: udid
@@ -7353,6 +7586,13 @@ components:
         `regional` ($4/year, $0.50/month) everywhere else. Prices are USD;
         the store or Stripe shows the local-currency figure. The 14-day
         trial and the welcome offer apply on every tier.
+      required:
+        - name
+        - yearly_usd
+        - monthly_usd
+        - currency
+        - source
+        - estimate
       properties:
         name:
           type: string
@@ -7393,6 +7633,16 @@ components:
         payment sheet); Solana quotes the offer price for plan
         `yearly_onboarding`. Every purchase path stamps `redeemed_at` and
         `store` on the first redemption.
+      required:
+        - issued_at
+        - expires_at
+        - percent_off
+        - months_free
+        - first_year_usd
+        - regular_year_usd
+        - tier
+        - currency
+        - state
       properties:
         issued_at:
           type: string
@@ -7439,6 +7689,9 @@ components:
     ExperimentAssignment:
       type: object
       description: The caller's variant on one experiment surface.
+      required:
+        - experiment_id
+        - variant
       properties:
         experiment_id:
           type: string
@@ -7448,6 +7701,7 @@ components:
 
     OnboardingOfferIssueArgs:
       type: object
+      required: []
       properties:
         surface:
           description: |
@@ -7513,6 +7767,8 @@ components:
 
     OnboardingOfferIssueResult:
       type: object
+      required:
+        - created
       properties:
         offer:
           description: The offer. The key is ABSENT (not null) when refused.
@@ -7526,6 +7782,8 @@ components:
 
     ErrorMessage:
       type: object
+      required:
+        - message
       properties:
         message:
           type: string
@@ -7619,6 +7877,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: An onboarding step was shown, completed or skipped.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7640,6 +7901,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: An onboarding step was shown, completed or skipped.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7661,6 +7925,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: An onboarding step was shown, completed or skipped.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7682,6 +7949,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: The welcome offer was shown on a surface.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7711,6 +7981,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: A plan card on the offer screen was tapped.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7728,6 +8001,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: The offer screen's primary button was tapped.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7747,6 +8023,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: The offer screen was left without a purchase.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7766,6 +8045,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: A purchase started, completed or was cancelled.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7795,6 +8077,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: A purchase started, completed or was cancelled.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7824,6 +8109,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: A purchase started, completed or was cancelled.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7853,6 +8141,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: A purchase failed.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7882,6 +8173,8 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: The network's first successful connection (once per network; resends are deduplicated).
+          required:
+            - name
           properties:
             name:
               type: string
@@ -7889,6 +8182,7 @@ components:
             props:
               type: object
               additionalProperties: false
+              required: []
               properties: {}
 
     ClientEventWidgetAdded:
@@ -7896,6 +8190,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: A widget, tile or control was added.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7913,6 +8210,8 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: In-app feedback was submitted.
+          required:
+            - name
           properties:
             name:
               type: string
@@ -7920,6 +8219,7 @@ components:
             props:
               type: object
               additionalProperties: false
+              required: []
               properties:
                 rating:
                   type: integer
@@ -7939,6 +8239,9 @@ components:
         - $ref: "#/components/schemas/ClientEventBase"
         - type: object
           description: The sign-up form's product-updates line was changed.
+          required:
+            - name
+            - props
           properties:
             name:
               type: string
@@ -7953,6 +8256,7 @@ components:
 
     ClientEventsSendArgs:
       type: object
+      required: []
       properties:
         events:
           type: array
@@ -7962,6 +8266,8 @@ components:
 
     ClientEventsSendResult:
       type: object
+      required:
+        - accepted
       properties:
         accepted:
           type: integer
@@ -7971,6 +8277,9 @@ components:
           description: schema refusals by batch index; final, do not resend
           items:
             type: object
+            required:
+              - index
+              - message
             properties:
               index:
                 type: integer
@@ -7979,12 +8288,16 @@ components:
 
     OnboardingClickArgs:
       type: object
+      required:
+        - token
       properties:
         token:
           type: string
 
     OnboardingClickResult:
       type: object
+      required:
+        - ok
       properties:
         ok:
           type: boolean
@@ -8007,6 +8320,8 @@ components:
 
     OnboardingFeedbackTokenResult:
       type: object
+      required:
+        - ok
       properties:
         ok:
           type: boolean
@@ -8039,6 +8354,11 @@ components:
 
     StripePaymentSheetResult:
       type: object
+      required:
+        - amount_first_period_usd
+        - regular_period_usd
+        - trial_days
+        - offer_applied
       properties:
         customer_id:
           type: string
@@ -8084,6 +8404,15 @@ components:
 
     StripePricesResult:
       type: object
+      required:
+        - tier
+        - currency
+        - yearly_price_id
+        - monthly_price_id
+        - yearly_usd
+        - monthly_usd
+        - publishable_key
+        - offer_eligible
       properties:
         tier:
           type: string
@@ -8116,6 +8445,33 @@ components:
         not events; the fixed-window outcomes are measured from each
         network's cohort time (see GET /admin/onboarding/results for every
         column's definition).
+      required:
+        - cohort_day
+        - experiment
+        - variant
+        - surface
+        - platform
+        - tier
+        - path
+        - exposures
+        - sent
+        - delivered
+        - opened
+        - clicked
+        - landing_clicked
+        - app_open_48h
+        - connect_7d
+        - widget_7d
+        - feedback_7d
+        - pro_start_14d
+        - trial_to_paid_35d
+        - refund_60d
+        - retention_d7
+        - retention_d30
+        - unsubscribe
+        - complaint
+        - matured_days
+        - computed_at
       properties:
         cohort_day:
           type: string
@@ -8178,6 +8534,10 @@ components:
 
     OnboardingResultsPage:
       type: object
+      required:
+        - rows
+        - next_cursor
+        - min_exposures
       properties:
         rows:
           type: array
@@ -8193,6 +8553,14 @@ components:
     OnboardingExperiment:
       type: object
       description: One registry entry (config/main/onboarding.yml onboarding.experiments).
+      required:
+        - id
+        - surface
+        - status
+        - allocation
+        - variants
+        - active
+        - variant_states
       properties:
         id:
           type: string
@@ -8209,12 +8577,12 @@ components:
           type: string
           format: date
         allocation:
-          type: object
+          type: [object, "null"]
           description: percent per variant name, by hash(network_id, id)
           additionalProperties:
             type: number
         variants:
-          type: object
+          type: [object, "null"]
           description: per variant, the Brevo template name or the store copy key set and layout id
           additionalProperties:
             type: object
@@ -8241,6 +8609,12 @@ components:
 
     OnboardingExperimentVariantState:
       type: object
+      required:
+        - experiment_id
+        - variant
+        - status
+        - reason
+        - updated_at
       properties:
         experiment_id:
           type: string
@@ -8258,6 +8632,9 @@ components:
 
     OnboardingExperimentsResult:
       type: object
+      required:
+        - experiments
+        - results
       properties:
         experiments:
           type: array
@@ -8266,6 +8643,10 @@ components:
         results:
           type: object
           description: The results configuration the rollup and the results endpoint apply.
+          required:
+            - min_exposures
+            - rollup_days
+            - guardrail_days
           properties:
             min_exposures:
               type: integer
@@ -8328,10 +8709,12 @@ components:
 
     BrevoWebhookResult:
       type: object
+      required: []
       properties: {}
 
     StatsProvidersArgs:
       type: object
+      required: []
       properties:
         last_n:
           description: n hours
@@ -8339,6 +8722,9 @@ components:
 
     StatsProvidersResult:
       type: object
+      required:
+        - created_time
+        - providers
       properties:
         created_time:
           description: datetime
@@ -8347,6 +8733,16 @@ components:
           type: array
           items:
             type: object
+            required:
+              - client_id
+              - connected
+              - connected_events_last_24h
+              - uptime_last_24h
+              - transfer_data_last_24h
+              - payout_last_24h
+              - search_interest_last_24h
+              - contracts_last_24h
+              - clients_last_24h
             properties:
               client_id:
                 description: udid
@@ -8357,6 +8753,9 @@ components:
                 type: array
                 items:
                   type: object
+                  required:
+                    - event_time
+                    - connected
                   properties:
                     event_time:
                       description: datetime
@@ -8385,6 +8784,8 @@ components:
 
     StatsProviderArgs:
       type: object
+      required:
+        - client_id
       properties:
         client_id:
           description: udid
@@ -8400,6 +8801,16 @@ components:
 
     StatsProviderResult:
       type: object
+      required:
+        - lookback
+        - created_time
+        - uptime
+        - transfer_data
+        - payout
+        - search_interest
+        - contracts
+        - clients
+        - client_details
       properties:
         lookback:
           type: integer
@@ -8446,6 +8857,9 @@ components:
           type: array
           items:
             type: object
+            required:
+              - client_id
+              - transfer_data
             properties:
               client_id:
                 description: udid
@@ -8459,6 +8873,7 @@ components:
 
     StatsProvidersOverviewArgs:
       type: object
+      required: []
       properties:
         last_n:
           description: n hours
@@ -8471,6 +8886,15 @@ components:
 
     StatsProvidersOverviewResult:
       type: object
+      required:
+        - lookback
+        - created_time
+        - uptime
+        - transfer_data
+        - payout
+        - search_interest
+        - contracts
+        - clients
       properties:
         lookback:
           type: integer
@@ -8516,15 +8940,22 @@ components:
 
     SubscriptionCheckBalanceCodeArgs:
       type: object
+      required:
+        - secret
       properties:
         secret:
           type: string
 
     SubscriptionCheckBalanceCodeResult:
       type: object
+      required: []
       properties:
         balance:
           type: object
+          required:
+            - start_time
+            - end_time
+            - balance_byte_count
           properties:
             start_time:
               type: string
@@ -8534,21 +8965,31 @@ components:
               type: integer
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     SubscriptionRedeemBalanceCodeArgs:
       type: object
+      required:
+        - secret
       properties:
         secret:
           type: string
 
     SubscriptionRedeemBalanceCodeResult:
       type: object
+      required: []
       properties:
         transfer_balance:
           type: object
+          required:
+            - transfer_balance_id
+            - start_time
+            - end_time
+            - balance_byte_count
           properties:
             transfer_balance_id:
               description: udid
@@ -8561,28 +9002,37 @@ components:
               type: integer
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     SubscriptionCreatePaymentIdArgs:
       type: object
+      required: []
       properties: {}
 
     SubscriptionCreatePaymentIdResult:
       type: object
+      required:
+        - subscription_payment_id
       properties:
         subscription_payment_id:
           description: udid
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     DeviceAddArgs:
       type: object
+      required:
+        - code
       properties:
         code:
           description: share code or adopt code
@@ -8590,6 +9040,8 @@ components:
 
     DeviceAddResult:
       type: object
+      required:
+        - client_id
       properties:
         code_type:
           type: string
@@ -8611,12 +9063,16 @@ components:
           type: number
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     DeviceCreateShareCodeArgs:
       type: object
+      required:
+        - client_id
       properties:
         client_id:
           description: udid
@@ -8627,23 +9083,29 @@ components:
 
     DeviceCreateShareCodeResult:
       type: object
+      required: []
       properties:
         share_code:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     DeviceShareStatusArgs:
       type: object
+      required:
+        - share_code
       properties:
         share_code:
           type: string
 
     DeviceShareStatusResult:
       type: object
+      required: []
       properties:
         pending:
           type: boolean
@@ -8651,12 +9113,16 @@ components:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     DeviceConfirmShareArgs:
       type: object
+      required:
+        - share_code
       properties:
         share_code:
           type: string
@@ -8665,17 +9131,21 @@ components:
 
     DeviceConfirmShareResult:
       type: object
+      required: []
       properties:
         associated_network_name:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     DeviceCreateAdoptCodeArgs:
       type: object
+      required: []
       properties:
         device_name:
           description: Name of the device that will be shared to the adopter
@@ -8685,6 +9155,7 @@ components:
 
     DeviceCreateAdoptCodeResult:
       type: object
+      required: []
       properties:
         adopt_code:
           type: string
@@ -8695,18 +9166,23 @@ components:
           type: number
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     DeviceAdoptStatusArgs:
       type: object
+      required:
+        - adopt_code
       properties:
         adopt_code:
           type: string
 
     DeviceAdoptStatusResult:
       type: object
+      required: []
       properties:
         pending:
           type: boolean
@@ -8714,12 +9190,17 @@ components:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     DeviceConfirmAdoptArgs:
       type: object
+      required:
+        - adopt_code
+        - adopt_secret
       properties:
         adopt_code:
           type: string
@@ -8730,18 +9211,24 @@ components:
 
     DeviceConfirmAdoptResult:
       type: object
+      required: []
       properties:
         by_client_jwt:
           description: client auth
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     DeviceRemoveAdoptCodeArgs:
       type: object
+      required:
+        - adopt_code
+        - adopt_secret
       properties:
         adopt_code:
           type: string
@@ -8750,9 +9237,12 @@ components:
 
     DeviceRemoveAdoptCodeResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -8764,6 +9254,7 @@ components:
         applies: a field a list does not set is omitted from that list's rows
         rather than sent empty.
       type: object
+      required: []
       properties:
         pending:
           description: |
@@ -8799,6 +9290,10 @@ components:
 
     DeviceAssociationsResult:
       type: object
+      required:
+        - pending_adoption_devices
+        - incoming_shared_devices
+        - outgoing_shared_devices
       properties:
         pending_adoption_devices:
           description: devices pending adoption that need to be confirmed by the offerer
@@ -8818,21 +9313,28 @@ components:
 
     DeviceRemoveAssociationArgs:
       type: object
+      required:
+        - code
       properties:
         code:
           type: string
 
     DeviceRemoveAssociationResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     DeviceSetAssociationNameArgs:
       type: object
+      required:
+        - code
       properties:
         code:
           type: string
@@ -8842,15 +9344,20 @@ components:
 
     DeviceSetAssociationNameResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     DeviceSetNameArgs:
       type: object
+      required:
+        - device_id
       properties:
         device_id:
           description: udid
@@ -8860,15 +9367,19 @@ components:
 
     DeviceSetNameResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     ConnectControlArgs:
       type: object
+      required: []
       properties:
         pack:
           description: |
@@ -8878,6 +9389,9 @@ components:
 
     ConnectControlResult:
       type: object
+      required:
+        - pack
+        - error
       properties:
         # unlike every other error field in this document, this one has no
         # omitempty on the server, so a successful response still carries
@@ -8888,13 +9402,16 @@ components:
             As an inline message, this is what would be sent from the control id after processing the control messages.
           type: string
         error:
-          type: object
+          type: [object, "null"]
+          required:
+            - message
           properties:
             message:
               type: string
 
     HelloResult:
       type: object
+      required: []
       properties:
         client_address:
           type: string
@@ -8921,6 +9438,7 @@ components:
 
     SetPayoutWalletArgs:
       type: object
+      required: []
       properties:
         wallet_id:
           description: udid
@@ -8928,17 +9446,23 @@ components:
 
     SetPayoutWalletResult:
       type: object
+      required: []
       properties: {}
 
     GetPayoutWalletResult:
       type: object
+      required:
+        - wallet_id
       properties:
         wallet_id:
           description: udid
-          type: string
+          type: [string, "null"]
 
     CreateAccountWalletExternalArgs:
       type: object
+      required:
+        - blockchain
+        - wallet_address
       properties:
         network_id:
           description: |
@@ -8967,6 +9491,8 @@ components:
 
     CreateAccountWalletResult:
       type: object
+      required:
+        - wallet_id
       properties:
         wallet_id:
           description: udid
@@ -8974,6 +9500,16 @@ components:
 
     AccountWallet:
       type: object
+      required:
+        - wallet_id
+        - network_id
+        - wallet_type
+        - blockchain
+        - wallet_address
+        - active
+        - default_token_type
+        - create_time
+        - has_seeker_token
       properties:
         wallet_id:
           description: udid
@@ -9016,6 +9552,8 @@ components:
 
     GetAccountWalletsResult:
       type: object
+      required:
+        - wallets
       properties:
         wallets:
           description: A list of wallets associated with your network
@@ -9025,6 +9563,8 @@ components:
 
     RemoveWalletArgs:
       type: object
+      required:
+        - wallet_id
       properties:
         wallet_id:
           description: udid
@@ -9032,18 +9572,30 @@ components:
 
     RemoveWalletResult:
       type: object
+      required:
+        - success
       properties:
         success:
           description: Wallet successfully removed
           type: boolean
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     NetworkReferralResult:
       type: object
+      required:
+        - referral_code
+        - total_referrals
+        - max_referrals
+        - bonus_per_referral_bytes
+        - referred_bonus_bytes
+        - bonus_period_seconds
+        - has_referral_network
       properties:
         referral_code:
           description: udid
@@ -9070,6 +9622,9 @@ components:
 
     TransferStatsResult:
       type: object
+      required:
+        - paid_bytes_provided
+        - unpaid_bytes_provided
       properties:
         paid_bytes_provided:
           type: integer
@@ -9078,6 +9633,7 @@ components:
 
     AddAuthArgs:
       type: object
+      required: []
       properties:
         user_auth:
           description: email or phone number
@@ -9095,14 +9651,18 @@ components:
           $ref: "#/components/schemas/WalletAuthArgs"
     AddAuthResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
     RemoveAuthArgs:
       type: object
+      required: []
       properties:
         auth_type:
           description: The sign-in method to remove; the last remaining method cannot be removed
@@ -9117,34 +9677,46 @@ components:
             - seedphrase
     RemoveAuthResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
     GenerateSeedphraseResult:
       type: object
+      required:
+        - seedphrase
       properties:
         seedphrase:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
     RegenerateSeedphraseResult:
       type: object
+      required:
+        - seedphrase
       properties:
         seedphrase:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
     ChangeNetworkNameArgs:
       type: object
+      required: []
       properties:
         network_name:
           type: string
@@ -9152,16 +9724,21 @@ components:
           type: string
     ChangeNetworkNameResult:
       type: object
+      required:
+        - network_name
       properties:
         network_name:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
     AuthWalletChallengeArgs:
       type: object
+      required: []
       properties:
         blockchain:
           description: solana (default) or tao/bittensor; case-insensitive
@@ -9175,6 +9752,11 @@ components:
           type: string
     AuthWalletChallengeResult:
       type: object
+      required:
+        - challenge
+        - timestamp
+        - expires_in
+        - message_template
       properties:
         challenge:
           description: 32 random bytes, base64url; embedded in message_template
@@ -9190,11 +9772,14 @@ components:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
     WalletAuthArgs:
       type: object
+      required: []
       properties:
         wallet_address:
           description: Solana base58 public key, or Bittensor ss58 address (prefix 42, checksum verified)
@@ -9222,6 +9807,12 @@ components:
 
     AccountPoint:
       type: object
+      required:
+        - account_point_id
+        - network_id
+        - event
+        - point_value
+        - create_time
       properties:
         account_point_id:
           description: uuid
@@ -9258,6 +9849,8 @@ components:
 
     AccountPointsResult:
       type: object
+      required:
+        - network_points
       properties:
         network_points:
           type: array
@@ -9266,10 +9859,17 @@ components:
 
     GetLeaderboardArgs:
       type: object
+      required: []
       properties: {}
 
     LeaderboardEarner:
       type: object
+      required:
+        - network_id
+        - network_name
+        - net_mib_count
+        - is_public
+        - contains_profanity
       properties:
         network_id:
           description: uuid
@@ -9288,6 +9888,10 @@ components:
 
     LeaderboardResult:
       type: object
+      required:
+        - earners
+        - rank
+        - total
       properties:
         earners:
           type: array
@@ -9301,12 +9905,22 @@ components:
           type: integer
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     NetworkRanking:
       type: object
+      required:
+        - net_mib_count
+        - leaderboard_rank
+        - leaderboard_public
+        - points_leaderboard_public
+        - rank_points
+        - rank_blocks
+        - rank_streak
       properties:
         net_mib_count:
           type: number
@@ -9337,17 +9951,22 @@ components:
 
     NetworkRankingResult:
       type: object
+      required:
+        - network_ranking
       properties:
         network_ranking:
           $ref: "#/components/schemas/NetworkRanking"
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     SetNetworkRankingVisibilityArgs:
       type: object
+      required: []
       properties:
         is_public:
           description: User can set whether their network is visible on the leaderboard
@@ -9355,9 +9974,12 @@ components:
 
     SetNetworkRankingVisibilityResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -9373,11 +9995,15 @@ components:
 
     SetNetworkPointsRankingVisibilityResult:
       type: object
+      required:
+        - points_leaderboard_public
       properties:
         points_leaderboard_public:
           type: boolean
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -9394,12 +10020,16 @@ components:
 
     SetNetworkEmojiTagResult:
       type: object
+      required:
+        - emoji_tag
       properties:
         emoji_tag:
           description: The stored (NFC-normalized) tag, empty when cleared
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -9407,6 +10037,7 @@ components:
 
     PointsLeaderboardArgs:
       type: object
+      required: []
       properties:
         sort:
           description: The dimension to page by
@@ -9438,6 +10069,17 @@ components:
 
     PointsLeaderboardRow:
       type: object
+      required:
+        - network_id
+        - anonymous
+        - total_points
+        - blocks_with_points
+        - streak
+        - longest_streak
+        - rank_points
+        - rank_blocks
+        - rank_streak
+        - position
       properties:
         network_id:
           type: string
@@ -9489,6 +10131,9 @@ components:
       allOf:
         - $ref: "#/components/schemas/PointsLeaderboardRow"
         - type: object
+          required:
+            - points_leaderboard_public
+            - ranked
           properties:
             points_leaderboard_public:
               type: boolean
@@ -9498,6 +10143,11 @@ components:
 
     PointsLeaderboardResult:
       type: object
+      required:
+        - rows
+        - total_ranked
+        - latest_epoch
+        - epoch_metrics_available
       properties:
         rows:
           type: array
@@ -9536,12 +10186,17 @@ components:
           $ref: "#/components/schemas/PointsLeaderboardMe"
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     ReferralNetwork:
       type: object
+      required:
+        - id
+        - name
       properties:
         id:
           description: uuid
@@ -9551,26 +10206,34 @@ components:
 
     ReferralNetworkResult:
       type: object
+      required: []
       properties:
         network:
           $ref: "#/components/schemas/ReferralNetwork"
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     SetNetworkReferralArgs:
       type: object
+      required:
+        - referral_code
       properties:
         referral_code:
           type: string
 
     SetNetworkReferralResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -9580,12 +10243,35 @@ components:
 
     GetNetworkAccountPaymentsError:
       type: object
+      required:
+        - message
       properties:
         message:
           type: string
 
     AccountPayment:
       type: object
+      required:
+        - payment_id
+        - payment_plan_id
+        - wallet_id
+        - network_id
+        - payout_byte_count
+        - payout_nano_cents
+        - subsidy_payout_nano_cents
+        - reliability_subsidy_nano_cents
+        - min_sweep_time
+        - create_time
+        - payment_record
+        - token_type
+        - token_amount
+        - payment_time
+        - payment_receipt
+        - wallet_address
+        - completed
+        - complete_time
+        - canceled
+        - cancel_time
       properties:
         payment_id:
           type: string
@@ -9643,6 +10329,7 @@ components:
 
     GetNetworkAccountPaymentsResult:
       type: object
+      required: []
       properties:
         account_payments:
           type: array
@@ -9653,6 +10340,7 @@ components:
 
     NetworkBlockLocationArgs:
       type: object
+      required: []
       properties:
         location_id:
           description: uuid
@@ -9660,15 +10348,19 @@ components:
 
     NetworkBlockLocationResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     NetworkUnblockLocationArgs:
       type: object
+      required: []
       properties:
         location_id:
           description: uuid
@@ -9676,15 +10368,23 @@ components:
 
     NetworkUnblockLocationResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     BlockedLocation:
       type: object
+      required:
+        - location_id
+        - location_name
+        - location_type
+        - country_code
       properties:
         location_id:
           description: uuid
@@ -9698,19 +10398,36 @@ components:
 
     GetNetworkBlockedLocationsResult:
       type: object
+      required:
+        - blocked_locations
       properties:
         blocked_locations:
-          type: array
+          type: [array, "null"]
           items:
             $ref: "#/components/schemas/BlockedLocation"
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     ReliabilityWindow:
       type: object
+      required:
+        - mean_reliability_weight
+        - min_time_unix_milli
+        - min_bucket_number
+        - max_time_unix_milli
+        - max_bucket_number
+        - bucket_duration_seconds
+        - max_client_count
+        - max_total_client_count
+        - reliability_weights
+        - client_counts
+        - total_client_counts
+        - country_multipliers
       properties:
         mean_reliability_weight:
           type: number
@@ -9749,12 +10466,17 @@ components:
           items:
             type: integer
         country_multipliers:
-          type: array
+          type: [array, "null"]
           items:
             $ref: "#/components/schemas/CountryMultiplier"
 
     CountryMultiplier:
       type: object
+      required:
+        - country_location_id
+        - country
+        - country_code
+        - reliability_multiplier
       properties:
         country_location_id:
           type: string
@@ -9769,17 +10491,22 @@ components:
 
     GetNetworkReliabilityResult:
       type: object
+      required: []
       properties:
         reliability_window:
           $ref: "#/components/schemas/ReliabilityWindow"
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     SolanaPaymentIntentArgs:
       type: object
+      required:
+        - plan
       properties:
         reference:
           description: A unique reference string to identify the payment intent added to the Solana transaction
@@ -9801,6 +10528,7 @@ components:
 
     SolanaPaymentIntentResult:
       type: object
+      required: []
       properties:
         amount_usd:
           type: number
@@ -9823,12 +10551,16 @@ components:
 
     ValidateReferralCodeArgs:
       type: object
+      required: []
       properties:
         referral_code:
           type: string
 
     ValidateReferralCodeResult:
       type: object
+      required:
+        - is_valid
+        - is_capped
       properties:
         is_valid:
           type: boolean
@@ -9836,12 +10568,20 @@ components:
           type: boolean
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     NetworkRedeemedBalanceCode:
       type: object
+      required:
+        - balance_code_id
+        - balance_byte_count
+        - redeem_time
+        - end_time
+        - secret
       properties:
         balance_code_id:
           description: uuid
@@ -9859,15 +10599,19 @@ components:
 
     NetworkBalanceCodesError:
       type: object
+      required:
+        - message
       properties:
         message:
           type: string
 
     NetworkBalanceCodesResult:
       type: object
+      required:
+        - balance_codes
       properties:
         balance_codes:
-          type: array
+          type: [array, "null"]
           items:
             $ref: "#/components/schemas/NetworkRedeemedBalanceCode"
         error:
@@ -9875,12 +10619,15 @@ components:
 
     CreateApiKeyArgs:
       type: object
+      required: []
       properties:
         name:
           type: string
 
     CreateApiKeyResult:
       type: object
+      required:
+        - id
       properties:
         id:
           description: uuid
@@ -9891,12 +10638,18 @@ components:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     PublicAccountApiKey:
       type: object
+      required:
+        - id
+        - name
+        - create_time
       properties:
         id:
           description: uuid
@@ -9909,19 +10662,24 @@ components:
 
     GetApiKeysResult:
       type: object
+      required:
+        - api_keys
       properties:
         api_keys:
-          type: array
+          type: [array, "null"]
           items:
             $ref: "#/components/schemas/PublicAccountApiKey"
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     DeleteApiKeyArgs:
       type: object
+      required: []
       properties:
         id:
           description: uuid
@@ -9929,9 +10687,12 @@ components:
 
     DeleteApiKeyResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -9998,6 +10759,14 @@ components:
       description: |
         Non-final /verify response - the server's signed commitment to the
         next hop. The next EXTEND submits trail + next_hop.
+      required:
+        - trail_id
+        - server_nonce
+        - trail
+        - next_hop
+        - M
+        - server_key_id
+        - assign_sig
       properties:
         trail_id:
           description: uuid
@@ -10027,6 +10796,9 @@ components:
     VerifyFinalResult:
       type: object
       description: Final /verify response at depth M.
+      required:
+        - status
+        - proof
       properties:
         status:
           description: '"complete"'
@@ -10036,6 +10808,11 @@ components:
 
     VerifyProofHeader:
       type: object
+      required:
+        - trail_id
+        - server_nonce
+        - vpk
+        - M
       properties:
         trail_id:
           description: uuid
@@ -10052,6 +10829,10 @@ components:
 
     VerifyProofHop:
       type: object
+      required:
+        - client_id
+        - time_ms
+        - egress_ip_hash
       properties:
         client_id:
           description: uuid. The canonical provider at this hop.
@@ -10075,6 +10856,13 @@ components:
         under the /verify/keys key for server_key_id (msg_type 0x04);
         verifier_sig is the validator's depth-M EXTEND signature
         (msg_type 0x02).
+      required:
+        - header
+        - hops
+        - server_key_id
+        - coverage
+        - final_sig
+        - verifier_sig
       properties:
         header:
           $ref: "#/components/schemas/VerifyProofHeader"
@@ -10099,6 +10887,9 @@ components:
 
     VerifyServerKey:
       type: object
+      required:
+        - server_key_id
+        - public_key
       properties:
         server_key_id:
           description: 1-byte key rotation id.
@@ -10109,6 +10900,8 @@ components:
 
     VerifyKeysResult:
       type: object
+      required:
+        - keys
       properties:
         keys:
           type: array
@@ -10135,15 +10928,21 @@ components:
 
     SnSetWalletResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     SnWallet:
       type: object
+      required:
+        - coldkey_ss58
+        - set_at_millis
       properties:
         coldkey_ss58:
           type: string
@@ -10156,6 +10955,8 @@ components:
 
     SnGetWalletResult:
       type: object
+      required:
+        - wallets
       properties:
         wallet:
           $ref: "#/components/schemas/SnWallet"
@@ -10165,6 +10966,8 @@ components:
             $ref: "#/components/schemas/SnWallet"
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -10180,6 +10983,10 @@ components:
 
     SnValidateWalletResult:
       type: object
+      required:
+        - valid_syntax
+        - exists_on_chain
+        - banned
       properties:
         valid_syntax:
           description: The address decodes as ss58 with the Bittensor prefix.
@@ -10195,6 +11002,12 @@ components:
 
     AccountEpoch:
       type: object
+      required:
+        - epoch
+        - start_millis
+        - end_millis
+        - points
+        - share_bps
       properties:
         epoch:
           type: integer
@@ -10214,6 +11027,8 @@ components:
 
     AccountEpochsResult:
       type: object
+      required:
+        - epochs
       properties:
         epochs:
           type: array
@@ -10221,12 +11036,26 @@ components:
             $ref: "#/components/schemas/AccountEpoch"
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     SnHeadResult:
       type: object
+      required:
+        - eligible
+        - score
+        - floor
+        - rank_estimate
+        - cutoff
+        - bound
+        - uid
+        - rank
+        - epoch
+        - netuid
+        - source
       properties:
         eligible:
           description: The estimate places the network inside the cutoff.
@@ -10267,6 +11096,8 @@ components:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -10277,6 +11108,14 @@ components:
         protocol.FleetBinding on the wire: 32-byte values as 0x-hex, the
         hotkey as ss58 or 0x-hex, the client id as its uuid. The digest is
         keccak256(domain "urnetwork/fleet-binding/v1" + fields).
+      required:
+        - chain_id
+        - coordinator
+        - fleet_id
+        - hotkey
+        - client_id
+        - client_key
+        - commitment_hash
       properties:
         chain_id:
           type: integer
@@ -10326,6 +11165,14 @@ components:
 
     SnHeadBindingResult:
       type: object
+      required:
+        - digest
+        - client_signature_valid
+        - hotkey_signature_valid
+        - ready
+        - to
+        - contract_address
+        - chain_id
       properties:
         digest:
           description: 0x-hex keccak256 binding digest.
@@ -10352,34 +11199,46 @@ components:
           type: integer
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     SnPoolClaimResult:
       type: object
+      required:
+        - epoch
+        - no_id
+        - coldkey
+        - share_bps
+        - proof
+        - payout_root
+        - contract_address
+        - chain_id
+        - claim_open_block
       properties:
         epoch:
           description: Epoch index.
           type: integer
         no_id:
           description: base64 encoded 32-byte network operator id, as committed on chain.
-          type: string
+          type: [string, "null"]
         coldkey:
           description: base64 encoded 32-byte coldkey public key (the ss58-decoded key set via /sn/wallet).
-          type: string
+          type: [string, "null"]
         share_bps:
           description: The caller's payout share in basis points.
           type: integer
         proof:
           description: Merkle proof from the (no_id, coldkey, share_bps) leaf to payout_root.
-          type: array
+          type: [array, "null"]
           items:
             description: base64 encoded 32-byte node hash.
             type: string
         payout_root:
           description: base64 encoded 32-byte committed payout merkle root.
-          type: string
+          type: [string, "null"]
         contract_address:
           description: 0x-hex EVM address of the subnet contract.
           type: string
@@ -10404,12 +11263,23 @@ components:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     SnEpochResult:
       type: object
+      required:
+        - epoch
+        - start_block
+        - commit_deadline_block
+        - trails_deadline_block
+        - finalize_block
+        - t_epoch_blocks
+        - chain_id
+        - contract_address
       properties:
         epoch:
           description: Epoch index.
@@ -10445,18 +11315,23 @@ components:
 
     RefreshTokenResult:
       type: object
+      required: []
       properties:
         by_jwt:
           description: The refreshed client JWT.
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     GetClientKeyResult:
       type: object
+      required:
+        - public_key
       properties:
         public_key:
           description: |
@@ -10466,6 +11341,8 @@ components:
 
     GetClientKeyHistoryResult:
       type: object
+      required:
+        - history
       properties:
         history:
           description: |
@@ -10478,9 +11355,14 @@ components:
 
     MyIPInfoResult:
       type: object
+      required:
+        - info
+        - connected_to_network
       properties:
         info:
           type: object
+          required:
+            - ip
           properties:
             ip:
               type: string
@@ -10489,9 +11371,13 @@ components:
                 `city` and `region` are left out when the IP is not located
                 that precisely, e.g. only to its country.
               type: object
+              required: []
               properties:
                 coordinates:
                   type: object
+                  required:
+                    - lat
+                    - lon
                   properties:
                     lat:
                       type: number
@@ -10504,6 +11390,7 @@ components:
                   type: string
                 country:
                   type: object
+                  required: []
                   properties:
                     code:
                       description: ISO 3166-1 alpha-2, lowercase.
@@ -10512,6 +11399,7 @@ components:
                       type: string
                 continent:
                   type: object
+                  required: []
                   properties:
                     code:
                       description: Two-letter continent code, lowercase.
@@ -10526,9 +11414,16 @@ components:
 
     GetNetworkUserResult:
       type: object
+      required: []
       properties:
         network_user:
           type: object
+          required:
+            - user_id
+            - verified
+            - auth_type
+            - network_name
+            - auth_types
           properties:
             user_id:
               description: udid
@@ -10548,6 +11443,8 @@ components:
               type: array
               items:
                 type: object
+                required:
+                  - auth_type
                 properties:
                   user_auth:
                     type: string
@@ -10557,6 +11454,9 @@ components:
               type: array
               items:
                 type: object
+                required:
+                  - auth_type
+                  - auth_jwt
                 properties:
                   user_id:
                     description: udid
@@ -10571,6 +11471,8 @@ components:
               type: array
               items:
                 type: object
+                required:
+                  - blockchain
                 properties:
                   user_id:
                     description: udid
@@ -10586,6 +11488,8 @@ components:
               type: array
               items:
                 type: object
+                required:
+                  - create_time
                 properties:
                   create_time:
                     type: string
@@ -10593,32 +11497,42 @@ components:
               description: |
                 Every configured sign-in method's type, including
                 `seedphrase`. The singular `auth_type` is the session's own.
-              type: array
+              type: [array, "null"]
               items:
                 type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     UpdateNetworkNameArgs:
       type: object
+      required: []
       properties:
         network_name:
           type: string
 
     UpdateNetworkNameResult:
       type: object
+      required: []
       properties:
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     VerifySeekerNftHolderArgs:
       type: object
+      required:
+        - wallet_address
+        - wallet_signature
+        - wallet_message
       properties:
         wallet_address:
           description: The wallet public key
@@ -10631,17 +11545,22 @@ components:
 
     VerifySeekerNftHolderResult:
       type: object
+      required:
+        - success
       properties:
         success:
           type: boolean
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     UploadLogFileResult:
       type: object
+      required: []
       properties:
         error:
           description: |
@@ -10649,12 +11568,17 @@ components:
             rate limit (one upload per network per period) or over the size
             limit.
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     StripePaymentIntent:
       type: object
+      required:
+        - subscription_type
+        - client_secret
       properties:
         subscription_type:
           type: string
@@ -10663,10 +11587,12 @@ components:
 
     StripeCreatePaymentIntentArgs:
       type: object
+      required: []
       properties: {}
 
     StripeCreatePaymentIntentResult:
       type: object
+      required: []
       properties:
         payment_intents:
           type: array
@@ -10680,6 +11606,8 @@ components:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -10705,6 +11633,7 @@ components:
           description: where the code (or the applied note) is sent; Stripe collects it at checkout when omitted
     PayDataCheckoutResult:
       type: object
+      required: []
       properties:
         url:
           type: string
@@ -10718,6 +11647,8 @@ components:
           description: the resolved network when network_name was given
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -10758,6 +11689,7 @@ components:
             key); it doubles as the transfer memo for a payment sent by hand
     PayDataSolanaIntentResult:
       type: object
+      required: []
       properties:
         amount_usd:
           type: number
@@ -10778,6 +11710,8 @@ components:
           format: uuid
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -10808,6 +11742,8 @@ components:
           format: date-time
     StripeCreateCheckoutSessionArgs:
       type: object
+      required:
+        - item_id
       properties:
         item_id:
           type: string
@@ -10837,6 +11773,7 @@ components:
 
     StripeCreateCheckoutSessionResult:
       type: object
+      required: []
       properties:
         ui_mode:
           type: string
@@ -10855,18 +11792,34 @@ components:
           description: both modes; the caller can reconcile the purchase with this
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     SubscriptionDetailsResult:
       type: object
+      required:
+        - subscriptions
+        - has_stripe_customer
+        - update_time
       properties:
         subscriptions:
           type: array
           description: One entry per store billing the network, ordered by store.
           items:
             type: object
+            required:
+              - store
+              - plan
+              - cadence
+              - start_time
+              - end_time
+              - auto_renew
+              - cancel_at_period_end
+              - can_cancel
+              - manage_url
             properties:
               store:
                 type: string
@@ -10907,6 +11860,7 @@ components:
 
     SubscriptionCancelArgs:
       type: object
+      required: []
       properties:
         store:
           type: string
@@ -10914,6 +11868,7 @@ components:
 
     SubscriptionCancelResult:
       type: object
+      required: []
       properties:
         store:
           type: string
@@ -10927,27 +11882,39 @@ components:
           description: For a store the server cannot act on, where the customer cancels.
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     StripeCreateCustomerPortalArgs:
       type: object
+      required: []
       properties: {}
 
     StripeCreateCustomerPortalResult:
       type: object
+      required: []
       properties:
         url:
           type: string
         error:
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
 
     WarpStatusResult:
       type: object
+      required:
+        - status
+        - client_address
+        - host
+        - service
+        - block
       properties:
         version:
           description: The process's build version; absent when it has none.
@@ -11012,6 +11979,8 @@ components:
 
     AuthWalletNonceResult:
       type: object
+      required:
+        - nonce
       properties:
         nonce:
           description: Single-use, expires in 5 minutes. Embed it in the signed message and echo it as `wallet_auth.wallet_nonce`.
@@ -11019,6 +11988,8 @@ components:
 
     RemoveNetworkClientsArgs:
       type: object
+      required:
+        - client_ids
       properties:
         client_ids:
           description: udids. Duplicates are collapsed; at most 1,000,000 per call.
@@ -11031,6 +12002,7 @@ components:
       description: |
         Empty when the removal ran synchronously. Otherwise exactly one of the
         three flags below says what happened.
+      required: []
       properties:
         scheduled:
           description: Handed off to the background task; deactivation is NOT complete yet.
@@ -11053,6 +12025,8 @@ components:
 
     ExtenderActivateArgs:
       type: object
+      required:
+        - public_key_hex
       properties:
         public_key_hex:
           description: |
@@ -11097,6 +12071,8 @@ components:
       description: |
         A refusal is a normal 200 with `activated: false` and `error`; nothing
         is stored.
+      required:
+        - activated
       properties:
         activated:
           type: boolean
@@ -11151,6 +12127,8 @@ components:
 
     ExtenderHintResult:
       type: object
+      required:
+        - continent_code
       properties:
         continent_code:
           description: |
@@ -11168,6 +12146,7 @@ components:
         client id (16 bytes), the extender public key (32), the nonce (32),
         `rtt_ms` (4 bytes big-endian) and `timestamp_ms` (8 bytes
         big-endian).
+      required: []
       properties:
         client_id:
           description: The provider's client id.
@@ -11190,6 +12169,8 @@ components:
 
     ExtenderLatencyReportArgs:
       type: object
+      required:
+        - attestations
       properties:
         attestations:
           description: At most 256.
@@ -11202,6 +12183,9 @@ components:
       description: |
         A refusal of the whole report is a normal 200 with `error`; nothing is
         stored.
+      required:
+        - accepted
+        - rejected
       properties:
         accepted:
           description: Attestations that verified and were stored.
@@ -11240,6 +12224,7 @@ components:
         `ur-extender-probe-cosign-v1` followed by the claim's signing bytes
         (domain included) and the pinger's signature, so a co-signature
         belongs to exactly one claim.
+      required: []
       properties:
         pinger_kind:
           description: Who pinged.
@@ -11306,6 +12291,7 @@ components:
 
     ExtenderPingReportArgs:
       type: object
+      required: []
       properties:
         pings:
           description: At most 256.
@@ -11318,6 +12304,9 @@ components:
       description: |
         A refusal of the whole report is a normal 200 with `error`; nothing is
         stored.
+      required:
+        - accepted
+        - rejected
       properties:
         accepted:
           description: Pings that verified and were stored, co-signed or not.
@@ -11338,6 +12327,8 @@ components:
     ProviderEgressDueProvider:
       type: object
       description: One due provider and the place it is published under.
+      required:
+        - client_id
       properties:
         client_id:
           description: udid
@@ -11351,6 +12342,8 @@ components:
 
     ProviderEgressDueResult:
       type: object
+      required:
+        - providers
       properties:
         providers:
           description: In due order.
@@ -11361,6 +12354,8 @@ components:
     ProviderEgressDestinationVerify:
       type: object
       description: A body check that proves the answer is what the destination serves.
+      required:
+        - kind
       properties:
         kind:
           type: string
@@ -11372,6 +12367,8 @@ components:
     ProviderEgressDestinationPlace:
       type: object
       description: A place a destination is known not to work from; without a region, the whole country.
+      required:
+        - country
       properties:
         country:
           description: Lowercase alpha-2.
@@ -11382,6 +12379,12 @@ components:
     ProviderEgressDestination:
       type: object
       description: One destination and its load contract, as the prober runs it.
+      required:
+        - name
+        - class
+        - url
+        - expect
+        - verify
       properties:
         name:
           type: string
@@ -11418,6 +12421,8 @@ components:
     ProviderEgressRequestProfile:
       type: object
       description: The browser navigation every request carries.
+      required:
+        - user_agent
       properties:
         user_agent:
           type: string
@@ -11428,6 +12433,11 @@ components:
 
     ProviderEgressDestinationPool:
       type: object
+      required:
+        - version
+        - generated_at
+        - destinations
+        - profile
       properties:
         version:
           description: Identifies the pool's contents.
@@ -11447,6 +12457,10 @@ components:
       description: |
         The exit address and when it was observed. The remaining fields are
         the retired vendor consensus's, accepted and ignored for one release.
+      required:
+        - client_id
+        - exit_ip
+        - observed_at
       properties:
         client_id:
           description: udid
@@ -11493,6 +12507,8 @@ components:
 
     SubmitProviderEgressLocationResult:
       type: object
+      required:
+        - location_id
       properties:
         location_id:
           description: udid
@@ -11500,6 +12516,8 @@ components:
 
     RecordProviderEgressProbeAttemptArgs:
       type: object
+      required:
+        - client_id
       properties:
         client_id:
           description: udid
@@ -11513,6 +12531,8 @@ components:
 
     RecordProviderEgressProbeAttemptResult:
       type: object
+      required:
+        - attempt_at
       properties:
         attempt_at:
           type: string
@@ -11521,6 +12541,9 @@ components:
     SubmitProviderBlackholeCheckArgs:
       type: object
       description: One provider's blackhole result, kept to the one question the check answers.
+      required:
+        - client_id
+        - checked_at
       properties:
         client_id:
           description: udid
@@ -11548,6 +12571,8 @@ components:
 
     SubmitProviderBlackholeChecksArgs:
       type: object
+      required:
+        - checks
       properties:
         checks:
           description: 1 to 10,000 results. The whole batch is validated before any of it is written.
@@ -11557,6 +12582,11 @@ components:
 
     SubmitProviderBandwidthArgs:
       type: object
+      required:
+        - client_id
+        - source
+        - bytes_per_second
+        - sample_byte_count
       properties:
         client_id:
           description: udid
@@ -11577,6 +12607,9 @@ components:
 
     ReserveProviderBandwidthArgs:
       type: object
+      required:
+        - client_id
+        - byte_count
       properties:
         client_id:
           description: udid
@@ -11587,6 +12620,9 @@ components:
 
     ReserveProviderBandwidthResult:
       type: object
+      required:
+        - reservation_id
+        - bucket_start
       properties:
         reservation_id:
           description: udid
@@ -11599,6 +12635,7 @@ components:
     ProviderEgressHealthClassResult:
       type: object
       description: One class's tally over the destinations the run sampled.
+      required: []
       properties:
         ok:
           type: integer
@@ -11610,6 +12647,8 @@ components:
       description: |
         One egress-health run. There is deliberately no measured_at: the
         server stamps arrival time. Unknown fields are rejected.
+      required:
+        - client_id
       properties:
         client_id:
           description: udid
@@ -11668,6 +12707,9 @@ components:
       description: |
         The reporting network comes from the session jwt and is never in the
         body. Unknown fields are rejected.
+      required:
+        - exit_client_id
+        - reason
       properties:
         exit_client_id:
           description: udid. The provider being reported.
@@ -11691,10 +12733,14 @@ components:
 
     SubmitProviderClientVerdictResult:
       type: object
+      required: []
       properties: {}
 
     ProberCredentialResult:
       type: object
+      required:
+        - by_client_jwt
+        - client_id
       properties:
         by_client_jwt:
           description: |
@@ -11712,6 +12758,7 @@ components:
         the leaf certificate and of its issuing intermediate, exactly as this
         server recorded them from a direct, WebPKI-validated connection. A
         match anywhere in the verified chain is accepted.
+      required: []
       properties:
         leaf:
           type: string
@@ -11732,6 +12779,7 @@ components:
 
     VerifyPlayPurchaseArgs:
       type: object
+      required: []
       properties:
         package_name:
           description: Defaults to, and must match, this app's package.
@@ -11746,6 +12794,8 @@ components:
 
     VerifyAppleTransactionArgs:
       type: object
+      required:
+        - signed_transaction
       properties:
         signed_transaction:
           description: The StoreKit transaction JWS (`Transaction.jwsRepresentation`).
@@ -11753,6 +12803,8 @@ components:
 
     VerifyStorePurchaseResult:
       type: object
+      required:
+        - status
       properties:
         status:
           description: |
@@ -11770,6 +12822,11 @@ components:
 
     X402Sku:
       type: object
+      required:
+        - sku_id
+        - description
+        - price_usd
+        - pro
       properties:
         sku_id:
           type: string
@@ -11785,6 +12842,11 @@ components:
 
     X402SkusResult:
       type: object
+      required:
+        - x402_version
+        - networks
+        - asset
+        - skus
       properties:
         x402_version:
           type: integer
@@ -11802,6 +12864,16 @@ components:
     X402Accept:
       type: object
       description: One set of payment terms the agent may satisfy.
+      required:
+        - scheme
+        - network
+        - maxAmountRequired
+        - resource
+        - description
+        - mimeType
+        - payTo
+        - asset
+        - maxTimeoutSeconds
       properties:
         scheme:
           type: string
@@ -11825,6 +12897,10 @@ components:
     X402PaymentRequired:
       type: object
       description: The body of a 402 response.
+      required:
+        - x402Version
+        - error
+        - accepts
       properties:
         x402Version:
           type: integer
@@ -11850,6 +12926,10 @@ components:
 
     X402PurchaseResult:
       type: object
+      required:
+        - complete
+        - sku_id
+        - pro
       properties:
         complete:
           type: boolean
@@ -11869,6 +12949,7 @@ components:
     StripeWebhookArgs:
       type: object
       description: Only the fields the server reads; Stripe sends a much larger event.
+      required: []
       properties:
         id:
           type: string
@@ -11876,6 +12957,7 @@ components:
           type: string
         data:
           type: object
+          required: []
           properties:
             object:
               description: The event's object, whose shape depends on `type`.
@@ -11883,10 +12965,13 @@ components:
 
     StripeWebhookResult:
       type: object
+      required: []
       properties:
         message:
           description: Set only when the event was not acted on.
           type: object
+          required:
+            - message
           properties:
             message:
               type: string
@@ -11894,9 +12979,12 @@ components:
     CoinbaseWebhookArgs:
       type: object
       description: Only the fields the server reads; Coinbase sends more.
+      required:
+        - event
       properties:
         event:
           type: object
+          required: []
           properties:
             id:
               type: string
@@ -11904,6 +12992,7 @@ components:
               type: string
             data:
               type: object
+              required: []
               properties:
                 id:
                   type: string
@@ -11922,14 +13011,19 @@ components:
 
     CoinbaseWebhookResult:
       type: object
+      required: []
       properties: {}
 
     PlayWebhookArgs:
       type: object
       description: The Pub/Sub push envelope. The notification itself is base64 in `message.data`.
+      required:
+        - message
       properties:
         message:
           type: object
+          required:
+            - data
           properties:
             data:
               description: base64 of the Play developer notification JSON.
@@ -11937,18 +13031,23 @@ components:
 
     PlayWebhookResult:
       type: object
+      required:
+        - Message
       properties:
         Message:
           description: |
             Present only when the notification was not acted on. The field is
             capitalized on the wire, because the Go field carries no json tag.
-          type: object
+          type: [object, "null"]
+          required:
+            - message
           properties:
             message:
               type: string
 
     HeliusWebhookResult:
       type: object
+      required: []
       properties:
         message:
           description: Set only when the transfer was not credited.
@@ -11960,6 +13059,7 @@ components:
         A Circle notification envelope carrying a challenge event. Only a
         `challenges.initialize` notification whose event is a completed
         `INITIALIZE` is acted on.
+      required: []
       properties:
         subscriptionId:
           type: string
@@ -11969,6 +13069,7 @@ components:
           type: string
         notification:
           type: object
+          required: []
           properties:
             id:
               type: string
@@ -11993,6 +13094,7 @@ components:
 
     CircleWalletWebhookResult:
       type: object
+      required: []
       properties: {}
 
     AppleNotificationPayload:
@@ -12010,6 +13112,13 @@ components:
 
     PublicVerifyStatsRow:
       type: object
+      required:
+        - period_start
+        - period_end
+        - client_id
+        - assignments
+        - confirmations
+        - reliability_ppm
       properties:
         period_start:
           type: string
@@ -12036,6 +13145,12 @@ components:
 
     GetVerifyStatsResult:
       type: object
+      required:
+        - schema
+        - profile
+        - policy_hash
+        - egress_hash_key_id
+        - rows
       properties:
         schema:
           type: string
@@ -12047,12 +13162,21 @@ components:
           description: The id only; the key itself never leaves the server.
           type: string
         rows:
-          type: array
+          type: [array, "null"]
           items:
             $ref: "#/components/schemas/PublicVerifyStatsRow"
 
     PublicVerifyProofRow:
       type: object
+      required:
+        - trail_id
+        - vpk
+        - server_key_id
+        - server_nonce
+        - depth
+        - status
+        - hops
+        - create_time
       properties:
         trail_id:
           description: uuid
@@ -12090,6 +13214,11 @@ components:
 
     GetVerifyProofsResult:
       type: object
+      required:
+        - schema
+        - profile
+        - policy_hash
+        - rows
       properties:
         schema:
           type: string
@@ -12098,7 +13227,7 @@ components:
         policy_hash:
           type: string
         rows:
-          type: array
+          type: [array, "null"]
           items:
             $ref: "#/components/schemas/PublicVerifyProofRow"
 
@@ -12106,6 +13235,10 @@ components:
 
     SnArtifactHistoryObject:
       type: object
+      required:
+        - key
+        - size
+        - content_hash
       properties:
         key:
           type: string
@@ -12117,6 +13250,11 @@ components:
 
     SnArtifactHistoryResult:
       type: object
+      required:
+        - schema
+        - objects
+        - more
+        - next_after
       properties:
         schema:
           description: Always `urnetwork-payout-artifact-history-v1`.
@@ -12136,6 +13274,18 @@ components:
       description: |
         A signed release-evidence envelope. The signature is what authorizes a
         publication; there is no separate credential.
+      required:
+        - schema
+        - deployment_id
+        - chain_id
+        - genesis_hash
+        - netuid
+        - kind
+        - created_at
+        - payload
+        - signer
+        - content_hash
+        - signature
       properties:
         schema:
           type: string
@@ -12168,6 +13318,11 @@ components:
 
     SnPublishedEvidenceResult:
       type: object
+      required:
+        - content_hash
+        - content_key
+        - history_key
+        - bucket
       properties:
         content_hash:
           type: string
@@ -12186,6 +13341,9 @@ components:
         The fields are Capitalized on the wire: this is Go's
         `server.BlobObject`, which carries no json tags. The artifact history
         at `/sn/artifacts` uses lower-case names instead.
+      required:
+        - Key
+        - Size
       properties:
         Key:
           type: string
@@ -12194,12 +13352,17 @@ components:
 
     SnEvidenceHistoryResult:
       type: object
+      required:
+        - schema
+        - objects
+        - more
+        - next_after
       properties:
         schema:
           description: Always `urnetwork-release-evidence-history-v1`.
           type: string
         objects:
-          type: array
+          type: [array, "null"]
           items:
             $ref: "#/components/schemas/SnEvidenceHistoryObject"
         more:
@@ -12213,6 +13376,9 @@ components:
       description: |
         The body must be exactly the canonical encoding of these two fields --
         no unknown fields, no trailing JSON, no re-ordering.
+      required:
+        - client_id
+        - request
       properties:
         client_id:
           description: uuid. The client whose key history is being observed.
@@ -12225,6 +13391,9 @@ components:
 
     ClientKeyEffectiveBoundary:
       type: object
+      required:
+        - block
+        - hash
       properties:
         epoch:
           type: integer
@@ -12238,6 +13407,13 @@ components:
 
     ClientKeyObservationRequest:
       type: object
+      required:
+        - client_id
+        - validator_hotkey
+        - native_block
+        - native_hash
+        - decision_boundary
+        - nonce
       properties:
         client_id:
           description: A 16-byte client id, on the wire as a JSON array of 16 integers.
@@ -12268,6 +13444,9 @@ components:
 
     ClientKeyObservationBatchRequest:
       type: object
+      required:
+        - requests
+        - maximum_response_bytes
       properties:
         requests:
           type: array
@@ -12278,6 +13457,9 @@ components:
 
     ClientKeyHistoryResponse:
       type: object
+      required:
+        - history
+        - observation
       properties:
         history:
           description: The client's signed key history statements, base64 encoded, oldest first.
@@ -12290,6 +13472,8 @@ components:
 
     ClientKeyObservationBatchResponse:
       type: object
+      required:
+        - responses
       properties:
         responses:
           description: One encoded ClientKeyHistoryResponse per request, in request order.
@@ -12304,6 +13488,31 @@ components:
       description: |
         One send day and dimension tuple. Every count is DISTINCT NETWORKS,
         never events.
+      required:
+        - send_day
+        - step
+        - template
+        - variant
+        - experiment
+        - experiment_variant
+        - platform
+        - path
+        - sent
+        - delivered
+        - opened
+        - clicked
+        - landing_clicked
+        - app_opened
+        - connected
+        - widget_added
+        - feedback_submitted
+        - pro_started
+        - engaged
+        - bounced
+        - unsubscribed
+        - complained
+        - attribution_ambiguous
+        - computed_at
       properties:
         send_day:
           type: string
@@ -12361,6 +13570,14 @@ components:
     OnboardingEmailTrackerDefinitions:
       type: object
       description: The rules the page was computed under, returned with the data.
+      required:
+        - counts
+        - dashboard_window_days
+        - engagement_window_days
+        - delivery_correction_days
+        - engaged_includes
+        - engaged_excludes
+        - legacy_attribution
       properties:
         counts:
           type: string
@@ -12383,6 +13600,11 @@ components:
 
     OnboardingEmailTrackerPage:
       type: object
+      required:
+        - rows
+        - next_cursor
+        - min_networks
+        - definitions
       properties:
         rows:
           type: array
@@ -12401,6 +13623,19 @@ components:
 
     AuthorizationServerMetadata:
       type: object
+      required:
+        - issuer
+        - authorization_endpoint
+        - token_endpoint
+        - jwks_uri
+        - scopes_supported
+        - response_types_supported
+        - grant_types_supported
+        - code_challenge_methods_supported
+        - token_endpoint_auth_methods_supported
+        - client_id_metadata_document_supported
+        - authorization_response_iss_parameter_supported
+        - resource_indicators_supported
       properties:
         issuer:
           type: string
@@ -12462,6 +13697,14 @@ components:
 
     Jwk:
       type: object
+      required:
+        - kty
+        - crv
+        - kid
+        - alg
+        - use
+        - x
+        - y
       properties:
         kty:
           type: string
@@ -12480,6 +13723,8 @@ components:
 
     JwkSet:
       type: object
+      required:
+        - keys
       properties:
         keys:
           type: array
@@ -12488,6 +13733,10 @@ components:
 
     OauthTokenResponse:
       type: object
+      required:
+        - access_token
+        - token_type
+        - expires_in
       properties:
         access_token:
           type: string
@@ -12505,6 +13754,8 @@ components:
     OauthError:
       type: object
       description: The rfc 6749 section 5.2 error envelope.
+      required:
+        - error
       properties:
         error:
           type: string
@@ -12513,6 +13764,8 @@ components:
 
     OauthClientMetadata:
       type: object
+      required:
+        - redirect_uris
       properties:
         client_id:
           type: string
@@ -12537,6 +13790,13 @@ components:
 
     OauthRegisteredClient:
       type: object
+      required:
+        - client_id
+        - client_name
+        - application_type
+        - redirect_uris
+        - scope
+        - token_endpoint_auth_method
       properties:
         client_id:
           type: string
@@ -12556,6 +13816,8 @@ components:
 
     OauthUserInfo:
       type: object
+      required:
+        - sub
       properties:
         sub:
           type: string
@@ -12569,6 +13831,13 @@ components:
     OauthConsentRequest:
       type: object
       description: The authorization request, as the consent page passes it through.
+      required:
+        - client_id
+        - redirect_uri
+        - response_type
+        - code_challenge
+        - code_challenge_method
+        - resource
       properties:
         client_id:
           type: string
@@ -12597,6 +13866,10 @@ components:
 
     OauthConsentResult:
       type: object
+      required:
+        - scopes
+        - issuer
+        - consent_required
       properties:
         client_name:
           type: string
@@ -12621,7 +13894,350 @@ components:
 
     OauthAuthorizeResult:
       type: object
+      required:
+        - redirect_uri
       properties:
         redirect_uri:
           description: Where the consent page should send the user agent; carries `code`, `iss` and any `state`.
           type: string
+
+    # ---- schemas added for the responses that were a bare `type: object` ----
+
+    SubmitProviderBlackholeChecksResult:
+      type: object
+      description: |
+        The handler answers `{}` (Go `struct{}{}`); the checks are recorded as
+        a side effect and nothing is reported back.
+      required: []
+      properties: {}
+      additionalProperties: false
+
+    SubmitProviderBandwidthResult:
+      type: object
+      description: |
+        The handler answers `{}` (an empty map); the sample is recorded as a
+        side effect and nothing is reported back.
+      required: []
+      properties: {}
+      additionalProperties: false
+
+    SubmitProviderEgressHealthResult:
+      type: object
+      description: |
+        The handler answers `{}` (an empty map); the run is recorded as a side
+        effect and nothing is reported back.
+      required: []
+      properties: {}
+      additionalProperties: false
+
+    AppleNotificationResult:
+      type: object
+      description: |
+        The webhook answers the literal `{}` once the notification has been
+        verified and processed; Apple only needs the 200.
+      required: []
+      properties: {}
+      additionalProperties: false
+
+    SnPayoutArtifact:
+      type: object
+      description: |
+        A canonical signed payout artifact, served byte-for-byte as it was
+        published (`payoutartifact.Artifact` in the sn module, aliased by
+        `server/startifact`). `content_hash` is `sha256:` plus the lowercase
+        hex digest of the canonical bytes with `content_hash` and `signature`
+        blank, and is what the response `ETag` carries.
+      required:
+        - schema
+        - deployment_id
+        - chain_id
+        - genesis_hash
+        - netuid
+        - coordinator
+        - settlement_vault
+        - epoch
+        - no_id
+        - policy_hash
+        - start
+        - end
+        - operator_snapshot_hash
+        - fleet_snapshot_hash
+        - provider_snapshot_hash
+        - reliability_a_min
+        - providers
+        - leaves
+        - payout_root
+        - total_usage_bytes
+        - eligible_usage_bytes
+        - excluded_usage_bytes
+        - shares_total_bps
+        - created_at
+        - signer
+        - content_hash
+        - signature
+      properties:
+        schema:
+          type: string
+          description: Always `urnetwork-payout-artifact-v1`.
+        deployment_id:
+          type: string
+        chain_id:
+          type: integer
+        genesis_hash:
+          type: string
+          description: "`0x`-prefixed hex digest."
+        netuid:
+          type: integer
+        coordinator:
+          type: string
+          description: "`0x`-prefixed 20-byte EVM address."
+        settlement_vault:
+          type: string
+          description: "`0x`-prefixed 20-byte EVM address."
+        epoch:
+          type: integer
+        no_id:
+          type: integer
+        policy_hash:
+          type: string
+          description: "`0x`-prefixed hex digest."
+        start:
+          $ref: "#/components/schemas/SnPayoutArtifactBoundary"
+        end:
+          $ref: "#/components/schemas/SnPayoutArtifactBoundary"
+        operator_snapshot_hash:
+          type: string
+          description: "`sha256:`-prefixed hex digest."
+        fleet_snapshot_hash:
+          type: string
+          description: "`sha256:`-prefixed hex digest."
+        provider_snapshot_hash:
+          type: string
+          description: "`sha256:`-prefixed hex digest."
+        reliability_a_min:
+          type: integer
+        providers:
+          description: |
+            The provider inputs the tree was built from; `null` when the
+            epoch had no providers (a nil slice in the builder).
+          type: [array, "null"]
+          items:
+            $ref: "#/components/schemas/SnPayoutArtifactProviderInput"
+        leaves:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnPayoutArtifactLeaf"
+        payout_root:
+          description: The 32-byte merkle root, as a JSON array of byte values.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        total_usage_bytes:
+          type: integer
+        eligible_usage_bytes:
+          type: integer
+        excluded_usage_bytes:
+          type: integer
+        shares_total_bps:
+          type: integer
+        created_at:
+          type: string
+          description: RFC 3339 UTC.
+        signer:
+          type: string
+          description: "`0x`-prefixed 20-byte EVM address of the signing key."
+        content_hash:
+          type: string
+        signature:
+          type: string
+          description: "`0x`-prefixed hex of the 65-byte secp256k1 signature over `content_hash`."
+
+    SnPayoutArtifactBoundary:
+      type: object
+      description: One chain block boundary of the artifact's window.
+      required: [number, hash]
+      properties:
+        number:
+          type: integer
+        hash:
+          type: string
+          description: "`0x`-prefixed block hash."
+
+    SnPayoutArtifactProviderInput:
+      type: object
+      description: One provider's input to the payout tree.
+      required:
+        - client_id
+        - network_id
+        - coldkey
+        - usage_bytes
+        - assignments
+        - confirmations
+        - reliability_ppm
+        - eligible
+        - head_excluded
+      properties:
+        client_id:
+          description: The 16-byte client id, as a JSON array of byte values.
+          type: array
+          items:
+            type: integer
+          minItems: 16
+          maxItems: 16
+        network_id:
+          description: The 16-byte network id, as a JSON array of byte values.
+          type: array
+          items:
+            type: integer
+          minItems: 16
+          maxItems: 16
+        coldkey:
+          description: The 32-byte coldkey public key, as a JSON array of byte values.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        usage_bytes:
+          type: integer
+        assignments:
+          type: integer
+        confirmations:
+          type: integer
+        reliability_ppm:
+          type: integer
+        eligible:
+          type: boolean
+        head_excluded:
+          type: boolean
+        exclusion_reason:
+          type: string
+          description: Omitted when empty.
+        binding_generation:
+          type: integer
+          description: Omitted when zero.
+
+    SnPayoutArtifactLeaf:
+      type: object
+      description: One leaf of the payout merkle tree with its inclusion proof.
+      required: [index, allocation_client_id, coldkey, share_bps, proof]
+      properties:
+        index:
+          type: integer
+        allocation_client_id:
+          description: The 16-byte client id, as a JSON array of byte values.
+          type: array
+          items:
+            type: integer
+          minItems: 16
+          maxItems: 16
+        coldkey:
+          description: The 32-byte coldkey public key, as a JSON array of byte values.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        share_bps:
+          type: integer
+        proof:
+          description: |
+            Sibling hashes from the leaf to the root, each a 32-byte value as
+            a JSON array of byte values; `null` for a tree that needs none.
+          type: [array, "null"]
+          items:
+            type: array
+            items:
+              type: integer
+            minItems: 32
+            maxItems: 32
+
+    SnAttemptMetadata:
+      description: |
+        The `metadata` object of an attempt stream. The server stores and
+        serves these bytes verbatim (their identity is the sha256 the caller
+        named); the shape is the sn validator's attempt stream v2 format
+        (`sn/validator/attempt_stream_v2.go`): either the stream manifest or
+        one descriptor page, told apart by `schema`.
+      oneOf:
+        - $ref: "#/components/schemas/SnAttemptStreamManifest"
+        - $ref: "#/components/schemas/SnAttemptStreamPage"
+
+    SnAttemptStreamManifest:
+      type: object
+      description: The manifest of one attempt stream (`AttemptStreamV2Manifest`).
+      required:
+        - schema
+        - kind
+        - item_count
+        - data_bytes
+        - chunk_count
+        - page_count
+        - first_page_hash
+        - first_page_bytes
+      properties:
+        schema:
+          type: string
+        kind:
+          type: string
+          enum: [records, proofs]
+        item_count:
+          type: integer
+        data_bytes:
+          type: integer
+        chunk_count:
+          type: integer
+        page_count:
+          type: integer
+        first_page_hash:
+          type: string
+          description: "`0x`-prefixed sha256 of the first descriptor page; zero for an empty stream."
+        first_page_bytes:
+          type: integer
+
+    SnAttemptStreamPage:
+      type: object
+      description: |
+        One descriptor page of an attempt stream (`AttemptStreamV2Page`). A
+        nonterminal page binds the next page's exact hash and size.
+      required: [schema, kind, index, chunks, next_page_hash, next_page_bytes]
+      properties:
+        schema:
+          type: string
+        kind:
+          type: string
+          enum: [records, proofs]
+        index:
+          type: integer
+        chunks:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnAttemptStreamChunk"
+        next_page_hash:
+          type: string
+          description: "`0x`-prefixed sha256 of the next page; zero on the last page."
+        next_page_bytes:
+          type: integer
+
+    SnAttemptStreamChunk:
+      type: object
+      description: |
+        One chunk descriptor (`AttemptStreamV2Chunk`). Chunk indices are zero
+        based; sequence coordinates keep the original ledger sequence numbers.
+      required: [index, first_sequence, last_sequence, item_count, data_bytes, content_hash]
+      properties:
+        index:
+          type: integer
+        first_sequence:
+          type: integer
+        last_sequence:
+          type: integer
+        item_count:
+          type: integer
+        data_bytes:
+          type: integer
+        content_hash:
+          type: string
+          description: "`0x`-prefixed sha256 of the chunk bytes."
