@@ -2109,9 +2109,9 @@ probe.
 
 ## 11. Step 7 — the prober loads real sites, retries, and decides for itself
 
-### 11.1 What the prober does today
+### 11.1 Historical baseline before Step 7
 
-The egress prober (`server/taskworker/work/provider_egress_probe_work.go`
+The pre-Step-7 egress prober (`server/taskworker/work/provider_egress_probe_work.go`
 over the `operator-proxy` packages) opens a tunnel to a provider exactly as
 a client would — a multiclient pinned to that one provider, a gvisor tun and
 a packet pump (`providertunnel.Open`) — and measures through it. Two passes
@@ -2130,6 +2130,16 @@ share the recurring task:
   Main runs it four shards wide at 52 tunnels each, 250 providers a batch.
   One failed check makes the provider dark for up to three hours, including
   after it reconnects.
+
+This is the historical no-retry/single-failure baseline, not the current dark
+rule. The current source retains measured blackhole verdicts for eight hours,
+with passing checks still due after ninety minutes; ordinary negatives need
+the consecutive-failure/span rule below, while TLS-authentication failure
+remains immediate evidence. NotMeasured does not refresh an older measured
+clock. The eight-hour retention change requires matching API/Taskworker and
+monitor rollout; it is not a claim about the currently deployed artifacts or
+about improved measurement throughput. The dated observations in §11.2 keep
+their original three-hour measurement window.
 
 ### 11.2 Historical dark-cohort observation (main, 2026-09-23)
 
