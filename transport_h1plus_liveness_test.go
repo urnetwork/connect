@@ -29,6 +29,8 @@ type h1LivenessConn struct {
 	writeRejected        atomic.Bool
 	readsAfterRejection  atomic.Int64
 	writesAfterRejection atomic.Int64
+	writesInProgress     atomic.Int64
+	writeTimedOut        atomic.Bool
 	closeOnce            sync.Once
 	closed               chan struct{}
 }
@@ -67,7 +69,14 @@ func (self *h1LivenessConn) Write(message []byte) (int, error) {
 	if self.failWrite.Load() {
 		return 0, errors.New("synthetic socket write failed")
 	}
-	return self.Conn.Write(message)
+	self.writesInProgress.Add(1)
+	defer self.writesInProgress.Add(-1)
+	n, err := self.Conn.Write(message)
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		self.writeTimedOut.Store(true)
+	}
+	return n, err
 }
 
 // Socket closure is an explicit witness independent of the route counters.
@@ -87,6 +96,8 @@ type h1LivenessFixture struct {
 	client          *h1LivenessConn
 	peer            *FramedMessageConn
 	peerDone        chan struct{}
+	peerReadBlocked chan struct{}
+	peerReadResume  chan struct{}
 	heartbeats      atomic.Int64
 	payloads        atomic.Int64
 	registered      atomic.Int64
@@ -99,6 +110,13 @@ type h1LivenessFixture struct {
 // No DNS, TLS, listening socket, host configuration or production identity is used.
 func newH1LivenessFixture(t *testing.T) *h1LivenessFixture {
 	t.Helper()
+	return newH1LivenessFixtureWithBackpressure(t, false, 0)
+}
+
+// A gate after one complete peer read applies actual pipe backpressure while
+// keeping that peer's sole writer available for independent heartbeats.
+func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTimeout time.Duration) *h1LivenessFixture {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	client, peer := net.Pipe()
 	fixture := &h1LivenessFixture{
@@ -106,6 +124,8 @@ func newH1LivenessFixture(t *testing.T) *h1LivenessFixture {
 		stats:           &H1PlusStats{},
 		connectionStats: &H1ConnectionStats{},
 		peerDone:        make(chan struct{}),
+		peerReadBlocked: make(chan struct{}),
+		peerReadResume:  make(chan struct{}),
 		cancel:          cancel,
 	}
 	ready := make(chan *FramedMessageConn, 1)
@@ -133,6 +153,7 @@ func newH1LivenessFixture(t *testing.T) *h1LivenessFixture {
 			return
 		}
 		ready <- framed
+		messageCount := 0
 		for {
 			_, message, err := framed.ReadMessage()
 			if err != nil {
@@ -142,6 +163,15 @@ func newH1LivenessFixture(t *testing.T) *h1LivenessFixture {
 				fixture.heartbeats.Add(1)
 			} else {
 				fixture.payloads.Add(1)
+			}
+			messageCount++
+			if pausePeer && messageCount == 1 {
+				close(fixture.peerReadBlocked)
+				select {
+				case <-ctx.Done():
+					return
+				case <-fixture.peerReadResume:
+				}
 			}
 		}
 	}()
@@ -174,6 +204,9 @@ func newH1LivenessFixture(t *testing.T) *h1LivenessFixture {
 	settings.ReadTimeout = 3 * time.Second
 	settings.PingTimeout = time.Second
 	settings.WriteTimeout = 2 * time.Second
+	if writeTimeout > 0 {
+		settings.WriteTimeout = writeTimeout
+	}
 	settings.ReconnectTimeout = time.Hour
 	settings.TransportBufferSize = 1
 	settings.H1PlusStats = fixture.stats
