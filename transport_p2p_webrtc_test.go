@@ -5222,6 +5222,55 @@ func TestWebRtcPeerTeardownWatchdogReportsCurrentStage(t *testing.T) {
 	}
 }
 
+// A stalled peer in a busy process must not write one record per unrelated
+// goroutine or keep teardown waiting for an unbounded diagnostic callback.
+func TestWebRtcPeerTeardownStackSampleBoundsDiagnosticFanout(t *testing.T) {
+	var snapshot strings.Builder
+	for stackIndex := 0; stackIndex < 1000; stackIndex++ {
+		if stackIndex > 0 {
+			snapshot.WriteString("\n\n")
+		}
+		fmt.Fprintf(&snapshot, "goroutine %d [select]:\nsynthetic.example/worker.wait()", stackIndex)
+	}
+	log := newRecordingLogger()
+	logPeerConnectionTeardownStackSample(
+		log,
+		peerConnectionTeardownStarting,
+		peerConnKey{},
+		[]byte(snapshot.String()),
+		false,
+	)
+	lines := log.lines()
+	if len(lines) != 1+peerConnectionTeardownStackSampleCount {
+		t.Fatalf("diagnostic records = %d, want at most one summary plus %d samples", len(lines), peerConnectionTeardownStackSampleCount)
+	}
+	if !strings.Contains(lines[0], "captured=1000 emitted=8") {
+		t.Fatalf("summary did not preserve captured versus emitted counts: %q", lines[0])
+	}
+	for _, line := range lines {
+		if len(line) > peerConnectionTeardownStackRecordBytes+512 {
+			t.Fatalf("diagnostic record has %d bytes", len(line))
+		}
+	}
+}
+
+// A full capture buffer may end inside a goroutine stack. That incomplete
+// frame must not be published as if it were evidence of a complete stack.
+func TestWebRtcPeerTeardownStackSampleDropsTruncatedFrame(t *testing.T) {
+	log := newRecordingLogger()
+	logPeerConnectionTeardownStackSample(
+		log,
+		peerConnectionTeardownStoppingDtls,
+		peerConnKey{},
+		[]byte("goroutine 1 [select]:\ncomplete\n\ngoroutine 2 [select]:\nincomplete"),
+		true,
+	)
+	lines := log.lines()
+	if len(lines) != 2 || !strings.Contains(lines[0], "capture_truncated=true") || strings.Contains(lines[1], "incomplete") {
+		t.Fatalf("truncated diagnostic was not bounded to complete stack: %#v", lines)
+	}
+}
+
 func TestWebRtcPeerTeardownWatchdogStopPreventsReport(t *testing.T) {
 	var stage atomic.Int32
 	stage.Store(int32(peerConnectionTeardownStarting))

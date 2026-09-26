@@ -2817,36 +2817,56 @@ func (self peerConnectionTeardownStage) String() string {
 
 const peerConnectionSlowTeardownTimeout = 5 * time.Second
 
-// logPeerConnectionTeardownStacks keeps each goroutine in its own log record.
-// The glog backend truncates one record at 15 KB; one monolithic runtime.Stack
-// dump therefore hides precisely the later goroutine that owns a shutdown
-// dependency when the process has many workers.
+const (
+	peerConnectionTeardownStackCaptureBytes = 256 * 1024
+	peerConnectionTeardownStackSampleCount  = 8
+	peerConnectionTeardownStackRecordBytes  = 8 * 1024
+)
+
+// logPeerConnectionTeardownStacks captures a bounded sample. Dumping every
+// goroutine separately made one stalled teardown emit tens of thousands of
+// records, and StopAndWait then joined that unbounded diagnostic callback.
 func logPeerConnectionTeardownStacks(
 	log Logger,
 	stage peerConnectionTeardownStage,
 	key peerConnKey,
 ) {
-	stackBuffer := make([]byte, 256*1024)
-	for {
-		stackByteCount := runtime.Stack(stackBuffer, true)
-		if stackByteCount < len(stackBuffer) {
-			goroutineStacks := strings.Split(
-				strings.TrimSpace(string(stackBuffer[:stackByteCount])),
-				"\n\n",
-			)
-			for stackIndex, goroutineStack := range goroutineStacks {
-				log.Infof(
-					"[peerconn]teardown goroutine %d/%d at %s %s:\n%s\n",
-					stackIndex+1,
-					len(goroutineStacks),
-					stage,
-					key,
-					goroutineStack,
-				)
-			}
-			return
+	stackBuffer := make([]byte, peerConnectionTeardownStackCaptureBytes)
+	stackByteCount := runtime.Stack(stackBuffer, true)
+	logPeerConnectionTeardownStackSample(log, stage, key, stackBuffer[:stackByteCount], stackByteCount == len(stackBuffer))
+}
+
+// logPeerConnectionTeardownStackSample bounds both record count and size even
+// when the process has more goroutines than the capture buffer can hold.
+func logPeerConnectionTeardownStackSample(
+	log Logger,
+	stage peerConnectionTeardownStage,
+	key peerConnKey,
+	stackSnapshot []byte,
+	truncated bool,
+) {
+	stackText := strings.TrimSpace(string(stackSnapshot))
+	if truncated {
+		// runtime.Stack may stop mid-goroutine; only publish complete entries.
+		if lastComplete := strings.LastIndex(stackText, "\n\n"); lastComplete >= 0 {
+			stackText = stackText[:lastComplete]
+		} else {
+			stackText = ""
 		}
-		stackBuffer = make([]byte, 2*len(stackBuffer))
+	}
+	if stackText == "" {
+		log.Infof("[peerconn]teardown stack sample unavailable at %s %s (capture truncated=%t)\n", stage, key, truncated)
+		return
+	}
+	stacks := strings.Split(stackText, "\n\n")
+	sampleCount := min(len(stacks), peerConnectionTeardownStackSampleCount)
+	log.Infof("[peerconn]teardown stack sample at %s %s: captured=%d emitted=%d capture_truncated=%t\n", stage, key, len(stacks), sampleCount, truncated)
+	for stackIndex := 0; stackIndex < sampleCount; stackIndex++ {
+		stack := stacks[stackIndex]
+		if len(stack) > peerConnectionTeardownStackRecordBytes {
+			stack = stack[:peerConnectionTeardownStackRecordBytes]
+		}
+		log.Infof("[peerconn]teardown goroutine sample %d/%d at %s %s:\n%s\n", stackIndex+1, sampleCount, stage, key, stack)
 	}
 }
 
