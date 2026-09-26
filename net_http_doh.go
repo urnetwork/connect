@@ -348,6 +348,10 @@ func httpClientWithDialer(settings *DohSettings, dialContext DialContextFunction
 	tr := &http.Transport{
 		DialContext:         dialContext,
 		TLSHandshakeTimeout: settings.TlsTimeout,
+		// Request cancellation releases httpSem, but net/http may keep its
+		// reusable dial alive. Bound dialing, handshaking and pooled sockets
+		// per resolver origin in this transport, including those detached dials.
+		MaxConnsPerHost: maxConcurrentHttpRequests(settings),
 		// keep the (typically single) DoH connection pooled across bursts so lookups don't
 		// re-pay a TCP+TLS handshake over the tunnel. Long: with session resumption the
 		// re-dial is cheap, but not re-dialing at all is cheaper still, and an idle h2
@@ -389,7 +393,7 @@ func httpClientWithDialer(settings *DohSettings, dialContext DialContextFunction
 
 type DohCache struct {
 	// remoteClient resolves over the tun (settings.DialContext); localClient over the host. Both
-	// share httpSem (the global in-flight cap) and the per-server success stats.
+	// share this cache's httpSem in-flight cap and per-server success stats.
 	remoteClient   *dohClient
 	localClient    *dohClient
 	remoteResolver *net.Resolver

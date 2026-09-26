@@ -110,12 +110,12 @@ type h1LivenessFixture struct {
 // No DNS, TLS, listening socket, host configuration or production identity is used.
 func newH1LivenessFixture(t *testing.T, configure ...func(*PlatformTransportSettings)) *h1LivenessFixture {
 	t.Helper()
-	return newH1LivenessFixtureWithBackpressure(t, false, 0)
+	return newH1LivenessFixtureWithBackpressure(t, false, 0, configure...)
 }
 
 // A gate after one complete peer read applies actual pipe backpressure while
 // keeping that peer's sole writer available for independent heartbeats.
-func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTimeout time.Duration) *h1LivenessFixture {
+func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTimeout time.Duration, configure ...func(*PlatformTransportSettings)) *h1LivenessFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	client, peer := net.Pipe()
