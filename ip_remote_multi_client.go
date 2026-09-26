@@ -132,6 +132,23 @@ type MultiClientGenerator interface {
 	FixedDestinationSize() (int, bool)
 }
 
+// MultiClientGeneratorReadTimeout exposes the effective carrier read interval
+// for one generated client. The API generator owns a copied per-client
+// PlatformTransportSettings, including custom overrides. A missing capability
+// falls back to MultiClientSettings.BlackholeTimeout; it must not manufacture
+// a shorter liveness deadline from the Transfer retransmit interval.
+type MultiClientGeneratorReadTimeout interface {
+	ClientReadTimeout(client *Client) (time.Duration, bool)
+}
+
+// Evaluation cadence and the freshness of comparative ACK evidence are not
+// liveness deadlines. Keep their original values when the no-send-ACK bound
+// follows a longer transport read interval.
+const (
+	blackholePollInterval         = 1250 * time.Millisecond
+	blackholeAckFreshnessInterval = 5 * time.Second
+)
+
 // MultiClientGeneratorExcluder is an optional generator capability: exclude a
 // provider from near-term discovery. Implementations own the retention policy;
 // the API generator uses a bounded oldest-evicted runtime history. Used by
@@ -207,7 +224,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		CPingRestTimeout: 10 * time.Second,
 		// a lower ack timeout helps cycle through bad providers faster
 		AckTimeout:              30 * time.Second,
-		BlackholeTimeout:        5 * time.Second,
+		BlackholeTimeout:        defaultPlatformTransportReadTimeout,
 		BlackholeReceiveTimeout: 20 * time.Second,
 		MaxFlowsPerExit:         16,
 		// Legacy/explicit affinity keeps its exit as it grows; ordinary fresh
@@ -324,6 +341,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 
 		TcpCollapsePrevention:   true,
 		UdpCollapsePrevention:   false,
+		UdpTransferNoAck:        true,
 		EnableIcmp:              false,
 		DegradedMode:            &atomic.Bool{},
 		DegradedLivenessScale:   3.0,
@@ -502,15 +520,22 @@ type MultiClientSettings struct {
 	CPingTimeout                  time.Duration
 	CPingRestTimeout              time.Duration
 	AckTimeout                    time.Duration
-	BlackholeTimeout              time.Duration
+	// BlackholeTimeout is the fallback no-send-ACK liveness interval for a
+	// generator without MultiClientGeneratorReadTimeout. The API generator
+	// uses its effective per-client transport ReadTimeout instead, so a
+	// custom carrier setting cannot drift from an earlier health deadline.
+	// Zero disables this verdict. Neither this interval nor its persistent
+	// no-progress clock changes Transfer resend pacing or ACK lifetime.
+	BlackholeTimeout time.Duration
 	// BlackholeReceiveTimeout bounds the weaker of the two blackhole signals:
 	// the provider is acknowledging our sends, so it is demonstrably alive,
 	// but nothing has come back from the destination. That is ambiguous -- a
 	// flow waiting on a slow origin looks identical to a provider whose
 	// upstream is broken -- and removing an exit is destructive, killing every
-	// flow pinned to it rather than just the quiet one. So it gets a longer
-	// bar than BlackholeTimeout, which covers the unambiguous case of a
-	// provider that has stopped acknowledging anything at all.
+	// flow pinned to it rather than just the quiet one. It therefore has its
+	// own corroboration and quarantine policy. A missing send ACK is also
+	// ambiguous while reliable H1 TCP is recovering; its separate bound must
+	// allow the full transport read interval, not preempt one retransmission.
 	//
 	// On mainnet at 5s this fired 44 times out of 44 removals, roughly one
 	// every 18s under load, against providers that were acking as much as 602
@@ -851,6 +876,10 @@ type MultiClientSettings struct {
 
 	TcpCollapsePrevention bool
 	UdpCollapsePrevention bool
+	// UdpTransferNoAck keeps an established UDP flow off Transfer's reliable
+	// resend path. Initial provider-race attempts still request an ACK; a
+	// successful route write alone does not prove provider receipt.
+	UdpTransferNoAck bool
 	// icmp echo egress. off by default until the provider fleet broadly
 	// parses icmp: a not-yet-upgraded provider silently blackholes icmp
 	// flows, and flow stickiness pins a ping run to its client (see ICMP.md)
@@ -6134,6 +6163,37 @@ func (self *RemoteUserNatMultiClient) SendPacketBatch(
 	packets [][]byte,
 	timeout time.Duration,
 ) int {
+	return self.sendPacketBatch(source, provideMode, packets, timeout, nil)
+}
+
+// SendPacketBatchWithResults consumes the same burst as SendPacketBatch and
+// writes one exact acceptance result per input position. accepted must have
+// len(packets) elements; previous values are cleared. The slice is borrowed
+// only during this call. Results describe admission, not subsequent delivery;
+// for fragments, true means the existing bounded fragment gate consumed the
+// input, even if the completed datagram is later rejected. No packet bytes are
+// inspected after their ownership has transferred.
+func (self *RemoteUserNatMultiClient) SendPacketBatchWithResults(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+	accepted []bool,
+) int {
+	if len(accepted) != len(packets) {
+		panic("SendPacketBatchWithResults: result length must match packet count")
+	}
+	clear(accepted)
+	return self.sendPacketBatch(source, provideMode, packets, timeout, accepted)
+}
+
+func (self *RemoteUserNatMultiClient) sendPacketBatch(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+	accepted []bool,
+) int {
 	containsFragments := false
 	for _, packet := range packets {
 		if isIpFragmentPacket(packet) {
@@ -6142,7 +6202,7 @@ func (self *RemoteUserNatMultiClient) SendPacketBatch(
 		}
 	}
 	if !containsFragments {
-		return self.sendCompletePacketBatch(source, provideMode, packets, timeout)
+		return self.sendCompletePacketBatch(source, provideMode, packets, timeout, accepted)
 	}
 
 	// Preserve wire order around a fragmented datagram. Ordinary contiguous
@@ -6153,11 +6213,16 @@ func (self *RemoteUserNatMultiClient) SendPacketBatch(
 	completeStart := 0
 	flushComplete := func(end int) {
 		if completeStart < end {
+			var completeAccepted []bool
+			if accepted != nil {
+				completeAccepted = accepted[completeStart:end]
+			}
 			acceptedCount += self.sendCompletePacketBatch(
 				source,
 				provideMode,
 				packets[completeStart:end],
 				timeout,
+				completeAccepted,
 			)
 		}
 	}
@@ -6168,6 +6233,9 @@ func (self *RemoteUserNatMultiClient) SendPacketBatch(
 		flushComplete(i)
 		if self.SendPacket(source, provideMode, packet, timeout) {
 			acceptedCount++
+			if accepted != nil {
+				accepted[i] = true
+			}
 		}
 		completeStart = i + 1
 	}
@@ -6180,11 +6248,19 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 	provideMode protocol.ProvideMode,
 	packets [][]byte,
 	timeout time.Duration,
+	accepted []bool,
 ) int {
-	groups, rejectedPackets := groupIpPacketsBounded(
+	// The legacy hot path retains neither this map nor per-group indexes;
+	// even ipPacketGroup's allocation size is unchanged by diagnostics.
+	var packetIndexes map[*ipPacketGroup][]int
+	if accepted != nil {
+		packetIndexes = make(map[*ipPacketGroup][]int)
+	}
+	groups, rejectedPackets := groupIpPacketsBoundedIndexed(
 		packets,
 		self.settings.PacketGroupMaxPacketCount,
 		self.settings.PacketGroupMaxByteCount,
+		packetIndexes,
 	)
 	for _, packet := range rejectedPackets {
 		MessagePoolReturn(packet)
@@ -6197,9 +6273,12 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 			// negotiation segment while rejecting a later plaintext segment.
 			// Preserve that per-packet result instead of applying the ordinary
 			// all-or-nothing flow-group transaction.
-			for _, packet := range group.packets {
+			for packetIndex, packet := range group.packets {
 				if self.SendPacket(source, provideMode, packet, timeout) {
 					sentPacketCount += 1
+					if accepted != nil {
+						accepted[packetIndexes[group][packetIndex]] = true
+					}
 				} else {
 					MessagePoolReturn(packet)
 				}
@@ -6208,6 +6287,9 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 		}
 		if self.sendPacketGroup(source, provideMode, group, timeout) {
 			sentPacketCount += len(group.packets)
+			for _, packetIndex := range packetIndexes[group] {
+				accepted[packetIndex] = true
+			}
 			continue
 		}
 		for _, packet := range group.packets {
@@ -6556,7 +6638,9 @@ func (self *RemoteUserNatMultiClient) canSendPacket(
 		// send policy gives Transfer end-to-end recovery ownership. Tunneled TCP
 		// always requests Transfer ACKs, including on a direct or otherwise
 		// reliable carrier, because carrier delivery cannot survive a disconnect
-		// or route replacement.
+		// or route replacement. NoAck bypasses the receiver's reliable Transfer
+		// window: it cannot retain/serialize a missing IP packet at that boundary,
+		// and inner TCP retries can amplify loss or out-of-order holes instead.
 		transferAckRequired := currentClient == nil ||
 			currentClient.ipPacketTransferAckRequired(ipPath)
 		if self.settings.TcpCollapsePrevention && transferAckRequired {
@@ -6564,9 +6648,11 @@ func (self *RemoteUserNatMultiClient) canSendPacket(
 			// As soon as a packet is sent to a client, Transfer either commits it
 			// end to end or the client is dropped. Inner retransmits do not need to
 			// be sent again while that exact Transfer item is still recovering.
-			if ipPath.Syn || ipPath.Rst {
+			// This decouples reliable serialization from the inner sender's retry
+			// clock; it is not permission to suppress that sender indefinitely.
+			if ipPath.Rst {
 				allow = true
-			} else if update.canUpdateSequence(sendPacket) {
+			} else if update.canUpdateSequenceForClient(sendPacket, currentClient) {
 				// sequence state is guarded by the per-flow `stateLock`, not
 				// the parent `stateLock`
 				allow = true
@@ -6629,6 +6715,11 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 	sendPacketGroup *parsedPacketGroup,
 	timeout time.Duration,
 ) (success bool) {
+	defer func() {
+		if observations := sendPacketGroup.admissionObservations; observations != nil {
+			observations.complete(success)
+		}
+	}()
 	firstPacket := &sendPacketGroup.packets[0]
 	ipPath := sendPacketGroup.ipPath
 	var sentUpdate *multiClientChannelUpdate
@@ -6638,10 +6729,11 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 			self.tcpCollapseDropCount.Add(uint64(len(sendPacketGroup.packets)))
 			return
 		}
-		// Preserve the singular path's pre-admission control semantics. In
-		// particular, a newly bound or racing SYN/RST must clear stale collapse
-		// state even though no current client exists to run the success commit.
-		update.resetSequenceGroup(sendPacketGroup)
+		// Passing the gate is only an offer. Neither SYN generation nor the
+		// hold clock/coverage changes until the selected queue owns the packet.
+		if ipPath.Protocol == IpProtocolTcp && self.settings.TcpCollapsePrevention {
+			sendPacketGroup.prepareCollapseAdmission(update)
+		}
 
 		enterTime := time.Now()
 
@@ -6684,11 +6776,12 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 			if client == nil {
 				return false
 			}
+			sendPacketGroup.prepareAdmissionObservations(client)
 			var err error
 			success, err = client.SendGroupDetailed(sendPacketGroup, sendTimeout)
 			if success {
 				// sequence state is guarded by the per-flow `stateLock`
-				update.commitSequenceGroup(sendPacketGroup)
+				update.commitSequenceGroupForClient(sendPacketGroup, client)
 			} else if err != nil {
 				// reset the path.
 				//
@@ -6812,7 +6905,11 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 					return
 				}
 
-				sent := client.SendGroup(sendPacketGroup, sendTimeout)
+				sendPacketGroup.prepareAdmissionObservations(client)
+				// A one-candidate formation still has an initial race/probe
+				// attempt. Keep that first group reliable; once committed,
+				// sendBoundClient applies the ordinary NoAck UDP policy.
+				sent := client.SendGroupWithAck(sendPacketGroup, sendTimeout, true)
 				var abandonedClients []*multiClientChannel
 				var receivePackets []*receivePacket
 				var returnPackets []*receivePacket
@@ -6848,6 +6945,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 				}
 
 				success = true
+				update.commitSequenceGroupForClient(sendPacketGroup, client)
 				if connectSucceeded {
 					client.addConnectSuccess(update.ipPath.Version)
 					self.clearDestinationServiceFailure(client, update.ipPath)
@@ -6940,6 +7038,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 				}
 
 				var successCount atomic.Int32
+				for _, client := range raceOrderedClients {
+					sendPacketGroup.prepareAdmissionObservations(client)
+				}
 				send := func(client *multiClientChannel) {
 					sent := false
 					select {
@@ -7257,16 +7358,13 @@ func (self *RemoteUserNatMultiClient) sendingChannelCount() int {
 // count as "the pool is demonstrably fine" for the comparative connect cut. The
 // uplink gate's own window when it is configured, so one exit's silence is
 // judged against exactly the freshness bar the tunnel-wide gate uses; otherwise
-// the blackhole poll bound, and a last-resort constant so a bare fixture still
-// gets a sane window instead of zero (which would disable the count).
+// the independent ACK freshness interval. Neither uses the longer carrier
+// read deadline as evidence that a stale sibling is still healthy.
 func (self *RemoteUserNatMultiClient) comparativeReceiveWindow() time.Duration {
 	if window := self.reliabilitySettings().UplinkStalenessGate; 0 < window {
 		return window
 	}
-	if self.settings != nil && 0 < self.settings.BlackholeTimeout {
-		return self.settings.BlackholeTimeout
-	}
-	return 5 * time.Second
+	return blackholeAckFreshnessInterval
 }
 
 // receivingChannelCount reports how many channels OTHER than exclude have
@@ -8865,6 +8963,20 @@ type multiClientChannelUpdate struct {
 	// signed-delta arithmetic (per RFC 1323 PAWS / RFC 7323), wraparound-tolerant
 	// across the 32-bit boundary.
 	sequenceNumber uint32 // guarded by stateLock
+	// A high water alone cannot prove that a lower byte range ever entered
+	// Transfer. One inline contiguous interval records only accepted coverage;
+	// a disjoint admission replaces the proof instead of bridging a hole.
+	sequenceCoveredFrom     uint32
+	sequenceCoveredTo       uint32
+	sequenceAckPosition     uint32
+	sequenceSynNumber       uint32
+	sequenceCovered         bool
+	sequenceAckPositionSeen bool
+	sequenceSynSeen         bool
+	// A failed asynchronous admission invalidates conservative coverage. A
+	// captured epoch prevents callback-before-return from being recommitted.
+	sequenceAdmissionEpoch uint64
+	sequenceClient         *multiClientChannel
 
 	// TCP close observations let the shared reaper retire a completed flow
 	// immediately instead of retaining its route, affinity entries, context,
@@ -9062,7 +9174,7 @@ func (self *multiClientChannelUpdate) resetSequenceGroup(sendPacketGroup *parsed
 // Must be called with stateLock.
 func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPacket) {
 	ipPath := sendPacket.ipPath
-	if ipPath.Syn {
+	if ipPath.Syn && (!self.sequenceSynSeen || self.sequenceSynNumber != ipPath.SequenceNumber) {
 		// A source port can be reused before the old tuple's idle deadline.
 		// A fresh SYN is a new TCP generation and must not inherit either FIN or
 		// ACK edge from the previous connection.
@@ -9077,6 +9189,11 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 		self.openTime = time.Now()
 		self.ackPerformance.reset()
 	}
+	self.sequenceAdmissionEpoch++
+	self.sequenceCovered = false
+	self.sequenceAckPositionSeen = false
+	self.sequenceSynSeen = ipPath.Syn
+	self.sequenceSynNumber = ipPath.SequenceNumber
 
 	self.ackSequenceNumber = ipPath.AckSequenceNumber
 	self.sequenceNumber = ipPath.SequenceNumber
@@ -9088,17 +9205,40 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if sendPacket.ipPath.Rst || sendPacket.ipPath.Syn &&
+		(!self.sequenceSynSeen || self.sequenceSynNumber != sendPacket.ipPath.SequenceNumber) {
+		self.resetSequenceWithLock(sendPacket)
+	}
 	self.updateSequenceWithLock(sendPacket)
 }
 
 // Applies a successful group in order under one existing flow lock. A control
 // packet resets state at its exact position, matching sequential sends.
 func (self *multiClientChannelUpdate) commitSequenceGroup(sendPacketGroup *parsedPacketGroup) {
+	self.commitSequenceGroupForClient(sendPacketGroup, self.client.Load())
+}
+
+func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGroup *parsedPacketGroup, client *multiClientChannel) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if admission := sendPacketGroup.collapseAdmission; admission.update != nil &&
+		admission.epoch != self.sequenceAdmissionEpoch {
+		return
+	}
+	if client != self.client.Load() {
+		// A concurrent rebind must never inherit this old provider's proof.
+		return
+	}
+	if self.sequenceClient != client {
+		self.sequenceCovered = false
+		self.sequenceAckPositionSeen = false
+		self.sequenceSynSeen = false
+		self.sequenceClient = client
+	}
 	for packetIndex := range sendPacketGroup.packets {
 		sendPacket := &sendPacketGroup.packets[packetIndex]
-		if sendPacket.ipPath.Syn || sendPacket.ipPath.Rst {
+		if sendPacket.ipPath.Rst || sendPacket.ipPath.Syn &&
+			(!self.sequenceSynSeen || self.sequenceSynNumber != sendPacket.ipPath.SequenceNumber) {
 			self.resetSequenceWithLock(sendPacket)
 		}
 		self.updateSequenceWithLock(sendPacket)
@@ -9109,7 +9249,7 @@ func (self *multiClientChannelUpdate) commitSequenceGroup(sendPacketGroup *parse
 func (self *multiClientChannelUpdate) updateSequenceWithLock(sendPacket *parsedPacket) {
 
 	ipPath := sendPacket.ipPath
-	update := false
+	update := self.sequencePacketCount == 0
 	var now time.Time
 	if ipPath.Protocol == IpProtocolTcp {
 		if self.ackPerformance.needsTimestamp(ipPath.Ack, ipPath.AckSequenceNumber) {
@@ -9131,18 +9271,23 @@ func (self *multiClientChannelUpdate) updateSequenceWithLock(sendPacket *parsedP
 	nextSequenceNumber := tcpPacketNextSequenceNumber(ipPath, sendPacket.payload)
 	// signed-delta comparison is wraparound-tolerant: > 0 means nextSequenceNumber
 	// is later in TCP sequence space than self.sequenceNumber
-	if 0 < int32(nextSequenceNumber-self.sequenceNumber) {
+	if self.sequencePacketCount == 0 || 0 < int32(nextSequenceNumber-self.sequenceNumber) {
 		self.sequenceNumber = nextSequenceNumber
 		update = true
 	}
 
+	if self.updateSequenceCoverageWithLock(sendPacket) {
+		update = true
+	}
 	if update {
 		self.sequencePacketCount += 1
-		if now.IsZero() {
-			now = time.Now()
-		}
-		self.sequenceTime = now
 	}
+	// Even an identical hold escape restarts the bound, but only after real
+	// successful admission. A refusal leaves the retry immediately eligible.
+	if now.IsZero() {
+		now = time.Now()
+	}
+	self.sequenceTime = now
 }
 
 // tcpPacketNextSequenceNumber returns the right edge occupied by this segment.
@@ -9224,8 +9369,8 @@ func (self *multiClientChannelUpdate) observeEgressTcpGroup(sendPacketGroup *par
 	return false
 }
 
-// releaseSequenceHold reports whether the flow has sat at the same sequence
-// state for at least maxHold, and when it has, restarts the window.
+// releaseSequenceHold is a read-only offer: successful admission, not a gate
+// check or queue refusal, restarts the window in updateSequenceWithLock.
 //
 // TcpCollapsePrevention discards a sender's retransmits on the premise that the
 // packet already committed to a client will either be delivered reliably or the
@@ -9234,9 +9379,9 @@ func (self *multiClientChannelUpdate) observeEgressTcpGroup(sendPacketGroup *par
 // are discarded for as long as failure detection takes (up to AckTimeout, 30s),
 // and the flow is frozen the whole time.
 //
-// Restarting the window on release means at most one retransmit is admitted per
-// maxHold rather than the whole backlog, so collapse prevention still holds
-// during a normal stall while a genuinely stuck flow keeps a way to recover.
+// Concurrent callers may both see the same offer. This deliberately fails
+// open; suppressing one before the other actually owns its bytes would hide
+// the only recovery when that other admission is refused.
 func (self *multiClientChannelUpdate) releaseSequenceHold(maxHold time.Duration) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -9250,7 +9395,6 @@ func (self *multiClientChannelUpdate) releaseSequenceHold(maxHold time.Duration)
 	if now.Sub(self.sequenceTime) < maxHold {
 		return false
 	}
-	self.sequenceTime = now
 	return true
 }
 
@@ -9264,14 +9408,28 @@ func (self *multiClientChannelUpdate) sourceRstSequence() uint32 {
 }
 
 func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket) bool {
+	return self.canUpdateSequenceForClient(sendPacket, nil)
+}
+
+func (self *multiClientChannelUpdate) canUpdateSequenceForClient(sendPacket *parsedPacket, client *multiClientChannel) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	if self.sequencePacketCount == 0 {
+	if self.sequencePacketCount == 0 || self.sequenceClient != nil && self.sequenceClient != client {
 		return true
 	}
 
 	ipPath := sendPacket.ipPath
+	if ipPath.Syn {
+		if !self.sequenceSynSeen || self.sequenceSynNumber != ipPath.SequenceNumber {
+			return true
+		}
+		// A same-ISN SYN is not a new generation. An admitted empty SYN
+		// remains redundant even after later packets changed ACK/window state.
+		if len(sendPacket.payload) == 0 {
+			return false
+		}
+	}
 
 	if self.ackSequenceNumber != ipPath.AckSequenceNumber {
 		return true
@@ -9280,15 +9438,7 @@ func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket
 		return true
 	}
 
-	nextSequenceNumber := tcpPacketNextSequenceNumber(ipPath, sendPacket.payload)
-	// strict signed-delta > 0 mirrors updateSequence; treating equality as
-	// "can update" would let identical retransmits pass the gate even though
-	// updateSequence won't advance state, defeating TcpCollapsePrevention.
-	if 0 < int32(nextSequenceNumber-self.sequenceNumber) {
-		return true
-	}
-
-	return false
+	return !self.sequenceCoversWithLock(sendPacket)
 }
 
 // commitRaceClientWithLock makes client the race winner and transfers every
@@ -9442,16 +9592,19 @@ type parsedPacket struct {
 	// site (probes, tests) gets the zero value = unpinned.
 	pin                  flowPin
 	transportAttribution *transportPacketAttribution
+	collapseAdmission    tcpCollapseAdmission
 }
 
 // One exact directional flow carried through policy, provider selection, and
 // Transfer admission without decomposing back into independently routed sends.
 type parsedPacketGroup struct {
-	packets              []parsedPacket
-	ipPath               *IpPath
-	pin                  flowPin
-	byteCount            ByteCount
-	transportAttribution *transportPacketAttribution
+	packets               []parsedPacket
+	ipPath                *IpPath
+	pin                   flowPin
+	byteCount             ByteCount
+	transportAttribution  *transportPacketAttribution
+	admissionObservations *sendPackAdmissionObservations
+	collapseAdmission     tcpCollapseAdmission
 }
 
 // flowPin is what a pin rule resolved to for one flow: the owning pinned
@@ -12655,6 +12808,12 @@ type clientWindowStats struct {
 	firstSendAckTime     time.Time
 	firstSendNackTime    time.Time
 	firstSendSynTime     time.Time
+	// A snapshot of the lifetime outstanding-send clock, not a rolling
+	// bucket. sendProgressKnown distinguishes an idle real channel from old
+	// synthetic stats that only carry firstSendNackTime.
+	pendingSendTime     time.Time
+	sendProgressKnown   bool
+	peerSendAckInWindow bool
 	// firstUnansweredSendSynTime is the start of the CURRENT unanswered
 	// connect attempt: set when a SYN goes out and no attempt is pending,
 	// left alone by SYN retransmits (the device stack retransmits at 1s, 2s,
@@ -12839,6 +12998,9 @@ type multiClientChannel struct {
 	// sourceFilter map[TransferPath]bool
 
 	client *Client
+	// Optional generator-owned effective carrier settings. Read only in the
+	// health poll, without stateLock held; not on a per-packet hot path.
+	readTimeoutProvider MultiClientGeneratorReadTimeout
 	// contractReliabilityOnce makes the platform's terminal destination
 	// verdict one lifecycle transition. Duplicate status frames may be
 	// dispatched concurrently, but they must not schedule unbounded window
@@ -12946,7 +13108,11 @@ type multiClientChannel struct {
 
 	// pendingSendTime is when the current run of unacked sends began, reset on
 	// every ack. With sendNackCount > 0 it is the age of the oldest unmade
-	// progress, which is what sendStalled tests. Guarded by stateLock.
+	// progress, used by sendStalled and the read-aligned no-send-ACK verdict.
+	// Rolling stats never expire it. Only peer ACK progress, a fully abandoned
+	// outstanding run, or the explicit carrier-down rebase may reset it; a
+	// route write, resend, or busy-probe ACK is not packet delivery.
+	// Guarded by stateLock.
 	pendingSendTime time.Time
 
 	// the busy-flow liveness probe's state (see busyLivenessProbe). All three
@@ -13177,7 +13343,11 @@ func newMultiClientChannel(
 		// in the same connect burst do not all drain in the same resize pass
 		effectiveLifetime: jitterClientLifetime(settings.MaxClientLifetime),
 		// sourceFilter: sourceFilter,
-		client:                    client,
+		client: client,
+		readTimeoutProvider: func() MultiClientGeneratorReadTimeout {
+			provider, _ := generator.(MultiClientGeneratorReadTimeout)
+			return provider
+		}(),
 		eventBuckets:              []*multiClientEventBucket{},
 		ip4DestinationSourceCount: map[Ip4Path]map[Ip4Path]int{},
 		ip6DestinationSourceCount: map[Ip6Path]map[Ip6Path]int{},
@@ -13769,8 +13939,9 @@ func (self *multiClientChannel) hasActiveTransport() bool {
 	return self.client.RouteManager().HasActiveTransport()
 }
 
-// hasActiveUnreliableSendTransport distinguishes a registered carrier from
-// one whose successful write proves delivery. Bare fixtures retain reliable
+// hasActiveUnreliableSendTransport distinguishes an explicitly lossy carrier
+// from a reliable one. A reliable local write still does NOT prove peer
+// delivery while its TCP stream is recovering. Bare fixtures retain reliable
 // semantics so existing classifier tests opt into the weaker evidence
 // explicitly.
 func (self *multiClientChannel) hasActiveUnreliableSendTransport() bool {
@@ -13778,6 +13949,18 @@ func (self *multiClientChannel) hasActiveUnreliableSendTransport() bool {
 		return false
 	}
 	return self.client.RouteManager().HasActiveUnreliableSendTransport()
+}
+
+func (self *multiClientChannel) noSendAckTimeout() time.Duration {
+	if self.readTimeoutProvider != nil {
+		if timeout, ok := self.readTimeoutProvider.ClientReadTimeout(self.client); ok {
+			return timeout
+		}
+	}
+	if self.settings != nil {
+		return self.settings.BlackholeTimeout
+	}
+	return defaultPlatformTransportReadTimeout
 }
 
 // setStalled makes the channel swallow packets without acknowledging or
@@ -14718,18 +14901,20 @@ func (self *multiClientChannel) ipPacketTransferAckRequired(ipPath *IpPath) bool
 		ipPath,
 		allowDirect,
 		self.settings.UdpCollapsePrevention,
+		self.settings.UdpTransferNoAck,
 	)
 }
 
 // TCP always retains end-to-end Transfer acknowledgement. A reliable carrier
-// only guarantees delivery for the lifetime of that carrier; it cannot prove
-// delivery across a disconnect or route replacement. UDP/ICMP retain datagram
-// semantics on direct paths and when collapse prevention explicitly selects
-// them on a non-direct path.
+// only guarantees delivery for its own lifetime, not across route replacement.
+// A bound UDP flow defaults to datagram semantics; initial provider races
+// explicitly override this policy with ACK-required sends. ICMP retains its
+// existing direct/collapse setting.
 func ipPacketTransferAckRequired(
 	ipPath *IpPath,
 	allowDirect bool,
 	udpCollapsePrevention bool,
+	udpTransferNoAck bool,
 ) bool {
 	if ipPacketTransferAckForRequest(ipPath, false) {
 		return true
@@ -14738,7 +14923,9 @@ func ipPacketTransferAckRequired(
 		return false
 	}
 	switch ipPath.Protocol {
-	case IpProtocolUdp, IpProtocolIcmp:
+	case IpProtocolUdp:
+		return !udpTransferNoAck && !udpCollapsePrevention
+	case IpProtocolIcmp:
 		return !udpCollapsePrevention
 	default:
 		return true
@@ -14748,6 +14935,9 @@ func ipPacketTransferAckRequired(
 // Applies the non-negotiable part of IP recovery policy at the final
 // packet-to-Transfer boundary. TCP and unclassified packets cannot be demoted
 // to NoAck by a caller; an affirmative request for any protocol is preserved.
+// The receiver has no reliable Transfer window for NoAck IP packets, so inner
+// TCP retries alone do not provide this boundary's retention/serialization.
+// TCP collapse prevention relies on the ACK-required item owning that recovery.
 func ipPacketTransferAckForRequest(ipPath *IpPath, requested bool) bool {
 	return requested || ipPath == nil || ipPath.Protocol == IpProtocolTcp
 }
@@ -14780,11 +14970,12 @@ func sendMultiClientGroupRaceAttempt(
 	timeout time.Duration,
 ) bool {
 	sharedGroup := &parsedPacketGroup{
-		packets:              make([]parsedPacket, len(sendPacketGroup.packets)),
-		ipPath:               sendPacketGroup.ipPath,
-		pin:                  sendPacketGroup.pin,
-		byteCount:            sendPacketGroup.byteCount,
-		transportAttribution: sendPacketGroup.transportAttribution,
+		packets:               make([]parsedPacket, len(sendPacketGroup.packets)),
+		ipPath:                sendPacketGroup.ipPath,
+		pin:                   sendPacketGroup.pin,
+		byteCount:             sendPacketGroup.byteCount,
+		transportAttribution:  sendPacketGroup.transportAttribution,
+		admissionObservations: sendPacketGroup.admissionObservations,
 	}
 	for packetIndex := range sendPacketGroup.packets {
 		sharedGroup.packets[packetIndex] = sendPacketGroup.packets[packetIndex]
@@ -14841,9 +15032,8 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	timeout time.Duration,
 	ack bool,
 ) (bool, error) {
-	// This is the final packet-to-Transfer boundary. Keep TCP recovery
-	// end-to-end even if a lower-level or future caller explicitly requests
-	// NoAck; carrier reliability cannot commit an item across disconnect.
+	// Enforce TCP ACK recovery at the final grouped boundary; no caller can
+	// demote it to NoAck or weaken an affirmative reliable commit.
 	ack = ipPacketTransferAckForRequest(sendPacketGroup.ipPath, ack)
 	if self.sendGroupForTest != nil {
 		return self.sendGroupForTest(sendPacketGroup, timeout, ack)
@@ -14880,10 +15070,18 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	var completionOnce sync.Once
 	ackCallback := func(err error) {
 		completionOnce.Do(func() {
+			sendPacketGroup.collapseAdmission.complete(err)
 			self.observePacketGroupTransferCompletion(sendPacketGroup, ack, err)
 		})
 	}
 	opts := []any{scheduleIpFlow(sendPacketGroup.ipPath)}
+	if sendPacketGroup.admissionObservations != nil && self.client != nil {
+		if observer := self.client.settings.SendBufferSettings.SendPackLifecycleObserver; observer != nil {
+			opts = append(opts, sendPackLifecycleObserverOption{
+				observer: sendPacketGroup.admissionObservations.wrap(observer),
+			})
+		}
+	}
 	if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
 		opts = append(opts, ForceStream())
 	}
@@ -14927,8 +15125,8 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 }
 
 func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) (bool, error) {
-	// Match the grouped boundary above. TCP is never converted to Transfer
-	// NoAck, regardless of the selected carrier or the caller's hint.
+	// Match the grouped boundary: TCP always retains Transfer ACK recovery,
+	// even when the caller explicitly requests NoAck.
 	ack = ipPacketTransferAckForRequest(parsedPacket.ipPath, ack)
 	if frame, err := ipPacketToProviderFrame(parsedPacket.packet, self.settings.ProtocolVersion); err != nil {
 		self.addError(err)
@@ -14965,8 +15163,10 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		}
 
 		var completionOnce sync.Once
+		collapseAdmission := parsedPacket.collapseAdmission
 		ackCallback := func(err error) {
 			completionOnce.Do(func() {
+				collapseAdmission.complete(err)
 				self.observePacketTransferCompletion(packetByteCount, sendTime, ack, err)
 			})
 		}
@@ -15045,7 +15245,7 @@ func (self *multiClientChannel) observePacketTransferCompletion(
 	err error,
 ) {
 	if err == nil {
-		self.addSendAck(packetByteCount)
+		self.addSendCompletion(packetByteCount, ack)
 		if ack {
 			self.addSendRttSample(self.packetTransferNow().Sub(sendTime))
 		}
@@ -15130,7 +15330,7 @@ func (self *multiClientChannel) observePacketGroupTransferCompletion(
 	err error,
 ) {
 	if err == nil {
-		self.addSendAckGroup(sendPacketGroup)
+		self.addSendGroupCompletion(sendPacketGroup, ack)
 		return
 	}
 	if packetTransferExpiredUnwritten(err) {
@@ -15191,17 +15391,19 @@ const (
 //
 // The signals differ in strength, so they get different bars:
 //
-//   - The provider acknowledges nothing. It is not there. Unambiguous, acted
-//     on at blackholeTimeout.
+//   - Outstanding sends make no peer-ACK progress for the carrier read
+//     interval. Before that deadline a reliable H1 carrier can still be
+//     recovering TCP loss; one resend is not proof that the provider is gone.
 //   - The provider acknowledges our sends but no destination data comes back.
 //     It is demonstrably alive, and may simply be carrying a flow waiting on a
 //     slow origin. Removing an exit destroys every flow pinned to it, not just
-//     the quiet one, so this needs receiveTimeout -- a longer bar.
+//     the quiet one, so this needs receiveTimeout plus corroboration and
+//     quarantine rather than borrowing the no-send-ACK deadline.
 //
 // Sharing one 5s bound removed 44 providers out of 44 on mainnet, about one
 // every 18s under load, every one still acknowledging sends (up to 602 sends /
 // 222KB). receiveTimeout of 0 disables the weaker check, leaving only the
-// unambiguous one.
+// read-aligned send check.
 //
 // IMPORTANT: receiveTimeout has a hard ceiling of roughly
 // StatsWindowDuration + StatsWindowBucketDuration (~31s at production
@@ -15227,9 +15429,9 @@ type blackholeGates struct {
 	unreliableSendTransport bool
 	// uplinkStale: tunnel-wide ingress silence past the uplink gate. The
 	// phone's own uplink is the prime suspect, so the receive verdicts --
-	// which convict purely on silence -- are held. No-send-ack remains
-	// independent proof on a reliable carrier; the carrier-aware gate above
-	// handles it separately on an unreliable carrier.
+	// which convict purely on silence -- are held. Reliable no-send-ACK uses
+	// the full read interval, and the carrier-aware gate above handles
+	// unreliable delivery separately.
 	uplinkStale bool
 	// receiveFreshSince is when the last inadmissible-evidence epoch ended:
 	// the end of the last uplink-stale epoch, or this channel's last
@@ -15284,6 +15486,31 @@ func unansweredConnectSince(windowStats *clientWindowStats) time.Time {
 		return windowStats.firstSendSynTime
 	}
 	return time.Time{}
+}
+
+// unacknowledgedSendSince is independent of the telemetry retention window.
+// pendingSendTime restarts on any peer ACK while sends remain outstanding.
+// Historical ACK counters therefore cannot mask a later stalled run, and
+// trimming the original NACK bucket cannot erase a genuinely silent run.
+func unacknowledgedSendSince(windowStats *clientWindowStats) time.Time {
+	if windowStats.sendProgressKnown {
+		if 0 < windowStats.sendNackCount {
+			return windowStats.pendingSendTime
+		}
+		return time.Time{}
+	}
+	// Compatibility for bare classifier fixtures without lifetime state.
+	if windowStats.sendAckCount <= 0 {
+		return windowStats.firstSendNackTime
+	}
+	return time.Time{}
+}
+
+func hasPeerSendAckInWindow(windowStats *clientWindowStats) bool {
+	if windowStats.sendProgressKnown {
+		return windowStats.peerSendAckInWindow
+	}
+	return 0 < windowStats.sendAckCount
 }
 
 // rebaseReceiveClock moves a receive-branch clock forward onto the end of the
@@ -15444,14 +15671,19 @@ func blackholeReasonFromStats(
 		return rebaseReceiveClock(clockStart, gates.receiveFreshSince)
 	}
 
-	if !windowStats.firstSendNackTime.IsZero() {
-		sendNackAge := now.Sub(windowStats.firstSendNackTime)
-
-		if blackholeTimeout <= sendNackAge && windowStats.sendAckCount <= 0 {
+	if pendingSince := unacknowledgedSendSince(windowStats); !pendingSince.IsZero() {
+		if 0 < blackholeTimeout && blackholeTimeout <= now.Sub(pendingSince) {
 			return verdict(blackholeNoSendAck, false)
 		}
+	}
+	if !windowStats.firstSendNackTime.IsZero() {
 		receiveNackAge := now.Sub(receiveClockStart(windowStats.firstSendNackTime))
 		if 0 < receiveTimeout && receiveTimeout <= receiveNackAge && windowStats.receiveAckCount <= 0 &&
+			// This is the ACKing-provider/no-destination-response branch.
+			// Without a true peer ACK it must not become an earlier substitute
+			// for the read-aligned no-send-ACK deadline. NoAck write completion
+			// contributes counters, not this liveness evidence.
+			hasPeerSendAckInWindow(windowStats) &&
 			// the corroboration bar: one destination's silence must not
 			// convict an exit that is demonstrably alive (it is acking the
 			// sends). 0/1 keeps the pre-change behavior. deliberately not a
@@ -15610,9 +15842,9 @@ func verdictAction(
 	if reason == blackholeNone {
 		return verdictActionNone
 	}
-	// no-send-ack is the one hard verdict here and is untouched by the
-	// demote: it must stay as fast as it was, because it covers the provider
-	// that is simply gone
+	// No-send-ACK becomes a hard verdict only after the classifier has
+	// allowed the full carrier read interval. Transfer's own logical ACK
+	// deadline may win at the same boundary; neither timer is a resend clock.
 	if reason == blackholeNoSendAck {
 		return verdictActionExecute
 	}
@@ -15820,7 +16052,7 @@ func (self *multiClientChannel) detectBlackhole() {
 				receiveFreshSince,
 				self.receivingSiblings,
 				func() bool {
-					return self.hasRecentSendAck(self.settings.BlackholeTimeout)
+					return self.hasRecentSendAck(blackholeAckFreshnessInterval)
 				},
 			)
 
@@ -15832,7 +16064,7 @@ func (self *multiClientChannel) detectBlackhole() {
 			reason, held := blackholeReasonFromStats(
 				now,
 				windowStats,
-				self.settings.BlackholeTimeout,
+				self.noSendAckTimeout(),
 				self.reliabilitySettings().BlackholeReceiveTimeout,
 				connectTimeout,
 				blackholeGates{
@@ -16027,6 +16259,10 @@ func (self *multiClientChannel) detectBlackhole() {
 						// blackhole) from "one destination silent" (a dead
 						// website that squeaked past a lowered gate) on the one
 						// line that survives into a field log.
+						nackSince := windowStats.firstSendNackTime
+						if reason == blackholeNoSendAck {
+							nackSince = unacknowledgedSendSince(windowStats)
+						}
 						self.addError(fmt.Errorf(
 							"Blackhole %s%s (send %d/%dB recv %d/%dB syn %d/%d nackAge %s synAge %s dsts=%d)",
 							reason,
@@ -16037,7 +16273,7 @@ func (self *multiClientChannel) detectBlackhole() {
 							windowStats.receiveAckByteCount,
 							windowStats.sendSynCount,
 							windowStats.receiveSynCount,
-							blackholeAgeString(windowStats.firstSendNackTime),
+							blackholeAgeString(nackSince),
 							blackholeAgeString(windowStats.firstSendSynTime),
 							windowStats.sendDestinationCount,
 						))
@@ -16083,7 +16319,7 @@ func (self *multiClientChannel) detectBlackhole() {
 				return
 			case <-self.client.Done():
 				return
-			case <-time.After(self.settings.BlackholeTimeout / 4):
+			case <-time.After(blackholePollInterval):
 			}
 		}
 	}
@@ -16333,6 +16569,9 @@ func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if self.packetStats.sendNackCount == 0 {
+		self.pendingSendTime = time.Now()
+	}
 	self.packetStats.sendNackCount += 1
 	self.packetStats.sendNackByteCount += ackByteCount
 
@@ -16345,6 +16584,13 @@ func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 }
 
 func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
+	self.addSendCompletion(ackByteCount, true)
+}
+
+// A successful NoAck route write retires its local outstanding owner and
+// contributes throughput accounting, but proves no peer ACK progress. It must
+// not refresh the no-ACK clock of another reliable send on the same channel.
+func (self *multiClientChannel) addSendCompletion(ackByteCount ByteCount, peerAck bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -16352,9 +16598,12 @@ func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
 	self.packetStats.sendNackByteCount -= ackByteCount
 	self.packetStats.sendAckCount += 1
 	self.packetStats.sendAckByteCount += ackByteCount
-	self.lastSendAckTime = time.Now()
-	// an ack is progress, so the stall clock restarts here
-	self.pendingSendTime = time.Now()
+	if peerAck {
+		self.lastSendAckTime = time.Now()
+		self.pendingSendTime = self.lastSendAckTime
+	} else if self.packetStats.sendNackCount <= 0 {
+		self.pendingSendTime = time.Time{}
+	}
 
 	eventBucket := self.eventBucket()
 	if eventBucket.sendAckCount == 0 {
@@ -16366,6 +16615,10 @@ func (self *multiClientChannel) addSendAck(ackByteCount ByteCount) {
 
 // Retires one logical group's packet-accurate outstanding accounting.
 func (self *multiClientChannel) addSendAckGroup(sendPacketGroup *parsedPacketGroup) {
+	self.addSendGroupCompletion(sendPacketGroup, true)
+}
+
+func (self *multiClientChannel) addSendGroupCompletion(sendPacketGroup *parsedPacketGroup, peerAck bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -16374,8 +16627,12 @@ func (self *multiClientChannel) addSendAckGroup(sendPacketGroup *parsedPacketGro
 	self.packetStats.sendNackByteCount -= sendPacketGroup.byteCount
 	self.packetStats.sendAckCount += packetCount
 	self.packetStats.sendAckByteCount += sendPacketGroup.byteCount
-	self.lastSendAckTime = time.Now()
-	self.pendingSendTime = time.Now()
+	if peerAck {
+		self.lastSendAckTime = time.Now()
+		self.pendingSendTime = self.lastSendAckTime
+	} else if self.packetStats.sendNackCount <= 0 {
+		self.pendingSendTime = time.Time{}
+	}
 
 	eventBucket := self.eventBucket()
 	if eventBucket.sendAckCount == 0 {
@@ -16759,6 +17016,9 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		windowDuration:             windowDuration,
 		firstSendAckTime:           firstSendAckTime,
 		firstSendNackTime:          firstSendNackTime,
+		pendingSendTime:            self.pendingSendTime,
+		sendProgressKnown:          true,
+		peerSendAckInWindow:        !self.lastSendAckTime.IsZero() && time.Since(self.lastSendAckTime) <= self.settings.StatsWindowDuration,
 		firstSendSynTime:           firstSendSynTime,
 		firstUnansweredSendSynTime: self.packetStats.firstUnansweredSendSynTime,
 		bucketCount:                len(eventBuckets),

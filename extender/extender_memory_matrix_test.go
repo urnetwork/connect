@@ -32,30 +32,7 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 			t.Run(string(inner)+"/"+outer, func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 				defer cancel()
-				var destination string
-				var packetDestination string
-				fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
-					settings.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-						return (&net.Dialer{}).DialContext(ctx, network, destination)
-					}
-					settings.DialPacketContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-						if address != packetDestination {
-							return nil, fmt.Errorf("extender destination = %q, want unresolved %q", address, packetDestination)
-						}
-						return (&net.Dialer{}).DialContext(ctx, network, destination)
-					}
-				})
-				// H3 must keep the upstream named-destination routing while
-				// carrying its device memory owner through the same dial seam.
-				fixture.server.allowedHosts = append(fixture.server.allowedHosts, "127.0.0.1", "alt.invalid")
-				destination = newExtenderMemoryPlatformPeer(t, ctx, fixture.destination.certificate, inner)
-				_, portString, err := net.SplitHostPort(destination)
-				if err != nil {
-					t.Fatal(err)
-				}
-				var port int
-				fmt.Sscan(portString, &port)
-				packetDestination = net.JoinHostPort("alt.invalid", portString)
+				fixture, port, packetDestination := newExtenderMemoryFixture(t, ctx, inner)
 				strategySettings := connect.DefaultClientStrategySettings()
 				strategySettings.ConnectSettings = *fixture.connectSettings()
 				strategySettings.TlsConfig = &tls.Config{InsecureSkipVerify: true} // local synthetic destination
@@ -185,6 +162,38 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 			})
 		}
 	}
+}
+
+func newExtenderMemoryFixture(t *testing.T, ctx context.Context, inner connect.TransportMode) (*extenderFixture, int, string) {
+	t.Helper()
+	var port int
+	var packetDestination string
+	fixture := newExtenderFixtureWithSetup(t, "127.0.0.1", []string{testSecret}, []string{"127.0.0.1", "alt.invalid"}, func(fixture *extenderFixture, settings *ExtenderSettings) {
+		// Resolve the fixture endpoints before the server publishes either dial
+		// callback. The callbacks capture values that never change while serving.
+		destination := newExtenderMemoryPlatformPeer(t, ctx, fixture.destination.certificate, inner)
+		_, portString, err := net.SplitHostPort(destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Sscan(portString, &port); err != nil {
+			t.Fatal(err)
+		}
+		packetAddress := net.JoinHostPort("alt.invalid", portString)
+		packetDestination = packetAddress
+		settings.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, destination)
+		}
+		// H3 keeps the upstream named-destination routing while carrying its
+		// device memory owner through the same dial seam.
+		settings.DialPacketContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			if address != packetAddress {
+				return nil, fmt.Errorf("extender destination = %q, want unresolved %q", address, packetAddress)
+			}
+			return (&net.Dialer{}).DialContext(ctx, network, destination)
+		}
+	})
+	return fixture, port, packetDestination
 }
 
 func newExtenderMemoryPlatformPeer(t *testing.T, ctx context.Context, certificate *tls.Certificate, mode connect.TransportMode) string {

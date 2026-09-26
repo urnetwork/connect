@@ -7,14 +7,15 @@ import (
 	"time"
 )
 
-// TCP is acknowledged even on a direct-capable carrier. Only the historical
-// UDP collapse option changes a non-direct datagram route.
+// TCP is acknowledged even on a direct-capable carrier. Established UDP uses
+// NoAck by default; the explicit legacy setting keeps a control arm available.
 func TestIpPacketTransferAckRequired(t *testing.T) {
 	tests := []struct {
 		name                  string
 		protocol              IpProtocol
 		allowDirect           bool
 		udpCollapsePrevention bool
+		udpTransferNoAck      bool
 		ackRequired           bool
 	}{
 		{
@@ -41,7 +42,13 @@ func TestIpPacketTransferAckRequired(t *testing.T) {
 			ackRequired: true,
 		},
 		{
-			name:        "platform udp",
+			name:             "platform udp default",
+			protocol:         IpProtocolUdp,
+			udpTransferNoAck: true,
+			ackRequired:      false,
+		},
+		{
+			name:        "platform udp ack control",
 			protocol:    IpProtocolUdp,
 			ackRequired: true,
 		},
@@ -51,12 +58,19 @@ func TestIpPacketTransferAckRequired(t *testing.T) {
 			udpCollapsePrevention: true,
 			ackRequired:           false,
 		},
+		{
+			name:             "platform icmp unaffected",
+			protocol:         IpProtocolIcmp,
+			udpTransferNoAck: true,
+			ackRequired:      true,
+		},
 	}
 	for _, test := range tests {
 		ackRequired := ipPacketTransferAckRequired(
 			&IpPath{Protocol: test.protocol},
 			test.allowDirect,
 			test.udpCollapsePrevention,
+			test.udpTransferNoAck,
 		)
 		if ackRequired != test.ackRequired {
 			t.Fatalf(
@@ -67,8 +81,11 @@ func TestIpPacketTransferAckRequired(t *testing.T) {
 			)
 		}
 	}
-	if !ipPacketTransferAckRequired(nil, false, true) {
+	if !ipPacketTransferAckRequired(nil, false, true, true) {
 		t.Fatal("missing IP metadata disabled compatibility acknowledgement")
+	}
+	if !DefaultMultiClientSettings().UdpTransferNoAck {
+		t.Fatal("steady-state UDP no-ACK default is disabled")
 	}
 }
 

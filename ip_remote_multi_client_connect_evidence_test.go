@@ -194,10 +194,14 @@ func TestMultiClientReconnectAfterAnsweredConnectIsBlackhole(t *testing.T) {
 	// would have left it
 	stats.receiveSynCount = 0
 	stats.receiveAckCount = 0
+	// Isolate the unanswered-connect clock. This fixture never supplied a
+	// peer send ACK either, so its persistent no-ACK clock also legitimately
+	// matures at the default 30s read boundary; that independent reason is
+	// covered by TestBlackholeReadTimeoutRealTransferBoundary.
 	reason, _ := blackholeReasonFromStats(
 		rearmed.Add(settings.BlackholeConnectTimeout+time.Second),
 		stats,
-		settings.BlackholeTimeout,
+		0,
 		0,
 		settings.BlackholeConnectTimeout,
 		blackholeGates{},

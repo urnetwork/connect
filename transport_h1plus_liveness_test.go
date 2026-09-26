@@ -108,7 +108,7 @@ type h1LivenessFixture struct {
 
 // Call inside a synctest bubble after priming the package's lazy pool outside.
 // No DNS, TLS, listening socket, host configuration or production identity is used.
-func newH1LivenessFixture(t *testing.T) *h1LivenessFixture {
+func newH1LivenessFixture(t *testing.T, configure ...func(*PlatformTransportSettings)) *h1LivenessFixture {
 	t.Helper()
 	return newH1LivenessFixtureWithBackpressure(t, false, 0)
 }
@@ -218,6 +218,9 @@ func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTim
 		} else {
 			fixture.withdrawn.Add(1)
 		}
+	}
+	for _, apply := range configure {
+		apply(settings)
 	}
 	fixture.routes = NewRouteManagerWithLogger(ctx, "synthetic-h1-liveness", NewNoopLogger())
 	fixture.transport = NewPlatformTransportWithTargetMode(ctx, fixture.strategy, fixture.routes,

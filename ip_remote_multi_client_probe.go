@@ -1268,9 +1268,11 @@ func (self *multiClientChannel) sendProbe(parsedPacket *parsedPacket, timeout ti
 		return false
 	}
 
-	var opts []any
+	opts := [2]any{sendPackHealthProbeOption{}}
+	optionCount := 1
 	if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
-		opts = append(opts, ForceStream())
+		opts[optionCount] = ForceStream()
+		optionCount++
 	}
 
 	success, err := self.client.SendMultiHopWithTimeoutDetailed(
@@ -1280,7 +1282,7 @@ func (self *multiClientChannel) sendProbe(parsedPacket *parsedPacket, timeout ti
 		// accounting does not observe it
 		nil,
 		timeout,
-		opts...,
+		opts[:optionCount]...,
 	)
 	// ownership mirrors SendDetailedWithAck: the packet is consumed on success,
 	// the wrapped marshal buffer is freed on failure. Probe packets are plain

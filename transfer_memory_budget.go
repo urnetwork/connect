@@ -269,6 +269,60 @@ func (self *TransferMemoryBudget) Release(byteCount ByteCount) {
 	self.notifyCapacityChanged()
 }
 
+// tryMoveReservation transfers an already-owned claim inside one immutable
+// budget tree. Common ancestors keep the same charge throughout the move:
+// neither a transient double reservation nor a release/reacquire gap is safe
+// when a receiver hands retained bytes to a downstream owner at a full root.
+// The caller must exclusively own byteCount of self's existing reservation.
+// Cross-root moves are deliberately unsupported; there is no shared atomic
+// admission boundary for them.
+func (self *TransferMemoryBudget) tryMoveReservation(target *TransferMemoryBudget, byteCount ByteCount) bool {
+	if self == nil || target == nil || byteCount < 0 || self.admissionRoot() != target.admissionRoot() {
+		return false
+	}
+	root := self.admissionRoot()
+	root.admissionLock.Lock()
+	contains := func(chain, member *TransferMemoryBudget) bool {
+		for budget := chain; budget != nil; budget = budget.parent {
+			if budget == member {
+				return true
+			}
+		}
+		return false
+	}
+	// Validate the complete move before changing any counter. A shrunken
+	// common ancestor can retain its existing owner without admitting growth.
+	for budget := self; budget != nil; budget = budget.parent {
+		if budget.usedByteCount.Load() < byteCount {
+			root.admissionLock.Unlock()
+			return false
+		}
+	}
+	for budget := target; budget != nil; budget = budget.parent {
+		if !contains(self, budget) && budget.totalByteCount.Load()-budget.usedByteCount.Load() < byteCount {
+			root.admissionLock.Unlock()
+			return false
+		}
+	}
+	for budget := self; budget != nil; budget = budget.parent {
+		if !contains(target, budget) {
+			budget.usedByteCount.Add(-byteCount)
+			budget.releasedByteCount.Add(byteCount)
+		}
+	}
+	for budget := target; budget != nil; budget = budget.parent {
+		if !contains(self, budget) {
+			budget.usedByteCount.Add(byteCount)
+			budget.reservedByteCount.Add(byteCount)
+		}
+	}
+	root.admissionLock.Unlock()
+	if self != target && byteCount != 0 {
+		self.notifyCapacityChanged()
+	}
+	return true
+}
+
 // CapacityNotify returns a channel closed the next time a release or resize
 // may make admission possible. Capture it before TryReserve to avoid a lost
 // wakeup.

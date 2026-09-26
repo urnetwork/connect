@@ -1510,7 +1510,13 @@ func (self *P2pSendTransport) run() {
 				}
 				legacyQueue = newP2pLegacySendQueueWithProbes(self.ctx, self.cancel, writeLegacy, self.settings.LegacySendQueueByteCount, budget, probeSender)
 			}
-			deadline := time.Now().Add(self.settings.WriteTimeout)
+			// WriteTimeout bounds one physical SCTP write, not its wait behind
+			// earlier writes. A queued absolute deadline can be nearly expired
+			// before an otherwise healthy write starts and tear down both P2P
+			// directions. Zero starts the unchanged timeout in writeLegacy;
+			// queue capacity/context and Transfer's ACK lifetime remain bounded
+			// independently, including during ordered flushes and priority waits.
+			deadline := time.Time{}
 			var err error
 			if legacyQueue != nil {
 				if probeMessage || messagePoolIsSmallUnordered(transferFrameBytes) {

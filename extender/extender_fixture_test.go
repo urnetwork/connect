@@ -354,6 +354,24 @@ func newExtenderFixtureWithSecrets(
 	configure func(settings *ExtenderSettings),
 ) *extenderFixture {
 	t.Helper()
+	return newExtenderFixtureWithSetup(t, loopbackIp, allowedSecrets, nil, func(_ *extenderFixture, settings *ExtenderSettings) {
+		if configure != nil {
+			configure(settings)
+		}
+	})
+}
+
+// Finalize the host policy and dial seams before construction snapshots the
+// proxy whitelist and before serving publishes them to any carrier worker.
+// Setup can use the destination certificate to build another local peer.
+func newExtenderFixtureWithSetup(
+	t *testing.T,
+	loopbackIp string,
+	allowedSecrets []string,
+	extraAllowedHosts []string,
+	configure func(fixture *extenderFixture, settings *ExtenderSettings),
+) *extenderFixture {
+	t.Helper()
 	ip, err := netip.ParseAddr(loopbackIp)
 	if err != nil {
 		t.Fatal(err)
@@ -454,7 +472,7 @@ func newExtenderFixtureWithSecrets(
 		fixture.acceptedHopCounts.add(header.HopCount)
 	}
 	if configure != nil {
-		configure(settings)
+		configure(fixture, settings)
 	}
 	fixture.settings = settings
 
@@ -462,7 +480,7 @@ func newExtenderFixtureWithSecrets(
 	fixture.server = NewExtenderServer(
 		ctx,
 		allowedSecrets,
-		[]string{"dest.example", "dest4.example", "dest6.example"},
+		append([]string{"dest.example", "dest4.example", "dest6.example"}, extraAllowedHosts...),
 		map[int][]connect.ExtenderConnectMode{
 			fixture.tcpPort:  {connect.ExtenderConnectModeTcpTls},
 			fixture.quicPort: {connect.ExtenderConnectModeQuic},

@@ -498,6 +498,9 @@ type PlatformTransportSettings struct {
 	// SendRouteObserver exposes route ownership to deterministic integration
 	// harnesses. It must not block. Nil retains normal production behavior.
 	SendRouteObserver func(transport Transport, route Route, connected bool)
+	// ProgressObserver is opt-in bounded, nonblocking H1 physical-I/O metadata.
+	// Nil performs no hashing, clock reads, or diagnostic allocation.
+	ProgressObserver func(TransferProgressEvent)
 	// ReceiveStats, when non-nil, aggregates carrier-to-route admission loss and
 	// reliable-H1 backpressure across every reconnect generation. The
 	// constructor uses a private counter set when it is nil.
@@ -654,6 +657,10 @@ type PlatformTransportSettings struct {
 	h3RetainedByteAccounting bool
 }
 
+// Shared with MultiClient's fallback no-send-ACK liveness bound. Retry/RTO and
+// logical Transfer ACK lifetimes are independent settings, not this interval.
+const defaultPlatformTransportReadTimeout = 30 * time.Second
+
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 	tlsConfig, err := DefaultTlsConfig()
 	if err != nil {
@@ -669,7 +676,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		ReconnectTimeout:          5 * time.Second,
 		PingTimeout:               5 * time.Second,
 		WriteTimeout:              10 * time.Second,
-		ReadTimeout:               30 * time.Second,
+		ReadTimeout:               defaultPlatformTransportReadTimeout,
 		TransportBufferSize:       32,
 		InactiveDrainTimeout:      30 * time.Second,
 		InactiveDrainMaxTimeout:   60 * time.Second,
@@ -2300,6 +2307,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// announcing readiness; withdraw readiness before releasing them.
 			releaseExtenderIp := self.holdExtenderIp(dialExtenderIp)
 			releaseH1ConnectionStats := self.settings.H1ConnectionStats.connected(ws)
+			h1Progress := newH1PhysicalProgress(self.settings.ProgressObserver, clientId, ws)
+			if framed, ok := ws.(*FramedMessageConn); ok {
+				framed.progress = h1Progress
+			}
 			self.setRegistered(true)
 
 			defer func() {
@@ -2326,6 +2337,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				// connection worker then closes the remaining reader, watcher,
 				// and socket-writer ownership before completion is published.
 				connectionWaitGroup.Wait()
+				h1Progress.event("h1_closed", nil, true, nil)
 				// No producer can enqueue after the join, so one deterministic
 				// drain releases every pooled message still sitting in either lane.
 				drain(send)
@@ -2351,7 +2363,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 
 				writeMessage := func(message []byte) error {
+					standaloneProgress := h1Progress.prepareWebSocketWrite(message)
 					err := ws.WriteMessage(websocket.BinaryMessage, message)
+					if standaloneProgress {
+						h1Progress.endWrite(err)
+					}
 					MessagePoolReturn(message)
 					if err != nil {
 						// note that for websocket a dealine timeout cannot be recovered
@@ -2420,6 +2436,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						return true, err
 					}
 					writeBatchConn.BeginWriteBatch()
+					h1Progress.beginWebSocketBatch()
+					defer h1Progress.finishWebSocketBatch()
 					if err = writeSendMessage(firstMessage); err != nil {
 						writeBatchConn.AbortWriteBatch()
 						return true, err
@@ -2468,7 +2486,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							priorityMessageCount = 0
 						}
 					}
-					if err = writeBatchConn.FlushWriteBatch(); err != nil {
+					h1Progress.beginWrite()
+					err = writeBatchConn.FlushWriteBatch()
+					h1Progress.endWrite(err)
+					if err != nil {
 						// A WebSocket write timeout or partial TLS write cannot
 						// be recovered; the transfer sequence retains each
 						// item and retries it over the replacement route.
@@ -2627,15 +2648,18 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					}
 
 					if err := ws.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout)); err != nil {
+						h1Progress.event("h1_read_deadline_error", nil, false, err)
 						return
 					}
 					messageType, message, err := ReadH1PooledMessage(ws, self.h1MaxMessageByteCount())
 					if err != nil {
+						h1Progress.event("h1_read_error", nil, false, err)
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
 						}
 						return
 					}
+					readProgress := h1Progress.event("h1_read", message, true, nil)
 
 					switch messageType {
 					case websocket.BinaryMessage:
@@ -2688,6 +2712,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							receive,
 							message,
 						)
+						if h1Progress != nil {
+							endTransferProgress(h1Progress.observer, readProgress, "h1_receive_end", delivered, nil)
+						}
 						if !open {
 							return
 						}

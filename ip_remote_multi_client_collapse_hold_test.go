@@ -69,7 +69,11 @@ func TestTcpCollapseHoldReleasesRetransmit(t *testing.T) {
 	// past the hold, the retransmit is let through
 	AssertEqual(t, collapseTestCanSend(client, update, retransmit), true)
 
-	// and the window restarts, so the backlog is not released all at once
+	// A gate check is read-only. Only successful queue admission consumes the
+	// escape; a refused send must leave the immediate retry eligible.
+	AssertEqual(t, collapseTestCanSend(client, update, retransmit), true)
+	update.updateSequence(retransmit)
+	// After that commit, the window restarts.
 	AssertEqual(t, collapseTestCanSend(client, update, retransmit), false)
 }
 

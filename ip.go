@@ -377,8 +377,17 @@ func groupIpPacketsBounded(
 	maxPacketCount int,
 	maxByteCount ByteCount,
 ) (groups []*ipPacketGroup, rejected [][]byte) {
+	return groupIpPacketsBoundedIndexed(packets, maxPacketCount, maxByteCount, nil)
+}
+
+func groupIpPacketsBoundedIndexed(
+	packets [][]byte,
+	maxPacketCount int,
+	maxByteCount ByteCount,
+	packetIndexes map[*ipPacketGroup][]int,
+) (groups []*ipPacketGroup, rejected [][]byte) {
 	groupsByKey := map[ipPacketFlowKey]*ipPacketGroup{}
-	for _, packet := range packets {
+	for packetIndex, packet := range packets {
 		var ipPath IpPath
 		payload, err := parseIpPathWithPayloadBorrowed(packet, &ipPath)
 		if err != nil ||
@@ -392,6 +401,10 @@ func groupIpPacketsBounded(
 				maxByteCount,
 			) {
 			rejected = append(rejected, packet)
+		} else if packetIndexes != nil {
+			key, _ := ipPacketFlowKeyFromPath(&ipPath)
+			group := groupsByKey[key]
+			packetIndexes[group] = append(packetIndexes[group], packetIndex)
 		}
 	}
 	return
@@ -749,11 +762,12 @@ type LocalUserNat struct {
 	// Linux; zero elsewhere. Invisible to every layer above the socket.
 	udpKernelReceiveDropCount atomic.Uint64
 
-	sendPackets chan *SendPacket
-	sendLock    sync.Mutex
-	sendClosed  bool
-	sendWg      sync.WaitGroup
-	runDone     chan struct{}
+	sendPackets      chan *SendPacket
+	reliableCapacity receiveCapacitySignal
+	sendLock         sync.Mutex
+	sendClosed       bool
+	sendWg           sync.WaitGroup
+	runDone          chan struct{}
 
 	settings      *LocalUserNatSettings
 	controlMemory *TransferMemoryBudget
@@ -783,6 +797,9 @@ type LocalUserNat struct {
 	sourceRetirementCallbacks map[uint64]sourceRetirementFunction
 
 	// Test-only completed-disposition edge. Nil is a production no-op.
+	// Tests can hold a queued owner before its final protocol admission.
+	// Nil in production; it must never be used as a scheduling policy.
+	beforeSendPacketForTest  func(*SendPacket)
 	afterSendPacketForTest   func()
 	beforeRunDoneWaitForTest func()
 }
@@ -1393,8 +1410,10 @@ func (self *LocalUserNat) Run() {
 	forward := func(shard int, sendPacket *SendPacket) bool {
 		select {
 		case <-self.ctx.Done():
-			for _, packet := range sendPacket.packets {
-				MessagePoolReturn(packet)
+			if sendPacket.reliable == nil {
+				for _, packet := range sendPacket.packets {
+					MessagePoolReturn(packet)
+				}
 			}
 			sendPacket.finish()
 			return false
@@ -1466,6 +1485,7 @@ send:
 		case <-self.ctx.Done():
 			return
 		case sendPacket := <-self.sendPackets:
+			self.reliableCapacity.notify()
 			if !route(sendPacket) {
 				return
 			}
@@ -1494,8 +1514,10 @@ func returnQueuedSendPackets(sendPackets chan *SendPacket) {
 		case sendPacket := <-sendPackets:
 			func() {
 				defer sendPacket.finish()
-				for _, packet := range sendPacket.packets {
-					MessagePoolReturn(packet)
+				if sendPacket.reliable == nil {
+					for _, packet := range sendPacket.packets {
+						MessagePoolReturn(packet)
+					}
 				}
 			}()
 		default:
@@ -1591,6 +1613,8 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	udp6Buffer := newUdp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.UdpBufferSettings)
 	tcp4Buffer := newTcp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.TcpBufferSettings)
 	tcp6Buffer := newTcp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.TcpBufferSettings)
+	tcp4Buffer.admissionCapacity = &self.reliableCapacity
+	tcp6Buffer.admissionCapacity = &self.reliableCapacity
 	tcp4Buffer.flowCloseCallback = self.closeTcpFlow
 	tcp6Buffer.flowCloseCallback = self.closeTcpFlow
 	icmp4Buffer := newIcmp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.IcmpBufferSettings)
@@ -1904,7 +1928,27 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	}
 
 	handleSendPacket := func(sendPacket *SendPacket) {
+		self.reliableCapacity.notify()
 		defer sendPacket.finish()
+		if self.beforeSendPacketForTest != nil {
+			self.beforeSendPacketForTest(sendPacket)
+		}
+		if owner := sendPacket.reliable; owner != nil {
+			sendPacket.reliable = nil
+			func() {
+				defer func() {
+					if failure := recover(); failure != nil {
+						owner.operation.complete(false)
+						panic(failure)
+					}
+				}()
+				owner.enterTcp(tcp4Buffer, tcp6Buffer)
+			}()
+			if self.afterSendPacketForTest != nil {
+				self.afterSendPacketForTest()
+			}
+			return
+		}
 		for _, ipPacket := range sendPacket.packets {
 			handleIpPacket(sendPacket.source, sendPacket.transferKey, sendPacket.provideMode, ipPacket)
 			if self.afterSendPacketForTest != nil {
@@ -1956,6 +2000,7 @@ type SendPacket struct {
 	provideMode protocol.ProvideMode
 	packets     [][]byte
 	disposition *localUserNatSendDisposition
+	reliable    *providerReliablePacket
 }
 
 // One provider admission can fan into several LocalUserNat send shards. The
@@ -1986,6 +2031,10 @@ func (self *localUserNatSendDisposition) finish() {
 
 func (self *SendPacket) finish() {
 	if self != nil {
+		if owner := self.reliable; owner != nil {
+			self.reliable = nil
+			owner.operation.complete(false)
+		}
 		self.disposition.finish()
 	}
 }
@@ -4062,6 +4111,9 @@ type TcpBufferSettings struct {
 	// Tests may hold a newly admitted sequence before it can consume its first
 	// pooled packet. Nil is a production no-op.
 	beforeSequenceRunForTest func()
+	// Tests can inspect the exact admitted queue without starting an upstream
+	// socket. Called on that sequence's worker before Run; nil in production.
+	beforeSequenceRunWithStateForTest func(*TcpSequence)
 	// Tests read the upstream socket the provider proxies through, once it is
 	// connected and configured: which buffers it has and what the kernel says
 	// about its window are only decidable on the real socket, and the flow
@@ -4126,6 +4178,7 @@ func (self *Tcp4Buffer) sendTransferKey(
 	tcp *parsedTcp,
 	timeout time.Duration,
 	ipPacket []byte,
+	prepaid ...*natMemoryReservation,
 ) (bool, error) {
 	source = source.LocalMask()
 	bufferId := NewBufferId4(
@@ -4143,6 +4196,7 @@ func (self *Tcp4Buffer) sendTransferKey(
 		tcp,
 		timeout,
 		ipPacket,
+		prepaid...,
 	)
 }
 
@@ -4200,6 +4254,7 @@ func (self *Tcp6Buffer) sendTransferKey(
 	tcp *parsedTcp,
 	timeout time.Duration,
 	ipPacket []byte,
+	prepaid ...*natMemoryReservation,
 ) (bool, error) {
 	source = source.LocalMask()
 	bufferId := NewBufferId6(
@@ -4217,6 +4272,7 @@ func (self *Tcp6Buffer) sendTransferKey(
 		tcp,
 		timeout,
 		ipPacket,
+		prepaid...,
 	)
 }
 
@@ -4227,6 +4283,7 @@ type TcpBuffer[BufferId comparable] struct {
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 	tcpBufferSettings              *TcpBufferSettings
 	flowCloseCallback              tcpFlowCloseFunction
+	admissionCapacity              *receiveCapacitySignal
 
 	mutex sync.Mutex
 	// The local NAT closes send admission before waiting, so no Add can race
@@ -4299,13 +4356,24 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 	tcp *parsedTcp,
 	timeout time.Duration,
 	ipPacket []byte,
+	prepaid ...*natMemoryReservation,
 ) (bool, error) {
 	source = source.LocalMask()
 	// A new flow must already own its initiating packet. Reserve that packet
 	// first so a near-full pool cannot install an idle, SYN-less generation.
 	var memory natMemoryReservation
 	accepted := false
-	if tcp.syn {
+	var credit *natMemoryReservation
+	if len(prepaid) != 0 {
+		credit = prepaid[0]
+	}
+	if credit != nil {
+		memory = *credit
+		if tcp.syn && (memory.budget != self.tcpBufferSettings.MemoryBudget ||
+			memory.budget != nil && memory.bytes < natPacketMemoryByteCount(ipPacket)) {
+			return false, ErrNatMemoryBudget
+		}
+	} else if tcp.syn {
 		var admitted bool
 		memory, admitted = reserveNatMemory(self.tcpBufferSettings.MemoryBudget, natPacketMemoryByteCount(ipPacket))
 		if !admitted {
@@ -4313,13 +4381,14 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		}
 	}
 	defer func() {
-		if !accepted {
+		if !accepted && credit == nil {
 			memory.release()
 		}
 	}()
 	var orphanRst []byte
 	var orphanSourceIp net.IP
 	var orphanDestinationIp net.IP
+	handledTerminalControl := false
 	initSequence := func() *TcpSequence {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
@@ -4337,6 +4406,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 				if 0 == len(sourceSequences) {
 					delete(self.sourceSequences, sequence.source)
 				}
+				handledTerminalControl = true
 				// Return false without consuming ipPacket; the LocalUserNat
 				// dispatcher owns and returns every packet a sequence does not
 				// accept.
@@ -4357,6 +4427,12 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		}
 
 		if !tcp.syn {
+			// An orphan RST, empty ACK, or empty FIN has a local terminal
+			// outcome: this flow does not exist. Applying that TCP decision
+			// is not congested data admission or a failed shared Transfer
+			// lane. Payload-bearing segments still have no secured owner.
+			// Retired sources return above and never gain this exception.
+			handledTerminalControl = tcp.rst || len(tcp.payload) == 0 && (tcp.ack || tcp.fin)
 			// drop the packet; only create a new sequence on SYN.
 			// Reply with a RST so the source fails fast instead of
 			// retransmitting into silence (PROXYDRAIN1.md §3.5) — sent
@@ -4452,6 +4528,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 			return nil
 		}
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
+		sequence.admissionCapacity = self.admissionCapacity
 		sequence.flowCloseCallback = self.flowCloseCallback
 		flowMemory := sequence.memory
 		sequence.memory = natMemoryReservation{}
@@ -4481,6 +4558,9 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 					}
 				}
 			}()
+			if self.tcpBufferSettings.beforeSequenceRunWithStateForTest != nil {
+				self.tcpBufferSettings.beforeSequenceRunWithStateForTest(sequence)
+			}
 			sequence.Run()
 		})
 		return sequence
@@ -4507,7 +4587,22 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 			)
 			MessagePoolReturn(orphanRst)
 		}
+		if credit != nil && handledTerminalControl {
+			// Secure only the already-applied local terminal-control action,
+			// never application bytes or delivery of the regenerable reset
+			// reply. Reset disable/rate-limit policy remains independent.
+			// This exact control no longer needs downstream packet ownership;
+			// consuming it must not strand another flow on this Transfer lane.
+			MessagePoolReturn(ipPacket)
+			credit.release()
+			return true, nil
+		}
 		// sequence does not exist and not a syn packet, drop
+		if credit != nil && !tcp.syn {
+			// A deliberate orphan/reset is terminal, not queue pressure.
+			// No final TCP owner was secured; do not park an impossible retry.
+			return false, errReliableIngressNoFlow
+		}
 		return false, nil
 	}
 
@@ -4518,10 +4613,17 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 	// which case the ordinary queue preserves handshake order.
 	if tcp.ack && !tcp.syn && !tcp.fin && !tcp.rst && len(tcp.payload) == 0 &&
 		sequence.applyEstablishedPureAck(source, transferKey, tcp, ipPacket) {
+		if credit != nil {
+			credit.release()
+		}
 		return true, nil
 	}
+	if credit != nil && (memory.budget != self.tcpBufferSettings.MemoryBudget ||
+		memory.budget != nil && memory.bytes < natPacketMemoryByteCount(ipPacket)) {
+		return false, ErrNatMemoryBudget
+	}
 
-	if !tcp.syn {
+	if !tcp.syn && credit == nil {
 		var admitted bool
 		memory, admitted = reserveNatMemory(self.tcpBufferSettings.MemoryBudget, natPacketMemoryByteCount(ipPacket))
 		if !admitted {
@@ -4538,6 +4640,9 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 	}
 	var err error
 	accepted, err = sequence.send(sendItem, timeout)
+	if accepted && credit != nil {
+		*credit = natMemoryReservation{}
+	}
 	return accepted, err
 }
 
@@ -4735,8 +4840,9 @@ type TcpSequence struct {
 	returnWake           chan struct{}
 	returnCapacity       chan struct{}
 
-	sendMutex sync.Mutex
-	sendItems chan *TcpSendItem
+	sendMutex         sync.Mutex
+	sendItems         chan *TcpSendItem
+	admissionCapacity *receiveCapacitySignal
 	// Lazily allocated only when the bounded send queue actually blocks.
 	// sendMutex serializes Reset/Stop.
 	sendTimer *time.Timer
@@ -4905,6 +5011,7 @@ func newTcpSequenceWithTransferKey(
 func (self *TcpSequence) send(sendItem *TcpSendItem, timeout time.Duration) (bool, error) {
 	self.sendMutex.Lock()
 	defer self.sendMutex.Unlock()
+	sendItem.admissionCapacity = self.admissionCapacity
 
 	select {
 	case <-self.ctx.Done():
@@ -5162,6 +5269,7 @@ func (self *TcpSequence) Run() {
 			return
 		case sendItem := <-self.sendItems:
 			idleTimer.Stop()
+			self.admissionCapacity.notify()
 			if self.log.V(2).Enabled() {
 				self.log.Infof("[init]send(%d)\n", len(sendItem.tcp.payload))
 			}
@@ -6370,6 +6478,7 @@ send:
 			return
 		case sendItem := <-self.sendItems:
 			idleTimer.Stop()
+			self.admissionCapacity.notify()
 			if !handleSendItem(sendItem) {
 				if !fin {
 					return
@@ -6381,6 +6490,7 @@ send:
 			for {
 				select {
 				case sendItem := <-self.sendItems:
+					self.admissionCapacity.notify()
 					if !handleSendItem(sendItem) {
 						if !fin {
 							return
@@ -6469,11 +6579,13 @@ func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated
 
 func (self *TcpSequence) Cancel() {
 	self.cancel()
+	self.admissionCapacity.notify()
 }
 
 func (self *TcpSequence) Close() {
 	self.flowCloseOnce.Do(func() {
 		self.cancel()
+		self.admissionCapacity.notify()
 		if self.flowCloseCallback != nil {
 			self.flowCloseCallback(self.source, self.ipPath)
 		}
@@ -6481,12 +6593,13 @@ func (self *TcpSequence) Close() {
 }
 
 type TcpSendItem struct {
-	memory      natMemoryReservation
-	source      TransferPath
-	transferKey TransferKey
-	provideMode protocol.ProvideMode
-	tcp         parsedTcp
-	ipPacket    []byte
+	memory            natMemoryReservation
+	admissionCapacity *receiveCapacitySignal
+	source            TransferPath
+	transferKey       TransferKey
+	provideMode       protocol.ProvideMode
+	tcp               parsedTcp
+	ipPacket          []byte
 	// Number of already-accepted payload bytes at the front of ipPacket. A
 	// crossover segment can overlap the current receive sequence; retaining the
 	// offset lets the socket writer forward only its new suffix without copying.
@@ -7550,6 +7663,7 @@ func newAdmittedRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat
 	}
 	userNatProvider.localUserNatUnsub = localUserNatUnsub
 	clientUnsub := client.AddReceiveCallback(userNatProvider.ClientReceive)
+	client.reliableProviderIngress.Store(true)
 	userNatProvider.clientUnsub = clientUnsub
 	userNatProvider.contractStatusUnsub = client.ContractManager().addContractStatusDispatchCallback(
 		func(status *ContractStatus) {
@@ -9301,6 +9415,10 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 
 // `connect.ReceiveFunction`
 func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*protocol.Frame, peer Peer) {
+	if peer.delivery != nil {
+		self.receiveReliableFrames(source, frames, peer)
+		return
+	}
 	memory, admitted := self.startMemoryOperation(providerFrameOperationBytes(frames))
 	if !admitted {
 		self.receiveControlFrames(source, frames, peer)
@@ -9313,17 +9431,17 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 
 // Both ordinary admission and the independently prepaid control fallback
 // retain the provider graph and callback workspace before entering here.
-func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, frames []*protocol.Frame, peer Peer) {
+func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, frames []*protocol.Frame, peer Peer) bool {
 	// receive functions should be non-blocking
 	// clients should manage their own congestion protocols on top to avoid overflowing the sequence queues
 	if source.IsControlSource() {
 		self.retireDisconnectedSenders(frames)
-		return
+		return true
 	}
 	source = source.LocalMask()
 	sourceLifecycle := self.acquireSourceLifecycle(source.SourceId)
 	if sourceLifecycle == nil {
-		return
+		return false
 	}
 	defer self.releaseSourceLifecycle(source.SourceId, sourceLifecycle)
 	transferKey := peer.TransferKey
@@ -9568,6 +9686,12 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 	}
 
 	for _, packetGroup := range packetGroups {
+		if peer.delivery != nil && packetGroup.ipPath.Protocol == IpProtocolTcp {
+			for _, packet := range packetGroup.packets {
+				self.queueReliablePacket(source, peer, sourceLifecycle, packetGroup.ipPath, packet)
+			}
+			continue
+		}
 		c := func() bool {
 			dropPacketGroup := func() {
 				var count int
@@ -9645,6 +9769,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 			c()
 		}
 	}
+	return true
 }
 
 // RequestClose is safe from an inline stats callback. Cancellation schedules

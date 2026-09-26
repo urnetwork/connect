@@ -41,6 +41,7 @@ type FramedMessageConn struct {
 	storage   []byte
 	body      framedMessageBody
 	stats     *H1PlusStats
+	progress  *h1PhysicalProgress
 }
 
 func NewFramedMessageConn(conn net.Conn, protocol string, maximum int, stats *H1PlusStats) (*FramedMessageConn, error) {
@@ -202,11 +203,18 @@ func (c *FramedMessageConn) WriteMessages(messages [][]byte) error {
 			count++
 		}
 		var err error
+		if c.progress != nil {
+			for _, message := range messages[:count] {
+				c.progress.queue(message)
+			}
+			c.progress.beginWrite()
+		}
 		if c.framer != nil {
 			err = c.framer.WriteBatchWithStorage(c, messages[:count], c.storage)
 		} else {
 			err = c.xl.WriteBatchWithStorage(c, messages[:count], c.storage)
 		}
+		c.progress.endWrite(err)
 		if err != nil {
 			if c.stats != nil {
 				c.stats.writeErrors.Add(1)

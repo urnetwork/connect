@@ -907,6 +907,19 @@ func (self *ApiMultiClientGenerator) NewClientSettings() *ClientSettings {
 	return self.clientSettingsGenerator()
 }
 
+// ClientReadTimeout reads the same copied settings used to construct this
+// client's platform carrier (and reused by migration generations). The
+// transport's setting, not a second MultiClient default, owns H1 liveness.
+func (self *ApiMultiClientGenerator) ClientReadTimeout(client *Client) (time.Duration, bool) {
+	self.transportLock.Lock()
+	defer self.transportLock.Unlock()
+	state := self.transports[client]
+	if state == nil || state.settings == nil {
+		return 0, false
+	}
+	return state.settings.ReadTimeout, true
+}
+
 func (self *ApiMultiClientGenerator) NewClient(
 	ctx context.Context,
 	args *MultiClientGeneratorClientArgs,

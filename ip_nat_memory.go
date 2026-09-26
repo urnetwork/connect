@@ -32,6 +32,38 @@ func (r *natMemoryReservation) release() {
 	}
 }
 
+// split hands part of an already charged owner to its downstream packet.
+// It changes neither a root counter nor its admission ceiling. The caller
+// exclusively owns r; the returned value has exactly one release owner.
+func (r *natMemoryReservation) split(bytes ByteCount) (natMemoryReservation, bool) {
+	if bytes < 0 {
+		return natMemoryReservation{}, false
+	}
+	if r.budget == nil {
+		return natMemoryReservation{}, true
+	}
+	if r.bytes < bytes {
+		return natMemoryReservation{}, false
+	}
+	part := natMemoryReservation{budget: r.budget, bytes: bytes}
+	r.bytes -= bytes
+	if r.bytes == 0 {
+		*r = natMemoryReservation{}
+	}
+	return part, true
+}
+
+func (r *natMemoryReservation) moveTo(target *TransferMemoryBudget) bool {
+	if r.budget == nil || target == nil {
+		return r.budget == target
+	}
+	if !r.budget.tryMoveReservation(target, r.bytes) {
+		return false
+	}
+	r.budget = target
+	return true
+}
+
 func natPacketMemoryByteCount(packet []byte) ByteCount {
 	return ByteCount(cap(packet)) + ByteCount(unsafe.Sizeof(TcpSendItem{})) + 128
 }
@@ -195,6 +227,7 @@ func (item *TcpSendItem) release() {
 	item.ipPacket = nil
 	item.clearPacketViews()
 	item.memory.release()
+	item.admissionCapacity.notify()
 }
 
 func (item *IcmpSendItem) release() {
