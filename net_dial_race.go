@@ -269,6 +269,11 @@ func dialDohAddrsRace(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	observer := tunDialObserver(ctx)
+	if observer != nil {
+		observer(TunDialDnsStarted)
+	}
+	ctx, dial = observeTunTcpDial(ctx, dial)
 	raceCtx, raceCancel := context.WithCancel(ctx)
 	recordTypes := dohDialRecordTypes(network)
 	results := make(chan dohDialQueryResult, len(recordTypes))
@@ -282,8 +287,12 @@ func dialDohAddrsRace(
 		go func() {
 			defer queryWorkers.Done()
 			addrs, authoritative := cache.QueryResult(raceCtx, recordType, host)
+			addrs = dialAddrsMatchNetwork(network, addrs)
+			if observer != nil && 0 < len(addrs) && raceCtx.Err() == nil {
+				observer(TunDialDnsAnswered)
+			}
 			results <- dohDialQueryResult{
-				addrs:         dialAddrsMatchNetwork(network, addrs),
+				addrs:         addrs,
 				authoritative: authoritative,
 			}
 		}()
@@ -319,6 +328,7 @@ func dialAddrsRace(
 	fallbackDelay time.Duration,
 	dial dialAddrFunction,
 ) (net.Conn, error) {
+	ctx, dial = observeTunTcpDial(ctx, dial)
 	return dialAddrsRaceWithResolution(ctx, addrs, fallbackDelay, dial, nil)
 }
 

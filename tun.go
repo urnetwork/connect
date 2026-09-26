@@ -1310,6 +1310,9 @@ func (self *Tun) convertToFullAddr(endpoint netip.AddrPort) (tcpip.FullAddress, 
 // callback registration and derived context and must be called by the caller.
 func (self *Tun) dialCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	dialCtx, dialCancel := context.WithCancel(self.ctx)
+	// Preserve only the explicit request diagnostic across this lifetime join.
+	// In particular, private resolver transports must not borrow HTTP traces.
+	dialCtx = WithTunDialObserver(dialCtx, tunDialObserver(ctx))
 	stopCallerCancel := context.AfterFunc(ctx, dialCancel)
 	if ctx.Err() != nil {
 		dialCancel()
