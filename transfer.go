@@ -1356,7 +1356,7 @@ type ReceivePack struct {
 	EncryptionCompanion bool
 }
 
-// A decoded owner is 968 bytes on the measured arm64 mobile target. Charge a
+// A decoded owner is 1000 bytes on the measured arm64 target. Charge a
 // rounded KiB so the aggregate receive budget covers the pipeline envelope as
 // well as both pooled byte roots and remains conservative on other targets.
 const decodedPackOwnerQueueByteCount = ByteCount(1024)
@@ -15960,28 +15960,30 @@ type receiveItem struct {
 	transferItem
 
 	contractId *Id
-	head       bool
 	// Ingress is independent of the existing reorder-gap timeout clock.
-	receivedAtNanos      int64
-	receiveTime          time.Time
-	frames               []*protocol.Frame
-	deliverFrameCount    int
-	deliverFrameCountSet bool
+	receivedAtNanos   int64
+	receiveTime       time.Time
+	frames            []*protocol.Frame
+	deliverFrameCount int
 	// Extra downstream ownership credit, separately added before any SACK.
 	// Only this exact portion may move to the NAT while receive roots live.
-	deliveryPrepaid  ByteCount
-	deliveryPrepared bool
-	contractFrame    *protocol.Frame
-	// The contract frame announces a successor rather than opening it
-	// (THROUGHPUTFIX §39.1): it is verified and stored, and the sequence does
-	// not switch to it.
-	contractAhead      bool
+	deliveryPrepaid    ByteCount
+	contractFrame      *protocol.Frame
 	receiveCallback    ReceiveFunction
-	ack                bool
 	tag                sequenceTag
 	decodedOwner       *decodedPackOwner
 	transferFrameBytes []byte
 	transportType      TransportType
+	// Keep flags together: this item is embedded in every decodedPackOwner,
+	// whose allocation must fit the fixed 1-KiB receive-budget charge.
+	head                 bool
+	deliverFrameCountSet bool
+	deliveryPrepared     bool
+	ack                  bool
+	// The contract frame announces a successor rather than opening it
+	// (THROUGHPUTFIX §39.1): it is verified and stored, and the sequence does
+	// not switch to it.
+	contractAhead bool
 	// committed is set once this held item has been selectively acknowledged,
 	// which under the committed-prefix policy happens only when it can no
 	// longer be evicted (THROUGHPUTFIX §37.20). A committed item is never

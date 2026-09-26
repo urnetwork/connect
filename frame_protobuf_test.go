@@ -1611,6 +1611,11 @@ func TestDecodedTransferFramePoolRetainedSizeStaysSmall(t *testing.T) {
 }
 
 func TestDecodedPackOwnerPoolRetentionIsBounded(t *testing.T) {
+	// The queue charge is a fixed allowance, not a knob to accommodate owner
+	// growth. Keep the allocation within it as receive pipeline fields change.
+	if decodedPackOwnerQueueByteCount > 1024 {
+		t.Fatalf("decoded Pack owner charge = %d, exceeds the 1-KiB allowance", decodedPackOwnerQueueByteCount)
+	}
 	size := unsafe.Sizeof(decodedPackOwner{})
 	if size > uintptr(decodedPackOwnerQueueByteCount) {
 		t.Fatalf(
