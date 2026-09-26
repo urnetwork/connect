@@ -139,6 +139,13 @@ The provider TCP sequence's pure-acknowledgement worker is also per flow. It may
 
 ## Tests
 
+Temporary investigation helpers and diagnostic programs must be written in Go
+by default. Use another language only when a clear task-specific requirement
+or concrete benefit justifies it; if Go is unavailable, prefer Python as the
+fallback. The helper should exercise the same Go dependencies and data model as
+the system when that matters to the finding. Do not infer a Go-path root cause
+from a different-language reproduction without cross-validating it in Go.
+
 - **Test data must never contain production identity or secrets.** Do not copy
   tokens, credentials, private route prefixes, customer/account identifiers,
   real hostnames or domains, public or private IP addresses, or other live
