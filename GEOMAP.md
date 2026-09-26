@@ -2236,9 +2236,26 @@ records a failure and schedules the next check after a backoff
 (`DarkBackoff`: 5, 15, 30 minutes); a provider is **dark** only after
 `DarkConsecutiveFailures` (default 3) failed checks in a row, spanning at
 least `DarkMinimumSpan` (30 minutes). One passing check clears the count.
-The due query serves overdue retries before first checks, so a failing
-provider is always confirmed or cleared on schedule and a retry queue
-cannot starve while the prober runs at all. `provider_blackhole_check`
+The due query interleaves existing due checks and first checks 1:1 whenever
+both queues have work, with unused share lent to the other queue. Existing
+checks keep oldest-`next_due_at` order (legacy rows use `checked_at + 90m`),
+then client id; first checks keep client-id order. An existing due check leads
+an odd-sized response, and a one-slot caller retains retry priority. A
+one-slot caller therefore does not have the two-class fairness guarantee.
+Each independent head reads at most the requested limit; a bounded stable
+merge returns at most that limit and deduplicates category changes between
+reads. This is a share of one caller's work, not a global budget or extra
+parallelism. Backoffs, dark rules, NotMeasured preservation and eligibility
+are unchanged. Existing NotMeasured-only rows still belong to the existing
+queue, not the never-checked class.
+
+Absolute existing-row priority previously excluded all first checks whenever
+renewed due work outpaced the sweep. Equal sharing preserves admission for
+both failed-provider recovery and first-check coverage; it cannot promise
+their deadlines when throughput is insufficient. Monitor each class's backlog
+and actual selected/completed evidence separately rather than treating a full
+returned batch or a healthy retry as whole-fleet recovery.
+`provider_blackhole_check`
 gains `consecutive_failures`, `first_failed_at` and `next_due_at`; the
 current-dark set of §10.3 is the rows whose count has reached the threshold
 within `ProviderBlackholeCheckMaxAge`.
