@@ -9652,12 +9652,18 @@ func (self *SendSequence) sendContractRemainingByteCount() ByteCount {
 // which is what makes the first contract — a megabyte, below any threshold —
 // announce its successor immediately.
 //
-// Refuses in four cases, each of which leaves today's behaviour exactly: the
+// Defers until a current-contract head is outstanding, and refuses when the
 // announcement is configured off, the peer never advertised the capability or
 // has stopped advertising it, a successor is already announced, or the
 // destination queue has no contract ready. Nothing here blocks.
 func (self *SendSequence) maybeAnnounceContractAhead() {
 	if self.sendContract == nil || self.aheadSendContract != nil {
+		return
+	}
+	// An idle receiver may have retired its verified contract. The first
+	// outstanding Pack must be a recovering head under the current contract;
+	// a successor announcement cannot authenticate that missing prefix.
+	if len(self.sendItems) == 0 {
 		return
 	}
 	if self.aheadSendContractAttempted {
