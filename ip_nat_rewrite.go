@@ -73,7 +73,8 @@ func RewriteIpv4Source(packet []byte, source netip.Addr) bool {
 }
 
 // RewriteIpv4Destination is the return-path counterpart of
-// `RewriteIpv4Source`.
+// `RewriteIpv4Source`. For ICMP errors it also restores the quoted packet's
+// source, so the receiving socket can recognize the failed outbound packet.
 func RewriteIpv4Destination(packet []byte, destination netip.Addr) bool {
 	return rewriteIpv4Addr(packet, ipv4DestinationOffset, destination)
 }
@@ -100,6 +101,13 @@ func rewriteIpv4Addr(packet []byte, offset int, addr netip.Addr) bool {
 		return true
 	}
 
+	fragmentOffset := binary.BigEndian.Uint16(packet[6:8]) & 0x1fff
+	if offset == ipv4DestinationOffset && fragmentOffset == 0 &&
+		ipProtocolNumber(packet[9]) == ipProtocolNumberIcmp4 &&
+		!rewriteIpv4IcmpErrorQuote(packet, headerSize, prior[:], next[:]) {
+		return false
+	}
+
 	headerChecksum := binary.BigEndian.Uint16(packet[10:12])
 	binary.BigEndian.PutUint16(
 		packet[10:12],
@@ -110,7 +118,6 @@ func rewriteIpv4Addr(packet []byte, offset int, addr netip.Addr) bool {
 	// Only the first fragment carries the transport header. A later fragment's
 	// transport checksum lives in the first one and is already correct there,
 	// so rewriting at this offset would corrupt payload bytes.
-	fragmentOffset := binary.BigEndian.Uint16(packet[6:8]) & 0x1fff
 	if fragmentOffset != 0 {
 		return true
 	}
@@ -166,12 +173,8 @@ func rewriteIpv4Addr(packet []byte, offset int, addr netip.Addr) bool {
 		)
 	case ipProtocolNumberIcmp4:
 		// ICMPv4's checksum covers the ICMP message only -- there is no
-		// pseudo-header -- so an address change does not affect it.
-		//
-		// An ICMP error quotes the offending packet in its body, and that
-		// quoted header still carries the pre-rewrite address. Repairing it
-		// would mean parsing and re-checksumming the quotation; the proxy
-		// drops inbound ICMP errors instead, so nothing here depends on it.
+		// pseudo-header. Return-path errors have already had their quotation
+		// and ICMP checksum repaired above; echo messages need no repair.
 	default:
 		// Everything else is header-only. The protocols whose checksum covers
 		// a pseudo-header -- and therefore the address -- are enumerated above;
@@ -180,5 +183,69 @@ func rewriteIpv4Addr(packet []byte, offset int, addr netip.Addr) bool {
 		// instead would drop those protocols outright rather than NAT them,
 		// which is a worse failure than the one it would be guarding against.
 	}
+	return true
+}
+
+// Locally generated UDP teardown errors bypass the provider-ingress ICMP
+// intercept. Their quotation must follow the same NAT mapping as the envelope.
+// Validate before mutating, and only inspect a bounded header prefix: an ICMP
+// quotation need not contain the original payload (or even a TCP checksum).
+func rewriteIpv4IcmpErrorQuote(packet []byte, headerSize int, prior, next []byte) bool {
+	totalSize := int(binary.BigEndian.Uint16(packet[2:4]))
+	if totalSize < headerSize+8 || len(packet) < totalSize {
+		return false
+	}
+	icmp := packet[headerSize:totalSize]
+	switch icmp[0] {
+	case 3, 11, 12: // destination unreachable, time exceeded, parameter problem
+	default:
+		return true
+	}
+	quote := icmp[8:]
+	if len(quote) < Ipv4HeaderSizeWithoutExtensions || quote[0]>>4 != 4 {
+		return false
+	}
+	quoteHeaderSize := int(quote[0]&0x0f) * 4
+	quoteTotalSize := int(binary.BigEndian.Uint16(quote[2:4]))
+	if quoteHeaderSize < Ipv4HeaderSizeWithoutExtensions ||
+		len(quote) < quoteHeaderSize+8 || quoteTotalSize < quoteHeaderSize+8 ||
+		binary.BigEndian.Uint16(quote[6:8])&0x1fff != 0 ||
+		!bytes.Equal(quote[ipv4SourceOffset:ipv4SourceOffset+4], prior) {
+		return false
+	}
+
+	checksumOffset := -1
+	protocol := ipProtocolNumber(quote[9])
+	switch protocol {
+	case ipProtocolNumberUdp, ipProtocolNumberUdpLite, ipProtocolNumberDccp:
+		checksumOffset = quoteHeaderSize + 6
+	case ipProtocolNumberTcp:
+		if quoteHeaderSize+18 <= len(quote) && quoteHeaderSize+18 <= quoteTotalSize {
+			checksumOffset = quoteHeaderSize + 16
+		}
+	}
+	prefixSize := quoteHeaderSize + 8
+	if prefixSize < checksumOffset+2 {
+		prefixSize = checksumOffset + 2
+	}
+	var before [60 + 18]byte // maximum IPv4 header plus TCP checksum
+	copy(before[:], quote[:prefixSize])
+	binary.BigEndian.PutUint16(quote[10:12], incrementalChecksum(
+		binary.BigEndian.Uint16(quote[10:12]), prior, next,
+	))
+	copy(quote[ipv4SourceOffset:ipv4SourceOffset+4], next)
+	if checksumOffset >= 0 {
+		checksum := binary.BigEndian.Uint16(quote[checksumOffset : checksumOffset+2])
+		if protocol != ipProtocolNumberUdp || checksum != 0 {
+			updated := incrementalChecksum(checksum, prior, next)
+			if protocol == ipProtocolNumberUdp && updated == 0 {
+				updated = 0xffff
+			}
+			binary.BigEndian.PutUint16(quote[checksumOffset:checksumOffset+2], updated)
+		}
+	}
+	binary.BigEndian.PutUint16(icmp[2:4], incrementalChecksum(
+		binary.BigEndian.Uint16(icmp[2:4]), before[:prefixSize], quote[:prefixSize],
+	))
 	return true
 }

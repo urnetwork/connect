@@ -248,10 +248,9 @@ func TestMultiClientPacketGroupSelectedClientAdmitsWholeGroupOnce(t *testing.T) 
 	requireGroupTestWitnessesReleased(t, packets, witnesses)
 }
 
-// A one-candidate first send has no selected-client success commit. Its
-// ordered SYN/RST controls must therefore reset stale collapse state before
-// candidate admission, as the singular path did.
-func TestMultiClientPacketGroupOneCandidateResetsControlSequenceBeforeSend(t *testing.T) {
+// A one-candidate first send must not reset committed state before admission.
+// Its successful commitment applies SYN/RST controls in their source order.
+func TestMultiClientPacketGroupOneCandidateCommitsControlSequenceAfterSend(t *testing.T) {
 	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
 	defer closeParent()
 
@@ -308,18 +307,21 @@ func TestMultiClientPacketGroupOneCandidateResetsControlSequenceBeforeSend(t *te
 	if got := callCount.Load(); got != 1 {
 		t.Errorf("candidate sends = %d, want 1", got)
 	}
-	if observedState.ackSequenceNumber != 0 ||
-		observedState.sequenceNumber != rstSequence ||
-		observedState.packetCount != 0 ||
-		observedState.sequenceTime.IsZero() {
+	if observedState.ackSequenceNumber != 91 ||
+		observedState.sequenceNumber != 92 ||
+		observedState.packetCount != 93 ||
+		!observedState.sequenceTime.IsZero() {
 		t.Errorf(
-			"pre-send sequence = ack:%d sequence:%d packets:%d time-zero:%t; want ack:0 sequence:%d packets:0 time-zero:false",
+			"pre-send sequence = ack:%d sequence:%d packets:%d time-zero:%t; want original 91/92/93/true",
 			observedState.ackSequenceNumber,
 			observedState.sequenceNumber,
 			observedState.packetCount,
 			observedState.sequenceTime.IsZero(),
-			rstSequence,
 		)
+	}
+	if update.ackSequenceNumber != 0 || update.sequenceNumber != rstSequence ||
+		update.sequencePacketCount != 1 || update.sequenceTime.IsZero() {
+		t.Fatalf("accepted control order not committed: ack=%d seq=%d count=%d", update.ackSequenceNumber, update.sequenceNumber, update.sequencePacketCount)
 	}
 	if update.client.Load() != client {
 		t.Error("one accepted candidate was not bound")
@@ -882,6 +884,44 @@ func TestMultiClientOneCandidateTCPHandshakeStartsSilenceClock(t *testing.T) {
 			waitSendCount,
 			client,
 		)
+	}
+}
+
+// The first UDP packet selects and probes an exit with Transfer ACK recovery.
+// Once that candidate is committed, ordinary UDP packets use the configured
+// datagram NoAck policy without changing TCP or ICMP behavior.
+func TestMultiClientUdpRaceAckThenBoundNoAck(t *testing.T) {
+	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
+	defer closeParent()
+	var observed []bool
+	client := &multiClientChannel{
+		ctx:      parent.ctx,
+		settings: parent.settings,
+		sendGroupForTest: func(group *parsedPacketGroup, _ time.Duration, ack bool) (bool, error) {
+			observed = append(observed, ack)
+			for packetIndex := range group.packets {
+				MessagePoolReturn(group.packets[packetIndex].packet)
+			}
+			return true, nil
+		},
+	}
+	parent.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel {
+		return []*multiClientChannel{client}
+	}
+	path := udpTestPath(4)
+	path.DestinationPort = 5001
+	for i := range 2 {
+		packet := MessagePoolCopy(ipOosUdpPacket(path, []byte{byte(i + 1)}))
+		group := requireGroupTestPacketGroup(t, packet)
+		if !parent.sendPacketGroup(SourceId(NewId()), protocol.ProvideMode_Network, group, 0) {
+			t.Fatalf("UDP group %d was not accepted", i)
+		}
+	}
+	if update.client.Load() != client {
+		t.Fatal("initial UDP race did not commit its candidate")
+	}
+	if len(observed) != 2 || !observed[0] || observed[1] {
+		t.Fatalf("UDP race/bound ACK policy = %v, want [true false]", observed)
 	}
 }
 

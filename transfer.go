@@ -160,6 +160,7 @@ type sendPackLifecycleRecord struct {
 	ackRequired         bool
 	messageType         protocol.MessageType
 	upstreamRecoverable bool
+	healthProbe         bool
 }
 
 // safeSendPackLifecycleObserve prevents optional measurement code from
@@ -218,6 +219,7 @@ func (self sendPackLifecycleRecord) observe(phase SendPackLifecyclePhase, err er
 		AckRequired:         self.ackRequired,
 		MessageType:         self.messageType,
 		UpstreamRecoverable: self.upstreamRecoverable,
+		HealthProbe:         self.healthProbe,
 		Err:                 err,
 	})
 }
@@ -615,6 +617,9 @@ type Peer struct {
 	// TransportType is the physical carrier that delivered this Pack. It is
 	// immutable through receive ordering and batching.
 	TransportType TransportType
+	// Private downstream-admission capability; public callbacks still borrow
+	// their frames only for the duration of the call.
+	delivery any
 }
 
 // ReceiveFunction is invoked inline and must not block. A handoff uses a
@@ -1183,6 +1188,7 @@ type SendPack struct {
 	lifecycleToken               uint64
 	lifecycleMessageType         protocol.MessageType
 	lifecycleUpstreamRecoverable bool
+	lifecycleHealthProbe         bool
 	// retainAfterAckTimeout transfers the only recoverable copy to Transfer.
 	// Its serialized resend item remains owned until peer Ack or lifecycle
 	// cancellation instead of becoming a silent loss at the ordinary deadline.
@@ -1219,6 +1225,7 @@ func (self *SendPack) lifecycleRecord() sendPackLifecycleRecord {
 		ackRequired:         self.Ack,
 		messageType:         self.lifecycleMessageType,
 		upstreamRecoverable: self.lifecycleUpstreamRecoverable,
+		healthProbe:         self.lifecycleHealthProbe,
 	}
 }
 
@@ -1349,7 +1356,7 @@ type ReceivePack struct {
 	EncryptionCompanion bool
 }
 
-// A decoded owner is 968 bytes on the measured arm64 mobile target. Charge a
+// A decoded owner is 1000 bytes on the measured arm64 target. Charge a
 // rounded KiB so the aggregate receive budget covers the pipeline envelope as
 // well as both pooled byte roots and remains conservative on other targets.
 const decodedPackOwnerQueueByteCount = ByteCount(1024)
@@ -1489,6 +1496,10 @@ type sendPackRecoveryOption struct {
 	upstreamRecoverable   bool
 	retainAfterAckTimeout bool
 }
+
+// Only the qualification-probe producer supplies this observation marker.
+// It changes neither packet classification nor admission/reliability policy.
+type sendPackHealthProbeOption struct{}
 
 // A send option naming the `sendAckTarget` of the Pack, for callers whose
 // entry point takes an `AckFunction`. A target takes precedence over the
@@ -1869,6 +1880,9 @@ type Client struct {
 	// Cached method value used by every ReceivePack. Constructing
 	// self.receive at the packet site allocates a closure per inbound pack.
 	receiveCallback ReceiveFunction
+	// Sticky after a provider is installed: its later closure must not turn
+	// undeliverable reliable TCP into successful generic callback delivery.
+	reliableProviderIngress atomic.Bool
 
 	loopback chan *SendPack
 	// rawSendPacks bounds reuse of the v2 per-packet asynchronous envelope.
@@ -3401,6 +3415,7 @@ func (self *Client) SendMultiWithTimeout(
 		logicalLane:                  resolved.logicalLane,
 		logicalLaneExplicit:          resolved.logicalLaneExplicit,
 		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
+		lifecycleHealthProbe:         resolved.healthProbe,
 		retainAfterAckTimeout:        resolved.retainAfterAckTimeout,
 	}
 	success, err := self.enqueueSendPack(sendPack, timeout)
@@ -3475,6 +3490,7 @@ func (self *Client) sendGroupToWithTimeoutDetailed(
 		TransferOptions:              resolved.transferOptions,
 		Frames:                       frames,
 		logicalGroup:                 true,
+		lifecycleObserver:            resolved.lifecycleObserver,
 		Destination:                  destinationId,
 		IntermediaryIds:              intermediaryIds,
 		AckCallback:                  ackCallback,
@@ -3488,6 +3504,7 @@ func (self *Client) sendGroupToWithTimeoutDetailed(
 		logicalLane:                  resolved.logicalLane,
 		logicalLaneExplicit:          resolved.logicalLaneExplicit,
 		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
+		lifecycleHealthProbe:         resolved.healthProbe,
 		retainAfterAckTimeout:        resolved.retainAfterAckTimeout,
 	}
 	return self.enqueueSendPack(sendPack, timeout)
@@ -3546,6 +3563,7 @@ func (self *Client) sendWithTimeoutAdmissionDetailed(
 		logicalLane:                  resolved.logicalLane,
 		logicalLaneExplicit:          resolved.logicalLaneExplicit,
 		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
+		lifecycleHealthProbe:         resolved.healthProbe,
 		retainAfterAckTimeout:        resolved.retainAfterAckTimeout,
 	}
 	if 0 < timeout {
@@ -3568,6 +3586,7 @@ func (self *Client) sendWithTimeoutAdmissionDetailed(
 
 // The fully resolved values shared by single, batch, and raw sends.
 type resolvedSendOptions struct {
+	lifecycleObserver      func(SendPackLifecycleObservation)
 	ctx                    context.Context
 	transferOptions        TransferOptions
 	encryptionRole         sequenceTlsRole
@@ -3577,6 +3596,7 @@ type resolvedSendOptions struct {
 	logicalLane            uint32
 	logicalLaneExplicit    bool
 	upstreamRecoverable    bool
+	healthProbe            bool
 	retainAfterAckTimeout  bool
 	ackTarget              sendAckTarget
 }
@@ -3642,8 +3662,12 @@ func (self *Client) resolveSendOptions(opts []any) resolvedSendOptions {
 		case sendPackRecoveryOption:
 			resolved.upstreamRecoverable = v.upstreamRecoverable
 			resolved.retainAfterAckTimeout = v.retainAfterAckTimeout
+		case sendPackHealthProbeOption:
+			resolved.healthProbe = true
 		case sendAckTargetOption:
 			resolved.ackTarget = v.target
+		case sendPackLifecycleObserverOption:
+			resolved.lifecycleObserver = v.observer
 		}
 	}
 	return resolved
@@ -3739,6 +3763,7 @@ func (self *Client) sendRawToWithTimeoutDetailed(
 		logicalLane:                  resolved.logicalLane,
 		logicalLaneExplicit:          resolved.logicalLaneExplicit,
 		lifecycleUpstreamRecoverable: resolved.upstreamRecoverable,
+		lifecycleHealthProbe:         resolved.healthProbe,
 		retainAfterAckTimeout:        resolved.retainAfterAckTimeout,
 		rawPool:                      self.rawSendPacks,
 	}
@@ -3822,6 +3847,13 @@ func (self *Client) enqueueSendPack(sendPack *SendPack, timeout time.Duration) (
 			if observationErr == nil {
 				observationErr = ErrSendPackNotAdmitted
 			}
+			if sendPack.lifecycleObserver != nil {
+				observationErr = &SendPackAdmissionError{
+					Boundary: sendPack.admissionFailure.String(),
+					Timeout:  timeout,
+					Err:      observationErr,
+				}
+			}
 			sendPack.completeLifecycleWithoutRouteWrite(observationErr)
 			if sendPack.noAckObserver != nil {
 				noAckErr := err
@@ -3839,7 +3871,10 @@ func (self *Client) enqueueSendPack(sendPack *SendPack, timeout time.Duration) (
 // publishes the immutable Started identity. A rebuilt Client intentionally
 // restarts this counter; shared trackers namespace each observer registration.
 func (self *Client) startSendPackLifecycle(sendPack *SendPack) {
-	lifecycleObserver := self.settings.SendBufferSettings.SendPackLifecycleObserver
+	lifecycleObserver := sendPack.lifecycleObserver
+	if lifecycleObserver == nil {
+		lifecycleObserver = self.settings.SendBufferSettings.SendPackLifecycleObserver
+	}
 	if lifecycleObserver == nil {
 		return
 	}
@@ -3862,6 +3897,7 @@ func (self *Client) startSendPackLifecycle(sendPack *SendPack) {
 		AckRequired:         sendPack.Ack,
 		MessageType:         messageType,
 		UpstreamRecoverable: sendPack.lifecycleUpstreamRecoverable,
+		HealthProbe:         sendPack.lifecycleHealthProbe,
 	})
 }
 
@@ -5241,7 +5277,10 @@ type SendPackLifecycleObservation struct {
 	// an enclosing transport that retains or can regenerate this Pack after a
 	// failed attempt. It is observation metadata and never weakens delivery.
 	UpstreamRecoverable bool
-	Err                 error
+	// HealthProbe identifies an optional qualification probe at its internal
+	// producer. It never changes delivery and is not inferred from packet data.
+	HealthProbe bool
+	Err         error
 }
 
 // Correlates an encrypted carrier message with its inspectable Transfer
@@ -13602,6 +13641,7 @@ type ReceiveSequence struct {
 	deliverItems  []*receiveItem
 	deliverFrames []*protocol.Frame
 	deliverPeer   Peer
+	deliveryQueue *receiveDeliveryQueue
 }
 
 // id reconstructs the immutable receive-buffer lookup identity used by test
@@ -14129,6 +14169,9 @@ func (self *ReceiveSequence) Run() {
 			}()
 			self.flushDeliver()
 		}()
+		if self.deliveryQueue != nil {
+			self.deliveryQueue.cancel()
+		}
 		// The ACK worker owns its route writer. Its stop path snapshots the final
 		// ACK window before closing. Cancel route waits before joining: Write
 		// still tries every immediately writable route before consulting the
@@ -14731,10 +14774,9 @@ func (self *ReceiveSequence) Run() {
 				} else {
 					// this item is a resend of a previous item
 					if item.ack {
-						self.sendAck(
+						self.sendDeliveredDuplicateAck(
 							item.sequenceNumber,
 							item.messageId,
-							false,
 							sequenceTag{},
 							item.unwrapped,
 							item.transportType,
@@ -14848,6 +14890,16 @@ func (self *ReceiveSequence) Run() {
 
 		checkpointId := self.idleCondition.Checkpoint()
 		idleTimer.Reset(timeout)
+		if self.deliveryQueue != nil && self.deliveryQueue.pending() {
+			pack, ok, timedOut := self.waitDelivery(idleTimer.C)
+			if timedOut || self.ctx.Err() != nil {
+				return
+			}
+			if pack != nil && !processPack(pack, ok) {
+				return
+			}
+			continue
+		}
 		select {
 		case <-self.ctx.Done():
 			return
@@ -14990,6 +15042,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		transportType:      receivePack.TransportType,
 		unwrapped:          receivePack.Unwrapped,
 	}
+	self.prepareReceiveDeliveryCredit(item)
 
 	// A compact head is meaningful only against a contract verified earlier in
 	// this sequence. Keep the sequence number pending and request the proof;
@@ -15081,10 +15134,9 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			}
 			// this item is a resend of a previous item
 			if item.ack {
-				self.sendAck(
+				self.sendDeliveredDuplicateAck(
 					sequenceNumber,
 					messageId,
-					false,
 					sequenceTag{},
 					item.unwrapped,
 					item.transportType,
@@ -15464,6 +15516,8 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 		self.flushDeliver()
 	}
 	self.deliverPeer = peer
+	item.deliverFrameCount = len(appFrames)
+	item.deliverFrameCountSet = true
 	self.deliverItems = append(self.deliverItems, item)
 	self.deliverFrames = append(self.deliverFrames, appFrames...)
 	if receiveDeliverBatchMaxFrames <= len(self.deliverFrames) {
@@ -15500,6 +15554,11 @@ func (self *ReceiveSequence) flushDeliver() {
 	self.deliverItems = self.deliverItems[:0]
 	clear(self.deliverFrames)
 	self.deliverFrames = self.deliverFrames[:0]
+	if self.needsDeliveryReceipts(items, frames) {
+		self.flushDeliveryReceipts(items, frames, peer)
+		endTransferProgress(progressObserver, progress, "deliver_end", true, nil)
+		return
+	}
 
 	// pool buffers return exactly once even when the callback panics
 	defer func() {
@@ -15901,22 +15960,30 @@ type receiveItem struct {
 	transferItem
 
 	contractId *Id
-	head       bool
 	// Ingress is independent of the existing reorder-gap timeout clock.
-	receivedAtNanos int64
-	receiveTime     time.Time
-	frames          []*protocol.Frame
-	contractFrame   *protocol.Frame
-	// The contract frame announces a successor rather than opening it
-	// (THROUGHPUTFIX §39.1): it is verified and stored, and the sequence does
-	// not switch to it.
-	contractAhead      bool
+	receivedAtNanos   int64
+	receiveTime       time.Time
+	frames            []*protocol.Frame
+	deliverFrameCount int
+	// Extra downstream ownership credit, separately added before any SACK.
+	// Only this exact portion may move to the NAT while receive roots live.
+	deliveryPrepaid    ByteCount
+	contractFrame      *protocol.Frame
 	receiveCallback    ReceiveFunction
-	ack                bool
 	tag                sequenceTag
 	decodedOwner       *decodedPackOwner
 	transferFrameBytes []byte
 	transportType      TransportType
+	// Keep flags together: this item is embedded in every decodedPackOwner,
+	// whose allocation must fit the fixed 1-KiB receive-budget charge.
+	head                 bool
+	deliverFrameCountSet bool
+	deliveryPrepared     bool
+	ack                  bool
+	// The contract frame announces a successor rather than opening it
+	// (THROUGHPUTFIX §39.1): it is verified and stored, and the sequence does
+	// not switch to it.
+	contractAhead bool
 	// committed is set once this held item has been selectively acknowledged,
 	// which under the committed-prefix policy happens only when it can no
 	// longer be evicted (THROUGHPUTFIX §37.20). A committed item is never

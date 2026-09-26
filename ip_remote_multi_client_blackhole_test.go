@@ -8,13 +8,9 @@ import (
 	"time"
 )
 
-// The two blackhole signals are not equally strong and must not share a bound.
-//
-// A provider that acknowledges nothing is gone. A provider that acknowledges
-// our sends but returns no destination data is demonstrably alive, and may
-// simply be carrying a flow that is waiting on a slow origin. Removing an exit
-// destroys every flow pinned to it, not just the quiet one, so the ambiguous
-// case has to clear a higher bar.
+// The two blackhole signals do not share a clock or a deadline. Missing peer
+// ACKs allow the full carrier read interval; receive silence keeps its own
+// corroboration/quarantine policy and bounded telemetry window.
 //
 // On mainnet the shared 5s bound removed 44 providers out of 44 -- roughly one
 // every 18s under load -- and every one of those providers was still
@@ -22,9 +18,9 @@ import (
 func TestBlackholeReceiveTimeoutIsSeparateFromSendTimeout(t *testing.T) {
 	settings := DefaultMultiClientSettings()
 
-	if settings.BlackholeReceiveTimeout <= settings.BlackholeTimeout {
+	if settings.BlackholeReceiveTimeout == settings.BlackholeTimeout || settings.BlackholeReceiveTimeout != 20*time.Second {
 		t.Errorf(
-			"receive bound %v must be longer than the send bound %v: it is the weaker signal",
+			"receive bound %v must remain independent of the read-aligned send bound %v",
 			settings.BlackholeReceiveTimeout, settings.BlackholeTimeout,
 		)
 	}

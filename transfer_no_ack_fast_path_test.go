@@ -192,6 +192,33 @@ func TestANoAckPackGoesStraightThroughAFullRetransmitBuffer(t *testing.T) {
 	}
 }
 
+// A logical group retains one ordered sequence owner even when it fits in a
+// single wire Pack. The caller-side direct path bypasses the sequence's
+// carrier batching/pacing, which regressed H3 QUIC in the measured PERFVAR
+// comparison. Keep the whole group eligible for one queue admission only.
+func TestNoAckLogicalGroupDoesNotBypassSequence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	harness := newNoAckFastPathHarness(t, ctx, 1)
+	harness.raiseBarrier(t)
+	frame := noAckFastPathTestFrame(t)
+	pack := &SendPack{
+		TransferOptions: TransferOptions{Ack: false},
+		Frames:          []*protocol.Frame{frame},
+		logicalGroup:    true,
+		Destination:     harness.destinationId,
+		Ctx:             ctx,
+	}
+	admitted, err := harness.sequence.Pack(pack, 0)
+	if admitted || err != nil {
+		t.Fatalf("full sequence queue accepted logical group: admitted=%t err=%v", admitted, err)
+	}
+	if harness.attempted || harness.written || len(harness.route) != 0 {
+		t.Fatal("logical group bypassed its sequence owner")
+	}
+	pack.returnFrames()
+}
+
 // Timeout above zero, the write fails, and no time remains: admission is still
 // tried, at zero, rather than not at all. And the write consumed none of the
 // deadline — the deadline the pack carries is the one it entered with.

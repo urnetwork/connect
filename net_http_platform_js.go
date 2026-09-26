@@ -36,7 +36,23 @@ func (self *ClientStrategy) httpPlatformDirect(request *http.Request) (*httpResu
 	return httpResult, true
 }
 
+// Go's js/wasm Transport starts fetch before inspecting Context.Done. A worker
+// awakened by teardown can therefore start another browser request with an
+// already-canceled context. WebKit rejects that request during navigation as
+// an access-control page error, even though the fetch rejection is handled.
+// Check before crossing into the browser, including the streaming HTTP path.
+type browserHttpTransport struct {
+	http.Transport
+}
+
+func (self *browserHttpTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if err := request.Context().Err(); err != nil {
+		return nil, err
+	}
+	return self.Transport.RoundTrip(request)
+}
+
 // The one transport the browser can drive: no dialers, so net/http uses fetch.
 func platformDirectHttpTransport() http.RoundTripper {
-	return &http.Transport{}
+	return &browserHttpTransport{}
 }
