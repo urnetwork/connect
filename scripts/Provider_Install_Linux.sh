@@ -104,7 +104,7 @@ arch="$(get_arch)"
 has_systemd=0
 update_timer_oncalendar=daily
 
-api_base="https://api.github.com/repos/urnetwork/connect"
+api_base="https://api.github.com/repos/urnetwork/build"
 
 install_path="$HOME/.local/share/urnetwork-provider"
 version_file="$install_path/.version"
@@ -684,7 +684,7 @@ EOF
                 printf "Disable service:       \e[1msystemctl --user disable urnetwork\e[0m\n"
                 printf "Disable auto-updates:  \e[1msystemctl --user disable urnetwork-update.timer\e[0m\n"
                 printf "\n"
-                printf "\e[1mRefer to <https://docs.ur.io/provider#linux-and-macos> for more detailed instructions.\e[0m\n"
+                printf "\e[1mRefer to <https://ur.xyz/docs/miner> for more detailed instructions.\e[0m\n"
             fi
             ;;
 

@@ -123,7 +123,7 @@ function Set-Path {
 
 Print-Settings
 
-$GithubURLBase = "https://api.github.com/repos/urnetwork/connect"
+$GithubURLBase = "https://api.github.com/repos/urnetwork/build"
 
 if ($Version -eq "latest") {
     $GithubURL = "$GithubURLBase/releases/latest"

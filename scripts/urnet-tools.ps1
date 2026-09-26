@@ -47,7 +47,7 @@
     None. Does not take any input.
 
 .LINK
-    https://docs.ur.io/provider
+    https://ur.xyz/docs/miner
 #>
 
 param(
@@ -78,7 +78,7 @@ if (-not $IsLinux) {
     $BinarySuffix = ".exe"
 }
 
-$GithubURLBase = "https://api.github.com/repos/urnetwork/connect"
+$GithubURLBase = "https://api.github.com/repos/urnetwork/build"
 
 function Get-Path {
     return [Environment]::GetEnvironmentVariable("PATH", [System.EnvironmentVariableTarget]::User)
