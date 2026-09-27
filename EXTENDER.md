@@ -1248,10 +1248,19 @@ only, which is a fact about the host and not a setting.
 
 M3. Contract counts. A gauge is a point in time, so each contract number
 comes in two forms: open now, and created in the trailing 24 hours. The
-open counts read the partial indexes: `open` for contracts, `dispute AND
-outcome IS NULL` for disputes, and the open set with an existence probe
-of `contract_extender` for contracts with an extender party, which is
-cheap because the open set is small. The 24 hour counts are bucketized in
+collector reads `open` contracts and `dispute AND outcome IS NULL` disputes
+in one bounded statement snapshot. Each set admits at most 100,001 visible
+rows: at most 100,000 is exact, while the sentinel is an explicit lower
+bound. The extender existence probe runs only over the materialized open
+sample, so a rare extender cannot force a complete open-table scan. An
+extender zero is not exact if the open sample was capped. Acquisition and
+query work have a five-second context budget and a read-only transaction's
+five-second server statement timeout; bounded rollback cleanup may take
+one further second. Visible-row caps do not bound physical visibility work
+through old tuple versions. Timeout/error evidence is unavailable, never
+an exact zero. Explicit model exact-count APIs remain available to callers
+that intentionally need an unbounded count; the collector does not call
+them. The 24 hour counts are bucketized in
 one hour blocks. A bucket is one hour of `create_time`. The counts of a
 complete bucket (contracts, disputed contracts, contracts with an
 extender party) are computed once, by whichever collector host needs them
@@ -1296,6 +1305,21 @@ exports today:
   `urnetwork_stats_open_contracts_with_extender`,
   `urnetwork_stats_contracts_with_extender_24h`,
   `urnetwork_stats_open_disputes`, `urnetwork_stats_disputes_24h`
+- `urnetwork_stats_contract_open_lower_bound{kind}`,
+  `urnetwork_stats_contract_open_status{kind,status}` and
+  `urnetwork_stats_contract_open_observed_at_seconds{kind}` qualify the
+  three open gauges. `kind` is `open`, `with_extender` or `dispute`;
+  status is one-hot `exact`, `capped` or `unavailable`. The legacy open
+  gauges are NaN when not exact; lower bounds are NaN and observation time
+  is zero when unavailable. One collector snapshot emits all fields
+  together. The providers dashboard joins same-process status and source
+  time, accepting at most ten-minute-old observations and thirty seconds
+  of future skew. Current stat panels use instant queries, so a historical
+  last-not-null value cannot conceal missing current evidence. Capped
+  series are labeled "at least"; they cannot establish total size, trend,
+  or extender share. Old publishers without authority metrics remain
+  unknown during a mixed-version rollout. Collector failures before this
+  phase age out through source time even if the old metrics keep pushing.
 
 The provider family counts come from the existing per-country provider
 scan, extended with `count(DISTINCT client_id) FILTER (WHERE ...)` per
