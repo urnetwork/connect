@@ -23,6 +23,16 @@ type MultiClientGeneratorClientArgs struct {
 	P2pOnly    bool
 }
 
+// NetworkClientCredentials is an optional in-process authority for the
+// generator's existing derived-client lifecycle. It must honor ctx and keep
+// the same ownership/authorization rules as the API. Implementations own
+// their parent credential; SetByJwt updates only the default HTTP authority.
+// A returned error never falls back to HTTP: a mint may already have committed.
+type NetworkClientCredentials interface {
+	AuthNetworkClient(context.Context, *AuthNetworkClientArgs) (*AuthNetworkClientResult, error)
+	RemoveNetworkClient(context.Context, *RemoveNetworkClientArgs) (*RemoveNetworkClientResult, error)
+}
+
 func DefaultApiMultiClientGeneratorSettings() *ApiMultiClientGeneratorSettings {
 	return &ApiMultiClientGeneratorSettings{
 		MigrateConnectTimeout:        60 * time.Second,
@@ -74,6 +84,9 @@ func cloneUniqueApiExcludeClientIds(clientIds []Id) []Id {
 }
 
 type ApiMultiClientGeneratorSettings struct {
+	// ClientCredentials is captured at construction, not read from mutable
+	// settings during a mint or retirement. Nil preserves the public API path.
+	ClientCredentials NetworkClientCredentials
 	// MigrateConnectTimeout bounds the temporary second platform transport.
 	// If it cannot establish a route in this interval, it is closed and the
 	// old transport remains until the server's drain fallback evicts it.
@@ -223,6 +236,7 @@ type ApiMultiClientGenerator struct {
 	sourceClientId          *Id
 	clientSettingsGenerator func() *ClientSettings
 	settings                *ApiMultiClientGeneratorSettings
+	clientCredentials       NetworkClientCredentials
 	// Window carriers created without an explicit caller budget all belong to
 	// this generator. Separate generators never contend through a package root.
 	defaultPlatformTransportBudget *PlatformTransportBudget
@@ -333,6 +347,7 @@ func NewApiMultiClientGenerator(
 		sourceClientId:                 sourceClientId,
 		clientSettingsGenerator:        clientSettingsGenerator,
 		settings:                       settings,
+		clientCredentials:              settings.ClientCredentials,
 		defaultPlatformTransportBudget: DefaultPlatformTransportBudget(),
 		platformTransportMode:          platformTransportMode,
 		platformModePreferences:        maps.Clone(settings.PlatformTransportModePreferences),
@@ -703,13 +718,18 @@ func (self *ApiMultiClientGenerator) NewClientArgsContext(ctx context.Context) (
 			DeviceSpec:     self.deviceSpec,
 		}
 
-		result, err := self.api.AuthNetworkClientSyncWithCtx(ctx, authNetworkClient)
+		result, err := self.authNetworkClient(ctx, authNetworkClient)
 		if err != nil {
 			return "", err
 		}
-
+		if result == nil {
+			return "", errors.New("client auth returned no result")
+		}
 		if result.Error != nil {
 			return "", errors.New(result.Error.Message)
+		}
+		if result.ByClientJwt == "" {
+			return "", errors.New("client auth returned no credential")
 		}
 
 		return result.ByClientJwt, nil
@@ -734,6 +754,17 @@ func (self *ApiMultiClientGenerator) NewClientArgsContext(ctx context.Context) (
 	} else {
 		return nil, err
 	}
+}
+
+func (self *ApiMultiClientGenerator) authNetworkClient(ctx context.Context, args *AuthNetworkClientArgs) (*AuthNetworkClientResult, error) {
+	if self.clientCredentials == nil {
+		return self.api.AuthNetworkClientSyncWithCtx(ctx, args)
+	}
+	// Match the HTTP strategy's finite outer request budget. An ambiguous
+	// callback error is final for this attempt, never a second public mint.
+	authCtx, cancel := context.WithTimeout(ctx, self.clientStrategy.settings.RequestTimeout)
+	defer cancel()
+	return self.clientCredentials.AuthNetworkClient(authCtx, args)
 }
 
 // NewClientArgsForDestination implements `MultiClientGeneratorWithDestination`
@@ -827,6 +858,12 @@ func (self *ApiMultiClientGenerator) removeClientArgsAndWait(
 		}
 	}
 
+	if self.clientCredentials != nil {
+		// The existing drain/retirement lifecycle above owns this call and its
+		// bounded context. Switching authorities cannot revoke before drain.
+		_, _ = self.clientCredentials.RemoveNetworkClient(ctx, &RemoveNetworkClientArgs{ClientId: args.ClientId})
+		return
+	}
 	_, _ = HttpPostWithStrategy(
 		ctx,
 		self.clientStrategy,
