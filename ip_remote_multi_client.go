@@ -9727,9 +9727,10 @@ func standingReserveTarget(
 }
 
 type multiClientWindow struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	log    Logger
+	ctx                context.Context
+	cancel             context.CancelFunc
+	log                Logger
+	providerEvaluation providerEvaluationState
 
 	// Consecutive platform rate limits across ALL expanders in this window.
 	// Shared deliberately: the herd is the problem, so the backoff has to be a
@@ -11457,7 +11458,8 @@ func (self *multiClientWindow) expand(
 	admitted := 0
 	pending := []*expandEvaluatedCandidate{}
 	type pendingPingFailure struct {
-		fail            func() bool
+		fail            func(bool) bool
+		args            *multiClientChannelArgs
 		evaluationCtx   context.Context
 		startedAt       time.Time
 		effectiveBudget time.Duration
@@ -11677,12 +11679,17 @@ func (self *multiClientWindow) expand(
 		var effectiveBudgetMin time.Duration
 		var observedBudgetMax time.Duration
 		for _, pendingFailure := range pendingPingFailures {
+			localContract := pendingFailure.args.providerEvaluation.localContractUnavailable()
 			deadlineOwned := evaluationBudgetDeadlineOwned(
 				passDeadlineExpired,
 				self.ctx,
 				pendingFailure.evaluationCtx,
 			)
-			if !pendingFailure.fail() || !deadlineOwned {
+			if !pendingFailure.fail(!localContract && deadlineOwned) || !deadlineOwned {
+				continue
+			}
+			if localContract {
+				self.recordLocalContractFailure(pendingFailure.args)
 				continue
 			}
 			deadlineFailureCount += 1
@@ -11770,6 +11777,10 @@ requestCandidates:
 			args.ReceivePackets = self.clientReceivePacketsCallback
 			args.NetworkPeerDestination = self.networkPeerDestination
 			args.contractStatus = self.contractStatusFromClient
+			args.providerEvaluation = &providerEvaluationAttempt{
+				owner:         &self.providerEvaluation,
+				destinationId: args.Destination.Tail(),
+			}
 			// the evaluation epoch, not the window ctx: identical between
 			// rebuilds, and what lets the outcome rebuild fail every
 			// in-flight candidate fast (see evalEpochContext)
@@ -11823,7 +11834,7 @@ requestCandidates:
 				pendingPingDones = append(pendingPingDones, pingDone)
 
 				// must be called with mutex
-				fail := func() bool {
+				fail := func(providerFailure bool) bool {
 					select {
 					case <-pingDone.Done():
 						// already done
@@ -11831,18 +11842,24 @@ requestCandidates:
 					default:
 					}
 
+					providerFailure = providerFailure && evaluationCtx.Err() == nil
 					pingCancel()
 					// The channel cleanup owns the generator args and preserves the
 					// derived identity through its final contract-close controls.
 					client.Cancel()
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.IpFamily)
-					if 0 < ipv6Shortfall && args.IpFamily.SupportsIpv6() {
+					state := ProviderStateNotAdded
+					if providerFailure {
+						state = ProviderStateEvaluationFailed
+					}
+					self.monitor.AddProviderEvent(args.ClientId, state, args.Destination.Tail(), args.Location, args.IpFamily)
+					if providerFailure && 0 < ipv6Shortfall && args.IpFamily.SupportsIpv6() {
 						self.noteIpv6CandidateFailed()
 					}
 					return true
 				}
 				pendingPingFailures = append(pendingPingFailures, pendingPingFailure{
 					fail:            fail,
+					args:            args,
 					evaluationCtx:   evaluationCtx,
 					startedAt:       pingStartedAt,
 					effectiveBudget: self.settings.PingTimeout,
@@ -11867,7 +11884,7 @@ requestCandidates:
 						func() {
 							mutex.Lock()
 							defer mutex.Unlock()
-							fail()
+							fail(false)
 						}()
 						return
 					case <-pingTimer.C:
@@ -11878,10 +11895,15 @@ requestCandidates:
 						mutex.Lock()
 						defer mutex.Unlock()
 						if evaluationCtx.Err() != nil {
-							fail()
+							fail(false)
 							return
 						}
-						if !fail() {
+						localContract := args.providerEvaluation.localContractUnavailable()
+						if !fail(!localContract) {
+							return
+						}
+						if localContract {
+							self.recordLocalContractFailure(args)
 							return
 						}
 						// unconditional (V0), was V(2): the unanswered
@@ -11918,7 +11940,7 @@ requestCandidates:
 								}
 								mutex.Lock()
 								defer mutex.Unlock()
-								fail()
+								fail(true)
 							}
 						}, client.Cancel)
 					}
@@ -11993,19 +12015,18 @@ requestCandidates:
 								}
 								pingCancel()
 							} else {
-								self.recordEvaluationPingFailure(evaluationCtx, args, err)
-								fail()
+								providerFailure := self.recordEvaluationPingFailure(evaluationCtx, args, err)
+								fail(providerFailure)
 							}
 						},
 					)
 					if err != nil {
-						if !isEvaluationContextCancellation(evaluationCtx, err) {
-							self.log.Infof("[multi]create client ping error = %s\n", err)
-							self.recordEvaluationFailure(windowFailureProvider, err)
+						if pingDone.Err() == nil {
+							providerFailure := self.recordEvaluationPingFailure(evaluationCtx, args, err)
+							fail(providerFailure)
 						}
-						fail()
 					} else if !success {
-						fail()
+						fail(!args.providerEvaluation.localContractUnavailable())
 					}
 				})
 			}
@@ -12108,6 +12129,10 @@ func (self *multiClientWindow) recordEvaluationPingFailure(
 	err error,
 ) bool {
 	if isEvaluationContextCancellation(evaluationCtx, err) {
+		return false
+	}
+	if evaluationCtx.Err() == nil && args.providerEvaluation.localContractUnavailable() {
+		self.recordLocalContractFailure(args)
 		return false
 	}
 	// unconditional (V0), was V(1): a ping-ack error is an
@@ -12760,7 +12785,8 @@ type multiClientChannelArgs struct {
 	// manager emitted a result. The public constructor callback does not carry
 	// that identity; the owning window needs it to retire only the failed route.
 	// nil keeps directly constructed test channels on the legacy relay path.
-	contractStatus func(client *multiClientChannel, status *ContractStatus)
+	contractStatus     func(client *multiClientChannel, status *ContractStatus)
+	providerEvaluation *providerEvaluationAttempt
 }
 
 // clientReceivePacketsFunction is the batch form of
@@ -13310,6 +13336,7 @@ func newMultiClientChannel(
 
 	clientSettings := generator.NewClientSettings()
 	clientSettings.SendBufferSettings.AckTimeout = settings.AckTimeout
+	clientSettings.SendBufferSettings.providerEvaluation = args.providerEvaluation
 	// This client is dedicated to the selected destination. Stamp every send
 	// with the authenticated relationship before NewClient can emit its
 	// initial ping; the platform's NetworkPeers batch may arrive later.

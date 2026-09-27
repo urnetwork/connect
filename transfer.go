@@ -5167,6 +5167,10 @@ type SendBufferSettings struct {
 	// Nil by default. Metadata-only diagnostic trace; must not block.
 	ProgressObserver func(TransferProgressEvent)
 
+	// Owned by one candidate; nil for ordinary Clients. Tracks control waits
+	// and real provider-directed write attempts, never diagnostic counters.
+	providerEvaluation *providerEvaluationAttempt
+
 	// Nil test barriers are copied into SendBuffer during construction. Tests
 	// set them before NewClient starts lifecycle goroutines, which keeps the
 	// seam race-free without synchronizing production paths.
@@ -9605,6 +9609,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 		}
 	}
 
+	self.sendBufferSettings.providerEvaluation.beginContractWait(self.destination)
 	createStartTime := time.Now()
 	var ok bool
 	if self.log.V(2).Enabled() {
@@ -9615,6 +9620,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 	} else {
 		ok = createContract()
 	}
+	self.sendBufferSettings.providerEvaluation.endContractWait(self.destination, !ok && self.ctx.Err() == nil)
 	// surface slow contract acquisition at default verbosity. The send
 	// sequence blocks here, so a slow create (e.g. a companion request that
 	// cannot match an origin contract) stalls the entire sequence.
@@ -12125,6 +12131,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			// The observation commits to this dispatch. Feedback that arrives
 			// afterward belongs to the original delivery, not preflight.
 			observe()
+			self.sendBufferSettings.providerEvaluation.noteProviderWrite(self.destination)
 			disposition, writeErr = writeMultiRouteWithCarrier(writer, self.ctx, bytes, timeout, reliableOnly)
 			if writeErr == nil {
 				return disposition, nil
