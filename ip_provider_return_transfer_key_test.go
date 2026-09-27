@@ -366,6 +366,8 @@ func providerReturnAckRecordFromWire(
 
 // Installs a deliberately paused send sequence so a test can inspect the
 // exact provider return pack before a sequence worker serializes it.
+// Real sequences belong to the Client; provider/source cancellation arrives
+// through each Pack's context, not through the shared sequence lifetime.
 func installProviderReturnTestSequence(
 	t *testing.T,
 	provider *RemoteUserNatProvider,
@@ -374,7 +376,7 @@ func installProviderReturnTestSequence(
 ) *SendSequence {
 	t.Helper()
 	sequence := &SendSequence{
-		ctx:           provider.ctx,
+		ctx:           client.Ctx(),
 		cancel:        func() {},
 		packs:         make(chan *SendPack, 1),
 		idleCondition: NewIdleCondition(),

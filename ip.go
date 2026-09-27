@@ -8732,7 +8732,14 @@ func (self *RemoteUserNatProvider) retryReturnSend(
 	if retryTimeout <= 0 {
 		retryTimeout = 10 * time.Millisecond
 	}
+	sendCtx := item.sendContext(self.ctx)
 	for {
+		// A parent's Done closes before cancellation reaches its children.
+		// Observe the provider directly so a still-live source cannot hand
+		// ownership to Transfer after the provider has already closed.
+		if self.ctx.Err() != nil || sendCtx.Err() != nil {
+			return false
+		}
 		if self.abandonSilentSource(item) {
 			return false
 		}
@@ -8754,7 +8761,6 @@ func (self *RemoteUserNatProvider) retryReturnSend(
 		if !item.recoveryMode.waitsForProviderReturnAdmission() {
 			return false
 		}
-		sendCtx := item.sendContext(self.ctx)
 		if sendCtx.Err() != nil {
 			// the attempt failed because the source or provider closed
 			return false
