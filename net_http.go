@@ -1496,12 +1496,14 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 	}
 
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		handleCtx, authProgress := traceAuthPostAttempt(handleCtx)
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
 		if err != nil {
 			return &evalResult{err: err}
 		}
 		httpClient := dialer.HttpClient()
 		response, err := httpClient.Do(attemptRequest)
+		authProgress.responseHeaders(response, err)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial %s %s = %s\n", request.Method, request.URL, err)
@@ -1536,6 +1538,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 	result := self.serialEvalWithAttemptContext(request.Context(), eval, helloEval, preferredHttpAttemptContext)
 	if result == nil {
+		observeAuthStrategyEnd(request.Context(), self.ctx)
 		return nil, fmt.Errorf("Timeout.")
 	}
 	return materializeHttpResult(result)

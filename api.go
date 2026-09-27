@@ -275,7 +275,9 @@ func (self *BringYourApi) AuthNetworkClientSync(authNetworkClient *AuthNetworkCl
 // maintenance. The ordinary API context owns the generator lifetime; this
 // narrower context prevents one auth request from parking destination
 // enumeration indefinitely.
-func (self *BringYourApi) AuthNetworkClientSyncWithCtx(ctx context.Context, authNetworkClient *AuthNetworkClientArgs) (*AuthNetworkClientResult, error) {
+func (self *BringYourApi) AuthNetworkClientSyncWithCtx(ctx context.Context, authNetworkClient *AuthNetworkClientArgs) (result *AuthNetworkClientResult, err error) {
+	ctx, observation := beginAuthRequestObservation(ctx, self.ctx)
+	defer func() { observation.finish(result, err) }()
 	return HttpPostWithStrategy(
 		ctx,
 		self.clientStrategy,
