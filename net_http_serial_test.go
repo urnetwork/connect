@@ -6,9 +6,11 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -154,6 +156,316 @@ func TestClientDialerWithoutOutcomeIsNotLastSuccess(t *testing.T) {
 	if dialer.IsLastSuccess() {
 		t.Fatal("new dialer was classified as a previously successful route")
 	}
+}
+
+// Four fast discovery routes must not divide a valid auth response's budget
+// into four too-short attempts that mint the same logical client repeatedly.
+func TestHttpSerialAllowsSlowAuthAfterRequestWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		settings := DefaultClientStrategySettings()
+		settings.RequestTimeout = 15 * time.Second
+		settings.ParallelBlockSize = 4
+		strategy := &ClientStrategy{
+			ctx:               ctx,
+			log:               NewNoopLogger(),
+			settings:          settings,
+			dialers:           map[*clientDialer]bool{},
+			extenderIpSecrets: map[netip.Addr]string{},
+		}
+		var stateLock sync.Mutex
+		helloReady := make(chan struct{})
+		helloRoutes := map[int]bool{}
+		postCount := 0
+		for route := range 4 {
+			strategy.dialers[&clientDialer{
+				minimumWeight: 1,
+				priority:      route,
+				settings:      settings,
+				httpClient: &http.Client{Transport: serialTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+					if request.Method == http.MethodGet {
+						func() {
+							stateLock.Lock()
+							defer stateLock.Unlock()
+							if !helloRoutes[route] {
+								helloRoutes[route] = true
+								if len(helloRoutes) == 4 {
+									close(helloReady)
+								}
+							}
+						}()
+						<-helloReady
+					} else {
+						postCount++
+						if postCount != 1 {
+							// Stop the pre-fix retry spiral at its first duplicate.
+							cancel()
+							return nil, context.Canceled
+						}
+						if trace := httptrace.ContextClientTrace(request.Context()); trace != nil && trace.WroteRequest != nil {
+							trace.WroteRequest(httptrace.WroteRequestInfo{})
+						}
+						select {
+						case <-time.After(4 * time.Second):
+						case <-request.Context().Done():
+							return nil, request.Context().Err()
+						}
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{},
+						Body:       io.NopCloser(bytes.NewBufferString(`{"ok":true}`)),
+						Request:    request,
+					}, nil
+				})},
+			}] = true
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.example/auth-client", bytes.NewBufferString(`{"derived":true}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hello, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example/hello", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		result, err := strategy.HttpSerial(request, hello)
+		if err != nil {
+			t.Fatalf("auth failed after %s with %d posts: %v", time.Since(started), postCount, err)
+		}
+		if result.response.StatusCode != http.StatusOK || postCount != 1 || time.Since(started) != 4*time.Second {
+			t.Fatalf("auth status=%d posts=%d elapsed=%s", result.response.StatusCode, postCount, time.Since(started))
+		}
+	})
+}
+
+// The HTTP parallel entry point first tries remembered routes serially; that
+// fast path must not truncate an already-written GET's valid slow response.
+func TestHttpParallelAllowsSlowResponseAfterRequestWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		settings := DefaultClientStrategySettings()
+		settings.RequestTimeout = 15 * time.Second
+		strategy := &ClientStrategy{
+			ctx:               ctx,
+			log:               NewNoopLogger(),
+			settings:          settings,
+			dialers:           map[*clientDialer]bool{},
+			extenderIpSecrets: map[netip.Addr]string{},
+		}
+		requests := 0
+		for route := range 4 {
+			strategy.dialers[&clientDialer{
+				minimumWeight:   1,
+				priority:        route,
+				settings:        settings,
+				successCount:    1,
+				lastSuccessTime: time.Now(),
+				httpClient: &http.Client{Transport: serialTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+					requests++
+					if requests != 1 {
+						cancel()
+						return nil, context.Canceled
+					}
+					if trace := httptrace.ContextClientTrace(request.Context()); trace != nil && trace.WroteRequest != nil {
+						trace.WroteRequest(httptrace.WroteRequestInfo{})
+					}
+					select {
+					case <-time.After(4 * time.Second):
+					case <-request.Context().Done():
+						return nil, request.Context().Err()
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{},
+						Body:       io.NopCloser(bytes.NewBufferString(`{}`)),
+						Request:    request,
+					}, nil
+				})},
+			}] = true
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example/config", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		result, err := strategy.HttpParallel(request)
+		if err != nil || result == nil || requests != 1 || time.Since(started) != 4*time.Second {
+			t.Fatalf("GET result=%v err=%v requests=%d elapsed=%s", result, err, requests, time.Since(started))
+		}
+	})
+}
+
+// A successful write releases only the private route timer, not the caller's
+// total deadline or an existing trace callback.
+func TestHttpAttemptWrittenRequestKeepsOverallDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		writes := 0
+		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+			WroteRequest: func(httptrace.WroteRequestInfo) { writes++ },
+		})
+		attemptCtx, attemptCancel := preferredHttpAttemptContext(ctx, 4)
+		defer attemptCancel()
+		requestDeadline, _ := ctx.Deadline()
+		attemptDeadline, _ := attemptCtx.Deadline()
+		if attemptDeadline != requestDeadline {
+			t.Fatal("HTTP transport received a shorter response deadline")
+		}
+		httptrace.ContextClientTrace(attemptCtx).WroteRequest(httptrace.WroteRequestInfo{})
+		started := time.Now()
+		<-time.After(4 * time.Second)
+		if attemptCtx.Err() != nil || writes != 1 {
+			t.Fatalf("written request ended early: err=%v trace writes=%d", attemptCtx.Err(), writes)
+		}
+		<-attemptCtx.Done()
+		if time.Since(started) != 15*time.Second || !errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("hard deadline elapsed=%s err=%v", time.Since(started), attemptCtx.Err())
+		}
+	})
+}
+
+// Missing or failed write progress cannot retain a dead preferred route.
+func TestHttpAttemptUnwrittenRequestKeepsFallbackBudget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for _, failedWrite := range []bool{false, true} {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			attemptCtx, attemptCancel := preferredHttpAttemptContext(ctx, 4)
+			if failedWrite {
+				httptrace.ContextClientTrace(attemptCtx).WroteRequest(httptrace.WroteRequestInfo{Err: errors.New("write refused")})
+			}
+			started := time.Now()
+			<-attemptCtx.Done()
+			if time.Since(started) != 3*time.Second || ctx.Err() != nil {
+				t.Fatalf("failed write=%v route elapsed=%s parent=%v", failedWrite, time.Since(started), ctx.Err())
+			}
+			// A write racing after the timer cannot resurrect an expired route.
+			httptrace.ContextClientTrace(attemptCtx).WroteRequest(httptrace.WroteRequestInfo{})
+			if attemptCtx.Err() == nil {
+				t.Fatal("late write revived an expired route")
+			}
+			attemptCancel()
+			cancel()
+		}
+	})
+}
+
+// Parent cancellation and attempt cleanup remain terminal after write progress.
+func TestHttpAttemptWrittenRequestHonorsCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for _, parentCancel := range []bool{false, true} {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			attemptCtx, attemptCancel := preferredHttpAttemptContext(ctx, 4)
+			httptrace.ContextClientTrace(attemptCtx).WroteRequest(httptrace.WroteRequestInfo{})
+			if parentCancel {
+				cancel()
+			} else {
+				attemptCancel()
+			}
+			if !errors.Is(attemptCtx.Err(), context.Canceled) {
+				t.Fatalf("parent cancel=%v attempt err=%v", parentCancel, attemptCtx.Err())
+			}
+			attemptCancel()
+			cancel()
+		}
+	})
+}
+
+// A route that never writes still yields its reserved slice to a healthy
+// route whose server response legitimately needs longer than that slice.
+func TestHttpSerialFallsBackBeforeWriteThenAllowsSlowResponse(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		settings := DefaultClientStrategySettings()
+		settings.RequestTimeout = 15 * time.Second
+		strategy := &ClientStrategy{
+			ctx:               ctx,
+			log:               NewNoopLogger(),
+			settings:          settings,
+			dialers:           map[*clientDialer]bool{},
+			extenderIpSecrets: map[netip.Addr]string{},
+		}
+		posts := [2]int{}
+		for route := range 2 {
+			strategy.dialers[&clientDialer{
+				minimumWeight:   1,
+				priority:        route,
+				settings:        settings,
+				successCount:    1,
+				lastSuccessTime: time.Now(),
+				httpClient: &http.Client{Transport: serialTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+					posts[route]++
+					if route == 0 {
+						<-request.Context().Done()
+						return nil, request.Context().Err()
+					}
+					httptrace.ContextClientTrace(request.Context()).WroteRequest(httptrace.WroteRequestInfo{})
+					select {
+					case <-time.After(6 * time.Second):
+					case <-request.Context().Done():
+						return nil, request.Context().Err()
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{},
+						Body:       io.NopCloser(bytes.NewBufferString(`{}`)),
+						Request:    request,
+					}, nil
+				})},
+			}] = true
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.example/auth-client", bytes.NewBufferString(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hello, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example/hello", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		result, err := strategy.HttpSerial(request, hello)
+		if err != nil || result == nil || posts != [2]int{1, 1} || time.Since(started) != 11*time.Second {
+			t.Fatalf("fallback result=%v err=%v posts=%v elapsed=%s", result, err, posts, time.Since(started))
+		}
+	})
+}
+
+// A written request that never receives a response ends at the original
+// request deadline without starting another client mint.
+func TestHttpSerialWrittenRequestCannotExtendTotalBudget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		strategy, _, cancel := newParallelEvalCancellationTestStrategy()
+		defer cancel()
+		strategy.settings.RequestTimeout = 15 * time.Second
+		posts := 0
+		for dialer := range strategy.dialers {
+			dialer.successCount = 1
+			dialer.lastSuccessTime = time.Now()
+			dialer.httpClient = &http.Client{Transport: serialTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+				posts++
+				httptrace.ContextClientTrace(request.Context()).WroteRequest(httptrace.WroteRequestInfo{})
+				<-request.Context().Done()
+				return nil, request.Context().Err()
+			})}
+		}
+		request, err := http.NewRequestWithContext(strategy.ctx, http.MethodPost, "https://api.example/auth-client", bytes.NewBufferString(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hello, err := http.NewRequestWithContext(strategy.ctx, http.MethodGet, "https://api.example/hello", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		result, err := strategy.HttpSerial(request, hello)
+		if err == nil || result != nil || posts != 1 || time.Since(started) != 15*time.Second {
+			t.Fatalf("hung request result=%v err=%v posts=%d elapsed=%s", result, err, posts, time.Since(started))
+		}
+	})
 }
 
 // Discovery cache maintenance retains a route whose latest outcome worked and

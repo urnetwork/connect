@@ -11,6 +11,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"slices"
@@ -963,10 +964,49 @@ func preferredEvalAttemptContext(
 	return context.WithTimeout(ctx, attemptTimeout)
 }
 
+// Reserve fallback time while establishing a preferred HTTP route. Once the
+// request was written, server work and response reading use the unchanged
+// overall deadline; repeatedly canceling a valid slow POST can amplify its
+// side effects. No request progress still gives another route its turn.
+func preferredHttpAttemptContext(
+	ctx context.Context,
+	remainingAttemptCount int,
+) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok || remainingAttemptCount <= 0 {
+		return context.WithCancel(ctx)
+	}
+	attemptCtx, attemptCancel := context.WithCancel(ctx)
+	attemptTimeout := time.Until(deadline) / time.Duration(remainingAttemptCount+1)
+	attemptTimer := time.AfterFunc(max(time.Duration(0), attemptTimeout), attemptCancel)
+	attemptCtx = httptrace.WithClientTrace(attemptCtx, &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err == nil {
+				attemptTimer.Stop()
+			}
+		},
+	})
+	return attemptCtx, func() {
+		attemptTimer.Stop()
+		attemptCancel()
+	}
+}
+
 // parallelEval races the dialers of one request. `webSocketOnly` restricts it
 // to the dialers that can carry a websocket, which is what a platform dial
 // needs and an api request does not (L4).
 func (self *ClientStrategy) parallelEval(ctx context.Context, webSocketOnly bool, eval func(ctx context.Context, dialer *clientDialer) *evalResult) *evalResult {
+	return self.parallelEvalWithAttemptContext(ctx, webSocketOnly, eval, preferredEvalAttemptContext)
+}
+
+// Only the preferred synchronous phase needs a private route slice. Cold
+// parallel candidates already share the original remaining request deadline.
+func (self *ClientStrategy) parallelEvalWithAttemptContext(
+	ctx context.Context,
+	webSocketOnly bool,
+	eval func(context.Context, *clientDialer) *evalResult,
+	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
+) *evalResult {
 	// in this order:
 	// 1. try all dialers that previously worked sequentially
 	// 2. try dialers that previously failed in parallel blocks
@@ -1073,7 +1113,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, webSocketOnly bool
 				default:
 				}
 
-				attemptCtx, attemptCancel := preferredEvalAttemptContext(
+				attemptCtx, attemptCancel := attemptContext(
 					handleCtx,
 					len(serialDialers)-i,
 				)
@@ -1202,6 +1242,17 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, webSocketOnly bool
 }
 
 func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx context.Context, dialer *clientDialer) *evalResult, helloEval func(ctx context.Context, dialer *clientDialer) *evalResult) *evalResult {
+	return self.serialEvalWithAttemptContext(ctx, eval, helloEval, preferredEvalAttemptContext)
+}
+
+// HTTP can distinguish a stalled route from a request already written;
+// other evaluators retain their complete-attempt timeout semantics.
+func (self *ClientStrategy) serialEvalWithAttemptContext(
+	ctx context.Context,
+	eval func(context.Context, *clientDialer) *evalResult,
+	helloEval func(context.Context, *clientDialer) *evalResult,
+	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
+) *evalResult {
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
 	// The strategy-context bridge is function-owned; join it so even a fast
 	// successful serial result leaves no callback racing the caller's cleanup.
@@ -1255,7 +1306,7 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 			default:
 			}
 
-			attemptCtx, attemptCancel := preferredEvalAttemptContext(
+			attemptCtx, attemptCancel := attemptContext(
 				handleCtx,
 				len(serialDialers)-i,
 			)
@@ -1407,7 +1458,7 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	}
 
-	result := self.parallelEval(request.Context(), false, eval)
+	result := self.parallelEvalWithAttemptContext(request.Context(), false, eval, preferredHttpAttemptContext)
 	if result == nil {
 		return nil, fmt.Errorf("Timeout.")
 	}
@@ -1483,7 +1534,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	}
 
-	result := self.serialEval(request.Context(), eval, helloEval)
+	result := self.serialEvalWithAttemptContext(request.Context(), eval, helloEval, preferredHttpAttemptContext)
 	if result == nil {
 		return nil, fmt.Errorf("Timeout.")
 	}
