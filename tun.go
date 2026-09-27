@@ -1390,6 +1390,50 @@ func (self *Tun) DialContext(ctx context.Context, network string, address string
 	)
 }
 
+// Dials an explicitly resolved stream without issuing another DNS query. The
+// caller owns name resolution; address retains the original hostname for socket
+// attribution. Family policy, staggered address racing and lifecycle ownership
+// are identical to ordinary tun streams. Safe for concurrent use.
+func (self *Tun) DialResolvedContext(ctx context.Context, network string, address string, addrs []netip.Addr) (net.Conn, error) {
+	return raceTunDialContext(ctx, self.ctx, network, address,
+		self.settings.DialRace, self.settings.DialRaceTimeout, self.settings.DialTimeout,
+		func(ctx context.Context, network string, address string) (net.Conn, error) {
+			dialCtx, cancel := self.dialCtx(ctx)
+			defer cancel()
+			return dialResolvedTunStream(dialCtx, network, address, addrs, self.ipv6Enabled, self.dialTcpAddr)
+		})
+}
+
+// Validates one supplied answer set before any socket is created, then reuses
+// the ordinary address race. Kept independent of a live stack for policy tests.
+func dialResolvedTunStream(ctx context.Context, network string, address string, addrs []netip.Addr, ipv6Enabled bool, dial func(context.Context, string, netip.AddrPort) (net.Conn, error)) (net.Conn, error) {
+	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		return nil, fmt.Errorf("resolved tun stream requires tcp network")
+	}
+	if network == "tcp6" && !ipv6Enabled {
+		return nil, syscall.EAFNOSUPPORT
+	}
+	host, portString, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil || port < 0 || 65535 < port {
+		return nil, fmt.Errorf("invalid port %q", portString)
+	}
+	resolveNetwork := network
+	if !ipv6Enabled {
+		resolveNetwork = "tcp4"
+	}
+	allowed := dialAddrsMatchNetwork(resolveNetwork, addrs)
+	if len(allowed) == 0 {
+		return nil, syscall.EAFNOSUPPORT
+	}
+	return dialAddrsRace(ctx, allowed, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+		return dial(ctx, host, netip.AddrPortFrom(addr, uint16(port)))
+	})
+}
+
 type tunDialResult struct {
 	conn net.Conn
 	err  error
