@@ -1249,10 +1249,12 @@ only, which is a fact about the host and not a setting.
 M3. Contract counts. A gauge is a point in time, so each contract number
 comes in two forms: open now, and created in the trailing 24 hours. The
 collector reads `open` contracts and `dispute AND outcome IS NULL` disputes
-in one bounded statement snapshot. Each set admits at most 100,001 visible
-rows: at most 100,000 is exact, while the sentinel is an explicit lower
+in one bounded statement snapshot. Each set admits at most 1,001 visible
+rows: at most 1,000 is exact, while the sentinel is an explicit lower
 bound. The extender existence probe runs only over the materialized open
-sample, so a rare extender cannot force a complete open-table scan. An
+sample, so a rare extender cannot force a complete open-table scan. The open
+sample starts at recent arrivals to avoid old-prefix visibility work; a direct
+small-cap control supports this conservative bound, not a runtime guarantee. An
 extender zero is not exact if the open sample was capped. Acquisition and
 query work have a five-second context budget and a read-only transaction's
 five-second server statement timeout; bounded rollback cleanup may take
