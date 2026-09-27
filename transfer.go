@@ -2307,6 +2307,7 @@ func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 		ResendQueueUnackedItemCount:            self.resendQueueUnackedItemCount.Load(),
 		ReceiveQueueEvictionByteCount:          self.receiveQueueEvictionByteCount.Load(),
 		ReceiveQueueEvictionNoticeOverflow:     self.receiveQueueEvictionNoticeOverflow.Load(),
+		SendEvictionResendCount:                self.sendEvictionResendCount.Load(),
 		AckHandoffDropCount:                    self.receiveAckHandoffDropCount.Load(),
 		AckHandoffQueueFullCount:               self.receiveAckHandoffQueueFullCount.Load(),
 		AckHandoffMissCount:                    self.receiveAckHandoffMissCount.Load(),
@@ -5155,7 +5156,10 @@ type SendBufferSettings struct {
 	// SendPackLifecycleObservation for exact phase and ownership semantics.
 	SendPackLifecycleObserver func(SendPackLifecycleObservation)
 
-	// Borrows the exact bytes immediately before one physical route attempt.
+	// Borrows the exact bytes for one bounded writer operation. A lifetime
+	// wake may retry the same unconsumed share within that operation's budget.
+	// Already-delivered recovery is suppressed before observation; terminal
+	// cancellation/expiry still reports the existing failed-dispatch outcome.
 	// WireMessageBytes includes the optional encryption wrapper while
 	// TransferFrameBytes is the corresponding plaintext Transfer frame. The
 	// callback must not retain either slice or block; a panic is recovered.
@@ -9466,8 +9470,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 					forceUnwrapped,
 				)
 
-				// FIXME
-				self.log.Infof("[s]%s->%s...%s s(%s) contract set %s\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId, nextSendContract.contractId)
+				self.log.Infof("[s]%s->%s...%s s(%s) contract set %s sequence=%s role=%s encryption_companion=%t force_stream=%t companion_contract=%t logical_lane=%d\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId, nextSendContract.contractId, self.sequenceId, self.encryptionRole, self.encryptionCompanion, self.forceStream, self.companionContract, self.logicalLane)
 
 				// THROUGHPUTFIX §39.1 at set time, which is what the first
 				// contract needs: it is a megabyte, below any threshold this
@@ -12078,6 +12081,14 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	// Takes the share on success. A lifetime wake that received valid feedback
 	// retries the same unconsumed share within the original writer time budget.
 	writeWithLifetime := func(bytes []byte) (transferWriteDisposition, error) {
+		observed := false
+		observe := func() {
+			if !observed {
+				self.beginReceiverRttWrite(item, resend)
+				self.observeTransferWireMessage(bytes, transferFrameBytes, item, resend)
+				observed = true
+			}
+		}
 		if item != nil && !item.expectsAck && len(bytes) <= smallPacketPoolSize {
 			messagePoolMarkSmallUnordered(bytes)
 		}
@@ -12086,12 +12097,24 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		if budget >= 0 {
 			until = time.Now().Add(budget)
 		}
+		var disposition transferWriteDisposition
+		var writeErr error
 		for {
 			if err := self.ctx.Err(); err != nil {
+				observe()
 				return transferWriteDisposition{}, err
 			}
 			deadline, lifetimeErr := writeStart.lifetime(time.Now())
 			if lifetimeErr != nil {
+				if errors.Is(lifetimeErr, errWindowPacingAcknowledged) {
+					if observed {
+						// A prior lifetime wake already attempted this share.
+						// Delivery cannot erase that real route outcome.
+						return disposition, writeErr
+					}
+					return transferWriteDisposition{}, lifetimeErr
+				}
+				observe()
 				if errors.Is(lifetimeErr, context.DeadlineExceeded) {
 					self.cancel()
 				}
@@ -12105,20 +12128,26 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			if lifetimeBound {
 				timeout = max(0, time.Until(deadline))
 			}
-			disposition, err := writeMultiRouteWithCarrier(writer, self.ctx, bytes, timeout, reliableOnly)
-			if err == nil {
+			// The observation commits to this dispatch. Feedback that arrives
+			// afterward belongs to the original delivery, not preflight.
+			observe()
+			disposition, writeErr = writeMultiRouteWithCarrier(writer, self.ctx, bytes, timeout, reliableOnly)
+			if writeErr == nil {
 				return disposition, nil
 			}
 			if _, lifetimeErr = writeStart.lifetime(time.Now()); lifetimeErr != nil {
+				if errors.Is(lifetimeErr, errWindowPacingAcknowledged) {
+					return disposition, writeErr
+				}
 				if errors.Is(lifetimeErr, context.DeadlineExceeded) {
 					self.cancel()
 				}
 				return transferWriteDisposition{}, lifetimeErr
 			}
-			if !lifetimeBound || !errors.Is(err, errTransferRouteWriteTimeout) || self.ctx.Err() != nil ||
+			if !lifetimeBound || !errors.Is(writeErr, errTransferRouteWriteTimeout) || self.ctx.Err() != nil ||
 				time.Now().Before(deadline) ||
 				!until.IsZero() && !time.Now().Before(until) {
-				return disposition, err
+				return disposition, writeErr
 			}
 		}
 	}
@@ -12174,8 +12203,6 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		if err := paceWrite(len(bytes)); err != nil {
 			return transferWriteDisposition{}, err
 		}
-		self.beginReceiverRttWrite(item, resend)
-		self.observeTransferWireMessage(bytes, transferFrameBytes, item, resend)
 		shared := MessagePoolShareReadOnly(bytes)
 		disposition, err := writeWithLifetime(shared)
 		finishPacedWrite(disposition, err)
@@ -12214,8 +12241,6 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	if err := paceWrite(len(wrapped)); err != nil {
 		return transferWriteDisposition{}, err
 	}
-	self.beginReceiverRttWrite(item, resend)
-	self.observeTransferWireMessage(wrapped, transferFrameBytes, item, resend)
 	shared := MessagePoolShareReadOnly(wrapped)
 	disposition, err := writeWithLifetime(shared)
 	finishPacedWrite(disposition, err)
@@ -12582,7 +12607,6 @@ type sendItem struct {
 	// outer wrap is skipped even if the per-peer cipher becomes available
 	// between the initial send and a retransmit.
 	forceUnwrapped                bool
-	contractControl               bool
 	transportWriteObserved        bool
 	unreliableCarrierObserved     bool
 	reliableCarrierObserved       bool
@@ -12590,6 +12614,9 @@ type sendItem struct {
 	hybridReliableCarrierObserved bool
 	unreliableFlightTracked       bool
 	unreliableFlowReserve         bool
+	// Use this trailing flag run's spare bytes; the run before reliableRoute
+	// is already full and would add an entire alignment word for this flag.
+	contractControl bool
 	// expectsAck records whether this item was written on the acknowledged
 	// lane. The resend queue is retention — an item there is charged to the
 	// window, resent on a timer, probed and lease-tracked — so an item that
@@ -15400,7 +15427,13 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 
 	if contractId != nil {
 		if _, ok := self.openReceiveContracts[*contractId]; !ok {
-			self.log.Infof("[r]drop nack contract mismatch %s<-%s s(%s)\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
+			// Fixed-size identities distinguish a wrong contract reference from
+			// an empty or split receive lane without dumping signed proof bytes.
+			currentContractId := Id{}
+			if self.receiveContract != nil {
+				currentContractId = self.receiveContract.contractId
+			}
+			self.log.Infof("[r]drop nack contract mismatch %s<-%s s(%s) sequence=%s role=%s encryption_companion=%t force_stream=%t companion_contract=%t logical_lane=%d contract=%s current_contract=%s open_contracts=%d next_sequence=%d unwrapped=%t\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, self.sequenceId, self.encryptionRole, self.encryptionCompanion, self.transferKey.ForceStream, self.transferKey.CompanionContract, self.transferKey.LogicalLane, *contractId, currentContractId, len(self.openReceiveContracts), self.nextSequenceNumber, receivePack.Unwrapped)
 			return false, nil
 		}
 	}

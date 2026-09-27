@@ -520,25 +520,65 @@ func TestExtenderListenSeamOwnsEveryPartialFactoryResult(t *testing.T) {
 // An occupied tcp port disables only the tcp carrier: the udp carriers still
 // serve, the failure is reported once, and Carriers omits tcp (G2).
 func TestExtenderBindsEachCarrierIndependently(t *testing.T) {
-	occupiedListener, err := net.Listen("tcp", ":0")
-	if err != nil {
-		t.Fatal(err)
+	testExtenderBindsEachCarrierIndependently(t, "")
+}
+
+// TCP and UDP have independent port namespaces. Force both numeric collisions
+// without relying on the host's ephemeral-port allocation order.
+func TestExtenderBindsEachCarrierIndependentlyWithSharedPort(t *testing.T) {
+	for _, mode := range []connect.ExtenderConnectMode{
+		connect.ExtenderConnectModeQuic,
+		connect.ExtenderConnectModeDns,
+	} {
+		t.Run(string(mode), func(t *testing.T) {
+			testExtenderBindsEachCarrierIndependently(t, mode)
+		})
 	}
-	defer occupiedListener.Close()
-	tcpPort := occupiedListener.Addr().(*net.TCPAddr).Port
+}
+
+func testExtenderBindsEachCarrierIndependently(t *testing.T, sharedMode connect.ExtenderConnectMode) {
+	t.Helper()
 
 	quicPacketConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { quicPacketConn.Close() })
 	dnsPacketConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { dnsPacketConn.Close() })
 	quicPort := quicPacketConn.LocalAddr().(*net.UDPAddr).Port
 	dnsPort := dnsPacketConn.LocalAddr().(*net.UDPAddr).Port
 
 	settings := DefaultExtenderSettings()
+	var tcpPort int
+	var tcpBindErr error
+	switch sharedMode {
+	case "":
+		occupiedListener, err := net.Listen("tcp", ":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { occupiedListener.Close() })
+		tcpPort = occupiedListener.Addr().(*net.TCPAddr).Port
+	case connect.ExtenderConnectModeQuic:
+		tcpPort = quicPort
+	case connect.ExtenderConnectModeDns:
+		tcpPort = dnsPort
+	default:
+		t.Fatalf("unexpected shared TCP port mode %q", sharedMode)
+	}
+	if sharedMode != "" {
+		tcpBindErr = errors.New("injected occupied TCP port")
+		settings.Listen = func(network string, address string) (net.Listener, error) {
+			if network != "tcp" || address != fmt.Sprintf(":%d", tcpPort) {
+				return nil, fmt.Errorf("unexpected extender listen %s %s", network, address)
+			}
+			return nil, tcpBindErr
+		}
+	}
 	settings.ListenPacket = func(network string, address string) (net.PacketConn, error) {
 		switch address {
 		case fmt.Sprintf(":%d", quicPort):
@@ -553,32 +593,46 @@ func TestExtenderBindsEachCarrierIndependently(t *testing.T) {
 	settings.ListenErrorHandler = func(carrier string, err error) {
 		listenErrors <- carrier
 	}
+	// TCP and either UDP carrier may have the same numeric port. Append each
+	// mode so the UDP fixture cannot erase the TCP bind whose failure we test.
+	ports := map[int][]connect.ExtenderConnectMode{}
+	ports[tcpPort] = append(ports[tcpPort], connect.ExtenderConnectModeTcpTls)
+	ports[quicPort] = append(ports[quicPort], connect.ExtenderConnectModeQuic)
+	ports[dnsPort] = append(ports[dnsPort], connect.ExtenderConnectModeDns)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	server := NewExtenderServer(
 		ctx,
 		nil,
 		nil,
-		map[int][]connect.ExtenderConnectMode{
-			tcpPort:  {connect.ExtenderConnectModeTcpTls},
-			quicPort: {connect.ExtenderConnectModeQuic},
-			dnsPort:  {connect.ExtenderConnectModeDns},
-		},
+		ports,
 		&net.Dialer{},
 		settings,
 	)
+	defer server.CloseAndWait()
 	serveDone := make(chan error, 1)
 	go func() {
 		serveDone <- server.ListenAndServe()
 	}()
 
-	<-server.Listening()
+	select {
+	case <-server.Listening():
+	case <-time.After(3 * time.Second):
+		t.Fatal("extender did not finish its carrier bind attempts")
+	}
 	expectedCarriers := []string{connect.ExtenderCarrierQuic, connect.ExtenderCarrierDns}
 	if carriers := server.Carriers(); !slices.Equal(carriers, expectedCarriers) {
 		t.Fatalf("carriers = %v, expected %v", carriers, expectedCarriers)
 	}
-	if carrier := <-listenErrors; carrier != connect.ExtenderCarrierTcp {
-		t.Fatalf("listen error carrier = %q, expected tcp", carrier)
+	// Listening closes after every synchronous bind callback has returned. A
+	// missing report is already a failure, not an event that may arrive later.
+	select {
+	case carrier := <-listenErrors:
+		if carrier != connect.ExtenderCarrierTcp {
+			t.Fatalf("listen error carrier = %q, expected tcp", carrier)
+		}
+	default:
+		t.Fatal("TCP bind failure was not reported before Listening")
 	}
 	// the failure is kept beside the handler call, which is what a status read
 	// long after the bind sees (G2, F3)
@@ -588,6 +642,9 @@ func TestExtenderBindsEachCarrierIndependently(t *testing.T) {
 	}
 	if serverListenErrors[connect.ExtenderCarrierTcp] == nil {
 		t.Fatalf("listen errors = %v, expected a tcp entry", serverListenErrors)
+	}
+	if tcpBindErr != nil && !errors.Is(serverListenErrors[connect.ExtenderCarrierTcp], tcpBindErr) {
+		t.Fatalf("TCP listen error = %v, expected injected failure", serverListenErrors[connect.ExtenderCarrierTcp])
 	}
 	select {
 	case carrier := <-listenErrors:
