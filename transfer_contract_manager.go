@@ -1491,12 +1491,27 @@ func (self *ContractManager) addContractToQueue(
 	return contractQueue.Add(contract, storedContract)
 }
 
+// Coalesces an identical pending request within its exact queue generation.
+// Completion releases admission; this is not remote exactly-once semantics.
 func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) {
 	// Retain ownership through the asynchronous callback. A route promotion can
 	// force-remove and drain this exact generation while the request is in
 	// flight; the callback then rejects and closes its stale result instead of
 	// reopening the old key.
 	contractQueue := self.openContractQueue(contractKey)
+	request := contractCreateRequest{
+		key:               contractKey,
+		seqIndex:          contractSeqIndex,
+		transferByteCount: self.contractByteCount(contractKey, contractSeqIndex, minByteCount),
+	}
+	if !contractQueue.beginCreate(request) {
+		self.closeContractQueue(contractKey, contractQueue)
+		return
+	}
+	finish := func() {
+		contractQueue.finishCreate(request)
+		self.closeContractQueue(contractKey, contractQueue)
+	}
 
 	streamVersion := uint32(DefaultStreamVersion)
 	senderRole := contractKey.EncryptionRole.toProtobuf()
@@ -1504,7 +1519,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	createContract := &protocol.CreateContract{
 		DestinationId:     contractKey.Destination.DestinationId.Bytes(),
 		IntermediaryIds:   contractKey.IntermediaryIds.Bytes(),
-		TransferByteCount: uint64(self.contractByteCount(contractKey, contractSeqIndex, minByteCount)),
+		TransferByteCount: uint64(request.transferByteCount),
 		Companion:         contractKey.CompanionContract,
 		ForceStream:       &contractKey.ForceStream,
 		StreamVersion:     &streamVersion,
@@ -1515,7 +1530,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	}
 	frame, err := ToFrame(createContract, self.settings.ProtocolVersion)
 	if err != nil {
-		self.closeContractQueue(contractKey, contractQueue)
+		finish()
 		self.client.log.Infof("[contract]could not create contract frame = %s", err)
 		return
 	}
@@ -1527,7 +1542,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	self.client.ClientOob().SendControl(
 		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
-			defer self.closeContractQueue(contractKey, contractQueue)
+			defer finish()
 			if err == nil {
 				// the OOB round-trip completed: the backend is reachable
 				noteBackendSuccess()
@@ -1914,6 +1929,14 @@ type queuedContract struct {
 	enqueueTime time.Time
 }
 
+// The original key also fences legacy queues that intentionally collapse
+// routing keys. Successor indices and larger reservations are not retries.
+type contractCreateRequest struct {
+	key               ContractKey
+	seqIndex          uint64
+	transferByteCount ByteCount
+}
+
 type contractQueue struct {
 	updateMonitor *Monitor
 	log           Logger
@@ -1922,6 +1945,9 @@ type contractQueue struct {
 	openCount int
 	contracts map[Id]*queuedContract
 	drained   bool
+	// Only externally owned in-flight callbacks retain entries. No process
+	// budget, completed-request cache, or retry timer is introduced here.
+	pendingCreates map[contractCreateRequest]bool
 
 	// remember all added contract ids
 	trackUsedContracts bool
@@ -1933,6 +1959,28 @@ type contractQueue struct {
 }
 
 var errContractQueueDrained = errors.New("contract queue drained")
+
+// Linearizes nonblocking admission under this queue generation's lock.
+func (self *contractQueue) beginCreate(request contractCreateRequest) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.drained || self.pendingCreates[request] {
+		return false
+	}
+	if self.pendingCreates == nil {
+		self.pendingCreates = map[contractCreateRequest]bool{}
+	}
+	self.pendingCreates[request] = true
+	return true
+}
+
+// Releases only this generation after its response processing has completed.
+// Queue waiters retain their existing bounded retry and contract notifications.
+func (self *contractQueue) finishCreate(request contractCreateRequest) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	delete(self.pendingCreates, request)
+}
 
 func newContractQueue(log Logger, trackUsedContracts bool) *contractQueue {
 	return &contractQueue{
