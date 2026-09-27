@@ -1147,13 +1147,16 @@ type MultiClientSettings struct {
 	// providers this long after it first tried to expand gets one automatic
 	// silent rebuild — the programmatic form of the manual
 	// disconnect+reconnect that reliably recovered the 2026-08-11 field hangs.
+	// An accepted candidate may finish one bounded setup/ping envelope first;
+	// an empty candidate wait never delays this rescue.
 	// 0 disables both the rebuild and the failed latch below.
 	WindowOutcomeDeadline time.Duration
 	// WindowOutcomeRebuildDeadline is the second half: zero Added this long
 	// after the automatic rebuild latches the terminal failed state (surfaced
 	// to the app with the stall reason, rendered as a failure + Retry). The
 	// machinery keeps running underneath, and a provider that lands later
-	// clears the latch. 0 disables the failed latch only.
+	// clears the latch. The same bounded candidate protection applies here.
+	// 0 disables the failed latch only.
 	WindowOutcomeRebuildDeadline time.Duration
 
 	// ServerNameAffinityBridge lets a new flow whose own affinity group has no
@@ -9840,6 +9843,9 @@ type multiClientWindow struct {
 	// outcomeArmTime is when the window first tried to expand (zero = never);
 	// reset by the automatic rebuild so the second deadline measures from it.
 	outcomeArmTime time.Time
+	// One pass may protect an accepted candidate, never an empty args wait.
+	// Its deadline is immutable after publication under outcomeLock.
+	outcomeEvaluationOwner *multiClientEvaluationOwner
 	// outcomeRebuilt: the ONE automatic rebuild has been spent.
 	outcomeRebuilt bool
 	// outcomeFailed is a UI/status latch cleared by noteClientAdded. It never
@@ -11410,6 +11416,8 @@ func (self *multiClientWindow) expand(
 	ipv6Shortfall int,
 ) (returnPingSuccess int) {
 	mutex := sync.Mutex{}
+	evaluationOwner := &multiClientEvaluationOwner{}
+	defer self.releaseOutcomeEvaluation(evaluationOwner)
 	pendingPingDones := []context.Context{}
 	added := 0
 	addedP2pOnly := 0
@@ -11701,6 +11709,7 @@ func (self *multiClientWindow) expand(
 		self.settings.clientSetupTimeout(),
 		self.settings.PingTimeout,
 	)
+	evaluationOwner.deadline = passEndTime
 
 requestCandidates:
 	for i := 0; i < requestCount; i += 1 {
@@ -11764,7 +11773,7 @@ requestCandidates:
 			// the evaluation epoch, not the window ctx: identical between
 			// rebuilds, and what lets the outcome rebuild fail every
 			// in-flight candidate fast (see evalEpochContext)
-			evaluationCtx := self.evalEpochContext()
+			evaluationCtx := self.beginOutcomeEvaluation(evaluationOwner)
 			client, err := newMultiClientChannel(
 				evaluationCtx,
 				args,

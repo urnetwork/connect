@@ -76,6 +76,136 @@ func TestMultiClientExpandRegistrationRetainsFreshPingBudget(t *testing.T) {
 	})
 }
 
+// The real whole-window watchdog must not rebuild the evaluation epoch before
+// its bounded setup and valid ping have had their independent allowances.
+func TestMultiClientOutcomeRetainsOwnedSetupAndPing(t *testing.T) {
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newMultiClientExpandLifecycleFixture(t)
+		settings := fixture.window.settings
+		settings.PingTimeout = 2 * time.Second
+		settings.WindowExpandTimeout = time.Second
+		settings.WindowClientSetupTimeout = 5 * time.Second
+		settings.WindowOutcomeDeadline = 3 * time.Second
+		settings.WindowOutcomeRebuildDeadline = 3 * time.Second
+		generator := fixture.window.generator.(*multiClientExpandLifecycleGenerator).TestMultiClientGenerator
+		newClient := generator.newClient
+		registrationStarted := make(chan struct{})
+		registrationReady := make(chan struct{})
+		generator.newClient = func(ctx context.Context, args *MultiClientGeneratorClientArgs, settings *ClientSettings) (*Client, error) {
+			close(registrationStarted)
+			select {
+			case <-registrationReady:
+				return newClient(ctx, args, settings)
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		fixture.window.armOutcome()
+		watchDone := make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			fixture.window.watchOutcome()
+		}()
+		defer func() {
+			fixture.cancelWindow()
+			<-watchDone
+		}()
+		expandDone := fixture.start()
+		<-registrationStarted
+		synctest.Wait()
+		time.Sleep(4 * time.Second)
+		synctest.Wait()
+		select {
+		case count := <-expandDone:
+			t.Fatalf("window watchdog truncated owned setup: admissions=%d", count)
+		default:
+		}
+		close(registrationReady)
+		fixture.wait(t, "held valid provider ping", fixture.pingResultEntered)
+		time.Sleep(time.Second)
+		fixture.releasePing()
+		if got := fixture.result(t, expandDone); got != 1 {
+			t.Fatalf("window watchdog truncated a valid ping: admissions=%d", got)
+		}
+		fixture.window.outcomeLock.Lock()
+		rebuilt := fixture.window.outcomeRebuilt
+		fixture.window.outcomeLock.Unlock()
+		if rebuilt {
+			t.Fatal("valid owned evaluation triggered a premature window rebuild")
+		}
+	})
+}
+
+// No accepted candidate means no phase protection: an actually empty window
+// still rebuilds and reports failure at its original configured deadlines.
+func TestMultiClientOutcomeEmptyWindowKeepsPromptRescue(t *testing.T) {
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newMultiClientExpandLifecycleFixture(t)
+		settings := fixture.window.settings
+		settings.WindowOutcomeDeadline = 2 * time.Second
+		settings.WindowOutcomeRebuildDeadline = 2 * time.Second
+		fixture.window.armOutcome()
+		oldEpoch := fixture.window.evalEpochContext()
+		watchDone := make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			fixture.window.watchOutcome()
+		}()
+		defer func() {
+			fixture.cancelWindow()
+			<-watchDone
+		}()
+		synctest.Wait()
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		if oldEpoch.Err() != context.Canceled {
+			t.Fatal("empty window lost its prompt automatic rescue")
+		}
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		fixture.window.outcomeLock.Lock()
+		failed := fixture.window.outcomeFailed
+		fixture.window.outcomeLock.Unlock()
+		if !failed {
+			t.Fatal("empty rebuilt window lost its configured failure deadline")
+		}
+	})
+}
+
+// Successive accepted passes cannot slide the epoch cap indefinitely, and an
+// old pass's cleanup cannot erase the current pass's bounded protection.
+func TestMultiClientOutcomeOwnershipHasFixedEpochCap(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	window := outcomeTestWindow(ctx, newRecordingLogger())
+	window.settings.WindowExpandTimeout = time.Second
+	window.settings.WindowClientSetupTimeout = 5 * time.Second
+	window.settings.PingTimeout = 2 * time.Second
+	window.armOutcome()
+	first := &multiClientEvaluationOwner{deadline: window.outcomeArmTime.Add(7 * time.Second)}
+	second := &multiClientEvaluationOwner{deadline: window.outcomeArmTime.Add(time.Hour)}
+	window.beginOutcomeEvaluation(first)
+	window.beginOutcomeEvaluation(second)
+	window.releaseOutcomeEvaluation(first)
+	window.outcomeLock.Lock()
+	deadline := window.outcomeEvaluationDeadlineWithLock(3 * time.Second)
+	owner := window.outcomeEvaluationOwner
+	disabled := window.outcomeEvaluationDeadlineWithLock(0)
+	window.outcomeLock.Unlock()
+	if owner != second || deadline != 8*time.Second || disabled != 0 {
+		t.Fatalf("epoch protection changed owner/cap/disable: current=%t deadline=%s disabled=%s", owner == second, deadline, disabled)
+	}
+	window.releaseOutcomeEvaluation(second)
+	window.outcomeLock.Lock()
+	deadline = window.outcomeEvaluationDeadlineWithLock(3 * time.Second)
+	window.outcomeLock.Unlock()
+	if deadline != 3*time.Second {
+		t.Fatalf("ended pass retained watchdog protection: %s", deadline)
+	}
+}
+
 // A setup timeout is local platform evidence, not a failed provider response.
 func TestMultiClientSetupDeadlineIsPlatformFailure(t *testing.T) {
 	MessagePoolReturn(MessagePoolGet(1))

@@ -52,9 +52,8 @@ func TestExpandCandidateWithinAcquisitionDeadline(t *testing.T) {
 	}
 }
 
-// TestMultiClientExpandDeadlinesPreserveBothPhaseBudgets prevents the
-// acquisition deadline from silently replacing the initial-ping deadline.
-func TestMultiClientExpandDeadlinesPreserveBothPhaseBudgets(t *testing.T) {
+// Every acquisition, setup and ping phase remains inside the finite pass sum.
+func TestMultiClientExpandDeadlinesPreserveAllPhaseBudgets(t *testing.T) {
 	startTime := time.Unix(0, 100)
 	requestEndTime, passEndTime := multiClientExpandDeadlines(
 		startTime,

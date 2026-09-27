@@ -233,6 +233,46 @@ func (self *multiClientWindow) evalEpochContext() context.Context {
 	return self.evalEpochCtx
 }
 
+// A pass publishes this only after accepting a candidate. Its immutable
+// deadline and identity prevent a late release from clearing a successor.
+type multiClientEvaluationOwner struct {
+	deadline time.Time
+}
+
+// Captures the epoch and its candidate ownership atomically with a watchdog
+// rebuild. No callback or network operation runs under the outcome lock.
+func (self *multiClientWindow) beginOutcomeEvaluation(owner *multiClientEvaluationOwner) context.Context {
+	self.outcomeLock.Lock()
+	defer self.outcomeLock.Unlock()
+	self.outcomeEvaluationOwner = owner
+	if self.evalEpochCtx == nil {
+		return self.ctx
+	}
+	return self.evalEpochCtx
+}
+
+// Terminal pass cleanup releases only its own protection after joining pings.
+func (self *multiClientWindow) releaseOutcomeEvaluation(owner *multiClientEvaluationOwner) {
+	self.outcomeLock.Lock()
+	defer self.outcomeLock.Unlock()
+	if self.outcomeEvaluationOwner == owner {
+		self.outcomeEvaluationOwner = nil
+	}
+}
+
+// Empty windows retain the configured rescue time. An accepted candidate may
+// finish inside one phase envelope from the epoch's original arm time; later
+// passes cannot keep extending that cap. Must be called with outcomeLock.
+func (self *multiClientWindow) outcomeEvaluationDeadlineWithLock(configured time.Duration) time.Duration {
+	if configured <= 0 || self.outcomeEvaluationOwner == nil || self.outcomeArmTime.IsZero() {
+		return configured
+	}
+	phaseBudget := max(time.Duration(0), self.settings.WindowExpandTimeout) +
+		self.settings.clientSetupTimeout() + max(time.Duration(0), self.settings.PingTimeout)
+	protected := min(self.outcomeEvaluationOwner.deadline.Sub(self.outcomeArmTime), max(configured, phaseBudget))
+	return max(configured, protected)
+}
+
 // armOutcome starts the outcome clock the first time the window actually tries
 // to expand. Deliberately not construction time: the speed window can sit
 // disabled (target 0) under a fixed-window profile, and a clock armed on a
@@ -437,6 +477,8 @@ func outcomeWatchPollTimeout(deadline time.Duration, resizeTimeout time.Duration
 // WindowOutcomeRebuildDeadline after that latches the failed state. Not wired
 // to `cancel` — like the heartbeat and the prober, a watchdog that exists to
 // describe and rescue the window must never be able to tear down the tunnel.
+// Only accepted candidates may defer either transition inside one finite
+// phase envelope from the epoch arm time; repeated passes cannot slide it.
 func (self *multiClientWindow) watchOutcome() {
 	for {
 		deadline := self.reliabilitySettings().WindowOutcomeDeadline
@@ -462,6 +504,8 @@ func (self *multiClientWindow) watchOutcome() {
 			rebuilt = self.outcomeRebuilt
 			failed = self.outcomeFailed
 			added = self.everAdded
+			deadline = self.outcomeEvaluationDeadlineWithLock(deadline)
+			rebuildDeadline = self.outcomeEvaluationDeadlineWithLock(rebuildDeadline)
 		}()
 
 		if !armTime.IsZero() && !added {
@@ -490,6 +534,7 @@ func (self *multiClientWindow) watchOutcome() {
 // yellow, the dots reset, no failure is surfaced yet.
 func (self *multiClientWindow) rebuildWindow(elapsed time.Duration) {
 	reason := self.stallReason()
+	configuredDeadline := self.reliabilitySettings().WindowOutcomeDeadline
 
 	var cancelEpoch context.CancelFunc
 	aborted := false
@@ -507,10 +552,17 @@ func (self *multiClientWindow) rebuildWindow(elapsed time.Duration) {
 			aborted = true
 			return
 		}
+		// A candidate can be accepted after the watchdog's snapshot. Recheck
+		// its finite phase ownership before canceling the captured epoch.
+		if deadline := self.outcomeEvaluationDeadlineWithLock(configuredDeadline); configuredDeadline < deadline && time.Since(self.outcomeArmTime) < deadline {
+			aborted = true
+			return
+		}
 		cancelEpoch = self.evalEpochCancel
 		epochCtx, epochCancel := context.WithCancel(self.ctx)
 		self.evalEpochCtx = epochCtx
 		self.evalEpochCancel = epochCancel
+		self.outcomeEvaluationOwner = nil
 		self.outcomeRebuilt = true
 		self.outcomeArmTime = time.Now()
 	}()
@@ -548,6 +600,7 @@ func (self *multiClientWindow) rebuildWindow(elapsed time.Duration) {
 // clears the latch (noteClientAdded).
 func (self *multiClientWindow) failOutcome(elapsed time.Duration) {
 	reason := self.stallReason()
+	configuredDeadline := self.reliabilitySettings().WindowOutcomeRebuildDeadline
 	aborted := false
 	func() {
 		self.outcomeLock.Lock()
@@ -558,6 +611,10 @@ func (self *multiClientWindow) failOutcome(elapsed time.Duration) {
 		// installed a provider — with nothing left to clear the lie, because
 		// noteClientAdded (the only other clearer) already ran.
 		if self.everAdded {
+			aborted = true
+			return
+		}
+		if deadline := self.outcomeEvaluationDeadlineWithLock(configuredDeadline); configuredDeadline < deadline && time.Since(self.outcomeArmTime) < deadline {
 			aborted = true
 			return
 		}
