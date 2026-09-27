@@ -1049,25 +1049,24 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 	}
 	provideTimer := time.NewTimer(provideTimeout)
 	defer provideTimer.Stop()
+	// A constructed client owns joined retirement even when registration
+	// fails. The window must not revoke its args again before that drain.
+	failSetup := func(err error) (*Client, error) {
+		self.RemoveClientWithArgs(client, args)
+		client.Cancel()
+		return nil, &multiClientSetupError{err: err, argsOwned: true}
+	}
 	select {
 	case err := <-provideAck:
 		if err != nil {
-			self.RemoveClientWithArgs(client, args)
-			client.Cancel()
-			return nil, err
+			return failSetup(err)
 		}
 	case <-provideTimer.C:
-		self.RemoveClientWithArgs(client, args)
-		client.Cancel()
-		return nil, fmt.Errorf("provide secret registration timed out")
+		return failSetup(fmt.Errorf("provide secret registration timed out"))
 	case <-callCtx.Done():
-		self.RemoveClientWithArgs(client, args)
-		client.Cancel()
-		return nil, callCtx.Err()
+		return failSetup(callCtx.Err())
 	case <-ctx.Done():
-		self.RemoveClientWithArgs(client, args)
-		client.Cancel()
-		return nil, ctx.Err()
+		return failSetup(ctx.Err())
 	}
 	// A transport delivery ack does not prove the platform has published the
 	// identity key that the provider needs to authenticate this client's proof.
@@ -1081,9 +1080,7 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 			registrationErr = keyManager.WaitForRegistration(callCtx)
 		}
 		if registrationErr != nil {
-			self.RemoveClientWithArgs(client, args)
-			client.Cancel()
-			return nil, fmt.Errorf("client key registration: %w", registrationErr)
+			return failSetup(fmt.Errorf("client key registration: %w", registrationErr))
 		}
 	}
 	self.transportLock.Lock()

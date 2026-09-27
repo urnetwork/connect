@@ -214,10 +214,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		PingWriteTimeout:              5 * time.Second,
 		CPingWriteTimeout:             15 * time.Second,
 		CPingMaxByteCountPerSecond:    kib(32),
-		// the initial ping includes creating the transports and contract
-		// ease up the timeout until perf issues are fully resolved
-		PingTimeout:  30 * time.Second,
-		CPingTimeout: 30 * time.Second,
+		// Control registration and the first provider response own separate
+		// bounded phases; slow platform setup cannot spend the ping interval.
+		WindowClientSetupTimeout: 30 * time.Second,
+		PingTimeout:              30 * time.Second,
+		CPingTimeout:             30 * time.Second,
 		// the rest between continuous pings. decoupled from `CPingTimeout` (the
 		// ack wait) so a dead idle client is detected within
 		// ~CPingRestTimeout+CPingTimeout instead of ~2x CPingTimeout
@@ -766,10 +767,12 @@ type MultiClientSettings struct {
 	StatsWindowEntropy float32
 	// WindowExpandTimeout bounds candidate acquisition for one expansion pass.
 	// A candidate accepted inside this phase remains owned by the same pass
-	// through its full PingTimeout; acquisition therefore cannot silently
-	// shorten initial evaluation, and a pass remains bounded by the sum of the
-	// two settings.
+	// through bounded client setup and its full PingTimeout. The pass retains
+	// terminal ownership for the sum of these three phase budgets.
 	WindowExpandTimeout time.Duration
+	// Processed control registration precedes the first provider ping. A zero
+	// value retains the default 30s setup bound for older settings literals.
+	WindowClientSetupTimeout time.Duration
 	// WindowExpandBlockTimeout     time.Duration
 	WindowExpandBlockCount int
 	// WindowEnumerateEmptyTimeout time.Duration
@@ -11381,15 +11384,16 @@ func expandCandidateWithinAcquisitionDeadline(candidateTime time.Time, deadline 
 	return !deadline.Before(candidateTime)
 }
 
-// multiClientExpandDeadlines keeps acquisition and initial evaluation as
-// distinct budgets while bounding one owning pass by their sum.
+// Acquisition, control setup and the first provider response each retain
+// their own budget while one pass owns the finite sum.
 func multiClientExpandDeadlines(
 	startTime time.Time,
 	requestTimeout time.Duration,
+	setupTimeout time.Duration,
 	pingTimeout time.Duration,
 ) (requestEndTime time.Time, passEndTime time.Time) {
 	requestEndTime = startTime.Add(requestTimeout)
-	passEndTime = requestEndTime.Add(pingTimeout)
+	passEndTime = requestEndTime.Add(setupTimeout + pingTimeout)
 	return
 }
 
@@ -11694,6 +11698,7 @@ func (self *multiClientWindow) expand(
 	requestEndTime, passEndTime := multiClientExpandDeadlines(
 		time.Now(),
 		self.settings.WindowExpandTimeout,
+		self.settings.clientSetupTimeout(),
 		self.settings.PingTimeout,
 	)
 
@@ -11725,8 +11730,8 @@ requestCandidates:
 			// the phase boundary cannot extend the pass beyond its documented
 			// acquisition + evaluation bound. Returning its args is the ordinary
 			// unused-candidate ownership path.
-			pingStartedAt := time.Now()
-			if !expandCandidateWithinAcquisitionDeadline(pingStartedAt, requestEndTime) {
+			candidateTime := time.Now()
+			if !expandCandidateWithinAcquisitionDeadline(candidateTime, requestEndTime) {
 				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 				self.log.V(2).Infof("[multi]expand window timeout before candidate evaluation\n")
 				break requestCandidates
@@ -11791,11 +11796,18 @@ requestCandidates:
 			)
 			if err != nil {
 				providerFailure := self.recordChannelCreationFailure(evaluationCtx, args, err)
-				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				var setupErr *multiClientSetupError
+				setupFailed := errors.As(err, &setupErr)
+				if !setupFailed || !setupErr.argsOwned {
+					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				}
 				if providerFailure {
 					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.IpFamily)
+				} else if setupFailed && evaluationCtx.Err() == nil {
+					self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
 				}
 			} else {
+				pingStartedAt := time.Now()
 
 				// send an initial ping on the client and let the ack timeout close it
 				pingDone, pingCancel := context.WithCancel(self.ctx)
@@ -11827,9 +11839,9 @@ requestCandidates:
 					effectiveBudget: self.settings.PingTimeout,
 				})
 
-				// PingTimeout owns the whole initial evaluation, including any
-				// transport or contract work SendDetailedMessage performs before
-				// returning. Start it here, not after the send returns. The pass
+				// PingTimeout starts after processed control registration, but
+				// includes transport/contract work during SendDetailedMessage.
+				// Start it here, not after the send returns. The pass
 				// waits for pingDone below, so a candidate accepted just before the
 				// acquisition deadline receives the same budget as the first one
 				// without letting its callback escape into a later resize pass.
@@ -11995,7 +12007,7 @@ requestCandidates:
 	}
 
 	// Candidate acquisition is over. Retain pass ownership until every ping
-	// resolves, capped at acquisition budget + one full initial-ping budget.
+	// resolves, capped at acquisition + setup + one full initial-ping budget.
 	// The individual ping timers normally close these contexts first; the pass
 	// cap is the terminal safety boundary that preserves bounded ownership if a
 	// callback or timer goroutine itself stalls.
@@ -12033,7 +12045,7 @@ func evaluationBudgetDeadlineOwned(
 }
 
 // recordEvaluationBudgetExhausted owns only candidates still unresolved after
-// candidate acquisition plus one full initial-ping budget. Pass cleanup stays
+// candidate acquisition, setup and one full initial-ping budget. Pass cleanup stays
 // the terminal owner, so a delayed ping callback cannot admit into a later
 // pass. Local epoch or window cancellation is filtered by the caller before a
 // candidate is counted.
@@ -12059,6 +12071,7 @@ func (self *multiClientWindow) recordEvaluationBudgetExhausted(
 			"effective_min", effectiveBudgetMin,
 			"observed_max", observedBudgetMax,
 			"ping_timeout", self.settings.PingTimeout,
+			"setup_timeout", self.settings.clientSetupTimeout(),
 			"expand_timeout", self.settings.WindowExpandTimeout,
 			"suppressed", suppressed,
 		))
@@ -12101,8 +12114,8 @@ func (self *multiClientWindow) recordEvaluationPingFailure(
 // recordChannelCreationFailure reports whether a failed candidate needs a
 // terminal provider event. A failure matching the construction context after
 // that context ended is caller-owned epoch rebuild or window retirement, not
-// a provider event or failure. A live-context error remains a genuine provider
-// failure even when the remote error itself is Canceled or DeadlineExceeded.
+// a provider event or failure. An owned setup deadline is platform evidence;
+// other live-context errors retain the existing provider classification.
 // The caller retains generator ownership until this classification completes.
 func (self *multiClientWindow) recordChannelCreationFailure(
 	evaluationCtx context.Context,
@@ -12110,6 +12123,11 @@ func (self *multiClientWindow) recordChannelCreationFailure(
 	err error,
 ) bool {
 	if isEvaluationContextCancellation(evaluationCtx, err) {
+		return false
+	}
+	var setupErr *multiClientSetupError
+	if errors.As(err, &setupErr) {
+		self.recordEvaluationFailure(windowFailurePlatform, err)
 		return false
 	}
 	// unconditional (V0): this transition was invisible in the field —
@@ -13301,10 +13319,13 @@ func newMultiClientChannel(
 		clientSettings.EncryptionSettings.Mode = EncryptionModeRequired
 	}
 
-	client, err := generator.NewClient(
+	client, err := newMultiClientChannelClient(
 		cancelCtx,
+		cancel,
 		&args.MultiClientGeneratorClientArgs,
+		generator,
 		clientSettings,
+		settings.clientSetupTimeout(),
 	)
 	if err != nil {
 		cancel()

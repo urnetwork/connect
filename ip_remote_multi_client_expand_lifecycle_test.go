@@ -15,6 +15,7 @@ import (
 const (
 	expandLifecycleWriteTimeout   = 11 * time.Second
 	expandLifecyclePingTimeout    = 17 * time.Second
+	expandLifecycleSetupTimeout   = 13 * time.Second
 	expandLifecycleRequestTimeout = 7 * time.Second
 )
 
@@ -58,13 +59,14 @@ func TestMultiClientExpandDeadlinesPreserveBothPhaseBudgets(t *testing.T) {
 	requestEndTime, passEndTime := multiClientExpandDeadlines(
 		startTime,
 		expandLifecycleRequestTimeout,
+		expandLifecycleSetupTimeout,
 		expandLifecyclePingTimeout,
 	)
 	if got := requestEndTime.Sub(startTime); got != expandLifecycleRequestTimeout {
 		t.Fatalf("candidate-acquisition budget=%s, want %s", got, expandLifecycleRequestTimeout)
 	}
-	if got := passEndTime.Sub(requestEndTime); got != expandLifecyclePingTimeout {
-		t.Fatalf("initial-ping budget=%s, want %s", got, expandLifecyclePingTimeout)
+	if got := passEndTime.Sub(requestEndTime); got != expandLifecycleSetupTimeout+expandLifecyclePingTimeout {
+		t.Fatalf("setup and initial-ping budget=%s, want %s", got, expandLifecycleSetupTimeout+expandLifecyclePingTimeout)
 	}
 }
 
