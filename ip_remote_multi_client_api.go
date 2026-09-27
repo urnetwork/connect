@@ -1054,7 +1054,7 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 	failSetup := func(err error) (*Client, error) {
 		self.RemoveClientWithArgs(client, args)
 		client.Cancel()
-		return nil, &multiClientSetupError{err: err, argsOwned: true}
+		return nil, &multiClientSetupError{err: &localControlRegistrationError{err: err}, argsOwned: true}
 	}
 	select {
 	case err := <-provideAck:

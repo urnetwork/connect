@@ -345,7 +345,42 @@ func TestApiMultiClientRegistrationFailureRetainsArgsOwnership(t *testing.T) {
 	if got.client != nil || !errors.As(got.err, &setupErr) || !setupErr.argsOwned || !errors.Is(got.err, context.Canceled) {
 		t.Fatalf("registration failure lost joined cleanup ownership: %v", got.err)
 	}
+	var registrationErr interface{ LocalControlRegistrationFailure() bool }
+	if !errors.As(got.err, &registrationErr) || !registrationErr.LocalControlRegistrationFailure() {
+		t.Fatal("processed local registration failure lost its typed non-provider cause")
+	}
 	waitCloseWaitBarrier(t, t.Context(), joinEntered, "registration retirement join")
+}
+
+// The marker is narrower than a setup error: a custom constructor can fail
+// because its peer refused or went offline, which is not local registration.
+func TestMultiClientGenericSetupFailureHasNoLocalRegistrationMarker(t *testing.T) {
+	for _, err := range []error{context.DeadlineExceeded, errors.New("synthetic peer refusal"), &multiClientSetupError{err: context.DeadlineExceeded}} {
+		var registrationErr interface{ LocalControlRegistrationFailure() bool }
+		if errors.As(err, &registrationErr) && registrationErr.LocalControlRegistrationFailure() {
+			t.Fatal("generic setup or peer failure was marked as local registration")
+		}
+	}
+}
+
+// The outer setup deadline may wrap an API registration cancellation; both
+// the local cause and joined identity-retirement ownership must survive.
+func TestMultiClientSetupDeadlineKeepsLocalRegistrationCause(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		generator := &registrationBudgetContextGenerator{setup: func(_ context.Context, callCtx context.Context, _ *MultiClientGeneratorClientArgs, _ *ClientSettings) (*Client, error) {
+			<-callCtx.Done()
+			return nil, &multiClientSetupError{err: &localControlRegistrationError{err: callCtx.Err()}, argsOwned: true}
+		}}
+		_, err := newMultiClientChannelClient(ctx, cancel, &MultiClientGeneratorClientArgs{}, generator, DefaultClientSettings(), time.Second)
+		var setupErr *multiClientSetupError
+		var registrationErr interface{ LocalControlRegistrationFailure() bool }
+		if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &setupErr) || !setupErr.argsOwned ||
+			!errors.As(err, &registrationErr) || !registrationErr.LocalControlRegistrationFailure() {
+			t.Fatalf("setup deadline erased exact registration ownership/cause: %v", err)
+		}
+	})
 }
 
 // Setup cancellation after success cannot terminate a healthy API-style client.

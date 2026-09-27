@@ -32,6 +32,26 @@ func (self *multiClientSetupError) Unwrap() error {
 	return self.err
 }
 
+// This cause is attached only to the API generator's own processed Provide
+// and ClientKey registration waits. It says nothing about a selected peer.
+type localControlRegistrationError struct {
+	err error
+}
+
+func (self *localControlRegistrationError) Error() string {
+	return self.err.Error()
+}
+
+func (self *localControlRegistrationError) Unwrap() error {
+	return self.err
+}
+
+// A structural marker lets a caller retain this narrow cause through wrappers
+// without treating generic channel setup or peer failures as local faults.
+func (*localControlRegistrationError) LocalControlRegistrationFailure() bool {
+	return true
+}
+
 // Older settings literals retain a finite setup allowance independent of ping.
 func (self *MultiClientSettings) clientSetupTimeout() time.Duration {
 	if 0 < self.WindowClientSetupTimeout {
