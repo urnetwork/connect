@@ -202,7 +202,7 @@ func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer
 			return
 		}
 		attempt = func() (bool, error) {
-			return tcp4.sendTransferKey(owner.source, owner.peer.TransferKey, owner.peer.ProvideMode, &tcp, 0, owner.packet, &owner.credit)
+			return tcp4.sendTransferKeyWithOwner(owner.source, owner.peer.TransferKey, owner.peer.ProvideMode, &tcp, 0, owner.packet, &owner.credit, owner)
 		}
 	} else {
 		protocol, source, destination, transport, valid := parseIpv6(packet)
@@ -211,7 +211,7 @@ func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer
 			return
 		}
 		attempt = func() (bool, error) {
-			return tcp6.sendTransferKey(owner.source, owner.peer.TransferKey, owner.peer.ProvideMode, &tcp, 0, owner.packet, &owner.credit)
+			return tcp6.sendTransferKeyWithOwner(owner.source, owner.peer.TransferKey, owner.peer.ProvideMode, &tcp, 0, owner.packet, &owner.credit, owner)
 		}
 	}
 	var valid bool
@@ -229,6 +229,9 @@ func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer
 			owner.packet = nil
 			return receiveDeliverySecured
 		}
+		if err == errReliableIngressResetPending {
+			return receiveDeliveryInFlight
+		}
 		if err != nil {
 			owner.traceFinalRejection(&tcp, err)
 			return receiveDeliveryRejected
@@ -242,6 +245,9 @@ func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer
 		owner.operation.complete(true)
 	case receiveDeliveryRejected:
 		owner.operation.complete(false)
+	case receiveDeliveryInFlight:
+		// A terminal reset owns asynchronous completion of this receipt.
+		return
 	default:
 		owner.operation.retry(owner.provider.localUserNat.reliableCapacity.subscribe, finalAttempt)
 	}

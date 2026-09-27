@@ -416,6 +416,9 @@ func TestAFastPathWriteIsChargedToTheContractItRead(t *testing.T) {
 	harness := newNoAckFastPathHarness(t, ctx, 1)
 	sequence := harness.sequence
 	first := harness.contract
+	barrier := &h1RetirementBarrierWriter{MultiRouteWriter: sequence.contractMultiRouteWriter, entered: make(chan struct{}), release: make(chan error, 1)}
+	sequence.contractMultiRouteWriter = barrier
+	sequence.publishNoAckFastPath()
 
 	pack := &SendPack{
 		TransferOptions:  TransferOptions{Ack: false},
@@ -426,11 +429,15 @@ func TestAFastPathWriteIsChargedToTheContractItRead(t *testing.T) {
 	}
 	byteCount := ByteCount(len(pack.Frame.MessageBytes))
 
-	// the caller reads
+	// The caller reads and acquires its reservation before retirement. A
+	// pointer read alone no longer authorizes writing a closed contract.
 	read := sequence.readNoAckFastPath(pack)
 	if read == nil || read.contract != first {
 		t.Fatal("the caller did not read a snapshot of the first contract")
 	}
+	wrote := make(chan bool, 1)
+	go func() { wrote <- sequence.writeNoAckFastPath(read, pack) }()
+	<-barrier.entered
 
 	// the loop switches under it and publishes
 	second := newContractAheadTestContract(t, harness.client, harness.destinationId)
@@ -441,8 +448,9 @@ func TestAFastPathWriteIsChargedToTheContractItRead(t *testing.T) {
 		t.Fatal("the switch did not publish a snapshot of the second contract")
 	}
 
-	// the caller writes with what it read
-	if !sequence.writeNoAckFastPath(read, pack) {
+	// The accepted caller finishes with the contract it reserved.
+	barrier.release <- nil
+	if !<-wrote {
 		t.Fatal("the write against the snapshot the caller read failed with room on the route")
 	}
 	written := harness.takeWrittenPack(t)

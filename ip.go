@@ -4183,6 +4183,18 @@ func (self *Tcp4Buffer) sendTransferKey(
 	ipPacket []byte,
 	prepaid ...*natMemoryReservation,
 ) (bool, error) {
+	var credit *natMemoryReservation
+	if len(prepaid) != 0 {
+		credit = prepaid[0]
+	}
+	return self.sendTransferKeyWithOwner(source, transferKey, provideMode, tcp, timeout, ipPacket, credit, nil)
+}
+
+func (self *Tcp4Buffer) sendTransferKeyWithOwner(
+	source TransferPath, transferKey TransferKey, provideMode protocol.ProvideMode,
+	tcp *parsedTcp, timeout time.Duration, ipPacket []byte,
+	credit *natMemoryReservation, terminalOwner *providerReliablePacket,
+) (bool, error) {
 	source = source.LocalMask()
 	bufferId := NewBufferId4(
 		source,
@@ -4190,7 +4202,7 @@ func (self *Tcp4Buffer) sendTransferKey(
 		tcp.destinationIp, int(tcp.destinationPort),
 	)
 
-	return self.tcpSend(
+	return self.tcpSendWithOwner(
 		bufferId,
 		source,
 		transferKey,
@@ -4199,7 +4211,8 @@ func (self *Tcp4Buffer) sendTransferKey(
 		tcp,
 		timeout,
 		ipPacket,
-		prepaid...,
+		credit,
+		terminalOwner,
 	)
 }
 
@@ -4259,6 +4272,18 @@ func (self *Tcp6Buffer) sendTransferKey(
 	ipPacket []byte,
 	prepaid ...*natMemoryReservation,
 ) (bool, error) {
+	var credit *natMemoryReservation
+	if len(prepaid) != 0 {
+		credit = prepaid[0]
+	}
+	return self.sendTransferKeyWithOwner(source, transferKey, provideMode, tcp, timeout, ipPacket, credit, nil)
+}
+
+func (self *Tcp6Buffer) sendTransferKeyWithOwner(
+	source TransferPath, transferKey TransferKey, provideMode protocol.ProvideMode,
+	tcp *parsedTcp, timeout time.Duration, ipPacket []byte,
+	credit *natMemoryReservation, terminalOwner *providerReliablePacket,
+) (bool, error) {
 	source = source.LocalMask()
 	bufferId := NewBufferId6(
 		source,
@@ -4266,7 +4291,7 @@ func (self *Tcp6Buffer) sendTransferKey(
 		tcp.destinationIp, int(tcp.destinationPort),
 	)
 
-	return self.tcpSend(
+	return self.tcpSendWithOwner(
 		bufferId,
 		source,
 		transferKey,
@@ -4275,7 +4300,8 @@ func (self *Tcp6Buffer) sendTransferKey(
 		tcp,
 		timeout,
 		ipPacket,
-		prepaid...,
+		credit,
+		terminalOwner,
 	)
 }
 
@@ -4351,6 +4377,19 @@ func (self *TcpBuffer[BufferId]) allowOrphanRstWithLock() bool {
 }
 
 func (self *TcpBuffer[BufferId]) tcpSend(
+	bufferId BufferId, source TransferPath, transferKey TransferKey,
+	provideMode protocol.ProvideMode, ipVersion int, tcp *parsedTcp,
+	timeout time.Duration, ipPacket []byte, prepaid ...*natMemoryReservation,
+) (bool, error) {
+	var credit *natMemoryReservation
+	if len(prepaid) != 0 {
+		credit = prepaid[0]
+	}
+	return self.tcpSendWithOwner(bufferId, source, transferKey, provideMode, ipVersion,
+		tcp, timeout, ipPacket, credit, nil)
+}
+
+func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 	bufferId BufferId,
 	source TransferPath,
 	transferKey TransferKey,
@@ -4359,17 +4398,14 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 	tcp *parsedTcp,
 	timeout time.Duration,
 	ipPacket []byte,
-	prepaid ...*natMemoryReservation,
+	credit *natMemoryReservation,
+	terminalOwner *providerReliablePacket,
 ) (bool, error) {
 	source = source.LocalMask()
 	// A new flow must already own its initiating packet. Reserve that packet
 	// first so a near-full pool cannot install an idle, SYN-less generation.
 	var memory natMemoryReservation
 	accepted := false
-	var credit *natMemoryReservation
-	if len(prepaid) != 0 {
-		credit = prepaid[0]
-	}
 	if credit != nil {
 		memory = *credit
 		if tcp.syn && (memory.budget != self.tcpBufferSettings.MemoryBudget ||
@@ -4573,6 +4609,22 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 	}
 	finishNoSequence := func() (bool, error) {
 		if orphanRst != nil {
+			path := &IpPath{
+				Version:         ipVersion,
+				Protocol:        IpProtocolTcp,
+				SourceIp:        orphanSourceIp,
+				SourcePort:      int(tcp.sourcePort),
+				DestinationIp:   orphanDestinationIp,
+				DestinationPort: int(tcp.destinationPort),
+			}
+			if terminalOwner != nil && credit != nil && len(tcp.payload) != 0 && !handledTerminalControl {
+				// A payload orphan has no TCP data owner. Only confirmation of
+				// the explicit terminal reset may settle its original receipt;
+				// the ordinary borrowed callback cannot report that outcome.
+				defer MessagePoolReturn(orphanRst)
+				terminalOwner.sendTerminalReset(path, orphanRst)
+				return false, errReliableIngressResetPending
+			}
 			// The shared local-NAT shard owns this synthesized control, so its
 			// callback must retain a nonblocking recovery contract.
 			self.receiveCallback(
@@ -4580,14 +4632,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 				transferKey,
 				provideMode,
 				receiveRecoveryModeRegenerableControl,
-				&IpPath{
-					Version:         ipVersion,
-					Protocol:        IpProtocolTcp,
-					SourceIp:        orphanSourceIp,
-					SourcePort:      int(tcp.sourcePort),
-					DestinationIp:   orphanDestinationIp,
-					DestinationPort: int(tcp.destinationPort),
-				},
+				path,
 				orphanRst,
 			)
 			MessagePoolReturn(orphanRst)
@@ -7147,6 +7192,11 @@ type providerReturnItem struct {
 	// behind a synthesized TCP reset instead of competing with that reset for
 	// the same bounded send-sequence slot.
 	afterRelease func()
+	// A rare payload-orphan reset holds the exact incoming receipt until its
+	// reliable return is acknowledged. Nil on every ordinary return. Before
+	// Transfer admission this item owns failure completion; after admission
+	// its ACK target owns completion independently of the pooled item.
+	terminalReset *providerTerminalResetAckTarget
 	// sourceLifecycle keeps the exact source behind the terminal verdict gate
 	// until this queued or in-flight return reaches final disposition.
 	sourceLifecycle *providerSourceLifecycle
@@ -8105,6 +8155,9 @@ func (self *RemoteUserNatProvider) returnSendAckEvidence(item *providerReturnIte
 // The ack target of a return item: its source's evidence, whose clock the
 // destination's acknowledgement advances. A test target wins.
 func (self *RemoteUserNatProvider) returnSendAckTarget(item *providerReturnItem) sendAckTarget {
+	if item.terminalReset != nil {
+		return item.terminalReset
+	}
 	if self.returnAckTargetForTest != nil {
 		return self.returnAckTargetForTest
 	}
@@ -8288,6 +8341,7 @@ func (self *RemoteUserNatProvider) releaseReturnItem(item *providerReturnItem) {
 	item.memory.release()
 	afterRelease := item.afterRelease
 	item.afterRelease = nil
+	terminalReset := item.terminalReset
 	sourceId := item.source.SourceId
 	sourceLifecycle := item.sourceLifecycle
 	item.sourceLifecycle = nil
@@ -8302,6 +8356,9 @@ func (self *RemoteUserNatProvider) releaseReturnItem(item *providerReturnItem) {
 	default:
 	}
 	self.releaseSourceLifecycle(sourceId, sourceLifecycle)
+	if terminalReset != nil {
+		terminalReset.complete(false)
+	}
 	if afterRelease != nil {
 		HandleError(afterRelease)
 	}
@@ -8882,6 +8939,9 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 		}
 	}
 	if sent {
+		// Transfer's ACK target now owns this exceptional receipt. Never
+		// leave it on the return item that is immediately reused from a pool.
+		item.terminalReset = nil
 		transportAttribution.admit()
 	} else {
 		self.congestionDrops.addReturnSend(1, item.packetByteCount)
@@ -9359,13 +9419,27 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 	ipPath *IpPath,
 	packet []byte,
 	afterRelease func(),
+	terminalReset ...*providerTerminalResetAckTarget,
 ) {
 	pendingAfterRelease := afterRelease
+	var pendingTerminalReset *providerTerminalResetAckTarget
+	if len(terminalReset) != 0 {
+		pendingTerminalReset = terminalReset[0]
+	}
 	defer func() {
+		if pendingTerminalReset != nil {
+			pendingTerminalReset.complete(false)
+		}
 		if pendingAfterRelease != nil {
 			HandleError(pendingAfterRelease)
 		}
 	}()
+	// One terminal-reset target belongs to one nonblocking admission attempt.
+	// A retrying socket owner may report failed intermediate attempts to its
+	// ACK target; it cannot share this final-disposition-only response state.
+	if pendingTerminalReset != nil && recoveryMode != receiveRecoveryModeRegenerableControl {
+		return
+	}
 	memory, admitted := self.startReturnMemoryOperation([][]byte{packet}, recoveryMode)
 	if !admitted {
 		return
@@ -9442,6 +9516,8 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 	item.packetByteCount = ByteCount(len(packet))
 	item.afterRelease = pendingAfterRelease
 	pendingAfterRelease = nil
+	item.terminalReset = pendingTerminalReset
+	pendingTerminalReset = nil
 	self.enqueueReturnItem(item)
 }
 

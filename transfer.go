@@ -6355,6 +6355,10 @@ type SendSequence struct {
 	// sequence's accounting. A leaf lock, like the eviction handoff.
 	noAckFastPathAccountingMutex   sync.Mutex
 	pendingNoAckFastPathAccounting []noAckFastPathAccounting
+	// Lazy, coalesced settlement wake. Retirement owns the small pending map;
+	// callers only signal the immutable channel published in their snapshot.
+	noAckFastPathSettled       chan struct{}
+	pendingNoAckContractCloses map[Id]*sequenceContract
 	// Whether a pack entering now could NOT also enter the resend queue,
 	// published by the send loop each pass. A reliable pack takes its
 	// admission slot only when this is clear (THROUGHPUTFIX §38.11):
@@ -7898,11 +7902,11 @@ func (self *SendSequence) resendIntervalForItem(
 //
 // The one thing that cannot be a snapshot is the byte accounting, which is a
 // mutation of the contract. The caller reserves room on the snapshot with a
-// compare-and-swap — the only field of a published snapshot that moves, and it
-// only moves down, so concurrent callers cannot together overdraw the contract
-// the loop published — and records what it wrote for the loop to apply on its
-// own goroutine. One owner per piece of state: the caller's goroutine owns none
-// of the sequence's.
+// compare-and-swap against headroom shared with the loop's ordinary debits.
+// Every snapshot of that contract retains the same budget, including a caller
+// whose writer was retired before its try. The caller records what it wrote
+// for the loop to apply on its own goroutine. Only the reservation is shared;
+// the contract's used-byte counters still have one owner.
 type noAckFastPathSnapshot struct {
 	writer MultiRouteWriter
 	// nil for a destination that requires no contract
@@ -7910,12 +7914,13 @@ type noAckFastPathSnapshot struct {
 	contractId         *Id
 	minUpdateByteCount ByteCount
 	metadataGeneration uint64
-	// room left on the contract as of publication less what callers have
-	// reserved since; reserved is what callers took, applied is what the loop
-	// has since charged, and their difference is carried into the next
-	// snapshot so a write in flight across a republish is not counted twice
-	remainingByteCount atomic.Int64
-	reservedByteCount  atomic.Int64
+	// Shared across every publication of this contract and ordinary owner
+	// debits. Only an unwritten rollback/release restores this headroom.
+	remainingByteCount *atomic.Int64
+	settled            chan<- struct{}
+	// Snapshot-local attribution of reservations and their later accounting;
+	// neither applying them nor republishing creates fresh capacity.
+	reservedByteCount atomic.Int64
 	// loop-owned
 	appliedByteCount int64
 }
@@ -7936,14 +7941,26 @@ func (self *noAckFastPathSnapshot) reserve(byteCount ByteCount) bool {
 	if self.contract == nil {
 		return true
 	}
+	if !self.contract.acquireNoAckWriter() {
+		return false
+	}
 	effective := self.effectiveByteCount(byteCount)
+	if !reserveNoAckContractBytes(self.remainingByteCount, effective) {
+		self.contract.releaseNoAckWriter()
+		self.notifySettled()
+		return false
+	}
+	self.reservedByteCount.Add(effective)
+	return true
+}
+
+func reserveNoAckContractBytes(remainingByteCount *atomic.Int64, effective int64) bool {
 	for {
-		remaining := self.remainingByteCount.Load()
+		remaining := remainingByteCount.Load()
 		if remaining < effective {
 			return false
 		}
-		if self.remainingByteCount.CompareAndSwap(remaining, remaining-effective) {
-			self.reservedByteCount.Add(effective)
+		if remainingByteCount.CompareAndSwap(remaining, remaining-effective) {
 			return true
 		}
 	}
@@ -7957,6 +7974,8 @@ func (self *noAckFastPathSnapshot) release(byteCount ByteCount) {
 	effective := self.effectiveByteCount(byteCount)
 	self.remainingByteCount.Add(effective)
 	self.reservedByteCount.Add(-effective)
+	self.contract.releaseNoAckWriter()
+	self.notifySettled()
 }
 
 // Publishes what a caller may write against right now, or nil. Called by the
@@ -7979,6 +7998,10 @@ func (self *SendSequence) publishNoAckFastPath() {
 			return
 		}
 		contract = self.sendContract
+		if contract.noAckWriterState.Load()&noAckContractRetired != 0 {
+			self.retireNoAckFastPath()
+			return
+		}
 	}
 	if writer == nil {
 		self.retireNoAckFastPath()
@@ -7986,8 +8009,7 @@ func (self *SendSequence) publishNoAckFastPath() {
 	}
 	previous := self.noAckFastPathPublished
 	if previous != nil && previous.writer == writer && previous.contract == contract {
-		// nothing a caller reads has changed; the room it reserves against
-		// is refreshed by the accounting the loop applies, below
+		// Ordinary debits and all snapshots already share the same headroom.
 		return
 	}
 	snapshot := &noAckFastPathSnapshot{
@@ -7995,18 +8017,24 @@ func (self *SendSequence) publishNoAckFastPath() {
 		contract: contract,
 	}
 	if contract != nil {
+		if self.noAckFastPathSettled == nil {
+			self.noAckFastPathSettled = make(chan struct{}, 1)
+		}
+		snapshot.settled = self.noAckFastPathSettled
 		contractId := contract.contractId
 		snapshot.contractId = &contractId
 		snapshot.minUpdateByteCount = contract.minUpdateByteCount
 		snapshot.metadataGeneration = self.sendContractMetadataGeneration
-		remaining := int64(contract.effectiveTransferByteCount -
-			(contract.ackedByteCount + contract.unackedByteCount))
-		if previous != nil && previous.contract == contract {
-			// writes in flight against the previous snapshot have reserved
-			// room the loop has not charged yet; it is not room here
-			remaining -= previous.reservedByteCount.Load() - previous.appliedByteCount
+		if !contract.noAckBudgetPublished {
+			// Lazy: receive contracts and send contracts without a published
+			// caller path keep their ordinary owner-only accounting. The
+			// embedded atomic adds no separate allocation at publication.
+			remaining := int64(contract.effectiveTransferByteCount -
+				(contract.ackedByteCount + contract.unackedByteCount))
+			contract.noAckRemainingByteCount.Store(max(0, remaining))
+			contract.noAckBudgetPublished = true
 		}
-		snapshot.remainingByteCount.Store(max(0, remaining))
+		snapshot.remainingByteCount = &contract.noAckRemainingByteCount
 	}
 	self.noAckFastPathPublished = snapshot
 	self.noAckFastPath.Store(snapshot)
@@ -8029,11 +8057,12 @@ func (self *SendSequence) recordNoAckFastPathWrite(
 		return
 	}
 	self.noAckFastPathAccountingMutex.Lock()
-	defer self.noAckFastPathAccountingMutex.Unlock()
 	self.pendingNoAckFastPathAccounting = append(
 		self.pendingNoAckFastPathAccounting,
 		noAckFastPathAccounting{snapshot: snapshot, byteCount: byteCount},
 	)
+	self.noAckFastPathAccountingMutex.Unlock()
+	snapshot.notifySettled()
 }
 
 // The loop's half: charges each fast-path write to the contract the caller
@@ -8046,24 +8075,12 @@ func (self *SendSequence) applyNoAckFastPathAccounting() {
 	self.pendingNoAckFastPathAccounting = nil
 	self.noAckFastPathAccountingMutex.Unlock()
 	for _, accounting := range pending {
-		snapshot := accounting.snapshot
-		contract := snapshot.contract
-		effective := snapshot.effectiveByteCount(accounting.byteCount)
-		snapshot.appliedByteCount += effective
-		// the bytes are on the wire and will never be acknowledged, which is
-		// exactly the loop's own no-acknowledgement item: debited and then
-		// acknowledged in one step
-		contract.accountWritten(ByteCount(effective))
-		if _, open := self.openSendContracts[contract.contractId]; open &&
-			self.sendContract != contract && contract.unackedByteCount == 0 {
-			// not current and drained, as ackItem closes it
-			self.client.ContractManager().CloseContract(
-				contract.contractId,
-				contract.ackedByteCount,
-				contract.unackedByteCount,
-			)
-			delete(self.openSendContracts, contract.contractId)
-		}
+		self.applyNoAckFastPathWrite(accounting.snapshot, accounting.byteCount)
+	}
+	// Failed physical writes have no accounting record, but their lease
+	// release still wakes the owner to finish an already-retired contract.
+	for _, contract := range self.pendingNoAckContractCloses {
+		self.tryCloseRetiredSendContract(contract)
 	}
 }
 
@@ -8264,7 +8281,7 @@ func (self *SendSequence) Run() {
 		// report their final counts, and nothing may be written against a
 		// sequence that is closing
 		self.retireNoAckFastPath()
-		self.applyNoAckFastPathAccounting()
+		self.joinNoAckContractWriters()
 
 		// close contract
 		for _, sendContract := range self.openSendContracts {
@@ -9244,6 +9261,7 @@ sendSequenceLoop:
 			}
 			return
 		case <-ackSnapshot.ackNotify:
+		case <-self.noAckFastPathSettled:
 		case <-memoryCapacityNotify:
 		case <-flightPolicy.notify:
 		case nextSendPack, ok := <-packIngress:
@@ -9364,14 +9382,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 		// do not close the current contract unless it has no pending data;
 		// the contract is tracked in `openSendContracts` and will be closed on ack
 		if self.sendContract != nil {
-			if self.sendContract.unackedByteCount == 0 {
-				self.client.ContractManager().CloseContract(
-					self.sendContract.contractId,
-					self.sendContract.ackedByteCount,
-					self.sendContract.unackedByteCount,
-				)
-				delete(self.openSendContracts, self.sendContract.contractId)
-			}
+			self.retireSendContract(self.sendContract)
 			self.sendContract = nil
 		}
 		return true, false, nil
@@ -9387,14 +9398,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 		retiredContract := self.sendContract
 		self.sendContract = nil
 		self.sendContractAcked = false
-		if retiredContract.unackedByteCount == 0 {
-			self.client.ContractManager().CloseContract(
-				retiredContract.contractId,
-				retiredContract.ackedByteCount,
-				retiredContract.unackedByteCount,
-			)
-			delete(self.openSendContracts, retiredContract.contractId)
-		}
+		self.retireSendContract(retiredContract)
 	}
 	if self.sendContract != nil &&
 		(allowAckPromotion || self.sendContractAcked) &&
@@ -9849,13 +9853,8 @@ func (self *SendSequence) setContract(
 ) {
 	// do not close the current contract unless it has no pending data
 	// the contract is tracked in `openSendContracts` and will be closed on ack
-	if self.sendContract != nil && self.sendContract.unackedByteCount == 0 {
-		self.client.ContractManager().CloseContract(
-			self.sendContract.contractId,
-			self.sendContract.ackedByteCount,
-			self.sendContract.unackedByteCount,
-		)
-		delete(self.openSendContracts, self.sendContract.contractId)
+	if self.sendContract != nil && self.sendContract != nextSendContract {
+		self.retireSendContract(self.sendContract)
 	}
 	self.openSendContracts[nextSendContract.contractId] = nextSendContract
 	self.sendContract = nextSendContract
@@ -11914,13 +11913,8 @@ func (self *SendSequence) ackItem(item *sendItem) {
 		if itemSendContract, ok := self.openSendContracts[*item.contractId]; ok {
 			itemSendContract.ack(item.messageByteCount)
 			// not current and closed
-			if self.sendContract != itemSendContract && itemSendContract.unackedByteCount == 0 {
-				self.client.ContractManager().CloseContract(
-					itemSendContract.contractId,
-					itemSendContract.ackedByteCount,
-					itemSendContract.unackedByteCount,
-				)
-				delete(self.openSendContracts, itemSendContract.contractId)
+			if self.sendContract != itemSendContract {
+				self.retireSendContract(itemSendContract)
 			}
 		}
 	}
@@ -16137,6 +16131,15 @@ type sequenceContract struct {
 
 	ackedByteCount   ByteCount
 	unackedByteCount ByteCount
+	// Activated by the send owner on first NoAck snapshot publication. Every
+	// later snapshot and ordinary debit reserves this same atomic headroom;
+	// delayed caller accounting therefore cannot be spent by another owner.
+	// The flag is loop-owned; callers see only the immutable atomic pointer.
+	noAckBudgetPublished    bool
+	noAckRemainingByteCount atomic.Int64
+	// High bit retires admission; lower bits count accepted writers through
+	// accounting settlement, including zero-byte writes.
+	noAckWriterState atomic.Uint64
 
 	// Set on the send side when this contract was announced ahead of its data
 	// and the announcement was acknowledged (THROUGHPUTFIX §39.1). The
@@ -16260,7 +16263,11 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 func (self *sequenceContract) update(byteCount ByteCount) bool {
 	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
 
-	if !self.canUpdate(byteCount) {
+	fits := self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.effectiveTransferByteCount
+	if fits && self.noAckBudgetPublished {
+		fits = reserveNoAckContractBytes(&self.noAckRemainingByteCount, int64(effectiveByteCount))
+	}
+	if !fits {
 		// doesn't fit in contract
 		// if self.log.V(1).Enabled() {
 		self.log.Infof(
@@ -16301,7 +16308,8 @@ func (self *sequenceContract) update(byteCount ByteCount) bool {
 // can push an otherwise-small batch over the transport message limit.
 func (self *sequenceContract) canUpdate(byteCount ByteCount) bool {
 	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
-	return self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.effectiveTransferByteCount
+	return self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.effectiveTransferByteCount &&
+		(!self.noAckBudgetPublished || int64(effectiveByteCount) <= self.noAckRemainingByteCount.Load())
 }
 
 // An admission failure before wire publication spends no contract capacity.
@@ -16311,6 +16319,9 @@ func (self *sequenceContract) rollbackUnwritten(byteCount ByteCount) {
 		panic("unwritten transfer contract debit missing")
 	}
 	self.unackedByteCount -= effectiveByteCount
+	if self.noAckBudgetPublished {
+		self.noAckRemainingByteCount.Add(int64(effectiveByteCount))
+	}
 	if self.statsEntry != nil {
 		self.statsEntry.updateUsedByteCount(self.ackedByteCount + self.unackedByteCount)
 	}

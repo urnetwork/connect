@@ -9,10 +9,11 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// Retiring an indexed flow only secures empty terminal controls. Application
-// bytes retain the failed final-owner outcome, including retirement after
-// lookup, and every prepaid reservation must return to its original root.
-func TestProviderReliableTcpRetiredPayloadNeverAcked(t *testing.T) {
+// Without a terminal-reset owner, retiring an indexed flow only secures empty
+// terminal controls. Application bytes retain the failed final-owner outcome,
+// including retirement after lookup, and every prepaid reservation returns to
+// its original root. Confirmed reset ownership has separate positive controls.
+func TestProviderReliableTcpRetiredPayloadWithoutResetNeverAcked(t *testing.T) {
 	for _, version := range []int{4, 6} {
 		for _, closeAfterLookup := range []bool{false, true} {
 			t.Run(fmt.Sprintf("ipv%d/after-lookup-%t", version, closeAfterLookup), func(t *testing.T) {
@@ -25,6 +26,9 @@ func TestProviderReliableTcpRetiredPayloadNeverAcked(t *testing.T) {
 						}
 					})
 					f := newReliableTcpIngressFixture(t, version, budget)
+					f.provider.returnStateLock.Lock()
+					f.provider.returnClosed = true
+					f.provider.returnStateLock.Unlock()
 					f.establishForControl()
 					sequence := f.runningReceiveSequence()
 					synctest.Wait()
