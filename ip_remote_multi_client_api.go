@@ -84,6 +84,9 @@ func cloneUniqueApiExcludeClientIds(clientIds []Id) []Id {
 }
 
 type ApiMultiClientGeneratorSettings struct {
+	// ControlTelemetryProbe marks only this generator's OOB control POSTs.
+	// Captured at construction; telemetry only, untrusted by the server.
+	ControlTelemetryProbe bool
 	// ClientCredentials is captured at construction, not read from mutable
 	// settings during a mint or retirement. Nil preserves the public API path.
 	ClientCredentials NetworkClientCredentials
@@ -237,6 +240,7 @@ type ApiMultiClientGenerator struct {
 	clientSettingsGenerator func() *ClientSettings
 	settings                *ApiMultiClientGeneratorSettings
 	clientCredentials       NetworkClientCredentials
+	controlTelemetryProbe   bool
 	// Window carriers created without an explicit caller budget all belong to
 	// this generator. Separate generators never contend through a package root.
 	defaultPlatformTransportBudget *PlatformTransportBudget
@@ -348,6 +352,7 @@ func NewApiMultiClientGenerator(
 		clientSettingsGenerator:        clientSettingsGenerator,
 		settings:                       settings,
 		clientCredentials:              settings.ClientCredentials,
+		controlTelemetryProbe:          settings.ControlTelemetryProbe,
 		defaultPlatformTransportBudget: DefaultPlatformTransportBudget(),
 		platformTransportMode:          platformTransportMode,
 		platformModePreferences:        maps.Clone(settings.PlatformTransportModePreferences),
@@ -979,7 +984,7 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 		return nil, errors.New("platform transport creation is closed")
 	}
 	defer self.transportCreation.end()
-	clientOob := NewApiOutOfBandControl(ctx, self.clientStrategy, args.ClientAuth.ByJwt, self.apiUrl)
+	clientOob := self.newClientOob(ctx, args.ClientAuth.ByJwt)
 	client := NewClient(ctx, args.ClientId, clientOob, clientSettings)
 	settings := self.newPlatformTransportSettings()
 	// propagate so the client-level logger covers the platform transport

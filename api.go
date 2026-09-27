@@ -431,6 +431,10 @@ func (self *BringYourApi) FindProviders2SyncWithCtx(ctx context.Context, findPro
 
 type ConnectControlCallback ApiCallback[*ConnectControlResult]
 
+// Public, spoofable telemetry marker; neither client nor server may use it for
+// authentication, authorization, accounting, routing or admission decisions.
+const ControlProbeTelemetryHeader = "X-Ur-Control-Probe"
+
 type ConnectControlArgs struct {
 	Pack string `json:"pack"`
 }
@@ -453,10 +457,18 @@ func (self *BringYourApi) ConnectControl(connectControl *ConnectControlArgs, cal
 // the client context is closed). Each request is bounded by the client
 // strategy's `RequestTimeout` regardless of the context passed.
 func (self *BringYourApi) ConnectControlWithCtx(ctx context.Context, connectControl *ConnectControlArgs, callback ConnectControlCallback) {
+	self.connectControlWithCtx(ctx, connectControl, callback, false)
+}
+
+// This private upgrade is used only by explicitly marked probe OOB owners.
+// Generic API calls cannot inherit it from a shared strategy or context.
+func (self *BringYourApi) connectControlWithCtx(ctx context.Context, connectControl *ConnectControlArgs, callback ConnectControlCallback, probeClaimed bool) {
 	go HandleError(func() {
-		HttpPostWithStrategy(
+		HttpPostWithRawFunction(
 			ctx,
-			self.clientStrategy,
+			func(ctx context.Context, requestUrl string, body []byte, byJwt string) ([]byte, error) {
+				return httpPostWithStrategyRaw(ctx, self.clientStrategy, requestUrl, body, byJwt, probeClaimed)
+			},
 			fmt.Sprintf("%s/connect/control", self.apiUrl),
 			connectControl,
 			self.ByJwt(),

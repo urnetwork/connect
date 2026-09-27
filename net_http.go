@@ -2394,6 +2394,19 @@ func HttpPostWithStrategyRaw(
 	requestBodyBytes []byte,
 	byJwt string,
 ) ([]byte, error) {
+	return httpPostWithStrategyRaw(ctx, clientStrategy, requestUrl, requestBodyBytes, byJwt, false)
+}
+
+// Only the private control-call boundary enables this self-reported marker.
+// Hello discovery and shared strategy headers remain untouched.
+func httpPostWithStrategyRaw(
+	ctx context.Context,
+	clientStrategy *ClientStrategy,
+	requestUrl string,
+	requestBodyBytes []byte,
+	byJwt string,
+	probeControl bool,
+) ([]byte, error) {
 	request, err := http.NewRequestWithContext(
 		ctx,
 		"POST",
@@ -2405,6 +2418,9 @@ func HttpPostWithStrategyRaw(
 	}
 
 	request.Header.Add("Content-Type", "text/json")
+	if probeControl {
+		request.Header.Set(ControlProbeTelemetryHeader, "1")
+	}
 
 	if byJwt != "" {
 		auth := fmt.Sprintf("Bearer %s", byJwt)

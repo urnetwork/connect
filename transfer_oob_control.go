@@ -39,6 +39,8 @@ type ApiOutOfBandControl struct {
 	api      *BringYourApi
 	ownsApi  bool
 	requests *lifecycleAdmission
+	// Immutable, self-reported telemetry only; never an authorization claim.
+	probeClaimed bool
 
 	// Nil test barrier exposes the exact join boundary after admission closes.
 	beforeCloseWaitForTest func()
@@ -50,12 +52,18 @@ func NewApiOutOfBandControl(
 	byJwt string,
 	apiUrl string,
 ) *ApiOutOfBandControl {
+	return newApiOutOfBandControl(ctx, clientStrategy, byJwt, apiUrl, false)
+}
+
+// The generator supplies the immutable probe marker for its private controls.
+func newApiOutOfBandControl(ctx context.Context, clientStrategy *ClientStrategy, byJwt, apiUrl string, probeClaimed bool) *ApiOutOfBandControl {
 	api := NewBringYourApi(ctx, clientStrategy, apiUrl)
 	api.SetByJwt(byJwt)
 	return &ApiOutOfBandControl{
-		api:      api,
-		ownsApi:  true,
-		requests: newLifecycleAdmission(),
+		api:          api,
+		ownsApi:      true,
+		requests:     newLifecycleAdmission(),
+		probeClaimed: probeClaimed,
 	}
 }
 
@@ -79,7 +87,7 @@ func (self *ApiOutOfBandControl) SendControl(
 ) {
 	// bound to the api lifecycle context: keep trying as long as the
 	// lifecycle is active
-	self.sendControl(self.api.ConnectControl, frames, callback)
+	self.SendControlWithCtx(self.api.ctx, frames, callback)
 }
 
 // SendControlWithCtx is a one-shot send on a caller-chosen context, for
@@ -91,7 +99,7 @@ func (self *ApiOutOfBandControl) SendControlWithCtx(
 	callback OobResultFunction,
 ) {
 	connectControl := func(connectControlArgs *ConnectControlArgs, apiCallback ConnectControlCallback) {
-		self.api.ConnectControlWithCtx(ctx, connectControlArgs, apiCallback)
+		self.api.connectControlWithCtx(ctx, connectControlArgs, apiCallback, self.probeClaimed)
 	}
 	self.sendControl(connectControl, frames, callback)
 }
