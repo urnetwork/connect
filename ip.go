@@ -4114,6 +4114,9 @@ type TcpBufferSettings struct {
 	// Tests can inspect the exact admitted queue without starting an upstream
 	// socket. Called on that sequence's worker before Run; nil in production.
 	beforeSequenceRunWithStateForTest func(*TcpSequence)
+	// Nil in production. Orders flow retirement after index lookup but before
+	// final packet admission without racing a real socket or cleanup worker.
+	beforeSequenceSendForTest func(*TcpSequence)
 	// Tests read the upstream socket the provider proxies through, once it is
 	// connected and configured: which buffers it has and what the kernel says
 	// about its window are only decidable on the real socket, and the flow
@@ -4392,7 +4395,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 	initSequence := func() *TcpSequence {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
-		if self.retiredSourceIds[source.SourceId] {
+		if self.ctx.Err() != nil || self.retiredSourceIds[source.SourceId] {
 			return nil
 		}
 
@@ -4412,14 +4415,17 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 				// accept.
 				return nil
 			}
-			if !tcp.syn || sequence.ctx.Err() == nil && tcp.seq == sequence.initialSynSeq {
+			if sequence.ctx.Err() == nil && (!tcp.syn || tcp.seq == sequence.initialSynSeq) {
 				return sequence
 			}
 
 			// A source may reuse a four-tuple before the previous sequence's
-			// goroutine reaches deferred map cleanup. A fresh SYN sent to that
-			// old sequence is rejected by its established sequence-number
-			// check, leaving the replacement connection silent until timeout.
+			// goroutine reaches deferred map cleanup. Retire a canceled index
+			// before applying the orphan-control decision below; sending a late
+			// empty ACK/FIN to that sequence would instead reject the shared
+			// Transfer receive lane. A fresh SYN sent to a live old sequence is
+			// rejected by its established sequence-number check, leaving the
+			// replacement connection silent until timeout.
 			// Keep an exact live SYN retransmission on the current generation;
 			// a different initial sequence number, or a canceled generation,
 			// atomically replaces it.
@@ -4565,8 +4571,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		})
 		return sequence
 	}
-	sequence := initSequence()
-	if sequence == nil {
+	finishNoSequence := func() (bool, error) {
 		if orphanRst != nil {
 			// The shared local-NAT shard owns this synthesized control, so its
 			// callback must retain a nonblocking recovery contract.
@@ -4605,6 +4610,14 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		}
 		return false, nil
 	}
+	sequence := initSequence()
+	if sequence == nil {
+		return finishNoSequence()
+	}
+
+	if before := self.tcpBufferSettings.beforeSequenceSendForTest; before != nil {
+		before(sequence)
+	}
 
 	// An established pure ACK has no sequence-space ordering dependency. Apply
 	// its monotonic acknowledgement/window update directly so a download does
@@ -4640,6 +4653,19 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 	}
 	var err error
 	accepted, err = sequence.send(sendItem, timeout)
+	if !accepted && credit != nil && !tcp.syn && len(tcp.payload) == 0 &&
+		(tcp.ack || tcp.fin || tcp.rst) && sequence.ctx.Err() != nil {
+		// Retirement can race the lookup above. This unconsumed terminal
+		// control still owns its packet and prepaid credit, so recheck the
+		// exact flow/source authority before rejecting the shared lane. A
+		// replacement generation gets one nonblocking admission attempt;
+		// never restart the caller's wait budget or retry application bytes.
+		sequence = initSequence()
+		if sequence == nil {
+			return finishNoSequence()
+		}
+		accepted, err = sequence.send(sendItem, 0)
+	}
 	if accepted && credit != nil {
 		*credit = natMemoryReservation{}
 	}

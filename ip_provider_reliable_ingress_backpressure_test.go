@@ -75,7 +75,7 @@ type reliableTcpIngressFixture struct {
 	processed chan struct{}
 }
 
-func newReliableTcpIngressFixture(t *testing.T, version int, budget *TransferMemoryBudget) *reliableTcpIngressFixture {
+func newReliableTcpIngressFixture(t *testing.T, version int, budget *TransferMemoryBudget, configure ...func(*ClientSettings)) *reliableTcpIngressFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &reliableTcpIngressFixture{t: t, ctx: ctx, cancel: cancel,
@@ -84,6 +84,9 @@ func newReliableTcpIngressFixture(t *testing.T, version int, budget *TransferMem
 	clientSettings.Log = NewNoopLogger()
 	clientSettings.EncryptionSettings.Mode = EncryptionModeOff
 	clientSettings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+	for _, apply := range configure {
+		apply(clientSettings)
+	}
 	f.client = NewClient(ctx, NewId(), NewNoContractClientOob(), clientSettings)
 	natSettings := DefaultLocalUserNatSettingsWithBufferSize(1)
 	natSettings.Log, natSettings.MemoryBudget = NewNoopLogger(), budget
@@ -652,9 +655,12 @@ func TestProviderReliableTcpAckWaitsForFinalTcpAdmission(t *testing.T) {
 		natSettings.Log = NewNoopLogger()
 		natSettings.TcpBufferSettings.WriteTimeout = 0
 		sequenceEntered := make(chan struct{})
-		natSettings.TcpBufferSettings.beforeSequenceRunForTest = func() {
+		natSettings.TcpBufferSettings.beforeSequenceRunWithStateForTest = func(sequence *TcpSequence) {
 			close(sequenceEntered)
-			<-ctx.Done()
+			// Parent cancellation can release this worker before it reaches
+			// the child's context. Keep the queue full until this exact owner
+			// is dead, rather than freeing a still-live slot during teardown.
+			<-sequence.ctx.Done()
 		}
 		nat := NewLocalUserNat(ctx, "reliable ingress final TCP owner", natSettings)
 		processed := make(chan struct{}, 2)
