@@ -173,14 +173,13 @@ func TestExpandReplacementDeclineSourceAnchor(t *testing.T) {
 	if !strings.Contains(body, `"expand_decline"`) {
 		t.Error("a declined replacement is not logged, so the decline is invisible in field logs")
 	}
-	// Once newMultiClientChannel succeeds, its cancellation goroutine owns both
-	// the Client and its generator args and retires them through
-	// RemoveClientWithArgs. A second direct RemoveClientArgs call revokes the
-	// derived JWT before final contract-close controls finish. The two remaining
-	// calls are both pre-ownership: an args delivery observed after acquisition
-	// closed, and the construction-error path.
-	if count := strings.Count(body, "RemoveClientArgs("); count != 2 {
-		t.Errorf("expand has %d direct RemoveClientArgs calls, want only the late-args and construction-error cleanups", count)
+	// Direct args retirement is allowed only before a channel owns them:
+	// late delivered args, a deferred fixed mint observed after cancellation
+	// or acquisition expiry, and a constructor failure that retained no args.
+	// The guard inventory rejects an extra or relocated call, even if another
+	// legitimate cleanup is removed so the total call count remains unchanged.
+	for _, violation := range expandArgsCleanupViolations(t, body) {
+		t.Error(violation)
 	}
 	deadlineCheck := strings.Index(body, "expandCandidateWithinAcquisitionDeadline(")
 	channelConstruction := strings.Index(body, "newMultiClientChannel(")
