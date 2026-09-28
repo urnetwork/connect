@@ -4,6 +4,7 @@ package connect
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -41,11 +42,13 @@ func (self *evaluationContractOob) SendControl(frames []*protocol.Frame, callbac
 
 // One virtual-time boundary controls a real expansion and send sequence.
 type evaluationContractCase struct {
-	grant          bool
-	contractBudget time.Duration
-	elapsed        time.Duration
-	expirePass     bool
-	cancelOwner    bool
+	grant            bool
+	contractBudget   time.Duration
+	elapsed          time.Duration
+	setupDelay       time.Duration
+	observePendingAt time.Duration
+	expirePass       bool
+	cancelOwner      bool
 }
 
 // Exercises the production timer/error callback without replacing its contract
@@ -70,6 +73,11 @@ func checkEvaluationContractBoundary(t *testing.T, test evaluationContractCase) 
 		oob := &evaluationContractOob{ready: test.grant}
 		var wireFrames atomic.Int64
 		generator.newClient = func(ctx context.Context, args *MultiClientGeneratorClientArgs, settings *ClientSettings) (*Client, error) {
+			// Virtual setup time places the probe cutoff before the later ping
+			// deadline without replacing the contract or carrier boundaries.
+			if 0 < test.setupDelay {
+				time.Sleep(test.setupDelay)
+			}
 			settings.EncryptionSettings.Mode = EncryptionModeOff
 			settings.Log = fixture.log
 			// Virtual time precedes the default historical enable date.
@@ -116,7 +124,24 @@ func checkEvaluationContractBoundary(t *testing.T, test evaluationContractCase) 
 		if got := fixture.window.failures.counts(time.Now())[windowFailureProvider]; got != 0 {
 			t.Fatalf("provider failure before expiry=%d", got)
 		}
-		time.Sleep(test.elapsed)
+		if 0 < test.observePendingAt {
+			time.Sleep(test.observePendingAt)
+			synctest.Wait()
+			if got := fixture.window.failures.counts(time.Now()); got != [windowFailureClassCount]int{} {
+				t.Fatal("pending sample occurred after a failure was recorded")
+			}
+			if fixture.window.providerEvaluation.localContractFailure.Load() {
+				t.Fatal("pending sample relied on a later ping-failure latch")
+			}
+			if got := candidate.providerEvaluation.localContractUnavailable(); got != !test.grant {
+				t.Fatalf("actual send witness=%t want=%t", got, !test.grant)
+			}
+			multiClient := &RemoteUserNatMultiClient{windows: map[WindowType]*multiClientWindow{WindowTypeQuality: fixture.window}}
+			if got := multiClient.ProviderContractAcquisitionUnavailable(); got != !test.grant {
+				t.Errorf("probe cutoff lost pending no-contact proof: unavailable=%t want=%t; elapsed=%s provider_frames=%d", got, !test.grant, time.Since(started), wireFrames.Load())
+			}
+		}
+		time.Sleep(test.elapsed - test.observePendingAt)
 		if test.expirePass {
 			close(expirePass)
 		}
@@ -127,8 +152,8 @@ func checkEvaluationContractBoundary(t *testing.T, test evaluationContractCase) 
 		if got := fixture.result(t, done); got != 0 {
 			t.Fatalf("admitted without provider acknowledgement=%d", got)
 		}
-		if got := time.Since(started); got != test.elapsed {
-			t.Fatalf("elapsed=%s want=%s", got, test.elapsed)
+		if got := time.Since(started); got != test.setupDelay+test.elapsed {
+			t.Fatalf("elapsed=%s want=%s", got, test.setupDelay+test.elapsed)
 		}
 		wantProvider, wantPlatform := 0, 1
 		if test.grant {
@@ -171,6 +196,22 @@ func TestEvaluationContractAcquisitionErrorIsLocal(t *testing.T) {
 // Once provider frames are attempted, an unanswered ping remains provider evidence.
 func TestEvaluationContractGrantedSilentProviderRemainsProviderFailure(t *testing.T) {
 	checkEvaluationContractBoundary(t, evaluationContractCase{grant: true, contractBudget: 4 * time.Second, elapsed: 2 * time.Second})
+}
+
+// The URL lookup can stop after delayed setup but before the ping's full budget.
+func TestEvaluationContractPendingWaitIsVisibleBeforePingDeadline(t *testing.T) {
+	checkEvaluationContractBoundary(t, evaluationContractCase{
+		contractBudget: 4 * time.Second, setupDelay: time.Second,
+		observePendingAt: time.Second, elapsed: 2 * time.Second,
+	})
+}
+
+// At the identical cutoff, an actual provider write must forbid unknown status.
+func TestEvaluationContractGrantedContactOutranksPendingCutoff(t *testing.T) {
+	checkEvaluationContractBoundary(t, evaluationContractCase{
+		grant: true, contractBudget: 4 * time.Second, setupDelay: time.Second,
+		observePendingAt: time.Second, elapsed: 2 * time.Second,
+	})
 }
 
 // The pass safety cap must snapshot the contract wait before canceling its owner.
@@ -217,4 +258,92 @@ func TestEvaluationContractWitnessIsConservativeAcrossCandidates(t *testing.T) {
 	if !replacement.localContractUnavailable() || client.ProviderContractAcquisitionUnavailable() {
 		t.Fatal("candidate replacement erased previous provider contact")
 	}
+}
+
+// Pending waits are counted per window, ignore other destinations and disappear
+// on cancellation without becoming latched natural failures.
+func TestEvaluationContractPendingWaitsAreOwnedAndReleased(t *testing.T) {
+	window, otherWindow := &multiClientWindow{}, &multiClientWindow{}
+	client := &RemoteUserNatMultiClient{windows: map[WindowType]*multiClientWindow{
+		WindowTypeQuality: window, WindowTypeSpeed: otherWindow,
+	}}
+	other := &RemoteUserNatMultiClient{windows: map[WindowType]*multiClientWindow{WindowTypeQuality: {}}}
+	destinationId := NewId()
+	first := &providerEvaluationAttempt{owner: &window.providerEvaluation, destinationId: destinationId}
+	second := &providerEvaluationAttempt{owner: &window.providerEvaluation, destinationId: destinationId}
+	first.beginContractWait(ControlId)
+	first.endContractWait(ControlId, false)
+	if client.ProviderContractAcquisitionUnavailable() {
+		t.Fatal("another destination acquired no-contact authority")
+	}
+	first.beginContractWait(destinationId)
+	second.beginContractWait(destinationId)
+	if !client.ProviderContractAcquisitionUnavailable() || other.ProviderContractAcquisitionUnavailable() {
+		t.Fatal("pending contract proof was lost or crossed an independent owner")
+	}
+	first.endContractWait(destinationId, false)
+	if !client.ProviderContractAcquisitionUnavailable() {
+		t.Fatal("one ended wait erased a second live acquisition")
+	}
+	second.endContractWait(destinationId, false)
+	if client.ProviderContractAcquisitionUnavailable() {
+		t.Fatal("canceled waits became permanent no-contact failures")
+	}
+	first.beginContractWait(destinationId)
+	otherAttempt := &providerEvaluationAttempt{owner: &otherWindow.providerEvaluation, destinationId: destinationId}
+	otherAttempt.noteProviderWrite(destinationId)
+	if client.ProviderContractAcquisitionUnavailable() {
+		t.Fatal("another window's provider write was hidden by a pending wait")
+	}
+	first.endContractWait(destinationId, false)
+}
+
+// A natural control failure replaces its pending count before evaluation can
+// consume the callback; cancellation alone remains unlatched in the prior test.
+func TestEvaluationContractPendingFailureHasNoWitnessGap(t *testing.T) {
+	window := &multiClientWindow{}
+	client := &RemoteUserNatMultiClient{windows: map[WindowType]*multiClientWindow{WindowTypeQuality: window}}
+	destinationId := NewId()
+	attempt := &providerEvaluationAttempt{owner: &window.providerEvaluation, destinationId: destinationId}
+	attempt.beginContractWait(destinationId)
+	attempt.endContractWait(destinationId, true)
+	if !client.ProviderContractAcquisitionUnavailable() {
+		t.Fatal("natural contract failure lost its witness before the evaluation callback")
+	}
+	attempt.noteProviderWrite(destinationId)
+	if client.ProviderContractAcquisitionUnavailable() {
+		t.Fatal("late real contact retained a historical control-failure exception")
+	}
+}
+
+// Joined concurrent waiters retain count accuracy and cannot undo any write.
+func TestEvaluationContractPendingWaitsRetainConcurrentContact(t *testing.T) {
+	window := &multiClientWindow{}
+	client := &RemoteUserNatMultiClient{windows: map[WindowType]*multiClientWindow{WindowTypeQuality: window}}
+	destinationId := NewId()
+	var started, finished sync.WaitGroup
+	started.Add(16)
+	release := make(chan struct{})
+	for range 16 {
+		finished.Go(func() {
+			attempt := &providerEvaluationAttempt{owner: &window.providerEvaluation, destinationId: destinationId}
+			attempt.beginContractWait(destinationId)
+			started.Done()
+			<-release
+			attempt.endContractWait(destinationId, false)
+		})
+	}
+	started.Wait()
+	if !client.ProviderContractAcquisitionUnavailable() {
+		t.Error("concurrent live waits were unobservable")
+	}
+	contact := &providerEvaluationAttempt{owner: &window.providerEvaluation, destinationId: destinationId}
+	contact.noteProviderWrite(destinationId)
+	close(release)
+	finished.Wait()
+	contact.beginContractWait(destinationId)
+	if client.ProviderContractAcquisitionUnavailable() {
+		t.Error("late wait callbacks erased the monotonic write witness")
+	}
+	contact.endContractWait(destinationId, false)
 }

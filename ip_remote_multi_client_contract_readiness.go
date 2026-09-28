@@ -8,11 +8,12 @@ import (
 	"time"
 )
 
-// Monotonic window evidence, safe for concurrent candidate and probe readers.
+// Window-owned pending waits and monotonic outcomes, safe for concurrent readers.
 // It is deliberately conservative across retries: an old contact is not erased.
 type providerEvaluationState struct {
-	localContractFailure atomic.Bool
-	providerContact      atomic.Bool
+	localContractFailure   atomic.Bool
+	providerContact        atomic.Bool
+	pendingContractWaiters atomic.Int32
 }
 
 // One candidate owns this witness before its Client is constructed. Only actual
@@ -29,6 +30,7 @@ type providerEvaluationAttempt struct {
 // Nil is the ordinary non-multi-client path and adds no ownership or observer.
 func (self *providerEvaluationAttempt) beginContractWait(destinationId Id) {
 	if self != nil && self.destinationId == destinationId {
+		self.owner.pendingContractWaiters.Add(1)
 		self.contractWaiters.Add(1)
 	}
 }
@@ -39,8 +41,10 @@ func (self *providerEvaluationAttempt) endContractWait(destinationId Id, failed 
 	if self != nil && self.destinationId == destinationId {
 		if failed {
 			self.contractFailed.Store(true)
+			self.owner.localContractFailure.Store(true)
 		}
 		self.contractWaiters.Add(-1)
+		self.owner.pendingContractWaiters.Add(-1)
 	}
 }
 
@@ -70,20 +74,25 @@ func (self *multiClientWindow) recordLocalContractFailure(args *multiClientChann
 	self.recordEvaluationFailure(windowFailurePlatform, nil)
 }
 
-// True only after a local acquisition failure and before any provider-directed
-// write attempt in this multi-client's lifetime. This is not a health verdict:
-// a probe may use it to decline measurement, never to pronounce a provider good.
-// The immutable windows map and atomic witnesses permit concurrent reads.
+// True during a local acquisition wait or after its failure, before any attempted
+// provider write. A probe can stop before the later ping timer classifies a wait.
+// This declines measurement; it never pronounces a provider good. The immutable
+// windows map and atomic witnesses permit concurrent reads.
 func (self *RemoteUserNatMultiClient) ProviderContractAcquisitionUnavailable() bool {
 	if self == nil {
 		return false
 	}
 	unavailable := false
 	for _, window := range self.windows {
+		unavailable = unavailable || window.providerEvaluation.pendingContractWaiters.Load() > 0 ||
+			window.providerEvaluation.localContractFailure.Load()
+	}
+	// Check every monotonic contact fence after reading absence evidence, so a
+	// different window's earlier write cannot be hidden by a newly pending wait.
+	for _, window := range self.windows {
 		if window.providerEvaluation.providerContact.Load() {
 			return false
 		}
-		unavailable = unavailable || window.providerEvaluation.localContractFailure.Load()
 	}
 	return unavailable
 }
