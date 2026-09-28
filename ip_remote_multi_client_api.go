@@ -267,6 +267,10 @@ type ApiMultiClientGenerator struct {
 	transportCreation apiTransportCreationLifecycle
 	retirementOnce    sync.Once
 	retirements       *lifecycleAdmission
+	// Keep only the first finite failure; a long-lived generator must not
+	// retain every remote response or a growing error chain.
+	retirementStateLock sync.Mutex
+	retirementErr       error
 	// Injectable lifecycle barriers for deterministic ownership tests.
 	beforeRetirementWaitForTest func()
 	newPlatformTransport        func(
@@ -456,6 +460,25 @@ func (self *ApiMultiClientGenerator) retirementLifecycle() *lifecycleAdmission {
 	return self.retirements
 }
 
+// Only fixed stage/class strings cross the final join boundary. HTTP bodies,
+// credential errors, identities, and remote URLs never enter the stored error.
+func (self *ApiMultiClientGenerator) recordRetirementError(stage string, err error) {
+	if err == nil {
+		return
+	}
+	cause := errors.New("request failed")
+	if errors.Is(err, context.DeadlineExceeded) {
+		cause = context.DeadlineExceeded
+	} else if errors.Is(err, context.Canceled) {
+		cause = context.Canceled
+	}
+	self.retirementStateLock.Lock()
+	defer self.retirementStateLock.Unlock()
+	if self.retirementErr == nil {
+		self.retirementErr = fmt.Errorf("client retirement %s: %w", stage, cause)
+	}
+}
+
 // CloseAndWait prevents new transports, cancels every generated client, waits
 // until each channel has handed its client back through RemoveClientWithArgs,
 // and joins the resulting Client/OOB retirement workers. A successful return
@@ -527,7 +550,10 @@ func (self *ApiMultiClientGenerator) CloseAndWait(ctx context.Context) error {
 	// stops the API context and identity writer without making RemoveClientArgs
 	// misclassify a destination change as process shutdown.
 	closeOwned()
-	return self.identityState.CloseAndWait(ctx)
+	identityErr := self.identityState.CloseAndWait(ctx)
+	self.retirementStateLock.Lock()
+	defer self.retirementStateLock.Unlock()
+	return errors.Join(identityErr, self.retirementErr)
 }
 
 func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
@@ -831,7 +857,7 @@ func (self *ApiMultiClientGenerator) RemoveClientArgs(args *MultiClientGenerator
 		}
 		removeCtx, removeCancel := context.WithTimeout(context.Background(), retireTimeout)
 		defer removeCancel()
-		self.removeClientArgsAndWait(removeCtx, args)
+		self.recordRetirementError("identity", self.removeClientArgsAndWait(removeCtx, args))
 	})
 }
 
@@ -843,7 +869,7 @@ func (self *ApiMultiClientGenerator) RemoveClientArgs(args *MultiClientGenerator
 func (self *ApiMultiClientGenerator) removeClientArgsAndWait(
 	ctx context.Context,
 	args *MultiClientGeneratorClientArgs,
-) {
+) error {
 	// Preserve restartable identities when the generator's parent is already
 	// closing. With no store, still make the same best-effort removal attempt as
 	// RemoveClientArgs; a strategy whose own owner has already closed may reject
@@ -851,7 +877,7 @@ func (self *ApiMultiClientGenerator) removeClientArgsAndWait(
 	select {
 	case <-self.ctx.Done():
 		if self.identityState.hasStore() {
-			return
+			return nil
 		}
 	default:
 		instanceId := Id{}
@@ -859,25 +885,34 @@ func (self *ApiMultiClientGenerator) removeClientArgsAndWait(
 			instanceId = args.ClientAuth.InstanceId
 		}
 		if !self.identityState.RemoveIfCurrent(args.ClientId, instanceId) {
-			return
+			return nil
 		}
 	}
 
+	var result *RemoveNetworkClientResult
+	var err error
 	if self.clientCredentials != nil {
 		// The existing drain/retirement lifecycle above owns this call and its
 		// bounded context. Switching authorities cannot revoke before drain.
-		_, _ = self.clientCredentials.RemoveNetworkClient(ctx, &RemoveNetworkClientArgs{ClientId: args.ClientId})
-		return
+		result, err = self.clientCredentials.RemoveNetworkClient(ctx, &RemoveNetworkClientArgs{ClientId: args.ClientId})
+	} else {
+		result, err = HttpPostWithStrategy(
+			ctx,
+			self.clientStrategy,
+			fmt.Sprintf("%s/network/remove-client", self.apiUrl),
+			&RemoveNetworkClientArgs{ClientId: args.ClientId},
+			self.api.ByJwt(),
+			&RemoveNetworkClientResult{},
+			NewNoopApiCallback[*RemoveNetworkClientResult](),
+		)
 	}
-	_, _ = HttpPostWithStrategy(
-		ctx,
-		self.clientStrategy,
-		fmt.Sprintf("%s/network/remove-client", self.apiUrl),
-		&RemoveNetworkClientArgs{ClientId: args.ClientId},
-		self.api.ByJwt(),
-		&RemoveNetworkClientResult{},
-		NewNoopApiCallback[*RemoveNetworkClientResult](),
-	)
+	if err != nil {
+		return err
+	}
+	if result == nil || result.Error != nil {
+		return errors.New("client retirement response absent or rejected")
+	}
+	return nil
 }
 
 func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *MultiClientGeneratorClientArgs) {
@@ -910,8 +945,9 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 	// blocks window replacement. CloseAndWait joins every Client-owned producer
 	// of contract-close controls; closing and joining the OOB boundary after
 	// that proves all admitted cleanup requests and callbacks are done before
-	// RemoveClientArgs revokes the identity. Both waits are bounded by the
-	// strategy request timeout, with a defensive 30-second floor.
+	// RemoveClientArgs revokes the identity. These asynchronous owners remain
+	// until actually joined, even when CloseAndWait's caller has timed out.
+	// Only then does identity removal start its independent finite budget.
 	go HandleError(func() {
 		if retirementAdmitted {
 			defer retirements.finish()
@@ -923,10 +959,21 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 		// every generator lock before publishing retirement completion. Like provider teardown,
 		// this asynchronous owner remains until the carrier is actually done;
 		// CloseAndWait's caller context bounds waiting, not resource ownership.
+		var drainErr error
 		if joiningTransport, ok := transport.(interface {
 			CloseAndWait(context.Context) error
 		}); ok {
-			_ = joiningTransport.CloseAndWait(context.Background())
+			drainErr = joiningTransport.CloseAndWait(context.Background())
+		}
+		drainErr = errors.Join(drainErr, client.CloseAndWait(context.Background()))
+		if clientOob, ok := client.ClientOob().(interface {
+			CloseAndWait(context.Context) error
+		}); ok {
+			drainErr = errors.Join(drainErr, clientOob.CloseAndWait(context.Background()))
+		}
+		if drainErr != nil {
+			self.recordRetirementError("drain", drainErr)
+			return
 		}
 		retireTimeout := self.clientStrategy.settings.RequestTimeout
 		if retireTimeout < 30*time.Second {
@@ -935,13 +982,7 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 		retireCtx, retireCancel := context.WithTimeout(context.Background(), retireTimeout)
 		defer retireCancel()
 
-		_ = client.CloseAndWait(retireCtx)
-		if clientOob, ok := client.ClientOob().(interface {
-			CloseAndWait(context.Context) error
-		}); ok {
-			_ = clientOob.CloseAndWait(retireCtx)
-		}
-		self.removeClientArgsAndWait(retireCtx, args)
+		self.recordRetirementError("identity", self.removeClientArgsAndWait(retireCtx, args))
 	})
 }
 
