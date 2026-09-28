@@ -40,6 +40,9 @@ func httpBrowserRequestForRedirectPolicy(request *http.Request) *http.Request {
 		return request
 	}
 	owned := request.Clone(request.Context())
+	if owned.Header == nil {
+		owned.Header = make(http.Header)
+	}
 	owned.Header.Set("js.fetch:redirect", "error")
 	return owned
 }

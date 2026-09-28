@@ -197,4 +197,25 @@ func TestHttpRequestRedirectPolicyKeepsClientAndBrowserOwnership(t *testing.T) {
 	if request.Header.Get("Authorization") != "Bearer synthetic credential" {
 		t.Fatal("browser consumed caller-owned header state")
 	}
+	for _, item := range []struct {
+		name   string
+		header http.Header
+	}{
+		{name: "nil"},
+		{name: "empty", header: make(http.Header)},
+	} {
+		original := request.Clone(request.Context())
+		original.Header = item.header
+		browser, panicValue := func() (browser *http.Request, panicValue any) {
+			defer func() { panicValue = recover() }()
+			return httpBrowserRequestForRedirectPolicy(original), nil
+		}()
+		if panicValue != nil || browser == nil || browser.Header.Get("js.fetch:redirect") != "error" {
+			t.Fatalf("browser scoped %s header could not retain redirect refusal: panic=%v", item.name, panicValue)
+		}
+		browser.Header.Set("Synthetic-Owned", "copied")
+		if len(original.Header) != 0 || (original.Header == nil) != (item.header == nil) {
+			t.Fatalf("browser scoped %s header mutated caller ownership", item.name)
+		}
+	}
 }
