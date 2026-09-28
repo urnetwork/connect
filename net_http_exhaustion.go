@@ -24,6 +24,15 @@ func (self *HttpRequestExhaustedError) Error() string   { return "http request a
 func (self *HttpRequestExhaustedError) Unwrap() []error { return slices.Clone(self.causes) }
 
 var errHttpExhaustionAdditionalHardCauses = errors.New("http request exhausted with additional non-transient causes")
+var errHttpExhaustionCauseTraversal = errors.New("http request cause tree exceeds its finite inspection bound")
+
+const httpRequestCauseNodes = 256
+const httpRequestCauseDepth = 64
+
+type httpRequestCause struct {
+	kind uint8
+	err  error
+}
 
 // The hook observes a real failed physical attempt after it has been retained.
 // It cannot replace an outcome or admission decision and runs outside locks.
@@ -42,35 +51,72 @@ func newHttpRequestCauses(ctx context.Context) *httpRequestCauses {
 	return &httpRequestCauses{transient: map[uint8]error{}, observe: observe}
 }
 
-// Repeated equivalent transport leaves occupy one slot. Unknown causes occupy
-// at most 32 slots plus a hard overflow sentinel, so none can disappear into a
-// pure transient verdict. Local path/link errors are never unwrapped into EOF.
-func (self *httpRequestCauses) recordWithLock(err error) {
-	if err == nil {
-		return
+// Unwrap and net.Error methods belong to foreign objects. Inspect a finite
+// tree outside ownership locks; cycles/depth/width overflow remain explicit
+// hard ambiguity. Local path/link errors cannot unwrap into transient EOF.
+func flattenHttpRequestCauses(err error) []httpRequestCause {
+	type pendingCause struct {
+		err   error
+		depth int
 	}
-	switch err.(type) {
-	case *os.PathError, *os.LinkError:
-		self.recordHardWithLock(err)
-		return
-	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		causes := joined.Unwrap()
-		if len(causes) == 0 {
-			self.recordHardWithLock(err)
-			return
+	pending := []pendingCause{{err: err, depth: 1}}
+	var result []httpRequestCause
+	overflow := false
+	remaining := httpRequestCauseNodes
+	for len(pending) != 0 && remaining > 0 {
+		item := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		remaining--
+		if item.err == nil {
+			continue
 		}
-		for _, cause := range causes {
-			self.recordWithLock(cause)
+		if item.depth > httpRequestCauseDepth {
+			overflow = true
+			continue
 		}
-		return
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		if cause := wrapped.Unwrap(); cause != nil {
-			self.recordWithLock(cause)
-			return
+		switch item.err.(type) {
+		case *os.PathError, *os.LinkError:
+			result = append(result, httpRequestCause{err: item.err})
+			continue
 		}
+		if joined, ok := item.err.(interface{ Unwrap() []error }); ok {
+			causes := joined.Unwrap()
+			available := remaining - len(pending)
+			if len(causes) > available {
+				overflow = true
+				causes = causes[:available]
+			}
+			before := len(pending)
+			for index := len(causes) - 1; index >= 0; index-- {
+				if causes[index] != nil {
+					pending = append(pending, pendingCause{err: causes[index], depth: item.depth + 1})
+				}
+			}
+			if len(pending) == before && !overflow {
+				result = append(result, httpRequestCause{err: item.err})
+			}
+			continue
+		}
+		if wrapped, ok := item.err.(interface{ Unwrap() error }); ok {
+			if cause := wrapped.Unwrap(); cause != nil {
+				if len(pending) >= remaining {
+					overflow = true
+				} else {
+					pending = append(pending, pendingCause{err: cause, depth: item.depth + 1})
+				}
+				continue
+			}
+		}
+		result = append(result, classifyHttpRequestCause(item.err))
 	}
+	if overflow || len(pending) != 0 {
+		result = append(result, httpRequestCause{err: errHttpExhaustionCauseTraversal})
+	}
+	return result
+}
+
+// Classify only a terminal leaf, with no caller-owned lock held.
+func classifyHttpRequestCause(err error) httpRequestCause {
 	var kind uint8
 	switch err {
 	case context.Canceled:
@@ -103,13 +149,7 @@ func (self *httpRequestCauses) recordWithLock(err error) {
 			}
 		}
 	}
-	if kind != 0 {
-		if self.transient[kind] == nil {
-			self.transient[kind] = err
-		}
-		return
-	}
-	self.recordHardWithLock(err)
+	return httpRequestCause{kind: kind, err: err}
 }
 
 func (self *httpRequestCauses) recordHardWithLock(err error) {
@@ -124,7 +164,20 @@ func (self *httpRequestCauses) record(err error) {
 	if err == nil {
 		return
 	}
-	func() { self.stateLock.Lock(); defer self.stateLock.Unlock(); self.recordWithLock(err) }()
+	causes := flattenHttpRequestCauses(err)
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for _, cause := range causes {
+			if cause.kind != 0 {
+				if self.transient[cause.kind] == nil {
+					self.transient[cause.kind] = cause.err
+				}
+			} else {
+				self.recordHardWithLock(cause.err)
+			}
+		}
+	}()
 	if self.observe != nil {
 		self.observe(err)
 	}
@@ -146,6 +199,13 @@ func (self *httpRequestCauses) track(result *evalResult) *evalResult {
 // Evaluators join all admitted workers before this immutable snapshot. The
 // collector still guards reads, so actual cancellation races stay data-race free.
 func (self *httpRequestCauses) exhausted(request, strategy context.Context) error {
+	// Context implementations may also reenter the owner. Copy their results
+	// before locking; the immutable cause snapshot has no foreign callbacks.
+	requestErr := request.Err()
+	var strategyErr error
+	if strategy != nil {
+		strategyErr = strategy.Err()
+	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	causes := []error{}
@@ -157,11 +217,6 @@ func (self *httpRequestCauses) exhausted(request, strategy context.Context) erro
 	causes = append(causes, self.hard...)
 	if self.moreHard {
 		causes = append(causes, errHttpExhaustionAdditionalHardCauses)
-	}
-	requestErr := request.Err()
-	var strategyErr error
-	if strategy != nil {
-		strategyErr = strategy.Err()
 	}
 	if requestErr != nil {
 		causes = append(causes, requestErr)

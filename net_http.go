@@ -1394,7 +1394,7 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(attemptRequest)
+		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, err)
@@ -1452,7 +1452,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(attemptRequest)
+		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial %s %s = %s\n", request.Method, request.URL, err)
@@ -1471,7 +1471,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(attemptRequest)
+		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, err)
