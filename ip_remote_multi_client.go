@@ -10455,8 +10455,9 @@ func windowGeneratorCall[T any](
 // RemoveClientArgs is the same cleanup every decline path uses (expired args,
 // ctx teardown), so the late client is deleted (and dropped from the identity
 // store) instead of leaking until server-side idle reap.
-func (self *multiClientWindow) removeLateClientArgs(clientArgs *MultiClientGeneratorClientArgs, err error) {
-	if err == nil && clientArgs != nil {
+func (self *multiClientWindow) removeLateClientArgs(clientArgs *MultiClientGeneratorClientArgs, _ error) {
+	// A partial result still owns its identity, even if a later step failed.
+	if clientArgs != nil {
 		loggerOrDefault(self.log).Infof("[multi]abandoned client args completed late; removing\n")
 		self.generator.RemoveClientArgs(clientArgs)
 	}
@@ -10474,7 +10475,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					if !ok {
 						return
 					}
-					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+					if !args.deferredClientArgs {
+						self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+					}
 				}
 			}
 		}()
@@ -10552,6 +10555,26 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			expirationTime := time.Now().Add(self.settings.WindowExpandArgsTimeout)
 			for _, enumerated := range destinations {
 				destination, stats := enumerated.destination, enumerated.stats
+				if _, fixed := self.generator.FixedDestinationSize(); fixed {
+					// Fixed membership has no useful speculative identity. Offer
+					// only the destination; expand owns any subsequent mint.
+					args := &multiClientChannelArgs{
+						Destination: destination, DestinationStats: stats,
+						FixedDestination: true, deferredClientArgs: true,
+					}
+					timeout := time.Until(expirationTime)
+					if timeout <= 0 {
+						return
+					}
+					select {
+					case <-self.ctx.Done():
+						return
+					case self.clientChannelArgs <- args:
+					case <-time.After(timeout):
+						return
+					}
+					continue
+				}
 
 				for {
 					timeout := expirationTime.Sub(time.Now())
@@ -11748,9 +11771,31 @@ requestCandidates:
 			// unused-candidate ownership path.
 			candidateTime := time.Now()
 			if !expandCandidateWithinAcquisitionDeadline(candidateTime, requestEndTime) {
-				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				if !args.deferredClientArgs {
+					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				}
 				self.log.V(2).Infof("[multi]expand window timeout before candidate evaluation\n")
 				break requestCandidates
+			}
+			if args.deferredClientArgs {
+				if self.fixedDestinationPresent(args.Destination) {
+					// Discovery may predate a sibling's admission. An inert
+					// duplicate is not demand and consumes no candidate slot.
+					i--
+					continue requestCandidates
+				}
+				requestCtx, cancelRequest := context.WithDeadline(self.ctx, requestEndTime)
+				clientArgs, err := self.fixedClientArgs(requestCtx, args.Destination)
+				cancelRequest()
+				if err != nil {
+					break requestCandidates
+				}
+				args.MultiClientGeneratorClientArgs = *clientArgs
+				args.deferredClientArgs = false
+				if self.ctx.Err() != nil || !expandCandidateWithinAcquisitionDeadline(time.Now(), requestEndTime) {
+					self.generator.RemoveClientArgs(clientArgs)
+					break requestCandidates
+				}
 			}
 			// randomly set to p2p only to meet the minimum requirement
 			if !args.MultiClientGeneratorClientArgs.P2pOnly {
@@ -12757,6 +12802,9 @@ func (self *multiClientWindow) removeClients(removedClients ...*multiClientChann
 
 type multiClientChannelArgs struct {
 	MultiClientGeneratorClientArgs
+	// A fixed destination offer owns no identity until expand accepts it.
+	// Only the receiving expansion mutates this after the unbuffered handoff.
+	deferredClientArgs bool
 
 	Destination MultiHopId
 	DestinationStats

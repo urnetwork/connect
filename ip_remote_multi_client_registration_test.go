@@ -38,10 +38,26 @@ type registrationSetupResult struct {
 
 func newGeneratorRegistrationFixture(t *testing.T, ipVersion int, beforeClientJoin func()) (*ApiMultiClientGenerator, *Client, *fakeWindowPlatformTransport, *registrationSetupContext, context.CancelFunc, <-chan registrationSetupResult, <-chan clientKeyRegistrationHttpAttempt) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	// Cleanup retires the identity over HTTP. The strategy must outlive
+	// t.Context(), which Go cancels before running test cleanup functions.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
 	attempts := make(chan clientKeyRegistrationHttpAttempt, 4)
+	clientId := NewId()
+	var removed atomic.Int32
 	endpoint := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/hello" || r.URL.Path == "/network/remove-client" {
+		if r.URL.Path == "/hello" {
+			_, _ = io.WriteString(w, `{}`)
+			return
+		}
+		if r.URL.Path == "/network/remove-client" {
+			var args RemoveNetworkClientArgs
+			if json.NewDecoder(r.Body).Decode(&args) != nil || args.ClientId != clientId {
+				t.Error("retirement did not name the generated identity")
+				http.Error(w, "invalid removal", http.StatusBadRequest)
+				return
+			}
+			removed.Add(1)
 			_, _ = io.WriteString(w, `{}`)
 			return
 		}
@@ -99,7 +115,7 @@ func newGeneratorRegistrationFixture(t *testing.T, ipVersion int, beforeClientJo
 	settings.beforeRunDoneWaitForTest = beforeClientJoin
 	callCtx, callCancel := context.WithCancel(ctx)
 	observedCtx := &registrationSetupContext{Context: callCtx, waiting: make(chan struct{})}
-	args := &MultiClientGeneratorClientArgs{ClientId: NewId(), ClientAuth: &ClientAuth{
+	args := &MultiClientGeneratorClientArgs{ClientId: clientId, ClientAuth: &ClientAuth{
 		ByJwt: "synthetic-derived-token", InstanceId: NewId(), AppVersion: "test-version",
 	}}
 	result := make(chan registrationSetupResult, 1)
@@ -126,6 +142,9 @@ func newGeneratorRegistrationFixture(t *testing.T, ipVersion int, beforeClientJo
 		defer joinCancel()
 		if err := generator.CloseAndWait(joinCtx); err != nil {
 			t.Error(err)
+		}
+		if got := removed.Load(); got != 1 {
+			t.Errorf("generated identity removals=%d, want 1", got)
 		}
 		cancel()
 		strategy.Close()
