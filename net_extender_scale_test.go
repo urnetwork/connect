@@ -206,6 +206,9 @@ func TestExtenderDirectoryScaleAMillionGossipRecords(t *testing.T) {
 // refresh; and the selection of one refresh's sample reads so little of the
 // directory that it takes under a millisecond, averaged over many refreshes.
 func TestExtenderPeerPingerScaleAHundredThousandPeers(t *testing.T) {
+	if extenderScaleInFreshProcess(t) {
+		return
+	}
 	scaleSettings := defaultTestExtenderScaleSettings()
 	directory, now := newTestScaleDirectory(t, func(settings *ExtenderDirectorySettings) {
 		settings.MaxActiveRecordCount = 0

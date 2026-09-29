@@ -75,14 +75,7 @@ func TestAckCompressionIsTheOnlyClockBelowHalfAWindowRung(t *testing.T) {
 
 	// the harness's ack channel is bounded and drops, so the count is taken
 	// as they arrive rather than from what is left in it
-	var ackCount atomic.Int64
-	acksDrained := make(chan struct{})
-	go func() {
-		defer close(acksDrained)
-		for range harness.acks {
-			ackCount.Add(1)
-		}
-	}()
+	ackCount := countHarnessAcks(harness)
 
 	payload := string(make([]byte, segmentByteCount))
 	// in-order segments: a repeated sequence number would be a retransmission
@@ -305,14 +298,7 @@ func TestSteadyStateUploadEmitsNoQuickacks(t *testing.T) {
 	})
 	go io.Copy(io.Discard, harness.upstreamSocket)
 
-	var ackCount atomic.Int64
-	acksDrained := make(chan struct{})
-	go func() {
-		defer close(acksDrained)
-		for range harness.acks {
-			ackCount.Add(1)
-		}
-	}()
+	ackCount := countHarnessAcks(harness)
 
 	payload := string(make([]byte, segmentByteCount))
 	seq := harness.nextSeq
@@ -385,14 +371,7 @@ func TestCountingRuleCountsSegmentsNotBytes(t *testing.T) {
 	})
 	go io.Copy(io.Discard, harness.upstreamSocket)
 
-	var ackCount atomic.Int64
-	acksDrained := make(chan struct{})
-	go func() {
-		defer close(acksDrained)
-		for range harness.acks {
-			ackCount.Add(1)
-		}
-	}()
+	ackCount := countHarnessAcks(harness)
 
 	payload := string(make([]byte, segmentByteCount))
 	seq := harness.nextSeq
@@ -516,11 +495,21 @@ func sendHarnessSegments(
 // bounded and drops
 func countHarnessAcks(harness *tcpReorderTestHarness) *atomic.Int64 {
 	ackCount := &atomic.Int64{}
+	acksDrained := make(chan struct{})
 	go func() {
+		defer close(acksDrained)
 		for range harness.acks {
 			ackCount.Add(1)
 		}
 	}()
+	harness.t.Cleanup(func() {
+		harness.close()
+		select {
+		case <-acksDrained:
+		case <-time.After(2 * time.Second):
+			harness.t.Error("TCP acknowledgement reader did not stop")
+		}
+	})
 	return ackCount
 }
 

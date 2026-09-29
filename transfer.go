@@ -16581,7 +16581,9 @@ type ForwardSequence struct {
 
 	forwardBufferSettings *ForwardBufferSettings
 
-	packMutex sync.Mutex
+	// Pack callers independently wait on their own admission budget. Close
+	// cancels all waiters, then excludes them before closing the channel.
+	packMutex sync.RWMutex
 	packs     chan *ForwardPack
 
 	idleCondition *IdleCondition
@@ -16610,8 +16612,8 @@ func NewForwardSequence(
 
 // success, error
 func (self *ForwardSequence) Pack(forwardPack *ForwardPack, timeout time.Duration) (bool, error) {
-	self.packMutex.Lock()
-	defer self.packMutex.Unlock()
+	self.packMutex.RLock()
+	defer self.packMutex.RUnlock()
 
 	select {
 	case <-forwardPack.Ctx.Done():
