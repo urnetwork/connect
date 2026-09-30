@@ -518,9 +518,11 @@ type MultiClientSettings struct {
 	CPingWriteTimeout             time.Duration
 	CPingMaxByteCountPerSecond    ByteCount
 	PingTimeout                   time.Duration
-	CPingTimeout                  time.Duration
-	CPingRestTimeout              time.Duration
-	AckTimeout                    time.Duration
+	// Optional identity-free terminal initial-ping diagnostics; nil is inert.
+	InitialPingObservations *InitialPingObservations
+	CPingTimeout            time.Duration
+	CPingRestTimeout        time.Duration
+	AckTimeout              time.Duration
 	// BlackholeTimeout is the fallback no-send-ACK liveness interval for a
 	// generator without MultiClientGeneratorReadTimeout. The API generator
 	// uses its effective per-client transport ReadTimeout instead, so a
@@ -11481,7 +11483,7 @@ func (self *multiClientWindow) expand(
 	admitted := 0
 	pending := []*expandEvaluatedCandidate{}
 	type pendingPingFailure struct {
-		fail            func(bool) bool
+		fail            func(bool, initialPingOutcome) bool
 		args            *multiClientChannelArgs
 		evaluationCtx   context.Context
 		startedAt       time.Time
@@ -11708,7 +11710,11 @@ func (self *multiClientWindow) expand(
 				self.ctx,
 				pendingFailure.evaluationCtx,
 			)
-			if !pendingFailure.fail(!localContract && deadlineOwned) || !deadlineOwned {
+			pingOutcome := initialPingCanceled
+			if deadlineOwned {
+				pingOutcome = initialPingExpired
+			}
+			if !pendingFailure.fail(!localContract && deadlineOwned, pingOutcome) || !deadlineOwned {
 				continue
 			}
 			if localContract {
@@ -11873,13 +11879,30 @@ requestCandidates:
 				}
 			} else {
 				pingStartedAt := time.Now()
+				observations := self.settings.InitialPingObservations
+				observations.begin()
+				pingObserved := false // guarded by this expansion's existing mutex
+				observePing := func(outcome initialPingOutcome) {
+					if observations == nil || pingObserved {
+						return
+					}
+					pingObserved = true
+					if self.ctx.Err() != nil || evaluationCtx.Err() != nil {
+						outcome = initialPingCanceled
+					}
+					observations.record(outcome,
+						initialPingDependencySnapshot(client.client, args.providerEvaluation),
+						time.Since(pingStartedAt))
+				}
 
 				// send an initial ping on the client and let the ack timeout close it
 				pingDone, pingCancel := context.WithCancel(self.ctx)
 				pendingPingDones = append(pendingPingDones, pingDone)
 
 				// must be called with mutex
-				fail := func(providerFailure bool) bool {
+				fail := func(providerFailure bool, outcome initialPingOutcome) bool {
+					// Observe before our own cancellation removes the carrier.
+					observePing(outcome)
 					select {
 					case <-pingDone.Done():
 						// already done
@@ -11929,7 +11952,7 @@ requestCandidates:
 						func() {
 							mutex.Lock()
 							defer mutex.Unlock()
-							fail(false)
+							fail(false, initialPingCanceled)
 						}()
 						return
 					case <-pingTimer.C:
@@ -11940,11 +11963,11 @@ requestCandidates:
 						mutex.Lock()
 						defer mutex.Unlock()
 						if evaluationCtx.Err() != nil {
-							fail(false)
+							fail(false, initialPingCanceled)
 							return
 						}
 						localContract := args.providerEvaluation.localContractUnavailable()
-						if !fail(!localContract) {
+						if !fail(!localContract, initialPingExpired) {
 							return
 						}
 						if localContract {
@@ -11985,7 +12008,7 @@ requestCandidates:
 								}
 								mutex.Lock()
 								defer mutex.Unlock()
-								fail(true)
+								fail(true, initialPingError)
 							}
 						}, client.Cancel)
 					}
@@ -12037,6 +12060,7 @@ requestCandidates:
 							}
 
 							if err == nil {
+								observePing(initialPingAcknowledged)
 								// evaluated: the candidate answered its ping.
 								// Admission (with the same-clientId
 								// replacement gate) now runs through the
@@ -12061,17 +12085,17 @@ requestCandidates:
 								pingCancel()
 							} else {
 								providerFailure := self.recordEvaluationPingFailure(evaluationCtx, args, err)
-								fail(providerFailure)
+								fail(providerFailure, initialPingError)
 							}
 						},
 					)
 					if err != nil {
 						if pingDone.Err() == nil {
 							providerFailure := self.recordEvaluationPingFailure(evaluationCtx, args, err)
-							fail(providerFailure)
+							fail(providerFailure, initialPingError)
 						}
 					} else if !success {
-						fail(!args.providerEvaluation.localContractUnavailable())
+						fail(!args.providerEvaluation.localContractUnavailable(), initialPingError)
 					}
 				})
 			}
