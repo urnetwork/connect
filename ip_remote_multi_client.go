@@ -1088,6 +1088,15 @@ type MultiClientSettings struct {
 	// probeExit, and the sweep that does lands in the next package.
 	ProviderProbe bool
 
+	// DataOnlyProviderProbe lets an application-owned, finite probe evaluate
+	// one explicitly fixed provider with its real traffic. It is effective
+	// only with ProviderProbe=false, one fixed destination, and one hop.
+	// Registration still completes before admission; Added means selectable,
+	// not remotely qualified. Initial, continuous and busy-stall IpPing are
+	// omitted. Contracts, encryption, transfer ACKs, passive failure detection
+	// and request deadlines retain their normal owners. The default is false.
+	DataOnlyProviderProbe bool
+
 	// ProbeTimeout bounds one probe pass. 0 falls back to the built-in 4s. It
 	// bounds how long positive evidence is waited for; it is never a timer that
 	// produces a verdict, because a pass that ends with nothing back leaves
@@ -10132,6 +10141,11 @@ func (self *multiClientWindow) watchSendStalls() {
 func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) bool {
 	var stalled []*multiClientChannel
 	for _, client := range self.unorderedClients() {
+		// A finite application probe owns its data deadline and outcome. Skip
+		// this active question and its conviction together, not just the ping.
+		if client.dataOnlyProviderProbe {
+			continue
+		}
 		if client.sendStalled(stallTimeout) {
 			stalled = append(stalled, client)
 		}
@@ -11969,6 +11983,23 @@ requestCandidates:
 				} else if setupFailed && evaluationCtx.Err() == nil {
 					self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
 				}
+			} else if client.dataOnlyProviderProbe {
+				// Registered construction is sufficient to select this explicit
+				// provider. The application's DNS/URL exchange owns qualification;
+				// do not fabricate a ping, ACK, or successful observation.
+				mutex.Lock()
+				candidate := &expandEvaluatedCandidate{client: client, args: args}
+				if self.ctx.Err() != nil || evaluationCtx.Err() != nil || client.IsDone() {
+					cancelCandidate(candidate)
+				} else {
+					added += 1
+					if client.IsP2pOnly() {
+						addedP2pOnly += 1
+					}
+					pending = append(pending, candidate)
+					admitPending()
+				}
+				mutex.Unlock()
 			} else {
 				pingStartedAt := time.Now()
 				observations := self.settings.InitialPingObservations
@@ -13106,6 +13137,9 @@ func (self *clientWindowStats) ExpectedByteCountPerSecond() ByteCount {
 }
 
 type multiClientChannel struct {
+	// Immutable at construction from the explicit fixed-provider authority.
+	dataOnlyProviderProbe bool
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	log    Logger
@@ -13558,8 +13592,9 @@ func newMultiClientChannel(
 	// }
 
 	clientChannel := &multiClientChannel{
-		ctx:    cancelCtx,
-		cancel: cancel,
+		dataOnlyProviderProbe: dataOnlyProviderProbeEnabled(settings, generator, args),
+		ctx:                   cancelCtx,
+		cancel:                cancel,
 		transportMigrator: func() MultiClientGeneratorTransportMigrator {
 			migrator, _ := generator.(MultiClientGeneratorTransportMigrator)
 			return migrator
@@ -13646,7 +13681,9 @@ func newMultiClientChannel(
 	}, cancel)
 
 	go HandleError(clientChannel.detectBlackhole, cancel)
-	if startForTest := settings.startChannelPingForTest; startForTest != nil {
+	if clientChannel.dataOnlyProviderProbe {
+		// The finite application probe supplies the first and subsequent data.
+	} else if startForTest := settings.startChannelPingForTest; startForTest != nil {
 		startForTest(func() { go HandleError(clientChannel.ping, cancel) })
 	} else {
 		go HandleError(clientChannel.ping, cancel)
