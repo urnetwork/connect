@@ -318,6 +318,30 @@ stop_systemd_units ()
     fi
 }
 
+# Without lingering the user's systemd manager, and urnetwork.service with it,
+# stops at logout and only starts again at the next login.
+enable_lingering ()
+{
+    if [ "$has_systemd" -ne 1 ]; then
+        return 0
+    fi
+
+    linger_user="$(id -un)"
+
+    if [ "$(loginctl show-user "$linger_user" --property=Linger --value 2>/dev/null)" = "yes" ]; then
+        return 0
+    fi
+
+    if loginctl enable-linger "$linger_user" &&
+        [ "$(loginctl show-user "$linger_user" --property=Linger --value 2>/dev/null)" = "yes" ]; then
+        pr_info "Enabled lingering so urnetwork.service keeps running after logout"
+        return 0
+    fi
+
+    pr_err "warning: Could not enable lingering for %s; urnetwork.service will stop when you log out" "$linger_user"
+    pr_err "warning: Run \`sudo loginctl enable-linger %s' to keep the provider running" "$linger_user"
+}
+
 install_systemd_units ()
 {
     start="$systemd_units_stopped"
@@ -669,7 +693,7 @@ EOF
 	fi
     fi
 
-	loginctl enable-linger
+    enable_lingering
 
     case "$operation" in
         install)
