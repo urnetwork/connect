@@ -316,8 +316,21 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// destinations and so already discounts race-loser noise.
 		//
 		// The truncation is enforced at raceClients in sendPacket
-		// (`raceOrderedClients = orderedClients[:self.settings.MultiRaceClientCount]`).
+		// (multiRaceClientCount, which also applies MultiRaceDegradedClientCount).
 		MultiRaceClientCount: 0,
+		// MultiRaceDegradedClientCount bounds the race field while the control
+		// API is degraded (isBackendDegraded), whatever MultiRaceClientCount
+		// says. The wide race above is tail-latency insurance for a rough
+		// provider pool, and that argument assumes the race can be won. In an
+		// outage it cannot -- no contract can be authorized, so no exit can
+		// carry the flow -- and every extra racer is only another copy of the
+		// packet (and of every resend of it) on the wire: the fan-out half of
+		// the outage amplification in
+		// https://github.com/urnetwork/connect/issues/181. Two keeps the
+		// losing-first-pick cover for the moment the backend recovers; the
+		// bound lifts on the first successful backend round-trip.
+		// 0 disables the degraded bound.
+		MultiRaceDegradedClientCount: 2,
 
 		StatsWindowMaxUnhealthyDuration:  15 * time.Second,
 		StatsWindowWarnUnhealthyDuration: 5 * time.Second,
@@ -835,6 +848,7 @@ type MultiClientSettings struct {
 	MultiRacePacketMaxCount              int
 	MultiRaceClientEarlyCompleteFraction float32
 	MultiRaceClientCount                 int
+	MultiRaceDegradedClientCount         int
 
 	StatsWindowMaxUnhealthyDuration  time.Duration
 	StatsWindowWarnUnhealthyDuration time.Duration
@@ -1620,6 +1634,9 @@ type RemoteUserNatMultiClient struct {
 	// changing production selection or adding synchronization to the send path.
 	groupRaceCandidatesForTest func(*parsedPacketGroup) []*multiClientChannel
 	sendClientPathForTest      func(*IpPath, flowPin, func(*multiClientChannelUpdate, *multiClientChannel))
+	// backendDegradedForTest replaces the process-wide isBackendDegraded read
+	// that bounds the race field. Production leaves it unset.
+	backendDegradedForTest func() bool
 	// appPinClients is the cross-version half of an app pin: the exit an
 	// app's flows are currently placed on, keyed by app id. The affinity
 	// groups are per-ip-version by construction (separate path maps), so a
@@ -3605,7 +3622,8 @@ var demotionLogThrottle = newLogThrottle(classifyLogInterval)
 // safety layer: membership is untouched, only order.
 //
 // READ THIS BEFORE ASSUMING THIS FUNCTION STEERS TRAFFIC. It does not, in the
-// shipped configuration. MultiRaceClientCount is 0 (see its default), so
+// shipped configuration. MultiRaceClientCount is 0 (see its default; only a
+// degraded backend bounds it, see MultiRaceDegradedClientCount), so
 // raceOrderedClients is the WHOLE candidate list: every exit is dialed in
 // parallel and completeRace binds whichever responds with the lowest
 // MEASURED rtt, ignoring list order entirely. Most flows never race at all
@@ -6714,6 +6732,30 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 	)
 }
 
+// multiRaceClientCount is how many of the orderedCount race candidates one
+// cold-start race dials: all of them, truncated to configuredCount when that is
+// set (MultiRaceClientCount), and further to degradedCount while the backend is
+// degraded (MultiRaceDegradedClientCount). A zero count leaves its bound off.
+func multiRaceClientCount(orderedCount int, configuredCount int, degradedCount int, degraded bool) int {
+	count := orderedCount
+	if 0 < configuredCount && configuredCount < count {
+		count = configuredCount
+	}
+	if degraded && 0 < degradedCount && degradedCount < count {
+		count = degradedCount
+	}
+	return count
+}
+
+// backendDegraded reports the process-wide backend state that bounds the race
+// field.
+func (self *RemoteUserNatMultiClient) backendDegraded() bool {
+	if self.backendDegradedForTest != nil {
+		return self.backendDegradedForTest()
+	}
+	return isBackendDegraded()
+}
+
 // Routes and admits one already-parsed exact-flow group as a unit.
 func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 	source TransferPath,
@@ -6987,12 +7029,12 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 				return
 
 			default:
-				var raceOrderedClients []*multiClientChannel
-				if 0 < self.settings.MultiRaceClientCount && self.settings.MultiRaceClientCount < len(orderedClients) {
-					raceOrderedClients = orderedClients[:self.settings.MultiRaceClientCount]
-				} else {
-					raceOrderedClients = orderedClients
-				}
+				raceOrderedClients := orderedClients[:multiRaceClientCount(
+					len(orderedClients),
+					self.settings.MultiRaceClientCount,
+					self.settings.MultiRaceDegradedClientCount,
+					self.backendDegraded(),
+				)]
 
 				// Publish the race and every candidate before any SendGroup call.
 				// Queue admission and provider return run on independent goroutines;

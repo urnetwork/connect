@@ -496,7 +496,8 @@ func TestReliabilitySettingsMultiRaceClientCountDefault(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find sendParsedPacketGroup")
 	}
-	if !strings.Contains(body, "orderedClients[:self.settings.MultiRaceClientCount]") {
+	if !strings.Contains(body, "orderedClients[:multiRaceClientCount(") ||
+		!strings.Contains(body, "self.settings.MultiRaceClientCount,") {
 		t.Error("sendParsedPacketGroup no longer truncates the race field to MultiRaceClientCount, so the default bounds nothing")
 	}
 }
