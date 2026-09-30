@@ -49,12 +49,14 @@ type initialPingObservationCell struct {
 // in this aggregate. Started and completed cells are independent atomic reads.
 //
 // The aggregate has 24 fixed cells (count and elapsed seconds) plus one started
-// count: 49 scalar series if exported directly. It retains no identifiers,
+// count: 49 scalar series in Snapshot. PathSnapshot adds 48 fixed scalar
+// series for the exact initial Pack's route and ACK witnesses. It retains no identifiers,
 // destinations, errors, URLs, clients, callbacks or goroutines. Do not copy it
 // after use. A nil observer performs no snapshot or recording work.
 type InitialPingObservations struct {
-	started atomic.Uint64
-	cells   [len(initialPingOutcomeLabels)][len(initialPingDependencyLabels)]initialPingObservationCell
+	started   atomic.Uint64
+	cells     [len(initialPingOutcomeLabels)][len(initialPingDependencyLabels)]initialPingObservationCell
+	pathCells [len(initialPingOutcomeLabels)][len(initialPingRouteWriteLabels)][len(initialPingAckCallbackLabels)]initialPingObservationCell
 }
 
 type InitialPingObservation struct {
@@ -136,4 +138,93 @@ func initialPingDependencySnapshot(client *Client, attempt *providerEvaluationAt
 		return initialPingContractFailed
 	}
 	return initialPingNoContractOrWrite
+}
+
+// These witnesses belong only to the original initial-ping Pack. The existing
+// provider-contact witness also includes control heads and unsuccessful writes;
+// it retains its original failure-authority semantics.
+var initialPingRouteWriteLabels = [...]string{"not_observed", "accepted"}
+var initialPingAckCallbackLabels = [...]string{"pending", "success", "error"}
+
+type initialPingPathWitness struct {
+	routeAccepted atomic.Bool
+	ackCallback   atomic.Uint32 // 0 pending, 1 success, 2 error; retain first entry
+}
+
+func (self *initialPingPathWitness) observeRouteWrite(_ TransportType) {
+	if self != nil {
+		self.routeAccepted.Store(true)
+	}
+}
+
+func (self *initialPingPathWitness) observeAckCallback(err error) {
+	if self == nil {
+		return
+	}
+	state := uint32(1)
+	if err != nil {
+		state = 2
+	}
+	self.ackCallback.CompareAndSwap(0, state)
+}
+
+func (self *initialPingPathWitness) snapshot() (route, ack int) {
+	if self == nil {
+		return
+	}
+	if self.routeAccepted.Load() {
+		route = 1
+	}
+	ack = int(self.ackCallback.Load())
+	return
+}
+
+// InitialPingPathObservation is one fixed terminal-evaluation cell. Accepted
+// means the original ping Pack had a successful local route write, including a
+// later retry; it does not prove remote receipt. Not observed is an absence of
+// this witness, not proof that no bytes were delivered. ACK callback states are
+// sampled before this evaluation's own cancellation and may race the deadline.
+// Callback success is not necessarily admission. Seconds is whole evaluation
+// residence, not time spent in the named route or callback state.
+//
+// Route and callback witnesses are independent atomic reads. In particular,
+// success with route acceptance not yet observed is conservatively retained;
+// a fast peer ACK can precede publication of the writer's return observation.
+type InitialPingPathObservation struct {
+	Outcome     string
+	RouteWrite  string
+	AckCallback string
+	Count       uint64
+	Seconds     float64
+}
+
+// PathSnapshot exports 24 fixed cells (48 count/seconds scalars), including
+// zeros. Like Snapshot, its fields are independent reads, not an atomic census.
+func (self *InitialPingObservations) PathSnapshot() [len(initialPingOutcomeLabels) * len(initialPingRouteWriteLabels) * len(initialPingAckCallbackLabels)]InitialPingPathObservation {
+	var values [len(initialPingOutcomeLabels) * len(initialPingRouteWriteLabels) * len(initialPingAckCallbackLabels)]InitialPingPathObservation
+	i := 0
+	for outcome, outcomeLabel := range initialPingOutcomeLabels {
+		for route, routeLabel := range initialPingRouteWriteLabels {
+			for ack, ackLabel := range initialPingAckCallbackLabels {
+				values[i] = InitialPingPathObservation{Outcome: outcomeLabel, RouteWrite: routeLabel, AckCallback: ackLabel}
+				if self != nil {
+					cell := &self.pathCells[outcome][route][ack]
+					values[i].Count = cell.count.Load()
+					values[i].Seconds = float64(cell.micros.Load()) / 1e6
+				}
+				i++
+			}
+		}
+	}
+	return values
+}
+
+func (self *InitialPingObservations) recordPath(outcome initialPingOutcome, route, ack int, elapsed time.Duration) {
+	if self == nil || outcome < 0 || int(outcome) >= len(initialPingOutcomeLabels) ||
+		route < 0 || route >= len(initialPingRouteWriteLabels) || ack < 0 || ack >= len(initialPingAckCallbackLabels) || elapsed < 0 {
+		return
+	}
+	cell := &self.pathCells[outcome][route][ack]
+	cell.micros.Add(uint64(elapsed.Microseconds()))
+	cell.count.Add(1)
 }

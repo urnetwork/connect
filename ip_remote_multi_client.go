@@ -520,6 +520,8 @@ type MultiClientSettings struct {
 	PingTimeout                   time.Duration
 	// Optional identity-free terminal initial-ping diagnostics; nil is inert.
 	InitialPingObservations *InitialPingObservations
+	// Nil in production; focused controls pin first-ping writer ordering.
+	startChannelPingForTest func(start func())
 	CPingTimeout            time.Duration
 	CPingRestTimeout        time.Duration
 	AckTimeout              time.Duration
@@ -11880,6 +11882,10 @@ requestCandidates:
 			} else {
 				pingStartedAt := time.Now()
 				observations := self.settings.InitialPingObservations
+				var pingPath *initialPingPathWitness
+				if observations != nil {
+					pingPath = &initialPingPathWitness{}
+				}
 				observations.begin()
 				pingObserved := false // guarded by this expansion's existing mutex
 				observePing := func(outcome initialPingOutcome) {
@@ -11890,9 +11896,11 @@ requestCandidates:
 					if self.ctx.Err() != nil || evaluationCtx.Err() != nil {
 						outcome = initialPingCanceled
 					}
-					observations.record(outcome,
-						initialPingDependencySnapshot(client.client, args.providerEvaluation),
-						time.Since(pingStartedAt))
+					dependency := initialPingDependencySnapshot(client.client, args.providerEvaluation)
+					elapsed := time.Since(pingStartedAt)
+					observations.record(outcome, dependency, elapsed)
+					route, ack := pingPath.snapshot()
+					observations.recordPath(outcome, route, ack, elapsed)
 				}
 
 				// send an initial ping on the client and let the ack timeout close it
@@ -12039,10 +12047,15 @@ requestCandidates:
 						self.clientExtenderIps(client),
 					)
 
+					var pingOptions []any
+					if pingPath != nil {
+						pingOptions = []any{observeTransportWrite(pingPath.observeRouteWrite)}
+					}
 					success, err := client.SendDetailedMessage(
 						&protocol.IpPing{},
 						self.settings.PingWriteTimeout,
 						func(err error) {
+							pingPath.observeAckCallback(err)
 							if self.beforeExpandPingResultForTest != nil {
 								self.beforeExpandPingResultForTest()
 							}
@@ -12088,6 +12101,7 @@ requestCandidates:
 								fail(providerFailure, initialPingError)
 							}
 						},
+						pingOptions...,
 					)
 					if err != nil {
 						if pingDone.Err() == nil {
@@ -13542,7 +13556,11 @@ func newMultiClientChannel(
 	}, cancel)
 
 	go HandleError(clientChannel.detectBlackhole, cancel)
-	go HandleError(clientChannel.ping, cancel)
+	if startForTest := settings.startChannelPingForTest; startForTest != nil {
+		startForTest(func() { go HandleError(clientChannel.ping, cancel) })
+	} else {
+		go HandleError(clientChannel.ping, cancel)
+	}
 
 	clientReceiveUnsub := client.AddReceiveCallback(clientChannel.clientReceive)
 	clientChannel.clientReceiveUnsub = clientReceiveUnsub
@@ -15473,11 +15491,10 @@ func (self *multiClientChannel) observePacketGroupTransferCompletion(
 	self.addSendAbandonedGroup(sendPacketGroup)
 }
 
-func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeout time.Duration, ackCallback func(error)) (bool, error) {
+func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeout time.Duration, ackCallback func(error), opts ...any) (bool, error) {
 	if frame, err := ToFrame(message, self.settings.ProtocolVersion); err != nil {
 		return false, err
 	} else {
-		var opts []any
 		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
 			opts = append(opts, ForceStream())
 		}
