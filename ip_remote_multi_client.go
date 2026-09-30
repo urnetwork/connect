@@ -9726,6 +9726,43 @@ func standingReserveTarget(
 	return reserveTargetWindowSize
 }
 
+// backendDegraded reports the process-wide backend state that gates window
+// expansion.
+func (self *multiClientWindow) backendDegraded() bool {
+	if self.backendDegradedForTest != nil {
+		return self.backendDegradedForTest()
+	}
+	return isBackendDegraded()
+}
+
+// degradedWindowTarget caps a window's resize target at its current size
+// while the control API is degraded (see isBackendDegraded), so an outage
+// never grows the window. Every client the window adds during an outage is
+// pure cost: it needs the api to find a provider and authorize a contract
+// (and contract creation is itself gated while degraded), so it cannot carry
+// traffic, but it does open its own platform transports and, once in the
+// window, receives a copy of each cold-start race packet and each resend.
+// Over a long outage, with unhealthy exits removed and replaced every
+// WindowResizeTimeout, that is exactly the fan-out amplifier reported in
+// https://github.com/urnetwork/connect/issues/181.
+//
+// The cap only ever lowers the target, and never below the current size: it
+// does not shrink a window, so exits that are still up keep carrying flows.
+// An empty window keeps a target of one, so a window that is trying to form
+// still makes one exit's worth of attempts per pass: those evaluations are
+// what the outcome watchdog and the stall reason (ip_remote_multi_client_outcome.go)
+// read to tell the user the platform is unreachable, and they are the first
+// thing to succeed when it comes back. A disabled window (target 0) stays
+// disabled, so the outcome clock arms exactly as it did before. Recovery needs
+// nothing of its own: the first successful backend round-trip clears the
+// degraded state and the next resize pass expands to the full target.
+func degradedWindowTarget(targetWindowSize int, clientCount int, degraded bool) int {
+	if !degraded || targetWindowSize <= 0 {
+		return targetWindowSize
+	}
+	return min(targetWindowSize, max(1, clientCount))
+}
+
 type multiClientWindow struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -9823,6 +9860,9 @@ type multiClientWindow struct {
 	finishExpandRequestsForTest   <-chan struct{}
 	expireExpandPingForTest       <-chan struct{}
 	expireExpandPassForTest       <-chan struct{}
+	// backendDegradedForTest replaces the process-wide isBackendDegraded
+	// read in resize. Production leaves it unset.
+	backendDegradedForTest func() bool
 	// verdictRemovalTimes is the storm breaker's record of recent
 	// verdict-driven removals, pruned to RemovalBudgetWindow on each check.
 	// Guarded by stateLock. Only removals a verdict argued for are recorded
@@ -11213,6 +11253,11 @@ func (self *multiClientWindow) resize() {
 			fixedDestination,
 		)
 
+		// while the control API is unreachable, hold the window at its
+		// current size. See degradedWindowTarget.
+		degraded := self.backendDegraded()
+		targetWindowSize = degradedWindowTarget(targetWindowSize, len(clients), degraded)
+
 		// publish the shortfall for the enumerator (it asks for v6-capable
 		// candidates first while one is open) and, at capacity, make room:
 		// with WindowSizeMax == WindowSizeMin the raise above cannot grow the
@@ -11221,7 +11266,10 @@ func (self *multiClientWindow) resize() {
 		self.setIpv6Shortfall(ipv6Shortfall)
 		withinCeiling := windowSize.WindowSizeHardMax <= 0 ||
 			len(clients)+len(warnedClients) <= windowSize.WindowSizeHardMax
-		if 0 < ipv6Shortfall && targetWindowSize <= len(clients) &&
+		// a family swap is an expansion by another name (it asks the
+		// enumerator for a candidate and admits it), so it waits out a
+		// degraded backend the same way
+		if !degraded && 0 < ipv6Shortfall && targetWindowSize <= len(clients) &&
 			!self.ipv6Starved(startTime) && !self.hasFamilySwapVictim() {
 			victim, flowless := self.selectFamilySwapVictim(clients, weights)
 			// a strict window cannot admit past its ceiling while a drained
