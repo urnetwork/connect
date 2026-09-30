@@ -568,6 +568,10 @@ type PlatformTransportSettings struct {
 	// PinnedReconnectMaxTimeout caps a pinned transport's own exponential
 	// dial backoff. Non-positive resolves to five minutes.
 	PinnedReconnectMaxTimeout time.Duration
+	// ReconnectMaxTimeout caps a family-agnostic transport's exponential
+	// backoff after consecutive failed dials (see dialRetryAfter).
+	// Non-positive resolves to one minute.
+	ReconnectMaxTimeout time.Duration
 
 	// MinConnectDelay time.Duration
 	// MaxConnectDelay time.Duration
@@ -683,6 +687,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		ModeInitialDelay:          2 * time.Second,
 		ModePreferences:           DefaultTransportModePreferences(),
 		PinnedReconnectMaxTimeout: 5 * time.Minute,
+		ReconnectMaxTimeout:       60 * time.Second,
 		// MinConnectDelay:      0,
 		// MaxConnectDelay:      1 * time.Second,
 		ProtocolVersion: DefaultProtocolVersion,
@@ -997,6 +1002,9 @@ type PlatformTransport struct {
 	familyHold    atomic.Int32
 	held          *MonitorValue[bool]
 	pinnedBackoff *pinnedDialBackoff
+	// failBackoff paces a family-agnostic transport's retries after
+	// consecutive failed dials. See dialRetryAfter.
+	failBackoff *pinnedDialBackoff
 	// unresolvable is a pinned transport's mark that its most recent dial
 	// attempt failed because the hostname does not resolve; the group reads
 	// it to release the standby early. See noteDialError.
@@ -1418,6 +1426,11 @@ func NewPlatformTransportWithTargetMode(
 		pinnedReconnectMaxTimeout = 5 * time.Minute
 	}
 	transport.pinnedBackoff = newPinnedDialBackoff(settings.ReconnectTimeout, pinnedReconnectMaxTimeout)
+	reconnectMaxTimeout := settings.ReconnectMaxTimeout
+	if reconnectMaxTimeout <= 0 {
+		reconnectMaxTimeout = 60 * time.Second
+	}
+	transport.failBackoff = newDialFailureBackoff(settings.ReconnectTimeout, reconnectMaxTimeout)
 	if transport.ipFamily == 6 {
 		// the dns pump host publishes no AAAA record: the mode cannot work
 		// over a v6 pin, so it is not offered rather than left to fail
@@ -2166,7 +2179,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				self.noteKick()
 				hadConnection = true
 				continue
-			case <-reconnect.After():
+			case <-self.dialRetryAfter(reconnect):
 				continue
 			}
 		}
@@ -3053,7 +3066,7 @@ func (self *PlatformTransport) runH3(
 				self.noteKick()
 				hadConnection = true
 				continue
-			case <-reconnect.After():
+			case <-self.dialRetryAfter(reconnect):
 				continue
 			}
 		}

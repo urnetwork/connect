@@ -314,11 +314,16 @@ func (self PlatformTransportState) String() string {
 // connect or a network change. It neither reads nor advances a strategy's
 // shared connect staircase, so a family that never connects cannot delay any
 // other transport's dials (A5).
+//
+// A family-agnostic transport uses the same shape after repeated failures
+// (newDialFailureBackoff): see dialRetryAfter.
 type pinnedDialBackoff struct {
 	stateLock sync.Mutex
 	base      time.Duration
 	max       time.Duration
 	failures  int
+	// grace is how many consecutive failures add no delay of their own.
+	grace int
 }
 
 func newPinnedDialBackoff(base time.Duration, max time.Duration) *pinnedDialBackoff {
@@ -331,17 +336,28 @@ func newPinnedDialBackoff(base time.Duration, max time.Duration) *pinnedDialBack
 	return &pinnedDialBackoff{base: base, max: max}
 }
 
-// delay is the wait before the next dial: zero after a success or a reset,
-// otherwise uniform in [d/2, d) where d doubles per consecutive failure up to
-// the cap.
+// newDialFailureBackoff is a family-agnostic transport's backoff after
+// consecutive failed dials. The first failure is free: its retry keeps the
+// transport's ordinary reconnect timing, so a one-off failure recovers exactly
+// as before, and the backoff starts from the second consecutive failure.
+func newDialFailureBackoff(base time.Duration, max time.Duration) *pinnedDialBackoff {
+	backoff := newPinnedDialBackoff(base, max)
+	backoff.grace = 1
+	return backoff
+}
+
+// delay is the wait before the next dial: zero after a success or a reset (or
+// within the grace), otherwise uniform in [d/2, d) where d doubles per
+// consecutive failure past the grace up to the cap.
 func (self *pinnedDialBackoff) delay() time.Duration {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if self.failures == 0 {
+	failures := self.failures - self.grace
+	if failures <= 0 {
 		return 0
 	}
 	d := self.base
-	for i := 1; i < self.failures && d < self.max; i += 1 {
+	for i := 1; i < failures && d < self.max; i += 1 {
 		d *= 2
 	}
 	d = min(d, self.max)
@@ -525,7 +541,31 @@ func (self *PlatformTransport) noteDialFailure() {
 		self.pinnedBackoff.fail()
 		return
 	}
+	self.failBackoff.fail()
 	noteBackendFailure()
+}
+
+// dialRetryAfter is the wait after a failed dial before the loop tries again.
+//
+// A pinned transport paces itself before each dial (nextDialTime), so it keeps
+// the reconnect timer. A family-agnostic transport used to have only the
+// reconnect timer, which is measured from the START of the attempt: once a
+// dial has taken longer than ReconnectTimeout to fail (an auth timeout, a
+// parallel eval across every dialer) it fires at once, and the only pacing
+// left is the strategy's shared 100ms-1s staircase. During a platform outage
+// every transport then retried a full dial roughly every second for as long
+// as the outage lasted -- the reconnect storm in
+// https://github.com/urnetwork/connect/issues/175. After the first failure
+// (which keeps the old timing) consecutive failures now back off
+// exponentially from ReconnectTimeout to ReconnectMaxTimeout. A successful
+// dial or a network change resets it.
+func (self *PlatformTransport) dialRetryAfter(reconnect *Reconnect) <-chan time.Time {
+	if !self.pinned() {
+		if d := self.failBackoff.delay(); 0 < d {
+			return time.After(d)
+		}
+	}
+	return reconnect.After()
 }
 
 // noteDialSuccess clears the transport's own backoff and, for a
@@ -536,6 +576,7 @@ func (self *PlatformTransport) noteDialSuccess() {
 		self.setUnresolvable(false)
 		return
 	}
+	self.failBackoff.reset()
 	noteBackendSuccess()
 }
 
@@ -572,11 +613,13 @@ func (self *PlatformTransport) unresolvableHost() bool {
 	return self.unresolvable.Load()
 }
 
-// noteKick resets a pinned transport's backoff: a network change is a fresh
-// start for the family, not another failure.
+// noteKick resets the transport's backoff: a network change is a fresh start
+// (for the family, when pinned), not another failure.
 func (self *PlatformTransport) noteKick() {
 	if self.pinned() {
 		self.pinnedBackoff.reset()
+	} else {
+		self.failBackoff.reset()
 	}
 }
 
