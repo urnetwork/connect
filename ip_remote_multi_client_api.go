@@ -90,6 +90,8 @@ type ApiMultiClientGeneratorSettings struct {
 	// ClientCredentials is captured at construction, not read from mutable
 	// settings during a mint or retirement. Nil preserves the public API path.
 	ClientCredentials NetworkClientCredentials
+	// Captured per generator; nil retains the ordinary HTTP control path.
+	ClientControl NetworkClientControl
 	// MigrateConnectTimeout bounds the temporary second platform transport.
 	// If it cannot establish a route in this interval, it is closed and the
 	// old transport remains until the server's drain fallback evicts it.
@@ -240,6 +242,7 @@ type ApiMultiClientGenerator struct {
 	clientSettingsGenerator func() *ClientSettings
 	settings                *ApiMultiClientGeneratorSettings
 	clientCredentials       NetworkClientCredentials
+	clientControl           NetworkClientControl
 	controlTelemetryProbe   bool
 	// Window carriers created without an explicit caller budget all belong to
 	// this generator. Separate generators never contend through a package root.
@@ -356,6 +359,7 @@ func NewApiMultiClientGenerator(
 		clientSettingsGenerator:        clientSettingsGenerator,
 		settings:                       settings,
 		clientCredentials:              settings.ClientCredentials,
+		clientControl:                  settings.ClientControl,
 		controlTelemetryProbe:          settings.ControlTelemetryProbe,
 		defaultPlatformTransportBudget: DefaultPlatformTransportBudget(),
 		platformTransportMode:          platformTransportMode,
