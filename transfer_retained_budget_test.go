@@ -247,6 +247,13 @@ func TestRetainedSendResidualWaitsAndSiblingReleaseWakes(t *testing.T) {
 }
 
 func TestRetainedSendFullBudgetStillPermitsNoAckControl(t *testing.T) {
+	// Global pool roots need an exclusive process; the protocol clock owns
+	// only this fixture, not asynchronous workers left by other tests.
+	if messagePoolSnapshotInFreshProcess(t) {
+		return
+	}
+	// Keep the process-global statistics worker outside every synctest bubble.
+	MessagePoolReturn(MessagePoolGet(1))
 	for _, warm := range []bool{false, true} {
 		t.Run(fmt.Sprintf("warm_%t", warm), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {

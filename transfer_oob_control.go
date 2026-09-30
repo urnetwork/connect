@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"encoding/base64"
 
@@ -35,10 +36,19 @@ type OutOfBandControlWithCtx interface {
 	SendControlWithCtx(ctx context.Context, frames []*protocol.Frame, callback OobResultFunction)
 }
 
+// NetworkClientControl is an explicitly supplied in-process control boundary.
+// Implementations authenticate the current derived JWT, preserve controller
+// accounting, and return only after processing the complete request. They must
+// honor ctx cancellation; the caller still joins their terminal return.
+type NetworkClientControl interface {
+	ConnectControl(context.Context, string, *ConnectControlArgs) (*ConnectControlResult, error)
+}
+
 type ApiOutOfBandControl struct {
-	api      *BringYourApi
-	ownsApi  bool
-	requests *lifecycleAdmission
+	localControl NetworkClientControl
+	api          *BringYourApi
+	ownsApi      bool
+	requests     *lifecycleAdmission
 	// Immutable, self-reported telemetry only; never an authorization claim.
 	probeClaimed bool
 
@@ -65,6 +75,17 @@ func newApiOutOfBandControl(ctx context.Context, clientStrategy *ClientStrategy,
 		requests:     newLifecycleAdmission(),
 		probeClaimed: probeClaimed,
 	}
+}
+
+// Local control keeps the actual API OOB owner and its processed-result,
+// frame-ownership and close/join rules. It does not replace the data transport.
+func NewApiOutOfBandControlWithLocalControl(ctx context.Context, strategy *ClientStrategy, byJwt, apiUrl string, control NetworkClientControl) *ApiOutOfBandControl {
+	if control == nil {
+		panic("local control authority is required")
+	}
+	owner := NewApiOutOfBandControl(ctx, strategy, byJwt, apiUrl)
+	owner.localControl = control
+	return owner
 }
 
 func NewApiOutOfBandControlWithApi(api *BringYourApi) *ApiOutOfBandControl {
@@ -99,7 +120,25 @@ func (self *ApiOutOfBandControl) SendControlWithCtx(
 	callback OobResultFunction,
 ) {
 	connectControl := func(connectControlArgs *ConnectControlArgs, apiCallback ConnectControlCallback) {
-		self.api.connectControlWithCtx(ctx, connectControlArgs, apiCallback, self.probeClaimed)
+		if self.localControl == nil {
+			self.api.connectControlWithCtx(ctx, connectControlArgs, apiCallback, self.probeClaimed)
+			return
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, self.api.clientStrategy.settings.RequestTimeout)
+		go func() {
+			defer cancel()
+			var result *ConnectControlResult
+			var err error
+			HandleError(func() {
+				if err = requestCtx.Err(); err == nil {
+					result, err = self.localControl.ConnectControl(requestCtx, self.api.ByJwt(), connectControlArgs)
+				}
+			}, func(recovered error) { err = fmt.Errorf("local control failed: %w", recovered) })
+			if requestCtx.Err() != nil {
+				result, err = nil, requestCtx.Err()
+			}
+			apiCallback.Result(result, err)
+		}()
 	}
 	self.sendControl(connectControl, frames, callback)
 }

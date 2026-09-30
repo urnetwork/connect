@@ -321,6 +321,9 @@ func (self *tcpReorderTestHarness) close() {
 		self.upstreamSocket.Close()
 		select {
 		case <-self.runDone:
+			// Run joins every callback producer before its completion is published.
+			// Only then can acknowledgement readers observe their terminal close.
+			close(self.acks)
 		case <-time.After(2 * time.Second):
 			self.t.Errorf("TCP reorder harness did not stop")
 		}

@@ -90,6 +90,8 @@ type ApiMultiClientGeneratorSettings struct {
 	// ClientCredentials is captured at construction, not read from mutable
 	// settings during a mint or retirement. Nil preserves the public API path.
 	ClientCredentials NetworkClientCredentials
+	// Captured per generator; nil retains the ordinary HTTP control path.
+	ClientControl NetworkClientControl
 	// MigrateConnectTimeout bounds the temporary second platform transport.
 	// If it cannot establish a route in this interval, it is closed and the
 	// old transport remains until the server's drain fallback evicts it.
@@ -240,6 +242,7 @@ type ApiMultiClientGenerator struct {
 	clientSettingsGenerator func() *ClientSettings
 	settings                *ApiMultiClientGeneratorSettings
 	clientCredentials       NetworkClientCredentials
+	clientControl           NetworkClientControl
 	controlTelemetryProbe   bool
 	// Window carriers created without an explicit caller budget all belong to
 	// this generator. Separate generators never contend through a package root.
@@ -356,6 +359,7 @@ func NewApiMultiClientGenerator(
 		clientSettingsGenerator:        clientSettingsGenerator,
 		settings:                       settings,
 		clientCredentials:              settings.ClientCredentials,
+		clientControl:                  settings.ClientControl,
 		controlTelemetryProbe:          settings.ControlTelemetryProbe,
 		defaultPlatformTransportBudget: DefaultPlatformTransportBudget(),
 		platformTransportMode:          platformTransportMode,
@@ -869,6 +873,7 @@ func (self *ApiMultiClientGenerator) RemoveClientArgs(args *MultiClientGenerator
 func (self *ApiMultiClientGenerator) removeClientArgsAndWait(
 	ctx context.Context,
 	args *MultiClientGeneratorClientArgs,
+	afterRetirement ...func(context.Context) error,
 ) error {
 	// Preserve restartable identities when the generator's parent is already
 	// closing. With no store, still make the same best-effort removal attempt as
@@ -912,12 +917,31 @@ func (self *ApiMultiClientGenerator) removeClientArgsAndWait(
 	if result == nil || result.Error != nil {
 		return errors.New("client retirement response absent or rejected")
 	}
+	// Only a successful authority response permits resident cleanup. The
+	// identity-state skips above preserve both SQL and Redis ownership.
+	for _, after := range afterRetirement {
+		if after != nil {
+			if err := after(ctx); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
 func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *MultiClientGeneratorClientArgs) {
+	// The asynchronous owner must not observe caller mutations after capture.
+	ownedArgs := *args
+	if args.ClientAuth != nil {
+		auth := *args.ClientAuth
+		ownedArgs.ClientAuth = &auth
+	}
+	args = &ownedArgs
 	retirements := self.retirementLifecycle()
 	retirementAdmitted := retirements.start()
+	// Capture while the generator still owns its carrier; the immutable token
+	// is only committed after every join and a successful SQL retirement.
+	residentRetirement, captureDone := self.prepareResidentRetirement(args)
 	var transport apiWindowPlatformTransport
 	self.transportLock.Lock()
 	if state := self.transports[client]; state != nil {
@@ -952,6 +976,11 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 		if retirementAdmitted {
 			defer retirements.finish()
 		}
+		// A Redis driver may outlive its context. Even a discarded late capture
+		// remains this retirement owner's responsibility until it actually exits.
+		if captureDone != nil {
+			defer func() { <-captureDone }()
+		}
 		<-client.Done()
 		// The generator, not Client, owns this external carrier. Route removal
 		// and Close only cancel it; its socket/receive workers may still retain
@@ -982,7 +1011,7 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 		retireCtx, retireCancel := context.WithTimeout(context.Background(), retireTimeout)
 		defer retireCancel()
 
-		self.recordRetirementError("identity", self.removeClientArgsAndWait(retireCtx, args))
+		self.recordRetirementError("identity", self.removeClientArgsAndWait(retireCtx, args, residentRetirement))
 	})
 }
 
