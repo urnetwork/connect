@@ -382,14 +382,20 @@ func newExtenderFixtureWithSetup(
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The fixture owns every prebound socket, including sockets a failed
+	// construction or rejected carrier bind never transfers to the server.
+	// Registered before server cleanup so that serving is joined first.
+	t.Cleanup(func() { tcpListener.Close() })
 	quicPacketConn, err := net.ListenPacket("udp", net.JoinHostPort(loopbackIp, "0"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { quicPacketConn.Close() })
 	dnsPacketConn, err := net.ListenPacket("udp", net.JoinHostPort(loopbackIp, "0"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { dnsPacketConn.Close() })
 	fixture := &extenderFixture{
 		t:                 t,
 		destination:       dest,
@@ -476,16 +482,19 @@ func newExtenderFixtureWithSetup(
 	}
 	fixture.settings = settings
 
+	// TCP and UDP can receive the same numeric ephemeral port. Preserve both
+	// modes instead of letting a later map-literal entry erase the TCP bind.
+	ports := map[int][]connect.ExtenderConnectMode{}
+	ports[fixture.tcpPort] = append(ports[fixture.tcpPort], connect.ExtenderConnectModeTcpTls)
+	ports[fixture.quicPort] = append(ports[fixture.quicPort], connect.ExtenderConnectModeQuic)
+	ports[fixture.dnsPort] = append(ports[fixture.dnsPort], connect.ExtenderConnectModeDns)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture.server = NewExtenderServer(
 		ctx,
 		allowedSecrets,
 		append([]string{"dest.example", "dest4.example", "dest6.example"}, extraAllowedHosts...),
-		map[int][]connect.ExtenderConnectMode{
-			fixture.tcpPort:  {connect.ExtenderConnectModeTcpTls},
-			fixture.quicPort: {connect.ExtenderConnectModeQuic},
-			fixture.dnsPort:  {connect.ExtenderConnectModeDns},
-		},
+		ports,
 		&net.Dialer{},
 		settings,
 	)

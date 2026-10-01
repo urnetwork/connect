@@ -27,6 +27,7 @@ func TestPrivateLocalOobDeadlineAndTerminalJoin(t *testing.T) {
 		defer api.Close()
 		strategy.settings.RequestTimeout = 3 * time.Second
 		entered, release := make(chan struct{}), make(chan struct{})
+		deadlineObserved := make(chan error, 1)
 		calls := atomic.Int32{}
 		control := NewApiOutOfBandControlWithLocalControl(t.Context(), strategy, "old", "https://local.invalid", privateLocalControl(func(ctx context.Context, jwt string, args *ConnectControlArgs) (*ConnectControlResult, error) {
 			calls.Add(1)
@@ -39,14 +40,26 @@ func TestPrivateLocalOobDeadlineAndTerminalJoin(t *testing.T) {
 			}
 			close(entered)
 			<-ctx.Done()
+			deadlineObserved <- ctx.Err()
 			<-release
 			return &ConnectControlResult{Pack: ""}, nil
 		}))
 		control.SetByJwt("current")
 		result := make(chan error, 1)
+		started := time.Now()
 		control.SendControl(nil, func(_ []*protocol.Frame, e error) { result <- e })
 		<-entered
-		time.Sleep(3 * time.Second)
+		// Sleeping exactly to the deadline races the timeout callback against
+		// Close's parent cancellation. Wait for the executor to observe the
+		// actual deadline first; fake time advances while this receive blocks.
+		if e := <-deadlineObserved; !errors.Is(e, context.DeadlineExceeded) {
+			close(release)
+			t.Fatalf("executor did not observe its deadline: %v", e)
+		}
+		if elapsed := time.Since(started); elapsed != 3*time.Second {
+			close(release)
+			t.Fatalf("deadline elapsed %s, want exactly 3s", elapsed)
+		}
 		joined := make(chan error, 1)
 		go func() { joined <- control.CloseAndWait(context.Background()) }()
 		synctest.Wait()

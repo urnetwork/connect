@@ -395,6 +395,41 @@ func TestMultiRouteWriterPublishesH1OnlyPolicy(t *testing.T) {
 	}
 }
 
+// An eventual P2P workload starts on a real H1 platform route. Existing H1
+// batching/pacing policy must follow the currently published carrier, not the
+// eventual workload label, and must stop applying on mixed or P2P routes.
+func TestMultiRouteWriterPrePromotionH1VersusP2pPolicy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	selector := NewMultiRouteSelector(ctx, "pre-promotion-h1", nil, TransferPath{}, false)
+	defer selector.Close()
+	h1, p2p := NewSendGatewayTransportWithType(TransportTypeH1), NewSendGatewayTransportWithType(TransportTypeP2p)
+	h1Route, p2pRoute := make(Route, 1), make(Route, 1)
+	selector.updateTransport(h1, []Route{h1Route})
+	initial := selector.transferFlightPolicy()
+	if !initial.h1Only {
+		t.Fatal("pre-promotion platform H1 lost its actual carrier policy")
+	}
+	selector.updateTransport(p2p, []Route{p2pRoute})
+	mixed := selector.transferFlightPolicy()
+	if mixed.h1Only || mixed.generation == initial.generation {
+		t.Fatal("mixed P2P publication retained the old H1-only policy generation")
+	}
+	selector.updateTransport(h1, nil)
+	p2pOnly := selector.transferFlightPolicy()
+	if p2pOnly.h1Only || p2pOnly.generation == mixed.generation {
+		t.Fatal("P2P-only publication retained H1-only policy")
+	}
+	selector.updateTransport(p2p, nil)
+	if selector.transferFlightPolicy().h1Only {
+		t.Fatal("empty selector retained H1-only policy")
+	}
+	selector.updateTransport(h1, []Route{h1Route})
+	if restored := selector.transferFlightPolicy(); !restored.h1Only || restored.generation == initial.generation {
+		t.Fatal("fresh H1-only generation did not publish its actual carrier policy")
+	}
+}
+
 // The route-wide policy still tells Transfer that a hybrid carrier exists,
 // while the exact accepted message disposition distinguishes its reliable and
 // unreliable lanes. The public transport-only result remains unchanged.

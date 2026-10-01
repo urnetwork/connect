@@ -3,9 +3,81 @@ package connect
 import (
 	"context"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 )
+
+// A new WireGuard stack can reuse its peer address while its predecessor's
+// UDP flows are still retained by the hosted multi-client. Expiring an old
+// flow must quote its old port, not a current socket's port. Such a quotation
+// is expected stale-flow evidence, not evidence that NAT changed a port.
+func TestFlowReaperUDPPreviousPeerGenerationKeepsOriginalPort(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultMultiClientSettings()
+	settings.DestinationAffinity = false
+	if settings.SequenceIdleTimeout != 120*time.Second || !settings.UdpTeardownSignal {
+		t.Fatal("this control must exercise the actual two-minute UDP teardown defaults")
+	}
+	parent := flowReaperTestParent(ctx, settings)
+	parent.reliabilityMetrics = newReliabilityMetrics()
+	oldPath := flowReaperTestPath(4, IpProtocolUdp, 54321)
+	oldPath.SourceIp = net.IPv4(169, 254, 7, 9).To4()
+	oldPath.DestinationIp = net.IPv4(1, 1, 1, 1).To4()
+	oldPath.DestinationPort = 53
+	newPath := *oldPath
+	newPath.SourcePort = 54322
+	old, _, _ := parent.sendUpdate(oldPath, flowPin{})
+	fresh, _, _ := parent.sendUpdate(&newPath, flowPin{})
+	if old == nil || fresh == nil || old == fresh {
+		t.Fatal("distinct source ports did not acquire distinct owned flow generations")
+	}
+	defer old.Close()
+	defer fresh.Close()
+	// Advance only the explicit reaper clock; never wait for a wall timer.
+	started := time.Unix(1234567890, 0)
+	old.activityTime = started
+	fresh.activityTime = started.Add(119 * time.Second)
+	deadline := started.Add(settings.SequenceIdleTimeout)
+	retired, delay, live := parent.detachIdleFlows(deadline.Add(-time.Nanosecond))
+	if len(retired) != 0 || !live || delay != time.Nanosecond {
+		t.Fatal("old UDP flow expired before its exact default deadline")
+	}
+	retired, delay, live = parent.detachIdleFlows(deadline)
+	if len(retired) != 1 || retired[0].update != old || !retired[0].shouldSignal || !live || delay != 119*time.Second {
+		t.Fatal("deadline did not retire only the previous peer generation")
+	}
+	parent.finishRetiredFlows(retired)
+	select {
+	case returned := <-parent.removalReceiveQueue:
+		packet := returned.Packet
+		if len(packet) != 56 || packet[9] != 1 || packet[20] != 3 || packet[21] != 3 || returned.IpPath.SourcePort != 54321 {
+			t.Fatal("old flow did not generate its own 56-byte ICMP3/3 teardown")
+		}
+		peer := netip.MustParseAddr("10.55.12.34")
+		if !RewriteIpv4Destination(packet, peer) {
+			t.Fatal("restore the same peer address after reconnect")
+		}
+		assertNatChecksums(t, packet, "previous generation envelope")
+		assertNatChecksums(t, packet[28:], "previous generation quotation")
+		quote, ok := ipParseIcmpEmbeddedPath(packet[28:])
+		if !ok || !quote.SourceIp.Equal(net.IP(peer.AsSlice())) || quote.SourcePort != 54321 ||
+			!quote.DestinationIp.Equal(newPath.DestinationIp) || quote.DestinationPort != newPath.DestinationPort {
+			t.Fatal("NAT changed a quoted port or another field of the old flow")
+		}
+	default:
+		t.Fatal("old flow expiration did not enqueue its teardown")
+	}
+	if fresh.IsDone() || parent.ip4PathUpdates[newPath.ToIp4Path()] != fresh || parent.ip4PathUpdates[oldPath.ToIp4Path()] != nil {
+		t.Fatal("old teardown disturbed the fresh source-port generation")
+	}
+	retired, _, _ = parent.detachIdleFlows(deadline)
+	parent.finishRetiredFlows(retired)
+	if len(retired) != 0 || len(parent.removalReceiveQueue) != 0 {
+		t.Fatal("one old generation generated more than one idle teardown")
+	}
+}
 
 func flowReaperTestParent(ctx context.Context, settings *MultiClientSettings) *RemoteUserNatMultiClient {
 	return &RemoteUserNatMultiClient{
