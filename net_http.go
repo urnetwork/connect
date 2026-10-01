@@ -65,10 +65,11 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 		HelloRetryTimeout:        5 * time.Second,
 		MaxHttpResponseBodyBytes: DefaultMaxHttpResponseBodyBytes,
 
-		GetRetryCount:       1,
-		GetRetryStatusCodes: []int{http.StatusBadGateway, http.StatusServiceUnavailable},
-		GetRetryMinTimeout:  100 * time.Millisecond,
-		GetRetryMaxTimeout:  1000 * time.Millisecond,
+		GetRetryCount:               1,
+		GetRetryStatusCodes:         []int{http.StatusBadGateway, http.StatusServiceUnavailable},
+		GetRetryMinTimeout:          100 * time.Millisecond,
+		GetRetryMaxTimeout:          1000 * time.Millisecond,
+		GetPreferredRouteHedgeDelay: time.Second,
 
 		MinNextConnectDelay: 100 * time.Millisecond,
 		MaxNextConnectDelay: 1000 * time.Millisecond,
@@ -216,6 +217,15 @@ type ClientStrategySettings struct {
 	// [GetRetryMinTimeout, GetRetryMaxTimeout)
 	GetRetryMinTimeout time.Duration
 	GetRetryMaxTimeout time.Duration
+
+	// A remembered GET route can become stale after a mobile network change.
+	// If it has not written the request by this delay, allow other known
+	// routes to race it within ParallelBlockSize. The preferred attempt keeps
+	// its original overall deadline: a slow working TLS connection remains
+	// usable. Once written, the ordinary response deadline is unchanged.
+	// GETs alone are idempotent; POST and WebSocket ordering are unaffected.
+	// <= 0 disables this early race and retains the ordinary preferred path.
+	GetPreferredRouteHedgeDelay time.Duration
 
 	MinNextConnectDelay time.Duration
 	MaxNextConnectDelay time.Duration
@@ -1008,7 +1018,18 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 	eval func(context.Context, *clientDialer) *evalResult,
 	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
 ) *evalResult {
-	// in this order:
+	return self.parallelEvalWithRouteHedge(ctx, webSocketOnly, eval, attemptContext, 0)
+}
+
+func (self *ClientStrategy) parallelEvalWithRouteHedge(
+	ctx context.Context,
+	webSocketOnly bool,
+	eval func(context.Context, *clientDialer) *evalResult,
+	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
+	preferredHedgeDelay time.Duration,
+) *evalResult {
+	// Ordinary ordering (GET can retain the first preferred attempt while
+	// allowing known alternatives to race after its establishment head start):
 	// 1. try all dialers that previously worked sequentially
 	// 2. try dialers that previously failed in parallel blocks
 	// 3. expand the extenders and try new extenders in parallel blocks
@@ -1047,7 +1068,7 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 
 	out := make(chan *evalResult)
 
-	run := func(dialer *clientDialer) {
+	runWithContext := func(evalCtx context.Context, dialer *clientDialer) {
 		success := false
 		defer func() {
 			if !success {
@@ -1057,7 +1078,7 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 				}
 			}
 		}()
-		result := eval(handleCtx, dialer)
+		result := eval(evalCtx, dialer)
 		if result == nil {
 			return
 		}
@@ -1070,6 +1091,7 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 			result.discardAfterContextCancellation()
 		}
 	}
+	run := func(dialer *clientDialer) { runWithContext(handleCtx, dialer) }
 
 	// keep trying as long as there is time left
 	for {
@@ -1107,6 +1129,69 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 			slices.SortStableFunc(serialDialers, func(a *clientDialer, b *clientDialer) int {
 				return a.priority - b.priority
 			})
+			if preferredHedgeDelay > 0 && self.settings.ParallelBlockSize > 1 &&
+				len(serialDialers) > 0 && len(serialDialers)+len(parallelDialers) > 1 {
+				// Retain one preferred attempt while exposing alternatives after
+				// a bounded head start. Canceling it at the head-start boundary
+				// would misclassify a slow but valid mobile handshake as failed.
+				headStartDelay := preferredHedgeDelay
+				if deadline, ok := handleCtx.Deadline(); ok {
+					// A caller with less than the configured head start still
+					// retains the ordinary preferred path's fallback share.
+					headStartDelay = min(headStartDelay, max(time.Duration(0),
+						time.Until(deadline)/time.Duration(len(serialDialers)+1)))
+				}
+				preferred := serialDialers[0]
+				parallelDialers = append(serialDialers[1:], parallelDialers...)
+				serialDialers = nil
+				written := make(chan struct{})
+				var writtenOnce sync.Once
+				preferredCtx := httptrace.WithClientTrace(handleCtx, &httptrace.ClientTrace{
+					WroteRequest: func(info httptrace.WroteRequestInfo) {
+						if info.Err == nil {
+							writtenOnce.Do(func() { close(written) })
+						}
+					},
+				})
+				startWorker(func() { runWithContext(preferredCtx, preferred) })
+				p++
+				timer := time.NewTimer(headStartDelay)
+				headStart := timer.C
+				writtenSignal := (<-chan struct{})(written)
+				waiting := true
+				for waiting {
+					select {
+					case <-handleCtx.Done():
+						timer.Stop()
+						return nil
+					case <-writtenSignal:
+						// A valid slow response is not a stale establishment.
+						timer.Stop()
+						headStart, writtenSignal = nil, nil
+					case <-headStart:
+						// The write and timer may become ready together. A write
+						// already reported by the transport keeps its response
+						// time without starting duplicate GETs.
+						select {
+						case <-written:
+							headStart, writtenSignal = nil, nil
+						default:
+							waiting = false
+						}
+					case result := <-out:
+						p--
+						if result != nil {
+							if result.Selected().err == nil || result.terminal {
+								timer.Stop()
+								return result
+							}
+							result.releaseAfterUse(handleCtx)
+						}
+						waiting = false
+					}
+				}
+				timer.Stop()
+			}
 			for i, dialer := range serialDialers {
 				select {
 				case <-handleCtx.Done():
@@ -1145,7 +1230,7 @@ func (self *ClientStrategy) parallelEvalWithAttemptContext(
 
 			// note parallel dialers is in the original weighted order
 			// WeightedShuffle(parallelDialers, dialerWeights)
-			n := min(len(parallelDialers), self.settings.ParallelBlockSize)
+			n := min(len(parallelDialers), self.settings.ParallelBlockSize-p)
 			p += n
 			for _, dialer := range parallelDialers[0:n] {
 				startWorker(func() {
@@ -1460,7 +1545,11 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 		return causes.track(newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes))
 	}
 
-	result := self.parallelEvalWithAttemptContext(request.Context(), false, eval, preferredHttpAttemptContext)
+	var preferredHedgeDelay time.Duration
+	if request.Method == http.MethodGet {
+		preferredHedgeDelay = self.settings.GetPreferredRouteHedgeDelay
+	}
+	result := self.parallelEvalWithRouteHedge(request.Context(), false, eval, preferredHttpAttemptContext, preferredHedgeDelay)
 	if result == nil {
 		return nil, causes.exhausted(request.Context(), self.ctx)
 	}
