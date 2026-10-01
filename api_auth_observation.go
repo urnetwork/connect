@@ -142,8 +142,8 @@ func (self *authPostProgress) responseHeaders(response *http.Response, err error
 	}
 }
 
-// serialEval's exhausted internal deadline is otherwise flattened to the
-// legacy "Timeout." error. Record the known cause without changing that API.
+// Preserve the operation's terminal verdict even when retained earlier attempt
+// failures contain another deadline or cancellation cause.
 func observeAuthStrategyEnd(ctx, strategyCtx context.Context) {
 	observation, _ := ctx.Value(authRequestContextKey{}).(*authRequestObservation)
 	if observation == nil {

@@ -16,7 +16,7 @@ import (
 // TLS, DNS and the connection pool.
 func (self *ClientStrategy) httpPlatformDirect(request *http.Request) (*httpResult, bool) {
 	client := &http.Client{Transport: platformDirectHttpTransport()}
-	response, err := client.Do(request)
+	response, err := httpClientForRequest(client, request).Do(request)
 	if self.log.V(2).Enabled() {
 		if err != nil {
 			self.log.Infof("[net]http fetch %s %s = %s\n", request.Method, request.URL, err)
@@ -49,7 +49,7 @@ func (self *browserHttpTransport) RoundTrip(request *http.Request) (*http.Respon
 	if err := request.Context().Err(); err != nil {
 		return nil, err
 	}
-	return self.Transport.RoundTrip(request)
+	return self.Transport.RoundTrip(httpBrowserRequestForRedirectPolicy(request))
 }
 
 // The one transport the browser can drive: no dialers, so net/http uses fetch.

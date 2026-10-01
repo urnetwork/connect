@@ -1430,6 +1430,7 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 		defer request.Body.Close()
 	}
 	self.applyExtraHeaders(request.Header)
+	causes := newHttpRequestCauses(request.Context())
 
 	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
 	if result, ok := self.httpPlatformDirect(request); ok {
@@ -1442,10 +1443,10 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
 		if err != nil {
-			return &evalResult{err: err}
+			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(attemptRequest)
+		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, err)
@@ -1456,12 +1457,12 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 
 		dialer.Update(handleCtx, err)
 
-		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
+		return causes.track(newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes))
 	}
 
 	result := self.parallelEvalWithAttemptContext(request.Context(), false, eval, preferredHttpAttemptContext)
 	if result == nil {
-		return nil, fmt.Errorf("Timeout.")
+		return nil, causes.exhausted(request.Context(), self.ctx)
 	}
 	return materializeHttpResult(result)
 }
@@ -1487,6 +1488,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 	self.applyExtraHeaders(request.Header)
 	self.applyExtraHeaders(helloRequest.Header)
+	causes := newHttpRequestCauses(request.Context())
 
 	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
 	if result, ok := self.httpPlatformDirect(request); ok {
@@ -1500,10 +1502,10 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		handleCtx, authProgress := traceAuthPostAttempt(handleCtx)
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
 		if err != nil {
-			return &evalResult{err: err}
+			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(attemptRequest)
+		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
 		authProgress.responseHeaders(response, err)
 		if self.log.V(2).Enabled() {
 			if err != nil {
@@ -1515,15 +1517,15 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 		dialer.Update(handleCtx, err)
 
-		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
+		return causes.track(newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes))
 	}
 	helloEval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, helloRequest)
 		if err != nil {
-			return &evalResult{err: err}
+			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(attemptRequest)
+		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, err)
@@ -1534,13 +1536,13 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 		dialer.Update(handleCtx, err)
 
-		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
+		return causes.track(newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes))
 	}
 
 	result := self.serialEvalWithAttemptContext(request.Context(), eval, helloEval, preferredHttpAttemptContext)
 	if result == nil {
 		observeAuthStrategyEnd(request.Context(), self.ctx)
-		return nil, fmt.Errorf("Timeout.")
+		return nil, causes.exhausted(request.Context(), self.ctx)
 	}
 	return materializeHttpResult(result)
 }
@@ -1574,6 +1576,7 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 		requestHeader = merged
 	}
 
+	causes := newHttpRequestCauses(ctx)
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		wsDialer := dialer.WsDialer(self.settings)
 		wsConn, response, err := wsDialer.DialContext(handleCtx, url, requestHeader)
@@ -1586,11 +1589,11 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 		}
 
 		dialer.Update(handleCtx, err)
-		// a pinned platform transport classifies the typed error of each
-		// attempt here; a failed parallelEval flattens it to "Timeout."
+		// A pinned platform transport observes each typed attempt before the
+		// operation owner snapshots the retained exhaustion causes.
 		observeDialAttempt(handleCtx, err)
 
-		return &evalResult{
+		return causes.track(&evalResult{
 			wsConn: wsConn,
 			err:    err,
 			httpResult: httpResult{
@@ -1599,12 +1602,12 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 				// header: response.Header.Clone(),
 				response: response,
 			},
-		}
+		})
 	}
 
 	result := self.parallelEval(ctx, true, eval)
 	if result == nil {
-		return nil, nil, nil, fmt.Errorf("Timeout.")
+		return nil, nil, nil, causes.exhausted(ctx, self.ctx)
 	}
 	return result.wsConn, result.response, result.dialer.Info(), result.err
 }
@@ -1620,6 +1623,7 @@ func (self *ClientStrategy) H1DialContextWithDialer(ctx context.Context, address
 		}
 		self.applyExtraHeaders(requestHeader)
 	}
+	causes := newHttpRequestCauses(ctx)
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		conn, err := dialH1MessagesWithinDeadline(handleCtx, address, requestHeader, dialer.WsDialer(self.settings), H1FramerProtocol, maximum, enabled, stats)
 		var upgradeErr *HTTPUpgradeError
@@ -1630,11 +1634,11 @@ func (self *ClientStrategy) H1DialContextWithDialer(ctx context.Context, address
 			dialer.Update(handleCtx, err)
 			observeDialAttempt(handleCtx, err)
 		}
-		return &evalResult{h1Conn: conn, err: err, terminal: terminal}
+		return causes.track(&evalResult{h1Conn: conn, err: err, terminal: terminal})
 	}
 	result := self.parallelEval(ctx, true, eval)
 	if result == nil {
-		return nil, nil, fmt.Errorf("Timeout.")
+		return nil, nil, causes.exhausted(ctx, self.ctx)
 	}
 	return result.h1Conn, result.dialer.Info(), result.err
 }
