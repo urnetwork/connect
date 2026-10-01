@@ -120,8 +120,13 @@ func (self *UdpSequence) awaitReturnRead(socket net.Conn, readBuffer []byte) (*u
 	readBytes := len(readBuffer)
 	if raw, ok := socketRawConn(socket); ok {
 		var readErr error
+		awaitReadiness := udpSocketPeekRequiresWait
 		if err := raw.Read(func(fd uintptr) bool {
-			readBytes, _, readErr = syscall.Recvfrom(SocketHandle(fd), readBuffer, syscall.MSG_PEEK)
+			if awaitReadiness {
+				awaitReadiness = false
+				return false
+			}
+			readBytes, readErr = peekUdpSocket(SocketHandle(fd), readBuffer)
 			return !errors.Is(readErr, syscall.EAGAIN) && !errors.Is(readErr, syscall.EWOULDBLOCK)
 		}); err != nil {
 			return nil, err

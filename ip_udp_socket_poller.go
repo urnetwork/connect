@@ -425,7 +425,7 @@ func drainReadyUdpSocketWithLimit(fd int, sequence *UdpSequence, buffer []byte, 
 			// datagram kernel-owned. Charge its actual bounded read length,
 			// not a maximum-sized datagram that can strand small control replies
 			// during an otherwise-valid old/new provider memory overlap.
-			n, _, err := syscall.Recvfrom(SocketHandle(fd), buffer, syscall.MSG_PEEK)
+			n, err := peekUdpSocket(SocketHandle(fd), buffer)
 			if err != nil {
 				if errors.Is(err, syscall.EINTR) {
 					continue
