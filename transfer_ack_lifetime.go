@@ -120,6 +120,25 @@ func (self *sequenceAckWindow) pendingDeliveryFor(sequenceNumber uint64, message
 	return ok && ack.sequenceNumber == sequenceNumber
 }
 
+// Both expiry decisions use the same typed pending evidence. A renewal is
+// anchored to the actual reply arrival, never to the time this check runs.
+// Zero means no valid renewal; contract requests still do not prove delivery.
+func (self *SendSequence) pendingAckLifetime(item *sendItem) (bool, time.Time) {
+	if self.ackWindow == nil {
+		return false, time.Time{}
+	}
+	delivered, receivedAtNanos := self.ackWindow.pendingLifetimeFeedback(item)
+	if delivered || receivedAtNanos == 0 {
+		return delivered, time.Time{}
+	}
+	renewedAt := time.Unix(0, receivedAtNanos)
+	if self.client != nil && !self.client.feedbackTimeBase.IsZero() {
+		base := self.client.feedbackTimeBase
+		renewedAt = base.Add(time.Duration(receivedAtNanos - base.UnixNano()))
+	}
+	return false, renewedAt.Add(item.ackTimeout)
+}
+
 // Future deadlines are constant-time reads. At expiry, reconcile only the due
 // prefix against feedback already received while the owner was pacing. Actual
 // delivery, callbacks and buffer release remain in the ordinary send loop.
@@ -130,24 +149,15 @@ func (self *SendSequence) nextAckLifetime(now time.Time) (time.Time, error) {
 		if now.Before(deadline) {
 			return deadline, nil
 		}
-		if self.ackWindow != nil {
-			delivered, receivedAtNanos := self.ackWindow.pendingLifetimeFeedback(item)
-			if delivered {
-				self.ackLifetimes.remove(item)
-				continue
-			}
-			if receivedAtNanos != 0 {
-				renewedAt := time.Unix(0, receivedAtNanos)
-				if self.client != nil && !self.client.feedbackTimeBase.IsZero() {
-					base := self.client.feedbackTimeBase
-					renewedAt = base.Add(time.Duration(receivedAtNanos - base.UnixNano()))
-				}
-				if renewedDeadline := renewedAt.Add(item.ackTimeout); renewedDeadline.After(deadline) {
-					self.ackLifetimes.items[0].at = renewedDeadline
-					heap.Fix(&self.ackLifetimes, 0)
-					continue
-				}
-			}
+		delivered, renewedDeadline := self.pendingAckLifetime(item)
+		if delivered {
+			self.ackLifetimes.remove(item)
+			continue
+		}
+		if renewedDeadline.After(deadline) {
+			self.ackLifetimes.items[0].at = renewedDeadline
+			heap.Fix(&self.ackLifetimes, 0)
+			continue
 		}
 		// Record the due identity here, including when a paced/route write
 		// will cancel this sequence before Run gets control back.

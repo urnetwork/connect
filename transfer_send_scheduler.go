@@ -266,6 +266,8 @@ func (self *sendPackScheduler) HasEligible(
 // NoAck data is explicitly unordered. A memory-blocked reliable head cannot
 // hold it behind retention capacity it never consumes, even in the same flow.
 // The caller restricts eligible to packets guaranteed to remain NoAck.
+// Prepared cancellation also uses this removal to dispose an unwritten Pack;
+// it never sends ordered data around an earlier reliable owner.
 func (self *sendPackScheduler) TakeUnorderedEligible(eligible func(*SendPack) bool) *SendPack {
 	for _, pack := range self.order {
 		if !eligible(pack) {

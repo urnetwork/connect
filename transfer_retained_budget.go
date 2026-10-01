@@ -95,6 +95,14 @@ func (self *SendSequence) retainedSendFrameByteCount(messageByteCount ByteCount,
 }
 
 func (self *SendSequence) retainedSendPackByteCount(pack *SendPack) ByteCount {
+	contractBytes := ByteCount(0)
+	if self.sendContract != nil {
+		contractBytes = ByteCount(proto.Size(self.sendContract.contract))
+	}
+	return self.retainedSendPackByteCountWithContractBytes(pack, contractBytes)
+}
+
+func (self *SendSequence) retainedSendPackByteCountWithContractBytes(pack *SendPack, contractBytes ByteCount) ByteCount {
 	frames := pack.frameList()
 	frameCount := len(frames)
 	if pack.logicalGroup {
@@ -103,11 +111,17 @@ func (self *SendSequence) retainedSendPackByteCount(pack *SendPack) ByteCount {
 			maxFrames, maxMessageByteCount) - pack.groupFrameIndex
 	}
 	return (&sendItem{}).retainedMemoryByteCount(
-		self.retainedSendFrameByteCount(pack.nextSerializedMessageByteCount(), frameCount),
+		addReceiveQueueByteCount(pack.nextSerializedMessageByteCount(), 512+32*ByteCount(frameCount)+contractBytes),
 		frameCount, self.sendBufferSettings.ProtocolVersion < 2)
 }
 
 func (self *SendSequence) retainedSendPackFits(pack *SendPack) bool {
-	return !self.resendQueue.lifetimeBudget || self.resendQueue.budget == nil ||
-		self.retainedSendPackByteCount(pack) <= self.resendQueue.budget.Available()
+	if !self.resendQueue.lifetimeBudget || self.resendQueue.budget == nil {
+		return true
+	}
+	required := self.retainedSendPackByteCount(pack)
+	if credit := pack.ackRecord().preparedMemory(); credit != nil {
+		credit.require(required)
+	}
+	return required <= self.resendQueue.budget.Available()+pack.preparedMemoryBytes(self.resendQueue.budget)
 }

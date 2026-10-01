@@ -1276,6 +1276,10 @@ func (self *SendPack) releaseRaw() {
 	// clear every field before returning the object to its pool. A caller must
 	// not read or write self after this call: another sender may immediately
 	// acquire and initialize the same object.
+	handoff := self.ackRecord().preparedHandoff()
+	if handoff != nil {
+		defer handoff.settle()
+	}
 	self.releaseAdmission()
 	if self.rawPool == nil {
 		return
@@ -3406,6 +3410,8 @@ func (self *Client) SendMultiWithTimeout(
 		TransferOptions:              resolved.transferOptions,
 		Frames:                       frames,
 		Destination:                  destinationId,
+		lifecycleObserver:            resolved.lifecycleObserver,
+		noAckObserver:                resolved.noAckObserver,
 		AckCallback:                  ackCallback,
 		MessageByteCount:             MessageByteCount(frames),
 		Ctx:                          resolved.ctx,
@@ -3493,6 +3499,7 @@ func (self *Client) sendGroupToWithTimeoutDetailed(
 		logicalGroup:                 true,
 		lifecycleObserver:            resolved.lifecycleObserver,
 		Destination:                  destinationId,
+		noAckObserver:                resolved.noAckObserver,
 		IntermediaryIds:              intermediaryIds,
 		AckCallback:                  ackCallback,
 		ackTarget:                    resolved.ackTarget,
@@ -3556,6 +3563,8 @@ func (self *Client) sendWithTimeoutAdmissionDetailed(
 		AckCallback:                  ackCallback,
 		ackTarget:                    resolved.ackTarget,
 		MessageByteCount:             messageByteCount,
+		lifecycleObserver:            resolved.lifecycleObserver,
+		noAckObserver:                resolved.noAckObserver,
 		Ctx:                          resolved.ctx,
 		EncryptionRole:               resolved.encryptionRole,
 		EncryptionCompanion:          resolved.encryptionCompanion,
@@ -3588,6 +3597,7 @@ func (self *Client) sendWithTimeoutAdmissionDetailed(
 // The fully resolved values shared by single, batch, and raw sends.
 type resolvedSendOptions struct {
 	lifecycleObserver      func(SendPackLifecycleObservation)
+	noAckObserver          func(NoAckSendObservation)
 	ctx                    context.Context
 	transferOptions        TransferOptions
 	encryptionRole         sequenceTlsRole
@@ -3622,6 +3632,8 @@ func (self *Client) resolveSendOptions(opts []any) resolvedSendOptions {
 			}
 		case transferOptionsSetAck:
 			resolved.transferOptions.Ack = v.Ack
+		case sendNoAckObserverOption:
+			resolved.noAckObserver = v.observer
 		case transferOptionsSetForceStream:
 			resolved.transferOptions.ForceStream = v.ForceStream
 		case transferOptionsSetCompanionContract:
@@ -3756,6 +3768,8 @@ func (self *Client) sendRawToWithTimeoutDetailed(
 		ackTarget:                    ackTarget,
 		ackValue:                     ackValue,
 		MessageByteCount:             ByteCount(len(messageBytes)),
+		lifecycleObserver:            resolved.lifecycleObserver,
+		noAckObserver:                resolved.noAckObserver,
 		Ctx:                          resolved.ctx,
 		EncryptionRole:               resolved.encryptionRole,
 		EncryptionCompanion:          resolved.encryptionCompanion,
@@ -3829,7 +3843,14 @@ func (self *Client) enqueueSendPack(sendPack *SendPack, timeout time.Duration) (
 		}
 	} else {
 		self.startSendPackLifecycle(sendPack)
-		noAckObserver := self.settings.SendBufferSettings.NoAckSendObserver
+		noAckObserver := sendPack.noAckObserver
+		// An override is only a candidate observer until a requested NoAck send
+		// starts its token. ACK sends must not retain it in their completion
+		// record, or they emit an unmatched NoAck terminal event with token zero.
+		sendPack.noAckObserver = nil
+		if noAckObserver == nil {
+			noAckObserver = self.settings.SendBufferSettings.NoAckSendObserver
+		}
 		if noAckObserver != nil && !sendPack.Ack {
 			token := self.noAckSendToken.Add(1)
 			sendPack.noAckObserver = noAckObserver
@@ -5183,6 +5204,9 @@ type SendBufferSettings struct {
 	// disposition and before the Ack worker advances to another item.
 	afterInitialWriteQueuedForTest        func(sendSequenceId, uint64)
 	afterAckCoalescedForTest              func(sendSequenceId, uint64)
+	beforeAckWorkerReceiveForTest         func(sendSequenceId)
+	beforeAckWorkerCoalesceForTest        func(sendSequenceId)
+	afterApplyAckSnapshotForTest          func(sendSequenceId)
 	afterAckSendItemForTest               func(sendSequenceId, uint64)
 	beforeDueResendForTest                func(sendSequenceId, uint64)
 	afterCreateSendGroupCompletionForTest func(sendSequenceId, int)
@@ -5331,6 +5355,11 @@ type NoAckSendObservation struct {
 	DestinationId Id
 	Token         uint64
 	Err           error
+	// A refused synchronous attempt is recoverable only when its exact input
+	// owner later completes that same datagram. An observation-buffer overflow
+	// remains a failure; route-write errors can never receive this credit.
+	RecoveredByOwner      bool
+	OwnerTrackingOverflow bool
 }
 
 // ErrNoAckSendNotAdmitted is reported only to the optional observer when the
@@ -5439,6 +5468,9 @@ type SendBuffer struct {
 	afterRunSendSequenceForTest           func(sendSequenceId)
 	afterInitialWriteQueuedForTest        func(sendSequenceId, uint64)
 	afterAckCoalescedForTest              func(sendSequenceId, uint64)
+	beforeAckWorkerReceiveForTest         func(sendSequenceId)
+	beforeAckWorkerCoalesceForTest        func(sendSequenceId)
+	afterApplyAckSnapshotForTest          func(sendSequenceId)
 	afterAckSendItemForTest               func(sendSequenceId, uint64)
 	beforeDueResendForTest                func(sendSequenceId, uint64)
 	afterCreateSendGroupCompletionForTest func(sendSequenceId, int)
@@ -5473,6 +5505,9 @@ func NewSendBuffer(ctx context.Context,
 		afterRunSendSequenceForTest:           sendBufferSettings.afterRunSendSequenceForTest,
 		afterInitialWriteQueuedForTest:        sendBufferSettings.afterInitialWriteQueuedForTest,
 		afterAckCoalescedForTest:              sendBufferSettings.afterAckCoalescedForTest,
+		beforeAckWorkerReceiveForTest:         sendBufferSettings.beforeAckWorkerReceiveForTest,
+		beforeAckWorkerCoalesceForTest:        sendBufferSettings.beforeAckWorkerCoalesceForTest,
+		afterApplyAckSnapshotForTest:          sendBufferSettings.afterApplyAckSnapshotForTest,
 		afterAckSendItemForTest:               sendBufferSettings.afterAckSendItemForTest,
 		beforeDueResendForTest:                sendBufferSettings.beforeDueResendForTest,
 		afterCreateSendGroupCompletionForTest: sendBufferSettings.afterCreateSendGroupCompletionForTest,
@@ -6377,15 +6412,25 @@ type SendSequence struct {
 	// channel with no send loop to publish anything, refused every retry. A
 	// gate that nothing has published must fail open.
 	resendCapacityUnavailable resendCapacityGate
+	// Prepared provider returns have already paid memory admission. They must
+	// still wait for the same protocol window / reliable-flight capacity.
+	preparedFlightUnavailable resendCapacityGate
+	preparedHandoffWake       chan struct{}
+	currentPreparedHandoff    *preparedSendHandoff // sequence owner only, during contract acquisition
+	// Only the sequence worker reads the mutable contract. Caller-side
+	// prepared admission uses its atomically published serialized size.
+	preparedContractByteCount atomic.Int64
 	// Published by Run after each route-policy snapshot so concurrent Pack
 	// callers never read the goroutine-owned multi-route writer directly.
 	flowIsolation atomic.Bool
 	ackMutex      sync.Mutex
 	acks          chan receiveAckMessage
-	// ackWindow is the allocation-free cumulative/selective ACK coalescer shared
-	// by the normal ACK worker and the saturated-handoff fallback. Publishing it
-	// at construction lets a full compact channel fold progress into the same
-	// window instead of dropping an ACK and waiting for Transfer recovery.
+	// ACK processing may run in the receiving caller or compatibility worker.
+	// Publish its failure before cancellation wakes the send owner.
+	ackWorkerExited atomic.Bool
+	// ackWindow is published before sequence indexing. Production handoff folds
+	// validated feedback here before returning accepted, so worker scheduling
+	// cannot hide received progress from the owner's lifetime checks.
 	ackWindow *sequenceAckWindow
 
 	resendQueue        *resendQueue
@@ -6638,6 +6683,7 @@ func newSendSequenceWithLogicalLane(
 		sendContractMetadataGeneration: 0,
 		openSendContracts:              map[Id]*sequenceContract{},
 		packs:                          make(chan *SendPack, sequenceBufferSize),
+		preparedHandoffWake:            make(chan struct{}, 1),
 		packAdmission:                  newSendPackAdmission(sequenceBufferSize),
 		acks:                           make(chan receiveAckMessage, ackBufferSize),
 		ackWindow:                      newSequenceAckWindow(),
@@ -6792,7 +6838,11 @@ func (self *SendSequence) awaitResendCapacity(
 	sendPack *SendPack,
 	timeout time.Duration,
 ) (bool, error, time.Duration) {
-	if !self.resendCapacityUnavailable.Load() {
+	gate := &self.resendCapacityUnavailable
+	if self.preparedPackFits(sendPack) {
+		gate = &self.preparedFlightUnavailable
+	}
+	if !gate.Load() {
 		return true, nil, timeout
 	}
 	if timeout == 0 {
@@ -6806,8 +6856,8 @@ func (self *SendSequence) awaitResendCapacity(
 		timeoutChannel = timer.C
 	}
 	for {
-		changed := self.resendCapacityUnavailable.Notify()
-		if !self.resendCapacityUnavailable.Load() {
+		changed := gate.Notify()
+		if !gate.Load() {
 			if 0 < timeout {
 				timeout = max(time.Duration(0), timeout-time.Since(startTime))
 			}
@@ -7094,6 +7144,7 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 		return false, err
 	}
 	queued := false
+	sendPack.ackRecord().preparedHandoff().bindSequence(self.preparedHandoffWake)
 	defer func() {
 		if !queued {
 			sendPack.releaseAdmission()
@@ -7279,22 +7330,20 @@ func (self *SendSequence) ackMessageDetailed(
 	default:
 	}
 
-	// fast path without arming a timer
+	// Accepted feedback must be visible to both lifetime checks, including
+	// when an ACK worker is descheduled after dequeue. Publish exactly once;
+	// retaining a second channel copy would duplicate RTT/service accounting.
+	if self.ackWindow != nil && self.resendQueue != nil {
+		self.coalesceAcceptedAck(ack)
+		return receiveAckHandoffAccepted, nil
+	}
+
+	// Directly constructed legacy sequences retain their channel-only handoff.
+	// Production sequences always have constructor-published ACK state above.
 	select {
 	case self.acks <- ack:
 		return receiveAckHandoffAccepted, nil
 	default:
-	}
-
-	// The ACK worker already folds cumulative and selective progress into one
-	// allocation-free window. If its compact handoff channel is momentarily
-	// full, publish this ACK to that same window instead of dropping progress or
-	// retaining the carrier reader in a timed wait. Older queued cumulative ACKs
-	// can arrive afterward safely: sequenceAckWindow is monotonic and absorbs
-	// stale heads while preserving selective and contract-recovery state.
-	if self.ackWindow != nil && self.resendQueue != nil {
-		self.coalesceReceivedAck(self.ackWindow, ack)
-		return receiveAckHandoffAccepted, nil
 	}
 
 	if timeout < 0 {
@@ -7327,10 +7376,24 @@ func (self *SendSequence) ackMessageDetailed(
 	}
 }
 
-// coalesceReceivedAck performs the ACK worker's bounded validation and folds
-// one live ACK into the shared monotonic window. It is safe from either the
-// worker or a saturated receive callback: resendQueue and sequenceAckWindow
-// provide their own short critical sections, and all counters are atomic.
+// Contain a processing panic to this sequence, as the compatibility ACK worker
+// does. The existing admission lock joins this publisher during teardown.
+func (self *SendSequence) coalesceAcceptedAck(ack receiveAckMessage) {
+	HandleError(func() {
+		completed := false
+		defer func() {
+			if !completed {
+				if self.ctx.Err() == nil {
+					self.ackWorkerExited.Store(true)
+				}
+				self.cancel()
+			}
+		}()
+		self.coalesceReceivedAck(self.ackWindow, ack)
+		completed = true
+	})
+}
+
 // THROUGHPUTFIX §39.1's capability gate, read from delivery acknowledgements
 // only.
 //
@@ -7351,6 +7414,8 @@ func (self *SendSequence) observeContractAheadCapability(ack receiveAckMessage) 
 	self.contractAheadSupported.Store(ack.contractAheadSupported)
 }
 
+// Validate retained identity and publish one ACK. Shared queues/windows own
+// their short critical sections; retained-item mutation stays with Run.
 func (self *SendSequence) coalesceReceivedAck(
 	ackWindow *sequenceAckWindow,
 	ack receiveAckMessage,
@@ -8268,7 +8333,6 @@ func (self *SendSequence) Run() {
 	defer self.windowPacer.close()
 	ackWorkerDone := make(chan struct{})
 	ackWorkerStarted := false
-	var ackWorkerExited atomic.Bool
 	defer func() {
 		if r := recover(); r != nil {
 			self.log.Errorf("[s]%s->%s...%s s(%s) abnormal exit =  %s\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId, r)
@@ -8280,6 +8344,10 @@ func (self *SendSequence) Run() {
 		if ackWorkerStarted {
 			<-ackWorkerDone
 		}
+		// Cancellation rejects future handoffs. Join the already-admitted
+		// caller before contracts, retained identities or pools are released.
+		self.ackMutex.Lock()
+		self.ackMutex.Unlock()
 
 		// what callers wrote on the fast path is charged before the contracts
 		// report their final counts, and nothing may be written against a
@@ -8345,18 +8413,24 @@ func (self *SendSequence) Run() {
 				// Publish the worker cause before its cancellation wakes Run.
 				// Ordinary parent/owner cancellation is not a worker failure.
 				if self.ctx.Err() == nil {
-					ackWorkerExited.Store(true)
+					self.ackWorkerExited.Store(true)
 				}
 				self.cancel()
 			}()
 
 			for {
+				if self.sendBuffer != nil && self.sendBuffer.beforeAckWorkerReceiveForTest != nil {
+					self.sendBuffer.beforeAckWorkerReceiveForTest(self.id())
+				}
 				select {
 				case <-self.ctx.Done():
 					return
 				case ack, ok := <-self.acks:
 					if !ok {
 						return
+					}
+					if self.sendBuffer != nil && self.sendBuffer.beforeAckWorkerCoalesceForTest != nil {
+						self.sendBuffer.beforeAckWorkerCoalesceForTest(self.id())
 					}
 					self.coalesceReceivedAck(ackWindow, ack)
 				}
@@ -8393,6 +8467,7 @@ func (self *SendSequence) Run() {
 		}
 	}()
 	packsClosed := false
+	drainPreparedCancellation := false
 	defer func() {
 		// This defer runs before scheduler/retained callbacks and before the
 		// cleanup cancellation. More specific owner paths record their cause
@@ -8404,7 +8479,7 @@ func (self *SendSequence) Run() {
 		if self.ctx.Err() != nil {
 			reason = "context"
 		}
-		if ackWorkerExited.Load() {
+		if self.ackWorkerExited.Load() {
 			reason = "ack_worker_exit"
 		}
 		self.recordSendSequenceExit(reason, nil, time.Time{}, nil)
@@ -8425,6 +8500,26 @@ func (self *SendSequence) Run() {
 	}
 sendSequenceLoop:
 	for {
+		select {
+		case <-self.preparedHandoffWake:
+			drainPreparedCancellation = true
+		default:
+		}
+		if drainPreparedCancellation {
+			// Admission slots still bound every drained owner. Cancellation
+			// must reach a queued prepared Pack even behind a full flight window.
+			drainPacks()
+			drainPreparedCancellation = false
+		}
+		for {
+			canceled := scheduler.TakeUnorderedEligible(func(pack *SendPack) bool {
+				return pack.ackRecord().preparedHandoff().cancellationRequested()
+			})
+			if canceled == nil {
+				break
+			}
+			canceled.disposeUnsentGroup(errPreparedSendCanceled)
+		}
 		flightPolicy := self.transferFlightPolicy()
 		if flightPolicy.generation != lastRouteGeneration {
 			if lastRouteGeneration != 0 {
@@ -8473,6 +8568,9 @@ sendSequenceLoop:
 		}
 		for messageId, ack := range ackSnapshot.contractMissingAcks {
 			self.receiveContractMissing(messageId, ack.missingContractId)
+		}
+		if self.sendBuffer != nil && self.sendBuffer.afterApplyAckSnapshotForTest != nil {
+			self.sendBuffer.afterApplyAckSnapshotForTest(self.id())
 		}
 
 		// what callers wrote on the fast path since the last pass is charged
@@ -8523,6 +8621,13 @@ sendSequenceLoop:
 					itemAckTimeout = 0
 				}
 				if itemAckTimeout <= 0 && !retainPastAckTimeout {
+					delivered, renewedDeadline := self.pendingAckLifetime(item)
+					if delivered || renewedDeadline.After(sendTime) {
+						// Feedback arrived after this iteration's snapshot. Apply
+						// it through the ordinary owner path before scanning again:
+						// index removal alone cannot retire callbacks/credit/pools.
+						continue sendSequenceLoop
+					}
 					// message took too long to ack
 					// close the sequence
 					self.recordSendSequenceExit("ack_lifetime", item, item.sendTime.Add(item.ackTimeout), context.DeadlineExceeded)
@@ -8925,6 +9030,9 @@ sendSequenceLoop:
 		}
 		resendCapacity = resendCapacity && reliableAdmission
 		self.resendCapacityUnavailable.Store(!resendCapacity)
+		preparedFlightAvailable := reliableAdmission &&
+			self.resendQueue.preparedWindowAvailable(self.sendWindowEstimate(sendTime).Window)
+		self.preparedFlightUnavailable.Store(!preparedFlightAvailable)
 		// The unreliable flight only gates admission while no reliable carrier
 		// can take the overflow; otherwise a full flight is written reliable-only
 		// (see writeMaybeWrappedBytes) instead of stalling the sequence.
@@ -8937,7 +9045,7 @@ sendSequenceLoop:
 		}
 		sendEligible := func(sendPack *SendPack) bool {
 			return self.noAckPackCanBypassRecoveryAdmission(sendPack) ||
-				resendCapacity &&
+				(resendCapacity || preparedFlightAvailable && self.preparedPackFits(sendPack)) &&
 					self.retainedSendPackFits(sendPack) &&
 					(!flightGates || self.flightController.canSendForKey(sendPack.schedulingKey))
 		}
@@ -8973,10 +9081,11 @@ sendSequenceLoop:
 			// half of the same composition defect admission had
 			// (THROUGHPUTFIX §38.11).
 			sendPack = scheduler.TakeFifoEligible(func(candidate *SendPack) bool {
-				return self.noAckPackCanBypassRecoveryAdmission(candidate) &&
+				return (self.noAckPackCanBypassRecoveryAdmission(candidate) ||
+					preparedFlightAvailable && self.preparedPackFits(candidate)) &&
 					flightEligible(candidate)
 			})
-			bypassedRecoveryAdmission = sendPack != nil
+			bypassedRecoveryAdmission = sendPack != nil && self.noAckPackCanBypassRecoveryAdmission(sendPack)
 		}
 		if sendPack == nil && self.resendQueue.lifetimeBudget {
 			sendPack = scheduler.TakeUnorderedEligible(func(candidate *SendPack) bool {
@@ -9128,12 +9237,16 @@ sendSequenceLoop:
 				contractUpdated := false
 				deferForRecoveryAdmission := false
 				var contractErr error
+				if sendPackCount == 1 {
+					self.currentPreparedHandoff = sendPack.ackRecord().preparedHandoff()
+				}
 				if bypassedRecoveryAdmission {
 					contractUpdated, deferForRecoveryAdmission, contractErr =
 						self.updateContractWithoutAckPromotionOutcome(messageByteCount)
 				} else {
 					contractUpdated, contractErr = self.updateContractOutcome(messageByteCount)
 				}
+				self.currentPreparedHandoff = nil
 				if contractUpdated {
 					if bypassedRecoveryAdmission {
 						self.client.unreliableNoAckAdmissionBypassCount.Add(1)
@@ -9178,7 +9291,10 @@ sendSequenceLoop:
 					return !packsClosed
 				}
 
-				err := self.classifyContractCreationFailure(contractErr)
+				err := contractErr
+				if !errors.Is(contractErr, errPreparedSendCanceled) {
+					err = self.classifyContractCreationFailure(contractErr)
+				}
 				for packIndex := range sendPackCount {
 					// same silent discard as a failed write, by a different
 					// route: no retry, and the error reaches nothing that counts
@@ -9192,7 +9308,7 @@ sendSequenceLoop:
 					sendPacks[packIndex].releaseRaw()
 					processingPacks[packIndex] = nil
 				}
-				return false
+				return errors.Is(contractErr, errPreparedSendCanceled) && !packsClosed
 			}
 
 			if !processPack() {
@@ -9266,6 +9382,8 @@ sendSequenceLoop:
 			return
 		case <-ackSnapshot.ackNotify:
 		case <-self.noAckFastPathSettled:
+		case <-self.preparedHandoffWake:
+			drainPreparedCancellation = true
 		case <-memoryCapacityNotify:
 		case <-flightPolicy.notify:
 		case nextSendPack, ok := <-packIngress:
@@ -9372,6 +9490,10 @@ func (self *SendSequence) updateContractWithAckPromotion(
 	messageByteCount ByteCount,
 	allowAckPromotion bool,
 ) (updated bool, deferForRecoveryAdmission bool, err error) {
+	handoff := self.currentPreparedHandoff
+	if handoff.cancellationRequested() {
+		return false, false, errPreparedSendCanceled
+	}
 	if self.sendBuffer != nil && self.sendBuffer.forceContractFailureForTest != nil &&
 		self.sendBuffer.forceContractFailureForTest(self.id()) {
 		return false, false, errors.New("No contract")
@@ -9388,6 +9510,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 		if self.sendContract != nil {
 			self.retireSendContract(self.sendContract)
 			self.sendContract = nil
+			self.preparedContractByteCount.Store(0)
 		}
 		return true, false, nil
 	}
@@ -9401,6 +9524,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 		self.sendContractMetadataGeneration != metadata.generation {
 		retiredContract := self.sendContract
 		self.sendContract = nil
+		self.preparedContractByteCount.Store(0)
 		self.sendContractAcked = false
 		self.retireSendContract(retiredContract)
 	}
@@ -9503,8 +9627,10 @@ func (self *SendSequence) updateContractWithAckPromotion(
 			if self.sendBuffer != nil && self.sendBuffer.beforeTakeContractForTest != nil {
 				self.sendBuffer.beforeTakeContractForTest(self.id())
 			}
+			contractContext, releaseContext := handoff.contractContext(metadata.ctx)
+			defer releaseContext()
 			contract := self.client.ContractManager().TakeContract(
-				metadata.ctx,
+				contractContext,
 				metadata.key,
 				timeout,
 			)
@@ -9572,6 +9698,10 @@ func (self *SendSequence) updateContractWithAckPromotion(
 		}
 
 		for {
+			if handoff.cancellationRequested() {
+				contractErr = errPreparedSendCanceled
+				return false
+			}
 			select {
 			case <-self.ctx.Done():
 				contractErr = self.ctx.Err()
@@ -9620,7 +9750,8 @@ func (self *SendSequence) updateContractWithAckPromotion(
 	} else {
 		ok = createContract()
 	}
-	self.sendBufferSettings.providerEvaluation.endContractWait(self.destination, !ok && self.ctx.Err() == nil)
+	self.sendBufferSettings.providerEvaluation.endContractWait(self.destination,
+		!ok && self.ctx.Err() == nil && !errors.Is(contractErr, errPreparedSendCanceled))
 	// surface slow contract acquisition at default verbosity. The send
 	// sequence blocks here, so a slow create (e.g. a companion request that
 	// cannot match an origin contract) stalls the entire sequence.
@@ -9864,6 +9995,7 @@ func (self *SendSequence) setContract(
 	}
 	self.openSendContracts[nextSendContract.contractId] = nextSendContract
 	self.sendContract = nextSendContract
+	self.preparedContractByteCount.Store(int64(proto.Size(nextSendContract.contract)))
 	self.sendContractAcked = false
 	// a new contract announces its own successor (THROUGHPUTFIX §39.1)
 	self.aheadSendContractAttempted = false
@@ -10115,35 +10247,47 @@ func (self *SendSequence) sendWithSetContractRecords(
 	}
 	item := takeSendItem()
 	*item = sendItem{acks: acks}
-	if ack && self.resendQueue.lifetimeBudget {
+	admissionErr := item.acks.commitPreparedHandoffs(func() error {
+		if !ack || !self.resendQueue.lifetimeBudget {
+			return nil
+		}
 		frameByteCount := self.retainedSendFrameByteCount(MessageByteCount(sendFrames), len(sendFrames))
 		if aheadContract != nil {
 			frameByteCount = addReceiveQueueByteCount(frameByteCount, ByteCount(proto.Size(aheadContract.contract)))
 		}
-		admissionErr := self.ctx.Err()
-		if admissionErr == nil && !item.reserveMemory(self.resendQueue.budget,
+		if err := self.ctx.Err(); err != nil {
+			return err
+		}
+		if !item.reservePreparedMemory(self.resendQueue.budget,
 			item.retainedMemoryByteCount(frameByteCount, len(sendFrames), self.sendBufferSettings.ProtocolVersion < 2)) {
-			admissionErr = ErrSendPackNotAdmitted
+			var credits [sendPackH1GroupMaxFrames]*preparedSendMemory
+			if item.acks.preparedMemories(self.resendQueue.budget, &credits) > 0 {
+				return errPreparedSendMemoryUnavailable
+			}
+			return ErrSendPackNotAdmitted
 		}
-		if admissionErr != nil {
-			// No frame has been allocated or published. A cross-flow loser
-			// returns every input and cannot leave a sequence/contract gap.
+		return nil
+	})
+	if admissionErr != nil {
+		// No frame has been allocated or published. A cross-flow loser
+		// returns every input and cannot leave a sequence/contract gap.
+		if ack {
 			self.nextSequenceNumber--
-			if self.sendContract != nil {
-				self.sendContract.rollbackUnwritten(MessageByteCount(sendFrames))
-			}
-			for _, frame := range sendFrames {
-				MessagePoolReturn(frame.MessageBytes)
-			}
-			item.acks.firstRouteWrite(admissionErr)
-			noAckSends.complete(admissionErr)
-			if noAckSends.count > 0 {
-				self.client.sendNoAckDiscardCount.Add(uint64(noAckSends.count))
-			}
-			item.acks.invoke(admissionErr)
-			item.messagePoolReturn()
-			return
 		}
+		if self.sendContract != nil {
+			self.sendContract.rollbackUnwritten(MessageByteCount(sendFrames))
+		}
+		for _, frame := range sendFrames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		item.acks.firstRouteWrite(admissionErr)
+		noAckSends.complete(admissionErr)
+		if noAckSends.count > 0 {
+			self.client.sendNoAckDiscardCount.Add(uint64(noAckSends.count))
+		}
+		item.acks.invoke(admissionErr)
+		item.messagePoolReturn()
+		return
 	}
 	compactContractHead := head && self.sendContract != nil &&
 		self.sendContractAcked && self.sendBufferSettings.CompactContractHead &&

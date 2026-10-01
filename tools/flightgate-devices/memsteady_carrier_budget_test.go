@@ -151,7 +151,6 @@ func TestMemsteadyCarrierHierarchyAcceptsEachBorrowingScope(t *testing.T) {
 		owner, from, to     string
 	}{
 		{"both levels", true, true, "device", "h1", "h3_explicit"},
-		{"child only", false, true, "device", "h3_auto", "h1"},
 		{"root only device", true, false, "device", "h1", "h3_auto"},
 		{"root only ownerless", true, false, "process", "h1", "h3_explicit"},
 		{"H1 to H1", true, true, "device", "h1", "h1"},
@@ -189,11 +188,22 @@ func TestMemsteadyCarrierHierarchyRejectsFalseProof(t *testing.T) {
 		mutate func(map[string]any)
 	}{
 		{"missing child", false, func(p map[string]any) { delete(p, "device_transport_budget_total_bytes") }},
-		{"wrong child ceiling", false, func(p map[string]any) { p["device_transport_budget_total_bytes"] = float64(iosCarrierRootBytes) }},
+		{"wrong child ceiling", false, func(p map[string]any) { p["device_transport_budget_total_bytes"] = float64(iosCarrierDeviceBytes + 1) }},
 		{"wrong child slot cap", false, func(p map[string]any) { p["device_transport_budget_max_count"] = float64(17) }},
 		{"hidden child byte escape", false, func(p map[string]any) {
-			setCarrierUsageFixture(p, "transport_budget_", 7*1024*1024, 1)
-			setCarrierUsageFixture(p, "device_transport_budget_", 6*1024*1024, 1)
+			setCarrierUsageFixture(p, "transport_budget_", iosCarrierRootBytes, 1)
+			setCarrierUsageFixture(p, "device_transport_budget_", iosCarrierDeviceBytes+1, 1)
+		}},
+		// At v2 the device and process ceilings are both 8 MiB: a child
+		// byte loan must also have an owning process loan.
+		{"child loan without equal-ceiling root loan", true, func(p map[string]any) {
+			setCarrierPairFixture(p, "transport_budget_", "device", "h1", "h3_explicit", false)
+			p["transport_budget_active_handoff_count"] = float64(0)
+			for _, key := range []string{"id", "h1_bytes", "bytes", "slots"} {
+				p["transport_budget_active_handoff_"+key] = float64(0)
+			}
+			p["transport_budget_active_handoff_from"] = ""
+			p["transport_budget_active_handoff_to"] = ""
 		}},
 		{"hidden child slot escape", false, func(p map[string]any) { p["device_transport_budget_used_count"] = float64(17) }},
 		{"child missing root charge", false, func(p map[string]any) { setCarrierUsageFixture(p, "device_transport_budget_", 1024*1024, 1) }},

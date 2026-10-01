@@ -121,9 +121,9 @@ func newReportFixture() reportFixture {
 				"transfer_root_used_bytes":              float64(iosPeerPinBudgetBytes + 256*1024),
 				"transfer_root_reserved_bytes":          float64(iosPeerPinBudgetBytes + 256*1024),
 				"transfer_root_released_bytes":          float64(0),
-				"client_transfer_total_bytes":           float64(9 * 1024 * 1024),
+				"client_transfer_total_bytes":           float64(iosClientTransferBytes),
 				"client_transfer_used_bytes":            float64(iosPeerPinBudgetBytes + 128*1024),
-				"provider_transfer_total_bytes":         float64(2 * 1024 * 1024),
+				"provider_transfer_total_bytes":         float64(iosProviderShareBytes / 2),
 				"provider_transfer_used_bytes":          float64(64 * 1024),
 				"nat_budget_total_bytes":                float64(iosNatBudgetBytes),
 				"nat_budget_used_bytes":                 float64(64 * 1024),
@@ -244,6 +244,7 @@ func TestMemsteadyReportRejectsInvalidEvidence(t *testing.T) {
 		{"no baseline interval", func(f *reportFixture) { f.meta.BaselineStart = 0 }},
 		{"single missing memory part", func(f *reportFixture) { delete(f.client[20].Payload, "go_total_bytes") }},
 		{"android profile", func(f *reportFixture) { f.meta.MemoryProfile = "android" }},
+		{"historical v1 profile", func(f *reportFixture) { f.meta.MemoryProfile = "ios-memory-audit-v1" }},
 		{"wrong target", func(f *reportFixture) { f.meta.DeviceMemoryTargetBytes = 28 * 1048576 }},
 		{"wrong manifest carrier root", func(f *reportFixture) { f.meta.ProcessTransportBytes = 16 * 1048576 }},
 		{"wrong live soft limit", func(f *reportFixture) { f.client[15].Payload["go_limit_bytes"] = float64(40 * 1048576) }},
@@ -342,7 +343,8 @@ func TestMemsteadyPassingReportNormalizesDeviceClocks(t *testing.T) {
 	// A forced heap profile outside the window is not an acceptance sample.
 	f.client = append(f.client, memsteadySample{Millis: f.meta.EndMillis + 2000, Payload: map[string]any{"go_total_bytes": float64(40 * 1048576)}})
 	s, err := runReportFixture(t, f)
-	if err != nil || !s.Pass || s.Client.Burst.MaxMiB != 24 || s.Client.Quiet.Samples != 151 || !s.P2pActive {
+	if err != nil || !s.Pass || s.Client.Burst.MaxMiB != 32 || s.Client.Quiet.Samples != 151 || !s.P2pActive ||
+		s.MemoryProfile != "ios-memory-audit-v2" || s.GoRuntimeLimitBytes != 33554432 {
 		t.Fatalf("valid clock-normalized report failed: %+v, %v", s, err)
 	}
 }
@@ -418,6 +420,7 @@ func TestLiveProfileMustBeTheIOSAuditArtifact(t *testing.T) {
 		change func(*memsteadyDeviceStatus)
 	}{
 		{"android profile even at low values", func(s *memsteadyDeviceStatus) { s.MemoryProfile = "android" }},
+		{"historical v1 profile at v2 values", func(s *memsteadyDeviceStatus) { s.MemoryProfile = "ios-memory-audit-v1" }},
 		{"wrong target", func(s *memsteadyDeviceStatus) { s.DeviceMemoryTargetBytes = 28 * 1048576 }},
 		{"wrong soft limit", func(s *memsteadyDeviceStatus) { s.ProcessMemoryLimitBytes = 40 * 1048576 }},
 		{"stale build", func(s *memsteadyDeviceStatus) { s.BuildID = "old" }},

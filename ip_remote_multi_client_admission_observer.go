@@ -12,12 +12,18 @@ type pendingSendPackAdmissionObservation struct {
 	observation SendPackLifecycleObservation
 }
 
+type pendingNoAckAdmissionObservation struct {
+	observer    func(NoAckSendObservation)
+	observation NoAckSendObservation
+}
+
 // One scope belongs to one exact input group and one native send invocation,
 // not a destination, flow tuple, Client, or token reused by another call.
 type sendPackAdmissionObservations struct {
-	mutex     sync.Mutex
-	pending   []pendingSendPackAdmissionObservation
-	completed bool
+	mutex        sync.Mutex
+	pending      []pendingSendPackAdmissionObservation
+	noAckPending []pendingNoAckAdmissionObservation
+	completed    bool
 }
 
 // Called only by the serialized selection owner, before candidate goroutines
@@ -60,6 +66,8 @@ func (self *sendPackAdmissionObservations) complete(accepted bool) {
 	self.completed = true
 	pending := self.pending
 	self.pending = nil
+	noAckPending := self.noAckPending
+	self.noAckPending = nil
 	self.mutex.Unlock()
 	for _, entry := range pending {
 		err := *entry.observation.Err.(*SendPackAdmissionError)
@@ -67,10 +75,38 @@ func (self *sendPackAdmissionObservations) complete(accepted bool) {
 		entry.observation.Err = &err
 		safeSendPackLifecycleObserve(entry.observer, entry.observation)
 	}
+	for _, entry := range noAckPending {
+		entry.observation.RecoveredByOwner = accepted
+		entry.observer(entry.observation)
+	}
+}
+
+// Only the synchronous not-admitted result is deferred. A queued datagram's
+// route-write error is an independent failure even if some later send works.
+func (self *sendPackAdmissionObservations) wrapNoAck(observer func(NoAckSendObservation)) func(NoAckSendObservation) {
+	return func(observation NoAckSendObservation) {
+		if observation.Phase == NoAckSendPhaseCompleted && observation.Err == ErrNoAckSendNotAdmitted {
+			self.mutex.Lock()
+			if !self.completed && len(self.noAckPending) < sendPackAdmissionObservationCapacity {
+				self.noAckPending = append(self.noAckPending, pendingNoAckAdmissionObservation{observer, observation})
+				self.mutex.Unlock()
+				return
+			}
+			if !self.completed {
+				observation.OwnerTrackingOverflow = true
+			}
+			self.mutex.Unlock()
+		}
+		observer(observation)
+	}
 }
 
 // Internal observer override; only the group owner supplies it, and public
 // callbacks and send results never use this measurement-only option.
 type sendPackLifecycleObserverOption struct {
 	observer func(SendPackLifecycleObservation)
+}
+
+type sendNoAckObserverOption struct {
+	observer func(NoAckSendObservation)
 }

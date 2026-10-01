@@ -88,6 +88,20 @@ func applyPlatformH3MemoryPolicy(settings *PlatformTransportSettings, target Byt
 	if !settings.h3RetainedByteAccounting {
 		return
 	}
+	ApplyMobilePlatformTransportMemoryPolicy(settings, target)
+}
+
+// ApplyMobilePlatformTransportMemoryPolicy keeps mobile carrier ownership
+// accounted at every positive target. A larger mobile allowance increases the
+// receive window and its composed claim; it must not turn off retained-send,
+// speculative-dial, socket, or application-queue accounting. Call after target
+// sizing and before starting transports. Desktop/server constructors retain
+// their existing policy unless their embedder explicitly selects this one.
+func ApplyMobilePlatformTransportMemoryPolicy(settings *PlatformTransportSettings, target ByteCount) {
+	if settings == nil || target <= 0 {
+		return
+	}
+	settings.h3RetainedByteAccounting = true
 	settings.H3SocketReadBufferByteCount = min(settings.H3SocketReadBufferByteCount, platformH3SocketByteCount)
 	settings.H3SocketWriteBufferByteCount = min(settings.H3SocketWriteBufferByteCount, platformH3SocketByteCount)
 	fixed := platformH3FixedMemoryByteCount()

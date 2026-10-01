@@ -3,6 +3,16 @@
 Status: living implementation plan
 Last updated: 2026-09-04
 
+Current iOS-profile memory gate (2026-09-30): every observed Go-runtime sample
+must be at most **28 MiB (29,360,128 bytes)**, including startup, traffic,
+drain, role transition and five-minute quiet recovery. Android MEMSTEADY must
+explicitly select and report `ios-memory-audit-v1`, with unchanged 20-MiB
+admission and 32-MiB Go soft-limit inputs; ordinary Android 28/40 is not that
+profile. This authorized cap change is not a performance improvement or a
+budget increase. Dated 24-MiB results below retain their original verdicts;
+new allocations require paired H1/default-path evidence and the current
+[MEMSTEADY gate](MEMSTEADY.md#scope-and-acceptance-signals).
+
 ## Outcome
 
 Make URnetwork feel materially more responsive and reliable than the current

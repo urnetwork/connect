@@ -12,15 +12,17 @@ import (
 )
 
 const (
-	iosMemoryAuditProfile    = "ios-memory-audit-v1"
-	iosDeviceTargetBytes     = 20 * 1024 * 1024
+	iosMemoryAuditProfile    = "ios-memory-audit-v2"
+	iosDeviceTargetBytes     = 32 * 1024 * 1024
 	iosProcessSoftLimitBytes = 32 * 1024 * 1024
 	iosCarrierRootBytes      = 8 * 1024 * 1024
 	iosCarrierRootMaxCount   = 16
-	iosCarrierDeviceBytes    = 5 * 1024 * 1024
+	iosCarrierDeviceBytes    = iosDeviceTargetBytes / 4
 	iosCarrierH1OverlapBytes = 256 * 1024
-	iosTransferRootBytes     = 13 * 1024 * 1024
-	iosNatBudgetBytes        = 2 * 1024 * 1024
+	iosClientTransferBytes   = iosDeviceTargetBytes * 9 / 20
+	iosProviderShareBytes    = iosDeviceTargetBytes / 5
+	iosTransferRootBytes     = iosClientTransferBytes + iosProviderShareBytes
+	iosNatBudgetBytes        = iosProviderShareBytes / 2
 	iosPeerPinBudgetBytes    = 1024 * 1024
 )
 
@@ -361,7 +363,7 @@ func readAcceptanceManifest(path string) (acceptanceManifest, error) {
 	if manifest.MemoryProfile != iosMemoryAuditProfile || manifest.DeviceMemoryTargetBytes != iosDeviceTargetBytes ||
 		manifest.ProcessMemoryLimitBytes != iosProcessSoftLimitBytes || manifest.ProcessTransportBytes != iosCarrierRootBytes ||
 		manifest.ProcessTransportCount != iosCarrierRootMaxCount {
-		return manifest, errors.New("explicit iOS memory audit profile (20 MiB device / 32 MiB process / 8 MiB carrier root) required")
+		return manifest, errors.New("explicit iOS memory audit profile (v2: 32 MiB device / 32 MiB process / 8 MiB carrier root) required")
 	}
 	return manifest, nil
 }
@@ -382,6 +384,7 @@ func verifyAcceptanceArtifact(apk, manifestPath string) (acceptanceManifest, err
 	}
 	return manifest, nil
 }
+
 type memsteadyDeviceStatus struct {
 	ClientID                string `json:"client_id"`
 	MemoryProfile           string `json:"memory_profile"`

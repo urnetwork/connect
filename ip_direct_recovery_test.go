@@ -25,10 +25,17 @@ func TestIpPacketTransferAckRequired(t *testing.T) {
 			ackRequired: true,
 		},
 		{
-			name:        "direct udp",
+			name:             "direct udp noack",
+			protocol:         IpProtocolUdp,
+			allowDirect:      true,
+			udpTransferNoAck: true,
+			ackRequired:      false,
+		},
+		{
+			name:        "direct udp ack control",
 			protocol:    IpProtocolUdp,
 			allowDirect: true,
-			ackRequired: false,
+			ackRequired: true,
 		},
 		{
 			name:        "direct icmp",

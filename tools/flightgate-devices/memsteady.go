@@ -19,10 +19,10 @@ import (
 // The MEMSTEADY mobile acceptance rules (connect/MEMSTEADY.md, "Scope and
 // acceptance signals"), applied to goRuntimeBytes (the SDK sampler's
 // go_total_bytes, logged by the transfer diagnostic seam every interval):
-// every sampled phase at or below the iOS profile's hard 24 MiB cap, including
+// every sampled phase at or below the v2 profile's hard 32 MiB Go cap, including
 // five quiet connected minutes after a burst, and every temporary client
 // released. There is no grace band above the cap.
-const memsteadyTargetBytes = 24 * 1024 * 1024
+const memsteadyTargetBytes = 32 * 1024 * 1024
 
 type memsteadySample struct {
 	Millis  int64
@@ -94,20 +94,22 @@ type memsteadySide struct {
 }
 
 type memsteadySummary struct {
-	Tag          string            `json:"tag"`
-	Build        string            `json:"build"`
-	ClientRole   string            `json:"client_role"`
-	ProviderRole string            `json:"provider_role"`
-	BurstSeconds int               `json:"burst_seconds"`
-	QuietSeconds int               `json:"quiet_seconds"`
-	BurstMbps    float64           `json:"burst_mbps"`
-	LoadErrors   int64             `json:"load_errors"`
-	P2pActive    bool              `json:"p2p_active"`
-	Client       memsteadySide     `json:"client"`
-	Provider     memsteadySide     `json:"provider"`
-	Breaches     []memsteadyBreach `json:"breaches"`
-	Pass         bool              `json:"pass"`
-	Failures     []string          `json:"failures"`
+	MemoryProfile       string            `json:"memory_profile"`
+	GoRuntimeLimitBytes int64             `json:"go_runtime_limit_bytes"`
+	Tag                 string            `json:"tag"`
+	Build               string            `json:"build"`
+	ClientRole          string            `json:"client_role"`
+	ProviderRole        string            `json:"provider_role"`
+	BurstSeconds        int               `json:"burst_seconds"`
+	QuietSeconds        int               `json:"quiet_seconds"`
+	BurstMbps           float64           `json:"burst_mbps"`
+	LoadErrors          int64             `json:"load_errors"`
+	P2pActive           bool              `json:"p2p_active"`
+	Client              memsteadySide     `json:"client"`
+	Provider            memsteadySide     `json:"provider"`
+	Breaches            []memsteadyBreach `json:"breaches"`
+	Pass                bool              `json:"pass"`
+	Failures            []string          `json:"failures"`
 }
 
 type memsteadyMeta struct {
@@ -497,7 +499,8 @@ func memsteadyReport(args []string) error {
 	if b, err := os.ReadFile(filepath.Join(dir, "pss.json")); err == nil {
 		_ = json.Unmarshal(b, &pss)
 	}
-	summary := memsteadySummary{Tag: meta.Tag, Build: meta.Build, ClientRole: meta.ClientRole, ProviderRole: meta.ProviderRole,
+	summary := memsteadySummary{MemoryProfile: iosMemoryAuditProfile, GoRuntimeLimitBytes: memsteadyTargetBytes,
+		Tag: meta.Tag, Build: meta.Build, ClientRole: meta.ClientRole, ProviderRole: meta.ProviderRole,
 		BurstSeconds: meta.BurstSeconds, QuietSeconds: meta.QuietSeconds, LoadErrors: meta.LoadErrors, Breaches: []memsteadyBreach{}, Failures: []string{}, Pass: true}
 	if meta.QuietSeconds < 300 || meta.EndMillis-meta.QuietStart < 300_000 {
 		summary.Failures = append(summary.Failures, "quiet connected window is shorter than five minutes")
@@ -508,7 +511,7 @@ func memsteadyReport(args []string) error {
 	if meta.MemoryProfile != iosMemoryAuditProfile || meta.DeviceMemoryTargetBytes != iosDeviceTargetBytes ||
 		meta.ProcessMemoryLimitBytes != iosProcessSoftLimitBytes || meta.ProcessTransportBytes != iosCarrierRootBytes ||
 		meta.ProcessTransportCount != iosCarrierRootMaxCount {
-		summary.Failures = append(summary.Failures, "not the explicit iOS memory audit 20/32 MiB profile with 8-MiB shared carrier root")
+		summary.Failures = append(summary.Failures, "not the explicit iOS memory audit v2 32/32 MiB profile with 8-MiB shared carrier root")
 	}
 	if meta.ClientID == "" || meta.ProviderID == "" || meta.ClientID == meta.ProviderID {
 		summary.Failures = append(summary.Failures, "missing distinct exact client/provider identities")
@@ -622,7 +625,7 @@ func memsteadyReport(args []string) error {
 				s.Failures = append(s.Failures, "missing or nonpositive Go runtime bytes")
 			}
 			if num(sample.Payload, "go_limit_bytes") != iosProcessSoftLimitBytes || num(sample.Payload, "device_memory_target_bytes") != iosDeviceTargetBytes {
-				s.Failures = append(s.Failures, "sample missing expected iOS 20-MiB target / 32-MiB Go soft limit")
+				s.Failures = append(s.Failures, "sample missing expected v2 iOS 32-MiB target / 32-MiB Go soft limit")
 			}
 			wantID := meta.ClientID
 			if side == "provider" {
@@ -647,7 +650,7 @@ func memsteadyReport(args []string) error {
 					}
 				}
 				summary.Breaches = append(summary.Breaches, memsteadyBreach{Side: side, Phase: phase, Millis: sample.Millis, MiB: mib, Memory: memory, Windows: windows[sample.Millis]})
-				s.Failures = append(s.Failures, phase+" runtime exceeds hard 24 MiB cap (see breach records)")
+				s.Failures = append(s.Failures, phase+" runtime exceeds hard 32 MiB cap (see breach records)")
 			}
 			if sample.Millis >= meta.StartMillis {
 				connected, present := sample.Payload["connect_enabled"].(bool)
@@ -708,15 +711,15 @@ func memsteadyReport(args []string) error {
 			s.Failures = append(s.Failures, "no quiet samples")
 		}
 		if s.Quiet.P50MiB*1048576 > memsteadyTargetBytes || s.Quiet.P95MiB*1048576 > memsteadyTargetBytes {
-			s.Failures = append(s.Failures, fmt.Sprintf("quiet p50/p95 %.2f/%.2f MiB above 24 MiB", s.Quiet.P50MiB, s.Quiet.P95MiB))
+			s.Failures = append(s.Failures, fmt.Sprintf("quiet p50/p95 %.2f/%.2f MiB above 32 MiB", s.Quiet.P50MiB, s.Quiet.P95MiB))
 		}
 		// The product ceiling is hard (it is an iOS extension limit), so the
 		// worst single sample decides, not only the percentiles.
 		if s.Quiet.MaxMiB*1048576 > memsteadyTargetBytes {
-			s.Failures = append(s.Failures, fmt.Sprintf("worst quiet sample %.2f MiB above 24 MiB", s.Quiet.MaxMiB))
+			s.Failures = append(s.Failures, fmt.Sprintf("worst quiet sample %.2f MiB above 32 MiB", s.Quiet.MaxMiB))
 		}
 		if s.Burst.MaxMiB*1048576 > memsteadyTargetBytes {
-			s.Failures = append(s.Failures, fmt.Sprintf("active max %.2f MiB above 24 MiB", s.Burst.MaxMiB))
+			s.Failures = append(s.Failures, fmt.Sprintf("active max %.2f MiB above 32 MiB", s.Burst.MaxMiB))
 		}
 		if base < 0 || end < 0 {
 			s.Failures = append(s.Failures, "missing temporary-client baseline or final count")
@@ -775,7 +778,8 @@ func memsteadyReport(args []string) error {
 	if err := writeJson(filepath.Join(dir, "memsteady.json"), summary); err != nil {
 		return err
 	}
-	headroom := math.Min(24-summary.Client.Quiet.MaxMiB, 24-summary.Provider.Quiet.MaxMiB)
+	ceilingMiB := float64(memsteadyTargetBytes) / (1024 * 1024)
+	headroom := math.Min(ceilingMiB-summary.Client.Quiet.MaxMiB, ceilingMiB-summary.Provider.Quiet.MaxMiB)
 	row := fmt.Sprintf("| %s | %s | %s→%s | %.1f | %.2f / %.2f / %.2f | %.2f / %.2f / %.2f | %.2f / %.2f | %+.2f | %.1f / %.1f | %.2f / %.2f | %d→%d / %d→%d | %.2f / %.2f | %d→%d / %d→%d | %.2f / %.2f | %.2f / %.2f | %d | %d→%d / %d→%d | %s |",
 		summary.Tag, summary.Build, summary.ClientRole, summary.ProviderRole, summary.BurstMbps,
 		summary.Client.Quiet.P50MiB, summary.Client.Quiet.P95MiB, summary.Client.Quiet.MaxMiB,
@@ -794,7 +798,7 @@ func memsteadyReport(args []string) error {
 		map[bool]string{true: "PASS", false: "FAIL: " + strings.Join(append(append(summary.Failures, summary.Client.Failures...), summary.Provider.Failures...), "; ")}[summary.Pass])
 	table := filepath.Join(filepath.Dir(filepath.Clean(dir)), "MEMSTEADY.md")
 	if _, err := os.Stat(table); err != nil {
-		header := "# MEMSTEADY peer-burst/recovery blocks (goRuntimeBytes = go_total_bytes; MiB)\n\nThese blocks do not replace the carrier-specific forced-mode or browser performance matrices.\n\n| run | build | roles | burst Mb/s | client quiet p50/p95/max | provider quiet p50/p95/max | active max c/p | worst-case headroom | quiet PSS p50 c/p | process carrier max MiB c/p | process slots c/p (before→end) | device carrier max MiB c/p | device slots c/p (before→end) | transfer root max MiB c/p | NAT max MiB c/p | >24 MiB | window clients c/p (before→end) | verdict |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+		header := "# MEMSTEADY peer-burst/recovery blocks (goRuntimeBytes = go_total_bytes; MiB)\n\nThese blocks do not replace the carrier-specific forced-mode or browser performance matrices.\n\n| run | build | roles | burst Mb/s | client quiet p50/p95/max | provider quiet p50/p95/max | active max c/p | worst-case headroom | quiet PSS p50 c/p | process carrier max MiB c/p | process slots c/p (before→end) | device carrier max MiB c/p | device slots c/p (before→end) | transfer root max MiB c/p | NAT max MiB c/p | >32 MiB | window clients c/p (before→end) | verdict |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
 		if err := os.WriteFile(table, []byte(header), 0o644); err != nil {
 			return err
 		}
@@ -1027,7 +1031,7 @@ func statusHasProvidingPeer(line, name string) bool {
 }
 
 // memsteadyAttribute prints, per block and per side, the quiet window's
-// percentiles and what the worst sample held. The 24 MiB ceiling is a hard
+// percentiles and what the worst sample held. The 32 MiB ceiling is a hard
 // product limit and the blocks sit within a fraction of a MiB of it, so the
 // question whoever picks this up will ask is which structure holds the bytes.
 // The answer this readout gives is that the live heap is only a third of the

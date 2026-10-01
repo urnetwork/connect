@@ -80,9 +80,10 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 	}
 	// A configured process budget identifies an embedded/mobile client. Bound
 	// the connection-resident HTTP/WebSocket working set there; an unset or
-	// reference-sized budget leaves Go and gorilla defaults untouched for
-	// desktop and server callers.
-	if 0 < MemoryBudget() && MemoryBudget() < referenceMemoryBudgetByteCount {
+	// larger-than-reference budget leaves Go and gorilla defaults untouched
+	// for desktop and server callers. Include the exact reference: Android's
+	// 64-MiB process cap still needs explicit bounded HTTP/2 receive windows.
+	if 0 < MemoryBudget() && MemoryBudget() <= referenceMemoryBudgetByteCount {
 		settings.HttpReadBufferSize = MemoryScaledCount(4*1024, 2*1024)
 		settings.HttpWriteBufferSize = MemoryScaledCount(4*1024, 2*1024)
 		settings.WebSocketReadBufferSize = MemoryScaledCount(4*1024, 2*1024)

@@ -101,6 +101,9 @@ const (
 	// without blocking its producer: the peer's retry elicits another response.
 	// Keep that promise distinct from arbitrary public callbacks.
 	receiveRecoveryModeRegenerableControl
+	// A prepaid socket read owns one datagram while a shared, nonblocking
+	// provider actor waits for reliable Transfer ownership.
+	receiveRecoveryModePreparedDatagram
 )
 
 // Only a producer dedicated to one TCP flow may propagate bounded Transfer
@@ -112,7 +115,8 @@ func (self receiveRecoveryMode) waitsForProviderReturnAdmission() bool {
 
 // These owners can recover a refused send without treating it as delivered.
 func (self receiveRecoveryMode) providerReturnUpstreamRecoverable() bool {
-	return self.waitsForProviderReturnAdmission() || self == receiveRecoveryModeRegenerableControl
+	return self.waitsForProviderReturnAdmission() || self == receiveRecoveryModeRegenerableControl ||
+		self == receiveRecoveryModePreparedDatagram
 }
 
 // Internal provider delivery retains the receiver-visible transfer identity
@@ -780,6 +784,8 @@ type LocalUserNat struct {
 	receivePacketsCallbacks *CallbackList[ReceivePacketsFunction]
 	// provider batch callback that retains the transfer lane
 	receiveTransferPacketsCallbacks *CallbackList[receiveTransferPacketsFunction]
+	providerDatagramSenders         *CallbackList[*providerDatagramSender]
+	providerReturnCapacity          receiveCapacitySignal
 	// TCP completion includes teardown, socket failure, capacity retirement,
 	// and idle timeout.
 	tcpFlowCloseCallbacks *CallbackList[tcpFlowCloseFunction]
@@ -891,6 +897,7 @@ func newAdmittedLocalUserNat(ctx context.Context, clientTag string, settings *Lo
 		receiveTransferCallbacks:        NewCallbackList[receiveTransferPacketFunction](),
 		receivePacketsCallbacks:         NewCallbackList[ReceivePacketsFunction](),
 		receiveTransferPacketsCallbacks: NewCallbackList[receiveTransferPacketsFunction](),
+		providerDatagramSenders:         NewCallbackList[*providerDatagramSender](),
 		tcpFlowCloseCallbacks:           NewCallbackList[tcpFlowCloseFunction](),
 		sourceRetirementOwnerIds:        map[uint64]map[Id]bool{},
 		sourceRetirementSourceIds:       map[Id]map[uint64]bool{},
@@ -1652,6 +1659,10 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	// callback after this nat's Run starts.
 	udp4Buffer.receiveTransferPacketsCallback = self.receiveTransferPackets
 	udp6Buffer.receiveTransferPacketsCallback = self.receiveTransferPackets
+	udp4Buffer.prepareReturnReadCallback = self.prepareUdpReturnRead
+	udp6Buffer.prepareReturnReadCallback = self.prepareUdpReturnRead
+	udp4Buffer.providerReturnCapacity = &self.providerReturnCapacity
+	udp6Buffer.providerReturnCapacity = &self.providerReturnCapacity
 	udp4Buffer.kernelReceiveDropCount = &self.udpKernelReceiveDropCount
 	udp6Buffer.kernelReceiveDropCount = &self.udpKernelReceiveDropCount
 	tcp4Buffer.receiveTransferPacketsCallback = self.receiveTransferPackets
@@ -2490,9 +2501,10 @@ func writeIpv6Header(packet []byte, ipProtocol ipProtocolNumber, packetSourceIp 
 const defaultUdpReceiveShardCount = 4
 
 type udpReceiveDispatchItem struct {
-	memory   natMemoryReservation
-	sequence *UdpSequence
-	packet   []byte
+	memory         natMemoryReservation
+	sequence       *UdpSequence
+	packet         []byte
+	preparedPublic *providerDatagramPublicDispatch
 }
 
 type udpReceiveDispatchShard struct {
@@ -2500,6 +2512,10 @@ type udpReceiveDispatchShard struct {
 	startOnce sync.Once
 	items     chan udpReceiveDispatchItem
 	batchSize int
+	// Prepared actors are asynchronous producers. Closing this small gate
+	// before the final drain prevents a late publication after worker exit.
+	preparedMutex  sync.Mutex
+	preparedClosed bool
 }
 
 type udpReceiveDispatcher struct {
@@ -2548,13 +2564,7 @@ func (dispatcher *udpReceiveDispatcher) enqueue(sequence *UdpSequence, packet []
 		return false
 	}
 	shard := &dispatcher.shards[sequence.receiveShard]
-	shard.startOnce.Do(func() {
-		dispatcher.waitGroup.Add(1)
-		go HandleError(func() {
-			defer dispatcher.waitGroup.Done()
-			shard.run()
-		})
-	})
+	dispatcher.startShard(shard)
 	select {
 	case <-dispatcher.ctx.Done():
 		memory.release()
@@ -2569,11 +2579,30 @@ func (dispatcher *udpReceiveDispatcher) enqueue(sequence *UdpSequence, packet []
 	}
 }
 
+func (dispatcher *udpReceiveDispatcher) startShard(shard *udpReceiveDispatchShard) {
+	shard.startOnce.Do(func() {
+		dispatcher.waitGroup.Add(1)
+		go HandleError(func() {
+			defer dispatcher.waitGroup.Done()
+			shard.run()
+		})
+	})
+}
+
+func (shard *udpReceiveDispatchShard) closePreparedAdmission() {
+	shard.preparedMutex.Lock()
+	shard.preparedClosed = true
+	shard.preparedMutex.Unlock()
+}
+
 // Completion means every receive shard returned its queued packet owners.
 // The parent first joins every producer, so no shard can start during Wait.
 func (dispatcher *udpReceiveDispatcher) waitForLifecycle() {
 	if dispatcher == nil {
 		return
+	}
+	for index := range dispatcher.shards {
+		dispatcher.shards[index].closePreparedAdmission()
 	}
 	dispatcher.waitGroup.Wait()
 	// Cancellation and a buffered send can become ready together. The worker's
@@ -2590,6 +2619,10 @@ func returnQueuedUdpDispatchItems(items chan udpReceiveDispatchItem) {
 	for {
 		select {
 		case item := <-items:
+			if item.preparedPublic != nil {
+				item.preparedPublic.release()
+				continue
+			}
 			MessagePoolReturn(item.packet)
 			item.memory.release()
 			item.sequence.finishRetirementOperation()
@@ -2606,10 +2639,15 @@ func (shard *udpReceiveDispatchShard) run() {
 	hasPending := false
 
 	releaseQueued := func() {
+		shard.closePreparedAdmission()
 		if hasPending {
-			MessagePoolReturn(pending.packet)
-			pending.memory.release()
-			pending.sequence.finishRetirementOperation()
+			if pending.preparedPublic != nil {
+				pending.preparedPublic.release()
+			} else {
+				MessagePoolReturn(pending.packet)
+				pending.memory.release()
+				pending.sequence.finishRetirementOperation()
+			}
 			pending = udpReceiveDispatchItem{}
 			hasPending = false
 		}
@@ -2631,6 +2669,10 @@ func (shard *udpReceiveDispatchShard) run() {
 			}
 		}
 
+		if item.preparedPublic != nil {
+			item.preparedPublic.deliver()
+			continue
+		}
 		sequence := item.sequence
 		batch = append(batch[:0], item.packet)
 		memories = append(memories[:0], item.memory)
@@ -2642,7 +2684,7 @@ func (shard *udpReceiveDispatchShard) run() {
 		for len(batch) < cap(batch) {
 			select {
 			case next := <-shard.items:
-				if next.sequence != sequence {
+				if next.sequence != sequence || next.preparedPublic != nil {
 					pending = next
 					hasPending = true
 					break fill
@@ -2819,6 +2861,8 @@ type UdpBuffer[BufferId comparable] struct {
 	log                            Logger
 	receiveCallback                receiveTransferPacketFunction
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
+	prepareReturnReadCallback      udpReturnReadPrepare
+	providerReturnCapacity         *receiveCapacitySignal
 	udpBufferSettings              *UdpBufferSettings
 	receiveDispatcher              *udpReceiveDispatcher
 	socketReadPoller               *udpSocketReadPoller
@@ -2956,6 +3000,8 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			return nil
 		}
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
+		sequence.prepareReturnReadCallback = self.prepareReturnReadCallback
+		sequence.providerReturnCapacity = self.providerReturnCapacity
 		sequence.receiveDispatcher = self.receiveDispatcher
 		sequence.receiveShard = self.receiveDispatcher.assignShard()
 		if self.socketReadPoller == nil {
@@ -3203,6 +3249,10 @@ type UdpSequence struct {
 	log                            Logger
 	receiveCallback                receiveTransferPacketFunction
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
+	prepareReturnReadCallback      udpReturnReadPrepare
+	providerReturnCapacity         *receiveCapacitySignal
+	returnReadPending              atomic.Bool
+	returnReadCapacity             receiveCapacitySignal
 	receiveDispatcher              *udpReceiveDispatcher
 	receiveShard                   int
 	socketReadPoller               *udpSocketReadPoller
@@ -3616,6 +3666,10 @@ func (self *UdpSequence) Run() {
 			if err := socket.SetReadDeadline(readTimeout); err != nil {
 				return
 			}
+			lease, prepareErr := self.awaitReturnRead(socket, buffer)
+			if prepareErr != nil {
+				return
+			}
 			n, err := socket.Read(buffer)
 
 			if err != nil {
@@ -3624,11 +3678,12 @@ func (self *UdpSequence) Run() {
 				}
 			}
 
-			if 0 < n {
+			if 0 < n || n == 0 && err == nil && lease != nil {
 				self.UpdateLastActivityTime()
 
 				packets, packetsErr := self.DataPackets(buffer, n, self.udpBufferSettings.Mtu)
 				if packetsErr != nil {
+					lease.abort()
 					self.log.Infof("[f%d]udp receive packets error = %s\n", forwardIter, packetsErr)
 					return
 				}
@@ -3637,19 +3692,25 @@ func (self *UdpSequence) Run() {
 						self.log.Infof("[f%d]udp receive segemented packets = %d\n", forwardIter, len(packets))
 					}
 				}
-				for _, packet := range packets {
-					if self.log.V(1).Enabled() {
-						self.log.Infof("[f%d]udp receive %d\n", forwardIter, len(packet))
-					}
-					if self.receiveDispatcher == nil {
-						// Directly constructed sequences (primarily focused
-						// tests) retain synchronous ordered delivery.
-						self.singleDataPacket[0] = packet
-						self.receiveBatch(self.singleDataPacket[:])
-					} else if !self.receiveDispatcher.enqueue(self, packet) {
-						MessagePoolReturn(packet)
+				if lease != nil {
+					lease.commit(packets)
+				} else {
+					for _, packet := range packets {
+						if self.log.V(1).Enabled() {
+							self.log.Infof("[f%d]udp receive %d\n", forwardIter, len(packet))
+						}
+						if self.receiveDispatcher == nil {
+							// Directly constructed sequences (primarily focused
+							// tests) retain synchronous ordered delivery.
+							self.singleDataPacket[0] = packet
+							self.receiveBatch(self.singleDataPacket[:])
+						} else if !self.receiveDispatcher.enqueue(self, packet) {
+							MessagePoolReturn(packet)
+						}
 					}
 				}
+			} else {
+				lease.abort()
 			}
 
 			if err != nil {
@@ -7006,6 +7067,7 @@ func DefaultRemoteUserNatProviderSettingsWithMemoryTarget(targetByteCount ByteCo
 	}
 	return &RemoteUserNatProviderSettings{
 		WriteTimeout:            30 * time.Second,
+		UdpTransferNoAck:        true,
 		ReturnSendRetryTimeout:  10 * time.Millisecond,
 		ReturnSendWorkerCount:   8,
 		ReturnSendQueueSize:     MemoryScaledCount(256, 64),
@@ -7024,6 +7086,14 @@ func DefaultRemoteUserNatProviderSettingsWithMemoryTarget(targetByteCount ByteCo
 
 type RemoteUserNatProviderSettings struct {
 	WriteTimeout time.Duration
+	// UdpTransferNoAck defaults to true and selects datagram Transfer delivery
+	// for actual UDP socket returns. The socket reader still reserves bounded
+	// ownership before reading and retries a refused local handoff. Successful
+	// route writes do not imply peer receipt and are never source-ACK evidence.
+	// Set this to the same value
+	// as MultiClientSettings.UdpTransferNoAck for a symmetric UDP policy.
+	// Borrowed public callbacks and ICMP retain their existing policy.
+	UdpTransferNoAck bool
 	// ReturnSendRetryTimeout is the strict pacing floor between failed TCP
 	// sender admissions. Zero retains the default.
 	ReturnSendRetryTimeout time.Duration
@@ -7575,6 +7645,7 @@ type RemoteUserNatProvider struct {
 	returnItemPool   chan *providerReturnItem
 	returnAdmissions sync.WaitGroup
 	returnWorkers    sync.WaitGroup
+	datagramSender   *providerDatagramSender
 	closeOnce        sync.Once
 
 	// Test-only synchronization seams. Nil keeps production callbacks and
@@ -7717,6 +7788,8 @@ func newAdmittedRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat
 	}
 	userNatProvider.sourceRetirementOwnerId = localUserNat.newSourceRetirementOwner()
 	userNatProvider.startReturnSenders()
+	userNatProvider.datagramSender = newProviderDatagramSender(userNatProvider)
+	localUserNatDatagramUnsub := localUserNat.addProviderDatagramSender(userNatProvider.datagramSender)
 
 	// Register both return paths. No-contract peers can take the NAT's drained
 	// batch directly; contract-bearing peers are fanned back to Receive so the
@@ -7733,6 +7806,7 @@ func newAdmittedRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat
 		userNatProvider.tcpFlowClosed,
 	)
 	localUserNatUnsub := func() {
+		localUserNatDatagramUnsub()
 		localUserNatBatchUnsub()
 		localUserNatPacketUnsub()
 		localUserNatFlowCloseUnsub()
@@ -8858,8 +8932,9 @@ func (self *RemoteUserNatProvider) returnSendRecoveryOption(
 	item *providerReturnItem,
 ) sendPackRecoveryOption {
 	return sendPackRecoveryOption{
-		upstreamRecoverable:   item.recoveryMode.providerReturnUpstreamRecoverable(),
-		retainAfterAckTimeout: item.recoveryMode == receiveRecoveryModeTcpSocket,
+		upstreamRecoverable: item.recoveryMode.providerReturnUpstreamRecoverable(),
+		retainAfterAckTimeout: item.recoveryMode == receiveRecoveryModeTcpSocket ||
+			item.recoveryMode == receiveRecoveryModePreparedDatagram,
 	}
 }
 
@@ -9943,6 +10018,9 @@ func (self *RemoteUserNatProvider) Close() {
 		}
 		self.returnAdmissions.Wait()
 		self.returnWorkers.Wait()
+		if self.datagramSender != nil {
+			<-self.datagramSender.done
+		}
 		for _, queue := range self.returnSendQueues {
 		drainQueue:
 			for {

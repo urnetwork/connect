@@ -1,18 +1,329 @@
 # Memory-budget performance research
 
 This is the working research document for converting bounded mobile memory
-headroom into lower page TTFB and higher transfer speed while keeping the iOS
-profile's Go runtime at or below a hard 24 MiB cap in every phase. Its subject is the allocation
+headroom into lower page TTFB and higher transfer speed while keeping the current
+iOS v2 profile's Go runtime at or below a hard 32 MiB cap in every phase. Its subject is the allocation
 of memory budgets: what each budget admits or retains, the performance mechanism
 it funds, the marginal result per MiB, and how that memory is reclaimed when the
 device changes roles. Update the hypotheses, measurements, and decisions here
 as experiments run; `LOWBAR.md` remains the full validation history.
 
 The central question is not "how can every limit be smaller?" It is: **given a
-fixed 24 MiB iOS-profile runtime envelope, which movable bytes buy the most
+fixed 32 MiB iOS-profile runtime envelope, which movable bytes buy the most
 useful TTFB and goodput across every live carrier?**
 Reducing allocation churn creates spendable headroom; queue, root, carrier, and
 topology budgets decide whether that headroom can do useful work.
+
+Current profiles, authorized 2026-09-30: iOS uses **32/32 MiB** DeviceLocal
+admission/Go soft limit; normal Android uses **64/64 MiB**, with both inputs
+clamped to the effective three-quarters-memory-class allowance. An unavailable
+or invalid Android memory class retains the 24/24-MiB fallback. The debug-only
+Android iOS surrogate is now **`ios-memory-audit-v2`**, with the independent
+observed Go ceiling **32 MiB = 33,554,432 bytes**. Historical v1 retains its
+20/32/28-MiB meaning. No historical artifact is requalified by this change.
+
+The admission partition remains DNS 10%, shared transfer/NAT 65%, carriers 25%.
+Mobile queue/window caps scale from their 24-MiB calibration and retained-byte
+accounting stays enabled above it. Explicit mobile H3 accounting now also stays
+enabled above 32 MiB: the full target-scaled receive window plus 1,600 KiB of
+send/socket/control/application ownership forms one composed carrier claim.
+Previously a 64-MiB target silently disabled those mobile accounting controls.
+Desktop constructors retain their existing classification. Returned pools remain
+256 KiB packet + 512 KiB large objects; GOGC remains 25 pending measurement.
+
+These are admission and GC settings, not a guarantee that every byte of live
+runtime fits those numbers. DNS singleton progress, carrier handoff overlap,
+runtime metadata, returned pools, and native/OS memory require separate telemetry.
+The signed iOS Network Extension **kernel lifetime `phys_footprint` peak must
+remain strictly below 50 MiB (52,428,800 bytes)**. No current physical-iPhone
+run qualifies that requirement. Android proxy and host measurements cannot do so.
+
+Deterministic profile/allocation/overlap tests cover 32 and 64 MiB. The new host
+H1 screen compares 20/32, 32/32, 28/64 and 64/64 at fixed GOGC/pools; loaded
+physical profile and performance qualification remain open. Dated results below
+retain their original inputs and verdicts.
+
+### 2026-09-30 full-target profile screens and quiet-reclaim candidate
+
+These are **host diagnostics, not PERFVAR results or physical memory passes**.
+The first eight-process screen used five in-process providers and began traffic
+after only five clients existed. Although every process delivered its echoes,
+Android 64/64 was still forming its larger topology during both measured routes.
+Those rates cannot establish a steady old/new comparison. Preserve that entire
+denominator in `/tmp/urnetwork-mobile-profiles-v2.bKYkJH`; no failed qualification
+was converted into a pass by dropping a cell.
+
+The corrected screen used twelve identical in-process providers in every arm.
+Before **each** measured route it required both target-scaled windows to have
+their exact healthy/present client counts, without warnings, done/quarantined
+channels or duplicate identities, continuously for one second. The merged
+`MinSatisfied` flag alone is insufficient because its two window values merge
+by OR. A timeout or sampled/terminal readiness loss invalidates the cell. The
+old five-client predicate failed deterministic readiness tests; the corrected
+gate passed normal/race tests and three independent fresh normal processes.
+
+All **8/8** corrected cells passed the declared delivery/readiness checks, in
+palindromic order v1, v2, prior Android, full Android, full Android, prior Android,
+v2, v1. Every quality/speed route sent 64 flows × 1,024 packets × 1,200 payload
+bytes. GOMAXPROCS=2, GOGC=25, returned pools=256/512 KiB, 100-ms active samples,
+20 seconds natural quiet, then separately forced GC/scavenge and resume were
+fixed. The observations are UDP echo payload goodput and full echo RTT over H1,
+not HTTP TTFB. UI/screen-sharing host noise was recorded before every cell.
+
+| Target / soft MiB | Ready quality + speed windows | Mean quality / speed Mb/s | Mean quality / speed p95 RTT, ms | Maximum sampled Go MiB |
+|---|---|---|---|---|
+| iOS v1 control 20/32 | 4 + 1 | 351.98 / 355.09 | 3.183 / 3.001 | 25.820 |
+| iOS v2 32/32 | 5 + 1 | 347.29 / 354.06 | 3.176 / 3.083 | 27.008 |
+| Prior Android 28/64 | 4 + 1 | 354.90 / 358.84 | 3.180 / 3.021 | 26.453 |
+| Full Android 64/64 | 10 + 2 | 342.40 / 340.69 | 3.561 / 3.536 | 32.722 |
+
+The iOS mean changes were −1.33% quality / −0.29% speed; Android changes were
+−3.52% / −5.06%, with p95 RTT +12.0% / +17.0%. These two repetitions per arm
+on a noisy host establish neither a speed win nor a regression bound. In
+particular, larger admission did not make this workload faster. Its stop/wait
+generator keeps only one 1,200-byte packet in flight per flow: it does not fill
+multi-MiB transfer queues. Maximum sampled transfer-root use was 8.30%, 5.15%,
+5.97%, and 3.04% respectively; the root includes a fixed 1-MiB peer-pin
+reservation. Carrier use reached 25%, 18.75%, 21.43%, and 43.75% respectively,
+including formation observations. Returned retention stayed at or below
+512 KiB of the 768-KiB total cap. No client/provider handoff drops or runtime
+GC-limiter activation were observed.
+
+Active GC cycles were 787/788, 765/783, 767/776, and 633/632; mean GC CPU seconds
+were 2.443, 2.504, 2.447, and 2.553. Mean active allocation was 2,555, 2,584,
+2,563, and 2,607 MiB respectively. These include the loopback providers and
+cannot be assigned to a mobile client alone. The larger Android topology
+retained more live owners even though its admission limits were unsaturated.
+
+Both full-Android cells performed one natural quiet trim, after one settled-owner
+deferral, at quiet second 18 or 19. Go runtime fell from 31.41–31.78 MiB to
+25.89–26.04 MiB, spending about 0.023 GC CPU seconds; returned pool retention
+fell from 512 to 256 KiB. Other cells recorded no quiet trim within this short
+window. The outstanding-owner guard is **not** an absolute veto: it already
+allows a settled count after a two-second retry. Zero trim counts in the short
+first screen therefore prove neither that guard is blocking nor that the
+24-MiB reclaim threshold is appropriate for Android64.
+
+The next single-variable candidate scales the Go-runtime quiet-reclaim trigger
+above a 32-MiB soft limit to three quarters of the actual effective limit:
+**Android64: 48 MiB; iOS32: unchanged 24 MiB**. Smaller-limit cases preserve
+the historical 24-MiB trigger. This is not an admission cap or physical-memory
+guarantee. The independent 40-MiB physical-pressure trigger, one-minute cooldown,
+settled-owner guard, GOGC=25, and returned pools remain unchanged. Deterministic
+boundary, no-early-trim, limit-change, latch, and independent physical-pressure
+tests precede the controlled 24/48/48/24-MiB threshold comparison. That comparison
+uses 60 seconds natural quiet and a natural resume **before** separately forced
+collection; its result is not yet a physical qualification.
+
+The predeclared threshold comparison completed **4/4 fresh processes**, in
+24/48/48/24-MiB order, with the same Android64/64 inputs, 10+2 ready windows,
+twelve providers, payload, GOGC=25 and returned-pool caps. The two binaries
+differed only in the pure Go-runtime reclaim-threshold function. All routes
+retained readiness and had zero client/provider handoff drops.
+
+| Reclaim threshold | Natural forced trims, runs | 60-second quiet GC CPU seconds | Final quiet Go MiB | Natural-resume p95 / max echo RTT, ms, runs | Resume pool creations, runs |
+|---|---|---|---|---|---|
+| Historical 24 MiB | 1, 1 | 0.0601, 0.0707 | 28.269, 26.980 | 0.577 / 1.623; 0.964 / 2.280 | 44, 41 |
+| Scaled 48 MiB | 0, 0 | 0.0242, 0.0322 | 29.004, 29.152 | 0.538 / 1.994; 0.567 / 1.606 | 0, 0 |
+
+Quiet GC cycle counts were 3/3 versus 1/2; natural/background GC still ran in
+the candidate. Returned retention at quiet end was approximately 254 KiB in
+the controls and 510 KiB in the candidates, below the unchanged 768-KiB cap.
+Candidate maximum sampled Go was 33.301/33.465 MiB, versus 34.160/32.832 MiB
+in the controls, all below the **Android64** soft setting. These are not iOS32
+samples and must never be offered to its observed-Go gate. Natural resume ran
+before the separately labeled forced collection/scavenge; the latter cannot
+explain the natural-resume counters.
+
+Retain the narrowly scaled Android quiet threshold: it avoids premature forced
+collection and pool rebuilding inside the expanded allowance while preserving
+the iOS32 and independent physical-pressure rules. This is a maintenance-policy
+decision, **not a performance-baseline promotion**. Active quality/speed means
+were 339.10/347.74 Mb/s for control and 315.55/346.26 for candidate; the noisy
+quality outlier prevents a speed or comparability claim. Longer physical
+MEMSTEADY/PERFVAR work remains necessary. No returned-pool or GOGC tuning is
+supported by this small host experiment.
+
+Threshold receipts are under `/tmp/urnetwork-mobile-reclaim-ab.7NVpbH/`.
+Results SHA-256:
+`cd4268b9e9c9080960836d20a56bf33d9bca1c7218a05b36750d0d7421b4ba19`.
+Control/candidate binary SHA-256:
+`2bbfe40072cab42ccfaf11eb75dced0afa8e45ed035a78d8b1ead3f0c8c040e7` /
+`7fa200e0278f7207c65503a166f67d8ee2a8738491e7ed735e1133629c6146a6`.
+SDK/Connect Go-source manifest SHA-256:
+`2db254d198a51af4f57e5e2488e0eb3ce7aeda3fcf4b691f1b5d5a9c8cd551e7` /
+`a772874e4d76c9c58e0c801e482502477e35566cd090ef698fa1f8d6c8c62ee4`.
+Every source, plan, overlay and binary pre/post check passed. Deterministic
+threshold tests first reproduced the premature 24-MiB trim, then passed the
+candidate, a race run and three independent fresh normal processes.
+
+Corrected-screen receipts: `/tmp/urnetwork-mobile-ready-v2.dbUM40/`
+contains the frozen plan, eight complete logs, owner/GC/pool observations,
+`cells.json`, and exact `results.json`. Results SHA-256:
+`a0045ec4464b89b45ed696ad54d4947dfd88b1946d9caa1822fb15197d761fd0`.
+Binary SHA-256:
+`2f8bed92b0d45c568ff99d5fe72ad306bb3cea662cd182a9716574ff1430a610`.
+SDK/Connect Go-source manifest SHA-256 values:
+`125b8f8235fd64e7b09faf3af2860de13b06cf37e3b9e7c24d2c3d3e2f071436` /
+`a772874e4d76c9c58e0c801e482502477e35566cd090ef698fa1f8d6c8c62ee4`.
+All pre/post source, overlay, plan and binary checks passed. SDK `c50e10db`
+and Connect `a89ce36f` were dirty, source-attested trees, not clean revisions.
+The host-only overlay changes only the mobile-platform predicate; the idle
+trimmer uses that same predicate without changing production GOOS behavior.
+
+Neither screen supplies the five-minute quiet physical gate, native/OS
+footprint, a loaded Android startup/profile proof, or signed iPhone evidence.
+The iOS v2 all-phase observed-Go gate remains <=33,554,432 bytes, and the actual
+Network Extension kernel lifetime `phys_footprint` peak must remain strictly
+<52,428,800 bytes. The latter remains unqualified until real-device testing.
+
+### Earlier 2026-09-30 evaluation: 32-MiB Go ceiling / below-50-MiB extension footprint
+
+Historical proposal and evidence review. Its stated 20/32 inputs and 28-MiB
+current gate were superseded by v2 above; its missing physical-iPhone evidence
+and requirement to measure kernel lifetime peak remain unresolved.
+
+**Proposal only; the current 28-MiB observed gate and 20/32-MiB iOS
+admission/soft inputs remain unchanged.** A 32-MiB observed Go ceiling would
+be exactly 33,554,432 bytes; the separate requested Network Extension
+`phys_footprint` bound is strictly below 50 MiB (52,428,800 bytes). A larger
+acceptance ceiling alone changes neither allocation nor performance.
+
+The retained physical iPhone baseline in
+[`sdk/build/APPLE_EXTENSION_MEMORY_BUDGET.md`](../sdk/build/APPLE_EXTENSION_MEMORY_BUDGET.md)
+is a signed Release build on iPhone 16 Pro Max / iOS 26.6, dated 2026-08-15:
+12 connected samples over 55 seconds, maximum Go runtime **19.635 MiB** and
+extension `phys_footprint` **20.876 MiB**, with 20/32-MiB inputs. It does not
+exercise Go use near 32 MiB, sustained traffic, recovery, or current source.
+The difference between those maxima is not a fixed native-overhead allowance.
+On this review's read-only CoreDevice inventory, the two listed iPhone 17 Pro
+entries were `shutdown`; no available physical iPhone was established. A real
+signed Network Extension run is therefore an outstanding prerequisite, not
+something the Android surrogate or an iOS simulator can replace.
+
+Apple DTS reports 50-MiB packet-tunnel limits on its tested iOS 16 devices and
+the same values for iOS 17/18, while explicitly requiring device/OS testing;
+that is not a universal guarantee for every later or older device.
+[Apple's provider-limit discussion](https://developer.apple.com/forums/thread/73148)
+and [Go's soft-limit contract](https://go.dev/doc/gc-guide#Memory_limit) also
+preclude treating a 32-MiB Go setting as a hard 32-MiB process footprint. Go
+accounting excludes native allocations and other OS-accounted memory, and the
+runtime may exceed its soft limit to make progress. Nominal 50-minus-32
+headroom is not a demonstrated safety margin.
+
+At the start of this review, `ExtensionMemoryMonitor.swift` retained only
+`TASK_VM_INFO.phys_footprint` every five seconds plus lifecycle/pressure events;
+that sampled maximum could miss a burst. The monitor now uses the implemented
+`ExtensionMemoryFootprint` decoder in `TunnelMemoryBounds.swift` to retain
+current footprint, kernel lifetime peak, and available-memory metadata from
+one `task_info` call. Returned counts and success gate each field; failures
+remain explicitly unavailable, never a fabricated zero. The existing SDK
+recorder still receives current footprint, not the historical kernel peak.
+Its sampled peak remains distinct from the newly logged kernel value. The
+installed iOS SDK exposes `ledger_phys_footprint_peak` at `TASK_VM_INFO_REV3`
+and `limit_bytes_remaining` at REV4. Apple's
+[XNU task-info implementation](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/task.c)
+reads a ledger lifetime maximum for the former. This implementation and its
+failure/count/availability tests have offline validation only; no new signed
+physical-iPhone extension capture is qualified. The five-second schedule is
+unchanged. App-page footprint is a different process and cannot be used in its
+place. Termination or a missing final sample remains a failure.
+
+Qualification required before adopting 32 MiB: source/build-pinned signed
+physical-iPhone sessions, at least three independent fresh extension processes,
+actual 20/32 inputs and rate-zero instrumentation, H1/default-path page and
+bulk traffic, bounded concurrency/reconnect/underlay transitions, drain, five
+quiet connected minutes, and teardown. Retain paired Go/current/kernel-peak
+footprint samples with phase/process identity and availability, all-sample Go
+max <=33,554,432 and kernel lifetime footprint max <52,428,800, quiet p50/p95/max,
+no sampler gaps/reset hidden by a new process, and no jetsam or watchdog death.
+Preserve any [jetsam report](https://developer.apple.com/documentation/xcode/identifying-high-memory-use-with-jetsam-event-reports)
+with its actual page size/build identity. A workload staying below 28 MiB
+does not demonstrate safe use of the proposed extra 4 MiB. Existing 40-MiB
+footprint-triggered quiet reclaim is only a provisional 10-MiB margin, not an
+active-load hard cap; no empirically safe minimum headroom is established yet.
+
+The proposed verifier must reject any absent/unavailable kernel peak, malformed
+or incomplete phase record, process-identity change, decreasing lifetime peak,
+or missing terminal observation; none becomes numeric zero or a fresh baseline.
+For one fresh, identity-bound extension lifetime, require positive current
+footprint <= kernel lifetime peak <52,428,800 bytes and positive observed Go
+runtime <=33,554,432 bytes throughout the predeclared phases. Preserve kernel
+peak even if every current sample missed the burst. Remaining-memory bytes are
+advisory metadata, not an alternative threshold or evidence of safety; reported
+zero and unavailable are distinct. Publish the maximum and quiet distribution,
+the complete failure denominator, source/build/PID-generation binding and
+cleanup/termination outcome. No offline parser is claimed to qualify an iPhone
+capture until that capture provides these identity and phase fields.
+
+Normal Android's 40-to-64-MiB process-limit change is separate. Its DeviceLocal
+target remains 28 MiB, and the iOS audit profile remains 20/32. Focused profile,
+memory-class clamp, HTTP/WebSocket-boundary tests and one Galaxy startup pass;
+the host-only measurements below show no meaningful H1 improvement. Loaded
+physical memory, GC cost and device performance remain unqualified.
+`Sdk.setMemoryLimit` also changes constructor
+sizing through `connect.SetMemoryBudget` (40/64 to 64/64 scale), so using that
+API is not solely a GC change. Current mobile returned-buffer pools remain
+capped at 256/512 KiB at either limit. Historical 64/20 Android peaks of
+43.16/50.94 MiB had unequal workloads and older source; they motivate a fresh
+40/64 comparison, not a current causal claim. Require actual effective limit
+after the Android memory-class clamp, H1 TTFB/goodput/GC-cost evidence, whole-app
+memory/pressure/recovery observations, and unchanged iOS-profile isolation
+before claiming a performance or loaded-memory benefit from the larger allowance.
+
+### 2026-09-30 Android 64-MiB host screen and startup-policy proof
+
+This is **non-PERFVAR host diagnostic evidence, not a device-speed win or a
+physical memory qualification**. The opt-in SDK test
+`TestDeviceLocalH1AndroidMemoryExperiment` ran six fresh processes in fixed
+order **40/40, 40/64, 64/64, 64/64, 40/64, 40/40** (process constructor-sizing /
+Go soft limit, MiB). Every arm kept target 28 MiB, GOGC 25, two Go cores, the
+same mobile-policy-only host overlay and five in-process providers. Each
+quality/speed route echoed 64 flows × 256 packets × 1,200 payload bytes over
+real H1 WebSockets, followed by 12 seconds of natural quiet and a separately
+labeled forced collection/scavenge and resume. No public endpoint or HTTP
+request was used; latency is full echo RTT, not HTTP TTFB.
+
+All **6/6 PASS**, with zero client/provider handoff drops. Two repetitions per
+arm on an uncontrolled noisy host are not a formal improvement test. Values
+below are rounded; exact per-cell values are retained in `results.json`.
+
+| Sizing/soft MiB | Mean quality / speed payload Mb/s | Maximum sampled Go MiB | 12-second quiet Go MiB, range | Active GC cycles, runs | Active GC CPU seconds, range |
+|---|---|---|---|---|---|
+| 40/40 | 365.76 / 395.94 | 23.148 | 20.898–22.664 | 224, 221 | 0.649–0.668 |
+| 40/64 | 362.48 / 391.12 | 23.387 | 20.195–22.855 | 221, 222 | 0.658–0.677 |
+| 64/64 | 365.50 / 398.55 | 23.535 | 22.023–22.597 | 220, 218 | 0.655–0.671 |
+
+GC assist CPU ranges were 0.375–0.388, 0.377–0.394 and 0.379–0.392 seconds;
+active allocation ranges were 641.272–650.476, 640.494–641.282 and
+641.536–647.460 MiB respectively. The GC limiter's last-enabled cycle was zero
+in every cell. Actual 64/64 versus 40/40 means were **−0.07% quality / +0.66%
+speed**, noise-scale differences, not a demonstrated improvement. This load
+gave no evidence that the 40-MiB soft limit was binding. Runtime values are
+100-ms post-warmup samples, include loopback providers and exclude non-Go
+process memory; they can miss short peaks. Twelve seconds of quiet is not the
+five-minute physical steady-state gate.
+
+Private artifacts: `/tmp/urnetwork-android64-h1.8v2Sta/{PLAN.md,handoff.json,
+results.json,cell-01-40-40.log,...,cell-06-40-40.log}`. SDK HEAD `c50e10db`
+and Connect HEAD `a89ce36f` had recorded source deltas, not clean trees.
+The test source SHA-256 is
+`ea3a044229ee492a892fbcd400b457bfeb61f6eaa5c6805704cd5f18cbd5edaa`;
+binary SHA-256 `887da17dffea6f68f91ab964cb41def7fb5e56f59d9353115f495931d100305e`.
+SDK/Connect source-manifest hashes and the sole mobileRuntime overlay are in
+the handoff; source and binary postchecks passed. The results SHA-256 is
+`966e9e897b2b7c469c8d0483067ee409f39e1e3d7bf2afb4feaad27715ffebce`.
+
+Separately, the allowlisted Galaxy S24 Ultra passed the opt-in no-login
+`AndroidMemoryStartupTest` **1/1** after fresh normal-profile SDK/app/test
+builds. Actual `ActivityManager.memoryClass=256` MiB; expected and observed Go
+soft limit were **67,108,864 bytes (64 MiB)**, and configured DeviceLocal target
+was **29,360,128 bytes (28 MiB)**. No activity/login/credential helper, traffic,
+or DeviceLocal instance was used. This proves startup policy, not a loaded
+footprint or speed result. The Pixel was untouched. Exact command, APK/AAR
+hashes and numeric receipt:
+`/tmp/urnetwork-android64-galaxy-startup-20260930.md`. The current iOS observed
+28-MiB gate and 20/32 inputs are unchanged; its 32/<50 proposal remains open.
 
 ## Physical Android device allowlist
 
@@ -40,22 +351,23 @@ additional devices remain outside the cohort and do not invalidate a block.
 
 The current Android campaign is an **iOS memory-profile proxy**, not an audit of
 Android's normal production memory allowance. The authoritative iOS profile in
-`apple/app/extension/TunnelMemoryBounds.swift` passes a **20 MiB DeviceLocal
+`apple/app/extension/TunnelMemoryBounds.swift` passes a **32 MiB DeviceLocal
 admission target** and a **32 MiB process/Go soft limit**. Its measured Go runtime
-must never exceed **24 MiB**, including baseline, burst, drain, role transition,
+must never exceed **32 MiB**, including baseline, burst, drain, role transition,
 and quiet recovery. These three quantities are different: the device target
-sizes admission controls, the soft limit paces GC, and 24 MiB is the hard observed
+sizes admission controls, the soft limit paces GC, and 32 MiB is the hard observed
 runtime acceptance cap.
 
-Normal Android builds retain their larger 28 MiB device target / 40 MiB process
-soft limit. Audit APKs explicitly select the debug-only
-`ios-memory-audit-v1` profile, reproduce iOS's 20/32 MiB inputs, and record the
+Normal Android builds use a 64 MiB device target / 64 MiB process soft-limit
+cap, both clamped to three quarters of Android's memory class. Audit APKs explicitly select the debug-only
+`ios-memory-audit-v2` profile, reproduce iOS's 32/32 MiB inputs, and record the
 profile, values, source revisions/patch hashes, and installed APK hash. Both
-phones must report the selected profile and target; every diagnostic sample
+phones must report the selected `memoryProfile=ios-memory-audit-v2` and target;
+every primitive sample must attest that selected profile and every diagnostic sample
 must contain the expected 32-MiB `go_limit_bytes`. An ordinary Android-profile
 APK cannot pass this campaign even when its sampled runtime happens to be low.
 The historical 24-MiB target budget ledger below describes earlier calibration
-arms; it must not replace the current iOS profile's 20-MiB admission target.
+arms; it must not replace the current iOS v2 profile's 32-MiB admission target.
 
 Android measurements establish proxy evidence about the shared Go runtime and
 budget controls. They do not establish Android production-profile conformance
@@ -89,12 +401,12 @@ Extension `phys_footprint`. The mobile acceptance rules are:
 
 - every iOS-profile runtime sample, including baseline, active traffic, drain,
   role transitions, and five quiet connected minutes after a burst, must stay
-  <= 24 MiB; report quiet p50/p95 as well as the maximum;
-- any sample above 24 MiB fails and requires allocation attribution rather than
+  <= 32 MiB; report quiet p50/p95 as well as the maximum;
+- any sample above 32 MiB fails and requires allocation attribution rather than
   a larger limit; there is no grace band above the cap;
-- the carrier-budget matrix below passes at the actual 20-MiB device target and
+- the carrier-budget matrix below must pass at the actual 32-MiB device target and
   32-MiB process limit. A passing H1-only test or a test sized at the historical
-  24-MiB target cannot certify this campaign;
+24-MiB target cannot certify this campaign;
 - every carrier graph, including an unowned NetworkSpace API/feed/probe path,
   consumes the same process-root allowance. A fallback may be refused when the
   aggregate budget is full, but it may not allocate from a separate hidden
@@ -114,35 +426,41 @@ never retained in checked-in results.
 
 ## Memory budget and provider state
 
-### Current iOS-profile admission ledger (2026-09-17)
+### Current mobile admission ledger (2026-09-30, v2)
 
-The 20-MiB iOS DeviceLocal target now splits into 2 MiB of DNS, a 13-MiB
-shared transfer/topology root, and 5 MiB of platform carriers. The transfer
+The 32-MiB iOS DeviceLocal target splits into approximately 3.2 MiB of DNS,
+20.8 MiB of shared transfer/topology ownership, and 8 MiB of platform carriers.
+The 64-MiB Android target doubles each area to 6.4/41.6/16 MiB. The transfer
 root is stable across role changes; its children are overlapping admission
 ceilings rather than additive reservations:
 
 | Admission owner | Provider on | Provider off |
 | --- | ---: | ---: |
-| DNS | 2 MiB | 2 MiB |
-| Shared transfer/topology root | 13 MiB | 13 MiB |
-| &nbsp;&nbsp;Client send/receive, Pack, P2P, and peer identity pins | 9 MiB | 13 MiB |
+| DNS | 3.2 MiB | 3.2 MiB |
+| Shared transfer/topology root | 20.8 MiB | 20.8 MiB |
+| &nbsp;&nbsp;Client send/receive, Pack, P2P, and peer identity pins | 14.4 MiB | 20.8 MiB |
 | &nbsp;&nbsp;&nbsp;&nbsp;Fixed durable peer-pin child (inside client) | 1 MiB | 1 MiB |
-| &nbsp;&nbsp;Provider send/receive and P2P child | 2 MiB | 640 KiB control floor |
-| &nbsp;&nbsp;All fallback, remote, and retiring NAT generations | 2 MiB | 2 MiB |
-| Shared platform carriers | 5 MiB | 5 MiB |
+| &nbsp;&nbsp;Provider send/receive and P2P child | 3.2 MiB | 640 KiB control floor |
+| &nbsp;&nbsp;All fallback, remote, and retiring NAT generations | 3.2 MiB | 3.2 MiB |
+| Shared platform carriers | 8 MiB | 8 MiB |
 
-The child rows deliberately do not sum to 13 MiB. They describe which class
+The child rows deliberately do not sum to 20.8 MiB. They describe which class
 may borrow idle root capacity; every live reservation is charged atomically to
-both its child and the one 13-MiB root. A role transition may leave old client
+both its child and the one 20.8-MiB root. A role transition may leave old client
 owners draining while provider or NAT work starts, but those generations may
-not escape into independent pools or overdraw the root.
+not escape into independent pools or overdraw the root. Integer byte rounding
+is retained: iOS DNS/root/carrier are exactly 3,355,443 / 21,810,380 / 8,388,608
+bytes (one target byte left); Android uses 6,710,886 / 43,620,760 / 16,777,216
+bytes (two target bytes left). Android provider/NAT/client shares double, while
+the fixed 1-MiB durable pin owner, 640-KiB idle provider control floor, and
+process returned-buffer caps do not multiply with every child or generation.
 
 The mobile peer-identity pin store prepays **1 MiB inside the client group**
 before allocating its fixed 256-entry table, 128-KiB-plus-one input/output
 owner, path, or decode/serialization scratch. This is not an extra device or
-process allowance: the iOS target remains 20 MiB, the process soft limit remains
-32 MiB, and every accepted runtime sample must remain at or below 24 MiB.
-The 28-MiB profile uses the same 1-MiB leaf inside its existing larger root.
+process allowance: the iOS target and process soft limit are 32 MiB, and every
+accepted v2 runtime sample must remain at or below 32 MiB.
+The Android profile uses the same 1-MiB leaf inside its larger root.
 At most **256 peers** and **128 KiB of persisted input/serialized output** are
 supported; no pin is evicted. A full store can still verify/update an existing
 peer, but refuses a new signed-pin commit before opening that session's Required cipher.
@@ -271,14 +589,18 @@ NetworkSpace API, feed, probe, and extender claims attach directly to that root.
 Thus two devices in one process, an inner carrier plus its extender, and an
 Auto race cannot each spend an independent allowance.
 
-Ordinary Android uses the same hierarchy rather than a separate code path: its
-28-MiB device target yields a 7-MiB child and its 40-MiB process profile yields
-a 10-MiB root (the 16-slot cap is unchanged). A slot admits one logical
+Current ordinary Android's **28/64-MiB** inputs yield a **7-MiB explicit
+device carrier budget / 16-MiB process-sized default carrier budget**, both
+with the unchanged 16-slot cap (`memory_budget.go` uses one quarter of the
+respective target here). The former **28/40 → 7/10-MiB** mapping is historical.
+Current constructors return independent lifecycle-owner admission roots;
+the shared-process-root description above is an older design, not the current
+`SetMemoryBudget` contract. A slot admits one logical
 PlatformTransport/carrier graph; it is not a raw file-descriptor count. Every
 physical socket, concurrent dial candidate, and inner/outer layer in that graph
 still contributes its full byte working set to the claim. Deterministic tests pin both
-20/32 and 28/40. The physical acceptance threshold in this campaign remains
-the stricter iOS-profile 20/32 inputs and all-sample 24-MiB runtime cap.
+20/32, historical 28/40, and current 28/64. The physical acceptance threshold in this campaign remains
+the iOS-profile 20/32 inputs and all-sample 28-MiB runtime cap.
 
 The 2-MiB DNS row covers DeviceLocal name-resolution/cache admission. It is not
 an exemption for transport-over-DNS. `H3Dns`, `H3DnsPump`, and the DNS extender
@@ -290,7 +612,7 @@ inner H3 window.
 
 These are admission ceilings, not eager allocations or a proof that mapped
 runtime fits. Runtime includes allocator spans, goroutine stacks, GC metadata,
-and all simultaneously retained ownership, so the independent hard <=24-MiB
+and all simultaneously retained ownership, so the independent hard <=28-MiB
 observed runtime gate still applies. The process GC soft limit is 32 MiB.
 
 ### Required live-carrier budget matrix
@@ -349,7 +671,8 @@ These are arithmetic window bounds, not measured throughput or an acceptance
 claim. Restoring the old 20-MiB connection credit while charging its fixed
 owners would need a 4160-KiB inner claim and **6112 KiB** for the nested graph,
 992 KiB beyond the child. The 20-MiB device target, 32-MiB process soft limit,
-all-sample <=24-MiB runtime gate, and live-carrier progress tests are unchanged.
+and live-carrier progress tests are unchanged; the
+current observed runtime gate is <=28 MiB.
 
 The deterministic gate and the Android campaign together cover both axes
 below. The extender axis is the complete 4 x 3 cross-product of inner
@@ -406,7 +729,7 @@ larger surrogate. For every row assert all of the following:
    gate and must report only the carrier it actually used.
 6. The two-phone production-Auto blocks record process-root total/used bytes and
    carrier-slot counts in every diagnostic sample, exercise both provider/client role
-   assignments, transfer payload, and remain under the all-sample 24-MiB runtime
+   assignments, transfer payload, and remain under the all-sample 28-MiB runtime
    cap. Forced-mode results are reported separately so one winning fallback
    cannot be mistaken for coverage of the other live paths.
 7. Every phone sample also records the 13-MiB transfer/topology root and its
@@ -449,7 +772,7 @@ Classify any failure before changing a limit:
   exact 20/32 profile. Reconcile the full inner-plus-outer working set and the
   ledger together; testing either layer alone is insufficient.
 - **Inefficient algorithm:** accounting is complete and within its admission
-  ceilings, but actual retained/runtime memory crosses 24 MiB or useful work
+  ceilings, but actual retained/runtime memory crosses 28 MiB or useful work
   cannot progress at a reasonable rate. Remove duplication, reduce retained
   roots/topology, or change the algorithm; admission bookkeeping alone is not
   a fix.

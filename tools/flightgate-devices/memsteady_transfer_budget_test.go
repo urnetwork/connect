@@ -195,8 +195,8 @@ func TestMemsteadyTransferBudgetReportsBaselinePeakAndReleasedEnd(t *testing.T) 
 		total, baseline, peak, end int64
 	}{
 		{"root", summary.Client.TransferRootBudget, iosTransferRootBytes, iosPeerPinBudgetBytes + 256*1024, rootPeak, iosPeerPinBudgetBytes},
-		{"client", summary.Client.ClientTransferBudget, 9 * 1024 * 1024, iosPeerPinBudgetBytes + 128*1024, iosPeerPinBudgetBytes + 512*1024, iosPeerPinBudgetBytes},
-		{"provider", summary.Client.ProviderTransferBudget, 2 * 1024 * 1024, 64 * 1024, 128 * 1024, 0},
+		{"client", summary.Client.ClientTransferBudget, iosClientTransferBytes, iosPeerPinBudgetBytes + 128*1024, iosPeerPinBudgetBytes + 512*1024, iosPeerPinBudgetBytes},
+		{"provider", summary.Client.ProviderTransferBudget, iosProviderShareBytes / 2, 64 * 1024, 128 * 1024, 0},
 		{"NAT", summary.Client.NatBudget, iosNatBudgetBytes, 64 * 1024, natPeak, 0},
 		{"Pack", summary.Client.PackQueueBudget, 256 * 1024, 32 * 1024, 96 * 1024, 0},
 		{"pins", summary.Client.PeerPinBudget, iosPeerPinBudgetBytes, iosPeerPinBudgetBytes, iosPeerPinBudgetBytes, iosPeerPinBudgetBytes},
@@ -273,7 +273,7 @@ func TestParseDiagJoinsTransferBudgetLogcatFragments(t *testing.T) {
 		}
 		fmt.Fprintf(&log, "09-17 01:02:03.000 I GoLog   : %s%s\n", prefix, encoded[start:min(start+1024, len(encoded))])
 	}
-	fmt.Fprintln(&log, `09-17 01:02:03.000 I GoLog   : I0917 01:02:03 [flightgate] {"part":"memory_device_transport","unix_millis":123456,"device_transport_budget_total_bytes":5242880}`)
+	fmt.Fprintf(&log, "09-17 01:02:03.000 I GoLog   : I0917 01:02:03 [flightgate] {\"part\":\"memory_device_transport\",\"unix_millis\":123456,\"device_transport_budget_total_bytes\":%d}\n", iosCarrierDeviceBytes)
 	path := filepath.Join(t.TempDir(), "logcat")
 	if err := os.WriteFile(path, []byte(log.String()), 0o600); err != nil {
 		t.Fatal(err)

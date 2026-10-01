@@ -897,9 +897,12 @@ type MultiClientSettings struct {
 
 	TcpCollapsePrevention bool
 	UdpCollapsePrevention bool
-	// UdpTransferNoAck keeps an established UDP flow off Transfer's reliable
-	// resend path. Initial provider-race attempts still request an ACK; a
-	// successful route write alone does not prove provider receipt.
+	// UdpTransferNoAck defaults to true and keeps an established UDP flow off
+	// Transfer's reliable resend path, including direct-capable routes. Set the
+	// provider's matching UdpTransferNoAck field to the same value for a symmetric
+	// UDP policy.
+	// Initial provider-race attempts still request an ACK; a successful route
+	// write alone does not prove provider receipt.
 	UdpTransferNoAck bool
 	// icmp echo egress. off by default until the provider fleet broadly
 	// parses icmp: a not-yet-upgraded provider silently blackholes icmp
@@ -8182,6 +8185,22 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 		} else if state, ok := race.clientStates[sourceClient]; !ok {
 			// this client is not part of the race, drop
 			self.log.Infof("[multi]receive client not part of race")
+		} else if race.responseWindowElapsed {
+			// The comparison deadline does not expire the application's flow.
+			// With no earlier answer, the first live candidate still wins.
+			if update.IsDone() || sourceClient.IsDone() {
+				return
+			}
+			state.packets = append(state.packets, &receivePacket{
+				Source: source, ProvideMode: provideMode, IpPath: ipPath,
+				Packet: packet, tcpControl: tcpControl,
+			})
+			receivePackets, abandonedClients, returnPackets, connectSucceeded =
+				update.commitRaceClientWithLock(sourceClient)
+			boundUpdate = update
+			if connectSucceeded {
+				connectPath = update.ipPath
+			}
 		} else if len(state.packets) < self.settings.MultiRaceClientPacketMaxCount && race.packetCount < self.settings.MultiRacePacketMaxCount {
 			packetCopy, pooled := MessagePoolCopyDetailed(packet)
 			receivePacket := &receivePacket{
@@ -8465,6 +8484,13 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 					winner = orderedClients[len(orderedClients)-1]
 				}
 			}
+			if winner == nil {
+				// Retain only candidate identity until a response or flow cleanup.
+				// Clearing it here discarded a valid late DNS answer while its
+				// socket was still waiting. No worker or packet owner is retained.
+				race.responseWindowElapsed = true
+				return
+			}
 			if winner != nil {
 				receivePackets, abandonedClients, returnPackets, connectSucceeded =
 					update.commitRaceClientWithLock(winner)
@@ -8476,9 +8502,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 					boundUpdate, boundClient = update, winner
 				}
 			}
-			// No response, or a committed client which was not in this stale
-			// race: release the race's buffered owners without changing the
-			// current binding.
+			// A committed client outside this stale race keeps its binding.
 			if update.race == race {
 				update.clearRaceWithLock()
 			}
@@ -9596,6 +9620,7 @@ type multiClientChannelUpdateRace struct {
 	packetCount            int
 	clientsWithPacketCount int
 	completeMonitor        *Monitor
+	responseWindowElapsed  bool
 }
 
 func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpdateRace {
@@ -15193,12 +15218,13 @@ func ipPacketTransferAckRequired(
 	if ipPacketTransferAckForRequest(ipPath, false) {
 		return true
 	}
+	if ipPath.Protocol == IpProtocolUdp {
+		return !udpTransferNoAck && !udpCollapsePrevention
+	}
 	if allowDirect {
 		return false
 	}
 	switch ipPath.Protocol {
-	case IpProtocolUdp:
-		return !udpTransferNoAck && !udpCollapsePrevention
 	case IpProtocolIcmp:
 		return !udpCollapsePrevention
 	default:

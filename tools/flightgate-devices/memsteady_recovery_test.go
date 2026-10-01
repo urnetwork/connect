@@ -172,10 +172,10 @@ func TestMemsteadyNatRecoveryPreservesOtherGates(t *testing.T) {
 				previous = used
 			}
 		}},
-		{"late runtime breach", "runtime exceeds hard 24 MiB", func(f *reportFixture) {
+		{"late runtime breach", "runtime exceeds hard 32 MiB", func(f *reportFixture) {
 			f.provider[len(f.provider)-1].Payload["go_total_bytes"] = float64(memsteadyTargetBytes + 1)
 		}},
-		{"witness runtime breach", "runtime exceeds hard 24 MiB", func(f *reportFixture) {
+		{"witness runtime breach", "runtime exceeds hard 32 MiB", func(f *reportFixture) {
 			f.provider[80].Payload["go_total_bytes"] = float64(memsteadyTargetBytes + 1)
 		}},
 		{"NAT ceiling", "nat_budget_ exceeds its byte ceiling", func(f *reportFixture) {

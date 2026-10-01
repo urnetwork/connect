@@ -73,6 +73,41 @@ func TestPlatformH3MobileComposedLedger(t *testing.T) {
 	}
 }
 
+func TestPlatformExplicitMobilePolicyScalesBeyondHistoricalTarget(t *testing.T) {
+	old := MemoryBudget()
+	defer SetMemoryBudget(old)
+	for _, target := range []ByteCount{mib(32), mib(64), mib(128)} {
+		t.Run(fmt.Sprint(target), func(t *testing.T) {
+			SetMemoryBudget(target)
+			settings := DefaultPlatformTransportSettingsWithMemoryTarget(target)
+			desktopWindow := settings.H3MaxConnectionReceiveWindowByteCount
+			if target > mib(32) && settings.h3RetainedByteAccounting {
+				t.Fatal("an ordinary desktop target was reclassified as mobile")
+			}
+			ApplyMobilePlatformTransportMemoryPolicy(settings, target)
+			config := newPlatformQuicConfig(settings, 1)
+			if config.Allow0RTT || !settings.h3RetainedByteAccounting {
+				t.Fatal("explicit mobile profile lost retained-send accounting")
+			}
+			if config.MaxConnectionReceiveWindow != uint64(desktopWindow) ||
+				settings.H3BudgetByteCount != desktopWindow+platformH3FixedMemoryByteCount() {
+				t.Fatalf("larger mobile window was shrunk or its claim omitted ownership: window=%d claim=%d", config.MaxConnectionReceiveWindow, settings.H3BudgetByteCount)
+			}
+			if (&PlatformTransport{settings: settings}).h3TransportBufferSize() != platformH3MemoryQueueCount ||
+				config.InitialStreamReceiveWindow != uint64(kib(128)) || config.InitialConnectionReceiveWindow != uint64(kib(256)) {
+				t.Fatal("mobile application/dial ownership escaped its fixed rows")
+			}
+			// Applying from both shared construction and a destination override
+			// must not add the fixed rows twice or replace an existing owner.
+			claim, budget := settings.H3BudgetByteCount, settings.PlatformTransportBudget
+			ApplyMobilePlatformTransportMemoryPolicy(settings, target)
+			if settings.H3BudgetByteCount != claim || settings.PlatformTransportBudget != budget {
+				t.Fatal("mobile policy was not idempotent")
+			}
+		})
+	}
+}
+
 func TestH3DatagramFlightFullFallsBackWithoutErrorOrBusyRetry(t *testing.T) {
 	for _, afterMtuFeedback := range []bool{false, true} {
 		t.Run(fmt.Sprint(afterMtuFeedback), func(t *testing.T) {
@@ -106,12 +141,16 @@ func TestH3DatagramFlightFullFallsBackWithoutErrorOrBusyRetry(t *testing.T) {
 func TestPlatformMobileNestedCarrierAdmissionMatrix(t *testing.T) {
 	old := MemoryBudget()
 	defer SetMemoryBudget(old)
-	for _, profile := range []struct{ target, process ByteCount }{{mib(20), mib(32)}, {mib(28), mib(40)}} {
+	for _, profile := range []struct{ target, process, nestedDnsSlack ByteCount }{
+		{mib(20), mib(32), kib(96)}, {mib(28), mib(40), kib(32)},
+		{mib(32), mib(32), kib(544)}, {mib(64), mib(64), kib(4384)},
+	} {
 		for _, mode := range []TransportMode{TransportModeH1, TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump} {
 			for _, carrier := range []string{"direct", ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns} {
 				t.Run(fmt.Sprintf("%d/%s/%s", profile.target, mode, carrier), func(t *testing.T) {
 					SetMemoryBudget(profile.process)
 					settings := DefaultPlatformTransportSettingsWithMemoryTarget(profile.target)
+					ApplyMobilePlatformTransportMemoryPolicy(settings, profile.target)
 					settings.AltUrl = "https://127.0.0.1:443"
 					settings.DnsPumpHost = "127.0.0.1"
 					transport := newTestAltTransport(t, settings)
@@ -173,10 +212,7 @@ func TestPlatformMobileNestedCarrierAdmissionMatrix(t *testing.T) {
 						t.Fatalf("carrier/owner accounting mismatch: carrier=%+v root=%+v", stats, root.Stats())
 					}
 					if (mode == TransportModeH3Dns || mode == TransportModeH3DnsPump) && carrier == ExtenderCarrierDns {
-						wantSlack := kib(96)
-						if profile.target == mib(28) {
-							wantSlack = kib(32)
-						}
+						wantSlack := profile.nestedDnsSlack
 						if stats.TotalByteCount-stats.UsedByteCount != wantSlack {
 							t.Fatalf("nested graph slack=%d want=%d", stats.TotalByteCount-stats.UsedByteCount, wantSlack)
 						}

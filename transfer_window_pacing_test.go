@@ -281,7 +281,13 @@ func TestWindowPacingServiceUsesAckArrival(t *testing.T) {
 				t.Fatalf("handoff: %v %v", result, err)
 			}
 			time.Sleep(workerDelay)
-			sequence.coalesceReceivedAck(sequence.ackWindow, <-sequence.acks)
+			// Legacy handoff queues; production publication may already be
+			// complete. Delay only owner application, not the receipt timestamp.
+			select {
+			case ack := <-sequence.acks:
+				sequence.coalesceReceivedAck(sequence.ackWindow, ack)
+			default:
+			}
 			ack := sequence.ackWindow.Snapshot(true).headAck
 			sequence.receiveAckAt(ack.messageId, false, ack.tag, false, ack.receivedAtNanos)
 		}
