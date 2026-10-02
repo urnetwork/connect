@@ -19,6 +19,7 @@ import (
 	"testing"
 )
 
+// Each case owns distinct real roots, policy bytes and synthetic kernel facts.
 type preparationFixture struct {
 	volume    *volumeFixture
 	request   PreparationRequest
@@ -27,6 +28,7 @@ type preparationFixture struct {
 	accepted  Reference
 }
 
+// The fixed synthetic adapter stages only public bytes and checks them on readback.
 func preparationTestAdapter() PreparationAdapter {
 	return PreparationAdapter{Build: func(ctx context.Context, parent *os.File, name string, owner PreparationOwner) (PreparationOwnerPlan, error) {
 		if err := syscall.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
@@ -78,6 +80,7 @@ func preparationTestAdapter() PreparationAdapter {
 	}}
 }
 
+// Every target is explicitly fresh; no test infers that from a missing journal.
 func newPreparationFixture(t *testing.T) *preparationFixture {
 	t.Helper()
 	volume := newVolumeFixture(t)
@@ -105,6 +108,7 @@ func newPreparationFixture(t *testing.T) *preparationFixture {
 	return self
 }
 
+// Indented input exercises real whitespace-preserving request and plan boundaries.
 func (self *preparationFixture) writeRequest(t *testing.T) {
 	t.Helper()
 	raw, err := json.MarshalIndent(self.request, "", "  ")
@@ -117,6 +121,7 @@ func (self *preparationFixture) writeRequest(t *testing.T) {
 	}
 }
 
+// Planning may create its staging bundle but must leave the live target empty.
 func (self *preparationFixture) build(t *testing.T) {
 	t.Helper()
 	plan, err := PlanPreparationWithHost(t.Context(), self.reference, preparationTestAdapter(), self.volume.host)
@@ -138,10 +143,12 @@ func (self *preparationFixture) build(t *testing.T) {
 	}
 }
 
+// Only real-I/O refusal barriers differ from the public applying entry point.
 func (self *preparationFixture) apply(ctx context.Context, hooks *preparationHooks) (PreparationResult, error) {
 	return applyPreparation(ctx, self.accepted, preparationTestAdapter(), self.volume.host, daemonScope, hooks)
 }
 
+// The resulting declaration must be consumable by the actual runtime guard.
 func TestPreparationReviewedPlanOpensActualGuard(t *testing.T) {
 	f := newPreparationFixture(t)
 	f.build(t)
@@ -170,6 +177,7 @@ func TestPreparationReviewedPlanOpensActualGuard(t *testing.T) {
 	}
 }
 
+// Every negative case proves its intended boundary and leaves control absent.
 func TestPreparationRefusesMissingChangedAndUnknownAuthority(t *testing.T) {
 	for _, mode := range []string{"wrong-plan", "missing-root", "replaced-root", "unjoined", "old-custody", "changed-stage", "canceled", "retained", "restore"} {
 		func() {
@@ -244,6 +252,7 @@ func TestPreparationRefusesMissingChangedAndUnknownAuthority(t *testing.T) {
 	}
 }
 
+// Pre-admission pressure preserves the same accepted plan for later continuation.
 func TestPreparationPressureAndObservationRetryOriginalPlan(t *testing.T) {
 	for _, mode := range []string{"bytes", "inodes", "read-only", "observation"} {
 		func() {
@@ -276,6 +285,7 @@ func TestPreparationPressureAndObservationRetryOriginalPlan(t *testing.T) {
 	}
 }
 
+// Completed bytes, names and metadata cannot be re-enrolled by repeating fresh apply.
 func TestPreparationCompletedCustodyCannotBeRecreated(t *testing.T) {
 	for _, mode := range []string{"all-members", "byte-identical-member", "control", "generation", "checkpoint", "declaration", "root"} {
 		func() {
@@ -340,6 +350,7 @@ func TestPreparationCompletedCustodyCannotBeRecreated(t *testing.T) {
 	}
 }
 
+// Each real publication boundary retains enough exact state for joined readback.
 func TestPreparationPendingLostAcknowledgementResumesExactBytes(t *testing.T) {
 	for _, stage := range []string{"control-header", "root-reservation", "control-pending", "member-sync", "parent-sync", "attribute-sync", "control-complete"} {
 		func() {
@@ -367,6 +378,7 @@ func TestPreparationPendingLostAcknowledgementResumesExactBytes(t *testing.T) {
 	}
 }
 
+// Partial unowned data stays byte-exact and refused; recovery cannot fill it in.
 func TestPreparationUnknownPartialControlAndPayloadRemainStopped(t *testing.T) {
 	for _, mode := range []string{"control", "payload"} {
 		func() {
@@ -405,6 +417,7 @@ func TestPreparationUnknownPartialControlAndPayloadRemainStopped(t *testing.T) {
 	}
 }
 
+// A synced pending payload distinguishes cancellation from an untouched request.
 func TestPreparationPostPublicationCancellationRequiresReadback(t *testing.T) {
 	f := newPreparationFixture(t)
 	f.build(t)
@@ -426,6 +439,7 @@ func TestPreparationPostPublicationCancellationRequiresReadback(t *testing.T) {
 	}
 }
 
+// The process exits at actual I/O barriers; only a joined child permits readback.
 func TestPreparationChildCrashJoinsBeforeExactResume(t *testing.T) {
 	if path := os.Getenv("URNETWORK_PREPARATION_CRASH_PLAN"); path != "" {
 		raw, err := os.ReadFile(path)
@@ -467,6 +481,7 @@ func TestPreparationChildCrashJoinsBeforeExactResume(t *testing.T) {
 	}
 }
 
+// A busy root and a separately scoped policy cannot block or admit another root.
 func TestPreparationSeparateScopeAndRootLease(t *testing.T) {
 	f := newPreparationFixture(t)
 	f.build(t)
@@ -496,14 +511,15 @@ func TestPreparationSeparateScopeAndRootLease(t *testing.T) {
 	}
 }
 
+// Owner-local system-device facts never relax the separately selected daemon API.
 func TestPreparationOwnerLocalSystemFilesystemRemainsExplicit(t *testing.T) {
 	f := newPreparationFixture(t)
 	f.request.Scope = "owner-local"
-	f.request.MountPath = "/"
 	f.writeRequest(t)
 	f.volume.host.change(func() {
-		device := f.volume.host.uuidDevice
-		f.volume.host.mounts = []Mount{{Id: 1, ParentId: 1, Device: device, Root: "/", Path: "/", FilesystemType: "ext4"}}
+		// Model one system device without relocating actual files to root disk.
+		// Literal '/' parser/mount bounds have their own owner-local controls.
+		f.volume.host.mounts[0].Device = f.volume.host.uuidDevice
 	})
 	if _, err := PlanPreparationWithHost(t.Context(), f.reference, preparationTestAdapter(), f.volume.host); err == nil {
 		t.Fatal("daemon planner gained owner-local system-filesystem scope")
@@ -536,6 +552,122 @@ func TestPreparationOwnerLocalSystemFilesystemRemainsExplicit(t *testing.T) {
 	}
 }
 
+// A completed control header or root reservation is already retained progress.
+// Cancellation after its real sync cannot be reported as a pristine refusal.
+func TestPreparationHeaderCancellationRetainsUncertainReservation(t *testing.T) {
+	for _, stage := range []string{"control-header", "root-reservation"} {
+		func() {
+			f := newPreparationFixture(t)
+			f.build(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			called := false
+			_, err := f.apply(ctx, &preparationHooks{after: func(operation, path string) error {
+				if operation == stage {
+					called = true
+					cancel()
+				}
+				return nil
+			}})
+			if !called || !errors.Is(err, context.Canceled) || !errors.Is(err, ErrPreparationUncertain) {
+				t.Fatal("retained control cancellation lost its readback requirement", stage, called, err)
+			}
+			control, err := os.Stat(f.request.ControlPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.apply(t.Context(), nil); err != nil {
+				t.Fatal("joined control could not resume original plan", stage, err)
+			}
+			retained, err := os.Stat(f.request.ControlPath)
+			if err != nil || !os.SameFile(control, retained) {
+				t.Fatal("resume replaced original control", stage, err)
+			}
+		}()
+	}
+}
+
+// Valid filesystem names can expand substantially in JSON. Planning must
+// admit their exact control representation before it reserves a live root.
+func TestPreparationEscapedControlCapacityPrecedesTargetMutation(t *testing.T) {
+	f := newPreparationFixture(t)
+	f.request.Limits.MaxEntries = 32
+	f.request.Limits.MaxDepth = 16
+	f.request.Limits.MaxPlanBytes = maximumPreparationPlanBytes
+	f.writeRequest(t)
+	adapter := preparationTestAdapter()
+	adapter.Build = func(ctx context.Context, parent *os.File, name string, owner PreparationOwner) (PreparationOwnerPlan, error) {
+		if err := syscall.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
+			return PreparationOwnerPlan{}, err
+		}
+		fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		if err != nil {
+			return PreparationOwnerPlan{}, err
+		}
+		directory := os.NewFile(uintptr(fd), name)
+		defer func() { directory.Close() }()
+		files := []PreparationFile{}
+		relative := ""
+		for index := 0; index < 15; index++ {
+			part := strings.Repeat("\x01", 240)
+			if err := syscall.Mkdirat(int(directory.Fd()), part, 0700); err != nil {
+				return PreparationOwnerPlan{}, err
+			}
+			next, err := syscall.Openat(int(directory.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+			if err != nil {
+				return PreparationOwnerPlan{}, err
+			}
+			if err := directory.Close(); err != nil {
+				syscall.Close(next)
+				return PreparationOwnerPlan{}, err
+			}
+			directory = os.NewFile(uintptr(next), part)
+			relative = filepath.Join(relative, part)
+			files = append(files, PreparationFile{Path: relative, Kind: "directory", Mode: 0700})
+		}
+		fileFd, err := syscall.Openat(int(directory.Fd()), "record.bin", syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
+		if err != nil {
+			return PreparationOwnerPlan{}, err
+		}
+		file := os.NewFile(uintptr(fileFd), "record.bin")
+		if err := file.Close(); err != nil {
+			return PreparationOwnerPlan{}, err
+		}
+		files = append(files, PreparationFile{Path: filepath.Join(relative, "record.bin"), Kind: "file", Mode: 0600, Sha256: testDigest(nil)})
+		return PreparationOwnerPlan{Owner: owner, StagingName: name, Files: files, Census: json.RawMessage(`{"synthetic":"escaped-names"}`)}, nil
+	}
+	plan, err := PlanPreparationWithHost(t.Context(), f.reference, adapter, f.volume.host)
+	if err == nil {
+		raw, encodeErr := json.Marshal(plan)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		ref := Reference{Path: filepath.Join(filepath.Dir(f.request.ControlPath), "capacity-plan.json"), Sha256: testDigest(raw)}
+		if writeErr := os.WriteFile(ref.Path, raw, 0600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+		_, applyErr := ApplyPreparationWithHost(t.Context(), ref, adapter, f.volume.host)
+		if applyErr == nil || !strings.Contains(applyErr.Error(), "control exceeds its finite record") {
+			t.Fatal("old planner failed before the real control capacity boundary", applyErr)
+		}
+		if _, statErr := os.Stat(f.request.ControlPath); statErr != nil {
+			t.Fatal("old apply did not retain the expected partial control", statErr)
+		}
+		t.Fatal("planner admitted an unrepresentable control record and apply failed after target mutation", applyErr)
+	}
+	if !strings.Contains(err.Error(), "control record") {
+		t.Fatal("planner did not reject an unrepresentable pending record", err)
+	}
+	entries, err := os.ReadDir(f.request.RootPath)
+	if err != nil || len(entries) != 0 {
+		t.Fatal("capacity refusal mutated target", err)
+	}
+	if _, err := os.Lstat(f.request.ControlPath); !os.IsNotExist(err) {
+		t.Fatal("capacity refusal reserved a control", err)
+	}
+}
+
+// Remounts and unreviewed checkpoint attributes cannot produce a complete report.
 func TestPreparationRemountAndUnknownOwnerMetadataRefuse(t *testing.T) {
 	for _, mode := range []string{"remount", "nested", "unknown-attribute"} {
 		func() {
@@ -564,6 +696,7 @@ func TestPreparationRemountAndUnknownOwnerMetadataRefuse(t *testing.T) {
 	}
 }
 
+// Independent count, byte and encoded-plan limits are enforced before reservation.
 func TestPreparationAdmitsAllCapacityDimensionsBeforeTargetEffects(t *testing.T) {
 	for _, mode := range []string{"bytes", "attributes", "plan"} {
 		func() {

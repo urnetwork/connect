@@ -21,7 +21,8 @@ var ErrPreparationUncertain = errors.New("storage preparation requires joined ex
 type preparationHooks struct{ after func(string, string) error }
 
 // Every variable work dimension is independently finite. The initial profile
-// also fixes individual custody attributes at4096bytes and control at64MiB.
+// also fixes individual custody attributes at 4096 bytes, control records at
+// 64 KiB and their complete retained journal at 64 MiB.
 type PreparationLimits struct {
 	MaxEntries             uint64 `json:"max_entries"`
 	MaxBytes               uint64 `json:"max_bytes"`
@@ -103,6 +104,7 @@ type PreparationAttributeSpec struct {
 	Name string `json:"name"`
 }
 
+// Returned checkpoint bytes have one fixed reviewed destination.
 type PreparedAttribute struct {
 	Spec PreparationAttributeSpec `json:"spec"`
 	Raw  []byte                   `json:"raw"`
@@ -116,6 +118,7 @@ type PreparationAdapter struct {
 	Inspect func(context.Context, *os.File, PreparationOwnerPlan) ([]PreparedAttribute, error)
 }
 
+// The public semantic census and portable staged files bind one fixed adapter.
 type PreparationOwnerPlan struct {
 	Owner       PreparationOwner           `json:"owner"`
 	StagingName string                     `json:"staging_name"`
@@ -152,6 +155,7 @@ type PreparationPlan struct {
 	RestartAuthorized bool                           `json:"restart_authorized"`
 }
 
+// A completed declaration remains an offline artifact, never restart authority.
 type PreparationResult struct {
 	Schema            string    `json:"schema"`
 	Plan              Reference `json:"plan"`
@@ -164,24 +168,38 @@ type PreparationResult struct {
 func PlanPreparation(ctx context.Context, request Reference, adapter PreparationAdapter) (PreparationPlan, error) {
 	return planPreparation(ctx, request, adapter, defaultHost(), daemonScope)
 }
+
+// Injects only kernel facts while retaining daemon parsing and real descriptors.
 func PlanPreparationWithHost(ctx context.Context, request Reference, adapter PreparationAdapter, host Host) (PreparationPlan, error) {
 	return planPreparation(ctx, request, adapter, host, daemonScope)
 }
+
+// Owner-local planning requires its separately selected public entry point.
 func PlanOwnerLocalPreparation(ctx context.Context, request Reference, adapter PreparationAdapter) (PreparationPlan, error) {
 	return planPreparation(ctx, request, adapter, defaultHost(), ownerLocalScope)
 }
+
+// Fact injection cannot authorize daemon policies or change real owner custody.
 func PlanOwnerLocalPreparationWithHost(ctx context.Context, request Reference, adapter PreparationAdapter, host Host) (PreparationPlan, error) {
 	return planPreparation(ctx, request, adapter, host, ownerLocalScope)
 }
+
+// Applies only one accepted daemon plan and closes every owned handle on return.
 func ApplyPreparation(ctx context.Context, plan Reference, adapter PreparationAdapter) (PreparationResult, error) {
 	return applyPreparation(ctx, plan, adapter, defaultHost(), daemonScope, nil)
 }
+
+// Real target publication remains mandatory when facts are supplied by a test.
 func ApplyPreparationWithHost(ctx context.Context, plan Reference, adapter PreparationAdapter, host Host) (PreparationResult, error) {
 	return applyPreparation(ctx, plan, adapter, host, daemonScope, nil)
 }
+
+// Owner-local application never silently reinterprets daemon declarations.
 func ApplyOwnerLocalPreparation(ctx context.Context, plan Reference, adapter PreparationAdapter) (PreparationResult, error) {
 	return applyPreparation(ctx, plan, adapter, defaultHost(), ownerLocalScope, nil)
 }
+
+// The explicit owner-local test seam changes facts, not publication semantics.
 func ApplyOwnerLocalPreparationWithHost(ctx context.Context, plan Reference, adapter PreparationAdapter, host Host) (PreparationResult, error) {
 	return applyPreparation(ctx, plan, adapter, host, ownerLocalScope, nil)
 }

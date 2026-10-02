@@ -25,6 +25,7 @@ import (
 const maximumPreparationRequestBytes = 1024 * 1024
 const maximumPreparationPlanBytes = 8 * 1024 * 1024
 const maximumPreparationControlBytes = 64 * 1024 * 1024
+const maximumPreparationControlRecordBytes = 64 * 1024
 
 // The complete request remains hash-bound even if JSON whitespace differs.
 func preparationDigest(raw []byte) string {
@@ -159,6 +160,7 @@ func preparationPrivate(file *os.File, directory bool) error {
 	return nil
 }
 
+// Inode facts come from a retained descriptor, never a pathname-derived claim.
 func preparationIdentity(file *os.File) (PreparationIdentity, error) {
 	var stat syscall.Stat_t
 	if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
@@ -282,6 +284,7 @@ func (self *preparationAdmission) check() error {
 	return self.ctx.Err()
 }
 
+// The synchronous invocation joins all retained directories and its root lease.
 func (self *preparationAdmission) close() error {
 	var result error
 	for path, file := range self.directories {
@@ -386,6 +389,9 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 		result.Owners = append(result.Owners, prepared)
 	}
 	if err := bindPreparationSources(ctx, request, &result); err != nil {
+		return result, err
+	}
+	if err := preparationControlCapacity(ctx, request, result); err != nil {
 		return result, err
 	}
 	if err := errors.Join(admission.check(), admission.fence(), preparationEmpty(ctx, admission.root), preparationRequireNoAttributes(admission.root)); err != nil {
@@ -597,6 +603,9 @@ func readPreparationPlan(ctx context.Context, reference Reference, scope ownerSc
 	}
 	if !reflect.DeepEqual(plan.Sources, copyPlan.Sources) {
 		return plan, request, errors.Join(ErrIdentity, errors.New("prepared source generation or census differs from the accepted plan"))
+	}
+	if err := preparationControlCapacity(ctx, request, plan); err != nil {
+		return plan, request, err
 	}
 	return plan, request, nil
 }

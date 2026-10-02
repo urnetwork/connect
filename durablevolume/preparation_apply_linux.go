@@ -11,13 +11,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"sort"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -26,8 +24,6 @@ import (
 const preparationControlSchema = "urnetwork-storage-preparation-control-v1"
 const preparationAnchorSchema = "urnetwork-storage-preparation-anchor-v1"
 
-// Failure barriers follow successful real syscalls and are instance-owned.
-// They can refuse continuation, never bypass protection, writes or syncing.
 // Exact bytes fit only for bounded metadata/attributes. Large prepared files
 // remain in the reviewed immutable staging bundle and are copied in chunks.
 type preparationStep struct {
@@ -41,6 +37,7 @@ type preparationStep struct {
 	Raw       []byte             `json:"raw,omitempty"`
 }
 
+// Both original inode generations and the accepted plan bind the control.
 type preparationControlHeader struct {
 	Schema     string              `json:"schema"`
 	PlanSha256 string              `json:"plan_sha256"`
@@ -48,6 +45,7 @@ type preparationControlHeader struct {
 	Control    PreparationIdentity `json:"control"`
 }
 
+// One hash-linked pending/complete pair acknowledges each exact mutation.
 type preparationControlRecord struct {
 	Sequence       uint64              `json:"sequence"`
 	PreviousSha256 string              `json:"previous_sha256"`
@@ -57,6 +55,7 @@ type preparationControlRecord struct {
 	Sha256         string              `json:"sha256"`
 }
 
+// The root retains its original external control even across process reopen.
 type preparationAnchor struct {
 	Schema     string              `json:"schema"`
 	PlanSha256 string              `json:"plan_sha256"`
@@ -183,9 +182,12 @@ func (self *preparationApply) parent(path string) (_ *os.File, name string, resu
 	return file, filepath.Base(path), nil
 }
 
+// Byte changes are checked separately from physical and protection identity.
 func preparationSameIdentity(a, b syscall.Stat_t) bool {
 	return a.Dev == b.Dev && a.Ino == b.Ino && a.Mode == b.Mode && a.Uid == b.Uid && a.Gid == b.Gid
 }
+
+// Unchanged retained file metadata avoids rereading an acknowledged prefix.
 func preparationSameFile(a, b syscall.Stat_t) bool {
 	return preparationSameIdentity(a, b) && a.Size == b.Size && a.Mtim == b.Mtim && a.Ctim == b.Ctim && a.Nlink == 1 && b.Nlink == 1
 }
@@ -231,6 +233,7 @@ func (self *preparationApply) after(stage, path string) error {
 	return nil
 }
 
+// Confirmed identity loss takes precedence over a recoverable lost acknowledgement.
 func (self *preparationApply) uncertain(err error) error {
 	if err == nil {
 		return nil
@@ -260,7 +263,7 @@ func (self *preparationApply) append(phase string, step preparationStep, identit
 		return err
 	}
 	raw = append(raw, '\n')
-	if len(raw) > 64*1024 || self.controlStat.Size > maximumPreparationControlBytes-int64(len(raw)) {
+	if len(raw) > maximumPreparationControlRecordBytes || self.controlStat.Size > maximumPreparationControlBytes-int64(len(raw)) {
 		return errors.New("preparation control exceeds its finite record or byte capacity")
 	}
 	n, err := self.control.WriteAt(raw, self.controlStat.Size)
@@ -289,6 +292,12 @@ func (self *preparationApply) append(phase string, step preparationStep, identit
 // Header identity is recorded before any target mutation. Its inode is also
 // bound on the original root, so replacing an entire completed journal fails.
 func (self *preparationApply) openControl() (resultErr error) {
+	mutated := false
+	defer func() {
+		if mutated && resultErr != nil {
+			resultErr = self.uncertain(resultErr)
+		}
+	}()
 	request := self.admission.request
 	parent := self.admission.directories[filepath.Dir(request.ControlPath)]
 	fd, err := syscall.Openat(int(parent.Fd()), filepath.Base(request.ControlPath), syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
@@ -302,8 +311,12 @@ func (self *preparationApply) openControl() (resultErr error) {
 				return err
 			}
 		}
+		if err := self.check(); err != nil {
+			return err
+		}
 		fd, err = syscall.Openat(int(parent.Fd()), filepath.Base(request.ControlPath), syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
 		created = err == nil
+		mutated = created
 	}
 	if err != nil {
 		return namedObservation("preparation control could not be opened", err)
@@ -330,7 +343,13 @@ func (self *preparationApply) openControl() (resultErr error) {
 		if err != nil || n != len(raw) {
 			return self.uncertain(errors.Join(io.ErrShortWrite, err))
 		}
-		if err := errors.Join(self.control.Sync(), parent.Sync(), self.after("control-header", request.ControlPath)); err != nil {
+		if err := self.control.Sync(); err != nil {
+			return self.uncertain(err)
+		}
+		if err := parent.Sync(); err != nil {
+			return self.uncertain(err)
+		}
+		if err := self.after("control-header", request.ControlPath); err != nil {
 			return self.uncertain(err)
 		}
 		self.previous = preparationDigest(raw[:len(raw)-1])
@@ -358,7 +377,11 @@ func (self *preparationApply) openControl() (resultErr error) {
 		if err := self.check(); err != nil {
 			return err
 		}
-		if err := errors.Join(preparationCreateAttribute(self.admission.root, PreparationAttribute, anchor), self.after("root-reservation", request.RootPath)); err != nil {
+		mutated = true
+		if err := preparationCreateAttribute(self.admission.root, PreparationAttribute, anchor); err != nil {
+			return self.uncertain(err)
+		}
+		if err := self.after("root-reservation", request.RootPath); err != nil {
 			return self.uncertain(err)
 		}
 		retained = anchor
@@ -383,7 +406,7 @@ func (self *preparationApply) readControl() error {
 		return errors.Join(ErrPreparationUncertain, errors.New("preparation control has an unknown or partial tail"))
 	}
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
-	scanner.Buffer(make([]byte, 4096), 64*1024)
+	scanner.Buffer(make([]byte, 4096), maximumPreparationControlRecordBytes)
 	if !scanner.Scan() {
 		return errors.Join(ErrIdentity, errors.New("preparation control header is absent"))
 	}
@@ -477,6 +500,7 @@ func (self *preparationApply) step(step preparationStep) error {
 	return nil
 }
 
+// New intent is recorded only after proving that its exact destination is absent.
 func (self *preparationApply) requireAbsent(step preparationStep) error {
 	if step.Kind == "attribute" {
 		file, err := self.attributeTarget(step.Path)
@@ -631,6 +655,7 @@ func (self *preparationApply) observe(step preparationStep, pending bool) (_ Pre
 	return identity, nil
 }
 
+// Real named and opened descriptors must still identify the same original member.
 func (self *preparationApply) sameMember(file, parent *os.File, name string) error {
 	fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -694,6 +719,7 @@ func (self *preparationApply) copyFile(target *os.File, step preparationStep) (r
 	return self.admission.ctx.Err()
 }
 
+// Exact fully written pending attributes can be synced; missing completed ones refuse.
 func (self *preparationApply) observeAttribute(step preparationStep, pending bool) (_ PreparationIdentity, resultErr error) {
 	mutated := false
 	defer func() {
@@ -971,16 +997,6 @@ func applyPreparation(ctx context.Context, reference Reference, adapter Preparat
 	return PreparationResult{Schema: PreparationResultSchema, Plan: reference, Declaration: Reference{Path: request.DeclarationPath, Sha256: preparationDigest(raw)}, RestartAuthorized: false}, nil
 }
 
-// Order is stable when an adapter uses a map to describe independent heads.
-func SortPreparationAttributes(attributes []PreparationAttributeSpec) {
-	sort.Slice(attributes, func(i, j int) bool {
-		if attributes[i].Path != attributes[j].Path {
-			return attributes[i].Path < attributes[j].Path
-		}
-		return attributes[i].Name < attributes[j].Name
-	})
-}
-
 // Filesystem type constants have exactly the same daemon/owner-local meaning.
 func filesystemMagic(name string) int64 {
 	switch name {
@@ -992,9 +1008,4 @@ func filesystemMagic(name string) int64 {
 		return 0x9123683e
 	}
 	return -1
-}
-
-// Keeps formatted physical errors readable without concealing the typed cause.
-func preparationReason(stage string, err error) error {
-	return fmt.Errorf("storage preparation %s: %w", stage, err)
 }
