@@ -71,8 +71,8 @@ func preparationReadReference(ctx context.Context, reference Reference, maximum 
 	return raw, nil
 }
 
-// The first executable slice admits only explicitly fresh, precreated roots.
-// This is not a retained/restore implementation or a missing-state fallback.
+// Fresh roots are either already private or explicitly created through one
+// reviewed staged inode. Retained/restore never fall back to either fresh mode.
 func (self PreparationRequest) validate(scope ownerScope) error {
 	expectedScope := "daemon"
 	if scope == ownerLocalScope {
@@ -80,6 +80,14 @@ func (self PreparationRequest) validate(scope ownerScope) error {
 	}
 	if self.Schema != PreparationRequestSchema || self.Scope != expectedScope || self.Purpose != "fresh" {
 		return errors.New("storage preparation requires the explicitly selected scope and supported fresh purpose; retained/restore are not implemented")
+	}
+	if self.RootCreation != "" && self.RootCreation != "create-private" {
+		return errors.New("preparation root creation profile is unsupported")
+	}
+	if self.RootCreation == "create-private" {
+		if _, err := preparationRootRenameNumber(); err != nil {
+			return err
+		}
 	}
 	limit := self.Limits
 	if limit.MaxEntries == 0 || limit.MaxEntries > 10000 || limit.MaxBytes == 0 || limit.MaxBytes > 1024*1024*1024*1024 ||
@@ -133,15 +141,17 @@ func (self PreparationRequest) declaration(inode uint64, generation, marker, lea
 // One synchronous command owns these descriptors. Concurrent commands acquire
 // independent nonblocking root leases; no mutable state is process-global.
 type preparationAdmission struct {
-	ctx         context.Context
-	request     PreparationRequest
-	scope       ownerScope
-	host        Host
-	root        *os.File
-	directories map[string]*os.File
-	identities  map[string]PreparationIdentity
-	mount       Mount
-	filesystem  Filesystem
+	ctx          context.Context
+	request      PreparationRequest
+	scope        ownerScope
+	host         Host
+	root         *os.File
+	rootSource   string
+	rootAtTarget bool
+	directories  map[string]*os.File
+	identities   map[string]PreparationIdentity
+	mount        Mount
+	filesystem   Filesystem
 }
 
 // Only genuinely private caller-owned preparation targets and metadata are
@@ -194,7 +204,11 @@ func (self *preparationAdmission) facts() (Mount, Filesystem, error) {
 			}
 		}
 	}
-	filesystem, err := self.host.Filesystem(self.root)
+	probeFile := self.root
+	if probeFile == nil {
+		probeFile = self.directories[filepath.Dir(request.RootPath)]
+	}
+	filesystem, err := self.host.Filesystem(probeFile)
 	if err != nil {
 		return Mount{}, Filesystem{}, unavailableObservation("preparation filesystem could not be observed", err)
 	}
@@ -207,9 +221,9 @@ func (self *preparationAdmission) facts() (Mount, Filesystem, error) {
 	return mount, filesystem, nil
 }
 
-// All namespaces are precreated in this initial slice. Opening never mkdirs a
-// missing root or substitutes a system-filesystem scratch directory.
-func openPreparationAdmission(ctx context.Context, request PreparationRequest, host Host, scope ownerScope) (_ *preparationAdmission, resultErr error) {
+// Every parent remains precreated. A missing target is admitted only by the
+// explicit create-private profile and exact staged source, never runtime fallback.
+func openPreparationAdmission(ctx context.Context, request PreparationRequest, host Host, scope ownerScope, rootSource string) (_ *preparationAdmission, resultErr error) {
 	if ctx == nil || host == nil {
 		return nil, errors.New("preparation context and host are required")
 	}
@@ -223,6 +237,9 @@ func openPreparationAdmission(ctx context.Context, request PreparationRequest, h
 		}
 	}()
 	paths := []string{request.RootPath, request.StagingDirectory, filepath.Dir(request.MarkerPath), filepath.Dir(request.LeasePath), filepath.Dir(request.DeclarationPath), filepath.Dir(request.ControlPath), filepath.Dir(request.FormerWriterFence.Path)}
+	if request.RootCreation == "create-private" {
+		paths[0] = filepath.Dir(request.RootPath)
+	}
 	for _, path := range paths {
 		if self.directories[path] != nil {
 			continue
@@ -241,9 +258,28 @@ func openPreparationAdmission(ctx context.Context, request PreparationRequest, h
 		}
 		self.identities[path] = identity
 	}
-	self.root = self.directories[request.RootPath]
-	if err := syscall.Flock(int(self.root.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil, errors.Join(ErrBusy, err)
+	if request.RootCreation == "create-private" {
+		parent := self.directories[filepath.Dir(request.RootPath)]
+		if err := syscall.Flock(int(parent.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			return nil, errors.Join(ErrBusy, err)
+		}
+		if rootSource == "" {
+			if err := preparationAbsent(parent, filepath.Base(request.RootPath)); err != nil {
+				return nil, err
+			}
+		} else if err := self.openStagedRoot(rootSource); err != nil {
+			return nil, err
+		}
+	} else {
+		if rootSource != "" {
+			return nil, errors.New("precreated preparation cannot select a staged root")
+		}
+		self.root = self.directories[request.RootPath]
+	}
+	if self.root != nil {
+		if err := syscall.Flock(int(self.root.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			return nil, errors.Join(ErrBusy, err)
+		}
 	}
 	var err error
 	self.mount, self.filesystem, err = self.facts()
@@ -270,7 +306,11 @@ func (self *preparationAdmission) check() error {
 		return errors.Join(ErrIdentity, errors.New("preparation mount generation changed"))
 	}
 	for path, file := range self.directories {
-		if err := errors.Join(sameNamedFile(file, path), preparationPrivate(file, true)); err != nil {
+		observedPath := path
+		if path == self.request.RootPath && self.rootSource != "" && !self.rootAtTarget {
+			observedPath = self.rootSource
+		}
+		if err := errors.Join(sameNamedFile(file, observedPath), preparationPrivate(file, true)); err != nil {
 			return err
 		}
 		identity, err := preparationIdentity(file)
@@ -279,6 +319,15 @@ func (self *preparationAdmission) check() error {
 		}
 		if identity != self.identities[path] || deviceNumber(identity.Device) != mount.Device {
 			return errors.Join(ErrIdentity, errors.New("preparation named directory or filesystem changed"))
+		}
+	}
+	if self.request.RootCreation == "create-private" {
+		absent := self.request.RootPath
+		if self.rootAtTarget {
+			absent = self.rootSource
+		}
+		if err := preparationAbsent(self.directories[filepath.Dir(absent)], filepath.Base(absent)); err != nil {
+			return err
 		}
 	}
 	return self.ctx.Err()
@@ -329,7 +378,7 @@ func (self *preparationAdmission) fence() error {
 	if err := decodeStrict(raw, &fence); err != nil {
 		return err
 	}
-	if fence.Schema != PreparationFenceSchema || fence.RootPath != self.request.RootPath || fence.RootInode != self.identities[self.request.RootPath].Inode ||
+	if fence.Schema != PreparationFenceSchema || fence.RootPath != self.request.RootPath || !self.fenceRootMatches(fence) ||
 		fence.Purpose != "fresh" || !fence.FormerWritersStopped || !fence.NoPreviousOwnerState || strings.TrimSpace(fence.Evidence) == "" || len(fence.Evidence) > 8192 {
 		return errors.New("explicit fresh namespace and stopped former-writer evidence are required")
 	}
@@ -350,7 +399,7 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 	if err := decodePreparationRequest(raw, &request); err != nil {
 		return result, err
 	}
-	admission, err := openPreparationAdmission(ctx, request, host, scope)
+	admission, err := openPreparationAdmission(ctx, request, host, scope, "")
 	if err != nil {
 		return result, err
 	}
@@ -360,7 +409,7 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 			result = PreparationPlan{}
 		}
 	}()
-	if err := errors.Join(admission.fence(), preparationEmpty(ctx, admission.root), preparationRequireNoAttributes(admission.root)); err != nil {
+	if err := errors.Join(admission.fence(), admission.freshRoot()); err != nil {
 		return result, err
 	}
 	for _, path := range []string{request.MarkerPath, request.LeasePath, request.DeclarationPath, request.ControlPath} {
@@ -373,6 +422,12 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 		if _, err := rand.Read(value); err != nil {
 			return result, err
 		}
+	}
+	if request.RootCreation == "create-private" {
+		if err := admission.stageRoot(result.Nonce); err != nil {
+			return result, err
+		}
+		result.Root, result.RootSource = admission.identities[request.RootPath], admission.rootSource
 	}
 	for index, owner := range request.Owners {
 		if err := admission.check(); err != nil {
@@ -394,7 +449,7 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 	if err := preparationControlCapacity(ctx, request, result); err != nil {
 		return result, err
 	}
-	if err := errors.Join(admission.check(), admission.fence(), preparationEmpty(ctx, admission.root), preparationRequireNoAttributes(admission.root)); err != nil {
+	if err := errors.Join(admission.check(), admission.fence(), admission.freshRoot()); err != nil {
 		return result, err
 	}
 	encoded, err := json.Marshal(result)
@@ -580,6 +635,13 @@ func readPreparationPlan(ctx context.Context, reference Reference, scope ownerSc
 	}
 	if plan.Schema != PreparationPlanSchema || plan.RestartAuthorized || plan.RequestSha256 != plan.Request.Sha256 || preparationDigest(plan.RequestBytes) != plan.RequestSha256 || len(plan.Nonce) != 32 || len(plan.Generation) != RootGenerationBytes || len(plan.Marker) != 32 || len(plan.Lease) != 32 || uint64(len(raw)) > request.Limits.MaxPlanBytes || len(plan.Owners) != len(request.Owners) {
 		return plan, request, errors.New("accepted preparation plan is malformed or outside its exact scope")
+	}
+	if request.RootCreation == "create-private" {
+		if plan.RootSource != preparationStagedRootPath(request, plan.Nonce) {
+			return plan, request, errors.New("accepted plan changed its exact staged root")
+		}
+	} else if plan.RootSource != "" {
+		return plan, request, errors.New("precreated plan cannot contain staged root authority")
 	}
 	requestRaw, err := preparationReadReference(ctx, plan.Request, maximumPreparationRequestBytes, "request")
 	if err != nil {

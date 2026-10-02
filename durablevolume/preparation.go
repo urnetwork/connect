@@ -45,6 +45,7 @@ type PreparationRequest struct {
 	MinAvailableBytes  uint64             `json:"min_available_bytes"`
 	MinAvailableInodes uint64             `json:"min_available_inodes"`
 	RootPath           string             `json:"root_path"`
+	RootCreation       string             `json:"root_creation,omitempty"`
 	MarkerPath         string             `json:"marker_path"`
 	LeasePath          string             `json:"lease_path"`
 	DeclarationPath    string             `json:"declaration_path"`
@@ -70,6 +71,7 @@ type PreparationFence struct {
 	Schema               string `json:"schema"`
 	RootPath             string `json:"root_path"`
 	RootInode            uint64 `json:"root_inode"`
+	ParentInode          uint64 `json:"parent_inode,omitempty"`
 	Purpose              string `json:"purpose"`
 	FormerWritersStopped bool   `json:"former_writers_stopped"`
 	NoPreviousOwnerState bool   `json:"no_previous_owner_state"`
@@ -144,6 +146,7 @@ type PreparationPlan struct {
 	RequestSha256     string                         `json:"request_sha256"`
 	RequestBytes      []byte                         `json:"request_bytes"`
 	Root              PreparationIdentity            `json:"root"`
+	RootSource        string                         `json:"root_source,omitempty"`
 	Directories       map[string]PreparationIdentity `json:"directories"`
 	Mount             Mount                          `json:"mount"`
 	Filesystem        Filesystem                     `json:"filesystem"`
