@@ -172,6 +172,7 @@ from a different-language reproduction without cross-validating it in Go.
 
 ## Locking
 
+- Minimize contention wherever possible; allow eventual consistency and asynchronous exception cleanup when they reduce contention, and document the consistency tradeoff and recovery behavior.
 - Functions that are expected to be called with one or more state locks should be named "*WithLock". Inversely, functions that do not have "*WithLock" should expect to be called with no state locks.
 - Operations on locked state should be as tightly scoped as possible.
 - Calls to external objects must not hold a state lock. This is generally an implication of the "WithLock" rule.
