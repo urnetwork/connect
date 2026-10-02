@@ -4825,9 +4825,11 @@ func (self *Client) Close() {
 // P2pTransport values, remain caller-owned and require their own close/join.
 // Extra dispatchers installed through public ReceiveSignalsFromClient only
 // unsubscribe when their returned function is called; their lifecycle is also
-// caller-owned. OOB work after SendControl returns is owned by the OOB
-// implementation, and the process-global probe observer dispatcher is
-// process-owned.
+// caller-owned. OOB transport work after SendControl returns is owned by the
+// OOB implementation. The contract manager joins its own create callbacks
+// because they may still produce shutdown closes; the external OOB owner must
+// then join those admitted controls. The process-global probe observer
+// dispatcher is process-owned.
 //
 // Owners must quiesce concurrent Client API calls before using a successful
 // join as permission to reclaim the Client. A call paused before an admission

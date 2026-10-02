@@ -1488,12 +1488,31 @@ func (self *ContractManager) addContractToQueue(
 		self.client.log.Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
 	}
 
+	// Linearize result publication with Close. Once shutdown's final flush
+	// starts, a returned reservation must use the existing retired-result close
+	// path, never repopulate a queue that no worker will consume or flush again.
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.closed {
+		return errContractQueueDrained
+	}
 	return contractQueue.Add(contract, storedContract)
 }
 
 // Coalesces an identical pending request within its exact queue generation.
 // Completion releases admission; this is not remote exactly-once semantics.
 func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) {
+	// The external OOB owns transport and frame buffers; this manager owns its
+	// callback until it has consumed or closed every returned reservation. The
+	// generator joins the Client before closing OOB admission, so retaining this
+	// owner also retains permission for the callback's bounded shutdown close.
+	self.mutex.Lock()
+	if self.closed || !self.workers.start() {
+		self.mutex.Unlock()
+		return
+	}
+	self.mutex.Unlock()
+
 	// Retain ownership through the asynchronous callback. A route promotion can
 	// force-remove and drain this exact generation while the request is in
 	// flight; the callback then rejects and closes its stale result instead of
@@ -1506,9 +1525,11 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	}
 	if !contractQueue.beginCreate(request) {
 		self.closeContractQueue(contractKey, contractQueue)
+		self.workers.finish()
 		return
 	}
 	finish := func() {
+		defer self.workers.finish()
 		contractQueue.finishCreate(request)
 		self.closeContractQueue(contractKey, contractQueue)
 	}
