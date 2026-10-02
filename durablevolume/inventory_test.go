@@ -192,9 +192,22 @@ func TestInventoryRestoredRootReportsChangedPhysicalIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture.custody(t)
+	if reopened, err := OpenWithHost(fixture.reference, fixture.root, Snapshot, fixture.host); !errors.Is(err, ErrIdentity) {
+		if reopened != nil {
+			reopened.Close()
+		}
+		t.Fatal("copied custody silently rebound old declaration", err)
+	}
+	priorRoot := fixture.config.Volumes[0].StateRoots[0]
+	fixture.config.Volumes[0].StateRoots[0] = provisionTestRoot(t, fixture.root, priorRoot.LeasePath, priorRoot.LeaseSha256)
+	fixture.writeConfig(t)
+	fence = fixture.fence(t)
 	restored := fixture.open(t, Snapshot)
-	result, err := restored.VerifyInventory(t.Context(), Reference{Path: path, Sha256: testDigest(raw)}, fence, limits)
-	if err != nil || !result.ExactLocalBytesAndMetadata || result.SamePhysicalRoot || result.RestartAuthorized {
+	if _, err := restored.VerifyInventory(t.Context(), Reference{Path: path, Sha256: testDigest(raw)}, fence, limits); err == nil {
+		t.Fatal("ordinary verification inferred rebind authority")
+	}
+	result, err := restored.VerifyReboundInventory(t.Context(), Reference{Path: path, Sha256: testDigest(raw)}, fence, limits)
+	if err != nil || !result.ExactLocalBytesAndMetadata || result.SamePhysicalRoot || result.SameDeclaration || result.SameRootGeneration || result.RestartAuthorized || result.ExpectedRootGeneration != before.RootGeneration {
 		t.Fatalf("restored identity: %+v %v", result, err)
 	}
 }

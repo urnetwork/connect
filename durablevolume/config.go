@@ -15,8 +15,10 @@ import (
 	"strings"
 )
 
-const Schema = "urnetwork-durable-volumes-v1"
-const OwnerLocalSchema = "urnetwork-owner-local-volumes-v1"
+const Schema = "urnetwork-durable-volumes-v2"
+const OwnerLocalSchema = "urnetwork-owner-local-volumes-v2"
+const RootGenerationAttribute = "user.urnetwork.durable-root-generation"
+const RootGenerationBytes = 32
 const maximumConfigBytes = 64 * 1024
 const maximumMarkerBytes = 4 * 1024
 
@@ -54,12 +56,14 @@ type VolumeSpec struct {
 	MinAvailableInodes uint64          `json:"min_available_inodes"`
 }
 
-// Separate provisioned lease files let unrelated owners on one volume run
-// while a stopped root is inventoried. They never enter journal inventories.
+// Separate leases let unrelated roots run during a stopped-root inventory.
+// The external inode/nonce binding is enrolled before use, never by runtime.
 type StateRootSpec struct {
-	Path        string `json:"path"`
-	LeasePath   string `json:"lease_path"`
-	LeaseSha256 string `json:"lease_sha256"`
+	Path             string `json:"path"`
+	LeasePath        string `json:"lease_path"`
+	LeaseSha256      string `json:"lease_sha256"`
+	RootInode        uint64 `json:"root_inode"`
+	GenerationSha256 string `json:"generation_sha256"`
 }
 
 // Only the policy reference is inherited; every descendant owns its own guard.
@@ -142,6 +146,9 @@ func (self Config) validateForScope(scope ownerScope) error {
 		for _, root := range volume.StateRoots {
 			if !canonical(root.Path) || !beneath(volume.MountPath, root.Path) || root.Path == volume.MountPath || len(roots) >= 256 {
 				return errors.New("durable owner root is absent, unbounded or outside its mount")
+			}
+			if root.RootInode == 0 || !validDigest(root.GenerationSha256) {
+				return errors.New("durable owner root requires preprovisioned inode and generation authority")
 			}
 			if !canonical(root.LeasePath) || !beneath(volume.MountPath, root.LeasePath) || root.LeasePath == volume.MarkerPath || !validDigest(root.LeaseSha256) || leasePaths[root.LeasePath] {
 				return errors.New("durable owner lease identity is absent, ambiguous or outside its mount")

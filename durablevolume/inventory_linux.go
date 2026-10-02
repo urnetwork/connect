@@ -30,17 +30,24 @@ func unchangedInventoryStat(before, after syscall.Stat_t) bool {
 }
 
 // Snapshot callers retain the exclusive lease throughout the bounded walk.
-func (self *Owner) inventory(ctx context.Context, result *Inventory) error {
+func (self *Owner) inventory(ctx context.Context, result *Inventory) (resultErr error) {
 	root, err := self.openChild("", false)
 	if err != nil {
 		return err
 	}
-	defer root.Close()
+	defer func() {
+		resultErr = errors.Join(resultErr, unavailableObservation("inventory root could not be closed", root.Close()))
+	}()
 	rootStat, err := inventoryStat(root)
+	if err != nil {
+		return unavailableObservation("inventory root metadata could not be observed", err)
+	}
+	result.PhysicalRoot = PhysicalRoot{Device: deviceNumber(rootStat.Dev), Inode: rootStat.Ino}
+	generation, err := self.rootGeneration()
 	if err != nil {
 		return err
 	}
-	result.PhysicalRoot = PhysicalRoot{Device: deviceNumber(rootStat.Dev), Inode: rootStat.Ino}
+	result.RootGeneration = hex.EncodeToString(generation)
 	var visit func(*os.File, string, uint64) error
 	visit = func(file *os.File, relative string, depth uint64) error {
 		if err := ctx.Err(); err != nil {
@@ -51,11 +58,11 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) error {
 		}
 		before, err := inventoryStat(file)
 		if err != nil {
-			return err
+			return unavailableObservation("inventory metadata could not be observed", err)
 		}
 		directory := before.Mode&syscall.S_IFMT == syscall.S_IFDIR
 		if err := protected(file, directory); err != nil {
-			return errors.Join(ErrIdentity, err)
+			return err
 		}
 		if deviceNumber(before.Dev) != self.mount.Device {
 			return errors.Join(ErrIdentity, errors.New("inventory entered another filesystem"))
@@ -70,7 +77,7 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) error {
 			remaining := result.Limits.MaxEntries - uint64(len(result.Entries))
 			children, err := file.ReadDir(int(remaining + 1))
 			if err != nil && !errors.Is(err, io.EOF) {
-				return err
+				return unavailableObservation("inventory directory could not be read", err)
 			}
 			if uint64(len(children)) > remaining {
 				return errors.New("durable inventory entry bound exhausted")
@@ -92,15 +99,12 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) error {
 				}
 				fd, err := syscall.Openat(int(file.Fd()), child.Name(), syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 				if err != nil {
-					return errors.Join(ErrIdentity, err)
+					return namedObservation("inventory child could not be opened", err)
 				}
 				opened := os.NewFile(uintptr(fd), filepath.Join(self.rootPath, path))
 				childErr := visit(opened, path, depth+1)
-				nameErr := sameNamedFile(opened, filepath.Join(self.rootPath, path))
-				closeErr := opened.Close()
-				if nameErr != nil {
-					nameErr = errors.Join(ErrIdentity, nameErr)
-				}
+				nameErr := sameNamedFileObserved(opened, filepath.Join(self.rootPath, path), self.observeFile)
+				closeErr := unavailableObservation("inventory child could not be closed", opened.Close())
 				if err := errors.Join(childErr, nameErr, closeErr); err != nil {
 					return err
 				}
@@ -123,7 +127,10 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) error {
 				}
 				n, err := file.ReadAt(buffer[:want], offset)
 				if n != int(want) || err != nil {
-					return errors.Join(errors.New("durable inventory file read was incomplete"), err)
+					if err != nil && !errors.Is(err, io.EOF) {
+						return unavailableObservation("inventory file bytes could not be observed", err)
+					}
+					return errors.Join(ErrIdentity, errors.New("durable inventory file read was incomplete"), err)
 				}
 				_, _ = hash.Write(buffer[:n])
 				offset += int64(n)
@@ -134,7 +141,7 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) error {
 		}
 		after, err := inventoryStat(file)
 		if err != nil {
-			return err
+			return unavailableObservation("inventory metadata could not be reobserved", err)
 		}
 		if !unchangedInventoryStat(before, after) {
 			return errors.Join(ErrIdentity, errors.New("durable inventory changed during traversal"))

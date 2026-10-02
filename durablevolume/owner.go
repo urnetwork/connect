@@ -21,7 +21,7 @@ var ErrBusy = errors.New("durable volume has another owner")
 var ErrClosed = errors.New("durable volume owner is closed")
 var ErrUnsupported = errors.New("durable volume ownership requires Linux")
 var ErrIdentity = errors.New("durable volume identity is lost")
-var ErrUnavailable = errors.New("durable volume write reserve is unavailable")
+var ErrUnavailable = errors.New("durable volume is temporarily unavailable")
 
 // Resource pressure pauses admission without changing identity or custody.
 type UnavailableError struct {
@@ -106,6 +106,9 @@ type Owner struct {
 	rootFile   *os.File
 	markerFile *os.File
 	leaseFile  *os.File
+	// An instance-local failure seam precedes real named-file observations.
+	// Production leaves it nil; it can refuse, never fabricate successful facts.
+	observeFile func(string, *os.File, string) error
 }
 
 // Uses the fixed Linux host adapter; no runtime flag selects a synthetic host.
@@ -209,6 +212,15 @@ func (self *Owner) CheckWrite() error {
 	return self.release(self.check(true))
 }
 
+// Identity-only admission permits inspection under read-only/full conditions.
+// This never grants mutation, releases the owner lease, or clears proven loss.
+func (self *Owner) CheckRead() error {
+	if err := self.borrow(); err != nil {
+		return err
+	}
+	return self.release(self.check(false))
+}
+
 // The path is immutable and only identifies the already selected root.
 func (self *Owner) RootPath() string {
 	if self == nil {
@@ -236,7 +248,15 @@ func (self *Owner) CheckDirectory(relative string, directory *os.File) error {
 	if err := self.borrow(); err != nil {
 		return err
 	}
-	return self.release(self.checkDirectory(relative, directory))
+	return self.release(self.checkDirectory(relative, directory, self.access == ReadWrite))
+}
+
+// The named retained descriptor is still authenticated without write reserve.
+func (self *Owner) CheckReadDirectory(relative string, directory *os.File) error {
+	if err := self.borrow(); err != nil {
+		return err
+	}
+	return self.release(self.checkDirectory(relative, directory, false))
 }
 
 // Joins bounded checks before closing. It never deletes or recreates state.

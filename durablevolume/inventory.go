@@ -12,7 +12,7 @@ import (
 	"errors"
 )
 
-const InventorySchema = "urnetwork-durable-volume-inventory-v1"
+const InventorySchema = "urnetwork-durable-volume-inventory-v2"
 const FormerWriterFenceSchema = "urnetwork-durable-volume-former-writer-fence-v1"
 
 // Explicit finite limits bound traversal work, allocation and bytes hashed.
@@ -61,6 +61,7 @@ type Inventory struct {
 	MarkerSha256      string           `json:"marker_sha256"`
 	StateRoot         StateRootSpec    `json:"state_root"`
 	PhysicalRoot      PhysicalRoot     `json:"physical_root"`
+	RootGeneration    string           `json:"root_generation"`
 	FormerWriterFence Reference        `json:"former_writer_fence"`
 	Limits            InventoryLimits  `json:"limits"`
 	TotalBytes        uint64           `json:"total_bytes"`
@@ -71,11 +72,16 @@ type Inventory struct {
 // A matching local inventory proves no remote database, cross-host or service
 // recovery. Existing signed root guards must still admit every resumed owner.
 type RestoreVerification struct {
-	ExpectedInventory          Reference `json:"expected_inventory"`
-	Observed                   Inventory `json:"observed"`
-	ExactLocalBytesAndMetadata bool      `json:"exact_local_bytes_and_metadata"`
-	SamePhysicalRoot           bool      `json:"same_physical_root"`
-	RestartAuthorized          bool      `json:"restart_authorized"`
+	ExpectedInventory          Reference     `json:"expected_inventory"`
+	Observed                   Inventory     `json:"observed"`
+	ExactLocalBytesAndMetadata bool          `json:"exact_local_bytes_and_metadata"`
+	SamePhysicalRoot           bool          `json:"same_physical_root"`
+	SameDeclaration            bool          `json:"same_declaration"`
+	SameRootGeneration         bool          `json:"same_root_generation"`
+	ExpectedDeclaration        Reference     `json:"expected_declaration"`
+	ExpectedStateRoot          StateRootSpec `json:"expected_state_root"`
+	ExpectedRootGeneration     string        `json:"expected_root_generation"`
+	RestartAuthorized          bool          `json:"restart_authorized"`
 }
 
 // The caller cannot accidentally request an unbounded traversal.
@@ -87,19 +93,34 @@ func (self InventoryLimits) validate() error {
 }
 
 // Every external report or fence is strict, protected and bound to exact bytes.
-func readReference(reference Reference, maximum int, target any) error {
+func readReference(ctx context.Context, reference Reference, maximum int, target any) error {
+	if ctx == nil {
+		return errors.New("durable inventory context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !canonical(reference.Path) || !validDigest(reference.Sha256) {
 		return errors.New("durable evidence requires an exact path and hash")
 	}
-	raw, err := readProtectedFile(reference.Path, maximum)
+	raw, err := readProtectedFileContext(ctx, reference.Path, maximum)
 	if err != nil {
 		return err
 	}
-	digest := sha256.Sum256(raw)
-	if "sha256:"+hex.EncodeToString(digest[:]) != reference.Sha256 {
+	digest := sha256.New()
+	for offset := 0; offset < len(raw); offset += 128 * 1024 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		digest.Write(raw[offset:min(offset+128*1024, len(raw))])
+	}
+	if "sha256:"+hex.EncodeToString(digest.Sum(nil)) != reference.Sha256 {
 		return errors.New("durable evidence bytes differ")
 	}
-	return decodeStrict(raw, target)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return errors.Join(decodeStrict(raw, target), ctx.Err())
 }
 
 // The exclusive lease is necessary but does not fence older unguarded writers.
@@ -123,7 +144,7 @@ func (self *Owner) Inventory(ctx context.Context, fenceReference Reference, limi
 			return errors.New("former-writer fence must stay outside the inventoried root")
 		}
 		var fence FormerWriterFence
-		if err := readReference(fenceReference, maximumConfigBytes, &fence); err != nil {
+		if err := readReference(ctx, fenceReference, maximumConfigBytes, &fence); err != nil {
 			return err
 		}
 		if fence.Schema != FormerWriterFenceSchema || fence.RootPath != self.rootPath || fence.DeclarationSha256 != self.reference.Sha256 || fence.LeaseSha256 != self.rootSpec.LeaseSha256 || !fence.FormerWritersStopped || len(fence.Evidence) == 0 || len(fence.Evidence) > 4096 {
@@ -148,24 +169,54 @@ func (self *Owner) Inventory(ctx context.Context, fenceReference Reference, limi
 // Verifies exact local file contents and metadata against a retained manifest.
 // A changed physical root is reported, never silently rebound or authorized.
 func (self *Owner) VerifyInventory(ctx context.Context, expectedReference, fenceReference Reference, limits InventoryLimits) (RestoreVerification, error) {
+	return self.verifyInventory(ctx, expectedReference, fenceReference, limits, false)
+}
+
+// Explicitly compares a locally restored root admitted by a separately reviewed
+// target declaration. This reports a rebind; it never performs or authorizes one.
+func (self *Owner) VerifyReboundInventory(ctx context.Context, expectedReference, fenceReference Reference, limits InventoryLimits) (RestoreVerification, error) {
+	return self.verifyInventory(ctx, expectedReference, fenceReference, limits, true)
+}
+
+// Ordinary inspection retains exact declaration equality; restore mode is explicit.
+func (self *Owner) verifyInventory(ctx context.Context, expectedReference, fenceReference Reference, limits InventoryLimits, allowRebound bool) (RestoreVerification, error) {
+	if ctx == nil {
+		return RestoreVerification{}, errors.New("durable inventory context is required")
+	}
+	if err := errors.Join(ctx.Err(), limits.validate()); err != nil {
+		return RestoreVerification{}, err
+	}
 	var expected Inventory
-	if err := readReference(expectedReference, 64*1024*1024, &expected); err != nil {
+	if err := readReference(ctx, expectedReference, 64*1024*1024, &expected); err != nil {
 		return RestoreVerification{}, err
 	}
 	if expected.Schema != InventorySchema || expected.RestartAuthorized || len(expected.Entries) == 0 || len(expected.Entries) > 10000 {
 		return RestoreVerification{}, errors.New("retained inventory scope is invalid")
 	}
+	rootGeneration, err := hex.DecodeString(expected.RootGeneration)
+	if err != nil || len(rootGeneration) != RootGenerationBytes || expected.StateRoot.RootInode == 0 || expected.StateRoot.RootInode != expected.PhysicalRoot.Inode {
+		return RestoreVerification{}, errors.New("retained inventory lacks exact root generation metadata")
+	}
+	rootDigest := sha256.Sum256(rootGeneration)
+	if "sha256:"+hex.EncodeToString(rootDigest[:]) != expected.StateRoot.GenerationSha256 {
+		return RestoreVerification{}, errors.New("retained inventory root generation differs from its declaration")
+	}
 	observed, err := self.Inventory(ctx, fenceReference, limits)
 	if err != nil {
 		return RestoreVerification{}, err
 	}
-	if expected.Declaration != observed.Declaration || expected.MountPath != observed.MountPath || expected.FilesystemUuid != observed.FilesystemUuid || expected.MarkerSha256 != observed.MarkerSha256 || expected.StateRoot != observed.StateRoot || expected.TotalBytes != observed.TotalBytes {
+	if expected.MountPath != observed.MountPath || expected.FilesystemUuid != observed.FilesystemUuid || expected.MarkerSha256 != observed.MarkerSha256 || expected.StateRoot.Path != observed.StateRoot.Path || expected.StateRoot.LeasePath != observed.StateRoot.LeasePath || expected.StateRoot.LeaseSha256 != observed.StateRoot.LeaseSha256 || expected.TotalBytes != observed.TotalBytes {
 		return RestoreVerification{}, errors.New("retained inventory declaration or byte count differs")
+	}
+	if !allowRebound && (expected.Declaration != observed.Declaration || expected.StateRoot != observed.StateRoot || expected.RootGeneration != observed.RootGeneration) {
+		return RestoreVerification{}, errors.New("retained inventory requires an explicit reviewed target declaration comparison")
 	}
 	want, err := json.Marshal(expected.Entries)
 	got, gotErr := json.Marshal(observed.Entries)
 	if err != nil || gotErr != nil || !bytes.Equal(want, got) {
 		return RestoreVerification{}, errors.Join(errors.New("retained inventory file bytes or metadata differ"), err, gotErr)
 	}
-	return RestoreVerification{ExpectedInventory: expectedReference, Observed: observed, ExactLocalBytesAndMetadata: true, SamePhysicalRoot: expected.PhysicalRoot == observed.PhysicalRoot}, nil
+	return RestoreVerification{ExpectedInventory: expectedReference, Observed: observed, ExactLocalBytesAndMetadata: true, SamePhysicalRoot: expected.PhysicalRoot == observed.PhysicalRoot,
+		SameDeclaration: expected.Declaration == observed.Declaration, SameRootGeneration: expected.RootGeneration == observed.RootGeneration,
+		ExpectedDeclaration: expected.Declaration, ExpectedStateRoot: expected.StateRoot, ExpectedRootGeneration: expected.RootGeneration}, nil
 }

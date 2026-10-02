@@ -6,6 +6,7 @@ package durablevolume
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -122,10 +123,27 @@ func newVolumeFixture(t *testing.T) *volumeFixture {
 		filesystem: Filesystem{Id: [2]int32{17, 19}, Type: 0xef53, AvailableBytes: 1024 * 1024, AvailableInodes: 1024},
 	}
 	config := Config{Schema: Schema, Volumes: []VolumeSpec{{MountPath: mount, FilesystemUuid: "1234-abcd", FilesystemType: "ext4", MarkerPath: marker,
-		MarkerSha256: testDigest(markerBytes), StateRoots: []StateRootSpec{{Path: root, LeasePath: lease, LeaseSha256: testDigest(leaseBytes)}}, MinAvailableBytes: 1024, MinAvailableInodes: 8}}}
+		MarkerSha256: testDigest(markerBytes), StateRoots: []StateRootSpec{provisionTestRoot(t, root, lease, testDigest(leaseBytes))}, MinAvailableBytes: 1024, MinAvailableInodes: 8}}}
 	self := &volumeFixture{reference: Reference{Path: filepath.Join(base, "volumes.json")}, config: config, root: root, mount: mount, marker: marker, host: host}
 	self.writeConfig(t)
 	return self
+}
+
+// Test-only provisioning explicitly enrolls physical roots before admission.
+func provisionTestRoot(t *testing.T, path, lease, leaseSha256 string) StateRootSpec {
+	t.Helper()
+	raw := make([]byte, RootGenerationBytes)
+	if _, err := rand.Read(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Setxattr(path, RootGenerationAttribute, raw, 0); err != nil {
+		t.Fatal(err)
+	}
+	var stat syscall.Stat_t
+	if err := syscall.Stat(path, &stat); err != nil {
+		t.Fatal(err)
+	}
+	return StateRootSpec{Path: path, LeasePath: lease, LeaseSha256: leaseSha256, RootInode: stat.Ino, GenerationSha256: testDigest(raw)}
 }
 
 // Deliberate invalid declarations are also hashed, so validation is exercised.
@@ -498,7 +516,7 @@ func TestOwnerSnapshotOfStoppedRootCoexistsWithOtherRootWriter(t *testing.T) {
 	if err := os.WriteFile(otherLease, otherLeaseBytes, 0600); err != nil {
 		t.Fatal(err)
 	}
-	fixture.config.Volumes[0].StateRoots = append(fixture.config.Volumes[0].StateRoots, StateRootSpec{Path: otherRoot, LeasePath: otherLease, LeaseSha256: testDigest(otherLeaseBytes)})
+	fixture.config.Volumes[0].StateRoots = append(fixture.config.Volumes[0].StateRoots, provisionTestRoot(t, otherRoot, otherLease, testDigest(otherLeaseBytes)))
 	fixture.writeConfig(t)
 	other, err := OpenWithHost(fixture.reference, otherRoot, ReadWrite, fixture.host)
 	if err != nil {

@@ -7,6 +7,7 @@ package durablevolume
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -139,20 +140,36 @@ func (self linuxHost) Filesystem(directory *os.File) (Filesystem, error) {
 }
 
 // Owned objects cannot be shared-writable, aliased files or special devices.
+func unavailableObservation(reason string, err error) error {
+	if err == nil || errors.Is(err, ErrIdentity) || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrClosed) || errors.Is(err, os.ErrClosed) || errors.Is(err, os.ErrInvalid) || errors.Is(err, syscall.EBADF) {
+		return err
+	}
+	return errors.Join(&UnavailableError{Reason: reason}, err)
+}
+
+// A successful namespace refusal proves absence/alias; I/O refusal proves none.
+func namedObservation(reason string, err error) error {
+	if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ELOOP) {
+		return errors.Join(ErrIdentity, err)
+	}
+	return unavailableObservation(reason, err)
+}
+
+// Protection is identity only after an actual successful metadata observation.
 func protected(file *os.File, directory bool) error {
 	var stat syscall.Stat_t
 	if file == nil {
 		return ErrClosed
 	}
 	if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
-		return err
+		return unavailableObservation("durable descriptor protection could not be observed", err)
 	}
 	want := uint32(syscall.S_IFREG)
 	if directory {
 		want = syscall.S_IFDIR
 	}
 	if stat.Mode&syscall.S_IFMT != want || stat.Mode&0022 != 0 || stat.Uid != 0 && stat.Uid != uint32(os.Geteuid()) || !directory && stat.Nlink != 1 {
-		return fmt.Errorf("durable path %q is not a protected physical object (mode %o, uid %d, links %d)", file.Name(), stat.Mode, stat.Uid, stat.Nlink)
+		return errors.Join(ErrIdentity, fmt.Errorf("durable path %q is not a protected physical object (mode %o, uid %d, links %d)", file.Name(), stat.Mode, stat.Uid, stat.Nlink))
 	}
 	return nil
 }
@@ -160,15 +177,15 @@ func protected(file *os.File, directory bool) error {
 // A root-owned sticky ancestor protects each owned child from other users.
 // The selected directory itself still requires the stricter private policy.
 func protectedAncestor(file *os.File) error {
-	if err := protected(file, true); err == nil {
-		return nil
+	if err := protected(file, true); err == nil || !errors.Is(err, ErrIdentity) {
+		return err
 	}
 	var stat syscall.Stat_t
 	if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
-		return err
+		return unavailableObservation("durable ancestor metadata could not be observed", err)
 	}
 	if stat.Mode&syscall.S_IFMT != syscall.S_IFDIR || stat.Uid != 0 || stat.Mode&syscall.S_ISVTX == 0 {
-		return errors.New("durable ancestor is not protected")
+		return errors.Join(ErrIdentity, errors.New("durable ancestor is not protected"))
 	}
 	return nil
 }
@@ -180,7 +197,7 @@ func openPhysicalDirectory(path string) (*os.File, error) {
 	}
 	fd, err := syscall.Open("/", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, err
+		return nil, unavailableObservation("durable ancestry could not be opened", err)
 	}
 	file := os.NewFile(uintptr(fd), "/")
 	for _, part := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
@@ -193,11 +210,11 @@ func openPhysicalDirectory(path string) (*os.File, error) {
 		next, openErr := syscall.Openat(int(file.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 		closeErr := file.Close()
 		if openErr != nil {
-			return nil, errors.Join(openErr, closeErr)
+			return nil, errors.Join(namedObservation("durable ancestry could not be opened", openErr), unavailableObservation("durable ancestor could not be closed", closeErr))
 		}
 		file = os.NewFile(uintptr(next), path)
 		if closeErr != nil {
-			return nil, errors.Join(closeErr, file.Close())
+			return nil, unavailableObservation("durable ancestors could not be closed", errors.Join(closeErr, file.Close()))
 		}
 	}
 	if err := protected(file, true); err != nil {
@@ -216,10 +233,10 @@ func openProtectedFile(path string) (*os.File, error) {
 	fd, openErr := syscall.Openat(int(parent.Fd()), filepath.Base(path), syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	closeErr := parent.Close()
 	if openErr != nil {
-		return nil, errors.Join(openErr, closeErr)
+		return nil, errors.Join(namedObservation("durable named file could not be opened", openErr), unavailableObservation("durable ancestor could not be closed", closeErr))
 	}
 	file := os.NewFile(uintptr(fd), path)
-	if err := errors.Join(closeErr, protected(file, false)); err != nil {
+	if err := errors.Join(unavailableObservation("durable ancestor could not be closed", closeErr), protected(file, false)); err != nil {
 		return nil, errors.Join(err, file.Close())
 	}
 	return file, nil
@@ -227,55 +244,129 @@ func openProtectedFile(path string) (*os.File, error) {
 
 // Concurrent readers use ReadAt rather than a shared file offset.
 func boundedProtectedRead(file *os.File, maximum int) ([]byte, error) {
+	return boundedProtectedReadContext(context.Background(), file, maximum)
+}
+
+// Finite chunks admit cancellation before each actual descriptor read.
+func boundedProtectedReadContext(ctx context.Context, file *os.File, maximum int) ([]byte, error) {
+	if ctx == nil {
+		return nil, errors.New("durable inventory context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := protected(file, false); err != nil {
 		return nil, err
 	}
 	before, err := file.Stat()
-	if err != nil || before.Size() <= 0 || before.Size() > int64(maximum) {
-		return nil, errors.Join(errors.New("durable protected file exceeds its size bound"), err)
+	if err != nil {
+		return nil, unavailableObservation("durable file metadata could not be observed", err)
+	}
+	if before.Size() <= 0 || before.Size() > int64(maximum) {
+		return nil, errors.Join(ErrIdentity, errors.New("durable protected file exceeds its size bound"))
 	}
 	raw := make([]byte, int(before.Size())+1)
-	n, readErr := file.ReadAt(raw, 0)
-	if readErr != nil && !errors.Is(readErr, io.EOF) {
-		return nil, readErr
+	n := 0
+	for n < len(raw) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		count, readErr := file.ReadAt(raw[n:min(n+128*1024, len(raw))], int64(n))
+		n += count
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, unavailableObservation("durable file bytes could not be observed", readErr)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	after, err := file.Stat()
-	if err != nil || n != int(before.Size()) || after.Size() != before.Size() || after.Mode() != before.Mode() || !after.ModTime().Equal(before.ModTime()) {
-		return nil, errors.Join(errors.New("durable protected file changed during read"), err)
+	if err != nil {
+		return nil, unavailableObservation("durable file metadata could not be reobserved", err)
+	}
+	if n != int(before.Size()) || after.Size() != before.Size() || after.Mode() != before.Mode() || !after.ModTime().Equal(before.ModTime()) {
+		return nil, errors.Join(ErrIdentity, errors.New("durable protected file changed during read"))
 	}
 	return raw[:n], protected(file, false)
 }
 
 // Conflicting pathname replacement is refused even if copied bytes match.
 func readProtectedFile(path string, maximum int) ([]byte, error) {
+	return readProtectedFileContext(context.Background(), path, maximum)
+}
+
+// Context admission precedes even path resolution/open of external evidence.
+func readProtectedFileContext(ctx context.Context, path string, maximum int) ([]byte, error) {
+	if ctx == nil {
+		return nil, errors.New("durable inventory context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	file, err := openProtectedFile(path)
 	if err != nil {
 		return nil, err
 	}
-	raw, readErr := boundedProtectedRead(file, maximum)
+	raw, readErr := boundedProtectedReadContext(ctx, file, maximum)
 	matchErr := sameNamedFile(file, path)
-	return raw, errors.Join(readErr, matchErr, file.Close())
+	err = errors.Join(readErr, matchErr, unavailableObservation("durable evidence could not be closed", file.Close()), ctx.Err())
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
 // Opened and named objects must remain the same protected physical generation.
 func sameNamedFile(file *os.File, path string) error {
+	return sameNamedFileObserved(file, path, nil)
+}
+
+// Failure injection retains all successful real descriptor/path operations.
+func sameNamedFileObserved(file *os.File, path string, observe func(string, *os.File, string) error) error {
+	if observe != nil {
+		if err := observe("opened-stat", file, path); err != nil {
+			return unavailableObservation("durable opened metadata could not be observed", err)
+		}
+	}
 	opened, err := file.Stat()
 	if err != nil {
-		return err
+		return unavailableObservation("durable opened metadata could not be observed", err)
 	}
 	var current *os.File
+	if observe != nil {
+		if err := observe("named-open", file, path); err != nil {
+			return namedObservation("durable named file could not be opened", err)
+		}
+	}
 	if opened.IsDir() {
 		current, err = openPhysicalDirectory(path)
 	} else {
 		current, err = openProtectedFile(path)
 	}
 	if err != nil {
-		return err
+		return namedObservation("durable named file could not be opened", err)
 	}
-	named, nameErr := current.Stat()
+	var nameErr error
+	if observe != nil {
+		nameErr = observe("named-stat", current, path)
+	}
+	var named os.FileInfo
+	if nameErr == nil {
+		named, nameErr = current.Stat()
+	}
 	closeErr := current.Close()
-	if nameErr != nil || !os.SameFile(opened, named) || opened.Mode() != named.Mode() {
-		return errors.Join(errors.New("durable physical path was replaced"), nameErr, closeErr)
+	if observe != nil {
+		closeErr = errors.Join(closeErr, observe("named-close", current, path))
+	}
+	closeErr = unavailableObservation("durable named file could not be closed", closeErr)
+	if nameErr != nil {
+		return errors.Join(unavailableObservation("durable named metadata could not be observed", nameErr), closeErr)
+	}
+	if !os.SameFile(opened, named) || opened.Mode() != named.Mode() {
+		return errors.Join(ErrIdentity, errors.New("durable physical path was replaced"), closeErr)
 	}
 	return errors.Join(protected(file, opened.IsDir()), closeErr)
 }
@@ -287,7 +378,7 @@ func (self *Owner) mountFacts() (Mount, error) {
 		return Mount{}, errors.Join(&UnavailableError{Reason: "kernel mount census could not be observed"}, err)
 	}
 	if len(mounts) == 0 || len(mounts) > 8192 {
-		return Mount{}, errors.New("durable mount census is empty or unbounded")
+		return Mount{}, errors.Join(ErrIdentity, errors.New("durable mount census is empty or unbounded"))
 	}
 	var selected, root Mount
 	selectedCount, rootCount := 0, 0
@@ -300,14 +391,14 @@ func (self *Owner) mountFacts() (Mount, error) {
 		}
 	}
 	if selectedCount != 1 || rootCount != 1 || selected.Id == 0 || selected.FilesystemType != self.spec.FilesystemType {
-		return Mount{}, errors.New("approved durable mount is absent, ambiguous or has another filesystem type")
+		return Mount{}, errors.Join(ErrIdentity, errors.New("approved durable mount is absent, ambiguous or has another filesystem type"))
 	}
 	if selected.Device == root.Device && self.scope != ownerLocalScope {
-		return Mount{}, errors.New("daemon durable mount is on the root filesystem")
+		return Mount{}, errors.Join(ErrIdentity, errors.New("daemon durable mount is on the root filesystem"))
 	}
 	for _, mount := range mounts {
 		if mount.Path != selected.Path && beneath(selected.Path, mount.Path) && (beneath(mount.Path, self.rootPath) || beneath(mount.Path, self.spec.MarkerPath) || beneath(mount.Path, self.rootSpec.LeasePath)) {
-			return Mount{}, errors.New("another mount covers the durable marker or owner root")
+			return Mount{}, errors.Join(ErrIdentity, errors.New("another mount covers the durable marker or owner root"))
 		}
 	}
 	device, err := self.host.DeviceUuid(self.spec.FilesystemUuid)
@@ -318,7 +409,7 @@ func (self *Owner) mountFacts() (Mount, error) {
 		return Mount{}, errors.Join(&UnavailableError{Reason: "kernel uuid device could not be observed"}, err)
 	}
 	if device != selected.Device {
-		return Mount{}, errors.New("durable mount differs from the approved filesystem uuid")
+		return Mount{}, errors.Join(ErrIdentity, errors.New("durable mount differs from the approved filesystem uuid"))
 	}
 	return selected, nil
 }
@@ -364,17 +455,15 @@ func (self *Owner) open() error {
 }
 
 // Every admission rechecks the kernel namespace, current uuid and marker bytes.
-func (self *Owner) check(write bool) (result error) {
-	defer func() {
-		if result != nil && !errors.Is(result, ErrUnavailable) {
-			result = errors.Join(ErrIdentity, result)
-		}
-	}()
+func (self *Owner) check(write bool) error {
 	mount, err := self.mountFacts()
+	if err != nil {
+		return err
+	}
 	identity := mount
 	identity.ReadOnly = self.mount.ReadOnly
-	if err != nil || identity != self.mount {
-		return errors.Join(errors.New("durable mount generation changed"), err)
+	if identity != self.mount {
+		return errors.Join(ErrIdentity, errors.New("durable mount generation changed"))
 	}
 	for _, entry := range []struct {
 		file *os.File
@@ -385,15 +474,15 @@ func (self *Owner) check(write bool) (result error) {
 		{file: self.markerFile, path: self.spec.MarkerPath},
 		{file: self.leaseFile, path: self.rootSpec.LeasePath},
 	} {
-		if err := sameNamedFile(entry.file, entry.path); err != nil {
+		if err := sameNamedFileObserved(entry.file, entry.path, self.observeFile); err != nil {
 			return err
 		}
 		var stat syscall.Stat_t
 		if err := syscall.Fstat(int(entry.file.Fd()), &stat); err != nil {
-			return err
+			return unavailableObservation("durable descriptor device could not be observed", err)
 		}
 		if deviceNumber(stat.Dev) != mount.Device {
-			return errors.New("durable descriptor belongs to another filesystem")
+			return errors.Join(ErrIdentity, errors.New("durable descriptor belongs to another filesystem"))
 		}
 	}
 	for _, identity := range []struct {
@@ -409,8 +498,11 @@ func (self *Owner) check(write bool) (result error) {
 		}
 		digest := sha256.Sum256(raw)
 		if "sha256:"+hex.EncodeToString(digest[:]) != identity.digest {
-			return errors.New("durable volume marker or root lease bytes differ")
+			return errors.Join(ErrIdentity, errors.New("durable volume marker or root lease bytes differ"))
 		}
+	}
+	if _, err := self.rootGeneration(); err != nil {
+		return err
 	}
 	filesystem, err := self.host.Filesystem(self.rootFile)
 	if err != nil {
@@ -418,7 +510,7 @@ func (self *Owner) check(write bool) (result error) {
 	}
 	typeMatches := self.spec.FilesystemType == "ext4" && filesystem.Type == 0xef53 || self.spec.FilesystemType == "xfs" && filesystem.Type == 0x58465342 || self.spec.FilesystemType == "btrfs" && filesystem.Type == 0x9123683e
 	if !typeMatches || filesystem.Id != self.filesystem.Id || filesystem.Type != self.filesystem.Type {
-		return errors.New("durable filesystem descriptor identity changed")
+		return errors.Join(ErrIdentity, errors.New("durable filesystem descriptor identity changed"))
 	}
 	if write && (self.access != ReadWrite || mount.ReadOnly || filesystem.ReadOnly || filesystem.AvailableBytes < self.spec.MinAvailableBytes || filesystem.AvailableInodes < self.spec.MinAvailableInodes) {
 		return &UnavailableError{Reason: "filesystem is read-only or below its byte/inode reserve"}
@@ -471,7 +563,7 @@ func (self *Owner) openChild(relative string, create bool) (*os.File, error) {
 	}
 	fd, err := syscall.Openat(int(self.rootFile.Fd()), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, err
+		return nil, unavailableObservation("durable child root could not be opened", err)
 	}
 	file := os.NewFile(uintptr(fd), self.rootPath)
 	path := self.rootPath
@@ -496,7 +588,10 @@ func (self *Owner) openChild(relative string, create bool) (*os.File, error) {
 			if errors.Is(openErr, syscall.ELOOP) || errors.Is(openErr, syscall.ENOTDIR) {
 				openErr = errors.Join(ErrIdentity, openErr)
 			}
-			return nil, errors.Join(openErr, file.Close())
+			if !errors.Is(openErr, syscall.ENOENT) {
+				openErr = unavailableObservation("durable child could not be opened", openErr)
+			}
+			return nil, errors.Join(openErr, unavailableObservation("durable child parent could not be closed", file.Close()))
 		}
 		child := os.NewFile(uintptr(next), path)
 		if create {
@@ -505,11 +600,11 @@ func (self *Owner) openChild(relative string, create bool) (*os.File, error) {
 			}
 		}
 		if err := file.Close(); err != nil {
-			return nil, errors.Join(err, child.Close())
+			return nil, unavailableObservation("durable child parent could not be closed", errors.Join(err, child.Close()))
 		}
 		file = child
 		if err := protected(file, true); err != nil {
-			return nil, errors.Join(ErrIdentity, err, file.Close())
+			return nil, errors.Join(err, unavailableObservation("durable child could not be closed", file.Close()))
 		}
 		var stat syscall.Stat_t
 		if err := syscall.Fstat(next, &stat); err != nil {
@@ -540,21 +635,21 @@ func (self *Owner) openDirectory(relative string, create bool) (*os.File, error)
 	if err := self.check(self.access == ReadWrite); err != nil {
 		return nil, errors.Join(err, file.Close())
 	}
-	if err := sameNamedFile(file, filepath.Join(self.rootPath, relative)); err != nil {
-		return nil, errors.Join(ErrIdentity, err, file.Close())
+	if err := sameNamedFileObserved(file, filepath.Join(self.rootPath, relative), self.observeFile); err != nil {
+		return nil, errors.Join(err, unavailableObservation("durable child could not be closed", file.Close()))
 	}
 	return file, nil
 }
 
 // Descriptor and logical name must agree before a caller acknowledges its write.
-func (self *Owner) checkDirectory(relative string, directory *os.File) error {
+func (self *Owner) checkDirectory(relative string, directory *os.File, write bool) error {
 	if directory == nil {
 		return ErrClosed
 	}
 	if _, err := relativeParts(relative); err != nil {
 		return err
 	}
-	if err := self.check(self.access == ReadWrite); err != nil {
+	if err := self.check(write); err != nil {
 		return err
 	}
 	current, err := self.openChild(relative, false)
@@ -566,20 +661,20 @@ func (self *Owner) checkDirectory(relative string, directory *os.File) error {
 	}
 	want, wantErr := current.Stat()
 	got, gotErr := directory.Stat()
-	closeErr := current.Close()
+	closeErr := unavailableObservation("durable descendant could not be closed", current.Close())
 	if gotErr != nil {
-		return errors.Join(gotErr, closeErr)
+		return errors.Join(unavailableObservation("borrowed durable descriptor could not be observed", gotErr), closeErr)
 	}
 	if wantErr != nil {
 		return errors.Join(&UnavailableError{Reason: "durable descendant metadata could not be observed"}, wantErr, closeErr)
 	}
-	if wantErr != nil || gotErr != nil || !os.SameFile(want, got) || want.Mode() != got.Mode() {
-		return errors.Join(ErrIdentity, errors.New("durable descendant descriptor changed"), wantErr, gotErr, closeErr)
+	if !os.SameFile(want, got) || want.Mode() != got.Mode() {
+		return errors.Join(ErrIdentity, errors.New("durable descendant descriptor changed"), closeErr)
 	}
-	if err := sameNamedFile(directory, filepath.Join(self.rootPath, relative)); err != nil {
-		return errors.Join(ErrIdentity, err, closeErr)
+	if err := sameNamedFileObserved(directory, filepath.Join(self.rootPath, relative), self.observeFile); err != nil {
+		return errors.Join(err, closeErr)
 	}
-	return errors.Join(closeErr, self.check(self.access == ReadWrite))
+	return errors.Join(closeErr, self.check(write))
 }
 
 // A compile-time assertion keeps the public host facts narrow and explicit.
