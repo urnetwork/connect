@@ -13,6 +13,7 @@ import (
 )
 
 const InventorySchema = "urnetwork-durable-volume-inventory-v3"
+const PhysicalInventorySchema = "urnetwork-durable-volume-physical-inventory-v1"
 const FormerWriterFenceSchema = "urnetwork-durable-volume-former-writer-fence-v1"
 
 // Explicit finite limits bound traversal work, allocation and bytes hashed.
@@ -44,6 +45,7 @@ type PhysicalRoot struct {
 // Names are relative, sorted, bounded and unique. Symlinks and special files
 // are refused instead of silently omitted from a plausible complete inventory.
 type InventoryEntry struct {
+	Physical        *PhysicalRoot        `json:"physical,omitempty"`
 	Path            string               `json:"path"`
 	Kind            string               `json:"kind"`
 	Mode            uint32               `json:"mode"`
@@ -143,6 +145,18 @@ func readReference(ctx context.Context, reference Reference, maximum int, target
 // The exclusive lease is necessary but does not fence older unguarded writers.
 // A separate exact external stop/join assertion is required and retained.
 func (self *Owner) Inventory(ctx context.Context, fenceReference Reference, limits InventoryLimits) (Inventory, error) {
+	return self.inventoryReport(ctx, fenceReference, limits, InventorySchema)
+}
+
+// Explicit physical export retains original leaf generations for separately
+// reviewed semantic restore. It grants neither rebinding nor restart authority.
+func (self *Owner) InventoryPhysical(ctx context.Context, fenceReference Reference, limits InventoryLimits) (Inventory, error) {
+	return self.inventoryReport(ctx, fenceReference, limits, PhysicalInventorySchema)
+}
+
+// Both report kinds use the same owned lease, limits and descriptor traversal.
+// The selected schema is fixed by the public method, never inferred from data.
+func (self *Owner) inventoryReport(ctx context.Context, fenceReference Reference, limits InventoryLimits, schema string) (Inventory, error) {
 	if ctx == nil {
 		return Inventory{}, errors.New("durable inventory context is required")
 	}
@@ -170,7 +184,7 @@ func (self *Owner) Inventory(ctx context.Context, fenceReference Reference, limi
 		if err := self.check(false); err != nil {
 			return err
 		}
-		result = Inventory{Schema: InventorySchema, Declaration: self.reference, MountPath: self.spec.MountPath, FilesystemUuid: self.spec.FilesystemUuid,
+		result = Inventory{Schema: schema, Declaration: self.reference, MountPath: self.spec.MountPath, FilesystemUuid: self.spec.FilesystemUuid,
 			MarkerSha256: self.spec.MarkerSha256, StateRoot: self.rootSpec, FormerWriterFence: fenceReference, Limits: limits}
 		if err := self.inventory(ctx, &result); err != nil {
 			return err
