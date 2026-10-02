@@ -239,7 +239,7 @@ func TestOwnerLocalSnapshotPreservesPendingAndCompletedIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot := openOwnerLocalFixture(t, fixture, Snapshot)
-	limits := InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4}
+	limits := InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4, MaxOwnerAttributes: 16, MaxOwnerAttributeBytes: 16384}
 	if _, err := snapshot.Inventory(t.Context(), Reference{}, limits); err == nil {
 		t.Fatal("owner-local snapshot waived the external former-writer fence")
 	}

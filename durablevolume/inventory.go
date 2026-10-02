@@ -12,14 +12,16 @@ import (
 	"errors"
 )
 
-const InventorySchema = "urnetwork-durable-volume-inventory-v2"
+const InventorySchema = "urnetwork-durable-volume-inventory-v3"
 const FormerWriterFenceSchema = "urnetwork-durable-volume-former-writer-fence-v1"
 
 // Explicit finite limits bound traversal work, allocation and bytes hashed.
 type InventoryLimits struct {
-	MaxEntries uint64 `json:"max_entries"`
-	MaxBytes   uint64 `json:"max_bytes"`
-	MaxDepth   uint64 `json:"max_depth"`
+	MaxEntries             uint64 `json:"max_entries"`
+	MaxBytes               uint64 `json:"max_bytes"`
+	MaxDepth               uint64 `json:"max_depth"`
+	MaxOwnerAttributes     uint64 `json:"max_owner_attributes"`
+	MaxOwnerAttributeBytes uint64 `json:"max_owner_attribute_bytes"`
 }
 
 // The retained external assertion includes legacy writers outside our leases.
@@ -42,31 +44,43 @@ type PhysicalRoot struct {
 // Names are relative, sorted, bounded and unique. Symlinks and special files
 // are refused instead of silently omitted from a plausible complete inventory.
 type InventoryEntry struct {
-	Path   string `json:"path"`
-	Kind   string `json:"kind"`
-	Mode   uint32 `json:"mode"`
-	Uid    uint32 `json:"uid"`
-	Gid    uint32 `json:"gid"`
-	Size   uint64 `json:"size"`
-	Sha256 string `json:"sha256,omitempty"`
+	Path            string               `json:"path"`
+	Kind            string               `json:"kind"`
+	Mode            uint32               `json:"mode"`
+	Uid             uint32               `json:"uid"`
+	Gid             uint32               `json:"gid"`
+	Size            uint64               `json:"size"`
+	Sha256          string               `json:"sha256,omitempty"`
+	OwnerAttributes []InventoryAttribute `json:"owner_attributes,omitempty"`
+}
+
+// Known owner attributes are opaque original bytes. Recording them does not
+// validate their signed records, embedded inode bindings or pending commits.
+// The selected root's generation is retained separately in RootGeneration.
+type InventoryAttribute struct {
+	Name   string `json:"name"`
+	Value  []byte `json:"value"`
+	Sha256 string `json:"sha256"`
 }
 
 // This exact manifest is sealed externally by its file hash. Its physical root
 // is evidence only; it never replaces historical signed inode/device bindings.
 type Inventory struct {
-	Schema            string           `json:"schema"`
-	Declaration       Reference        `json:"declaration"`
-	MountPath         string           `json:"mount_path"`
-	FilesystemUuid    string           `json:"filesystem_uuid"`
-	MarkerSha256      string           `json:"marker_sha256"`
-	StateRoot         StateRootSpec    `json:"state_root"`
-	PhysicalRoot      PhysicalRoot     `json:"physical_root"`
-	RootGeneration    string           `json:"root_generation"`
-	FormerWriterFence Reference        `json:"former_writer_fence"`
-	Limits            InventoryLimits  `json:"limits"`
-	TotalBytes        uint64           `json:"total_bytes"`
-	Entries           []InventoryEntry `json:"entries"`
-	RestartAuthorized bool             `json:"restart_authorized"`
+	Schema                   string           `json:"schema"`
+	Declaration              Reference        `json:"declaration"`
+	MountPath                string           `json:"mount_path"`
+	FilesystemUuid           string           `json:"filesystem_uuid"`
+	MarkerSha256             string           `json:"marker_sha256"`
+	StateRoot                StateRootSpec    `json:"state_root"`
+	PhysicalRoot             PhysicalRoot     `json:"physical_root"`
+	RootGeneration           string           `json:"root_generation"`
+	FormerWriterFence        Reference        `json:"former_writer_fence"`
+	Limits                   InventoryLimits  `json:"limits"`
+	TotalBytes               uint64           `json:"total_bytes"`
+	TotalOwnerAttributes     uint64           `json:"total_owner_attributes"`
+	TotalOwnerAttributeBytes uint64           `json:"total_owner_attribute_bytes"`
+	Entries                  []InventoryEntry `json:"entries"`
+	RestartAuthorized        bool             `json:"restart_authorized"`
 }
 
 // A matching local inventory proves no remote database, cross-host or service
@@ -88,6 +102,9 @@ type RestoreVerification struct {
 func (self InventoryLimits) validate() error {
 	if self.MaxEntries == 0 || self.MaxEntries > 10000 || self.MaxBytes == 0 || self.MaxBytes > 1024*1024*1024*1024 || self.MaxDepth == 0 || self.MaxDepth > 32 {
 		return errors.New("durable inventory requires bounded entries, bytes and depth")
+	}
+	if self.MaxOwnerAttributes == 0 || self.MaxOwnerAttributes > 10000 || self.MaxOwnerAttributeBytes == 0 || self.MaxOwnerAttributeBytes > 16*1024*1024 {
+		return errors.New("durable inventory requires bounded owner attribute count and bytes")
 	}
 	return nil
 }
@@ -205,7 +222,7 @@ func (self *Owner) verifyInventory(ctx context.Context, expectedReference, fence
 	if err != nil {
 		return RestoreVerification{}, err
 	}
-	if expected.MountPath != observed.MountPath || expected.FilesystemUuid != observed.FilesystemUuid || expected.MarkerSha256 != observed.MarkerSha256 || expected.StateRoot.Path != observed.StateRoot.Path || expected.StateRoot.LeasePath != observed.StateRoot.LeasePath || expected.StateRoot.LeaseSha256 != observed.StateRoot.LeaseSha256 || expected.TotalBytes != observed.TotalBytes {
+	if expected.MountPath != observed.MountPath || expected.FilesystemUuid != observed.FilesystemUuid || expected.MarkerSha256 != observed.MarkerSha256 || expected.StateRoot.Path != observed.StateRoot.Path || expected.StateRoot.LeasePath != observed.StateRoot.LeasePath || expected.StateRoot.LeaseSha256 != observed.StateRoot.LeaseSha256 || expected.TotalBytes != observed.TotalBytes || expected.TotalOwnerAttributes != observed.TotalOwnerAttributes || expected.TotalOwnerAttributeBytes != observed.TotalOwnerAttributeBytes {
 		return RestoreVerification{}, errors.New("retained inventory declaration or byte count differs")
 	}
 	if !allowRebound && (expected.Declaration != observed.Declaration || expected.StateRoot != observed.StateRoot || expected.RootGeneration != observed.RootGeneration) {

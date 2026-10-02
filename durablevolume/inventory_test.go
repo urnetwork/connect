@@ -54,7 +54,7 @@ func TestInventoryAndRestoreRetainExactLocalCustody(t *testing.T) {
 	fixture.custody(t)
 	fence := fixture.fence(t)
 	snapshot := fixture.open(t, Snapshot)
-	limits := InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4}
+	limits := InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4, MaxOwnerAttributes: 16, MaxOwnerAttributeBytes: 16384}
 	inventory, err := snapshot.Inventory(t.Context(), fence, limits)
 	if err != nil {
 		t.Fatal(err)
@@ -106,7 +106,7 @@ func TestInventoryAndRestoreRetainExactLocalCustody(t *testing.T) {
 func TestInventoryRequiresExactFormerWriterFence(t *testing.T) {
 	fixture := newVolumeFixture(t)
 	snapshot := fixture.open(t, Snapshot)
-	limits := InventoryLimits{MaxEntries: 8, MaxBytes: 4096, MaxDepth: 4}
+	limits := InventoryLimits{MaxEntries: 8, MaxBytes: 4096, MaxDepth: 4, MaxOwnerAttributes: 16, MaxOwnerAttributeBytes: 16384}
 	if _, err := snapshot.Inventory(t.Context(), Reference{}, limits); err == nil {
 		t.Fatal("missing legacy fence admitted")
 	}
@@ -139,7 +139,7 @@ func TestInventoryWorkAndByteBoundsAndCancellation(t *testing.T) {
 		fixture := newVolumeFixture(t)
 		fixture.custody(t)
 		snapshot := fixture.open(t, Snapshot)
-		limits := InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4}
+		limits := InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4, MaxOwnerAttributes: 16, MaxOwnerAttributeBytes: 16384}
 		ctx, cancel := context.WithCancel(t.Context())
 		switch kind {
 		case "entries":
@@ -167,9 +167,14 @@ func TestInventoryWorkAndByteBoundsAndCancellation(t *testing.T) {
 func TestInventoryRestoredRootReportsChangedPhysicalIdentity(t *testing.T) {
 	fixture := newVolumeFixture(t)
 	fixture.custody(t)
+	ownerName := "user.urnetwork.native-journal-custody"
+	ownerBytes := []byte("opaque-original-inode-bound-acknowledgement")
+	if err := syscall.Setxattr(fixture.root, ownerName, ownerBytes, 1); err != nil {
+		t.Fatal(err)
+	}
 	fence := fixture.fence(t)
 	snapshot := fixture.open(t, Snapshot)
-	limits := InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4}
+	limits := InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4, MaxOwnerAttributes: 16, MaxOwnerAttributeBytes: 16384}
 	before, err := snapshot.Inventory(t.Context(), fence, limits)
 	if err != nil {
 		t.Fatal(err)
@@ -203,6 +208,12 @@ func TestInventoryRestoredRootReportsChangedPhysicalIdentity(t *testing.T) {
 	fixture.writeConfig(t)
 	fence = fixture.fence(t)
 	restored := fixture.open(t, Snapshot)
+	if _, err := restored.VerifyReboundInventory(t.Context(), Reference{Path: path, Sha256: testDigest(raw)}, fence, limits); err == nil {
+		t.Fatal("explicit root rebind omitted original owner custody attributes")
+	}
+	if err := syscall.Setxattr(fixture.root, ownerName, ownerBytes, 1); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := restored.VerifyInventory(t.Context(), Reference{Path: path, Sha256: testDigest(raw)}, fence, limits); err == nil {
 		t.Fatal("ordinary verification inferred rebind authority")
 	}
@@ -236,7 +247,7 @@ func TestInventoryRejectsAliasesAndNestedMounts(t *testing.T) {
 				fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 9, ParentId: 7, Device: fixture.host.uuidDevice, Root: "/", Path: filepath.Join(fixture.root, "journal"), FilesystemType: "ext4"})
 			})
 		}
-		if _, err := snapshot.Inventory(t.Context(), fixture.fence(t), InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4}); !errors.Is(err, ErrIdentity) {
+		if _, err := snapshot.Inventory(t.Context(), fixture.fence(t), InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4, MaxOwnerAttributes: 16, MaxOwnerAttributeBytes: 16384}); !errors.Is(err, ErrIdentity) {
 			t.Fatalf("%s integrity result: %v", kind, err)
 		}
 	}
@@ -329,7 +340,7 @@ func TestOwnerCrashReleasesLeaseAndRetainsCompletedBytes(t *testing.T) {
 	}
 	joined = true
 	snapshot := fixture.open(t, Snapshot)
-	result, err := snapshot.Inventory(t.Context(), fixture.fence(t), InventoryLimits{MaxEntries: 4, MaxBytes: 4096, MaxDepth: 2})
+	result, err := snapshot.Inventory(t.Context(), fixture.fence(t), InventoryLimits{MaxEntries: 4, MaxBytes: 4096, MaxDepth: 2, MaxOwnerAttributes: 16, MaxOwnerAttributeBytes: 16384})
 	if err != nil || len(result.Entries) != 2 {
 		t.Fatalf("crash inventory: %+v %v", result, err)
 	}

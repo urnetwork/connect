@@ -71,7 +71,7 @@ func TestInventoryNamedObservationUnavailableCanRetry(t *testing.T) {
 	fixture.custody(t)
 	owner := fixture.open(t, Snapshot)
 	fence := fixture.fence(t)
-	limits := InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4}
+	limits := InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4, MaxOwnerAttributes: 16, MaxOwnerAttributeBytes: 16384}
 	owner.observeFile = func(step string, _ *os.File, path string) error {
 		if step == "named-stat" && path == filepath.Join(fixture.root, "journal", "pending") {
 			return syscall.EIO

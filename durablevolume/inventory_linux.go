@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -48,6 +49,21 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) (resultErr 
 		return err
 	}
 	result.RootGeneration = hex.EncodeToString(generation)
+	// Limit escaped path and metadata reporting independently of file contents.
+	// This leaves room for declarations within the 64 MiB evidence reader bound.
+	var entryReportBytes uint64
+	appendEntry := func(entry InventoryEntry) error {
+		raw, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		entryReportBytes += uint64(len(raw)) + 1
+		if entryReportBytes > 60*1024*1024 {
+			return errors.New("inventory encoded metadata report bound exhausted")
+		}
+		result.Entries = append(result.Entries, entry)
+		return nil
+	}
 	var visit func(*os.File, string, uint64) error
 	visit = func(file *os.File, relative string, depth uint64) error {
 		if err := ctx.Err(); err != nil {
@@ -71,9 +87,15 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) (resultErr 
 			return err
 		}
 		entry := InventoryEntry{Path: relative, Mode: before.Mode & 07777, Uid: before.Uid, Gid: before.Gid}
+		entry.OwnerAttributes, err = self.inventoryAttributes(ctx, file, relative, result)
+		if err != nil {
+			return err
+		}
 		if directory {
 			entry.Kind = "directory"
-			result.Entries = append(result.Entries, entry)
+			if err := appendEntry(entry); err != nil {
+				return err
+			}
 			remaining := result.Limits.MaxEntries - uint64(len(result.Entries))
 			children, err := file.ReadDir(int(remaining + 1))
 			if err != nil && !errors.Is(err, io.EOF) {
@@ -137,7 +159,9 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) (resultErr 
 			}
 			entry.Sha256 = "sha256:" + hex.EncodeToString(hash.Sum(nil))
 			result.TotalBytes += entry.Size
-			result.Entries = append(result.Entries, entry)
+			if err := appendEntry(entry); err != nil {
+				return err
+			}
 		}
 		after, err := inventoryStat(file)
 		if err != nil {
