@@ -12405,6 +12405,10 @@ func (self *SendSequence) observeTransferWireMessage(
 	item *sendItem,
 	resend bool,
 ) {
+	// The ordinary build compiles this diagnostic-only call out entirely.
+	if ackLineageTraceEnabled {
+		observeAckLineagePacing(self, item, resend)
+	}
 	if progressObserver := self.sendBufferSettings.ProgressObserver; progressObserver != nil {
 		beginTransferProgress(progressObserver, TransferProgressEvent{
 			Stage: "send_attempt", ClientId: self.client.ClientId(), PeerId: self.destination,
