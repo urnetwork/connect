@@ -129,13 +129,24 @@ func (self *ApiOutOfBandControl) SendControlWithCtx(
 			defer cancel()
 			var result *ConnectControlResult
 			var err error
+			byJwt := self.api.ByJwt()
 			HandleError(func() {
 				if err = requestCtx.Err(); err == nil {
-					result, err = self.localControl.ConnectControl(requestCtx, self.api.ByJwt(), connectControlArgs)
+					result, err = self.localControl.ConnectControl(requestCtx, byJwt, connectControlArgs)
 				}
 			}, func(recovered error) { err = fmt.Errorf("local control failed: %w", recovered) })
 			if requestCtx.Err() != nil {
-				result, err = nil, requestCtx.Err()
+				// A local handler may return a committed contract after its
+				// request was canceled. Retain this admitted owner through the
+				// requester's zero-use close before discarding that result. The
+				// canceled result never reaches a data producer or becomes success.
+				var cleanupErr error
+				HandleError(func() {
+					cleanupErr = self.closeUndeliveredLocalContracts(requestCtx, byJwt, connectControlArgs, result)
+				}, func(recovered error) {
+					cleanupErr = fmt.Errorf("local undelivered contract cleanup failed: %w", recovered)
+				})
+				result, err = nil, errors.Join(requestCtx.Err(), cleanupErr)
 			}
 			apiCallback.Result(result, err)
 		}()
