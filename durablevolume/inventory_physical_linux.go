@@ -31,7 +31,7 @@ func validatePhysicalInventory(ctx context.Context, report Inventory) error {
 	if ctx == nil {
 		return errors.New("physical inventory requires cancellation context")
 	}
-	if err := errors.Join(ctx.Err(), report.Limits.validate()); err != nil {
+	if err := errors.Join(ctx.Err(), report.Limits.validateEntries(MaximumPhysicalInventoryEntries)); err != nil {
 		return err
 	}
 	if report.Schema != PhysicalInventorySchema || report.RestartAuthorized || len(report.Entries) == 0 || uint64(len(report.Entries)) > report.Limits.MaxEntries || report.StateRoot.RootInode == 0 || report.StateRoot.RootInode != report.PhysicalRoot.Inode || !canonical(report.StateRoot.Path) || !canonical(report.Declaration.Path) || !validDigest(report.Declaration.Sha256) || !validDigest(report.StateRoot.GenerationSha256) {

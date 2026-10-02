@@ -78,8 +78,11 @@ func (self PreparationRequest) validate(scope ownerScope) error {
 	if scope == ownerLocalScope {
 		expectedScope = "owner-local"
 	}
-	if self.Schema != PreparationRequestSchema || self.Scope != expectedScope || self.Purpose != "fresh" {
-		return errors.New("storage preparation requires the explicitly selected scope and supported fresh purpose; retained/restore are not implemented")
+	if self.Schema != PreparationRequestSchema || self.Scope != expectedScope || self.Purpose != "fresh" && self.Purpose != "restore" {
+		return errors.New("storage preparation requires an explicit scope and supported fresh or restore purpose")
+	}
+	if err := self.validateRestore(); err != nil {
+		return err
 	}
 	if self.RootCreation != "" && self.RootCreation != "create-private" {
 		return errors.New("preparation root creation profile is unsupported")
@@ -90,7 +93,11 @@ func (self PreparationRequest) validate(scope ownerScope) error {
 		}
 	}
 	limit := self.Limits
-	if limit.MaxEntries == 0 || limit.MaxEntries > 10000 || limit.MaxBytes == 0 || limit.MaxBytes > 1024*1024*1024*1024 ||
+	maximumEntries := uint64(10000)
+	if self.Purpose == "restore" {
+		maximumEntries = MaximumPhysicalInventoryEntries
+	}
+	if limit.MaxEntries == 0 || limit.MaxEntries > maximumEntries || limit.MaxBytes == 0 || limit.MaxBytes > 1024*1024*1024*1024 ||
 		limit.MaxDepth == 0 || limit.MaxDepth > 16 || limit.MaxOwnerAttributes == 0 || limit.MaxOwnerAttributes > 128 ||
 		limit.MaxOwnerAttributeBytes == 0 || limit.MaxOwnerAttributeBytes > 128*4096 || limit.MaxPlanBytes < 4096 || limit.MaxPlanBytes > maximumPreparationPlanBytes ||
 		len(self.Owners) == 0 || len(self.Owners) > 32 {
@@ -120,8 +127,11 @@ func (self PreparationRequest) validate(scope ownerScope) error {
 		}
 	}
 	for _, owner := range self.Owners {
-		if owner.Kind == "" || len(owner.Kind) > 128 || owner.RelativePath != "." || owner.Purpose != "fresh" || len(owner.Inputs) == 0 || len(owner.Inputs) > maximumPreparationRequestBytes {
-			return errors.New("preparation owner requires a fixed fresh kind at the precreated root")
+		if owner.Kind == "" || len(owner.Kind) > 128 || owner.RelativePath != "." || owner.Purpose != self.Purpose || len(owner.Inputs) == 0 || len(owner.Inputs) > maximumPreparationRequestBytes {
+			if self.Purpose == "fresh" {
+				return errors.New("preparation owner requires a fixed fresh kind at the precreated root")
+			}
+			return errors.New("preparation owner requires its exact fixed kind and declared purpose")
 		}
 	}
 	return nil
@@ -378,9 +388,11 @@ func (self *preparationAdmission) fence() error {
 	if err := decodeStrict(raw, &fence); err != nil {
 		return err
 	}
+	fresh := self.request.Purpose == "fresh" && fence.NoPreviousOwnerState && !fence.NoPreviousTargetState
+	restore := self.request.Purpose == "restore" && !fence.NoPreviousOwnerState && fence.NoPreviousTargetState
 	if fence.Schema != PreparationFenceSchema || fence.RootPath != self.request.RootPath || !self.fenceRootMatches(fence) ||
-		fence.Purpose != "fresh" || !fence.FormerWritersStopped || !fence.NoPreviousOwnerState || strings.TrimSpace(fence.Evidence) == "" || len(fence.Evidence) > 8192 {
-		return errors.New("explicit fresh namespace and stopped former-writer evidence are required")
+		fence.Purpose != self.request.Purpose || !fence.FormerWritersStopped || !fresh && !restore || strings.TrimSpace(fence.Evidence) == "" || len(fence.Evidence) > 8192 {
+		return errors.New("explicit target history and stopped former-writer evidence are required")
 	}
 	return nil
 }
@@ -388,15 +400,15 @@ func (self *preparationAdmission) fence() error {
 // Directory creation is staging-only here. Every returned source is fully
 // read and bound independently of an adapter's claimed digest.
 func planPreparation(ctx context.Context, reference Reference, adapter PreparationAdapter, host Host, scope ownerScope) (result PreparationPlan, resultErr error) {
-	if adapter.Build == nil || adapter.Inspect == nil {
-		return result, errors.New("fixed preparation adapters are required")
-	}
 	raw, err := preparationReadReference(ctx, reference, maximumPreparationRequestBytes, "request")
 	if err != nil {
 		return result, err
 	}
 	var request PreparationRequest
 	if err := decodePreparationRequest(raw, &request); err != nil {
+		return result, err
+	}
+	if err := preparationAdapterAdmission(request, adapter); err != nil {
 		return result, err
 	}
 	admission, err := openPreparationAdmission(ctx, request, host, scope, "")
@@ -412,12 +424,24 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 	if err := errors.Join(admission.fence(), admission.freshRoot()); err != nil {
 		return result, err
 	}
+	var archive *preparationRestoreArchive
+	if request.Purpose == "restore" {
+		archive, err = openPreparationRestoreArchive(ctx, request, host)
+		if err != nil {
+			return result, err
+		}
+		defer func() { resultErr = errors.Join(resultErr, archive.close()) }()
+	}
 	for _, path := range []string{request.MarkerPath, request.LeasePath, request.DeclarationPath, request.ControlPath} {
 		if err := preparationAbsent(admission.directories[filepath.Dir(path)], filepath.Base(path)); err != nil {
 			return result, err
 		}
 	}
 	result = PreparationPlan{Schema: PreparationPlanSchema, Request: reference, RequestSha256: reference.Sha256, RequestBytes: append(json.RawMessage(nil), raw...), Root: admission.identities[request.RootPath], Directories: admission.identities, Mount: admission.mount, Filesystem: admission.filesystem, Nonce: make([]byte, 32), Generation: make([]byte, RootGenerationBytes), Marker: make([]byte, 32), Lease: make([]byte, 32), RestartAuthorized: false}
+	if archive != nil {
+		identity := archive.identity
+		result.RestoreArchive = &identity
+	}
 	for _, value := range [][]byte{result.Nonce, result.Generation, result.Marker, result.Lease} {
 		if _, err := rand.Read(value); err != nil {
 			return result, err
@@ -434,7 +458,18 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 			return result, err
 		}
 		name := fmt.Sprintf("preparation-%s-%02d", hex.EncodeToString(result.Nonce), index)
-		prepared, err := adapter.Build(ctx, admission.directories[request.StagingDirectory], name, owner)
+		var prepared PreparationOwnerPlan
+		if archive == nil {
+			prepared, err = adapter.Build(ctx, admission.directories[request.StagingDirectory], name, owner)
+		} else {
+			prepared, err = adapter.Restore(ctx, name, owner, archive.inventory)
+			if err == nil {
+				err = validatePreparationRestoreOwner(archive.inventory, prepared)
+			}
+			if err == nil {
+				err = archive.stage(admission.directories[request.StagingDirectory], name, prepared)
+			}
+		}
 		if err != nil {
 			return result, err
 		}
@@ -451,6 +486,11 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 	}
 	if err := errors.Join(admission.check(), admission.fence(), admission.freshRoot()); err != nil {
 		return result, err
+	}
+	if archive != nil {
+		if err := archive.check(); err != nil {
+			return result, err
+		}
 	}
 	encoded, err := json.Marshal(result)
 	if err != nil || uint64(len(encoded)) > request.Limits.MaxPlanBytes {
@@ -635,6 +675,9 @@ func readPreparationPlan(ctx context.Context, reference Reference, scope ownerSc
 	}
 	if plan.Schema != PreparationPlanSchema || plan.RestartAuthorized || plan.RequestSha256 != plan.Request.Sha256 || preparationDigest(plan.RequestBytes) != plan.RequestSha256 || len(plan.Nonce) != 32 || len(plan.Generation) != RootGenerationBytes || len(plan.Marker) != 32 || len(plan.Lease) != 32 || uint64(len(raw)) > request.Limits.MaxPlanBytes || len(plan.Owners) != len(request.Owners) {
 		return plan, request, errors.New("accepted preparation plan is malformed or outside its exact scope")
+	}
+	if request.Purpose == "fresh" && plan.RestoreArchive != nil || request.Purpose == "restore" && (plan.RestoreArchive == nil || plan.RestoreArchive.Inode == 0) {
+		return plan, request, errors.New("accepted preparation purpose differs from retained source authority")
 	}
 	if request.RootCreation == "create-private" {
 		if plan.RootSource != preparationStagedRootPath(request, plan.Nonce) {

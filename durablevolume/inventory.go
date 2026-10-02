@@ -14,6 +14,7 @@ import (
 
 const InventorySchema = "urnetwork-durable-volume-inventory-v3"
 const PhysicalInventorySchema = "urnetwork-durable-volume-physical-inventory-v1"
+const MaximumPhysicalInventoryEntries = 32768
 const FormerWriterFenceSchema = "urnetwork-durable-volume-former-writer-fence-v1"
 
 // Explicit finite limits bound traversal work, allocation and bytes hashed.
@@ -102,7 +103,13 @@ type RestoreVerification struct {
 
 // The caller cannot accidentally request an unbounded traversal.
 func (self InventoryLimits) validate() error {
-	if self.MaxEntries == 0 || self.MaxEntries > 10000 || self.MaxBytes == 0 || self.MaxBytes > 1024*1024*1024*1024 || self.MaxDepth == 0 || self.MaxDepth > 32 {
+	return self.validateEntries(10000)
+}
+
+// The explicit physical profile counts namespace structure independently of
+// owner accounting slots. It includes full native raw custody plus directories.
+func (self InventoryLimits) validateEntries(maximumEntries uint64) error {
+	if self.MaxEntries == 0 || self.MaxEntries > maximumEntries || self.MaxBytes == 0 || self.MaxBytes > 1024*1024*1024*1024 || self.MaxDepth == 0 || self.MaxDepth > 32 {
 		return errors.New("durable inventory requires bounded entries, bytes and depth")
 	}
 	if self.MaxOwnerAttributes == 0 || self.MaxOwnerAttributes > 10000 || self.MaxOwnerAttributeBytes == 0 || self.MaxOwnerAttributeBytes > 16*1024*1024 {
@@ -160,7 +167,11 @@ func (self *Owner) inventoryReport(ctx context.Context, fenceReference Reference
 	if ctx == nil {
 		return Inventory{}, errors.New("durable inventory context is required")
 	}
-	if err := errors.Join(ctx.Err(), limits.validate()); err != nil {
+	maximumEntries := uint64(10000)
+	if schema == PhysicalInventorySchema {
+		maximumEntries = MaximumPhysicalInventoryEntries
+	}
+	if err := errors.Join(ctx.Err(), limits.validateEntries(maximumEntries)); err != nil {
 		return Inventory{}, err
 	}
 	if err := self.borrow(); err != nil {
