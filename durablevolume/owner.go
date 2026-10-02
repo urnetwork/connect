@@ -48,8 +48,8 @@ func (self *BusyError) Unwrap() error { return ErrBusy }
 
 // Kernel device numbers are compared with the uuid's current block device.
 type Device struct {
-	Major uint32
-	Minor uint32
+	Major uint32 `json:"major"`
+	Minor uint32 `json:"minor"`
 }
 
 // One kernel mount record; changing any coordinate invalidates an active owner.
@@ -94,6 +94,7 @@ type Owner struct {
 	closeErr  error
 
 	spec       VolumeSpec
+	reference  Reference
 	rootSpec   StateRootSpec
 	rootPath   string
 	access     Access
@@ -126,7 +127,7 @@ func OpenWithHost(reference Reference, rootPath string, access Access, host Host
 			if declared.Path != rootPath {
 				continue
 			}
-			self := &Owner{spec: spec, rootSpec: declared, rootPath: rootPath, access: access, host: host, stopping: make(chan struct{}), joined: make(chan struct{}), closed: make(chan struct{})}
+			self := &Owner{spec: spec, reference: reference, rootSpec: declared, rootPath: rootPath, access: access, host: host, stopping: make(chan struct{}), joined: make(chan struct{}), closed: make(chan struct{})}
 			if err := self.open(); err != nil {
 				return nil, errors.Join(err, self.Close())
 			}

@@ -258,7 +258,7 @@ func TestOwnerRefusesReadOnlyAndExhaustedReserve(t *testing.T) {
 			fixture.host.filesystem.ReadOnly = false
 			fixture.host.mounts[1].ReadOnly = false
 		})
-		if err := owner.Check(); err != nil {
+		if err := owner.CheckWrite(); err != nil {
 			t.Fatalf("%s availability recovery: %v", kind, err)
 		}
 	}

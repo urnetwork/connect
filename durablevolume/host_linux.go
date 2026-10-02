@@ -443,6 +443,23 @@ func relativeParts(relative string) ([]string, error) {
 	return parts, nil
 }
 
+// A bind mount can keep the same device number while changing child custody.
+func (self *Owner) childMount(path string) error {
+	mounts, err := self.host.Mounts()
+	if err != nil {
+		return errors.Join(&UnavailableError{Reason: "durable child mount census could not be observed"}, err)
+	}
+	if len(mounts) == 0 || len(mounts) > 8192 {
+		return errors.Join(ErrIdentity, errors.New("durable child mount census is empty or unbounded"))
+	}
+	for _, mount := range mounts {
+		if mount.Id != self.mount.Id && beneath(self.spec.MountPath, mount.Path) && beneath(mount.Path, path) {
+			return errors.Join(ErrIdentity, errors.New("durable child crosses another mount"))
+		}
+	}
+	return nil
+}
+
 // Child walking always stays on the retained descriptor and same filesystem.
 func (self *Owner) openChild(relative string, create bool) (*os.File, error) {
 	parts, err := relativeParts(relative)
@@ -498,17 +515,8 @@ func (self *Owner) openChild(relative string, create bool) (*os.File, error) {
 		if deviceNumber(stat.Dev) != self.mount.Device {
 			return nil, errors.Join(ErrIdentity, errors.New("durable child enters another filesystem"), file.Close())
 		}
-		mounts, err := self.host.Mounts()
-		if err != nil {
-			return nil, errors.Join(&UnavailableError{Reason: "durable child mount census could not be observed"}, err, file.Close())
-		}
-		if len(mounts) == 0 || len(mounts) > 8192 {
-			return nil, errors.Join(ErrIdentity, errors.New("durable child mount census is empty or unbounded"), file.Close())
-		}
-		for _, mount := range mounts {
-			if mount.Id != self.mount.Id && beneath(self.spec.MountPath, mount.Path) && beneath(mount.Path, path) {
-				return nil, errors.Join(ErrIdentity, errors.New("durable child crosses another mount"), file.Close())
-			}
+		if err := self.childMount(path); err != nil {
+			return nil, errors.Join(err, file.Close())
 		}
 	}
 	return file, nil
