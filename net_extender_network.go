@@ -274,6 +274,9 @@ type ExtenderNetworkClient struct {
 	// the probe pass goroutine's join and wake (DESIGNNOTES4.md §4)
 	probeDone chan struct{}
 	probeWake *Monitor
+	// closed by run after its first bootstrap/manual readiness and expiry,
+	// before sampling; early hints must not probe a partial bootstrap set
+	initialProbeReady chan struct{}
 	// the attesting provider, nil for a client that only ranks. Installed
 	// by the provider role and cleared when it stops.
 	probeAttestor *ExtenderProbeAttestor
@@ -309,18 +312,19 @@ func NewExtenderNetworkClient(
 	}
 	cancelCtx, cancel := context.WithCancel(ctx)
 	self := &ExtenderNetworkClient{
-		ctx:            cancelCtx,
-		cancel:         cancel,
-		done:           make(chan struct{}),
-		log:            loggerOrDefault(settings.Log),
-		clientStrategy: clientStrategy,
-		directory:      directory,
-		settings:       settings,
-		statusMonitor:  NewMonitorValue[ExtenderNetworkClientStatus](ExtenderNetworkClientStatus{}),
-		wakeMonitor:    NewMonitor(),
-		manualHosts:    slices.Clone(settings.ManualHosts),
-		probeDone:      make(chan struct{}),
-		probeWake:      NewMonitor(),
+		ctx:               cancelCtx,
+		cancel:            cancel,
+		done:              make(chan struct{}),
+		log:               loggerOrDefault(settings.Log),
+		clientStrategy:    clientStrategy,
+		directory:         directory,
+		settings:          settings,
+		statusMonitor:     NewMonitorValue[ExtenderNetworkClientStatus](ExtenderNetworkClientStatus{}),
+		wakeMonitor:       NewMonitor(),
+		manualHosts:       slices.Clone(settings.ManualHosts),
+		probeDone:         make(chan struct{}),
+		probeWake:         NewMonitor(),
+		initialProbeReady: make(chan struct{}),
 	}
 	directory.SetInitialSamplePending()
 	// a path change invalidates the feed connection and the addresses that
@@ -414,6 +418,7 @@ func (self *ExtenderNetworkClient) updateStatus(update func(*ExtenderNetworkClie
 // success resets.
 func (self *ExtenderNetworkClient) run() {
 	backoff := self.settings.MinBackoff
+	initialProbeReady := self.initialProbeReady
 	var lastBootstrapTime time.Time
 	var lastHelloTime time.Time
 	var lastHintTime time.Time
@@ -459,6 +464,13 @@ func (self *ExtenderNetworkClient) run() {
 			lastManualTime = now
 		}
 		self.directory.Expire(self.settings.Now())
+		if initialProbeReady != nil {
+			// Bootstrap/manual discovery has reached first readiness or
+			// terminal failure. Its progressive DNS tail remains live; do not
+			// wait for that tail or for a possibly long-lived feed sample.
+			close(initialProbeReady)
+			initialProbeReady = nil
+		}
 
 		// a subscription holds inside this call for as long as it lives; the
 		// first attempt is marked done from inside, as soon as the sample
@@ -1163,6 +1175,11 @@ func (self *ExtenderNetworkClient) runProbes() {
 	if self.settings.ProbeWindowCount <= 0 {
 		<-self.ctx.Done()
 		return
+	}
+	select {
+	case <-self.ctx.Done():
+		return
+	case <-self.initialProbeReady:
 	}
 	for {
 		// subscribe before the pass, so a wake that lands while it runs is

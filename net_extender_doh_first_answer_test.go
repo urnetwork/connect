@@ -46,7 +46,12 @@ type extenderFirstAnswerFixture struct {
 
 // No system DNS or external socket is available. Signed mode verifies a real
 // synthetic root-signed TXT record; unsigned bootstrap remains nondialable.
-func newExtenderFirstAnswerFixture(t *testing.T, readyIpv6 bool, mode string) *extenderFirstAnswerFixture {
+func newExtenderFirstAnswerFixture(
+	t *testing.T,
+	readyIpv6 bool,
+	mode string,
+	configure ...func(*ExtenderNetworkClientSettings),
+) *extenderFirstAnswerFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	self := &extenderFirstAnswerFixture{
@@ -166,6 +171,9 @@ func newExtenderFirstAnswerFixture(t *testing.T, readyIpv6 bool, mode string) *e
 		settings.ExtenderDnsName = ""
 		settings.ManualHosts = []string{"manual-first.example"}
 	}
+	for _, configure := range configure {
+		configure(settings)
+	}
 	self.client = NewExtenderNetworkClient(ctx, self.strategy, self.directory, settings)
 	t.Cleanup(func() {
 		cancel()
@@ -252,6 +260,64 @@ func TestExtenderDohFirstAnswerManualIpv6StartsBeforeHeldIpv4(t *testing.T) {
 	self := newExtenderFirstAnswerFixture(t, true, "manual")
 	self.requireFeedBeforeHeldFamily(t)
 	self.requireBothAddresses(t, ExtenderSourceManual)
+}
+
+// Initial probe readiness follows the same first-answer boundary as feed
+// readiness. The sibling DNS query and the feed dial are both still held when
+// the first usable candidate is measured; a later manual address wakes probes.
+func TestExtenderDohFirstAnswerProbesBeforeHeldFamily(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		mode      string
+		readyIpv6 bool
+	}{
+		{name: "signed", mode: "signed"},
+		{name: "manual_ipv4", mode: "manual"},
+		{name: "manual_ipv6", mode: "manual", readyIpv6: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			probed := make(chan netip.Addr, 4)
+			self := newExtenderFirstAnswerFixture(t, test.readyIpv6, test.mode, func(settings *ExtenderNetworkClientSettings) {
+				settings.ProbeWindowCount = 2
+				settings.Probe = func(_ context.Context, candidate *ExtenderCandidate, _ *ExtenderProbeAttestor) (time.Duration, ExtenderPingOutcome, error) {
+					probed <- candidate.Ip
+					return 20 * time.Millisecond, ExtenderPingUnattested, nil
+				}
+			})
+			self.requireFeedBeforeHeldFamily(t)
+			select {
+			case ip := <-probed:
+				if ip != self.readyAddr {
+					t.Fatalf("initial probe = %s, want the first usable answer %s", ip, self.readyAddr)
+				}
+			case <-self.ctx.Done():
+				t.Fatal("initial probe waited for the held DNS sibling or feed attempt")
+			}
+			select {
+			case <-self.heldDone:
+				t.Fatal("the DNS sibling completed before the first probe")
+			default:
+			}
+			if self.client.Status().InitialAttemptDone {
+				t.Fatal("the first probe waited until the held feed attempt ended")
+			}
+			source := ExtenderSourceDns
+			if test.mode == "manual" {
+				source = ExtenderSourceManual
+			}
+			self.requireBothAddresses(t, source)
+			if test.mode == "manual" {
+				select {
+				case ip := <-probed:
+					if ip != self.lateAddr {
+						t.Fatalf("later probe = %s, want the DNS sibling %s", ip, self.lateAddr)
+					}
+				case <-self.ctx.Done():
+					t.Fatal("late manual DNS publication did not wake probes")
+				}
+			}
+		})
+	}
 }
 
 // Unsigned DNS can release the startup attempt and fill inventory, but cannot

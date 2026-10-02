@@ -49,7 +49,10 @@ type quicSendFlightFrame struct {
 	packet int64  // -1: retained in the stream's retransmission queue
 	order  uint64 // admission order of a DATAGRAM still in quic-go's FIFO
 	fin    bool
-	used   bool
+	// A zero-reliability reset discards this root on loss instead of
+	// retransmitting it. While packet-owned it still occupies its buffer.
+	abandoned bool
+	used      bool
 }
 
 type quicSendFlightPacket struct {
@@ -194,7 +197,7 @@ func (self *quicSendFlight) snapshot() quicSendFlightSnapshot {
 }
 
 func (self *quicSendFlight) newWriter(stream quicSendFlightStream) *quicSendFlightWriter {
-	writer := &quicSendFlightWriter{flight: self, stream: stream}
+	writer := &quicSendFlightWriter{flight: self, stream: stream, resetPacket: -1}
 	self.mutex.Lock()
 	registered := false
 	for i := range self.writers {
@@ -213,8 +216,8 @@ func (self *quicSendFlight) newWriter(stream quicSendFlightStream) *quicSendFlig
 }
 
 // A pooled API connection registers each request before writing its headers.
-// Reuse the fixed writer slot only after its FIN and every retained root have
-// been acknowledged (or after connection teardown), never merely on Body.Close.
+// Reuse the fixed writer slot only after its FIN or RESET and every retained
+// root have retired (or after connection teardown), never merely on Body.Close.
 func (self *quicSendFlight) retireWriter(writer *quicSendFlightWriter) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -285,7 +288,14 @@ func (self *quicSendFlight) requestStreamID() quic.StreamID {
 func (self *quicSendFlight) waitFinished(ctx context.Context, stream quic.StreamID) error {
 	for {
 		self.mutex.Lock()
-		done := stream >= 0 && self.ackedFin >= stream && self.frameCount+self.pending == 0
+		terminal := stream >= 0 && self.ackedFin >= stream
+		if writer := self.writerLocked(stream); writer != nil {
+			terminal = writer.finAcked
+			if writer.reset {
+				terminal = writer.resetAcked
+			}
+		}
+		done := terminal && self.frameCount+self.pending == 0
 		err := self.err
 		if self.closed && err == nil {
 			err = net.ErrClosed
@@ -306,8 +316,67 @@ func (self *quicSendFlight) waitFinished(ctx context.Context, stream quic.Stream
 	}
 }
 
+func (self *quicSendFlight) writerLocked(stream quic.StreamID) *quicSendFlightWriter {
+	for _, writer := range self.writers {
+		if writer != nil && writer.stream.StreamID() == stream {
+			return writer
+		}
+	}
+	return nil
+}
+
+// In pinned quic-go v0.61, processing STOP_SENDING / a zero-reliability reset
+// returns nextFrame and the retransmission queue to their pools. Packet-owned
+// roots are different: their ACK/loss callbacks still own and release them.
+// PacketReceived is emitted after handling the frames, so this transition is
+// observed only after QUIC has relinquished the queued roots.
+func (self *quicSendFlight) stoppedLocked(stream quic.StreamID) {
+	retained := false
+	for i := range self.frames {
+		frame := &self.frames[i]
+		if !frame.used || frame.stream != stream {
+			continue
+		}
+		retained = true
+		if frame.packet < 0 {
+			self.releaseFrameLocked(i)
+		} else {
+			frame.abandoned = true
+		}
+	}
+	if writer := self.writerLocked(stream); writer != nil {
+		retained = retained || writer.pending > 0
+		self.pending -= writer.pending
+		writer.pending = 0
+		// QUIC ignores a late STOP for a send stream already deleted after
+		// its FIN and data were ACKed; no RESET will be generated for it.
+		if retained || !writer.finAcked {
+			writer.reset = true
+		}
+	}
+}
+
+func (self *quicSendFlight) sentResetLocked(packet int64, frame *qlog.ResetStreamFrame) {
+	if frame.ReliableSize != 0 {
+		// RESET_STREAM_AT can still own a reliable prefix. The API path does
+		// not use that extension; retain its charges rather than guess.
+		return
+	}
+	self.stoppedLocked(frame.StreamID)
+	if writer := self.writerLocked(frame.StreamID); writer != nil {
+		if writer.resetPacket >= 0 && writer.resetPacket != packet {
+			// PTO transfers the entire packet, including any sibling roots,
+			// even when quic-go emits no PacketLost for that transfer.
+			self.lostLocked(writer.resetPacket)
+		}
+		writer.reset = true
+		writer.resetAcked = false
+		writer.resetPacket = packet
+	}
+}
+
 // A lost packet no longer owns its frames. Its frames move to retransmission
-// storage and retain their charges until their new packet is acknowledged.
+// storage unless that stream was reset, in which case QUIC returns the roots.
 func (self *quicSendFlight) lostLocked(packet int64) {
 	for i := range self.packets {
 		if self.packets[i].used && self.packets[i].packet == packet {
@@ -316,11 +385,16 @@ func (self *quicSendFlight) lostLocked(packet int64) {
 	}
 	for i := range self.frames {
 		if self.frames[i].used && self.frames[i].packet == packet {
-			if self.frames[i].stream == -1 {
+			if self.frames[i].stream == -1 || self.frames[i].abandoned {
 				self.releaseFrameLocked(i)
 			} else {
 				self.frames[i].packet = -1
 			}
+		}
+	}
+	for _, writer := range self.writers {
+		if writer != nil && writer.resetPacket == packet {
+			writer.resetPacket = -1
 		}
 	}
 	self.signalLocked()
@@ -445,7 +519,7 @@ func (self *quicSendFlight) sentFrameLocked(packet int64, frame *qlog.StreamFram
 		// Retransmissions are an entire frame or its prefix. A prefix split
 		// allocates a second pooled root. PTO moves an entire old packet,
 		// even though v0.61 does not emit PacketLost for that move.
-		if start != old.start || old.end < end {
+		if old.abandoned || start != old.start || old.end < end {
 			self.failLocked()
 			return
 		}
@@ -462,10 +536,15 @@ func (self *quicSendFlight) sentFrameLocked(packet int64, frame *qlog.StreamFram
 		}
 		return
 	}
-	if self.pending > 0 {
-		self.pending--
+	abandoned := false
+	if writer := self.writerLocked(frame.StreamID); writer != nil {
+		abandoned = writer.reset
+		if writer.pending > 0 {
+			writer.pending--
+			self.pending--
+		}
 	}
-	self.addFrameLocked(quicSendFlightFrame{stream: frame.StreamID, start: start, end: end, packet: packet, fin: frame.Fin})
+	self.addFrameLocked(quicSendFlightFrame{stream: frame.StreamID, start: start, end: end, packet: packet, fin: frame.Fin, abandoned: abandoned})
 }
 
 func (self *quicSendFlight) sent(event qlog.PacketSent) {
@@ -492,6 +571,9 @@ func (self *quicSendFlight) sent(event qlog.PacketSent) {
 		case *qlog.DatagramFrame:
 			ackEliciting = true
 			self.sentDatagramLocked(int64(event.Header.PacketNumber), frame.Length)
+		case *qlog.ResetStreamFrame:
+			ackEliciting = true
+			self.sentResetLocked(int64(event.Header.PacketNumber), frame)
 		default:
 			ackEliciting = true
 		}
@@ -537,16 +619,29 @@ func (self *quicSendFlight) received(event qlog.PacketReceived) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 	for _, frame := range event.Frames {
+		if stop, ok := frame.Frame.(*qlog.StopSendingFrame); ok {
+			self.stoppedLocked(stop.StreamID)
+			continue
+		}
 		ack, ok := frame.Frame.(*qlog.AckFrame)
 		if !ok {
 			continue
 		}
 		for _, r := range ack.AckRanges {
+			for _, writer := range self.writers {
+				if writer != nil && writer.resetPacket >= 0 && int64(r.Smallest) <= writer.resetPacket && writer.resetPacket <= int64(r.Largest) {
+					writer.resetAcked = true
+					writer.resetPacket = -1
+				}
+			}
 			for i := range self.frames {
 				f := &self.frames[i]
 				if f.used && f.packet >= 0 && int64(r.Smallest) <= f.packet && f.packet <= int64(r.Largest) {
 					if f.fin {
 						self.ackedFin = max(self.ackedFin, f.stream)
+						if writer := self.writerLocked(f.stream); writer != nil {
+							writer.finAcked = true
+						}
 					}
 					self.releaseFrameLocked(i)
 				}
@@ -633,6 +728,13 @@ type quicSendFlightWriter struct {
 	writeMu  sync.Mutex
 	mutex    sync.Mutex
 	deadline time.Time
+	// Guarded by flight.mutex. Fixed per-writer state, not a growing stream
+	// history; retirement waits for the terminal ACK and every retained root.
+	pending     int
+	finAcked    bool
+	reset       bool
+	resetAcked  bool
+	resetPacket int64
 }
 
 func (self *quicSendFlightWriter) writeDeadline() time.Time {
@@ -673,6 +775,7 @@ func (self *quicSendFlightWriter) Write(b []byte) (int, error) {
 					return 0
 				}
 				self.flight.pending++
+				self.pending++
 				return maxBytes
 			})
 		} else {

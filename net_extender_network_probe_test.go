@@ -138,6 +138,9 @@ func TestExtenderNetworkClientProbesTheHintedContinentFirstAndStops(t *testing.T
 			settings.MaxHoldTimeout = 0
 		},
 		func(settings *ExtenderNetworkClientSettings) {
+			// Inspect candidate order only after the first feed attempt has
+			// finished recording failures; leave later attempts parked.
+			settings.PassAfter = func(time.Duration) <-chan time.Time { return nil }
 			settings.ProbeWindowCount = 2
 			settings.ProbeMaxCandidateCount = 8
 			settings.ProbeCountPerExtender = 1
@@ -194,6 +197,9 @@ func TestExtenderNetworkClientProbesTheHintedContinentFirstAndStops(t *testing.T
 	if status.LastProbeTime.IsZero() {
 		t.Fatal("the status carries no probe time")
 	}
+	waitForExtenderNetworkStatus(t, networkClient, "completed initial feed attempt", func(status ExtenderNetworkClientStatus) bool {
+		return status.InitialAttemptDone
+	})
 	// the measured EU extenders lead, best first, then the unmeasured NA ones
 	candidates := directory.Candidates(4, 8)
 	assertIpOrder(t, candidates, "192.0.2.10", "192.0.2.11", "192.0.2.20", "192.0.2.21")
