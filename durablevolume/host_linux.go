@@ -299,8 +299,11 @@ func (self *Owner) mountFacts() (Mount, error) {
 			selected, selectedCount = mount, selectedCount+1
 		}
 	}
-	if selectedCount != 1 || rootCount != 1 || selected.Id == 0 || selected.Device == root.Device || selected.FilesystemType != self.spec.FilesystemType {
-		return Mount{}, errors.New("approved durable mount is absent, ambiguous or on the root filesystem")
+	if selectedCount != 1 || rootCount != 1 || selected.Id == 0 || selected.FilesystemType != self.spec.FilesystemType {
+		return Mount{}, errors.New("approved durable mount is absent, ambiguous or has another filesystem type")
+	}
+	if selected.Device == root.Device && self.scope != ownerLocalScope {
+		return Mount{}, errors.New("daemon durable mount is on the root filesystem")
 	}
 	for _, mount := range mounts {
 		if mount.Path != selected.Path && beneath(selected.Path, mount.Path) && (beneath(mount.Path, self.rootPath) || beneath(mount.Path, self.spec.MarkerPath) || beneath(mount.Path, self.rootSpec.LeasePath)) {

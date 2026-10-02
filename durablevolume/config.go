@@ -16,8 +16,18 @@ import (
 )
 
 const Schema = "urnetwork-durable-volumes-v1"
+const OwnerLocalSchema = "urnetwork-owner-local-volumes-v1"
 const maximumConfigBytes = 64 * 1024
 const maximumMarkerBytes = 4 * 1024
+
+// The caller selects a scope independently of declaration contents. Daemon
+// admission can never acquire the owner-local system-filesystem exception.
+type ownerScope uint8
+
+const (
+	daemonScope ownerScope = iota + 1
+	ownerLocalScope
+)
 
 // The independently selected operational declaration has exact retained bytes.
 type Reference struct {
@@ -76,6 +86,9 @@ func canonical(path string) bool {
 
 // A separator boundary prevents one sibling prefix from admitting another.
 func beneath(parent, path string) bool {
+	if parent == string(filepath.Separator) {
+		return filepath.IsAbs(path)
+	}
 	return path == parent || strings.HasPrefix(path, parent+string(filepath.Separator))
 }
 
@@ -90,7 +103,17 @@ func validDigest(value string) bool {
 
 // Bounds, ambiguity and unsupported filesystems are rejected before opening.
 func (self Config) validate() error {
-	if self.Schema != Schema || len(self.Volumes) == 0 || len(self.Volumes) > 16 {
+	return self.validateForScope(daemonScope)
+}
+
+// Owner-local custody may use the declared system filesystem. Its protected
+// precreated root, external lease and identity marker remain mandatory.
+func (self Config) validateForScope(scope ownerScope) error {
+	expectedSchema := Schema
+	if scope == ownerLocalScope {
+		expectedSchema = OwnerLocalSchema
+	}
+	if scope != daemonScope && scope != ownerLocalScope || self.Schema != expectedSchema || len(self.Volumes) == 0 || len(self.Volumes) > 16 {
 		return errors.New("durable volume schema or volume count is invalid")
 	}
 	var roots []string
@@ -98,7 +121,8 @@ func (self Config) validate() error {
 	leasePaths := map[string]bool{}
 	mounts := map[string]bool{}
 	for _, volume := range self.Volumes {
-		if !canonical(volume.MountPath) || mounts[volume.MountPath] || !canonical(volume.MarkerPath) || !beneath(volume.MountPath, volume.MarkerPath) ||
+		canonicalMount := canonical(volume.MountPath) || scope == ownerLocalScope && volume.MountPath == "/"
+		if !canonicalMount || mounts[volume.MountPath] || !canonical(volume.MarkerPath) || !beneath(volume.MountPath, volume.MarkerPath) ||
 			!validDigest(volume.MarkerSha256) || len(volume.StateRoots) == 0 || len(volume.StateRoots) > 64 || volume.MinAvailableBytes == 0 || volume.MinAvailableInodes == 0 {
 			return errors.New("durable volume identity, roots or positive reserve is incomplete")
 		}
@@ -194,6 +218,17 @@ func decodeStrict(raw []byte, target any) error {
 
 // Reads only the exact protected external declaration; never mutates a path.
 func Load(reference Reference) (Config, error) {
+	return loadForScope(reference, daemonScope)
+}
+
+// This entry point accepts only the independently reviewed owner-local schema;
+// daemon declarations cannot silently change meaning at the signing boundary.
+func LoadOwnerLocal(reference Reference) (Config, error) {
+	return loadForScope(reference, ownerLocalScope)
+}
+
+// Hash and protected-file checks are identical for both explicit scopes.
+func loadForScope(reference Reference, scope ownerScope) (Config, error) {
 	if !canonical(reference.Path) || !validDigest(reference.Sha256) {
 		return Config{}, errors.New("durable volume declaration path and hash are required")
 	}
@@ -209,7 +244,7 @@ func Load(reference Reference) (Config, error) {
 	if err := decodeStrict(raw, &config); err != nil {
 		return Config{}, fmt.Errorf("durable volume declaration: %w", err)
 	}
-	if err := config.validate(); err != nil {
+	if err := config.validateForScope(scope); err != nil {
 		return Config{}, err
 	}
 	return config, nil

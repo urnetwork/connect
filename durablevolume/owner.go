@@ -94,6 +94,7 @@ type Owner struct {
 	closeErr  error
 
 	spec       VolumeSpec
+	scope      ownerScope
 	reference  Reference
 	rootSpec   StateRootSpec
 	rootPath   string
@@ -115,7 +116,24 @@ func Open(reference Reference, rootPath string, access Access) (*Owner, error) {
 // Explicit instance-owned host adapters make kernel boundary tests causal.
 // Actual file ownership and I/O checks remain mandatory for every adapter.
 func OpenWithHost(reference Reference, rootPath string, access Access, host Host) (*Owner, error) {
-	config, err := Load(reference)
+	return openForScope(reference, rootPath, access, host, daemonScope)
+}
+
+// Owner devices may use their declared system filesystem; this explicit API
+// retains every other physical identity, protection, lease and reserve check.
+func OpenOwnerLocal(reference Reference, rootPath string, access Access) (*Owner, error) {
+	return OpenOwnerLocalWithHost(reference, rootPath, access, defaultHost())
+}
+
+// Kernel facts remain the only substitutable boundary. A daemon entry point
+// never calls this function based on a schema it discovers in untrusted input.
+func OpenOwnerLocalWithHost(reference Reference, rootPath string, access Access, host Host) (*Owner, error) {
+	return openForScope(reference, rootPath, access, host, ownerLocalScope)
+}
+
+// Scope is selected by the caller before decoding the operational policy.
+func openForScope(reference Reference, rootPath string, access Access, host Host, scope ownerScope) (*Owner, error) {
+	config, err := loadForScope(reference, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +145,7 @@ func OpenWithHost(reference Reference, rootPath string, access Access, host Host
 			if declared.Path != rootPath {
 				continue
 			}
-			self := &Owner{spec: spec, reference: reference, rootSpec: declared, rootPath: rootPath, access: access, host: host, stopping: make(chan struct{}), joined: make(chan struct{}), closed: make(chan struct{})}
+			self := &Owner{spec: spec, scope: scope, reference: reference, rootSpec: declared, rootPath: rootPath, access: access, host: host, stopping: make(chan struct{}), joined: make(chan struct{}), closed: make(chan struct{})}
 			if err := self.open(); err != nil {
 				return nil, errors.Join(err, self.Close())
 			}
