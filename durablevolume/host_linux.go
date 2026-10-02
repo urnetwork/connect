@@ -449,7 +449,7 @@ func (self *Owner) open() error {
 	}
 	self.filesystem, err = self.host.Filesystem(self.rootFile)
 	if err != nil {
-		return err
+		return unavailableObservation("initial durable filesystem facts could not be observed", err)
 	}
 	return self.check(self.access == ReadWrite)
 }
