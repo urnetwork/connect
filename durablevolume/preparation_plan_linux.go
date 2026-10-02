@@ -279,7 +279,7 @@ func (self *preparationAdmission) check() error {
 			return errors.Join(ErrIdentity, errors.New("preparation named directory or filesystem changed"))
 		}
 	}
-	return nil
+	return self.ctx.Err()
 }
 
 func (self *preparationAdmission) close() error {
@@ -466,7 +466,7 @@ func bindPreparationSources(ctx context.Context, request PreparationRequest, pla
 			attributesUsed++
 		}
 	}
-	if attributesUsed > request.Limits.MaxOwnerAttributes {
+	if attributesUsed > request.Limits.MaxOwnerAttributes || attributesUsed*4096 > request.Limits.MaxOwnerAttributeBytes {
 		return errors.New("preparation owner attribute count exceeds its capacity")
 	}
 	for _, owner := range plan.Owners {
@@ -580,6 +580,12 @@ func readPreparationPlan(ctx context.Context, reference Reference, scope ownerSc
 		return plan, request, errors.New("accepted preparation request differs")
 	}
 	for index, owner := range plan.Owners {
+		var normalized bytes.Buffer
+		if err := json.Compact(&normalized, owner.Owner.Inputs); err != nil {
+			return plan, request, err
+		}
+		owner.Owner.Inputs = append(json.RawMessage(nil), normalized.Bytes()...)
+		plan.Owners[index] = owner
 		if !reflect.DeepEqual(owner.Owner, request.Owners[index]) || owner.StagingName != fmt.Sprintf("preparation-%s-%02d", hex.EncodeToString(plan.Nonce), index) {
 			return plan, request, errors.New("accepted owner plan changed its fixed scope")
 		}
