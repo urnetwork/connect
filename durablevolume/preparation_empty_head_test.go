@@ -170,3 +170,23 @@ func TestPreparationAttributeOnlyOwnerResumesExactPendingHead(t *testing.T) {
 		t.Fatal("missing completed empty head was recreated", err)
 	}
 }
+
+// Exclusive namespace intent is part of the exact plan, not a later advisory.
+func TestPreparationExclusiveHeadRefusesSharedNamespace(t *testing.T) {
+	f := newPreparationFixture(t)
+	f.request.Owners = append(f.request.Owners, PreparationOwner{Kind: "second-synthetic", RelativePath: ".", Purpose: "fresh", Inputs: json.RawMessage(`{"public":true}`)})
+	f.writeRequest(t)
+	adapter := preparationEmptyHeadAdapter()
+	build := adapter.Build
+	adapter.Build = func(ctx context.Context, parent *os.File, name string, owner PreparationOwner) (PreparationOwnerPlan, error) {
+		plan, err := build(ctx, parent, name, owner)
+		plan.ExclusiveRoot = true
+		return plan, err
+	}
+	if _, err := PlanPreparationWithHost(t.Context(), f.reference, adapter, f.volume.host); err == nil || !strings.Contains(err.Error(), "exclusive root namespace") {
+		t.Fatal("exclusive owner reached conflicting peer or wrong failure", err)
+	}
+	if _, err := os.Lstat(f.request.ControlPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("shared exclusive roots started publication", err)
+	}
+}

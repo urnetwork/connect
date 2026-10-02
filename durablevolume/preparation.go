@@ -120,11 +120,12 @@ type PreparationAdapter struct {
 
 // The public semantic census and portable staged files bind one fixed adapter.
 type PreparationOwnerPlan struct {
-	Owner       PreparationOwner           `json:"owner"`
-	StagingName string                     `json:"staging_name"`
-	Files       []PreparationFile          `json:"files"`
-	Attributes  []PreparationAttributeSpec `json:"attributes"`
-	Census      json.RawMessage            `json:"census"`
+	Owner         PreparationOwner           `json:"owner"`
+	StagingName   string                     `json:"staging_name"`
+	ExclusiveRoot bool                       `json:"exclusive_root,omitempty"`
+	Files         []PreparationFile          `json:"files"`
+	Attributes    []PreparationAttributeSpec `json:"attributes"`
+	Census        json.RawMessage            `json:"census"`
 }
 
 // Every copied file retains both a portable target manifest and its original

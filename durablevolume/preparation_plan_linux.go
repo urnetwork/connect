@@ -431,8 +431,11 @@ func bindPreparationSources(ctx context.Context, request PreparationRequest, pla
 	seen, attributes := map[string]bool{}, map[string]bool{}
 	bytesUsed, attributesUsed := uint64(0), uint64(0)
 	for _, owner := range plan.Owners {
-		if len(owner.Census) == 0 || len(owner.Files) == 0 {
-			return errors.New("preparation adapter returned no exact file census")
+		if len(owner.Census) == 0 || len(owner.Files) == 0 && len(owner.Attributes) == 0 {
+			return errors.New("preparation adapter returned no exact file or attribute census")
+		}
+		if owner.ExclusiveRoot && len(plan.Owners) != 1 {
+			return errors.New("preparation owner requires its own exclusive root namespace")
 		}
 		for _, file := range owner.Files {
 			if !preparationRelative(file.Path, request.Limits.MaxDepth, false) || seen[file.Path] || file.Mode&0077 != 0 || file.Mode&^uint32(0700) != 0 ||
