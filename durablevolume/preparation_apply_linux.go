@@ -235,6 +235,10 @@ func (self *preparationApply) uncertain(err error) error {
 	if err == nil {
 		return nil
 	}
+	if errors.Is(err, ErrIdentity) {
+		self.failed = err
+		return err
+	}
 	self.failed = errors.Join(ErrPreparationUncertain, err)
 	return self.failed
 }
@@ -263,7 +267,10 @@ func (self *preparationApply) append(phase string, step preparationStep, identit
 	if err != nil || n != len(raw) {
 		return self.uncertain(errors.Join(io.ErrShortWrite, err))
 	}
-	if err := errors.Join(self.control.Sync(), self.after("control-"+phase, step.Path)); err != nil {
+	if err := self.control.Sync(); err != nil {
+		return self.uncertain(err)
+	}
+	if err := self.after("control-"+phase, step.Path); err != nil {
 		return self.uncertain(err)
 	}
 	if err := syscall.Fstat(int(self.control.Fd()), &self.controlStat); err != nil {
@@ -276,7 +283,7 @@ func (self *preparationApply) append(phase string, step preparationStep, identit
 		self.completed = append(self.completed, record)
 		self.pending = nil
 	}
-	return self.check()
+	return self.uncertain(self.check())
 }
 
 // Header identity is recorded before any target mutation. Its inode is also
@@ -464,7 +471,7 @@ func (self *preparationApply) step(step preparationStep) error {
 		return err
 	}
 	if err := self.append("complete", step, identity); err != nil {
-		return err
+		return self.uncertain(err)
 	}
 	self.position++
 	return nil
@@ -532,6 +539,12 @@ func (self *preparationApply) observe(step preparationStep, pending bool) (_ Pre
 	if step.Kind == "attribute" {
 		return self.observeAttribute(step, pending)
 	}
+	mutated := false
+	defer func() {
+		if mutated && resultErr != nil {
+			resultErr = self.uncertain(resultErr)
+		}
+	}()
 	parent, name, err := self.parent(step.Path)
 	if err != nil {
 		return PreparationIdentity{}, err
@@ -551,11 +564,13 @@ func (self *preparationApply) observe(step preparationStep, pending bool) (_ Pre
 			if err := syscall.Mkdirat(int(parent.Fd()), name, step.Mode); err != nil {
 				return PreparationIdentity{}, self.uncertain(err)
 			}
+			mutated = true
 			fd, err = syscall.Openat(int(parent.Fd()), name, flags, 0)
 		} else {
 			fd, err = syscall.Openat(int(parent.Fd()), name, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, step.Mode)
 		}
 		created = err == nil
+		mutated = mutated || created
 	}
 	if err != nil {
 		return PreparationIdentity{}, namedObservation("preparation member could not be observed", err)
@@ -588,7 +603,17 @@ func (self *preparationApply) observe(step preparationStep, pending bool) (_ Pre
 		}
 	}
 	if pending {
-		if err := errors.Join(file.Sync(), self.after("member-sync", step.Path), parent.Sync(), self.after("parent-sync", step.Path)); err != nil {
+		mutated = true
+		if err := file.Sync(); err != nil {
+			return PreparationIdentity{}, err
+		}
+		if err := self.after("member-sync", step.Path); err != nil {
+			return PreparationIdentity{}, err
+		}
+		if err := parent.Sync(); err != nil {
+			return PreparationIdentity{}, err
+		}
+		if err := self.after("parent-sync", step.Path); err != nil {
 			return PreparationIdentity{}, self.uncertain(err)
 		}
 	}
@@ -670,6 +695,12 @@ func (self *preparationApply) copyFile(target *os.File, step preparationStep) (r
 }
 
 func (self *preparationApply) observeAttribute(step preparationStep, pending bool) (_ PreparationIdentity, resultErr error) {
+	mutated := false
+	defer func() {
+		if mutated && resultErr != nil {
+			resultErr = self.uncertain(resultErr)
+		}
+	}()
 	file, err := self.attributeTarget(step.Path)
 	if err != nil {
 		return PreparationIdentity{}, err
@@ -684,7 +715,11 @@ func (self *preparationApply) observeAttribute(step preparationStep, pending boo
 		if err := self.check(); err != nil {
 			return PreparationIdentity{}, err
 		}
-		if err := errors.Join(preparationCreateAttribute(file, step.Attribute, step.Raw), self.after("attribute-sync", step.Path+":"+step.Attribute)); err != nil {
+		mutated = true
+		if err := preparationCreateAttribute(file, step.Attribute, step.Raw); err != nil {
+			return PreparationIdentity{}, err
+		}
+		if err := self.after("attribute-sync", step.Path+":"+step.Attribute); err != nil {
 			return PreparationIdentity{}, self.uncertain(err)
 		}
 		retained, err = readInventoryAttribute(file, step.Attribute, 4096)
@@ -696,6 +731,7 @@ func (self *preparationApply) observeAttribute(step preparationStep, pending boo
 		return PreparationIdentity{}, errors.Join(ErrIdentity, errors.New("preparation attribute differs from original pending or completed authority"))
 	}
 	if pending {
+		mutated = true
 		if err := file.Sync(); err != nil {
 			return PreparationIdentity{}, self.uncertain(err)
 		}
@@ -715,6 +751,31 @@ func (self *preparationApply) observeAttribute(step preparationStep, pending boo
 // unchanged file metadata thereafter. No acknowledged leaf can disappear.
 func (self *preparationApply) finalCensus() error {
 	request := self.admission.request
+	allowedAttributes := map[string]bool{request.RootPath + "\x00" + PreparationAttribute: true, request.RootPath + "\x00" + RootGenerationAttribute: true}
+	for _, owner := range self.plan.Owners {
+		for _, attribute := range owner.Attributes {
+			path := request.RootPath
+			if attribute.Path != "." {
+				path = filepath.Join(path, attribute.Path)
+			}
+			allowedAttributes[path+"\x00"+attribute.Name] = true
+		}
+	}
+	checkAttributes := func(file *os.File, path string) error {
+		names, err := listInventoryAttributes(file)
+		if err != nil {
+			return err
+		}
+		for _, name := range names {
+			if strings.HasPrefix(name, ownerAttributeNamespace) && !allowedAttributes[path+"\x00"+name] {
+				return errors.Join(ErrIdentity, errors.New("prepared namespace retains unreviewed owner metadata"))
+			}
+		}
+		return nil
+	}
+	if err := checkAttributes(self.admission.root, request.RootPath); err != nil {
+		return err
+	}
 	expected := map[string]bool{}
 	for _, source := range self.plan.Sources {
 		expected[source.File.Path] = true
@@ -768,6 +829,9 @@ func (self *preparationApply) finalCensus() error {
 			}
 			if err == nil && stat.Mode&syscall.S_IFMT == syscall.S_IFDIR {
 				err = visit(file, path, depth+1)
+			}
+			if err == nil {
+				err = checkAttributes(file, absolute)
 			}
 			if err := errors.Join(err, file.Close()); err != nil {
 				return err
