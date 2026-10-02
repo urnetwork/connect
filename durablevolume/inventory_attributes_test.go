@@ -123,7 +123,7 @@ func TestInventoryConcurrentOwnerAttributeChangePoisonsSnapshot(t *testing.T) {
 	}
 }
 
-func TestInventoryAttributeKernelReadFailureAndCapacityRemainDistinct(t *testing.T) {
+func TestInventoryAttributeCallerFailureAndCapacityRemainDistinct(t *testing.T) {
 	fixture := newVolumeFixture(t)
 	path := filepath.Join(fixture.root, "lock")
 	if err := os.WriteFile(path, nil, 0600); err != nil {
@@ -143,8 +143,8 @@ func TestInventoryAttributeKernelReadFailureAndCapacityRemainDistinct(t *testing
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readInventoryAttribute(file, name, 4096); !errors.Is(err, ErrUnavailable) || !errors.Is(err, syscall.EBADF) || errors.Is(err, ErrIdentity) {
-		t.Fatal("kernel observation failure became size or identity verdict", err)
+	if _, err := readInventoryAttribute(file, name, 4096); err == nil || !errors.Is(err, syscall.EBADF) || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrIdentity) {
+		t.Fatal("closed caller descriptor became resource or identity verdict", err)
 	}
 }
 
