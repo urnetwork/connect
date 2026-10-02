@@ -32,28 +32,37 @@ type PreparationLimits struct {
 	MaxPlanBytes           uint64 `json:"max_plan_bytes"`
 }
 
-// The command independently selects daemon or owner-local scope. Purpose is
-// explicit: this first slice supports fresh only; retained/restore never fall
-// back to fresh merely because a target happens to be empty.
+// The command independently selects daemon or owner-local scope. Restore has
+// separate source authority; neither purpose is inferred from an empty target.
 type PreparationRequest struct {
-	Schema             string             `json:"schema"`
-	Purpose            string             `json:"purpose"`
-	Scope              string             `json:"scope"`
-	MountPath          string             `json:"mount_path"`
-	FilesystemUuid     string             `json:"filesystem_uuid"`
-	FilesystemType     string             `json:"filesystem_type"`
-	MinAvailableBytes  uint64             `json:"min_available_bytes"`
-	MinAvailableInodes uint64             `json:"min_available_inodes"`
-	RootPath           string             `json:"root_path"`
-	RootCreation       string             `json:"root_creation,omitempty"`
-	MarkerPath         string             `json:"marker_path"`
-	LeasePath          string             `json:"lease_path"`
-	DeclarationPath    string             `json:"declaration_path"`
-	ControlPath        string             `json:"control_path"`
-	StagingDirectory   string             `json:"staging_directory"`
-	FormerWriterFence  Reference          `json:"former_writer_fence"`
-	Limits             PreparationLimits  `json:"limits"`
-	Owners             []PreparationOwner `json:"owners"`
+	Schema             string                    `json:"schema"`
+	Purpose            string                    `json:"purpose"`
+	Scope              string                    `json:"scope"`
+	MountPath          string                    `json:"mount_path"`
+	FilesystemUuid     string                    `json:"filesystem_uuid"`
+	FilesystemType     string                    `json:"filesystem_type"`
+	MinAvailableBytes  uint64                    `json:"min_available_bytes"`
+	MinAvailableInodes uint64                    `json:"min_available_inodes"`
+	RootPath           string                    `json:"root_path"`
+	RootCreation       string                    `json:"root_creation,omitempty"`
+	RestoreSource      *PreparationRestoreSource `json:"restore_source,omitempty"`
+	MarkerPath         string                    `json:"marker_path"`
+	LeasePath          string                    `json:"lease_path"`
+	DeclarationPath    string                    `json:"declaration_path"`
+	ControlPath        string                    `json:"control_path"`
+	StagingDirectory   string                    `json:"staging_directory"`
+	FormerWriterFence  Reference                 `json:"former_writer_fence"`
+	Limits             PreparationLimits         `json:"limits"`
+	Owners             []PreparationOwner        `json:"owners"`
+}
+
+// A protected archive is read-only input. Its reviewed physical inventory
+// retains original member generations even when the archive is a copied tree.
+// The source stop assertion and target zero-history fence are independent.
+type PreparationRestoreSource struct {
+	Directory         string    `json:"directory"`
+	Inventory         Reference `json:"inventory"`
+	FormerWriterFence Reference `json:"former_writer_fence"`
 }
 
 // Application registries parse Inputs into fixed public schemas. Connect does
@@ -68,14 +77,15 @@ type PreparationOwner struct {
 // External evidence is an explicit assertion, not proof from a local flock
 // that an old or remote writer was stopped. The accepted plan retains its hash.
 type PreparationFence struct {
-	Schema               string `json:"schema"`
-	RootPath             string `json:"root_path"`
-	RootInode            uint64 `json:"root_inode"`
-	ParentInode          uint64 `json:"parent_inode,omitempty"`
-	Purpose              string `json:"purpose"`
-	FormerWritersStopped bool   `json:"former_writers_stopped"`
-	NoPreviousOwnerState bool   `json:"no_previous_owner_state"`
-	Evidence             string `json:"evidence"`
+	Schema                string `json:"schema"`
+	RootPath              string `json:"root_path"`
+	RootInode             uint64 `json:"root_inode"`
+	ParentInode           uint64 `json:"parent_inode,omitempty"`
+	Purpose               string `json:"purpose"`
+	FormerWritersStopped  bool   `json:"former_writers_stopped"`
+	NoPreviousOwnerState  bool   `json:"no_previous_owner_state"`
+	NoPreviousTargetState bool   `json:"no_previous_target_state,omitempty"`
+	Evidence              string `json:"evidence"`
 }
 
 // Identity is separate from file bytes; byte-identical replacement is not a
@@ -116,8 +126,10 @@ type PreparedAttribute struct {
 // copied target. It borrows descriptors synchronously, never closes them,
 // starts workers, signs, writes the live target or authorizes a restart.
 type PreparationAdapter struct {
-	Build   func(context.Context, *os.File, string, PreparationOwner) (PreparationOwnerPlan, error)
-	Inspect func(context.Context, *os.File, PreparationOwnerPlan) ([]PreparedAttribute, error)
+	Build          func(context.Context, *os.File, string, PreparationOwner) (PreparationOwnerPlan, error)
+	Inspect        func(context.Context, *os.File, PreparationOwnerPlan) ([]PreparedAttribute, error)
+	Restore        func(context.Context, string, PreparationOwner, Inventory) (PreparationOwnerPlan, error)
+	InspectRestore func(context.Context, *os.File, PreparationOwnerPlan, Inventory) ([]PreparedAttribute, error)
 }
 
 // The public semantic census and portable staged files bind one fixed adapter.
@@ -147,6 +159,7 @@ type PreparationPlan struct {
 	RequestBytes      []byte                         `json:"request_bytes"`
 	Root              PreparationIdentity            `json:"root"`
 	RootSource        string                         `json:"root_source,omitempty"`
+	RestoreArchive    *PreparationIdentity           `json:"restore_archive,omitempty"`
 	Directories       map[string]PreparationIdentity `json:"directories"`
 	Mount             Mount                          `json:"mount"`
 	Filesystem        Filesystem                     `json:"filesystem"`

@@ -894,12 +894,31 @@ func (self *preparationApply) finalCensus() error {
 // One invocation never retries a failed mutation. Its deferred close joins all
 // descriptors before the same accepted plan can perform bounded readback.
 func applyPreparation(ctx context.Context, reference Reference, adapter PreparationAdapter, host Host, scope ownerScope, hooks *preparationHooks) (result PreparationResult, resultErr error) {
-	if adapter.Build == nil || adapter.Inspect == nil {
-		return result, errors.New("fixed preparation adapters are required")
-	}
 	plan, request, err := readPreparationPlan(ctx, reference, scope)
 	if err != nil {
 		return result, err
+	}
+	if err := preparationAdapterAdmission(request, adapter); err != nil {
+		return result, err
+	}
+	var inventory Inventory
+	if request.Purpose == "restore" {
+		inventory, err = readPreparationRestoreInventory(ctx, request)
+		if err != nil {
+			return result, err
+		}
+		for _, owner := range plan.Owners {
+			expected, err := adapter.Restore(ctx, owner.StagingName, owner.Owner, inventory)
+			if err != nil {
+				return result, err
+			}
+			if !reflect.DeepEqual(expected, owner) {
+				return result, errors.New("accepted restore owner differs from its original fixed semantic census")
+			}
+			if err := validatePreparationRestoreOwner(inventory, owner); err != nil {
+				return result, err
+			}
+		}
 	}
 	admission, err := openPreparationAdmission(ctx, request, host, scope, plan.RootSource)
 	if err != nil {
@@ -952,7 +971,12 @@ func applyPreparation(ctx context.Context, reference Reference, adapter Preparat
 		if err := self.finalCensus(); err != nil {
 			return result, err
 		}
-		attributes, err := adapter.Inspect(ctx, admission.root, owner)
+		var attributes []PreparedAttribute
+		if request.Purpose == "restore" {
+			attributes, err = adapter.InspectRestore(ctx, admission.root, owner, inventory)
+		} else {
+			attributes, err = adapter.Inspect(ctx, admission.root, owner)
+		}
 		if err != nil {
 			return result, err
 		}
