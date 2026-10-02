@@ -563,6 +563,9 @@ func (self *preparationApply) observe(step preparationStep, pending bool) (_ Pre
 	if step.Kind == "attribute" {
 		return self.observeAttribute(step, pending)
 	}
+	if step.Kind == "root-directory" {
+		return self.observeRoot(step, pending)
+	}
 	mutated := false
 	defer func() {
 		if mutated && resultErr != nil {
@@ -898,7 +901,7 @@ func applyPreparation(ctx context.Context, reference Reference, adapter Preparat
 	if err != nil {
 		return result, err
 	}
-	admission, err := openPreparationAdmission(ctx, request, host, scope)
+	admission, err := openPreparationAdmission(ctx, request, host, scope, plan.RootSource)
 	if err != nil {
 		return result, err
 	}
@@ -922,6 +925,11 @@ func applyPreparation(ctx context.Context, reference Reference, adapter Preparat
 	}()
 	if err := self.openControl(); err != nil {
 		return result, err
+	}
+	if request.RootCreation == "create-private" {
+		if err := self.step(preparationRootStep(request, plan)); err != nil {
+			return result, err
+		}
 	}
 	attributeStep := func(path, name string, raw []byte) preparationStep {
 		return preparationStep{Kind: "attribute", Path: path, Attribute: name, Bytes: uint64(len(raw)), Sha256: preparationDigest(raw), Raw: raw}

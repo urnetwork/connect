@@ -43,6 +43,11 @@ func preparationControlCapacity(ctx context.Context, request PreparationRequest,
 		used += pair
 		return nil
 	}
+	if request.RootCreation == "create-private" {
+		if err := reserve(preparationRootStep(request, plan)); err != nil {
+			return err
+		}
+	}
 	attribute := func(path, name string, raw []byte) preparationStep {
 		return preparationStep{Kind: "attribute", Path: path, Attribute: name, Bytes: uint64(len(raw)), Sha256: digest, Raw: raw}
 	}
