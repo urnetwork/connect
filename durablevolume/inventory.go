@@ -210,6 +210,12 @@ func (self *Owner) verifyInventory(ctx context.Context, expectedReference, fence
 	if expected.Schema != InventorySchema || expected.RestartAuthorized || len(expected.Entries) == 0 || len(expected.Entries) > 10000 {
 		return RestoreVerification{}, errors.New("retained inventory scope is invalid")
 	}
+	if err := expected.Limits.validate(); err != nil {
+		return RestoreVerification{}, errors.Join(errors.New("retained inventory limits are invalid"), err)
+	}
+	if uint64(len(expected.Entries)) > expected.Limits.MaxEntries || expected.TotalBytes > expected.Limits.MaxBytes || expected.TotalOwnerAttributes > expected.Limits.MaxOwnerAttributes || expected.TotalOwnerAttributeBytes > expected.Limits.MaxOwnerAttributeBytes {
+		return RestoreVerification{}, errors.New("retained inventory exceeds its declared limits")
+	}
 	rootGeneration, err := hex.DecodeString(expected.RootGeneration)
 	if err != nil || len(rootGeneration) != RootGenerationBytes || expected.StateRoot.RootInode == 0 || expected.StateRoot.RootInode != expected.PhysicalRoot.Inode {
 		return RestoreVerification{}, errors.New("retained inventory lacks exact root generation metadata")
