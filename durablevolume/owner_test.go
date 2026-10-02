@@ -25,33 +25,36 @@ type fixtureHost struct {
 	uuidDevice     Device
 	filesystem     Filesystem
 	filesystemHook func(*os.File)
+	mountsErr      error
+	uuidErr        error
+	filesystemErr  error
 }
 
 // Returns a copy so readers cannot mutate or race the next census.
 func (self *fixtureHost) Mounts() ([]Mount, error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return append([]Mount(nil), self.mounts...), nil
+	return append([]Mount(nil), self.mounts...), self.mountsErr
 }
 
 // The test controls only the kernel's uuid lookup result.
 func (self *fixtureHost) DeviceUuid(string) (Device, error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.uuidDevice, nil
+	return self.uuidDevice, self.uuidErr
 }
 
 // Barriers run outside the fixture mutex, just as production host calls do.
 func (self *fixtureHost) Filesystem(file *os.File) (Filesystem, error) {
-	facts, hook := func() (Filesystem, func(*os.File)) {
+	facts, hook, err := func() (Filesystem, func(*os.File), error) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		return self.filesystem, self.filesystemHook
+		return self.filesystem, self.filesystemHook, self.filesystemErr
 	}()
 	if hook != nil {
 		hook(file)
 	}
-	return facts, nil
+	return facts, err
 }
 
 // Changes facts at a chosen causal boundary without process-global hooks.
@@ -240,9 +243,11 @@ func TestOwnerRefusesReadOnlyAndExhaustedReserve(t *testing.T) {
 				fixture.host.filesystem.AvailableInodes = fixture.config.Volumes[0].MinAvailableInodes - 1
 			}
 		})
-		if directory, err := owner.OpenDirectory("must-not-exist", true); err == nil {
-			directory.Close()
-			t.Fatalf("%s admitted mutation", kind)
+		if directory, err := owner.OpenDirectory("must-not-exist", true); !errors.Is(err, ErrUnavailable) || errors.Is(err, ErrIdentity) {
+			if directory != nil {
+				directory.Close()
+			}
+			t.Fatalf("%s availability classification: %v", kind, err)
 		}
 		if _, err := os.Lstat(filepath.Join(fixture.root, "must-not-exist")); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s changed state: %v", kind, err)
@@ -256,6 +261,119 @@ func TestOwnerRefusesReadOnlyAndExhaustedReserve(t *testing.T) {
 		if err := owner.Check(); err != nil {
 			t.Fatalf("%s availability recovery: %v", kind, err)
 		}
+	}
+}
+
+// An unavailable kernel observation refuses this attempt and retains the cause,
+// but identical later facts can admit work without discarding the owner.
+func TestOwnerTransientKernelObservationRetainsGeneration(t *testing.T) {
+	for _, kind := range []string{"mounts", "uuid", "filesystem"} {
+		fixture := newVolumeFixture(t)
+		owner := fixture.open(t, ReadWrite)
+		cause := errors.New("synthetic kernel observation unavailable")
+		fixture.host.change(func() {
+			switch kind {
+			case "mounts":
+				fixture.host.mountsErr = cause
+			case "uuid":
+				fixture.host.uuidErr = cause
+			case "filesystem":
+				fixture.host.filesystemErr = cause
+			}
+		})
+		if err := owner.Check(); !errors.Is(err, ErrUnavailable) || errors.Is(err, ErrIdentity) || !errors.Is(err, cause) {
+			t.Fatalf("%s transient observation classification: %v", kind, err)
+		}
+		fixture.host.change(func() { fixture.host.mountsErr = nil; fixture.host.uuidErr = nil; fixture.host.filesystemErr = nil })
+		if err := owner.CheckWrite(); err != nil {
+			t.Fatalf("%s observation recovery: %v", kind, err)
+		}
+	}
+}
+
+// A proven descendant loss invalidates that borrowed generation even if the
+// original inode is restored under its original name before another check.
+func TestOwnerDescendantLossRemainsPoisonedAfterRestoration(t *testing.T) {
+	for _, kind := range []string{"missing", "replacement", "symlink", "permissions", "nested-mount"} {
+		fixture := newVolumeFixture(t)
+		owner := fixture.open(t, ReadWrite)
+		directory, err := owner.OpenDirectory("journal", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer directory.Close()
+		path := filepath.Join(fixture.root, "journal")
+		switch kind {
+		case "missing", "replacement", "symlink":
+			if err := os.Rename(path, path+"-retained"); err != nil {
+				t.Fatal(err)
+			}
+			if kind == "replacement" {
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if kind == "symlink" {
+				if err := os.Symlink(path+"-retained", path); err != nil {
+					t.Fatal(err)
+				}
+			}
+		case "permissions":
+			if err := os.Chmod(path, 0777); err != nil {
+				t.Fatal(err)
+			}
+		case "nested-mount":
+			fixture.host.change(func() {
+				fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 9, ParentId: 7, Device: fixture.host.uuidDevice, Root: "/", Path: path, FilesystemType: "ext4"})
+			})
+		}
+		if err := owner.CheckDirectory("journal", directory); !errors.Is(err, ErrIdentity) {
+			t.Fatalf("%s custody loss classification: %v", kind, err)
+		}
+		switch kind {
+		case "missing", "replacement", "symlink":
+			if kind != "missing" {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Rename(path+"-retained", path); err != nil {
+				t.Fatal(err)
+			}
+		case "permissions":
+			if err := os.Chmod(path, 0700); err != nil {
+				t.Fatal(err)
+			}
+		case "nested-mount":
+			fixture.host.change(func() { fixture.host.mounts = fixture.host.mounts[:2] })
+		}
+		if err := owner.CheckDirectory("journal", directory); !errors.Is(err, ErrIdentity) {
+			t.Fatalf("%s restored generation was readmitted: %v", kind, err)
+		}
+	}
+}
+
+// Invalid caller arguments and an as-yet unclaimed absent descendant do not
+// falsely report observed destruction of already admitted custody.
+func TestOwnerCallerErrorsDoNotPoisonIdentity(t *testing.T) {
+	fixture := newVolumeFixture(t)
+	owner := fixture.open(t, ReadWrite)
+	directory, err := owner.OpenDirectory("", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+	if err := owner.CheckDirectory("../escape", directory); err == nil || errors.Is(err, ErrIdentity) {
+		t.Fatalf("caller input classification: %v", err)
+	}
+	if file, err := owner.OpenDirectory("not-yet-created", false); !errors.Is(err, os.ErrNotExist) || errors.Is(err, ErrIdentity) {
+		if file != nil {
+			file.Close()
+		}
+		t.Fatalf("unclaimed absence: %v", err)
+	}
+	if err := owner.CheckWrite(); err != nil {
+		t.Fatalf("caller error poisoned owner: %v", err)
 	}
 }
 

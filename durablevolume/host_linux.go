@@ -120,7 +120,7 @@ func (self linuxHost) DeviceUuid(uuid string) (Device, error) {
 		return Device{}, err
 	}
 	if stat.Mode&syscall.S_IFMT != syscall.S_IFBLK {
-		return Device{}, errors.New("filesystem uuid does not resolve to a block device")
+		return Device{}, errors.Join(ErrIdentity, errors.New("filesystem uuid does not resolve to a block device"))
 	}
 	return deviceNumber(stat.Rdev), nil
 }
@@ -283,8 +283,11 @@ func sameNamedFile(file *os.File, path string) error {
 // Select one exact mount and reject a nested mount over the marker or owner.
 func (self *Owner) mountFacts() (Mount, error) {
 	mounts, err := self.host.Mounts()
-	if err != nil || len(mounts) == 0 || len(mounts) > 8192 {
-		return Mount{}, errors.Join(errors.New("durable mount census is unavailable or unbounded"), err)
+	if err != nil {
+		return Mount{}, errors.Join(&UnavailableError{Reason: "kernel mount census could not be observed"}, err)
+	}
+	if len(mounts) == 0 || len(mounts) > 8192 {
+		return Mount{}, errors.New("durable mount census is empty or unbounded")
 	}
 	var selected, root Mount
 	selectedCount, rootCount := 0, 0
@@ -305,8 +308,14 @@ func (self *Owner) mountFacts() (Mount, error) {
 		}
 	}
 	device, err := self.host.DeviceUuid(self.spec.FilesystemUuid)
-	if err != nil || device != selected.Device {
-		return Mount{}, errors.Join(errors.New("durable mount differs from the approved filesystem uuid"), err)
+	if err != nil {
+		if errors.Is(err, ErrIdentity) {
+			return Mount{}, err
+		}
+		return Mount{}, errors.Join(&UnavailableError{Reason: "kernel uuid device could not be observed"}, err)
+	}
+	if device != selected.Device {
+		return Mount{}, errors.New("durable mount differs from the approved filesystem uuid")
 	}
 	return selected, nil
 }
@@ -402,7 +411,7 @@ func (self *Owner) check(write bool) (result error) {
 	}
 	filesystem, err := self.host.Filesystem(self.rootFile)
 	if err != nil {
-		return err
+		return errors.Join(&UnavailableError{Reason: "kernel filesystem facts could not be observed"}, err)
 	}
 	typeMatches := self.spec.FilesystemType == "ext4" && filesystem.Type == 0xef53 || self.spec.FilesystemType == "xfs" && filesystem.Type == 0x58465342 || self.spec.FilesystemType == "btrfs" && filesystem.Type == 0x9123683e
 	if !typeMatches || filesystem.Id != self.filesystem.Id || filesystem.Type != self.filesystem.Type {
@@ -464,6 +473,9 @@ func (self *Owner) openChild(relative string, create bool) (*os.File, error) {
 			next, openErr = syscall.Openat(int(file.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 		}
 		if openErr != nil {
+			if errors.Is(openErr, syscall.ELOOP) || errors.Is(openErr, syscall.ENOTDIR) {
+				openErr = errors.Join(ErrIdentity, openErr)
+			}
 			return nil, errors.Join(openErr, file.Close())
 		}
 		child := os.NewFile(uintptr(next), path)
@@ -477,19 +489,25 @@ func (self *Owner) openChild(relative string, create bool) (*os.File, error) {
 		}
 		file = child
 		if err := protected(file, true); err != nil {
-			return nil, errors.Join(err, file.Close())
+			return nil, errors.Join(ErrIdentity, err, file.Close())
 		}
 		var stat syscall.Stat_t
-		if err := syscall.Fstat(next, &stat); err != nil || deviceNumber(stat.Dev) != self.mount.Device {
-			return nil, errors.Join(errors.New("durable child enters another filesystem"), err, file.Close())
+		if err := syscall.Fstat(next, &stat); err != nil {
+			return nil, errors.Join(&UnavailableError{Reason: "durable child device could not be observed"}, err, file.Close())
+		}
+		if deviceNumber(stat.Dev) != self.mount.Device {
+			return nil, errors.Join(ErrIdentity, errors.New("durable child enters another filesystem"), file.Close())
 		}
 		mounts, err := self.host.Mounts()
-		if err != nil || len(mounts) == 0 || len(mounts) > 8192 {
-			return nil, errors.Join(errors.New("durable child mount census is unavailable"), err, file.Close())
+		if err != nil {
+			return nil, errors.Join(&UnavailableError{Reason: "durable child mount census could not be observed"}, err, file.Close())
+		}
+		if len(mounts) == 0 || len(mounts) > 8192 {
+			return nil, errors.Join(ErrIdentity, errors.New("durable child mount census is empty or unbounded"), file.Close())
 		}
 		for _, mount := range mounts {
 			if mount.Id != self.mount.Id && beneath(self.spec.MountPath, mount.Path) && beneath(mount.Path, path) {
-				return nil, errors.Join(errors.New("durable child crosses another mount"), file.Close())
+				return nil, errors.Join(ErrIdentity, errors.New("durable child crosses another mount"), file.Close())
 			}
 		}
 	}
@@ -508,8 +526,11 @@ func (self *Owner) openDirectory(relative string, create bool) (*os.File, error)
 	if err != nil {
 		return nil, err
 	}
-	if err := errors.Join(self.check(self.access == ReadWrite), sameNamedFile(file, filepath.Join(self.rootPath, relative))); err != nil {
+	if err := self.check(self.access == ReadWrite); err != nil {
 		return nil, errors.Join(err, file.Close())
+	}
+	if err := sameNamedFile(file, filepath.Join(self.rootPath, relative)); err != nil {
+		return nil, errors.Join(ErrIdentity, err, file.Close())
 	}
 	return file, nil
 }
@@ -519,16 +540,28 @@ func (self *Owner) checkDirectory(relative string, directory *os.File) error {
 	if directory == nil {
 		return ErrClosed
 	}
+	if _, err := relativeParts(relative); err != nil {
+		return err
+	}
 	if err := self.check(self.access == ReadWrite); err != nil {
 		return err
 	}
 	current, err := self.openChild(relative, false)
 	if err != nil {
+		if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ELOOP) {
+			err = errors.Join(ErrIdentity, err)
+		}
 		return err
 	}
 	want, wantErr := current.Stat()
 	got, gotErr := directory.Stat()
 	closeErr := current.Close()
+	if gotErr != nil {
+		return errors.Join(gotErr, closeErr)
+	}
+	if wantErr != nil {
+		return errors.Join(&UnavailableError{Reason: "durable descendant metadata could not be observed"}, wantErr, closeErr)
+	}
 	if wantErr != nil || gotErr != nil || !os.SameFile(want, got) || want.Mode() != got.Mode() {
 		return errors.Join(ErrIdentity, errors.New("durable descendant descriptor changed"), wantErr, gotErr, closeErr)
 	}
