@@ -87,6 +87,9 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) (resultErr 
 			return err
 		}
 		entry := InventoryEntry{Path: relative, Mode: before.Mode & 07777, Uid: before.Uid, Gid: before.Gid}
+		if result.Schema == PhysicalInventorySchema {
+			entry.Physical = &PhysicalRoot{Device: deviceNumber(before.Dev), Inode: before.Ino}
+		}
 		entry.OwnerAttributes, err = self.inventoryAttributes(ctx, file, relative, result)
 		if err != nil {
 			return err
