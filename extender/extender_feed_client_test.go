@@ -30,9 +30,11 @@ const testFeedNetworkHost = "space.example"
 type feedServer struct {
 	t      *testing.T
 	sample []*protocol.ExtenderFeedFrame
-	pushes chan *protocol.ExtenderFeedFrame
-	opened chan *protocol.ExtenderFeedRequest
-	closed chan struct{}
+	// Optional barrier after the request, before the first sample frame.
+	sampleRelease <-chan struct{}
+	pushes        chan *protocol.ExtenderFeedFrame
+	opened        chan *protocol.ExtenderFeedRequest
+	closed        chan struct{}
 
 	stateLock       sync.Mutex
 	refuseRemaining int
@@ -68,6 +70,13 @@ func (self *feedServer) handle(conn net.Conn) {
 		// the connection is dropped without a sample, which is what a failed
 		// feed attempt looks like to the client
 		return
+	}
+	if self.sampleRelease != nil {
+		select {
+		case <-self.sampleRelease:
+		case <-self.closed:
+			return
+		}
 	}
 	for _, frame := range self.sample {
 		if err := connect.WriteExtenderFeedFrame(conn, frame); err != nil {

@@ -8,6 +8,17 @@ import (
 	"time"
 )
 
+type observedH1CloseJoinTransport struct {
+	*PlatformTransport
+	joinEntered chan struct{}
+	joinOnce    sync.Once
+}
+
+func (self *observedH1CloseJoinTransport) CloseAndWait(ctx context.Context) error {
+	self.joinOnce.Do(func() { close(self.joinEntered) })
+	return self.PlatformTransport.CloseAndWait(ctx)
+}
+
 // The generated client can finish while its external H1 carrier still owns
 // socket/receive workers. The generator owns that carrier, so it cannot report
 // a successful join merely because Client.CloseAndWait returned.
@@ -36,6 +47,7 @@ func TestApiMultiClientGeneratorJoinsActualH1Transport(t *testing.T) {
 		releaseOnce.Do(func() { close(release) })
 		_ = transport.CloseAndWait(context.Background())
 		_ = client.CloseAndWait(context.Background())
+		_ = generator.CloseAndWait(context.Background())
 	}()
 	for !transport.IsConnected() {
 		notify := transport.ConnectedNotify()
@@ -53,13 +65,19 @@ func TestApiMultiClientGeneratorJoinsActualH1Transport(t *testing.T) {
 		t.Fatalf("connected H1 did not acquire its admission claim: %+v", connectedClaims)
 	}
 	args := &MultiClientGeneratorClientArgs{ClientId: client.ClientId(), ClientAuth: &ClientAuth{InstanceId: NewId()}}
+	joiningTransport := &observedH1CloseJoinTransport{
+		PlatformTransport: transport,
+		joinEntered:       make(chan struct{}),
+	}
 	generator.transportLock.Lock()
 	generator.transportIdle = make(chan struct{})
-	generator.transports[client] = &apiWindowClientTransport{current: transport}
+	generator.transports[client] = &apiWindowClientTransport{current: joiningTransport}
 	generator.transportLock.Unlock()
+	retirementHandedOff := make(chan struct{})
 	go func() {
 		<-client.Done()
 		generator.RemoveClientWithArgs(client, args)
+		close(retirementHandedOff)
 	}()
 	// A short caller deadline is a liveness bound, not an altered production
 	// timeout. The held H1 owner must prevent successful completion throughout.
@@ -68,6 +86,11 @@ func TestApiMultiClientGeneratorJoinsActualH1Transport(t *testing.T) {
 	result := make(chan error, 1)
 	go func() { result <- generator.CloseAndWait(joinCtx) }()
 	waitCloseWaitBarrier(t, ctx, entered, "actual H1 teardown barrier")
+	// H1 teardown can start before RemoveClientWithArgs finishes its short
+	// map-removal critical section. Wait for that handoff and the actual carrier
+	// join before checking which locks the held join owns.
+	waitCloseWaitBarrier(t, ctx, retirementHandedOff, "generated client retirement handoff")
+	waitCloseWaitBarrier(t, ctx, joiningTransport.joinEntered, "actual H1 carrier join")
 	heldClaims := budget.MemoryOwnerCensus()
 	if !generator.transportLock.TryLock() {
 		t.Fatal("carrier join holds the generator transport lock")

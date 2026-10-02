@@ -24,6 +24,7 @@ const (
 )
 
 var errAltRequestMemory = errors.New("alt HTTP request exceeds its retained upload budget")
+var errAltStoppedUpload = errors.New("alt HTTP upload ended by normal stream cancellation")
 
 // AltQuicUnsupportedRequestError lets a strategy select another carrier before
 // opening an alt socket or consuming the request body. Alt serves bounded API
@@ -47,8 +48,8 @@ type altQuicConnection struct {
 // headers, body, and FIN synchronously cancellable by the send-root guard.
 // HTTP/3 still owns framing, response decoding, gzip, response trailers, and
 // connection-control handling. One request remains active through Body.Close
-// and FIN acknowledgment. http.Client owns redirects; ClientStrategy owns
-// retries, with no implicit replay of possibly delivered API mutations here.
+// and FIN or RESET_STREAM acknowledgment. http.Client owns redirects;
+// ClientStrategy owns retries, with no implicit replay of API mutations here.
 // Request trailers, CONNECT, and explicit 0-RTT pseudo-methods are refused.
 // Full httptrace transport-lifecycle parity is not provided; the API callers
 // use none of these features. RequestStream's own tracing hooks still run.
@@ -241,10 +242,12 @@ func (self *altQuicBoundedTransport) RoundTrip(request *http.Request) (*http.Res
 	}
 	flight := quicSendFlightForConn(entry.conn)
 	writer := flight.newWriter(stream) // must precede even the request HEADERS
-	var uploaded atomic.Bool
+	var sendFinished atomic.Bool
+	// True only when response closure precedes request-context cancellation.
+	var responseFinished atomic.Bool
 	stopRequest := context.AfterFunc(ctx, func() {
 		stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
-		if !uploaded.Load() {
+		if !sendFinished.Load() {
 			stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
 			body.Close()
 		}
@@ -280,14 +283,39 @@ func (self *altQuicBoundedTransport) RoundTrip(request *http.Request) (*http.Res
 		if request.Body != nil && request.Body != http.NoBody {
 			uploadErr = writeAltQuicBody(ctx, writer, body, request)
 		}
+		var writeErr *altQuicUploadWriteError
+		if errors.As(uploadErr, &writeErr) {
+			if altUploadSendStopped(ctx, stream.Context(), writeErr.err, responseFinished.Load()) {
+				uploadErr = errAltStoppedUpload
+			} else {
+				uploadErr = writeErr.err
+			}
+		} else if responseFinished.Load() && errors.Is(uploadErr, context.Canceled) &&
+			altUploadStoppedNormally(ctx, stream.Context(), true) {
+			// Body.Close must unblock a pending Read. Its resulting cancellation
+			// is intentional only after this response was explicitly closed.
+			uploadErr = errAltStoppedUpload
+		}
 		if uploadErr == nil {
 			uploadErr = stream.Close()
+			// quic-go's Close returns an untyped error after STOP_SENDING.
+			// Only the actual stream cause can identify that normal send stop.
+			if uploadErr != nil && altUploadStoppedNormally(ctx, stream.Context(), responseFinished.Load()) {
+				uploadErr = errAltStoppedUpload
+			}
+		}
+		if errors.Is(uploadErr, errAltStoppedUpload) {
+			// A stopped request upload does not cancel the peer's response.
+			// A credit wait can observe the stop before calling QUIC Write;
+			// acknowledge it to quic-go so RESET ACK can retire the stream.
+			stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeNoError))
+			uploadErr = nil
 		}
 		if uploadErr != nil {
 			stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
 			stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
 		} else {
-			uploaded.Store(true)
+			sendFinished.Store(true)
 		}
 	}
 	if request.Body != nil && request.Body != http.NoBody {
@@ -330,12 +358,19 @@ func (self *altQuicBoundedTransport) RoundTrip(request *http.Request) (*http.Res
 	response.TLS, response.Request = &state, request
 	responseBody := &altQuicResponseBody{ReadCloser: response.Body, ctx: ctx}
 	responseBody.finish = func() {
+		// http.Client cancels its timeout context immediately after Body.Close
+		// returns. Capture ordinary response closure, and stop the send side,
+		// synchronously; that later cancellation must not masquerade as an
+		// upload failure while the asynchronous terminal-ACK join is running.
+		stopRequest()
+		responseFinished.Store(ctx.Err() == nil)
+		if !sendFinished.Load() {
+			stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		}
 		go func() {
 			defer cancel()
 			defer func() { <-self.slot }()
-			stopRequest()
-			if !uploaded.Load() {
-				stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+			if !sendFinished.Load() {
 				body.Close()
 			}
 			<-uploadDone
@@ -384,7 +419,7 @@ func writeAltQuicBody(ctx context.Context, writer io.Writer, body io.Reader, req
 		if n > 0 {
 			emptyReads = 0
 			if sent, writeErr := writer.Write(scratch[:n]); writeErr != nil {
-				return writeErr
+				return &altQuicUploadWriteError{err: writeErr}
 			} else if sent != n {
 				return io.ErrShortWrite
 			}
@@ -408,6 +443,36 @@ func writeAltQuicBody(ctx context.Context, writer io.Writer, body io.Reader, req
 			return err
 		}
 	}
+}
+
+// Keep send failures distinct from a body reader returning the same error.
+// A remote STOP_SENDING must not hide local reader/length/trailer/budget errors.
+type altQuicUploadWriteError struct{ err error }
+
+func (e *altQuicUploadWriteError) Error() string { return e.err.Error() }
+func (e *altQuicUploadWriteError) Unwrap() error { return e.err }
+
+// Only normal peer upload completion or our own explicit response close can
+// stop sending without failing the response. responseClosed means the response
+// was closed while its context was live, before http.Client cancels its timer.
+// A cancellation already present at response closure always retains priority.
+func altUploadStoppedNormally(ctx, streamCtx context.Context, responseClosed bool) bool {
+	var streamErr *quic.StreamError
+	return (ctx.Err() == nil || responseClosed) && errors.As(context.Cause(streamCtx), &streamErr) &&
+		(streamErr.Remote && streamErr.ErrorCode == quic.StreamErrorCode(http3.ErrCodeNoError) ||
+			responseClosed && !streamErr.Remote && streamErr.ErrorCode == quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+}
+
+func altUploadSendStopped(ctx, streamCtx context.Context, err error, responseClosed bool) bool {
+	if !altUploadStoppedNormally(ctx, streamCtx, responseClosed) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true // the bounded writer's credit wait observes stream cancellation
+	}
+	var streamErr, cause *quic.StreamError
+	return errors.As(err, &streamErr) && errors.As(context.Cause(streamCtx), &cause) &&
+		streamErr.StreamID == cause.StreamID && streamErr.Remote == cause.Remote && streamErr.ErrorCode == cause.ErrorCode
 }
 
 func (self *altQuicBoundedTransport) closeConnections(idleOnly bool) {
