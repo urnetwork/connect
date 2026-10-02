@@ -28,7 +28,7 @@ func ownerAttributeLimit(name string) (int, bool) {
 	switch name {
 	case RootGenerationAttribute:
 		return RootGenerationBytes, true
-	case ownerAttributeNamespace + "native-journal-custody", ownerAttributeNamespace + "attempt-ledger-custody":
+	case ownerAttributeNamespace + "native-journal-custody", ownerAttributeNamespace + "attempt-ledger-custody", PreparationAttribute:
 		return 4096, true
 	}
 	if strings.HasPrefix(name, snapshotAttributePrefix) {
