@@ -1432,9 +1432,9 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 	self.applyExtraHeaders(request.Header)
 
 	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
-	if result, ok := self.httpPlatformDirect(request); ok {
-		if result == nil {
-			return nil, fmt.Errorf("http request failed")
+	if result, ok, err := self.httpPlatformDirect(request); ok {
+		if err != nil {
+			return nil, fmt.Errorf("http request failed: %w", err)
 		}
 		return result, nil
 	}
@@ -1489,9 +1489,9 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 	self.applyExtraHeaders(helloRequest.Header)
 
 	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
-	if result, ok := self.httpPlatformDirect(request); ok {
-		if result == nil {
-			return nil, fmt.Errorf("http request failed")
+	if result, ok, err := self.httpPlatformDirect(request); ok {
+		if err != nil {
+			return nil, fmt.Errorf("http request failed: %w", err)
 		}
 		return result, nil
 	}

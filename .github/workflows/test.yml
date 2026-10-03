@@ -46,12 +46,13 @@ jobs:
           GOOS=js GOARCH=wasm GOEXPERIMENT=greenteagc go build . ./protocol ./emoji
           GOOS=js GOARCH=wasm GOEXPERIMENT=greenteagc go vet .
 
-      # The js-only tests (*_js_test.go) run under node with the toolchain's
-      # go_js_wasm_exec.
+      # The js-only tests (*_js_test.go) run under node. The exec wrapper keeps
+      # net/http on fetch (stock go_js_wasm_exec disables it under node) so
+      # the browser http tests drive a fake fetch.
       - name: Test js/wasm
         run: |
-          PATH="$PATH:$(go env GOROOT)/lib/wasm" GOOS=js GOARCH=wasm GOEXPERIMENT=greenteagc \
-            go test -count=1 -run '^(TestWebRtcJs|TestHttpPlatformJs)' .
+          GOOS=js GOARCH=wasm GOEXPERIMENT=greenteagc \
+            go test -count=1 -exec "$PWD/tools/go_js_wasm_exec_fetch.sh" -run '^(TestWebRtcJs|TestHttpPlatformJs)' .
 
       # -count=1 defeats the test result cache so a green run always means the
       # tests actually ran. the root package (the data path) takes ~9 min.
