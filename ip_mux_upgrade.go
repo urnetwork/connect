@@ -98,7 +98,8 @@ type DnsUpgradeSettings struct {
 	// Fallback resolves over the local host egress (not the tunnel), used as the handicapped
 	// fallback above so DNS stays responsive while the tunnel-DoH is still coming up — preventing
 	// the OS from tearing down an apparently-unresponsive tunnel, at the cost of a brief DNS leak
-	// during startup. nil disables the fallback.
+	// during startup, which can reveal those lookups to the local network. nil (the default)
+	// disables the fallback: DNS then resolves only through the tunnel.
 	Fallback *DnsResolverSettings
 	// MemoryTarget, when set, is the owner's live dns byte budget, shared by
 	// the mux's tunnel and fallback resolver caches: every in-flight DoH
@@ -119,11 +120,13 @@ type UpgradeMuxSettings struct {
 
 // DefaultUpgradeMuxSettings is the app/device default: DNS (UDP/TCP 53) is intercepted and resolved
 // over DoH that egresses the tunnel, and plaintext HTTP (TCP/80) is passed through to the egress
-// unchanged. While the tunnel-DoH is still establishing on a fresh connect (its connect and TLS
-// budgets are tens of seconds), a query the tunnel can't answer within LocalFallbackTimeout is
-// raced against a handicapped DoH resolver over the LOCAL host egress (Fallback), so DNS stays
-// responsive and the OS doesn't tear the tunnel down — at the cost of a brief DNS leak during
-// startup. The tunnel result is always preferred when it arrives first.
+// unchanged. DNS resolves only through the tunnel: Fallback is nil, so no query is ever resolved
+// over the host network. The handicapped host-network fallback ("fast DNS on connect") is an
+// opt-in: an owner that sets Fallback races a query the tunnel can't answer within
+// LocalFallbackTimeout (ColdLocalFallbackTimeout while the tunnel-DoH is cold) against a DoH
+// resolver over the LOCAL host egress, which keeps DNS responsive while the tunnel establishes at
+// the cost of revealing those lookups to the local network. The timeouts are kept here so an
+// owner that enables the fallback gets the tuned handicaps.
 //
 // For pure pass-through to the egress (the server/proxy use case — no DNS interception,
 // no HTTP upgrade), do not install a mux at all: pass nil settings, which avoids a
@@ -159,8 +162,8 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			ReverseTtl:         1 * time.Hour,
 			ReverseMaxEntries:  defaultReverseMaxEntries,
 			MaxInflightQueries: defaultMaxInflightDnsQueries,
-			// handicapped local fallback: if the tunnel-DoH hasn't answered within 1s, also
-			// resolve over the local host egress. A real multi-origin Android page exposed the
+			// handicapped local fallback, when the owner enables it: if the tunnel-DoH hasn't
+			// answered within 1s, also resolve over the local host egress. A real multi-origin Android page exposed the
 			// former 5s value directly as a 5.29s DNS tail when a stale first-choice DoH server
 			// filled the bounded tunnel wave. Healthy tunnel answers measured around 0.2s, so
 			// 1s retains a clear tunnel preference while bounding the stalled-provider tail.
@@ -171,13 +174,22 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			// per lookup — an accepted widening of the startup leak window, closed again by
 			// the first tunnel-DoH success (see ColdLocalFallbackTimeout)
 			ColdLocalFallbackTimeout: 250 * time.Millisecond,
-			Fallback: &DnsResolverSettings{
-				EnableLocalDoh:   true,
-				LocalDohUrlsIpv4: resolver.RemoteDohUrlsIpv4,
-				LocalDohUrlsIpv6: resolver.RemoteDohUrlsIpv6,
-			},
+			// no host-network fallback by default: DNS resolves only through the tunnel.
+			// The owner opts in by setting Fallback (see DefaultDnsUpgradeFallbackSettings)
+			Fallback: nil,
 		},
 		Http: &HttpUpgradeSettings{Mode: HttpUpgradeUnencrypted},
+	}
+}
+
+// The opt-in host-network fallback resolver for DnsUpgradeSettings.Fallback ("fast DNS on connect"): the default DoH servers dialed over the
+// local host egress, never plaintext DNS. It is not part of DefaultUpgradeMuxSettings.
+func DefaultDnsUpgradeFallbackSettings() *DnsResolverSettings {
+	resolver := DefaultDnsResolverSettings()
+	return &DnsResolverSettings{
+		EnableLocalDoh:   true,
+		LocalDohUrlsIpv4: resolver.RemoteDohUrlsIpv4,
+		LocalDohUrlsIpv6: resolver.RemoteDohUrlsIpv6,
 	}
 }
 

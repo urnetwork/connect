@@ -59,7 +59,10 @@ func TestUpgradeMuxDnsServerScoresExcludeLocalFallbackPath(t *testing.T) {
 	defer cancel()
 
 	rec := &ipMuxRecorder{}
-	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, DefaultUpgradeMuxSettings(), nil)
+	settings := DefaultUpgradeMuxSettings()
+	// the host-network fallback is opt-in
+	settings.Dns.Fallback = DefaultDnsUpgradeFallbackSettings()
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +73,7 @@ func TestUpgradeMuxDnsServerScoresExcludeLocalFallbackPath(t *testing.T) {
 	mux.mux.Tun().DohCache().remoteClient.stats.record(tunnelWinner, true)
 	fallback := mux.fallbackDohCache.Load()
 	if fallback == nil {
-		t.Fatal("default mux did not create a local fallback cache")
+		t.Fatal("enabled fallback did not create a local fallback cache")
 	}
 	for range 16 {
 		fallback.localClient.stats.record(localWinner, true)
