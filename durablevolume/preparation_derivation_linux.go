@@ -1,6 +1,6 @@
 //go:build linux
 
-// A fixed restore profile may derive one unsigned physical census while every
+// A fixed restore profile may derive at most two unsigned physical censuses while every
 // signed member stays byte-exact. Both census generations remain bound by the
 // accepted plan; target publication preserves the reviewed staging inodes.
 package durablevolume
@@ -28,31 +28,60 @@ func validatePreparationPhysicalMetadata(request PreparationRequest, owner Prepa
 		!preparationRelative(metadata.Path, 1, false) || metadata.MaximumBytes == 0 || metadata.MaximumBytes > 8*1024*1024 {
 		return errors.New("physical metadata requires bounded exclusive or complete-union restore coverage")
 	}
+	if metadata.CompanionPath != "" && (!preparationRelative(metadata.CompanionPath, 1, false) || metadata.CompanionPath == metadata.Path) {
+		return errors.New("physical metadata companion is invalid or aliases the original census")
+	}
 	if _, err := preparationRootRenameNumber(); err != nil {
 		return err
 	}
-	present := false
+	present := map[string]bool{}
 	for _, file := range owner.Files {
 		if file.Kind != "file" || file.Mode != 0600 || !preparationRelative(file.Path, 1, false) {
 			return errors.New("physical metadata restore requires exact private flat members")
 		}
-		if file.Path == metadata.Path {
-			if present || file.Bytes == 0 || file.Bytes > metadata.MaximumBytes {
+		if preparationMetadataOwns(metadata, file.Path) {
+			if present[file.Path] || file.Bytes == 0 || file.Bytes > metadata.MaximumBytes {
 				return errors.New("physical metadata census is duplicated or outside its reviewed capacity")
 			}
-			present = true
+			present[file.Path] = true
 		}
 	}
-	if !present {
+	if !present[metadata.Path] || metadata.CompanionPath != "" && !present[metadata.CompanionPath] {
 		return errors.New("physical metadata lacks its original census file")
 	}
 	return nil
+}
+
+// The optional companion does not extend authority to any other member.
+func preparationMetadataOwns(metadata *PreparationPhysicalMetadata, path string) bool {
+	return metadata != nil && (path == metadata.Path || metadata.CompanionPath != "" && path == metadata.CompanionPath)
+}
+
+// The primary path remains first so absent companions preserve legacy plans.
+func preparationMetadataPaths(metadata *PreparationPhysicalMetadata) []string {
+	if metadata == nil {
+		return nil
+	}
+	paths := []string{metadata.Path}
+	if metadata.CompanionPath != "" {
+		paths = append(paths, metadata.CompanionPath)
+	}
+	return paths
 }
 
 // The retained original metadata lives outside the moved owner namespace.
 // Its deterministic plan-owned name cannot collide with an application member.
 func preparationOriginalMetadataPath(request PreparationRequest, owner PreparationOwnerPlan) string {
 	return filepath.Join(request.StagingDirectory, owner.StagingName+"-original-metadata")
+}
+
+// The separately retained companion never overwrites the first original.
+func preparationOriginalMetadataMemberPath(request PreparationRequest, owner PreparationOwnerPlan, path string) string {
+	original := preparationOriginalMetadataPath(request, owner)
+	if owner.PhysicalMetadata != nil && path == owner.PhysicalMetadata.CompanionPath {
+		return original + "-companion"
+	}
+	return original
 }
 
 // Large metadata is read once with a finite bound and before/after named-file
@@ -107,8 +136,8 @@ func preparePhysicalMetadata(ctx context.Context, admission *preparationAdmissio
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, parent.Close()) }()
-	var original PreparationSource
-	targets := make([]PreparationSource, 0, len(owner.Files)-1)
+	originals := map[string]PreparationSource{}
+	targets := make([]PreparationSource, 0, len(owner.Files))
 	for _, member := range owner.Files {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -124,66 +153,77 @@ func preparePhysicalMetadata(ctx context.Context, admission *preparationAdmissio
 			return err
 		}
 		source := PreparationSource{File: member, Path: path, Identity: identity}
-		if member.Path == owner.PhysicalMetadata.Path {
-			original = source
+		if preparationMetadataOwns(owner.PhysicalMetadata, member.Path) {
+			originals[member.Path] = source
 		} else {
 			targets = append(targets, source)
 		}
 	}
-	raw, err := preparationReadOriginalMetadata(ctx, original, owner.PhysicalMetadata.MaximumBytes)
-	if err != nil {
-		return err
-	}
-	derived, err := adapter.RebindRestore(ctx, owner, report, raw, targets)
-	if err := errors.Join(err, ctx.Err()); err != nil {
-		return err
-	}
-	if len(derived) == 0 || uint64(len(derived)) > owner.PhysicalMetadata.MaximumBytes {
-		return errors.New("derived physical metadata exceeds its fixed runtime capacity")
-	}
-	if err := admission.check(); err != nil {
-		return err
-	}
-	backup := preparationOriginalMetadataPath(admission.request, owner)
-	staging := admission.directories[admission.request.StagingDirectory]
-	if err := preparationRenameRoot(parent, owner.PhysicalMetadata.Path, staging, filepath.Base(backup)); err != nil {
-		return err
-	}
-	original.Path = backup
-	if _, err := preparationReadOriginalMetadata(ctx, original, owner.PhysicalMetadata.MaximumBytes); err != nil {
-		return err
-	}
-	fd, err := syscall.Openat(int(parent.Fd()), owner.PhysicalMetadata.Path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
-	if err != nil {
-		return err
-	}
-	file := os.NewFile(uintptr(fd), filepath.Join(parentPath, owner.PhysicalMetadata.Path))
-	defer func() { resultErr = errors.Join(resultErr, file.Close()) }()
-	for offset := 0; offset < len(derived); {
-		if err := ctx.Err(); err != nil {
+	derivedBytes := map[string][]byte{}
+	for _, path := range preparationMetadataPaths(owner.PhysicalMetadata) {
+		raw, err := preparationReadOriginalMetadata(ctx, originals[path], owner.PhysicalMetadata.MaximumBytes)
+		if err != nil {
 			return err
 		}
-		part := derived[offset:min(offset+64*1024, len(derived))]
-		n, err := file.Write(part)
-		if err != nil || n != len(part) {
-			return errors.Join(err, io.ErrShortWrite)
+		derived, err := adapter.RebindRestore(ctx, owner, report, raw, targets)
+		if err := errors.Join(err, ctx.Err()); err != nil {
+			return err
 		}
-		offset += n
+		if len(derived) == 0 || uint64(len(derived)) > owner.PhysicalMetadata.MaximumBytes {
+			return errors.New("derived physical metadata exceeds its fixed runtime capacity")
+		}
+		derivedBytes[path] = derived
 	}
-	if err := errors.Join(file.Sync(), parent.Sync(), staging.Sync(), sameNamedFile(file, file.Name()), admission.check()); err != nil {
-		return err
-	}
+	// Both transformations finish before moving either original. The two
+	// retained buffers are independently bounded, never sized by disk input.
 	owner.Files = append([]PreparationFile(nil), owner.Files...)
-	var derivedFile PreparationFile
-	for fileIndex := range owner.Files {
-		if owner.Files[fileIndex].Path == owner.PhysicalMetadata.Path {
-			owner.Files[fileIndex].Bytes = uint64(len(derived))
-			owner.Files[fileIndex].Sha256 = preparationDigest(derived)
-			derivedFile = owner.Files[fileIndex]
+	for _, path := range preparationMetadataPaths(owner.PhysicalMetadata) {
+		original, derived := originals[path], derivedBytes[path]
+		if err := admission.check(); err != nil {
+			return err
 		}
+		backup := preparationOriginalMetadataMemberPath(admission.request, owner, path)
+		staging := admission.directories[admission.request.StagingDirectory]
+		if err := preparationRenameRoot(parent, path, staging, filepath.Base(backup)); err != nil {
+			return err
+		}
+		original.Path = backup
+		if _, err := preparationReadOriginalMetadata(ctx, original, owner.PhysicalMetadata.MaximumBytes); err != nil {
+			return err
+		}
+		if err := func() (writeErr error) {
+			fd, err := syscall.Openat(int(parent.Fd()), path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
+			if err != nil {
+				return err
+			}
+			file := os.NewFile(uintptr(fd), filepath.Join(parentPath, path))
+			defer func() { writeErr = errors.Join(writeErr, file.Close()) }()
+			for offset := 0; offset < len(derived); {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				part := derived[offset:min(offset+64*1024, len(derived))]
+				n, err := file.Write(part)
+				if err != nil || n != len(part) {
+					return errors.Join(err, io.ErrShortWrite)
+				}
+				offset += n
+			}
+			return errors.Join(file.Sync(), parent.Sync(), staging.Sync(), sameNamedFile(file, file.Name()), admission.check())
+		}(); err != nil {
+			return err
+		}
+		var derivedFile PreparationFile
+		for fileIndex := range owner.Files {
+			if owner.Files[fileIndex].Path == path {
+				owner.Files[fileIndex].Bytes = uint64(len(derived))
+				owner.Files[fileIndex].Sha256 = preparationDigest(derived)
+				derivedFile = owner.Files[fileIndex]
+			}
+		}
+		plan.Derivations = append(plan.Derivations, PreparationDerivation{OwnerIndex: index, Original: original, Derived: derivedFile})
 	}
 	plan.Owners[index] = owner
-	plan.Derivations = append(plan.Derivations, PreparationDerivation{OwnerIndex: index, Original: original, Derived: derivedFile})
 	return nil
 }
 
@@ -213,26 +253,40 @@ func preparationMoveSources(plan PreparationPlan) map[string]PreparationSource {
 // Accepted derivation replays the fixed pure transformation over the retained
 // original census and reviewed member identities. No runtime alias is added.
 func validatePhysicalMetadataDerivations(ctx context.Context, request PreparationRequest, plan PreparationPlan, adapter PreparationAdapter, report Inventory) error {
-	derivations := map[int]PreparationDerivation{}
+	derivations := map[int]map[string]PreparationDerivation{}
 	for _, derivation := range plan.Derivations {
-		if _, present := derivations[derivation.OwnerIndex]; present || derivation.OwnerIndex < 0 || derivation.OwnerIndex >= len(plan.Owners) {
+		if derivation.OwnerIndex < 0 || derivation.OwnerIndex >= len(plan.Owners) {
 			return errors.New("physical metadata derivation owner is invalid or repeated")
 		}
-		derivations[derivation.OwnerIndex] = derivation
+		if derivations[derivation.OwnerIndex] == nil {
+			derivations[derivation.OwnerIndex] = map[string]PreparationDerivation{}
+		}
+		path := derivation.Original.File.Path
+		if _, present := derivations[derivation.OwnerIndex][path]; present {
+			return errors.New("physical metadata derivation owner is invalid or repeated")
+		}
+		derivations[derivation.OwnerIndex][path] = derivation
 	}
 	for index, owner := range plan.Owners {
 		if err := validatePreparationPhysicalMetadata(request, owner); err != nil {
 			return err
 		}
-		derivation, derived := derivations[index]
+		derived := derivations[index]
 		if owner.PhysicalMetadata == nil {
-			if derived {
+			if len(derived) != 0 {
 				return errors.New("ordinary preparation cannot acquire a physical metadata rewrite")
 			}
 			continue
 		}
-		if !derived || adapter.RebindRestore == nil || derivation.Original.Path != preparationOriginalMetadataPath(request, owner) || derivation.Original.File.Path != owner.PhysicalMetadata.Path || derivation.Derived.Path != owner.PhysicalMetadata.Path {
+		paths := preparationMetadataPaths(owner.PhysicalMetadata)
+		if len(derived) != len(paths) || adapter.RebindRestore == nil {
 			return errors.New("physical metadata lost original derivation lineage")
+		}
+		for _, path := range paths {
+			derivation, present := derived[path]
+			if !present || derivation.Original.Path != preparationOriginalMetadataMemberPath(request, owner, path) || derivation.Derived.Path != path {
+				return errors.New("physical metadata lost original derivation lineage")
+			}
 		}
 		expected, err := adapter.Restore(ctx, owner.StagingName, owner.Owner, report)
 		if err != nil {
@@ -243,35 +297,39 @@ func validatePhysicalMetadataDerivations(ctx context.Context, request Preparatio
 		}
 		originalOwner := expected
 		expected.Files = append([]PreparationFile(nil), expected.Files...)
-		found := false
+		found := 0
 		for fileIndex, file := range expected.Files {
-			if file.Path == owner.PhysicalMetadata.Path {
+			if preparationMetadataOwns(owner.PhysicalMetadata, file.Path) {
+				derivation := derived[file.Path]
 				if file != derivation.Original.File {
 					return errors.New("original physical metadata differs from its exported authority")
 				}
 				expected.Files[fileIndex] = derivation.Derived
-				found = true
+				found++
 			}
 		}
-		if !found || !reflect.DeepEqual(expected, owner) {
+		if found != len(paths) || !reflect.DeepEqual(expected, owner) {
 			return errors.New("physical derivation changed a signed member or unrelated owner field")
 		}
-		raw, err := preparationReadOriginalMetadata(ctx, derivation.Original, owner.PhysicalMetadata.MaximumBytes)
-		if err != nil {
-			return err
-		}
-		targets := make([]PreparationSource, 0, len(owner.Files)-1)
+		targets := make([]PreparationSource, 0, len(owner.Files)-len(paths))
 		for _, source := range plan.Sources {
-			if filepath.Base(filepath.Dir(source.Path)) == owner.StagingName && source.File.Path != owner.PhysicalMetadata.Path {
+			if filepath.Base(filepath.Dir(source.Path)) == owner.StagingName && !preparationMetadataOwns(owner.PhysicalMetadata, source.File.Path) {
 				targets = append(targets, source)
 			}
 		}
-		derivedRaw, err := adapter.RebindRestore(ctx, originalOwner, report, raw, targets)
-		if err := errors.Join(err, ctx.Err()); err != nil {
-			return err
-		}
-		if uint64(len(derivedRaw)) != derivation.Derived.Bytes || len(derivedRaw) == 0 || uint64(len(derivedRaw)) > owner.PhysicalMetadata.MaximumBytes || preparationDigest(derivedRaw) != derivation.Derived.Sha256 {
-			return errors.Join(ErrIdentity, errors.New("physical metadata derivation no longer matches the reviewed result"))
+		for _, path := range paths {
+			derivation := derived[path]
+			raw, err := preparationReadOriginalMetadata(ctx, derivation.Original, owner.PhysicalMetadata.MaximumBytes)
+			if err != nil {
+				return err
+			}
+			derivedRaw, err := adapter.RebindRestore(ctx, originalOwner, report, raw, targets)
+			if err := errors.Join(err, ctx.Err()); err != nil {
+				return err
+			}
+			if uint64(len(derivedRaw)) != derivation.Derived.Bytes || len(derivedRaw) == 0 || uint64(len(derivedRaw)) > owner.PhysicalMetadata.MaximumBytes || preparationDigest(derivedRaw) != derivation.Derived.Sha256 {
+				return errors.Join(ErrIdentity, errors.New("physical metadata derivation no longer matches the reviewed result"))
+			}
 		}
 	}
 	return nil
