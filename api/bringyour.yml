@@ -641,6 +641,13 @@ paths:
     post:
       description: |
         Send password reset code to email or phone number.
+
+        With `result_errors` set, a reset code that was not sent is reported
+        in the result `error` (`verify_send_failed`, or `verify_rate_limited`
+        with `retry_after_seconds`). Without it, a rate limit is a 429 and a
+        failed send is a 502, both with a plain text body. Clients must not
+        report a reset code as sent unless the response is a 200 without
+        `error`.
       operationId: Auth Password Reset
       security: []
       requestBody:
@@ -656,6 +663,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthPasswordResetResult"
+        "429":
+          description: Too many attempts (requests without `result_errors`). Plain text body.
+          headers:
+            Retry-After:
+              description: Seconds until a new reset code can be requested.
+              schema:
+                type: integer
+        "502":
+          description: The reset code could not be sent (requests without `result_errors`). Plain text body.
 
   /auth/password-set:
     post:
@@ -6334,6 +6350,11 @@ components:
         user_auth:
           description: email or phone number
           type: string
+        result_errors:
+          description: |
+            Report a reset code that was not sent in the result `error` with a
+            200, instead of a 429 or 502. New clients set this.
+          type: boolean
 
     AuthPasswordResetResult:
       type: object
@@ -6343,6 +6364,9 @@ components:
         user_auth:
           description: email or phone number
           type: string
+        error:
+          description: Present when the reset code was not sent (only with `result_errors`).
+          $ref: "#/components/schemas/AuthVerifySendError"
 
     AuthPasswordSetArgs:
       type: object
