@@ -36,12 +36,15 @@ jobs:
       # The release SDK imports the root package for js/wasm. Exercise each
       # socket-buffer descriptor implementation: native Linux selects unix,
       # Windows selects its Handle implementation, and browser WASM selects
-      # the deliberate no-socket fallback.
+      # the deliberate no-socket fallback. protocol and emoji are the other
+      # connect packages sdk/js imports. vet compiles the js test package too.
+      # TestPlatformBuildVariantsCompile repeats this inside go test.
       - name: Build root package platform variants
         run: |
-          GOOS=darwin GOARCH=arm64 go build .
-          GOOS=windows GOARCH=amd64 go build .
-          GOOS=js GOARCH=wasm GOEXPERIMENT=greenteagc go build .
+          GOOS=darwin GOARCH=arm64 go build . ./protocol ./emoji
+          GOOS=windows GOARCH=amd64 go build . ./protocol ./emoji
+          GOOS=js GOARCH=wasm GOEXPERIMENT=greenteagc go build . ./protocol ./emoji
+          GOOS=js GOARCH=wasm GOEXPERIMENT=greenteagc go vet .
 
       # The js-only tests (*_js_test.go) run under node. The exec wrapper keeps
       # net/http on fetch (stock go_js_wasm_exec disables it under node) so
