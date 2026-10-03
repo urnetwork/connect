@@ -1,3 +1,5 @@
+//go:build !js
+
 package connect
 
 // FLIGHTGATEFIX §20.3. The fast path's reverse lane carries the peer's own

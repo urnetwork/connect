@@ -1,3 +1,5 @@
+//go:build !js
+
 package connect
 
 // icmp memory budget validation (see ICMP.md). The provider byte-cost model

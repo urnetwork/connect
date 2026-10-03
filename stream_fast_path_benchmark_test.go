@@ -1,3 +1,5 @@
+//go:build !js
+
 // This file compares the compact datagram path with the current WebRTC route
 // and measures both serial aggregate work and independently running hop stages.
 package connect
