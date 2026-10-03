@@ -119,7 +119,7 @@ func TestSyntaxWorkflowRunsEveryFuzzTarget(t *testing.T) {
 // where the whole point is to block the commit.
 func TestSyntaxWorkflowGatesRatherThanReports(t *testing.T) {
 	workflow := readSyntaxWorkflow(t)
-	for _, needle := range []string{"push:", "pull_request:", "beta/message"} {
+	for _, needle := range []string{"push:", "pull_request:", "- main"} {
 		if !strings.Contains(workflow, needle) {
 			t.Errorf("the syntax workflow is missing %q, so it does not run on the branch this work is on", needle)
 		}
