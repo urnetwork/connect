@@ -7425,12 +7425,22 @@ components:
     WalletCircleTransferOutArgs:
       type: object
       required:
+        - request_id
+        - to_address
+        - amount_usdc_nano_cents
         - terms
       properties:
+        request_id:
+          type: string
+          format: uuid
+          description: Caller-generated operation identity. Persist with the exact transfer intent before the first call and reuse unchanged for every retry, including after application restart. A distinct intended transfer requires a new id. Missing ids are refused; the server never invents a replacement.
         to_address:
           type: string
         amount_usdc_nano_cents:
           type: integer
+          minimum: 1000
+          multipleOf: 1000
+          description: Positive exact USDC amount, with one dollar represented by 1000000000. Values not representable with six decimals are refused.
         terms:
           description: user consent to accept terms of transfer
           type: boolean
@@ -7439,6 +7449,13 @@ components:
       type: object
       required: []
       properties:
+        request_id:
+          type: string
+          format: uuid
+        challenge_status:
+          type: string
+          enum: [PENDING, IN_PROGRESS, COMPLETE, FAILED, EXPIRED]
+          description: Status of the original retained user-confirmation challenge. COMPLETE is not a payment settlement or transfer receipt. Known challenges are observed without another transfer submission.
         user_token:
           type: object
           required:
