@@ -22,6 +22,9 @@ package connect
 //     levin packet limit.
 //   - RakNet (MessageIdentifiers.h, RakPeer.cpp): an offline message (unconnected
 //     ping, open connection request 1 or 2) carrying the 16-byte offline magic.
+//   - Ethereum devp2p discovery v4 and RLPx: a keccak256 hash over the packet,
+//     and an on-curve secp256k1 ephemeral key in a length-exact auth message
+//     (ip_security_appstandard_ethereum.go).
 //
 // The Noise "WA" framing used by WhatsApp on 5222 is not implemented: its bytes
 // must be confirmed against a capture first (IPSECURITY-UPDATE4 6.2).
@@ -49,16 +52,22 @@ type AppStandardSettings struct {
 	Rtmp      bool
 	Levin     bool
 	RakNet    bool
+	// devp2p discovery v4 (udp)
+	EthereumDiscv4 bool
+	// devp2p RLPx auth (tcp)
+	EthereumRlpx bool
 }
 
 func DefaultAppStandardSettings() *AppStandardSettings {
 	return &AppStandardSettings{
-		Enabled:   true,
-		WireGuard: true,
-		OpenVpn:   true,
-		Rtmp:      true,
-		Levin:     true,
-		RakNet:    true,
+		Enabled:        true,
+		WireGuard:      true,
+		OpenVpn:        true,
+		Rtmp:           true,
+		Levin:          true,
+		RakNet:         true,
+		EthereumDiscv4: true,
+		EthereumRlpx:   true,
 	}
 }
 
@@ -141,7 +150,8 @@ func (self *appStandardDetector) enabled() bool {
 
 // match recognizes a single-packet application standard. first is true for
 // the flow's first payload-bearing packet; the TCP detectors only match there.
-// It returns the reason and the offset where the recognized header ends.
+// payload is the complete payload, since the Ethereum invariants cover every
+// byte. It returns the reason and the offset where the recognized header ends.
 func (self *appStandardDetector) match(ipPath *IpPath, payload []byte, first bool) (SecurityPolicyReason, int, bool) {
 	if !self.enabled() {
 		return SecurityPolicyReasonUnknown, 0, false
@@ -157,10 +167,20 @@ func (self *appStandardDetector) match(ipPath *IpPath, payload []byte, first boo
 		if self.settings.Levin && isLevinHead(payload) {
 			return SecurityPolicyReasonAllowLevin, levinHeadLength, true
 		}
+		if self.settings.EthereumRlpx {
+			if headerEnd, ok := ethereumRlpxAuth(payload); ok {
+				return SecurityPolicyReasonAllowEthereumRlpx, headerEnd, true
+			}
+		}
 	case IpProtocolUdp:
 		if self.settings.RakNet {
 			if headerEnd, ok := rakNetOfflineMessage(payload); ok {
 				return SecurityPolicyReasonAllowRakNet, headerEnd, true
+			}
+		}
+		if self.settings.EthereumDiscv4 {
+			if headerEnd, ok := ethereumDiscv4Packet(payload); ok {
+				return SecurityPolicyReasonAllowEthereumDiscv4, headerEnd, true
 			}
 		}
 	}

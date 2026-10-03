@@ -18,10 +18,15 @@ payload, parsed with `ParseIpPathWithPayload`, a SYN first for TCP).
 These fixtures are **synthesized from public protocol specifications, not
 captured from real apps**. Each fixture's `provenance` field names the facts it
 encodes (WireGuard whitepaper, OpenVPN protocol, Adobe RTMP 1.0, Monero
-`levin_base.h`, RakNet `MessageIdentifiers.h`, the BitTorrent BEPs, RFC 8446).
+`levin_base.h`, RakNet `MessageIdentifiers.h`, devp2p `discv4.md`/`rlpx.md`
+and EIP-8, the BitTorrent BEPs, RFC 8446).
 Fields that are random on the wire (keys, ciphertext, padding, ids) are a
 SHA-256 counter stream keyed by the fixture name, so the files are
-reproducible:
+reproducible. The Ethereum fixtures are complete protocol instances built from
+that stream: the discv4 packets carry real keccak256 hashes and deterministic
+(RFC 6979) secp256k1 signatures from a stream-derived key, and the RLPx auth is
+genuinely ECIES-encrypted to a stream-derived recipient key. Endpoint fields in
+the discv4 packets are RFC 5737 documentation addresses:
 
     go run testdata/ipsecurity/generate.go
 

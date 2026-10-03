@@ -108,6 +108,9 @@ func TestSecurityPolicyReasonsAttributeEachRule(t *testing.T) {
 		{fixture: "monero-rpc-http", reason: SecurityPolicyReasonAllowHttp},
 		{fixture: "bittorrent-tcp-51413", reason: SecurityPolicyReasonBittorrent},
 		{fixture: "raknet-open-connection-zero-padded", reason: SecurityPolicyReasonAllowRakNet},
+		{fixture: "ethereum-discv4", reason: SecurityPolicyReasonAllowEthereumDiscv4},
+		{fixture: "ethereum-rlpx-eip8", reason: SecurityPolicyReasonAllowEthereumRlpx},
+		{fixture: "ethereum-rlpx-off-curve", reason: SecurityPolicyReasonDropEncrypted},
 	}
 	for i, c := range cases {
 		stats := DefaultSecurityPolicyStatsCollector()

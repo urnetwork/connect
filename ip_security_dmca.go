@@ -14,8 +14,8 @@ package connect
 //   - a positive, plaintext BitTorrent signature  -> Incident (report) + Drop
 //   - an initial payload that looks fully encrypted/random AND is NOT a
 //     whitelisted standard (TLS, DTLS, QUIC, STUN/TURN, RTP/RTCP), an
-//     application standard (WireGuard, OpenVPN, RTMP, Levin, RakNet), or an
-//     exact provider-scoped gaming endpoint -> Drop
+//     application standard (WireGuard, OpenVPN, RTMP, Levin, RakNet, Ethereum
+//     discovery v4 or RLPx), or an exact provider-scoped gaming endpoint -> Drop
 //   - anything else (plaintext unknown protocol, a sanctioned standard/provider
 //     endpoint, or budget exhausted without a hit) -> Allow
 //
@@ -87,8 +87,9 @@ type DmcaSecurityPolicySettings struct {
 	Gaming *GamingSecurityPolicySettings
 
 	// App configures the positive application-standard detectors (WireGuard,
-	// OpenVPN, RTMP, Levin, RakNet). They are evaluated after the BitTorrent
-	// signatures, the gaming exceptions and the web standards. Nil disables them.
+	// OpenVPN, RTMP, Levin, RakNet, Ethereum discovery v4 and RLPx). They are
+	// evaluated after the BitTorrent signatures, the gaming exceptions and the
+	// web standards. Nil disables them.
 	App *AppStandardSettings
 
 	// InspectPrivilegedSignatures checks the stateless BitTorrent signatures on
@@ -362,10 +363,15 @@ func (self *dmcaFlowState) advance(
 		// work below.
 		return self.setTerminal(dmcaAllow, reason)
 	}
-	if reason, headerEnd, ok := app.match(ipPath, b, 1 == self.inspectedPackets); ok {
-		// a single-packet application standard. The bytes it carries after the
-		// recognized header must not hide a BitTorrent payload.
-		if containsBittorrentSignature(b[headerEnd:]) {
+	if reason, headerEnd, ok := app.match(ipPath, payload, 1 == self.inspectedPackets); ok {
+		// a single-packet application standard, matched over the complete payload
+		// (the Ethereum invariants cover every byte). The bytes it carries after
+		// the recognized header must not hide a BitTorrent payload.
+		rest := payload[headerEnd:]
+		if settings.MaxInspectionPayload < len(rest) {
+			rest = rest[:settings.MaxInspectionPayload]
+		}
+		if containsBittorrentSignature(rest) {
 			return self.setTerminal(dmcaBittorrent, SecurityPolicyReasonBittorrent)
 		}
 		return self.allowAppStandard(reason, settings)
