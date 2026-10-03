@@ -15,10 +15,14 @@ import (
 // Conservative actual wire records bound all legal inode/sequence widths and
 // each adapter's fixed maximum checkpoint. Unknown eventual bytes may vary in
 // value, but []byte encodes at a fixed base64 length in the retained intent.
-func preparationControlCapacity(ctx context.Context, request PreparationRequest, plan PreparationPlan) error {
+func preparationControlCapacity(ctx context.Context, request PreparationRequest, plan PreparationPlan, cohortCapacity ...*uint64) error {
 	identity := PreparationIdentity{Device: ^uint64(0), Inode: ^uint64(0), Mode: ^uint32(0), Uid: ^uint32(0), Gid: ^uint32(0)}
 	digest := "sha256:" + strings.Repeat("f", 64)
-	header, err := json.Marshal(preparationControlHeader{Schema: preparationControlSchema, PlanSha256: digest, Root: identity, Control: identity})
+	headerValue := preparationControlHeader{Schema: preparationControlSchema, PlanSha256: digest, Root: identity, Control: identity}
+	if len(cohortCapacity) != 0 {
+		headerValue.CohortSha256 = digest
+	}
+	header, err := json.Marshal(headerValue)
 	if err != nil {
 		return err
 	}
@@ -91,6 +95,9 @@ func preparationControlCapacity(ctx context.Context, request PreparationRequest,
 		if err := reserve(preparationStep{Kind: "file", Path: metadata.path, Mode: 0600, Bytes: uint64(len(metadata.raw)), Sha256: digest, Raw: metadata.raw}); err != nil {
 			return err
 		}
+	}
+	if len(cohortCapacity) == 1 && cohortCapacity[0] != nil {
+		*cohortCapacity[0] = used
 	}
 	return ctx.Err()
 }

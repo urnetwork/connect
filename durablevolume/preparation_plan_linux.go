@@ -93,14 +93,24 @@ func (self PreparationRequest) validate(scope ownerScope) error {
 		}
 	}
 	limit := self.Limits
+	maximumOwners, maximumOwnerAttributes := 32, uint64(128)
+	switch self.CapacityProfile {
+	case "":
+	case "urnetwork-preparation-many-owners-v1":
+		// Counts are explicit opt-in bounds, not a larger allocation or a
+		// bypass of the request, plan, per-attribute or control byte limits.
+		maximumOwners, maximumOwnerAttributes = 2048, 2048
+	default:
+		return errors.New("storage preparation capacity profile is unsupported")
+	}
 	maximumEntries := uint64(10000)
 	if self.Purpose == "restore" {
 		maximumEntries = MaximumPhysicalInventoryEntries
 	}
 	if limit.MaxEntries == 0 || limit.MaxEntries > maximumEntries || limit.MaxBytes == 0 || limit.MaxBytes > 1024*1024*1024*1024 ||
-		limit.MaxDepth == 0 || limit.MaxDepth > 16 || limit.MaxOwnerAttributes == 0 || limit.MaxOwnerAttributes > 128 ||
-		limit.MaxOwnerAttributeBytes == 0 || limit.MaxOwnerAttributeBytes > 128*4096 || limit.MaxPlanBytes < 4096 || limit.MaxPlanBytes > maximumPreparationPlanBytes ||
-		len(self.Owners) == 0 || len(self.Owners) > 32 {
+		limit.MaxDepth == 0 || limit.MaxDepth > 16 || limit.MaxOwnerAttributes == 0 || limit.MaxOwnerAttributes > maximumOwnerAttributes ||
+		limit.MaxOwnerAttributeBytes == 0 || limit.MaxOwnerAttributeBytes > maximumOwnerAttributes*4096 || limit.MaxPlanBytes < 4096 || limit.MaxPlanBytes > maximumPreparationPlanBytes ||
+		len(self.Owners) == 0 || len(self.Owners) > maximumOwners {
 		return errors.New("storage preparation capacities are absent or exceed the finite profile")
 	}
 	// Reuse daemon/owner-local declaration validation without enrolling any
@@ -234,6 +244,12 @@ func (self *preparationAdmission) facts() (Mount, Filesystem, error) {
 // Every parent remains precreated. A missing target is admitted only by the
 // explicit create-private profile and exact staged source, never runtime fallback.
 func openPreparationAdmission(ctx context.Context, request PreparationRequest, host Host, scope ownerScope, rootSource string) (_ *preparationAdmission, resultErr error) {
+	return openPreparationAdmissionWithParents(ctx, request, host, scope, rootSource, nil)
+}
+
+// A synchronous cohort may share the same retained private-parent description
+// for sibling root moves. Duplicates share its flock; unrelated owners do not.
+func openPreparationAdmissionWithParents(ctx context.Context, request PreparationRequest, host Host, scope ownerScope, rootSource string, sharedParents map[string]*os.File) (_ *preparationAdmission, resultErr error) {
 	if ctx == nil || host == nil {
 		return nil, errors.New("preparation context and host are required")
 	}
@@ -254,7 +270,18 @@ func openPreparationAdmission(ctx context.Context, request PreparationRequest, h
 		if self.directories[path] != nil {
 			continue
 		}
-		file, err := openPhysicalDirectory(path)
+		var file *os.File
+		var err error
+		if original := sharedParents[path]; original != nil {
+			var fd int
+			fd, err = syscall.Dup(int(original.Fd()))
+			if err == nil {
+				syscall.CloseOnExec(fd)
+				file = os.NewFile(uintptr(fd), path)
+			}
+		} else {
+			file, err = openPhysicalDirectory(path)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -298,6 +325,12 @@ func openPreparationAdmission(ctx context.Context, request PreparationRequest, h
 	}
 	if err := self.check(); err != nil {
 		return nil, err
+	}
+	if sharedParents != nil && request.RootCreation == "create-private" {
+		parentPath := filepath.Dir(request.RootPath)
+		if sharedParents[parentPath] == nil {
+			sharedParents[parentPath] = self.directories[parentPath]
+		}
 	}
 	return self, nil
 }
@@ -669,6 +702,12 @@ func preparationOpenAbsolute(path string, directory bool) (*os.File, error) {
 // Hash work is chunked and exactly bounded, including detection of appended
 // bytes. The caller independently retains/rechecks the named inode.
 func preparationVerifyFile(ctx context.Context, file *os.File, size uint64, digest string) error {
+	return preparationVerifyFileWithRead(ctx, file, size, digest, nil)
+}
+
+// The optional observer reports actual bytes read and cannot supply data or
+// change an admission verdict. Ordinary callers do not install an observer.
+func preparationVerifyFileWithRead(ctx context.Context, file *os.File, size uint64, digest string, read func(int)) error {
 	var before, after syscall.Stat_t
 	if err := syscall.Fstat(int(file.Fd()), &before); err != nil {
 		return unavailableObservation("preparation file size could not be observed", err)
@@ -684,6 +723,9 @@ func preparationVerifyFile(ctx context.Context, file *os.File, size uint64, dige
 		}
 		part := buffer[:min(uint64(len(buffer)), size-offset)]
 		n, err := file.ReadAt(part, int64(offset))
+		if read != nil && n > 0 {
+			read(n)
+		}
 		if err != nil || n != len(part) {
 			return errors.Join(unavailableObservation("preparation exact file read failed", err), io.ErrUnexpectedEOF)
 		}

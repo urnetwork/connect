@@ -445,7 +445,7 @@ func (self *preparationRestoreArchive) walk(enroll bool) error {
 
 // The complete selected mount and root name remain the same before and after
 // cold source copying; observation failures do not assert proven custody loss.
-func (self *preparationRestoreArchive) check() error {
+func (self *preparationRestoreArchive) checkRoot() error {
 	if err := errors.Join(self.ctx.Err(), sameNamedFile(self.root, self.path)); err != nil {
 		return err
 	}
@@ -456,7 +456,49 @@ func (self *preparationRestoreArchive) check() error {
 	if actual != self.mount {
 		return errors.Join(ErrIdentity, errors.New("restore archive mount generation changed"))
 	}
+	return nil
+}
+
+// A full member/attribute census is separate from the constant-size root
+// checks used during target publication. It never rereads immutable payloads.
+func (self *preparationRestoreArchive) check() error {
+	if err := self.checkRoot(); err != nil {
+		return err
+	}
 	return self.walk(false)
+}
+
+// Apply cannot substitute its staged copy for lost original archive custody.
+// Hash each copied original once at admission, under its retained source flock,
+// and keep its names, physical generation and owner attributes until close.
+func (self *preparationRestoreArchive) authenticate(hooks *preparationHooks) error {
+	for _, entry := range self.inventory.Entries {
+		if entry.Kind != "file" {
+			continue
+		}
+		file, err := self.open(entry.Path, false)
+		if err != nil {
+			return err
+		}
+		var read func(int)
+		if hooks != nil && hooks.sourceRead != nil {
+			read = func(n int) { hooks.sourceRead(filepath.Join(self.path, entry.Path), n) }
+		}
+		readErr := preparationVerifyFileWithRead(self.ctx, file, entry.Size, entry.Sha256, read)
+		if err := errors.Join(readErr, file.Close()); err != nil {
+			return err
+		}
+	}
+	return self.check()
+}
+
+// Completed target progress remains usable only with the same reviewed source.
+// This check is deliberately outside per-member mutation loops.
+func (self *preparationApply) checkRestore() error {
+	if self.archive == nil {
+		return nil
+	}
+	return self.archive.check()
 }
 
 // Staging copies only complete, reviewed payloads and never old physical
