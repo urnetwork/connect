@@ -1,3 +1,5 @@
+//go:build !js
+
 // Tracks pooled ownership across complete client and fixture-worker lifecycles.
 // Exact-owner barriers distinguish late callback handoffs from sampling noise.
 package connect

@@ -1,3 +1,5 @@
+//go:build !js
+
 package connect
 
 // Deterministic reproductions of the fast-path mechanisms in

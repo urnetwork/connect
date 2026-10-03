@@ -1,3 +1,5 @@
+//go:build !js
+
 package connect
 
 // Deterministic pin for the closed-conn signal-delivery contract: a peerConn

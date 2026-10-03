@@ -1,3 +1,5 @@
+//go:build !js
+
 // Exact lifecycle regressions cover callback admission, context callbacks,
 // transport drains, and pooled-owner rejection at shutdown.
 package connect

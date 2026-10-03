@@ -1,3 +1,5 @@
+//go:build !js
+
 // Tests pin path-independent destination routing, receiver-visible lane keys,
 // acknowledgement routing, and teardown ordering around stream fast paths.
 package connect
