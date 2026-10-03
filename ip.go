@@ -8597,6 +8597,12 @@ func (self *RemoteUserNatProvider) SecurityPolicyStats(reset bool) SecurityPolic
 	return self.securityPolicy.Stats().Stats(reset)
 }
 
+// SecurityPolicyReasons returns the verdict-reason counts per port for the
+// remote clients' traffic this provider inspected.
+func (self *RemoteUserNatProvider) SecurityPolicyReasons(reset bool) SecurityPolicyReasonStats {
+	return self.securityPolicy.Stats().Reasons(reset)
+}
+
 // PacketStats returns the cumulative packet counts relayed for remote clients.
 // remote ingress is traffic received from the tunnel (remote clients' egress),
 // remote egress is the return traffic sent back into the tunnel, and blocked is
@@ -10158,6 +10164,11 @@ func (self *RemoteUserNatClient) DestinationIds() []Id {
 
 func (self *RemoteUserNatClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
 	return self.securityPolicy.Stats().Stats(reset)
+}
+
+// SecurityPolicyReasons returns the egress verdict-reason counts per port.
+func (self *RemoteUserNatClient) SecurityPolicyReasons(reset bool) SecurityPolicyReasonStats {
+	return self.securityPolicy.Stats().Reasons(reset)
 }
 
 // `SendPacketFunction`

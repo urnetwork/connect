@@ -98,6 +98,33 @@ internet:
 - `RemoteUserNatClient.SendPacket`, `RemoteUserNatMultiClient.SendPacket`
   (`ip.go`, `ip_remote_multi_client.go`) — a client emitting toward a provider.
 
+#### 2.4.1 Client handling of a Drop
+
+The policy allows a flow while it is inspecting (§4.1), so on the client the
+first packets of a flow have already gone to a provider when the encrypted
+heuristic drops it. `RemoteUserNatMultiClient.securityRoute` therefore:
+
+- **Fails fast.** When the packet that decides `dropEncrypted` would move a
+  provider-routed flow elsewhere, it is blocked and the app is told: a TCP reset
+  (`deliverTcpPolicyReset`, as for SMTP rejects) or an ICMP port unreachable for
+  UDP (`icmpUnreachableForPolicyReject`: v4 type 3 code 3, v6 type 1 code 4).
+  This applies with the kill switch on or off: with it off, continuing the flow
+  from the device's own address cannot work for TCP and misleads UDP. A flow the
+  user already routes locally never reached a provider and is left alone.
+- **Hints the destination.** The (address, port, transport) is kept in a bounded
+  local cache (`PolicyHintTtl` 10 min, `PolicyHintMaxCount` 1024). Every later
+  packet to it is handled as that drop from its first packet: routed locally when
+  the local security bypass is on (kill switch off), so the app's retry works
+  outside the tunnel as the bypass promises; blocked and rejected at once when it
+  is off. An incident (BitTorrent, non-public destination) never creates a hint
+  and is never routed locally.
+- **Names the reason.** `BlockAction.Reason` is `security-encrypted`,
+  `security-bittorrent`, `security-port`, `security-ip`, `security-smtp`,
+  `security` (a custom policy), `blocker` or `override`, so the apps can label
+  blocks by the safety rules and offer the existing route-local override.
+
+None of this changes what a provider accepts or sends anything off the device.
+
 ### 2.5 Statistics
 
 `SecurityPolicyStatsCollector` accumulates outcome counts. Egress uses
@@ -631,6 +658,10 @@ implemented (IPSECURITY-UPDATE4 §6.5, §10).
   precedence over every detector, MSE/encrypted µTP still dropped (including the
   148-byte variant), privileged-port signatures, zero allocation and a fuzz target
   in `ip_security_appstandard_test.go`.
+- **Client fail fast:** `ip_remote_multi_client_policy_reject_test.go` (reset,
+  unreachable, retry routing, incidents never hinted) and
+  `ip_policy_hint_test.go` (hint ttl/bound with an injected clock, ICMPv6, block
+  action reasons, override and batch paths).
 - **Fixtures:** `ip_security_fixture_test.go` replays the packet fixtures in
   `testdata/ipsecurity/` (synthesized from protocol specifications; see its
   README) through `InspectEgress` as the multi-client send path does and checks

@@ -25,7 +25,7 @@ func TestBlockActionCollectorFlushReleasesEpochOwners(t *testing.T) {
 			collector.add(&blockActionDecision{
 				clusterKey: ip, clusterIps: []netip.Addr{ip},
 				clusterHosts: []string{fmt.Sprintf("epoch-%04d.example.test", i)},
-			}, false, false, nil, 1200)
+			}, false, false, nil, "", 1200)
 		}
 		owners := make([]weak.Pointer[blockActionAgg], 0, len(collector.agg))
 		for _, aggregate := range collector.agg {

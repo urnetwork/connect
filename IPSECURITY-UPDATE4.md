@@ -2,6 +2,11 @@
 
 Status: proposal (research complete, no code changed) · Scope: `connect` data plane security policy, with sdk/app follow-ups noted · Companion to `docs/IP_SECURITY.md` (the authoritative spec; this document proposes its next revision)
 
+Implementation status (branch `fix/ipsecurity-update4` in connect, sdk, localizations, android, apple, windows, linux):
+
+- **Implemented:** Phase 0 (verdict-reason statistics, `ip_security_reason.go`; the fixture harness, `testdata/ipsecurity` — synthesized from the Appendix A specifications, not captures); Phase 1 (`ip_security_appstandard.go`: WireGuard, OpenVPN, RTMP, Levin, RakNet) and the §6.3 privileged-port BitTorrent signatures; Phase 2 (fail fast with TCP reset / ICMP unreachable, the policy-local hint cache, `BlockAction.Reason`); the sdk reason surfacing and verbose reason table; the app labels and the kill-switch text.
+- **Not implemented:** the Noise "WA" detector (`NoiseIm`, gated on a capture that does not exist; no setting is shipped for it); §5 option B and the §6.5 curated-port quota (conditional on Phase 0 field data); §5 option D and every §10 open question (product/legal decisions); §9.3 rollout mitigations (a) and (b) — see the branch report: (a) needs a Phase 1 release version or hash to target and a per-flow placement preference inside the exit-selection machinery, (b) needs flow-level attribution of an aggregate per-source counter and cannot move a live TCP flow between exits, so neither can be done cleanly here; the `PacketStats` security/override split (not needed by the apps, which read `BlockAction.Reason`).
+
 Research basis: the code at connect `8c76f568` (2026-09-30), sdk `8f4d101d`, android `d1979043`, apple `b2fc0802`; the git history of `ip_security*.go`; and the factury support inbox (7,853 items, 20 tagged `site-or-app-blocked`). Inbox items are cited by directory name under `/Users/brien/urnetwork/factury/support/inbox/`.
 
 ---
@@ -279,7 +284,7 @@ In `RemoteUserNatMultiClient.SendPacket` (`ip_remote_multi_client.go:5945-6090`)
 
 Nothing in Phase 2 changes what a provider accepts or sends anywhere new: the RST/ICMP go to the local app; the hint cache is local; `BlockAction` already flows only to the local UI.
 
-### 6.5 Rejected for now: fan-out quota and provider opt-in tier
+### 6.5 Rejected for now: fan-out quota and provider opt-in tier (not implemented)
 
 See §5 B and D and §10. If Phase 0 shows a significant long tail that §6.2 does not cover, the curated-port variant of B is the fallback: allow `dmcaDropEncrypted`-classified flows only to a short list of IANA-registered ports owned by single-server protocols (Mosh 60000-61000, ZeroTier 9993, Mumble 64738) **and** only while the sender's distinct destinations on that port in the last hour are ≤ 2, implemented as a per-sender LRU set inside `dmcaDetector`. It must ship behind a default-off setting and after the stats from Phase 0 show what it would admit.
 
@@ -394,7 +399,7 @@ go test -fuzz FuzzAppStandardDetectors -fuzztime 60s ./
 
 ---
 
-## 10. Open questions
+## 10. Open questions (not implemented; decisions pending)
 
 1. **Roblox, WhatsApp 5222, X Spaces, Xbox/PSN/Switch/Genshin/Zoom**: which of these actually trip the heuristic on current code? Only Phase 0 captures can answer; the §3 table records the hypotheses. If Roblox's RakNet fork drops the zero padding, the RakNet detector covers it only if the magic survives; otherwise the Steam pattern (Roblox AS22697 prefixes × UDP 49152-65535) is the fallback (§5 H).
 2. **Ethereum and other many-peer encrypted protocols** are indistinguishable from encrypted BitTorrent at the flow level and have no plaintext header. Leave dropped, or revisit with option B's curated-port quota (30303 is a registered port)? The honest answer today is "dropped by design", which the spec should say explicitly.

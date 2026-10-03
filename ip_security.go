@@ -136,6 +136,49 @@ func inspectAndRefreshEgressForSenderBorrowed(
 	return inspectAndRefreshEgressBorrowed(policy, provideMode, ipPath, payload)
 }
 
+// detailedEgressSecurityPolicy is the in-package form of InspectEgress that also
+// names the deciding rule and whether this packet decided its flow. The client
+// uses it to fail fast on the first Drop of a flow. Custom policies do not
+// implement it and keep today's behavior (no reason, never decided now).
+type detailedEgressSecurityPolicy interface {
+	inspectEgressDetailed(
+		provideMode protocol.ProvideMode,
+		ipPath *IpPath,
+		payload []byte,
+	) (SecurityPolicyResult, securityDecision, error)
+	inspectAndRefreshEgressGroupDetailedBorrowed(
+		provideMode protocol.ProvideMode,
+		ipPaths []IpPath,
+		payloads [][]byte,
+	) (SecurityPolicyResult, securityDecision, error)
+}
+
+func inspectEgressDetailed(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	payload []byte,
+) (SecurityPolicyResult, securityDecision, error) {
+	if detailed, ok := policy.(detailedEgressSecurityPolicy); ok {
+		return detailed.inspectEgressDetailed(provideMode, ipPath, payload)
+	}
+	result, err := policy.InspectEgress(provideMode, ipPath, payload)
+	return result, securityDecision{}, err
+}
+
+func inspectAndRefreshEgressGroupDetailedBorrowed(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	payloads [][]byte,
+) (SecurityPolicyResult, securityDecision, error) {
+	if detailed, ok := policy.(detailedEgressSecurityPolicy); ok && 0 < len(ipPaths) && len(ipPaths) == len(payloads) {
+		return detailed.inspectAndRefreshEgressGroupDetailedBorrowed(provideMode, ipPaths, payloads)
+	}
+	result, err := inspectAndRefreshEgressGroupBorrowed(policy, provideMode, ipPaths, payloads)
+	return result, securityDecision{}, err
+}
+
 // Makes one conservative decision for a homogeneous packet group. Custom
 // policies retain their existing per-packet inspection API, so the fallback
 // calls it in order and folds the results before refreshing the flow once.

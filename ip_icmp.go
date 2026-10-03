@@ -933,3 +933,83 @@ func (self *IcmpSequence) Close() {
 func icmpEgressUnsupportedError(ipVersion int) error {
 	return fmt.Errorf("No icmp egress support for ip version %d on this platform.", ipVersion)
 }
+
+const (
+	icmp4TypeDestinationUnreachable = byte(3)
+	icmp4CodePortUnreachable        = byte(3)
+	icmp6TypeDestinationUnreachable = byte(1)
+	icmp6CodePortUnreachable        = byte(4)
+	// rfc 792 quotes the ip header and the first 8 transport bytes
+	icmp4UnreachableQuotedTransport = 8
+	// rfc 4443 2.4: an error must not exceed the minimum ipv6 mtu
+	icmp6MinMtu = 1280
+)
+
+// icmpUnreachableForPolicyReject returns a port-unreachable error addressed to
+// the source of a rejected UDP datagram, as if from its destination (v4 type 3
+// code 3 per rfc 792 quoting the ip header and 8 transport bytes; v6 type 1
+// code 4 per rfc 4443 quoting as much as fits in 1280 bytes). It returns nil
+// for anything that is not a complete UDP datagram, so an error is never sent
+// about an error. The returned packet is a pool buffer owned by the caller.
+func icmpUnreachableForPolicyReject(packet []byte) []byte {
+	if len(packet) == 0 {
+		return nil
+	}
+	ipVersion := int(packet[0] >> 4)
+	switch ipVersion {
+	case 4:
+		ipProtocol, sourceIp, destinationIp, transport, ok := parseIpv4(packet)
+		if !ok || ipProtocol != ipProtocolNumberUdp || len(transport) < UdpHeaderSize {
+			return nil
+		}
+		ipHeaderByteCount := int(packet[0]&0x0f) * 4
+		quoted := packet[:ipHeaderByteCount+min(len(transport), icmp4UnreachableQuotedTransport)]
+		reply := MessagePoolGet(Ipv4HeaderSizeWithoutExtensions + IcmpHeaderSize + len(quoted))
+		writeIpv4Header(reply, ipProtocolNumberIcmp4, destinationIp, sourceIp)
+		icmp := reply[Ipv4HeaderSizeWithoutExtensions:]
+		icmp[0] = icmp4TypeDestinationUnreachable
+		icmp[1] = icmp4CodePortUnreachable
+		clear(icmp[2:IcmpHeaderSize])
+		copy(icmp[IcmpHeaderSize:], quoted)
+		binary.BigEndian.PutUint16(icmp[2:4], checksumFinish(checksumAdd(0, icmp)))
+		return reply
+	case 6:
+		ipProtocol, sourceIp, destinationIp, transport, ok := parseIpv6(packet)
+		if !ok || ipProtocol != ipProtocolNumberUdp || len(transport) < UdpHeaderSize {
+			return nil
+		}
+		quotedByteCount := min(len(packet), icmp6MinMtu-Ipv6HeaderSize-IcmpHeaderSize)
+		reply := MessagePoolGet(Ipv6HeaderSize + IcmpHeaderSize + quotedByteCount)
+		writeIpv6Header(reply, ipProtocolNumberIcmp6, destinationIp, sourceIp)
+		icmp := reply[Ipv6HeaderSize:]
+		icmp[0] = icmp6TypeDestinationUnreachable
+		icmp[1] = icmp6CodePortUnreachable
+		clear(icmp[2:IcmpHeaderSize])
+		copy(icmp[IcmpHeaderSize:], packet[:quotedByteCount])
+		binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(ipProtocolNumberIcmp6, destinationIp, sourceIp, icmp))
+		return reply
+	default:
+		return nil
+	}
+}
+
+// deliverIcmpPolicyUnreachable hands a port-unreachable for a rejected UDP
+// datagram to the local receive callback. The datagram is borrowed.
+func deliverIcmpPolicyUnreachable(
+	receive ReceivePacketFunction,
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) {
+	unreachable := icmpUnreachableForPolicyReject(packet)
+	if unreachable == nil {
+		return
+	}
+	defer MessagePoolReturn(unreachable)
+	if receive != nil {
+		HandleError(func() {
+			receive(source, provideMode, ipPath, unreachable)
+		})
+	}
+}
