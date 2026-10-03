@@ -383,10 +383,9 @@ func TestLogicalLaneBuffersShareFixedLazyBudgets(t *testing.T) {
 		settings.SendBufferSettings.SequenceBufferSize,
 		1,
 	) * maxLogicalDataLaneCount
-	maxAckCapacity := logicalLaneSequenceBufferSize(
-		settings.SendBufferSettings.AckBufferSize,
-		1,
-	) * maxLogicalDataLaneCount
+	// Constructor-owned ACK feedback is coalesced directly; no lane needs a
+	// compatibility queue. The actual data-channel bound stays unchanged.
+	maxAckCapacity := 0
 	if sendChannelCapacity != maxSendCapacity || ackChannelCapacity != maxAckCapacity {
 		t.Fatalf(
 			"data-lane channels = (%d,%d), want bounded (%d,%d)",

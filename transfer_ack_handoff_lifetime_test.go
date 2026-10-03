@@ -52,6 +52,18 @@ func (self *ackHandoffLifetimeBarrier) requireReached(t *testing.T) {
 	}
 }
 
+// Constructor-owned ACK publication has no queue worker. Keep the timing
+// barrier for an explicit legacy channel, and otherwise require the actual
+// inline owner before advancing the unchanged lifetime controls.
+func (self *ackHandoffLifetimeBarrier) requireReachedOrInline(t *testing.T, sequence *SendSequence) {
+	t.Helper()
+	if sequence.acks == nil && sequence.ackWindow != nil && sequence.resendQueue != nil {
+		synctest.Wait()
+		return
+	}
+	self.requireReached(t)
+}
+
 // The receiving callback returned accepted while the bounded channel still
 // owns the exact cumulative ACK. The original lifetime must not expire it.
 func TestTransferAckAcceptedBeforeWorkerReceiveKeepsLifetime(t *testing.T) {
@@ -111,7 +123,7 @@ func runAckHandoffLifetime(t *testing.T, dequeued bool) {
 		default:
 			// A receiving caller may publish synchronously. Do not require it
 			// to visit an obsolete worker handoff merely to satisfy this test.
-			if !dequeued || fixture.ackedCount != 1 && !sequence.ackWindow.pendingDeliveryFor(number, messageId) {
+			if fixture.ackedCount != 1 && !sequence.ackWindow.pendingDeliveryFor(number, messageId) {
 				t.Fatal("accepted ACK is neither worker-owned nor already published")
 			}
 		}
@@ -181,7 +193,7 @@ func runAckHandoffInvalidLifetime(t *testing.T, kind string) {
 			ack.messageId = RequireIdFromBytes(younger.pack.MessageId)
 			ack.selective = true
 		}
-		barrier.requireReached(t)
+		barrier.requireReachedOrInline(t, sequence)
 		arrival := deadline.Add(-time.Second)
 		if kind == "after_close" {
 			arrival = deadline.Add(time.Nanosecond)
@@ -237,7 +249,7 @@ func TestTransferAckHandoffSackRenewsOnlyOnce(t *testing.T) {
 		messageId := RequireIdFromBytes(original.pack.MessageId)
 		lifetime := sequence.sendBufferSettings.AckTimeout
 		deadline := time.Now().Add(lifetime)
-		barrier.requireReached(t)
+		barrier.requireReachedOrInline(t, sequence)
 		time.Sleep(time.Until(deadline.Add(-time.Second)))
 		renewedDeadline := time.Now().Add(lifetime)
 		result, err := sequence.ackMessageDetailed(receiveAckMessage{
