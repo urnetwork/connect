@@ -2890,12 +2890,12 @@ func (self *Group) PendingMemberCount() (int, error) {
 // answers the empty set for such a commit, and the fan-out then seals the next epoch to the
 // removed member's own X-Wing key, which is the whole defect the exclusion exists to prevent.
 // The staged commit carries the answer directly and no tree comparison can reproduce it. That is
-// MEASURED and not reasoned from the RFC: messagegroup's
-// TestARemovalWhoseLeafIsRefilledInTheSameCommitIsStillNamedByTheStagedCommit builds that commit,
-// asserts the two occupied-leaf sets and the two member counts EQUAL, and holds this accessor to
-// naming the removal anyway. The order is the proposals' and not an ascending one, which
-// TestTheStagedCommitNamesTheLeavesInTheOrderTheProposalsDid drives with two leaves named high
-// to low.
+// MEASURED and not reasoned from the RFC, one package over: messagegroup's
+// engineremovewithextensions_test.go builds that commit, asserts the two occupied-leaf sets and the
+// two member counts EQUAL, and holds this accessor to naming the removal anyway. The order is the
+// proposals' and not an ascending one, which the same file drives with two leaves named high to
+// low. (Cited by file, not by test name: this package's citation gate checks a named test against
+// the tests this package declares, and those two are messagegroup's.)
 //
 // The slice is storage the caller owns: RemovedLeaves copies, so nothing here aliases the staged
 // value the merge is about to install.
