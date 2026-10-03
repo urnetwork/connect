@@ -2815,7 +2815,13 @@ paths:
         the body is parsed. The server matches a transfer to a payment intent
         by the Solana Pay reference among the transaction's account keys, or
         by the memo text, and credits the plan or the data pack (see
-        `/solana/payment-intent` and `/pay/data/solana-intent`).
+        `/solana/payment-intent` and `/pay/data/solana-intent`). Each quote is
+        the price plus a unique sub-cent suffix, so a transfer with neither
+        reference nor memo falls back to its exact amount: it is credited only
+        when it is the one USDC transfer to our receiving address and exactly
+        one open intent was quoted that amount, sent between the quote and the
+        intent's `expires_at`. An ambiguous or unmatched transfer is recorded
+        as unfulfilled for support to credit by hand.
 
         The body is Helius's own enhanced-transaction ARRAY, not a wrapped
         object. One delivery carries a batch, and a customer's payment can sit
@@ -3951,10 +3957,17 @@ paths:
         (/pay/solana) matches the transfer by the reference among the
         transaction's account keys OR by the memo text, then lands the data on
         the network (data only, valid for one year, no Pro) and emails the
-        network's admin when their login is an email.
+        network's admin when their login is an email. A transfer with no
+        reference and no memo (a wallet that cannot add one) is matched by its
+        exact `amount_usd`, which is unique among open quotes: it is credited
+        only when it is the one USDC transfer to our receiving address and
+        exactly one open intent was quoted that amount, sent between the quote
+        and `expires_at`. Anything else is recorded for support to credit by
+        hand.
 
-        The intent expires after 24 hours (`expires_at`); a payment that arrives
-        late still credits as long as the intent has not been swept. A reused
+        The intent expires after 24 hours (`expires_at`); a payment that carries
+        the reference or memo and arrives late still credits as long as the
+        intent has not been swept. A reused
         reference, an unknown item or an unknown network return `error.message`
         with a 200. Unauthenticated, per-ip rate limited.
       operationId: Pay Data Solana Intent
@@ -10637,7 +10650,11 @@ components:
       properties:
         amount_usd:
           type: number
-          description: the price the server quoted; the client must pay exactly this
+          description: >-
+            the amount the server quoted; the client must pay exactly this. It is
+            the plan price plus a unique sub-cent suffix (0.000001 to 0.009999,
+            in USDC's 6 decimals) that identifies a payment sent without the
+            reference, so show and pay every decimal
         tier:
           type: string
         plan:
@@ -11813,7 +11830,11 @@ components:
       properties:
         amount_usd:
           type: number
-          description: the exact amount to send, in USDC
+          description: >-
+            the exact amount to send, in USDC: the data pack price plus a unique
+            sub-cent suffix (0.000001 to 0.009999, in USDC's 6 decimals) that
+            identifies a payment sent without the memo, so show and pay every
+            decimal
         reference:
           type: string
         memo:
