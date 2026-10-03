@@ -12278,7 +12278,9 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			// afterward belongs to the original delivery, not preflight.
 			observe()
 			self.sendBufferSettings.providerEvaluation.noteProviderWrite(self.destination)
+			self.sendBufferSettings.providerEvaluation.beginLocalWrite(self.destination)
 			disposition, writeErr = writeMultiRouteWithCarrier(writer, self.ctx, bytes, timeout, reliableOnly)
+			self.sendBufferSettings.providerEvaluation.endLocalWrite(self.destination, writeErr == nil, item != nil && !item.contractControl)
 			if writeErr == nil {
 				return disposition, nil
 			}
