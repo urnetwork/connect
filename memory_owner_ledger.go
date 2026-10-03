@@ -59,19 +59,35 @@ type TransferMemoryOwnerSnapshot struct {
 // CleanupWorkers means Run returned and buffer-owned cleanup has begun, not
 // merely that a context was canceled or that all lookup entries are absent.
 func (l *TransferMemoryOwnerLedger) Snapshot() TransferMemoryOwnerSnapshot {
+	return l.snapshot(nil)
+}
+
+// boundary is used only by deterministic interleaving controls. Production
+// callers pass nil; the ledger does not retain the callback or traverse owners.
+func (l *TransferMemoryOwnerLedger) snapshot(boundary func(final bool)) TransferMemoryOwnerSnapshot {
 	if l == nil {
 		return TransferMemoryOwnerSnapshot{}
 	}
 	beforeWriters := l.writers.Load()
 	beforeRevision := l.revision.Load()
+	if boundary != nil {
+		boundary(false)
+	}
 	out := TransferMemoryOwnerSnapshot{
 		Enabled: true,
 		Send:    l.send.snapshot(int64(unsafe.Sizeof(SendSequence{}))),
 		Receive: l.receive.snapshot(int64(unsafe.Sizeof(ReceiveSequence{}))),
 		Forward: l.forward.snapshot(int64(unsafe.Sizeof(ForwardSequence{}))),
 	}
+	// Read the active-writer count before the closing revision. Reversing
+	// these loads lets a writer finish between them: a partial group can then
+	// carry the old revision and a zero writer count and appear coherent.
+	afterWriters := l.writers.Load()
+	if boundary != nil {
+		boundary(true)
+	}
 	out.Revision = l.revision.Load()
-	out.Complete = beforeWriters == 0 && l.writers.Load() == 0 && beforeRevision == out.Revision
+	out.Complete = beforeWriters == 0 && afterWriters == 0 && beforeRevision == out.Revision
 	return out
 }
 
