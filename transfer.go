@@ -1533,6 +1533,10 @@ func Ctx(ctx context.Context) transferCtx {
 }
 
 type ClientSettings struct {
+	// Optional lifecycle-only memory accounting. Nil leaves it disabled. The
+	// pointer is captured at construction; do not mutate settings concurrently.
+	MemoryOwnerLedger *TransferMemoryOwnerLedger
+
 	SendBufferSize    int
 	ForwardBufferSize int
 	ReadTimeout       time.Duration
@@ -1874,7 +1878,8 @@ type Client struct {
 
 	log Logger
 
-	settings *ClientSettings
+	settings          *ClientSettings
+	memoryOwnerLedger *TransferMemoryOwnerLedger
 
 	receiveCallbacks *CallbackList[ReceiveFunction]
 	forwardCallbacks *CallbackList[ForwardFunction]
@@ -2114,6 +2119,7 @@ func NewClientWithTag(
 		clientOob:                    clientOob,
 		log:                          log,
 		settings:                     settings,
+		memoryOwnerLedger:            settings.MemoryOwnerLedger,
 		receiveCallbacks:             NewCallbackList[ReceiveFunction](),
 		forwardCallbacks:             NewCallbackList[ForwardFunction](),
 		subprotocols:                 newSubprotocolRegistry(),
@@ -5767,6 +5773,9 @@ func (self *SendBuffer) createSendSequence(id sendSequenceId, sendPack *SendPack
 	self.wireSendSequences[wireId] = sendSequence
 	self.sendSequencesBySequenceId[sendSequence.sequenceId] = sendSequence
 	self.activeSendSequences[sendSequence] = true
+	if ledger := self.client.memoryOwnerLedger; ledger != nil {
+		ledger.admit(transferMemoryOwnerSend, sendSequence.memoryOwnerChannelBytes())
+	}
 	// note we do not associate destination here
 	// the sequence will call `AssociateDestination` before it writes
 	go self.runSendSequence(id, wireId, sendSequence)
@@ -5834,6 +5843,7 @@ func (self *SendBuffer) closeSendSequence(
 }
 
 func (self *SendBuffer) runSendSequence(id sendSequenceId, wireId sendSequenceWireId, sendSequence *SendSequence) {
+	cleanup := false
 	defer func() {
 		self.mutex.Lock()
 		delete(self.activeSendSequences, sendSequence)
@@ -5843,6 +5853,9 @@ func (self *SendBuffer) runSendSequence(id sendSequenceId, wireId sendSequenceWi
 				delete(self.windowPacingServices, id.logicalLaneBase())
 			}
 		}
+		if ledger := self.client.memoryOwnerLedger; ledger != nil {
+			ledger.finish(transferMemoryOwnerSend, sendSequence.memoryOwnerChannelBytes(), cleanup)
+		}
 		close(sendSequence.done)
 		self.mutex.Unlock()
 	}()
@@ -5851,6 +5864,10 @@ func (self *SendBuffer) runSendSequence(id sendSequenceId, wireId sendSequenceWi
 	}
 	HandleError(func() {
 		defer func() {
+			if ledger := self.client.memoryOwnerLedger; ledger != nil {
+				ledger.beginCleanup(transferMemoryOwnerSend, sendSequence.memoryOwnerChannelBytes())
+				cleanup = true
+			}
 			self.closeSendSequence(id, wireId, sendSequence)
 			if self.afterRunSendSequenceForTest != nil {
 				self.afterRunSendSequenceForTest(id)
@@ -13527,6 +13544,9 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 			self.receiveSequences[receiveSequenceId] = receiveSequence
 			self.headReceiveSequenceIds[headKey] = receiveSequenceId
 			self.activeReceiveSequences[receiveSequence] = true
+			if ledger := self.client.memoryOwnerLedger; ledger != nil {
+				ledger.admit(transferMemoryOwnerReceive, receiveSequence.memoryOwnerChannelBytes())
+			}
 			go self.runReceiveSequence(
 				receiveSequenceId,
 				headKey,
@@ -13567,9 +13587,13 @@ func (self *ReceiveBuffer) runReceiveSequence(
 	headKey receiveSequenceHeadKey,
 	receiveSequence *ReceiveSequence,
 ) {
+	cleanup := false
 	defer func() {
 		self.mutex.Lock()
 		delete(self.activeReceiveSequences, receiveSequence)
+		if ledger := self.client.memoryOwnerLedger; ledger != nil {
+			ledger.finish(transferMemoryOwnerReceive, receiveSequence.memoryOwnerChannelBytes(), cleanup)
+		}
 		close(receiveSequence.done)
 		self.mutex.Unlock()
 	}()
@@ -13584,6 +13608,10 @@ func (self *ReceiveBuffer) runReceiveSequence(
 		}()
 		defer receiveSequence.Close()
 		defer func() {
+			if ledger := self.client.memoryOwnerLedger; ledger != nil {
+				ledger.beginCleanup(transferMemoryOwnerReceive, receiveSequence.memoryOwnerChannelBytes())
+				cleanup = true
+			}
 			self.mutex.Lock()
 			self.removeReceiveSequenceWithLock(
 				receiveSequenceId,
@@ -16596,6 +16624,9 @@ func (self *ForwardBuffer) Pack(forwardPack *ForwardPack, timeout time.Duration)
 		)
 		self.forwardSequences[forwardPack.Destination] = forwardSequence
 		self.activeForwardSequences[forwardSequence] = true
+		if ledger := self.client.memoryOwnerLedger; ledger != nil {
+			ledger.admit(transferMemoryOwnerForward, forwardSequence.memoryOwnerChannelBytes())
+		}
 		go self.runForwardSequence(forwardPack.Destination, forwardSequence)
 		return forwardSequence
 	}
@@ -16632,9 +16663,13 @@ func (self *ForwardBuffer) runForwardSequence(
 	destination TransferPath,
 	forwardSequence *ForwardSequence,
 ) {
+	cleanup := false
 	defer func() {
 		self.mutex.Lock()
 		delete(self.activeForwardSequences, forwardSequence)
+		if ledger := self.client.memoryOwnerLedger; ledger != nil {
+			ledger.finish(transferMemoryOwnerForward, forwardSequence.memoryOwnerChannelBytes(), cleanup)
+		}
 		close(forwardSequence.done)
 		self.mutex.Unlock()
 	}()
@@ -16649,6 +16684,10 @@ func (self *ForwardBuffer) runForwardSequence(
 		}()
 		defer forwardSequence.Close()
 		defer func() {
+			if ledger := self.client.memoryOwnerLedger; ledger != nil {
+				ledger.beginCleanup(transferMemoryOwnerForward, forwardSequence.memoryOwnerChannelBytes())
+				cleanup = true
+			}
 			self.mutex.Lock()
 			if forwardSequence == self.forwardSequences[destination] {
 				delete(self.forwardSequences, destination)
