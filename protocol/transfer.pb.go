@@ -2203,6 +2203,7 @@ type CloseContract struct {
 	AckedByteCount   uint64                 `protobuf:"varint,2,opt,name=acked_byte_count,json=ackedByteCount,proto3" json:"acked_byte_count,omitempty"`
 	UnackedByteCount uint64                 `protobuf:"varint,3,opt,name=unacked_byte_count,json=unackedByteCount,proto3" json:"unacked_byte_count,omitempty"`
 	Checkpoint       bool                   `protobuf:"varint,4,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
+	ReportId         []byte                 `protobuf:"bytes,5,opt,name=report_id,json=reportId,proto3" json:"report_id,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -2263,6 +2264,13 @@ func (x *CloseContract) GetCheckpoint() bool {
 		return x.Checkpoint
 	}
 	return false
+}
+
+func (x *CloseContract) GetReportId() []byte {
+	if x != nil {
+		return x.ReportId
+	}
+	return nil
 }
 
 // peer auditing
@@ -2953,7 +2961,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\x0f_destination_idB\f\n" +
 	"\n" +
 	"_stream_idB\v\n" +
-	"\t_priority\"\xa8\x01\n" +
+	"\t_priority\"\xc5\x01\n" +
 	"\rCloseContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12(\n" +
@@ -2961,7 +2969,8 @@ const file_transfer_proto_rawDesc = "" +
 	"\x12unacked_byte_count\x18\x03 \x01(\x04R\x10unackedByteCount\x12\x1e\n" +
 	"\n" +
 	"checkpoint\x18\x04 \x01(\bR\n" +
-	"checkpoint\"\xf3\x03\n" +
+	"checkpoint\x12\x1b\n" +
+	"\treport_id\x18\x05 \x01(\fR\breportId\"\xf3\x03\n" +
 	"\tPeerAudit\x12\x17\n" +
 	"\apeer_id\x18\x01 \x01(\fR\x06peerId\x12\x1a\n" +
 	"\bduration\x18\x02 \x01(\x04R\bduration\x12\x14\n" +
