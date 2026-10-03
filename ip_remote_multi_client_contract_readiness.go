@@ -11,20 +11,24 @@ import (
 // Window-owned pending waits and monotonic outcomes, safe for concurrent readers.
 // It is deliberately conservative across retries: an old contact is not erased.
 type providerEvaluationState struct {
-	localContractFailure   atomic.Bool
-	providerContact        atomic.Bool
-	pendingContractWaiters atomic.Int32
+	localContractFailure     atomic.Bool
+	providerContact          atomic.Bool
+	pendingContractWaiters   atomic.Int32
+	pendingLocalWrites       atomic.Int32
+	localWriteFailed         atomic.Bool
+	applicationWriteAdmitted atomic.Bool
 }
 
 // One candidate owns this witness before its Client is constructed. Only actual
 // contract waits and bounded writes to the selected destination may update it.
 // All fields are safe for concurrent send sequences and evaluation callbacks.
 type providerEvaluationAttempt struct {
-	owner           *providerEvaluationState
-	destinationId   Id
-	contractWaiters atomic.Int32
-	contractFailed  atomic.Bool
-	providerContact atomic.Bool
+	owner             *providerEvaluationState
+	destinationId     Id
+	observeLocalWrite bool
+	contractWaiters   atomic.Int32
+	contractFailed    atomic.Bool
+	providerContact   atomic.Bool
 }
 
 // Nil is the ordinary non-multi-client path and adds no ownership or observer.
@@ -91,6 +95,47 @@ func (self *RemoteUserNatMultiClient) ProviderContractAcquisitionUnavailable() b
 	// different window's earlier write cannot be hidden by a newly pending wait.
 	for _, window := range self.windows {
 		if window.providerEvaluation.providerContact.Load() {
+			return false
+		}
+	}
+	return unavailable
+}
+
+// Only data-only probes opt into the actual route-writer observation. Ordinary
+// clients retain no additional per-packet atomic work or measuring authority.
+func (self *providerEvaluationAttempt) beginLocalWrite(destinationId Id) {
+	if self != nil && self.observeLocalWrite && self.destinationId == destinationId {
+		self.owner.pendingLocalWrites.Add(1)
+	}
+}
+
+// Successful application handoff is monotonic across candidate replacement.
+// A contract-only head cannot prove that the queued application was admitted.
+// Queue acceptance is not a claim of physical delivery or a provider reply.
+func (self *providerEvaluationAttempt) endLocalWrite(destinationId Id, admitted, application bool) {
+	if self != nil && self.observeLocalWrite && self.destinationId == destinationId {
+		if admitted && application {
+			self.owner.applicationWriteAdmitted.Store(true)
+		} else if !admitted {
+			self.owner.localWriteFailed.Store(true)
+		}
+		self.owner.pendingLocalWrites.Add(-1)
+	}
+}
+
+// True only with an observed pending/refused writer and no application frame
+// ever admitted to a local route. Preserve the separate attempted-write fence
+// used by contract acquisition. False does not prove contact or delivery.
+func (self *RemoteUserNatMultiClient) ProviderLocalWriteUnavailable() bool {
+	if self == nil {
+		return false
+	}
+	unavailable := false
+	for _, window := range self.windows {
+		unavailable = unavailable || window.providerEvaluation.pendingLocalWrites.Load() > 0 || window.providerEvaluation.localWriteFailed.Load()
+	}
+	for _, window := range self.windows {
+		if window.providerEvaluation.applicationWriteAdmitted.Load() {
 			return false
 		}
 	}

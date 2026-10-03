@@ -11960,8 +11960,9 @@ requestCandidates:
 			args.NetworkPeerDestination = self.networkPeerDestination
 			args.contractStatus = self.contractStatusFromClient
 			args.providerEvaluation = &providerEvaluationAttempt{
-				owner:         &self.providerEvaluation,
-				destinationId: args.Destination.Tail(),
+				owner:             &self.providerEvaluation,
+				destinationId:     args.Destination.Tail(),
+				observeLocalWrite: self.settings.DataOnlyProviderProbe,
 			}
 			// the evaluation epoch, not the window ctx: identical between
 			// rebuilds, and what lets the outcome rebuild fail every
