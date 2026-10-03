@@ -6443,7 +6443,9 @@ type SendSequence struct {
 	// callers never read the goroutine-owned multi-route writer directly.
 	flowIsolation atomic.Bool
 	ackMutex      sync.Mutex
-	acks          chan receiveAckMessage
+	// Explicit legacy owners may supply a queue. Constructor-owned ACKs
+	// coalesce directly into ackWindow and leave this channel nil.
+	acks chan receiveAckMessage
 	// ACK processing may run in the receiving caller or compatibility worker.
 	// Publish its failure before cancellation wakes the send owner.
 	ackWorkerExited atomic.Bool
@@ -6634,10 +6636,6 @@ func newSendSequenceWithLogicalLane(
 		sendBufferSettings.SequenceBufferSize,
 		logicalLane,
 	)
-	ackBufferSize := logicalLaneSequenceBufferSize(
-		sendBufferSettings.AckBufferSize,
-		logicalLane,
-	)
 	resendQueueBudget := sendBufferSettings.ResendQueueBudget
 	resendQueueMinByteCount := sendBufferSettings.ResendQueueMinByteCount
 	if logicalLane != 0 {
@@ -6704,7 +6702,6 @@ func newSendSequenceWithLogicalLane(
 		packs:                          make(chan *SendPack, sequenceBufferSize),
 		preparedHandoffWake:            make(chan struct{}, 1),
 		packAdmission:                  newSendPackAdmission(sequenceBufferSize),
-		acks:                           make(chan receiveAckMessage, ackBufferSize),
 		ackWindow:                      newSequenceAckWindow(),
 		resendQueue:                    newResendQueue(resendQueueBudget, resendQueueMinByteCount),
 		sendItems:                      []*sendItem{},
@@ -8350,7 +8347,7 @@ func (self *SendSequence) noAckPackCanBypassRecoveryAdmission(
 
 func (self *SendSequence) Run() {
 	defer self.windowPacer.close()
-	ackWorkerDone := make(chan struct{})
+	var ackWorkerDone chan struct{}
 	ackWorkerStarted := false
 	defer func() {
 		if r := recover(); r != nil {
@@ -8424,38 +8421,43 @@ func (self *SendSequence) Run() {
 		// sequences publish the shared window before they are indexed.
 		ackWindow = newSequenceAckWindow()
 	}
-	ackWorkerStarted = true
-	go func() {
-		defer close(ackWorkerDone)
-		HandleError(func() {
-			defer func() {
-				// Publish the worker cause before its cancellation wakes Run.
-				// Ordinary parent/owner cancellation is not a worker failure.
-				if self.ctx.Err() == nil {
-					self.ackWorkerExited.Store(true)
-				}
-				self.cancel()
-			}()
+	// Production feedback is already published by the receiving caller.
+	// Start the historical queue worker only for an explicit legacy channel.
+	if self.acks != nil {
+		ackWorkerDone = make(chan struct{})
+		ackWorkerStarted = true
+		go func() {
+			defer close(ackWorkerDone)
+			HandleError(func() {
+				defer func() {
+					// Publish the worker cause before its cancellation wakes Run.
+					// Ordinary parent/owner cancellation is not a worker failure.
+					if self.ctx.Err() == nil {
+						self.ackWorkerExited.Store(true)
+					}
+					self.cancel()
+				}()
 
-			for {
-				if self.sendBuffer != nil && self.sendBuffer.beforeAckWorkerReceiveForTest != nil {
-					self.sendBuffer.beforeAckWorkerReceiveForTest(self.id())
-				}
-				select {
-				case <-self.ctx.Done():
-					return
-				case ack, ok := <-self.acks:
-					if !ok {
+				for {
+					if self.sendBuffer != nil && self.sendBuffer.beforeAckWorkerReceiveForTest != nil {
+						self.sendBuffer.beforeAckWorkerReceiveForTest(self.id())
+					}
+					select {
+					case <-self.ctx.Done():
 						return
+					case ack, ok := <-self.acks:
+						if !ok {
+							return
+						}
+						if self.sendBuffer != nil && self.sendBuffer.beforeAckWorkerCoalesceForTest != nil {
+							self.sendBuffer.beforeAckWorkerCoalesceForTest(self.id())
+						}
+						self.coalesceReceivedAck(ackWindow, ack)
 					}
-					if self.sendBuffer != nil && self.sendBuffer.beforeAckWorkerCoalesceForTest != nil {
-						self.sendBuffer.beforeAckWorkerCoalesceForTest(self.id())
-					}
-					self.coalesceReceivedAck(ackWindow, ack)
 				}
-			}
-		}, self.cancel)
-	}()
+			}, self.cancel)
+		}()
+	}
 
 	// reusable idle/resend timer: a per-iteration time.After would allocate a
 	// timer per packet on this hot loop. created already-fired; the Reset before
@@ -12690,7 +12692,9 @@ func (self *SendSequence) Close() {
 	func() {
 		self.ackMutex.Lock()
 		defer self.ackMutex.Unlock()
-		close(self.acks)
+		if self.acks != nil {
+			close(self.acks)
+		}
 	}()
 
 	// drain the channel
