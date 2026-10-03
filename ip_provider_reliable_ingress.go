@@ -117,6 +117,7 @@ func (self *RemoteUserNatProvider) queueReliablePacket(source TransferPath, peer
 		self.releaseSourceLifecycle(source.SourceId, lifecycle)
 		return
 	}
+	owner.operation.pipelined = true
 	// All sources are subscribed by the sequence worker before attempting.
 	owner.operation.contexts = []<-chan struct{}{self.ctx.Done(), self.localUserNat.ctx.Done(), lifecycle.ctx.Done()}
 	if budget := self.localUserNat.settings.MemoryBudget; budget != nil {
@@ -223,6 +224,9 @@ func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer
 	finalAttempt := func() receiveDeliveryAttempt {
 		if !owner.alive() {
 			return receiveDeliveryRejected
+		}
+		if !owner.operation.previousDataSecured() {
+			return receiveDeliveryWaiting
 		}
 		accepted, err := attempt()
 		if accepted {

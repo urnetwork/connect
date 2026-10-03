@@ -94,3 +94,5 @@ retract v0.2.0 // retract self
 replace github.com/urnetwork/glog => ../glog
 
 replace github.com/pion/sctp => ./sctp
+
+replace gvisor.dev/gvisor => ../gvisor

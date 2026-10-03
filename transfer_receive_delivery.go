@@ -89,6 +89,15 @@ func (q *receiveDeliveryQueue) append(item *receiveItem, required bool) (*receiv
 	}
 	controlReserve := !regular
 	if controlReserve && (!control || q.controlCount >= receiveDeliveryControlMaxCount || bytes > receiveDeliveryControlMaxBytes-q.controlBytes) {
+		if ackLineageTraceEnabled {
+			reason := "memory"
+			if len(q.items)-q.controlCount >= q.maxCount {
+				reason = "count"
+			} else if bytes > q.maxBytes-(q.bytes-q.controlBytes) {
+				reason = "bytes"
+			}
+			q.traceReceiptStateLocked(&receiveDeliveryReceipt{ack: sequenceAck{messageId: item.messageId, sequenceNumber: item.sequenceNumber}, messageBytes: item.messageByteCount}, "delivery_receipt_refused", false, reason)
+		}
 		return nil, false
 	}
 	r := &receiveDeliveryReceipt{queue: q, item: item, bytes: bytes, messageBytes: item.messageByteCount,
@@ -102,6 +111,9 @@ func (q *receiveDeliveryQueue) append(item *receiveItem, required bool) (*receiv
 	if controlReserve {
 		q.controlCount++
 		q.controlBytes += bytes
+	}
+	if ackLineageTraceEnabled {
+		q.traceReceiptLocked(r, "delivery_receipt_admitted", true)
 	}
 	return r, true
 }
@@ -152,6 +164,9 @@ func (r *receiveDeliveryReceipt) seal() {
 	r.sealed = true
 	failed := r.required && !r.claimed
 	if failed && !q.closed {
+		if ackLineageTraceEnabled {
+			q.traceReceiptStateLocked(r, "delivery_receipt_rejected", false, "unclaimed")
+		}
 		q.closed = true
 		q.failedFrom = r.ack.sequenceNumber
 	}
@@ -171,6 +186,9 @@ func (claim *receiveDeliveryClaim) complete(secured bool) {
 	q.mutex.Lock()
 	r.pending--
 	if !secured && !q.closed {
+		if ackLineageTraceEnabled {
+			q.traceReceiptStateLocked(r, "delivery_receipt_rejected", false, "claim")
+		}
 		q.closed = true
 		q.failedFrom = r.ack.sequenceNumber
 	}
@@ -187,9 +205,18 @@ func (claim *receiveDeliveryClaim) complete(secured bool) {
 func (q *receiveDeliveryQueue) advanceLocked(changed *receiveDeliveryReceipt) []*receiveItem {
 	var returns []*receiveItem
 	if changed.sealed && changed.pending == 0 && !q.closed {
+		if ackLineageTraceEnabled && !changed.secured {
+			q.traceReceiptLocked(changed, "delivery_receipt_secured", true)
+		}
 		changed.secured = true
 	}
+	if ackLineageTraceEnabled && changed.sealed && changed.pending > 0 {
+		q.traceReceiptLocked(changed, "delivery_receipt_wait", false)
+	}
 	if q.closed {
+		if ackLineageTraceEnabled && changed.queue == q {
+			q.traceReceiptLocked(changed, "delivery_receipt_closed", false)
+		}
 		remaining := q.items[:0]
 		for _, r := range q.items {
 			if r.sealed && r.pending == 0 {
@@ -244,6 +271,9 @@ func (q *receiveDeliveryQueue) advanceLocked(changed *receiveDeliveryReceipt) []
 		q.items[0] = nil
 		q.items = q.items[1:]
 		q.removeChargeLocked(r)
+		if ackLineageTraceEnabled {
+			q.traceReceiptLocked(r, "delivery_receipt_prefix", true)
+		}
 		q.sequence.ackWindow.UpdateDelivered(r.ack, r.messageBytes)
 		if r.item != nil {
 			returns = append(returns, r.item)
@@ -272,6 +302,9 @@ func (q *receiveDeliveryQueue) duplicate(sequenceNumber uint64, messageID Id) (k
 func (q *receiveDeliveryQueue) cancel() {
 	q.mutex.Lock()
 	if !q.closed {
+		if ackLineageTraceEnabled && len(q.items) > 0 {
+			q.traceReceiptStateLocked(q.items[0], "delivery_queue_canceled", false, "sequence")
+		}
 		q.closed = true
 		if len(q.items) > 0 {
 			q.failedFrom = q.items[0].ack.sequenceNumber

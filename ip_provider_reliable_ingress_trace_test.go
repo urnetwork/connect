@@ -24,6 +24,9 @@ func TestProviderReliableTcpRejectionTraceIdentity(t *testing.T) {
 				assertMessagePoolOwnership(t)
 				synctest.Test(t, func(t *testing.T) {
 					f := newReliableTcpIngressFixture(t, version, nil)
+					// Exercise the permanent no-flow refusal, not the separate
+					// confirmed-terminal-reset owner used when orphan RST is on.
+					f.nat.settings.TcpBufferSettings.EnableOrphanRst = false
 					observer, observations := progressTraceTestObserver()
 					sequence := f.runningReceiveSequence(func(settings *ReceiveBufferSettings) { settings.ProgressObserver = observer })
 					path := *f.path

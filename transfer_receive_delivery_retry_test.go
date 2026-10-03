@@ -205,3 +205,32 @@ func TestReceiveDeliveryRetryAllowsSynchronousRetry(t *testing.T) {
 		t.Error("synchronous retry was overwritten by the earlier attempt result")
 	}
 }
+
+func TestReceiveDeliveryPipelineFinalGuardRejectsFailedPrefixAndAllowsControl(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	q, _ := testReceiveDeliveryLedger(t, 4)
+	q.maxBytes = 64 * 1024
+	flow, _ := ipPacketFlowKeyFromPath(icmpTcpTestPath(4))
+	var operations []*receiveDeliveryOperation
+	for number := range 3 {
+		r, _ := q.append(testReceiveDeliveryItem(uint64(number)), true)
+		op := r.operation(flow, number == 2, nil, func() receiveDeliveryAttempt { return receiveDeliveryInFlight }, nil)
+		op.pipelined = true
+		operations = append(operations, op)
+		r.seal()
+	}
+	q.pump()
+	if operations[1].previousDataSecured() || !operations[2].previousDataSecured() {
+		t.Fatal("final admission bypassed pending data or blocked independent same-lane control")
+	}
+	operations[0].complete(false)
+	if operations[1].previousDataSecured() {
+		t.Fatal("failed predecessor was mistaken for secured final admission")
+	}
+	q.cancel()
+	operations[1].complete(false)
+	operations[2].complete(false)
+	if q.bytes != 0 || len(q.items) != 0 || len(q.operations) != 0 || q.sequence.ackWindow.Pending() {
+		t.Fatal("failed pipelined prefix ACKed or retained its original ownership")
+	}
+}

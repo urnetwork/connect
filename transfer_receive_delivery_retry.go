@@ -16,10 +16,13 @@ const (
 // a second copy of an in-flight owner. Only the ReceiveSequence worker calls
 // pump; downstream workers may complete or return an operation to waiting.
 type receiveDeliveryOperation struct {
-	mutex             sync.Mutex
-	claim             *receiveDeliveryClaim
-	flow              ipPacketFlowKey
-	control           bool
+	mutex   sync.Mutex
+	claim   *receiveDeliveryClaim
+	flow    ipPacketFlowKey
+	control bool
+	// Pipelined owners may enter the existing NAT FIFO together; their
+	// final TCP admission still waits for the previous data owner below.
+	pipelined         bool
 	state             receiveDeliveryAttempt
 	terminal          bool
 	canceled          bool
@@ -95,7 +98,7 @@ func (q *receiveDeliveryQueue) pump() []<-chan struct{} {
 			wakes = append(wakes, op.budget.CapacityNotify())
 		}
 		blocked := false
-		if !op.control {
+		if !op.control && !op.pipelined {
 			for _, earlier := range operations[:index] {
 				if earlier.flow != op.flow || earlier.control {
 					continue
@@ -184,6 +187,7 @@ func (op *receiveDeliveryOperation) complete(secured bool) {
 	}
 	op.terminal = true
 	secured = secured && !op.canceled
+	op.completionSecured = secured
 	release := op.release
 	op.release, op.attempt, op.subscribe = nil, nil, nil
 	op.mutex.Unlock()
@@ -193,6 +197,38 @@ func (op *receiveDeliveryOperation) complete(secured bool) {
 	op.claim.complete(secured)
 	op.claim.receipt.queue.notify()
 	op.claim.receipt.queue.pruneOperations()
+}
+
+// This is the final-admission ordering barrier, not a wait for a remote ACK.
+// Completion and cancellation may race a NAT callback. Inspect the existing
+// bounded ledger under its lock rather than retain predecessor objects after
+// their receipt/memory charge has been released. The healthy FIFO head checks
+// no predecessor; only actual downstream pressure leaves earlier owners here.
+func (op *receiveDeliveryOperation) previousDataSecured() bool {
+	if op.control {
+		return true
+	}
+	q := op.claim.receipt.queue
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	if q.closed {
+		return false
+	}
+	for _, previous := range q.operations {
+		if previous == op {
+			return true
+		}
+		if previous.flow != op.flow || previous.control {
+			continue
+		}
+		previous.mutex.Lock()
+		secured := previous.terminal && previous.completionSecured
+		previous.mutex.Unlock()
+		if !secured {
+			return false
+		}
+	}
+	return false
 }
 
 // A downstream queue still owns in-flight bytes during cancellation. It

@@ -8681,8 +8681,15 @@ sendSequenceLoop:
 				// retransmit for every snapshot/arrival race. The lock is paid only
 				// on the due-recovery path, never for an ordinary initial write.
 				unreliableTimeout := item.recoveryKind == sendRecoveryNone && item.unreliableFlightTracked
+				// Stable H1 timeouts also defer while a cumulative prefix is
+				// draining. Apply newly coalesced lower progress before consulting
+				// lastCumulativeAckTime; explicit recovery keeps its own boundary.
+				h1ProgressTimeout := item.recoveryKind == sendRecoveryNone &&
+					self.sendBufferSettings.DeferTimeoutResendWhileCumulativeProgress &&
+					item.reliableCarrierObserved && !item.unreliableCarrierObserved &&
+					!item.carrierChanged && flightPolicy.h1Only
 				if ackWindow.PendingDispositionFor(item.sequenceNumber, item.messageId) ||
-					unreliableTimeout && ackWindow.PendingCumulativeProgress() {
+					(unreliableTimeout || h1ProgressTimeout) && ackWindow.PendingCumulativeProgress() {
 					self.client.ackPendingResendPreemptCount.Add(1)
 					continue sendSequenceLoop
 				}

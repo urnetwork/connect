@@ -438,6 +438,198 @@ incompatible with its single admission/ownership contract. A deterministic
 test now pins logical groups to sequence admission. These same-host simulator
 records do not qualify physical devices or the iOS-profile memory gate.
 
+## 2026-10-02 — H1 carrier TCP PTO starvation under reverse traffic
+
+The failed full-runner H1/5-Mbit/s loaded download and two later fresh-process
+replays received and verified the complete 1 MiB body, then missed the one-byte
+application completion at the provider. A build-gated, bounded scalar trace
+followed the exact TCP packet, Transfer owner, H1 physical writes, and relay
+stages. The original device send sequence expired at its unchanged 30-second
+ACK lifetime. The provider remained able to read heartbeats, but neither the
+missing original Transfer head nor the completion marker reached its H1 read.
+The complete relay trace located four consecutive simulated outer device→edge
+TCP payload queue refusals; the device gVisor TCP connection then emitted no
+further payload for about 30 seconds despite successful application writes.
+The edge's repeated nonzero-window ACKs crossed the reverse link into its
+destination queue; that trace alone does not prove endpoint consumption.
+The separate real-TUN reproduction below proves sender-socket consumption
+of ongoing reverse data. This is an outer TCP sender
+retransmission failure, not provider Transfer receipt backpressure or a
+missing completion-body byte. Trace evidence:
+`/tmp/urnetwork-h1-relay-lineage.VJ7qGW/repeat-06.stdout`.
+
+`server/connect/perfvar/h1_outer_tcp_tail_drop_test.go` now reproduces that
+boundary deterministically with the pinned gVisor module: four consecutive
+outer payload drops plus continuing reverse traffic leave 0/5,120 bytes
+delivered, zero retransmits and zero RTOs after five seconds, despite over
+127 KiB of reverse data consumed by that same socket. The identical drop
+schedule without reverse traffic recovers in about 357 ms with four
+retransmits and one RTO. The full-TUN attribution is therefore stronger than
+the earlier H1+ socket snapshot alone, but it does not imply that all
+historical H1 stalls have this one cause.
+
+The pinned gVisor sender calls `postXmit(false, true)` after an ACK handling
+pass that sends no new data. Its `schedulePTO()` path disables the RTO and
+rearms the probe timer; repeated reverse packets can postpone that probe
+indefinitely. A **private**, one-file gVisor experiment schedules that PTO
+only when `dataSent` is true. It does not disable RACK, change the 200-ms RTO,
+increase an ACK lifetime, or change the independent cumulative-ACK progress
+path. The deterministic reverse-traffic case then recovers all 5,120 bytes in
+about 0.35 s with four retransmits and one RTO. Normal and race-enabled
+matrices passed all 18 candidate controls each (high-RTT/no-loss,
+delayed-ACK/no-loss, SACK gap, zero-window, quiet loss and reverse loss);
+the unchanged dependency retained exactly the three expected reverse-loss
+failures in each matrix. The module cache and release `go.mod` files were not
+modified. Private patch, exact module pins and logs:
+`/tmp/urnetwork-gvisor-tail-drop.lNiV9z/HANDOFF.txt`.
+
+A source-pinned full-TUN diagnostic with the same Connect source and only
+that private gVisor difference found loaded H1 correctness 1/2 for control
+versus 2/2 for candidate. The control failure again completed the body before
+a 102.56-second completion-read timeout; this small sample supports the
+mechanism but does not prove a release-level cure or a speed gain. The clean
+32-MiB H1 screen had upload write timeouts in **both** arms (4/4 control,
+3/4 candidate); downloads completed but were mostly calibration-invalid.
+Host activity was material. All incorrect and invalid records remain in
+`/tmp/urnetwork-gvisor-tail-drop.lNiV9z/focused-perf/`. No baseline is
+promoted. Release integration requires an immutable upstream or authorized
+fork commit pinned in both Connect and Server, followed by a clean full
+PERFVAR/MAIN replay and device-memory qualification. Do not ship a `/tmp`
+module replacement or infer that a lower Transfer retry cap repairs this TCP
+timer starvation.
+
+### Upstream negative control and packaging boundary
+
+The inspected upstream main commit
+[`5b2a159f2738`](https://github.com/google/gvisor/commit/5b2a159f2738bd71f18e0f4a3917f03dc224564f)
+resolves to `v0.0.0-20261003011742-5b2a159f2738`. Its entire TCP `snd.go`
+is byte-identical to pinned `9b1144b679cb`: the no-transmission PTO rearm
+remains. Its `timer.go` changes comments only; its RACK changes concern
+reordering/clock-resolution loss detection, not this PTO scheduling path.
+A private direct-module test could not execute: Go reported conflicting
+`stack` and `bridge` test packages. This is a packaging boundary, not a
+runtime pass or failure. Upstream's [Go-consumer instructions](https://github.com/google/gvisor#using-go-get)
+require the synthetic `go` branch; `@latest` selects Bazel-oriented main.
+
+The then-current official Go projection
+[`14888a6ce3a7`](https://github.com/google/gvisor/commit/14888a6ce3a7fc6478cf6120ed8fefb3ea186a24)
+(`v0.0.0-20261002235135-14888a6ce3a7`) projects main `b65c70734`, the
+requested commit's direct parent. The intervening main commit changes only
+a C++ stress test; the projection has the same TCP sender source. It builds,
+but the unchanged deterministic reverse-data/four-drop case fails **3/3**:
+0/5,120 bytes after five seconds, zero retransmits/RTOs, a 200-ms reported
+RTO and over 127 KiB of reverse data consumed by the sending socket. The
+other 15 quiet-loss, high-RTT/no-loss, delayed-ACK/no-loss, SACK-gap and
+zero-window cases pass. Server/Connect fingerprints held. Neither snapshot
+is a release resolution for this bug; no dependency update is justified as
+a fix. Exact downloads, private module paths, source hashes and test logs:
+`/tmp/urnetwork-gvisor-upstream.Ua9kyj/RESULT.txt`.
+
+### Separate clean-LAN upload isolation and NAT-stage correction
+
+A bounded CPU8 private-overlay diagnostic reused the existing 32-MiB upload
+helper, original 30-second workload deadline and 1,100-byte application MTU.
+Both unmodified and PTO-guard dependency arms completed bare TUN→TUN
+uploads for default/mobile resources without retransmits or RTOs. Direct
+application-TUN→production LocalUserNat→host-TCP uploads also completed all
+four arm/resource cells with exact body/hash, nonzero receive windows,
+zero NAT-admission refusals and zero retransmits/RTOs. These reduced paths
+remove H1/Transfer; they do not establish that NAT cannot contribute under
+full-route backpressure. Their timings are diagnostic, not performance
+qualification.
+
+The composed full-H1 default-resource upload failed in both arms after
+origin receipt of 2,479,328 bytes (guard) and 2,525,064 bytes (control), not
+after a complete body. Mobile was timing-sensitive: one guard run failed at
+5,165,256 bytes while one control run completed. A subsequent scalar-only
+guard trace failed at 2,627,728 bytes: advertised raw TCP window stayed
+positive (4,096), about 808 KiB of emitted TCP sequence space remained
+unacknowledged, and the application stack counted 1,568 retransmits/nine
+RTOs. Its reported RTO grew to about 4.97 seconds. This is active recovery
+with severely reduced forward progress, not zero-RTO starvation. The
+provider NAT's SYN-ACK does not offer SACK, so this inner TCP flow does not
+use the outer connection's RACK/TLP mechanism. These reduced-path and
+TCP-boundary artifacts are retained in
+`/tmp/urnetwork-h1-clean-upload.4QViyl/` and
+`/tmp/urnetwork-h1-upload-boundary.svnzc3/`.
+
+A final source-pinned, tagged owner trace failed at 3,044,000 origin bytes
+with 1,758 application retransmits/nine RTOs. The exact first unacknowledged
+TCP range at timeout, sequence 81,436,928, was originally sent in Transfer
+sequence hash `799759a70917a045`, message number 1,054. Its original pack
+reached provider `receive_pack_end` successfully about 2.3 ms after send,
+and the device consumed its selective Transfer ACK about 4.8 ms after send.
+Provider delivery-receipt admission and contiguous-prefix advancement for
+that same message occurred only after a later retry, about 29.98 seconds
+after original pack receipt and after the workload deadline. This localizes
+the observed delay between provider Transfer pack acceptance and delivery
+admission, not loss on the outer H1 carrier. A selective ACK is not proof
+of secured downstream delivery.
+
+The earliest recorded provider receipt closure was message 511. This first
+trace did not distinguish capacity refusal, consumer rejection and
+cancellation; it was not sufficient to justify a receipt-deadlock fix,
+blame the pending-prefix patch alone or disable TCP collapse. Both packet traces and all
+progress chunks have zero overflow/unpublished entries (packet malformed
+counts are also zero). The terminal exit, scalar trace, private overlay
+and matching source fingerprints are in
+`/tmp/urnetwork-h1-upload-owner.sOFxL6/`.
+
+A subsequent failure-cause trace resolves the closure: an append refused
+message 548 with exactly 256/256 receipts, immediately canceling the
+receive sequence and its pending head 292. The cycle repeated at message
+746/head 490. Neither a missing claim nor final TCP rejection caused these
+first closures. The upload timed out at 2,324,152 bytes; all trace records
+and source pins held in `/tmp/urnetwork-h1-upload-closure.4e9prz/`.
+
+The retained fix is limited to the reliable-provider admission scheduler.
+Previously, one same-flow packet had to finish **final TCP admission**
+before its successor could even enter the existing NAT FIFO. This imposed
+a per-packet round trip between workers and let a healthy incoming burst
+fill the receipt ledger despite unused NAT queue capacity. Initial NAT
+admission now pipelines into that same bounded queue. A separate final
+admission check consults the existing operation ledger: later data cannot
+pass an earlier unsecured data owner, while independent TCP control still
+passes. Only secured final admission completes the receipt. No extra
+owner-history objects, queue capacity, memory budget, worker, timer, remote
+ACK requirement or timeout change was introduced.
+
+The deterministic held-NAT/full-TCP regression fails on the serial control
+in all four IPv4/IPv6 × unbudgeted/2-MiB-budget cells, then passes with the
+fix: both packets can occupy the existing NAT stage, neither is ACKed while
+TCP is full, and successive TCP slot releases admit and ACK the exact
+original packets in order. Budgeted cleanup returns the entire root charge.
+Adjacent receipt, same-lane control, duplicate, cancellation, impossible-fit
+and memory-handoff checks pass with normal `-count=10` and tagged race
+`-count=3`. A tagged no-flow trace fixture now explicitly disables orphan
+RST; its old expectation also failed with pre-pipeline source because the
+default orphan path owns a separate confirmed terminal reset.
+
+Two preliminary scheduling changes (pump before refusing a full batch and
+service a completion wake before ready Pack input) were insufficient in
+full-H1 replays and were removed. Their diagnostic artifacts remain in
+`/tmp/urnetwork-h1-upload-pump.zIVzYr/` and
+`/tmp/urnetwork-h1-upload-fair.GER4Ec/`; the removed local experiment test is
+recoverable as `scheduling-experiment_test.go` in the closure artifact.
+
+After that ablation, three fresh untagged processes each completed both
+default and mobile 32-MiB H1 uploads with exact hashes: original pinned
+gVisor, private PTO-guard gVisor, then original pinned gVisor again (6/6).
+Default elapsed times were 0.377–0.381 seconds; mobile was 0.559–0.566
+seconds. A final cause-only tagged replay passed both profiles with zero
+receipt refusal/rejection/cancellation events and zero trace overflow or
+unpublished records. Source, private module and overlay pins held. These
+are CPU8 local diagnostic timings, without PERFVAR calibration or physical
+device-memory qualification, not a promoted baseline. Full records,
+RED/GREEN matrices and reproducible commands:
+`/tmp/urnetwork-h1-upload-validation.V7Y6ZJ/`.
+
+Genuine downstream saturation still retains the existing bounded refusal
+policy; this change does not claim to redesign arbitrary-overload control
+admission or cancellation lease revocation. The distinct outer-TCP PTO
+bug above still requires its own source-managed dependency resolution. No
+release dependency, TCP-collapse policy or hosted MAIN run was changed.
+
 ## Decision gates and next work
 
 1. Keep the global TUN and Transfer defaults at 8 seconds. The ACK-required 3s/3s fixture is valid on clean high-access-RTT but exposed extra inner-TCP retries and a one-loss no-send-ACK **health preemption**, not an ACK deadline failure. Reproduce the health verdict deterministically, measure the independent Transfer ACK terminal time with health intervention disabled only inside a test, distinguish dead exit from recoverable reliable-carrier TCP loss, and qualify a bounded health fix before further timer A/B promotion. Then compare 3s/3s against 8s/8s with 3s/8s and 8s/3s component controls, actual wire-policy/collapse assertions, and clean/loss/low-edge/high-access-RTT conditions. A 2s/2s pair and the 3s/6s and 2s/4s hypotheses follow, not as unmeasured defaults. The diagnostic opt-in TCP-NoAck policy seam must remain removed.
