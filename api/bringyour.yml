@@ -7635,6 +7635,17 @@ components:
           type: integer
         update_time:
           type: string
+        guest:
+          type: boolean
+          description: |
+            The network has no login method (no email/phone, SSO, wallet or
+            seedphrase sign-in): a legacy guest network. Read from the live
+            auth methods on every call, so it stays true after a token refresh
+            (which signs every jwt without the `guest_mode` claim) and turns
+            false as soon as a login method is added with /auth/add-auth. A
+            client must not sell a plan to a guest network: nothing can sign
+            back in to it. Absent from older
+            servers, where a client falls back to the jwt `guest_mode` claim.
         price_tier:
           $ref: "#/components/schemas/PriceTier"
         onboarding_offer:
