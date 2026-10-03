@@ -55,6 +55,8 @@ const (
 	SecurityPolicyReasonAllowRtmp
 	SecurityPolicyReasonAllowLevin
 	SecurityPolicyReasonAllowRakNet
+	SecurityPolicyReasonAllowEthereumDiscv4
+	SecurityPolicyReasonAllowEthereumRlpx
 
 	// one past the last reason
 	securityPolicyReasonEnd
@@ -114,6 +116,10 @@ func (self SecurityPolicyReason) String() string {
 		return "allow-app-standard:levin"
 	case SecurityPolicyReasonAllowRakNet:
 		return "allow-app-standard:raknet"
+	case SecurityPolicyReasonAllowEthereumDiscv4:
+		return "allow-app-standard:ethereum-discv4"
+	case SecurityPolicyReasonAllowEthereumRlpx:
+		return "allow-app-standard:ethereum-rlpx"
 	default:
 		return "unknown"
 	}

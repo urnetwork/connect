@@ -155,6 +155,7 @@ and are local diagnostics: nothing about them is sent off the device.
 | `ip_security_dmca.go`        | yes | Per-flow DPI state machine, including BitTorrent signatures, RTP probation, and the encrypted heuristic. |
 | `ip_security_webstandard.go` | yes | TLS/DTLS/QUIC/STUN/TURN/RTP/RTCP framing and header classifier. |
 | `ip_security_appstandard.go` | yes | WireGuard/OpenVPN/RTMP/Levin/RakNet application-standard detectors. |
+| `ip_security_appstandard_ethereum.go` | yes | Ethereum devp2p discovery v4 (keccak256 packet hash) and RLPx auth (length-exact, on-curve secp256k1 key) detectors. |
 | `security/main.go`           | yes | Generator for the block tables (`go generate ./...`). |
 | `*_test.go`                  | yes | Behavior, invariant, cross-check, and zero-alloc tests. |
 
@@ -391,8 +392,9 @@ On the **first** observation: TCP `sawFlowStart = (SYN present)`; UDP
      terminal `allow` once the budget is spent (the BitTorrent check above keeps
      running until then);
    - whitelisted stateless standard (§4.4) → terminal `allow`;
-   - single-packet application standard (§4.4.2) → `allow`, unless the bytes
-     after its header carry any BitTorrent signature → terminal `bittorrent`;
+   - single-packet application standard (§4.4.2), matched over the complete
+     payload → `allow`, unless the bytes after its header carry any BitTorrent
+     signature → terminal `bittorrent`;
    - a pending two-packet application candidate confirmed → `allow`; a failed
      candidate is judged normally below;
    - a packet that opens a two-packet application candidate → consumes budget,
@@ -471,6 +473,8 @@ invariant from a public specification:
 | RTMP | TCP, first payload | `03`, 4-byte time, 4-byte zero word (the digest variant is not matched) | Adobe RTMP 1.0 §5.2 |
 | Levin | TCP, first payload | signature `01 21 01 01 01 01 01 01`, `protocol_version == 1` (LE u32 at 29), body length ≤ 100,000,000 | Monero `levin_base.h` |
 | RakNet | UDP | open connection request 1/2 (`05`/`07`) with the 16-byte offline magic at offset 1, or unconnected ping (`01`) with it at offset 9 | RakNet `MessageIdentifiers.h`, `RakPeer.cpp` |
+| Ethereum discovery v4 | UDP, any packet while inspecting | `hash ‖ signature (65) ‖ packet-type ‖ packet-data`, 99–1280 bytes, type 1–6, data a canonical RLP list that fits; then `hash == keccak256(signature ‖ packet-type ‖ packet-data)` over the complete packet | devp2p `discv4.md` (Wire Protocol) |
+| Ethereum RLPx | TCP, first payload | the whole segment is the initiator's auth: EIP-8 `auth-size (BE u16) == len − 2`, `auth-size ≥ 282` (ECIES overhead 113 + the minimal RLP auth body 169), then `04 ‖ x ‖ y` an uncompressed secp256k1 point (`x, y < p`, `y² = x³ + 7 mod p`); or the pre-EIP-8 auth, exactly 307 bytes starting with such a point | devp2p `rlpx.md` (Initial Handshake, ECIES), EIP-8, SEC 2 (secp256k1) |
 
 Rules: they run after the BitTorrent signatures, the gaming exception and the web
 standards; an allowed flow keeps checking the BitTorrent signatures until its
@@ -480,8 +484,31 @@ encrypted, so a random BitTorrent flow whose first blob happens to match an open
 (≈ 2^-32 per flow) is dropped one packet later; repeated openers end at the budget.
 The WhatsApp Noise "WA" framing is **not implemented**: its bytes must first be
 confirmed against a capture. `AppStandardSettings` (`Dmca.App`) has `Enabled`,
-`WireGuard`, `OpenVpn`, `Rtmp`, `Levin`, `RakNet`, all on by default; nil
-disables them.
+`WireGuard`, `OpenVpn`, `Rtmp`, `Levin`, `RakNet`, `EthereumDiscv4`,
+`EthereumRlpx`, all on by default; nil disables them.
+
+**Ethereum and the fan-out threat model.** Ethereum nodes talk to many peers on
+user ports with payloads random from byte 0 — the flow-level profile of
+encrypted BitTorrent. They are admitted per flow only by a cryptographic
+invariant the flow itself carries, never by port, fan-out or entropy:
+
+| Detector | Random payload | MSE/PE (`Ya` 96 + `PadA` 0–512) | Plain peer wire / tracker | µTP, DHT, UDP tracker |
+|----------|----------------|---------------------------------|---------------------------|------------------------|
+| discovery v4 | ≤ 2^-256 (keccak), and the hash only runs for the ≈ 1 in 200 datagrams that pass the structural checks | TCP: never (UDP only). Over µTP it is a UDP datagram: ≤ 2^-256 | never (TCP) | first bytes are fixed (`(type<<4)\|1`, `d1:`, the tracker magic) and would have to equal a keccak256 output: ≤ 2^-256; the signatures run first anyway |
+| RLPx EIP-8 | 2^-16 (size) × 2^-8 (`04`) × ≈ 2^-255 (on curve) ≈ 2^-279 | same as random; the 148-byte and every length < 284 can never match | never: `13 42` declares 4,930 bytes and byte 2 is `i`; the signatures run first | never (UDP) |
+| RLPx pre-EIP-8 | only at exactly 307 bytes: 2^-8 × ≈ 2^-255 | only `PadA = 211`: ≈ 2^-263 | never | never (UDP) |
+
+A modified client can forge either invariant (compute a keccak, use a real
+curve point), which is the accepted disguise class (§4.8); a stock BitTorrent
+client cannot. The responder's ack/pong is ingress and is not inspected, so no
+reverse-direction confirmation is used — none is needed at these
+probabilities. **Discovery v5 is not detectable**: its header is AES-CTR
+masked with the first 16 bytes of the *destination* node id, which the exit
+never sees, so a v5 packet is indistinguishable from random; it shares the v4
+socket, so a v5 datagram before any v4 packet on the same 5-tuple counts toward
+the heuristic (a v4 packet while still inspecting admits the flow). An RLPx auth
+split across TCP segments (MSS below ~500) is not matched and is dropped as
+before.
 
 #### 4.4.1 Steam/Valve provider exception (→ Allow)
 
@@ -536,6 +563,7 @@ can drop.
 | `Gaming.AllowSteam` | `true` | Allow Valve-prefix + documented-remote-port Steam traffic after BitTorrent checks. |
 | `App.Enabled` | `true` | Master switch for application standards (§4.4.2). |
 | `App.WireGuard`, `.OpenVpn`, `.Rtmp`, `.Levin`, `.RakNet` | `true` | Individual application-standard detectors. |
+| `App.EthereumDiscv4`, `.EthereumRlpx` | `true` | Ethereum devp2p discovery v4 and RLPx auth (§4.4.2). |
 | `InspectPrivilegedSignatures` | `true` | Run the stateless BitTorrent signatures on privileged ports (§4.0); false restores the uninspected allow. |
 | `InspectionPacketBudget` | `8` | Max payload packets before giving up (→ Allow). |
 | `EncryptedDecisionPackets` | `3` | Encrypted-looking packets required before the heuristic drops. |
@@ -578,8 +606,9 @@ Plaintext BitTorrent signatures are also caught on privileged ports (§4.0), so 
 peer listening on 443 or a tracker announce on 80 is an incident.
 
 **Not caught / evasions:** forced encryption with DHT/LSD/PEX disabled behind a
-whitelisted-protocol disguise (a fake TLS ClientHello or a WireGuard/OpenVPN/RTMP
-header prefixed by a modified client); encrypted BitTorrent on a privileged port
+whitelisted-protocol disguise (a fake TLS ClientHello, a WireGuard/OpenVPN/RTMP
+header prefixed by a modified client, or a forged discv4 hash / RLPx curve
+point); encrypted BitTorrent on a privileged port
 (the entropy heuristic does not run there by design); a UDP flow joined
 mid-stream (handshake missed; TCP is protected by `sawFlowStart`, UDP is not);
 nested tunneling (VPN-over-VPN — WireGuard and OpenVPN are now admitted
@@ -587,8 +616,9 @@ deliberately: abuse inside them exits from the VPN server's address).
 
 **Accepted FP surface (dropped by design):** fully encrypted protocols with no
 plaintext structure on inspected ports: MSE/PE BitTorrent and encrypted µTP (the
-target), Mosh, ZeroTier, Bitcoin BIP324 v2, Ethereum RLPx/devp2p (a many-peer
-profile indistinguishable from BitTorrent), obfs4, the RTMP digest handshake, and
+target), Mosh, ZeroTier, Bitcoin BIP324 v2, Ethereum discovery v5 (masked with
+the destination node id) and an RLPx auth split across TCP segments, obfs4, the
+RTMP digest handshake, and
 proprietary game/voice crypto outside a scoped exception. To spare one, add a
 positive protocol detector (§4.4, §4.4.2) or a provider-prefix + remote-port
 exception (§4.4.1). Quotas or a provider opt-in tier for the long tail are not
@@ -604,7 +634,8 @@ implemented (IPSECURITY-UPDATE4 §6.5, §10).
   BitTorrent BEP 3 / 5 / 14 / 15 / 29; TLS RFC 8446 / 5246; DTLS RFC 6347 / 9147;
   QUIC RFC 9000 / 9369; STUN RFC 8489; TURN RFC 8656; RTP/RTCP RFC 3550 and
   multiplexing RFC 7983; WireGuard whitepaper; OpenVPN protocol documentation;
-  Adobe RTMP 1.0; Monero `levin_base.h`; RakNet message identifiers. Byte
+  Adobe RTMP 1.0; Monero `levin_base.h`; RakNet message identifiers; Ethereum
+  devp2p `discv4.md`, `rlpx.md` and EIP-8, with secp256k1 from SEC 2. Byte
   signatures and constants are functional protocol facts, not derived from any
   third-party implementation.
 - **Steam exception** is factual prefix and port data published by Valve/Steam;
@@ -657,7 +688,12 @@ implemented (IPSECURITY-UPDATE4 §6.5, §10).
 - **Application standards:** positive flows, near misses, toggles, BitTorrent
   precedence over every detector, MSE/encrypted µTP still dropped (including the
   148-byte variant), privileged-port signatures, zero allocation and a fuzz target
-  in `ip_security_appstandard_test.go`.
+  in `ip_security_appstandard_test.go`; for Ethereum, positive discv4/RLPx
+  flows, near misses of every structural and cryptographic check, every
+  BitTorrent variant (MSE/PE paddings including 148 and 211, look-alikes that
+  pass every structural check, encrypted µTP, the plaintext signatures on 30303
+  and on privileged ports), random payloads, a differential fuzz target and
+  zero allocation in `ip_security_appstandard_ethereum_test.go`.
 - **Client fail fast:** `ip_remote_multi_client_policy_reject_test.go` (reset,
   unreachable, retry routing, incidents never hinted) and
   `ip_policy_hint_test.go` (hint ttl/bound with an injected clock, ICMPv6, block

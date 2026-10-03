@@ -12,6 +12,9 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -19,6 +22,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
+	"golang.org/x/crypto/sha3"
 )
 
 type fixture struct {
@@ -122,6 +129,144 @@ func tlsClientHello(s *stream) []byte {
 	body := cat([]byte{0x03, 0x03}, s.bytes(32), []byte{0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00})
 	handshake := cat([]byte{0x01, 0x00}, be16(uint16(len(body))), body)
 	return cat([]byte{0x16, 0x03, 0x01}, be16(uint16(len(handshake))), handshake)
+}
+
+// rlp (Ethereum yellow paper appendix B): byte strings and lists
+func rlpString(b []byte) []byte {
+	if len(b) == 1 && b[0] < 0x80 {
+		return b
+	}
+	return cat(rlpHeader(0x80, len(b)), b)
+}
+
+func rlpUint(v uint64) []byte {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], v)
+	i := 0
+	for i < 8 && b[i] == 0 {
+		i += 1
+	}
+	return rlpString(b[i:])
+}
+
+func rlpList(items ...[]byte) []byte {
+	payload := cat(items...)
+	return cat(rlpHeader(0xc0, len(payload)), payload)
+}
+
+func rlpHeader(offset byte, length int) []byte {
+	if length <= 55 {
+		return []byte{offset + byte(length)}
+	}
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(length))
+	i := 0
+	for b[i] == 0 {
+		i += 1
+	}
+	return cat([]byte{offset + 55 + byte(8-i)}, b[i:])
+}
+
+func keccak256(parts ...[]byte) []byte {
+	h := sha3.NewLegacyKeccak256()
+	for _, part := range parts {
+		h.Write(part)
+	}
+	return h.Sum(nil)
+}
+
+// sign is a recoverable secp256k1 signature r || s || recovery id over a
+// 32-byte hash (deterministic, RFC 6979)
+func sign(key *secp256k1.PrivateKey, hash []byte) []byte {
+	compact := ecdsa.SignCompact(key, hash, false)
+	return cat(compact[1:65], []byte{compact[0] - 27})
+}
+
+func privateKey(s *stream) *secp256k1.PrivateKey {
+	return secp256k1.PrivKeyFromBytes(s.bytes(32))
+}
+
+// devp2p discv4 "Wire Protocol": hash || signature || packet-type || packet-data,
+// signature = sign(keccak256(packet-type || packet-data)),
+// hash = keccak256(signature || packet-type || packet-data)
+func discv4Packet(key *secp256k1.PrivateKey, packetType byte, data []byte) []byte {
+	typed := cat([]byte{packetType}, data)
+	signature := sign(key, keccak256(typed))
+	return cat(keccak256(signature, typed), signature, typed)
+}
+
+// discv4 endpoint = [ip, udp-port, tcp-port]; RFC 5737 documentation addresses
+func discv4Endpoint(ip []byte, udpPort uint64, tcpPort uint64) []byte {
+	return rlpList(rlpString(ip), rlpUint(udpPort), rlpUint(tcpPort))
+}
+
+// NIST SP 800-56 concatenation KDF with SHA-256 (rlpx "ECIES Encryption")
+func concatKdf(z []byte, length int) []byte {
+	var out []byte
+	for counter := uint32(1); len(out) < length; counter += 1 {
+		var c [4]byte
+		binary.BigEndian.PutUint32(c[:], counter)
+		sum := sha256.Sum256(cat(c[:], z))
+		out = append(out, sum[:]...)
+	}
+	return out[:length]
+}
+
+// rlpx "ECIES Encryption": R || iv || c || d, where R = r*G, S = x(r*K_B),
+// kE || kM = KDF(S, 32), c = AES-128-CTR(kE, iv, m),
+// d = HMAC-SHA256(sha256(kM), iv || c || shared-mac-data)
+func eciesEncrypt(s *stream, recipient *secp256k1.PublicKey, message []byte, sharedMacData []byte) []byte {
+	ephemeral := privateKey(s)
+	key := concatKdf(secp256k1.GenerateSharedSecret(ephemeral, recipient), 32)
+	block, err := aes.NewCipher(key[:16])
+	if err != nil {
+		panic(err)
+	}
+	iv := s.bytes(16)
+	c := make([]byte, len(message))
+	cipher.NewCTR(block, iv).XORKeyStream(c, message)
+	macKey := sha256.Sum256(key[16:32])
+	mac := hmac.New(sha256.New, macKey[:])
+	mac.Write(iv)
+	mac.Write(c)
+	mac.Write(sharedMacData)
+	return cat(ephemeral.PubKey().SerializeUncompressed(), iv, c, mac.Sum(nil))
+}
+
+func xor(a []byte, b []byte) []byte {
+	out := make([]byte, len(a))
+	for i := range a {
+		out[i] = a[i] ^ b[i]
+	}
+	return out
+}
+
+// rlpx "Initial Handshake" auth from the initiator. EIP-8: auth-size ||
+// ecies(auth-body || auth-padding) with auth-size as the shared mac data,
+// auth-body = [sig, initiator-pubk, initiator-nonce, auth-vsn = 4]. Pre-EIP-8:
+// ecies(sig || keccak256(ephemeral-pubk) || initiator-pubk || nonce || 0x00),
+// 307 bytes. sig = sign(ephemeral-privk, static-shared-secret ^ nonce).
+func rlpxAuth(s *stream, eip8 bool, padding int) []byte {
+	initiator := privateKey(s)
+	recipient := privateKey(s).PubKey()
+	ephemeral := privateKey(s)
+	nonce := s.bytes(32)
+	signature := sign(ephemeral, xor(secp256k1.GenerateSharedSecret(initiator, recipient), nonce))
+	initiatorPublic := initiator.PubKey().SerializeUncompressed()[1:]
+	if !eip8 {
+		body := cat(signature, keccak256(ephemeral.PubKey().SerializeUncompressed()[1:]), initiatorPublic, nonce, []byte{0})
+		return eciesEncrypt(s, recipient, body, nil)
+	}
+	body := cat(rlpList(rlpString(signature), rlpString(initiatorPublic), rlpString(nonce), rlpUint(4)), s.bytes(padding))
+	// ecies adds R (65), iv (16) and d (32)
+	size := be16(uint16(65 + 16 + len(body) + 32))
+	return cat(size, eciesEncrypt(s, recipient, body, size))
+}
+
+// an RLPx frame after the handshake: header-ciphertext (16) || header-mac (16)
+// || frame-ciphertext padded to 16 || frame-mac (16)
+func rlpxFrame(s *stream, frameSize int) []byte {
+	return s.bytes(16 + 16 + (frameSize+15)/16*16 + 16)
 }
 
 func main() {
@@ -448,6 +593,121 @@ func main() {
 	},
 		[]byte("d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe"),
 	)
+
+	{
+		s := newStream("ethereum-discv4")
+		key := privateKey(s)
+		local := discv4Endpoint([]byte{192, 0, 2, 10}, 30303, 30303)
+		remote := discv4Endpoint([]byte{203, 0, 113, 40}, 30303, 30303)
+		expiration := rlpUint(1790000000)
+		ping := discv4Packet(key, 0x01, rlpList(rlpUint(4), local, remote, expiration, rlpUint(7)))
+		add(fixture{
+			Name:            "ethereum-discv4",
+			Protocol:        "ethereum-discv4",
+			Provenance:      "devp2p discv4 Wire Protocol: hash || signature || packet-type || packet-data; Ping (1), Pong (2), FindNode (3), ENRRequest (5)",
+			Transport:       "udp",
+			DestinationPort: 30303,
+			ExpectBefore:    "drop",
+			ExpectAfter:     "allow",
+		},
+			ping,
+			discv4Packet(key, 0x02, rlpList(remote, rlpString(ping[:32]), expiration, rlpUint(7))),
+			discv4Packet(key, 0x05, rlpList(expiration)),
+			discv4Packet(key, 0x03, rlpList(rlpString(s.bytes(64)), expiration)),
+		)
+	}
+	{
+		s := newStream("ethereum-discv4-bad-hash")
+		key := privateKey(s)
+		expiration := rlpUint(1790000000)
+		corrupt := func(packet []byte) []byte {
+			packet[0] ^= 0x01
+			return packet
+		}
+		add(fixture{
+			Name:            "ethereum-discv4-bad-hash",
+			Protocol:        "ethereum-discv4",
+			Provenance:      "devp2p discv4 packets whose hash does not match keccak256 of the rest; not matched by design",
+			Transport:       "udp",
+			DestinationPort: 30303,
+			ExpectBefore:    "drop",
+			ExpectAfter:     "drop",
+			Note:            "a discv4-shaped header without the hash invariant is judged by the encrypted heuristic",
+		},
+			corrupt(discv4Packet(key, 0x01, rlpList(rlpUint(4), discv4Endpoint([]byte{192, 0, 2, 10}, 30303, 30303), discv4Endpoint([]byte{203, 0, 113, 40}, 30303, 30303), expiration, rlpUint(7)))),
+			corrupt(discv4Packet(key, 0x05, rlpList(expiration))),
+			corrupt(discv4Packet(key, 0x03, rlpList(rlpString(s.bytes(64)), expiration))),
+		)
+	}
+	{
+		s := newStream("ethereum-rlpx-eip8")
+		add(fixture{
+			Name:            "ethereum-rlpx-eip8",
+			Protocol:        "ethereum-rlpx",
+			Provenance:      "devp2p RLPx Initial Handshake with EIP-8 auth (auth-size || ECIES R || iv || c || d), then framed Hello and Status",
+			Transport:       "tcp",
+			DestinationPort: 30303,
+			ExpectBefore:    "drop",
+			ExpectAfter:     "allow",
+		},
+			rlpxAuth(s, true, 150),
+			rlpxFrame(s, 140),
+			rlpxFrame(s, 100),
+			rlpxFrame(s, 3),
+		)
+	}
+	{
+		s := newStream("ethereum-rlpx-pre-eip8")
+		add(fixture{
+			Name:            "ethereum-rlpx-pre-eip8",
+			Protocol:        "ethereum-rlpx",
+			Provenance:      "devp2p RLPx Initial Handshake with the pre-EIP-8 307-byte auth (ECIES R || iv || c || d), then frames",
+			Transport:       "tcp",
+			DestinationPort: 30303,
+			ExpectBefore:    "drop",
+			ExpectAfter:     "allow",
+		},
+			rlpxAuth(s, false, 0),
+			rlpxFrame(s, 140),
+			rlpxFrame(s, 100),
+		)
+	}
+	{
+		s := newStream("ethereum-rlpx-off-curve")
+		auth := rlpxAuth(s, true, 150)
+		// replace the ephemeral key's y with bytes that are not on the curve
+		copy(auth[2+33:2+65], s.bytes(32))
+		add(fixture{
+			Name:            "ethereum-rlpx-off-curve",
+			Protocol:        "ethereum-rlpx",
+			Provenance:      "an EIP-8-shaped auth whose ephemeral key is not a secp256k1 point; not matched by design",
+			Transport:       "tcp",
+			DestinationPort: 30303,
+			ExpectBefore:    "drop",
+			ExpectAfter:     "drop",
+		},
+			auth,
+			rlpxFrame(s, 140),
+			rlpxFrame(s, 100),
+		)
+	}
+	{
+		// MSE with PadA = 211 is exactly the 307-byte length of a pre-EIP-8 auth
+		s := newStream("mse-tcp-pad211")
+		add(fixture{
+			Name:            "mse-tcp-pad211",
+			Protocol:        "bittorrent-mse",
+			Provenance:      "BitTorrent Message Stream Encryption: Ya (96 bytes) + PadA (211 random bytes, the pre-EIP-8 RLPx auth length), then encrypted messages",
+			Transport:       "tcp",
+			DestinationPort: 30303,
+			ExpectBefore:    "drop",
+			ExpectAfter:     "drop",
+		},
+			s.bytes(96+211),
+			s.bytes(120),
+			s.bytes(300),
+		)
+	}
 
 	for _, f := range fixtures {
 		out, err := json.MarshalIndent(f, "", "  ")

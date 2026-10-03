@@ -1,0 +1,15 @@
+{
+  "name": "ethereum-discv4-bad-hash",
+  "protocol": "ethereum-discv4",
+  "provenance": "devp2p discv4 packets whose hash does not match keccak256 of the rest; not matched by design",
+  "transport": "udp",
+  "destination_port": 30303,
+  "payloads": [
+    "db5f19a1dca7d030273e3147c14305917f69a20271d954b40edd1a9bf400c0555df5c41c3e3e00d60eca2055c3839cce42f2f6e411c2040a728e0c08f1d08ea03475243a8823d263f1a0dcbc82548680881e839c8fb0a036ee57b43429660fd40001df04cb84c000020a82765f82765fcb84cb00712882765f82765f846ab13b8007",
+    "28381fa3feea2c7cb47a763d7b5bd0f04f4a3caa46b0b7e3b1d22c3def82073a5094a35745e4aa383303d8da146f4cd981e95c8e176dfdd58b4ff9c0938c77af73d0503ea46ad8fb0c12959853eae2cf5517f363c8c81b8432707f9cd343f00e0105c5846ab13b80",
+    "65fd7c76882b17accdd12405c807ad959752ba3807f99db6e6fb522283b32402f6a24177bec82e68b230d3b8d092773fa90ff47740977719e233ed857db4f6ed345cdf308ee78838484bb55fa4e7f02f198310e6ec746f446c06411048ddf0ed0103f847b840b9c99e3d37aef316c872a2d32e0f8a930ae923f1e79885b80acf522823634700168a860e7f799a89eae312b9f0284b48d3d774646d2959879ba0f2eb5f5a6aab846ab13b80"
+  ],
+  "expect_before": "drop",
+  "expect_after": "drop",
+  "note": "a discv4-shaped header without the hash invariant is judged by the encrypted heuristic"
+}
