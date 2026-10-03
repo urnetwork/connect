@@ -56,6 +56,7 @@ func preparationControlCapacity(ctx context.Context, request PreparationRequest,
 	}
 	for _, source := range plan.Sources {
 		step := preparationStep{Kind: source.File.Kind, Path: filepath.Join(request.RootPath, source.File.Path), Mode: source.File.Mode, Bytes: source.File.Bytes, Sha256: source.File.Sha256}
+		step.Move = preparationSourceMoves(plan, source)
 		if source.File.Kind == "file" {
 			step.Source = &source
 		}

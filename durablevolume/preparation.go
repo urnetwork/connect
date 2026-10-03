@@ -14,6 +14,7 @@ const PreparationPlanSchema = "urnetwork-storage-preparation-plan-v1"
 const PreparationResultSchema = "urnetwork-storage-preparation-result-v1"
 const PreparationFenceSchema = "urnetwork-storage-preparation-fence-v1"
 const PreparationAttribute = "user.urnetwork.storage-preparation"
+const PreparationCompleteUnion = "complete-union-v1"
 
 var ErrPreparationUncertain = errors.New("storage preparation requires joined exact-plan readback")
 
@@ -72,6 +73,8 @@ type PreparationOwner struct {
 	RelativePath string          `json:"relative_path"`
 	Purpose      string          `json:"purpose"`
 	Inputs       json.RawMessage `json:"inputs"`
+	// Absence preserves the original complete single-owner restore contract.
+	RestoreCoverage string `json:"restore_coverage,omitempty"`
 }
 
 // External evidence is an explicit assertion, not proof from a local flock
@@ -122,6 +125,22 @@ type PreparedAttribute struct {
 	Raw  []byte                   `json:"raw"`
 }
 
+// Only a fixed restore adapter may nominate one unsigned physical census.
+// Original bytes remain separately retained; signed member payloads do not
+// receive this permission. The reviewed bound is independent of plan size.
+type PreparationPhysicalMetadata struct {
+	Path         string `json:"path"`
+	MaximumBytes uint64 `json:"maximum_bytes"`
+}
+
+// Both original and derived hashes remain in the accepted plan. Original is
+// an immutable staged file; Derived names only the fixed unsigned census.
+type PreparationDerivation struct {
+	OwnerIndex int               `json:"owner_index"`
+	Original   PreparationSource `json:"original"`
+	Derived    PreparationFile   `json:"derived"`
+}
+
 // A fixed adapter builds fresh public bytes in staging and later inspects the
 // copied target. It borrows descriptors synchronously, never closes them,
 // starts workers, signs, writes the live target or authorizes a restart.
@@ -130,16 +149,20 @@ type PreparationAdapter struct {
 	Inspect        func(context.Context, *os.File, PreparationOwnerPlan) ([]PreparedAttribute, error)
 	Restore        func(context.Context, string, PreparationOwner, Inventory) (PreparationOwnerPlan, error)
 	InspectRestore func(context.Context, *os.File, PreparationOwnerPlan, Inventory) ([]PreparedAttribute, error)
+	// RebindRestore is pure: it borrows original metadata bytes and reviewed
+	// target-member identities, returning only a bounded unsigned census.
+	RebindRestore func(context.Context, PreparationOwnerPlan, Inventory, []byte, []PreparationSource) ([]byte, error)
 }
 
 // The public semantic census and portable staged files bind one fixed adapter.
 type PreparationOwnerPlan struct {
-	Owner         PreparationOwner           `json:"owner"`
-	StagingName   string                     `json:"staging_name"`
-	ExclusiveRoot bool                       `json:"exclusive_root,omitempty"`
-	Files         []PreparationFile          `json:"files"`
-	Attributes    []PreparationAttributeSpec `json:"attributes"`
-	Census        json.RawMessage            `json:"census"`
+	Owner            PreparationOwner             `json:"owner"`
+	StagingName      string                       `json:"staging_name"`
+	ExclusiveRoot    bool                         `json:"exclusive_root,omitempty"`
+	Files            []PreparationFile            `json:"files"`
+	Attributes       []PreparationAttributeSpec   `json:"attributes"`
+	Census           json.RawMessage              `json:"census"`
+	PhysicalMetadata *PreparationPhysicalMetadata `json:"physical_metadata,omitempty"`
 }
 
 // Every copied file retains both a portable target manifest and its original
@@ -168,6 +191,7 @@ type PreparationPlan struct {
 	Marker            []byte                         `json:"marker"`
 	Lease             []byte                         `json:"lease"`
 	Owners            []PreparationOwnerPlan         `json:"owners"`
+	Derivations       []PreparationDerivation        `json:"derivations,omitempty"`
 	Sources           []PreparationSource            `json:"sources"`
 	RestartAuthorized bool                           `json:"restart_authorized"`
 }

@@ -463,12 +463,6 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 			prepared, err = adapter.Build(ctx, admission.directories[request.StagingDirectory], name, owner)
 		} else {
 			prepared, err = adapter.Restore(ctx, name, owner, archive.inventory)
-			if err == nil {
-				err = validatePreparationRestoreOwner(archive.inventory, prepared)
-			}
-			if err == nil {
-				err = archive.stage(admission.directories[request.StagingDirectory], name, prepared)
-			}
 		}
 		if err != nil {
 			return result, err
@@ -477,8 +471,26 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 			return result, errors.New("preparation adapter changed its exact public owner scope")
 		}
 		result.Owners = append(result.Owners, prepared)
+		if prepared.PhysicalMetadata != nil && archive == nil {
+			return result, errors.New("fresh preparation cannot derive retained physical metadata")
+		}
 	}
-	if err := bindPreparationSources(ctx, request, &result); err != nil {
+	if archive != nil {
+		// Pure owner views must form a complete disjoint union before any
+		// source member is staged. The original full report remains retained.
+		if err := validatePreparationRestoreCoverage(archive.inventory, result.Owners); err != nil {
+			return result, err
+		}
+		for index, owner := range result.Owners {
+			if err := archive.stage(admission.directories[request.StagingDirectory], owner.StagingName, owner); err != nil {
+				return result, err
+			}
+			if err := preparePhysicalMetadata(ctx, admission, adapter, archive.inventory, &result, index); err != nil {
+				return result, err
+			}
+		}
+	}
+	if err := bindPreparationSources(ctx, request, &result, nil); err != nil {
 		return result, err
 	}
 	if err := preparationControlCapacity(ctx, request, result); err != nil {
@@ -522,10 +534,20 @@ func preparationRelative(path string, maximumDepth uint64, allowRoot bool) bool 
 
 // Plan members are sorted parent-first. Empty directories remain explicit
 // members; no hidden files or unspecified owner attribute can be published.
-func bindPreparationSources(ctx context.Context, request PreparationRequest, plan *PreparationPlan) error {
+func bindPreparationSources(ctx context.Context, request PreparationRequest, plan *PreparationPlan, retained []PreparationSource) error {
 	seen, attributes := map[string]bool{}, map[string]bool{}
+	retainedSources := map[string]PreparationSource{}
+	for _, source := range retained {
+		if _, exists := retainedSources[source.Path]; exists {
+			return errors.New("prepared source paths are duplicated")
+		}
+		retainedSources[source.Path] = source
+	}
 	bytesUsed, attributesUsed := uint64(0), uint64(0)
 	for _, owner := range plan.Owners {
+		if err := validatePreparationPhysicalMetadata(request, owner); err != nil {
+			return err
+		}
 		if len(owner.Census) == 0 || len(owner.Files) == 0 && len(owner.Attributes) == 0 {
 			return errors.New("preparation adapter returned no exact file or attribute census")
 		}
@@ -544,6 +566,27 @@ func bindPreparationSources(ctx context.Context, request PreparationRequest, pla
 			bytesUsed += file.Bytes
 			path := filepath.Join(request.StagingDirectory, owner.StagingName, file.Path)
 			opened, err := preparationOpenAbsolute(path, file.Kind == "directory")
+			if retained != nil && owner.PhysicalMetadata != nil {
+				targetPath := filepath.Join(request.RootPath, file.Path)
+				if errors.Is(err, syscall.ENOENT) {
+					prior, present := retainedSources[path]
+					if !present || prior.File != file {
+						return errors.Join(ErrIdentity, errors.New("moved restore source lacks its original reviewed identity"))
+					}
+					opened, err = preparationOpenAbsolute(targetPath, false)
+					if errors.Is(err, syscall.ENOENT) {
+						return errors.Join(ErrIdentity, errors.New("reviewed restore member is absent from both source and target"), err)
+					}
+				} else if err == nil {
+					target, targetErr := preparationOpenAbsolute(targetPath, false)
+					if targetErr == nil {
+						return errors.Join(ErrIdentity, errors.New("restore member exists at both reviewed source and target"), opened.Close(), target.Close())
+					}
+					if !errors.Is(targetErr, syscall.ENOENT) {
+						return errors.Join(targetErr, opened.Close())
+					}
+				}
+			}
 			if err != nil {
 				return err
 			}
@@ -706,7 +749,7 @@ func readPreparationPlan(ctx context.Context, reference Reference, scope ownerSc
 	}
 	copyPlan := plan
 	copyPlan.Sources = nil
-	if err := bindPreparationSources(ctx, request, &copyPlan); err != nil {
+	if err := bindPreparationSources(ctx, request, &copyPlan, plan.Sources); err != nil {
 		return plan, request, err
 	}
 	if !reflect.DeepEqual(plan.Sources, copyPlan.Sources) {

@@ -20,16 +20,26 @@ import (
 )
 
 // Restore is a new empty target with known historical source, never a renamed
-// fresh request. Shared multi-owner archives remain an explicit later profile.
+// fresh request. Shared coverage is explicit; omission retains the old profile.
 func (self PreparationRequest) validateRestore() error {
 	if self.Purpose == "fresh" {
 		if self.RestoreSource != nil {
 			return errors.New("fresh preparation cannot contain retained restore authority")
 		}
+		for _, owner := range self.Owners {
+			if owner.RestoreCoverage != "" {
+				return errors.New("fresh preparation cannot select retained owner coverage")
+			}
+		}
 		return nil
 	}
-	if self.Purpose != "restore" || self.RestoreSource == nil || len(self.Owners) != 1 {
-		return errors.New("restore requires one fixed owner and an explicit complete source archive")
+	if self.Purpose != "restore" || self.RestoreSource == nil || len(self.Owners) == 0 {
+		return errors.New("restore requires fixed owner coverage and an explicit complete source archive")
+	}
+	for _, owner := range self.Owners {
+		if owner.RestoreCoverage != "" && owner.RestoreCoverage != PreparationCompleteUnion || len(self.Owners) != 1 && owner.RestoreCoverage != PreparationCompleteUnion {
+			return errors.New("shared restore coverage requires the explicit complete-union profile for every owner")
+		}
 	}
 	source := self.RestoreSource
 	if !canonical(source.Directory) || !canonical(source.Inventory.Path) || !validDigest(source.Inventory.Sha256) ||
@@ -134,6 +144,60 @@ func validatePreparationRestoreOwner(report Inventory, owner PreparationOwnerPla
 			return errors.New("restore adapter changed the original owner checkpoint destinations")
 		}
 		delete(attributes, attribute)
+	}
+	return nil
+}
+
+// Every source file and protocol head has exactly one fixed owner. Views may
+// omit unrelated names only when this complete union independently covers them;
+// duplicate ownership is refused, never collapsed by map assignment.
+func validatePreparationRestoreCoverage(report Inventory, owners []PreparationOwnerPlan) error {
+	if len(owners) == 1 && owners[0].Owner.RestoreCoverage == "" {
+		return validatePreparationRestoreOwner(report, owners[0])
+	}
+	files := map[string]PreparationFile{}
+	attributes := map[PreparationAttributeSpec]bool{}
+	for _, entry := range report.Entries {
+		if entry.Path != "" {
+			if _, found := files[entry.Path]; found {
+				return errors.New("restore coverage source repeats an original member")
+			}
+			files[entry.Path] = PreparationFile{Path: entry.Path, Kind: entry.Kind, Mode: entry.Mode, Bytes: entry.Size, Sha256: entry.Sha256}
+		}
+		for _, attribute := range entry.OwnerAttributes {
+			if entry.Path == "" && attribute.Name == PreparationAttribute {
+				continue
+			}
+			path := entry.Path
+			if path == "" {
+				path = "."
+			}
+			key := PreparationAttributeSpec{Path: path, Name: attribute.Name}
+			if attributes[key] {
+				return errors.New("restore coverage source repeats an original checkpoint")
+			}
+			attributes[key] = true
+		}
+	}
+	for _, owner := range owners {
+		if owner.Owner.Purpose != "restore" || owner.Owner.RelativePath != "." || owner.Owner.RestoreCoverage != PreparationCompleteUnion || len(owner.Census) == 0 || owner.ExclusiveRoot && len(owners) != 1 {
+			return errors.New("restore coverage changed its fixed owner scope or overlaps an exclusive root")
+		}
+		for _, file := range owner.Files {
+			if original, found := files[file.Path]; !found || original != file {
+				return errors.New("restore coverage overlaps, invents or changes an original member")
+			}
+			delete(files, file.Path)
+		}
+		for _, attribute := range owner.Attributes {
+			if !attributes[attribute] {
+				return errors.New("restore coverage overlaps or invents an original checkpoint")
+			}
+			delete(attributes, attribute)
+		}
+	}
+	if len(files) != 0 || len(attributes) != 0 {
+		return errors.New("restore coverage omitted original members or owner checkpoints")
 	}
 	return nil
 }

@@ -35,6 +35,7 @@ type preparationStep struct {
 	Sha256    string             `json:"sha256,omitempty"`
 	Source    *PreparationSource `json:"source,omitempty"`
 	Raw       []byte             `json:"raw,omitempty"`
+	Move      bool               `json:"move,omitempty"`
 }
 
 // Both original inode generations and the accepted plan bind the control.
@@ -80,6 +81,7 @@ type preparationApply struct {
 	position    int
 	retained    map[string]syscall.Stat_t
 	attributes  map[string][]byte
+	moveSources map[string]PreparationSource
 	hooks       *preparationHooks
 	failed      error
 }
@@ -560,6 +562,9 @@ func (self *preparationApply) attributeTarget(path string) (*os.File, error) {
 // A pending complete publication can be synced and acknowledged after its
 // former owner joins. Unknown/partial bytes are never filled in or replaced.
 func (self *preparationApply) observe(step preparationStep, pending bool) (_ PreparationIdentity, resultErr error) {
+	if step.Move {
+		return self.observeMovedRestoreFile(step, pending)
+	}
 	if step.Kind == "attribute" {
 		return self.observeAttribute(step, pending)
 	}
@@ -907,18 +912,23 @@ func applyPreparation(ctx context.Context, reference Reference, adapter Preparat
 		if err != nil {
 			return result, err
 		}
+		expectedOwners := make([]PreparationOwnerPlan, 0, len(plan.Owners))
 		for _, owner := range plan.Owners {
 			expected, err := adapter.Restore(ctx, owner.StagingName, owner.Owner, inventory)
 			if err != nil {
 				return result, err
 			}
-			if !reflect.DeepEqual(expected, owner) {
+			if owner.PhysicalMetadata == nil && !reflect.DeepEqual(expected, owner) {
 				return result, errors.New("accepted restore owner differs from its original fixed semantic census")
 			}
-			if err := validatePreparationRestoreOwner(inventory, owner); err != nil {
-				return result, err
-			}
+			expectedOwners = append(expectedOwners, expected)
 		}
+		if err := validatePreparationRestoreCoverage(inventory, expectedOwners); err != nil {
+			return result, err
+		}
+	}
+	if err := validatePhysicalMetadataDerivations(ctx, request, plan, adapter, inventory); err != nil {
+		return result, err
 	}
 	admission, err := openPreparationAdmission(ctx, request, host, scope, plan.RootSource)
 	if err != nil {
@@ -936,7 +946,7 @@ func applyPreparation(ctx context.Context, reference Reference, adapter Preparat
 	if err := admission.fence(); err != nil {
 		return result, err
 	}
-	self := &preparationApply{admission: admission, plan: plan, reference: reference, retained: map[string]syscall.Stat_t{}, attributes: map[string][]byte{}, hooks: hooks}
+	self := &preparationApply{admission: admission, plan: plan, reference: reference, retained: map[string]syscall.Stat_t{}, attributes: map[string][]byte{}, moveSources: preparationMoveSources(plan), hooks: hooks}
 	defer func() {
 		if self.control != nil {
 			resultErr = errors.Join(resultErr, self.control.Close())
@@ -958,6 +968,7 @@ func applyPreparation(ctx context.Context, reference Reference, adapter Preparat
 	}
 	for _, source := range plan.Sources {
 		step := preparationStep{Kind: source.File.Kind, Path: filepath.Join(request.RootPath, source.File.Path), Mode: source.File.Mode, Bytes: source.File.Bytes, Sha256: source.File.Sha256}
+		step.Move = preparationSourceMoves(plan, source)
 		if source.File.Kind == "file" {
 			copySource := source
 			step.Source = &copySource
