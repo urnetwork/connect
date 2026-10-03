@@ -1,0 +1,72 @@
+{
+  "artifact": "sanitized unlanded SDK duplex ACK-tail v3 diagnostic evidence",
+  "attribution_limits": [
+    "Original and candidate gates/warmup/budgets remain unchanged.",
+    "Primer all-arm runs diagnose phase and are not replacement capacity oracles.",
+    "The forced 50.1 ms first-ACK barrier is a synthetic recovery stimulus, not proof of the natural initial trigger.",
+    "These virtual FIFO results do not attribute historical host TCP failures.",
+    "Candidate fixes this SDK phase symptom but regresses genuine propagation growth; it is not a completed production fix."
+  ],
+  "candidate": {
+    "decision": "Do not land the ACK-tail v3 candidate.",
+    "production_status": "Current production is unchanged by this diagnostic candidate.",
+    "reason": "The candidate passes its forced and primer SDK probes but fails genuine RTT-growth controls.",
+    "status": "unlanded_rejected"
+  },
+  "counts": {
+    "completed_runs": 14,
+    "early_v3_passes": 3,
+    "exact_rtt_baseline_passes": 3,
+    "exact_rtt_trace_failures": 1,
+    "exact_rtt_v3_failures": 3,
+    "failed_outcomes": 11,
+    "forced_v3_passes": 3,
+    "full_numerical_readings": 122,
+    "late_v3_passes": 3,
+    "natural_v3_passes": 3,
+    "normalized_outcomes": 170,
+    "passed_outcomes": 159,
+    "service_control_failures": 1,
+    "service_control_passes": 6,
+    "worker_after_passes": 30,
+    "worker_before_expected_failures": 3,
+    "worker_race_passes": 102
+  },
+  "excluded_exploration": "Older quiet and quantum explorations are excluded from the final candidate evidence and remain diagnostics only.",
+  "handoff_sha256": "8551af12d0b0062d0a8943c88e873b5500889451dd3080ba3f8d18d16e89ceee",
+  "redaction": "No raw logs, source or overlay contents, binaries, commands, absolute paths, or trace text are included. The archive retains normalized outcomes, full numerical readings, and content hashes only.",
+  "schema": "throughput-fix-2/sdk-ack-tail-v3-evidence-summary-v1",
+  "scope": "New cumulative H1 burst-tail ACK policy only; pacing unchanged except separately named trace instrumentation.",
+  "true_rtt_growth_failure": {
+    "cell": {
+      "ack_compression_ns": 10000000,
+      "change_after_ns": 4000000000,
+      "flows": 8,
+      "initial_round_trip_ns": 300000,
+      "measurement_seconds": 1,
+      "payload_bytes": 1280,
+      "rate_bytes_per_second": 12500000,
+      "round_trip_after_ns": 100000000,
+      "warmup_seconds": 8
+    },
+    "control": "TestWindowPathAckTailRoundTripGrowthControl",
+    "service_control_failure_reading": {
+      "delivery_mbps": 6.8608,
+      "minimum_flow_mbps": 0.84992,
+      "reading_index": 47,
+      "run": "service-controls-v3"
+    },
+    "unchanged_baseline_delivery_mbps": [
+      95.80544,
+      95.82592,
+      95.80544
+    ],
+    "v3_delivery_mbps": [
+      72.45824,
+      24.7808,
+      42.25024
+    ],
+    "v3_failed_repetitions": 3,
+    "v3_trace_delivery_mbps": 14.11072
+  }
+}

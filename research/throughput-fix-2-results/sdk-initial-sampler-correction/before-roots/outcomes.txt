@@ -1,0 +1,49 @@
+=== RUN   TestWindowPacingSdkInitialAckBeforeWriteConfirmation
+--- FAIL: TestWindowPacingSdkInitialAckBeforeWriteConfirmation (0.00s)
+=== RUN   TestWindowPacingSdkInitialDelayedOpeningAccounting
+--- FAIL: TestWindowPacingSdkInitialDelayedOpeningAccounting (0.00s)
+=== RUN   TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain
+--- FAIL: TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain (0.00s)
+=== RUN   TestWindowPacingSdkInitialUnreadPairPreservesService
+--- PASS: TestWindowPacingSdkInitialUnreadPairPreservesService (0.00s)
+=== RUN   TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence
+--- PASS: TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence (0.00s)
+=== RUN   TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService
+--- FAIL: TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService (0.00s)
+=== RUN   TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSdkInitialFreshPairDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialFreshPairDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSdkInitialAckBeforeWriteConfirmation
+--- FAIL: TestWindowPacingSdkInitialAckBeforeWriteConfirmation (0.00s)
+=== RUN   TestWindowPacingSdkInitialDelayedOpeningAccounting
+--- FAIL: TestWindowPacingSdkInitialDelayedOpeningAccounting (0.00s)
+=== RUN   TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain
+--- FAIL: TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain (0.00s)
+=== RUN   TestWindowPacingSdkInitialUnreadPairPreservesService
+--- PASS: TestWindowPacingSdkInitialUnreadPairPreservesService (0.00s)
+=== RUN   TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence
+--- PASS: TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence (0.00s)
+=== RUN   TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService
+--- FAIL: TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService (0.00s)
+=== RUN   TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSdkInitialFreshPairDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialFreshPairDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSdkInitialAckBeforeWriteConfirmation
+--- FAIL: TestWindowPacingSdkInitialAckBeforeWriteConfirmation (0.00s)
+=== RUN   TestWindowPacingSdkInitialDelayedOpeningAccounting
+--- FAIL: TestWindowPacingSdkInitialDelayedOpeningAccounting (0.00s)
+=== RUN   TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain
+--- FAIL: TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain (0.00s)
+=== RUN   TestWindowPacingSdkInitialUnreadPairPreservesService
+--- PASS: TestWindowPacingSdkInitialUnreadPairPreservesService (0.00s)
+=== RUN   TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence
+--- PASS: TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence (0.00s)
+=== RUN   TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService
+--- FAIL: TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService (0.00s)
+=== RUN   TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService (0.00s)
+=== RUN   TestWindowPacingSdkInitialFreshPairDiscoversSlowService
+--- PASS: TestWindowPacingSdkInitialFreshPairDiscoversSlowService (0.00s)
+FAIL

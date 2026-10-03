@@ -1,3 +1,5 @@
+//go:build !js
+
 package connect
 
 // Deterministic pin for the closed-conn signal-delivery contract: a peerConn
@@ -31,12 +33,21 @@ func lifecycleTestManager(ctx context.Context, t *testing.T) *WebRtcManager {
 	// transport_p2p_webrtc_test.go
 	settings.IceServerUrls = nil
 	settings.UseLoopbackOnlyIceInterfaces = true
-	return NewWebRtcManager(ctx, newSignalPipe(nil), settings)
+	return newTestWebRtcManager(t, ctx, newSignalPipe(nil), settings)
 }
 
-func lifecycleCandidateSignals(t *testing.T, streamId Id, count int) *protocol.ExchangeSignals {
+// testIceHostCandidate is a host ICE candidate line for the family: the
+// address sits in the family's documentation range so nothing routes.
+func testIceHostCandidate(ipVersion int) string {
+	if ipVersion == 6 {
+		return "candidate:0 1 udp 2122252543 2001:db8::1 40000 typ host"
+	}
+	return "candidate:0 1 udp 2122252543 192.0.2.1 40000 typ host"
+}
+
+func lifecycleCandidateSignals(t *testing.T, ipVersion int, streamId Id, count int) *protocol.ExchangeSignals {
 	candidateJson, err := json.Marshal(webrtc.ICECandidateInit{
-		Candidate: "candidate:0 1 udp 2122252543 127.0.0.1 40000 typ host",
+		Candidate: testIceHostCandidate(ipVersion),
 	})
 	if err != nil {
 		t.Fatalf("marshal candidate: %v", err)
@@ -60,11 +71,16 @@ func lifecycleCandidateSignals(t *testing.T, streamId Id, count int) *protocol.E
 // return in bounded time (the no-op is cheap — no locks into pion, no
 // per-signal work that could occupy the shared signal-delivery path).
 func TestClosedPeerConnDropsLateSignals(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testClosedPeerConnDropsLateSignals(t, ipVersion)
+	})
+}
+
+func testClosedPeerConnDropsLateSignals(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	manager := lifecycleTestManager(ctx, t)
-	defer manager.Close()
 
 	peerId := NewId()
 	streamId := NewId()
@@ -84,7 +100,11 @@ func TestClosedPeerConnDropsLateSignals(t *testing.T) {
 	// the sanity probe briefly — the pin is that a LIVE conn buffers at all
 	sanityDeadline := time.Now().Add(5 * time.Second)
 	for {
-		err = manager.ReceiveExchangeSignals(source, lifecycleCandidateSignals(t, streamId, 1))
+		err = manager.ReceiveExchangeSignals(
+			source,
+			TransferKey{},
+			lifecycleCandidateSignals(t, ipVersion, streamId, 1),
+		)
 		AssertEqual(t, err, nil)
 		buffered := func() int {
 			pconn.signalLock.Lock()
@@ -134,7 +154,11 @@ func TestClosedPeerConnDropsLateSignals(t *testing.T) {
 	// late signals: dropped without error, without buffering, in bounded time
 	startTime := time.Now()
 	for i := 0; i < 100; i += 1 {
-		err = manager.ReceiveExchangeSignals(source, lifecycleCandidateSignals(t, streamId, 10))
+		err = manager.ReceiveExchangeSignals(
+			source,
+			TransferKey{},
+			lifecycleCandidateSignals(t, ipVersion, streamId, 10),
+		)
 		if err != nil {
 			t.Fatalf("late signals to a closed conn must be a no-op, not an error (batch %d): %v", i, err)
 		}
@@ -165,7 +189,9 @@ type blockingSignalSender struct {
 	blockedCount     int32
 }
 
-func (self *blockingSignalSender) SendSignal(path TransferPath, signal *protocol.Frame, opts ...any) {
+// SendSignal consumes one frame after modeling blocking or nonblocking delivery.
+func (self *blockingSignalSender) SendSignal(_ Id, signal *protocol.Frame, opts ...any) {
+	defer MessagePoolReturn(signal.MessageBytes)
 	for _, opt := range opts {
 		if _, ok := opt.(signalSendNonBlocking); ok {
 			atomic.AddInt32(&self.nonBlockingCount, 1)
@@ -191,8 +217,7 @@ func TestReceivePathSignalSendsDoNotBlock(t *testing.T) {
 	settings.IceServerUrls = nil
 	settings.UseLoopbackOnlyIceInterfaces = true
 	sender := &blockingSignalSender{ctx: ctx}
-	manager := NewWebRtcManager(ctx, sender, settings)
-	defer manager.Close()
+	manager := newTestWebRtcManager(t, ctx, sender, settings)
 
 	peerId := NewId()
 	streamId := NewId()
@@ -222,7 +247,7 @@ func TestReceivePathSignalSendsDoNotBlock(t *testing.T) {
 	source.StreamId = streamId
 	done := make(chan error, 1)
 	go func() {
-		done <- manager.ReceiveExchangeSignals(source, &protocol.ExchangeSignals{
+		done <- manager.ReceiveExchangeSignals(source, TransferKey{}, &protocol.ExchangeSignals{
 			StreamId: streamId.Bytes(),
 			Signals: []*protocol.ExchangeSignal{{
 				SignalType: protocol.SignalType_WaitingForSdpOffer,
@@ -237,5 +262,53 @@ func TestReceivePathSignalSendsDoNotBlock(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&sender.nonBlockingCount); got == 0 {
 		t.Fatal("the receive-path response send did not carry the non-blocking contract")
+	}
+}
+
+// A Pion ICE callback shares Pion's event machinery. Candidate publication
+// must therefore use the same zero-timeout transfer handoff as an inbound
+// signal response, even though the candidate was generated locally.
+func TestPionIceCandidateCallbackSendDoesNotBlock(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testPionIceCandidateCallbackSendDoesNotBlock(t, ipVersion)
+	})
+}
+
+func testPionIceCandidateCallbackSendDoesNotBlock(t *testing.T, ipVersion int) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender := &blockingSignalSender{ctx: ctx}
+	conn := &peerConn{
+		ctx:                ctx,
+		key:                peerConnKey{PeerId: NewId(), StreamId: NewId()},
+		signalSender:       sender,
+		signalGeneration:   NewId(),
+		iceCandidatesReady: true,
+	}
+	candidate := &webrtc.ICECandidate{
+		Foundation: "nonblocking",
+		Priority:   1,
+		Address:    testDocAddr(ipVersion, 1).String(),
+		Protocol:   webrtc.ICEProtocolUDP,
+		Port:       10000,
+		Typ:        webrtc.ICECandidateTypeHost,
+		Component:  1,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn.handleLocalIceCandidate(candidate)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Pion ICE callback blocked on a saturated Transfer sender")
+	}
+	if got := atomic.LoadInt32(&sender.nonBlockingCount); got != 1 {
+		t.Fatalf("nonblocking candidate sends = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&sender.blockedCount); got != 0 {
+		t.Fatalf("blocking candidate sends = %d, want 0", got)
 	}
 }

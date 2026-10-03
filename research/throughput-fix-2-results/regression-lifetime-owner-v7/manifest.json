@@ -1,0 +1,48 @@
+{
+  "created_utc": "2026-09-16T15:37:28.061066+00:00",
+  "mode": "regression",
+  "test_pattern": ".",
+  "run_flags": [
+    "-test.skip",
+    "^TestWindow(Path|CompressionResidence)"
+  ],
+  "connect": {
+    "revision": "f903f59a96e629f8b1dfa5849d7a3198aaef9920",
+    "branch": "throughput-fix-2",
+    "source_sha256": "08ea6df65e7f27476c692436afcac6b57993d43882b4fb1ee2c0c8369bc416c8",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "e7ad4bf2bbad884037c117e267d72aa0e34d9e336f5fab3c440856c4eea8d16f",
+  "host_load_average_at_start": [
+    5.2099609375,
+    7.6923828125,
+    9.92626953125
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {},
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 874,
+        "input_sha256": "38a406e2ad55455dafa6ca225be546f82808dc2454a34a72b82b70aac79e7070"
+      }
+    },
+    "external_local_replacements": [
+      "/Users/brien/urnetwork/glog"
+    ],
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "binary_sha256": "46489aee0394c88aea47accd44ecba5d7c5eb22a1fe6ba2155ec027b0919ced4",
+  "sources_stable_during_build": true,
+  "source_inspection_uses_build_snapshot": true
+}

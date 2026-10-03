@@ -1,0 +1,8 @@
+{
+  "note": "Original archive manifest/payload remain immutable; this file hashes only explicitly added supplemental payloads.",
+  "original_archive_manifest_sha256": "5e07aadd585d767a295d195cb257af5fb1275fd9fd4e4b14b1b5896f615256c6",
+  "schema_version": 1,
+  "supplements": {
+    "retry-only-clock-selection/manifest.json": "0a6906489ec0774555c4217b32efbf659f645d4760bdbe6eb195c3635d7443c1"
+  }
+}

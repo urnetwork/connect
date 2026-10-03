@@ -1,0 +1,36 @@
+{"benchmark": "BenchmarkWindowPacingServiceContinuous", "gomaxprocs": 10, "iterations": 2278522, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 259.4}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceContinuous", "gomaxprocs": 10, "iterations": 2343552, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 254.8}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceContinuous", "gomaxprocs": 10, "iterations": 2365478, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 254.2}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceHold", "gomaxprocs": 10, "iterations": 2638098, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 229.4}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceHold", "gomaxprocs": 10, "iterations": 2647778, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 227.8}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceHold", "gomaxprocs": 10, "iterations": 2644117, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 228.9}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceStatisticsHold", "gomaxprocs": 10, "iterations": 2643348, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 226.2}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceStatisticsHold", "gomaxprocs": 10, "iterations": 2638471, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 226.9}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceStatisticsHold", "gomaxprocs": 10, "iterations": 2609462, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 227.6}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrival", "gomaxprocs": 10, "iterations": 11151103, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 54.4}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrival", "gomaxprocs": 10, "iterations": 10983092, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 54.65}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrival", "gomaxprocs": 10, "iterations": 11027392, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 54.53}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrivalLargeWindow", "gomaxprocs": 10, "iterations": 8012378, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 75.45}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrivalLargeWindow", "gomaxprocs": 10, "iterations": 7605144, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 93.78}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrivalLargeWindow", "gomaxprocs": 10, "iterations": 7124049, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 89.81}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceAckBatchArrival", "gomaxprocs": 10, "iterations": 1299574, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 461.4}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceAckBatchArrival", "gomaxprocs": 10, "iterations": 1000000, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 560.6}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceAckBatchArrival", "gomaxprocs": 10, "iterations": 1000000, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 577.9}, "variant": "before"}
+{"benchmark": "BenchmarkWindowPacingServiceContinuous", "gomaxprocs": 10, "iterations": 2220510, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 268.6}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceContinuous", "gomaxprocs": 10, "iterations": 2227880, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 269.7}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceContinuous", "gomaxprocs": 10, "iterations": 2237838, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 269.1}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceHold", "gomaxprocs": 10, "iterations": 2483692, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 242.2}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceHold", "gomaxprocs": 10, "iterations": 2477196, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 242.8}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceHold", "gomaxprocs": 10, "iterations": 2497189, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 240.1}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceStatisticsHold", "gomaxprocs": 10, "iterations": 2467212, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 241.2}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceStatisticsHold", "gomaxprocs": 10, "iterations": 2488957, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 239.7}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceStatisticsHold", "gomaxprocs": 10, "iterations": 2499141, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "estimated-B/s": 12500000.0, "ns/op": 240.8}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrival", "gomaxprocs": 10, "iterations": 8089527, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 74.52}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrival", "gomaxprocs": 10, "iterations": 7969278, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 75.05}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrival", "gomaxprocs": 10, "iterations": 7960524, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 74.91}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrivalLargeWindow", "gomaxprocs": 10, "iterations": 5257800, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 121.9}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrivalLargeWindow", "gomaxprocs": 10, "iterations": 5340642, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 120.2}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceAckArrivalLargeWindow", "gomaxprocs": 10, "iterations": 5347167, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 112.7}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceAckBatchArrival", "gomaxprocs": 10, "iterations": 999590, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 555.3}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceAckBatchArrival", "gomaxprocs": 10, "iterations": 991626, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 590.6}, "variant": "after"}
+{"benchmark": "BenchmarkWindowPacingServiceAckBatchArrival", "gomaxprocs": 10, "iterations": 1257074, "metrics": {"B/op": 0.0, "allocs/op": 0.0, "ns/op": 476.1}, "variant": "after"}

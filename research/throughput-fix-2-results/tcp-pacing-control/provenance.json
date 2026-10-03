@@ -1,0 +1,8 @@
+{
+  "source_log": "run.log",
+  "source_log_sha256": "993f56bb2d66e8c91357ab1c001d81de66c6f9ea248a355810bf13a2b37e26b9",
+  "note": "Three-second pacing on/off diagnostic, before longer TCP warmup.",
+  "rows": 12,
+  "final": false,
+  "outcome": "passed"
+}

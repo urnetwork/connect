@@ -1,0 +1,10 @@
+{
+  "archive": "window-retention-adjacent-policy-v1",
+  "payload_sha256": {
+    "outcomes.jsonl": "8e85213ed954ed6c522ba7eb0bfca88c378ed92be7cf874e75c53f22190de54c",
+    "provenance.json": "f0d14702265edd5416bf6545aff0aa976bfb9a3fd51193301cfe7de593287226",
+    "source-manifest-policy-v1.json": "33e1d5b55ea962a7fb587329e2521023f3ac82ab8511763ee976068c1e3cb888",
+    "source-pins.json": "9984a06bed18eaeb59017f0693b7aea8810412f1129e3499c0a68600f471d5c0",
+    "status.json": "ab0469e83b1989856a9fa9c40836561b1e1dee4786d700e169c1fbb915e8a02f"
+  }
+}

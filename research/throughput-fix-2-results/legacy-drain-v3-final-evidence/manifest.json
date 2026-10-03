@@ -1,0 +1,13 @@
+{
+  "archive_kind": "legacy_drain_v3_final_evidence",
+  "file_count": 6,
+  "file_sha256": {
+    "fixture-diagnostic-outcomes.jsonl": "8a5da75c760e5e5d4f866fc0f07161058f251d219047d16f651da70f3c1e8a64",
+    "performance-control-outcomes.jsonl": "f3554826770a10acdc63c4527740758a05d8ac55cb05bf4d067e2cf7878dabd8",
+    "performance-control-readings.jsonl": "d586f770ed5069f1f68015a9a498ba11724e3f8e8169cbb76daeb060d4ac03ee",
+    "provenance.json": "52d94d4fceafdf80a252931eaa270e4270dde8bee14579249526ec8cf51a9196",
+    "root-outcomes.jsonl": "346e4e3dcb9d3069877a7c69f8c3f7486423fac08558b0cc506dc7e397eb4ee7",
+    "status.json": "b3673d8cb509625e87a9d7f85f127b40f063278a33e66f89eef11e6ad8d10a2c"
+  },
+  "schema_version": 1
+}

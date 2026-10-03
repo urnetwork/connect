@@ -1,0 +1,30 @@
+--- before/transfer_window_service_credit.go
++++ after/transfer_window_service_credit.go
+@@ -75,6 +75,7 @@
+ 	}
+ 	credit := windowServiceAckCredit{}
+ 	headCredited := false
++	headByteCount := ByteCount(0)
+ 	func() {
+ 		self.resendQueue.stateLock.Lock()
+ 		defer self.resendQueue.stateLock.Unlock()
+@@ -84,6 +85,7 @@
+ 			return
+ 		}
+ 		headCredited = !item.serviceCreditObserved && item.pacingByteCount > 0
++		headByteCount = item.pacingByteCount
+ 		if selective {
+ 			credit.addItemWithLock(item)
+ 			return
+@@ -113,7 +115,10 @@
+ 		}
+ 		self.serviceAckHeadNumber, self.serviceAckHeadSet = head, true
+ 	}()
+-	if headCredited && credit.receiverTimingEligible && timing.receivedAtNanos != 0 && timing.receivedAtNanos == at.UnixNano() {
++	// A relayed head can arrive before an earlier sequence hole. Its own
++	// wait cannot remove time spent receiving that newly credited prefix.
++	if headCredited && credit.receiverTimingEligible && (timing.receiverDelay == 0 || credit.bytes == headByteCount) &&
++		timing.receivedAtNanos != 0 && timing.receivedAtNanos == at.UnixNano() {
+ 		credit.receiverTiming = timing
+ 	}
+ 	self.observePacingServiceCredit(credit, at)

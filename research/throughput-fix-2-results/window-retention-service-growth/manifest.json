@@ -1,0 +1,9 @@
+{
+  "archive": "window-retention-service-growth",
+  "payload_sha256": {
+    "outcomes.jsonl": "fec33a6cbdfa54b761504f10e2d8c8c3b29c9f839d27d3d7a27b787fb3ee39e6",
+    "provenance.json": "79c1bf11dda69c249752599dfe36a6123e804bf1f4fdd0a4af6410038dc45d81",
+    "source-pins.json": "7fb41b2b8cd0e5d724652208cf749f982cc326562f4edfd21d5d5f677a9c5add",
+    "status.json": "63c5cb9300064b964b7718450df89649c9e5741f11b542c71808a4bc5ce3bfab"
+  }
+}

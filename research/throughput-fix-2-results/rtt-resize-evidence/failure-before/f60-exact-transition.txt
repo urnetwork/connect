@@ -1,0 +1,5 @@
+=== RUN   TestWindowPathServiceSettledLargeMessageCapacityChanges
+    transfer_window_pacing_capacity_test.go:40: large-message rate=125000->1250000 payload=65536: reference=10.000 candidate=7.344 minimum=0.781 drops=0 queue=69/4529091
+--- FAIL: TestWindowPathServiceSettledLargeMessageCapacityChanges (0.07s)
+FAIL
+FAIL	github.com/urnetwork/connect	1.354s

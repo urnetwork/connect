@@ -1,0 +1,26 @@
+{
+  "created_utc": "2026-09-17T01:47:01.993547+00:00",
+  "scope": "Terminal candidate root regression and final Python runner contracts.",
+  "file_sha256": {
+    "README.md": "45b977386c4254383aaffaeba46e50650cee269c7198e86e3ece09677795b30e",
+    "harness/manifest.json": "adbdd48ac9738a27b4ead73b29ede89cd7b82fd335437a5b3c82e5f33b29e82b",
+    "harness/revision.txt": "e05538949d0957ebe5fabb7365a2f11993682ef9b102aab4ce2aa905d657ded6",
+    "harness/server-env.log": "dae97527feaa5f4404b7cf8a367c36b5834935509ab9babacf648b1bb8476a3b",
+    "harness/snapshot.log": "2dad41e7181a86df6581f2c1f609d4f07aeb82e80afd12e6c645e47c812eee7d",
+    "harness/source-hashes.txt": "f8bb6ca3f44a885beb490698e2b53bf17563bc969070f035411cbc6b001afad8",
+    "harness/status-at-run.txt": "a72b0242c0127f66a11721e3678b2115597ec0536bf2fb555e0fb269f46a8df0",
+    "harness/status.json": "376fa7f4ace50009317578a41cc0b80c10cf8932cdb484eec9e6b505327de584",
+    "regression/ledger.jsonl": "98d168bb42f6eac9370c3a47e62b7897b9bcc1ceae7ec9b6afc337e8064a539b",
+    "regression/manifest.json": "76fb7ddc673fca8c6fa3592ace3487e52f7840a080ff857863f67660d87a794d",
+    "regression/outcome-counts.json": "5d1cd3e335908fcb285709aa3d806969b6fe05999074dfa221b8fd96b3509cae",
+    "regression/outcomes.txt": "dcebb2b5d0b535b3fd3799df881f2a9e4222c439e5355ee30cc180b2a3d3ce99",
+    "regression/run.log": "2cfc48c6cdf79537acf738d325c31fa375d9fecb2ee6463169b09fdf66683713",
+    "regression/snapshot-inputs.json": "2db608dbafd98bd9a743941d4243f7c0470f1f30c83adbfb90abfbdd3024f6e0",
+    "regression/status.json": "396605ee4c58958a37e1e1be17c71b919c77a556643ffb24251b3ea94617f138",
+    "runner/regression-runner.sh.txt": "042642ce3c7302d9adceb0a198fb40e8747fdfdb508d863b14f06b94e2df1d18",
+    "runner/server-env-test.py.txt": "d24280ec74a92b362bf7b57bdea5ca5193c07bb11d8b9c60df56c202912f4ea8",
+    "runner/snapshot-fixture.patch": "1aeccfbdea20089e6500bb95413c8392a7959641db12fee5adced6272c938609",
+    "runner/snapshot-test-after.py.txt": "1e3d56389edde8097e6e7e9033627f7e8f789e6e8a09d52318ae01755dc19f67",
+    "runner/snapshot-test-before.py.txt": "9adaf8d376586285804caf6ba91415312228672e597f161eca5504ba2b7ed348"
+  }
+}

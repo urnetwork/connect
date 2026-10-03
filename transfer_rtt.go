@@ -2,28 +2,26 @@ package connect
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"time"
-
-	"container/heap"
 
 	"github.com/urnetwork/connect/protocol"
 )
 
 type rttWindowItem struct {
-	sendTime    time.Time
-	receiveTime time.Time
-	rtt         time.Duration
-
-	heapIndex int
+	receiveUnixNano int64
+	rtt             time.Duration
+	// Zero is unavailable; positive values encode adjusted nanoseconds plus one.
+	receiverAdjustedNanos int64
+	// Advertised compression belongs to the same exact ACK, never a later hint.
+	receiverCompressionMicros uint32
+	sequence                  uint64
 }
 
-func newRttWindowItem(sendTime time.Time, receiveTime time.Time) *rttWindowItem {
-	return &rttWindowItem{
-		sendTime:    sendTime,
-		receiveTime: receiveTime,
-		rtt:         receiveTime.Sub(sendTime),
-	}
+type rttWindowMinimum struct {
+	rtt      time.Duration
+	sequence uint64
 }
 
 type RttWindow struct {
@@ -43,11 +41,31 @@ type RttWindow struct {
 	maxScaledRtt    time.Duration
 
 	stateLock       sync.Mutex
-	window          []*rttWindowItem
+	window          []rttWindowItem
 	windowTailIndex int
-	windowHeadIndex int
+	windowCount     int
+	nextSequence    uint64
+	netRtt          time.Duration
+	// Legacy samples may apply late; new paired timing must never rewind.
+	latestObservedNanos int64
+	qualityAfterNanos   int64
+	qualityPending      bool
 
-	rtts *rttHeap
+	// minimums is a fixed-capacity monotonic deque. Keeping the smallest live
+	// RTT at its head avoids both the old per-Ack heap node allocation and an
+	// O(window) scan on the recovery-probe path.
+	minimums         []rttWindowMinimum
+	minimumHeadIndex int
+	minimumCount     int
+
+	// rttVar is RFC 6298's deviation term: an exponentially weighted mean of
+	// |sample - mean|, one duration of state and no retained bytes. The
+	// scaled mean this window reports carries a fixed margin, RttScale, which
+	// cannot cover an excursion of several times the mean without lengthening
+	// every retransmit on every lane. The deviation covers it where the lane
+	// has shown a wide spread and tightens toward the mean where it has not
+	// (FLIGHTGATEFIX §25.2).
+	rttVar time.Duration
 }
 
 func NewRttWindow(
@@ -67,7 +85,7 @@ func NewRttWindow(
 		// (the historical flat-floor behavior)
 		rttMinScaledRtt = minScaledRtt
 	}
-	window := make([]*rttWindowItem, windowSize)
+	window := make([]rttWindowItem, windowSize)
 
 	return &RttWindow{
 		log:             loggerOrDefault(log),
@@ -78,22 +96,37 @@ func NewRttWindow(
 		maxScaledRtt:    maxScaledRtt,
 		window:          window,
 		windowTailIndex: 0,
-		windowHeadIndex: 0,
-		rtts:            newRttHeap(),
+		minimums:        make([]rttWindowMinimum, windowSize),
 	}
 }
 
-// must be called inside the state lock
-func (self *RttWindow) coalesce(windowTime time.Time) {
-	windowStartTime := windowTime.Add(-self.windowTimeout)
-	for self.windowTailIndex != self.windowHeadIndex {
+// removeOldestWithLock removes exactly one live sample while stateLock is held.
+func (self *RttWindow) removeOldestWithLock() {
+	if self.windowCount == 0 {
+		return
+	}
+	item := self.window[self.windowTailIndex]
+	self.netRtt -= item.rtt
+	if self.minimumCount != 0 &&
+		self.minimums[self.minimumHeadIndex].sequence == item.sequence {
+		self.minimums[self.minimumHeadIndex] = rttWindowMinimum{}
+		self.minimumHeadIndex = (self.minimumHeadIndex + 1) % len(self.minimums)
+		self.minimumCount--
+	}
+	self.window[self.windowTailIndex] = rttWindowItem{}
+	self.windowTailIndex = (self.windowTailIndex + 1) % len(self.window)
+	self.windowCount--
+}
+
+// Removes expired samples while stateLock is held.
+func (self *RttWindow) coalesceWithLock(windowTime time.Time) {
+	windowStartUnixNano := windowTime.Add(-self.windowTimeout).UnixNano()
+	for self.windowCount != 0 {
 		item := self.window[self.windowTailIndex]
-		if !item.receiveTime.Before(windowStartTime) {
+		if item.receiveUnixNano >= windowStartUnixNano {
 			break
 		}
-		self.rtts.Remove(item)
-		self.window[self.windowTailIndex] = nil
-		self.windowTailIndex = (self.windowTailIndex + 1) % len(self.window)
+		self.removeOldestWithLock()
 	}
 }
 
@@ -124,31 +157,203 @@ func (self *RttWindow) CloseSendTime(sendTimeUnixMilli uint64) {
 }
 
 func (self *RttWindow) closeSendTime(sendTimeUnixMilli uint64, receiveTime time.Time) {
+	self.closeSendTimeForWrite(sendTimeUnixMilli, receiveTime, time.UnixMilli(int64(sendTimeUnixMilli)).UnixNano())
+}
+
+// Tags are legacy wall-clock values. Production supplies the immutable local
+// physical stamp separately so a wall-clock step cannot relabel a generation.
+func (self *RttWindow) closeSendTimeForWrite(sendTimeUnixMilli uint64, receiveTime time.Time, firstSentAtNanos int64) {
 	sendTime := time.UnixMilli(int64(sendTimeUnixMilli))
 	if receiveTime.Before(sendTime) {
 		// ignore
 		return
 	}
 
+	self.observeRoundTripForWrite(receiveTime.Sub(sendTime), 0, 0, receiveTime, false, firstSentAtNanos)
+}
+
+// Receiver residence is optional and does not change raw recovery samples.
+func (self *RttWindow) observeReceiverRoundTrip(roundTrip, receiverDelay time.Duration, compressionMicros uint32, receiveTime time.Time) {
+	if receiverDelay < 0 || roundTrip < receiverDelay || roundTrip-receiverDelay == time.Duration(math.MaxInt64) {
+		return
+	}
+	self.observeRoundTrip(roundTrip, int64(roundTrip-receiverDelay)+1, compressionMicros, receiveTime, true)
+}
+
+// Both forms share the same bounded sample capacity and expiration policy.
+func (self *RttWindow) observeRoundTrip(roundTrip time.Duration, receiverAdjustedNanos int64, compressionMicros uint32, receiveTime time.Time, chronological bool) {
+	self.observeRoundTripForWrite(roundTrip, receiverAdjustedNanos, compressionMicros, receiveTime, chronological, receiveTime.Add(-roundTrip).UnixNano())
+}
+
+// The sample's measurement clock and its first-write generation are separate
+// facts for legacy tags; exact receiver timing carries both on the local clock.
+func (self *RttWindow) observeRoundTripForWrite(roundTrip time.Duration, receiverAdjustedNanos int64, compressionMicros uint32, receiveTime time.Time, chronological bool, firstSentAtNanos int64) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-
-	self.coalesce(receiveTime)
-
-	item := newRttWindowItem(
-		sendTime,
-		receiveTime,
-	)
-	self.rtts.Add(item)
-
-	if replaceItem := self.window[self.windowHeadIndex]; replaceItem != nil {
-		self.rtts.Remove(replaceItem)
+	if self.qualityAfterNanos != 0 {
+		if firstSentAtNanos <= self.qualityAfterNanos {
+			return
+		}
+		if self.qualityPending {
+			clear(self.window)
+			clear(self.minimums)
+			self.windowTailIndex, self.windowCount, self.minimumHeadIndex, self.minimumCount = 0, 0, 0, 0
+			self.netRtt, self.rttVar, self.latestObservedNanos = 0, 0, 0
+			self.qualityPending = false
+		}
 	}
-	self.window[self.windowHeadIndex] = item
-	self.windowHeadIndex = (self.windowHeadIndex + 1) % len(self.window)
-	if self.windowTailIndex == self.windowHeadIndex {
-		self.windowTailIndex = (self.windowTailIndex + 1) % len(self.window)
+	if chronological && self.nextSequence != 0 && receiveTime.UnixNano() < self.latestObservedNanos {
+		return
 	}
+	if self.nextSequence == 0 || self.latestObservedNanos < receiveTime.UnixNano() {
+		self.latestObservedNanos = receiveTime.UnixNano()
+	}
+
+	self.coalesceWithLock(receiveTime)
+
+	if self.windowCount == len(self.window) {
+		self.removeOldestWithLock()
+	}
+	self.nextSequence++
+	item := rttWindowItem{
+		receiveUnixNano:           receiveTime.UnixNano(),
+		rtt:                       roundTrip,
+		receiverAdjustedNanos:     receiverAdjustedNanos,
+		receiverCompressionMicros: compressionMicros,
+		sequence:                  self.nextSequence,
+	}
+	windowHeadIndex := (self.windowTailIndex + self.windowCount) % len(self.window)
+	self.window[windowHeadIndex] = item
+	self.windowCount++
+	// the deviation is measured against the mean before this sample joins it,
+	// as RFC 6298 does, so one outlier does not hide inside its own mean
+	if self.windowCount != 1 {
+		mean := self.netRtt / time.Duration(self.windowCount-1)
+		deviation := item.rtt - mean
+		if deviation < 0 {
+			deviation = -deviation
+		}
+		// rttVar = 3/4 rttVar + 1/4 deviation
+		self.rttVar = (3*self.rttVar + deviation) / 4
+	} else {
+		// RFC 6298's first sample: the deviation starts at half the sample
+		self.rttVar = item.rtt / 2
+	}
+	self.netRtt += item.rtt
+
+	// Newer equal minima supersede older ones. This keeps the deque shortest
+	// and guarantees its head remains live until the matching sequence leaves
+	// the sample ring.
+	for self.minimumCount != 0 {
+		minimumTailIndex := (self.minimumHeadIndex + self.minimumCount - 1) % len(self.minimums)
+		if self.minimums[minimumTailIndex].rtt < item.rtt {
+			break
+		}
+		self.minimums[minimumTailIndex] = rttWindowMinimum{}
+		self.minimumCount--
+	}
+	minimumTailIndex := (self.minimumHeadIndex + self.minimumCount) % len(self.minimums)
+	self.minimums[minimumTailIndex] = rttWindowMinimum{rtt: item.rtt, sequence: item.sequence}
+	self.minimumCount++
+}
+
+// DeviationRtt is RFC 6298's retransmit timer for this window: the mean
+// round trip plus four deviations, floored as the scaled mean is and capped
+// by the same overall maximum. An empty window answers with the cold floor,
+// exactly as the scaled mean does, so a cold start is unchanged.
+//
+// Against the scaled mean it trades two things. A lane whose samples are
+// tight reports a shorter timer, so a genuinely lost tail is recovered
+// sooner. A lane whose samples are spread reports a longer one, so a
+// routine excursion of several times the mean no longer rewrites the whole
+// window; its rare real loss waits longer for it (FLIGHTGATEFIX §25.2).
+// An estimate carried with its own evidence: the value, how many samples back
+// it, and how old the newest of them is.
+//
+// It is a type rather than a duration on purpose. A zero mean over no samples
+// means unsampled and a zero mean over samples means a measured
+// sub-millisecond path, and this program has twice been misled by exactly that
+// ambiguity — once by a deviation timer over an unsampled stall and once by a
+// receive-side precondition. A bare duration lets a caller read the first as
+// the second by accident; this does not. Every other reader on the window
+// folds the unsampled case into a resend floor, which is right for timing and
+// wrong for measurement.
+type RttEstimate struct {
+	Mean time.Duration
+	// Min is the smallest live sample, from the window's monotonic-minimum
+	// deque, taken under the same lock and the same coalesce as the mean so
+	// the two cannot disagree.
+	//
+	// It is what separates added latency from a backlog in one reading. A
+	// minimum near the path's own delay with a mean far above it means
+	// acknowledgements queued behind something, which is a backlog rather
+	// than time added to each one; a minimum as high as the mean means every
+	// acknowledgement genuinely took that long, and the excess is real. On a
+	// real path Min is the path plus fixed processing and Mean − Min is
+	// queueing, ours or the window's own.
+	Min         time.Duration
+	SampleCount int
+	// Age of the newest sample when the estimate was taken. An estimate whose
+	// newest sample is older than the path's behaviour describes a path that
+	// no longer exists, so freshness travels with the value rather than being
+	// inferred from the caller's own clock.
+	NewestSampleAge time.Duration
+}
+
+// Sampled reports whether any sample backs the mean.
+func (self RttEstimate) Sampled() bool {
+	return 0 < self.SampleCount
+}
+
+// Estimate is the window's unscaled mean round trip with its evidence.
+func (self *RttWindow) Estimate() RttEstimate {
+	return self.estimate(time.Now())
+}
+
+func (self *RttWindow) estimate(sampleTime time.Time) RttEstimate {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.coalesceWithLock(sampleTime)
+
+	if self.windowCount == 0 {
+		return RttEstimate{}
+	}
+	newestIndex := (self.windowTailIndex + self.windowCount - 1) % len(self.window)
+	newestSampleAge := sampleTime.Sub(time.Unix(0, self.window[newestIndex].receiveUnixNano))
+	minimum := time.Duration(0)
+	if self.minimumCount != 0 {
+		minimum = self.minimums[self.minimumHeadIndex].rtt
+	}
+	return RttEstimate{
+		Mean:            self.netRtt / time.Duration(self.windowCount),
+		Min:             minimum,
+		SampleCount:     self.windowCount,
+		NewestSampleAge: max(0, newestSampleAge),
+	}
+}
+
+func (self *RttWindow) DeviationRtt() time.Duration {
+	return self.deviationRtt(time.Now())
+}
+
+func (self *RttWindow) deviationRtt(sendTime time.Time) time.Duration {
+	self.stateLock.Lock()
+	self.coalesceWithLock(sendTime)
+
+	if self.windowCount == 0 {
+		self.stateLock.Unlock()
+		// no evidence: the cold floor, as the scaled mean answers
+		return min(self.minScaledRtt, self.maxScaledRtt)
+	}
+	mean := self.netRtt / time.Duration(self.windowCount)
+	margin := max(self.rttMinScaledRtt, 4*self.rttVar)
+	floor := self.rttMinScaledRtt
+	if self.qualityPending {
+		floor = max(floor, self.minScaledRtt)
+	}
+	self.stateLock.Unlock()
+
+	return min(max(mean+margin, floor), self.maxScaledRtt)
 }
 
 // clamp(mean rtt of window * scale, floor, overall max), where the floor is
@@ -160,15 +365,18 @@ func (self *RttWindow) ScaledRtt() time.Duration {
 
 func (self *RttWindow) scaledRtt(sendTime time.Time) time.Duration {
 	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	self.coalesceWithLock(sendTime)
 
-	self.coalesce(sendTime)
-
-	useRtt := self.rtts.MeanRtt()
+	var useRtt time.Duration
+	if self.windowCount != 0 {
+		useRtt = self.netRtt / time.Duration(self.windowCount)
+	}
 	floor := self.rttMinScaledRtt
 	if useRtt == 0 {
 		// no samples: no evidence to be aggressive on
 		floor = self.minScaledRtt
+	} else if self.qualityPending {
+		floor = max(floor, self.minScaledRtt)
 	}
 	scaledRtt := min(
 		max(
@@ -177,6 +385,7 @@ func (self *RttWindow) scaledRtt(sendTime time.Time) time.Duration {
 		),
 		self.maxScaledRtt,
 	)
+	self.stateLock.Unlock()
 	// guard the V(2) diagnostic: this runs per packet (resend timing), and the
 	// disabled-level call would still box the Duration arg into []any and build
 	// the variadic slice on the heap. the guard keeps the hot path allocation-free.
@@ -186,77 +395,69 @@ func (self *RttWindow) scaledRtt(sendTime time.Time) time.Duration {
 	return scaledRtt
 }
 
-type rttHeap struct {
-	items  []*rttWindowItem
-	netRtt time.Duration
+// Returns a bounded minimum-path RTT for one receiver-paced recovery probe.
+// Queue-inflated mean RTT remains the ordinary resend timer; using the minimum
+// here prevents one deep serialization queue from turning a tail probe into the
+// same multi-second RTO it is meant to precede. Callers bound duplicate cost to
+// one probe per item.
+func (self *RttWindow) ProbeRtt() time.Duration {
+	return self.probeRtt(time.Now())
 }
 
-// `heap` is a min heap
-func newRttHeap() *rttHeap {
-	h := &rttHeap{
-		items:  []*rttWindowItem{},
-		netRtt: time.Duration(0),
+func (self *RttWindow) probeRtt(probeTime time.Time) time.Duration {
+	self.stateLock.Lock()
+	self.coalesceWithLock(probeTime)
+
+	var useRtt time.Duration
+	if self.minimumCount != 0 {
+		useRtt = self.minimums[self.minimumHeadIndex].rtt
 	}
-	heap.Init(h)
-	return h
-}
-
-func (self *rttHeap) Add(item *rttWindowItem) {
-	heap.Push(self, item)
-	self.netRtt += item.rtt
-}
-
-func (self *rttHeap) Remove(item *rttWindowItem) {
-	heap.Remove(self, item.heapIndex)
-	self.netRtt -= item.rtt
-}
-
-func (self *rttHeap) MinRtt() time.Duration {
-	n := len(self.items)
-	if n == 0 {
-		return time.Duration(0)
+	floor := self.rttMinScaledRtt
+	if useRtt == 0 {
+		floor = self.minScaledRtt
+	} else if self.qualityPending {
+		floor = max(floor, self.minScaledRtt)
 	}
-	maxItem := self.items[n-1]
-	return maxItem.rtt
-}
+	probeRtt := min(
+		max(
+			time.Duration(float32(useRtt/time.Millisecond)*self.rttScale)*time.Millisecond,
+			floor,
+		),
+		self.maxScaledRtt,
+	)
+	self.stateLock.Unlock()
 
-func (self *rttHeap) MeanRtt() time.Duration {
-	n := len(self.items)
-	if n == 0 {
-		return 0
+	if self.log.V(2).Enabled() {
+		self.log.Infof("[rtt]probe=%dms\n", probeRtt/time.Millisecond)
 	}
-	return self.netRtt / time.Duration(n)
+	return probeRtt
 }
 
-// `heap.Interface`
-
-func (self *rttHeap) Len() int {
-	return len(self.items)
-}
-
-func (self *rttHeap) Less(i, j int) bool {
-	return self.items[i].rtt < self.items[j].rtt
-}
-
-func (self *rttHeap) Swap(i, j int) {
-	a := self.items[i]
-	b := self.items[j]
-	b.heapIndex = i
-	self.items[i] = b
-	a.heapIndex = j
-	self.items[j] = a
-}
-
-func (self *rttHeap) Push(x any) {
-	item := x.(*rttWindowItem)
-	item.heapIndex = len(self.items)
-	self.items = append(self.items, item)
-}
-
-func (self *rttHeap) Pop() any {
-	n := len(self.items)
-	item := self.items[n-1]
-	self.items[n-1] = nil
-	self.items = self.items[0 : n-1]
-	return item
+// Reads paired receiver timing without retiring or repricing any sample.
+// Each historical maximum compression remains attached to its exact ACK.
+func (self *RttWindow) receiverWindowEstimate(at time.Time) (time.Duration, time.Duration, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	cutoff := at.Add(-self.windowTimeout).UnixNano()
+	adjustedMin, residenceMin, count := time.Duration(0), time.Duration(0), 0
+	for offset := range self.windowCount {
+		item := self.window[(self.windowTailIndex+offset)%len(self.window)]
+		if item.receiverAdjustedNanos <= 0 || item.receiveUnixNano < cutoff || item.receiveUnixNano > at.UnixNano() {
+			continue
+		}
+		adjusted := time.Duration(item.receiverAdjustedNanos - 1)
+		compression := time.Duration(item.receiverCompressionMicros) * time.Microsecond
+		residence := time.Duration(math.MaxInt64)
+		if adjusted <= time.Duration(math.MaxInt64)-compression {
+			residence = max(item.rtt, adjusted+compression)
+		}
+		if count == 0 || adjusted < adjustedMin {
+			adjustedMin = adjusted
+		}
+		if count == 0 || residence < residenceMin {
+			residenceMin = residence
+		}
+		count++
+	}
+	return adjustedMin, residenceMin, count > 0
 }

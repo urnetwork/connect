@@ -155,6 +155,11 @@ func ShedMemory() {
 // seconds later.
 var networkChangeListeners = NewCallbackList[func()]()
 
+// networkQualityChangeListeners receive app-reported radio or path-quality
+// changes that do not require rebuilding a working transport. Callbacks must
+// only enqueue their work: the host may call this from an OS listener thread.
+var networkQualityChangeListeners = NewCallbackList[func()]()
+
 // AddNetworkChangeListener registers a callback invoked by NetworkChanged. It returns an
 // unregister closure; an owner must unregister when it closes.
 func AddNetworkChangeListener(listener func()) func() {
@@ -164,10 +169,32 @@ func AddNetworkChangeListener(listener func()) func() {
 	}
 }
 
+// AddNetworkQualityChangeListener registers a callback invoked by
+// NetworkQualityChanged. It returns an unregister closure; an owner must
+// unregister when it closes.
+func AddNetworkQualityChangeListener(listener func()) func() {
+	callbackId := networkQualityChangeListeners.Add(listener)
+	return func() {
+		networkQualityChangeListeners.Remove(callbackId)
+	}
+}
+
+// NetworkQualityChanged reports a change in cell signal bars, cellular type,
+// or Wi-Fi signal quality. It requests bounded estimator remeasurement without
+// reconnecting transports or resetting connection liveness.
+func NetworkQualityChanged() {
+	for _, listener := range networkQualityChangeListeners.Get() {
+		HandleError(listener)
+	}
+}
+
 // NetworkChanged invokes the registered network-change listeners. The host calls this on
 // its OS path-update signal (NWPathMonitor / ConnectivityManager); it is cheap and safe to
 // call on every update — listeners only tear down state bound to a possibly-dead path.
 func NetworkChanged() {
+	// A hard path switch also invalidates quality measurements. Keep this one
+	// canonical call so DeviceLocal does not need to emit both notifications.
+	NetworkQualityChanged()
 	for _, listener := range networkChangeListeners.Get() {
 		HandleError(listener)
 	}
@@ -187,8 +214,10 @@ type CallbackList[T any] struct {
 
 // coalescingCallbackWorker isolates a state-change observer from its producer.
 // At most one callback is in flight and one additional wake is pending. It is
-// intentionally not used for Client send/receive/forward callbacks, whose
-// blocking behavior is part of the transfer backpressure contract.
+// intentionally not wrapped around Client receive/forward callbacks: those
+// borrow their arguments and run inline, so each callback must finish promptly
+// or make its own bounded zero-timeout handoff. Sender callbacks may retain
+// sender-side backpressure.
 type coalescingCallbackWorker struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -456,14 +485,45 @@ func (self *Event) SetOnSignals(signalValues ...syscall.Signal) func() {
 	}
 }
 
+// weightedRandomSource is the subset of a random generator used by the
+// weighted ordering routines. The public entry points use the concurrency-safe
+// math/rand package functions; tests can supply an isolated seeded generator.
+type weightedRandomSource interface {
+	Float32() float32
+	Intn(n int) int
+	Shuffle(n int, swap func(i int, j int))
+}
+
+// weightedGlobalRandomSource adapts math/rand's package-level generator without
+// changing the public routines' random-stream or concurrency semantics.
+type weightedGlobalRandomSource struct{}
+
+func (weightedGlobalRandomSource) Float32() float32 {
+	return mathrand.Float32()
+}
+
+func (weightedGlobalRandomSource) Intn(n int) int {
+	return mathrand.Intn(n)
+}
+
+func (weightedGlobalRandomSource) Shuffle(n int, swap func(i int, j int)) {
+	mathrand.Shuffle(n, swap)
+}
+
 func WeightedShuffle[T comparable](values []T, weights map[T]float32) {
 	WeightedShuffleWithEntropy[T](values, weights, float32(0))
 }
 
 func WeightedShuffleWithEntropy[T comparable](values []T, weights map[T]float32, entropy float32) {
+	weightedShuffleWithEntropy(values, weights, entropy, weightedGlobalRandomSource{})
+}
+
+// weightedShuffleWithEntropy contains the implementation behind
+// WeightedShuffleWithEntropy with an injectable random source.
+func weightedShuffleWithEntropy[T comparable, R weightedRandomSource](values []T, weights map[T]float32, entropy float32, random R) {
 	n := len(values)
 
-	mathrand.Shuffle(n, func(i int, j int) {
+	random.Shuffle(n, func(i int, j int) {
 		values[i], values[j] = values[j], values[i]
 	})
 
@@ -474,7 +534,7 @@ func WeightedShuffleWithEntropy[T comparable](values []T, weights map[T]float32,
 
 	for i := 0; i < n-1; i += 1 {
 		j := func() int {
-			r := mathrand.Float32()
+			r := random.Float32()
 			rnet := r * netRemaining
 			net := entropy * netRemaining
 			for j := i; j < n; j += 1 {
@@ -497,9 +557,15 @@ func WeightedShuffleFunc[T any](values []T, weight func(T) float32) {
 }
 
 func WeightedShuffleFuncWithEntropy[T any](values []T, weight func(T) float32, entropy float32) {
+	weightedShuffleFuncWithEntropy(values, weight, entropy, weightedGlobalRandomSource{})
+}
+
+// weightedShuffleFuncWithEntropy contains the implementation behind
+// WeightedShuffleFuncWithEntropy with an injectable random source.
+func weightedShuffleFuncWithEntropy[T any, R weightedRandomSource](values []T, weight func(T) float32, entropy float32, random R) {
 	n := len(values)
 
-	mathrand.Shuffle(n, func(i int, j int) {
+	random.Shuffle(n, func(i int, j int) {
 		values[i], values[j] = values[j], values[i]
 	})
 
@@ -510,7 +576,7 @@ func WeightedShuffleFuncWithEntropy[T any](values []T, weight func(T) float32, e
 
 	for i := 0; i < n-1; i += 1 {
 		j := func() int {
-			r := mathrand.Float32()
+			r := random.Float32()
 			rnet := r * netRemaining
 			net := entropy * netRemaining
 			for j := i; j < n; j += 1 {
@@ -534,6 +600,12 @@ func WeightedSelectFunc[T any](values []T, n int, weight func(T) float32) {
 
 // puts the result at the front of values
 func WeightedSelectFuncWithEntropy[T any](values []T, n int, weight func(T) float32, entropy float32) {
+	weightedSelectFuncWithEntropy(values, n, weight, entropy, weightedGlobalRandomSource{})
+}
+
+// weightedSelectFuncWithEntropy contains the implementation behind
+// WeightedSelectFuncWithEntropy with an injectable random source.
+func weightedSelectFuncWithEntropy[T any, R weightedRandomSource](values []T, n int, weight func(T) float32, entropy float32, random R) {
 	n = min(n, len(values))
 
 	netRemaining := float32(0)
@@ -543,10 +615,10 @@ func WeightedSelectFuncWithEntropy[T any](values []T, n int, weight func(T) floa
 
 	for i := 0; i < n; i += 1 {
 		j := func() int {
-			r := mathrand.Float32()
+			r := random.Float32()
 			rnet := r * netRemaining
 			net := entropy * netRemaining
-			j := i + (mathrand.Intn(len(values)-i) % (len(values) - i))
+			j := i + (random.Intn(len(values)-i) % (len(values) - i))
 			for c := 0; c < len(values)-i; c += 1 {
 				w := weight(values[j])
 				net += w
@@ -555,7 +627,7 @@ func WeightedSelectFuncWithEntropy[T any](values []T, n int, weight func(T) floa
 					return j
 				}
 				// shuffle iteration
-				j = i + (mathrand.Intn(len(values)-i) % (len(values) - i))
+				j = i + (random.Intn(len(values)-i) % (len(values) - i))
 			}
 			// zero weights, use the last value
 			return j

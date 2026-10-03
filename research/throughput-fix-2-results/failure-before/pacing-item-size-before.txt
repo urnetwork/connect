@@ -1,0 +1,5 @@
+--- FAIL: TestLandingStructsMatchMergedLessTheDeferState (0.00s)
+    flight_gate_landing_size_test.go:66: sendItem is 584 bytes, want merged's 520 plus 32 for the deferred retransmit's own state and 8 for the lane position it last looked at, plus 16 for paced wire bytes and actual write time; anything else means a removed mechanism left a field behind
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.920s

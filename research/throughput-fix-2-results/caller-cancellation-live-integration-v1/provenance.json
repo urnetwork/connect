@@ -1,0 +1,27 @@
+{
+  "adjacent_repetitions": 1,
+  "after_transfer_sha256": "929fcf839be50ec9c6d7375cdf591d986cb9bce9939cab1820de83d2281a4fd5",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "network_quality_events": false,
+  "optional_ack_policy_included": false,
+  "outcomes": "Before6P18F; after24P0F; after-adjacent24P0F. All race=true, zero race warnings.",
+  "production_changes": [
+    "transfer.go:SendBuffer.Pack canceled-caller classification",
+    "transfer.go:ForwardBuffer.Pack canceled-caller classification",
+    "transfer.go:SendEncryptedControl lifetime comment"
+  ],
+  "race": true,
+  "receiver_service_research_adopted": false,
+  "retention": "Full immutable compile inputs, sources, binaries and raw logs remain outside Git; normalized pins below retain every actual outcome.",
+  "root_repetitions": 3,
+  "source_base": {
+    "after_artifact": "throughput-fix-2-live-caller-isolation-after-v1",
+    "after_snapshot_sha256": "1f4590a75a67eb2e3a2b845988a6c5627d3b5f3397004b7d4f3bc9d8aa97ea58",
+    "before_artifact": "throughput-fix-2-live-caller-isolation-before-v1",
+    "before_snapshot_sha256": "c8591c0a4f8185352e305fbe067a1fde422ad26b77e17e43c7ba7a519c37bb91"
+  },
+  "source_distinction": "Original isolated caller proof used the receiver-service experimental anchor with explicit timed credit callback. This live matched source keeps the older live publishAckServiceCredit callback and unchanged live sampler. Both sides here match except the hard caller fix.",
+  "standalone_tests_unchanged": true,
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "unchanged_live_sampler_sha256": "345b06a0f1fa96dcf6135f1451c371e162ec295e7b8cabe090e0f247d1fe92b5"
+}

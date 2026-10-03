@@ -1,0 +1,10 @@
+{
+  "complete": true,
+  "data_race_blocks": 0,
+  "expected_open_root_fail_count": 6,
+  "no_production_fix_proposed": true,
+  "numeric_outcome_rows": 4,
+  "open_pacing_wait_root_retained": true,
+  "pass_count": 6,
+  "top_level_outcome_rows": 12
+}

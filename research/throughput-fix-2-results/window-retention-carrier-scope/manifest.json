@@ -1,0 +1,11 @@
+{
+  "archive": "window-retention-carrier-scope",
+  "payload_sha256": {
+    "outcomes.jsonl": "edfab52bbac8c3302881f80145c94db81159222bc920303ae99e57e5ce5586de",
+    "provenance.json": "cfa3259e37ec460eca850fe363c178d611ab783c6ad9365693a065b999af4bf6",
+    "source-manifest-after.json": "fd26a1ddcaf9a5d3bb3fb6aa3d4df4e9bc8a3eb78b6e86fcea78080556e435cb",
+    "source-manifest-before.json": "ab2cd09c3418a94eb33322a81eb1fe25ea3421d456d242bca17159d2cb0aaa04",
+    "source-pins.json": "478a3b0549b62f8fa755c4a742128bdec07a07165b00a08b22f359fd2cd8e973",
+    "status.json": "148c830e08a879e92ed2a18f4d0fb0f7a3ea6e9f3999b1bf689f1c7eb04e993e"
+  }
+}

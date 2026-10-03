@@ -1,0 +1,14 @@
+{
+  "archive_kind": "receiver_timing_observation_once",
+  "file_count": 7,
+  "file_sha256": {
+    "after-outcomes.jsonl": "e6a9c0a2284d393577279d8fb79aa82a4065600f990389eb028f77fb6206cc21",
+    "before-outcomes.jsonl": "5842a7c1288be9ef7968c759884db71b36a6001ce9f7e5ebe9127e912be5fec8",
+    "before-variant-checks.jsonl": "70506c4f4ba8809911b8ec5667d77ad2cd1ef0cefa8512edf48c3c333f6ad676",
+    "first-case-diagnostic-checks.jsonl": "8181b0f04d8b19fd9c1db750c82fe1413379d2734917097b7397a9e1f958dd83",
+    "first-case-diagnostic-outcomes.jsonl": "4f566b82731393bfb3095d95264463a93d2de5a93b8496644a7feea083869772",
+    "provenance.json": "bdfa47803580e278f5ccfeb7cc3268ca47b3972bc3a051a77055be750d4b5060",
+    "status.json": "f3053b3ac5848e88581a90010f86229de3b0f25946e5802f75e51d7a3a937988"
+  },
+  "schema_version": 1
+}

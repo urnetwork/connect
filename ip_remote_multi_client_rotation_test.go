@@ -173,8 +173,18 @@ func TestExpandReplacementDeclineSourceAnchor(t *testing.T) {
 	if !strings.Contains(body, `"expand_decline"`) {
 		t.Error("a declined replacement is not logged, so the decline is invisible in field logs")
 	}
-	if !strings.Contains(body, "RemoveClientArgs(&args.MultiClientGeneratorClientArgs)") {
-		t.Error("expand no longer returns declined/failed args to the generator")
+	// Direct args retirement is allowed only before a channel owns them:
+	// late delivered args, a deferred fixed mint observed after cancellation
+	// or acquisition expiry, and a constructor failure that retained no args.
+	// The guard inventory rejects an extra or relocated call, even if another
+	// legitimate cleanup is removed so the total call count remains unchanged.
+	for _, violation := range expandArgsCleanupViolations(t, body) {
+		t.Error(violation)
+	}
+	deadlineCheck := strings.Index(body, "expandCandidateWithinAcquisitionDeadline(")
+	channelConstruction := strings.Index(body, "newMultiClientChannel(")
+	if deadlineCheck < 0 || channelConstruction < 0 || channelConstruction < deadlineCheck {
+		t.Error("expand checks the acquisition deadline after channel construction, so direct args cleanup could revoke an owned channel")
 	}
 
 	gate, ok := functionBody(source, "func (self *multiClientWindow) replacementAllowed(")
@@ -186,6 +196,75 @@ func TestExpandReplacementDeclineSourceAnchor(t *testing.T) {
 	}
 	if !strings.Contains(gate, "IsDone()") {
 		t.Error("replacementAllowed does not check for a done channel, so dead channels could be kept over fresh ones")
+	}
+}
+
+func TestStrictWindowAdmissionHardMax(t *testing.T) {
+	firstId := NewId()
+	secondId := NewId()
+	newId := NewId()
+	windowSize := WindowSizeSettings{WindowSizeHardMax: 2}
+	window := &multiClientWindow{
+		settings: &MultiClientSettings{StrictWindowSizeHardMax: true},
+		clients: map[Id]*multiClientChannel{
+			firstId:  nil,
+			secondId: nil,
+		},
+	}
+
+	if window.strictWindowAdmissionAllowed(newId, windowSize) {
+		t.Fatal("strict hard max admitted a new identity at the ownership ceiling")
+	}
+	if !window.strictWindowAdmissionAllowed(firstId, windowSize) {
+		t.Fatal("strict hard max rejected a same-identity replacement")
+	}
+
+	delete(window.clients, secondId)
+	if !window.strictWindowAdmissionAllowed(newId, windowSize) {
+		t.Fatal("strict hard max rejected a new identity below the ceiling")
+	}
+}
+
+func TestStrictWindowAdmissionIsOptInAndZeroMaxIsUnbounded(t *testing.T) {
+	newId := NewId()
+	var nilWindow *multiClientWindow
+	if !nilWindow.strictWindowAdmissionAllowed(newId, WindowSizeSettings{WindowSizeHardMax: 1}) {
+		t.Fatal("nil window unexpectedly enabled strict admission")
+	}
+	bareWindow := &multiClientWindow{}
+	if !bareWindow.strictWindowAdmissionAllowed(newId, WindowSizeSettings{WindowSizeHardMax: 1}) {
+		t.Fatal("partial settings unexpectedly enabled strict admission")
+	}
+	window := &multiClientWindow{
+		settings: DefaultMultiClientSettings(),
+		clients: map[Id]*multiClientChannel{
+			NewId(): nil,
+		},
+	}
+	if !window.strictWindowAdmissionAllowed(newId, WindowSizeSettings{WindowSizeHardMax: 1}) {
+		t.Fatal("default settings unexpectedly enabled strict admission")
+	}
+
+	window.settings.StrictWindowSizeHardMax = true
+	if !window.strictWindowAdmissionAllowed(newId, WindowSizeSettings{}) {
+		t.Fatal("zero hard max did not retain its unbounded meaning")
+	}
+}
+
+func TestExpandConsultsStrictWindowAdmissionGate(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := functionBody(source, "func (self *multiClientWindow) expand(")
+	if !ok {
+		t.Fatal("could not find expand")
+	}
+	if !strings.Contains(body, "self.strictWindowAdmissionAllowed(") {
+		t.Fatal("expand bypasses the strict hard-max admission gate")
+	}
+	if !strings.Contains(body, `"strict_hard_max"`) {
+		t.Fatal("strict hard-max declines are not observable in field logs")
 	}
 }
 
@@ -345,10 +424,9 @@ func TestStandingReserveTargetTable(t *testing.T) {
 	}{
 		// the speed window's shape: fixed size 1, hard max 4
 		{"speed window", 1, 4, true, false, 2},
-		// the quality window's shape: demand target up to 6, hard max 12.
-		// the spare may exceed WindowSizeMax -- the max bounds demand
-		// growth, the spare is insurance on top
-		{"quality window", 6, 12, true, false, 7},
+		// the quality window's default shape: its memory ceiling prevents
+		// the reserve from adding a seventh full client graph
+		{"quality window at memory ceiling", 6, 6, true, false, 6},
 		// the hard max is a hard bound: the spare never breaches it
 		{"at hard max", 4, 4, true, false, 4},
 		// 0 hard max is unbounded, as everywhere else
@@ -378,6 +456,17 @@ func TestStandingReserveTargetTable(t *testing.T) {
 func TestStandingReserveDefaultsAndOverrideRoundTrip(t *testing.T) {
 	settings := DefaultMultiClientSettings()
 	AssertEqual(t, settings.StandingReserve, true)
+
+	qualityWindow := settings.WindowSizes[WindowTypeQuality]
+	AssertEqual(t, qualityWindow.WindowSizeMin, 6)
+	AssertEqual(t, qualityWindow.WindowSizeMax, 6)
+	AssertEqual(t, qualityWindow.WindowSizeHardMax, 6)
+	AssertEqual(t, standingReserveTarget(
+		qualityWindow.WindowSizeMax,
+		qualityWindow.WindowSizeHardMax,
+		settings.StandingReserve,
+		false,
+	), 6)
 
 	reliabilitySettings := ReliabilitySettingsFrom(settings)
 	AssertEqual(t, reliabilitySettings.StandingReserve, true)

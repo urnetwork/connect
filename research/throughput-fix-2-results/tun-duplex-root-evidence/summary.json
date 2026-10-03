@@ -1,0 +1,34 @@
+{
+  "after": {
+    "binary_sha256": "312e6d60b0706a3fb83029ca178d2100762e4075127bd6ea6405af26f72c6718",
+    "effective_source_sha256": "57bc4cdc7dc16a0798642518738a72d3b8d82460aead58b08b6a7eef1640bb19",
+    "test_sha256": "b98248a8adba00e4a6e0d0dd3647277afbc22e45dd65b6b79d14c5a9dda668a8",
+    "tun_sha256": "ef8a323c939a4570c996d05072d15ca8837e0ef705270bbb9b8ac9b5c2efac96"
+  },
+  "artifact": "sanitized final TUN duplex root evidence",
+  "base_connect_canonical_source_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+  "before": {
+    "binary_sha256": "b33705f1f35a67c50a0026791dbf3c08ebd9b3d283f2ace1f350bee88bf30f01",
+    "effective_source_sha256": "0c23ca75b0f47973c270e8246808a789ff8f0c491bf13da348c88d7907f2cde1",
+    "test_sha256": "b98248a8adba00e4a6e0d0dd3647277afbc22e45dd65b6b79d14c5a9dda668a8",
+    "tun_sha256": "61bedc3e5e3662633e6c711a7a665c86398aea38d4cdf8c63d72fd1e8dafcf8f"
+  },
+  "counts": {
+    "after_race_failures": 0,
+    "after_race_passes": 57,
+    "after_race_skips": 0,
+    "after_race_warnings": 0,
+    "before_expected_failures": 6,
+    "before_passes": 0,
+    "race_iterations": 3,
+    "root_tests_per_after_iteration": 19
+  },
+  "limits": [
+    "This is deterministic isolated TUN handoff evidence, not an accepted physical-H1 or SDK throughput comparison.",
+    "Physical duplex outcomes remain separately frozen and censored.",
+    "Raw stack diagnostics are deliberately excluded."
+  ],
+  "redaction": "No raw logs, source or overlay contents, binaries, commands, absolute paths, or stack traces are copied. Hashes and normalized outcomes are retained.",
+  "schema": "throughput-fix-2/tun-duplex-root-evidence-summary-v1",
+  "status": "isolated deterministic TUN handoff evidence; before failures reproduced and after race selection passed"
+}

@@ -161,6 +161,14 @@ type sendPackFrame struct {
 	// true (proto3 implicit presence; false is the legacy default lane)
 	forceStream       bool
 	companionContract bool
+	// logicalLane is Pack field 12. Zero is the legacy/control lane and is
+	// omitted; nonzero values are capability-negotiated and bounded to 1..8.
+	logicalLane uint32
+	// contractAhead is Pack field 13: the contract frame announces the
+	// successor rather than opening it (THROUGHPUTFIX §39.1). Emitted only
+	// when true, and only to a receiver that advertised the capability, so a
+	// legacy peer's wire is unchanged.
+	contractAhead bool
 }
 
 // sizePack returns the encoded size of the Pack submessage body.
@@ -200,6 +208,12 @@ func (m *sendPackFrame) sizePack() int {
 	}
 	if m.companionContract {
 		n += protoSizeTag(11) + 1
+	}
+	if m.logicalLane != 0 {
+		n += protoSizeTag(12) + protoSizeVarint(uint64(m.logicalLane))
+	}
+	if m.contractAhead {
+		n += protoSizeTag(13) + 1
 	}
 	return n
 }
@@ -249,6 +263,14 @@ func (m *sendPackFrame) appendPack(b []byte) []byte {
 	}
 	if m.companionContract {
 		b = protoAppendTag(b, 11, protoWireVarint)
+		b = append(b, 1)
+	}
+	if m.logicalLane != 0 {
+		b = protoAppendTag(b, 12, protoWireVarint)
+		b = protoAppendVarint(b, uint64(m.logicalLane))
+	}
+	if m.contractAhead {
+		b = protoAppendTag(b, 13, protoWireVarint)
 		b = append(b, 1)
 	}
 	return b
@@ -322,12 +344,27 @@ func marshalSendPackTransferFrame(m *sendPackFrame) []byte {
 // carrying an Ack. The inner ack frame is not session-stamped (wrapping, when
 // it happens, adds the role/companion hint to the outer encrypted frame).
 type sendAckFrame struct {
-	path        TransferPath
-	messageId   Id
-	sequenceId  Id
-	selective   bool
-	tagSendTime uint64
-	tagSet      bool
+	path                     TransferPath
+	messageId                Id
+	sequenceId               Id
+	selective                bool
+	tagSendTime              uint64
+	tagSet                   bool
+	missingContractId        *Id
+	compactContractRecovery  bool
+	logicalLaneVersion       uint32
+	receiveWindowByteCount   uint64
+	receiveWindowSet         bool
+	ackCompressTimeoutMicros uint32
+	ackCompressTimeoutSet    bool
+	receiverAckDelayMicros   uint32
+	receiverAckDelaySet      bool
+	// sequence numbers the receiver evicted after acknowledging them
+	evictedSequenceNumbers []uint64
+	// contractAhead is Ack field 10: this receiver registers a successor
+	// contract announced ahead of its data (THROUGHPUTFIX §39.1). Emitted only
+	// when true; absent is the legacy peer.
+	contractAhead bool
 }
 
 func (m *sendAckFrame) sizeAck() int {
@@ -341,6 +378,34 @@ func (m *sendAckFrame) sizeAck() int {
 	if m.tagSet {
 		tagBody := sizeTagBody(m.tagSendTime)
 		n += protoSizeTag(4) + protoSizeVarint(uint64(tagBody)) + tagBody
+	}
+	if m.missingContractId != nil {
+		n += protoSizeTag(5) + protoSizeVarint(16) + 16
+	}
+	if m.compactContractRecovery {
+		n += protoSizeTag(6) + 1
+	}
+	if m.logicalLaneVersion != 0 {
+		n += protoSizeTag(7) + protoSizeVarint(uint64(m.logicalLaneVersion))
+	}
+	if m.receiveWindowSet {
+		n += protoSizeTag(8) + protoSizeVarint(m.receiveWindowByteCount)
+	}
+	if 0 < len(m.evictedSequenceNumbers) {
+		body := 0
+		for _, sequenceNumber := range m.evictedSequenceNumbers {
+			body += protoSizeVarint(sequenceNumber)
+		}
+		n += protoSizeTag(9) + protoSizeVarint(uint64(body)) + body
+	}
+	if m.contractAhead {
+		n += protoSizeTag(10) + 1
+	}
+	if m.ackCompressTimeoutSet {
+		n += protoSizeTag(11) + protoSizeVarint(uint64(m.ackCompressTimeoutMicros))
+	}
+	if m.receiverAckDelaySet {
+		n += protoSizeTag(12) + protoSizeVarint(uint64(m.receiverAckDelayMicros))
 	}
 	return n
 }
@@ -356,6 +421,47 @@ func (m *sendAckFrame) appendAck(b []byte) []byte {
 		b = protoAppendTag(b, 4, protoWireBytes)
 		b = protoAppendVarint(b, uint64(sizeTagBody(m.tagSendTime)))
 		b = appendTagBody(b, m.tagSendTime)
+	}
+	if m.missingContractId != nil {
+		b = appendIdField(b, 5, *m.missingContractId)
+	}
+	if m.compactContractRecovery {
+		b = protoAppendTag(b, 6, protoWireVarint)
+		b = append(b, 1)
+	}
+	if m.logicalLaneVersion != 0 {
+		b = protoAppendTag(b, 7, protoWireVarint)
+		b = protoAppendVarint(b, uint64(m.logicalLaneVersion))
+	}
+	// optional: zero is a receiver that is currently full, so presence is
+	// carried by the tag rather than by the value
+	if m.receiveWindowSet {
+		b = protoAppendTag(b, 8, protoWireVarint)
+		b = protoAppendVarint(b, m.receiveWindowByteCount)
+	}
+	// packed, which is what proto3 emits for a repeated scalar
+	if 0 < len(m.evictedSequenceNumbers) {
+		body := 0
+		for _, sequenceNumber := range m.evictedSequenceNumbers {
+			body += protoSizeVarint(sequenceNumber)
+		}
+		b = protoAppendTag(b, 9, protoWireBytes)
+		b = protoAppendVarint(b, uint64(body))
+		for _, sequenceNumber := range m.evictedSequenceNumbers {
+			b = protoAppendVarint(b, sequenceNumber)
+		}
+	}
+	if m.contractAhead {
+		b = protoAppendTag(b, 10, protoWireVarint)
+		b = append(b, 1)
+	}
+	if m.ackCompressTimeoutSet {
+		b = protoAppendTag(b, 11, protoWireVarint)
+		b = protoAppendVarint(b, uint64(m.ackCompressTimeoutMicros))
+	}
+	if m.receiverAckDelaySet {
+		b = protoAppendTag(b, 12, protoWireVarint)
+		b = protoAppendVarint(b, uint64(m.receiverAckDelayMicros))
 	}
 	return b
 }
@@ -531,7 +637,7 @@ const (
 	// Free objects, not in-flight objects. 256 covers the parallel receive
 	// width of the production-shaped provider kernel (166 owners created in
 	// the exact profile) while bounding retained protocol + pipeline state to
-	// roughly 232 KiB (928 bytes/owner on arm64). The previous 1024 x 536-byte
+	// 250 KiB (1000 bytes/owner on arm64). The previous 1024 x 536-byte
 	// protocol-only cache had a ~536 KiB worst retained bound and still
 	// allocated separate ReceivePack/receiveItem envelopes.
 	decodedPackOwnerPoolCapacity = 256
@@ -685,18 +791,26 @@ func (owner *decodedPackOwner) nextFrame() *protocol.Frame {
 type decodedTransferFrame struct {
 	frame protocol.TransferFrame
 
-	path        protocol.TransferPath
-	pathIds     [3]Id
-	carrier     protocol.Frame
-	packOwner   *decodedPackOwner
-	sessionRole protocol.SequenceRole
-	companion   bool
+	path                   protocol.TransferPath
+	pathIds                [3]Id
+	carrier                protocol.Frame
+	packOwner              *decodedPackOwner
+	ack                    protocol.Ack
+	ackIds                 [3]Id
+	ackWindowByteCount     uint64
+	ackCompressionMicros   uint32
+	ackReceiverDelayMicros uint32
+	ackTag                 protocol.Tag
+	sessionRole            protocol.SequenceRole
+	companion              bool
 }
 
 // decodedTransferFrame itself contains pointer-bearing protobuf views into its
 // inline path/role storage, so Go conservatively moves it to the heap. Reuse
 // those synchronous wrappers through a second, much smaller bounded cache.
-// At 384 bytes/object on arm64, the 256-object cap retains at most 96 KiB.
+// Inline ACK storage, including receiver timing, is bounded by the exact
+// retained-size test. The 256-object cap bounds this cache independently of
+// the active queues, while the common ACK decode remains allocation-free.
 const decodedTransferFramePoolCapacity = 256
 
 type decodedTransferFramePoolShard struct {
@@ -778,6 +892,7 @@ func (decoded *decodedTransferFrame) release() {
 		decoded.frame.Pack = nil
 	}
 	decoded.frame.TransferPath = nil
+	decoded.frame.Ack = nil
 	decoded.frame.EncryptedTransferFrame = nil
 	decoded.frame.SessionRole = nil
 	decoded.frame.SessionCompanion = nil
@@ -1043,7 +1158,7 @@ func decodePack(b []byte) (pack *protocol.Pack, success bool) {
 			}
 			b = b[vn:]
 			pack.Nack = protowire.DecodeBool(v)
-		case 10, 11: // force_stream, companion_contract (sequence lane)
+		case 10, 11, 12, 13: // force_stream, companion_contract, logical_lane, contract_ahead
 			if typ != protowire.VarintType {
 				return nil, false
 			}
@@ -1052,10 +1167,15 @@ func decodePack(b []byte) (pack *protocol.Pack, success bool) {
 				return nil, false
 			}
 			b = b[vn:]
-			if num == 10 {
+			switch num {
+			case 10:
 				pack.ForceStream = protowire.DecodeBool(v)
-			} else {
+			case 11:
 				pack.CompanionContract = protowire.DecodeBool(v)
+			case 12:
+				pack.LogicalLane = uint32(v)
+			default:
+				pack.ContractAhead = protowire.DecodeBool(v)
 			}
 		case 5, 7: // frames (repeated), contract_frame (Frame)
 			if typ != protowire.BytesType {
@@ -1173,7 +1293,7 @@ func decodePackOwned(b []byte) (owner *decodedPackOwner, success bool) {
 			}
 			b = b[vn:]
 			pack.Nack = protowire.DecodeBool(v)
-		case 10, 11: // force_stream, companion_contract (sequence lane)
+		case 10, 11, 12, 13: // force_stream, companion_contract, logical_lane, contract_ahead
 			if typ != protowire.VarintType {
 				return nil, false
 			}
@@ -1182,10 +1302,15 @@ func decodePackOwned(b []byte) (owner *decodedPackOwner, success bool) {
 				return nil, false
 			}
 			b = b[vn:]
-			if num == 10 {
+			switch num {
+			case 10:
 				pack.ForceStream = protowire.DecodeBool(v)
-			} else {
+			case 11:
 				pack.CompanionContract = protowire.DecodeBool(v)
+			case 12:
+				pack.LogicalLane = uint32(v)
+			default:
+				pack.ContractAhead = protowire.DecodeBool(v)
 			}
 		case 5: // frames (repeated)
 			if typ != protowire.BytesType {
@@ -1286,6 +1411,96 @@ func decodeAck(b []byte) (*protocol.Ack, bool) {
 				return nil, false
 			}
 			ack.Tag = tg
+		case 5: // missing_contract_id (bytes)
+			if typ != protowire.BytesType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			ack.MissingContractId = copyProtoBytes(v)
+		case 6: // compact_contract_recovery
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			ack.CompactContractRecovery = protowire.DecodeBool(v)
+		case 7: // logical_lane_version
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			ack.LogicalLaneVersion = uint32(v)
+		case 8: // receive_window_byte_count
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			receiveWindowByteCount := v
+			ack.ReceiveWindowByteCount = &receiveWindowByteCount
+		case 9: // evicted_sequence_numbers, packed varints
+			if typ != protowire.BytesType {
+				return nil, false
+			}
+			body, bn := protowire.ConsumeBytes(b)
+			if bn < 0 {
+				return nil, false
+			}
+			b = b[bn:]
+			for 0 < len(body) {
+				v, vn := protowire.ConsumeVarint(body)
+				if vn < 0 {
+					return nil, false
+				}
+				body = body[vn:]
+				ack.EvictedSequenceNumbers = append(ack.EvictedSequenceNumbers, v)
+			}
+		case 10: // contract_ahead
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			ack.ContractAhead = protowire.DecodeBool(v)
+		case 11: // ack_compress_timeout_micros, including explicit zero
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			micros := uint32(v)
+			ack.AckCompressTimeoutMicros = &micros
+		case 12: // receiver_ack_delay_micros, including explicit zero
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			micros := uint32(v)
+			ack.ReceiverAckDelayMicros = &micros
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {
@@ -1295,6 +1510,159 @@ func decodeAck(b []byte) (*protocol.Ack, bool) {
 		}
 	}
 	return ack, true
+}
+
+// decodeAckOwned keeps the synchronous ACK wrapper and its fixed-size IDs in
+// decodedTransferFrame. Client.run copies the small semantic value into the
+// destination SendSequence before returning that owner, so the ACK hot path
+// does not allocate a protocol object or three byte slices per frame.
+func decodeAckOwned(b []byte, decoded *decodedTransferFrame) bool {
+	ack := &decoded.ack
+	for 0 < len(b) {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return false
+		}
+		b = b[n:]
+		switch num {
+		case 1, 2: // message_id, sequence_id (bytes)
+			if typ != protowire.BytesType {
+				return false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			if num == 1 {
+				if !setInlineProtoId(&ack.MessageId, &decoded.ackIds[0], v) {
+					return false
+				}
+			} else if !setInlineProtoId(&ack.SequenceId, &decoded.ackIds[1], v) {
+				return false
+			}
+		case 3: // selective
+			if typ != protowire.VarintType {
+				return false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			ack.Selective = protowire.DecodeBool(v)
+		case 4: // tag (Tag)
+			if typ != protowire.BytesType {
+				return false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 || !decodeTagInto(v, &decoded.ackTag) {
+				return false
+			}
+			b = b[vn:]
+			ack.Tag = &decoded.ackTag
+		case 5: // missing_contract_id (bytes)
+			if typ != protowire.BytesType {
+				return false
+			}
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 || !setInlineProtoId(
+				&ack.MissingContractId,
+				&decoded.ackIds[2],
+				v,
+			) {
+				return false
+			}
+			b = b[vn:]
+		case 6: // compact_contract_recovery
+			if typ != protowire.VarintType {
+				return false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			ack.CompactContractRecovery = protowire.DecodeBool(v)
+		case 7: // logical_lane_version
+			if typ != protowire.VarintType {
+				return false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			ack.LogicalLaneVersion = uint32(v)
+		case 8: // receive_window_byte_count
+			if typ != protowire.VarintType {
+				return false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			decoded.ackWindowByteCount = v
+			ack.ReceiveWindowByteCount = &decoded.ackWindowByteCount
+		case 9: // evicted_sequence_numbers, packed varints
+			if typ != protowire.BytesType {
+				return false
+			}
+			body, bn := protowire.ConsumeBytes(b)
+			if bn < 0 {
+				return false
+			}
+			b = b[bn:]
+			for 0 < len(body) {
+				v, vn := protowire.ConsumeVarint(body)
+				if vn < 0 {
+					return false
+				}
+				body = body[vn:]
+				ack.EvictedSequenceNumbers = append(ack.EvictedSequenceNumbers, v)
+			}
+		case 10: // contract_ahead
+			if typ != protowire.VarintType {
+				return false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			ack.ContractAhead = protowire.DecodeBool(v)
+		case 11: // ack_compress_timeout_micros, including explicit zero
+			if typ != protowire.VarintType {
+				return false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			decoded.ackCompressionMicros = uint32(v)
+			ack.AckCompressTimeoutMicros = &decoded.ackCompressionMicros
+		case 12: // receiver_ack_delay_micros, including explicit zero
+			if typ != protowire.VarintType {
+				return false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			decoded.ackReceiverDelayMicros = uint32(v)
+			ack.ReceiverAckDelayMicros = &decoded.ackReceiverDelayMicros
+		default:
+			fn := protowire.ConsumeFieldValue(num, typ, b)
+			if fn < 0 {
+				return false
+			}
+			b = b[fn:]
+		}
+	}
+	return true
 }
 
 // unmarshalTransferFrame decodes b into tf (see the section comment for the
@@ -1420,11 +1788,18 @@ func unmarshalTransferFrameInto(
 				return false
 			}
 			b = b[vn:]
-			a, ok := decodeAck(v)
-			if !ok {
-				return false
+			if decoded == nil {
+				a, ok := decodeAck(v)
+				if !ok {
+					return false
+				}
+				tf.Ack = a
+			} else {
+				if !decodeAckOwned(v, decoded) {
+					return false
+				}
+				tf.Ack = &decoded.ack
 			}
-			tf.Ack = a
 		case 6: // encryptedTransferFrame (bytes)
 			if typ != protowire.BytesType {
 				return false

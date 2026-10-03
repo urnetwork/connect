@@ -1,0 +1,16 @@
+[
+  {
+    "selection": "accepted-contracts",
+    "pass": 60,
+    "fail": 0,
+    "skip": 0,
+    "race_warnings": 0,
+    "race_instrumented": true,
+    "effective_inputs_sha256": "e928e40cc5dc3dc0ff52c8672a0be2dc61138fd24491f0cca3e562b4e7618bc9",
+    "binary_sha256": "f2aeff6c4776e2b12234966b9bf1f1cbb6ac4a2208c25a4426d4119c7efcc217",
+    "original_manifest_sha256": "0237dc2aed9735b3039318024fda780298c49227aa2fe578dea2d1a448e07970",
+    "original_status_sha256": "debef785313a4a09b7e52a5af3957f45c392e08340a2a329f2bf10142127eead",
+    "raw_log_sha256": "433b38b78ce9ee127d6e3e15e8531722353540704aeb9d4b25c2d5b8c7e7d917",
+    "note": "60P0F:20definitions across accepted SDK attribution contracts, six prefix safety/ownership controls and six bounded-history contracts. This is a justified test-contract correction on combined candidate source, not a before/after production performance comparison. Original exact SDK failures are retained in service-receiver-prefix-timing-v1."
+  }
+]

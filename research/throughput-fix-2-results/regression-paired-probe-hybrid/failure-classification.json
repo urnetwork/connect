@@ -1,0 +1,19 @@
+{
+  "failure_observations": [
+    {
+      "classification": "unresolved regression failure",
+      "duration": "76.98s",
+      "normalized_assertion": "message 1438 was not admitted",
+      "test": "TestSilentLaneLongerThanTheProbeCadenceStillDrains"
+    },
+    {
+      "classification": "unresolved regression failure",
+      "duration": "1.89s",
+      "normalized_assertion": "the harness no longer reproduces the retransmit storm",
+      "test": "TestSingleReliableLaneQueueInflatedRttDoesNotStorm"
+    }
+  ],
+  "race_warning_blocks": 0,
+  "rerun": false,
+  "schema_version": 1
+}

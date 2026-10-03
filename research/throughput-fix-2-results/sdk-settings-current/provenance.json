@@ -1,0 +1,40 @@
+{
+  "input_sha256": {
+    "manifest.json": "0ed0141e434854b4757a3b661c96e8535d381ffb0afd9b3b200f03f7e05dea73",
+    "run.log": "b93dae74697e37c17cc3ee1a2d596c407d54548e38d3d43a284940e811389fae",
+    "settings.json": "b51778c468c23f195ea5549a4ea0e3e6cb04b03d8e494a60c47af7cb8a22e45d",
+    "status.json": "da0d35a69a7ed13c7af1b6ccbafcf80ee64f0f22f6fe49aea51826e202b46640"
+  },
+  "outcome": "process passed",
+  "purpose": "Constructor-only SDK window settings capture; no network client or mobile-runtime claim.",
+  "redaction": "No default-host, secret, token, password, endpoint, URL, or raw log fields were copied. Generated overlay sources and binary remain outside this archive.",
+  "rows": 8,
+  "settings_field_allowlist": [
+    "AckCompressionNs",
+    "AdvertiseReceiveWindow",
+    "DeviceTarget",
+    "H1QueueBytes",
+    "H1QueueCount",
+    "LogicalDataLanes",
+    "MinimumMessageLimit",
+    "MobilePolicy",
+    "Name",
+    "PackPool",
+    "ProcessBudget",
+    "Providing",
+    "ReceiveMaximum",
+    "ReceiveMinimum",
+    "ReceivePool",
+    "ReceiveQueueBytes",
+    "ReceiveQueueCount",
+    "RetainedReceiveAccounting",
+    "SendInitial",
+    "SendMinimum",
+    "SendPool",
+    "WindowCeiling",
+    "WindowScale",
+    "WindowSizing"
+  ],
+  "source_manifests_stable_during_build": true,
+  "source_state_note": "This capture pins connect source_sha256 5f28f1587548882900d65383a1ec176f5346df688c266366dcdf37d76e645c91 at HEAD 6a212aee. It is a stable SDK-capture state and is not represented as the earlier f60 model source."
+}

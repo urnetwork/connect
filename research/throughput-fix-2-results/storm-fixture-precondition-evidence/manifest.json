@@ -1,0 +1,13 @@
+{
+  "archive_kind": "storm_fixture_precondition_evidence",
+  "file_count": 6,
+  "file_sha256": {
+    "excluded-setup.json": "da3d5576191e77e851c21db952eafa290442195f3824d2f10ef374227aa9bb05",
+    "outcomes.jsonl": "fe4915e57bc326147fca59f7531ed8877f3d5377a31e1e027376fb4b3d348972",
+    "provenance.json": "11e8e1d8a9cf85c820664f7c719412dcc0a82f754dbb3376092ff7650921ac1f",
+    "source-pins.json": "5de0213f147750370a693d7f126dcb8a1e6b1b90dd5a3394f28aa81c06437950",
+    "status.json": "8b01eef1463814b3b0fbc1e6e418869d76681bb9cc8d6d309ea7ef7cfc2997a6",
+    "storm-observations.jsonl": "06854beed63d83169f678b427406de77a9465ace545c921f520b86d1fa015a07"
+  },
+  "schema_version": 1
+}

@@ -123,7 +123,7 @@ func runPeerIdentitiesEstablishedAndVerified(t *testing.T, encryptionControlUseC
 		if err != nil {
 			panic(err)
 		}
-		client.Send(frame, DestinationId(dst), func(error) {})
+		client.Send(frame, dst, func(error) {})
 	}
 
 	stop := make(chan struct{})

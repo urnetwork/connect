@@ -1,0 +1,54 @@
+{
+  "all_reported_metrics_preserved": true,
+  "benchtime": "250ms",
+  "classification": "Diagnostic fixed-memory, CPU and allocation cost of the experimental common delivery ring and cold finalizer; no production adoption or throughput acceptance.",
+  "common_work": "Confirmed initial H1 setup fills complete-flight histories. New benchmarks measure once-only credit publication and full estimate/snapshot; existing real coalescer with128 receiver samples and service-read families remain included. Assertions run outside timed loops.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "host_timing_pass_threshold": null,
+  "interpretation": "The fixed common history costs measurable CPU and per-service bytes without per-operation allocation. No optimization was applied; repeated policy/lock reads and empty warm-ring scans remain reviewable cost.",
+  "median_ns_before_after": {
+    "credit_publication": [
+      103.4,
+      142.1
+    ],
+    "full_estimate": [
+      1465,
+      1838
+    ],
+    "real_32_head_batch": [
+      1586,
+      2006
+    ],
+    "real_head": [
+      1068,
+      1444
+    ],
+    "real_head_large_window": [
+      1122,
+      1519
+    ],
+    "service_continuous": [
+      387.7,
+      529.7
+    ],
+    "service_hold": [
+      260,
+      410.3
+    ],
+    "service_statistics_hold": [
+      256.5,
+      412.3
+    ],
+    "snapshot": [
+      1423,
+      1853
+    ]
+  },
+  "memory": "Inline ring adds3608bytes per service: service struct6416\u219210024bytes; estimate192\u2192200bytes. These are shallow struct sizes; existing separately allocated storage is excluded and unchanged. All54 readings are0B/op,0allocs/op.",
+  "policy_reads": "Full estimate/snapshot invokes the current policy provider5\u21927times/op. Counter fixture records actual calls; it does not model network worker contention.",
+  "race": false,
+  "repetitions": 3,
+  "run_context": "Recorded host load and no-quiescence-wait metadata retained; absolute ns/op and ratios are diagnostic.",
+  "source_pair": "Matched cold shared-delivery v2 before/after plus identical benchmark file. Prefix timing correction and later warm max policy are absent from both.",
+  "test_execution_owner": "test_monitor_medium (Terra medium)"
+}

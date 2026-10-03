@@ -1,0 +1,9 @@
+{
+  "source_log": "throughput-fix-2-relay-fixture-race.log",
+  "source_log_sha256": "09efd600304006aafedd55d788dba1eb53489b4ed2ceb0967b952734159aef6a",
+  "outcome": "process passed",
+  "top_level_passed": 30,
+  "top_level_failed": 0,
+  "top_level_skipped": 0,
+  "note": "Raw log remains outside this archive. Outcomes contain only test names and result lines."
+}

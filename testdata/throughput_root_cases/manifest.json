@@ -1,0 +1,48 @@
+{
+  "base_commit": "272f95e517dfe3a9f5e793aae59a4cdd24b95447",
+  "common_patch": "receiver-common.patch",
+  "default_pattern": "^TestWindow(Receiver.*|PacingReverseCompression.*)$",
+  "file_sha256": {
+    "early-handoff.patch": "a6abe1df4f17b8d07057d4de2f50c79815b1e1e4f900aaae30050858175511b6",
+    "queued-endpoints.patch": "ebaeca2ce34d024109910c0ef58ede0349fd0aaee8a33cbf09050c1f0d951fde",
+    "receiver-common.patch": "4bcdda462a1fdc53ae09bff20dbc83745f7c7fe226032f1d3059a1850b93a847",
+    "receiver/transfer_window_receiver_carrier_buffer_test.go": "518c6efc3d31ee2e56f4da48f0dc536e1be807e52006af7ca01288cbc1ff438e",
+    "receiver/transfer_window_receiver_controlled_train_roots_test.go": "c7e17a13e1ee1c1bd61f7204b7d2417e9dc51d3aa63e1b1580e79fa753643e47",
+    "receiver/transfer_window_receiver_forward_step_aging_roots_test.go": "e02bd4e1c83c5834aef2d8d4874f4341f758bcd7cc05d3f462121d4e58a587cc",
+    "receiver/transfer_window_receiver_hybrid_affected_models_test.go": "63eb0b20efc095314b07abd58409c4d4b323612dbb0e2e2e5f6cbfe5bd1b21c9",
+    "receiver/transfer_window_receiver_hybrid_ownership_diagnostic_test.go": "af20128fc8eef32b4494906afd5b7885071ad33550b253b623f6c336e13a896d",
+    "receiver/transfer_window_receiver_ingress_counter_diagnostic_test.go": "1e5424252b7f2fcdf0377c3a63399496c2108ff7a35b01bc985741105e48e977",
+    "receiver/transfer_window_receiver_ingress_reverse_compression_test.go": "efdf4d7893b60b96481d4b9bed5f27b448190295e397c04d992fedce68ab18e6",
+    "receiver/transfer_window_receiver_offer_train_roots_test.go": "0b3df443b3968043e272563ab1422f60884367449199c0e5d0397536557be103",
+    "receiver/transfer_window_receiver_physical_span_roots_test.go": "1c9b3614342fa9ff3e6a5407b4bc2ac9a1934675d8c33602b79848766adfa8a3",
+    "receiver/transfer_window_receiver_queue_roots_test.go": "9b01aa99335add4e4ff0667ca48391bea2156eccd7152e32d344c5fce0c987f9",
+    "receiver/transfer_window_receiver_queue_worker_test.go": "a4ced6d863ec4f0b1ce8e3d773124760902725a51f65acc6382a66ef9eb25ca9",
+    "sender-confirmed-rise.patch": "92f4dd7e359c848a93e6356f689fd9bb6354cddb7daba51883e87baa5be2dac4"
+  },
+  "fixtures": {
+    "transfer_window_receiver_carrier_buffer_test.go": "receiver/transfer_window_receiver_carrier_buffer_test.go",
+    "transfer_window_receiver_controlled_train_roots_test.go": "receiver/transfer_window_receiver_controlled_train_roots_test.go",
+    "transfer_window_receiver_forward_step_aging_roots_test.go": "receiver/transfer_window_receiver_forward_step_aging_roots_test.go",
+    "transfer_window_receiver_hybrid_affected_models_test.go": "receiver/transfer_window_receiver_hybrid_affected_models_test.go",
+    "transfer_window_receiver_hybrid_ownership_diagnostic_test.go": "receiver/transfer_window_receiver_hybrid_ownership_diagnostic_test.go",
+    "transfer_window_receiver_ingress_counter_diagnostic_test.go": "receiver/transfer_window_receiver_ingress_counter_diagnostic_test.go",
+    "transfer_window_receiver_ingress_reverse_compression_test.go": "receiver/transfer_window_receiver_ingress_reverse_compression_test.go",
+    "transfer_window_receiver_offer_train_roots_test.go": "receiver/transfer_window_receiver_offer_train_roots_test.go",
+    "transfer_window_receiver_physical_span_roots_test.go": "receiver/transfer_window_receiver_physical_span_roots_test.go",
+    "transfer_window_receiver_queue_roots_test.go": "receiver/transfer_window_receiver_queue_roots_test.go",
+    "transfer_window_receiver_queue_worker_test.go": "receiver/transfer_window_receiver_queue_worker_test.go"
+  },
+  "scope": "Experimental receiver service counter roots. Production pending roots live in normal package tests. No new wire fields are implemented.",
+  "variants": {
+    "early-handoff": [
+      "early-handoff.patch"
+    ],
+    "hybrid": [],
+    "queued-endpoints": [
+      "queued-endpoints.patch"
+    ],
+    "sender-confirmed-rise": [
+      "sender-confirmed-rise.patch"
+    ]
+  }
+}

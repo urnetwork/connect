@@ -1,0 +1,26 @@
+{
+  "carrier_after": {
+    "executions": 42,
+    "fail": 0,
+    "pass": 42,
+    "race": true,
+    "selection": "^TestWindowPacingReceiverTiming"
+  },
+  "carrier_before": {
+    "executions": 3,
+    "fail": 3,
+    "pass": 0,
+    "test": "TestWindowPacingReceiverTimingFollowsCurrentCarrier"
+  },
+  "interpretation": "CPU/receiver carrier root evidence only; long RTT result is retained as a failed isolated observation, not accepted throughput evidence.",
+  "isolated_long_rtt_failure": {
+    "candidate_mbps": 9.48224,
+    "fail": 1,
+    "measurement_drops": 328,
+    "minimum_mbps": 1.0171733333333333,
+    "pass": 0,
+    "reference_mbps": 95.77130666666667,
+    "test": "TestWindowPathServiceRoundTripGrowthBeyondOldRing",
+    "total_drops": 1269
+  }
+}

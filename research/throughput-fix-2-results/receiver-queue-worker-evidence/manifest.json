@@ -1,0 +1,10 @@
+{
+  "archive": "receiver-queue-worker-evidence",
+  "payload_sha256": {
+    "outcomes.jsonl": "4aa26ebd5897ced8f60d91203c274850e3a7115c27ca2d115b5208e8331141d5",
+    "provenance.json": "bb7ce29dac59d48b2624c8c4124b3ad9f3179a8c58f9cde0874bbf2ef0bcc519",
+    "source-pins.json": "f8cb6ebd0c02f8a5d67ee2d3541877639c780ef0ce55a5b8e5ef45bf5471bb46",
+    "status.json": "e862c3a51999c1b21a90107647156605924d2ee5629114a600305391681a5a15",
+    "worker-readings.jsonl": "1c67d1f9a29026f2f2a7d04f646cb61c61c270858f4572a0dceee5397a515ef6"
+  }
+}

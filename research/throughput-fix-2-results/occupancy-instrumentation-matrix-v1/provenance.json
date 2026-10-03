@@ -1,0 +1,14 @@
+{
+  "classification": "Four-arm instrument-controlled occupancy comparison; no sampler-source regression established. Mixed-instrumentation profiles are retained as ineligible source attribution.",
+  "matrix_result": "Both race variants fail all three repetitions at approximately0.20\u20130.21. Both nonrace variants pass all three at approximately0.47\u20130.48.",
+  "no_quiescence_wait": true,
+  "outcomes": 18,
+  "production_changed_for_occupancy": false,
+  "profiled_runs": 2,
+  "readings": 18,
+  "runner_correction": "Exclude this wall-clock performance assertion from the scoped race correctness mode; keep it in full nonrace root regression. The retained-policy rename unintentionally added it to the race prefix.",
+  "source_review_sha256": "584dbb7327391e03deb324d2c9d1cd0afd20adf5fc9ea62b0c29ca5bff4e67a4",
+  "source_scope": "Current is frozen correctness-retained-sampler-v4. Older arm changes only the sampler to54b360 plus identical cumulative helper; its source review digest is retained. External replacements retain the original run limitations.",
+  "test_changed": false,
+  "threshold_changed": false
+}

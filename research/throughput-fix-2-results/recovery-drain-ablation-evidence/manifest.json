@@ -1,0 +1,14 @@
+{
+  "archive_kind": "recovery_drain_ablation_evidence",
+  "file_count": 7,
+  "file_sha256": {
+    "comparisons.jsonl": "2fb7b8ab9600f13162df0bca55270a602d3b09db32efef8cbe097578280ddfa7",
+    "drain-liveness-outcomes.jsonl": "b035838a26cb2c59abf2da3269e61b9b02f0c3903e7b2eb9501553f528a94ca1",
+    "model-outcomes.jsonl": "9383453824b1feedb444809016a511ef347d9ca323cc1d141a526c78f77b0949",
+    "provenance.json": "deeefc6d44a74ab80c0cec656fb356fd5286cb35f11ec3bf32ccf18064973d0c",
+    "service-readings.jsonl": "3d78c03294be582f6493b2976aa376f8355a86bc10627ea841f943e6aef44745",
+    "source-pins.json": "8e9104769aeab2958f39f64e7ef578a8e78fc81bbe34e34acfee3bcdbd559a3f",
+    "status.json": "310c3a314f950fc51a8da53f930938442150d665f32f21736989ecc9485bd836"
+  },
+  "schema_version": 1
+}

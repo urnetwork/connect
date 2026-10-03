@@ -1,0 +1,1618 @@
+{
+  "attribution_limits": [
+    "All existing gates, warmups, budgets, fixtures and complete failed outcomes are preserved.",
+    "First-feedback barrier and primer timing are synthetic recovery/phase stimuli, not proof of the natural trigger.",
+    "Virtual FIFO SDK results do not attribute the historical host TCP failures.",
+    "TUN handoff deadlock is an independent cause/fix.",
+    "Versions v3/v4 of the cycle prototype used inconsistent drained-byte fixtures; only the consistent v5 original-root failures are accepted as the coalesced-accounting proof.",
+    "Earlier ACK v3 evidence is separately archived as unlanded/rejected; v4 differs in quiet-time ceiling division.",
+    "Full correctness/model and physical SDK validation remain root/monitor work after reviewed landing."
+  ],
+  "base": {
+    "canonical_shared_go_source_at_build": "c07140f78cac0dc84c22ec06ac8635de755e925471d3bb8a0dbacf0d7737262e",
+    "note": "Includes independent reviewed TUN change; production ACK/Transfer/pacing base matches 3ce605cb."
+  },
+  "candidate": "ack-tail-v4-plus-feedback-cycle-v10",
+  "frozen_unused_v9_primer_build": {
+    "manifest_file": "partial-feedback-cycle-v9-primer.manifest.json",
+    "manifest_sha256": "af2d0b0d05dc4f9de7d5b8316db2a33fec20de0bc10475e91265046a292b2baa"
+  },
+  "guarded_files": [
+    {
+      "candidate_file": "burst-tail-transfer-v4.go",
+      "candidate_sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+      "expected_base_sha256": "af0c88c3dbae3b7d7ed80265fac13d94b6eea6af077b1ebb173671c6afd74246",
+      "target_file": "transfer.go"
+    },
+    {
+      "candidate_file": "burst-tail-ack-v3.go",
+      "candidate_sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+      "expected_base_sha256": "0cc7b6682443136652f61a5597205713acdd377599c1c81b62f96359e7ac0f0e",
+      "target_file": "transfer_ack_compression.go"
+    },
+    {
+      "candidate_file": "burst-tail-worker-v3_test.go",
+      "candidate_sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+      "expected_base_sha256": null,
+      "target_file": "transfer_receive_ack_burst_tail_test.go"
+    },
+    {
+      "candidate_file": "burst-tail-quiet-bound_test.go",
+      "candidate_sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+      "expected_base_sha256": null,
+      "target_file": "transfer_receive_ack_quiet_bound_test.go"
+    },
+    {
+      "candidate_file": "ack-tail-rtt-root_test.go",
+      "candidate_sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+      "expected_base_sha256": null,
+      "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+    },
+    {
+      "candidate_file": "partial-feedback-cycle-startup_test.go",
+      "candidate_sha256": "6efe883fd4bad5f10a76ae11d306b928dd5e381f9374ba7060f18281e77e4262",
+      "expected_base_sha256": null,
+      "target_file": "transfer_window_feedback_cycle_startup_test.go"
+    },
+    {
+      "candidate_file": "partial-feedback-cycle-v9_test.go",
+      "candidate_sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+      "expected_base_sha256": null,
+      "target_file": "transfer_window_feedback_cycle_test.go"
+    },
+    {
+      "candidate_file": "partial-feedback-cycle-v10-pacing.go",
+      "candidate_sha256": "a7fbedd5178c77d590da186bb4e8582d85deb547908bb62c04090f02b1e6d667",
+      "expected_base_sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7",
+      "target_file": "transfer_window_pacing.go"
+    },
+    {
+      "candidate_file": "partial-feedback-service-v2_test.go",
+      "candidate_sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+      "expected_base_sha256": null,
+      "target_file": "transfer_window_partial_feedback_service_test.go"
+    },
+    {
+      "candidate_file": "path-minimal-forced_test.go",
+      "candidate_sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+      "expected_base_sha256": "35d5efdde343b2c49e6ae83e6b36f0c010ccb141ed9ea965dd5a733c057f2457",
+      "target_file": "transfer_window_path_performance_test.go"
+    },
+    {
+      "candidate_file": "minimal-forced-feedback_test.go",
+      "candidate_sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+      "expected_base_sha256": null,
+      "target_file": "transfer_window_sdk_feedback_phase_test.go"
+    }
+  ],
+  "input_handoff_file": "partial-feedback-cycle-v10-handoff.json",
+  "input_handoff_sha256": "56eafaf37ac939aa00ab10932d33c58229a4ebd25bf8e2b1456383d5b6ed1c75",
+  "policy": {
+    "credit_bytes": 32000,
+    "cycle_completion": "Actual post-gap ACK timestamps span the pinned compression interval, or all bytes from a physically ACK-proved drained flight have applied. Missing old bytes cannot be paid by new arrivals. A fresh post-boundary pair may supersede and retire old incomplete evidence only on controller acceptance.",
+    "extra_encoded_carrier_overhead_bound": "At most 1% of newly cumulative credited bytes; excludes lower-level TCP/WebSocket framing.",
+    "maximum_complete_encoded_head_carrier_bytes": 320,
+    "partial_increase": "New cycle bytes divided by the full preceding-gap-to-last-ACK interval may raise the hold while keeping the cycle incomplete. Only completed evidence can lower the held rate; no expected-rate byte quota.",
+    "quiet_interval": "ceil(AckCompressTimeout / 10), with minimum 1 ns for positive timeout; existing immediate behavior for non-positive timeout",
+    "storage": "Three fixed timestamp/byte summaries plus bounded metadata; existing 64-bucket ring unchanged in size."
+  },
+  "prior_rejected_ack_archive": "throughput-fix-2-results/sdk-ack-tail-v3-evidence",
+  "runs": [
+    {
+      "binary_sha256": "76a9896e5ff691a24687eb22761826b4d481570a0b90ad6d9d18c7a897325afd",
+      "build_manifest_file": "partial-feedback-cycle-v10.manifest.json",
+      "build_manifest_sha256": "2648644ab8a6d4286ce728c12f5300c2d31d649186ea65ea6384020e1ebc79b6",
+      "complete": true,
+      "effective_input_sha256": "501b9737653d4c865b2f91731e4eb53419cf3c449ec29533854bdd6bd9f2ab46",
+      "id": "v10-focus",
+      "inputs_stable_during_build": true,
+      "note": "",
+      "original_log_sha256": "6543902aed5003dec8e36eef4605a43608f4f9d4c10811c04bfcea76f0eff681",
+      "outcome_count": 393,
+      "overlay_sha256": "ded53cdc50f116f3fd1628866eff073b8557664f88ade5a09186a6ab4c457560",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-startup_test.go",
+          "sha256": "6efe883fd4bad5f10a76ae11d306b928dd5e381f9374ba7060f18281e77e4262",
+          "target_file": "transfer_window_feedback_cycle_startup_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v10-pacing.go",
+          "sha256": "a7fbedd5178c77d590da186bb4e8582d85deb547908bb62c04090f02b1e6d667",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {
+        "count": 3,
+        "test_regex": "^TestWindow(Pacing|BurstPacing)|^TestReceiveSequenceBurstTail"
+      },
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "76a9896e5ff691a24687eb22761826b4d481570a0b90ad6d9d18c7a897325afd",
+      "build_manifest_file": "partial-feedback-cycle-v10.manifest.json",
+      "build_manifest_sha256": "2648644ab8a6d4286ce728c12f5300c2d31d649186ea65ea6384020e1ebc79b6",
+      "complete": true,
+      "effective_input_sha256": "501b9737653d4c865b2f91731e4eb53419cf3c449ec29533854bdd6bd9f2ab46",
+      "id": "v10-recovery",
+      "inputs_stable_during_build": true,
+      "note": "",
+      "original_log_sha256": "4326778f13017a228ec5dc7d294f86591afc9f4552df8512ea95ffd491af7ad0",
+      "outcome_count": 9,
+      "overlay_sha256": "ded53cdc50f116f3fd1628866eff073b8557664f88ade5a09186a6ab4c457560",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-startup_test.go",
+          "sha256": "6efe883fd4bad5f10a76ae11d306b928dd5e381f9374ba7060f18281e77e4262",
+          "target_file": "transfer_window_feedback_cycle_startup_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v10-pacing.go",
+          "sha256": "a7fbedd5178c77d590da186bb4e8582d85deb547908bb62c04090f02b1e6d667",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {
+        "count": 3,
+        "test_names": [
+          "TestWindowPathAckTailRoundTripGrowthControl",
+          "TestWindowPathServiceLongCompressedFeedback",
+          "TestWindowPathSdkDuplexRecoversAfterInitialFeedbackBarrier"
+        ]
+      },
+      "reading_count": 18
+    },
+    {
+      "binary_sha256": "76a9896e5ff691a24687eb22761826b4d481570a0b90ad6d9d18c7a897325afd",
+      "build_manifest_file": "partial-feedback-cycle-v10.manifest.json",
+      "build_manifest_sha256": "2648644ab8a6d4286ce728c12f5300c2d31d649186ea65ea6384020e1ebc79b6",
+      "complete": true,
+      "effective_input_sha256": "501b9737653d4c865b2f91731e4eb53419cf3c449ec29533854bdd6bd9f2ab46",
+      "id": "v10-service-controls",
+      "inputs_stable_during_build": true,
+      "note": "",
+      "original_log_sha256": "1530cb342be85188aea67a4c3889f8c1b497257c0e15390e9c61d07167097c89",
+      "outcome_count": 6,
+      "overlay_sha256": "ded53cdc50f116f3fd1628866eff073b8557664f88ade5a09186a6ab4c457560",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-startup_test.go",
+          "sha256": "6efe883fd4bad5f10a76ae11d306b928dd5e381f9374ba7060f18281e77e4262",
+          "target_file": "transfer_window_feedback_cycle_startup_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v10-pacing.go",
+          "sha256": "a7fbedd5178c77d590da186bb4e8582d85deb547908bb62c04090f02b1e6d667",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {
+        "count": 1,
+        "test_names": [
+          "TestWindowPathServiceSettledLargeMessageCapacityChanges",
+          "TestWindowPathServiceCapacityIncreaseRecovery",
+          "TestWindowPathServiceAcrossRepeatedDrains",
+          "TestWindowPacingDelayedWakeKeepsService",
+          "TestWindowPathServicesShareFiniteRelay",
+          "TestWindowPathServiceRoundTripChanges"
+        ]
+      },
+      "reading_count": 36
+    },
+    {
+      "binary_sha256": "0b37a844f67d2ec5c7ae6cf6ddad8338d46603f36ae442d855f5cf850db3aa65",
+      "build_manifest_file": "partial-feedback-cycle-v10-race.manifest.json",
+      "build_manifest_sha256": "30ac57a4df2be8aab865eba419da8d01eb3e3c3f7713661b2c133f9affad4d23",
+      "complete": true,
+      "effective_input_sha256": "501b9737653d4c865b2f91731e4eb53419cf3c449ec29533854bdd6bd9f2ab46",
+      "id": "v10-race",
+      "inputs_stable_during_build": true,
+      "note": "",
+      "original_log_sha256": "96cf0cef8684a00abdba759a4882be1278e613d52492cdc38bfe76cc14af823f",
+      "outcome_count": 393,
+      "overlay_sha256": "ded53cdc50f116f3fd1628866eff073b8557664f88ade5a09186a6ab4c457560",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-startup_test.go",
+          "sha256": "6efe883fd4bad5f10a76ae11d306b928dd5e381f9374ba7060f18281e77e4262",
+          "target_file": "transfer_window_feedback_cycle_startup_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v10-pacing.go",
+          "sha256": "a7fbedd5178c77d590da186bb4e8582d85deb547908bb62c04090f02b1e6d667",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {
+        "count": 3,
+        "race": true,
+        "test_regex": "^TestWindow(Pacing|BurstPacing)|^TestReceiveSequenceBurstTail"
+      },
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "b8713e64b72c383ca20ae55365bce9333d188fbd8add2295dd73c2e2ddf1b537",
+      "build_manifest_file": "partial-feedback-cycle-v10-primer.manifest.json",
+      "build_manifest_sha256": "2f3b411da4ac5c96e5faa4960dece6802a9b1e154784e22a0edacfe19ec0b8cd",
+      "complete": true,
+      "effective_input_sha256": "1017e872cc3d505a0010f219ebdc72e5e02a5ad3f7f60d5a7fc157d70f2e5005",
+      "id": "v10-natural",
+      "inputs_stable_during_build": true,
+      "note": "Primer all-arm results are phase diagnostics, not replacement oracles.",
+      "original_log_sha256": "717cc73426e2510d669a3360f87f5d7d11d59c8c16262e58aa5fb10f47992334",
+      "outcome_count": 6,
+      "overlay_sha256": "63cba232e90e665ad1ffe86a985c30e76d9ea09bfd07d72606bb0cf15fa32ddd",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-startup_test.go",
+          "sha256": "6efe883fd4bad5f10a76ae11d306b928dd5e381f9374ba7060f18281e77e4262",
+          "target_file": "transfer_window_feedback_cycle_startup_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v10-pacing.go",
+          "sha256": "a7fbedd5178c77d590da186bb4e8582d85deb547908bb62c04090f02b1e6d667",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-primed-delayed_test.go",
+          "sha256": "28fe11f25ec24f4c1bc222a9924b7481ff20f12872e3fdb9dff7ae03a0628538",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "counterfactual_test.go",
+          "sha256": "c6fdd27a5b5f05c1f0dbbc0ddb1a397465872df7e9283b3861609aafaa4901f8",
+          "target_file": "transfer_window_sdk_probe_test.go"
+        }
+      ],
+      "protocol": {
+        "count": 3,
+        "environment": {},
+        "test_regex": "^TestWindowPathSdkProviderDuplex(Probe|UnpacedControl)$"
+      },
+      "reading_count": 15
+    },
+    {
+      "binary_sha256": "b8713e64b72c383ca20ae55365bce9333d188fbd8add2295dd73c2e2ddf1b537",
+      "build_manifest_file": "partial-feedback-cycle-v10-primer.manifest.json",
+      "build_manifest_sha256": "2f3b411da4ac5c96e5faa4960dece6802a9b1e154784e22a0edacfe19ec0b8cd",
+      "complete": true,
+      "effective_input_sha256": "1017e872cc3d505a0010f219ebdc72e5e02a5ad3f7f60d5a7fc157d70f2e5005",
+      "id": "v10-early",
+      "inputs_stable_during_build": true,
+      "note": "Primer all-arm results are phase diagnostics, not replacement oracles.",
+      "original_log_sha256": "a4bd3d7107cff7426b601cd6301f6f3e75c0f32e359985a7923531568b2ca01c",
+      "outcome_count": 6,
+      "overlay_sha256": "63cba232e90e665ad1ffe86a985c30e76d9ea09bfd07d72606bb0cf15fa32ddd",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-startup_test.go",
+          "sha256": "6efe883fd4bad5f10a76ae11d306b928dd5e381f9374ba7060f18281e77e4262",
+          "target_file": "transfer_window_feedback_cycle_startup_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v10-pacing.go",
+          "sha256": "a7fbedd5178c77d590da186bb4e8582d85deb547908bb62c04090f02b1e6d667",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-primed-delayed_test.go",
+          "sha256": "28fe11f25ec24f4c1bc222a9924b7481ff20f12872e3fdb9dff7ae03a0628538",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "counterfactual_test.go",
+          "sha256": "c6fdd27a5b5f05c1f0dbbc0ddb1a397465872df7e9283b3861609aafaa4901f8",
+          "target_file": "transfer_window_sdk_probe_test.go"
+        }
+      ],
+      "protocol": {
+        "count": 3,
+        "environment": {
+          "CONNECT_WINDOW_SDK_PRIME": "1"
+        },
+        "test_regex": "^TestWindowPathSdkProviderDuplex(Probe|UnpacedControl)$"
+      },
+      "reading_count": 15
+    },
+    {
+      "binary_sha256": "b8713e64b72c383ca20ae55365bce9333d188fbd8add2295dd73c2e2ddf1b537",
+      "build_manifest_file": "partial-feedback-cycle-v10-primer.manifest.json",
+      "build_manifest_sha256": "2f3b411da4ac5c96e5faa4960dece6802a9b1e154784e22a0edacfe19ec0b8cd",
+      "complete": true,
+      "effective_input_sha256": "1017e872cc3d505a0010f219ebdc72e5e02a5ad3f7f60d5a7fc157d70f2e5005",
+      "id": "v10-late",
+      "inputs_stable_during_build": true,
+      "note": "Primer all-arm results are phase diagnostics, not replacement oracles.",
+      "original_log_sha256": "44968c551aa4c80765cf5a3002a00f3c2e2fe6affd641e1ea534fda2de3b65cf",
+      "outcome_count": 6,
+      "overlay_sha256": "63cba232e90e665ad1ffe86a985c30e76d9ea09bfd07d72606bb0cf15fa32ddd",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-startup_test.go",
+          "sha256": "6efe883fd4bad5f10a76ae11d306b928dd5e381f9374ba7060f18281e77e4262",
+          "target_file": "transfer_window_feedback_cycle_startup_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v10-pacing.go",
+          "sha256": "a7fbedd5178c77d590da186bb4e8582d85deb547908bb62c04090f02b1e6d667",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-primed-delayed_test.go",
+          "sha256": "28fe11f25ec24f4c1bc222a9924b7481ff20f12872e3fdb9dff7ae03a0628538",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "counterfactual_test.go",
+          "sha256": "c6fdd27a5b5f05c1f0dbbc0ddb1a397465872df7e9283b3861609aafaa4901f8",
+          "target_file": "transfer_window_sdk_probe_test.go"
+        }
+      ],
+      "protocol": {
+        "count": 3,
+        "environment": {
+          "CONNECT_WINDOW_SDK_PRIME": "1",
+          "CONNECT_WINDOW_SDK_PRIME_DELAY_NS": "2000000"
+        },
+        "test_regex": "^TestWindowPathSdkProviderDuplex(Probe|UnpacedControl)$"
+      },
+      "reading_count": 15
+    },
+    {
+      "binary_sha256": "e3efc709f834aa60f295ae1980a4da197cb99e96aaf02a5ef22f320e90862a06",
+      "build_manifest_file": "partial-feedback-cycle-v10-before.manifest.json",
+      "build_manifest_sha256": "e70f9d08c4ecdd35adbd5d7b64121716c012d1ddad7b0469bbd3c2e331c12ffa",
+      "complete": true,
+      "effective_input_sha256": "5d10868376cb1c5bd607648a86f091bf4f69a192b2aee09b116f9ede44936617",
+      "id": "v10-startup-before",
+      "inputs_stable_during_build": true,
+      "note": "Frozen v9 fails both new startup/gap-bound roots on all three repetitions.",
+      "original_log_sha256": "59dcb259c5f91979dbb797e6efecdd6ec727f4b9533bd771f925c42c97280fc3",
+      "outcome_count": 6,
+      "overlay_sha256": "4f16ec191b6b74c0c980f19e821d4a085c043c3acbcf891abbc6509910d8b6fe",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-startup_test.go",
+          "sha256": "6efe883fd4bad5f10a76ae11d306b928dd5e381f9374ba7060f18281e77e4262",
+          "target_file": "transfer_window_feedback_cycle_startup_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9-pacing.go",
+          "sha256": "89df096523ae0f8d74012f0a9ceed051e10624fa3e0439a7e247575f54993b0e",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {
+        "count": 3,
+        "test_regex": "^TestWindowPacingPartialCycle"
+      },
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "4e2d55e3c15c55bac546c926e1e9cad9e149037550fba4abe40b22410ac69ea6",
+      "build_manifest_file": "partial-feedback-cycle-v5-baseline.manifest.json",
+      "build_manifest_sha256": "ea357e3e07c67817bd3c3e4c80c6857b6af318404b0a7f232e90f1c266ac8a0b",
+      "complete": true,
+      "effective_input_sha256": "0cd3526dcbaa9e460090e61662d0e004edc93819e8e0c777c84965b29022796b",
+      "id": "original-sampler-root-before",
+      "inputs_stable_during_build": true,
+      "note": "Original 7320e29a sampler; ACK v4. Consistent actual physical/accounted bytes. Partial-gap collapse and coalesced drain roots each fail 3/3.",
+      "original_log_sha256": "e9622c195eb0d0e057c6067d0d3f0bc228284140c8be123be4583fc1afbbb08e",
+      "outcome_count": 6,
+      "overlay_sha256": "97890c66694f41b44e3d2dea9c5c32eb1b86cefdf41339c4b4d523d2eb30a9bc",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v5_test.go",
+          "sha256": "b21f99672fac71423d91aa9e982a2b3212f7ea34d3b56a406534dc5a67cb0319",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {},
+      "reading_count": 0
+    },
+    {
+      "complete": true,
+      "id": "v6-adjacent-before",
+      "note": "Old-cycle late-byte reentry and compression shortening regressions.",
+      "original_log_sha256": "32f5baa3b590313e2d07e3b2e48d09e02f0fbc44da43115f8654fee3a7af5b11",
+      "outcome_count": 9,
+      "overlay_sha256": "8284a70d8de0cfc3c2f0e6347570a79e2c5f226cabfd7884e87cffbbf21e6c78",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v6_test.go",
+          "sha256": "31e99af5eaddff408b0d4e386079c85c2d6e57cdd4e68d9229c47a5f22f8d426",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v5-pacing.go",
+          "sha256": "db1e466de100f517f637ce0f39ab943225c5b73cb05e00a9bc207721413bcf17",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {},
+      "provenance_limit": "Direct go test overlay run; no separate standalone binary manifest was retained. Overlay/source/log hashes are retained.",
+      "reading_count": 0
+    },
+    {
+      "complete": true,
+      "id": "v7-adjacent-before",
+      "note": "Fresh slow timestamps beyond the ring while old accounting remains pending.",
+      "original_log_sha256": "c7c756519d56c95a7e56308b709c2582c2f63f82ef412e5174ecf124a6cfb105",
+      "outcome_count": 6,
+      "overlay_sha256": "d464226d2d07a6ca892ceb52c78feab582758854875111b8c57467ed7a3bd392",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v7_test.go",
+          "sha256": "61619cf2986e62498e8214d0341e88ae63ffd6be145ff3c66754c1e901516baf",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v6-pacing.go",
+          "sha256": "865608a2ada681cd4a9dba1dc5bb0a71b4be83fa843bf0458dabe04574530687",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {},
+      "provenance_limit": "Direct go test overlay run; no separate standalone binary manifest was retained. Overlay/source/log hashes are retained.",
+      "reading_count": 0
+    },
+    {
+      "complete": true,
+      "id": "v8-adjacent-before",
+      "note": "Retirement must retain compression provenance for identical ACKs.",
+      "original_log_sha256": "702438fae8b35caacc4cf611c61803f566a5e8bfe0426dfdc97cac9d03ece322",
+      "outcome_count": 6,
+      "overlay_sha256": "229116ede031105792edcc375f615feaa30e4029192a3cf38f8112acd885b5e5",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v8_test.go",
+          "sha256": "efdc483f8e46084b95ca5509b1154bc6931a19978b6469a0c19d8256ec55c27e",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v7-pacing.go",
+          "sha256": "09bfc626f0313425dbf91f5c22e190ee370cec8bdd02ea3d15d7c12f86176ade",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {},
+      "provenance_limit": "Direct go test overlay run; no separate standalone binary manifest was retained. Overlay/source/log hashes are retained.",
+      "reading_count": 0
+    },
+    {
+      "complete": true,
+      "id": "v9-adjacent-before",
+      "note": "Queued average must use pinned compression; repeated actual drain must re-anchor fresh summary.",
+      "original_log_sha256": "a85445eddd174d71e4a765de1f2c9e093d815c4c2c532070f64b30938305c802",
+      "outcome_count": 6,
+      "overlay_sha256": "118cedca42556c5a6b50fd6c22dea44746208bd35f46f4ead2f3e6241c8e1ae3",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v8-pacing.go",
+          "sha256": "3b333d4e2648ad91b3c7a3f8331ea5a14288453d5d48e1479a830a07fc21331d",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {},
+      "provenance_limit": "Direct go test overlay run; no separate standalone binary manifest was retained. Overlay/source/log hashes are retained.",
+      "reading_count": 0
+    },
+    {
+      "complete": true,
+      "id": "quiet-rounding-before",
+      "note": "19 ns and 29 ns configurations need ceiling division to bound early turns.",
+      "original_log_sha256": "69586bbf3f8d799b996c06f321a08be45ea2b29da63f282a187101160910a61f",
+      "outcome_count": 6,
+      "overlay_sha256": "85d7c1975ce12d00eba03a8efdccdd98ff8a6a7782a6b9a921f486195aa7c0c8",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v3.go",
+          "sha256": "403556c7aedc7481d8cd9c43d818f1e4a6f4c64327cd8fcd215c25ed4a8a7be3",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service_test.go",
+          "sha256": "ce97c18501ff0112db8a8eb920623eeef9566d3e386797889dd8adb854c997ef",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {},
+      "provenance_limit": "Direct go test overlay run; no separate standalone binary manifest was retained. Overlay/source/log hashes are retained.",
+      "reading_count": 0
+    },
+    {
+      "complete": true,
+      "id": "quiet-rounding-after",
+      "note": "ACK v4 fixes ceiling division; same code remains in v10.",
+      "original_log_sha256": "34ceaebc939cb023519111631ed8990736282da3e78d589aec157eb3ed9c5620",
+      "outcome_count": 3,
+      "overlay_sha256": "f0d31c4da149f31315d58b1ff51c47099f8a8adce25bc7a41804564e4101c061",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service_test.go",
+          "sha256": "ce97c18501ff0112db8a8eb920623eeef9566d3e386797889dd8adb854c997ef",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {},
+      "provenance_limit": "Direct go test overlay run; no separate standalone binary manifest was retained. Overlay/source/log hashes are retained.",
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "e5c543437e6f3bab03aa3d2d5e57f5009ec7be2145eade4411ecdfbcefc56d56",
+      "build_manifest_file": "partial-feedback-cycle-v9.manifest.json",
+      "build_manifest_sha256": "e881dd50d26faaa0391b2c2f4721bf28890426dda4335dbd675a034f013ae79b",
+      "complete": true,
+      "effective_input_sha256": "42b91b9411f6cec5eb860355d1a75b42a9b419fe70e065fb110c2e8bb4eacc54",
+      "id": "rejected-v9-focus",
+      "inputs_stable_during_build": true,
+      "note": "v9 unlanded and rejected after exact long-path gate failure.",
+      "original_log_sha256": "73cb15cb32560896a30933ed53b49d97d64969994988b92d47f5086cc82f4754",
+      "outcome_count": 387,
+      "overlay_sha256": "f51795277052e89101086bad7a6ed2bef7cc3409759cfde1d7a4b6d9a78f0ad8",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9-pacing.go",
+          "sha256": "89df096523ae0f8d74012f0a9ceed051e10624fa3e0439a7e247575f54993b0e",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {},
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "e5c543437e6f3bab03aa3d2d5e57f5009ec7be2145eade4411ecdfbcefc56d56",
+      "build_manifest_file": "partial-feedback-cycle-v9.manifest.json",
+      "build_manifest_sha256": "e881dd50d26faaa0391b2c2f4721bf28890426dda4335dbd675a034f013ae79b",
+      "complete": true,
+      "effective_input_sha256": "42b91b9411f6cec5eb860355d1a75b42a9b419fe70e065fb110c2e8bb4eacc54",
+      "id": "rejected-v9-recovery",
+      "inputs_stable_during_build": true,
+      "note": "v9 unlanded and rejected after exact long-path gate failure.",
+      "original_log_sha256": "6a478c39566c8642a1a493077394412fd770b979696d2fb16eb6e280b535d6a7",
+      "outcome_count": 6,
+      "overlay_sha256": "f51795277052e89101086bad7a6ed2bef7cc3409759cfde1d7a4b6d9a78f0ad8",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9-pacing.go",
+          "sha256": "89df096523ae0f8d74012f0a9ceed051e10624fa3e0439a7e247575f54993b0e",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {},
+      "reading_count": 12
+    },
+    {
+      "binary_sha256": "e5c543437e6f3bab03aa3d2d5e57f5009ec7be2145eade4411ecdfbcefc56d56",
+      "build_manifest_file": "partial-feedback-cycle-v9.manifest.json",
+      "build_manifest_sha256": "e881dd50d26faaa0391b2c2f4721bf28890426dda4335dbd675a034f013ae79b",
+      "complete": true,
+      "effective_input_sha256": "42b91b9411f6cec5eb860355d1a75b42a9b419fe70e065fb110c2e8bb4eacc54",
+      "id": "rejected-v9-service-controls",
+      "inputs_stable_during_build": true,
+      "note": "v9 unlanded and rejected after exact long-path gate failure.",
+      "original_log_sha256": "9f54976dc93762b586dea7ad05022549b6ed9a8ca426b868b54845ce608922b1",
+      "outcome_count": 7,
+      "overlay_sha256": "f51795277052e89101086bad7a6ed2bef7cc3409759cfde1d7a4b6d9a78f0ad8",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9-pacing.go",
+          "sha256": "89df096523ae0f8d74012f0a9ceed051e10624fa3e0439a7e247575f54993b0e",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {},
+      "reading_count": 38
+    },
+    {
+      "binary_sha256": "71e3cb7aea921e2dc7319081964a9855559904647561c4a786051eb94c5cd7a0",
+      "build_manifest_file": "partial-feedback-cycle-v9-race.manifest.json",
+      "build_manifest_sha256": "6f01e4cbe2dbc53495c7525a1b8da77bc01e17562afe02b5036bc2c6e2bf85e2",
+      "complete": true,
+      "effective_input_sha256": "42b91b9411f6cec5eb860355d1a75b42a9b419fe70e065fb110c2e8bb4eacc54",
+      "id": "rejected-v9-race",
+      "inputs_stable_during_build": true,
+      "note": "Passing focused race coverage did not override the failed performance gate.",
+      "original_log_sha256": "11bec64a378e0f4867dcfd34d3b7439eaf145c0d5d264652ceb7f9c7993b416d",
+      "outcome_count": 387,
+      "overlay_sha256": "f51795277052e89101086bad7a6ed2bef7cc3409759cfde1d7a4b6d9a78f0ad8",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9-pacing.go",
+          "sha256": "89df096523ae0f8d74012f0a9ceed051e10624fa3e0439a7e247575f54993b0e",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {},
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "e5c543437e6f3bab03aa3d2d5e57f5009ec7be2145eade4411ecdfbcefc56d56",
+      "build_manifest_file": "partial-feedback-cycle-v9.manifest.json",
+      "build_manifest_sha256": "e881dd50d26faaa0391b2c2f4721bf28890426dda4335dbd675a034f013ae79b",
+      "complete": true,
+      "effective_input_sha256": "42b91b9411f6cec5eb860355d1a75b42a9b419fe70e065fb110c2e8bb4eacc54",
+      "id": "rejected-v9-long",
+      "inputs_stable_during_build": true,
+      "note": "400 ms RTT, 50 ms compression, unchanged 2.33554432 s warmup/1 s measurement/90% gate: 3/3 fail.",
+      "original_log_sha256": "146378c59caa928977a79c4ea3bb5ffbf2d0a2f292220ae993ea6925423a77b7",
+      "outcome_count": 3,
+      "overlay_sha256": "f51795277052e89101086bad7a6ed2bef7cc3409759cfde1d7a4b6d9a78f0ad8",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9_test.go",
+          "sha256": "52a8b691df333b48bf60c43dd4b539688b10d4eabebe95f6d22a3b6b7da90256",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v9-pacing.go",
+          "sha256": "89df096523ae0f8d74012f0a9ceed051e10624fa3e0439a7e247575f54993b0e",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {
+        "count": 3,
+        "test_names": [
+          "TestWindowPathServiceLongCompressedFeedback"
+        ]
+      },
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "4e2d55e3c15c55bac546c926e1e9cad9e149037550fba4abe40b22410ac69ea6",
+      "build_manifest_file": "partial-feedback-cycle-v5-baseline.manifest.json",
+      "build_manifest_sha256": "ea357e3e07c67817bd3c3e4c80c6857b6af318404b0a7f232e90f1c266ac8a0b",
+      "complete": true,
+      "effective_input_sha256": "0cd3526dcbaa9e460090e61662d0e004edc93819e8e0c777c84965b29022796b",
+      "id": "ack-only-long",
+      "inputs_stable_during_build": true,
+      "note": "ACK v4 with unchanged original sampler: 1/3 fail, 2/3 pass.",
+      "original_log_sha256": "c946717b40f1b3d643b2a74aace1042c2bad624656ec9ba8a033bf6275757d5c",
+      "outcome_count": 3,
+      "overlay_sha256": "97890c66694f41b44e3d2dea9c5c32eb1b86cefdf41339c4b4d523d2eb30a9bc",
+      "overlay_sources": [
+        {
+          "candidate_file": "burst-tail-transfer-v4.go",
+          "sha256": "9cc4862dd6b5bad63bec0d406fec0501331b87174593fce60435cd6dc075ba2a",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce",
+          "target_file": "transfer_ack_compression.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "burst-tail-quiet-bound_test.go",
+          "sha256": "7a7d3841a22aa15545e4a46938f4b152ae84e68fdb51ff24c1b69c4f37768d76",
+          "target_file": "transfer_receive_ack_quiet_bound_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "partial-feedback-cycle-v5_test.go",
+          "sha256": "b21f99672fac71423d91aa9e982a2b3212f7ea34d3b56a406534dc5a67cb0319",
+          "target_file": "transfer_window_feedback_cycle_test.go"
+        },
+        {
+          "candidate_file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "partial-feedback-service-v2_test.go",
+          "sha256": "f1ee7a3beb8773c25e97651c4b36e4a7e71dd62762688df140fe9385d89d131d",
+          "target_file": "transfer_window_partial_feedback_service_test.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {
+        "count": 3,
+        "test_names": [
+          "TestWindowPathServiceLongCompressedFeedback"
+        ]
+      },
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "aa127c48f82d88e49984329fab5a05c55b4423d91d0de1a601652d154626b31a",
+      "build_manifest_file": "burst-tail-baseline-rtt.manifest.json",
+      "build_manifest_sha256": "ce651a3b338bbb872b3cb734ef7fa48ada89cc28f384b8e7316c4c8a052b3e41",
+      "complete": true,
+      "effective_input_sha256": "9b3233e9a89760d85c8917baf938a148735ee95bfe34ed4a4f080f715017d992",
+      "id": "unchanged-long",
+      "inputs_stable_during_build": true,
+      "note": "Original ACK policy and original sampler: 3/3 pass.",
+      "original_log_sha256": "55c5cf6e1a8730b09cd56c7cd77fef17a67ae3e48f56b6fe92fcca9769057b5c",
+      "outcome_count": 3,
+      "overlay_sha256": "f81804f4022321bb5ada470ac91532f5442802176aac8e2505707e31c4ae5d79",
+      "overlay_sources": [
+        {
+          "candidate_file": "combined-transfer.go",
+          "sha256": "af0c88c3dbae3b7d7ed80265fac13d94b6eea6af077b1ebb173671c6afd74246",
+          "target_file": "transfer.go"
+        },
+        {
+          "candidate_file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b",
+          "target_file": "transfer_receive_ack_burst_tail_test.go"
+        },
+        {
+          "candidate_file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11",
+          "target_file": "transfer_window_ack_tail_rtt_root_test.go"
+        },
+        {
+          "candidate_file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7",
+          "target_file": "transfer_window_pacing.go"
+        },
+        {
+          "candidate_file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac",
+          "target_file": "transfer_window_path_performance_test.go"
+        },
+        {
+          "candidate_file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a",
+          "target_file": "transfer_window_sdk_feedback_phase_test.go"
+        }
+      ],
+      "protocol": {
+        "count": 3,
+        "test_names": [
+          "TestWindowPathServiceLongCompressedFeedback"
+        ]
+      },
+      "reading_count": 6
+    }
+  ],
+  "schema": "throughput-fix-2/sdk-feedback-cycle-v10-evidence-provenance-v1",
+  "status": "unlanded; final focused, race, recovery and declared service/phase controls passed; awaiting root review and wider combined validation",
+  "trace_evidence": {
+    "log_sha256": "3ba563afc9a181891a30a86552fea74c4abd9c2a564baa7bdb45d6ff54d9622a",
+    "overlay_sha256": "b7705a9ea874d362b04f5881cfc1fda88fcad903352571e8bb3ef6d35d46d180",
+    "scope": "Logging only in existing measurement calls; diagnostic timeline, not replacement gate evidence."
+  }
+}

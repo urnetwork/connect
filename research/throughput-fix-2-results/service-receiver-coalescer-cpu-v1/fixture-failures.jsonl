@@ -1,0 +1,6 @@
+{"benchmark": "BenchmarkWindowPacingReceiverHeadCoalescing", "classification": "Fixture invariant used raw RTT where residence includes the advertised compression allowance.", "variant": "fixture-before"}
+{"benchmark": "BenchmarkWindowPacingReceiverHeadCoalescingLargeWindow", "classification": "Fixture invariant used raw RTT where residence includes the advertised compression allowance.", "variant": "fixture-before"}
+{"benchmark": "BenchmarkWindowPacingReceiverHeadBatchCoalescing", "classification": "Fixture invariant used raw RTT where residence includes the advertised compression allowance.", "variant": "fixture-before"}
+{"benchmark": "BenchmarkWindowPacingReceiverHeadCoalescing", "classification": "Fixture invariant used raw RTT where residence includes the advertised compression allowance.", "variant": "fixture-warm-after"}
+{"benchmark": "BenchmarkWindowPacingReceiverHeadCoalescingLargeWindow", "classification": "Fixture invariant used raw RTT where residence includes the advertised compression allowance.", "variant": "fixture-warm-after"}
+{"benchmark": "BenchmarkWindowPacingReceiverHeadBatchCoalescing", "classification": "Fixture invariant used raw RTT where residence includes the advertised compression allowance.", "variant": "fixture-warm-after"}

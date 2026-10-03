@@ -49,6 +49,7 @@ real internet through an **IP/TUN** layer.
   real internet  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
        │  egress sockets (provider side)
   ┌────┴─────────────────────────────────────────────┐
+  │ Subprotocols          subprotocol.go             │  user protocols as frames (SUBPROTOCOL.md)
   │ IP / TUN layer        ip.go, tun.go               │  TCP/UDP <-> packets <-> sequences
   ├───────────────────────────────────────────────────┤
   │ Contracts             transfer_contract_manager.go│  bandwidth authorization & accounting

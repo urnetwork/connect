@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "7cf456fafdda65810bb0b04c8b99a23be9c77606b0e06729063287a3ae1f0b6c",
+  "binary_sha256": "8c2272786b0a1ec1f5a9d3432d691f1a0c1d777aaa01f20d88f147bc9ee0d70a",
+  "effective_inputs_sha256": "395c79c599fb592d3784bdd730ca85dc75737d9d0191b9e94b40d34b5905f936",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiverBatchedSplitPacingEscapesSlowHold$",
+    "-test.count=1",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as build; absolute relationship pinned by original status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:57:22.298332+00:00",
+  "loadavg_start": [
+    33.21923828125,
+    16.84228515625,
+    15.24609375
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 1.4786275001242757,
+  "loadavg_end": [
+    33.21923828125,
+    16.84228515625,
+    15.24609375
+  ],
+  "ended_utc": "2026-09-16T20:57:23.777527+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "c1eac36bb6eff0d9213939244ca2d318cb26250ff4970b28e729b4b8491d23ad",
+  "pass": 0,
+  "fail": 1,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "0P1F: bounded copied-source diagnostics show owned summary exists but same-endpoint rejection still vetoes it. No bypass was implemented because interval ownership itself is not sound across relayed reorder.",
+  "rows": 9
+}

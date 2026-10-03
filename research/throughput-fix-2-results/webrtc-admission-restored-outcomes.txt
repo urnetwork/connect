@@ -1,0 +1,11 @@
+Race selection outcome summary: 120 top-level executions passed, with no failures or skips.
+
+20 PASS: TestWebRtcSharedBudgetPendingRetirementPreventsCrossManagerDrain
+20 PASS: TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget
+20 PASS: TestWebRtcAdmissionNotificationWakesOnlyCapacityFit
+20 PASS: TestWebRtcAdmissionNotificationUsesDedicatedThreshold
+20 PASS: TestWebRtcNewestNetworkPeerReclaimsLeaseProtectedDedicatedBudget
+20 PASS: TestWebRtcFailedPriorityStreamRetainsReleasedBudgetReservation
+
+PASS
+ok  	github.com/urnetwork/connect	2.467s

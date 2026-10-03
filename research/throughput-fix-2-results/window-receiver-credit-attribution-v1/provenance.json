@@ -1,0 +1,24 @@
+{
+  "comparison": "Both variants carry the identical exact-ACK credit interface. Before sampler.observeAckWithLock is an inert seam forwarding bytes at their original raw arrival; after applies the separately frozen corrected-endpoint sampler. Only transfer_window_pacing.go differs between effective sources. Test files and all clock stimuli are identical.",
+  "controls": "Confirmed initial H1 exact head and entire newly credited prefix; pending, failed, retried, H3, wrong-tag and absent metadata fallback; sibling timing cannot retime legacy credit; delayed publication retains its own wait; prior SACK and duplicate heads preserve prefix byte ownership; equal/reversed corrected endpoints grant no new rate; cold slow equal waits and legacy short-train bound remain valid.",
+  "credit_patch_sha256": "e193550b17b571ed085018f9ed0576efbc8743a2aee1e157a4998af48501a946",
+  "event_plumbing": false,
+  "fixed_roots": [
+    "TestWindowPacingReceiverCreditDelayedAccountingKeepsOwnWait",
+    "TestWindowPacingReceiverCreditNonpositiveIntervalCannotGrantCapacity"
+  ],
+  "performance_gates_changed": false,
+  "production_adopted": false,
+  "race": true,
+  "repetitions": 3,
+  "sampler_patch_sha256": "51725d1ddd136620c915172a0a65046a0493ed4369b5bc65217f28c44dca9ab4",
+  "source_base": {
+    "accepted_sampler_before_plumbing_sha256": "345b06a0f1fa96dcf6135f1451c371e162ec295e7b8cabe090e0f247d1fe92b5",
+    "receiver_round_trip_sha256": "416d47e5e55a4eddc720c1c7a34cc615ae6b21db52a7db3fa6f1ef500ed02433",
+    "snapshot": "correctness-retained-sampler-v4"
+  },
+  "test_execution_owner": "test_monitor_medium",
+  "unfinished_cause": "The warm candidate preserves the raw advertised10ms compression interval requirement; the paired3.605920ms opening remains unqualified. That separate cold-eligibility change is not included.",
+  "unfinished_root": "TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain",
+  "warmup_changed": false
+}

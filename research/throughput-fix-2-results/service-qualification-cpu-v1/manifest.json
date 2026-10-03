@@ -1,0 +1,9 @@
+{
+  "archive": "service-qualification-cpu-v1",
+  "payload_sha256": {
+    "provenance.json": "0c0e4f7d588e1d8f3a3e4fbc95c1f7b4eb184db2e346d68e1a6ee61facc8ecce",
+    "readings.jsonl": "80114fcb31595b8f45711a828cb81f41d2a2a92db2987fa84337f6ddb8dfabbe",
+    "source-pins.json": "3b893687a22b80220499b836264a2b4525673736536002e85c66d5246c7d7389",
+    "status.json": "6089f58ae8cb5a2419c42632c477cbc9acec74e4693798b487fc50367e564362"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "examples": "Initial-feedback duplex direction1 delivers13.53728 versus754.64704Mb/s. RTT growth delivers5.61152 versus95.771307Mb/s, with all3 intervals failing. Shared finite relay fails the100Mb/s cell at72.68352 versus95.616Mb/s, with zero drops/retries; the1Mb/s and1Gb/s controls pass.",
+  "interpretation": "The deterministic slowdown root is fixed and507scoped race checks pass, but this candidate is not accepted. These schedule-sensitive readings alone cannot isolate the added bound as the cause; new owned-sibling deterministic roots pursue the missing attribution.",
+  "no_quiescence_wait": true,
+  "outcome": "25 passes and5 failures: SDK initial-feedback duplex recovery, SDK profiles, SDK bidirectional, RTT growth, and shared finite relay.",
+  "race": false,
+  "role": "Complete normal model of the bounded invalid-order slowdown correction on the restored receiver-clock source.",
+  "source_scope": "Full current root/benchmark inventory plus accepted cumulative fallback, receiver exact-credit/consumer/ordering changes and bounded slowdown correction. No NetworkQualityChanged plumbing.",
+  "working_directory": "Exact copied module used to compile; binary and every copied source verified."
+}

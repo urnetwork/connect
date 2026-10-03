@@ -1,0 +1,11 @@
+{
+  "archive": "receiver-test-contract-audit-v1",
+  "payload_sha256": {
+    "original-sibling-tests.go.txt": "53a1da554794aa85a616fc4f06a1d3bb57be05131dab4047ad6a09af85712edf",
+    "outcomes.jsonl": "ef0b5d9c735cc76647dab12712bcc43c1ae132e0275a186097e039029479aec1",
+    "provenance.json": "86eb5a60f44a1a8c78bb9fa15bf5e6e5fe50c1dc585166cb6140e6aa2dfb0a06",
+    "sampler-audit.md": "6b6e57a419e782f2cf9fa5a3d2b76573fb01bd3f78f61c6fdb60b1ac9e33a3cd",
+    "source-pins.json": "bc74b3940035ae97ecd09e6b0913cc4e8ec15f2d0acfa4e5107dc22f669c751e",
+    "status.json": "fa28114fa6affd4c05847168d9ddac4be0e8b918d3185fc1252ae162ddbb193b"
+  }
+}

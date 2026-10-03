@@ -1,0 +1,27 @@
+{
+  "candidate_status": "isolated experimental candidate; no live adoption",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "failure_split": "Before six SendBuffer/ForwardBuffer caller-isolation roots fail each3 (18); three optional ACK retention/coverage/retry roots fail each3 (9). Other controls pass before and after.",
+  "fixture_correction": "Only v2 test setup changed: provider child context before workers, and send-worker hook set in ClientSettings before NewClient. Production bytes match v2 on each side.",
+  "fixture_patch_sha256": "fa5e56726955e01f5549c5a5bb043daa15e645f46baef8aaba5c39cd8d4bee53",
+  "hard_caller_patch_sha256": "00b16d01ea1634c230ccfe928d3e96f82978047b132d28c90f9457bf357797e9",
+  "hard_contract": "Cancellation of an unadmitted caller cannot retire a healthy shared send/forward sequence or reclaim accepted sibling bytes. A genuinely closed sequence still recreates for a live caller.",
+  "network_quality_events": false,
+  "optional_ack_patch_sha256": "d6631f9e16664d95ee091706d4ab75fa2453bbffbc975e6569bb7156050abe9c",
+  "optional_policy": "Existing dedicated pure-ACK worker may retain one control until admission or exact flow/provider/source cancellation. This avoids artificial control loss; loss of a pure ACK remains legal TCP recovery behavior. Exact old+latest replay is not required; latest-only coalescing is valid.",
+  "outcomes": "Before24P27F; after51P0F, zero race warnings.",
+  "performance_acceptance": false,
+  "physical_rig_limit": "Existing physical A/B/A rejects all provider ReturnSend refusal, including recoverable pure ACKs. That gate can exclude a legal well-performing TCP recovery path; original fixture remains unchanged and results must separate this preference from delivered throughput and byte correctness.",
+  "policy_limits": "Shared/public/orphan callback refusal stays zero-wait. No queue, byte limit or worker count is increased. No-pressure admission creates no combined context; a context join is created only after actual initial refusal. Accepted control keeps ordinary Transfer ACK timeout.",
+  "production_patch_sha256": "c51ad918363f4a1234b2a85a9f39b7b82817d3d0f3af3a5da1aec5ea7c0bc5c5",
+  "pure_ack_zero_refusal_is_not_protocol_correctness": true,
+  "race": true,
+  "repetitions": 3,
+  "retention": "Original sources, binaries, logs, commands and local paths remain immutable outside Git, represented by hashes.",
+  "source_base": {
+    "artifact": "throughput-fix-2-receiver-service-validation-v1",
+    "candidate_source_sha256": "e6aaeb0801e4dc566dd66a9a4843c6a78d713722321a48e85312e4d7115d7790",
+    "inventory_sha256": "cb79e929de859509e52b7b821d40d5d2df8420858308ea94da39057f184e736d"
+  },
+  "test_execution_owner": "test_monitor_medium (Terra medium)"
+}

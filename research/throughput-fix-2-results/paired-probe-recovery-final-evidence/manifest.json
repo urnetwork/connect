@@ -1,0 +1,12 @@
+{
+  "archive_kind": "paired_probe_recovery_final_evidence",
+  "file_count": 5,
+  "file_sha256": {
+    "numerical-readings.jsonl": "e36b35a5ad0880dd63bfacbb40cdecf414dfece79b556d42efcb1a3f12906d99",
+    "outcomes.jsonl": "837ccf01a1dca563b512af262c85234a6eaf00ca2a15d6cb1c234b2f0f1002d3",
+    "provenance.json": "dbb813cc9e604da472ba2b4710a0950e4f6aa9a64ba91a5e24d06ddf12be2567",
+    "source-pins.json": "78636fe18feebf0a0a27f7a738b8dda3149da1957f904a2544ed096da46e897c",
+    "status.json": "1a39a162436bed2f835db7976e326145075192be5abc1da4c05ab29a8eeaf844"
+  },
+  "schema_version": 1
+}

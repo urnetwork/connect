@@ -11,8 +11,10 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"math"
 	mathrandv2 "math/rand/v2"
 	"testing"
+	"unsafe"
 
 	"google.golang.org/protobuf/proto"
 
@@ -33,6 +35,8 @@ func buildEquivalentTransferFrame(m *sendPackFrame) *protocol.TransferFrame {
 		Tag:               &protocol.Tag{SendTime: m.tagSendTime},
 		ForceStream:       m.forceStream,
 		CompanionContract: m.companionContract,
+		LogicalLane:       m.logicalLane,
+		ContractAhead:     m.contractAhead,
 	}
 	if m.contractId != nil {
 		pack.ContractId = m.contractId.Bytes()
@@ -228,6 +232,9 @@ func TestFrameCodecRandomized(t *testing.T) {
 		m.nack = mathrandv2.IntN(2) == 0
 		m.forceStream = mathrandv2.IntN(2) == 0
 		m.companionContract = mathrandv2.IntN(2) == 0
+		if mathrandv2.IntN(3) == 0 {
+			m.logicalLane = uint32(1 + mathrandv2.IntN(maxLogicalDataLaneCount))
+		}
 		if mathrandv2.IntN(4) != 0 {
 			frameCount := mathrandv2.IntN(3)
 			for i := 0; i < frameCount; i++ {
@@ -253,6 +260,9 @@ func TestFrameCodecRandomized(t *testing.T) {
 			m.sessionRole = protocol.SequenceRole_SequenceRoleClient
 		}
 		m.companion = mathrandv2.IntN(2) == 0
+		// THROUGHPUTFIX §39.1: the announcement flag, randomized with the
+		// other Pack discriminators
+		m.contractAhead = mathrandv2.IntN(2) == 0
 
 		assertCodecMatches(t, m)
 	}
@@ -263,11 +273,46 @@ func buildEquivalentAckFrame(m *sendAckFrame) *protocol.TransferFrame {
 	if m.tagSet {
 		tag = &protocol.Tag{SendTime: m.tagSendTime}
 	}
+	var missingContractId []byte
+	if m.missingContractId != nil {
+		missingContractId = m.missingContractId.Bytes()
+	}
+	// `receive_window_byte_count` is optional, so the oracle carries presence
+	// separately from value. Reading the value alone would make an absent
+	// capacity and an explicit zero the same message, which is the collapse the
+	// keyword exists to prevent: absent is a peer that does not advertise and
+	// takes the sender's own constant, zero is a receiver stating it has no
+	// room and is clamped to the working floor. An oracle that merged them
+	// could not see a codec that merged them
+	// (`TestAnAbsentCapacityAndAZeroCapacityTakeDifferentBranches`).
+	var receiveWindowByteCount *uint64
+	if m.receiveWindowSet {
+		value := m.receiveWindowByteCount
+		receiveWindowByteCount = &value
+	}
+	var compression *uint32
+	if m.ackCompressTimeoutSet {
+		value := m.ackCompressTimeoutMicros
+		compression = &value
+	}
+	var receiverDelay *uint32
+	if m.receiverAckDelaySet {
+		value := m.receiverAckDelayMicros
+		receiverDelay = &value
+	}
 	ack := &protocol.Ack{
-		MessageId:  m.messageId.Bytes(),
-		SequenceId: m.sequenceId.Bytes(),
-		Selective:  m.selective,
-		Tag:        tag,
+		AckCompressTimeoutMicros: compression,
+		ReceiverAckDelayMicros:   receiverDelay,
+		MessageId:                m.messageId.Bytes(),
+		SequenceId:               m.sequenceId.Bytes(),
+		Selective:                m.selective,
+		Tag:                      tag,
+		MissingContractId:        missingContractId,
+		CompactContractRecovery:  m.compactContractRecovery,
+		LogicalLaneVersion:       m.logicalLaneVersion,
+		ContractAhead:            m.contractAhead,
+		ReceiveWindowByteCount:   receiveWindowByteCount,
+		EvictedSequenceNumbers:   m.evictedSequenceNumbers,
 	}
 	tf := &protocol.TransferFrame{
 		TransferPath: m.path.ToProtobuf(),
@@ -299,7 +344,7 @@ func assertAckCodecMatches(t *testing.T, m *sendAckFrame) {
 }
 
 func TestAckCodecEdgeCases(t *testing.T) {
-	idA, idB, idC := NewId(), NewId(), NewId()
+	idA, idB, idC, idD := NewId(), NewId(), NewId(), NewId()
 	cases := map[string]*sendAckFrame{
 		"minimal no tag": {
 			path:       TransferPath{DestinationId: idA, SourceId: idB},
@@ -326,9 +371,153 @@ func TestAckCodecEdgeCases(t *testing.T) {
 			sequenceId: idA,
 			selective:  true,
 		},
+		"missing contract recovery": {
+			path:                    TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:               idC,
+			sequenceId:              idA,
+			missingContractId:       &idD,
+			compactContractRecovery: true,
+		},
+		"logical lane capability": {
+			path:               TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:          idC,
+			sequenceId:         idA,
+			logicalLaneVersion: transferLogicalLaneVersion,
+		},
+		"contract ahead capability": {
+			path:               TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:          idC,
+			sequenceId:         idA,
+			logicalLaneVersion: transferLogicalLaneVersion,
+			contractAhead:      true,
+		},
+		// field 8, the advertised capacity. It is the OUTERMOST clamp on every
+		// send window, so a marshal that drops or corrupts it is silent in the
+		// worst way: the field simply reads absent, the sender takes the legacy
+		// branch, and a peer that offered thirty mebibytes is sent two. That
+		// looks exactly like correct legacy behaviour.
+		"advertised capacity zero": {
+			path:                   TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:              idC,
+			sequenceId:             idA,
+			receiveWindowSet:       true,
+			receiveWindowByteCount: 0,
+		},
+		"advertised capacity one byte varint": {
+			path:                   TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:              idC,
+			sequenceId:             idA,
+			receiveWindowSet:       true,
+			receiveWindowByteCount: 127,
+		},
+		"advertised capacity two byte varint": {
+			path:                   TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:              idC,
+			sequenceId:             idA,
+			receiveWindowSet:       true,
+			receiveWindowByteCount: 128,
+		},
+		"advertised capacity shipping hold": {
+			path:                   TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:              idC,
+			sequenceId:             idA,
+			receiveWindowSet:       true,
+			receiveWindowByteCount: 2 * 1024 * 1024,
+		},
+		"advertised capacity max": {
+			path:                   TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:              idC,
+			sequenceId:             idA,
+			receiveWindowSet:       true,
+			receiveWindowByteCount: math.MaxUint64,
+		},
+		// field 9, the eviction notice. A marshal bug here means an eviction is
+		// never confessed, and the sender holds a lease on withdrawn bytes
+		// until its selective acknowledgement timeout - a minute - which again
+		// is indistinguishable from a peer that simply does not send the field.
+		"eviction notice empty": {
+			path:                   TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:              idC,
+			sequenceId:             idA,
+			evictedSequenceNumbers: []uint64{},
+		},
+		"eviction notice one": {
+			path:                   TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:              idC,
+			sequenceId:             idA,
+			evictedSequenceNumbers: []uint64{1},
+		},
+		"eviction notice zero sequence number": {
+			path:                   TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:              idC,
+			sequenceId:             idA,
+			evictedSequenceNumbers: []uint64{0},
+		},
+		// Every varint length boundary in one packed body, which is where a
+		// hand-rolled marshal goes wrong: the body length is summed in one pass
+		// and written in another, so a size function and an append function
+		// that disagree about any one value produce a body whose declared
+		// length does not match its contents.
+		"eviction notice varint boundaries": {
+			path:       TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:  idC,
+			sequenceId: idA,
+			evictedSequenceNumbers: []uint64{
+				0,
+				127, 128,
+				16383, 16384,
+				2097151, 2097152,
+				268435455, 268435456,
+				34359738367, 34359738368,
+				4398046511103, 4398046511104,
+				562949953421311, 562949953421312,
+				72057594037927935, 72057594037927936,
+				math.MaxUint64,
+			},
+		},
+		// the largest generation one acknowledgement carries, which is what the
+		// field's own comment means by splitting a large generation across
+		// acknowledgements: this is the size of one of those pieces
+		"eviction notice full generation": {
+			path:                   TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:              idC,
+			sequenceId:             idA,
+			evictedSequenceNumbers: ackCodecTestEvictionGeneration(evictionNoticeMaxCount),
+		},
+		// both new fields beside every older one, so field ordering across the
+		// whole message is exercised rather than each field in isolation
+		"every field together": {
+			path:                    TransferPath{DestinationId: idA, SourceId: idB, StreamId: idC},
+			messageId:               idC,
+			sequenceId:              idA,
+			selective:               true,
+			tagSendTime:             1_700_000_000_000,
+			tagSet:                  true,
+			missingContractId:       &idD,
+			compactContractRecovery: true,
+			logicalLaneVersion:      transferLogicalLaneVersion,
+			receiveWindowSet:        true,
+			receiveWindowByteCount:  30 * 1024 * 1024,
+			evictedSequenceNumbers:  []uint64{7, 8, 9, 1 << 20},
+			contractAhead:           true,
+		},
 	}
 	for _, m := range cases {
 		assertAckCodecMatches(t, m)
+		encoded := marshalSendAckTransferFrame(m)
+		var frame protocol.TransferFrame
+		if !unmarshalTransferFrame(encoded, &frame, true) {
+			MessagePoolReturn(encoded)
+			t.Fatal("hand decoder rejected Ack frame")
+		}
+		MessagePoolReturn(encoded)
+		if frame.Ack.GetLogicalLaneVersion() != m.logicalLaneVersion {
+			t.Fatalf(
+				"hand decoder logical lane version = %d, want %d",
+				frame.Ack.GetLogicalLaneVersion(),
+				m.logicalLaneVersion,
+			)
+		}
 	}
 }
 
@@ -352,6 +541,17 @@ func TestAckCodecRandomized(t *testing.T) {
 			m.path.StreamId = randId()
 		}
 		m.selective = mathrandv2.IntN(2) == 0
+		if mathrandv2.IntN(4) == 0 {
+			missingContractId := randId()
+			m.missingContractId = &missingContractId
+		}
+		m.compactContractRecovery = mathrandv2.IntN(2) == 0
+		if mathrandv2.IntN(3) == 0 {
+			m.logicalLaneVersion = transferLogicalLaneVersion
+		}
+		// THROUGHPUTFIX §39.1's capability bit, randomized with the others so
+		// the hand-rolled codec is held to the library's bytes for it too
+		m.contractAhead = mathrandv2.IntN(2) == 0
 		switch mathrandv2.IntN(3) {
 		case 0:
 			m.tagSendTime = mathrandv2.Uint64()
@@ -359,7 +559,213 @@ func TestAckCodecRandomized(t *testing.T) {
 		case 1:
 			m.tagSet = true
 		}
+		// field 8, three ways, because presence and value are independent: not
+		// advertised, advertised as zero, advertised at a random magnitude
+		switch mathrandv2.IntN(3) {
+		case 0:
+			m.receiveWindowSet = true
+		case 1:
+			m.receiveWindowSet = true
+			m.receiveWindowByteCount = mathrandv2.Uint64()
+		}
+		// field 9, with lengths that cross the packed body's own varint
+		// boundary as well as each element's
+		switch mathrandv2.IntN(4) {
+		case 0:
+			m.evictedSequenceNumbers = []uint64{}
+		case 1:
+			count := 1 + mathrandv2.IntN(8)
+			m.evictedSequenceNumbers = make([]uint64, 0, count)
+			for range count {
+				m.evictedSequenceNumbers = append(
+					m.evictedSequenceNumbers, mathrandv2.Uint64())
+			}
+		case 2:
+			// a body long enough that its own length prefix is multi-byte
+			count := 16 + mathrandv2.IntN(64)
+			m.evictedSequenceNumbers = make([]uint64, 0, count)
+			for range count {
+				m.evictedSequenceNumbers = append(
+					m.evictedSequenceNumbers,
+					uint64(mathrandv2.UintN(1<<uint(1+mathrandv2.IntN(63)))),
+				)
+			}
+		}
+		m.ackCompressTimeoutSet = mathrandv2.IntN(2) == 0
+		m.ackCompressTimeoutMicros = mathrandv2.Uint32()
+		m.receiverAckDelaySet = mathrandv2.IntN(2) == 0
+		m.receiverAckDelayMicros = mathrandv2.Uint32()
 		assertAckCodecMatches(t, m)
+	}
+}
+
+// an eviction generation of consecutive sequence numbers spanning every varint
+// length, which is what a real generation looks like: a run of adjacent numbers
+// from wherever the hold happened to be
+func ackCodecTestEvictionGeneration(count int) []uint64 {
+	generation := make([]uint64, 0, count)
+	for i := range count {
+		generation = append(generation, uint64(i)*0x0101_0101_0101)
+	}
+	return generation
+}
+
+// The distinction the optional keyword exists for, asserted at the wire rather
+// than at the decode.
+//
+// `TestAnAbsentCapacityAndAZeroCapacityTakeDifferentBranches` pins that a nil
+// pointer and a zero take different branches in the window consumer. That is
+// only true if the two survive the wire as different messages, and until the
+// oracle carried field 8 nothing checked that the hand-rolled marshal keeps
+// them apart. A codec that emitted nothing for a zero capacity would turn every
+// receiver stating "no room" into a peer that does not advertise, which is the
+// legacy branch and a two mebibyte window - silently, and looking exactly like
+// correct legacy behaviour.
+func TestTheAckCodecKeepsAnAbsentAndAZeroCapacityApart(t *testing.T) {
+	idA, idB, idC := NewId(), NewId(), NewId()
+	newFrame := func(set bool) *sendAckFrame {
+		return &sendAckFrame{
+			path:             TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:        idC,
+			sequenceId:       idA,
+			receiveWindowSet: set,
+		}
+	}
+
+	absentBytes := marshalSendAckTransferFrame(newFrame(false))
+	defer MessagePoolReturn(absentBytes)
+	zeroBytes := marshalSendAckTransferFrame(newFrame(true))
+	defer MessagePoolReturn(zeroBytes)
+
+	if bytes.Equal(absentBytes, zeroBytes) {
+		t.Fatalf(
+			"an absent capacity and an explicit zero marshal to the same %d bytes. The field is optional precisely so a receiver with no room can be told apart from a peer that does not advertise; merged, every full receiver is read as a legacy peer and given the sender's own constant",
+			len(absentBytes),
+		)
+	}
+
+	for _, entry := range []struct {
+		name  string
+		bytes []byte
+		want  bool
+	}{
+		{"absent", absentBytes, false},
+		{"explicit zero", zeroBytes, true},
+	} {
+		var frame protocol.TransferFrame
+		if !unmarshalTransferFrame(entry.bytes, &frame, true) {
+			t.Fatalf("%s: could not decode the acknowledgement frame", entry.name)
+		}
+		ack := frame.GetAck()
+		if ack == nil {
+			t.Fatalf("%s: the frame carried no acknowledgement", entry.name)
+		}
+		if (ack.ReceiveWindowByteCount != nil) != entry.want {
+			t.Errorf(
+				"%s: the decoded capacity pointer is present=%t, want %t",
+				entry.name, ack.ReceiveWindowByteCount != nil, entry.want,
+			)
+			continue
+		}
+		if entry.want && *ack.ReceiveWindowByteCount != 0 {
+			t.Errorf("%s: the decoded capacity is %d rather than zero", entry.name, *ack.ReceiveWindowByteCount)
+		}
+		// and through the consumer's own decode, which is what the window
+		// consumer reads
+		decoded, err := receiveAckMessageFromProtocol(ack)
+		if err != nil {
+			t.Fatalf("%s: %s", entry.name, err)
+		}
+		if decoded.receiveWindowSet != entry.want {
+			t.Errorf(
+				"%s: receiveWindowSet reads %t after the round trip, want %t",
+				entry.name, decoded.receiveWindowSet, entry.want,
+			)
+		}
+	}
+}
+
+// The eviction generation survives the round trip with its values and its order
+// intact, at the largest size one acknowledgement carries.
+//
+// The packed encoding is where a hand-rolled marshal is most likely to be
+// wrong, because the body length is summed in one pass and written in another:
+// a size function and an append function that disagree about any single value
+// produce a body whose declared length does not match its contents, and the
+// generation then decodes short, long, or not at all. The byte-for-byte
+// comparison above catches that against the library; this asserts what the
+// receiver actually needs, which is that every sequence number it named comes
+// back and comes back in order, because the sender resends exactly what the
+// notice names.
+func TestTheAckCodecRoundTripsAWholeEvictionGeneration(t *testing.T) {
+	idA, idB, idC := NewId(), NewId(), NewId()
+	generation := ackCodecTestEvictionGeneration(evictionNoticeMaxCount)
+
+	frameBytes := marshalSendAckTransferFrame(&sendAckFrame{
+		path:                   TransferPath{DestinationId: idA, SourceId: idB},
+		messageId:              idC,
+		sequenceId:             idA,
+		selective:              true,
+		evictedSequenceNumbers: generation,
+	})
+	defer MessagePoolReturn(frameBytes)
+
+	var frame protocol.TransferFrame
+	if !unmarshalTransferFrame(frameBytes, &frame, true) {
+		t.Fatal("could not decode an acknowledgement carrying a full eviction generation")
+	}
+	ack := frame.GetAck()
+	if ack == nil {
+		t.Fatal("the frame carried no acknowledgement")
+	}
+	if len(ack.EvictedSequenceNumbers) != len(generation) {
+		t.Fatalf(
+			"%d of %d evicted sequence numbers survived the round trip. A generation that decodes short is an eviction never confessed, and the sender holds a lease on those bytes until its selective acknowledgement timeout",
+			len(ack.EvictedSequenceNumbers), len(generation),
+		)
+	}
+	for i, sequenceNumber := range generation {
+		if ack.EvictedSequenceNumbers[i] != sequenceNumber {
+			t.Fatalf(
+				"evicted sequence number %d decoded as %d rather than %d; the sender resends exactly what the notice names, so a corrupted entry is a resend of something that was never withdrawn and a lease kept on something that was",
+				i, ack.EvictedSequenceNumbers[i], sequenceNumber,
+			)
+		}
+	}
+
+	decoded, err := receiveAckMessageFromProtocol(ack)
+	if err != nil {
+		t.Fatalf("decoding the acknowledgement: %s", err)
+	}
+	if decoded.evictions == nil {
+		t.Fatal("the consumer's decode produced no eviction notice from an acknowledgement carrying a full generation")
+	}
+	if len(decoded.evictions.sequenceNumbers) != len(generation) {
+		t.Errorf(
+			"the consumer's decode carried %d of %d evicted sequence numbers",
+			len(decoded.evictions.sequenceNumbers), len(generation),
+		)
+	}
+
+	// an acknowledgement carrying no generation must produce no notice at all,
+	// which is what keeps an ordinary acknowledgement from looking like an
+	// empty confession
+	emptyBytes := marshalSendAckTransferFrame(&sendAckFrame{
+		path:       TransferPath{DestinationId: idA, SourceId: idB},
+		messageId:  idC,
+		sequenceId: idA,
+	})
+	defer MessagePoolReturn(emptyBytes)
+	var emptyFrame protocol.TransferFrame
+	if !unmarshalTransferFrame(emptyBytes, &emptyFrame, true) {
+		t.Fatal("could not decode an acknowledgement with no eviction generation")
+	}
+	emptyDecoded, err := receiveAckMessageFromProtocol(emptyFrame.GetAck())
+	if err != nil {
+		t.Fatalf("decoding the empty acknowledgement: %s", err)
+	}
+	if emptyDecoded.evictions != nil {
+		t.Error("an acknowledgement carrying no evicted sequence numbers produced an eviction notice")
 	}
 }
 
@@ -504,6 +910,151 @@ func TestTwoPacketEncryptedPackFitsMinimumMessageLimit(t *testing.T) {
 	}
 }
 
+// H1 may use more small frames than the compatibility coalescer. Assert the
+// maximum frame-count/byte combination, a bounded ordinary opening contract,
+// and outer sequence encryption still fit the ordinary 4-KiB data class inside
+// the minimum H1 envelope. Opening/rotating contracts retain 3 KiB; an
+// established contract can safely use three full 1,100-byte packets only while
+// no contract frame rides on that Pack.
+func TestH1MaximumLogicalGroupEncryptedPackFitsMinimumMessageLimit(t *testing.T) {
+	const ordinaryH1DataEnvelopeByteCount = 4 * 1024
+
+	c := newFrameCodecTestSequenceCipher(t)
+	path := TransferPath{DestinationId: NewId(), SourceId: NewId(), StreamId: NewId()}
+	frames := make([]*protocol.Frame, sendPackH1GroupMaxFrames)
+	baseFrameByteCount := int(sendPackH1GroupMaxMessageByteCount) / len(frames)
+	remainingByteCount := int(sendPackH1GroupMaxMessageByteCount)
+	for frameIndex := range frames {
+		frameByteCount := baseFrameByteCount
+		if frameIndex == len(frames)-1 {
+			frameByteCount = remainingByteCount
+		}
+		remainingByteCount -= frameByteCount
+		frames[frameIndex] = &protocol.Frame{
+			MessageType:  protocol.MessageType_IpIpPacketFromProvider,
+			MessageBytes: make([]byte, frameByteCount),
+			Raw:          true,
+		}
+	}
+	m := &sendPackFrame{
+		path:           path,
+		messageId:      NewId(),
+		sequenceId:     NewId(),
+		sequenceNumber: ^uint64(0),
+		head:           true,
+		frames:         frames,
+		contractFrame: &protocol.Frame{
+			MessageType:  protocol.MessageType_TransferContract,
+			MessageBytes: make([]byte, 512),
+		},
+		tagSendTime:    ^uint64(0),
+		sessionRole:    protocol.SequenceRole_SequenceRoleServer,
+		sessionRoleSet: true,
+		companion:      true,
+	}
+	inner := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(inner)
+	wrapped, err := c.SealOuterFrame(
+		path,
+		inner,
+		protocol.SequenceRole_SequenceRoleServer,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("SealOuterFrame: %s", err)
+	}
+	defer MessagePoolReturn(wrapped)
+	limit := int(DefaultClientSettings().MinimumMessageLenLimit())
+	if limit < len(wrapped) {
+		t.Fatalf(
+			"maximum H1 logical-group encrypted Pack is %d bytes, exceeds minimum transport limit %d",
+			len(wrapped),
+			limit,
+		)
+	}
+
+	establishedFrames := make([]*protocol.Frame, 3)
+	for frameIndex := range establishedFrames {
+		establishedFrames[frameIndex] = &protocol.Frame{
+			MessageType:  protocol.MessageType_IpIpPacketFromProvider,
+			MessageBytes: make([]byte, DefaultMtu),
+			Raw:          true,
+		}
+	}
+	contractId := NewId()
+	m.frames = establishedFrames
+	m.contractId = &contractId
+	m.contractFrame = nil
+	establishedInner := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(establishedInner)
+	establishedWrapped, err := c.SealOuterFrame(
+		path,
+		establishedInner,
+		protocol.SequenceRole_SequenceRoleServer,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("Seal established H1 frame: %s", err)
+	}
+	defer MessagePoolReturn(establishedWrapped)
+	if limit < len(establishedWrapped) {
+		t.Fatalf(
+			"established three-MTU H1 Pack is %d bytes, exceeds minimum transport limit %d",
+			len(establishedWrapped),
+			limit,
+		)
+	}
+
+	m.contractFrame = &protocol.Frame{
+		MessageType:  protocol.MessageType_TransferContract,
+		MessageBytes: make([]byte, 512),
+	}
+	rotatingInner := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(rotatingInner)
+	rotatingWrapped, err := c.SealOuterFrame(
+		path,
+		rotatingInner,
+		protocol.SequenceRole_SequenceRoleServer,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("Seal rotating H1 frame: %s", err)
+	}
+	defer MessagePoolReturn(rotatingWrapped)
+	if remaining := ordinaryH1DataEnvelopeByteCount - len(rotatingWrapped); remaining < 0 || 32 < remaining {
+		t.Fatalf(
+			"contract-bearing three-MTU H1 Pack is %d bytes at ordinary data limit %d, want no more than 32 bytes of fragile headroom",
+			len(rotatingWrapped),
+			ordinaryH1DataEnvelopeByteCount,
+		)
+	}
+
+	// A slightly larger still-ordinary signed contract crosses the deployed
+	// envelope. The established path must therefore prove that no contract
+	// frame can ride on its larger chunk instead of relying on the 512-byte
+	// example's accidental ten-byte margin.
+	m.contractFrame.MessageBytes = make([]byte, 544)
+	largeContractInner := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(largeContractInner)
+	largeContractWrapped, err := c.SealOuterFrame(
+		path,
+		largeContractInner,
+		protocol.SequenceRole_SequenceRoleServer,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("Seal large-contract H1 frame: %s", err)
+	}
+	defer MessagePoolReturn(largeContractWrapped)
+	if len(largeContractWrapped) <= ordinaryH1DataEnvelopeByteCount {
+		t.Fatalf(
+			"large-contract three-MTU H1 Pack is %d bytes, want above ordinary data limit %d",
+			len(largeContractWrapped),
+			ordinaryH1DataEnvelopeByteCount,
+		)
+	}
+}
+
 func BenchmarkSequenceCipherOuterWrap(b *testing.B) {
 	c := newFrameCodecTestSequenceCipher(b)
 	path := TransferPath{DestinationId: NewId(), SourceId: NewId(), StreamId: NewId()}
@@ -644,10 +1195,12 @@ func TestDecodeTransferFrameEdgeCases(t *testing.T) {
 			TransferPath: TransferPath{DestinationId: idA, SourceId: idB}.ToProtobuf(),
 			MessageType:  &mtAck,
 			Ack: &protocol.Ack{
-				MessageId:  idC.Bytes(),
-				SequenceId: idA.Bytes(),
-				Selective:  true,
-				Tag:        &protocol.Tag{SendTime: 7},
+				MessageId:               idC.Bytes(),
+				SequenceId:              idA.Bytes(),
+				Selective:               true,
+				Tag:                     &protocol.Tag{SendTime: 7},
+				MissingContractId:       idB.Bytes(),
+				CompactContractRecovery: true,
 			},
 		},
 		{
@@ -743,10 +1296,14 @@ func TestDecodeTransferFrameRandomized(t *testing.T) {
 			mt := protocol.MessageType_TransferAck
 			ref.MessageType = &mt
 			ref.Ack = &protocol.Ack{
-				MessageId:  randId().Bytes(),
-				SequenceId: randId().Bytes(),
-				Selective:  mathrandv2.IntN(2) == 0,
-				Tag:        randTag(),
+				MessageId:               randId().Bytes(),
+				SequenceId:              randId().Bytes(),
+				Selective:               mathrandv2.IntN(2) == 0,
+				Tag:                     randTag(),
+				CompactContractRecovery: mathrandv2.IntN(2) == 0,
+			}
+			if mathrandv2.IntN(3) == 0 {
+				ref.Ack.MissingContractId = randId().Bytes()
 			}
 		case 2: // encrypted
 			ref.EncryptedTransferFrame = randBytes(64)
@@ -952,7 +1509,126 @@ func TestOwnedDecodeHasExplicitCallbackLifetime(t *testing.T) {
 	MessagePoolReturn(retained)
 }
 
+func TestOwnedAckDecodeCopiesCompactQueueValueBeforeRelease(t *testing.T) {
+	messageId := NewId()
+	sequenceId := NewId()
+	missingContractId := NewId()
+	m := &sendAckFrame{
+		path:                    TransferPath{DestinationId: NewId(), SourceId: NewId()},
+		messageId:               messageId,
+		sequenceId:              sequenceId,
+		selective:               true,
+		tagSendTime:             1_700_000_000_000,
+		tagSet:                  true,
+		missingContractId:       &missingContractId,
+		compactContractRecovery: true,
+		logicalLaneVersion:      transferLogicalLaneVersion,
+	}
+	encoded := marshalSendAckTransferFrame(m)
+	defer MessagePoolReturn(encoded)
+
+	decoded := inboundDecodedTransferFrames.take()
+	if !unmarshalOwnedTransferFrame(encoded, decoded, true) {
+		inboundDecodedTransferFrames.put(decoded)
+		t.Fatal("owned ACK decode failed")
+	}
+	ack := decoded.frame.Ack
+	if ack != &decoded.ack ||
+		&ack.MessageId[0] != &decoded.ackIds[0][0] ||
+		&ack.SequenceId[0] != &decoded.ackIds[1][0] ||
+		&ack.MissingContractId[0] != &decoded.ackIds[2][0] ||
+		ack.Tag != &decoded.ackTag {
+		inboundDecodedTransferFrames.put(decoded)
+		t.Fatal("owned ACK fields do not use inline decoder storage")
+	}
+	receiveAck, err := receiveAckMessageFromProtocol(ack)
+	if err != nil {
+		inboundDecodedTransferFrames.put(decoded)
+		t.Fatalf("copy compact ACK: %s", err)
+	}
+	inboundDecodedTransferFrames.put(decoded)
+
+	if receiveAck.messageId != messageId ||
+		receiveAck.sequenceId != sequenceId ||
+		receiveAck.missingContractId != missingContractId ||
+		!receiveAck.selective || !receiveAck.contractMissing ||
+		!receiveAck.compactContractRecoverySupported ||
+		receiveAck.logicalLaneVersion != transferLogicalLaneVersion ||
+		!receiveAck.tag.set || receiveAck.tag.sendTime != m.tagSendTime {
+		t.Fatalf("compact ACK changed after decoder release: %+v", receiveAck)
+	}
+}
+
+func TestOwnedAckDecodeSteadyStateDoesNotAllocate(t *testing.T) {
+	m := &sendAckFrame{
+		path:                     TransferPath{DestinationId: NewId(), SourceId: NewId()},
+		messageId:                NewId(),
+		sequenceId:               NewId(),
+		tagSendTime:              1,
+		tagSet:                   true,
+		receiveWindowSet:         true,
+		receiveWindowByteCount:   1 << 20,
+		ackCompressTimeoutSet:    true,
+		ackCompressTimeoutMicros: 10000,
+		receiverAckDelaySet:      true,
+		receiverAckDelayMicros:   7500,
+	}
+	encoded := marshalSendAckTransferFrame(m)
+	defer MessagePoolReturn(encoded)
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		decoded := inboundDecodedTransferFrames.take()
+		if !unmarshalOwnedTransferFrame(encoded, decoded, true) {
+			panic("owned ACK decode failed")
+		}
+		if _, err := receiveAckMessageFromProtocol(decoded.frame.Ack); err != nil {
+			panic(err)
+		}
+		inboundDecodedTransferFrames.put(decoded)
+	})
+	if allocs != 0 {
+		t.Fatalf("owned ACK decode + compact copy allocated %.2f times, want 0", allocs)
+	}
+}
+
+func TestDecodedTransferFramePoolRetainedSizeStaysSmall(t *testing.T) {
+	size := unsafe.Sizeof(decodedTransferFrame{})
+	// Includes optional compression metadata and inline capacity/compression
+	// storage: the hot decoder keeps these fields allocation-free.
+	if size > 680 {
+		t.Fatalf("decoded TransferFrame owner size = %d, want <= 680 bytes", size)
+	}
+	t.Logf(
+		"decoded TransferFrame owner=%d bytes; exact pool ceiling=%d bytes",
+		size,
+		uintptr(decodedTransferFramePoolCapacity)*size,
+	)
+	ackSize := unsafe.Sizeof(receiveAckMessage{})
+	if ackSize > 104 {
+		t.Fatalf("compact receive ACK size = %d, want <= 104 bytes", ackSize)
+	}
+	t.Logf("compact receive ACK=%d bytes", ackSize)
+}
+
 func TestDecodedPackOwnerPoolRetentionIsBounded(t *testing.T) {
+	// The queue charge is a fixed allowance, not a knob to accommodate owner
+	// growth. Keep the allocation within it as receive pipeline fields change.
+	if decodedPackOwnerQueueByteCount > 1024 {
+		t.Fatalf("decoded Pack owner charge = %d, exceeds the 1-KiB allowance", decodedPackOwnerQueueByteCount)
+	}
+	size := unsafe.Sizeof(decodedPackOwner{})
+	if size > uintptr(decodedPackOwnerQueueByteCount) {
+		t.Fatalf(
+			"decoded Pack owner size = %d, exceeds %d-byte receive-budget charge",
+			size,
+			decodedPackOwnerQueueByteCount,
+		)
+	}
+	t.Logf(
+		"decoded Pack owner=%d bytes; exact pool ceiling=%d bytes",
+		size,
+		uintptr(decodedPackOwnerPoolCapacity)*size,
+	)
 	pool := newDecodedPackOwnerPool()
 	for i := 0; i < decodedPackOwnerPoolCapacity+97; i++ {
 		pool.put(&decodedPackOwner{})
@@ -974,11 +1650,19 @@ func TestDecodedPackOwnerPoolRetentionIsBounded(t *testing.T) {
 }
 
 func TestOwnedPackDecodeSteadyStateAllocs(t *testing.T) {
+	frames := make([]*protocol.Frame, sendPackBatchMaxFrames)
+	for i := range frames {
+		frames[i] = &protocol.Frame{
+			MessageType:  protocol.MessageType_IpIpPacketFromProvider,
+			MessageBytes: make([]byte, 64),
+			Raw:          true,
+		}
+	}
 	m := &sendPackFrame{
 		path:        TransferPath{DestinationId: NewId(), SourceId: NewId()},
 		messageId:   NewId(),
 		sequenceId:  NewId(),
-		frames:      []*protocol.Frame{{MessageType: protocol.MessageType_IpIpPacketFromProvider, MessageBytes: make([]byte, 1400), Raw: true}},
+		frames:      frames,
 		tagSendTime: 1,
 	}
 	encoded := marshalSendPackTransferFrame(m)
@@ -991,7 +1675,7 @@ func TestOwnedPackDecodeSteadyStateAllocs(t *testing.T) {
 		}
 		inboundDecodedTransferFrames.put(decoded)
 	})
-	t.Logf("owned pack decode steady-state allocations: %.2f", allocs)
+	t.Logf("owned %d-frame pack decode steady-state allocations: %.2f", len(frames), allocs)
 	if allocs != 0 {
 		t.Fatalf("owned pack decode allocated %.2f times per packet, want 0", allocs)
 	}
@@ -1024,6 +1708,46 @@ func BenchmarkTransferFrameDecode(b *testing.B) {
 			decoded := inboundDecodedTransferFrames.take()
 			if !unmarshalOwnedTransferFrame(encoded, decoded, true) {
 				b.Fatal("decode failed")
+			}
+			inboundDecodedTransferFrames.put(decoded)
+		}
+	})
+}
+
+func BenchmarkTransferAckFrameDecode(b *testing.B) {
+	missingContractId := NewId()
+	m := &sendAckFrame{
+		path:                    TransferPath{DestinationId: NewId(), SourceId: NewId()},
+		messageId:               NewId(),
+		sequenceId:              NewId(),
+		selective:               true,
+		tagSendTime:             1_700_000_000_000,
+		tagSet:                  true,
+		missingContractId:       &missingContractId,
+		compactContractRecovery: true,
+		logicalLaneVersion:      transferLogicalLaneVersion,
+	}
+	encoded := marshalSendAckTransferFrame(m)
+	defer MessagePoolReturn(encoded)
+
+	b.Run("copy-safe-protocol-objects", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			var decoded protocol.TransferFrame
+			if !unmarshalTransferFrame(encoded, &decoded, true) {
+				b.Fatal("decode failed")
+			}
+		}
+	})
+	b.Run("bounded-owned-values", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			decoded := inboundDecodedTransferFrames.take()
+			if !unmarshalOwnedTransferFrame(encoded, decoded, true) {
+				b.Fatal("decode failed")
+			}
+			if _, err := receiveAckMessageFromProtocol(decoded.frame.Ack); err != nil {
+				b.Fatal(err)
 			}
 			inboundDecodedTransferFrames.put(decoded)
 		}

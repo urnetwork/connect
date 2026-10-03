@@ -1,0 +1,27 @@
+{
+  "created_utc": "2026-09-15T14:59:55.746344+00:00",
+  "mode": "tcp",
+  "test_pattern": "^TestWindowTcp(Download|Upload)PerformanceMatrix$",
+  "connect": {
+    "revision": "8f30ab6a50664ad35ef685ccc2cfda65a540ddff",
+    "branch": "throughput-fix-2",
+    "source_sha256": "e01e3a74695d902cf4accb0664202d0819785e099dda78f73cfd5a27ea12591b",
+    "dirty": true
+  },
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "binary_sha256": "64cb26da219c0354bd9ed423dd8d9351849a0158664bb129cee7e910b9afde04",
+  "environment": {
+    "CONNECT_WINDOW_PATH_SECONDS": "10",
+    "CONNECT_WINDOW_PATH_FLOWS": "8",
+    "CONNECT_WINDOW_PATH_RTT_US": "100000",
+    "CONNECT_WINDOW_PATH_ACK_MS": "10",
+    "CONNECT_WINDOW_PATH_REPETITIONS": "1",
+    "CONNECT_WINDOW_TCP_MEASURE": "1",
+    "CONNECT_WINDOW_PATH_ARMS": "ceiling,matched,delivery,matched"
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN"
+}

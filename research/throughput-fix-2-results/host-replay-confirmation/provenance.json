@@ -1,0 +1,79 @@
+{
+  "arms": {
+    "after": {
+      "binary_sha256": "dbe3358861b26de6b3084f253e66706ccde97e62611d6701e0e3a4c0300ee8d5",
+      "effective_source_sha256": "ac218470cc544b459ccd4a3e926b8616e4869bff9508d6835cde299f0d57f732",
+      "fixture_marker_in_binary": true,
+      "invalid_prior_binary_sha256": "27069d09ceb62fc95561d4981018492f50595d87cc8f856f17470aca89731367",
+      "overlay_sha256": "ef37790dcc110af3bdb1c114f368fdfdc594207b71cd250cfe190ec3e06defb0",
+      "override_sha256": {
+        "ip.go": "b6106882056ed96677e1210410d8ef9bb4dfc23f3ae81427a62c6007dd915314",
+        "transfer_window_pacing.go": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7",
+        "transfer_window_tcp_performance_test.go": "b587b0f6cb8792a77f21483ede15245a19ac3b8344f63cf5f914e83ce26cdc19"
+      },
+      "sources_stable_during_build": true
+    },
+    "before": {
+      "binary_sha256": "22f6568b988c79c273f8c70ba718c21e8d33e4d6fb4a778fcc1004603468e2e7",
+      "effective_source_sha256": "c08ae59a9824bc292e3dec4e6b4c7538f1e9ae5ff80e323599f19de306908987",
+      "fixture_marker_in_binary": true,
+      "invalid_prior_binary_sha256": "27069d09ceb62fc95561d4981018492f50595d87cc8f856f17470aca89731367",
+      "overlay_sha256": "484b5fd266ba8ee3f85484ca88df84efc5b8b94fe23205e2f783296a97cfba0f",
+      "override_sha256": {
+        "ip.go": "b6106882056ed96677e1210410d8ef9bb4dfc23f3ae81427a62c6007dd915314",
+        "transfer_window_pacing.go": "81dc11a50c7077d15fd1e0bea3e27d57421c9c7a2e379d74f7d101cfce4360ed",
+        "transfer_window_tcp_performance_test.go": "b587b0f6cb8792a77f21483ede15245a19ac3b8344f63cf5f914e83ce26cdc19"
+      },
+      "sources_stable_during_build": true
+    }
+  },
+  "base_snapshot_manifest_sha256": "7a9d88126bdeb95cac96bc26d0d725fb46238858ead0d88acab1852794e9b158",
+  "base_source_sha256": "7afd9e4bc98b0bfb038d14c96450a4423bd25d341a88cb1ae4128b467c6513c3",
+  "environment": {
+    "CONNECT_WINDOW_FORCE_IDLE_REPLAY": "1",
+    "CONNECT_WINDOW_PATH_ACK_MS": "10",
+    "CONNECT_WINDOW_PATH_ARMS": "matched,ceiling,delivery,matched",
+    "CONNECT_WINDOW_PATH_FLOWS": "1",
+    "CONNECT_WINDOW_PATH_REPETITIONS": "1",
+    "CONNECT_WINDOW_PATH_RTT_US": "300",
+    "CONNECT_WINDOW_PATH_SECONDS": "12",
+    "CONNECT_WINDOW_TCP_MEASURE": "1",
+    "unset_overrides": [
+      "CONNECT_WINDOW_INNER_TCP_TRACE",
+      "CONNECT_WINDOW_TCP_TRACE",
+      "CONNECT_WINDOW_PACING_TRACE",
+      "CONNECT_WINDOW_PATH_PACING_TRACE"
+    ]
+  },
+  "invalid_prior_compile": "Identical binaries lacked the forced fixture marker: Go ignored noncanonical /tmp overlay keys while compiling the /private/tmp source tree. Invalid binaries were not executed. Recompiled using resolved keys.",
+  "limits": [
+    "This is an induced host diagnostic, not a general host or H1 production acceptance result.",
+    "Both fixture brackets required actual forced idle/replay observations and passed, but the before/after readings alone do not establish a repair claim.",
+    "The before binary disables only the source-idle delimiter as described by the compile manifest; all production/source/binary/overlay content is excluded from this archive.",
+    "The then-current TCP helper used SendMultiWithTimeout, which can create Packs larger than actual H1's 8 KiB cap. These results are FIFO/userspace-TUN plus real-origin sampler evidence, not physical-H1 throughput confirmation, and do not imply a repair throughput gain."
+  ],
+  "load_observations": {
+    "after_prelaunch": "not independently sampled; launched immediately after before terminal under the stated no-quiescence policy",
+    "at_archive": [
+      10.6201171875,
+      13.1142578125,
+      14.03955078125
+    ],
+    "before_prelaunch": [
+      11.7763671875,
+      14.36376953125,
+      14.6259765625
+    ]
+  },
+  "raw_log_sha256": {
+    "after": "b4717c02431808a9ea69ea343423f64d7cfa7aaedf0082758aa1b740df69087a",
+    "before": "337807d75eb476fc0d44c489c428b8f0b111078c7a0569548c608656d428057c"
+  },
+  "redaction": "Raw logs, binary content, overlay content, source content, commands, and local paths are excluded. Full comparison rows, forced-idle-replay observations, hashes, environment, load observations, and outcomes are retained.",
+  "run_context": {
+    "after": "forced idle-replay host diagnostic under current load; copied 7afd package cwd; duplicate valid frontier ACK stimulus",
+    "before": "forced idle-replay host diagnostic under current load; copied 7afd package cwd; duplicate valid frontier ACK stimulus"
+  },
+  "schema": "throughput-fix-2/host-replay-confirmation-provenance-v1",
+  "scope": "Induced inner-TCP duplicate-frontier feedback through real recovery, real loopback origin, userspace TUN, FIFO Transfer carrier; no native TUN or WebSocket claim. Before is current production with source-idle delimiter disabled only."
+}

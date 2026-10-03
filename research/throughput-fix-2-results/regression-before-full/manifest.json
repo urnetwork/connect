@@ -1,0 +1,24 @@
+{
+  "created_utc": "2026-09-15T18:28:41.478092+00:00",
+  "mode": "regression-partition",
+  "test_pattern": ".",
+  "run_flags": [
+    "-test.skip",
+    "^(TestWindow(Path|CompressionResidence)|TestReceiverBudgetDropsDoNotWedgeEitherArm$|TestTheWindowRuleIsInertOnAShortPath$)"
+  ],
+  "connect": {
+    "revision": "8f30ab6a50664ad35ef685ccc2cfda65a540ddff",
+    "branch": "throughput-fix-2",
+    "source_sha256": "daf39eb1c8b750adc99b44df4af68e3ae69ffe490c6463f826579b28c73bffe0",
+    "dirty": true
+  },
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {},
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "binary_sha256": "fd8b770fcfd0ac9d2cd9259862b49c0d2d977cbb0dc60e3ca7841bdd45f99ab4",
+  "sources_stable_during_build": true
+}

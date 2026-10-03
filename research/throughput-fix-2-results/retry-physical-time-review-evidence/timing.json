@@ -1,0 +1,10 @@
+{
+  "after_next_deadline": 1.8,
+  "after_next_firing": 1.8,
+  "before_next_deadline": 0.9,
+  "before_next_firing": 1.2,
+  "first_retry_due": 0.3,
+  "first_retry_physical": 1.2,
+  "initial_physical": 0,
+  "unchanged_next_backoff": 0.6
+}

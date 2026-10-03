@@ -1,0 +1,15 @@
+{
+  "archive": "window-cumulative-shared-delivery-cold-v2",
+  "payload_sha256": {
+    "candidate.patch": "055a78bfb5e8d53fce6ad4c06b7f4ab276dbc998b5aba86296e6351afeff88eb",
+    "ledger.jsonl": "cbba3ed874e1f6069334b7c323a208116e5a468447c6c29af06214f12125912b",
+    "outcomes.jsonl": "97dd0337b9ea356830ebdc2cf33560e77dab03e616db98b13307245a83be7577",
+    "policy-source.txt": "f1a720bf440a5444db6087fe4b9d7ca2231bdbd6f78d55dbe35a19dbfdd687c4",
+    "provenance.json": "ffa6c307129eaf344edb74ae55e3600435d1dcd5b4a4279aaa758fe9c99f74b1",
+    "root-source.txt": "d4d50030910391cf7fa8a33960a9548afdfa076fe444f29964ca32a28ce94ca9",
+    "source-manifest-after.json": "6bef9511e87361f3b6379558e13d9cee09d4ece77b7ed7f6a293273864f323f4",
+    "source-manifest-before.json": "e89539f21ebd90ae7074e0cd319153245d1349fdc9d0cc10f3c67037e327e613",
+    "source-pins.json": "3a6db233bdc7d12473832fdcaa242a001654b8158235139281e160b6bf5684b3",
+    "status.json": "43c2df21c71df55d1b2f35016ca407ee75c8deeae606690df5f0b6794185a5ae"
+  }
+}

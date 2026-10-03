@@ -1,0 +1,6 @@
+=== RUN   TestWindowPacingCanceledTailNeedsFreshDelivery
+    transfer_window_pacing_probe_test.go:97: canceling an unacknowledged tail manufactured a drained-burst RTT probe
+--- FAIL: TestWindowPacingCanceledTailNeedsFreshDelivery (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.620s

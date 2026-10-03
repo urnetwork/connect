@@ -1,0 +1,258 @@
+[
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingInvalid",
+    "estimated_bytes_per_second": [
+      4020775.0
+    ],
+    "invalid_samples": [
+      64.0
+    ],
+    "ns_per_op": {
+      "max": 9124.0,
+      "median": 9082.0,
+      "min": 9062.0
+    },
+    "repetitions": 3,
+    "variant": "bounded-slowdown-after"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingInvalidStatistics",
+    "estimated_bytes_per_second": [
+      4020775.0
+    ],
+    "invalid_samples": [
+      64.0
+    ],
+    "ns_per_op": {
+      "max": 9121.0,
+      "median": 9099.0,
+      "min": 9083.0
+    },
+    "repetitions": 3,
+    "variant": "bounded-slowdown-after"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingLegacy",
+    "estimated_bytes_per_second": [
+      3990588.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 552.3,
+      "median": 552.2,
+      "min": 551.6
+    },
+    "repetitions": 3,
+    "variant": "bounded-slowdown-after"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingLegacyStatistics",
+    "estimated_bytes_per_second": [
+      3990588.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 550.3,
+      "median": 550.1,
+      "min": 548.3
+    },
+    "repetitions": 3,
+    "variant": "bounded-slowdown-after"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingMixed",
+    "estimated_bytes_per_second": [
+      3990588.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 651.2,
+      "median": 648.9,
+      "min": 648.7
+    },
+    "repetitions": 3,
+    "variant": "bounded-slowdown-after"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingMixedStatistics",
+    "estimated_bytes_per_second": [
+      3990588.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 647.4,
+      "median": 646.5,
+      "min": 645.8
+    },
+    "repetitions": 3,
+    "variant": "bounded-slowdown-after"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingValid",
+    "estimated_bytes_per_second": [
+      4000000.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 774.5,
+      "median": 772.3,
+      "min": 770.8
+    },
+    "repetitions": 3,
+    "variant": "bounded-slowdown-after"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingValidStatistics",
+    "estimated_bytes_per_second": [
+      4000000.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 770.5,
+      "median": 769.7,
+      "min": 767.8
+    },
+    "repetitions": 3,
+    "variant": "bounded-slowdown-after"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingInvalid",
+    "estimated_bytes_per_second": [
+      12500000.0
+    ],
+    "invalid_samples": [
+      64.0
+    ],
+    "ns_per_op": {
+      "max": 8765.0,
+      "median": 8611.0,
+      "min": 8576.0
+    },
+    "repetitions": 3,
+    "variant": "restored-before"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingInvalidStatistics",
+    "estimated_bytes_per_second": [
+      12500000.0
+    ],
+    "invalid_samples": [
+      64.0
+    ],
+    "ns_per_op": {
+      "max": 8595.0,
+      "median": 8579.0,
+      "min": 8575.0
+    },
+    "repetitions": 3,
+    "variant": "restored-before"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingLegacy",
+    "estimated_bytes_per_second": [
+      3990588.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 553.6,
+      "median": 546.7,
+      "min": 545.6
+    },
+    "repetitions": 3,
+    "variant": "restored-before"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingLegacyStatistics",
+    "estimated_bytes_per_second": [
+      3990588.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 545.0,
+      "median": 541.7,
+      "min": 540.7
+    },
+    "repetitions": 3,
+    "variant": "restored-before"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingMixed",
+    "estimated_bytes_per_second": [
+      3990588.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 640.4,
+      "median": 640.0,
+      "min": 639.9
+    },
+    "repetitions": 3,
+    "variant": "restored-before"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingMixedStatistics",
+    "estimated_bytes_per_second": [
+      3990588.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 647.3,
+      "median": 642.7,
+      "min": 638.2
+    },
+    "repetitions": 3,
+    "variant": "restored-before"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingValid",
+    "estimated_bytes_per_second": [
+      4000000.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 781.6,
+      "median": 778.4,
+      "min": 777.1
+    },
+    "repetitions": 3,
+    "variant": "restored-before"
+  },
+  {
+    "benchmark": "BenchmarkWindowPacingReceiverRingValidStatistics",
+    "estimated_bytes_per_second": [
+      4000000.0
+    ],
+    "invalid_samples": [
+      0.0
+    ],
+    "ns_per_op": {
+      "max": 778.1,
+      "median": 777.4,
+      "min": 775.2
+    },
+    "repetitions": 3,
+    "variant": "restored-before"
+  }
+]

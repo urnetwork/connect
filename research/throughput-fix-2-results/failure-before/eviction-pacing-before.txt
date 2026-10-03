@@ -1,0 +1,5 @@
+--- FAIL: TestAckCompressionPacesEvictionOnlyHeadCarriers (0.00s)
+    transfer_ack_compression_test.go:137: compression turn repeated cumulative head: 8 carriers
+FAIL
+FAIL	github.com/urnetwork/connect	0.588s
+FAIL

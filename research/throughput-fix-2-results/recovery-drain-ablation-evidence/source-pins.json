@@ -1,0 +1,64 @@
+{
+  "base_manifest_sha256": "c8e7f15ad435c28131e5b05e0c391eff1edac04a6f7969acaabdb62eec9a0fe4",
+  "fixture_filter": {
+    "change": "Skip all matrix rows except1250000B/s,300usRTT,50mscompression,flows1and8. Original warmup, duration, measured arms, thresholds and queue/drop checks are unchanged. Same fixture in all variants.",
+    "patch_sha256": "f3aac160864705e14e2940159e779e28359c25164c9d7696c3fdfdc9d1cc9639",
+    "source_sha256": "9d4ee21dbb28de83798b1e23e476e752753d53c8483cba599788656bf7ff3e73"
+  },
+  "origin_input_inventory_sha256": "9c723bff9ed0b1deda2bb9b14f8f151a796c58c8d76e6c4d923b2640b929a9d4",
+  "origin_manifest_sha256": "0086e6a1be23d96ee8f147b34437ba161feab1a4834ba09c4696154527a71634",
+  "runs": [
+    {
+      "binary_sha256": "e8bba2e91f5b29beafc1f32df6248d0ca325ec0f9e0fc4c3c4546ed239c65fb2",
+      "effective_source_sha256": "3a56411003f11877ae18a3f38ad179b221ec910a6a586ef94156e8c8d1f4bf69",
+      "production_file_sha256": {
+        "transfer.go": "ee4d46a49cd060230b535cea96d9345acf0bc1219b0f2edab56f05f2cde238fc",
+        "transfer_recovery_time.go": "2e2d62346e0538d28cf96e87de5e7fcacdb723df7291ad4ea85a306f4b701f4e",
+        "transfer_window_pacing.go": "a320261b31a7d4f216a491be38766d6c89db19d01b1ce05d7f81531cbc27db76"
+      },
+      "race_instrumentation": false,
+      "raw_build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "raw_model_log_sha256": "9858e37cafdc6b25213b184b9982620d8ee2e0885e8e6a64711a25af3b47615d",
+      "run_manifest_sha256": "0e289574af78f02fe39fa00f0233c72eb5f36b3d32d98fd9983244b84acfa9b7",
+      "source_stable": true,
+      "variant": "checkpoint-8cda"
+    },
+    {
+      "binary_sha256": "3cf6445f0168f1472e75ba3263af48e3d1b91c005a8ad19cfe1b907872d1f50c",
+      "effective_source_sha256": "f8efab79030b283e7c530b148c34ee72dc8fd0558b98790c4c05427cd73f819b",
+      "production_file_sha256": {
+        "transfer.go": "49d903ad5e60f0e1707c30a7285167d7acc96fce7ef4da6d29f57e3a4c8b19fa",
+        "transfer_recovery_time.go": "339e2668ced4d566600457e08cd92ce77433ba39a39200241095d9abdf77dc03",
+        "transfer_window_pacing.go": "a320261b31a7d4f216a491be38766d6c89db19d01b1ce05d7f81531cbc27db76"
+      },
+      "race_instrumentation": false,
+      "raw_build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "raw_model_log_sha256": "298355c4b3f9781df2498cfa2f24410346b149fb241f1a5bdc314e044c65ed69",
+      "run_manifest_sha256": "bef76f94f94687f7348c31c60dc9a19a4ab3a0a6d9dda45875372baea8e05b27",
+      "source_stable": true,
+      "variant": "retry-only"
+    },
+    {
+      "binary_sha256": "2d5e4d4e909957c40d041cad709e2007b89a5589817ac2fcdaaab892269e4e2a",
+      "drain_liveness_exit_code": 0,
+      "drain_liveness_raw_log_sha256": "c23fa498ba844cc668bc5ed66ad93f8726e2938f8f4ccf62ab1859cd08fed0a9",
+      "effective_source_sha256": "4e857494c40dc9535d2b852bb59c141b25fc12108e6ecc5db0fcc82818e9f112",
+      "production_file_sha256": {
+        "transfer.go": "49d903ad5e60f0e1707c30a7285167d7acc96fce7ef4da6d29f57e3a4c8b19fa",
+        "transfer_recovery_time.go": "339e2668ced4d566600457e08cd92ce77433ba39a39200241095d9abdf77dc03",
+        "transfer_window_pacing.go": "f9c01edab76d690e50ee29c71654dcc1c649a1baa62ae27057551e06a88400dd"
+      },
+      "race_instrumentation": false,
+      "raw_build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "raw_model_log_sha256": "e1feac542c045e81b30b1cff7fa685514f14d3ff6c735b0bb85890408f75a652",
+      "run_manifest_sha256": "c85a71315b656e10b53f68cbb596ce71dd2e80cc3298cba9a8334dbf220fab25",
+      "source_stable": true,
+      "variant": "retry-drain-f9"
+    }
+  ],
+  "unchanged_long_test": {
+    "scope": "Original aggregate, per-second, no-stall, no-drop gates unchanged.",
+    "sha256": "498719874ad29569765decabc17afaf9b5b6a452d193d9fb18e74fa52b3b1c74"
+  },
+  "unique_input_pins_verified": 19
+}

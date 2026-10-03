@@ -1,0 +1,4 @@
+server-connect-deterministic: BLOCKED before source snapshot, compilation, or test execution
+server-proxy: BLOCKED before source snapshot, compilation, or test execution
+shared block: local launcher readiness attestation was unavailable to server/test-env.sh
+DB-backed server integrations remain deferred.

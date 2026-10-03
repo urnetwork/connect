@@ -1,0 +1,23 @@
+{
+  "candidate_status": "complete experimental receiver-service candidate with restored cumulative fallback; not accepted production",
+  "controls": "One free slot admits the same ACK. A public callback with no dedicated owner still returns/refuses at capacity and does not retry later. All pre-existing queue and byte limits remain unchanged.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "network_quality_events": false,
+  "outcomes": "6 passes,3 failures; pressure root fails in both constant and delivery policy arms on every repetition.",
+  "performance_acceptance": false,
+  "production_changes": [],
+  "production_fix": false,
+  "proof": "Explicit started/release barriers and synctest.Wait establish the attempted admission and blocked/quiescent state. The timer-free decision assertion observes no admitted ACK and exactly one52B ReturnSend drop even after capacity returns. No sleeps, queue-length polling or scheduling probability is used as the witness.",
+  "race": true,
+  "repetitions": 3,
+  "retention": "Original sources, binaries, logs, commands and local paths remain immutable outside Git and are represented by hashes.",
+  "root": "Existing real TCP sequence/net.Pipe and provider callback fixtures, with only the Transfer consumer paused. Captured SDK profile grants16 entries over8 logical lanes=2 slots. Two socket returns own those slots; resend capacity is open. One real52B timestamped pure ACK is generated for one uploaded byte, its first admission is forced, then one slot is released. No new upload or retransmission occurs.",
+  "scope": "Admission mechanism and ownership regression, not a replacement physical throughput rig. A future fix must preserve shared callbacks, bounded storage, cancellation and updated ACK ownership.",
+  "source_base": {
+    "artifact": "throughput-fix-2-receiver-service-validation-v1",
+    "candidate_source_sha256": "e6aaeb0801e4dc566dd66a9a4843c6a78d713722321a48e85312e4d7115d7790",
+    "inventory_sha256": "cb79e929de859509e52b7b821d40d5d2df8420858308ea94da39057f184e736d"
+  },
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "test_patch_sha256": "06727979cbc864e4a827bfe9ea929457ff5be70da40fb61a05ffd5707e604949"
+}

@@ -1,0 +1,28 @@
+{
+  "schema": "throughput-fix-2/regression-runtime-classification-v1",
+  "compile_source_sha256": "5605efa750834abb352be42548f7c20cd55f56d154a2837dc5996e8b580180f7",
+  "runtime_source_sha256_at_source_inspection": "538e6248fb744795d9e829e97e503744ed70284d107ebad10da646b56bf6e460",
+  "raw_log_sha256": "ed56c1fd22ae6d357ebd0ef0cdc79161a064c353fb559ba8ed903d49d7cff3d8",
+  "tests": [
+    {
+      "name": "TestTheWindowHasOneOwner",
+      "outcome": "failed",
+      "classification": "runtime-source-mismatch",
+      "reason": "The test reads transfer.go from its runtime working directory. Its 5605 binary ran after shared transfer.go had changed to the 538 source, so the old source-inspection ownership table and runtime source did not match.",
+      "interpretation": "Preserved as a terminal test failure, but it is not evidence that the immutable 5605 binary violated its compiled ownership contract."
+    },
+    {
+      "name": "TestTheWindowRuleIsInertOnAShortPath",
+      "outcome": "failed",
+      "classification": "independent-throughput-failure",
+      "measurement": {
+        "constant_megabytes_per_second": 9.9,
+        "sized_megabytes_per_second": 8.6,
+        "sized_over_constant": 0.87,
+        "path_round_trip_ms": 5
+      },
+      "interpretation": "This result is independent of the runtime source-inspection mismatch and remains a preserved baseline regression failure."
+    }
+  ],
+  "redaction": "This classification retains test outcomes, numerical measurements, source hashes, and the raw-log hash only. The raw log, source files, overlays, and binary are outside the archive."
+}

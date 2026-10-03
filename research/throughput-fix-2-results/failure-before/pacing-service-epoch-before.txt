@@ -1,0 +1,14 @@
+=== RUN   TestWindowPacingDrainedProbeHoldsServiceUntilFreshEvidence
+    transfer_window_pacing_probe_test.go:44: covering=false: one resumed probe measured idle as service: 6677 B/s, want 12500000
+    transfer_window_pacing_probe_test.go:44: covering=true: one resumed probe measured idle as service: 6677 B/s, want 12500000
+--- FAIL: TestWindowPacingDrainedProbeHoldsServiceUntilFreshEvidence (0.00s)
+=== RUN   TestWindowPacingProbeAckBeforeWriteConfirmationHoldsService
+    transfer_window_pacing_probe_test.go:83: h1=false: ACK before write confirmation lost the previous service: rate=6677 latest=6677
+    transfer_window_pacing_probe_test.go:83: h1=true: ACK before write confirmation lost the previous service: rate=6677 latest=6677
+    transfer_window_pacing_probe_test.go:91: h1=true: write confirmation left the wrong sample epoch: rate=6677 latest=6677 want=12500000
+--- FAIL: TestWindowPacingProbeAckBeforeWriteConfirmationHoldsService (0.00s)
+=== RUN   TestWindowPacingMissingProbeKeepsFreshServiceEvidence
+--- PASS: TestWindowPacingMissingProbeKeepsFreshServiceEvidence (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.723s

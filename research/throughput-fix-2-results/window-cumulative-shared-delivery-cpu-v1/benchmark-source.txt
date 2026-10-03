@@ -1,0 +1,156 @@
+// Measure common credit publication and the complete estimator separately.
+// Explicit physical feedback fills each bounded ring before timing starts.
+package connect
+
+import (
+	"reflect"
+	"testing"
+	"time"
+	"unsafe"
+)
+
+// Count actual policy-reader calls without adding shared benchmark workers.
+type windowAggregateBenchmarkPolicy struct {
+	windowPacingPolicyWriter
+	reads int
+}
+
+func (self *windowAggregateBenchmarkPolicy) transferFlightPolicy() transferFlightPolicySnapshot {
+	self.reads++
+	return self.policy
+}
+
+// Populate cold complete-flight history through confirmed items and the real
+// credit owner. Each 8 KiB flight remains below the 512 KiB opening. No sockets,
+// background workers or host-clock timing supply measurement evidence.
+func newWindowAggregateBenchmarkSequence(b *testing.B) (*SendSequence, time.Time, *windowAggregateBenchmarkPolicy) {
+	b.Helper()
+	settings := DefaultSendBufferSettings()
+	settings.DeliverySizedWindowScale = 2
+	settings.ResendQueueMaxByteCount = 512 * 1024
+	settings.ResendQueueMinByteCount = 64 * 1024
+	settings.ResendQueueBudget = NewTransferMemoryBudget(16 * 1024 * 1024)
+	settings.TargetGoodputByteRate = 125000000
+	policy := &windowAggregateBenchmarkPolicy{windowPacingPolicyWriter: windowPacingPolicyWriter{policy: transferFlightPolicySnapshot{h1Only: true}}}
+	sequence := &SendSequence{
+		sequenceId: NewId(), sendBufferSettings: settings, contractMultiRouteWriter: policy,
+		resendQueue:    newResendQueue(settings.ResendQueueBudget, settings.ResendQueueMinByteCount),
+		deliveredBytes: make([]deliveredBytesSample, deliveredBytesRingSize),
+		rttWindow: NewRttWindow(nil, settings.RttWindowSize, settings.RttWindowTimeout, settings.RttScale,
+			settings.MinResendInterval, settings.RttMinResendInterval, settings.MaxResendInterval),
+	}
+	service := newWindowPacingService(settings)
+	sequence.windowPacer.service, sequence.windowPacer.serviceSequenceId = service, sequence.sequenceId
+	b.Cleanup(func() {
+		sequence.windowPacer.close()
+		sequence.resendQueue.Clear()
+	})
+	at := time.Unix(1700000000, 0)
+	sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
+		receiveWindowSet: true, receiveWindowByteCount: 8 * 1024 * 1024,
+		ackCompressTimeoutSet: true, ackCompressTimeoutMicros: 10000,
+	})
+	sequence.receiveWindowSetAtNanos.Store(at.UnixNano())
+	for number := range 2 * deliveredBytesRingSize {
+		item := &sendItem{
+			transferItem: transferItem{messageId: NewId(), sequenceNumber: uint64(number)},
+			sendTime:     at, sendCount: 1, expectsAck: true, transferFrameBytes: make([]byte, 8192),
+			pacingByteCount: 8192, pacingSentAtNanos: at.UnixNano(), rttState: sendItemRttWritePending,
+		}
+		sequence.resendQueue.Add(item)
+		sequence.windowPacer.serviceSent += 8192
+		service.sent += 8192
+		service.beginWrite(sequence.sequenceId, item.messageId, item.sequenceNumber, at, false)
+		sequence.finishReceiverRttWrite(item, transferWriteDisposition{transportType: TransportTypeH1, reliable: true}, nil)
+		service.finishWrite(sequence.sequenceId, item.messageId, true)
+		at = at.Add(10 * time.Millisecond)
+		sequence.rttWindow.closeSendTime(uint64(item.sendTime.UnixMilli()), at)
+		service.acknowledgeWrite(sequence.sequenceId, item.messageId, item.sequenceNumber, false, 10*time.Millisecond, at)
+		sequence.publishAckServiceCredit(item.messageId, false, at)
+		sequence.observeAckedBytesWithServiceCredit(8192, 0, windowServiceAckCredit{}, at)
+		if sequence.resendQueue.RemoveByMessageId(item.messageId) != item || !item.serviceCreditObserved {
+			b.Fatal("benchmark setup lost exact retained credit")
+		}
+	}
+	estimate := sequence.sendWindowEstimate(at)
+	if !estimate.Sized || estimate.ServiceByteRate != 0 || estimate.DeliveryByteRate != 819200 ||
+		service.sent != service.total || service.total != 2*deliveredBytesRingSize*8192 {
+		b.Fatalf("benchmark did not establish cold complete-flight evidence: %+v", estimate)
+	}
+	policy.reads = 0
+	return sequence, at, policy
+}
+
+// Report fixed ownership separately from per-operation allocations. Reflection
+// keeps this same benchmark source compatible with the pre-ring binary.
+func reportWindowAggregateBenchmarkMemory(b *testing.B, service *windowPacingService) {
+	b.Helper()
+	b.ReportMetric(float64(unsafe.Sizeof(*service)), "service-B")
+	b.ReportMetric(float64(unsafe.Sizeof(SendWindowEstimate{})), "estimate-B")
+	size := uintptr(0)
+	if field, ok := reflect.TypeOf(*service).FieldByName("aggregate"); ok {
+		size = field.Type.Size()
+	}
+	b.ReportMetric(float64(size), "aggregate-B")
+}
+
+// Reuse one confirmed envelope, as existing ACK microbenchmarks reuse their
+// bounded flights. Included work is queue credit validation and both service
+// publications; RTT/coalescer validation is measured by the existing family.
+func BenchmarkWindowPacingAggregateCreditPublication(b *testing.B) {
+	sequence, at, _ := newWindowAggregateBenchmarkSequence(b)
+	service := sequence.windowPacer.service
+	item := &sendItem{
+		transferItem:       transferItem{messageId: NewId(), sequenceNumber: 128},
+		transferFrameBytes: make([]byte, 8192), pacingByteCount: 8192,
+		rttState: sendItemRttWriteConfirmed, rttH1: true,
+	}
+	sequence.resendQueue.Add(item)
+	initial := service.total
+	b.ReportAllocs()
+	for b.Loop() {
+		item.serviceCreditObserved, sequence.serviceAckHeadSet = false, false
+		item.pacingSentAtNanos = at.UnixNano()
+		at = at.Add(10 * time.Millisecond)
+		sequence.windowPacer.serviceSent += 8192
+		service.sent += 8192
+		sequence.publishAckServiceCredit(item.messageId, false, at)
+	}
+	if service.total != initial+ByteCount(b.N)*8192 || sequence.windowPacer.serviceAcked != service.total || service.sent != service.total {
+		b.Fatal("publication benchmark lost exact once-only byte ownership")
+	}
+	reportWindowAggregateBenchmarkMemory(b, service)
+}
+
+// Admission reads include current carrier policy, window limits and the final
+// shared pacing decision. Their input clock and delivered bytes stay fixed.
+func BenchmarkWindowPacingAggregateWindowEstimate(b *testing.B) {
+	benchmarkWindowPacingAggregateEstimate(b, true)
+}
+
+// Statistics consume the same evidence without committing new measurements.
+func BenchmarkWindowPacingAggregateWindowSnapshot(b *testing.B) {
+	benchmarkWindowPacingAggregateEstimate(b, false)
+}
+
+// Validate retained ownership outside the measured loop; host ns/op is a
+// diagnostic reading with no timing pass threshold.
+func benchmarkWindowPacingAggregateEstimate(b *testing.B, retain bool) {
+	b.Helper()
+	sequence, at, policy := newWindowAggregateBenchmarkSequence(b)
+	service := sequence.windowPacer.service
+	initial := service.total
+	window, epoch := sequence.windowSize.window, service.serviceEpochAt
+	var estimate SendWindowEstimate
+	b.ReportAllocs()
+	for b.Loop() {
+		estimate = sequence.estimateSendWindow(at, retain)
+	}
+	if !estimate.Sized || estimate.DeliveryByteRate != 819200 || estimate.ServiceByteRate != 0 ||
+		estimate.PacingByteRate != 901120 || sequence.windowSize.window != window || service.serviceEpochAt != epoch ||
+		service.total != initial || service.sent != initial || sequence.windowPacer.serviceAcked != initial {
+		b.Fatalf("estimator benchmark changed physical evidence or ownership: %+v", estimate)
+	}
+	b.ReportMetric(float64(policy.reads)/float64(b.N), "policy-reads/op")
+	reportWindowAggregateBenchmarkMemory(b, service)
+}

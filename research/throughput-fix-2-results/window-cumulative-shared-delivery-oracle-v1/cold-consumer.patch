@@ -1,0 +1,102 @@
+--- a/transfer.go	2026-09-16 13:13:02
++++ b/transfer.go	2026-09-16 16:17:26
+@@ -10709,6 +10709,9 @@
+ 	// A fresh, qualified cumulative interval can guide cold pacing before a
+ 	// serialization pair exists. This rate is never derived from retained bytes.
+ 	DeliveryByteRate ByteCount
++	// Fresh once-only H1 delivery over one common service interval. This
++	// guides shared pacing without changing this sequence's sizing evidence.
++	AggregateDeliveryByteRate ByteCount
+ 	// The same owner computes pacing from recently serialized delivery, so
+ 	// writers consume its result without interpreting the target themselves.
+ 	ServiceByteRate      ByteCount
+@@ -10767,6 +10770,9 @@
+ 		}
+ 		estimate.PacingProbeByteRate = estimate.PacingByteRate
+ 		estimate.PacingProbeByteCount = max(0, initial)
++		// Finalize after every evidence path, including shared-service early
++		// returns that have no local cumulative sizing interval.
++		defer self.finalizeWindowPacing(now, &estimate)
+ 		// Two compressed ACK intervals can measure one complete service
+ 		// interval even when the first and last replies are partial. Bound
+ 		// discovery to twice the ordinary opening window on slow services.
+@@ -10791,7 +10797,6 @@
+ 				}
+ 				estimate.ServiceEstablished = true
+ 				estimate.ServiceBacklogged = service.backloggedAt(estimate.ServiceByteRate, now)
+-				estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingByteRate)
+ 			}
+ 		}
+ 	}
+@@ -10921,11 +10926,6 @@
+ 	// Candidate computation below never teaches an advertised maximum on its
+ 	// own. Statistics report the last admitted value without learning growth.
+ 	defer func() {
+-		// Cumulative qualification occurs after service sampling. Finalize once
+-		// both are known, without treating a retained window as a rate sample.
+-		if estimate.PacingProbeByteRate > 0 {
+-			estimate.PacingByteRate = windowPacingRate(estimate, estimate.PacingProbeByteRate)
+-		}
+ 		candidate := estimate.Window
+ 		candidateTargetBound := estimate.Sized && estimate.TargetBound && estimate.Reason == "target"
+ 		serviceCandidateChosen := estimate.ServiceSized && (!estimate.Sized || candidate < serviceCandidate)
+--- a/transfer_window_pacing.go	2026-09-16 14:26:20
++++ b/transfer_window_pacing.go	2026-09-16 16:19:34
+@@ -210,15 +210,22 @@
+ // until physical service is known. Ten percent above recent delivery discovers
+ // spare capacity; queued service leaves a drain margin. The target caps both.
+ func windowPacingRate(estimate SendWindowEstimate, target ByteCount) ByteCount {
+-	if estimate.WindowRoundTrip <= 0 && estimate.ServiceByteRate <= 0 {
++	if estimate.WindowRoundTrip <= 0 && estimate.ServiceByteRate <= 0 &&
++		estimate.AggregateDeliveryByteRate <= 0 {
+ 		return target
+ 	}
+ 	rate := float64(target)
+ 	if estimate.WindowRoundTrip > 0 {
+ 		rate = float64(estimate.Initial) / estimate.WindowRoundTrip.Seconds()
+ 	}
+-	if estimate.ServiceByteRate <= 0 && estimate.DeliveryByteRate > 0 {
+-		rate = 1.1 * float64(estimate.DeliveryByteRate)
++	if estimate.ServiceByteRate <= 0 {
++		deliveryRate := estimate.AggregateDeliveryByteRate
++		if deliveryRate <= 0 {
++			deliveryRate = estimate.DeliveryByteRate
++		}
++		if deliveryRate > 0 {
++			rate = 1.1 * float64(deliveryRate)
++		}
+ 	}
+ 	if estimate.ServiceByteRate > 0 {
+ 		serviceRate := float64(estimate.ServiceByteRate)
+--- /dev/null	2026-09-16 16:22:37
++++ b/transfer_window_pacing_delivery.go	2026-09-16 16:22:36
+@@ -0,0 +1,29 @@
++// Shared pacing consumes a service-wide rate even when its logical senders
++// retain separate cumulative sizing histories. This reader never learns bytes.
++package connect
++
++import "time"
++
++// Current H1 evidence may guide every early-return path with pacing enabled.
++// Serialization stays authoritative; missing aggregate history keeps the own
++// cumulative fallback. Snapshot reads do not mutate either measurement owner.
++func (self *SendSequence) finalizeWindowPacing(at time.Time, estimate *SendWindowEstimate) {
++	if estimate.PacingProbeByteRate <= 0 {
++		return
++	}
++	if service := self.windowPacer.service; service != nil && self.transferFlightPolicy().h1Only {
++		residence := estimate.WindowRoundTrip
++		if residence <= 0 {
++			residence = service.roundTripEvidence(at).residence
++		}
++		if residence > 0 {
++			minimumSpan := max(windowServiceDeliveryMinimumSpan(residence), 4*self.deliveredBytesSampleIntervalAt(at))
++			afterNanos := max(self.receiveWindowSetAtNanos.Load(), service.windowDeliveryStep())
++			delivery := service.aggregateDelivery(at, minimumSpan, afterNanos)
++			if delivery.arrivalByteRate > 0 && min(estimate.Initial, kib(4)) <= delivery.bytes-delivery.firstBytes {
++				estimate.AggregateDeliveryByteRate = delivery.arrivalByteRate
++			}
++		}
++	}
++	estimate.PacingByteRate = windowPacingRate(*estimate, estimate.PacingProbeByteRate)
++}

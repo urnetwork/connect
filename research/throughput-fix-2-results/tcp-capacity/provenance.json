@@ -1,0 +1,12 @@
+{
+  "source_log": "run.log",
+  "source_log_sha256": "bb78443f9211ac124e095047a7a8d74d868529a8e62e7014c030d4f9c2b9e523",
+  "note": "Final-source separate 48 MiB gVisor TCP capacity control; retain its paired arms and any calibration failures.",
+  "rows": 168,
+  "final": true,
+  "outcome": "passed",
+  "outcome_excerpt": {
+    "raw_log_sha256": "bb78443f9211ac124e095047a7a8d74d868529a8e62e7014c030d4f9c2b9e523",
+    "note": "Only test names and outcomes are included. The original raw log remains outside the committed archive. This extraction does not establish build-source provenance."
+  }
+}

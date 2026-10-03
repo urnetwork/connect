@@ -1,0 +1,20 @@
+{
+  "counts": {
+    "fail": 0,
+    "nonrace_outcomes": 2,
+    "nonrace_pass": 2,
+    "race_outcomes": 24,
+    "race_pass": 24,
+    "size_observations": 5,
+    "skip": 0
+  },
+  "files": {
+    "outcomes-nonrace.jsonl": "af81350954be2698171914551b4b5efe8f74901255ea310a59e4e3947ce59877",
+    "outcomes-race.jsonl": "214ed345836b6f46c84c05e69cc04f641d41880fdfa3719aff7a5f6a5754ef8b",
+    "provenance.json": "eb2b783bd58e17aa8568e1d7764c8440904ec91e34bf849768bef5d7cd728ec4",
+    "size-observations.jsonl": "b4febfccc80eef6a94f8de58954bdf94ee23f94178ad86919817eb315ad36226",
+    "summary.json": "bd3fe64a4066189dab5528a3fc716a2553fc29310764c88af8b7220d63fe98fd"
+  },
+  "schema": "throughput-fix-2/ack-receiver-delay-wire-manifest-v1",
+  "verification": "fresh copied source snapshot verified before archive; copied source reverified after both builds/runs; output hashes pinned; normalized outcomes and size observations only"
+}

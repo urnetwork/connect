@@ -1,0 +1,9 @@
+{
+  "archive": "sdk-initial-service-root-before",
+  "payload_sha256": {
+    "outcomes.jsonl": "6a39110b8a6156447e58270b9f556dbf515079435c63bd18f3cc48d4fa1d7651",
+    "provenance.json": "fc977ad9a91def7e565cec9be58a69234d527fe00986e4f4a65727f503a5d16f",
+    "source-pins.json": "2c77607280cba5ac8c7c3ee5db680ee9b1522207ec2914a6273ff077fafdb04f",
+    "status.json": "0b9fdd2ba15fad06c4570d6577a4f0a316fb106c68758619e9341e564db5c61e"
+  }
+}

@@ -64,6 +64,7 @@ type AddrGenerator struct {
 	cancel context.CancelFunc
 	prefix netip.Prefix
 	next   chan netip.Addr
+	done   chan struct{}
 }
 
 func NewAddrGenerator(prefix netip.Prefix) *AddrGenerator {
@@ -73,6 +74,7 @@ func NewAddrGenerator(prefix netip.Prefix) *AddrGenerator {
 		cancel: cancel,
 		prefix: prefix,
 		next:   make(chan netip.Addr),
+		done:   make(chan struct{}),
 	}
 	go HandleError(ag.run)
 	return ag
@@ -81,6 +83,7 @@ func NewAddrGenerator(prefix netip.Prefix) *AddrGenerator {
 func (self *AddrGenerator) run() {
 	defer self.cancel()
 	defer close(self.next)
+	defer close(self.done)
 	for addr := range AddrsInPrefix(self.prefix) {
 		select {
 		case self.next <- addr:
@@ -97,4 +100,5 @@ func (self *AddrGenerator) Next() (netip.Addr, bool) {
 
 func (self *AddrGenerator) Close() {
 	self.cancel()
+	<-self.done
 }

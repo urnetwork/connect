@@ -1,0 +1,12 @@
+{
+  "archive_kind": "initial_ack_lifetime_review_evidence",
+  "file_count": 5,
+  "file_sha256": {
+    "numeric-outcomes.jsonl": "9af1ab1d24dc208d998df3b5c8d188ccc37d50dfa8125800294fefe7ffaf2c96",
+    "outcomes.jsonl": "a5091556938c94dd8abbdc8548cd905f74d03145d5f28f3afc4ea8b8d0996ea2",
+    "provenance.json": "ac8435a3eeaf96c1a6d50a5d1ff2a861d4f2e236ba2f36377fe63c4abf7d693b",
+    "source-pins.json": "2326867c15abbea164bffa341081328676f101655ea3f710d453ee2d1fefa123",
+    "status.json": "2ea0708159c73e83af4a083905d0ee21c12fc04124a1139da9fe28ec53ebf128"
+  },
+  "schema_version": 1
+}

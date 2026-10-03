@@ -1,0 +1,11 @@
+{
+  "archive": "window-retention-statistics-selection",
+  "payload_sha256": {
+    "outcomes.jsonl": "43c9d96f1aaa3a4d3e3f3184e2ee0d6262b608dab0db55c6120b9eb9838a95d4",
+    "provenance.json": "eed7c7a056b410fe11c34af6ac93d83ef462ee29baa32fc01a4f293e5094723e",
+    "source-manifest-after.json": "6fbbdf4f4dc6666806390901dbc09b697a04e71839338c0b55498bd869f47a9a",
+    "source-manifest-before.json": "4d89bceb5a942211884afb9d46cb5afc899029cdb1d457831596b64f933a3d39",
+    "source-pins.json": "57615455eb50023498e86e1649e065aa347bfc6e505415a77875cdd567bf2f1f",
+    "status.json": "44b5e7c59311d167fd06bdba5a6f9a2ff11edc31a527bbed14715c85c07c021c"
+  }
+}

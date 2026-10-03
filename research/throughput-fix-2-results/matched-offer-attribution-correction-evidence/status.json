@@ -1,0 +1,12 @@
+{
+  "accepted_performance_result": false,
+  "diagnostic_model_fail_outcomes": 1,
+  "diagnostic_model_service_readings": 2,
+  "production_fix_claimed": false,
+  "race_blocks": 0,
+  "raw_event_rows_excluded": 17824,
+  "raw_events_omitted": 0,
+  "root_fail_outcomes": 3,
+  "root_numerical_rows": 6,
+  "status": "unfixed causal root; source frozen, no shared changes"
+}

@@ -1,3 +1,5 @@
+// Exercises busy-flow probe decisions and the window gates that admit them.
+// Virtual clocks and explicit waiter barriers keep scheduling out of the proof.
 package connect
 
 import (
@@ -6,15 +8,16 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
 // The busy-flow liveness probe (concept ported from upstream main e05ecee)
 // interposes between the send-stall bar tripping and the conviction that used
 // to follow it immediately. These tests drive the interposition from the
-// window's conviction pass, which is where it lives, using the same
-// stallTestChannel / watchdogTestWindow fixtures the stall suite already
-// establishes.
+// window's conviction pass using the stall suite's bare fixtures. Scheduler
+// controls inspect the probe's own verdict: window admission can correctly
+// hold that verdict if corroborating receive evidence ages out during a pause.
 
 // busyProbeTestChannel is a stalled-capable bare channel with a context and a
 // probe seam: `send` stands in for what the exit does about the control ping.
@@ -52,51 +55,53 @@ func stallPast(client *multiClientChannel, stallTimeout time.Duration) {
 // the conviction off entirely, and it must refresh the stall bar so the next
 // watchdog pass does not simply re-convict a millisecond later.
 func TestBusyProbeAcquitsOnAck(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
 
-	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-		go ackCallback(nil)
-		return true, nil
+		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
+			go ackCallback(nil)
+			return true, nil
+		})
+		stallPast(client, stallTimeout)
+
+		// the bar has genuinely tripped before the probe runs
+		AssertEqual(t, client.sendStalled(stallTimeout), true)
+
+		client.stateLock.Lock()
+		pendingBefore := client.pendingSendTime
+		client.stateLock.Unlock()
+
+		window := busyProbeTestWindow(500*time.Millisecond, client)
+
+		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+		AssertEqual(t, client.IsDone(), false)
+
+		client.stateLock.Lock()
+		endErr := client.endErr
+		probeAckTime := client.busyProbeAckTime
+		pendingAfter := client.pendingSendTime
+		outstanding := client.busyProbeOutstanding
+		client.stateLock.Unlock()
+
+		AssertEqual(t, endErr == nil, true)
+		// the liveness is recorded on its own field...
+		AssertEqual(t, probeAckTime.IsZero(), false)
+		// ...and pendingSendTime is NOT forged into an ack that never happened:
+		// the outstanding run's true start survives the acquittal
+		AssertEqual(t, pendingAfter.Equal(pendingBefore), true)
+		// the outstanding send is still outstanding -- nothing about the stalled
+		// data changed, only what we now know about the exit
+		client.stateLock.Lock()
+		AssertEqual(t, 0 < client.packetStats.sendNackCount, true)
+		client.stateLock.Unlock()
+		// the suspect demerit does not outlive the probe
+		AssertEqual(t, outstanding, false)
+
+		// and the bar really is refreshed: the same evidence must not re-convict
+		// on the very next pass
+		AssertEqual(t, client.sendStalled(stallTimeout), false)
+		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
 	})
-	stallPast(client, stallTimeout)
-
-	// the bar has genuinely tripped before the probe runs
-	AssertEqual(t, client.sendStalled(stallTimeout), true)
-
-	client.stateLock.Lock()
-	pendingBefore := client.pendingSendTime
-	client.stateLock.Unlock()
-
-	window := busyProbeTestWindow(500*time.Millisecond, client)
-
-	AssertEqual(t, window.convictSendStalls(stallTimeout), false)
-	AssertEqual(t, client.IsDone(), false)
-
-	client.stateLock.Lock()
-	endErr := client.endErr
-	probeAckTime := client.busyProbeAckTime
-	pendingAfter := client.pendingSendTime
-	outstanding := client.busyProbeOutstanding
-	client.stateLock.Unlock()
-
-	AssertEqual(t, endErr == nil, true)
-	// the liveness is recorded on its own field...
-	AssertEqual(t, probeAckTime.IsZero(), false)
-	// ...and pendingSendTime is NOT forged into an ack that never happened:
-	// the outstanding run's true start survives the acquittal
-	AssertEqual(t, pendingAfter.Equal(pendingBefore), true)
-	// the outstanding send is still outstanding -- nothing about the stalled
-	// data changed, only what we now know about the exit
-	client.stateLock.Lock()
-	AssertEqual(t, 0 < client.packetStats.sendNackCount, true)
-	client.stateLock.Unlock()
-	// the suspect demerit does not outlive the probe
-	AssertEqual(t, outstanding, false)
-
-	// and the bar really is refreshed: the same evidence must not re-convict
-	// on the very next pass
-	AssertEqual(t, client.sendStalled(stallTimeout), false)
-	AssertEqual(t, window.convictSendStalls(stallTimeout), false)
 }
 
 // The conviction. An exit that does not answer inside the budget is judged
@@ -105,29 +110,31 @@ func TestBusyProbeAcquitsOnAck(t *testing.T) {
 // the probe was asked and did not answer. The "Blackhole " prefix must stay
 // off it: this is hard evidence and the storm breaker must not budget it.
 func TestBusyProbeConvictsOnTimeout(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
 
-	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-		// queued, never answered
-		return true, nil
+		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
+			// queued, never answered
+			return true, nil
+		})
+		stallPast(client, stallTimeout)
+
+		window := busyProbeTestWindow(40*time.Millisecond, client, receivingSibling())
+
+		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+		AssertEqual(t, client.IsDone(), true)
+
+		client.stateLock.Lock()
+		endErr := client.endErr
+		client.stateLock.Unlock()
+
+		AssertEqual(t, endErr != nil, true)
+		AssertEqual(t, strings.HasPrefix(endErr.Error(), "send stalled"), true)
+		if !strings.Contains(endErr.Error(), "liveness probe timed out after") {
+			t.Errorf("the reason does not name the probe outcome: %q", endErr.Error())
+		}
+		AssertEqual(t, blackholeVerdictErr(endErr), false)
 	})
-	stallPast(client, stallTimeout)
-
-	window := busyProbeTestWindow(40*time.Millisecond, client, receivingSibling())
-
-	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
-	AssertEqual(t, client.IsDone(), true)
-
-	client.stateLock.Lock()
-	endErr := client.endErr
-	client.stateLock.Unlock()
-
-	AssertEqual(t, endErr != nil, true)
-	AssertEqual(t, strings.HasPrefix(endErr.Error(), "send stalled"), true)
-	if !strings.Contains(endErr.Error(), "liveness probe timed out after") {
-		t.Errorf("the reason does not name the probe outcome: %q", endErr.Error())
-	}
-	AssertEqual(t, blackholeVerdictErr(endErr), false)
 }
 
 // The probe write failing is weak evidence on its own: the send path being
@@ -136,65 +143,69 @@ func TestBusyProbeConvictsOnTimeout(t *testing.T) {
 // the next probe to queue. Two consecutive failures inside one stale episode
 // convict; one does not.
 func TestBusyProbeConvictsOnTwoUnsendable(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
 
-	sends := atomic.Int32{}
-	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-		sends.Add(1)
-		// (fixture note: the window below carries a receiving sibling, so
-		// the sibling-corroboration gate is open and the unsendable-count
-		// logic is what decides)
-		// backpressure: reported unsuccessful, never queued, no ack possible
-		return false, nil
+		sends := atomic.Int32{}
+		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
+			sends.Add(1)
+			// (fixture note: the window below carries a receiving sibling, so
+			// the sibling-corroboration gate is open and the unsendable-count
+			// logic is what decides)
+			// backpressure: reported unsuccessful, never queued, no ack possible
+			return false, nil
+		})
+		stallPast(client, stallTimeout)
+
+		window := busyProbeTestWindow(40*time.Millisecond, client, receivingSibling())
+
+		// first failure: no verdict, the episode continues
+		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+		AssertEqual(t, client.IsDone(), false)
+		client.stateLock.Lock()
+		AssertEqual(t, client.endErr == nil, true)
+		AssertEqual(t, client.busyProbeSendFailures, 1)
+		client.stateLock.Unlock()
+
+		// second failure in the same episode: convicted, and the reason says why
+		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+		AssertEqual(t, client.IsDone(), true)
+		AssertEqual(t, sends.Load(), int32(2))
+
+		client.stateLock.Lock()
+		endErr := client.endErr
+		client.stateLock.Unlock()
+		AssertEqual(t, strings.HasPrefix(endErr.Error(), "send stalled"), true)
+		if !strings.Contains(endErr.Error(), "liveness probe unsendable") {
+			t.Errorf("the reason does not name the probe outcome: %q", endErr.Error())
+		}
+		AssertEqual(t, blackholeVerdictErr(endErr), false)
 	})
-	stallPast(client, stallTimeout)
-
-	window := busyProbeTestWindow(40*time.Millisecond, client, receivingSibling())
-
-	// first failure: no verdict, the episode continues
-	AssertEqual(t, window.convictSendStalls(stallTimeout), false)
-	AssertEqual(t, client.IsDone(), false)
-	client.stateLock.Lock()
-	AssertEqual(t, client.endErr == nil, true)
-	AssertEqual(t, client.busyProbeSendFailures, 1)
-	client.stateLock.Unlock()
-
-	// second failure in the same episode: convicted, and the reason says why
-	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
-	AssertEqual(t, client.IsDone(), true)
-	AssertEqual(t, sends.Load(), int32(2))
-
-	client.stateLock.Lock()
-	endErr := client.endErr
-	client.stateLock.Unlock()
-	AssertEqual(t, strings.HasPrefix(endErr.Error(), "send stalled"), true)
-	if !strings.Contains(endErr.Error(), "liveness probe unsendable") {
-		t.Errorf("the reason does not name the probe outcome: %q", endErr.Error())
-	}
-	AssertEqual(t, blackholeVerdictErr(endErr), false)
 }
 
 // "Consecutive" is scoped to one stale episode. A transient queue-full result
 // that survived a healthy interval would make the next episode convict on its
 // first unsendable probe -- an exit removed for one bad moment minutes ago.
 func TestBusyProbeUnsendableRunResetsBetweenEpisodes(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
 
-	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-		return false, nil
+		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
+			return false, nil
+		})
+		stallPast(client, stallTimeout)
+
+		window := busyProbeTestWindow(40*time.Millisecond, client)
+		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+
+		// the exit delivers: the episode is over
+		client.addSendAck(1440)
+		AssertEqual(t, client.sendStalled(stallTimeout), false)
+
+		client.stateLock.Lock()
+		AssertEqual(t, client.busyProbeSendFailures, 0)
+		client.stateLock.Unlock()
 	})
-	stallPast(client, stallTimeout)
-
-	window := busyProbeTestWindow(40*time.Millisecond, client)
-	AssertEqual(t, window.convictSendStalls(stallTimeout), false)
-
-	// the exit delivers: the episode is over
-	client.addSendAck(1440)
-	AssertEqual(t, client.sendStalled(stallTimeout), false)
-
-	client.stateLock.Lock()
-	AssertEqual(t, client.busyProbeSendFailures, 0)
-	client.stateLock.Unlock()
 }
 
 // The transport gate holds BEFORE any probe. A channel whose carrier is down
@@ -215,7 +226,13 @@ func TestBusyProbeTransportDownHoldsBeforeAnyProbe(t *testing.T) {
 	// a real client for its route manager; nothing registers a transport, so
 	// the channel's carrier is down
 	client.client = NewClientWithDefaults(ctx, NewId(), NewNoContractClientOob())
-	defer client.client.Cancel()
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		if err := client.client.CloseAndWait(closeCtx); err != nil {
+			t.Errorf("close probe test client: %v", err)
+		}
+	})
 
 	stallPast(client, stallTimeout)
 
@@ -232,133 +249,231 @@ func TestBusyProbeTransportDownHoldsBeforeAnyProbe(t *testing.T) {
 // port -- the pass is the one that shipped: no question, immediate conviction,
 // today's exact reason string.
 func TestBusyProbeDisabledConvictsImmediately(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
 
-	probes := atomic.Int32{}
-	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-		probes.Add(1)
-		go ackCallback(nil)
-		return true, nil
+		probes := atomic.Int32{}
+		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
+			probes.Add(1)
+			go ackCallback(nil)
+			return true, nil
+		})
+		stallPast(client, stallTimeout)
+
+		// watchdogTestWindow carries zero-value settings: BusyProbe off
+		window := watchdogTestWindow(client, receivingSibling())
+
+		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+		AssertEqual(t, client.IsDone(), true)
+		AssertEqual(t, probes.Load(), int32(0))
+
+		client.stateLock.Lock()
+		endErr := client.endErr
+		client.stateLock.Unlock()
+		AssertEqual(t, endErr.Error(), "send stalled: no ack progress for 20ms")
 	})
-	stallPast(client, stallTimeout)
-
-	// watchdogTestWindow carries zero-value settings: BusyProbe off
-	window := watchdogTestWindow(client, receivingSibling())
-
-	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
-	AssertEqual(t, client.IsDone(), true)
-	AssertEqual(t, probes.Load(), int32(0))
-
-	client.stateLock.Lock()
-	endErr := client.endErr
-	client.stateLock.Unlock()
-	AssertEqual(t, endErr.Error(), "send stalled: no ack progress for 20ms")
 }
 
 // A channel with no probe plumbing under it (a bare fixture, a channel whose
 // client is gone) must fall back to the pre-probe verdict rather than acquit on
 // the absence of a mechanism.
 func TestBusyProbeUnavailableConvictsAsBefore(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
 
-	// no busyProbeSendFunc and no client: sendBusyProbe reports unavailable
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	client := stallTestChannel()
-	client.ctx, client.cancel = context.WithCancel(ctx)
-	stallPast(client, stallTimeout)
+		// no busyProbeSendFunc and no client: sendBusyProbe reports unavailable
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		client := stallTestChannel()
+		client.ctx, client.cancel = context.WithCancel(ctx)
+		stallPast(client, stallTimeout)
 
-	window := busyProbeTestWindow(40*time.Millisecond, client, receivingSibling())
+		window := busyProbeTestWindow(40*time.Millisecond, client, receivingSibling())
 
-	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
-	client.stateLock.Lock()
-	endErr := client.endErr
-	failures := client.busyProbeSendFailures
-	client.stateLock.Unlock()
-	AssertEqual(t, endErr.Error(), "send stalled: no ack progress for 20ms")
-	// absence of the mechanism is not evidence, so it must not be booked as an
-	// unsendable probe
-	AssertEqual(t, failures, 0)
+		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+		client.stateLock.Lock()
+		endErr := client.endErr
+		failures := client.busyProbeSendFailures
+		client.stateLock.Unlock()
+		AssertEqual(t, endErr.Error(), "send stalled: no ack progress for 20ms")
+		// absence of the mechanism is not evidence, so it must not be booked as an
+		// unsendable probe
+		AssertEqual(t, failures, 0)
+	})
 }
 
-// A probe armed before the host was suspended must not convict on wake: neither
-// the exit's answer nor this waiter had a cpu, so the expired budget says
-// nothing. The pause detector grants the SAME probe one fresh budget.
-//
-// Driven with a tolerance of one nanosecond, which every real timer exceeds:
-// the timer fires at the budget plus its own scheduling slop, so the "the wait
-// itself was suspended" branch is taken deterministically. The ack then lands
-// inside the refreshed budget and acquits.
+// Parks the probe after its timer is armed but before it can observe expiry.
+// Only the test owns resume; cancellation still belongs to the wrapped context.
+type busyProbeTestPauseContext struct {
+	context.Context
+	resume <-chan struct{}
+}
+
+// Models a descheduled waiter without depending on real timer lateness.
+func (self *busyProbeTestPauseContext) Done() <-chan struct{} {
+	<-self.resume
+	return self.Context.Done()
+}
+
+// Starts one probe inside the caller's synctest bubble, lets its budget expire
+// while the waiter is parked, then resumes it before any ack can arrive.
+func busyProbeTestPausedProbe(t *testing.T, budget time.Duration, tolerance time.Duration) (*multiClientChannel, <-chan busyProbeVerdict, func(error)) {
+	t.Helper()
+	var ackCallback func(error)
+	client := busyProbeTestChannel(t, func(_ time.Duration, ack func(error)) (bool, error) {
+		ackCallback = ack
+		return true, nil
+	})
+	client.settings.SchedulerPauseTolerance = tolerance
+	resume := make(chan struct{})
+	client.ctx = &busyProbeTestPauseContext{Context: client.ctx, resume: resume}
+	verdicts := make(chan busyProbeVerdict, 1)
+	go func() {
+		verdicts <- client.busyLivenessProbe(budget)
+	}()
+	synctest.Wait()
+	if ackCallback == nil || !client.busyProbeOutstandingNow() {
+		t.Fatal("probe did not arm before the simulated scheduler pause")
+	}
+
+	time.Sleep(budget + budget/2)
+	close(resume)
+	synctest.Wait()
+	return client, verdicts, ackCallback
+}
+
+// A probe armed before a scheduler pause gets one fresh budget. The ack is
+// delivered explicitly inside that budget, after the expired timer was handled.
 func TestBusyProbeSchedulerPauseRefreshesBudget(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
-	budget := 50 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		budget := 50 * time.Millisecond
+		client, verdicts, ackCallback := busyProbeTestPausedProbe(t, budget, 10*time.Millisecond)
+		select {
+		case verdict := <-verdicts:
+			t.Fatalf("suspended probe returned before its refreshed budget: %+v", verdict)
+		default:
+		}
+		if !client.busyProbeOutstandingNow() {
+			t.Fatal("refresh disarmed the unanswered probe")
+		}
 
-	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-		go func() {
-			// past the first budget, inside the refreshed one
-			time.Sleep(75 * time.Millisecond)
-			ackCallback(nil)
-		}()
-		return true, nil
+		time.Sleep(budget / 2)
+		ackTime := time.Now()
+		ackCallback(nil)
+		synctest.Wait()
+		select {
+		case verdict := <-verdicts:
+			if verdict.convict || verdict.detail != "liveness probe answered" {
+				t.Fatalf("ack inside the refreshed budget did not acquit: %+v", verdict)
+			}
+		default:
+			t.Fatal("probe did not finish after its ack")
+		}
+		AssertEqual(t, client.IsDone(), false)
+		AssertEqual(t, client.busyProbeOutstandingNow(), false)
+		client.stateLock.Lock()
+		probeAckTime := client.busyProbeAckTime
+		client.stateLock.Unlock()
+		AssertEqual(t, probeAckTime.Equal(ackTime), true)
 	})
-	client.settings.SchedulerPauseTolerance = 1
-	stallPast(client, stallTimeout)
-
-	window := busyProbeTestWindow(budget, client)
-
-	AssertEqual(t, window.convictSendStalls(stallTimeout), false)
-	AssertEqual(t, client.IsDone(), false)
-
-	client.stateLock.Lock()
-	probeAckTime := client.busyProbeAckTime
-	client.stateLock.Unlock()
-	AssertEqual(t, probeAckTime.IsZero(), false)
 }
 
-// The negative control for the refresh: with the detector off (zero tolerance,
-// the pre-change behavior) the same late ack convicts at the first expiry.
+// With the detector off, the same paused probe returns a conviction at its
+// first expiry. Window admission is tested separately: a sibling stamped once
+// at construction may correctly age out while this waiter is descheduled.
 func TestBusyProbeSchedulerPauseOffConvictsAtTheBudget(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
-	budget := 50 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		budget := 50 * time.Millisecond
+		client, verdicts, ackCallback := busyProbeTestPausedProbe(t, budget, 0)
+		select {
+		case verdict := <-verdicts:
+			if !verdict.convict || verdict.detail != "liveness probe timed out after 50ms" {
+				t.Fatalf("disabled pause detector did not convict at the first expiry: %+v", verdict)
+			}
+		default:
+			t.Fatal("disabled pause detector incorrectly refreshed the expired budget")
+		}
 
-	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-		go func() {
-			time.Sleep(75 * time.Millisecond)
-			ackCallback(nil)
-		}()
-		return true, nil
+		// Late or duplicate callbacks must neither block nor change the
+		// completed probe's decision, and no callback goroutine outlives us.
+		ackCallback(nil)
+		ackCallback(nil)
+		AssertEqual(t, client.busyProbeOutstandingNow(), false)
+		client.stateLock.Lock()
+		probeAckTime := client.busyProbeAckTime
+		client.stateLock.Unlock()
+		AssertEqual(t, probeAckTime.IsZero(), true)
 	})
-	client.settings.SchedulerPauseTolerance = 0
-	stallPast(client, stallTimeout)
+}
 
-	window := busyProbeTestWindow(budget, client, receivingSibling())
+// A construction-to-dispatch delay can age a one-shot sibling proof out during
+// the probe. Hold without refreshing the stall; a fresh receive admits the next
+// pass. This forces the full-suite failure's ordering without predecessor load.
+func TestBusyProbeHoldsWhenSiblingProofExpiresDuringProbe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
+		budget := 50 * time.Millisecond
+		client := busyProbeTestChannel(t, func(_ time.Duration, _ func(error)) (bool, error) {
+			return true, nil
+		})
+		stallPast(client, stallTimeout)
+		sibling := receivingSibling()
+		window := busyProbeTestWindow(budget, client, sibling)
+		client.stateLock.Lock()
+		pendingBefore := client.pendingSendTime
+		client.stateLock.Unlock()
 
-	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
-	AssertEqual(t, client.IsDone(), true)
+		// Construction-to-dispatch delay plus the probe budget now exceeds
+		// the sibling proof's stallTimeout+budget lifetime by one nanosecond.
+		time.Sleep(stallTimeout + time.Nanosecond)
+		AssertEqual(t, sibling.hasRecentReceive(stallTimeout+budget), true)
+		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+		AssertEqual(t, sibling.hasRecentReceive(stallTimeout+budget), false)
+		AssertEqual(t, client.IsDone(), false)
+		AssertEqual(t, client.sendStalled(stallTimeout), true)
+		client.stateLock.Lock()
+		pendingHeld := client.pendingSendTime
+		endErr := client.endErr
+		client.stateLock.Unlock()
+		AssertEqual(t, endErr == nil, true)
+		AssertEqual(t, pendingHeld.Equal(pendingBefore), true)
+
+		sibling.stateLock.Lock()
+		sibling.lastReceiveAckTime = time.Now()
+		sibling.stateLock.Unlock()
+		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+		AssertEqual(t, client.IsDone(), true)
+		client.stateLock.Lock()
+		pendingAfter := client.pendingSendTime
+		client.stateLock.Unlock()
+		AssertEqual(t, pendingAfter.Equal(pendingBefore), true)
+	})
 }
 
 // An ack callback that reports an error is a failed question, not an answer:
 // the send sequence gave up carrying the ping. It convicts, named distinctly
 // from a plain timeout.
 func TestBusyProbeAckErrorConvicts(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
 
-	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-		go ackCallback(errors.New("sequence closed"))
-		return true, nil
+		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
+			go ackCallback(errors.New("sequence closed"))
+			return true, nil
+		})
+		stallPast(client, stallTimeout)
+
+		window := busyProbeTestWindow(500*time.Millisecond, client, receivingSibling())
+
+		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+		client.stateLock.Lock()
+		endErr := client.endErr
+		client.stateLock.Unlock()
+		if !strings.Contains(endErr.Error(), "liveness probe failed") {
+			t.Errorf("the reason does not name the probe outcome: %q", endErr.Error())
+		}
+		AssertEqual(t, blackholeVerdictErr(endErr), false)
 	})
-	stallPast(client, stallTimeout)
-
-	window := busyProbeTestWindow(500*time.Millisecond, client, receivingSibling())
-
-	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
-	client.stateLock.Lock()
-	endErr := client.endErr
-	client.stateLock.Unlock()
-	if !strings.Contains(endErr.Error(), "liveness probe failed") {
-		t.Errorf("the reason does not name the probe outcome: %q", endErr.Error())
-	}
-	AssertEqual(t, blackholeVerdictErr(endErr), false)
 }
 
 // The probe budget derivation: 0 means max(1s, bar/2), so the shipped 3s bar
@@ -456,27 +571,29 @@ func TestBusyProbeUsesTheControlPingPlumbing(t *testing.T) {
 // and the last probe ack, so an acquitted exit gets a full fresh bar without
 // anything forging a send ack.
 func TestBusyProbeAckRefreshesTheStallBarOnly(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
-	client := stallTestChannel()
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
+		client := stallTestChannel()
 
-	client.addSend(1440, udpTestPath(4))
-	time.Sleep(stallTimeout + 30*time.Millisecond)
-	AssertEqual(t, client.sendStalled(stallTimeout), true)
+		client.addSend(1440, udpTestPath(4))
+		time.Sleep(stallTimeout + 30*time.Millisecond)
+		AssertEqual(t, client.sendStalled(stallTimeout), true)
 
-	client.addBusyProbeAck()
+		client.addBusyProbeAck()
 
-	// refreshed
-	AssertEqual(t, client.sendStalled(stallTimeout), false)
-	// the send is still outstanding and its clock still records when it began
-	client.stateLock.Lock()
-	AssertEqual(t, client.packetStats.sendNackCount, 1)
-	AssertEqual(t, client.pendingSendTime.IsZero(), false)
-	AssertEqual(t, stallTimeout <= time.Since(client.pendingSendTime), true)
-	client.stateLock.Unlock()
+		// refreshed
+		AssertEqual(t, client.sendStalled(stallTimeout), false)
+		// the send is still outstanding and its clock still records when it began
+		client.stateLock.Lock()
+		AssertEqual(t, client.packetStats.sendNackCount, 1)
+		AssertEqual(t, client.pendingSendTime.IsZero(), false)
+		AssertEqual(t, stallTimeout <= time.Since(client.pendingSendTime), true)
+		client.stateLock.Unlock()
 
-	// and only for one bar: a still-dead exit convicts on the next round
-	time.Sleep(stallTimeout + 30*time.Millisecond)
-	AssertEqual(t, client.sendStalled(stallTimeout), true)
+		// and only for one bar: a still-dead exit convicts on the next round
+		time.Sleep(stallTimeout + 30*time.Millisecond)
+		AssertEqual(t, client.sendStalled(stallTimeout), true)
+	})
 }
 
 // The shipped defaults, and the override round trip. A knob dropped by

@@ -1,0 +1,22 @@
+{
+  "executions": 3,
+  "failed_executions": 1,
+  "passed_executions": 2,
+  "raw_log_sha256": "0b447d0d5aa353a309dad5e4eb5d9defb3d91c573035dae3de248c39a1e293a3",
+  "run": {
+    "end_utc": "2026-09-16T01:32:34.820268+00:00",
+    "environment": {},
+    "exit_code": 1,
+    "load_average": [
+      17.47900390625,
+      21.3232421875,
+      20.05322265625
+    ],
+    "log_sha256": "0b447d0d5aa353a309dad5e4eb5d9defb3d91c573035dae3de248c39a1e293a3",
+    "name": "sdk-provider-duplex-after",
+    "start_utc": "2026-09-16T01:32:25.707000+00:00"
+  },
+  "schema": "throughput-fix-2/source-idle-followup-sdk-duplex-v1",
+  "status": "Unresolved SDK reverse-direction gate failure; 1/3 executions failed after source-idle fix.",
+  "test": "TestWindowPathSdkProviderDuplexProbe"
+}

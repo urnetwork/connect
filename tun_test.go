@@ -3,9 +3,12 @@ package connect
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -19,6 +22,110 @@ import (
 
 type trackedTunDialConn struct {
 	closed atomic.Bool
+}
+
+// uncomparableTunTestContext catches interface equality on arbitrary Context
+// implementations; its slice deliberately makes the dynamic value uncomparable.
+type uncomparableTunTestContext struct {
+	context.Context
+	marker []byte
+}
+
+func TestTunDialCtxJoinsCallerAndLifecycleCancellation(t *testing.T) {
+	tunCtx, tunCancel := context.WithCancel(context.Background())
+	tun := &Tun{ctx: tunCtx}
+
+	callerCtx, callerCancel := context.WithCancel(context.Background())
+	linkedCtx, cleanup := tun.dialCtx(callerCtx)
+	callerCancel()
+	select {
+	case <-linkedCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("caller cancellation did not reach linked dial context")
+	}
+	cleanup()
+
+	callerCtx, callerCancel = context.WithCancel(context.Background())
+	linkedCtx, cleanup = tun.dialCtx(callerCtx)
+	cleanup()
+	if !errors.Is(linkedCtx.Err(), context.Canceled) {
+		t.Fatalf("cleanup left linked dial context active: %v", linkedCtx.Err())
+	}
+	if callerCtx.Err() != nil {
+		t.Fatalf("cleanup canceled caller context: %v", callerCtx.Err())
+	}
+	callerCancel()
+
+	callerCtx, callerCancel = context.WithCancel(context.Background())
+	linkedCtx, cleanup = tun.dialCtx(callerCtx)
+	tunCancel()
+	select {
+	case <-linkedCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("tun lifecycle cancellation did not reach linked dial context")
+	}
+	cleanup()
+	callerCancel()
+}
+
+func TestTunDialCtxHandlesAlreadyCanceledAndSharedContexts(t *testing.T) {
+	tunCtx, tunCancel := context.WithCancel(context.Background())
+	defer tunCancel()
+	tun := &Tun{ctx: tunCtx}
+
+	canceledCtx, canceledCtxCancel := context.WithCancel(context.Background())
+	canceledCtxCancel()
+	linkedCtx, cleanup := tun.dialCtx(canceledCtx)
+	defer cleanup()
+	if !errors.Is(linkedCtx.Err(), context.Canceled) {
+		t.Fatalf("already-canceled caller returned active dial context: %v", linkedCtx.Err())
+	}
+
+	sharedCtx, sharedCleanup := tun.dialCtx(tunCtx)
+	sharedCleanup()
+	if tunCtx.Err() != nil {
+		t.Fatalf("shared-context cleanup canceled tun lifecycle: %v", tunCtx.Err())
+	}
+	if !errors.Is(sharedCtx.Err(), context.Canceled) {
+		t.Fatalf("shared-context cleanup left derived dial active: %v", sharedCtx.Err())
+	}
+
+	uncomparableCtx := uncomparableTunTestContext{Context: context.Background(), marker: []byte{1}}
+	uncomparableTun := &Tun{ctx: uncomparableCtx}
+	uncomparableLinkedCtx, uncomparableCleanup := uncomparableTun.dialCtx(uncomparableCtx)
+	uncomparableCleanup()
+	if !errors.Is(uncomparableLinkedCtx.Err(), context.Canceled) {
+		t.Fatalf("uncomparable context cleanup left derived dial active: %v", uncomparableLinkedCtx.Err())
+	}
+}
+
+func TestTunDialCtxDoesNotParkOneGoroutinePerLiveCaller(t *testing.T) {
+	tunCtx, tunCancel := context.WithCancel(context.Background())
+	defer tunCancel()
+	tun := &Tun{ctx: tunCtx}
+	baselineGoroutines := runtime.NumGoroutine()
+	const callerCount = 256
+	callerCancels := make([]context.CancelFunc, 0, callerCount)
+	cleanups := make([]context.CancelFunc, 0, callerCount)
+	for range callerCount {
+		callerCtx, callerCancel := context.WithCancel(context.Background())
+		linkedCtx, cleanup := tun.dialCtx(callerCtx)
+		if linkedCtx.Err() != nil {
+			t.Fatalf("live caller produced canceled dial context: %v", linkedCtx.Err())
+		}
+		callerCancels = append(callerCancels, callerCancel)
+		cleanups = append(cleanups, cleanup)
+	}
+	runtime.Gosched()
+	if delta := runtime.NumGoroutine() - baselineGoroutines; 16 < delta {
+		t.Fatalf("%d live dial contexts parked %d goroutines", callerCount, delta)
+	}
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
+	for _, callerCancel := range callerCancels {
+		callerCancel()
+	}
 }
 
 // newTunTcpInboundTestPacket builds the minimum packet shape needed to test
@@ -81,6 +188,123 @@ func TestTunTcpInboundShardHandoffCadenceIsBounded(t *testing.T) {
 	}
 }
 
+// Raw Write clears finite-burst producer metadata before returning while
+// retaining its packet counter. One P makes this a synchronous bookkeeping
+// assertion; established-endpoint delivery is covered separately.
+func TestTunWriteCompletesFiniteTcpInboundHandoffBeforeReturn(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	runtime.LockOSThread()
+	defer func() {
+		runtime.UnlockOSThread()
+		runtime.GOMAXPROCS(previousProcs)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Close()
+
+	packet := newTunTcpInboundTestPacket(40000, 443)
+	_, shardIndex, ok := tcpInboundFlow(packet)
+	if !ok {
+		t.Fatal("test packet was not classified as TCP")
+	}
+	if _, err := tun.Write(packet); err != nil {
+		t.Fatalf("write finite TCP return: %v", err)
+	}
+
+	shard := &tun.tcpInboundShards[shardIndex]
+	shard.writeLock.Lock()
+	packetCount := shard.packetCount
+	endpointCount := shard.endpointCount
+	shard.writeLock.Unlock()
+	if packetCount != 1 || endpointCount != 0 {
+		t.Fatalf(
+			"Write returned before finite TCP handoff: packet_count=%d endpoint_count=%d, want 1/0",
+			packetCount,
+			endpointCount,
+		)
+	}
+}
+
+// Clearing finite-burst metadata must not erase the bounded scheduler-yield
+// cadence shared by consecutive one-packet callbacks on the same flow.
+func TestTunWriteRetainsTcpInboundYieldCadence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Close()
+
+	packet := newTunTcpInboundTestPacket(40000, 443)
+	_, shardIndex, ok := tcpInboundFlow(packet)
+	if !ok {
+		t.Fatal("test packet was not classified as TCP")
+	}
+	for packetIndex := 1; packetIndex <= tunTcpInboundBurstPacketCount; packetIndex += 1 {
+		if _, err := tun.Write(packet); err != nil {
+			t.Fatalf("write packet %d: %v", packetIndex, err)
+		}
+		shard := &tun.tcpInboundShards[shardIndex]
+		shard.writeLock.Lock()
+		packetCount := shard.packetCount
+		endpointCount := shard.endpointCount
+		shard.writeLock.Unlock()
+		wantPacketCount := uint32(packetIndex % tunTcpInboundBurstPacketCount)
+		if packetCount != wantPacketCount || endpointCount != 0 {
+			t.Fatalf(
+				"packet %d cadence/handoff=%d/%d, want %d/0",
+				packetIndex,
+				packetCount,
+				endpointCount,
+				wantPacketCount,
+			)
+		}
+	}
+}
+
+// WriteBatch may end below the producer quantum on several shards. This
+// counter assertion verifies every touched shard is cleared before return;
+// established-endpoint delivery is covered separately.
+func TestTunWriteBatchFinishesEveryTcpInboundHandoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Close()
+
+	packets := [][]byte{
+		newTunTcpInboundTestPacket(40000, 443),
+		newTunTcpInboundTestPacket(40001, 443),
+		newTunTcpInboundTestPacket(40002, 443),
+	}
+	if _, err := tun.WriteBatch(packets); err != nil {
+		t.Fatalf("write finite TCP return batch: %v", err)
+	}
+	for shardIndex := range tun.tcpInboundShards {
+		shard := &tun.tcpInboundShards[shardIndex]
+		shard.writeLock.Lock()
+		packetCount := shard.packetCount
+		endpointCount := shard.endpointCount
+		shard.writeLock.Unlock()
+		if packetCount != 0 || endpointCount != 0 {
+			t.Fatalf(
+				"batch left shard %d unsynchronized: packet_count=%d endpoint_count=%d",
+				shardIndex,
+				packetCount,
+				endpointCount,
+			)
+		}
+	}
+}
+
 func TestTunWriteReleasesInjectedPacketBufferReference(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -114,7 +338,9 @@ func TestTunWriteReleasesUnsupportedPacketBufferReference(t *testing.T) {
 	defer tun.Close()
 
 	released := make(chan struct{})
-	if n, writeErr := tun.write([]byte{0x60}, func() { close(released) }); writeErr != syscall.EAFNOSUPPORT || n != 0 {
+	// version 7 is carried by no stack; a v6 packet is covered by the
+	// dual-stack tests, where its acceptance depends on the link mtu
+	if n, writeErr := tun.write([]byte{0x70}, func() { close(released) }); writeErr != syscall.EAFNOSUPPORT || n != 0 {
 		t.Fatalf("unsupported write = %d, %v; want 0, %v", n, writeErr, syscall.EAFNOSUPPORT)
 	}
 	select {
@@ -127,6 +353,19 @@ func TestTunWriteReleasesUnsupportedPacketBufferReference(t *testing.T) {
 type tunLinkWriteResult struct {
 	n   int
 	err tcpip.Error
+}
+
+// Observes the full-queue wait without depending on how soon its writer runs.
+type tunLinkWaitContext struct {
+	context.Context
+	waiting chan struct{}
+	once    sync.Once
+}
+
+// Signals only after the endpoint has tried and failed to enqueue its packet.
+func (self *tunLinkWaitContext) Done() <-chan struct{} {
+	self.once.Do(func() { close(self.waiting) })
+	return self.Context.Done()
 }
 
 func newTunLinkTestPacket(marker byte) *stack.PacketBuffer {
@@ -145,7 +384,9 @@ func writeTunLinkPacket(endpoint *tunLinkEndpoint, packet *stack.PacketBuffer) t
 func TestTunOutboundQueueBackpressuresInsteadOfDropping(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	tun, err := CreateTun(ctx, DefaultTunSettingsWithBufferSize(1))
+	settings := DefaultTunSettingsWithBufferSize(1)
+	settings.OutboundQueueWaitTimeout = 0
+	tun, err := CreateTun(ctx, settings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,17 +400,16 @@ func TestTunOutboundQueueBackpressuresInsteadOfDropping(t *testing.T) {
 
 	secondPacket := newTunLinkTestPacket(2)
 	defer secondPacket.DecRef()
-	started := make(chan struct{})
+	waiting := make(chan struct{})
+	tun.ep.ctx = &tunLinkWaitContext{Context: tun.ctx, waiting: waiting}
 	done := make(chan tunLinkWriteResult, 1)
 	go func() {
-		close(started)
 		done <- writeTunLinkPacket(tun.ep, secondPacket)
 	}()
-	<-started
 	select {
-	case result := <-done:
-		t.Fatalf("full outbound queue dropped write immediately: %d, %v", result.n, result.err)
-	case <-time.After(20 * time.Millisecond):
+	case <-waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer did not reach the full outbound queue")
 	}
 
 	firstRead, readErr := tun.Read()
@@ -195,7 +435,9 @@ func TestTunOutboundQueueBackpressuresInsteadOfDropping(t *testing.T) {
 func TestTunCloseUnblocksOutboundQueueBackpressure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	tun, err := CreateTun(ctx, DefaultTunSettingsWithBufferSize(1))
+	settings := DefaultTunSettingsWithBufferSize(1)
+	settings.OutboundQueueWaitTimeout = 0
+	tun, err := CreateTun(ctx, settings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,17 +451,16 @@ func TestTunCloseUnblocksOutboundQueueBackpressure(t *testing.T) {
 
 	secondPacket := newTunLinkTestPacket(2)
 	defer secondPacket.DecRef()
-	started := make(chan struct{})
+	waiting := make(chan struct{})
+	tun.ep.ctx = &tunLinkWaitContext{Context: tun.ctx, waiting: waiting}
 	done := make(chan tunLinkWriteResult, 1)
 	go func() {
-		close(started)
 		done <- writeTunLinkPacket(tun.ep, secondPacket)
 	}()
-	<-started
 	select {
-	case result := <-done:
-		t.Fatalf("full outbound queue dropped write immediately: %d, %v", result.n, result.err)
-	case <-time.After(20 * time.Millisecond):
+	case <-waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer did not reach the full outbound queue")
 	}
 
 	if closeErr := tun.Close(); closeErr != nil {
@@ -469,16 +710,22 @@ func TestTunDialRaceUsesOneAbsoluteTimeout(t *testing.T) {
 }
 
 func TestTunTCPBridge(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testTunTCPBridge(t, ipVersion)
+	})
+}
+
+func testTunTCPBridge(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	left, err := CreateTunWithDefaults(ctx)
+	left, err := CreateTun(ctx, tunTestSettings(ipVersion))
 	if err != nil {
 		t.Fatalf("create left tun: %v", err)
 	}
 	defer left.Close()
 
-	right, err := CreateTunWithDefaults(ctx)
+	right, err := CreateTun(ctx, tunTestSettings(ipVersion))
 	if err != nil {
 		t.Fatalf("create right tun: %v", err)
 	}
@@ -487,7 +734,7 @@ func TestTunTCPBridge(t *testing.T) {
 	bridgeTun(ctx, left, right)
 	bridgeTun(ctx, right, left)
 
-	rightIP := net.IP(right.localAddresses[0].AsSlice())
+	rightIP := net.IP(tunTestLocalAddress(t, right, ipVersion).AsSlice())
 	ln, err := right.ListenTCP(&net.TCPAddr{IP: rightIP, Port: 0})
 	if err != nil {
 		t.Fatalf("listen tcp: %v", err)
@@ -591,22 +838,28 @@ func bridgeTunBatch(ctx context.Context, dst *Tun, src *Tun) {
 // head-of-line-blocks the tun receive loop (e.g. holding a lock across a blocking
 // enqueue) collapses this number.
 func TestTunTCPThroughput(t *testing.T) {
-	// generous overall cap: the transfer is measured several times (below), and
-	// each run's stalls are independently bounded by per-chunk 55s deadlines.
-	// The cap only backstops a true hang; slow-but-progressing runs on a
-	// loaded -race host stay inside it.
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testTunTCPThroughput(t, ipVersion)
+	})
+}
+
+func testTunTCPThroughput(t *testing.T, ipVersion int) {
+	// Generous overall cap: the transfer is measured several times (below), and
+	// each read/write phase is independently bounded by a 55s progress window.
+	// Every operation is also capped by this absolute deadline, so a loaded host
+	// may slow an attempt but cannot extend the complete test past the cap.
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
 	// size the ring buffers well above the default (32) so the bridge can keep
 	// the pipe full under load, the way the proxy sizes its tun.
-	left, err := CreateTun(ctx, DefaultTunSettingsWithBufferSize(2048))
+	left, err := CreateTun(ctx, tunTestApplyIpVersion(DefaultTunSettingsWithBufferSize(2048), ipVersion))
 	if err != nil {
 		t.Fatalf("create left tun: %v", err)
 	}
 	defer left.Close()
 
-	right, err := CreateTun(ctx, DefaultTunSettingsWithBufferSize(2048))
+	right, err := CreateTun(ctx, tunTestApplyIpVersion(DefaultTunSettingsWithBufferSize(2048), ipVersion))
 	if err != nil {
 		t.Fatalf("create right tun: %v", err)
 	}
@@ -616,18 +869,24 @@ func TestTunTCPThroughput(t *testing.T) {
 	bridgeTunBatch(ctx, left, right)
 	bridgeTunBatch(ctx, right, left)
 
-	rightIP := net.IP(right.localAddresses[0].AsSlice())
+	rightIP := net.IP(tunTestLocalAddress(t, right, ipVersion).AsSlice())
 
-	// full speed moves ~300 MiB/s; under -race the gvisor stack runs ~250x slower
-	// (~1 MiB/s). Scale the transfer down under -race so it still streams enough
-	// bytes to catch a stall / head-of-line-block regression while keeping the
-	// test duration bounded; drop the floor to a value that only a genuine stall
-	// (~0) falls under. The per-chunk deadlines below bound a stall, not the
-	// transfer wall clock, so a loaded host slows an attempt without failing it.
+	// full speed moves ~300 MiB/s; under -race the gvisor stack runs ~2000x
+	// slower. Measured on darwin/arm64: 7-9.5s per MiB, unloaded or under full
+	// suite load, on both families. Scale the transfer down under -race so it
+	// still streams enough bytes to catch a stall / head-of-line-block
+	// regression while keeping the test duration bounded; drop the floor to a
+	// value that only a genuine stall (~0) falls under. The per-chunk deadlines
+	// below bound a stall, not the transfer wall clock, so a loaded host slows
+	// an attempt without failing it.
 	totalBytes := int64(128) << 20 // 128 MiB
 	minThroughputMiBs := 1.0       // conservative floor; a stall is ~0
 	if raceEnabled {
-		totalBytes = int64(16) << 20 // 16 MiB (~13s under -race unloaded)
+		// 8 MiB is ~60-75s per attempt at the measured rate, so all
+		// throughputRuns attempts fit the 300s per-family budget with margin.
+		// 16 MiB did not: three attempts needed 336-456s and only two ever ran,
+		// which is why the deadline fell between attempts at all.
+		totalBytes = int64(8) << 20
 		minThroughputMiBs = 0.1
 	}
 	// measure several times and take the max, to ride out host scheduling noise
@@ -643,6 +902,10 @@ func TestTunTCPThroughput(t *testing.T) {
 	// throughputRuns independent attempts, so one slow or broken attempt is
 	// ridden out instead of failing the test early.
 	runTransfer := func() (mibs float64, runErr error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
 		// a panic in the gvisor stack under load fails only this attempt.
 		defer func() {
 			if r := recover(); r != nil {
@@ -672,17 +935,15 @@ func TestTunTCPThroughput(t *testing.T) {
 				return
 			}
 			defer conn.Close()
-			// drain exactly totalBytes, so neither side needs a half-close.
-			// The deadline is refreshed per bounded step so it bounds a
-			// stall in the stack, not the whole transfer: under -race plus
-			// host load the full stream legitimately outlasts any single
-			// fixed deadline while still making progress.
+			// Drain exactly totalBytes, so neither side needs a half-close.
+			// Each bounded read gets a fresh progress window without exceeding
+			// the test's absolute deadline.
 			received := int64(0)
+			readBuffer := make([]byte, 1024*1024)
 			for received < totalBytes {
-				_ = conn.SetReadDeadline(time.Now().Add(55 * time.Second))
 				step := min(totalBytes-received, int64(1024*1024))
-				n, err := io.CopyN(io.Discard, conn, step)
-				received += n
+				n, err := readFullWithProgressDeadline(ctx, conn, readBuffer[:int(step)], 55*time.Second)
+				received += int64(n)
 				if err != nil {
 					recvErr <- err
 					return
@@ -706,14 +967,12 @@ func TestTunTCPThroughput(t *testing.T) {
 			if remaining := totalBytes - written; remaining < int64(len(chunk)) {
 				chunk = payload[:remaining]
 			}
-			// per-chunk deadline: bounds a stalled pipe without capping the
-			// whole transfer's wall clock (see the receiver note above)
-			_ = conn.SetWriteDeadline(time.Now().Add(55 * time.Second))
-			n, err := conn.Write(chunk)
-			if err != nil {
+			// Each chunk gets a progress window capped by the absolute test
+			// deadline; the helper checks cancellation before any socket write.
+			if err := writeConnPhaseWithDeadline(ctx, conn, chunk, 55*time.Second); err != nil {
 				return 0, fmt.Errorf("write through tun after %d bytes: %w", written, err)
 			}
-			written += int64(n)
+			written += int64(len(chunk))
 		}
 
 		select {
@@ -736,6 +995,19 @@ func TestTunTCPThroughput(t *testing.T) {
 	best := 0.0
 	failures := 0
 	for i := range throughputRuns {
+		if err := ctx.Err(); err != nil {
+			// The budget is spent. An attempt that runs out of time INSIDE
+			// runTransfer returns an error and is ridden out, so expiring
+			// between attempts must not be fatal either once an earlier
+			// attempt has measured the pipe -- the floor is judged against the
+			// best of the attempts that completed, and discarding a good
+			// measurement here made the verdict depend on nothing but whether
+			// the deadline landed inside an attempt or between two.
+			if 0 < best {
+				break
+			}
+			t.Fatalf("throughput deadline before run %d/%d: %v", i+1, throughputRuns, err)
+		}
 		mibs, err := runTransfer()
 		if err != nil {
 			failures++

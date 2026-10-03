@@ -1,0 +1,9 @@
+{
+  "archive": "window-retention-reporting",
+  "payload_sha256": {
+    "outcomes.jsonl": "663909383f1dc16fa30b9b4f1fb738f06d8ded6186c69ff3f48e988293229b46",
+    "provenance.json": "4106651cabb7d81e87afab924af3cfeeb844a38b75cd84a605a3198005005578",
+    "source-pins.json": "dd1873231dcccbedfbfe0a98bc3cc78712fd5d43119e3388b11d06a84c4b1fe1",
+    "status.json": "e95cf5d541cf0ea2b6262eb6c93f83acef1893796facd371d21cb05376b0678f"
+  }
+}

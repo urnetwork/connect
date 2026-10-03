@@ -1,0 +1,6 @@
+{
+  "classification": "Full nonrace model: 28 passes, two failures (changing receive window and SDK bidirectional); RTT-growth passes. Separate from the six-gate pass on this same binary.",
+  "outcomes": 30,
+  "readings": 824,
+  "worker_readings": 0
+}

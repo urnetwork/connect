@@ -1,0 +1,11 @@
+{
+  "archive": "correctness-receiver-service-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "7c4103183df4016fe4af1de98dcf5818653b6c2c24246a908f970a004c077f56",
+    "outcomes.jsonl": "7aad8037bae62eeef54ab9bc16c12f88a9f75529203d4347550cf0457717a8c6",
+    "provenance.json": "9a264a57bdecae54ced963c21c02c420b3c9b89235679765383d15e879e94069",
+    "source-pins.json": "755b11b7e5c7f3781ef7abbf5fd86f8ae45e704552a660be9b2909696d9371ba",
+    "status.json": "4954efe4b642dfb3f9e4e229d21c4fb8927c5963a8f9066dd0a8737e0e3c5ccb",
+    "worker-readings.jsonl": "db7900dae39a352bc7f887505f8fa1ce9dffc94d74c46469cb621a6f0a2b1d7e"
+  }
+}

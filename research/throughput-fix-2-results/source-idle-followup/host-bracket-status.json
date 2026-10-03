@@ -1,0 +1,65 @@
+{
+  "after": {
+    "comparison_outcome": "pass",
+    "intervals": 48,
+    "readings": 4,
+    "run": {
+      "end_utc": "2026-09-16T01:31:46.975749+00:00",
+      "environment": {
+        "CONNECT_WINDOW_DIAGNOSTIC_WINDOW_RTT_US": "1300",
+        "CONNECT_WINDOW_INNER_TCP_TRACE": "1",
+        "CONNECT_WINDOW_PATH_ACK_MS": "10",
+        "CONNECT_WINDOW_PATH_ARMS": "matched,ceiling,delivery,matched",
+        "CONNECT_WINDOW_PATH_FLOWS": "1",
+        "CONNECT_WINDOW_PATH_REPETITIONS": "1",
+        "CONNECT_WINDOW_PATH_RTT_US": "300",
+        "CONNECT_WINDOW_PATH_SECONDS": "12",
+        "CONNECT_WINDOW_TCP_MEASURE": "1",
+        "CONNECT_WINDOW_TCP_REVERSE_DELAY_AFTER_MS": "5000",
+        "CONNECT_WINDOW_TCP_REVERSE_DELAY_MS": "80"
+      },
+      "exit_code": 0,
+      "instrumentation": "Transfer pacing trace disabled; retained read-only TUN/NAT100ms trace enabled.",
+      "load_average": [
+        19.59619140625,
+        23.0693359375,
+        20.46484375
+      ],
+      "log_sha256": "26ce01c017a770a889aa1b55c7d9831898a621921b22247e4d44f3b1460f2942",
+      "name": "combined-after-bracket",
+      "start_utc": "2026-09-16T01:30:48.910157+00:00"
+    }
+  },
+  "before": {
+    "comparison_outcome": "pass",
+    "intervals": 48,
+    "readings": 4,
+    "run": {
+      "end_utc": "2026-09-16T01:30:48.909053+00:00",
+      "environment": {
+        "CONNECT_WINDOW_DIAGNOSTIC_WINDOW_RTT_US": "1300",
+        "CONNECT_WINDOW_INNER_TCP_TRACE": "1",
+        "CONNECT_WINDOW_PATH_ACK_MS": "10",
+        "CONNECT_WINDOW_PATH_ARMS": "matched,ceiling,delivery,matched",
+        "CONNECT_WINDOW_PATH_FLOWS": "1",
+        "CONNECT_WINDOW_PATH_REPETITIONS": "1",
+        "CONNECT_WINDOW_PATH_RTT_US": "300",
+        "CONNECT_WINDOW_PATH_SECONDS": "12",
+        "CONNECT_WINDOW_TCP_MEASURE": "1",
+        "CONNECT_WINDOW_TCP_REVERSE_DELAY_AFTER_MS": "5000",
+        "CONNECT_WINDOW_TCP_REVERSE_DELAY_MS": "80"
+      },
+      "exit_code": 0,
+      "instrumentation": "Transfer pacing trace disabled; retained read-only TUN/NAT100ms trace enabled.",
+      "load_average": [
+        30.1640625,
+        25.07080078125,
+        20.92578125
+      ],
+      "log_sha256": "5654ca1e034412bed6b2560f3255fc48987219f7420df895575d39945ab65146",
+      "name": "combined-before-bracket",
+      "start_utc": "2026-09-16T01:29:50.823670+00:00"
+    }
+  },
+  "schema": "throughput-fix-2/source-idle-followup-host-brackets-v1"
+}

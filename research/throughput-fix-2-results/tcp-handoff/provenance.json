@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-upload-handoff-fixed.log",
+  "source_log_sha256": "2e2c85cb4a4728e8f6f3322b73a359d03ab1407261d9302115390916acdbbae8",
+  "note": "Pure-ACK handoff fixed, but per-packet NAT fixture still caused admission loss.",
+  "rows": 5,
+  "final": false,
+  "outcome": "failed"
+}

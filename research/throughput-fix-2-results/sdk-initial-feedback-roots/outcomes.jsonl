@@ -1,0 +1,7 @@
+{"outcome": "FAIL", "seconds": "31.51s", "test": "TestWindowPathSdkConstrainedInitialFeedback", "variant": "enforced-one-lane-205ms-root-and-220ms-control"}
+{"outcome": "PASS", "seconds": "49.03s", "test": "TestWindowPathSdkConstrainedLaterFeedbackControl", "variant": "enforced-one-lane-205ms-root-and-220ms-control"}
+{"outcome": "PASS", "seconds": "42.51s", "test": "TestWindowPathSdkConstrainedInitialFeedback", "variant": "enforced-one-lane-205ms-root-and-220ms-control"}
+{"outcome": "PASS", "seconds": "46.94s", "test": "TestWindowPathSdkConstrainedLaterFeedbackControl", "variant": "enforced-one-lane-205ms-root-and-220ms-control"}
+{"outcome": "FAIL", "seconds": "31.51s", "test": "TestWindowPathSdkConstrainedInitialFeedback", "variant": "enforced-one-lane-205ms-root-and-220ms-control"}
+{"outcome": "PASS", "seconds": "45.40s", "test": "TestWindowPathSdkConstrainedLaterFeedbackControl", "variant": "enforced-one-lane-205ms-root-and-220ms-control"}
+{"outcome": "PASS", "seconds": "37.99s", "test": "TestWindowPathSdkDuplexRecoversAfterInitialFeedbackBarrier", "variant": "eight-lane-initial-feedback-control"}

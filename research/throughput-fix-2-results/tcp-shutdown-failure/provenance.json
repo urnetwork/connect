@@ -1,0 +1,8 @@
+{
+  "source_log": "run.log",
+  "source_log_sha256": "cd5af1fcf4087c15298267431620936487958af67ce1b770c5719b1942587cdc",
+  "note": "All 64 arms completed, but upload teardown leaked 123 pooled roots. This is a failed validation run, before queue-close/drain fix and adaptive pacing.",
+  "rows": 80,
+  "final": false,
+  "outcome": "failed"
+}

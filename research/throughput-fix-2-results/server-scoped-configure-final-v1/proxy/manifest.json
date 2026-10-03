@@ -1,0 +1,134 @@
+{
+  "created_utc": "2026-09-17T01:36:23.267779+00:00",
+  "mode": "server-proxy",
+  "test_pattern": "^(TestDrainCoordinatorCompletesWhenIdle|TestDrainCoordinatorDisabled|TestDrainCoordinatorGraceDeadline|TestProxyConnectionMetricsPreserveDirectionalBytesAndCloseOnce|TestProxyDeviceManagerCloseAndWaitJoinsOwnedNetworkSpace|TestProxyDeviceManagerCloseJoinsAdmittedOpenAndRejectsLateOpen|TestProxyDeviceManagerPreservesInjectedNetworkSpace|TestProxyDeviceManagerRetainsRetryingDeviceAcrossWindowLoss|TestProxyDeviceManagerSharesOneNetworkSpaceLifetime|TestProxyDeviceMemoryBudgetDisabled|TestProxyDeviceMemoryBudgetKeepsThePerDeviceTarget|TestProxyDeviceMemoryBudgetNeverExceedsTheAggregate|TestProxyDeviceMemoryBudgetRefusesWithoutConstructing|TestProxyDeviceMemoryBudgetReleasedOnConstructionFailure|TestProxyDeviceMemoryBudgetReleasedOnDeviceClose|TestProxyDeviceSendBorrowedBatchCopiesBeforeReturn|TestProxyDeviceSendBorrowedBatchReturnsRejectedCopies|TestProxyDeviceTunDialDoesNotStealWireGuardReturn|TestProxyDeviceWireGuardReturnWaitsForQueueCapacity|TestProxyIngressCollectorExportsCompleteBoundedLibrarySnapshots|TestProxyLifecycleJoinCapabilityMetric|TestProxySessionDurationSummaryExportsExactSumCountWithoutBuckets|TestProxySessionMaximumResetsAtIntervalBoundary|TestWgClientStackCloseAndWaitJoinsTCPDispatcher|TestWindowIdentityRestoreGateJoinsConcurrentReleaseWrite|TestWindowIdentityRestoreGateKeepsNewestDeviceGeneration|TestWindowIdentityRestoreGateProtectsLazyOpen|TestWireGuardPacketMetricsCountPayloadAfterOffset)$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "f903f59a96e629f8b1dfa5849d7a3198aaef9920",
+    "branch": "throughput-fix-2",
+    "source_sha256": "a36793a9871306b3acbb87e2f0ddeb1d79cecaebf26c795c518acdf1ae27c04b",
+    "dirty": true
+  },
+  "package": "./proxy",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "80565912ce0e724922397cf6c8be6bc713bf9fb69cb1abaa4daf3c4f185ac524",
+  "benchmark_ledger_parser_sha256": "566ed53eb6762d5daea23b5dac1492d279c25c1e8fbee9b6d52c0ffda1fb9585",
+  "host_load_average_at_start": [
+    13.25146484375,
+    9.82861328125,
+    8.74365234375
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CGO_ENABLED": "0"
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "server": {
+    "revision": "8ebcf6b0f76dc988fa1b0b62f34215d3c4f4d708",
+    "branch": "main",
+    "source_sha256": "7f4a4a85cf3b3063547cda485eb9413a4d165a9a57d2bd0e049de837a2ef1026",
+    "dirty": false
+  },
+  "server_test_environment_source": "/Users/brien/urnetwork/server/test-env.sh",
+  "server_test_environment": {
+    "WARP_ENV": "local",
+    "WARP_SERVICE": "test",
+    "WARP_DOMAIN": "bringyour.com",
+    "WARP_BLOCK": "test",
+    "WARP_VERSION": "0.0.0",
+    "WARP_VAULT_HOME": "/Users/brien/urnetwork/vault",
+    "WARP_CONFIG_HOME": "/Users/brien/urnetwork/config"
+  },
+  "server_test_environment_scope": {
+    "scope": "configuration only for audited non-database tests",
+    "mode": "server-proxy",
+    "race_instrumented": false,
+    "configuration_function": "test_env_configure",
+    "environment_source": "/Users/brien/urnetwork/server/test-env.sh",
+    "environment_sha256": "317b889ff56b6639a94f8b3cf3af3ef3dca88bac9ebf8cdd8b939557cac95ded",
+    "launcher_helper_sha256": "7c93f5c17eb91ba18e545bc30dc621d3791354e366bee79dc689988b52355700",
+    "generated_configuration_sha256": "88e44acf15cb05ba630d83957665b68c26919504a50a3cd5386177710d684645",
+    "service_preflight_ran": false,
+    "reason": "Selected tests use owned synthetic fixtures; they do not require launcher, PostgreSQL or Redis readiness.",
+    "tests": {
+      "TestDrainCoordinatorCompletesWhenIdle": "proxy/drain_coordinator_test.go",
+      "TestDrainCoordinatorGraceDeadline": "proxy/drain_coordinator_test.go",
+      "TestDrainCoordinatorDisabled": "proxy/drain_coordinator_test.go",
+      "TestProxyDeviceMemoryBudgetKeepsThePerDeviceTarget": "proxy/proxy_device_memory_budget_test.go",
+      "TestProxyDeviceMemoryBudgetNeverExceedsTheAggregate": "proxy/proxy_device_memory_budget_test.go",
+      "TestProxyDeviceMemoryBudgetRefusesWithoutConstructing": "proxy/proxy_device_memory_budget_test.go",
+      "TestProxyDeviceMemoryBudgetReleasedOnConstructionFailure": "proxy/proxy_device_memory_budget_test.go",
+      "TestProxyDeviceMemoryBudgetReleasedOnDeviceClose": "proxy/proxy_device_memory_budget_test.go",
+      "TestProxyDeviceMemoryBudgetDisabled": "proxy/proxy_device_memory_budget_test.go",
+      "TestProxyDeviceWireGuardReturnWaitsForQueueCapacity": "proxy/proxy_device_receive_test.go",
+      "TestProxyDeviceTunDialDoesNotStealWireGuardReturn": "proxy/proxy_device_receive_test.go",
+      "TestProxyDeviceManagerRetainsRetryingDeviceAcrossWindowLoss": "proxy/proxy_device_transport_test.go",
+      "TestProxyDeviceManagerSharesOneNetworkSpaceLifetime": "proxy/proxy_device_transport_test.go",
+      "TestProxyDeviceManagerCloseAndWaitJoinsOwnedNetworkSpace": "proxy/proxy_device_transport_test.go",
+      "TestProxyDeviceManagerCloseJoinsAdmittedOpenAndRejectsLateOpen": "proxy/proxy_device_transport_test.go",
+      "TestProxyDeviceManagerPreservesInjectedNetworkSpace": "proxy/proxy_device_transport_test.go",
+      "TestProxyDeviceSendBorrowedBatchCopiesBeforeReturn": "proxy/proxy_device_wireguard_batch_test.go",
+      "TestProxyDeviceSendBorrowedBatchReturnsRejectedCopies": "proxy/proxy_device_wireguard_batch_test.go",
+      "TestProxyIngressCollectorExportsCompleteBoundedLibrarySnapshots": "proxy/traffic_metrics_test.go",
+      "TestProxyConnectionMetricsPreserveDirectionalBytesAndCloseOnce": "proxy/traffic_metrics_test.go",
+      "TestProxySessionMaximumResetsAtIntervalBoundary": "proxy/traffic_metrics_test.go",
+      "TestProxySessionDurationSummaryExportsExactSumCountWithoutBuckets": "proxy/traffic_metrics_test.go",
+      "TestWireGuardPacketMetricsCountPayloadAfterOffset": "proxy/traffic_metrics_test.go",
+      "TestWgClientStackCloseAndWaitJoinsTCPDispatcher": "proxy/wg_client_lifecycle_test.go",
+      "TestProxyLifecycleJoinCapabilityMetric": "proxy/wg_runtime_metrics_test.go",
+      "TestWindowIdentityRestoreGateProtectsLazyOpen": "proxy/window_identity_gate_test.go",
+      "TestWindowIdentityRestoreGateJoinsConcurrentReleaseWrite": "proxy/window_identity_gate_test.go",
+      "TestWindowIdentityRestoreGateKeepsNewestDeviceGeneration": "proxy/window_identity_gate_test.go"
+    },
+    "test_file_sha256": {
+      "proxy/drain_coordinator_test.go": "9042935fa2fdccfa736d9707a51b4e4d4596e466bd43a881adc9afd570135133",
+      "proxy/proxy_device_memory_budget_test.go": "f678a42dddcf5ff974d226f1830af989de0b87f4076026df23d630e67cd1912a",
+      "proxy/proxy_device_receive_test.go": "b528e52d8965b8e96e2bbe0c626ba7dbfc230af64ffe3649558ecee33240ea49",
+      "proxy/proxy_device_transport_test.go": "0aa23819acd325c4e910bfc6753818bdfc8e48551c1a6208846587e8602f8fa6",
+      "proxy/proxy_device_wireguard_batch_test.go": "1d530be1fe2bcc6a916972a648a3a32718c1871648f0ccb08ba0646c3ec2cc6a",
+      "proxy/traffic_metrics_test.go": "d3ecaca269961e7e5037cc498138131266b2a4545acc1489faa73b426e3f328e",
+      "proxy/wg_client_lifecycle_test.go": "7a6cb39efc41c3a503c6b573030b4d3f8ff37a8080f61bc2edf63bef7d8e9351",
+      "proxy/wg_runtime_metrics_test.go": "80fedc75e5a678a8db6726b5bff5581cc5ea907600333cbbf859d0c8722b67d2",
+      "proxy/window_identity_gate_test.go": "1e4da2f8db975b3897f3afbfd12ffb249f35e663770821c5f125c288c9a2553b"
+    },
+    "excluded_database_tests": [],
+    "reviewed_selection_sha256": "ac11c1083d7ac2800d13bf81f23131b737d57e4d68b7afa1535a5c46c7802738"
+  },
+  "server_test_environment_scope_sha256": "44393d882eca91041f56ee2960aafaacbd7a7c3c09242767d73785282fab6b6c",
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 920,
+        "input_sha256": "45f7bedbf1f8c3a00f970c8bb0743a936d8a0577aff769d3a2c9df5f35cfba66"
+      },
+      "server": {
+        "file_count": 4264,
+        "input_sha256": "e703648644cd184c7eb5dd2beb5057c66a2c6cbbf05ae35cffe32776eff5f639"
+      }
+    },
+    "external_local_replacements": [
+      "/Users/brien/urnetwork/glog",
+      "/Users/brien/urnetwork/goidenticons",
+      "/Users/brien/urnetwork/operator-proxy",
+      "/Users/brien/urnetwork/proxy",
+      "/Users/brien/urnetwork/sdk",
+      "/Users/brien/urnetwork/sn",
+      "/Users/brien/urnetwork/userwireguard",
+      "/Users/brien/urnetwork/warp"
+    ],
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "binary_sha256": "e30e31469c1336a5df71b3441dcb441f61b9854531876f69b516a6271093d7f3",
+  "binary_build_info": "/tmp/throughput-fix-2-terra-server-proxy-final-cgo0/tests: go1.26.7\n\tpath\tgithub.com/urnetwork/server/proxy.test\n\tmod\tgithub.com/urnetwork/server\t(devel)\t\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOOS=darwin\n\tbuild\tGOARM64=v8.0\n",
+  "sources_stable_during_build": true,
+  "source_inspection_uses_build_snapshot": true
+}

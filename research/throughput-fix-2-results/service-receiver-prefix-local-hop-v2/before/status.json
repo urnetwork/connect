@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "32077c9ce6e18e9d578a7156dbcbb9876548010aee84ec436572cc694857228b",
+  "binary_sha256": "249d6dd3854ff702c20c46a0186f0846136e0f99487003453423e1e47e6c0eec",
+  "effective_inputs_sha256": "335cbc8d5d3c31c6fdc294351270ad6b0ed71a4d069fa0a828013b0b46403840",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiver(EarlyIngressHeadCannotRetimePrefix|EarlyIngressSackKeepsPrefixRaw|OrderedIngressPrefixControl|PrefixZeroWaitKeepsRawClock|SackedPrefixKeepsNewHeadTiming|RelayReorderCannotBorrowLocalFifo)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as build; absolute relationship pinned by original status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T21:41:30.963468+00:00",
+  "loadavg_start": [
+    7.2041015625,
+    9.48193359375,
+    9.37548828125
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 1.7684387909248471,
+  "loadavg_end": [
+    7.2041015625,
+    9.48193359375,
+    9.37548828125
+  ],
+  "ended_utc": "2026-09-16T21:41:32.733136+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "25c93f9c2723c84cf8508b0c1458c893b51f49b481fb18f5b5b972a67a456d90",
+  "pass": 12,
+  "fail": 6,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "12P6F: both two-local-route and known same-local-H1 downstream-reorder cases overstate200kB/s physical service as16MB/s. Four controls pass.",
+  "rows": 6
+}

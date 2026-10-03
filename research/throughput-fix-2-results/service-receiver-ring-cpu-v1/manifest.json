@@ -1,0 +1,10 @@
+{
+  "payload_sha256": {
+    "fixture-failures.jsonl": "b976ed39f65514698fff961eac7d76f8e70463d29b45501a4f3214c21c39b77a",
+    "ledger.jsonl": "769d57bc9a39440782b630c88fb271753aef61238b26155c8006381bda5633c7",
+    "provenance.json": "e7c5baa84c26120df2bb6e462f12f8714cf97abb9d04eec7e4490741cf3c50d5",
+    "source-pins.json": "7a01effe631ae34e6ecd799f893978ed0442c41c358fd29e82f7af9a5918fe5f",
+    "status.json": "5f6111833dcf638c15801b0e137df397919f458f9127677aa8df2250c063b25f",
+    "summary.json": "fcb99e3869e33f07b3c2626c018f628d338a45258501140f73443c064e692152"
+  }
+}

@@ -1,5 +1,7 @@
 package connect
 
+import "net"
+
 // The embedded probe target table.
 //
 // Source: probe-list-v3.csv, reduced once at authoring time rather than parsed
@@ -23,7 +25,10 @@ package connect
 //
 // A few health hostnames are literal ip addresses (1.1.1.1). They need no
 // resolution and a caller may pass them straight through; see
-// sampleProbeTargets for why resolution is the caller's job at all.
+// sampleProbeTargets for why resolution is the caller's job at all. A pass
+// over v6 swaps each v4 literal for the same operator's v6 endpoint
+// (probeLiteralHostIp), so the host sample itself is family-independent and
+// a provider walks the same rotation whichever family a pass asks over.
 
 // probeHostNames are the health-class hostnames, dialed at :443.
 var probeHostNames = []string{
@@ -161,9 +166,10 @@ var probeHostNames = []string{
 	"www.riotgames.com",
 }
 
-// probeResolverIps are the dns-class resolver ips, queried at :53. All v4 in
-// this revision of the list, which is why the sampler hands back a string and
-// the crafting side is the only place the family matters.
+// probeResolverIps are the v4 dns-class resolver ips, queried at :53. The v6
+// list below holds the same operators' v6 endpoints; sampleProbeTargetsForIpFamily
+// picks from whichever the exit can carry. The sampler hands back a string
+// and the crafting side is the only place the family matters.
 var probeResolverIps = []string{
 	"8.8.8.8",
 	"8.8.4.4",
@@ -188,6 +194,66 @@ var probeResolverIps = []string{
 	"119.29.29.29",
 	"114.114.114.114",
 	"185.222.222.222",
+}
+
+// probeHostLiteralIpv6s maps the table's v4 literal health hosts to the same
+// operators' v6 endpoints, every one of which terminates tls on :443 like its
+// v4 form, so a v6 pass keeps the resolver-down fallback (see
+// probeFallbackLiteralTargetsForIpVersion) with the same three independent
+// dial questions.
+var probeHostLiteralIpv6s = map[string]string{
+	"1.1.1.1": "2606:4700:4700::1111",
+	"8.8.8.8": "2001:4860:4860::8888",
+	"9.9.9.9": "2620:fe::fe",
+}
+
+// probeLiteralHostIp is the ip a sampled host stands for in a pass over
+// ipVersion: a v4 literal itself over v4, its v6 sibling over v6, and a v6
+// literal itself over v6. A hostname returns (nil, false) and is resolved by
+// the caller; a literal of the other family with no sibling also returns
+// (nil, false) and the caller skips it, since an ip cannot be resolved into
+// the other family.
+func probeLiteralHostIp(host string, ipVersion int) (net.IP, bool) {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil, false
+	}
+	switch ipVersion {
+	case 4:
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4, true
+		}
+	case 6:
+		if ip.To4() == nil {
+			return ip, true
+		}
+		if sibling, ok := probeHostLiteralIpv6s[host]; ok {
+			if siblingIp := net.ParseIP(sibling); siblingIp != nil {
+				return siblingIp, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// probeResolverIpv6s are the v6 dns-class resolver ips (Cloudflare, Google,
+// Quad9, OpenDNS, AdGuard, Control D, CleanBrowsing, Yandex, DNS.SB), for
+// exits that can carry v6.
+var probeResolverIpv6s = []string{
+	"2606:4700:4700::1111",
+	"2606:4700:4700::1001",
+	"2001:4860:4860::8888",
+	"2001:4860:4860::8844",
+	"2620:fe::fe",
+	"2620:fe::9",
+	"2620:119:35::35",
+	"2620:119:53::53",
+	"2a10:50c0::ad1:ff",
+	"2a10:50c0::ad2:ff",
+	"2606:1a40::",
+	"2a0d:2a00:1::",
+	"2a02:6b8::feed:0ff",
+	"2a09::",
 }
 
 // The pass width (how many health hosts one probe pass uses, alongside one
@@ -227,8 +293,48 @@ const probePassFraction = 0.6
 // mechanism itself must not be able to introduce that confusion, so it is not
 // given the ability to resolve anything.
 func sampleProbeTargets(seed uint64, n int) (hosts []string, resolver string) {
-	if 0 < len(probeResolverIps) {
-		resolver = probeResolverIps[seed%uint64(len(probeResolverIps))]
+	return sampleProbeTargetsForIpFamily(seed, n, IpFamilyV4Only)
+}
+
+// probeIpVersionForFamily is the family one pass asks its questions over,
+// given the exit's address-family category and the pass seed: v4-only and
+// legacy exits are asked over v4, v6-only exits over v6, and a dualstack exit
+// alternates by seed (the caller seeds from the pass index) so a re-probed
+// provider proves both families over consecutive passes. Anything the
+// category cannot carry is never asked, so a v6-only exit is never read as
+// unqualifiable for failing v4 questions it could not carry.
+func probeIpVersionForFamily(seed uint64, ipFamily IpFamily) int {
+	switch ipFamily.Normalize() {
+	case IpFamilyV6Only:
+		return 6
+	case IpFamilyDualstack:
+		if seed%2 == 1 {
+			return 6
+		}
+		return 4
+	default:
+		return 4
+	}
+}
+
+// sampleProbeTargetsForIpFamily is sampleProbeTargets with the resolver drawn
+// from the list the exit's address-family category can carry, per
+// probeIpVersionForFamily.
+func sampleProbeTargetsForIpFamily(seed uint64, n int, ipFamily IpFamily) (hosts []string, resolver string) {
+	return sampleProbeTargetsForIpVersion(seed, n, probeIpVersionForFamily(seed, ipFamily))
+}
+
+// sampleProbeTargetsForIpVersion is sampleProbeTargets with the resolver drawn
+// from the given family's list. The host sample is the same for both
+// families; a v4 literal host is swapped for its v6 sibling at target-build
+// time (probeLiteralHostIp), not here.
+func sampleProbeTargetsForIpVersion(seed uint64, n int, ipVersion int) (hosts []string, resolver string) {
+	resolverIps := probeResolverIps
+	if ipVersion == 6 {
+		resolverIps = probeResolverIpv6s
+	}
+	if 0 < len(resolverIps) {
+		resolver = resolverIps[seed%uint64(len(resolverIps))]
 	}
 	if n <= 0 || len(probeHostNames) == 0 {
 		return nil, resolver

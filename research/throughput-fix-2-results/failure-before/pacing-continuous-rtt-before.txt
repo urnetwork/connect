@@ -1,0 +1,5 @@
+--- FAIL: TestWindowPacingContinuousFlightRefreshesChangedRoundTrip (0.00s)
+    transfer_window_pacing_probe_test.go:43: continuous flight kept the stale propagation floor: got=1ms want=100ms
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.690s

@@ -1,0 +1,36 @@
+{
+  "archive_kind": "static_mismatch_service_credit",
+  "attribution_limits": [
+    "This is one original full static mismatch matrix on a normal binary built from the frozen integrated service-credit snapshot.",
+    "The prior setup-only attempt did not compile or run tests; it is retained separately and does not affect matrix outcomes.",
+    "The matrix top-level pass preserves all 216 numerical service readings. No full model or regression acceptance is implied.",
+    "Raw logs, source copies, binaries, local paths, and identifiers are excluded; hashes and normalized rows are retained."
+  ],
+  "collection_time_utc": "2026-09-16T10:20:38.858372+00:00",
+  "normal_binary_sha256": "6f5e66af33985e7c17273cbe39ea257e348cd8d77d5dca71cbafc32b236eb579",
+  "raw_build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "raw_run_log_sha256": "cfae9b2c907d3982c472e764625beb3a600187cafe0c0e2eb7111f2e9a6f6eb6",
+  "redaction_policy": {
+    "ipv4_literals": "redacted if encountered",
+    "local_paths": "excluded",
+    "raw_logs": "excluded; sha256 only",
+    "source_binary": "excluded; sha256 only"
+  },
+  "run_context": "integrated service-credit original static mismatch matrix; concurrent isolated recovery investigation; no quiescence wait",
+  "schema_version": 1,
+  "source_snapshot": {
+    "file_count": 827,
+    "input_sha256": "c5eff06db24d1c1b82d4f7a9ca4ba6bd68219a32975c50e18c97d1f824fb56f4",
+    "prior_correctness_binary_sha256": "5f7c2ac4c310ff8bd18982c1b0e1e019390132388e61cf9f1dc9ff4e37c3feff",
+    "production_sha256": "8802ba4b3f35096d38f0c9eef8afd7a74709a92b4d6efce77c7d86917b1c02d1",
+    "stable_during_build": true
+  },
+  "test": "TestWindowPathWindowMismatchMatrix",
+  "test_flags": [
+    "-test.run",
+    "^TestWindowPathWindowMismatchMatrix$",
+    "-test.count=1",
+    "-test.v",
+    "-test.timeout=15m"
+  ]
+}

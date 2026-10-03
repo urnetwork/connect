@@ -1,0 +1,40 @@
+{
+  "archive_kind": "receiver_hybrid_baseline_review_evidence",
+  "attribution_limits": [
+    "This archive preserves an overlay-only candidate review; it is not an accepted shared-source performance result.",
+    "The final focused block passes, but the retained hybrid and legacy long-RTT failures leave long-path performance unresolved.",
+    "The 160 ms and 300 us queue roots are retained as distinct failure-before evidence.",
+    "Ordering-before outcomes apply to the rejected baseline-v1 draft, not the original shared producer.",
+    "The earlier unlocked 153/3 focus with two race warnings is a stated historical limit only; it is not merged into final focused totals.",
+    "All retained source, overlay, binary, build, and raw-log references are hashes only. No local paths, source copies, overlays, raw logs, binaries, traces, or generated identifiers are archived."
+  ],
+  "candidate": "hybrid separated receiver observation and unloaded baseline",
+  "changes": [
+    "Separate retained observed paired residence from an adjusted unloaded baseline; ordinary queued observations cannot raise baseline or enlarge physical burst cadence.",
+    "Only the exact sequence/message receiver tuple can refresh a physically confirmed empty-flight probe; later covering heads cannot supply its receiver delay.",
+    "Restore bounded existing drain test for live metadata using adjusted queue evidence; receiver-only wait cannot trigger that test.",
+    "Historical reads ignore future baseline; delayed probe preserves newer lower observations and tuples.",
+    "Producer sticky one-shot and reviewed legacy bounds retained; common metadata recovery guard is a separate counterfactual, excluded from this handoff."
+  ],
+  "collection_time_utc": "2026-09-16T09:15:52.364604+00:00",
+  "evidence_limits": [
+    "160ms and300us queue roots retained separately.",
+    "Ordering before failures apply to rejected baseline-v1 draft, not original shared producer.",
+    "Earlier baseline focus153/3 included2racewarnings from the old unlocked drain fixture; final192PASS uses corrected locked fixture.",
+    "Broad long gate aggregatepass had [0,0,270.66368] Mb/s and1582warmupdrops, not stable recovery.",
+    "All comparison variants emit the same receiver metadata and use new first-physical raw timestamps; legacy consumer is not an old whole-commit replay."
+  ],
+  "handoff_sha256": "5b7eed951f2872d5a32ed300137a681d3d29d67b11692d4effd95f4d012329b6",
+  "handoff_status": "reviewable deterministic correction; full long RTT and small-window gates still fail; no recovery claim",
+  "redaction_policy": {
+    "ipv4_literals": "redacted if encountered",
+    "local_paths": "excluded",
+    "raw_logs": "excluded; sha256 only",
+    "source_overlay_binary": "excluded; sha256 only"
+  },
+  "schema_version": 1,
+  "test_changes": [
+    "Two original prototype tests still verify rolling observed RTT using receiverWindowEstimate; they no longer equate a rolling queued minimum with unloaded baseline.",
+    "New roots cover count and time retirement, fixed byte evidence/rate, exact ACK/write order, failure, missing exact reply, burst allowance, timestamp ordering, expiry and raw fallback."
+  ]
+}

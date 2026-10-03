@@ -1,0 +1,19 @@
+{
+  "archive_status": "append_only_open_failure_not_causal_proof",
+  "assertion": "message 1335 was not admitted",
+  "binary_sha256": "eab3791cd355e836e0e8bc68a1218a196c85c765fcbc32a8b7c18cf9dbfba890",
+  "effective_source_sha256": "c313ca4cd42aa70edf930b82eef4ecd1a9857f6ff1718b9709c8c2e1bf75f53c",
+  "elapsed_seconds": 77.02,
+  "exclusions": [
+    "No raw logs, source, binaries, overlays, synthetic identities or packet data in sanitized archive.",
+    "This one run does not establish a deterministic mechanism or a fixed regression."
+  ],
+  "handoff_sha256": "8eddec854d1e0e18fb71a7505263c388d057cf0bd158c7a60076a2c1e4ff9bee",
+  "manifest_sha256": "78d163d9080e011446d3e5635e847126318d332c939b4d846dcbfb329bddbf20",
+  "outcome": "FAIL",
+  "prior_full_regression_failure": "message 1438 was not admitted on frozen fffee019",
+  "race_warning_blocks": 0,
+  "raw_log_sha256": "99d0a991c1865939c0395485f0a5445bbab0edb6e35b541b7359747cedde5a0e",
+  "scope": "One previously requested bounded candidate silent-lane run; no rerun. This remains an open regression and is independent of the retry-clock root.",
+  "test": "TestSilentLaneLongerThanTheProbeCadenceStillDrains"
+}

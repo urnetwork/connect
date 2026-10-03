@@ -1,0 +1,2 @@
+{"accepted_fraction_maximum": 0.85, "accepted_fraction_minimum": 0.45, "ceiling_bytes": 66846720, "mean_occupancy_fraction": 0.2, "paired_ticks": 835, "reason": "retained window", "test": "TestWindowRetainedSteadyPathPreservesOccupancyBand", "window_bytes": 2097152}
+{"arrival_index": 6, "expected_service_rate": 12500000, "reported_latest_rate": 38018, "reported_rate": 606338, "test": "TestWindowPacingLimitedFlightAckPhaseDoesNotCompleteService"}

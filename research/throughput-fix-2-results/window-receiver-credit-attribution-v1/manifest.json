@@ -1,0 +1,11 @@
+{
+  "archive": "window-receiver-credit-attribution-v1",
+  "payload_sha256": {
+    "outcomes.jsonl": "200a7627857998c0ad11cba34d761425cc19677fd10b48cbe77a98f138ff8fbf",
+    "provenance.json": "121826dfbca1cf50580cf8de831c89b6e0245498e15304d467b9200ff80ebd06",
+    "source-manifest-before.json": "3dd65122e58865cb20c4832d51d8f0ee239963a155926fe322fa1043e26bb8cf",
+    "source-manifest-warm-after.json": "6167f068ff85a1de64ffc6d5eb78c9aaa0fda5dd1fa7953fec2f0756b339974d",
+    "source-pins.json": "c2fe8fe9d31e5a410d37e275b81cf176436c54be413f9f4aaafa13e6f99bb6cd",
+    "status.json": "2d7f7ebfef9ef4291a5a4cacb6879363885de0550f27e943678bafaec710900a"
+  }
+}

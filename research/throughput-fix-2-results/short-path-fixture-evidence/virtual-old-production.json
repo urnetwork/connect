@@ -1,0 +1,26 @@
+{
+  "interpretation": "Calibrated virtual carrier on old production passes; this distinguishes the fixture clock artifact from a production pacing claim.",
+  "outcomes": [
+    {
+      "duration": "0.21s",
+      "outcome": "PASS",
+      "repetition": 1,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    },
+    {
+      "duration": "0.20s",
+      "outcome": "PASS",
+      "repetition": 2,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    },
+    {
+      "duration": "0.20s",
+      "outcome": "PASS",
+      "repetition": 3,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    }
+  ],
+  "passed": 3,
+  "schema": "throughput-fix-2/short-path-virtual-old-production-v1",
+  "test": "TestTheWindowRuleIsInertOnAShortPath"
+}

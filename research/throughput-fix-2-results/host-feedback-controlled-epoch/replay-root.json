@@ -1,0 +1,41 @@
+{
+  "Test": "TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle",
+  "Status": "FAIL before fix; no fixed result yet",
+  "Count": 3,
+  "Failures": [
+    {
+      "Run": 1,
+      "ServiceByteRate": 3536,
+      "ReplayPacketBytes": 1100,
+      "NextBulkWriteBytes": 71680,
+      "PacingWaitSeconds": 18.430482186
+    },
+    {
+      "Run": 2,
+      "ServiceByteRate": 3536,
+      "ReplayPacketBytes": 1100,
+      "NextBulkWriteBytes": 71680,
+      "PacingWaitSeconds": 18.430482186
+    },
+    {
+      "Run": 3,
+      "ServiceByteRate": 3536,
+      "ReplayPacketBytes": 1100,
+      "NextBulkWriteBytes": 71680,
+      "PacingWaitSeconds": 18.430482186
+    }
+  ],
+  "EstablishedServiceByteRate": 125000000,
+  "FeedbackProtocol": "Real TcpSequence.runReturnRecovery emits its first timed replay at one virtual second. Ordinary Transfer tail acknowledgment and service checkpoints are forced at 680 and 690 ms. The replay crosses actual windowBurstPacer.waitForServiceMessage and receives a virtual 1 ms ACK. Only then does applySendAckWithLock reopen the inner TCP receive window. The next 70 KiB write is paced with the resulting measured estimate. Channel handoff fixes the replay-before-window-reopen order.",
+  "Clock": "testing/synctest; no wall-clock sleeps, negative timeout proof, or scheduler-dependent injection",
+  "RawLog": "/tmp/throughput-fix-2-host-feedback-6a212aee/replay-root-before.log",
+  "RawLogSha256": "834495a7126be870b2cf6cb56c2539bd2d7fe6377e120ad3097e9f3c0a8bd9c2",
+  "OriginalTestSource": "/tmp/throughput-fix-2-host-feedback-6a212aee/replay-root_test.go",
+  "OriginalTestSourceSha256": "e8aeb4eacab96f385b087f1e6902beede6228385c357f6f02799549d6c232e39",
+  "Overlay": "/tmp/throughput-fix-2-host-feedback-6a212aee/replay-root-overlay.json",
+  "OverlaySha256": "fdc83307f98e9f2fb87c9e1ae6960183662d6c84dacd6ee26122906ff3e64e83",
+  "PacingSourceSha256": "eb558a979ce50c341103c86dbf0b79a13dc979ad8cdc1157eaa99c23ba17c45e",
+  "ArchivedTestSource": "replay-root-test.go.txt",
+  "Command": "go test -overlay /tmp/throughput-fix-2-host-feedback-6a212aee/replay-root-overlay.json -run ^TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle$ -count=3 -v -timeout=2m ./",
+  "InclusionReason": "The synthetic source is retained as non-.go text so an explicitly unfixed failure is reviewable without becoming an active normal test."
+}

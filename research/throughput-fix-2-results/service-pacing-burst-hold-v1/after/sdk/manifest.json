@@ -1,0 +1,41 @@
+{
+  "created_utc": "2026-09-17T01:15:00.233139+00:00",
+  "arm": "after",
+  "selection": "sdk",
+  "source_sha256": "a36793a9871306b3acbb87e2f0ddeb1d79cecaebf26c795c518acdf1ae27c04b",
+  "input_sha256": "eb6431e445050a4d4cf883630921ac55f1c142d952dcfd161ce26faab9527a05",
+  "source_manifest_sha256": "7d5b6610905ccf7bf516f62445b018290ec547441b8c99292ecd2f95c2ff9534",
+  "working_directory": "/tmp/throughput-fix-2-burst-hold-pinned-v1/after/source/connect",
+  "build_command": [
+    "go",
+    "test",
+    "-race=false",
+    "-c",
+    "-o",
+    "/tmp/throughput-fix-2-burst-hold-pinned-v1/after/tests",
+    "."
+  ],
+  "run_command": [
+    "/tmp/throughput-fix-2-burst-hold-pinned-v1/after/tests",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPathSdkRetainedDeviceDuplexShort$",
+    "-test.count=5",
+    "-test.timeout=15m"
+  ],
+  "host_load_average_at_start": [
+    8.9306640625,
+    8.75244140625,
+    8.6328125
+  ],
+  "no_quiescence_wait": true,
+  "go_version": "go version go1.26.7 darwin/arm64",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "logical_cpus": 10,
+  "environment": {
+    "GOCACHE": "/tmp/codex-go-cache"
+  },
+  "run_script_sha256": "6f628e2e87212e1c8014110c194977e265142c34549b3ff42ce61ae2bde6e025",
+  "binary_sha256": "85542b68e7796c72bf3f4b611609ed63496ccfa0c1eef9381c67fa3c60ecd172",
+  "go_version_m": "/tmp/throughput-fix-2-burst-hold-pinned-v1/after/tests: go1.26.7\n\tpath\tgithub.com/urnetwork/connect.test\n\tmod\tgithub.com/urnetwork/connect\t(devel)\t\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\tCGO_ENABLED=1\n\tbuild\tCGO_CFLAGS=\n\tbuild\tCGO_CPPFLAGS=\n\tbuild\tCGO_CXXFLAGS=\n\tbuild\tCGO_LDFLAGS=\n\tbuild\tGOARCH=arm64\n\tbuild\tGOOS=darwin\n\tbuild\tGOARM64=v8.0\n"
+}

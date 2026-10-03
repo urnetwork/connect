@@ -1,0 +1,20 @@
+{
+  "archive_result": "complete_pinned_virtual_silent_lane_before_and_trace_v2_diagnostic",
+  "before": {
+    "FAIL": 3,
+    "PASS": 0,
+    "SKIP": 0,
+    "assertion": "message 1445 was not admitted",
+    "race_warning_blocks": 0,
+    "same_original_gates": "20-second stall and 3000 messages"
+  },
+  "excluded_compile_only_attempts": 1,
+  "trace_v2": {
+    "FAIL": 1,
+    "PASS": 0,
+    "SKIP": 0,
+    "assertion": "message 1445 was not admitted",
+    "race_warning_blocks": 0,
+    "terminal_snapshots": 2
+  }
+}

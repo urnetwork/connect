@@ -1,0 +1,12 @@
+{
+  "archive": "receiver-feedback-wire-design",
+  "payload_sha256": {
+    "design-review.md": "c409418d8c07748794668b0d2a3ad2a6f2ef9f1a78896b8d7e7331f972ae0abd",
+    "layout.json": "63fae9b8e73aa14daa416935731ddea6787dc260070e554f8b6fd01d822f0dba",
+    "outcomes.json": "5657f5c6a7f5ccf968dc15e2b3d3aa6743716715fdbad7fb9a4a93b1410ddd0b",
+    "provenance.json": "a899d5f03166e7843bfebae2cf148456e73494ba76cef7c7e0ff334255839646",
+    "source-pins.json": "ca191058b7fc705e4222ca809693e6d36488130bcfd473887c3807d4eb84afc7",
+    "status.json": "b47b26dda4cc1b3308365183c25e5b9974e1b55e8821b746789170e053959b91",
+    "wire-rows.jsonl": "840a9367cc3ccf87639f479f134ed8ab9b4fe3798a04b368d6aa113b1b81a962"
+  }
+}

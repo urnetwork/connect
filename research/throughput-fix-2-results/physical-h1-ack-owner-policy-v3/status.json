@@ -1,0 +1,6 @@
+{
+  "classification": "Clean deterministic ownership/lifecycle proof for an optional pure-ACK liveness policy plus an independently separable caller-isolation fix. No physical throughput acceptance.",
+  "outcomes": 212,
+  "readings": 0,
+  "worker_readings": 0
+}

@@ -1,0 +1,9 @@
+{"duration":"0.45s","outcome":"PASS","repetition":1,"test":"TestWindowPathServiceLargeMessageCapacityChanges"}
+{"duration":"0.77s","outcome":"PASS","repetition":1,"test":"TestWindowPathServiceSettledLargeMessageCapacityChanges"}
+{"duration":"0.09s","outcome":"PASS","repetition":1,"test":"TestWindowPathServiceCapacityIncreaseRecovery"}
+{"duration":"0.67s","outcome":"PASS","repetition":1,"test":"TestWindowPathServiceLongCompressedFeedback"}
+{"duration":"21.85s","outcome":"PASS","repetition":1,"test":"TestWindowPathServiceAcrossRepeatedDrains"}
+{"duration":"9.67s","outcome":"PASS","repetition":1,"test":"TestWindowPathServiceDelayedPacingWake"}
+{"duration":"9.12s","outcome":"PASS","repetition":1,"test":"TestWindowPathServiceCapacityChanges"}
+{"duration":"11.93s","outcome":"PASS","repetition":1,"test":"TestWindowPathServicesShareFiniteRelay"}
+{"duration":"57.93s","outcome":"PASS","repetition":1,"test":"TestWindowPathServiceRoundTripChanges"}

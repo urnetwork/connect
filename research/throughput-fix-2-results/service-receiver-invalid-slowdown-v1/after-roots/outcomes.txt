@@ -1,0 +1,43 @@
+=== RUN   TestWindowPacingReceiverInterleavedSlowdownAdaptsWithInvalidRing
+--- PASS: TestWindowPacingReceiverInterleavedSlowdownAdaptsWithInvalidRing (0.18s)
+=== RUN   TestWindowPacingReceiverInterleavedSlowdownLegacyControl
+--- PASS: TestWindowPacingReceiverInterleavedSlowdownLegacyControl (0.09s)
+=== RUN   TestWindowPacingReceiverInterleavedSlowdownMixedControl
+--- PASS: TestWindowPacingReceiverInterleavedSlowdownMixedControl (0.10s)
+=== RUN   TestWindowPacingReceiverInvalidShortQueueKeepsHold
+--- PASS: TestWindowPacingReceiverInvalidShortQueueKeepsHold (0.01s)
+=== RUN   TestWindowPacingReceiverInvalidQueuedBoundCannotRaiseService
+--- PASS: TestWindowPacingReceiverInvalidQueuedBoundCannotRaiseService (0.03s)
+=== RUN   TestWindowPacingReceiverInvalidWaitAllowancePreservesFastService
+--- PASS: TestWindowPacingReceiverInvalidWaitAllowancePreservesFastService (0.06s)
+=== RUN   TestWindowPacingReceiverInvalidLimitedRefillsKeepHold
+--- PASS: TestWindowPacingReceiverInvalidLimitedRefillsKeepHold (0.00s)
+=== RUN   TestWindowPacingReceiverInterleavedSlowdownAdaptsWithInvalidRing
+--- PASS: TestWindowPacingReceiverInterleavedSlowdownAdaptsWithInvalidRing (0.17s)
+=== RUN   TestWindowPacingReceiverInterleavedSlowdownLegacyControl
+--- PASS: TestWindowPacingReceiverInterleavedSlowdownLegacyControl (0.09s)
+=== RUN   TestWindowPacingReceiverInterleavedSlowdownMixedControl
+--- PASS: TestWindowPacingReceiverInterleavedSlowdownMixedControl (0.10s)
+=== RUN   TestWindowPacingReceiverInvalidShortQueueKeepsHold
+--- PASS: TestWindowPacingReceiverInvalidShortQueueKeepsHold (0.01s)
+=== RUN   TestWindowPacingReceiverInvalidQueuedBoundCannotRaiseService
+--- PASS: TestWindowPacingReceiverInvalidQueuedBoundCannotRaiseService (0.03s)
+=== RUN   TestWindowPacingReceiverInvalidWaitAllowancePreservesFastService
+--- PASS: TestWindowPacingReceiverInvalidWaitAllowancePreservesFastService (0.07s)
+=== RUN   TestWindowPacingReceiverInvalidLimitedRefillsKeepHold
+--- PASS: TestWindowPacingReceiverInvalidLimitedRefillsKeepHold (0.00s)
+=== RUN   TestWindowPacingReceiverInterleavedSlowdownAdaptsWithInvalidRing
+--- PASS: TestWindowPacingReceiverInterleavedSlowdownAdaptsWithInvalidRing (0.18s)
+=== RUN   TestWindowPacingReceiverInterleavedSlowdownLegacyControl
+--- PASS: TestWindowPacingReceiverInterleavedSlowdownLegacyControl (0.09s)
+=== RUN   TestWindowPacingReceiverInterleavedSlowdownMixedControl
+--- PASS: TestWindowPacingReceiverInterleavedSlowdownMixedControl (0.10s)
+=== RUN   TestWindowPacingReceiverInvalidShortQueueKeepsHold
+--- PASS: TestWindowPacingReceiverInvalidShortQueueKeepsHold (0.01s)
+=== RUN   TestWindowPacingReceiverInvalidQueuedBoundCannotRaiseService
+--- PASS: TestWindowPacingReceiverInvalidQueuedBoundCannotRaiseService (0.03s)
+=== RUN   TestWindowPacingReceiverInvalidWaitAllowancePreservesFastService
+--- PASS: TestWindowPacingReceiverInvalidWaitAllowancePreservesFastService (0.06s)
+=== RUN   TestWindowPacingReceiverInvalidLimitedRefillsKeepHold
+--- PASS: TestWindowPacingReceiverInvalidLimitedRefillsKeepHold (0.00s)
+PASS

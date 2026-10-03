@@ -1,0 +1,19 @@
+{
+  "files": {
+    "benchmark-rows.jsonl": "29a056484713681dd374876d4e75edcc62837ac79927f5d1b9bc925b91698815",
+    "benchmark-summary.json": "ba9e2fe4198187e36455bef37058887092c6b36e0d3e98a00d2e38ea06a635f8",
+    "ledger.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "manifest.json": "913323a8dce5f3c5f7c2eb00c6f4dfc38f5076abb8ba452c422f61ee18055fca",
+    "outcomes.txt": "c26de83abdc9496cd1301470918ec39ecca1cf389ef0ae1c6504da1800d1c431",
+    "provenance.json": "d7e611b4e84041d18584391ec88e543d2991ce180fcebdbe2c81ae1416666b3f",
+    "status.json": "13555d588b084efdbeb8618cc3f5b3e108289f058cf4c6794279b06cf25f1fb3"
+  },
+  "input_hashes_preserved_in": "provenance.json",
+  "redaction": {
+    "external_local_replacement_locations": "redacted",
+    "raw_logs": "excluded",
+    "source_and_binary_contents": "excluded"
+  },
+  "schema": "throughput-fix-2/pacing-estimator-baseline-archive-manifest-v1",
+  "verification": "three benchmark rows extracted from the terminal raw log whose original hash is retained in provenance; generic runner ledger remains empty by mode design"
+}

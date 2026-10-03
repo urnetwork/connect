@@ -1,0 +1,5 @@
+--- FAIL: TestWindowPacingProbeNeedsQueueDelayEvidence (0.00s)
+    transfer_window_pacing_test.go:529: propagating flight was treated as a standing queue
+FAIL
+FAIL	github.com/urnetwork/connect	0.760s
+FAIL

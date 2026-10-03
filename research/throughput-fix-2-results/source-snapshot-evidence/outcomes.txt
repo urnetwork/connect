@@ -1,0 +1,4 @@
+synthetic forced source drift before: expected FAIL; both relative and runtime.Caller audits observed the original edit
+final helper validation: 3 PASS
+intermediate portability check: expected failure retained by SHA; final comparison normalizes temporary paths
+peer review: copied replacement metadata, frozen input inventory, and copied sibling-module checks retained with hashes

@@ -275,7 +275,9 @@ func (self *BringYourApi) AuthNetworkClientSync(authNetworkClient *AuthNetworkCl
 // maintenance. The ordinary API context owns the generator lifetime; this
 // narrower context prevents one auth request from parking destination
 // enumeration indefinitely.
-func (self *BringYourApi) AuthNetworkClientSyncWithCtx(ctx context.Context, authNetworkClient *AuthNetworkClientArgs) (*AuthNetworkClientResult, error) {
+func (self *BringYourApi) AuthNetworkClientSyncWithCtx(ctx context.Context, authNetworkClient *AuthNetworkClientArgs) (result *AuthNetworkClientResult, err error) {
+	ctx, observation := beginAuthRequestObservation(ctx, self.ctx)
+	defer func() { observation.finish(result, err) }()
 	return HttpPostWithStrategy(
 		ctx,
 		self.clientStrategy,
@@ -364,6 +366,11 @@ type FindProviders2Args struct {
 	ExcludeClientIds    []Id            `json:"exclude_client_ids"`
 	ExcludeDestinations [][]Id          `json:"exclude_destinations,omitempty"`
 	RankMode            string          `json:"rank_mode"`
+	ForceMinimum        bool            `json:"force_minimum,omitempty"`
+	// IpFamily filters providers by proven address family. Empty means
+	// v4-capable, which is every provider an older server knows, so an older
+	// client keeps today's behavior. See ip_family.go.
+	IpFamily IpFamilyFilter `json:"ip_family,omitempty"`
 }
 
 type FindProviders2Result struct {
@@ -376,9 +383,18 @@ type FindProvidersProvider struct {
 	HasEstimatedBytesPerSecond bool      `json:"has_estimated_bytes_per_second"`
 	Tier                       int       `json:"tier"`
 	IntermediaryIds            []Id      `json:"intermediary_ids,omitempty"`
+	// NetworkOnly is true when this provider is available through the caller's
+	// own network relationship rather than as a public exit.
+	NetworkOnly bool `json:"network_only,omitempty"`
+	// ReputationFailedNames comes from low-rate external probes. Values are
+	// opaque domain/vendor labels; the tunnel does not infer them from TLS.
+	ReputationFailedNames string `json:"reputation_failed_names,omitempty"`
 	// Location is the provider's location. nil when the server does not know
 	// it (or an older server).
 	Location *ProviderLocation `json:"location,omitempty"`
+	// IpFamily is the provider's proven address-family category. Empty from
+	// an older server, which the client treats as v4-only (legacy).
+	IpFamily IpFamily `json:"ip_family,omitempty"`
 }
 
 func (self *BringYourApi) FindProviders2(findProviders2 *FindProviders2Args, callback FindProviders2Callback) {
@@ -415,12 +431,17 @@ func (self *BringYourApi) FindProviders2SyncWithCtx(ctx context.Context, findPro
 
 type ConnectControlCallback ApiCallback[*ConnectControlResult]
 
+// Public, spoofable telemetry marker; neither client nor server may use it for
+// authentication, authorization, accounting, routing or admission decisions.
+const ControlProbeTelemetryHeader = "X-Ur-Control-Probe"
+
 type ConnectControlArgs struct {
 	Pack string `json:"pack"`
 }
 
 type ConnectControlResult struct {
-	Pack string `json:"pack"`
+	Pack  string               `json:"pack"`
+	Error *ConnectControlError `json:"error"`
 }
 
 type ConnectControlError struct {
@@ -436,10 +457,18 @@ func (self *BringYourApi) ConnectControl(connectControl *ConnectControlArgs, cal
 // the client context is closed). Each request is bounded by the client
 // strategy's `RequestTimeout` regardless of the context passed.
 func (self *BringYourApi) ConnectControlWithCtx(ctx context.Context, connectControl *ConnectControlArgs, callback ConnectControlCallback) {
+	self.connectControlWithCtx(ctx, connectControl, callback, false)
+}
+
+// This private upgrade is used only by explicitly marked probe OOB owners.
+// Generic API calls cannot inherit it from a shared strategy or context.
+func (self *BringYourApi) connectControlWithCtx(ctx context.Context, connectControl *ConnectControlArgs, callback ConnectControlCallback, probeClaimed bool) {
 	go HandleError(func() {
-		HttpPostWithStrategy(
+		HttpPostWithRawFunction(
 			ctx,
-			self.clientStrategy,
+			func(ctx context.Context, requestUrl string, body []byte, byJwt string) ([]byte, error) {
+				return httpPostWithStrategyRaw(ctx, self.clientStrategy, requestUrl, body, byJwt, probeClaimed)
+			},
 			fmt.Sprintf("%s/connect/control", self.apiUrl),
 			connectControl,
 			self.ByJwt(),
@@ -457,6 +486,19 @@ type GetClientKeyArgs struct {
 
 type GetClientKeyResult struct {
 	PublicKey []byte `json:"public_key"`
+}
+
+// GetClientKeyHistoryResult is the response of the unauthenticated
+// `/key/<client_id>/history` API: the peer's signed registration chain,
+// generation 1 first.
+//
+// An empty history is a successful answer meaning "this client has no signed
+// evidence" — a legacy client, or an operator that does not run the signed
+// path. It is NOT an error, and the distinction is load-bearing: an error is
+// an availability signal and must never be read as evidence of substitution.
+// See `transfer_key_history_session.go` and DESIGNNOTES3 §5.3.
+type GetClientKeyHistoryResult struct {
+	History [][]byte `json:"history"`
 }
 
 // GetClientKey fetches a peer client's long-lived public identity key

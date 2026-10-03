@@ -1,0 +1,15 @@
+{
+  "interpretation": "Original real-clock observation retained as a fixture failure; MB/s denotes million bytes per second.",
+  "measurements": [
+    {
+      "constant_megabytes_per_second": 9.9,
+      "sized_megabytes_per_second": 8.6,
+      "sized_over_constant": 0.87,
+      "test": "TestTheWindowRuleIsInertOnAShortPath"
+    }
+  ],
+  "outcome": "FAIL",
+  "path_round_trip_milliseconds": 5,
+  "schema": "throughput-fix-2/short-path-original-failure-v1",
+  "test": "TestTheWindowRuleIsInertOnAShortPath"
+}

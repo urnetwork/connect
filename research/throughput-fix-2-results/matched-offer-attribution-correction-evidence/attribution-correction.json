@@ -1,0 +1,92 @@
+{
+  "abort_events": 0,
+  "conclusions": [
+    "The ACK gap prices propagation-step separation, not a matched sender-window idle interval: the affected original physical offers span12.288192ms around the configured4s step, while ACK checkpoints span603.394ms.",
+    "The unrelated contemporary no-write interval4.62592152s to5.20036376s occurs later than those original physical offers and cannot justify marking their service sample source-idle.",
+    "This run reprices9355500B/s to62019B/s at5.22931552s, before the controlled drain starts5.271005445s. No abort event occurred in the captured interval.",
+    "An isolated actual resend-queue cumulative-prefix test reproduces62019B/s on both absent and present receiver-delay metadata with no drain/probe at all; three top-level runs fail, each with both rows, no races.",
+    "The separately preserved successful-drain read-order root remains valid: once low service is retained, a later physically valid probe captures it. Its inference that contemporaneous no-write gaps caused the model sample was incomplete and is superseded by this matched provenance.",
+    "The sender-only all-worker offer-train diagnostic cannot honestly classify these bytes as an idle-crossing sample solely from a later worker pause. Receiver-side serialization evidence addresses additional path-delay ambiguity; no new wire/timer/policy is implemented here."
+  ],
+  "controlled_drain_starts_ns": [
+    5271005445
+  ],
+  "first_material_decline": {
+    "at_ns": 5229315520,
+    "drain_active": false,
+    "hold_Bps": 62019,
+    "new_ack_ns": 5229315520,
+    "old_ack_ns": 4625921520,
+    "old_hold_Bps": 9355500,
+    "outstanding_bytes": 2101164,
+    "pair_bytes": 37422,
+    "pair_span_ns": 603394000
+  },
+  "new_credit_groups": [
+    {
+      "ack_at_ns": 5219315520,
+      "bytes": 2673,
+      "first_physical_send_ns": 4000122755,
+      "last_physical_send_ns": 4000122755
+    },
+    {
+      "ack_at_ns": 5219529360,
+      "bytes": 2673,
+      "first_physical_send_ns": 4000294055,
+      "last_physical_send_ns": 4000294055
+    },
+    {
+      "ack_at_ns": 5219743200,
+      "bytes": 2673,
+      "first_physical_send_ns": 4000518020,
+      "last_physical_send_ns": 4000518020
+    },
+    {
+      "ack_at_ns": 5219957040,
+      "bytes": 2673,
+      "first_physical_send_ns": 4000741984,
+      "last_physical_send_ns": 4000741984
+    },
+    {
+      "ack_at_ns": 5220170880,
+      "bytes": 2673,
+      "first_physical_send_ns": 4000965948,
+      "last_physical_send_ns": 4000965948
+    },
+    {
+      "ack_at_ns": 5220384720,
+      "bytes": 2673,
+      "first_physical_send_ns": 4001113041,
+      "last_physical_send_ns": 4001113041
+    },
+    {
+      "ack_at_ns": 5220598560,
+      "bytes": 2673,
+      "first_physical_send_ns": 4007031564,
+      "last_physical_send_ns": 4007031564
+    },
+    {
+      "ack_at_ns": 5220812400,
+      "bytes": 2673,
+      "first_physical_send_ns": 4007031564,
+      "last_physical_send_ns": 4007031564
+    },
+    {
+      "ack_at_ns": 5229315520,
+      "bytes": 16038,
+      "first_physical_send_ns": 4007031564,
+      "last_physical_send_ns": 4010011118
+    }
+  ],
+  "note": "This corrects the earlier causal inference from contemporaneous no-write gaps. It retains computed scalar credit/offer summaries only, not raw event rows.",
+  "old_checkpoint": {
+    "ack_at_ns": 4625921520,
+    "bytes": 5346,
+    "first_physical_send_ns": 3997722926,
+    "last_physical_send_ns": 3999416510
+  },
+  "physical_offer_span_ns": 12288192,
+  "raw_event_rows_excluded": 17824,
+  "raw_events_omitted": 0,
+  "scope": "Additional matched physical-credit provenance; corrects the earlier causal inference from contemporaneous no-write gaps. No fix proposed."
+}

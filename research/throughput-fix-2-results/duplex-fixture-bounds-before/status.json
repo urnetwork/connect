@@ -1,0 +1,18 @@
+{
+  "censored_comparisons": 0,
+  "comparison_count": 0,
+  "completeness": "incomplete: each repetition failed at upload=true, flows=1 before the declared upload=true, flows=8 cell produced a reading",
+  "declared_reading_count": 12,
+  "exit_code": 1,
+  "failed_comparisons": 0,
+  "finished_utc": "2026-09-16T04:41:58.130647+00:00",
+  "host_load_average_at_finish": [
+    13.73388671875,
+    12.16357421875,
+    14.80615234375
+  ],
+  "phase": "run",
+  "recorded_reading_count": 9,
+  "rows": 9,
+  "unobserved_declared_cell_count": 3
+}

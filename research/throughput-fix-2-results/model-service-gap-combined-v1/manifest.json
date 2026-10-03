@@ -1,0 +1,10 @@
+{
+  "archive": "model-service-gap-combined-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "53ac0baedc19e277434a9b8d378a9b3c35b7d7677de97b9ab883e5327ffa1efa",
+    "outcomes.jsonl": "ba362578dab0744ae8490fb985af818878e4c4fd401860791e8c475594434d6b",
+    "provenance.json": "e3aacf501df2b31a7758c80f46c105a9cd74c27dd364a816d492b31fca19455b",
+    "source-pins.json": "efcbe5124ea5edcd950a2870a0ae7088d0b630ebec86323dceeb735763388fab",
+    "status.json": "7890692e90106f4575116c88db799f2f39ac1d46d1f82e213ff1bcbd4742bcbd"
+  }
+}

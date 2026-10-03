@@ -1,0 +1,2 @@
+# Unified-diff context prefixes are intentional fixture bytes.
+*.patch -whitespace

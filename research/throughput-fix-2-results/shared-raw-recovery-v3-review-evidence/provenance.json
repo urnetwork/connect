@@ -1,0 +1,35 @@
+{
+  "append_only_terminal_silent_lane": {
+    "collected_utc": "2026-09-16T10:28:58.223823+00:00",
+    "handoff_sha256": "8eddec854d1e0e18fb71a7505263c388d057cf0bd158c7a60076a2c1e4ff9bee",
+    "limit": "One bounded run remains an open regression; it establishes neither a deterministic mechanism nor a repaired regression.",
+    "source_fidelity": "Frozen credit-long-after source and binary pins were rechecked from the handoff."
+  },
+  "archive_kind": "shared_raw_recovery_v3_review_evidence",
+  "artifact_exclusions": [
+    "Do not copy raw logs, source, overlays, binaries, environment, packet buffers or synthetic wire identities into the sanitized evidence archive. Numerical readings and test outcomes may be normalized.",
+    "The earlier oracle-v1 uses a rejected broad RTO and cannot establish final acceptance.",
+    "Intermediate diagnostic and race-contaminated test shapes are retained but are not passing evidence."
+  ],
+  "attribution_limits": [
+    "This is scoped review evidence. The recovery candidate is not throughput acceptance because the retained original long gate fails.",
+    "The final race selection proves the named recovery roots only. It does not close the frozen silent-lane or retransmit-storm regression failures.",
+    "All raw logs, source copies, overlays, binaries, environment material, packet buffers, synthetic wire identities, local paths, and identifiers remain outside this archive.",
+    "The earlier broad-RTO policy is rejected. Its actual one-SACK failure and fixture failures remain archived as negative evidence.",
+    "The intermediate fixture with a race warning is retained and explicitly excluded from passing evidence.",
+    "Oracle and O(n) controls are retained as excluded diagnostics; their numerical readings are not acceptance evidence."
+  ],
+  "collection_time_utc": "2026-09-16T10:25:14.978386+00:00",
+  "fixture_clock_rationale": "Independent actual-write root forces600ms local pacing and proves300ms recovery begins at600ms. Existing controlled-probe fixtures spent100ms before physical write; their unchanged300ms interval now has explicit negative check through physical+300ms-1ns and required retry atphysical+300ms. An independent actual second-message SACK at100ms preserves the older one-interval endpoint-loss bound. The original12 fixture failures remain in logs.",
+  "handoff_sha256": "8f5779017e07cf8e8c9e369602fd40907ff8c8ca7d58628ed082da5b0d75e947",
+  "integration_fidelity": "Each of the ten guarded files was checksum-verified against the reviewed candidate and the current shared source during archival.",
+  "open_adjacent": [
+    "The analogous retry re-arm still starts from pre-write loop time; no root or fix is claimed. Parent requested a separate actual-worker reproduction after this handoff.",
+    "Frozen fffee019 full-regression silent-lane admission failure remains open. One bounded prior comparison passed without explaining it; final candidate single run is pending.",
+    "Frozen retransmit-storm fixture precondition remains open; parent owns constant-window virtual-time diagnostic.",
+    "Measured service still collapses in the long cell; recovery does not close capacity.",
+    "No explicit receipt/attempt protocol implemented; cross-route physical drain remains independently unproven."
+  ],
+  "scope": "First paced H1 recovery starts at the first physical write. Unproved ordinary first-copy recovery may consume confirmed retained sibling raw residence, after explicit/lane loss classification and within existing scale/max/lifetime bounds. Both heaps are repaired without removing ACK/budget ownership. No service estimator, wire, burst, or retry-backoff change.",
+  "status_from_handoff": "reviewed roots pass; long throughput remains failing; no shared mutation by pacing agent"
+}

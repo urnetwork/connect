@@ -13,6 +13,14 @@ param(
     [Switch]$AddToStartup = $false
 );
 
+# Test-YesAnswer reads a [Y/n] prompt answer: yes is the default, so an empty
+# answer (plain Enter), "y" and "yes" all mean yes.
+function Test-YesAnswer {
+    param([string]$Answer)
+    $Normalized = "$Answer".Trim().ToLower()
+    return ($Normalized -eq "" -or $Normalized -eq "y" -or $Normalized -eq "yes")
+}
+
 $Bold = ""
 $Reset = ""
 
@@ -123,7 +131,7 @@ function Set-Path {
 
 Print-Settings
 
-$GithubURLBase = "https://api.github.com/repos/urnetwork/connect"
+$GithubURLBase = "https://api.github.com/repos/urnetwork/build"
 
 if ($Version -eq "latest") {
     $GithubURL = "$GithubURLBase/releases/latest"
@@ -292,7 +300,7 @@ if (-not $NonInteractive) {
     else {
 	$Answer = Read-Host "Would you like to authenticate to URnetwork now? [Y/n]"
 
-	if ($Answer.ToLower() -eq "y") {
+	if (Test-YesAnswer $Answer) {
 	    Write-Host "Authenticating now"
 
 	    while ($true) {
@@ -318,7 +326,7 @@ if ($OS -eq "windows") {
 	$Answer = Read-Host "Do you want to add this service to startup? [Y/n]"
     }
     
-    if ($Answer.ToLower() -eq "y") {
+    if (Test-YesAnswer $Answer) {
 	$StartupPath = Join-Path -Path $env:APPDATA -ChildPath "Microsoft\Windows\Start Menu\Programs\Startup"
 	$ShortcutPath = Join-Path -Path $StartupPath -ChildPath "urnetwork.lnk"
 

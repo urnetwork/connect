@@ -1,0 +1,9 @@
+{
+  "fixture_correction": "Initial before/after benchmarks incorrectly expected 11 ms residence instead of 20 ms. Both failed before emitting timing rows. Only the expected residence and explicit raw RTT assertion changed; no production correction or threshold relaxation is implied.",
+  "interpretation": "27 nonrace CPU readings under concurrent host load, without a timing acceptance threshold. These are not host throughput or full estimator acceptance.",
+  "invariants": "Each ACK timing is consumed; exact once-only cumulative byte totals, 10 ms adjusted RTT, 11 ms raw RTT, 20 ms residence including 10 ms advertised compression, 128 observations, and zero allocations are checked.",
+  "no_quiescence_wait": true,
+  "raw_logs": "Excluded; hashes, safe run context, all benchmark readings and fixture failures are retained.",
+  "scope": "Real coalesceReceivedAck entry point with exact confirmed first H1 heads, 128 active RTT observations, 512 or 8192 retained envelopes, and 1 or 32 newly credited messages per ACK. Dispatch and envelope allocation are outside the measured work.",
+  "source_boundary": "Raw-plumbed and warm-corrected arms differ in the warm sampler endpoint math with identical timing-credit plumbing. The third arm is current live production and therefore also lacks the proposed timing-credit plumbing. The copied plumbed sources retain their earlier sizing/statistics implementation; those functions are not exercised by this fixture. All six differing production file digests are retained."
+}

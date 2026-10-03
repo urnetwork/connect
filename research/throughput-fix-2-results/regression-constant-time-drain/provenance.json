@@ -1,0 +1,22 @@
+{
+  "censored_comparisons": 0,
+  "comparison_count": 0,
+  "failed_comparisons": null,
+  "host_performance_acceptance": "no host comparisons in this selection",
+  "input_sha256": {
+    "ledger.jsonl": "3893f9c34662c17523defb3ac8d9f94510d6a9ce7cd9a7bee79c751c11531de6",
+    "manifest.json": "a7a7989fa7cade663657812786ab4232c59293b08dce135a6ff3bd4843498763",
+    "run.log": "1331437e5c8576c57326ac245f3d015247a48b6febb5a712f9acca7b9072614e",
+    "status.json": "c42fbdcb91910860a9212d3a12fd8f9cc412c39d0e3e50eb6277667db6c2f057"
+  },
+  "note": "Raw run.log remains outside this archive; its hash is retained. Outcomes are an excerpt. Process success alone does not prove performance acceptance.",
+  "outcome": "process passed",
+  "sanitization": {
+    "numerical_ledger_rows_unchanged": true,
+    "outcomes_excerpt_ipv4_literals_redacted": 1,
+    "raw_run_log_excluded_and_original_sha256_retained": true
+  },
+  "top_level_failed": 0,
+  "top_level_passed": 3169,
+  "top_level_skipped": 25
+}

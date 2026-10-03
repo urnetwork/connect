@@ -1,0 +1,12 @@
+--- FAIL: TestWindowPacingDrainsAQueueAtEachServiceRate (0.00s)
+    --- FAIL: TestWindowPacingDrainsAQueueAtEachServiceRate/rate=125000 (0.00s)
+        transfer_window_pacing_test.go:631: queued service had no drain capacity: 1s
+    --- FAIL: TestWindowPacingDrainsAQueueAtEachServiceRate/rate=1250000 (0.00s)
+        transfer_window_pacing_test.go:631: queued service had no drain capacity: 1s
+    --- FAIL: TestWindowPacingDrainsAQueueAtEachServiceRate/rate=12500000 (0.00s)
+        transfer_window_pacing_test.go:631: queued service had no drain capacity: 1s
+    --- FAIL: TestWindowPacingDrainsAQueueAtEachServiceRate/rate=125000000 (0.00s)
+        transfer_window_pacing_test.go:631: queued service had no drain capacity: 1s
+FAIL
+FAIL	github.com/urnetwork/connect	0.799s
+FAIL

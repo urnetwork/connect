@@ -1,0 +1,6 @@
+=== RUN   TestWindowPacingDeliveredSiblingTailsAreNotWireFlight
+    transfer_window_pacing_flight_test.go:135: known delivery did not end the opening allowance for new excess flight
+--- FAIL: TestWindowPacingDeliveredSiblingTailsAreNotWireFlight (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.763s

@@ -1,0 +1,26 @@
+{
+  "classification": "Authoritative pre-fix prescribed-training and actual shared-consumer accounting root: all four equal/unequal two/four-lane utilization cases fail independently.",
+  "consumer_scope": "Actual waitForService reservation and shared burst dispatch consume each final qualified lane estimate. Three prior flight amounts remain below all effective byte windows and within the freshness interval. Probe was spent by real preceding reservations/confirmed writes and bounded ACKed flights.",
+  "contract_split": "Byte ownership, target/window bounds, finite startup allowance and evidence scope are hard controls. Completing the next aggregate work within its observed prior delivery duration is the stated utilization objective, not a protocol correctness invariant or exact serialization-rate oracle.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "experimental_sampler_sha256": "3294610224c983316fc09191818e13f59bc964dcff6af76ab9db793cf8ad4f3a",
+  "fixture_revision": "Explicit legacy10ms compression keeps short raw ACK trains unqualified. Its two-opening-window discovery is spent through separate bounded physical flights.",
+  "limits": "No production fix, broad model acceptance, physical throughput or attribution to existing SDK failures is claimed.",
+  "outcomes": "45P12F0S; race=true, no warnings.",
+  "production_changes": [],
+  "race": true,
+  "repetitions": 3,
+  "scope_controls": "Actual-consumer idle/stale references and independent-service evidence controls pass.",
+  "source_base": {
+    "artifact": "throughput-fix-2-cumulative-shared-reserve-before-v3-pinned",
+    "snapshot_inputs_sha256": "3ae2257adc4a65dd26f4f31f45f7011f32e257d0ec578f8689f091bcbaf639f5"
+  },
+  "table_failure_propagation": false,
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "test_sha256": "372e70a86e0a4f49cc51a32ec6fcf31337c5b91c71b6f3ff8946c3325e34b0c4",
+  "training_scope": "Prescribed complete H1 flights and raw ACK times bypass the pacing timer during training. Messages\u22648KiB, flights\u2264effective opening, aggregate offered rate below125MB/s, exact service/sequence byte totals and complete tail drains. This is not closed-loop throughput reachability.",
+  "transfer_sha256": "16fb5b507169f93e6ce22b67696fbdb82a4e9c4e18deed0caeb868335293407a",
+  "unchanged_original_controls": "All12 original TestWindowPacingCumulative roots pass, including single reply, tiny replies, missing/stale history, permission step, genuine slower service, target/byte caps, wrong carrier, sibling ownership and standalone behavior.",
+  "unexecuted_cases_are_not_go_test_skips": true,
+  "unexecuted_table_cases": []
+}

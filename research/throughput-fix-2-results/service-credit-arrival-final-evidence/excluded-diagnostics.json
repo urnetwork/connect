@@ -1,0 +1,22 @@
+[
+  {
+    "diagnostic_only": true,
+    "log": "trace.log",
+    "raw_log_sha256": "11ef4aa50deeecfc07badf6c7ad2f22064f85ebc1edfd1c454ac9e0cbdd8e0f5",
+    "reason": "Trace perturbs scheduling; retain only hash and exclusion.",
+    "service_readings_normalized": 0,
+    "top_level_outcomes": "not_normalized; raw_trace_excluded"
+  },
+  {
+    "diagnostic_only": true,
+    "log": "arrival.log",
+    "raw_log_sha256": "95a59336a542ca80f5091a5460893c48dc2d35fe1fd3b191bfa17fa2e7939238",
+    "reason": "O(n) per-item arrival candidate is explicitly diagnostic and unlanded; retain only hash and exclusion.",
+    "service_readings_normalized": 0,
+    "top_level_outcomes": {
+      "FAIL": 0,
+      "PASS": 1,
+      "SKIP": 0
+    }
+  }
+]

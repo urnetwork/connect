@@ -1,0 +1,20 @@
+{
+  "archive_path_normalization": "External artifact lookup paths are represented by snapshot identifier and relative path. Raw logs and original compile manifests remain unmodified outside the repository; their original hashes are pinned. Race-stack extracts replace only frozen-source and Go-installation path prefixes, preserving line numbers and stack text.",
+  "candidate_patch_sha256": "988baf3b1a04ff26da1dfdb40888e3da9fce183f5b987182e4b5de16bd97b01e",
+  "comparison": "Same frozen combined-v3 core plus identical new test files. After adds only the fresh cumulative rate field/qualification, final pacing calculation, and absent-service fallback helper hunk.",
+  "event_plumbing": false,
+  "performance_gates_changed": false,
+  "race": false,
+  "repetitions": 1,
+  "sampler": "accepted 54b360 retained in both variants",
+  "scope": "Original SDK constructor fixture and checkWindowSdkCell, unchanged serializers, warmup, durations and gates. Short covers four constrained device/provider profiles at one/eight flows (eight cells); Long covers default device100/400ms at one flow (two cells). Each cell retains reference/candidate readings. Short passes after; Long remains failed and must not be attributed to the zero-service fallback.",
+  "scope_guard_included": false,
+  "sdk_fixture_sha256": "44e0bf1b907dace14b09405ca48246ddf0d890a77afcfd751025b7ef3f57564a",
+  "source_base": {
+    "snapshot": "model-retained-service-combined-v3",
+    "source_content_sha256": "cdac094ad63473c3edfc4b75df040a183c6f7329c989e2ae83ba215872d52d51"
+  },
+  "test_execution_owner": "test_monitor_medium",
+  "test_names_in_outcomes": "Exact raw names; no retroactive mapping.",
+  "warmup_changed": false
+}

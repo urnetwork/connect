@@ -1,0 +1,34 @@
+{
+  "after_outcomes": "69P3F0S",
+  "before_outcomes": "57P15F0S",
+  "classification": "Initial joined shared-ring/cold-consumer candidate passes four utilization roots but newly written early-return test incorrectly requires initial rather than retained window. This original failed control is preserved, not production acceptance.",
+  "consumer_scope": "Actual waitForService reservation and shared burst dispatch consume final qualified estimates for at most three observed flights, within measured freshness and effective byte limits. Startup allowance is spent through actual preceding reservations and bounded ACKed flights.",
+  "contract_split": "Exact byte ownership, finite probe, target/window limits, and evidence scope are hard invariants. Aggregate release within its measured prior duration is a utilization objective, not protocol correctness or an exact required serialization value.",
+  "credit_scope": "Every physical initial H1 write enrolls an actual retained frame, confirms its write, then publishes through publishAckServiceCredit. Duplicate cumulative heads and late SACK calls cannot add credit. Exactly acknowledged frames are removed before the next complete flight.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "event_plumbing": false,
+  "limits": "No general sampler acceptance, actual worker throughput, SDK attribution, or closed-loop warm-growth claim.",
+  "live_adoption": false,
+  "performance_gates_changed": false,
+  "production_changes": [
+    "transfer.go",
+    "transfer_window_pacing.go",
+    "transfer_window_pacing_delivery.go",
+    "transfer_window_service_credit.go",
+    "transfer_window_service_delivery.go"
+  ],
+  "race": true,
+  "repetitions": 3,
+  "source_base": {
+    "after": "throughput-fix-2-cumulative-shared-delivery-after-v1-pinned",
+    "before": "throughput-fix-2-cumulative-shared-delivery-before-v1-pinned"
+  },
+  "test_contract_error": "missing-history requires Window==Initial, although a prior qualified interval legitimately retained548588 bytes. Correct contract preserves the pre-clear effective window; common pacing already matched the sibling. No production change follows from this assertion failure.",
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "training_scope": "Prescribed complete H1 flights and explicit raw ACK times bypass pacing during training. All physical frames are at most8KiB; each flight stays within effective window and aggregate training below125MB/s. This is not closed-loop throughput reachability.",
+  "unexecuted_after_table_cases": [
+    "no-budget",
+    "delivery-admission"
+  ],
+  "unexecuted_cases_are_not_go_test_skips": true
+}

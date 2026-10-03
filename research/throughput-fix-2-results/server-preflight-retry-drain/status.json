@@ -1,0 +1,10 @@
+{
+  "archive_result": "complete_setup_only_server_preflight_record",
+  "attempts": 4,
+  "database_integrations_deferred": true,
+  "go_build_started": false,
+  "go_tests_started": false,
+  "outcomes": {
+    "SETUP_BLOCKED": 4
+  }
+}

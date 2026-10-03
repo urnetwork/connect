@@ -1,0 +1,22 @@
+{
+  "scope": "Normalized copied proof, original raw/source/binary/status hashes preserved",
+  "file_sha256": {
+    "after-expanded/ledger.jsonl": "f81ddc5bc4edc1d7371d48c4adf4dc9d34d62076abd8f5e45adfcc9b888f35b7",
+    "after-expanded/manifest.json": "598510bcfeac593baf7ff19f7510e00ce48f46ff5390147ee2bfb208ca88abb5",
+    "after-expanded/outcomes.txt": "fddb9bb8e3c3751493cde10547d3add52b7609ef0eb43c54af253f6e25b9cc59",
+    "after-expanded/provenance.json": "f8f0a34e511fd3c89f977749ac891d19faf3cb8d6534bfb572cf0bd545c01122",
+    "after-expanded/status.json": "de1c9be696a1f52d24a72ad2f97394914ac9f36069b278f9a7e5e0a5529710ca",
+    "baseline-negative/ledger.jsonl": "e8f9f87c3badc14d0d792b953661082fc41791882d4fb924a20540b2ba869238",
+    "baseline-negative/manifest.json": "6f7cd969d42233ee55c451ca6f71584e55c0d046de5428d02153604a84d887f1",
+    "baseline-negative/outcomes.txt": "3fc135774feb60dcf9c138607dfcaeb9a59469782dfd466e9137dbf1f6011ef1",
+    "baseline-negative/provenance.json": "cee0bb219e4d698d194e7cd62fffb80f998a508be6fc66821a9da07e7ac4ff30",
+    "baseline-negative/status.json": "839d340858c710ff7e7c007813d17d112f218d606ee54eeabac79fbb90b61621",
+    "before-expanded/ledger.jsonl": "e8f9f87c3badc14d0d792b953661082fc41791882d4fb924a20540b2ba869238",
+    "before-expanded/manifest.json": "5b89cabd8868b13832bc6e905dc12c0be326dd5197872e2c043605b999d42c94",
+    "before-expanded/outcomes.txt": "a41d20eb78abcfc1cef186fbd5cb6dec5414f7acc16163a14e0c353ac34b807a",
+    "before-expanded/provenance.json": "53ac53da98266bca5e23703404b11a5fc592fe59d14703c006922a0b317d4197",
+    "before-expanded/status.json": "459d201762549e95cb0c125ca33cec50cd825bf8331e17e6f8839a08565be618",
+    "contract-audit.md": "2b3dcddd36c2994e4cb6c0b7a0687059f09ce77f76305e400892c27e372ce16f",
+    "summary.json": "ebefff1062b3093a3fc68e3cfe3c27676a6b0bea71345d799ee0095ffb35462d"
+  }
+}

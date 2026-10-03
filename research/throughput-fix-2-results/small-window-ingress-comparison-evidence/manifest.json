@@ -1,0 +1,17 @@
+{
+  "archive_kind": "small_window_ingress_comparison_evidence",
+  "file_count": 10,
+  "file_sha256": {
+    "artifact-inventory-pins.json": "86ea62a491a644aa7fcfe83a9a44b4b854938e49de566bd542a868d601d77da6",
+    "build-pins.json": "d2ed160d7b026de3dc321cd17f088528b4ea142108b307804503c04932a3ff59",
+    "excluded-diagnostics.json": "1a3a2e18bf9ae84a39ede9971f3baf40e6d7f9b455084c7988825d31cb207b2e",
+    "fixture-observations.jsonl": "5093cb2b3e6ca51975b2e0b013e89b6a4460b122488b3413407d79b844eb02dd",
+    "outcomes.jsonl": "746cce9eed4542dfe92c5f812232fd815244b7f0284b80635bd29c3497619608",
+    "provenance.json": "2cab0092f05691b1eeadf6033b187c2f0a95a911760fd37f5c7227c187fa0ae2",
+    "run-status.json": "e16aeaabc8a3058f67b650d5aae3671125a13d6e470cf63f8fcef6b5dfc33689",
+    "service-readings.jsonl": "f9d1c6884c828f88e7ca3430968f9dcdbf970f5a0d910d4a7ab2bde6b5291e10",
+    "source-pins.json": "0a7a750ef5c35ae9aff87af695d2bc6a7a24e1d861a9b10f53aafdd76e3d7126",
+    "status.json": "e490b9b856acb3205304639312a1513efa59b385968455aeac7593df250d8da1"
+  },
+  "schema_version": 1
+}

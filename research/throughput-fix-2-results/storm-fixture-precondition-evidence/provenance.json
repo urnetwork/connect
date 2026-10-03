@@ -1,0 +1,23 @@
+{
+  "archive_kind": "storm_fixture_precondition_evidence",
+  "attribution_limits": [
+    "This is a fixture correction and an independent default-pacer regression; it is not a production recovery change.",
+    "The default-pacer control establishes that the earlier storm fixture no longer reproduces its assumed timeout-retry precondition.",
+    "The forced constant-window control retains the original recovery and fairness assertions without relaxed thresholds.",
+    "The silent-lane admission failure remains open and is not covered by this evidence.",
+    "Raw logs, source files, overlays, binaries, local paths, and synthetic identities are excluded; only normalized outcomes, numeric observations, and checksums are retained."
+  ],
+  "collection_time_utc": "2026-09-16T10:30:59.193043+00:00",
+  "handoff_sha256": "99e14c8761bdf7382dc9ca33fd38aee552f2df0ae8d64187ad3fb6d2a0e17e82",
+  "limits": [
+    "This is a fixture correction plus an independent default-pacer regression, not a production recovery change",
+    "Silent-lane admission remains a failing regression and is not covered by this correction"
+  ],
+  "rationale": [
+    "Default paced delivery makes zero retries even with historical deferral disabled; old storm precondition is no longer true",
+    "The original queued-window storm is forced with existing constantSendWindow for both deferral arms; all old recovery/fairness assertions stay",
+    "Separate default-pacer control requires delivery with zero timeout retries and zero hidden timeout deferrals",
+    "Virtual time and pooled ownership setup provide deterministic scheduling and complete cleanup; existing fixed delivery bound retained"
+  ],
+  "scope": "Reviewed storm fixture: virtual-time queued-window/defer control and separate default-pacer control, on current integrated credit+recovery production. No relaxed recovery thresholds."
+}

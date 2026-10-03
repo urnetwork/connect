@@ -1,19 +1,16 @@
 package connect
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
 
-// The two blackhole signals are not equally strong and must not share a bound.
-//
-// A provider that acknowledges nothing is gone. A provider that acknowledges
-// our sends but returns no destination data is demonstrably alive, and may
-// simply be carrying a flow that is waiting on a slow origin. Removing an exit
-// destroys every flow pinned to it, not just the quiet one, so the ambiguous
-// case has to clear a higher bar.
+// The two blackhole signals do not share a clock or a deadline. Missing peer
+// ACKs allow the full carrier read interval; receive silence keeps its own
+// corroboration/quarantine policy and bounded telemetry window.
 //
 // On mainnet the shared 5s bound removed 44 providers out of 44 -- roughly one
 // every 18s under load -- and every one of those providers was still
@@ -21,9 +18,9 @@ import (
 func TestBlackholeReceiveTimeoutIsSeparateFromSendTimeout(t *testing.T) {
 	settings := DefaultMultiClientSettings()
 
-	if settings.BlackholeReceiveTimeout <= settings.BlackholeTimeout {
+	if settings.BlackholeReceiveTimeout == settings.BlackholeTimeout || settings.BlackholeReceiveTimeout != 20*time.Second {
 		t.Errorf(
-			"receive bound %v must be longer than the send bound %v: it is the weaker signal",
+			"receive bound %v must remain independent of the read-aligned send bound %v",
 			settings.BlackholeReceiveTimeout, settings.BlackholeTimeout,
 		)
 	}
@@ -163,35 +160,38 @@ func TestSynWaitExceededIsPerExit(t *testing.T) {
 	update := &multiClientChannelUpdate{}
 	exitA := &multiClientChannel{}
 	exitB := &multiClientChannel{}
+	tcpPath := udpTestPath(4)
+	tcpPath.Protocol = IpProtocolTcp
+	tcpPath.Syn = true
 	// wide enough that a scheduler or GC stall between two adjacent calls
 	// cannot age the clock past the bound and fail the "does not trip"
 	// assertions spuriously on a loaded runner
 	timeout := 250 * time.Millisecond
 
 	// first syn arms the clock, nothing trips
-	if update.synWaitExceeded(exitA, timeout) {
+	if update.synWaitExceeded(exitA, tcpPath, timeout) {
 		t.Fatal("first syn tripped the clock")
 	}
 	// a retransmit inside the window does not trip
-	if update.synWaitExceeded(exitA, timeout) {
+	if update.synWaitExceeded(exitA, tcpPath, timeout) {
 		t.Fatal("retransmit inside the window tripped the clock")
 	}
 
 	time.Sleep(timeout + 50*time.Millisecond)
 
 	// moving to a new exit must restart the wait, not inherit the old one
-	if update.synWaitExceeded(exitB, timeout) {
+	if update.synWaitExceeded(exitB, tcpPath, timeout) {
 		t.Fatal("a fresh exit inherited the previous exit's wait")
 	}
 
 	time.Sleep(timeout + 50*time.Millisecond)
 
 	// the same exit past the timeout trips
-	if !update.synWaitExceeded(exitB, timeout) {
+	if !update.synWaitExceeded(exitB, tcpPath, timeout) {
 		t.Fatal("an aged wait on the same exit did not trip")
 	}
 	// and tripping restarts the clock rather than firing on every retransmit
-	if update.synWaitExceeded(exitB, timeout) {
+	if update.synWaitExceeded(exitB, tcpPath, timeout) {
 		t.Fatal("the clock did not restart after tripping")
 	}
 }
@@ -306,11 +306,10 @@ func TestBlackholeUplinkStaleHoldsReceiveVerdicts(t *testing.T) {
 	}
 }
 
-// The no-send-ack verdict is the unambiguous signal and must never be gated
-// or rebased by uplink staleness: send acks ride the tunnel transport whose
-// liveness the transport gate tracks separately, so a provider that stops
-// acknowledging while that transport is up is convicted on its own signal.
-func TestBlackholeUplinkGateNeverHoldsNoSendAck(t *testing.T) {
+// On a reliable carrier, no-send-ack is an unambiguous signal and must never be
+// gated or rebased by uplink staleness: successful carrier delivery leaves the
+// provider as the missing acknowledgement owner.
+func TestBlackholeUplinkGateNeverHoldsReliableNoSendAck(t *testing.T) {
 	stats := &clientWindowStats{
 		log:               DefaultLogger(),
 		firstSendNackTime: time.Now().Add(-10 * time.Second),
@@ -330,6 +329,37 @@ func TestBlackholeUplinkGateNeverHoldsNoSendAck(t *testing.T) {
 	}
 	if held != blackholeNone {
 		t.Errorf("the send verdict was reported held: %q", held)
+	}
+}
+
+// QUIC DATAGRAM transport-up proves only that the carrier accepts writes. A
+// Pack or its Ack can still be lost while Transfer is recovering it, including
+// when unrelated datagrams are getting through. Transfer's bounded Ack retry
+// lifetime is therefore the hard verdict for an unreliable carrier; the short
+// blackhole window must not race it in either uplink state.
+func TestBlackholeDefersUnreliableNoSendAckToTransfer(t *testing.T) {
+	now := time.Now()
+	stats := &clientWindowStats{
+		log:               DefaultLogger(),
+		firstSendNackTime: now.Add(-10 * time.Second),
+	}
+
+	for _, uplinkStale := range []bool{false, true} {
+		gates := blackholeGates{
+			uplinkStale:             uplinkStale,
+			unreliableSendTransport: true,
+		}
+		reason, held := blackholeReasonFromStats(
+			now,
+			stats,
+			5*time.Second,
+			20*time.Second,
+			30*time.Second,
+			gates,
+		)
+		if reason != blackholeNone || held != blackholeNoSendAck {
+			t.Fatalf("uplinkStale=%t unreliable carrier reason=%q held=%q, want none/%q", uplinkStale, reason, held, blackholeNoSendAck)
+		}
 	}
 }
 
@@ -429,6 +459,77 @@ func TestBlackholeTransportDownHoldsAllVerdicts(t *testing.T) {
 	reason, held := blackholeReasonFromStats(now, healthy, 5*time.Second, 20*time.Second, 30*time.Second, blackholeGates{transportDown: true})
 	if reason != blackholeNone || held != blackholeNone {
 		t.Errorf("a healthy window reported reason %q held %q with the transport down", reason, held)
+	}
+}
+
+// An empty route set is exculpatory only for a bounded restoration grace. The
+// clock is separate from provider-traffic stats because those stats eventually
+// age to zero/zero (healthy) while a permanently route-less channel still
+// cannot carry a single packet.
+func TestTransportDownExpiryBoundsTheVerdictHold(t *testing.T) {
+	now := time.Now()
+	maxHold := 15 * time.Second
+
+	if transportDownExpired(now, time.Time{}, maxHold) {
+		t.Fatal("a transport that never entered a down epoch expired")
+	}
+	if transportDownExpired(now, now.Add(-maxHold), 0) {
+		t.Fatal("a disabled transport-down bound expired")
+	}
+	if transportDownExpired(now, now.Add(-maxHold+time.Nanosecond), maxHold) {
+		t.Fatal("transport-down grace expired early")
+	}
+	if !transportDownExpired(now, now.Add(-maxHold), maxHold) {
+		t.Fatal("transport-down grace did not expire at its bound")
+	}
+}
+
+// Exercise the same route-set predicate and epoch state machine used by the
+// live detector. A migration that restores a route inside the grace must erase
+// the old epoch, so elapsed time from the withdrawal cannot later retire the
+// channel. A second withdrawal starts a fresh epoch rather than inheriting the
+// first one's age.
+func TestTransportDownEpochResetsWhenRouteReturns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	routeManager := NewRouteManager(ctx, "transport-down-epoch-test")
+	transport := NewSendGatewayTransport()
+	route := make(chan []byte)
+	t0 := time.Now()
+	maxHold := 15 * time.Second
+
+	transportDownSince, entered, restored := updateTransportDownEpoch(
+		t0,
+		!routeManager.HasActiveTransport(),
+		time.Time{},
+	)
+	if !entered || restored || !transportDownSince.Equal(t0) {
+		t.Fatalf("initial withdrawal = (%v, entered=%v, restored=%v), want (%v, true, false)", transportDownSince, entered, restored, t0)
+	}
+
+	routeManager.UpdateTransport(transport, []Route{route})
+	transportDownSince, entered, restored = updateTransportDownEpoch(
+		t0.Add(maxHold/2),
+		!routeManager.HasActiveTransport(),
+		transportDownSince,
+	)
+	if entered || !restored || !transportDownSince.IsZero() {
+		t.Fatalf("route restoration = (%v, entered=%v, restored=%v), want (zero, false, true)", transportDownSince, entered, restored)
+	}
+	if transportDownExpired(t0.Add(2*maxHold), transportDownSince, maxHold) {
+		t.Fatal("the erased withdrawal epoch expired after its route returned")
+	}
+
+	routeManager.RemoveTransport(transport)
+	secondDown := t0.Add(2 * maxHold)
+	transportDownSince, entered, restored = updateTransportDownEpoch(
+		secondDown,
+		!routeManager.HasActiveTransport(),
+		transportDownSince,
+	)
+	if !entered || restored || !transportDownSince.Equal(secondDown) {
+		t.Fatalf("second withdrawal = (%v, entered=%v, restored=%v), want (%v, true, false)", transportDownSince, entered, restored, secondDown)
 	}
 }
 
@@ -715,6 +816,9 @@ func TestBlackholeDetectConsultsGates(t *testing.T) {
 	if !strings.Contains(body, "hasActiveTransport(") {
 		t.Error("detectBlackhole does not cross-check the channel's transport liveness")
 	}
+	if !strings.Contains(body, "hasActiveUnreliableSendTransport(") {
+		t.Error("detectBlackhole does not distinguish unreliable send-carrier silence")
+	}
 	if !strings.Contains(body, "blackholeGates{") {
 		t.Error("detectBlackhole does not pass the gates into the decision")
 	}
@@ -743,7 +847,7 @@ func TestFormationPollTimeoutDefaults(t *testing.T) {
 }
 
 // TestFormationFastPollGuardsEmptyWindowOnly pins where the fast poll applies:
-// sendPacket's retry loop consults FormationPollTimeout only on the
+// sendParsedPacketGroup's retry loop consults FormationPollTimeout only on the
 // zero-candidates branch (the window has no offer at all), never as a general
 // retry accelerant — candidates that exist, including the benched fallback,
 // keep the SendRetryTimeout pacing.
@@ -753,18 +857,18 @@ func TestFormationFastPollGuardsEmptyWindowOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendPacket(")
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(")
 	if !ok {
-		t.Fatal("could not find sendPacket")
+		t.Fatal("could not find sendParsedPacketGroup")
 	}
 
 	emptyBranch := "if len(orderedClients) == 0 {"
 	branchStart := strings.Index(body, emptyBranch)
 	if branchStart < 0 {
-		t.Fatal("sendPacket's retry loop has no empty-candidates branch")
+		t.Fatal("sendParsedPacketGroup's retry loop has no empty-candidates branch")
 	}
 	if !strings.Contains(body, "FormationPollTimeout") {
-		t.Fatal("sendPacket does not consult FormationPollTimeout")
+		t.Fatal("sendParsedPacketGroup does not consult FormationPollTimeout")
 	}
 	// the consult must live inside the empty branch: after its start, before
 	// the race call that only runs with candidates

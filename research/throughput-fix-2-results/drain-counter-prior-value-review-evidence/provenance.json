@@ -1,0 +1,34 @@
+{
+  "archive_kind": "drain_counter_prior_value_review_evidence",
+  "classification": "bounded_accounting_lookup_optimization",
+  "cpu_scope": "Only two lifecycle benchmarks rerun on the optimized candidate,3x300ms each. Finished drain-scan rows were not rerun or relabeled as this source.",
+  "focused_race_scope": "11 direct drain roots and13 adjacent cancellation/identity/confirmation/deadline controls, each once.",
+  "input_handoff_pins_verified": 12,
+  "input_handoff_sha256": "ec68968699bfe65bea22b5bc54bb489b48345d077e3293b1dc87527e47edf647",
+  "performance_acceptance": "not evaluated",
+  "review": {
+    "conclusion": "The existing caller lock protects the prior write and generation across all four read/store pairs. Reusing that value removes redundant map reads without changing old/new predicate accounting. No new lifecycle issue found.",
+    "limitations": [
+      "Sequential CPU samples under current load, not a physical throughput acceptance claim.",
+      "No new broad model or regression run; the bounded race selection has24passes once."
+    ],
+    "memory_change_relative_to_counter": {
+      "per_ack_record_bytes": 0,
+      "per_item_bytes": 0,
+      "per_service_bytes": 0
+    },
+    "observed_cpu_change": "Ordinary lifecycle110.8\u219282.77ns median; retry/fresh299.8\u2192241.1ns. All six optimized samples0B/0allocs. Retain original counter and scan measurements unchanged."
+  },
+  "sanitization": {
+    "local_paths_network_addresses_and_generated_ids": "excluded",
+    "raw_logs_sources_overlays_and_binaries": "excluded; SHA-256 pins retained only",
+    "reference_before_rows": "preserved from the original counter run and explicitly not relabeled as optimized-source observations"
+  },
+  "schema_version": 1,
+  "scope": "Reuse the tail state already read under stateLock at four accounting calls; no counter predicate, cancellation generation, drain policy, admission, timer, wire, or retained-state changes.",
+  "sources_stable": {
+    "cpu": true,
+    "focused_race": true
+  },
+  "throughput_acceptance": "not evaluated"
+}

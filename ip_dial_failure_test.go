@@ -108,8 +108,10 @@ func TestClassifyDialFailureNoSignal(t *testing.T) {
 	if action, packet := classifyDialFailure(nil, syscall.ECONNREFUSED); action != dialFailureNone || packet != nil {
 		t.Errorf("nil path: action = %d, packet = %v, want none/nil", action, packet)
 	}
-	unknown := &IpPath{Version: 4, Protocol: IpProtocolUnknown}
-	if action, packet := classifyDialFailure(unknown, errors.New("x")); action != dialFailureNone || packet != nil {
-		t.Errorf("unknown protocol: action = %d, packet = %v, want none/nil", action, packet)
+	for _, ipVersion := range testIpVersions {
+		unknown := &IpPath{Version: ipVersion, Protocol: IpProtocolUnknown}
+		if action, packet := classifyDialFailure(unknown, errors.New("x")); action != dialFailureNone || packet != nil {
+			t.Errorf("v%d unknown protocol: action = %d, packet = %v, want none/nil", ipVersion, action, packet)
+		}
 	}
 }

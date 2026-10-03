@@ -1,0 +1,5 @@
+--- FAIL: TestTcpReturnCacheSharesAnExactBudgetAcrossFlows (0.00s)
+    ip_tcp_return_recovery_test.go:192: blocked retention allocated a replay copy outside the shared budget
+FAIL
+FAIL	github.com/urnetwork/connect	0.706s
+FAIL

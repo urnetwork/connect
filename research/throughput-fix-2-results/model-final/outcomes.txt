@@ -1,0 +1,25 @@
+=== RUN   TestWindowPathWindowMismatchMatrix
+--- PASS: TestWindowPathWindowMismatchMatrix (399.38s)
+=== RUN   TestWindowPathWindowMismatchChanges
+--- PASS: TestWindowPathWindowMismatchChanges (2.75s)
+=== RUN   TestWindowPathFifoSeparatesQueueAndPropagation
+--- PASS: TestWindowPathFifoSeparatesQueueAndPropagation (0.00s)
+=== RUN   TestWindowCompressionResidenceRestoresShortPathCapacity
+--- PASS: TestWindowCompressionResidenceRestoresShortPathCapacity (0.33s)
+=== RUN   TestWindowPathDeterministicPerformanceMatrix
+--- PASS: TestWindowPathDeterministicPerformanceMatrix (525.17s)
+=== RUN   TestWindowPathBoundsBurstsAtFiniteRelay
+--- PASS: TestWindowPathBoundsBurstsAtFiniteRelay (8.45s)
+=== RUN   TestWindowPathSlowLinkKeepsCapacity
+--- PASS: TestWindowPathSlowLinkKeepsCapacity (1.81s)
+=== RUN   TestWindowPathGapDeadline
+--- PASS: TestWindowPathGapDeadline (0.00s)
+=== RUN   TestWindowPathFifoServiceChange
+--- PASS: TestWindowPathFifoServiceChange (0.00s)
+=== RUN   TestWindowPathServicePerformanceMatrix
+--- PASS: TestWindowPathServicePerformanceMatrix (15.41s)
+=== RUN   TestWindowPathServiceCapacityChanges
+--- PASS: TestWindowPathServiceCapacityChanges (6.84s)
+=== RUN   TestWindowPathServicesShareFiniteRelay
+--- PASS: TestWindowPathServicesShareFiniteRelay (8.88s)
+PASS

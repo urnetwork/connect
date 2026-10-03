@@ -1,0 +1,90 @@
+{
+  "archive_kind": "receiver_timing_estimator_cpu",
+  "base_source": {
+    "asset_paths_are_relative_to": "connect",
+    "asset_pin_count": 3,
+    "asset_pin_manifest_sha256": "cc8812c467fba30db7c6e9cd7f5b5371089b3812a2571d78a9fbb260f811dc05",
+    "input_count": 753,
+    "input_inventory_sha256": "d1a7e3796b61250291f03a2c7d55ecfcb830b8ba77e85fc89cb48175ec5b966f",
+    "source_input_manifest_sha256": "49aa2b780117096ac06add5e2c516e919b6b8e54f2d3eac66073d3413209f729"
+  },
+  "build_and_run": {
+    "binary_sha256": "1ec85b8c63e3f2f212d54ed87298770c3cef8f905917e4c35961af772c666842",
+    "compile_host_load_average_at_end": [
+      7.84716796875,
+      7.177734375,
+      8.35302734375
+    ],
+    "compile_host_load_average_at_start": [
+      6.32177734375,
+      6.791015625,
+      8.27001953125
+    ],
+    "compile_manifest_sha256": "3f422235f7de707012c95a1ba53b881c3f4a97abb26e17142d5285a1151ff00a",
+    "go_version": "go version go1.26.7 darwin/arm64",
+    "prepare_manifest_sha256": "2cdb6eb0c0ff14a5892ea2893a67a32fd17a191f3228995ca1980f7be4567960",
+    "raw_compile_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw_run_log_sha256": "7d25d42e9569aec1723e81b8574e6e6dda28b2692dfe89d1f0fc6b649082f672",
+    "run_exit_code": 0,
+    "run_flags": [
+      "-test.run",
+      "^$",
+      "-test.bench",
+      "^BenchmarkWindowPacing(Service|Receiver)",
+      "-test.benchmem",
+      "-test.benchtime=500ms",
+      "-test.count=1"
+    ]
+  },
+  "candidate_source": {
+    "input_count": 755,
+    "input_inventory_sha256": "12ea2bb4321a84b808ef4e668f95b8667844bdae1ee5941e79e5c9ca216aba88",
+    "stable_after_compile": true,
+    "stable_after_run": true,
+    "stable_before_compile": true
+  },
+  "outcome": {
+    "allocation_guard_failures": 0,
+    "assertion_failures": 0,
+    "benchmark_failures": 0,
+    "benchmark_rows": 7,
+    "race_warnings": 0
+  },
+  "overlays": [
+    {
+      "destination": "connect/transfer_window_receiver_rtt.go",
+      "sha256": "b3ceb1f8c4598a2f1facc40e68bdcfa88fbb9e5100e0076babb37d34795f141e",
+      "source_name": "receiver-rtt.go"
+    },
+    {
+      "destination": "connect/transfer_window_pacing.go",
+      "sha256": "cfd8d0e686a339e920200a56794c3e7c00f5fb42c8d567d5a24ec8a6bf60f2d0",
+      "source_name": "candidate-pacing.go"
+    },
+    {
+      "destination": "connect/transfer.go",
+      "sha256": "f7942cbe0ee8ff97146998af2c780ee4dc94fcad74ab0c052c01004c971cc9de",
+      "source_name": "candidate-transfer.go"
+    },
+    {
+      "destination": "connect/transfer_window_receiver_benchmark_test.go",
+      "sha256": "35a94c53483d18f50eee24513876fcaec1f5be26e73ce862a791886a0046b7e7",
+      "source_name": "receiver-benchmark_test.go"
+    }
+  ],
+  "sanitization": {
+    "copied_source_overlay_and_binary": "not copied; represented by SHA-256 pins only",
+    "local_paths_generated_ids_and_network_addresses": "removed from archive text",
+    "raw_compile_and_run_logs": "retained locally; represented by SHA-256 only"
+  },
+  "schema_version": 1,
+  "scope": {
+    "benchmark_count": 1,
+    "benchmark_duration": "500ms",
+    "classification": "isolated_unlanded_cpu_prototype",
+    "performance_acceptance": "not evaluated",
+    "race": false,
+    "run_context": "isolated receiver timing CPU prototype; concurrent pacing and relay prototype work; no quiescence wait",
+    "throughput_acceptance": "not evaluated"
+  }
+}

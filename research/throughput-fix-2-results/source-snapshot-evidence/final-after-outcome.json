@@ -1,0 +1,11 @@
+{
+  "interpretation": "The final snapshot helper copied inputs before compiling and running, including both relative and runtime.Caller source inspections.",
+  "outcome": "3 PASS",
+  "raw_log_sha256": "62cbd118907b6b453096b15b1e8979eb4559b7ab09f0db99b098aba0b816df04",
+  "schema": "throughput-fix-2/source-snapshot-final-after-v1",
+  "tests": [
+    "test_compiled_audits_keep_the_build_source",
+    "test_copied_inputs_are_independent_and_verified",
+    "test_local_replacements_come_from_the_copied_module"
+  ]
+}

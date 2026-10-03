@@ -184,6 +184,16 @@ func TestMinTime(t *testing.T) {
 	AssertEqual(t, a, foundA)
 }
 
+// Keep size/samplesPerValue at four: for a uniform ranking, the standard error
+// of each sampled mean position is approximately sqrt(size/(12*samplesPerValue)).
+// These values therefore retain the prior test's statistical resolution and
+// exact rank tolerances while avoiding its sixteen-fold excess O(k*n^3) work.
+const (
+	weightedShuffleTestSize                  = 128
+	weightedShuffleTestSamplesPerValue       = 32
+	weightedShuffleTestSeed            int64 = 0x5753485546464c45
+)
+
 func TestWeightedShuffle(t *testing.T) {
 	// weighted shuffle many times and look at the average position
 	// the average position order should trend with the weight order
@@ -192,40 +202,43 @@ func TestWeightedShuffle(t *testing.T) {
 		t.Skip("skipping testing in short mode")
 	}
 
-	k := 64
-	n := 256
+	k := weightedShuffleTestSamplesPerValue
+	n := weightedShuffleTestSize
+	random := mathrand.New(mathrand.NewSource(weightedShuffleTestSeed))
 
 	netIndexes1 := map[int]int64{}
 	netIndexes2 := map[int]int64{}
 	netIndexes3 := map[int]int64{}
+	values := make([]int, n)
+	weights := make(map[int]float32, n)
+	for value := range n {
+		weights[value] = float32(n - value)
+	}
 
 	for i := 0; i < n*k; i += 1 {
 		if i%100 == 0 {
 			fmt.Printf("[w]%d/%d\n", i+1, n*k)
 		}
 
-		values := []int{}
-		weights := map[int]float32{}
-		for j := 0; j < n; j += 1 {
-			values = append(values, j)
-			weights[j] = float32(n - j)
+		for value := range n {
+			values[value] = value
 		}
 
-		WeightedShuffle(values, weights)
+		weightedShuffleWithEntropy(values, weights, float32(0), random)
 		for index, value := range values {
 			netIndexes1[value] += int64(index)
 		}
 
-		WeightedShuffleFunc(values, func(i int) float32 {
+		weightedShuffleFuncWithEntropy(values, func(i int) float32 {
 			return weights[i]
-		})
+		}, float32(0), random)
 		for index, value := range values {
 			netIndexes2[value] += int64(index)
 		}
 
-		WeightedSelectFunc(values, len(values), func(i int) float32 {
+		weightedSelectFuncWithEntropy(values, len(values), func(i int) float32 {
 			return weights[i]
-		})
+		}, float32(0), random)
 		for index, value := range values {
 			netIndexes3[value] += int64(index)
 		}
@@ -268,8 +281,12 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 		t.Skip("skipping testing in short mode")
 	}
 
-	k := 64
-	n := 256
+	k := weightedShuffleTestSamplesPerValue
+	n := weightedShuffleTestSize
+	weights := make(map[int]float32, n)
+	for value := range n {
+		weights[value] = float32(n - value)
+	}
 
 	orderedEntropies := []float32{
 		0.0,
@@ -278,37 +295,36 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 	}
 
 	for entropyIndex, entropy := range orderedEntropies {
+		random := mathrand.New(mathrand.NewSource(weightedShuffleTestSeed + int64(entropyIndex) + 1))
 		netIndexes1 := map[int]int64{}
 		netIndexes2 := map[int]int64{}
 		netIndexes3 := map[int]int64{}
+		values := make([]int, n)
 
 		for i := 0; i < n*k; i += 1 {
 			if i%100 == 0 {
 				fmt.Printf("[we]%d/%d\n", i+1, n*k)
 			}
 
-			values := []int{}
-			weights := map[int]float32{}
-			for j := 0; j < n; j += 1 {
-				values = append(values, j)
-				weights[j] = float32(n - j)
+			for value := range n {
+				values[value] = value
 			}
 
-			WeightedShuffleWithEntropy(values, weights, entropy)
+			weightedShuffleWithEntropy(values, weights, entropy, random)
 			for index, value := range values {
 				netIndexes1[value] += int64(index)
 			}
 
-			WeightedShuffleFuncWithEntropy(values, func(i int) float32 {
+			weightedShuffleFuncWithEntropy(values, func(i int) float32 {
 				return weights[i]
-			}, entropy)
+			}, entropy, random)
 			for index, value := range values {
 				netIndexes2[value] += int64(index)
 			}
 
-			WeightedSelectFuncWithEntropy(values, len(values), func(i int) float32 {
+			weightedSelectFuncWithEntropy(values, len(values), func(i int) float32 {
 				return weights[i]
-			}, entropy)
+			}, entropy, random)
 			for index, value := range values {
 				netIndexes3[value] += int64(index)
 			}

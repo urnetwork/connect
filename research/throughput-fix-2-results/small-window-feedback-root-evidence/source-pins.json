@@ -1,0 +1,16 @@
+{
+  "input_files": [
+    {
+      "name": "transfer_window_compressed_flights_test.go",
+      "sha256": "4fc60ed42d76607b6d238cd5a3e8c335907d334368eba9a9a1703e8745f89baa"
+    },
+    {
+      "name": "transfer_window_receiver_shrink_test.go",
+      "sha256": "1a737c94aa09bac26f94d7b0ae2668f7e2cd51d660c62b5c2245906fd77b8000"
+    },
+    {
+      "name": "transfer_window_pacing.go",
+      "sha256": "b8121e2e71a41cdc3ab3ccaf270600ec179be77e947a11375cfce0578a5dec31"
+    }
+  ]
+}

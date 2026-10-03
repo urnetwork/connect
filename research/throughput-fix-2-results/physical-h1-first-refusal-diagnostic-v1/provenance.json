@@ -1,0 +1,26 @@
+{
+  "candidate_status": "complete experimental receiver-service candidate with restored cumulative fallback; not accepted production",
+  "capture": "At most one record per arm and admission branch. Packet metadata copied while borrowed; no retained payload. Record emission occurs after original cleanup. Queue lengths are safe near-edge snapshots, not simultaneous atomic state; gate publication is immutable send-owner evidence.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "diagnostic_patch_sha256": "db2787d15247fa893068922359691aadc0a1d499de4fb9a1e987f30598783939",
+  "fixture_source": {
+    "artifact": "physical-h1-duplex-tun-fix-final",
+    "duplex_sha256": "c4754456f27ee4f9eea9ea4050b9b3ad5141158188313c46b11fa270e0f71918",
+    "physical_sha256_before_diagnostic": "bc7b10c6690c60bf0b6a7d583668caeb45a7c8e0f99b3f7ec7f0ac5080729fae"
+  },
+  "limits": "Diagnostic overhead and concurrent host load prohibit using rates for causal throughput attribution. The complete failed/censored physical readings remain retained, including the delivery slowdown.",
+  "network_quality_events": false,
+  "observation": "Both constant arms first refused pure52B TCP ACKs at count admission2/2 with resend gate open, before shared byte-capacity and provider-shard refusals. Delivery first hit its524288-byte opening, then the same count gate.",
+  "performance_acceptance": false,
+  "production_fix": false,
+  "race": false,
+  "repetitions": 1,
+  "retention": "Original sources, binaries, logs, commands and local paths remain immutable outside Git and are represented by hashes.",
+  "source_base": {
+    "artifact": "throughput-fix-2-receiver-service-validation-v1",
+    "candidate_source_sha256": "e6aaeb0801e4dc566dd66a9a4843c6a78d713722321a48e85312e4d7115d7790",
+    "inventory_sha256": "cb79e929de859509e52b7b821d40d5d2df8420858308ea94da39057f184e736d"
+  },
+  "stimuli": "Original constant/delivery/constant A/B/A, eight duplex TCP streams,1Gb/s each direction,300us added RTT,2.5s warmup and5s measurement. Gates, serializers, budgets, ports and workload unchanged.",
+  "test_execution_owner": "test_monitor_medium (Terra medium)"
+}

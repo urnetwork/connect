@@ -1,0 +1,43 @@
+{
+  "created_utc": "2026-09-15T23:56:27.390043+00:00",
+  "mode": "tcp",
+  "test_pattern": "^TestWindowTcp(Download|Upload)PerformanceMatrix$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "8b9002c927ffbf729da07e016d1ef23e3be2ef0f",
+    "branch": "throughput-fix-2",
+    "source_sha256": "b5b407364a99cbb0a022b5de897fc5eb8bade0593541ddd2e0b658636c692207",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "6af611e430a6efe1820dad4649d52cb06bb6edbd0215218523bba11957eff293",
+  "host_load_average_at_start": [
+    21.52490234375,
+    23.56005859375,
+    27.5537109375
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_PATH_SECONDS": "5",
+    "CONNECT_WINDOW_PATH_FLOWS": "1,8",
+    "CONNECT_WINDOW_TCP_BUFFER_MAX_MIB": "48",
+    "CONNECT_WINDOW_PATH_RTT_US": "300,100000",
+    "CONNECT_WINDOW_RUN_CONTEXT": "Final service-epoch validation started immediately while concurrent root documentation, monitor tests, profiling, and peer campaign jobs were active; no quiescence wait.",
+    "CONNECT_WINDOW_PATH_DIRECTION": "both",
+    "CONNECT_WINDOW_PATH_ACK_MS": "10",
+    "CONNECT_WINDOW_PATH_REPETITIONS": "3",
+    "CONNECT_WINDOW_TCP_MEASURE": "1"
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "binary_sha256": "83e1551bc8a90ce57e52ba8e2613b8c78feb7c4c1dac9a2429b7800af67bb565",
+  "sources_stable_during_build": true
+}

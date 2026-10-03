@@ -1,0 +1,89 @@
+{
+  "artifact": "sanitized frozen physical-H1 duplex diagnostic evidence",
+  "attempts": [
+    {
+      "binary_sha256": "7ef488ec949ebd15466e3ad72f6976e37b8d5f1656596eb9b5f59e4a1e7870b1",
+      "id": "initial-nil-pack-pool-interruption",
+      "manifest_sha256": "fc07f34c45a77c5ec6000ce858fc64ff15aad7c01e38a73ae23c9593415e4f5e",
+      "provider_mode": "initial-nil-pack-pool-failure",
+      "reported_comparison_count": 0,
+      "reported_reading_count": 0,
+      "effective_diagnostic_source_sha256": "ffaf334b667667968c4e6fdce2e8b4fbafa4a9e81f61a2e7ef735310adc271a9",
+      "source_stage_id": "initial-nil-pack-pool-failure",
+      "test_exit": 2
+    },
+    {
+      "binary_sha256": "b8d42aa22ab64f90ce4d27c56ff0f7aff6848055c9688570613f54ff31086de2",
+      "id": "direct-callback-calibration-censored",
+      "manifest_sha256": "aaf8b9f574c79715400db3d203bd1a5417e932c404b80f4fd004e63712dec655",
+      "provider_mode": "direct-callback-calibration-failure",
+      "reported_comparison_count": 1,
+      "reported_reading_count": 3,
+      "effective_diagnostic_source_sha256": "65d3ee7abd5a6e911668014ddc1a44e5fd0fb86d6dc896c7fe5c1e0dadc64eea",
+      "source_stage_id": "direct-callback-calibration-failure",
+      "test_exit": 1
+    },
+    {
+      "binary_sha256": "ce597ecf04963ce2ef64ca95b179a5035d7619b6145682ced2db931e5f85509b",
+      "id": "actual-provider-dispatcher-censored",
+      "manifest_sha256": "7ed08e0f4deae06a4f88cdd6b1e0216f5b281fd0efe177c3aa65f912f28ea522",
+      "provider_mode": "actual-provider-dispatcher",
+      "reported_comparison_count": 1,
+      "reported_reading_count": 3,
+      "effective_diagnostic_source_sha256": "fc9e430c0e47e6c7e0339c503477e45de5561c864adde20138b770a5fc209d7c",
+      "source_stage_id": ".",
+      "test_exit": 1
+    }
+  ],
+  "counts": {
+    "accepted_comparisons": 0,
+    "actual_provider_readings": 3,
+    "censored_comparisons": 2,
+    "completed_three_arm_attempts": 2,
+    "direct_callback_readings": 3,
+    "failed_comparisons": 2,
+    "frozen_attempts": 3,
+    "initial_interruptions": 1,
+    "reported_comparisons": 2,
+    "reported_full_numerical_readings": 6,
+    "unreported_arms_in_completed_attempts": 0
+  },
+  "decision": "diagnostic only; neither direct-callback nor actual-provider result is an accepted SDK or physical-throughput comparison",
+  "exclusions": [
+    "No accepted paired throughput conclusion.",
+    "No authenticated production server/connect or database tier.",
+    "No native TUN.",
+    "Transfer encryption and provider security are disabled for the owned diagnostic origin.",
+    "The fixed-port bind bypasses the literal Tun.DialContext race wrapper.",
+    "Direct-callback and actual-provider runs are retained separately; neither establishes pacing causality."
+  ],
+  "identity_redaction": {
+    "generated_tun_address": "abstracted in every reading as the same generated TUN address",
+    "same_address_verified_across_all_six_readings": true
+  },
+  "redaction": "No raw logs, source or overlay contents, binaries, commands, absolute paths, or trace text are copied. Hashes, normalized outcomes, constructor settings, and full numerical readings are retained.",
+  "schema": "throughput-fix-2/physical-h1-duplex-diagnostics-summary-v1",
+  "scope": "owned TLS/WebSocket PlatformTransport H1, finite1Gb/s serializer in each direction,300us addedRTT,8 full-duplex TCP connections sharing per-connection control state;userspace gVisor, owned loopback kernel origin;no native TUN or actual authenticated server/connect/DB tier;Transfer encryption and provider security off",
+  "source_fidelity": {
+    "all_stage_manifests_record_sources_stable_during_build_and_after_run": true,
+    "base_connect_canonical_source_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+    "copied_snapshot_git_head": "1bf11158c107b978a21eca5c9df0ad1ecf613985",
+    "copied_snapshot_git_head_interpretation": "Git metadata from the copied snapshot, distinct from the base canonical source and the per-stage effective diagnostic source pins.",
+    "current_production_fidelity_audit": {
+      "audited_current_commit_short": "01ce6a6b",
+      "expected_test_only_difference_count": 1,
+      "missing_tracked_go_files": 0,
+      "tracked_go_files_compared": 710,
+      "production_source_matches_base_b6_after_excluding_expected_test_only_difference": true
+    },
+    "diagnostic_source_files_sha256": {
+      "transfer_window_h1_duplex_test.go": "c4754456f27ee4f9eea9ea4050b9b3ad5141158188313c46b11fa270e0f71918",
+      "transfer_window_h1_physical_test.go": "bc7b10c6690c60bf0b6a7d583668caeb45a7c8e0f99b3f7ec7f0ac5080729fae",
+      "transfer_window_tcp_performance_test.go": "3e5e2aab599e5d59139d47eb8d7fd1659edf9f32acde4cfd4b4727cc055a33db"
+    },
+    "guard_shared_physical_file_sha256": "f6b89c1adaeaba9de463b6e42af0276d69ace98ff37e4c41037ea7dc9ac12231",
+    "note": "Each attempt has its own immutable diagnostic snapshot and binary pin. The copied snapshot Git head is 1bf11158c107b978a21eca5c9df0ad1ecf613985; it is not an effective source pin. The final actual-provider effective diagnostic snapshot is not the base canonical source and is retained only as diagnostic provenance.",
+    "shared_source_changed": false
+  },
+  "status": "diagnostic/censored; no accepted paired throughput conclusion"
+}

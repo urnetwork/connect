@@ -1,0 +1,562 @@
+{
+  "candidate_status": "unlanded; rejected for landing because genuine RTT-growth control fails",
+  "redaction": "No raw logs, source or overlay contents, binaries, commands, absolute paths, or trace text are included. The archive retains normalized outcomes, full numerical readings, and content hashes only.",
+  "retention": "The listed hashes identify inputs retained outside this sanitized archive. No paths, commands, source contents, overlays, binaries, or raw logs are copied here.",
+  "runs": [
+    {
+      "complete": true,
+      "id": "forced-original",
+      "note": "Original forced first-feedback barrier; unchanged combined production.",
+      "outcome_count": 3,
+      "overlay_sha256": "dcc5ccf2796b3c2d6f7953563aedd8b68fd1f5173f2ac0b36cc49426286aa6df",
+      "overlay_source_sha256": [
+        {
+          "file": "combined-transfer.go",
+          "sha256": "af0c88c3dbae3b7d7ed80265fac13d94b6eea6af077b1ebb173671c6afd74246"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac"
+        },
+        {
+          "file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a"
+        }
+      ],
+      "reading_count": 6,
+      "reading_files": [
+        "readings-forced-original.jsonl"
+      ],
+      "source_log_sha256": "b56baa41a9ef753e2d05bc2cb957a2f4d7d9400cc01bb507066445ac3a4759ac"
+    },
+    {
+      "complete": true,
+      "id": "early-original",
+      "note": "Real primer acknowledgements complete before bulk release; original combined production.",
+      "outcome_count": 3,
+      "overlay_sha256": "ad4eb57cecc777799bf0334cd11b09b7bd6208b944dae27fef3dbcf367fa1595",
+      "overlay_source_sha256": [
+        {
+          "file": "combined-transfer.go",
+          "sha256": "af0c88c3dbae3b7d7ed80265fac13d94b6eea6af077b1ebb173671c6afd74246"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-primed_test.go",
+          "sha256": "43813df8c71d9152be36563ae4006482eb8570e3cc6f797e7c3b5cf1c19f1fea"
+        },
+        {
+          "file": "counterfactual_test.go",
+          "sha256": "c6fdd27a5b5f05c1f0dbbc0ddb1a397465872df7e9283b3861609aafaa4901f8"
+        }
+      ],
+      "reading_count": 9,
+      "reading_files": [
+        "readings-early-original.jsonl"
+      ],
+      "source_log_sha256": "f2d1db84b49cac8781871385e0c5615c2fadb30474f7c53333568d216a22afb3"
+    },
+    {
+      "complete": true,
+      "id": "late-original",
+      "note": "Provider primer offering delayed 2 ms before the barrier requiring all real ACKs; original combined production.",
+      "outcome_count": 3,
+      "overlay_sha256": "5b37a3c2e71e09f56e397934b3284feaf9fb2ff1a5e33b1b52f4000a1f11ddcf",
+      "overlay_source_sha256": [
+        {
+          "file": "combined-transfer.go",
+          "sha256": "af0c88c3dbae3b7d7ed80265fac13d94b6eea6af077b1ebb173671c6afd74246"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-primed-delayed_test.go",
+          "sha256": "28fe11f25ec24f4c1bc222a9924b7481ff20f12872e3fdb9dff7ae03a0628538"
+        },
+        {
+          "file": "counterfactual_test.go",
+          "sha256": "c6fdd27a5b5f05c1f0dbbc0ddb1a397465872df7e9283b3861609aafaa4901f8"
+        }
+      ],
+      "reading_count": 9,
+      "reading_files": [
+        "readings-late-original.jsonl"
+      ],
+      "source_log_sha256": "68e34ca82b4d7c2db03bb1119a8e757c743bd47d28dd1a61e781742461aa3468"
+    },
+    {
+      "binary_sha256": "aa127c48f82d88e49984329fab5a05c55b4423d91d0de1a601652d154626b31a",
+      "build_manifest_sha256": "ce651a3b338bbb872b3cb734ef7fa48ada89cc28f384b8e7316c4c8a052b3e41",
+      "complete": true,
+      "effective_inputs_sha256": "9b3233e9a89760d85c8917baf938a148735ee95bfe34ed4a4f080f715017d992",
+      "id": "worker-before",
+      "inputs_stable_during_build": true,
+      "note": "Exact v3 worker root test on unchanged combined production.",
+      "outcome_count": 3,
+      "overlay_sha256": "f81804f4022321bb5ada470ac91532f5442802176aac8e2505707e31c4ae5d79",
+      "overlay_source_sha256": [
+        {
+          "file": "combined-transfer.go",
+          "sha256": "af0c88c3dbae3b7d7ed80265fac13d94b6eea6af077b1ebb173671c6afd74246"
+        },
+        {
+          "file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+        },
+        {
+          "file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac"
+        },
+        {
+          "file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a"
+        }
+      ],
+      "reading_count": 0,
+      "reading_files": [],
+      "source_log_sha256": "f320c94145b1a238ba0f47054c5742b9459d06076fad8df1074d52632c7ff7fe"
+    },
+    {
+      "binary_sha256": "bb261861bac0a4c14fd515053aa5e9e4911ff7ca9253a78938d9464d222ad7f9",
+      "build_manifest_sha256": "e57f58e8f172bf4c3a5211800672c3b72be8cae353810badba3f60b115cc7daa",
+      "complete": true,
+      "effective_inputs_sha256": "853166ae96012aef7959ed4e07301f78a5232f0b9c5bf13efc7763aa273dafd9",
+      "id": "worker-after",
+      "inputs_stable_during_build": true,
+      "note": "Ten deterministic ACK-worker tests, three repetitions; immutable binary without race instrumentation.",
+      "outcome_count": 30,
+      "overlay_sha256": "ae24f53c30a99dabfd08a129c48db1c5edf3a45dc42ddc6af4202b339c951070",
+      "overlay_source_sha256": [
+        {
+          "file": "burst-tail-transfer-v3.go",
+          "sha256": "403556c7aedc7481d8cd9c43d818f1e4a6f4c64327cd8fcd215c25ed4a8a7be3"
+        },
+        {
+          "file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce"
+        },
+        {
+          "file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac"
+        },
+        {
+          "file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a"
+        }
+      ],
+      "reading_count": 0,
+      "reading_files": [],
+      "source_log_sha256": "af5bb9b950e8292863b93bf87b02f69455dfcd4914f94eae26637d8afc40b737"
+    },
+    {
+      "complete": true,
+      "id": "worker-race",
+      "note": "102 race test executions including 30 new worker cases; the go test temporary race binary was not retained.",
+      "outcome_count": 102,
+      "overlay_sha256": "ae24f53c30a99dabfd08a129c48db1c5edf3a45dc42ddc6af4202b339c951070",
+      "overlay_source_sha256": [
+        {
+          "file": "burst-tail-transfer-v3.go",
+          "sha256": "403556c7aedc7481d8cd9c43d818f1e4a6f4c64327cd8fcd215c25ed4a8a7be3"
+        },
+        {
+          "file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce"
+        },
+        {
+          "file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac"
+        },
+        {
+          "file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a"
+        }
+      ],
+      "reading_count": 0,
+      "reading_files": [],
+      "source_log_sha256": "bdc97ff46148c17db36719bc174fa4cd825803342ffda349a67ac606bd0c7fad"
+    },
+    {
+      "binary_sha256": "bb261861bac0a4c14fd515053aa5e9e4911ff7ca9253a78938d9464d222ad7f9",
+      "build_manifest_sha256": "e57f58e8f172bf4c3a5211800672c3b72be8cae353810badba3f60b115cc7daa",
+      "complete": true,
+      "effective_inputs_sha256": "853166ae96012aef7959ed4e07301f78a5232f0b9c5bf13efc7763aa273dafd9",
+      "id": "forced-v3",
+      "inputs_stable_during_build": true,
+      "note": "Forced initial 50.1 ms first-ACK barrier; original directional gate and warmup unchanged.",
+      "outcome_count": 3,
+      "overlay_sha256": "ae24f53c30a99dabfd08a129c48db1c5edf3a45dc42ddc6af4202b339c951070",
+      "overlay_source_sha256": [
+        {
+          "file": "burst-tail-transfer-v3.go",
+          "sha256": "403556c7aedc7481d8cd9c43d818f1e4a6f4c64327cd8fcd215c25ed4a8a7be3"
+        },
+        {
+          "file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce"
+        },
+        {
+          "file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac"
+        },
+        {
+          "file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a"
+        }
+      ],
+      "reading_count": 6,
+      "reading_files": [
+        "readings-forced-v3.jsonl"
+      ],
+      "source_log_sha256": "88db147dab357e717819c993a2a1de793d187f5bc82da866a0d50a2173fec406"
+    },
+    {
+      "binary_sha256": "028fe52f18b2f40012bcc18cb68c6d56dd26fd846a87e38b74576540d60775cf",
+      "build_manifest_sha256": "db4995fb230de1fa03c307eded6c7a0e16c5a150f4d3c20d68a21f0d740a994a",
+      "complete": true,
+      "effective_inputs_sha256": "5e8e408bada3c458f0e3de96adc243b620b0ca4ca38488a1a828e75321cf1a02",
+      "id": "natural-v3",
+      "inputs_stable_during_build": true,
+      "note": "No primer env enabled; original exact SDK constructor profile and gate.",
+      "outcome_count": 3,
+      "overlay_sha256": "4f3151d3ca593cb20381f452837e6a45958fc4f4c3969da62c45a635674a9427",
+      "overlay_source_sha256": [
+        {
+          "file": "burst-tail-transfer-v3.go",
+          "sha256": "403556c7aedc7481d8cd9c43d818f1e4a6f4c64327cd8fcd215c25ed4a8a7be3"
+        },
+        {
+          "file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce"
+        },
+        {
+          "file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-primed-delayed_test.go",
+          "sha256": "28fe11f25ec24f4c1bc222a9924b7481ff20f12872e3fdb9dff7ae03a0628538"
+        },
+        {
+          "file": "counterfactual_test.go",
+          "sha256": "c6fdd27a5b5f05c1f0dbbc0ddb1a397465872df7e9283b3861609aafaa4901f8"
+        }
+      ],
+      "reading_count": 6,
+      "reading_files": [
+        "readings-natural-v3.jsonl"
+      ],
+      "source_log_sha256": "28b6ea7a6851dd5d2d13caee497ef20ace1dbfa91776f0b5937bb2055aa3c751"
+    },
+    {
+      "binary_sha256": "028fe52f18b2f40012bcc18cb68c6d56dd26fd846a87e38b74576540d60775cf",
+      "build_manifest_sha256": "db4995fb230de1fa03c307eded6c7a0e16c5a150f4d3c20d68a21f0d740a994a",
+      "complete": true,
+      "effective_inputs_sha256": "5e8e408bada3c458f0e3de96adc243b620b0ca4ca38488a1a828e75321cf1a02",
+      "id": "early-v3",
+      "inputs_stable_during_build": true,
+      "note": "Real primer barrier enabled, no delayed offering; all three arms reported; diagnostic test itself logs without gate.",
+      "outcome_count": 3,
+      "overlay_sha256": "4f3151d3ca593cb20381f452837e6a45958fc4f4c3969da62c45a635674a9427",
+      "overlay_source_sha256": [
+        {
+          "file": "burst-tail-transfer-v3.go",
+          "sha256": "403556c7aedc7481d8cd9c43d818f1e4a6f4c64327cd8fcd215c25ed4a8a7be3"
+        },
+        {
+          "file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce"
+        },
+        {
+          "file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-primed-delayed_test.go",
+          "sha256": "28fe11f25ec24f4c1bc222a9924b7481ff20f12872e3fdb9dff7ae03a0628538"
+        },
+        {
+          "file": "counterfactual_test.go",
+          "sha256": "c6fdd27a5b5f05c1f0dbbc0ddb1a397465872df7e9283b3861609aafaa4901f8"
+        }
+      ],
+      "reading_count": 9,
+      "reading_files": [
+        "readings-early-v3.jsonl"
+      ],
+      "source_log_sha256": "be770113d301f71afdbc2acf59717484e66f0f500d9de0cb6ee2dd10a4fc5e43"
+    },
+    {
+      "binary_sha256": "028fe52f18b2f40012bcc18cb68c6d56dd26fd846a87e38b74576540d60775cf",
+      "build_manifest_sha256": "db4995fb230de1fa03c307eded6c7a0e16c5a150f4d3c20d68a21f0d740a994a",
+      "complete": true,
+      "effective_inputs_sha256": "5e8e408bada3c458f0e3de96adc243b620b0ca4ca38488a1a828e75321cf1a02",
+      "id": "late-v3",
+      "inputs_stable_during_build": true,
+      "note": "Real primer barrier with 2 ms provider offer delay; all three arms reported. This diagnostic test logs readings without asserting a gate.",
+      "outcome_count": 3,
+      "overlay_sha256": "4f3151d3ca593cb20381f452837e6a45958fc4f4c3969da62c45a635674a9427",
+      "overlay_source_sha256": [
+        {
+          "file": "burst-tail-transfer-v3.go",
+          "sha256": "403556c7aedc7481d8cd9c43d818f1e4a6f4c64327cd8fcd215c25ed4a8a7be3"
+        },
+        {
+          "file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce"
+        },
+        {
+          "file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-primed-delayed_test.go",
+          "sha256": "28fe11f25ec24f4c1bc222a9924b7481ff20f12872e3fdb9dff7ae03a0628538"
+        },
+        {
+          "file": "counterfactual_test.go",
+          "sha256": "c6fdd27a5b5f05c1f0dbbc0ddb1a397465872df7e9283b3861609aafaa4901f8"
+        }
+      ],
+      "reading_count": 9,
+      "reading_files": [
+        "readings-late-v3.jsonl"
+      ],
+      "source_log_sha256": "7f36bc9875655e946c32d76872064f718e16e284dfd71abded233011a8ef3766"
+    },
+    {
+      "binary_sha256": "bb261861bac0a4c14fd515053aa5e9e4911ff7ca9253a78938d9464d222ad7f9",
+      "build_manifest_sha256": "e57f58e8f172bf4c3a5211800672c3b72be8cae353810badba3f60b115cc7daa",
+      "complete": true,
+      "effective_inputs_sha256": "853166ae96012aef7959ed4e07301f78a5232f0b9c5bf13efc7763aa273dafd9",
+      "id": "service-controls-v3",
+      "inputs_stable_during_build": true,
+      "note": "Seven service tests: six pass. Genuine RTT-growth matrix fails at 100 Mb/s, 0.3 to 100 ms.",
+      "outcome_count": 7,
+      "overlay_sha256": "ae24f53c30a99dabfd08a129c48db1c5edf3a45dc42ddc6af4202b339c951070",
+      "overlay_source_sha256": [
+        {
+          "file": "burst-tail-transfer-v3.go",
+          "sha256": "403556c7aedc7481d8cd9c43d818f1e4a6f4c64327cd8fcd215c25ed4a8a7be3"
+        },
+        {
+          "file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce"
+        },
+        {
+          "file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac"
+        },
+        {
+          "file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a"
+        }
+      ],
+      "reading_count": 54,
+      "reading_files": [
+        "readings-service-controls-v3-01.jsonl",
+        "readings-service-controls-v3-02.jsonl",
+        "readings-service-controls-v3-03.jsonl",
+        "readings-service-controls-v3-04.jsonl",
+        "readings-service-controls-v3-05.jsonl",
+        "readings-service-controls-v3-06.jsonl",
+        "readings-service-controls-v3-07.jsonl"
+      ],
+      "source_log_sha256": "5f5b21764e124e95d0df686cf7f66d3536f6d074e2867de12d972d6647a41d7c"
+    },
+    {
+      "binary_sha256": "aa127c48f82d88e49984329fab5a05c55b4423d91d0de1a601652d154626b31a",
+      "build_manifest_sha256": "ce651a3b338bbb872b3cb734ef7fa48ada89cc28f384b8e7316c4c8a052b3e41",
+      "complete": true,
+      "effective_inputs_sha256": "9b3233e9a89760d85c8917baf938a148735ee95bfe34ed4a4f080f715017d992",
+      "id": "exact-rtt-before",
+      "inputs_stable_during_build": true,
+      "note": "Exact original 100 Mb/s RTT-growth cell passes 3/3 on unchanged combined production.",
+      "outcome_count": 3,
+      "overlay_sha256": "f81804f4022321bb5ada470ac91532f5442802176aac8e2505707e31c4ae5d79",
+      "overlay_source_sha256": [
+        {
+          "file": "combined-transfer.go",
+          "sha256": "af0c88c3dbae3b7d7ed80265fac13d94b6eea6af077b1ebb173671c6afd74246"
+        },
+        {
+          "file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+        },
+        {
+          "file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac"
+        },
+        {
+          "file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a"
+        }
+      ],
+      "reading_count": 6,
+      "reading_files": [
+        "readings-exact-rtt-before.jsonl"
+      ],
+      "source_log_sha256": "9b13ef7b7846a6a3f47b2ed82ac09a4743c5961253a1426b0c82b314338ad266"
+    },
+    {
+      "binary_sha256": "cfec64841c2e8d3cbf75cce5ae67e11b6d8580b62e74323822cd633d89251dbf",
+      "build_manifest_sha256": "51a3b2bd34a9bcbbe8ae04c2946878f9e78b066d8536ea458d2182c909754e69",
+      "complete": true,
+      "effective_inputs_sha256": "8758f54110bbaa9f621819520c704b148c86a6286e9cbdaaa57c20c72e0de4ad",
+      "id": "exact-rtt-v3",
+      "inputs_stable_during_build": true,
+      "note": "Exact 100 Mb/s RTT-growth cell fails 3/3. The v3 candidate is not eligible to land.",
+      "outcome_count": 3,
+      "overlay_sha256": "895913c6b1e03251c22877e198ee0b37c9d94eed12057b96cc2ee2cf697bb2d1",
+      "overlay_source_sha256": [
+        {
+          "file": "burst-tail-transfer-v3.go",
+          "sha256": "403556c7aedc7481d8cd9c43d818f1e4a6f4c64327cd8fcd215c25ed4a8a7be3"
+        },
+        {
+          "file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce"
+        },
+        {
+          "file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+        },
+        {
+          "file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11"
+        },
+        {
+          "file": "combined-transfer_window_pacing.go",
+          "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+        },
+        {
+          "file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac"
+        },
+        {
+          "file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a"
+        }
+      ],
+      "reading_count": 6,
+      "reading_files": [
+        "readings-exact-rtt-v3.jsonl"
+      ],
+      "source_log_sha256": "0593b7ceba2051b88a85adf32d5f9de7e3a861943c88e76b2caac1172c60f6fd"
+    },
+    {
+      "complete": true,
+      "id": "exact-rtt-trace-v3",
+      "note": "Diagnostic logging inside existing controller measurement transitions only; failure reproduced at 14.11 Mb/s. No extra measurement calls.",
+      "outcome_count": 1,
+      "overlay_sha256": "4ae4565fb04fe94860f12011d82831aca4a22002249ca4ceada4e2dbe9ec9760",
+      "overlay_source_sha256": [
+        {
+          "file": "burst-tail-transfer-v3.go",
+          "sha256": "403556c7aedc7481d8cd9c43d818f1e4a6f4c64327cd8fcd215c25ed4a8a7be3"
+        },
+        {
+          "file": "burst-tail-ack-v3.go",
+          "sha256": "53ab98dff3b9f2841a23abba16e9ff0faaeca6c5d49e396a861ca3c637a8e0ce"
+        },
+        {
+          "file": "burst-tail-worker-v3_test.go",
+          "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+        },
+        {
+          "file": "ack-tail-rtt-root_test.go",
+          "sha256": "71f348cfbbef1c3f875bbd3490e46f80c910838cb40b149a1dac1906ed2c4f11"
+        },
+        {
+          "file": "burst-tail-rtt-trace-pacing.go",
+          "sha256": "c75169392040fe2018a0eeb0e7362d66f84babf6d6a968f6e4a831e3990f47fa"
+        },
+        {
+          "file": "path-minimal-forced_test.go",
+          "sha256": "4473537853188859e4f7d54bcecde109b6f9463e22a9c0550b83df40744d9aac"
+        },
+        {
+          "file": "minimal-forced-feedback_test.go",
+          "sha256": "b5f3874287611c9850245e7be54e1c0be2a86c3fc3ed964aa95ed660afa4602a"
+        }
+      ],
+      "reading_count": 2,
+      "reading_files": [
+        "readings-exact-rtt-trace-v3.jsonl"
+      ],
+      "source_log_sha256": "9c383c1d64fea8dfa81c23f0055930d1d4360979ef48b83b6167c3fed4e7a00e"
+    }
+  ],
+  "schema": "throughput-fix-2/sdk-ack-tail-v3-evidence-provenance-v1",
+  "source_handoff_run_count": 14,
+  "source_handoff_sha256": "8551af12d0b0062d0a8943c88e873b5500889451dd3080ba3f8d18d16e89ceee"
+}

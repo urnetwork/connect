@@ -1,0 +1,26 @@
+{
+  "censored_comparisons": 0,
+  "comparison_count": 0,
+  "failed_comparisons": null,
+  "host_performance_acceptance": "no host comparisons in this selection",
+  "input_sha256": {
+    "ledger.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "manifest.json": "e6e1721931ef4926b6b836c5ebab78c39be13b65d6f9ec8134221f63f30821d0",
+    "run.log": "f2835410d45dec9f1c3d3bb24ac11ff7c4c0743490af11e200ae7b589e4e3d49",
+    "status.json": "0e9188ba6f59955f1da91ee5d508715aea964a31693df508a29a7256d743a57e"
+  },
+  "note": "Raw run.log remains outside this archive; its hash is retained. Outcomes are an excerpt. Process success alone does not prove performance acceptance.",
+  "outcome": "process passed",
+  "sanitization": {
+    "changes": [
+      "manifest external local replacement location"
+    ],
+    "original_input_sha256_retained": true,
+    "sanitized_archive_files_sha256": {
+      "manifest.json": "9fbbe803f3699f63985b9f9bd7f7993e1fbe863c5fec5f1bab34931295d67273"
+    }
+  },
+  "top_level_failed": 0,
+  "top_level_passed": 5,
+  "top_level_skipped": 0
+}

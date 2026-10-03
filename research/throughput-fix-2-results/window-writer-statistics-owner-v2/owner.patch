@@ -1,0 +1,62 @@
+--- a/transfer.go
++++ b/transfer.go
+@@ -6279,6 +6279,9 @@
+ 	resendWriteCount     atomic.Uint64
+ 	resendWriteByteCount atomic.Uint64
+ 
++	// The send worker owns replacement and all direct uses. Statistics copy
++	// the handle under this leaf lock before reading its concurrent policy.
++	contractWriterStateLock  sync.Mutex
+ 	contractMultiRouteWriter MultiRouteWriter
+ 	// Nil in production; tests rendezvous at the handle access after external
+ 	// selector effects, without holding the publication lock.
+@@ -7541,14 +7544,19 @@
+ 	transferFlightPolicy() transferFlightPolicySnapshot
+ }
+ 
+-// Reads the current immutable route generation. Before the first route write
+-// opens a selector, or for a custom writer without policy support, admission is
+-// intentionally unchanged.
++// Copies the worker-published handle before reading the immutable route
++// generation. The provider call holds no sequence lock. An unopened selector
++// or custom writer without policy support leaves admission unchanged.
+ func (self *SendSequence) transferFlightPolicy() transferFlightPolicySnapshot {
+ 	if before := self.beforeContractWriterAccessForTest; before != nil {
+ 		before(false)
+ 	}
+-	if provider, ok := self.contractMultiRouteWriter.(transferFlightPolicyProvider); ok {
++	writer := func() MultiRouteWriter {
++		self.contractWriterStateLock.Lock()
++		defer self.contractWriterStateLock.Unlock()
++		return self.contractMultiRouteWriter
++	}()
++	if provider, ok := writer.(transferFlightPolicyProvider); ok {
+ 		return provider.transferFlightPolicy()
+ 	}
+ 	return transferFlightPolicySnapshot{}
+@@ -11939,7 +11947,11 @@
+ 		if before := self.beforeContractWriterAccessForTest; before != nil {
+ 			before(true)
+ 		}
+-		self.contractMultiRouteWriter = writer
++		func() {
++			self.contractWriterStateLock.Lock()
++			defer self.contractWriterStateLock.Unlock()
++			self.contractMultiRouteWriter = writer
++		}()
+ 		self.contractMultiRouteWriterDestination = destination
+ 
+ 		// associate the destination with this sequence to receive acks
+@@ -11986,7 +11998,11 @@
+ 		if before := self.beforeContractWriterAccessForTest; before != nil {
+ 			before(true)
+ 		}
+-		self.contractMultiRouteWriter = nil
++		func() {
++			self.contractWriterStateLock.Lock()
++			defer self.contractWriterStateLock.Unlock()
++			self.contractMultiRouteWriter = nil
++		}()
+ 		self.contractMultiRouteWriterDestination = TransferPath{}
+ 	}
+ }

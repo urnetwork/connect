@@ -1,0 +1,35 @@
+{
+  "created_utc": "2026-09-16T01:01:25.393547+00:00",
+  "mode": "model",
+  "test_pattern": "^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*)$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "6ec6fae2fb41be2b7aafc9636b611ba37cd29933",
+    "branch": "throughput-fix-2",
+    "source_sha256": "56eec7b1968bac2214224b2d7975f849d0fe6efef53cd9322eb11a01b31bc6ef",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "6af611e430a6efe1820dad4649d52cb06bb6edbd0215218523bba11957eff293",
+  "host_load_average_at_start": [
+    9.26318359375,
+    13.14453125,
+    18.12255859375
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "Full RTT-resize model validation started immediately while root fixture review and overlay-only relay investigation were active; no quiescence wait."
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "binary_sha256": "2c2ed0aed147c63214741d0cc936137dc420136f413fa84ac9445a16ecf95a1e",
+  "sources_stable_during_build": true
+}

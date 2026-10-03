@@ -235,6 +235,17 @@ func TestWatchSendStallsSourceAnchors(t *testing.T) {
 	if !strings.Contains(body, "self.resizeMonitor.NotifyAll()") {
 		t.Error("watchSendStalls does not wake resize for the reap and backfill")
 	}
+
+	// The watchdog owns the complete verdict, including active-probe, uplink,
+	// shared-fate, and quarantine gates. A raw resize-side read bypassed those
+	// gates and removed an explicitly held one-bar route.
+	body, ok = functionBody(source, "func (self *multiClientWindow) resize()")
+	if !ok {
+		t.Fatal("could not find resize")
+	}
+	if strings.Contains(body, ".sendStalled(") {
+		t.Error("resize bypasses the send-stall watchdog verdict gates")
+	}
 }
 
 // The cping timeout must never convict. An earlier pass here added
@@ -256,7 +267,100 @@ func TestCpingTimeoutSourceAnchors(t *testing.T) {
 	if strings.Contains(body, `addError(errors.New("cping timeout"))`) {
 		t.Error("the cping timeout branch convicts: one lost ping ack would remove a live exit and every flow on it")
 	}
+	if strings.Contains(body, "defer self.cancel()") {
+		t.Error("ping still cancels the channel on every return, including its explicitly non-convicting timeout")
+	}
 	if !strings.Contains(body, "unanswered: ping loop ended") {
 		t.Error("the cping timeout is silent again: the log line is the observability the removed conviction was after")
+	}
+}
+
+// A real lifecycle pin for the source invariant above: an admitted ping whose
+// callback never arrives is the ordinary DATAGRAM-loss case. When its bounded
+// wait expires, only this optional monitor stops; the channel and its flow
+// context must remain alive for Transfer retransmission and the evidence
+// classifiers to make their own decisions.
+func TestCpingTimeoutLeavesChannelAlive(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	channel := stallTestChannel()
+	channel.ctx = ctx
+	channel.cancel = cancel
+	channel.log = DefaultLogger()
+	channel.args = &multiClientChannelArgs{Destination: RequireMultiHopId(NewId())}
+	channel.settings.CPingTimeout = 25 * time.Millisecond
+	channel.settings.CPingWriteTimeout = 25 * time.Millisecond
+	var lateAck func(error)
+	channel.pingSendForTest = func(_ time.Duration, ackCallback func(error)) (bool, error) {
+		lateAck = ackCallback
+		return true, nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		channel.ping()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cping did not end after its unanswered-ack timeout")
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatal("one unanswered cping canceled the live channel")
+	default:
+	}
+	lateAckDone := make(chan struct{})
+	go func() {
+		defer close(lateAckDone)
+		lateAck(nil)
+	}()
+	select {
+	case <-lateAckDone:
+	case <-time.After(time.Second):
+		t.Fatal("late cping Ack retained its callback after the ping loop ended")
+	}
+}
+
+// A concrete send/ack error remains hard evidence. Removing the blanket defer
+// must not turn a reported Transfer failure into the same harmless timeout.
+func TestCpingAckErrorStillCancelsWithCause(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	channel := stallTestChannel()
+	channel.ctx = ctx
+	channel.cancel = cancel
+	channel.log = DefaultLogger()
+	channel.args = &multiClientChannelArgs{Destination: RequireMultiHopId(NewId())}
+	channel.settings.CPingTimeout = time.Second
+	wantErr := errors.New("cping transfer failed")
+	channel.pingSendForTest = func(_ time.Duration, ackCallback func(error)) (bool, error) {
+		go ackCallback(wantErr)
+		return true, nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		channel.ping()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cping did not finish after its Transfer error")
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("a reported cping Transfer error did not cancel the channel")
+	}
+	_, gotErr := channel.WindowStats()
+	if !errors.Is(gotErr, wantErr) {
+		t.Fatalf("channel error=%v, want %v", gotErr, wantErr)
 	}
 }

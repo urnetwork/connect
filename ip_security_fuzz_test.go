@@ -72,7 +72,7 @@ func FuzzParseIpPathWithPayload(f *testing.F) {
 }
 
 // FuzzSecurityPolicyInspectEgress fuzzes the full egress decision chain (CFAA gate ->
-// DMCA DPI incl. the bencode/uTP/QUIC/STUN/TLS matchers -> encrypted heuristic) with
+// DMCA DPI incl. the bencode/uTP/QUIC/STUN/TURN/RTP/RTCP/TLS matchers -> encrypted heuristic) with
 // arbitrary payloads and 5-tuples. The policy must never panic and must return one of
 // the defined results. Flow state accumulates across iterations (shared policy), which
 // also fuzzes the state machine's packet-sequence handling, not just single packets.
@@ -93,6 +93,9 @@ func FuzzSecurityPolicyInspectEgress(f *testing.F) {
 	f.Add(uint8(17), uint16(41005), uint16(50000), false, encryptedPayload(512))
 	f.Add(uint8(6), uint16(41006), uint16(6881), true, []byte{})
 	f.Add(uint8(17), uint16(41007), uint16(123), false, []byte("x"))
+	f.Add(uint8(17), uint16(41008), uint16(3478), false, turnChannelData(0x4001, encryptedPayload(64), false))
+	f.Add(uint8(17), uint16(41009), uint16(50000), false, rtpPacket(1, 1, 960, 111))
+	f.Add(uint8(17), uint16(41010), uint16(50000), false, rtcpReceiverReport(1))
 
 	f.Fuzz(func(t *testing.T, proto uint8, srcPort uint16, dstPort uint16, syn bool, payload []byte) {
 		var ipProto IpProtocol

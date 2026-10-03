@@ -1,0 +1,11 @@
+{
+  "archive": "window-cumulative-pacing-roots-v1",
+  "payload_sha256": {
+    "outcomes.jsonl": "751ab0d0910609d053eccb465d1f7681623c18276ace45cacf4c198cf6ba601c",
+    "provenance.json": "499960468021484e701977cf7fcbf9657212a2aabe34732bccf1ccc1fba93f97",
+    "source-manifest-after.json": "5318ab9ecff7dbdb9b90ceac5bbe61689c1b168c2b5baf88a5e8116a3f306ca8",
+    "source-manifest-before.json": "a9c08d133be296672e617feb7253d32ed4d648ac3bd3c52f9a180ec0a8258ed3",
+    "source-pins.json": "82994a16b67952c57b2a789b56883ed37a874224d4a8217eaeb6cbfd880d629f",
+    "status.json": "d084c900778256ea79651768605fc878846ac7382668e7a0cb15114ddd4be8d9"
+  }
+}

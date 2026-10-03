@@ -1,0 +1,70 @@
+[
+  {
+    "binary_sha256": "a2c62e4c88c31132152f92f841b18b52ddbaa463737abe54a271fded3765ffe2",
+    "compile_manifest_sha256": "eae866300eed9c1b60088e6b10756b294288e1e26ccb51cf4557f5d3d3bf3031",
+    "effective_inputs_sha256": "e29be42a4f9b7a71f1265eb08586efcd8a67f19ac82606a80d9dd892b93d4177",
+    "inputs_match_at_archive": true,
+    "raw_log_sha256": "fa99b31ad7615efe745b6be0f2ac763434a82a50b71dc4c9b499711896b93177",
+    "run_status": {
+      "benchmark_readings": 18,
+      "binary_sha256": "a2c62e4c88c31132152f92f841b18b52ddbaa463737abe54a271fded3765ffe2",
+      "effective_inputs_sha256": "e29be42a4f9b7a71f1265eb08586efcd8a67f19ac82606a80d9dd892b93d4177",
+      "elapsed_seconds": 11.828464749734849,
+      "ended_utc": "2026-09-16T17:08:35.892804+00:00",
+      "exit_status": 0,
+      "loadavg_end": [
+        15.87841796875,
+        15.72509765625,
+        13.259765625
+      ],
+      "loadavg_start": [
+        17.40380859375,
+        15.98779296875,
+        13.306640625
+      ],
+      "manifest_sha256": "eae866300eed9c1b60088e6b10756b294288e1e26ccb51cf4557f5d3d3bf3031",
+      "no_quiescence_wait": true,
+      "race_warnings": 0,
+      "raw_log_sha256": "fa99b31ad7615efe745b6be0f2ac763434a82a50b71dc4c9b499711896b93177",
+      "run_context": "Concurrent local jobs; no quiescence wait; benchmark has no host timing gate.",
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T17:08:24.063821+00:00"
+    },
+    "variant": "before"
+  },
+  {
+    "binary_sha256": "6c3f7d9e964a61ab390a1ca11af266e0fbdaa1a19d26a3ab18e3467015b37b7d",
+    "compile_manifest_sha256": "491276bf0d1c95203832d937c661daca4eb099ca89bd6a8adc13ddd3ca020272",
+    "effective_inputs_sha256": "c5b0dd1d4cefc9043f0de88fb797c18963a74603f2e0bac021ac0b479374db9c",
+    "inputs_match_at_archive": true,
+    "raw_log_sha256": "0659210c636bf6a94a55cb9177e7ef8e8b7fc0253b06dd873b4f8b6ed1e1347a",
+    "run_status": {
+      "benchmark_readings": 18,
+      "binary_sha256": "6c3f7d9e964a61ab390a1ca11af266e0fbdaa1a19d26a3ab18e3467015b37b7d",
+      "effective_inputs_sha256": "c5b0dd1d4cefc9043f0de88fb797c18963a74603f2e0bac021ac0b479374db9c",
+      "elapsed_seconds": 12.43895237473771,
+      "ended_utc": "2026-09-16T17:08:36.502958+00:00",
+      "exit_status": 0,
+      "loadavg_end": [
+        15.87841796875,
+        15.72509765625,
+        13.259765625
+      ],
+      "loadavg_start": [
+        17.40380859375,
+        15.98779296875,
+        13.306640625
+      ],
+      "manifest_sha256": "491276bf0d1c95203832d937c661daca4eb099ca89bd6a8adc13ddd3ca020272",
+      "no_quiescence_wait": true,
+      "race_warnings": 0,
+      "raw_log_sha256": "0659210c636bf6a94a55cb9177e7ef8e8b7fc0253b06dd873b4f8b6ed1e1347a",
+      "run_context": "Concurrent local jobs; no quiescence wait; benchmark has no host timing gate.",
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T17:08:24.063326+00:00"
+    },
+    "variant": "after"
+  }
+]

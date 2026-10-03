@@ -104,7 +104,7 @@ arch="$(get_arch)"
 has_systemd=0
 update_timer_oncalendar=daily
 
-api_base="https://api.github.com/repos/urnetwork/connect"
+api_base="https://api.github.com/repos/urnetwork/build"
 
 install_path="$HOME/.local/share/urnetwork-provider"
 version_file="$install_path/.version"
@@ -316,6 +316,30 @@ stop_systemd_units ()
             pr_err "Failed to disable urnetwork-update.timer early before update/reinstall; continuing anyway"
         }
     fi
+}
+
+# Without lingering the user's systemd manager, and urnetwork.service with it,
+# stops at logout and only starts again at the next login.
+enable_lingering ()
+{
+    if [ "$has_systemd" -ne 1 ]; then
+        return 0
+    fi
+
+    linger_user="$(id -un)"
+
+    if [ "$(loginctl show-user "$linger_user" --property=Linger --value 2>/dev/null)" = "yes" ]; then
+        return 0
+    fi
+
+    if loginctl enable-linger "$linger_user" &&
+        [ "$(loginctl show-user "$linger_user" --property=Linger --value 2>/dev/null)" = "yes" ]; then
+        pr_info "Enabled lingering so urnetwork.service keeps running after logout"
+        return 0
+    fi
+
+    pr_err "warning: Could not enable lingering for %s; urnetwork.service will stop when you log out" "$linger_user"
+    pr_err "warning: Run \`sudo loginctl enable-linger %s' to keep the provider running" "$linger_user"
 }
 
 install_systemd_units ()
@@ -669,7 +693,7 @@ EOF
 	fi
     fi
 
-	loginctl enable-linger
+    enable_lingering
 
     case "$operation" in
         install)
@@ -684,7 +708,7 @@ EOF
                 printf "Disable service:       \e[1msystemctl --user disable urnetwork\e[0m\n"
                 printf "Disable auto-updates:  \e[1msystemctl --user disable urnetwork-update.timer\e[0m\n"
                 printf "\n"
-                printf "\e[1mRefer to <https://docs.ur.io/provider#linux-and-macos> for more detailed instructions.\e[0m\n"
+                printf "\e[1mRefer to <https://ur.xyz/docs/miner> for more detailed instructions.\e[0m\n"
             fi
             ;;
 

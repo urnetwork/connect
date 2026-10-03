@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-service-drain-model.log",
+  "source_log_sha256": "4354fe5f9dcaa7e526fdc54fd2f0eb476be36aeeaaeeb9d02ca5049de02f3c8a",
+  "note": "Focused slow/shared controls passed after adding actual queue drain capacity; predates adjacent review.",
+  "rows": 126,
+  "final": false,
+  "outcome": "passed"
+}

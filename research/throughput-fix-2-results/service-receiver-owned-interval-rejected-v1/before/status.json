@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "6ab221b700c38f8dd843ff482b7de4a6eb28a9a44a594f7a64bfedbfc248ccf4",
+  "binary_sha256": "3a1b96f41a4d79ea95a3cd5cb374e103af60de8afbf90c9f22e516c7fea8f466",
+  "effective_inputs_sha256": "e86c9c7bc1ea624fe21894acb0d4606037b028951f42644e94962fc4b5cef80a",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiver(Owned|SustainedPacingEscapesSlowHold$|BatchedSplitPacingEscapesSlowHold$)",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as build; absolute relationship pinned by original status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:55:13.328831+00:00",
+  "loadavg_start": [
+    13.89208984375,
+    13.35400390625,
+    14.2177734375
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 5.451241458300501,
+  "loadavg_end": [
+    13.580078125,
+    13.2978515625,
+    14.19287109375
+  ],
+  "ended_utc": "2026-09-16T20:55:18.780359+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "61fadf047b4c72dfc5369eb76b39b1fd6164dba083fae0944a1e960b92e2a985",
+  "pass": 12,
+  "fail": 3,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "12P3F: lawful batched hold remains; rejected queued-start cap omitted as documented in frozen source audit, original failed proposal preserved elsewhere.",
+  "rows": 54
+}

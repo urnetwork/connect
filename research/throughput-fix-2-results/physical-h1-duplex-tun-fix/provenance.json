@@ -1,0 +1,73 @@
+{
+  "base_connect": {
+    "branch": "throughput-fix-2",
+    "canonical_source_sha256": "c07140f78cac0dc84c22ec06ac8635de755e925471d3bb8a0dbacf0d7737262e",
+    "dirty_at_snapshot": true,
+    "revision": "e0b6f5c587029489992da016ff15063e0342fa92",
+    "source_file_count": 721
+  },
+  "binary_sha256": "3d59a7006079cc088f7a7d261fedb0c60b7da4e16919698a7b169da56fb4acd2",
+  "compile_exit": 0,
+  "counterfactual": "Only current c071 TUN production was changed relative to the frozen fixture. The two fixture test inputs are explicitly pinned; no ACK-tail, estimator, or stack-dump fixture input was used.",
+  "fixture_source_base_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+  "frozen_prior_physical_handoff_sha256": "a981745cc3868200a658649dc007100ec8994bfc25787db0d863fbfff684d52e",
+  "instrument": "owned TLS/WebSocket H1 relay, gVisor TUN and loopback socket origin; Transfer encryption disabled; no native kernel TUN or server authentication",
+  "load_after": [
+    28.28271484375,
+    15.01171875,
+    12.92578125
+  ],
+  "load_before": [
+    10.533203125,
+    10.93359375,
+    11.48095703125
+  ],
+  "raw_run_log_sha256": "43b2596d57c8f7a2c34f85a66bfbc0fcb3334b2a2336f1a6581455636bbc4d99",
+  "retention": "Raw logs, source snapshots, fixture sources, binaries, commands, and local paths remain outside this sanitized archive. They are represented by hashes and normalized metadata only.",
+  "run_context": "captured under the active concurrent workload; no quiescence wait",
+  "schema": "throughput-fix-2/physical-h1-duplex-tun-fix-provenance-v1",
+  "setup_attempt": {
+    "attempt_id": "initial-git-free-snapshot-setup",
+    "base_connect_source_sha256": "c07140f78cac0dc84c22ec06ac8635de755e925471d3bb8a0dbacf0d7737262e",
+    "binary_produced": false,
+    "classification": "invalid_pre_compilation_setup_attempt",
+    "compile_started": false,
+    "expected_base_connect_source_sha256": "c07140f78cac0dc84c22ec06ac8635de755e925471d3bb8a0dbacf0d7737262e",
+    "normalized_reason": "A local harness attempted to derive Git metadata inside the intentionally Git-free copied snapshot. It stopped before compilation or test execution and is retained only for provenance.",
+    "phase": "setup",
+    "reported_comparisons": 0,
+    "reported_readings": 0,
+    "schema": "throughput-fix-2/physical-h1-duplex-tun-fix-setup-attempt-v1",
+    "source_or_production_mutation": false,
+    "status_exit_code": 2,
+    "test_started": false
+  },
+  "source_snapshot": {
+    "effective_snapshot_file_count_after_fixture_override": 785,
+    "effective_snapshot_input_sha256_after_fixture_override": "ce8aa4b9c28a1940913b6119e00adee43d6762d692375dcfd12a15909253ca7b",
+    "effective_source_file_count_after_fixture_override": 722,
+    "effective_source_sha256_after_fixture_override": "228bb760c46323df42a000037ee366f693a9607a788d4610df6bafb915832baa",
+    "external_local_replacement_count": 1,
+    "fixture_overrides": [
+      {
+        "frozen_fixture_sha256": "c4754456f27ee4f9eea9ea4050b9b3ad5141158188313c46b11fa270e0f71918",
+        "name": "transfer_window_h1_duplex_test.go",
+        "operation": "add",
+        "shared_input_sha256_before_override": null
+      },
+      {
+        "frozen_fixture_sha256": "bc7b10c6690c60bf0b6a7d583668caeb45a7c8e0f99b3f7ec7f0ac5080729fae",
+        "name": "transfer_window_h1_physical_test.go",
+        "operation": "replace",
+        "shared_input_sha256_before_override": "f6b89c1adaeaba9de463b6e42af0276d69ace98ff37e4c41037ea7dc9ac12231"
+      }
+    ],
+    "production_snapshot_file_count_before_fixture_override": 784,
+    "production_snapshot_input_sha256_before_fixture_override": "29befefa1e8e8488b7f91a814bf18b683a6040bf901b504f71cd146ea9dd1e31",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175",
+    "source_inspection_uses_build_snapshot": true,
+    "sources_stable_after_run": true,
+    "sources_stable_during_build": true
+  },
+  "test_selection": "TestWindowPhysicalH1SdkDuplex, one A/B/A actual-provider run, 1Gb/s each direction, 300us added RTT, eight duplex connections, 2.5s warmup and 5s measurement per arm; profile budgets, fixed ports, and gates are fixture-defined and retained in the full readings."
+}

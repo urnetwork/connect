@@ -1,0 +1,221 @@
+=== RUN   TestLandingStructsMatchMergedLessTheDeferState
+--- PASS: TestLandingStructsMatchMergedLessTheDeferState (0.00s)
+=== RUN   TestDecodedTransferFramePoolRetainedSizeStaysSmall
+--- PASS: TestDecodedTransferFramePoolRetainedSizeStaysSmall (0.00s)
+=== RUN   TestAckCompressionStaysUnderTheRetransmissionFloor
+--- PASS: TestAckCompressionStaysUnderTheRetransmissionFloor (0.00s)
+=== RUN   TestAckCompressionIsTheOnlyClockBelowHalfAWindowRung
+--- PASS: TestAckCompressionIsTheOnlyClockBelowHalfAWindowRung (0.60s)
+=== RUN   TestTcpReturnRecoversLostMiddleAfterTransferDelivery
+--- PASS: TestTcpReturnRecoversLostMiddleAfterTransferDelivery (0.00s)
+=== RUN   TestTcpReturnRecoversLostTailWithoutLaterData
+--- PASS: TestTcpReturnRecoversLostTailWithoutLaterData (0.00s)
+=== RUN   TestTcpReturnRecoveryCrossesSequenceWrap
+--- PASS: TestTcpReturnRecoveryCrossesSequenceWrap (0.00s)
+=== RUN   TestTcpReturnKeepsRecoveryAfterOriginEof
+--- PASS: TestTcpReturnKeepsRecoveryAfterOriginEof (0.00s)
+=== RUN   TestTcpReturnHealthyPathDoesNotReplay
+--- PASS: TestTcpReturnHealthyPathDoesNotReplay (0.00s)
+=== RUN   TestTcpReturnRecoveryIpv6
+--- PASS: TestTcpReturnRecoveryIpv6 (0.00s)
+=== RUN   TestTcpReturnCacheSharesAnExactBudgetAcrossFlows
+--- PASS: TestTcpReturnCacheSharesAnExactBudgetAcrossFlows (0.00s)
+=== RUN   TestTcpReturnCacheCancellationReleasesAWaiter
+--- PASS: TestTcpReturnCacheCancellationReleasesAWaiter (0.00s)
+=== RUN   TestTcpReturnCacheSkipsAlreadyAcknowledgedReadAhead
+--- PASS: TestTcpReturnCacheSkipsAlreadyAcknowledgedReadAhead (0.00s)
+=== RUN   TestTcpSequenceCancelBeforeWritePublicationReturnsPacket
+--- PASS: TestTcpSequenceCancelBeforeWritePublicationReturnsPacket (0.00s)
+=== RUN   TestEvictionAcknowledgementsFitEveryCarrier
+--- PASS: TestEvictionAcknowledgementsFitEveryCarrier (0.01s)
+=== RUN   TestAckResponsesKeepOrderedOverflow
+--- PASS: TestAckResponsesKeepOrderedOverflow (0.10s)
+=== RUN   TestAckOverflowDoesNotAddCompressionIntervals
+--- PASS: TestAckOverflowDoesNotAddCompressionIntervals (0.01s)
+=== RUN   TestAckWorkerBoundsEveryResponseAndFinalDrain
+--- PASS: TestAckWorkerBoundsEveryResponseAndFinalDrain (0.01s)
+=== RUN   TestAckCompressionEnforcesItsOwnResponseCountLimit
+--- PASS: TestAckCompressionEnforcesItsOwnResponseCountLimit (0.00s)
+=== RUN   TestAckCompressionHeadDrainDoesNotAllocate
+--- PASS: TestAckCompressionHeadDrainDoesNotAllocate (0.00s)
+=== RUN   TestAckCompressionOneHeadThenOldestSacksAboveHead
+--- PASS: TestAckCompressionOneHeadThenOldestSacksAboveHead (0.00s)
+=== RUN   TestAckCompressionAdvancingHeadAbsorbsUnsentSacks
+--- PASS: TestAckCompressionAdvancingHeadAbsorbsUnsentSacks (0.00s)
+=== RUN   TestAckCompressionPacesSacksAtCompressionDeadlines
+--- PASS: TestAckCompressionPacesSacksAtCompressionDeadlines (0.00s)
+=== RUN   TestAckCompressionPacesEvictionOnlyHeadCarriers
+--- PASS: TestAckCompressionPacesEvictionOnlyHeadCarriers (0.00s)
+=== RUN   TestAckCompressionEvictionAfterSackRepeatsTheHead
+--- PASS: TestAckCompressionEvictionAfterSackRepeatsTheHead (0.01s)
+=== RUN   TestAckCompressionWireHasOneHeadAndBoundedOldestSacks
+--- PASS: TestAckCompressionWireHasOneHeadAndBoundedOldestSacks (0.00s)
+=== RUN   TestSequenceAckWindowCoalescesReusableNotification
+--- PASS: TestSequenceAckWindowCoalescesReusableNotification (0.00s)
+=== RUN   TestSequenceAckWindowSteadyStateDoesNotAllocate
+--- PASS: TestSequenceAckWindowSteadyStateDoesNotAllocate (0.00s)
+=== RUN   TestSequenceAckWindowPendingDoesNotCloneSelectiveAcks
+--- PASS: TestSequenceAckWindowPendingDoesNotCloneSelectiveAcks (0.00s)
+=== RUN   TestSequenceAckWindowDueDispositionIgnoresUnrelatedProgress
+--- PASS: TestSequenceAckWindowDueDispositionIgnoresUnrelatedProgress (0.00s)
+=== RUN   TestSequenceAckWindowPreservesCompactRecoveryCapability
+--- PASS: TestSequenceAckWindowPreservesCompactRecoveryCapability (0.00s)
+=== RUN   TestSequenceAckWindowTracksCarrierOfLatestAckTrigger
+--- PASS: TestSequenceAckWindowTracksCarrierOfLatestAckTrigger (0.00s)
+=== RUN   TestResendCapacityReleaseWakesAdmissionImmediately
+--- PASS: TestResendCapacityReleaseWakesAdmissionImmediately (0.00s)
+=== RUN   TestSequenceAckWindowGapWakeOncePerHead
+--- PASS: TestSequenceAckWindowGapWakeOncePerHead (0.00s)
+=== RUN   TestSequenceAckWindowGapWakeDisabled
+--- PASS: TestSequenceAckWindowGapWakeDisabled (0.00s)
+=== RUN   TestSequenceAckWindowGapWakeSteadyStateDoesNotAllocate
+--- PASS: TestSequenceAckWindowGapWakeSteadyStateDoesNotAllocate (0.00s)
+=== RUN   TestGapWakeRepairsTheFirstCumulativeHead
+--- PASS: TestGapWakeRepairsTheFirstCumulativeHead (0.00s)
+=== RUN   TestGapWakeDoesNotReproveTheSameHeadEverySnapshot
+--- PASS: TestGapWakeDoesNotReproveTheSameHeadEverySnapshot (0.00s)
+=== RUN   TestGapWakeCountsEvidenceAcrossSnapshots
+--- PASS: TestGapWakeCountsEvidenceAcrossSnapshots (0.00s)
+=== RUN   TestGapWakeWorkerCompressesRepeatedProof
+--- PASS: TestGapWakeWorkerCompressesRepeatedProof (0.00s)
+=== RUN   TestWindowPacingRoundTripExcludesLocalWriteWait
+--- PASS: TestWindowPacingRoundTripExcludesLocalWriteWait (0.00s)
+=== RUN   TestWindowPacingAmbiguousDeliveryCannotSetRelayRoundTrip
+--- PASS: TestWindowPacingAmbiguousDeliveryCannotSetRelayRoundTrip (0.00s)
+=== RUN   TestWindowMismatchUnbudgetedSenderRespectsKnownLimits
+--- PASS: TestWindowMismatchUnbudgetedSenderRespectsKnownLimits (0.00s)
+=== RUN   TestWindowMismatchZeroHoldKeepsOneItemProgress
+--- PASS: TestWindowMismatchZeroHoldKeepsOneItemProgress (0.00s)
+=== RUN   TestWindowMismatchLargeTargetCannotWrapItsBounds
+--- PASS: TestWindowMismatchLargeTargetCannotWrapItsBounds (0.00s)
+=== RUN   TestWindowDeliveryContractLeadDoesNotOverflow
+--- PASS: TestWindowDeliveryContractLeadDoesNotOverflow (0.00s)
+=== RUN   TestWindowPacingLocalHistoryRetainsStableFeedbackSpan
+--- PASS: TestWindowPacingLocalHistoryRetainsStableFeedbackSpan (0.00s)
+=== RUN   TestWindowMismatchCapacityIncreaseStartsFreshDeliveryEvidence
+--- PASS: TestWindowMismatchCapacityIncreaseStartsFreshDeliveryEvidence (0.00s)
+=== RUN   TestWindowPacingQueueEstimateDoesNotIncludeWindowLimitedIdle
+--- PASS: TestWindowPacingQueueEstimateDoesNotIncludeWindowLimitedIdle (0.00s)
+=== RUN   TestWindowBucketStatsLeadingUnknownAndLateHold
+--- PASS: TestWindowBucketStatsLeadingUnknownAndLateHold (0.00s)
+=== RUN   TestWindowBucketStatsPartialAfterIdleKeepsCompletedHold
+--- PASS: TestWindowBucketStatsPartialAfterIdleKeepsCompletedHold (0.00s)
+=== RUN   TestWindowBucketStatsWeightsCompletedBucketsEqually
+--- PASS: TestWindowBucketStatsWeightsCompletedBucketsEqually (0.00s)
+=== RUN   TestWindowBucketStatsZeroOrderHoldDistinguishesMeasuredZero
+--- PASS: TestWindowBucketStatsZeroOrderHoldDistinguishesMeasuredZero (0.00s)
+=== RUN   TestWindowBucketStatsExactBoundaries
+--- PASS: TestWindowBucketStatsExactBoundaries (0.00s)
+=== RUN   TestWindowBucketStatsAcceptsRetainedOutOfOrderMeasurements
+--- PASS: TestWindowBucketStatsAcceptsRetainedOutOfOrderMeasurements (0.00s)
+=== RUN   TestWindowBucketStatsExpirationCannotOverwriteTheHold
+--- PASS: TestWindowBucketStatsExpirationCannotOverwriteTheHold (0.00s)
+=== RUN   TestWindowMismatchRespectsBothEndpoints
+--- PASS: TestWindowMismatchRespectsBothEndpoints (0.01s)
+=== RUN   TestWindowPacingDrainedProbeSurvivesHeadCompression
+--- PASS: TestWindowPacingDrainedProbeSurvivesHeadCompression (0.00s)
+=== RUN   TestWindowPacingDrainedProbeRequiresEverySibling
+--- PASS: TestWindowPacingDrainedProbeRequiresEverySibling (0.00s)
+=== RUN   TestWindowPacingCanceledTailNeedsFreshDelivery
+--- PASS: TestWindowPacingCanceledTailNeedsFreshDelivery (0.00s)
+=== RUN   TestWindowPacingDrainedProbeRejectsAmbiguousEvidence
+--- PASS: TestWindowPacingDrainedProbeRejectsAmbiguousEvidence (0.00s)
+=== RUN   TestWindowPacingWindowUsesRefreshedServiceResidence
+--- PASS: TestWindowPacingWindowUsesRefreshedServiceResidence (0.00s)
+=== RUN   TestWindowPacingCoalescerPreservesDrainedProbeArrival
+--- PASS: TestWindowPacingCoalescerPreservesDrainedProbeArrival (0.00s)
+=== RUN   TestWindowPacingSlowServiceDeferralNeedsFreshProgress
+--- PASS: TestWindowPacingSlowServiceDeferralNeedsFreshProgress (0.00s)
+=== RUN   TestWindowPacingServiceByteEnvelope
+--- PASS: TestWindowPacingServiceByteEnvelope (0.01s)
+=== RUN   TestWindowPacingServiceChangesPreserveDebt
+--- PASS: TestWindowPacingServiceChangesPreserveDebt (0.00s)
+=== RUN   TestWindowPacingProbeBoundaryIdleAndIndependentSequences
+--- PASS: TestWindowPacingProbeBoundaryIdleAndIndependentSequences (0.00s)
+=== RUN   TestWindowPacingCanceledSmallWrite
+--- PASS: TestWindowPacingCanceledSmallWrite (0.00s)
+=== RUN   TestWindowPacingCancellationDuringProbe
+--- PASS: TestWindowPacingCancellationDuringProbe (0.00s)
+=== RUN   TestWindowPacingServiceMeasurementAcrossAckCompression
+--- PASS: TestWindowPacingServiceMeasurementAcrossAckCompression (0.00s)
+=== RUN   TestWindowPacingRateBoundsAndHandshake
+--- PASS: TestWindowPacingRateBoundsAndHandshake (0.00s)
+=== RUN   TestWindowPacingServiceUsesAckArrival
+--- PASS: TestWindowPacingServiceUsesAckArrival (0.00s)
+=== RUN   TestWindowPacingServiceCountsSacksOnce
+--- PASS: TestWindowPacingServiceCountsSacksOnce (0.00s)
+=== RUN   TestWindowPacingSlowerServiceSupersedesFastHistory
+--- PASS: TestWindowPacingSlowerServiceSupersedesFastHistory (0.00s)
+=== RUN   TestWindowPacingSharedServiceEnvelopeAndCancellation
+--- PASS: TestWindowPacingSharedServiceEnvelopeAndCancellation (0.00s)
+=== RUN   TestWindowPacingSharedProbeAndServiceIsolation
+--- PASS: TestWindowPacingSharedProbeAndServiceIsolation (0.00s)
+=== RUN   TestWindowPacingSharedCompressionUsesAWholeAckInterval
+--- PASS: TestWindowPacingSharedCompressionUsesAWholeAckInterval (0.00s)
+=== RUN   TestWindowPacingSharedShortTrainAcrossSampleBoundaries
+--- PASS: TestWindowPacingSharedShortTrainAcrossSampleBoundaries (0.00s)
+=== RUN   TestWindowPacingShortAndCompressedTrainEdges
+--- PASS: TestWindowPacingShortAndCompressedTrainEdges (0.00s)
+=== RUN   TestWindowPacingProbeNeedsQueueDelayEvidence
+--- PASS: TestWindowPacingProbeNeedsQueueDelayEvidence (0.00s)
+=== RUN   TestWindowPacingOpeningProbeCoversBoundedCompression
+--- PASS: TestWindowPacingOpeningProbeCoversBoundedCompression (0.00s)
+=== RUN   TestWindowPacingRetainsServiceUntilFeedbackCanReturn
+--- PASS: TestWindowPacingRetainsServiceUntilFeedbackCanReturn (0.00s)
+=== RUN   TestWindowPacingBackloggedServiceUsesSustainedDelivery
+--- PASS: TestWindowPacingBackloggedServiceUsesSustainedDelivery (0.00s)
+=== RUN   TestWindowPacingDrainsAQueueAtEachServiceRate
+--- PASS: TestWindowPacingDrainsAQueueAtEachServiceRate (0.00s)
+=== RUN   TestWindowPacingBacklogProbeAndCanceledOwnership
+--- PASS: TestWindowPacingBacklogProbeAndCanceledOwnership (0.00s)
+=== RUN   TestWindowPacingCreditsTheFirstWireEnvelope
+--- PASS: TestWindowPacingCreditsTheFirstWireEnvelope (0.00s)
+=== RUN   TestWindowPacingUsesDeliveryBeforeTheConfiguredTarget
+--- PASS: TestWindowPacingUsesDeliveryBeforeTheConfiguredTarget (0.00s)
+=== RUN   TestWindowPacingServiceMeasurementExcludesWindowIdleAndExpires
+--- PASS: TestWindowPacingServiceMeasurementExcludesWindowIdleAndExpires (0.00s)
+=== RUN   TestWindowBurstPacingBoundsBusyAndIdleWrites
+--- PASS: TestWindowBurstPacingBoundsBusyAndIdleWrites (0.00s)
+=== RUN   TestWindowBurstPacingCancellationJoinsWait
+--- PASS: TestWindowBurstPacingCancellationJoinsWait (0.00s)
+=== RUN   TestWindowBurstPacingRetainsBoundedTimerLateness
+--- PASS: TestWindowBurstPacingRetainsBoundedTimerLateness (0.00s)
+=== RUN   TestWindowPerformanceRejectsSlowCandidate
+--- PASS: TestWindowPerformanceRejectsSlowCandidate (0.00s)
+=== RUN   TestWindowPerformanceCappedFixtureCannotHideRegression
+--- PASS: TestWindowPerformanceCappedFixtureCannotHideRegression (0.00s)
+=== RUN   TestWindowPerformanceDriftCannotEraseSlowReading
+--- PASS: TestWindowPerformanceDriftCannotEraseSlowReading (0.00s)
+=== RUN   TestWindowPerformanceChecksMatchedControlsIndependently
+--- PASS: TestWindowPerformanceChecksMatchedControlsIndependently (0.00s)
+=== RUN   TestWindowPerformanceRejectsDeliveryLossAndStalls
+--- PASS: TestWindowPerformanceRejectsDeliveryLossAndStalls (0.00s)
+=== RUN   TestWindowPerformanceAcceptsItsDeclaredMargin
+--- PASS: TestWindowPerformanceAcceptsItsDeclaredMargin (0.00s)
+=== RUN   TestWindowPerformanceMissingControlsStayInconclusive
+--- PASS: TestWindowPerformanceMissingControlsStayInconclusive (0.00s)
+=== RUN   TestAckCompressionAdvertisementPreservesPresence
+--- PASS: TestAckCompressionAdvertisementPreservesPresence (0.00s)
+=== RUN   TestWindowTargetIncludesAcknowledgementResidence
+--- PASS: TestWindowTargetIncludesAcknowledgementResidence (0.00s)
+=== RUN   TestWindowDeliveryIncludesAcknowledgementResidence
+--- PASS: TestWindowDeliveryIncludesAcknowledgementResidence (0.00s)
+=== RUN   TestDeliveryRateUsesCheckpointTimes
+--- PASS: TestDeliveryRateUsesCheckpointTimes (0.00s)
+=== RUN   TestDeliveryRateWaitsForWholeHorizon
+--- PASS: TestDeliveryRateWaitsForWholeHorizon (0.00s)
+=== RUN   TestDeliveryRateHistoryCoversDesignRoundTrip
+--- PASS: TestDeliveryRateHistoryCoversDesignRoundTrip (0.00s)
+=== RUN   TestWindowDeliveryLargeResidenceDoesNotOverflow
+--- PASS: TestWindowDeliveryLargeResidenceDoesNotOverflow (0.00s)
+=== RUN   TestWindowPathGapDeadline
+--- PASS: TestWindowPathGapDeadline (0.00s)
+=== RUN   TestTheWindowHasOneOwner
+--- PASS: TestTheWindowHasOneOwner (0.01s)
+=== RUN   TestFamilyStandbyTracksChangingDialEvidence
+--- PASS: TestFamilyStandbyTracksChangingDialEvidence (0.00s)
+=== RUN   TestTunAckHandoffClassifiesOnlyAcknowledgements
+--- PASS: TestTunAckHandoffClassifiesOnlyAcknowledgements (0.00s)
+=== RUN   TestTunAckHandoffDoesNotWaitForBusyTcpEndpoint
+--- PASS: TestTunAckHandoffDoesNotWaitForBusyTcpEndpoint (0.00s)
+PASS

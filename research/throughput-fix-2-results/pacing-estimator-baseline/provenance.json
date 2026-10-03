@@ -1,0 +1,26 @@
+{
+  "input_sha256": {
+    "manifest.json": "c508b4eab1c06a458023a0d42f2a92afdd69deb2369936efee5c2562daf258e9",
+    "status.json": "d4a934da9b487c492cf6ef4123a68fa86119cc915638c72371c58c36d4d66487",
+    "ledger.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "run.log": "60451c31688d3648e2e350b1fc9f03e8832f02b8337b21db1d6a0e68caf193f1"
+  },
+  "outcome": "process passed",
+  "top_level_passed": 0,
+  "top_level_failed": 0,
+  "top_level_skipped": 0,
+  "host_performance_acceptance": "no host comparisons in this selection",
+  "comparison_count": 0,
+  "failed_comparisons": null,
+  "censored_comparisons": 0,
+  "note": "Raw run.log remains outside this archive; its hash is retained. Outcomes are an excerpt. Process success alone does not prove performance acceptance.",
+  "derived_benchmark_rows": {
+    "benchmark_row_count": 3,
+    "input_raw_log_sha256": "60451c31688d3648e2e350b1fc9f03e8832f02b8337b21db1d6a0e68caf193f1",
+    "parser": "terminal Go benchmark result rows; preserves iterations, ns/op, estimated-B/s, B/op, and allocs/op",
+    "raw_log": "excluded"
+  },
+  "sanitization": {
+    "manifest_external_local_replacement_locations": "redacted; original input manifest hash remains under input_sha256.manifest.json"
+  }
+}

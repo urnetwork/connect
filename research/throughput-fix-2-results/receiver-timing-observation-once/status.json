@@ -1,0 +1,21 @@
+{
+  "after_fail_count": 0,
+  "after_pass_count": 72,
+  "after_race_execution_count": 72,
+  "after_race_warning_count": 0,
+  "after_timing_root_count": 24,
+  "archive_result": "complete_pinned_lifecycle_root_evidence",
+  "before_top_level_executions": 3,
+  "before_top_level_fail_count": 3,
+  "before_variant_check_count": 12,
+  "before_variants": {
+    "before-retry": 3,
+    "confirmed-retry": 3,
+    "failed-retry": 3,
+    "unreliable-retry": 3
+  },
+  "first_case_diagnostic_check_count": 3,
+  "first_case_diagnostic_top_level_fail_count": 3,
+  "numerical_timing_check_count": 15,
+  "performance_claim": "none"
+}

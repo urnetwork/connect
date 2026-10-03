@@ -1,0 +1,11 @@
+{
+  "archive": "matched-offer-attribution-correction-evidence",
+  "payload_sha256": {
+    "attribution-correction.json": "ec58cbd3e4d5e38c467d04eef0a92567d7a08ca5d33b64318505d7134e8696ee",
+    "numeric-readings.jsonl": "e6d259cf7c902f204df55903fc379571ee97745d09d29b89e5c9f0a9a6e2edff",
+    "outcomes.jsonl": "212177b420ae8aabb21aa74b9bc74029a0b2019824b0b12e01288ff6c8c373c2",
+    "provenance.json": "1cfb3009b8b0ee7e6f25160cab0807733ae050b08d97a9f963ac72c709df11d8",
+    "source-pins.json": "c855af77ec6d1a88361c7301503dad8132e2b5b965723a7ac525a65d2afed570",
+    "status.json": "f5e50b52747686a989413d51a0d5087f7be75b8d84abeee7835409e191cc349d"
+  }
+}

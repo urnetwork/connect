@@ -1,0 +1,39 @@
+{
+  "candidate": "paired-probe-common-raw-residence-bound",
+  "candidate_inputs": [
+    {
+      "sha256": "2194543aebd4295f77ac1854520051e9d81b6cd0687c3c29b8b50fed6007b48f",
+      "target": "transfer_window_pacing.go"
+    },
+    {
+      "sha256": "f30a123bf1d0bf27387c4e12aa077bcd5d1612561cb289c87ee8603cf04520ac",
+      "target": "transfer_window_pacing_paired_probe_worker_test.go"
+    },
+    {
+      "sha256": "43f954d71112f2578673d4348e727dbb0da80d945e2cb2ba6cacd75fa7b549ef",
+      "target": "transfer_window_pacing_paired_probe_lane_test.go"
+    },
+    {
+      "sha256": "2857878507f0358be837e91c0a708f6250fd643b83aae0f5256c414839591453",
+      "target": "transfer_window_pacing_paired_probe_bounds_test.go"
+    }
+  ],
+  "dependency_inputs": [
+    {
+      "sha256": "240d0b746565f0af820034bc88dfdcf7e2d53022b8a8548c9cdfd6a8e01c5c81",
+      "target": "transfer_window_receiver_rtt.go"
+    },
+    {
+      "sha256": "17627ce33cbb584b2b01c9a8ef91910216c3c39d5296ad193c4bf293ea3705a7",
+      "target": "transfer_sender_ack_timing.go"
+    },
+    {
+      "sha256": "aaae216684febe04753f49bf5f7f358f573e3187d34beae1acb811392c9fae73",
+      "target": "transfer.go"
+    }
+  ],
+  "final_focus_build_manifest_sha256": "cb70f2a94209a03c9238d0c49e60498f5add0a9ace3dfd658aff82f71924fb06",
+  "final_focus_log_sha256": "3003f185fceb1afcdbe9c4f8dcca54862662006c628dbf215e274a326fcd20a1",
+  "final_guarded_handoff_sha256": "4811b4aa38625b5f097b956ed227629e60561dac51c877b92e6046e341c6b31b",
+  "production_patch_sha256": "81f34e342ce2e88acaab23112e040e09b992d3ab3d6dca573b45613eae5ad48c"
+}

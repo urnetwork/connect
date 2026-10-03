@@ -1,0 +1,11 @@
+{
+  "classification": "Exploratory live checkout runs; persistent test binaries were not retained. The pinned comparison in sibling before/after directories supplies source/build hashes.",
+  "before_command": "go test -overlay=/tmp/throughput-fix-2-astra-prefix-before/overlay.json -v -run ^TestWindowPathSdkRetainedDeviceDuplexShort$ -count=3 .",
+  "after_command": "go test -v -run ^TestWindowPathSdkRetainedDeviceDuplexShort$ -count=3 .",
+  "working_directory": "/Users/brien/urnetwork/connect",
+  "no_quiescence_wait": true,
+  "run_log_sha256": {
+    "before": "ded47aa11537d35ec984ba9ead5ebde68fbdaf29b62a120490d78297b2c52a84",
+    "after": "fa5c59cd199d9259004355c691671a85c9e949a84973dbe3c888896f20798ad6"
+  }
+}

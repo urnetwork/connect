@@ -1,0 +1,6 @@
+=== RUN   TestWindowPacingCanceledHeadTransfersControlledDrain
+    transfer_window_pacing_probe_test.go:281: head cancellation discarded its successor's controlled gap: epoch=0001-01-01 00:00:00 +0000 UTC want=1999-12-31 18:00:00.12 -0600 CST
+--- FAIL: TestWindowPacingCanceledHeadTransfersControlledDrain (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.724s

@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "8e9a9b9e57045af3fd74ba0e7336bda3d70fa8025157497c7e2d74ccaf64b30e",
+  "binary_sha256": "f0ad3a4431cad376c4add7ce3c7b3ccfb77b9527a8fb10143283f5d069d23f41",
+  "effective_inputs_sha256": "db86cf33b4698434e3a5d85e47b19724fb9d59bef978a320ac11a476405415dc",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^(TestWindowPacingReceiverInterleavedSlowdown.*|TestWindowPacingReceiverInvalid.*)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as the effective build inputs; original absolute cwd retained by raw status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T19:29:32.154052+00:00",
+  "loadavg_start": [
+    48.892578125,
+    36.58642578125,
+    26.73583984375
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 2.4303754586726427,
+  "loadavg_end": [
+    46.97900390625,
+    36.39404296875,
+    26.7255859375
+  ],
+  "ended_utc": "2026-09-16T19:29:34.584825+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "6d29b543f658d3736545668933ebd4cb0edab9751aef3f60c284bb950869263b",
+  "pass": 18,
+  "fail": 3,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "rows": 0,
+  "normalization_note": "Corrected controls publish every arrival through one shared controller timestamp. Restored cumulative fallback retained; unchanged interleaved paired slowdown fails all3 while six controls pass."
+}

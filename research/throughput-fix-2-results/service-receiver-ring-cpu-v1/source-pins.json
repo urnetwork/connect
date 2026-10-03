@@ -1,0 +1,79 @@
+[
+  {
+    "argv": [
+      "tests-nonrace.test",
+      "-test.v",
+      "-test.run",
+      "^BenchmarkWindowPacingReceiverRing",
+      "-test.count=3",
+      "-test.timeout=30m",
+      "-test.run=^$",
+      "-test.benchmem"
+    ],
+    "benchmark_source_sha256": "5070b7391b2362546b2acc1e9a4a592ac87bf52fdab2405f1ded707293a58635",
+    "binary_sha256": "8d6d96c05911d83c1b8f98bc8c5c11a33c0237b790f38fc08a5822106d0c7290",
+    "build_inputs_stable": true,
+    "compile_manifest_sha256": "faa07a2a07a4339a0a1aab622005e24795f6de266e95d693da8a9be8de3f1d01",
+    "effective_inputs_sha256": "39b15d4d8373d8acc8d324c710d0605153d3474e396048946c2972bdf0d8894e",
+    "inputs_match_at_archive": true,
+    "loadavg_end": [
+      14.4638671875,
+      14.521484375,
+      18.603515625
+    ],
+    "loadavg_start": [
+      14.4638671875,
+      14.521484375,
+      18.603515625
+    ],
+    "name": "initial-empty-selector",
+    "race": false,
+    "raw_log_sha256": "50a1a6ec8f834d30267a8829e7584ae99959d715cef83627fa7d611725ba92b0",
+    "raw_run_status_sha256": "9f58e735e83abbc8013993f5f3185f9a3e753e4420ab1d8ce90fba3ac909a710",
+    "readings": 0,
+    "run_metadata_limit": "Wrapper exited zero but selected no benchmarks; not valid performance evidence.",
+    "terminal": "PASS"
+  },
+  {
+    "benchmark_source_sha256": "5070b7391b2362546b2acc1e9a4a592ac87bf52fdab2405f1ded707293a58635",
+    "binary_sha256": "8d6d96c05911d83c1b8f98bc8c5c11a33c0237b790f38fc08a5822106d0c7290",
+    "build_inputs_stable": true,
+    "compile_manifest_sha256": "faa07a2a07a4339a0a1aab622005e24795f6de266e95d693da8a9be8de3f1d01",
+    "effective_inputs_sha256": "39b15d4d8373d8acc8d324c710d0605153d3474e396048946c2972bdf0d8894e",
+    "inputs_match_at_archive": true,
+    "name": "initial-two-endpoint-fixture",
+    "race": false,
+    "raw_log_sha256": "2ea42b78f7cf1c934e26fa8f29094563667c20fe62b501463eca8561d360f2b6",
+    "readings": 18,
+    "run_metadata_limit": "Direct benchmark runs have no separate runtime load/cwd/status manifest. Monitor ran immediately alongside the full model and research; exact per-run load/time is unavailable.",
+    "terminal": "FAIL"
+  },
+  {
+    "benchmark_source_sha256": "2d855bdd53117609eff73a2bf857ce2f6fd76773f57e0399feab55935e1d56ea",
+    "binary_sha256": "7c058e4544d56a1601c3baaa72be7485c956f730b3a358bea24eef3848a049cd",
+    "build_inputs_stable": true,
+    "compile_manifest_sha256": "7fcfaff4cdcec76b29d13946517b2d59ae147022174c18f10c81535be2e6c453",
+    "effective_inputs_sha256": "961d9c4b3c062eca80f388e0f6cae526fa7cf6524972bb4ecbf473217cbf2638",
+    "inputs_match_at_archive": true,
+    "name": "restored-before",
+    "race": false,
+    "raw_log_sha256": "61aa16c11a794f697a91b6185e3f796a88fd7851a449cff3635e572801119668",
+    "readings": 24,
+    "run_metadata_limit": "Direct benchmark runs have no separate runtime load/cwd/status manifest. Monitor ran immediately alongside the full model and research; exact per-run load/time is unavailable.",
+    "terminal": "PASS"
+  },
+  {
+    "benchmark_source_sha256": "2d855bdd53117609eff73a2bf857ce2f6fd76773f57e0399feab55935e1d56ea",
+    "binary_sha256": "3f82861e03ddcd7f66fce2d69cf80d663026c0eddd91f8e42401228e00d3a4de",
+    "build_inputs_stable": true,
+    "compile_manifest_sha256": "b147b8ac3683434ad6143281e9a2e3ab4168519fcdafde827bddca4d53eaaaa5",
+    "effective_inputs_sha256": "091c401216e3adb4a8a75a6e02b3716e7ade26c23298f7d8b62934a242cdd35e",
+    "inputs_match_at_archive": true,
+    "name": "bounded-slowdown-after",
+    "race": false,
+    "raw_log_sha256": "3976432183ca78460b13902cb83ee1fee8df64694610579857e613289ddb72ec",
+    "readings": 24,
+    "run_metadata_limit": "Direct benchmark runs have no separate runtime load/cwd/status manifest. Monitor ran immediately alongside the full model and research; exact per-run load/time is unavailable.",
+    "terminal": "PASS"
+  }
+]

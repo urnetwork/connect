@@ -153,7 +153,7 @@ func TestProbeSynAckCompletesAndIsNotForwarded(t *testing.T) {
 	egress := update.probe.ipPath
 	ingressPath, packet := probeTestSynAck(t, egress, 0x5150)
 
-	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, ingressPath, packet)
+	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, TransportTypeUnknown, ingressPath, packet)
 
 	var result probeResult
 	select {
@@ -218,7 +218,7 @@ func TestProbeRstIsNotAnAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, ingressPath, rstPacket)
+	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, TransportTypeUnknown, ingressPath, rstPacket)
 
 	var result probeResult
 	select {
@@ -267,7 +267,7 @@ func TestProbeDnsAnswerPasses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, ingressPath, answer)
+	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, TransportTypeUnknown, ingressPath, answer)
 
 	var result probeResult
 	select {
@@ -338,7 +338,7 @@ func TestProbeLateAnswerIsConsumedNotForwarded(t *testing.T) {
 		DestinationPort: target.Port,
 	}
 	ingressPath, packet := probeTestSynAck(t, egress, 0x5150)
-	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, ingressPath, packet)
+	parent.clientReceivePacket(client, TransferPath{}, protocol.ProvideMode_Public, TransportTypeUnknown, ingressPath, packet)
 
 	if n := len(*forwarded); n != 0 {
 		t.Errorf("a late probe answer was forwarded to the application (%d packet(s))", n)
@@ -738,12 +738,17 @@ func TestProbePacketsAreWellFormed(t *testing.T) {
 		if got := binary.BigEndian.Uint16(payload[4:6]); got != 1 {
 			t.Errorf("v%d: dns qdcount = %d, want 1", version, got)
 		}
+		// the query asks for an address the same pass can dial: A over v4,
+		// AAAA (28) over v6
 		wantQuestion := []byte{
 			3, 'w', 'w', 'w',
 			7, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
 			3, 'c', 'o', 'm',
 			0,
 			0, 1, 0, 1,
+		}
+		if version == 6 {
+			wantQuestion[len(wantQuestion)-3] = 28
 		}
 		if got := payload[12:]; string(got) != string(wantQuestion) {
 			t.Errorf("v%d: dns question = %v, want %v", version, got, wantQuestion)

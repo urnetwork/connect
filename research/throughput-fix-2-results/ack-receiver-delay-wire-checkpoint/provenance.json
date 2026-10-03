@@ -1,0 +1,114 @@
+{
+  "binaries": [
+    {
+      "build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "raw_log_sha256": "a9f07979b252cf13ff11e0912d9d03d4048676b6235320b5924768ec681fe1c2",
+      "selection": "race",
+      "sha256": "5799fa86112479b8a09af41d314ccd14b97997bf893ce58c1d02b54feeaf7e6e"
+    },
+    {
+      "build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "raw_log_sha256": "56b808aa3348eb4692ee5a52d9b0ad7173356a51fa2d4194f877ab273af33fc4",
+      "selection": "nonrace",
+      "sha256": "8c87d1d5c2a9ee1e2f08d66f3d3710964df77ead6c8c2cd64903f83a6a4a48d8"
+    }
+  ],
+  "field": {
+    "name": "receiver_ack_delay_micros",
+    "number": 12,
+    "type": "optional uint32"
+  },
+  "input_run": {
+    "manifest_sha256": "650b44f836526ad0e6f35ccd7de06ce104f08ba8cf9adee98a9daf8cd400ae86",
+    "selection_sha256": "b497e7a353c63dad9bc8c22244cb6ec49f0822ba8d5cef148bac89e4609c93ff"
+  },
+  "oracle_review": "not triggered: no terminal failures occurred",
+  "redaction": {
+    "external_local_replacement_locations": "redacted",
+    "local_paths": "excluded",
+    "raw_logs": "excluded",
+    "source_and_binary_contents": "excluded"
+  },
+  "schema": "throughput-fix-2/ack-receiver-delay-wire-provenance-v1",
+  "scope_limits": [
+    "Validates wire field presence, codec/decode behavior, compatibility decoding, malformed rejection, retained compact-message size, and existing ACK bounds.",
+    "Does not validate receiver/sender behavior inference; that work remains isolated.",
+    "No legacy zero-growth assertion was run because its static expectations conflict with the current landing guard."
+  ],
+  "selection": {
+    "nonrace": {
+      "build_flags": [
+        "-race=false"
+      ],
+      "pattern": "^(TestOwnedAckDecodeSteadyStateDoesNotAllocate|TestAckCompressionHeadDrainDoesNotAllocate)$",
+      "run_flags": [
+        "-test.v",
+        "-test.count=1",
+        "-test.timeout=30m"
+      ]
+    },
+    "not_selected": {
+      "legacy_zero_growth_guard": "TestAckStructsGainNoBytes is intentionally separate because its static size expectations conflict with current landing expectations."
+    },
+    "race": {
+      "build_flags": [
+        "-race"
+      ],
+      "pattern": "^(TestAckReceiverDelay.*|TestAckCodecEdgeCases|TestAckCodecRandomized|TestTheAckCodecKeepsAnAbsentAndAZeroCapacityApart|TestTheAckCodecRoundTripsAWholeEvictionGeneration|TestDecodeTransferFrameMalformed|TestOwnedAckDecodeCopiesCompactQueueValueBeforeRelease|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestLandingStructsMatchMergedLessTheDeferState|TestEvictionAcknowledgementsFitEveryCarrier|TestAckResponsesKeepOrderedOverflow|TestAckOverflowDoesNotAddCompressionIntervals|TestAckWorkerBoundsEveryResponseAndFinalDrain|TestAckCompression(EnforcesItsOwnResponseCountLimit|OneHeadThenOldestSacksAboveHead|AdvancingHeadAbsorbsUnsentSacks|PacesSacksAtCompressionDeadlines|PacesEvictionOnlyHeadCarriers|EvictionAfterSackRepeatsTheHead|WireHasOneHeadAndBoundedOldestSacks)|TestReceiveSequenceBurstTailEncodedCostIncludesWrapping)$",
+      "run_flags": [
+        "-test.v",
+        "-test.count=1",
+        "-test.timeout=30m"
+      ]
+    }
+  },
+  "source": {
+    "canonical_source_sha256": "8ae48d8a35b811eed7307626cb441934cbc542becfca58674476a797d6c08187",
+    "file_count": 797,
+    "runner_sha256": "25939d8152e35ed053e75d2dd2a27ff4be341c44c72ad217bee1ccb434fca20f",
+    "snapshot_input_sha256": "57bb116b92c9e29f01c6a66eeff495fd934b0b0c72da326e8fbcc8d344e65667",
+    "sources_stable_during_build_and_run": true
+  },
+  "source_pins": [
+    {
+      "file": "protocol/transfer.proto",
+      "sha256": "0a1a8ddda59e01b051e1d23818abc8d3c23810b8de29f1d0474a82a92045f2ad"
+    },
+    {
+      "file": "protocol/transfer.pb.go",
+      "sha256": "d759a2b1e63295a39aa1eff9336c650afb8643a6fac5a4c73d347b26a1a42838"
+    },
+    {
+      "file": "frame_protobuf.go",
+      "sha256": "ac4609bb0347bbf573c1d486e02e1c15961e2afca412a77df3d3e09ce35d117a"
+    },
+    {
+      "file": "transfer.go",
+      "sha256": "420b0a93e534ea348aff5a28264011463b7e871dbf8f7da1b807806782c58100"
+    },
+    {
+      "file": "transfer_ack_timing_codec_test.go",
+      "sha256": "95a83d64be8875a56c282334dc7d31078390b2beebdf270e20a183a740f3eeb0"
+    },
+    {
+      "file": "frame_protobuf_test.go",
+      "sha256": "7daafaedea3a5dd5c03eba746d6aa0decae4686af4f5ddb870b3e7542ff98aab"
+    },
+    {
+      "file": "flight_gate_landing_size_test.go",
+      "sha256": "27e2134eaf88b951dbe7a9c7be0685ef93fa9a7cece32ea7e3c48007617cc9be"
+    },
+    {
+      "file": "transfer_ack_bounds_test.go",
+      "sha256": "5c945984e27eb59213e7a67fd2f15cb5897f9a1bae8fe746ec1bf18ac5a4181d"
+    },
+    {
+      "file": "transfer_ack_compression_test.go",
+      "sha256": "6d5a34a3d3301dd0dafa6065c9d1207049a863568f95ba934e17e4bf669530e9"
+    },
+    {
+      "file": "transfer_receive_ack_burst_tail_test.go",
+      "sha256": "85a0a879dd7503f70a1d081f17acb608deb219cae4bcb9d615d7a6ed078a597b"
+    }
+  ]
+}

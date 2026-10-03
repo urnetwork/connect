@@ -1,0 +1,15 @@
+=== RUN   TestWindowMismatchUnbudgetedSenderRespectsKnownLimits
+    transfer_window_adjacent_test.go:31: configured=0 phase=0: window=2097152 floor=262144, want limit 65536
+    transfer_window_adjacent_test.go:31: configured=0 phase=1: window=2097152 floor=262144, want limit 65536
+    transfer_window_adjacent_test.go:31: configured=32768 phase=0: window=2097152 floor=262144, want limit 32768
+    transfer_window_adjacent_test.go:31: configured=32768 phase=1: window=2097152 floor=262144, want limit 32768
+--- FAIL: TestWindowMismatchUnbudgetedSenderRespectsKnownLimits (0.00s)
+=== RUN   TestWindowMismatchCapacityIncreaseStartsFreshDeliveryEvidence
+    transfer_window_adjacent_test.go:60: old constrained delivery undid a capacity increase: window=262144 reason=delivery
+--- FAIL: TestWindowMismatchCapacityIncreaseStartsFreshDeliveryEvidence (0.00s)
+=== RUN   TestWindowPacingQueueEstimateDoesNotIncludeWindowLimitedIdle
+    transfer_window_adjacent_test.go:92: window idle reduced a full-rate service train to 31562500 B/s
+--- FAIL: TestWindowPacingQueueEstimateDoesNotIncludeWindowLimitedIdle (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.703s

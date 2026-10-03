@@ -1,0 +1,8 @@
+{
+  "limitations": [
+    "Zero added wire cost and bounded test-only message lookup.",
+    "Separate actual Client queue root fails this version.",
+    "Queue exclusion and production feedback encoding require independent validation."
+  ],
+  "scope": "Original full 27-test model selection with narrower startup handoff; receiver owns service only after an eligible pair"
+}

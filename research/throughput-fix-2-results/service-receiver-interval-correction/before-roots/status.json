@@ -1,0 +1,38 @@
+{
+  "manifest_sha256": "acdc282c21ec260bf4ca5d0597fbd3a84b60e9b9a2d7e32da7e95bc8f19c306d",
+  "binary_sha256": "0fd477b187d8a2fd513fe003225a87b070cbbf1f38c37c038bc586f32fb5ddcf",
+  "effective_inputs_sha256": "ae03da4bd17c3ac1c5da01e9e1008f6b397ac8f26c1d5b3933b76b7a098560f0",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacing(ReceiverWaitPreservesPhysicalSerialization|EqualReceiverWaitsDiscoverSlowSerialization|ReceiverWaitStillDiscoversCorrectedSlowSerialization)$",
+    "-test.count=3",
+    "-test.timeout=90s"
+  ],
+  "started_utc": "2026-09-16T18:21:03.416181+00:00",
+  "loadavg_start": [
+    7.71044921875,
+    7.8291015625,
+    8.63232421875
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent retained-window implementation and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 0.957889708224684,
+  "loadavg_end": [
+    7.71044921875,
+    7.8291015625,
+    8.63232421875
+  ],
+  "ended_utc": "2026-09-16T18:21:04.374413+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "8d7eec80338c253b9ab2988f35ccc3c7c87a3d5bfc5f24da23178a4ff17ef905",
+  "pass": 3,
+  "fail": 6,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "rows": 6
+}

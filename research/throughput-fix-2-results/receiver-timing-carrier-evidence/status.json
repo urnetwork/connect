@@ -1,0 +1,9 @@
+{
+  "carrier_after_race_passes": 42,
+  "carrier_before_failures": 3,
+  "complete": true,
+  "fail_count": 4,
+  "long_rtt_failures": 1,
+  "outcomes": 46,
+  "pass_count": 42
+}

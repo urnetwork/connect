@@ -1,0 +1,3 @@
+{"Kind": "sampler_qualification_assertion", "Test": "TestWindowPacingLimitedFlightAckPhaseDoesNotCompleteService", "Evidence": "transfer_window_service_flight_phase_test.go:60: arrival=6: drifting ack phase priced refill silence as service: 606338/38018"}
+{"Kind": "sampler_qualification_assertion", "Test": "TestWindowPacingLimitedFlightAckPhaseDoesNotCompleteService", "Evidence": "transfer_window_service_flight_phase_test.go:60: arrival=6: drifting ack phase priced refill silence as service: 606338/38018"}
+{"Kind": "sampler_qualification_assertion", "Test": "TestWindowPacingLimitedFlightAckPhaseDoesNotCompleteService", "Evidence": "transfer_window_service_flight_phase_test.go:60: arrival=6: drifting ack phase priced refill silence as service: 606338/38018"}

@@ -1,0 +1,12 @@
+{
+  "file_sha256": {
+    "failure-classification.json": "75fa31e6d5e19459cb657db2297332dfad30db428354951b32e755d7f9924624",
+    "ledger.jsonl": "d0286d3c9ca726fbbaf835bd914ee1a0bbe7d301820ccd95d16855f6953c861a",
+    "manifest.json": "2c39c33dd35d34fbd98f7ba64baca23704e7b2c0a8d59dbf095116de92417abe",
+    "outcomes.txt": "2e2f03f9f51decfc90cf74da70fbdc916f1c0a24151ee965f069291a0635e431",
+    "provenance.json": "2380d367d91fd74198b878df964352dc2fb7791bcb8bbdb4bc1d537a12804ff9",
+    "status.json": "63c72b9f454a18b51f55811271a9ffb128d843689b254371a22661f878c8de62"
+  },
+  "purpose": "hashes of redacted archive payload files; original raw input hashes remain in provenance.json",
+  "schema_version": 1
+}

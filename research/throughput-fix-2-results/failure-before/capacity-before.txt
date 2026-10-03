@@ -1,0 +1,5 @@
+--- FAIL: TestResendCapacityReleaseWakesAdmissionImmediately (0.00s)
+    transfer_capacity_wake_test.go:32: free capacity still waits for the 2 ms admission poll
+FAIL
+FAIL	github.com/urnetwork/connect	0.714s
+FAIL

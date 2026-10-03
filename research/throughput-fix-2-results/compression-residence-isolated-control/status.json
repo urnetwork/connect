@@ -1,0 +1,18 @@
+{
+  "archive_extracted_service_readings": 6,
+  "censored_comparisons": 0,
+  "comparison_count": 0,
+  "exit_code": 0,
+  "failed_comparisons": 0,
+  "finished_utc": "2026-09-16T04:35:34.265066+00:00",
+  "host_load_average_at_finish": [
+    13.6181640625,
+    15.00439453125,
+    17.1298828125
+  ],
+  "phase": "run",
+  "rows": 6,
+  "source_run_log_sha256": "39bc15ae3d3c2bd38b5ade4395cfabcb1abdf1e794d415c642e0ae1e4cf9051d",
+  "source_runner_rows_before_extraction": 0,
+  "source_status_sha256": "144732e652b73242b73a5aab8d5f9eef1c91d202ab409b8a36884e8312a3bd88"
+}

@@ -1,3 +1,5 @@
+// Stream controls publish bounded lifecycle work; receive callbacks cancel or
+// enqueue, while one owned worker performs generation-ordered blocking joins.
 package connect
 
 import (
@@ -51,6 +53,18 @@ type StreamManager struct {
 
 	rejectedStreamsLock sync.Mutex
 	rejectedStreams     map[Id]*rejectedStreamOpen
+}
+
+// Close retires stream admission and requests teardown without waiting.
+func (self *StreamManager) Close() {
+	self.streamBuffer.Close()
+}
+
+// closeAndWait retires every stream generation and joins its lifecycle and
+// transport workers, or returns when ctx expires.
+func (self *StreamManager) closeAndWait(ctx context.Context) error {
+	self.Close()
+	return self.streamBuffer.closeAndWait(ctx)
 }
 
 func NewStreamManager(ctx context.Context, client *Client, webRtcManager *WebRtcManager, streamManagerSettings *StreamManagerSettings) *StreamManager {
@@ -426,6 +440,14 @@ func (self *StreamManager) IsStreamOpen(streamId Id) bool {
 	return self.streamBuffer.IsStreamOpen(streamId)
 }
 
+// Retains a final-peer route alias only when an endpoint StreamSequence owns a
+// live scope for the contract's authenticated stream. The RouteManager records
+// early authentication and activates it when StreamOpen arrives.
+func (self *StreamManager) authenticateStreamDestination(streamId Id, destinationId Id) bool {
+	return self.client.RouteManager().authenticateWriterStreamDestination(streamId, destinationId)
+}
+
+// StreamBufferSettings configures stream forwarding and adjacent P2P workers.
 type StreamBufferSettings struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
@@ -433,6 +455,7 @@ type StreamBufferSettings struct {
 	P2pTransportSettings *P2pTransportSettings
 }
 
+// streamSequenceId is the exact directional identity of one stream generation.
 type streamSequenceId struct {
 	SourceId       Id
 	HasSource      bool
@@ -441,6 +464,41 @@ type streamSequenceId struct {
 	StreamId       Id
 }
 
+// maxPendingStreamOpenRequests bounds remote control state waiting for the
+// lifecycle worker. A normal client has only a small number of adjacent
+// streams, while the fixed limit prevents a stalled teardown from turning
+// repeated StreamOpen frames into unbounded memory growth.
+const maxPendingStreamOpenRequests = 128
+
+// maxManagedStreamOpenRequests bounds active lifecycle work, including
+// requests currently blocked while joining a retired generation. Terminal
+// requests leave this registry, so sequential stream churn cannot exhaust it.
+const maxManagedStreamOpenRequests = 1024
+
+// Hard-bounds published sequence state independently from transient lifecycle
+// work. Replacement of an existing stream id remains admissible at the limit.
+const maxLiveStreamSequences = 1024
+
+// streamOpenRequest is an immutable StreamOpen snapshot owned by the lifecycle
+// worker. Generation distinguishes a superseding open or close for the same
+// stream id while an older generation is waiting for teardown.
+type streamOpenRequest struct {
+	sourceId      *Id
+	destinationId *Id
+	streamId      Id
+	generation    uint64
+}
+
+// streamLifecycleSnapshot captures one managed request or live sequence for a
+// generation-conditional control retirement.
+type streamLifecycleSnapshot struct {
+	id         streamSequenceId
+	request    *streamOpenRequest
+	sequence   *StreamSequence
+	generation uint64
+}
+
+// newStreamSequenceId snapshots optional endpoint identities into a map key.
 func newStreamSequenceId(sourceId *Id, destinationId *Id, streamId Id) streamSequenceId {
 	streamSequenceId := streamSequenceId{
 		StreamId: streamId,
@@ -456,6 +514,7 @@ func newStreamSequenceId(sourceId *Id, destinationId *Id, streamId Id) streamSeq
 	return streamSequenceId
 }
 
+// StreamBuffer indexes live sequences and owns bounded asynchronous Open work.
 type StreamBuffer struct {
 	ctx context.Context
 
@@ -463,16 +522,62 @@ type StreamBuffer struct {
 
 	streamBufferSettings *StreamBufferSettings
 
+	// Lifecycle code that needs both locks takes managementStateLock before
+	// mutex. It never invokes RouteManager or another component while either
+	// state lock is held.
+	managementStateLock       sync.Mutex
+	closed                    bool
+	managedOpenRequests       map[Id]*streamOpenRequest
+	pendingOpenRequests       map[Id]*streamOpenRequest
+	openWorkers               map[Id]bool
+	openWorkerAdmission       *lifecycleAdmission
+	sequenceWorkerAdmission   *lifecycleAdmission
 	mutex                     sync.Mutex
 	streamSequences           map[streamSequenceId]*StreamSequence
 	streamSequencesByStreamId map[Id]*StreamSequence
+
+	// Tests use this hook to stall old-generation teardown before its owned
+	// join, without changing production lifecycle behavior.
+	beforeRetiredStreamJoinForTest func(*StreamSequence)
+	// Tests can pause construction before any sequence resource is opened.
+	beforeStreamSequenceConstructForTest func(*streamOpenRequest)
+	// Tests observe that closeAndWait reached the open-worker join boundary.
+	beforeCloseWaitForTest func()
+	// Tests can pause after RouteManager orders an Open but before publication.
+	afterStreamOpenGenerationForTest func(*streamOpenRequest)
+	// Tests configure a sequence before its Run worker becomes visible.
+	configureStreamSequenceForTest func(*StreamSequence)
+	// Tests observe exact publication without polling asynchronous lifecycle
+	// state. The hook runs after both StreamBuffer locks are released.
+	afterStreamSequencePublishForTest func(*StreamSequence)
+	// Tests observe terminal handling for one queued control after all managed
+	// request state is released.
+	afterStreamOpenProcessedForTest func(*streamOpenRequest)
+	// Tests observe map cleanup after a Run worker has published done and both
+	// StreamBuffer indexes have released its exact sequence pointer.
+	afterStreamSequenceRemoveForTest func(*StreamSequence)
+	// Tests pause an epoch-ordered close before its conditional alias clear.
+	beforeCloseAliasClearForTest func()
+	// Tests pause a reset after its lifecycle snapshot and before any
+	// generation-conditional alias removal.
+	afterResetLifecycleSnapshotForTest func()
+	// Tests pause a snapshotted policy clear before RouteManager publication.
+	beforePolicyAliasClearForTest func(Id, uint64)
+	// Tests pause a disconnected-peer snapshot before its conditional clear.
+	beforeDisconnectedAliasClearForTest func(Id, uint64)
 }
 
+// NewStreamBuffer initializes bounded per-stream lifecycle ownership.
 func NewStreamBuffer(ctx context.Context, streamManager *StreamManager, streamBufferSettings *StreamBufferSettings) *StreamBuffer {
 	return &StreamBuffer{
 		ctx:                       ctx,
 		streamManager:             streamManager,
 		streamBufferSettings:      streamBufferSettings,
+		managedOpenRequests:       map[Id]*streamOpenRequest{},
+		pendingOpenRequests:       map[Id]*streamOpenRequest{},
+		openWorkers:               map[Id]bool{},
+		openWorkerAdmission:       newLifecycleAdmission(),
+		sequenceWorkerAdmission:   newLifecycleAdmission(),
 		streamSequences:           map[streamSequenceId]*StreamSequence{},
 		streamSequencesByStreamId: map[Id]*StreamSequence{},
 	}
@@ -482,83 +587,594 @@ func NewStreamBuffer(ctx context.Context, streamManager *StreamManager, streamBu
 // A reset that relists the current streams reconciles instead of tearing down,
 // so the kept sequences (and their p2p transports) survive a resident migration
 func (self *StreamBuffer) ResetStreams(keep map[streamSequenceId]bool) {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	for streamSequenceId, streamSequence := range self.streamSequences {
-		if !keep[streamSequenceId] {
-			streamSequence.Cancel()
+	keepStreamIds := map[Id]bool{}
+	for id := range keep {
+		keepStreamIds[id.StreamId] = true
+	}
+	resetGeneration := self.streamManager.Client().
+		RouteManager().
+		writerStreamAliasGenerationCheckpoint()
+	self.streamManager.Client().RouteManager().finishWriterStreamAliasGenerationsThrough(
+		resetGeneration,
+	)
+	snapshots := self.lifecycleSnapshot()
+	if self.afterResetLifecycleSnapshotForTest != nil {
+		self.afterResetLifecycleSnapshotForTest()
+	}
+
+	self.streamManager.Client().RouteManager().clearWriterStreamAliasScopesExceptThroughGenerationAsync(
+		keepStreamIds,
+		resetGeneration,
+	)
+	for _, snapshot := range snapshots {
+		if resetGeneration < snapshot.generation {
+			continue
+		}
+		if keep[snapshot.id] {
+			// Relisted StreamOpen is enqueued after ResetStreams returns. Stop an
+			// older unpublished duplicate so only that fresh control can publish.
+			if snapshot.request != nil {
+				self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(
+					snapshot.id.StreamId,
+					snapshot.generation,
+				)
+				self.invalidateOpenRequestIfCurrent(snapshot.request)
+			}
+			continue
+		}
+		if keepStreamIds[snapshot.id.StreamId] && snapshot.generation != 0 {
+			self.streamManager.Client().RouteManager().clearWriterStreamAliasScopeThroughGenerationAsync(
+				snapshot.id.StreamId,
+				resetGeneration,
+			)
+		}
+		if snapshot.request != nil {
+			self.invalidateOpenRequestIfCurrent(snapshot.request)
+		}
+		if snapshot.sequence != nil {
+			snapshot.sequence.CancelThroughGeneration(resetGeneration)
 		}
 	}
 }
 
+// OpenStream records an authoritative open and returns without waiting for an
+// older same-id generation to finish. One bounded worker per active stream id
+// preserves same-id order without head-of-line blocking unrelated streams.
 func (self *StreamBuffer) OpenStream(sourceId *Id, destinationId *Id, streamId Id) (bool, error) {
-	streamSequenceId := newStreamSequenceId(sourceId, destinationId, streamId)
+	select {
+	case <-self.ctx.Done():
+		return false, errors.New("Done.")
+	default:
+	}
 
-	initStreamSequence := func(skip *StreamSequence) *StreamSequence {
+	request := &streamOpenRequest{
+		sourceId:      cloneOptionalId(sourceId),
+		destinationId: cloneOptionalId(destinationId),
+		streamId:      streamId,
+	}
+
+	// Reject obvious saturation before allocating a RouteManager generation.
+	// Capacity is checked again at publication to cover concurrent opens.
+	self.managementStateLock.Lock()
+	if self.closed {
+		self.managementStateLock.Unlock()
+		return false, errors.New("Done.")
+	}
+	_, alreadyPending := self.pendingOpenRequests[streamId]
+	if !alreadyPending && maxPendingStreamOpenRequests <= len(self.pendingOpenRequests) {
+		self.managementStateLock.Unlock()
+		return false, errors.New("Stream open queue full.")
+	}
+	if _, managed := self.managedOpenRequests[streamId]; !managed && maxManagedStreamOpenRequests <= len(self.managedOpenRequests) {
+		self.managementStateLock.Unlock()
+		return false, errors.New("Managed stream open limit reached.")
+	}
+	self.managementStateLock.Unlock()
+	self.mutex.Lock()
+	_, alreadyLive := self.streamSequencesByStreamId[streamId]
+	tooManyLiveStreams := !alreadyLive && maxLiveStreamSequences <= len(self.streamSequencesByStreamId)
+	self.mutex.Unlock()
+	if tooManyLiveStreams {
+		return false, errors.New("Live stream limit reached.")
+	}
+
+	generation, ok := self.streamManager.Client().RouteManager().beginWriterStreamAliasGeneration(streamId)
+	if !ok {
+		return false, errors.New("Stream alias generation limit reached.")
+	}
+	request.generation = generation
+	if self.afterStreamOpenGenerationForTest != nil {
+		self.afterStreamOpenGenerationForTest(request)
+	}
+	if !self.streamManager.Client().RouteManager().isWriterStreamAliasGenerationCurrent(
+		streamId,
+		generation,
+	) {
+		return true, nil
+	}
+
+	streamSequenceId := newStreamSequenceId(request.sourceId, request.destinationId, streamId)
+	for {
+		self.managementStateLock.Lock()
+		if self.closed {
+			self.managementStateLock.Unlock()
+			self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(streamId, generation)
+			return false, errors.New("Done.")
+		}
+		alreadyPending = self.pendingOpenRequests[streamId] != nil
+		if !alreadyPending && maxPendingStreamOpenRequests <= len(self.pendingOpenRequests) {
+			self.managementStateLock.Unlock()
+			self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(streamId, generation)
+			return false, errors.New("Stream open queue full.")
+		}
+		if existing := self.managedOpenRequests[streamId]; existing != nil && generation < existing.generation {
+			self.managementStateLock.Unlock()
+			self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(streamId, generation)
+			return true, nil
+		}
+		if _, managed := self.managedOpenRequests[streamId]; !managed && maxManagedStreamOpenRequests <= len(self.managedOpenRequests) {
+			self.managementStateLock.Unlock()
+			self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(streamId, generation)
+			return false, errors.New("Managed stream open limit reached.")
+		}
+		self.managementStateLock.Unlock()
+
 		self.mutex.Lock()
-		defer self.mutex.Unlock()
+		existingExact := self.streamSequences[streamSequenceId]
+		self.mutex.Unlock()
+		if existingExact != nil && !existingExact.reserveLifecycleGeneration(generation) {
+			self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(streamId, generation)
+			return true, nil
+		}
 
-		streamSequence, ok := self.streamSequences[streamSequenceId]
-		if ok {
-			if skip == nil || skip != streamSequence {
-				return streamSequence
-			} else {
-				streamSequence.Cancel()
-				delete(self.streamSequences, streamSequenceId)
+		self.managementStateLock.Lock()
+		self.mutex.Lock()
+		if self.closed {
+			self.mutex.Unlock()
+			self.managementStateLock.Unlock()
+			self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(streamId, generation)
+			return false, errors.New("Done.")
+		}
+		if self.streamSequences[streamSequenceId] != existingExact {
+			self.mutex.Unlock()
+			self.managementStateLock.Unlock()
+			continue
+		}
+		if existing := self.managedOpenRequests[streamId]; existing != nil && generation < existing.generation {
+			self.mutex.Unlock()
+			self.managementStateLock.Unlock()
+			self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(streamId, generation)
+			return true, nil
+		}
+		alreadyPending = self.pendingOpenRequests[streamId] != nil
+		if !alreadyPending && maxPendingStreamOpenRequests <= len(self.pendingOpenRequests) {
+			self.mutex.Unlock()
+			self.managementStateLock.Unlock()
+			self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(streamId, generation)
+			return false, errors.New("Stream open queue full.")
+		}
+		if _, managed := self.managedOpenRequests[streamId]; !managed && maxManagedStreamOpenRequests <= len(self.managedOpenRequests) {
+			self.mutex.Unlock()
+			self.managementStateLock.Unlock()
+			self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(streamId, generation)
+			return false, errors.New("Managed stream open limit reached.")
+		}
+		self.managedOpenRequests[streamId] = request
+		self.pendingOpenRequests[streamId] = request
+		startWorker := !self.openWorkers[streamId]
+		if startWorker {
+			if !self.openWorkerAdmission.start() {
+				delete(self.openWorkers, streamId)
+				delete(self.pendingOpenRequests, streamId)
+				delete(self.managedOpenRequests, streamId)
+				self.mutex.Unlock()
+				self.managementStateLock.Unlock()
+				self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(streamId, generation)
+				return false, errors.New("Done.")
+			}
+			self.openWorkers[streamId] = true
+		}
+		self.mutex.Unlock()
+		self.managementStateLock.Unlock()
+		if startWorker {
+			go func() {
+				defer self.openWorkerAdmission.finish()
+				self.runOpenRequests(streamId)
+			}()
+		}
+		return true, nil
+	}
+}
+
+// cloneOptionalId snapshots one optional control-frame identity for the
+// asynchronous lifecycle worker.
+func cloneOptionalId(id *Id) *Id {
+	if id == nil {
+		return nil
+	}
+	cloned := *id
+	return &cloned
+}
+
+// runOpenRequests owns potentially blocking replacement joins for one stream.
+// A stalled replacement cannot block construction for an unrelated stream.
+func (self *StreamBuffer) runOpenRequests(streamId Id) {
+	for {
+		self.managementStateLock.Lock()
+		request := self.pendingOpenRequests[streamId]
+		delete(self.pendingOpenRequests, streamId)
+		if request == nil {
+			delete(self.openWorkers, streamId)
+			self.managementStateLock.Unlock()
+			return
+		}
+		self.managementStateLock.Unlock()
+
+		if err := self.processOpenRequest(request); err != nil {
+			select {
+			case <-self.ctx.Done():
+				continue
+			default:
+			}
+			if self.streamManager.Client().log.V(1).Enabled() {
+				self.streamManager.Client().log.Infof(
+					"[sm]%s async open s(%s) err = %s\n",
+					self.streamManager.Client().ClientTag(),
+					request.streamId,
+					err,
+				)
 			}
 		}
-
-		if streamSequenceByStreamId, ok := self.streamSequencesByStreamId[streamId]; ok {
-			streamSequenceByStreamId.Cancel()
-			delete(self.streamSequencesByStreamId, streamId)
-		}
-
-		streamSequence = NewStreamSequence(self.ctx, self.streamManager, sourceId, destinationId, streamId, self.streamBufferSettings)
-
-		self.streamSequences[streamSequenceId] = streamSequence
-		self.streamSequencesByStreamId[streamId] = streamSequence
-		go HandleError(func() {
-			defer func() {
-				self.mutex.Lock()
-				defer self.mutex.Unlock()
-				streamSequence.Close()
-				// clean up
-				if streamSequence == self.streamSequences[streamSequenceId] {
-					delete(self.streamSequences, streamSequenceId)
-				}
-				if streamSequence == self.streamSequencesByStreamId[streamId] {
-					delete(self.streamSequencesByStreamId, streamId)
-				}
-			}()
-			streamSequence.Run()
-		})
-		return streamSequence
 	}
-
-	var streamSequence *StreamSequence
-	var success bool
-	var err error
-	for i := 0; i < 2; i += 1 {
-		select {
-		case <-self.ctx.Done():
-			return false, errors.New("Done.")
-		default:
-		}
-		streamSequence = initStreamSequence(streamSequence)
-		if success, err = streamSequence.Open(); err == nil {
-			return success, nil
-		}
-		// sequence closed
-	}
-	return success, err
 }
 
-func (self *StreamBuffer) CloseStream(streamId Id) {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
+// processOpenRequest opens or refreshes one stream. A failed sequence is
+// retired and retried once, preserving the previous OpenStream behavior.
+func (self *StreamBuffer) processOpenRequest(request *streamOpenRequest) error {
+	defer self.finishOpenRequest(request)
 
-	if streamSequence, ok := self.streamSequencesByStreamId[streamId]; ok {
+	var skipped *StreamSequence
+	for openAttempt := 0; openAttempt < 2; {
+		streamSequence, retired, current := self.prepareOpenRequest(request, skipped)
+		if !current {
+			return nil
+		}
+		if retired != nil {
+			if self.beforeRetiredStreamJoinForTest != nil {
+				self.beforeRetiredStreamJoinForTest(retired)
+			}
+			retired.CloseAndWait()
+			continue
+		}
+
+		if !streamSequence.activateWriterStreamAliasScope(request.generation) {
+			if !self.streamManager.Client().RouteManager().isWriterStreamAliasGenerationCurrent(
+				request.streamId,
+				request.generation,
+			) {
+				return nil
+			}
+			skipped = streamSequence
+			openAttempt += 1
+			continue
+		}
+		_, err := streamSequence.Open()
+		if err == nil {
+			return nil
+		}
+		skipped = streamSequence
+		openAttempt += 1
+	}
+	return errors.New("Stream sequence closed during open.")
+}
+
+// finishOpenRequest releases terminal pending/in-flight state without changing
+// a live alias scope. A newer request remains authoritative.
+func (self *StreamBuffer) finishOpenRequest(request *streamOpenRequest) {
+	self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(
+		request.streamId,
+		request.generation,
+	)
+
+	self.managementStateLock.Lock()
+	if self.managedOpenRequests[request.streamId] == request {
+		delete(self.managedOpenRequests, request.streamId)
+	}
+	self.managementStateLock.Unlock()
+	if self.afterStreamOpenProcessedForTest != nil {
+		self.afterStreamOpenProcessedForTest(request)
+	}
+}
+
+// prepareOpenRequest selects an existing sequence, retires a conflicting
+// generation, or publishes a fresh sequence. Construction happens outside
+// lifecycle locks because it opens a RouteManager alias scope.
+func (self *StreamBuffer) prepareOpenRequest(
+	request *streamOpenRequest,
+	skipped *StreamSequence,
+) (streamSequence *StreamSequence, retired *StreamSequence, current bool) {
+	streamSequenceId := newStreamSequenceId(
+		request.sourceId,
+		request.destinationId,
+		request.streamId,
+	)
+
+	if !self.streamManager.Client().RouteManager().isWriterStreamAliasGenerationCurrent(
+		request.streamId,
+		request.generation,
+	) {
+		return nil, nil, false
+	}
+	self.managementStateLock.Lock()
+	if self.managedOpenRequests[request.streamId] != request {
+		self.managementStateLock.Unlock()
+		return nil, nil, false
+	}
+	self.mutex.Lock()
+	streamSequence = self.streamSequences[streamSequenceId]
+	if streamSequence != nil && streamSequence != skipped {
+		self.mutex.Unlock()
+		self.managementStateLock.Unlock()
+		return streamSequence, nil, true
+	}
+	if streamSequence != nil {
+		retired = streamSequence
+		self.removeStreamSequenceWithLock(retired)
+	} else if streamSequence = self.streamSequencesByStreamId[request.streamId]; streamSequence != nil {
+		retired = streamSequence
+		self.removeStreamSequenceWithLock(retired)
+	}
+	self.mutex.Unlock()
+	self.managementStateLock.Unlock()
+	if retired != nil {
+		return nil, retired, true
+	}
+
+	if self.beforeStreamSequenceConstructForTest != nil {
+		self.beforeStreamSequenceConstructForTest(request)
+	}
+	streamSequence = NewStreamSequence(
+		self.ctx,
+		self.streamManager,
+		request.sourceId,
+		request.destinationId,
+		request.streamId,
+		self.streamBufferSettings,
+	)
+	if self.configureStreamSequenceForTest != nil {
+		self.configureStreamSequenceForTest(streamSequence)
+	}
+	if !streamSequence.reserveLifecycleGeneration(request.generation) {
 		streamSequence.Cancel()
+		return nil, nil, false
+	}
+
+	if !self.streamManager.Client().RouteManager().isWriterStreamAliasGenerationCurrent(
+		request.streamId,
+		request.generation,
+	) {
+		streamSequence.Cancel()
+		return nil, nil, false
+	}
+	self.managementStateLock.Lock()
+	if self.managedOpenRequests[request.streamId] != request {
+		self.managementStateLock.Unlock()
+		streamSequence.Cancel()
+		return nil, nil, false
+	}
+	self.mutex.Lock()
+	if existing := self.streamSequencesByStreamId[request.streamId]; existing != nil {
+		self.removeStreamSequenceWithLock(existing)
+		self.mutex.Unlock()
+		self.managementStateLock.Unlock()
+		streamSequence.Cancel()
+		return nil, existing, true
+	}
+	if maxLiveStreamSequences <= len(self.streamSequencesByStreamId) {
+		self.mutex.Unlock()
+		self.managementStateLock.Unlock()
+		streamSequence.Cancel()
+		return nil, nil, false
+	}
+	if !self.sequenceWorkerAdmission.start() {
+		self.mutex.Unlock()
+		self.managementStateLock.Unlock()
+		streamSequence.Cancel()
+		return nil, nil, false
+	}
+	self.streamSequences[streamSequenceId] = streamSequence
+	self.streamSequencesByStreamId[request.streamId] = streamSequence
+	self.mutex.Unlock()
+	self.managementStateLock.Unlock()
+	if self.afterStreamSequencePublishForTest != nil {
+		self.afterStreamSequencePublishForTest(streamSequence)
+	}
+
+	go HandleError(func() {
+		defer self.sequenceWorkerAdmission.finish()
+		defer func() {
+			self.mutex.Lock()
+			self.removeStreamSequenceWithLock(streamSequence)
+			self.mutex.Unlock()
+			if self.afterStreamSequenceRemoveForTest != nil {
+				self.afterStreamSequenceRemoveForTest(streamSequence)
+			}
+		}()
+		streamSequence.Run()
+	})
+	return streamSequence, nil, true
+}
+
+// Close prevents later stream publication, invalidates pending generations,
+// and requests teardown without joining callback-facing control handling.
+func (self *StreamBuffer) Close() {
+	var requests []*streamOpenRequest
+	self.managementStateLock.Lock()
+	if self.closed {
+		self.managementStateLock.Unlock()
+		return
+	}
+	self.closed = true
+	for _, request := range self.managedOpenRequests {
+		requests = append(requests, request)
+	}
+	clear(self.managedOpenRequests)
+	clear(self.pendingOpenRequests)
+	self.managementStateLock.Unlock()
+
+	self.openWorkerAdmission.close()
+	self.sequenceWorkerAdmission.close()
+	for _, request := range requests {
+		self.streamManager.Client().RouteManager().finishWriterStreamAliasGeneration(
+			request.streamId,
+			request.generation,
+		)
+	}
+
+	self.mutex.Lock()
+	sequences := make([]*StreamSequence, 0, len(self.streamSequences))
+	for _, sequence := range self.streamSequences {
+		sequences = append(sequences, sequence)
+	}
+	self.mutex.Unlock()
+	for _, sequence := range sequences {
+		sequence.Cancel()
+	}
+}
+
+// closeAndWait joins every open-request and live-sequence worker admitted
+// before Close won the publication boundary.
+func (self *StreamBuffer) closeAndWait(ctx context.Context) error {
+	self.Close()
+	if self.beforeCloseWaitForTest != nil {
+		self.beforeCloseWaitForTest()
+	}
+	var result error
+	if err := waitForLifecycleDone(
+		ctx,
+		self.openWorkerAdmission.Done(),
+		"stream open workers",
+	); err != nil {
+		result = errors.Join(result, err)
+	}
+	if err := waitForLifecycleDone(
+		ctx,
+		self.sequenceWorkerAdmission.Done(),
+		"stream sequence workers",
+	); err != nil {
+		result = errors.Join(result, err)
+	}
+	return result
+}
+
+// lifecycleSnapshot captures every pending/in-flight request and live
+// sequence without invoking sequence methods while StreamBuffer locks are held.
+func (self *StreamBuffer) lifecycleSnapshot() []streamLifecycleSnapshot {
+	self.managementStateLock.Lock()
+	self.mutex.Lock()
+
+	snapshots := make([]streamLifecycleSnapshot, 0, len(self.managedOpenRequests)+len(self.streamSequences))
+	for _, request := range self.managedOpenRequests {
+		snapshots = append(snapshots, streamLifecycleSnapshot{
+			id:         newStreamSequenceId(request.sourceId, request.destinationId, request.streamId),
+			request:    request,
+			generation: request.generation,
+		})
+	}
+	for id, sequence := range self.streamSequences {
+		snapshots = append(snapshots, streamLifecycleSnapshot{
+			id:       id,
+			sequence: sequence,
+		})
+	}
+
+	self.mutex.Unlock()
+	self.managementStateLock.Unlock()
+	for index := range snapshots {
+		if snapshots[index].sequence != nil {
+			snapshots[index].generation = snapshots[index].sequence.LifecycleGeneration()
+		}
+	}
+	return snapshots
+}
+
+// invalidateOpenRequestIfCurrent retires exactly one snapshotted lifecycle
+// request without disturbing a newer same-id open.
+func (self *StreamBuffer) invalidateOpenRequestIfCurrent(request *streamOpenRequest) bool {
+	self.managementStateLock.Lock()
+	defer self.managementStateLock.Unlock()
+	if self.managedOpenRequests[request.streamId] != request {
+		return false
+	}
+	delete(self.managedOpenRequests, request.streamId)
+	if self.pendingOpenRequests[request.streamId] == request {
+		delete(self.pendingOpenRequests, request.streamId)
+	}
+	return true
+}
+
+// streamAllowedByProviderPolicy evaluates one stream identity against the
+// current inbound provider policy without holding StreamBuffer state locks.
+func streamAllowedByProviderPolicy(
+	id streamSequenceId,
+	allowAny bool,
+	allowNetwork bool,
+	isNetworkPeer func(Id) bool,
+) bool {
+	if allowAny {
+		return true
+	}
+	if allowNetwork && id.HasSource != id.HasDestination {
+		peerId := id.DestinationId
+		if id.HasSource {
+			peerId = id.SourceId
+		}
+		return isNetworkPeer(peerId)
+	}
+	return false
+}
+
+// Removes one sequence from both indexes while mutex is held.
+func (self *StreamBuffer) removeStreamSequenceWithLock(streamSequence *StreamSequence) {
+	streamSequenceId := newStreamSequenceId(
+		streamSequence.sourceId,
+		streamSequence.destinationId,
+		streamSequence.streamId,
+	)
+	if self.streamSequences[streamSequenceId] == streamSequence {
+		delete(self.streamSequences, streamSequenceId)
+	}
+	if self.streamSequencesByStreamId[streamSequence.streamId] == streamSequence {
+		delete(self.streamSequencesByStreamId, streamSequence.streamId)
+	}
+}
+
+// CloseStream orders an authoritative epoch, clears aliases, and cancels old
+// generations without joining their Run workers.
+func (self *StreamBuffer) CloseStream(streamId Id) {
+	closeGeneration := self.streamManager.Client().
+		RouteManager().
+		writerStreamAliasGenerationCheckpoint()
+	snapshots := self.lifecycleSnapshot()
+	if self.beforeCloseAliasClearForTest != nil {
+		self.beforeCloseAliasClearForTest()
+	}
+	self.streamManager.Client().RouteManager().clearWriterStreamAliasScopeThroughGenerationAsync(
+		streamId,
+		closeGeneration,
+	)
+
+	for _, snapshot := range snapshots {
+		if snapshot.id.StreamId != streamId ||
+			closeGeneration < snapshot.generation {
+			continue
+		}
+		if snapshot.request != nil {
+			self.invalidateOpenRequestIfCurrent(snapshot.request)
+		}
+		if snapshot.sequence != nil {
+			snapshot.sequence.CancelThroughGeneration(closeGeneration)
+		}
 	}
 }
 
@@ -578,23 +1194,25 @@ func (self *StreamBuffer) CloseDisallowedInboundProviderStreams(
 		return
 	}
 
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-
-	for id, sequence := range self.streamSequences {
-		if allowAny {
+	for _, snapshot := range self.lifecycleSnapshot() {
+		if streamAllowedByProviderPolicy(snapshot.id, allowAny, allowNetwork, isNetworkPeer) {
 			continue
 		}
-		if allowNetwork && id.HasSource != id.HasDestination {
-			peerId := id.DestinationId
-			if id.HasSource {
-				peerId = id.SourceId
-			}
-			if isNetworkPeer(peerId) {
-				continue
-			}
+		if self.beforePolicyAliasClearForTest != nil {
+			self.beforePolicyAliasClearForTest(snapshot.id.StreamId, snapshot.generation)
 		}
-		sequence.Cancel()
+		if snapshot.generation != 0 {
+			self.streamManager.Client().RouteManager().clearWriterStreamAliasScopeThroughGenerationAsync(
+				snapshot.id.StreamId,
+				snapshot.generation,
+			)
+		}
+		if snapshot.request != nil {
+			self.invalidateOpenRequestIfCurrent(snapshot.request)
+		}
+		if snapshot.sequence != nil {
+			snapshot.sequence.CancelThroughGeneration(snapshot.generation)
+		}
 	}
 }
 
@@ -602,17 +1220,30 @@ func (self *StreamBuffer) CloseDisallowedInboundProviderStreams(
 // disconnected peer. The platform reconnect update clears the tombstone, and
 // a subsequent StreamOpen then constructs a fresh generation.
 func (self *StreamBuffer) CloseDisconnectedPeerStreams(peerIds map[Id]bool) {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-
-	for id, sequence := range self.streamSequences {
-		if (id.HasSource && peerIds[id.SourceId]) ||
-			(id.HasDestination && peerIds[id.DestinationId]) {
-			sequence.Cancel()
+	for _, snapshot := range self.lifecycleSnapshot() {
+		if (!snapshot.id.HasSource || !peerIds[snapshot.id.SourceId]) &&
+			(!snapshot.id.HasDestination || !peerIds[snapshot.id.DestinationId]) {
+			continue
+		}
+		if self.beforeDisconnectedAliasClearForTest != nil {
+			self.beforeDisconnectedAliasClearForTest(snapshot.id.StreamId, snapshot.generation)
+		}
+		if snapshot.generation != 0 {
+			self.streamManager.Client().RouteManager().clearWriterStreamAliasScopeThroughGenerationAsync(
+				snapshot.id.StreamId,
+				snapshot.generation,
+			)
+		}
+		if snapshot.request != nil {
+			self.invalidateOpenRequestIfCurrent(snapshot.request)
+		}
+		if snapshot.sequence != nil {
+			snapshot.sequence.CancelThroughGeneration(snapshot.generation)
 		}
 	}
 }
 
+// IsStreamOpen reports whether a sequence is currently indexed for streamId.
 func (self *StreamBuffer) IsStreamOpen(streamId Id) bool {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -621,9 +1252,11 @@ func (self *StreamBuffer) IsStreamOpen(streamId Id) bool {
 	return ok
 }
 
+// StreamSequence owns one directional P2P hop generation and its alias scope.
 type StreamSequence struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	done   chan struct{}
 
 	streamManager *StreamManager
 
@@ -632,10 +1265,33 @@ type StreamSequence struct {
 	sourceId      *Id
 	destinationId *Id
 	streamId      Id
+	// aliasStateLock protects replacement of the endpoint scope owner. Scope
+	// callbacks are invoked after releasing it. It also protects the latest
+	// lifecycle generation attached to this live sequence.
+	aliasStateLock              sync.Mutex
+	closeWriterStreamAliasScope func()
+	lifecycleGeneration         uint64
+	// Tests can pause after RouteManager opens a scope but before ownership is
+	// published under aliasStateLock.
+	afterAliasScopeOpenForTest func()
+	// Tests inspect the StreamBuffer lock hierarchy immediately after this
+	// sequence's lifecycle lock is acquired.
+	afterLifecycleStateLockForTest func()
+	// Tests can hold teardown before alias removal and done publication.
+	exitBarrierForTest func()
+	// Tests can inspect both private intermediary directions before either
+	// P2P association starts publishing routes.
+	intermediaryRouteManagersForTest func(*RouteManager, *RouteManager)
+	// Tests can hold a forwarding child after route cleanup but before the
+	// sequence's child-worker join completes.
+	beforeForwardWorkerDoneForTest func()
+	// Tests observe that every intermediary child has been launched.
+	afterChildrenStartedForTest func()
 
 	idleCondition *IdleCondition
 }
 
+// NewStreamSequence constructs an unpublished, inactive stream generation.
 func NewStreamSequence(
 	ctx context.Context,
 	streamManager *StreamManager,
@@ -645,9 +1301,10 @@ func NewStreamSequence(
 	streamBufferSettings *StreamBufferSettings) *StreamSequence {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
-	return &StreamSequence{
+	streamSequence := &StreamSequence{
 		ctx:                  cancelCtx,
 		cancel:               cancel,
+		done:                 make(chan struct{}),
 		streamManager:        streamManager,
 		streamBufferSettings: streamBufferSettings,
 		sourceId:             sourceId,
@@ -655,8 +1312,109 @@ func NewStreamSequence(
 		streamId:             streamId,
 		idleCondition:        NewIdleCondition(),
 	}
+	return streamSequence
 }
 
+// activateWriterStreamAliasScope installs generation-gated ownership for an
+// endpoint sequence. Intermediary sequences do not expose a final-peer alias.
+func (self *StreamSequence) activateWriterStreamAliasScope(generation uint64) bool {
+	if (self.sourceId == nil) == (self.destinationId == nil) {
+		self.aliasStateLock.Lock()
+		if generation < self.lifecycleGeneration {
+			self.aliasStateLock.Unlock()
+			return false
+		}
+		select {
+		case <-self.ctx.Done():
+			self.aliasStateLock.Unlock()
+			return false
+		default:
+		}
+		self.lifecycleGeneration = generation
+		self.aliasStateLock.Unlock()
+		return true
+	}
+
+	closeScope, ok := self.streamManager.Client().
+		RouteManager().
+		openWriterStreamAliasScopeForGeneration(self.streamId, generation)
+	if !ok {
+		return false
+	}
+	if self.afterAliasScopeOpenForTest != nil {
+		self.afterAliasScopeOpenForTest()
+	}
+
+	self.aliasStateLock.Lock()
+	if generation < self.lifecycleGeneration {
+		self.aliasStateLock.Unlock()
+		closeScope()
+		return false
+	}
+	select {
+	case <-self.ctx.Done():
+		self.aliasStateLock.Unlock()
+		closeScope()
+		return false
+	default:
+	}
+	previousCloseScope := self.closeWriterStreamAliasScope
+	self.closeWriterStreamAliasScope = closeScope
+	self.lifecycleGeneration = generation
+	self.aliasStateLock.Unlock()
+	if previousCloseScope != nil {
+		previousCloseScope()
+	}
+	return true
+}
+
+// reserveLifecycleGeneration records monotonic ownership before publication so
+// a stale worker or control snapshot cannot lower or cancel a newer refresh.
+func (self *StreamSequence) reserveLifecycleGeneration(generation uint64) bool {
+	self.aliasStateLock.Lock()
+	if self.afterLifecycleStateLockForTest != nil {
+		self.afterLifecycleStateLockForTest()
+	}
+	defer self.aliasStateLock.Unlock()
+	if generation < self.lifecycleGeneration {
+		return false
+	}
+	self.lifecycleGeneration = generation
+	return true
+}
+
+// LifecycleGeneration returns the latest authoritative generation attached to
+// this sequence for conditional policy/reset retirement.
+func (self *StreamSequence) LifecycleGeneration() uint64 {
+	self.aliasStateLock.Lock()
+	defer self.aliasStateLock.Unlock()
+	return self.lifecycleGeneration
+}
+
+// CancelThroughGeneration atomically cancels only when this sequence has not
+// been refreshed by a generation after the caller's control snapshot.
+func (self *StreamSequence) CancelThroughGeneration(generation uint64) bool {
+	self.aliasStateLock.Lock()
+	defer self.aliasStateLock.Unlock()
+	if generation < self.lifecycleGeneration {
+		return false
+	}
+	self.cancel()
+	return true
+}
+
+// closeWriterStreamAliases releases the most recent endpoint alias scope.
+func (self *StreamSequence) closeWriterStreamAliases() {
+	self.aliasStateLock.Lock()
+	closeScope := self.closeWriterStreamAliasScope
+	self.closeWriterStreamAliasScope = nil
+	self.aliasStateLock.Unlock()
+	if closeScope != nil {
+		closeScope()
+	}
+}
+
+// Open refreshes the sequence idle lease when its context remains live.
 func (self *StreamSequence) Open() (bool, error) {
 	select {
 	case <-self.ctx.Done():
@@ -672,14 +1430,33 @@ func (self *StreamSequence) Open() (bool, error) {
 	return true, nil
 }
 
+// Run owns adjacent transports, forwarding workers, alias teardown, and done.
 func (self *StreamSequence) Run() {
-	defer self.cancel()
+	defer close(self.done)
+	childWorkers := newLifecycleAdmission()
+	p2pTransports := []*P2pTransport{}
+	defer func() {
+		self.cancel()
+		for _, p2pTransport := range p2pTransports {
+			p2pTransport.cancel()
+		}
+		for _, p2pTransport := range p2pTransports {
+			<-p2pTransport.done
+		}
+		childWorkers.close()
+		<-childWorkers.Done()
+		self.closeWriterStreamAliases()
+	}()
+	if self.exitBarrierForTest != nil {
+		defer self.exitBarrierForTest()
+	}
 
 	if self.sourceId == nil || self.destinationId == nil {
 		clientRouteManager := self.streamManager.Client().RouteManager()
+		var endpointTransport *P2pTransport
 
 		if self.sourceId != nil {
-			NewP2pTransport(
+			endpointTransport = newP2pTransport(
 				self.ctx,
 				self.streamManager.Client(),
 				self.streamManager.WebRtcManager(),
@@ -689,9 +1466,10 @@ func (self *StreamSequence) Run() {
 				self.streamId,
 				PeerTypeSource,
 				self.streamBufferSettings.P2pTransportSettings,
+				true,
 			)
 		} else if self.destinationId != nil {
-			NewP2pTransport(
+			endpointTransport = newP2pTransport(
 				self.ctx,
 				self.streamManager.Client(),
 				self.streamManager.WebRtcManager(),
@@ -701,6 +1479,7 @@ func (self *StreamSequence) Run() {
 				self.streamId,
 				PeerTypeDestination,
 				self.streamBufferSettings.P2pTransportSettings,
+				true,
 			)
 		} else {
 			// the stream must have one of source or destination
@@ -709,12 +1488,19 @@ func (self *StreamSequence) Run() {
 			}
 			return
 		}
+		p2pTransports = append(p2pTransports, endpointTransport)
 	} else {
 		p2pToDestinationRouteManager := NewRouteManagerWithLogger(self.ctx, fmt.Sprintf("->s(%s)", self.streamId), self.streamManager.client.log)
 		p2pToSourceRouteManager := NewRouteManagerWithLogger(self.ctx, fmt.Sprintf("<-s(%s)", self.streamId), self.streamManager.client.log)
+		if self.intermediaryRouteManagersForTest != nil {
+			self.intermediaryRouteManagersForTest(
+				p2pToDestinationRouteManager,
+				p2pToSourceRouteManager,
+			)
+		}
 
 		// to destination
-		NewP2pTransport(
+		p2pTransports = append(p2pTransports, NewP2pTransport(
 			self.ctx,
 			self.streamManager.Client(),
 			self.streamManager.WebRtcManager(),
@@ -724,9 +1510,9 @@ func (self *StreamSequence) Run() {
 			self.streamId,
 			PeerTypeDestination,
 			self.streamBufferSettings.P2pTransportSettings,
-		)
+		))
 		// to source
-		NewP2pTransport(
+		p2pTransports = append(p2pTransports, NewP2pTransport(
 			self.ctx,
 			self.streamManager.Client(),
 			self.streamManager.WebRtcManager(),
@@ -736,7 +1522,7 @@ func (self *StreamSequence) Run() {
 			self.streamId,
 			PeerTypeSource,
 			self.streamBufferSettings.P2pTransportSettings,
-		)
+		))
 
 		forward := func(routeManager *RouteManager) {
 			defer self.cancel()
@@ -777,12 +1563,25 @@ func (self *StreamSequence) Run() {
 			}
 		}
 
-		go HandleError(func() {
-			forward(p2pToDestinationRouteManager)
-		}, self.cancel)
-		go HandleError(func() {
-			forward(p2pToSourceRouteManager)
-		}, self.cancel)
+		startForward := func(routeManager *RouteManager) {
+			if !childWorkers.start() {
+				return
+			}
+			go func() {
+				defer childWorkers.finish()
+				HandleError(func() {
+					forward(routeManager)
+				}, self.cancel)
+				if self.beforeForwardWorkerDoneForTest != nil {
+					self.beforeForwardWorkerDoneForTest()
+				}
+			}()
+		}
+		startForward(p2pToDestinationRouteManager)
+		startForward(p2pToSourceRouteManager)
+		if self.afterChildrenStartedForTest != nil {
+			self.afterChildrenStartedForTest()
+		}
 	}
 
 	select {
@@ -791,10 +1590,25 @@ func (self *StreamSequence) Run() {
 	}
 }
 
+// Cancel requests teardown without waiting for transport workers. Receive
+// control handling relies on this nonblocking boundary.
 func (self *StreamSequence) Cancel() {
 	self.cancel()
 }
 
+// Join waits until transport and alias teardown for this generation finishes.
+func (self *StreamSequence) Join() {
+	<-self.done
+}
+
+// CloseAndWait retires a generation before a same-stream replacement is
+// published, preventing its ready transport from matching the new alias.
+func (self *StreamSequence) CloseAndWait() {
+	self.Cancel()
+	self.Join()
+}
+
+// Close requests teardown without joining the generation.
 func (self *StreamSequence) Close() {
-	self.cancel()
+	self.Cancel()
 }

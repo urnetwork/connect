@@ -1,0 +1,41 @@
+--- a/transfer_window_receiver_ordering_test.go
++++ b/transfer_window_receiver_ordering_test.go
+@@ -10,6 +10,7 @@
+ // Each sibling supplies one confirmed physical head and its own ACK wait.
+ type windowReceiverOrderingPoint struct {
+ 	bytes     ByteCount
++	offered   time.Duration
+ 	delivered time.Duration
+ 	wait      time.Duration
+ }
+@@ -27,7 +28,7 @@
+ 	lastAt := start
+ 	for index, point := range points {
+ 		fixtures[index] = newWindowReceiverCreditFixture(t, service, start, compression)
+-		items[index] = fixtures[index].write(0, point.bytes, start)
++		items[index] = fixtures[index].write(0, point.bytes, start.Add(point.offered))
+ 		total += point.bytes
+ 		if at := start.Add(point.delivered + point.wait); at.After(lastAt) {
+ 			lastAt = at
+@@ -186,3 +187,21 @@
+ 		}
+ 	}
+ }
++
++// Invalid older history must not veto an independent later physical pair.
++// All five writes precede feedback, so neither an idle reset nor a new flight
++// boundary can remove the older aggregate before this controller read.
++func TestWindowPacingReceiverOrderingLaterPairSupersedesInvalidHistory(t *testing.T) {
++	points := []windowReceiverOrderingPoint{
++		{bytes: 1000, delivered: 100250 * time.Microsecond},
++		{bytes: 4000, delivered: 101250 * time.Microsecond, wait: 4 * time.Millisecond},
++		{bytes: 12000, delivered: 104250 * time.Microsecond},
++		{bytes: 1000, offered: 90 * time.Millisecond, delivered: 114 * time.Millisecond},
++		{bytes: 16000, offered: 90 * time.Millisecond, delivered: 118 * time.Millisecond},
++	}
++	service, at := windowReceiverOrderingService(t, 0, 10*time.Millisecond, points, []int{0, 2, 1, 3, 4}, 0)
++	rate, _, latest := service.measured(time.Second, at)
++	if measured := max(rate, latest); measured != 4000000 {
++		t.Fatalf("older invalid receiver history vetoed later physical4MB/s: %d", measured)
++	}
++}

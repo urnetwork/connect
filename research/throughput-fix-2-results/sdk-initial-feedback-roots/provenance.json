@@ -1,0 +1,5 @@
+{
+  "raw_logs": "Raw logs and binary remain outside the Git archive; this archive contains normalized outcomes, numeric readings, and source/binary pins only.",
+  "root_policy": "The 205 ms one-lane initial-feedback assertion remains an enforced failure condition; the 220 ms case is its same-fixture control.",
+  "scope": "Race-enabled promoted SDK root and existing eight-lane control from one frozen connect-plus-glog source copy."
+}

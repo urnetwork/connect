@@ -1,0 +1,184 @@
+{
+  "constructor_resolution": "all settings constructed before workers and globals restored: captured sdk-provider-h1 under32MiB process/24MiB owner;captured connect-process-default under384MiB with DeviceTarget absent;server carrier and gVisor use process384MiB defaults,not zero private owner;provider NAT and RemoteUserNatProvider target DeviceTarget/5",
+  "coverage": {
+    "all_readings_covered": true,
+    "reading_count": 6,
+    "settings_set_count": 1
+  },
+  "final_provider_wiring": "one LocalUserNat,one RemoteUserNatProvider ingress consumer and keyed return pair,one read-only provider lane observer,one server TUN receive consumer;no duplicated data delivery;fixed-port gonet.DialTCPWithBind uses same stack/endpoint implementation but bypasses literal Tun.DialContext race wrapper",
+  "redaction": "No commands, paths, raw logs, source contents, overlays, or binaries are copied.",
+  "schema": "throughput-fix-2/physical-h1-duplex-constructor-settings-v1",
+  "settings_sets": [
+    {
+      "observed_in": [
+        {
+          "arm": "ceiling-before",
+          "stage_id": "direct-callback-calibration-censored"
+        },
+        {
+          "arm": "delivery",
+          "stage_id": "direct-callback-calibration-censored"
+        },
+        {
+          "arm": "ceiling-after",
+          "stage_id": "direct-callback-calibration-censored"
+        },
+        {
+          "arm": "ceiling-before",
+          "stage_id": "actual-provider-dispatcher-censored"
+        },
+        {
+          "arm": "delivery",
+          "stage_id": "actual-provider-dispatcher-censored"
+        },
+        {
+          "arm": "ceiling-after",
+          "stage_id": "actual-provider-dispatcher-censored"
+        }
+      ],
+      "settings": {
+        "CarrierConstructor": [
+          "DefaultPlatformTransportSettingsWithMemoryTarget(DeviceTarget), private owner",
+          "DefaultPlatformTransportSettings under captured process budget"
+        ],
+        "CarrierH1Claim": [
+          262144,
+          524288
+        ],
+        "CarrierMessageLimit": [
+          8192,
+          8192
+        ],
+        "CarrierQueueCount": [
+          32,
+          32
+        ],
+        "Nat": {
+          "MaximumWindowBytes": 8388608,
+          "Mtu": 1100,
+          "ProviderTarget": 5033164,
+          "ReadBufferBytes": 32768,
+          "ReturnBudget": 4194304,
+          "SequenceBufferCount": 512,
+          "WriteBatchCount": 64
+        },
+        "ProfileSha256": "44e0bf1b907dace14b09405ca48246ddf0d890a77afcfd751025b7ef3f57564a",
+        "Profiles": [
+          {
+            "AckCompressionNs": 10000000,
+            "AckQueueCount": 64,
+            "AdvertiseReceiveWindow": true,
+            "ClientSendQueueCount": 16,
+            "DeviceTarget": 25165824,
+            "ExplicitH1": true,
+            "H1AckHandoffTimeoutNs": 1000000,
+            "H1PackHandoffTimeoutNs": -1,
+            "H1QueueAdaptiveBytes": 0,
+            "H1QueueAdaptiveCount": 0,
+            "H1QueueAdaptiveStepBytes": 0,
+            "H1QueueAdaptiveStepCount": 0,
+            "H1QueueAdaptiveThreshold": 0,
+            "H1QueueAdaptiveWindowNs": 0,
+            "H1QueueBytes": 131072,
+            "H1QueueCount": 64,
+            "LaneFloor": 0,
+            "LogicalDataLanes": 8,
+            "MinimumMessageLimit": 8192,
+            "MobilePolicy": true,
+            "Name": "sdk-provider-h1",
+            "PackPool": 1572864,
+            "ProcessBudget": 33554432,
+            "Providing": true,
+            "ReceiveMaximum": 2097152,
+            "ReceiveMinimum": 0,
+            "ReceivePool": 1438046,
+            "ReceiveQueueBytes": 131072,
+            "ReceiveQueueCount": 16,
+            "ReliablePackHandoffTimeoutNs": -1,
+            "RetainedPackAccounting": false,
+            "RetainedReceiveAccounting": true,
+            "SendInitial": 524288,
+            "SendMinimum": 65536,
+            "SendPool": 1078535,
+            "SendQueueCount": 16,
+            "TargetGoodputByteRate": 125000000,
+            "WindowCeiling": 0,
+            "WindowScale": 2,
+            "WindowSizing": 1
+          },
+          {
+            "AckCompressionNs": 10000000,
+            "AckQueueCount": 32,
+            "AdvertiseReceiveWindow": true,
+            "ClientSendQueueCount": 32,
+            "DeviceTarget": 0,
+            "ExplicitH1": false,
+            "H1AckHandoffTimeoutNs": 0,
+            "H1PackHandoffTimeoutNs": 0,
+            "H1QueueAdaptiveBytes": 0,
+            "H1QueueAdaptiveCount": 0,
+            "H1QueueAdaptiveStepBytes": 0,
+            "H1QueueAdaptiveStepCount": 0,
+            "H1QueueAdaptiveThreshold": 0,
+            "H1QueueAdaptiveWindowNs": 0,
+            "H1QueueBytes": 262144,
+            "H1QueueCount": 256,
+            "LaneFloor": 0,
+            "LogicalDataLanes": 0,
+            "MinimumMessageLimit": 8192,
+            "MobilePolicy": false,
+            "Name": "connect-process-default",
+            "PackPool": null,
+            "ProcessBudget": 402653184,
+            "Providing": false,
+            "ReceiveMaximum": 50331648,
+            "ReceiveMinimum": 327680,
+            "ReceivePool": 50331648,
+            "ReceiveQueueBytes": 262144,
+            "ReceiveQueueCount": 256,
+            "ReliablePackHandoffTimeoutNs": -1,
+            "RetainedPackAccounting": false,
+            "RetainedReceiveAccounting": false,
+            "SendInitial": 2097152,
+            "SendMinimum": 262144,
+            "SendPool": 50331648,
+            "SendQueueCount": 32,
+            "TargetGoodputByteRate": 125000000,
+            "WindowCeiling": 0,
+            "WindowScale": 2,
+            "WindowSizing": 1
+          }
+        ],
+        "TunSettings": {
+          "ChannelSize": 2048,
+          "Constructor": "DefaultTunSettingsWithBufferSize(2048) under server ProcessBudget",
+          "Gro": true,
+          "MaxRto": 8000000000,
+          "Mtu": 1280,
+          "OutboundWait": 250000000,
+          "ProcessBudget": 402653184,
+          "ReceiveBuffer": {
+            "Default": 1048576,
+            "Max": 50331648,
+            "Min": 4096
+          },
+          "SendBuffer": {
+            "Default": 1048576,
+            "Max": 50331648,
+            "Min": 4096
+          }
+        },
+        "WebSocketReadBuffer": [
+          2048,
+          0
+        ],
+        "WebSocketWriteBuffer": [
+          2048,
+          0
+        ]
+      },
+      "sha256": "d2e9e6d9e1784028ad54bf91d87e686e50880c424372811765dad3ca575d0295"
+    }
+  ],
+  "source": "deduplicated exact settings extracted from every archived reading"
+}

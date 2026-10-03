@@ -1,0 +1,8 @@
+{"arm": "unpaced", "flows": 1, "gap_repairs": 28422, "goodput_mbps": 642.4, "min_flow_mbps": 642.4, "relay_drops": 37205, "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "before"}
+{"arm": "delivery", "flows": 1, "gap_repairs": 0, "goodput_mbps": 958.1, "min_flow_mbps": 958.1, "relay_drops": 0, "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "before"}
+{"arm": "unpaced", "flows": 8, "gap_repairs": 28464, "goodput_mbps": 629.0, "min_flow_mbps": 76.9, "relay_drops": 38303, "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "before"}
+{"arm": "delivery", "flows": 8, "gap_repairs": 0, "goodput_mbps": 958.1, "min_flow_mbps": 116.4, "relay_drops": 0, "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "before"}
+{"arm": "unpaced", "flows": 1, "gap_repairs": 28571, "goodput_mbps": 588.8, "min_flow_mbps": 588.8, "relay_drops": 38235, "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "retained-growth-v2"}
+{"arm": "delivery", "flows": 1, "gap_repairs": 0, "goodput_mbps": 958.1, "min_flow_mbps": 958.1, "relay_drops": 0, "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "retained-growth-v2"}
+{"arm": "unpaced", "flows": 8, "gap_repairs": 28420, "goodput_mbps": 638.9, "min_flow_mbps": 78.6, "relay_drops": 37339, "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "retained-growth-v2"}
+{"arm": "delivery", "flows": 8, "gap_repairs": 0, "goodput_mbps": 958.1, "min_flow_mbps": 118.5, "relay_drops": 0, "test": "TestWindowPathBoundsBurstsAtFiniteRelay", "variant": "retained-growth-v2"}

@@ -1,0 +1,16 @@
+{
+  "original_test_sha256": "68c5d1ec7e24711c9ca25307b6aa6e6ef57b7a0633f5f7238aeb23d6ce58645a",
+  "accepted_test_sha256": "9527beee6b7abc68cb39870888ea448a7a5bcf6cf0795e514c73d668e8f216b4",
+  "file_sha256": {
+    "README.md": "f35c1636a44c66afaba22702da2164501570ba7c8e3dbd1c8b881aae27872abc",
+    "accepted-contracts/ledger.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "accepted-contracts/manifest.json": "e98746c573af994eb794b7088cce444471506f142b0399ae17a57f11f8875c3f",
+    "accepted-contracts/outcomes.txt": "2e2893c18463c24610f30234badae8937f0f241b70d6c9a2bb1191df35f6b5d3",
+    "accepted-contracts/provenance.json": "c6f71562f1e75a0b384e88b80519d20e508964541e1979dfd4dc66390b414fa0",
+    "accepted-contracts/status.json": "08d300a1437080324b4172fb093c5708ebc1281b3504f98f2de0b6104101f04f",
+    "accepted-test-source.go.txt": "9527beee6b7abc68cb39870888ea448a7a5bcf6cf0795e514c73d668e8f216b4",
+    "original-test-source.go.txt": "68c5d1ec7e24711c9ca25307b6aa6e6ef57b7a0633f5f7238aeb23d6ce58645a",
+    "summary.json": "35fd3a230a09dfe9e46de5a7540ad4758491f7da17953a230079f8cc99f2882f",
+    "test-contract.patch": "4fdc9e3dbbea2ffbca7abca1c5d23b85c0762c97e26d348afc202693ca86c38c"
+  }
+}

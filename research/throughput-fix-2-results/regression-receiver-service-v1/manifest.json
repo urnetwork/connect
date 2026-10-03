@@ -1,0 +1,11 @@
+{
+  "archive": "regression-receiver-service-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "f534200b28f3400c13eae12c4d1cc1828873b7a573d500d8a0e4b3eeed8e9bd4",
+    "outcomes.jsonl": "2777b5f537afd1fce03a0c3eb63fd36bf3eae1c99d6255cd3c3c3925cdb5a368",
+    "provenance.json": "2f5031af5111c3f6a8a769eb515ff98c2c2911b8d6e5eb36afa562f0d2f0e1ce",
+    "source-pins.json": "6101b09dd42925af6aec9895d307b493de7d722788d5fc69287b55af32c657cc",
+    "status.json": "b94d378b836ea52ff563de1da2d71c380805bf8a7bbd3cbf1650824e8112a86b",
+    "worker-readings.jsonl": "97d3ee51495927940986134437bb8d541c0ea5bdad5d8afb2cee2461640b8b0a"
+  }
+}

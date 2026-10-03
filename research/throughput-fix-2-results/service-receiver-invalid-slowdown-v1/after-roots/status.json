@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "74fad69af0c413d66681e0e498b15181530d57b142a0534dabc4c3deed3565d1",
+  "binary_sha256": "a056c029ad287745ca411d15c1909a6fb94ac3a5e5d017bacce86c1136fe4800",
+  "effective_inputs_sha256": "b487d4b6336141bedccb16350ae2e6dbda30aefab75cddb3c4cd9e0224135b04",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^(TestWindowPacingReceiverInterleavedSlowdown.*|TestWindowPacingReceiverInvalid.*)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as the effective build inputs; original absolute cwd retained by raw status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T19:29:32.153437+00:00",
+  "loadavg_start": [
+    48.892578125,
+    36.58642578125,
+    26.73583984375
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 4.308615041896701,
+  "loadavg_end": [
+    46.97900390625,
+    36.39404296875,
+    26.7255859375
+  ],
+  "ended_utc": "2026-09-16T19:29:36.462617+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "cedcac6cb775024e52340e01a8ffaed53993360637e6344d63b2efead30e954f",
+  "pass": 21,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "rows": 0,
+  "normalization_note": "Only sampler maximum exact receiver wait and qualified sustained downward allowance differ. Exact conservative span includes every interval byte; cold service, increases, short intervals and unbacklogged refills keep the old eligibility."
+}

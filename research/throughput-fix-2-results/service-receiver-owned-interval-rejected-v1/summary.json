@@ -1,0 +1,44 @@
+[
+  {
+    "selection": "before",
+    "pass": 12,
+    "fail": 3,
+    "skip": 0,
+    "race_warnings": 0,
+    "race_instrumented": true,
+    "effective_inputs_sha256": "e86c9c7bc1ea624fe21894acb0d4606037b028951f42644e94962fc4b5cef80a",
+    "binary_sha256": "3a1b96f41a4d79ea95a3cd5cb374e103af60de8afbf90c9f22e516c7fea8f466",
+    "original_manifest_sha256": "6ab221b700c38f8dd843ff482b7de4a6eb28a9a44a594f7a64bfedbfc248ccf4",
+    "original_status_sha256": "f2cad3d518113dd03ab4f0f1d402fb741a20d077ac5c6784f791298f3641e6ee",
+    "raw_log_sha256": "61fadf047b4c72dfc5369eb76b39b1fd6164dba083fae0944a1e960b92e2a985",
+    "note": "12P3F: lawful batched hold remains; rejected queued-start cap omitted as documented in frozen source audit, original failed proposal preserved elsewhere."
+  },
+  {
+    "selection": "after",
+    "pass": 12,
+    "fail": 3,
+    "skip": 0,
+    "race_warnings": 0,
+    "race_instrumented": true,
+    "effective_inputs_sha256": "3aa36b0a8dd5c3290a4e894f75d9eb5c63e4bfbd4b9fb5cc45446b26b8078483",
+    "binary_sha256": "a7d6122a467e02443cf01aee2e1a7a70dfd02ef9aca1665029804f20bdb99c7e",
+    "original_manifest_sha256": "76300c50015d0051aafa88f01cfe2d19526e54ca55e347bb32cefdbaefa3feef",
+    "original_status_sha256": "9e7f579b5c0fa70e8a0c7058af5bfe39a3de7bec921e57d586620f108311bdfe",
+    "raw_log_sha256": "5e77228249cdfefdc604115e27c455fc479a06c8257fe87bc209f69f6238ee48",
+    "note": "12P3F: proposed per-sequence corrected-prefix intervals do not fix the lawful root. Further review rejects destination-FIFO inference from sequence monotonicity or a local H1 route; no adoption."
+  },
+  {
+    "selection": "diagnostic",
+    "pass": 0,
+    "fail": 1,
+    "skip": 0,
+    "race_warnings": 0,
+    "race_instrumented": true,
+    "effective_inputs_sha256": "395c79c599fb592d3784bdd730ca85dc75737d9d0191b9e94b40d34b5905f936",
+    "binary_sha256": "8c2272786b0a1ec1f5a9d3432d691f1a0c1d777aaa01f20d88f147bc9ee0d70a",
+    "original_manifest_sha256": "7cf456fafdda65810bb0b04c8b99a23be9c77606b0e06729063287a3ae1f0b6c",
+    "original_status_sha256": "353c64060fdc1706dda329954064554ad00bc34a338a010a84195ecdf56b038f",
+    "raw_log_sha256": "c1eac36bb6eff0d9213939244ca2d318cb26250ff4970b28e729b4b8491d23ad",
+    "note": "0P1F: bounded copied-source diagnostics show owned summary exists but same-endpoint rejection still vetoes it. No bypass was implemented because interval ownership itself is not sound across relayed reorder."
+  }
+]

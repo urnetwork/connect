@@ -1,0 +1,181 @@
+[env]glog not configured from command line. Using default configuration.
+I0915 14:15:28.159201   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [settings.yml]
+I0915 14:15:28.160151   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [settings.yml]
+I0915 14:15:28.160323   91566 env.go:770] [env]try /Users/brien/urnetwork/site, [settings.yml]
+I0915 14:15:28.160397   91566 env.go:67] [env]settings = map[]
+=== RUN   TestExchangeRelayPoolBalance
+I0915 14:15:28.166408   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [pg.yml]
+I0915 14:15:28.166545   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [pg.yml]
+I0915 14:15:28.166638   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [redis.yml]
+I0915 14:15:28.166681   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [redis.yml]
+I0915 14:15:28.166735   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [db.yml]
+I0915 14:15:28.166783   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [db.yml]
+I0915 14:15:28.166855   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [redis.yml]
+I0915 14:15:28.166893   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [redis.yml]
+I0915 14:15:28.167245   91566 env.go:705] [env]lookup env var "BRINGYOUR_POSTGRES_HOSTNAME"
+I0915 14:15:28.167258   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[authority] = 10***32
+I0915 14:15:28.167273   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[user] = br***ur
+I0915 14:15:28.167291   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[password] = ur***st
+I0915 14:15:28.167344   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[db] = br***ur
+I0915 14:15:28.167678   91566 env.go:705] [env]lookup env var "BRINGYOUR_REDIS_HOSTNAME"
+I0915 14:15:28.167710   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[authority] = 10***79
+I0915 14:15:28.167757   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[password] = ***
+I0915 14:15:28.167771   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[db] = 0
+I0915 14:15:28.167782   91566 env.go:640] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[cluster] = false
+I0915 14:15:28.168011   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[min_connections] = 4
+I0915 14:15:28.168032   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[max_connections] = 16
+I0915 14:15:28.168525   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[min_connections] = 4
+I0915 14:15:28.168539   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[max_connections] = 16
+    test_util.go:781: local integration test preflight: postgres preflight failed at 10.213.0.1:5432: authenticate PostgreSQL test connection: failed to connect to `user=bringyour database=bringyour`: 10.213.0.1:5432 (10.213.0.1): failed SASL auth: FATAL: password authentication failed for user "bringyour" (SQLSTATE 28P01); start ./local/run-local.sh
+--- FAIL: TestExchangeRelayPoolBalance (0.01s)
+=== RUN   TestConnectH1
+I0915 14:15:28.173820   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [pg.yml]
+I0915 14:15:28.173889   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [pg.yml]
+I0915 14:15:28.173943   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [redis.yml]
+I0915 14:15:28.174062   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [redis.yml]
+I0915 14:15:28.174133   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [db.yml]
+I0915 14:15:28.176657   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [db.yml]
+I0915 14:15:28.176836   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [redis.yml]
+I0915 14:15:28.176880   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [redis.yml]
+I0915 14:15:28.177129   91566 env.go:705] [env]lookup env var "BRINGYOUR_POSTGRES_HOSTNAME"
+I0915 14:15:28.177142   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[authority] = 10***32
+I0915 14:15:28.177155   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[user] = br***ur
+I0915 14:15:28.177169   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[password] = ur***st
+I0915 14:15:28.177279   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[db] = br***ur
+I0915 14:15:28.177372   91566 env.go:705] [env]lookup env var "BRINGYOUR_REDIS_HOSTNAME"
+I0915 14:15:28.177381   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[authority] = 10***79
+I0915 14:15:28.177395   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[password] = ***
+I0915 14:15:28.177401   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[db] = 0
+I0915 14:15:28.177407   91566 env.go:640] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[cluster] = false
+I0915 14:15:28.177478   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[min_connections] = 4
+I0915 14:15:28.177485   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[max_connections] = 16
+I0915 14:15:28.177536   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[min_connections] = 4
+I0915 14:15:28.177543   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[max_connections] = 16
+    test_util.go:781: local integration test preflight: postgres preflight failed at 10.213.0.1:5432: authenticate PostgreSQL test connection: failed to connect to `user=bringyour database=bringyour`: 10.213.0.1:5432 (10.213.0.1): failed SASL auth: FATAL: password authentication failed for user "bringyour" (SQLSTATE 28P01); start ./local/run-local.sh
+--- FAIL: TestConnectH1 (0.01s)
+=== RUN   TestConnectH3
+I0915 14:15:28.183784   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [pg.yml]
+I0915 14:15:28.183848   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [pg.yml]
+I0915 14:15:28.183900   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [redis.yml]
+I0915 14:15:28.183930   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [redis.yml]
+I0915 14:15:28.183975   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [db.yml]
+I0915 14:15:28.184005   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [db.yml]
+I0915 14:15:28.184127   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [redis.yml]
+I0915 14:15:28.184207   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [redis.yml]
+I0915 14:15:28.184536   91566 env.go:705] [env]lookup env var "BRINGYOUR_POSTGRES_HOSTNAME"
+I0915 14:15:28.184577   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[authority] = 10***32
+I0915 14:15:28.184620   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[user] = br***ur
+I0915 14:15:28.184635   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[password] = ur***st
+I0915 14:15:28.184648   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[db] = br***ur
+I0915 14:15:28.184759   91566 env.go:705] [env]lookup env var "BRINGYOUR_REDIS_HOSTNAME"
+I0915 14:15:28.184768   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[authority] = 10***79
+I0915 14:15:28.184782   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[password] = ***
+I0915 14:15:28.184788   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[db] = 0
+I0915 14:15:28.184795   91566 env.go:640] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[cluster] = false
+I0915 14:15:28.184858   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[min_connections] = 4
+I0915 14:15:28.184866   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[max_connections] = 16
+I0915 14:15:28.184910   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[min_connections] = 4
+I0915 14:15:28.184920   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[max_connections] = 16
+    test_util.go:781: local integration test preflight: postgres preflight failed at 10.213.0.1:5432: authenticate PostgreSQL test connection: failed to connect to `user=bringyour database=bringyour`: 10.213.0.1:5432 (10.213.0.1): failed SASL auth: FATAL: password authentication failed for user "bringyour" (SQLSTATE 28P01); start ./local/run-local.sh
+--- FAIL: TestConnectH3 (0.01s)
+=== RUN   TestConnectH1Encrypted
+I0915 14:15:28.189098   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [pg.yml]
+I0915 14:15:28.189161   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [pg.yml]
+I0915 14:15:28.189212   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [redis.yml]
+I0915 14:15:28.189242   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [redis.yml]
+I0915 14:15:28.189284   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [db.yml]
+I0915 14:15:28.189363   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [db.yml]
+I0915 14:15:28.189452   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [redis.yml]
+I0915 14:15:28.189487   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [redis.yml]
+I0915 14:15:28.189593   91566 env.go:705] [env]lookup env var "BRINGYOUR_POSTGRES_HOSTNAME"
+I0915 14:15:28.189603   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[authority] = 10***32
+I0915 14:15:28.189618   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[user] = br***ur
+I0915 14:15:28.189635   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[password] = ur***st
+I0915 14:15:28.189648   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[db] = br***ur
+I0915 14:15:28.189774   91566 env.go:705] [env]lookup env var "BRINGYOUR_REDIS_HOSTNAME"
+I0915 14:15:28.189783   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[authority] = 10***79
+I0915 14:15:28.189800   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[password] = ***
+I0915 14:15:28.189805   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[db] = 0
+I0915 14:15:28.189810   91566 env.go:640] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[cluster] = false
+I0915 14:15:28.189861   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[min_connections] = 4
+I0915 14:15:28.189869   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[max_connections] = 16
+I0915 14:15:28.189916   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[min_connections] = 4
+I0915 14:15:28.189934   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[max_connections] = 16
+    test_util.go:781: local integration test preflight: postgres preflight failed at 10.213.0.1:5432: authenticate PostgreSQL test connection: failed to connect to `user=bringyour database=bringyour`: 10.213.0.1:5432 (10.213.0.1): failed SASL auth: FATAL: password authentication failed for user "bringyour" (SQLSTATE 28P01); start ./local/run-local.sh
+--- FAIL: TestConnectH1Encrypted (0.00s)
+=== RUN   TestConnectH3Encrypted
+I0915 14:15:28.193327   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [pg.yml]
+I0915 14:15:28.193379   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [pg.yml]
+I0915 14:15:28.193427   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [redis.yml]
+I0915 14:15:28.193460   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [redis.yml]
+I0915 14:15:28.193513   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [db.yml]
+I0915 14:15:28.193545   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [db.yml]
+I0915 14:15:28.193588   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [redis.yml]
+I0915 14:15:28.193619   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [redis.yml]
+I0915 14:15:28.193724   91566 env.go:705] [env]lookup env var "BRINGYOUR_POSTGRES_HOSTNAME"
+I0915 14:15:28.193782   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[authority] = 10***32
+I0915 14:15:28.193824   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[user] = br***ur
+I0915 14:15:28.193843   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[password] = ur***st
+I0915 14:15:28.193859   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[db] = br***ur
+I0915 14:15:28.193913   91566 env.go:705] [env]lookup env var "BRINGYOUR_REDIS_HOSTNAME"
+I0915 14:15:28.193922   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[authority] = 10***79
+I0915 14:15:28.193934   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[password] = ***
+I0915 14:15:28.193939   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[db] = 0
+I0915 14:15:28.193943   91566 env.go:640] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[cluster] = false
+I0915 14:15:28.193986   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[min_connections] = 4
+I0915 14:15:28.193992   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[max_connections] = 16
+I0915 14:15:28.194175   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[min_connections] = 4
+I0915 14:15:28.194194   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[max_connections] = 16
+    test_util.go:781: local integration test preflight: postgres preflight failed at 10.213.0.1:5432: authenticate PostgreSQL test connection: failed to connect to `user=bringyour database=bringyour`: 10.213.0.1:5432 (10.213.0.1): failed SASL auth: FATAL: password authentication failed for user "bringyour" (SQLSTATE 28P01); start ./local/run-local.sh
+--- FAIL: TestConnectH3Encrypted (0.01s)
+=== RUN   TestConnectH1EncryptedAllowFallback
+I0915 14:15:28.200866   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [pg.yml]
+I0915 14:15:28.200933   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [pg.yml]
+I0915 14:15:28.201060   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [redis.yml]
+I0915 14:15:28.201122   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [redis.yml]
+I0915 14:15:28.201186   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [db.yml]
+I0915 14:15:28.201226   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [db.yml]
+I0915 14:15:28.201276   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [redis.yml]
+I0915 14:15:28.201306   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [redis.yml]
+I0915 14:15:28.201419   91566 env.go:705] [env]lookup env var "BRINGYOUR_POSTGRES_HOSTNAME"
+I0915 14:15:28.201429   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[authority] = 10***32
+I0915 14:15:28.201450   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[user] = br***ur
+I0915 14:15:28.201510   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[password] = ur***st
+I0915 14:15:28.201526   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[db] = br***ur
+I0915 14:15:28.201580   91566 env.go:705] [env]lookup env var "BRINGYOUR_REDIS_HOSTNAME"
+I0915 14:15:28.201587   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[authority] = 10***79
+I0915 14:15:28.201600   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[password] = ***
+I0915 14:15:28.201606   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[db] = 0
+I0915 14:15:28.201612   91566 env.go:640] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[cluster] = false
+I0915 14:15:28.201668   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[min_connections] = 4
+I0915 14:15:28.201675   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[max_connections] = 16
+I0915 14:15:28.201726   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[min_connections] = 4
+I0915 14:15:28.201733   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[max_connections] = 16
+    test_util.go:781: local integration test preflight: postgres preflight failed at 10.213.0.1:5432: authenticate PostgreSQL test connection: failed to connect to `user=bringyour database=bringyour`: 10.213.0.1:5432 (10.213.0.1): failed SASL auth: FATAL: password authentication failed for user "bringyour" (SQLSTATE 28P01); start ./local/run-local.sh
+--- FAIL: TestConnectH1EncryptedAllowFallback (0.00s)
+=== RUN   TestConnectH3EncryptedAllowFallback
+I0915 14:15:28.205882   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [pg.yml]
+I0915 14:15:28.205949   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [pg.yml]
+I0915 14:15:28.206000   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault, [redis.yml]
+I0915 14:15:28.206044   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/vault/local, [redis.yml]
+I0915 14:15:28.206097   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [db.yml]
+I0915 14:15:28.206139   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [db.yml]
+I0915 14:15:28.206198   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config, [redis.yml]
+I0915 14:15:28.206232   91566 env.go:770] [env]try /Users/brien/urnetwork/server/local/testdata/config/local, [redis.yml]
+I0915 14:15:28.206403   91566 env.go:705] [env]lookup env var "BRINGYOUR_POSTGRES_HOSTNAME"
+I0915 14:15:28.206423   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[authority] = 10***32
+I0915 14:15:28.206440   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[user] = br***ur
+I0915 14:15:28.224067   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[password] = ur***st
+I0915 14:15:28.224109   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/pg.yml[db] = br***ur
+I0915 14:15:28.224238   91566 env.go:705] [env]lookup env var "BRINGYOUR_REDIS_HOSTNAME"
+I0915 14:15:28.224251   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[authority] = 10***79
+I0915 14:15:28.224264   91566 env.go:672] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[password] = ***
+I0915 14:15:28.224271   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[db] = 0
+I0915 14:15:28.224278   91566 env.go:640] [env]/Users/brien/urnetwork/server/local/testdata/vault/local/redis.yml[cluster] = false
+I0915 14:15:28.224329   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[min_connections] = 4
+I0915 14:15:28.224336   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/db.yml[max_connections] = 16
+I0915 14:15:28.224389   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[min_connections] = 4
+I0915 14:15:28.224397   91566 env.go:656] [env]/Users/brien/urnetwork/server/local/testdata/config/local/redis.yml[max_connections] = 16
+    test_util.go:781: local integration test preflight: postgres preflight failed at 10.213.0.1:5432: authenticate PostgreSQL test connection: failed to connect to `user=bringyour database=bringyour`: 10.213.0.1:5432 (10.213.0.1): failed SASL auth: FATAL: password authentication failed for user "bringyour" (SQLSTATE 28P01); start ./local/run-local.sh
+--- FAIL: TestConnectH3EncryptedAllowFallback (0.02s)
+FAIL

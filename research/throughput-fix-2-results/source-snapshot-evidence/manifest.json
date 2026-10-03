@@ -1,0 +1,57 @@
+{
+  "artifact": "sanitized snapshot-runner synthetic and review evidence",
+  "contents": [
+    {
+      "bytes": 680,
+      "name": "before-outcome.json",
+      "sha256": "73d9f411b352ff5040989e761b6b070ff753fb4d48574bb3021666a418f78c00"
+    },
+    {
+      "bytes": 514,
+      "name": "final-after-outcome.json",
+      "sha256": "c55d0dbbdd390f583e1f08ab5dec0e8c2a4223813794c94d5886b39814e0b3ec"
+    },
+    {
+      "bytes": 1159,
+      "name": "final-bounded-checkpoint.json",
+      "sha256": "4e5bc785b02ad3731b20dcfa29e6b96a6a260f8f2adf71c6db108d6f3eb22336"
+    },
+    {
+      "bytes": 352,
+      "name": "intermediate-portability.json",
+      "sha256": "5948eb5916d08333ff04aff9b6877d1a58c611ee698661275d6d3062ff52db3f"
+    },
+    {
+      "bytes": 382,
+      "name": "outcomes.txt",
+      "sha256": "ee4335b861fb5aaf4ed191163fb24fe614f97a5adb8303be8cc9652466dccdcc"
+    },
+    {
+      "bytes": 1543,
+      "name": "output-boundary.json",
+      "sha256": "2f9b01fdb36886665e2e9bfc873e08e9c2658d18292d365d2a27f5407f54f5ce"
+    },
+    {
+      "bytes": 1181,
+      "name": "provenance.json",
+      "sha256": "fb7bb6fe37e151102c5bba6e4b6346b73c70f137b641bc8dbf1b71aebe2554d2"
+    },
+    {
+      "bytes": 4096,
+      "name": "review.json",
+      "sha256": "3bbce69bd92ad847c7a811b8859b81f0d3b54cb6a32dc179cd90f6b75e674a14"
+    }
+  ],
+  "counts": {
+    "final_after_passes": 3,
+    "final_bounded_after_passes": 5,
+    "guarded_external_output_successes": 1,
+    "guarded_output_boundary_rejections": 4,
+    "intermediate_portability_expected_failures": 1,
+    "prior_output_boundary_new_go_inputs": 2,
+    "review_probes": 3,
+    "synthetic_before_expected_failures": 1
+  },
+  "redaction": "No raw logs, raw commands, local paths, source contents, overlays, or binaries are included.",
+  "schema": "throughput-fix-2/source-snapshot-evidence-manifest-v3"
+}

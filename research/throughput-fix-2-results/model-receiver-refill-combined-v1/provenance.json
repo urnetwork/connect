@@ -1,0 +1,10 @@
+{
+  "binary_sha256": "0b7d8ee0b6c3c19631b991e9010d1f3801f562ede9b6215e7c7815686e3662f6",
+  "interpretation": "Targeted virtual-time throughput evidence. This source is not yet adopted in the working implementation and does not establish full correctness, full model or host throughput acceptance.",
+  "no_quiescence_wait": true,
+  "outcome": "All six original targeted throughput gates pass on one binary. The same source is undergoing the full model; those results are separate.",
+  "race": false,
+  "role": "Actual-worker combined follow-through for exact receiver-delay intervals, cold short-pair qualification and receiver-aware cycle start.",
+  "source_inputs_sha256": "ddef3374b48fd37e29261dc52dcba08d4d8aef4688d520a19d0fff6548f7bd45",
+  "source_scope": "Includes the isolated warm receiver-interval correction, cold qualification candidate474b63 and exact timing-credit cycle-start change, with current retained sizing and earlier proven corrections. Excludes pending corrected-endpoint ordering and raw-summary/fallback follow-ups."
+}

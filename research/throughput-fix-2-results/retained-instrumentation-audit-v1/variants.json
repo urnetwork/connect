@@ -1,0 +1,536 @@
+[
+  {
+    "actual_race": false,
+    "archive": "window-retention-adjacent-policy-v2",
+    "binary_matches": true,
+    "claimed_race": false,
+    "compile_manifest_sha256": "6bea9c402eeeb8d6e445eff840397527f1e4b2dff58ba9a0346f60bd25fdb35f",
+    "manifest_found": true,
+    "variant": "policy-v2"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-binding-owner",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "e6e6efb12cab9bc6d62f4424b8ab20db713a3698248a70c1c9510bf1d0f92724",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-binding-owner",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "0b72383af618f02ad52214e1294069f82c684a3ad87516f5d36c7ffc64d3e717",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "after"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v1",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "2c09117048efc9f201d2e750999c0c0966ed6efbaf906f850076b4f84e8729e9",
+    "manifest_found": true,
+    "variant": "before-count3"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v1",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "2c09117048efc9f201d2e750999c0c0966ed6efbaf906f850076b4f84e8729e9",
+    "manifest_found": true,
+    "variant": "before-fresh1"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v1",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "2c09117048efc9f201d2e750999c0c0966ed6efbaf906f850076b4f84e8729e9",
+    "manifest_found": true,
+    "variant": "before-fresh2"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v1",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "2c09117048efc9f201d2e750999c0c0966ed6efbaf906f850076b4f84e8729e9",
+    "manifest_found": true,
+    "variant": "before-fresh3"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v1",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "6e15fe29b519f809247aabf8926384e0321ca79daf54991253d42aae13e16933",
+    "manifest_found": true,
+    "variant": "after-count3"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v1",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "6e15fe29b519f809247aabf8926384e0321ca79daf54991253d42aae13e16933",
+    "manifest_found": true,
+    "variant": "after-fresh1"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v1",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "6e15fe29b519f809247aabf8926384e0321ca79daf54991253d42aae13e16933",
+    "manifest_found": true,
+    "variant": "after-fresh2"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v1",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "6e15fe29b519f809247aabf8926384e0321ca79daf54991253d42aae13e16933",
+    "manifest_found": true,
+    "variant": "after-fresh3"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v1",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "6e15fe29b519f809247aabf8926384e0321ca79daf54991253d42aae13e16933",
+    "manifest_found": true,
+    "variant": "after-adjacent"
+  },
+  {
+    "actual_race": false,
+    "archive": "service-receiver-credit-cpu-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "c48dfb00bea730d564b2939a1009bfb6bcf08ce6c856ede69de64ea1e42aca06",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": null
+  },
+  {
+    "actual_race": false,
+    "archive": "service-receiver-credit-cpu-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "a3f5a42cf39fe46327a5ff436ad055b3b26d72b1a58decb9c5598b9e0ea0ad8f",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": null
+  },
+  {
+    "actual_race": false,
+    "archive": "window-cumulative-pacing-sdk-v1",
+    "binary_matches": true,
+    "claimed_race": false,
+    "compile_manifest_sha256": "740f512662257a598283bd9f5bdedf4fe9ff2fef5a025dd435454ce4ad4d4a53",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": false,
+    "archive": "window-cumulative-pacing-sdk-v1",
+    "binary_matches": true,
+    "claimed_race": false,
+    "compile_manifest_sha256": "73b8e8efd39cfb49f119aea881b859adcf0ab2fc4e64720368e2830fd1155f6a",
+    "manifest_found": true,
+    "variant": "after"
+  },
+  {
+    "actual_race": false,
+    "archive": "window-retention-bootstrap-controls-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "d9c241119dc1dc754ce276af75eddd12c9875b0978ba2392216a1236cfe77e72",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": false,
+    "archive": "window-retention-bootstrap-controls-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "e17fe88883784435b4eb1fe391b03deee8c451cb31ececadf60582f9fe084407",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "retained-growth-v2"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-cumulative-pacing-roots-v1",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "7d74c1d3028a743e7235a841f25b24f97be9b42bb9c58e318500eea0f83e6237",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-cumulative-pacing-roots-v1",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "c5c6e82da3b4479b60b82bda017f718368d0e1be9d7dcf6d69e2989330e9de1b",
+    "manifest_found": true,
+    "variant": "after"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-policy-assertions-v2",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "903fa8dfebdd536e5ff6a85a223157c784dd9584b46b243ed32ca54d0fd2f0fc",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "run"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-policy-assertions-v2",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "903fa8dfebdd536e5ff6a85a223157c784dd9584b46b243ed32ca54d0fd2f0fc",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "fixture-controls"
+  },
+  {
+    "actual_race": false,
+    "archive": "window-retention-adjacent-original-regression",
+    "binary_matches": true,
+    "claimed_race": false,
+    "compile_manifest_sha256": "24eb9deb11c885e6e2b55bdd9eeeb9f75b99609dca8cf672989d1314c59a0d45",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "original"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-policy-service-v3",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "55e6a759ad8e7e58bad2f5756caa1063eb808041cfbbfcefe61524177730ad40",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "after"
+  },
+  {
+    "actual_race": false,
+    "archive": "window-retention-adjacent-policy-v1",
+    "binary_matches": true,
+    "claimed_race": false,
+    "compile_manifest_sha256": "233ec1f1254e300e4082f26059288199076f2c7f8821d3278eee84c614744d56",
+    "manifest_found": true,
+    "variant": "policy-v1"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v2",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "d5865e251632352486011491866fb994464c8a43c81b5a480f186d313a1a8d1e",
+    "manifest_found": true,
+    "variant": "before-fresh1"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v2",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "d5865e251632352486011491866fb994464c8a43c81b5a480f186d313a1a8d1e",
+    "manifest_found": true,
+    "variant": "before-fresh2"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v2",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "d5865e251632352486011491866fb994464c8a43c81b5a480f186d313a1a8d1e",
+    "manifest_found": true,
+    "variant": "before-fresh3"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v2",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "75dde2fa4f60c3b2ae9982cf19e1f6267524410cec3a1d492c7c053e1778ecdd",
+    "manifest_found": true,
+    "variant": "after-fresh1"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v2",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "75dde2fa4f60c3b2ae9982cf19e1f6267524410cec3a1d492c7c053e1778ecdd",
+    "manifest_found": true,
+    "variant": "after-fresh2"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v2",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "75dde2fa4f60c3b2ae9982cf19e1f6267524410cec3a1d492c7c053e1778ecdd",
+    "manifest_found": true,
+    "variant": "after-fresh3"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-writer-statistics-owner-v2",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "75dde2fa4f60c3b2ae9982cf19e1f6267524410cec3a1d492c7c053e1778ecdd",
+    "manifest_found": true,
+    "variant": "after-adjacent"
+  },
+  {
+    "actual_race": false,
+    "archive": "window-retention-model-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "0b500ddc97c98251fcdfd53d8cf9a16a5aaef36c76844e774b4486eb900726a8",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": false,
+    "archive": "window-retention-model-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "d069ee91205cab75284bdd807f675b912d61f4bd0730c1389b6011fc361d2bfd",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "retained-window-v1"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-policy-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "91c1cc40f2ec4b1f5cfe30b5b70495a0a66d61dde557ac327af2b8452dce3aa5",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "before-run"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-policy-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "91c1cc40f2ec4b1f5cfe30b5b70495a0a66d61dde557ac327af2b8452dce3aa5",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "before-existing-roots"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-policy-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "fcb4c0a0c9379f0b430950bf792452453c24ceaa9a3bf6bc6ac33329057b0a56",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "after-run"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-policy-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "fcb4c0a0c9379f0b430950bf792452453c24ceaa9a3bf6bc6ac33329057b0a56",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "after-existing-roots"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-carrier-scope",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "7ae9fc008b0c6d98fd3d67cb6e594d019be18d58fb9011f1b20d628a8ff2d5eb",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-carrier-scope",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "8aea93850524c1803672136c7d9ee79c151ed119b0f3b5150e2c41c1dc5751cf",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "after"
+  },
+  {
+    "actual_race": false,
+    "archive": "service-qualification-cpu-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "eae866300eed9c1b60088e6b10756b294288e1e26ccb51cf4557f5d3d3bf3031",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": null
+  },
+  {
+    "actual_race": false,
+    "archive": "service-qualification-cpu-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "491276bf0d1c95203832d937c661daca4eb099ca89bd6a8adc13ddd3ca020272",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": null
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-target-diagnostic",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "6a7a885e2bf216fedf042dee736d73f7a5157c2958b4b506c60428f7130c98d1",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-target-diagnostic",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "f03730626ce38adfe01211f922d98e50be816fc745306279e74ef9923b7804e1",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "after"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-service-binding",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "22d1d09ace3f02b715982d9fdc3c77f07f91923677484fa07217959c16035a12",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-service-binding",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "55e6a759ad8e7e58bad2f5756caa1063eb808041cfbbfcefe61524177730ad40",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "after"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-reporting",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "6133242f5e7d32b143288ca4e48b7251ebbefd4c3e556c3232f32c4c24c3645f",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-reporting",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "6e0082bf6ee9a97cc7eaeddd54f5adf3c8aa13c5e17b3c75b4513d832bb37243",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "after"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-statistics-selection",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "8aea93850524c1803672136c7d9ee79c151ed119b0f3b5150e2c41c1dc5751cf",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-statistics-selection",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "55e6a759ad8e7e58bad2f5756caa1063eb808041cfbbfcefe61524177730ad40",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "after"
+  },
+  {
+    "actual_race": true,
+    "archive": "model-service-gap-combined-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "0275b39c2b5db2025aa9bbaa3e840e13de56b1e3d1e46b43a876bc58bb76b326",
+    "manifest_found": true,
+    "variant": "race"
+  },
+  {
+    "actual_race": false,
+    "archive": "model-service-gap-combined-v1",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "30a0ce4ad8254e6cd6454415e797bd2432761da551178664d2736c776b3a2c40",
+    "manifest_found": true,
+    "variant": "nonrace"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-service-growth",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "86278a3a652dddca84db14f64f683984a71eebc83ba14d7aab731a4882ffa1b6",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-retention-service-growth",
+    "binary_matches": true,
+    "claimed_race": null,
+    "compile_manifest_sha256": "6931b71c3f5d5324bb765a842d268a739507a4da8bc7729d565a3d7a9a13a573",
+    "evidence": "Verified pinned binary SHA and go version -m build setting.",
+    "manifest_found": true,
+    "variant": "after"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-cumulative-pacing-carrier-scope-v2",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "0b827e02474b32074b5d88864cabb41799db7888294a9f758112b5323c760edc",
+    "manifest_found": true,
+    "variant": "before"
+  },
+  {
+    "actual_race": true,
+    "archive": "window-cumulative-pacing-carrier-scope-v2",
+    "binary_matches": true,
+    "claimed_race": true,
+    "compile_manifest_sha256": "17cef2faf2feb1bf06fc696946ab52963e5e75799d79799ebd5c5a6bbbcd5b4d",
+    "manifest_found": true,
+    "variant": "after"
+  }
+]

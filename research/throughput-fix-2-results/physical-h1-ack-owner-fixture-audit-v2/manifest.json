@@ -1,0 +1,13 @@
+{
+  "archive": "physical-h1-ack-owner-fixture-audit-v2",
+  "payload_sha256": {
+    "failure-witnesses.json": "3e1736251a37dd6611ee31ff9991a33babfe9dd137f7e9c13d699ddaee0888ce",
+    "fixture-correction.patch": "fa5e56726955e01f5549c5a5bb043daa15e645f46baef8aaba5c39cd8d4bee53",
+    "outcomes.jsonl": "aa0bff0793a298407ac748322a5d5032cae106058d16e5f62ca07166f7a6e4f1",
+    "provenance.json": "3d3c520284744b4229832c48adc3cf9512707072a472c10ae37ff77efa15ec17",
+    "source-manifest-after.json": "cdca232d1572f07662aeb49f136a01b2231daf694c430f9ee228337262af5553",
+    "source-manifest-before.json": "06076c85ec9fceb1fa23f93a4cfaf80be643ccacb0088653f42247958d1d1c5d",
+    "source-pins.json": "3bc8840c734a97f7762812a79864b6aa9adccfc208059383cce441f2ebc87ffc",
+    "status.json": "58bf117eea9d7c825168b0cf67d1b791b5fac8f36fa2bc07fb8489b6223440c7"
+  }
+}

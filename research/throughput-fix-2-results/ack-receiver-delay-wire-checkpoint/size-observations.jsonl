@@ -1,0 +1,5 @@
+{"bytes":96,"check":"TestLandingStructsMatchMergedLessTheDeferState","delta_bytes":0,"expected_bytes":96,"kind":"exact-size","struct":"sequenceAck"}
+{"bytes":104,"check":"TestLandingStructsMatchMergedLessTheDeferState","delta_bytes":0,"expected_bytes":104,"kind":"exact-size","struct":"receiveAckMessage"}
+{"bytes":584,"check":"TestLandingStructsMatchMergedLessTheDeferState","delta_bytes":0,"expected_bytes":584,"kind":"exact-size","struct":"sendItem"}
+{"bytes":680,"check":"TestDecodedTransferFramePoolRetainedSizeStaysSmall","headroom_bytes":0,"kind":"maximum-size","maximum_bytes":680,"struct":"decodedTransferFrame"}
+{"bytes":104,"check":"TestDecodedTransferFramePoolRetainedSizeStaysSmall","headroom_bytes":0,"kind":"maximum-size","maximum_bytes":104,"struct":"receiveAckMessage"}

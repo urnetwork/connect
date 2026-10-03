@@ -1,0 +1,51 @@
+{
+  "input_handoff_sha256": "91f5ecf8ac6af93088eaee7d3b6c67486ff19b835d09ae08663dca23e5f8c65d",
+  "numeric_summary_sha256": "59f47fbe3a0ff7cb2e9fb68aa1282502548d9bab1ccf75c0f11bb6ca5895ef3f",
+  "prior_handoff_sha256s": [
+    "9a648856c7339f5c84de360faa922a922359a461e89e2b8ac1b6081a16dda848",
+    "e79fad510bab30e22ff340cb9e6547f32e752dd71de310412007d6d4a42b98ab"
+  ],
+  "raw_log_and_manifest_pins": [
+    {
+      "raw_log_sha256": "5def1f82853a32ead38ef71aff21e2567fe974d35eb83c463bdf67eda6c3c908",
+      "run_manifest_sha256": "5f312fc182f0bcbf63e54f9eac84784a20d3e9ad84d7a954c933dfc5eeec2e7c"
+    },
+    {
+      "raw_log_sha256": "7f3fa83056f63e6782220915a683f1712c43b5b335a2802b16bdd08079ed5ab0",
+      "run_manifest_sha256": "54e62ccd8b93828b21ec3578582fc01245d40f613c2d0e19d405c63423d93ffb"
+    }
+  ],
+  "root_fixture_landing_status": "isolated failure-before fixture only",
+  "root_fixture_source_sha256": "d686c88d224871c3be30aa8aadb584180e6001e87d441a01e2b889c43b82a7d4",
+  "supplied_file_sha256s": [
+    "59f47fbe3a0ff7cb2e9fb68aa1282502548d9bab1ccf75c0f11bb6ca5895ef3f",
+    "8eaf1f73518a2af230d5976adf46e3d5e106ade76510761dd8e6afed43f1da7d",
+    "d686c88d224871c3be30aa8aadb584180e6001e87d441a01e2b889c43b82a7d4",
+    "9c805ba2b0b01ffc9c382f21327fcacb16f60edde5ca27fe6d0590e5f4b38a9a",
+    "5f312fc182f0bcbf63e54f9eac84784a20d3e9ad84d7a954c933dfc5eeec2e7c",
+    "95668b8c69205c365d84c6721588d8ea4efdd896af88a8c604e23f4dd6bdb8fd",
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "5def1f82853a32ead38ef71aff21e2567fe974d35eb83c463bdf67eda6c3c908",
+    "3fe4e1c1a9224efe5c589e43f339007afb6dbc8afecf40d4dd24c496f43884b2",
+    "54e62ccd8b93828b21ec3578582fc01245d40f613c2d0e19d405c63423d93ffb",
+    "ec1a3e6f0e347751e52d3161dbac3b291fbd5d2d8c8f9a5d66dfaf6e860b6bd4",
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "7f3fa83056f63e6782220915a683f1712c43b5b335a2802b16bdd08079ed5ab0",
+    "7fac1d75e0b47f40cb0cd9f7696193217c19eda705787afa69b2cc85cfd9db36"
+  ],
+  "validated_pin_count": 22,
+  "variants": [
+    {
+      "binary_sha256": "3fe4e1c1a9224efe5c589e43f339007afb6dbc8afecf40d4dd24c496f43884b2",
+      "race_blocks": 0,
+      "source_sha256": "971a56e6f39082f89864be7f914a1c3c914958eeae2356c165246c36dfbd4af4",
+      "variant": "f9-credit"
+    },
+    {
+      "binary_sha256": "7fac1d75e0b47f40cb0cd9f7696193217c19eda705787afa69b2cc85cfd9db36",
+      "race_blocks": 0,
+      "source_sha256": "341a5160fe1bb392c5bdece5ce4c54d560896d9fc2400f4908e9b2fa758e8002",
+      "variant": "matched-offer-root"
+    }
+  ]
+}

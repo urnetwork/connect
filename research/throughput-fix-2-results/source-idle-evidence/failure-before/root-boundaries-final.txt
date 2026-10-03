@@ -1,0 +1,60 @@
+=== RUN   TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle
+--- FAIL: TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle (0.00s)
+=== RUN   TestWindowPacingSourceIdleRequiresConfirmationAndFreshEvidence
+--- FAIL: TestWindowPacingSourceIdleRequiresConfirmationAndFreshEvidence (0.00s)
+=== RUN   TestWindowPacingSourceIdleCancellationPreservesSuccessor
+--- FAIL: TestWindowPacingSourceIdleCancellationPreservesSuccessor (0.00s)
+=== RUN   TestWindowPacingLastCanceledDemandStartsSourceIdle
+--- FAIL: TestWindowPacingLastCanceledDemandStartsSourceIdle (0.00s)
+=== RUN   TestWindowPacingPackWaitingBeforeReservationAcceptsFreshService
+--- FAIL: TestWindowPacingPackWaitingBeforeReservationAcceptsFreshService (0.00s)
+=== RUN   TestWindowPacingSharedSourceIdleRequiresEveryTail
+--- FAIL: TestWindowPacingSharedSourceIdleRequiresEveryTail (0.00s)
+=== RUN   TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle
+--- FAIL: TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle (0.00s)
+=== RUN   TestWindowPacingSourceIdleRequiresConfirmationAndFreshEvidence
+--- FAIL: TestWindowPacingSourceIdleRequiresConfirmationAndFreshEvidence (0.00s)
+=== RUN   TestWindowPacingSourceIdleCancellationPreservesSuccessor
+--- FAIL: TestWindowPacingSourceIdleCancellationPreservesSuccessor (0.00s)
+=== RUN   TestWindowPacingLastCanceledDemandStartsSourceIdle
+--- FAIL: TestWindowPacingLastCanceledDemandStartsSourceIdle (0.00s)
+=== RUN   TestWindowPacingPackWaitingBeforeReservationAcceptsFreshService
+--- FAIL: TestWindowPacingPackWaitingBeforeReservationAcceptsFreshService (0.00s)
+=== RUN   TestWindowPacingSharedSourceIdleRequiresEveryTail
+--- FAIL: TestWindowPacingSharedSourceIdleRequiresEveryTail (0.00s)
+=== RUN   TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle
+--- FAIL: TestTcpReturnReplayPreservesPacingServiceAcrossFeedbackIdle (0.00s)
+=== RUN   TestWindowPacingSourceIdleRequiresConfirmationAndFreshEvidence
+--- FAIL: TestWindowPacingSourceIdleRequiresConfirmationAndFreshEvidence (0.00s)
+=== RUN   TestWindowPacingSourceIdleCancellationPreservesSuccessor
+--- FAIL: TestWindowPacingSourceIdleCancellationPreservesSuccessor (0.00s)
+=== RUN   TestWindowPacingLastCanceledDemandStartsSourceIdle
+--- FAIL: TestWindowPacingLastCanceledDemandStartsSourceIdle (0.00s)
+=== RUN   TestWindowPacingPackWaitingBeforeReservationAcceptsFreshService
+--- FAIL: TestWindowPacingPackWaitingBeforeReservationAcceptsFreshService (0.00s)
+=== RUN   TestWindowPacingSharedSourceIdleRequiresEveryTail
+--- FAIL: TestWindowPacingSharedSourceIdleRequiresEveryTail (0.00s)
+FAIL
+FAIL	github.com/urnetwork/connect	0.612s
+FAIL
+    transfer_window_host_feedback_test.go:91: isolated inner replay replaced established service: 3536
+    transfer_window_host_feedback_test.go:100: a healthy inner replay priced feedback idle as service: service=3536 replay=1100 bulk-wait=18.430482186s
+    transfer_window_host_feedback_test.go:162: ack-first=false h1=true: confirmation left service=12345/12345 total=201000 want=10000000/201000
+    transfer_window_host_feedback_test.go:296: canceled=0: successor lost source-idle evidence: 3558/3558 epoch=0001-01-01 00:00:00 +0000 UTC
+    transfer_window_host_feedback_test.go:343: last canceled demand lost the idle boundary: 9900/9900 epoch=0001-01-01 00:00:00 +0000 UTC
+    transfer_window_host_feedback_test.go:501: local ACK application wait replaced the physical rate: 12345/12345
+    transfer_window_host_feedback_test.go:568: delivered sibling cleanup lost shared idle: rate=1234/1234 want=12345 epoch=0001-01-01 00:00:00 +0000 UTC
+    transfer_window_host_feedback_test.go:91: isolated inner replay replaced established service: 3536
+    transfer_window_host_feedback_test.go:100: a healthy inner replay priced feedback idle as service: service=3536 replay=1100 bulk-wait=18.430482186s
+    transfer_window_host_feedback_test.go:162: ack-first=false h1=true: confirmation left service=12345/12345 total=201000 want=10000000/201000
+    transfer_window_host_feedback_test.go:296: canceled=0: successor lost source-idle evidence: 3558/3558 epoch=0001-01-01 00:00:00 +0000 UTC
+    transfer_window_host_feedback_test.go:343: last canceled demand lost the idle boundary: 9900/9900 epoch=0001-01-01 00:00:00 +0000 UTC
+    transfer_window_host_feedback_test.go:501: local ACK application wait replaced the physical rate: 12345/12345
+    transfer_window_host_feedback_test.go:568: delivered sibling cleanup lost shared idle: rate=1234/1234 want=12345 epoch=0001-01-01 00:00:00 +0000 UTC
+    transfer_window_host_feedback_test.go:91: isolated inner replay replaced established service: 3536
+    transfer_window_host_feedback_test.go:100: a healthy inner replay priced feedback idle as service: service=3536 replay=1100 bulk-wait=18.430482186s
+    transfer_window_host_feedback_test.go:162: ack-first=false h1=true: confirmation left service=12345/12345 total=201000 want=10000000/201000
+    transfer_window_host_feedback_test.go:296: canceled=0: successor lost source-idle evidence: 3558/3558 epoch=0001-01-01 00:00:00 +0000 UTC
+    transfer_window_host_feedback_test.go:343: last canceled demand lost the idle boundary: 9900/9900 epoch=0001-01-01 00:00:00 +0000 UTC
+    transfer_window_host_feedback_test.go:501: local ACK application wait replaced the physical rate: 12345/12345
+    transfer_window_host_feedback_test.go:568: delivered sibling cleanup lost shared idle: rate=1234/1234 want=12345 epoch=0001-01-01 00:00:00 +0000 UTC

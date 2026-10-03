@@ -3,7 +3,6 @@ package connect
 import (
 	"context"
 	"testing"
-	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -123,6 +122,7 @@ func TestStreamManagerVerifiedNetworkContractAdmitsWindowClientStream(t *testing
 
 	client := streamManagerNetworkOnlyProviderClient(ctx)
 	defer client.Close()
+	openTracker := newStreamOpenTestTracker(client.streamManager.streamBuffer)
 
 	peerDeviceId := NewId()
 	streamManagerAnnouncePeer(t, client, peerDeviceId)
@@ -137,11 +137,13 @@ func TestStreamManagerVerifiedNetworkContractAdmitsWindowClientStream(t *testing
 	}
 
 	// The proof arrives, as it physically does, after the StreamOpen.
+	publication := openTracker.expectPublication(streamId)
 	client.streamManager.NetworkPeerWindowClientAuthenticated(windowClientId)
-
+	publication.wait(t)
 	if !client.streamManager.IsStreamOpen(streamId) {
 		t.Fatal("window client stream was not admitted after its Network contract verified")
 	}
+	publication.resume()
 }
 
 // TestStreamManagerUnprovenWindowClientStreamIsRefused pins that the fix did
@@ -232,6 +234,7 @@ func TestStreamManagerRejectedStreamOpensAreBounded(t *testing.T) {
 
 	client := streamManagerNetworkOnlyProviderClient(ctx)
 	defer client.Close()
+	openTracker := newStreamOpenTestTracker(client.streamManager.streamBuffer)
 
 	var lastWindowClientId Id
 	var lastStreamId Id
@@ -252,10 +255,13 @@ func TestStreamManagerRejectedStreamOpensAreBounded(t *testing.T) {
 		t.Fatalf("retained %d refused stream opens, want at most %d", retained, maxRejectedStreamOpens)
 	}
 
+	publication := openTracker.expectPublication(lastStreamId)
 	client.streamManager.NetworkPeerWindowClientAuthenticated(lastWindowClientId)
+	publication.wait(t)
 	if !client.streamManager.IsStreamOpen(lastStreamId) {
 		t.Fatal("the newest refusal was evicted and could not be reconsidered")
 	}
+	publication.resume()
 }
 
 // TestStreamManagerNetworkPeerWindowClientsAreBounded pins the witness map
@@ -326,23 +332,23 @@ func TestStreamManagerProvenWindowClientStreamSurvivesPeerReconcile(t *testing.T
 
 	client := streamManagerNetworkOnlyProviderClient(ctx)
 	defer client.Close()
+	openTracker := newStreamOpenTestTracker(client.streamManager.streamBuffer)
 
 	windowClientId := NewId()
 	streamId := NewId()
 	streamManagerOpenStream(t, client, windowClientId, streamId)
+	publication := openTracker.expectPublication(streamId)
 	client.streamManager.NetworkPeerWindowClientAuthenticated(windowClientId)
+	publication.wait(t)
 	if !client.streamManager.IsStreamOpen(streamId) {
 		t.Fatal("proven window client stream was not admitted")
 	}
+	sequence := streamLifecycleSequence(client, streamId)
 
 	// An unrelated peer membership change reconciles provider streams.
 	streamManagerAnnouncePeer(t, client, NewId())
-
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if !client.streamManager.IsStreamOpen(streamId) {
-			t.Fatal("peer reconcile retired a proven window client stream")
-		}
-		time.Sleep(10 * time.Millisecond)
+	if !client.streamManager.IsStreamOpen(streamId) || sequence == nil || sequence.ctx.Err() != nil {
+		t.Fatal("peer reconcile retired a proven window client stream")
 	}
+	publication.resume()
 }

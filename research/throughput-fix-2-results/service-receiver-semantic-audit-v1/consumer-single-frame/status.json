@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "c0727b93e045627cb3286ff4c4eb67ae508c4d536d066021c6a27850cd28af1a",
+  "binary_sha256": "f8ceac3860785cdd69daad70ad2b5ff134630d5c84c99989cc0c1e4bd79911e0",
+  "effective_inputs_sha256": "0920e19cf2c15efdc3b9de2ab473491acafd5550cadf06e0dcc7032a6abd541f",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiverSingleFramePacing",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied module as build; original absolute relationship is pinned by original status/manifest hashes",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:32:37.265265+00:00",
+  "loadavg_start": [
+    14.2705078125,
+    18.23828125,
+    17.55126953125
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 25.49718337506056,
+  "loadavg_end": [
+    10.94140625,
+    17.140625,
+    17.1748046875
+  ],
+  "ended_utc": "2026-09-16T20:33:02.762555+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "8e7f4b92e0f9230e8b62e1b7a4f438d4e91b66953aa1b4015fa3ca074a47ac3a",
+  "pass": 18,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "normalization_note": "Legal 1,000/4,000/8,000-byte single frames, opening 40 and 3.25 ms physical cycles. Both per-ACK and batched reads pass all 18 checks on unchanged production. Own-lane pacing is only a necessary control: final shared pace 3,157,407 B/s is about 79 percent of aggregate 4 MB/s physical delivery.",
+  "rows": 648
+}

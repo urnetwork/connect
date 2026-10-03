@@ -1,0 +1,9 @@
+{
+  "base": "f903f59a lifetime production with the SDK initial-service root, excluding the separate working unprovable-drain correction in both variants.",
+  "candidate": "Only transfer.go sizing changes plus the leaf-locked retained-window state; service sampling and pacing are identical to the baseline.",
+  "existing_comparison": "Identical 289 existing/new assertions once under race: before267 pass/22 fail; after259 pass/30 fail. Fifteen new failures remain visible for old-policy-versus-defect review; six new policy tests and the existing short compressed-service throughput root switch to pass.",
+  "host_context": "All jobs started immediately with concurrent jobs; source-pins retain load and time.",
+  "new_policy_tests": "Six deterministic policy tests, three race repetitions: baseline 0 pass/18 fail; candidate 18 pass/0 fail.",
+  "scope": "No event API, SDK changes, peer notifications or shrink episode implementation. Full unchanged performance matrix is a separate pending comparison.",
+  "service_result": "The unchanged 300 microsecond RTT, 50ms compression, 10 Mb/s one/eight-flow throughput root now delivers9.58464 Mb/s and passes. Five remaining sampler roots still fail."
+}

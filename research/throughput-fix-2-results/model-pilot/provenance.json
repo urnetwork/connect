@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-model-matrix.log",
+  "source_log_sha256": "029f2640d0226b8fbf3d968bd8d0471b4936d67086ca0f946bb315a31bb706c2",
+  "note": "Before final pacing and long-RTT warmup; failed cells retained.",
+  "rows": 36,
+  "final": false,
+  "outcome": "failed"
+}

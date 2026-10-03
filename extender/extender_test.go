@@ -4,14 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"time"
 
 	"testing"
@@ -24,83 +22,98 @@ func TestExtender(t *testing.T) {
 		t.Skip("skipping testing in short mode")
 	}
 
-	// actual content server, ephemeral port
-	// https, self signed
-	// one route, /hello
-
-	// extender server, port 1442
-
-	// client
-
-	// test uses extender http client to GET /hello
-
 	settings := DefaultExtenderSettings()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	certPemBytes, keyPemBytes, err := selfSign([]string{"localhost"}, "Connect Test", settings.ValidFrom, settings.ValidFor)
-	connect.AssertEqual(t, err, nil)
+	certificate, err := selfSignedCertificate(
+		[]string{"127.0.0.1"},
+		"Connect Test",
+		settings.ValidFrom,
+		settings.ValidFor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	tempDirPath := t.TempDir()
-
-	certFile := filepath.Join(tempDirPath, "localhost.pem")
-	keyFile := filepath.Join(tempDirPath, "localhost.key")
-	connect.AssertEqual(t, os.WriteFile(certFile, certPemBytes, 0o600), nil)
-	connect.AssertEqual(t, os.WriteFile(keyFile, keyPemBytes, 0o600), nil)
-
-	// the extender port is shared between the server, the client and the readiness
-	// poll below, so that the poll cannot drift from what is listened on
-	const extenderPort = 1442
-
-	// bind the content server here rather than inside ListenAndServeTLS on a
-	// goroutine. that form throws the bind error away, and the port it used, 443,
-	// is privileged on linux, so under an unprivileged CI user the content server
-	// silently never came up. the request then died with an EOF from the
-	// extender's own refused forward dial, which reads like a startup race and is
-	// not one. port 0 takes an ephemeral port: no privilege, and no collision with
-	// whatever else is on the machine.
-	contentListener, err := net.Listen("tcp", ":0")
-	connect.AssertEqual(t, err, nil)
-	defer contentListener.Close()
+	contentListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
 	contentPort := contentListener.Addr().(*net.TCPAddr).Port
-
 	server := &http.Server{
 		Handler: &testExtenderServer{},
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{*certificate},
+		},
 	}
-	defer server.Close()
-	go server.ServeTLS(contentListener, certFile, keyFile)
+	contentDone := make(chan error, 1)
+	go func() {
+		contentDone <- server.ServeTLS(contentListener, "", "")
+	}()
+	t.Cleanup(func() {
+		server.Close()
+		if err := <-contentDone; err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("content server: %v", err)
+		}
+	})
+
+	extenderListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	extenderPort := extenderListener.Addr().(*net.TCPAddr).Port
+	listenerClaimed := false
+	settings.Listen = func(network string, address string) (net.Listener, error) {
+		if network != "tcp" || address != fmt.Sprintf(":%d", extenderPort) {
+			return nil, fmt.Errorf("unexpected extender listen %s %s", network, address)
+		}
+		if listenerClaimed {
+			return nil, fmt.Errorf("extender listener requested more than once")
+		}
+		listenerClaimed = true
+		return extenderListener, nil
+	}
+	handlerErrors := make(chan error, 1)
+	settings.ErrorHandler = func(stage string, err error) {
+		select {
+		case handlerErrors <- fmt.Errorf("%s: %w", stage, err):
+		default:
+		}
+	}
 
 	extenderServer := NewExtenderServer(
 		ctx,
 		[]string{"montrose"},
-		[]string{"localhost"},
+		[]string{"127.0.0.1"},
 		map[int][]connect.ExtenderConnectMode{
-			extenderPort: []connect.ExtenderConnectMode{connect.ExtenderConnectModeTcpTls},
+			extenderPort: {connect.ExtenderConnectModeTcpTls},
 		},
 		&net.Dialer{},
 		settings,
 	)
-	defer extenderServer.Close()
-	go extenderServer.ListenAndServe()
-
-	// the extender binds on a goroutine, so wait until it actually accepts before
-	// issuing the request. a fixed sleep here would be a race: on a loaded runner
-	// the bind can land after the sleep expires, and the request then fails
-	// against a socket that is not listening yet. the content listener above is
-	// already bound by the time we get here, so it needs no poll.
-	awaitListening(t, fmt.Sprintf("127.0.0.1:%d", extenderPort))
+	extenderDone := make(chan error, 1)
+	go func() {
+		extenderDone <- extenderServer.ListenAndServe()
+	}()
+	t.Cleanup(func() {
+		extenderServer.CloseAndWait()
+		if err := <-extenderDone; err != nil {
+			t.Errorf("extender server: %v", err)
+		}
+	})
 
 	localIp, err := netip.ParseAddr("127.0.0.1")
-	connect.AssertEqual(t, err, nil)
-
-	rootCAs := x509.NewCertPool()
-	if !rootCAs.AppendCertsFromPEM(certPemBytes) {
-		t.Fatal("could not add content server certificate")
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	rootCas := x509.NewCertPool()
+	rootCas.AddCert(certificate.Leaf)
 	connectSettings := connect.DefaultConnectSettings()
 	connectSettings.TlsConfig = &tls.Config{
-		RootCAs: rootCAs,
+		RootCAs: rootCas,
 	}
 
 	client := connect.NewExtenderHttpClient(
@@ -108,57 +121,45 @@ func TestExtender(t *testing.T) {
 		&connect.ExtenderConfig{
 			Profile: connect.ExtenderProfile{
 				ConnectMode: connect.ExtenderConnectModeTcpTls,
-				ServerName:  "bringyour.com",
+				ServerName:  "front.example",
 				Port:        extenderPort,
 			},
 			Ip:     localIp,
 			Secret: "montrose",
 		},
 	)
+	t.Cleanup(client.CloseIdleConnections)
 
-	// the extender forwards to the host:port the client dialed, so the content
-	// port travels to it in the extender header
-	r, err := client.Get(fmt.Sprintf("https://localhost:%d/hello", contentPort))
-
-	connect.AssertEqual(t, err, nil)
-	connect.AssertEqual(t, r.StatusCode, 200)
-
-	body, err := io.ReadAll(r.Body)
-	connect.AssertEqual(t, err, nil)
-	connect.AssertEqual(t, string(body), "{}")
-
-}
-
-// awaitListening blocks until every addr accepts a tcp connection, and fails the
-// test if any of them is still not accepting when the overall deadline passes.
-func awaitListening(t *testing.T, addrs ...string) {
-	t.Helper()
-
-	const timeout = 5 * time.Second
-	const pollInterval = 10 * time.Millisecond
-
-	deadline := time.Now().Add(timeout)
-	for _, addr := range addrs {
-		for {
-			conn, err := net.DialTimeout("tcp", addr, pollInterval*10)
-			if err == nil {
-				conn.Close()
-				break
-			}
-			if !time.Now().Before(deadline) {
-				t.Fatalf("%s was not accepting connections within %s: %s", addr, timeout, err)
-			}
-			select {
-			case <-time.After(pollInterval):
-			}
+	response, err := client.Get(fmt.Sprintf("https://127.0.0.1:%d/hello", contentPort))
+	if err != nil {
+		select {
+		case handlerErr := <-handlerErrors:
+			t.Fatalf("request: %v; extender: %v", err, handlerErr)
+		default:
+			t.Fatal(err)
 		}
 	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, expected %d", response.StatusCode, http.StatusOK)
+	}
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "{}" {
+		t.Fatalf("body = %q, expected %q", body, "{}")
+	}
+
 }
 
-func TestSelfSignValiditySpansPresent(t *testing.T) {
+// The self-signed leaf spans the moment it was created: ValidFrom is the
+// tolerated history before creation and ValidFor the lifetime after it.
+func TestSelfSignedCertificateValiditySpansPresent(t *testing.T) {
 	before := time.Now()
-	certPemBytes, _, err := selfSign(
-		[]string{"localhost"},
+	certificate, err := selfSignedCertificate(
+		[]string{"leaf.example"},
 		"Connect Test",
 		2*time.Hour,
 		3*time.Hour,
@@ -166,23 +167,94 @@ func TestSelfSignValiditySpansPresent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	block, _ := pem.Decode(certPemBytes)
-	if block == nil {
-		t.Fatal("selfSign returned no certificate PEM block")
+	after := time.Now()
+	if delta := certificate.Leaf.NotBefore.Sub(before.Add(-2 * time.Hour)); delta < -time.Second || time.Second < delta {
+		t.Fatalf("NotBefore = %s, expected about two hours before creation", certificate.Leaf.NotBefore)
 	}
-	certificate, err := x509.ParseCertificate(block.Bytes)
+	if delta := certificate.Leaf.NotAfter.Sub(after.Add(3 * time.Hour)); delta < -time.Second || time.Second < delta {
+		t.Fatalf("NotAfter = %s, expected about three hours after creation", certificate.Leaf.NotAfter)
+	}
+	if before.Before(certificate.Leaf.NotBefore) || certificate.Leaf.NotAfter.Before(after) {
+		t.Fatalf(
+			"certificate validity %s..%s does not span creation",
+			certificate.Leaf.NotBefore,
+			certificate.Leaf.NotAfter,
+		)
+	}
+}
+
+// A name is issued once and the cached leaf is reused, so a handshake never
+// generates a key (B3).
+func TestExtenderCertificatesCacheLeavesPerServerName(t *testing.T) {
+	settings := DefaultExtenderSettings()
+	certificates, err := newExtenderCertificates(nil, settings)
 	if err != nil {
 		t.Fatal(err)
 	}
-	after := time.Now()
-	if delta := certificate.NotBefore.Sub(before.Add(-2 * time.Hour)); delta < -time.Second || time.Second < delta {
-		t.Fatalf("NotBefore = %s, expected about two hours before creation", certificate.NotBefore)
+	first, err := certificates.certificateForServerName("one.example")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if delta := certificate.NotAfter.Sub(after.Add(3 * time.Hour)); delta < -time.Second || time.Second < delta {
-		t.Fatalf("NotAfter = %s, expected about three hours after creation", certificate.NotAfter)
+	again, err := certificates.certificateForServerName("one.example")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if before.Before(certificate.NotBefore) || certificate.NotAfter.Before(after) {
-		t.Fatalf("certificate validity %s..%s does not span creation", certificate.NotBefore, certificate.NotAfter)
+	if first != again {
+		t.Fatal("the same server name was issued twice")
+	}
+	other, err := certificates.certificateForServerName("two.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == other {
+		t.Fatal("two server names share one certificate")
+	}
+	if first.Leaf.DNSNames[0] != "one.example" || other.Leaf.DNSNames[0] != "two.example" {
+		t.Fatalf("issued names = %v, %v", first.Leaf.DNSNames, other.Leaf.DNSNames)
+	}
+	if 1 < len(first.Certificate) {
+		t.Fatal("an extender without an identity key issued a chain")
+	}
+}
+
+// With an identity key the leaf is issued under the self-signed ed25519 ca,
+// and the leaf signature verifies under the identity key (B3).
+func TestExtenderCertificatesIssueUnderTheIdentityKey(t *testing.T) {
+	seed, err := connect.NewExtenderKeySeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := DefaultExtenderSettings()
+	certificates, err := newExtenderCertificates(seed, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey, err := connect.ExtenderPublicKeyFromSeed(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(certificates.PublicKey()) != string(publicKey) {
+		t.Fatal("the published key is not the identity key")
+	}
+	certificate, err := certificates.certificateForServerName("leaf.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(certificate.Certificate) != 2 {
+		t.Fatalf("certificate chain has %d entries, expected the leaf and the ca", len(certificate.Certificate))
+	}
+	if certificate.Leaf.SignatureAlgorithm != x509.PureEd25519 {
+		t.Fatalf("leaf signature algorithm = %s, expected ed25519", certificate.Leaf.SignatureAlgorithm)
+	}
+	caCertificate, err := x509.ParseCertificate(certificate.Certificate[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !caCertificate.IsCA {
+		t.Fatal("the issuing certificate is not a ca")
+	}
+	if err := certificate.Leaf.CheckSignatureFrom(caCertificate); err != nil {
+		t.Fatalf("the leaf is not signed by the ca: %v", err)
 	}
 }
 

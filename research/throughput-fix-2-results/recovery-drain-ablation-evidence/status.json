@@ -1,0 +1,11 @@
+{
+  "comparison_pairs": 9,
+  "complete": true,
+  "drain_liveness_pass": 11,
+  "failed_comparison_pairs": 9,
+  "model_top_level_fail": 6,
+  "no_production_mutation_or_acceptance_gate_change": true,
+  "race_instrumentation": false,
+  "service_readings": 18,
+  "variants": 3
+}

@@ -1,0 +1,11 @@
+--- FAIL: TestTcpReturnRecoversLostMiddleAfterTransferDelivery (0.00s)
+    ip_tcp_return_recovery_test.go:114: inner TCP hole after successful Transfer delivery: recovered 4/32 bytes by 100ms
+--- FAIL: TestTcpReturnRecoversLostTailWithoutLaterData (0.00s)
+    ip_tcp_return_recovery_test.go:119: inner TCP hole after successful Transfer delivery: recovered 4/8 bytes by 1.1s
+--- FAIL: TestTcpReturnRecoveryCrossesSequenceWrap (0.00s)
+    ip_tcp_return_recovery_test.go:124: inner TCP hole after successful Transfer delivery: recovered 4/32 bytes by 100ms
+--- FAIL: TestTcpReturnKeepsRecoveryAfterOriginEof (0.00s)
+    ip_tcp_return_recovery_test.go:129: inner TCP hole after successful Transfer delivery: recovered 4/8 bytes by 2.1s
+FAIL
+FAIL	github.com/urnetwork/connect	0.600s
+FAIL

@@ -1,0 +1,46 @@
+{
+  "binary": {
+    "bytes": 73742914,
+    "sha256": "41167ba6300fbaefc35d3bb94321867b45c12cb27d570128ac9138850f62c97b"
+  },
+  "outcomes": {
+    "FAIL": 0,
+    "PASS": 321,
+    "SKIP": 0,
+    "unique_tests": 107
+  },
+  "overlay_input_pins": {
+    "transfer.go": {
+      "bytes": 614058,
+      "sha256": "af0c88c3dbae3b7d7ed80265fac13d94b6eea6af077b1ebb173671c6afd74246"
+    },
+    "transfer_window_pacing.go": {
+      "bytes": 40721,
+      "sha256": "7320e29a16053e3c1e6d039b494eb76fbb2b12a33600bcd99676bfb8ad3744a7"
+    },
+    "transfer_window_pacing_pending_test.go": {
+      "bytes": 13080,
+      "sha256": "b048c45ba996b8615df8c89ce2d8d14d43155c49b4c519846ea161c5be6d1f4b"
+    },
+    "transfer_window_single_owner_test.go": {
+      "bytes": 5204,
+      "sha256": "4d71c6fc6408db793b5497335af0a40844962e5cdc21795e9acae8f90be4073a"
+    },
+    "transfer_window_stats_observer_test.go": {
+      "bytes": 5168,
+      "sha256": "9b6862b2225a276423b965911ee8a78604b2adec64656ffa46093a235a907a2d"
+    }
+  },
+  "overlay_sha256": "9441c924fbe331641bfec5d4294ac0054c6f6bb69365d05289f333474abdbdd0",
+  "race": true,
+  "raw_log": {
+    "bytes": 59279,
+    "sha256": "2dbed23f2e4a997b9ecf31405032526cd1030c6bacae0a01fe3f69916727ea2b"
+  },
+  "redaction": "Binary, overlay content, source content, and raw log are excluded; hashes and sanitized test outcomes are retained.",
+  "schema": "throughput-fix-2/pending-probe-observer-combined-focused-provenance-v1",
+  "source_context": {
+    "limit": "Ad hoc overlay run with pinned binary and inputs; no runner source manifest was captured. This is scoped focused evidence, not a throughput-runner checkpoint.",
+    "shared_source_sha256_at_handoff": "538e6248fb744795d9e829e97e503744ed70284d107ebad10da646b56bf6e460"
+  }
+}

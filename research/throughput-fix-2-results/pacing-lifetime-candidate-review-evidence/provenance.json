@@ -1,0 +1,26 @@
+{
+  "archive_kind": "pacing_lifetime_candidate_review_evidence",
+  "classification": "isolated_unaccepted_candidate",
+  "conclusions": {
+    "adjacent": "Older item sent0 expires500ms; younger item sent100ms waits600ms with own lifetime600ms. Both baseline and current candidate miss older500ms callback,3/3 each. This remains open and candidate is not complete.",
+    "focused": "12 PASS15 FAIL before;129 PASS after including preserved reliable-retention and cancellation. Before adds only inert expiresAt field for direct-fixture compilation.",
+    "full": "334 PASS2 FAIL0 race; both failures construct sendItem with sendTime but no ackTimeout, unlike real producer. They need explicit real lifetime before interpreting as policy regressions. No correction rerun yet.",
+    "superseded": "Initial after23PASS1FAIL1race is an unlocked FIFO precondition fixture read; final fixture uses service lock. Originalbefore12PASS12FAIL0race retained."
+  },
+  "input_handoff_sha256": "1b04f79ce89e0649c0d8653075acddd3a98b4e836e5262ca9f516286b567358a",
+  "input_pins_verified": 19,
+  "production_integration": "not authorized",
+  "sanitization": {
+    "earlier_fixture_race": "retained separately and not treated as final evidence",
+    "full_selector_failures": "retained separately from focused candidate results",
+    "local_paths_network_addresses_and_generated_ids": "excluded",
+    "raw_sources_logs_overlays_and_binaries": "excluded; SHA-256 pins and normalized test outcomes retained only"
+  },
+  "schema_version": 1,
+  "scope": "ISOLATED UNACCEPTED LIFETIME CANDIDATE, no shared production change. Same-record initial/FIFO/active-drain/retry/late-dispatch roots fixed; older-record shared-worker lifetime still violated.",
+  "superseded_input": {
+    "name": "candidate-handoff.json",
+    "status": "superseded and intentionally not used because its base-fixture path changed"
+  },
+  "throughput_acceptance": "not evaluated"
+}

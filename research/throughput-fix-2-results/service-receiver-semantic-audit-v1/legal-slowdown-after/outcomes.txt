@@ -1,0 +1,25 @@
+=== RUN   TestWindowPacingReceiverLegalRollingQueueReducesFastHold
+--- PASS: TestWindowPacingReceiverLegalRollingQueueReducesFastHold (2.89s)
+=== RUN   TestWindowPacingReceiverLegalRollingQueueLegacyControl
+--- PASS: TestWindowPacingReceiverLegalRollingQueueLegacyControl (1.01s)
+=== RUN   TestWindowPacingReceiverLegalRollingQueueMixedControl
+--- PASS: TestWindowPacingReceiverLegalRollingQueueMixedControl (0.80s)
+=== RUN   TestWindowPacingReceiverLegalSharedPositiveServiceBudget
+--- PASS: TestWindowPacingReceiverLegalSharedPositiveServiceBudget (1.51s)
+=== RUN   TestWindowPacingReceiverLegalRollingQueueReducesFastHold
+--- PASS: TestWindowPacingReceiverLegalRollingQueueReducesFastHold (2.86s)
+=== RUN   TestWindowPacingReceiverLegalRollingQueueLegacyControl
+--- PASS: TestWindowPacingReceiverLegalRollingQueueLegacyControl (1.02s)
+=== RUN   TestWindowPacingReceiverLegalRollingQueueMixedControl
+--- PASS: TestWindowPacingReceiverLegalRollingQueueMixedControl (0.80s)
+=== RUN   TestWindowPacingReceiverLegalSharedPositiveServiceBudget
+--- PASS: TestWindowPacingReceiverLegalSharedPositiveServiceBudget (1.52s)
+=== RUN   TestWindowPacingReceiverLegalRollingQueueReducesFastHold
+--- PASS: TestWindowPacingReceiverLegalRollingQueueReducesFastHold (2.86s)
+=== RUN   TestWindowPacingReceiverLegalRollingQueueLegacyControl
+--- PASS: TestWindowPacingReceiverLegalRollingQueueLegacyControl (1.01s)
+=== RUN   TestWindowPacingReceiverLegalRollingQueueMixedControl
+--- PASS: TestWindowPacingReceiverLegalRollingQueueMixedControl (0.80s)
+=== RUN   TestWindowPacingReceiverLegalSharedPositiveServiceBudget
+--- PASS: TestWindowPacingReceiverLegalSharedPositiveServiceBudget (1.50s)
+PASS

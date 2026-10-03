@@ -1,0 +1,146 @@
+[
+  {
+    "base_commit": "272f95e517dfe3a9f5e793aae59a4cdd24b95447",
+    "variant": "hybrid",
+    "bundle_sha256": "857410be93a49a4a2e47b173e0e713585ed15ead053a910d097e4161ef56da8d",
+    "pattern": "^TestWindow(Receiver.*|PacingReverseCompression.*)$",
+    "count": 3,
+    "race": true,
+    "no_quiescence_wait": true,
+    "started_utc": "2026-09-16T14:06:02.496889+00:00",
+    "loadavg_start": [
+      4.52880859375,
+      5.26123046875,
+      7.61767578125
+    ],
+    "go": "go version go1.26.7 darwin/arm64",
+    "source_sha256": "31db1cc0007fdc10fe2b069ecd10d205d0afccd990e01cc404fbbc0f39e4f239",
+    "compile_exit_code": 0,
+    "sources_stable_during_build": true,
+    "binary_sha256": "97da82adf1035ac1cde1613364c876ae88241a9b17807021f4be833ab5d67ce9",
+    "exit_code": 1,
+    "raw_log_sha256": "e83ddbe5cce0386fdc4e85b3824886be35ad59290f2d3024e8f1711226ebb861",
+    "sources_stable_after": true,
+    "elapsed_seconds": 22.42993283411488,
+    "finished_utc": "2026-09-16T14:06:24.939822+00:00",
+    "loadavg_end": [
+      4.31982421875,
+      5.14453125,
+      7.505859375
+    ],
+    "race_warnings": 0,
+    "outcomes": {
+      "PASS": 87,
+      "FAIL": 21,
+      "SKIP": 0
+    }
+  },
+  {
+    "base_commit": "272f95e517dfe3a9f5e793aae59a4cdd24b95447",
+    "variant": "early-handoff",
+    "bundle_sha256": "857410be93a49a4a2e47b173e0e713585ed15ead053a910d097e4161ef56da8d",
+    "pattern": "^TestWindow(Receiver.*|PacingReverseCompression.*)$",
+    "count": 3,
+    "race": true,
+    "no_quiescence_wait": true,
+    "started_utc": "2026-09-16T14:08:35.473974+00:00",
+    "loadavg_start": [
+      4.5048828125,
+      4.994140625,
+      7.11083984375
+    ],
+    "go": "go version go1.26.7 darwin/arm64",
+    "source_sha256": "53db976389853fffde6ffe36206a2771c722ca0bec003b7cd3ad5aee77512ee3",
+    "compile_exit_code": 0,
+    "sources_stable_during_build": true,
+    "binary_sha256": "40e8a3101bba8c6ea22d355145e0c7a6b45dd0b91cdac0573b72286185dab583",
+    "exit_code": 1,
+    "raw_log_sha256": "2b4b6d32fab0d8d22a32912ccfa8e69b8f9c16981d2db780b36072faa9d21f91",
+    "sources_stable_after": true,
+    "elapsed_seconds": 27.169860708061606,
+    "finished_utc": "2026-09-16T14:09:02.658817+00:00",
+    "loadavg_end": [
+      9.13916015625,
+      5.98779296875,
+      7.40283203125
+    ],
+    "race_warnings": 0,
+    "outcomes": {
+      "PASS": 84,
+      "FAIL": 24,
+      "SKIP": 0
+    }
+  },
+  {
+    "base_commit": "272f95e517dfe3a9f5e793aae59a4cdd24b95447",
+    "variant": "queued-endpoints",
+    "bundle_sha256": "857410be93a49a4a2e47b173e0e713585ed15ead053a910d097e4161ef56da8d",
+    "pattern": "^TestWindow(Receiver.*|PacingReverseCompression.*)$",
+    "count": 3,
+    "race": true,
+    "no_quiescence_wait": true,
+    "started_utc": "2026-09-16T14:08:35.475353+00:00",
+    "loadavg_start": [
+      4.5048828125,
+      4.994140625,
+      7.11083984375
+    ],
+    "go": "go version go1.26.7 darwin/arm64",
+    "source_sha256": "3ddec12c37efc05d6741ad8c1d69cd1c391b28c247c252015c55736f922a11b1",
+    "compile_exit_code": 0,
+    "sources_stable_during_build": true,
+    "binary_sha256": "e58320f3d296c11442377a0cc7a1f29e643a1064afc1a79fcbc8093e48f7aa56",
+    "exit_code": 1,
+    "raw_log_sha256": "8220c7b131809b60c17602c6ebff975a6a5381f4fe91a2d8a9fccbc826b8e821",
+    "sources_stable_after": true,
+    "elapsed_seconds": 25.574080917052925,
+    "finished_utc": "2026-09-16T14:09:01.063171+00:00",
+    "loadavg_end": [
+      9.13916015625,
+      5.98779296875,
+      7.40283203125
+    ],
+    "race_warnings": 0,
+    "outcomes": {
+      "PASS": 90,
+      "FAIL": 18,
+      "SKIP": 0
+    }
+  },
+  {
+    "base_commit": "272f95e517dfe3a9f5e793aae59a4cdd24b95447",
+    "variant": "sender-confirmed-rise",
+    "bundle_sha256": "857410be93a49a4a2e47b173e0e713585ed15ead053a910d097e4161ef56da8d",
+    "pattern": "^TestWindow(Receiver.*|PacingReverseCompression.*)$",
+    "count": 3,
+    "race": true,
+    "no_quiescence_wait": true,
+    "started_utc": "2026-09-16T14:08:35.476208+00:00",
+    "loadavg_start": [
+      4.5048828125,
+      4.994140625,
+      7.11083984375
+    ],
+    "go": "go version go1.26.7 darwin/arm64",
+    "source_sha256": "d607f5d75d578dbca4bf3f81849554369f75ea6b21482fef5d42325311212e2d",
+    "compile_exit_code": 0,
+    "sources_stable_during_build": true,
+    "binary_sha256": "446d42f40025e9da06c2fa7dc828a4b15b75769bb4410fd0907929f95e693ac5",
+    "exit_code": 1,
+    "raw_log_sha256": "6ca048be130a08f418539eadb9458bb4a8db1f3abf470ea76aac7c94bbdd2269",
+    "sources_stable_after": true,
+    "elapsed_seconds": 26.393337124958634,
+    "finished_utc": "2026-09-16T14:09:01.882158+00:00",
+    "loadavg_end": [
+      9.13916015625,
+      5.98779296875,
+      7.40283203125
+    ],
+    "race_warnings": 0,
+    "outcomes": {
+      "PASS": 93,
+      "FAIL": 15,
+      "SKIP": 0
+    }
+  }
+]

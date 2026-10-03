@@ -1,0 +1,8 @@
+{
+  "kind": "offline-derived-review",
+  "file_sha256": {
+    "review.md": "c8ef58666b41ddf2d3f6769107626f5d02ef877c85974d83721acb4a078f9c6c",
+    "source-hashes.json": "b3f950a940076d61fec5cc8f239ec32ea5a9986afb6d73e9ef5122f698e9045d",
+    "summary.json": "9a5b4fabd781d15bb12ae5b888b8f6b9111459f85d06477de09a2d730c461c34"
+  }
+}

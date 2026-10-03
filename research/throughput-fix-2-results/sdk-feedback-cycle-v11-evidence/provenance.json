@@ -1,0 +1,288 @@
+{
+  "attribution_limits": [
+    "All effective source inputs were frozen before the independent ACK-credit record refactor; this handoff replaces only the pacing file and adds one normal summary test file. The new ACK plumbing still needs combined validation.",
+    "The 1.2-second control was declared before running; all six before/after failures and exact settings are retained. Its stale 15\u201318 ms RTT estimate and existing one-second drain cap motivate a separate forced investigation.",
+    "The frozen v10 full-model window-mismatch failures are independent open work owned by the pacing debugger; these summary results do not close them.",
+    "Primer timing and forced first-feedback barriers remain synthetic diagnostics, not attribution of natural host TCP failures."
+  ],
+  "candidate": "feedback-summary-v11",
+  "changes": [
+    "A retained completed cycle remains an eligible byte-accounting summary until newer measured evidence supersedes it.",
+    "Controller acceptance keeps the fresh summary while committing its epoch; excluded old bytes remain delivery accounting only.",
+    "The retained summary pins any larger advertised compression interval used by later observations.",
+    "No new fields, history growth, expected-rate completion quotas, admission or FIFO changes."
+  ],
+  "diagnostic_only_unresolved_test": {
+    "do_not_apply_as_completed_fix": true,
+    "protocol": {
+      "budget_bytes": 50331648,
+      "candidate_initial_rtt_ns": 300000,
+      "candidate_later_rtt_ns": 1200000000,
+      "candidate_reference_ratio": 0.9,
+      "change_after_ns": 4000000000,
+      "compression_ns": 10000000,
+      "flows": 8,
+      "lanes": 8,
+      "measure_ns": 3000000000,
+      "measured_relay_drops": 0,
+      "minimum_flow_mbps": "strictly positive",
+      "rate_bytes_per_second": 12500000,
+      "reference_min_mbps": 90,
+      "reference_rtt_ns": 1200000000,
+      "warmup_ns": 12000000000
+    },
+    "source_file": "long-ring-growth_test.go",
+    "source_sha256": "1cacdd887b2e41dbe6a4f2d791adb89093c27818966b248a132548655af17e81"
+  },
+  "guarded_files": [
+    {
+      "candidate_file": "summary-pinned_test.go",
+      "candidate_sha256": "be612ac3a58d1aa5ce8f9381861beb1a385271dff94f6bcf199257f1fe242237",
+      "expected_base_sha256": null,
+      "target_file": "transfer_window_feedback_summary_test.go"
+    },
+    {
+      "candidate_file": "v11-pinned-pacing.go",
+      "candidate_sha256": "fb150c9e4493ead750c2c7a9e2438432aecb99dc92274fc35602f869fa505600",
+      "expected_base_sha256": "a7fbedd5178c77d590da186bb4e8582d85deb547908bb62c04090f02b1e6d667",
+      "target_file": "transfer_window_pacing.go"
+    }
+  ],
+  "input_handoff_file": "v11-handoff.json",
+  "input_handoff_sha256": "f045b79f06271d5468388c8edf935b0f5650546fc6d8ab66c0d77d7008d74c11",
+  "prior_handoff": {
+    "file": "partial-feedback-cycle-v10-handoff.json",
+    "sha256": "56eafaf37ac939aa00ab10932d33c58229a4ebd25bf8e2b1456383d5b6ed1c75"
+  },
+  "runs": [
+    {
+      "binary_sha256": "114ff8ae1370be6b5454ea34ca5771631ab9038e0fa634ff003de2aea24d7538",
+      "build_manifest_file": "before.manifest.json",
+      "build_manifest_sha256": "16f103d68a6486666583b1a9286f843908e53acef78bac40737902ed714a3250",
+      "complete": true,
+      "effective_input_sha256": "90c5a529493b5ec7dd8732d492fabebd06d62aabb19a268c4327d4f13fcfcab4",
+      "id": "original-partition-root",
+      "inputs_stable_during_build": true,
+      "note": "Frozen v10; identical bytes and timestamps split across worker applications produce 1000 versus 10000 B/s, three failures.",
+      "original_log_sha256": "55d96644f7296be1bba86721c7d8f06b65a6d2d434bed69686f5cf7f869947e6",
+      "outcome_count": 3,
+      "overlay_sha256": "a886f634c54b013764de48a8b11a38a09aad4a5d3ce2055b9ca68f69e0c048c3",
+      "protocol": {},
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "bbfff10faeb18886476ec0657e0a91d9433b394600217862e9cb460f09734f0d",
+      "build_manifest_file": "v11-before.manifest.json",
+      "build_manifest_sha256": "bb4463a69a47d98d821acff4314c9dfb532c777144f1d74eaca1be39ad229ccd",
+      "complete": true,
+      "effective_input_sha256": "f4c08eb25b010b3b4fda24f48d2c4238d80a601cb18b3a62f76daf1e18782b3d",
+      "id": "ordinary-and-retired-summary-roots",
+      "inputs_stable_during_build": true,
+      "note": "Frozen v10; ordinary summaries lose late bytes without reads; accepted fresh summaries lose them after controller retirement; superseded-summary control passes.",
+      "original_log_sha256": "6a1ba4fea1ad789b9a8fc358943a4f3954692dc350db9df86001fe40317f690c",
+      "outcome_count": 12,
+      "overlay_sha256": "eb34acc5ea754fa5c3cd34de7808105d0256ba79b4363d5e14f0630749a9fc1b",
+      "protocol": {},
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "ebd042f09cd1798d7e1b02c855deda8decfe7e6a074bf240a4a197205811bc8d",
+      "build_manifest_file": "v11-compression-before.manifest.json",
+      "build_manifest_sha256": "db964531e25bc79247b03c0b24741f2c8586bfc91fe1c482abed589646ec8b99",
+      "complete": true,
+      "effective_input_sha256": "ed51680a5686284922ccd1693414ea5347812613f77ff4582b3484155164aa64",
+      "id": "compression-pin-before",
+      "inputs_stable_during_build": true,
+      "note": "Intermediate summary prototype missed compression growth while extending its retained interval; same observations became 400000 versus 10731 B/s, three failures.",
+      "original_log_sha256": "74af8421f61d807fa386bca75f269314ca401a017325b9c71cf5bd2843ef4f4d",
+      "outcome_count": 3,
+      "overlay_sha256": "2ceeb038aae66063552848951bb071df253c0d3cba9a59c3f4d0184ccb9240a3",
+      "protocol": {},
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "8ee495dd1fdf2d00545c9766eaf8b92f4d881b74ce5f9503f2c7fc58e237e179",
+      "build_manifest_file": "v11.manifest.json",
+      "build_manifest_sha256": "30de007cd38ff1713af8ce73a403bc916c51b10cd5318d1d48eaafc8cd06f167",
+      "complete": true,
+      "effective_input_sha256": "50832604bea29784af3904f6eb0184a08abe55ac4f1421e345851a8d0ac827b5",
+      "id": "prototype-focus",
+      "inputs_stable_during_build": true,
+      "note": "Initial 405 focused passes preceded the separate compression provenance failure; final production includes that correction.",
+      "original_log_sha256": "d2b2f1767d3756d609e0fb34cdf9f400636ceb7165e87c41df8f8fcb9097f9e2",
+      "outcome_count": 405,
+      "overlay_sha256": "5d9985282975aa6a22b43d294650599fd2dbe1cae76e924cfa82073c46e53f53",
+      "protocol": {},
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "04bf5061c98374dc733a857533c14612bfaae0ed258947453d59de67da0ed365",
+      "build_manifest_file": "v11-final.manifest.json",
+      "build_manifest_sha256": "faf676f5021c49d368cc4466c78f09a899b7fd0a4cdfd0b6ed85d86296ef30c1",
+      "complete": true,
+      "effective_input_sha256": "c0f3027c8e59fee85eb987d704d62dc4b702368060de5c0e5308d8fed8282042",
+      "id": "final-focus",
+      "inputs_stable_during_build": true,
+      "note": "",
+      "original_log_sha256": "999c8406bb8d18e65a673d032c7a026677e20fc84d54f36fb6f9e733fe4e52f9",
+      "outcome_count": 408,
+      "overlay_sha256": "27a97e4d4c9617f159ce99408cba4983f5fa16f617784cb1f701224092ec2aa8",
+      "protocol": {
+        "count": 3,
+        "test_regex": "^TestWindow(Pacing|BurstPacing)|^TestReceiveSequenceBurstTail"
+      },
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "019add699cc5e47d355b70bd8c4173add16cc628d6122acf43764c98f326b7f6",
+      "build_manifest_file": "v11-final-race.manifest.json",
+      "build_manifest_sha256": "fdb74e8386254176fe2b6a4deac97c4da79c637c27ac7df10ca83842f3388562",
+      "complete": true,
+      "effective_input_sha256": "c0f3027c8e59fee85eb987d704d62dc4b702368060de5c0e5308d8fed8282042",
+      "id": "final-race",
+      "inputs_stable_during_build": true,
+      "note": "",
+      "original_log_sha256": "d39ebf6524164ca9e45adf3033189855c4efddcec09c7dc1015affbc9cb69295",
+      "outcome_count": 408,
+      "overlay_sha256": "27a97e4d4c9617f159ce99408cba4983f5fa16f617784cb1f701224092ec2aa8",
+      "protocol": {
+        "count": 3,
+        "race": true,
+        "test_regex": "^TestWindow(Pacing|BurstPacing)|^TestReceiveSequenceBurstTail"
+      },
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "04bf5061c98374dc733a857533c14612bfaae0ed258947453d59de67da0ed365",
+      "build_manifest_file": "v11-final.manifest.json",
+      "build_manifest_sha256": "faf676f5021c49d368cc4466c78f09a899b7fd0a4cdfd0b6ed85d86296ef30c1",
+      "complete": true,
+      "effective_input_sha256": "c0f3027c8e59fee85eb987d704d62dc4b702368060de5c0e5308d8fed8282042",
+      "id": "final-recovery-and-new-long-cell",
+      "inputs_stable_during_build": true,
+      "note": "Existing RTT growth, 400 ms/50 ms compression and forced SDK recovery each pass three times. The newly predeclared 1.2-second RTT growth cell fails all three and remains unresolved.",
+      "original_log_sha256": "fd216d736599f1e97c2e1a5fa8740a715de2c975c93f90ea90ae0e0e557021e5",
+      "outcome_count": 12,
+      "overlay_sha256": "27a97e4d4c9617f159ce99408cba4983f5fa16f617784cb1f701224092ec2aa8",
+      "protocol": {
+        "count": 3,
+        "test_names": [
+          "TestWindowPathAckTailRoundTripGrowthControl",
+          "TestWindowPathServiceLongCompressedFeedback",
+          "TestWindowPathSdkDuplexRecoversAfterInitialFeedbackBarrier",
+          "TestWindowPathServiceRoundTripGrowthBeyondOldRing"
+        ]
+      },
+      "reading_count": 24
+    },
+    {
+      "binary_sha256": "04bf5061c98374dc733a857533c14612bfaae0ed258947453d59de67da0ed365",
+      "build_manifest_file": "v11-final.manifest.json",
+      "build_manifest_sha256": "faf676f5021c49d368cc4466c78f09a899b7fd0a4cdfd0b6ed85d86296ef30c1",
+      "complete": true,
+      "effective_input_sha256": "c0f3027c8e59fee85eb987d704d62dc4b702368060de5c0e5308d8fed8282042",
+      "id": "final-service-controls",
+      "inputs_stable_during_build": true,
+      "note": "",
+      "original_log_sha256": "a8c7adaa7821a5cfc5e201b9df01865241a122016facc20731ea3a2494db41a5",
+      "outcome_count": 6,
+      "overlay_sha256": "27a97e4d4c9617f159ce99408cba4983f5fa16f617784cb1f701224092ec2aa8",
+      "protocol": {
+        "count": 1,
+        "test_names": [
+          "TestWindowPathServiceSettledLargeMessageCapacityChanges",
+          "TestWindowPathServiceCapacityIncreaseRecovery",
+          "TestWindowPathServiceAcrossRepeatedDrains",
+          "TestWindowPacingDelayedWakeKeepsService",
+          "TestWindowPathServicesShareFiniteRelay",
+          "TestWindowPathServiceRoundTripChanges"
+        ]
+      },
+      "reading_count": 36
+    },
+    {
+      "binary_sha256": "5a044d0eb085fcad879b6e4444cedb55237cb09ba473b5dc754fec6aee6caf5e",
+      "build_manifest_file": "v11-long-baseline.manifest.json",
+      "build_manifest_sha256": "a13514df32f395710dc1f74b30ee83ed07776fe742c8b597529763a1977b4979",
+      "complete": true,
+      "effective_input_sha256": "2566fdb46d5a91c4a81e4ca2f2fb249b362e4152571181d43f12fb8a1050b811",
+      "id": "long-cell-v10-baseline",
+      "inputs_stable_during_build": true,
+      "note": "The same predeclared new long-path gate fails on v10; this establishes an unresolved preceding limitation, not attribution to the summary correction.",
+      "original_log_sha256": "19a6e9c0cc9939f0a03059bd57de69a9df360416f1be071cd7e152288e26f0b1",
+      "outcome_count": 3,
+      "overlay_sha256": "91de1402e999027e42c116e393cfedce472d16295fbbee5b2a19bd18d95dc3c1",
+      "protocol": {
+        "count": 3,
+        "test_names": [
+          "TestWindowPathServiceRoundTripGrowthBeyondOldRing"
+        ]
+      },
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "44f2494979433ec9b40322ff5ab18fd0fb4226700ba03918a2ac69c73e1f6005",
+      "build_manifest_file": "v11-primer.manifest.json",
+      "build_manifest_sha256": "439dc2762c57e720f906e66805dea133b12efa191460f77008f96fd0877a893a",
+      "complete": true,
+      "effective_input_sha256": "e6ca6848daf6c6259bd87b9113d21a4608be754231845a29f811789833e074e8",
+      "id": "final-natural",
+      "inputs_stable_during_build": true,
+      "note": "All-arm primer diagnostics retain the original phase, reference and gates.",
+      "original_log_sha256": "1ffdba4638871142aec1b2e45c89a5e0e5afec41d42c2434f827a3ddd1475d49",
+      "outcome_count": 6,
+      "overlay_sha256": "fcff565138e53ca76ab6718a6e7bb375367a08be6fbf40da85cf3e7ea63fd050",
+      "protocol": {
+        "count": 3,
+        "environment": {},
+        "test_regex": "^TestWindowPathSdkProviderDuplex(Probe|UnpacedControl)$"
+      },
+      "reading_count": 15
+    },
+    {
+      "binary_sha256": "44f2494979433ec9b40322ff5ab18fd0fb4226700ba03918a2ac69c73e1f6005",
+      "build_manifest_file": "v11-primer.manifest.json",
+      "build_manifest_sha256": "439dc2762c57e720f906e66805dea133b12efa191460f77008f96fd0877a893a",
+      "complete": true,
+      "effective_input_sha256": "e6ca6848daf6c6259bd87b9113d21a4608be754231845a29f811789833e074e8",
+      "id": "final-early",
+      "inputs_stable_during_build": true,
+      "note": "All-arm primer diagnostics retain the original phase, reference and gates.",
+      "original_log_sha256": "4254420961364b0906fe334debebea63a3f365636cb46dc70b45af343272585a",
+      "outcome_count": 6,
+      "overlay_sha256": "fcff565138e53ca76ab6718a6e7bb375367a08be6fbf40da85cf3e7ea63fd050",
+      "protocol": {
+        "count": 3,
+        "environment": {
+          "CONNECT_WINDOW_SDK_PRIME": "1"
+        },
+        "test_regex": "^TestWindowPathSdkProviderDuplex(Probe|UnpacedControl)$"
+      },
+      "reading_count": 15
+    },
+    {
+      "binary_sha256": "44f2494979433ec9b40322ff5ab18fd0fb4226700ba03918a2ac69c73e1f6005",
+      "build_manifest_file": "v11-primer.manifest.json",
+      "build_manifest_sha256": "439dc2762c57e720f906e66805dea133b12efa191460f77008f96fd0877a893a",
+      "complete": true,
+      "effective_input_sha256": "e6ca6848daf6c6259bd87b9113d21a4608be754231845a29f811789833e074e8",
+      "id": "final-late",
+      "inputs_stable_during_build": true,
+      "note": "All-arm primer diagnostics retain the original phase, reference and gates.",
+      "original_log_sha256": "2ec418c67271051c33b0026cd89408c742554e6700f75e2d1adcf439ec75cb4e",
+      "outcome_count": 6,
+      "overlay_sha256": "fcff565138e53ca76ab6718a6e7bb375367a08be6fbf40da85cf3e7ea63fd050",
+      "protocol": {
+        "count": 3,
+        "environment": {
+          "CONNECT_WINDOW_SDK_PRIME": "1",
+          "CONNECT_WINDOW_SDK_PRIME_DELAY_NS": "2000000"
+        },
+        "test_regex": "^TestWindowPathSdkProviderDuplex(Probe|UnpacedControl)$"
+      },
+      "reading_count": 15
+    }
+  ],
+  "schema": "throughput-fix-2/sdk-feedback-cycle-v11-evidence-provenance-v1",
+  "status": "unlanded; bounded summary roots and declared existing controls pass; new long-path control remains failing on v10 and v11"
+}

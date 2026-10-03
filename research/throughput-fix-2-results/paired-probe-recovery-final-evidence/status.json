@@ -1,0 +1,107 @@
+{
+  "archive_result": "complete_pinned_isolated_paired_probe_evidence",
+  "by_run": [
+    {
+      "binary_sha256": "410d8d592d9adc94b101711f29df25c8aba6fa8cf9559b2f44cb2097aa748d3e",
+      "build_manifest_sha256": "185ad049b7788232080a36c71eca3b56dc0c64f167fd7f8a3cf150f560e2639b",
+      "classification": "failure-before",
+      "compile_exit_code": 0,
+      "counts": {
+        "FAIL": 6,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "effective_source_sha256": "cf14c1e59ddbcbbb6c1c61d607da97226af5fb05ba8067d6ff6f3cf98b1f780b",
+      "inputs_stable_during_build": true,
+      "name": "before-root-race",
+      "note": "Initial loop proves cumulative-head stale retry and too-early no-reply retry. Failing the first synctest stops later loop cases; selective failure-before is supplied separately below.",
+      "overlay_sha256": "d1aac1e65bc73b8309e5b9840ac204070406ec7f30a66d12a7f7e1c8b0b4665b",
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "f782d1f891b87a7da2129f6cc083d6516a32107d6ffc3d4ef9d39797f66acfac",
+      "reading_count": 3
+    },
+    {
+      "binary_sha256": "b90b344d81175ba58d31e9cd640c7b9bc4f72fae4d6ec115874c18a6dfaa35dd",
+      "build_manifest_sha256": "fdb8ee544628891b018c53efd2aeaf991e6d8c1e56ce9bf562b66ec513bac299",
+      "classification": "root-after",
+      "compile_exit_code": 0,
+      "counts": {
+        "FAIL": 0,
+        "PASS": 6,
+        "SKIP": 0
+      },
+      "effective_source_sha256": "acc7a9150f1a9099d0e20b079fe27ca179cc89999d077ebf85df952571c58623",
+      "inputs_stable_during_build": true,
+      "name": "after-root-race",
+      "note": "Initial head/SACK and default/600ms finite deadline cases all pass.",
+      "overlay_sha256": "503f85aebe3e350d90f27e516eeecf50aa58b960c01986e90231aa42c573d93b",
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "4d0e7e35d5ab83413112ce4842afc23bc7954653564694566d4896ebc64ebc28",
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "9b2dcf21000088786ad64098f448cf4164bef77d7959a038bd9606f6562cd893",
+      "build_manifest_sha256": "f5872f4523f3078fd1fe291f05abea3deda9f0a4019f7fce8da15f13596aa1b6",
+      "classification": "failure-before",
+      "compile_exit_code": 0,
+      "counts": {
+        "FAIL": 6,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "effective_source_sha256": "6f6420f611d4c4ab2ccdc23fdeb72d0090abe7b20c753fc223bcad06b97ab347",
+      "inputs_stable_during_build": true,
+      "name": "before-v2-root-race",
+      "note": "Separate cumulative-head and selective roots each fail three times; both make two same-message physical copies and cannot obtain an unambiguous timing sample.",
+      "overlay_sha256": "5c5f25b61ecb0271399f7d5497f73380d45c4f00394714f5dfd57635a21e1692",
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "04422841f72dcc6d3edc396510f32b2bd2c17892c85b130addeba18f14e5fcd4",
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "41b28a687dff496daaaa37317ef399c53d892ad6c5afe97b5b77adee536b0d8a",
+      "build_manifest_sha256": "6f86d16d97c2a6ed5c3934ab301b7ef6e53632c7d164f2c48fc7a608ce653ff3",
+      "classification": "focused-after",
+      "compile_exit_code": 0,
+      "counts": {
+        "FAIL": 0,
+        "PASS": 150,
+        "SKIP": 0
+      },
+      "effective_source_sha256": "fd405cd1c74bf8b53ff4eaf4652beda982edb07ae3641ed395acae2e33c94765",
+      "inputs_stable_during_build": true,
+      "name": "after-v2-focused-race",
+      "note": "Eight metadata-active worker and bound tests plus legacy recovery and receiver timing controls, 50 tests repeated three times.",
+      "overlay_sha256": "0eb4ca6be26910381dcace2d760ed1f269cbc50d2d7cbb1e05d78e4a0d004e48",
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "c392ee79f20eccee5ec419812bcc4bf2af5423372c993da17eac46e47dc3116d",
+      "reading_count": 6
+    },
+    {
+      "binary_sha256": "45b2461b669aa10c8e43de6f85a5725b4e2fa12f47a5c3f48b0fe02ceee11670",
+      "build_manifest_sha256": "cb70f2a94209a03c9238d0c49e60498f5add0a9ace3dfd658aff82f71924fb06",
+      "classification": "final-focused-after",
+      "compile_exit_code": 0,
+      "counts": {
+        "FAIL": 0,
+        "PASS": 150,
+        "SKIP": 0
+      },
+      "effective_source_sha256": "039532f41274066e9aa4e2156ee823eac9c0e56afa53aa2ae276fdb17657b562",
+      "inputs_stable_during_build": true,
+      "name": "after-v3-focused-race",
+      "note": "Final test comments normalized only. Same 50 tests repeated three times on final handoff source.",
+      "overlay_sha256": "f5bccb2792bd7698dd6a2129d8c3bfd9fd8b0e295dfaca5e732b92092f87f40b",
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "3003f185fceb1afcdbe9c4f8dcca54862662006c628dbf215e274a326fcd20a1",
+      "reading_count": 6
+    }
+  ],
+  "fail": 12,
+  "numerical_readings": 27,
+  "outcomes": 318,
+  "pass": 306,
+  "race_warning_blocks": 0,
+  "runs": 5,
+  "skip": 0
+}

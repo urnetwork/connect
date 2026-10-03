@@ -1,0 +1,10 @@
+=== RUN   TestWindowPacingBurstLimitsAreIndependent
+--- PASS: TestWindowPacingBurstLimitsAreIndependent (0.00s)
+=== RUN   TestWindowPacingBurstEstimateChanges
+--- PASS: TestWindowPacingBurstEstimateChanges (0.00s)
+=== RUN   TestWindowPacingSharedBurstsBoundActualDispatch
+    transfer_window_pacing_wakeup_test.go:82: delay=15ms: actual shared burst=20000 exceeds estimated 10000-byte limit
+--- FAIL: TestWindowPacingSharedBurstsBoundActualDispatch (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.736s

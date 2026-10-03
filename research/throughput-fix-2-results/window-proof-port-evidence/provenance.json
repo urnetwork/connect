@@ -1,0 +1,15 @@
+{
+  "exclusions": [
+    "Raw source copies, overlays, manifests, binaries, and logs remain local.",
+    "No model, host, TCP, SDK, or throughput-acceptance run is implied.",
+    "The before overlay intentionally exposes inert delivery step behavior and is retained as failure-before evidence."
+  ],
+  "full_correctness_provenance": {
+    "count": 1,
+    "race_compiled_binary": true,
+    "run_context": "window-proof-port-full-correctness; concurrent-workload=relay-full-model; no-quiescence-wait",
+    "selector_sha256": "5fd010dc9bc78eb702b1691001c616f1f107f28aabc859f0a47455ccf2d7690d"
+  },
+  "input_stability": "Each compile and execution rechecked the complete effective input inventory. Before/after differ only in the declared transfer.go and transfer_window_pacing.go overlays; the four frozen root files are identical overlay inputs.",
+  "scope": "Frozen before/after port of proved-RTT delivery-history step and latest-evidence comparison; prior-value optimization retained and original service sampler preserved."
+}

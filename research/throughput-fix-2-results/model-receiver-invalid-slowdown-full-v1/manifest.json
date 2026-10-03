@@ -1,0 +1,10 @@
+{
+  "archive": "model-receiver-invalid-slowdown-full-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "0395d6e43a9d648669034e9e8da1036e709f9de249ce0d1fbd58e7d11189a00b",
+    "outcomes.jsonl": "c10480f2175a9c57d4a2dce345a7a0014332389928888243782bc1bfa8c74e7b",
+    "provenance.json": "e95d7e374272897c949b2f54858f8486d3393bec13681e45ffd3cd3f837e50d2",
+    "source-pins.json": "5ac9065993e54c558dd1ce2423dc8361af0ebfe6c34b8edc1468ca6038344227",
+    "status.json": "57dc86f62833c419667bbadc7647eed661b6702794f84baa4ac9603dd1e01be9"
+  }
+}

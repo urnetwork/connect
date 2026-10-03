@@ -1,0 +1,12 @@
+{
+  "archive": "window-cumulative-shared-reserve-root-v3",
+  "payload_sha256": {
+    "ledger.jsonl": "72f1d3b6b88d95d034f9753eb452328255c69b08f0f62e790c9bfbaac923b809",
+    "outcomes.jsonl": "94cf0ee00f6de93605e3e3d165a0a7a513e5ca15ef22173f4388905661187f11",
+    "provenance.json": "bf9e1736cc18f537f5e42756c8bd7af887f160074dc2c6424c63b9aadc7ef613",
+    "root-source.txt": "372e70a86e0a4f49cc51a32ec6fcf31337c5b91c71b6f3ff8946c3325e34b0c4",
+    "source-manifest-before.json": "3ee161e02c5098743092411b63231e8537250852dec276b52afa2719dae8d6a3",
+    "source-pins.json": "c0b53ab86a6c0d60af1a3cbef125fc2785a25abd998ede5ba936926a0f5ca715",
+    "status.json": "07ef4438e2ba7f886210ec4ee3a1ff61204be815e75ee0f69cac4eeea4b862db"
+  }
+}

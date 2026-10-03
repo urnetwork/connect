@@ -1,0 +1,6 @@
+=== RUN   TestWindowPacingBurstMeterOutOfOrderUpdates
+    transfer_window_pacing_wakeup_test.go:48: out-of-order update earned the same elapsed service twice: wait=0s
+--- FAIL: TestWindowPacingBurstMeterOutOfOrderUpdates (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.700s

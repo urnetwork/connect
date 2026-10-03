@@ -1,0 +1,5 @@
+--- FAIL: TestWindowPacingDecreasedEstimateCannotForgiveALateRelease (0.00s)
+    transfer_window_pacing_wakeup_test.go:107: nominal deadline forgave a late physical burst: elapsed=1ns want>=8ms
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.749s

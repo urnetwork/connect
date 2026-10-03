@@ -3,6 +3,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -19,6 +20,162 @@ import (
 	"github.com/pion/transport/v4/vnet"
 	"github.com/pion/webrtc/v4"
 )
+
+// TestWebRtcFastPathFitsIpv6MinimumMtuOnActualWire applies the minimum IPv6
+// MTU to Pion's actual encrypted UDP payload. The filter is enabled only after
+// ICE, DTLS, and carrier warmup finish, so an oversized application fragment
+// is the deterministic alternative to complete-message delivery.
+func TestWebRtcFastPathFitsIpv6MinimumMtuOnActualWire(t *testing.T) {
+	const ipv6MinimumMtuByteCount = 1280
+	const ipv6UdpHeaderByteCount = 40 + 8
+
+	router, err := vnet.NewRouter(&vnet.RouterConfig{
+		CIDR:          "10.3.0.0/24",
+		MinDelay:      time.Millisecond,
+		LoggerFactory: logging.NewDefaultLoggerFactory(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	netA, err := vnet.NewNet(&vnet.NetConfig{StaticIPs: []string{"10.3.0.1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	netB, err := vnet.NewNet(&vnet.NetConfig{StaticIPs: []string{"10.3.0.2"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := router.AddNet(netA); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.AddNet(netB); err != nil {
+		t.Fatal(err)
+	}
+	var enforceMtu atomic.Bool
+	var maximumUdpPayloadByteCount atomic.Uint64
+	oversizedPacket := make(chan int, 1)
+	router.AddChunkFilter(func(chunk vnet.Chunk) bool {
+		source, sourceOk := chunk.SourceAddr().(*net.UDPAddr)
+		destination, destinationOk := chunk.DestinationAddr().(*net.UDPAddr)
+		if !enforceMtu.Load() || !sourceOk || !destinationOk ||
+			!source.IP.Equal(net.ParseIP("10.3.0.1")) ||
+			!destination.IP.Equal(net.ParseIP("10.3.0.2")) {
+			return true
+		}
+		udpPayloadByteCount := len(chunk.UserData())
+		for {
+			maximumByteCount := maximumUdpPayloadByteCount.Load()
+			if uint64(udpPayloadByteCount) <= maximumByteCount ||
+				maximumUdpPayloadByteCount.CompareAndSwap(
+					maximumByteCount,
+					uint64(udpPayloadByteCount),
+				) {
+				break
+			}
+		}
+		outerPacketByteCount := ipv6UdpHeaderByteCount + udpPayloadByteCount
+		if outerPacketByteCount <= ipv6MinimumMtuByteCount {
+			return true
+		}
+		select {
+		case oversizedPacket <- outerPacketByteCount:
+		default:
+		}
+		return false
+	})
+	if err := router.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := router.Stop(); err != nil {
+			t.Errorf("stop router: %v", err)
+		}
+	})
+
+	pair := newP2pFastPathTestPairForStreamWithSettings(
+		t,
+		true,
+		true,
+		NewId(),
+		nil,
+		nil,
+		func(active *WebRtcSettings, passive *WebRtcSettings) {
+			active.Network = netA
+			passive.Network = netB
+		},
+	)
+	activeFast := pair.active.(webRtcFastPathConn)
+	passiveFast := pair.passive.(webRtcFastPathConn)
+	// Bounded by this test's own deadline rather than by a fixed ten seconds.
+	//
+	// Establishment here is ICE, DTLS and SCTP, none of which this row tests:
+	// it tests that a fast-path write fits the minimum IPv6 MTU. A fixed wait
+	// for a step the row does not test is a second deadline competing with the
+	// one the runner set, and under load it expired first, so the row failed in
+	// setup and reported a carrier that did not become ready rather than
+	// anything about MTU. The pair's own context is no help — it is built with
+	// a 45 second timeout, far longer than the wait — so the bound has to come
+	// from the test.
+	//
+	// Derived rather than counted, and named as such: the margin below is a
+	// judgement, not a measurement. It leaves room for the assertion after this
+	// point to run and fail on its own terms rather than being killed by the
+	// runner mid-write.
+	readyTimeout := 10 * time.Second
+	if deadline, ok := t.Deadline(); ok {
+		if remaining := time.Until(deadline) - 5*time.Second; remaining < readyTimeout {
+			readyTimeout = max(remaining, time.Second)
+		}
+	}
+	if !activeFast.WaitFastPathReady(pair.ctx, readyTimeout) ||
+		!passiveFast.WaitFastPathReady(pair.ctx, readyTimeout) {
+		t.Fatalf(
+			"fast carrier did not become ready within %s before MTU enforcement; this row tests the MTU of a fast-path write, so a failure here is establishment rather than the property under test",
+			readyTimeout,
+		)
+	}
+	enforceMtu.Store(true)
+
+	message := bytes.Repeat(
+		[]byte{0xb4},
+		2*p2pFastPathFragmentPayloadByteCount,
+	)
+	fragmentCount, err := activeFast.WriteFastPathMessage(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fragmentCount != 2 {
+		t.Fatalf("fragment count=%d want=2", fragmentCount)
+	}
+	// the same bound as the readiness wait, for the same reason
+	timer := time.NewTimer(readyTimeout)
+	defer timer.Stop()
+	select {
+	case outerPacketByteCount := <-oversizedPacket:
+		t.Fatalf(
+			"fast carrier submitted %d bytes to a %d-byte IPv6 path",
+			outerPacketByteCount,
+			ipv6MinimumMtuByteCount,
+		)
+	case received := <-passiveFast.FastPathMessages():
+		if !bytes.Equal(received.message, message) {
+			MessagePoolReturn(received.message)
+			t.Fatal("MTU-safe fast carrier changed the message")
+		}
+		MessagePoolReturn(received.message)
+	case <-timer.C:
+		t.Fatal("MTU-safe fast carrier message did not arrive")
+	}
+	maximumOuterPacketByteCount := ipv6UdpHeaderByteCount +
+		int(maximumUdpPayloadByteCount.Load())
+	if maximumOuterPacketByteCount != ipv6MinimumMtuByteCount {
+		t.Fatalf(
+			"maximum fast carrier packet=%d want=%d",
+			maximumOuterPacketByteCount,
+			ipv6MinimumMtuByteCount,
+		)
+	}
+}
 
 type sctpPathMeasureConfig struct {
 	oneWayDelay             time.Duration
@@ -52,11 +209,15 @@ type sctpPathMeasureResult struct {
 }
 
 func newVnetWebRtcPeerConnectionFactory(
-	t *testing.T,
+	t testing.TB,
 	network *vnet.Net,
 	settings *WebRtcSettings,
 ) *webRtcPeerConnectionFactory {
 	t.Helper()
+	mediaEngine, err := newWebRtcMediaEngine(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.SetNet(network)
 	settingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
@@ -80,12 +241,15 @@ func newVnetWebRtcPeerConnectionFactory(
 	}
 	api := webrtc.NewAPI(
 		webrtc.WithSettingEngine(settingEngine),
-		webrtc.WithMediaEngine(&webrtc.MediaEngine{}),
+		webrtc.WithMediaEngine(mediaEngine),
 		webrtc.WithInterceptorRegistry(nil),
 	)
 	return &webRtcPeerConnectionFactory{
-		newPeerConnection: func(networkPeer bool) (*webrtc.PeerConnection, error) {
-			return api.NewPeerConnection(webrtc.Configuration{})
+		newPeerConnection: func(
+			networkPeer bool,
+		) (*webrtc.PeerConnection, context.CancelFunc, error) {
+			pc, err := api.NewPeerConnection(webrtc.Configuration{})
+			return pc, func() {}, err
 		},
 	}
 }
@@ -165,8 +329,8 @@ func TestWebRtcIdleResumeSctpBlackholeReconnects(t *testing.T) {
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)
-	managerA := NewWebRtcManager(ctx, signalPipeA, settingsA)
-	managerB := NewWebRtcManager(ctx, signalPipeB, settingsB)
+	managerA := newTestWebRtcManager(t, ctx, signalPipeA, settingsA)
+	managerB := newTestWebRtcManager(t, ctx, signalPipeB, settingsB)
 	managerA.newPeerConnectionFactory = func(
 		*WebRtcSettings,
 		*webrtc.Certificate,

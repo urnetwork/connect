@@ -1,0 +1,6 @@
+{
+  "classification": "Hard caller-isolation fix re-proved against frozen current live source; separate from the experimental receiver-service baseline.",
+  "outcomes": 72,
+  "readings": 0,
+  "worker_readings": 0
+}

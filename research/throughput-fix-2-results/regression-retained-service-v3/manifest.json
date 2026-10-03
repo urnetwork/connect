@@ -1,0 +1,11 @@
+{
+  "archive": "regression-retained-service-v3",
+  "payload_sha256": {
+    "ledger.jsonl": "b8cf9e3866d74689d494b1b59906dd76decc920d47f59e3661477e30ba2ba7a6",
+    "outcomes.jsonl": "4d52cdfd6c8c837387558da7cd4be86d35c0ee222ef478c893aa3c679045d5ff",
+    "provenance.json": "352c203fce5a2d44263c27fc26566b6e37ed7ef2f0748e8911209ae2d79fd38c",
+    "source-pins.json": "485b63188b33c4dea048e925b6ba8e4db48361e2c7858abbd61e57d1e6dc66a8",
+    "status.json": "44d0bdf364903e2b324fa379567dbc5a4f76002e2892ec0c1e7df601fdde32b7",
+    "worker-readings.jsonl": "572b3d109e24d6290f1931d8ae8764d790d92259e1c0a0785a76bf5f0272efc3"
+  }
+}

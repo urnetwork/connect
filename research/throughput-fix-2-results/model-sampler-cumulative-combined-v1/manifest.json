@@ -1,0 +1,10 @@
+{
+  "archive": "model-sampler-cumulative-combined-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "600776480b713fa6b1e883a99c817b16e44732d3e95bdb23989bc2c424ce2eb6",
+    "outcomes.jsonl": "39d45f203e81ff41b9dbf8fbbe1dd590d9d93d114351338a7a5737a4167319dc",
+    "provenance.json": "ddc9b1d2cd0191115c68fcc72a849ebe55cf8815ae0eb438ee16f2a14e37ac89",
+    "source-pins.json": "8d94fb28731b20af310c972b5f13aa1291d6c130cf56699bb0b19312b0c67542",
+    "status.json": "e093b6134ca9bad70e437e984ceb4738f50f86346c791356a434356fce082cf3"
+  }
+}

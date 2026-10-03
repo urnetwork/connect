@@ -1,0 +1,348 @@
+{
+  "all_archived_normalized_outcomes": {
+    "FAIL": 64,
+    "PASS": 325,
+    "SKIP": 0,
+    "race_warning_blocks": 1,
+    "service_readings": 12
+  },
+  "all_archived_normalized_outcomes_after_append": {
+    "FAIL": 65,
+    "PASS": 325,
+    "SKIP": 0,
+    "race_warning_blocks": 1,
+    "service_readings": 12
+  },
+  "append_only_terminal_silent_lane": {
+    "archive_status": "append_only_open_failure_not_causal_proof",
+    "assertion": "message 1335 was not admitted",
+    "binary_sha256": "eab3791cd355e836e0e8bc68a1218a196c85c765fcbc32a8b7c18cf9dbfba890",
+    "effective_source_sha256": "c313ca4cd42aa70edf930b82eef4ecd1a9857f6ff1718b9709c8c2e1bf75f53c",
+    "elapsed_seconds": 77.02,
+    "exclusions": [
+      "No raw logs, source, binaries, overlays, synthetic identities or packet data in sanitized archive.",
+      "This one run does not establish a deterministic mechanism or a fixed regression."
+    ],
+    "handoff_sha256": "8eddec854d1e0e18fb71a7505263c388d057cf0bd158c7a60076a2c1e4ff9bee",
+    "manifest_sha256": "78d163d9080e011446d3e5635e847126318d332c939b4d846dcbfb329bddbf20",
+    "outcome": "FAIL",
+    "prior_full_regression_failure": "message 1438 was not admitted on frozen fffee019",
+    "race_warning_blocks": 0,
+    "raw_log_sha256": "99d0a991c1865939c0395485f0a5445bbab0edb6e35b541b7359747cedde5a0e",
+    "scope": "One previously requested bounded candidate silent-lane run; no rerun. This remains an open regression and is independent of the retry-clock root.",
+    "test": "TestSilentLaneLongerThanTheProbeCadenceStillDrains"
+  },
+  "archive_result": "complete_pinned_recovery_v3_review_evidence_not_performance_acceptance",
+  "by_log": [
+    {
+      "classification": "failure-before-real-worker",
+      "excluded_from_passing_evidence": false,
+      "name": "stale-sibling-before.log",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "a552ac664d6f08e7a9ef1a9814d979a37df9f77472f5a79d8b253a38bf9006ab",
+      "scope": "initial real-worker failure before",
+      "service_readings": 0
+    },
+    {
+      "classification": "failure-before-original-roots",
+      "excluded_from_passing_evidence": false,
+      "name": "recovery-roots-before.log",
+      "outcomes": {
+        "FAIL": 6,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "247c82f49b54a818609e555ba647c1cbb2b907ff7073fd638c6700ceefe853ac",
+      "scope": "original first-physical and sibling roots before",
+      "service_readings": 0
+    },
+    {
+      "classification": "intermediate-anchor-only",
+      "excluded_from_passing_evidence": false,
+      "name": "anchor-only-roots.log",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "41cbc22d7875b13e4feb41e6bec30a76763fc722e37288a194237ce5d4545e7d",
+      "scope": "first-clock fix alone; sibling remains failing",
+      "service_readings": 0
+    },
+    {
+      "classification": "failure-before-heap-adjacency",
+      "excluded_from_passing_evidence": false,
+      "name": "heap-anchor-before.log",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "12c1e1c66e3848109d229a593883ec8e9735ed5f9cce11e376c0b329d0bdd581",
+      "scope": "anchor-only heap adjacency before",
+      "service_readings": 0
+    },
+    {
+      "classification": "rejected-broad-rto-fixture",
+      "excluded_from_passing_evidence": false,
+      "name": "shared-raw-v1-focused.log",
+      "outcomes": {
+        "FAIL": 12,
+        "PASS": 78,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "f5c5669fbbe98143575617b96ba3ebb30b763ded76e6193172bcb3e2ec611475",
+      "scope": "rejected broad RTO: twelve old fixture failures retained",
+      "service_readings": 0
+    },
+    {
+      "classification": "rejected-broad-rto-actual-sack-root",
+      "excluded_from_passing_evidence": false,
+      "name": "shared-raw-v1-loss.log",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "c3d7cd9679bc7f73e25b9e615822e54641b37fab2bfec7966908dc0c38f3f017",
+      "scope": "rejected broad RTO: actual one-SACK proof fails",
+      "service_readings": 0
+    },
+    {
+      "classification": "excluded-race-contaminated-fixture",
+      "excluded_from_passing_evidence": true,
+      "name": "shared-raw-v2-roots-first-shape.log",
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 11,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 1,
+      "raw_log_sha256": "879522be768d6f997764fa8c183066a14ba32aebf3c836bde28591f12f430943",
+      "scope": "intermediate fixture read race; not an accepted check",
+      "service_readings": 0
+    },
+    {
+      "classification": "intermediate-race-clean-corrected-fixture",
+      "excluded_from_passing_evidence": false,
+      "name": "shared-raw-v2-roots.log",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 12,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "49b300a2d3689cdd7450643c977816a71219c130ab51215d103c31f2a4144177",
+      "scope": "race-clean corrected actual-SACK fixture",
+      "service_readings": 0
+    },
+    {
+      "classification": "intermediate-fixed-deadline-controls",
+      "excluded_from_passing_evidence": false,
+      "name": "shared-raw-v3-roots.log",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 18,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "590438df9beb1d084ccb9a3490fa3a76750c10e49d0895b662479a0e9abb06d4",
+      "scope": "fixed-deadline root and lifetime controls",
+      "service_readings": 0
+    },
+    {
+      "classification": "intermediate-positive-controls-before-negative-checks",
+      "excluded_from_passing_evidence": false,
+      "name": "shared-raw-v3-credit-focused.log",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 99,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "8d264e21ea358e0015f87ffb2ef5e7f9d8ded602b5608182b6b56a1adf78e35c",
+      "scope": "positive clock controls before adding explicit negative checks",
+      "service_readings": 0
+    },
+    {
+      "classification": "final-shaped-failure-before",
+      "excluded_from_passing_evidence": false,
+      "name": "credit-roots-final-before.log",
+      "outcomes": {
+        "FAIL": 27,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "b3f05645b5fc6063d586b10bbf2c770be94c5def7a72f8e7dce9b50214fa91de",
+      "scope": "final-shaped roots/clock controls before production correction",
+      "service_readings": 0
+    },
+    {
+      "classification": "final-race-selection",
+      "excluded_from_passing_evidence": false,
+      "name": "shared-raw-v3-credit-final.log",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 99,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "94a2ad2bf6f2339675ae478271c0627b68c20d2b394dead43396fe3c89aa52d0",
+      "scope": "final race selection with both sides of physical deadline",
+      "service_readings": 0
+    },
+    {
+      "classification": "historical-bounded-not-full-regression",
+      "excluded_from_passing_evidence": false,
+      "name": "historical-before.log",
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 1,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "cfbeff31ac8e35432c317e21735de8417713691ce67a23cd3635325e613fae40",
+      "scope": "one bounded historical run; full-regression failures remain open",
+      "service_readings": 0
+    },
+    {
+      "classification": "excluded-instrumented-oracle-long",
+      "excluded_from_passing_evidence": true,
+      "name": "oracle-diagnostic-long.log",
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "7c13aa3d76b913383264542b70b68e678408e52d08bf4ef35ffd9f6a52c541ee",
+      "scope": "instrumented oracle; perturbation prevents quantitative attribution to earlier run",
+      "service_readings": 2
+    },
+    {
+      "classification": "excluded-o-n-arrival-credit-long",
+      "excluded_from_passing_evidence": true,
+      "name": "arrival-credit-long.log",
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "a88f0d23e35a90c980132b6203f63c20aae02e6a171d2d2243198294fc537e59",
+      "scope": "old O(n) diagnostic credit control; superseded by bounded integrated credit",
+      "service_readings": 2
+    },
+    {
+      "classification": "excluded-known-service-oracle-anchor-only",
+      "excluded_from_passing_evidence": true,
+      "name": "anchor-only-oracle-long.log",
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "7b30f5a0ee41b1b6423eab49c4372f548d7c44ad56c92e46e5a5816651fc6054",
+      "scope": "known-service oracle with first-clock fix only",
+      "service_readings": 2
+    },
+    {
+      "classification": "excluded-known-service-oracle-rejected-rto",
+      "excluded_from_passing_evidence": true,
+      "name": "shared-raw-v1-oracle-long.log",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 1,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "0127b6106981b26cec55910bbef5fc4c7c655ec86e7b0e26b5ffd9a5ad2edd47",
+      "scope": "known-service oracle on rejected broad-RTO policy",
+      "service_readings": 2
+    },
+    {
+      "classification": "integrated-credit-long-failure-before-recovery",
+      "excluded_from_passing_evidence": false,
+      "name": "credit-before-long.log",
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "f209cb3808445b91cb898785e321a731b60209fa4cf4d87b8776b711e452f8fb",
+      "scope": "integrated measured credit; original long gate fails",
+      "service_readings": 2
+    },
+    {
+      "classification": "integrated-credit-plus-recovery-long-failure",
+      "excluded_from_passing_evidence": false,
+      "name": "shared-raw-v3-credit-long.log",
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "8ecfbb64411da5a0d74b073712b2a89478fe9fbe5a31e8431bb369d06bd69f80",
+      "scope": "integrated measured credit plus safe recovery; original long gate fails",
+      "service_readings": 2
+    }
+  ],
+  "excluded_diagnostic_outcomes": {
+    "FAIL": 4,
+    "PASS": 12,
+    "SKIP": 0,
+    "service_readings": 8
+  },
+  "final_expected_outcomes": {
+    "before_selection": {
+      "fail": 27,
+      "pass": 3,
+      "race_blocks": 0
+    },
+    "race_selection": {
+      "fail": 0,
+      "pass": 99,
+      "race_blocks": 0
+    },
+    "rejected_broad_rto_actual_loss_root": {
+      "fail": 3,
+      "pass": 0,
+      "race_blocks": 0
+    }
+  },
+  "long_gate": {
+    "after_cumulative_timeout_writes": 137,
+    "after_intervals_mbps": [
+      4.34176,
+      7.53664,
+      7.22944
+    ],
+    "after_mbps": 6.36928,
+    "after_total_drops": 0,
+    "before_cumulative_timeout_writes": 457,
+    "before_mbps": 4.13696,
+    "before_total_drops": 0,
+    "reference_mbps": 95.77130666666667,
+    "result": "FAIL; all original average, per-flow, per-interval and drop gates retained"
+  },
+  "nonexcluded_review_outcomes": {
+    "FAIL": 60,
+    "PASS": 313,
+    "SKIP": 0,
+    "service_readings": 4
+  }
+}

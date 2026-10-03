@@ -1,0 +1,27 @@
+{
+  "counts": {
+    "fail": 28,
+    "outcomes": 2278,
+    "pass": 2250,
+    "race_warnings": 8,
+    "readings": 102,
+    "runs": 19,
+    "skip": 0
+  },
+  "files": {
+    "outcomes.jsonl": "9897335c2f56d54619540e05d57f31a46a92cc01bd78414ffad66863ed3224fd",
+    "provenance.json": "64f50d38f130d97f878a2aa47550b30c09973aaf2c34420f446e4ed1d0d220a8",
+    "readings.jsonl": "144d2f92b969e3f23d95dd5442bc30b79786d2629ee76bb63f55def8d2d6c86a",
+    "summary.json": "c1f1f4bebdba2c82a6b2b65b75c78b486611954fda607d5981e55844c8e82e7d"
+  },
+  "input_handoff_sha256": "35616dba1bf68360dcab239d03b62ff4a6e5c28de0d1ab98f9cdaaae06ad9ccb",
+  "redaction": {
+    "generated_ids": "excluded",
+    "local_paths": "excluded",
+    "normalized_terminal_outcomes_and_full_numerical_readings": "retained",
+    "raw_logs_and_trace_text": "excluded",
+    "source_overlay_and_binary_contents": "excluded"
+  },
+  "schema": "throughput-fix-2/long-drain-v2-recovery-manifest-v1",
+  "verification": "verified frozen handoff, prior handoff, corrected root, all additional/production source hashes, and every completed run log/overlay/build manifest; each declared binary and overlay pin matches its verified build manifest"
+}

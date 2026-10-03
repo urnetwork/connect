@@ -1,0 +1,156 @@
+{
+  "attribution_limits": [
+    "All effective inputs frozen from v11 diagnostics before separate ACK-credit API refactor and path duplex fixture correction.",
+    "Configured-cap counterfactual is global60s only, not actual custom AckTimeout plumbing.",
+    "Long-path model remains failing; neither configured root nor successful-drain trace closes throughput gate.",
+    "Trace logs contain generated test IDs and local paths; archive only normalized numeric rows/outcomes and hashes.",
+    "Earlier invalid setup/cleanup fixtures remain in /tmp and are explicitly excluded as causal proof."
+  ],
+  "candidate": "long-drain-roots-before",
+  "input_handoff_file": "failure-before-handoff.json",
+  "input_handoff_sha256": "8b7ecf1583c820999855a7ddcbba9d7078be361c9216c324dfdbecf5a9f3acad",
+  "runs": [
+    {
+      "binary_sha256": "80c9f01746245ba5a537719553b0fefa39ceeddb41de86984123a1941c09b792",
+      "build_manifest_file": "before-v2.manifest.json",
+      "build_manifest_sha256": "22eca9b90362e01d98da43977493d47df9967c9f7161c02f78e5311334de21ed",
+      "complete": true,
+      "effective_input_sha256": "1ac0cbd274f884456312b4992a5645d5ee829e9ab82312ba37733b2920dcc3d5",
+      "id": "tail-drain-before",
+      "inputs_stable_during_build": true,
+      "note": "Unchanged v11 one-second expiry; valid direct pacing/FIFO root.",
+      "original_log_sha256": "dd85539b40024026021f98ea7d6057cd7f26b6aaa8f05a0330bfe7ecd5ac161b",
+      "outcome_count": 3,
+      "overlay_sha256": "aacfa91a4bd54358bcadff4fda7dd834c7dbd4ef3dd6d4fd3629659589b59fb7",
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "db0fda8bff056719fe22c5dd5b2c7be568a478dfc185c285c1ad6eacc323ddc1",
+      "build_manifest_file": "configured-roots-before.manifest.json",
+      "build_manifest_sha256": "9c33c50210b9ea87b80e894dd28ba872b103be453d497d4115750803d7e9e96f",
+      "complete": true,
+      "effective_input_sha256": "7311eb1e8219f2897c89a9b46f69d42aa32336cd6b542ad6a924c452b538712b",
+      "id": "configured-drain-roots-before",
+      "inputs_stable_during_build": true,
+      "note": "Unchanged v11, real configured service: one-second cap and mixed old-short/current-long residence.",
+      "original_log_sha256": "b07ba3a01da87594317d36183ee7c9f4f7b07e81ed39ec24b0d7216f26723ece",
+      "outcome_count": 6,
+      "overlay_sha256": "9b248fc47cb99628125b7581242d10b2ab3960103ca34a55547ef26ddda3aa25",
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "17e8870f33d9be9b866565bc43ee76c8420c70e6dd8ab89de6491f5f268ac128",
+      "build_manifest_file": "configured-roots-cap.manifest.json",
+      "build_manifest_sha256": "ce3f34a5a39603f591af0f05dd23eb8c8837ba780c21a6c5b4cec61796d877e8",
+      "complete": true,
+      "effective_input_sha256": "b481cce09b52bd0da8aef27c253f84cf63b43c0c3efca38baa578b4c8eb8ff5e",
+      "id": "configured-cap-only-counterfactual",
+      "inputs_stable_during_build": false,
+      "note": "Only global cap changed to default60s. First root passes, mixed-mean root still fails; not proposed configurable implementation.",
+      "original_log_sha256": "83cb52b324dce8a8eb88193fbfa14b5b374b159ee7b68b253a53076e81eb451a",
+      "outcome_count": 6,
+      "overlay_sha256": "b1a43ce4ace0a58d01d30b46fdf14ff24d87f545a0bb66b2991492f3ecea5c2c",
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "afed6781440f7854271b4319db18c86e88bc73ccc99dbf5f30557cced22e2623",
+      "build_manifest_file": "configured-roots-latest.manifest.json",
+      "build_manifest_sha256": "d0d3de574dbbe8aa1fe2fb4418cc1595db081423fd80e94621377e5800603846",
+      "complete": true,
+      "effective_input_sha256": "a956a3b41422318176ef6c72aa772f0fc5adcac8295aceaad16b212b3a6fbcf7",
+      "id": "configured-latest-counterfactual",
+      "inputs_stable_during_build": false,
+      "note": "Global60s cap and latest physical residence. Both forced roots pass; not full long-path fix.",
+      "original_log_sha256": "57188bb2ca9b20310306047c9ea30f5ad0b5914b56d552b80c3f06adbb219ba8",
+      "outcome_count": 6,
+      "overlay_sha256": "c4786f3d21d6128ff70851ede7293a079df4bc4623146e5f18729ef92e210881",
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "d0b2c7f3b53ccd8e4d5b7f91e0a67cecc984c3e338210786235f335d08fc8740",
+      "build_manifest_file": "probe-retry-worker-before.manifest.json",
+      "build_manifest_sha256": "98ce5e413a8bd3634ad552b0dcd49acaaea9255fd38e1ca70f872eea0e8da7d3",
+      "complete": true,
+      "effective_input_sha256": "e453230a7190e2f259b82d24bab9d2b5b646f9e480bc80cbc2a2602b84112a47",
+      "id": "probe-retry-worker-before",
+      "inputs_stable_during_build": true,
+      "note": "Actual send worker: successful drain; same probe retried before1.2s reply; ambiguous ACK correctly rejected.",
+      "original_log_sha256": "8d638b73e49a388ee47eaa5f98a24bd680898ff960b0fa2540e566ba549a78e5",
+      "outcome_count": 3,
+      "overlay_sha256": "d6c71b94efd7fc56a4db18d8c88327bad7a760e4bd6476042dd03d00c106ecd0",
+      "reading_count": 0
+    },
+    {
+      "binary_sha256": "4e9cbce2529744aa628f1e9da09a636bc2637709f71d42c4acf8c90fb263fb06",
+      "build_manifest_file": "ack-lifetime-cap.manifest.json",
+      "build_manifest_sha256": "be1e4aa33e66608dc66f87100c2a32b5612013596867dc2c839cf61b3776e3a4",
+      "complete": true,
+      "effective_input_sha256": "2e32f5f5778a359a752e6cb75b6c9da08efdd18f48dcc564f4f0f73ca5ffe8f0",
+      "id": "cap-only-model-counterfactual",
+      "inputs_stable_during_build": true,
+      "note": "Forced expiry root and400ms control pass; all three1.2s model gates fail.",
+      "original_log_sha256": "cbcdecd7d4c0031446b24b9e1be6723e8f9328dc855861dcb001c4439588b307",
+      "outcome_count": 9,
+      "overlay_sha256": "c913a76b2b639bf40e4dae4eaa01992db295b38b452702da0a3f3fbcd17717ae",
+      "reading_count": 12
+    },
+    {
+      "binary_sha256": "e8df5f639fed2aa0302e20a466d5d0f1cd6414f15ef7a1598473e9af7ad17320",
+      "build_manifest_file": "latest-residence.manifest.json",
+      "build_manifest_sha256": "807861abcac59a3df067acca4b4bb46a37ef5411d690863ae38fe1a1f422e6bd",
+      "complete": true,
+      "effective_input_sha256": "01b124c7bb7a54b9afa0af0abc83fbe8aa12d276932203c7bf744c8f8f1adc50",
+      "id": "latest-residence-model-counterfactual",
+      "inputs_stable_during_build": true,
+      "note": "Forced expiry root and400ms control pass; all three1.2s model gates fail.",
+      "original_log_sha256": "3e677c10a7cb1fd2eaf33abb57f4cc66f0232619597e6953f857cc4bb2ac77a4",
+      "outcome_count": 9,
+      "overlay_sha256": "9aa3065ec1e851e1d32ccb666c9f3bf77d2fb0c558131a18d78cd572aec7110a",
+      "reading_count": 12
+    },
+    {
+      "binary_sha256": "99af4f7428352a7f76f18c6714b8607437c23803856895e2612647f5f63a7603",
+      "build_manifest_file": "latest-residence-trace.manifest.json",
+      "build_manifest_sha256": "89c905e3566da1866b7411495ec5558cd5e0f76589fff5054d7648da9928815e",
+      "complete": true,
+      "effective_input_sha256": "5241790fdc0fee21b3b299026f2c5da39fb7bbae7e16ce8d4ba10522d628e514",
+      "id": "latest-residence-trace",
+      "inputs_stable_during_build": true,
+      "note": "Existing-operation logging only; phase may change, causal inference requires forced worker root.",
+      "original_log_sha256": "531f10ff35cc476713eae55d0dc6b503f7bd7e974f17f460c1d4adedbbabd52c",
+      "outcome_count": 1,
+      "overlay_sha256": "4120a26c0a74b8f1f9e4b9db5ad741f09a82232dd0f5962401fa641f40559b05",
+      "reading_count": 2
+    },
+    {
+      "binary_sha256": "ddc8d7b48d9c2b622b053d0a587274343067f6bbb2cdce7b62e2a7b39d455ed6",
+      "build_manifest_file": "retry-boundary.manifest.json",
+      "build_manifest_sha256": "fdadc1865597954ad6435ae7224d59e6eda892d6abb6ba1d9ebc80c2e8f2b634",
+      "complete": true,
+      "effective_input_sha256": "136aedd68e53c5544691a8428eafa441f319f923375a8ce3a059f15866a9c0d1",
+      "id": "same-message-retry-trace",
+      "inputs_stable_during_build": true,
+      "note": "Logs exact same probe and retry message number. Diagnostic phase only; not separate fix proof.",
+      "original_log_sha256": "0a1c0bf4e568e3e8632ae07dfb4c3a71b76ff8cfc814f9d16ce91cd2b1f289cd",
+      "outcome_count": 1,
+      "overlay_sha256": "1ed14595b0d111ebe9cbdaffb48eedafdc256759c46eb6b4d90776942851c079",
+      "reading_count": 2
+    }
+  ],
+  "schema": "throughput-fix-2/long-drain-root-failure-before-evidence-provenance-v1",
+  "status": "immutable failure-before and diagnostic counterfactual evidence; candidate unlanded",
+  "tests": [
+    {
+      "sha256": "9f7d4c8193ce62be49a14a753e15ef10c4871595b8871ce329f6d1e5200ff27c",
+      "test_file": "observed-flight-v2_test.go"
+    },
+    {
+      "sha256": "22649482a319afcf5447b31dcaac701b6cdd9bafe1bda09c26c62ba75479fd9a",
+      "test_file": "configured-long-flight_test.go"
+    },
+    {
+      "sha256": "06e5ace70d25cdbc6d4be5aaa08097cb787d918ce6872903eff92753791ea280",
+      "test_file": "probe-retry-worker_test.go"
+    }
+  ]
+}

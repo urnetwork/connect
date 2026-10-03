@@ -1,0 +1,13 @@
+{
+  "files": {
+    "inventory.json": "cd14ddd0c5156feab26d529e39f9ad80f43f682a2bc1989e99b9d023d56d7f6b",
+    "summary.json": "b47c4751f487d7d92b14b0105ec8a62c147693e5da6257dc1022375c14137d57"
+  },
+  "redaction": {
+    "local_paths": "not recorded",
+    "raw_logs": "not applicable",
+    "source_contents": "not copied"
+  },
+  "schema": "throughput-fix-2/ack-metadata-compatibility-inventory-manifest-v1",
+  "verification": "runner patterns and cited source files were read without compilation or test execution"
+}

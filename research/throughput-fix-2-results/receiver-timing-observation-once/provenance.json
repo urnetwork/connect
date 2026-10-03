@@ -1,0 +1,93 @@
+{
+  "archive_kind": "receiver_timing_observation_once",
+  "handoff": {
+    "name": "handoff.json",
+    "scope": "Four explicit retry-order variants fail each of 3 executions before; 24 timing tests x3 pass after under race. First-case-only diagnostic retained separately. No throughput claim.",
+    "sha256": "aa9db71cbc5e83b62e9248aa3cbc47f66898c85b7f2898754dd1dff543657b4c"
+  },
+  "runs": {
+    "after": {
+      "binary_sha256": "ecad417ef932ac690ec2116aca9fad490ccb4144f52922fda4f028fdf79acec9",
+      "host_load_average_at_start": [
+        11.86279296875,
+        12.05908203125,
+        11.29296875
+      ],
+      "input_sha256": "5feabb253dd26c36227da9c12a55644e5b6761b42ba4a498e97566629d922e7b",
+      "manifest_sha256": "23eadfc21cf6ee87654d08d194a920e81b4776f8b9527a0facc42da5d68169b9",
+      "original_log_sha256": "8d2d565a1aa328570852089f0068af0ffb3f82c6d6ea6850064d1b6baee21194",
+      "test_exit_status": 0
+    },
+    "before": {
+      "binary_sha256": "41243050583f8b5771880baf0c08a1c2dc2dbd15729fb0a80a942ab6fb923d19",
+      "host_load_average_at_start": [
+        15.1318359375,
+        12.52001953125,
+        11.3681640625
+      ],
+      "input_sha256": "aeb43b4f37cff441f7ce2fedbe4c0612396b68976379ba3bc53a619bd2bda553",
+      "manifest_sha256": "228f50ee76274e8af3960c9436c8836c578190899ead52e8b7f63563acf3eeda",
+      "original_log_sha256": "ce7da9fe974f2ab62766b2170ce0de909d7286f6401c31395392a9b5cf5ddf37",
+      "test_exit_status": 1
+    },
+    "first_case_diagnostic": {
+      "binary_sha256": "66fe6a983ad2eb73e23adb352d6dd6ce961347874170cbe95f4005e634f28e13",
+      "host_load_average_at_start": [
+        10.96142578125,
+        10.94921875,
+        10.7265625
+      ],
+      "input_sha256": "ccde28efd705ca451f5632462bdb19c48ae847ebbf6cf43c221c4b360d18a6e0",
+      "manifest_sha256": "f06448e4e333fab2e2cc8f741de7c48e63a3ce9ea4d90c021f363e718e4a6c97",
+      "original_log_sha256": "b7bec5820e328799ffba85a2d8027f8ccd61f8befaecc7901e66ad355b3a8678",
+      "test_exit_status": 1
+    }
+  },
+  "sanitization": {
+    "local_paths_generated_ids_network_addresses": "removed from archive text",
+    "raw_logs": "retained locally and represented only by SHA-256 pins",
+    "source_overlays_binaries": "not copied and represented only by SHA-256 pins"
+  },
+  "schema_version": 1,
+  "scope_limits": {
+    "first_case_diagnostic": "Retained separately because it exercises only before-retry. It is incomplete relative to the four-variant deterministic before root and is not used as the authoritative causal result.",
+    "performance_claim": "none",
+    "shared_integration": "Root integrated a guarded helper and test; this archive does not validate later combined candidates.",
+    "throughput_acceptance": "not evaluated"
+  },
+  "source_boundary": {
+    "after_source_inventory_file_count": 810,
+    "after_source_inventory_sha256": "5feabb253dd26c36227da9c12a55644e5b6761b42ba4a498e97566629d922e7b",
+    "base_source_sha256": "733ee2d256f26567abc67f4fc78882e27991ff5d37fece308e8aa9478fa16358",
+    "before_source_inventory_file_count": 810,
+    "before_source_inventory_sha256": "aeb43b4f37cff441f7ce2fedbe4c0612396b68976379ba3bc53a619bd2bda553",
+    "candidate_and_guard_pins": [
+      {
+        "candidate_sha256": "6452ec1af4e9bbf6218fea6fef3623e4143c9914a82b5bfc6fadbc0834d61fbf",
+        "guard_sha256": "2473d14f3b9e11c3f758293f6d3c343e17131207b584cb040b42c55e7e3279cc",
+        "target": "transfer_sender_ack_timing.go"
+      },
+      {
+        "candidate_sha256": "2a604e9b79561be726ecf3b4a65dd9f69d9406b2d91d734af1d8bc8d258f9b1c",
+        "guard_sha256": null,
+        "target": "transfer_sender_ack_timing_retry_test.go"
+      }
+    ],
+    "first_case_diagnostic_inventory_file_count": 810,
+    "first_case_diagnostic_inventory_sha256": "ccde28efd705ca451f5632462bdb19c48ae847ebbf6cf43c221c4b360d18a6e0",
+    "scope": "Copied immutable model snapshot; exact one-shot receiver timing observation root only; no performance claim."
+  },
+  "verification": {
+    "after_snapshot_matches_after_inventory": true,
+    "all_binary_and_log_pins_verified": true,
+    "all_outcomes_parsed_from_pinned_logs": true,
+    "before_inventory_reconstructed_from_retained_after_snapshot_and_guard": true,
+    "first_case_diagnostic_difference_from_after": [
+      "transfer_sender_ack_timing.go",
+      "transfer_sender_ack_timing_retry_test.go"
+    ],
+    "first_case_diagnostic_inventory_self_hash_valid": true,
+    "race_warning_count": 0,
+    "verified_pin_count": 13
+  }
+}

@@ -1,0 +1,24 @@
+--- a/transfer_window_pacing.go
++++ b/transfer_window_pacing.go
+@@ -1015,9 +1015,20 @@
+ func (self *windowPacingService) measure(horizon time.Duration, now time.Time, retain bool) (ByteCount, ByteCount, ByteCount) {
+ 	self.stateLock.Lock()
+ 	defer self.stateLock.Unlock()
++	return self.measureWithLock(horizon, now, retain, true)
++}
++
++// Receiver timing may preserve or reduce service; an upward revision requires
++// sender feedback too, so a compressed local read cannot enlarge the burst alone.
++func (self *windowPacingService) measureWithLock(horizon time.Duration, now time.Time, retain, allowReceiver bool) (ByteCount, ByteCount, ByteCount) {
+ 	timing := self.roundTripEvidenceWithLock(now)
+ 	intervalForDiagnostic := max(deliverySizedWindowSampleInterval, self.bucketInterval)
+-	if rate, latest, available := ingressCounterDiagnosticEstimate(self, min(horizon, max(4*intervalForDiagnostic, timing.residence+2*intervalForDiagnostic)), now); available {
++	if rate, latest, available := ingressCounterDiagnosticEstimate(self, min(horizon, max(4*intervalForDiagnostic, timing.residence+2*intervalForDiagnostic)), now); available && allowReceiver {
++		if max(rate, latest) > self.serviceHoldRate {
++			senderRate, _, senderLatest := self.measureWithLock(horizon, now, false, false)
++			ceiling := max(self.serviceHoldRate, senderRate, senderLatest)
++			rate, latest = min(rate, ceiling), min(latest, ceiling)
++		}
+ 		if retain {
+ 			self.serviceHoldRate = max(rate, latest)
+ 			if self.roundTripProbe.resetService {

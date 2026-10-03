@@ -3,6 +3,7 @@
 package connect
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/pion/datachannel"
@@ -30,8 +31,11 @@ func newWebRtcPeerConnectionFactory(
 		// The js/wasm SettingEngine cannot size the SCTP receive window, so the
 		// network-peer window (Fix 1) is a no-op here; accept and ignore the flag
 		// to satisfy the shared factory signature.
-		newPeerConnection: func(networkPeer bool) (*webrtc.PeerConnection, error) {
-			return api.NewPeerConnection(configuration)
+		newPeerConnection: func(
+			networkPeer bool,
+		) (*webrtc.PeerConnection, context.CancelFunc, error) {
+			pc, err := api.NewPeerConnection(configuration)
+			return pc, func() {}, err
 		},
 	}, certificate, nil
 }

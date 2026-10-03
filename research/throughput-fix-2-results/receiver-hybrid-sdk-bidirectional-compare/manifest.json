@@ -1,0 +1,13 @@
+{
+  "archive_kind": "receiver_hybrid_sdk_bidirectional_comparison",
+  "file_count": 6,
+  "file_sha256": {
+    "comparisons.jsonl": "f42660ca7eb646bb49f5d481b72ea2c8c8619e9f325b4e6c0f002e759b7bae20",
+    "failure-observations.jsonl": "4ff731bd159e4d654be4cfb37e72426379b90b5c557e5e0308d9c96d61329beb",
+    "outcomes.jsonl": "202278f6181fad5c4289f7e86358b75429cf76f38379d00d943dadcd01206709",
+    "provenance.json": "526d82f2a41140d005a3be12481fe80ae9845d6f9128b48fb211eec0d2ac3d7b",
+    "service-readings.jsonl": "8052ad448f5d570a0e015d17db6a5ab4c01760d3620469e88ed994540cca7912",
+    "status.json": "af61c71df135b2a6a55ac0b98ce08b8ee62cf5841c425aefc2c85cbc1f3ed8c4"
+  },
+  "schema_version": 1
+}

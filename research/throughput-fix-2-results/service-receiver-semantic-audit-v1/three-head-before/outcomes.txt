@@ -1,0 +1,31 @@
+=== RUN   TestWindowPacingReceiverLateSiblingCompletesColdSerialization
+--- FAIL: TestWindowPacingReceiverLateSiblingCompletesColdSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedColdSiblingsKeepSerialization
+--- PASS: TestWindowPacingReceiverOrderedColdSiblingsKeepSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverLateSiblingCompletesEpochSerialization
+--- FAIL: TestWindowPacingReceiverLateSiblingCompletesEpochSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverLateSiblingFindsSlowEpochSerialization
+--- FAIL: TestWindowPacingReceiverLateSiblingFindsSlowEpochSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedEpochSiblingsKeepSerialization
+--- PASS: TestWindowPacingReceiverOrderedEpochSiblingsKeepSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverLateSiblingCompletesColdSerialization
+--- FAIL: TestWindowPacingReceiverLateSiblingCompletesColdSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedColdSiblingsKeepSerialization
+--- PASS: TestWindowPacingReceiverOrderedColdSiblingsKeepSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverLateSiblingCompletesEpochSerialization
+--- FAIL: TestWindowPacingReceiverLateSiblingCompletesEpochSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverLateSiblingFindsSlowEpochSerialization
+--- FAIL: TestWindowPacingReceiverLateSiblingFindsSlowEpochSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedEpochSiblingsKeepSerialization
+--- PASS: TestWindowPacingReceiverOrderedEpochSiblingsKeepSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverLateSiblingCompletesColdSerialization
+--- FAIL: TestWindowPacingReceiverLateSiblingCompletesColdSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedColdSiblingsKeepSerialization
+--- PASS: TestWindowPacingReceiverOrderedColdSiblingsKeepSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverLateSiblingCompletesEpochSerialization
+--- FAIL: TestWindowPacingReceiverLateSiblingCompletesEpochSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverLateSiblingFindsSlowEpochSerialization
+--- FAIL: TestWindowPacingReceiverLateSiblingFindsSlowEpochSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverOrderedEpochSiblingsKeepSerialization
+--- PASS: TestWindowPacingReceiverOrderedEpochSiblingsKeepSerialization (0.00s)
+FAIL

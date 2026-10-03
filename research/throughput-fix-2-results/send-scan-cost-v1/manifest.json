@@ -1,0 +1,8 @@
+{
+  "archive": "send-scan-cost-v1",
+  "payload_sha256": {
+    "provenance.json": "aea402e19765796978e2194fffd0fa9e8a628d7581cc5aba6076ff042f8e3562",
+    "readings.jsonl": "aeb1bbde2c1f1547b3030837a1a0a4b9ceedf188d2aee282bca0bca7e5c7ff7a",
+    "source-pins.json": "1ac0686d9781e63ef8f6cec2ceb71ac37983b542ad218d565d6ae3a890d477e0"
+  }
+}

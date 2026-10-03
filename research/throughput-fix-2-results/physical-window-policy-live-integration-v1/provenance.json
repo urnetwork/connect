@@ -1,0 +1,44 @@
+{
+  "absent_duplex_fixture_adopted": false,
+  "auxiliary_check": {
+    "command": "bash -n tools/throughput-fix-2.sh",
+    "evidence": "test_monitor_medium completion report relayed by parent; no separate raw syntax-check artifact supplied",
+    "result": "passed"
+  },
+  "calibration_gates_changed": false,
+  "comparison": "One frozen live source and race binary after the reviewed caller-isolation fix and fixture-only policy gate were integrated. This validates integration; causal before/after proofs are separate archives.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "limits": "No physical throughput acceptance and no acceptance of the optional owned-ACK optimization follows from these deterministic integration checks.",
+  "optional_ack_policy_included": false,
+  "outcomes": "Combined count1: 16P0F (8 caller, 8 policy). Policy-only count3: 24P0F. Total40 outcomes:32 policy,8 caller;16 distinct roots. No race warnings.",
+  "physical_rerun_performed": false,
+  "prior_live_caller_fix_preserved": true,
+  "production_changes_during_policy_integration": [],
+  "race": true,
+  "receiver_service_research_adopted": false,
+  "refusal_gates_changed": false,
+  "related_archives": {
+    "caller_live_causal": "caller-cancellation-live-integration-v1",
+    "policy_causal": "physical-window-policy-gate-contract-v1"
+  },
+  "relevant_source_sha256": {
+    "ip.go": "ffca0558cdd626e73c7af0756effaa3c239837196f33f8630d940e1b7ae8ac23",
+    "tools/throughput-fix-2.sh": "82243913e3d56510a4e55cb009cd6e53072593694c1fd53d7f911d18b2b3bc49",
+    "transfer.go": "929fcf839be50ec9c6d7375cdf591d986cb9bce9939cab1820de83d2281a4fd5",
+    "transfer_forward_pack_context_owner_test.go": "334bf28d4ac9a3b409228fb45527756b9dc39fea16be63ad51a4cd5792edeeee",
+    "transfer_pack_context_owner_test.go": "1e26149d5c1a7ca7f3cf1052b65c41a2b268fe2aa498ef86937c83d4deae9ddb",
+    "transfer_window_h1_physical_test.go": "9408a137e443f4704d688319d06292aee1294480e6e44a64f6a48dd35d277015",
+    "transfer_window_h1_policy_contract_test.go": "1e25f8f00b0e803a793e15af69043a08484304535256e5d9011f6f8d75004177",
+    "transfer_window_h1_policy_gate_test.go": "8679c34cce3f776d11c6bacec7badea56e502cbf447e2cd706ed13625b92646c",
+    "transfer_window_pacing.go": "345b06a0f1fa96dcf6135f1451c371e162ec295e7b8cabe090e0f247d1fe92b5"
+  },
+  "scope": "Actual constructor and destination sequence mode, effective scale, memory budget and delivery-ring ownership determine the policy gate; transient Sized/ServiceSized/retained-capacity diagnostics remain independent.",
+  "source_base": {
+    "artifact": "throughput-fix-2-live-policy-caller-v1",
+    "snapshot_inputs_sha256": "d3f0a1fcdbce485e9d6f3ac0d46da22a4765ad2639201ef65f606b8e808c3f65"
+  },
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "throughput_gates_changed": false,
+  "unchanged_live_sampler": true,
+  "warmups_and_stimuli_changed": false
+}

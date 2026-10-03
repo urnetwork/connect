@@ -1,0 +1,10 @@
+{
+  "archive": "model-receiver-ordering-combined-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "40b56dda19863d9b4c49cc8ae5082427235dcac4eaa8f00552d8f4444e75a7eb",
+    "outcomes.jsonl": "312f9903a2a0f246a328b90904dd4f80b4ebfe76da0a3f410cfc22e87b837dc4",
+    "provenance.json": "f020dfc3038c4ad20553d6cdb0a27399175ac56d047295a156ec51e460ec4cb3",
+    "source-pins.json": "fbd40c8f4b8346722118b5fc23b68f2172f2a781604a6adf4d0424f89d5aee91",
+    "status.json": "f5af1c0650583fe51bf791d25d5bd2037aca2161098cf5a18f22927819e7682b"
+  }
+}

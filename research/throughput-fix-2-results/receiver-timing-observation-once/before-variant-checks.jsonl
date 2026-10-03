@@ -1,0 +1,12 @@
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"before-retry"}
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"confirmed-retry"}
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"failed-retry"}
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"unreliable-retry"}
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"before-retry"}
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"confirmed-retry"}
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"failed-retry"}
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"unreliable-retry"}
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"before-retry"}
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"confirmed-retry"}
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"failed-retry"}
+{"after_age":"0s","after_count":2,"after_mean":"15ms","after_min":"10ms","before_age":"0s","before_count":1,"before_mean":"10ms","before_min":"10ms","run_id":"before","variant":"unreliable-retry"}

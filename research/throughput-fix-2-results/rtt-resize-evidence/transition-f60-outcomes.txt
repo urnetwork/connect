@@ -1,0 +1,4 @@
+=== RUN   TestWindowPathServiceSettledLargeMessageCapacityChanges
+--- FAIL: TestWindowPathServiceSettledLargeMessageCapacityChanges (0.07s)
+FAIL
+FAIL	github.com/urnetwork/connect	1.354s

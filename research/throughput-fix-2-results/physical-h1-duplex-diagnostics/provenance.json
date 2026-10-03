@@ -1,0 +1,129 @@
+{
+  "base_connect_canonical_source_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+  "copied_snapshot_git_head": "1bf11158c107b978a21eca5c9df0ad1ecf613985",
+  "copied_snapshot_git_head_interpretation": "Git metadata from the copied snapshot; it is not an effective diagnostic source pin. The base canonical source and each stage's effective diagnostic source hash are listed separately.",
+  "current_production_fidelity_audit": {
+    "audited_current_commit_short": "01ce6a6b",
+    "comparison_scope": "710 tracked Go files in the current checkout compared with the frozen copied source",
+    "missing_file_count": 0,
+    "expected_test_only_difference": {
+      "current_checkout_sha256": "f6b89c1adaeaba9de463b6e42af0276d69ace98ff37e4c41037ea7dc9ac12231",
+      "frozen_isolated_snapshot_sha256": "bc7b10c6690c60bf0b6a7d583668caeb45a7c8e0f99b3f7ec7f0ac5080729fae",
+      "file": "transfer_window_h1_physical_test.go"
+    },
+    "tracked_go_file_difference_count": 1,
+    "production_source_matches_base_b6_after_excluding_expected_test_only_difference": true,
+    "summary": "The only differing tracked Go file is the isolated physical-H1 test fixture; the added duplex fixture is isolated and untracked. This distinguishes current b6 production identity from inherited copied-snapshot Git metadata."
+  },
+  "constructor_resolution": "all settings constructed before workers and globals restored: captured sdk-provider-h1 under32MiB process/24MiB owner;captured connect-process-default under384MiB with DeviceTarget absent;server carrier and gVisor use process384MiB defaults,not zero private owner;provider NAT and RemoteUserNatProvider target DeviceTarget/5",
+  "fidelity_limits": [
+    "Each stage manifest pins a distinct immutable diagnostic source snapshot, binary, and raw-log hash; all record source stability during build and after run.",
+    "The handoff reports no shared-source change, but the diagnostic stage source hashes differ from the base canonical source because test-only isolated inputs were used.",
+    "Each stage manifest records one external local replacement; its path and content are deliberately excluded from this sanitized archive.",
+    "Only hashes of raw logs, source snapshots, manifests, overlays, and binaries are retained."
+  ],
+  "final_provider_wiring": "one LocalUserNat,one RemoteUserNatProvider ingress consumer and keyed return pair,one read-only provider lane observer,one server TUN receive consumer;no duplicated data delivery;fixed-port gonet.DialTCPWithBind uses same stack/endpoint implementation but bypasses literal Tun.DialContext race wrapper",
+  "gates": "per-direction and aggregate candidate >=90% matchedreference;A/A drift<=10%;both references>=90% constrainedwindow/feedbackbound and nominal1Gb/s retainedas separatecalibration gate;zero handoff,NAT,provider,TUNdrops;everyflowprogress;onecarrierconnection;8KiBcap;512message/2MiB relaybound;all poolsbalanced",
+  "guard_shared_physical_file_sha256": "f6b89c1adaeaba9de463b6e42af0276d69ace98ff37e4c41037ea7dc9ac12231",
+  "lifecycle": "workload context cancelled first;close origin sockets/listener,actualProvider,NAT,TUN;join all socket pairs and workloadworkers,NATchildren;close/join PlatformTransports and Clients,relayworkers and strategies;all carrier,Transfer and4MiB replay budgets balanced0;messagepool guard no violations",
+  "observations": "directcallback allreferences0;actualdispatcher firstreference539.159/471.976Mb then delivery0/0 and finalreference0/0;each finalarm has52B regenerable TCPcontrol return-send refusals and gVisor outbound drops,zero Transfer/H1 drops;not a pacing causality claim",
+  "pairing": "source ports20000+37*flow;normal production IP scheduling keys and keyed NAT returns;the same generated TUN address reused and verified;actual measured flow/lane masks retained;insufficient/mismatched steady mapping censors pair",
+  "redaction": "No commands, local paths, raw logs, source contents, overlay contents, binaries, or diagnostics are copied.",
+  "retention": "The frozen handoff and raw logs, source snapshots, overlays, manifests, and binaries remain outside this sanitized archive. This archive retains their identifying hashes and normalized evidence only.",
+  "schema": "throughput-fix-2/physical-h1-duplex-diagnostics-provenance-v1",
+  "scope": "owned TLS/WebSocket PlatformTransport H1, finite1Gb/s serializer in each direction,300us addedRTT,8 full-duplex TCP connections sharing per-connection control state;userspace gVisor, owned loopback kernel origin;no native TUN or actual authenticated server/connect/DB tier;Transfer encryption and provider security off",
+  "shared_source_changed": false,
+  "source_files_sha256": {
+    "transfer_window_h1_duplex_test.go": "c4754456f27ee4f9eea9ea4050b9b3ad5141158188313c46b11fa270e0f71918",
+    "transfer_window_h1_physical_test.go": "bc7b10c6690c60bf0b6a7d583668caeb45a7c8e0f99b3f7ec7f0ac5080729fae",
+    "transfer_window_tcp_performance_test.go": "3e5e2aab599e5d59139d47eb8d7fd1659edf9f32acde4cfd4b4727cc055a33db"
+  },
+  "source_handoff_sha256": "a981745cc3868200a658649dc007100ec8994bfc25787db0d863fbfff684d52e",
+  "source_handoff_status": "diagnostic/censored; no accepted paired throughput conclusion",
+  "stages": [
+    {
+      "binary_sha256": "7ef488ec949ebd15466e3ad72f6976e37b8d5f1656596eb9b5f59e4a1e7870b1",
+      "compile_exit": 0,
+      "external_local_replacement_count": 1,
+      "copied_snapshot_git_head": "1bf11158c107b978a21eca5c9df0ad1ecf613985",
+      "id": "initial-nil-pack-pool-interruption",
+      "load_after": [
+        11.76513671875,
+        11.94873046875,
+        13.19189453125
+      ],
+      "load_before": [
+        11.2197265625,
+        11.861328125,
+        13.19921875
+      ],
+      "manifest_sha256": "fc07f34c45a77c5ec6000ce858fc64ff15aad7c01e38a73ae23c9593415e4f5e",
+      "provider_mode": "initial-nil-pack-pool-failure",
+      "raw_log_sha256": "f0f99f8ef30f22e0068f6bd827ccfb4f0f5da15aa30bd97e9138476b23302857",
+      "reported_comparison_count": 0,
+      "reported_reading_count": 0,
+      "snapshot_file_count": 781,
+      "effective_diagnostic_source_sha256": "ffaf334b667667968c4e6fdce2e8b4fbafa4a9e81f61a2e7ef735310adc271a9",
+      "source_stage_id": "initial-nil-pack-pool-failure",
+      "sources_stable_after_run": true,
+      "sources_stable_during_build": true,
+      "test_exit": 2
+    },
+    {
+      "binary_sha256": "b8d42aa22ab64f90ce4d27c56ff0f7aff6848055c9688570613f54ff31086de2",
+      "compile_exit": 0,
+      "external_local_replacement_count": 1,
+      "copied_snapshot_git_head": "1bf11158c107b978a21eca5c9df0ad1ecf613985",
+      "id": "direct-callback-calibration-censored",
+      "load_after": [
+        11.54345703125,
+        11.83056640625,
+        13.03173828125
+      ],
+      "load_before": [
+        10.05615234375,
+        11.54638671875,
+        12.9970703125
+      ],
+      "manifest_sha256": "aaf8b9f574c79715400db3d203bd1a5417e932c404b80f4fd004e63712dec655",
+      "provider_mode": "direct-callback-calibration-failure",
+      "raw_log_sha256": "fe052237dbb611e206478d1e77fd6e51930777222dff0a9e8c92d5d4efaf2b66",
+      "reported_comparison_count": 1,
+      "reported_reading_count": 3,
+      "snapshot_file_count": 781,
+      "effective_diagnostic_source_sha256": "65d3ee7abd5a6e911668014ddc1a44e5fd0fb86d6dc896c7fe5c1e0dadc64eea",
+      "source_stage_id": "direct-callback-calibration-failure",
+      "sources_stable_after_run": true,
+      "sources_stable_during_build": true,
+      "test_exit": 1
+    },
+    {
+      "binary_sha256": "ce597ecf04963ce2ef64ca95b179a5035d7619b6145682ced2db931e5f85509b",
+      "compile_exit": 0,
+      "external_local_replacement_count": 1,
+      "copied_snapshot_git_head": "1bf11158c107b978a21eca5c9df0ad1ecf613985",
+      "id": "actual-provider-dispatcher-censored",
+      "load_after": [
+        11.955078125,
+        12.2587890625,
+        13.029296875
+      ],
+      "load_before": [
+        10.3203125,
+        12.0361328125,
+        12.99169921875
+      ],
+      "manifest_sha256": "7ed08e0f4deae06a4f88cdd6b1e0216f5b281fd0efe177c3aa65f912f28ea522",
+      "provider_mode": "actual-provider-dispatcher",
+      "raw_log_sha256": "c360cd39383472eb847f47366bccf84cc9cc24e6175ec4148492de9085482d97",
+      "reported_comparison_count": 1,
+      "reported_reading_count": 3,
+      "snapshot_file_count": 781,
+      "effective_diagnostic_source_sha256": "fc9e430c0e47e6c7e0339c503477e45de5561c864adde20138b770a5fc209d7c",
+      "source_stage_id": ".",
+      "sources_stable_after_run": true,
+      "sources_stable_during_build": true,
+      "test_exit": 1
+    }
+  ]
+}

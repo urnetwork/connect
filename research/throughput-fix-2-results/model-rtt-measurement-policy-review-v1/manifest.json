@@ -1,0 +1,8 @@
+{
+  "payload_sha256": {
+    "comparison.json": "4e975001d55ec51642ccb44fa720a70d9342955734834caccab269c0f9cce12d",
+    "ledger.jsonl": "7b140f59e9d1d961a4541943ae8d935b6604f5e786da776e49f5b4d55465c235",
+    "provenance.json": "1bdb175f38b369054473b44989996e40f18c73a898e776b96604c3a44759ebed",
+    "source-pins.json": "02198b7f638bd1740ef12a83ca1eb351532805f4ba6d45d8fbf07510dbdcb5bd"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "archive_path_normalization": "External artifact lookup paths are represented by snapshot identifier and relative path. Raw logs and original compile manifests remain unmodified outside the repository; their original hashes are pinned. Race-stack extracts replace only frozen-source and Go-installation path prefixes, preserving line numbers and stack text.",
+  "candidate_patch_sha256": "988baf3b1a04ff26da1dfdb40888e3da9fce183f5b987182e4b5de16bd97b01e",
+  "comparison": "Same frozen combined-v3 core plus identical new test files. After adds only the fresh cumulative rate field/qualification, final pacing calculation, and absent-service fallback helper hunk.",
+  "event_plumbing": false,
+  "performance_gates_changed": false,
+  "race": true,
+  "repetitions": 3,
+  "sampler": "accepted 54b360 retained in both variants",
+  "scope": "Nine explicit-clock roots. Fresh fully-qualified cumulative delivery advances and lowers cold pacing; a single reply, tiny control traffic, missing/stale history and an old permission epoch cannot provide a new rate. Positive slow service and hard target/byte bounds remain authoritative. Carrier attribution is separately tightened and tested in the scope-v2 archive.",
+  "scope_guard_included": false,
+  "source_base": {
+    "snapshot": "model-retained-service-combined-v3",
+    "source_content_sha256": "cdac094ad63473c3edfc4b75df040a183c6f7329c989e2ae83ba215872d52d51"
+  },
+  "test_execution_owner": "test_monitor_medium",
+  "warmup_changed": false
+}

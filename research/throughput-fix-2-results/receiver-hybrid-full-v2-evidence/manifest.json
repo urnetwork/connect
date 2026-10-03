@@ -1,0 +1,10 @@
+{
+  "archive": "receiver-hybrid-full-v2-evidence",
+  "payload_sha256": {
+    "ledger.jsonl": "12791a79363d2858dc28519c14e679483305ac2751925cfb4df7098a6de9c3b7",
+    "outcomes.jsonl": "a443770fa37fb03f1c8f501f780929a67feb5863a88c78ea680664e121905130",
+    "provenance.json": "0f9e3d3a1a15c41394406dcd7c62b59abc74fb2f1323e6ae21bb96ef262fff63",
+    "source-pins.json": "4e0f7dbd8bea0d2ffb3b7ba117efc5634f62da7433b42edf13e872370a57a013",
+    "status.json": "6d25d4ecdeaf50257778f72eacc679de8c8dd634bf3316e8eacbee45c62402d0"
+  }
+}

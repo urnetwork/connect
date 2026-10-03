@@ -1,0 +1,34 @@
+{
+  "archive_kind": "paired_probe_recovery_final_evidence",
+  "attribution_limits": [
+    "This root starts after a successful physical drain and protects exactly the resumed probe. It does not prove or fix old-tail retry behavior while the drain is still in progress.",
+    "Frozen hybrid + common bound full long model remains failed at approximately 12.370 Mb/s, compared with hybrid-before 12.397 Mb/s. Model evidence belongs to pacing agent comparison archive and is not duplicated as a passing control here.",
+    "The production delta removes only the receiver-metadata exception from an existing configured raw-residence protection. It does not change timing schema, retry identity, loss verdicts, MaxResendInterval, AckTimeout, or accepted ambiguity.",
+    "One synthetic prior lane sample is 1 ms; the new exact raw sample is 1.210 s. Therefore the two-sample raw mean is 605.5 ms, independently of adjusted unloaded baseline 1.2 s.",
+    "Initial metadata and old physical flight evidence are set explicitly before the real worker runs. The delayed head/SACK traverses the real SendSequence ACK coalescer and exact retained initial-write lifecycle.",
+    "Normalize numerical readings, outcomes, classifications, and source/build/overlay/log/binary hashes only. Do not archive raw logs, traces, source, overlay files, local paths, identifiers, or binaries.",
+    "This remains an isolated candidate evidence set. It was not a shared-source performance campaign."
+  ],
+  "changes": [
+    "Remove only the live-metadata exclusion from the existing exact confirmed controlled-probe recovery deadline. Raw residence remains pinned at dispatch; metadata presence does not change MaxResendInterval, original AckTimeout, loss verdict, cancellation, or retry ambiguity.",
+    "Actual worker roots force live metadata, an old physical drain, initial write, stale per-lane due timer, then exact head or SACK at 1.210 s with 10 ms receiver delay.",
+    "Metadata-active adjacent controls force proven lane loss, unrelated lane progress, cancellation, short delivery lifetime, finite no-reply retry, exact live identity, repeated evidence, and duration overflow."
+  ],
+  "collection_time_utc": "2026-09-16T09:17:56.543374+00:00",
+  "final_handoff_sha256": "4811b4aa38625b5f097b956ed227629e60561dac51c877b92e6046e341c6b31b",
+  "limits": [
+    "This handoff depends on the separate reviewed hybrid baseline/identity consumer; its guard is the frozen hybrid pacing source, not current shared legacy-only pacing.",
+    "Both head and SACK fail three times before; the correction restores one unambiguous physical sample and keeps raw full residence.",
+    "The same-input long RTT model still fails at about 12.37 Mb/s after the common bound, compared with about 12.40 before. This is not a complete throughput recovery.",
+    "Eight new tests are normal top-level tests. Source/helper and prior fixture diagnostics remain preserved in /tmp; no shared source was modified."
+  ],
+  "redaction_policy": {
+    "ipv4_literals": "redacted if present",
+    "local_paths": "excluded",
+    "raw_logs": "excluded; sha256 pins only",
+    "source_overlay_binary_build_inputs": "excluded; sha256 pins only"
+  },
+  "review_handoff_sha256": "2c4f2dda70982e596291732ce2a94d79762cabfda831091e5927109346446b3e",
+  "schema_version": 1,
+  "status": "Frozen isolated bounded correction. Final V3 focused race run has 150 PASS, zero failures/races. Separate head and SACK failure-before roots fail 6/6. Long-path throughput remains unresolved; no shared source changed."
+}

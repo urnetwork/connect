@@ -1,0 +1,29 @@
+{
+  "archive_result": "complete_pinned_diagnostic_design_evidence",
+  "oracle": {
+    "candidate_interval_mbps": [
+      66.72384,
+      61.02016,
+      89.01632
+    ],
+    "candidate_mbps": 72.25344,
+    "candidate_measured_drops": 0,
+    "candidate_min_flow_mbps": 8.51968,
+    "candidate_timeout_writes_cumulative": 3130,
+    "candidate_total_drops": 0,
+    "gate_unchanged": true,
+    "outcome": "FAIL",
+    "readings": 2,
+    "reference_mbps": 95.77813333333333
+  },
+  "route_ownership": {
+    "outcomes": {
+      "fail": 6,
+      "pass": 3,
+      "total": 9
+    },
+    "production_changes": false,
+    "protocol_implemented": false,
+    "race_warnings": 0
+  }
+}

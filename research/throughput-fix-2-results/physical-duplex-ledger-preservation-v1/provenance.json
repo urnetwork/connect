@@ -1,0 +1,16 @@
+{
+  "after_readings": 4,
+  "before_readings": 0,
+  "binary_sha256": "4c52bda2ad3aaf2eb525b1511dbe2082f99bed1f73515a10aad7c2c2fbccb8b3",
+  "compile_manifest_sha256": "bc70732fcb5fbb4e8b18666e8852b5ccee04ba355f27caae3389e5986a625d9a",
+  "effective_inputs_sha256": "450270bdfcaa4920f9f74663ee30ac0628ae62a1f090443972c26a22eadb5523",
+  "interpretation": "The previous pattern dropped all3duplex arms and their comparison. The new parser preserves calibration/failure reasons and rates. This changes evidence export only and does not make the physical run accepted.",
+  "method": "Replay the original physical-row regex and new shared physical_reading function over the identical complete failed H1 duplex diagnostic log. No host workload rerun.",
+  "parser_sha256": "566ed53eb6762d5daea23b5dac1492d279c25c1e8fbee9b6d52c0ffda1fb9585",
+  "race": false,
+  "raw_log_sha256": "8185a8a51a3d412c56819ff3db687e940c3410956b319bcf17f1e8ca5582c08b",
+  "runner_sha256": "ed7924c660ddf83a5e2074d60a414f36635cca269da019125d9e14ce5ffd0d83",
+  "source_inputs_match_at_archive": true,
+  "unit_tests_sha256": "5338b210965e165cb826a7d17a77b81e3d9c5a509a8081289a3077ce3188c092",
+  "verification": "Terra medium ran6Python unit tests and bash-n; all passed. Existing smoke schema, failed/censored duplex arms and all benchmark metrics are covered."
+}

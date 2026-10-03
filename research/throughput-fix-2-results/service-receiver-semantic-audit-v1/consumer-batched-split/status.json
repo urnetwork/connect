@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "14c7f8bb62a2537ff39f380621e8fb45fefe1a866155622335d5370980a100dd",
+  "binary_sha256": "0fbc6205d1b9e66ed25e07eaee4a9dbd10b9b75b0bf2fad33111ee3fb5307311",
+  "effective_inputs_sha256": "089013d8b206b05fe833a6880797d49b509675fbe0c437dcc735f7cc9ff4e19a",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiver(SustainedPacingEscapesSlowHold|BatchedSplitPacingEscapesSlowHold)$",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied module as build; original absolute relationship is pinned by original status/manifest hashes",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:35:03.772802+00:00",
+  "loadavg_start": [
+    5.95068359375,
+    13.1728515625,
+    15.58984375
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 5.313287583179772,
+  "loadavg_end": [
+    5.87451171875,
+    13.037109375,
+    15.52734375
+  ],
+  "ended_utc": "2026-09-16T20:35:09.086342+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "0e109f6956e757925423f0450999d5fc5b7e7b9b121e5e0ae4d18edd988d303f",
+  "pass": 3,
+  "fail": 3,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "Matched lawful cadence comparison: same opening 40 and largest group 2 times 6,000-byte confirmed H1 heads. Per-refill estimate control passes 3; batch-only estimate fails 3, holding service 1 MB/s and shared pacing 950,000 B/s through 192 and 384 cycles despite qualified own delivery. This is a component read-order/policy defect under prescribed inputs, not closed-loop throughput proof.",
+  "rows": 54
+}

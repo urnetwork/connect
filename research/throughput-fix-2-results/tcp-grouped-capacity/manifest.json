@@ -1,0 +1,58 @@
+{
+  "created_utc": "2026-09-16T03:25:39.221129+00:00",
+  "mode": "tcp",
+  "test_pattern": "^TestWindowTcp(Download|Upload)PerformanceMatrix$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "c5df37705bc466d5d6008bce90655b935662809e",
+    "branch": "throughput-fix-2",
+    "source_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "b4825593f93dea132e1739842c5264f0eefedb0ff634a4aa1958f5fa6c0f590b",
+  "host_load_average_at_start": [
+    10.05615234375,
+    11.54638671875,
+    12.9970703125
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_PATH_SECONDS": "12",
+    "CONNECT_WINDOW_PATH_FLOWS": "1",
+    "CONNECT_WINDOW_TCP_BUFFER_MAX_MIB": "48",
+    "CONNECT_WINDOW_PATH_RTT_US": "100000",
+    "CONNECT_WINDOW_RUN_CONTEXT": "monitor=validation_monitor,run=tcp-grouped-capacity,no_quiescence_wait=true,concurrent=physical-duplex-fixture+astra-sampler-experiments,processes=839,loadavg= 10.06 11.55 13.00 ",
+    "CONNECT_WINDOW_PATH_DIRECTION": "both",
+    "CONNECT_WINDOW_PATH_ACK_MS": "10",
+    "CONNECT_WINDOW_PATH_REPETITIONS": "1",
+    "CONNECT_WINDOW_TCP_MEASURE": "1",
+    "CONNECT_WINDOW_PATH_ARMS": "matched,ceiling,delivery,matched"
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 783,
+        "input_sha256": "11aa02027abf342edc29f3876711e029e92d676102d39cc81a6ee83919df5a9b"
+      }
+    },
+    "external_local_replacements": [
+      "/Users/brien/urnetwork/glog"
+    ],
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "binary_sha256": "d1ff01997e77e4c0e6d629e4c0a1d57976959c37a3a2035fd3581d406bf8c691",
+  "sources_stable_during_build": true,
+  "source_inspection_uses_build_snapshot": true
+}

@@ -1,0 +1,21 @@
+{
+  "archive_kind": "initial_ack_lifetime_review_evidence",
+  "classification": "bounded_diagnostic_no_production_patch",
+  "conclusions": {
+    "initial_success_retime": "No reproduced lifetime bug: current physical400ms/first-recovery700ms/ACK-lifetime500ms retires and fails callback exactly500ms,3/3PASS. Resend loop already schedules separate lifetime wakeup before resendTime comparison. No clamp proposed.",
+    "neighboring_longer_lifetime": "Current physical400ms/first-recovery700ms/ACK-lifetime900ms retries at700ms and fails callback exactly900ms,3/3PASS.",
+    "open_preexisting_pacing_wait": "Pacing600ms with original ACK-lifetime500ms does not retire at500ms and still emits one physical write600ms, then fails callback600ms. Current49d903 and pre-anchor817237 eachFAIL3/3. Initial wait uses sequence context and blocks the worker owning its lifetime scan; this predates the physical recovery anchor and retry re-arm.",
+    "scope_boundary": "No change to retainPastAckTimeout, no per-write context/timer, and no lifetime redesign. The600/500 root remains explicitly open."
+  },
+  "input_handoff_sha256": "57a9c18f979228964e9857eb49f11c9008fd2c30325041ee4ac2a154941625dc",
+  "input_pins_verified": 8,
+  "performance_acceptance": "not evaluated",
+  "sanitization": {
+    "local_paths_network_addresses_and_generated_ids": "excluded",
+    "open_pacing_wait_root": "preserved as an unresolved expected failure, not omitted or relabeled",
+    "raw_sources_logs_binaries_and_overlays": "excluded; SHA-256 pins retained only"
+  },
+  "schema_version": 1,
+  "scope": "Actual initial sender worker, forced serialization reservations, no reply; no production patch. Original comparator changes only transfer.go to the pre-physical-anchor817237 source, retaining the same fixture and other inputs.",
+  "throughput_acceptance": "not evaluated"
+}

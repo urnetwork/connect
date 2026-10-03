@@ -1,0 +1,54 @@
+{
+  "artifact": "sanitized physical-H1 TCP workload fixture evidence",
+  "contents": [
+    {
+      "bytes": 2271,
+      "name": "current-copied-source-race-outcomes.jsonl",
+      "sha256": "43ee1b2b6309dacc9dfb96ca9f7db56e0e9d546125011e190c1fd30532f08f6d"
+    },
+    {
+      "bytes": 1515,
+      "name": "frozen-after-race-outcomes.jsonl",
+      "sha256": "05968d905cbdb6456baf058c83288682041d32b2c269f3c7fb94162367d98789"
+    },
+    {
+      "bytes": 1093,
+      "name": "frozen-before-outcomes.jsonl",
+      "sha256": "c0b1cb366157e9a26086fd5bd400c0df1418a05aa821af0308c8b7aa6a7f4d54"
+    },
+    {
+      "bytes": 6441,
+      "name": "provenance.json",
+      "sha256": "86bd208188c52f3c6d7720b37921e8560c090f7e84174126bb95b68dd6e06b9d"
+    },
+    {
+      "bytes": 3710,
+      "name": "summary.json",
+      "sha256": "a62e1878170cceb133e58424704d7f3696ae07aaec94111d4a07ccb9b3f48c1a"
+    }
+  ],
+  "counts": {
+    "current_copied_source_race_passes": 12,
+    "current_copied_source_race_tests": 4,
+    "current_physical_h1_censored_comparisons": 0,
+    "current_physical_h1_comparisons": 1,
+    "current_physical_h1_failed_comparisons": 0,
+    "current_physical_h1_readings": 3,
+    "frozen_grouped_race_passes": 9,
+    "frozen_initial_raw_batch_expected_failures": 3,
+    "frozen_workload_context_expected_failures": 3,
+    "invalid_reused_snapshot_passes_retained_for_provenance": 12,
+    "setup_attempts_without_compile_or_test": 1
+  },
+  "redaction": "No raw logs, source or overlay contents, binaries, commands, absolute paths, or diagnostics are included. Raw artifacts remain outside this archive and are represented only by hashes and normalized outcomes.",
+  "schema": "throughput-fix-2/physical-h1-fixture-evidence-manifest-v1",
+  "source_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+  "verification": {
+    "all_before_failures_retained": true,
+    "all_frozen_after_race_passes_retained": true,
+    "current_copied_source_race_passes_retained": true,
+    "frozen_handoff_sha256_matches": true,
+    "ordinary_collector_smoke_reference_pinned": true,
+    "redaction_scan_passed": true
+  }
+}

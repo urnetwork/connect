@@ -1,0 +1,6 @@
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowRetainedCampaignAcceptsServiceQualification", "variant": "before"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowRetainedCampaignAcceptsServiceQualification", "variant": "before"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowRetainedCampaignAcceptsServiceQualification", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowRetainedCampaignAcceptsServiceQualification", "variant": "after"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowRetainedCampaignAcceptsServiceQualification", "variant": "after"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowRetainedCampaignAcceptsServiceQualification", "variant": "after"}

@@ -1,0 +1,10 @@
+{
+  "accepted_throughput_readings": 0,
+  "classification": "First-refusal mechanism capture; original A/B/A remains failed and censored. No throughput acceptance or causal throughput attribution.",
+  "mechanism_records": 8,
+  "outcomes": 1,
+  "preserved_physical_arm_readings": 3,
+  "preserved_physical_comparisons": 1,
+  "readings": 0,
+  "worker_readings": 0
+}

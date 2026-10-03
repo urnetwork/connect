@@ -1,0 +1,51 @@
+{
+  "architecture": "arm64",
+  "binary_sha256": "c2a574c64230af7982ef6a576d508fb211d1a4de2f835666bddfa4afe9727272",
+  "build_flags": [
+    "-race=false"
+  ],
+  "connect": {
+    "branch": "throughput-fix-2",
+    "dirty": true,
+    "revision": "f55e5d41a120d26789b60ec0450daa63e6fa43df",
+    "source_sha256": "fffee01996b0d1d75fb8323f3554858b3b9e45ebdd969fb48e3664b714e72741"
+  },
+  "created_utc": "2026-09-16T09:22:36.870443+00:00",
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "paired-probe integrated hybrid root regression; concurrent root original model cells and isolated relay/pacing fixes; no quiescence wait"
+  },
+  "go": "go version go1.26.7 darwin/arm64",
+  "host_load_average_at_start": [
+    16.3251953125,
+    15.60498046875,
+    12.57080078125
+  ],
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "logical_cpus": 10,
+  "mode": "regression",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "package": "./",
+  "run_flags": [
+    "-test.skip",
+    "^TestWindow(Path|CompressionResidence)"
+  ],
+  "runner_sha256": "0e4d12db6b096a41a7d6f6c763c7750daffdfec81ac918d5a2512186d36fde24",
+  "source_inspection_uses_build_snapshot": true,
+  "source_snapshot": {
+    "external_local_replacements": [
+      "external-local-replacement"
+    ],
+    "external_local_replacements_are_not_frozen_inputs": true,
+    "repositories": {
+      "connect": {
+        "file_count": 823,
+        "input_sha256": "e6e7d180a2b64beda6fbdb652f7bcc7b61ab834b1ad8bb5c351770d38d94d81a"
+      }
+    },
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "sources_stable_during_build": true,
+  "test_pattern": "."
+}

@@ -1,0 +1,13 @@
+=== RUN   TestWindowPacingLateQueuedTimingCannotEvictRecentDelivery
+--- FAIL: TestWindowPacingLateQueuedTimingCannotEvictRecentDelivery (0.00s)
+=== RUN   TestWindowPacingOldestRetainedQueuedTimingStillQualifiesDelivery
+--- PASS: TestWindowPacingOldestRetainedQueuedTimingStillQualifiesDelivery (0.00s)
+=== RUN   TestWindowPacingLateQueuedTimingCannotEvictRecentDelivery
+--- FAIL: TestWindowPacingLateQueuedTimingCannotEvictRecentDelivery (0.00s)
+=== RUN   TestWindowPacingOldestRetainedQueuedTimingStillQualifiesDelivery
+--- PASS: TestWindowPacingOldestRetainedQueuedTimingStillQualifiesDelivery (0.00s)
+=== RUN   TestWindowPacingLateQueuedTimingCannotEvictRecentDelivery
+--- FAIL: TestWindowPacingLateQueuedTimingCannotEvictRecentDelivery (0.00s)
+=== RUN   TestWindowPacingOldestRetainedQueuedTimingStillQualifiesDelivery
+--- PASS: TestWindowPacingOldestRetainedQueuedTimingStillQualifiesDelivery (0.00s)
+FAIL

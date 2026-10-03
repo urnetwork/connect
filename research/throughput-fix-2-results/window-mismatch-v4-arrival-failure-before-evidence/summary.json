@@ -1,0 +1,39 @@
+{
+  "accepted_as_performance_validation": false,
+  "archive_limits": [
+    "Contains normalized terminal outcomes, supplied numerical observations, and input hashes only.",
+    "Raw logs, source files, overlays, binaries, commands, and local paths remain outside this archive.",
+    "The v4 candidate is unlanded; this archive is failure-before evidence only."
+  ],
+  "base_source_sha256": "914a2a724a7e0c1a5681301ded65e89447699ca80505772f9a9f454865ef2246",
+  "candidate": "v4-arrival-ordering",
+  "candidate_parent_pacing_sha256": "fb150c9e4493ead750c2c7a9e2438432aecb99dc92274fc35602f869fa505600",
+  "fail_count": 6,
+  "failure_assertion_row_count": 9,
+  "go_test_execution_count": 9,
+  "numerical_observation_count": 3,
+  "pass_count": 3,
+  "schema": "throughput-fix-2/window-mismatch-v4-arrival-summary-v1",
+  "skip_count": 0,
+  "status": "immutable failure-before evidence; v4 candidate unlanded",
+  "tests": [
+    {
+      "failure_assertion_rows_per_execution": 2,
+      "repetitions": 3,
+      "result": "FAIL",
+      "suffix": "ShortFlightEligibilitySurvivesApplicationOrder"
+    },
+    {
+      "failure_assertion_rows_per_execution": 1,
+      "repetitions": 3,
+      "result": "FAIL",
+      "suffix": "CompressionChangeKeepsObservationProvenance"
+    },
+    {
+      "failure_assertion_rows_per_execution": 0,
+      "repetitions": 3,
+      "result": "PASS",
+      "suffix": "ShortFlightRejectsOlderResidence"
+    }
+  ]
+}

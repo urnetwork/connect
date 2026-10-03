@@ -1,0 +1,6 @@
+{
+  "classification": "Matched receiver-clock consumer correction: roots12P18F to30P0F, affected194P6F to200P0F under race. After-only targeted nonrace model6P0F; full model still pending.",
+  "outcomes": 493,
+  "readings": 60,
+  "worker_readings": 20
+}

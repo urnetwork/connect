@@ -3,12 +3,40 @@ package connect
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	mathrand "math/rand"
+	"os"
+	"sync"
 	"testing"
 )
 
+func TestMessagePoolReadAllLimit(t *testing.T) {
+	const limit = 8192
+
+	exact := bytes.Repeat([]byte{0x5a}, limit)
+	message, err := MessagePoolReadAllLimit(bytes.NewReader(exact), limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(message, exact) {
+		t.Fatal("exact-limit message changed")
+	}
+	MessagePoolReturn(message)
+
+	message, err = MessagePoolReadAllLimit(bytes.NewReader(append(exact, 0x01)), limit)
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("oversized message error = %v, want %v", err, ErrMessageTooLarge)
+	}
+	if message != nil {
+		t.Fatal("oversized read returned a buffer")
+	}
+}
+
 func TestMessagePool(t *testing.T) {
+	if messagePoolSnapshotInFreshProcess(t) {
+		return
+	}
 	ResetMessagePoolStats()
 	for n := range 1024 * 8 {
 		if n%32 == 0 {
@@ -45,6 +73,9 @@ func TestMessagePool(t *testing.T) {
 }
 
 func TestMessagePoolShare(t *testing.T) {
+	if messagePoolSnapshotInFreshProcess(t) {
+		return
+	}
 	holdCount := 16
 	holdMessages := make([][][]byte, holdCount)
 
@@ -107,6 +138,222 @@ func TestMessagePoolShare(t *testing.T) {
 	}
 }
 
+func TestMessagePoolPacketOutstandingCountTracksRootOwnershipWithoutAllocating(t *testing.T) {
+	// Force either sign of foreign activity between the two snapshots in the
+	// negative control. The corrected dispatch keeps that owner in its parent.
+	foreignStep := func() func() {
+		mode := os.Getenv(messagePoolSnapshotForeignEnv)
+		if mode == "" {
+			return func() {}
+		}
+		selected := os.Getenv(messagePoolSnapshotRootEnv)
+		if selected != "" && selected != t.Name() || mode != "return" && mode != "take" {
+			t.Fatalf("invalid pool snapshot foreign-owner control %q", mode)
+		}
+		var messages [][]byte
+		if mode == "return" {
+			for range 4 {
+				messages = append(messages, MessagePoolGet(DefaultMtu))
+			}
+		}
+		transition := make(chan struct{})
+		joined := make(chan struct{})
+		var once sync.Once
+		go func() {
+			<-transition
+			if mode == "return" {
+				for _, message := range messages {
+					MessagePoolReturn(message)
+				}
+				messages = nil
+			} else {
+				for range 4 {
+					messages = append(messages, MessagePoolGet(DefaultMtu))
+				}
+			}
+			close(joined)
+		}()
+		step := func() {
+			once.Do(func() { close(transition) })
+			<-joined
+		}
+		t.Cleanup(func() {
+			step()
+			for _, message := range messages {
+				MessagePoolReturn(message)
+			}
+		})
+		return step
+	}()
+	if messagePoolSnapshotInFreshProcess(t) {
+		return
+	}
+	baseline := MessagePoolPacketOutstandingCount()
+	baselineBytes := MessagePoolPacketOutstandingByteCount()
+	foreignStep()
+	message := MessagePoolGet(DefaultMtu)
+	if got := MessagePoolPacketOutstandingCount(); got != baseline+1 {
+		t.Fatalf("packet outstanding after take = %d, want %d", got, baseline+1)
+	}
+	if got := MessagePoolPacketOutstandingByteCount(); got != baselineBytes+packetPoolSize {
+		t.Fatalf("packet outstanding bytes after take = %d, want %d", got, baselineBytes+packetPoolSize)
+	}
+	if got := MessagePoolPacketRootByteCount(message); got != packetPoolSize {
+		t.Fatalf("full packet root bytes = %d, want %d", got, packetPoolSize)
+	}
+
+	MessagePoolShareReadOnly(message)
+	if got := MessagePoolPacketOutstandingCount(); got != baseline+1 {
+		t.Fatalf("packet outstanding after share = %d, want %d", got, baseline+1)
+	}
+	if MessagePoolReturn(message) {
+		t.Fatal("non-final shared return unexpectedly released packet root")
+	}
+	if got := MessagePoolPacketOutstandingCount(); got != baseline+1 {
+		t.Fatalf("packet outstanding after non-final return = %d, want %d", got, baseline+1)
+	}
+	if !MessagePoolReturn(message) {
+		t.Fatal("final shared return did not release packet root")
+	}
+	if got := MessagePoolPacketOutstandingCount(); got != baseline {
+		t.Fatalf("packet outstanding after final return = %d, want %d", got, baseline)
+	}
+	if got := MessagePoolPacketOutstandingByteCount(); got != baselineBytes {
+		t.Fatalf("packet outstanding bytes after final return = %d, want %d", got, baselineBytes)
+	}
+
+	if allocations := testing.AllocsPerRun(100, func() {
+		_ = MessagePoolPacketOutstandingCount()
+		_ = MessagePoolPacketOutstandingByteCount()
+	}); allocations != 0 {
+		t.Fatalf("packet outstanding snapshots allocated %.0f objects, want 0", allocations)
+	}
+}
+
+func TestMessagePoolSmallPacketClassUsesByteSizedRoot(t *testing.T) {
+	if messagePoolSnapshotInFreshProcess(t) {
+		return
+	}
+	baselineCount := MessagePoolPacketOutstandingCount()
+	baselineBytes := MessagePoolPacketOutstandingByteCount()
+	message := MessagePoolGet(80)
+	if got := cap(message); got != smallPacketPoolSize+MessagePoolMetaByteCount {
+		t.Fatalf("small packet capacity = %d, want %d", got, smallPacketPoolSize+MessagePoolMetaByteCount)
+	}
+	if got := MessagePoolPacketOutstandingCount(); got != baselineCount+1 {
+		t.Fatalf("small packet outstanding = %d, want %d", got, baselineCount+1)
+	}
+	if got := MessagePoolPacketOutstandingByteCount(); got != baselineBytes+smallPacketPoolSize {
+		t.Fatalf("small packet outstanding bytes = %d, want %d", got, baselineBytes+smallPacketPoolSize)
+	}
+	if got := MessagePoolPacketRootByteCount(message); got != smallPacketPoolSize {
+		t.Fatalf("small packet root bytes = %d, want %d", got, smallPacketPoolSize)
+	}
+	if !MessagePoolReturn(message) {
+		t.Fatal("small packet did not return to its pool")
+	}
+	if got := MessagePoolPacketOutstandingByteCount(); got != baselineBytes {
+		t.Fatalf("small packet bytes after return = %d, want %d", got, baselineBytes)
+	}
+
+	full := MessagePoolGet(smallPacketPoolSize + 1)
+	defer MessagePoolReturn(full)
+	if got := MessagePoolPacketRootByteCount(full); got != packetPoolSize {
+		t.Fatalf("post-small packet root bytes = %d, want %d", got, packetPoolSize)
+	}
+	if got := MessagePoolPacketRootByteCount(make([]byte, 80)); got != 0 {
+		t.Fatalf("unpooled packet root bytes = %d, want 0", got)
+	}
+}
+
+func TestMessagePoolOutstandingSurvivesDiagnosticReset(t *testing.T) {
+	if !messagePoolTrackPacketOutstanding {
+		t.Skip("fast packet-root tracking is compiled only on mobile")
+	}
+	pool := newMessagePool(smallPacketPoolSize, messagePoolShardCount)
+	message := pool.take(80, 7)
+	pool.resetStats()
+	shard, _ := pool.shardFor(message[:cap(message)])
+	shard.stateLock.Lock()
+	outstanding := shard.outstanding
+	shard.stateLock.Unlock()
+	if outstanding != 1 {
+		t.Fatalf("outstanding after diagnostic reset = %d, want 1", outstanding)
+	}
+	if !pool.release(message[:cap(message)]) {
+		t.Fatal("final return did not release reset-spanning root")
+	}
+	shard.stateLock.Lock()
+	outstanding = shard.outstanding
+	shard.stateLock.Unlock()
+	if outstanding != 0 {
+		t.Fatalf("outstanding after return = %d, want 0", outstanding)
+	}
+}
+
+func TestMessagePoolRootByteCountChargesBackingClass(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		size int
+		want ByteCount
+	}{
+		{name: "small packet", size: 60, want: 256},
+		{name: "full packet", size: 1500, want: 2048},
+		{name: "small frame", size: 3000, want: 4096},
+		{name: "large frame", size: 6000, want: 8192},
+		{name: "unpooled", size: 9000, want: 9000},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			message := MessagePoolGet(testCase.size)
+			if got := MessagePoolRootByteCount(message); got != testCase.want {
+				t.Fatalf("root charge = %d, want %d", got, testCase.want)
+			}
+			MessagePoolReturn(message)
+		})
+	}
+}
+
+func TestMessagePoolDeviceTunEgressClassificationFollowsRootLifetime(t *testing.T) {
+	if messagePoolSnapshotInFreshProcess(t) {
+		return
+	}
+	baseline := MessagePoolDeviceTunEgressOutstandingByteCount()
+	small := MessagePoolGet(80)
+	full := MessagePoolGet(DefaultMtu)
+	if !MessagePoolMarkDeviceTunEgress(small) ||
+		!MessagePoolMarkDeviceTunEgress(full) {
+		t.Fatal("pooled packet roots rejected device TUN classification")
+	}
+	if !MessagePoolMarkDeviceTunEgress(small) {
+		t.Fatal("idempotent device TUN classification failed")
+	}
+	want := baseline + smallPacketPoolSize + packetPoolSize
+	if got := MessagePoolDeviceTunEgressOutstandingByteCount(); got != want {
+		t.Fatalf("device TUN egress bytes = %d, want %d", got, want)
+	}
+
+	MessagePoolShareReadOnly(full)
+	if MessagePoolReturn(full) {
+		t.Fatal("non-final shared return released device TUN root")
+	}
+	if got := MessagePoolDeviceTunEgressOutstandingByteCount(); got != want {
+		t.Fatalf("device TUN bytes after shared return = %d, want %d", got, want)
+	}
+	if !MessagePoolReturn(full) {
+		t.Fatal("final shared return did not release device TUN root")
+	}
+	if got := MessagePoolDeviceTunEgressOutstandingByteCount(); got != baseline+smallPacketPoolSize {
+		t.Fatalf("device TUN bytes after full return = %d", got)
+	}
+	MessagePoolReturn(small)
+	if got := MessagePoolDeviceTunEgressOutstandingByteCount(); got != baseline {
+		t.Fatalf("device TUN bytes after all returns = %d, want %d", got, baseline)
+	}
+	if MessagePoolMarkDeviceTunEgress(make([]byte, 80)) {
+		t.Fatal("unpooled packet accepted device TUN classification")
+	}
+}
+
 func TestBase64(t *testing.T) {
 	for range 128 {
 		n := mathrand.Intn(512)
@@ -119,7 +366,7 @@ func TestBase64(t *testing.T) {
 }
 
 func BenchmarkMessagePoolGetReturn(b *testing.B) {
-	for _, size := range []int{DefaultMtu, 3000, 6000} {
+	for _, size := range []int{80, DefaultMtu, 3000, 6000} {
 		b.Run(fmt.Sprintf("serial/%d", size), func(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(size))
@@ -140,5 +387,29 @@ func BenchmarkMessagePoolGetReturn(b *testing.B) {
 				}
 			})
 		})
+	}
+}
+
+func BenchmarkMessagePoolPacketOutstandingCount(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = MessagePoolPacketOutstandingCount()
+	}
+}
+
+func BenchmarkMessagePoolPacketOutstandingFastSnapshot(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = messagePoolPacketOutstandingSnapshot(true)
+	}
+}
+
+func BenchmarkMessagePoolDeviceTunEgressLifecycle(b *testing.B) {
+	b.ReportAllocs()
+	b.SetBytes(80)
+	for b.Loop() {
+		message := MessagePoolGet(80)
+		MessagePoolMarkDeviceTunEgress(message)
+		MessagePoolReturn(message)
 	}
 }

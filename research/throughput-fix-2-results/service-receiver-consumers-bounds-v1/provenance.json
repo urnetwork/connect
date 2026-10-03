@@ -1,0 +1,11 @@
+{
+  "affected_outcome": "200 actual test outcomes each:194 passes and6 failures before,200 passes after. A selector listed204 names, but4 accepted mixed-feedback test definitions were absent in both copied sources; separate supplementary validation is required.",
+  "comparison": "Both variants include the refined corrected-endpoint bounds helper and identical root/control definitions. Consumer correction is the production delta. The targeted actual model is after-only and is not an isolated model comparison.",
+  "incomplete_root_selector": "The original after selector ran only9 of10 roots (27 passes). Preserved separately as after-incomplete-root-selector; the corrected selector subsequently ran all30 executions.",
+  "interpretation": "Receiver metadata fixes reproduced timing errors across consumers. This isolated candidate does not yet establish complete correctness, full performance or host validation. RTT-growth recovery is associated with the combined consumer patch, not yet one individually isolated consumer.",
+  "no_quiescence_wait": true,
+  "performance_outcome": "Six targeted nonrace performance tests pass on the after binary; the full model is running separately and is not claimed here.",
+  "role": "Centralize receiver-adjusted spans for pending-cycle rates, queued averaging, retained summaries and feedback-cycle boundaries with corrected endpoint bounds held identical in both variants.",
+  "root_outcome": "Ten tests repeated three times: 12 passes and18 failures before,30 passes after. No race warnings.",
+  "source_inputs_after_sha256": "f305b78904edb96ea2367576a7a3e040a5ea66492064bfdadfaea22ad0430550"
+}

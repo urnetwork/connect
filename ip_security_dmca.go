@@ -8,15 +8,16 @@ package connect
 // advances a small state machine over the first payload-bearing packets of each
 // egress flow until it reaches a terminal verdict:
 //
-//   - a privileged destination port (<1024) -> Allow without inspection: peers, DHT, uTP, and
-//     plaintext trackers run on ephemeral/high ports, so a privileged port can't host a p2p hole;
-//     skipping it lets legitimate non-web-standard encrypted services (e.g. Telegram MTProto on
-//     443) through. Peer traffic on high ports is still inspected.
+//   - a privileged destination port (<1024) -> only the stateless BitTorrent signatures
+//     (Incident); otherwise Allow without flow state or the encrypted heuristic, which lets
+//     legitimate non-web-standard encrypted services (e.g. Telegram MTProto on 443) through.
 //   - a positive, plaintext BitTorrent signature  -> Incident (report) + Drop
 //   - an initial payload that looks fully encrypted/random AND is NOT a
-//     whitelisted web standard (TLS, DTLS, QUIC, STUN/TURN) -> Drop
-//   - anything else (plaintext unknown protocol, a web standard, or budget
-//     exhausted without a hit) -> Allow
+//     whitelisted standard (TLS, DTLS, QUIC, STUN/TURN, RTP/RTCP), an
+//     application standard (WireGuard, OpenVPN, RTMP, Levin, RakNet, Ethereum
+//     discovery v4 or RLPx), or an exact provider-scoped gaming endpoint -> Drop
+//   - anything else (plaintext unknown protocol, a sanctioned standard/provider
+//     endpoint, or budget exhausted without a hit) -> Allow
 //
 // Packets are allowed through while the flow is still INSPECTING; enforcement
 // only begins once a terminal verdict is reached. Detection is keyed off the
@@ -25,8 +26,10 @@ package connect
 // Everything here is a clean-room implementation from the public protocol
 // definitions: BitTorrent BEP 3 (peer wire / HTTP tracker), BEP 5 (DHT KRPC),
 // BEP 15 (UDP tracker), BEP 29 (uTP); TLS RFC 8446/5246; DTLS RFC 6347/9147;
-// QUIC RFC 9000/9369; STUN RFC 5389. The byte signatures are protocol facts,
-// not derived from any third-party implementation.
+// QUIC RFC 9000/9369; STUN RFC 8489; TURN RFC 8656; RTP/RTCP RFC 3550 and
+// RFC 7983. The byte signatures are protocol facts, not derived from any
+// third-party implementation. Provider prefix/port facts live separately in
+// ip_security_gaming.go with their first-party sources.
 
 import (
 	"bytes"
@@ -42,6 +45,14 @@ import (
 // number of flow-table shards. Sharding keeps the per-packet table lookup off a
 // single global lock on the hot path.
 const dmcaFlowShards = 16
+
+const (
+	// Two packets sharing the 32-bit SSRC and payload type, with coherent
+	// sequence/timestamp movement, provide far stronger evidence than RFC
+	// 7983's broad first-byte RTP range by itself.
+	rtpValidationPackets = 2
+	rtpMaxSequenceGap    = 64
+)
 
 // DmcaSecurityPolicySettings holds every threshold and decision input for the
 // egress BitTorrent detector, so behavior can be tuned (and later driven by a
@@ -66,9 +77,25 @@ type DmcaSecurityPolicySettings struct {
 
 	// DropUnsanctionedEncrypted enforces on flows whose initial payload looks
 	// fully encrypted/random and are not positively identified as a whitelisted
-	// web standard. This is the heuristic backstop for obfuscated BitTorrent
-	// (MSE/PE over TCP, or encrypted uTP over UDP).
+	// web or communication standard. This is the heuristic backstop for
+	// obfuscated BitTorrent (MSE/PE over TCP, or encrypted uTP over UDP).
 	DropUnsanctionedEncrypted bool
+
+	// Gaming configures provider-scoped gaming exceptions. These are evaluated
+	// after positive BitTorrent signatures but before the encrypted heuristic.
+	// Nil disables all gaming exceptions.
+	Gaming *GamingSecurityPolicySettings
+
+	// App configures the positive application-standard detectors (WireGuard,
+	// OpenVPN, RTMP, Levin, RakNet, Ethereum discovery v4 and RLPx). They are
+	// evaluated after the BitTorrent signatures, the gaming exceptions and the
+	// web standards. Nil disables them.
+	App *AppStandardSettings
+
+	// InspectPrivilegedSignatures checks the stateless BitTorrent signatures on
+	// privileged destination ports (<1024), which are otherwise allowed without
+	// inspection. No flow state and no entropy heuristic run there.
+	InspectPrivilegedSignatures bool
 
 	// InspectionPacketBudget is the max number of payload-bearing packets to
 	// inspect for a flow before giving up and treating it as not-BitTorrent.
@@ -114,6 +141,9 @@ func DefaultDmcaSecurityPolicySettings() *DmcaSecurityPolicySettings {
 		DropBittorrentSignature:       true,
 		ReportBittorrentIncident:      true,
 		DropUnsanctionedEncrypted:     true,
+		Gaming:                        DefaultGamingSecurityPolicySettings(),
+		App:                           DefaultAppStandardSettings(),
+		InspectPrivilegedSignatures:   true,
 		InspectionPacketBudget:        8,
 		EncryptedDecisionPackets:      3,
 		MaxInspectionPayload:          512,
@@ -138,6 +168,14 @@ const (
 	dmcaBittorrent    dmcaVerdict = 3
 )
 
+// dmcaFlowKey separates identical virtual tuples by the authenticated sender
+// at a provider. Device-side policies use the zero id because they have one
+// local owner.
+type dmcaFlowKey struct {
+	senderClientId Id
+	ip6Path        Ip6Path
+}
+
 // dmcaFlowState is the per-flow state machine. It implements UserLimited so the
 // shared applyLruUserLimit eviction can bound memory.
 type dmcaFlowState struct {
@@ -146,8 +184,15 @@ type dmcaFlowState struct {
 	// atomic dmcaVerdict; the terminal-verdict fast path reads this without
 	// taking mu, so steady-state packets on a decided flow are lock-free
 	terminal int32
+	// atomic SecurityPolicyReason for the terminal verdict. Stored before
+	// terminal, so a reader that observes a terminal verdict observes its reason.
+	terminalReason int32
 
-	key Ip6Path
+	key dmcaFlowKey
+	// These identify the TCP generation that created the state. They are set
+	// before publication and remain immutable.
+	synSeen     bool
+	synSequence uint32
 
 	// mu guards the inspection bookkeeping below, touched only while INSPECTING
 	mu               sync.Mutex
@@ -156,6 +201,21 @@ type dmcaFlowState struct {
 	sawObservation   bool
 	sawFlowStart     bool
 	sawPlaintext     bool
+	rtpCandidates    [2]rtpCandidate
+	// a pending two-packet application standard
+	appCandidate appCandidate
+	// the application standard that allowed the flow while it still checks the
+	// BitTorrent signatures for the rest of its budget; unknown when none
+	appReason SecurityPolicyReason
+}
+
+type rtpCandidate struct {
+	ssrc        uint32
+	timestamp   uint32
+	sequence    uint16
+	payloadType uint8
+	packets     uint8
+	used        bool
 }
 
 func (self *dmcaFlowState) LastActivityTime() time.Time {
@@ -166,21 +226,94 @@ func (self *dmcaFlowState) Cancel() {
 	// no async resources; eviction just drops the map entry
 }
 
-func (self *dmcaFlowState) setTerminal(v dmcaVerdict) dmcaVerdict {
+// setTerminal publishes the terminal verdict and its reason. It is called with
+// mu held and returns the verdict as decided by this packet.
+func (self *dmcaFlowState) setTerminal(v dmcaVerdict, reason SecurityPolicyReason) (dmcaVerdict, SecurityPolicyReason, bool) {
+	atomic.StoreInt32(&self.terminalReason, int32(reason))
 	atomic.StoreInt32(&self.terminal, int32(v))
-	return v
+	return v, reason, true
+}
+
+// terminalVerdict is the lock-free read of a decided flow.
+func (self *dmcaFlowState) terminalVerdict() (dmcaVerdict, SecurityPolicyReason) {
+	v := dmcaVerdict(atomic.LoadInt32(&self.terminal))
+	if v == dmcaInspecting {
+		return v, SecurityPolicyReasonInspecting
+	}
+	return v, SecurityPolicyReason(atomic.LoadInt32(&self.terminalReason))
+}
+
+// observeRtp validates continuity for up to two interleaved media sources (for
+// example, audio and video). Out-of-order/duplicate packets do not destroy a
+// promising candidate; an implausibly large forward jump starts probation over.
+func (self *dmcaFlowState) observeRtp(header rtpHeader) bool {
+	replacement := 0
+	hasEmpty := false
+	for i := range self.rtpCandidates {
+		candidate := &self.rtpCandidates[i]
+		if candidate.used && candidate.ssrc == header.ssrc && candidate.payloadType == header.payloadType {
+			delta := uint16(header.sequence - candidate.sequence)
+			switch {
+			case delta == 0:
+				// Duplicate.
+				return false
+			case 0x8000 <= delta:
+				// Older/out-of-order under serial-number arithmetic.
+				return false
+			case rtpMaxSequenceGap < delta || 0x80000000 <= uint32(header.timestamp-candidate.timestamp):
+				// Forward, but not a credible continuation.
+				*candidate = newRtpCandidate(header)
+				return false
+			default:
+				candidate.sequence = header.sequence
+				candidate.timestamp = header.timestamp
+				if candidate.packets < 0xff {
+					candidate.packets++
+				}
+				return rtpValidationPackets <= candidate.packets
+			}
+		}
+
+		if !candidate.used {
+			replacement = i
+			hasEmpty = true
+		} else if !hasEmpty && candidate.packets < self.rtpCandidates[replacement].packets {
+			replacement = i
+		}
+	}
+
+	self.rtpCandidates[replacement] = newRtpCandidate(header)
+	return false
+}
+
+func newRtpCandidate(header rtpHeader) rtpCandidate {
+	return rtpCandidate{
+		ssrc:        header.ssrc,
+		timestamp:   header.timestamp,
+		sequence:    header.sequence,
+		payloadType: header.payloadType,
+		packets:     1,
+		used:        true,
+	}
 }
 
 // advance moves the state machine forward by one packet and returns the current
+// verdict, the reason for it, and whether this packet reached the terminal
 // verdict. The payload is read synchronously and never retained, so the shared
 // packet buffer is not aliased.
-func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *DmcaSecurityPolicySettings, web *webStandardDetector) dmcaVerdict {
+func (self *dmcaFlowState) advance(
+	ipPath *IpPath,
+	payload []byte,
+	settings *DmcaSecurityPolicySettings,
+	web *webStandardDetector,
+	app *appStandardDetector,
+) (dmcaVerdict, SecurityPolicyReason, bool) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
 	// recheck: another goroutine may have decided between the fast-path load and here
-	if v := dmcaVerdict(atomic.LoadInt32(&self.terminal)); v != dmcaInspecting {
-		return v
+	if v, reason := self.terminalVerdict(); v != dmcaInspecting {
+		return v, reason, false
 	}
 
 	if !self.sawObservation {
@@ -197,7 +330,7 @@ func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *Dmc
 
 	// empty payloads (TCP SYN / pure ACK) carry no signal but keep the flow open
 	if 0 == len(payload) {
-		return dmcaInspecting
+		return dmcaInspecting, SecurityPolicyReasonInspecting, false
 	}
 
 	self.inspectedPackets += 1
@@ -208,12 +341,63 @@ func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *Dmc
 	}
 
 	if detectBittorrentSignature(ipPath, b) {
-		return self.setTerminal(dmcaBittorrent)
+		return self.setTerminal(dmcaBittorrent, SecurityPolicyReasonBittorrent)
 	}
-	if web.match(ipPath, b) {
-		// a sanctioned web standard (TLS/QUIC/DTLS/STUN): the fallback that keeps
-		// the encrypted-traffic heuristic from dropping a legitimate encrypted flow
-		return self.setTerminal(dmcaAllow)
+	if self.appReason != SecurityPolicyReasonUnknown {
+		// allowed by an application standard: the BitTorrent signatures above keep
+		// precedence for the rest of the budget, then the allow becomes terminal
+		if settings.InspectionPacketBudget <= self.inspectedPackets {
+			return self.setTerminal(dmcaAllow, self.appReason)
+		}
+		return dmcaAllow, self.appReason, false
+	}
+	if isSanctionedGamingEndpoint(settings.Gaming, ipPath) {
+		// Provider prefix + transport + documented remote port is sufficient
+		// evidence for the Steam exception. The positive BitTorrent checks above
+		// intentionally retain precedence.
+		return self.setTerminal(dmcaAllow, SecurityPolicyReasonAllowGaming)
+	}
+	if reason, ok := web.matchReason(ipPath, payload); ok {
+		// A sanctioned web/communication standard. Full framing is evaluated over
+		// the complete payload; MaxInspectionPayload only caps signature and entropy
+		// work below.
+		return self.setTerminal(dmcaAllow, reason)
+	}
+	if reason, headerEnd, ok := app.match(ipPath, payload, 1 == self.inspectedPackets); ok {
+		// a single-packet application standard, matched over the complete payload
+		// (the Ethereum invariants cover every byte). The bytes it carries after
+		// the recognized header must not hide a BitTorrent payload.
+		rest := payload[headerEnd:]
+		if settings.MaxInspectionPayload < len(rest) {
+			rest = rest[:settings.MaxInspectionPayload]
+		}
+		if containsBittorrentSignature(rest) {
+			return self.setTerminal(dmcaBittorrent, SecurityPolicyReasonBittorrent)
+		}
+		return self.allowAppStandard(reason, settings)
+	}
+	if self.appCandidate.kind != appCandidateNone {
+		candidate := self.appCandidate
+		self.appCandidate = appCandidate{}
+		if reason, ok := app.confirm(&candidate, ipPath, payload); ok {
+			return self.allowAppStandard(reason, settings)
+		}
+		// a failed candidate is judged normally below (or reopens one)
+	}
+	if candidate, ok := app.open(ipPath, payload); ok {
+		// The opening packet of a two-packet standard consumes budget but is not
+		// counted as encrypted: the next packet confirms it or is judged normally.
+		// A random flow whose blob happens to match an opener leaks one packet.
+		self.appCandidate = candidate
+		if settings.InspectionPacketBudget <= self.inspectedPackets {
+			return self.setTerminal(dmcaAllow, SecurityPolicyReasonAllowBudget)
+		}
+		return dmcaInspecting, SecurityPolicyReasonInspecting, false
+	}
+	if header, ok := web.rtpHeader(ipPath, payload); ok && self.observeRtp(header) {
+		// RTP/SRTP needs coherent headers from multiple packets before it is trusted;
+		// a single first byte in RFC 7983's 128-191 range is intentionally insufficient.
+		return self.setTerminal(dmcaAllow, SecurityPolicyReasonAllowRtp)
 	}
 	if isHttpRequest(b) {
 		// raw plaintext HTTP (a request line) — media/radio streaming relies on it,
@@ -221,7 +405,7 @@ func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *Dmc
 		// budget/entropy bookkeeping) so a later high-entropy body never trips the
 		// encrypted-traffic heuristic. Checked after the BitTorrent signatures so an
 		// HTTP-tracker GET is still classified as BitTorrent.
-		return self.setTerminal(dmcaAllow)
+		return self.setTerminal(dmcaAllow, SecurityPolicyReasonAllowHttp)
 	}
 	if payloadLooksEncrypted(b, settings) {
 		self.encryptedPackets += 1
@@ -239,24 +423,37 @@ func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *Dmc
 	switch {
 	case self.sawPlaintext:
 		// per policy only sketchy (encrypted) non-web-standard traffic is dropped
-		return self.setTerminal(dmcaAllow)
+		return self.setTerminal(dmcaAllow, SecurityPolicyReasonAllowPlaintext)
 	case settings.DropUnsanctionedEncrypted && self.sawFlowStart && decisionPackets <= self.encryptedPackets:
-		return self.setTerminal(dmcaDropEncrypted)
+		return self.setTerminal(dmcaDropEncrypted, SecurityPolicyReasonDropEncrypted)
 	case settings.InspectionPacketBudget <= self.inspectedPackets:
-		return self.setTerminal(dmcaAllow)
+		return self.setTerminal(dmcaAllow, SecurityPolicyReasonAllowBudget)
 	default:
-		return dmcaInspecting
+		return dmcaInspecting, SecurityPolicyReasonInspecting, false
 	}
+}
+
+// allowAppStandard allows the flow for an application standard. The allow is
+// terminal once the inspection budget is spent; until then the flow keeps
+// checking the BitTorrent signatures.
+func (self *dmcaFlowState) allowAppStandard(reason SecurityPolicyReason, settings *DmcaSecurityPolicySettings) (dmcaVerdict, SecurityPolicyReason, bool) {
+	self.appReason = reason
+	if settings.InspectionPacketBudget <= self.inspectedPackets {
+		return self.setTerminal(dmcaAllow, reason)
+	}
+	return dmcaAllow, reason, false
 }
 
 type dmcaFlowShard struct {
 	mu    sync.RWMutex
-	flows map[Ip6Path]*dmcaFlowState
+	flows map[dmcaFlowKey]*dmcaFlowState
 }
 
 type dmcaDetector struct {
+	runDone     chan struct{}
 	settings    *DmcaSecurityPolicySettings
 	web         *webStandardDetector
+	app         *appStandardDetector
 	perShardCap int
 	shards      [dmcaFlowShards]*dmcaFlowShard
 }
@@ -270,19 +467,26 @@ func newDmcaDetector(ctx context.Context, settings *DmcaSecurityPolicySettings, 
 		}
 	}
 	self := &dmcaDetector{
+		runDone:     make(chan struct{}),
 		settings:    settings,
 		web:         web,
+		app:         newAppStandardDetector(settings.App),
 		perShardCap: perShardCap,
 	}
 	for i := range self.shards {
 		self.shards[i] = &dmcaFlowShard{
-			flows: map[Ip6Path]*dmcaFlowState{},
+			flows: map[dmcaFlowKey]*dmcaFlowState{},
 		}
 	}
 	// reclaim flows idle past FlowTtl. The capacity-LRU eviction (evictWithLock) still
 	// bounds memory under load; this adds prompt time-based reclamation when egress is quiet.
 	if ctx != nil && 0 < settings.FlowTtl {
-		go self.run(ctx)
+		go func() {
+			defer close(self.runDone)
+			self.run(ctx)
+		}()
+	} else {
+		close(self.runDone)
 	}
 	return self
 }
@@ -336,7 +540,7 @@ func (self *dmcaDetector) flowCount() int {
 // refresh updates a tracked flow's last-activity time — the eviction key for both the idle scan
 // and the capacity-LRU. An untracked key (a privileged-port flow, or one already evicted) is a
 // no-op; reverse-direction packets never create state.
-func (self *dmcaDetector) refresh(key Ip6Path) {
+func (self *dmcaDetector) refresh(key dmcaFlowKey) {
 	shard := self.shards[dmcaShardIndex(key)]
 	shard.mu.RLock()
 	st := shard.flows[key]
@@ -346,9 +550,46 @@ func (self *dmcaDetector) refresh(key Ip6Path) {
 	}
 }
 
+// remove retires one exact sender-owned flow.
+func (self *dmcaDetector) remove(key dmcaFlowKey) {
+	shard := self.shards[dmcaShardIndex(key)]
+	shard.mu.Lock()
+	delete(shard.flows, key)
+	shard.mu.Unlock()
+}
+
+// removeSender retires all flow state owned by one authenticated sender.
+func (self *dmcaDetector) removeSender(senderClientId Id) {
+	for _, shard := range self.shards {
+		shard.mu.Lock()
+		for key := range shard.flows {
+			if key.senderClientId == senderClientId {
+				delete(shard.flows, key)
+			}
+		}
+		shard.mu.Unlock()
+	}
+}
+
+// dmcaFlowKeyForPath canonicalizes the directional egress tuple.
+func dmcaFlowKeyForPath(senderClientId Id, ipPath *IpPath) dmcaFlowKey {
+	ip6Path := ipPath.ToIp6Path()
+	// The affinity server name is not part of the transport flow identity.
+	ip6Path.ServerName = ""
+	return dmcaFlowKey{
+		senderClientId: senderClientId,
+		ip6Path:        ip6Path,
+	}
+}
+
 // touchEgress refreshes a flow from a sent (client->destination) packet — the packet's 5-tuple is
 // the flow key directly.
 func (self *dmcaDetector) touchEgress(ipPath *IpPath) {
+	self.touchEgressForSender(Id{}, ipPath)
+}
+
+// touchEgressForSender refreshes or retires one sender-owned outbound flow.
+func (self *dmcaDetector) touchEgressForSender(senderClientId Id, ipPath *IpPath) {
 	if !self.settings.Enabled {
 		return
 	}
@@ -361,15 +602,23 @@ func (self *dmcaDetector) touchEgress(ipPath *IpPath) {
 	if ipPath.DestinationPort < 1024 {
 		return
 	}
-	key := ipPath.ToIp6Path()
-	// the flow 5-tuple is the identity here; the affinity ServerName is not set
-	key.ServerName = ""
+	key := dmcaFlowKeyForPath(senderClientId, ipPath)
+	if ipPath.Protocol == IpProtocolTcp && (ipPath.Fin || ipPath.Rst) {
+		self.remove(key)
+		return
+	}
 	self.refresh(key)
 }
 
 // touchIngress refreshes a flow from a received (destination->client) packet, reversing the
 // 5-tuple to the egress key the flow is stored under.
 func (self *dmcaDetector) touchIngress(ipPath *IpPath) {
+	self.touchIngressForSender(Id{}, ipPath)
+}
+
+// touchIngressForSender maps a sender-owned return packet back to its outbound
+// flow. Either direction's TCP teardown retires the state immediately.
+func (self *dmcaDetector) touchIngressForSender(senderClientId Id, ipPath *IpPath) {
 	if !self.settings.Enabled {
 		return
 	}
@@ -382,74 +631,162 @@ func (self *dmcaDetector) touchIngress(ipPath *IpPath) {
 	if ipPath.SourcePort < 1024 {
 		return
 	}
-	key := ipPath.Reverse().ToIp6Path()
-	key.ServerName = ""
+	reversePath := ipPath.Reverse()
+	key := dmcaFlowKeyForPath(senderClientId, reversePath)
+	if ipPath.Protocol == IpProtocolTcp && (ipPath.Fin || ipPath.Rst) {
+		self.remove(key)
+		return
+	}
 	self.refresh(key)
 }
 
-func dmcaShardIndex(key Ip6Path) int {
-	// FNV-1a over the destination ip + ports; distribution, not security
+// retireEgressForSender removes state when the provider NAT closes a TCP
+// sequence without observing a wire teardown.
+func (self *dmcaDetector) retireEgressForSender(senderClientId Id, ipPath *IpPath) {
+	if !self.settings.Enabled || ipPath == nil || ipPath.Protocol != IpProtocolTcp ||
+		ipPath.DestinationPort < 1024 {
+		return
+	}
+	self.remove(dmcaFlowKeyForPath(senderClientId, ipPath))
+}
+
+func dmcaShardIndex(key dmcaFlowKey) int {
+	// FNV-1a over the sender, destination ip, and ports; distribution only.
 	h := uint32(2166136261)
-	for _, b := range key.DestinationIp {
+	for _, b := range key.senderClientId {
 		h = (h ^ uint32(b)) * 16777619
 	}
-	h = (h ^ uint32(key.SourcePort)) * 16777619
-	h = (h ^ uint32(key.DestinationPort)) * 16777619
+	for _, b := range key.ip6Path.DestinationIp {
+		h = (h ^ uint32(b)) * 16777619
+	}
+	h = (h ^ uint32(key.ip6Path.SourcePort)) * 16777619
+	h = (h ^ uint32(key.ip6Path.DestinationPort)) * 16777619
 	return int(h % dmcaFlowShards)
 }
 
 // classify advances the per-flow state machine and returns the raw verdict
-// (consulting the injected web-standards detector during inspection).
+// (consulting the injected standards detector during inspection).
 func (self *dmcaDetector) classify(ipPath *IpPath, payload []byte) dmcaVerdict {
+	return self.classifyForSender(Id{}, ipPath, payload)
+}
+
+// classifyForSender advances state scoped to an authenticated provider sender.
+func (self *dmcaDetector) classifyForSender(
+	senderClientId Id,
+	ipPath *IpPath,
+	payload []byte,
+) dmcaVerdict {
+	v, _, _ := self.classifyForSenderDetailed(senderClientId, ipPath, payload)
+	return v
+}
+
+// classifyForSenderDetailed is classifyForSender plus the verdict reason and
+// whether this packet moved the flow from inspecting to its terminal verdict.
+func (self *dmcaDetector) classifyForSenderDetailed(
+	senderClientId Id,
+	ipPath *IpPath,
+	payload []byte,
+) (dmcaVerdict, SecurityPolicyReason, bool) {
 	if !self.settings.Enabled {
-		return dmcaAllow
+		return dmcaAllow, SecurityPolicyReasonAllowUninspected, false
 	}
 	switch ipPath.Protocol {
 	case IpProtocolTcp, IpProtocolUdp:
 	default:
-		return dmcaAllow
+		return dmcaAllow, SecurityPolicyReasonAllowUninspected, false
 	}
 
-	// A privileged destination port (<1024) can't host a peer-to-peer / BitTorrent hole — peers,
-	// DHT, uTP, and plaintext trackers all run on ephemeral/high ports — so allow it without
-	// payload inspection or flow tracking. This lets legitimate non-web-standard encrypted services
-	// on privileged ports (e.g. Telegram MTProto on 443) through, which the unsanctioned-encrypted
-	// heuristic would otherwise drop. Peer traffic on high ports is still inspected.
+	// A privileged destination port (<1024) is trusted as a service port: it is allowed without
+	// flow tracking or the encrypted heuristic, which lets legitimate non-web-standard encrypted
+	// services there (e.g. Telegram MTProto or OpenVPN on 443) through. A peer can still listen on
+	// a privileged port, so the stateless positive BitTorrent signatures run on every payload; TLS,
+	// QUIC and HTTP fail their first comparison.
 	if ipPath.DestinationPort < 1024 {
-		return dmcaAllow
+		if self.settings.InspectPrivilegedSignatures && 0 < len(payload) {
+			b := payload
+			if self.settings.MaxInspectionPayload < len(b) {
+				b = b[:self.settings.MaxInspectionPayload]
+			}
+			if detectBittorrentSignature(ipPath, b) {
+				return dmcaBittorrent, SecurityPolicyReasonBittorrent, true
+			}
+		}
+		return dmcaAllow, SecurityPolicyReasonAllowPrivileged, false
 	}
 
-	key := ipPath.ToIp6Path()
-	// the flow 5-tuple is the identity here; the affinity ServerName is not set
-	key.ServerName = ""
+	key := dmcaFlowKeyForPath(senderClientId, ipPath)
 	shard := self.shards[dmcaShardIndex(key)]
 
-	shard.mu.RLock()
-	st := shard.flows[key]
-	shard.mu.RUnlock()
-	if st == nil {
+	if ipPath.Protocol == IpProtocolTcp && ipPath.Rst {
 		shard.mu.Lock()
-		st = shard.flows[key]
-		if st == nil {
-			// seed the activity time on creation; ongoing refreshes come from the per-direction
-			// RefreshEgress/RefreshIngress calls at the forwarding points
-			st = &dmcaFlowState{key: key, lastActivityUnixNanos: time.Now().UnixNano()}
-			self.evictWithLock(shard)
-			shard.flows[key] = st
-		}
+		delete(shard.flows, key)
 		shard.mu.Unlock()
+		return dmcaAllow, SecurityPolicyReasonInspecting, false
 	}
 
-	v := dmcaVerdict(atomic.LoadInt32(&st.terminal))
-	if dmcaInspecting == v {
-		v = st.advance(ipPath, payload, self.settings, self.web)
+	createState := func() *dmcaFlowState {
+		state := &dmcaFlowState{
+			key:                   key,
+			lastActivityUnixNanos: time.Now().UnixNano(),
+		}
+		if ipPath.Protocol == IpProtocolTcp && ipPath.Syn {
+			state.synSeen = true
+			state.synSequence = ipPath.SequenceNumber
+		}
+		return state
 	}
-	return v
+
+	var state *dmcaFlowState
+	if ipPath.Protocol == IpProtocolTcp && ipPath.Syn {
+		// A SYN is the generation boundary. Serialize its replacement so a new
+		// connection cannot inherit a terminal verdict from tuple reuse.
+		shard.mu.Lock()
+		state = shard.flows[key]
+		if state == nil || !state.synSeen || state.synSequence != ipPath.SequenceNumber {
+			replacing := state != nil
+			state = createState()
+			if !replacing {
+				self.evictWithLock(shard)
+			}
+			shard.flows[key] = state
+		}
+		shard.mu.Unlock()
+	} else {
+		shard.mu.RLock()
+		state = shard.flows[key]
+		shard.mu.RUnlock()
+		if state == nil {
+			shard.mu.Lock()
+			state = shard.flows[key]
+			if state == nil {
+				// Ongoing refreshes come from the per-direction forwarding points.
+				state = createState()
+				self.evictWithLock(shard)
+				shard.flows[key] = state
+			}
+			shard.mu.Unlock()
+		}
+	}
+	if ipPath.Protocol == IpProtocolTcp && ipPath.Fin {
+		// Inspect a payload-bearing FIN, then retire only the generation seen here.
+		defer func() {
+			shard.mu.Lock()
+			defer shard.mu.Unlock()
+			if shard.flows[key] == state {
+				delete(shard.flows, key)
+			}
+		}()
+	}
+
+	if v, reason := state.terminalVerdict(); v != dmcaInspecting {
+		return v, reason, false
+	}
+	return state.advance(ipPath, payload, self.settings, self.web, self.app)
 }
 
 // inspect classifies the flow and maps the verdict to a SecurityPolicyResult via
 // the policy settings. The egress policy switches on classify directly (to keep
-// the bittorrent / web-standard / encrypted decision explicit); this is the
+// the BitTorrent / sanctioned-standard / encrypted decision explicit); this is the
 // convenience form for callers that only want the enforced result.
 func (self *dmcaDetector) inspect(ipPath *IpPath, payload []byte) SecurityPolicyResult {
 	return self.result(self.classify(ipPath, payload))
@@ -464,7 +801,7 @@ func (self *dmcaDetector) evictWithLock(shard *dmcaFlowShard) {
 	if len(shard.flows) < self.perShardCap {
 		return
 	}
-	applyLruMapLimit(shard.flows, self.perShardCap-1, func(key Ip6Path, st *dmcaFlowState) bool {
+	applyLruMapLimit(shard.flows, self.perShardCap-1, func(key dmcaFlowKey, st *dmcaFlowState) bool {
 		delete(shard.flows, key)
 		return true
 	})

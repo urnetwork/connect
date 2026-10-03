@@ -1,0 +1,5 @@
+--- FAIL: TestWindowPacingBackloggedServiceUsesSustainedDelivery (0.00s)
+    transfer_window_pacing_test.go:609: queued service followed compressed burst peak: 25000000, want 12500000
+FAIL
+FAIL	github.com/urnetwork/connect	0.719s
+FAIL

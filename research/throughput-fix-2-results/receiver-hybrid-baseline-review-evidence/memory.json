@@ -1,0 +1,8 @@
+{
+  "ack_record_bytes": 96,
+  "history_header_bytes": 112,
+  "hot_allocs": 0,
+  "ring_bytes_at_128": 4096,
+  "send_item_bytes": 584,
+  "service_bytes": 3560
+}

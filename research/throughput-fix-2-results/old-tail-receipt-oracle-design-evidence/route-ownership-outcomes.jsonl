@@ -1,0 +1,9 @@
+{"duration":"0.01s","ordinal":1,"result":"FAIL","test":"TestWindowPacingRetriedTailNeedsPhysicalAttemptEcho"}
+{"duration":"0.00s","ordinal":2,"result":"PASS","test":"TestWindowPacingOriginalAckCannotCertifyHeldPhysicalRetry"}
+{"duration":"0.00s","ordinal":3,"result":"FAIL","test":"TestWindowPacingDifferentH1RouteTailCannotCertifyOlderCopy"}
+{"duration":"0.00s","ordinal":4,"result":"FAIL","test":"TestWindowPacingRetriedTailNeedsPhysicalAttemptEcho"}
+{"duration":"0.00s","ordinal":5,"result":"PASS","test":"TestWindowPacingOriginalAckCannotCertifyHeldPhysicalRetry"}
+{"duration":"0.00s","ordinal":6,"result":"FAIL","test":"TestWindowPacingDifferentH1RouteTailCannotCertifyOlderCopy"}
+{"duration":"0.00s","ordinal":7,"result":"FAIL","test":"TestWindowPacingRetriedTailNeedsPhysicalAttemptEcho"}
+{"duration":"0.00s","ordinal":8,"result":"PASS","test":"TestWindowPacingOriginalAckCannotCertifyHeldPhysicalRetry"}
+{"duration":"0.00s","ordinal":9,"result":"FAIL","test":"TestWindowPacingDifferentH1RouteTailCannotCertifyOlderCopy"}

@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 
 	"golang.org/x/net/icmp"
 
@@ -90,6 +90,15 @@ func testingIcmp6EchoTypePacket(sourceIp string, destinationIp string, echoType 
 	packet := make([]byte, len(buffer.Bytes()))
 	copy(packet, buffer.Bytes())
 	return packet
+}
+
+// testingIcmpPathIps is the (source, destination) pair the icmp path tests
+// use for a family: a private source and a public resolver destination.
+func testingIcmpPathIps(ipVersion int) (net.IP, net.IP) {
+	if ipVersion == 6 {
+		return net.ParseIP("fd00::1"), net.ParseIP("2606:4700:4700::1111")
+	}
+	return net.ParseIP("10.0.0.1").To4(), net.ParseIP("203.0.113.7").To4()
 }
 
 func testingIcmp6EchoPacket(sourceIp string, destinationIp string, id int, seq int, payload []byte) []byte {
@@ -414,16 +423,27 @@ func TestCfaaInspectIcmp(t *testing.T) {
 	if got := d.inspect(net.ParseIP("203.0.113.7"), 0, IpProtocolIcmp, 4); got != cfaaAllow {
 		t.Fatalf("icmp4 clean = %v, want allow", got)
 	}
-	if got := d.inspect(net.ParseIP("2606:4700:4700::1111"), 0, IpProtocolIcmp, 6); got != cfaaAllow {
+	if got := d.inspect(net.ParseIP("2001:db8::7"), 0, IpProtocolIcmp, 6); got != cfaaAllow {
 		t.Fatalf("icmp6 clean = %v, want allow", got)
 	}
 
-	if 0 < cfaaBlockedPrefixCount {
-		lo, _ := cfaaRangeAt(0)
-		blocked := net.IPv4(byte(lo>>24), byte(lo>>16), byte(lo>>8), byte(lo))
-		if got := d.inspect(blocked, 0, IpProtocolIcmp, 4); got != cfaaDrop {
-			t.Fatalf("icmp blocked ip = %v, want drop", got)
-		}
+	if cfaaBlockedPrefixCount < 10_000 {
+		t.Fatalf("default CFAA IPv4 records = %d, want at least reviewed minimum 10000", cfaaBlockedPrefixCount)
+	}
+	lo4, _ := cfaaRangeAt(0)
+	blocked4 := net.IPv4(byte(lo4>>24), byte(lo4>>16), byte(lo4>>8), byte(lo4))
+	if got := d.inspect(blocked4, 0, IpProtocolIcmp, 4); got != cfaaDrop {
+		t.Fatalf("icmp4 blocked ip = %v, want drop", got)
+	}
+
+	if cfaaBlockedPrefix6Count < 100 {
+		t.Fatalf("default CFAA IPv6 records = %d, want at least reviewed minimum 100", cfaaBlockedPrefix6Count)
+	}
+	data6 := cfaaBlockedPrefix6Data
+	blocked6 := net.IP(make([]byte, net.IPv6len))
+	copy(blocked6, data6[:net.IPv6len])
+	if got := d.inspect(blocked6, 0, IpProtocolIcmp, 6); got != cfaaDrop {
+		t.Fatalf("icmp6 blocked ip = %v, want drop", got)
 	}
 }
 
@@ -434,47 +454,53 @@ func TestDmcaNonTransportProtocolAllow(t *testing.T) {
 	defer cancel()
 
 	dmca := newDmcaDetector(ctx, DefaultDmcaSecurityPolicySettings(), newWebStandardDetector(DefaultWebStandardSettings()))
-	for _, proto := range []IpProtocol{IpProtocolIcmp, IpProtocol(99)} {
-		ipPath := &IpPath{
-			Version:         4,
-			Protocol:        proto,
-			SourceIp:        net.ParseIP("10.0.0.1").To4(),
-			SourcePort:      0,
-			DestinationIp:   net.ParseIP("203.0.113.7").To4(),
-			DestinationPort: 8443,
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		sourceIp, destinationIp := testingIcmpPathIps(ipVersion)
+		for _, proto := range []IpProtocol{IpProtocolIcmp, IpProtocol(99)} {
+			ipPath := &IpPath{
+				Version:         ipVersion,
+				Protocol:        proto,
+				SourceIp:        sourceIp,
+				SourcePort:      0,
+				DestinationIp:   destinationIp,
+				DestinationPort: 8443,
+			}
+			if got := dmca.classify(ipPath, []byte{0x16, 0x03, 0x01}); got != dmcaAllow {
+				t.Fatalf("protocol %v classify = %v, want allow", proto, got)
+			}
+			dmca.touchEgress(ipPath)
+			dmca.touchIngress(ipPath.Reverse())
 		}
-		if got := dmca.classify(ipPath, []byte{0x16, 0x03, 0x01}); got != dmcaAllow {
-			t.Fatalf("protocol %v classify = %v, want allow", proto, got)
+		if count := dmca.flowCount(); count != 0 {
+			t.Fatalf("flow count = %d, want 0", count)
 		}
-		dmca.touchEgress(ipPath)
-		dmca.touchIngress(ipPath.Reverse())
-	}
-	if count := dmca.flowCount(); count != 0 {
-		t.Fatalf("flow count = %d, want 0", count)
-	}
+	})
 }
 
 // reset/oos synthesis safe defaults: non-tcp paths get no synthetic reset,
 // and the oos builder returns nil rather than panicking for icmp
 func TestIpOosNonTransportNil(t *testing.T) {
-	for _, proto := range []IpProtocol{IpProtocolUdp, IpProtocolIcmp, IpProtocolUnknown, IpProtocol(99)} {
-		ipPath := &IpPath{
-			Version:         4,
-			Protocol:        proto,
-			SourceIp:        net.ParseIP("10.0.0.1").To4(),
-			SourcePort:      1000,
-			DestinationIp:   net.ParseIP("203.0.113.7").To4(),
-			DestinationPort: 2000,
-		}
-		if packet, ok := ipOosRst(ipPath); ok || packet != nil {
-			t.Errorf("protocol %v: rst = %v, %v; want nil, false", proto, packet, ok)
-		}
-		if proto != IpProtocolUdp {
-			if packet := ipOosPacket(ipPath, []byte("payload")); packet != nil {
-				t.Errorf("protocol %v: oos packet = %v; want nil", proto, packet)
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		sourceIp, destinationIp := testingIcmpPathIps(ipVersion)
+		for _, proto := range []IpProtocol{IpProtocolUdp, IpProtocolIcmp, IpProtocolUnknown, IpProtocol(99)} {
+			ipPath := &IpPath{
+				Version:         ipVersion,
+				Protocol:        proto,
+				SourceIp:        sourceIp,
+				SourcePort:      1000,
+				DestinationIp:   destinationIp,
+				DestinationPort: 2000,
+			}
+			if packet, ok := ipOosRst(ipPath); ok || packet != nil {
+				t.Errorf("protocol %v: rst = %v, %v; want nil, false", proto, packet, ok)
+			}
+			if proto != IpProtocolUdp {
+				if packet := ipOosPacket(ipPath, []byte("payload")); packet != nil {
+					t.Errorf("protocol %v: oos packet = %v; want nil", proto, packet)
+				}
 			}
 		}
-	}
+	})
 }
 
 // mux classification: icmp passes through unclaimed with no parse in both
@@ -499,89 +525,97 @@ func TestMultiClientIcmpGate(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	request := testingIcmp4EchoPacket("10.0.0.1", "203.0.113.7", 0x1234, 1, []byte("ping"))
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		request := testingIcmp4EchoPacket("10.0.0.1", "203.0.113.7", 0x1234, 1, []byte("ping"))
+		if ipVersion == 6 {
+			request = testingIcmp6EchoPacket("fd00::1", "2606:4700:4700::1111", 0x1234, 1, []byte("ping"))
+		}
 
-	disabled := &RemoteUserNatMultiClient{
-		ctx:      ctx,
-		log:      NewNoopLogger(),
-		settings: DefaultMultiClientSettings(),
-	}
-	if disabled.SendPacket(TransferPath{}, protocol.ProvideMode_Network, request, 0) {
-		t.Fatal("gated icmp packet was accepted")
-	}
-	if count := disabled.sendIcmpDisabledDropCount.Load(); count != 1 {
-		t.Fatalf("icmp disabled drop count = %d, want 1", count)
-	}
-	if count := disabled.sendParseDropCount.Load(); count != 0 {
-		t.Fatalf("parse drop count = %d, want 0", count)
-	}
+		disabled := &RemoteUserNatMultiClient{
+			ctx:      ctx,
+			log:      NewNoopLogger(),
+			settings: DefaultMultiClientSettings(),
+		}
+		if disabled.SendPacket(TransferPath{}, protocol.ProvideMode_Network, request, 0) {
+			t.Fatal("gated icmp packet was accepted")
+		}
+		if count := disabled.sendIcmpDisabledDropCount.Load(); count != 1 {
+			t.Fatalf("icmp disabled drop count = %d, want 1", count)
+		}
+		if count := disabled.sendParseDropCount.Load(); count != 0 {
+			t.Fatalf("parse drop count = %d, want 0", count)
+		}
 
-	enabledSettings := DefaultMultiClientSettings()
-	enabledSettings.EnableIcmp = true
-	enabled := &RemoteUserNatMultiClient{
-		ctx:            ctx,
-		log:            NewNoopLogger(),
-		settings:       enabledSettings,
-		securityPolicy: &failingEgressSecurityPolicy{stats: DefaultSecurityPolicyStatsCollector()},
-	}
-	if enabled.SendPacket(TransferPath{}, protocol.ProvideMode_Network, request, 0) {
-		t.Fatal("packet accepted through failing policy")
-	}
-	// reaching the policy proves the gate passed
-	if count := enabled.sendPolicyDropCount.Load(); count != 1 {
-		t.Fatalf("policy drop count = %d, want 1", count)
-	}
-	if count := enabled.sendIcmpDisabledDropCount.Load(); count != 0 {
-		t.Fatalf("icmp disabled drop count = %d, want 0", count)
-	}
+		enabledSettings := DefaultMultiClientSettings()
+		enabledSettings.EnableIcmp = true
+		enabled := &RemoteUserNatMultiClient{
+			ctx:            ctx,
+			log:            NewNoopLogger(),
+			settings:       enabledSettings,
+			securityPolicy: &failingEgressSecurityPolicy{stats: DefaultSecurityPolicyStatsCollector()},
+		}
+		if enabled.SendPacket(TransferPath{}, protocol.ProvideMode_Network, request, 0) {
+			t.Fatal("packet accepted through failing policy")
+		}
+		// reaching the policy proves the gate passed
+		if count := enabled.sendPolicyDropCount.Load(); count != 1 {
+			t.Fatalf("policy drop count = %d, want 1", count)
+		}
+		if count := enabled.sendIcmpDisabledDropCount.Load(); count != 0 {
+			t.Fatalf("icmp disabled drop count = %d, want 0", count)
+		}
+	})
 }
 
 // icmp affinity is per destination ip, ahead of the port buckets: raw-ip
 // pings to one host share a bucket instead of collapsing into the shared
 // port-0 (below 1024) bucket
 func TestMultiClientAffinityIcmp(t *testing.T) {
-	multiClient := &RemoteUserNatMultiClient{}
-	multiClient.config.Store(&multiClientConfig{
-		performanceProfile: nil,
-		serverNameLookup:   nil,
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		sourceIp, destinationIp := testingIcmpPathIps(ipVersion)
+		multiClient := &RemoteUserNatMultiClient{}
+		multiClient.config.Store(&multiClientConfig{
+			performanceProfile: nil,
+			serverNameLookup:   nil,
+		})
+
+		icmpPath := &IpPath{
+			Version:       ipVersion,
+			Protocol:      IpProtocolIcmp,
+			SourceIp:      sourceIp,
+			SourcePort:    0x1234,
+			DestinationIp: destinationIp,
+		}
+		affinityPaths := multiClient.affinityIpPathsWithLock(icmpPath)
+		if len(affinityPaths) != 1 {
+			t.Fatalf("affinity paths = %d, want 1", len(affinityPaths))
+		}
+		if !affinityPaths[0].DestinationIp.Equal(destinationIp) ||
+			affinityPaths[0].DestinationPort != 0 ||
+			affinityPaths[0].ServerName != "" {
+			t.Fatalf("affinity path = %+v", affinityPaths[0])
+		}
+
+		// contrast: a port-0 udp path collapses into the per-port bucket with no
+		// destination ip
+		udpPath := &IpPath{
+			Version:       ipVersion,
+			Protocol:      IpProtocolUdp,
+			SourceIp:      sourceIp,
+			SourcePort:    40000,
+			DestinationIp: destinationIp,
+		}
+		udpAffinityPaths := multiClient.affinityIpPathsWithLock(udpPath)
+		if len(udpAffinityPaths) != 1 || udpAffinityPaths[0].DestinationIp != nil {
+			t.Fatalf("udp port 0 affinity path = %+v", udpAffinityPaths[0])
+		}
 	})
-
-	icmpPath := &IpPath{
-		Version:       4,
-		Protocol:      IpProtocolIcmp,
-		SourceIp:      net.ParseIP("10.0.0.1").To4(),
-		SourcePort:    0x1234,
-		DestinationIp: net.ParseIP("203.0.113.7").To4(),
-	}
-	affinityPaths := multiClient.affinityIpPathsWithLock(icmpPath)
-	if len(affinityPaths) != 1 {
-		t.Fatalf("affinity paths = %d, want 1", len(affinityPaths))
-	}
-	if !affinityPaths[0].DestinationIp.Equal(net.ParseIP("203.0.113.7")) ||
-		affinityPaths[0].DestinationPort != 0 ||
-		affinityPaths[0].ServerName != "" {
-		t.Fatalf("affinity path = %+v", affinityPaths[0])
-	}
-
-	// contrast: a port-0 udp path collapses into the per-port bucket with no
-	// destination ip
-	udpPath := &IpPath{
-		Version:       4,
-		Protocol:      IpProtocolUdp,
-		SourceIp:      net.ParseIP("10.0.0.1").To4(),
-		SourcePort:    40000,
-		DestinationIp: net.ParseIP("203.0.113.7").To4(),
-	}
-	udpAffinityPaths := multiClient.affinityIpPathsWithLock(udpPath)
-	if len(udpAffinityPaths) != 1 || udpAffinityPaths[0].DestinationIp != nil {
-		t.Fatalf("udp port 0 affinity path = %+v", udpAffinityPaths[0])
-	}
 }
 
 // the icmp budget item of the provider byte-cost model: floors dominate a
 // small target, the item scales with a large target, and it is additive —
-// the udp/tcp shares are untouched by it. Scaled caps under a process
-// budget, unlimited flows unbudgeted.
+// the udp/tcp shares are untouched by it. Unlimited flows without a target,
+// whatever the process budget.
 func TestProviderIcmpSettings(t *testing.T) {
 	defer SetMemoryBudget(0)
 
@@ -611,9 +645,10 @@ func TestProviderIcmpSettings(t *testing.T) {
 	AssertEqual(t, unbudgeted.IcmpBufferSettings.UserLimit, 0)
 	AssertEqual(t, unbudgeted.IcmpBufferSettings.GlobalLimit, 0)
 
-	// the ios packet tunnel budget (scale 24/64)
+	// a process budget (the ios packet tunnel's 24 MiB here) is not a flow
+	// policy: the targetless provider keeps its unlimited table
 	SetMemoryBudget(24 * 1024 * 1024)
 	budgeted := DefaultProviderLocalUserNatSettings()
-	AssertEqual(t, budgeted.IcmpBufferSettings.UserLimit, 48)
-	AssertEqual(t, budgeted.IcmpBufferSettings.GlobalLimit, 96)
+	AssertEqual(t, budgeted.IcmpBufferSettings.UserLimit, 0)
+	AssertEqual(t, budgeted.IcmpBufferSettings.GlobalLimit, 0)
 }

@@ -1,0 +1,9 @@
+=== RUN   TestWindowPathSlowLinkKeepsCapacity
+    transfer_window_path_performance_test.go:253: slow rtt=300µs flows=1 ceiling=95.8 fixed=95.8 min-flow=95.8 model Mb/s startup-and-measurement-drops=0
+    transfer_window_path_performance_test.go:253: slow rtt=300µs flows=8 ceiling=95.8 fixed=95.8 min-flow=11.1 model Mb/s startup-and-measurement-drops=0
+    transfer_window_path_performance_test.go:253: slow rtt=100ms flows=1 ceiling=95.8 fixed=9.5 min-flow=9.5 model Mb/s startup-and-measurement-drops=12206
+    transfer_window_path_performance_test.go:255: slow link lost capacity: ceiling=95.8 fixed=9.5 min-flow=9.5
+--- FAIL: TestWindowPathSlowLinkKeepsCapacity (1.19s)
+FAIL
+FAIL	github.com/urnetwork/connect	1.881s
+FAIL

@@ -1,0 +1,4 @@
+{
+  "source_log_sha256": "fb3d10805b94b8ee93c898103dbe258396d1bfacd6f06f5edb8b4b32f9ec1651",
+  "note": "Configured local server test selection. Only test outcomes and directional throughput lines are retained; environment and network diagnostics are excluded."
+}

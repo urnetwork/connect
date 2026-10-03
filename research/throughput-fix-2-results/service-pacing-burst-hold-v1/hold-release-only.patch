@@ -1,0 +1,28 @@
+--- before/transfer_window_pacing.go
++++ after/transfer_window_pacing.go
+@@ -496,16 +496,19 @@
+ 	self.heldPacingRate = rate
+ }
+ 
+-// Discovery ends at the first sustained queue, using the drain check's margin
+-// so a transient opening-probe bump on a fast path cannot end it. Every later
+-// queued reply releases the held pace, so a slower path lowers pacing even
+-// when the flight happens to be drained at read time.
++// Discovery ends at the drain check's queue margin. A held pace tolerates
++// one permitted burst of return-path residence; a longer queue releases it
++// even after physical flight drains. Backlogged admission reads also lower it.
+ func (self *windowPacingService) observeQueueWithLock(timing windowReceiverRoundTripEstimate, roundTripCompression time.Duration, at time.Time) {
+-	if timing.minimum > 0 && timing.latest > timing.minimum+roundTripCompression+max(2*time.Millisecond, timing.minimum/4) {
++	margin := max(2*time.Millisecond, timing.minimum/4)
++	if timing.minimum > 0 && timing.latest > timing.minimum+roundTripCompression+margin {
+ 		if self.queueObservedAt.IsZero() {
+ 			self.queueObservedAt = at
+ 		}
+-		self.heldPacingRate = 0
++		burstTime := windowPacingBurstMaximumTime(max(deliverySizedWindowSampleInterval, self.burstEstimateTime))
++		if timing.latest-timing.minimum-roundTripCompression > max(margin, burstTime) {
++			self.heldPacingRate = 0
++		}
+ 	}
+ }
+ 

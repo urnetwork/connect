@@ -1,0 +1,38 @@
+{
+  "manifest_sha256": "fe42a6b8d6e55bcf9b1c80514a8aa8d660e4777c3f1021cd714b4bfdd7033956",
+  "binary_sha256": "825e73e00db48d95c3dfb1a062a5bcdd151cdb8ad65ac538580ad1d67de8c2b6",
+  "effective_inputs_sha256": "c5b0dd1d4cefc9043f0de88fb797c18963a74603f2e0bac021ac0b479374db9c",
+  "argv": [
+    "/private/tmp/throughput-fix-2-service-qualification-after-v3-pinned/tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacing(CompressedFlightsKeepMeasuredSerialization|CarrierBufferedReadsAcrossSamplerBuckets|CarrierBufferedReadsDoNotInflateServiceBurst|CarrierUnqueuedTrainPreservesCapacity|CarrierFasterTrainRaisesMeasuredCapacity|LimitedFlight.*|CarrierPeakStaysUnqualifiedAfterQueueClears|CarrierFreshFastPairSupersedesRejectedPeak|CarrierSustainedQueuedIncreaseRaisesService|CarrierSameBucketHoldEndsAtFreshTrain|CarrierLateAccountingRetainsQueueProvenance)$",
+    "-test.count=3",
+    "-test.timeout=90s"
+  ],
+  "started_utc": "2026-09-16T16:56:34.759092+00:00",
+  "loadavg_start": [
+    20.77685546875,
+    11.951171875,
+    10.8173828125
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent retained-window implementation and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 2.240985000040382,
+  "loadavg_end": [
+    20.77685546875,
+    11.951171875,
+    10.8173828125
+  ],
+  "ended_utc": "2026-09-16T16:56:37.000410+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "d921c4d4feb29611d7083504b5c31033a8712fc84d2cde77e6a91231ccd210b0",
+  "pass": 42,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "rows": 21
+}

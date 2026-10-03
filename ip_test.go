@@ -4,16 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"fmt"
-
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -70,12 +72,14 @@ func TestTcp4Path(t *testing.T) {
 	AssertEqual(t, IpProtocolTcp, ipPath.Protocol)
 
 	AssertEqual(t, &IpPath{
-		Version:         4,
-		Protocol:        IpProtocolTcp,
-		SourceIp:        net.IPv4(byte(72), byte(0), byte(0), byte(1)).To4(),
-		SourcePort:      40000 + 1,
-		DestinationIp:   net.IPv4(byte(72), byte(1+1), byte(1+1), byte(1+1)).To4(),
-		DestinationPort: 443,
+		Version:             4,
+		Protocol:            IpProtocolTcp,
+		SourceIp:            net.IPv4(byte(72), byte(0), byte(0), byte(1)).To4(),
+		SourcePort:          40000 + 1,
+		DestinationIp:       net.IPv4(byte(72), byte(1+1), byte(1+1), byte(1+1)).To4(),
+		DestinationPort:     443,
+		TcpWindowSize:       4096,
+		TcpPayloadByteCount: 4,
 	}, ipPath)
 
 	ip4Path := ipPath.ToIp4Path()
@@ -122,12 +126,14 @@ func TestTcp6Path(t *testing.T) {
 	AssertEqual(t, IpProtocolTcp, ipPath.Protocol)
 
 	AssertEqual(t, &IpPath{
-		Version:         6,
-		Protocol:        IpProtocolTcp,
-		SourceIp:        net.IPv4(byte(72), byte(0), byte(0), byte(1)).To16(),
-		SourcePort:      40000 + 1,
-		DestinationIp:   net.IPv4(byte(72), byte(1+1), byte(1+1), byte(1+1)).To16(),
-		DestinationPort: 443,
+		Version:             6,
+		Protocol:            IpProtocolTcp,
+		SourceIp:            net.IPv4(byte(72), byte(0), byte(0), byte(1)).To16(),
+		SourcePort:          40000 + 1,
+		DestinationIp:       net.IPv4(byte(72), byte(1+1), byte(1+1), byte(1+1)).To16(),
+		DestinationPort:     443,
+		TcpWindowSize:       4096,
+		TcpPayloadByteCount: 4,
 	}, ipPath)
 
 	ip6Path := ipPath.ToIp6Path()
@@ -208,8 +214,14 @@ func tcp6Packet(s int, i int, j int, k int) (packet []byte, payload []byte) {
 	return
 }
 
+// This exact-delivery fixture keeps admission loss out of its routing
+// assertions. Focused Transfer tests force full queues; this capacity covers
+// the fixture's complete one-direction burst without changing production
+// defaults.
+const testClientTransferBufferSize = 4096
+
 func testingNewClient(ctx context.Context, providerClient *Client, receivePacketCallback ReceivePacketFunction) (UserNatClient, error) {
-	settings := DefaultClientSettings()
+	settings := DefaultClientSettingsWithBufferSize(testClientTransferBufferSize)
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 
 	routeSend := make(chan []byte)
@@ -239,7 +251,9 @@ func testingNewClient(ctx context.Context, providerClient *Client, receivePacket
 	), nil
 }
 
-// test with all sequence buffer sizes set to 0
+// Test with bounded production Transfer handoffs. Deterministic callback
+// regressions cover full and zero-capacity admission; this broader fixture
+// verifies routing, retransmission, and exact payload delivery under load.
 func testClient[P comparable](
 	t *testing.T,
 	userNatClientGenerator func(context.Context, *Client, ReceivePacketFunction) (UserNatClient, error),
@@ -266,39 +280,45 @@ func testClient[P comparable](
 	timeout := 30 * time.Second
 
 	m := 6
-	n := 6
+	// Keep enough independent tuples to exercise recovery and routing without
+	// making the package's correctness suite a long-duration performance run.
+	n := 2
 	repeatCount := 6
 	parallelCount := 6
 	echoCount := 2
 
 	// each packet gets echoed back
-	totalCount := parallelCount * m * n * n * n * repeatCount * (1 + echoCount)
+	sendCount := parallelCount * m * n * n * n * repeatCount
+	totalCount := sendCount * (1 + echoCount)
 
 	// cMutex := sync.Mutex{}
 	// cSendCount := 0
 	// cReceiveCount := 0
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	clientId := NewId()
 	providerClientId := NewId()
 
-	settings := DefaultClientSettings()
-	settings.SendBufferSettings.SequenceBufferSize = 0
-	settings.SendBufferSettings.AckBufferSize = 0
-	settings.ReceiveBufferSettings.SequenceBufferSize = 0
-	// settings.ReceiveBufferSettings.AckBufferSize = 0
-	settings.ForwardBufferSettings.SequenceBufferSize = 0
+	settings := DefaultClientSettingsWithBufferSize(testClientTransferBufferSize)
 	providerClient := NewClient(ctx, providerClientId, NewNoContractClientOob(), settings)
-	defer providerClient.Cancel()
 
 	type receivePacket struct {
 		source TransferPath
 		packet []byte
 	}
 
-	receivePackets := make(chan *receivePacket)
+	// Receive callbacks may not block. Size the test's single collector for the
+	// exact expected workload and make both callback handoffs nonblocking.
+	receivePackets := make(chan *receivePacket, totalCount)
+	var receivePacketOverflowCount atomic.Int64
+	asyncErrors := make(chan error, 1)
+	recordAsyncError := func(err error) {
+		select {
+		case asyncErrors <- err:
+		default:
+		}
+	}
 
 	receivePacketCallback := func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 		// record the echo packet
@@ -310,7 +330,8 @@ func testClient[P comparable](
 
 		ipPath, payload, err := ParseIpPathWithPayload(packet)
 		if err != nil {
-			panic(err)
+			recordAsyncError(fmt.Errorf("parse client receive packet: %w", err))
+			return
 		}
 		packet = ipOosPacket(ipPath.Reverse(), payload)
 
@@ -322,11 +343,65 @@ func testClient[P comparable](
 		select {
 		case <-ctx.Done():
 		case receivePackets <- receivePacket:
+		default:
+			receivePacketOverflowCount.Add(1)
+			recordAsyncError(errors.New("client receive collector overflow"))
 		}
 	}
 
 	natClient, err := userNatClientGenerator(ctx, providerClient, receivePacketCallback)
 	AssertEqual(t, err, nil)
+
+	// A receive callback cannot make a blocking send. One bounded queue and a
+	// fixed worker set own every echo send, avoiding the old goroutine-per-echo
+	// memory spike while preserving all expected echo work.
+	echoPackets := make(chan *receivePacket, sendCount)
+	var echoWorkerWaitGroup sync.WaitGroup
+	for workerIndex := 0; workerIndex < parallelCount; workerIndex += 1 {
+		echoWorkerWaitGroup.Add(1)
+		go func() {
+			defer echoWorkerWaitGroup.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case receivePacket := <-echoPackets:
+					ipPath, payload, parseErr := ParseIpPathWithPayload(receivePacket.packet)
+					if parseErr != nil {
+						recordAsyncError(fmt.Errorf("parse provider echo packet: %w", parseErr))
+						continue
+					}
+					packet := ipOosPacket(ipPath.Reverse(), payload)
+					for echoIndex := 0; echoIndex < echoCount; echoIndex += 1 {
+						ipPacketFromProvider := &protocol.IpPacketFromProvider{
+							IpPacket: &protocol.IpPacket{
+								PacketBytes: packet,
+							},
+						}
+						frame, frameErr := ToFrame(ipPacketFromProvider, DefaultProtocolVersion)
+						if frameErr != nil {
+							recordAsyncError(fmt.Errorf("encode provider echo: %w", frameErr))
+							break
+						}
+						if !providerClient.SendWithTimeout(frame, receivePacket.source.SourceId, func(error) {}, -1) {
+							if ctx.Err() == nil {
+								recordAsyncError(errors.New("send provider echo"))
+							}
+							break
+						}
+					}
+				}
+			}
+		}()
+	}
+	var sendWorkerWaitGroup sync.WaitGroup
+	defer func() {
+		natClient.Close()
+		cancel()
+		providerClient.Cancel()
+		sendWorkerWaitGroup.Wait()
+		echoWorkerWaitGroup.Wait()
+	}()
 
 	providerClient.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, peer Peer) {
 		// cMutex.Lock()
@@ -334,32 +409,6 @@ func testClient[P comparable](
 		// // fmt.Printf("C Receive %d/%d (%.2f%%)\n", cReceiveCount, totalCount, 100.0 * float32(cReceiveCount) / float32(totalCount))
 		// cMutex.Unlock()
 
-		echo := func(packet []byte) {
-			// reverse the packet
-			ipPath, payload, err := ParseIpPathWithPayload(packet)
-			if err != nil {
-				panic(err)
-			}
-			packet = ipOosPacket(ipPath.Reverse(), payload)
-
-			ipPacketFromProvider := &protocol.IpPacketFromProvider{
-				IpPacket: &protocol.IpPacket{
-					PacketBytes: packet,
-				},
-			}
-			frame, err := ToFrame(ipPacketFromProvider, DefaultProtocolVersion)
-			if err != nil {
-				panic(err)
-			}
-
-			success := providerClient.SendWithTimeout(frame, source.Reverse(), func(err error) {}, -1)
-			AssertEqual(t, true, success)
-
-			// cMutex.Lock()
-			// cSendCount += 1
-			// // fmt.Printf("C Send %d/%d (%.2f%%)\n", cSendCount, totalCount, 100.0 * float32(cSendCount) / float32(totalCount))
-			// cMutex.Unlock()
-		}
 		for _, frame := range frames {
 			if ipPacketToProvider_, err := FromFrame(frame); err == nil {
 				if ipPacketToProvider, ok := ipPacketToProvider_.(*protocol.IpPacketToProvider); ok {
@@ -373,13 +422,18 @@ func testClient[P comparable](
 						packet: packet,
 					}
 
-					receivePackets <- receivePacket
+					select {
+					case receivePackets <- receivePacket:
+					default:
+						receivePacketOverflowCount.Add(1)
+						recordAsyncError(errors.New("provider receive collector overflow"))
+					}
 
-					for i := 0; i < echoCount; i += 1 {
-						// do not make a blocking call back into the client from the receiver
-						// this could deadlock the client depending on whether other messages are
-						// queued to this receiver
-						go echo(packet)
+					select {
+					case <-ctx.Done():
+					case echoPackets <- receivePacket:
+					default:
+						recordAsyncError(errors.New("provider echo queue overflow"))
 					}
 				}
 			}
@@ -388,7 +442,9 @@ func testClient[P comparable](
 	})
 
 	for p := 0; p < parallelCount; p += 1 {
+		sendWorkerWaitGroup.Add(1)
 		go func() {
+			defer sendWorkerWaitGroup.Done()
 			source := SourceId(clientId)
 			packetCount := 0
 			for s := 0; s < m; s += 1 {
@@ -400,9 +456,11 @@ func testClient[P comparable](
 								packet, _ := packetGenerator(s, i, j, k)
 								success := natClient.SendPacket(source, protocol.ProvideMode_Network, packet, -1)
 								if !success {
-									fmt.Printf("[TIMEOUT][%d] %T\n", packetCount, natClient)
+									if ctx.Err() == nil {
+										recordAsyncError(fmt.Errorf("send packet %d with %T", packetCount, natClient))
+									}
+									return
 								}
-								AssertEqual(t, true, success)
 
 								// cMutex.Lock()
 								// cSendCount += 1
@@ -465,6 +523,8 @@ func testClient[P comparable](
 		case <-time.After(timeout):
 			fmt.Printf("[TIMEOUT]receive\n")
 			t.FailNow()
+		case asyncErr := <-asyncErrors:
+			t.Fatalf("asynchronous test worker: %v", asyncErr)
 		}
 	}
 	select {
@@ -472,6 +532,9 @@ func testClient[P comparable](
 		// excesss packets received
 		t.FailNow()
 	case <-time.After(1 * time.Second):
+	}
+	if got := receivePacketOverflowCount.Load(); got != 0 {
+		t.Fatalf("receive callback collector overflowed %d time(s)", got)
 	}
 
 	// make sure all messages were received
@@ -518,8 +581,19 @@ func testClient[P comparable](
 // connects the packet side of `tun` to `localUserNat`.
 // returns a function that removes the receive callback.
 func bridgeTunToLocalUserNat(tun *Tun, localUserNat *LocalUserNat, source TransferPath) func() {
+	return bridgeTunToLocalUserNatWithBatchSize(tun, localUserNat, source, 64)
+}
+
+// Connects the same bridge while making the TUN read-ahead cap explicit for
+// batch-depth benchmarks.
+func bridgeTunToLocalUserNatWithBatchSize(
+	tun *Tun,
+	localUserNat *LocalUserNat,
+	source TransferPath,
+	maximumPacketCount int,
+) func() {
 	go HandleError(func() {
-		packets := make([][]byte, 64)
+		packets := make([][]byte, max(1, maximumPacketCount))
 		for {
 			n, err := tun.ReadBatch(packets)
 			if err != nil {
@@ -588,9 +662,19 @@ func TestIpEgressTcp4(t *testing.T) {
 	removeReceiveCallback := bridgeTunToLocalUserNat(tun, localUserNat, SourceId(NewId()))
 	defer removeReceiveCallback()
 
-	// the tcp socket read buffer is `DefaultMtu` minus the maximum headers (1380),
-	// and data packets segment at `DefaultMtu`
-	payloadSizes := []int{1, 1379, 1380, 1381, 2048, 16384, 1 << 20}
+	// Exercise the TCP socket read boundary on both sides of DefaultMtu minus
+	// the maximum 60 bytes of IPv4/TCP headers; data packets segment at the
+	// global tunnel MTU.
+	maximumPayloadByteCount := DefaultMtu - 60
+	payloadSizes := []int{
+		1,
+		maximumPayloadByteCount - 1,
+		maximumPayloadByteCount,
+		maximumPayloadByteCount + 1,
+		2048,
+		16384,
+		1 << 20,
+	}
 
 	parallelCount := 4
 	flowErrs := make(chan error, parallelCount)
@@ -612,8 +696,7 @@ func TestIpEgressTcp4(t *testing.T) {
 					go HandleError(func() {
 						readErr <- func() error {
 							echoPayload := make([]byte, payloadSize)
-							conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-							if n, err := io.ReadFull(conn, echoPayload); err != nil {
+							if n, err := readFullWithProgressDeadline(ctx, conn, echoPayload, 10*time.Second); err != nil {
 								stats := tun.Stats()
 								return fmt.Errorf(
 									"read size=%d received=%d: %w (ip=%d/%d/%d malformed=%d tcp=%d/%d checksum=%d dropped=%d tx_no_buffer=%d)",
@@ -638,8 +721,7 @@ func TestIpEgressTcp4(t *testing.T) {
 						}()
 					})
 
-					conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-					if _, err := conn.Write(payload); err != nil {
+					if err := writeConnPhaseWithDeadline(ctx, conn, payload, 10*time.Second); err != nil {
 						return fmt.Errorf("write size=%d: %w", payloadSize, err)
 					}
 					if err := <-readErr; err != nil {
@@ -874,6 +956,17 @@ func newBenchmarkEgressBridgeWithShardCount(b *testing.B, ctx context.Context, s
 // directly into the receiver tap/tun interface. the large mtu benchmark
 // variants are diagnostics only.
 func newBenchmarkEgressBridgeWithMtu(b *testing.B, ctx context.Context, mtu int) (*Tun, func()) {
+	return newBenchmarkEgressBridgeWithMtuAndBatchSize(b, ctx, mtu, 64)
+}
+
+// Builds the same bridge while varying only the TUN and per-flow ready-drain
+// caps. Queue capacities and flow windows retain their production defaults.
+func newBenchmarkEgressBridgeWithMtuAndBatchSize(
+	b *testing.B,
+	ctx context.Context,
+	mtu int,
+	maximumPacketCount int,
+) (*Tun, func()) {
 	tunSettings := DefaultTunSettingsWithBufferSize(2048)
 	tunSettings.Mtu = mtu
 	tun, err := CreateTun(ctx, tunSettings)
@@ -883,8 +976,15 @@ func newBenchmarkEgressBridgeWithMtu(b *testing.B, ctx context.Context, mtu int)
 	localUserNatSettings := DefaultLocalUserNatSettings()
 	localUserNatSettings.TcpBufferSettings.Mtu = mtu
 	localUserNatSettings.UdpBufferSettings.Mtu = mtu
+	localUserNatSettings.TcpBufferSettings.WriteBatchSize = maximumPacketCount
+	localUserNatSettings.UdpBufferSettings.WriteBatchSize = maximumPacketCount
 	localUserNat := NewLocalUserNat(ctx, "benchEgress", localUserNatSettings)
-	removeReceiveCallback := bridgeTunToLocalUserNat(tun, localUserNat, SourceId(NewId()))
+	removeReceiveCallback := bridgeTunToLocalUserNatWithBatchSize(
+		tun,
+		localUserNat,
+		SourceId(NewId()),
+		maximumPacketCount,
+	)
 	closeBridge := func() {
 		removeReceiveCallback()
 		localUserNat.Close()
@@ -897,16 +997,26 @@ func newBenchmarkEgressBridgeWithMtu(b *testing.B, ctx context.Context, mtu int)
 // this exercises the tcp send path: sequence buffering, the write pipeline,
 // window adjustment, and pure acks back to the source.
 func BenchmarkIpEgressTcp4Up(b *testing.B) {
-	benchmarkIpEgressTcp4Up(b, DefaultMtu)
+	benchmarkIpEgressTcp4Up(b, DefaultMtu, 64)
+}
+
+// Measures the shared TUN/NAT upload path with an eight-packet ready drain.
+func BenchmarkIpEgressTcp4UpBatch8(b *testing.B) {
+	benchmarkIpEgressTcp4Up(b, DefaultMtu, 8)
+}
+
+// Measures the shared TUN/NAT upload path with its current ready drain.
+func BenchmarkIpEgressTcp4UpBatch64(b *testing.B) {
+	benchmarkIpEgressTcp4Up(b, DefaultMtu, 64)
 }
 
 // `BenchmarkIpEgressTcp4Up` at the maximum mtu.
 // the gap to the default mtu run is the per-packet overhead of the pipeline.
 func BenchmarkIpEgressTcp4UpMtu64k(b *testing.B) {
-	benchmarkIpEgressTcp4Up(b, 65535)
+	benchmarkIpEgressTcp4Up(b, 65535, 64)
 }
 
-func benchmarkIpEgressTcp4Up(b *testing.B, mtu int) {
+func benchmarkIpEgressTcp4Up(b *testing.B, mtu int, maximumPacketCount int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -937,7 +1047,12 @@ func benchmarkIpEgressTcp4Up(b *testing.B, mtu int) {
 		}
 	})
 
-	tun, closeBridge := newBenchmarkEgressBridgeWithMtu(b, ctx, mtu)
+	tun, closeBridge := newBenchmarkEgressBridgeWithMtuAndBatchSize(
+		b,
+		ctx,
+		mtu,
+		maximumPacketCount,
+	)
 	defer closeBridge()
 
 	conn, err := tun.DialContext(ctx, "tcp", sinkListener.Addr().String())
@@ -973,16 +1088,26 @@ func benchmarkIpEgressTcp4Up(b *testing.B, mtu int) {
 // this exercises the tcp receive path: socket reads, data packet
 // serialization, and window waits against the source acks.
 func BenchmarkIpEgressTcp4Down(b *testing.B) {
-	benchmarkIpEgressTcp4Down(b, DefaultMtu)
+	benchmarkIpEgressTcp4Down(b, DefaultMtu, 64)
+}
+
+// Measures the shared TUN/NAT download path with an eight-packet ready drain.
+func BenchmarkIpEgressTcp4DownBatch8(b *testing.B) {
+	benchmarkIpEgressTcp4Down(b, DefaultMtu, 8)
+}
+
+// Measures the shared TUN/NAT download path with its current ready drain.
+func BenchmarkIpEgressTcp4DownBatch64(b *testing.B) {
+	benchmarkIpEgressTcp4Down(b, DefaultMtu, 64)
 }
 
 // `BenchmarkIpEgressTcp4Down` at the maximum mtu.
 // the gap to the default mtu run is the per-packet overhead of the pipeline.
 func BenchmarkIpEgressTcp4DownMtu64k(b *testing.B) {
-	benchmarkIpEgressTcp4Down(b, 65535)
+	benchmarkIpEgressTcp4Down(b, 65535, 64)
 }
 
-func benchmarkIpEgressTcp4Down(b *testing.B, mtu int) {
+func benchmarkIpEgressTcp4Down(b *testing.B, mtu int, maximumPacketCount int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1019,7 +1144,12 @@ func benchmarkIpEgressTcp4Down(b *testing.B, mtu int) {
 		}
 	})
 
-	tun, closeBridge := newBenchmarkEgressBridgeWithMtu(b, ctx, mtu)
+	tun, closeBridge := newBenchmarkEgressBridgeWithMtuAndBatchSize(
+		b,
+		ctx,
+		mtu,
+		maximumPacketCount,
+	)
 	defer closeBridge()
 
 	conn, err := tun.DialContext(ctx, "tcp", sourceListener.Addr().String())
@@ -1124,6 +1254,20 @@ func BenchmarkIpEgressUdp4RoundTrip(b *testing.B) {
 // source keeps at most `windowSize` datagrams unacked. the window stays below
 // all of the buffer sizes so the flow is lossless by construction.
 func BenchmarkIpEgressUdp4Up(b *testing.B) {
+	benchmarkIpEgressUdp4Up(b, 64)
+}
+
+// Measures the shared TUN/NAT UDP upload path with an eight-packet drain.
+func BenchmarkIpEgressUdp4UpBatch8(b *testing.B) {
+	benchmarkIpEgressUdp4Up(b, 8)
+}
+
+// Measures the shared TUN/NAT UDP upload path with its current drain.
+func BenchmarkIpEgressUdp4UpBatch64(b *testing.B) {
+	benchmarkIpEgressUdp4Up(b, 64)
+}
+
+func benchmarkIpEgressUdp4Up(b *testing.B, maximumPacketCount int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1159,7 +1303,12 @@ func BenchmarkIpEgressUdp4Up(b *testing.B) {
 		}
 	})
 
-	tun, closeBridge := newBenchmarkEgressBridge(b, ctx)
+	tun, closeBridge := newBenchmarkEgressBridgeWithMtuAndBatchSize(
+		b,
+		ctx,
+		DefaultMtu,
+		maximumPacketCount,
+	)
 	defer closeBridge()
 
 	conn, err := tun.DialContext(ctx, "udp", sinkConn.LocalAddr().String())
@@ -1217,6 +1366,20 @@ func BenchmarkIpEgressUdp4Up(b *testing.B) {
 // server keeps at most `windowSize` datagrams unacked. the window stays below
 // all of the buffer sizes so the flow is lossless by construction.
 func BenchmarkIpEgressUdp4Down(b *testing.B) {
+	benchmarkIpEgressUdp4Down(b, 64)
+}
+
+// Measures the shared TUN/NAT UDP download path with an eight-packet drain.
+func BenchmarkIpEgressUdp4DownBatch8(b *testing.B) {
+	benchmarkIpEgressUdp4Down(b, 8)
+}
+
+// Measures the shared TUN/NAT UDP download path with its current drain.
+func BenchmarkIpEgressUdp4DownBatch64(b *testing.B) {
+	benchmarkIpEgressUdp4Down(b, 64)
+}
+
+func benchmarkIpEgressUdp4Down(b *testing.B, maximumPacketCount int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1266,7 +1429,12 @@ func BenchmarkIpEgressUdp4Down(b *testing.B) {
 		}
 	})
 
-	tun, closeBridge := newBenchmarkEgressBridge(b, ctx)
+	tun, closeBridge := newBenchmarkEgressBridgeWithMtuAndBatchSize(
+		b,
+		ctx,
+		DefaultMtu,
+		maximumPacketCount,
+	)
 	defer closeBridge()
 
 	conn, err := tun.DialContext(ctx, "udp", sourceConn.LocalAddr().String())

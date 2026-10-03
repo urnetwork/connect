@@ -1,0 +1,269 @@
+[
+  {
+    "binary_sha256": "f25e0ac8e0327f82a104aaf984a46b69d48d671f5ff9e493ac63044d23c40763",
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "8fa28edcbe940da794ea2dfa718901e4b827291cdac085d5df44d92e4e157668",
+    "effective_inputs_sha256": "7f87e26e1da2e29c61ea3b377f38bd3890f9ca60e03960231dbecfd563670572",
+    "inputs_match_at_archive": true,
+    "instrumentation_evidence": {
+      "binary_sha256_matched": true,
+      "compile_manifest_race": true,
+      "embedded_go_build_race": true
+    },
+    "name": "before-roots",
+    "original_inputs": {
+      "compile_manifest": {
+        "artifact": "receiver-ordering-bounds-before-pinned",
+        "path": "tests.manifest.json"
+      },
+      "raw_log": {
+        "artifact": "receiver-ordering-bounds-before-pinned",
+        "path": "roots/run.log"
+      },
+      "run_status": {
+        "artifact": "receiver-ordering-bounds-before-pinned",
+        "path": "roots/status.json"
+      }
+    },
+    "outcome_scope": "complete raw invocation",
+    "outcomes": {
+      "FAIL": 3,
+      "PASS": 21,
+      "SKIP": 0
+    },
+    "race": true,
+    "race_warnings": 0,
+    "raw_log_sha256": "1907a161693724294dd066f81d6cdf3415cb3818a6e868b4407a62119ce517ba",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "f25e0ac8e0327f82a104aaf984a46b69d48d671f5ff9e493ac63044d23c40763",
+      "effective_inputs_sha256": "7f87e26e1da2e29c61ea3b377f38bd3890f9ca60e03960231dbecfd563670572",
+      "elapsed_seconds": 0.9836423331871629,
+      "ended_utc": "2026-09-16T18:59:32.450618+00:00",
+      "exit_status": 1,
+      "fail": 3,
+      "loadavg_end": [
+        8.85400390625,
+        15.72216796875,
+        15.96484375
+      ],
+      "loadavg_start": [
+        8.85400390625,
+        15.72216796875,
+        15.96484375
+      ],
+      "manifest_sha256": "8fa28edcbe940da794ea2dfa718901e4b827291cdac085d5df44d92e4e157668",
+      "no_quiescence_wait": true,
+      "pass": 21,
+      "race_warnings": 0,
+      "raw_log_sha256": "1907a161693724294dd066f81d6cdf3415cb3818a6e868b4407a62119ce517ba",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T18:59:31.466649+00:00"
+    },
+    "selected_tests": [
+      "TestWindowPacingReceiverOrderingDelayedCreditCannotHideReversal",
+      "TestWindowPacingReceiverOrderingEarliestBytesStayWithTheirEndpoint",
+      "TestWindowPacingReceiverOrderingEqualCheckpointCannotCountEarlierBytes",
+      "TestWindowPacingReceiverOrderingInteriorReplyCannotRaiseCapacity",
+      "TestWindowPacingReceiverOrderingLaterPairSupersedesInvalidHistory",
+      "TestWindowPacingReceiverOrderingMonotoneDeliveryKeepsCapacity",
+      "TestWindowPacingReceiverOrderingResizeCannotRestoreInvalidInterval",
+      "TestWindowPacingReceiverOrderingWarmIntervalCannotRaiseCapacity"
+    ],
+    "source_content_sha256": "ba3cdb64c6e44d5f38deacc1cdeef3962324c0124d0f4cd848c26623bc240219",
+    "test_pattern": "^TestWindowPacingReceiverOrdering.*$"
+  },
+  {
+    "binary_sha256": "7b1487a7fe77de32c79c8228bdfa2040397db659ef67816cbf019ef51ceef1ce",
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "845817c636bd7ce9994f48f1a534c8f2dd5d305d1fe0d7f2f4a2feb9aea14cee",
+    "effective_inputs_sha256": "527de5a4b4171e46333d638b0862e5da4428e41bff73ca9506a1cc197033fc92",
+    "inputs_match_at_archive": true,
+    "instrumentation_evidence": {
+      "binary_sha256_matched": true,
+      "compile_manifest_race": true,
+      "embedded_go_build_race": true
+    },
+    "name": "after-roots",
+    "original_inputs": {
+      "compile_manifest": {
+        "artifact": "receiver-ordering-bounds-after-pinned",
+        "path": "tests.manifest.json"
+      },
+      "raw_log": {
+        "artifact": "receiver-ordering-bounds-after-pinned",
+        "path": "roots/run.log"
+      },
+      "run_status": {
+        "artifact": "receiver-ordering-bounds-after-pinned",
+        "path": "roots/status.json"
+      }
+    },
+    "outcome_scope": "complete raw invocation",
+    "outcomes": {
+      "FAIL": 0,
+      "PASS": 24,
+      "SKIP": 0
+    },
+    "race": true,
+    "race_warnings": 0,
+    "raw_log_sha256": "b032ecde51c8d66ec0013ea9c5a8a2512d8f8b72c5f3eaf9961f3cf85046c125",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "7b1487a7fe77de32c79c8228bdfa2040397db659ef67816cbf019ef51ceef1ce",
+      "effective_inputs_sha256": "527de5a4b4171e46333d638b0862e5da4428e41bff73ca9506a1cc197033fc92",
+      "elapsed_seconds": 1.9892153339460492,
+      "ended_utc": "2026-09-16T19:00:12.099459+00:00",
+      "exit_status": 0,
+      "fail": 0,
+      "loadavg_end": [
+        8.5859375,
+        14.78564453125,
+        15.60888671875
+      ],
+      "loadavg_start": [
+        8.5859375,
+        14.78564453125,
+        15.60888671875
+      ],
+      "manifest_sha256": "845817c636bd7ce9994f48f1a534c8f2dd5d305d1fe0d7f2f4a2feb9aea14cee",
+      "no_quiescence_wait": true,
+      "pass": 24,
+      "race_warnings": 0,
+      "raw_log_sha256": "b032ecde51c8d66ec0013ea9c5a8a2512d8f8b72c5f3eaf9961f3cf85046c125",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T19:00:10.109870+00:00"
+    },
+    "selected_tests": [
+      "TestWindowPacingReceiverOrderingDelayedCreditCannotHideReversal",
+      "TestWindowPacingReceiverOrderingEarliestBytesStayWithTheirEndpoint",
+      "TestWindowPacingReceiverOrderingEqualCheckpointCannotCountEarlierBytes",
+      "TestWindowPacingReceiverOrderingInteriorReplyCannotRaiseCapacity",
+      "TestWindowPacingReceiverOrderingLaterPairSupersedesInvalidHistory",
+      "TestWindowPacingReceiverOrderingMonotoneDeliveryKeepsCapacity",
+      "TestWindowPacingReceiverOrderingResizeCannotRestoreInvalidInterval",
+      "TestWindowPacingReceiverOrderingWarmIntervalCannotRaiseCapacity"
+    ],
+    "source_content_sha256": "39535cd7cc4f2d47ca1aa4a7b7612e226130d249368d8b509fe0dc2c5430354d",
+    "test_pattern": "^TestWindowPacingReceiverOrdering.*$"
+  },
+  {
+    "binary_sha256": "7b1487a7fe77de32c79c8228bdfa2040397db659ef67816cbf019ef51ceef1ce",
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "845817c636bd7ce9994f48f1a534c8f2dd5d305d1fe0d7f2f4a2feb9aea14cee",
+    "effective_inputs_sha256": "527de5a4b4171e46333d638b0862e5da4428e41bff73ca9506a1cc197033fc92",
+    "inputs_match_at_archive": true,
+    "instrumentation_evidence": {
+      "binary_sha256_matched": true,
+      "compile_manifest_race": true,
+      "embedded_go_build_race": true
+    },
+    "name": "after-adjacent",
+    "original_inputs": {
+      "compile_manifest": {
+        "artifact": "receiver-ordering-bounds-after-pinned",
+        "path": "tests.manifest.json"
+      },
+      "raw_log": {
+        "artifact": "receiver-ordering-bounds-after-pinned",
+        "path": "adjacent/run.log"
+      },
+      "run_status": {
+        "artifact": "receiver-ordering-bounds-after-pinned",
+        "path": "adjacent/status.json"
+      }
+    },
+    "outcome_scope": "complete raw invocation",
+    "outcomes": {
+      "FAIL": 0,
+      "PASS": 132,
+      "SKIP": 0
+    },
+    "race": true,
+    "race_warnings": 0,
+    "raw_log_sha256": "ac9e6b35b35df58d74174cb9ac62e2737f369bb0855b4648a34f56a6c81c4a5f",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "7b1487a7fe77de32c79c8228bdfa2040397db659ef67816cbf019ef51ceef1ce",
+      "effective_inputs_sha256": "527de5a4b4171e46333d638b0862e5da4428e41bff73ca9506a1cc197033fc92",
+      "elapsed_seconds": 1.466490250080824,
+      "ended_utc": "2026-09-16T19:00:26.612073+00:00",
+      "exit_status": 0,
+      "fail": 0,
+      "loadavg_end": [
+        8.16015625,
+        14.38720703125,
+        15.45166015625
+      ],
+      "loadavg_start": [
+        8.16015625,
+        14.38720703125,
+        15.45166015625
+      ],
+      "manifest_sha256": "845817c636bd7ce9994f48f1a534c8f2dd5d305d1fe0d7f2f4a2feb9aea14cee",
+      "no_quiescence_wait": true,
+      "pass": 132,
+      "race_warnings": 0,
+      "raw_log_sha256": "ac9e6b35b35df58d74174cb9ac62e2737f369bb0855b4648a34f56a6c81c4a5f",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T19:00:25.144334+00:00"
+    },
+    "selected_tests": [
+      "TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets",
+      "TestWindowPacingCarrierBufferedReadsDoNotInflateServiceBurst",
+      "TestWindowPacingCarrierChangeInvalidatesProbeBeforeUnpacedRetry",
+      "TestWindowPacingCarrierFasterTrainRaisesMeasuredCapacity",
+      "TestWindowPacingCarrierFreshFastPairSupersedesRejectedPeak",
+      "TestWindowPacingCarrierLateAccountingRetainsQueueProvenance",
+      "TestWindowPacingCarrierPeakStaysUnqualifiedAfterQueueClears",
+      "TestWindowPacingCarrierSameBucketHoldEndsAtFreshTrain",
+      "TestWindowPacingCarrierSustainedQueuedIncreaseRaisesService",
+      "TestWindowPacingCarrierUnqueuedTrainPreservesCapacity",
+      "TestWindowPacingCompressedFlightsKeepMeasuredSerialization",
+      "TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization",
+      "TestWindowPacingLimitedFlightAcceptsContinuousSlowPair",
+      "TestWindowPacingLimitedFlightAcceptsQueuedSlowService",
+      "TestWindowPacingLimitedFlightAckPhaseDoesNotCompleteService",
+      "TestWindowPacingLimitedFlightModestQueueKeepsSerialization",
+      "TestWindowPacingLimitedFlightReorderedAccountingKeepsService",
+      "TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts",
+      "TestWindowPacingPartialCycleIncreaseKeepsCompressionGap",
+      "TestWindowPacingPartialCycleRaisesOnlyFromNewDelivery",
+      "TestWindowPacingPartialFeedbackGapPreservesEstablishedService",
+      "TestWindowPacingReceiverCreditDelayedAccountingKeepsOwnWait",
+      "TestWindowPacingReceiverCreditMixedPrefixKeepsRawInterval",
+      "TestWindowPacingReceiverCreditNonpositiveIntervalCannotGrantCapacity",
+      "TestWindowPacingReceiverCreditRejectsUnprovedHeads",
+      "TestWindowPacingReceiverCreditSackedHeadKeepsPrefixRaw",
+      "TestWindowPacingReceiverCreditSiblingCannotRetimeLegacyHead",
+      "TestWindowPacingReceiverWaitPreservesPhysicalSerialization",
+      "TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization",
+      "TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved",
+      "TestWindowPacingSdkColdDrainedTrainUsesExactPair",
+      "TestWindowPacingSdkColdEqualWaitsDiscoverSlowService",
+      "TestWindowPacingSdkColdLegacyTrainKeepsCompressionBound",
+      "TestWindowPacingSdkColdOneCumulativeReplyStaysUnmeasured",
+      "TestWindowPacingSdkColdReceiverWaitMeasuresShortTrain",
+      "TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity",
+      "TestWindowPacingSdkInitialAckBeforeWriteConfirmation",
+      "TestWindowPacingSdkInitialDelayedOpeningAccounting",
+      "TestWindowPacingSdkInitialDrainedReplyDoesNotEstablishService",
+      "TestWindowPacingSdkInitialFreshPairDiscoversSlowService",
+      "TestWindowPacingSdkInitialLateOpeningPairRemainsEvidence",
+      "TestWindowPacingSdkInitialOutstandingFlightDiscoversSlowService",
+      "TestWindowPacingSdkInitialSiblingFeedbackStartsFreshTrain",
+      "TestWindowPacingSdkInitialUnreadPairPreservesService"
+    ],
+    "source_content_sha256": "39535cd7cc4f2d47ca1aa4a7b7612e226130d249368d8b509fe0dc2c5430354d",
+    "test_pattern": "^(TestWindowPacingSdkCold.*|TestWindowPacingReceiverCredit.*|TestWindowPacingSdkInitial.*|TestWindowPacingCarrier.*|TestWindowPacingCompressedFlights.*|TestWindowPacingPartialFeedback.*|TestWindowPacingPartialCycle.*|TestWindowPacingLimitedFlight.*|TestWindowPacingReceiverWait.*|TestWindowPacingEqualReceiverWaits.*)$"
+  }
+]

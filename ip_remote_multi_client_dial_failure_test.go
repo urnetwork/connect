@@ -218,13 +218,13 @@ func TestDialStarvedWindowing(t *testing.T) {
 		t.Fatal("a fresh channel reported starved with no failures")
 	}
 
-	client.addDialFailure("93.184.216.34")
-	client.addDialFailure("142.250.74.100")
+	client.addDialFailure("93.184.216.34", 4)
+	client.addDialFailure("142.250.74.100", 4)
 	if client.dialStarved() {
 		t.Fatal("2 failures (below the threshold) reported starved")
 	}
 
-	client.addDialFailure("93.184.216.34")
+	client.addDialFailure("93.184.216.34", 4)
 	if !client.dialStarved() {
 		t.Fatal("3 failures across 2 destinations with no successes did not report starved")
 	}
@@ -233,7 +233,7 @@ func TestDialStarvedWindowing(t *testing.T) {
 	}
 
 	// a single proven connect in the window resets starvation
-	client.addConnectSuccess()
+	client.addConnectSuccess(4)
 	if client.dialStarved() {
 		t.Fatal("a connect success in the window did not reset starvation")
 	}
@@ -248,9 +248,9 @@ func TestDialStarvedRequiresDistinctDestinations(t *testing.T) {
 	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
 
 	// three strikes, one destination: not starvation
-	client.addDialFailure("93.184.216.34")
-	client.addDialFailure("93.184.216.34")
-	client.addDialFailure("93.184.216.34")
+	client.addDialFailure("93.184.216.34", 4)
+	client.addDialFailure("93.184.216.34", 4)
+	client.addDialFailure("93.184.216.34", 4)
 	if client.dialStarved() {
 		t.Fatal("3 strikes from a single destination reported starved: one dead site convicted the exit")
 	}
@@ -261,7 +261,7 @@ func TestDialStarvedRequiresDistinctDestinations(t *testing.T) {
 
 	// a strike for a second destination makes the span, and the exit is
 	// starved immediately -- demotion stays fast for the real dud
-	client.addDialFailure("142.250.74.100")
+	client.addDialFailure("142.250.74.100", 4)
 	if !client.dialStarved() {
 		t.Fatal("strikes spanning 2 destinations did not report starved")
 	}
@@ -323,7 +323,7 @@ func TestChannelInterceptDoesNotBumpReceiveCounters(t *testing.T) {
 		args:        &multiClientChannelArgs{},
 		settings:    DefaultMultiClientSettings(),
 		packetStats: &clientWindowStats{log: DefaultLogger()},
-		clientReceivePacketCallback: func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+		clientReceivePacketCallback: func(client *multiClientChannel, source TransferPath, provideMode protocol.ProvideMode, transportType TransportType, ipPath *IpPath, packet []byte) {
 		},
 		dialFailureCallback: func(sourceClient *multiClientChannel, egressIpPath *IpPath) bool {
 			gotClient = sourceClient
@@ -441,13 +441,39 @@ func TestDialFailureQuicFlowReraces(t *testing.T) {
 func TestSynWaitHandshakeTrips(t *testing.T) {
 	update := &multiClientChannelUpdate{}
 	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
+	tcpPath := udpTestPath(4)
+	tcpPath.Protocol = IpProtocolTcp
+	tcpPath.Syn = true
 
-	if update.synWaitExceeded(client, 0) {
+	if update.synWaitExceeded(client, tcpPath, 0) {
 		t.Fatal("the first probe must only start the clock, never trip")
 	}
 	// a zero timeout is already exceeded by the second probe
-	if !update.synWaitExceeded(client, 0) {
+	if !update.synWaitExceeded(client, tcpPath, 0) {
 		t.Error("a retransmitting handshake past the timeout did not trip")
+	}
+}
+
+// A pure TCP SYN never becomes a one-way stream. Even an unusually persistent
+// dial must remain eligible for re-racing after the UDP ambiguity budget is
+// exhausted; otherwise a long caller timeout can strand it permanently.
+func TestSynWaitTCPHandshakeNeverExhaustsResponseBudget(t *testing.T) {
+	update := &multiClientChannelUpdate{}
+	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
+	tcpPath := udpTestPath(4)
+	tcpPath.Protocol = IpProtocolTcp
+	tcpPath.Syn = true
+
+	if update.synWaitExceeded(client, tcpPath, time.Hour) {
+		t.Fatal("the first SYN tripped the silence clock")
+	}
+	for range dialProbeMaxSends {
+		if update.synWaitExceeded(client, tcpPath, time.Hour) {
+			t.Fatal("a SYN inside a deliberately wide timeout tripped the silence clock")
+		}
+	}
+	if !update.synWaitExceeded(client, tcpPath, 0) {
+		t.Fatal("a TCP handshake aged into the one-way UDP exemption")
 	}
 }
 
@@ -459,23 +485,24 @@ func TestSynWaitHandshakeTrips(t *testing.T) {
 func TestSynWaitStreamIsExempt(t *testing.T) {
 	update := &multiClientChannelUpdate{}
 	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
+	udpPath := udpTestPath(4)
 
-	update.synWaitExceeded(client, 0) // starts the clock at count 1
+	update.synWaitExceeded(client, udpPath, 0) // starts the clock at count 1
 	for range dialProbeMaxSends - 1 {
-		update.synWaitExceeded(client, time.Hour) // burn the budget, no trip
+		update.synWaitExceeded(client, udpPath, time.Hour) // burn the budget, no trip
 	}
 	// the budget is spent; even a long-exceeded timeout must not trip
-	if update.synWaitExceeded(client, 0) {
+	if update.synWaitExceeded(client, udpPath, 0) {
 		t.Error("a flow past the probe budget was re-raced: streams belong to the blackhole detector")
 	}
 
 	// a re-race onto another exit re-keys clock and budget, so the flow is
 	// judged fresh where it actually dials fresh
 	other := &multiClientChannel{settings: DefaultMultiClientSettings()}
-	if update.synWaitExceeded(other, 0) {
+	if update.synWaitExceeded(other, udpPath, 0) {
 		t.Fatal("first probe on a fresh exit must only start the clock")
 	}
-	if !update.synWaitExceeded(other, 0) {
+	if !update.synWaitExceeded(other, udpPath, 0) {
 		t.Error("the re-keyed budget did not allow a fresh handshake to trip")
 	}
 }
@@ -487,11 +514,11 @@ func TestSendPathInferenceUsesDialProbePacket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendPacket(")
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(")
 	if !ok {
-		t.Fatal("could not find sendPacket")
+		t.Fatal("could not find sendParsedPacketGroup")
 	}
 	if !strings.Contains(body, "dialProbePacket(ipPath)") {
-		t.Error("sendPacket does not gate the dial-failure inference on dialProbePacket: udp handshakes have lost their early escape")
+		t.Error("sendParsedPacketGroup does not gate the dial-failure inference on dialProbePacket: udp handshakes have lost their early escape")
 	}
 }

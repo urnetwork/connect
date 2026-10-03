@@ -1,0 +1,18 @@
+{
+  "base_commit": "272f95e517dfe3a9f5e793aae59a4cdd24b95447",
+  "effective_inputs_sha256": "943fc72f7bdefdd64cbfdd9153d56998581a995af1bac279a193d2554275481c",
+  "raw_log_sha256": "47f602a791a806bf43fdf9e108589a5f61738cccd7cd0141222be01146939df3",
+  "command": "go test -race -run ^TestWindowPacing(NewPathProof|QueuedPathObservation|WindowProof) -count=3 -v",
+  "outcomes": {
+    "PASS": 33,
+    "FAIL": 0,
+    "SKIP": 0
+  },
+  "race_warnings": 0,
+  "inputs_match_after_run": true,
+  "limitations": [
+    "No retained binary or start-load manifest for this go test invocation.",
+    "Full correctness evidence is separately pinned to the working drain variant."
+  ],
+  "scope": "HEAD plus proved-RTT window history correction and eleven deterministic roots; no experimental drain or receiver service sampler changes."
+}

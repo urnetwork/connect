@@ -1,0 +1,26 @@
+{
+  "overlay": "/tmp/throughput-fix-2-static-long-path-work/overlay.json",
+  "overlay_sha256": "0d987d4e5509e6a43fcd777e6d856aabd425b1d88e0444b03d59bb09d1efb050",
+  "inputs_stable_during_build": true,
+  "sources_stable_during_build": true,
+  "source_inspection_uses_build_snapshot": true,
+  "build_cwd": "/private/tmp/throughput-fix-2-static-long-path-work/source/connect",
+  "compile_argv": [
+    "go",
+    "test",
+    "-race=false",
+    "-c",
+    "-overlay",
+    "/tmp/throughput-fix-2-static-long-path-work/overlay.json",
+    "-o",
+    "/tmp/throughput-fix-2-static-long-path-work/tests-nonrace.test"
+  ],
+  "build_flags": [
+    "-race=false"
+  ],
+  "compile_exit_code": 0,
+  "snapshot_inputs_sha256": "353274ab087436af4f324ecafcab70b41d54baaa5d3b69dd25651af3c8f74997",
+  "build_script_sha256": "89af35ec790de479ded484bbaf57358a18578a56e3812bcce820ab6cd35cb7f6",
+  "binary_sha256": "8b290de6b032876c69d2139a2b2cc034042201820cb7d8781fc555724086ec49",
+  "binary_build_metadata": "/tmp/throughput-fix-2-static-long-path-work/tests-nonrace.test: go1.26.7\n\tpath\tgithub.com/urnetwork/connect.test\n\tmod\tgithub.com/urnetwork/connect\t(devel)\t\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\tCGO_ENABLED=1\n\tbuild\tCGO_CFLAGS=\n\tbuild\tCGO_CPPFLAGS=\n\tbuild\tCGO_CXXFLAGS=\n\tbuild\tCGO_LDFLAGS=\n\tbuild\tGOARCH=arm64\n\tbuild\tGOOS=darwin\n\tbuild\tGOARM64=v8.0\n"
+}

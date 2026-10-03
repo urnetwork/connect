@@ -1,0 +1,68 @@
+{
+  "artifact": "sanitized physical-H1 duplex c071 TUN-only counterfactual",
+  "base_connect_canonical_source_sha256": "c07140f78cac0dc84c22ec06ac8635de755e925471d3bb8a0dbacf0d7737262e",
+  "binary_sha256": "3d59a7006079cc088f7a7d261fedb0c60b7da4e16919698a7b169da56fb4acd2",
+  "contents": [
+    {
+      "bytes": 1816,
+      "name": "comparisons.jsonl",
+      "sha256": "e6f229b96d73f43ed37fb51caa7d575ccbd4d230f0f818b59c370159637c4bd3"
+    },
+    {
+      "bytes": 5166,
+      "name": "constructor-settings.json",
+      "sha256": "e190ef76ab27b896ade2f325808200084dcc3751abdb12d9db915e37dd79aad1"
+    },
+    {
+      "bytes": 970,
+      "name": "outcomes.jsonl",
+      "sha256": "59800fccfc219068c85078a66e3b8cbc7207639b5f3fd22252fd229470abea75"
+    },
+    {
+      "bytes": 4227,
+      "name": "provenance.json",
+      "sha256": "370c7de4c80c99cedca6f4ef772a256d80c2e3090dc417ef664002ccfb547c35"
+    },
+    {
+      "bytes": 49204,
+      "name": "readings.jsonl",
+      "sha256": "bece0dbd9256d31a5da297f599b34c4e0557efc0b0380a13572dbb112dc5f922"
+    },
+    {
+      "bytes": 543,
+      "name": "status.json",
+      "sha256": "953930496171acd41894854e0c9206deb4c04738710f307ee746a53de936a76c"
+    },
+    {
+      "bytes": 4742,
+      "name": "summary.json",
+      "sha256": "16e249d907ae91f4bbfd810aa989317cb0eb4ba79c7916f9d85a23ab8cddd772"
+    }
+  ],
+  "counts": {
+    "accepted_comparisons": 0,
+    "censored_comparisons": 1,
+    "comparisons": 1,
+    "compiled_test_attempts": 1,
+    "failed_comparisons": 1,
+    "full_numerical_readings": 3,
+    "invalid_pre_compilation_setup_attempts": 1,
+    "top_level_failed": 1
+  },
+  "effective_fixture_source_sha256": "228bb760c46323df42a000037ee366f693a9607a788d4610df6bafb915832baa",
+  "redaction": "No raw logs, source or overlay contents, binaries, commands, absolute paths, stack traces, or generated IP literals are copied. The generated TUN address is abstracted while equality across all readings is retained.",
+  "schema": "throughput-fix-2/physical-h1-duplex-tun-fix-manifest-v1",
+  "status": "failed and censored diagnostic; no accepted physical-H1 or SDK throughput conclusion",
+  "verification": {
+    "all_failure_and_censor_reasons_retained": true,
+    "all_three_full_readings_and_one_comparison_retained": true,
+    "c071_source_pin_matches_manifest": true,
+    "effective_fixture_source_and_binary_pins_match_manifest": true,
+    "invalid_pre_compilation_setup_attempt_retained": true,
+    "no_retry_after_failure": true,
+    "only_two_frozen_fixture_test_inputs_overrode_c071_snapshot": true,
+    "provider_control_return_and_gvisor_drop_counters_retained": true,
+    "redaction_scan_passed": true,
+    "source_snapshot_stable_during_build_and_after_run": true
+  }
+}

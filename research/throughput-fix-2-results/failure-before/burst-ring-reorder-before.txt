@@ -1,0 +1,6 @@
+=== RUN   TestWindowPacingBurstStatsAcceptRetainedCurrentBurst
+    transfer_window_burst_stats_test.go:97: a retained observation from the current burst was discarded
+--- FAIL: TestWindowPacingBurstStatsAcceptRetainedCurrentBurst (0.00s)
+FAIL
+FAIL	command-line-arguments	0.354s
+FAIL

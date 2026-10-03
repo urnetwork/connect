@@ -1,0 +1,55 @@
+=== RUN   TestWindowPathAckTailRoundTripGrowthControl
+--- PASS: TestWindowPathAckTailRoundTripGrowthControl (1.27s)
+=== RUN   TestWindowPathServiceLargeMessageCapacityChanges
+--- PASS: TestWindowPathServiceLargeMessageCapacityChanges (0.31s)
+=== RUN   TestWindowPathWindowMismatchMatrix
+--- PASS: TestWindowPathWindowMismatchMatrix (343.72s)
+=== RUN   TestWindowPathWindowMismatchChanges
+--- FAIL: TestWindowPathWindowMismatchChanges (2.54s)
+=== RUN   TestWindowPathServiceSettledLargeMessageCapacityChanges
+--- PASS: TestWindowPathServiceSettledLargeMessageCapacityChanges (0.57s)
+=== RUN   TestWindowPathServiceCapacityIncreaseRecovery
+--- PASS: TestWindowPathServiceCapacityIncreaseRecovery (0.08s)
+=== RUN   TestWindowPathServiceLongCompressedFeedback
+--- PASS: TestWindowPathServiceLongCompressedFeedback (0.49s)
+=== RUN   TestWindowPathServiceAcrossRepeatedDrains
+--- PASS: TestWindowPathServiceAcrossRepeatedDrains (17.64s)
+=== RUN   TestWindowPathServiceDelayedPacingWake
+--- PASS: TestWindowPathServiceDelayedPacingWake (6.48s)
+=== RUN   TestWindowPathFifoSeparatesQueueAndPropagation
+--- PASS: TestWindowPathFifoSeparatesQueueAndPropagation (0.00s)
+=== RUN   TestWindowCompressionResidenceRestoresShortPathCapacity
+--- PASS: TestWindowCompressionResidenceRestoresShortPathCapacity (0.23s)
+=== RUN   TestWindowPathDeterministicPerformanceMatrix
+--- PASS: TestWindowPathDeterministicPerformanceMatrix (294.97s)
+=== RUN   TestWindowPathBoundsBurstsAtFiniteRelay
+--- PASS: TestWindowPathBoundsBurstsAtFiniteRelay (6.55s)
+=== RUN   TestWindowPathSlowLinkKeepsCapacity
+--- PASS: TestWindowPathSlowLinkKeepsCapacity (1.07s)
+=== RUN   TestWindowPathSdkDuplexRecoversAfterInitialFeedbackBarrier
+--- PASS: TestWindowPathSdkDuplexRecoversAfterInitialFeedbackBarrier (2.54s)
+=== RUN   TestWindowPathSdkProfiles
+--- FAIL: TestWindowPathSdkProfiles (191.40s)
+=== RUN   TestWindowPathSdkBidirectional
+--- PASS: TestWindowPathSdkBidirectional (37.07s)
+=== RUN   TestWindowPathServiceRoundTripGrowthBeyondOldRing
+--- FAIL: TestWindowPathServiceRoundTripGrowthBeyondOldRing (1.72s)
+=== RUN   TestWindowPathFifoCombinedServiceAndPropagationChange
+--- PASS: TestWindowPathFifoCombinedServiceAndPropagationChange (0.00s)
+=== RUN   TestWindowPathGapDeadline
+--- PASS: TestWindowPathGapDeadline (0.00s)
+=== RUN   TestWindowPathFifoServiceChange
+--- PASS: TestWindowPathFifoServiceChange (0.00s)
+=== RUN   TestWindowPathServicePerformanceMatrix
+--- FAIL: TestWindowPathServicePerformanceMatrix (11.34s)
+=== RUN   TestWindowPathServiceCapacityChanges
+--- PASS: TestWindowPathServiceCapacityChanges (5.57s)
+=== RUN   TestWindowPathServiceLargeMessages
+--- PASS: TestWindowPathServiceLargeMessages (4.96s)
+=== RUN   TestWindowPathServicesShareFiniteRelay
+--- PASS: TestWindowPathServicesShareFiniteRelay (7.19s)
+=== RUN   TestWindowPathServiceRoundTripChanges
+--- PASS: TestWindowPathServiceRoundTripChanges (31.49s)
+=== RUN   TestWindowPathFifoPropagationChangePreservesOldFrames
+--- PASS: TestWindowPathFifoPropagationChangePreservesOldFrames (0.00s)
+FAIL

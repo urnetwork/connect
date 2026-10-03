@@ -1,0 +1,6 @@
+--- FAIL: TestWindowPacingBurstStatsAcceptRetainedAfterReset (0.00s)
+    transfer_window_burst_stats_test.go:127: same-bucket: a retained current-burst ACK before its first applied arrival was discarded
+    transfer_window_burst_stats_test.go:127: preceding-bucket: a retained current-burst ACK before its first applied arrival was discarded
+FAIL
+FAIL	command-line-arguments	0.362s
+FAIL

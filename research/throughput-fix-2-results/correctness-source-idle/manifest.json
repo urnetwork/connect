@@ -1,0 +1,35 @@
+{
+  "created_utc": "2026-09-16T01:27:12.874854+00:00",
+  "mode": "correctness",
+  "test_pattern": "^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "6ec6fae2fb41be2b7aafc9636b611ba37cd29933",
+    "branch": "throughput-fix-2",
+    "source_sha256": "5605efa750834abb352be42548f7c20cd55f56d154a2837dc5996e8b580180f7",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race"
+  ],
+  "runner_sha256": "db3cfeac62e50c387873884078857be9fd510c5bf6e6048271abcf92224711c1",
+  "host_load_average_at_start": [
+    24.3037109375,
+    21.14501953125,
+    19.021484375
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "Source-idle correctness validation started immediately while root SDK fixture review, Astra slow-shared investigation, and relay overlay preparation were active; no quiescence wait."
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "binary_sha256": "d0254c994bb9bc93a05b56918880d545c82dffa78758347833674401da4a8e18",
+  "sources_stable_during_build": true
+}

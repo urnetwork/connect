@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-perf-pilot.log",
+  "source_log_sha256": "b7ce7f544c25a2e9258d39152464e8ef0d37bb4575ede01a79fbc0054415544d",
+  "note": "Early wall-clock FIFO instrument; failed calibration retained.",
+  "rows": 20,
+  "final": false,
+  "outcome": "failed"
+}

@@ -67,6 +67,7 @@ type SnSetWalletCallback ApiCallback[*SnSetWalletResult]
 // the payout wallet types on purpose.
 type SnSetWalletArgs struct {
 	ColdkeySs58 string `json:"coldkey_ss58"`
+	ClientId    *Id    `json:"client_id,omitempty"`
 }
 
 type SnSetWalletError struct {
@@ -118,15 +119,23 @@ type SnPoolClaimArgs struct {
 // `NoId`, `Coldkey`, `PayoutRoot`, and each `Proof` element are raw 32-byte
 // values (base64 in JSON); `ContractAddress` is the 0x-hex EVM address.
 type SnPoolClaimResult struct {
-	Epoch           uint64   `json:"epoch"`
-	NoId            []byte   `json:"no_id"`
-	Coldkey         []byte   `json:"coldkey"`
-	ShareBps        int      `json:"share_bps"`
-	Proof           [][]byte `json:"proof"`
-	PayoutRoot      []byte   `json:"payout_root"`
-	ContractAddress string   `json:"contract_address"`
-	ChainId         uint64   `json:"chain_id"`
-	ClaimOpenBlock  uint64   `json:"claim_open_block"`
+	Epoch                  uint64            `json:"epoch"`
+	NoId                   []byte            `json:"no_id"`
+	Coldkey                []byte            `json:"coldkey"`
+	ShareBps               int               `json:"share_bps"`
+	Proof                  [][]byte          `json:"proof"`
+	PayoutRoot             []byte            `json:"payout_root"`
+	ContractAddress        string            `json:"contract_address"`
+	ChainId                uint64            `json:"chain_id"`
+	ClaimOpenBlock         uint64            `json:"claim_open_block"`
+	ArtifactHash           string            `json:"artifact_hash,omitempty"`
+	ArtifactUri            string            `json:"artifact_uri,omitempty"`
+	SettlementVaultAddress string            `json:"settlement_vault_address,omitempty"`
+	Error                  *SnPoolClaimError `json:"error,omitempty"`
+}
+
+type SnPoolClaimError struct {
+	Message string `json:"message"`
 }
 
 // SnPoolClaim fetches the caller network's pool claim for an epoch via the

@@ -1,0 +1,79 @@
+{
+  "base_source_manifest_sha256": "65d94706bc1c84d86ab1663a9db39626ce7196b7192d00618b277b819628aa73",
+  "benchmark_files": [
+    {
+      "expected_target_before_review": "absent; parent subsequently landed the same hash",
+      "selector": "^BenchmarkWindowPacingDrainEligibility",
+      "source_sha256": "4d7d646a6308cb5d2218409d21822ea26be36a2e7a21344f73dd5436e5c80de3",
+      "target": "transfer_window_pacing_drain_benchmark_test.go"
+    },
+    {
+      "expected_target_before_review": "absent",
+      "selector": "^BenchmarkWindowPacingTailLifecycle",
+      "source_sha256": "5f4d5793a3ee88768b53b8994436d323cc5b4951f3711748d6bb56ce825168f2",
+      "target": "transfer_window_pacing_tail_benchmark_test.go"
+    }
+  ],
+  "final_runs": [
+    {
+      "binary_sha256": "104a57ed1477316fea820badcdc64bcf85c231fe9b201b07253d785e88517c43",
+      "effective_source_sha256": "72325257438ffdbe9ab9fe91c30aae7acb61ab6723421ff564377558fd8001be",
+      "fixture": "final",
+      "raw_benchmark_log_sha256": "af55ab2efe6b705f9f7a84eafb5bed9a431f3e7a173d8369cdd542b123216c1b",
+      "raw_build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "run_id": "final_drain_scan",
+      "run_manifest_sha256": "58b6d9fabd6d8d69acf8449176c86e1537862531a7417bd482117b2595cf7177",
+      "sources_stable": true,
+      "variant": "scan"
+    },
+    {
+      "binary_sha256": "23f39c9a89efc2e4309cbc063cd069460b4a6b8f9d8cb7bdc296b21e99f5ed8a",
+      "effective_source_sha256": "ca0cb305faa4781d9d1a78f70fa085979b003817fcfc72cdf9a131eff1e593bb",
+      "fixture": "final",
+      "raw_benchmark_log_sha256": "2313fda77f8a20473b1f91ef2ca885ff1489f2a6f8492b323292d1dc2760e623",
+      "raw_build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "run_id": "final_drain_counter",
+      "run_manifest_sha256": "1b4e05448e975eb01ca8fac09d2bdefccfb46087f40488681be494267050b3fd",
+      "sources_stable": true,
+      "variant": "counter"
+    },
+    {
+      "binary_sha256": "f790f1b82f583652e6c0df360839144ad1fa96364e4c99235df762dbb2cf4a07",
+      "effective_source_sha256": "dff00bca27448ab4729fd424ce63f82c060fe3bb7a569588bf31f4c142b59486",
+      "fixture": "lifecycle",
+      "raw_benchmark_log_sha256": "e6d9385b78f0006f525c74787b26e940ca7b34467186ba5021ded92a94e4e9d4",
+      "raw_build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "run_id": "final_lifecycle_scan",
+      "run_manifest_sha256": "926c8ca426b0df15065130587a7d20bb516087e8edfa352c7e3f921fb1481409",
+      "sources_stable": true,
+      "variant": "scan"
+    },
+    {
+      "binary_sha256": "381495d0971abfd7eecfe8263097985dabc50fce48124a3ec9485e2aaa14ee2d",
+      "effective_source_sha256": "5b67aa16b165381d1378340712a98aa90ff5fe68ab189abbdadb3e6ed5e72415",
+      "fixture": "lifecycle",
+      "raw_benchmark_log_sha256": "11ae87e1540c2bf7b776ac6bef5f0fc1718ebc35039bcf57dedad944ae0922b4",
+      "raw_build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "run_id": "final_lifecycle_counter",
+      "run_manifest_sha256": "ca34fde3b4a7c01abe49f27e498c78767f9a2e6a1371ab7d3955c308638c4415",
+      "sources_stable": true,
+      "variant": "counter"
+    }
+  ],
+  "initial_scan": {
+    "benchmark_source_sha256": "2d5fd36d90a2733c5852e52278cb4b2ba595cbbf41eba6af91da0fec180cc3ad",
+    "binary_sha256": "530b146cf5107d88797d34bb12690404867e2b1f19f74bdde1bf910b307ed8bf",
+    "raw_benchmark_log_sha256": "46ce98c1b205a8ad1c97117eba5cbf867117eab347f336c71fee33476300c0c1",
+    "raw_build_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_manifest_sha256": "65d94706bc1c84d86ab1663a9db39626ce7196b7192d00618b277b819628aa73"
+  },
+  "pins_verified_against_local_inputs": 25,
+  "production_variants": {
+    "counter": {
+      "sha256": "f9c01edab76d690e50ee29c71654dcc1c649a1baa62ae27057551e06a88400dd"
+    },
+    "scan": {
+      "sha256": "b596def4ca171f02097d58b98c549e73930704fec6aca313673d3620fc07e521"
+    }
+  }
+}

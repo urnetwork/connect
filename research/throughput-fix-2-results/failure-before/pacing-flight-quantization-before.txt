@@ -1,0 +1,9 @@
+=== RUN   TestWindowPacingOneMessageIsNotAStandingQueue
+    transfer_window_pacing_flight_test.go:28: rate=125000 RTT=300µs: one 64 KiB message was treated as a standing queue
+--- FAIL: TestWindowPacingOneMessageIsNotAStandingQueue (0.00s)
+=== RUN   TestWindowPacingWaitingReservationsAreNotWireFlight
+    transfer_window_pacing_flight_test.go:61: two unsent reservations manufactured a physical relay backlog
+--- FAIL: TestWindowPacingWaitingReservationsAreNotWireFlight (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.733s

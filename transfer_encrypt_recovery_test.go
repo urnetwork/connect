@@ -19,10 +19,13 @@ package connect
 // the recovery.
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // waitForSealedSession polls until the client reports a sealed peer session,
@@ -71,7 +74,7 @@ func TestEncryptedPeerSessionLossRecovery(t *testing.T) {
 	// the handshake (opportunistic seals from establishment on)
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "before"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -102,7 +105,7 @@ func TestEncryptedPeerSessionLossRecovery(t *testing.T) {
 	for !recovered && time.Now().Before(recoveryDeadline) {
 		a.SendWithTimeout(
 			requiredGateFrame(t, fmt.Sprintf("after-%d", sendIndex)),
-			DestinationId(bClientId),
+			bClientId,
 			func(error) {},
 			0,
 		)
@@ -151,7 +154,7 @@ func TestNackEchoingCurrentEpochIsIgnored(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "establish"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -199,7 +202,7 @@ func TestForgedNackCausesNoOutage(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "establish"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -222,7 +225,7 @@ func TestForgedNackCausesNoOutage(t *testing.T) {
 	// peer and the entry gate holds sends sealed-only in the interim
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "after-forged-nack"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		20*time.Second,
 	); !ok {
@@ -272,7 +275,7 @@ func TestNackStormDuringRecoveryConverges(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "before"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -318,7 +321,7 @@ func TestNackStormDuringRecoveryConverges(t *testing.T) {
 	for !recovered && time.Now().Before(recoveryDeadline) {
 		a.SendWithTimeout(
 			requiredGateFrame(t, fmt.Sprintf("storm-%d", sendIndex)),
-			DestinationId(bClientId),
+			bClientId,
 			func(error) {},
 			0,
 		)
@@ -374,7 +377,7 @@ func TestNackDemoteChurnIsBounded(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "establish"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -444,7 +447,7 @@ func TestUnknownWrapNackEmissionIsRateLimited(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "establish"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -484,6 +487,67 @@ func TestUnknownWrapNackEmissionIsRateLimited(t *testing.T) {
 	}
 }
 
+// An undecryptable wrap can race the responder's identity-proof completion:
+// its matching handshake epoch is live but not readable yet. The nack must
+// name that generation so the already-sealed initiator recognizes normal
+// convergence instead of demoting the cipher and putting a new ClientHello
+// behind the dropped application's receive-sequence gap.
+func TestUnknownWrapNackNamesInFlightEpoch(t *testing.T) {
+	epochId := NewId()
+	var nackedEpochId Id
+	session := &peerEncryptionSession{
+		settings: DefaultEncryptionSettings(),
+		epoch: &tlsHandshakeEpoch{
+			epochId:           epochId,
+			establishmentDone: make(chan struct{}),
+		},
+		unknownWrapNackForTest: func(ec *protocol.EncryptedControl) {
+			if parsed, err := IdFromBytes(ec.GetEpochId()); err == nil {
+				nackedEpochId = parsed
+			}
+		},
+	}
+
+	session.sendUnknownWrapNack()
+
+	if nackedEpochId != epochId {
+		t.Fatalf(
+			"nack epoch = %s, want live handshake epoch %s; empty feedback falsely claims the responder lost all session state",
+			nackedEpochId,
+			epochId,
+		)
+	}
+}
+
+// A finished but unestablished epoch is not convergence evidence. Leaving the
+// nack generation unset is what tells a sealed initiator to replace state the
+// responder can no longer complete or read.
+func TestUnknownWrapNackDoesNotNameFailedEpoch(t *testing.T) {
+	epochId := NewId()
+	establishmentDone := make(chan struct{})
+	close(establishmentDone)
+	var nackedEpochBytes []byte
+	session := &peerEncryptionSession{
+		settings: DefaultEncryptionSettings(),
+		epoch: &tlsHandshakeEpoch{
+			epochId:           epochId,
+			establishmentDone: establishmentDone,
+		},
+		unknownWrapNackForTest: func(ec *protocol.EncryptedControl) {
+			nackedEpochBytes = bytes.Clone(ec.GetEpochId())
+		},
+	}
+
+	session.sendUnknownWrapNack()
+
+	if len(nackedEpochBytes) != 0 {
+		t.Fatalf(
+			"failed epoch was advertised as live: got %x, want an unset nack generation",
+			nackedEpochBytes,
+		)
+	}
+}
+
 // TestNackWithStaleRealEpochDoesNotDemote pins the refinement behind the
 // Dns*Encrypted Required retry pattern: a nack carrying a REAL but older
 // (client-minted) epoch means the peer is alive and transiently lagging an
@@ -506,7 +570,7 @@ func TestNackWithStaleRealEpochDoesNotDemote(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "establish"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -545,7 +609,7 @@ func TestNackWithStaleRealEpochDoesNotDemote(t *testing.T) {
 	// and traffic keeps flowing on the undisturbed epoch
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "after-stale-nack"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		20*time.Second,
 	); !ok {

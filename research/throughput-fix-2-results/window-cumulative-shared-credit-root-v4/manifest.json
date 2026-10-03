@@ -1,0 +1,13 @@
+{
+  "archive": "window-cumulative-shared-credit-root-v4",
+  "payload_sha256": {
+    "attribution-fixture.patch": "db4b6c3d51c846fe7745bcc0e2d819bad7569283136c450f51383bf18785e4d5",
+    "ledger.jsonl": "72f1d3b6b88d95d034f9753eb452328255c69b08f0f62e790c9bfbaac923b809",
+    "outcomes.jsonl": "f45ce803460e4a1c4a3416f9b0cd200b5daea9d91d2584794e051b422e93f936",
+    "provenance.json": "ba68d3f7201c8976a857ca7e6212875b624ec97a1353391e9bc30a222d3ba658",
+    "root-source.txt": "d4d50030910391cf7fa8a33960a9548afdfa076fe444f29964ca32a28ce94ca9",
+    "source-manifest-before.json": "cba12c55de49928cf181671634fba0193152cf34f06992efe1876ac8e78bd18f",
+    "source-pins.json": "9b9547952a1875867bb948b9286f1e7ec25cc25639850f28396df6b85f1fcce2",
+    "status.json": "64ec8f989fd396a8bec8bad25e9189d9c5ad1d370717c1e8ae7ce5028cbf53b1"
+  }
+}

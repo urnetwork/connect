@@ -1,0 +1,156 @@
+[
+  {
+    "binary_sha256": "a823934805f9127afb30fa086bad86a198a33e03139dd91af3e305f96c32608f",
+    "build_flags": [
+      "-race"
+    ],
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "57d59154435bf24325e3664e5dbdb123fd3a41c8d80ec44250d025d119aec357",
+    "effective_inputs_sha256": "3858c29ef14b20a2c08d8b53e04aea76aec44055f88232f21f262e1f3668ae5d",
+    "inputs_match_at_archive": true,
+    "name": "before",
+    "outcome_scope": "complete raw invocation",
+    "outcomes": {
+      "FAIL": 31,
+      "PASS": 20,
+      "SKIP": 0
+    },
+    "race": true,
+    "race_instrumentation_verified_by": "compile argv and immutable binary go version -m metadata",
+    "race_warnings": 1,
+    "raw_log_sha256": "b11aca5ff738301012d334b2c5a06995917ee11f4d342150143693bf4a2ccc90",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "a823934805f9127afb30fa086bad86a198a33e03139dd91af3e305f96c32608f",
+      "cwd": {
+        "artifact": "throughput-fix-2-physical-h1-control-owned-before-v2",
+        "path": "source/connect"
+      },
+      "cwd_source": "effective Go module snapshot",
+      "effective_inputs_sha256": "3858c29ef14b20a2c08d8b53e04aea76aec44055f88232f21f262e1f3668ae5d",
+      "elapsed_seconds": 1.9328967076726258,
+      "ended_utc": "2026-09-16T20:03:06.761064+00:00",
+      "exit_status": 1,
+      "fail": 31,
+      "loadavg_end": [
+        7.3955078125,
+        6.54541015625,
+        9.89794921875
+      ],
+      "loadavg_start": [
+        7.3955078125,
+        6.54541015625,
+        9.89794921875
+      ],
+      "manifest_sha256": "57d59154435bf24325e3664e5dbdb123fd3a41c8d80ec44250d025d119aec357",
+      "no_quiescence_wait": true,
+      "pass": 20,
+      "race_warnings": 1,
+      "raw_log_sha256": "b11aca5ff738301012d334b2c5a06995917ee11f4d342150143693bf4a2ccc90",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T20:03:04.827529+00:00"
+    },
+    "selected_tests": [
+      "TestForwardBufferCallerCancelDuringAdmissionKeepsSiblings",
+      "TestForwardBufferCallerCancelKeepsAcceptedPackOwned",
+      "TestForwardBufferCallerCancelPreservesSharedAdmission",
+      "TestForwardBufferClosedSequenceStillRecreatesForLiveCaller",
+      "TestSendBufferCallerCancelDuringAdmissionKeepsSiblings",
+      "TestSendBufferCallerCancelKeepsAcceptedPackOwned",
+      "TestSendBufferCallerCancelPreservesSharedAdmission",
+      "TestSendBufferClosedSequenceStillRecreatesForLiveCaller",
+      "TestWindowPhysicalH1ProviderPublicAckStillRefusesAtCapacity",
+      "TestWindowPhysicalH1ProviderPureAckAdvancesAfterHeldControl",
+      "TestWindowPhysicalH1ProviderPureAckCancelAtRetryKeepsSiblings",
+      "TestWindowPhysicalH1ProviderPureAckCancelBeforeAttemptStopsOwner",
+      "TestWindowPhysicalH1ProviderPureAckFlowCancelReleasesOwner",
+      "TestWindowPhysicalH1ProviderPureAckProviderCancelReleasesOwner",
+      "TestWindowPhysicalH1ProviderPureAckSurvivesAdmissionPressure",
+      "TestWindowPhysicalH1ProviderPureAckUsesAvailableAdmission",
+      "TestWindowPhysicalH1ProviderSharedRegenerableAckStillRefuses"
+    ],
+    "source_content_sha256": "ae340a33a4372ddaaabcbabfd4dc72a8127ad26621b4b7ed9addff1e2c5075d9",
+    "test_pattern": "^(TestWindowPhysicalH1Provider.*|TestSendBufferCallerCancel.*|TestSendBufferClosedSequenceStillRecreatesForLiveCaller|TestForwardBufferCallerCancel.*|TestForwardBufferClosedSequenceStillRecreatesForLiveCaller)$"
+  },
+  {
+    "binary_sha256": "2f2ad0d0bb704964955817388bdd9fe48f5a0fb432664337cad72690a3409810",
+    "build_flags": [
+      "-race"
+    ],
+    "compile_inputs_stable": true,
+    "compile_manifest_sha256": "7a4720b0009982cdbc76b821126413cd50a2aa05dd791d1270155374b5855628",
+    "effective_inputs_sha256": "fad4e34e295978211ff3a737fa1e5fd2b633f9d63b13ebce9d6fe5b1563fed79",
+    "inputs_match_at_archive": true,
+    "name": "after",
+    "outcome_scope": "complete raw invocation",
+    "outcomes": {
+      "FAIL": 4,
+      "PASS": 47,
+      "SKIP": 0
+    },
+    "race": true,
+    "race_instrumentation_verified_by": "compile argv and immutable binary go version -m metadata",
+    "race_warnings": 1,
+    "raw_log_sha256": "154dc5e970ce7d869423f6182d2dc1d1a3cf90456af866d832a3b7e28c352062",
+    "run_metadata_limit": null,
+    "run_status": {
+      "binary_sha256": "2f2ad0d0bb704964955817388bdd9fe48f5a0fb432664337cad72690a3409810",
+      "cwd": {
+        "artifact": "throughput-fix-2-physical-h1-control-owned-after-v2",
+        "path": "source/connect"
+      },
+      "cwd_source": "effective Go module snapshot",
+      "effective_inputs_sha256": "fad4e34e295978211ff3a737fa1e5fd2b633f9d63b13ebce9d6fe5b1563fed79",
+      "elapsed_seconds": 1.1177071672864258,
+      "ended_utc": "2026-09-16T20:03:05.945872+00:00",
+      "exit_status": 1,
+      "fail": 4,
+      "loadavg_end": [
+        7.3955078125,
+        6.54541015625,
+        9.89794921875
+      ],
+      "loadavg_start": [
+        7.3955078125,
+        6.54541015625,
+        9.89794921875
+      ],
+      "manifest_sha256": "7a4720b0009982cdbc76b821126413cd50a2aa05dd791d1270155374b5855628",
+      "no_quiescence_wait": true,
+      "pass": 47,
+      "race_warnings": 1,
+      "raw_log_sha256": "154dc5e970ce7d869423f6182d2dc1d1a3cf90456af866d832a3b7e28c352062",
+      "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+      "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+      "skip": 0,
+      "sources_stable_after": true,
+      "sources_stable_before": true,
+      "started_utc": "2026-09-16T20:03:04.827536+00:00"
+    },
+    "selected_tests": [
+      "TestForwardBufferCallerCancelDuringAdmissionKeepsSiblings",
+      "TestForwardBufferCallerCancelKeepsAcceptedPackOwned",
+      "TestForwardBufferCallerCancelPreservesSharedAdmission",
+      "TestForwardBufferClosedSequenceStillRecreatesForLiveCaller",
+      "TestSendBufferCallerCancelDuringAdmissionKeepsSiblings",
+      "TestSendBufferCallerCancelKeepsAcceptedPackOwned",
+      "TestSendBufferCallerCancelPreservesSharedAdmission",
+      "TestSendBufferClosedSequenceStillRecreatesForLiveCaller",
+      "TestWindowPhysicalH1ProviderPublicAckStillRefusesAtCapacity",
+      "TestWindowPhysicalH1ProviderPureAckAdvancesAfterHeldControl",
+      "TestWindowPhysicalH1ProviderPureAckCancelAtRetryKeepsSiblings",
+      "TestWindowPhysicalH1ProviderPureAckCancelBeforeAttemptStopsOwner",
+      "TestWindowPhysicalH1ProviderPureAckFlowCancelReleasesOwner",
+      "TestWindowPhysicalH1ProviderPureAckProviderCancelReleasesOwner",
+      "TestWindowPhysicalH1ProviderPureAckSurvivesAdmissionPressure",
+      "TestWindowPhysicalH1ProviderPureAckUsesAvailableAdmission",
+      "TestWindowPhysicalH1ProviderSharedRegenerableAckStillRefuses"
+    ],
+    "source_content_sha256": "a939479dd489946a7deba97014b5311ca6cb4168f3f55302c236dfe5bfbf9327",
+    "test_pattern": "^(TestWindowPhysicalH1Provider.*|TestSendBufferCallerCancel.*|TestSendBufferClosedSequenceStillRecreatesForLiveCaller|TestForwardBufferCallerCancel.*|TestForwardBufferClosedSequenceStillRecreatesForLiveCaller)$"
+  }
+]

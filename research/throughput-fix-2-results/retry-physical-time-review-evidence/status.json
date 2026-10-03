@@ -1,0 +1,187 @@
+{
+  "all_archived_outcomes": {
+    "FAIL": 35,
+    "PASS": 180,
+    "SKIP": 0,
+    "race_warning_blocks": 0
+  },
+  "archive_result": "complete_pinned_retry_physical_time_review_evidence",
+  "by_log": [
+    {
+      "classification": "historical-actual-worker-before",
+      "excluded_from_production_conclusions": false,
+      "name": "before.log",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "47b72599c613fd90ec2676d3da402049a51b886b8450ef4ac1f6159f19878bcd",
+      "scope": "Original actual-worker retry root before; ephemeral go-test binary not retained. Final frozen before repeats same causal ordering."
+    },
+    {
+      "classification": "historical-initial-retry-correction",
+      "excluded_from_production_conclusions": false,
+      "name": "after-v1.log",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "3bfefa9aea60b658048425d2c70169e83c124b00f8d101fd848794c83066c2bd",
+      "scope": "Initial existing-waiter retry correction, original root only; ephemeral go-test binary not retained."
+    },
+    {
+      "classification": "historical-monotonic-before",
+      "excluded_from_production_conclusions": false,
+      "name": "clock-before.log",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "724f6b9635b7b928489a15366bc5b885fbf633661cc125da8e4d763046f3e4ab",
+      "scope": "Independent first-deadline monotonic ownership failure before; repeated in final frozen before."
+    },
+    {
+      "classification": "excluded-intermediate-outer-fatal-and-shared-route-fixture",
+      "excluded_from_production_conclusions": true,
+      "name": "adjacent-after.log",
+      "outcomes": {
+        "FAIL": 6,
+        "PASS": 18,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "5b3c893495dcf2ec0026fa9f42c1d49e0f90ada7d2cd708a64b7b08b22bcec64",
+      "scope": "Intermediate fixture assumptions: outer-test Fatal misuse plus shared physical channel/reliability/cancellation assumptions; excluded from production conclusions."
+    },
+    {
+      "classification": "excluded-intermediate-boundary-fixture",
+      "excluded_from_production_conclusions": true,
+      "name": "adjacent-boundary-diagnostic.log",
+      "outcomes": {
+        "FAIL": 2,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "8eb55024719efbeb5348b153d55ce0df68cc4d239ad35fdfb0029fe85fa7607a",
+      "scope": "Corrected test ownership; cancellation due inspection was mistaken for a write; invalid shared-route carrier setup retained."
+    },
+    {
+      "classification": "excluded-invalid-shared-route-carrier-fixture",
+      "excluded_from_production_conclusions": true,
+      "name": "adjacent-boundaries-after.log",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "61d4a4665919db4166f81e2ec7d609eb6a34a7e63484c15d87af1476381f5ce0",
+      "scope": "Cancellation physical ownership passes; invalid shared-route carrier setup still fails."
+    },
+    {
+      "classification": "excluded-carrier-reliability-fixture",
+      "excluded_from_production_conclusions": true,
+      "name": "carrier-separate-route.log",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "5785cb3109af4493dc6f623596b8bfdf736dedb95ccf200fd3ec8e145584ffb2",
+      "scope": "Correct carrier timing observed, but fixture incorrectly assumed H3 type itself means DATAGRAM; fixed by explicit stream/DATAGRAM properties."
+    },
+    {
+      "classification": "final-adjacent-boundary-controls",
+      "excluded_from_production_conclusions": false,
+      "name": "adjacent-final-boundaries.log",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 6,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "9ce3c06c1e3ce3ae491dbfc7d3308233be1933dc4bc1be5f7c1c6f06cd04a815",
+      "scope": "Final stream/DATAGRAM switch and cancellation controls pass."
+    },
+    {
+      "classification": "final-shaped-failure-before",
+      "excluded_from_production_conclusions": false,
+      "name": "final-before.log",
+      "outcomes": {
+        "FAIL": 12,
+        "PASS": 12,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "a50c8c27c5584a5e00617efc7e71dd927cb2d533614c64e71fcff25fb8594157",
+      "scope": "Final-shaped frozen failure-before: retry clock, capped clock, lifetime ordering and monotonic preservation each fail three times; four safety controls pass."
+    },
+    {
+      "classification": "final-focused-race-after",
+      "excluded_from_production_conclusions": false,
+      "name": "final-after.log",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 138,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "72d20ebfe164cf0faac3d45aa7716d4fd73b8d43afc26a06532c0eda7194c51b",
+      "scope": "Final frozen focused race selection: 46 top-level tests, three repetitions."
+    },
+    {
+      "classification": "unchanged-virtual-silent-lane-open",
+      "excluded_from_production_conclusions": false,
+      "name": "silent-after.log",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "5883193b15530d9bfcf12d6354de0b9d5b9813b25a89f9c953faa423258ca42b",
+      "scope": "Original virtual silent-lane integration remains failing at message1445, unchanged by this correction."
+    }
+  ],
+  "excluded_intermediate_fixture_outcomes": {
+    "FAIL": 14,
+    "PASS": 21,
+    "SKIP": 0
+  },
+  "final_expected_results": {
+    "after": {
+      "fail": 0,
+      "pass": 138,
+      "race_blocks": 0
+    },
+    "before": {
+      "fail": 12,
+      "pass": 12,
+      "race_blocks": 0
+    },
+    "silent_lane": {
+      "fail": 3,
+      "message_not_admitted": 1445,
+      "pass": 0,
+      "race_blocks": 0
+    }
+  },
+  "forced_retry_timeline_seconds": {
+    "after_next_deadline": 1.8,
+    "after_next_firing": 1.8,
+    "before_next_deadline": 0.9,
+    "before_next_firing": 1.2,
+    "first_retry_due": 0.3,
+    "first_retry_physical": 1.2,
+    "initial_physical": 0,
+    "unchanged_next_backoff": 0.6
+  }
+}

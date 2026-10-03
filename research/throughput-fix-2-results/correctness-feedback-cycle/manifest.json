@@ -1,0 +1,49 @@
+{
+  "created_utc": "2026-09-16T04:12:32.718253+00:00",
+  "mode": "correctness",
+  "test_pattern": "^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$|^TestWindowTcp(SocketBatch|CanceledBatch|WorkloadCancel).*$|^TestTun(DuplexDataHandoffDoesNotCycleThroughAdmission|FiniteTcpTailProgressesAfterEndpointOwnerReleases)$|^TestReceiveSequenceBurstTail.*$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "f55e5d41a120d26789b60ec0450daa63e6fa43df",
+    "branch": "throughput-fix-2",
+    "source_sha256": "914a2a724a7e0c1a5681301ded65e89447699ca80505772f9a9f454865ef2246",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race"
+  ],
+  "runner_sha256": "b8cbdc5fef4a1b9c578bfd5815373af2f29f2024aa7292974e45bc43d3975b06",
+  "host_load_average_at_start": [
+    18.10205078125,
+    15.79248046875,
+    14.6025390625
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "concurrent c071 regression snapshot; isolated pacing/relay overlay diagnostics; feedback-cycle correctness build/run; no quiescence wait"
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 791,
+        "input_sha256": "579c1a08d63b1a55dc273f3cee360d7e0007d30a2951a4dae4d74b7261c16b65"
+      }
+    },
+    "external_local_replacements": [
+      "/Users/brien/urnetwork/glog"
+    ],
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "binary_sha256": "7fb858b9440dd399a243e9e85f3f9d4dd78fd8fc79de6cd49172bedda6fda43f",
+  "sources_stable_during_build": true,
+  "source_inspection_uses_build_snapshot": true
+}

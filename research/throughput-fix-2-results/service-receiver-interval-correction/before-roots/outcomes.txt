@@ -1,0 +1,19 @@
+=== RUN   TestWindowPacingReceiverWaitPreservesPhysicalSerialization
+--- FAIL: TestWindowPacingReceiverWaitPreservesPhysicalSerialization (0.00s)
+=== RUN   TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization
+--- PASS: TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization
+--- FAIL: TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitPreservesPhysicalSerialization
+--- FAIL: TestWindowPacingReceiverWaitPreservesPhysicalSerialization (0.00s)
+=== RUN   TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization
+--- PASS: TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization
+--- FAIL: TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitPreservesPhysicalSerialization
+--- FAIL: TestWindowPacingReceiverWaitPreservesPhysicalSerialization (0.00s)
+=== RUN   TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization
+--- PASS: TestWindowPacingEqualReceiverWaitsDiscoverSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization
+--- FAIL: TestWindowPacingReceiverWaitStillDiscoversCorrectedSlowSerialization (0.00s)
+FAIL

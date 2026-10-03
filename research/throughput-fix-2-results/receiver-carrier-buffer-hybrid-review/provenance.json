@@ -1,0 +1,8 @@
+{
+  "limitations": [
+    "Fake owned serializer and carrier reader model upstream buffering; not a real kernel timestamp experiment.",
+    "Receiver tuples still use test-only lookup with zero wire cost.",
+    "Sender-confirmed rate-rise candidate still needs affected-cell and full-model validation."
+  ],
+  "scope": "Actual Client/ACK/pacer workers with an explicitly stalled carrier reader behind a fixed 32-frame upstream FIFO; arrival times never enter the estimator"
+}

@@ -1,0 +1,266 @@
+{
+  "Run": "combined-state",
+  "RawLogSha256": "a2544c50633db3838f79d0c4f0a0f5d0f130c26711d9cf86e78fb9859395c4d1",
+  "Points": [
+    {
+      "RequestedAtSeconds": 5.078,
+      "Forward": {
+        "AtSeconds": 5.078159875,
+        "bytes": 555033816,
+        "window": 1612332,
+        "rate": 6321867,
+        "service": 5747152
+      },
+      "ForwardPacing": {
+        "AtSeconds": 5.078159875,
+        "outstanding": 0,
+        "bound": 1595208,
+        "reserved": 0,
+        "waits": 0,
+        "tails": 0,
+        "burst": 466,
+        "burst-limit": 1517415,
+        "credit": 1182961,
+        "ring-mean-ns": 15812000,
+        "ring-buckets": 4,
+        "debt-seconds": 0.0,
+        "drain-seconds": 0.0,
+        "cooldown-seconds": 3.450348958
+      },
+      "Nat": {
+        "AtSeconds": 5.063062458,
+        "flight": 1855480,
+        "window": 1855480,
+        "available": 0,
+        "retained": 1914176,
+        "chunks": 30,
+        "attempts": 0,
+        "duplicates": 0,
+        "progress-age-seconds": 0.057318917
+      }
+    },
+    {
+      "RequestedAtSeconds": 5.196,
+      "Forward": {
+        "AtSeconds": 5.196097917,
+        "bytes": 555171176,
+        "window": 262144,
+        "rate": 251293,
+        "service": 228449
+      },
+      "ForwardPacing": {
+        "AtSeconds": 5.196097917,
+        "outstanding": 0,
+        "bound": 73377,
+        "reserved": 70644,
+        "waits": 1,
+        "tails": 0,
+        "burst": 470,
+        "burst-limit": 70646,
+        "credit": 561,
+        "ring-mean-ns": 11354000,
+        "ring-buckets": 4,
+        "debt-seconds": 0.036549244,
+        "drain-seconds": 0.0,
+        "cooldown-seconds": 3.332410916
+      },
+      "Nat": {
+        "AtSeconds": 5.163770792,
+        "flight": 2080384,
+        "window": 2080384,
+        "available": 0,
+        "retained": 2144880,
+        "chunks": 34,
+        "attempts": 0,
+        "duplicates": 0,
+        "progress-age-seconds": 0.049247625
+      }
+    },
+    {
+      "RequestedAtSeconds": 5.789,
+      "Forward": {
+        "AtSeconds": 5.788588083,
+        "bytes": 556144784,
+        "window": 262144,
+        "rate": 1855900,
+        "service": 1687182
+      },
+      "ForwardPacing": {
+        "AtSeconds": 5.788588083,
+        "outstanding": 0,
+        "bound": 89477,
+        "reserved": 0,
+        "waits": 0,
+        "tails": 0,
+        "burst": 498,
+        "burst-limit": 70646,
+        "credit": 84,
+        "ring-mean-ns": 1814500,
+        "ring-buckets": 4,
+        "debt-seconds": 0.0,
+        "drain-seconds": 0.0,
+        "cooldown-seconds": 2.73992075
+      },
+      "Nat": {
+        "AtSeconds": 5.768152083,
+        "flight": 2080384,
+        "window": 2080384,
+        "available": 0,
+        "retained": 2144880,
+        "chunks": 34,
+        "attempts": 0,
+        "duplicates": 0,
+        "progress-age-seconds": 0.653628875
+      }
+    },
+    {
+      "RequestedAtSeconds": 6.002,
+      "Forward": {
+        "AtSeconds": 6.001520417,
+        "bytes": 556181464,
+        "window": 262144,
+        "rate": 2058146,
+        "service": 1871042
+      },
+      "ForwardPacing": {
+        "AtSeconds": 6.001520417,
+        "outstanding": 0,
+        "bound": 91529,
+        "reserved": 0,
+        "waits": 0,
+        "tails": 0,
+        "burst": 498,
+        "burst-limit": 70646,
+        "credit": 84,
+        "ring-mean-ns": 1161000,
+        "ring-buckets": 4,
+        "debt-seconds": 0.0,
+        "drain-seconds": 0.0,
+        "cooldown-seconds": 2.526988416
+      },
+      "Nat": {
+        "AtSeconds": 5.969297583,
+        "flight": 2080384,
+        "window": 2080384,
+        "available": 0,
+        "retained": 2144880,
+        "chunks": 34,
+        "attempts": 0,
+        "duplicates": 0,
+        "progress-age-seconds": 0.854774417
+      }
+    },
+    {
+      "RequestedAtSeconds": 6.198,
+      "Forward": {
+        "AtSeconds": 6.197608042,
+        "bytes": 556181464,
+        "window": 262144,
+        "rate": 4094,
+        "service": 3722
+      },
+      "ForwardPacing": {
+        "AtSeconds": 6.197608042,
+        "outstanding": 0,
+        "bound": 18750,
+        "reserved": 0,
+        "waits": 0,
+        "tails": 0,
+        "burst": 499,
+        "burst-limit": 18710,
+        "credit": 17507,
+        "ring-mean-ns": 875000,
+        "ring-buckets": 4,
+        "debt-seconds": 0.0,
+        "drain-seconds": 0.0,
+        "cooldown-seconds": 2.330900791
+      },
+      "Nat": {
+        "AtSeconds": 6.170375208,
+        "flight": 2080384,
+        "window": 2080384,
+        "available": 0,
+        "retained": 2144880,
+        "chunks": 34,
+        "attempts": 1,
+        "duplicates": 4,
+        "progress-age-seconds": 0.054934458
+      }
+    },
+    {
+      "RequestedAtSeconds": 6.994,
+      "Forward": {
+        "AtSeconds": 6.993555125,
+        "bytes": 556181464,
+        "window": 262144,
+        "rate": 4094,
+        "service": 3722
+      },
+      "ForwardPacing": {
+        "AtSeconds": 6.993555125,
+        "outstanding": 0,
+        "bound": 70686,
+        "reserved": 70646,
+        "waits": 1,
+        "tails": 0,
+        "burst": 499,
+        "burst-limit": 70646,
+        "credit": 18710,
+        "ring-mean-ns": 875000,
+        "ring-buckets": 4,
+        "debt-seconds": 16.378506081,
+        "drain-seconds": 0.0,
+        "cooldown-seconds": 1.534953708
+      },
+      "Nat": {
+        "AtSeconds": 6.9821065,
+        "flight": 1378352,
+        "window": 2096256,
+        "available": 717904,
+        "retained": 1382952,
+        "chunks": 24,
+        "attempts": 0,
+        "duplicates": 1,
+        "progress-age-seconds": 0.25765075000000004
+      }
+    },
+    {
+      "RequestedAtSeconds": 14.293,
+      "Forward": {
+        "AtSeconds": 14.292659083,
+        "bytes": 556181464,
+        "window": 262144,
+        "rate": 4094,
+        "service": 3722
+      },
+      "ForwardPacing": {
+        "AtSeconds": 14.292659083,
+        "outstanding": 0,
+        "bound": 70686,
+        "reserved": 70646,
+        "waits": 1,
+        "tails": 0,
+        "burst": 499,
+        "burst-limit": 70646,
+        "credit": 18710,
+        "ring-mean-ns": 875000,
+        "ring-buckets": 4,
+        "debt-seconds": 9.079402123,
+        "drain-seconds": 0.0,
+        "cooldown-seconds": 0.0
+      },
+      "Nat": {
+        "AtSeconds": 14.212285042,
+        "flight": 1378352,
+        "window": 2096256,
+        "available": 717904,
+        "retained": 1382952,
+        "chunks": 24,
+        "attempts": 1,
+        "duplicates": 4,
+        "progress-age-seconds": 6.486964292
+      }
+    }
+  ],
+  "Interpretation": "A small replay creates a slow service checkpoint after feedback-induced source idle. Later valid inner ACK progress reopens NAT capacity, but the next larger Transfer write inherits the new very low rate. These selected trace points corroborate, rather than replace, the deterministic replay-boundary failure."
+}

@@ -1,0 +1,8 @@
+{
+  "limitations": [
+    "Global test lookup conveys receiver snapshots at zero wire cost",
+    "No final bounded wire ownership or queue-compression correction",
+    "Separate run/load manifest was not supplied; raw source and logs remain local"
+  ],
+  "scope": "Full original model with receiver diagnostic enabled/reset per measured cell; original thresholds unchanged"
+}

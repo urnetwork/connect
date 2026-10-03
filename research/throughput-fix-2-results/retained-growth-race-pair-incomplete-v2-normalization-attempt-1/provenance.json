@@ -1,0 +1,6 @@
+{
+  "classification": "Incomplete timeout; not performance acceptance.",
+  "method": "Frozen paired race binaries, affected-cell selection, count one, global test timeout 30 minutes.",
+  "raw_logs_retained_at_origin": true,
+  "run_context": "Concurrent host jobs; no quiescence wait."
+}

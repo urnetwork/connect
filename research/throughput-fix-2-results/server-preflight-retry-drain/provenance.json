@@ -1,0 +1,11 @@
+{
+  "archive_kind": "server_preflight_retry_drain",
+  "attribution_limits": [
+    "All attempts stopped during setup/preflight. No Go build, test binary, or test outcome exists.",
+    "Default launcher ownership was unreadable in two attempts; the portable PostgreSQL endpoint was unreachable in two attempts.",
+    "No database, launcher, credential, host, or server-checkout mutation was made.",
+    "Environment values, raw logs, local paths, and commands are excluded; only normalized setup outcomes and hashes are retained."
+  ],
+  "collection_time_utc": "2026-09-16T11:09:30.367526+00:00",
+  "scope": "Observed runner setup results from tool outputs; no Go build or test executed. No database, launcher or server checkout mutation. Full database integration remains deferred."
+}

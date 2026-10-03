@@ -1,0 +1,89 @@
+{
+  "archive_result": "complete_pinned_unresolved_root_and_rejected_counterfactual",
+  "by_run": [
+    {
+      "binary_sha256": "f9c3d458bdb47dc98196948de6491cb888231756b31cd2670bb767b2176938d4",
+      "build_manifest_sha256": "076828e9904acb55486a75f72394f1549b41d59b72449268be3513ab9ed5658f",
+      "file_count": 810,
+      "input_sha256": "48506d30cc8311edc9a6110d731443cc2a68fc14a4f7521eb928fbd3485c125e",
+      "name": "before",
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warnings": 0,
+      "raw_log_sha256": "04ca7a3b37e741271df1f3dcb7a8644cafb43664f105f36006598422995e3ef4",
+      "scope": "Original extracted receiver shrink cell; unchanged relative gate; untraced baseline."
+    },
+    {
+      "binary_sha256": "f9c3d458bdb47dc98196948de6491cb888231756b31cd2670bb767b2176938d4",
+      "build_manifest_sha256": "076828e9904acb55486a75f72394f1549b41d59b72449268be3513ab9ed5658f",
+      "file_count": 810,
+      "input_sha256": "48506d30cc8311edc9a6110d731443cc2a68fc14a4f7521eb928fbd3485c125e",
+      "name": "trace",
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warnings": 0,
+      "raw_log_sha256": "f6e82a9e449e731f07747ff872c10376f369ac0b221c3c308556d0c731531c3a",
+      "scope": "Existing pacer trace enabled; diagnostic perturbation, not acceptance."
+    },
+    {
+      "binary_sha256": "13776a7456906d97dc1564f8b27a2a4dc43c817dbb0516f03637c79042ef2241",
+      "build_manifest_sha256": "4793f9ca6b9f84d20b65b923a59d4e47971edfc0e231acc1fdc5491704e9f755",
+      "file_count": 810,
+      "input_sha256": "28d6365939a23fdb678cdd4fcbb95ab93520a2652b90506ff2d4b7e918db6525",
+      "name": "transition-trace",
+      "outcomes": {
+        "FAIL": 1,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warnings": 0,
+      "raw_log_sha256": "5e81b6c510547e040693d181fcc59279be8f2444c653a061c51e84e61d10985c",
+      "scope": "Instrumented hold transition; diagnostic only."
+    },
+    {
+      "binary_sha256": "cfbcef6ceb70bd1cd49bb1e2f69ff7218980e6839501132592bff4287d99840b",
+      "build_manifest_sha256": "1ed26b8121b580b053835ad05768cdb34bec014409fe36958295178ac85dc9f7",
+      "file_count": 811,
+      "input_sha256": "5c3892723afe6f9d527fa6c22dd0f88296490a85ca23a1c897aaa9539e01375d",
+      "name": "root-before",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warnings": 0,
+      "raw_log_sha256": "c7d884683cbc679c513af0d72a0d76144203e9cf0d57e860407405a7318a53ad",
+      "scope": "Explicit write/ACK transitions at fixed times, forced root before any candidate; three race executions."
+    },
+    {
+      "binary_sha256": "52673cf21a31d78d12810175dab7c3fc2eafe964325a7b013013c4dfe8338001",
+      "build_manifest_sha256": "8bf9425a8664c273b6cd15f7f3d1397980819158d0904d5170f5510e88b1ed96",
+      "file_count": 751,
+      "input_sha256": "da71429e9c88832d5567552ee02bbe345717d724bc124eca7f195bb586885d6f",
+      "name": "hybrid-rate-focus",
+      "outcomes": {
+        "FAIL": 13,
+        "PASS": 88,
+        "SKIP": 0
+      },
+      "race_warnings": 0,
+      "raw_log_sha256": "43ab7822fcf54a7c8994b69f21757cde88e89b6f349bbc2df2579caffbcf4724",
+      "scope": "Rejected blanket gap/flight-size filter: eleven genuine previous-root regressions; two frozen pre-hybrid test API expectations separately identified."
+    }
+  ],
+  "numerical_readings": 9,
+  "outcomes": {
+    "fail": 19,
+    "pass": 88,
+    "skip": 0,
+    "total": 107
+  },
+  "race_warning_blocks": 0,
+  "runs": 5
+}

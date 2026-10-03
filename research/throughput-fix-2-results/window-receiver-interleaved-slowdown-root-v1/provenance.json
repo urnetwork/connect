@@ -1,0 +1,20 @@
+{
+  "baseline_limitation": "This frozen consumer snapshot lacks the separately accepted cumulative windowPacingRate fallback. These direct-service roots never call that helper, and this archive does not claim full core acceptance.",
+  "comparison": "Test-only supplement on unchanged joined receiver consumer and endpoint-bound candidate; no production edits.",
+  "controls": "Identical physical bytes, waits and publication schedules with all legacy or one legacy sibling metadata pass three repetitions each. All shared/per-sibling byte totals, confirmed H1 offering, unacknowledged physical tails and persistent5.44MB queue assertions pass.",
+  "event_plumbing": false,
+  "failing_root": "TestWindowPacingReceiverInterleavedSlowdownAdaptsWithInvalidRing",
+  "failure_details": "At phase6ms, both callback publication021 and201 retain12.5MB/s through the final16 controller reads while all64 ordinary intervals are invalid. The independent physical serializer continuously delivers4MB/s. Both errors recur inside each of three failed root invocations.",
+  "performance_gates_changed": false,
+  "production_adopted": false,
+  "race": true,
+  "repetitions": 3,
+  "source_base": {
+    "helper_sha256": "fd25773d42a57b0c6715137bace2714342cd3a1c85fbfe7d4aecbeb9f08685dd",
+    "sampler_sha256": "ec23747570a0ed4930da4f45e5acb6229f369286b347e328e96cfc4c5f5a3ee4",
+    "snapshot": "receiver-consumers-bounds-after-pinned"
+  },
+  "status": "Open sampler qualification defect handed to lifetime_root_review; no fix or full-model acceptance claimed.",
+  "stimulus": "512 preoffered cycles of1000+4000+12000 bytes across three logical siblings;192 cycles delivered at4MB/s. Receiver waits0/4ms/0, publication021/201, phases0/6ms. Prior12.5MB/s is established from eight actual byte/time intervals. Final16 reads must settle within3.6\u20134.4MB/s without any network event.",
+  "test_execution_owner": "test_monitor_medium"
+}

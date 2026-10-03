@@ -1,0 +1,11 @@
+--- a/transfer_window_h1_duplex_test.go
++++ b/transfer_window_h1_duplex_test.go
+@@ -433,7 +433,7 @@
+ 		if ratios[direction] < .9 {
+ 			failureReasons = append(failureReasons, fmt.Sprintf("direction%d candidate below90%% matched reference", direction))
+ 		}
+-		if readings[1].Window[direction].Sized == false || readings[0].Window[direction].Sized || readings[2].Window[direction].Sized {
++		if !windowPhysicalH1ArmPolicyMatches("delivery", readings[1], direction) || !windowPhysicalH1ArmPolicyMatches("ceiling-before", readings[0], direction) || !windowPhysicalH1ArmPolicyMatches("ceiling-after", readings[2], direction) {
+ 			failureReasons = append(failureReasons, fmt.Sprintf("direction%d wrong window policy", direction))
+ 		}
+ 		aggregateReference += references[direction]

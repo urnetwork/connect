@@ -1,0 +1,47 @@
+{
+  "by_run": {
+    "combined-v2-focused-race": {
+      "classification": "fixture-diagnostic",
+      "fail": 3,
+      "pass": 108,
+      "readings": 15
+    },
+    "combined-v3-focused-race": {
+      "classification": "final-candidate-focused-after",
+      "fail": 0,
+      "pass": 162,
+      "readings": 15
+    },
+    "sender-v2-confirmation-before-race": {
+      "classification": "deterministic-failure-before",
+      "fail": 3,
+      "pass": 0,
+      "readings": 3
+    },
+    "sender-v3-focused-race": {
+      "classification": "fixture-diagnostic",
+      "fail": 3,
+      "pass": 51,
+      "readings": 0
+    },
+    "sender-v3-ordering-before-race": {
+      "classification": "historical-failure-before",
+      "fail": 6,
+      "pass": 0,
+      "readings": 6
+    },
+    "sender-v3-ordering-corrected-before-race": {
+      "classification": "deterministic-failure-before",
+      "fail": 6,
+      "pass": 0,
+      "readings": 6
+    }
+  },
+  "complete_runs": 6,
+  "fail_count": 21,
+  "fixture_diagnostics_retained_as_noncausal": 2,
+  "outcomes": 342,
+  "pass_count": 321,
+  "race_warning_count": 0,
+  "reading_count": 45
+}

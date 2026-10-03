@@ -47,16 +47,12 @@ func contractFreeEncryptedPair(
 	provideModes := map[protocol.ProvideMode]bool{protocol.ProvideMode_Network: true}
 
 	makeSettings := func(mode EncryptionMode) *ClientSettings {
-		s := DefaultClientSettings()
-		s.SendBufferSettings.SequenceBufferSize = 0
-		s.SendBufferSettings.AckBufferSize = 0
+		s := DefaultClientSettingsWithBufferSize(64)
 		s.SendBufferSettings.AckTimeout = 60 * time.Second
 		s.SendBufferSettings.IdleTimeout = 60 * time.Second
 		s.SendBufferSettings.MinResendInterval = 10 * time.Millisecond
-		s.ReceiveBufferSettings.SequenceBufferSize = 0
 		s.ReceiveBufferSettings.GapTimeout = 60 * time.Second
 		s.ReceiveBufferSettings.IdleTimeout = 60 * time.Second
-		s.ForwardBufferSettings.SequenceBufferSize = 0
 		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
 		// the transfer_test contract-free idiom
 		s.ContractManagerSettings.LegacyCreateContract = true
@@ -132,7 +128,10 @@ func contractFreeEncryptedPair(
 		for _, frame := range frames {
 			if m, err := FromFrame(frame); err == nil {
 				if sm, ok := m.(*protocol.SimpleMessage); ok {
-					receivesB <- sm.Content
+					select {
+					case receivesB <- sm.Content:
+					default:
+					}
 				}
 			}
 		}
@@ -157,7 +156,7 @@ func TestRequiredContractFreeEstablishesViaOobKeyFetcher(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "sealed-contract-free"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {
@@ -192,7 +191,7 @@ func TestRequiredContractFreeWithoutKeySourceFailsClosed(t *testing.T) {
 
 	if ok := a.SendWithTimeout(
 		requiredGateFrame(t, "never"),
-		DestinationId(bClientId),
+		bClientId,
 		func(error) {},
 		3*time.Second,
 	); ok {
@@ -212,7 +211,7 @@ func TestRequiredContractFreeWithoutKeySourceFailsClosed(t *testing.T) {
 
 	if ok := a2.SendWithTimeout(
 		requiredGateFrame(t, "plaintext-fallback"),
-		DestinationId(b2ClientId),
+		b2ClientId,
 		func(error) {},
 		30*time.Second,
 	); !ok {

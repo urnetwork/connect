@@ -1,0 +1,30 @@
+{
+  "acceptance_limit": "Writer-handle synchronization and adjacent correctness only. No full performance/model acceptance or sampler service-loss resolution is claimed.",
+  "adjacent_scope": "Ownership, destination statistics selection and service-read purity, original nine cumulative pacing roots, and three retained service attribution controls.",
+  "after_result": "All three fresh processes pass all three roots without races: aggregate9 pass/0 fail. Same-binary adjacent count3 adds60 pass/0 fail.",
+  "archive_path_normalization": "External artifact lookup paths are represented by snapshot identifier and relative path. Raw logs and original compile manifests remain unmodified outside the repository; their original hashes are pinned. Race-stack extracts replace only frozen-source and Go-installation path prefixes, preserving line numbers and stack text.",
+  "before_result": "All three fresh processes fail both teardown/statistics and opening/policy roots with one report each, and pass the external-retirement control: aggregate3 pass/6 fail,6 race warnings.",
+  "changed_source_paths": [
+    "transfer.go"
+  ],
+  "fresh_process_repetitions": 3,
+  "new_network_api": false,
+  "new_test_sha256": "77b92e12cf0527041b5f09d3a009ecb987edb29e728651ecfdc56ffa54326bf6",
+  "owner_patch_sha256": "1cb7231bcc7ff8763a47b93c8cf1fd220b34b2a4f7d9f56afc72803d96b5bbbc",
+  "performance_gates_changed": false,
+  "positive_control": "A real acquired route writer snapshot is retained while external CloseMultiRouteWriter waits. Statistics complete before release, proving no sequence publication lock spans that external wait.",
+  "prior_fixture": "window-writer-statistics-owner-v1 retains the broad start barrier, its one missed fresh teardown reproduction, and all original outcomes. It is explicitly not the final deterministic gate.",
+  "race": true,
+  "root_mechanism": "Both workers reach their immediate handle access after external selector effects, then the main test releases them without ordering one after the other. The only intended ordering between pointer read/store is the added leaf mutex. No elapsed sleeps, polling or retry loop provides overlap.",
+  "sampler_changed": false,
+  "seam_equivalence": "Before and after contain identical nil-by-default beforeContractWriterAccessForTest field and three calls: one before the policy handle copy, one after OpenMultiRouteWriter returns but before publication, and one after CloseMultiRouteWriter returns but before clearing the handle. The identical test file supplies separate read/publication once guards and a common release channel. All hooks execute outside the publication lock.",
+  "seams_patch_sha256": "6edf414547083e9e495221d91efae54e119dcdc9b9e58f0ade9f9cbd8b2485fd",
+  "sizing_math_changed": false,
+  "source_attribution": "The original unprotected publication/close/policy/receiver-timing methods are byte-identical at f903f59a and the live pre-fix retained core, as preserved in the v1 source-review. This issue predates retention; no historical f903 test binary was run.",
+  "source_base": {
+    "compile_manifest_sha256": "958f0aa140d9e6c48754accd4e089fbfab57ea933df992dcd2aad5b21f1817c1",
+    "snapshot": "combined-sampler-cumulative-v1",
+    "source_content_sha256": "ee6ebf9def890e6509b3d3587f7a4c6bfad8e303f143d8d5ff253783337ac261"
+  },
+  "test_execution_owner": "test_monitor_medium"
+}

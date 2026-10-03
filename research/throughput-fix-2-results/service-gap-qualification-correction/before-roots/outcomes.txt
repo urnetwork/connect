@@ -1,0 +1,61 @@
+=== RUN   TestWindowPacingCompressedFlightsKeepMeasuredSerialization
+--- PASS: TestWindowPacingCompressedFlightsKeepMeasuredSerialization (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleKeepsFullGap
+--- PASS: TestWindowPacingFeedbackCycleKeepsFullGap (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleCompletesAtPhysicalTail
+--- PASS: TestWindowPacingFeedbackCycleCompletesAtPhysicalTail (0.00s)
+=== RUN   TestWindowPacingLimitedFlightModestQueueKeepsSerialization
+--- FAIL: TestWindowPacingLimitedFlightModestQueueKeepsSerialization (0.00s)
+=== RUN   TestWindowPacingFreshTrainRejectsPriorPropagationGap
+--- FAIL: TestWindowPacingFreshTrainRejectsPriorPropagationGap (0.00s)
+=== RUN   TestWindowPacingFreshTrainBelowEndpointAllowanceLowersService
+--- PASS: TestWindowPacingFreshTrainBelowEndpointAllowanceLowersService (0.00s)
+=== RUN   TestWindowPacingFreshTrainSustainedSlowdownReplacesHold
+--- PASS: TestWindowPacingFreshTrainSustainedSlowdownReplacesHold (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsContinuousSlowPair
+--- PASS: TestWindowPacingLimitedFlightAcceptsContinuousSlowPair (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsQueuedSlowService
+--- PASS: TestWindowPacingLimitedFlightAcceptsQueuedSlowService (0.00s)
+=== RUN   TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts
+--- PASS: TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts (0.00s)
+=== RUN   TestWindowPacingCompressedFlightsKeepMeasuredSerialization
+--- PASS: TestWindowPacingCompressedFlightsKeepMeasuredSerialization (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleKeepsFullGap
+--- PASS: TestWindowPacingFeedbackCycleKeepsFullGap (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleCompletesAtPhysicalTail
+--- PASS: TestWindowPacingFeedbackCycleCompletesAtPhysicalTail (0.00s)
+=== RUN   TestWindowPacingLimitedFlightModestQueueKeepsSerialization
+--- FAIL: TestWindowPacingLimitedFlightModestQueueKeepsSerialization (0.00s)
+=== RUN   TestWindowPacingFreshTrainRejectsPriorPropagationGap
+--- FAIL: TestWindowPacingFreshTrainRejectsPriorPropagationGap (0.00s)
+=== RUN   TestWindowPacingFreshTrainBelowEndpointAllowanceLowersService
+--- PASS: TestWindowPacingFreshTrainBelowEndpointAllowanceLowersService (0.00s)
+=== RUN   TestWindowPacingFreshTrainSustainedSlowdownReplacesHold
+--- PASS: TestWindowPacingFreshTrainSustainedSlowdownReplacesHold (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsContinuousSlowPair
+--- PASS: TestWindowPacingLimitedFlightAcceptsContinuousSlowPair (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsQueuedSlowService
+--- PASS: TestWindowPacingLimitedFlightAcceptsQueuedSlowService (0.00s)
+=== RUN   TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts
+--- PASS: TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts (0.00s)
+=== RUN   TestWindowPacingCompressedFlightsKeepMeasuredSerialization
+--- PASS: TestWindowPacingCompressedFlightsKeepMeasuredSerialization (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleKeepsFullGap
+--- PASS: TestWindowPacingFeedbackCycleKeepsFullGap (0.00s)
+=== RUN   TestWindowPacingFeedbackCycleCompletesAtPhysicalTail
+--- PASS: TestWindowPacingFeedbackCycleCompletesAtPhysicalTail (0.00s)
+=== RUN   TestWindowPacingLimitedFlightModestQueueKeepsSerialization
+--- FAIL: TestWindowPacingLimitedFlightModestQueueKeepsSerialization (0.00s)
+=== RUN   TestWindowPacingFreshTrainRejectsPriorPropagationGap
+--- FAIL: TestWindowPacingFreshTrainRejectsPriorPropagationGap (0.00s)
+=== RUN   TestWindowPacingFreshTrainBelowEndpointAllowanceLowersService
+--- PASS: TestWindowPacingFreshTrainBelowEndpointAllowanceLowersService (0.00s)
+=== RUN   TestWindowPacingFreshTrainSustainedSlowdownReplacesHold
+--- PASS: TestWindowPacingFreshTrainSustainedSlowdownReplacesHold (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsContinuousSlowPair
+--- PASS: TestWindowPacingLimitedFlightAcceptsContinuousSlowPair (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsQueuedSlowService
+--- PASS: TestWindowPacingLimitedFlightAcceptsQueuedSlowService (0.00s)
+=== RUN   TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts
+--- PASS: TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts (0.00s)
+FAIL

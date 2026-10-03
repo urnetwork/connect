@@ -1,0 +1,3 @@
+=== RUN   TestThroughputFix2SdkWindowSettings
+--- PASS: TestThroughputFix2SdkWindowSettings (0.00s)
+PASS

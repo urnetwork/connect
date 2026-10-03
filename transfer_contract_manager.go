@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"time"
@@ -39,6 +40,10 @@ type ContractKey struct {
 	IntermediaryIds   MultiHopId
 	CompanionContract bool
 	ForceStream       bool
+	// LogicalLane is local queue-generation identity only. It is intentionally
+	// absent from CreateContract: every lane requests the same backend contract
+	// class, but must not flush a sibling lane's pending queue on idle exit.
+	LogicalLane uint32
 	// NetworkPeer is contract sizing/retention policy, not routing identity:
 	// it is true only when the sender has an authenticated same-network
 	// relationship with Destination. Unlike ForceStream, it never classifies a
@@ -95,9 +100,15 @@ type contractStatusCallbackWorker struct {
 	maxCount   int
 	closed     bool
 	notify     chan struct{}
+	done       chan struct{}
 }
 
-func newContractStatusCallbackWorker(ctx context.Context, callback ContractStatusFunction, bufferSize int) *contractStatusCallbackWorker {
+func newContractStatusCallbackWorker(
+	ctx context.Context,
+	callback ContractStatusFunction,
+	bufferSize int,
+	finished ...func(),
+) *contractStatusCallbackWorker {
 	callbackCtx, cancel := context.WithCancel(ctx)
 	worker := &contractStatusCallbackWorker{
 		ctx:      callbackCtx,
@@ -107,8 +118,17 @@ func newContractStatusCallbackWorker(ctx context.Context, callback ContractStatu
 		order:    make([]ContractKey, max(1, bufferSize)),
 		maxCount: max(1, bufferSize),
 		notify:   make(chan struct{}, 1),
+		done:     make(chan struct{}),
 	}
-	go HandleError(worker.run, cancel)
+	go func() {
+		defer func() {
+			close(worker.done)
+			if 0 < len(finished) && finished[0] != nil {
+				finished[0]()
+			}
+		}()
+		HandleError(worker.run, cancel)
+	}()
 	return worker
 }
 
@@ -187,6 +207,12 @@ func (self *contractStatusCallbackWorker) Close() {
 	self.order = nil
 	self.stateLock.Unlock()
 	self.cancel()
+}
+
+// closeAndWait cancels delivery and joins the callback invocation worker.
+func (self *contractStatusCallbackWorker) closeAndWait(ctx context.Context) error {
+	self.Close()
+	return waitForLifecycleDone(ctx, self.done, "contract status callback")
 }
 
 type ContractManagerStats struct {
@@ -384,11 +410,15 @@ func (self *ContractManagerSettings) ContractsEnabled() bool {
 
 type ContractManager struct {
 	ctx    context.Context
+	cancel context.CancelFunc
 	client *Client
 
 	settings *ContractManagerSettings
 
-	mutex sync.Mutex
+	mutex             sync.Mutex
+	closed            bool
+	workers           *lifecycleAdmission
+	closeControlSyncs map[*ControlSync]bool
 
 	// `provideSecretKeys` retains all keys until app restart (typically system restart)
 	// this makes it faster for clients to reconnect with existing contracts
@@ -405,6 +435,11 @@ type ContractManager struct {
 	sendNoContractClientIds    map[Id]bool
 
 	contractStatusCallbacks *CallbackList[*contractStatusCallbackWorker]
+	// Multi-client windows install one nonblocking dispatcher per client and
+	// coalesce all of those clients into the window's single callback worker.
+	// Keeping this internal prevents a general caller from putting blocking work
+	// back on HandleControlFrame.
+	contractStatusDispatchCallbacks *CallbackList[ContractStatusFunction]
 
 	localStats *ContractManagerStats
 
@@ -420,6 +455,18 @@ type ContractManager struct {
 
 	controlSyncProvide    *ControlSync
 	controlSyncProvideOob *ControlSyncOob
+
+	// Tests pause the drain/detach boundary and observe a competing opener.
+	// Nil keeps production queue lifecycle unchanged.
+	testingBeforeOpenContractQueueLock func(ContractKey)
+	// Nil test barrier pauses an owned background worker after its cleanup and
+	// before joined completion.
+	beforeWorkerDoneForTest func(string)
+	// Nil test barrier pauses a provide ping after frame ownership is created.
+	beforeProvidePingSendForTest func(*protocol.Frame)
+	// Nil test barriers expose callback admission and manager join entry.
+	beforeCallbackAdmissionLockForTest func()
+	beforeCloseWaitForTest             func()
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
@@ -431,6 +478,7 @@ func NewContractManager(
 	client *Client,
 	settings *ContractManagerSettings,
 ) *ContractManager {
+	managerCtx, cancel := context.WithCancel(ctx)
 	// at a minimum
 	// - messages to/from the platform (ControlId) do not need a contract
 	//   this is because the platform is needed to create contracts
@@ -445,32 +493,122 @@ func NewContractManager(
 	}
 
 	contractManager := &ContractManager{
-		ctx:                        ctx,
-		client:                     client,
-		settings:                   settings,
-		provideSecretKeys:          map[protocol.ProvideMode][]byte{},
-		provideModes:               map[protocol.ProvideMode]bool{},
-		providePaused:              false,
-		provideMonitor:             NewMonitor(),
-		destinationContracts:       map[ContractKey]*contractQueue{},
-		receiveNoContractClientIds: receiveNoContractClientIds,
-		sendNoContractClientIds:    sendNoContractClientIds,
-		contractStatusCallbacks:    NewCallbackList[*contractStatusCallbackWorker](),
-		localStats:                 NewContractManagerStats(),
-		contractStatsEntries:       map[contractStatsKey]*contractStatsEntry{},
-		contractStatsCallbacks:     NewCallbackList[ContractStatsFunction](),
-		contractStatsSequences:     map[Id]uint64{},
-		controlSyncProvide:         NewControlSync(ctx, client, "provide"),
-		controlSyncProvideOob:      NewControlSyncOob(ctx, client, "provide-oob"),
+		ctx:                             managerCtx,
+		cancel:                          cancel,
+		client:                          client,
+		settings:                        settings,
+		provideSecretKeys:               map[protocol.ProvideMode][]byte{},
+		provideModes:                    map[protocol.ProvideMode]bool{},
+		providePaused:                   false,
+		provideMonitor:                  NewMonitor(),
+		destinationContracts:            map[ContractKey]*contractQueue{},
+		receiveNoContractClientIds:      receiveNoContractClientIds,
+		sendNoContractClientIds:         sendNoContractClientIds,
+		contractStatusCallbacks:         NewCallbackList[*contractStatusCallbackWorker](),
+		contractStatusDispatchCallbacks: NewCallbackList[ContractStatusFunction](),
+		localStats:                      NewContractManagerStats(),
+		contractStatsEntries:            map[contractStatsKey]*contractStatsEntry{},
+		contractStatsCallbacks:          NewCallbackList[ContractStatsFunction](),
+		contractStatsSequences:          map[Id]uint64{},
+		controlSyncProvide:              NewControlSync(managerCtx, client, "provide"),
+		controlSyncProvideOob:           NewControlSyncOob(managerCtx, client, "provide-oob"),
+		workers:                         newLifecycleAdmission(),
+		closeControlSyncs:               map[*ControlSync]bool{},
 	}
 
 	if client.ClientId() != ControlId {
-		go HandleError(contractManager.providePing, client.Cancel)
+		contractManager.startWorker("provide ping", contractManager.providePing)
 	}
 
-	go HandleError(contractManager.expireQueuedContracts, client.Cancel)
+	contractManager.startWorker("contract expiry", contractManager.expireQueuedContracts)
 
 	return contractManager
+}
+
+// startWorker admits one manager-owned background loop before launch.
+func (self *ContractManager) startWorker(name string, run func()) bool {
+	if !self.workers.start() {
+		return false
+	}
+	go func() {
+		defer self.workers.finish()
+		HandleError(run, self.client.Cancel)
+		if self.beforeWorkerDoneForTest != nil {
+			self.beforeWorkerDoneForTest(name)
+		}
+	}()
+	return true
+}
+
+// Close prevents later manager work, cancels control retries, and requests
+// callback and background-worker teardown without waiting.
+func (self *ContractManager) Close() {
+	self.mutex.Lock()
+	if self.closed {
+		self.mutex.Unlock()
+		return
+	}
+	self.closed = true
+	closeControlSyncs := make(
+		[]*ControlSync,
+		0,
+		len(self.closeControlSyncs),
+	)
+	for controlSync := range self.closeControlSyncs {
+		closeControlSyncs = append(closeControlSyncs, controlSync)
+	}
+	self.mutex.Unlock()
+
+	self.cancel()
+	self.workers.close()
+	self.controlSyncProvide.Close()
+	self.controlSyncProvideOob.Close()
+	for _, controlSync := range closeControlSyncs {
+		controlSync.Close()
+	}
+	for _, worker := range self.contractStatusCallbacks.Get() {
+		worker.Close()
+	}
+}
+
+// closeAndWait joins manager background/callback work and every registered
+// control retry generation, or returns when ctx expires.
+func (self *ContractManager) closeAndWait(ctx context.Context) error {
+	self.Close()
+	if self.beforeCloseWaitForTest != nil {
+		self.beforeCloseWaitForTest()
+	}
+	var result error
+	if err := waitForLifecycleDone(
+		ctx,
+		self.workers.Done(),
+		"contract manager workers",
+	); err != nil {
+		result = errors.Join(result, err)
+	}
+	if err := self.controlSyncProvide.closeAndWait(ctx); err != nil {
+		result = errors.Join(result, err)
+	}
+	if err := self.controlSyncProvideOob.closeAndWait(ctx); err != nil {
+		result = errors.Join(result, err)
+	}
+
+	self.mutex.Lock()
+	closeControlSyncs := make(
+		[]*ControlSync,
+		0,
+		len(self.closeControlSyncs),
+	)
+	for controlSync := range self.closeControlSyncs {
+		closeControlSyncs = append(closeControlSyncs, controlSync)
+	}
+	self.mutex.Unlock()
+	for _, controlSync := range closeControlSyncs {
+		if err := controlSync.closeAndWait(ctx); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
 }
 
 // expireQueuedContracts periodically closes queued contracts that no sequence
@@ -658,12 +796,20 @@ func (self *ContractManager) providePing() {
 			self.client.log.Infof("[contract]could not create provide ping frame = %s", err)
 			return
 		}
-		self.client.SendControl(frame, func(err error) {
+		if self.beforeProvidePingSendForTest != nil {
+			self.beforeProvidePingSendForTest(frame)
+		}
+		if !self.client.SendControl(frame, func(err error) {
 			select {
 			case ack <- err:
 			case <-self.ctx.Done():
 			}
-		})
+		}) {
+			// SendControl transfers MessageBytes only on success. Shutdown keeps
+			// ownership with this worker, so release it before the joined exit.
+			MessagePoolReturn(frame.MessageBytes)
+			return
+		}
 		// wait for the ack before sending another ping
 		select {
 		case err := <-ack:
@@ -682,16 +828,57 @@ func (self *ContractManager) StandardContractTransferByteCount() ByteCount {
 }
 
 func (self *ContractManager) AddContractStatusCallback(contractStatusCallback ContractStatusFunction) func() {
-	worker := newContractStatusCallbackWorker(self.ctx, contractStatusCallback, self.settings.SequenceBufferSize)
+	if self.beforeCallbackAdmissionLockForTest != nil {
+		self.beforeCallbackAdmissionLockForTest()
+	}
+	self.mutex.Lock()
+	if self.closed || !self.workers.start() {
+		self.mutex.Unlock()
+		return func() {}
+	}
+	worker := newContractStatusCallbackWorker(
+		self.ctx,
+		contractStatusCallback,
+		self.settings.SequenceBufferSize,
+		self.workers.finish,
+	)
 	callbackId := self.contractStatusCallbacks.Add(worker)
+	self.mutex.Unlock()
 	return func() {
 		self.contractStatusCallbacks.Remove(callbackId)
 		worker.Close()
 	}
 }
 
+// addContractStatusDispatchCallback registers an internal callback whose only
+// permitted work is a bounded, nonblocking Dispatch into a parent-owned
+// worker. RemoteUserNatMultiClient uses it to avoid allocating a goroutine and
+// SequenceBufferSize-sized ring for every exit when one coalescer per window is
+// sufficient. Public callbacks continue through AddContractStatusCallback and
+// retain independent failure containment.
+func (self *ContractManager) addContractStatusDispatchCallback(
+	contractStatusCallback ContractStatusFunction,
+) func() {
+	if contractStatusCallback == nil {
+		return func() {}
+	}
+	self.mutex.Lock()
+	if self.closed {
+		self.mutex.Unlock()
+		return func() {}
+	}
+	callbackId := self.contractStatusDispatchCallbacks.Add(contractStatusCallback)
+	self.mutex.Unlock()
+	return func() {
+		self.contractStatusDispatchCallbacks.Remove(callbackId)
+	}
+}
+
 // ContractStatusFunction
 func (self *ContractManager) contractStatus(contractStatus *ContractStatus) {
+	for _, dispatch := range self.contractStatusDispatchCallbacks.Get() {
+		dispatch(contractStatus)
+	}
 	for _, contractStatusCallback := range self.contractStatusCallbacks.Get() {
 		contractStatusCallback.Dispatch(contractStatus)
 	}
@@ -709,6 +896,17 @@ func (self *ContractManager) Receive(source TransferPath, frames []*protocol.Fra
 */
 
 func (self *ContractManager) HandleControlFrame(contractKey ContractKey, frame *protocol.Frame) error {
+	return self.handleControlFrameForQueue(contractKey, nil, frame)
+}
+
+// Handles one contract result for either the current key or the exact queue
+// generation that issued the request. A captured generation prevents a late
+// response from reopening a route hint that its send sequence already retired.
+func (self *ContractManager) handleControlFrameForQueue(
+	contractKey ContractKey,
+	ownedQueue *contractQueue,
+	frame *protocol.Frame,
+) error {
 	switch frame.MessageType {
 	case protocol.MessageType_TransferCreateContractResult:
 		contracts, contractErrors := self.parseControlFrame(frame)
@@ -720,7 +918,19 @@ func (self *ContractManager) HandleControlFrame(contractKey ContractKey, frame *
 						self.contractStatus(contractStatus)
 					}
 				}()
-				err := self.addContract(contractKey, contract)
+				var err error
+				if ownedQueue == nil {
+					err = self.addContract(contractKey, contract)
+				} else {
+					err = self.addContractToQueue(contractKey, ownedQueue, contract)
+				}
+				if errors.Is(err, errContractQueueDrained) {
+					// The owning send sequence promoted or closed while this OOB
+					// request was in flight. Retire the returned platform contract
+					// without publishing it under a replacement queue generation.
+					self.closeContracts([]*protocol.Contract{contract})
+					return nil
+				}
 				if err != nil {
 					// contract rejected
 					contractError := protocol.ContractError_Trust
@@ -1248,6 +1458,18 @@ func (self *ContractManager) hasOpenContractForKeyWithLock(contractKey ContractK
 }
 
 func (self *ContractManager) addContract(contractKey ContractKey, contract *protocol.Contract) error {
+	contractQueue := self.openContractQueue(contractKey)
+	defer self.closeContractQueue(contractKey, contractQueue)
+	return self.addContractToQueue(contractKey, contractQueue, contract)
+}
+
+// Validates and adds a result only to the queue generation that owns the
+// corresponding request. The queue itself linearizes add against drain.
+func (self *ContractManager) addContractToQueue(
+	contractKey ContractKey,
+	contractQueue *contractQueue,
+	contract *protocol.Contract,
+) error {
 	storedContract := &protocol.StoredContract{}
 	err := ProtoUnmarshal(contract.StoredContractBytes, storedContract)
 	if err != nil {
@@ -1266,35 +1488,70 @@ func (self *ContractManager) addContract(contractKey ContractKey, contract *prot
 		self.client.log.Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
 	}
 
-	func() {
-		contractQueue := self.openContractQueue(contractKey)
-		defer self.closeContractQueue(contractKey, contractQueue)
-		contractQueue.Add(contract, storedContract)
-	}()
-
-	return nil
+	// Linearize result publication with Close. Once shutdown's final flush
+	// starts, a returned reservation must use the existing retired-result close
+	// path, never repopulate a queue that no worker will consume or flush again.
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.closed {
+		return errContractQueueDrained
+	}
+	return contractQueue.Add(contract, storedContract)
 }
 
+// Coalesces an identical pending request within its exact queue generation.
+// Completion releases admission; this is not remote exactly-once semantics.
 func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) {
-	// look at destinationContracts and last contract to get previous contract id
+	// The external OOB owns transport and frame buffers; this manager owns its
+	// callback until it has consumed or closed every returned reservation. The
+	// generator joins the Client before closing OOB admission, so retaining this
+	// owner also retains permission for the callback's bounded shutdown close.
+	self.mutex.Lock()
+	if self.closed || !self.workers.start() {
+		self.mutex.Unlock()
+		return
+	}
+	self.mutex.Unlock()
+
+	// Retain ownership through the asynchronous callback. A route promotion can
+	// force-remove and drain this exact generation while the request is in
+	// flight; the callback then rejects and closes its stale result instead of
+	// reopening the old key.
 	contractQueue := self.openContractQueue(contractKey)
-	defer self.closeContractQueue(contractKey, contractQueue)
+	request := contractCreateRequest{
+		key:               contractKey,
+		seqIndex:          contractSeqIndex,
+		transferByteCount: self.contractByteCount(contractKey, contractSeqIndex, minByteCount),
+	}
+	if !contractQueue.beginCreate(request) {
+		self.closeContractQueue(contractKey, contractQueue)
+		self.workers.finish()
+		return
+	}
+	finish := func() {
+		defer self.workers.finish()
+		contractQueue.finishCreate(request)
+		self.closeContractQueue(contractKey, contractQueue)
+	}
 
 	streamVersion := uint32(DefaultStreamVersion)
+	senderRole := contractKey.EncryptionRole.toProtobuf()
 
 	createContract := &protocol.CreateContract{
 		DestinationId:     contractKey.Destination.DestinationId.Bytes(),
 		IntermediaryIds:   contractKey.IntermediaryIds.Bytes(),
-		TransferByteCount: uint64(self.contractByteCount(contractKey, contractSeqIndex, minByteCount)),
+		TransferByteCount: uint64(request.transferByteCount),
 		Companion:         contractKey.CompanionContract,
 		ForceStream:       &contractKey.ForceStream,
 		StreamVersion:     &streamVersion,
+		SenderRole:        &senderRole,
 	}
 	if self.settings.TrackUsedContracts {
 		createContract.UsedContractIds = contractQueue.UsedContractIdBytes()
 	}
 	frame, err := ToFrame(createContract, self.settings.ProtocolVersion)
 	if err != nil {
+		finish()
 		self.client.log.Infof("[contract]could not create contract frame = %s", err)
 		return
 	}
@@ -1306,11 +1563,12 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	self.client.ClientOob().SendControl(
 		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
+			defer finish()
 			if err == nil {
 				// the OOB round-trip completed: the backend is reachable
 				noteBackendSuccess()
 				for _, resultFrame := range resultFrames {
-					self.HandleControlFrame(contractKey, resultFrame)
+					self.handleControlFrameForQueue(contractKey, contractQueue, resultFrame)
 				}
 			} else {
 				select {
@@ -1484,6 +1742,27 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	}
 
 	closeControlSync := NewControlSync(self.ctx, self.client, fmt.Sprintf("close-contract-%s", contractId))
+	self.mutex.Lock()
+	if self.closed {
+		self.mutex.Unlock()
+		closeControlSync.Close()
+		MessagePoolReturn(frame.MessageBytes)
+		return
+	}
+	self.closeControlSyncs[closeControlSync] = true
+	if !self.startWorker("contract close sync", func() {
+		<-closeControlSync.workers.Done()
+		self.mutex.Lock()
+		delete(self.closeControlSyncs, closeControlSync)
+		self.mutex.Unlock()
+	}) {
+		delete(self.closeControlSyncs, closeControlSync)
+		self.mutex.Unlock()
+		closeControlSync.Close()
+		MessagePoolReturn(frame.MessageBytes)
+		return
+	}
+	self.mutex.Unlock()
 	closeControlSync.Send(frame, nil, func(sendErr error) {
 		defer closeControlSync.Close()
 		if sendErr == nil && opened {
@@ -1550,10 +1829,34 @@ func (self *ContractManager) Flush(resetUsedContractIds bool) []Id {
 }
 
 func (self *ContractManager) FlushContractQueue(contractKey ContractKey, resetUsedContractIds bool) []Id {
-	contractQueue := self.openContractQueue(contractKey)
-	defer self.closeContractQueueWithForceRemove(contractKey, contractQueue, true)
+	if self.settings.LegacyCreateContract {
+		contractKey = contractKey.Legacy()
+	}
 
-	contracts := contractQueue.Flush(resetUsedContractIds)
+	var contractQueue *contractQueue
+	var contracts []*protocol.Contract
+	func() {
+		// Keep the manager-to-queue lock order used by every queue lifecycle
+		// operation. Holding the manager lock through drain and map deletion
+		// makes retirement one boundary: a concurrent opener either owns this
+		// generation before the drain or creates a fresh one after deletion.
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+
+		contractQueue = self.destinationContracts[contractKey]
+		if contractQueue == nil {
+			return
+		}
+		contractQueue.mutex.Lock()
+		contracts = contractQueue.flushAndDrainWithLock(resetUsedContractIds)
+		contractQueue.mutex.Unlock()
+		if self.destinationContracts[contractKey] == contractQueue {
+			delete(self.destinationContracts, contractKey)
+		}
+	}()
+	if contractQueue != nil {
+		contractQueue.updateMonitor.NotifyAll()
+	}
 
 	return self.closeContracts(contracts)
 }
@@ -1575,6 +1878,9 @@ func (self *ContractManager) closeContracts(contracts []*protocol.Contract) []Id
 func (self *ContractManager) openContractQueue(contractKey ContractKey) *contractQueue {
 	if self.settings.LegacyCreateContract {
 		contractKey = contractKey.Legacy()
+	}
+	if self.testingBeforeOpenContractQueueLock != nil {
+		self.testingBeforeOpenContractQueueLock(contractKey)
 	}
 
 	self.mutex.Lock()
@@ -1644,6 +1950,14 @@ type queuedContract struct {
 	enqueueTime time.Time
 }
 
+// The original key also fences legacy queues that intentionally collapse
+// routing keys. Successor indices and larger reservations are not retries.
+type contractCreateRequest struct {
+	key               ContractKey
+	seqIndex          uint64
+	transferByteCount ByteCount
+}
+
 type contractQueue struct {
 	updateMonitor *Monitor
 	log           Logger
@@ -1652,10 +1966,41 @@ type contractQueue struct {
 	openCount int
 	contracts map[Id]*queuedContract
 	drained   bool
+	// Only externally owned in-flight callbacks retain entries. No process
+	// budget, completed-request cache, or retry timer is introduced here.
+	pendingCreates map[contractCreateRequest]bool
 
 	// remember all added contract ids
 	trackUsedContracts bool
 	usedContractIds    map[Id]bool
+
+	// Tests pause after this queue lock is owned so manager-lock atomicity can
+	// be proved at the drain boundary. Nil keeps production flushes unchanged.
+	testingBeforeFlushWithLock func()
+}
+
+var errContractQueueDrained = errors.New("contract queue drained")
+
+// Linearizes nonblocking admission under this queue generation's lock.
+func (self *contractQueue) beginCreate(request contractCreateRequest) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.drained || self.pendingCreates[request] {
+		return false
+	}
+	if self.pendingCreates == nil {
+		self.pendingCreates = map[contractCreateRequest]bool{}
+	}
+	self.pendingCreates[request] = true
+	return true
+}
+
+// Releases only this generation after its response processing has completed.
+// Queue waiters retain their existing bounded retry and contract notifications.
+func (self *contractQueue) finishCreate(request contractCreateRequest) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	delete(self.pendingCreates, request)
 }
 
 func newContractQueue(log Logger, trackUsedContracts bool) *contractQueue {
@@ -1756,6 +2101,9 @@ func (self *contractQueue) expireWithLock(minEnqueueTime time.Time) []*protocol.
 func (self *contractQueue) Add(contract *protocol.Contract, storedContract *protocol.StoredContract) error {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
+	if self.drained {
+		return errContractQueueDrained
+	}
 
 	contractId, err := IdFromBytes(storedContract.ContractId)
 	if err != nil {
@@ -1803,6 +2151,9 @@ func (self *contractQueue) RemoveUsedContract(contractId Id) {
 func (self *contractQueue) Flush(removeUsedContractIds bool) []*protocol.Contract {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
+	if self.testingBeforeFlushWithLock != nil {
+		self.testingBeforeFlushWithLock()
+	}
 
 	contracts := []*protocol.Contract{}
 	for _, queuedContract := range self.contracts {
@@ -1813,6 +2164,25 @@ func (self *contractQueue) Flush(removeUsedContractIds bool) []*protocol.Contrac
 		self.usedContractIds = map[Id]bool{}
 	}
 
+	return contracts
+}
+
+// flushAndDrainWithLock retires a generation and returns every result that won
+// its race with retirement. The manager holds its own lock and this queue's
+// lock so no opener can observe the drained generation in the map.
+func (self *contractQueue) flushAndDrainWithLock(removeUsedContractIds bool) []*protocol.Contract {
+	if self.testingBeforeFlushWithLock != nil {
+		self.testingBeforeFlushWithLock()
+	}
+	contracts := []*protocol.Contract{}
+	for _, queuedContract := range self.contracts {
+		contracts = append(contracts, queuedContract.contract)
+	}
+	self.contracts = map[Id]*queuedContract{}
+	if removeUsedContractIds {
+		self.usedContractIds = map[Id]bool{}
+	}
+	self.drained = true
 	return contracts
 }
 

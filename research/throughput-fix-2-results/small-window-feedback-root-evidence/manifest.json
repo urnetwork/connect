@@ -1,0 +1,12 @@
+{
+  "archive_kind": "small_window_feedback_root_evidence",
+  "file_count": 5,
+  "file_sha256": {
+    "numerical-readings.jsonl": "687daca3980a8fbad8e0a7735bae9755239711b11ef1fc2e5f6100b5c967c7c7",
+    "outcomes.jsonl": "c9484d20f1b0eb4b191a06822e150edce56b725d3b0d68a1cd7d1dcdd9276104",
+    "provenance.json": "7585a7db110bb45a4cae6b5e8b56f99085534f832564b184726090ad2d4c4111",
+    "source-pins.json": "e8910d2cf2239294740163ec5e3be5f0698b2c11fc826956786c2530bb41b31b",
+    "status.json": "9d138cf9776ab12ac8b4a109316308577d98e06cd27d58cf5e7dfbc8ddd8a482"
+  },
+  "schema_version": 1
+}

@@ -98,7 +98,8 @@ type DnsUpgradeSettings struct {
 	// Fallback resolves over the local host egress (not the tunnel), used as the handicapped
 	// fallback above so DNS stays responsive while the tunnel-DoH is still coming up — preventing
 	// the OS from tearing down an apparently-unresponsive tunnel, at the cost of a brief DNS leak
-	// during startup. nil disables the fallback.
+	// during startup, which can reveal those lookups to the local network. nil (the default)
+	// disables the fallback: DNS then resolves only through the tunnel.
 	Fallback *DnsResolverSettings
 	// MemoryTarget, when set, is the owner's live dns byte budget, shared by
 	// the mux's tunnel and fallback resolver caches: every in-flight DoH
@@ -119,11 +120,13 @@ type UpgradeMuxSettings struct {
 
 // DefaultUpgradeMuxSettings is the app/device default: DNS (UDP/TCP 53) is intercepted and resolved
 // over DoH that egresses the tunnel, and plaintext HTTP (TCP/80) is passed through to the egress
-// unchanged. While the tunnel-DoH is still establishing on a fresh connect (its connect and TLS
-// budgets are tens of seconds), a query the tunnel can't answer within LocalFallbackTimeout is
-// raced against a handicapped DoH resolver over the LOCAL host egress (Fallback), so DNS stays
-// responsive and the OS doesn't tear the tunnel down — at the cost of a brief DNS leak during
-// startup. The tunnel result is always preferred when it arrives first.
+// unchanged. DNS resolves only through the tunnel: Fallback is nil, so no query is ever resolved
+// over the host network. The handicapped host-network fallback ("fast DNS on connect") is an
+// opt-in: an owner that sets Fallback races a query the tunnel can't answer within
+// LocalFallbackTimeout (ColdLocalFallbackTimeout while the tunnel-DoH is cold) against a DoH
+// resolver over the LOCAL host egress, which keeps DNS responsive while the tunnel establishes at
+// the cost of revealing those lookups to the local network. The timeouts are kept here so an
+// owner that enables the fallback gets the tuned handicaps.
 //
 // For pure pass-through to the egress (the server/proxy use case — no DNS interception,
 // no HTTP upgrade), do not install a mux at all: pass nil settings, which avoids a
@@ -159,8 +162,8 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			ReverseTtl:         1 * time.Hour,
 			ReverseMaxEntries:  defaultReverseMaxEntries,
 			MaxInflightQueries: defaultMaxInflightDnsQueries,
-			// handicapped local fallback: if the tunnel-DoH hasn't answered within 1s, also
-			// resolve over the local host egress. A real multi-origin Android page exposed the
+			// handicapped local fallback, when the owner enables it: if the tunnel-DoH hasn't
+			// answered within 1s, also resolve over the local host egress. A real multi-origin Android page exposed the
 			// former 5s value directly as a 5.29s DNS tail when a stale first-choice DoH server
 			// filled the bounded tunnel wave. Healthy tunnel answers measured around 0.2s, so
 			// 1s retains a clear tunnel preference while bounding the stalled-provider tail.
@@ -171,13 +174,22 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			// per lookup — an accepted widening of the startup leak window, closed again by
 			// the first tunnel-DoH success (see ColdLocalFallbackTimeout)
 			ColdLocalFallbackTimeout: 250 * time.Millisecond,
-			Fallback: &DnsResolverSettings{
-				EnableLocalDoh:   true,
-				LocalDohUrlsIpv4: resolver.RemoteDohUrlsIpv4,
-				LocalDohUrlsIpv6: resolver.RemoteDohUrlsIpv6,
-			},
+			// no host-network fallback by default: DNS resolves only through the tunnel.
+			// The owner opts in by setting Fallback (see DefaultDnsUpgradeFallbackSettings)
+			Fallback: nil,
 		},
 		Http: &HttpUpgradeSettings{Mode: HttpUpgradeUnencrypted},
+	}
+}
+
+// The opt-in host-network fallback resolver for DnsUpgradeSettings.Fallback ("fast DNS on connect"): the default DoH servers dialed over the
+// local host egress, never plaintext DNS. It is not part of DefaultUpgradeMuxSettings.
+func DefaultDnsUpgradeFallbackSettings() *DnsResolverSettings {
+	resolver := DefaultDnsResolverSettings()
+	return &DnsResolverSettings{
+		EnableLocalDoh:   true,
+		LocalDohUrlsIpv4: resolver.RemoteDohUrlsIpv4,
+		LocalDohUrlsIpv6: resolver.RemoteDohUrlsIpv6,
 	}
 }
 
@@ -254,12 +266,12 @@ const (
 )
 
 type dnsTcpFlowKey struct {
-	clientAddr [4]byte
+	clientAddr netip.Addr
 	clientPort uint16
 }
 
 type dnsTcpFlow struct {
-	serverAddr [4]byte
+	serverAddr netip.Addr
 	lastActive time.Time
 }
 
@@ -275,6 +287,16 @@ type UpgradeMux struct {
 	// deliberately not part of the swappable settings, so SetSettings
 	// cannot clear it.
 	blocker atomic.Pointer[Blocker]
+
+	// ipv6Unroutable, when set and true, answers every AAAA query with an
+	// empty NOERROR without an upstream lookup (IPV6.md B6): the windows have
+	// formed and no exit can carry v6, so a v6 address would only send the
+	// app into a blackholed connect until its own fallback fires, which many
+	// apps lack. The multi client owns the answer; the device installs it
+	// through SetIpv6Unroutable, outside the swappable settings like the
+	// blocker. A NOERROR with no records (not NXDOMAIN) keeps the A answer
+	// for the same name valid.
+	ipv6Unroutable atomic.Pointer[func() bool]
 
 	// fallbackDohCache resolves over the local host egress (not the tun); the handicapped local
 	// fallback used when the tunnel-DoH is slow to come up. nil when no Fallback is configured.
@@ -334,11 +356,16 @@ type UpgradeMux struct {
 	// be SNATed back before downstream delivery. Both accepted connections and
 	// remembered flows are hard-capped; DNS-over-TCP is a rare truncation
 	// fallback and must not create an unbounded per-client surface.
-	dnsTcpListener  net.Listener
+	// one listener per family the internal stack has a local address for;
+	// the v6 listener is optional (a stack with no v6 address fails v6
+	// DNS-over-TCP closed rather than leaking it)
+	dnsTcpListeners []net.Listener
 	dnsTcpLocalAddr netip.Addr
-	dnsTcpSem       chan struct{}
-	dnsTcpLock      sync.Mutex
-	dnsTcpFlows     map[dnsTcpFlowKey]dnsTcpFlow
+	// dnsTcpLocalAddr6 is the zero Addr when the stack has no v6 address
+	dnsTcpLocalAddr6 netip.Addr
+	dnsTcpSem        chan struct{}
+	dnsTcpLock       sync.Mutex
+	dnsTcpFlows      map[dnsTcpFlowKey]dnsTcpFlow
 
 	// reverse maps a resolved IP to the hostname(s) the mux served for it, for the
 	// multi-client's ServerName path affinity (point 4) and block-action server-name
@@ -352,6 +379,11 @@ type UpgradeMux struct {
 	// cache emits no query the mux sees). Observation only — the flow always passes
 	// through. Self-contained + independently testable (see sniSniffer).
 	sni *sniSniffer
+
+	// upstreamMultiClient resolves a successful DoH connection's exact socket
+	// tuple to the provider that carried it. Installed with the batch upstream;
+	// nil for generic/server uses where provider affinity is not meaningful.
+	upstreamMultiClient atomic.Pointer[RemoteUserNatMultiClient]
 }
 
 // dnsResolverSettings extracts the resolver config from the mux settings (nil = no DNS
@@ -524,6 +556,9 @@ func NewUpgradeMux(
 	dohSettings.DohServerResolvedCallback = func(domain string, addrs []netip.Addr) {
 		self.reverse.record(addrs, domain)
 	}
+	dohSettings.DohResultCallback = func(domain string, addrs []netip.Addr, route *DohRoute) {
+		self.bindDnsResultToExit(domain, addrs, route)
+	}
 	tunSettings.DohSettings = dohSettings
 	// ResolveTimeout is the single DNS-resolution timeout: it bounds each handleDns attempt (the
 	// query context) and the underlying DoH request through the tun alike. SetSettings re-derives
@@ -538,6 +573,7 @@ func NewUpgradeMux(
 	// one mux per connect, so the first-load timeline's activation is the connect start
 	self.firstLoad = newFirstLoadTimeline(log)
 	self.mux = NewIpMux(cancelCtx, tun, source, provideMode, sendTimeout, self.onSend, self.onPump, initialReceiver, log)
+	self.mux.setOnSendGroup(self.onSendGroup)
 	self.tunnelDohWarmFunction = func(ctx context.Context, serverCount int) bool {
 		return self.mux.Tun().DohCache().Warm(ctx, serverCount)
 	}
@@ -556,9 +592,14 @@ func NewUpgradeMux(
 	return self, nil
 }
 
+// startDnsTcpServer listens on port 53 of the internal stack's first v4
+// address (required) and first v6 address (when the stack has one), so a
+// truncated query over either family is redirected to a server of the same
+// family. Redirected flows keep their original family end to end.
 func (self *UpgradeMux) startDnsTcpServer(tun *Tun) error {
 	for _, addr := range tun.LocalAddresses() {
-		if !addr.Is4() {
+		if addr.Is4() && self.dnsTcpLocalAddr.IsValid() ||
+			addr.Is6() && self.dnsTcpLocalAddr6.IsValid() {
 			continue
 		}
 		listener, err := tun.ListenTCP(&net.TCPAddr{
@@ -566,19 +607,35 @@ func (self *UpgradeMux) startDnsTcpServer(tun *Tun) error {
 			Port: 53,
 		})
 		if err != nil {
+			for _, listener := range self.dnsTcpListeners {
+				listener.Close()
+			}
+			self.dnsTcpListeners = nil
 			return fmt.Errorf("listen on internal dns tcp address %s: %w", addr, err)
 		}
-		self.dnsTcpLocalAddr = addr
-		self.dnsTcpListener = listener
-		go HandleError(self.serveDnsTcp)
-		return nil
+		if addr.Is4() {
+			self.dnsTcpLocalAddr = addr
+		} else {
+			self.dnsTcpLocalAddr6 = addr
+		}
+		self.dnsTcpListeners = append(self.dnsTcpListeners, listener)
+		go HandleError(func() {
+			self.serveDnsTcp(listener)
+		})
 	}
-	return fmt.Errorf("internal dns tcp server has no IPv4 address")
+	if !self.dnsTcpLocalAddr.IsValid() {
+		for _, listener := range self.dnsTcpListeners {
+			listener.Close()
+		}
+		self.dnsTcpListeners = nil
+		return fmt.Errorf("internal dns tcp server has no IPv4 address")
+	}
+	return nil
 }
 
-func (self *UpgradeMux) serveDnsTcp() {
+func (self *UpgradeMux) serveDnsTcp(listener net.Listener) {
 	for {
-		conn, err := self.dnsTcpListener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			return
 		}
@@ -718,20 +775,33 @@ func (self *UpgradeMux) resolveDnsTcpQuery(query []byte) []byte {
 }
 
 func dnsTcpFlowKeyFrom(ip net.IP, port int) (dnsTcpFlowKey, bool) {
-	ip4 := ip.To4()
-	if len(ip4) != 4 || port < 0 || 0xffff < port {
+	addr, ok := netIPAddr(ip)
+	if !ok || port < 0 || 0xffff < port {
 		return dnsTcpFlowKey{}, false
 	}
 	return dnsTcpFlowKey{
-		clientAddr: [4]byte(ip4),
+		clientAddr: addr,
 		clientPort: uint16(port),
 	}, true
 }
 
+// dnsTcpLocalAddrFor is the internal server address for a client's family,
+// or the zero Addr when the stack has none for that family.
+func (self *UpgradeMux) dnsTcpLocalAddrFor(ipVersion int) netip.Addr {
+	switch ipVersion {
+	case 4:
+		return self.dnsTcpLocalAddr
+	case 6:
+		return self.dnsTcpLocalAddr6
+	default:
+		return netip.Addr{}
+	}
+}
+
 func (self *UpgradeMux) rememberDnsTcpFlow(ipPath *IpPath) bool {
 	key, ok := dnsTcpFlowKeyFrom(ipPath.SourceIp, ipPath.SourcePort)
-	serverIp := ipPath.DestinationIp.To4()
-	if !ok || len(serverIp) != 4 {
+	serverAddr, serverOk := netIPAddr(ipPath.DestinationIp)
+	if !ok || !serverOk || key.clientAddr.Is4() != serverAddr.Is4() {
 		return false
 	}
 	now := time.Now()
@@ -758,27 +828,27 @@ func (self *UpgradeMux) rememberDnsTcpFlow(ipPath *IpPath) bool {
 		}
 	}
 	self.dnsTcpFlows[key] = dnsTcpFlow{
-		serverAddr: [4]byte(serverIp),
+		serverAddr: serverAddr,
 		lastActive: now,
 	}
 	return true
 }
 
-func (self *UpgradeMux) dnsTcpServerForClient(ipPath *IpPath) ([4]byte, bool) {
+func (self *UpgradeMux) dnsTcpServerForClient(ipPath *IpPath) (netip.Addr, bool) {
 	key, ok := dnsTcpFlowKeyFrom(ipPath.DestinationIp, ipPath.DestinationPort)
 	if !ok {
-		return [4]byte{}, false
+		return netip.Addr{}, false
 	}
 	now := time.Now()
 	self.dnsTcpLock.Lock()
 	defer self.dnsTcpLock.Unlock()
 	flow, ok := self.dnsTcpFlows[key]
 	if !ok {
-		return [4]byte{}, false
+		return netip.Addr{}, false
 	}
 	if dnsTcpFlowTtl < now.Sub(flow.lastActive) {
 		delete(self.dnsTcpFlows, key)
-		return [4]byte{}, false
+		return netip.Addr{}, false
 	}
 	flow.lastActive = now
 	self.dnsTcpFlows[key] = flow
@@ -788,47 +858,81 @@ func (self *UpgradeMux) dnsTcpServerForClient(ipPath *IpPath) ([4]byte, bool) {
 	return flow.serverAddr, true
 }
 
-// rewriteDnsTcpIpv4Address changes one IPv4 address in a non-fragmented TCP
-// packet and recomputes both checksums. Callers own and may mutate packet.
-func rewriteDnsTcpIpv4Address(packet []byte, address [4]byte, source bool) bool {
-	if len(packet) < Ipv4HeaderSizeWithoutExtensions || packet[0]>>4 != 4 {
+// rewriteDnsTcpAddress changes one address of a non-fragmented TCP packet
+// to `address`, which must be of the packet's own family, and recomputes the
+// checksums (the v4 header checksum and the transport checksum with the
+// family's pseudo header). A v6 packet may carry extension headers; a v6
+// fragment cannot be rewritten. Callers own and may mutate packet.
+func rewriteDnsTcpAddress(packet []byte, address netip.Addr, source bool) bool {
+	if len(packet) == 0 {
 		return false
 	}
-	headerByteCount := int(packet[0]&0x0f) * 4
-	totalByteCount := int(binary.BigEndian.Uint16(packet[2:4]))
-	if headerByteCount < Ipv4HeaderSizeWithoutExtensions ||
-		totalByteCount < headerByteCount+TcpHeaderSizeWithoutExtensions ||
-		len(packet) < totalByteCount ||
-		packet[9] != byte(ipProtocolNumberTcp) ||
-		binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0 {
+	switch packet[0] >> 4 {
+	case 4:
+		if !address.Is4() || len(packet) < Ipv4HeaderSizeWithoutExtensions {
+			return false
+		}
+		headerByteCount := int(packet[0]&0x0f) * 4
+		totalByteCount := int(binary.BigEndian.Uint16(packet[2:4]))
+		if headerByteCount < Ipv4HeaderSizeWithoutExtensions ||
+			totalByteCount < headerByteCount+TcpHeaderSizeWithoutExtensions ||
+			len(packet) < totalByteCount ||
+			packet[9] != byte(ipProtocolNumberTcp) ||
+			binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0 {
+			return false
+		}
+		address4 := address.As4()
+		if source {
+			copy(packet[12:16], address4[:])
+		} else {
+			copy(packet[16:20], address4[:])
+		}
+		packet[10], packet[11] = 0, 0
+		binary.BigEndian.PutUint16(
+			packet[10:12],
+			checksumFinish(checksumAdd(0, packet[:headerByteCount])),
+		)
+		transport := packet[headerByteCount:totalByteCount]
+		transport[16], transport[17] = 0, 0
+		binary.BigEndian.PutUint16(
+			transport[16:18],
+			transportChecksum(ipProtocolNumberTcp, packet[12:16], packet[16:20], transport),
+		)
+		return true
+	case 6:
+		if !address.Is6() || address.Is4In6() {
+			return false
+		}
+		nextHeader, transportOffset, payloadEnd, ok := ipv6TransportOffset(packet)
+		if !ok || nextHeader != ipProtocolNumberTcp ||
+			payloadEnd < transportOffset+TcpHeaderSizeWithoutExtensions {
+			return false
+		}
+		address16 := address.As16()
+		if source {
+			copy(packet[8:24], address16[:])
+		} else {
+			copy(packet[24:40], address16[:])
+		}
+		transport := packet[transportOffset:payloadEnd]
+		transport[16], transport[17] = 0, 0
+		binary.BigEndian.PutUint16(
+			transport[16:18],
+			transportChecksum(ipProtocolNumberTcp, packet[8:24], packet[24:40], transport),
+		)
+		return true
+	default:
 		return false
 	}
-	if source {
-		copy(packet[12:16], address[:])
-	} else {
-		copy(packet[16:20], address[:])
-	}
-
-	packet[10], packet[11] = 0, 0
-	binary.BigEndian.PutUint16(
-		packet[10:12],
-		checksumFinish(checksumAdd(0, packet[:headerByteCount])),
-	)
-	transport := packet[headerByteCount:totalByteCount]
-	transport[16], transport[17] = 0, 0
-	binary.BigEndian.PutUint16(
-		transport[16:18],
-		transportChecksum(ipProtocolNumberTcp, packet[12:16], packet[16:20], transport),
-	)
-	return true
 }
 
 func (self *UpgradeMux) handleDnsTcpPacket(ipPath *IpPath, packet []byte) bool {
-	if ipPath.Version != 4 || !self.dnsTcpLocalAddr.Is4() || !self.rememberDnsTcpFlow(ipPath) {
+	localAddr := self.dnsTcpLocalAddrFor(ipPath.Version)
+	if !localAddr.IsValid() || !self.rememberDnsTcpFlow(ipPath) {
 		return true // claimed and fail-closed; never leak to the advertised identity
 	}
 	redirected := append([]byte(nil), packet...)
-	if !rewriteDnsTcpIpv4Address(redirected, self.dnsTcpLocalAddr.As4(), false) {
+	if !rewriteDnsTcpAddress(redirected, localAddr, false) {
 		return true
 	}
 	if _, err := self.mux.Tun().Write(redirected); err != nil {
@@ -845,13 +949,13 @@ func (self *UpgradeMux) handleDnsTcpPacket(ipPath *IpPath, packet []byte) bool {
 func (self *UpgradeMux) onPump(packet []byte) bool {
 	var ipPath IpPath
 	if _, err := parseIpPathWithPayloadBorrowed(packet, &ipPath); err != nil ||
-		ipPath.Version != 4 ||
 		ipPath.Protocol != IpProtocolTcp ||
 		ipPath.SourcePort != 53 {
 		return false
 	}
+	localAddr := self.dnsTcpLocalAddrFor(ipPath.Version)
 	source, ok := netIPAddr(ipPath.SourceIp)
-	if !ok || source != self.dnsTcpLocalAddr {
+	if !ok || !localAddr.IsValid() || source != localAddr {
 		return false
 	}
 	serverAddr, ok := self.dnsTcpServerForClient(&ipPath)
@@ -859,7 +963,7 @@ func (self *UpgradeMux) onPump(packet []byte) bool {
 		return false
 	}
 	defer MessagePoolReturn(packet)
-	if !rewriteDnsTcpIpv4Address(packet, serverAddr, true) {
+	if !rewriteDnsTcpAddress(packet, serverAddr, true) {
 		return true
 	}
 	self.mux.deliverDownstream(self.source, self.provideMode, &ipPath, packet)
@@ -914,6 +1018,64 @@ func (self *UpgradeMux) onSend(source TransferPath, provideMode protocol.Provide
 	return false
 }
 
+// Classifies one exact directional flow once while preserving content state
+// that inherently advances for each ordered packet. A claimed group is
+// consumed in full; malformed content inside an intercepted flow fails closed
+// instead of decomposing the group into independently routed packets.
+func (self *UpgradeMux) onSendGroup(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	group *ipPacketGroup,
+	timeout time.Duration,
+) bool {
+	if group == nil || group.ipPath == nil || len(group.packets) == 0 {
+		return true
+	}
+	for _, packet := range group.packets {
+		self.firstLoad.observeSend(packet)
+	}
+
+	ipPath := group.ipPath
+	switch {
+	case ipPath.Protocol == IpProtocolTcp && ipPath.DestinationPort == 443:
+		for _, packet := range group.packets {
+			var segment tlsSegment
+			if peekClaim(packet, &segment) == peekTls {
+				self.sni.observeSegment(segment)
+			}
+		}
+		return false
+	case ipPath.Protocol == IpProtocolTcp && ipPath.DestinationPort == 80:
+		return self.httpBlocked()
+	case ipPath.Protocol == IpProtocolUdp && ipPath.DestinationPort == 53:
+		settings := self.settings.Load()
+		if settings == nil || settings.Dns == nil || settings.Dns.Resolver == nil {
+			return false
+		}
+		for _, packet := range group.packets {
+			packetPath, payload, err := ParseIpPathWithPayload(packet)
+			if err == nil {
+				self.handleDns(source, provideMode, packetPath, payload)
+			}
+		}
+		return true
+	case ipPath.Protocol == IpProtocolTcp && ipPath.DestinationPort == 53:
+		settings := self.settings.Load()
+		if settings == nil || settings.Dns == nil || settings.Dns.Resolver == nil {
+			return false
+		}
+		for _, packet := range group.packets {
+			packetPath, err := ParseIpPath(packet)
+			if err == nil {
+				self.handleDnsTcpPacket(packetPath, packet)
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 // httpBlocked reports whether claimed plaintext HTTP (TCP/80) should be dropped (block mode);
 // otherwise it passes through to the egress unchanged.
 func (self *UpgradeMux) httpBlocked() bool {
@@ -938,6 +1100,24 @@ func (self *UpgradeMux) getBlocker() Blocker {
 		return *b
 	}
 	return nil
+}
+
+// SetIpv6Unroutable installs (or, with nil, removes) the predicate that
+// reports whether the tunnel currently has no exit able to carry IPv6. While
+// it reports true, AAAA queries are answered empty; see the field comment.
+func (self *UpgradeMux) SetIpv6Unroutable(ipv6Unroutable func() bool) {
+	if ipv6Unroutable == nil {
+		self.ipv6Unroutable.Store(nil)
+	} else {
+		self.ipv6Unroutable.Store(&ipv6Unroutable)
+	}
+}
+
+func (self *UpgradeMux) isIpv6Unroutable() bool {
+	if f := self.ipv6Unroutable.Load(); f != nil {
+		return (*f)()
+	}
+	return false
 }
 
 // tunnelDohCold reports whether the tunnel-DoH path is cold: it has never
@@ -1034,8 +1214,16 @@ func dnsColdProbeDelay(failureCount int, initialDelay time.Duration, maxDelay ti
 }
 
 func (self *UpgradeMux) coldDohProbeNeeded() bool {
-	return self.dnsProbeRequested.Load() ||
-		(self.fallbackDohCache.Load() != nil && self.tunnelDohCold())
+	return self.dnsUpgradeEnabled() && (self.dnsProbeRequested.Load() ||
+		(self.fallbackDohCache.Load() != nil && self.tunnelDohCold()))
+}
+
+// dnsUpgradeEnabled reports whether this mux owns DNS interception. An
+// UpgradeMux may exist only for HTTP/SNI policy with Dns nil; in that mode its
+// internal Tun still has a DohCache for implementation uniformity, but it must
+// not open speculative DoH connections or retain their retry workers.
+func (self *UpgradeMux) dnsUpgradeEnabled() bool {
+	return dnsResolverSettings(self.settings.Load()) != nil
 }
 
 // ensureColdProber starts at most one background warm-probe worker. A cold mux
@@ -1117,6 +1305,10 @@ func (self *UpgradeMux) runColdDohProber() {
 }
 
 func (self *UpgradeMux) wakeColdProber() {
+	if !self.dnsUpgradeEnabled() {
+		self.dnsProbeRequested.Store(false)
+		return
+	}
 	self.dnsProbeRequested.Store(true)
 	if self.ensureColdProber() {
 		return
@@ -1128,7 +1320,8 @@ func (self *UpgradeMux) wakeColdProber() {
 }
 
 func (self *UpgradeMux) warmFallbackDns() {
-	if self.ctx.Err() != nil || self.fallbackDohCache.Load() == nil {
+	if !self.dnsUpgradeEnabled() || self.ctx.Err() != nil || self.fallbackDohCache.Load() == nil {
+		self.fallbackDohWarmPending.Store(false)
 		return
 	}
 	self.fallbackDohWarmPending.Store(true)
@@ -1264,40 +1457,45 @@ func peekClaim(packet []byte, seg *tlsSegment) peekResult {
 			return peekOther // not tcp/udp: never claimed
 		}
 	case 6:
-		if len(packet) < 44 {
+		if len(packet) < 40 {
 			return peekUndecided
 		}
-		switch packet[6] { // next header
-		case 6: // tcp
-			switch int(packet[42])<<8 | int(packet[43]) {
+		// walk any extension chain to the transport (ip_ipv6_ext.go). a v6
+		// fragment has no transport header to classify and is left to the
+		// full parse, which rejects it until reassembly
+		nextHeader, transportOffset, end, ok := ipv6TransportOffset(packet)
+		if !ok {
+			return peekUndecided
+		}
+		if len(packet) < transportOffset+4 {
+			return peekUndecided
+		}
+		switch nextHeader {
+		case ipProtocolNumberTcp:
+			switch int(packet[transportOffset+2])<<8 | int(packet[transportOffset+3]) {
 			case 53:
 				return peekDns
 			case 80:
 				return peekHttp
 			case 443:
-				payloadLen := int(packet[4])<<8 | int(packet[5])
-				end := 40 + payloadLen
-				if len(packet) < end {
-					end = len(packet)
-				}
 				src, _ := netip.AddrFromSlice(packet[8:24])
 				dst, _ := netip.AddrFromSlice(packet[24:40])
-				if s, ok := tcpSegment443(packet, 40, end, src, dst); ok {
+				if s, ok := tcpSegment443(packet, transportOffset, end, src, dst); ok {
 					*seg = s
 					return peekTls
 				}
 				return peekOther
 			}
 			return peekOther
-		case 17: // udp
-			if 53 == int(packet[42])<<8|int(packet[43]) {
+		case ipProtocolNumberUdp:
+			if 53 == int(packet[transportOffset+2])<<8|int(packet[transportOffset+3]) {
 				return peekDns
 			}
 			return peekOther
-		case 58: // icmpv6: passthrough, never claimed
+		case ipProtocolNumberIcmp6: // passthrough, never claimed
 			return peekOther
 		default:
-			return peekUndecided // extension header / other: needs the full parse
+			return peekOther // not tcp/udp: never claimed
 		}
 	default:
 		return peekUndecided
@@ -1401,6 +1599,24 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 			addrs = []netip.Addr{netip.IPv6Unspecified()}
 		}
 		respPayload, err := buildDnsResponse(header.ID, question, addrs, responseTtl)
+		if err != nil {
+			return false
+		}
+		reverse := ipPath.Reverse()
+		self.mux.deliverDownstream(source, provideMode, reverse, ipOosPacket(reverse, respPayload))
+		return true
+	}
+
+	// while no exit can carry v6, an AAAA answers empty NOERROR locally so
+	// the app connects over v4 at once instead of timing out on a v6 address
+	// the tunnel cannot route (IPV6.md B6). Never cached and never recorded
+	// in the reverse index: the answer describes the tunnel, not the name.
+	if question.Type == dnsmessage.TypeAAAA && self.isIpv6Unroutable() {
+		var responseTtl uint32
+		if dns := self.settings.Load().Dns; dns != nil {
+			responseTtl = dns.ResponseTtl
+		}
+		respPayload, err := buildDnsResponse(header.ID, question, nil, responseTtl)
 		if err != nil {
 			return false
 		}
@@ -2386,6 +2602,18 @@ func (self *UpgradeMux) SendPacket(source TransferPath, provideMode protocol.Pro
 	return self.mux.SendPacket(source, provideMode, packet, timeout)
 }
 
+// Consumes a native packet burst after grouping it by exact directional flow.
+// Each group is classified once at the routing boundary while content-aware
+// observers still inspect its packets in order.
+func (self *UpgradeMux) SendPacketBatch(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+) int {
+	return self.mux.SendPacketBatch(source, provideMode, packets, timeout)
+}
+
 // Receive is installed as the wrapped upstream's receive callback. The
 // callback IpPath is the canonical outbound path, not the return packet's
 // direction. Read the actual packet source (the server IP) to refresh that
@@ -2402,9 +2630,71 @@ func (self *UpgradeMux) Receive(source TransferPath, provideMode protocol.Provid
 	self.mux.Receive(source, provideMode, ipPath, packet)
 }
 
+// Batch receive preserves first-load and reverse-affinity observation for
+// every packet, then retains the batch through the generic mux boundary.
+func (self *UpgradeMux) ReceivePackets(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packets [][]byte,
+) {
+	for _, packet := range packets {
+		self.firstLoad.observeReceive(packet)
+		if packetSource, _, ok := ipPacketSourceDestinationAddrs(packet); ok {
+			self.reverse.touch(packetSource)
+		}
+	}
+	self.mux.ReceivePackets(source, provideMode, ipPath, packets)
+}
+
+// A batch receiver is used by device adapters while the singular receiver
+// remains available for synthesized and mixed traffic.
+func (self *UpgradeMux) AddPacketsReceiver(receiver ReceivePacketsFunction) func() {
+	return self.mux.AddPacketsReceiver(receiver)
+}
+
 // SetUpstream wires the wrapped upstream send (the remote UserNat).
 func (self *UpgradeMux) SetUpstream(upstream IpMuxSend) {
+	self.upstreamMultiClient.Store(nil)
 	self.mux.SetUpstream(upstream)
+}
+
+func (self *UpgradeMux) bindDnsResultToExit(domain string, addrs []netip.Addr, route *DohRoute) {
+	upstream := self.upstreamMultiClient.Load()
+	if upstream == nil || route == nil || !route.Local.IsValid() || !route.Remote.IsValid() {
+		return
+	}
+	localAddr := route.Local.Addr().Unmap()
+	remoteAddr := route.Remote.Addr().Unmap()
+	if localAddr.Is4() != remoteAddr.Is4() {
+		return
+	}
+	version := 6
+	if localAddr.Is4() {
+		version = 4
+	}
+	upstream.bindDnsResultToExit(&IpPath{
+		Version:         version,
+		Protocol:        IpProtocolTcp,
+		SourceIp:        net.IP(localAddr.AsSlice()),
+		SourcePort:      int(route.Local.Port()),
+		DestinationIp:   net.IP(remoteAddr.AsSlice()),
+		DestinationPort: int(route.Remote.Port()),
+	}, domain, addrs)
+}
+
+// Wires an exact-flow group path when the upstream supports it.
+func (self *UpgradeMux) SetUpstreamBatchClient(upstream *RemoteUserNatMultiClient) {
+	self.upstreamMultiClient.Store(upstream)
+	self.mux.SetUpstream(upstream.SendPacket)
+	self.mux.setUpstreamGroupSend(func(
+		source TransferPath,
+		provideMode protocol.ProvideMode,
+		group *ipPacketGroup,
+		timeout time.Duration,
+	) bool {
+		return upstream.sendPacketGroup(source, provideMode, group, timeout)
+	})
 }
 
 // SetSettings updates the mux's DNS and HTTP policy at runtime. The tun's DohCache is
@@ -2459,8 +2749,8 @@ func (self *UpgradeMux) Close() {
 	if self.firstLoad != nil {
 		self.firstLoad.Close()
 	}
-	if self.dnsTcpListener != nil {
-		self.dnsTcpListener.Close()
+	for _, listener := range self.dnsTcpListeners {
+		listener.Close()
 	}
 	self.unregisterShed()
 	if fallback := self.fallbackDohCache.Load(); fallback != nil {

@@ -1,0 +1,67 @@
+[
+  {
+    "classification": "excluded-race-contaminated-fixture",
+    "name": "shared-raw-v2-roots-first-shape.log",
+    "outcomes": {
+      "FAIL": 1,
+      "PASS": 11,
+      "SKIP": 0
+    },
+    "race_warning_blocks": 1,
+    "raw_log_sha256": "879522be768d6f997764fa8c183066a14ba32aebf3c836bde28591f12f430943",
+    "reason": "intermediate fixture read race; not an accepted check",
+    "service_readings": 0
+  },
+  {
+    "classification": "excluded-instrumented-oracle-long",
+    "name": "oracle-diagnostic-long.log",
+    "outcomes": {
+      "FAIL": 1,
+      "PASS": 0,
+      "SKIP": 0
+    },
+    "race_warning_blocks": 0,
+    "raw_log_sha256": "7c13aa3d76b913383264542b70b68e678408e52d08bf4ef35ffd9f6a52c541ee",
+    "reason": "instrumented oracle; perturbation prevents quantitative attribution to earlier run",
+    "service_readings": 2
+  },
+  {
+    "classification": "excluded-o-n-arrival-credit-long",
+    "name": "arrival-credit-long.log",
+    "outcomes": {
+      "FAIL": 1,
+      "PASS": 0,
+      "SKIP": 0
+    },
+    "race_warning_blocks": 0,
+    "raw_log_sha256": "a88f0d23e35a90c980132b6203f63c20aae02e6a171d2d2243198294fc537e59",
+    "reason": "old O(n) diagnostic credit control; superseded by bounded integrated credit",
+    "service_readings": 2
+  },
+  {
+    "classification": "excluded-known-service-oracle-anchor-only",
+    "name": "anchor-only-oracle-long.log",
+    "outcomes": {
+      "FAIL": 1,
+      "PASS": 0,
+      "SKIP": 0
+    },
+    "race_warning_blocks": 0,
+    "raw_log_sha256": "7b30f5a0ee41b1b6423eab49c4372f548d7c44ad56c92e46e5a5816651fc6054",
+    "reason": "known-service oracle with first-clock fix only",
+    "service_readings": 2
+  },
+  {
+    "classification": "excluded-known-service-oracle-rejected-rto",
+    "name": "shared-raw-v1-oracle-long.log",
+    "outcomes": {
+      "FAIL": 0,
+      "PASS": 1,
+      "SKIP": 0
+    },
+    "race_warning_blocks": 0,
+    "raw_log_sha256": "0127b6106981b26cec55910bbef5fc4c7c655ec86e7b0e26b5ffd9a5ad2edd47",
+    "reason": "known-service oracle on rejected broad-RTO policy",
+    "service_readings": 2
+  }
+]

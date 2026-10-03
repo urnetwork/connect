@@ -1,0 +1,30 @@
+[
+  {
+    "before_counter_median_ns_per_op": 110.8,
+    "before_counter_range_ns_per_op": [
+      101.5,
+      151.7
+    ],
+    "median_fraction_change": -0.25297833935018055,
+    "name": "BenchmarkWindowPacingTailLifecycleOriginal",
+    "optimized_counter_median_ns_per_op": 82.77,
+    "optimized_counter_range_ns_per_op": [
+      82.52,
+      83.13
+    ]
+  },
+  {
+    "before_counter_median_ns_per_op": 299.8,
+    "before_counter_range_ns_per_op": [
+      287.2,
+      325.0
+    ],
+    "median_fraction_change": -0.19579719813208807,
+    "name": "BenchmarkWindowPacingTailLifecycleRetryFresh",
+    "optimized_counter_median_ns_per_op": 241.1,
+    "optimized_counter_range_ns_per_op": [
+      240.1,
+      241.9
+    ]
+  }
+]

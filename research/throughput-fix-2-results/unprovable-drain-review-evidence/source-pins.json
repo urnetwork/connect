@@ -1,0 +1,127 @@
+{
+  "guarded_files_landed_exactly": [
+    {
+      "candidate_sha256": "f9c01edab76d690e50ee29c71654dcc1c649a1baa62ae27057551e06a88400dd",
+      "current_shared_source_matches_candidate": true,
+      "preintegration_guard_sha256": "a320261b31a7d4f216a491be38766d6c89db19d01b1ce05d7f81531cbc27db76",
+      "target": "transfer_window_pacing.go",
+      "was_new_file": false
+    },
+    {
+      "candidate_sha256": "104e8fdd031d58e5f06a7be6c9ca726ee109bc347f9c1daf5b31418fca31f999",
+      "current_shared_source_matches_candidate": true,
+      "preintegration_guard_sha256": null,
+      "target": "transfer_window_pacing_unprovable_drain_test.go",
+      "was_new_file": true
+    },
+    {
+      "candidate_sha256": "0ed6eaa7ed42836dac95ff5123e26fc14e36c7eb068378b0b8f46fe1c6a5990b",
+      "current_shared_source_matches_candidate": true,
+      "preintegration_guard_sha256": "0386c3e89b4a33ab2b38aa39dedf6933be8543f2d6b983f589e6c97a731ebbff",
+      "target": "transfer_window_pacing_probe_test.go",
+      "was_new_file": false
+    },
+    {
+      "candidate_sha256": "f9e23e1040f518d4b57b73fffa19d7a441a313575289e69ac49bb6bbd282857c",
+      "current_shared_source_matches_candidate": true,
+      "preintegration_guard_sha256": "19c912bcd1822fe6d8394ddb388b998062cc29d9d9c389d2c019857f9e338ad2",
+      "target": "flight_gate_lane_probe_test.go",
+      "was_new_file": false
+    }
+  ],
+  "handoff_sha256": "5341e2f2a612ad0f2a6ed170baa9af32e89621e06dd522bb52b5d00070e5e0b3",
+  "root_integration_sha256": "161182e51efb46cf2fbf8cc204b105aaff585d706ee524571ff568b6f1274930",
+  "runs": [
+    {
+      "base_input_sha256": null,
+      "binary_sha256": "4d26b1712f922f1a05098bba50b741e3a46f6770b04ad751cf1779f61b1abfff",
+      "effective_source_sha256": null,
+      "input_sha256": "612edd0cf2fa358cefc10b88453d2a2dda00f3c27a8c1fbfcea28b80d97f68ec",
+      "manifest_sha256": "a6df885f2d179b9c693cdfc8daa28fa2e8799bc36749f77cbbf87f4c17cb6c56",
+      "overlay_sha256": null,
+      "race_warnings": 0,
+      "raw_log_sha256": "54913094e90cb42398ad4623f58b624c1be257427cbfefc819620136bb5ce795",
+      "scope": "before",
+      "source_manifest_sha256": null,
+      "sources_stable_during_build_and_test": null
+    },
+    {
+      "base_input_sha256": null,
+      "binary_sha256": "86280706bd99b29ca4f713b695a2913bd6c529de5cab0739a9c87526f863d7a6",
+      "effective_source_sha256": null,
+      "input_sha256": "19656fab624ad9a83e7629769f1598a0f4f6d07286b38a6749f76a37bd5e6181",
+      "manifest_sha256": "dc22425a019ffd49ebab37569e9a1e1528121c2616e8d540032fa8398cb59a93",
+      "overlay_sha256": null,
+      "race_warnings": 0,
+      "raw_log_sha256": "617563d75a263e2484fe60ca2974ff84c177eb8ed5e755d120b7435ad46b3509",
+      "scope": "after",
+      "source_manifest_sha256": null,
+      "sources_stable_during_build_and_test": null
+    },
+    {
+      "base_input_sha256": null,
+      "binary_sha256": "4137d51fbef7e5ee6a0ef6264fd89aa6d257ee44be1807691dbeb84f97afce60",
+      "effective_source_sha256": null,
+      "input_sha256": "73492be960645160559eac7619526d9a92d2f4916f2f32b7741d216ea90b5566",
+      "manifest_sha256": "ddb3f71200c24d7787680a5e9eccf4d4d7e68051ff5d317b209b2bd897bd0729",
+      "overlay_sha256": null,
+      "race_warnings": 0,
+      "raw_log_sha256": "7f19947e69c91ae33d5329e31c65ab385861a85daa4a767b97e56fb541e01881",
+      "scope": "final-shaped-before",
+      "source_manifest_sha256": null,
+      "sources_stable_during_build_and_test": null
+    },
+    {
+      "base_input_sha256": null,
+      "binary_sha256": "945faee9c008f099d070c18b71e37672937806a8f62af800286f5fefed25e8c7",
+      "effective_source_sha256": null,
+      "input_sha256": "c3232ec131541f7a743038979aa0638aff06e09ad1a82ca397023d608e9238e7",
+      "manifest_sha256": "54a5267ac231fc3b91fac43ca01cdee4ef47040e88f0c00faf446dea68677535",
+      "overlay_sha256": null,
+      "race_warnings": 0,
+      "raw_log_sha256": "4bb6e28ea89e5e9e3b115db4ec38b188e4ccf44762eee8c30f32139156679ac2",
+      "scope": "final-before",
+      "source_manifest_sha256": null,
+      "sources_stable_during_build_and_test": null
+    },
+    {
+      "base_input_sha256": null,
+      "binary_sha256": "566a1da25a160cc006fa385172f8bb567bc465d843f568893dfd0f12655de34f",
+      "effective_source_sha256": null,
+      "input_sha256": "60cfcb61be73e83b609c2798fa71c0ce0648d09e97c6dd95d2f6bc7f2e009ad5",
+      "manifest_sha256": "a16ea687e4744b9756ceb33a6de7f93fb6073079227bdf0e6496626389fc49ea",
+      "overlay_sha256": null,
+      "race_warnings": 0,
+      "raw_log_sha256": "27d90ca24f4f84ba0fe6a6ba8dac15865b14b3ebc5b5db1cc5f5e70517aa5c9d",
+      "scope": "counter-after",
+      "source_manifest_sha256": null,
+      "sources_stable_during_build_and_test": null
+    },
+    {
+      "base_input_sha256": null,
+      "binary_sha256": "86280706bd99b29ca4f713b695a2913bd6c529de5cab0739a9c87526f863d7a6",
+      "effective_source_sha256": null,
+      "input_sha256": "19656fab624ad9a83e7629769f1598a0f4f6d07286b38a6749f76a37bd5e6181",
+      "manifest_sha256": "8e95618d566f030337f7c263267e64ddb6b47c16d11c1c72d15d1162d34efb5d",
+      "overlay_sha256": null,
+      "race_warnings": 0,
+      "raw_log_sha256": "31417dd49e51129ca8d9d2ab150a44e010b2a5db7bb684d7e7fbade8c989dfb4",
+      "scope": "initial-scan-adjacent-old-carrier-expectation",
+      "source_manifest_sha256": "dc22425a019ffd49ebab37569e9a1e1528121c2616e8d540032fa8398cb59a93",
+      "sources_stable_during_build_and_test": null
+    },
+    {
+      "base_input_sha256": null,
+      "binary_sha256": "11e29a7e512b465f9c66f1daa3d4aa2674316130475f2354b18ed248c83e96fa",
+      "effective_source_sha256": null,
+      "input_sha256": "f02e834aca7a7d6d89681441f1b0d0e8288acc4fe70419866ac10963f956a9df",
+      "manifest_sha256": "e8074facbb1b471818262b48c8bfe0bf2f1b6fe15b9a55cf9117fdb79e153202",
+      "overlay_sha256": "9ffa0c05c89563e357f7217d85bf2cd8c6c294e89f7501cadb93cba42a5d482b",
+      "race_warnings": 0,
+      "raw_log_sha256": "3e81bd1d452f53aa90168cff3c80d30aaad3472a42c4bdf5e095e33ac4638546",
+      "scope": "diagnostic-only-exact-ambiguous-tail",
+      "source_manifest_sha256": null,
+      "sources_stable_during_build_and_test": null
+    }
+  ]
+}

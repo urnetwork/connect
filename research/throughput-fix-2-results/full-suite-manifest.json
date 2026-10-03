@@ -1,0 +1,20 @@
+{
+  "created_utc": "2026-09-15T15:29:30.642730+00:00",
+  "mode": "full-suite",
+  "connect": {
+    "revision": "8f30ab6a50664ad35ef685ccc2cfda65a540ddff",
+    "branch": "throughput-fix-2",
+    "source_sha256": "9a56efe2da1a53d413dd01c202fb222115b8556207127c06c080fdc4676eb5a3",
+    "dirty": true
+  },
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "binary_sha256": "c95cc13fdf2262a95bfbf26a6423cca9432a4bbf3c5b04ca45d549de9886ad3d",
+  "environment": {},
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "command": "go test ./... -v -count=1 -timeout=30m",
+  "note": "Root package binary hash taken from the running full-suite process. Source digest is from the immediately preceding focused build; production sources were unchanged. The head-drain allocation test and two ACK benchmarks were added afterward and validated separately. An optional TCP buffer-capacity control was also added afterward; its zero/default path and explicit larger-buffer path are covered by the final TCP runs."
+}

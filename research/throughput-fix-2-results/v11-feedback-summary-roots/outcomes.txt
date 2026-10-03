@@ -1,0 +1,11 @@
+=== RUN   TestWindowPacingCompletedCycleRetainsEligibleLateBytes
+--- PASS: TestWindowPacingCompletedCycleRetainsEligibleLateBytes (0.00s)
+=== RUN   TestWindowPacingRetiredFreshCycleRetainsEligibleLateBytes
+--- PASS: TestWindowPacingRetiredFreshCycleRetainsEligibleLateBytes (0.00s)
+=== RUN   TestWindowPacingSupersededCycleCannotReturnThroughLateBytes
+--- PASS: TestWindowPacingSupersededCycleCannotReturnThroughLateBytes (0.00s)
+=== RUN   TestWindowPacingCompletedCycleExtendsThroughCompressedSuffix
+--- PASS: TestWindowPacingCompletedCycleExtendsThroughCompressedSuffix (0.00s)
+=== RUN   TestWindowPacingRetainedSummaryPinsLaterCompression
+--- PASS: TestWindowPacingRetainedSummaryPinsLaterCompression (0.00s)
+PASS

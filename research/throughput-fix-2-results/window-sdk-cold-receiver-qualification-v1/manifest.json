@@ -1,0 +1,15 @@
+{
+  "archive": "window-sdk-cold-receiver-qualification-v1",
+  "payload_sha256": {
+    "candidate.patch": "f2f2a549c835ea34c5825306683ef52b36c60e2f55db000392388321490cf372",
+    "ledger.jsonl": "ae6c314bdd1007667c8ce1ccdb7558bb6d213730a5d3cdf62245b3b605db76a8",
+    "outcomes.jsonl": "9496d75da1ac6cca5ac6fa8d0fae43edf11d5b6fab2d51503ee6fec9c3bdcf3f",
+    "provenance.json": "31ddbb175d87427889d79037cf866e533497e56001380eb58bbc293201681492",
+    "source-manifest-after-adjacent.json": "2a766f08993cc99864fe73874e4e192377d30c25dd34ea59153c393b5860c147",
+    "source-manifest-after-roots.json": "93db95b4d71cd1b071d90f87e6627b6b3bca3b9a182048c96d7262e6baba38b6",
+    "source-manifest-after-sdk-normal.json": "78c2220227618ec72ee70d0f6e2bcaf4483907dbbb7713ced884543e20a1e253",
+    "source-manifest-before-roots.json": "d0fb2de475a1fc942a9080ae24f7aedd29c038d4f7da2c7b1eb152f9b1a1b84b",
+    "source-pins.json": "695891d189675c36adf94bad6f248918b9bebbe8fe0ad3a6d21e611e49da76b2",
+    "status.json": "67ac658fcecc2690ae0f8d88de7f4e0c57e7a63570b02f49f55a54c64b62c1f3"
+  }
+}

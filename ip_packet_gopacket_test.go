@@ -3,11 +3,12 @@ package connect
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"net"
 	"testing"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 )
 
 // differential tests for the hand-rolled packet builders against gopacket
@@ -67,7 +68,7 @@ func TestSynAckMatchesGopacketReference(t *testing.T) {
 			Ack:     state.sendSeq,
 			ACK:     true,
 			SYN:     true,
-			Window:  state.encodedWindowSize(),
+			Window:  uint16(min(state.windowSize, uint32(math.MaxUint16))),
 			Options: opts,
 		}
 		tcp.SetNetworkLayerForChecksum(ip)

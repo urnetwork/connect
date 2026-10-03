@@ -1,0 +1,146 @@
+{
+  "comparisons": [
+    {
+      "candidate_direction_mbps": [
+        957.48096,
+        542.57664
+      ],
+      "candidate_drop_counters": {
+        "Receiver": {
+          "AckHandoffDropCount": 0,
+          "PackHandoffDropByteCount": 0,
+          "PackHandoffDropCount": 0,
+          "ReceiveQueueDropByteCount": 0,
+          "ReceiveQueueDropCount": 0,
+          "ReceiveQueueEvictionByteCount": 0,
+          "ReceiveQueueEvictionCount": 0,
+          "ReceiveQueueEvictionNoticeOverflow": 0,
+          "ReceiveQueueTentativeEvictionByteCount": 0,
+          "ReceiveQueueTentativeEvictionCount": 0,
+          "SendEvictionResendCount": 0,
+          "SendNoAckRefusedCount": 0,
+          "SendPackDeadlineDropCount": 0
+        },
+        "SenderReceive": {
+          "AckHandoffDropCount": 0,
+          "PackHandoffDropByteCount": 0,
+          "PackHandoffDropCount": 0,
+          "ReceiveQueueDropByteCount": 0,
+          "ReceiveQueueDropCount": 0,
+          "ReceiveQueueEvictionByteCount": 0,
+          "ReceiveQueueEvictionCount": 0,
+          "ReceiveQueueEvictionNoticeOverflow": 0,
+          "ReceiveQueueTentativeEvictionByteCount": 0,
+          "ReceiveQueueTentativeEvictionCount": 0,
+          "SendEvictionResendCount": 0,
+          "SendNoAckRefusedCount": 0,
+          "SendPackDeadlineDropCount": 0
+        }
+      },
+      "candidate_over_reference": [
+        1.0000213899167933,
+        0.8751218062001421
+      ],
+      "reference_direction_mbps": [
+        957.46048,
+        620.00128
+      ],
+      "repetition": 0
+    },
+    {
+      "candidate_direction_mbps": [
+        957.4604800000001,
+        684.87168
+      ],
+      "candidate_drop_counters": {
+        "Receiver": {
+          "AckHandoffDropCount": 0,
+          "PackHandoffDropByteCount": 0,
+          "PackHandoffDropCount": 0,
+          "ReceiveQueueDropByteCount": 0,
+          "ReceiveQueueDropCount": 0,
+          "ReceiveQueueEvictionByteCount": 0,
+          "ReceiveQueueEvictionCount": 0,
+          "ReceiveQueueEvictionNoticeOverflow": 0,
+          "ReceiveQueueTentativeEvictionByteCount": 0,
+          "ReceiveQueueTentativeEvictionCount": 0,
+          "SendEvictionResendCount": 0,
+          "SendNoAckRefusedCount": 0,
+          "SendPackDeadlineDropCount": 0
+        },
+        "SenderReceive": {
+          "AckHandoffDropCount": 0,
+          "PackHandoffDropByteCount": 0,
+          "PackHandoffDropCount": 0,
+          "ReceiveQueueDropByteCount": 0,
+          "ReceiveQueueDropCount": 0,
+          "ReceiveQueueEvictionByteCount": 0,
+          "ReceiveQueueEvictionCount": 0,
+          "ReceiveQueueEvictionNoticeOverflow": 0,
+          "ReceiveQueueTentativeEvictionByteCount": 0,
+          "ReceiveQueueTentativeEvictionCount": 0,
+          "SendEvictionResendCount": 0,
+          "SendNoAckRefusedCount": 0,
+          "SendPackDeadlineDropCount": 0
+        }
+      },
+      "candidate_over_reference": [
+        1.0000213903743318,
+        1.452756418610713
+      ],
+      "reference_direction_mbps": [
+        957.4399999999999,
+        471.42911999999995
+      ],
+      "repetition": 1
+    },
+    {
+      "candidate_direction_mbps": [
+        957.45024,
+        678.7072
+      ],
+      "candidate_drop_counters": {
+        "Receiver": {
+          "AckHandoffDropCount": 0,
+          "PackHandoffDropByteCount": 0,
+          "PackHandoffDropCount": 0,
+          "ReceiveQueueDropByteCount": 0,
+          "ReceiveQueueDropCount": 0,
+          "ReceiveQueueEvictionByteCount": 0,
+          "ReceiveQueueEvictionCount": 0,
+          "ReceiveQueueEvictionNoticeOverflow": 0,
+          "ReceiveQueueTentativeEvictionByteCount": 0,
+          "ReceiveQueueTentativeEvictionCount": 0,
+          "SendEvictionResendCount": 0,
+          "SendNoAckRefusedCount": 0,
+          "SendPackDeadlineDropCount": 0
+        },
+        "SenderReceive": {
+          "AckHandoffDropCount": 0,
+          "PackHandoffDropByteCount": 0,
+          "PackHandoffDropCount": 0,
+          "ReceiveQueueDropByteCount": 0,
+          "ReceiveQueueDropCount": 0,
+          "ReceiveQueueEvictionByteCount": 0,
+          "ReceiveQueueEvictionCount": 0,
+          "ReceiveQueueEvictionNoticeOverflow": 0,
+          "ReceiveQueueTentativeEvictionByteCount": 0,
+          "ReceiveQueueTentativeEvictionCount": 0,
+          "SendEvictionResendCount": 0,
+          "SendNoAckRefusedCount": 0,
+          "SendPackDeadlineDropCount": 0
+        }
+      },
+      "candidate_over_reference": [
+        1.0000106951871657,
+        1.1776202405699767
+      ],
+      "reference_direction_mbps": [
+        957.44,
+        576.3379199999999
+      ],
+      "repetition": 2
+    }
+  ],
+  "schema": "throughput-fix-2/source-idle-followup-sdk-comparisons-v1"
+}

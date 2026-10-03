@@ -158,6 +158,18 @@ func blackholeControlId(ctx context.Context, routeManager *RouteManager) {
 	}()
 }
 
+// Counts application frames inline without handing receive-pump work to a
+// queue that can fill or block.
+func countSimpleMessageFrames(frames []*protocol.Frame, receiveCount *int64) {
+	for _, frame := range frames {
+		if message, err := FromFrame(frame); err == nil {
+			if _, ok := message.(*protocol.SimpleMessage); ok {
+				atomic.AddInt64(receiveCount, 1)
+			}
+		}
+	}
+}
+
 // TestSendReceiveEncryptedWithContracts exercises bidirectional encrypted
 // transfer when contracts are required and supplied on demand by a
 // contract-granting oob. The send idle timeout is short so send sequences
@@ -194,18 +206,14 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 	provideModes := map[protocol.ProvideMode]bool{protocol.ProvideMode_Network: true}
 
 	makeSettings := func() *ClientSettings {
-		s := DefaultClientSettings()
-		s.SendBufferSettings.SequenceBufferSize = 0
-		s.SendBufferSettings.AckBufferSize = 0
+		s := DefaultClientSettingsWithBufferSize(64)
 		s.SendBufferSettings.AckTimeout = 60 * time.Second
 		// Short send idle so a send sequence exits (and flushes its contract
 		// queue) between bursts.
 		s.SendBufferSettings.IdleTimeout = 1 * time.Second
 		s.SendBufferSettings.MinResendInterval = 10 * time.Millisecond
-		s.ReceiveBufferSettings.SequenceBufferSize = 0
 		s.ReceiveBufferSettings.GapTimeout = 60 * time.Second
 		s.ReceiveBufferSettings.IdleTimeout = 60 * time.Second
-		s.ForwardBufferSettings.SequenceBufferSize = 0
 		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
 		s.ContractManagerSettings.LegacyCreateContract = false
 		s.EncryptionSettings.Mode = EncryptionModeOpportunistic
@@ -251,25 +259,12 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 	blackholeControlId(ctx, b.RouteManager())
 	b.ContractManager().SetProvideModes(provideModes)
 
-	receivesA := make(chan string, 1024)
-	receivesB := make(chan string, 1024)
+	var gotA, gotB int64
 	a.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
-		for _, frame := range frames {
-			if m, err := FromFrame(frame); err == nil {
-				if sm, ok := m.(*protocol.SimpleMessage); ok {
-					receivesA <- sm.Content
-				}
-			}
-		}
+		countSimpleMessageFrames(frames, &gotA)
 	})
 	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
-		for _, frame := range frames {
-			if m, err := FromFrame(frame); err == nil {
-				if sm, ok := m.(*protocol.SimpleMessage); ok {
-					receivesB <- sm.Content
-				}
-			}
-		}
+		countSimpleMessageFrames(frames, &gotB)
 	})
 
 	send := func(client *Client, dst Id, label string) {
@@ -278,7 +273,7 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		client.Send(frame, DestinationId(dst), func(error) {})
+		client.Send(frame, dst, func(error) {})
 	}
 
 	// Drive both directions in parallel: A and B each initiate to the other at
@@ -293,7 +288,6 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 	// handshake.
 	stop := make(chan struct{})
 	defer close(stop)
-	var gotA, gotB int64
 	go func() {
 		for i := 0; ; i += 1 {
 			select {
@@ -312,19 +306,6 @@ func TestSendReceiveEncryptedWithContracts(t *testing.T) {
 			}
 		}
 	}()
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			case <-receivesA:
-				atomic.AddInt64(&gotA, 1)
-			case <-receivesB:
-				atomic.AddInt64(&gotB, 1)
-			}
-		}
-	}()
-
 	cipherUp := func(client *Client, peer Id) bool {
 		sess := client.EncryptionSessionManager().Lookup(peer, sequenceTlsRoleClient, false)
 		return sess != nil && sess.Cipher() != nil
@@ -388,16 +369,12 @@ func TestSendReceiveEncryptedPeerWithoutEncryption(t *testing.T) {
 	provideModes := map[protocol.ProvideMode]bool{protocol.ProvideMode_Network: true}
 
 	makeSettings := func(encrypt bool) *ClientSettings {
-		s := DefaultClientSettings()
-		s.SendBufferSettings.SequenceBufferSize = 0
-		s.SendBufferSettings.AckBufferSize = 0
+		s := DefaultClientSettingsWithBufferSize(64)
 		s.SendBufferSettings.AckTimeout = 60 * time.Second
 		s.SendBufferSettings.IdleTimeout = 60 * time.Second
 		s.SendBufferSettings.MinResendInterval = 10 * time.Millisecond
-		s.ReceiveBufferSettings.SequenceBufferSize = 0
 		s.ReceiveBufferSettings.GapTimeout = 60 * time.Second
 		s.ReceiveBufferSettings.IdleTimeout = 60 * time.Second
-		s.ForwardBufferSettings.SequenceBufferSize = 0
 		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
 		s.ContractManagerSettings.LegacyCreateContract = false
 		if encrypt {
@@ -451,25 +428,12 @@ func TestSendReceiveEncryptedPeerWithoutEncryption(t *testing.T) {
 	// handshake EncryptedControl frames bubble up to the receive callback as
 	// ordinary frames; filtering on SimpleMessage ignores them, as an
 	// application would ignore frame types it doesn't consume.
-	receivesA := make(chan string, 1024)
-	receivesB := make(chan string, 1024)
+	var gotA, gotB int64
 	a.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
-		for _, frame := range frames {
-			if m, err := FromFrame(frame); err == nil {
-				if sm, ok := m.(*protocol.SimpleMessage); ok {
-					receivesA <- sm.Content
-				}
-			}
-		}
+		countSimpleMessageFrames(frames, &gotA)
 	})
 	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
-		for _, frame := range frames {
-			if m, err := FromFrame(frame); err == nil {
-				if sm, ok := m.(*protocol.SimpleMessage); ok {
-					receivesB <- sm.Content
-				}
-			}
-		}
+		countSimpleMessageFrames(frames, &gotB)
 	})
 
 	send := func(client *Client, dst Id, label string) {
@@ -478,12 +442,11 @@ func TestSendReceiveEncryptedPeerWithoutEncryption(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		client.Send(frame, DestinationId(dst), func(error) {})
+		client.Send(frame, dst, func(error) {})
 	}
 
 	stop := make(chan struct{})
 	defer close(stop)
-	var gotA, gotB int64
 	go func() {
 		for i := 0; ; i += 1 {
 			select {
@@ -502,19 +465,6 @@ func TestSendReceiveEncryptedPeerWithoutEncryption(t *testing.T) {
 			}
 		}
 	}()
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			case <-receivesA:
-				atomic.AddInt64(&gotA, 1)
-			case <-receivesB:
-				atomic.AddInt64(&gotB, 1)
-			}
-		}
-	}()
-
 	// assertNoCipher sweeps every per-peer session a holds for b — the
 	// client-role initiator plus any receive-side sessions — and requires all
 	// of them cipher-nil: with b's manager inert the handshake has no
@@ -604,16 +554,12 @@ func TestRequiredEncryptionEstablishesAndDelivers(t *testing.T) {
 	provideModes := map[protocol.ProvideMode]bool{protocol.ProvideMode_Network: true}
 
 	makeSettings := func() *ClientSettings {
-		s := DefaultClientSettings()
-		s.SendBufferSettings.SequenceBufferSize = 0
-		s.SendBufferSettings.AckBufferSize = 0
+		s := DefaultClientSettingsWithBufferSize(64)
 		s.SendBufferSettings.AckTimeout = 60 * time.Second
 		s.SendBufferSettings.IdleTimeout = 1 * time.Second
 		s.SendBufferSettings.MinResendInterval = 10 * time.Millisecond
-		s.ReceiveBufferSettings.SequenceBufferSize = 0
 		s.ReceiveBufferSettings.GapTimeout = 60 * time.Second
 		s.ReceiveBufferSettings.IdleTimeout = 60 * time.Second
-		s.ForwardBufferSettings.SequenceBufferSize = 0
 		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
 		s.ContractManagerSettings.LegacyCreateContract = false
 		s.EncryptionSettings.Mode = EncryptionModeRequired
@@ -672,25 +618,12 @@ func TestRequiredEncryptionEstablishesAndDelivers(t *testing.T) {
 	})
 	defer aEventsUnsub()
 
-	receivesA := make(chan string, 1024)
-	receivesB := make(chan string, 1024)
+	var gotA, gotB int64
 	a.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
-		for _, frame := range frames {
-			if m, err := FromFrame(frame); err == nil {
-				if sm, ok := m.(*protocol.SimpleMessage); ok {
-					receivesA <- sm.Content
-				}
-			}
-		}
+		countSimpleMessageFrames(frames, &gotA)
 	})
 	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
-		for _, frame := range frames {
-			if m, err := FromFrame(frame); err == nil {
-				if sm, ok := m.(*protocol.SimpleMessage); ok {
-					receivesB <- sm.Content
-				}
-			}
-		}
+		countSimpleMessageFrames(frames, &gotB)
 	})
 
 	send := func(client *Client, dst Id, label string) {
@@ -699,12 +632,11 @@ func TestRequiredEncryptionEstablishesAndDelivers(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		client.Send(frame, DestinationId(dst), func(error) {})
+		client.Send(frame, dst, func(error) {})
 	}
 
 	stop := make(chan struct{})
 	defer close(stop)
-	var gotA, gotB int64
 	go func() {
 		for i := 0; ; i += 1 {
 			select {
@@ -723,19 +655,6 @@ func TestRequiredEncryptionEstablishesAndDelivers(t *testing.T) {
 			}
 		}
 	}()
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			case <-receivesA:
-				atomic.AddInt64(&gotA, 1)
-			case <-receivesB:
-				atomic.AddInt64(&gotB, 1)
-			}
-		}
-	}()
-
 	cipherUp := func(client *Client, peer Id) bool {
 		sess := client.EncryptionSessionManager().Lookup(peer, sequenceTlsRoleClient, false)
 		return sess != nil && sess.Cipher() != nil
@@ -835,16 +754,12 @@ func TestRequiredEncryptionFailsClosedAgainstPlaintextPeer(t *testing.T) {
 	provideModes := map[protocol.ProvideMode]bool{protocol.ProvideMode_Network: true}
 
 	makeSettings := func(mode EncryptionMode) *ClientSettings {
-		s := DefaultClientSettings()
-		s.SendBufferSettings.SequenceBufferSize = 0
-		s.SendBufferSettings.AckBufferSize = 0
+		s := DefaultClientSettingsWithBufferSize(64)
 		s.SendBufferSettings.AckTimeout = 60 * time.Second
 		s.SendBufferSettings.IdleTimeout = 60 * time.Second
 		s.SendBufferSettings.MinResendInterval = 10 * time.Millisecond
-		s.ReceiveBufferSettings.SequenceBufferSize = 0
 		s.ReceiveBufferSettings.GapTimeout = 60 * time.Second
 		s.ReceiveBufferSettings.IdleTimeout = 60 * time.Second
-		s.ForwardBufferSettings.SequenceBufferSize = 0
 		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
 		s.ContractManagerSettings.LegacyCreateContract = false
 		s.EncryptionSettings.Mode = mode
@@ -901,25 +816,12 @@ func TestRequiredEncryptionFailsClosedAgainstPlaintextPeer(t *testing.T) {
 	blackholeControlId(ctx, b.RouteManager())
 	b.ContractManager().SetProvideModes(provideModes)
 
-	receivesA := make(chan string, 1024)
-	receivesB := make(chan string, 1024)
+	var gotA, gotB int64
 	a.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
-		for _, frame := range frames {
-			if m, err := FromFrame(frame); err == nil {
-				if sm, ok := m.(*protocol.SimpleMessage); ok {
-					receivesA <- sm.Content
-				}
-			}
-		}
+		countSimpleMessageFrames(frames, &gotA)
 	})
 	b.AddReceiveCallback(func(source TransferPath, frames []*protocol.Frame, _ Peer) {
-		for _, frame := range frames {
-			if m, err := FromFrame(frame); err == nil {
-				if sm, ok := m.(*protocol.SimpleMessage); ok {
-					receivesB <- sm.Content
-				}
-			}
-		}
+		countSimpleMessageFrames(frames, &gotB)
 	})
 
 	send := func(client *Client, dst Id, label string) {
@@ -928,7 +830,7 @@ func TestRequiredEncryptionFailsClosedAgainstPlaintextPeer(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		client.Send(frame, DestinationId(dst), func(error) {})
+		client.Send(frame, dst, func(error) {})
 	}
 
 	// Separate send loops: a's Send blocks at the Required entry gate (the
@@ -938,7 +840,6 @@ func TestRequiredEncryptionFailsClosedAgainstPlaintextPeer(t *testing.T) {
 	// exercises the receive gate.
 	stop := make(chan struct{})
 	defer close(stop)
-	var gotA, gotB int64
 	go func() {
 		for i := 0; ; i += 1 {
 			select {
@@ -973,19 +874,6 @@ func TestRequiredEncryptionFailsClosedAgainstPlaintextPeer(t *testing.T) {
 			}
 		}
 	}()
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			case <-receivesA:
-				atomic.AddInt64(&gotA, 1)
-			case <-receivesB:
-				atomic.AddInt64(&gotB, 1)
-			}
-		}
-	}()
-
 	// Watch for 12s (far longer than the ~1s plaintext delivery seen under
 	// Opportunistic in TestSendReceiveEncryptedPeerWithoutEncryption): neither
 	// counter may ever advance.
@@ -1019,7 +907,7 @@ func TestRequiredEncryptionFailsClosedAgainstPlaintextPeer(t *testing.T) {
 	// gap-producing drop would instead pin the queue at its cap forever.)
 	drainDeadline := time.After(20 * time.Second)
 	for {
-		count, byteCount, _ := b.ResendQueueSize(DestinationId(aClientId), MultiHopId{}, false, false)
+		count, byteCount, _ := b.ResendQueueSize(aClientId, MultiHopId{}, false, false)
 		if count == 0 && byteCount == 0 {
 			break
 		}
@@ -1119,19 +1007,15 @@ func TestEncryptedCompanionSessionsCreateSeparateContracts(t *testing.T) {
 	provideModes := map[protocol.ProvideMode]bool{protocol.ProvideMode_Network: true}
 
 	makeSettings := func() *ClientSettings {
-		s := DefaultClientSettings()
-		s.SendBufferSettings.SequenceBufferSize = 0
-		s.SendBufferSettings.AckBufferSize = 0
+		s := DefaultClientSettingsWithBufferSize(64)
 		s.SendBufferSettings.AckTimeout = 60 * time.Second
 		// Long send idle so all eight sequences stay alive (and keep their
 		// contracts open) through the assertion — this test is about how many
 		// distinct sequences/contracts exist, not contract-flush churn.
 		s.SendBufferSettings.IdleTimeout = 60 * time.Second
 		s.SendBufferSettings.MinResendInterval = 10 * time.Millisecond
-		s.ReceiveBufferSettings.SequenceBufferSize = 0
 		s.ReceiveBufferSettings.GapTimeout = 60 * time.Second
 		s.ReceiveBufferSettings.IdleTimeout = 60 * time.Second
-		s.ForwardBufferSettings.SequenceBufferSize = 0
 		s.ForwardBufferSettings.IdleTimeout = 1 * time.Second
 		s.ContractManagerSettings.LegacyCreateContract = false
 		s.EncryptionSettings.Mode = EncryptionModeOpportunistic
@@ -1189,9 +1073,9 @@ func TestEncryptedCompanionSessionsCreateSeparateContracts(t *testing.T) {
 			panic(err)
 		}
 		if companion {
-			client.SendWithTimeout(frame, DestinationId(dst), func(error) {}, 1*time.Second, CompanionContract())
+			client.SendWithTimeout(frame, dst, func(error) {}, 1*time.Second, CompanionContract())
 		} else {
-			client.SendWithTimeout(frame, DestinationId(dst), func(error) {}, 1*time.Second)
+			client.SendWithTimeout(frame, dst, func(error) {}, 1*time.Second)
 		}
 	}
 

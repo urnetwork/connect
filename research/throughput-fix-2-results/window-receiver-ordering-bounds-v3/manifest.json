@@ -1,0 +1,15 @@
+{
+  "archive": "window-receiver-ordering-bounds-v3",
+  "payload_sha256": {
+    "candidate.patch": "db92b3dc3b5028c57a4a279a1f9e80ea37042f49421e197385066e5b7ba42107",
+    "combined-ordering.patch": "3578359bfddd931d433d2a8398c0fbf7e2631ef059fc12d083664a6ce8995d7f",
+    "outcomes.jsonl": "1dc468683ee51bc37c2192100f3ca8a184fb6b1a5bcf33cec686dc09652a6451",
+    "positive-control.patch": "43ee42adc804c675fdb8841dedb050138fc9b8c2f6b9d36b38a6e2bf59519e3a",
+    "provenance.json": "877e49c0c468e15caaa00a7e22bb0ab8333cec925e1df7f510c7ca3491d4d3e2",
+    "source-manifest-after-adjacent.json": "45145c89b6aa49c26f0c272b3c3ebd64831271b94e301c028f4adc9f0f2d0985",
+    "source-manifest-after-roots.json": "69523d6815aa63800eccbc542f9e5bb99a5d8255c40557ba7b04d4b4cc85ff70",
+    "source-manifest-before-roots.json": "9c2b4aab6f060e2c28a2af998cbce02183d97915b91e5b66620ef6212da80596",
+    "source-pins.json": "4a2f3b3c8566bd00ac0624fc7816facb639c433ba9ca585dbba74fa17a2f7775",
+    "status.json": "1f75f8eca70f824e7965bed34abfc42826464faedd46a5a4e9973845c199a060"
+  }
+}

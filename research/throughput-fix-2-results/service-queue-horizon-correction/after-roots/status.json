@@ -1,0 +1,38 @@
+{
+  "manifest_sha256": "61f20f660e7c6f73a99c05c6add0f3fe2b47693bdf73f78ce711247936357812",
+  "binary_sha256": "32c67112f4b36a48f63035ae1658b6bb31b5f37691400187ad044309c7918da3",
+  "effective_inputs_sha256": "9a7a0467c5c66608a8bbdddb27a6a92a8c3cc929f3b2362a9d7ee8a25ec6aca8",
+  "argv": [
+    "/private/tmp/throughput-fix-2-queue-horizon-after-pinned/tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacing(LateQueuedTimingCannotEvictRecentDelivery|OldestRetainedQueuedTimingStillQualifiesDelivery)$",
+    "-test.count=3",
+    "-test.timeout=90s"
+  ],
+  "started_utc": "2026-09-16T17:13:11.776812+00:00",
+  "loadavg_start": [
+    11.66552734375,
+    13.34326171875,
+    12.82666015625
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent retained-window implementation and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 1.9914992908015847,
+  "loadavg_end": [
+    11.66552734375,
+    13.34326171875,
+    12.82666015625
+  ],
+  "ended_utc": "2026-09-16T17:13:13.769343+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "0574d4d209fc889585dbf75ee20d742c54009b18ec0f43a0bfc32587b627bbde",
+  "pass": 6,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "rows": 0
+}

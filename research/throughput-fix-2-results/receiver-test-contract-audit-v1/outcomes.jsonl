@@ -1,0 +1,15 @@
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingReceiverLateSiblingCompletesColdSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingReceiverOrderedColdSiblingsKeepSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingReceiverLateSiblingCompletesEpochSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingReceiverLateSiblingFindsSlowEpochSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingReceiverOrderedEpochSiblingsKeepSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingReceiverLateSiblingCompletesColdSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingReceiverOrderedColdSiblingsKeepSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingReceiverLateSiblingCompletesEpochSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingReceiverLateSiblingFindsSlowEpochSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingReceiverOrderedEpochSiblingsKeepSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingReceiverLateSiblingCompletesColdSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingReceiverOrderedColdSiblingsKeepSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingReceiverLateSiblingCompletesEpochSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "FAIL", "seconds": "0.00s", "test": "TestWindowPacingReceiverLateSiblingFindsSlowEpochSerialization", "variant": "original-exact-response-assertions"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPacingReceiverOrderedEpochSiblingsKeepSerialization", "variant": "original-exact-response-assertions"}

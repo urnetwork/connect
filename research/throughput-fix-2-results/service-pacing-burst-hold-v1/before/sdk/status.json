@@ -1,0 +1,16 @@
+{
+  "exit_code": 0,
+  "rows": 20,
+  "passed": 5,
+  "failed": 0,
+  "skipped": 0,
+  "run_log_sha256": "5c0e1dbfbb81bbfcc3eb4e76af0351c0e470ccf88cf45d1257a6ecab757e137d",
+  "sources_stable_during_build_and_run": true,
+  "finished_utc": "2026-09-17T01:14:30.995344+00:00",
+  "host_load_average_at_finish": [
+    9.53515625,
+    8.8193359375,
+    8.6513671875
+  ],
+  "no_quiescence_wait": true
+}

@@ -1,0 +1,6 @@
+{
+  "classification": "Affected original SDK subset: short paths corrected, positive-service long-path failure remains; not full model acceptance.",
+  "outcomes": 4,
+  "readings": 40,
+  "worker_readings": 0
+}

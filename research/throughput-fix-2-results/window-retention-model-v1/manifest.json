@@ -1,0 +1,10 @@
+{
+  "archive": "window-retention-model-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "d6392e797ca32eb206d8467d94eb737b4ddc1eb3f66f6e7a4042dc84d51e7bc6",
+    "outcomes.jsonl": "92496d54b7edb489c5a3c8dfdd261b9cc61a4ac7ea10a5ac63cad351215a2e67",
+    "provenance.json": "61f6e91a7c7a3a8f5cca9f3c260907886eb189c7f2edd0c54c6c4220f1ba5609",
+    "source-pins.json": "30b9580f872040bf4513109215cb1021f63f57b2a6f3d299f55fb97ef4aed2ad",
+    "status.json": "675bb54fcba9156ed6faf8ea87f4a863ff3836cd89ae53ca6619d19997c390a3"
+  }
+}

@@ -1,0 +1,13 @@
+=== RUN   TestWindowPacingReceiverWaitRefillPreservesSerialization
+--- FAIL: TestWindowPacingReceiverWaitRefillPreservesSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitRefillDiscoversSlowSerialization
+--- PASS: TestWindowPacingReceiverWaitRefillDiscoversSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitRefillPreservesSerialization
+--- FAIL: TestWindowPacingReceiverWaitRefillPreservesSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitRefillDiscoversSlowSerialization
+--- PASS: TestWindowPacingReceiverWaitRefillDiscoversSlowSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitRefillPreservesSerialization
+--- FAIL: TestWindowPacingReceiverWaitRefillPreservesSerialization (0.00s)
+=== RUN   TestWindowPacingReceiverWaitRefillDiscoversSlowSerialization
+--- PASS: TestWindowPacingReceiverWaitRefillDiscoversSlowSerialization (0.00s)
+FAIL

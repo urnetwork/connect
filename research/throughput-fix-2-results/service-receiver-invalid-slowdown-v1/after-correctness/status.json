@@ -1,0 +1,45 @@
+{
+  "manifest_sha256": "74fad69af0c413d66681e0e498b15181530d57b142a0534dabc4c3deed3565d1",
+  "binary_sha256": "a056c029ad287745ca411d15c1909a6fb94ac3a5e5d017bacce86c1136fe4800",
+  "effective_inputs_sha256": "b487d4b6336141bedccb16350ae2e6dbda30aefab75cddb3c4cd9e0224135b04",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$|^TestWindowTcp(SocketBatch|CanceledBatch|WorkloadCancel).*$|^TestTun(DuplexDataHandoffDoesNotCycleThroughAdmission|FiniteTcpTailProgressesAfterEndpointOwnerReleases)$|^TestReceiveSequenceBurstTail.*$|^Test(AckReceiverDelay|ReceiverAckTiming|SenderReceiverTiming|RttReceiverTiming).*$|^Test(SilentLaneLongerThanTheProbeCadenceStillDrains|SingleReliableLaneQueueInflatedRttDoesNotStorm)$|^TestWindowRetained.*$|^Test(AdvertisementRaisesPermissionWithoutLearningCapacity|DeliveryCandidatesRequireFreshPermissionHistory|AClampedWindowReportsTheMemoryShare|ALearnedWindowSurvivesTheMemoryClamp|DeliveryGrowthRemainsBelowTheSmallMemoryShare|AConfiguredCeilingDoesNotReportTheMemoryShare|TheThreePeerBranchesHaveDifferentPermissionCeilings)$|^TestWindowDestinationStats.*$|^TestWindowStats.*$",
+    "-test.count=1",
+    "-test.timeout=30m",
+    "-test.short=false",
+    "-test.skip",
+    "^TestWindowRetainedSteadyPathPreservesOccupancyBand$"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied Go module as the effective build inputs; original absolute cwd retained by raw status hash",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T19:30:01.338440+00:00",
+  "loadavg_start": [
+    50.29736328125,
+    38.015625,
+    27.58935546875
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 37.99922695802525,
+  "loadavg_end": [
+    43.90185546875,
+    37.890625,
+    28.02001953125
+  ],
+  "ended_utc": "2026-09-16T19:30:39.337927+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "ba9bf6b1d5845d5a46f2d9e82bba168f0a7557018e95e75e503805578efc312a",
+  "pass": 507,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "rows": 12,
+  "normalization_note": "Complete current copied source and all accepted/new roots, including cumulative fallback restoration and parent benchmarks. Current runner scoped race selection; only its existing wall-clock occupancy exclusion. Actual model acceptance remains separate."
+}

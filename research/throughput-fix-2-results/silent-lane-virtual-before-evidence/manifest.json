@@ -1,0 +1,13 @@
+{
+  "archive_kind": "virtual_silent_lane_before_evidence",
+  "file_count": 6,
+  "file_sha256": {
+    "excluded-diagnostics.json": "dce78b8b60ad38ba5ca8c87c210334442af2cdcbf88f66f629f2a7d92d8fb0c5",
+    "outcomes.jsonl": "1f5dcee9e45a99e08f4b184a595ff0dd1a1d3429082410ae19d63ad211a42354",
+    "provenance.json": "e0254b0d49e3524a2c1cdd5c65427f67c4ab6e718046068989e91dc1a6412db9",
+    "source-pins.json": "b98a1d6b2d705ab6b9c1797104fd962f716684292022cd8c649fcd856bc03f3b",
+    "status.json": "9a1bcf7bd94eaf149ed37439c813f690ca5c2d909b2138ba26a4932eb19fa91f",
+    "trace-v2-terminal-snapshots.jsonl": "7fbccdd23b70a9dc6f77bc7e609a8fb8982e0f6f4aa615ed759288d701faac93"
+  },
+  "schema_version": 1
+}

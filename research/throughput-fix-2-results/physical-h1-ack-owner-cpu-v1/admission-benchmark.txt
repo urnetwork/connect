@@ -1,0 +1,121 @@
+// Measure the no-pressure pure-ACK provider admission path with matched
+// terminal ownership. This is CPU/allocation evidence, not a throughput gate.
+package connect
+
+import (
+	"context"
+	"net"
+	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/urnetwork/connect/protocol"
+)
+
+// Both variants complete the same borrowed 52-byte ACK and consume its real
+// SendPack. The existing provider shard is used before; the existing dedicated
+// ACK producer owns the direct admission after. A variant-only factory returns
+// the exact recovery value that its production pure-ACK worker publishes.
+func BenchmarkProviderPureAckAdmissionAvailable(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	settings := closeWaitClientSettings()
+	settings.SendBufferSettings.SequenceBufferSize = 2
+	settings.SendBufferSettings.beforeRunSendSequenceForTest = func(id sendSequenceId) {
+		if id.Destination != ControlId {
+			<-ctx.Done()
+		}
+	}
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	providerCtx, providerCancel := context.WithCancel(ctx)
+	providerSettings := DefaultRemoteUserNatProviderSettings()
+	providerSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
+	provider := &RemoteUserNatProvider{
+		ctx: providerCtx, cancel: providerCancel, client: client,
+		localUserNat:        &LocalUserNat{ctx: providerCtx, sendPackets: make(chan *SendPacket, 1)},
+		settings:            providerSettings,
+		securityPolicy:      providerSettings.SecurityPolicyGenerator(providerCtx, DefaultSecurityPolicyStatsCollector()),
+		packetStatsCounters: &packetStatsCounters{}, packetStatsCallbacks: NewCallbackList[PacketStatsFunction](),
+		sourceProvideMode: map[Id]protocol.ProvideMode{}, sourceP2pPriorityRefresh: map[Id]time.Time{},
+	}
+	released := make(chan struct{}, 1)
+	provider.afterReturnReleaseForTest = func() { released <- struct{}{} }
+	provider.startReturnSenders()
+	b.Cleanup(func() {
+		provider.Close()
+		cancel()
+		if err := client.CloseAndWait(context.Background()); err != nil {
+			b.Errorf("benchmark ownership join: %v", err)
+		}
+	})
+	peer := NewId()
+	client.ContractManager().AddNoContractPeer(peer)
+	state := &ConnectionState{
+		ipVersion: 4, sourceIp: net.IPv4(192, 0, 2, 1).To4(), sourcePort: 40000,
+		destinationIp: net.IPv4(203, 0, 113, 7).To4(), destinationPort: 443,
+		receiveSeq: 1000, sendSeq: 2000, windowSize: 1024 * 1024, windowScale: 5,
+		enableTimestamp: true, timestampRecent: 3000, peerMss: 1460,
+		timestampValueForTest: func() uint32 { return 4000 },
+	}
+	packet, err := state.PureAck()
+	if err != nil || len(packet) != 52 {
+		b.Fatalf("benchmark must publish an actual 52-byte pure ACK: %d %v", len(packet), err)
+	}
+	defer MessagePoolReturn(packet)
+	var path IpPath
+	if _, err := parseIpPathWithPayloadBorrowed(packet, &path); err != nil {
+		b.Fatal(err)
+	}
+	recovery := benchmarkPureAckRecovery(ctx)
+	source := SourceId(peer)
+	provider.receiveTransferWithRecovery(source, TransferKey{}, protocol.ProvideMode_Network, recovery, &path, packet)
+	select {
+	case <-released:
+	case <-ctx.Done():
+		b.Fatal("warm admission failed to reach terminal release")
+	}
+	id := sendSequenceId{Destination: peer, EncryptionRole: sequenceTlsRoleClient}
+	client.sendBuffer.mutex.Lock()
+	sequence := client.sendBuffer.sendSequences[id]
+	client.sendBuffer.mutex.Unlock()
+	if sequence == nil || len(sequence.packs) != 1 || sequence.packAdmission.count != 1 {
+		b.Fatal("warm ACK failed its real two-slot admission")
+	}
+	warm := <-sequence.packs
+	if !warm.Ack || !warm.lifecycleUpstreamRecoverable || warm.retainAfterAckTimeout {
+		b.Fatal("warm ACK changed its ordinary Transfer lifetime")
+	}
+	warm.returnFrames()
+	warm.releaseRaw()
+	completed := 0
+	failed := false
+	b.ReportAllocs()
+	b.SetBytes(int64(len(packet)))
+	b.ResetTimer()
+	for range b.N {
+		provider.receiveTransferWithRecovery(source, TransferKey{}, protocol.ProvideMode_Network, recovery, &path, packet)
+		select {
+		case <-released:
+		case <-ctx.Done():
+			failed = true
+		}
+		if failed {
+			break
+		}
+		select {
+		case pack := <-sequence.packs:
+			pack.returnFrames()
+			pack.releaseRaw()
+			completed++
+		default:
+			failed = true
+		}
+		if failed {
+			break
+		}
+	}
+	b.StopTimer()
+	if failed || completed != b.N || sequence.packAdmission.count != 0 || provider.CongestionDropStats() != (ProviderCongestionDrops{}) {
+		b.Fatalf("no-pressure benchmark lost terminal ownership: completed=%d/%d admission=%d drops=%+v", completed, b.N, sequence.packAdmission.count, provider.CongestionDropStats())
+	}
+	b.ReportMetric(float64(unsafe.Sizeof(providerReturnItem{})), "return-item-B")
+}

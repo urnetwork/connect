@@ -1,0 +1,6 @@
+{
+  "classification": "Deterministic access-barrier proof: both writer-handle races fail in each of three fresh before processes; all after roots and60 adjacent checks pass.",
+  "outcomes": 78,
+  "readings": 0,
+  "worker_readings": 0
+}

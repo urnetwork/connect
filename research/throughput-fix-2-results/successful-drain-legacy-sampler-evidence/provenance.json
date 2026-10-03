@@ -1,0 +1,19 @@
+{
+  "artifact_exclusions": [
+    "Normalize numerical rows/outcomes/pins only; do not copy raw logs, source, overlays, binaries, or inventories.",
+    "Keep all18 excluded fixture failures distinct from final legacy root failures.",
+    "No sender-only candidate was evaluated on this fixture: its service-only API calls do not supply actual SendSequence Run producer-wait provenance. No inference of passing eligibility without that evidence."
+  ],
+  "classification": "legacy/no-field12 deterministic failure-before extension; not a production fix or performance acceptance result",
+  "created_utc": "2026-09-16T11:59:23.106941+00:00",
+  "fixture_precondition_exclusion": "The 18 explicitly retained failures are excluded from causal proof because the new raw RTT stayed in an incomplete bucket and the drain never began.",
+  "input_handoff_sha256": "e79fad510bab30e22ff340cb9e6547f32e752dd71de310412007d6d4a42b98ab",
+  "numeric_summary_sha256": "c12f48fb3b80646f666f4cbd6b143c6b615b2efe94022f1314f95cdf484f1bd1",
+  "pin_validation": {
+    "checked": 34,
+    "mismatches": 0
+  },
+  "prior_metadata_boundary": "The prior paired-metadata handoff remains immutable and separately archived; this archive covers only the legacy/no-field12 extension.",
+  "prior_metadata_handoff_sha256": "9a648856c7339f5c84de360faa922a922359a461e89e2b8ac1b6081a16dda848",
+  "scope": "Legacy/no-field12 extension only, original paired-metadata results remain separately frozen."
+}

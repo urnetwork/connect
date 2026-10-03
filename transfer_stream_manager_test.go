@@ -33,6 +33,7 @@ func TestStreamManagerStreamLifecycle(t *testing.T) {
 	})
 
 	streamManager := client.streamManager
+	openTracker := newStreamOpenTestTracker(streamManager.streamBuffer)
 
 	mustFrame := func(message proto.Message) *protocol.Frame {
 		frame, err := ToFrame(message, DefaultProtocolVersion)
@@ -72,47 +73,44 @@ func TestStreamManagerStreamLifecycle(t *testing.T) {
 		return ok
 	}
 
-	eventually := func(c func() bool) bool {
-		endTime := time.Now().Add(5 * time.Second)
-		for time.Now().Before(endTime) {
-			if c() {
-				return true
-			}
-			select {
-			case <-ctx.Done():
-				return c()
-			case <-time.After(10 * time.Millisecond):
-			}
-		}
-		return c()
-	}
-
 	// open with destination only: this client is the stream source
 	destinationId := NewId()
 	endpointStreamId := NewId()
+	endpointPublication := openTracker.expectPublication(endpointStreamId)
 	receiveControl(streamOpen(nil, &destinationId, endpointStreamId))
+	endpointPublication.wait(t)
 	AssertEqual(t, true, streamManager.IsStreamOpen(endpointStreamId))
+	endpointPublication.resume()
 
 	// open with source only: this client is the stream destination
 	sourceId := NewId()
 	sourceStreamId := NewId()
+	sourcePublication := openTracker.expectPublication(sourceStreamId)
 	receiveControl(streamOpen(&sourceId, nil, sourceStreamId))
+	sourcePublication.wait(t)
 	AssertEqual(t, true, streamManager.IsStreamOpen(sourceStreamId))
 
 	// open with both: this client is an intermediary hop
 	intermediaryStreamId := NewId()
+	intermediaryPublication := openTracker.expectPublication(intermediaryStreamId)
 	receiveControl(streamOpen(&sourceId, &destinationId, intermediaryStreamId))
+	intermediaryPublication.wait(t)
 	AssertEqual(t, true, streamManager.IsStreamOpen(intermediaryStreamId))
 
 	// a duplicate open leaves the existing sequence in place
 	sequence := getSequence(endpointStreamId)
 	AssertEqual(t, true, sequence != nil)
+	duplicateCompletion := openTracker.expectCompletion(endpointStreamId)
 	receiveControl(streamOpen(nil, &destinationId, endpointStreamId))
+	waitForStreamOpenTestCompletion(t, duplicateCompletion)
 	AssertEqual(t, true, sequence == getSequence(endpointStreamId))
 
 	// reopening the stream id with different endpoints cancels the old sequence
 	otherDestinationId := NewId()
+	replacementPublication := openTracker.expectPublication(endpointStreamId)
+	evictedRemoval := openTracker.expectRemoval(endpointStreamId)
 	receiveControl(streamOpen(nil, &otherDestinationId, endpointStreamId))
+	replacementPublication.wait(t)
 	AssertEqual(t, true, streamManager.IsStreamOpen(endpointStreamId))
 	evictedSequence := sequence
 	sequence = getSequence(endpointStreamId)
@@ -120,42 +118,50 @@ func TestStreamManagerStreamLifecycle(t *testing.T) {
 	AssertEqual(t, true, evictedSequence != sequence)
 	AssertEqual(t, true, evictedSequence.ctx.Err() != nil)
 	// the evicted sequence is asynchronously cleaned up
-	AssertEqual(t, true, eventually(func() bool {
-		return !hasStreamSequenceId(nil, &destinationId, endpointStreamId)
-	}))
+	waitForStreamLifecycleSignal(t, evictedRemoval, "evicted stream did not leave its indexes")
+	AssertEqual(t, false, hasStreamSequenceId(nil, &destinationId, endpointStreamId))
 
 	// close cancels the stream
+	intermediaryRemoval := openTracker.expectRemoval(intermediaryStreamId)
 	receiveControl(&protocol.StreamClose{
 		StreamId: intermediaryStreamId.Bytes(),
 	})
-	AssertEqual(t, true, eventually(func() bool {
-		return !streamManager.IsStreamOpen(intermediaryStreamId)
-	}))
+	intermediaryPublication.resume()
+	waitForStreamLifecycleSignal(t, intermediaryRemoval, "closed intermediary stream did not leave its indexes")
+	AssertEqual(t, false, streamManager.IsStreamOpen(intermediaryStreamId))
 
 	// reset reconciles: relisted streams keep their sequences,
 	// unlisted streams close, and newly listed streams open
 	resetStreamId := NewId()
+	sourceRemoval := openTracker.expectRemoval(sourceStreamId)
+	resetPublication := openTracker.expectPublication(resetStreamId)
 	receiveControl(&protocol.StreamReset{
 		Streams: []*protocol.StreamOpen{
 			streamOpen(nil, &otherDestinationId, endpointStreamId),
 			streamOpen(nil, &destinationId, resetStreamId),
 		},
 	})
+	resetPublication.wait(t)
 	AssertEqual(t, true, streamManager.IsStreamOpen(endpointStreamId))
 	AssertEqual(t, true, streamManager.IsStreamOpen(resetStreamId))
-	AssertEqual(t, true, eventually(func() bool {
-		return !streamManager.IsStreamOpen(sourceStreamId)
-	}))
+	sourcePublication.resume()
+	replacementPublication.resume()
+	resetPublication.resume()
+	waitForStreamLifecycleSignal(t, sourceRemoval, "unlisted reset stream did not leave its indexes")
+	AssertEqual(t, false, streamManager.IsStreamOpen(sourceStreamId))
 	// the relisted stream keeps its live sequence across the reset,
 	// so its p2p transports survive a resident migration
 	AssertEqual(t, true, sequence == getSequence(endpointStreamId))
 	AssertEqual(t, true, sequence.ctx.Err() == nil)
 
 	// an empty reset cancels everything (the legacy reset behavior)
+	endpointRemoval := openTracker.expectRemoval(endpointStreamId)
+	resetRemoval := openTracker.expectRemoval(resetStreamId)
 	receiveControl(&protocol.StreamReset{})
-	AssertEqual(t, true, eventually(func() bool {
-		return !streamManager.IsStreamOpen(endpointStreamId) && !streamManager.IsStreamOpen(resetStreamId)
-	}))
+	waitForStreamLifecycleSignal(t, endpointRemoval, "empty reset endpoint stream did not leave its indexes")
+	waitForStreamLifecycleSignal(t, resetRemoval, "empty reset listed stream did not leave its indexes")
+	AssertEqual(t, false, streamManager.IsStreamOpen(endpointStreamId))
+	AssertEqual(t, false, streamManager.IsStreamOpen(resetStreamId))
 	AssertEqual(t, true, sequence.ctx.Err() != nil)
 }
 
@@ -174,12 +180,13 @@ func TestStreamManagerProvidePolicyRetiresStaleInboundStreams(t *testing.T) {
 	defer client.Close()
 
 	streamManager := client.streamManager
+	openTracker := newStreamOpenTestTracker(streamManager.streamBuffer)
 	mustFrame := func(message proto.Message) *protocol.Frame {
 		frame, err := ToFrame(message, DefaultProtocolVersion)
 		AssertEqual(t, err, nil)
 		return frame
 	}
-	open := func(sourceId *Id, destinationId *Id, streamId Id) {
+	receiveOpen := func(sourceId *Id, destinationId *Id, streamId Id) {
 		message := &protocol.StreamOpen{StreamId: streamId.Bytes()}
 		if sourceId != nil {
 			message.SourceId = sourceId.Bytes()
@@ -189,17 +196,12 @@ func TestStreamManagerProvidePolicyRetiresStaleInboundStreams(t *testing.T) {
 		}
 		streamManager.Receive(SourceId(ControlId), []*protocol.Frame{mustFrame(message)}, Peer{})
 	}
-	eventuallyClosed := func(streamId Id) bool {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			if !streamManager.IsStreamOpen(streamId) {
-				return true
-			}
-			time.Sleep(time.Millisecond)
-		}
-		return !streamManager.IsStreamOpen(streamId)
+	openAndHold := func(sourceId *Id, destinationId *Id, streamId Id) *streamOpenTestPublication {
+		publication := openTracker.expectPublication(streamId)
+		receiveOpen(sourceId, destinationId, streamId)
+		publication.wait(t)
+		return publication
 	}
-
 	publicSourceId := NewId()
 	networkSourceId := NewId()
 	destinationId := NewId()
@@ -226,31 +228,41 @@ func TestStreamManagerProvidePolicyRetiresStaleInboundStreams(t *testing.T) {
 		protocol.ProvideMode_Public:  true,
 		protocol.ProvideMode_Network: true,
 	})
-	open(&publicSourceId, nil, publicStreamId)
-	open(&networkSourceId, nil, networkStreamId)
-	open(nil, &destinationId, outboundStreamId)
-	open(&publicSourceId, &destinationId, intermediaryStreamId)
+	publicPublication := openAndHold(&publicSourceId, nil, publicStreamId)
+	networkPublication := openAndHold(&networkSourceId, nil, networkStreamId)
+	outboundPublication := openAndHold(nil, &destinationId, outboundStreamId)
+	intermediaryPublication := openAndHold(&publicSourceId, &destinationId, intermediaryStreamId)
 	AssertEqual(t, true, streamManager.IsStreamOpen(publicStreamId))
 	AssertEqual(t, true, streamManager.IsStreamOpen(networkStreamId))
 	AssertEqual(t, true, streamManager.IsStreamOpen(outboundStreamId))
 	AssertEqual(t, true, streamManager.IsStreamOpen(intermediaryStreamId))
+	networkSequence := streamLifecycleSequence(client, networkStreamId)
+	outboundSequence := streamLifecycleSequence(client, outboundStreamId)
+	publicPublication.resume()
+	intermediaryPublication.resume()
 
 	// Network-only retires a public endpoint and public intermediary, but not a
 	// known network peer or an outbound stream on which this client is source.
+	publicRemoval := openTracker.expectRemoval(publicStreamId)
+	intermediaryRemoval := openTracker.expectRemoval(intermediaryStreamId)
 	client.ContractManager().SetProvideModes(map[protocol.ProvideMode]bool{
 		protocol.ProvideMode_Network: true,
 	})
-	AssertEqual(t, true, eventuallyClosed(publicStreamId))
-	AssertEqual(t, true, eventuallyClosed(intermediaryStreamId))
+	waitForStreamLifecycleSignal(t, publicRemoval, "public stream did not leave its indexes after Network-only policy")
+	waitForStreamLifecycleSignal(t, intermediaryRemoval, "relay stream did not leave its indexes after Network-only policy")
+	AssertEqual(t, false, streamManager.IsStreamOpen(publicStreamId))
+	AssertEqual(t, false, streamManager.IsStreamOpen(intermediaryStreamId))
 	AssertEqual(t, true, streamManager.IsStreamOpen(networkStreamId))
 	AssertEqual(t, true, streamManager.IsStreamOpen(outboundStreamId))
+	AssertEqual(t, true, networkSequence.ctx.Err() == nil)
+	AssertEqual(t, true, outboundSequence.ctx.Err() == nil)
 
 	// A delayed StreamOpen or StreamReset from the old public registration
 	// must not resurrect its P2P admission loop.
 	relistedPublicStreamId := NewId()
 	relistedRelayStreamId := NewId()
-	open(&publicSourceId, nil, relistedPublicStreamId)
-	open(&publicSourceId, &destinationId, relistedRelayStreamId)
+	receiveOpen(&publicSourceId, nil, relistedPublicStreamId)
+	receiveOpen(&publicSourceId, &destinationId, relistedRelayStreamId)
 	AssertEqual(t, false, streamManager.IsStreamOpen(relistedPublicStreamId))
 	AssertEqual(t, false, streamManager.IsStreamOpen(relistedRelayStreamId))
 	streamManager.Receive(
@@ -269,24 +281,39 @@ func TestStreamManagerProvidePolicyRetiresStaleInboundStreams(t *testing.T) {
 	AssertEqual(t, false, streamManager.IsStreamOpen(relistedRelayStreamId))
 	AssertEqual(t, true, streamManager.IsStreamOpen(networkStreamId))
 	AssertEqual(t, true, streamManager.IsStreamOpen(outboundStreamId))
+	AssertEqual(t, true, networkSequence.ctx.Err() == nil)
+	AssertEqual(t, true, outboundSequence.ctx.Err() == nil)
 
 	// Pause has the same public/FF suppression while retaining Network.
 	client.ContractManager().SetProvideModes(map[protocol.ProvideMode]bool{
 		protocol.ProvideMode_Public:  true,
 		protocol.ProvideMode_Network: true,
 	})
-	open(&publicSourceId, nil, publicStreamId)
+	publicPublication = openAndHold(&publicSourceId, nil, publicStreamId)
 	AssertEqual(t, true, streamManager.IsStreamOpen(publicStreamId))
+	pausedPublicSequence := streamLifecycleSequence(client, publicStreamId)
+	pausedPublicRemoval := openTracker.expectRemoval(publicStreamId)
 	client.ContractManager().SetProvidePaused(true)
-	AssertEqual(t, true, eventuallyClosed(publicStreamId))
+	AssertEqual(t, true, pausedPublicSequence.ctx.Err() != nil)
+	publicPublication.resume()
+	waitForStreamLifecycleSignal(t, pausedPublicRemoval, "paused public stream did not leave its indexes")
+	AssertEqual(t, false, streamManager.IsStreamOpen(publicStreamId))
 	AssertEqual(t, true, streamManager.IsStreamOpen(networkStreamId))
 
 	// No provider modes ("never") retires every provider-owned direction,
 	// including a companion/return stream on which this client is source.
 	client.ContractManager().SetProvidePaused(false)
+	networkRemoval := openTracker.expectRemoval(networkStreamId)
+	outboundRemoval := openTracker.expectRemoval(outboundStreamId)
 	client.ContractManager().SetProvideModes(map[protocol.ProvideMode]bool{})
-	AssertEqual(t, true, eventuallyClosed(networkStreamId))
-	AssertEqual(t, true, eventuallyClosed(outboundStreamId))
+	AssertEqual(t, true, networkSequence.ctx.Err() != nil)
+	AssertEqual(t, true, outboundSequence.ctx.Err() != nil)
+	networkPublication.resume()
+	outboundPublication.resume()
+	waitForStreamLifecycleSignal(t, networkRemoval, "disabled network stream did not leave its indexes")
+	waitForStreamLifecycleSignal(t, outboundRemoval, "disabled outbound stream did not leave its indexes")
+	AssertEqual(t, false, streamManager.IsStreamOpen(networkStreamId))
+	AssertEqual(t, false, streamManager.IsStreamOpen(outboundStreamId))
 }
 
 // TestStreamManagerNetworkPeerBatchOrderingAndDisconnectRetirement covers the
@@ -302,6 +329,7 @@ func TestStreamManagerNetworkPeerBatchOrderingAndDisconnectRetirement(t *testing
 	settings.ProviderStreamPolicy = true
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Close()
+	openTracker := newStreamOpenTestTracker(client.streamManager.streamBuffer)
 	client.ContractManager().SetProvideModes(map[protocol.ProvideMode]bool{
 		protocol.ProvideMode_Network: true,
 	})
@@ -314,6 +342,7 @@ func TestStreamManagerNetworkPeerBatchOrderingAndDisconnectRetirement(t *testing
 
 	peerId := NewId()
 	streamId := NewId()
+	publication := openTracker.expectPublication(streamId)
 	client.receive(
 		SourceId(ControlId),
 		[]*protocol.Frame{
@@ -333,11 +362,14 @@ func TestStreamManagerNetworkPeerBatchOrderingAndDisconnectRetirement(t *testing
 		},
 		Peer{},
 	)
+	publication.wait(t)
 	if !client.streamManager.IsStreamOpen(streamId) {
 		t.Fatal("same-batch Network stream was rejected before peer state became visible")
 	}
+	sequence := streamLifecycleSequence(client, streamId)
 
 	disconnectTime := uint64(time.Now().UnixMilli())
+	removal := openTracker.expectRemoval(streamId)
 	client.receive(
 		SourceId(ControlId),
 		[]*protocol.Frame{mustFrame(&protocol.NetworkPeersUpdate{
@@ -348,10 +380,11 @@ func TestStreamManagerNetworkPeerBatchOrderingAndDisconnectRetirement(t *testing
 		})},
 		Peer{},
 	)
-	deadline := time.Now().Add(5 * time.Second)
-	for client.streamManager.IsStreamOpen(streamId) && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	if sequence == nil || sequence.ctx.Err() == nil {
+		t.Fatal("disconnected Network peer did not cancel its provider stream")
 	}
+	publication.resume()
+	waitForStreamLifecycleSignal(t, removal, "disconnected Network stream did not leave its indexes")
 	if client.streamManager.IsStreamOpen(streamId) {
 		t.Fatal("disconnected Network peer retained stale provider stream")
 	}
@@ -369,6 +402,7 @@ func TestStreamManagerPublicProviderRetiresKnownDisconnectedPeer(t *testing.T) {
 	settings.WebRtcSettings.MemoryBudget = NewTransferMemoryBudget(0)
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Close()
+	openTracker := newStreamOpenTestTracker(client.streamManager.streamBuffer)
 	client.ContractManager().SetProvideModes(map[protocol.ProvideMode]bool{
 		protocol.ProvideMode_Network: true,
 		protocol.ProvideMode_Public:  true,
@@ -383,6 +417,7 @@ func TestStreamManagerPublicProviderRetiresKnownDisconnectedPeer(t *testing.T) {
 	}
 	peerId := NewId()
 	streamId := NewId()
+	publication := openTracker.expectPublication(streamId)
 	client.receive(
 		SourceId(ControlId),
 		[]*protocol.Frame{
@@ -399,11 +434,14 @@ func TestStreamManagerPublicProviderRetiresKnownDisconnectedPeer(t *testing.T) {
 		},
 		Peer{},
 	)
+	publication.wait(t)
 	if !client.streamManager.IsStreamOpen(streamId) {
 		t.Fatal("connected peer stream did not open on public-capable provider")
 	}
+	sequence := streamLifecycleSequence(client, streamId)
 
 	disconnectTime := uint64(time.Now().UnixMilli())
+	removal := openTracker.expectRemoval(streamId)
 	client.receive(
 		SourceId(ControlId),
 		[]*protocol.Frame{mustFrame(&protocol.NetworkPeersUpdate{
@@ -414,10 +452,11 @@ func TestStreamManagerPublicProviderRetiresKnownDisconnectedPeer(t *testing.T) {
 		})},
 		Peer{},
 	)
-	deadline := time.Now().Add(time.Second)
-	for client.streamManager.IsStreamOpen(streamId) && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	if sequence == nil || sequence.ctx.Err() == nil {
+		t.Fatal("public provide policy did not cancel a known disconnected peer stream")
 	}
+	publication.resume()
+	waitForStreamLifecycleSignal(t, removal, "disconnected public-provider stream did not leave its indexes")
 	if client.streamManager.IsStreamOpen(streamId) {
 		t.Fatal("public provide policy retained a known disconnected peer stream")
 	}
@@ -439,6 +478,7 @@ func TestStreamManagerPublicProviderRetiresKnownDisconnectedPeer(t *testing.T) {
 	// blanket requirement that every public client appear in NetworkPeers.
 	publicPeerId := NewId()
 	publicStreamId := NewId()
+	publicPublication := openTracker.expectPublication(publicStreamId)
 	client.receive(
 		SourceId(ControlId),
 		[]*protocol.Frame{mustFrame(&protocol.StreamOpen{
@@ -447,11 +487,14 @@ func TestStreamManagerPublicProviderRetiresKnownDisconnectedPeer(t *testing.T) {
 		})},
 		Peer{},
 	)
+	publicPublication.wait(t)
 	if !client.streamManager.IsStreamOpen(publicStreamId) {
 		t.Fatal("public provider rejected an identity absent from NetworkPeers")
 	}
+	publicPublication.resume()
 
 	// A real reconnect clears the marker before a same-batch stream relist.
+	reconnectPublication := openTracker.expectPublication(streamId)
 	client.receive(
 		SourceId(ControlId),
 		[]*protocol.Frame{
@@ -468,9 +511,11 @@ func TestStreamManagerPublicProviderRetiresKnownDisconnectedPeer(t *testing.T) {
 		},
 		Peer{},
 	)
+	reconnectPublication.wait(t)
 	if !client.streamManager.IsStreamOpen(streamId) {
 		t.Fatal("peer reconnect did not permit a fresh stream generation")
 	}
+	reconnectPublication.resume()
 }
 
 // TestStreamManagerOrdinaryClientKeepsTransportDirectionsWithoutProviderMode
@@ -484,6 +529,7 @@ func TestStreamManagerOrdinaryClientKeepsTransportDirectionsWithoutProviderMode(
 
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
 	defer client.Close()
+	openTracker := newStreamOpenTestTracker(client.streamManager.streamBuffer)
 
 	sourceId := NewId()
 	destinationId := NewId()
@@ -493,10 +539,14 @@ func TestStreamManagerOrdinaryClientKeepsTransportDirectionsWithoutProviderMode(
 		{DestinationId: destinationId.Bytes(), StreamId: streamIds[1].Bytes()},
 		{SourceId: sourceId.Bytes(), DestinationId: destinationId.Bytes(), StreamId: streamIds[2].Bytes()},
 	}
-	for _, message := range opens {
+	publications := make([]*streamOpenTestPublication, 0, len(opens))
+	for index, message := range opens {
+		publication := openTracker.expectPublication(streamIds[index])
 		frame, err := ToFrame(message, DefaultProtocolVersion)
 		AssertEqual(t, err, nil)
 		client.streamManager.Receive(SourceId(ControlId), []*protocol.Frame{frame}, Peer{})
+		publication.wait(t)
+		publications = append(publications, publication)
 	}
 	for _, streamId := range streamIds {
 		AssertEqual(t, true, client.streamManager.IsStreamOpen(streamId))
@@ -505,6 +555,11 @@ func TestStreamManagerOrdinaryClientKeepsTransportDirectionsWithoutProviderMode(
 	client.ContractManager().SetProvideModes(map[protocol.ProvideMode]bool{})
 	for _, streamId := range streamIds {
 		AssertEqual(t, true, client.streamManager.IsStreamOpen(streamId))
+		sequence := streamLifecycleSequence(client, streamId)
+		AssertEqual(t, true, sequence != nil && sequence.ctx.Err() == nil)
+	}
+	for _, publication := range publications {
+		publication.resume()
 	}
 }
 
@@ -520,6 +575,7 @@ func TestStreamManagerResetSkipsBadEntries(t *testing.T) {
 	defer client.Close()
 
 	streamManager := client.streamManager
+	openTracker := newStreamOpenTestTracker(streamManager.streamBuffer)
 
 	destinationId := NewId()
 	streamIdA := NewId()
@@ -549,9 +605,15 @@ func TestStreamManagerResetSkipsBadEntries(t *testing.T) {
 		},
 	}, DefaultProtocolVersion)
 	AssertEqual(t, err, nil)
+	publicationA := openTracker.expectPublication(streamIdA)
+	publicationB := openTracker.expectPublication(streamIdB)
 	streamManager.Receive(SourceId(ControlId), []*protocol.Frame{frame}, Peer{})
+	publicationA.wait(t)
+	publicationB.wait(t)
 
 	// both valid streams opened despite the malformed entries around them
 	AssertEqual(t, true, streamManager.IsStreamOpen(streamIdA))
 	AssertEqual(t, true, streamManager.IsStreamOpen(streamIdB))
+	publicationA.resume()
+	publicationB.resume()
 }

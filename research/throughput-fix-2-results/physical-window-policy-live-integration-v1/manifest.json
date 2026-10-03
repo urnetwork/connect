@@ -1,0 +1,11 @@
+{
+  "archive": "physical-window-policy-live-integration-v1",
+  "payload_sha256": {
+    "outcomes.jsonl": "463327b74a2f49b3660b126a7eb51a7c18e5b837a4d2e77adffafd57418a5e0c",
+    "provenance.json": "3bddeabceffe6c8f5ec6bd871d43828186c1e8eee7fecf52cc3592af83f3bb19",
+    "source-manifest-combined-count1.json": "eef0dea0602b3cae607b14ff7509ba5df69a2fe912e1ba840d7f37e36eb56f2f",
+    "source-manifest-policy-count3.json": "0f09bc342d65d00b24b5ee84707d8d7d35697741b4c565fdebc2e652597dad16",
+    "source-pins.json": "9f577ca67e563531a890cab1cb462eb62cc1488724a082cdb31a758965060e38",
+    "status.json": "58da1bc49512aae1b5712f69ed893876b323fee4786f2a91741cc1a1eda5867c"
+  }
+}

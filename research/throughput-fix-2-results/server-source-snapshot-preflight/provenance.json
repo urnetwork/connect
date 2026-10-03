@@ -1,0 +1,22 @@
+{
+  "schema": "throughput-fix-2/server-source-snapshot-preflight-v1",
+  "attempts": [
+    {
+      "mode": "server-connect-deterministic",
+      "outcome": "blocked-before-snapshot",
+      "exit_code": 1
+    },
+    {
+      "mode": "server-proxy",
+      "outcome": "blocked-before-snapshot",
+      "exit_code": 1
+    }
+  ],
+  "blocker": "The server test-environment bootstrap did not find its required local launcher readiness attestation.",
+  "runner_sha256": "0b80e99a5825869e5f1d4bb6c3618575184a7ab581528f679ebd717a7fabb507",
+  "source_snapshot_created": false,
+  "binary_created": false,
+  "external_action": "No server, SDK, or sibling-workspace process or file was modified.",
+  "scope_limit": "This is a bootstrap preflight result, not a server test result. DB-backed integrations remain deferred.",
+  "redaction": "The terminal diagnostic is represented only by its outcome and blocker category; local paths, raw commands, and raw output are excluded."
+}

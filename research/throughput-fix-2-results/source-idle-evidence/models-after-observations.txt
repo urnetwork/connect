@@ -1,0 +1,26 @@
+    transfer_window_pacing_capacity_test.go:90: capacity recovery after change=13s reference-10-to-14s=9.961472 candidate-10-to-14s=10.092544 intervals=[2.097152 2.097152 2.62144 3.145728 3.145728 3.670016 4.194304 6.291456 9.961472 8.912896 9.961472 10.48576 9.961472 9.961472 8.912896 9.961472 9.961472 9.961472 9.961472 8.912896]
+    transfer_window_pacing_long_test.go:29: long compressed feedback reference=95.846 candidate=95.857 minimum=11.981 drops=0 queue=1346/3593876
+    transfer_window_pacing_long_test.go:59: repeated drains payload=16384 wake=0s reference=993.624 candidate=992.816 intervals=[993.656832 993.656832 993.656832 993.52576 986.185728 993.656832 993.656832 993.52576 993.656832 991.297536 993.656832 993.656832]
+    transfer_window_pacing_long_test.go:59: repeated drains payload=16384 wake=1ms reference=993.624 candidate=992.903 intervals=[993.656832 993.656832 993.656832 993.656832 989.5936 993.656832 993.656832 993.656832 993.52576 988.807168 993.656832 993.656832]
+    transfer_window_pacing_long_test.go:59: repeated drains payload=16384 wake=3ms reference=993.624 candidate=992.838 intervals=[993.656832 993.52576 993.656832 993.656832 989.069312 993.52576 993.656832 993.656832 993.656832 988.807168 993.52576 993.656832]
+    transfer_window_pacing_long_test.go:59: repeated drains payload=65536 wake=0s reference=998.419 candidate=997.982 intervals=[998.244352 998.244352 998.76864 998.244352 998.244352 998.244352 998.244352 998.76864 998.244352 994.050048 998.244352 998.244352]
+    transfer_window_pacing_long_test.go:59: repeated drains payload=65536 wake=1ms reference=998.419 candidate=997.502 intervals=[998.244352 998.244352 998.76864 998.244352 997.195776 998.244352 998.244352 998.76864 998.244352 989.331456 998.244352 998.244352]
+    transfer_window_pacing_long_test.go:59: repeated drains payload=65536 wake=3ms reference=998.419 candidate=997.414 intervals=[998.244352 998.244352 998.76864 998.244352 994.050048 998.244352 998.244352 998.76864 998.244352 991.428608 998.244352 998.244352]
+    transfer_window_service_performance_test.go:197: case: rate=1250000-to-12500000/compression=0s
+    transfer_window_service_performance_test.go:214: capacity 1250000->12500000 compression=0s ceiling=95.826 fixed=95.805 min-flow=11.971 model Mb/s drops=0 queue=738/1971130
+    transfer_window_service_performance_test.go:197: case: rate=1250000-to-12500000/compression=10ms
+    transfer_window_service_performance_test.go:214: capacity 1250000->12500000 compression=10ms ceiling=95.826 fixed=95.805 min-flow=11.971 model Mb/s drops=0 queue=1059/2823378
+    transfer_window_service_performance_test.go:197: case: rate=1250000-to-12500000/compression=50ms
+    transfer_window_service_performance_test.go:214: capacity 1250000->12500000 compression=50ms ceiling=95.805 fixed=95.805 min-flow=11.971 model Mb/s drops=0 queue=1636/4369731
+    transfer_window_service_performance_test.go:197: case: rate=12500000-to-1250000/compression=0s
+    transfer_window_service_performance_test.go:214: capacity 12500000->1250000 compression=0s ceiling=9.585 fixed=9.585 min-flow=1.198 model Mb/s drops=0 queue=676/1806272
+    transfer_window_service_performance_test.go:197: case: rate=12500000-to-1250000/compression=10ms
+    transfer_window_service_performance_test.go:214: capacity 12500000->1250000 compression=10ms ceiling=9.585 fixed=9.585 min-flow=1.198 model Mb/s drops=0 queue=956/2552186
+    transfer_window_service_performance_test.go:197: case: rate=12500000-to-1250000/compression=50ms
+    transfer_window_service_performance_test.go:214: capacity 12500000->1250000 compression=50ms ceiling=9.585 fixed=9.585 min-flow=1.198 model Mb/s drops=0 queue=1398/3734058
+    transfer_window_service_performance_test.go:261: case: rate=125000
+    transfer_window_service_performance_test.go:278: shared service=125000 ceiling=0.952 fixed=0.963 min-flow=0.118 model Mb/s drops=0 queue=1233/3261776
+    transfer_window_service_performance_test.go:261: case: rate=12500000
+    transfer_window_service_performance_test.go:278: shared service=12500000 ceiling=95.606 fixed=95.754 min-flow=11.853 model Mb/s drops=0 queue=634/1684351
+    transfer_window_service_performance_test.go:261: case: rate=125000000
+    transfer_window_service_performance_test.go:278: shared service=125000000 ceiling=957.368 fixed=957.266 min-flow=119.178 model Mb/s drops=0 queue=1508/4023144

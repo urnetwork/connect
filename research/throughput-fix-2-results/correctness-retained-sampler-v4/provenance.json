@@ -1,0 +1,39 @@
+{
+  "binary_sha256": "f4392af59bc8b60b9d1aaad2b6c64aa120799062da5000d904bc417254eb4a14",
+  "branch": "throughput-fix-2",
+  "build_flags": [
+    "-race"
+  ],
+  "connect_source_sha256": "a02246e3d7a4d857982fbf7fb5ddd34576adbf8be9ae8df540a221a33153e726",
+  "exclusions": "No completed root was excluded; the new phase test was complete when the source snapshot was made.",
+  "failures": [
+    "TestWindowRetainedSteadyPathPreservesOccupancyBand",
+    "TestWindowPacingLimitedFlightAckPhaseDoesNotCompleteService"
+  ],
+  "host_load_at_finish": [
+    15.4462890625,
+    13.04150390625,
+    13.205078125
+  ],
+  "host_load_at_start": [
+    13.47412109375,
+    11.9794921875,
+    12.849609375
+  ],
+  "no_quiescence_wait": true,
+  "raw_input_sha256": {
+    "ledger.jsonl": "78985e16b3feb9feeb8425871f9795a1b407274086f70b7ec569e6bab46fc7e0",
+    "manifest.json": "f2ff68f63197beed5654e9786b8854b9309a4e16b50a632505d2513f1d37bf22",
+    "run.log": "2f5882a0b49c95b1d24b4a8c45a9b2674fd4b258c430fb3542cb6ab13b217b2f",
+    "snapshot-inputs.json": "f6c0d5ebf898b3e0120f890880c6fe82a8e847f435873ef54995737371e4bfd4",
+    "status.json": "0d041e615d837e489b68506040410ad8a3f0613664ac4833486cc3787777f7e3"
+  },
+  "runner_sha256": "3572a310533934eb889f1a8ce051a59112580c3c68d211e5a1d3e5c7d38cf05c",
+  "scope": "This is the normal correctness harness under race, not a full root regression or full throughput model. External local glog replacement and host dependencies remain live as declared by the runner.",
+  "snapshot_input_sha256": "e429d3aed6dd592179924ab230ac3f2ddecf9e8093bd13388a7f49cd1575704c",
+  "source_boundary": "Accepted retained sizing, cumulative carrier scope, writer synchronization, sampler qualification/gap/queue-epoch corrections. Includes completed new ACK-phase root without its later production correction. No network-quality events or cold SDK candidate.",
+  "source_file_count": 895,
+  "source_files_match_at_archive": true,
+  "source_revision": "f903f59a96e629f8b1dfa5849d7a3198aaef9920",
+  "test_pattern": "^(TestAckCompression.*|TestAckResponses.*|TestAckOverflow.*|TestAckWorkerBounds.*|TestEvictionAcknowledgementsFitEveryCarrier|TestGapWake.*|TestSequenceAckWindow.*|TestWindow(TargetIncludes|DeliveryIncludes|DeliveryLargeResidence|DeliveryContractLead).*|TestDeliveryRate.*|TestResendCapacityRelease.*|TestTcpReturn.*|TestTcpSequenceCancelBeforeWritePublication.*|TestTunAckHandoff.*|TestWindow(BurstPacing|Pacing|Mismatch).*|TestWindowPathGapDeadline|TestTheWindowHasOneOwner|TestLandingStructs.*|TestDecodedTransferFramePoolRetainedSizeStaysSmall|TestFamilyStandbyTracks.*)$|^TestWindowPerformance.*$|^TestWindowBucketStats.*$|^TestALegacyAcknowledgementCannotOverwriteAnAdvertisement$|^TestRelayInflationUsesConstantSendWindow$|^TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget$|^TestWindowTcp(SocketBatch|CanceledBatch|WorkloadCancel).*$|^TestTun(DuplexDataHandoffDoesNotCycleThroughAdmission|FiniteTcpTailProgressesAfterEndpointOwnerReleases)$|^TestReceiveSequenceBurstTail.*$|^Test(AckReceiverDelay|ReceiverAckTiming|SenderReceiverTiming|RttReceiverTiming).*$|^Test(SilentLaneLongerThanTheProbeCadenceStillDrains|SingleReliableLaneQueueInflatedRttDoesNotStorm)$|^TestWindowRetained.*$|^Test(AdvertisementRaisesPermissionWithoutLearningCapacity|DeliveryCandidatesRequireFreshPermissionHistory|AClampedWindowReportsTheMemoryShare|ALearnedWindowSurvivesTheMemoryClamp|DeliveryGrowthRemainsBelowTheSmallMemoryShare|AConfiguredCeilingDoesNotReportTheMemoryShare|TheThreePeerBranchesHaveDifferentPermissionCeilings)$|^TestWindowDestinationStats.*$|^TestWindowStats.*$"
+}

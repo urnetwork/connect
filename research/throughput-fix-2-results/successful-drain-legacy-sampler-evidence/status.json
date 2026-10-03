@@ -1,0 +1,12 @@
+{
+  "accepted_performance_result": false,
+  "excluded_fixture_precondition_fail": 18,
+  "excluded_fixture_precondition_outcomes": 18,
+  "production_fix_claimed": false,
+  "race_blocks_all": 0,
+  "status": "legacy sampler root remains open",
+  "valid_legacy_fail": 6,
+  "valid_legacy_numerical_readings": 18,
+  "valid_legacy_outcomes": 18,
+  "valid_legacy_pass": 12
+}

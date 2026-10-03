@@ -1,0 +1,9 @@
+{
+  "archive": "lifetime-owner-evolution",
+  "payload_sha256": {
+    "outcomes.jsonl": "fae26ac83ed08901cbe3de7ad0203f30ec8a16a4e392cf585c3ac83edf1d989b",
+    "provenance.json": "92aebd73b1ed37e2e1d4feebeec41102efd761b7809cd9b3777df538c84b16dd",
+    "source-pins.json": "8f3659db58f2d494639443511d67b6cef96a662dff4c2858c371c6e601e09ca4",
+    "status.json": "171b17c2e51fef5b4a4038ddbdd1d46278ed25d60399b791365794176ef64619"
+  }
+}

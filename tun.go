@@ -3,8 +3,15 @@ package connect
 // a userspace tun device backed by the gvisor network stack.
 // `Tun` exposes a packet interface on one side (`Read`/`Write`) and
 // socket interfaces on the other (`DialContext`, `ListenTCP`, `ListenUDP`).
-// all tun instances share a single gvisor stack, with one nic and one
-// link-local ipv4 address per instance.
+// each tun instance owns a private gvisor stack with one nic, one link-local
+// ipv4 address and, when the link mtu admits it, one ula ipv6 address.
+//
+// Dual stack (IPV6.md C1): the stack carries both families with a default
+// route for each, so a tun can originate and accept v6 flows exactly like v4.
+// gVisor refuses to emit IPv6 on a link narrower than the protocol's minimum
+// MTU (1280, RFC 8200 §5), so a tun whose settings.Mtu is below
+// tunIpv6MinimumMtu keeps IPv4 only: no v6 address, no v6 route, and v6 dials
+// and writes fail with EAFNOSUPPORT as they always did. See Ipv6Enabled.
 
 import (
 	// "bytes"
@@ -19,13 +26,14 @@ import (
 	// "regexp"
 	mathrand "math/rand"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	// "github.com/google/gopacket"
-	// "github.com/google/gopacket/layers"
+	// "github.com/gopacket/gopacket"
+	// "github.com/gopacket/gopacket/layers"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -44,6 +52,60 @@ import (
 
 // const DefaultChannelSize = 64
 
+// The divisor of the process memory budget that gives one of the tun's gVisor
+// TCP buffer maxima. One eighth: 8 MiB at the 64 MiB reference, 32 MiB at 256.
+//
+// THROUGHPUTFIX §43.1, the `tun reservation` row of §44.1's share table, and
+// the third ceiling of §39.2. The receive maximum and the send maximum each
+// draw the share rather than splitting one, because they bind opposite
+// directions: receive is the download binder, reached by gVisor's receive
+// moderation, and send is the upload binder together with the inner
+// acknowledgement clock.
+const tunBudgetShareDivisor = 8
+
+// tunBudgetShareByteCount is the largest a single gVisor TCP receive or send
+// buffer under this tun may auto-tune to: a draw on the process memory budget,
+// proportional to it.
+//
+// It must never be a `MemoryScaledByteCount`, and that distinction is the
+// whole finding rather than a detail of style. That helper's scale returns one
+// at or above the 64 MiB reference and a fraction below, so it can only shrink
+// its argument: every constant written in the local idiom was sized for a
+// reference host, and a provider with eight gigabytes ran a 64 MiB device's
+// buffers. Raising the budget bought nothing here. Since the adjacent lines in
+// this file all scale a constant, copying one is the natural way to write this
+// and `TestTheTunsMaximaAreADrawOnTheBudget` is what holds it: substitute the
+// idiom and it fails at the first budget step above the reference.
+//
+// Whose ceiling this is, because it bounds what the change can reach. Only a
+// client whose inner TCP stack is this tree's gVisor: the hosted, simulated
+// and probe modes. A shipped native desktop, phone or extension creates no
+// gVisor tun at all — its OS tun hands packets to `DeviceLocal.SendPacket` —
+// so the equivalent ceiling there is the operating system's own autotuning
+// maximum, which is the same order (about 4 MiB on macOS, 6 on Linux and
+// Android, up to 16 on Windows) and is not this tree's to set.
+//
+// The floor is this buffer's own working minimum, deliberately not the 4 MiB
+// of §43.1's first form. A floor there is an admission floor rather than a
+// buffer floor, and taking a fraction of a floored reservation inflates small
+// hosts: at an 8 MiB budget it would ask 4 MiB of each maximum, 8 MiB of the
+// two beside the transport total's 3 MiB floor, against the whole budget
+// (§44.2's third constraint). Keeping today's floor makes the draw
+// bit-identical to today's value at every budget where the floor binds, and
+// never below it at any budget.
+//
+// A zero budget is the absence of the surface rather than a small share: an
+// unbudgeted process keeps today's constant, because falling to the floor here
+// would make every unbudgeted host eight times slower at this layer the moment
+// the rule was turned on.
+func tunBudgetShareByteCount() ByteCount {
+	budget := MemoryBudget()
+	if budget <= 0 {
+		return mib(4)
+	}
+	return max(kib(512), budget/tunBudgetShareDivisor)
+}
+
 func DefaultTunSettings() *TunSettings {
 	return DefaultTunSettingsWithBufferSize(1024)
 }
@@ -51,10 +113,16 @@ func DefaultTunSettings() *TunSettings {
 func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 	return &TunSettings{
 		ChannelSize: bufferSize,
-		// must match `DefaultMtu`. packets are written directly into the
-		// receiver tap/tun interface, so this must not exceed the device
-		// interface mtu.
-		Mtu: 1440,
+		// Far above a healthy drain interval (the reader empties a full
+		// queue in milliseconds), so ordinary bulk transfer still sees
+		// backpressure rather than drops.
+		OutboundQueueWaitTimeout: 250 * time.Millisecond,
+		// the link mtu, matching the native tunnel interfaces
+		// (`DefaultTunnelMtu`). Packets written into the tun are at most
+		// `DefaultMtu`, which is below this by design. IPv6 needs at least
+		// tunIpv6MinimumMtu here; below that the tun is IPv4 only (see the
+		// file comment).
+		Mtu: DefaultTunnelMtu,
 
 		DialRace:          2,
 		DialRaceTimeout:   2 * time.Second,
@@ -71,7 +139,10 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// tcp buffer auto-tuning ranges for the server/proxy data plane (the shared
 		// stack). Max applies per connection, so it caps per-connection memory; a
 		// memory-constrained IpMux on a private stack shrinks these much further.
-		// default and max are per connection, so scaled by the memory budget.
+		// Default is per connection and scaled by the memory budget; Max is per
+		// connection and a draw on it (`tunBudgetShareByteCount`), so a larger
+		// budget raises the ceiling a single stream can auto-tune to instead of
+		// leaving every host at a 64 MiB device's 4 MiB.
 		// The tunnel path's effective ack rtt runs orders of magnitude above
 		// loopback (userspace relay hops + ack coalescing), so the throughput
 		// of a single stream is window/rtt-bound: the former 256KiB default
@@ -81,12 +152,12 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		TcpReceiveBuffer: TcpBufferRange{
 			Min:     4 * 1024,
 			Default: int(MemoryScaledByteCount(mib(1), kib(128))),
-			Max:     int(MemoryScaledByteCount(mib(4), kib(512))),
+			Max:     int(tunBudgetShareByteCount()),
 		},
 		TcpSendBuffer: TcpBufferRange{
 			Min:     4 * 1024,
 			Default: int(MemoryScaledByteCount(mib(1), kib(128))),
-			Max:     int(MemoryScaledByteCount(mib(4), kib(512))),
+			Max:     int(tunBudgetShareByteCount()),
 		},
 
 		// cap rto backoff well below the gvisor default (120s). The path under
@@ -110,6 +181,12 @@ type TunSettings struct {
 
 	ChannelSize int
 	Mtu         int
+	// OutboundQueueWaitTimeout bounds how long netstack waits for space in
+	// the outbound (tun read) queue before dropping the rest of a write. The
+	// queue's consumer can be inside an inbound injection itself (SendPacket
+	// -> receive callback -> Tun.Write -> gVisor reply), which would otherwise
+	// deadlock the whole stack. Non-positive waits without bound.
+	OutboundQueueWaitTimeout time.Duration
 
 	DialRace        int
 	DialRaceTimeout time.Duration
@@ -139,6 +216,12 @@ type TunSettings struct {
 	// (the default cap is 120s). See DefaultTunSettings for why the tun uses
 	// a small cap.
 	TcpMaxRto time.Duration
+	// TcpMinRto, when positive, sets the floor of the gVisor TCP
+	// retransmission timeout (the stack default is 200ms). The floor bounds
+	// the peer's acknowledgement compression from above: an acknowledgement
+	// held longer than a sender's floor is a spurious retransmission
+	// (THROUGHPUTFIX §22). Zero leaves the stack default.
+	TcpMinRto time.Duration
 
 	// TcpGro enables generic receive offload for Tun.WriteBatch: the tcp
 	// packets of one batch coalesce into super-segments before delivery,
@@ -154,10 +237,34 @@ type TcpBufferRange struct {
 	Max     int
 }
 
-func newTunStack(tcpReceive TcpBufferRange, tcpSend TcpBufferRange, tcpMaxRto time.Duration) *stack.Stack {
+// tunIpv6MinimumMtu is the smallest link mtu on which gVisor will emit IPv6
+// (header.IPv6MinimumMTU, 1280). A tun below it is IPv4 only.
+const tunIpv6MinimumMtu = int(header.IPv6MinimumMTU)
+
+func newTunStack(
+	tcpReceive TcpBufferRange,
+	tcpSend TcpBufferRange,
+	tcpMaxRto time.Duration,
+	tcpMinRto time.Duration,
+) *stack.Stack {
 	opts := stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocolWithOptions(ipv4.Options{AllowExternalLoopbackTraffic: true})},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4},
+		NetworkProtocols: []stack.NetworkProtocolFactory{
+			ipv4.NewProtocolWithOptions(ipv4.Options{AllowExternalLoopbackTraffic: true}),
+			// the tun is a point-to-point link into the tunnel: there is no
+			// router to solicit and no neighbor to detect a duplicate
+			// address against, and every such probe would otherwise leave
+			// through the tunnel as user traffic (and hold the address
+			// tentative, failing dials, until it timed out)
+			ipv6.NewProtocolWithOptions(ipv6.Options{
+				NDPConfigs: ipv6.NDPConfigurations{
+					MaxRtrSolicitations: 0,
+					HandleRAs:           ipv6.HandlingRAsDisabled,
+				},
+				DADConfigs:                   stack.DADConfigurations{DupAddrDetectTransmits: 0},
+				AllowExternalLoopbackTraffic: true,
+			}),
+		},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
 		HandleLocal:        true,
 	}
 	s := stack.New(opts)
@@ -185,6 +292,10 @@ func newTunStack(tcpReceive TcpBufferRange, tcpSend TcpBufferRange, tcpMaxRto ti
 	}
 	if 0 < tcpMaxRto {
 		opt := tcpip.TCPMaxRTOOption(tcpMaxRto)
+		s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)
+	}
+	if 0 < tcpMinRto {
+		opt := tcpip.TCPMinRTOOption(tcpMinRto)
 		s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)
 	}
 
@@ -270,6 +381,89 @@ var defaultLocalIpv4AddressAllocator = sync.OnceValue(func() *LocalIpv4AddressAl
 		128,
 	)
 })
+
+// LocalIpv6Prefix is the one fixed unique-local /64 (RFC 4193) every tun and
+// native tunnel address in this process lives in: fd75:726e:6574::/64, the
+// hex of "urnet" under fd00::/8. A fixed prefix is the v6 counterpart of the
+// 169.254.0.0/16 pool: nothing on a real network routes it, and both ends of
+// a tunnel can recognize it as tunnel-internal.
+var LocalIpv6Prefix = netip.MustParsePrefix("fd75:726e:6574::/64")
+
+// localIpv6AllocatorPrefix is the low /96 of LocalIpv6Prefix that the tun
+// allocator hands out sequentially. A /96 keeps the address iterator's count
+// inside an int (a /64 has 2^64 hosts, which overflows it to zero).
+var localIpv6AllocatorPrefix = netip.MustParsePrefix("fd75:726e:6574::/96")
+
+// LocalIpv6AddressAllocator is the v6 counterpart of LocalIpv4AddressAllocator:
+// process-unique tun addresses from localIpv6AllocatorPrefix with a bounded
+// free list. Safe for concurrent use.
+type LocalIpv6AddressAllocator struct {
+	stateLock   sync.Mutex
+	generator   *AddrGenerator
+	freeList    []netip.Addr
+	maxFreeList int
+}
+
+func NewLocalIpv6AddressAllocator(prefix netip.Prefix, maxFreeList int) *LocalIpv6AddressAllocator {
+	return &LocalIpv6AddressAllocator{
+		generator:   NewAddrGenerator(prefix),
+		maxFreeList: maxFreeList,
+	}
+}
+
+func (self *LocalIpv6AddressAllocator) TakeAddr() (netip.Addr, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if n := len(self.freeList); n > 0 {
+		addr := self.freeList[n-1]
+		self.freeList = self.freeList[:n-1]
+		return addr, true
+	}
+	return self.generator.Next()
+}
+
+func (self *LocalIpv6AddressAllocator) ReturnAddr(addr netip.Addr) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if len(self.freeList) >= self.maxFreeList {
+		return
+	}
+	self.freeList = append(self.freeList, addr)
+}
+
+// defaultLocalIpv6AddressAllocator is lazy for the same reason as the v4 one.
+var defaultLocalIpv6AddressAllocator = sync.OnceValue(func() *LocalIpv6AddressAllocator {
+	return NewLocalIpv6AddressAllocator(localIpv6AllocatorPrefix, 128)
+})
+
+// TakeLocalIpv6Address reserves a process-unique local IPv6 address from the
+// tun pool inside LocalIpv6Prefix. Return it with ReturnLocalIpv6Address when
+// the address is no longer in use.
+func TakeLocalIpv6Address() (netip.Addr, bool) {
+	return defaultLocalIpv6AddressAllocator().TakeAddr()
+}
+
+// ReturnLocalIpv6Address returns an address previously taken with
+// TakeLocalIpv6Address to the pool's free list.
+func ReturnLocalIpv6Address(addr netip.Addr) {
+	defaultLocalIpv6AddressAllocator().ReturnAddr(addr)
+}
+
+// RandomLocalIpv6 returns a native tunnel address in LocalIpv6Prefix with a
+// random 64-bit interface identifier outside the tun allocator's /96, the v6
+// counterpart of RandomLocalIpv4. A unique-local address never overlaps a
+// real network the way a 10/8 lease can, so there is nothing to avoid.
+func RandomLocalIpv6() netip.Addr {
+	addr := LocalIpv6Prefix.Masked().Addr().As16()
+	for {
+		mathrand.Read(addr[8:])
+		candidate := netip.AddrFrom16(addr)
+		// keep clear of the subnet anycast address and the tun pool
+		if candidate != LocalIpv6Prefix.Masked().Addr() && !localIpv6AllocatorPrefix.Contains(candidate) {
+			return candidate
+		}
+	}
+}
 
 // TakeLocalIpv4Address reserves a process-unique local IPv4 address from the default
 // 169.254.0.0/16 pool shared by Tun and the SDK tunnel address. Return it with
@@ -360,6 +554,10 @@ type Tun struct {
 	nicIdAllocator            *NicIdAllocator
 	localAddresses            []netip.Addr
 	localIpv4AddressAllocator *LocalIpv4AddressAllocator
+	localIpv6AddressAllocator *LocalIpv6AddressAllocator
+	// ipv6Enabled is whether the stack carries IPv6: a v6 address and default
+	// route exist. False when settings.Mtu is below tunIpv6MinimumMtu.
+	ipv6Enabled bool
 	// mtu                 int
 	// registeredAddresses map[netip.Addr]bool
 	dohResolver atomic.Pointer[DohCache]
@@ -385,15 +583,14 @@ type Tun struct {
 }
 
 const (
-	// Reconcile each producer burst well below gVisor's 100-segment processing
-	// quantum. A processor that meets a syscall-owned endpoint relies on the
-	// subsequent user unlock to requeue it; the transfer shim has no return-path
-	// retransmission with which to recover from a missed handoff.
+	// Yield each producer burst below gVisor's 100-segment processing quantum.
+	// The dispatcher owns endpoint wakeups after injection; no endpoint lock
+	// may be acquired from the reliable receive callback.
 	tunTcpInboundBurstPacketCount = 16
 	tunTcpInboundShardCount       = 32
 )
 
-// tunTcpInboundShard bounds one set of TCP flow handoffs without serializing
+// tunTcpInboundShard bounds one set of TCP producer bursts without serializing
 // unrelated flows. Its fixed arrays make memory independent of flow churn.
 type tunTcpInboundShard struct {
 	writeLock     sync.Mutex
@@ -403,31 +600,76 @@ type tunTcpInboundShard struct {
 }
 
 // tcpInboundFlow parses the endpoint identity and stable shard of a complete,
-// unfragmented IPv4 TCP packet.
+// unfragmented IPv4 or IPv6 TCP packet. A v6 packet whose next header is an
+// extension header is not a flow here: the in-process NAT writes plain
+// headers, so such a packet is not one whose finite-burst ordering this shard
+// machinery exists to protect.
 func tcpInboundFlow(packet []byte) (stack.TransportEndpointID, int, bool) {
-	if len(packet) < header.IPv4MinimumSize || packet[0]>>4 != 4 || packet[9] != uint8(header.TCPProtocolNumber) {
+	if len(packet) < header.IPv4MinimumSize {
 		return stack.TransportEndpointID{}, 0, false
 	}
-	ipHeaderByteCount := int(packet[0]&0x0f) * 4
-	if ipHeaderByteCount < header.IPv4MinimumSize ||
-		len(packet) < ipHeaderByteCount+header.TCPMinimumSize ||
-		binary.BigEndian.Uint16(packet[6:8])&0x1fff != 0 {
+	var transport []byte
+	var endpointId stack.TransportEndpointID
+	var flowHash uint32
+	switch packet[0] >> 4 {
+	case 4:
+		if packet[9] != uint8(header.TCPProtocolNumber) {
+			return stack.TransportEndpointID{}, 0, false
+		}
+		ipHeaderByteCount := int(packet[0]&0x0f) * 4
+		if ipHeaderByteCount < header.IPv4MinimumSize ||
+			len(packet) < ipHeaderByteCount+header.TCPMinimumSize ||
+			binary.BigEndian.Uint16(packet[6:8])&0x1fff != 0 {
+			return stack.TransportEndpointID{}, 0, false
+		}
+		transport = packet[ipHeaderByteCount:]
+		endpointId.LocalAddress = tcpip.AddrFrom4Slice(packet[16:20])
+		endpointId.RemoteAddress = tcpip.AddrFrom4Slice(packet[12:16])
+		flowHash = binary.BigEndian.Uint32(packet[12:16]) ^ binary.BigEndian.Uint32(packet[16:20])
+	case 6:
+		if len(packet) < header.IPv6MinimumSize+header.TCPMinimumSize ||
+			packet[6] != uint8(header.TCPProtocolNumber) {
+			return stack.TransportEndpointID{}, 0, false
+		}
+		transport = packet[header.IPv6MinimumSize:]
+		endpointId.LocalAddress = tcpip.AddrFrom16Slice(packet[24:40])
+		endpointId.RemoteAddress = tcpip.AddrFrom16Slice(packet[8:24])
+		for offset := 8; offset < 40; offset += 4 {
+			flowHash ^= binary.BigEndian.Uint32(packet[offset : offset+4])
+		}
+	default:
 		return stack.TransportEndpointID{}, 0, false
 	}
-	transport := packet[ipHeaderByteCount:]
 	localPort := binary.BigEndian.Uint16(transport[2:4])
 	remotePort := binary.BigEndian.Uint16(transport[0:2])
-	endpointId := stack.TransportEndpointID{
-		LocalPort:     localPort,
-		LocalAddress:  tcpip.AddrFrom4Slice(packet[16:20]),
-		RemotePort:    remotePort,
-		RemoteAddress: tcpip.AddrFrom4Slice(packet[12:16]),
-	}
-	flowHash := uint32(localPort)<<16 | uint32(remotePort)
-	flowHash ^= binary.BigEndian.Uint32(packet[12:16])
-	flowHash ^= binary.BigEndian.Uint32(packet[16:20])
+	endpointId.LocalPort = localPort
+	endpointId.RemotePort = remotePort
+	flowHash ^= uint32(localPort)<<16 | uint32(remotePort)
 	flowHash ^= flowHash >> 16
 	return endpointId, int(flowHash & (tunTcpInboundShardCount - 1)), true
+}
+
+// tcpInboundNetworkProtocol is the network protocol an inbound flow's
+// endpoint was registered under, read off the endpoint id's address width.
+func tcpInboundNetworkProtocol(endpointId stack.TransportEndpointID) tcpip.NetworkProtocolNumber {
+	if endpointId.LocalAddress.Len() == header.IPv6AddressSize {
+		return ipv6.ProtocolNumber
+	}
+	return ipv4.ProtocolNumber
+}
+
+// Called only for a packet validated by tcpInboundFlow. Pure ACKs skip
+// producer-burst accounting and its scheduler yield; injection still publishes
+// them to gVisor through the same ordered path as data-bearing packets.
+func tcpInboundAcknowledgementOnly(packet []byte) bool {
+	offset := Ipv6HeaderSize
+	if packet[0]>>4 == 4 {
+		offset = int(packet[0]&15) * 4
+	}
+	transport := packet[offset:]
+	headerSize := int(transport[12]>>4) * 4
+	return headerSize >= TcpHeaderSizeWithoutExtensions && headerSize == len(transport) &&
+		transport[13]&tcpFlagAck != 0 && transport[13]&(tcpFlagSyn|tcpFlagFin|tcpFlagRst) == 0
 }
 
 // addTcpInboundEndpointWithLock records an endpoint once in the current
@@ -443,7 +685,7 @@ func (self *Tun) addTcpInboundEndpointWithLock(shard *tunTcpInboundShard, endpoi
 }
 
 // advanceTcpInboundShardWithLock records one injection and reports when its
-// shard needs an endpoint handoff. The shard write lock must be held.
+// producer burst should yield. The shard write lock must be held.
 func (self *Tun) advanceTcpInboundShardWithLock(shard *tunTcpInboundShard, endpointId stack.TransportEndpointID) bool {
 	self.addTcpInboundEndpointWithLock(shard, endpointId)
 	shard.packetCount += 1
@@ -454,38 +696,31 @@ func (self *Tun) advanceTcpInboundShardWithLock(shard *tunTcpInboundShard, endpo
 	return true
 }
 
-// synchronizeTcpInboundProcessorsWithLock performs gVisor's documented user
-// unlock handoff for every endpoint touched in the burst. The shard write lock
-// remains held so the next burst cannot overtake the handoff.
-func (self *Tun) synchronizeTcpInboundProcessorsWithLock(shard *tunTcpInboundShard) {
-	for endpointIndex := 0; endpointIndex < shard.endpointCount; endpointIndex += 1 {
-		endpointId := shard.endpointIds[endpointIndex]
-		stackEndpoint := self.stack.FindTransportEndpoint(
-			ipv4.ProtocolNumber,
-			tcp.ProtocolNumber,
-			endpointId,
-			self.nicId,
-		)
-		if endpoint, ok := stackEndpoint.(*tcp.Endpoint); ok {
-			endpoint.LockUser()
-			endpoint.UnlockUser()
-		}
-	}
+// Injection/Flush has already transferred each segment to gVisor. Its TCP
+// dispatcher queues processor-owned endpoints, requeues unfinished work, and
+// the syscall owner's UnlockUser wakes segments queued during that syscall.
+// Taking the endpoint lock here would join an unrelated outbound write while
+// holding receive/GRO ownership, closing the duplex admission/ACK cycle.
+func (self *Tun) finishTcpInboundBurstWithLock(shard *tunTcpInboundShard) {
 	shard.endpointCount = 0
-	// UnlockUser requeues protocol work but does not run it synchronously.
-	// Yield once while this shard remains gated so the awakened worker cannot
-	// be starved by an immediately reacquired producer lock.
-	runtime.Gosched()
 }
 
 // tunLinkEndpoint converts channel.Endpoint's silent bounded-queue drop into
-// bounded backpressure. The user-NAT TCP bridge is intentionally lossless and
-// does not retransmit its return path, so dropping one ACK here can otherwise
-// strand a flow forever at its advertised receive window.
+// bounded backpressure. Inner TCP and provider return replay can recover
+// losses, but dropping feedback still delays progress. The timeout remains
+// the bounded NIC-loss escape, not a receive-callback synchronization step.
 type tunLinkEndpoint struct {
 	*channel.Endpoint
 	ctx   context.Context
 	space chan struct{}
+	// waitTimeout bounds how long a netstack writer waits for outbound queue
+	// space before the rest of its batch is dropped (counted in dropCount).
+	// The goroutine that drains this queue can itself be inside an inbound
+	// injection (SendPacket -> receive callback -> Tun.Write -> gVisor reply),
+	// so an unbounded wait is a self-deadlock. Non-positive keeps the
+	// unbounded backpressure.
+	waitTimeout time.Duration
+	dropCount   atomic.Uint64
 
 	// dispatcher is the NIC's network dispatcher, captured at Attach so
 	// WriteBatch can deliver GRO-coalesced packets through the same path
@@ -507,7 +742,7 @@ func (self *tunLinkEndpoint) networkDispatcher() stack.NetworkDispatcher {
 	return self.dispatcher
 }
 
-func newTunLinkEndpoint(ctx context.Context, size int, mtu uint32, linkAddr tcpip.LinkAddress) *tunLinkEndpoint {
+func newTunLinkEndpoint(ctx context.Context, size int, mtu uint32, linkAddr tcpip.LinkAddress, waitTimeout time.Duration) *tunLinkEndpoint {
 	endpoint := channel.New(size, mtu, linkAddr)
 	// Inbound packets originate from the in-process user NAT over an
 	// authenticated tunnel, so ip/tcp checksum validation here is redundant
@@ -518,9 +753,10 @@ func newTunLinkEndpoint(ctx context.Context, size int, mtu uint32, linkAddr tcpi
 	// packet as checksum-invalid.
 	endpoint.LinkEPCapabilities |= stack.CapabilityRXChecksumOffload
 	return &tunLinkEndpoint{
-		Endpoint: endpoint,
-		ctx:      ctx,
-		space:    make(chan struct{}, 1),
+		Endpoint:    endpoint,
+		ctx:         ctx,
+		space:       make(chan struct{}, 1),
+		waitTimeout: waitTimeout,
 	}
 }
 
@@ -551,12 +787,26 @@ func (self *tunLinkEndpoint) WritePackets(packets stack.PacketBufferList) (int, 
 	packetSlice := packets.AsSlice()
 	written := 0
 	remaining := packets
+	waitedForSpace := false
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		n, err := self.Endpoint.WritePackets(remaining)
 		written += n
+		if 0 < n && waitedForSpace {
+			// Batch reads coalesce their space notifications into one token.
+			// Pass it on after making progress so other parked writers can
+			// use the remaining slots without waiting for another read.
+			self.notifySpace()
+		}
 		if err != nil || written == len(packetSlice) {
 			return written, err
 		}
+		waitedForSpace = true
 
 		// A partial batch is unusual (gVisor normally passes one packet), so
 		// construct its suffix only on queue saturation. A completely rejected
@@ -568,10 +818,27 @@ func (self *tunLinkEndpoint) WritePackets(packets stack.PacketBufferList) (int, 
 			}
 		}
 
+		if self.waitTimeout <= 0 {
+			select {
+			case <-self.ctx.Done():
+				return written, &tcpip.ErrClosedForSend{}
+			case <-self.space:
+			}
+			continue
+		}
+		if timer == nil {
+			timer = time.NewTimer(self.waitTimeout)
+		}
 		select {
 		case <-self.ctx.Done():
 			return written, &tcpip.ErrClosedForSend{}
 		case <-self.space:
+		case <-timer.C:
+			// Drop the rest like a saturated NIC queue would. The caller keeps
+			// its own packet references, so nothing is released here; TCP
+			// recovers by retransmission once the queue drains.
+			self.dropCount.Add(uint64(len(packetSlice) - written))
+			return written, nil
 		}
 	}
 }
@@ -589,6 +856,7 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 
 	nicIdAllocator := defaultNicIdAllocator
 	localIpv4AddressAllocator := defaultLocalIpv4AddressAllocator()
+	localIpv6AddressAllocator := defaultLocalIpv6AddressAllocator()
 
 	localIpv4Address, ok := localIpv4AddressAllocator.TakeAddr()
 	if !ok {
@@ -596,15 +864,37 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		return nil, fmt.Errorf("No more local addresses")
 	}
 
+	// IPv6 rides only a link wide enough for it (see the file comment)
+	ipv6Enabled := tunIpv6MinimumMtu <= settings.Mtu
+	var localIpv6Address netip.Addr
+	if ipv6Enabled {
+		localIpv6Address, ok = localIpv6AddressAllocator.TakeAddr()
+		if !ok {
+			localIpv4AddressAllocator.ReturnAddr(localIpv4Address)
+			cancel()
+			return nil, fmt.Errorf("No more local ipv6 addresses")
+		}
+	}
+
 	nicId := nicIdAllocator.TakeNicId()
 
 	// each Tun owns a private gVisor stack, destroyed on Close() so all of its
 	// endpoints are reclaimed. (There is no shared stack: it could not reclaim a
 	// closed Tun's connection endpoints, leaking them under Tun churn.)
-	tunStackInstance := newTunStack(settings.TcpReceiveBuffer, settings.TcpSendBuffer, settings.TcpMaxRto)
+	tunStackInstance := newTunStack(
+		settings.TcpReceiveBuffer,
+		settings.TcpSendBuffer,
+		settings.TcpMaxRto,
+		settings.TcpMinRto,
+	)
 
+	// v4 first: consumers that predate dual stack read the tun's address
+	// from the head of this list
 	localAddresses := []netip.Addr{
 		localIpv4Address,
+	}
+	if ipv6Enabled {
+		localAddresses = append(localAddresses, localIpv6Address)
 	}
 
 	ep := newTunLinkEndpoint(
@@ -612,6 +902,7 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		settings.ChannelSize,
 		uint32(settings.Mtu),
 		tcpip.LinkAddress(fmt.Sprintf("%x", nicId)),
+		settings.OutboundQueueWaitTimeout,
 	)
 
 	releaseOnError := func() {
@@ -620,6 +911,8 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		for _, addr := range localAddresses {
 			if addr.Is4() {
 				localIpv4AddressAllocator.ReturnAddr(addr)
+			} else {
+				localIpv6AddressAllocator.ReturnAddr(addr)
 			}
 		}
 		cancel()
@@ -636,6 +929,8 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		nicIdAllocator:            nicIdAllocator,
 		localAddresses:            localAddresses,
 		localIpv4AddressAllocator: localIpv4AddressAllocator,
+		localIpv6AddressAllocator: localIpv6AddressAllocator,
+		ipv6Enabled:               ipv6Enabled,
 	}
 
 	tun.dohResolver.Store(tun.buildDohCache(dnsResolverSettings, settings.DohRequestTimeout))
@@ -664,10 +959,36 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		}
 	}
 	tun.stack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: nicId})
+	if ipv6Enabled {
+		// ::/0 routes the same way as 0.0.0.0/0: everything leaves the nic
+		tun.stack.AddRoute(tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: nicId})
+	} else if tun.log.V(1).Enabled() {
+		tun.log.Infof("[tun]ipv6 disabled: mtu %d is below the ipv6 minimum %d\n", settings.Mtu, tunIpv6MinimumMtu)
+	}
 
 	tun.gro.Init(settings.TcpGro)
 
 	return tun, nil
+}
+
+// Ipv6Enabled reports whether this tun carries IPv6: a v6 local address and
+// default route exist, so v6 packets are accepted and v6 dials are made.
+// False when the link mtu is below tunIpv6MinimumMtu.
+func (self *Tun) Ipv6Enabled() bool {
+	return self.ipv6Enabled
+}
+
+// injectNetworkProtocol maps a packet's version nibble to the network protocol
+// it is injected under, or false for a version this tun does not carry.
+func (self *Tun) injectNetworkProtocol(version byte) (tcpip.NetworkProtocolNumber, bool) {
+	switch version {
+	case 4:
+		return header.IPv4ProtocolNumber, true
+	case 6:
+		return header.IPv6ProtocolNumber, self.ipv6Enabled
+	default:
+		return 0, false
+	}
 }
 
 func (self *Tun) DohCache() *DohCache {
@@ -693,9 +1014,23 @@ func (self *Tun) buildDohCache(dnsResolverSettings *DnsResolverSettings, request
 	dohSettings.TlsTimeout = 30 * time.Second
 	dohSettings.DialContextSettings = &DialContextSettings{
 		DialContext: self.DialContext,
+		dohTun:      true,
 	}
 	if dnsResolverSettings != nil {
 		dohSettings.DnsResolverSettings = dnsResolverSettings
+	}
+	if !self.ipv6Enabled {
+		// Only the remote paths traverse this tun. Keep host-side fallback and
+		// explicit resolver choices intact; never mutate the caller's settings.
+		resolverSettings := *dohSettings.DnsResolverSettings
+		resolverSettings.RemoteDohUrlsIpv6 = nil
+		resolverSettings.RemoteDnsIpv6 = nil
+		if dohSettings.IpVersion == 6 {
+			// Plain DNS normally falls back to its other server family when
+			// one list is empty. An explicit IPv6 choice must stay unsupported.
+			resolverSettings.RemoteDnsIpv4 = nil
+		}
+		dohSettings.DnsResolverSettings = &resolverSettings
 	}
 	return NewDohCache(dohSettings)
 }
@@ -837,8 +1172,9 @@ func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
 		if len(packet) == 0 {
 			continue
 		}
-		if packet[0]>>4 != 4 {
-			// ipv4-only tun, matching write()
+		networkProtocol, ok := self.injectNetworkProtocol(packet[0] >> 4)
+		if !ok {
+			// a version this tun does not carry, matching write()
 			continue
 		}
 
@@ -855,7 +1191,7 @@ func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
 		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(packet),
 		})
-		pkb.NetworkProtocolNumber = header.IPv4ProtocolNumber
+		pkb.NetworkProtocolNumber = networkProtocol
 		// the trusted in-process NAT computed these checksums; skipping GRO's
 		// re-validation matches the link's CapabilityRXChecksumOffload
 		pkb.RXChecksumValidated = true
@@ -863,16 +1199,41 @@ func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
 		pkb.DecRef()
 		total += len(packet)
 
-		if tcpInbound && self.advanceTcpInboundShardWithLock(shard, endpointId) {
-			// the shard's burst is full: deliver everything queued so far so
-			// the user-unlock handoff runs against enqueued segments
-			// (write()'s inject-then-synchronize order), and so the shard's
-			// bounded endpoint array cannot overflow mid-batch
+		if tcpInbound && !tcpInboundAcknowledgementOnly(packet) && self.advanceTcpInboundShardWithLock(shard, endpointId) {
+			// Publish the full producer burst before yielding, keeping the
+			// bounded per-shard metadata and same-flow ordering intact.
 			self.gro.Flush()
-			self.synchronizeTcpInboundProcessorsWithLock(shard)
+			self.finishTcpInboundBurstWithLock(shard)
+			// Give the dispatcher a turn while the same-flow shard remains
+			// gated. This yield never acquires its TCP endpoint lock.
+			runtime.Gosched()
 		}
 	}
 	self.gro.Flush()
+
+	// Flush publishes a finite tail even below the normal producer quantum.
+	// gVisor's dispatcher and user-unlock path retain responsibility for every
+	// queued segment, so no subsequent packet or synthetic endpoint lock is
+	// needed to schedule that tail.
+	finalYield := false
+	for shardIndex, locked := range lockedShards {
+		if !locked {
+			continue
+		}
+		shard := &self.tcpInboundShards[shardIndex]
+		if shard.endpointCount == 0 {
+			shard.packetCount = 0
+			continue
+		}
+		self.finishTcpInboundBurstWithLock(shard)
+		shard.packetCount = 0
+		finalYield = true
+	}
+	if finalYield {
+		// Yield once after the finite batch while touched shards remain
+		// gated, retaining the existing producer scheduling cadence.
+		runtime.Gosched()
+	}
 
 	return total, nil
 }
@@ -889,11 +1250,13 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 
 	endpointId, shardIndex, tcpInbound := tcpInboundFlow(packet)
 	var tcpInboundShard *tunTcpInboundShard
-	synchronize := false
+	yieldProcessor := false
 	if tcpInbound {
 		tcpInboundShard = &self.tcpInboundShards[shardIndex]
 		tcpInboundShard.writeLock.Lock()
-		synchronize = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
+		if !tcpInboundAcknowledgementOnly(packet) {
+			yieldProcessor = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
+		}
 	}
 
 	// copy the packet
@@ -906,24 +1269,26 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 	// endpoints do. Without this release, every inbound packet and its copied
 	// payload remain live for the process lifetime.
 
-	switch packet[0] >> 4 {
-	case 4:
-		self.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
-		pkb.DecRef()
-		if tcpInbound {
-			if synchronize {
-				self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
-			}
-			tcpInboundShard.writeLock.Unlock()
-		}
-		return len(packet), nil
-	default:
+	networkProtocol, ok := self.injectNetworkProtocol(packet[0] >> 4)
+	if !ok {
 		pkb.DecRef()
 		if tcpInbound {
 			tcpInboundShard.writeLock.Unlock()
 		}
 		return 0, syscall.EAFNOSUPPORT
 	}
+	self.ep.InjectInbound(networkProtocol, pkb)
+	pkb.DecRef()
+	if tcpInbound {
+		// Injection has already published this finite burst to gVisor.
+		// Clear producer metadata without waiting on the endpoint owner.
+		self.finishTcpInboundBurstWithLock(tcpInboundShard)
+		if yieldProcessor {
+			runtime.Gosched()
+		}
+		tcpInboundShard.writeLock.Unlock()
+	}
+	return len(packet), nil
 }
 
 func (self *Tun) convertToFullAddr(endpoint netip.AddrPort) (tcpip.FullAddress, tcpip.NetworkProtocolNumber) {
@@ -940,26 +1305,31 @@ func (self *Tun) convertToFullAddr(endpoint netip.AddrPort) (tcpip.FullAddress, 
 	}, protoNumber
 }
 
-func (self *Tun) dialCtx(ctx context.Context) context.Context {
-	if ctx == self.ctx {
-		return ctx
-	}
+// dialCtx joins one call's cancellation to the tun lifecycle without parking
+// a goroutine for every unresolved dial. The returned cleanup owns both the
+// callback registration and derived context and must be called by the caller.
+func (self *Tun) dialCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	dialCtx, dialCancel := context.WithCancel(self.ctx)
-	go func() {
-		defer dialCancel()
-		select {
-		case <-ctx.Done():
-		case <-self.ctx.Done():
-		}
-	}()
-	return dialCtx
+	// Preserve only the explicit request diagnostic across this lifetime join.
+	// In particular, private resolver transports must not borrow HTTP traces.
+	dialCtx = WithTunDialObserver(dialCtx, tunDialObserver(ctx))
+	stopCallerCancel := context.AfterFunc(ctx, dialCancel)
+	if ctx.Err() != nil {
+		dialCancel()
+	}
+	return dialCtx, func() {
+		stopCallerCancel()
+		dialCancel()
+	}
 }
 
 func (self *Tun) ListenTCP(addr *net.TCPAddr) (*gonet.TCPListener, error) {
 	var addrPort netip.AddrPort
 	if addr != nil {
+		// Unmap: a 16-byte net.IP holding a v4 address must bind the v4
+		// endpoint, not a v4-mapped v6 one
 		ip, _ := netip.AddrFromSlice(addr.IP)
-		addrPort = netip.AddrPortFrom(ip, uint16(addr.Port))
+		addrPort = netip.AddrPortFrom(ip.Unmap(), uint16(addr.Port))
 	}
 	fa, pn := self.convertToFullAddr(addrPort)
 	return gonet.ListenTCP(self.stack, fa, pn)
@@ -969,7 +1339,7 @@ func (self *Tun) ListenUDP(laddr *net.UDPAddr) (*gonet.UDPConn, error) {
 	var addrPort netip.AddrPort
 	if laddr != nil {
 		ip, _ := netip.AddrFromSlice(laddr.IP)
-		addrPort = netip.AddrPortFrom(ip, uint16(laddr.Port))
+		addrPort = netip.AddrPortFrom(ip.Unmap(), uint16(laddr.Port))
 	}
 	lfa, pn := self.convertToFullAddr(addrPort)
 	return self.dialUdp(&lfa, nil, pn)
@@ -1018,6 +1388,50 @@ func (self *Tun) DialContext(ctx context.Context, network string, address string
 		self.settings.DialTimeout,
 		self.dialContext,
 	)
+}
+
+// Dials an explicitly resolved stream without issuing another DNS query. The
+// caller owns name resolution; address retains the original hostname for socket
+// attribution. Family policy, staggered address racing and lifecycle ownership
+// are identical to ordinary tun streams. Safe for concurrent use.
+func (self *Tun) DialResolvedContext(ctx context.Context, network string, address string, addrs []netip.Addr) (net.Conn, error) {
+	return raceTunDialContext(ctx, self.ctx, network, address,
+		self.settings.DialRace, self.settings.DialRaceTimeout, self.settings.DialTimeout,
+		func(ctx context.Context, network string, address string) (net.Conn, error) {
+			dialCtx, cancel := self.dialCtx(ctx)
+			defer cancel()
+			return dialResolvedTunStream(dialCtx, network, address, addrs, self.ipv6Enabled, self.dialTcpAddr)
+		})
+}
+
+// Validates one supplied answer set before any socket is created, then reuses
+// the ordinary address race. Kept independent of a live stack for policy tests.
+func dialResolvedTunStream(ctx context.Context, network string, address string, addrs []netip.Addr, ipv6Enabled bool, dial func(context.Context, string, netip.AddrPort) (net.Conn, error)) (net.Conn, error) {
+	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		return nil, fmt.Errorf("resolved tun stream requires tcp network")
+	}
+	if network == "tcp6" && !ipv6Enabled {
+		return nil, syscall.EAFNOSUPPORT
+	}
+	host, portString, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil || port < 0 || 65535 < port {
+		return nil, fmt.Errorf("invalid port %q", portString)
+	}
+	resolveNetwork := network
+	if !ipv6Enabled {
+		resolveNetwork = "tcp4"
+	}
+	allowed := dialAddrsMatchNetwork(resolveNetwork, addrs)
+	if len(allowed) == 0 {
+		return nil, syscall.EAFNOSUPPORT
+	}
+	return dialAddrsRace(ctx, allowed, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+		return dial(ctx, host, netip.AddrPortFrom(addr, uint16(port)))
+	})
 }
 
 type tunDialResult struct {
@@ -1140,9 +1554,29 @@ func raceTunDialContext(
 	}
 }
 
+// dialContext is one attempt of the stream/datagram dial through this tun's
+// stack (raceTunDialContext may run several). A name resolves through the
+// tun's DoH cache for the families the network permits, A and AAAA
+// concurrently. A stream starts the first usable answer immediately and
+// staggers later addresses (net_dial_race.go). A datagram dial uses the first
+// usable answer and cancels/joins the pending family; its socket success is
+// not remote path proof. Family-specific networks and literals are honored: a v6 target on
+// an IPv4-only tun is EAFNOSUPPORT.
+//
 // safe to call from multiple goroutines
 func (self *Tun) dialContext(ctx context.Context, network string, address string) (net.Conn, error) {
-	dialCtx := self.dialCtx(ctx)
+	var stream bool
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		stream = true
+	case "udp", "udp4", "udp6":
+		stream = false
+	default:
+		return nil, fmt.Errorf("Unsupported network %s", network)
+	}
+	if strings.HasSuffix(network, "6") && !self.ipv6Enabled {
+		return nil, syscall.EAFNOSUPPORT
+	}
 
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
@@ -1152,66 +1586,163 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 	if err != nil {
 		return nil, err
 	}
-
-	var addrs []netip.Addr
-	if addr, err := netip.ParseAddr(host); err == nil {
-		// address is ip:port
-		addrs = append(addrs, addr)
-	} else {
-		// resolve ips using doh, local
-
-		resolvedAddrs := self.DohCache().Query(dialCtx, "A", host)
-		if self.log.V(1).Enabled() {
-			self.log.Infof("[tun]query doh (%s) found %v\n", host, resolvedAddrs)
-		}
-		for _, addr := range resolvedAddrs {
-			addrs = append(addrs, addr)
-		}
+	if port < 0 || 65535 < port {
+		return nil, fmt.Errorf("invalid port %q", portStr)
 	}
 
+	dialCtx, dialCtxCancel := self.dialCtx(ctx)
+	defer dialCtxCancel()
+
+	var addrs []netip.Addr
+	if literal, literalErr := netip.ParseAddr(host); literalErr == nil {
+		// address is ip:port: no resolution, and the family is settled
+		literal = literal.Unmap()
+		if literal.Is6() && !self.ipv6Enabled {
+			return nil, syscall.EAFNOSUPPORT
+		}
+		if strings.HasSuffix(network, "4") && !literal.Is4() || strings.HasSuffix(network, "6") && !literal.Is6() {
+			return nil, syscall.EAFNOSUPPORT
+		}
+		addrs = []netip.Addr{literal}
+	} else {
+		resolveNetwork := network
+		if !self.ipv6Enabled {
+			// an IPv4-only tun must not resolve an address it cannot dial
+			resolveNetwork = strings.TrimRight(network, "46") + "4"
+		}
+		if stream {
+			return dialDohAddrsRace(dialCtx, self.DohCache(), resolveNetwork, host, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+				return self.dialTcpAddr(ctx, host, netip.AddrPortFrom(addr, uint16(port)))
+			})
+		}
+		addrs, err = resolveFirstDohDialAddrs(dialCtx, self.DohCache(), resolveNetwork, host)
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[tun]query doh (%s) found %v err=%v\n", host, addrs, err)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("Could not resolve %s: %w", address, err)
+		}
+	}
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("Could not resolve %s", address)
 	}
 
-	addr := addrs[mathrand.Intn(len(addrs))]
-
-	// var returnErr error
-	// for _, addr := range addrs {
-	addrPort := netip.AddrPortFrom(addr, uint16(port))
-
-	switch network {
-	case "tcp", "tcp4", "tcp6":
-		fa, pn := self.convertToFullAddr(addrPort)
-		conn, err := gonet.DialContextTCP(dialCtx, self.stack, fa, pn)
-		if err == nil {
-			if self.log.V(1).Enabled() {
-				self.log.Infof("[tun]tcp connect (%s)->%s success\n", host, addrPort)
-			}
-			return conn, nil
-		}
-		if self.log.V(1).Enabled() {
-			self.log.Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
-		}
-		return nil, err
-	case "udp", "udp4", "udp6":
-		fa, pn := self.convertToFullAddr(addrPort)
-		conn, err := self.dialUdp(nil, &fa, pn)
-		if err == nil {
-			if self.log.V(1).Enabled() {
-				self.log.Infof("[tun]udp connect (%s)->%s success\n", host, addrPort)
-			}
-			return conn, nil
-		}
-		if self.log.V(1).Enabled() {
-			self.log.Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
-		}
-		return nil, err
-	default:
-		return nil, fmt.Errorf("Unsupported network %s", network)
+	if stream {
+		return dialAddrsRace(dialCtx, addrs, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+			return self.dialTcpAddr(ctx, host, netip.AddrPortFrom(addr, uint16(port)))
+		})
 	}
-	// }
+	return self.dialUdpAddr(host, netip.AddrPortFrom(udpDialAddr(addrs), uint16(port)))
+}
 
-	// return nil, returnErr
+// udpDialAddr picks the one address a datagram dial uses: the first v4
+// address when there is one, since nothing can prove a v6 path before the
+// first reply, else the first address.
+func udpDialAddr(addrs []netip.Addr) netip.Addr {
+	for _, addr := range addrs {
+		if addr.Is4() {
+			return addr
+		}
+	}
+	return addrs[0]
+}
+
+// A stream connection through the stack that keeps its endpoint, so a test
+// or a measurement can read the stack's view of the connection (congestion
+// window, slow start threshold, smoothed round trip, retransmission timeout)
+// without an accessor the gonet adapter does not provide.
+type TunTcpConn struct {
+	*gonet.TCPConn
+	endpoint tcpip.Endpoint
+}
+
+// TcpInfo reads the stack's TCP info for this connection.
+func (self *TunTcpConn) TcpInfo() (tcpip.TCPInfoOption, error) {
+	var info tcpip.TCPInfoOption
+	if tcpipErr := self.endpoint.GetSockOpt(&info); tcpipErr != nil {
+		return tcpip.TCPInfoOption{}, fmt.Errorf("Could not read tcp info err=%s", tcpipErr)
+	}
+	return info, nil
+}
+
+// creates a tcp endpoint and connects it. This mirrors
+// `gonet.DialContextTCP`, which does not expose the endpoint it creates.
+func (self *Tun) dialTcp(
+	ctx context.Context,
+	remoteAddr tcpip.FullAddress,
+	protoNumber tcpip.NetworkProtocolNumber,
+) (*TunTcpConn, error) {
+	wq := &waiter.Queue{}
+	ep, tcpipErr := self.stack.NewEndpoint(tcp.ProtocolNumber, protoNumber, wq)
+	if tcpipErr != nil {
+		return nil, fmt.Errorf("Could not create tcp endpoint err=%s", tcpipErr)
+	}
+	// registered before connect, which always returns before completing
+	waitEntry, notify := waiter.NewChannelEntry(waiter.WritableEvents)
+	wq.EventRegister(&waitEntry)
+	defer wq.EventUnregister(&waitEntry)
+
+	select {
+	case <-ctx.Done():
+		ep.Close()
+		return nil, ctx.Err()
+	default:
+	}
+	tcpipErr = ep.Connect(remoteAddr)
+	if _, started := tcpipErr.(*tcpip.ErrConnectStarted); started {
+		select {
+		case <-ctx.Done():
+			ep.Close()
+			return nil, ctx.Err()
+		case <-notify:
+		}
+		tcpipErr = ep.LastError()
+	}
+	if tcpipErr != nil {
+		ep.Close()
+		return nil, &net.OpError{
+			Op:   "connect",
+			Net:  "tcp",
+			Addr: &net.TCPAddr{IP: net.IP(remoteAddr.Addr.AsSlice()), Port: int(remoteAddr.Port)},
+			Err:  fmt.Errorf("%s", tcpipErr),
+		}
+	}
+	return &TunTcpConn{
+		TCPConn:  gonet.NewTCPConn(wq, ep),
+		endpoint: ep,
+	}, nil
+}
+
+// dialTcpAddr is one stream connect through the stack to a resolved address.
+func (self *Tun) dialTcpAddr(ctx context.Context, host string, addrPort netip.AddrPort) (net.Conn, error) {
+	fa, pn := self.convertToFullAddr(addrPort)
+	conn, err := self.dialTcp(ctx, fa, pn)
+	if err == nil {
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[tun]tcp connect (%s)->%s success\n", host, addrPort)
+		}
+		return conn, nil
+	}
+	if self.log.V(1).Enabled() {
+		self.log.Infof("[tun]tcp connect (%s)->%s err = %s\n", host, addrPort, err)
+	}
+	return nil, err
+}
+
+// dialUdpAddr is one datagram connect through the stack to a resolved address.
+func (self *Tun) dialUdpAddr(host string, addrPort netip.AddrPort) (net.Conn, error) {
+	fa, pn := self.convertToFullAddr(addrPort)
+	conn, err := self.dialUdp(nil, &fa, pn)
+	if err == nil {
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[tun]udp connect (%s)->%s success\n", host, addrPort)
+		}
+		return conn, nil
+	}
+	if self.log.V(1).Enabled() {
+		self.log.Infof("[tun]udp connect (%s)->%s err = %s\n", host, addrPort, err)
+	}
+	return nil, err
 }
 
 func (self *Tun) Dial(network, address string) (net.Conn, error) {
@@ -1232,6 +1763,8 @@ func (self *Tun) Close() error {
 		for _, addr := range self.localAddresses {
 			if addr.Is4() {
 				self.localIpv4AddressAllocator.ReturnAddr(addr)
+			} else {
+				self.localIpv6AddressAllocator.ReturnAddr(addr)
 			}
 		}
 		// destroy this Tun's stack so its endpoints and background goroutines are released.
@@ -1245,6 +1778,24 @@ func (self *Tun) Close() error {
 }
 
 // Stats returns the gVisor stack statistics for this Tun's private stack.
+// OutboundDropCount is the number of netstack packets dropped because the
+// outbound queue stayed full past OutboundQueueWaitTimeout.
+// TunLinkStatsSnapshot is the tun link's own counters for campaign records;
+// the outbound drop count must read 0 wherever the bounded wait is only a
+// guard (FLIGHTGATEFIX §13.4).
+type TunLinkStatsSnapshot struct {
+	OutboundDropCount uint64
+}
+
+// LinkStats reads the link endpoint counters without stopping the stack.
+func (self *Tun) LinkStats() TunLinkStatsSnapshot {
+	return TunLinkStatsSnapshot{OutboundDropCount: self.OutboundDropCount()}
+}
+
+func (self *Tun) OutboundDropCount() uint64 {
+	return self.ep.dropCount.Load()
+}
+
 func (self *Tun) Stats() tcpip.Stats {
 	return self.stack.Stats()
 }

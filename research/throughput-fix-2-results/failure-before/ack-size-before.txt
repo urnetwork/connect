@@ -1,0 +1,5 @@
+--- FAIL: TestEvictionAcknowledgementsFitEveryCarrier (0.00s)
+    transfer_ack_bounds_test.go:57: version 1: 4096 notices produced 41212 bytes, exceeding minimum carrier limit
+FAIL
+FAIL	github.com/urnetwork/connect	0.672s
+FAIL

@@ -35,14 +35,17 @@ func TestVerifyKeysResultJson(t *testing.T) {
 // TestSnSetWalletJson pins the `POST /sn/wallet` args/result shapes,
 // including error omission when unset.
 func TestSnSetWalletJson(t *testing.T) {
+	clientId, err := ParseId("00000000-0000-0000-0000-000000000042")
+	AssertEqual(t, nil, err)
 	setWalletArgs := &SnSetWalletArgs{
 		ColdkeySs58: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+		ClientId:    &clientId,
 	}
 	setWalletArgsJson, err := json.Marshal(setWalletArgs)
 	AssertEqual(t, nil, err)
 	AssertEqual(
 		t,
-		`{"coldkey_ss58":"5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"}`,
+		`{"coldkey_ss58":"5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY","client_id":"00000000-0000-0000-0000-000000000042"}`,
 		string(setWalletArgsJson),
 	)
 	var parsedSetWalletArgs SnSetWalletArgs
@@ -88,10 +91,16 @@ func TestSnPoolClaimJson(t *testing.T) {
 			testVerifyHexBytes(t, testVerifyClientNonceHex),
 			testVerifyHexBytes(t, testVerifyServerNonceHex),
 		},
-		PayoutRoot:      testVerifyHexBytes(t, testVerifyVpkHex),
-		ContractAddress: "0x00000000000000000000000000000000000009c4",
-		ChainId:         964,
-		ClaimOpenBlock:  123456,
+		PayoutRoot:             testVerifyHexBytes(t, testVerifyVpkHex),
+		ContractAddress:        "0x00000000000000000000000000000000000009c4",
+		ChainId:                964,
+		ClaimOpenBlock:         123456,
+		ArtifactHash:           "sha256:0123",
+		ArtifactUri:            "https://no.example/sn/artifacts/sha256:0123",
+		SettlementVaultAddress: "0x0000000000000000000000000000000000000abc",
+		Error: &SnPoolClaimError{
+			Message: "claim not open",
+		},
 	}
 	poolClaimResultJson, err := json.Marshal(poolClaimResult)
 	AssertEqual(t, nil, err)

@@ -1,0 +1,28 @@
+[
+  {
+    "classification": "separate-old-carrier-expectation",
+    "excluded_from_final_root_evidence": true,
+    "manifest_sha256": "8e95618d566f030337f7c263267e64ddb6b47c16d11c1c72d15d1162d34efb5d",
+    "outcomes": {
+      "FAIL": 3,
+      "PASS": 609,
+      "SKIP": 0
+    },
+    "race_warning_blocks": 0,
+    "raw_log_sha256": "31417dd49e51129ca8d9d2ab150a44e010b2a5db7bb684d7e7fbade8c989dfb4",
+    "scope": "initial-scan-adjacent-old-carrier-expectation"
+  },
+  {
+    "classification": "diagnostic-exact-ambiguous-tail",
+    "excluded_from_final_root_evidence": true,
+    "manifest_sha256": "e8074facbb1b471818262b48c8bfe0bf2f1b6fe15b9a55cf9117fdb79e153202",
+    "outcomes": {
+      "FAIL": 1,
+      "PASS": 0,
+      "SKIP": 0
+    },
+    "race_warning_blocks": 0,
+    "raw_log_sha256": "3e81bd1d452f53aa90168cff3c80d30aaad3472a42c4bdf5e095e33ac4638546",
+    "scope": "diagnostic-only-exact-ambiguous-tail"
+  }
+]

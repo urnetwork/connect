@@ -1,0 +1,897 @@
+--- /dev/null
++++ b/ip_provider_pure_ack_admission_test.go
+@@ -0,0 +1,248 @@
++// A dedicated TCP acknowledgement owner must retain its one control while
++// the existing two-slot H1 lane is full. Shared callbacks still refuse at once.
++package connect
++
++import (
++	"context"
++	"testing"
++	"testing/synctest"
++
++	"github.com/urnetwork/connect/protocol"
++)
++
++// Reuse the provider callback and TCP-sequence fixtures; only the Transfer
++// consumer is paused so the exact physical trace's admission edge is forced.
++type providerPureAckAdmissionFixture struct {
++	provider *RemoteUserNatProvider
++	client   *Client
++	tcp      *tcpReorderTestHarness
++	sequence *SendSequence
++}
++
++// The captured mobile provider profile has sixteen entries shared by eight
++// lanes: exactly two admissions, independent of window policy or byte capacity.
++func newProviderPureAckAdmissionFixture(t *testing.T, sizing WindowSizingPolicyKind) *providerPureAckAdmissionFixture {
++	return newProviderPureAckAdmissionFixtureWithSetup(t, sizing, nil)
++}
++
++// Worker hooks belong in immutable settings before NewClient starts any
++// worker, including the independently running key publisher.
++func newProviderPureAckAdmissionFixtureWithSetup(t *testing.T, sizing WindowSizingPolicyKind, setup func(*ClientSettings)) *providerPureAckAdmissionFixture {
++	t.Helper()
++	profiles, _ := windowSdkProfiles(t)
++	var profile *windowPathEndpointProfile
++	for index := range profiles {
++		if profiles[index].Name == "sdk-provider-h1" {
++			profile = &profiles[index]
++		}
++	}
++	if profile == nil {
++		t.Fatal("pinned provider H1 profile missing")
++	}
++	settings := DefaultClientSettings()
++	settings.Log = NewNoopLogger()
++	settings.EncryptionSettings.Mode = EncryptionModeOff
++	settings.SendBufferSettings.WindowSizing = sizing
++	settings.SendBufferSettings.ApplyWindowSizing()
++	profile.apply(settings)
++	if sizing == WindowSizingConstant {
++		settings.SendBufferSettings.ResendQueueMaxByteCount = *profile.SendPool
++		if settings.SendBufferSettings.DeliverySizedWindowScale != 0 {
++			t.Fatal("constant control enabled window sizing")
++		}
++	}
++	providerSettings := DefaultRemoteUserNatProviderSettings()
++	providerSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
++	if setup != nil {
++		setup(settings)
++	}
++	provider, client := newProviderPureAckClientFixture(t, providerSettings, settings)
++	fixture := &providerPureAckAdmissionFixture{provider: provider, client: client}
++	fixture.tcp = newTcpReorderTestHarnessWithSynOptions(t, 1000, 8, 0, func(tcp *TcpSequence) {
++		lane := ipSendSchedulingKey(tcp.IpPath()).logicalLaneForCount(settings.SendBufferSettings.LogicalDataLaneCount)
++		id := sendSequenceId{Destination: tcp.source.SourceId, EncryptionRole: sequenceTlsRoleClient, LogicalLane: lane}
++		sequence := installProviderReturnTestSequence(t, provider, client, id)
++		sequence.client, sequence.sendBuffer = client, client.sendBuffer
++		sequence.destination, sequence.logicalLane = id.Destination, lane
++		sequence.sendBufferSettings = settings.SendBufferSettings
++		sequence.log = NewNoopLogger()
++		sequence.encryptionRole = id.EncryptionRole
++		sequence.packs = make(chan *SendPack, logicalLaneSequenceBufferSize(settings.SendBufferSettings.SequenceBufferSize, lane))
++		sequence.packAdmission = newSendPackAdmission(cap(sequence.packs))
++		sequence.resendQueue = newResendQueue(settings.SendBufferSettings.ResendQueueBudget, 0)
++		sequence.contractMultiRouteWriter = &windowPacingPolicyWriter{policy: transferFlightPolicySnapshot{h1Only: true}}
++		fixture.sequence = sequence
++		if cap(sequence.packs) != 2 || !sequence.transferFlightPolicy().h1Only {
++			t.Fatal("root lost the physical H1 two-slot lane")
++		}
++		client.sendBuffer.mutex.Lock()
++		client.sendBuffer.logicalLaneVersions[id.logicalLaneBase()] = transferLogicalLaneVersion
++		client.sendBuffer.publishLogicalLaneVersionsWithLock()
++		client.sendBuffer.mutex.Unlock()
++		original := tcp.receiveCallback
++		tcp.receiveCallback = func(source TransferPath, key TransferKey, mode protocol.ProvideMode, recovery receiveRecoveryMode, path *IpPath, packet []byte) {
++			// The existing harness owns handshake observation. Only the exact
++			// post-handshake acknowledgement enters the production provider.
++			original(source, key, mode, recovery, path, packet)
++			var reply IpPath
++			if _, err := parseIpPathWithPayloadBorrowed(packet, &reply); err == nil && reply.Ack && !reply.Syn && !reply.Fin && !reply.Rst && reply.TcpPayloadByteCount == 0 {
++				provider.receiveTransferWithRecovery(source, key, mode, recovery, path, packet)
++			}
++		}
++	}, []byte{1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0})
++	t.Cleanup(func() {
++		// Cancel the provider before joining a dedicated sender parked there.
++		provider.Close()
++		fixture.tcp.close()
++		fixture.releasePacks()
++		fixture.sequence.resendQueue.Clear()
++		if err := client.CloseAndWait(context.Background()); err != nil {
++			t.Errorf("provider client close: %v", err)
++		}
++	})
++	return fixture
++}
++
++// Each packet is borrowed by the real socket-return callback. Its successful
++// raw admission owns the retained share until this fixture drains that slot.
++func (self *providerPureAckAdmissionFixture) fill(t *testing.T, count int) {
++	t.Helper()
++	path := self.tcp.sequence.IpPath()
++	for index := range count {
++		packet := MessagePoolCopy(craftSecurityPacket(IpProtocolTcp, path.DestinationIp, path.DestinationPort, path.SourceIp, path.SourcePort, false, []byte{byte(index + 1)}))
++		self.provider.receiveTransferWithRecovery(self.tcp.source, TransferKey{}, protocol.ProvideMode_Network, receiveRecoveryModeTcpSocket, path, packet)
++		MessagePoolReturn(packet)
++	}
++	if self.sequence.resendCapacityUnavailable.Load() || !self.sequence.resendQueue.CanAdd(0, self.sequence.sendBufferSettings.ResendQueueMaxByteCount) {
++		t.Fatal("byte capacity closed before the count-admission root")
++	}
++	if len(self.sequence.packs) != count || self.sequence.packAdmission.count != count {
++		t.Fatal("socket returns did not own the requested bounded slots")
++	}
++}
++
++// Mirror the ordinary consumer's terminal release without serializing a new
++// message or manufacturing a Transfer acknowledgement in this admission root.
++func (self *providerPureAckAdmissionFixture) releaseOne() {
++	pack := <-self.sequence.packs
++	pack.returnFrames()
++	pack.releaseRaw()
++}
++
++// Cleanup may also own the final admitted control after its inspection.
++func (self *providerPureAckAdmissionFixture) releasePacks() {
++	for {
++		select {
++		case pack := <-self.sequence.packs:
++			pack.returnFrames()
++			pack.releaseRaw()
++		default:
++			return
++		}
++	}
++}
++
++// Return only scalar control metadata while releasing every admitted buffer.
++func (self *providerPureAckAdmissionFixture) deliveredAcks(t *testing.T) []uint32 {
++	t.Helper()
++	var acks []uint32
++	for {
++		select {
++		case pack := <-self.sequence.packs:
++			packet := providerCallbackQueuePacketBytes(t, pack)
++			var path IpPath
++			_, err := parseIpPathWithPayloadBorrowed(packet, &path)
++			if err == nil && path.Ack && !path.Syn && !path.Fin && !path.Rst && path.TcpPayloadByteCount == 0 {
++				if len(packet) != 52 || !pack.Ack || !pack.lifecycleUpstreamRecoverable || pack.retainAfterAckTimeout {
++					t.Errorf("pure ACK lost exact52B regenerable/reliable ownership: bytes=%d ack=%t recoverable=%t retained=%t", len(packet), pack.Ack, pack.lifecycleUpstreamRecoverable, pack.retainAfterAckTimeout)
++				}
++				acks = append(acks, path.AckSequenceNumber)
++			}
++			pack.returnFrames()
++			pack.releaseRaw()
++		default:
++			return acks
++		}
++	}
++}
++
++// Once one slot returns, the already-generated ACK must progress without
++// another upload or an inner TCP retransmission to regenerate it.
++func TestWindowPhysicalH1ProviderPureAckSurvivesAdmissionPressure(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		for _, sizing := range []WindowSizingPolicyKind{WindowSizingConstant, WindowSizingFromDelivery} {
++			fixture := newProviderPureAckAdmissionFixture(t, sizing)
++			fixture.fill(t, 2)
++			started, release := make(chan struct{}), make(chan struct{})
++			fixture.provider.returnSendStarted = func() { close(started); <-release }
++			fixture.tcp.sendPayload(fixture.tcp.nextSeq, "x", false)
++			fixture.tcp.readPayload("x")
++			<-started
++			close(release)
++			// Every other goroutine must reach a real blocking edge. On the
++			// old path the shared worker has discarded the ACK; a retained
++			// owner must instead be waiting on the still-full admission gate.
++			synctest.Wait()
++			fixture.releaseOne()
++			synctest.Wait()
++			acks := fixture.deliveredAcks(t)
++			if len(acks) != 1 || acks[0] != fixture.tcp.nextSeq+1 {
++				t.Errorf("sizing=%d: released H1 slot did not deliver the owned52B ACK without retransmission: acks=%v drops=%+v", sizing, acks, fixture.provider.CongestionDropStats())
++			}
++			if drops := fixture.provider.CongestionDropStats(); drops != (ProviderCongestionDrops{}) {
++				t.Errorf("sizing=%d: transient bounded admission lost control: %+v", sizing, drops)
++			}
++			fixture.provider.Close()
++			fixture.tcp.close()
++		}
++	})
++}
++
++// The same real worker/provider path is a positive control when one of the
++// unchanged two admissions is already available.
++func TestWindowPhysicalH1ProviderPureAckUsesAvailableAdmission(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 1)
++		fixture.tcp.sendPayload(fixture.tcp.nextSeq, "x", false)
++		fixture.tcp.readPayload("x")
++		synctest.Wait()
++		acks := fixture.deliveredAcks(t)
++		if len(acks) != 1 || acks[0] != fixture.tcp.nextSeq+1 || fixture.provider.CongestionDropStats() != (ProviderCongestionDrops{}) {
++			t.Fatalf("available control changed: acks=%v drops=%+v", acks, fixture.provider.CongestionDropStats())
++		}
++	})
++}
++
++// A public callback has no dedicated recovery owner and must still return at
++// the existing zero-wait boundary rather than hold an unrelated flow's pump.
++func TestWindowPhysicalH1ProviderPublicAckStillRefusesAtCapacity(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 2)
++		fixture.tcp.sequence.mutex.Lock()
++		packet, err := fixture.tcp.sequence.PureAck()
++		fixture.tcp.sequence.mutex.Unlock()
++		if err != nil {
++			t.Fatal(err)
++		}
++		fixture.provider.Receive(fixture.tcp.source, protocol.ProvideMode_Network, fixture.tcp.sequence.IpPath(), packet)
++		MessagePoolReturn(packet)
++		synctest.Wait()
++		drops := fixture.provider.CongestionDropStats()
++		if drops.ReturnSendPacketCount != 1 || drops.ReturnSendByteCount != 52 || drops.ReturnQueuePacketCount != 0 {
++			t.Fatalf("shared callback did not preserve exact zero-wait refusal: %+v", drops)
++		}
++		fixture.releasePacks()
++		synctest.Wait()
++		if len(fixture.sequence.packs) != 0 {
++			t.Fatal("a public callback retried after its terminal refusal")
++		}
++	})
++}
+--- /dev/null
++++ b/ip_provider_pure_ack_fixture_test.go
+@@ -0,0 +1,31 @@
++// The provider is a child of the client, matching production lifetime
++// ownership. Provider.Close must never cancel the independently live client.
++package connect
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/urnetwork/connect/protocol"
++)
++
++// Only the unused NAT ingress is paused; return workers use real provider
++// admission with a provider context derived before any worker is started.
++func newProviderPureAckClientFixture(t *testing.T, providerSettings *RemoteUserNatProviderSettings, clientSettings *ClientSettings) (*RemoteUserNatProvider, *Client) {
++	t.Helper()
++	clientCtx, clientCancel := context.WithCancel(context.Background())
++	client := NewClient(clientCtx, NewId(), NewNoContractClientOob(), clientSettings)
++	providerCtx, providerCancel := context.WithCancel(clientCtx)
++	localUserNat := &LocalUserNat{ctx: providerCtx, sendPackets: make(chan *SendPacket, 1)}
++	provider := &RemoteUserNatProvider{
++		ctx: providerCtx, client: client, cancel: providerCancel, localUserNat: localUserNat,
++		securityPolicy: providerSettings.SecurityPolicyGenerator(providerCtx, DefaultSecurityPolicyStatsCollector()),
++		settings:       providerSettings, packetStatsCounters: &packetStatsCounters{},
++		packetStatsCallbacks: NewCallbackList[PacketStatsFunction](),
++		sourceProvideMode:    map[Id]protocol.ProvideMode{}, sourceP2pPriorityRefresh: map[Id]time.Time{},
++	}
++	provider.startReturnSenders()
++	t.Cleanup(func() { provider.Close(); clientCancel(); client.Cancel() })
++	return provider, client
++}
+--- /dev/null
++++ b/ip_provider_pure_ack_owner_test.go
+@@ -0,0 +1,240 @@
++// Dedicated ACK ownership stays bounded by the existing flow worker and
++// ends at flow/provider cancellation without changing shared callback policy.
++package connect
++
++import (
++	"sync"
++	"sync/atomic"
++	"testing"
++	"testing/synctest"
++
++	"github.com/urnetwork/connect/protocol"
++)
++
++// Cancelling only the TCP flow must release the held control and join its
++// owner while the provider and its two occupied Transfer slots remain live.
++func TestWindowPhysicalH1ProviderPureAckFlowCancelReleasesOwner(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 2)
++		var witness []byte
++		stopped := make(chan struct{})
++		fixture.tcp.sequence.afterPureAckBuildForTest = func(packet []byte) { witness = MessagePoolShareReadOnly(packet) }
++		fixture.tcp.sequence.afterPureAckWorkerStopForTest = func() { close(stopped) }
++		fixture.tcp.sendPayload(fixture.tcp.nextSeq, "x", false)
++		fixture.tcp.readPayload("x")
++		synctest.Wait()
++		if witness == nil {
++			t.Fatal("the actual ACK worker never built its control")
++		}
++		fixture.tcp.sequence.Cancel()
++		synctest.Wait()
++		select {
++		case <-stopped:
++		default:
++			t.Error("flow cancellation did not release its own pending ACK worker")
++		}
++		if providerPureAckCurrentLane(fixture) != fixture.sequence {
++			t.Error("flow-only cancellation retired the shared Transfer lane")
++		}
++		if fixture.provider.ctx.Err() != nil || len(fixture.sequence.packs) != 2 {
++			t.Error("flow cancellation changed provider or existing Transfer ownership")
++		}
++		if !MessagePoolReturn(witness) {
++			t.Error("flow cancellation left the pending ACK owned outside its witness")
++		}
++		fixture.releasePacks()
++		synctest.Wait()
++		if len(fixture.sequence.packs) != 0 {
++			t.Error("canceled flow published its old ACK when capacity returned")
++		}
++	})
++}
++
++// Provider shutdown joins the same fixed sender admission without requiring
++// a send-buffer slot or cancelling unrelated client state first.
++func TestWindowPhysicalH1ProviderPureAckProviderCancelReleasesOwner(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 2)
++		var witness []byte
++		fixture.tcp.sequence.afterPureAckBuildForTest = func(packet []byte) { witness = MessagePoolShareReadOnly(packet) }
++		fixture.tcp.sendPayload(fixture.tcp.nextSeq, "x", false)
++		fixture.tcp.readPayload("x")
++		synctest.Wait()
++		if witness == nil {
++			t.Fatal("the actual ACK worker never built its control")
++		}
++		fixture.provider.Close()
++		synctest.Wait()
++		if fixture.client.ctx.Err() != nil || len(fixture.sequence.packs) != 2 {
++			t.Error("provider close used client cancellation or changed admitted slots")
++		}
++		if !MessagePoolReturn(witness) {
++			t.Error("provider cancellation retained the pending ACK")
++		}
++		fixture.releasePacks()
++		synctest.Wait()
++		if len(fixture.sequence.packs) != 0 {
++			t.Error("closed provider published its old ACK after capacity returned")
++		}
++	})
++}
++
++// New upload progress while the sole ACK owner is parked must eventually
++// cover the latest cumulative head. Both latest-only coalescing and an older
++// ACK followed by the latest are valid; neither may grow a pending queue or
++// extend the normal Transfer acknowledgement lifetime.
++func TestWindowPhysicalH1ProviderPureAckAdvancesAfterHeldControl(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 2)
++		var built atomic.Int64
++		fixture.tcp.sequence.afterPureAckBuildForTest = func([]byte) { built.Add(1) }
++		started, release := make(chan struct{}), make(chan struct{})
++		var first sync.Once
++		fixture.provider.returnSendStarted = func() { first.Do(func() { close(started); <-release }) }
++		fixture.tcp.sendPayload(fixture.tcp.nextSeq, "x", false)
++		fixture.tcp.readPayload("x")
++		<-started
++		close(release)
++		synctest.Wait()
++		fixture.tcp.sendPayload(fixture.tcp.nextSeq+1, "y", false)
++		fixture.tcp.readPayload("y")
++		synctest.Wait()
++		if len(fixture.sequence.packs) != 2 || fixture.sequence.packAdmission.count != 2 {
++			t.Error("waiting controls exceeded the existing two-slot admission bound")
++		}
++		fixture.releaseOne()
++		synctest.Wait()
++		firstAcks := fixture.deliveredAcks(t)
++		synctest.Wait()
++		secondAcks := fixture.deliveredAcks(t)
++		acks := append(firstAcks, secondAcks...)
++		latest := fixture.tcp.nextSeq + 2
++		if len(acks) == 0 || len(acks) > 2 || acks[len(acks)-1] != latest {
++			t.Errorf("released admission did not cover the latest cumulative head: %v", acks)
++		}
++		for index, head := range acks {
++			if head < fixture.tcp.nextSeq+1 || latest < head || 0 < index && head <= acks[index-1] {
++				t.Errorf("ACK heads must advance without duplicate ownership: %v", acks)
++			}
++		}
++		if fixture.provider.CongestionDropStats() != (ProviderCongestionDrops{}) {
++			t.Errorf("owned cumulative coverage was refused: built=%d drops=%+v", built.Load(), fixture.provider.CongestionDropStats())
++		}
++		if fixture.sequence.packAdmission.count != 0 {
++			t.Error("control admission retained a slot after final consumption")
++		}
++	})
++}
++
++// An orphan/shared synthesized control has no dedicated worker capability.
++// It retains the same zero-wait refusal even though a peer can regenerate it.
++func TestWindowPhysicalH1ProviderSharedRegenerableAckStillRefuses(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 2)
++		fixture.tcp.sequence.mutex.Lock()
++		packet, err := fixture.tcp.sequence.PureAck()
++		fixture.tcp.sequence.mutex.Unlock()
++		if err != nil {
++			t.Fatal(err)
++		}
++		fixture.provider.receiveTransferWithRecovery(fixture.tcp.source, TransferKey{}, protocol.ProvideMode_Network, receiveRecoveryModeRegenerableControl, fixture.tcp.sequence.IpPath(), packet)
++		MessagePoolReturn(packet)
++		synctest.Wait()
++		drops := fixture.provider.CongestionDropStats()
++		if drops.ReturnSendPacketCount != 1 || drops.ReturnSendByteCount != 52 || drops.ReturnQueuePacketCount != 0 {
++			t.Fatalf("shared regenerable control changed its terminal zero-wait disposition: %+v", drops)
++		}
++		fixture.releasePacks()
++		synctest.Wait()
++		if len(fixture.sequence.packs) != 0 {
++			t.Fatal("shared regenerable control retried after refusal")
++		}
++	})
++}
++
++// A failed zero-timeout attempt may enter the existing paced retry boundary.
++// Canceling there must stop the exact flow without retiring accepted siblings.
++func TestWindowPhysicalH1ProviderPureAckCancelAtRetryKeepsSiblings(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 2)
++		fixture.provider.settings.WriteTimeout = 0
++		var witness []byte
++		fixture.tcp.sequence.afterPureAckBuildForTest = func(packet []byte) { witness = MessagePoolShareReadOnly(packet) }
++		entered, release := make(chan struct{}), make(chan struct{})
++		var first sync.Once
++		fixture.provider.beforeTcpReturnSendRetryForTest = func() { first.Do(func() { close(entered); <-release }) }
++		fixture.tcp.sendPayload(fixture.tcp.nextSeq, "x", false)
++		fixture.tcp.readPayload("x")
++		synctest.Wait()
++		select {
++		case <-entered:
++		default:
++			t.Error("owned ACK was discarded instead of reaching its cancellable retry boundary")
++		}
++		fixture.tcp.sequence.Cancel()
++		close(release)
++		synctest.Wait()
++		if witness == nil {
++			t.Fatal("the worker never built its pure ACK")
++		}
++		if !MessagePoolReturn(witness) {
++			t.Error("retry-boundary cancellation retained a pooled ACK owner")
++		}
++		if providerPureAckCurrentLane(fixture) != fixture.sequence || len(fixture.sequence.packs) != 2 {
++			t.Error("retry-boundary cancellation retired accepted siblings")
++		}
++		fixture.releasePacks()
++		synctest.Wait()
++		if len(fixture.sequence.packs) != 0 {
++			t.Error("canceled retry delivered its old ACK when capacity returned")
++		}
++	})
++}
++
++// Cancellation between provider ownership registration and its first send
++// must finish without creating a waiting context or retrying on source life.
++func TestWindowPhysicalH1ProviderPureAckCancelBeforeAttemptStopsOwner(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 2)
++		var witness []byte
++		stopped := make(chan struct{})
++		fixture.tcp.sequence.afterPureAckBuildForTest = func(packet []byte) { witness = MessagePoolShareReadOnly(packet) }
++		fixture.tcp.sequence.afterPureAckWorkerStopForTest = func() { close(stopped) }
++		fixture.provider.returnSendStarted = func() { fixture.tcp.sequence.Cancel() }
++		fixture.tcp.sendPayload(fixture.tcp.nextSeq, "x", false)
++		fixture.tcp.readPayload("x")
++		synctest.Wait()
++		select {
++		case <-stopped:
++		default:
++			t.Error("pre-attempt flow cancellation left its ACK worker retrying")
++		}
++		if witness == nil {
++			t.Fatal("the worker never built its pure ACK")
++		}
++		if !MessagePoolReturn(witness) {
++			t.Error("pre-attempt cancellation retained a pooled ACK owner")
++		}
++		if providerPureAckCurrentLane(fixture) != fixture.sequence || len(fixture.sequence.packs) != 2 {
++			t.Error("pre-attempt cancellation retired accepted siblings")
++		}
++	})
++}
+--- /dev/null
++++ b/transfer_pack_context_owner_test.go
+@@ -0,0 +1,164 @@
++// Caller cancellation owns only that caller's unadmitted Pack. It must not
++// retire a shared lane or reclaim already-accepted sibling ownership.
++package connect
++
++import (
++	"context"
++	"testing"
++	"testing/synctest"
++
++	"github.com/urnetwork/connect/protocol"
++)
++
++// Read the same exact id used by real provider return admission.
++func providerPureAckCurrentLane(fixture *providerPureAckAdmissionFixture) *SendSequence {
++	fixture.client.sendBuffer.mutex.Lock()
++	defer fixture.client.sendBuffer.mutex.Unlock()
++	return fixture.client.sendBuffer.sendSequences[fixture.sequence.id()]
++}
++
++// A canceled caller is stopped before admission; its two live siblings keep
++// the original shared sequence and retained bytes.
++func TestSendBufferCallerCancelPreservesSharedAdmission(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 2)
++		ctx, cancel := context.WithCancel(context.Background())
++		cancel()
++		bytes := MessagePoolCopy([]byte("unadmitted-caller"))
++		pack := &SendPack{TransferOptions: TransferOptions{Ack: true}, Frame: &protocol.Frame{MessageBytes: bytes}, Destination: fixture.sequence.destination, EncryptionRole: fixture.sequence.encryptionRole, Ctx: ctx, logicalLane: fixture.sequence.logicalLane, logicalLaneExplicit: true}
++		accepted, err := fixture.client.sendBuffer.Pack(pack, 0)
++		if !accepted {
++			MessagePoolReturn(bytes)
++		}
++		if accepted || err == nil {
++			t.Errorf("canceled caller admission=%t error=%v", accepted, err)
++		}
++		if providerPureAckCurrentLane(fixture) != fixture.sequence || fixture.sequence.ctx.Err() != nil {
++			t.Error("a canceled unadmitted caller retired its shared sequence")
++		}
++		if len(fixture.sequence.packs) != 2 || fixture.sequence.packAdmission.count != 2 {
++			t.Error("canceled caller changed sibling admission ownership")
++		}
++	})
++}
++
++// Cancellation during the actual count-capacity wait must return the same
++// failure without treating the healthy lane as a closed generation.
++func TestSendBufferCallerCancelDuringAdmissionKeepsSiblings(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 2)
++		ctx, cancel := context.WithCancel(context.Background())
++		defer cancel()
++		bytes := MessagePoolCopy([]byte("blocked-caller"))
++		pack := &SendPack{TransferOptions: TransferOptions{Ack: true}, Frame: &protocol.Frame{MessageBytes: bytes}, Destination: fixture.sequence.destination, EncryptionRole: fixture.sequence.encryptionRole, Ctx: ctx, logicalLane: fixture.sequence.logicalLane, logicalLaneExplicit: true}
++		type result struct {
++			accepted bool
++			err      error
++		}
++		done := make(chan result, 1)
++		go func() {
++			accepted, err := fixture.client.sendBuffer.Pack(pack, -1)
++			done <- result{accepted: accepted, err: err}
++		}()
++		synctest.Wait()
++		select {
++		case <-done:
++			t.Fatal("the full two-slot lane did not retain the caller outside admission")
++		default:
++		}
++		cancel()
++		got := <-done
++		if !got.accepted {
++			MessagePoolReturn(bytes)
++		}
++		if got.accepted || got.err == nil {
++			t.Errorf("canceled blocked admission=%t error=%v", got.accepted, got.err)
++		}
++		if providerPureAckCurrentLane(fixture) != fixture.sequence || len(fixture.sequence.packs) != 2 {
++			t.Error("cancellation after a capacity wait retired sibling ownership")
++		}
++	})
++}
++
++// A successful send has already transferred ownership, even if that caller
++// cancels before its next send. Failure of the next Pack cannot reclaim it.
++func TestSendBufferCallerCancelKeepsAcceptedPackOwned(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		ctx, cancel := context.WithCancel(context.Background())
++		firstBytes := MessagePoolCopy([]byte("accepted-caller"))
++		first := &SendPack{TransferOptions: TransferOptions{Ack: true}, Frame: &protocol.Frame{MessageBytes: firstBytes}, Destination: fixture.sequence.destination, EncryptionRole: fixture.sequence.encryptionRole, Ctx: ctx, logicalLane: fixture.sequence.logicalLane, logicalLaneExplicit: true}
++		if accepted, err := fixture.client.sendBuffer.Pack(first, 0); !accepted || err != nil {
++			MessagePoolReturn(firstBytes)
++			t.Fatalf("first caller was not admitted: %t %v", accepted, err)
++		}
++		cancel()
++		nextBytes := MessagePoolCopy([]byte("canceled-next"))
++		next := &SendPack{TransferOptions: TransferOptions{Ack: true}, Frame: &protocol.Frame{MessageBytes: nextBytes}, Destination: fixture.sequence.destination, EncryptionRole: fixture.sequence.encryptionRole, Ctx: ctx, logicalLane: fixture.sequence.logicalLane, logicalLaneExplicit: true}
++		accepted, err := fixture.client.sendBuffer.Pack(next, 0)
++		if !accepted {
++			MessagePoolReturn(nextBytes)
++		}
++		if accepted || err == nil || providerPureAckCurrentLane(fixture) != fixture.sequence {
++			t.Error("the canceled next send retired its accepted predecessor's lane")
++		}
++		select {
++		case owned := <-fixture.sequence.packs:
++			if owned != first || string(owned.Frame.MessageBytes) != "accepted-caller" {
++				t.Error("accepted Pack ownership or bytes changed")
++			}
++			owned.returnFrames()
++			owned.releaseRaw()
++		default:
++			t.Error("accepted Pack was reclaimed before its consumer took it")
++		}
++	})
++}
++
++// A real sequence closure is still a generation failure. A live caller must
++// recreate and admit through the replacement, preserving existing semantics.
++func TestSendBufferClosedSequenceStillRecreatesForLiveCaller(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		releaseWorker := make(chan struct{})
++		defer close(releaseWorker)
++		fixture := newProviderPureAckAdmissionFixtureWithSetup(t, WindowSizingConstant, func(settings *ClientSettings) {
++			settings.SendBufferSettings.beforeRunSendSequenceForTest = func(id sendSequenceId) {
++				if id.Destination != ControlId {
++					<-releaseWorker
++				}
++			}
++		})
++		closed, cancel := context.WithCancel(fixture.provider.ctx)
++		cancel()
++		fixture.sequence.ctx = closed
++		// The immutable constructor hook parks only data workers. Admission
++		// remains the real SendBuffer/SendSequence path and unchanged channel.
++		bytes := MessagePoolCopy([]byte("replacement-caller"))
++		pack := &SendPack{TransferOptions: TransferOptions{Ack: true}, Frame: &protocol.Frame{MessageBytes: bytes}, Destination: fixture.sequence.destination, EncryptionRole: fixture.sequence.encryptionRole, Ctx: fixture.provider.ctx, logicalLane: fixture.sequence.logicalLane, logicalLaneExplicit: true}
++		accepted, err := fixture.client.sendBuffer.Pack(pack, 0)
++		replacement := providerPureAckCurrentLane(fixture)
++		if !accepted || err != nil {
++			MessagePoolReturn(bytes)
++			t.Fatalf("live caller did not recreate closed sequence: %t %v", accepted, err)
++		}
++		if replacement == nil || replacement == fixture.sequence {
++			t.Fatal("closed sequence was retained")
++		}
++		owned := <-replacement.packs
++		if owned != pack {
++			t.Error("replacement admitted different Pack ownership")
++		}
++		owned.returnFrames()
++		owned.releaseRaw()
++	})
++}
+--- /dev/null
++++ b/transfer_forward_pack_context_owner_test.go
+@@ -0,0 +1,199 @@
++// A forwarding caller owns only its unadmitted frame. Its cancellation must
++// preserve the shared destination worker and already-admitted sibling bytes.
++package connect
++
++import (
++	"context"
++	"testing"
++	"testing/synctest"
++	"time"
++)
++
++// Pause real workers before Run so the bounded two-entry channel is the exact
++// admission boundary; client cancellation releases every paused owner.
++type forwardPackCallerOwnerFixture struct {
++	client      *Client
++	destination TransferPath
++	sequence    *ForwardSequence
++}
++
++// All context waits are inside the explicit synctest clock. No socket or route
++// must become available for admission, cancellation, or final ownership release.
++func newForwardPackCallerOwnerFixture(t *testing.T) *forwardPackCallerOwnerFixture {
++	t.Helper()
++	ctx, cancel := context.WithCancel(context.Background())
++	settings := closeWaitClientSettings()
++	settings.ForwardBufferSettings.SequenceBufferSize = 2
++	settings.ForwardBufferSettings.beforeRunForwardSequenceForTest = func(TransferPath) { <-ctx.Done() }
++	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
++	fixture := &forwardPackCallerOwnerFixture{client: client, destination: DestinationId(NewId())}
++	t.Cleanup(func() {
++		cancel()
++		if err := client.CloseAndWait(context.Background()); err != nil {
++			t.Errorf("forward caller fixture close: %v", err)
++		}
++	})
++	return fixture
++}
++
++// Read the destination owner under the same lock used for replacement.
++func (self *forwardPackCallerOwnerFixture) currentSequence() *ForwardSequence {
++	self.client.forwardBuffer.mutex.Lock()
++	defer self.client.forwardBuffer.mutex.Unlock()
++	return self.client.forwardBuffer.forwardSequences[self.destination]
++}
++
++// A true return transfers the pooled bytes to the real ForwardSequence.
++func (self *forwardPackCallerOwnerFixture) send(ctx context.Context, value string, timeout time.Duration) (bool, error) {
++	bytes := MessagePoolCopy([]byte(value))
++	accepted, err := self.client.forwardBuffer.Pack(&ForwardPack{
++		Destination: self.destination, TransferFrameBytes: bytes, Ctx: ctx,
++	}, timeout)
++	if !accepted {
++		MessagePoolReturn(bytes)
++	}
++	return accepted, err
++}
++
++// Retain two accepted sibling frames before the attempted canceled caller.
++func (self *forwardPackCallerOwnerFixture) fill(t *testing.T) {
++	t.Helper()
++	for _, value := range []string{"accepted-first", "accepted-second"} {
++		if accepted, err := self.send(self.client.ctx, value, 0); !accepted || err != nil {
++			t.Fatalf("forward sibling admission: %t %v", accepted, err)
++		}
++	}
++	self.sequence = self.currentSequence()
++	if self.sequence == nil || len(self.sequence.packs) != 2 {
++		t.Fatal("forward fixture did not occupy its two admitted slots")
++	}
++}
++
++// The original shared worker and both accepted buffers survive caller failure.
++func (self *forwardPackCallerOwnerFixture) requireSiblings(t *testing.T) {
++	t.Helper()
++	if self.currentSequence() != self.sequence || self.sequence.ctx.Err() != nil {
++		t.Error("canceled forwarding caller retired the healthy shared destination")
++	}
++	if len(self.sequence.packs) != 2 {
++		t.Errorf("forwarded sibling ownership changed: %d", len(self.sequence.packs))
++	}
++	for _, expected := range []string{"accepted-first", "accepted-second"} {
++		select {
++		case pack := <-self.sequence.packs:
++			if string(pack.TransferFrameBytes) != expected {
++				t.Errorf("forward sibling bytes changed: %q", pack.TransferFrameBytes)
++			}
++			MessagePoolReturn(pack.TransferFrameBytes)
++		default:
++			t.Error("forward sibling disappeared before its consumer")
++		}
++	}
++}
++
++// Pre-canceled admission is not evidence that a live destination closed.
++func TestForwardBufferCallerCancelPreservesSharedAdmission(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newForwardPackCallerOwnerFixture(t)
++		fixture.fill(t)
++		ctx, cancel := context.WithCancel(context.Background())
++		cancel()
++		accepted, err := fixture.send(ctx, "canceled-unadmitted", 0)
++		if accepted || err == nil {
++			t.Errorf("canceled forwarding caller admission: %t %v", accepted, err)
++		}
++		fixture.requireSiblings(t)
++	})
++}
++
++// A cancellation arriving while the real queue wait is blocked has the same
++// caller-only ownership as cancellation before the first attempt.
++func TestForwardBufferCallerCancelDuringAdmissionKeepsSiblings(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newForwardPackCallerOwnerFixture(t)
++		fixture.fill(t)
++		ctx, cancel := context.WithCancel(context.Background())
++		defer cancel()
++		type result struct {
++			accepted bool
++			err      error
++		}
++		done := make(chan result, 1)
++		go func() {
++			accepted, err := fixture.send(ctx, "blocked-unadmitted", -1)
++			done <- result{accepted: accepted, err: err}
++		}()
++		synctest.Wait()
++		select {
++		case <-done:
++			t.Fatal("full forward queue did not block this caller")
++		default:
++		}
++		cancel()
++		got := <-done
++		if got.accepted || got.err == nil {
++			t.Errorf("canceled blocked forwarding admission: %t %v", got.accepted, got.err)
++		}
++		fixture.requireSiblings(t)
++	})
++}
++
++// A later caller cancellation cannot retract a frame already owned by the
++// forwarding sequence, even when that caller tries another send.
++func TestForwardBufferCallerCancelKeepsAcceptedPackOwned(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newForwardPackCallerOwnerFixture(t)
++		ctx, cancel := context.WithCancel(context.Background())
++		if accepted, err := fixture.send(ctx, "accepted-caller", 0); !accepted || err != nil {
++			cancel()
++			t.Fatalf("first forwarding caller was not admitted: %t %v", accepted, err)
++		}
++		original := fixture.currentSequence()
++		cancel()
++		accepted, err := fixture.send(ctx, "canceled-next", 0)
++		if accepted || err == nil || fixture.currentSequence() != original || original.ctx.Err() != nil {
++			t.Error("canceled next caller retired the admitted predecessor's owner")
++		}
++		select {
++		case pack := <-original.packs:
++			if string(pack.TransferFrameBytes) != "accepted-caller" {
++				t.Error("admitted forwarding bytes changed")
++			}
++			MessagePoolReturn(pack.TransferFrameBytes)
++		default:
++			t.Error("admitted frame was reclaimed before its consumer")
++		}
++	})
++}
++
++// A genuinely closed destination still replaces its generation for a caller
++// whose own context remains live; cancellation classification cannot pin it.
++func TestForwardBufferClosedSequenceStillRecreatesForLiveCaller(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newForwardPackCallerOwnerFixture(t)
++		fixture.fill(t)
++		fixture.sequence.Cancel()
++		accepted, err := fixture.send(fixture.client.ctx, "replacement-caller", 0)
++		replacement := fixture.currentSequence()
++		if !accepted || err != nil || replacement == nil || replacement == fixture.sequence {
++			t.Fatalf("live forwarding caller failed closed-sequence replacement: %t %v", accepted, err)
++		}
++		select {
++		case pack := <-replacement.packs:
++			if string(pack.TransferFrameBytes) != "replacement-caller" {
++				t.Error("replacement owns different forwarding bytes")
++			}
++			MessagePoolReturn(pack.TransferFrameBytes)
++		default:
++			t.Error("replacement admission lost caller ownership")
++		}
++	})
++}

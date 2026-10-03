@@ -1,0 +1,67 @@
+{
+  "all_archived_outcomes": {
+    "FAIL": 3,
+    "PASS": 12,
+    "SKIP": 0,
+    "race_warning_blocks": 0,
+    "storm_observations": 18
+  },
+  "archive_result": "complete_pinned_storm_fixture_precondition_evidence_test_only",
+  "by_log": [
+    {
+      "classification": "default-pacer-precondition-failure-before",
+      "name": "virtual-current-v3.log",
+      "outcomes": {
+        "FAIL": 3,
+        "PASS": 0,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "8cb8f1372e9ef0e3d553d393f64ede3010760c81c9713b7eeea0725626fa3b04",
+      "storm_observations": 3
+    },
+    {
+      "classification": "constant-window-forced-storm-control",
+      "name": "virtual-constant-v3.log",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 3,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "028d5c2d1d5539ccc11c5215fb1e387ca27f9bb32c0de4aaf67e260f9635dbaa",
+      "storm_observations": 6
+    },
+    {
+      "classification": "final-race-fixture-and-default-pacer-controls",
+      "name": "final.log",
+      "outcomes": {
+        "FAIL": 0,
+        "PASS": 9,
+        "SKIP": 0
+      },
+      "race_warning_blocks": 0,
+      "raw_log_sha256": "9aab2768672858da6b2e4ad2d9985bf89f1895d0f06f9fe82495f889bc58afe8",
+      "storm_observations": 9
+    }
+  ],
+  "constant_window_forced_storm_control": {
+    "FAIL": 0,
+    "PASS": 3,
+    "SKIP": 0,
+    "race_warning_blocks": 0
+  },
+  "default_pacer_precondition_before": {
+    "FAIL": 3,
+    "PASS": 0,
+    "SKIP": 0,
+    "race_warning_blocks": 0
+  },
+  "excluded_setup_attempts": 3,
+  "final_race_controls": {
+    "FAIL": 0,
+    "PASS": 9,
+    "SKIP": 0,
+    "race_warning_blocks": 0
+  }
+}

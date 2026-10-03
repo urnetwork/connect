@@ -26,34 +26,27 @@ func TestRemoteUserNatProviderPingOwnsAsyncEcho(t *testing.T) {
 	defer client.Cancel()
 
 	peerId := NewId()
-	destination := DestinationId(peerId)
+	transferKey := TransferKey{
+		EncryptionRole: protocol.SequenceRole_SequenceRoleServer,
+	}
 	id := sendSequenceId{
-		Destination:         destination,
-		CompanionContract:   true,
-		EncryptionCompanion: true,
+		Destination:       peerId,
+		CompanionContract: true,
+		EncryptionRole:    sequenceTlsRoleServer,
 	}
-
-	// Install a deliberately paused sequence. This makes the asynchronous
-	// ownership boundary deterministic: ClientReceive can enqueue the echo,
-	// but no sequence goroutine serializes it before we recycle the input.
-	sequence := &SendSequence{
-		ctx:           ctx,
-		cancel:        func() {},
-		packs:         make(chan *SendPack, 1),
-		idleCondition: NewIdleCondition(),
-	}
-	client.sendBuffer.mutex.Lock()
-	client.sendBuffer.sendSequences[id] = sequence
-	client.sendBuffer.wireSendSequences[id.wireId()] = sequence
-	client.sendBuffer.mutex.Unlock()
-
 	providerSettings := DefaultRemoteUserNatProviderSettings()
 	provider := &RemoteUserNatProvider{
+		ctx:                      ctx,
 		client:                   client,
 		settings:                 providerSettings,
 		sourceProvideMode:        map[Id]protocol.ProvideMode{},
 		sourceP2pPriorityRefresh: map[Id]time.Time{},
 	}
+
+	// Install a deliberately paused sequence. This makes the asynchronous
+	// ownership boundary deterministic: ClientReceive can enqueue the echo,
+	// but no sequence goroutine serializes it before we recycle the input.
+	sequence := installProviderReturnTestSequence(t, provider, client, id)
 
 	want := []byte{0x70, 0x69, 0x6e, 0x67}
 	inboundBytes := MessagePoolCopy(want)
@@ -66,7 +59,10 @@ func TestRemoteUserNatProviderPingOwnsAsyncEcho(t *testing.T) {
 	provider.ClientReceive(
 		SourceId(peerId),
 		[]*protocol.Frame{inbound},
-		Peer{ProvideMode: protocol.ProvideMode_Public},
+		Peer{
+			ProvideMode: protocol.ProvideMode_Public,
+			TransferKey: transferKey,
+		},
 	)
 
 	var queued *SendPack
@@ -77,6 +73,9 @@ func TestRemoteUserNatProviderPingOwnsAsyncEcho(t *testing.T) {
 	}
 	if queued.Frame == inbound {
 		t.Fatal("ping echo retained the borrowed receive Frame")
+	}
+	if queued.Destination != peerId {
+		t.Fatalf("ping echo destination = %s, want %s", queued.Destination, peerId)
 	}
 
 	// Simulate the receive owner returning and resetting its decoded Frame as

@@ -1,0 +1,8 @@
+{
+  "compact_ack_bytes": 104,
+  "decoded_ack_bytes": 680,
+  "decoded_pack_owner_bytes": 1000,
+  "receive_item_bytes": 232,
+  "receive_pack_bytes": 216,
+  "sequence_ack_bytes": 96
+}

@@ -1,0 +1,10 @@
+{
+  "source_log": "throughput-fix-2-pacing-long-feedback-before.log",
+  "source_log_sha256": "15129ee49952cbdca4a90dc51ec6935d33d44b26149ab63033bac3343730acf3",
+  "outcome": "process failed",
+  "top_level_passed": 0,
+  "top_level_failed": 1,
+  "top_level_skipped": 0,
+  "ledger_rows": 2,
+  "note": "Raw log remains outside this archive. The ledger retains complete service-reading numerical rows; outcomes retain the failure summary."
+}

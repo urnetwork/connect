@@ -1,0 +1,61 @@
+{
+  "created_utc": "2026-09-17T01:02:52.203686+00:00",
+  "mode": "model-core",
+  "test_pattern": "^(TestWindowPathFifo.*|TestWindowPathGapDeadline|TestWindowCompressionResidence.*|TestWindowPathDeterministicPerformanceMatrix|TestWindowPathBoundsBurstsAtFiniteRelay|TestWindowPathSlowLinkKeepsCapacity|TestWindowPathService.*|TestWindowPathWindowMismatch.*|TestWindowPathSdk.*|TestWindowPathAckTailRoundTripGrowthControl|TestWindowPathRetainedSdk.*|TestWindowPathDiscovery.*|TestWindowPathPermissionShrinkKeepsPace|TestWindowPathCapacityDropStillLowersPace)$",
+  "run_flags": [
+    "-test.short=false",
+    "-test.skip",
+    "^(TestWindowPathAckTailRoundTripGrowthControl|TestWindowPathServiceRoundTripChanges|TestWindowPathServiceRoundTripGrowthBeyondOldRing)$"
+  ],
+  "connect": {
+    "revision": "f903f59a96e629f8b1dfa5849d7a3198aaef9920",
+    "branch": "throughput-fix-2",
+    "source_sha256": "5099a11c24e26b9f4bd9ed0f8da8ce067bbb6d50521f7c52250898bfad6aaad4",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "042642ce3c7302d9adceb0a198fb40e8747fdfdb508d863b14f06b94e2df1d18",
+  "benchmark_ledger_parser_sha256": "566ed53eb6762d5daea23b5dac1492d279c25c1e8fbee9b6d52c0ffda1fb9585",
+  "host_load_average_at_start": [
+    6.97216796875,
+    7.14501953125,
+    7.44384765625
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {},
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "deferred_tests": {
+    "reason": "User deferred explicit connection-quality-change performance tests until NetworkQualityChanged is implemented and invoked at the modeled path switch.",
+    "tests": [
+      "TestWindowPathAckTailRoundTripGrowthControl",
+      "TestWindowPathServiceRoundTripChanges",
+      "TestWindowPathServiceRoundTripGrowthBeyondOldRing"
+    ],
+    "retained_core_coverage": "Static paths, cold and warm pacing recovery, sustained congestion, window changes, ACK scheduling, ownership and FIFO fixture correctness.",
+    "complete_historical_mode": "model"
+  },
+  "deferred_tests_sha256": "9b44cca05105b10c1fb67b970b807f783311992a2dacde1b4b50c94143f26ad8",
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 913,
+        "input_sha256": "3c74773da648de66383da82d9b9de750991ac05a9a0ff0faa499d732748be65d"
+      }
+    },
+    "external_local_replacements": [
+      "/Users/brien/urnetwork/glog"
+    ],
+    "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "binary_sha256": "21f76e9d56b873715a0a271a2438a0c6075118c9ed2ec5a653ec876362dbd01d",
+  "sources_stable_during_build": true,
+  "source_inspection_uses_build_snapshot": true
+}

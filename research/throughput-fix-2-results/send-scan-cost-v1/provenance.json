@@ -1,0 +1,5 @@
+{
+  "classification": "benchmark diagnostic; no host timing threshold",
+  "method": "Frozen ownership-fixed source plus benchmark-only file. Normal and race binaries, 6 benchmark names x 3 repetitions each.",
+  "readings": 36
+}

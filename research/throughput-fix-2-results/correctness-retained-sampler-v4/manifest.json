@@ -1,0 +1,11 @@
+{
+  "archive": "correctness-retained-sampler-v4",
+  "payload_sha256": {
+    "diagnostics.jsonl": "92f3acf6b37ed11a9e02f3b51ad9e89d6d25129b12d477a39d87f7c838b44646",
+    "ledger.jsonl": "68169ccca4bf15bb3f75cd0e1b8c6607ee8b64801d3f80919cceb562a04957c5",
+    "outcomes.jsonl": "6e0905f35f5a4fc4b6ca6847f74d8c71194e3f0834e110fdd5dc613c9242c821",
+    "provenance.json": "607328cf164ef85b5453201c79d85f670b7a19177bafe9ab2ea5f57880f4bd30",
+    "source-pins.json": "9c72588cf3953fa1b2a875532815fcd8e5781580c01c9f7c7268a1aa2ef1615a",
+    "status.json": "591406bc16b4b53a5121bbe801f064e1376203f2551186924666b25d6c06a021"
+  }
+}

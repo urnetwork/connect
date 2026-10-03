@@ -1,0 +1,6 @@
+{
+  "finding": "A temporary-directory alias was compared without path normalization. The final test resolves both paths before comparison.",
+  "outcome": "expected intermediate failure",
+  "raw_log_sha256": "59f2bfa737c50f5128f257eac15d6891c750516b91b1c113cb6632b86e26594f",
+  "schema": "throughput-fix-2/source-snapshot-intermediate-portability-v1"
+}

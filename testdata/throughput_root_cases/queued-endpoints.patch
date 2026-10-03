@@ -1,0 +1,110 @@
+--- a/transfer.go
++++ b/transfer.go
+@@ -4137,6 +4137,7 @@
+ 		var transferFrameBytes []byte
+ 		var transportType TransportType
+ 		var carrierReliability CarrierReliability
++		var receiveQueued bool
+ 		var err error
+ 		c := func() error {
+ 			if carrierReader, ok := multiRouteReader.(transferCarrierMultiRouteReader); ok {
+@@ -4147,6 +4148,7 @@
+ 				)
+ 				transportType = disposition.transportType
+ 				carrierReliability = disposition.reliability
++				receiveQueued = disposition.queued
+ 			} else if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
+ 				transferFrameBytes, transportType, err = transportReader.ReadWithTransport(
+ 					self.ctx,
+@@ -4513,7 +4515,7 @@
+ 						}
+ 					}
+ 				}
+-				recordIngressCounterDiagnostic(self.clientId, source.SourceId, pack, receiveRole, receiveCompanion, transportType, ingressOuterBytes, ingressAt)
++				recordIngressQueueCounterDiagnostic(self.clientId, source.SourceId, pack, receiveRole, receiveCompanion, transportType, ingressOuterBytes, ingressAt, receiveQueued)
+ 				messageByteCount := MessageByteCount(pack.Frames)
+ 				decodedOwner := decodedFrame.detachPackOwner()
+ 				c := func() bool {
+--- a/transfer_route_manager.go
++++ b/transfer_route_manager.go
+@@ -332,6 +332,7 @@
+ type transferReceiveDisposition struct {
+ 	transportType TransportType
+ 	reliability   CarrierReliability
++	queued        bool
+ }
+ 
+ type transferCarrierMultiRouteReader interface {
+@@ -1856,10 +1857,11 @@
+ 	return TransportTypeUnknown
+ }
+ 
+-func (self *routeSnapshot) receiveDisposition(route Route) transferReceiveDisposition {
++func (self *routeSnapshot) receiveDisposition(route Route, queued bool) transferReceiveDisposition {
+ 	return transferReceiveDisposition{
+ 		transportType: self.transportType(route),
+ 		reliability:   self.routeCarrierProperties[route].ReceiveReliability,
++		queued:        queued,
+ 	}
+ }
+ 
+@@ -3205,7 +3207,7 @@
+ 						self.log.Infof("[mrr]nb %s/%s<- s(%s)\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId)
+ 					}
+ 					self.updateReceiveStats(route, 1, ByteCount(len(transferFrameBytes)))
+-					return transferFrameBytes, snapshot.receiveDisposition(route), nil
++					return transferFrameBytes, snapshot.receiveDisposition(route, true), nil
+ 				} else {
+ 					// mark the route as closed, try again
+ 					self.setActive(route, false)
+@@ -3250,7 +3252,7 @@
+ 			case transferFrameBytes, ok := <-route0:
+ 				if ok {
+ 					self.updateReceiveStats(route0, 1, ByteCount(len(transferFrameBytes)))
+-					return transferFrameBytes, snapshot.receiveDisposition(route0), nil
++					return transferFrameBytes, snapshot.receiveDisposition(route0, false), nil
+ 				}
+ 				// mark the route as closed, try again
+ 				self.setActive(route0, false)
+@@ -3258,7 +3260,7 @@
+ 			case transferFrameBytes, ok := <-route1:
+ 				if ok {
+ 					self.updateReceiveStats(route1, 1, ByteCount(len(transferFrameBytes)))
+-					return transferFrameBytes, snapshot.receiveDisposition(route1), nil
++					return transferFrameBytes, snapshot.receiveDisposition(route1, false), nil
+ 				}
+ 				self.setActive(route1, false)
+ 				continue
+@@ -3348,7 +3350,7 @@
+ 			if ok {
+ 				transferFrameBytes := value.Bytes()
+ 				self.updateReceiveStats(route, 1, ByteCount(len(transferFrameBytes)))
+-				return transferFrameBytes, snapshot.receiveDisposition(route), nil
++				return transferFrameBytes, snapshot.receiveDisposition(route, false), nil
+ 			} else {
+ 				// mark the route as closed, try again
+ 				self.setActive(route, false)
+--- a/transfer_window_receiver_ingress_counter_diagnostic_test.go
++++ b/transfer_window_receiver_ingress_counter_diagnostic_test.go
+@@ -123,6 +123,11 @@
+ 
+ // Called after decoding identity, with time and outer size captured before unwrap.
+ func recordIngressCounterDiagnostic(receiver, source Id, pack *protocol.Pack, role sequenceTlsRole, companion bool, transport TransportType, bytes ByteCount, at time.Time) {
++	recordIngressQueueCounterDiagnostic(receiver, source, pack, role, companion, transport, bytes, at, false)
++}
++
++// Count all physical ingress, but queued software reads cannot be a rate endpoint.
++func recordIngressQueueCounterDiagnostic(receiver, source Id, pack *protocol.Pack, role sequenceTlsRole, companion bool, transport TransportType, bytes ByteCount, at time.Time, queued bool) {
+ 	if pack == nil || pack.Nack || transport != TransportTypeH1 || bytes <= 0 {
+ 		return
+ 	}
+@@ -165,6 +170,9 @@
+ 	tuple.physicalBytes, tuple.duplicateBytes = traffic.physicalBytes, traffic.duplicateBytes
+ 	tuple.at = at.UnixNano()
+ 	d.groups[key] = tuple
++	if queued {
++		return
++	}
+ 	old := d.order[d.next]
+ 	delete(d.tuples, old)
+ 	d.order[d.next] = messageId

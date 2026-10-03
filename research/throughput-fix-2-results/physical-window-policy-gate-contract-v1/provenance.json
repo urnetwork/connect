@@ -1,0 +1,32 @@
+{
+  "calibration_gates_changed": false,
+  "comparison": "Before helper preserves the exact original smoke/duplex predicate Sized == (arm == delivery), with new metadata capture. After changes only the shared predicate to actual resolved settings and destination owner eligibility. The same8 tests run both sides.",
+  "controls": "Accept service-qualified and aged retained states. Reject wrong-arm settings despite fresh evidence, disabled scale/budget/competing admission, sequence mode/instrument/budget disagreement, missing destination owner and unknown arm. Correct qualified/constant cases remain positive controls.",
+  "correct_contract": "Delivery arms use FromDelivery, positive configured/effective scale, actual memory budget and owned delivery instrument on a nonempty set of destination sequences. Constant arms use Constant with zero scale. Actual sequence mode and effective scale must agree with construction.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "independent_evidence": "Sized, ServiceSized and learned/retained capacity remain untouched logged diagnostics. Service qualification and expired evidence can both be valid states of the configured policy.",
+  "isolated_duplex_patch_sha256": "c8625a3a5e3cbea600959dc8c6a630331ad51a5fcd87234ad8d9f3f60af5bb51",
+  "isolated_sibling": "transfer_window_h1_duplex_test.go remains absent from live; its shared-gate call is a separate patch.",
+  "limits": "This validates gate semantics, not physical throughput or the optional ACK policy. Integration on current live source is a separate narrow check.",
+  "live_patch_scope": [
+    "transfer_window_h1_physical_test.go",
+    "transfer_window_h1_policy_gate_test.go",
+    "transfer_window_h1_policy_contract_test.go"
+  ],
+  "original_failed_physical_runs_preserved": true,
+  "outcomes": "Before3P21F; after24P0F, race=true/no warnings.",
+  "physical_rerun_performed": false,
+  "production_changes": [],
+  "race": true,
+  "refusal_gates_changed": false,
+  "repetitions": 3,
+  "smoke_patch_sha256": "9bbbf1c96d70806c25d1c28a9fd5f1d8165ff57759579d77477b9a758c38de15",
+  "snapshot_safety": "Constructor settings and ring allocation are immutable in this fixture. Copy destination owner pointers under the existing buffer lock, release it, then read settings and the queue budget through its own accessor. No estimator call, admission, retained-value mutation, wire change or external callback.",
+  "source_base": {
+    "artifact": "throughput-fix-2-physical-h1-ack-policy-after-v1",
+    "inventory_sha256": "d531c929cb52c22a84445d12b4e2a23de1acecc5a0d9bbc105591066dfd4fc90"
+  },
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "throughput_gates_changed": false,
+  "warmups_and_stimuli_changed": false
+}

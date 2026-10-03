@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "2c3199e8fcc1633b3db68501476b106e0b1f57caed0d776d59ae9a79d4d26e9e",
+  "binary_sha256": "fb66f2fd23725a8de0c53344f044ff76a76dd10543b16ef1367b91d5795c546b",
+  "effective_inputs_sha256": "b7814a49fb5d0d2547342d997df5af970c4abecb50e96820bb7c62064c5f528c",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiverSustainedPacing",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied module as build; original absolute relationship is pinned by original status/manifest hashes",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:26:34.637220+00:00",
+  "loadavg_start": [
+    5.5107421875,
+    12.56103515625,
+    15.53955078125
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 17.79928837530315,
+  "loadavg_end": [
+    5.47607421875,
+    12.087890625,
+    15.2998046875
+  ],
+  "ended_utc": "2026-09-16T20:26:52.436709+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "45d984619f618d063ca2d2af0a0e6406d3fe186f3cc128f4738b10e792668337",
+  "pass": 18,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 0,
+  "normalization_note": "Legal opening 40, two confirmed 6,000-byte items per largest cumulative group, and normal controller reads before each physical offer/refill. Production is byte-identical to historical v2. All 18 checks pass; warm service 3,324,121 B/s gives pacing 3,157,914 B/s versus own delivery 2,823,529 B/s. This is an open-loop estimate-consumer control, not a closed-loop throughput claim.",
+  "rows": 324
+}

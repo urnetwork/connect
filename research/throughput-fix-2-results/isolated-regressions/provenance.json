@@ -1,0 +1,5 @@
+{
+  "source_log_sha256": "fcf58530fe27da6111524ae569f48be48630be4e8bb4c58ba028b13fc3f0f3fa",
+  "note": "The two host-sensitive full-sweep failures passed in isolation on the source containing the adjacent fixes. No failure was discarded.",
+  "outcome": "passed"
+}

@@ -1,0 +1,6 @@
+{
+  "classification": "Initial writer-handle race comparison: one fresh-process teardown miss rejects the broad start barrier as a deterministic gate; exact failures, clean after runs and adjacent controls are preserved.",
+  "outcomes": 96,
+  "readings": 0,
+  "worker_readings": 0
+}

@@ -1,0 +1,12 @@
+=== RUN   TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget
+    transport_p2p_webrtc_test.go:1737: network peer over-admitted its full dedicated budget
+--- FAIL: TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget (0.00s)
+=== RUN   TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget
+    transport_p2p_webrtc_test.go:1737: network peer over-admitted its full dedicated budget
+--- FAIL: TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget (0.00s)
+=== RUN   TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget
+    transport_p2p_webrtc_test.go:1737: network peer over-admitted its full dedicated budget
+--- FAIL: TestWebRtcNetworkPeerAdmissionWaitsOnDedicatedBudget (0.00s)
+FAIL
+FAIL	github.com/urnetwork/connect	0.785s
+FAIL

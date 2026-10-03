@@ -1,0 +1,69 @@
+{
+  "archive_kind": "receiver_timing_carrier_evidence",
+  "handoff": {
+    "name": "carrier-handoff.json",
+    "scope": "isolated receiver timing carrier eligibility and original long RTT gate",
+    "sha256": "b21b3f0b0426ef0e22fd03ae8152dc61d0d06164d0b6e9383200f89bb6cb2638"
+  },
+  "pins": {
+    "files": [
+      {
+        "name": "carrier-transfer.go",
+        "sha256": "792d5c748044808ff24aed31598f387c415a0d594adcf366d927795881f5febe"
+      },
+      {
+        "name": "carrier_test.go",
+        "sha256": "dfafadf35d3e4bd99992720da9e46f5cbe3ae454c621129e516f78e8dd573c0c"
+      },
+      {
+        "name": "service-root-carrier_test.go",
+        "sha256": "91d067fd32883ac006c4939e40975b7455ef03409036a2871911d4cc2a6e4cc2"
+      },
+      {
+        "name": "carrier-before-overlay.json",
+        "sha256": "d0525352aaa29bdb475f07828de0f766c9ffd8b7a285b5842fddc29ac90c340e"
+      },
+      {
+        "name": "carrier-after-overlay.json",
+        "sha256": "4a1dc8a9afb607eb3e44da03923635d423ef200cd42cdee933ef2253fd21682b"
+      },
+      {
+        "name": "carrier-before.log",
+        "sha256": "2385f81209502b105a5ec8486108e22c2495e1f06a365b58b92629ab34b51af1"
+      },
+      {
+        "name": "carrier-after.log",
+        "sha256": "e29218c42ca9f644bc3c772c105c00c0971b6e64a7f854d4bd644c4dec57d43d"
+      },
+      {
+        "name": "combined-v2-long-rtt.log",
+        "sha256": "e18a930151c6fa07be804bf4b32d1b2107f799f43951aec769a72114a3d7fae9"
+      },
+      {
+        "name": "combined-v2.test",
+        "sha256": "4653bc0b933746c72acd10a8c7a4ddd32b9c8a85c469491d66abfb5c418c0bb3"
+      }
+    ],
+    "transfer_base": {
+      "name": "combined-v2-transfer.go",
+      "sha256": "dd5bf2f3037cd30f9ba913b478819b6b9b155da7aeb6d51f49774edeec2e88f6"
+    }
+  },
+  "sanitization": {
+    "local_paths_network_addresses": "removed",
+    "raw_logs_sources_overlays_binaries": "retained locally; represented by SHA-256 only"
+  },
+  "schema_version": 1,
+  "scope_limits": {
+    "classification": "isolated_candidate_root_evidence",
+    "performance_acceptance": "not evaluated",
+    "separate_from": "the immutable 733ee2 receiver timing campaigns and later baseline experiments",
+    "shared_source_attribution": "none; root later applied only an independently reviewed carrier helper hunk/test/explicit-H1 fixture lines"
+  },
+  "verification": {
+    "after_executions": 42,
+    "after_race": true,
+    "before_executions": 3,
+    "verified_pins": 10
+  }
+}

@@ -154,6 +154,138 @@ func TestDmcaStateMachineEncryptedTcpMidstreamAllowed(t *testing.T) {
 	}
 }
 
+func TestDmcaFreshSynReplacesTerminalVerdict(t *testing.T) {
+	settings := DefaultDmcaSecurityPolicySettings()
+	detector := newDmcaDetector(
+		nil,
+		settings,
+		newWebStandardDetector(DefaultWebStandardSettings()),
+	)
+
+	firstSyn := dmcaPath(IpProtocolTcp, 40013, 50000, true)
+	firstSyn.SequenceNumber = 1000
+	if verdict := detector.classify(firstSyn, nil); verdict != dmcaInspecting {
+		t.Fatalf("first SYN verdict = %d, want inspecting", verdict)
+	}
+	firstData := dmcaPath(IpProtocolTcp, 40013, 50000, false)
+	firstData.SequenceNumber = 1001
+	if verdict := detector.classify(firstData, []byte("GET / HTTP/1.1\r\n\r\n")); verdict != dmcaAllow {
+		t.Fatalf("first connection verdict = %d, want allow", verdict)
+	}
+
+	secondSyn := dmcaPath(IpProtocolTcp, 40013, 50000, true)
+	secondSyn.SequenceNumber = 2000
+	if verdict := detector.classify(secondSyn, nil); verdict != dmcaInspecting {
+		t.Fatalf("reused-tuple SYN verdict = %d, want inspecting", verdict)
+	}
+	secondData := dmcaPath(IpProtocolTcp, 40013, 50000, false)
+	secondData.SequenceNumber = 2001
+	if verdict := detector.classify(secondData, btHandshake()); verdict != dmcaBittorrent {
+		t.Fatalf("second connection verdict = %d, want bittorrent", verdict)
+	}
+}
+
+func TestDmcaNamespacesIdenticalFlowBySenderClientId(t *testing.T) {
+	detector := newDmcaDetector(
+		nil,
+		DefaultDmcaSecurityPolicySettings(),
+		newWebStandardDetector(DefaultWebStandardSettings()),
+	)
+	firstSenderClientId := NewId()
+	secondSenderClientId := NewId()
+	path := dmcaPath(IpProtocolTcp, 40016, 50000, false)
+
+	if verdict := detector.classifyForSender(
+		firstSenderClientId,
+		path,
+		[]byte("GET / HTTP/1.1\r\n\r\n"),
+	); verdict != dmcaAllow {
+		t.Fatalf("first sender verdict = %d, want allow", verdict)
+	}
+	if verdict := detector.classifyForSender(
+		secondSenderClientId,
+		path,
+		btHandshake(),
+	); verdict != dmcaBittorrent {
+		t.Fatalf("second sender inherited first sender verdict: got %d, want bittorrent", verdict)
+	}
+	if flowCount := detector.flowCount(); flowCount != 2 {
+		t.Fatalf("identical tuple across senders retained %d flows, want 2", flowCount)
+	}
+
+	returnFin := path.Reverse()
+	returnFin.Fin = true
+	detector.touchIngressForSender(firstSenderClientId, returnFin)
+	if flowCount := detector.flowCount(); flowCount != 1 {
+		t.Fatalf("first sender return FIN left %d flows, want second sender only", flowCount)
+	}
+	if verdict := detector.classifyForSender(secondSenderClientId, path, nil); verdict != dmcaBittorrent {
+		t.Fatalf("first sender teardown changed second sender verdict to %d", verdict)
+	}
+	detector.retireEgressForSender(secondSenderClientId, path)
+	if flowCount := detector.flowCount(); flowCount != 0 {
+		t.Fatalf("provider flow close left %d sender-scoped flows, want 0", flowCount)
+	}
+}
+
+func TestProviderReversePolicyCarriesSenderClientId(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	policy := Reverse(DefaultSecurityPolicy(ctx))
+	firstSenderClientId := NewId()
+	secondSenderClientId := NewId()
+	path := dmcaPath(IpProtocolTcp, 40017, 50000, false)
+
+	firstResult, err := inspectAndRefreshIngressForSenderBorrowed(
+		policy,
+		firstSenderClientId,
+		protocol.ProvideMode_Public,
+		*path,
+		[]byte("GET / HTTP/1.1\r\n\r\n"),
+	)
+	if err != nil || firstResult != SecurityPolicyResultAllow {
+		t.Fatalf("first provider sender result = (%d, %v), want allow", firstResult, err)
+	}
+	secondResult, err := inspectAndRefreshIngressForSenderBorrowed(
+		policy,
+		secondSenderClientId,
+		protocol.ProvideMode_Public,
+		*path,
+		btHandshake(),
+	)
+	if err != nil || secondResult != SecurityPolicyResultIncident {
+		t.Fatalf("second provider sender result = (%d, %v), want incident", secondResult, err)
+	}
+}
+
+func TestDmcaTcpTeardownClearsFlowState(t *testing.T) {
+	detector := newDmcaDetector(
+		nil,
+		DefaultDmcaSecurityPolicySettings(),
+		newWebStandardDetector(DefaultWebStandardSettings()),
+	)
+
+	finPath := dmcaPath(IpProtocolTcp, 40014, 50000, true)
+	finPath.SequenceNumber = 3000
+	detector.classify(finPath, nil)
+	finPath.Syn = false
+	finPath.Fin = true
+	finPath.SequenceNumber = 3001
+	detector.classify(finPath, nil)
+
+	rstPath := dmcaPath(IpProtocolTcp, 40015, 50000, true)
+	rstPath.SequenceNumber = 4000
+	detector.classify(rstPath, nil)
+	rstPath.Syn = false
+	rstPath.Rst = true
+	rstPath.SequenceNumber = 4001
+	detector.classify(rstPath, nil)
+
+	if flowCount := detector.flowCount(); flowCount != 0 {
+		t.Fatalf("DMCA flow table retained %d TCP teardown states, want 0", flowCount)
+	}
+}
+
 // encrypted UDP (first datagram is the start) -> drop
 func TestDmcaStateMachineEncryptedUdpDropped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -300,11 +432,11 @@ func TestEgressSecurityPolicyDpi(t *testing.T) {
 		t.Fatalf("tls on 8443 -> %v, want allow", r)
 	}
 
-	// a privileged destination port (<1024) is allowed without inspection; even a BitTorrent
-	// handshake (an incident on a high port) passes
+	// a privileged destination port (<1024) skips the stateful inspection, but the stateless
+	// BitTorrent signatures still run there: a peer listening on 443 is an incident
 	r, _ = policy.InspectEgress(protocol.ProvideMode_Public, dmcaPath(IpProtocolTcp, 41005, 443, false), btHandshake())
-	if r != SecurityPolicyResultAllow {
-		t.Fatalf("bittorrent handshake on privileged port 443 -> %v, want allow", r)
+	if r != SecurityPolicyResultIncident {
+		t.Fatalf("bittorrent handshake on privileged port 443 -> %v, want incident", r)
 	}
 
 	// known bittorrent port -> drop without payload
@@ -333,8 +465,7 @@ func TestDmcaFlowTtl(t *testing.T) {
 	eg := dmcaPath(IpProtocolTcp, 41100, 40000, false)
 	d.classify(eg, []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
 
-	key := eg.ToIp6Path()
-	key.ServerName = ""
+	key := dmcaFlowKeyForPath(Id{}, eg)
 	shard := d.shards[dmcaShardIndex(key)]
 	read := func() (*dmcaFlowState, bool) {
 		shard.mu.RLock()

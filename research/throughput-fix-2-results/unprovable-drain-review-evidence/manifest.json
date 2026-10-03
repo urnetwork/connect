@@ -1,0 +1,12 @@
+{
+  "archive_kind": "unprovable_drain_review_evidence",
+  "file_count": 5,
+  "file_sha256": {
+    "excluded-diagnostics.json": "32f75c0a291c0183533dde2bf133e952d73e2c167e280575cef6f4cff48baa10",
+    "outcomes.jsonl": "98cd1011bb813bb102a1e97156d032e96389a52b7622ab8068811f3ff32c6caa",
+    "provenance.json": "04c7b705118dfcf01e9002fa3985d9ebf2c715d5a73f69af1e593d5842661fc5",
+    "source-pins.json": "af756d624aecd8e696de35804b3a4c6a88387c5a8ee10da68ef709ee2c51a198",
+    "status.json": "81ae542620c4dfa8c36f40084fe707748f090333a74abd497c1acabe690cb1b0"
+  },
+  "schema_version": 1
+}

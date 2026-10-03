@@ -1,0 +1,11 @@
+=== RUN   TestRelayInflationUsesConstantSendWindow
+    flight_gate_relay_inflation_test.go:129: queue=64 defer=true sender: historical control uses policy=1 scale=2 target=125000000 budget=<nil>; delivery sizing and H1 pacing must be off
+    flight_gate_relay_inflation_test.go:129: queue=64 defer=true receiver: historical control uses policy=1 scale=2 target=125000000 budget=<nil>; delivery sizing and H1 pacing must be off
+    flight_gate_relay_inflation_test.go:129: queue=4096 defer=false sender: historical control uses policy=1 scale=2 target=125000000 budget=<nil>; delivery sizing and H1 pacing must be off
+    flight_gate_relay_inflation_test.go:129: queue=4096 defer=false receiver: historical control uses policy=1 scale=2 target=125000000 budget=<nil>; delivery sizing and H1 pacing must be off
+    flight_gate_relay_inflation_test.go:129: queue=4096 defer=true sender: historical control uses policy=1 scale=2 target=125000000 budget=<nil>; delivery sizing and H1 pacing must be off
+    flight_gate_relay_inflation_test.go:129: queue=4096 defer=true receiver: historical control uses policy=1 scale=2 target=125000000 budget=<nil>; delivery sizing and H1 pacing must be off
+--- FAIL: TestRelayInflationUsesConstantSendWindow (0.00s)
+FAIL
+FAIL	github.com/urnetwork/connect	0.737s
+FAIL

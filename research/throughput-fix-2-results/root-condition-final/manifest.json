@@ -1,0 +1,12 @@
+{
+  "archive": "root-condition-final",
+  "payload_sha256": {
+    "assertions-and-controls.jsonl": "d508665f26357c30b1238ee40c27a36234b4e14fd23953fbf7107b4cde40d097",
+    "ledger.jsonl": "52391bb75fc0b03e57984550ef45f0bbc5d8f51e89e35b59ef655a78dd7dd490",
+    "outcomes.jsonl": "073bffb4072ac76460e514338c1dec8088ae3379a5396b9a007fdd293bd7d7aa",
+    "provenance.json": "10227a19bcb30c9da9f93b7bea9c9ef4c992496ef2e52c6949cbeb4a050ca710",
+    "source-pins.json": "581f524d6b58149e9e525a1c373c7af8a9ab69e542d8c7cf8dd56f1c976aadea",
+    "status.json": "cdff5da18e1afe69c5db2f05c2c07d94773697f80e0a35a7281c580ee2f82be7",
+    "worker-readings.jsonl": "123064a54670e523c6a14019cf71cb192bb03630180a5b8559aed748aaded059"
+  }
+}

@@ -1,0 +1,13 @@
+Mutation: retain new probe tests/instrumentation, disable upward RTT refresh and use only the old sequence RTT minimum for window sizing.
+=== RUN   TestWindowPacingDrainedProbeSurvivesHeadCompression
+    transfer_window_pacing_probe_test.go:35: ack-before-write=false: compressed head lost the drained probe's residence: 1ms
+--- FAIL: TestWindowPacingDrainedProbeSurvivesHeadCompression (0.00s)
+=== RUN   TestWindowPacingWindowUsesRefreshedServiceResidence
+    transfer_window_pacing_probe_test.go:129: the stale sequence minimum still shrank a newly longer path: {Window:1627218 Sized:false Reason:no delivery rate samples DeliveredByteCount:0 Interval:0s RoundTrip:1ms WindowRoundTrip:11ms AckCompressTimeout:10ms SampleCount:0 Initial:2097152 Floor:262144 Ceiling:1627218 Obtainable:50593792 TargetBound:true ServiceByteRate:0 PacingByteRate:147928994 ServiceEstablished:false ServiceBacklogged:false PacingProbeByteRate:147928994 PacingProbeByteCount:2958580}
+--- FAIL: TestWindowPacingWindowUsesRefreshedServiceResidence (0.00s)
+=== RUN   TestWindowPacingCoalescerPreservesDrainedProbeArrival
+    transfer_window_pacing_probe_test.go:162: delayed head application or a duplicate ACK changed the measured probe
+--- FAIL: TestWindowPacingCoalescerPreservesDrainedProbeArrival (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.707s

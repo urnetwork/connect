@@ -1,0 +1,7 @@
+{
+  "comparison": "Only the four-test file is added to each corresponding earlier snapshot. No production difference from the associated consumer before/after source.",
+  "limitation": "These controls do not exercise the missing cumulative-delivery fallback; its later restoration has separate proof.",
+  "no_quiescence_wait": true,
+  "outcome": "12 passes before and12 passes after, no race warnings. This supplements, rather than changes, the prior200-outcome affected selections.",
+  "role": "Supplement the missing four accepted mixed-feedback test definitions in the matched receiver-consumer snapshots."
+}

@@ -1,0 +1,115 @@
+--- before/transfer_window_pacing.go
++++ after/transfer_window_pacing.go
+@@ -692,6 +692,8 @@
+ 	lastAtNanos  int64
+ 	bytes        ByteCount
+ 	queued       bool
++	firstQueued  bool
++	lastQueued   bool
+ 	// Raw endpoints keep ownership and expiry. The second clock is usable
+ 	// only when every byte carries its own confirmed receiver timing.
+ 	receiverFirstAtNanos int64
+@@ -1085,15 +1087,19 @@
+ 		sample.firstAtNanos = at.UnixNano()
+ 		sample.firstBytes = bytes
+ 		sample.receiverFirstAtNanos = receiverAtNanos
++		sample.firstQueued = queued
+ 	} else if at.UnixNano() == sample.firstAtNanos {
+ 		sample.firstBytes += bytes
+ 		sample.receiverFirstAtNanos = min(sample.receiverFirstAtNanos, receiverAtNanos)
++		sample.firstQueued = sample.firstQueued || queued
+ 	}
+ 	if sample.bytes == 0 || at.UnixNano() > sample.lastAtNanos {
+ 		sample.lastAtNanos = at.UnixNano()
+ 		sample.receiverLastAtNanos = receiverAtNanos
++		sample.lastQueued = queued
+ 	} else if at.UnixNano() == sample.lastAtNanos {
+ 		sample.receiverLastAtNanos = max(sample.receiverLastAtNanos, receiverAtNanos)
++		sample.lastQueued = sample.lastQueued || queued
+ 	}
+ 	sample.bytes += bytes
+ 	sample.queued = sample.queued || queued
+@@ -1260,9 +1266,9 @@
+ 	increaseSpan := int64(max(compression, interval))
+ 	rejectedIncreaseAt, qualifiedAt := int64(0), int64(0)
+ 	invalidReceiverAt := int64(0)
+-	observeRate := func(bytes ByteCount, span, atNanos int64, queued bool) bool {
++	observeRate := func(bytes ByteCount, span, atNanos int64, queued, firstQueued bool) bool {
+ 		measured := byteRate(bytes, span)
+-		if hold > 0 && measured > hold && queued && span < increaseSpan {
++		if measured > hold && queued && span < increaseSpan && (hold > 0 || firstQueued) {
+ 			// A carrier reader can empty a completed flight at memory speed.
+ 			// Its queue-delayed peak needs a full feedback interval before it
+ 			// can raise service, even after the outstanding count reaches zero.
+@@ -1285,12 +1291,15 @@
+ 		}
+ 		// With immediate ACKs a small peer window can fit entirely inside
+ 		// one bucket. Its first/last arrivals still measure serialization.
+-		if span := newer.lastAtNanos - newer.firstAtNanos; span > 0 && span >= minSpan {
++		// Exact receiver endpoints already remove their own ACK waiting.
++		// A cold pair can discover service before the advertised timer;
++		// a train queued from its first checkpoint still needs a full turn.
++		if span := newer.lastAtNanos - newer.firstAtNanos; span > 0 && (span >= minSpan || hold == 0 && newer.receiverBytes == newer.bytes) {
+ 			if newer.receiverBytes == newer.bytes {
+ 				span = newer.receiverLastAtNanos - newer.receiverFirstAtNanos
+ 			}
+ 			if span > 0 {
+-				observeRate(newer.bytes-newer.firstBytes, span, newer.lastAtNanos, newer.queued)
++				observeRate(newer.bytes-newer.firstBytes, span, newer.lastAtNanos, newer.queued, newer.firstQueued)
+ 			} else {
+ 				invalidReceiverAt = max(invalidReceiverAt, newer.lastAtNanos)
+ 			}
+@@ -1307,21 +1316,23 @@
+ 			span := newer.lastAtNanos - samples[j].lastAtNanos
+ 			receiverTimed = receiverTimed && samples[j].receiverBytes == samples[j].bytes
+ 			receiverSpan := newer.receiverLastAtNanos - samples[j].receiverLastAtNanos
++			firstQueued := samples[j].lastQueued
+ 			candidateBytes := bytes
+ 			if span < minSpan && newer.lastAtNanos-samples[j].firstAtNanos >= minSpan {
+ 				// The first checkpoint preserves a short opening train
+ 				// whose last checkpoint is too close to the next bucket.
+ 				span = newer.lastAtNanos - samples[j].firstAtNanos
+ 				receiverSpan = newer.receiverLastAtNanos - samples[j].receiverFirstAtNanos
++				firstQueued = samples[j].firstQueued
+ 				candidateBytes += samples[j].bytes - samples[j].firstBytes
+ 			}
+-			if span > 0 && span >= minSpan {
++			if span > 0 && (span >= minSpan || hold == 0 && receiverTimed) {
+ 				if receiverTimed {
+ 					span = receiverSpan
+ 				}
+ 				if span <= 0 {
+ 					invalidReceiverAt = max(invalidReceiverAt, newer.lastAtNanos)
+-				} else if observeRate(candidateBytes, span, newer.lastAtNanos, queued || samples[j].queued) {
++				} else if observeRate(candidateBytes, span, newer.lastAtNanos, queued || samples[j].queued, firstQueued) {
+ 					break
+ 				}
+ 			}
+@@ -1389,7 +1400,7 @@
+ 		for _, cycle := range []windowServiceSample{self.feedbackFresh, self.feedbackComplete} {
+ 			span := cycle.lastAtNanos - cycle.firstAtNanos
+ 			if cycle.bytes > cycle.firstBytes && span >= int64(max(time.Nanosecond, compression, self.feedbackInterval)) && (epochAt.IsZero() || cycle.firstAtNanos >= epochAt.UnixNano()) {
+-				if observeRate(cycle.bytes-cycle.firstBytes, span, cycle.lastAtNanos, cycle.queued) {
++				if observeRate(cycle.bytes-cycle.firstBytes, span, cycle.lastAtNanos, cycle.queued, cycle.queued) {
+ 					completedFallback = true
+ 					break
+ 				}
+@@ -1531,14 +1542,18 @@
+ 			if sample.firstAtNanos < destination.firstAtNanos {
+ 				destination.firstAtNanos, destination.firstBytes = sample.firstAtNanos, sample.firstBytes
+ 				destination.receiverFirstAtNanos = sample.receiverFirstAtNanos
++				destination.firstQueued = sample.firstQueued
+ 			} else if sample.firstAtNanos == destination.firstAtNanos {
+ 				destination.firstBytes += sample.firstBytes
+ 				destination.receiverFirstAtNanos = min(destination.receiverFirstAtNanos, sample.receiverFirstAtNanos)
++				destination.firstQueued = destination.firstQueued || sample.firstQueued
+ 			}
+ 			if destination.lastAtNanos < sample.lastAtNanos {
+ 				destination.receiverLastAtNanos = sample.receiverLastAtNanos
++				destination.lastQueued = sample.lastQueued
+ 			} else if sample.lastAtNanos == destination.lastAtNanos {
+ 				destination.receiverLastAtNanos = max(destination.receiverLastAtNanos, sample.receiverLastAtNanos)
++				destination.lastQueued = destination.lastQueued || sample.lastQueued
+ 			}
+ 			destination.lastAtNanos = max(destination.lastAtNanos, sample.lastAtNanos)
+ 			destination.bytes += sample.bytes

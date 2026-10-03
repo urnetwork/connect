@@ -1,0 +1,9 @@
+{
+  "archive": "occupancy-instrumentation-matrix-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "2b29c4665138c108a5fd9bc6cce2957344da0875852971db2ac682aa76b73972",
+    "outcomes.jsonl": "149ff7bd9fcd3bbea2e2a862fc412c69b02e605594a3cf1182956b2314d6d238",
+    "provenance.json": "1daa88c369cb819249b5bd5e5b7a89aacc5bc26794fe7497d07274acaa2ff0e0",
+    "source-pins.json": "473af3f4518cfefdc8d3c650ff92edc5ed54d0a90d2fa043f32db8b3040dba05"
+  }
+}

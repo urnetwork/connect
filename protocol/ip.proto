@@ -24,3 +24,15 @@ message IpPacketFromProvider {
 message IpPing {
 }
 
+// ProviderDiagnostics lets a client distinguish a stale provider build or
+// policy from an ordinary transport blackhole. Counters are cumulative for
+// the authenticated source receiving this message, never provider-global.
+message IpProviderDiagnostics {
+    string build_version = 1;
+    string security_policy_hash = 2;
+    uint64 block_ingress_packet_count = 3;
+    uint64 block_ingress_byte_count = 4;
+    uint64 block_egress_packet_count = 5;
+    uint64 block_egress_byte_count = 6;
+    uint64 sequence = 7;
+}

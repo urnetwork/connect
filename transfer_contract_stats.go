@@ -253,12 +253,20 @@ func (self *ContractManager) closeContractStats(contractId Id) {
 // AddContractStatsCallback registers a listener for the epoch contract stats
 // events. the epoch worker starts on the first callback
 func (self *ContractManager) AddContractStatsCallback(contractStatsCallback ContractStatsFunction) func() {
+	if self.beforeCallbackAdmissionLockForTest != nil {
+		self.beforeCallbackAdmissionLockForTest()
+	}
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.closed {
+		return func() {}
+	}
 	func() {
 		self.contractStatsLock.Lock()
 		defer self.contractStatsLock.Unlock()
 		if !self.contractStatsStarted {
 			self.contractStatsStarted = true
-			go HandleError(self.runContractStats, self.client.Cancel)
+			self.startWorker("contract stats", self.runContractStats)
 		}
 	}()
 	callbackId := self.contractStatsCallbacks.Add(contractStatsCallback)

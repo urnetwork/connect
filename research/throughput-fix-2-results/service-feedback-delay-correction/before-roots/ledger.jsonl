@@ -1,0 +1,3 @@
+{"Kind": "sampler_qualification_assertion", "Test": "TestWindowPacingLimitedFlightLegacyTurnUsesOwnDelay", "Evidence": "transfer_window_service_feedback_delay_test.go:38: sameArrival=false: old zero-delay metadata blocked slow legacy feedback: 0/12500000"}
+{"Kind": "sampler_qualification_assertion", "Test": "TestWindowPacingLimitedFlightLegacyTurnUsesOwnDelay", "Evidence": "transfer_window_service_feedback_delay_test.go:38: sameArrival=false: old zero-delay metadata blocked slow legacy feedback: 0/12500000"}
+{"Kind": "sampler_qualification_assertion", "Test": "TestWindowPacingLimitedFlightLegacyTurnUsesOwnDelay", "Evidence": "transfer_window_service_feedback_delay_test.go:38: sameArrival=false: old zero-delay metadata blocked slow legacy feedback: 0/12500000"}

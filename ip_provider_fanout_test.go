@@ -11,10 +11,9 @@ import (
 
 const providerColdPageTestFlowCount = 192
 
-// TestProviderNatTargetUsesMinimalLosslessTcpQueue verifies an explicit
-// provider target removes generic process-profile headroom from every flow
-// without shrinking below one full advertised tcp window.
-func TestProviderNatTargetUsesMinimalLosslessTcpQueue(t *testing.T) {
+// An explicit provider target must not expand each flow's preallocated queue
+// to the much larger demand-driven high-BDP window.
+func TestProviderNatTargetKeepsBoundedTcpQueue(t *testing.T) {
 	defer SetMemoryBudget(0)
 
 	cases := []struct {
@@ -27,28 +26,28 @@ func TestProviderNatTargetUsesMinimalLosslessTcpQueue(t *testing.T) {
 	}
 	for _, c := range cases {
 		SetMemoryBudget(c.memoryBudgetByteCount)
+		defaultSettings := DefaultTcpBufferSettings()
 		settings := DefaultProviderLocalUserNatSettingsWithMemoryTarget(4 * 1024 * 1024)
 		tcpSettings := settings.TcpBufferSettings
+		if tcpSettings.SequenceBufferSize != defaultSettings.SequenceBufferSize {
+			t.Errorf(
+				"budget=%d tcp queue=%d, want bounded default depth=%d",
+				c.memoryBudgetByteCount,
+				tcpSettings.SequenceBufferSize,
+				defaultSettings.SequenceBufferSize,
+			)
+		}
 		payloadByteCount := tcpSettings.Mtu - Ipv6HeaderSize - TcpHeaderSizeWithoutExtensions
-		want := int(
+		windowPacketCount := int(
 			(tcpSettings.MaxWindowSize + uint32(payloadByteCount) - 1) /
 				uint32(payloadByteCount),
 		)
-		if tcpSettings.SequenceBufferSize != want {
+		if windowPacketCount <= tcpSettings.SequenceBufferSize {
 			t.Errorf(
-				"budget=%d tcp queue=%d, want minimal max-window depth %d",
+				"budget=%d high-BDP window depth=%d did not exceed bounded queue=%d",
 				c.memoryBudgetByteCount,
+				windowPacketCount,
 				tcpSettings.SequenceBufferSize,
-				want,
-			)
-		}
-		if tcpSettings.SequenceBufferSize*payloadByteCount < int(tcpSettings.MaxWindowSize) {
-			t.Errorf(
-				"budget=%d tcp queue %d x payload %d does not cover window %d",
-				c.memoryBudgetByteCount,
-				tcpSettings.SequenceBufferSize,
-				payloadByteCount,
-				tcpSettings.MaxWindowSize,
 			)
 		}
 	}

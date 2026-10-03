@@ -1,0 +1,7 @@
+=== RUN   TestWindowCompressionResidenceRestoresShortPathCapacity
+--- PASS: TestWindowCompressionResidenceRestoresShortPathCapacity (3.45s)
+=== RUN   TestWindowCompressionResidenceRestoresShortPathCapacity
+--- PASS: TestWindowCompressionResidenceRestoresShortPathCapacity (3.45s)
+=== RUN   TestWindowCompressionResidenceRestoresShortPathCapacity
+--- PASS: TestWindowCompressionResidenceRestoresShortPathCapacity (3.46s)
+PASS

@@ -1,0 +1,29 @@
+{
+  "candidate": "long-drain-roots-before",
+  "counts": {
+    "fail": 23,
+    "outcomes": 44,
+    "pass": 21,
+    "readings": 28,
+    "runs": 9,
+    "skip": 0
+  },
+  "files": {
+    "outcomes.jsonl": "567c1cd64e524424654a4fe21b0742d46d4ee82ce1b0f1f5edffa26a6f6065e3",
+    "provenance.json": "09521cc84a25e6cd20d83b6dfea74aafaf65835eb5b0a5fa3ee974e278a2fab6",
+    "readings-cap-only-model-counterfactual.jsonl": "fcd83939b050a3a195c51c22c7383fd87e0e4b9d63e73b698358d7db5c6c53be",
+    "readings-latest-residence-model-counterfactual.jsonl": "6c92d16cd935e8866fae5c74661ee87ce9aab77e1590a92624a6d2931e650abe",
+    "readings-latest-residence-trace.jsonl": "874635a85926ff59cf96d0ea3bd1d9502280e79ab41d5e0aa3db3423bde4faf4",
+    "readings-same-message-retry-trace.jsonl": "743b0220db5777eef68c10b0af54a28cf8b3e5a4dc4298f27232362cd2c17a99",
+    "summary.json": "a9c790582716eac29842961c1975e9d44bf0aa5a21adda260051189610fc9d05"
+  },
+  "input_handoff_sha256": "8b7ecf1583c820999855a7ddcbba9d7078be361c9216c324dfdbecf5a9f3acad",
+  "redaction": {
+    "commands_local_paths_and_traces": "excluded",
+    "full_numerical_readings_and_terminal_outcomes": "retained",
+    "raw_logs": "excluded",
+    "source_overlay_and_binary_contents": "excluded"
+  },
+  "schema": "throughput-fix-2/long-drain-root-failure-before-evidence-manifest-v1",
+  "verification": "all frozen handoff, test, log, overlay and build-manifest hashes verified before artifact creation"
+}

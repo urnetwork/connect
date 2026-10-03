@@ -130,7 +130,7 @@ func TestMultiClientMonitorBlockedCallbackCannotBlockMaintenance(t *testing.T) {
 	id3 := NewId()
 	id4 := NewId()
 	id5 := NewId()
-	monitor.AddProviderEvent(id1, ProviderStateInEvaluation, id1, nil)
+	monitor.AddProviderEvent(id1, ProviderStateInEvaluation, id1, nil, IpFamilyLegacy)
 	select {
 	case <-started:
 	case <-time.After(time.Second):
@@ -142,11 +142,11 @@ func TestMultiClientMonitorBlockedCallbackCannotBlockMaintenance(t *testing.T) {
 	publishDone := make(chan struct{})
 	go func() {
 		defer close(publishDone)
-		monitor.AddProviderEvent(id2, ProviderStateAdded, id2, nil)
-		monitor.AddProviderEvent(id3, ProviderStateEvaluationFailed, id3, nil)
-		monitor.AddProviderEvent(id4, ProviderStateNotAdded, id4, nil)
-		monitor.AddProviderEvent(id1, ProviderStateRemoved, id1, nil)
-		monitor.AddProviderEvent(id5, ProviderStateInEvaluation, id5, nil)
+		monitor.AddProviderEvent(id2, ProviderStateAdded, id2, nil, IpFamilyLegacy)
+		monitor.AddProviderEvent(id3, ProviderStateEvaluationFailed, id3, nil, IpFamilyLegacy)
+		monitor.AddProviderEvent(id4, ProviderStateNotAdded, id4, nil, IpFamilyLegacy)
+		monitor.AddProviderEvent(id1, ProviderStateRemoved, id1, nil, IpFamilyLegacy)
+		monitor.AddProviderEvent(id5, ProviderStateInEvaluation, id5, nil, IpFamilyLegacy)
 	}()
 	select {
 	case <-publishDone:
@@ -206,7 +206,7 @@ func TestMultiClientMonitorCallbackPanicIsListenerLocal(t *testing.T) {
 	})
 	defer unsub()
 
-	monitor.AddProviderEvent(NewId(), ProviderStateAdded, NewId(), nil)
+	monitor.AddProviderEvent(NewId(), ProviderStateAdded, NewId(), nil, IpFamilyLegacy)
 	waitForTestCondition(t, time.Second, func() bool {
 		return calls.Load() == 1
 	}, "first callback did not run")
@@ -216,7 +216,7 @@ func TestMultiClientMonitorCallbackPanicIsListenerLocal(t *testing.T) {
 		t.Fatal("listener panic was isolated but not reported")
 	}
 
-	monitor.AddProviderEvent(NewId(), ProviderStateAdded, NewId(), nil)
+	monitor.AddProviderEvent(NewId(), ProviderStateAdded, NewId(), nil, IpFamilyLegacy)
 	waitForTestCondition(t, time.Second, func() bool {
 		return 2 <= calls.Load()
 	}, "callback worker died after listener panic")
@@ -247,9 +247,9 @@ func TestMergedMultiClientMonitorResetIncludesEveryWindow(t *testing.T) {
 
 	firstId := NewId()
 	secondId := NewId()
-	first.AddProviderEvent(firstId, ProviderStateAdded, firstId, nil)
+	first.AddProviderEvent(firstId, ProviderStateAdded, firstId, nil, IpFamilyLegacy)
 	waitForStallStart(t, gate)
-	second.AddProviderEvent(secondId, ProviderStateAdded, secondId, nil)
+	second.AddProviderEvent(secondId, ProviderStateAdded, secondId, nil, IpFamilyLegacy)
 	// Inject the bounded reset that an underlying listener produces on
 	// overflow. Call its merge adapter directly so the test does not depend
 	// on scheduler timing between two asynchronous callback workers.
@@ -548,7 +548,7 @@ func TestMultiClientMonitorProviderEventCarriesDetails(t *testing.T) {
 	defer unsub()
 
 	before := time.Now()
-	monitor.AddProviderEvent(windowClientId, ProviderStateAdded, egressClientId, location)
+	monitor.AddProviderEvent(windowClientId, ProviderStateAdded, egressClientId, location, IpFamilyLegacy)
 	after := time.Now()
 
 	_, events := monitor.Events()
@@ -581,7 +581,7 @@ func TestMultiClientMonitorProviderEventCarriesDetails(t *testing.T) {
 		t.Fatal("callback diff was not delivered")
 	}
 
-	monitor.AddProviderEvent(windowClientId, ProviderStateRemoved, egressClientId, location)
+	monitor.AddProviderEvent(windowClientId, ProviderStateRemoved, egressClientId, location, IpFamilyLegacy)
 	if _, events := monitor.Events(); events[windowClientId] != nil {
 		t.Fatal("terminal event did not delete the retained provider")
 	}
@@ -791,7 +791,9 @@ func TestMultiClientStaleFlowCleanupCannotDeleteReplacement(t *testing.T) {
 				affinityIp4Paths: map[Ip4Path]map[Ip4Path]time.Time{},
 				affinityIp6Paths: map[Ip6Path]map[Ip6Path]time.Time{},
 				clientUpdates:    map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+				flowReaperWake:   make(chan struct{}, 1),
 			}
+			go multi.runFlowReaper()
 			path := &IpPath{
 				Version:         version,
 				Protocol:        IpProtocolTcp,
@@ -816,13 +818,14 @@ func TestMultiClientStaleFlowCleanupCannotDeleteReplacement(t *testing.T) {
 			replacement := newMultiClientChannelUpdate(ctx, path)
 			defer replacement.Close()
 
-			// Hold the parent lock while waking the old teardown and installing
-			// the replacement. This deterministically makes the old goroutine
-			// observe the newer generation when it resumes.
+			// Hold the parent lock while waking the shared reaper and installing
+			// the replacement. This deterministically makes cleanup observe the
+			// newer generation when it resumes.
 			multi.stateLock.Lock()
 			old.client.Store(client)
 			multi.clientUpdates[client] = map[*multiClientChannelUpdate]bool{old: true}
 			old.cancel()
+			multi.notifyFlowReaper()
 			if version == 4 {
 				multi.ip4PathUpdates[path.ToIp4Path()] = replacement
 			} else {
@@ -975,6 +978,37 @@ func TestContractStatusObserverStallIsBoundedAndNonBlocking(t *testing.T) {
 		t.Fatal("status coalescing did not retain the latest value for a contract key")
 	}
 	gate.Release()
+}
+
+func TestMultiClientContractStatusWorkerSizesToLiveContracts(t *testing.T) {
+	settings := DefaultMultiClientSettings()
+	settings.SequenceBufferSize = 4096
+	settings.MaxFlowsPerExit = 7
+	settings.WindowSizes[WindowTypeQuality] = WindowSizeSettings{
+		WindowSizeMin:     3,
+		WindowSizeMax:     3,
+		WindowSizeHardMax: 3,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	window := &multiClientWindow{
+		ctx:                     ctx,
+		windowType:              WindowTypeQuality,
+		settings:                settings,
+		contractStatusCallbacks: NewCallbackList[*contractStatusCallbackWorker](),
+	}
+	unsub := window.AddContractStatusCallback(func(*ContractStatus) {})
+	defer unsub()
+	workers := window.contractStatusCallbacks.Get()
+	if len(workers) != 1 {
+		t.Fatalf("contract status workers = %d, want 1", len(workers))
+	}
+	if got, want := workers[0].maxCount, 21; got != want {
+		t.Fatalf("contract status pending max = %d, want %d", got, want)
+	}
+	if workers[0].maxCount == settings.SequenceBufferSize {
+		t.Fatal("contract status ring still follows packet SequenceBufferSize")
+	}
 }
 
 func TestContractStatsObserverStallIsBoundedAndCoalesced(t *testing.T) {
@@ -1226,7 +1260,7 @@ func TestOptionalIdentityLoadCannotSuppressFixedDestination(t *testing.T) {
 	}
 }
 
-func testTransferCallbackBackpressure(t *testing.T, invoke func(*stallGate)) {
+func testTransferCallbackInlineDispatch(t *testing.T, invoke func(*stallGate)) {
 	t.Helper()
 	gate := newStallGate()
 	done := make(chan struct{})
@@ -1235,27 +1269,30 @@ func testTransferCallbackBackpressure(t *testing.T, invoke func(*stallGate)) {
 		invoke(gate)
 	}()
 	waitForStallStart(t, gate)
-	assertStillBlocked(t, done, 25*time.Millisecond, "transfer callback did not apply backpressure")
+	assertStillBlocked(t, done, 25*time.Millisecond, "transfer callback was not dispatched inline")
 	gate.Release()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("transfer callback did not resume after backpressure released")
+		t.Fatal("inline transfer callback did not return after release")
 	}
 }
 
 func TestTransferSendAckCallbackPreservesIntentionalBackpressure(t *testing.T) {
-	testTransferCallbackBackpressure(t, func(gate *stallGate) {
+	testTransferCallbackInlineDispatch(t, func(gate *stallGate) {
 		safeAck(func(error) { gate.Wait() }, nil)
 	})
 }
 
-func TestTransferReceiveCallbackPreservesIntentionalBackpressure(t *testing.T) {
+// Receive callbacks are inline so borrowed frames cannot escape. This test
+// deliberately installs a contract-violating blocker only to pin that
+// ownership property; production callbacks must never block (CODESTYLE.md).
+func TestTransferReceiveCallbackDispatchIsInline(t *testing.T) {
 	client := &Client{
 		log:              DefaultLogger(),
 		receiveCallbacks: NewCallbackList[ReceiveFunction](),
 	}
-	testTransferCallbackBackpressure(t, func(gate *stallGate) {
+	testTransferCallbackInlineDispatch(t, func(gate *stallGate) {
 		client.AddReceiveCallback(func(TransferPath, []*protocol.Frame, Peer) {
 			gate.Wait()
 		})
@@ -1263,12 +1300,13 @@ func TestTransferReceiveCallbackPreservesIntentionalBackpressure(t *testing.T) {
 	})
 }
 
-func TestTransferForwardCallbackPreservesIntentionalBackpressure(t *testing.T) {
+// Forward callbacks have the same inline borrowed-bytes ownership contract.
+func TestTransferForwardCallbackDispatchIsInline(t *testing.T) {
 	client := &Client{
 		log:              DefaultLogger(),
 		forwardCallbacks: NewCallbackList[ForwardFunction](),
 	}
-	testTransferCallbackBackpressure(t, func(gate *stallGate) {
+	testTransferCallbackInlineDispatch(t, func(gate *stallGate) {
 		client.AddForwardCallback(func(TransferPath, []byte) {
 			gate.Wait()
 		})
@@ -1276,7 +1314,7 @@ func TestTransferForwardCallbackPreservesIntentionalBackpressure(t *testing.T) {
 	})
 }
 
-func TestTransferCancelDoesNotBypassInFlightReceiveBackpressure(t *testing.T) {
+func TestTransferCancelDoesNotJoinInFlightReceiveCallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client := NewClient(
@@ -1302,13 +1340,13 @@ func TestTransferCancelDoesNotBypassInFlightReceiveBackpressure(t *testing.T) {
 		t,
 		250*time.Millisecond,
 		client.Cancel,
-		"client cancellation waited for intentional receive backpressure",
+		"client cancellation joined an in-flight receive callback",
 	)
 	assertStillBlocked(
 		t,
 		done,
 		25*time.Millisecond,
-		"cancellation incorrectly bypassed an in-flight receive callback",
+		"cancellation changed inline callback execution",
 	)
 	gate.Release()
 	select {
@@ -1517,7 +1555,7 @@ func TestMultiClientRemovalDoesNotWaitForPeerConnectionTeardown(t *testing.T) {
 			Destination:                    RequireMultiHopId(NewId()),
 		},
 		generator,
-		func(*multiClientChannel, TransferPath, protocol.ProvideMode, *IpPath, []byte) {},
+		func(*multiClientChannel, TransferPath, protocol.ProvideMode, TransportType, *IpPath, []byte) {},
 		nil,
 		DefaultSecurityPolicy(ctx),
 		func(*ContractStatus) {},

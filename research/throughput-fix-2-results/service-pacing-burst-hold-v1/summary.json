@@ -1,0 +1,423 @@
+{
+  "scope": "Matched component policy proof; unchanged SDK gates pass both arms and do not establish uplift.",
+  "arms": {
+    "before": {
+      "roots": {
+        "exit_code": 1,
+        "rows": 0,
+        "passed": 12,
+        "failed": 3,
+        "skipped": 0,
+        "run_log_sha256": "0f59c77a815a4816e5a2e1c1ece286e0ea3194020187901e0c1afa439c79bc31",
+        "sources_stable_during_build_and_run": true,
+        "finished_utc": "2026-09-17T01:13:46.797916+00:00",
+        "host_load_average_at_finish": [
+          7.96044921875,
+          8.455078125,
+          8.521484375
+        ],
+        "no_quiescence_wait": true
+      },
+      "sdk": {
+        "exit_code": 0,
+        "rows": 20,
+        "passed": 5,
+        "failed": 0,
+        "skipped": 0,
+        "run_log_sha256": "5c0e1dbfbb81bbfcc3eb4e76af0351c0e470ccf88cf45d1257a6ecab757e137d",
+        "sources_stable_during_build_and_run": true,
+        "finished_utc": "2026-09-17T01:14:30.995344+00:00",
+        "host_load_average_at_finish": [
+          9.53515625,
+          8.8193359375,
+          8.6513671875
+        ],
+        "no_quiescence_wait": true
+      },
+      "sdk_comparisons": [
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.19584,
+            957.20448
+          ],
+          "candidate_direction_mbps": [
+            804.78208,
+            904.7552
+          ],
+          "ratios": [
+            3.9412266185246474,
+            0.9452057725429784
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.37696,
+            957.184
+          ],
+          "candidate_direction_mbps": [
+            795.6992,
+            891.31008
+          ],
+          "ratios": [
+            2.6314809170645805,
+            0.9311794597485958
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.2368,
+            957.19424
+          ],
+          "candidate_direction_mbps": [
+            745.53344,
+            895.63136
+          ],
+          "ratios": [
+            3.6503384306843825,
+            0.9356840258462065
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.24384,
+            957.184
+          ],
+          "candidate_direction_mbps": [
+            771.59424,
+            891.26912
+          ],
+          "ratios": [
+            2.5528865699959344,
+            0.9311366675581707
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.2368,
+            957.19424
+          ],
+          "candidate_direction_mbps": [
+            814.97088,
+            911.39072
+          ],
+          "ratios": [
+            3.990323389320632,
+            0.9521481449783902
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.30528,
+            957.184
+          ],
+          "candidate_direction_mbps": [
+            763.36128,
+            874.41408
+          ],
+          "ratios": [
+            2.5251337985231355,
+            0.9135276811981814
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.288,
+            957.20448
+          ],
+          "candidate_direction_mbps": [
+            816.92672,
+            911.49312
+          ],
+          "ratios": [
+            3.9988972431077694,
+            0.9522449372572932
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.31552,
+            957.184
+          ],
+          "candidate_direction_mbps": [
+            783.60576,
+            891.58656
+          ],
+          "ratios": [
+            2.5920130068082514,
+            0.9314683070339663
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            208.93696,
+            957.21472
+          ],
+          "candidate_direction_mbps": [
+            819.61984,
+            912.91648
+          ],
+          "ratios": [
+            3.9228092530876295,
+            0.9537217313164594
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.44864,
+            957.20448
+          ],
+          "candidate_direction_mbps": [
+            766.01344,
+            873.14432
+          ],
+          "ratios": [
+            2.5327058504875404,
+            0.9121816061705018
+          ],
+          "relay_drops": 0
+        }
+      ]
+    },
+    "after": {
+      "roots": {
+        "exit_code": 0,
+        "rows": 0,
+        "passed": 15,
+        "failed": 0,
+        "skipped": 0,
+        "run_log_sha256": "d279eb40036138137e2a7453de479656d884df8bb9dd6f58d8f4267d37108feb",
+        "sources_stable_during_build_and_run": true,
+        "finished_utc": "2026-09-17T01:15:00.232597+00:00",
+        "host_load_average_at_finish": [
+          8.9306640625,
+          8.75244140625,
+          8.6328125
+        ],
+        "no_quiescence_wait": true
+      },
+      "sdk": {
+        "exit_code": 0,
+        "rows": 20,
+        "passed": 5,
+        "failed": 0,
+        "skipped": 0,
+        "run_log_sha256": "742ec1d124056c403bcce8100c31ced2b975f3b46731cd954915016ca34f544b",
+        "sources_stable_during_build_and_run": true,
+        "finished_utc": "2026-09-17T01:15:43.880529+00:00",
+        "host_load_average_at_finish": [
+          8.61376953125,
+          8.6806640625,
+          8.60986328125
+        ],
+        "no_quiescence_wait": true
+      },
+      "sdk_comparisons": [
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.2368,
+            957.20448
+          ],
+          "candidate_direction_mbps": [
+            762.08128,
+            869.71392
+          ],
+          "ratios": [
+            3.7313612434194035,
+            0.9085978369010559
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.46912,
+            957.184
+          ],
+          "candidate_direction_mbps": [
+            807.76192,
+            905.13408
+          ],
+          "ratios": [
+            2.67055995666599,
+            0.9456218240171169
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.25728,
+            957.21472
+          ],
+          "candidate_direction_mbps": [
+            789.61664,
+            881.89952
+          ],
+          "ratios": [
+            3.8657943550408578,
+            0.921318385074563
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.31552,
+            957.184
+          ],
+          "candidate_direction_mbps": [
+            798.23872,
+            902.89152
+          ],
+          "ratios": [
+            2.6404159468888664,
+            0.9432789515913347
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            204.35968,
+            957.21472
+          ],
+          "candidate_direction_mbps": [
+            779.08992,
+            866.08896
+          ],
+          "ratios": [
+            3.8123465450719047,
+            0.9048011296775712
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.36672,
+            957.20448
+          ],
+          "candidate_direction_mbps": [
+            796.79488,
+            902.63552
+          ],
+          "ratios": [
+            2.6351937144405313,
+            0.9429913240690224
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            208.90624,
+            957.20448
+          ],
+          "candidate_direction_mbps": [
+            801.85344,
+            898.9696
+          ],
+          "ratios": [
+            3.8383412577814813,
+            0.9391615049691369
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.4384,
+            957.184
+          ],
+          "candidate_direction_mbps": [
+            768.8704,
+            882.72896
+          ],
+          "ratios": [
+            2.54223802268495,
+            0.9222144958545067
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": false,
+          "reference_direction_mbps": [
+            208.8448,
+            957.19424
+          ],
+          "candidate_direction_mbps": [
+            780.10368,
+            892.18048
+          ],
+          "ratios": [
+            3.7353272860995346,
+            0.9320788223715177
+          ],
+          "relay_drops": 0
+        },
+        {
+          "providing": true,
+          "reference_direction_mbps": [
+            302.35648,
+            957.20448
+          ],
+          "candidate_direction_mbps": [
+            795.63776,
+            899.84
+          ],
+          "ratios": [
+            2.631455955566092,
+            0.9400708195598918
+          ],
+          "relay_drops": 0
+        }
+      ]
+    }
+  },
+  "model-core": {
+    "exit_code": 0,
+    "rows": 846,
+    "comparison_count": 0,
+    "failed_comparisons": 0,
+    "censored_comparisons": 0,
+    "finished_utc": "2026-09-17T01:18:59.399014+00:00",
+    "host_load_average_at_finish": [
+      8.30078125,
+      8.17041015625,
+      8.384765625
+    ]
+  },
+  "correctness": {
+    "exit_code": 0,
+    "rows": 12,
+    "comparison_count": 0,
+    "failed_comparisons": 0,
+    "censored_comparisons": 0,
+    "finished_utc": "2026-09-17T01:11:25.091188+00:00",
+    "host_load_average_at_finish": [
+      7.7431640625,
+      9.3408203125,
+      8.8349609375
+    ]
+  }
+}

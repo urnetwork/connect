@@ -1,0 +1,138 @@
+{
+  "receiver_timing_prefix_audit": {
+    "executed_outcomes": [
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestAckReceiverDelayCodecPreservesPresenceAndLifetime"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestAckReceiverDelayIsOptionalForLegacyPeer"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestAckReceiverDelayRejectsMalformedAndPreservesLastValue"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestAckReceiverDelayFitsEncodedEntryReservation"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestReceiverAckTimingDurationBounds"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestReceiverAckTimingCoalescesExactHeadAndSelectiveIdentity"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestReceiverAckTimingWrappersAndUntaggedRecovery"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestReceiverAckTimingRepeatedHeadUsesCurrentEncodingTime"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestReceiverAckTimingIncludesQueueAndDeliveryWait"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestReceiverAckTimingPreservesExactZeroDelay"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestRttReceiverTimingRejectsMixedLegacyReordering"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestRttReceiverTimingBoundsSamplingWithPairedResidence"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestRttReceiverTimingKeepsRawRecoveryAndPairedWindowResidence"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestRttReceiverTimingPinsCompressionAndReadOnlySampleCutoffs"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestRttReceiverTimingRollingSamplesTrackLongRoundTripGrowth"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestSenderReceiverTimingRejectsInvalidTupleWithoutConsumingWrite"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestSenderReceiverTimingInvalidatesRetryAndUnreliableCopies"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestSenderReceiverTimingKeepsConfirmedAndPendingMessagesSeparate"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestSenderReceiverTimingSuppressionSurvivesAckCoalescing"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestSenderReceiverTimingWaitsForPhysicalConfirmation"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestSenderReceiverTimingRejectsFailedPhysicalWrite"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestSenderReceiverTimingCancelDropsUnconfirmedReply"
+      },
+      {
+        "elapsed_seconds": 0.0,
+        "result": "PASS",
+        "test_name": "TestSenderReceiverTimingArrivesBeforeBlockedWorker"
+      }
+    ],
+    "executed_root_count": 23,
+    "expected_root_count": 23,
+    "missing_roots": [],
+    "prefixes": [
+      "TestAckReceiverDelay",
+      "TestReceiverAckTiming",
+      "TestSenderReceiverTiming",
+      "TestRttReceiverTiming"
+    ],
+    "unexpected_executed_roots": []
+  },
+  "runtime_source_audit": {
+    "runner_source_inspection_uses_build_snapshot": true,
+    "source_runtime_audit_executed_from": "copied_source_snapshot",
+    "source_snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175"
+  },
+  "schema_version": 1,
+  "source_sha256": "733ee2d256f26567abc67f4fc78882e27991ff5d37fece308e8aa9478fa16358"
+}

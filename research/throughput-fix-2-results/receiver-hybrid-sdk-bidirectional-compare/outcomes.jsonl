@@ -1,0 +1,3 @@
+{"duration":"35.29s","result":"FAIL","terminal_status":"FAIL","test":"TestWindowPathSdkBidirectional","variant":"broad-v1"}
+{"duration":"37.55s","result":"FAIL","terminal_status":"FAIL","test":"TestWindowPathSdkBidirectional","variant":"legacy-consumer-v1"}
+{"duration":"40.32s","result":"PASS","terminal_status":"PASS","test":"TestWindowPathSdkBidirectional","variant":"hybrid-v1"}

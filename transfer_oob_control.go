@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"encoding/base64"
 
@@ -35,8 +36,24 @@ type OutOfBandControlWithCtx interface {
 	SendControlWithCtx(ctx context.Context, frames []*protocol.Frame, callback OobResultFunction)
 }
 
+// NetworkClientControl is an explicitly supplied in-process control boundary.
+// Implementations authenticate the current derived JWT, preserve controller
+// accounting, and return only after processing the complete request. They must
+// honor ctx cancellation; the caller still joins their terminal return.
+type NetworkClientControl interface {
+	ConnectControl(context.Context, string, *ConnectControlArgs) (*ConnectControlResult, error)
+}
+
 type ApiOutOfBandControl struct {
-	api *BringYourApi
+	localControl NetworkClientControl
+	api          *BringYourApi
+	ownsApi      bool
+	requests     *lifecycleAdmission
+	// Immutable, self-reported telemetry only; never an authorization claim.
+	probeClaimed bool
+
+	// Nil test barrier exposes the exact join boundary after admission closes.
+	beforeCloseWaitForTest func()
 }
 
 func NewApiOutOfBandControl(
@@ -45,16 +62,36 @@ func NewApiOutOfBandControl(
 	byJwt string,
 	apiUrl string,
 ) *ApiOutOfBandControl {
+	return newApiOutOfBandControl(ctx, clientStrategy, byJwt, apiUrl, false)
+}
+
+// The generator supplies the immutable probe marker for its private controls.
+func newApiOutOfBandControl(ctx context.Context, clientStrategy *ClientStrategy, byJwt, apiUrl string, probeClaimed bool) *ApiOutOfBandControl {
 	api := NewBringYourApi(ctx, clientStrategy, apiUrl)
 	api.SetByJwt(byJwt)
 	return &ApiOutOfBandControl{
-		api: api,
+		api:          api,
+		ownsApi:      true,
+		requests:     newLifecycleAdmission(),
+		probeClaimed: probeClaimed,
 	}
+}
+
+// Local control keeps the actual API OOB owner and its processed-result,
+// frame-ownership and close/join rules. It does not replace the data transport.
+func NewApiOutOfBandControlWithLocalControl(ctx context.Context, strategy *ClientStrategy, byJwt, apiUrl string, control NetworkClientControl) *ApiOutOfBandControl {
+	if control == nil {
+		panic("local control authority is required")
+	}
+	owner := NewApiOutOfBandControl(ctx, strategy, byJwt, apiUrl)
+	owner.localControl = control
+	return owner
 }
 
 func NewApiOutOfBandControlWithApi(api *BringYourApi) *ApiOutOfBandControl {
 	return &ApiOutOfBandControl{
-		api: api,
+		api:      api,
+		requests: newLifecycleAdmission(),
 	}
 }
 
@@ -71,7 +108,7 @@ func (self *ApiOutOfBandControl) SendControl(
 ) {
 	// bound to the api lifecycle context: keep trying as long as the
 	// lifecycle is active
-	self.sendControl(self.api.ConnectControl, frames, callback)
+	self.SendControlWithCtx(self.api.ctx, frames, callback)
 }
 
 // SendControlWithCtx is a one-shot send on a caller-chosen context, for
@@ -83,7 +120,36 @@ func (self *ApiOutOfBandControl) SendControlWithCtx(
 	callback OobResultFunction,
 ) {
 	connectControl := func(connectControlArgs *ConnectControlArgs, apiCallback ConnectControlCallback) {
-		self.api.ConnectControlWithCtx(ctx, connectControlArgs, apiCallback)
+		if self.localControl == nil {
+			self.api.connectControlWithCtx(ctx, connectControlArgs, apiCallback, self.probeClaimed)
+			return
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, self.api.clientStrategy.settings.RequestTimeout)
+		go func() {
+			defer cancel()
+			var result *ConnectControlResult
+			var err error
+			byJwt := self.api.ByJwt()
+			HandleError(func() {
+				if err = requestCtx.Err(); err == nil {
+					result, err = self.localControl.ConnectControl(requestCtx, byJwt, connectControlArgs)
+				}
+			}, func(recovered error) { err = fmt.Errorf("local control failed: %w", recovered) })
+			if requestCtx.Err() != nil {
+				// A local handler may return a committed contract after its
+				// request was canceled. Retain this admitted owner through the
+				// requester's zero-use close before discarding that result. The
+				// canceled result never reaches a data producer or becomes success.
+				var cleanupErr error
+				HandleError(func() {
+					cleanupErr = self.closeUndeliveredLocalContracts(requestCtx, byJwt, connectControlArgs, result)
+				}, func(recovered error) {
+					cleanupErr = fmt.Errorf("local undelivered contract cleanup failed: %w", recovered)
+				})
+				result, err = nil, errors.Join(requestCtx.Err(), cleanupErr)
+			}
+			apiCallback.Result(result, err)
+		}()
 	}
 	self.sendControl(connectControl, frames, callback)
 }
@@ -100,29 +166,50 @@ func (self *ApiOutOfBandControl) sendControl(
 			})
 		}
 	}
+	returnFrames := func() {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	}
+	if !self.requests.start() {
+		returnFrames()
+		safeCallback(nil, context.Canceled)
+		return
+	}
 
 	pack := &protocol.Pack{
 		Frames: frames,
 	}
-	defer func() {
-		for _, frame := range frames {
-			MessagePoolReturn(frame.MessageBytes)
-		}
-	}()
 	packBytes, err := ProtoMarshal(pack)
 	if err != nil {
+		defer self.requests.finish()
+		returnFrames()
 		safeCallback(nil, err)
 		return
 	}
-	defer MessagePoolReturn(packBytes)
+	encodedPack := EncodeBase64(base64.StdEncoding, packBytes)
+	MessagePoolReturn(packBytes)
+	returnFrames()
 
 	connectControl(
 		&ConnectControlArgs{
-			Pack: EncodeBase64(base64.StdEncoding, packBytes),
+			Pack: encodedPack,
 		},
 		NewApiCallback(func(result *ConnectControlResult, err error) {
+			// Request completion is published after every callback-local pooled
+			// buffer has returned. CloseAndWait may therefore use completion as
+			// an exact ownership barrier.
+			defer self.requests.finish()
 			if err != nil {
 				safeCallback(nil, err)
+				return
+			}
+			if result == nil {
+				safeCallback(nil, errors.New("connect control response is absent"))
+				return
+			}
+			if result.Error != nil {
+				safeCallback(nil, errors.New("connect control rejected: "+result.Error.Message))
 				return
 			}
 
@@ -143,6 +230,29 @@ func (self *ApiOutOfBandControl) sendControl(
 			safeCallback(responsePack.Frames, nil)
 		}),
 	)
+}
+
+// Close prevents later request admission. A control constructed with its own
+// API also cancels API-bound requests; a wrapper around a caller-owned API
+// leaves that shared API open. Caller-context cleanup requests remain bounded
+// by their client-strategy timeout and are joined by CloseAndWait.
+func (self *ApiOutOfBandControl) Close() {
+	self.requests.close()
+	if self.ownsApi {
+		self.api.Close()
+	}
+}
+
+// CloseAndWait closes request admission and joins every request and callback
+// admitted before that boundary. An OOB callback must not call CloseAndWait
+// because it would wait for its own return. It may call Close and ask an
+// external owner goroutine to perform the wait.
+func (self *ApiOutOfBandControl) CloseAndWait(ctx context.Context) error {
+	self.Close()
+	if self.beforeCloseWaitForTest != nil {
+		self.beforeCloseWaitForTest()
+	}
+	return waitForLifecycleDone(ctx, self.requests.Done(), "api out-of-band requests")
 }
 
 type NoContractClientOob struct {

@@ -1,0 +1,86 @@
+{
+  "deterministic_probes": [
+    {
+      "after": {
+        "external_count": 1,
+        "go_exit": 0,
+        "required_replacement_exists": true,
+        "result": "pass with copied replacement metadata"
+      },
+      "before": {
+        "go_exit_code": 1,
+        "required_replacement_exists": false,
+        "result": "expected setup failure when live replacement metadata is used",
+        "snapshot_verification_passed": true
+      },
+      "correction": "Parse go mod edit -json from destination, then resolve the frozen relative target against the original source directory.",
+      "name": "replacement_metadata_must_come_from_snapshot",
+      "setup": "A synthetic main module requires example.invalid/dep via ../dep. After capture, edit only the original go.mod to ../changed before linking replacements."
+    },
+    {
+      "after": {
+        "rejected": true,
+        "result": "snapshot input-set change rejected"
+      },
+      "before": {
+        "result": "unexpected added Go file accepted",
+        "unexpected_go_file_accepted": true
+      },
+      "correction": "Compare the snapshot regular-file inventory with captured metadata before checking content hashes.",
+      "name": "snapshot_file_inventory_must_be_frozen",
+      "setup": "Capture one synthetic source file, then add extra_test.go directly to the snapshot before verification."
+    },
+    {
+      "interpretation": "The relative replacement uses the copied sibling, not the live original.",
+      "name": "copied_sibling_module_stays_frozen",
+      "result": {
+        "external": [],
+        "go_exit": 0,
+        "is_symlink": false
+      },
+      "setup": "Capture synthetic server and connect sibling modules with server replacing example.invalid/connect via ../connect, then make original connect source uncompilable."
+    }
+  ],
+  "limits": [
+    "These are independent synthetic helper and Go-build probes, not a full runner or production-package validation. Root owns final runner validation.",
+    "External local replacement modules remain mutable and are explicitly listed by the runner; this review verified the copied server-to-connect sibling path.",
+    "Local temporary directory names and machine-specific absolute paths are removed from this handoff."
+  ],
+  "local_evidence_hashes": [
+    {
+      "artifact": "throughput-fix-2-snapshot-review-replacement.json",
+      "sha256": "8555748846a4a5fdf2e562c999933419023ded7fb45194840c8043e28a04ebbd"
+    },
+    {
+      "artifact": "throughput-fix-2-snapshot-review-adjacent.json",
+      "sha256": "938474064aa983b75b0f25c4744d4a2cd0915da4ce3ab72836faf7e16e2ad97f"
+    },
+    {
+      "artifact": "throughput-fix-2-snapshot-review-after.json",
+      "sha256": "a51287c200edbf0270fae9b1b6ddfa4c69f609cd9d574e50875b0175da166011"
+    }
+  ],
+  "redaction": "Tool output, raw commands, local temporary paths, source contents, and binaries are excluded.",
+  "reviewed_files": [
+    {
+      "path": "tools/throughput-fix-2-snapshot.py",
+      "sha256_at_handoff": "7692ebadbce051ba7dc6db72dd1a1e535956c599322e7d86b92e3cb8b0bce20f"
+    },
+    {
+      "path": "tools/throughput-fix-2-snapshot-test.py",
+      "sha256_at_handoff": "68f399cbac4ea144fb3de62859a82eb0f3733b6eeb48f1930427fe0a91ee1759"
+    },
+    {
+      "path": "tools/throughput-fix-2.sh",
+      "sha256_at_handoff": "0b80e99a5825869e5f1d4bb6c3618575184a7ab581528f679ebd717a7fabb507"
+    }
+  ],
+  "schema": "throughput-fix-2/source-snapshot-review-v1",
+  "scope": "Read-only peer review of the throughput runner source-inspection snapshot boundary.",
+  "shared_source_edits": false,
+  "test_review": {
+    "cwd_and_runtime_caller": "The runner compiles inside the snapshot and runs from the copied package directory, covering both source-inspection forms.",
+    "file_symlink_fixtures": "Readable file symlinks are copied as independent bytes; later target edits do not leak into the snapshot.",
+    "replacement_path_expectation": "Use str(dep.resolve()) because the helper intentionally canonicalizes external paths and macOS tempfile paths can have a /var versus /private/var alias."
+  }
+}

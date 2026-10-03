@@ -1,0 +1,7 @@
+=== RUN   TestWindowPacingBackloggedSparseHeadsKeepTheirTime
+    transfer_window_pacing_test.go:641: reverse=false: sparse heads measured 250000 B/s, want 125000
+    transfer_window_pacing_test.go:641: reverse=true: sparse heads measured 250000 B/s, want 125000
+--- FAIL: TestWindowPacingBackloggedSparseHeadsKeepTheirTime (0.00s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	0.666s

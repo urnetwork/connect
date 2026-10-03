@@ -1,0 +1,73 @@
+=== RUN   TestWindowPacingCompressedFlightsKeepMeasuredSerialization
+--- FAIL: TestWindowPacingCompressedFlightsKeepMeasuredSerialization (0.00s)
+=== RUN   TestWindowPacingCarrierBufferedReadsDoNotInflateServiceBurst
+--- PASS: TestWindowPacingCarrierBufferedReadsDoNotInflateServiceBurst (0.02s)
+=== RUN   TestWindowPacingCarrierUnqueuedTrainPreservesCapacity
+--- PASS: TestWindowPacingCarrierUnqueuedTrainPreservesCapacity (0.01s)
+=== RUN   TestWindowPacingCarrierFasterTrainRaisesMeasuredCapacity
+--- PASS: TestWindowPacingCarrierFasterTrainRaisesMeasuredCapacity (0.01s)
+=== RUN   TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets
+--- FAIL: TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets (0.05s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsContinuousSlowPair
+--- PASS: TestWindowPacingLimitedFlightAcceptsContinuousSlowPair (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsQueuedSlowService
+--- PASS: TestWindowPacingLimitedFlightAcceptsQueuedSlowService (0.00s)
+=== RUN   TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts
+--- PASS: TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts (0.00s)
+=== RUN   TestWindowPacingLimitedFlightReorderedAccountingKeepsService
+--- FAIL: TestWindowPacingLimitedFlightReorderedAccountingKeepsService (0.00s)
+=== RUN   TestWindowPacingCarrierPeakStaysUnqualifiedAfterQueueClears
+--- FAIL: TestWindowPacingCarrierPeakStaysUnqualifiedAfterQueueClears (0.00s)
+=== RUN   TestWindowPacingCarrierFreshFastPairSupersedesRejectedPeak
+--- FAIL: TestWindowPacingCarrierFreshFastPairSupersedesRejectedPeak (0.00s)
+=== RUN   TestWindowPacingCarrierSustainedQueuedIncreaseRaisesService
+--- PASS: TestWindowPacingCarrierSustainedQueuedIncreaseRaisesService (0.00s)
+=== RUN   TestWindowPacingCompressedFlightsKeepMeasuredSerialization
+--- FAIL: TestWindowPacingCompressedFlightsKeepMeasuredSerialization (0.00s)
+=== RUN   TestWindowPacingCarrierBufferedReadsDoNotInflateServiceBurst
+--- PASS: TestWindowPacingCarrierBufferedReadsDoNotInflateServiceBurst (0.01s)
+=== RUN   TestWindowPacingCarrierUnqueuedTrainPreservesCapacity
+--- PASS: TestWindowPacingCarrierUnqueuedTrainPreservesCapacity (0.01s)
+=== RUN   TestWindowPacingCarrierFasterTrainRaisesMeasuredCapacity
+--- PASS: TestWindowPacingCarrierFasterTrainRaisesMeasuredCapacity (0.01s)
+=== RUN   TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets
+--- FAIL: TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets (0.04s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsContinuousSlowPair
+--- PASS: TestWindowPacingLimitedFlightAcceptsContinuousSlowPair (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsQueuedSlowService
+--- PASS: TestWindowPacingLimitedFlightAcceptsQueuedSlowService (0.00s)
+=== RUN   TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts
+--- PASS: TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts (0.00s)
+=== RUN   TestWindowPacingLimitedFlightReorderedAccountingKeepsService
+--- FAIL: TestWindowPacingLimitedFlightReorderedAccountingKeepsService (0.00s)
+=== RUN   TestWindowPacingCarrierPeakStaysUnqualifiedAfterQueueClears
+--- FAIL: TestWindowPacingCarrierPeakStaysUnqualifiedAfterQueueClears (0.00s)
+=== RUN   TestWindowPacingCarrierFreshFastPairSupersedesRejectedPeak
+--- FAIL: TestWindowPacingCarrierFreshFastPairSupersedesRejectedPeak (0.00s)
+=== RUN   TestWindowPacingCarrierSustainedQueuedIncreaseRaisesService
+--- PASS: TestWindowPacingCarrierSustainedQueuedIncreaseRaisesService (0.00s)
+=== RUN   TestWindowPacingCompressedFlightsKeepMeasuredSerialization
+--- FAIL: TestWindowPacingCompressedFlightsKeepMeasuredSerialization (0.00s)
+=== RUN   TestWindowPacingCarrierBufferedReadsDoNotInflateServiceBurst
+--- PASS: TestWindowPacingCarrierBufferedReadsDoNotInflateServiceBurst (0.01s)
+=== RUN   TestWindowPacingCarrierUnqueuedTrainPreservesCapacity
+--- PASS: TestWindowPacingCarrierUnqueuedTrainPreservesCapacity (0.01s)
+=== RUN   TestWindowPacingCarrierFasterTrainRaisesMeasuredCapacity
+--- PASS: TestWindowPacingCarrierFasterTrainRaisesMeasuredCapacity (0.01s)
+=== RUN   TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets
+--- FAIL: TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets (0.04s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsContinuousSlowPair
+--- PASS: TestWindowPacingLimitedFlightAcceptsContinuousSlowPair (0.00s)
+=== RUN   TestWindowPacingLimitedFlightAcceptsQueuedSlowService
+--- PASS: TestWindowPacingLimitedFlightAcceptsQueuedSlowService (0.00s)
+=== RUN   TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts
+--- PASS: TestWindowPacingLimitedFlightRepeatedSlowRefillAdapts (0.00s)
+=== RUN   TestWindowPacingLimitedFlightReorderedAccountingKeepsService
+--- FAIL: TestWindowPacingLimitedFlightReorderedAccountingKeepsService (0.00s)
+=== RUN   TestWindowPacingCarrierPeakStaysUnqualifiedAfterQueueClears
+--- FAIL: TestWindowPacingCarrierPeakStaysUnqualifiedAfterQueueClears (0.00s)
+=== RUN   TestWindowPacingCarrierFreshFastPairSupersedesRejectedPeak
+--- FAIL: TestWindowPacingCarrierFreshFastPairSupersedesRejectedPeak (0.00s)
+=== RUN   TestWindowPacingCarrierSustainedQueuedIncreaseRaisesService
+--- PASS: TestWindowPacingCarrierSustainedQueuedIncreaseRaisesService (0.00s)
+FAIL

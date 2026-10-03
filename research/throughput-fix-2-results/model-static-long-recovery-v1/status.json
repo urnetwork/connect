@@ -1,0 +1,39 @@
+{
+  "manifest_sha256": "f827076262954260ab22636b4f22fd380764f8cc393480a7df04372f1fd56bc6",
+  "binary_sha256": "8b290de6b032876c69d2139a2b2cc034042201820cb7d8781fc555724086ec49",
+  "effective_inputs_sha256": "aba8a2dd72688c523a760a72d2fd82cbe1fb6eac61d28594c1027c2938cbf9c3",
+  "argv": [
+    "/tmp/throughput-fix-2-static-long-path-work/tests-nonrace.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPathServiceStaticLongRoundTrip(Small|Shared)Opening$",
+    "-test.count=1",
+    "-test.timeout=30m"
+  ],
+  "cwd": "/private/tmp/throughput-fix-2-static-long-path-work/source/connect",
+  "cwd_source": "effective Go module snapshot",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T21:40:26.430413+00:00",
+  "loadavg_start": [
+    9.1162109375,
+    10.349609375,
+    9.65673828125
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 0,
+  "elapsed_seconds": 8.777482541278005,
+  "loadavg_end": [
+    8.56298828125,
+    10.18994140625,
+    9.60791015625
+  ],
+  "ended_utc": "2026-09-16T21:40:35.209128+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "76874a7ac0d0e5d4f65ee8a22a913b5b2d875b3ab7519736dcf7cebbbe6ec711",
+  "pass": 2,
+  "fail": 0,
+  "skip": 0,
+  "race_warnings": 0
+}

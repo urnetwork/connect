@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"strings"
 
 	// "os/exec"
 	// "path/filepath"
@@ -21,6 +24,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync/atomic"
 
 	// "encoding/base64"
 	"bytes"
@@ -51,6 +55,17 @@ type sinkReceive struct {
 	provideMode  protocol.ProvideMode
 }
 
+// Performs the sink's callback-to-printer handoff without stalling the
+// client's shared receive pump.
+func enqueueSinkReceive(receives chan<- *sinkReceive, receive *sinkReceive) bool {
+	select {
+	case receives <- receive:
+		return true
+	default:
+		return false
+	}
+}
+
 // snapshotSinkReceive formats borrowed receive frames before the callback
 // returns. The decoder may immediately clear and reuse the Frame objects.
 func snapshotSinkReceive(
@@ -70,8 +85,11 @@ func init() {
 	Err = log.New(os.Stderr, "", log.Ldate|log.Ltime|log.Lshortfile)
 }
 
-func main() {
-	usage := fmt.Sprintf(
+// connectCtlUsage is the docopt grammar of every command. It is a function so
+// the grammar itself can be parsed in a test, which is where a flag that no
+// usage line accepts shows up.
+func connectCtlUsage() string {
+	return fmt.Sprintf(
 		`Connect control.
 
 The default urls are:
@@ -104,6 +122,18 @@ Usage:
     connectctl sink [--connect_url=<connect_url>] [--api_url=<api_url>] --jwt=<jwt>
         [--message_count=<message_count>]
         [--instance_id=<instance_id>]
+    connectctl extender --jwt=<jwt> [--api_url=<api_url>]
+        [--extender_key_file=<path>]
+        [--listen_tcp=<port>]
+        [--listen_udp=<port>]
+        [--listen_dns=<port>]
+        [--dns_privileged_port]
+        [--allowed_host=<host>]...
+        [--nlayer-hop=<spec>]...
+        [--admission_subnets_per_minute=<count>]
+        [--admission_actions_per_subnet_per_minute=<count>]
+        [--admission_unlimited_source=<cidr>]...
+        [--state_dir=<dir>]
     
 Options:
     -h --help                        Show this screen.
@@ -118,12 +148,33 @@ Options:
     --jwt=<jwt>                      Your platform JWT.
     --destination_id=<destination_id>   Destination client_id
     --message_count=<message_count>  Print this many messages then exit.
-    --instance_id=<instance_id>      Set the client instance id.`,
+    --instance_id=<instance_id>      Set the client instance id.
+    --extender_key_file=<path>       Extender identity key file (hex seed), created when absent.
+    --listen_tcp=<port>              Extender tcp carrier port (default 443).
+    --listen_udp=<port>              Extender quic carrier port (default 443).
+    --listen_dns=<port>              Extender dns carrier port (default 4053).
+    --dns_privileged_port            Also bind the extender dns carrier on 53.
+    --allowed_host=<host>            Extra host the extender may forward to. Repeatable.
+    --nlayer-hop=<spec>              Another extender to relay every forward to, which makes
+                                     this an NLayer extender. Repeatable; forwards are balanced
+                                     over the hops. The spec is
+                                     [tcp|quic|dns://]<ip>[:<port>][?key=<hex>&secret_file=<path>&sni=<name>&tld=<tld>&fragment&reorder].
+                                     A private hop's secret is read from the file secret_file names,
+                                     never given in the spec.
+    --admission_subnets_per_minute=<count>
+                                     Distinct source subnets the extender admits a minute (default 1000, 0 disables).
+    --admission_actions_per_subnet_per_minute=<count>
+                                     Actions one source subnet may take a minute (default 8, 0 disables).
+    --admission_unlimited_source=<cidr>
+                                     A source prefix exempt from both limits, such as an NLayer front. Repeatable.
+    --state_dir=<dir>                Directory for the extender key and the known extenders.`,
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)
+}
 
-	opts, err := docopt.ParseArgs(usage, os.Args[1:], ConnectCtlVersion)
+func main() {
+	opts, err := docopt.ParseArgs(connectCtlUsage(), os.Args[1:], ConnectCtlVersion)
 	if err != nil {
 		panic(err)
 	}
@@ -142,6 +193,8 @@ Options:
 		send(opts)
 	} else if sink_, _ := opts.Bool("sink"); sink_ {
 		sink(opts)
+	} else if extender_, _ := opts.Bool("extender"); extender_ {
+		extenderCommand(opts)
 	}
 }
 
@@ -522,8 +575,10 @@ func send(opts docopt.Opts) {
 	defer cancel()
 
 	clientStrategy := connect.NewClientStrategyWithDefaults(cancelCtx)
+	defer clientStrategy.Close()
 
 	api := connect.NewBringYourApi(cancelCtx, clientStrategy, apiUrl)
+	defer api.Close()
 	api.SetByJwt(jwt)
 	oobControl := connect.NewApiOutOfBandControlWithApi(api)
 
@@ -547,15 +602,14 @@ func send(opts docopt.Opts) {
 		AppVersion: fmt.Sprintf("connectctl %s", ConnectCtlVersion),
 	}
 	for i := 0; i < transportCount; i += 1 {
-		platformTransport := connect.NewPlatformTransportWithDefaults(
+		platformTransport := newFamilyPlatformTransportGroup(
 			cancelCtx,
 			clientStrategy,
 			client.RouteManager(),
-			fmt.Sprintf("%s/", connectUrl),
+			connectUrl,
 			auth,
 		)
 		defer platformTransport.Close()
-		// go platformTransport.Run(routeManager)
 	}
 
 	provideModes := map[protocol.ProvideMode]bool{
@@ -583,7 +637,7 @@ func send(opts docopt.Opts) {
 			}
 			client.Send(
 				frame,
-				connect.DestinationId(destinationId),
+				destinationId,
 				func(err error) {
 					acks <- err
 				},
@@ -666,8 +720,10 @@ func sink(opts docopt.Opts) {
 	defer cancel()
 
 	clientStrategy := connect.NewClientStrategyWithDefaults(cancelCtx)
+	defer clientStrategy.Close()
 
 	api := connect.NewBringYourApi(cancelCtx, clientStrategy, apiUrl)
+	defer api.Close()
 	api.SetByJwt(jwt)
 	oobControl := connect.NewApiOutOfBandControlWithApi(api)
 
@@ -697,28 +753,112 @@ func sink(opts docopt.Opts) {
 		AppVersion: fmt.Sprintf("connectctl %s", ConnectCtlVersion),
 	}
 	for i := 0; i < transportCount; i += 1 {
-		platformTransport := connect.NewPlatformTransportWithDefaults(
+		platformTransport := newFamilyPlatformTransportGroup(
 			cancelCtx,
 			clientStrategy,
 			client.RouteManager(),
-			fmt.Sprintf("%s/", connectUrl),
+			connectUrl,
 			auth,
 		)
 		defer platformTransport.Close()
-		// go platformTransport.Run(routeManager)
 	}
 
-	receives := make(chan *sinkReceive)
+	const receiveBufferSize = 256
+	receives := make(chan *sinkReceive, receiveBufferSize)
+	var receiveDropCount atomic.Uint64
 
 	client.AddReceiveCallback(func(source connect.TransferPath, frames []*protocol.Frame, peer connect.Peer) {
-		receives <- snapshotSinkReceive(source, frames, peer)
+		if !enqueueSinkReceive(receives, snapshotSinkReceive(source, frames, peer)) {
+			receiveDropCount.Add(1)
+		}
 	})
 
 	// FIXME reassemble the chunks. Only a complete message counts as 1 against the message count
-	for i := 0; messageCount < 0 || i < messageCount; i += 1 {
+	reportDrops := func() {
+		if dropCount := receiveDropCount.Swap(0); 0 < dropCount {
+			Err.Printf("sink receive buffer full; dropped %d callback delivery(s)", dropCount)
+		}
+	}
+	defer reportDrops()
+	for receiveCount := 0; messageCount < 0 || receiveCount < messageCount; {
 		select {
 		case receive := <-receives:
 			fmt.Printf("[%s %s] %s\n", receive.source, receive.provideMode, receive.frameSummary)
+			receiveCount += 1
+			reportDrops()
+		case <-time.After(time.Second):
+			reportDrops()
 		}
 	}
+}
+
+// newFamilyPlatformTransportGroup runs the v4-pinned, v6-pinned and standby
+// platform transports for a cli provider (connect/IPV6.md A1, A4), so a
+// connectctl sink or sender proves both address families the way an app
+// provider does. The family urls derive from --connect_url by the same rule
+// the sdk uses; a url with no service label to suffix (an ip literal) runs
+// the legacy single transport.
+func newFamilyPlatformTransportGroup(
+	ctx context.Context,
+	clientStrategy *connect.ClientStrategy,
+	routeManager *connect.RouteManager,
+	connectUrl string,
+	auth *connect.ClientAuth,
+) *connect.FamilyPlatformTransportGroup {
+	platformUrl := fmt.Sprintf("%s/", connectUrl)
+	return connect.NewFamilyPlatformTransportGroup(
+		ctx,
+		connect.DefaultClientStrategySettings(),
+		clientStrategy,
+		routeManager,
+		platformUrl,
+		familyServiceUrl(platformUrl, 4),
+		familyServiceUrl(platformUrl, 6),
+		auth,
+		connect.TransportModeAuto,
+		connect.DefaultPlatformTransportSettings(),
+		nil,
+	)
+}
+
+// familyServiceUrl derives the family-pinned form of a service url for ip
+// version 4 or 6 by inserting the suffix on the service label, so
+// `wss://connect.example.com/` becomes `wss://connect-v4.example.com/` and
+// `g2-connect` becomes `g2-connect-v4`. Scheme, port and path are kept. "" when
+// there is no label to suffix: an ip literal, a single-label host, or a label
+// the operator already pinned with -v4/-v6.
+//
+// The platform transport group (IPV6.md A1, A4) and the extender activation
+// (EXTENDER.md C2) derive their urls the same way, from --connect_url and
+// --api_url respectively, which is the sdk's own rule.
+func familyServiceUrl(serviceUrl string, ipVersion int) string {
+	if ipVersion != 4 && ipVersion != 6 {
+		return ""
+	}
+	serviceUrl = strings.TrimSpace(serviceUrl)
+	if serviceUrl == "" {
+		return ""
+	}
+	parsedUrl, err := url.Parse(serviceUrl)
+	if err != nil || parsedUrl.Host == "" {
+		return ""
+	}
+	hostName := parsedUrl.Hostname()
+	if net.ParseIP(hostName) != nil {
+		return ""
+	}
+	label, domain, ok := strings.Cut(hostName, ".")
+	if !ok || label == "" || domain == "" {
+		return ""
+	}
+	if strings.HasSuffix(label, "-v4") || strings.HasSuffix(label, "-v6") {
+		return ""
+	}
+	familyHostName := fmt.Sprintf("%s-v%d.%s", label, ipVersion, domain)
+	if port := parsedUrl.Port(); port != "" {
+		parsedUrl.Host = net.JoinHostPort(familyHostName, port)
+	} else {
+		parsedUrl.Host = familyHostName
+	}
+	return parsedUrl.String()
 }

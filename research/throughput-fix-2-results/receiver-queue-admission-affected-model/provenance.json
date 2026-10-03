@@ -1,0 +1,7 @@
+{
+  "limitations": [
+    "Test-only bounded receiver lookup adds zero wire bytes.",
+    "Queued-read exclusion covers Client route queue, not earlier kernel buffering."
+  ],
+  "scope": "Original shrink, rate changes, long RTT, short service, cold small window, six static mismatch cells, SDK ordinary/receiver comparison"
+}

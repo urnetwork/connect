@@ -1,0 +1,88 @@
+--- a/ip_provider_pure_ack_admission_test.go
++++ b/ip_provider_pure_ack_admission_test.go
+@@ -22,6 +22,12 @@
+ // The captured mobile provider profile has sixteen entries shared by eight
+ // lanes: exactly two admissions, independent of window policy or byte capacity.
+ func newProviderPureAckAdmissionFixture(t *testing.T, sizing WindowSizingPolicyKind) *providerPureAckAdmissionFixture {
++	return newProviderPureAckAdmissionFixtureWithSetup(t, sizing, nil)
++}
++
++// Worker hooks belong in immutable settings before NewClient starts any
++// worker, including the independently running key publisher.
++func newProviderPureAckAdmissionFixtureWithSetup(t *testing.T, sizing WindowSizingPolicyKind, setup func(*ClientSettings)) *providerPureAckAdmissionFixture {
+ 	t.Helper()
+ 	profiles, _ := windowSdkProfiles(t)
+ 	var profile *windowPathEndpointProfile
+@@ -47,7 +53,10 @@
+ 	}
+ 	providerSettings := DefaultRemoteUserNatProviderSettings()
+ 	providerSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
+-	provider, client, _ := newProviderTransferKeyTestFixtureWithClientSettings(t, providerSettings, settings)
++	if setup != nil {
++		setup(settings)
++	}
++	provider, client := newProviderPureAckClientFixture(t, providerSettings, settings)
+ 	fixture := &providerPureAckAdmissionFixture{provider: provider, client: client}
+ 	fixture.tcp = newTcpReorderTestHarnessWithSynOptions(t, 1000, 8, 0, func(tcp *TcpSequence) {
+ 		lane := ipSendSchedulingKey(tcp.IpPath()).logicalLaneForCount(settings.SendBufferSettings.LogicalDataLaneCount)
+--- /dev/null
++++ b/ip_provider_pure_ack_fixture_test.go
+@@ -0,0 +1,31 @@
++// The provider is a child of the client, matching production lifetime
++// ownership. Provider.Close must never cancel the independently live client.
++package connect
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/urnetwork/connect/protocol"
++)
++
++// Only the unused NAT ingress is paused; return workers use real provider
++// admission with a provider context derived before any worker is started.
++func newProviderPureAckClientFixture(t *testing.T, providerSettings *RemoteUserNatProviderSettings, clientSettings *ClientSettings) (*RemoteUserNatProvider, *Client) {
++	t.Helper()
++	clientCtx, clientCancel := context.WithCancel(context.Background())
++	client := NewClient(clientCtx, NewId(), NewNoContractClientOob(), clientSettings)
++	providerCtx, providerCancel := context.WithCancel(clientCtx)
++	localUserNat := &LocalUserNat{ctx: providerCtx, sendPackets: make(chan *SendPacket, 1)}
++	provider := &RemoteUserNatProvider{
++		ctx: providerCtx, client: client, cancel: providerCancel, localUserNat: localUserNat,
++		securityPolicy: providerSettings.SecurityPolicyGenerator(providerCtx, DefaultSecurityPolicyStatsCollector()),
++		settings:       providerSettings, packetStatsCounters: &packetStatsCounters{},
++		packetStatsCallbacks: NewCallbackList[PacketStatsFunction](),
++		sourceProvideMode:    map[Id]protocol.ProvideMode{}, sourceP2pPriorityRefresh: map[Id]time.Time{},
++	}
++	provider.startReturnSenders()
++	t.Cleanup(func() { provider.Close(); clientCancel(); client.Cancel() })
++	return provider, client
++}
+--- a/transfer_pack_context_owner_test.go
++++ b/transfer_pack_context_owner_test.go
+@@ -129,13 +129,20 @@
+ 	assertMessagePoolOwnership(t)
+ 	MessagePoolReturn(MessagePoolGet(1))
+ 	synctest.Test(t, func(t *testing.T) {
+-		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		releaseWorker := make(chan struct{})
++		defer close(releaseWorker)
++		fixture := newProviderPureAckAdmissionFixtureWithSetup(t, WindowSizingConstant, func(settings *ClientSettings) {
++			settings.SendBufferSettings.beforeRunSendSequenceForTest = func(id sendSequenceId) {
++				if id.Destination != ControlId {
++					<-releaseWorker
++				}
++			}
++		})
+ 		closed, cancel := context.WithCancel(fixture.provider.ctx)
+ 		cancel()
+ 		fixture.sequence.ctx = closed
+-		// Park only the replacement worker before it runs. Admission remains
+-		// the real SendBuffer/SendSequence path with its unchanged channel.
+-		fixture.client.sendBuffer.beforeRunSendSequenceForTest = func(sendSequenceId) { <-fixture.client.ctx.Done() }
++		// The immutable constructor hook parks only data workers. Admission
++		// remains the real SendBuffer/SendSequence path and unchanged channel.
+ 		bytes := MessagePoolCopy([]byte("replacement-caller"))
+ 		pack := &SendPack{TransferOptions: TransferOptions{Ack: true}, Frame: &protocol.Frame{MessageBytes: bytes}, Destination: fixture.sequence.destination, EncryptionRole: fixture.sequence.encryptionRole, Ctx: fixture.provider.ctx, logicalLane: fixture.sequence.logicalLane, logicalLaneExplicit: true}
+ 		accepted, err := fixture.client.sendBuffer.Pack(pack, 0)

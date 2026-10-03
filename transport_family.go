@@ -1,0 +1,1863 @@
+package connect
+
+// transport_family.go — family-pinned platform transports and the group that
+// runs a provider's v4 transport, v6 transport and family-agnostic standby
+// (IPV6.md decisions A2, A4, A5, A6, A7).
+//
+// A PINNED transport proves one address family to the platform. It dials its
+// family url with the network narrowed to that family regardless of the
+// control-plane policy or the demotion ledger, resolves only the matching
+// record type, uses direct dialers only, declares its intent in the auth
+// header or frame, and never counts a dial failure against the process-wide
+// backend-degraded gate. A pinned transport that cannot possibly connect is
+// HELD rather than spun: it sleeps while the device has no path of its family
+// and idles while a Force policy contradicts it, and it wakes on a network
+// change or a policy change.
+//
+// The family reaches the dial layers by two routes, because the transport does
+// not own them. A context value narrows the network inside
+// dialControlTlsWithFamilyFallback, which every tls dial (normal and resilient)
+// passes through, so name resolution requests only the pinned record type. A
+// DialContextSettings wrapper installed by NewDirectClientStrategy is the final
+// enforcement below resolution, and the only route for a plain ws:// dial,
+// which gorilla hands to NetDialContext without any tls chain.
+//
+// The GROUP owns the three transports a provider runs (A4). The standby is the
+// full-strategy, family-agnostic transport this product has always run; it
+// dials only after StandbyDelay has elapsed with neither pinned transport
+// connected, and it stands down again when one connects. That covers
+// unprovisioned family names, blocked DNS and censored networks, where the
+// provider is then tagged legacy v4 by the platform. The delay is skipped
+// when no pinned transport can connect soon: every configured pin is held
+// (sleeping or idle by policy) or its last dial failed because its hostname
+// does not resolve. Any other failure keeps the delay.
+//
+// Concurrency: transport state added here follows the transport's own rules
+// (atomics and MonitorValues, nothing held across a dial). The group's mutable
+// state is guarded by its stateLock.
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	mathrand "math/rand"
+	"net"
+	"net/http"
+	"net/netip"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	quic "github.com/quic-go/quic-go"
+)
+
+// pinnedIpFamilyContextKey carries a pinned transport's family through the
+// client strategy to the dial helpers it does not own.
+type pinnedIpFamilyContextKey struct{}
+
+// withPinnedIpFamily tags ctx with the family a dial must use. An unpinned
+// family (0, or anything but 4 and 6) returns ctx unchanged.
+func withPinnedIpFamily(ctx context.Context, ipFamily int) context.Context {
+	if normalizeIpFamily(ipFamily) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, pinnedIpFamilyContextKey{}, ipFamily)
+}
+
+// pinnedIpFamilyFromContext is 4, 6, or 0 when the dial is not pinned.
+func pinnedIpFamilyFromContext(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	if ipFamily, ok := ctx.Value(pinnedIpFamilyContextKey{}).(int); ok {
+		return normalizeIpFamily(ipFamily)
+	}
+	return 0
+}
+
+// dialAttemptObserverContextKey carries a pinned transport's observer of each
+// dialer attempt through the client strategy. The strategy keeps trying its
+// dialers until the request timeout and reports a failed dial only as
+// "Timeout.", so the reason a dial failed is only visible where the strategy
+// sees each attempt's typed error.
+type dialAttemptObserverContextKey struct{}
+
+// withDialAttemptObserver tags ctx with the observer the strategy calls with
+// the result of every dialer attempt, nil for a success.
+func withDialAttemptObserver(ctx context.Context, observer func(error)) context.Context {
+	if observer == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, dialAttemptObserverContextKey{}, observer)
+}
+
+// observeDialAttempt reports one dialer attempt's outcome to the observer in
+// ctx, if any.
+func observeDialAttempt(ctx context.Context, err error) {
+	if ctx == nil {
+		return
+	}
+	if observer, ok := ctx.Value(dialAttemptObserverContextKey{}).(func(error)); ok {
+		observer(err)
+	}
+}
+
+// normalizeIpFamily is 4 or 6, else 0.
+func normalizeIpFamily(ipFamily int) int {
+	switch ipFamily {
+	case 4, 6:
+		return ipFamily
+	default:
+		return 0
+	}
+}
+
+// pinnedDialNetwork narrows a family-agnostic network string to the pinned
+// family. A network already of that family passes unchanged; a network of the
+// OTHER family is an error, because a pinned transport must never dial the
+// family it does not prove. Networks that carry no family (unix sockets) pass
+// unchanged.
+func pinnedDialNetwork(network string, ipFamily int) (string, error) {
+	ipFamily = normalizeIpFamily(ipFamily)
+	if ipFamily == 0 {
+		return network, nil
+	}
+	switch network {
+	case "tcp", "udp":
+		return fmt.Sprintf("%s%d", network, ipFamily), nil
+	case "tcp4", "udp4":
+		if ipFamily == 4 {
+			return network, nil
+		}
+	case "tcp6", "udp6":
+		if ipFamily == 6 {
+			return network, nil
+		}
+	default:
+		return network, nil
+	}
+	return "", fmt.Errorf("network %s contradicts the ipv%d pin", network, ipFamily)
+}
+
+// pinnedFamilyPolicyConflict reports whether the developer's control family
+// policy forbids the pinned family outright. Unlike a demotion, a Force is an
+// explicit override and a pinned transport obeys it by idling (A6).
+func pinnedFamilyPolicyConflict(ipFamily int) bool {
+	switch ControlIpFamilyPolicy() {
+	case IpFamilyForce4:
+		return ipFamily == 6
+	case IpFamilyForce6:
+		return ipFamily == 4
+	default:
+		return false
+	}
+}
+
+// ipLiteralFamily is 4 or 6 for a dial address that names an ip literal (with
+// or without a port), else 0.
+func ipLiteralFamily(addr string) int {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return 0
+	}
+	if ip.Unmap().Is4() {
+		return 4
+	}
+	return 6
+}
+
+// pinnedFamilySupported reports whether this device currently has a path of
+// the family that a pinned transport could use: a global address of the
+// family off this product's own tunnel, and, when the process is bound to an
+// egress interface that carries exactly one family, that family.
+func pinnedFamilySupported(ipFamily int) bool {
+	if !controlFamilyProbe(ipFamily) {
+		return false
+	}
+	index4, index6 := EgressInterfaceIndex()
+	if (index4 == 0) == (index6 == 0) {
+		// unbound, or bound to an interface that carries both families:
+		// the bind constrains nothing about family
+		return true
+	}
+	if ipFamily == 4 {
+		return index4 != 0
+	}
+	return index6 != 0
+}
+
+// udpWildcardForFamily is the family-specific wildcard a QUIC socket binds to,
+// so a v6 dial never leaves an AF_INET socket and a v4 dial never depends on
+// the platform's dual-stack socket behavior.
+func udpWildcardForFamily(ipFamily int) (string, *net.UDPAddr) {
+	if ipFamily == 6 {
+		return "udp6", &net.UDPAddr{IP: net.IPv6zero, Port: 0}
+	}
+	return "udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+}
+
+// udpAddrFamily is 4 or 6 for a resolved udp address.
+func udpAddrFamily(udpAddr *net.UDPAddr) int {
+	if udpAddr != nil && udpAddr.IP.To4() != nil {
+		return 4
+	}
+	return 6
+}
+
+// NewDirectClientStrategy builds the client strategy a family-pinned platform
+// transport dials with: the caller's settings without extenders and without a
+// proxy, so every dial is direct and the observed remote family is the
+// family the provider actually has (A4), and with the pin enforced below name
+// resolution. Each pinned transport owns one, which also gives it connect
+// pacing independent of the process-wide strategy (A5).
+//
+// The caller's settings are not mutated. An injected DialContextSettings
+// (headless hosts) is kept as the inner dial so a source-identity seam still
+// applies; a configured ProxySettings is dropped, because a pinned dial through
+// a proxy would prove the proxy's family, not the provider's.
+func NewDirectClientStrategy(ctx context.Context, settings *ClientStrategySettings, ipFamily int) *ClientStrategy {
+	direct := *settings
+	direct.ExtenderConfigs = nil
+	direct.ExtenderDirectory = nil
+	direct.ExpandExtenderProfileCount = 0
+	direct.MaxExtenderCount = 0
+	direct.ConnectSettings.ProxySettings = nil
+
+	ipFamily = normalizeIpFamily(ipFamily)
+	// the alt carriers dial udp themselves, below any dial context, so the pin
+	// reaches them through the settings (L4)
+	direct.ipFamily = ipFamily
+	if ipFamily != 0 {
+		base := direct.ConnectSettings
+		base.DialContextSettings = nil
+		inner := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+			return base.NetDialer().DialContext(ctx, network, addr)
+		}
+		var packetConnFactory func(context.Context) (net.PacketConn, error)
+		if injected := direct.ConnectSettings.DialContextSettings; injected != nil {
+			if injected.DialContext != nil {
+				inner = injected.DialContext
+			}
+			packetConnFactory = injected.PacketConnFactory
+		}
+		direct.ConnectSettings.DialContextSettings = &DialContextSettings{
+			DialContext:       pinnedDialContext(ipFamily, inner),
+			PacketConnFactory: packetConnFactory,
+		}
+	}
+	return NewClientStrategy(ctx, &direct)
+}
+
+// pinnedDialContext is the enforcement below name resolution: the network is
+// narrowed to the pin, a Force that contradicts the pin is an error (so a plain
+// ws:// dial, which bypasses the tls chain, still cannot connect against the
+// developer's override), and an ip literal of the other family is refused
+// rather than dialed.
+func pinnedDialContext(ipFamily int, inner DialContextFunction) DialContextFunction {
+	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		network, err := pinnedDialNetwork(network, ipFamily)
+		if err != nil {
+			return nil, err
+		}
+		if pinnedFamilyPolicyConflict(ipFamily) {
+			return nil, fmt.Errorf("ipv%d is disabled by the control family policy", ipFamily)
+		}
+		if literalFamily := ipLiteralFamily(addr); literalFamily != 0 && literalFamily != ipFamily {
+			return nil, fmt.Errorf("dial %s %s: address is not ipv%d", network, addr, ipFamily)
+		}
+		return inner(ctx, network, addr)
+	}
+}
+
+// PlatformTransportState is the coarse lifecycle a transport reports to its
+// owner. The group's per-family status and the sdk read it.
+type PlatformTransportState int
+
+const (
+	// dialing, waiting out a backoff, or waiting for budget
+	PlatformTransportStateConnecting PlatformTransportState = iota
+	// a connection has routes registered
+	PlatformTransportStateConnected
+	// held by the owner (SetEnabled(false)); never dials
+	PlatformTransportStateDisabled
+	// pinned: the device currently has no path of the pinned family
+	PlatformTransportStateSleeping
+	// pinned: the control family policy forbids the pinned family
+	PlatformTransportStateIdlePolicy
+)
+
+func (self PlatformTransportState) String() string {
+	switch self {
+	case PlatformTransportStateConnecting:
+		return "connecting"
+	case PlatformTransportStateConnected:
+		return "connected"
+	case PlatformTransportStateDisabled:
+		return "disabled"
+	case PlatformTransportStateSleeping:
+		return "sleeping"
+	case PlatformTransportStateIdlePolicy:
+		return "idle-policy"
+	default:
+		return "unknown"
+	}
+}
+
+// pinnedDialBackoff is a pinned transport's own reconnect pacing: jittered
+// exponential from the reconnect timeout to a cap, reset by a successful
+// connect or a network change. It neither reads nor advances a strategy's
+// shared connect staircase, so a family that never connects cannot delay any
+// other transport's dials (A5).
+//
+// A family-agnostic transport uses the same shape after repeated failures
+// (newDialFailureBackoff): see dialRetryAfter.
+type pinnedDialBackoff struct {
+	stateLock sync.Mutex
+	base      time.Duration
+	max       time.Duration
+	failures  int
+	// grace is how many consecutive failures add no delay of their own.
+	grace int
+}
+
+func newPinnedDialBackoff(base time.Duration, max time.Duration) *pinnedDialBackoff {
+	if base <= 0 {
+		base = time.Second
+	}
+	if max < base {
+		max = base
+	}
+	return &pinnedDialBackoff{base: base, max: max}
+}
+
+// newDialFailureBackoff is a family-agnostic transport's backoff after
+// consecutive failed dials. The first failure is free: its retry keeps the
+// transport's ordinary reconnect timing, so a one-off failure recovers exactly
+// as before, and the backoff starts from the second consecutive failure.
+func newDialFailureBackoff(base time.Duration, max time.Duration) *pinnedDialBackoff {
+	backoff := newPinnedDialBackoff(base, max)
+	backoff.grace = 1
+	return backoff
+}
+
+// delay is the wait before the next dial: zero after a success or a reset (or
+// within the grace), otherwise uniform in [d/2, d) where d doubles per
+// consecutive failure past the grace up to the cap.
+func (self *pinnedDialBackoff) delay() time.Duration {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	failures := self.failures - self.grace
+	if failures <= 0 {
+		return 0
+	}
+	d := self.base
+	for i := 1; i < failures && d < self.max; i += 1 {
+		d *= 2
+	}
+	d = min(d, self.max)
+	half := d / 2
+	if half <= 0 {
+		return d
+	}
+	return half + time.Duration(mathrand.Int63n(int64(half)))
+}
+
+func (self *pinnedDialBackoff) fail() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.failures < 62 {
+		self.failures += 1
+	}
+}
+
+func (self *pinnedDialBackoff) reset() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.failures = 0
+}
+
+// IpFamily is the pinned family, 4 or 6, or 0 for a family-agnostic transport.
+func (self *PlatformTransport) IpFamily() int {
+	return self.ipFamily
+}
+
+func (self *PlatformTransport) pinned() bool {
+	return self.ipFamily != 0
+}
+
+// SetEnabled is the owner's switch. Disabling closes the live connection and
+// parks every mode runner before its next dial; enabling lets them dial again.
+// A transport constructed with StartDisabled begins parked.
+func (self *PlatformTransport) SetEnabled(enabled bool) {
+	self.enabled.Store(enabled)
+	self.updateHold()
+}
+
+func (self *PlatformTransport) Enabled() bool {
+	return self.enabled.Load()
+}
+
+// State is the coarse lifecycle: the owner's hold and the pinned family's own
+// holds take precedence over connected, which takes precedence over connecting.
+func (self *PlatformTransport) State() PlatformTransportState {
+	if !self.enabled.Load() {
+		return PlatformTransportStateDisabled
+	}
+	if hold := PlatformTransportState(self.familyHold.Load()); hold != PlatformTransportStateConnecting {
+		return hold
+	}
+	if self.IsConnected() {
+		return PlatformTransportStateConnected
+	}
+	return PlatformTransportStateConnecting
+}
+
+// updateHold derives the dial gate from the owner's switch and the pinned
+// family's hold. A gate that just closed kicks the live connection so the
+// runner re-enters admission and parks there.
+func (self *PlatformTransport) updateHold() {
+	held := !self.enabled.Load() || self.familyHold.Load() != int32(PlatformTransportStateConnecting)
+	if self.held.Set(held) && held {
+		self.kickMonitor.NotifyAll()
+	}
+}
+
+// waitDialAdmission parks a mode runner while the transport is held. False
+// means the transport is closing.
+func (self *PlatformTransport) waitDialAdmission(ctx context.Context) bool {
+	for {
+		held, notify := self.held.Get()
+		if !held {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-notify:
+		}
+	}
+}
+
+// heldNotify returns the current hold and the channel that closes when it
+// changes, for runners that must react to a hold while connected.
+func (self *PlatformTransport) heldNotify() (bool, chan struct{}) {
+	return self.held.Get()
+}
+
+// refreshFamilyHold re-evaluates a pinned transport's own reasons not to dial.
+// Policy first: a Force is definitive and cheaper than an interface walk.
+func (self *PlatformTransport) refreshFamilyHold() {
+	if !self.pinned() {
+		return
+	}
+	hold := PlatformTransportStateConnecting
+	if pinnedFamilyPolicyConflict(self.ipFamily) {
+		hold = PlatformTransportStateIdlePolicy
+	} else if !pinnedFamilySupported(self.ipFamily) {
+		hold = PlatformTransportStateSleeping
+	}
+	previous := PlatformTransportState(self.familyHold.Swap(int32(hold)))
+	if previous != hold {
+		// one line per transition, never per attempt: the hold exists so a
+		// family that cannot work is silent, not noisy
+		self.log.Infof("[t]ipv%d transport %s -> %s\n", self.ipFamily, previous, hold)
+	}
+	self.updateHold()
+}
+
+// runFamilyHoldWatcher keeps a pinned transport's hold current. It wakes on a
+// network change (the kick, which the transport already subscribes to) and on
+// a control family policy change; the channels are captured before each
+// evaluation so a change between the two cannot be missed.
+func (self *PlatformTransport) runFamilyHoldWatcher() {
+	for {
+		kick := self.kickMonitor.NotifyChannel()
+		policy := controlFamilyPolicyNotify()
+		self.refreshFamilyHold()
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-kick:
+		case <-policy:
+		}
+	}
+}
+
+// dialContext tags a dial with the pinned family so the strategy's tls dial
+// helper narrows the network before resolution, and with the attempt observer
+// that classifies each dialer attempt's typed error (see noteDialError).
+func (self *PlatformTransport) dialContext(ctx context.Context) context.Context {
+	ctx = context.WithValue(ctx, extenderTransportSettingsContextKey{}, self.settings)
+	if !self.pinned() {
+		return ctx
+	}
+	return withDialAttemptObserver(withPinnedIpFamily(ctx, self.ipFamily), self.noteDialError)
+}
+
+// applyIntentHeader declares the pinned family on the h1 v2 auth headers. A
+// family-agnostic transport sends nothing, which the platform reads as legacy.
+func (self *PlatformTransport) applyIntentHeader(header http.Header) {
+	if self.pinned() {
+		header.Set(HeaderIpFamily, fmt.Sprintf("%d", self.ipFamily))
+	}
+}
+
+// authIntent is the protocol.Auth ip_family value: the pinned family, or zero.
+func (self *PlatformTransport) authIntent() int32 {
+	return int32(self.ipFamily)
+}
+
+// nextDialTime is the pacing before a dial. A family-agnostic transport uses
+// the strategy's shared staircase and reconnect fast path exactly as before. A
+// pinned transport uses only its own backoff and never touches the strategy's
+// pacing state, even though it owns its strategy: the intent is that a family
+// that never connects paces nobody but itself.
+func (self *PlatformTransport) nextDialTime(hadConnection bool) (connectTime time.Time, releaseReconnect func(), cancelConnect func()) {
+	releaseReconnect = func() {}
+	cancelConnect = func() {}
+	if self.pinned() {
+		return time.Now().Add(self.pinnedBackoff.delay()), releaseReconnect, cancelConnect
+	}
+	if hadConnection {
+		connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
+	} else {
+		connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
+	}
+	return connectTime, releaseReconnect, cancelConnect
+}
+
+// noteDialFailure records a failed connect. A pinned transport's failure is
+// evidence about one family on this device, not about the backend, so it only
+// feeds the transport's own backoff; the process-wide degraded gate is left to
+// family-agnostic transports (A5).
+func (self *PlatformTransport) noteDialFailure() {
+	if self.pinned() {
+		self.pinnedBackoff.fail()
+		return
+	}
+	self.failBackoff.fail()
+	noteBackendFailure()
+}
+
+// dialRetryAfter is the wait after a failed dial before the loop tries again.
+//
+// A pinned transport paces itself before each dial (nextDialTime), so it keeps
+// the reconnect timer. A family-agnostic transport used to have only the
+// reconnect timer, which is measured from the START of the attempt: once a
+// dial has taken longer than ReconnectTimeout to fail (an auth timeout, a
+// parallel eval across every dialer) it fires at once, and the only pacing
+// left is the strategy's shared 100ms-1s staircase. During a platform outage
+// every transport then retried a full dial roughly every second for as long
+// as the outage lasted -- the reconnect storm in
+// https://github.com/urnetwork/connect/issues/175. After the first failure
+// (which keeps the old timing) consecutive failures now back off
+// exponentially from ReconnectTimeout to ReconnectMaxTimeout. A successful
+// dial or a network change resets it.
+func (self *PlatformTransport) dialRetryAfter(reconnect *Reconnect) <-chan time.Time {
+	if !self.pinned() {
+		if d := self.failBackoff.delay(); 0 < d {
+			return time.After(d)
+		}
+	}
+	return reconnect.After()
+}
+
+// noteDialSuccess clears the transport's own backoff and, for a
+// family-agnostic transport, the process-wide degraded state.
+func (self *PlatformTransport) noteDialSuccess() {
+	if self.pinned() {
+		self.pinnedBackoff.reset()
+		self.setUnresolvable(false)
+		return
+	}
+	self.failBackoff.reset()
+	noteBackendSuccess()
+}
+
+// noteDialError classifies one dial attempt of a pinned transport. A hostname
+// the resolver reports as not found (NXDOMAIN, or an answer with no record of
+// the pinned family) marks the transport unresolvable, which lets the group
+// release its standby at once; a success or any other failure clears the
+// mark, because a name that resolves may connect on the next attempt.
+func (self *PlatformTransport) noteDialError(err error) {
+	if !self.pinned() {
+		return
+	}
+	self.setUnresolvable(err != nil && authoritativeDnsMiss(err))
+}
+
+// setUnresolvable stores the mark and wakes the group through the connected
+// monitor when it changed, so the standby decision is re-evaluated promptly.
+func (self *PlatformTransport) setUnresolvable(unresolvable bool) {
+	if self.unresolvable.Swap(unresolvable) == unresolvable {
+		return
+	}
+	// one line per transition, never per attempt
+	if unresolvable {
+		self.log.Infof("[t]ipv%d transport hostname does not resolve\n", self.ipFamily)
+	} else {
+		self.log.Infof("[t]ipv%d transport hostname resolves\n", self.ipFamily)
+	}
+	self.connectedMonitor.NotifyAll()
+}
+
+// unresolvableHost reports whether the most recent dial attempt failed
+// because the hostname does not resolve.
+func (self *PlatformTransport) unresolvableHost() bool {
+	return self.unresolvable.Load()
+}
+
+// noteKick resets the transport's backoff: a network change is a fresh start
+// (for the family, when pinned), not another failure.
+func (self *PlatformTransport) noteKick() {
+	if self.pinned() {
+		self.pinnedBackoff.reset()
+	} else {
+		self.failBackoff.reset()
+	}
+}
+
+// platformH3FamilyRaceStagger is the Happy Eyeballs delay between candidate
+// addresses of a family-agnostic H3 dial. A definitive failure launches the
+// next candidate immediately.
+const platformH3FamilyRaceStagger = 250 * time.Millisecond
+
+// resolveControlUDPAddrs is the multi-address form of resolveControlUDPAddr.
+// It applies the same protected-domain, custom-resolver and egress-bound
+// policy, then returns every usable address for the requested family, or for
+// both families interleaved v6 first when ipFamily is 0. The process-wide Force
+// and demotion narrow a family-agnostic request exactly as controlDialNetwork
+// does for a stream dial; a pinned request bypasses a demotion and errors on
+// a contradicting Force.
+func (self *ClientStrategy) resolveControlUDPAddrs(ctx context.Context, address string, ipFamily int) ([]*net.UDPAddr, error) {
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	if host == "" {
+		return nil, fmt.Errorf("resolve %s: empty host", address)
+	}
+	port, err := parseControlUDPPort(address, portStr)
+	if err != nil {
+		return nil, err
+	}
+	ipFamily = normalizeIpFamily(ipFamily)
+	network, err := pinnedDialNetwork("udp", ipFamily)
+	if err != nil {
+		return nil, err
+	}
+	network, err = controlDialNetwork(network, address)
+	if err != nil {
+		return nil, err
+	}
+	if ipFamily != 0 && pinnedFamilyPolicyConflict(ipFamily) {
+		return nil, fmt.Errorf("ipv%d is disabled by the control family policy", ipFamily)
+	}
+
+	// an ip literal needs no resolution; it must only agree with the pin
+	if ip, ipErr := netip.ParseAddr(host); ipErr == nil {
+		if literalFamily := ipLiteralFamily(host); ipFamily != 0 && literalFamily != ipFamily {
+			return nil, fmt.Errorf("resolve %s: address is not ipv%d", address, ipFamily)
+		}
+		return []*net.UDPAddr{{IP: net.IP(ip.AsSlice()), Port: port, Zone: ip.Zone()}}, nil
+	}
+
+	var addrs []net.IPAddr
+	if self != nil && self.internalDohResolver != nil && self.internalDohResolver.matches(host) {
+		resolved, err := self.internalDohResolver.resolve(ctx, network, host)
+		if err != nil {
+			return nil, err
+		}
+		for _, addr := range resolved {
+			addrs = append(addrs, net.IPAddr{IP: net.IP(addr.AsSlice()), Zone: addr.Zone()})
+		}
+	} else {
+		// the same resolver selection as resolveEgressUDPAddr (egress_dial.go):
+		// the platform's egress-bound resolver while bound, else the OS
+		// resolver. A nil *net.Resolver IS the default resolver (net docs:
+		// "A nil *Resolver is equivalent to the zero Resolver"), which keeps
+		// this the multi-address twin of that audited no-egress path.
+		var resolver *net.Resolver
+		boundFamilyOnly := 0
+		if self != nil && self.settings != nil && self.settings.ConnectSettings.Resolver != nil {
+			resolver = self.settings.ConnectSettings.Resolver
+		} else if platformResolver := egressResolver(); platformResolver != nil && egressBound() {
+			resolver = platformResolver
+			// the same single-family hard constraint egressBoundIPAddr
+			// applies to a one-address pick
+			index4, index6 := EgressInterfaceIndex()
+			if (index4 == 0) != (index6 == 0) {
+				boundFamilyOnly = 4
+				if index6 != 0 {
+					boundFamilyOnly = 6
+				}
+			}
+		}
+		resolved, err := resolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		for _, addr := range resolved {
+			if boundFamilyOnly != 0 && ipAddrFamily(addr) != boundFamilyOnly {
+				continue
+			}
+			addrs = append(addrs, addr)
+		}
+	}
+
+	// the network may have been narrowed by the pin, a Force or a demotion
+	wantFamily := 0
+	switch network {
+	case "udp4":
+		wantFamily = 4
+	case "udp6":
+		wantFamily = 6
+	}
+	udpAddrs := []*net.UDPAddr{}
+	for _, addr := range orderControlIPAddrs(addrs) {
+		if wantFamily != 0 && ipAddrFamily(addr) != wantFamily {
+			continue
+		}
+		udpAddrs = append(udpAddrs, &net.UDPAddr{IP: addr.IP, Port: port, Zone: addr.Zone})
+	}
+	if len(udpAddrs) == 0 {
+		if wantFamily != 0 {
+			return nil, fmt.Errorf("resolve %s: no ipv%d address", address, wantFamily)
+		}
+		return nil, fmt.Errorf("resolve %s: no addresses", address)
+	}
+	return udpAddrs, nil
+}
+
+func ipAddrFamily(addr net.IPAddr) int {
+	if addr.IP.To4() != nil {
+		return 4
+	}
+	return 6
+}
+
+// orderControlIPAddrs dedupes and interleaves the families v6 first, so a
+// dead family costs one stagger and never the whole attempt.
+func orderControlIPAddrs(addrs []net.IPAddr) []net.IPAddr {
+	ipv4 := []net.IPAddr{}
+	ipv6 := []net.IPAddr{}
+	seen := map[string]bool{}
+	for _, addr := range addrs {
+		key := addr.String()
+		if addr.IP == nil || seen[key] {
+			continue
+		}
+		seen[key] = true
+		if addr.IP.To4() != nil {
+			ipv4 = append(ipv4, addr)
+		} else {
+			ipv6 = append(ipv6, addr)
+		}
+	}
+	ordered := make([]net.IPAddr, 0, len(ipv4)+len(ipv6))
+	for i := 0; i < max(len(ipv4), len(ipv6)); i += 1 {
+		if i < len(ipv6) {
+			ordered = append(ordered, ipv6[i])
+		}
+		if i < len(ipv4) {
+			ordered = append(ordered, ipv4[i])
+		}
+	}
+	return ordered
+}
+
+// h3DialAttempt is one QUIC connection in the making: its socket, transport
+// and connection. Ownership is single: close releases all three.
+type h3DialAttempt struct {
+	udpAddr       *net.UDPAddr
+	packetConn    net.PacketConn
+	quicTransport *quic.Transport
+	conn          *quic.Conn
+	egressPinned  bool
+	// API alt dials own a separate carrier claim. Ordinary platform attempts
+	// use their long-lived transport's claim instead.
+	budgetReservation      *platformTransportBudgetReservation
+	translationReservation *platformTransportBudgetReservation
+}
+
+func (self *h3DialAttempt) close() {
+	if self == nil {
+		return
+	}
+	if self.conn != nil {
+		self.conn.CloseWithError(0, "")
+	}
+	if self.quicTransport != nil {
+		self.quicTransport.Close()
+	}
+	if self.packetConn != nil {
+		self.packetConn.Close()
+	}
+	self.budgetReservation.Release()
+	self.translationReservation.Release()
+}
+
+// openH3PacketConn is the socket for one H3 dial: the injected endpoint for
+// any H3 mode when a factory is set, else a host UDP socket bound to the
+// wildcard of the destination's family and pinned to the physical egress
+// interface. The returned endpoint is owned by the caller on every non-nil
+// return, including one returned alongside an error.
+func (self *PlatformTransport) openH3PacketConn(
+	ctx context.Context,
+	ptMode TransportMode,
+	serverName string,
+	udpAddr *net.UDPAddr,
+) (net.PacketConn, net.Addr, bool, error) {
+	if self.settings.H3PacketConnFactory != nil {
+		packetConn, err := self.settings.H3PacketConnFactory(ctx)
+		return packetConn, nil, false, err
+	}
+	// An extender-only strategy has no direct path, so reach the destination
+	// through the extender instead of binding a local socket. The extender
+	// carrier is a reliable stream and quic needs datagrams, so the datagrams
+	// are framed on it and become real udp at the far end
+	// (net_extender_datagram.go). Without this an h3-pinned client had no
+	// extender path at all.
+	//
+	// The destination is a NAME, not the address the direct path would have
+	// resolved. The extender resolves it from its own egress, which is the
+	// point: a client that cannot resolve the alt host is exactly the client
+	// that needs an extender, and an extender's destination whitelist is a
+	// list of operator name patterns that no ip literal matches.
+	//
+	// Nothing is egress pinned: the socket that leaves this host belongs to
+	// the extender dial, and pinning is that dial's business rather than ours.
+	extenderConfig, extenderDestination, err := self.h3ExtenderDestination(ptMode, serverName)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if extenderConfig != nil {
+		udpNetwork, _ := udpWildcardForFamily(udpAddrFamily(udpAddr))
+		// Naming is delegated to the extender, but memory ownership stays
+		// with this transport's device child, not the standalone API root.
+		packetConn, err := NewExtenderPacketDialContext(
+			self.clientStrategy.ConnectSettings(), extenderConfig,
+		)(self.dialContext(ctx), udpNetwork, extenderDestination)
+		if err != nil {
+			if packetConn != nil {
+				packetConn.Close()
+			}
+			return nil, nil, false, err
+		}
+		// Quic must dial the same peer the connection reports on read, or it
+		// discards every arriving packet as coming from somewhere else. The
+		// relayed connection is point to point, so that peer is whatever it
+		// says it is.
+		return packetConn, ExtenderPacketConnRemoteAddr(packetConn), false, nil
+	}
+	udpNetwork, wildcard := udpWildcardForFamily(udpAddrFamily(udpAddr))
+	udpConn, err := net.ListenUDP(udpNetwork, wildcard)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	// bind to the physical egress interface so the platform QUIC connection
+	// never loops into the tunnel this process provides (R1); a no-op off
+	// Windows and when no egress index is set. a bind failure is not fatal --
+	// the connection is still worth attempting -- but it must not be silent:
+	// an unpinned socket here follows the route table into our own tun and
+	// blackholes, which is indistinguishable from a dead network unless
+	// someone says so.
+	egressPinned := egressBound()
+	if bindErr := applyEgress(udpConn); bindErr != nil {
+		egressPinned = false
+		self.log.Infof("[tr]egress bind failed, the platform connection may loop into the tunnel: %s\n", bindErr)
+	}
+	return udpConn, nil, egressPinned, nil
+}
+
+// raceH3Dial is Happy Eyeballs for QUIC: candidates launch in order, each
+// after platformH3FamilyRaceStagger or immediately after the previous one
+// fails definitively, and the first confirmed handshake wins. Losers are
+// cancelled and closed, including any that complete after the winner. The
+// returned error when nothing wins is the first candidate's error, which
+// names the preferred family's failure.
+func raceH3Dial(
+	ctx context.Context,
+	candidates []*net.UDPAddr,
+	dial func(ctx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error),
+) (*h3DialAttempt, error) {
+	return raceH3DialProgressive(ctx, candidates, nil, dial)
+}
+
+// The first family starts the existing confirmed-handshake race. DNS workers
+// are joined on return; late candidates retain the ordinary fallback stagger.
+func raceH3DialProgressive(
+	ctx context.Context,
+	candidates []*net.UDPAddr,
+	source *udpDialCandidateSource,
+	dial func(ctx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error),
+) (*h3DialAttempt, error) {
+	defer source.close()
+	resolution := source.resultChannel()
+	if len(candidates) == 0 {
+		return nil, errors.New("h3 race: no candidates")
+	}
+	type raceResult struct {
+		attempt *h3DialAttempt
+		err     error
+	}
+	results := make(chan raceResult, len(candidates))
+	cancels := make([]context.CancelFunc, 0, len(candidates))
+	launched := 0
+	launch := func() {
+		attemptCtx, cancel := context.WithCancel(ctx)
+		cancels = append(cancels, cancel)
+		udpAddr := candidates[launched]
+		launched += 1
+		go func() {
+			attempt, err := dial(attemptCtx, udpAddr)
+			results <- raceResult{attempt: attempt, err: err}
+		}()
+	}
+	finish := func(pending int) {
+		for _, cancel := range cancels {
+			cancel()
+		}
+		// every launched attempt reports exactly once; a loser that completes
+		// after the winner is closed here rather than leaked
+		go func() {
+			for range pending {
+				result := <-results
+				result.attempt.close()
+			}
+		}()
+	}
+
+	launch()
+	pending := 1
+	var firstErr error
+	staggerReady := false
+	stagger := time.NewTimer(platformH3FamilyRaceStagger)
+	defer stagger.Stop()
+	for {
+		select {
+		case result := <-results:
+			pending -= 1
+			if result.err == nil {
+				finish(pending)
+				return result.attempt, nil
+			}
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			if launched < len(candidates) {
+				launch()
+				pending += 1
+				staggerReady = false
+				stagger.Reset(platformH3FamilyRaceStagger)
+			} else if pending == 0 && resolution == nil {
+				return nil, firstErr
+			}
+		case <-stagger.C:
+			staggerReady = true
+			if launched < len(candidates) {
+				launch()
+				pending += 1
+				staggerReady = false
+				stagger.Reset(platformH3FamilyRaceStagger)
+			}
+		case resolved := <-resolution:
+			candidates = source.appendReady(candidates, resolved)
+			resolution = source.resultChannel()
+			if launched < len(candidates) && (pending == 0 || staggerReady) {
+				launch()
+				pending++
+				staggerReady = false
+				stagger.Reset(platformH3FamilyRaceStagger)
+			} else if pending == 0 && resolution == nil {
+				return nil, firstErr
+			}
+		case <-ctx.Done():
+			finish(pending)
+			if firstErr != nil {
+				return nil, firstErr
+			}
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// FamilyPlatformTransportGroupSettings tunes the provider transport group.
+type FamilyPlatformTransportGroupSettings struct {
+	// StandbyDelay is how long neither pinned transport may be connected
+	// (since the group started, or since the last pinned disconnect) before
+	// the family-agnostic standby dials. The delay is skipped while no pinned
+	// transport can connect soon: every configured pinned transport is held
+	// (sleeping or idle by policy) or its last dial failed because its
+	// hostname does not resolve. Any other failure waits out the delay.
+	StandbyDelay time.Duration
+}
+
+func DefaultFamilyPlatformTransportGroupSettings() *FamilyPlatformTransportGroupSettings {
+	return &FamilyPlatformTransportGroupSettings{
+		StandbyDelay: 15 * time.Second,
+	}
+}
+
+// FamilyPlatformTransportGroupStatus is the per-transport readout for the sdk
+// and a developer screen.
+type FamilyPlatformTransportGroupStatus struct {
+	HasIpv4 bool
+	Ipv4    PlatformTransportState
+	HasIpv6 bool
+	Ipv6    PlatformTransportState
+	Standby PlatformTransportState
+	// StandbyActive is true while the standby is released to dial, whether
+	// or not it has connected yet.
+	StandbyActive bool
+}
+
+// FamilyPlatformTransportGroup runs a provider's v4-pinned, v6-pinned and
+// standby platform transports as one unit (A4). All three register on the
+// same route manager, so the platform may route over whichever is live.
+type FamilyPlatformTransportGroup struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	log    Logger
+	done   chan struct{}
+
+	settings *FamilyPlatformTransportGroupSettings
+
+	ipv4Transport    *PlatformTransport
+	ipv6Transport    *PlatformTransport
+	standbyTransport *PlatformTransport
+	// owned direct-only strategies, one per pinned transport
+	ipv4Strategy *ClientStrategy
+	ipv6Strategy *ClientStrategy
+
+	connectedMonitor *Monitor
+
+	stateLock      sync.Mutex
+	standbyActive  bool
+	standbyDueTime time.Time
+	// the group's current view, for the fan-in notify below
+	lastConnected bool
+}
+
+// NewFamilyPlatformTransportGroup starts the group. platformUrlV4 and
+// platformUrlV6 are the family urls (empty disables that pinned transport);
+// platformUrl is the family-agnostic url the standby dials with the caller's
+// full clientStrategy. clientStrategySettings seeds the direct-only strategies
+// the pinned transports own. settings is cloned per transport: the pinned
+// clones carry their family and background budget priority.
+func NewFamilyPlatformTransportGroup(
+	ctx context.Context,
+	clientStrategySettings *ClientStrategySettings,
+	clientStrategy *ClientStrategy,
+	routeManager *RouteManager,
+	platformUrl string,
+	platformUrlV4 string,
+	platformUrlV6 string,
+	auth *ClientAuth,
+	targetMode TransportMode,
+	settings *PlatformTransportSettings,
+	groupSettings *FamilyPlatformTransportGroupSettings,
+) *FamilyPlatformTransportGroup {
+	if groupSettings == nil {
+		groupSettings = DefaultFamilyPlatformTransportGroupSettings()
+	}
+	cancelCtx, cancel := context.WithCancel(ctx)
+	group := &FamilyPlatformTransportGroup{
+		ctx:              cancelCtx,
+		cancel:           cancel,
+		log:              loggerOrDefault(settings.Log),
+		done:             make(chan struct{}),
+		settings:         groupSettings,
+		connectedMonitor: NewMonitor(),
+	}
+
+	// each pinned transport dials the family alt name that pairs with its own
+	// family platform url, so alt-v4 goes with connect-v4 (L3). An alt url
+	// that is not the one the label rule derives from the family-agnostic
+	// platform url was set explicitly, and an override is passed through to
+	// every transport unchanged.
+	familyAltUrl := func(platformUrlFamily string) string {
+		if settings.AltUrl == "" {
+			return ""
+		}
+		if AltUrlFromPlatformUrl(platformUrl) != settings.AltUrl {
+			return settings.AltUrl
+		}
+		if altUrlFamily := AltUrlFromPlatformUrl(platformUrlFamily); altUrlFamily != "" {
+			return altUrlFamily
+		}
+		return settings.AltUrl
+	}
+	pinnedSettings := func(ipFamily int, platformUrlFamily string) *PlatformTransportSettings {
+		copied := *settings
+		copied.IpFamily = ipFamily
+		copied.StartDisabled = false
+		copied.PlatformTransportBudgetPriority = PlatformTransportBudgetPriorityBackground
+		copied.AltUrl = familyAltUrl(platformUrlFamily)
+		return &copied
+	}
+	if platformUrlV4 != "" {
+		group.ipv4Strategy = NewDirectClientStrategy(cancelCtx, clientStrategySettings, 4)
+		group.ipv4Transport = NewPlatformTransportWithTargetMode(
+			cancelCtx,
+			group.ipv4Strategy,
+			routeManager,
+			platformUrlV4,
+			auth,
+			targetMode,
+			pinnedSettings(4, platformUrlV4),
+		)
+	}
+	if platformUrlV6 != "" {
+		group.ipv6Strategy = NewDirectClientStrategy(cancelCtx, clientStrategySettings, 6)
+		group.ipv6Transport = NewPlatformTransportWithTargetMode(
+			cancelCtx,
+			group.ipv6Strategy,
+			routeManager,
+			platformUrlV6,
+			auth,
+			targetMode,
+			pinnedSettings(6, platformUrlV6),
+		)
+	}
+	hasPinned := group.ipv4Transport != nil || group.ipv6Transport != nil
+	standbySettings := *settings
+	standbySettings.IpFamily = 0
+	// with no pinned transport at all the group is the legacy single
+	// transport and the standby dials at once
+	standbySettings.StartDisabled = hasPinned
+	group.standbyTransport = NewPlatformTransportWithTargetMode(
+		cancelCtx,
+		clientStrategy,
+		routeManager,
+		platformUrl,
+		auth,
+		targetMode,
+		&standbySettings,
+	)
+	group.standbyActive = !hasPinned
+	group.standbyDueTime = time.Now().Add(groupSettings.StandbyDelay)
+
+	go HandleError(func() {
+		defer close(group.done)
+		group.run()
+	}, cancel)
+	return group
+}
+
+// run drives the standby from the pinned transports' connected state and fans
+// the three connected notifications into one.
+func (self *FamilyPlatformTransportGroup) run() {
+	for {
+		notifies := []chan struct{}{}
+		for _, transport := range self.Transports() {
+			notifies = append(notifies, transport.connectedMonitor.NotifyChannel())
+		}
+
+		var timer <-chan time.Time
+		var stopTimer func()
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+
+			now := time.Now()
+			pinnedConnected := self.pinnedConnectedWithLock()
+			if pinnedConnected {
+				if self.standbyActive {
+					self.log.Infof("[t]standby transport stands down: a pinned transport connected\n")
+					self.standbyTransport.SetEnabled(false)
+					self.standbyActive = false
+				}
+				// the delay restarts from the moment the last pinned
+				// transport disconnects
+				self.standbyDueTime = time.Time{}
+			} else {
+				if self.standbyDueTime.IsZero() {
+					self.standbyDueTime = now.Add(self.settings.StandbyDelay)
+				}
+				if !self.standbyActive {
+					if !now.Before(self.standbyDueTime) {
+						self.log.Infof("[t]standby transport dials: no pinned transport connected for %s\n", self.settings.StandbyDelay)
+						self.standbyTransport.SetEnabled(true)
+						self.standbyActive = true
+					} else if self.pinnedCannotConnectWithLock() {
+						self.log.Infof("[t]standby transport dials: no pinned transport can connect (hostname does not resolve, or held)\n")
+						self.standbyTransport.SetEnabled(true)
+						self.standbyActive = true
+					} else {
+						t := time.NewTimer(self.standbyDueTime.Sub(now))
+						timer = t.C
+						stopTimer = func() { t.Stop() }
+					}
+				}
+			}
+
+			connected := self.connectedWithLock()
+			if connected != self.lastConnected {
+				self.lastConnected = connected
+				self.connectedMonitor.NotifyAll()
+			}
+		}()
+
+		wake := make(chan struct{})
+		var wakeOnce sync.Once
+		for _, notify := range notifies {
+			go func(notify chan struct{}) {
+				select {
+				case <-notify:
+					wakeOnce.Do(func() { close(wake) })
+				case <-wake:
+				case <-self.ctx.Done():
+				}
+			}(notify)
+		}
+		select {
+		case <-self.ctx.Done():
+			wakeOnce.Do(func() { close(wake) })
+			if stopTimer != nil {
+				stopTimer()
+			}
+			return
+		case <-wake:
+			if stopTimer != nil {
+				stopTimer()
+			}
+		case <-timer:
+			wakeOnce.Do(func() { close(wake) })
+		}
+	}
+}
+
+func (self *FamilyPlatformTransportGroup) pinnedConnectedWithLock() bool {
+	return (self.ipv4Transport != nil && self.ipv4Transport.IsConnected()) ||
+		(self.ipv6Transport != nil && self.ipv6Transport.IsConnected())
+}
+
+// pinnedCannotConnectWithLock reports whether no pinned transport can connect
+// soon, which releases the standby before StandbyDelay: every configured
+// pinned transport is held (sleeping without a path of its family, or idle
+// under a contradicting Force) or its last dial failed because its hostname
+// does not resolve. A pinned transport that is plain connecting, whatever
+// its last error, keeps the delay.
+func (self *FamilyPlatformTransportGroup) pinnedCannotConnectWithLock() bool {
+	cannotConnect := func(transport *PlatformTransport) bool {
+		if transport == nil {
+			return true
+		}
+		switch transport.State() {
+		case PlatformTransportStateSleeping, PlatformTransportStateIdlePolicy:
+			return true
+		case PlatformTransportStateConnecting:
+			return transport.unresolvableHost()
+		default:
+			return false
+		}
+	}
+	return cannotConnect(self.ipv4Transport) && cannotConnect(self.ipv6Transport)
+}
+
+func (self *FamilyPlatformTransportGroup) connectedWithLock() bool {
+	return self.pinnedConnectedWithLock() || self.standbyTransport.IsConnected()
+}
+
+// Transports lists the live transports: v4, v6 (when configured) and standby.
+func (self *FamilyPlatformTransportGroup) Transports() []*PlatformTransport {
+	transports := []*PlatformTransport{}
+	if self.ipv4Transport != nil {
+		transports = append(transports, self.ipv4Transport)
+	}
+	if self.ipv6Transport != nil {
+		transports = append(transports, self.ipv6Transport)
+	}
+	transports = append(transports, self.standbyTransport)
+	return transports
+}
+
+func (self *FamilyPlatformTransportGroup) Ipv4Transport() *PlatformTransport {
+	return self.ipv4Transport
+}
+
+func (self *FamilyPlatformTransportGroup) Ipv6Transport() *PlatformTransport {
+	return self.ipv6Transport
+}
+
+func (self *FamilyPlatformTransportGroup) StandbyTransport() *PlatformTransport {
+	return self.standbyTransport
+}
+
+// IsConnected reports whether any transport in the group has routes.
+func (self *FamilyPlatformTransportGroup) IsConnected() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.connectedWithLock()
+}
+
+// ConnectedNotify closes on the next change of IsConnected. Capture it before
+// reading IsConnected.
+func (self *FamilyPlatformTransportGroup) ConnectedNotify() <-chan struct{} {
+	return self.connectedMonitor.NotifyChannel()
+}
+
+// Status is the per-transport readout.
+func (self *FamilyPlatformTransportGroup) Status() FamilyPlatformTransportGroupStatus {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	status := FamilyPlatformTransportGroupStatus{
+		Standby:       self.standbyTransport.State(),
+		StandbyActive: self.standbyActive,
+	}
+	if self.ipv4Transport != nil {
+		status.HasIpv4 = true
+		status.Ipv4 = self.ipv4Transport.State()
+	}
+	if self.ipv6Transport != nil {
+		status.HasIpv6 = true
+		status.Ipv6 = self.ipv6Transport.State()
+	}
+	return status
+}
+
+// SetAuth installs a new auth generation on every transport.
+func (self *FamilyPlatformTransportGroup) SetAuth(auth *ClientAuth) {
+	for _, transport := range self.Transports() {
+		transport.SetAuth(auth)
+	}
+}
+
+// Kick re-dials every transport now, as on a host network change.
+func (self *FamilyPlatformTransportGroup) Kick() {
+	for _, transport := range self.Transports() {
+		transport.Kick()
+	}
+}
+
+// IsWaitingForBudget reports whether the standby, the transport a policy
+// replacement is bounded by, is blocked on the aggregate budget.
+func (self *FamilyPlatformTransportGroup) IsWaitingForBudget() bool {
+	return self.standbyTransport.IsWaitingForBudget()
+}
+
+// CanMakeBeforeBreakFrom pairs each transport with its counterpart in the
+// group it replaces, so a policy migration keeps the old group alive until
+// the new one connects without a second full working set escaping the budget.
+func (self *FamilyPlatformTransportGroup) CanMakeBeforeBreakFrom(previous *FamilyPlatformTransportGroup) bool {
+	if self == nil || previous == nil {
+		return true
+	}
+	if !self.standbyTransport.CanMakeBeforeBreakFrom(previous.standbyTransport) {
+		return false
+	}
+	if self.ipv4Transport != nil && previous.ipv4Transport != nil &&
+		!self.ipv4Transport.CanMakeBeforeBreakFrom(previous.ipv4Transport) {
+		return false
+	}
+	if self.ipv6Transport != nil && previous.ipv6Transport != nil &&
+		!self.ipv6Transport.CanMakeBeforeBreakFrom(previous.ipv6Transport) {
+		return false
+	}
+	return true
+}
+
+// Close stops every transport and the owned strategies. Nonblocking.
+func (self *FamilyPlatformTransportGroup) Close() {
+	self.cancel()
+	for _, transport := range self.Transports() {
+		transport.Close()
+	}
+	if self.ipv4Strategy != nil {
+		self.ipv4Strategy.Close()
+	}
+	if self.ipv6Strategy != nil {
+		self.ipv6Strategy.Close()
+	}
+}
+
+// Done closes after the controller and every transport have finished.
+func (self *FamilyPlatformTransportGroup) Done() <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		<-self.done
+		for _, transport := range self.Transports() {
+			<-transport.Done()
+		}
+		close(done)
+	}()
+	return done
+}
+
+// CloseAndWait closes and joins, bounded by ctx.
+func (self *FamilyPlatformTransportGroup) CloseAndWait(ctx context.Context) error {
+	self.Close()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-self.Done():
+		return nil
+	}
+}
+
+// resolveSingleControlUDPAddr is the one-address name path for the modes that
+// wrap a single socket in packet translation. A pinned transport takes the
+// first address of its family; a family-agnostic one keeps the strategy's
+// existing single pick.
+func (self *PlatformTransport) resolveSingleControlUDPAddr(ctx context.Context, address string) (*net.UDPAddr, error) {
+	if self.pinned() {
+		udpAddrs, err := self.clientStrategy.resolveControlUDPAddrs(ctx, address, self.ipFamily)
+		if err != nil {
+			return nil, err
+		}
+		return udpAddrs[0], nil
+	}
+	return self.clientStrategy.resolveControlUDPAddr(ctx, address)
+}
+
+// h3PacketConnWrapper adapts the socket of one dial for a translated mode. The
+// plain mode uses the socket as is.
+type h3PacketConnWrapper func(ctx context.Context, packetConn net.PacketConn) (net.PacketConn, error)
+
+// h3CarrierDestination is the unresolved host and ports one H3 carrier sends
+// to, before any name resolution.
+//
+// It is the naming half of h3DialCandidates, split out because the extender
+// path needs the NAME and the direct path needs the addresses. Sharing it is
+// the point: the alt substitution (L4) and the dns port order (L2) are decided
+// once, so a client that reaches the operator through an extender targets
+// exactly the service a direct client would.
+func (self *PlatformTransport) h3CarrierDestination(
+	ptMode TransportMode,
+	serverName string,
+) (string, []int, error) {
+	altHost, altPort := altUrlHostPort(self.settings.AltUrl)
+	switch ptMode {
+	case TransportModeH3Dns:
+		dnsHost := serverName
+		dnsPorts := []int{self.settings.DnsPort}
+		if altHost != "" {
+			// the dns carrier is alt's whodis listener, on 53 through the
+			// router and on 4053 directly (L2)
+			dnsHost = altHost
+			dnsPorts = altDnsPorts(altPort, self.settings.DnsPort)
+		}
+		return dnsHost, dnsPorts, nil
+	case TransportModeH3DnsPump:
+		pumpServerName := strings.TrimSpace(self.settings.DnsPumpHost)
+		dnsPorts := []int{self.settings.DnsPort}
+		if pumpServerName == "" {
+			// the pump host is only where this client's own pump packets go,
+			// so it derives from the alt url rather than from a published
+			// name of its own (L3)
+			pumpServerName = altHost
+			dnsPorts = altDnsPorts(altPort, self.settings.DnsPort)
+		}
+		if pumpServerName == "" {
+			return "", nil, fmt.Errorf("H3 DNS pump host is empty")
+		}
+		return pumpServerName, dnsPorts, nil
+	default:
+		h3Host := serverName
+		h3Port := self.settings.H3Port
+		if altHost != "" {
+			h3Host = altHost
+			if 0 < altPort {
+				h3Port = altPort
+			}
+		}
+		return h3Host, []int{h3Port}, nil
+	}
+}
+
+// h3ExtenderDestination is where an extender should be asked to relay an H3
+// carrier's datagrams, as a host and port the extender resolves itself.
+//
+// Unresolved on purpose. Resolving here would need working dns for the alt
+// host on a client that may have none, which is half of what an extender is
+// for, and it would hand the extender an ip literal -- which its destination
+// whitelist, a list of operator name patterns, refuses outright.
+//
+// Empty when this strategy has a direct path, which leaves every ordinary
+// client dialing exactly as before.
+func (self *PlatformTransport) h3ExtenderDestination(
+	ptMode TransportMode,
+	serverName string,
+) (*ExtenderConfig, string, error) {
+	extenderConfig := self.clientStrategy.H3ExtenderConfig()
+	if extenderConfig == nil {
+		return nil, "", nil
+	}
+	host, ports, err := self.h3CarrierDestination(ptMode, serverName)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(ports) == 0 {
+		return nil, "", fmt.Errorf("H3 carrier has no destination port")
+	}
+	// One port, not the race: the extender reaches the destination from its
+	// own egress, so the port the client would have had to try second is not
+	// a censorship question any more. Ascending order puts 53 first, which is
+	// what alt serves through the router.
+	return extenderConfig, net.JoinHostPort(host, strconv.Itoa(ports[0])), nil
+}
+
+type h3TranslationReservationContextKey struct{}
+
+func (self *PlatformTransport) acquireH3TranslationMemory(ctx context.Context) (*platformTransportBudgetReservation, error) {
+	_, byteCount := boundedQuicPacketTranslationSettings()
+	budget := self.settings.PlatformTransportBudget
+	if budget == nil {
+		budget = DefaultPlatformTransportBudget()
+	}
+	if nested, _ := ctx.Value(platformTransportNestedBudgetContextKey{}).(*PlatformTransportBudget); nested != nil {
+		budget = nested
+	}
+	return (extenderQuicMemoryPolicy{budget: budget, byteCount: byteCount}).acquire(ctx)
+}
+
+// h3DialCandidates resolves the addresses one H3 connect attempt may dial, in
+// dial order, and how their sockets are wrapped. The dns modes translate one
+// socket and so dial one address. The plain mode dials one address when a
+// packet-connection factory owns the endpoint, and otherwise every resolved
+// address: the pinned family only for a pinned transport, both families
+// interleaved v6 first for a family-agnostic one (C6).
+func (self *PlatformTransport) h3DialCandidates(ctx context.Context, ptMode TransportMode, serverName string) ([]*net.UDPAddr, h3PacketConnWrapper, error) {
+	return self.h3DialCandidatesWithResolver(ctx, ptMode, serverName, self.clientStrategy.resolveControlUDPAddrs)
+}
+
+// The runtime dialer consumes this progressive plan. The static list form
+// remains for callers which explicitly need the complete inventory.
+func (self *PlatformTransport) h3DialCandidatesProgressive(ctx context.Context, ptMode TransportMode, serverName string) ([]*net.UDPAddr, h3PacketConnWrapper, *udpDialCandidateSource, error) {
+	var source *udpDialCandidateSource
+	candidates, wrap, err := self.h3DialCandidatesWithResolver(ctx, ptMode, serverName,
+		func(ctx context.Context, address string, ipFamily int) ([]*net.UDPAddr, error) {
+			addrs, pending, err := self.clientStrategy.startControlUdpCandidates(ctx, address, ipFamily)
+			source = pending
+			return addrs, err
+		})
+	if err != nil {
+		source.close()
+		return nil, nil, nil, err
+	}
+	return candidates, wrap, source, nil
+}
+
+// Both forms share carrier, pin, injected endpoint and wrapper policy.
+func (self *PlatformTransport) h3DialCandidatesWithResolver(
+	ctx context.Context,
+	ptMode TransportMode,
+	serverName string,
+	resolve func(context.Context, string, int) ([]*net.UDPAddr, error),
+) ([]*net.UDPAddr, h3PacketConnWrapper, error) {
+	plain := func(_ context.Context, packetConn net.PacketConn) (net.PacketConn, error) {
+		return packetConn, nil
+	}
+	translated := func(mode PacketTranslationMode, tld []byte) h3PacketConnWrapper {
+		return func(attemptCtx context.Context, packetConn net.PacketConn) (net.PacketConn, error) {
+			if err := attemptCtx.Err(); err != nil {
+				return nil, err
+			}
+			ptSettings, _ := boundedQuicPacketTranslationSettings()
+			ptSettings.DnsTlds = [][]byte{tld}
+			claim, preadmitted := attemptCtx.Value(h3TranslationReservationContextKey{}).(*platformTransportBudgetReservation)
+			if !preadmitted {
+				var err error
+				claim, err = self.acquireH3TranslationMemory(attemptCtx)
+				if err != nil {
+					return nil, err
+				}
+			}
+			// The connection cleanup owns the translated PacketConn. Keep its
+			// encoder alive while cancellation closes QUIC gracefully; otherwise
+			// the parent cancellation can discard the CONNECTION_CLOSE before
+			// CloseWithError reaches the wire and leave a stale server route.
+			translation, err := NewPacketTranslation(
+				context.WithoutCancel(attemptCtx),
+				mode,
+				packetConn,
+				ptSettings,
+			)
+			if err != nil {
+				if !preadmitted {
+					claim.Release()
+				}
+				return nil, err
+			}
+			if preadmitted {
+				return translation, nil
+			}
+			return &extenderBudgetPacketConn{PacketConn: translation, reservation: claim}, nil
+		}
+	}
+	host, ports, err := self.h3CarrierDestination(ptMode, serverName)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Through an extender the client does not resolve at all: it names the
+	// destination and the extender resolves it from its own egress. One
+	// candidate, because there is nothing to race -- the extender reaches
+	// whichever address the name has.
+	//
+	// The wrapper still applies. A dns carrier's packets are dns-encoded by
+	// this client and decoded by alt's whodis listener; the extender only
+	// moves them, so the translation belongs on this side exactly as it does
+	// on a direct dial.
+	if _, extenderDestination, err := self.h3ExtenderDestination(ptMode, serverName); err != nil {
+		return nil, nil, err
+	} else if extenderDestination != "" {
+		var wrap h3PacketConnWrapper = plain
+		switch ptMode {
+		case TransportModeH3Dns:
+			wrap = translated(PacketTranslationModeDns, self.randomDnsTld())
+		case TransportModeH3DnsPump:
+			wrap = translated(PacketTranslationModeDnsPump, self.randomDnsTld())
+		}
+		return []*net.UDPAddr{extenderPlaceholderUDPAddr(ports[0])}, wrap, nil
+	}
+	switch ptMode {
+	case TransportModeH3Dns:
+		tld := self.randomDnsTld()
+		udpAddrs, err := self.resolveDnsCarrierAddrs(ctx, host, ports)
+		if err != nil {
+			return nil, nil, err
+		}
+		return udpAddrs, translated(PacketTranslationModeDns, tld), nil
+	case TransportModeH3DnsPump:
+		tld := self.randomDnsTld()
+		udpAddrs, err := self.resolveDnsCarrierAddrs(ctx, host, ports)
+		if err != nil {
+			return nil, nil, err
+		}
+		return udpAddrs, translated(PacketTranslationModeDnsPump, tld), nil
+	default:
+		address := net.JoinHostPort(host, strconv.Itoa(ports[0]))
+		if self.settings.resolveH3AddrsForTest != nil {
+			udpAddrs, err := self.settings.resolveH3AddrsForTest(ctx, address, self.ipFamily)
+			return udpAddrs, plain, err
+		}
+		if self.settings.H3PacketConnFactory != nil {
+			// an injected endpoint is one socket with its own routing, so it
+			// is dialed to one address
+			udpAddr, err := self.resolveSingleControlUDPAddr(ctx, address)
+			if err != nil {
+				return nil, nil, err
+			}
+			return []*net.UDPAddr{udpAddr}, plain, nil
+		}
+		udpAddrs, err := resolve(ctx, address, self.ipFamily)
+		if err != nil {
+			return nil, nil, err
+		}
+		return udpAddrs, plain, nil
+	}
+}
+
+// resolveDnsCarrierAddrs is the candidate list of one dns carrier dial, in
+// dial order (L2). The host is resolved once -- the translation wraps one
+// socket, so one address is dialed -- and each port becomes one candidate: 53
+// before 4053 where alt offers both. Several candidates go through the same
+// race the family dial uses, so the second port costs one stagger rather than
+// a whole attempt.
+//
+// The strategy resolver applies the network-space DoH policy before preserving
+// the existing egress-aware fallback. The socket can be pinned while an OS name
+// query still loops into this process's own tunnel. See egress_dial.go.
+func (self *PlatformTransport) resolveDnsCarrierAddrs(
+	ctx context.Context,
+	host string,
+	dnsPorts []int,
+) ([]*net.UDPAddr, error) {
+	if len(dnsPorts) == 0 {
+		return nil, fmt.Errorf("the H3 dns carrier has no port")
+	}
+	udpAddr, err := self.resolveSingleControlUDPAddr(ctx, net.JoinHostPort(host, strconv.Itoa(dnsPorts[0])))
+	if err != nil {
+		return nil, err
+	}
+	udpAddrs := []*net.UDPAddr{}
+	for _, dnsPort := range dnsPorts {
+		udpAddrs = append(udpAddrs, &net.UDPAddr{
+			IP:   udpAddr.IP,
+			Port: dnsPort,
+			Zone: udpAddr.Zone,
+		})
+	}
+	return udpAddrs, nil
+}
+
+// dialH3 opens the socket for one address and completes the QUIC dial on it.
+// confirm waits for the handshake to complete before reporting success, which
+// a race needs: DialEarly may return as soon as cached 0-RTT parameters exist,
+// before the peer has answered, and a blackholed family must not win on that.
+// The returned attempt owns its socket, transport and connection.
+func (self *PlatformTransport) dialH3(
+	ctx context.Context,
+	ptMode TransportMode,
+	serverName string,
+	udpAddr *net.UDPAddr,
+	wrap h3PacketConnWrapper,
+	tlsConfig *tls.Config,
+	quicConfig *quic.Config,
+	slowMultiple int,
+	confirm bool,
+) (*h3DialAttempt, error) {
+	var translationClaim *platformTransportBudgetReservation
+	if ptMode == TransportModeH3Dns || ptMode == TransportModeH3DnsPump {
+		var err error
+		translationClaim, err = self.acquireH3TranslationMemory(ctx)
+		if err != nil {
+			return nil, err
+		}
+		ctx = context.WithValue(ctx, h3TranslationReservationContextKey{}, translationClaim)
+	}
+	claimTransferred := false
+	defer func() {
+		if !claimTransferred {
+			translationClaim.Release()
+		}
+	}()
+	packetConn, peerAddr, egressPinned, err := self.openH3PacketConn(ctx, ptMode, serverName, udpAddr)
+	if err != nil {
+		// A factory can return a usable endpoint together with an error.
+		// Ownership transfers on every non-nil return, including this
+		// rejected result.
+		if packetConn != nil {
+			packetConn.Close()
+		}
+		return nil, err
+	}
+	if packetConn == nil {
+		return nil, fmt.Errorf("H3 packet connection factory returned nil")
+	}
+	// An extender dial has no local address for the peer: the name is resolved
+	// at the extender. Its connection reports the peer it actually relays to,
+	// and quic has to agree with that.
+	if peerAddr == nil {
+		peerAddr = udpAddr
+	}
+	attempt := &h3DialAttempt{
+		udpAddr:                udpAddr,
+		translationReservation: translationClaim,
+		packetConn: capPlatformPacketConn(
+			packetConn,
+			self.h3SocketReadBufferByteCount(),
+			self.h3SocketWriteBufferByteCount(),
+		),
+		egressPinned: egressPinned,
+	}
+	claimTransferred = true
+	success := false
+	defer func() {
+		if !success {
+			attempt.close()
+		}
+	}()
+	wrapped, err := wrap(ctx, attempt.packetConn)
+	if err != nil {
+		return nil, err
+	}
+	attempt.packetConn = wrapped
+
+	// packetConn, not the host socket: an injected endpoint has no host
+	// socket, and a packet translation reports the address of the one it wraps.
+	self.log.Infof("[c]h3 connect to %v (%s) local=%v bound=%t\n", peerAddr, tlsConfig.ServerName, attempt.packetConn.LocalAddr(), egressPinned)
+
+	attempt.quicTransport = &quic.Transport{
+		Conn: attempt.packetConn,
+	}
+	// per attempt: a race runs several dials against one config
+	attemptTlsConfig := tlsConfig.Clone()
+	attemptQuicConfig := quicConfig.Clone()
+	handshakeAttempt := self.settings.H3QuicPacketStats.beginHandshakeAttempt()
+	if handshakeAttempt != nil {
+		attemptQuicConfig.Tracer = self.settings.H3QuicPacketStats.tracerForAttempt(handshakeAttempt)
+	}
+	if self.settings.h3RetainedByteAccounting {
+		installQuicSendFlight(attemptQuicConfig)
+	}
+	var conn *quic.Conn
+	if self.settings.h3RetainedByteAccounting {
+		// Allow0RTT is a server acceptance option, not a client-send switch.
+		// The retained-flight controller intentionally tracks only confirmed
+		// 1-RTT ownership; Dial (not DialEarly) also avoids Retry requeueing
+		// application roots outside that tracker on resumed connections.
+		conn, err = attempt.quicTransport.Dial(ctx, peerAddr, attemptTlsConfig, attemptQuicConfig)
+	} else {
+		conn, err = attempt.quicTransport.DialEarly(ctx, peerAddr, attemptTlsConfig, attemptQuicConfig)
+	}
+	if err != nil {
+		handshakeAttempt.finish(false)
+		if handshakeAttempt.sentWithoutResponse() {
+			self.log.Infof(
+				"[c]h3 handshake no response mode=%s sent_packets=%d pto=%d err=%s\n",
+				ptMode,
+				handshakeAttempt.sent.Load(),
+				handshakeAttempt.pto.Load(),
+				err,
+			)
+		}
+		self.log.Infof("[c]h3 connect err = %s\n", err)
+		return nil, err
+	}
+	attempt.conn = conn
+	// DialEarly may return as soon as cached 0-RTT transport parameters
+	// are available, before the peer has answered this connection. Keep
+	// the attempt open until QUIC confirms the handshake or the connection
+	// dies; otherwise an Initial blackhole after a 0-RTT dial is falsely
+	// counted as a success and never reaches the no-response signal.
+	if handshakeAttempt != nil {
+		go func() {
+			handshakeComplete := conn.HandshakeComplete()
+			select {
+			case <-handshakeComplete:
+				handshakeAttempt.finish(true)
+			case <-conn.Context().Done():
+				// If both channels closed together, handshake completion wins.
+				select {
+				case <-handshakeComplete:
+					handshakeAttempt.finish(true)
+					return
+				default:
+				}
+				handshakeAttempt.finish(false)
+				if handshakeAttempt.sentWithoutResponse() {
+					self.log.Infof(
+						"[c]h3 handshake no response mode=%s sent_packets=%d pto=%d err=%s\n",
+						ptMode,
+						handshakeAttempt.sent.Load(),
+						handshakeAttempt.pto.Load(),
+						context.Cause(conn.Context()),
+					)
+				}
+			}
+		}()
+	}
+	if confirm {
+		select {
+		case <-conn.HandshakeComplete():
+		case <-conn.Context().Done():
+			return nil, fmt.Errorf("h3 handshake failed: %w", context.Cause(conn.Context()))
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	success = true
+	return attempt, nil
+}
+
+// randomDnsTld picks the tld one dns carrier attempt encodes with.
+func (self *PlatformTransport) randomDnsTld() []byte {
+	return self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
+}
+
+// extenderPlaceholderUDPAddr stands in for the address an extender dial does
+// not have, because the name is resolved at the extender rather than here.
+//
+// It is never dialed. dialH3 replaces it with the address the extender packet
+// connection reports, so quic's notion of the peer matches what arrives.
+func extenderPlaceholderUDPAddr(port int) *net.UDPAddr {
+	return &net.UDPAddr{IP: net.IPv4zero, Port: port}
+}

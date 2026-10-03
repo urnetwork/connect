@@ -1,0 +1,19 @@
+{
+  "all_reported_metrics_preserved": true,
+  "benchtime": "250ms",
+  "classification": "Diagnostic CPU/allocation cost of an isolated optional ACK ownership policy; no production adoption or throughput acceptance.",
+  "common_work": "A borrowed real52-byte pure ACK passes through provider receiveTransferWithRecovery, actual SendPack admission and terminal consumption. Before uses the existing provider shard; after uses the existing dedicated ACK producer directly.",
+  "context_controls": "After-only Available and Wait isolate context composition. The Wait callback forces one initial refusal then success and includes every join/cancel cleanup; it does not measure host wait duration.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "host_timing_pass_threshold": null,
+  "interpretation": "The no-pressure path adds no per-item context join. Actual refusal pays one correctly cancellable join. The recovery owner is allocated once per existing flow worker; item layout costs32additionalbytes. The admission timing change includes the intentional worker-route change and is not an isolated interface-boxing measurement.",
+  "limits": "No physical A/B/A calibration or SDK throughput conclusion follows from these microbenchmarks.",
+  "matched_fixture": "Common admission benchmark body is byte-identical. A variant-only factory creates once the corresponding production recovery value outside timed work.",
+  "optional_ack_policy_adopted": false,
+  "race": false,
+  "repetitions": 3,
+  "results": "Admission before2368\u20132936ns/op and after1305\u20131357ns/op; both880B/op16allocs/op. providerReturnItem grows304\u2192336bytes. Available context11.58\u201312.04ns/op,0B/0allocs/0joins; forced-wait context312.2\u2013315.1ns/op,248B/5allocs/1join.",
+  "run_context": "Both benchmark processes overlapped on a loaded Apple M1 Max host. Absolute timing and timing ratios are diagnostic only; no quiescence wait or performance acceptance claim.",
+  "source_pair": "Corresponding optional ACK-owner v3 before/after; after also includes hard caller-isolation guards. Same experimental receiver-service sampler in both.",
+  "test_execution_owner": "test_monitor_medium (Terra medium)"
+}

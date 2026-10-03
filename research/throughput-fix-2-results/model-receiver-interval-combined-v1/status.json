@@ -1,0 +1,6 @@
+{
+  "classification": "Isolated receiver-delay candidate; warm roots pass but changing-window and long SDK throughput still fail.",
+  "outcomes": 6,
+  "readings": 32,
+  "worker_readings": 0
+}

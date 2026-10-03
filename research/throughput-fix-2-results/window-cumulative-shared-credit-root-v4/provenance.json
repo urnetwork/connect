@@ -1,0 +1,20 @@
+{
+  "classification": "Actual once-only H1 credit attribution supplement reproduces the same four cold shared-consumer utilization failures as v3, before any production change.",
+  "comparison_to_v3": "Same training clocks, physical tail ownership, estimator read schedule and utilization assertions; raw callbacks replaced by exact retained-item publication.45P12F, all four split cases independently failed; no precondition changed.",
+  "consumer_scope": "Actual waitForService reservation and shared burst dispatch consume final qualified estimates for at most three observed flights, within measured freshness and effective byte limits. Startup allowance is spent through actual preceding reservations and bounded ACKed flights.",
+  "contract_split": "Exact byte ownership, finite probe, target/window limits, and evidence scope are hard invariants. Aggregate release within its measured prior duration is a utilization objective, not protocol correctness or an exact required serialization value.",
+  "credit_scope": "Every physical initial H1 write enrolls an actual retained frame, confirms its write, then publishes through publishAckServiceCredit. Duplicate cumulative heads and late SACK calls cannot add credit. Exactly acknowledged frames are removed before the next complete flight.",
+  "debugging_owner": "network_quality_design (Astra max)",
+  "event_plumbing": false,
+  "live_adoption": false,
+  "original_controls": "All12 original cumulative roots plus single-lane, idle/stale and other-service controls pass.",
+  "outcomes": "45P12F0S, race=true, no warnings.",
+  "performance_gates_changed": false,
+  "production_changes": [],
+  "source_base": {
+    "artifact": "throughput-fix-2-cumulative-shared-reserve-credit-before-v4-pinned",
+    "snapshot_inputs_sha256": "11fa111af6353a62adbbf746661783acf92c9c3fd62378c577fa96d7b033dba8"
+  },
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "training_scope": "Prescribed complete H1 flights and explicit raw ACK times bypass pacing during training. All physical frames are at most8KiB; each flight stays within effective window and aggregate training below125MB/s. This is not closed-loop throughput reachability."
+}

@@ -1,0 +1,20 @@
+{
+  "schema": "throughput-fix-2/source-snapshot-final-bounded-checkpoint-v1",
+  "outcome": "5 PASS",
+  "tests": [
+    "test_compiled_audits_keep_the_build_source",
+    "test_copied_inputs_are_independent_and_verified",
+    "test_local_replacements_come_from_the_copied_module",
+    "test_runner_rejects_outputs_in_any_worktree",
+    "test_source_checkout_cannot_contain_its_snapshot"
+  ],
+  "final_exit_code": 0,
+  "raw_log_sha256": "8fc006361784a98a47a5b4c112a1dcb9d493de342ed11090b86d8f858c779beb",
+  "final_files_sha256": {
+    "throughput-fix-2-snapshot-test.py": "9adaf8d376586285804caf6ba91415312228672e597f161eca5504ba2b7ed348",
+    "throughput-fix-2-snapshot.py": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175",
+    "throughput-fix-2.sh": "66f497152ebcdf99a0a875bd1caa67dc5be6e96cf7b8795dc7d9d46731bff8b8"
+  },
+  "guard": "The runner rejects output inside any Git worktree, and the snapshot helper rejects a nested snapshot source checkout.",
+  "scope": "Runner and synthetic-helper coverage only. Existing snapshot runs retain their already-copied Go source and remain valid because this change bounds unsafe output locations."
+}

@@ -1,0 +1,242 @@
+--- /dev/null
++++ b/ip_provider_pure_ack_admission_test.go
+@@ -0,0 +1,239 @@
++// A dedicated TCP acknowledgement owner must retain its one control while
++// the existing two-slot H1 lane is full. Shared callbacks still refuse at once.
++package connect
++
++import (
++	"context"
++	"testing"
++	"testing/synctest"
++
++	"github.com/urnetwork/connect/protocol"
++)
++
++// Reuse the provider callback and TCP-sequence fixtures; only the Transfer
++// consumer is paused so the exact physical trace's admission edge is forced.
++type providerPureAckAdmissionFixture struct {
++	provider *RemoteUserNatProvider
++	client   *Client
++	tcp      *tcpReorderTestHarness
++	sequence *SendSequence
++}
++
++// The captured mobile provider profile has sixteen entries shared by eight
++// lanes: exactly two admissions, independent of window policy or byte capacity.
++func newProviderPureAckAdmissionFixture(t *testing.T, sizing WindowSizingPolicyKind) *providerPureAckAdmissionFixture {
++	t.Helper()
++	profiles, _ := windowSdkProfiles(t)
++	var profile *windowPathEndpointProfile
++	for index := range profiles {
++		if profiles[index].Name == "sdk-provider-h1" {
++			profile = &profiles[index]
++		}
++	}
++	if profile == nil {
++		t.Fatal("pinned provider H1 profile missing")
++	}
++	settings := DefaultClientSettings()
++	settings.Log = NewNoopLogger()
++	settings.EncryptionSettings.Mode = EncryptionModeOff
++	settings.SendBufferSettings.WindowSizing = sizing
++	settings.SendBufferSettings.ApplyWindowSizing()
++	profile.apply(settings)
++	if sizing == WindowSizingConstant {
++		settings.SendBufferSettings.ResendQueueMaxByteCount = *profile.SendPool
++		if settings.SendBufferSettings.DeliverySizedWindowScale != 0 {
++			t.Fatal("constant control enabled window sizing")
++		}
++	}
++	providerSettings := DefaultRemoteUserNatProviderSettings()
++	providerSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
++	provider, client, _ := newProviderTransferKeyTestFixtureWithClientSettings(t, providerSettings, settings)
++	fixture := &providerPureAckAdmissionFixture{provider: provider, client: client}
++	fixture.tcp = newTcpReorderTestHarnessWithSynOptions(t, 1000, 8, 0, func(tcp *TcpSequence) {
++		lane := ipSendSchedulingKey(tcp.IpPath()).logicalLaneForCount(settings.SendBufferSettings.LogicalDataLaneCount)
++		id := sendSequenceId{Destination: tcp.source.SourceId, EncryptionRole: sequenceTlsRoleClient, LogicalLane: lane}
++		sequence := installProviderReturnTestSequence(t, provider, client, id)
++		sequence.client, sequence.sendBuffer = client, client.sendBuffer
++		sequence.destination, sequence.logicalLane = id.Destination, lane
++		sequence.sendBufferSettings = settings.SendBufferSettings
++		sequence.log = NewNoopLogger()
++		sequence.encryptionRole = id.EncryptionRole
++		sequence.packs = make(chan *SendPack, logicalLaneSequenceBufferSize(settings.SendBufferSettings.SequenceBufferSize, lane))
++		sequence.packAdmission = newSendPackAdmission(cap(sequence.packs))
++		sequence.resendQueue = newResendQueue(settings.SendBufferSettings.ResendQueueBudget, 0)
++		sequence.contractMultiRouteWriter = &windowPacingPolicyWriter{policy: transferFlightPolicySnapshot{h1Only: true}}
++		fixture.sequence = sequence
++		if cap(sequence.packs) != 2 || !sequence.transferFlightPolicy().h1Only {
++			t.Fatal("root lost the physical H1 two-slot lane")
++		}
++		client.sendBuffer.mutex.Lock()
++		client.sendBuffer.logicalLaneVersions[id.logicalLaneBase()] = transferLogicalLaneVersion
++		client.sendBuffer.publishLogicalLaneVersionsWithLock()
++		client.sendBuffer.mutex.Unlock()
++		original := tcp.receiveCallback
++		tcp.receiveCallback = func(source TransferPath, key TransferKey, mode protocol.ProvideMode, recovery receiveRecoveryMode, path *IpPath, packet []byte) {
++			// The existing harness owns handshake observation. Only the exact
++			// post-handshake acknowledgement enters the production provider.
++			original(source, key, mode, recovery, path, packet)
++			var reply IpPath
++			if _, err := parseIpPathWithPayloadBorrowed(packet, &reply); err == nil && reply.Ack && !reply.Syn && !reply.Fin && !reply.Rst && reply.TcpPayloadByteCount == 0 {
++				provider.receiveTransferWithRecovery(source, key, mode, recovery, path, packet)
++			}
++		}
++	}, []byte{1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0})
++	t.Cleanup(func() {
++		// Cancel the provider before joining a dedicated sender parked there.
++		provider.Close()
++		fixture.tcp.close()
++		fixture.releasePacks()
++		fixture.sequence.resendQueue.Clear()
++		if err := client.CloseAndWait(context.Background()); err != nil {
++			t.Errorf("provider client close: %v", err)
++		}
++	})
++	return fixture
++}
++
++// Each packet is borrowed by the real socket-return callback. Its successful
++// raw admission owns the retained share until this fixture drains that slot.
++func (self *providerPureAckAdmissionFixture) fill(t *testing.T, count int) {
++	t.Helper()
++	path := self.tcp.sequence.IpPath()
++	for index := range count {
++		packet := MessagePoolCopy(craftSecurityPacket(IpProtocolTcp, path.DestinationIp, path.DestinationPort, path.SourceIp, path.SourcePort, false, []byte{byte(index + 1)}))
++		self.provider.receiveTransferWithRecovery(self.tcp.source, TransferKey{}, protocol.ProvideMode_Network, receiveRecoveryModeTcpSocket, path, packet)
++		MessagePoolReturn(packet)
++	}
++	if self.sequence.resendCapacityUnavailable.Load() || !self.sequence.resendQueue.CanAdd(0, self.sequence.sendBufferSettings.ResendQueueMaxByteCount) {
++		t.Fatal("byte capacity closed before the count-admission root")
++	}
++	if len(self.sequence.packs) != count || self.sequence.packAdmission.count != count {
++		t.Fatal("socket returns did not own the requested bounded slots")
++	}
++}
++
++// Mirror the ordinary consumer's terminal release without serializing a new
++// message or manufacturing a Transfer acknowledgement in this admission root.
++func (self *providerPureAckAdmissionFixture) releaseOne() {
++	pack := <-self.sequence.packs
++	pack.returnFrames()
++	pack.releaseRaw()
++}
++
++// Cleanup may also own the final admitted control after its inspection.
++func (self *providerPureAckAdmissionFixture) releasePacks() {
++	for {
++		select {
++		case pack := <-self.sequence.packs:
++			pack.returnFrames()
++			pack.releaseRaw()
++		default:
++			return
++		}
++	}
++}
++
++// Return only scalar control metadata while releasing every admitted buffer.
++func (self *providerPureAckAdmissionFixture) deliveredAcks(t *testing.T) []uint32 {
++	t.Helper()
++	var acks []uint32
++	for {
++		select {
++		case pack := <-self.sequence.packs:
++			packet := providerCallbackQueuePacketBytes(t, pack)
++			var path IpPath
++			_, err := parseIpPathWithPayloadBorrowed(packet, &path)
++			if err == nil && path.Ack && !path.Syn && !path.Fin && !path.Rst && path.TcpPayloadByteCount == 0 {
++				if len(packet) != 52 || !pack.Ack || !pack.lifecycleUpstreamRecoverable || pack.retainAfterAckTimeout {
++					t.Errorf("pure ACK lost exact52B regenerable/reliable ownership: bytes=%d ack=%t recoverable=%t retained=%t", len(packet), pack.Ack, pack.lifecycleUpstreamRecoverable, pack.retainAfterAckTimeout)
++				}
++				acks = append(acks, path.AckSequenceNumber)
++			}
++			pack.returnFrames()
++			pack.releaseRaw()
++		default:
++			return acks
++		}
++	}
++}
++
++// Once one slot returns, the already-generated ACK must progress without
++// another upload or an inner TCP retransmission to regenerate it.
++func TestWindowPhysicalH1ProviderPureAckSurvivesAdmissionPressure(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		for _, sizing := range []WindowSizingPolicyKind{WindowSizingConstant, WindowSizingFromDelivery} {
++			fixture := newProviderPureAckAdmissionFixture(t, sizing)
++			fixture.fill(t, 2)
++			started, release := make(chan struct{}), make(chan struct{})
++			fixture.provider.returnSendStarted = func() { close(started); <-release }
++			fixture.tcp.sendPayload(fixture.tcp.nextSeq, "x", false)
++			fixture.tcp.readPayload("x")
++			<-started
++			close(release)
++			// Every other goroutine must reach a real blocking edge. On the
++			// old path the shared worker has discarded the ACK; a retained
++			// owner must instead be waiting on the still-full admission gate.
++			synctest.Wait()
++			fixture.releaseOne()
++			synctest.Wait()
++			acks := fixture.deliveredAcks(t)
++			if len(acks) != 1 || acks[0] != fixture.tcp.nextSeq+1 {
++				t.Errorf("sizing=%d: released H1 slot did not deliver the owned52B ACK without retransmission: acks=%v drops=%+v", sizing, acks, fixture.provider.CongestionDropStats())
++			}
++			if drops := fixture.provider.CongestionDropStats(); drops != (ProviderCongestionDrops{}) {
++				t.Errorf("sizing=%d: transient bounded admission lost control: %+v", sizing, drops)
++			}
++			fixture.provider.Close()
++			fixture.tcp.close()
++		}
++	})
++}
++
++// The same real worker/provider path is a positive control when one of the
++// unchanged two admissions is already available.
++func TestWindowPhysicalH1ProviderPureAckUsesAvailableAdmission(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 1)
++		fixture.tcp.sendPayload(fixture.tcp.nextSeq, "x", false)
++		fixture.tcp.readPayload("x")
++		synctest.Wait()
++		acks := fixture.deliveredAcks(t)
++		if len(acks) != 1 || acks[0] != fixture.tcp.nextSeq+1 || fixture.provider.CongestionDropStats() != (ProviderCongestionDrops{}) {
++			t.Fatalf("available control changed: acks=%v drops=%+v", acks, fixture.provider.CongestionDropStats())
++		}
++	})
++}
++
++// A public callback has no dedicated recovery owner and must still return at
++// the existing zero-wait boundary rather than hold an unrelated flow's pump.
++func TestWindowPhysicalH1ProviderPublicAckStillRefusesAtCapacity(t *testing.T) {
++	assertMessagePoolOwnership(t)
++	MessagePoolReturn(MessagePoolGet(1))
++	synctest.Test(t, func(t *testing.T) {
++		fixture := newProviderPureAckAdmissionFixture(t, WindowSizingConstant)
++		fixture.fill(t, 2)
++		fixture.tcp.sequence.mutex.Lock()
++		packet, err := fixture.tcp.sequence.PureAck()
++		fixture.tcp.sequence.mutex.Unlock()
++		if err != nil {
++			t.Fatal(err)
++		}
++		fixture.provider.Receive(fixture.tcp.source, protocol.ProvideMode_Network, fixture.tcp.sequence.IpPath(), packet)
++		MessagePoolReturn(packet)
++		synctest.Wait()
++		drops := fixture.provider.CongestionDropStats()
++		if drops.ReturnSendPacketCount != 1 || drops.ReturnSendByteCount != 52 || drops.ReturnQueuePacketCount != 0 {
++			t.Fatalf("shared callback did not preserve exact zero-wait refusal: %+v", drops)
++		}
++		fixture.releasePacks()
++		synctest.Wait()
++		if len(fixture.sequence.packs) != 0 {
++			t.Fatal("a public callback retried after its terminal refusal")
++		}
++	})
++}

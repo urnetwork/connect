@@ -1,0 +1,10 @@
+{
+  "archive": "sdk-initial-feedback-isolation",
+  "payload_sha256": {
+    "ledger.jsonl": "6d42a2f9e5d6fa030253678fa6b7a188a1ab04b9ea17612c132dc0d6020f5f09",
+    "outcomes.jsonl": "3409c459f245066c43efbace32dfcc05c60af7ac4b449e77d24b656fc2c603cf",
+    "provenance.json": "d4011c1dd5502daddcf53e6377e08e16f91c5c04b1ff90114910cf33eac3d2f6",
+    "source-pins.json": "f721b74446f1c5a29d2a47663702d045e0b7285364b87f708a749193ab1ce7c9",
+    "status.json": "f02c4198ff925e98ad82586e7cf939e39d9b22360714e19b71d58a0ba4775afc"
+  }
+}

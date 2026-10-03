@@ -1,0 +1,10 @@
+{
+  "archive": "window-proof-port-evidence",
+  "payload_sha256": {
+    "failure-observations.jsonl": "e3c873b49c6ea57669133f3b096c1a1b37c98c183e6027e328e473c7c2cb4209",
+    "outcomes.jsonl": "5d14ae722c354da2a64a1c2beafb7f85ce349b86812b48b9c5b3ab2c7df0ee44",
+    "provenance.json": "9a9637f13b4abdb7bb3d48e7ebdb2b8fd21465628448a6df7f3fe95e23aed986",
+    "source-pins.json": "cd272f53afdde6fce11b3db9786a731da7704d64d319d012ba3ebd27debf7174",
+    "status.json": "3941ad284da7d3a245692147c676497e8bf7a27e9fbd3bf3b058bff5af94a1e9"
+  }
+}

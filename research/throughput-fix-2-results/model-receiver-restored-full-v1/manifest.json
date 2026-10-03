@@ -1,0 +1,10 @@
+{
+  "archive": "model-receiver-restored-full-v1",
+  "payload_sha256": {
+    "ledger.jsonl": "252b7a4923124683df1c791b7fa38a8098b3cfc11d4788974ae24e1d7b40a8fa",
+    "outcomes.jsonl": "5d26325da2e0067ac5968f975f2321028a10ee37d0fab3aecebad4824d01cbd1",
+    "provenance.json": "6493fc23d1a7089d8a97d46103ae9559ef16c5636dcd94b7f539036b06f47369",
+    "source-pins.json": "fbbb95c2012d5e9b9bdc5df93b0e4eba4510f5bb6281577b8efd056f7ba0a36b",
+    "status.json": "7aabc5703f1a76bfcb646927543f53dce45ac42646f6b156e5764c44631fa3ec"
+  }
+}

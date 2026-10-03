@@ -64,10 +64,26 @@ const (
 	// answer (SynAck) requires the provider's own upstream connect to have
 	// succeeded, which is the whole point.
 	probeClassHealth probeClass = 0
-	// probeClassDns is a public resolver, asked an A query at udp/53. Any
-	// answer at all is success; the content is irrelevant and is not parsed.
+	// probeClassDns is a public resolver, asked an address query at udp/53
+	// (A over v4, AAAA over v6 -- the family of the resolver ip). Any answer
+	// at all is success; the content is irrelevant and is not parsed.
 	probeClassDns probeClass = 1
 )
+
+// the dns record types the probe asks for and the resolution stage parses
+const (
+	probeDnsRecordTypeA    uint16 = 1
+	probeDnsRecordTypeAAAA uint16 = 28
+)
+
+// probeDnsRecordTypeForIpVersion is the address record type a pass over
+// ipVersion asks for: the answer must be an address the same pass can dial.
+func probeDnsRecordTypeForIpVersion(ipVersion int) uint16 {
+	if ipVersion == 6 {
+		return probeDnsRecordTypeAAAA
+	}
+	return probeDnsRecordTypeA
+}
 
 // probeTarget is one destination of one probe pass, already resolved.
 //
@@ -76,6 +92,12 @@ const (
 // the confusion would be indistinguishable from a real dial failure. The
 // tunnel's doh cache resolves outside the probed channel and hands the
 // addresses in; F-1's tests use literals for the same reason.
+//
+// Ip carries the address family: registration picks the matching probe
+// source address and ip version from it, and every packet crafted for the
+// target is built for that version, so a v6 target is asked over v6 with no
+// further plumbing (IPV6.md B1: a pass asks only over a family the exit can
+// carry, see probeProviderPass).
 type probeTarget struct {
 	// Host is the name this target came from, for logging and for the dns
 	// query name. Empty is legal (a literal-ip target).
@@ -173,9 +195,7 @@ const (
 	// net.ipv4.ip_local_port_range to 32768-60999: the kernel never
 	// auto-assigns a source port at or above 61000, so this range cannot
 	// collide with the ephemeral traffic a tun actually carries. 512 ports is
-	// far more than the concurrency this mechanism will ever have in flight
-	// (one pass is five probes) and leaves headroom for the aggressive startup
-	// sweep of the next package.
+	// enough for a full-table pass and leaves headroom for concurrent exits.
 	//
 	// The range is belt to the addresses' braces: the ingress classifier
 	// requires BOTH the reserved port and the benchmarking source address, so a
@@ -222,12 +242,17 @@ type probeFlow struct {
 
 	done         chan struct{}
 	answered     atomic.Bool
+	sent         atomic.Bool
 	completeOnce sync.Once
 	// answer is the dns answer payload, kept only when the target asked for it
 	// (CaptureAnswer) and the probe completed answered. Written inside the
 	// completeOnce and read only after done is closed, so the channel close is
 	// the publication barrier and no lock is needed.
 	answer []byte
+	// Resolution questions share one UDP flow. This immutable, bounded table
+	// is published under stateLock before sending; only its anchor occupies a
+	// path-map entry. Each question still has its own completion and DNS id.
+	dnsQueries map[uint16]*probeFlow
 }
 
 // complete records the probe's outcome exactly once and wakes the waiter. Late
@@ -330,11 +355,13 @@ func probeCourtesyRstPacket(ipPath *IpPath, synSequence uint32) ([]byte, bool) {
 	return ipOosRstSequence(ipPath, synSequence+1)
 }
 
-// probeDnsQueryPacket builds a udp/53 packet carrying a standard recursive A
-// query for name. Returns false when the name cannot be encoded as a dns
-// question (labels are bounded at 63 bytes and names at 255).
+// probeDnsQueryPacket builds a udp/53 packet carrying a standard recursive
+// address query for name: A over a v4 path, AAAA over a v6 path, so the
+// resolution stage gets addresses the same pass can dial. Returns false when
+// the name cannot be encoded as a dns question (labels are bounded at 63
+// bytes and names at 255).
 func probeDnsQueryPacket(ipPath *IpPath, name string, id uint16) ([]byte, bool) {
-	question, ok := dnsQuestion(name)
+	question, ok := dnsQuestionType(name, probeDnsRecordTypeForIpVersion(ipPath.Version))
 	if !ok {
 		return nil, false
 	}
@@ -351,9 +378,15 @@ func probeDnsQueryPacket(ipPath *IpPath, name string, id uint16) ([]byte, bool) 
 	return ipOosUdpPacket(ipPath, payload), true
 }
 
-// dnsQuestion encodes name as a dns question section: length-prefixed labels,
-// a root label, then qtype A and qclass IN.
+// dnsQuestion encodes name as a dns question section for an A query: the
+// v4 form of dnsQuestionType.
 func dnsQuestion(name string) ([]byte, bool) {
+	return dnsQuestionType(name, probeDnsRecordTypeA)
+}
+
+// dnsQuestionType encodes name as a dns question section: length-prefixed
+// labels, a root label, then the given qtype and qclass IN.
+func dnsQuestionType(name string, recordType uint16) ([]byte, bool) {
 	name = strings.TrimSuffix(name, ".")
 	if name == "" {
 		return nil, false
@@ -372,8 +405,9 @@ func dnsQuestion(name string) ([]byte, bool) {
 	if 255 < len(question) {
 		return nil, false
 	}
-	// qtype A, qclass IN
-	question = append(question, 0, 1, 0, 1)
+	// qtype, qclass IN
+	question = binary.BigEndian.AppendUint16(question, recordType)
+	question = append(question, 0, 1)
 	return question, true
 }
 
@@ -426,7 +460,11 @@ func (self *RemoteUserNatMultiClient) probeCtx() context.Context {
 func (self *RemoteUserNatMultiClient) registerProbeFlow(
 	client *multiClientChannel,
 	target probeTarget,
+	dnsNames ...string,
 ) (*probeFlow, bool) {
+	if len(dnsNames) > probeResolverMaxQuestions || len(dnsNames) != 0 && target.Class != probeClassDns {
+		return nil, false
+	}
 	sourceIp, version, ok := probeSourceIpFor(target.Ip)
 	if !ok {
 		return nil, false
@@ -481,6 +519,18 @@ func (self *RemoteUserNatMultiClient) registerProbeFlow(
 			ipPath:      ipPath,
 			synSequence: synSequence,
 			done:        make(chan struct{}),
+		}
+		if len(dnsNames) != 0 {
+			probe.dnsQueries = make(map[uint16]*probeFlow, len(dnsNames))
+			for i, name := range dnsNames {
+				questionTarget := target
+				questionTarget.QueryName, questionTarget.CaptureAnswer = name, true
+				id := uint16(synSequence) + uint16(i)
+				probe.dnsQueries[id] = &probeFlow{
+					target: questionTarget, ipPath: ipPath, synSequence: uint32(id),
+					done: make(chan struct{}),
+				}
+			}
 		}
 		update := newMultiClientChannelUpdate(self.probeCtx(), ipPath)
 		update.probe = probe
@@ -545,9 +595,22 @@ func (self *RemoteUserNatMultiClient) unregisterProbeFlows(probes []*probeFlow) 
 		return removed
 	}()
 
-	// cancel outside the lock: Close takes the update's own leaf lock, and the
-	// parent lock must never be held over a leaf
+	// A local deadline does not cancel the provider's longer upstream dial.
+	// Retire still-pending TCP questions explicitly, like answered SYNs. Never
+	// wait behind a congested send queue during optional-probe cleanup; a
+	// refused RST leaves the provider's existing dial/idle timeout as fallback.
+	// All I/O and Close happen outside the parent lock.
 	for _, update := range updates {
+		probe := update.probe
+		if probe.target.Class == probeClassHealth && probe.sent.Load() {
+			if client := update.client.Load(); client != nil {
+				if packet, ok := probeCourtesyRstPacket(probe.ipPath, probe.synSequence); ok {
+					if !client.sendProbe(&parsedPacket{packet: packet, ipPath: probe.ipPath}, 0) {
+						MessagePoolReturn(packet)
+					}
+				}
+			}
+		}
 		update.Close()
 	}
 }
@@ -615,6 +678,7 @@ func (self *RemoteUserNatMultiClient) probeExit(
 			continue
 		}
 		result.Sent += 1
+		probe.sent.Store(true)
 		self.reliabilityMetrics.probeSent()
 		probes = append(probes, probe)
 	}
@@ -790,17 +854,34 @@ func (self *RemoteUserNatMultiClient) clientReceiveProbePacket(
 			key := egressIpPath.ToIp4Path()
 			if u, ok := self.ip4PathUpdates[key]; ok && u.isProbe() {
 				found = u
-				delete(self.ip4PathUpdates, key)
 			}
 		case 6:
 			key := egressIpPath.ToIp6Path()
 			if u, ok := self.ip6PathUpdates[key]; ok && u.isProbe() {
 				found = u
-				delete(self.ip6PathUpdates, key)
 			}
 		}
 		if found == nil {
 			return
+		}
+		if questions := found.probe.dnsQueries; questions != nil {
+			// The path identifies this resolver and pass; the transaction id
+			// identifies a question. Wrong/late/duplicate ids cannot complete
+			// a sibling, and another channel cannot answer for this one.
+			if found.client.Load() != sourceClient {
+				return
+			}
+			_, payload, err := ParseIpPathWithPayload(packet)
+			if err == nil && len(payload) >= 2 {
+				probe = questions[binary.BigEndian.Uint16(payload[:2])]
+			}
+			return
+		}
+		switch egressIpPath.Version {
+		case 4:
+			delete(self.ip4PathUpdates, egressIpPath.ToIp4Path())
+		case 6:
+			delete(self.ip6PathUpdates, egressIpPath.ToIp6Path())
 		}
 		// removed as it is answered: a retransmitted answer then finds nothing,
 		// is consumed by the unmatched path above, and cannot re-complete or
@@ -812,6 +893,11 @@ func (self *RemoteUserNatMultiClient) clientReceiveProbePacket(
 	if probe == nil {
 		// consumed and dropped
 		return
+	}
+	select {
+	case <-probe.done:
+		return
+	default:
 	}
 
 	// What counts as an answer, per class.
@@ -867,7 +953,7 @@ func (self *RemoteUserNatMultiClient) clientReceiveProbePacket(
 	// destination answered). This is the positive half of the asymmetry; the
 	// failure half records nothing anywhere.
 	if sourceClient != nil && ipPath.Syn && ipPath.Ack {
-		sourceClient.addConnectSuccess()
+		sourceClient.addConnectSuccess(ipPath.Version)
 	}
 
 	// courtesy close, so the destination is not left holding a half-open
@@ -964,6 +1050,9 @@ func (self *RemoteUserNatMultiClient) probeDialFailure(
 	if probe != nil {
 		// the answer to the question is "no". That is the entire effect.
 		probe.complete(false)
+		for _, question := range probe.dnsQueries {
+			question.complete(false)
+		}
 		if update != nil {
 			update.Close()
 		}
@@ -1163,18 +1252,27 @@ func (self *multiClientChannel) sendProbe(parsedPacket *parsedPacket, timeout ti
 	// to it. This is also how the exclusion tests model a never-answering exit
 	// without a transport.
 	if self.stalled.Load() {
+		if !frame.Raw {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		MessagePoolReturn(parsedPacket.packet)
 		return true
 	}
 
 	// bare fixture channels have no underlying client; refuse rather than
 	// panic, the same convention ClientId and Tier follow
 	if self.client == nil {
+		if !frame.Raw {
+			MessagePoolReturn(frame.MessageBytes)
+		}
 		return false
 	}
 
-	var opts []any
+	opts := [2]any{sendPackHealthProbeOption{}}
+	optionCount := 1
 	if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
-		opts = append(opts, ForceStream())
+		opts[optionCount] = ForceStream()
+		optionCount++
 	}
 
 	success, err := self.client.SendMultiHopWithTimeoutDetailed(
@@ -1184,7 +1282,7 @@ func (self *multiClientChannel) sendProbe(parsedPacket *parsedPacket, timeout ti
 		// accounting does not observe it
 		nil,
 		timeout,
-		opts...,
+		opts[:optionCount]...,
 	)
 	// ownership mirrors SendDetailedWithAck: the packet is consumed on success,
 	// the wrapped marshal buffer is freed on failure. Probe packets are plain

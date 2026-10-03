@@ -1,0 +1,25 @@
+{
+  "precondition_failure": {
+    "source_log": "throughput-fix-2-relay-precondition-before.log",
+    "source_log_sha256": "97a8ca4d8cb02e24642db14aab38feb3de0f28fe48ee603ede89b049b5f7b50f",
+    "outcome": "process failed",
+    "failed_test": "TestRelayInflationUsesConstantSendWindow",
+    "failure_scope": "six endpoint controls required the historical constant send window with delivery sizing and H1 pacing disabled"
+  },
+  "restored_control": {
+    "source_log": "throughput-fix-2-relay-restored.log",
+    "source_log_sha256": "d5702eb11e3e9226555d70ca650e93fe8972fbff7d02408e414ec5816afdf606",
+    "outcome": "process passed",
+    "storm_repetitions": 3,
+    "deep_queue_defer_off_timeout_resends": [1455, 1545, 1438],
+    "minimum_required_timeout_resends": 500
+  },
+  "fixture_race": {
+    "source_log": "throughput-fix-2-relay-fixture-race.log",
+    "source_log_sha256": "09efd600304006aafedd55d788dba1eb53489b4ed2ceb0967b952734159aef6a",
+    "outcome": "process passed",
+    "top_level_passed": 30,
+    "top_level_failed": 0
+  },
+  "note": "Raw logs are not copied into this archive."
+}

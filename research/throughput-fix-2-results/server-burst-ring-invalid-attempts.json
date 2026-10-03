@@ -1,0 +1,33 @@
+{
+  "note": "These attempts did not produce valid server validation results. Raw runner output is not archived.",
+  "attempts": [
+    {
+      "modes": [
+        "server-connect-deterministic",
+        "server-proxy"
+      ],
+      "output_directories": [
+        "/tmp/throughput-fix-2-server-connect-deterministic-burst-ring",
+        "/tmp/throughput-fix-2-server-proxy-burst-ring"
+      ],
+      "outcome": "invalid build attempt",
+      "reason": "The runner detected server sources changed during compilation and stopped before test execution.",
+      "connect_source_sha256": "2b40106a41c1b5fa93dd13ed5c3092dddc0e7510f4a36a233e180ceafdc6abf0",
+      "server_source_sha256_at_manifest_start": "beb6376e1ae989a16886b3625e2181cd6efb7746e6e9d105fdb3270fe2ad2147",
+      "run_context": "Final burst-ring validation started immediately with concurrent root documentation work, focused Go/profiling jobs, and peer campaign jobs active; no quiescence wait."
+    },
+    {
+      "modes": [
+        "server-connect-deterministic",
+        "server-proxy"
+      ],
+      "output_directories": [
+        "/tmp/throughput-fix-2-server-connect-deterministic-burst-ring-retry1",
+        "/tmp/throughput-fix-2-server-proxy-burst-ring-retry1"
+      ],
+      "outcome": "external preflight block",
+      "reason": "server/test-env.sh stopped before a manifest, build, or test because PostgreSQL was unreachable.",
+      "run_context": "Final burst-ring server retry 1 started immediately while unrelated server-tree edits and concurrent root validation jobs were active; prior server builds were invalidated by a source-change check; no quiescence wait."
+    }
+  ]
+}

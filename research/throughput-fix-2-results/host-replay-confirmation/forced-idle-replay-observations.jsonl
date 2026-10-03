@@ -1,0 +1,8 @@
+{"arm_index":0,"at":"5.081697208s","count":1,"final":{"held":true,"replays":1},"idle":true,"pacing_after":0,"pacing_before":0,"service_after":0,"service_before":0,"variant":"before"}
+{"arm_index":1,"at":"5.081696417s","count":1,"final":{"held":true,"replays":1},"idle":true,"pacing_after":0,"pacing_before":0,"service_after":0,"service_before":0,"variant":"before"}
+{"arm_index":2,"at":"5.081725084s","count":1,"final":{"held":true,"replays":1},"idle":true,"pacing_after":20941,"pacing_before":127695492,"service_after":19038,"service_before":116086811,"variant":"before"}
+{"arm_index":3,"at":"5.082040458s","count":1,"final":{"held":true,"replays":1},"idle":true,"pacing_after":0,"pacing_before":0,"service_after":0,"service_before":0,"variant":"before"}
+{"arm_index":0,"at":"5.082153208s","count":1,"final":{"held":true,"replays":1},"idle":true,"pacing_after":0,"pacing_before":0,"service_after":0,"service_before":0,"variant":"after"}
+{"arm_index":1,"at":"5.081106375s","count":1,"final":{"held":true,"replays":1},"idle":true,"pacing_after":0,"pacing_before":0,"service_after":0,"service_before":0,"variant":"after"}
+{"arm_index":2,"at":"5.081473416s","count":1,"final":{"held":true,"replays":1},"idle":true,"pacing_after":27777451,"pacing_before":27777451,"service_after":25252229,"service_before":25252229,"variant":"after"}
+{"arm_index":3,"at":"5.080854292s","count":1,"final":{"held":true,"replays":1},"idle":true,"pacing_after":0,"pacing_before":0,"service_after":0,"service_before":0,"variant":"after"}

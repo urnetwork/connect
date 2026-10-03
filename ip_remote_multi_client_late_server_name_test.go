@@ -24,6 +24,7 @@ func lateNameClient(ctx context.Context, lookup ServerNameLookup, bridge bool) *
 		ctx: ctx,
 		settings: &MultiClientSettings{
 			DestinationAffinity:      true,
+			FreshFlowAffinity:        true,
 			ServerNameAffinityBridge: bridge,
 			SequenceIdleTimeout:      10 * time.Minute,
 			TcpSequenceIdleTimeout:   10 * time.Minute,

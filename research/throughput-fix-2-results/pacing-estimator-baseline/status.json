@@ -1,0 +1,1 @@
+{"benchmark_status": "PASS", "censored_comparisons": 0, "comparison_count": 0, "exit_code": 0, "failed_comparisons": 0, "finished_utc": "2026-09-16T05:33:31.490688+00:00", "host_load_average_at_finish": [17.578125, 24.54833984375, 21.3623046875], "rows": 0, "runner_ledger_rows": 0, "sanitized_benchmark_rows": 3}

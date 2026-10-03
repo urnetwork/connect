@@ -4,6 +4,8 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 
 ## Naming
 
+- Treat acronyms and initialisms as ordinary words in Go identifiers: capitalize only the first letter of each acronym, not every letter. Write `EvmTxManager`, `Tcp`, `Rpc`, `Http`, `Api`, `Json`, `Id`, and `Uid`, not `EVMTxManager`, `TCP`, `RPC`, `HTTP`, `API`, `JSON`, `ID`, or `UID`. At the start of an unexported identifier, lowercase the whole acronym: `evmTxManager`, `tcpConnection`, `rpcClient`, `clientId`, and `validatorUid`. Apply this consistently to types, functions, methods, fields, variables, constants, and test names in code we write. This deliberately differs from standard Go initialism conventions.
+- Preserve identifiers required by external packages, generated bindings, or interface contracts, and preserve serialized field names and protocol formats unless changing that contract is explicitly part of the task. Rename an owned identifier and all its references together; a naming-only change must not alter behavior or wire compatibility.
 - Our receiver name is `self`: `func (self *T) f(...)` (pointer receiver) or `func (self T) f(...)` (value receiver).
 - Our canonical name for a `sync.Mutex` guarding state is `stateLock`.
 - Field and variable names are slightly more verbose than standard Go, so usage and type can be inferred from the name. The scheme is usage + type:
@@ -69,26 +71,37 @@ actually use.
 
 A routing key is a value that decides *which* instance of something a message belongs to: the sequence lane (`Pack.force_stream` / `Pack.companion_contract`), the session role and identity companion (`TransferFrame.session_role` / `session_companion`), the handshake generation (`EncryptedControl.epoch_id`). Adding one is never a single-site change.
 
+- **Peer messages are path-independent for correctness.** `TransferKey` selects the logical send sequence and its lane/session; it does not select a transport path. The sequence's destination-keyed multi-route writer may use any live route to that peer, including exchange, direct P2P, or a multihop stream. Route knowledge may influence that choice for performance, but correctness must not depend on which route wins. In particular, do not add a transport-local stream id to `TransferKey`, the send-sequence identity, or the serialized transfer path.
+- **Source identity and transfer identity stay separate.** A receive callback gets the authenticated source as its `TransferPath` argument and the receiver-visible lane/session as `peer.TransferKey`. `TransferKey` must not repeat the source id already carried by the callback path. A reply normally sends to `source.SourceId` and passes `peer.TransferKey` as a send option so the peer's logical lane is reproduced without threading a transport path through the application.
+- **A selectable route must be usable end to end.** One connected local adjacency does not make a multihop stream live. Keep its transport alias unavailable while the stream is establishing, publish it only after end-to-end readiness succeeds, and withdraw it when the stream disconnects or loses readiness. An incomplete route is establishment state, not a slower route that ordinary traffic may try.
 - **Every delivery path must carry the key.** A message usually reaches its consumer by more than one route — the in-order drain and an optimistic fast path, a per-item call and a batch call, a live path and a replay/resend path. One path that omits the key silently reintroduces the entire class of bug the key was added to fix, and it surfaces only in the narrow race where that path wins. Adding a key is therefore: define it, stamp it at every producer, and grep for **every** consumer entry point before calling the change done.
 - **Sender-local state that selects a route must be visible to the receiver**, or the receiver cannot distinguish two live things and will collapse them into one — dropping whichever it decides is "older". If a key must stay off the wire, the sender is responsible for never running two things that differ only by it.
 - **Prefer routing a mismatch over judging it.** A message from another instance is evidence about that instance, not about this one. Judging it here produces a wrong verdict on state it does not describe (a proof for another generation fails signature verification and looks like an attack), and the wrong verdict is usually sticky. Route it, ignore it, or converge onto it.
 - **Order the key when the instances are ordered.** `Id` is a ULID, so generations compare directly: older is a straggler to drop, newer is a signal to converge. Without an ordering the receiver can only tell "different", which is not enough to decide who should move.
 - **A key with a single-slot consumer needs the key checked before the slot is taken.** Pending/first-wins state (one buffered proof per epoch, one head per sequence) is a resource a stale message can consume; validate the key first, or a straggler denies the slot to the message that belongs there.
 
-## Receive callbacks must not block
+## Receive callbacks and reliable-carrier backpressure
 
-Send and receive sit on opposite sides of the backpressure contract. **Senders block**: a packet/frame send is allowed to wait (buffer full, contract wait, write timeout) because blocking the producer is how backpressure propagates toward the source. **Receivers buffer and drop**: a packet/frame receive callback must never block, because by the time data reaches the receive side there is no producer left to slow down — there is only the delivery pipeline, and stalling it stalls everyone behind the stall.
+Send and receive sit on opposite sides of the backpressure contract. **Senders block**: a packet/frame send is allowed to wait (buffer full, contract wait, write timeout) because blocking the producer is how backpressure propagates toward the source. **Shared receive callbacks buffer and refuse**: a callback serving unrelated flows must never block, because stalling it stalls everyone behind the stall. A dedicated socket reader is different when it has read one complete message from an exactly identified reliable physical lane: retaining that one message until fixed downstream capacity or cancellation propagates backpressure into TCP/QUIC/SCTP. Dropping it instead manufactures loss above the reliable carrier and can pin every later Transfer Pack behind an artificial sequence gap.
 
-- **A receive callback that hands off must use a 0 timeout on the handoff.** Enqueue non-blocking; if the queue is full, drop (and count the drop). Never propagate a downstream wait back into the delivery path.
+- **A shared receive callback that hands off must use a 0 timeout on the handoff.** Enqueue non-blocking; if the queue is full, refuse (and count the refusal). Never propagate one destination's downstream wait through a callback that serves unrelated work.
+- **Classify the exact physical receive lane, not the connection family.** Hybrid H3 publishes separate reliable-stream and DATAGRAM routes; production P2P publishes separate SCTP and native-datagram routes. H1, QUIC stream, SCTP, and framed internal TCP readers may retain only their one already-read complete message while waiting for fixed queue capacity or cancellation. H3 DATAGRAM, outer DNS datagrams, and native P2P datagrams remain zero-wait and counted on refusal. Unknown/custom lanes retain the compatibility policy rather than being guessed reliable.
+- **The final Client-to-Pack handoff follows that exact lane contract.** A complete Pack from a reliable lane may wait for the existing count/byte-bounded sequence queue or cancellation; a DATAGRAM Pack remains zero-wait. This is the narrow shared-pump exception justified by Transfer ordering: discarding the reliable Pack creates a permanent hole while later work consumes the same finite reorder budget. It does not authorize a larger queue, a wait for unreliable traffic, or blocking arbitrary Client callbacks.
+- **A bounded carrier adapter may separate admission from forwarding.** The carrier reader must still offer into that adapter with a zero-wait send and drop immediately on refusal. One adapter-owned forwarding worker may wait on its consumer, because the carrier reader is insulated by the queue; the queue must have independent hard message and byte bounds, cancellation must join the worker, and every queued pooled buffer must be returned before lifecycle completion. Do not share that waiting worker across independent carrier readers.
+- **A reliable byte-stream fragment cannot be dropped and skipped.** If a shared receiver multiplexes reliable logical streams and one bounded handoff refuses immediately, close that complete connection/generation so its owner can reconnect. Waiting creates cross-stream head-of-line blocking; continuing after a dropped byte fragment silently corrupts framing.
 - **Do not call a blocking send from inside a receive callback.** A send blocks by design, which makes it exactly the thing a receive callback must not contain. Hand the data to a queue owned by a sender goroutine instead, with a 0-timeout enqueue as above.
-- **Dropping is correct.** The transmission control running on top of the transport (TCP in the tunnel, the transfer protocol's ack/resend) exists to discover the achievable rate; a dropped packet is the signal it feeds on. Buffering "to be safe" hides the signal and converts loss into latency; blocking converts it into a stall.
+- **Refusal is correct only at a recoverable boundary.** A true datagram or shared callback can refuse promptly and let the transmission control above it discover the achievable rate. An already-read reliable carrier message is not that boundary: refusing it hides loss from the carrier and forces a much slower Transfer recovery cycle. Never infer the contract from H3 or P2P alone; use the lane metadata that accompanied the exact message.
 - The failure shape when this rule is broken is **head-of-line blocking across unrelated flows**: receive delivery is fanned out from shared pumps (a dispatch shard serves many flows; a client receive loop serves every sequence from a source), so one blocked callback parks every flow sharing the pump. One dead destination whose return send blocks for its full write timeout can starve delivery for all live destinations for that entire window — observed as flows that look dead on arrival while their peer is provably alive.
 
-The device-side tun write is the deliberate exception, documented at its call site: the provider NAT does not retransmit toward the device, so that handoff is synchronous and its inline write is the path's flow control. An exception must be argued like that one — in a comment, from the specific loss model — not assumed.
+The device-side tun write is one deliberate callback exception, documented at its call site: its synchronous handoff provides flow control; provider TCP replay is a bounded recovery backstop for loss after Transfer delivery. The provider's local-NAT TCP return callback is another: it runs on one flow's socket-reader or recovery goroutine, with origin bytes retained until the inner TCP acknowledges them. It may retry Transfer admission synchronously on that dedicated flow goroutine to propagate pressure without manufacturing retransmissions. The exact reliable-carrier and Pack waits above are the other documented exceptions; both retain fixed ownership and end at capacity or lifecycle cancellation. Do not put these waits behind a shared callback worker, extend them to UDP/ICMP/datagram lanes, or infer them from a transport family. An exception must be argued like these — in a comment, from the specific loss model — not assumed.
+
+The provider TCP sequence's pure-acknowledgement worker is also per flow. It may retain its single regenerable acknowledgement while bounded Transfer admission waits, because refusing it after construction can stall the peer behind a full send window. Provider or flow cancellation joins that wait and returns the pooled packet. This exception does not apply to duplicate resets, unreachables, arbitrary synthesized controls, or public receive callbacks; those still use zero-wait refusal on the shared workers.
 
 ## Concurrency and goroutine safety
 
 - By default, package-level functions are assumed safe for concurrent use, and a type's methods are assumed NOT safe unless the type documents otherwise.
+- **Budgets are owned by instances, not by the process.** A client, probe, device, transport group, or other lifecycle owner constructs its own memory, carrier-count, queue, and concurrency budgets and passes them through settings to the instances it creates. Descendants may share an explicitly passed parent budget when they belong to the same owner; unrelated instances must not silently contend for a package-level singleton. A default settings function may choose limit *values*, but it must not return a shared mutable budget object. Do not add new `Set...Budget` process-global controls or use a process-global budget as a shortcut for per-instance ownership; migrate legacy globals at the owning construction boundaries when touching them. The Go runtime memory limit and shared allocator free-list bounds are process resources, not substitutes for owner-level admission budgets.
+- **DoH state follows the same owner boundary.** Each independent probe, hosted device, or tunnel owns its resolver cache, request admission, and lifecycle. Sharing immutable resolver settings or a parent directory is fine; sharing a mutable DoH cache or semaphore between unrelated owners is not. Test simultaneous owners and verify closing one leaves the other's resolver usable.
 - Hold a lock across the smallest scope that needs it. The idiom is an immediately-invoked closure: `func() { self.stateLock.Lock(); defer self.stateLock.Unlock(); ... }()`.
 - Every potentially infinite loop must take a context (for cancellation) and rate-limit itself (to avoid busy-spinning).
 - Use `connect.Reconnect` for reconnect rate limiting.
@@ -107,6 +120,8 @@ The device-side tun write is the deliberate exception, documented at its call si
 
 - Start a type's internal management goroutines in its constructor, so the returned object is already fully running. The lifecycle loop is conventionally `func (self *T) run()` — lowercase, internal, started by the constructor. When a type has a single internal lifecycle/maintenance loop (e.g. one goroutine that periodically evicts TTL state), name it `run`; give specific names only when a type has several distinct long-lived loops.
 - Exception: when an external manager must clean up after the lifecycle, expose `func (self *T) Run()` (uppercase) instead. The manager calls `Run()` after construction and tears the object down when `Run()` returns. Casing carries the meaning: lowercase `run()` is internal and self-started; uppercase `Run()` is externally driven.
+- A client-owned callback must never call `Client.CloseAndWait` directly. Receive, forward, ack, contract-status, contract-stats, encryption-event, peer-identity, and P2P callbacks can execute inside the worker tree that `CloseAndWait` joins; calling it there can self-join forever. A callback may request non-joining `Close`/`Cancel`, or hand shutdown to an owner goroutine outside the client tree.
+- Out-of-band control is an explicit ownership boundary. The client's launcher is owned until `SendControl`/`SendControlWithCtx` returns; after return, the OOB implementation owns its request, frames, and callback and the client does not join that external work. The one-shot `CloseContract` fallback started with `context.Background()` after client shutdown uses the same transfer deliberately; server-side contract expiry is its failure backstop.
 - Wait with `time.After` inside the run loop by default; we don't reach for `time.Timer` for the convenience of it.
 - Exception — hot-path timer reuse: in a per-packet (or otherwise hot) loop, where profiling shows the per-iteration `time.After` allocation is a significant share of allocations, reuse a single `time.Timer` instead. Create it with `time.NewTimer(0)` before the loop, `defer timer.Stop()`, and `timer.Reset(d)` immediately before each blocking `select` that reads `timer.C`. This relies on go1.23+ timer semantics, where `Reset` guarantees no stale fire is delivered afterward, so the drain dance is unnecessary and the initial already-fired state is harmless. Reach for this only with a profile that justifies it, not preemptively.
 
@@ -124,6 +139,26 @@ The device-side tun write is the deliberate exception, documented at its call si
 
 ## Tests
 
+Temporary investigation helpers and diagnostic programs must be written in Go
+by default. Use another language only when a clear task-specific requirement
+or concrete benefit justifies it; if Go is unavailable, prefer Python as the
+fallback. The helper should exercise the same Go dependencies and data model as
+the system when that matters to the finding. Do not infer a Go-path root cause
+from a different-language reproduction without cross-validating it in Go.
+
+- **Test data must never contain production identity or secrets.** Do not copy
+  tokens, credentials, private route prefixes, customer/account identifiers,
+  real hostnames or domains, public or private IP addresses, or other live
+  configuration values into test code, fixtures, golden files, comments, or
+  snapshots. Use visibly synthetic names, `.example` hostnames, RFC-reserved
+  documentation addresses (`192.0.2.0/24`, `198.51.100.0/24`,
+  `203.0.113.0/24`, and `2001:db8::/32`), and generated test-only identifiers.
+  When reproducing a length, collision, parser, or topology boundary, construct
+  an equal-or-more-demanding synthetic value and test the invariant rather than
+  retaining the production literal. Sanitize any production capture before it
+  becomes a fixture; keep necessary raw incident evidence outside the source
+  repository under its restricted evidence policy.
+- **Deterministic reproduction is a completion gate.** A bug fix is not complete until a regression test deterministically reproduces the pre-fix failure and verifies the corrected behavior. Use explicit barriers, hooks, or state transitions to force the relevant ordering; do not make sleeps, short negative timeouts, queue-length polling, or scheduler luck the primary proof. Race, ownership, stale-generation, and topology bugs each need a test at the layer where the broken behavior is observable so the same issue cannot silently return through another path.
 - Each test is a top-level `func TestXxx(t *testing.T)`. Normal (positive) tests do not use `t.Run` subtests: if cases are logically separate, write separate top-level tests; if they are homogeneous variations of one thing, use a plain table loop (`for _, c := range cases { ... }`) reporting with `t.Errorf`/`t.Fatalf`.
 - `t.Run` is appropriate only when the subtest boundary itself is the point — notably when a test deliberately runs a subtest that is expected to FAIL and asserts that failure. The subtest isolates and captures the failure so the parent can check it.
 
@@ -137,10 +172,11 @@ The device-side tun write is the deliberate exception, documented at its call si
 
 ## Locking
 
+- Minimize contention wherever possible; allow eventual consistency and asynchronous exception cleanup when they reduce contention, and document the consistency tradeoff and recovery behavior.
 - Functions that are expected to be called with one or more state locks should be named "*WithLock". Inversely, functions that do not have "*WithLock" should expect to be called with no state locks.
 - Operations on locked state should be as tightly scoped as possible.
 - Calls to external objects must not hold a state lock. This is generally an implication of the "WithLock" rule.
-- Locks must always be acquired in consistent order. 
+- Locks must always be acquired in consistent order.
 - Do not use re-entrant locks because they will mask locking issues.
 
 ## Message Pool
@@ -150,3 +186,44 @@ Pool buffers (`MessagePoolGet`) have a single owner that is responsible for retu
 1. **A successful send takes ownership.** When a buffer is handed to a sender and the send returns success, the sender now owns the buffer and is responsible for returning it.
 2. **An unsuccessful send leaves ownership with the caller.** If the send returns not-success, the caller still owns the buffer and must return it (or reuse/retry it).
 3. **A callback buffer is borrowed, valid only for the call.** A buffer passed to a callback is owned by the caller and is only valid for the duration of that call. To use it beyond the callback (e.g. to forward it on a channel or hand it to another goroutine), the callback must take a shared copy with `MessagePoolShareReadOnly` and pass that copy on; ownership of the copy then follows the send rules above.
+
+### Which entry points borrow, take, or take on success
+
+Adjacent entry points a layer apart differ, and nothing in their names says
+which. Three test cells and one adopted helper leaked or over-returned before
+this was written down, each by calling one of these as if it were another.
+Every new entry point goes under one of these headings, and its doc comment
+says which in those words. `TestEveryPoolBufferEntryPointDeclaresItsOwnership`
+(`pool_ownership_heading_test.go`) reads this list against the package source,
+so an entry point added here without the word in its own doc comment, or
+renamed out from under the list, fails rather than waiting to be noticed.
+
+**Borrows** — valid for the call, a share kept where the callee needs one, and
+the caller still owns the original afterwards. A caller that built the buffer
+must return it after the call.
+
+- `RemoteUserNatProvider.Receive`, `receiveTransfer`, `receiveTransferWithRecovery`
+- `RemoteUserNatProvider.ReceiveBatch`, `receiveTransferBatch`
+- `TcpSequence.retainReturnChunk`
+- every `ReceiveFunction` / `ReceivePacketFunction` callback
+
+**Takes** — ownership moves at the call and the buffer is returned by the
+callee. The caller must not return it and must not use it afterwards.
+
+- `TcpSequence.receivePacket`, `TcpSequence.receiveBatch`
+
+**Takes on success** — a true return transfers ownership; a false return
+leaves it with the caller, who must return it.
+
+- `LocalUserNat.SendPacket`, `SendPacketWithTimeout`, `SendPackets`
+- `Client.SendWithTimeout`, `SendWithTimeoutDetailed`
+- `Client.sendWithTimeoutAdmissionDetailed` (internal admission diagnostics)
+
+A batch entry's true return reads as a transfer and means delivered; the
+per-buffer ownership is the heading it sits under, not what the boolean
+suggests.
+
+Fixtures should call a borrowing entry through one helper that returns the
+buffer after the call, so the correct pattern is the easy one, and should run
+the pool boundary reconciliation in cleanup, which catches the leak direction
+as well as the over-return direction.

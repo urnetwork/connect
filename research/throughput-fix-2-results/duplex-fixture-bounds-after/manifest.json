@@ -1,0 +1,49 @@
+{
+  "architecture": "arm64",
+  "binary_sha256": "56a38d4b8b502ff6ea6fe5efbc359208d0606cedfbeec79f54b7d9857fc2894c",
+  "build_flags": [
+    "-race"
+  ],
+  "connect": {
+    "branch": "throughput-fix-2",
+    "dirty": true,
+    "revision": "f55e5d41a120d26789b60ec0450daa63e6fa43df",
+    "source_sha256": "00093323fc8563a7d64f999f11787d9083b3b1f48e1cd67884f7bf3fdf317ec9"
+  },
+  "created_utc": "2026-09-16T04:53:55.880143+00:00",
+  "environment": {
+    "CONNECT_WINDOW_RUN_CONTEXT": "concurrent isolated mismatch and long-drain candidate diagnostics; duplex serializer and SDK calibration after race; no quiescence wait"
+  },
+  "external_local_replacement_count": 1,
+  "external_local_replacements": "external local replacements are not frozen",
+  "go": "go version go1.26.7 darwin/arm64",
+  "host_load_average_at_start": [
+    11.86279296875,
+    20.39599609375,
+    21.57763671875
+  ],
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "logical_cpus": 10,
+  "mode": "duplex-fixture-bounds-after",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "package": "./",
+  "run_flags": [
+    "-test.short=false",
+    "-test.count=3"
+  ],
+  "runner_sha256": "b8cbdc5fef4a1b9c578bfd5815373af2f29f2024aa7292974e45bc43d3975b06",
+  "scope": "Compile and run inside copied repository inputs; external local replacements and host services are not frozen.",
+  "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175",
+  "source_inspection_uses_build_snapshot": true,
+  "source_snapshot": {
+    "repositories": {
+      "connect": {
+        "file_count": 1472,
+        "input_sha256": "c10d0107a9c85e052a03222d42a674e3b1777c6278bee02fc9019366e9d959d8"
+      }
+    }
+  },
+  "sources_stable_during_build": true,
+  "test_pattern": "^TestWindowPerformanceDuplexBounds(BothDirections|RateChanges)$"
+}

@@ -1,0 +1,2 @@
+{"outcome": "FAIL", "seconds": "22.53s", "test": "TestWindowPhysicalH1SdkDuplex", "variant": "before"}
+{"outcome": "FAIL", "seconds": "22.53s", "test": "TestWindowPhysicalH1SdkDuplex", "variant": "after"}

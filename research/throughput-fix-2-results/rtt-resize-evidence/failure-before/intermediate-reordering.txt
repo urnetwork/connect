@@ -1,0 +1,16 @@
+=== RUN   TestWindowPacingResizedSamplesKeepFirstBytesAndReordering
+    transfer_window_pacing_resize_test.go:45: shrinking=true at-first=false: resized service=300000 total=3200 want=193333/3200
+    transfer_window_pacing_resize_test.go:55: shrinking=true at-first=false: aggregate timestamps or bytes changed: {bucket:170000000000 firstAtNanos:1700000000005000000 firstBytes:200 lastAtNanos:1700000000005000000 bytes:200}
+    transfer_window_pacing_resize_test.go:55: shrinking=true at-first=false: aggregate timestamps or bytes changed: {bucket:170000000001 firstAtNanos:1700000000000000000 firstBytes:300 lastAtNanos:1700000000015000000 bytes:3000}
+    transfer_window_pacing_resize_test.go:59: shrinking=true at-first=false: overlapping aggregates=2
+    transfer_window_pacing_resize_test.go:45: shrinking=true at-first=true: resized service=200000 total=3200 want=180000/3200
+    transfer_window_pacing_resize_test.go:55: shrinking=true at-first=true: aggregate timestamps or bytes changed: {bucket:170000000000 firstAtNanos:1700000000000000000 firstBytes:200 lastAtNanos:1700000000000000000 bytes:200}
+    transfer_window_pacing_resize_test.go:55: shrinking=true at-first=true: aggregate timestamps or bytes changed: {bucket:170000000001 firstAtNanos:1700000000000000000 firstBytes:300 lastAtNanos:1700000000015000000 bytes:3000}
+    transfer_window_pacing_resize_test.go:59: shrinking=true at-first=true: overlapping aggregates=2
+--- FAIL: TestWindowPacingResizedSamplesKeepFirstBytesAndReordering (0.00s)
+=== RUN   TestWindowPacingResizedSamplesExpireRetainedTime
+--- PASS: TestWindowPacingResizedSamplesExpireRetainedTime (0.00s)
+=== RUN   TestWindowPacingResizedSamplesRespectServiceEpoch
+--- PASS: TestWindowPacingResizedSamplesRespectServiceEpoch (0.00s)
+FAIL
+FAIL	github.com/urnetwork/connect	0.811s

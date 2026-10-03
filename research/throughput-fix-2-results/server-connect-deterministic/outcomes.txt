@@ -1,0 +1,67 @@
+=== RUN   TestSendPooledReceiveUnreliableRefusesWithOwnership
+--- PASS: TestSendPooledReceiveUnreliableRefusesWithOwnership (0.00s)
+=== RUN   TestSendPooledReceiveReliableWaitsThenDelivers
+--- PASS: TestSendPooledReceiveReliableWaitsThenDelivers (0.00s)
+=== RUN   TestSendPooledReceiveReliableCancellationReturnsOwnership
+--- PASS: TestSendPooledReceiveReliableCancellationReturnsOwnership (0.00s)
+=== RUN   TestReliableExchangeQueueSaturationPreservesFramedOrder
+--- PASS: TestReliableExchangeQueueSaturationPreservesFramedOrder (0.00s)
+=== RUN   TestExchangeGenerationRetiresAfterAnyUndeliveredFrame
+--- PASS: TestExchangeGenerationRetiresAfterAnyUndeliveredFrame (0.00s)
+=== RUN   TestResidentTransportReceiveAdmissionUsesExactLane
+--- PASS: TestResidentTransportReceiveAdmissionUsesExactLane (0.00s)
+=== RUN   TestProductionSocketReadersDeclareExactReceiveLanes
+--- PASS: TestProductionSocketReadersDeclareExactReceiveLanes (0.00s)
+=== RUN   TestResidentForwardCallbackRetiresFullIngressWithoutWaiting
+--- PASS: TestResidentForwardCallbackRetiresFullIngressWithoutWaiting (0.00s)
+=== RUN   TestResidentControlCallbackRefusesAndRetiresFullIngressWithoutWaiting
+--- PASS: TestResidentControlCallbackRefusesAndRetiresFullIngressWithoutWaiting (0.01s)
+=== RUN   TestResidentClientCallbacksContainOnlyZeroWaitIngressWork
+--- PASS: TestResidentClientCallbacksContainOnlyZeroWaitIngressWork (0.04s)
+=== RUN   TestResidentContractManagerCanceledLookupReturnsInactive
+--- PASS: TestResidentContractManagerCanceledLookupReturnsInactive (0.00s)
+=== RUN   TestExchangeOutboundBatchFormation
+--- PASS: TestExchangeOutboundBatchFormation (0.01s)
+=== RUN   TestResidentAdmitsMinimumMessageLenLimit
+--- PASS: TestResidentAdmitsMinimumMessageLenLimit (0.00s)
+=== RUN   TestResidentNetworkPeerSendFailureReturnsFrameOwnership
+--- PASS: TestResidentNetworkPeerSendFailureReturnsFrameOwnership (0.01s)
+=== RUN   TestResidentTransportCloseDrainsQueuedSendOwnership
+--- PASS: TestResidentTransportCloseDrainsQueuedSendOwnership (0.00s)
+=== RUN   TestResidentCloseJoinsDelayedProducer
+--- PASS: TestResidentCloseJoinsDelayedProducer (0.00s)
+=== RUN   TestResidentForwardIngressStartsLazilyWithStableCapacity
+--- PASS: TestResidentForwardIngressStartsLazilyWithStableCapacity (0.00s)
+=== RUN   TestResidentForwardIngressWorkerRegistrationIsJoinedByClose
+--- PASS: TestResidentForwardIngressWorkerRegistrationIsJoinedByClose (0.00s)
+=== RUN   TestResidentCloseAndWaitDrainsLateCallbackOwners
+--- PASS: TestResidentCloseAndWaitDrainsLateCallbackOwners (0.00s)
+=== RUN   TestResidentAddForwardCloseJoinsConsumerAndDrainsQueue
+--- PASS: TestResidentAddForwardCloseJoinsConsumerAndDrainsQueue (0.00s)
+=== RUN   TestExchangeHeaderUnreliableTransferGobCompatibility
+--- PASS: TestExchangeHeaderUnreliableTransferGobCompatibility (0.00s)
+=== RUN   TestResidentTransportConstructorCarriesTransferProperties
+--- PASS: TestResidentTransportConstructorCarriesTransferProperties (0.00s)
+=== RUN   TestResidentUnreliableTransportPublishesTransferFlightPolicy
+--- PASS: TestResidentUnreliableTransportPublishesTransferFlightPolicy (0.00s)
+=== RUN   TestConnectH1ReadyDrainBalancesAcksAndPayloadBytes
+--- PASS: TestConnectH1ReadyDrainBalancesAcksAndPayloadBytes (0.00s)
+=== RUN   TestConnectH1UserReadyBatchBoundsDrainAndPreservesFifo
+--- PASS: TestConnectH1UserReadyBatchBoundsDrainAndPreservesFifo (0.00s)
+=== RUN   TestConnectH1UserReadyBatchUnwrappedFallbackStaysSingleton
+--- PASS: TestConnectH1UserReadyBatchUnwrappedFallbackStaysSingleton (0.00s)
+=== RUN   TestConnectH1WriteBatchForConnRejectsTypedNil
+--- PASS: TestConnectH1WriteBatchForConnRejectsTypedNil (0.00s)
+=== RUN   TestConnectH1UserReadyBatchFlushErrorReturnsOwnership
+--- PASS: TestConnectH1UserReadyBatchFlushErrorReturnsOwnership (0.00s)
+=== RUN   TestConnectH1UserReadyBatchFrameErrorReturnsOwnership
+--- PASS: TestConnectH1UserReadyBatchFrameErrorReturnsOwnership (0.00s)
+=== RUN   TestConnectH1WorkersJoinHeldReadyBatchOwnership
+--- PASS: TestConnectH1WorkersJoinHeldReadyBatchOwnership (0.00s)
+=== RUN   TestConnectH1BatchResponseWriterPassesThroughUpgradeWrites
+--- PASS: TestConnectH1BatchResponseWriterPassesThroughUpgradeWrites (0.00s)
+=== RUN   TestConnectH3InitialDatagramPathByteCountUsesQuicLimit
+--- PASS: TestConnectH3InitialDatagramPathByteCountUsesQuicLimit (0.00s)
+=== RUN   TestConnectH3TransferCarrierEnablesBoundedAckReserve
+--- PASS: TestConnectH3TransferCarrierEnablesBoundedAckReserve (0.00s)
+PASS

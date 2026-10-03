@@ -1,0 +1,259 @@
+{
+  "archive_kind": "legacy_drain_v3_final_evidence",
+  "attribution_limits": [
+    "Keep fixture diagnostics separate from deterministic production roots.",
+    "The final focused block contains no performance claim; the three unchanged model controls are separately labeled.",
+    "The 1.2 s model candidate measured 111.7252267 Mb/s in its fixed window with backlog catch-up; do not claim this exceeds the configured 100 Mb/s sustained physical rate or closes every long-path deficit. Preserve all interval rows.",
+    "This candidate protects absent-metadata legacy probes only. Optional timing baseline and common raw-residence recovery experiments are subsequent isolated work, excluded here.",
+    "No v4 coalescer residence hint or receiver-rate heuristic is included.",
+    "Archive normalized numerical rows, outcomes, classifications, and source/log/overlay/binary/build hashes only. Do not copy raw logs, traces, source, overlay files, local paths, identifiers, or binaries into repository evidence."
+  ],
+  "classification_policy": {
+    "failure_before_root_after_final_focused_after": "deterministic root and focused evidence",
+    "fixture_diagnostic": "retained in a separate outcome file; not causal production proof",
+    "performance_control": "full interval readings retained; no sustained-capacity or broad performance-closure claim"
+  },
+  "guarded_artifacts": {
+    "final_carrier_fixture": {
+      "name": "service-root-carrier_test.go",
+      "sha256": "91d067fd32883ac006c4939e40975b7455ef03409036a2871911d4cc2a6e4cc2"
+    },
+    "formatting_only_followup": {
+      "name": "probe-other-message-formatted_test.go",
+      "sha256": "69d8978cb4f456431888cbd6d420483a4c0bb6eea0991c20de6fed7ac24f2bcd"
+    },
+    "guarded_production_handoff": {
+      "name": "legacy-v2-review-handoff.json",
+      "sha256": "07649cd7601162406bb4993345d89f318010daa96bbc105e9b7ce37004177c1c"
+    },
+    "required_locked_fixture": {
+      "name": "drain-recovery-locked_test.go",
+      "sha256": "fef6bc3b578843ffdbd0e779f2006456e0ca06df3ea1866610c9e6a69f4ce6f7"
+    }
+  },
+  "handoff": {
+    "candidate_label": "legacy-drain-after-receiver-timing-final-v3",
+    "name": "legacy-final-v3-evidence-handoff.json",
+    "sha256": "ee38cb0a2d5911abefb1225e7983795d4ffaccbb6bbf948bb0562e6ec03fb6f6",
+    "status": "Reviewed bounded production integrated by parent. Broad performance remains open. Final v3 differs from v2 only by the already-reviewed explicit H1 prerequisites in two shared receiver-timing unit fixtures."
+  },
+  "rejected_source_drift_build": {
+    "build_log_name": "before-race-build.log",
+    "build_log_sha256": "5a949cce29f19ac2233ff076d80ddbcd1bb5ddd49dad6511650db1033542423f",
+    "classification": "rejected_unexecuted_source_drift_build",
+    "manifest_name": "before-race.manifest.json",
+    "manifest_sha256": "d0db2d5d3d4911af2f539261c70c8840e1b5c3d4ce78b62e583279129cc9eeaf",
+    "note": "No execution. A new carrier test appeared while this build compiled, so inputs_stable_during_build was false. The locked build pins that file and is the authoritative failure-before run.",
+    "test_execution_count": 0
+  },
+  "run_pins": [
+    {
+      "binary_sha256": "79bb2acd86606e4c3881a1c2a9921aa409284212077b6142b62948b57be7dc3b",
+      "build_manifest_sha256": "80e2d63d8bdc647879cbd000f368b3c6316b146830a461743b6c0ff8e5fc51ef",
+      "classification": "failure-before",
+      "compile_exit_code": 0,
+      "effective_source_sha256": "d9a95797dceab91cfd0705d4eb2b56a376489b2d77bb5a1e2f3f260cedfc3a0d",
+      "inputs_stable_during_build": true,
+      "note": "Original integrated receiver-timing production with locked root fixture: all three legacy drain regressions fail deterministically; no race.",
+      "original_log_sha256": "3e81817fa79c47f5c9b3931b0a1bffd6a97d02f7fdb2697ae83b26c0ad8b3ac7",
+      "outcome_count": 9,
+      "overlay_sha256": "a1ade77423cd1811c3b7fd7857f8b802dd8e50f5ef3bcb638711b14106b1331f",
+      "race_warning_blocks": 0,
+      "reading_count": 0,
+      "run_id": "before-locked-race"
+    },
+    {
+      "binary_sha256": "413a03ef0f4bac7df8fed9e54824ab2e9294ac7b9c1b538704a19f43240bf3d0",
+      "build_manifest_sha256": "4865b99850a6506d747659674ef4269075ed2652a617d32ea9d2ba6fa5946691",
+      "classification": "fixture-diagnostic",
+      "compile_exit_code": 0,
+      "effective_source_sha256": "fef82b4453358f3c9d30ce4d61db7a1f0a369d2736ea83ae25cdfd027f0821be",
+      "inputs_stable_during_build": true,
+      "note": "Lane-loss proof was injected before the worker advanced its route generation, so normal generation reset removed it. This failure is excluded as a production proof.",
+      "original_log_sha256": "7241cfeb916993f9aceea8fb90c34ba908f980d320f24d2e7dfc9f4227d0c49f",
+      "outcome_count": 48,
+      "overlay_sha256": "aeb3cc6da7cdd192257cc5a57de4f2b0cb1157bcd485934480b4fa96e7e9d7fa",
+      "race_warning_blocks": 0,
+      "reading_count": 0,
+      "run_id": "candidate-v1-roots-race"
+    },
+    {
+      "binary_sha256": "a6ea1a362b5deb65e1ef2c8e689fc26ecfb7fc9b8f55f36853d4c04e0c6ef041",
+      "build_manifest_sha256": "239e49026ba401b6d4cc0e86e0f93df3bdb4c34083ef4d81ac841ac87a444e28",
+      "classification": "fixture-diagnostic",
+      "compile_exit_code": 0,
+      "effective_source_sha256": "1e7c9575cdbea64cd16572b089e5e27810bc2d2ce1b06cbf97e966b8a7e3f8cd",
+      "inputs_stable_during_build": true,
+      "note": "Same pre-generation lane fixture; excluded from causal proof.",
+      "original_log_sha256": "d197d8e7deb1b406080bb5676a879bc565df77359d5e553953058b152bc118ef",
+      "outcome_count": 6,
+      "overlay_sha256": "1e9986950e9ad63c7c33612799576fe7f2bb9f7946ee6e5a7314501f132c1087",
+      "race_warning_blocks": 0,
+      "reading_count": 0,
+      "run_id": "lane-unsafe-before-race"
+    },
+    {
+      "binary_sha256": "eebe34f3728c9cced4193269060705326356ec13532a49da4857bf0123cc63fd",
+      "build_manifest_sha256": "5a549aeaa5746543310f429c106b02298f52d577f87aafef54204966065c0f5d",
+      "classification": "fixture-diagnostic",
+      "compile_exit_code": 0,
+      "effective_source_sha256": "8a5d95ed54d9e2d8b8b67e336641d41c16be9446fe8062cf4e28e36960faac35",
+      "inputs_stable_during_build": true,
+      "note": "Instrumented confirmation that generation reset erased the fixture proof; no gate change accepted from this diagnostic.",
+      "original_log_sha256": "bc4aa197998e6f80fa4f39901e8444373a5a731465d91ee012018e166da10c95",
+      "outcome_count": 1,
+      "overlay_sha256": "c201849f553df5d592ec15c837b8f965c04f56ef8a7b27d1d96cdc4593b5ba55",
+      "race_warning_blocks": 0,
+      "reading_count": 0,
+      "run_id": "lane-diagnostic"
+    },
+    {
+      "binary_sha256": "be9c6229eafbe181c70c6fd7f84ef9581da9625a256adce15c4c8454423f6d76",
+      "build_manifest_sha256": "dee06cd9278a7d64208ac232a11c7cc9f08b6ac65d1ee556f82c0da020492db0",
+      "classification": "failure-before",
+      "compile_exit_code": 0,
+      "effective_source_sha256": "850b4029e5800c64702d518e33d23904840651fe2b67529b7669ad72ac4126bb",
+      "inputs_stable_during_build": true,
+      "note": "Same-lane loss is injected at the existing beforeDueResend hook after generation synchronization. Unsafe probe guard fails three times; unrelated-lane negative control passes three times. Original 200 ms gate retained.",
+      "original_log_sha256": "2753476066ad65c232e83b676c19830ad6e840769443be57ffd686c4cb07d6f1",
+      "outcome_count": 6,
+      "overlay_sha256": "d5812c01c7ef8be8b542bac1e80b38970b93faa287dc4cba6d1a155846bd49ff",
+      "race_warning_blocks": 0,
+      "reading_count": 0,
+      "run_id": "lane-unsafe-at-due-race"
+    },
+    {
+      "binary_sha256": "c380e6b1618342528d143bb0fb8006bdd847592e93643a485b3ef9a31ce5f7ab",
+      "build_manifest_sha256": "31da75320867f193f73cad96adfdb9f01c1fc775c839970232d05304a538c085",
+      "classification": "root-after",
+      "compile_exit_code": 0,
+      "effective_source_sha256": "dc9278d8eaa1cca4218769a90811d0d5e85c966af52fd9446947cff3959cc91d",
+      "inputs_stable_during_build": true,
+      "note": "All 17 roots and adjacent controls pass three times with lane verdict evaluated before probe deferral.",
+      "original_log_sha256": "8983bb7807fd26dd6546d36e7f0834044329e69163894fc6a7d227a52931d23b",
+      "outcome_count": 51,
+      "overlay_sha256": "f15d993ef8910e2e76f752c6456cadc838fe699490da1b426a0545fb8f0cc3a0",
+      "race_warning_blocks": 0,
+      "reading_count": 0,
+      "run_id": "candidate-v1-lane-at-due-race"
+    },
+    {
+      "binary_sha256": "c380e6b1618342528d143bb0fb8006bdd847592e93643a485b3ef9a31ce5f7ab",
+      "build_manifest_sha256": "31da75320867f193f73cad96adfdb9f01c1fc775c839970232d05304a538c085",
+      "classification": "focused-after",
+      "compile_exit_code": 0,
+      "effective_source_sha256": "dc9278d8eaa1cca4218769a90811d0d5e85c966af52fd9446947cff3959cc91d",
+      "inputs_stable_during_build": true,
+      "note": "177 tests repeated three times; pre-carrier snapshot intentionally excludes independently reviewed carrier test.",
+      "original_log_sha256": "b3572379d860b088ee1f7813e038616adc024aa2d75490b9341b7d8dc2b25d5c",
+      "outcome_count": 531,
+      "overlay_sha256": "f15d993ef8910e2e76f752c6456cadc838fe699490da1b426a0545fb8f0cc3a0",
+      "race_warning_blocks": 0,
+      "reading_count": 0,
+      "run_id": "candidate-v1-focus-race"
+    },
+    {
+      "binary_sha256": "95da9c225897a0f3c6379a3c50d2a55c153a9993c24498845fedf23c904828d0",
+      "build_manifest_sha256": "922352c0cb3e064d44a91e4b8e6b3d8a294484a4959ab692d483d9302d280e70",
+      "classification": "fixture-diagnostic",
+      "compile_exit_code": 0,
+      "effective_source_sha256": "29749e7daa6c4fcc22d11f7f091eb07b12904332ffa3d2eda07ff46a84186b26",
+      "inputs_stable_during_build": true,
+      "note": "Carrier eligibility is corrected, but two old shared-timing fixtures did not declare H1. Their six failures are retained. Final v3 pins the reviewed explicit-H1 fixtures without changing timing assertions.",
+      "original_log_sha256": "38e6b143d3489acb97359d3691b3d10d4cca690d783d995a0d5c23ad03b49af7",
+      "outcome_count": 534,
+      "overlay_sha256": "fa7f0ab150cfa67e1fbc5dc8ce01b5226eb9e4bed29c7a600897f9474ace2d93",
+      "race_warning_blocks": 0,
+      "reading_count": 0,
+      "run_id": "candidate-v2-focus-race"
+    },
+    {
+      "binary_sha256": "a992d74fcebfe1a90aba463a46b4c65be9db3d1c10423c1dc17085ce4f7baf0d",
+      "build_manifest_sha256": "61c15a97aa99c405bb56d637e5368104d33b7c66371d54fe3af3f8d048ab440d",
+      "classification": "performance-control",
+      "compile_exit_code": 0,
+      "effective_source_sha256": "29749e7daa6c4fcc22d11f7f091eb07b12904332ffa3d2eda07ff46a84186b26",
+      "inputs_stable_during_build": true,
+      "note": "Three unchanged top-level model controls; all 12 numerical rows retained. One long-RTT candidate interval exceeds 100 Mb/s through catch-up, so this is not a sustained capacity or causal closure claim.",
+      "original_log_sha256": "d8726abae12dd46ed5d3742271ad9a76349a53c61e228eca4aa57364befe8c03",
+      "outcome_count": 3,
+      "overlay_sha256": "fa7f0ab150cfa67e1fbc5dc8ce01b5226eb9e4bed29c7a600897f9474ace2d93",
+      "race_warning_blocks": 0,
+      "reading_count": 12,
+      "run_id": "candidate-v2-model-controls"
+    },
+    {
+      "binary_sha256": "672ec366d41e9f3038a3524d1356e0d0a9cf3dcaecbdc4c26ab63122c979f9df",
+      "build_manifest_sha256": "32f244dcdace2607fd48d2103dbf0864587f54b87c7b84378616a9aeab6f5327",
+      "classification": "final-focused-after",
+      "compile_exit_code": 0,
+      "effective_source_sha256": "c5604336f0f1dc6cf5c20c1bd81933aadbcded618a716d1200b499f64586a19b",
+      "inputs_stable_during_build": true,
+      "note": "Final 178 tests repeated three times, including exact carrier policy and explicit H1 fixture preconditions. Production matches the guarded v2 candidate.",
+      "original_log_sha256": "18e15e3a0dc8d04d50f6bc44a2bb5f5751bb2cc539c88ff0bcf0f6c4d3c38ffb",
+      "outcome_count": 534,
+      "overlay_sha256": "f772d99a6d756f2e38bd0976850f1c84026e50678383d6cd2de89e41becc1f16",
+      "race_warning_blocks": 0,
+      "reading_count": 0,
+      "run_id": "candidate-v3-focus-race"
+    }
+  ],
+  "sanitization": {
+    "local_paths_generated_ids_network_addresses": "removed from archive text",
+    "raw_logs_traces_sources_overlays_binaries": "retained locally; archive carries names and SHA-256 pins only"
+  },
+  "schema_version": 1,
+  "source_pins": [
+    {
+      "name": "candidate-v2-transfer.go",
+      "sha256": "aaae216684febe04753f49bf5f7f358f573e3187d34beae1acb811392c9fae73",
+      "target": "transfer.go"
+    },
+    {
+      "name": "candidate-v1-pacing.go",
+      "sha256": "5ff0a125eeab10ec4f5ab2f2ea626b4e2756441cda3f5b582dffcb2320f84508",
+      "target": "transfer_window_pacing.go"
+    },
+    {
+      "name": "candidate-v1-receiver-rtt.go",
+      "sha256": "d6d56ea092f5025858be9f5847d65420a666b87e84f47a126f4d888db9e25658",
+      "target": "transfer_window_receiver_rtt.go"
+    },
+    {
+      "name": "probe-lane-at-due_test.go",
+      "sha256": "4ad93cb5db768168a6622a7b51ecb6251c3889251cc42a6183cb547ec6687680",
+      "target": "transfer_window_pacing_probe_lane_test.go"
+    },
+    {
+      "name": "probe-recovery-bounds_test.go",
+      "sha256": "e46c00b97fa987e2cc1396410f1ef023b1bd33212288f35bf656ae4298b2ea1b",
+      "target": "transfer_window_pacing_probe_recovery_bounds_test.go"
+    },
+    {
+      "name": "probe-other-message_test.go",
+      "sha256": "dbfbc5600bb34edadf2de58db70021d54360e44e67f5476bc4726c3adc80666e",
+      "target": "transfer_window_pacing_probe_other_message_test.go"
+    },
+    {
+      "name": "probe-identity_test.go",
+      "sha256": "90998ca2963c79edbbc7f1adb838a7e206a7eed5af4f6d0dd393c55c275c6530",
+      "target": "transfer_window_pacing_probe_identity_test.go"
+    },
+    {
+      "name": "drain-arrival_test.go",
+      "sha256": "41d2f4b695f5c85b052399080689a1ae7f177dfa18456370628a93277d4cd6ef",
+      "target": "transfer_window_pacing_drain_arrival_test.go"
+    },
+    {
+      "name": "drain-arrival-bounds_test.go",
+      "sha256": "c3185ba3282475ec90770f80c4b25a647fcb6703b5a4b7254590f580905cd3ed",
+      "target": "transfer_window_pacing_drain_arrival_bounds_test.go"
+    }
+  ],
+  "verification": {
+    "all_completed_run_build_inputs_stable": true,
+    "all_completed_run_race_warning_blocks_zero": true,
+    "all_declared_outcomes_and_readings_accounted_for": true,
+    "verified_pin_count": 55
+  }
+}

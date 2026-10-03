@@ -1,0 +1,58 @@
+{
+  "accepted_as_performance_validation": false,
+  "field": "protocol Ack field 12 receiver_ack_delay_micros",
+  "nonrace": {
+    "fail": 0,
+    "pass": 2,
+    "skip": 0
+  },
+  "race": {
+    "fail": 0,
+    "pass": 24,
+    "skip": 0
+  },
+  "schema": "throughput-fix-2/ack-receiver-delay-wire-summary-v1",
+  "size_observations": [
+    {
+      "bytes": 96,
+      "check": "TestLandingStructsMatchMergedLessTheDeferState",
+      "delta_bytes": 0,
+      "expected_bytes": 96,
+      "kind": "exact-size",
+      "struct": "sequenceAck"
+    },
+    {
+      "bytes": 104,
+      "check": "TestLandingStructsMatchMergedLessTheDeferState",
+      "delta_bytes": 0,
+      "expected_bytes": 104,
+      "kind": "exact-size",
+      "struct": "receiveAckMessage"
+    },
+    {
+      "bytes": 584,
+      "check": "TestLandingStructsMatchMergedLessTheDeferState",
+      "delta_bytes": 0,
+      "expected_bytes": 584,
+      "kind": "exact-size",
+      "struct": "sendItem"
+    },
+    {
+      "bytes": 680,
+      "check": "TestDecodedTransferFramePoolRetainedSizeStaysSmall",
+      "headroom_bytes": 0,
+      "kind": "maximum-size",
+      "maximum_bytes": 680,
+      "struct": "decodedTransferFrame"
+    },
+    {
+      "bytes": 104,
+      "check": "TestDecodedTransferFramePoolRetainedSizeStaysSmall",
+      "headroom_bytes": 0,
+      "kind": "maximum-size",
+      "maximum_bytes": 104,
+      "struct": "receiveAckMessage"
+    }
+  ],
+  "status": "completed wire checkpoint; behavior inference remains isolated"
+}

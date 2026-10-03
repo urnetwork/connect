@@ -1,0 +1,7 @@
+=== RUN   TestWindowPathServiceLongCompressedFeedback
+    transfer_window_pacing_long_test.go:29: long compressed feedback reference=95.846 candidate=66.806 minimum=8.346 drops=0 queue=1345/3592495
+    transfer_window_pacing_long_test.go:34: long compressed feedback underfilled the service: reference=+95.846 candidate=+66.806
+--- FAIL: TestWindowPathServiceLongCompressedFeedback (0.58s)
+FAIL
+exit status 1
+FAIL	github.com/urnetwork/connect	1.280s

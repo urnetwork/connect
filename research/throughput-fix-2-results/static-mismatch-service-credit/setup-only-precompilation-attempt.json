@@ -1,0 +1,10 @@
+{
+  "compile_exit_code": 1,
+  "normalized_phase_error": "copied snapshot parent selected instead of its package directory; module file unavailable",
+  "raw_build_log_sha256": "f718031b71a6eb82bab59b71d6f3fe40fc7744ce7bfb810d8499a7ac0b9e304c",
+  "rerun_reason": "authorized original matrix had not started; corrected package directory used in a new immutable output",
+  "source_snapshot_file_count": 827,
+  "source_snapshot_input_sha256": "c5eff06db24d1c1b82d4f7a9ca4ba6bd68219a32975c50e18c97d1f824fb56f4",
+  "test_readings": 0,
+  "test_started": false
+}

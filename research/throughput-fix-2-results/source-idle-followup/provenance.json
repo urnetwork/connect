@@ -1,0 +1,111 @@
+{
+  "after_pacing_sha256": "c3aa8b115da61d1acc7ec90d572377301ab8f66f10ec6fb64f4217daea847592",
+  "before_pacing_commit": "6ec6fae2fb41be2b7aafc9636b611ba37cd29933",
+  "binary_pins": {
+    "after.test": {
+      "bytes": 60948754,
+      "sha256": "67f215a330f5729586210a56251230cef799971d4201c8bd1c7b1eb5e6e3a853"
+    },
+    "before.test": {
+      "bytes": 60948738,
+      "sha256": "adb675d90da854f51b6f2a098d363a6f5d7f1e6dadded71702ffc2c4c67b2317"
+    },
+    "sdk-after.test": {
+      "bytes": 60982914,
+      "sha256": "eb27d1796a87fe92599e1a66449c8ea0943992f5932f55dbc84338e5166e7399"
+    }
+  },
+  "input_sha256": {
+    "combined-after-bracket-run.json": "ff970fdfc3033d23b64f8f7be267676c2b4773718f82071bf3007d8b6397895b",
+    "combined-before-bracket-run.json": "3f8292953635e28bee7b9dd83eef4ce132d26e41bbb1427974777a13c07b7d6d",
+    "compile-manifest.json": "ee631b354cecbb2c7bd3dfcdb7116ec4268d330979a98bb0a9ff4e74e7aebdea",
+    "host-comparisons.json": "48a5fa5f77f55a17903ea2dce8b0f73fd10c8aa03b931ef5003c92ebc915c7a7",
+    "host-readings.jsonl": "3376fa723dd638025b8c9ed42f500812fb58e87fbb83b8c84e9ebb4fc8138629",
+    "host-summary.json": "0e2bd92f613d9d9a766b295e08fbb9649870d62e3591429a2a468adb149ded91",
+    "sdk-after-readings.jsonl": "7e1ff3e5f69d900f7ff1468fe783187f6ed3bdb3abb3f2f20d3cf8e412c3c7e0",
+    "sdk-after-summary.json": "e9e8e55f52f99f9d143c397f23698273108adec1034c7e4730e13dff8980024f",
+    "sdk-provider-duplex-after-run.json": "4bba5bb5e6384ce4360d9483a5c89567fbf153ed84ba075be68b2412e7156e44"
+  },
+  "limitations": [
+    "Both full host brackets passed, but every arm sampled zero NAT replay events.",
+    "The host observations do not reproduce the retained replay root and support no host-repair claim.",
+    "Read-only TUN/NAT snapshots can affect scheduling; counters are periodic samples rather than proof about unsampled final instants.",
+    "The exact SDK duplex diagnostic retains its unresolved reverse-direction gate failure: 1 of 3 executions failed."
+  ],
+  "overlay_manifest_pins": {
+    "host-after-overlay.json": {
+      "bytes": 636,
+      "sha256": "f57648ae02c1a72cc05d2f2dc0f4d5b96098be24d0fdaff8ad296e09eca9fdad"
+    },
+    "host-before-overlay.json": {
+      "bytes": 637,
+      "sha256": "57612f519ff99ccbad0ddad29f7901d510de2954cb76e7771ce30d2fb5ce0bb5"
+    },
+    "sdk-after-overlay.json": {
+      "bytes": 546,
+      "sha256": "9a042cacf8c5b6bf258899ff3e4961e9e9ec58e2a638ee1e0f6c7f1c094e6ba4"
+    }
+  },
+  "physical_fixture": "Retained6a host state fixture, unchanged",
+  "raw_log_sha256": {
+    "combined-after-bracket": "26ce01c017a770a889aa1b55c7d9831898a621921b22247e4d44f3b1460f2942",
+    "combined-before-bracket": "5654ca1e034412bed6b2560f3255fc48987219f7420df895575d39945ab65146",
+    "sdk-provider-duplex-after": "0b447d0d5aa353a309dad5e4eb5d9defb3d91c573035dae3de248c39a1e293a3"
+  },
+  "redaction": {
+    "excluded": [
+      "raw logs",
+      "overlay content",
+      "source content",
+      "test binaries",
+      "raw trace output"
+    ],
+    "included": "structured numerical readings, comparison outcomes, run status, and hashes only"
+  },
+  "revision": "6ec6fae2fb41be2b7aafc9636b611ba37cd29933",
+  "schema": "throughput-fix-2/source-idle-followup-provenance-v1",
+  "source_manifest_pins": {
+    "host-after-overlay.json": "e549edec63fb95aeabf912f50acc2379727dfaaa70cfae7f1523d7185f5ef1ef",
+    "host-before-overlay.json": "a308574dd17791c3179f819464e0dfecf4dae855cb647c88566319126ea67dd5",
+    "sdk-after-overlay.json": "527f900a63e08c974ef6671d76fc0a82446ba92ae4a593cfed8422e97623c456"
+  },
+  "source_pins": {
+    "empty_test.go": {
+      "bytes": 16,
+      "sha256": "9c031faf0d586542bb789d90385d4359399f9c8001f4cd4dd60cb39586bd2df9"
+    },
+    "ip.go": {
+      "bytes": 338786,
+      "sha256": "b6106882056ed96677e1210410d8ef9bb4dfc23f3ae81427a62c6007dd915314"
+    },
+    "pacing-after.go": {
+      "bytes": 39571,
+      "sha256": "c3aa8b115da61d1acc7ec90d572377301ab8f66f10ec6fb64f4217daea847592"
+    },
+    "pacing-before.go": {
+      "bytes": 38665,
+      "sha256": "8ae252587008d23c35c0eab2c15fb395a4026849089cb178630bfdcd5477229b"
+    },
+    "path_test.go": {
+      "bytes": 35513,
+      "sha256": "5421cc26e9ebeb32f3aa42595ca576900471092265f53f5337714d01f9454b73"
+    },
+    "sdk-path_test.go": {
+      "bytes": 37428,
+      "sha256": "35d5efdde343b2c49e6ae83e6b36f0c010ccb141ed9ea965dd5a733c057f2457"
+    },
+    "sdk-probe_test.go": {
+      "bytes": 1030,
+      "sha256": "7b43296533b02f581d5fdbc02a76d522aa9e81e726e4358ad0791f5cf8563053"
+    },
+    "sdk_test.go": {
+      "bytes": 11607,
+      "sha256": "2f5dc8fabd44abca279a73e4dd22f02f3a49ad874ba50b430d6474776c396d8a"
+    },
+    "tcp_test.go": {
+      "bytes": 10582,
+      "sha256": "d982ef801bf154e7d03931cf85a574734d0df64bf6d1dfb17738f406dd7d8d0b"
+    }
+  },
+  "sources_stable_during_build": true
+}

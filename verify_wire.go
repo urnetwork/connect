@@ -134,13 +134,10 @@ type VerifyProofHop struct {
 }
 
 // VerifyProof is the published, non-repudiable completed trail (VALIDATOR.md
-// §3.3). `Coverage` is the server-attested coverage of the trail (v1 = M-1,
-// the server-assigned confirmed hops with the seed excluded) — the effort a
-// subnet effort leaf claims. `FinalSig` is the server's Ed25519 signature over
-// `VerifyEffortDigest(VerifyFinalDigest(BuildVerifyFinalMessage(...)),
-// Coverage)` — the effort digest, which binds `Coverage` into the signature so
-// it cannot be forged in an effort leaf (and is still a 32-byte message the
-// 0x402 precompile can verify on-chain). `VerifierSig` is the validator's
+// §3.3). `Coverage` is deterministic measurement metadata (v1 = M-1, the
+// server-assigned confirmed hops with the seed excluded). `FinalSig` is the
+// server's Ed25519 signature over the raw canonical
+// `BuildVerifyFinalMessage(...)` bytes. `VerifierSig` is the validator's
 // depth-M EXTEND signature (the wire name `verifier_sig` is historical — it is
 // the validator's signature). `ServerKeyId` selects the published server key
 // that verifies `FinalSig` across rotations.
@@ -278,40 +275,12 @@ func BuildVerifyFinalMessage(serverKeyId byte, trailId Id, serverNonce []byte, v
 	return message, nil
 }
 
-// VerifyFinalDigest is the canonical 32-byte digest of a FINAL message:
-// sha256 over the exact `BuildVerifyFinalMessage` bytes. FINAL signatures
-// (the server `final_sig` and the validator's vpk co-signature committed in
-// subnet effort leaves) are Ed25519 signatures over THIS digest, not the raw
-// message: the subtensor Ed25519 precompile (0x402) that decides on-chain
-// trail-leaf disputes only verifies 32-byte messages, so the digest is the
-// only form a dispute can check. SEED/EXTEND/ASSIGN signatures stay over the
-// raw message bytes — they are never verified on-chain.
+// VerifyFinalDigest is the canonical compact artifact identity for a FINAL
+// message: sha256 over the exact `BuildVerifyFinalMessage` bytes. Release-1.0
+// FINAL signatures cover the raw message, like SEED/EXTEND/ASSIGN; this digest
+// is retained for indexing and audit references only.
 func VerifyFinalDigest(finalMessage []byte) [32]byte {
 	return sha256.Sum256(finalMessage)
-}
-
-// VerifyEffortDigest is the canonical 32-byte digest that binds a completed
-// trail's coverage into its FINAL attestation:
-//
-//	sha256( finalDigest(32) ‖ uint256_be(coverage)(32) )
-//
-// where `finalDigest` is `VerifyFinalDigest(finalMessage)` and `coverage` is
-// encoded as a 32-byte big-endian word — byte-identical to the contract's
-// `sha256(abi.encodePacked(bytes32 finalDigest, uint256 coverage))`.
-//
-// The server's `final_sig` and the validator's vpk co-signature in a subnet
-// effort leaf are Ed25519 signatures over THIS digest, not `finalDigest`
-// alone. This is what makes an effort leaf's `coverage` unforgeable: the
-// on-chain dispute path recomputes the digest from the leaf's `finalDigest`
-// and `coverage` and verifies both signatures over it (0x402), so a validator
-// cannot commit a `coverage` the server never attested. (Fixes the review
-// A2 gap: coverage was previously outside the signed material.)
-func VerifyEffortDigest(finalDigest [32]byte, coverage uint64) [32]byte {
-	var buf [64]byte
-	copy(buf[0:32], finalDigest[:])
-	// coverage as a uint256 big-endian word: its 8 bytes occupy the low end
-	binary.BigEndian.PutUint64(buf[56:64], coverage)
-	return sha256.Sum256(buf[:])
 }
 
 // SignVerifyMessage signs a canonical `/verify` message (the exact bytes

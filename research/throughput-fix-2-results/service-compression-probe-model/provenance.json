@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-service-compression-probe-model.log",
+  "source_log_sha256": "6f67020bde6a972997f26c1135d0de07171652874e135de428ac60b3592b70ba",
+  "note": "A longer bounded opening probe alone was insufficient.",
+  "rows": 126,
+  "final": false,
+  "outcome": "passed"
+}

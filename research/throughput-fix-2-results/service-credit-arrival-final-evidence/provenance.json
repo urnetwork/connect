@@ -1,0 +1,35 @@
+{
+  "archive_kind": "service_credit_arrival_final_evidence",
+  "attribution_limits": [
+    "Final V3 evidence is an integrated, bounded ACK-arrival service-credit candidate. It does not close shrinking-window or long-RTT acceptance.",
+    "The original six static mismatch cells are replayed unchanged but do not replace the required full final mismatch matrix.",
+    "O(n) arrival and trace experiments are listed only as excluded diagnostics. Their numerical rows are not merged into accepted totals.",
+    "V1 CPU benchmarks precede the V3 zero-timestamp fallback-only adjustment; retain them as scoped cost evidence only.",
+    "Raw logs, traces, source inventories/copies, overlays, binaries, local paths, and identifiers are excluded; normalized outcomes, numerical readings, benchmark metrics, and hashes are retained."
+  ],
+  "candidate": "Bounded ACK-arrival service credit",
+  "changes": [
+    "Publish original service bytes at coalescer arrival with per-item dedup, indexed new cumulative prefix and SACK O(1)",
+    "Preserve worker logical delivery/callback ownership and fallback for temporarily removed retries",
+    "Serialize cancellation and credit under service lock, preserving 584-byte sendItem and wire/ACK record sizes",
+    "Share existing zero-arrival fallback timestamp in final coalescer call"
+  ],
+  "collection_time_utc": "2026-09-16T10:11:45.234068+00:00",
+  "handoff_sha256": "5d8476d9d0757f1689466710d3384ce9f88a8c847aedbb90c2b56ad402292e43",
+  "limits": [
+    "Trace and unbounded O(n) arrival candidate are diagnostics only; not landed",
+    "V1 benchmarks precede the final zero-timestamp fallback-only call adjustment",
+    "Static mismatch replay extracts original six cells unchanged; full final matrix still required",
+    "No shrinking-window/long-RTT acceptance; no full combined regression pass yet"
+  ],
+  "redaction_policy": {
+    "ipv4_literals": "redacted if encountered",
+    "local_paths": "excluded",
+    "raw_logs": "excluded; sha256 only",
+    "raw_traces": "excluded; sha256 only",
+    "source_overlay_binary": "excluded; sha256 only"
+  },
+  "schema_version": 1,
+  "status": "Reviewed and integrated independently proved correction; shrinking-window and long-RTT gates remain open",
+  "supplemental_static_control": "A later pinned causal control was appended: exact six static cells on common-probe base without service credit fail, while final credit-static replay passes. See static-credit-control-provenance.json."
+}

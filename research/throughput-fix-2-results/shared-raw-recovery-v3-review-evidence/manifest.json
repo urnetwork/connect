@@ -1,0 +1,14 @@
+{
+  "archive_kind": "shared_raw_recovery_v3_review_evidence",
+  "file_count": 7,
+  "file_sha256": {
+    "excluded-diagnostics.json": "20b87b827c02763ce5cfccca551a08bf393e5eb4339ed3f8cc7b3832642015cb",
+    "numerical-readings.jsonl": "5fd8f812a1c903455cb7f09eb68597f8032fa393489569bad3c0e1a99d1667d3",
+    "outcomes.jsonl": "d0dcf20c85f1c6d4262b304a0d1032344f2818b08a38593ea451f75ebae4509b",
+    "provenance.json": "cfd4c53da9854fc026428b09764d03583996ae89290d636392524c1d98c5d986",
+    "silent-lane-terminal.json": "9878a9df6739cf8b5dfadd118308a9a9fbfc5e952f29f618b9851ab5ab922ccb",
+    "source-pins.json": "c4d8073647e181cade6df6918e073d37b5bd01368f3542e9a6e76e622aafe4b0",
+    "status.json": "93e3f95b7eba0c848c90e285a11c9b1298267fa8842218b8b2ba9870218c355e"
+  },
+  "schema_version": 1
+}

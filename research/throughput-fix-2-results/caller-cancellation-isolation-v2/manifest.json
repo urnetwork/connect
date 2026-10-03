@@ -1,0 +1,14 @@
+{
+  "archive": "caller-cancellation-isolation-v2",
+  "payload_sha256": {
+    "caller-isolation.patch": "00b16d01ea1634c230ccfe928d3e96f82978047b132d28c90f9457bf357797e9",
+    "outcomes.jsonl": "ac4de6062b42e24139d8f92dcec4d83cd248b08a7eda188d1f00cc18942cf00e",
+    "provenance.json": "a4939645e394c8332846d9273fb4b2e58a71342409607aab87597597475b58a6",
+    "source-manifest-after-adjacent.json": "0030f8e9a0c8dd6d1a05449499d0ef22b3e7df3c1187c712e28fdeee315319fa",
+    "source-manifest-after.json": "6d8ac921347e2f3e6a18e85d0145c6a6dbf91e0aa20f68a4808da7372bd0a961",
+    "source-manifest-before.json": "b41d3de2e414f90896097d5a888516aaeaae8027a3d314b746061464701c9e09",
+    "source-pins.json": "140dd12a05ff39f6f854c0d917fb0392b5d963d9304dee1bbb19d268e529ffd1",
+    "status.json": "6dfb8375db8fd97b5600724f494de00e3c389a0eaf2893b5bc2af1b93241656f",
+    "tests.patch": "b55fb374510aa0e6e6da81091775a04c6b10f593072b6fec76f04b5a0c51fa0d"
+  }
+}

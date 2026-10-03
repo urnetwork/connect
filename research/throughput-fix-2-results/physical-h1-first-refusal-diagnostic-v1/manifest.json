@@ -1,0 +1,13 @@
+{
+  "archive": "physical-h1-first-refusal-diagnostic-v1",
+  "payload_sha256": {
+    "diagnostic.patch": "db2787d15247fa893068922359691aadc0a1d499de4fb9a1e987f30598783939",
+    "outcomes.jsonl": "eeec06adaa034053ff387b95cddeb64085a4cc4c469ba0a411c542c64d78e02c",
+    "physical-readings.jsonl": "6486151b9f1660b6d4f63151e1678af920ab6661c584a1a682c83fdc6b266ff7",
+    "provenance.json": "a8ff986ee3b5bf2e3b557c8fa570d3ec0b9fe04a66c20c85373ad3737dad8a04",
+    "refusals.jsonl": "ac7c71de6d2298655d197877944845d4b60e63737fa7d7250817c5f6b0ebade1",
+    "source-manifest-mechanism.json": "2d281f12dd664b41c081a6952e2f06c41fdd542b27c23560c8fd012a64a592c9",
+    "source-pins.json": "00681ca38f21358cea53e567912b4088a56e48138c0eb6136a4b77cf48d35214",
+    "status.json": "572371940239c15872ea6577690444d5c36a0a8e182e78416a0d57b978dcfdb0"
+  }
+}

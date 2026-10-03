@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-service-compressed-edge-model.log",
+  "source_log_sha256": "5a45c754053d007a3e271e44bd2c6261c7ffda16a21ca3cb65dc5798f644fd5c",
+  "note": "Rejected compressed-tail byte extrapolation; shared slow service regressed.",
+  "rows": 134,
+  "final": false,
+  "outcome": "failed"
+}

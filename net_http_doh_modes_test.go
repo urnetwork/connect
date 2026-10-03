@@ -84,8 +84,14 @@ type fakeDnsServer struct {
 }
 
 func newFakeDnsServer(t *testing.T, answers map[string]netip.Addr) *fakeDnsServer {
+	return newFakeDnsServerOnFamily(t, answers, 4)
+}
+
+// newFakeDnsServerOnFamily is newFakeDnsServer bound to the loopback of the
+// given ip version, so a resolver mode can be exercised over either family.
+func newFakeDnsServerOnFamily(t *testing.T, answers map[string]netip.Addr, ipVersion int) *fakeDnsServer {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	pc, err := net.ListenPacket(testUdpNetwork(ipVersion), testLoopbackHostPort(ipVersion, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,21 +247,40 @@ func TestDohCacheLocalDohMode(t *testing.T) {
 // RegionalDnsResolverSettings) — resolves plaintext :53 through the tunnel dialer to
 // the configured server, and the answer is cached (LocalExpiration).
 func TestDohCacheRemoteDnsMode(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testDohCacheRemoteDnsMode(t, ipVersion)
+	})
+}
+
+func testDohCacheRemoteDnsMode(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	testIp := netip.MustParseAddr("203.0.113.13")
-	remoteDns := newFakeDnsServer(t, map[string]netip.Addr{
+	remoteDns := newFakeDnsServerOnFamily(t, map[string]netip.Addr{
 		"remote-dns.mode.test": testIp,
-	})
+	}, ipVersion)
 	defer remoteDns.close()
 
-	// the regional recommendation shape, pointed at the test server
+	// the regional recommendation shape, pointed at the test server of the
+	// family under test (the other family's list is emptied so the interleaved
+	// resolver list holds exactly this server)
 	rs := RegionalDnsResolverSettings("cn")
 	if rs == nil || !rs.EnableRemoteDns {
 		t.Fatalf("regional settings must enable remote dns: %+v", rs)
 	}
-	rs.RemoteDnsIpv4 = []string{"192.0.2.53"}
+	configuredServer := "192.0.2.53"
+	if ipVersion == 6 {
+		configuredServer = "2001:db8::53"
+	}
+	rs.RemoteDnsIpv4 = nil
+	rs.RemoteDnsIpv6 = nil
+	if ipVersion == 4 {
+		rs.RemoteDnsIpv4 = []string{configuredServer}
+	} else {
+		rs.RemoteDnsIpv6 = []string{configuredServer}
+	}
+	configuredServerPrefix := net.JoinHostPort(configuredServer, "53")
 
 	var mu sync.Mutex
 	dns53Dials := []string{}
@@ -282,7 +307,7 @@ func TestDohCacheRemoteDnsMode(t *testing.T) {
 		t.Fatalf("remote dns did not resolve: addrs=%v authoritative=%t", addrs, authoritative)
 	}
 	mu.Lock()
-	if len(dns53Dials) == 0 || !strings.HasPrefix(dns53Dials[0], "192.0.2.53:") {
+	if len(dns53Dials) == 0 || dns53Dials[0] != configuredServerPrefix {
 		t.Fatalf("the resolution must dial the configured remote dns server through the tunnel, dials=%v", dns53Dials)
 	}
 	dialsBefore := len(dns53Dials)
@@ -305,13 +330,19 @@ func TestDohCacheRemoteDnsMode(t *testing.T) {
 // authoritative miss that is cached. the local resolver dials the configured server
 // ip on :53 (unbindable in a test), so the fake server stands in for it.
 func TestDohCacheLocalDnsMode(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testDohCacheLocalDnsMode(t, ipVersion)
+	})
+}
+
+func testDohCacheLocalDnsMode(t *testing.T, ipVersion int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	testIp := netip.MustParseAddr("203.0.113.14")
-	localDns := newFakeDnsServer(t, map[string]netip.Addr{
+	localDns := newFakeDnsServerOnFamily(t, map[string]netip.Addr{
 		"local-dns.mode.test": testIp,
-	})
+	}, ipVersion)
 	defer localDns.close()
 
 	var tunnelDials atomic.Int32
@@ -319,7 +350,11 @@ func TestDohCacheLocalDnsMode(t *testing.T) {
 	settings.RequestTimeout = 5 * time.Second
 	settings.DnsResolverSettings = &DnsResolverSettings{
 		EnableLocalDns: true,
-		LocalDnsIpv4:   []string{"192.0.2.54"},
+	}
+	if ipVersion == 4 {
+		settings.DnsResolverSettings.LocalDnsIpv4 = []string{"192.0.2.54"}
+	} else {
+		settings.DnsResolverSettings.LocalDnsIpv6 = []string{"2001:db8::54"}
 	}
 	settings.DialContextSettings = &DialContextSettings{
 		DialContext: func(dialCtx context.Context, network string, addr string) (net.Conn, error) {

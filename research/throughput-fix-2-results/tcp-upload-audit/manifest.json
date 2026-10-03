@@ -1,0 +1,42 @@
+{
+  "created_utc": "2026-09-15T20:17:08.525904+00:00",
+  "mode": "tcp",
+  "test_pattern": "^TestWindowTcpUploadPerformanceMatrix$",
+  "run_flags": [
+    "-test.short=false"
+  ],
+  "connect": {
+    "revision": "8b9002c927ffbf729da07e016d1ef23e3be2ef0f",
+    "branch": "throughput-fix-2",
+    "source_sha256": "8f27efb27b99bbdbbb3f2772f45aef823caeab8882d91facb3a21955043e5335",
+    "dirty": true
+  },
+  "package": "./",
+  "build_flags": [
+    "-race=false"
+  ],
+  "runner_sha256": "0922f8e80c8f8e91328282caa029c7720af877dfb0ce4b0668473e74fa4e1bdb",
+  "host_load_average_at_start": [
+    11.12548828125,
+    13.947265625,
+    22.166015625
+  ],
+  "go": "go version go1.26.7 darwin/arm64",
+  "os": "Darwin",
+  "os_release": "25.6.0",
+  "architecture": "arm64",
+  "logical_cpus": 10,
+  "environment": {
+    "CONNECT_WINDOW_PATH_SECONDS": "5",
+    "CONNECT_WINDOW_PATH_FLOWS": "1,8",
+    "CONNECT_WINDOW_PATH_RTT_US": "100000",
+    "CONNECT_WINDOW_RUN_CONTEXT": "Started immediately under existing host load; another throughput follow-up and focused race checks may overlap.",
+    "CONNECT_WINDOW_PATH_DIRECTION": "upload",
+    "CONNECT_WINDOW_PATH_ACK_MS": "10",
+    "CONNECT_WINDOW_PATH_REPETITIONS": "3",
+    "CONNECT_WINDOW_TCP_MEASURE": "1"
+  },
+  "instrument": "local FIFO plus optional gVisor TUN and loopback socket origin; no native kernel TUN",
+  "binary_sha256": "b46f130950f579ff00aaea5b4c0bc83ac88fe178bbac4b035565f12e0e25bc66",
+  "sources_stable_during_build": true
+}

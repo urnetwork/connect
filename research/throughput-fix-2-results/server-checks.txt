@@ -1,0 +1,5 @@
+Unit tests with race detector:
+ok  	github.com/urnetwork/server/connect	2.290s
+
+Configured relay pool-balance integration:
+ok  	github.com/urnetwork/server/connect	8.855s

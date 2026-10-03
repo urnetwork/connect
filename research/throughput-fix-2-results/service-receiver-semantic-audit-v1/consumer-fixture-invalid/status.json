@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "003204b7aaca9fd1d1d66de8d872309ba1040e7381178693dc54c107f2c77753",
+  "binary_sha256": "8966c0fd3be591ef21eeb12251231ba52ce728c9ddc749cd17c2d98f748bb108",
+  "effective_inputs_sha256": "f1331aedccceb34ba73344e04667606113189044bc8e8a8629d54d83867cbb38",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiverSustainedPacing",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied module as build; original absolute relationship is pinned by original status/manifest hashes",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:15:00.171997+00:00",
+  "loadavg_start": [
+    45.56494140625,
+    28.56982421875,
+    19.35791015625
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 3.3305436661466956,
+  "loadavg_end": [
+    45.56494140625,
+    28.56982421875,
+    19.35791015625
+  ],
+  "ended_utc": "2026-09-16T20:15:03.503110+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "0f0cf8f2b0bdb02c347b678f9ec3874328470d9d750fe2cda78d80a9a5b5daa6",
+  "pass": 0,
+  "fail": 18,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "Invalid fixture: all-at-once physical offers make residence grow with elapsed serialization, so no2RTT cumulative interval qualifies. Legacy worker RTT close also missing.0P18F is unmet precondition evidence, not18production failures.",
+  "rows": 54
+}

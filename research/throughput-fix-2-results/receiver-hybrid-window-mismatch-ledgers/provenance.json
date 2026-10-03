@@ -1,0 +1,107 @@
+{
+  "archive_kind": "receiver_hybrid_window_mismatch_ledgers",
+  "attribution_limits": [
+    "These are root-owned isolated comparison ledgers from separately pinned frozen binaries.",
+    "All three variants failed their one-count mismatch test. Preserve complete numerical rows and failure status; no failing cell was rerun.",
+    "This evidence does not establish a shared-source fix or throughput acceptance.",
+    "Raw logs, source copies, overlays, binaries, local paths, and identifiers are excluded; hashes are retained."
+  ],
+  "collection_time_utc": "2026-09-16T09:20:12.668998+00:00",
+  "redaction_policy": {
+    "ipv4_literals": "redacted if encountered",
+    "local_paths": "excluded",
+    "raw_logs": "excluded; sha256 only",
+    "source_overlay_binary": "excluded; sha256 only"
+  },
+  "schema_version": 1,
+  "test": "TestWindowPathWindowMismatchChanges",
+  "variant_pins": {
+    "broad-v1": {
+      "base_input_sha256": "94b5e61a11934a15b4bb1003bf7d33e8cc7fd7446d886a66e1bce4184fa82f83",
+      "binary_sha256": "f94fceb41db9ab72056cacadc6069867ddc56cdde8aa5a1526b61ea9fe8bec02",
+      "build_manifest_sha256": "dc685674819354141f9667a7ef9b31f20ac1f6fb09a385b305317069991c394e",
+      "command": [
+        "-test.v",
+        "-test.run",
+        "^TestWindowPathWindowMismatchChanges$",
+        "-test.count=1",
+        "-test.timeout=5m"
+      ],
+      "effective_source_sha256": "94b5e61a11934a15b4bb1003bf7d33e8cc7fd7446d886a66e1bce4184fa82f83",
+      "host_load_average_at_end": [
+        8.50537109375,
+        7.994140625,
+        8.015625
+      ],
+      "host_load_average_at_start": [
+        8.50537109375,
+        7.994140625,
+        8.015625
+      ],
+      "overlay_sha256": "b3d17abb4df6e7981bbacf51ccb3040f509add6a7f642d3f8daa35a54c7c8484",
+      "raw_ledger_sha256": "5f62bf8b5aa3ae967ebe96e9e1bdda219f0a78dd3a6785afeb28da3cb25413b2",
+      "raw_log_sha256": "f483bec5c658164da30720e0a834cf41470d8179ff75d0d87521d58f66b1c1ff",
+      "rows": 12,
+      "source_file_count": 749,
+      "sources_stable_during_build": true
+    },
+    "hybrid-v1": {
+      "base_input_sha256": "94b5e61a11934a15b4bb1003bf7d33e8cc7fd7446d886a66e1bce4184fa82f83",
+      "binary_sha256": "1cf553c752c4dade7017070a2e12678aee56c4b3abdfcc4012477c1184f8f937",
+      "build_manifest_sha256": "e474b82d07aa5209598880d964fcc2d23fb7aaac134f1fa91465ebb0f0fc42e4",
+      "command": [
+        "-test.v",
+        "-test.run",
+        "^TestWindowPathWindowMismatchChanges$",
+        "-test.count=1",
+        "-test.timeout=5m"
+      ],
+      "effective_source_sha256": "97a2d9c09f5d6c0c8c6ed3d03ed5835013dec375d41bb08c05ab528fccfd3fd7",
+      "host_load_average_at_end": [
+        8.625,
+        8.02734375,
+        8.02685546875
+      ],
+      "host_load_average_at_start": [
+        8.625,
+        8.02734375,
+        8.02685546875
+      ],
+      "overlay_sha256": "4af63c337d6317b4cc7c0e0efcb9456643f9b52b316d3366b5c0d46c542d43a7",
+      "raw_ledger_sha256": "21735148b22517fd70dc4d340af7132efb1dd749c33dd3857c21f12bb57b19f8",
+      "raw_log_sha256": "ae70882c948e359beb630d199f8df46d124154ad4aa4242c57ea6e21a74c280c",
+      "rows": 12,
+      "source_file_count": 749,
+      "sources_stable_during_build": true
+    },
+    "legacy-consumer-v1": {
+      "base_input_sha256": "94b5e61a11934a15b4bb1003bf7d33e8cc7fd7446d886a66e1bce4184fa82f83",
+      "binary_sha256": "2641b606faa6c77466586bcd020ccf21a61c0f940a3355d1abb9c9fb554fee1f",
+      "build_manifest_sha256": "8861d5375542ba2f34f2d00bc42564dc753924f23f32975c15b1001f5bc76a85",
+      "command": [
+        "-test.v",
+        "-test.run",
+        "^TestWindowPathWindowMismatchChanges$",
+        "-test.count=1",
+        "-test.timeout=5m"
+      ],
+      "effective_source_sha256": "19a485ada77e8dc4a317046921e0ff05c1099f39f2d073f0d29db9f739d817a1",
+      "host_load_average_at_end": [
+        8.625,
+        8.02734375,
+        8.02685546875
+      ],
+      "host_load_average_at_start": [
+        8.50537109375,
+        7.994140625,
+        8.015625
+      ],
+      "overlay_sha256": "d422348fad8c8e7b818c4b361e9ce0e21b9fbf7a5a205f6ad3aaec26f25c0a09",
+      "raw_ledger_sha256": "56f385d1ffc029d628ed699dd48874713259cd67613c6b9dc56e13558ddeeb31",
+      "raw_log_sha256": "6ee265238478fc7d488a5a1a7df711ab4d00c98fb0bf8e2e8d5c491f3c80ce3e",
+      "rows": 12,
+      "source_file_count": 749,
+      "sources_stable_during_build": true
+    }
+  }
+}

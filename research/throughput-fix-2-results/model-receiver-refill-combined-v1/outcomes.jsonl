@@ -1,0 +1,6 @@
+{"outcome": "PASS", "seconds": "2.60s", "test": "TestWindowPathWindowMismatchChanges", "variant": "combined-six-gates"}
+{"outcome": "PASS", "seconds": "0.70s", "test": "TestWindowPathServiceSettledLargeMessageCapacityChanges", "variant": "combined-six-gates"}
+{"outcome": "PASS", "seconds": "0.10s", "test": "TestWindowPathServiceCapacityIncreaseRecovery", "variant": "combined-six-gates"}
+{"outcome": "PASS", "seconds": "3.13s", "test": "TestWindowPathRetainedSdkCumulativePacingLong", "variant": "combined-six-gates"}
+{"outcome": "PASS", "seconds": "0.19s", "test": "TestWindowPacingShortCompressedServiceKeepsMeasuredCapacity", "variant": "combined-six-gates"}
+{"outcome": "PASS", "seconds": "3.13s", "test": "TestWindowPathServiceRoundTripGrowthBeyondOldRing", "variant": "combined-six-gates"}

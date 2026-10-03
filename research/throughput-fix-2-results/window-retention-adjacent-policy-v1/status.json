@@ -1,0 +1,6 @@
+{
+  "classification": "Intermediate policy-test revision: 9 pass, 3 fail; newly added pacing assertion is invalid for the unchanged Unknown carrier.",
+  "outcomes": 12,
+  "readings": 0,
+  "worker_readings": 0
+}

@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-service-intrabucket-model.log",
+  "source_log_sha256": "5b2b21a92dbf982deceaae9cdc06ccb490d240279f7d81ef4459f22ad97e55ef",
+  "note": "Immediate short trains repaired; compressed long-RTT cells still failed.",
+  "rows": 14,
+  "final": false,
+  "outcome": "failed"
+}

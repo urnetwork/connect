@@ -1,0 +1,30 @@
+[
+  {
+    "selection": "before",
+    "pass": 12,
+    "fail": 6,
+    "skip": 0,
+    "race_warnings": 0,
+    "race_instrumented": true,
+    "effective_inputs_sha256": "335cbc8d5d3c31c6fdc294351270ad6b0ed71a4d069fa0a828013b0b46403840",
+    "binary_sha256": "249d6dd3854ff702c20c46a0186f0846136e0f99487003453423e1e47e6c0eec",
+    "original_manifest_sha256": "32077c9ce6e18e9d578a7156dbcbb9876548010aee84ec436572cc694857228b",
+    "original_status_sha256": "87960b877ccdac64312101add40f82e5f91557a8f3b02e9f13622003d1fff2a5",
+    "raw_log_sha256": "25c93f9c2723c84cf8508b0c1458c893b51f49b481fb18f5b5b972a67a456d90",
+    "note": "12P6F: both two-local-route and known same-local-H1 downstream-reorder cases overstate200kB/s physical service as16MB/s. Four controls pass."
+  },
+  {
+    "selection": "after",
+    "pass": 18,
+    "fail": 0,
+    "skip": 0,
+    "race_warnings": 0,
+    "race_instrumented": true,
+    "effective_inputs_sha256": "d8ea6f6df77a5cb846f04cc7de26c07d336e5a8a2284d6ae66362223dd02c7d4",
+    "binary_sha256": "4a01d7e411c45236d4df951fee1f2431fe604d2964e651368f668d30d2925061",
+    "original_manifest_sha256": "1b07ac14b591b90b2bb758361fe487ae640a8d7cc5869597f7c1e094731624d3",
+    "original_status_sha256": "2dc1917362b73ea1b8be0729cb60af7c9254fdaa5f9fc8187315d257eab488bb",
+    "raw_log_sha256": "631e1928eae67b244165d3fe4cabe41f08876ddf5e362d02f59bd468145d3b87",
+    "note": "18P0F: only safe-prefix timing restriction; all six cases preserve exact credit. Local first-hop continuity does not establish destination ingress FIFO."
+  }
+]

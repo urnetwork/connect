@@ -1,0 +1,9 @@
+{"outcome": "FAIL", "seconds": "0.02s", "test": "TestWindowPhysicalH1ProviderPureAckSurvivesAdmissionPressure", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPhysicalH1ProviderPureAckUsesAvailableAdmission", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPhysicalH1ProviderPublicAckStillRefusesAtCapacity", "variant": "before"}
+{"outcome": "FAIL", "seconds": "0.01s", "test": "TestWindowPhysicalH1ProviderPureAckSurvivesAdmissionPressure", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPhysicalH1ProviderPureAckUsesAvailableAdmission", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPhysicalH1ProviderPublicAckStillRefusesAtCapacity", "variant": "before"}
+{"outcome": "FAIL", "seconds": "0.01s", "test": "TestWindowPhysicalH1ProviderPureAckSurvivesAdmissionPressure", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPhysicalH1ProviderPureAckUsesAvailableAdmission", "variant": "before"}
+{"outcome": "PASS", "seconds": "0.00s", "test": "TestWindowPhysicalH1ProviderPublicAckStillRefusesAtCapacity", "variant": "before"}

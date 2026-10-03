@@ -86,6 +86,23 @@ const (
 	// Older clients ignore the unknown message type and fall back to the
 	// drain eviction plus excuse path (CONNECTDRAIN2.md).
 	MessageType_TransferResidentMigrate MessageType = 28
+	// Provider build/policy identity and per-source security block counters.
+	// Older clients ignore this data-path message.
+	MessageType_IpIpProviderDiagnostics MessageType = 29
+	// A message of a subprotocol registered on the receiving client
+	// (SUBPROTOCOL.md). `Frame.message_bytes` is a marshaled `SubprotocolMessage`
+	// whose own `message_bytes` are decoded in place by the subprotocol's
+	// codec. Never sent to the control id; older clients ignore the unknown
+	// message type.
+	MessageType_Subprotocol MessageType = 30
+	// Asks a peer which subprotocols it can receive. `Frame.message_bytes` is
+	// a marshaled `SubprotocolsQuery`; the peer answers with
+	// `TransferSubprotocolsQueryResult`. Intercepted by the receiving client,
+	// never delivered to application callbacks.
+	MessageType_TransferSubprotocolsQuery MessageType = 31
+	// The answer to `TransferSubprotocolsQuery`. `Frame.message_bytes` is a
+	// marshaled `SubprotocolsQueryResult`.
+	MessageType_TransferSubprotocolsQueryResult MessageType = 32
 	// ── URmessage (beta/message). Block 1000-1099 reserved so parallel beta
 	// branches do not collide. Every operation lives in a oneof inside
 	// MessageServerRequest/Response/Push, NOT as its own MessageType.
@@ -142,45 +159,53 @@ var (
 		26:   "TransferNetworkPeersReset",
 		27:   "TransferNetworkPeersUpdate",
 		28:   "TransferResidentMigrate",
+		29:   "IpIpProviderDiagnostics",
+		30:   "Subprotocol",
+		31:   "TransferSubprotocolsQuery",
+		32:   "TransferSubprotocolsQueryResult",
 		1000: "MessageMessageServerRequest",
 		1001: "MessageMessageServerResponse",
 		1002: "MessageMessageServerPush",
 		1003: "MessageMessageServerFragment",
 	}
 	MessageType_value = map[string]int32{
-		"TransferPack":                 0,
-		"TransferAck":                  1,
-		"TransferContract":             2,
-		"TransferProvide":              3,
-		"TransferAuth":                 4,
-		"TransferCreateStream":         5,
-		"TransferCreateStreamResult":   6,
-		"TransferCloseStream":          7,
-		"TransferStreamOpen":           8,
-		"TransferStreamClose":          9,
-		"TransferCreateContract":       10,
-		"TransferCreateContractResult": 11,
-		"TransferCloseContract":        12,
-		"TransferPeerAudit":            13,
-		"TestSimpleMessage":            14,
-		"IpIpPacketToProvider":         15,
-		"IpIpPacketFromProvider":       16,
-		"IpIpPing":                     17,
-		"TransferControlPing":          18,
-		"TransferProvidePing":          19,
-		"TransferExchangeSignals":      20,
-		"TransferExchangeSignal":       21,
-		"TransferStreamReset":          22,
-		"TransferEncryptedControl":     23,
-		"TransferEncryptedKey":         24,
-		"TransferClientKey":            25,
-		"TransferNetworkPeersReset":    26,
-		"TransferNetworkPeersUpdate":   27,
-		"TransferResidentMigrate":      28,
-		"MessageMessageServerRequest":  1000,
-		"MessageMessageServerResponse": 1001,
-		"MessageMessageServerPush":     1002,
-		"MessageMessageServerFragment": 1003,
+		"TransferPack":                    0,
+		"TransferAck":                     1,
+		"TransferContract":                2,
+		"TransferProvide":                 3,
+		"TransferAuth":                    4,
+		"TransferCreateStream":            5,
+		"TransferCreateStreamResult":      6,
+		"TransferCloseStream":             7,
+		"TransferStreamOpen":              8,
+		"TransferStreamClose":             9,
+		"TransferCreateContract":          10,
+		"TransferCreateContractResult":    11,
+		"TransferCloseContract":           12,
+		"TransferPeerAudit":               13,
+		"TestSimpleMessage":               14,
+		"IpIpPacketToProvider":            15,
+		"IpIpPacketFromProvider":          16,
+		"IpIpPing":                        17,
+		"TransferControlPing":             18,
+		"TransferProvidePing":             19,
+		"TransferExchangeSignals":         20,
+		"TransferExchangeSignal":          21,
+		"TransferStreamReset":             22,
+		"TransferEncryptedControl":        23,
+		"TransferEncryptedKey":            24,
+		"TransferClientKey":               25,
+		"TransferNetworkPeersReset":       26,
+		"TransferNetworkPeersUpdate":      27,
+		"TransferResidentMigrate":         28,
+		"IpIpProviderDiagnostics":         29,
+		"Subprotocol":                     30,
+		"TransferSubprotocolsQuery":       31,
+		"TransferSubprotocolsQueryResult": 32,
+		"MessageMessageServerRequest":     1000,
+		"MessageMessageServerResponse":    1001,
+		"MessageMessageServerPush":        1002,
+		"MessageMessageServerFragment":    1003,
 	}
 )
 
@@ -281,7 +306,7 @@ const file_frame_proto_rawDesc = "" +
 	"\x05Frame\x129\n" +
 	"\fmessage_type\x18\x01 \x01(\x0e2\x16.bringyour.MessageTypeR\vmessageType\x12#\n" +
 	"\rmessage_bytes\x18\x02 \x01(\fR\fmessageBytes\x12\x10\n" +
-	"\x03raw\x18\x03 \x01(\bR\x03raw*\xf2\x06\n" +
+	"\x03raw\x18\x03 \x01(\bR\x03raw*\xe4\a\n" +
 	"\vMessageType\x12\x10\n" +
 	"\fTransferPack\x10\x00\x12\x0f\n" +
 	"\vTransferAck\x10\x01\x12\x14\n" +
@@ -312,7 +337,11 @@ const file_frame_proto_rawDesc = "" +
 	"\x11TransferClientKey\x10\x19\x12\x1d\n" +
 	"\x19TransferNetworkPeersReset\x10\x1a\x12\x1e\n" +
 	"\x1aTransferNetworkPeersUpdate\x10\x1b\x12\x1b\n" +
-	"\x17TransferResidentMigrate\x10\x1c\x12 \n" +
+	"\x17TransferResidentMigrate\x10\x1c\x12\x1b\n" +
+	"\x17IpIpProviderDiagnostics\x10\x1d\x12\x0f\n" +
+	"\vSubprotocol\x10\x1e\x12\x1d\n" +
+	"\x19TransferSubprotocolsQuery\x10\x1f\x12#\n" +
+	"\x1fTransferSubprotocolsQueryResult\x10 \x12 \n" +
 	"\x1bMessageMessageServerRequest\x10\xe8\a\x12!\n" +
 	"\x1cMessageMessageServerResponse\x10\xe9\a\x12\x1d\n" +
 	"\x18MessageMessageServerPush\x10\xea\a\x12!\n" +

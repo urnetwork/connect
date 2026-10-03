@@ -1,0 +1,63 @@
+{
+  "archive_path_normalization": "External artifact lookup paths are represented by snapshot identifier and relative path. Raw logs and original compile manifests remain unmodified outside the repository; their original hashes are pinned. Race-stack extracts replace only frozen-source and Go-installation path prefixes, preserving line numbers and stack text.",
+  "carrier_scope": "The existing send-window harness publishes TransportTypeUnknown. Its slow-path case validates actual drain, cumulative candidate response and learned-window retention. It does not exercise the H1 physical pacing path and is not physical pacing proof.",
+  "event_plumbing": false,
+  "occupancy_numeric_gate": [
+    0.45,
+    0.85
+  ],
+  "offer_warmup_serializers_changed": false,
+  "original_to_v1_changed_source_paths": [
+    "transfer_send_window_test.go",
+    "transfer_window_legacy_settle_test.go",
+    "transfer_window_properties_test.go"
+  ],
+  "performance_gates_changed": false,
+  "preserved_checks": "Candidate arithmetic from delivered bytes/span and measured residence, independent ServiceSized arithmetic, raw RTT below recovery floor, interior candidate bounds, byte ceilings, no deadline expiration, delivery within 10 percent of configured drain, at least threefold slow-path candidate reduction, exact legacy no-advertisement bootstrap and growing-candidate trajectory, original paired occupancy sampling and 0.45-0.85 band.",
+  "race": false,
+  "repetitions": 1,
+  "same_production_source": true,
+  "sampler": "accepted 54b360 owner-fixed retained core; no cumulative fallback or later sampler candidate",
+  "scope": "Four selected failures from the complete 3252 pass, 6 fail, 25 skip invocation. Parent separately archives the complete regression; its two sampler failures are outside this policy comparison.",
+  "test_execution_owner": "test_monitor_medium",
+  "test_name_mapping": [
+    {
+      "original": "TestSizedWindowIsComputedFromTheMeasuredRoundTrip",
+      "v1": "TestWindowRetainedCandidateUsesMeasuredRoundTrip",
+      "v2": "TestWindowRetainedCandidateUsesMeasuredRoundTrip"
+    },
+    {
+      "original": "TestSizedWindowShrinksWhenThePathShrinks",
+      "v1": "TestWindowRetainedSlowPathLowersCandidateAndPacing",
+      "v2": "TestWindowRetainedSlowPathLowersCandidateWithoutShrinking"
+    },
+    {
+      "original": "TestAgainstALegacyPeerTheWindowSettlesOnceAndStays",
+      "v1": "TestWindowRetainedLegacyBootstrapBoundsGrowingCandidates",
+      "v2": "TestWindowRetainedLegacyBootstrapBoundsGrowingCandidates"
+    },
+    {
+      "original": "TestAtEquilibriumOccupancyIsHalfTheWindow",
+      "v1": "TestWindowRetainedSteadyPathPreservesOccupancyBand",
+      "v2": "TestWindowRetainedSteadyPathPreservesOccupancyBand"
+    }
+  ],
+  "unchanged_delivery_lifetime_and_hard_ceiling_gates_sha256": "22c8e60db649b569674abdf2004eaf2c91b741e7ff3396ba6aa42a63fd468563",
+  "unchanged_helper_function_sha256": {
+    "newPacedSendWindowHarness": "1a952b57cd6368461071023fd7101e89b921e71d70e3845b3a53eb39be2ce1ab",
+    "newPacedSendWindowHarnessWithClient": "bd1c96746a9c818f1aeeba15e917062c13a3293f94da71633b1a5aaff30fd010",
+    "newRateLimitedSendWindowHarness": "7e52b3c776c9cbf85adb5710fdb80bf0a2760c5c0f9c34313e64fcd6617aef19",
+    "newSendWindowHarness": "609722eca0375e57f26ae4b47c8499d730bbc6bda6e53f5ca97c4a79c14c4f0b",
+    "newSendWindowHarnessWithClient": "bf85c7a42ac4ea82520ba663f66124fedef8917181eec650a3f6262c284e9dca",
+    "offer": "1ba931eda2362cee00356dfaa6aaaf02bc7f9058b9ede31bb93ffeade63e0e3c",
+    "offerWithCtx": "04d245ea0336b1ac6f271a8e7cc1a46794c256541a0ef136f081ad25a612a26d"
+  },
+  "unchanged_occupancy_gate_sha256": "901c5a87f10646d1ec3321f59e99838641fe0d240d196d569981d562178df253",
+  "unchanged_occupancy_instrumentation_sha256": "a8b0eb478e90dcbf0960913abdd7f373ba30f014c1d5cee65715b97bcad0d57e",
+  "unchanged_slow_path_fixture_sha256": "67bc74831c305a9c0f3eed2bb5a0a94e0df9fc0bda0fe596bb8f4a65b297e0f0",
+  "v1_failure": "Only the newly added threefold PacingByteRate reduction failed, at 9247028 versus 6090423 B/s. That metadata is unused by this Unknown-carrier physical path; the original candidate response and delivery gates passed. The intermediate failed assertion and exact name remain archived.",
+  "v1_to_v2_changed_source_paths": [
+    "transfer_send_window_test.go"
+  ],
+  "v2_adjustment": "Removed only the newly added out-of-scope pacing-factor assertion; renamed its test and clarified Unknown carrier provenance. Original delivery/candidate numeric gates and the new grow-only retention check remain. Pacing adaptation is covered by separate H1 service/cumulative roots."
+}

@@ -1,0 +1,10 @@
+{
+  "archive": "receiver-queue-sampler-controls",
+  "payload_sha256": {
+    "failure-readings.jsonl": "f32e33ecfc07da4d439ec58006c5f6b68ebc47687822aa2b7348c6e652dbe336",
+    "outcomes.jsonl": "25d9dbbe9286541e17f6403b80d8a8559d0ae2a33457569f9961c394884a3a28",
+    "provenance.json": "c51d472b1fdfdd1d533644e88068f35fef46fa6be4b0867b285053310ead1212",
+    "source-pins.json": "17e730e2c6d2b4cc3da55e8c8c3ca19c696c1be79e2d159c6ccd6692fa82360e",
+    "status.json": "e5d23be91df290e4cb0cc424ebb2f73e96b691c21ff49c72279e5981dd50642a"
+  }
+}

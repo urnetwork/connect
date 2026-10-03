@@ -1,0 +1,5 @@
+=== RUN   TestWindowPacingShorterRoundTripKeepsFasterServiceEvidence
+    transfer_window_pacing_capacity_test.go:115: RTT resize discarded faster ACK pair: rate=0 latest=125000 want=1250000
+--- FAIL: TestWindowPacingShorterRoundTripKeepsFasterServiceEvidence (0.00s)
+FAIL
+FAIL	github.com/urnetwork/connect	0.924s

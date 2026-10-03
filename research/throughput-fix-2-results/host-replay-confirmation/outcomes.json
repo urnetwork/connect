@@ -1,0 +1,18 @@
+{
+  "after": {
+    "censored_comparisons": 0,
+    "comparison_passed": true,
+    "exit_code": 0,
+    "failed_comparisons": 0,
+    "forced_idle_replay_observations": 4
+  },
+  "before": {
+    "censored_comparisons": 0,
+    "comparison_passed": true,
+    "exit_code": 0,
+    "failed_comparisons": 0,
+    "forced_idle_replay_observations": 4
+  },
+  "diagnostic_interpretation": "Both brackets exercised the forced replay fixture and passed their comparison gates; this remains bounded diagnostic evidence pending control review.",
+  "schema": "throughput-fix-2/host-replay-confirmation-outcomes-v1"
+}

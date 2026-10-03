@@ -1,0 +1,8 @@
+{
+  "source_log": "run.log",
+  "source_log_sha256": "19941fefbe3f57e0a97f4f7853bd37d87579a697187c201fabbff768f3d970e6",
+  "note": "Full server/connect review selection; database-backed resident cases stopped at the local PostgreSQL authentication preflight, while the remaining selection ran.",
+  "rows": 0,
+  "final": true,
+  "outcome": "failed"
+}

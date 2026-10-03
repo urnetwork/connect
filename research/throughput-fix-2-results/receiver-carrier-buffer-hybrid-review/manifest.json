@@ -1,0 +1,10 @@
+{
+  "archive": "receiver-carrier-buffer-hybrid-review",
+  "payload_sha256": {
+    "outcomes.jsonl": "c0fe2434447ee80bb91c214a5f8b25365648195996b605520932486429827c96",
+    "provenance.json": "d836742a487d44b9df17b1a52ee036220da834021cb22deed8f1ffeb3e8ebdf5",
+    "source-pins.json": "1d510134cc117768e37d1ed34c9b93df3e08d1752d8c9caed235e797d737e602",
+    "status.json": "810d53df84fcc9c7e423ec65b1ca23a2abe1cb118d95c016b146ea99e316c94b",
+    "worker-readings.jsonl": "aded873138001513d02177b951c3ebf21e340c59bc7de2cd9bb5f398d67363a8"
+  }
+}

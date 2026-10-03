@@ -1,0 +1,14 @@
+{
+  "archive": "window-receiver-ordering-v1",
+  "payload_sha256": {
+    "candidate.patch": "51b6b5dd000a9f2b1c749818edcad4a10511223b88bc1d73499e897ea5f7e858",
+    "outcomes.jsonl": "52ba9771e071554eb41c502b4d39a5a41006fb434fab5933f7d9a8cea060979e",
+    "provenance.json": "cc3cc5af952c7bf7933932b9c5a45058e0bc343fadb3848a2521ad2c8c0d6452",
+    "roots.patch": "d8733d1ed1600fa062184c1198bca3f54eb1065b3e468b6746afd8547e4fe806",
+    "source-manifest-after-adjacent.json": "c30945816dad78a1356e5531cd115b5c04955f6143153f6b9828437a9c3966a1",
+    "source-manifest-after-roots.json": "0b2c2a574cb1221de71180c0d6087d1a54f1ed1463cdaddd743d0a13702e3ae1",
+    "source-manifest-before-roots.json": "49128108f4589427f9444f9a6cece92b58cd6ab1f8bacb0414cbc1aef015061a",
+    "source-pins.json": "d121154d2e984e6716e768354d7b5c4c1f2eafc24fae0a88ac2b66be18976c4d",
+    "status.json": "7f7ba6e263ffc925e7d9331107b3c464f0646473988522a0906eb38244b76369"
+  }
+}

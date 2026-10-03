@@ -1,0 +1,70 @@
+==================
+WARNING: DATA RACE
+Write at 0x00c0000df1e8 by goroutine 12:
+  github.com/urnetwork/connect.(*SendSequence).closeContractMultiRouteWriter()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer.go:11988 +0x1a0
+  github.com/urnetwork/connect.TestWindowStatsConcurrentWriterTeardown.func1.1()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer_window_writer_stats_test.go:91 +0x44
+
+Previous read at 0x00c0000df1e8 by goroutine 13:
+  github.com/urnetwork/connect.(*SendSequence).transferFlightPolicy()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer.go:7551 +0x68
+  github.com/urnetwork/connect.(*SendSequence).receiverWindowTiming()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer.go:16232 +0x58
+  github.com/urnetwork/connect.(*SendSequence).deliveredBytesSampleIntervalAt()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer.go:10352 +0xa4
+  github.com/urnetwork/connect.(*SendSequence).estimateSendWindow()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer.go:11027 +0xba0
+  github.com/urnetwork/connect.(*SendSequence).sendWindowSnapshot()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer.go:10732 +0x3f8
+  github.com/urnetwork/connect.(*SendBuffer).DestinationSendStats()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer.go:5954 +0x420
+  github.com/urnetwork/connect.TestWindowStatsConcurrentWriterTeardown.func1.2()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer_window_writer_stats_test.go:96 +0x88
+
+Goroutine 12 (running) created at:
+  github.com/urnetwork/connect.TestWindowStatsConcurrentWriterTeardown.func1()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer_window_writer_stats_test.go:89 +0x324
+  testing.tRunner()
+      <go>/src/testing/testing.go:2036 +0x164
+  testing.testingSynctestTest.gowrap1()
+      <go>/src/testing/testing.go:2150 +0x34
+
+Goroutine 13 (finished) created at:
+  github.com/urnetwork/connect.TestWindowStatsConcurrentWriterTeardown.func1()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer_window_writer_stats_test.go:94 +0x3f4
+  testing.tRunner()
+      <go>/src/testing/testing.go:2036 +0x164
+  testing.testingSynctestTest.gowrap1()
+      <go>/src/testing/testing.go:2150 +0x34
+==================
+==================
+WARNING: DATA RACE
+Read at 0x00c00024a3e8 by goroutine 18:
+  github.com/urnetwork/connect.(*SendSequence).transferFlightPolicy()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer.go:7551 +0x68
+  github.com/urnetwork/connect.TestWindowStatsConcurrentWriterPublication.func1.2()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer_window_writer_stats_test.go:132 +0x48
+
+Previous write at 0x00c00024a3e8 by goroutine 17:
+  github.com/urnetwork/connect.(*SendSequence).openContractMultiRouteWriter()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer.go:11941 +0x1c8
+  github.com/urnetwork/connect.TestWindowStatsConcurrentWriterPublication.func1.1()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer_window_writer_stats_test.go:127 +0x44
+
+Goroutine 18 (running) created at:
+  github.com/urnetwork/connect.TestWindowStatsConcurrentWriterPublication.func1()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer_window_writer_stats_test.go:130 +0x3f4
+  testing.tRunner()
+      <go>/src/testing/testing.go:2036 +0x164
+  testing.testingSynctestTest.gowrap1()
+      <go>/src/testing/testing.go:2150 +0x34
+
+Goroutine 17 (finished) created at:
+  github.com/urnetwork/connect.TestWindowStatsConcurrentWriterPublication.func1()
+      <frozen/writer-stats-owner-v2-before>/connect/transfer_window_writer_stats_test.go:125 +0x324
+  testing.tRunner()
+      <go>/src/testing/testing.go:2036 +0x164
+  testing.testingSynctestTest.gowrap1()
+      <go>/src/testing/testing.go:2150 +0x34
+==================

@@ -1,0 +1,7 @@
+{
+  "comparison": "Same combined receiver/cold/refill baseline. Refined endpoint bounds and its expanded permutation control change between the two variants. This precedes the shared consumer correction.",
+  "limitation": "Both copied samplers omit the earlier accepted cumulative-delivery startup fallback; later integration audit found and restored that unrelated drift. These runs are diagnostic and do not establish final candidate acceptance.",
+  "no_quiescence_wait": true,
+  "outcome": "Ordering v1 fails changing windows and RTT growth; bounds v2 fails only RTT growth. Both retain all eight repeated ordering roots and both full six-gate selections.",
+  "role": "Actual six-gate and ordering-root follow-through before and after accepting provable delayed interior receiver points."
+}

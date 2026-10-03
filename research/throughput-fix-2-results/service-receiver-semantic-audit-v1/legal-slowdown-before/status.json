@@ -1,0 +1,42 @@
+{
+  "manifest_sha256": "068a4132e1e49c5014a006482917f96e60bdec918f040ee91aef9c757be72d0f",
+  "binary_sha256": "dcbe1431d274c02f83e10b5a8c551037b51721cac2d82dd68dfe66da4ba7e43e",
+  "effective_inputs_sha256": "8180033fcbaa424d7f0e55415b2270c5d2d4f67bfdc0196ce178d7e5b38d7380",
+  "argv": [
+    "tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacingReceiverLegal(RollingQueue|SharedPositiveService)",
+    "-test.count=3",
+    "-test.timeout=30m"
+  ],
+  "cwd": "source/connect",
+  "cwd_source": "same copied module as build; original absolute relationship is pinned by original status/manifest hashes",
+  "runner_sha256": "857ad92a127562ff190cac424282c1e93c00216a68322f6049b4b3c91f8528eb",
+  "started_utc": "2026-09-16T20:41:21.950675+00:00",
+  "loadavg_start": [
+    26.654296875,
+    23.1845703125,
+    18.90185546875
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent performance model, correctness research and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 18.157297875266522,
+  "loadavg_end": [
+    22.58935546875,
+    22.4560546875,
+    18.71630859375
+  ],
+  "ended_utc": "2026-09-16T20:41:40.108572+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "0f0715b6fb373bea0a1c5a91aabd527894ab1a0a13f51d604938bce9240a1a12",
+  "pass": 9,
+  "fail": 3,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "normalization_note": "Legal rolling-flight audit before bounded decrease: 9P/3F. Only the paired 12 KB cumulative group (2 times 6 KB physical items), opening 40 and batched read schedule retains shared pace 13.75 MB/s at both 192 and 384 cycles against physical 4 MB/s. Single 8 KB, frequent-read, legacy and mixed controls pass. The 4.4 MB/s ceiling is an explicit convergence policy, not exact measurement math.",
+  "rows": 396
+}

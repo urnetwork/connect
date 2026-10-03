@@ -1,0 +1,12 @@
+{
+  "archive": "physical-h1-control-admission-root-v1",
+  "payload_sha256": {
+    "failure-witnesses.json": "4cb34449c0ff263bcba13e7146ef1ac1fa11956cbbd1d023cacecb22d205a3af",
+    "outcomes.jsonl": "65553e3d8f3cb49ee20141881476c571bc6efad702adc20156b0431527810c5c",
+    "provenance.json": "05d6c398492f0e52fc21b6ae1cee1df487fc6b3c69f321fe2ab05c1aa920779e",
+    "root.patch": "06727979cbc864e4a827bfe9ea929457ff5be70da40fb61a05ffd5707e604949",
+    "source-manifest-before.json": "65aca180db0d73e2affb5a4f6b754ff14e2089453caef2b50646dc546f4398d2",
+    "source-pins.json": "02eab23cb17f86af5c40f7e41a6fe766f2a610f0853f16bfe94d3b34f1a3b8b2",
+    "status.json": "4aaa149d3c56e94a35894d04a6f71db8643fb45e7b1dda6a3449de5d2770a0a5"
+  }
+}

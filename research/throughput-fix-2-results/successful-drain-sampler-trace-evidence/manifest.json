@@ -1,0 +1,11 @@
+{
+  "archive": "successful-drain-sampler-trace-evidence",
+  "payload_sha256": {
+    "causal-excerpt.json": "22505c96fe2a581c39f6a965760b3b7adb2cff68604fc2bd8361057c02802ad9",
+    "numeric-readings.jsonl": "7212c3ae17102816d57218015082ab8e2752c2e264555556a6061a4b4ba02404",
+    "outcomes.jsonl": "f9be54c932e46ad5d2390719ec73a890e4c89523b961b0d7ad1e5f1c7d53e82a",
+    "provenance.json": "602ded0188e44dc4a35ac234f0f28fa6175761e9ccce58216a16d4ef047794dd",
+    "source-pins.json": "2ef6cda42317ea7b6b26b11fd51c3b7b854d1546c2dc1c695a7e74c36603bc25",
+    "status.json": "7c2d68129516e52649314a485c920386694c9aeb855d58050aee436a35a6350b"
+  }
+}

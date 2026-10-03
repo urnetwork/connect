@@ -1,0 +1,43 @@
+{
+  "changed_source_files": [
+    "connect/transfer.go"
+  ],
+  "event_plumbing": false,
+  "initial_invocation_error": "An initial relative overlay argument failed before compilation; the absolute-path retry built the same frozen sources. The initial build logs remain in each temporary evidence root.",
+  "parent_failure_source": "/tmp/throughput-fix-2-correctness-retained-service-combined-v3/source",
+  "performance_gates_changed": false,
+  "race": true,
+  "repetitions": 3,
+  "scope": "Both variants are physical copies of the broad race failing source. Only transfer.go changes: estimateSendWindow reads the configured-byte ceiling and passes that snapshot to bindingTerm. All three formatter calls preserve the same priority. The existing TestTheWindowHasOneOwner source and permitted owner lists are unchanged. Physical source copies ensure the structural test inspects the exact source used to build its binary.",
+  "selected_tests": [
+    "TestWindowMismatchCapacityIncreaseStartsFreshDeliveryEvidence",
+    "TestALearnedWindowSurvivesTheMemoryClamp",
+    "TestDeliveryGrowthRemainsBelowTheSmallMemoryShare",
+    "TestTheThreePeerBranchesHaveDifferentPermissionCeilings",
+    "TestAdvertisementRaisesPermissionWithoutLearningCapacity",
+    "TestDeliveryCandidatesRequireFreshPermissionHistory",
+    "TestGrowthDoublesFromAFullWindowAndStallsFromAHalfFilledOne",
+    "TestWindowPacingWindowProofPreservesHardBoundsAndRetainedCapacity",
+    "TestWindowPacingWindowProofAcceptsFreshSlowDeliveryWithoutShrinking",
+    "TestWindowPacingWindowProofWaitsForPhysicalConfirmation",
+    "TestWindowPacingWindowProofPreservesOtherCarrierHistory",
+    "TestWindowPacingNewPathProofRequiresFreshCumulativeDelivery",
+    "TestWindowPacingQueuedPathObservationKeepsDeliveryCandidate",
+    "TestALegacyAcknowledgementCannotOverwriteAnAdvertisement",
+    "TestWindowDestinationStatsKeepsLargestEffectiveWindow",
+    "TestWindowDestinationStatsKeepsLargestQualifiedWindow",
+    "TestWindowDestinationStatsEqualWindowsPreferCumulativeEvidence",
+    "TestWindowDestinationStatsEqualEvidenceKeepsFirstEstimate",
+    "TestWindowRetainedServiceGrowthReportsHardBound",
+    "TestWindowRetainedServiceGrowthReportsTargetBound",
+    "TestWindowRetainedServiceGrowthReportsServiceBelowBounds",
+    "TestAClampedWindowReportsTheMemoryShare",
+    "TestAConfiguredCeilingDoesNotReportTheMemoryShare",
+    "TestAClampedWindowFollowsItsShareDownAndUp",
+    "TestWindowPacingDestinationStatsDoNotUpdateServiceHold",
+    "TestWindowPacingDestinationStatsCannotRepriceConfirmedProbe",
+    "TestWindowPacingDestinationStatsKeepSharedServiceEvidence",
+    "TestTheWindowHasOneOwner"
+  ],
+  "test_execution_owner": "test_monitor_medium"
+}

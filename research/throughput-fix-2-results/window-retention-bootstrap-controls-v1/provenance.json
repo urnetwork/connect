@@ -1,0 +1,9 @@
+{
+  "opening_controls": {
+    "configured_opening": "48 MiB",
+    "small_opening": "256 KiB",
+    "thresholds": "unchanged"
+  },
+  "raw_logs": "Retained outside the archive; hashes, terminal outcomes, numerical readings, worker rows, source pins, and load context are preserved here.",
+  "scope": "Two frozen race control tests, count=1, independently frozen before/after sources."
+}

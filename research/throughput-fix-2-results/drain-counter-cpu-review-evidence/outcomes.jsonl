@@ -1,0 +1,5 @@
+{"classification":"diagnostic_context_only","exit_code":0,"notes":"Retained initial direct-map scanner context; not the final paired lifecycle fixture.","retained_row_count":24,"run_id":"initial_direct_map_scan","status":"PASS"}
+{"classification":"paired_cpu_comparison","exit_code":0,"fixture":"final","retained_row_count":24,"run_id":"final_drain_scan","status":"PASS","variant":"scan"}
+{"classification":"paired_cpu_comparison","exit_code":0,"fixture":"final","retained_row_count":24,"run_id":"final_drain_counter","status":"PASS","variant":"counter"}
+{"classification":"paired_cpu_comparison","exit_code":0,"fixture":"lifecycle","retained_row_count":6,"run_id":"final_lifecycle_scan","status":"PASS","variant":"scan"}
+{"classification":"paired_cpu_comparison","exit_code":0,"fixture":"lifecycle","retained_row_count":6,"run_id":"final_lifecycle_counter","status":"PASS","variant":"counter"}

@@ -1,0 +1,7 @@
+{
+  "base_commit": "2a01635920605d974a99dd7303090d2d5adc415a",
+  "race": true,
+  "repetitions": 3,
+  "scope": "No experimental receiver sampler or uncommitted drain correction. Normal failing assertions are retained. v1-tag-control exposes RTT timestamp mutation; v2-tight-control exposes expiry tied with pacing permission.",
+  "source_ownership": "Each variant was compiled and run from its frozen source and frozen local glog dependency. Raw logs and source copies remain outside the repository."
+}

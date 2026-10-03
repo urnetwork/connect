@@ -1,0 +1,34 @@
+{
+  "adjacent_repetitions": 1,
+  "debugging_owner": "network_quality_design (Astra max)",
+  "determinism": "Real NewClient and Buffer.Pack construct actual sequence state. Immutable constructor hooks park data workers before Run, and synctest.Wait forces the real capacity wait. No provider, SDK, ACK-policy, physical rig, route or socket fixture is needed.",
+  "existing_test_dependencies": [
+    "transfer_close_wait_test.go:closeWaitClientSettings",
+    "message_pool_ownership_test.go:assertMessagePoolOwnership"
+  ],
+  "fix": "On a rejected SendPack or ForwardPack, return the caller cancellation error before the buffer retries by retiring its shared sequence. Successful admissions and live-caller true sequence-closure recovery are unchanged.",
+  "history": "The earlier v3 policy comparison used an ACK fixture for send roots. This matched standalone supplement removes that dependency while preserving names and ownership assertions; all earlier outcomes remain separately archived.",
+  "network_quality_events": false,
+  "optional_ack_policy_included": false,
+  "outcomes": "Before6P18F; after24P0F; after-adjacent24P0F. All race=true, zero race warnings.",
+  "performance_gates_changed": false,
+  "pooled_ownership": "Failed calls retain caller bytes. Accepted sibling buffers are checked exactly and released by explicit consumer or joined sequence cleanup. Existing pool-boundary reconciliation covers all roots.",
+  "production_changes": [
+    "transfer.go"
+  ],
+  "production_patch_sha256": "00b16d01ea1634c230ccfe928d3e96f82978047b132d28c90f9457bf357797e9",
+  "race": true,
+  "retention": "Original sources, binaries, logs, commands and local paths remain immutable outside Git, represented by hashes.",
+  "root_repetitions": 3,
+  "roots": "Each buffer has separate roots for initial caller cancellation, cancellation during full two-slot admission, and preservation of that caller's previously accepted Pack. Each has a positive true-closure replacement control.",
+  "source_base": {
+    "artifact": "throughput-fix-2-receiver-service-validation-v1",
+    "candidate_source_sha256": "e6aaeb0801e4dc566dd66a9a4843c6a78d713722321a48e85312e4d7115d7790",
+    "inventory_sha256": "cb79e929de859509e52b7b821d40d5d2df8420858308ea94da39057f184e736d"
+  },
+  "test_execution_owner": "test_monitor_medium (Terra medium)",
+  "test_files": [
+    "transfer_pack_context_owner_test.go",
+    "transfer_forward_pack_context_owner_test.go"
+  ]
+}

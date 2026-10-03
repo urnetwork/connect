@@ -1,0 +1,294 @@
+--- a/ip.go
++++ b/ip.go
+@@ -84,20 +84,37 @@
+ // ReceivePacketFunction.
+ type ReceivePacketsFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packets [][]byte)
+ 
+-// Identifies the provider return's recovery promise after failed admission. It
+-// is deliberately independent of the wire protocol: socket data stays retained,
+-// internal controls can be regenerated, and arbitrary public callbacks make no
+-// recovery promise.
+-type receiveRecoveryMode int
++// A sealed recovery promise is independent of the wire protocol. The ordinary
++// values keep their existing behavior; an owned ACK additionally carries the
++// exact flow cancellation boundary for its dedicated producer.
++type receiveRecoveryMode interface {
++	receiveRecoveryPromise()
++}
++
++// Ordinary callback modes carry no per-flow ownership or cancellation lease.
++type receiveRecoveryKind int
++
++// Marks the finite non-owning callback modes.
++func (receiveRecoveryKind) receiveRecoveryPromise() {}
+ 
+ const (
+-	receiveRecoveryModeNonblocking receiveRecoveryMode = iota
++	receiveRecoveryModeNonblocking receiveRecoveryKind = iota
+ 	receiveRecoveryModeTcpSocket
+ 	// A synthesized ACK, reset, or unreachable response is safe to refuse
+ 	// without blocking its producer: the peer's retry elicits another response.
+ 	// Keep that promise distinct from arbitrary public callbacks.
+ 	receiveRecoveryModeRegenerableControl
+ )
++
++// One value belongs to the already-running pure-ACK worker. At most its one
++// generated packet may wait; no shared callback can manufacture this ownership
++// merely by declaring its IP protocol. The context is immutable.
++type tcpAckReturnOwner struct {
++	ctx context.Context
++}
++
++// Marks an exact dedicated ACK worker, rather than a shared callback.
++func (*tcpAckReturnOwner) receiveRecoveryPromise() {}
+ 
+ // Internal provider delivery retains the receiver-visible transfer identity
+ // and recovery ownership while the public callback stays source-compatible.
+@@ -5501,6 +5518,10 @@
+ 			}
+ 		}()
+ 
++		// This existing worker can retain one generated ACK while admission
++		// waits. Shared reset/duplicate callbacks remain zero-wait.
++		ackOwner := &tcpAckReturnOwner{ctx: self.ctx}
++
+ 		// reusable ack-compress timer (avoids a per-iteration time.After alloc
+ 		// on the hot ack coalescing path)
+ 		ackCompressTimer := time.NewTimer(0)
+@@ -5570,7 +5591,7 @@
+ 			default:
+ 			}
+ 
+-			self.receivePacket(packet, receiveRecoveryModeRegenerableControl)
++			self.receivePacket(packet, ackOwner)
+ 
+ 			if 0 < self.tcpBufferSettings.AckCompressTimeout {
+ 				// coalesce acks up to the timeout.
+@@ -6745,6 +6766,10 @@
+ 	// sourceLifecycle keeps the exact source behind the terminal verdict gate
+ 	// until this queued or in-flight return reaches final disposition.
+ 	sourceLifecycle *providerSourceLifecycle
++	// Only a dedicated ACK admission combines its exact flow lifetime with
++	// the source/provider lifetime. Set and released by that synchronous owner.
++	ownedSendContext        context.Context
++	releaseOwnedSendContext func()
+ }
+ 
+ // One sender-worker result exposes the exact completed accounting edge to
+@@ -6908,10 +6933,56 @@
+ // Returns the exact source cancellation boundary when this item was admitted;
+ // direct unit fixtures without a lifecycle retain the provider fallback.
+ func (self *providerReturnItem) sendContext(fallback context.Context) context.Context {
++	if self.ownedSendContext != nil {
++		return self.ownedSendContext
++	}
+ 	if self.sourceLifecycle != nil {
+ 		return self.sourceLifecycle.ctx
+ 	}
+ 	return fallback
++}
++
++// Only the socket reader or the exact pure-ACK worker may retain one item
++// outside the shared callback queues while its downstream admission waits.
++func (self *providerReturnItem) ownsReturnSend() bool {
++	if self.recoveryMode == receiveRecoveryModeTcpSocket {
++		return true
++	}
++	owner, ok := self.recoveryMode.(*tcpAckReturnOwner)
++	return ok && owner != nil && owner.ctx != nil
++}
++
++// Try an owned ACK once without allocating a combined context. Only an
++// admission that needs to wait joins the exact flow and source lifetimes; that
++// join is retained across retries and released with this one return item.
++func (self *RemoteUserNatProvider) admitReturnPacket(
++	item *providerReturnItem,
++	send func(time.Duration, context.Context) bool,
++) bool {
++	owner, owned := item.recoveryMode.(*tcpAckReturnOwner)
++	if !owned || owner == nil || owner.ctx == nil {
++		return send(self.returnWriteTimeout(item), item.sendContext(self.ctx))
++	}
++	if item.ownedSendContext == nil {
++		sourceCtx := item.sendContext(self.ctx)
++		if owner.ctx.Err() != nil || sourceCtx.Err() != nil {
++			return false
++		}
++		if send(0, sourceCtx) {
++			return true
++		}
++		ownedCtx, cancel := context.WithCancel(sourceCtx)
++		stop := context.AfterFunc(owner.ctx, cancel)
++		if owner.ctx.Err() != nil {
++			cancel()
++		}
++		item.ownedSendContext = ownedCtx
++		item.releaseOwnedSendContext = func() {
++			stop()
++			cancel()
++		}
++	}
++	return send(self.returnWriteTimeout(item), item.ownedSendContext)
+ }
+ 
+ // One source gate linearizes callback admission with a terminal Reliability
+@@ -7774,6 +7845,10 @@
+ 		})
+ 	}
+ 	item.returnPackets()
++	if release := item.releaseOwnedSendContext; release != nil {
++		release()
++		item.releaseOwnedSendContext = nil
++	}
+ 	afterRelease := item.afterRelease
+ 	item.afterRelease = nil
+ 	sourceId := item.source.SourceId
+@@ -7812,9 +7887,9 @@
+ }
+ 
+ // Admits one provider return without blocking shared receive pumps. Only a
+-// dedicated TCP socket reader may request synchronous recovery after upstream
+-// bytes were consumed; synthesized controls and public callbacks use the
+-// bounded nonblocking shards regardless of their IP protocol. Admission under
++// dedicated TCP socket reader or pure-ACK worker may request synchronous
++// recovery. The ACK worker carries its exact flow context; shared synthesized
++// controls and public callbacks use the bounded nonblocking shards. Admission under
+ // the read lock lets shutdown stop and join every registered decision without
+ // holding a state lock across a synchronous send.
+ func (self *RemoteUserNatProvider) enqueueReturnItem(item *providerReturnItem) bool {
+@@ -7826,7 +7901,7 @@
+ 		return false
+ 	}
+ 	item.sourceLifecycle = sourceLifecycle
+-	if item.recoveryMode == receiveRecoveryModeTcpSocket {
++	if item.ownsReturnSend() {
+ 		admitted := false
+ 		self.returnStateLock.RLock()
+ 		if !self.returnClosed {
+@@ -8190,7 +8265,11 @@
+ 			}
+ 			return true
+ 		}
+-		if item.recoveryMode != receiveRecoveryModeTcpSocket {
++		if !item.ownsReturnSend() {
++			return false
++		}
++		if owner, ok := item.recoveryMode.(*tcpAckReturnOwner); ok && owner.ctx.Err() != nil {
++			// Cancellation before the first attempt needs no joined context.
+ 			return false
+ 		}
+ 		sendCtx := item.sendContext(self.ctx)
+@@ -8212,12 +8291,12 @@
+ 	}
+ }
+ 
+-// only one dedicated TCP socket reader can retain consumed upstream bytes
+-// while Transfer admission waits. Datagram and shared callback workers serve
++// A dedicated socket reader or pure-ACK worker may retain its one pending
++// return while Transfer admission waits. Datagram and shared callback workers serve
+ // unrelated flows, so one full destination must receive a zero-wait refusal
+ // instead of parking that worker for the provider-wide write timeout.
+ func (self *RemoteUserNatProvider) returnWriteTimeout(item *providerReturnItem) time.Duration {
+-	if item.recoveryMode == receiveRecoveryModeTcpSocket {
++	if item.ownsReturnSend() {
+ 		return self.settings.WriteTimeout
+ 	}
+ 	return 0
+@@ -8226,12 +8305,13 @@
+ // A dedicated TCP socket reader retains the exact consumed bytes until
+ // Transfer admission. Admission moves the only recoverable copy into the
+ // bounded resend queue, which must keep retrying past the ordinary Ack timeout.
+-// Synthesized controls remain regenerable by the peer and need no such lease.
++// The dedicated ACK worker may wait before admission but still uses the
++// ordinary Transfer ACK timeout afterwards; it consumes no upstream payload.
+ func (self *RemoteUserNatProvider) returnSendRecoveryOption(
+ 	item *providerReturnItem,
+ ) sendPackRecoveryOption {
+ 	return sendPackRecoveryOption{
+-		upstreamRecoverable: item.recoveryMode == receiveRecoveryModeTcpSocket ||
++		upstreamRecoverable: item.ownsReturnSend() ||
+ 			item.recoveryMode == receiveRecoveryModeRegenerableControl,
+ 		retainAfterAckTimeout: item.recoveryMode == receiveRecoveryModeTcpSocket,
+ 	}
+@@ -8250,7 +8330,6 @@
+ 		item.ipProtocol,
+ 	)
+ 	destinationId := item.source.SourceId
+-	writeTimeout := self.returnWriteTimeout(item)
+ 	recoveryOption := self.returnSendRecoveryOption(item)
+ 	transportAttribution := newTransportPacketAttribution(
+ 		self.packetStatsCounters,
+@@ -8261,21 +8340,23 @@
+ 	var sent bool
+ 	if 2 <= self.settings.ProtocolVersion {
+ 		sent = self.retryReturnSend(item, 1, item.packetByteCount, func() bool {
+-			attemptSent, _ := self.client.sendRawWithTimeoutDetailed(
+-				protocol.MessageType_IpIpPacketFromProvider,
+-				packet,
+-				destinationId,
+-				ackTarget,
+-				0,
+-				writeTimeout,
+-				returnOption,
+-				returnTransferKey,
+-				Ctx(item.sendContext(self.ctx)),
+-				sendSchedulingKeyOption{key: item.schedulingKey},
+-				observeTransportWrite(transportAttribution.observe),
+-				recoveryOption,
+-			)
+-			return attemptSent
++			return self.admitReturnPacket(item, func(writeTimeout time.Duration, sendCtx context.Context) bool {
++				attemptSent, _ := self.client.sendRawWithTimeoutDetailed(
++					protocol.MessageType_IpIpPacketFromProvider,
++					packet,
++					destinationId,
++					ackTarget,
++					0,
++					writeTimeout,
++					returnOption,
++					returnTransferKey,
++					Ctx(sendCtx),
++					sendSchedulingKeyOption{key: item.schedulingKey},
++					observeTransportWrite(transportAttribution.observe),
++					recoveryOption,
++				)
++				return attemptSent
++			})
+ 		})
+ 		if !sent {
+ 			MessagePoolReturn(packet)
+@@ -8294,19 +8375,21 @@
+ 			panic(err)
+ 		}
+ 		sent = self.retryReturnSend(item, 1, item.packetByteCount, func() bool {
+-			return self.client.SendWithTimeout(
+-				frame,
+-				destinationId,
+-				func(err error) {},
+-				writeTimeout,
+-				returnOption,
+-				returnTransferKey,
+-				Ctx(item.sendContext(self.ctx)),
+-				sendSchedulingKeyOption{key: item.schedulingKey},
+-				observeTransportWrite(transportAttribution.observe),
+-				recoveryOption,
+-				sendAckTargetOption{target: ackTarget},
+-			)
++			return self.admitReturnPacket(item, func(writeTimeout time.Duration, sendCtx context.Context) bool {
++				return self.client.SendWithTimeout(
++					frame,
++					destinationId,
++					func(err error) {},
++					writeTimeout,
++					returnOption,
++					returnTransferKey,
++					Ctx(sendCtx),
++					sendSchedulingKeyOption{key: item.schedulingKey},
++					observeTransportWrite(transportAttribution.observe),
++					recoveryOption,
++					sendAckTargetOption{target: ackTarget},
++				)
++			})
+ 		})
+ 		if !sent {
+ 			MessagePoolReturn(frame.MessageBytes)

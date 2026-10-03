@@ -1,0 +1,55 @@
+{
+  "inputs": {
+    "b5_before": {
+      "sanitization": "synthetic fixture output inspected before archival",
+      "sha256": "c24564c95e09900ae61056f0863d3d0504d1b105ea61432edd0c56953673f17e"
+    },
+    "cancel_before": {
+      "sanitization": "synthetic fixture output inspected before archival",
+      "sha256": "16756da8ef1fba97486e0e2117330d0b40541ffc87480e14a45fa13e5e266772"
+    },
+    "committed_b5_probes": {
+      "sanitization": "synthetic fixture output inspected before archival",
+      "sha256": "53c150e6ed9a1ff71399996c35b22b5a69840889f44370d8f20630815c3e55f2"
+    },
+    "focused": {
+      "sanitization": "outcomes only and full structured numerical service readings",
+      "sha256": "1004278c6f18de24b238664674aa38d599d20be6e98ee9b8faff313718664a9c"
+    },
+    "late_before": {
+      "sanitization": "synthetic fixture output inspected before archival",
+      "sha256": "06eefcc2626ea28bf994f03ff36ffe75a41a4cd9a9e4c80e93eb3884f161e33c"
+    },
+    "restored_model": {
+      "sanitization": "outcomes only and full structured numerical service readings",
+      "sha256": "6d6003bd537c90878b4c23de0deb137e865f0ccd49fc1f05fe6c0c7be6bb22da"
+    }
+  },
+  "intermediate_evidence": {
+    "canceled_head": "The canceled-head failure was from an intermediate head-cancel branch.",
+    "late_dispatch": "The late-dispatch failure was from an intermediate deadline-clear branch."
+  },
+  "lineage": {
+    "committed_b5_bug": {
+      "description": "Final-shaped settled 64KiB capacity-rise fixture against the committed b5 pacer; it records 1.09375 Mb/s and minimum flow 0 after 1 to 10 Mb/s increase.",
+      "pacer_sha256": "8ff4934113531251bb72775e5bd559e89647c5264f4a05730fe4789e54adb054",
+      "source_canonical_sha256": "b5b407364a99cbb0a022b5de897fc5eb8bade0593541ddd2e0b658636c692207"
+    },
+    "committed_b5_probe_failures": {
+      "description": "Focused controlled-drain probe failures against the committed b5 pacing implementation through the exact overlay below; three deterministic failures.",
+      "pacer_sha256": "8ff4934113531251bb72775e5bd559e89647c5264f4a05730fe4789e54adb054"
+    },
+    "controlled_only_fix": {
+      "description": "Frozen follow-up source. Focused race tests and scoped model selection passed without broad campaign restart.",
+      "runner_sha256": "6af611e430a6efe1820dad4649d52cb06bb6edbd0215218523bba11957eff293",
+      "source_canonical_sha256": "f60cf11db4f0c7a928144ad78d1b9cebe96bbf8916fa620d1b58d01598fc613a"
+    }
+  },
+  "overlay": {
+    "description": "Only transfer_window_pacing.go was substituted to reproduce the committed b5 pacer under the focused controlled-drain tests.",
+    "overlay_sha256": "b0053b4e42f4c416552c6f7d909c8bcc4a3cf4da12925874ba971aecaff37f2d",
+    "replaced_file": "transfer_window_pacing.go",
+    "replacement_pacer_sha256": "8ff4934113531251bb72775e5bd559e89647c5264f4a05730fe4789e54adb054"
+  },
+  "purpose": "Sanitized focused evidence for the controlled-drain pacing correction. Raw diagnostic logs and binaries remain outside this archive."
+}

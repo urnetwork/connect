@@ -1,0 +1,12 @@
+{"name":"TestWindowPacingInitialWriteKeepsOriginalAckLifetime","outcome":"PASS","outcome_id":1,"race_blocks":0,"run_id":"current-1","seconds":0.01,"variant":"current"}
+{"name":"TestWindowPacingInitialRecoveryPrecedesLongerAckLifetime","outcome":"PASS","outcome_id":2,"race_blocks":0,"run_id":"current-1","seconds":0.0,"variant":"current"}
+{"name":"TestWindowPacingInitialWaitCannotOutliveAckLifetime","outcome":"FAIL","outcome_id":3,"race_blocks":0,"run_id":"current-1","seconds":0.0,"variant":"current"}
+{"name":"TestWindowPacingInitialWriteKeepsOriginalAckLifetime","outcome":"PASS","outcome_id":4,"race_blocks":0,"run_id":"current-1","seconds":0.0,"variant":"current"}
+{"name":"TestWindowPacingInitialRecoveryPrecedesLongerAckLifetime","outcome":"PASS","outcome_id":5,"race_blocks":0,"run_id":"current-1","seconds":0.0,"variant":"current"}
+{"name":"TestWindowPacingInitialWaitCannotOutliveAckLifetime","outcome":"FAIL","outcome_id":6,"race_blocks":0,"run_id":"current-1","seconds":0.0,"variant":"current"}
+{"name":"TestWindowPacingInitialWriteKeepsOriginalAckLifetime","outcome":"PASS","outcome_id":7,"race_blocks":0,"run_id":"current-1","seconds":0.0,"variant":"current"}
+{"name":"TestWindowPacingInitialRecoveryPrecedesLongerAckLifetime","outcome":"PASS","outcome_id":8,"race_blocks":0,"run_id":"current-1","seconds":0.0,"variant":"current"}
+{"name":"TestWindowPacingInitialWaitCannotOutliveAckLifetime","outcome":"FAIL","outcome_id":9,"race_blocks":0,"run_id":"current-1","seconds":0.0,"variant":"current"}
+{"name":"TestWindowPacingInitialWaitCannotOutliveAckLifetime","outcome":"FAIL","outcome_id":1,"race_blocks":0,"run_id":"pre-physical-anchor-2","seconds":0.01,"variant":"pre-physical-anchor"}
+{"name":"TestWindowPacingInitialWaitCannotOutliveAckLifetime","outcome":"FAIL","outcome_id":2,"race_blocks":0,"run_id":"pre-physical-anchor-2","seconds":0.0,"variant":"pre-physical-anchor"}
+{"name":"TestWindowPacingInitialWaitCannotOutliveAckLifetime","outcome":"FAIL","outcome_id":3,"race_blocks":0,"run_id":"pre-physical-anchor-2","seconds":0.0,"variant":"pre-physical-anchor"}

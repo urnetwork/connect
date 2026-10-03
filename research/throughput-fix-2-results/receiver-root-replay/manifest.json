@@ -1,0 +1,9 @@
+{
+  "archive": "receiver-root-replay",
+  "payload_sha256": {
+    "worker-readings.jsonl": "ea1c254fe67ffd53abf44a9647f9c1998552e2e6e3701d31143c770b4f542cb2",
+    "outcomes.jsonl": "cb80570a2a8665fb0f863e19346f513eb3f07762494543da3737dd554e4ed764",
+    "variants.json": "6ee04b2c1d8fc426d71ded1d1530244d1acbc6643f35a7e41e1b90bc3bdb4c04",
+    "status.json": "49c95c36bde384dbffc37d354ebc4e998410f9e235e36ba17d843c86f43338b8"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "source_log": "throughput-fix-2-model-final.log",
+  "source_log_sha256": "4eb768325c0789f31c266f205c0280f36f13a68cab75e85e650dc490421cf84a",
+  "note": "Target-rate pacer; later slow-link control exposed its service-rate defect.",
+  "rows": 36,
+  "final": false,
+  "outcome": "passed"
+}

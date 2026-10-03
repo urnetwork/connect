@@ -1,0 +1,8 @@
+{
+  "archive": "retained-growth-race-pair-incomplete-v2",
+  "payload_sha256": {
+    "outcomes.jsonl": "68ea92654408dca6426e0982b87b48865ef2a4ba35b68bec695f5a648677a3fe",
+    "provenance.json": "d43a5b7e71797edcdab94d54ed61967e2fcc481018a9d0ba24e20ab3b97d72dd",
+    "source-pins.json": "c82dcf5b2bc2b5d2258f71ed9994ba74e5a4f536df16c49129811208f082653c"
+  }
+}

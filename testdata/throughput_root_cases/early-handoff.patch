@@ -1,0 +1,11 @@
+--- a/transfer_window_receiver_ingress_counter_diagnostic_test.go
++++ b/transfer_window_receiver_ingress_counter_diagnostic_test.go
+@@ -274,7 +274,7 @@
+ 	}
+ 	if sender.latest == 0 {
+ 		// A first endpoint supplies no receiver rate and cannot own discovery.
+-		return 0, 0, false
++		return 0, service.serviceHoldRate, true
+ 	}
+ 	var rate, latest ByteCount
+ 	var latestAt int64

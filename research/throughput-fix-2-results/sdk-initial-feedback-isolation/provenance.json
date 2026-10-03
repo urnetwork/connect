@@ -1,0 +1,11 @@
+{
+  "forced_phase_partial_outcomes": 14,
+  "labels": {
+    "candidate": "Complete unforced or traced candidate observations; not promotion acceptance evidence.",
+    "partial": "Forced-phase diagnostic subset; not a complete acceptance selection."
+  },
+  "scope": "Normalized terminal SDK-isolation outcomes only; raw logs and binaries remain outside the Git archive.",
+  "traced_forced_outcomes": 6,
+  "traced_unforced_outcomes": 6,
+  "unforced_complete_outcomes": 24
+}

@@ -1,0 +1,37 @@
+=== RUN   TestWindowPacingReceiverSustainedPacingColdFallback
+--- FAIL: TestWindowPacingReceiverSustainedPacingColdFallback (0.18s)
+=== RUN   TestWindowPacingReceiverSustainedPacingEscapesSlowHold
+--- FAIL: TestWindowPacingReceiverSustainedPacingEscapesSlowHold (0.17s)
+=== RUN   TestWindowPacingReceiverSustainedPacingLowersFastHold
+--- FAIL: TestWindowPacingReceiverSustainedPacingLowersFastHold (0.16s)
+=== RUN   TestWindowPacingReceiverSustainedPacingAlignedControl
+--- FAIL: TestWindowPacingReceiverSustainedPacingAlignedControl (0.08s)
+=== RUN   TestWindowPacingReceiverSustainedPacingLegacyControl
+--- FAIL: TestWindowPacingReceiverSustainedPacingLegacyControl (0.06s)
+=== RUN   TestWindowPacingReceiverSustainedPacingMixedControl
+--- FAIL: TestWindowPacingReceiverSustainedPacingMixedControl (0.08s)
+=== RUN   TestWindowPacingReceiverSustainedPacingColdFallback
+--- FAIL: TestWindowPacingReceiverSustainedPacingColdFallback (0.17s)
+=== RUN   TestWindowPacingReceiverSustainedPacingEscapesSlowHold
+--- FAIL: TestWindowPacingReceiverSustainedPacingEscapesSlowHold (0.19s)
+=== RUN   TestWindowPacingReceiverSustainedPacingLowersFastHold
+--- FAIL: TestWindowPacingReceiverSustainedPacingLowersFastHold (0.19s)
+=== RUN   TestWindowPacingReceiverSustainedPacingAlignedControl
+--- FAIL: TestWindowPacingReceiverSustainedPacingAlignedControl (0.09s)
+=== RUN   TestWindowPacingReceiverSustainedPacingLegacyControl
+--- FAIL: TestWindowPacingReceiverSustainedPacingLegacyControl (0.07s)
+=== RUN   TestWindowPacingReceiverSustainedPacingMixedControl
+--- FAIL: TestWindowPacingReceiverSustainedPacingMixedControl (0.09s)
+=== RUN   TestWindowPacingReceiverSustainedPacingColdFallback
+--- FAIL: TestWindowPacingReceiverSustainedPacingColdFallback (0.20s)
+=== RUN   TestWindowPacingReceiverSustainedPacingEscapesSlowHold
+--- FAIL: TestWindowPacingReceiverSustainedPacingEscapesSlowHold (0.19s)
+=== RUN   TestWindowPacingReceiverSustainedPacingLowersFastHold
+--- FAIL: TestWindowPacingReceiverSustainedPacingLowersFastHold (0.16s)
+=== RUN   TestWindowPacingReceiverSustainedPacingAlignedControl
+--- FAIL: TestWindowPacingReceiverSustainedPacingAlignedControl (0.08s)
+=== RUN   TestWindowPacingReceiverSustainedPacingLegacyControl
+--- FAIL: TestWindowPacingReceiverSustainedPacingLegacyControl (0.06s)
+=== RUN   TestWindowPacingReceiverSustainedPacingMixedControl
+--- FAIL: TestWindowPacingReceiverSustainedPacingMixedControl (0.08s)
+FAIL

@@ -1,0 +1,2 @@
+{"candidate_mbps_approx":17.287,"cell_shape":"256KiB send window, 100ms RTT, 10ms compression, one or eight flows","classification":"unresolved-frozen-hybrid-mismatch","failed_cells":6,"gate":"90-percent","reference_mbps_approx":19.3,"test":"TestWindowPathWindowMismatchMatrix"}
+{"candidate_mbps":0.16384,"classification":"unresolved-frozen-hybrid-slow-shared","link_rate_mbps":1,"other_link_rate_controls":{"1000_mbps":"PASS","100_mbps":"PASS"},"reference_mbps_approx":0.957,"test":"TestWindowPathServicesShareFiniteRelay"}

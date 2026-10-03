@@ -1,0 +1,12 @@
+{"duration":"0.61s","outcome":"PASS","repetition":1,"test":"TestSizedWindowShrinksWhenThePathShrinks"}
+{"duration":"0.00s","outcome":"PASS","repetition":1,"test":"TestTheWindowSizingSwitchOffIsTodaysBehaviour"}
+{"duration":"3.54s","outcome":"PASS","repetition":1,"test":"TestTheWindowRuleIsInertOnAShortPath"}
+{"duration":"0.00s","outcome":"PASS","repetition":1,"test":"TestTheTransferShareIsADrawOnTheBudget"}
+{"duration":"0.86s","outcome":"PASS","repetition":2,"test":"TestSizedWindowShrinksWhenThePathShrinks"}
+{"duration":"0.00s","outcome":"PASS","repetition":2,"test":"TestTheWindowSizingSwitchOffIsTodaysBehaviour"}
+{"duration":"3.47s","outcome":"PASS","repetition":2,"test":"TestTheWindowRuleIsInertOnAShortPath"}
+{"duration":"0.00s","outcome":"PASS","repetition":2,"test":"TestTheTransferShareIsADrawOnTheBudget"}
+{"duration":"0.79s","outcome":"PASS","repetition":3,"test":"TestSizedWindowShrinksWhenThePathShrinks"}
+{"duration":"0.00s","outcome":"PASS","repetition":3,"test":"TestTheWindowSizingSwitchOffIsTodaysBehaviour"}
+{"duration":"4.72s","outcome":"PASS","repetition":3,"test":"TestTheWindowRuleIsInertOnAShortPath"}
+{"duration":"0.00s","outcome":"PASS","repetition":3,"test":"TestTheTransferShareIsADrawOnTheBudget"}

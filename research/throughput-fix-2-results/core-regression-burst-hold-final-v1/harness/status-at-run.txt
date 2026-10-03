@@ -1,0 +1,231 @@
+ M THROUGHPUT-REPORT-PR2.md
+ M THROUGHPUTFIX-PR2.md
+ M flight_gate_lane_probe_test.go
+ M testdata/throughput_root_cases/README.md
+ M throughput-fix-2-results/README.md
+ M tools/throughput-fix-2-snapshot-test.py
+ M tools/throughput-fix-2.sh
+ M transfer.go
+ M transfer_send_window_test.go
+ M transfer_sender_ack_timing.go
+ M transfer_throughput_chain_test.go
+ M transfer_window_adjacent_test.go
+ M transfer_window_clamped_fixture_test.go
+ M transfer_window_h1_physical_test.go
+ M transfer_window_legacy_settle_test.go
+ M transfer_window_pacing.go
+ M transfer_window_pacing_probe_test.go
+ M transfer_window_path_performance_test.go
+ M transfer_window_peer_branches_test.go
+ M transfer_window_properties_test.go
+ M transfer_window_receiver_rtt.go
+ M transfer_window_refill_adjacent_test.go
+ M transfer_window_refill_carrier_test.go
+ M transfer_window_refill_proof_test.go
+ M transfer_window_service_credit.go
+?? THOUGHPUTFIX-HANDOFF.md
+?? throughput-fix-2-results/ack-final/run.log
+?? throughput-fix-2-results/benchmark-ledger-preservation-v1/
+?? throughput-fix-2-results/caller-cancellation-isolation-v2/
+?? throughput-fix-2-results/caller-cancellation-live-integration-v1/
+?? throughput-fix-2-results/core-regression-burst-hold-final-v1/
+?? throughput-fix-2-results/correctness-constant-time-drain/
+?? throughput-fix-2-results/correctness-lifetime-owner-v6/
+?? throughput-fix-2-results/correctness-lifetime-owner-v7/
+?? throughput-fix-2-results/correctness-prior-value-counter/
+?? throughput-fix-2-results/correctness-receiver-service-v1/
+?? throughput-fix-2-results/correctness-retained-sampler-v4/
+?? throughput-fix-2-results/correctness-retained-service-v3/
+?? throughput-fix-2-results/correctness-root-condition-coverage/
+?? throughput-fix-2-results/correctness/run.log
+?? throughput-fix-2-results/drain-counter-cpu-review-evidence/
+?? throughput-fix-2-results/drain-counter-prior-value-review-evidence/
+?? throughput-fix-2-results/initial-ack-lifetime-review-evidence/
+?? throughput-fix-2-results/isolated-regressions/throughput-fix-2-isolated-regressions.txt
+?? throughput-fix-2-results/matched-offer-attribution-correction-evidence/
+?? throughput-fix-2-results/model-constant-time-drain/
+?? throughput-fix-2-results/model-core-deferral-v1/
+?? throughput-fix-2-results/model-core-live-baseline-v1/
+?? throughput-fix-2-results/model-endpoint-pacing-review-v1/
+?? throughput-fix-2-results/model-final/run.log
+?? throughput-fix-2-results/model-flight-phase-combined-v1/
+?? throughput-fix-2-results/model-lifetime-owner-v1/
+?? throughput-fix-2-results/model-receiver-consumers-full-v1/
+?? throughput-fix-2-results/model-receiver-interval-combined-v1/
+?? throughput-fix-2-results/model-receiver-invalid-slowdown-full-v1/
+?? throughput-fix-2-results/model-receiver-ordering-combined-v1/
+?? throughput-fix-2-results/model-receiver-refill-combined-v1/
+?? throughput-fix-2-results/model-receiver-refill-full-v1/
+?? throughput-fix-2-results/model-receiver-restored-full-v1/
+?? throughput-fix-2-results/model-retained-service-combined-v3/
+?? throughput-fix-2-results/model-rtt-measurement-policy-review-v1/
+?? throughput-fix-2-results/model-sampler-cumulative-combined-v1/
+?? throughput-fix-2-results/model-service-gap-combined-v1/
+?? throughput-fix-2-results/model-static-long-recovery-v1/
+?? throughput-fix-2-results/model-window-proof-original-sampler/
+?? throughput-fix-2-results/occupancy-instrumentation-matrix-v1/
+?? throughput-fix-2-results/pacing-discovery-root-v1/
+?? throughput-fix-2-results/pacing-lifetime-candidate-review-evidence/
+?? throughput-fix-2-results/pacing-lifetime-owner-v3/
+?? throughput-fix-2-results/physical-duplex-ledger-preservation-v1/
+?? throughput-fix-2-results/physical-h1-ack-owner-cpu-v1/
+?? throughput-fix-2-results/physical-h1-ack-owner-fixture-audit-v2/
+?? throughput-fix-2-results/physical-h1-ack-owner-policy-v3/
+?? throughput-fix-2-results/physical-h1-ack-policy-experiment-v1/
+?? throughput-fix-2-results/physical-h1-control-admission-root-v1/
+?? throughput-fix-2-results/physical-h1-first-refusal-diagnostic-v1/
+?? throughput-fix-2-results/physical-window-policy-gate-contract-v1/
+?? throughput-fix-2-results/physical-window-policy-live-integration-v1/
+?? throughput-fix-2-results/receiver-carrier-buffer-hybrid-review/
+?? throughput-fix-2-results/receiver-feedback-wire-design/
+?? throughput-fix-2-results/receiver-hybrid-full-v2-evidence/
+?? throughput-fix-2-results/receiver-hybrid-ownership-affected/
+?? throughput-fix-2-results/receiver-hybrid-ownership-full-model/
+?? throughput-fix-2-results/receiver-queue-admission-affected-model/
+?? throughput-fix-2-results/receiver-queue-admission-diagnostic/
+?? throughput-fix-2-results/receiver-queue-admission-full-model/
+?? throughput-fix-2-results/receiver-queue-sampler-controls/
+?? throughput-fix-2-results/receiver-queue-worker-evidence/
+?? throughput-fix-2-results/receiver-test-contract-audit-v1/
+?? throughput-fix-2-results/recovery-drain-ablation-evidence/
+?? throughput-fix-2-results/regression-constant-time-drain/
+?? throughput-fix-2-results/regression-lifetime-owner-v3/
+?? throughput-fix-2-results/regression-lifetime-owner-v7/
+?? throughput-fix-2-results/regression-receiver-service-v1/
+?? throughput-fix-2-results/regression-retained-service-v3/
+?? throughput-fix-2-results/retained-growth-race-pair-incomplete-v2-normalization-attempt-1/
+?? throughput-fix-2-results/retained-growth-race-pair-incomplete-v2/
+?? throughput-fix-2-results/retained-instrumentation-audit-v1/
+?? throughput-fix-2-results/sdk-initial-feedback-isolation/
+?? throughput-fix-2-results/sdk-initial-feedback-roots/
+?? throughput-fix-2-results/sdk-initial-sampler-correction/
+?? throughput-fix-2-results/sdk-initial-service-root-before/
+?? throughput-fix-2-results/send-scan-cost-v1/
+?? throughput-fix-2-results/server-connect-deterministic-final/run.log
+?? throughput-fix-2-results/server-connect-deterministic/run.log
+?? throughput-fix-2-results/server-functional-adjacent/run.log
+?? throughput-fix-2-results/server-functional-final/run.log
+?? throughput-fix-2-results/server-preflight-retry-drain/
+?? throughput-fix-2-results/server-proxy-deterministic-final/run.log
+?? throughput-fix-2-results/server-proxy-deterministic/run.log
+?? throughput-fix-2-results/server-proxy-final/run.log
+?? throughput-fix-2-results/server-retained-window-source-review/
+?? throughput-fix-2-results/server-scoped-configure-final-v1/
+?? throughput-fix-2-results/server-unit-adjacent/run.log
+?? throughput-fix-2-results/server-unit-final/run.log
+?? throughput-fix-2-results/server-unit/run.log
+?? throughput-fix-2-results/service-feedback-delay-correction/
+?? throughput-fix-2-results/service-flight-phase-correction/
+?? throughput-fix-2-results/service-gap-qualification-correction/
+?? throughput-fix-2-results/service-pacing-burst-hold-v1/
+?? throughput-fix-2-results/service-qualification-correction/
+?? throughput-fix-2-results/service-qualification-cpu-v1/
+?? throughput-fix-2-results/service-qualification-v2-rejected/
+?? throughput-fix-2-results/service-queue-epoch-correction/
+?? throughput-fix-2-results/service-queue-horizon-correction/
+?? throughput-fix-2-results/service-receiver-coalescer-cpu-v1/
+?? throughput-fix-2-results/service-receiver-consumers-bounds-v1/
+?? throughput-fix-2-results/service-receiver-credit-cpu-v1/
+?? throughput-fix-2-results/service-receiver-cumulative-restoration-v1/
+?? throughput-fix-2-results/service-receiver-interval-correction/
+?? throughput-fix-2-results/service-receiver-invalid-slowdown-v1/
+?? throughput-fix-2-results/service-receiver-mixed-supplement-v1/
+?? throughput-fix-2-results/service-receiver-owned-interval-rejected-v1/
+?? throughput-fix-2-results/service-receiver-prefix-contract-correction-v3/
+?? throughput-fix-2-results/service-receiver-prefix-live-sdk-v1/
+?? throughput-fix-2-results/service-receiver-prefix-local-hop-v2/
+?? throughput-fix-2-results/service-receiver-prefix-timing-v1/
+?? throughput-fix-2-results/service-receiver-refill-correction/
+?? throughput-fix-2-results/service-receiver-ring-cpu-v1/
+?? throughput-fix-2-results/service-receiver-semantic-audit-v1/
+?? throughput-fix-2-results/service-shared-aggregate-boundaries-v1/
+?? throughput-fix-2-results/service-shared-aggregate-warm-v1/
+?? throughput-fix-2-results/silent-lane-virtual-before-evidence/
+?? throughput-fix-2-results/small-window-ingress-comparison-evidence/
+?? throughput-fix-2-results/successful-drain-legacy-sampler-evidence/
+?? throughput-fix-2-results/successful-drain-sampler-correction/
+?? throughput-fix-2-results/successful-drain-sampler-trace-evidence/
+?? throughput-fix-2-results/tcp-capacity/run.log
+?? throughput-fix-2-results/tcp-final/run.log
+?? throughput-fix-2-results/tcp-shutdown-failure/failure.txt
+?? throughput-fix-2-results/unprovable-drain-review-evidence/
+?? throughput-fix-2-results/window-cumulative-pacing-carrier-scope-v2/
+?? throughput-fix-2-results/window-cumulative-pacing-roots-v1/
+?? throughput-fix-2-results/window-cumulative-pacing-sdk-v1/
+?? throughput-fix-2-results/window-cumulative-shared-credit-root-v4/
+?? throughput-fix-2-results/window-cumulative-shared-delivery-cold-v2/
+?? throughput-fix-2-results/window-cumulative-shared-delivery-cpu-v1/
+?? throughput-fix-2-results/window-cumulative-shared-delivery-oracle-v1/
+?? throughput-fix-2-results/window-cumulative-shared-prefix-sdk-v1/
+?? throughput-fix-2-results/window-cumulative-shared-reserve-precondition-v1/
+?? throughput-fix-2-results/window-cumulative-shared-reserve-root-v2/
+?? throughput-fix-2-results/window-cumulative-shared-reserve-root-v3/
+?? throughput-fix-2-results/window-cumulative-shared-warm-pacing-v2/
+?? throughput-fix-2-results/window-receiver-credit-attribution-v1/
+?? throughput-fix-2-results/window-receiver-interleaved-slowdown-root-v1/
+?? throughput-fix-2-results/window-receiver-ordering-bounds-v3/
+?? throughput-fix-2-results/window-receiver-ordering-recovery-v2/
+?? throughput-fix-2-results/window-receiver-ordering-v1/
+?? throughput-fix-2-results/window-retention-adjacent-original-regression/
+?? throughput-fix-2-results/window-retention-adjacent-policy-v1/
+?? throughput-fix-2-results/window-retention-adjacent-policy-v2/
+?? throughput-fix-2-results/window-retention-binding-owner/
+?? throughput-fix-2-results/window-retention-bootstrap-controls-v1/
+?? throughput-fix-2-results/window-retention-carrier-scope/
+?? throughput-fix-2-results/window-retention-model-v1/
+?? throughput-fix-2-results/window-retention-policy-assertions-v2/
+?? throughput-fix-2-results/window-retention-policy-service-v3/
+?? throughput-fix-2-results/window-retention-policy-v1/
+?? throughput-fix-2-results/window-retention-reporting/
+?? throughput-fix-2-results/window-retention-service-binding/
+?? throughput-fix-2-results/window-retention-service-growth/
+?? throughput-fix-2-results/window-retention-statistics-selection/
+?? throughput-fix-2-results/window-retention-target-diagnostic/
+?? throughput-fix-2-results/window-sdk-cold-receiver-qualification-v1/
+?? throughput-fix-2-results/window-writer-statistics-owner-v1/
+?? throughput-fix-2-results/window-writer-statistics-owner-v2/
+?? tools/__pycache__/
+?? tools/throughput-fix-2-ledger-test.py
+?? tools/throughput-fix-2-ledger.py
+?? tools/throughput-fix-2-server-env-test.py
+?? tools/throughput-fix-2-server-env.py
+?? tools/throughput-fix-2-server-tests.json
+?? transfer_forward_pack_context_owner_test.go
+?? transfer_pack_context_owner_test.go
+?? transfer_send_scan_benchmark_test.go
+?? transfer_window_cold_refill_cohort_test.go
+?? transfer_window_cumulative_pacing_test.go
+?? transfer_window_h1_policy_contract_test.go
+?? transfer_window_h1_policy_gate_test.go
+?? transfer_window_pacing_burst_queue_test.go
+?? transfer_window_pacing_discovery_state_test.go
+?? transfer_window_pacing_discovery_test.go
+?? transfer_window_pacing_drain_benchmark_test.go
+?? transfer_window_pacing_tail_benchmark_test.go
+?? transfer_window_receiver_prefix_ingress_test.go
+?? transfer_window_retained_growth_test.go
+?? transfer_window_retained_reporting_test.go
+?? transfer_window_retained_service_bounds_test.go
+?? transfer_window_retained_service_scope_test.go
+?? transfer_window_retained_test.go
+?? transfer_window_sdk_cumulative_pacing_test.go
+?? transfer_window_sdk_duplex_short_test.go
+?? transfer_window_sdk_initial_feedback_test.go
+?? transfer_window_sdk_initial_service_order_test.go
+?? transfer_window_sdk_initial_service_test.go
+?? transfer_window_sdk_receiver_interval_test.go
+?? transfer_window_service_feedback_delay_test.go
+?? transfer_window_service_flight_phase_test.go
+?? transfer_window_service_gap_qualification_test.go
+?? transfer_window_service_qualification_test.go
+?? transfer_window_service_queue_epoch_test.go
+?? transfer_window_service_queue_horizon_test.go
+?? transfer_window_service_receiver_credit_benchmark_test.go
+?? transfer_window_service_receiver_interval_test.go
+?? transfer_window_service_refill_interval_test.go
+?? transfer_window_size.go
+?? transfer_window_static_long_recovery_test.go
+?? transfer_window_stats.go
+?? transfer_window_stats_selection_test.go
+?? transfer_window_successful_drain_adjacent_test.go
+?? transfer_window_writer_stats_test.go

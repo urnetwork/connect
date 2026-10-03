@@ -1,0 +1,107 @@
+{
+  "current_copied_source_race": {
+    "binary_sha256": "e5b25f88825673ef6c82995eb75c83a3f462312444e6973c876dc908c6775910",
+    "race": true,
+    "raw_log_sha256": "606ed7721651cffec68306d7f88ec2af632cf27d5bb59bcea2270e23c62e22c9",
+    "run_context": "captured in process environment under current load; no quiescence wait",
+    "snapshot_file_count": 783,
+    "snapshot_input_sha256": "2fa9ed67f641d71c50524aae5ebb5cc43ffe780a11e88696278d4ff4b1efda3b",
+    "snapshot_tool_sha256": "8a71bb83df2c1458eda48336c9d9da58205e516061bbacd39d09fad8afdcb175",
+    "source_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+    "sources_verified_before_and_after_build_and_run": true,
+    "test_count": 3,
+    "tests": [
+      "TestWindowTcpSocketBatchFitsPhysicalH1",
+      "TestWindowTcpCanceledBatchReturnsShares",
+      "TestWindowTcpWorkloadCancelUnblocksGroupAdmission",
+      "TestTcpSequenceCloseDeliversFlowLifecycleOnce"
+    ]
+  },
+  "discarded_snapshot_setup_attempt": {
+    "classification": "snapshot_setup_failed_before_compile",
+    "compiled": false,
+    "reason": "A temporary verifier incorrectly expected Git metadata inside the intentionally Git-free copy.",
+    "source_or_production_mutation": false,
+    "tested": false
+  },
+  "frozen_handoff_sha256": "aa0d4c362cd456c765a436da52cab75adc79e163d4845ae839ef52c4549d81ac",
+  "frozen_handoff_status": "frozen; no shared source mutations by debugger",
+  "frozen_ownership_scope": {
+    "generic_nat": "fresh DefaultLocalUserNatSettings, existing48MiB ReturnQueueBudget; socket dial redirected only to owned loopback origin; no other profile change",
+    "join": "caller cancels workload context; cleanup closes owned origin sockets/listener, NAT and gVisor TUN, joins workload workers and NAT children, then reconciles replay budget; physical fixture also closes/joins PlatformTransport and Client trees, joins relay workers, closes ClientStrategies/server, checks everyTransfer andcarrierbudget plus pooled-root integrity",
+    "relay": "per direction hard512-message/2MiB queue including added propagation; reader/writer each own at most one additional8KiB message; 8KiB WebSocket cap remains active; no loss on reliable backpressure",
+    "sdk_nat": "only physical smoke supplies fresh DefaultProviderLocalUserNatSettingsWithMemoryTarget(DeviceTarget/5), matching SDK4/20 provider share; process32MiB gives4MiB replay pool; no48MiB override",
+    "sendWindowTcpPackets": "borrows each packet; creates a MessagePoolShareReadOnly frame share; admitted group owns shares until its sequence completes or closes; rejected group returns shares; caller retains and returns original packets; Ctx(ctx) binds waiting to workload cancellation"
+  },
+  "frozen_regression_manifest_sha256": "7769215819bdb16b946607bae0342ed97fe045b72e94e9e2a89db2c80bcff37e",
+  "frozen_regression_runs": [
+    {
+      "binary_sha256": "bcb55ef6f8a4824b9e34fe882cf4c242d1ddf30f58bc7785a928c04c2610a69a",
+      "compile_exit": 0,
+      "id": "raw-before",
+      "test_exit": 1
+    },
+    {
+      "binary_sha256": "df2e478dbfd6d16c830b75d2150b1680a9d0d543c4e11d857cc68810bd0428e0",
+      "compile_exit": 0,
+      "id": "cancel-before",
+      "test_exit": 1
+    },
+    {
+      "binary_sha256": "862878f7fe775eb354e78b5965f5ee560afb42d223b8fe8e19699befdaaf2336",
+      "compile_exit": 0,
+      "id": "grouped-after-race",
+      "test_exit": 0
+    }
+  ],
+  "frozen_relay_and_profile_scope": {
+    "ack_reserve": "provider0 / device8, matching pinned SDK constructor asymmetry",
+    "cell": "100Mb/s per direction finite relay,300us added RTT,10ms Transfer ACK compression,one download flow,2.5s warmup and5s measure per A/B/A arm",
+    "physical": "real PlatformTransport H1 client readers/writers over owned loopback TLS WebSockets, actual kernel loopback TCP origin, userspace gVisor TUN",
+    "profiles": "captured sdk-provider-h1 plus sdk-device-h1 Providing=true;32MiB process,24MiB owner; distinct endpoint pools/carrier owners"
+  },
+  "frozen_source_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+  "guarded_file_hashes": [
+    {
+      "name": "transfer_window_tcp_performance_test.go",
+      "original_shared_sha256": "f93a239d8836dc42a47988a3d6ad3370ef0be13776332e02e55463b42c451de8",
+      "proposed_sha256": "3e5e2aab599e5d59139d47eb8d7fd1659edf9f32acde4cfd4b4727cc055a33db"
+    },
+    {
+      "name": "transfer_window_tcp_h1_group_test.go",
+      "original_shared_sha256": null,
+      "proposed_sha256": "a76e1373820afe6c571f2479306a73ff50c42a46f3483bb41f2003c612aca5b7"
+    },
+    {
+      "name": "transfer_window_h1_physical_test.go",
+      "original_shared_sha256": null,
+      "proposed_sha256": "f6b89c1adaeaba9de463b6e42af0276d69ace98ff37e4c41037ea7dc9ac12231"
+    }
+  ],
+  "invalid_reused_snapshot_attempt": {
+    "binary_sha256": "7f674b01e85c9ca9b246f46269619cfb2fedd9573f3eea35775fc3578d026872",
+    "classification": "invalid_source_snapshot_not_validation_evidence",
+    "outcomes_observed": 12,
+    "outcomes_passed": 12,
+    "raw_log_sha256": "606ed7721651cffec68306d7f88ec2af632cf27d5bb59bcea2270e23c62e22c9",
+    "reason": "A generated Python bytecode entry existed in the copied input set, so source-snapshot verification failed before and after the run. The results are retained but excluded from acceptance.",
+    "source_or_production_mutation": false
+  },
+  "omitted": "Raw logs, source files, overlay files, binaries, commands, local paths, and diagnostic traces are not copied.",
+  "ordinary_collector_smoke": {
+    "archive_id": "physical-h1-smoke",
+    "binary_sha256": "a4d95e754f40a2ffca476482a52f1003bb11b9d59c2fc4ab32979ffb993a2077",
+    "comparison_count": 1,
+    "ledger_sha256": "729d08a606a05f54a21a5da980fdfcb3f9905743633dd2807b5b70d68e8bd79f",
+    "manifest_sha256": "e08500a0ac9c3105243a0e67519b20e847681edae185e12caae0046c07857984",
+    "raw_log_sha256": "cdcee56d78922c6f7c58cb2c8c8e1a019997da215e1a0f531904a8dad54380b2",
+    "rows": 4,
+    "runner_sha256": "b4825593f93dea132e1739842c5264f0eefedb0ff634a4aa1958f5fa6c0f590b",
+    "snapshot_input_sha256": "52b225b89e667db5cff9b4f1ff16e2f6fbf880a58e1956da3710dcea2132f1c6",
+    "source_inspection_uses_build_snapshot": true,
+    "source_sha256": "b6abfa4edec7ef3da125a9431a5231d8d7125c9f76072e4bdd8f375f03a8f8b4",
+    "sources_stable_during_build": true,
+    "top_level_passed": 1
+  },
+  "schema": "throughput-fix-2/physical-h1-fixture-evidence-provenance-v1"
+}

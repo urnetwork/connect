@@ -1,0 +1,15 @@
+{"classification":"default-pacer-precondition-failure-before","duration":"0.04s","outcome":"FAIL","source_log":"virtual-current-v3.log","test":"TestSingleReliableLaneQueueInflatedRttDoesNotStorm"}
+{"classification":"default-pacer-precondition-failure-before","duration":"0.02s","outcome":"FAIL","source_log":"virtual-current-v3.log","test":"TestSingleReliableLaneQueueInflatedRttDoesNotStorm"}
+{"classification":"default-pacer-precondition-failure-before","duration":"0.03s","outcome":"FAIL","source_log":"virtual-current-v3.log","test":"TestSingleReliableLaneQueueInflatedRttDoesNotStorm"}
+{"classification":"constant-window-forced-storm-control","duration":"0.10s","outcome":"PASS","source_log":"virtual-constant-v3.log","test":"TestSingleReliableLaneQueueInflatedRttDoesNotStorm"}
+{"classification":"constant-window-forced-storm-control","duration":"0.09s","outcome":"PASS","source_log":"virtual-constant-v3.log","test":"TestSingleReliableLaneQueueInflatedRttDoesNotStorm"}
+{"classification":"constant-window-forced-storm-control","duration":"0.08s","outcome":"PASS","source_log":"virtual-constant-v3.log","test":"TestSingleReliableLaneQueueInflatedRttDoesNotStorm"}
+{"classification":"final-race-fixture-and-default-pacer-controls","duration":"0.06s","outcome":"PASS","source_log":"final.log","test":"TestSingleReliableLaneQueueInflatedRttDoesNotStorm"}
+{"classification":"final-race-fixture-and-default-pacer-controls","duration":"0.03s","outcome":"PASS","source_log":"final.log","test":"TestWindowPacingPreventsReliableLaneQueueStorm"}
+{"classification":"final-race-fixture-and-default-pacer-controls","duration":"0.00s","outcome":"PASS","source_log":"final.log","test":"TestDefaultSendBufferSettingsDeferTimeoutResendWhileProgressing"}
+{"classification":"final-race-fixture-and-default-pacer-controls","duration":"0.06s","outcome":"PASS","source_log":"final.log","test":"TestSingleReliableLaneQueueInflatedRttDoesNotStorm"}
+{"classification":"final-race-fixture-and-default-pacer-controls","duration":"0.03s","outcome":"PASS","source_log":"final.log","test":"TestWindowPacingPreventsReliableLaneQueueStorm"}
+{"classification":"final-race-fixture-and-default-pacer-controls","duration":"0.00s","outcome":"PASS","source_log":"final.log","test":"TestDefaultSendBufferSettingsDeferTimeoutResendWhileProgressing"}
+{"classification":"final-race-fixture-and-default-pacer-controls","duration":"0.06s","outcome":"PASS","source_log":"final.log","test":"TestSingleReliableLaneQueueInflatedRttDoesNotStorm"}
+{"classification":"final-race-fixture-and-default-pacer-controls","duration":"0.03s","outcome":"PASS","source_log":"final.log","test":"TestWindowPacingPreventsReliableLaneQueueStorm"}
+{"classification":"final-race-fixture-and-default-pacer-controls","duration":"0.00s","outcome":"PASS","source_log":"final.log","test":"TestDefaultSendBufferSettingsDeferTimeoutResendWhileProgressing"}

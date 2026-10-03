@@ -1,0 +1,45 @@
+=== RUN   TestWindowPathServiceLargeMessageCapacityChanges
+--- PASS: TestWindowPathServiceLargeMessageCapacityChanges (0.34s)
+=== RUN   TestWindowPathWindowMismatchMatrix
+--- PASS: TestWindowPathWindowMismatchMatrix (361.02s)
+=== RUN   TestWindowPathWindowMismatchChanges
+--- PASS: TestWindowPathWindowMismatchChanges (2.60s)
+=== RUN   TestWindowPathServiceSettledLargeMessageCapacityChanges
+--- PASS: TestWindowPathServiceSettledLargeMessageCapacityChanges (0.60s)
+=== RUN   TestWindowPathServiceCapacityIncreaseRecovery
+--- PASS: TestWindowPathServiceCapacityIncreaseRecovery (0.08s)
+=== RUN   TestWindowPathServiceLongCompressedFeedback
+--- PASS: TestWindowPathServiceLongCompressedFeedback (0.56s)
+=== RUN   TestWindowPathServiceAcrossRepeatedDrains
+--- PASS: TestWindowPathServiceAcrossRepeatedDrains (18.44s)
+=== RUN   TestWindowPathServiceDelayedPacingWake
+--- PASS: TestWindowPathServiceDelayedPacingWake (7.41s)
+=== RUN   TestWindowPathFifoSeparatesQueueAndPropagation
+--- PASS: TestWindowPathFifoSeparatesQueueAndPropagation (0.00s)
+=== RUN   TestWindowCompressionResidenceRestoresShortPathCapacity
+--- PASS: TestWindowCompressionResidenceRestoresShortPathCapacity (0.29s)
+=== RUN   TestWindowPathDeterministicPerformanceMatrix
+--- PASS: TestWindowPathDeterministicPerformanceMatrix (323.75s)
+=== RUN   TestWindowPathBoundsBurstsAtFiniteRelay
+--- PASS: TestWindowPathBoundsBurstsAtFiniteRelay (11.81s)
+=== RUN   TestWindowPathSlowLinkKeepsCapacity
+--- PASS: TestWindowPathSlowLinkKeepsCapacity (1.54s)
+=== RUN   TestWindowPathFifoCombinedServiceAndPropagationChange
+--- PASS: TestWindowPathFifoCombinedServiceAndPropagationChange (0.00s)
+=== RUN   TestWindowPathGapDeadline
+--- PASS: TestWindowPathGapDeadline (0.00s)
+=== RUN   TestWindowPathFifoServiceChange
+--- PASS: TestWindowPathFifoServiceChange (0.00s)
+=== RUN   TestWindowPathServicePerformanceMatrix
+--- PASS: TestWindowPathServicePerformanceMatrix (14.62s)
+=== RUN   TestWindowPathServiceCapacityChanges
+--- PASS: TestWindowPathServiceCapacityChanges (7.19s)
+=== RUN   TestWindowPathServiceLargeMessages
+--- PASS: TestWindowPathServiceLargeMessages (5.80s)
+=== RUN   TestWindowPathServicesShareFiniteRelay
+--- FAIL: TestWindowPathServicesShareFiniteRelay (9.43s)
+=== RUN   TestWindowPathServiceRoundTripChanges
+--- PASS: TestWindowPathServiceRoundTripChanges (50.72s)
+=== RUN   TestWindowPathFifoPropagationChangePreservesOldFrames
+--- PASS: TestWindowPathFifoPropagationChangePreservesOldFrames (0.00s)
+FAIL

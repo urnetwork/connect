@@ -1,0 +1,139 @@
+// A cumulative head reports its own original ingress time. Relayed H1 paths
+// can deliver that head before a hole, so its wait cannot time every byte that
+// is released with it. The physical inputs fit both carrier and flight limits.
+package connect
+
+import (
+	"testing"
+	"time"
+)
+
+// A 200 kB/s shared serializer sends a 100-byte head before its earlier
+// 7,900-byte sequence item on a different route. The receive sequence retains
+// the head until the hole arrives, then reports the head's original timestamp.
+// A delayed selective reply can reach the sender after the cumulative reply.
+func windowReceiverPrefixIngress(t *testing.T, reordered, selectiveFirst bool) {
+	t.Helper()
+	const physicalRate ByteCount = 200000
+	sequence, start := newWindowCumulativePacingFixture(t)
+	sequence.client = &Client{feedbackTimeBase: start}
+	service := sequence.windowPacer.service
+	sequence.windowPacer.serviceSequenceId = sequence.sequenceId
+	t.Cleanup(sequence.windowPacer.close)
+	fixture := &windowReceiverCreditFixture{sequence: sequence, service: service, ackWindow: newSequenceAckWindow(), compression: 50 * time.Millisecond}
+	window := sequence.sendWindowEstimate(start).Window
+	if window < 9000 {
+		t.Fatal("the three physical items exceed initial permission")
+	}
+	routes := [2]Route{make(Route), make(Route)}
+	write := func(number uint64, bytes ByteCount, route Route) *sendItem {
+		if bytes > 8000 || sequence.windowPacer.serviceSent-sequence.windowPacer.serviceAcked+bytes > window {
+			t.Fatal("fixture bypassed a frame or flight bound")
+		}
+		item := fixture.offer(number, bytes, start)
+		sequence.finishReceiverRttWrite(item, transferWriteDisposition{route: route, transportType: TransportTypeH1, reliable: true}, nil)
+		service.finishWrite(sequence.sequenceId, item.messageId, true)
+		return item
+	}
+	first := write(0, 1000, routes[0])
+	hole := write(1, 7900, routes[0])
+	headRoute := routes[0]
+	if reordered {
+		headRoute = routes[1]
+	}
+	head := write(2, 100, headRoute)
+	firstIngress := start.Add(100 * time.Millisecond)
+	headIngress := firstIngress.Add(40 * time.Millisecond)
+	holeIngress := headIngress.Add(-500 * time.Microsecond)
+	if reordered {
+		headIngress = firstIngress.Add(500 * time.Microsecond)
+		holeIngress = firstIngress.Add(40 * time.Millisecond)
+	}
+	suffixEnd := headIngress
+	if holeIngress.After(suffixEnd) {
+		suffixEnd = holeIngress
+	}
+	if time.Duration(8000)*time.Second/time.Duration(physicalRate) != suffixEnd.Sub(firstIngress) {
+		t.Fatal("the independently serialized suffix changed physical rate")
+	}
+	sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(first, firstIngress, 0))
+	sackAt := firstIngress.Add(10 * time.Millisecond)
+	if selectiveFirst {
+		sack := fixture.ack(head, sackAt, sackAt.Sub(headIngress))
+		sack.selective = true
+		sequence.coalesceReceivedAck(fixture.ackWindow, sack)
+	}
+	// The hole releases the head after 140 ms. Ten more milliseconds of
+	// ACK waiting belongs to the original head ingress, including its wait
+	// behind the hole, exactly as ReceiveSequence.flushDeliver records it.
+	ackAt := firstIngress.Add(50 * time.Millisecond)
+	sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(head, ackAt, ackAt.Sub(headIngress)))
+	if !selectiveFirst && reordered {
+		lateSack := fixture.ack(head, ackAt.Add(time.Millisecond), ackAt.Add(time.Millisecond).Sub(headIngress))
+		lateSack.selective = true
+		sequence.coalesceReceivedAck(fixture.ackWindow, lateSack)
+	}
+	if service.total != 9000 || sequence.windowPacer.serviceAcked != 9000 || !service.drained || !hole.serviceCreditObserved {
+		t.Fatal("cumulative/selective ordering changed exact physical credit")
+	}
+	rate, _, latest := service.measured(time.Second, ackAt.Add(time.Millisecond))
+	if max(rate, latest) > physicalRate {
+		t.Errorf("one early head retimed its later prefix: reordered=%t selective_first=%t service=%d/%d physical=%d", reordered, selectiveFirst, rate, latest, physicalRate)
+	}
+}
+
+// A delayed SACK leaves the cumulative head newly credited. Its own early
+// timestamp cannot certify serialization of a prefix received after it.
+func TestWindowPacingReceiverEarlyIngressHeadCannotRetimePrefix(t *testing.T) {
+	windowReceiverPrefixIngress(t, true, false)
+}
+
+// A first selective credit consumes the head's timing before the later hole
+// is credited; the cumulative prefix must retain its unambiguous raw clock.
+func TestWindowPacingReceiverEarlyIngressSackKeepsPrefixRaw(t *testing.T) {
+	windowReceiverPrefixIngress(t, true, true)
+}
+
+// In-order delivery on the same route permits the final head to enclose the
+// whole suffix. No negative control may discard or duplicate those bytes.
+func TestWindowPacingReceiverOrderedIngressPrefixControl(t *testing.T) {
+	windowReceiverPrefixIngress(t, false, false)
+}
+
+// With no removed receiver interval, a cumulative head retains the raw clock
+// regardless of how many legal envelopes its prefix newly acknowledges.
+func TestWindowPacingReceiverPrefixZeroWaitKeepsRawClock(t *testing.T) {
+	start := time.Unix(1700000000, 0)
+	fixture := newWindowReceiverCreditFixture(t, nil, start, 50*time.Millisecond)
+	first := fixture.write(0, 1000, start)
+	fixture.write(1, 7900, start)
+	head := fixture.write(2, 100, start)
+	fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(first, start.Add(100*time.Millisecond), 0))
+	at := start.Add(140 * time.Millisecond)
+	fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(head, at, 0))
+	if rate := fixture.measured(at); rate > 200000 || fixture.service.total != 9000 {
+		t.Fatalf("zero wait changed raw prefix rate or ownership: service=%d total=%d", rate, fixture.service.total)
+	}
+}
+
+// A prior SACK has already credited the entire prefix. The remaining head's
+// own wait still exposes its independently serialized one-millisecond step.
+func TestWindowPacingReceiverSackedPrefixKeepsNewHeadTiming(t *testing.T) {
+	start := time.Unix(1700000000, 0)
+	fixture := newWindowReceiverCreditFixture(t, nil, start, 50*time.Millisecond)
+	first := fixture.write(0, 4000, start)
+	head := fixture.write(1, 4000, start)
+	sack := fixture.ack(first, start.Add(100*time.Millisecond), 0)
+	sack.selective = true
+	fixture.sequence.coalesceReceivedAck(fixture.ackWindow, sack)
+	at := start.Add(150 * time.Millisecond)
+	fixture.sequence.coalesceReceivedAck(fixture.ackWindow, fixture.ack(head, at, 49*time.Millisecond))
+	rate := fixture.measured(at)
+	if rate < 3600000 || rate > 4000000 || fixture.service.total != 8000 {
+		t.Fatalf("old selective credit removed the new head's own timing: service=%d total=%d", rate, fixture.service.total)
+	}
+	fixture.sequence.coalesceReceivedAck(fixture.ackWindow, sack)
+	if fixture.service.total != 8000 {
+		t.Fatal("late old selective credit was counted twice")
+	}
+}

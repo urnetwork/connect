@@ -1,0 +1,13 @@
+{
+  "archive": "physical-window-policy-gate-contract-v1",
+  "payload_sha256": {
+    "duplex-policy-gate.patch": "c8625a3a5e3cbea600959dc8c6a630331ad51a5fcd87234ad8d9f3f60af5bb51",
+    "outcomes.jsonl": "c5f645d447d3f6da3e346ccf1c64fd143da3a47cecc00945f0704eb983eec4aa",
+    "provenance.json": "8041c432af19bb8e5f34f60ae1124b1b16e710ea7660a0b780aecbf540136d3d",
+    "smoke-policy-gate.patch": "9bbbf1c96d70806c25d1c28a9fd5f1d8165ff57759579d77477b9a758c38de15",
+    "source-manifest-after.json": "24cd227d230747115983b5d952abe6166831825e0f02436bfafd49baf83cdadc",
+    "source-manifest-before.json": "8e0697751fb02f6f0fd4954ddc8d2d376d302d98a7105a60bea17d84e491b56e",
+    "source-pins.json": "b8b3d1b7ebb16ae053d52d510fcafabf1bb2291c1f5bc480cf801ce631ee8d5e",
+    "status.json": "50275db08d053d4c94cec79a4ad6788a3ac4184228fb532decfd284fcad16742"
+  }
+}

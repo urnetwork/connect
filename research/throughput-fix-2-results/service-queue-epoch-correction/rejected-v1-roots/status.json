@@ -1,0 +1,38 @@
+{
+  "manifest_sha256": "7c9a9284d2948788fe72002b71416f127e5ebe26b0eab2dcac156308f2f6bbe6",
+  "binary_sha256": "ba8eaf78ef5133e8730f898b70ca3c8140a25f1615ed59e285ee80f086661217",
+  "effective_inputs_sha256": "d38220518d2b1c6fe559824d78b53d2564bf686ceb010c96dd77711547eeb532",
+  "argv": [
+    "/private/tmp/throughput-fix-2-queue-epoch-after-pinned/tests.test",
+    "-test.v",
+    "-test.run",
+    "^TestWindowPacing(FirstQueuedTimingAfterEpochKeepsProvenance|PostDrainFirstBytesKeepQueueProvenance|ColdQueuedTimingDoesNotInventDelivery|AbandonedDrainCannotResetLaterService)",
+    "-test.count=3",
+    "-test.timeout=90s"
+  ],
+  "started_utc": "2026-09-16T17:44:40.716942+00:00",
+  "loadavg_start": [
+    12.25927734375,
+    13.3173828125,
+    13.64404296875
+  ],
+  "no_quiescence_wait": true,
+  "run_context": "concurrent retained-window implementation and local host load; no quiescence wait",
+  "sources_stable_before": true,
+  "exit_status": 1,
+  "elapsed_seconds": 0.07820679200813174,
+  "loadavg_end": [
+    12.25927734375,
+    13.3173828125,
+    13.64404296875
+  ],
+  "ended_utc": "2026-09-16T17:44:40.795721+00:00",
+  "sources_stable_after": true,
+  "raw_log_sha256": "17bad1204c4512698a2b2203e99a2b34f22a0d33217553f0972d7a2dff42bbc0",
+  "pass": 9,
+  "fail": 3,
+  "skip": 0,
+  "race_warnings": 0,
+  "exit_code": 1,
+  "rows": 12
+}

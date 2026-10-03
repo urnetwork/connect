@@ -1,0 +1,9 @@
+{
+  "archive": "lifetime-owner-final",
+  "payload_sha256": {
+    "outcomes.jsonl": "460615b3c00995ba1033b67a28529b63e41a8077ca92a42f5025bdbfaa1bf36d",
+    "provenance.json": "99b7699708d511d169961285fa136acf25de60331ac5972a2ac040bb1989f152",
+    "source-pins.json": "dd2dcf42c9076135b246e513f998bf4c340094a901aba7b8941d0f16b5c1a4ec",
+    "status.json": "cf51b03656713a5ab84270aaf224a4083c067d2e64c445f38bd0570fa2bf4d52"
+  }
+}

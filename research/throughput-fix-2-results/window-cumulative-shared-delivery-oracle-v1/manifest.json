@@ -1,0 +1,15 @@
+{
+  "archive": "window-cumulative-shared-delivery-oracle-v1",
+  "payload_sha256": {
+    "cold-consumer.patch": "8db4fb47da137968b0d9ef6120512bf80720edc2853fdc328d43e598a200b083",
+    "ledger.jsonl": "cbba3ed874e1f6069334b7c323a208116e5a468447c6c29af06214f12125912b",
+    "outcomes.jsonl": "b0ddf74d5a887c69b955c7629711535a5ab25d3900ce61499def8d15ed9b4074",
+    "policy-source-original.txt": "9360e0a838586fb35798874a879b988d74caa2bd3438add4be02a1e7095ac502",
+    "provenance.json": "ffa287ddd8eda47e5c8ed90186f59ad1ac93de47520a65af01a9defd7e3bc94d",
+    "root-source.txt": "d4d50030910391cf7fa8a33960a9548afdfa076fe444f29964ca32a28ce94ca9",
+    "source-manifest-after.json": "e6c00594cc2527496b23128f324ff4f7afec98ec7cf4de12a09c647735d14500",
+    "source-manifest-before.json": "ecdfb4730b0b4ecf858618a5fe711590e8cd6e210c008c597451ebfed1a39cac",
+    "source-pins.json": "d196fd5a2cde32ea1a65d4a1dc6a023574e8c86926e109b7dd33ba06eb4058ef",
+    "status.json": "bd4e8e3ec8d9bb7b46863eeee0a72ae3f11558f314fae785649f16d2e16a6117"
+  }
+}

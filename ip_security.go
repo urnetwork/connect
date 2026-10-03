@@ -16,8 +16,8 @@ import (
 	// "time"
 	// "net/netip"
 
-	// "github.com/google/gopacket"
-	// "github.com/google/gopacket/layers"
+	// "github.com/gopacket/gopacket"
+	// "github.com/gopacket/gopacket/layers"
 
 	"maps"
 
@@ -81,6 +81,31 @@ type borrowedEgressSecurityPolicy interface {
 	) (SecurityPolicyResult, error)
 }
 
+// borrowedSenderEgressSecurityPolicy carries the authenticated peer sender id
+// into provider-side stateful inspection. Custom policies retain the public
+// sender-agnostic fallback.
+type borrowedSenderEgressSecurityPolicy interface {
+	inspectAndRefreshEgressForSenderBorrowed(
+		senderClientId Id,
+		provideMode protocol.ProvideMode,
+		ipPath IpPath,
+		payload []byte,
+	) (SecurityPolicyResult, error)
+}
+
+// borrowedEgressGroupSecurityPolicy makes one policy decision for an ordered,
+// homogeneous directional-flow group. Implementations may inspect every
+// payload internally, but endpoint policy, statistics, and activity refresh
+// happen once for the group. The paths, their address slices, and the payloads
+// are borrowed for the duration of the call.
+type borrowedEgressGroupSecurityPolicy interface {
+	inspectAndRefreshEgressGroupBorrowed(
+		provideMode protocol.ProvideMode,
+		ipPaths []IpPath,
+		payloads [][]byte,
+	) (SecurityPolicyResult, error)
+}
+
 func inspectAndRefreshEgressBorrowed(
 	policy SecurityPolicy,
 	provideMode protocol.ProvideMode,
@@ -91,6 +116,149 @@ func inspectAndRefreshEgressBorrowed(
 		return borrowed.inspectAndRefreshEgressBorrowed(provideMode, ipPath, payload)
 	}
 	return inspectAndRefreshEgressFallback(policy, provideMode, ipPath, payload)
+}
+
+func inspectAndRefreshEgressForSenderBorrowed(
+	policy SecurityPolicy,
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	if borrowed, ok := policy.(borrowedSenderEgressSecurityPolicy); ok {
+		return borrowed.inspectAndRefreshEgressForSenderBorrowed(
+			senderClientId,
+			provideMode,
+			ipPath,
+			payload,
+		)
+	}
+	return inspectAndRefreshEgressBorrowed(policy, provideMode, ipPath, payload)
+}
+
+// detailedEgressSecurityPolicy is the in-package form of InspectEgress that also
+// names the deciding rule and whether this packet decided its flow. The client
+// uses it to fail fast on the first Drop of a flow. Custom policies do not
+// implement it and keep today's behavior (no reason, never decided now).
+type detailedEgressSecurityPolicy interface {
+	inspectEgressDetailed(
+		provideMode protocol.ProvideMode,
+		ipPath *IpPath,
+		payload []byte,
+	) (SecurityPolicyResult, securityDecision, error)
+	inspectAndRefreshEgressGroupDetailedBorrowed(
+		provideMode protocol.ProvideMode,
+		ipPaths []IpPath,
+		payloads [][]byte,
+	) (SecurityPolicyResult, securityDecision, error)
+}
+
+func inspectEgressDetailed(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	payload []byte,
+) (SecurityPolicyResult, securityDecision, error) {
+	if detailed, ok := policy.(detailedEgressSecurityPolicy); ok {
+		return detailed.inspectEgressDetailed(provideMode, ipPath, payload)
+	}
+	result, err := policy.InspectEgress(provideMode, ipPath, payload)
+	return result, securityDecision{}, err
+}
+
+func inspectAndRefreshEgressGroupDetailedBorrowed(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	payloads [][]byte,
+) (SecurityPolicyResult, securityDecision, error) {
+	if detailed, ok := policy.(detailedEgressSecurityPolicy); ok && 0 < len(ipPaths) && len(ipPaths) == len(payloads) {
+		return detailed.inspectAndRefreshEgressGroupDetailedBorrowed(provideMode, ipPaths, payloads)
+	}
+	result, err := inspectAndRefreshEgressGroupBorrowed(policy, provideMode, ipPaths, payloads)
+	return result, securityDecision{}, err
+}
+
+// Makes one conservative decision for a homogeneous packet group. Custom
+// policies retain their existing per-packet inspection API, so the fallback
+// calls it in order and folds the results before refreshing the flow once.
+func inspectAndRefreshEgressGroupBorrowed(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	payloads [][]byte,
+) (SecurityPolicyResult, error) {
+	if len(ipPaths) == 0 || len(ipPaths) != len(payloads) {
+		return SecurityPolicyResultIncident, fmt.Errorf(
+			"invalid security policy group cardinality paths=%d payloads=%d",
+			len(ipPaths),
+			len(payloads),
+		)
+	}
+	if borrowed, ok := policy.(borrowedEgressGroupSecurityPolicy); ok {
+		return borrowed.inspectAndRefreshEgressGroupBorrowed(
+			provideMode,
+			ipPaths,
+			payloads,
+		)
+	}
+	return inspectAndRefreshEgressGroupFallback(
+		policy,
+		provideMode,
+		ipPaths,
+		payloads,
+	)
+}
+
+// Keep custom pointer calls outside the built-in dispatcher so their path
+// copies may escape without forcing the built-in group metadata to escape.
+//
+//go:noinline
+func inspectAndRefreshEgressGroupFallback(
+	policy SecurityPolicy,
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	payloads [][]byte,
+) (SecurityPolicyResult, error) {
+	groupResult := SecurityPolicyResultAllow
+	for packetIndex := range ipPaths {
+		ipPath := ipPaths[packetIndex]
+		result, err := policy.InspectEgress(
+			provideMode,
+			&ipPath,
+			payloads[packetIndex],
+		)
+		if err != nil {
+			return result, err
+		}
+		groupResult = conservativeSecurityPolicyResult(groupResult, result)
+	}
+	refreshPath := ipPaths[0]
+	policy.RefreshEgress(&refreshPath)
+	return groupResult, nil
+}
+
+// Incidents are never overridable, and a drop in any group member prevents
+// the group from reaching a provider. Unknown results are incident-class.
+func conservativeSecurityPolicyResult(
+	groupResult SecurityPolicyResult,
+	memberResult SecurityPolicyResult,
+) SecurityPolicyResult {
+	if groupResult != SecurityPolicyResultAllow &&
+		groupResult != SecurityPolicyResultDrop {
+		return SecurityPolicyResultIncident
+	}
+	switch memberResult {
+	case SecurityPolicyResultAllow:
+		return groupResult
+	case SecurityPolicyResultDrop:
+		if groupResult == SecurityPolicyResultAllow {
+			return SecurityPolicyResultDrop
+		}
+		return groupResult
+	default:
+		return SecurityPolicyResultIncident
+	}
 }
 
 // Keep the address-taking fallback in a separate non-inlined function. Escape
@@ -127,6 +295,17 @@ type borrowedIngressSecurityPolicy interface {
 	) (SecurityPolicyResult, error)
 }
 
+// borrowedSenderIngressSecurityPolicy is the provider receive-side counterpart
+// to borrowedSenderEgressSecurityPolicy.
+type borrowedSenderIngressSecurityPolicy interface {
+	inspectAndRefreshIngressForSenderBorrowed(
+		senderClientId Id,
+		provideMode protocol.ProvideMode,
+		ipPath IpPath,
+		payload []byte,
+	) (SecurityPolicyResult, error)
+}
+
 func inspectAndRefreshIngressBorrowed(
 	policy SecurityPolicy,
 	provideMode protocol.ProvideMode,
@@ -137,6 +316,49 @@ func inspectAndRefreshIngressBorrowed(
 		return borrowed.inspectAndRefreshIngressBorrowed(provideMode, ipPath, payload)
 	}
 	return inspectAndRefreshIngressFallback(policy, provideMode, ipPath, payload)
+}
+
+func inspectAndRefreshIngressForSenderBorrowed(
+	policy SecurityPolicy,
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	if borrowed, ok := policy.(borrowedSenderIngressSecurityPolicy); ok {
+		return borrowed.inspectAndRefreshIngressForSenderBorrowed(
+			senderClientId,
+			provideMode,
+			ipPath,
+			payload,
+		)
+	}
+	return inspectAndRefreshIngressBorrowed(policy, provideMode, ipPath, payload)
+}
+
+// senderFlowSecurityPolicy exposes lifecycle retirement only to in-package
+// provider plumbing. The public SecurityPolicy contract remains compatible with
+// custom implementations.
+type senderFlowSecurityPolicy interface {
+	retireEgressFlowForSender(senderClientId Id, ipPath *IpPath)
+	retireIngressFlowForSender(senderClientId Id, ipPath *IpPath)
+	retireSender(senderClientId Id)
+}
+
+func retireIngressSecurityFlowForSender(
+	policy SecurityPolicy,
+	senderClientId Id,
+	ipPath *IpPath,
+) {
+	if senderPolicy, ok := policy.(senderFlowSecurityPolicy); ok {
+		senderPolicy.retireIngressFlowForSender(senderClientId, ipPath)
+	}
+}
+
+func retireSecuritySender(policy SecurityPolicy, senderClientId Id) {
+	if senderPolicy, ok := policy.(senderFlowSecurityPolicy); ok {
+		senderPolicy.retireSender(senderClientId)
+	}
 }
 
 //go:noinline
@@ -215,11 +437,26 @@ func (self *securityPolicy) Stats() *SecurityPolicyStatsCollector {
 }
 
 func (self *securityPolicy) InspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
-	result, err := self.inspectEgress(provideMode, ipPath, payload)
-	if ipPath != nil {
-		self.stats.AddDestination(ipPath, result, 1)
-	}
+	result, _, err := self.inspectEgressDetailed(provideMode, ipPath, payload)
 	return result, err
+}
+
+// inspectEgressDetailed is InspectEgress plus the verdict reason and whether
+// this packet decided its flow. Statistics are recorded exactly as InspectEgress.
+func (self *securityPolicy) inspectEgressDetailed(
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	payload []byte,
+) (SecurityPolicyResult, securityDecision, error) {
+	if ipPath == nil {
+		if protocol.ProvideMode_Network == provideMode {
+			return SecurityPolicyResultAllow, securityDecision{reason: SecurityPolicyReasonNetwork}, nil
+		}
+		return SecurityPolicyResultIncident, securityDecision{}, fmt.Errorf("missing ip path")
+	}
+	result, decision := self.inspectEgressForSenderDetailed(Id{}, provideMode, ipPath, payload)
+	self.stats.addDestinationReason(ipPath, result, decision.reason, 1)
+	return result, decision, nil
 }
 
 func (self *securityPolicy) inspectAndRefreshEgressBorrowed(
@@ -227,47 +464,144 @@ func (self *securityPolicy) inspectAndRefreshEgressBorrowed(
 	ipPath IpPath,
 	payload []byte,
 ) (SecurityPolicyResult, error) {
-	result, err := self.InspectEgress(provideMode, &ipPath, payload)
-	if err == nil {
-		self.RefreshEgress(&ipPath)
-	}
+	return self.inspectAndRefreshEgressForSenderBorrowed(Id{}, provideMode, ipPath, payload)
+}
+
+func (self *securityPolicy) inspectAndRefreshEgressForSenderBorrowed(
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	result, decision := self.inspectEgressForSenderDetailed(senderClientId, provideMode, &ipPath, payload)
+	self.stats.addDestinationReason(&ipPath, result, decision.reason, 1)
+	self.dmca.touchEgressForSender(senderClientId, &ipPath)
+	return result, nil
+}
+
+func (self *securityPolicy) inspectAndRefreshEgressGroupBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	payloads [][]byte,
+) (SecurityPolicyResult, error) {
+	result, _, err := self.inspectAndRefreshEgressGroupDetailedBorrowed(provideMode, ipPaths, payloads)
 	return result, err
 }
 
+// inspectAndRefreshEgressGroupDetailedBorrowed folds the group conservatively.
+// The reported reason is the one of the member that set the group result (the
+// first member with the most severe result); decidedNow is set when any member
+// moved the flow to its terminal verdict.
+func (self *securityPolicy) inspectAndRefreshEgressGroupDetailedBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	payloads [][]byte,
+) (SecurityPolicyResult, securityDecision, error) {
+	ipPath := &ipPaths[0]
+	result := SecurityPolicyResultAllow
+	decision := securityDecision{reason: SecurityPolicyReasonNetwork}
+	if provideMode != protocol.ProvideMode_Network {
+		if !isPublicUnicast(ipPath.DestinationIp) {
+			result = SecurityPolicyResultIncident
+			decision.reason = SecurityPolicyReasonNotPublic
+		} else {
+			destinationIp, destinationVersion := policyAddress(ipPath.DestinationIp, ipPath.Version)
+			verdict, cfaaReason := self.cfaa.inspectReason(
+				destinationIp,
+				ipPath.DestinationPort,
+				ipPath.Protocol,
+				destinationVersion,
+			)
+			switch verdict {
+			case cfaaDrop:
+				result = SecurityPolicyResultDrop
+				decision.reason = cfaaReason
+			case cfaaAllow:
+				result = SecurityPolicyResultAllow
+				decision.reason = cfaaReason
+			default:
+				for packetIndex := range payloads {
+					v, reason, decidedNow := self.dmca.classifyForSenderDetailed(
+						Id{},
+						&ipPaths[packetIndex],
+						payloads[packetIndex],
+					)
+					memberResult := self.dmca.result(v)
+					groupResult := conservativeSecurityPolicyResult(result, memberResult)
+					if packetIndex == 0 || groupResult != result {
+						decision.reason = reason
+					}
+					result = groupResult
+					decision.decidedNow = decision.decidedNow || decidedNow
+				}
+			}
+		}
+	}
+	self.stats.addDestinationReason(ipPath, result, decision.reason, uint64(len(ipPaths)))
+	self.dmca.touchEgress(ipPath)
+	return result, decision, nil
+}
+
 func (self *securityPolicy) inspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
+	return self.inspectEgressForSender(Id{}, provideMode, ipPath, payload)
+}
+
+func (self *securityPolicy) inspectEgressForSender(
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	result, _ := self.inspectEgressForSenderDetailed(senderClientId, provideMode, ipPath, payload)
+	return result, nil
+}
+
+// inspectEgressForSenderDetailed decides one egress packet and names the rule
+// that decided it. It records no statistics.
+func (self *securityPolicy) inspectEgressForSenderDetailed(
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	payload []byte,
+) (SecurityPolicyResult, securityDecision) {
 	if protocol.ProvideMode_Network == provideMode {
-		return SecurityPolicyResultAllow, nil
+		return SecurityPolicyResultAllow, securityDecision{reason: SecurityPolicyReasonNetwork}
 	}
 
 	// apply public rules:
 	// - only public unicast network destinations
 	// - block insecure or known unencrypted traffic
 	if !isPublicUnicast(ipPath.DestinationIp) {
-		return SecurityPolicyResultIncident, nil
+		return SecurityPolicyResultIncident, securityDecision{reason: SecurityPolicyReasonNotPublic}
 	}
 
-	// static endpoint reputation (blocked ips + port policy) on the destination
-	switch self.cfaa.inspect(ipPath.DestinationIp, ipPath.DestinationPort, ipPath.Protocol, ipPath.Version) {
+	// static endpoint reputation (blocked ips + port policy) on the destination,
+	// with a v4-mapped v6 destination judged as its v4 address
+	destinationIp, destinationVersion := policyAddress(ipPath.DestinationIp, ipPath.Version)
+	switch verdict, cfaaReason := self.cfaa.inspectReason(destinationIp, ipPath.DestinationPort, ipPath.Protocol, destinationVersion); verdict {
 	case cfaaDrop:
-		return SecurityPolicyResultDrop, nil
+		return SecurityPolicyResultDrop, securityDecision{reason: cfaaReason}
 	case cfaaAllow:
-		return SecurityPolicyResultAllow, nil
+		return SecurityPolicyResultAllow, securityDecision{reason: cfaaReason}
 	default:
 		// No static verdict — run stateful payload DPI. Switch on the verdict so
 		// the policy reads explicitly: a positive BitTorrent signature is reported;
 		// a flow that looks fully encrypted is dropped UNLESS it matched a
-		// sanctioned web standard (TLS/QUIC/DTLS/STUN) — that web-standard match is
-		// the fallback that rescues an otherwise-ambiguous encrypted flow.
+		// sanctioned web/communication standard (TLS/QUIC/DTLS/STUN/TURN or
+		// RTP/RTCP), or an exact provider-scoped gaming exception — that positive
+		// match is the fallback that rescues an otherwise-ambiguous encrypted flow.
 		// Enforcement of each verdict honors the detector settings (log-only,
 		// drop/report toggles), applied by result().
-		switch v := self.dmca.classify(ipPath, payload); v {
+		v, reason, decidedNow := self.dmca.classifyForSenderDetailed(senderClientId, ipPath, payload)
+		decision := securityDecision{reason: reason, decidedNow: decidedNow}
+		switch v {
 		case dmcaBittorrent:
-			return self.dmca.result(v), nil
+			return self.dmca.result(v), decision
 		case dmcaDropEncrypted:
-			return self.dmca.result(v), nil
+			return self.dmca.result(v), decision
 		default:
-			// still inspecting, a sanctioned web standard, or benign plaintext
-			return SecurityPolicyResultAllow, nil
+			// still inspecting, a sanctioned standard, or benign plaintext
+			return SecurityPolicyResultAllow, decision
 		}
 	}
 }
@@ -285,9 +619,19 @@ func (self *securityPolicy) inspectAndRefreshIngressBorrowed(
 	ipPath IpPath,
 	payload []byte,
 ) (SecurityPolicyResult, error) {
-	result, err := self.InspectIngress(provideMode, &ipPath, payload)
+	return self.inspectAndRefreshIngressForSenderBorrowed(Id{}, provideMode, ipPath, payload)
+}
+
+func (self *securityPolicy) inspectAndRefreshIngressForSenderBorrowed(
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	result, err := self.inspectIngress(provideMode, &ipPath)
+	self.stats.AddSource(&ipPath, result, 1)
 	if err == nil {
-		self.RefreshIngress(&ipPath)
+		self.dmca.touchIngressForSender(senderClientId, &ipPath)
 	}
 	return result, err
 }
@@ -306,6 +650,21 @@ func (self *securityPolicy) RefreshIngress(ipPath *IpPath) {
 	}
 }
 
+func (self *securityPolicy) retireEgressFlowForSender(senderClientId Id, ipPath *IpPath) {
+	self.dmca.retireEgressForSender(senderClientId, ipPath)
+}
+
+func (self *securityPolicy) retireIngressFlowForSender(senderClientId Id, ipPath *IpPath) {
+	if ipPath == nil {
+		return
+	}
+	self.dmca.retireEgressForSender(senderClientId, ipPath.Reverse())
+}
+
+func (self *securityPolicy) retireSender(senderClientId Id) {
+	self.dmca.removeSender(senderClientId)
+}
+
 func (self *securityPolicy) inspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath) (SecurityPolicyResult, error) {
 	// network-relationship traffic (e.g. same network_id) bypasses the public
 	// rules, mirroring the egress policy. The return path of a network-mode
@@ -316,8 +675,9 @@ func (self *securityPolicy) inspectIngress(provideMode protocol.ProvideMode, ipP
 	}
 
 	// mirror the egress static drops (blocked ips + port policy), evaluated on the
-	// source endpoint
-	if cfaaDrop == self.cfaa.inspect(ipPath.SourceIp, ipPath.SourcePort, ipPath.Protocol, ipPath.Version) {
+	// source endpoint, with a v4-mapped v6 source judged as its v4 address
+	sourceIp, sourceVersion := policyAddress(ipPath.SourceIp, ipPath.Version)
+	if cfaaDrop == self.cfaa.inspect(sourceIp, ipPath.SourcePort, ipPath.Protocol, sourceVersion) {
 		return SecurityPolicyResultDrop, nil
 	}
 	return SecurityPolicyResultAllow, nil
@@ -357,6 +717,23 @@ func (self *disableSecurityPolicy) inspectAndRefreshEgressBorrowed(
 	return SecurityPolicyResultAllow, nil
 }
 
+func (self *disableSecurityPolicy) inspectAndRefreshEgressForSenderBorrowed(
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	return SecurityPolicyResultAllow, nil
+}
+
+func (self *disableSecurityPolicy) inspectAndRefreshEgressGroupBorrowed(
+	provideMode protocol.ProvideMode,
+	ipPaths []IpPath,
+	payloads [][]byte,
+) (SecurityPolicyResult, error) {
+	return SecurityPolicyResultAllow, nil
+}
+
 func (self *disableSecurityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
 	return SecurityPolicyResultAllow, nil
 }
@@ -369,9 +746,26 @@ func (self *disableSecurityPolicy) inspectAndRefreshIngressBorrowed(
 	return SecurityPolicyResultAllow, nil
 }
 
+func (self *disableSecurityPolicy) inspectAndRefreshIngressForSenderBorrowed(
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	return SecurityPolicyResultAllow, nil
+}
+
 func (self *disableSecurityPolicy) RefreshEgress(ipPath *IpPath) {}
 
 func (self *disableSecurityPolicy) RefreshIngress(ipPath *IpPath) {}
+
+func (self *disableSecurityPolicy) retireEgressFlowForSender(senderClientId Id, ipPath *IpPath) {
+}
+
+func (self *disableSecurityPolicy) retireIngressFlowForSender(senderClientId Id, ipPath *IpPath) {
+}
+
+func (self *disableSecurityPolicy) retireSender(senderClientId Id) {}
 
 // reverseSecurityPolicy swaps the egress and ingress directions of an underlying policy — the
 // provider's view of a flow. The remote client's egress (the outbound packet the provider receives
@@ -406,6 +800,21 @@ func (self *reverseSecurityPolicy) inspectAndRefreshEgressBorrowed(
 	return result, err
 }
 
+func (self *reverseSecurityPolicy) inspectAndRefreshEgressForSenderBorrowed(
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	return inspectAndRefreshIngressForSenderBorrowed(
+		self.policy,
+		senderClientId,
+		provideMode,
+		ipPath,
+		payload,
+	)
+}
+
 func (self *reverseSecurityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
 	return self.policy.InspectEgress(provideMode, ipPath, payload)
 }
@@ -418,12 +827,45 @@ func (self *reverseSecurityPolicy) inspectAndRefreshIngressBorrowed(
 	return inspectAndRefreshEgressBorrowed(self.policy, provideMode, ipPath, payload)
 }
 
+func (self *reverseSecurityPolicy) inspectAndRefreshIngressForSenderBorrowed(
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	ipPath IpPath,
+	payload []byte,
+) (SecurityPolicyResult, error) {
+	return inspectAndRefreshEgressForSenderBorrowed(
+		self.policy,
+		senderClientId,
+		provideMode,
+		ipPath,
+		payload,
+	)
+}
+
 func (self *reverseSecurityPolicy) RefreshEgress(ipPath *IpPath) {
 	self.policy.RefreshIngress(ipPath)
 }
 
 func (self *reverseSecurityPolicy) RefreshIngress(ipPath *IpPath) {
 	self.policy.RefreshEgress(ipPath)
+}
+
+func (self *reverseSecurityPolicy) retireEgressFlowForSender(senderClientId Id, ipPath *IpPath) {
+	if senderPolicy, ok := self.policy.(senderFlowSecurityPolicy); ok {
+		senderPolicy.retireIngressFlowForSender(senderClientId, ipPath)
+	}
+}
+
+func (self *reverseSecurityPolicy) retireIngressFlowForSender(senderClientId Id, ipPath *IpPath) {
+	if senderPolicy, ok := self.policy.(senderFlowSecurityPolicy); ok {
+		senderPolicy.retireEgressFlowForSender(senderClientId, ipPath)
+	}
+}
+
+func (self *reverseSecurityPolicy) retireSender(senderClientId Id) {
+	if senderPolicy, ok := self.policy.(senderFlowSecurityPolicy); ok {
+		senderPolicy.retireSender(senderClientId)
+	}
 }
 
 // Testing_FlowCount reports the number of tracked DMCA flows. Test hook: exact flow-table
@@ -441,7 +883,16 @@ func (self *reverseSecurityPolicy) Testing_FlowCount() int {
 	return 0
 }
 
+// isPublicUnicast reports whether an egress destination is on the public
+// internet. An IPv4-mapped v6 address (::ffff:a.b.c.d) is judged as the v4
+// address it carries, so a v6 packet cannot reach private v4 space by
+// wrapping the address; the v6 prefixes that embed or tunnel to v4 (6to4,
+// Teredo, NAT64, IPv4-compatible) and the non-routable v6 ranges are not
+// public either. See IPV6.md C4.
 func isPublicUnicast(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+	}
 	switch {
 	case ip.IsPrivate(),
 		ip.IsLoopback(),
@@ -449,9 +900,70 @@ func isPublicUnicast(ip net.IP) bool {
 		ip.IsMulticast(),
 		ip.IsUnspecified():
 		return false
-	default:
+	}
+	if len(ip) == net.IPv6len && isReservedIpv6(ip) {
+		return false
+	}
+	return true
+}
+
+// isReservedIpv6 lists the v6 prefixes that are never a public unicast
+// egress destination but pass net.IP's own predicates: the ranges that embed
+// a v4 address (6to4 2002::/16, Teredo 2001::/32, NAT64 64:ff9b::/96 and
+// its local-use 64:ff9b:1::/48, the deprecated IPv4-compatible ::/96), the
+// discard-only 100::/64, documentation 2001:db8::/32, the deprecated
+// site-local fec0::/10 and the historical 6bone 3ffe::/16. `ip` must be a
+// 16-byte address that is not v4-mapped.
+func isReservedIpv6(ip net.IP) bool {
+	switch {
+	case ip[0] == 0x20 && ip[1] == 0x02:
+		// 6to4
+		return true
+	case ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00:
+		// teredo
+		return true
+	case ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8:
+		// documentation
+		return true
+	case ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b &&
+		((ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 &&
+			ip[8] == 0 && ip[9] == 0 && ip[10] == 0 && ip[11] == 0) ||
+			(ip[4] == 0 && ip[5] == 1)):
+		// nat64 well-known prefix and its local-use prefix
+		return true
+	case ip[0] == 0x01 && ip[1] == 0x00 &&
+		ip[2] == 0 && ip[3] == 0 && ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0:
+		// discard-only
+		return true
+	case ip[0] == 0xfe && ip[1]&0xc0 == 0xc0:
+		// site-local
+		return true
+	case ip[0] == 0x3f && ip[1] == 0xfe:
+		// 6bone
 		return true
 	}
+	// ipv4-compatible ::a.b.c.d: the first 96 bits zero. :: itself is
+	// unspecified and ::1 loopback, both already excluded by the caller, so
+	// this only matches the deprecated embedded-v4 form.
+	for _, b := range ip[:12] {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// policyAddress is the address a v4-keyed policy table sees for a packet: an
+// IPv4-mapped v6 destination is unwrapped to its v4 address and version so
+// the v4 block tables and port policies apply to it, everything else passes
+// through unchanged.
+func policyAddress(ip net.IP, version int) (net.IP, int) {
+	if version == 6 {
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4, 4
+		}
+	}
+	return ip, version
 }
 
 type SecurityPolicyStats = map[SecurityPolicyResult]map[SecurityDestination]uint64
@@ -551,17 +1063,46 @@ func (self *SecurityDestination) String() string {
 
 // get current counts of outcomes per (protocol, destination port)
 type SecurityPolicyStatsCollector struct {
-	includeIp bool
+	includeIp                bool
+	maxDestinationsPerResult int
 
 	stateLock               sync.Mutex
 	resultDestinationCounts SecurityPolicyStats
+	// verdict reasons, always keyed by port only (see ip_security_reason.go)
+	reasonDestinationCounts SecurityPolicyReasonStats
 }
 
 func DefaultSecurityPolicyStatsCollector() *SecurityPolicyStatsCollector {
 	return &SecurityPolicyStatsCollector{
 		includeIp:               false,
 		resultDestinationCounts: SecurityPolicyStats{},
+		reasonDestinationCounts: SecurityPolicyReasonStats{},
 	}
+}
+
+// maxDestinationsWithLock is the per-key destination bound, including the
+// overflow destination.
+func (self *SecurityPolicyStatsCollector) maxDestinationsWithLock() int {
+	if self.maxDestinationsPerResult <= 0 {
+		return securityPolicyStatsMaxDestinationsPerResult
+	}
+	return self.maxDestinationsPerResult
+}
+
+// boundedDestinationAddWithLock adds count under destination, folding a new
+// destination into the overflow destination once the bound is reached.
+func boundedDestinationAddWithLock(
+	destinationCounts map[SecurityDestination]uint64,
+	destination SecurityDestination,
+	maxDestinations int,
+	count uint64,
+) {
+	if _, ok := destinationCounts[destination]; !ok && maxDestinations <= len(destinationCounts)+1 {
+		// Reserve the final slot for all later destinations. A real IpPath has
+		// version 4 or 6, so the zero destination cannot collide with one.
+		destination = securityPolicyStatsOverflowDestination
+	}
+	destinationCounts[destination] += count
 }
 
 // add records one diagnostic count while bounding every result's destination
@@ -586,19 +1127,72 @@ func (self *SecurityPolicyStatsCollector) add(
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.addResultWithLock(destination, result, count)
+}
 
+func (self *SecurityPolicyStatsCollector) addResultWithLock(
+	destination SecurityDestination,
+	result SecurityPolicyResult,
+	count uint64,
+) {
 	destinationCounts, ok := self.resultDestinationCounts[result]
 	if !ok {
 		destinationCounts = map[SecurityDestination]uint64{}
 		self.resultDestinationCounts[result] = destinationCounts
 	}
-	if _, ok := destinationCounts[destination]; !ok &&
-		securityPolicyStatsMaxDestinationsPerResult <= len(destinationCounts)+1 {
-		// Reserve the final slot for all later destinations. A real IpPath has
-		// version 4 or 6, so the zero destination cannot collide with one.
-		destination = securityPolicyStatsOverflowDestination
+	boundedDestinationAddWithLock(destinationCounts, destination, self.maxDestinationsWithLock(), count)
+}
+
+func (self *SecurityPolicyStatsCollector) addReasonWithLock(
+	portDestination SecurityDestination,
+	reason SecurityPolicyReason,
+	count uint64,
+) {
+	if self.reasonDestinationCounts == nil {
+		// a zero-value collector
+		self.reasonDestinationCounts = SecurityPolicyReasonStats{}
 	}
-	destinationCounts[destination] += count
+	switch {
+	case reason < SecurityPolicyReasonUnknown, securityPolicyReasonEnd <= reason:
+		// out-of-range values share one bucket so they cannot defeat the bound
+		reason = SecurityPolicyReasonUnknown
+	}
+	destinationCounts, ok := self.reasonDestinationCounts[reason]
+	if !ok {
+		destinationCounts = map[SecurityDestination]uint64{}
+		self.reasonDestinationCounts[reason] = destinationCounts
+	}
+	boundedDestinationAddWithLock(destinationCounts, portDestination, self.maxDestinationsWithLock(), count)
+}
+
+// addDestinationReason records an egress result and its reason under one lock.
+// The reason is keyed by destination port only.
+func (self *SecurityPolicyStatsCollector) addDestinationReason(
+	ipPath *IpPath,
+	result SecurityPolicyResult,
+	reason SecurityPolicyReason,
+	count uint64,
+) {
+	if count == 0 {
+		return
+	}
+	portDestination := newSecurityDestinationPort(ipPath)
+	destination := portDestination
+	if self.includeIp {
+		destination = newSecurityDestination(ipPath)
+	}
+	switch result {
+	case SecurityPolicyResultDrop,
+		SecurityPolicyResultAllow,
+		SecurityPolicyResultIncident:
+	default:
+		result = securityPolicyStatsUnknownResult
+	}
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.addResultWithLock(destination, result, count)
+	self.addReasonWithLock(portDestination, reason, count)
 }
 
 func (self *SecurityPolicyStatsCollector) AddDestination(ipPath *IpPath, result SecurityPolicyResult, count uint64) {
@@ -635,4 +1229,20 @@ func (self *SecurityPolicyStatsCollector) Stats(reset bool) SecurityPolicyStats 
 		clear(self.resultDestinationCounts)
 	}
 	return resultDestinationCounts
+}
+
+// Reasons returns the egress verdict-reason counts per destination port and
+// optionally clears them. It is independent of the Stats reset.
+func (self *SecurityPolicyStatsCollector) Reasons(reset bool) SecurityPolicyReasonStats {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	reasonDestinationCounts := SecurityPolicyReasonStats{}
+	for reason, destinationCounts := range self.reasonDestinationCounts {
+		reasonDestinationCounts[reason] = maps.Clone(destinationCounts)
+	}
+	if reset {
+		clear(self.reasonDestinationCounts)
+	}
+	return reasonDestinationCounts
 }
