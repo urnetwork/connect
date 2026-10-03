@@ -1,0 +1,14 @@
+{
+  "name": "openvpn-tcp",
+  "protocol": "openvpn",
+  "provenance": "OpenVPN protocol over TCP: 2-byte packet length prefix, then the same reliability-layer header as UDP",
+  "transport": "tcp",
+  "destination_port": 1194,
+  "payloads": [
+    "00395009d51828836273c36500196b4bb650ea814bde926e837cff4ce5fecc0f1fd0e71f9127e1a45ff78d8ea920a86691637b31e1fb1a705c2247",
+    "00692009d51828836273c322bcba4c06912df0bb830e775d24d880f7594946bbc9e1d2b8add947b14edb969c62569cbbde31ec68625bfd39340ba46cdd98ea3fb9468d0250381e272e524a6cd7aa5847b97df260313da89761e858839f4a9d9a675e6a536200e1327db4c5",
+    "00a92009d51828836273c3443a8f5a12da9e4ab37d424e0102c61ac4d48a77454fd2682dd90c08c3352804e75ace90807be96a7d66f2b49c9b8ab6654e32351820383cd01b62de154fbc73370ffef058f6be8f837ea3df397f44bda2a0b169de8f4e9df3fb680de16dc025c0134870210ae9fa92444aed02eddac95bb9897e883dd83f6c85765e3fec96a1343d12b1799ab2e8b33aa11861e28ef7572727b873fc2c2f0ffcd245876caf94"
+  ],
+  "expect_before": "drop",
+  "expect_after": "allow"
+}

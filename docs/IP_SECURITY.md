@@ -105,11 +105,22 @@ internet:
 protocol, port)` only; `includeIp` additionally keys by IP. `Stats(reset)` returns
 `map[SecurityPolicyResult]map[SecurityDestination]uint64` and optionally clears.
 
+Egress decisions also record a **verdict reason** (`SecurityPolicyReason`,
+`ip_security_reason.go`): the rule that decided the packet (`cfaa-drop-ip`,
+`cfaa-drop-port`, `cfaa-allow`, `bittorrent`, `drop-encrypted`, `inspecting`,
+`allow-privileged`, `allow-gaming`, `allow-web-standard:<kind>`, `allow-rtp`,
+`allow-http`, `allow-plaintext`, `allow-budget`, …). `Reasons(reset)` returns
+`map[SecurityPolicyReason]map[SecurityDestination]uint64`, reset independently of
+`Stats`. Reason counts are **always keyed by `(version, protocol, port)` only**,
+even when `includeIp` is set, share the result table's per-key cardinality bound,
+and are local diagnostics: nothing about them is sent off the device.
+
 ### 2.6 Files
 
 | File | Hand-written? | Role |
 |------|---------------|------|
 | `ip_security.go`             | yes | Interface, results, egress/ingress/disable policies, `isPublicUnicast`, stats. |
+| `ip_security_reason.go`      | yes | Verdict reasons recorded with the egress statistics. |
 | `ip_security_cfaa.go`        | yes | CFAA detector: settings, verdicts, port policy, `cfaaBlockedIp4`/`cfaaBlockedIp6` range lookups. |
 | `ip_security_telegram.go`    | yes | Exact Telegram call-reflector endpoint/port exception. |
 | `ip_security_gaming.go`      | yes | Provider-prefix + transport + documented-remote-port gaming exceptions. |
@@ -531,7 +542,7 @@ provider-prefix + remote-port exception (§4.4.1).
 
 ## 7. Testing
 
-`go test -run 'Cfaa|Dmca|WebStandard|Security' ./` covers both layers:
+`go test -run 'Cfaa|Dmca|WebStandard|Security|Fixture' ./` covers both layers:
 
 - **CFAA:** `TestCfaaPortClassification` (full port table), `TestCfaaBlockedIps` (IP
   precedence), `TestCfaaDisabled`, `TestCfaaIngressMirrorsSourceDrops`,
@@ -549,3 +560,8 @@ provider-prefix + remote-port exception (§4.4.1).
   lifecycle tests in `ip_security_dmca_test.go`; strict STUN/TURN/RTP/RTCP parsing
   in `ip_security_webstandard_test.go`; stateful RTP continuity and near-miss
   enforcement in `ip_security_rtc_test.go`.
+- **Fixtures:** `ip_security_fixture_test.go` replays the packet fixtures in
+  `testdata/ipsecurity/` (synthesized from protocol specifications; see its
+  README) through `InspectEgress` as the multi-client send path does and checks
+  each fixture's expected verdict. Reason attribution and bounds are in
+  `ip_security_reason_test.go`.

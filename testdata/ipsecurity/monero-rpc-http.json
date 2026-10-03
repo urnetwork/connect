@@ -1,0 +1,12 @@
+{
+  "name": "monero-rpc-http",
+  "protocol": "http",
+  "provenance": "Monero wallet RPC over plain HTTP (POST /json_rpc)",
+  "transport": "tcp",
+  "destination_port": 18081,
+  "payloads": [
+    "504f5354202f6a736f6e5f72706320485454502f312e310d0a486f73743a206e6f64652e6578616d706c650d0a436f6e74656e742d547970653a206170706c69636174696f6e2f6a736f6e0d0a436f6e74656e742d4c656e6774683a2034360d0a0d0a7b226a736f6e727063223a22322e30222c226964223a2230222c226d6574686f64223a226765745f696e666f227d"
+  ],
+  "expect_before": "allow",
+  "expect_after": "allow"
+}

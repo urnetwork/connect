@@ -1,0 +1,12 @@
+{
+  "name": "bittorrent-tcp-51413",
+  "protocol": "bittorrent",
+  "provenance": "BEP 3 peer wire handshake",
+  "transport": "tcp",
+  "destination_port": 51413,
+  "payloads": [
+    "13426974546f7272656e742070726f746f636f6c0000000000000000ee7f61776ebbb14f6a30cfb07a38479c55741c9f2d5858303030302d9233c96d2f4929d465784c3f"
+  ],
+  "expect_before": "incident",
+  "expect_after": "incident"
+}

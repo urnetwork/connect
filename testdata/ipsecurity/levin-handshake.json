@@ -1,0 +1,13 @@
+{
+  "name": "levin-handshake",
+  "protocol": "levin",
+  "provenance": "Monero levin_base.h bucket head (signature 0x0101010101012101, protocol_version 1) and portable_storage_base.h body",
+  "transport": "tcp",
+  "destination_port": 18080,
+  "payloads": [
+    "0121010101010101860000000000000001e903000000000000010000000100000001110101010102010108096e6f64655f646174610c10076d795f706f727406a04600000a6e6574776f726b5f69640a400000000000000000000000000000000007706565725f69640500000000000000000c7061796c6f61645f646174610c100e63757272656e745f68656967687405c0c62d00000000000e746f705f76657273696f6e0810"
+  ],
+  "expect_before": "allow",
+  "expect_after": "allow",
+  "note": "plaintext before (allow-plaintext); recognized as levin after"
+}

@@ -86,8 +86,15 @@ func newCfaaDetector(settings *CfaaSecurityPolicySettings) *cfaaDetector {
 //   - every other privileged port (<1024),
 //     dns/tcp and 80/udp                            -> drop
 func (self *cfaaDetector) inspect(ip net.IP, port int, protocol IpProtocol, version int) cfaaVerdict {
+	verdict, _ := self.inspectReason(ip, port, protocol, version)
+	return verdict
+}
+
+// inspectReason is inspect plus the rule that decided it. A drop is attributed
+// to the ip reputation table or to the port policy; pass carries no reason.
+func (self *cfaaDetector) inspectReason(ip net.IP, port int, protocol IpProtocol, version int) (cfaaVerdict, SecurityPolicyReason) {
 	if !self.settings.Enabled {
-		return cfaaPass
+		return cfaaPass, SecurityPolicyReasonUnknown
 	}
 
 	// Blocked-IP reputation takes precedence over the port policy.
@@ -95,13 +102,13 @@ func (self *cfaaDetector) inspect(ip net.IP, port int, protocol IpProtocol, vers
 	case 4:
 		if ip4 := ip.To4(); ip4 != nil {
 			if cfaaBlockedIp4(binary.BigEndian.Uint32(ip4)) {
-				return cfaaDrop
+				return cfaaDrop, SecurityPolicyReasonCfaaDropIp
 			}
 		}
 	case 6:
 		if ip16 := ip.To16(); ip16 != nil {
 			if cfaaBlockedIp6([16]byte(ip16)) {
-				return cfaaDrop
+				return cfaaDrop, SecurityPolicyReasonCfaaDropIp
 			}
 		}
 	}
@@ -110,7 +117,7 @@ func (self *cfaaDetector) inspect(ip net.IP, port int, protocol IpProtocol, vers
 	// blocked-ip reputation check above still does. echo-only parsing
 	// constrains what reaches here (see ICMP.md).
 	if protocol == IpProtocolIcmp {
-		return cfaaAllow
+		return cfaaAllow, SecurityPolicyReasonCfaaAllow
 	}
 
 	// Telegram's call reflectors use privileged ports 596-599, with one exact
@@ -118,46 +125,46 @@ func (self *cfaaDetector) inspect(ip net.IP, port int, protocol IpProtocol, vers
 	// of weakening the privileged-port rule for every host. The reputation check
 	// above intentionally remains authoritative if an address is also blocked.
 	if self.settings.AllowTelegramCalls && isTelegramCallReflector(ip, port, protocol, version) {
-		return cfaaAllow
+		return cfaaAllow, SecurityPolicyReasonCfaaAllow
 	}
 
 	switch {
 	case 6881 <= port && port <= 6889, port == 6969, port == 1337, port == 9337, port == 2710:
 		// bittorrent and unofficial bittorrent-related ports
-		return cfaaDrop
+		return cfaaDrop, SecurityPolicyReasonCfaaDropPort
 	case port == 123, port == 500, port == 4500:
 		// apple system ports: ntp (123), wifi calling / ike+nat-t (500, 4500)
 		// see https://support.apple.com/en-us/103229
-		return cfaaAllow
+		return cfaaAllow, SecurityPolicyReasonCfaaAllow
 	case port == 53:
 		// plain dns over udp is allowed (and must not be entropy-dropped); dns
 		// over tcp is not whitelisted here.
 		// FIXME allow plain dns for now; TODO upgrade to doh inline.
 		if protocol == IpProtocolUdp {
-			return cfaaAllow
+			return cfaaAllow, SecurityPolicyReasonCfaaAllow
 		}
-		return cfaaDrop
+		return cfaaDrop, SecurityPolicyReasonCfaaDropPort
 	case port == 443, port == 853, port == 465, port == 993, port == 995,
 		port == smtpStartTlsPort && protocol == IpProtocolTcp:
 		// https/quic, dns over tls, and secure email -> downstream DPI
 		// The main client egress paths invoke the SMTP guard before this policy,
 		// restricting TCP/587 plaintext negotiation and requiring STARTTLS plus
 		// a ClientHello before transaction or authentication commands.
-		return cfaaPass
+		return cfaaPass, SecurityPolicyReasonUnknown
 	case port == 80:
 		// http over tcp is allowed through to DPI (some radio streaming relies on
 		// it); 80/udp is not http.
 		// FIXME allow http for now; TODO upgrade to https inline.
 		if protocol == IpProtocolTcp {
-			return cfaaPass
+			return cfaaPass, SecurityPolicyReasonUnknown
 		}
-		return cfaaDrop
+		return cfaaDrop, SecurityPolicyReasonCfaaDropPort
 	case port < 1024:
 		// other privileged ports are not permitted
-		return cfaaDrop
+		return cfaaDrop, SecurityPolicyReasonCfaaDropPort
 	default:
 		// user / ephemeral ports: no static verdict, hand to DPI
-		return cfaaPass
+		return cfaaPass, SecurityPolicyReasonUnknown
 	}
 }
 

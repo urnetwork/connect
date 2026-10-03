@@ -1,0 +1,12 @@
+{
+  "name": "bittorrent-tcp-80",
+  "protocol": "bittorrent",
+  "provenance": "BEP 3 peer wire handshake",
+  "transport": "tcp",
+  "destination_port": 80,
+  "payloads": [
+    "13426974546f7272656e742070726f746f636f6c000000000000000086b7472ce2319e73f9258f11255a4a4486e26b1c2d5858303030302d94995318082311a8b52c9f73"
+  ],
+  "expect_before": "allow",
+  "expect_after": "incident"
+}
