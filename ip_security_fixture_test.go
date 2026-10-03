@@ -170,7 +170,10 @@ func parseSecurityPolicyResult(t *testing.T, name string, value string) Security
 }
 
 // TestFixtureReplayMatchesExpectedVerdicts replays every fixture through the
-// default policy and checks the verdict of its last packet.
+// default policy and checks the verdict of its last packet against
+// expect_after. ip_security_appstandard_test.go checks expect_before against
+// the policy with the update's detectors turned off, so drift in either
+// direction fails.
 func TestFixtureReplayMatchesExpectedVerdicts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -178,7 +181,7 @@ func TestFixtureReplayMatchesExpectedVerdicts(t *testing.T) {
 	for i, fixture := range loadSecurityFixtures(t) {
 		policy := DefaultSecurityPolicy(ctx)
 		results := replayFixture(t, policy, fixture, 40000+i)
-		want := parseSecurityPolicyResult(t, fixture.Name, fixture.ExpectBefore)
+		want := parseSecurityPolicyResult(t, fixture.Name, fixture.ExpectAfter)
 		if got := results[len(results)-1]; got != want {
 			t.Errorf("%s: last result = %v (all %v), want %v", fixture.Name, got, results, want)
 		}

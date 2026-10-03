@@ -1110,7 +1110,7 @@ func (self *SecurityPolicyStatsCollector) addReasonWithLock(
 		self.reasonDestinationCounts = SecurityPolicyReasonStats{}
 	}
 	switch {
-	case reason < SecurityPolicyReasonUnknown, SecurityPolicyReasonAllowUninspected < reason:
+	case reason < SecurityPolicyReasonUnknown, securityPolicyReasonEnd <= reason:
 		// out-of-range values share one bucket so they cannot defeat the bound
 		reason = SecurityPolicyReasonUnknown
 	}

@@ -127,6 +127,7 @@ and are local diagnostics: nothing about them is sent off the device.
 | `ip_security_cfaa_block.go`  | **generated** | Packed IPv4 + IPv6 blocked-range tables + source attribution. |
 | `ip_security_dmca.go`        | yes | Per-flow DPI state machine, including BitTorrent signatures, RTP probation, and the encrypted heuristic. |
 | `ip_security_webstandard.go` | yes | TLS/DTLS/QUIC/STUN/TURN/RTP/RTCP framing and header classifier. |
+| `ip_security_appstandard.go` | yes | WireGuard/OpenVPN/RTMP/Levin/RakNet application-standard detectors. |
 | `security/main.go`           | yes | Generator for the block tables (`go generate ./...`). |
 | `*_test.go`                  | yes | Behavior, invariant, cross-check, and zero-alloc tests. |
 
@@ -167,7 +168,7 @@ false, `inspect` always returns `cfaaPass`.
 | 53                                     | TCP      | `cfaaDrop`  | DNS-over-TCP not whitelisted |
 | 595                                    | TCP      | `cfaaAllow` | only for Telegram's exact `91.108.9.38` protocol-v12 fallback |
 | 596–599                                | TCP/UDP  | `cfaaAllow` | only for exact published Telegram call-reflector IPv4s; all other hosts retain the privileged-port drop |
-| 443, 853, 465, 993, 995                | any      | `cfaaPass`  | HTTPS/QUIC, DoT, secure email → DPI (TLS/QUIC whitelisted there, BitTorrent-over-443 caught) |
+| 443, 853, 465, 993, 995                | any      | `cfaaPass`  | HTTPS/QUIC, DoT, secure email → DPI's privileged-port rule (§4.0): stateless BitTorrent signatures → Incident, anything else Allow |
 | 80                                     | TCP      | `cfaaPass`  | HTTP → DPI (catches HTTP-tracker announces; plaintext web passes; FIXME upgrade to HTTPS inline) |
 | 80                                     | UDP      | `cfaaDrop`  | not HTTP |
 | < 1024 (any other privileged port)     | any      | `cfaaDrop`  | e.g. 22 (SSH), 179 (BGP) — insecure low ports stay blocked |
@@ -310,6 +311,18 @@ Reached only when the CFAA layer returns `cfaaPass`. The detector keeps a small
 per-flow (5-tuple) state object and advances it one packet at a time until a
 **terminal verdict**, evaluated on the **outbound** direction.
 
+### 4.0 Privileged destination ports
+
+A destination port below 1024 that the CFAA layer passes (443, 853, 465, 587,
+993, 995, 80/tcp) is a **trusted service port**: no flow state is created and the
+encrypted heuristic does not run, so non-TLS encrypted services there (Telegram
+MTProto, OpenVPN/TCP, Noise messengers on 443) are allowed. A peer can still
+listen on such a port, so when `InspectPrivilegedSignatures` is set (default) the
+**stateless BitTorrent signatures (§4.3) run on every payload** and a match is
+`bittorrent` → **Incident**. TLS (`0x16`/`0x17`), QUIC and ordinary HTTP fail each
+signature's first comparison. The entropy heuristic deliberately never runs on
+these ports (that would break apps that work today; IPSECURITY-UPDATE4 §10.8).
+
 ### 4.1 Design principles
 
 1. **Whitelist positive standards/endpoints; drop sketchy unidentified encrypted
@@ -347,7 +360,16 @@ On the **first** observation: TCP `sawFlowStart = (SYN present)`; UDP
    bytes:
    - BitTorrent signature (§4.3) → terminal `bittorrent`;
    - provider-scoped gaming endpoint (§4.4.1) → terminal `allow`;
+   - flow already allowed by an application standard (§4.4.2) → `allow`, and
+     terminal `allow` once the budget is spent (the BitTorrent check above keeps
+     running until then);
    - whitelisted stateless standard (§4.4) → terminal `allow`;
+   - single-packet application standard (§4.4.2) → `allow`, unless the bytes
+     after its header carry any BitTorrent signature → terminal `bittorrent`;
+   - a pending two-packet application candidate confirmed → `allow`; a failed
+     candidate is judged normally below;
+   - a packet that opens a two-packet application candidate → consumes budget,
+     is **not** counted as encrypted, remain `inspecting`;
    - structurally valid RTP/SRTP → keep up to two SSRC candidates; two coherent
      observations → terminal `allow`;
    - looks encrypted (§4.5) → increment `encryptedPackets`;
@@ -409,6 +431,31 @@ out-of-order packets are ignored, while implausible forward gaps reset probation
 `Rtcp` toggles, all enabled by default. **Adding another legitimate encrypted
 protocol means adding a positive detector here**, not loosening the entropy heuristic.
 
+#### 4.4.2 Application standards (→ Allow)
+
+`ip_security_appstandard.go` positively recognizes non-web protocols whose
+payloads look fully encrypted. Each is a fixed-format header or a cross-packet
+invariant from a public specification:
+
+| Protocol | L4 | Rule | Source |
+|----------|----|------|--------|
+| WireGuard | UDP | 148-byte initiation (`01 00 00 00`) opens; a transport datagram (`04 00 00 00`, ≥ 32 bytes, length ≡ 0 mod 16) confirms. Mid-stream: two transport datagrams with the same receiver index and a little-endian counter increasing by 1..2^20-1 | WireGuard whitepaper §5.4.2, §5.4.6 |
+| OpenVPN | UDP, TCP (2-byte length prefix) | hard reset from the client (opcode 7 or 10, key id 0, ≥ 14 bytes) opens; a control/ack/reset packet (opcode 4, 5, 7, 10, 11) repeating the 8-byte session id confirms. Mid-stream: two `P_DATA_V2` (opcode 9) packets with the same key id and 24-bit peer id | OpenVPN protocol (`ssl_pkt.h`) |
+| RTMP | TCP, first payload | `03`, 4-byte time, 4-byte zero word (the digest variant is not matched) | Adobe RTMP 1.0 §5.2 |
+| Levin | TCP, first payload | signature `01 21 01 01 01 01 01 01`, `protocol_version == 1` (LE u32 at 29), body length ≤ 100,000,000 | Monero `levin_base.h` |
+| RakNet | UDP | open connection request 1/2 (`05`/`07`) with the 16-byte offline magic at offset 1, or unconnected ping (`01`) with it at offset 9 | RakNet `MessageIdentifiers.h`, `RakPeer.cpp` |
+
+Rules: they run after the BitTorrent signatures, the gaming exception and the web
+standards; an allowed flow keeps checking the BitTorrent signatures until its
+inspection budget is spent, and a single-packet match whose remaining bytes carry
+a BitTorrent signature is `bittorrent`. A two-packet opener is not counted as
+encrypted, so a random BitTorrent flow whose first blob happens to match an opener
+(≈ 2^-32 per flow) is dropped one packet later; repeated openers end at the budget.
+The WhatsApp Noise "WA" framing is **not implemented**: its bytes must first be
+confirmed against a capture. `AppStandardSettings` (`Dmca.App`) has `Enabled`,
+`WireGuard`, `OpenVpn`, `Rtmp`, `Levin`, `RakNet`, all on by default; nil
+disables them.
+
 #### 4.4.1 Steam/Valve provider exception (→ Allow)
 
 `ip_security_gaming.go` allows Steam traffic only when all three dimensions match:
@@ -460,6 +507,9 @@ can drop.
 | `DropUnsanctionedEncrypted` | `true` | Enforce the encrypted heuristic. |
 | `Gaming.Enabled` | `true` | Master switch for provider-scoped gaming exceptions. |
 | `Gaming.AllowSteam` | `true` | Allow Valve-prefix + documented-remote-port Steam traffic after BitTorrent checks. |
+| `App.Enabled` | `true` | Master switch for application standards (§4.4.2). |
+| `App.WireGuard`, `.OpenVpn`, `.Rtmp`, `.Levin`, `.RakNet` | `true` | Individual application-standard detectors. |
+| `InspectPrivilegedSignatures` | `true` | Run the stateless BitTorrent signatures on privileged ports (§4.0); false restores the uninspected allow. |
 | `InspectionPacketBudget` | `8` | Max payload packets before giving up (→ Allow). |
 | `EncryptedDecisionPackets` | `3` | Encrypted-looking packets required before the heuristic drops. |
 | `MaxInspectionPayload` | `512` | Max leading payload bytes examined per packet. |
@@ -497,14 +547,25 @@ stream is MSE-encrypted.
 no plaintext control plane in view — caught by §4.5 after a leak of up to
 `EncryptedDecisionPackets` packets.
 
-**Not caught / evasions:** forced encryption with DHT/LSD/PEX disabled behind a
-whitelisted-protocol disguise; a UDP flow joined mid-stream (handshake missed; TCP is
-protected by `sawFlowStart`, UDP is not); nested tunneling (VPN-over-VPN).
+Plaintext BitTorrent signatures are also caught on privileged ports (§4.0), so a
+peer listening on 443 or a tracker announce on 80 is an incident.
 
-**Accepted FP surface:** non-web encrypted protocols on inspected ports (a
-proprietary game outside a scoped exception, a third-party VPN) are dropped by
-§4.5 — by design. To spare one, add a positive protocol detector (§4.4) or a
-provider-prefix + remote-port exception (§4.4.1).
+**Not caught / evasions:** forced encryption with DHT/LSD/PEX disabled behind a
+whitelisted-protocol disguise (a fake TLS ClientHello or a WireGuard/OpenVPN/RTMP
+header prefixed by a modified client); encrypted BitTorrent on a privileged port
+(the entropy heuristic does not run there by design); a UDP flow joined
+mid-stream (handshake missed; TCP is protected by `sawFlowStart`, UDP is not);
+nested tunneling (VPN-over-VPN — WireGuard and OpenVPN are now admitted
+deliberately: abuse inside them exits from the VPN server's address).
+
+**Accepted FP surface (dropped by design):** fully encrypted protocols with no
+plaintext structure on inspected ports: MSE/PE BitTorrent and encrypted µTP (the
+target), Mosh, ZeroTier, Bitcoin BIP324 v2, Ethereum RLPx/devp2p (a many-peer
+profile indistinguishable from BitTorrent), obfs4, the RTMP digest handshake, and
+proprietary game/voice crypto outside a scoped exception. To spare one, add a
+positive protocol detector (§4.4, §4.4.2) or a provider-prefix + remote-port
+exception (§4.4.1). Quotas or a provider opt-in tier for the long tail are not
+implemented (IPSECURITY-UPDATE4 §6.5, §10).
 
 ---
 
@@ -515,8 +576,10 @@ provider-prefix + remote-port exception (§4.4.1).
 - **DMCA detector** is a clean-room implementation from public protocol specs:
   BitTorrent BEP 3 / 5 / 14 / 15 / 29; TLS RFC 8446 / 5246; DTLS RFC 6347 / 9147;
   QUIC RFC 9000 / 9369; STUN RFC 8489; TURN RFC 8656; RTP/RTCP RFC 3550 and
-  multiplexing RFC 7983. Byte signatures and constants are functional
-  protocol facts, not derived from any third-party implementation.
+  multiplexing RFC 7983; WireGuard whitepaper; OpenVPN protocol documentation;
+  Adobe RTMP 1.0; Monero `levin_base.h`; RakNet message identifiers. Byte
+  signatures and constants are functional protocol facts, not derived from any
+  third-party implementation.
 - **Steam exception** is factual prefix and port data published by Valve/Steam;
   no client or server implementation code is incorporated.
 
@@ -534,6 +597,10 @@ provider-prefix + remote-port exception (§4.4.1).
   from higher-level data-plane settings is a follow-up if runtime config is needed.
 - **Feeds are a build-time snapshot.** The block table is only as fresh as the last
   regeneration; there is no runtime feed refresh.
+- **Application standards are spec-derived, not capture-verified.** The fixtures in
+  `testdata/ipsecurity` are synthesized from the specifications; captures from the
+  real apps (Roblox, WhatsApp on 5222, X Spaces, console/voice crypto) are still
+  needed to confirm which of them trip the heuristic.
 - **Provider exceptions are snapshots.** Valve may update AS32590 prefixes or Steam
   ports; refresh `ip_security_gaming.go` from the cited first-party lists when this
   policy is maintained.
@@ -560,6 +627,10 @@ provider-prefix + remote-port exception (§4.4.1).
   lifecycle tests in `ip_security_dmca_test.go`; strict STUN/TURN/RTP/RTCP parsing
   in `ip_security_webstandard_test.go`; stateful RTP continuity and near-miss
   enforcement in `ip_security_rtc_test.go`.
+- **Application standards:** positive flows, near misses, toggles, BitTorrent
+  precedence over every detector, MSE/encrypted µTP still dropped (including the
+  148-byte variant), privileged-port signatures, zero allocation and a fuzz target
+  in `ip_security_appstandard_test.go`.
 - **Fixtures:** `ip_security_fixture_test.go` replays the packet fixtures in
   `testdata/ipsecurity/` (synthesized from protocol specifications; see its
   README) through `InspectEgress` as the multi-client send path does and checks

@@ -8,14 +8,14 @@ package connect
 // advances a small state machine over the first payload-bearing packets of each
 // egress flow until it reaches a terminal verdict:
 //
-//   - a privileged destination port (<1024) -> Allow without inspection: peers, DHT, uTP, and
-//     plaintext trackers run on ephemeral/high ports, so a privileged port can't host a p2p hole;
-//     skipping it lets legitimate non-web-standard encrypted services (e.g. Telegram MTProto on
-//     443) through. Peer traffic on high ports is still inspected.
+//   - a privileged destination port (<1024) -> only the stateless BitTorrent signatures
+//     (Incident); otherwise Allow without flow state or the encrypted heuristic, which lets
+//     legitimate non-web-standard encrypted services (e.g. Telegram MTProto on 443) through.
 //   - a positive, plaintext BitTorrent signature  -> Incident (report) + Drop
 //   - an initial payload that looks fully encrypted/random AND is NOT a
-//     whitelisted standard (TLS, DTLS, QUIC, STUN/TURN, RTP/RTCP) or exact
-//     provider-scoped gaming endpoint -> Drop
+//     whitelisted standard (TLS, DTLS, QUIC, STUN/TURN, RTP/RTCP), an
+//     application standard (WireGuard, OpenVPN, RTMP, Levin, RakNet), or an
+//     exact provider-scoped gaming endpoint -> Drop
 //   - anything else (plaintext unknown protocol, a sanctioned standard/provider
 //     endpoint, or budget exhausted without a hit) -> Allow
 //
@@ -86,6 +86,16 @@ type DmcaSecurityPolicySettings struct {
 	// Nil disables all gaming exceptions.
 	Gaming *GamingSecurityPolicySettings
 
+	// App configures the positive application-standard detectors (WireGuard,
+	// OpenVPN, RTMP, Levin, RakNet). They are evaluated after the BitTorrent
+	// signatures, the gaming exceptions and the web standards. Nil disables them.
+	App *AppStandardSettings
+
+	// InspectPrivilegedSignatures checks the stateless BitTorrent signatures on
+	// privileged destination ports (<1024), which are otherwise allowed without
+	// inspection. No flow state and no entropy heuristic run there.
+	InspectPrivilegedSignatures bool
+
 	// InspectionPacketBudget is the max number of payload-bearing packets to
 	// inspect for a flow before giving up and treating it as not-BitTorrent.
 	InspectionPacketBudget int
@@ -131,6 +141,8 @@ func DefaultDmcaSecurityPolicySettings() *DmcaSecurityPolicySettings {
 		ReportBittorrentIncident:      true,
 		DropUnsanctionedEncrypted:     true,
 		Gaming:                        DefaultGamingSecurityPolicySettings(),
+		App:                           DefaultAppStandardSettings(),
+		InspectPrivilegedSignatures:   true,
 		InspectionPacketBudget:        8,
 		EncryptedDecisionPackets:      3,
 		MaxInspectionPayload:          512,
@@ -189,6 +201,11 @@ type dmcaFlowState struct {
 	sawFlowStart     bool
 	sawPlaintext     bool
 	rtpCandidates    [2]rtpCandidate
+	// a pending two-packet application standard
+	appCandidate appCandidate
+	// the application standard that allowed the flow while it still checks the
+	// BitTorrent signatures for the rest of its budget; unknown when none
+	appReason SecurityPolicyReason
 }
 
 type rtpCandidate struct {
@@ -283,7 +300,13 @@ func newRtpCandidate(header rtpHeader) rtpCandidate {
 // verdict, the reason for it, and whether this packet reached the terminal
 // verdict. The payload is read synchronously and never retained, so the shared
 // packet buffer is not aliased.
-func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *DmcaSecurityPolicySettings, web *webStandardDetector) (dmcaVerdict, SecurityPolicyReason, bool) {
+func (self *dmcaFlowState) advance(
+	ipPath *IpPath,
+	payload []byte,
+	settings *DmcaSecurityPolicySettings,
+	web *webStandardDetector,
+	app *appStandardDetector,
+) (dmcaVerdict, SecurityPolicyReason, bool) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
@@ -319,6 +342,14 @@ func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *Dmc
 	if detectBittorrentSignature(ipPath, b) {
 		return self.setTerminal(dmcaBittorrent, SecurityPolicyReasonBittorrent)
 	}
+	if self.appReason != SecurityPolicyReasonUnknown {
+		// allowed by an application standard: the BitTorrent signatures above keep
+		// precedence for the rest of the budget, then the allow becomes terminal
+		if settings.InspectionPacketBudget <= self.inspectedPackets {
+			return self.setTerminal(dmcaAllow, self.appReason)
+		}
+		return dmcaAllow, self.appReason, false
+	}
 	if isSanctionedGamingEndpoint(settings.Gaming, ipPath) {
 		// Provider prefix + transport + documented remote port is sufficient
 		// evidence for the Steam exception. The positive BitTorrent checks above
@@ -330,6 +361,32 @@ func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *Dmc
 		// the complete payload; MaxInspectionPayload only caps signature and entropy
 		// work below.
 		return self.setTerminal(dmcaAllow, reason)
+	}
+	if reason, headerEnd, ok := app.match(ipPath, b, 1 == self.inspectedPackets); ok {
+		// a single-packet application standard. The bytes it carries after the
+		// recognized header must not hide a BitTorrent payload.
+		if containsBittorrentSignature(b[headerEnd:]) {
+			return self.setTerminal(dmcaBittorrent, SecurityPolicyReasonBittorrent)
+		}
+		return self.allowAppStandard(reason, settings)
+	}
+	if self.appCandidate.kind != appCandidateNone {
+		candidate := self.appCandidate
+		self.appCandidate = appCandidate{}
+		if reason, ok := app.confirm(&candidate, ipPath, payload); ok {
+			return self.allowAppStandard(reason, settings)
+		}
+		// a failed candidate is judged normally below (or reopens one)
+	}
+	if candidate, ok := app.open(ipPath, payload); ok {
+		// The opening packet of a two-packet standard consumes budget but is not
+		// counted as encrypted: the next packet confirms it or is judged normally.
+		// A random flow whose blob happens to match an opener leaks one packet.
+		self.appCandidate = candidate
+		if settings.InspectionPacketBudget <= self.inspectedPackets {
+			return self.setTerminal(dmcaAllow, SecurityPolicyReasonAllowBudget)
+		}
+		return dmcaInspecting, SecurityPolicyReasonInspecting, false
 	}
 	if header, ok := web.rtpHeader(ipPath, payload); ok && self.observeRtp(header) {
 		// RTP/SRTP needs coherent headers from multiple packets before it is trusted;
@@ -370,6 +427,17 @@ func (self *dmcaFlowState) advance(ipPath *IpPath, payload []byte, settings *Dmc
 	}
 }
 
+// allowAppStandard allows the flow for an application standard. The allow is
+// terminal once the inspection budget is spent; until then the flow keeps
+// checking the BitTorrent signatures.
+func (self *dmcaFlowState) allowAppStandard(reason SecurityPolicyReason, settings *DmcaSecurityPolicySettings) (dmcaVerdict, SecurityPolicyReason, bool) {
+	self.appReason = reason
+	if settings.InspectionPacketBudget <= self.inspectedPackets {
+		return self.setTerminal(dmcaAllow, reason)
+	}
+	return dmcaAllow, reason, false
+}
+
 type dmcaFlowShard struct {
 	mu    sync.RWMutex
 	flows map[dmcaFlowKey]*dmcaFlowState
@@ -379,6 +447,7 @@ type dmcaDetector struct {
 	runDone     chan struct{}
 	settings    *DmcaSecurityPolicySettings
 	web         *webStandardDetector
+	app         *appStandardDetector
 	perShardCap int
 	shards      [dmcaFlowShards]*dmcaFlowShard
 }
@@ -395,6 +464,7 @@ func newDmcaDetector(ctx context.Context, settings *DmcaSecurityPolicySettings, 
 		runDone:     make(chan struct{}),
 		settings:    settings,
 		web:         web,
+		app:         newAppStandardDetector(settings.App),
 		perShardCap: perShardCap,
 	}
 	for i := range self.shards {
@@ -620,12 +690,21 @@ func (self *dmcaDetector) classifyForSenderDetailed(
 		return dmcaAllow, SecurityPolicyReasonAllowUninspected, false
 	}
 
-	// A privileged destination port (<1024) can't host a peer-to-peer / BitTorrent hole — peers,
-	// DHT, uTP, and plaintext trackers all run on ephemeral/high ports — so allow it without
-	// payload inspection or flow tracking. This lets legitimate non-web-standard encrypted services
-	// on privileged ports (e.g. Telegram MTProto on 443) through, which the unsanctioned-encrypted
-	// heuristic would otherwise drop. Peer traffic on high ports is still inspected.
+	// A privileged destination port (<1024) is trusted as a service port: it is allowed without
+	// flow tracking or the encrypted heuristic, which lets legitimate non-web-standard encrypted
+	// services there (e.g. Telegram MTProto or OpenVPN on 443) through. A peer can still listen on
+	// a privileged port, so the stateless positive BitTorrent signatures run on every payload; TLS,
+	// QUIC and HTTP fail their first comparison.
 	if ipPath.DestinationPort < 1024 {
+		if self.settings.InspectPrivilegedSignatures && 0 < len(payload) {
+			b := payload
+			if self.settings.MaxInspectionPayload < len(b) {
+				b = b[:self.settings.MaxInspectionPayload]
+			}
+			if detectBittorrentSignature(ipPath, b) {
+				return dmcaBittorrent, SecurityPolicyReasonBittorrent, true
+			}
+		}
 		return dmcaAllow, SecurityPolicyReasonAllowPrivileged, false
 	}
 
@@ -696,7 +775,7 @@ func (self *dmcaDetector) classifyForSenderDetailed(
 	if v, reason := state.terminalVerdict(); v != dmcaInspecting {
 		return v, reason, false
 	}
-	return state.advance(ipPath, payload, self.settings, self.web)
+	return state.advance(ipPath, payload, self.settings, self.web, self.app)
 }
 
 // inspect classifies the flow and maps the verdict to a SecurityPolicyResult via

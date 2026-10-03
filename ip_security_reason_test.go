@@ -97,12 +97,17 @@ func TestSecurityPolicyReasonsAttributeEachRule(t *testing.T) {
 		fixture string
 		reason  SecurityPolicyReason
 	}{
-		{fixture: "wireguard-handshake", reason: SecurityPolicyReasonDropEncrypted},
+		{fixture: "rtmp-digest", reason: SecurityPolicyReasonDropEncrypted},
+		{fixture: "wireguard-handshake", reason: SecurityPolicyReasonAllowWireGuard},
+		{fixture: "openvpn-udp", reason: SecurityPolicyReasonAllowOpenVpn},
+		{fixture: "rtmp-publish", reason: SecurityPolicyReasonAllowRtmp},
+		{fixture: "levin-handshake", reason: SecurityPolicyReasonAllowLevin},
+		{fixture: "bittorrent-tcp-443", reason: SecurityPolicyReasonBittorrent},
 		{fixture: "tls-443", reason: SecurityPolicyReasonAllowPrivileged},
 		{fixture: "simplex-tls", reason: SecurityPolicyReasonAllowTls},
 		{fixture: "monero-rpc-http", reason: SecurityPolicyReasonAllowHttp},
 		{fixture: "bittorrent-tcp-51413", reason: SecurityPolicyReasonBittorrent},
-		{fixture: "raknet-open-connection-zero-padded", reason: SecurityPolicyReasonAllowPlaintext},
+		{fixture: "raknet-open-connection-zero-padded", reason: SecurityPolicyReasonAllowRakNet},
 	}
 	for i, c := range cases {
 		stats := DefaultSecurityPolicyStatsCollector()

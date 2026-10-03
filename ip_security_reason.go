@@ -49,6 +49,15 @@ const (
 	SecurityPolicyReasonAllowBudget
 	// payload inspection is disabled, or the transport is not tcp/udp
 	SecurityPolicyReasonAllowUninspected
+	// application standards (ip_security_appstandard.go)
+	SecurityPolicyReasonAllowWireGuard
+	SecurityPolicyReasonAllowOpenVpn
+	SecurityPolicyReasonAllowRtmp
+	SecurityPolicyReasonAllowLevin
+	SecurityPolicyReasonAllowRakNet
+
+	// one past the last reason
+	securityPolicyReasonEnd
 )
 
 func (self SecurityPolicyReason) String() string {
@@ -95,6 +104,16 @@ func (self SecurityPolicyReason) String() string {
 		return "allow-budget"
 	case SecurityPolicyReasonAllowUninspected:
 		return "allow-uninspected"
+	case SecurityPolicyReasonAllowWireGuard:
+		return "allow-app-standard:wireguard"
+	case SecurityPolicyReasonAllowOpenVpn:
+		return "allow-app-standard:openvpn"
+	case SecurityPolicyReasonAllowRtmp:
+		return "allow-app-standard:rtmp"
+	case SecurityPolicyReasonAllowLevin:
+		return "allow-app-standard:levin"
+	case SecurityPolicyReasonAllowRakNet:
+		return "allow-app-standard:raknet"
 	default:
 		return "unknown"
 	}
