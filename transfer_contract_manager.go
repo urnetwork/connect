@@ -1703,11 +1703,16 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	// holds little state — a mutex, a monitor, and a derived context
 	// — and its supervisor goroutine exits on success or when the
 	// parent context closes, so there's no long-lived leak.
+	// One identity belongs to this logical incremental report. ControlSync
+	// retransfers and the closed-client OOB path keep the serialized frame;
+	// another equal-byte checkpoint is a different operation with a new ID.
+	// Deploy only after every backend route supports close-report identities.
 	frame, err := ToFrame(&protocol.CloseContract{
 		ContractId:       contractId.Bytes(),
 		AckedByteCount:   uint64(ackedByteCount),
 		UnackedByteCount: uint64(unackedByteCount),
 		Checkpoint:       checkpoint,
+		ReportId:         NewId().Bytes(),
 	}, self.settings.ProtocolVersion)
 	if err != nil {
 		self.client.log.Infof("[contract]could not create close contract frame = %s\n", err)
