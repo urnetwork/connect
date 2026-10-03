@@ -33,6 +33,12 @@ type NetworkClientCredentials interface {
 	RemoveNetworkClient(context.Context, *RemoveNetworkClientArgs) (*RemoveNetworkClientResult, error)
 }
 
+// A caller-owned discovery authority preserves request context, credentials,
+// filters and ranking. A local error never falls back to public HTTP.
+type NetworkProviderDiscovery interface {
+	FindProviders2(context.Context, string, *FindProviders2Args) (*FindProviders2Result, error)
+}
+
 func DefaultApiMultiClientGeneratorSettings() *ApiMultiClientGeneratorSettings {
 	return &ApiMultiClientGeneratorSettings{
 		MigrateConnectTimeout:        60 * time.Second,
@@ -92,6 +98,8 @@ type ApiMultiClientGeneratorSettings struct {
 	ClientCredentials NetworkClientCredentials
 	// Captured per generator; nil retains the ordinary HTTP control path.
 	ClientControl NetworkClientControl
+	// Captured per generator; nil preserves ordinary HTTP discovery.
+	ProviderDiscovery NetworkProviderDiscovery
 	// MigrateConnectTimeout bounds the temporary second platform transport.
 	// If it cannot establish a route in this interval, it is closed and the
 	// old transport remains until the server's drain fallback evicts it.
@@ -243,6 +251,7 @@ type ApiMultiClientGenerator struct {
 	settings                *ApiMultiClientGeneratorSettings
 	clientCredentials       NetworkClientCredentials
 	clientControl           NetworkClientControl
+	providerDiscovery       NetworkProviderDiscovery
 	controlTelemetryProbe   bool
 	// Window carriers created without an explicit caller budget all belong to
 	// this generator. Separate generators never contend through a package root.
@@ -360,6 +369,7 @@ func NewApiMultiClientGenerator(
 		settings:                       settings,
 		clientCredentials:              settings.ClientCredentials,
 		clientControl:                  settings.ClientControl,
+		providerDiscovery:              settings.ProviderDiscovery,
 		controlTelemetryProbe:          settings.ControlTelemetryProbe,
 		defaultPlatformTransportBudget: DefaultPlatformTransportBudget(),
 		platformTransportMode:          platformTransportMode,
@@ -702,7 +712,18 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 			IpFamily:            ipFamily,
 		}
 
-		result, err := self.api.FindProviders2SyncWithCtx(ctx, findProviders2)
+		var result *FindProviders2Result
+		var err error
+		if self.providerDiscovery != nil {
+			discoveryCtx, cancel := context.WithTimeout(ctx, self.clientStrategy.settings.RequestTimeout)
+			result, err = self.providerDiscovery.FindProviders2(discoveryCtx, self.api.ByJwt(), findProviders2)
+			cancel()
+		} else {
+			result, err = self.api.FindProviders2SyncWithCtx(ctx, findProviders2)
+		}
+		if err == nil && result == nil {
+			err = errors.New("provider discovery returned no result")
+		}
 		if err != nil {
 			// prefer returning any fixed destinations over failing the whole call
 			if 0 < len(destinations) {
