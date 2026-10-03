@@ -40,10 +40,11 @@ type preparationStep struct {
 
 // Both original inode generations and the accepted plan bind the control.
 type preparationControlHeader struct {
-	Schema     string              `json:"schema"`
-	PlanSha256 string              `json:"plan_sha256"`
-	Root       PreparationIdentity `json:"root"`
-	Control    PreparationIdentity `json:"control"`
+	Schema       string              `json:"schema"`
+	PlanSha256   string              `json:"plan_sha256"`
+	CohortSha256 string              `json:"cohort_sha256,omitempty"`
+	Root         PreparationIdentity `json:"root"`
+	Control      PreparationIdentity `json:"control"`
 }
 
 // One hash-linked pending/complete pair acknowledges each exact mutation.
@@ -58,10 +59,11 @@ type preparationControlRecord struct {
 
 // The root retains its original external control even across process reopen.
 type preparationAnchor struct {
-	Schema     string              `json:"schema"`
-	PlanSha256 string              `json:"plan_sha256"`
-	RootInode  uint64              `json:"root_inode"`
-	Control    PreparationIdentity `json:"control"`
+	Schema       string              `json:"schema"`
+	PlanSha256   string              `json:"plan_sha256"`
+	CohortSha256 string              `json:"cohort_sha256,omitempty"`
+	RootInode    uint64              `json:"root_inode"`
+	Control      PreparationIdentity `json:"control"`
 }
 
 // All fields belong to one synchronous invocation, which closes every handle
@@ -84,6 +86,12 @@ type preparationApply struct {
 	moveSources map[string]PreparationSource
 	hooks       *preparationHooks
 	failed      error
+	adapter     PreparationAdapter
+	inventory   Inventory
+	readOnly    bool
+	complete    bool
+	prepared    PreparationResult
+	cohort      Reference
 }
 
 // Absence is legal only for a separately reviewed, still-fresh plan target.
@@ -294,6 +302,9 @@ func (self *preparationApply) append(phase string, step preparationStep, identit
 // Header identity is recorded before any target mutation. Its inode is also
 // bound on the original root, so replacing an entire completed journal fails.
 func (self *preparationApply) openControl() (resultErr error) {
+	if self.control != nil {
+		return self.reserveControl()
+	}
 	mutated := false
 	defer func() {
 		if mutated && resultErr != nil {
@@ -335,7 +346,7 @@ func (self *preparationApply) openControl() (resultErr error) {
 		return err
 	}
 	if created {
-		self.header = preparationControlHeader{Schema: preparationControlSchema, PlanSha256: self.reference.Sha256, Root: self.plan.Root, Control: identity}
+		self.header = preparationControlHeader{Schema: preparationControlSchema, PlanSha256: self.reference.Sha256, CohortSha256: self.cohort.Sha256, Root: self.plan.Root, Control: identity}
 		raw, err := json.Marshal(self.header)
 		if err != nil {
 			return err
@@ -358,13 +369,26 @@ func (self *preparationApply) openControl() (resultErr error) {
 	} else if err := self.readControl(); err != nil {
 		return err
 	}
-	if self.header.Schema != preparationControlSchema || self.header.PlanSha256 != self.reference.Sha256 || self.header.Root != self.plan.Root || self.header.Control != identity {
+	if self.header.Schema != preparationControlSchema || self.header.PlanSha256 != self.reference.Sha256 || self.header.CohortSha256 != self.cohort.Sha256 || self.header.Root != self.plan.Root || self.header.Control != identity {
 		return errors.Join(ErrIdentity, errors.New("preparation control belongs to another plan or physical generation"))
 	}
 	if err := syscall.Fstat(fd, &self.controlStat); err != nil {
 		return err
 	}
-	anchor, err := json.Marshal(preparationAnchor{Schema: preparationAnchorSchema, PlanSha256: self.reference.Sha256, RootInode: self.plan.Root.Inode, Control: identity})
+	return self.reserveControl()
+}
+
+// A cohort may already hold and authenticate this control without writing it.
+// Enrollment still occurs only at the original write-ahead publication boundary.
+func (self *preparationApply) reserveControl() (resultErr error) {
+	mutated := false
+	defer func() {
+		if mutated && resultErr != nil {
+			resultErr = self.uncertain(resultErr)
+		}
+	}()
+	request := self.admission.request
+	anchor, err := json.Marshal(preparationAnchor{Schema: preparationAnchorSchema, PlanSha256: self.reference.Sha256, CohortSha256: self.cohort.Sha256, RootInode: self.plan.Root.Inode, Control: self.header.Control})
 	if err != nil {
 		return err
 	}
@@ -478,6 +502,9 @@ func (self *preparationApply) step(step preparationStep) error {
 		}
 		self.position++
 		return nil
+	}
+	if self.readOnly {
+		return self.preflightNextStep(step)
 	}
 	if self.pending != nil {
 		if !reflect.DeepEqual(self.pending.Step, step) {
@@ -784,6 +811,12 @@ func (self *preparationApply) observeAttribute(step preparationStep, pending boo
 // Completion checks the entire target namespace once and only reobserves
 // unchanged file metadata thereafter. No acknowledged leaf can disappear.
 func (self *preparationApply) finalCensus() error {
+	return self.census(false)
+}
+
+// Partial admission accepts only the exact acknowledged/pending prefix. Future
+// plan members are not permission to adopt files already present without intent.
+func (self *preparationApply) census(partial bool) error {
 	request := self.admission.request
 	allowedAttributes := map[string]bool{request.RootPath + "\x00" + PreparationAttribute: true, request.RootPath + "\x00" + RootGenerationAttribute: true}
 	for _, owner := range self.plan.Owners {
@@ -793,6 +826,15 @@ func (self *preparationApply) finalCensus() error {
 				path = filepath.Join(path, attribute.Path)
 			}
 			allowedAttributes[path+"\x00"+attribute.Name] = true
+		}
+	}
+	if partial {
+		allowedAttributes = map[string]bool{}
+		if len(self.anchor) != 0 {
+			allowedAttributes[request.RootPath+"\x00"+PreparationAttribute] = true
+		}
+		for key := range self.attributes {
+			allowedAttributes[key] = true
 		}
 	}
 	checkAttributes := func(file *os.File, path string) error {
@@ -812,6 +854,9 @@ func (self *preparationApply) finalCensus() error {
 	}
 	expected := map[string]bool{}
 	for _, source := range self.plan.Sources {
+		if _, present := self.retained[filepath.Join(request.RootPath, source.File.Path)]; partial && !present {
+			continue
+		}
 		expected[source.File.Path] = true
 	}
 	var visit func(*os.File, string, uint64) error
@@ -896,65 +941,95 @@ func (self *preparationApply) finalCensus() error {
 	return self.check()
 }
 
-// One invocation never retries a failed mutation. Its deferred close joins all
-// descriptors before the same accepted plan can perform bounded readback.
-func applyPreparation(ctx context.Context, reference Reference, adapter PreparationAdapter, host Host, scope ownerScope, hooks *preparationHooks) (result PreparationResult, resultErr error) {
+// Admission retains all physical leases without creating a control or writing
+// a target. Cohorts can admit every member before executing their first step.
+func openPreparationApplication(ctx context.Context, reference Reference, adapter PreparationAdapter, host Host, scope ownerScope, hooks *preparationHooks, sharedParents map[string]*os.File) (_ *preparationApply, resultErr error) {
 	plan, request, err := readPreparationPlan(ctx, reference, scope)
 	if err != nil {
-		return result, err
+		return nil, err
 	}
 	if err := preparationAdapterAdmission(request, adapter); err != nil {
-		return result, err
+		return nil, err
 	}
 	var inventory Inventory
 	if request.Purpose == "restore" {
 		inventory, err = readPreparationRestoreInventory(ctx, request)
 		if err != nil {
-			return result, err
+			return nil, err
 		}
 		expectedOwners := make([]PreparationOwnerPlan, 0, len(plan.Owners))
 		for _, owner := range plan.Owners {
 			expected, err := adapter.Restore(ctx, owner.StagingName, owner.Owner, inventory)
 			if err != nil {
-				return result, err
+				return nil, err
 			}
 			if owner.PhysicalMetadata == nil && !reflect.DeepEqual(expected, owner) {
-				return result, errors.New("accepted restore owner differs from its original fixed semantic census")
+				return nil, errors.New("accepted restore owner differs from its original fixed semantic census")
 			}
 			expectedOwners = append(expectedOwners, expected)
 		}
 		if err := validatePreparationRestoreCoverage(inventory, expectedOwners); err != nil {
-			return result, err
+			return nil, err
 		}
 	}
 	if err := validatePhysicalMetadataDerivations(ctx, request, plan, adapter, inventory); err != nil {
-		return result, err
+		return nil, err
 	}
-	admission, err := openPreparationAdmission(ctx, request, host, scope, plan.RootSource)
+	admission, err := openPreparationAdmissionWithParents(ctx, request, host, scope, plan.RootSource, sharedParents)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, admission.close())
+		}
+	}()
+	if !reflect.DeepEqual(admission.identities, plan.Directories) || admission.identities[request.RootPath] != plan.Root || admission.mount != plan.Mount || admission.filesystem.Id != plan.Filesystem.Id || admission.filesystem.Type != plan.Filesystem.Type {
+		return nil, errors.Join(ErrIdentity, errors.New("accepted preparation physical generation changed"))
+	}
+	if err := admission.fence(); err != nil {
+		return nil, err
+	}
+	return &preparationApply{admission: admission, plan: plan, reference: reference, retained: map[string]syscall.Stat_t{}, attributes: map[string][]byte{}, moveSources: preparationMoveSources(plan), hooks: hooks, adapter: adapter, inventory: inventory}, nil
+}
+
+// No failed invocation retries a mutation. A joined new invocation reads back
+// the same original plan and never resets completed or pending journal records.
+func applyPreparation(ctx context.Context, reference Reference, adapter PreparationAdapter, host Host, scope ownerScope, hooks *preparationHooks) (result PreparationResult, resultErr error) {
+	self, err := openPreparationApplication(ctx, reference, adapter, host, scope, hooks, nil)
 	if err != nil {
 		return result, err
 	}
 	defer func() {
-		resultErr = errors.Join(resultErr, admission.close())
+		resultErr = errors.Join(resultErr, self.close())
 		if resultErr != nil {
 			result = PreparationResult{}
-		}
-	}()
-	if !reflect.DeepEqual(admission.identities, plan.Directories) || admission.identities[request.RootPath] != plan.Root || admission.mount != plan.Mount || admission.filesystem.Id != plan.Filesystem.Id || admission.filesystem.Type != plan.Filesystem.Type {
-		return result, errors.Join(ErrIdentity, errors.New("accepted preparation physical generation changed"))
-	}
-	if err := admission.fence(); err != nil {
-		return result, err
-	}
-	self := &preparationApply{admission: admission, plan: plan, reference: reference, retained: map[string]syscall.Stat_t{}, attributes: map[string][]byte{}, moveSources: preparationMoveSources(plan), hooks: hooks}
-	defer func() {
-		if self.control != nil {
-			resultErr = errors.Join(resultErr, self.control.Close())
 		}
 	}()
 	if err := self.openControl(); err != nil {
 		return result, err
 	}
+	return self.run()
+}
+
+// Closing joins this synchronous application's retained control and all roots.
+func (self *preparationApply) close() error {
+	var err error
+	if self.control != nil {
+		err = self.control.Close()
+		self.control = nil
+	}
+	return errors.Join(err, self.admission.close())
+}
+
+// Both read-only cohort admission and publication walk the same exact sequence.
+// The read-only walk stops at the first unacknowledged step without mutation.
+func (self *preparationApply) run() (result PreparationResult, resultErr error) {
+	plan, reference := self.plan, self.reference
+	admission := self.admission
+	request, ctx, scope := admission.request, admission.ctx, admission.scope
+	adapter, inventory := self.adapter, self.inventory
+	var err error
 	if request.RootCreation == "create-private" {
 		if err := self.step(preparationRootStep(request, plan)); err != nil {
 			return result, err

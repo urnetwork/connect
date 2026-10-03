@@ -244,6 +244,12 @@ func (self *preparationAdmission) facts() (Mount, Filesystem, error) {
 // Every parent remains precreated. A missing target is admitted only by the
 // explicit create-private profile and exact staged source, never runtime fallback.
 func openPreparationAdmission(ctx context.Context, request PreparationRequest, host Host, scope ownerScope, rootSource string) (_ *preparationAdmission, resultErr error) {
+	return openPreparationAdmissionWithParents(ctx, request, host, scope, rootSource, nil)
+}
+
+// A synchronous cohort may share the same retained private-parent description
+// for sibling root moves. Duplicates share its flock; unrelated owners do not.
+func openPreparationAdmissionWithParents(ctx context.Context, request PreparationRequest, host Host, scope ownerScope, rootSource string, sharedParents map[string]*os.File) (_ *preparationAdmission, resultErr error) {
 	if ctx == nil || host == nil {
 		return nil, errors.New("preparation context and host are required")
 	}
@@ -264,7 +270,18 @@ func openPreparationAdmission(ctx context.Context, request PreparationRequest, h
 		if self.directories[path] != nil {
 			continue
 		}
-		file, err := openPhysicalDirectory(path)
+		var file *os.File
+		var err error
+		if original := sharedParents[path]; original != nil {
+			var fd int
+			fd, err = syscall.Dup(int(original.Fd()))
+			if err == nil {
+				syscall.CloseOnExec(fd)
+				file = os.NewFile(uintptr(fd), path)
+			}
+		} else {
+			file, err = openPhysicalDirectory(path)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -308,6 +325,12 @@ func openPreparationAdmission(ctx context.Context, request PreparationRequest, h
 	}
 	if err := self.check(); err != nil {
 		return nil, err
+	}
+	if sharedParents != nil && request.RootCreation == "create-private" {
+		parentPath := filepath.Dir(request.RootPath)
+		if sharedParents[parentPath] == nil {
+			sharedParents[parentPath] = self.directories[parentPath]
+		}
 	}
 	return self, nil
 }
