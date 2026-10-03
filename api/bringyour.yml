@@ -10638,6 +10638,12 @@ components:
           type: boolean
         currency:
           type: string
+        recipient:
+          type: string
+          description: the merchant address (base58) to pay; build the payment url from this, never a hardcoded address
+        spl_token_mint:
+          type: string
+          description: the SPL token mint (base58) to pay in (USDC)
         error:
           oneOf:
             - $ref: "#/components/schemas/ErrorMessage"
