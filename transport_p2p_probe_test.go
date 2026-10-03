@@ -1,3 +1,5 @@
+//go:build !js
+
 // End-to-end stream readiness tests model opaque intermediary forwarding,
 // exact transport generations, reconnect epochs, compatibility, and carrier
 // accounting without requiring a public network.

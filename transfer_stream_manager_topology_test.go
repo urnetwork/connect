@@ -1,3 +1,5 @@
+//go:build !js
+
 // Intermediary topology tests pin adjacent destination route keys across both
 // private forwarding directions with real loopback WebRTC associations.
 package connect
