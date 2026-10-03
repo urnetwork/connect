@@ -112,16 +112,18 @@ func (self *UdpSequence) returnReadPollShard() *udpSocketReadPollShard {
 // The portable reader already owns a per-flow goroutine. Its real UDP socket
 // waits for readability without consuming the datagram, then obtains the same
 // credit as the shared poller. Quiet sockets therefore do not hoard flight
-// memory. Non-syscall test/custom connections retain the bounded pre-read wait.
+// memory. Non-syscall test/custom connections, and platforms without a
+// datagram peek, retain the bounded pre-read wait.
 func (self *UdpSequence) awaitReturnRead(socket net.Conn, readBuffer []byte) (*udpReturnReadLease, error) {
 	if self.prepareReturnReadCallback == nil {
 		return nil, nil
 	}
 	readBytes := len(readBuffer)
-	if raw, ok := socketRawConn(socket); ok {
+	// without a peek (windows, js) the read is charged the full buffer
+	if raw, ok := socketRawConn(socket); ok && udpSocketPeekSupported {
 		var readErr error
 		if err := raw.Read(func(fd uintptr) bool {
-			readBytes, _, readErr = syscall.Recvfrom(SocketHandle(fd), readBuffer, syscall.MSG_PEEK)
+			readBytes, readErr = peekUdpSocket(SocketHandle(fd), readBuffer)
 			return !errors.Is(readErr, syscall.EAGAIN) && !errors.Is(readErr, syscall.EWOULDBLOCK)
 		}); err != nil {
 			return nil, err
