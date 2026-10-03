@@ -125,12 +125,14 @@ type PreparedAttribute struct {
 	Raw  []byte                   `json:"raw"`
 }
 
-// Only a fixed restore adapter may nominate one unsigned physical census.
+// Only a fixed restore adapter may nominate an unsigned physical census and
+// its optional single interrupted-checkpoint companion, each within the bound.
 // Original bytes remain separately retained; signed member payloads do not
 // receive this permission. The reviewed bound is independent of plan size.
 type PreparationPhysicalMetadata struct {
-	Path         string `json:"path"`
-	MaximumBytes uint64 `json:"maximum_bytes"`
+	Path          string `json:"path"`
+	MaximumBytes  uint64 `json:"maximum_bytes"`
+	CompanionPath string `json:"companion_path,omitempty"`
 }
 
 // Both original and derived hashes remain in the accepted plan. Original is
