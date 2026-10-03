@@ -14,6 +14,7 @@ const PreparationPlanSchema = "urnetwork-storage-preparation-plan-v1"
 const PreparationResultSchema = "urnetwork-storage-preparation-result-v1"
 const PreparationFenceSchema = "urnetwork-storage-preparation-fence-v1"
 const PreparationAttribute = "user.urnetwork.storage-preparation"
+const PreparationCompleteUnion = "complete-union-v1"
 
 var ErrPreparationUncertain = errors.New("storage preparation requires joined exact-plan readback")
 
@@ -72,6 +73,8 @@ type PreparationOwner struct {
 	RelativePath string          `json:"relative_path"`
 	Purpose      string          `json:"purpose"`
 	Inputs       json.RawMessage `json:"inputs"`
+	// Absence preserves the original complete single-owner restore contract.
+	RestoreCoverage string `json:"restore_coverage,omitempty"`
 }
 
 // External evidence is an explicit assertion, not proof from a local flock

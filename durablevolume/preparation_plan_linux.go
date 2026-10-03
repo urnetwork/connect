@@ -463,12 +463,6 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 			prepared, err = adapter.Build(ctx, admission.directories[request.StagingDirectory], name, owner)
 		} else {
 			prepared, err = adapter.Restore(ctx, name, owner, archive.inventory)
-			if err == nil {
-				err = validatePreparationRestoreOwner(archive.inventory, prepared)
-			}
-			if err == nil {
-				err = archive.stage(admission.directories[request.StagingDirectory], name, prepared)
-			}
 		}
 		if err != nil {
 			return result, err
@@ -477,9 +471,19 @@ func planPreparation(ctx context.Context, reference Reference, adapter Preparati
 			return result, errors.New("preparation adapter changed its exact public owner scope")
 		}
 		result.Owners = append(result.Owners, prepared)
-		if prepared.PhysicalMetadata != nil {
-			if archive == nil {
-				return result, errors.New("fresh preparation cannot derive retained physical metadata")
+		if prepared.PhysicalMetadata != nil && archive == nil {
+			return result, errors.New("fresh preparation cannot derive retained physical metadata")
+		}
+	}
+	if archive != nil {
+		// Pure owner views must form a complete disjoint union before any
+		// source member is staged. The original full report remains retained.
+		if err := validatePreparationRestoreCoverage(archive.inventory, result.Owners); err != nil {
+			return result, err
+		}
+		for index, owner := range result.Owners {
+			if err := archive.stage(admission.directories[request.StagingDirectory], owner.StagingName, owner); err != nil {
+				return result, err
 			}
 			if err := preparePhysicalMetadata(ctx, admission, adapter, archive.inventory, &result, index); err != nil {
 				return result, err

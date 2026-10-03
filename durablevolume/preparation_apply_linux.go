@@ -912,6 +912,7 @@ func applyPreparation(ctx context.Context, reference Reference, adapter Preparat
 		if err != nil {
 			return result, err
 		}
+		expectedOwners := make([]PreparationOwnerPlan, 0, len(plan.Owners))
 		for _, owner := range plan.Owners {
 			expected, err := adapter.Restore(ctx, owner.StagingName, owner.Owner, inventory)
 			if err != nil {
@@ -920,9 +921,10 @@ func applyPreparation(ctx context.Context, reference Reference, adapter Preparat
 			if owner.PhysicalMetadata == nil && !reflect.DeepEqual(expected, owner) {
 				return result, errors.New("accepted restore owner differs from its original fixed semantic census")
 			}
-			if err := validatePreparationRestoreOwner(inventory, expected); err != nil {
-				return result, err
-			}
+			expectedOwners = append(expectedOwners, expected)
+		}
+		if err := validatePreparationRestoreCoverage(inventory, expectedOwners); err != nil {
+			return result, err
 		}
 	}
 	if err := validatePhysicalMetadataDerivations(ctx, request, plan, adapter, inventory); err != nil {

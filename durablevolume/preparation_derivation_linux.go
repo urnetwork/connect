@@ -15,16 +15,18 @@ import (
 	"syscall"
 )
 
-// This first physical-metadata profile is a flat, exclusive owner namespace.
-// Shared-owner union admission is distinct; no overlapping claim is filtered.
+// Physical metadata has a fixed flat namespace. Shared ownership requires the
+// separately explicit and complete disjoint coverage profile.
 func validatePreparationPhysicalMetadata(request PreparationRequest, owner PreparationOwnerPlan) error {
 	metadata := owner.PhysicalMetadata
 	if metadata == nil {
 		return nil
 	}
-	if request.Purpose != "restore" || owner.Owner.Purpose != "restore" || !owner.ExclusiveRoot || len(request.Owners) != 1 ||
+	legacy := owner.Owner.RestoreCoverage == "" && owner.ExclusiveRoot && len(request.Owners) == 1
+	union := owner.Owner.RestoreCoverage == PreparationCompleteUnion
+	if request.Purpose != "restore" || owner.Owner.Purpose != "restore" || !legacy && !union ||
 		!preparationRelative(metadata.Path, 1, false) || metadata.MaximumBytes == 0 || metadata.MaximumBytes > 8*1024*1024 {
-		return errors.New("physical metadata requires a bounded exclusive restore profile")
+		return errors.New("physical metadata requires bounded exclusive or complete-union restore coverage")
 	}
 	if _, err := preparationRootRenameNumber(); err != nil {
 		return err
@@ -260,7 +262,7 @@ func validatePhysicalMetadataDerivations(ctx context.Context, request Preparatio
 		}
 		targets := make([]PreparationSource, 0, len(owner.Files)-1)
 		for _, source := range plan.Sources {
-			if preparationSourceMoves(plan, source) && source.File.Path != owner.PhysicalMetadata.Path {
+			if filepath.Base(filepath.Dir(source.Path)) == owner.StagingName && source.File.Path != owner.PhysicalMetadata.Path {
 				targets = append(targets, source)
 			}
 		}
