@@ -606,6 +606,12 @@ paths:
     post:
       description: |
         Send verification code to email or phone number.
+
+        With `result_errors` set, a code that was not sent is reported in the
+        result `error` (`verify_send_failed`, or `verify_rate_limited` with
+        `retry_after_seconds`). Without it, a rate limit is a 429 and a failed
+        send is a 502, both with a plain text body. Clients must not report a
+        code as sent unless the response is a 200 without `error`.
       operationId: Auth Verify Send
       security: []
       requestBody:
@@ -621,6 +627,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthVerifySendResult"
+        "429":
+          description: Too many attempts (requests without `result_errors`). Plain text body.
+          headers:
+            Retry-After:
+              description: Seconds until a new code can be requested.
+              schema:
+                type: integer
+        "502":
+          description: The code could not be sent (requests without `result_errors`). Plain text body.
 
   /auth/password-reset:
     post:
@@ -6211,6 +6226,11 @@ components:
             user_auth:
               description: email or phone number
               type: string
+            send_error:
+              description: |
+                Present when the verification code was not sent. Clients must
+                not say a code was sent, and show this instead.
+              $ref: "#/components/schemas/AuthVerifySendError"
         network:
           type: object
           required: []
@@ -6269,6 +6289,11 @@ components:
         use_numeric:
           description: optionally create a numeric 6 digit code instead of the default 8 digit
           type: boolean
+        result_errors:
+          description: |
+            Report a code that was not sent in the result `error` with a 200,
+            instead of a 429 or 502. New clients set this.
+          type: boolean
 
     AuthVerifySendResult:
       type: object
@@ -6278,6 +6303,28 @@ components:
         user_auth:
           description: email or phone number
           type: string
+        error:
+          description: Present when the code was not sent (only with `result_errors`).
+          $ref: "#/components/schemas/AuthVerifySendError"
+
+    AuthVerifySendError:
+      description: A verification code that was not sent.
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: |
+            `verify_send_failed`: the email or SMS send failed.
+            `verify_rate_limited`: too many attempts; see `retry_after_seconds`.
+            Clients treat an unknown code as a code that was not sent.
+        message:
+          type: string
+        retry_after_seconds:
+          description: For `verify_rate_limited`, seconds until a new code can be requested.
+          type: integer
 
     AuthPasswordResetArgs:
       type: object
@@ -6408,6 +6455,11 @@ components:
             user_auth:
               description: email or phone number
               type: string
+            send_error:
+              description: |
+                Present when the verification code was not sent. Clients must
+                not say a code was sent, and show this instead.
+              $ref: "#/components/schemas/AuthVerifySendError"
         error:
           type: object
           required:
