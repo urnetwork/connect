@@ -17,10 +17,10 @@ name: Test — mls/syntax
 on:
   push:
     branches:
-      - beta/message
+      - main
   pull_request:
     branches:
-      - beta/message
+      - main
   workflow_dispatch:
 
 permissions:
