@@ -3643,7 +3643,8 @@ paths:
       description: |
         Verify that a wallet holds a Seeker or Saga Genesis token by
         validating a signed message. Either holding succeeds; a wallet with
-        neither is refused with `error.message`.
+        neither is refused with `error.message` and `error.code`
+        `seeker_token_not_found`.
       operationId: Account Verify Seeker Token
       security:
         - BearerAuth: []
@@ -11649,6 +11650,15 @@ components:
             - message
           properties:
             message:
+              type: string
+            code:
+              description: |
+                Why the wallet was not verified, for a localized message.
+                `seeker_token_not_found`: the wallet holds no Seeker or Saga token.
+                `seeker_invalid_signature`: the wallet signature did not verify.
+                `seeker_lookup_failed`: the token lookup failed.
+                Absent from older servers; clients fall back to `message` for
+                an absent or unknown code.
               type: string
 
     UploadLogFileResult:
