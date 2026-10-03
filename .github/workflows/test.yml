@@ -25,6 +25,12 @@ jobs:
       - name: Check out glog dependency
         run: git clone --depth 1 https://github.com/urnetwork/glog.git ../glog
 
+      # go.mod also has `replace gvisor.dev/gvisor => ../gvisor`: urnetwork's fork
+      # of gvisor, on its `go` branch. Without it every step that compiles stops at
+      # "replacement directory ../gvisor does not exist".
+      - name: Check out gvisor dependency
+        run: git clone --depth 1 --branch go https://github.com/urnetwork/gvisor.git ../gvisor
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
