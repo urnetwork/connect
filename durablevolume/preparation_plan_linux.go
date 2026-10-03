@@ -93,14 +93,24 @@ func (self PreparationRequest) validate(scope ownerScope) error {
 		}
 	}
 	limit := self.Limits
+	maximumOwners, maximumOwnerAttributes := 32, uint64(128)
+	switch self.CapacityProfile {
+	case "":
+	case "urnetwork-preparation-many-owners-v1":
+		// Counts are explicit opt-in bounds, not a larger allocation or a
+		// bypass of the request, plan, per-attribute or control byte limits.
+		maximumOwners, maximumOwnerAttributes = 2048, 2048
+	default:
+		return errors.New("storage preparation capacity profile is unsupported")
+	}
 	maximumEntries := uint64(10000)
 	if self.Purpose == "restore" {
 		maximumEntries = MaximumPhysicalInventoryEntries
 	}
 	if limit.MaxEntries == 0 || limit.MaxEntries > maximumEntries || limit.MaxBytes == 0 || limit.MaxBytes > 1024*1024*1024*1024 ||
-		limit.MaxDepth == 0 || limit.MaxDepth > 16 || limit.MaxOwnerAttributes == 0 || limit.MaxOwnerAttributes > 128 ||
-		limit.MaxOwnerAttributeBytes == 0 || limit.MaxOwnerAttributeBytes > 128*4096 || limit.MaxPlanBytes < 4096 || limit.MaxPlanBytes > maximumPreparationPlanBytes ||
-		len(self.Owners) == 0 || len(self.Owners) > 32 {
+		limit.MaxDepth == 0 || limit.MaxDepth > 16 || limit.MaxOwnerAttributes == 0 || limit.MaxOwnerAttributes > maximumOwnerAttributes ||
+		limit.MaxOwnerAttributeBytes == 0 || limit.MaxOwnerAttributeBytes > maximumOwnerAttributes*4096 || limit.MaxPlanBytes < 4096 || limit.MaxPlanBytes > maximumPreparationPlanBytes ||
+		len(self.Owners) == 0 || len(self.Owners) > maximumOwners {
 		return errors.New("storage preparation capacities are absent or exceed the finite profile")
 	}
 	// Reuse daemon/owner-local declaration validation without enrolling any

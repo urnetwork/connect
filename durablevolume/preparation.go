@@ -36,9 +36,12 @@ type PreparationLimits struct {
 // The command independently selects daemon or owner-local scope. Restore has
 // separate source authority; neither purpose is inferred from an empty target.
 type PreparationRequest struct {
-	Schema             string                    `json:"schema"`
-	Purpose            string                    `json:"purpose"`
-	Scope              string                    `json:"scope"`
+	Schema  string `json:"schema"`
+	Purpose string `json:"purpose"`
+	Scope   string `json:"scope"`
+	// Empty retains the original 32-owner/128-attribute profile. The explicit
+	// many-owner profile changes counts only; all other finite limits still join.
+	CapacityProfile    string                    `json:"capacity_profile,omitempty"`
 	MountPath          string                    `json:"mount_path"`
 	FilesystemUuid     string                    `json:"filesystem_uuid"`
 	FilesystemType     string                    `json:"filesystem_type"`
