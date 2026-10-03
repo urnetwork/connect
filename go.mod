@@ -2,6 +2,8 @@ module github.com/urnetwork/connect
 
 go 1.26.3
 
+toolchain go1.26.5
+
 require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815

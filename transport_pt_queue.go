@@ -284,6 +284,9 @@ type pumpItem struct {
 	header     [18]byte
 	tld        []byte
 	updateTime time.Time
+	// insertion order within the owning pumpQueue, assigned by Add.
+	// zero for an item that was never added.
+	seq uint64
 
 	heapIndex    int
 	maxHeapIndex int
@@ -296,6 +299,14 @@ type pumpQueue struct {
 	orderedItems []*pumpItem
 
 	addrMaxHeap map[string]*pumpQueueMaxHeap
+
+	// counter for pumpItem.seq, which breaks ties between items stamped with the
+	// same updateTime. updateTime alone is only a partial order, and a heap over
+	// a partial order returns an arbitrary element among ties, so RemoveLast
+	// would not reliably return the most recently added item. That is not a rare
+	// edge case: time.Now() advances every ~500us on Windows, so a burst of adds
+	// lands wholly inside one tick and the ties are the normal case there.
+	seq uint64
 
 	settings *PacketTranslationSettings
 }
@@ -352,6 +363,8 @@ func (self *pumpQueue) RemoveLastN(addr net.Addr, n int) []*pumpItem {
 	return items
 }
 
+// removes every item that was updated at or before minUpdateTime.
+// see combineQueue.RemoveOlder for why the boundary is inclusive.
 func (self *pumpQueue) RemoveOlder(minUpdateTime time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -401,6 +414,8 @@ func (self *pumpQueue) Add(item *pumpItem) (limit bool) {
 	}
 
 	item.updateTime = time.Now()
+	self.seq += 1
+	item.seq = self.seq
 
 	heap.Push(self, item)
 	heap.Push(maxHeap, item)
@@ -430,8 +445,15 @@ func (self *pumpQueue) Len() int {
 	return len(self.orderedItems)
 }
 
+// ordered by update time ascending, ties broken by insertion order so that the
+// order is total. see pumpQueue.seq
 func (self *pumpQueue) Less(i int, j int) bool {
-	return self.orderedItems[i].updateTime.Before(self.orderedItems[j].updateTime)
+	a := self.orderedItems[i]
+	b := self.orderedItems[j]
+	if a.updateTime.Equal(b.updateTime) {
+		return a.seq < b.seq
+	}
+	return a.updateTime.Before(b.updateTime)
 }
 
 func (self *pumpQueue) Swap(i int, j int) {
@@ -495,8 +517,17 @@ func (self *pumpQueueMaxHeap) Len() int {
 	return len(self.orderedItems)
 }
 
+// ordered by update time descending, ties broken by insertion order so that the
+// order is total. see pumpQueue.seq. RemoveLast reads the head of this heap, so
+// without the tiebreak it returns an arbitrary item from the newest tick rather
+// than the most recently added one.
 func (self *pumpQueueMaxHeap) Less(i int, j int) bool {
-	return self.orderedItems[j].updateTime.Before(self.orderedItems[i].updateTime)
+	a := self.orderedItems[i]
+	b := self.orderedItems[j]
+	if a.updateTime.Equal(b.updateTime) {
+		return b.seq < a.seq
+	}
+	return b.updateTime.Before(a.updateTime)
 }
 
 func (self *pumpQueueMaxHeap) Swap(i int, j int) {
