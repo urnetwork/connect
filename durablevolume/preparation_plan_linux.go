@@ -103,12 +103,16 @@ func (self PreparationRequest) validate(scope ownerScope) error {
 	default:
 		return errors.New("storage preparation capacity profile is unsupported")
 	}
-	maximumEntries := uint64(10000)
+	maximumEntries, maximumDepth := uint64(10000), uint64(16)
 	if self.Purpose == "restore" {
 		maximumEntries = MaximumPhysicalInventoryEntries
+		// Restore must represent the complete namespace already admitted by
+		// physical inventory. The reviewed request still chooses its exact
+		// finite depth; fresh preparation keeps its existing smaller profile.
+		maximumDepth = 32
 	}
 	if limit.MaxEntries == 0 || limit.MaxEntries > maximumEntries || limit.MaxBytes == 0 || limit.MaxBytes > 1024*1024*1024*1024 ||
-		limit.MaxDepth == 0 || limit.MaxDepth > 16 || limit.MaxOwnerAttributes == 0 || limit.MaxOwnerAttributes > maximumOwnerAttributes ||
+		limit.MaxDepth == 0 || limit.MaxDepth > maximumDepth || limit.MaxOwnerAttributes == 0 || limit.MaxOwnerAttributes > maximumOwnerAttributes ||
 		limit.MaxOwnerAttributeBytes == 0 || limit.MaxOwnerAttributeBytes > maximumOwnerAttributes*4096 || limit.MaxPlanBytes < 4096 || limit.MaxPlanBytes > maximumPreparationPlanBytes ||
 		len(self.Owners) == 0 || len(self.Owners) > maximumOwners {
 		return errors.New("storage preparation capacities are absent or exceed the finite profile")
