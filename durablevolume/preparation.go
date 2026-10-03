@@ -19,7 +19,10 @@ const PreparationCompleteUnion = "complete-union-v1"
 var ErrPreparationUncertain = errors.New("storage preparation requires joined exact-plan readback")
 
 // Instance-local refusal barriers are used only by deterministic package tests.
-type preparationHooks struct{ after func(string, string) error }
+type preparationHooks struct {
+	after      func(string, string) error
+	sourceRead func(string, int)
+}
 
 // Every variable work dimension is independently finite. The initial profile
 // also fixes individual custody attributes at 4096 bytes, control records at

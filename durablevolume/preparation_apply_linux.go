@@ -70,6 +70,7 @@ type preparationAnchor struct {
 // before returning. Reconciliation always opens a distinct joined invocation.
 type preparationApply struct {
 	admission   *preparationAdmission
+	archive     *preparationRestoreArchive
 	plan        PreparationPlan
 	reference   Reference
 	control     *os.File
@@ -209,6 +210,11 @@ func (self *preparationApply) check() error {
 	}
 	if err := self.admission.check(); err != nil {
 		return err
+	}
+	if self.archive != nil {
+		if err := self.archive.checkRoot(); err != nil {
+			return err
+		}
 	}
 	if self.control != nil {
 		if err := sameNamedFile(self.control, self.admission.request.ControlPath); err != nil {
@@ -990,7 +996,25 @@ func openPreparationApplication(ctx context.Context, reference Reference, adapte
 	if err := admission.fence(); err != nil {
 		return nil, err
 	}
-	return &preparationApply{admission: admission, plan: plan, reference: reference, retained: map[string]syscall.Stat_t{}, attributes: map[string][]byte{}, moveSources: preparationMoveSources(plan), hooks: hooks, adapter: adapter, inventory: inventory}, nil
+	self := &preparationApply{admission: admission, plan: plan, reference: reference, retained: map[string]syscall.Stat_t{}, attributes: map[string][]byte{}, moveSources: preparationMoveSources(plan), hooks: hooks, adapter: adapter, inventory: inventory}
+	if request.Purpose == "restore" {
+		self.archive, err = openPreparationRestoreArchive(ctx, request, host)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if resultErr != nil {
+				resultErr = errors.Join(resultErr, self.archive.close())
+			}
+		}()
+		if plan.RestoreArchive == nil || self.archive.identity != *plan.RestoreArchive {
+			return nil, errors.Join(ErrIdentity, errors.New("accepted restore archive physical generation changed"))
+		}
+		if err := self.archive.authenticate(hooks); err != nil {
+			return nil, err
+		}
+	}
+	return self, nil
 }
 
 // No failed invocation retries a mutation. A joined new invocation reads back
@@ -1006,6 +1030,9 @@ func applyPreparation(ctx context.Context, reference Reference, adapter Preparat
 			result = PreparationResult{}
 		}
 	}()
+	if err := self.checkRestore(); err != nil {
+		return result, err
+	}
 	if err := self.openControl(); err != nil {
 		return result, err
 	}
@@ -1019,12 +1046,24 @@ func (self *preparationApply) close() error {
 		err = self.control.Close()
 		self.control = nil
 	}
+	if self.archive != nil {
+		err = errors.Join(err, self.archive.close())
+		self.archive = nil
+	}
 	return errors.Join(err, self.admission.close())
 }
 
 // Both read-only cohort admission and publication walk the same exact sequence.
 // The read-only walk stops at the first unacknowledged step without mutation.
 func (self *preparationApply) run() (result PreparationResult, resultErr error) {
+	// Full source names/attributes are checked at operation boundaries, never
+	// rehashed for every target member or journal append.
+	defer func() {
+		resultErr = errors.Join(resultErr, self.checkRestore())
+		if resultErr != nil {
+			result = PreparationResult{}
+		}
+	}()
 	plan, reference := self.plan, self.reference
 	admission := self.admission
 	request, ctx, scope := admission.request, admission.ctx, admission.scope

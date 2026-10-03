@@ -184,6 +184,9 @@ func prepareCohort(ctx context.Context, reference Reference, adapter Preparation
 	}
 	if apply {
 		for _, self := range applications {
+			if err := self.checkRestore(); err != nil {
+				return result, err
+			}
 			prepared := self.prepared
 			if self.complete {
 				// Read-only preflight already authenticated the completed bytes.
@@ -209,6 +212,11 @@ func prepareCohort(ctx context.Context, reference Reference, adapter Preparation
 			}
 		}
 		result.Complete = true
+	}
+	for _, self := range applications {
+		if err := self.checkRestore(); err != nil {
+			return result, err
+		}
 	}
 	if result.Complete {
 		result.DeclarationDocument, result.DeclarationSha256 = string(declaration), preparationDigest(declaration)

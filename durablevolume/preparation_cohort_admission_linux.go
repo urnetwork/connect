@@ -155,5 +155,5 @@ func (self *preparationApply) preflight() (resultErr error) {
 			}
 		}
 	}
-	return self.check()
+	return errors.Join(self.check(), self.checkRestore())
 }

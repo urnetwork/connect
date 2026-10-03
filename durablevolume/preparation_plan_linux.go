@@ -702,6 +702,12 @@ func preparationOpenAbsolute(path string, directory bool) (*os.File, error) {
 // Hash work is chunked and exactly bounded, including detection of appended
 // bytes. The caller independently retains/rechecks the named inode.
 func preparationVerifyFile(ctx context.Context, file *os.File, size uint64, digest string) error {
+	return preparationVerifyFileWithRead(ctx, file, size, digest, nil)
+}
+
+// The optional observer reports actual bytes read and cannot supply data or
+// change an admission verdict. Ordinary callers do not install an observer.
+func preparationVerifyFileWithRead(ctx context.Context, file *os.File, size uint64, digest string, read func(int)) error {
 	var before, after syscall.Stat_t
 	if err := syscall.Fstat(int(file.Fd()), &before); err != nil {
 		return unavailableObservation("preparation file size could not be observed", err)
@@ -717,6 +723,9 @@ func preparationVerifyFile(ctx context.Context, file *os.File, size uint64, dige
 		}
 		part := buffer[:min(uint64(len(buffer)), size-offset)]
 		n, err := file.ReadAt(part, int64(offset))
+		if read != nil && n > 0 {
+			read(n)
+		}
 		if err != nil || n != len(part) {
 			return errors.Join(unavailableObservation("preparation exact file read failed", err), io.ErrUnexpectedEOF)
 		}
