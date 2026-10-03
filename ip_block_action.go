@@ -93,6 +93,58 @@ type BlockAction struct {
 	RouteOverrideId *Id
 	PacketCount     int
 	ByteCount       ByteCount
+	// what decided a blocked or locally routed action, one of the
+	// BlockActionReason values; empty for ordinary provider-routed traffic
+	Reason string
+}
+
+// BlockAction reasons. The security reasons mean the URnetwork safety rules
+// (ip_security.go) kept the traffic off the providers: blocked with the kill
+// switch on, routed from the device's own address with it off.
+const (
+	// the destination's traffic looked fully encrypted and matched no
+	// recognized protocol
+	BlockActionReasonSecurityEncrypted = "security-encrypted"
+	// a BitTorrent signature; never overridable
+	BlockActionReasonSecurityBittorrent = "security-bittorrent"
+	// the destination port is not allowed
+	BlockActionReasonSecurityPort = "security-port"
+	// the destination address is not public or is on the reputation blocklist
+	BlockActionReasonSecurityIp = "security-ip"
+	// smtp must be encrypted, and port 25 is routed locally
+	BlockActionReasonSecuritySmtp = "security-smtp"
+	// another security rule (a custom policy)
+	BlockActionReasonSecurity = "security"
+	// the ad/tracker blocker matched
+	BlockActionReasonBlocker = "blocker"
+	// a user block or route override decided
+	BlockActionReasonOverride = "override"
+)
+
+// blockActionReason names what decided an egress action. An override takes
+// precedence, then the blocker, then the security result.
+func blockActionReason(r SecurityPolicyResult, reason SecurityPolicyReason, blockerBlock bool, match *blockActionMatch) string {
+	if match != nil && (match.blockOverride != nil || match.routeOverride != nil) {
+		return BlockActionReasonOverride
+	}
+	if blockerBlock {
+		return BlockActionReasonBlocker
+	}
+	if r == SecurityPolicyResultAllow {
+		return ""
+	}
+	switch reason {
+	case SecurityPolicyReasonDropEncrypted:
+		return BlockActionReasonSecurityEncrypted
+	case SecurityPolicyReasonBittorrent:
+		return BlockActionReasonSecurityBittorrent
+	case SecurityPolicyReasonCfaaDropPort:
+		return BlockActionReasonSecurityPort
+	case SecurityPolicyReasonCfaaDropIp, SecurityPolicyReasonNotPublic:
+		return BlockActionReasonSecurityIp
+	default:
+		return BlockActionReasonSecurity
+	}
 }
 
 type BlockActionFunction func(blockActions []*BlockAction)
@@ -811,6 +863,7 @@ type blockActionKey struct {
 	// zero when no override applied
 	blockOverrideId Id
 	routeOverrideId Id
+	reason          string
 }
 
 type blockActionAgg struct {
@@ -853,6 +906,7 @@ func (self *blockActionCollector) add(
 	block bool,
 	local bool,
 	match *blockActionMatch,
+	reason string,
 	byteCount ByteCount,
 ) {
 	key := blockActionKey{
@@ -860,6 +914,7 @@ func (self *blockActionCollector) add(
 		block:      block,
 		local:      local,
 		blocker:    decision.blockerBlock,
+		reason:     reason,
 	}
 	if match != nil {
 		if match.blockOverride != nil {
@@ -960,6 +1015,7 @@ func (self *blockActionCollector) flush() {
 			Blocker:      key.blocker,
 			PacketCount:  keyAgg.packetCount,
 			ByteCount:    keyAgg.byteCount,
+			Reason:       key.reason,
 		}
 		if key.blockOverrideId != (Id{}) {
 			blockOverrideId := key.blockOverrideId

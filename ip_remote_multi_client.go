@@ -460,6 +460,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		EventEpoch:                  1 * time.Second,
 		BlockActionDecisionTtl:      30 * time.Second,
 		BlockActionDecisionMaxCount: 4096,
+		PolicyHintTtl:               10 * time.Minute,
+		PolicyHintMaxCount:          1024,
 		BlockActionAggMaxCount:      1024,
 		IpAssocSettings:             DefaultIpAssocSettings(),
 
@@ -1296,6 +1298,12 @@ type MultiClientSettings struct {
 	BlockActionDecisionMaxCount int
 	// max distinct block actions aggregated per epoch
 	BlockActionAggMaxCount int
+	// how long a destination whose flow the security policy dropped as
+	// unsanctioned encrypted traffic keeps routing the app's retries
+	// consistently (local with the security bypass, refused without it).
+	// 0 disables the hints
+	PolicyHintTtl      time.Duration
+	PolicyHintMaxCount int
 	// nil disables activity association (`IpAssoc`)
 	IpAssocSettings *IpAssocSettings
 
@@ -1598,6 +1606,9 @@ type RemoteUserNatMultiClient struct {
 	// immutable snapshot of the compiled overrides, swapped by `SetBlockActionOverrides`
 	blockActionState atomic.Pointer[blockActionState]
 	blockActionCache *blockActionCache
+	// destinations whose flow was dropped as unsanctioned encrypted traffic;
+	// nil when disabled
+	policyLocalHints *policyHintCache
 
 	// the G-4b flow-owner seam: the platform's resolver for "which pinned
 	// app owns this flow", with its per-flow-key answer cache. Zero values
@@ -2466,6 +2477,7 @@ func NewRemoteUserNatMultiClient(
 		destinationServiceFailures: map[destinationServiceFailureKey]destinationServiceFailure{},
 		localUserNat:               localUserNat,
 		blockActionCache:           newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		policyLocalHints:           newPolicyHintCache(settings.PolicyHintTtl, settings.PolicyHintMaxCount, nil),
 		blockActionCollector:       newBlockActionCollector(settings.BlockActionAggMaxCount, log),
 		blockActionIgnoreCache:     newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
 		packetStatsCounters:        &packetStatsCounters{},
@@ -2649,6 +2661,11 @@ func (self *RemoteUserNatMultiClient) localReceivePacket(
 
 func (self *RemoteUserNatMultiClient) SecurityPolicyStats(reset bool) SecurityPolicyStats {
 	return self.securityPolicyStats.Stats(reset)
+}
+
+// SecurityPolicyReasons returns the egress verdict-reason counts per port.
+func (self *RemoteUserNatMultiClient) SecurityPolicyReasons(reset bool) SecurityPolicyReasonStats {
+	return self.securityPolicyStats.Reasons(reset)
 }
 
 func (self *RemoteUserNatMultiClient) Monitor() MultiClientMonitor {
@@ -5904,7 +5921,13 @@ func (self *RemoteUserNatMultiClient) sendSmtpLocal(
 	)
 	byteCount := ByteCount(len(packet))
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
-		self.blockActionCollector.add(decision, block, local, match, byteCount)
+		reason := BlockActionReasonSecuritySmtp
+		if match != nil && (match.blockOverride != nil || match.routeOverride != nil) {
+			reason = BlockActionReasonOverride
+		} else if blockerBlock {
+			reason = BlockActionReasonBlocker
+		}
+		self.blockActionCollector.add(decision, block, local, match, reason, byteCount)
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
@@ -5933,12 +5956,82 @@ func (self *RemoteUserNatMultiClient) rejectSmtpPacket(
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
 		// Encryption enforcement is not overridable. Pass no match so a user
 		// override is not reported as the cause of this mandatory rejection.
-		self.blockActionCollector.add(decision, true, false, nil, byteCount)
+		self.blockActionCollector.add(decision, true, false, nil, BlockActionReasonSecuritySmtp, byteCount)
 	}
 	self.packetStatsCounters.blockEgressPacketCount.Add(1)
 	self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
 	self.logSparseSendDrop("smtp encryption", &self.sendSmtpDropCount, errSmtpEncryptionRequired)
 	deliverTcpPolicyReset(self.deliverReceivePacket, source, provideMode, ipPath, packet)
+}
+
+// securityRoute turns a security result into the route for one packet (or one
+// flow group). It applies two client-side rules on top of blockActionApply:
+//
+//   - fail fast: the policy allows a flow while it is inspecting, so the first
+//     packets of a flow the policy later drops as unsanctioned encrypted traffic
+//     have already gone to a provider. Moving the rest of that flow to the local
+//     route (security bypass on) cannot work for TCP, whose source address would
+//     change mid-connection, and silently blocking it (bypass off) stalls the app
+//     until its own timeout. So when the deciding packet would flip a
+//     provider-routed flow, the packet is blocked and rejected to the app (TCP
+//     reset, ICMP port unreachable), with the bypass on or off.
+//   - hints: the destination of that flow is remembered for PolicyHintTtl. Every
+//     later packet to it is handled as that drop from its first packet: routed
+//     locally with the bypass on, so the app's retry works outside the tunnel as
+//     the bypass promises, or blocked and rejected at once with it off.
+//
+// An incident is never hinted and is never routed locally. Nothing changes on
+// providers; the reject goes only to the local app.
+func (self *RemoteUserNatMultiClient) securityRoute(
+	r SecurityPolicyResult,
+	decision securityDecision,
+	ipPath *IpPath,
+	localSecurityBypass bool,
+	blockerBlock bool,
+	match *blockActionMatch,
+) (result SecurityPolicyResult, block bool, local bool, reject bool, reason SecurityPolicyReason) {
+	reason = decision.reason
+	hinted := false
+	if (r == SecurityPolicyResultAllow || r == SecurityPolicyResultDrop) &&
+		reason != SecurityPolicyReasonNetwork &&
+		self.policyLocalHints.has(ipPath) {
+		r = SecurityPolicyResultDrop
+		reason = SecurityPolicyReasonDropEncrypted
+		hinted = true
+	}
+	block, local = blockActionApply(r, localSecurityBypass, blockerBlock, match)
+	switch {
+	case !hinted && decision.decidedNow &&
+		r == SecurityPolicyResultDrop &&
+		decision.reason == SecurityPolicyReasonDropEncrypted:
+		self.policyLocalHints.add(ipPath)
+		allowBlock, allowLocal := blockActionApply(SecurityPolicyResultAllow, localSecurityBypass, blockerBlock, match)
+		if !allowBlock && !allowLocal {
+			// the flow's earlier packets went to a provider
+			block = true
+			local = false
+			reject = true
+		}
+	case hinted && block:
+		reject = true
+	}
+	return r, block, local, reject, reason
+}
+
+// deliverPolicyReject tells the local app its flow was refused: a TCP reset or
+// an ICMP port unreachable for UDP. The packet is borrowed.
+func (self *RemoteUserNatMultiClient) deliverPolicyReject(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+	packet []byte,
+) {
+	switch ipPath.Protocol {
+	case IpProtocolTcp:
+		deliverTcpPolicyReset(self.deliverReceivePacket, source, provideMode, ipPath, packet)
+	case IpProtocolUdp:
+		deliverIcmpPolicyUnreachable(self.deliverReceivePacket, source, provideMode, ipPath, packet)
+	}
 }
 
 // `SendPacketFunction`
@@ -6006,7 +6099,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		self.rejectSmtpPacket(source, provideMode, ipPath, packet)
 		return false
 	}
-	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
+	r, securityDecision, err := inspectEgressDetailed(self.securityPolicy, relationship, ipPath, payload)
 	if err != nil {
 		self.logSparseSendDrop("policy", &self.sendPolicyDropCount, err)
 		return false
@@ -6044,16 +6137,26 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		match = decision.match
 		blockerBlock = decision.blockerBlock
 	}
-	block, local := blockActionApply(r, config.localSecurityBypass, blockerBlock, match)
+	r, block, local, reject, securityReason := self.securityRoute(
+		r,
+		securityDecision,
+		ipPath,
+		config.localSecurityBypass,
+		blockerBlock,
+		match,
+	)
 
 	byteCount := ByteCount(len(packet))
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
-		self.blockActionCollector.add(decision, block, local, match, byteCount)
+		self.blockActionCollector.add(decision, block, local, match, blockActionReason(r, securityReason, blockerBlock, match), byteCount)
 	}
 
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		if reject {
+			self.deliverPolicyReject(source, provideMode, ipPath, packet)
+		}
 		return false
 	}
 	if local {
@@ -6112,7 +6215,7 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 		return false
 	}
 	relationship := egressRelationship(provideMode, self.provideMode)
-	r, err := self.securityPolicy.InspectEgress(relationship, ipPath, payload)
+	r, securityDecision, err := inspectEgressDetailed(self.securityPolicy, relationship, ipPath, payload)
 	if err != nil {
 		self.logSparseSendDrop("fragment policy", &self.sendPolicyDropCount, err)
 		return false
@@ -6136,18 +6239,29 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 		match = decision.match
 		blockerBlock = decision.blockerBlock
 	}
-	block, local := blockActionApply(r, config.localSecurityBypass, blockerBlock, match)
+	r, block, local, reject, securityReason := self.securityRoute(
+		r,
+		securityDecision,
+		ipPath,
+		config.localSecurityBypass,
+		blockerBlock,
+		match,
+	)
+	actionReason := blockActionReason(r, securityReason, blockerBlock, match)
 	byteCount := ByteCount(0)
 	for _, fragment := range fragments {
 		fragmentByteCount := ByteCount(len(fragment))
 		byteCount += fragmentByteCount
 		if decision != nil && self.blockActionCollector.hasCallbacks() {
-			self.blockActionCollector.add(decision, block, local, match, fragmentByteCount)
+			self.blockActionCollector.add(decision, block, local, match, actionReason, fragmentByteCount)
 		}
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(fragments)))
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		if reject {
+			self.deliverPolicyReject(source, provideMode, ipPath, reassembled)
+		}
 		return false
 	}
 	if local {
@@ -6394,7 +6508,7 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 			payload: payload,
 		}
 	}
-	result, err := inspectAndRefreshEgressGroupBorrowed(
+	result, securityDecision, err := inspectAndRefreshEgressGroupDetailedBorrowed(
 		self.securityPolicy,
 		egressRelationship(provideMode, self.provideMode),
 		memberIpPaths,
@@ -6404,20 +6518,24 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 		self.logSparseSendDrop("policy", &self.sendPolicyDropCount, err)
 		return false
 	}
-	block, local := blockActionApply(
+	result, block, local, reject, securityReason := self.securityRoute(
 		result,
+		securityDecision,
+		ipPath,
 		config.localSecurityBypass,
 		blockerBlock,
 		match,
 	)
 
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
+		actionReason := blockActionReason(result, securityReason, blockerBlock, match)
 		for _, packet := range group.packets {
 			self.blockActionCollector.add(
 				decision,
 				block,
 				local,
 				match,
+				actionReason,
 				ByteCount(len(packet)),
 			)
 		}
@@ -6425,6 +6543,9 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(group.packets)))
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(group.byteCount))
+		if reject {
+			self.deliverPolicyReject(source, provideMode, ipPath, group.packets[len(group.packets)-1])
+		}
 		return false
 	}
 	if local {

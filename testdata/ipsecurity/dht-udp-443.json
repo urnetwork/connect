@@ -1,0 +1,12 @@
+{
+  "name": "dht-udp-443",
+  "protocol": "bittorrent-dht",
+  "provenance": "BEP 5 KRPC ping query",
+  "transport": "udp",
+  "destination_port": 443,
+  "payloads": [
+    "64313a6164323a696432303a6162636465666768696a3031323334353637383965313a71343a70696e67313a74323a6161313a79313a7165"
+  ],
+  "expect_before": "allow",
+  "expect_after": "incident"
+}

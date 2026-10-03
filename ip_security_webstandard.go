@@ -57,22 +57,40 @@ func newWebStandardDetector(settings *WebStandardSettings) *webStandardDetector 
 // match reports whether payload is a complete packet/frame of a recognized,
 // enabled stateless standard for ipPath's protocol.
 func (self *webStandardDetector) match(ipPath *IpPath, payload []byte) bool {
+	_, ok := self.matchReason(ipPath, payload)
+	return ok
+}
+
+// matchReason is match plus which standard was recognized.
+func (self *webStandardDetector) matchReason(ipPath *IpPath, payload []byte) (SecurityPolicyReason, bool) {
 	if !self.settings.Enabled {
-		return false
+		return SecurityPolicyReasonUnknown, false
 	}
 	switch ipPath.Protocol {
 	case IpProtocolTcp:
-		return (self.settings.Tls && isTlsClientHello(payload)) ||
-			(self.settings.Stun && isStunStream(payload)) ||
-			(self.settings.Turn && isTurnChannelDataStream(payload))
+		switch {
+		case self.settings.Tls && isTlsClientHello(payload):
+			return SecurityPolicyReasonAllowTls, true
+		case self.settings.Stun && isStunStream(payload):
+			return SecurityPolicyReasonAllowStun, true
+		case self.settings.Turn && isTurnChannelDataStream(payload):
+			return SecurityPolicyReasonAllowTurn, true
+		}
 	case IpProtocolUdp:
-		return (self.settings.Dtls && isDtlsClientHello(payload)) ||
-			(self.settings.Quic && isQuicLongHeader(payload)) ||
-			(self.settings.Stun && isStun(payload)) ||
-			(self.settings.Turn && isTurnChannelData(payload)) ||
-			(self.settings.Rtcp && isRtcp(payload))
+		switch {
+		case self.settings.Dtls && isDtlsClientHello(payload):
+			return SecurityPolicyReasonAllowDtls, true
+		case self.settings.Quic && isQuicLongHeader(payload):
+			return SecurityPolicyReasonAllowQuic, true
+		case self.settings.Stun && isStun(payload):
+			return SecurityPolicyReasonAllowStun, true
+		case self.settings.Turn && isTurnChannelData(payload):
+			return SecurityPolicyReasonAllowTurn, true
+		case self.settings.Rtcp && isRtcp(payload):
+			return SecurityPolicyReasonAllowRtcp, true
+		}
 	}
-	return false
+	return SecurityPolicyReasonUnknown, false
 }
 
 // rtpHeader parses a possible UDP RTP/SRTP packet. A structural match alone is

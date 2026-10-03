@@ -256,11 +256,11 @@ func TestBlockActionCollector(t *testing.T) {
 	}
 
 	// two packets aggregate into one action per key
-	collector.add(clusterDecision, true, false, match, 100)
-	collector.add(clusterDecision, true, false, match, 50)
+	collector.add(clusterDecision, true, false, match, "", 100)
+	collector.add(clusterDecision, true, false, match, "", 50)
 	// a different decision for the same cluster is a separate action
-	collector.add(clusterDecision, false, false, nil, 25)
-	collector.add(otherDecision, false, true, nil, 10)
+	collector.add(clusterDecision, false, false, nil, "", 25)
+	collector.add(otherDecision, false, true, nil, "", 10)
 
 	collector.flush()
 	AssertEqual(t, 1, len(flushed))
@@ -319,7 +319,7 @@ func TestBlockActionCollectorMatchedDisjoint(t *testing.T) {
 		clusterIps:   []netip.Addr{a, b, c},
 		clusterHosts: []string{"example.com", "ads.example.com", "cdn.other.com"},
 	}
-	collector.add(decision, true, false, match, 100)
+	collector.add(decision, true, false, match, "", 100)
 	collector.flush()
 
 	AssertEqual(t, 1, len(flushed))
@@ -366,8 +366,8 @@ func TestBlockActionCollectorHostsAdopted(t *testing.T) {
 	named := &blockActionDecision{clusterKey: a, clusterIps: []netip.Addr{a}, clusterHosts: []string{"pbs.com"}}
 
 	// ip-only decision first, then the named decision for the same cluster/key
-	collector.add(emptyHosts, true, false, nil, 10)
-	collector.add(named, true, false, nil, 20)
+	collector.add(emptyHosts, true, false, nil, "", 10)
+	collector.add(named, true, false, nil, "", 20)
 
 	collector.flush()
 	AssertEqual(t, 1, len(flushed))
@@ -378,8 +378,8 @@ func TestBlockActionCollectorHostsAdopted(t *testing.T) {
 
 	// the reverse (named first) already reports hosts and must not be cleared by
 	// a later empty-hosts decision
-	collector.add(named, true, false, nil, 5)
-	collector.add(emptyHosts, true, false, nil, 5)
+	collector.add(named, true, false, nil, "", 5)
+	collector.add(emptyHosts, true, false, nil, "", 5)
 	collector.flush()
 	AssertEqual(t, 2, len(flushed))
 	AssertEqual(t, []string{"pbs.com"}, flushed[1][0].Hosts)

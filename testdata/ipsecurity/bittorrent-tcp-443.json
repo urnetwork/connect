@@ -1,0 +1,12 @@
+{
+  "name": "bittorrent-tcp-443",
+  "protocol": "bittorrent",
+  "provenance": "BEP 3 peer wire handshake",
+  "transport": "tcp",
+  "destination_port": 443,
+  "payloads": [
+    "13426974546f7272656e742070726f746f636f6c00000000000000003759ac5ce5fca457aeb572c0b7b2775617113d522d5858303030302df1f792b54e1af802564f7787"
+  ],
+  "expect_before": "allow",
+  "expect_after": "incident"
+}

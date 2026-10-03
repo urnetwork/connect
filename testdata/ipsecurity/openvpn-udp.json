@@ -1,0 +1,15 @@
+{
+  "name": "openvpn-udp",
+  "protocol": "openvpn",
+  "provenance": "OpenVPN protocol: P_CONTROL_HARD_RESET_CLIENT_V2 (7), P_CONTROL_V1 (4), P_ACK_V1 (5), key id 0, 8-byte session id",
+  "transport": "udp",
+  "destination_port": 1194,
+  "payloads": [
+    "384e4135093b08dd4e4403a3dacd08028745d5fb674a494e2812e2cee83c2058022a0233aec456f60fb5db3995837ccfe0e389df42182e1d97",
+    "204e4135093b08dd4e1a0bf41e3beda513b1bfd523ecf6104b56448951b39d08c86aad68187674e26f02c66348ded17c6718bf7b1832b8530120ba1ec8c51a82ff8a7738bdff3f7193cca77e491a97456a17399b4859ec878ee1974e6294c39ef3c75eb4e215c610ef",
+    "284e4135093b08dd4ea534c6b1aa27e6c514782faf1e6d8e04b551de9857d56881025e8e62dd79c6d1aadf7c218e07bbaf1b71ab4d270414f5371e842e658b57c06dea89a9806667dd",
+    "204e4135093b08dd4e1e9f9b46cfe67dcffaf4ab6db7c1c663bb7296e33ccb71460e6ca14cfcabae34583b7689c7a90aca3f598f6387cc3a8eb7f77e3dc321eb371100197cdc991c6da3d45afef1101d5ec6be7ca91fe0dc29d587720a4f07434852b95682b9bb669fe3f0da93039a99381590ae2e22585c76f19b61f41b0c0c63837031a03ffb6b78c3082776a66dc5e045cb6551bc0ff3e7bbafca531f3e8b1a98e5a0df5bfedf6e"
+  ],
+  "expect_before": "drop",
+  "expect_after": "allow"
+}
