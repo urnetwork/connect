@@ -204,7 +204,7 @@ sequenceDiagram
 
 ## Issues
 
-Submit issues on the [issues page](https://github.com/bringyour/connect/issues). 
+Submit issues on the [issues page](https://github.com/bringyour/connect/issues).
 
 ## Roadmap
 
@@ -226,4 +226,3 @@ BringYour connect is licenced under the [MPL 2.0](LICENSE).
 ![Connect](res/images/connect-project.webp "BringYour Connect")
 
 [BringYour](https://bringyour.com): Fast and secure internet wherever you want to be
-
