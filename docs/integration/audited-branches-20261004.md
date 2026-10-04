@@ -38,3 +38,5 @@ listed below. They are not compiled or activated by this merge.
 - `origin/inspect` (`26952d2f927a`): Draft inspection protocol retained with the exploratory analysis source. Current generated production wire types remain unchanged. Exact historical source: `research/historical-branches-20261004/inspect.patch.gz`.
 
 - `origin/inspect-occurrence-data` (`06769d0068f8`): All31 distinct exploratory analysis commits are retained as source patches and merge parents. The study expects its old generated protocol tree and separate clustering dependencies; it is not activated. Original binary captures stay reachable in original Git objects, without duplication into active builds. Exact historical source: `research/historical-branches-20261004/inspect-occurrence-data.patch.gz`.
+
+- `origin/merge-protocol` (`e748904c83fd`): Current root module already owns generated protocol and protocol/Makefile. Preserve current schemas, generated code, CI and dependencies instead of older import/generator rewrites. Exact historical source: `research/historical-branches-20261004/merge-protocol.patch.gz`.
