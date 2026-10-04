@@ -77,6 +77,7 @@ type originalWorkOutbox struct {
 	lockInfo   os.FileInfo
 	failure    error
 	step       func(string, string) error
+	readFile   func(*os.File, []byte) (int, error)
 }
 
 func originalWorkOutboxDigest(raw []byte) string {
@@ -513,18 +514,22 @@ func (self *originalWorkOutbox) readMember(ctx context.Context, member OriginalW
 	}
 	raw := make([]byte, 0, int(member.Bytes))
 	buffer := make([]byte, 32*1024)
+	read := file.Read
+	if self.readFile != nil {
+		read = func(raw []byte) (int, error) { return self.readFile(file, raw) }
+	}
 	for {
 		if err := self.boundary(ctx, "original-read", member.Name); err != nil {
 			return nil, err
 		}
-		n, readErr := file.Read(buffer)
+		n, readErr := read(buffer)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, readErr
+		}
 		if uint64(n) > member.Bytes-uint64(len(raw)) {
 			return nil, originalWorkOutboxLoss("retained original grew during read", nil)
 		}
 		raw = append(raw, buffer[:n]...)
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return nil, readErr
-		}
 		if errors.Is(readErr, io.EOF) {
 			break
 		}

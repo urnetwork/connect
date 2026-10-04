@@ -295,6 +295,62 @@ func TestWholeWorkOutboxReadObservationCanRetryWithoutCustodyInference(t *testin
 	}
 }
 
+// A failed actual read owns its cause even if its partial byte count differs.
+// Removing the interruption lets the same owner admit restored exact bytes.
+func TestWholeWorkOutboxFailedReadCannotInferOversizedOriginal(t *testing.T) {
+	client := newWholeWorkTestClient(t, NewNoContractClientOob(), nil)
+	settings, request, _ := wholeWorkCaptureFixture(t, client)
+	outbox, err := openOriginalWorkOutbox(settings.OutboxDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.close()
+	requestRaw, _ := request.Bytes()
+	original, err := client.ContractManager().captureOriginalWork(t.Context(), settings, outbox, requestRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := originalWorkOutboxName(request)
+	path := filepath.Join(settings.OutboxDirectory, name)
+	hit := false
+	outbox.readFile = func(file *os.File, buffer []byte) (int, error) {
+		if hit || len(original)+1 > len(buffer) {
+			t.Fatal("controlled read did not enter its first complete original chunk")
+		}
+		hit = true
+		if err := os.Chmod(path, 0600); err != nil {
+			return 0, err
+		}
+		if err := os.WriteFile(path, append(bytes.Clone(original), '\n'), 0600); err != nil {
+			return 0, err
+		}
+		if err := os.Chmod(path, 0400); err != nil {
+			return 0, err
+		}
+		n, err := file.Read(buffer)
+		if err != nil || n != len(original)+1 {
+			t.Fatal("controlled actual read did not observe the additional byte", n, err)
+		}
+		return n, syscall.EIO
+	}
+	if raw, err := outbox.read(t.Context(), name); !hit || raw != nil || !errors.Is(err, syscall.EIO) || errors.Is(err, ErrOriginalWorkOutboxIdentity) || outbox.failure != nil {
+		t.Fatal("failed partial observation inferred irreversible custody loss", hit, err)
+	}
+	outbox.readFile = nil
+	if err := os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0400); err != nil {
+		t.Fatal(err)
+	}
+	if actual, err := outbox.read(t.Context(), name); err != nil || !bytes.Equal(actual, original) {
+		t.Fatal("same retained owner could not reobserve exact original bytes", err)
+	}
+}
+
 func TestWholeWorkOutboxPositiveReplacementPoisonsRetainedOwner(t *testing.T) {
 	for _, changed := range []string{"ancestor", "leaf", "hardlink"} {
 		func() {
