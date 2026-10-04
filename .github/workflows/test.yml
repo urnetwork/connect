@@ -31,10 +31,14 @@ jobs:
       - name: Check out gvisor dependency
         run: git clone --depth 1 --branch go https://github.com/urnetwork/gvisor.git ../gvisor
 
+      # go.mod's toolchain line names the Go this module is built and tested
+      # with, and mls's TestPinnedToolchain holds the test binary to it, as the
+      # URmessage master design (§7.2) requires for the crypto code. `stable`
+      # installed the newest release instead, and that test failed under it.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version-file: go.mod
 
       # test.sh is a zsh script, and the TestTestScriptPackageDiscovery* tests
       # run it: without zsh they fail at their first line. The runner image
