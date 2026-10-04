@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"sync"
 	"testing"
 	"time"
 
@@ -147,8 +148,9 @@ func TestOriginalCloseReportUnavailableKeyKeepsLegacyObligation(t *testing.T) {
 // Cancellation after original creation moves that exact signed tuple to the
 // cleanup path. The barrier fixes the ordering without a scheduler/time guess.
 func TestOriginalCloseReportCreatedBeforeCancelKeepsOneCleanupOriginal(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
+	owner, stopOwner := context.WithTimeout(t.Context(), 10*time.Second)
+	defer stopOwner()
+	ctx, cancel := context.WithCancel(owner)
 	oob := &closeReportRecordingOob{}
 	settings := DefaultClientSettings()
 	settings.ControlPingTimeout = 0
@@ -156,25 +158,56 @@ func TestOriginalCloseReportCreatedBeforeCancelKeepsOneCleanupOriginal(t *testin
 	settings.ContractManagerSettings.CloseReportDomainHash = [32]byte{21}
 	client := NewClient(ctx, NewId(), oob, settings)
 	created, release, done := make(chan *protocol.CloseContract, 1), make(chan struct{}), make(chan struct{})
+	var released sync.Once
+	releaseOriginal := func() { released.Do(func() { close(release) }) }
 	client.ContractManager().beforeOriginalCloseFrameForTest = func(report *protocol.CloseContract) {
-		created <- proto.Clone(report).(*protocol.CloseContract)
-		<-release
+		select {
+		case created <- proto.Clone(report).(*protocol.CloseContract):
+		case <-owner.Done():
+			return
+		}
+		select {
+		case <-release:
+		case <-owner.Done():
+		}
 	}
+	t.Cleanup(func() {
+		cancel()
+		releaseOriginal()
+		stopOwner()
+		join, stop := context.WithTimeout(context.Background(), 3*time.Second)
+		defer stop()
+		if err := client.CloseAndWait(join); err != nil {
+			t.Error("original close client did not join", err)
+		}
+		select {
+		case <-done:
+		case <-join.Done():
+			t.Error("original close report worker did not join", join.Err())
+		}
+	})
 	go func() {
 		defer close(done)
 		client.ContractManager().CloseContract(NewId(), 121, 7)
 	}()
-	original := <-created
+	var original *protocol.CloseContract
+	select {
+	case original = <-created:
+	case <-owner.Done():
+		t.Fatal("original close was not created at the owned barrier", owner.Err())
+	}
 	cancel()
-	join, stop := context.WithTimeout(context.Background(), 3*time.Second)
+	join, stop := context.WithTimeout(owner, 3*time.Second)
 	defer stop()
 	if err := client.CloseAndWait(join); err != nil {
-		close(release)
-		<-done
-		t.Fatal(err)
+		t.Fatal("client cancellation did not join before original release", err)
 	}
-	close(release)
-	<-done
+	releaseOriginal()
+	select {
+	case <-done:
+	case <-owner.Done():
+		t.Fatal("released original report did not complete", owner.Err())
+	}
 	oob.mu.Lock()
 	defer oob.mu.Unlock()
 	if oob.bad || len(oob.reports) != 1 || !proto.Equal(original, oob.reports[0]) {
