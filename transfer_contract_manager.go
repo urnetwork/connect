@@ -356,6 +356,8 @@ type ContractManagerSettings struct {
 	CloseReportDomainHash [32]byte
 	// Optional independently configured request/cut transport and durable outbox.
 	OriginalWorkCapture *OriginalWorkCaptureSettings
+	// Optional individual pre-send request and returned reservation custody.
+	OriginalContractCapture *OriginalContractCaptureSettings
 
 	// this should be enough to do a single ping
 	InitialContractTransferByteCount ByteCount
@@ -424,6 +426,7 @@ type ContractManager struct {
 	closeInventory        originalCloseInventoryOwner
 	wholeWorkInventory    originalWorkInventoryOwner
 	originalWorkCapture   *OriginalWorkCaptureSettings
+	contractCreation      originalContractCreationOwner
 
 	mutex             sync.Mutex
 	closed            bool
@@ -535,6 +538,11 @@ func NewContractManager(
 	}
 
 	contractManager.startWorker("contract expiry", contractManager.expireQueuedContracts)
+	if directory, err := originalContractCreationDirectory(settings); err != nil {
+		client.log.Errorf("[contract]original request custody configuration unavailable: %v", err)
+	} else {
+		contractManager.contractCreation.directory = directory
+	}
 	if settings.OriginalWorkCapture != nil {
 		capture := *settings.OriginalWorkCapture
 		contractManager.originalWorkCapture = &capture
@@ -1585,11 +1593,13 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	}
 
 	self.beginOriginalWorkCreate()
+	originalRequest := self.captureOriginalContractRequest(frame)
 	self.client.ClientOob().SendControl(
 		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
 			defer finish()
 			defer self.finishOriginalWorkCreate(resultFrames, err)
+			self.captureOriginalContractAdmission(originalRequest, resultFrames, err)
 			if err == nil {
 				// the OOB round-trip completed: the backend is reachable
 				noteBackendSuccess()
