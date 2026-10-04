@@ -2214,8 +2214,11 @@ type CloseContract struct {
 	// before counting it as authenticated work. A signature alone does not prove
 	// a complete contract, earning window, reliability or provider eligibility.
 	OriginalReport []byte `protobuf:"bytes,6,opt,name=original_report,json=originalReport,proto3" json:"original_report,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Optional signed report-chain companion. Older routes may omit it; missing
+	// inventory remains unknown without changing the original close obligation.
+	OriginalInventory []byte `protobuf:"bytes,7,opt,name=original_inventory,json=originalInventory,proto3" json:"original_inventory,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *CloseContract) Reset() {
@@ -2286,6 +2289,13 @@ func (x *CloseContract) GetReportId() []byte {
 func (x *CloseContract) GetOriginalReport() []byte {
 	if x != nil {
 		return x.OriginalReport
+	}
+	return nil
+}
+
+func (x *CloseContract) GetOriginalInventory() []byte {
+	if x != nil {
+		return x.OriginalInventory
 	}
 	return nil
 }
@@ -2989,7 +2999,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\x0f_destination_idB\f\n" +
 	"\n" +
 	"_stream_idB\v\n" +
-	"\t_priority\"\xee\x01\n" +
+	"\t_priority\"\x9d\x02\n" +
 	"\rCloseContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12(\n" +
@@ -2999,7 +3009,8 @@ const file_transfer_proto_rawDesc = "" +
 	"checkpoint\x18\x04 \x01(\bR\n" +
 	"checkpoint\x12\x1b\n" +
 	"\treport_id\x18\x05 \x01(\fR\breportId\x12'\n" +
-	"\x0foriginal_report\x18\x06 \x01(\fR\x0eoriginalReport\"\xf3\x03\n" +
+	"\x0foriginal_report\x18\x06 \x01(\fR\x0eoriginalReport\x12-\n" +
+	"\x12original_inventory\x18\a \x01(\fR\x11originalInventory\"\xf3\x03\n" +
 	"\tPeerAudit\x12\x17\n" +
 	"\apeer_id\x18\x01 \x01(\fR\x06peerId\x12\x1a\n" +
 	"\bduration\x18\x02 \x01(\x04R\bduration\x12\x14\n" +
