@@ -2588,9 +2588,13 @@ func (x *EncryptedKey) GetClientKeySignedTlsCertificate() []byte {
 type ClientKey struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// 32-byte Ed25519 public key.
-	PublicKey     []byte `protobuf:"bytes,1,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PublicKey []byte `protobuf:"bytes,1,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
+	// Optional exact client-key history namespace; absent keeps the legacy
+	// operator-selected domain. A configured provider sends the same digest
+	// used by its original signed close reports on every key rotation.
+	HistoryDomainHash []byte `protobuf:"bytes,2,opt,name=history_domain_hash,json=historyDomainHash,proto3" json:"history_domain_hash,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *ClientKey) Reset() {
@@ -2626,6 +2630,13 @@ func (*ClientKey) Descriptor() ([]byte, []int) {
 func (x *ClientKey) GetPublicKey() []byte {
 	if x != nil {
 		return x.PublicKey
+	}
+	return nil
+}
+
+func (x *ClientKey) GetHistoryDomainHash() []byte {
+	if x != nil {
+		return x.HistoryDomainHash
 	}
 	return nil
 }
@@ -3009,10 +3020,11 @@ const file_transfer_proto_rawDesc = "" +
 	"\vProvidePing\"\x90\x01\n" +
 	"\fEncryptedKey\x126\n" +
 	"\x17provide_tls_certificate\x18\x01 \x03(\fR\x15provideTlsCertificate\x12H\n" +
-	"!client_key_signed_tls_certificate\x18\x02 \x01(\fR\x1dclientKeySignedTlsCertificate\"*\n" +
+	"!client_key_signed_tls_certificate\x18\x02 \x01(\fR\x1dclientKeySignedTlsCertificate\"Z\n" +
 	"\tClientKey\x12\x1d\n" +
 	"\n" +
-	"public_key\x18\x01 \x01(\fR\tpublicKey\"\xf7\x01\n" +
+	"public_key\x18\x01 \x01(\fR\tpublicKey\x12.\n" +
+	"\x13history_domain_hash\x18\x02 \x01(\fR\x11historyDomainHash\"\xf7\x01\n" +
 	"\x10EncryptedControl\x12B\n" +
 	"\fcontrol_type\x18\x01 \x01(\x0e2\x1f.bringyour.EncryptedControlTypeR\vcontrolType\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12:\n" +
