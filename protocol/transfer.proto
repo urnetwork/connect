@@ -704,6 +704,10 @@ message EncryptedKey {
 message ClientKey {
     // 32-byte Ed25519 public key.
     bytes public_key = 1;
+    // Optional exact client-key history namespace; absent keeps the legacy
+    // operator-selected domain. A configured provider sends the same digest
+    // used by its original signed close reports on every key rotation.
+    bytes history_domain_hash = 2;
 }
 
 
