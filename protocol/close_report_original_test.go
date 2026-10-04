@@ -42,7 +42,7 @@ func TestOriginalCloseReportCanonicalWireAndLegacyGolden(t *testing.T) {
 	want = append(want, bytes.Repeat([]byte{4}, 16)...)
 	want = append(want, key[32:]...)
 	want = append(want, 1, 2, 3, 4, 5, 6, 7, 8, 255, 255, 255, 255, 255, 255, 255, 255, 1)
-	if len(wire) != OriginalCloseReportBytes || !bytes.Equal(wire[:len(wire)-64], want) || !ed25519.Verify(key[32:], want, wire[len(wire)-64:]) {
+	if len(wire) != OriginalCloseReportBytes || !bytes.Equal(wire[:len(wire)-64], want) || !ed25519.Verify(ed25519.PublicKey(key[32:]), want, wire[len(wire)-64:]) {
 		t.Fatal("original close report canonical signed bytes changed")
 	}
 	decoded, err := DecodeOriginalCloseReport(wire)
