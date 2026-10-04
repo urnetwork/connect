@@ -18,3 +18,5 @@ listed below. They are not compiled or activated by this merge.
 - `origin/add-nix-flake-and-single-mod` (`2ac69d2ce392`): The single root module and in-tree protocol are already the current layout. Preserve current Go1.26/module graph; the old Go/Nix shell and wholesale old-layout formatting are historical, not a replacement build authority. Source: `research/historical-branches-20261004/add-nix-flake-and-single-mod.patch.gz`.
 
 - `origin/add-peer-to-peer-connections` (`f7f897021be0`): Historical webrtc-conn/Pion-v3 API, five-second wrapper and deleted connect/ layout are retained. Current Pion-v4 transport_p2p_webrtc.go owns authenticated signaling, admission and lifecycle; the prototype is not selected. Exact historical source: `research/historical-branches-20261004/add-peer-to-peer-connections.patch.gz`.
+
+- `origin/api-network-user` (`9067c85a7983`): Current API already contains both network-user routes with current GetNetworkUserResult and UpdateNetworkName schemas matching server handlers. Preserve those schemas over the obsolete field shapes. Exact historical source: `research/historical-branches-20261004/api-network-user.patch.gz`.
