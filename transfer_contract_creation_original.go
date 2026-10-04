@@ -20,7 +20,9 @@ import (
 // leaves retain individual originals; only the independent cut roster certifies
 // complete contract coverage. Empty settings never mean an empty participant set.
 type OriginalContractCaptureSettings struct {
-	Directory string
+	Directory        string
+	PublicKey        [32]byte
+	SourceGeneration [16]byte
 }
 
 // File publication is serialized locally and uses a process lease per write.
@@ -28,6 +30,7 @@ type OriginalContractCaptureSettings struct {
 type originalContractCreationOwner struct {
 	stateLock sync.Mutex
 	directory string
+	scope     OriginalContractStoreScope
 }
 
 // Separate roots prevent an optional leaf from corrupting a complete cut-outbox
@@ -189,13 +192,22 @@ func (self *originalContractCreationOwner) retainAdmission(ctx context.Context, 
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.close()) }()
+	if err := self.scope.Validate(); err != nil {
+		return err
+	}
+	if store.checkpoint.Scope != self.scope {
+		return originalContractStoreLoss("original contract namespace differs from independently approved source", nil)
+	}
 	name, err := originalContractLeafName("request", requestRaw)
 	if err != nil {
 		return err
 	}
 	retained, err := store.read(ctx, name)
-	if err != nil || !bytes.Equal(requestRaw, retained) {
-		return errors.Join(errors.New("original contract request custody changed before admission"), err)
+	if err != nil {
+		return originalContractStoreObservation("original contract request custody disappeared before admission", err)
+	}
+	if !bytes.Equal(requestRaw, retained) {
+		return originalContractStoreLoss("original contract request custody changed before admission", nil)
 	}
 	name, err = originalContractLeafName("admission", admissionRaw)
 	if err != nil {
@@ -214,6 +226,12 @@ func (self *originalContractCreationOwner) retain(ctx context.Context, kind stri
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.close()) }()
+	if err := self.scope.Validate(); err != nil {
+		return err
+	}
+	if store.checkpoint.Scope != self.scope {
+		return originalContractStoreLoss("original contract namespace differs from independently approved source", nil)
+	}
 	name, err := originalContractLeafName(kind, raw)
 	if err != nil {
 		return err

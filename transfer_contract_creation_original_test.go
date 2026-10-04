@@ -6,6 +6,7 @@ package connect
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"os"
 	"path/filepath"
@@ -85,8 +86,13 @@ func newOriginalCreationTestClient(t *testing.T) (*Client, *originalCreationTest
 	settings.ClientKeySeed = bytes.Repeat([]byte{121}, 32)
 	settings.ContractManagerSettings = DefaultContractManagerSettingsNoNetworkEvents()
 	settings.ContractManagerSettings.CloseReportDomainHash = [32]byte{122}
-	settings.ContractManagerSettings.OriginalContractCapture = &OriginalContractCaptureSettings{Directory: directory}
-	client := NewClient(t.Context(), NewId(), oob, settings)
+	clientId := NewId()
+	key := ed25519.NewKeyFromSeed(settings.ClientKeySeed)
+	scope := OriginalContractStoreScope{DomainHash: settings.ContractManagerSettings.CloseReportDomainHash, ClientId: [16]byte(clientId), SourceGeneration: [16]byte{124}}
+	copy(scope.PublicKey[:], key[ed25519.SeedSize:])
+	settings.ContractManagerSettings.OriginalContractCapture = &OriginalContractCaptureSettings{Directory: directory, PublicKey: scope.PublicKey, SourceGeneration: scope.SourceGeneration}
+	prepareOriginalContractStoreTest(t, directory, scope)
+	client := NewClient(t.Context(), clientId, oob, settings)
 	t.Cleanup(func() {
 		if oob.callback != nil {
 			callback := oob.callback

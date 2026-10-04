@@ -542,6 +542,9 @@ func NewContractManager(
 		client.log.Errorf("[contract]original request custody configuration unavailable: %v", err)
 	} else {
 		contractManager.contractCreation.directory = directory
+		if settings.OriginalContractCapture != nil {
+			contractManager.contractCreation.scope = OriginalContractStoreScope{DomainHash: contractManager.closeReportDomainHash, ClientId: [16]byte(client.ClientId()), PublicKey: settings.OriginalContractCapture.PublicKey, SourceGeneration: settings.OriginalContractCapture.SourceGeneration}
+		}
 	}
 	if settings.OriginalWorkCapture != nil {
 		capture := *settings.OriginalWorkCapture
