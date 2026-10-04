@@ -707,6 +707,12 @@ func TestPreparationAdmitsAllCapacityDimensionsBeforeTargetEffects(t *testing.T)
 			case "attributes":
 				f.request.Limits.MaxOwnerAttributeBytes = 1
 			case "plan":
+				// 4096 is the floor a request may name, and the fixture's plan
+				// is close to it: about 4 KiB, carrying every path under TMPDIR.
+				// Under a short TMPDIR such as CI's /tmp it fits and would be
+				// admitted. The inputs reach the plan twice, in the request
+				// bytes and in the owner, so this puts it over on any host.
+				f.request.Owners[0].Inputs = json.RawMessage(`{"public":true,"padding":"` + strings.Repeat("x", 4096) + `"}`)
 				f.request.Limits.MaxPlanBytes = 4096
 			}
 			f.writeRequest(t)
