@@ -584,6 +584,12 @@ message CloseContract {
     // this ID with the exact party, amount and checkpoint flag before emission
     // is enabled on hosted clients; older backends ignore the field.
     bytes report_id = 5;
+    // Optional canonical original-close-report envelope signed by the client key.
+    // The versioned envelope binds its policy domain and this exact report tuple.
+    // Empty preserves legacy bytes; evidence-aware backends retain the original
+    // before counting it as authenticated work. A signature alone does not prove
+    // a complete contract, earning window, reliability or provider eligibility.
+    bytes original_report = 6;
 }
 
 
