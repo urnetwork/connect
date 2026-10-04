@@ -26,3 +26,5 @@ listed below. They are not compiled or activated by this merge.
 - `origin/codex/astra-receive-gap-ordering-20260925` (`3cc6ef2a89ca`): Receive-gap ordering and the rekey generation controls already exist. Preserve current sequence and lifecycle code; retain this older reviewed implementation in history. Exact historical source: `research/historical-branches-20261004/codex--astra-receive-gap-ordering-20260925.patch.gz`.
 
 - `origin/diagrams` (`1a74f4b96021`): Original architecture diagrams retained as a dated historical document; their simplified ownership and old paths are not current runtime authority. Exact historical source: `research/historical-branches-20261004/diagrams.patch.gz`.
+
+- `origin/extender-fixes` (`b8184cc9df66`): Old UDP extender source retained as research. Current net_extender_datagram/network/strategy/verification implementations own current cancellation and security. Deleted connect/ package files are not restored into the build. Exact historical source: `research/historical-branches-20261004/extender-fixes.patch.gz`.
