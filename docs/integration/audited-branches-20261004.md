@@ -50,3 +50,5 @@ listed below. They are not compiled or activated by this merge.
 - `origin/privacytxt-01` (`935d89f39edc`): Privacytxt API draft and 2024 port rules retained as historical source. Current ip_security owners and regression controls remain authoritative; no destination or protocol rule is weakened. Exact historical source: `research/historical-branches-20261004/privacytxt-01.patch.gz`.
 
 - `origin/provider-mips-fixes` (`896e5f639c42`): Later provider MIPS/debug variant retained with earlier tuning history. Current TLS, pool and parser implementations remain; removed provider executable and mininit behavior are not reinstated. Exact historical source: `research/historical-branches-20261004/provider-mips-fixes.patch.gz`.
+
+- `origin/split` (`b85960c6a563`): Dated split-tunnel product design retained as historical documentation, without claiming every proposal is selected in current clients. Exact historical source: `research/historical-branches-20261004/split.patch.gz`.
