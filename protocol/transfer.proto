@@ -590,6 +590,9 @@ message CloseContract {
     // before counting it as authenticated work. A signature alone does not prove
     // a complete contract, earning window, reliability or provider eligibility.
     bytes original_report = 6;
+    // Optional signed report-chain companion. Older routes may omit it; missing
+    // inventory remains unknown without changing the original close obligation.
+    bytes original_inventory = 7;
 }
 
 

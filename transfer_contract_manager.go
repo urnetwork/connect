@@ -419,6 +419,7 @@ type ContractManager struct {
 
 	settings              *ContractManagerSettings
 	closeReportDomainHash [32]byte
+	closeInventory        originalCloseInventoryOwner
 
 	mutex             sync.Mutex
 	closed            bool
@@ -1723,13 +1724,14 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 		ReportId:         NewId().Bytes(),
 	}
 	if self.closeReportDomainHash != ([32]byte{}) {
-		original, signErr := self.client.ClientKeyManager().signOriginalCloseReport(self.closeReportDomainHash, self.client.ClientId(), report)
+		original, inventory, signErr := self.signOriginalCloseInventory(report)
 		if signErr != nil {
 			// Optional evidence failure cannot erase the original close obligation.
 			// The empty envelope remains visibly unauthenticated to its consumer.
 			self.client.log.Errorf("[contract]original close evidence unavailable: %v", signErr)
 		} else {
 			report.OriginalReport = original
+			report.OriginalInventory = inventory
 		}
 	}
 	if self.beforeOriginalCloseFrameForTest != nil {
