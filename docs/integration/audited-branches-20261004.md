@@ -32,3 +32,5 @@ listed below. They are not compiled or activated by this merge.
 - `origin/find-providers-tune1` (`4dd156de516d`): Old provider CLI/MIPS/mininit experiment retained. Current byte-count formatting/parsing and TLS configuration already exist with newer shared-certificate/session ownership. Removed provider CLI, generated IP lists, pool initialization and dependency versions are not resurrected. Exact historical source: `research/historical-branches-20261004/find-providers-tune1.patch.gz`.
 
 - `origin/geode-api` (`bde5b739ece0`): Proposed earnings API retained as historical draft; it is not represented as current deployed endpoint behavior. Current API schema and generator workflow remain authoritative. Exact historical source: `research/historical-branches-20261004/geode-api.patch.gz`.
+
+- `origin/gvisor-test` (`419aa07b516e`): 2024 source-map/netstack experiment retained. It does not replace current LocalUserNat or qualify an alternative to the missing current sibling gvisor fork. Current module pin and replacement are unchanged. Exact historical source: `research/historical-branches-20261004/gvisor-test.patch.gz`.
