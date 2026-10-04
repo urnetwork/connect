@@ -36,3 +36,5 @@ listed below. They are not compiled or activated by this merge.
 - `origin/gvisor-test` (`419aa07b516e`): 2024 source-map/netstack experiment retained. It does not replace current LocalUserNat or qualify an alternative to the missing current sibling gvisor fork. Current module pin and replacement are unchanged. Exact historical source: `research/historical-branches-20261004/gvisor-test.patch.gz`.
 
 - `origin/inspect` (`26952d2f927a`): Draft inspection protocol retained with the exploratory analysis source. Current generated production wire types remain unchanged. Exact historical source: `research/historical-branches-20261004/inspect.patch.gz`.
+
+- `origin/inspect-occurrence-data` (`06769d0068f8`): All31 distinct exploratory analysis commits are retained as source patches and merge parents. The study expects its old generated protocol tree and separate clustering dependencies; it is not activated. Original binary captures stay reachable in original Git objects, without duplication into active builds. Exact historical source: `research/historical-branches-20261004/inspect-occurrence-data.patch.gz`.
