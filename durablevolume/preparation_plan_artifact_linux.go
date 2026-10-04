@@ -31,8 +31,11 @@ func RetainPreparationPlan(ctx context.Context, plan PreparationPlan) (result Re
 		return result, errors.New("cohort staging plan lost its exact daemon request")
 	}
 	requestRaw, err := preparationReadReference(ctx, plan.Request, maximumPreparationRequestBytes, "cohort plan request")
-	if err != nil || !bytes.Equal(requestRaw, plan.RequestBytes) {
-		return result, errors.Join(errors.New("cohort staging request differs"), err)
+	if err != nil {
+		return result, err
+	}
+	if !bytes.Equal(requestRaw, plan.RequestBytes) {
+		return result, errors.New("cohort staging request differs")
 	}
 	raw, err := json.Marshal(plan)
 	if err != nil {

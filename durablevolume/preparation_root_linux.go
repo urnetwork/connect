@@ -119,6 +119,12 @@ func (self *preparationAdmission) stageRoot(nonce []byte) error {
 // Reopen selects either the original staged inode or a retained moved inode.
 // Both missing, both present, or an unreserved preexisting target are refused.
 func (self *preparationAdmission) openStagedRoot(source string) error {
+	return self.openStagedRootWithObservation(source, nil)
+}
+
+// The instance-owned barrier exercises failures immediately before the actual
+// moved-root attribute read. Production calls supply no observer or substitute.
+func (self *preparationAdmission) openStagedRootWithObservation(source string, observe func(*os.File) error) error {
 	request := self.request
 	if !canonical(source) || filepath.Dir(source) != request.StagingDirectory || !strings.HasPrefix(filepath.Base(source), "preparation-root-") {
 		return errors.New("staged preparation root is outside its exact namespace")
@@ -131,9 +137,19 @@ func (self *preparationAdmission) openStagedRoot(source string) error {
 		if err != nil {
 			return err
 		}
-		raw, readErr := readInventoryAttribute(file, PreparationAttribute, 4096)
-		if readErr != nil || len(raw) == 0 {
-			return errors.Join(ErrIdentity, errors.New("moved preparation root lacks its original reservation"), readErr, file.Close())
+		var raw []byte
+		var readErr error
+		if observe != nil {
+			readErr = observe(file)
+		}
+		if readErr = errors.Join(readErr, self.ctx.Err()); readErr == nil {
+			raw, readErr = readInventoryAttribute(file, PreparationAttribute, 4096)
+		}
+		if readErr != nil {
+			return errors.Join(readErr, file.Close())
+		}
+		if len(raw) == 0 {
+			return errors.Join(ErrIdentity, errors.New("moved preparation root lacks its original reservation"), file.Close())
 		}
 	} else if err != nil {
 		return err
