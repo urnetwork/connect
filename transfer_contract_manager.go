@@ -354,6 +354,8 @@ type ContractManagerSettings struct {
 	// Optional exact client-key-history policy domain digest. Zero leaves reports
 	// unsigned. The manager copies it once; retries never adopt another domain.
 	CloseReportDomainHash [32]byte
+	// Optional independently configured request/cut transport and durable outbox.
+	OriginalWorkCapture *OriginalWorkCaptureSettings
 
 	// this should be enough to do a single ping
 	InitialContractTransferByteCount ByteCount
@@ -420,6 +422,8 @@ type ContractManager struct {
 	settings              *ContractManagerSettings
 	closeReportDomainHash [32]byte
 	closeInventory        originalCloseInventoryOwner
+	wholeWorkInventory    originalWorkInventoryOwner
+	originalWorkCapture   *OriginalWorkCaptureSettings
 
 	mutex             sync.Mutex
 	closed            bool
@@ -506,6 +510,7 @@ func NewContractManager(
 		client:                          client,
 		settings:                        settings,
 		closeReportDomainHash:           settings.CloseReportDomainHash,
+		wholeWorkInventory:              originalWorkInventoryOwner{generation: NewId()},
 		provideSecretKeys:               map[protocol.ProvideMode][]byte{},
 		provideModes:                    map[protocol.ProvideMode]bool{},
 		providePaused:                   false,
@@ -530,6 +535,11 @@ func NewContractManager(
 	}
 
 	contractManager.startWorker("contract expiry", contractManager.expireQueuedContracts)
+	if settings.OriginalWorkCapture != nil {
+		capture := *settings.OriginalWorkCapture
+		contractManager.originalWorkCapture = &capture
+		contractManager.startWorker("original work capture", contractManager.runOriginalWorkCapture)
+	}
 
 	return contractManager
 }
@@ -1307,7 +1317,11 @@ func (self *ContractManager) Verify(storedContractHmac []byte, storedContractByt
 		return false
 	}
 
-	return VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
+	verified := VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
+	if verified {
+		self.admitOriginalWork(storedContractBytes)
+	}
+	return verified
 }
 
 func (self *ContractManager) GetProvideSecretKey(provideMode protocol.ProvideMode) ([]byte, bool) {
@@ -1492,6 +1506,7 @@ func (self *ContractManager) addContractToQueue(
 	if sourceId != self.client.ClientId() {
 		return fmt.Errorf("Contract source must be this client: %s<>%s", sourceId, self.client.ClientId())
 	}
+	self.admitOriginalWork(contract.StoredContractBytes)
 
 	if self.client.log.V(1).Enabled() {
 		self.client.log.Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
@@ -1569,10 +1584,12 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		self.client.log.Infof("[contract]create %s %s\n", self.client.ClientId(), contractKey.Destination)
 	}
 
+	self.beginOriginalWorkCreate()
 	self.client.ClientOob().SendControl(
 		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
 			defer finish()
+			defer self.finishOriginalWorkCreate(resultFrames, err)
 			if err == nil {
 				// the OOB round-trip completed: the backend is reachable
 				noteBackendSuccess()
@@ -1726,6 +1743,7 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	if self.closeReportDomainHash != ([32]byte{}) {
 		original, inventory, signErr := self.signOriginalCloseInventory(report)
 		if signErr != nil {
+			self.retainOriginalWorkClose(report)
 			// Optional evidence failure cannot erase the original close obligation.
 			// The empty envelope remains visibly unauthenticated to its consumer.
 			self.client.log.Errorf("[contract]original close evidence unavailable: %v", signErr)

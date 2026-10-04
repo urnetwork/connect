@@ -30,7 +30,7 @@ type originalCloseInventoryOwner struct {
 
 // Only logical creation advances the chain. Native/OOB retries own the already
 // serialized pair and never call this method again. Cleanup may finish after cancel.
-func (self *ContractManager) signOriginalCloseInventory(report *protocol.CloseContract) ([]byte, []byte, error) {
+func (self *ContractManager) signOriginalCloseInventory(report *protocol.CloseContract) (originalRaw []byte, inventoryRaw []byte, resultErr error) {
 	manager := self.client.ClientKeyManager()
 	if manager == nil || report == nil || len(report.ContractId) != 16 || len(report.ReportId) != 16 {
 		return nil, nil, errors.New("original close key owner or tuple is unavailable")
@@ -38,6 +38,13 @@ func (self *ContractManager) signOriginalCloseInventory(report *protocol.CloseCo
 	owner := &self.closeInventory
 	owner.stateLock.Lock()
 	defer owner.stateLock.Unlock()
+	// Capture while the logical per-contract sequence still owns this lock.
+	// A concurrent checkpoint cannot publish its whole-owner head out of order.
+	defer func() {
+		owned := *report
+		owned.OriginalInventory = inventoryRaw
+		self.retainOriginalWorkClose(&owned)
+	}()
 	manager.stateLock.RLock()
 	defer manager.stateLock.RUnlock()
 	original, err := protocol.SignOriginalCloseReport(protocol.OriginalCloseReport{DomainHash: self.closeReportDomainHash, ClientId: [16]byte(self.client.ClientId()), ContractId: [16]byte(report.ContractId), ReportId: [16]byte(report.ReportId), AckedByteCount: report.AckedByteCount, UnackedByteCount: report.UnackedByteCount, Checkpoint: report.Checkpoint}, manager.privateKey)
