@@ -174,6 +174,7 @@ func TestWholeWorkActualLifecyclePollsRetainsAndDeliversSignedCut(t *testing.T) 
 	}
 	got := make(chan protocol.OriginalWorkCutSubmission, 1)
 	enrolled := make(chan protocol.OriginalWorkOwnerEnrollment, 1)
+	cycleFinished := make(chan struct{}, 1)
 	failures := make(chan error, 1)
 	fail := func(err error) {
 		select {
@@ -242,7 +243,12 @@ func TestWholeWorkActualLifecyclePollsRetainsAndDeliversSignedCut(t *testing.T) 
 		}
 	}))
 	defer server.Close()
-	capture := &OriginalWorkCaptureSettings{ApiUrl: server.URL, OutboxDirectory: directory, RequestPublicKey: approver, HttpClient: server.Client(), now: func() time.Time { return time.Unix(1100, 0) }}
+	capture := &OriginalWorkCaptureSettings{ApiUrl: server.URL, OutboxDirectory: directory, RequestPublicKey: approver, HttpClient: server.Client(), now: func() time.Time { return time.Unix(1100, 0) }, afterCycle: func() {
+		select {
+		case cycleFinished <- struct{}{}:
+		default:
+		}
+	}}
 	client := newWholeWorkTestClient(t, NewNoContractClientOob(), capture)
 	var submission protocol.OriginalWorkCutSubmission
 	select {
@@ -251,6 +257,11 @@ func TestWholeWorkActualLifecyclePollsRetainsAndDeliversSignedCut(t *testing.T) 
 		t.Fatal(err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("actual SDK capture worker did not deliver")
+	}
+	select {
+	case <-cycleFinished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("actual capture cycle did not finish before custody assertion")
 	}
 	if other, err := openOriginalWorkOutbox(directory); err == nil {
 		other.close()

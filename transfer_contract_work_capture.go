@@ -37,6 +37,7 @@ type OriginalWorkCaptureSettings struct {
 	HttpClient *http.Client
 	httpClient *http.Client
 	now        func() time.Time
+	afterCycle func()
 }
 
 // A descriptor and exclusive process lease protect the complete retained set.
@@ -504,6 +505,9 @@ func (self *ContractManager) runOriginalWorkCapture() {
 			}
 			return owner.Err()
 		}()
+		if settings.afterCycle != nil {
+			settings.afterCycle()
+		}
 		if err != nil && self.ctx.Err() == nil {
 			self.client.log.Errorf("[contract]whole-work evidence pending: %v", err)
 		}
