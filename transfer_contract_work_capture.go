@@ -14,9 +14,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -31,101 +28,16 @@ type OriginalWorkCaptureSettings struct {
 	ApiUrl           string
 	OutboxDirectory  string
 	RequestPublicKey [32]byte
-	PollInterval     time.Duration
+	// The approved provider launch profile pins this retained signing identity.
+	// Historical rotated keys need their separately approved original profile.
+	PublicKey    [32]byte
+	PollInterval time.Duration
 	// The owning launcher supplies its isolated proxy/trust transport. The worker
 	// copies the client and always enforces its own timeout and redirect refusal.
 	HttpClient *http.Client
 	httpClient *http.Client
 	now        func() time.Time
 	afterCycle func()
-}
-
-// A descriptor and exclusive process lease protect the complete retained set.
-// No cut is evicted to make a failed or full generation look like an empty one.
-type originalWorkOutbox struct {
-	root *os.Root
-	lock *os.File
-}
-
-// Private descriptor anchoring refuses symlinks, public directories and two
-// simultaneous owners. A partial write remains visible and is never recaptured.
-func openOriginalWorkOutbox(directory string) (*originalWorkOutbox, error) {
-	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
-		return nil, errors.New("whole-work outbox requires a canonical absolute directory")
-	}
-	if err := os.MkdirAll(directory, 0700); err != nil {
-		return nil, err
-	}
-	info, err := os.Lstat(directory)
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() || info.Mode().Perm() != 0700 {
-		return nil, errors.New("whole-work outbox directory is not private")
-	}
-	root, err := os.OpenRoot(directory)
-	if err != nil {
-		return nil, err
-	}
-	opened, err := root.Stat(".")
-	if err != nil || !os.SameFile(info, opened) {
-		root.Close()
-		return nil, errors.New("whole-work outbox directory changed")
-	}
-	lock, err := lockOriginalWorkOutbox(root)
-	if err != nil {
-		root.Close()
-		return nil, err
-	}
-	return &originalWorkOutbox{root: root, lock: lock}, nil
-}
-
-// The SDK joins this owner before releasing its retained directory lease.
-func (self *originalWorkOutbox) close() error {
-	return errors.Join(self.lock.Close(), self.root.Close())
-}
-
-// Every retained name is checked; unknown or oversized entries hold evidence.
-func (self *originalWorkOutbox) entries(ctx context.Context) ([]string, error) {
-	file, err := self.root.Open(".")
-	if err != nil {
-		return nil, err
-	}
-	entries, readErr := file.ReadDir(maximumOriginalWorkOutboxRecords + 2)
-	closeErr := file.Close()
-	if err := errors.Join(readErr, closeErr); err != nil && !errors.Is(err, io.EOF) {
-		return nil, err
-	}
-	result := make([]string, 0, len(entries))
-	var total int64
-	for _, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if entry.Name() == ".owner.lock" {
-			continue
-		}
-		name := entry.Name()
-		if len(name) != 69 || !strings.HasSuffix(name, ".json") {
-			return nil, errors.New("whole-work outbox has an unrecognized original")
-		}
-		if _, err := hex.DecodeString(name[:64]); err != nil || strings.ToLower(name) != name {
-			return nil, errors.New("whole-work outbox name is not canonical")
-		}
-		info, err := self.root.Lstat(name)
-		if err != nil {
-			return nil, err
-		}
-		if !info.Mode().IsRegular() || info.Mode().Perm() != 0400 || info.Size() <= 0 || info.Size() > protocol.MaximumOriginalWorkSubmissionBytes {
-			return nil, errors.New("whole-work outbox original is partial or unprotected")
-		}
-		total += info.Size()
-		if total > maximumOriginalWorkOutboxBytes || len(result) >= maximumOriginalWorkOutboxRecords {
-			return nil, errors.New("whole-work outbox complete inventory exceeds capacity")
-		}
-		result = append(result, name)
-	}
-	return result, nil
 }
 
 // The window phase identity excludes a caller's request id. A newly signed
@@ -138,96 +50,6 @@ func originalWorkOutboxName(request protocol.OriginalWorkRequest) string {
 	raw = append(raw, request.Kind...)
 	hash := sha256.Sum256(raw)
 	return hex.EncodeToString(hash[:]) + ".json"
-}
-
-// Retained public envelopes remain bounded while reading and retain all errors.
-func (self *originalWorkOutbox) read(ctx context.Context, name string) ([]byte, error) {
-	info, err := self.root.Lstat(name)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm() != 0400 || info.Size() <= 0 || info.Size() > protocol.MaximumOriginalWorkSubmissionBytes {
-		return nil, errors.New("whole-work retained original is not complete and protected")
-	}
-	file, err := self.root.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	opened, statErr := file.Stat()
-	if statErr != nil || !os.SameFile(info, opened) {
-		file.Close()
-		return nil, errors.New("whole-work retained original changed")
-	}
-	var value bytes.Buffer
-	buffer := make([]byte, 32*1024)
-	for value.Len() <= protocol.MaximumOriginalWorkSubmissionBytes {
-		if err := ctx.Err(); err != nil {
-			file.Close()
-			return nil, err
-		}
-		n, readErr := file.Read(buffer)
-		value.Write(buffer[:n])
-		if readErr != nil {
-			closeErr := file.Close()
-			if !errors.Is(readErr, io.EOF) {
-				return nil, errors.Join(readErr, closeErr)
-			}
-			if closeErr != nil {
-				return nil, closeErr
-			}
-			if value.Len() > protocol.MaximumOriginalWorkSubmissionBytes {
-				return nil, errors.New("whole-work retained original exceeds capacity")
-			}
-			return value.Bytes(), nil
-		}
-	}
-	file.Close()
-	return nil, errors.New("whole-work retained original exceeds capacity")
-}
-
-// Create once, sync bytes and metadata, then sync the parent before publication.
-// A failed partial original is retained as a visible hold; never unlink/retry it.
-func (self *originalWorkOutbox) retain(ctx context.Context, name string, raw []byte) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	entries, err := self.entries(ctx)
-	if err != nil {
-		return err
-	}
-	if len(entries) >= maximumOriginalWorkOutboxRecords || len(raw) > protocol.MaximumOriginalWorkSubmissionBytes {
-		return errors.New("whole-work outbox has no complete-record capacity")
-	}
-	var total int64
-	for _, entry := range entries {
-		info, err := self.root.Stat(entry)
-		if err != nil {
-			return err
-		}
-		total += info.Size()
-	}
-	if int64(len(raw)) > maximumOriginalWorkOutboxBytes-total {
-		return errors.New("whole-work outbox has no complete-byte capacity")
-	}
-	file, err := self.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return err
-	}
-	_, writeErr := file.Write(raw)
-	if writeErr == nil {
-		writeErr = file.Chmod(0400)
-	}
-	if writeErr == nil {
-		writeErr = file.Sync()
-	}
-	if err := errors.Join(writeErr, file.Close()); err != nil {
-		return err
-	}
-	parent, err := self.root.Open(".")
-	if err != nil {
-		return err
-	}
-	return errors.Join(parent.Sync(), parent.Close(), ctx.Err())
 }
 
 // A complete request cycle uses one original 300-second owner. Every individual
@@ -316,6 +138,9 @@ func (self *ContractManager) deliverOriginalWork(ctx context.Context, settings O
 	if request.ClientId != [16]byte(self.client.ClientId()) || request.DomainHash != self.closeReportDomainHash {
 		return errors.New("whole-work outbox belongs to a different client or domain")
 	}
+	if settings.PublicKey != ([32]byte{}) && request.PublicKey != settings.PublicKey {
+		return errors.New("whole-work outbox signing key differs from its approved capture profile")
+	}
 	endpoint := base.ResolveReference(&url.URL{Path: "/provider-work/v1/cuts"}).String()
 	response, err := originalWorkCaptureHttp(ctx, client, http.MethodPost, endpoint, raw, 8*1024)
 	if err != nil {
@@ -338,18 +163,38 @@ func (self *ContractManager) captureOriginalWork(ctx context.Context, settings O
 	if request.ClientId != [16]byte(self.client.ClientId()) || request.DomainHash != self.closeReportDomainHash {
 		return nil, errors.New("whole-work request belongs to a different owner")
 	}
+	if settings.PublicKey != ([32]byte{}) && request.PublicKey != settings.PublicKey {
+		return nil, errors.New("whole-work request signing key differs from its approved capture profile")
+	}
 	name := originalWorkOutboxName(request)
 	if prior, err := outbox.read(ctx, name); err == nil {
 		var retained protocol.OriginalWorkCutSubmission
 		if json.Unmarshal(prior, &retained) != nil {
 			return nil, errors.New("whole-work retained submission is malformed")
 		}
+		canonical, marshalErr := json.Marshal(retained)
+		if marshalErr != nil || !bytes.Equal(prior, canonical) {
+			return nil, errors.Join(errors.New("whole-work retained submission is not canonical"), marshalErr)
+		}
+		if _, err := protocol.VerifyOriginalWorkSubmission(ctx, retained, settings.RequestPublicKey); err != nil {
+			return nil, err
+		}
+		originalRequest, err := protocol.DecodeOriginalWorkRequest(retained.Request, settings.RequestPublicKey)
+		if err != nil {
+			return nil, err
+		}
+		if originalWorkOutboxName(originalRequest) != name {
+			return nil, errors.New("whole-work retained original has another phase identity")
+		}
 		cut, err := protocol.DecodeOriginalWorkCut(ctx, retained.Cut)
-		if err != nil || !request.Matches(cut) {
+		if err != nil {
+			return nil, err
+		}
+		if !request.Matches(cut) {
 			return nil, errors.New("whole-work request reinterprets retained boundary")
 		}
 		return prior, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
+	} else if !errors.Is(err, errOriginalWorkOutboxUncaptured) {
 		return nil, err
 	}
 	now := time.Now()
@@ -365,6 +210,9 @@ func (self *ContractManager) captureOriginalWork(ctx context.Context, settings O
 	cut, err := self.OriginalWorkCut(ctx, request.Epoch, request.Block, request.BlockHash)
 	if err != nil {
 		return nil, err
+	}
+	if !cut.Complete {
+		return nil, errors.New("whole-work original capture is waiting for complete current obligations")
 	}
 	if !request.Matches(cut) {
 		return nil, errors.New("whole-work requested signing owner differs")
@@ -432,15 +280,15 @@ func (self *ContractManager) runOriginalWorkCapture() {
 	}()
 	for self.ctx.Err() == nil {
 		err := func() error {
+			owner, cancel := context.WithTimeout(self.ctx, 300*time.Second)
+			defer cancel()
 			if outbox == nil {
-				opened, err := openOriginalWorkOutbox(settings.OutboxDirectory)
+				opened, err := openOriginalWorkOutboxContext(owner, settings.OutboxDirectory)
 				if err != nil {
 					return err
 				}
 				outbox = opened
 			}
-			owner, cancel := context.WithTimeout(self.ctx, 300*time.Second)
-			defer cancel()
 			entries, err := outbox.entries(owner)
 			if err != nil {
 				return err

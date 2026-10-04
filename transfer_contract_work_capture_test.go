@@ -21,6 +21,40 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// Explicit test preparation uses the same borrowed-descriptor birth inspector
+// as the offline owner adapter. Runtime capture itself never creates a birth.
+func prepareOriginalWorkOutboxTest(t *testing.T, directory string) {
+	t.Helper()
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	index, err := os.OpenFile(filepath.Join(directory, OriginalWorkOutboxIndexName), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(index.Sync(), index.Close()); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	raw, err := BuildFreshOriginalWorkOutboxCheckpoint(t.Context(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceOriginalWorkOutboxAttribute(root, raw, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Sync(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Exact profile time is independent of scheduler speed in direct capture tests.
 func wholeWorkCaptureFixture(t *testing.T, client *Client) (OriginalWorkCaptureSettings, protocol.OriginalWorkRequest, ed25519.PrivateKey) {
 	t.Helper()
@@ -31,6 +65,7 @@ func wholeWorkCaptureFixture(t *testing.T, client *Client) (OriginalWorkCaptureS
 	if err := os.Chmod(directory, 0700); err != nil {
 		t.Fatal(err)
 	}
+	prepareOriginalWorkOutboxTest(t, directory)
 	settings := OriginalWorkCaptureSettings{ApiUrl: "https://work.example", OutboxDirectory: directory, RequestPublicKey: approver, now: func() time.Time { return time.Unix(1100, 0) }}
 	cut, err := client.ContractManager().OriginalWorkCut(t.Context(), 7, 101, [32]byte{75})
 	if err != nil {
@@ -40,6 +75,7 @@ func wholeWorkCaptureFixture(t *testing.T, client *Client) (OriginalWorkCaptureS
 	if err != nil {
 		t.Fatal(err)
 	}
+	settings.PublicKey = request.PublicKey
 	return settings, request, key
 }
 
@@ -169,6 +205,7 @@ func TestWholeWorkActualLifecyclePollsRetainsAndDeliversSignedCut(t *testing.T) 
 	var approver [32]byte
 	copy(approver[:], key[32:])
 	directory := t.TempDir()
+	prepareOriginalWorkOutboxTest(t, directory)
 	if err := os.Chmod(directory, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -317,6 +354,7 @@ func TestWholeWorkActualLifecycleCancellationJoinsPendingHttp(t *testing.T) {
 	}))
 	defer server.Close()
 	directory := t.TempDir()
+	prepareOriginalWorkOutboxTest(t, directory)
 	if err := os.Chmod(directory, 0700); err != nil {
 		t.Fatal(err)
 	}
