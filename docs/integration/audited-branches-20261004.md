@@ -14,3 +14,5 @@ listed below. They are not compiled or activated by this merge.
 - `fix/memory-owner-ledger-emitter-20261003` (`6bca0432528d`): every nonmerge patch is already equivalent on the base; retain current implementations and merge ancestry.
 - `fix/transfer-ack-owner-memory-20261003` (`d788cb4a8dfa`): every nonmerge patch is already equivalent on the base; retain current implementations and merge ancestry.
 - `origin/codex/r46-exit-gap-root-20260926` (`e1fe2daf4841`): every nonmerge patch is already equivalent on the base; retain current implementations and merge ancestry.
+
+- `origin/add-nix-flake-and-single-mod` (`2ac69d2ce392`): The single root module and in-tree protocol are already the current layout. Preserve current Go1.26/module graph; the old Go/Nix shell and wholesale old-layout formatting are historical, not a replacement build authority. Source: `research/historical-branches-20261004/add-nix-flake-and-single-mod.patch.gz`.
