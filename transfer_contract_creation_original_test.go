@@ -1,3 +1,5 @@
+//go:build linux || darwin || freebsd
+
 // Actual request/callback tests observe durable originals at transport admission.
 package connect
 
