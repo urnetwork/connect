@@ -11,3 +11,4 @@ listed below. They are not compiled or activated by this merge.
 
 - `fix/checkpoint-report-id-20261003` (`ded1ebd68f51`): every nonmerge patch is already equivalent on the base; retain current implementations and merge ancestry.
 - `fix/memory-owner-ledger-20261003` (`15d6c8b9cbee`): every nonmerge patch is already equivalent on the base; retain current implementations and merge ancestry.
+- `fix/memory-owner-ledger-emitter-20261003` (`6bca0432528d`): every nonmerge patch is already equivalent on the base; retain current implementations and merge ancestry.
