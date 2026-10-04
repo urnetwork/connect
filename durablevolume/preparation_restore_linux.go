@@ -610,6 +610,11 @@ func (self *preparationRestoreArchive) stageMember(stage *os.File, member Prepar
 	if !unchangedInventoryStat(before, after) || "sha256:"+hex.EncodeToString(hasher.Sum(nil)) != member.Sha256 {
 		return errors.Join(ErrIdentity, errors.New("restore payload changed or differs from original exported bytes"))
 	}
+	// Immutable evidence stays read-only after its private staging write. The
+	// original reviewed mode is part of custody, including retry after sync.
+	if err := target.Chmod(os.FileMode(member.Mode)); err != nil {
+		return err
+	}
 	return errors.Join(self.ctx.Err(), sameNamedFile(source, filepath.Join(self.path, member.Path)), sameNamedFile(target, target.Name()), target.Sync(), parent.Sync())
 }
 

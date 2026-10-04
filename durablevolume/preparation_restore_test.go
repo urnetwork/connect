@@ -45,9 +45,18 @@ func preparationRestoreTestAdapter() PreparationAdapter {
 // different. The target fence explicitly denies prior target state only.
 func newPreparationRestoreFixture(t *testing.T) *preparationFixture {
 	t.Helper()
+	return newPreparationRestoreModeFixture(t, 0600)
+}
+
+// Exact original modes are exported from real files, never patched in a report.
+func newPreparationRestoreModeFixture(t *testing.T, mode os.FileMode) *preparationFixture {
+	t.Helper()
 	f := newPreparationFixture(t)
 	raw := []byte("exact reviewed public bytes\n")
 	if err := os.WriteFile(filepath.Join(f.volume.root, "record.bin"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(f.volume.root, "record.bin"), mode); err != nil {
 		t.Fatal(err)
 	}
 	var stat syscall.Stat_t
@@ -84,6 +93,9 @@ func newPreparationRestoreFixture(t *testing.T) *preparationFixture {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(archive, "record.bin"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(archive, "record.bin"), mode); err != nil {
 		t.Fatal(err)
 	}
 	for _, attribute := range report.Entries[0].OwnerAttributes {

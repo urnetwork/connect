@@ -68,7 +68,7 @@ func validatePhysicalInventory(ctx context.Context, report Inventory) error {
 				return errors.New("physical directory metadata is invalid")
 			}
 		case "file":
-			if entry.Mode != 0600 || !validDigest(entry.Sha256) || entry.Size > report.Limits.MaxBytes-totalBytes {
+			if entry.Mode != 0600 && entry.Mode != 0400 || !validDigest(entry.Sha256) || entry.Size > report.Limits.MaxBytes-totalBytes {
 				return errors.New("physical file metadata is invalid or unbounded")
 			}
 			totalBytes += entry.Size
