@@ -22,9 +22,10 @@ const MaximumOriginalWorkContractBytes = 16 * 1024
 // The raw reservation names both parties. The latest signed close inventory
 // binds every prior increment; no aggregate count can replace either original.
 type OriginalWorkContract struct {
-	ContractId      [16]byte `json:"contract_id"`
-	StoredContract  []byte   `json:"stored_contract"`
-	LatestInventory []byte   `json:"latest_inventory,omitempty"`
+	ContractId       [16]byte `json:"contract_id"`
+	StoredContract   []byte   `json:"stored_contract"`
+	OriginalCreation []byte   `json:"original_creation,omitempty"`
+	LatestInventory  []byte   `json:"latest_inventory,omitempty"`
 }
 
 // Restart creates another generation. Missing generations, incomplete cuts and
@@ -84,9 +85,19 @@ func (self OriginalWorkCut) signingBytes(ctx context.Context) ([]byte, error) {
 			return nil, errors.New("whole-work cut contract ownership or order differs")
 		}
 		previous = contract.ContractId
-		used += len(contract.StoredContract) + len(contract.LatestInventory)
+		used += len(contract.StoredContract) + len(contract.OriginalCreation) + len(contract.LatestInventory)
 		if used > MaximumOriginalWorkCutBytes/2 {
 			return nil, errors.New("whole-work cut exceeds original byte capacity")
+		}
+		if len(contract.OriginalCreation) != 0 {
+			admission, err := DecodeOriginalContractAdmission(ctx, contract.OriginalCreation)
+			if err != nil {
+				return nil, err
+			}
+			facts, err := admission.Facts(ctx)
+			if err != nil || facts.DomainHash != self.DomainHash || facts.ClientId != source || self.ClientId != source || facts.Generation != self.Generation || facts.PublicKey != self.PublicKey || facts.ContractId != contract.ContractId || !bytes.Equal(facts.StoredContract, contract.StoredContract) {
+				return nil, errors.New("whole-work cut original creation differs")
+			}
 		}
 		if len(contract.LatestInventory) != 0 {
 			inventory, err := DecodeOriginalCloseInventory(contract.LatestInventory)

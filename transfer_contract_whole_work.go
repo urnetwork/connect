@@ -223,7 +223,7 @@ func (self *ContractManager) OriginalWorkCut(ctx context.Context, epoch, block u
 		defer owner.stateLock.Unlock()
 		cut := protocol.OriginalWorkCut{DomainHash: self.closeReportDomainHash, ClientId: [16]byte(self.client.ClientId()), Generation: [16]byte(owner.generation), Epoch: epoch, Block: block, BlockHash: blockHash, Revision: owner.revision, Complete: !owner.broken && owner.pending == 0, Contracts: make([]protocol.OriginalWorkContract, 0, len(owner.contractKVs))}
 		for _, original := range owner.contractKVs {
-			cut.Contracts = append(cut.Contracts, protocol.OriginalWorkContract{ContractId: original.ContractId, StoredContract: bytes.Clone(original.StoredContract), LatestInventory: bytes.Clone(original.LatestInventory)})
+			cut.Contracts = append(cut.Contracts, protocol.OriginalWorkContract{ContractId: original.ContractId, StoredContract: bytes.Clone(original.StoredContract), OriginalCreation: bytes.Clone(original.OriginalCreation), LatestInventory: bytes.Clone(original.LatestInventory)})
 		}
 		return cut
 	}()
