@@ -36,6 +36,26 @@ jobs:
         with:
           go-version: stable
 
+      # test.sh is a zsh script, and the TestTestScriptPackageDiscovery* tests
+      # run it: without zsh they fail at their first line. The runner image
+      # does not ship it.
+      - name: Install zsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+
+      # The family tests run over loopback, but first they ask
+      # probeFamilySupport whether this host has IPv6. It counts only a global
+      # address on a non-loopback interface, and a runner has none. So seven of
+      # them failed: TestFamilySupportedOnThisHost, and six transport tests that
+      # need the probe's yes before they dial v6. IPV6.md D3 runs them on
+      # dual-stack hosts. This gives the runner the one thing the probe looks
+      # for, a ULA address on a dummy interface. It adds no route beyond its own
+      # /64, so the runner still has no IPv6 path off the machine.
+      - name: Give the runner an IPv6 address for the family probe
+        run: |
+          sudo ip link add ci-v6 type dummy
+          sudo ip link set ci-v6 up
+          sudo ip -6 addr add fd00:ca::1/64 dev ci-v6 nodad
+
       - name: Build
         run: go build ./...
 
@@ -61,9 +81,11 @@ jobs:
             go test -count=1 -exec "$PWD/tools/go_js_wasm_exec_fetch.sh" -run '^(TestWebRtcJs|TestHttpPlatformJs)' .
 
       # -count=1 defeats the test result cache so a green run always means the
-      # tests actually ran. the root package (the data path) takes ~9 min.
+      # tests actually ran. the root package (the data path) takes about 30 min
+      # on a runner (1750 s measured on 2026-10-04), so 20 min stopped it
+      # partway.
       - name: Test
-        run: go test -count=1 -timeout 20m $(go list ./... | grep -v '/extender$')
+        run: go test -count=1 -timeout 45m $(go list ./... | grep -v '/extender$')
 
       # extender's TestExtender fails on a fresh checkout, before any change of
       # ours: it sleeps a fixed 1s for its TLS and extender listeners to come up
