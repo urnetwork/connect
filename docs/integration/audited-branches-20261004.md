@@ -9,3 +9,4 @@ listed below. They are not compiled or activated by this merge.
 
 ## Dispositions
 
+- `fix/checkpoint-report-id-20261003` (`ded1ebd68f51`): every nonmerge patch is already equivalent on the base; retain current implementations and merge ancestry.
