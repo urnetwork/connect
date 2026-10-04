@@ -1,0 +1,298 @@
+[
+  {
+    "ref": "origin/add-nix-flake-and-single-mod",
+    "head": "2ac69d2ce3922e05f905aa927f95dce5f9a98183",
+    "unique_commits": [
+      "2ac69d2ce3922e05f905aa927f95dce5f9a98183"
+    ],
+    "patch_file": "research/historical-branches-20261004/add-nix-flake-and-single-mod.patch.gz",
+    "compressed_sha256": "9018b405f0d265f6d2185fa80766850e71db704e5440c7319b8d67680ab682dc",
+    "patch_sha256": "d1e91cfa123aa2d2c004d230e09351f27d8f6b88ccd0b52471ef89699d68ae22",
+    "patch_bytes": 584169,
+    "compressed_bytes": 96092,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/add-peer-to-peer-connections",
+    "head": "f7f897021be08221f6d23a73abaca497b73d23c4",
+    "unique_commits": [
+      "a71b4daeb06a4d218b301bec97364d1cf322f12f",
+      "ea2e59addffe2ec25c77d2eee55a9f32fcc161f2",
+      "234341a43407084409ab0780dc46fbc9d07728f7",
+      "f7f897021be08221f6d23a73abaca497b73d23c4"
+    ],
+    "patch_file": "research/historical-branches-20261004/add-peer-to-peer-connections.patch.gz",
+    "compressed_sha256": "b61a9bcb4a5788086c6f41b60a4ebfa5969a5d1c62cebde0c681910def85fe0a",
+    "patch_sha256": "b9d66a9a331ce730c6e160148be5f73586e667ae881025fc42f7a0bf96da9958",
+    "patch_bytes": 95521,
+    "compressed_bytes": 26901,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/api-network-user",
+    "head": "9067c85a79837e8a3b51b4607d5ac9ba7c1ab151",
+    "unique_commits": [
+      "9067c85a79837e8a3b51b4607d5ac9ba7c1ab151"
+    ],
+    "patch_file": "research/historical-branches-20261004/api-network-user.patch.gz",
+    "compressed_sha256": "c68ce412473b60160e2e3af2ebd8dc950cfdcb9ba84ab04814aae3c42f9e2731",
+    "patch_sha256": "28bc02bd5fde65c40087f7d6095bf1f96293b28334c62df5b91b88b3bb1843dc",
+    "patch_bytes": 3546,
+    "compressed_bytes": 841,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/codex/astra-r43-transport-recovery-20260924",
+    "head": "3b7eca941491cc6cdf22f6816bf43eaadf4f0bc1",
+    "unique_commits": [
+      "6c0d1a71cc7001598ee2b97caec403e064e652d0"
+    ],
+    "patch_file": "research/historical-branches-20261004/codex--astra-r43-transport-recovery-20260924.patch.gz",
+    "compressed_sha256": "4af537b78cf62c3e0b3a4bbc11e27650d289a9d0ea82636b8aeda0ad35d23eae",
+    "patch_sha256": "82fd1dcfb84336dbbd900326e71e00e64e89233a5c13565f842dc634d15034c8",
+    "patch_bytes": 15580,
+    "compressed_bytes": 4922,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/codex/astra-receive-gap-ordering-20260925",
+    "head": "3cc6ef2a89ca8c3f6f9acc3aa918f0ff157bd89d",
+    "unique_commits": [
+      "6c0d1a71cc7001598ee2b97caec403e064e652d0"
+    ],
+    "patch_file": "research/historical-branches-20261004/codex--astra-receive-gap-ordering-20260925.patch.gz",
+    "compressed_sha256": "4af537b78cf62c3e0b3a4bbc11e27650d289a9d0ea82636b8aeda0ad35d23eae",
+    "patch_sha256": "82fd1dcfb84336dbbd900326e71e00e64e89233a5c13565f842dc634d15034c8",
+    "patch_bytes": 15580,
+    "compressed_bytes": 4922,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/diagrams",
+    "head": "1a74f4b96021697ef8a8b1e22cf6e769bf277a5e",
+    "unique_commits": [
+      "4e4b11308c717eb33a3f58e470ab8561fdff01b4",
+      "096b20db4445118275907d07d836063b8df0aca4",
+      "1617e6b384cef3b52115ca475a5f2363c28d312b",
+      "4b8a2b9ed54cf6f07100ea2b7c51d3c4a764a0d5",
+      "1a74f4b96021697ef8a8b1e22cf6e769bf277a5e"
+    ],
+    "patch_file": "research/historical-branches-20261004/diagrams.patch.gz",
+    "compressed_sha256": "9329b82d16de116f0860b46662f6d05fc316a437cde8246ee40a1cc209723460",
+    "patch_sha256": "93dcc2fc6cbd608764c0d881eb72ff5a6d41395f94006e833a1cddb87ee96a3b",
+    "patch_bytes": 9605,
+    "compressed_bytes": 2644,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/extender-fixes",
+    "head": "b8184cc9df66439c764ceb258763ddbd0dd60e67",
+    "unique_commits": [
+      "b8184cc9df66439c764ceb258763ddbd0dd60e67"
+    ],
+    "patch_file": "research/historical-branches-20261004/extender-fixes.patch.gz",
+    "compressed_sha256": "dbf862ac6537456b1e4ed05e9633c6bc3f42d81db92e7d4ae77c93f790f6d21b",
+    "patch_sha256": "a642f28cdb0c26f30a2a94f476189881184e6f8bfb344686cf6c79687bbef29c",
+    "patch_bytes": 12181,
+    "compressed_bytes": 4244,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/find-providers-tune1",
+    "head": "4dd156de516dbe49384d59639c28760e1a1c5375",
+    "unique_commits": [
+      "7594a806c31f073bdd512476eb916a774642fb25",
+      "44bbbd00810299a8f629b2d9918c50212af93a62",
+      "9d3935fec3d03c33bcb977954b5661741716ad94",
+      "46efa561f3183df5bd91d910af5bc96fdd151767"
+    ],
+    "patch_file": "research/historical-branches-20261004/find-providers-tune1.patch.gz",
+    "compressed_sha256": "acf8c8ca678602a0355315a7e9c03ebf2b126cd730295b9b2f865ee8aeb36cc4",
+    "patch_sha256": "72a5192bcc15124f443f3d9d46b0895f005b5669db5361e4ecbf60885946ae17",
+    "patch_bytes": 5362137,
+    "compressed_bytes": 686355,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/geode-api",
+    "head": "bde5b739ece03f25863de55c9b1dfbeff4f8c37d",
+    "unique_commits": [
+      "bde5b739ece03f25863de55c9b1dfbeff4f8c37d"
+    ],
+    "patch_file": "research/historical-branches-20261004/geode-api.patch.gz",
+    "compressed_sha256": "7e16aeb9ca22d6efe9ca304bb9a6ce4ac791f9f21783a9d8fe9d871f0e70d8e1",
+    "patch_sha256": "40fc1400c0be5c37b7108165a4305c905fffd5aedc1ff5ac54ac4166b03178fb",
+    "patch_bytes": 2748,
+    "compressed_bytes": 1061,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/gvisor-test",
+    "head": "419aa07b516e7ea716a2b73e384292e9db6fc38e",
+    "unique_commits": [
+      "419aa07b516e7ea716a2b73e384292e9db6fc38e"
+    ],
+    "patch_file": "research/historical-branches-20261004/gvisor-test.patch.gz",
+    "compressed_sha256": "724e66921a7a25cac8b1adecdfc00bbdc60bd3a72d77815316434d076e2b9072",
+    "patch_sha256": "22561886d2eff025706d8cc9772ecd7ce325ea2fd0678a040c9b14f6c1000586",
+    "patch_bytes": 66494,
+    "compressed_bytes": 19223,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/inspect",
+    "head": "26952d2f927a5553651871d7633d9dc1d0585c63",
+    "unique_commits": [
+      "26952d2f927a5553651871d7633d9dc1d0585c63"
+    ],
+    "patch_file": "research/historical-branches-20261004/inspect.patch.gz",
+    "compressed_sha256": "6d34d87b779bff4ef3a9436a325d86f30dd6162371735e5038be475d32f517ad",
+    "patch_sha256": "6b0fba4fc94705ed04f1993f5d7363ab4db936139b7c60fcf31695dcb7006a8b",
+    "patch_bytes": 3126,
+    "compressed_bytes": 1234,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/inspect-occurrence-data",
+    "head": "06769d0068f881654477b6e4e8af8f2831c54400",
+    "unique_commits": [
+      "26952d2f927a5553651871d7633d9dc1d0585c63",
+      "9d6aa981212626996903124cc4c5d068c299ff4f",
+      "cd1763ccb05e633fe7ed08002d180ef197632f9b",
+      "f98916fd9d5d56c96bb3a959eec12690388574c6",
+      "7cfd805565d372e1ed7835a6b517a105cb2b78fb",
+      "d88d3a2f55bb5e2f808adee984cc7799e20085c8",
+      "a0e838c62dfaa244ada703e22d7eeb69d1b7ee12",
+      "393c2403e3f835450f6f146ea0be3953d98588d3",
+      "9f1e7a80c4662c59b423e11ffa9dedd34f17285d",
+      "6b44ef89d6e3eaf00dfdf854bf76038e131b82a5",
+      "72a6969e8c7caded7293991a628527b921ebe02d",
+      "fe20ed23611b0ec3670367315261641d8bd81c54",
+      "413faf369638c490d675dc169ce30785ea202f04",
+      "d3b8eef673d789dbcf21db836eca3400117a13ab",
+      "9cb2b15861b9bd7b9a188141376cd2fe9acb06ff",
+      "7fc6f875fb649a3b6ea202e4e4914a6e4cc440ca",
+      "bb427238092ec5d0aceba8e5e2595ff8e924f510",
+      "4d731daded7ee851410555d2986b638df17ee1c7",
+      "07629d4f3d632f6cae77d7727a244bbde6d44e75",
+      "4a2d4022907e089b4d9edc9213cd6cb1a2caceec",
+      "ca21eb5cdea99d1ebafca44675d0c397817780f2",
+      "88dfe02649ced8cd324d308d8090c8293ba5dcf1",
+      "418bd053aef09172d611575bc9bda0bfd22d815d",
+      "b534e14ccf117bef86cce5b7202d5eced649d85b",
+      "e9129ecea5303b4b3c600f1a0d2b2cbbc0f01514",
+      "75b24166fb0fd40badc6f1fc5a057f9e9e199db1",
+      "80c45403056879e400cd6e7131d23ecdf6777f30",
+      "7ad9ccbab233b8fbdcb34d5cd2e1f226c13d3ce4",
+      "d8738e63d836f9439ff33d1411ded5a4026573e5",
+      "e70b74e1f596fa554f8d25cc6f25d88e34ffef93",
+      "06769d0068f881654477b6e4e8af8f2831c54400"
+    ],
+    "patch_file": "research/historical-branches-20261004/inspect-occurrence-data.patch.gz",
+    "compressed_sha256": "68fcaad32559045cff5e26b92d43f393a57827057d42889577430b767a596d6a",
+    "patch_sha256": "5dc0b6606db3bb0a757ea7e318812b315a086446a2a6b22d427412e2ec27a274",
+    "patch_bytes": 3204359,
+    "compressed_bytes": 816809,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/merge-protocol",
+    "head": "e748904c83fd59b319c8d4e2da821870d29186f4",
+    "unique_commits": [
+      "8497655d11f81bd487bbaf6afc54670f3c8ecb3a",
+      "693f1c904e70391c76b898950031ac7c7ffa90c7",
+      "6f02fce72d2cd72ccae61b929c99983cf42a5664",
+      "e748904c83fd59b319c8d4e2da821870d29186f4"
+    ],
+    "patch_file": "research/historical-branches-20261004/merge-protocol.patch.gz",
+    "compressed_sha256": "d6ff75931d4befda2a826c9343efdde193e4ea38ea17291e133990f92172cd39",
+    "patch_sha256": "4e559264a2b2877a2291cd57f0daee211ec29a0966aac00c2e93c878677149fb",
+    "patch_bytes": 212931,
+    "compressed_bytes": 29583,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/multi-key",
+    "head": "ef3ec3a5d6fbfb4d50c4bf551fe2f17a4d2f2d90",
+    "unique_commits": [
+      "ef3ec3a5d6fbfb4d50c4bf551fe2f17a4d2f2d90"
+    ],
+    "patch_file": "research/historical-branches-20261004/multi-key.patch.gz",
+    "compressed_sha256": "f34d7efcd893551b9c4ffb758a9d8019f74d33d79d728dc03aa1fcb22c861b40",
+    "patch_sha256": "de70b05f9b5346ac090ac5b80e3d0d592753d86372630aca314e56a7fa427752",
+    "patch_bytes": 13072,
+    "compressed_bytes": 3052,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/net-fixes",
+    "head": "ff6769d600d1ae98f37280e18514a9e03c98c964",
+    "unique_commits": [
+      "26952d2f927a5553651871d7633d9dc1d0585c63"
+    ],
+    "patch_file": "research/historical-branches-20261004/net-fixes.patch.gz",
+    "compressed_sha256": "6d34d87b779bff4ef3a9436a325d86f30dd6162371735e5038be475d32f517ad",
+    "patch_sha256": "6b0fba4fc94705ed04f1993f5d7363ab4db936139b7c60fcf31695dcb7006a8b",
+    "patch_bytes": 3126,
+    "compressed_bytes": 1234,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/p2p-stream",
+    "head": "c220330a05e5badf59f0052c0270065fd50bee32",
+    "unique_commits": [
+      "c220330a05e5badf59f0052c0270065fd50bee32"
+    ],
+    "patch_file": "research/historical-branches-20261004/p2p-stream.patch.gz",
+    "compressed_sha256": "af05ab58b9688acda630cfb9cb4120a8ff2f870f26f17a7bb2cc3d1be4a245cf",
+    "patch_sha256": "8c87429d54c9cba2a0b823878399c819557f324c67b476028b0c545ba00605aa",
+    "patch_bytes": 899,
+    "compressed_bytes": 493,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/privacytxt-01",
+    "head": "935d89f39edc2152b128822b5d7ab224ab307a7d",
+    "unique_commits": [
+      "d8571ae9006e7f0eb24bd64322843b741dd17b52",
+      "935d89f39edc2152b128822b5d7ab224ab307a7d"
+    ],
+    "patch_file": "research/historical-branches-20261004/privacytxt-01.patch.gz",
+    "compressed_sha256": "3af2c116337a849851ae4d35e708abf637387193b5a1d46b9f6dd70507398804",
+    "patch_sha256": "7b0233051c30cf2effec192700ffdec954e8cba26b7b5d148160e03c29e1a213",
+    "patch_bytes": 11526,
+    "compressed_bytes": 2609,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/provider-mips-fixes",
+    "head": "896e5f639c426ae57f5cc76fbc5a32640a74f504",
+    "unique_commits": [
+      "7594a806c31f073bdd512476eb916a774642fb25",
+      "44bbbd00810299a8f629b2d9918c50212af93a62",
+      "9d3935fec3d03c33bcb977954b5661741716ad94",
+      "46efa561f3183df5bd91d910af5bc96fdd151767",
+      "0f92306ff045571dd6437447a2d057edd8e79447",
+      "896e5f639c426ae57f5cc76fbc5a32640a74f504"
+    ],
+    "patch_file": "research/historical-branches-20261004/provider-mips-fixes.patch.gz",
+    "compressed_sha256": "374680991c392ece0b882a92cfc50374ddecb2f53b053e2f235145e2aed321d4",
+    "patch_sha256": "f9c58a10280434c7c550c6ef59cdb9d417fe39fecadcd7c9b2a729afd04f4572",
+    "patch_bytes": 5366688,
+    "compressed_bytes": 686954,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  },
+  {
+    "ref": "origin/split",
+    "head": "b85960c6a5637d3c249a3ed16619a5de1b232810",
+    "unique_commits": [
+      "b85960c6a5637d3c249a3ed16619a5de1b232810"
+    ],
+    "patch_file": "research/historical-branches-20261004/split.patch.gz",
+    "compressed_sha256": "1b065ee598e718076278356c53ce6acd681e94586d14ec744e8cdf4285409736",
+    "patch_sha256": "7dda2b3ebddc4e43bced565ad71a0b65a191d08419e68e85710aa1d169adf0ad",
+    "patch_bytes": 2463,
+    "compressed_bytes": 1278,
+    "binary_payloads": "not duplicated; exact original binary objects remain reachable through merged source commits"
+  }
+]
