@@ -32,8 +32,11 @@ type OriginalWorkCaptureSettings struct {
 	OutboxDirectory  string
 	RequestPublicKey [32]byte
 	PollInterval     time.Duration
-	httpClient       *http.Client
-	now              func() time.Time
+	// The owning launcher supplies its isolated proxy/trust transport. The worker
+	// copies the client and always enforces its own timeout and redirect refusal.
+	HttpClient *http.Client
+	httpClient *http.Client
+	now        func() time.Time
 }
 
 // A descriptor and exclusive process lease protect the complete retained set.
@@ -275,7 +278,7 @@ func originalWorkCaptureHttp(ctx context.Context, client *http.Client, method, e
 		}
 		stop()
 		if owner.Err() != nil {
-			return nil, errors.Join(owner.Err(), sendErr)
+			return nil, errors.Join(owner.Err(), context.Cause(owner), sendErr)
 		}
 		if sendErr == nil {
 			return raw, nil
@@ -285,7 +288,7 @@ func originalWorkCaptureHttp(ctx context.Context, client *http.Client, method, e
 		}
 		select {
 		case <-owner.Done():
-			return nil, errors.Join(owner.Err(), sendErr)
+			return nil, errors.Join(owner.Err(), context.Cause(owner), sendErr)
 		case <-time.After(time.Second):
 		}
 	}
@@ -403,8 +406,12 @@ func (self *ContractManager) runOriginalWorkCapture() {
 	}
 	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true, MaxIdleConns: 4, MaxIdleConnsPerHost: 2, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second}
 	client := &http.Client{Timeout: 60 * time.Second, Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	if settings.httpClient != nil {
-		copy := *settings.httpClient
+	configuredClient := settings.HttpClient
+	if configuredClient == nil {
+		configuredClient = settings.httpClient
+	}
+	if configuredClient != nil {
+		copy := *configuredClient
 		copy.Timeout = 60 * time.Second
 		copy.CheckRedirect = client.CheckRedirect
 		client = &copy
@@ -414,13 +421,23 @@ func (self *ContractManager) runOriginalWorkCapture() {
 	if interval < 5*time.Second || interval > time.Minute {
 		interval = 15 * time.Second
 	}
+	var outbox *originalWorkOutbox
+	defer func() {
+		if outbox != nil {
+			if err := outbox.close(); err != nil {
+				self.client.log.Errorf("[contract]whole-work outbox custody close failed: %v", err)
+			}
+		}
+	}()
 	for self.ctx.Err() == nil {
 		err := func() error {
-			outbox, err := openOriginalWorkOutbox(settings.OutboxDirectory)
-			if err != nil {
-				return err
+			if outbox == nil {
+				opened, err := openOriginalWorkOutbox(settings.OutboxDirectory)
+				if err != nil {
+					return err
+				}
+				outbox = opened
 			}
-			defer outbox.close()
 			owner, cancel := context.WithTimeout(self.ctx, 300*time.Second)
 			defer cancel()
 			entries, err := outbox.entries(owner)
@@ -435,6 +452,23 @@ func (self *ContractManager) runOriginalWorkCapture() {
 				if err := self.deliverOriginalWork(owner, settings, client, base, raw); err != nil {
 					return err
 				}
+			}
+			identity, err := self.OriginalWorkIdentity(owner)
+			if err != nil {
+				return err
+			}
+			identityRaw, err := identity.Bytes(owner)
+			if err != nil {
+				return err
+			}
+			identityEndpoint := base.ResolveReference(&url.URL{Path: "/provider-work/v1/owners"}).String()
+			identityResponse, err := originalWorkCaptureHttp(owner, client, http.MethodPost, identityEndpoint, identityRaw, 8*1024)
+			if err != nil {
+				return err
+			}
+			var identityReceipt protocol.OriginalWorkOwnerReceipt
+			if json.Unmarshal(identityResponse, &identityReceipt) != nil || identityReceipt.Schema != protocol.OriginalWorkOwnerReceiptSchema || identityReceipt.OwnerHash != sha256.Sum256(identityRaw) {
+				return errors.New("whole-work owner receipt differs from original enrollment")
 			}
 			keyOwner := self.client.ClientKeyManager()
 			if keyOwner == nil {

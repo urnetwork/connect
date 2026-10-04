@@ -25,6 +25,28 @@ type originalWorkInventoryOwner struct {
 	broken      bool
 }
 
+// The independent request owner can enroll this signed actual lifecycle identity
+// before requesting a boundary. Callers cannot supply or restore its generation.
+func (self *ContractManager) OriginalWorkIdentity(ctx context.Context) (protocol.OriginalWorkOwnerEnrollment, error) {
+	if ctx == nil {
+		return protocol.OriginalWorkOwnerEnrollment{}, errors.New("whole-work identity requires an owner")
+	}
+	if err := ctx.Err(); err != nil {
+		return protocol.OriginalWorkOwnerEnrollment{}, errors.Join(err, context.Cause(ctx))
+	}
+	if self == nil || self.client == nil || self.closeReportDomainHash == ([32]byte{}) {
+		return protocol.OriginalWorkOwnerEnrollment{}, errors.New("whole-work identity is unavailable")
+	}
+	manager := self.client.ClientKeyManager()
+	if manager == nil {
+		return protocol.OriginalWorkOwnerEnrollment{}, errors.New("whole-work client key owner unavailable")
+	}
+	manager.stateLock.RLock()
+	defer manager.stateLock.RUnlock()
+	value := protocol.OriginalWorkOwnerEnrollment{DomainHash: self.closeReportDomainHash, ClientId: [16]byte(self.client.ClientId()), Generation: [16]byte(self.wholeWorkInventory.generation)}
+	return protocol.SignOriginalWorkOwnerEnrollment(ctx, value, manager.privateKey)
+}
+
 // Revision exhaustion is permanent for this generation, never a fresh zero.
 func (self *originalWorkInventoryOwner) advanceWithLock() {
 	if self.revision == math.MaxUint64 {

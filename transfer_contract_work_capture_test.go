@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -172,6 +173,7 @@ func TestWholeWorkActualLifecyclePollsRetainsAndDeliversSignedCut(t *testing.T) 
 		t.Fatal(err)
 	}
 	got := make(chan protocol.OriginalWorkCutSubmission, 1)
+	enrolled := make(chan protocol.OriginalWorkOwnerEnrollment, 1)
 	failures := make(chan error, 1)
 	fail := func(err error) {
 		select {
@@ -182,6 +184,19 @@ func TestWholeWorkActualLifecyclePollsRetainsAndDeliversSignedCut(t *testing.T) 
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
+		case "/provider-work/v1/owners":
+			raw, err := io.ReadAll(io.LimitReader(request.Body, protocol.MaximumOriginalWorkOwnerBytes+1))
+			identity, decodeErr := protocol.DecodeOriginalWorkOwnerEnrollment(request.Context(), raw)
+			if err != nil || decodeErr != nil {
+				fail(errors.Join(err, decodeErr))
+				http.Error(writer, "invalid owner", http.StatusBadRequest)
+				return
+			}
+			json.NewEncoder(writer).Encode(protocol.OriginalWorkOwnerReceipt{Schema: protocol.OriginalWorkOwnerReceiptSchema, OwnerHash: sha256.Sum256(raw)})
+			select {
+			case enrolled <- identity:
+			default:
+			}
 		case "/provider-work/v1/requests":
 			value := protocol.OriginalWorkRequest{RequestId: [16]byte{78}, Epoch: 9, Kind: "start", Block: 200, BlockHash: [32]byte{79}, IssuedAtUnix: 1000, ExpiresAtUnix: 1300}
 			for _, field := range []struct {
@@ -227,7 +242,7 @@ func TestWholeWorkActualLifecyclePollsRetainsAndDeliversSignedCut(t *testing.T) 
 		}
 	}))
 	defer server.Close()
-	capture := &OriginalWorkCaptureSettings{ApiUrl: server.URL, OutboxDirectory: directory, RequestPublicKey: approver, httpClient: server.Client(), now: func() time.Time { return time.Unix(1100, 0) }}
+	capture := &OriginalWorkCaptureSettings{ApiUrl: server.URL, OutboxDirectory: directory, RequestPublicKey: approver, HttpClient: server.Client(), now: func() time.Time { return time.Unix(1100, 0) }}
 	client := newWholeWorkTestClient(t, NewNoContractClientOob(), capture)
 	var submission protocol.OriginalWorkCutSubmission
 	select {
@@ -236,6 +251,22 @@ func TestWholeWorkActualLifecyclePollsRetainsAndDeliversSignedCut(t *testing.T) 
 		t.Fatal(err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("actual SDK capture worker did not deliver")
+	}
+	if other, err := openOriginalWorkOutbox(directory); err == nil {
+		other.close()
+		t.Fatal("live owner released custody between polling cycles")
+	}
+	identity, err := client.ContractManager().OriginalWorkIdentity(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case observed := <-enrolled:
+		if observed != identity {
+			t.Fatal("enrollment differs from real retained SDK identity")
+		}
+	default:
+		t.Fatal("request polling preceded authentic generation enrollment")
 	}
 	join, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
