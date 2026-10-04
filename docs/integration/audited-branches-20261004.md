@@ -34,3 +34,5 @@ listed below. They are not compiled or activated by this merge.
 - `origin/geode-api` (`bde5b739ece0`): Proposed earnings API retained as historical draft; it is not represented as current deployed endpoint behavior. Current API schema and generator workflow remain authoritative. Exact historical source: `research/historical-branches-20261004/geode-api.patch.gz`.
 
 - `origin/gvisor-test` (`419aa07b516e`): 2024 source-map/netstack experiment retained. It does not replace current LocalUserNat or qualify an alternative to the missing current sibling gvisor fork. Current module pin and replacement are unchanged. Exact historical source: `research/historical-branches-20261004/gvisor-test.patch.gz`.
+
+- `origin/inspect` (`26952d2f927a`): Draft inspection protocol retained with the exploratory analysis source. Current generated production wire types remain unchanged. Exact historical source: `research/historical-branches-20261004/inspect.patch.gz`.
