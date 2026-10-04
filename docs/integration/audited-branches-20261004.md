@@ -52,3 +52,24 @@ listed below. They are not compiled or activated by this merge.
 - `origin/provider-mips-fixes` (`896e5f639c42`): Later provider MIPS/debug variant retained with earlier tuning history. Current TLS, pool and parser implementations remain; removed provider executable and mininit behavior are not reinstated. Exact historical source: `research/historical-branches-20261004/provider-mips-fixes.patch.gz`.
 
 - `origin/split` (`b85960c6a563`): Dated split-tunnel product design retained as historical documentation, without claiming every proposal is selected in current clients. Exact historical source: `research/historical-branches-20261004/split.patch.gz`.
+## Equivalent ref aliases
+
+These additional audited names are retained through the same merged source parents.
+Each has no patch-unique commit relative to the integration base.
+
+- `fix/transfer-owner-snapshot-fence-20261003` (`f29b679b7a88`): current patch-equivalent implementation retained; head is an ancestor of this integration.
+- `origin/fix/transfer-ack-owner-memory-20261003` (`d788cb4a8dfa`): current patch-equivalent implementation retained; head is an ancestor of this integration.
+- `origin/fp2-close-report-identity-emission-20261003` (`fd4388de8f8c`): current patch-equivalent implementation retained; head is an ancestor of this integration.
+- `origin/fp2-close-report-owner-ledger-20261003` (`6bca0432528d`): current patch-equivalent implementation retained; head is an ancestor of this integration.
+- `origin/fp2-close-report-wire-20261003` (`ded1ebd68f51`): current patch-equivalent implementation retained; head is an ancestor of this integration.
+- `origin/fp2-transfer-owner-snapshot-fence-20261003` (`f29b679b7a88`): current patch-equivalent implementation retained; head is an ancestor of this integration.
+- `origin/fp2-transport-owner-ledger-only-20261003` (`15d6c8b9cbee`): current patch-equivalent implementation retained; head is an ancestor of this integration.
+
+## Validation and limits
+
+All 31 audited ref heads are ancestors of this integration. The active source,
+module files, and generated protocol bytes are identical to the fresh main base;
+only integration documentation and historical source archives are added. The
+focused close-report protocol race controls pass. A full current module build is
+unqualified because the required sibling gVisor checkout is unavailable.
+Historical feature drafts are preserved, not represented as enabled runtime features.
