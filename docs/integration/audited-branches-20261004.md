@@ -16,3 +16,5 @@ listed below. They are not compiled or activated by this merge.
 - `origin/codex/r46-exit-gap-root-20260926` (`e1fe2daf4841`): every nonmerge patch is already equivalent on the base; retain current implementations and merge ancestry.
 
 - `origin/add-nix-flake-and-single-mod` (`2ac69d2ce392`): The single root module and in-tree protocol are already the current layout. Preserve current Go1.26/module graph; the old Go/Nix shell and wholesale old-layout formatting are historical, not a replacement build authority. Source: `research/historical-branches-20261004/add-nix-flake-and-single-mod.patch.gz`.
+
+- `origin/add-peer-to-peer-connections` (`f7f897021be0`): Historical webrtc-conn/Pion-v3 API, five-second wrapper and deleted connect/ layout are retained. Current Pion-v4 transport_p2p_webrtc.go owns authenticated signaling, admission and lifecycle; the prototype is not selected. Exact historical source: `research/historical-branches-20261004/add-peer-to-peer-connections.patch.gz`.
