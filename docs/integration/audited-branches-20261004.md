@@ -44,3 +44,5 @@ listed below. They are not compiled or activated by this merge.
 - `origin/multi-key` (`ef3ec3a5d6fb`): Distinct destination-affinity experiment retained explicitly as research, not claimed equivalent. Key sharing, idle-owner changes and removed RST behavior require separate lifecycle qualification before runtime selection. Exact historical source: `research/historical-branches-20261004/multi-key.patch.gz`.
 
 - `origin/net-fixes` (`ff6769d600d1`): Inspection draft and older HTTP changes retained. Current net_http transport/DNS/cancellation implementations supersede the deleted connect/net_http.go layout; no production wire change. Exact historical source: `research/historical-branches-20261004/net-fixes.patch.gz`.
+
+- `origin/p2p-stream` (`c220330a05e5`): Historical P2P-only timeout design note retained. Current measured P2P settings and lifecycle bounds remain unchanged. Exact historical source: `research/historical-branches-20261004/p2p-stream.patch.gz`.
