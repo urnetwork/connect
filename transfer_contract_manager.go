@@ -351,6 +351,10 @@ func DefaultContractManagerSettingsNoNetworkEvents() *ContractManagerSettings {
 type ContractManagerSettings struct {
 	SequenceBufferSize int
 
+	// Optional exact client-key-history policy domain digest. Zero leaves reports
+	// unsigned. The manager copies it once; retries never adopt another domain.
+	CloseReportDomainHash [32]byte
+
 	// this should be enough to do a single ping
 	InitialContractTransferByteCount ByteCount
 	// InitialNetworkPeerContractTransferByteCount covers a bounded interactive
@@ -413,7 +417,8 @@ type ContractManager struct {
 	cancel context.CancelFunc
 	client *Client
 
-	settings *ContractManagerSettings
+	settings              *ContractManagerSettings
+	closeReportDomainHash [32]byte
 
 	mutex             sync.Mutex
 	closed            bool
@@ -467,6 +472,8 @@ type ContractManager struct {
 	// Nil test barriers expose callback admission and manager join entry.
 	beforeCallbackAdmissionLockForTest func()
 	beforeCloseWaitForTest             func()
+	// Nil in production; exposes completed original creation before route selection.
+	beforeOriginalCloseFrameForTest func(*protocol.CloseContract)
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
@@ -497,6 +504,7 @@ func NewContractManager(
 		cancel:                          cancel,
 		client:                          client,
 		settings:                        settings,
+		closeReportDomainHash:           settings.CloseReportDomainHash,
 		provideSecretKeys:               map[protocol.ProvideMode][]byte{},
 		provideModes:                    map[protocol.ProvideMode]bool{},
 		providePaused:                   false,
@@ -1707,13 +1715,27 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	// retransfers and the closed-client OOB path keep the serialized frame;
 	// another equal-byte checkpoint is a different operation with a new ID.
 	// Deploy only after every backend route supports close-report identities.
-	frame, err := ToFrame(&protocol.CloseContract{
+	report := &protocol.CloseContract{
 		ContractId:       contractId.Bytes(),
 		AckedByteCount:   uint64(ackedByteCount),
 		UnackedByteCount: uint64(unackedByteCount),
 		Checkpoint:       checkpoint,
 		ReportId:         NewId().Bytes(),
-	}, self.settings.ProtocolVersion)
+	}
+	if self.closeReportDomainHash != ([32]byte{}) {
+		original, signErr := self.client.ClientKeyManager().signOriginalCloseReport(self.closeReportDomainHash, self.client.ClientId(), report)
+		if signErr != nil {
+			// Optional evidence failure cannot erase the original close obligation.
+			// The empty envelope remains visibly unauthenticated to its consumer.
+			self.client.log.Errorf("[contract]original close evidence unavailable: %v", signErr)
+		} else {
+			report.OriginalReport = original
+		}
+	}
+	if self.beforeOriginalCloseFrameForTest != nil {
+		self.beforeOriginalCloseFrameForTest(report)
+	}
+	frame, err := ToFrame(report, self.settings.ProtocolVersion)
 	if err != nil {
 		self.client.log.Infof("[contract]could not create close contract frame = %s\n", err)
 		return
