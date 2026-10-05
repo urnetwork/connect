@@ -16615,7 +16615,7 @@ func (self *ForwardBuffer) Pack(forwardPack *ForwardPack, timeout time.Duration)
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
-		if self.closed {
+		if self.closed || forwardPack.Ctx.Err() != nil {
 			return nil
 		}
 		forwardSequence, ok := self.forwardSequences[forwardPack.Destination]
