@@ -113,8 +113,8 @@ type ClientStrategySettings struct {
 	// if true, enables non-ech
 	// TODO set this to default false
 	ExposeServerHostNames bool
-	// note that extenders and proxy are the only strategies that will be enabled if
-	// `ExposeServerIps == false` and `ExposeServerNames == false`
+	// note that extenders, vless and proxy are the only strategies that will be
+	// enabled if `ExposeServerIps == false` and `ExposeServerNames == false`
 
 	EnableNormal bool
 	// tls frag, retransmit, tls frag + retransmit
@@ -135,6 +135,12 @@ type ClientStrategySettings struct {
 	// Measurement fixtures use it for hermetic production extender paths. Nil
 	// retains normal discovery and selection. The strategy copies each entry.
 	ExtenderConfigs []*ExtenderConfig
+	// VlessConfigs are VLESS servers the user named (vless.go), each an
+	// additional persistent dialer that carries the strategy's connections
+	// through its server. The strategy copies each entry, and
+	// `SetVlessConfigs` replaces them on a running strategy. Empty is a
+	// strategy without VLESS.
+	VlessConfigs []*VlessConfig
 	// ExtenderDirectory is where discovered extenders come from (E1, E2). The
 	// strategy draws candidates from it, reports every dial outcome back to
 	// it, and drops the dialers of addresses it retires. Nil disables
@@ -425,6 +431,11 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		}
 		dialers[dialer] = true
 	}
+	for _, vlessConfig := range settings.VlessConfigs {
+		if dialer := newVlessClientDialer(settings, vlessConfig); dialer != nil {
+			dialers[dialer] = true
+		}
+	}
 	// FIXME
 	/*
 		if settings.EnablePt {
@@ -601,6 +612,72 @@ func (self *ClientStrategy) CustomExtenders() map[netip.Addr]string {
 	defer self.mutex.Unlock()
 
 	return maps.Clone(self.extenderIpSecrets)
+}
+
+// The VLESS dialer weight floor and rank. A server the user named is meant to
+// be used, so it keeps the floor of the direct dialer; among dialers that
+// last succeeded it ranks after the direct ones, which skip the extra hop when
+// they work, and before the resilient and extender ones.
+const (
+	vlessDialerMinimumWeight = float32(0.5)
+	vlessDialerPriority      = 30
+)
+
+// A persistent dialer for one VLESS server, or nil for a nil or invalid
+// configuration. The dialer keeps its own copy of the configuration.
+func newVlessClientDialer(settings *ClientStrategySettings, vlessConfig *VlessConfig) *clientDialer {
+	if vlessConfig == nil || vlessConfig.Validate() != nil {
+		return nil
+	}
+	copiedConfig := vlessConfig.Copy()
+	return &clientDialer{
+		description:        "vless",
+		createTime:         time.Now(),
+		persistent:         true,
+		minimumWeight:      vlessDialerMinimumWeight,
+		priority:           vlessDialerPriority,
+		dialTlsContext:     newVlessDialTlsContext(&settings.ConnectSettings, copiedConfig, clientWebSocketNextProtos),
+		httpDialTlsContext: newVlessDialTlsContext(&settings.ConnectSettings, copiedConfig, clientHttpNextProtos),
+		dialContext:        newVlessDialContext(&settings.ConnectSettings, copiedConfig),
+		vlessConfig:        copiedConfig,
+		settings:           settings,
+	}
+}
+
+// SetVlessConfigs replaces the strategy's VLESS dialers with one per valid
+// configuration; nil or empty removes them. The replaced dialers' pooled
+// connections close, and requests in flight finish on the connections they
+// have.
+func (self *ClientStrategy) SetVlessConfigs(vlessConfigs []*VlessConfig) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	for dialer := range self.dialers {
+		if dialer.vlessConfig != nil {
+			dialer.Close()
+			delete(self.dialers, dialer)
+		}
+	}
+	for _, vlessConfig := range vlessConfigs {
+		if dialer := newVlessClientDialer(self.settings, vlessConfig); dialer != nil {
+			self.dialers[dialer] = true
+		}
+	}
+}
+
+// Copies of the configurations of the strategy's VLESS dialers, in no
+// particular order.
+func (self *ClientStrategy) VlessConfigs() []*VlessConfig {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	vlessConfigs := []*VlessConfig{}
+	for dialer := range self.dialers {
+		if dialer.vlessConfig != nil {
+			vlessConfigs = append(vlessConfigs, dialer.vlessConfig.Copy())
+		}
+	}
+	return vlessConfigs
 }
 
 // nextConnectMaxLead caps how far the shared next-connect timestamp may run
@@ -2080,6 +2157,9 @@ type clientDialer struct {
 	httpClientFactory func() *http.Client
 
 	extenderConfig *ExtenderConfig
+	// the server of a VLESS dialer, nil for every other dialer. Never changed
+	// after construction.
+	vlessConfig *VlessConfig
 
 	mutex           sync.Mutex
 	successCount    uint64
