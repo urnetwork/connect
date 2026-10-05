@@ -40,6 +40,8 @@ func TestDialFramedUpgradePreservesOriginalReadCauses(t *testing.T) {
 	}{
 		{name: "eof", failure: io.EOF, fallback: true},
 		{name: "incomplete response", failure: io.ErrUnexpectedEOF, fallback: true},
+		{name: "closed network connection", failure: net.ErrClosed, fallback: true},
+		{name: "unclassified closed pipe", failure: io.ErrClosedPipe},
 		{name: "hard original", failure: hard},
 		{name: "mixed original", failure: errors.Join(io.ErrUnexpectedEOF, hard)},
 		{name: "mixed cancellation", failure: errors.Join(io.ErrUnexpectedEOF, context.Canceled)},

@@ -27,6 +27,25 @@ type h1DeadlineConn struct {
 	closed atomic.Bool
 }
 
+// net.Pipe reports io.ErrClosedPipe for its own closure; a native socket
+// reports net.ErrClosed. Match the native boundary only after this fixture's
+// Close, so a private probe timeout exercises the real fallback policy.
+func (c *h1DeadlineConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if err == io.ErrClosedPipe && c.closed.Load() {
+		err = net.ErrClosed
+	}
+	return n, err
+}
+
+func (c *h1DeadlineConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err == io.ErrClosedPipe && c.closed.Load() {
+		err = net.ErrClosed
+	}
+	return n, err
+}
+
 func (c *h1DeadlineConn) Close() error {
 	c.closed.Store(true)
 	return c.Conn.Close()
