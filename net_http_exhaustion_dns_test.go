@@ -45,14 +45,14 @@ func TestHttpRequestExhaustionPublicRetainsTerminalDnsTransport(t *testing.T) {
 	}
 }
 
-// Contradictory DNS flags must not collapse a hard notfound leaf into the
-// transient timeout bucket, or unwrap permanent DNS into a transient child.
+// Contradictory DNS flags cannot soften not-found. A complete unflagged leaf
+// also remains hard, without inferring permanence from absent flags on a wrapper.
 func TestHttpRequestExhaustionPublicKeepsPermanentDnsCause(t *testing.T) {
 	for _, serial := range []bool{false, true} {
 		for _, hard := range []*net.DNSError{
 			{Err: "synthetic absent name", Name: "absent.example", IsNotFound: true, IsTimeout: true},
 			{Err: "synthetic absent name", Name: "absent.example", IsNotFound: true, IsTemporary: true, UnwrapErr: io.EOF},
-			{Err: "synthetic permanent resolver failure", Name: "permanent.example", UnwrapErr: io.EOF},
+			{Err: "synthetic permanent resolver failure", Name: "permanent.example"},
 		} {
 			transient := &net.DNSError{Err: "synthetic prior resolver timeout", Name: "timeout.example", IsTimeout: true}
 			err := runHttpExhaustionTest(t, serial, context.DeadlineExceeded, errors.Join(transient, hard))

@@ -113,9 +113,9 @@ func flattenHttpRequestCauses(err error) []httpRequestCause {
 			continue
 		}
 		if dns, ok := item.err.(*net.DNSError); ok {
-			// A concrete DNS error can be complete without a wrapped cause.
-			// Permanent DNS metadata still dominates any transient child.
-			if dns.IsNotFound || !dns.IsTimeout && !dns.IsTemporary {
+			// Not-found is authoritative even with a transient child. Other
+			// flags classify only a leaf; actual children keep their meaning.
+			if dns.IsNotFound {
 				result = append(result, httpRequestCause{err: item.err})
 				continue
 			}
