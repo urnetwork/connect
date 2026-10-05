@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"testing/fstest"
+	"testing/synctest"
 	"time"
 )
 
@@ -303,33 +304,53 @@ func TestExtenderDirectorySpoofCountryCode(t *testing.T) {
 // The override of the bug: while the hint endpoint answers, its country is in
 // force whatever the host reports; once it cannot be reached, the network
 // country the host reports is.
+//
+// The test runs on the hint loop harness (newTestHintLoop) in a synctest
+// bubble: a pass at a time, each settling the refresh and hint loops before
+// anything is read. It used to poll for the country and read the continent at
+// once, which failed when the read was between the two (refreshHint applies
+// the country first). And it moved the clock as soon as the continent had
+// landed, while the hint loop could still be about to record the read with
+// the clock it then read (Answer), which left the next read never due.
 func TestExtenderNetworkClientFallsBackToTheNetworkCountryWhenTheHintFails(t *testing.T) {
-	setTestNetworkCountryCode(t, "RU")
-	clock := newTestClock()
-	hint := newTestExtenderHint(&ExtenderHintResult{ContinentCode: "EU", CountryCode: "DE"})
-	_, directory, _ := newTestExtenderNetworkClient(t, clock, func(settings *ExtenderNetworkClientSettings) {
-		settings.Hint = hint.Hint
-		settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
-			return nil, nil
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		setTestNetworkCountryCode(t, "RU")
+		hint := newTestExtenderHint(&ExtenderHintResult{ContinentCode: "EU", CountryCode: "DE"})
+		loop := newTestHintLoop(t, hint.Hint, nil)
+		settings := DefaultExtenderNetworkClientSettings()
+
+		// the first read has ended: the operator's country and continent are
+		// in force
+		synctest.Wait()
+		if countryCode := loop.directory.SpoofCountryCode(); countryCode != "de" {
+			t.Fatalf("spoof country = %q, expected the operator's", countryCode)
+		}
+		if continentCode := loop.directory.ContinentHint(); continentCode != "EU" {
+			t.Fatalf("continent = %q, expected the operator's", continentCode)
+		}
+
+		// the operator is now unreachable; the next refresh finds out
+		hint.Fail(fmt.Errorf("the operator is unreachable in this test"))
+		count := hint.Count()
+		loop.clock.advance(settings.RebootstrapTimeout)
+		loop.pass(t)
+		if readCount := hint.Count(); readCount != count+1 {
+			t.Fatalf("hint reads = %d, expected the refresh to read it again", readCount)
+		}
+		if countryCode := loop.directory.SpoofCountryCode(); countryCode != "ru" {
+			t.Fatalf("spoof country = %q, expected the network country", countryCode)
+		}
+
+		// the operator answers again: the first pass after the failure's
+		// backoff reads it, and its country is back in force
+		hint.Answer(&ExtenderHintResult{ContinentCode: "EU", CountryCode: "DE"})
+		loop.clock.advance(settings.HintMinBackoff)
+		loop.pass(t)
+		if countryCode := loop.directory.SpoofCountryCode(); countryCode != "de" {
+			t.Fatalf("spoof country = %q, expected the operator's again", countryCode)
 		}
 	})
-	waitForSpoofCountryCode(t, directory, "de")
-	if continentCode := directory.ContinentHint(); continentCode != "EU" {
-		t.Fatalf("continent = %q, expected the operator's", continentCode)
-	}
-
-	// the operator is now unreachable; the next refresh finds out
-	hint.Fail(fmt.Errorf("the operator is unreachable in this test"))
-	count := hint.Count()
-	clock.advance(DefaultExtenderNetworkClientSettings().RebootstrapTimeout)
-	hint.waitForCount(t, count+1)
-	waitForSpoofCountryCode(t, directory, "ru")
-
-	// the operator answers again: the first pass after the failure's backoff
-	// reads it, and its country is back in force
-	hint.Answer(&ExtenderHintResult{ContinentCode: "EU", CountryCode: "DE"})
-	clock.advance(DefaultExtenderNetworkClientSettings().HintMinBackoff)
-	waitForSpoofCountryCode(t, directory, "de")
 }
 
 // A path change makes the hint's country stale at once -- it placed the
