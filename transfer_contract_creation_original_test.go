@@ -77,7 +77,7 @@ func (self *originalCreationTestOob) SendControl(frames []*protocol.Frame, callb
 // Activate the real production capture setting before constructing the client.
 func newOriginalCreationTestClient(t *testing.T) (*Client, *originalCreationTestOob) {
 	t.Helper()
-	directory := filepath.Join(t.TempDir(), "original-requests")
+	directory := filepath.Join(physicalTempDir(t), "original-requests")
 	oob := &originalCreationTestOob{directory: directory, ordinary: NewNoContractClientOob()}
 	settings := DefaultClientSettings()
 	settings.ControlPingTimeout = 0
@@ -220,7 +220,7 @@ func TestOriginalContractCreationStoreRefusesPartialOriginalAndSymlink(t *testin
 	if err != nil || len(cut.Contracts) != 1 || len(cut.Contracts[0].OriginalCreation) != 0 {
 		t.Fatal("partial retained request was accepted as immutable", cut, err)
 	}
-	alias := filepath.Join(t.TempDir(), "alias")
+	alias := filepath.Join(physicalTempDir(t), "alias")
 	if err := os.Symlink(oob.directory, alias); err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +231,7 @@ func TestOriginalContractCreationStoreRefusesPartialOriginalAndSymlink(t *testin
 }
 
 func TestOriginalContractCreationCustodyCannotPolluteWholeWorkOutbox(t *testing.T) {
-	parent := t.TempDir()
+	parent := physicalTempDir(t)
 	outbox := filepath.Join(parent, "whole-work")
 	for _, directory := range []string{outbox, filepath.Join(outbox, "requests"), parent} {
 		settings := &ContractManagerSettings{OriginalWorkCapture: &OriginalWorkCaptureSettings{OutboxDirectory: outbox}, OriginalContractCapture: &OriginalContractCaptureSettings{Directory: directory}}

@@ -61,7 +61,7 @@ func wholeWorkCaptureFixture(t *testing.T, client *Client) (OriginalWorkCaptureS
 	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{74}, 32))
 	var approver [32]byte
 	copy(approver[:], key[32:])
-	directory := t.TempDir()
+	directory := physicalTempDir(t)
 	if err := os.Chmod(directory, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +77,47 @@ func wholeWorkCaptureFixture(t *testing.T, client *Client) (OriginalWorkCaptureS
 	}
 	settings.PublicKey = request.PublicKey
 	return settings, request, key
+}
+
+func TestWholeWorkOutboxFixtureWithSymlinkTempDir(t *testing.T) {
+	useSymlinkCustodyTempDir(t)
+	t.Run("physical custody and explicit alias", func(t *testing.T) {
+		client := newWholeWorkTestClient(t, NewNoContractClientOob(), nil)
+		settings, request, _ := wholeWorkCaptureFixture(t, client)
+		outbox, err := openOriginalWorkOutbox(settings.OutboxDirectory)
+		if err != nil {
+			t.Fatal("positive fixture retained the temporary-directory alias", err)
+		}
+		defer outbox.close()
+		requestRaw, err := request.Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if raw, err := client.ContractManager().captureOriginalWork(t.Context(), settings, outbox, requestRaw); err != nil || len(raw) == 0 {
+			t.Fatal("physical fixture could not retain original work", err)
+		}
+		if err := outbox.close(); err != nil {
+			t.Fatal(err)
+		}
+		alias := filepath.Join(physicalTempDir(t), "explicit-alias")
+		if err := os.Symlink(settings.OutboxDirectory, alias); err != nil {
+			t.Fatal(err)
+		}
+		if borrowed, err := openOriginalWorkOutbox(alias); !errors.Is(err, ErrOriginalWorkOutboxIdentity) {
+			if borrowed != nil {
+				borrowed.close()
+			}
+			t.Fatal("explicit alias became physical work custody", err)
+		}
+		retained, err := openOriginalWorkOutbox(settings.OutboxDirectory)
+		if err != nil {
+			t.Fatal("alias rejection changed physical custody", err)
+		}
+		defer retained.close()
+		if entries, err := retained.entries(t.Context()); err != nil || len(entries) != 1 {
+			t.Fatal("alias rejection lost the original cut", entries, err)
+		}
+	})
 }
 
 func TestWholeWorkOutboxRetainsFirstBoundaryAcrossRetryExpiryAndRestart(t *testing.T) {
@@ -181,7 +222,7 @@ func TestWholeWorkOutboxPrivateLeasePartialAndSymlinkRefusals(t *testing.T) {
 	if err := outbox.close(); err != nil {
 		t.Fatal(err)
 	}
-	alias := filepath.Join(t.TempDir(), "outbox")
+	alias := filepath.Join(physicalTempDir(t), "outbox")
 	if err := os.Symlink(settings.OutboxDirectory, alias); err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +245,7 @@ func TestWholeWorkActualLifecyclePollsRetainsAndDeliversSignedCut(t *testing.T) 
 	key := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{77}, 32))
 	var approver [32]byte
 	copy(approver[:], key[32:])
-	directory := t.TempDir()
+	directory := physicalTempDir(t)
 	prepareOriginalWorkOutboxTest(t, directory)
 	if err := os.Chmod(directory, 0700); err != nil {
 		t.Fatal(err)
@@ -346,14 +387,32 @@ func TestWholeWorkActualLifecyclePollsRetainsAndDeliversSignedCut(t *testing.T) 
 
 // Cancel while the real HTTPS request is blocked; the exact owner must join.
 func TestWholeWorkActualLifecycleCancellationJoinsPendingHttp(t *testing.T) {
-	entered := make(chan struct{})
-	var once sync.Once
+	entered := make(chan error, 1)
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce, canceledOnce sync.Once
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		once.Do(func() { close(entered) })
-		<-request.Context().Done()
+		// HTTP/1 observes disconnects after the request body reaches EOF. Keep
+		// the response pending, not an unread enrollment body.
+		_, err := io.Copy(io.Discard, http.MaxBytesReader(writer, request.Body, protocol.MaximumOriginalWorkOwnerBytes))
+		enteredOnce.Do(func() { entered <- err })
+		if err != nil {
+			return
+		}
+		select {
+		case <-request.Context().Done():
+			canceledOnce.Do(func() { close(canceled) })
+		case <-release:
+		}
 	}))
-	defer server.Close()
-	directory := t.TempDir()
+	// Registered before the client cleanup, so a failed assertion still joins
+	// its owner before releasing the handler as a cleanup-only fallback.
+	t.Cleanup(func() {
+		close(release)
+		server.CloseClientConnections()
+		server.Close()
+	})
+	directory := physicalTempDir(t)
 	prepareOriginalWorkOutboxTest(t, directory)
 	if err := os.Chmod(directory, 0700); err != nil {
 		t.Fatal(err)
@@ -361,7 +420,10 @@ func TestWholeWorkActualLifecycleCancellationJoinsPendingHttp(t *testing.T) {
 	capture := &OriginalWorkCaptureSettings{ApiUrl: server.URL, OutboxDirectory: directory, RequestPublicKey: [32]byte{79}, httpClient: server.Client()}
 	client := newWholeWorkTestClient(t, NewNoContractClientOob(), capture)
 	select {
-	case <-entered:
+	case err := <-entered:
+		if err != nil {
+			t.Fatal("actual enrollment body could not be consumed", err)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("actual request did not enter")
 	}
@@ -370,9 +432,16 @@ func TestWholeWorkActualLifecycleCancellationJoinsPendingHttp(t *testing.T) {
 	if err := client.CloseAndWait(join); err != nil {
 		t.Fatal("pending HTTPS capture escaped SDK owner", err)
 	}
+	select {
+	case <-canceled:
+	case <-join.Done():
+		t.Fatal("pending HTTPS request did not observe owner cancellation", join.Err())
+	}
 	outbox, err := openOriginalWorkOutbox(directory)
 	if err != nil {
 		t.Fatal("canceled worker retained outbox lease", err)
 	}
-	outbox.close()
+	if err := outbox.close(); err != nil {
+		t.Fatal(err)
+	}
 }

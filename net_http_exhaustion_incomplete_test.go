@@ -122,17 +122,33 @@ func (self *httpIncompleteWideTestError) Unwrap() []error {
 // Absent children neither multiply retained marker storage nor bypass finite
 // callback work through successive otherwise empty joined wrappers.
 func TestHttpRequestCausesChargeAbsentChildrenWithinOriginalBudget(t *testing.T) {
+	// The root callback and its 128 absent children leave 127 nodes. Visiting
+	// the admitted recursive child leaves 126, which cannot admit its complete
+	// 129-child frame. Refusal stops at two callbacks; the unused allowance
+	// cannot be spent on a truncated frame: 2 + 128 + 126 = 256.
+	const wantVisits = 2
+	const wantAbsentChildren = 128
+	const wantUnspentNodes = 126
+	const wantNodes = wantVisits + wantAbsentChildren + wantUnspentNodes
+	if httpRequestCauseNodes != wantNodes {
+		t.Fatalf("fixture requires the original node budget: got %d want %d", httpRequestCauseNodes, wantNodes)
+	}
 	cause := &httpIncompleteWideTestError{}
 	retained := flattenHttpRequestCauses(cause)
-	incomplete, overflow := 0, false
+	incomplete, overflow := 0, 0
 	for _, item := range retained {
+		if item.kind != 0 {
+			t.Fatalf("incomplete traversal retained a transient cause: kind=%d", item.kind)
+		}
 		if item.err == errHttpExhaustionCauseIncomplete {
 			incomplete++
 		}
-		overflow = overflow || item.err == errHttpExhaustionCauseTraversal
+		if item.err == errHttpExhaustionCauseTraversal {
+			overflow++
+		}
 	}
-	if cause.visits > 2 || len(retained) > 258 || incomplete != 1 || !overflow {
-		t.Fatalf("absent branches escaped shared admission: visits=%d retained=%d incomplete=%d overflow=%t", cause.visits, len(retained), incomplete, overflow)
+	if cause.visits != wantVisits || len(retained) != 2 || incomplete != 1 || overflow != 1 {
+		t.Fatalf("absent branches escaped shared admission: visits=%d retained=%d incomplete=%d overflow=%d", cause.visits, len(retained), incomplete, overflow)
 	}
 }
 

@@ -50,7 +50,7 @@ func TestSenderReceiverTimingArrivesBeforeBlockedWorker(t *testing.T) {
 		}()
 		client.ContractManager().AddNoContractPeer(destination)
 		client.RouteManager().UpdateTransport(&h1SendClientTransportForGroupTest{sendClientTransport: NewSendClientTransport(DestinationId(destination))}, []Route{route})
-		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination})
+		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination, Ctx: ctx})
 		synctest.Wait()
 		sequence.windowPacer.afterAdmissionForTest = func() {
 			close(localWait)

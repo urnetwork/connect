@@ -8855,6 +8855,10 @@ sendSequenceLoop:
 				// item's timeout backoff; a lost recovery returns to its prior
 				// ordinary cadence. Any resend awaits fresh acknowledgement state.
 				recoveryKind := item.recoveryKind
+				// Attribute the hole before a successful retry can change the
+				// item's carrier. Recovery on a direct lane does not make an
+				// earlier relay-carried hole a direct-lane loss.
+				holeCarrier := gapHoleCarrierOf(item)
 				item.recoveryKind = sendRecoveryNone
 				// §34.3: what this firing means is decided by this item's own
 				// lane and by its position in it. Anything acknowledged above
@@ -9064,7 +9068,7 @@ sendSequenceLoop:
 				if recoveryKind == sendRecoverySelectiveGap && 0 < item.timeoutDeferCount {
 					// a recovery the deferred retransmit declined to write
 					// and the scoreboard wrote instead (FLIGHTGATEFIX §23.3)
-					self.client.selectiveGapWritesOfDeferredItems[gapHoleCarrierOf(item)].Add(1)
+					self.client.selectiveGapWritesOfDeferredItems[holeCarrier].Add(1)
 				}
 				if recoveryKind == sendRecoverySelectiveGap &&
 					self.scheduleGapRecoveryProbe(

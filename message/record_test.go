@@ -21,9 +21,11 @@
 package message
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"os"
@@ -803,10 +805,9 @@ func joinTouchesTheVocabulary(left, right joinOperand) bool {
 }
 
 var classBucketJoinShapes = []joinShape{
-	// class<<4. Matched on the shift alone rather than on an operand, because neither
-	// package packs bits: there is no other reason to shift a value by exactly four
-	// here, and a legitimate shift by four arriving later is a review conversation,
-	// which is the point.
+	// class<<4. Unknown shifts remain violations even when their operand has been
+	// renamed. Reviewed TCP/IP operations are distinguished by their complete AST
+	// context below; a name such as "packet" alone cannot exempt an expression.
 	{name: "class<<4", half: joinsTheByte, commits: func(op token.Token, left, right joinOperand) bool {
 		return op == token.SHL && right.isValue(nibbleShiftValue)
 	}},
@@ -1055,6 +1056,171 @@ func joinConstantOf(expr ast.Expr) (int64, bool) {
 	return 0, false
 }
 
+// SDK also handles IP/TCP nibbles and allocator size classes. These reviewed
+// snapshots identify those operations by their exact path, declarations, and
+// imports, including the packet getter's provenance. They do not exempt files
+// or function names: changed bodies and new expressions still face every rule.
+// The large memory soak needs only its complete pool-accounting range statement;
+// its enclosing signature and unshadowed imports are checked as well.
+var joinReviewedSDKContexts = map[string]struct {
+	expressions   int
+	rangeFunction string
+}{
+	"../../sdk/packet_batch.go":                {expressions: 1},
+	"../../sdk/socket.go":                      {expressions: 2},
+	"../../sdk/socket_test.go":                 {expressions: 1},
+	"../../sdk/mobile_packet_pressure_test.go": {expressions: 1},
+	"../../sdk/device_synthetic_memory_test.go": {expressions: 1,
+		rangeFunction: "TestDeviceLocalSyntheticDeviceRemoteMemorySoak"},
+}
+
+// Ignore source positions, formatting, and comments, but preserve every AST
+// token. A broken reviewed snapshot must fail closed rather than erase a rule.
+func joinASTSignature(node ast.Node) string {
+	var out bytes.Buffer
+	if err := format.Node(&out, token.NewFileSet(), node); err != nil {
+		panic(fmt.Errorf("format reviewed join context: %w", err))
+	}
+	return out.String()
+}
+
+func joinImportIdentity(spec *ast.ImportSpec) (string, string) {
+	path, err := strconv.Unquote(spec.Path.Value)
+	if err != nil {
+		panic(err)
+	}
+	name := filepath.Base(path)
+	if spec.Name != nil {
+		name = spec.Name.Name
+	}
+	return name, path
+}
+
+// The loop's selector must still resolve to the reviewed imported package.
+// Even a local binding in an otherwise unrelated nested scope requires review.
+func joinShadowsImports(function *ast.FuncDecl, names map[string]bool) bool {
+	shadowed := false
+	check := func(expr ast.Expr) {
+		if name, ok := expr.(*ast.Ident); ok && names[name.Name] {
+			shadowed = true
+		}
+	}
+	ast.Inspect(function, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range node.Lhs {
+				check(lhs)
+			}
+		case *ast.RangeStmt:
+			check(node.Key)
+			check(node.Value)
+		case *ast.ValueSpec:
+			for _, name := range node.Names {
+				check(name)
+			}
+		case *ast.TypeSpec:
+			check(node.Name)
+		case *ast.Field:
+			for _, name := range node.Names {
+				check(name)
+			}
+		}
+		return !shadowed
+	})
+	return shadowed
+}
+
+func joinReviewedSDKExpressions(scan joinScan, path string) (map[token.Pos]bool, error) {
+	review, exists := joinReviewedSDKContexts[path]
+	if !exists {
+		return nil, nil
+	}
+	fixture := filepath.Join("testdata", "reviewed-sdk", filepath.Base(path))
+	reference, err := parser.ParseFile(token.NewFileSet(), fixture, nil, parser.SkipObjectResolution)
+	if err != nil {
+		return nil, fmt.Errorf("read reviewed SDK context %s: %w", fixture, err)
+	}
+	actual := scan.syntax[path]
+	if actual.Name.Name != reference.Name.Name {
+		return nil, nil
+	}
+	imports := map[string]bool{}
+	for _, spec := range reference.Imports {
+		name, importedPath := joinImportIdentity(spec)
+		imports[name] = true
+		matches := 0
+		for _, candidate := range actual.Imports {
+			candidateName, candidatePath := joinImportIdentity(candidate)
+			if candidateName == name {
+				if candidatePath != importedPath {
+					return nil, nil
+				}
+				matches++
+			}
+		}
+		if matches != 1 {
+			return nil, nil
+		}
+	}
+	var contexts []ast.Node
+	for _, declaration := range reference.Decls {
+		if group, ok := declaration.(*ast.GenDecl); ok && group.Tok == token.IMPORT {
+			continue
+		}
+		var matches []ast.Node
+		for _, candidate := range actual.Decls {
+			if review.rangeFunction == "" {
+				if joinASTSignature(candidate) == joinASTSignature(declaration) {
+					matches = append(matches, candidate)
+				}
+				continue
+			}
+			function, ok := candidate.(*ast.FuncDecl)
+			if !ok || function.Name.Name != review.rangeFunction || function.Body == nil || joinShadowsImports(function, imports) {
+				continue
+			}
+			wanted, ok := declaration.(*ast.FuncDecl)
+			if !ok || wanted.Body == nil || len(wanted.Body.List) != 1 {
+				return nil, fmt.Errorf("reviewed pool context must contain one range statement")
+			}
+			if _, ok := wanted.Body.List[0].(*ast.RangeStmt); !ok {
+				return nil, fmt.Errorf("reviewed pool context is not a range statement")
+			}
+			actualHeader, wantedHeader := *function, *wanted
+			actualHeader.Body, wantedHeader.Body = nil, nil
+			if joinASTSignature(&actualHeader) != joinASTSignature(&wantedHeader) {
+				continue
+			}
+			for _, statement := range function.Body.List {
+				if joinASTSignature(statement) == joinASTSignature(wanted.Body.List[0]) {
+					matches = append(matches, statement)
+				}
+			}
+		}
+		if len(matches) != 1 {
+			return nil, nil
+		}
+		contexts = append(contexts, matches[0])
+	}
+	reviewed := map[token.Pos]bool{}
+	for _, context := range contexts {
+		ast.Inspect(context, func(node ast.Node) bool {
+			if binary, ok := node.(*ast.BinaryExpr); ok {
+				for _, shape := range classBucketJoinShapes {
+					if shape.commits(binary.Op, joinOperandOf(binary.X), joinOperandOf(binary.Y)) {
+						reviewed[binary.Pos()] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	if len(reviewed) != review.expressions {
+		return nil, fmt.Errorf("reviewed context %s has %d matching expressions, want %d", fixture, len(reviewed), review.expressions)
+	}
+	return reviewed, nil
+}
+
 // Every expression in one file that commits shape, with its position and its source, so
 // a failure is actionable. The gates and the controls both call this, so a rule that
 // stopped matching fails the control instead of passing every file in the tree.
@@ -1064,6 +1230,10 @@ func joinShapeExpressions(scan joinScan, path string, shape joinShape) []string 
 	if !scanned {
 		return found
 	}
+	reviewed, err := joinReviewedSDKExpressions(scan, path)
+	if err != nil {
+		return []string{err.Error()}
+	}
 	text := scan.sourceTexts[path]
 	ast.Inspect(syntax, func(node ast.Node) bool {
 		binary, isBinary := node.(*ast.BinaryExpr)
@@ -1072,7 +1242,7 @@ func joinShapeExpressions(scan joinScan, path string, shape joinShape) []string 
 		}
 		left := joinOperandOf(binary.X)
 		right := joinOperandOf(binary.Y)
-		if shape.commits(binary.Op, left, right) {
+		if shape.commits(binary.Op, left, right) && !reviewed[binary.Pos()] {
 			found = append(found, fmt.Sprintf("%s: %s", scan.fileSet.Position(binary.Pos()), joinSourceOf(scan, text, binary)))
 		}
 		return true
@@ -1136,8 +1306,8 @@ func joinControlPath(t *testing.T, control joinScan, name string) string {
 
 // The gate. Test files are in scope as well as production ones, this one included: a
 // test that rebuilds the join is a second implementation of it, and the assertion it
-// then makes about the wire is an assertion about itself. Nothing is exempt but the file
-// that is allowed to cross, and that exemption is counted.
+// then makes about the wire is an assertion about itself. Only record.go may cross
+// that boundary; the reviewed SDK contexts above perform different operations.
 func TestClassBucketJoinIsConfinedToRecordGo(t *testing.T) {
 	roots := joinScanRoots(t)
 	scan := mustScanJoinSources(t, roots)
@@ -1262,6 +1432,93 @@ func TestJoinRulesIgnoreTheDocumentedFixture(t *testing.T) {
 		if !strings.Contains(text, shape.name) {
 			t.Errorf("the documented fixture does not mention %s, so it controls nothing", shape.name)
 		}
+	}
+}
+
+// These reviewed SDK operations carry IP/TCP fields or pool counters, not a
+// retention byte. Mutating their context must never exempt retention arithmetic
+// merely because it occurs in the same file or uses the same local variable.
+func TestJoinSDKPacketAndPoolContexts(t *testing.T) {
+	for _, example := range []struct {
+		file, function, insertion, from, to string
+	}{
+		{"packet_batch.go", "IpVersion", "packet := self.Get(index)", "packet := self.Get(index)", "packet := record.HeaderBytes"},
+		{"socket.go", "socketPacketDestination", "if len(packet) >= 20", "if len(packet) >= 20", "packet = record.HeaderBytes\n\tif len(packet) >= 20"},
+		{"socket_test.go", "SendPacket", "defer connect.MessagePoolReturn(p)", "defer connect.MessagePoolReturn(p)", "p = record.HeaderBytes\n\tdefer connect.MessagePoolReturn(p)"},
+		{"mobile_packet_pressure_test.go", "mobilePressureTcp4Packet", "packet := make", "tcp := packet[20:]", "tcp := record.HeaderBytes"},
+		{"device_synthetic_memory_test.go", "TestDeviceLocalSyntheticDeviceRemoteMemorySoak", "for _, classStats := range", "range connect.GetMessagePoolClassStats()", "range retentionClassStats"},
+	} {
+		t.Run(example.file, func(t *testing.T) {
+			body, err := os.ReadFile(filepath.Join("testdata", "reviewed-sdk", example.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			source := string(body)
+			path := "../../sdk/" + example.file
+			cases := []struct {
+				name, path, source, want string
+			}{
+				{"reviewed", path, source, ""},
+				{"different_package", path, strings.Replace(source, "package sdk", "package messaging", 1), "any violation"},
+				{"different_directory", "../mls/" + example.file, source, "any violation"},
+				{"different_sdk_path", "../../sdk/other/" + example.file, source, "any violation"},
+				{"different_function", path, strings.Replace(source, " "+example.function+"(", " unreviewedFunction(", 1), "any violation"},
+				{"changed_provenance", path, strings.Replace(source, example.from, example.to, 1), "any violation"},
+				{"same_function_aliased_retention", path, strings.Replace(source, example.insertion, "b := retentionClass\n\t_ = b << 4\n\t"+example.insertion, 1), "b << 4"},
+				{"same_function_retention_split", path, strings.Replace(source, example.insertion, "_ = retentionWire >> 4\n\t"+example.insertion, 1), "retentionWire >> 4"},
+				{"same_file_retention", path, source + "\nfunc misuse(retentionClass byte) byte { return retentionClass << 4 }\n", "retentionClass << 4"},
+			}
+			if example.file == "packet_batch.go" {
+				cases = append(cases, struct{ name, path, source, want string }{
+					"changed_getter", path, strings.Replace(source, "return self.packets[index]", "return record.HeaderBytes", 1), "any violation",
+				})
+			}
+			if example.file == "device_synthetic_memory_test.go" {
+				for _, mutation := range []struct{ name, from, to string }{
+					{"shadowed_import", example.insertion, "connect := retentionSource\n\t" + example.insertion},
+					{"shadowed_import_var", example.insertion, "var connect = retentionSource\n\t" + example.insertion},
+					{"different_import", `"github.com/urnetwork/connect"`, `connect "example.invalid/retention"`},
+					{"shadowed_counter", "t.Logf(", "classStats := retentionStats\n\t\tt.Logf("},
+				} {
+					cases = append(cases, struct{ name, path, source, want string }{
+						mutation.name, path, strings.Replace(source, mutation.from, mutation.to, 1), "any violation",
+					})
+				}
+				// Copying the reviewed loop must not silently widen its allowance.
+				loopStart := strings.Index(source, "\tfor _, classStats := range")
+				loopEnd := strings.LastIndex(source, "\n}")
+				if loopStart < 0 || loopEnd < loopStart {
+					t.Fatal("reviewed pool loop is missing")
+				}
+				cases = append(cases, struct{ name, path, source, want string }{
+					"duplicated_context", path, source[:loopEnd] + "\n" + source[loopStart:loopEnd] + source[loopEnd:], "any violation",
+				})
+			}
+			for _, testCase := range cases {
+				t.Run(testCase.name, func(t *testing.T) {
+					if testCase.name != "reviewed" && testCase.path == path && testCase.source == source {
+						t.Fatal("mutation did not change the source")
+					}
+					scan := joinScan{fileSet: token.NewFileSet(), sourceTexts: map[string]string{testCase.path: testCase.source}, syntax: map[string]*ast.File{}}
+					syntax, err := parser.ParseFile(scan.fileSet, testCase.path, testCase.source, parser.SkipObjectResolution)
+					if err != nil {
+						t.Fatal(err)
+					}
+					scan.syntax[testCase.path] = syntax
+					var violations []string
+					for _, shape := range classBucketJoinShapes {
+						violations = append(violations, joinViolations(scan, []string{testCase.path}, shape, joinAllowedPaths)[testCase.path]...)
+					}
+					if testCase.want == "" {
+						if len(violations) != 0 {
+							t.Fatalf("non-retention operation rejected: %v", violations)
+						}
+					} else if len(violations) == 0 || (testCase.want != "any violation" && !strings.Contains(strings.Join(violations, "\n"), testCase.want)) {
+						t.Fatalf("wanted %q to remain under the gate, got %v", testCase.want, violations)
+					}
+				})
+			}
+		})
 	}
 }
 

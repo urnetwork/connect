@@ -401,10 +401,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// the transports to re-register and the first return packets to land,
 		// short enough that a genuinely dead exit is still convicted promptly
 		SchedulerPauseRecoveryTimeout: 5 * time.Second,
-		// well under the 30s AckTimeout that previously bounded a stalled
-		// flow, and past the ~200ms-1s range of a first tcp rto so a healthy
-		// flow's retransmits are still collapsed
-		TcpCollapseMaxHold: 1500 * time.Millisecond,
+		// Keep exact accepted ownership for the flow lifetime. Elapsed time
+		// alone must not multiply an inner TCP retry into another Transfer Pack.
+		// A positive runtime override retains the optional timed-escape policy.
+		TcpCollapseMaxHold: 0,
 		SoftVerdictDemote:  true,
 		// two removals per half minute lets the ordinary single-provider
 		// failure execute immediately (and its replacement fail once too)
@@ -953,12 +953,12 @@ type MultiClientSettings struct {
 	PacketGroupMaxPacketCount int
 	PacketGroupMaxByteCount   ByteCount
 
-	// TcpCollapseMaxHold bounds how long TcpCollapsePrevention may keep
-	// discarding a sender's retransmits while the committed packet makes no
-	// progress. After this long at the same sequence state, one retransmit is
-	// admitted per window. 0 disables the bound, restoring the previous
-	// behavior where retransmits were dropped until the client was declared
-	// dead (up to AckTimeout). Ignored when TcpCollapsePrevention is off.
+	// TcpCollapseMaxHold is an optional compatibility bound on duplicate
+	// suppression. The default 0 keeps exact accepted ownership for the flow
+	// lifetime, until an admitted different-ISN SYN, flow clear, or ownership
+	// invalidation resets it. A positive override offers an identical retry
+	// after this interval; only successful admission restarts that interval.
+	// Ignored when TcpCollapsePrevention is off.
 	TcpCollapseMaxHold time.Duration
 
 	// SendStallTimeout is how long a client may hold outstanding sends without
@@ -1487,6 +1487,7 @@ type tcpControlObservation struct {
 	fin               bool
 	rst               bool
 	valid             bool
+	syn               bool
 }
 
 type pendingIngressTcpControl struct {
@@ -1506,6 +1507,7 @@ func tcpControlFromIpPath(ipPath *IpPath) tcpControlObservation {
 		fin:               ipPath.Fin,
 		rst:               ipPath.Rst,
 		valid:             true,
+		syn:               ipPath.Syn,
 	}
 }
 
@@ -6889,8 +6891,9 @@ func (self *RemoteUserNatMultiClient) canSendPacket(
 			// As soon as a packet is sent to a client, Transfer either commits it
 			// end to end or the client is dropped. Inner retransmits do not need to
 			// be sent again while that exact Transfer item is still recovering.
-			// This decouples reliable serialization from the inner sender's retry
-			// clock; it is not permission to suppress that sender indefinitely.
+			// By default elapsed time cannot revoke that ownership: an admitted
+			// new SYN generation, flow clear, or ownership invalidation can. The
+			// optional positive hold below preserves the timed-escape policy.
 			if ipPath.Rst {
 				allow = true
 			} else if update.canUpdateSequenceForClient(sendPacket, currentClient) {
@@ -6899,10 +6902,8 @@ func (self *RemoteUserNatMultiClient) canSendPacket(
 				allow = true
 			} else if tcpCollapseMaxHold := self.reliabilitySettings().TcpCollapseMaxHold; 0 < tcpCollapseMaxHold &&
 				update.releaseSequenceHold(tcpCollapseMaxHold) {
-				// the flow has been pinned at the same sequence state past the
-				// hold, so the committed packet is not making progress. let a
-				// retransmit through rather than discarding the sender's only
-				// recovery mechanism until failure detection catches up
+				// Explicit positive overrides permit an aged duplicate. This
+				// read-only offer does not consume the escape on queue refusal.
 				allow = true
 			}
 		} else {
@@ -6990,16 +6991,6 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 	var sentUpdate *multiClientChannelUpdate
 	self.sendClientPath(ipPath, sendPacketGroup.pin, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
 		sentUpdate = update
-		if !self.canSendPacketGroup(sendPacketGroup, update, currentClient) {
-			self.tcpCollapseDropCount.Add(uint64(len(sendPacketGroup.packets)))
-			return
-		}
-		// Passing the gate is only an offer. Neither SYN generation nor the
-		// hold clock/coverage changes until the selected queue owns the packet.
-		if ipPath.Protocol == IpProtocolTcp && self.settings.TcpCollapsePrevention {
-			sendPacketGroup.prepareCollapseAdmission(update)
-		}
-
 		enterTime := time.Now()
 
 		// Client-side dial-failure inference. A connection attempt
@@ -7018,6 +7009,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 		// guard order matters on this path: every egress packet passes here,
 		// so the plain field checks go first and the atomic load, settings
 		// read, and clock only run for a probe on an unestablished flow.
+		// This observation must precede collapse: a same-ISN SYN can remain
+		// owned forever while silence still requires guarded provider recovery.
+		// Observation alone never authorizes a duplicate old-owner admission.
 		if dialProbePacket(ipPath) &&
 			currentClient != nil && !update.receivedInbound.Load() &&
 			self.reliabilitySettings().DialFailureRerace &&
@@ -7032,6 +7026,19 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 			if self.clientDialFailure(currentClient, ipPath) {
 				currentClient = nil
 			}
+		}
+		if !self.canSendPacketGroup(sendPacketGroup, update, currentClient) {
+			self.tcpCollapseDropCount.Add(uint64(len(sendPacketGroup.packets)))
+			return
+		}
+		// Passing the gate is only an offer. Neither SYN generation nor the
+		// hold clock/coverage changes until the selected queue owns the packet.
+		// Snapshot admission after inference and the gate, against the current
+		// flow generation rather than a potentially abandoned provider.
+		// Generation response ownership is also required when duplicate
+		// suppression is disabled: a new SYN may receive its reply inline.
+		if ipPath.Protocol == IpProtocolTcp {
+			sendPacketGroup.prepareCollapseAdmission(update)
 		}
 
 		// Send through a committed client and preserve the selected-client error
@@ -8214,7 +8221,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 			// committed-flow fast path: batch. the first-inbound mark still
 			// runs per packet -- it gates the dial-failure re-race and resets
 			// the dial-strike window, exactly as on the per-packet path.
-			if update.receivedInbound.CompareAndSwap(false, true) {
+			if update.markReceivedInbound(sourceClient, tcpControl) {
 				sourceClient.addConnectSuccess(update.ipPath.Version)
 				self.clearDestinationServiceFailure(sourceClient, update.ipPath)
 				self.logSmtpProviderOutcome(update.ipPath, sourceClient, "connected")
@@ -8343,7 +8350,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			// first inbound packet for this flow marks it established, which
 			// gates the dial-failure re-race (a stale signal must not unbind a
 			// flow already carrying data).
-			if update.receivedInbound.CompareAndSwap(false, true) {
+			if update.markReceivedInbound(sourceClient, tcpControl) {
 				connectSucceeded = true
 				connectPath = update.ipPath
 			}
@@ -8366,7 +8373,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 
 		if client == sourceClient {
 			// committed between the lock-free check and acquiring the lock
-			if update.receivedInbound.CompareAndSwap(false, true) {
+			if update.markReceivedInboundWithLock(sourceClient, tcpControl) {
 				connectSucceeded = true
 				connectPath = update.ipPath
 			}
@@ -8442,10 +8449,6 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			update.clearRaceWithLock()
 			update.client.Store(sourceClient)
 			boundUpdate = update
-			if update.receivedInbound.CompareAndSwap(false, true) {
-				connectSucceeded = true
-				connectPath = update.ipPath
-			}
 			receivePacket := &receivePacket{
 				Source:      source,
 				ProvideMode: provideMode,
@@ -8455,6 +8458,10 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			}
 			receivePackets = append(state.packets, receivePacket)
 			for _, p := range receivePackets {
+				if update.markReceivedInboundWithLock(sourceClient, p.tcpControl) {
+					connectSucceeded = true
+					connectPath = update.ipPath
+				}
 				if p.Pooled {
 					p.Pooled = false
 					returnPackets = append(returnPackets, p)
@@ -9199,8 +9206,17 @@ type multiClientChannelUpdate struct {
 	// resolves this flow to its committed client (the receiveClientPath path).
 	// It marks the flow established, which gates the dial-failure re-race: a
 	// late or stale dial-failure signal must never unbind a flow that is
-	// already carrying data. Written lock-free (atomic) from the ingress path.
+	// already carrying data. New-SYN generation commit and its first response
+	// are serialized by stateLock; established ingress remains lock-free.
 	receivedInbound atomic.Bool
+	// Identity is independent of collapse coverage: an unwritten expiry or
+	// provider rebind must not turn a same-ISN retry into a new generation.
+	// The transient list has one inline numeric receipt per live new-SYN send,
+	// never packet storage or persistent history. All guarded by stateLock.
+	synGenerationNumber   uint32
+	synGenerationSeen     bool
+	synGenerationAwaiting bool
+	synAdmissions         *tcpSynAdmission
 
 	// synWaitStart is when synWaitClient was first asked to open this flow's
 	// upstream connection -- the first dial probe (tcp syn, or quic/dns udp:
@@ -9239,9 +9255,9 @@ type multiClientChannelUpdate struct {
 	// successfully admitted source packets. It contains only counters and
 	// timestamps, never payload or TLS metadata, and is guarded by stateLock.
 	ackPerformance tcpAckPerformance
-	// sequenceTime is when the sequence state last advanced. it bounds how long
-	// TcpCollapsePrevention may keep discarding a sender's retransmits while
-	// the committed packet makes no progress. guarded by stateLock.
+	// sequenceTime is the last successful admission time. It bounds duplicate
+	// suppression only with an explicit positive TcpCollapseMaxHold override;
+	// the default lifetime hold does not expire. Guarded by stateLock.
 	sequenceTime      time.Time
 	ackSequenceNumber uint32 // guarded by stateLock
 	// tcpWindowSize is the last successfully committed raw advertised receive
@@ -9464,7 +9480,7 @@ func (self *multiClientChannelUpdate) resetSequenceGroup(sendPacketGroup *parsed
 // Must be called with stateLock.
 func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPacket) {
 	ipPath := sendPacket.ipPath
-	if ipPath.Syn && (!self.sequenceSynSeen || self.sequenceSynNumber != ipPath.SequenceNumber) {
+	if ipPath.Syn && (!self.synGenerationSeen || self.synGenerationNumber != ipPath.SequenceNumber) {
 		// A source port can be reused before the old tuple's idle deadline.
 		// A fresh SYN is a new TCP generation and must not inherit either FIN or
 		// ACK edge from the previous connection.
@@ -9478,6 +9494,14 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 		self.ingressAckSeen = false
 		self.openTime = time.Now()
 		self.ackPerformance.reset()
+		if self.synGenerationSeen || self.sequencePacketCount != 0 {
+			self.receivedInbound.Store(false)
+			self.synGenerationAwaiting = true
+		}
+		self.synGenerationSeen, self.synGenerationNumber = true, ipPath.SequenceNumber
+		self.synWaitClient = self.client.Load()
+		self.synWaitStart = time.Now()
+		self.synWaitSendCount = 1
 	}
 	self.sequenceAdmissionEpoch++
 	self.sequenceCovered = false
@@ -9530,6 +9554,13 @@ func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGro
 		if sendPacket.ipPath.Rst || sendPacket.ipPath.Syn &&
 			(!self.sequenceSynSeen || self.sequenceSynNumber != sendPacket.ipPath.SequenceNumber) {
 			self.resetSequenceWithLock(sendPacket)
+			if observations := sendPacketGroup.admissionObservations; observations != nil && sendPacket.ipPath.Syn {
+				proof := &observations.synAdmission
+				if proof.update == self && proof.sequence == sendPacket.ipPath.SequenceNumber && proof.responseClient == client {
+					self.receivedInbound.Store(true)
+					self.synGenerationAwaiting = false
+				}
+			}
 		}
 		self.updateSequenceWithLock(sendPacket)
 	}
@@ -9662,16 +9693,14 @@ func (self *multiClientChannelUpdate) observeEgressTcpGroup(sendPacketGroup *par
 // releaseSequenceHold is a read-only offer: successful admission, not a gate
 // check or queue refusal, restarts the window in updateSequenceWithLock.
 //
-// TcpCollapsePrevention discards a sender's retransmits on the premise that the
-// packet already committed to a client will either be delivered reliably or the
-// client will be dropped. When a client stalls without yet being declared dead,
-// that premise fails: retransmits -- the sender's only recovery mechanism --
-// are discarded for as long as failure detection takes (up to AckTimeout, 30s),
-// and the flow is frozen the whole time.
+// This implements only the explicit positive-hold compatibility policy. The
+// default keeps accepted ownership until generation/flow reset or ownership
+// invalidation; unwritten expiry and guarded provider recovery are independent
+// paths and do not need elapsed time to admit a duplicate to the old owner.
 //
 // Concurrent callers may both see the same offer. This deliberately fails
 // open; suppressing one before the other actually owns its bytes would hide
-// the only recovery when that other admission is refused.
+// an eligible retry when that other admission is refused.
 func (self *multiClientChannelUpdate) releaseSequenceHold(maxHold time.Duration) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -9774,8 +9803,10 @@ func (self *multiClientChannelUpdate) commitRaceClientWithLock(
 
 	self.clearRaceWithLock()
 	self.client.Store(client)
-	if 0 < len(receivePackets) && self.receivedInbound.CompareAndSwap(false, true) {
-		connectSucceeded = true
+	for _, packet := range receivePackets {
+		if self.markReceivedInboundWithLock(client, packet.tcpControl) {
+			connectSucceeded = true
+		}
 	}
 	return
 }

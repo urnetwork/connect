@@ -1,6 +1,6 @@
 # Retransmission optimization: TUN TCP and client Transfer
 
-Status: research in progress, 2026-09-25. No production TCP RTO, Transfer resend, ACK policy, or reconnect default has been changed by this study. The client-TCP-NoAck direction was explicitly superseded after a partial diagnostic screen; ACK-required 3s-TUN/3s-Transfer is the active candidate. Do not promote pilots or screens as baselines.
+Status: research in progress, updated 2026-10-05. No production TCP RTO, Transfer resend, ACK policy, or reconnect default has been changed by this study. The later lifetime-collapse contract correction below changes the collapse default; exact-source performance and memory qualification remain pending. The client-TCP-NoAck direction was explicitly superseded after a partial diagnostic screen; ACK-required 3s-TUN/3s-Transfer is the active candidate. Do not promote pilots or screens as baselines.
 
 ## Scope and ownership
 
@@ -24,7 +24,7 @@ The frozen 2026-09-25 source does **not** set ordinary TCP IP packets to Transfe
 
 An opt-in client → provider TCP `NoAck` policy was built and verified in a **diagnostic-only** clean fixture, then **rejected as the current product direction by the user**. The receiver does not have a separate Transfer receive window that can reliably serialize arbitrary missing IP packets. A successful NoAck route write is not peer receipt; holes and out-of-order packets can multiply at the IP receiver. Keep MultiClient TCP IP packets Transfer-ACK-required so one exact packet remains owned and recoverable until the receiver acknowledges it. The provider may also have consumed upstream socket bytes before return delivery, so its TCP return remains ACK-required with retained exact bytes. The provider additionally has a bounded inner-TCP return cache and lost-middle/tail/EOF/IPv6 tests (`ip_tcp_return_recovery_test.go`), but that does not remove the current Transfer ACK contract.
 
-TCP collapse prevention is the intended decoupling from an inner TCP sender's retransmits: while the exact ACK-required Transfer item is still recovering, MultiClient can suppress a repeat with the same covered sequence/ACK/window state instead of multiplying it into another Transfer Pack. SYN/RST and genuine sequence progress pass; `TcpCollapseMaxHold` bounds the suppression so the sender's only recovery is not hidden forever. `canSendPacket` already checks the selected client's ACK policy before collapsing (`ip_remote_multi_client.go`). This coupling, including singleton and grouped final send boundaries, must be pinned by deterministic tests and explained in code comments. Do **not** retain an outbound-TCP-NoAck production setting merely because a small pilot looked fast. UDP/ICMP have a separate current NoAck policy on some direct/collapse paths; no conclusion about changing that policy follows from this TCP decision.
+TCP collapse prevention is the intended decoupling from an inner TCP sender's retransmits: while the exact ACK-required Transfer item is still recovering, MultiClient can suppress a repeat with the same covered sequence/ACK/window state instead of multiplying it into another Transfer Pack. The required default is a flow-lifetime hold (`TcpCollapseMaxHold=0`): elapsed time alone cannot reopen that gate. A successfully admitted different-ISN SYN resets the generation; a same-ISN SYN remains gated. RST, genuine sequence/ACK/window progress, flow clear and invalidated ownership retain their separate rules. Positive holds remain explicit compatibility overrides, not the shipping default. `canSendPacket` checks the selected client's ACK policy before collapsing (`ip_remote_multi_client.go`). Do **not** retain an outbound-TCP-NoAck production setting merely because a small pilot looked fast. UDP/ICMP have a separate current NoAck policy on some direct/collapse paths; no conclusion about changing that policy follows from this TCP decision.
 
 The next fixture exercises production ownership: `Tun.DohCache` → `Tun.DialContext` → client inner TCP → actual MultiClient/device Transfer → fixed H1 route → provider NAT/return Transfer → TLS/HTTP/2 DoH server. No host-dial shortcut may satisfy a cell. It must assert **TCP Transfer ACK-required in both directions on the wire**, preserve one exit/egress and inner TCP identity through bounded loss/reconnect, and check full DNS answer/correctness, ACK lifetimes, collapse-drop counts, duplicate Pack/wire bytes, TCP retransmits/timeouts, TTFB, completion, allocations, peak heap and RSS. The active A/B is Ack/8s-TUN/8s-Transfer versus Ack/3s/3s, with Ack/3s/8s and Ack/8s/3s component controls. The 3s Transfer arm sets device and provider send caps while keeping their effective ACK lifetimes unchanged. Compare Ack/2s/2s only after the 3s/3s result; 3s/6s and 2s/4s are older hypotheses, not defaults. DoH answer latency/correctness can justify some bounded retry cost, but wire and memory cost must be reported.
 
@@ -61,9 +61,15 @@ The exact established-route four-cell replay after the fix was source-frozen and
 
 The timeout-write and TCP counters cover the measurement through application retirement, not just pre-answer query traffic. The 3s/3s cells were faster in this single run but used more retransmissions and **47% more clean / 82% more loss-profile wire bytes**. Warm inner-TCP RTT varied around 11.48–14.07s, and the previous clean pair was approximately 6.01s in both arms; timing phase matters. Do not promote 3s/3s defaults on n=1 or conflate whole-simulator memory with the iOS 24 MiB app profile. Full per-cell memory, exact counters, hashes and artifacts: `/tmp/urnetwork-doh-read-liveness.eAMHyQ/RESULTS.md`. A predeclared paired repeat and component controls are required before a timer-default decision.
 
-Before that paired repeat, audit MultiClient TCP collapse prevention. Its default `TcpCollapseMaxHold` is 1.5s, after which one same-sequence retransmission is deliberately admitted per hold interval even if an ACK-required Transfer item may still be recovering. A 3s inner-TCP retry can therefore pass that gate. This is a provable policy behavior, **not yet an attribution** of the extra 3s/3s wire bytes: the four-cell records do not capture per-IP sequence/ACK/window lineage. Test the actual final-send singleton/group/race boundaries, older-hole recovery and stalled-Transfer escape before changing the hold; preserving the sender's only recovery path remains essential. The 40-cell paired cohort is paused pending this audit.
+At that audit's frozen source, the MultiClient `TcpCollapseMaxHold` default was 1.5s, after which one same-sequence retransmission was deliberately admitted per hold interval even if an ACK-required Transfer item might still be recovering. A 3s inner-TCP retry could therefore pass that gate. This is a provable historical policy behavior, **not an attribution** of the extra 3s/3s wire bytes: the four-cell records do not capture per-IP sequence/ACK/window lineage. The later lifetime-contract correction below supersedes that default; these finite-hold measurements do not qualify the zero-hold source. The 40-cell paired cohort remains paused pending exact-source qualification.
 
-### TCP collapse and provider ingress ownership audit (partial fix; receiver remediation pending)
+### TCP collapse and provider ingress ownership audit (historical RED ledger)
+
+The following ledger records the earlier frozen source and staged remediation,
+not the current implementation state. Its statements about receiver fixes still
+pending and deferring zero hold are historical; the subsequent integrated fixes
+and the 2026-10-05 lifetime-contract correction below supersede those deferrals.
+Retaining this ledger does not qualify the current source's performance or memory.
 
 The 1.5s hold was introduced in commit `1f3e2f58` to avoid the earlier indefinite high-water gate discarding a stalled flow's only TCP retries for up to the 30s Transfer ACK lifetime. That commit explicitly said the field freeze motivating the escape had **not** been reproduced at runtime. The setting is therefore a safety hypothesis, not a measured optimum. `canSendPacket` checks flow sequence/ACK/window high-water, then `releaseSequenceHold`; it does not consult the exact pending Transfer Pack or its peer ACK. At unchanged state an inner-TCP retry every 3s passes the 1.5s escape by design. A group passes whole if **any** member advances, even if other members are duplicates. These are code facts, not proof of which packets caused the measured wire increase.
 
@@ -629,6 +635,107 @@ policy; this change does not claim to redesign arbitrary-overload control
 admission or cancellation lease revocation. The distinct outer-TCP PTO
 bug above still requires its own source-managed dependency resolution. No
 release dependency, TCP-collapse policy or hosted MAIN run was changed.
+
+## Flow-lifetime TCP collapse contract correction (2026-10-05; qualification pending)
+
+The earlier explicit contract requires a lifetime gate, not a timed default escape.
+The 1.5s setting survived the ownership repairs above and still flowed unchanged
+through the public constructor's immutable reliability projection. Deterministic
+public `SendPacket`, batch and mux tests reproduced accepted data and established
+same-ISN SYN admission at 3s, for both IPv4 and IPv6. Production was unchanged for
+the RED controls (`red.log`, `red-syn.log` in
+`/tmp/urnetwork-collapse-default.HdgKNF/`). The correction sets the shipping
+default to zero while retaining explicit positive-hold compatibility.
+
+An adjacent RED demonstrated that the early duplicate return hid unanswered-SYN
+failure inference when the hold was zero: the old queue retained one SYN, but no
+replacement was ever selected. The existing guarded silence observation now
+precedes collapse; admission preparation follows both observation and the gate.
+A real return packet must still prevent stale inference from unbinding the flow.
+Elapsed time does not authorize an old-owner duplicate. Failed first/new-SYN or
+replacement admission does not commit coverage; accepted different-ISN SYN,
+ownership replacement and flow retirement retain distinct reset boundaries.
+
+The second generation RED (`red-generation.log`) exposed an established old
+tuple's `receivedInbound` state surviving an accepted different-ISN SYN. The
+repair keeps accepted generation identity separate from revocable collapse
+coverage. A transient numeric receipt in the existing optional admission scope
+preserves a matching current-owner SYN-ACK received before commit; stale old
+SYN-ACK/data cannot establish the newly committed generation. Refusal cannot
+reset the old connection. Receipts unlink and clear all flow/client/next links
+on success, refusal, cancellation and panic. First-ever generation response
+semantics remain unchanged; this does not claim to reject every stale response
+on a tuple with no prior accepted generation. The stale-inference guard control
+stages eligibility, actual return ingress and guarded rejection; it is not a
+claim of an independently scheduled concurrent race.
+
+Focused public-path and adjacent tests passed ten normal repetitions (8.442s)
+and three race repetitions (4.430s), with IPv4/IPv6, singleton/batch/mux,
+actual batched ingress, ordered two-SYN groups, inline current then stale
+responses, wrapped ISN, disabled collapse, simultaneous offers, unwritten
+expiry, and refusal/cancellation/panic cleanup. The final benchmark-fixture
+edit was followed by fresh normal/race passes (1.394s/2.588s). Independent
+code review found no remaining blocker within that scope. `go vet .` is
+not clean: it reports the unchanged, out-of-scope protobuf copylock at
+`transfer_contract_close_lineage.go:44`; no waiver or unrelated edit was made.
+Commands, RED controls and raw results are in
+`/tmp/urnetwork-collapse-default.HdgKNF/`.
+
+The old parsed-admission benchmark copied `Syn=true` fixture metadata despite
+ACK-only wire bytes, unintentionally measuring a new SYN every iteration. Its
+original logs remain as artificial SYN-churn diagnostics, not healthy-data
+evidence (+96 B / one allocation per new-generation observation). The corrected
+fixture parses its actual ACK-only template before timing. A full private
+pre-generation source closure and the candidate used this identical corrected
+fixture, three 100ms samples per benchmark at CPU2; all source and overlay
+fingerprints matched before/after. Healthy gate, singleton and eight-packet
+allocations remain respectively 352 B/1, 496 B/10 and 1,896 B/17. Sequential
+median times were 106.9→106.8ns, 460.9→474.8ns and 1,052→1,087ns; these are
+microbenchmarks, not a statistically qualified speed or throughput result.
+
+Measured arm64 layouts, in bytes:
+
+| State | Before | After |
+| --- | ---: | ---: |
+| Flow update | 384 | 400 |
+| Parsed packet / group / collapse token | 104 / 96 / 16 | 104 / 96 / 16 |
+| Optional admission-observation scope | 64 | 96 |
+| TCP-control observation | 16 | 20 |
+| Receive packet / pending ingress control | 112 / 24 | 120 / 32 |
+
+There is real state growth despite unchanged healthy-data allocation counts.
+No memory limit was raised, and this is not an iOS-profile 24 MiB qualification.
+
+A separate private, hermetic actual WireGuard/TUN → ProxyDevice NAT →
+MultiClient/Transfer → provider/LocalUserNat → verified-TLS diagnostic passed
+five zero-hold cases normally (22.759s, n=1): healthy delayed flight, origin
+FIN, relay FIN, cancellation and a long hold measured 19.501s from the first
+tail. The long case kept the HTTP 30s timeout, completed verified TLS/HTTP204
+on one upstream dial, and asserted zero provider/handoff drop errors, FIN or
+RST. Before release it retained nine items/1,423 B, with nine held Transfer
+emissions and six exact TCP-collapse refusals. These are scripted-loss
+observations, not performance baselines.
+
+That fixture's former exact-message-ID ACK barrier was invalid: production
+delivery ACKs cumulatively cover earlier sequence ordinals. The oracle's
+counterfactual RED (0.832s) failed only compressed-head coverage; its corrected
+GREEN (0.794s) passed ten controls. HTTP completion was asserted before the
+successful run's ACK barrier: held ordinal 6 was covered by known same-sequence
+cumulative ACK 14 while exact-ID ACK remained false. Unknown IDs, wrong
+sequences, selective/missing-contract ACKs, earlier ordinals and pre-release
+coverage remain rejected. The original failed zero-hold run is preserved and
+its unobserved HTTP outcome remains unknown.
+
+Crucially, that overlay pins **pre-repair** Connect SHA
+`32a6d66201574f030abcc2ffc93dc3e2227df8cb4253ee5a5224d91d78205511`
+with a private explicit zero-hold setting, not this new default/generation/
+inference candidate. All 2,283 local input hashes matched. Evidence:
+`/Users/builder/urnetwork/temp/proxy-connect-path.nL5339/evidence.json`
+and `zero-coverage-five-cases-normal.log`. Its race check remains queued.
+It does not qualify the current candidate, canonical PERF or any hosted MAIN
+root-cause attribution. Exact-current-source zero-hold private matrix,
+canonical PERF and memory qualification remain required; neither those old
+zero-hold diagnostics nor prior 1.5s results establish release readiness.
 
 ## Decision gates and next work
 

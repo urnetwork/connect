@@ -83,6 +83,33 @@ func originalContractStoreTestFiles(t *testing.T, directory string) []OriginalCo
 	return files
 }
 
+// Ordinary macOS TMPDIR has a symlink ancestor. Make that precondition explicit
+// on every supported host and keep a separate runtime alias rejection check.
+func TestOriginalContractStoreFixtureWithSymlinkTempDir(t *testing.T) {
+	useSymlinkCustodyTempDir(t)
+	t.Run("physical custody and explicit alias", func(t *testing.T) {
+		client, oob := newOriginalCreationTestClient(t)
+		scope := client.ContractManager().contractCreation.scope
+		if err := ValidateOriginalContractStore(t.Context(), oob.directory, scope); err != nil {
+			t.Fatal("positive fixture retained the temporary-directory alias", err)
+		}
+		client.ContractManager().CreateContract(ContractKey{Destination: DestinationId(NewId())}, 0, 100)
+		if oob.readErr != nil || len(oob.retained) == 0 {
+			t.Fatal("physical fixture did not retain its pre-send original", oob.readErr)
+		}
+		alias := filepath.Join(physicalTempDir(t), "explicit-alias")
+		if err := os.Symlink(oob.directory, alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateOriginalContractStore(t.Context(), alias, scope); !errors.Is(err, ErrOriginalContractStoreIdentity) {
+			t.Fatal("explicit alias became physical contract custody", err)
+		}
+		if err := ValidateOriginalContractStore(t.Context(), oob.directory, scope); err != nil {
+			t.Fatal("alias rejection changed physical custody", err)
+		}
+	})
+}
+
 func TestOriginalContractStoreReadbackRetainsNamedInodeAndLinks(t *testing.T) {
 	for _, change := range []string{"replacement", "hardlink", "size"} {
 		func() {
@@ -224,7 +251,7 @@ func TestOriginalContractStorePreparedBirthAndIndependentHistoricalScope(t *test
 	if err := ValidateOriginalContractStore(t.Context(), oob.directory, scope); err != nil {
 		t.Fatal(err)
 	}
-	unprepared := t.TempDir()
+	unprepared := physicalTempDir(t)
 	if err := os.Chmod(unprepared, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +305,7 @@ func TestOriginalContractStorePortableRestoreKeepsCompleteOriginalClosure(t *tes
 		t.Fatal(err)
 	}
 	originals := originalContractStoreTestFiles(t, oob.directory)
-	target := t.TempDir()
+	target := physicalTempDir(t)
 	if err := os.Chmod(target, 0700); err != nil {
 		t.Fatal(err)
 	}

@@ -48,9 +48,8 @@ func collapseTestCanSend(
 	})
 }
 
-// a retransmit inside the hold is still collapsed, and the same retransmit
-// after the hold is admitted so a stalled flow can recover without waiting out
-// the 30s AckTimeout
+// An explicit positive compatibility hold admits an aged retransmit. The
+// shipping default is a lifetime hold; this test pins the opt-in escape only.
 func TestTcpCollapseHoldReleasesRetransmit(t *testing.T) {
 	maxHold := 50 * time.Millisecond
 	client, update := collapseTestClient(maxHold)
@@ -77,8 +76,7 @@ func TestTcpCollapseHoldReleasesRetransmit(t *testing.T) {
 	AssertEqual(t, collapseTestCanSend(client, update, retransmit), false)
 }
 
-// zero must reproduce the previous behavior exactly: retransmits collapsed
-// indefinitely, however long the flow has been stuck
+// Zero is the lifetime default: elapsed time alone never revokes ownership.
 func TestTcpCollapseHoldDisabled(t *testing.T) {
 	client, update := collapseTestClient(0)
 
@@ -95,7 +93,7 @@ func TestTcpCollapseHoldDisabled(t *testing.T) {
 }
 
 // the hold must not interfere with packets that legitimately advance the flow,
-// nor with syn/rst which always pass
+// nor with a fresh SYN generation or RST
 func TestTcpCollapseHoldAllowsProgress(t *testing.T) {
 	client, update := collapseTestClient(50 * time.Millisecond)
 
@@ -111,7 +109,7 @@ func TestTcpCollapseHoldAllowsProgress(t *testing.T) {
 	ack := collapseTestPacket(1100, 6000, 0, false, false)
 	AssertEqual(t, collapseTestCanSend(client, update, ack), true)
 
-	// syn and rst are never collapsed
+	// A previously unseen SYN generation and RST pass.
 	AssertEqual(t, collapseTestCanSend(client, update, collapseTestPacket(1000, 5000, 100, true, false)), true)
 	AssertEqual(t, collapseTestCanSend(client, update, collapseTestPacket(1000, 5000, 100, false, true)), true)
 }
@@ -232,7 +230,5 @@ func TestTcpCollapseIncludesDirectSelectedClient(t *testing.T) {
 
 func TestDefaultMultiClientSettingsSetsTcpCollapseMaxHold(t *testing.T) {
 	maxHold := DefaultMultiClientSettings().TcpCollapseMaxHold
-	AssertEqual(t, 0 < maxHold, true)
-	// must stay well under the AckTimeout it exists to preempt
-	AssertEqual(t, maxHold < DefaultMultiClientSettings().AckTimeout, true)
+	AssertEqual(t, maxHold, time.Duration(0))
 }

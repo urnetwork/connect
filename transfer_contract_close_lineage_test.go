@@ -11,15 +11,30 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-func inventoryTestClient(t *testing.T) (*Client, *closeReportRecordingOob) {
+// Optional operations run under the live key owner. The returned client is
+// joined so subsequent reports exercise the synchronous cleanup handoff.
+func inventoryTestClient(t *testing.T, beforeClose ...func(*Client)) (*Client, *closeReportRecordingOob) {
 	t.Helper()
 	owner, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	oob := &closeReportRecordingOob{}
 	settings := DefaultClientSettings()
 	settings.ControlPingTimeout = 0
 	settings.Log = NewNoopLogger()
+	settings.EncryptionSettings.Mode = EncryptionModeOff
+	settings.ContractManagerSettings = DefaultContractManagerSettingsNoNetworkEvents()
 	settings.ContractManagerSettings.CloseReportDomainHash = [32]byte{61}
 	client := NewClient(owner, NewId(), oob, settings)
+	t.Cleanup(func() {
+		cancel()
+		join, stop := context.WithTimeout(context.Background(), 3*time.Second)
+		defer stop()
+		if err := client.CloseAndWait(join); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, operation := range beforeClose {
+		operation(client)
+	}
 	cancel()
 	join, stop := context.WithTimeout(context.Background(), 3*time.Second)
 	defer stop()
@@ -30,11 +45,19 @@ func inventoryTestClient(t *testing.T) (*Client, *closeReportRecordingOob) {
 }
 
 func TestOriginalInventoryActualCleanupRotationAndIndependentContracts(t *testing.T) {
-	client, oob := inventoryTestClient(t)
 	contract := NewId()
-	client.ContractManager().CheckpointContract(contract, 73, 5)
-	if err := client.ClientKeyManager().SetSeed(bytes.Repeat([]byte{62}, 32)); err != nil {
-		t.Fatal(err)
+	client, oob := inventoryTestClient(t, func(client *Client) {
+		client.ContractManager().CheckpointContract(contract, 73, 5)
+		if err := client.ClientKeyManager().SetSeed(bytes.Repeat([]byte{62}, 32)); err != nil {
+			t.Fatal("live owner could not rotate", err)
+		}
+	})
+	rotatedKey := bytes.Clone(client.ClientKeyManager().PublicKey())
+	if err := client.ClientKeyManager().SetSeed(bytes.Repeat([]byte{63}, 32)); err == nil {
+		t.Fatal("joined key owner accepted a new rotation")
+	}
+	if !bytes.Equal(rotatedKey, client.ClientKeyManager().PublicKey()) {
+		t.Fatal("rejected rotation changed the cleanup signing key")
 	}
 	client.ContractManager().CloseContract(contract, 48, 7)
 	client.ContractManager().CloseContract(NewId(), 121, 0)
