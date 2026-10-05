@@ -777,7 +777,8 @@ never removed by policy. A hold, a limit (A12) and a latency sample
 (DESIGNNOTES4.md §6) are judged by whichever of the monotonic and the wall
 clock has moved further: the monotonic clock stops while the host sleeps, so
 a sleep counts toward them, and a wall clock set back does not extend them.
-A path change drops the latency samples. A `MonitorValue` publishes change;
+A path change drops the latency samples, and a resume from a sleep of at
+least 15 minutes drops those taken before it. A `MonitorValue` publishes change;
 `Snapshot` serves status. Persistence goes through a store interface `Load() ([]byte,
 error)` and `Save([]byte) error` with a JSON envelope `{version, records,
 addresses, country_hint}`, saved coalesced at 1 s after a change.
