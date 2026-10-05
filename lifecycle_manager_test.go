@@ -327,6 +327,13 @@ func TestClientCloseAndWaitJoinsContractManagerWorkers(t *testing.T) {
 	settings.ContractManagerSettings.ProvidePingTimeout = time.Hour
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	manager := client.contractManager
+	// Queue a real reservation to activate the lazy expiry/final-flush owner.
+	destination := NewId()
+	frame := expiryContractFrame(t, client.ClientId(), destination, NewId())
+	defer MessagePoolReturn(frame.MessageBytes)
+	if err := manager.HandleControlFrame(ContractKey{Destination: DestinationId(destination)}, frame); err != nil {
+		t.Fatal(err)
+	}
 	workerEntered := make(chan string, 3)
 	releaseWorkers := make(chan struct{})
 	joinEntered := make(chan struct{})
