@@ -586,6 +586,24 @@ type EncryptionSettings struct {
 	// Required (never expose application data in plaintext to/from a peer for
 	// which a session is expected). See EncryptionMode.
 	Mode EncryptionMode
+	// OpportunisticEstablishHold, when positive under
+	// EncryptionModeOpportunistic, holds application sends to a peer for up to
+	// this long while the peer's session first establishes, so a peer that
+	// answers the handshake in time is sealed from the first application byte
+	// rather than after the first few. The hold belongs to the session, not to
+	// a send: it runs from the session's first establishment attempt and ends
+	// for good when the session seals, when an establishment attempt fails, or
+	// at its deadline. A send still held then falls through to plaintext, as
+	// Opportunistic sends; it is never refused for want of a cipher, which is
+	// what EncryptionModeRequired does instead. A send whose own budget ends
+	// inside the hold returns not-sent with no error, as under backpressure,
+	// and a non-blocking send does not wait. Zero, the default, disables it,
+	// and it has no effect in the other modes.
+	//
+	// It narrows the plaintext window and does not close it: a peer that never
+	// answers, or a relay that drops the handshake, still gets plaintext once
+	// the hold ends.
+	OpportunisticEstablishHold time.Duration
 	// TLS config used when local is in the TLS-client role for a peer.
 	// When nil, a permissive default with InsecureSkipVerify is used.
 	ClientTlsConfig *tls.Config
@@ -1096,6 +1114,15 @@ type peerEncryptionSession struct {
 	// Protected by stateLock.
 	initialHandshakeFailureCount  int
 	nextInitialHandshakeRetryTime time.Time
+	// establishHoldStart is when this session's first handshake epoch began:
+	// the start of the Opportunistic establish hold
+	// (`EncryptionSettings.OpportunisticEstablishHold`). Zero until then.
+	// Protected by stateLock.
+	establishHoldStart time.Time
+	// establishHoldEnded latches once that hold is over for good (the session
+	// sealed, an establishment attempt failed, or the deadline passed), so
+	// every later send skips stateLock.
+	establishHoldEnded atomic.Bool
 
 	// out-of-band identity fetch pacing (see
 	// maybeFetchPeerClientPublicKeyForIdentity). Guarded by stateLock.
@@ -1453,6 +1480,9 @@ func (self *peerEncryptionSession) reset() {
 func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 	if self.ctx.Err() != nil {
 		return
+	}
+	if self.establishHoldStart.IsZero() {
+		self.establishHoldStart = time.Now()
 	}
 	if self.epoch != nil && self.epoch != self.establishedEpoch {
 		self.epoch.cancel()
@@ -2785,6 +2815,44 @@ func (self *peerEncryptionSession) requiredCipherState() (*sequenceCipher, <-cha
 		self.keyHistoryState != clientKeyHistoryRejected &&
 		self.keyHistoryState != clientKeyHistoryStoreUnavailable
 	return cipher, changed, retry, self.nextInitialHandshakeRetryTime
+}
+
+// establishHoldPending reports, without stateLock, whether the Opportunistic
+// establish hold (`EncryptionSettings.OpportunisticEstablishHold`) can still
+// apply to this session. False is final.
+func (self *peerEncryptionSession) establishHoldPending() bool {
+	return self.settings != nil &&
+		self.settings.Mode == EncryptionModeOpportunistic &&
+		0 < self.settings.OpportunisticEstablishHold &&
+		!self.establishHoldEnded.Load()
+}
+
+// establishHoldState snapshots the Opportunistic establish hold. holding is
+// true while an application send should keep waiting for the session's first
+// cipher, until deadline at the latest; changed is the readiness broadcast the
+// Required gate waits on, which sealing, an establishment failure and a new
+// epoch all fire. A hold that is over for good latches establishHoldEnded.
+// Before any establishment has started (a server-role session before the
+// peer's ClientHello) there is nothing to wait for yet, and nothing latches.
+func (self *peerEncryptionSession) establishHoldState(now time.Time) (holding bool, changed <-chan struct{}, deadline time.Time) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.establishedEpoch != nil || 0 < self.initialHandshakeFailureCount {
+		self.establishHoldEnded.Store(true)
+		return false, nil, time.Time{}
+	}
+	if self.establishHoldStart.IsZero() {
+		return false, nil, time.Time{}
+	}
+	deadline = self.establishHoldStart.Add(self.settings.OpportunisticEstablishHold)
+	if !now.Before(deadline) {
+		self.establishHoldEnded.Store(true)
+		return false, nil, time.Time{}
+	}
+	if self.requiredCipherChanged == nil {
+		self.requiredCipherChanged = make(chan struct{})
+	}
+	return true, self.requiredCipherChanged, deadline
 }
 
 // Wakes every Required sender, but owns no worker and never consumes the
