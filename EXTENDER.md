@@ -263,7 +263,9 @@ country while the default network is cellular), else the hint's last country.
 The hint is read through direct dialers only (DESIGNNOTES4.md §4): where only
 an extender reaches the operator, the hint fails rather than placing it.
 A failed hint and a path change make the hint's country stale, and a path
-change asks for the hint again. When the list in force changes, the strategy
+change asks for the hint again at once; a failed hint is asked again after a
+backoff (1 min doubling to 6 h on the same path), and no read holds up the
+refresh pass. When the list in force changes, the strategy
 drops its discovery extender dialers so every address is drawn again from the
 new list. The whitelist of A5 is every bundled list, `AllSpoofDomains()`. No
 country list is bundled yet; each needs a measurement of what its network lets

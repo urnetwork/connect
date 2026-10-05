@@ -325,8 +325,10 @@ func TestExtenderNetworkClientFallsBackToTheNetworkCountryWhenTheHintFails(t *te
 	hint.waitForCount(t, count+1)
 	waitForSpoofCountryCode(t, directory, "ru")
 
-	// the operator answers again: its country is back in force
+	// the operator answers again: the first pass after the failure's backoff
+	// reads it, and its country is back in force
 	hint.Answer(&ExtenderHintResult{ContinentCode: "EU", CountryCode: "DE"})
+	clock.advance(DefaultExtenderNetworkClientSettings().HintMinBackoff)
 	waitForSpoofCountryCode(t, directory, "de")
 }
 

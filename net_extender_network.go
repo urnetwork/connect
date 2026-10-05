@@ -29,7 +29,9 @@ import (
 // a sample, and then either holds the subscription open or sleeps until the
 // next tick; every failure path goes back through the same backoff. Three
 // things wake it early: a network path change, a drop below the low-water
-// mark, and `Close`.
+// mark, and `Close`. The operator's hint and the latency probe pass each run
+// in a loop of their own beside it (`runHints`, `runProbes`), so neither
+// holds up a pass.
 //
 // Every clock and every side effect is a settings seam -- `Now`, `ResolveDns`,
 // `Hello` -- so the whole loop is deterministic in tests.
@@ -83,6 +85,16 @@ type ExtenderNetworkClientSettings struct {
 	// is no longer there. Not named in E3; without it a black-holed
 	// subscription would never reconnect, because nothing else ends the read.
 	SubscribeIdleTimeout time.Duration
+
+	// A hint read that failed is read again only once this backoff has
+	// passed, and the backoff doubles with each further failure on the same
+	// path up to HintMaxBackoff; a path change reads it again at once, and an
+	// answer is read again on the rebootstrap period. An operator that a
+	// direct read cannot reach on this path -- a whitelist-only network, a
+	// blocked api -- does not answer at the next pass either, and every read
+	// dials the operator's address directly (GetExtenderHint).
+	HintMinBackoff time.Duration
+	HintMaxBackoff time.Duration
 
 	// The latency probe pass (DESIGNNOTES4.md §4). ProbeWindowCount is m:
 	// the pass stops once this many usable extenders of a family measure
@@ -173,6 +185,8 @@ func DefaultExtenderNetworkClientSettings() *ExtenderNetworkClientSettings {
 		DialTimeout:            30 * time.Second,
 		HelloTimeout:           30 * time.Second,
 		SubscribeIdleTimeout:   90 * time.Second,
+		HintMinBackoff:         1 * time.Minute,
+		HintMaxBackoff:         6 * time.Hour,
 		ProbeWindowCount:       4,
 		ProbeCountPerExtender:  2,
 		ProbeMaxCandidateCount: 16,
@@ -280,17 +294,23 @@ type ExtenderNetworkClient struct {
 	// closed by run after its first bootstrap/manual readiness and expiry,
 	// before sampling; early hints must not probe a partial bootstrap set
 	initialProbeReady chan struct{}
+	// the hint loop's join and wake (DESIGNNOTES4.md §4)
+	hintDone chan struct{}
+	hintWake *Monitor
+	// closed by the hint loop once its first read has ended, answered or
+	// not; the first probe pass waits for it too, so the operator's
+	// continent is probed first
+	initialHintDone chan struct{}
 	// the attesting provider, nil for a client that only ranks. Installed
 	// by the provider role and cleared when it stops.
 	probeAttestor *ExtenderProbeAttestor
 	// where the attesting provider's pings are reported, nil for nowhere
 	// (GEOMAP §2.5)
 	probeReporter *ExtenderPingReporter
-	// true once the operator's hint has been applied, which the dns
-	// inference then defers to
-	operatorHintApplied bool
-	// set by a path change: the hint placed the address of the old path, so
-	// the next pass asks again rather than waiting out the refresh period
+	// set by a path change: the hint placed the address of the old path, and
+	// a failure on the old path says nothing about the new one, so the hint
+	// loop reads it again at once rather than waiting out the refresh period
+	// or a failure's backoff
 	hintRearmed bool
 
 	// Resolver publications share this client's lifetime, never process state.
@@ -298,6 +318,14 @@ type ExtenderNetworkClient struct {
 	dnsPublicationKVs map[string]*extenderDnsPublication
 	dnsWorkers        sync.WaitGroup
 	dnsClosed         bool
+
+	// orders the two sources of the continent hint: the hint loop's operator
+	// answer and the bootstrap's dns inference run side by side, and an
+	// inference must not land after the operator's answer it checked for
+	continentLock sync.Mutex
+	// true once the operator's hint has been applied, which the dns
+	// inference then defers to
+	operatorHintApplied bool
 }
 
 // The client is running when this returns: the directory has been told a first
@@ -331,6 +359,9 @@ func NewExtenderNetworkClient(
 		probeDone:         make(chan struct{}),
 		probeWake:         NewMonitor(),
 		initialProbeReady: make(chan struct{}),
+		hintDone:          make(chan struct{}),
+		hintWake:          NewMonitor(),
+		initialHintDone:   make(chan struct{}),
 	}
 	directory.SetInitialSamplePending()
 	// a path change invalidates the feed connection and the addresses that
@@ -339,6 +370,13 @@ func NewExtenderNetworkClient(
 	go HandleError(func() {
 		defer close(self.done)
 		self.run()
+	}, cancel)
+	// the hint has its own loop: a pass needs nothing from its answer, and a
+	// read the operator does not answer must not hold up the bootstrap and
+	// the sample that follow it (DESIGNNOTES4.md §4)
+	go HandleError(func() {
+		defer close(self.hintDone)
+		self.runHints()
 	}, cancel)
 	// the probe pass has its own loop: in the feed role the refresh loop is
 	// parked on the subscription for as long as it lives, and records that
@@ -367,7 +405,8 @@ func (self *ExtenderNetworkClient) StatusMonitor() *MonitorValue[ExtenderNetwork
 // It invalidates the hint's country too, which placed the address of the old
 // path: the country goes stale at once, so the network country the host
 // reports for the new path stands in until the operator answers for it, and
-// the next pass asks the operator again.
+// the hint loop asks the operator again at once, whatever a failure on the
+// old path had it waiting for.
 func (self *ExtenderNetworkClient) networkChanged() {
 	feedStream := func() *ExtenderFeedStream {
 		self.stateLock.Lock()
@@ -379,6 +418,7 @@ func (self *ExtenderNetworkClient) networkChanged() {
 	if feedStream != nil {
 		feedStream.Close()
 	}
+	self.hintWake.NotifyAll()
 	self.wakeMonitor.NotifyAll()
 }
 
@@ -413,6 +453,7 @@ func (self *ExtenderNetworkClient) Close() {
 		self.cancel()
 		<-self.done
 		<-self.probeDone
+		<-self.hintDone
 		self.dnsWorkers.Wait()
 	})
 }
@@ -444,7 +485,6 @@ func (self *ExtenderNetworkClient) run() {
 	initialProbeReady := self.initialProbeReady
 	var lastBootstrapTime time.Time
 	var lastHelloTime time.Time
-	var lastHintTime time.Time
 	var lastManualTime time.Time
 	// the manual host list this loop has already applied; a reconfiguration
 	// changes the version and re-resolves at once (K6)
@@ -462,20 +502,12 @@ func (self *ExtenderNetworkClient) run() {
 		// pass runs is carried into the next wait instead of being lost
 		wake := self.wakeMonitor.NotifyChannel()
 
+		// each pass has the hint loop look whether the hint is due, and goes
+		// on without waiting for the read (runHints)
+		self.hintWake.NotifyAll()
 		if lastHelloTime.IsZero() || self.settings.RebootstrapTimeout <= now.Sub(lastHelloTime) {
 			if self.refreshRootKeys() {
 				lastHelloTime = now
-			}
-		}
-		// the hint before the bootstrap, so the dns inference below knows
-		// whether the operator has already said (DESIGNNOTES4.md §4). A path
-		// change asks again as a first start does, until it answers
-		if self.takeHintRearmed() {
-			lastHintTime = time.Time{}
-		}
-		if lastHintTime.IsZero() || self.settings.RebootstrapTimeout <= now.Sub(lastHintTime) {
-			if self.refreshHint() {
-				lastHintTime = now
 			}
 		}
 		if lastBootstrapTime.IsZero() ||
@@ -1059,6 +1091,118 @@ func extenderFeedConfig(
 
 // The hint (DESIGNNOTES4.md §4).
 
+// The hint loop. The hint is read beside the refresh pass, never ahead of it:
+// nothing a pass does needs the answer -- while there is none the network
+// country the host reports stands in for the operator's (SpoofCountryCode),
+// and the operator's continent overrides the dns inference whenever it lands
+// -- so a read the operator does not answer, as where only extenders reach it
+// (a whitelist-only network, a blocked api), never holds up the bootstrap,
+// the manual hosts or the sample. One read is in flight at a time.
+//
+// The loop has no clock of its own. It looks whether the hint is due at its
+// start, at each pass, which wakes it, and at a path change, which is the
+// cadence the hint was read at as part of the pass; extenderHintSchedule
+// decides what is due, so a failed read is not repeated at every pass.
+func (self *ExtenderNetworkClient) runHints() {
+	initialHintDone := self.initialHintDone
+	hintSchedule := newExtenderHintSchedule(
+		self.settings.RebootstrapTimeout,
+		self.settings.HintMinBackoff,
+		self.settings.HintMaxBackoff,
+	)
+	for {
+		// subscribe before the read, so a pass or a path change that lands
+		// while it runs is carried into the next wait instead of being lost
+		wake := self.hintWake.NotifyChannel()
+		if self.takeHintRearmed() {
+			hintSchedule.Rearm()
+		}
+		if hintSchedule.Due(self.settings.Now()) {
+			if self.refreshHint() {
+				hintSchedule.Answer(self.settings.Now())
+			} else {
+				hintSchedule.Fail(self.settings.Now())
+			}
+		}
+		if initialHintDone != nil {
+			close(initialHintDone)
+			initialHintDone = nil
+		}
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-wake:
+		}
+	}
+}
+
+// When the hint is due. An answer is read again after the refresh timeout.
+// A failure is read again only once its backoff has passed, and the backoff
+// doubles with each further failure, up to the max: an operator that a direct
+// read cannot reach on a path does not answer at the next pass either, and
+// the backoff is what keeps a refresh loop that passes after every feed drop
+// from dialing it at each one. A path change is a fresh start: the hint is
+// due at once, and a failure on the new path backs off from the minimum.
+//
+// Only the hint loop holds one, so it takes no lock.
+type extenderHintSchedule struct {
+	refreshTimeout time.Duration
+	minBackoff     time.Duration
+	maxBackoff     time.Duration
+
+	// when the last read on this path ended, zero for none
+	readTime time.Time
+	// the wait after readTime: the refresh timeout after an answer, the
+	// backoff after a failure
+	wait time.Duration
+	// zero until a read on this path fails, then the wait the next failure
+	// doubles
+	backoff time.Duration
+}
+
+func newExtenderHintSchedule(
+	refreshTimeout time.Duration,
+	minBackoff time.Duration,
+	maxBackoff time.Duration,
+) *extenderHintSchedule {
+	return &extenderHintSchedule{
+		refreshTimeout: refreshTimeout,
+		minBackoff:     minBackoff,
+		maxBackoff:     max(minBackoff, maxBackoff),
+	}
+}
+
+// Whether a read is due at `now`: none has ended on this path yet, or the
+// wait after the last has passed.
+func (self *extenderHintSchedule) Due(now time.Time) bool {
+	return self.readTime.IsZero() || self.wait <= now.Sub(self.readTime)
+}
+
+// The read that ended at `now` answered.
+func (self *extenderHintSchedule) Answer(now time.Time) {
+	self.readTime = now
+	self.wait = self.refreshTimeout
+	self.backoff = 0
+}
+
+// The read that ended at `now` failed.
+func (self *extenderHintSchedule) Fail(now time.Time) {
+	if self.backoff <= 0 {
+		self.backoff = self.minBackoff
+	} else {
+		self.backoff = min(2*self.backoff, self.maxBackoff)
+	}
+	self.readTime = now
+	self.wait = self.backoff
+}
+
+// The path changed.
+func (self *extenderHintSchedule) Rearm() {
+	self.readTime = time.Time{}
+	self.wait = 0
+	self.backoff = 0
+}
+
 // Reads the operator's hint and applies it to the directory. An empty
 // continent is an operator that cannot place this client, which leaves
 // whatever the dns inference said; an empty country leaves the last one, stale.
@@ -1092,11 +1236,11 @@ func (self *ExtenderNetworkClient) refreshHint() bool {
 		return true
 	}
 	func() {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
+		self.continentLock.Lock()
+		defer self.continentLock.Unlock()
 		self.operatorHintApplied = true
+		self.applyContinentHint(continentCode, "operator")
 	}()
-	self.applyContinentHint(continentCode, "operator")
 	return true
 }
 
@@ -1125,12 +1269,12 @@ func (self *ExtenderNetworkClient) inferContinentHint(continentCounts map[string
 	if bestCount*2 <= total {
 		return
 	}
-	operatorHintApplied := func() bool {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-		return self.operatorHintApplied
-	}()
-	if operatorHintApplied {
+	// checked and applied under one lock: the hint loop's answer may land
+	// while the bootstrap runs, and must not be overridden by an inference
+	// that checked before it
+	self.continentLock.Lock()
+	defer self.continentLock.Unlock()
+	if self.operatorHintApplied {
 		return
 	}
 	self.applyContinentHint(best, "dns")
@@ -1219,6 +1363,14 @@ func (self *ExtenderNetworkClient) runProbes() {
 	case <-self.ctx.Done():
 		return
 	case <-self.initialProbeReady:
+	}
+	// the first pass also waits for the first hint read, which runs beside
+	// the bootstrap, so it probes the operator's continent first rather than
+	// spending its pings before the operator has said
+	select {
+	case <-self.ctx.Done():
+		return
+	case <-self.initialHintDone:
 	}
 	for {
 		// subscribe before the pass, so a wake that lands while it runs is

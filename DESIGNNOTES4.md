@@ -167,6 +167,15 @@ proxy configured the client makes no direct request at all -- the country
 falls back to the network country the host reports (`SetNetworkCountryCode`);
 a path change makes the hint's country stale and asks for the hint again.
 
+The hint is read in a loop of its own beside the refresh pass, never ahead
+of it: the pass needs nothing from the answer (the country falls back, and
+the operator's continent overrides the DNS inference whenever it lands), so
+an operator that only extenders reach costs the bootstrap and the sample
+nothing. A failed read is asked again only once its backoff has passed, one
+minute doubling with each further failure on the same path up to six hours;
+a path change asks again at once. The first probe pass waits for the first
+read, so it still probes the operator's continent first.
+
 The probe pass runs after bootstrap and before the feed dial: up to `n` probes
 per extender, stopping once `m` candidates are "close enough" — within
 `ProbeCloseFactor × best` or under `ProbeCloseFloor`, whichever admits more,
