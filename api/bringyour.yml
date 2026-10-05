@@ -475,6 +475,13 @@ paths:
           and the client continues to /auth/network-create with a fresh
           challenge.
         - a seedphrase
+
+        A well-formed wallet signature that does not verify for
+        `wallet_address` over the challenge (in practice the wallet signed
+        with another account than the address entered) is refused with
+        `error.code` `signature_mismatch` when the request sets
+        `result_errors`, as a 200. Without it, that refusal is a 401 with a
+        plain text body. Every other wallet refusal keeps its HTTP status.
       operationId: Auth Login
       security: []
       requestBody:
@@ -726,6 +733,15 @@ paths:
       description: |
         Create a new network.
         A user authority can be associated with at most one network.
+
+        A well-formed wallet signature that does not verify for
+        `wallet_address` over the challenge (in practice the wallet signed
+        with another account than the address entered) is refused with a
+        401. When the request sets `result_errors`, the 401's body is the
+        JSON result with `error.code` `signature_mismatch`; without it, the
+        body is the plain text message. A 2xx is always a created network or
+        its pending state, never a refusal. Every other refusal keeps its
+        HTTP status and plain text body.
       operationId: authNetworkCreate
       security: []
       requestBody:
@@ -743,6 +759,18 @@ paths:
                 $ref: "#/components/schemas/NetworkCreateResult"
         "400":
           description: The request was malformed, the network name is taken, or the referral code is invalid.
+        "401":
+          description: |
+            The wallet signature does not verify for `wallet_address`. With
+            `result_errors` the body is the result, with `error.code`
+            `signature_mismatch`; without it, the plain text message.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkCreateResult"
+            text/plain:
+              schema:
+                type: string
 
   /auth/network-delete:
     post:
@@ -978,6 +1006,11 @@ paths:
         must sign the single-use challenge from /auth/wallet-challenge, the
         same proof as wallet login; one wallet address binds to one user.
         Subject to the account action rate limit.
+
+        Refusals come back in the result `error` as a 200. A well-formed
+        wallet signature that does not verify for `wallet_address` over the
+        challenge (in practice the wallet signed with another account than
+        the address entered) has `error.code` `signature_mismatch`.
       operationId: Auth Add Auth
       security:
         - BearerAuth: []
@@ -6278,6 +6311,11 @@ components:
         seedphrase:
           description: The recovery seedphrase, for a seedphrase login.
           type: string
+        result_errors:
+          description: |
+            Report a refusal that has a code (`signature_mismatch`) in the
+            result `error` with a 200, instead of a 401. New clients set this.
+          type: boolean
 
     AuthLoginResult:
       type: object
@@ -6313,6 +6351,20 @@ components:
                 - password
                 - apple
                 - google
+            code:
+              description: |
+                A stable code for a refusal that has one, so a client can pick
+                a localized message. Only with `result_errors`.
+                `signature_mismatch`: the wallet signature is well formed but
+                does not verify for `wallet_address` over the challenge. In
+                practice the wallet signed with another account than the
+                address entered (an sr25519 signature cannot be recovered to
+                the key that made it, so the server cannot name that account),
+                or signed other text. Sign the issued challenge with the
+                entered address. The challenge is not used up. Absent for
+                every other refusal; clients fall back to `message` for an
+                absent or unknown code.
+              type: string
             message:
               type: string
         network:
@@ -6551,6 +6603,12 @@ components:
             is ever sent. Honored on every create path, including sign-ups
             that complete through /auth/verify. The server records a
             `signup.optout_changed` event with the value.
+        result_errors:
+          description: |
+            Answer a refusal that has a code (`signature_mismatch`) with the
+            result as the JSON body of its 401, instead of the plain text
+            message. New clients set this.
+          type: boolean
 
     NetworkCreateResult:
       type: object
@@ -6598,6 +6656,19 @@ components:
           required:
             - message
           properties:
+            code:
+              description: |
+                A stable code for a refusal that has one, so a client can pick
+                a localized message. Only with `result_errors`, in the body of
+                the refusal's 401.
+                `signature_mismatch`: the wallet signature is well formed but
+                does not verify for `wallet_address` over the challenge. In
+                practice the wallet signed with another account than the
+                address entered, or signed other text. Sign the issued
+                challenge with the entered address. The challenge is not used
+                up. Clients fall back to `message` for an absent or unknown
+                code.
+              type: string
             message:
               type: string
 
@@ -9905,6 +9976,18 @@ components:
           required:
             - message
           properties:
+            code:
+              description: |
+                A stable code for a refusal that has one, so a client can pick
+                a localized message.
+                `signature_mismatch`: the wallet signature is well formed but
+                does not verify for `wallet_address` over the challenge. In
+                practice the wallet signed with another account than the
+                address entered, or signed other text. Sign the issued
+                challenge with the entered address. The challenge is not used
+                up. Absent from older servers and for every other refusal;
+                clients fall back to `message` for an absent or unknown code.
+              type: string
             message:
               type: string
     RemoveAuthArgs:
