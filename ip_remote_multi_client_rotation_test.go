@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -407,6 +408,14 @@ func TestDrainBranchWarnsUnconditionally(t *testing.T) {
 	if got := nextWarningCall(`printStats("client health warning")`); got != "setWarning(remove, warnUnhealthy)" {
 		t.Errorf("the health-warning branch warns with %q, want the rank-derived setWarning(remove, warnUnhealthy)", got)
 	}
+	// the one exemption is the user's Fixed IP: the drain branch is entered
+	// through lifetimeDrainDue with the pass's sticky read, never through a
+	// bare removeTime check that would drain a sticky exit
+	drainCondition := body[:drainAt]
+	drainCondition = drainCondition[strings.LastIndex(drainCondition, "if "):]
+	if !strings.Contains(drainCondition, "lifetimeDrainDue(stats, startTime, stickyExit)") {
+		t.Errorf("the drain branch is entered by %q, want lifetimeDrainDue(stats, startTime, stickyExit): a Fixed IP exit would drain hourly", strings.TrimSpace(drainCondition))
+	}
 }
 
 // --- item 5: the standing reserve ---
@@ -420,29 +429,35 @@ func TestStandingReserveTargetTable(t *testing.T) {
 		hardMax          int
 		standingReserve  bool
 		fixedDestination bool
+		stickyExit       bool
 		want             int
 	}{
 		// the speed window's shape: fixed size 1, hard max 4
-		{"speed window", 1, 4, true, false, 2},
+		{"speed window", 1, 4, true, false, false, 2},
 		// the quality window's default shape: its memory ceiling prevents
 		// the reserve from adding a seventh full client graph
-		{"quality window at memory ceiling", 6, 6, true, false, 6},
+		{"quality window at memory ceiling", 6, 6, true, false, false, 6},
 		// the hard max is a hard bound: the spare never breaches it
-		{"at hard max", 4, 4, true, false, 4},
+		{"at hard max", 4, 4, true, false, false, 4},
 		// 0 hard max is unbounded, as everywhere else
-		{"no hard max", 2, 0, true, false, 3},
+		{"no hard max", 2, 0, true, false, false, 3},
 		// target 0 is a disabled window (a non-active fixed-profile window);
 		// a spare would silently re-enable it
-		{"disabled window", 0, 12, true, false, 0},
+		{"disabled window", 0, 12, true, false, false, 0},
 		// the A/B off switch restores exact-target sizing
-		{"reserve off", 3, 12, false, false, 3},
+		{"reserve off", 3, 12, false, false, false, 3},
 		// a fixed destination set cannot produce a spare; asking would leave
 		// every expand pass waiting out its timeout on args that cannot come
-		{"fixed destination", 3, 12, true, true, 3},
+		{"fixed destination", 3, 12, true, true, false, 3},
+		// the user's Fixed IP as the apps send it: size 1 and hard max 0, so
+		// the hard max never bounded the spare. A sticky window holds none
+		{"fixed ip window", 1, 0, true, false, true, 1},
+		// a sticky window that is not the active one stays disabled
+		{"disabled fixed ip window", 0, 0, true, false, true, 0},
 	}
 
 	for _, c := range cases {
-		got := standingReserveTarget(c.target, c.hardMax, c.standingReserve, c.fixedDestination)
+		got := standingReserveTarget(c.target, c.hardMax, c.standingReserve, c.fixedDestination, c.stickyExit)
 		if got != c.want {
 			t.Errorf("%s: standingReserveTarget = %d, want %d", c.name, got, c.want)
 		}
@@ -466,6 +481,7 @@ func TestStandingReserveDefaultsAndOverrideRoundTrip(t *testing.T) {
 		qualityWindow.WindowSizeHardMax,
 		settings.StandingReserve,
 		false,
+		false,
 	), 6)
 
 	reliabilitySettings := ReliabilitySettingsFrom(settings)
@@ -487,5 +503,295 @@ func TestStandingReserveSourceAnchor(t *testing.T) {
 	}
 	if !strings.Contains(body, "standingReserveTarget(") {
 		t.Error("resize does not apply the standing reserve, so failover still starts with a cold connect")
+	}
+}
+
+// --- item 6: the user's Fixed IP (a sticky window) ---
+
+// fixedIpTestProfile is the profile every app sends for Fixed IP: a fixed
+// window type with window min = max = 1, which the sdk turns into
+// FixedWindowSize 1, and WindowSizeHardMax left at 0.
+func fixedIpTestProfile(windowType WindowType) *PerformanceProfile {
+	return &PerformanceProfile{
+		WindowType: windowType,
+		WindowSize: WindowSizeSettings{
+			WindowSizeMin:   1,
+			WindowSizeMax:   1,
+			FixedWindowSize: 1,
+		},
+	}
+}
+
+// unfixedTestProfile is the apps' Quality or Speed profile without Fixed IP:
+// window min 2, max 4, which the sdk leaves unfixed.
+func unfixedTestProfile(windowType WindowType) *PerformanceProfile {
+	return &PerformanceProfile{
+		WindowType: windowType,
+		WindowSize: WindowSizeSettings{
+			WindowSizeMin: 2,
+			WindowSizeMax: 4,
+		},
+	}
+}
+
+// Only the user's Fixed IP is sticky. Auto mode's speed window is
+// FixedWindowSize 1 in its settings, and the predicate must not read it.
+func TestStickyExitProfile(t *testing.T) {
+	AssertEqual(t, stickyExitProfile(fixedIpTestProfile(WindowTypeQuality)), true)
+	AssertEqual(t, stickyExitProfile(fixedIpTestProfile(WindowTypeSpeed)), true)
+
+	AssertEqual(t, stickyExitProfile(nil), false)
+	auto := fixedIpTestProfile(WindowTypeAuto)
+	AssertEqual(t, stickyExitProfile(auto), false)
+	AssertEqual(t, stickyExitProfile(unfixedTestProfile(WindowTypeQuality)), false)
+	AssertEqual(t, stickyExitProfile(unfixedTestProfile(WindowTypeSpeed)), false)
+	fixedTwo := &PerformanceProfile{
+		WindowType: WindowTypeQuality,
+		WindowSize: WindowSizeSettings{
+			WindowSizeMin:   2,
+			WindowSizeMax:   2,
+			FixedWindowSize: 2,
+		},
+	}
+	AssertEqual(t, stickyExitProfile(fixedTwo), false)
+
+	// the window reads its live profile
+	window := &multiClientWindow{}
+	AssertEqual(t, window.stickyExit(), false)
+	window.SetPerformanceProfile(fixedIpTestProfile(WindowTypeSpeed))
+	AssertEqual(t, window.stickyExit(), true)
+	window.SetPerformanceProfile(unfixedTestProfile(WindowTypeSpeed))
+	AssertEqual(t, window.stickyExit(), false)
+}
+
+// The drain decision: past removeTime drains, unless the window is sticky or
+// rotation is disabled.
+func TestLifetimeDrainDue(t *testing.T) {
+	now := time.Now()
+	past := &clientWindowStats{removeTime: now.Add(-time.Minute)}
+	future := &clientWindowStats{removeTime: now.Add(time.Minute)}
+	disabled := &clientWindowStats{}
+
+	AssertEqual(t, lifetimeDrainDue(past, now, false), true)
+	AssertEqual(t, lifetimeDrainDue(future, now, false), false)
+	AssertEqual(t, lifetimeDrainDue(disabled, now, false), false)
+
+	AssertEqual(t, lifetimeDrainDue(past, now, true), false)
+	AssertEqual(t, lifetimeDrainDue(future, now, true), false)
+}
+
+// stickyTestWindow runs a live window -- resize, the enumerator and the
+// watchdogs -- of one type and profile against a generator, with the fast
+// passes of TestWindowResizeTargetHeldWhileDegraded.
+func stickyTestWindow(
+	t *testing.T,
+	generator MultiClientGenerator,
+	windowType WindowType,
+	performanceProfile *PerformanceProfile,
+) *multiClientWindow {
+	t.Helper()
+	resetBackendDegraded()
+	t.Cleanup(resetBackendDegraded)
+
+	settings := DefaultMultiClientSettings()
+	settings.WindowResizeTimeout = 20 * time.Millisecond
+	settings.WindowExpandTimeout = 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return newMultiClientWindow(
+		ctx,
+		cancel,
+		generator,
+		nil,
+		nil,
+		false,
+		nil,
+		DisableSecurityPolicy(),
+		func(*multiClientChannel) {},
+		windowType,
+		performanceProfile,
+		settings,
+		func() *ReliabilitySettings { return ReliabilitySettingsFrom(settings) },
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+}
+
+// stickyTestTarget is the resize target an empty live window publishes. An
+// empty window computes the same target on every pass, and publishes it for
+// the length of each expand, so the first published value decides it; a
+// short tail of further samples guards against reading a transient.
+func stickyTestTarget(t *testing.T, window *multiClientWindow) int {
+	t.Helper()
+	maxTarget := 0
+	var firstTime time.Time
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if event := window.monitor.WindowExpandEvent(); event != nil {
+			maxTarget = max(maxTarget, event.TargetSize)
+		}
+		if 0 < maxTarget && firstTime.IsZero() {
+			firstTime = time.Now()
+		}
+		if !firstTime.IsZero() && 250*time.Millisecond <= time.Since(firstTime) {
+			return maxTarget
+		}
+		if deadline.Before(time.Now()) {
+			t.Fatal("the window published no resize target")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// The standing reserve made a Fixed IP window hold two exits: the apps leave
+// WindowSizeHardMax at 0, so nothing bounded the spare, and the spare is a
+// second selectable egress ip. End to end through the live resize loop, a
+// Fixed IP window of either type now asks for exactly one exit.
+func TestStickyExitSkipsStandingReserve(t *testing.T) {
+	for _, windowType := range []WindowType{WindowTypeQuality, WindowTypeSpeed} {
+		window := stickyTestWindow(t, &testingEmptyMultiClientGenerator{}, windowType, fixedIpTestProfile(windowType))
+		if target := stickyTestTarget(t, window); target != 1 {
+			t.Errorf("Fixed IP %s window asks for %d exits, want 1: a standing spare is a second egress ip", windowType.RankMode(), target)
+		}
+	}
+}
+
+// Rotation's capacity insurance stays everywhere else: auto mode's speed
+// window and the Quality and Speed profiles without Fixed IP keep the spare.
+func TestAutoAndUnfixedWindowsKeepStandingReserve(t *testing.T) {
+	cases := []struct {
+		name               string
+		windowType         WindowType
+		performanceProfile *PerformanceProfile
+		// the computed target plus the one spare
+		want int
+	}{
+		{"auto speed window", WindowTypeSpeed, nil, 2},
+		{"speed without fixed ip", WindowTypeSpeed, unfixedTestProfile(WindowTypeSpeed), 3},
+		{"quality without fixed ip", WindowTypeQuality, unfixedTestProfile(WindowTypeQuality), 3},
+	}
+	for _, c := range cases {
+		window := stickyTestWindow(t, &testingEmptyMultiClientGenerator{}, c.windowType, c.performanceProfile)
+		if target := stickyTestTarget(t, window); target != c.want {
+			t.Errorf("%s asks for %d exits, want %d (target and its standing spare)", c.name, target, c.want)
+		}
+	}
+}
+
+// stickyTestPastLifetimeChannel is a bare exit past its lifetime: its first
+// event was two lifetimes ago, so its removeTime has passed. It has no
+// transport, no traffic and no flows, which reads as healthy (0/0), so a
+// resize pass judges it on the lifetime alone.
+func stickyTestPastLifetimeChannel() *multiClientChannel {
+	client := stallTestChannel()
+	client.ctx = context.Background()
+	client.log = DefaultLogger()
+	client.cancel = func() {}
+	client.clientReceiveUnsub = func() {}
+	client.args = &multiClientChannelArgs{
+		MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{
+			ClientId: NewId(),
+		},
+		Destination: RequireMultiHopId(NewId()),
+	}
+	client.effectiveLifetime = time.Hour
+	client.firstEventTime = time.Now().Add(-2 * time.Hour)
+	return client
+}
+
+// installStickyTestChannel puts an exit in the live window as expand admits
+// one, and wakes resize.
+func installStickyTestChannel(window *multiClientWindow, client *multiClientChannel) {
+	func() {
+		window.stateLock.Lock()
+		defer window.stateLock.Unlock()
+		window.clients[client.ClientId()] = client
+	}()
+	window.noteClientAdded(client)
+	window.resizeMonitor.NotifyAll()
+}
+
+// waitStickyTestResizePasses waits until resize has read the exit's stats on
+// at least `passes` separate passes. In a bare window only the resize pass
+// reads a bare exit's stats (it has no blackhole or ping loop of its own),
+// and every read of a traffic-free exit moves lastHealthyTime, so each
+// observed move is at least one pass; by the second, the first pass's
+// classification has finished.
+func waitStickyTestResizePasses(t *testing.T, client *multiClientChannel, passes int) {
+	t.Helper()
+	lastHealthyTime := func() time.Time {
+		client.stateLock.Lock()
+		defer client.stateLock.Unlock()
+		return client.lastHealthyTime
+	}
+	last := lastHealthyTime()
+	deadline := time.Now().Add(30 * time.Second)
+	for seen := 0; seen < passes; {
+		if current := lastHealthyTime(); last.Before(current) {
+			seen += 1
+			last = current
+			continue
+		}
+		if deadline.Before(time.Now()) {
+			t.Fatalf("resize read the exit on %d passes, want %d", seen, passes)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// The lifetime drain warned even the rank-0 exit of a FixedWindowSize=1
+// window, so a Fixed IP session moved its new flows (and its quic flows, by
+// migration) to another egress ip every 45-60 minutes. A past-lifetime exit
+// of a Fixed IP window now stays selectable.
+func TestStickyExitSkipsLifetimeDrain(t *testing.T) {
+	for _, windowType := range []WindowType{WindowTypeSpeed, WindowTypeQuality} {
+		window := stickyTestWindow(t, &testingEmptyMultiClientGenerator{}, windowType, fixedIpTestProfile(windowType))
+		client := stickyTestPastLifetimeChannel()
+		installStickyTestChannel(window, client)
+		waitStickyTestResizePasses(t, client, 3)
+
+		if client.isWarning() {
+			t.Fatalf("Fixed IP %s window warned its past-lifetime exit (%s): new flows leave its egress ip", windowType.RankMode(), client.warningCause())
+		}
+		if !slices.Contains(window.OrderedClients(), client) {
+			t.Fatalf("Fixed IP %s window no longer offers its exit to new flows", windowType.RankMode())
+		}
+	}
+}
+
+// The f36c6e6f intent holds outside Fixed IP: auto mode (both windows) and
+// the Quality and Speed profiles without Fixed IP drain a past-lifetime exit
+// out of new-flow selection.
+func TestAutoSpeedWindowStillDrains(t *testing.T) {
+	cases := []struct {
+		name               string
+		windowType         WindowType
+		performanceProfile *PerformanceProfile
+	}{
+		{"auto speed window", WindowTypeSpeed, nil},
+		{"auto quality window", WindowTypeQuality, nil},
+		{"speed without fixed ip", WindowTypeSpeed, unfixedTestProfile(WindowTypeSpeed)},
+		{"quality without fixed ip", WindowTypeQuality, unfixedTestProfile(WindowTypeQuality)},
+	}
+	for _, c := range cases {
+		window := stickyTestWindow(t, &testingEmptyMultiClientGenerator{}, c.windowType, c.performanceProfile)
+		client := stickyTestPastLifetimeChannel()
+		installStickyTestChannel(window, client)
+
+		deadline := time.Now().Add(30 * time.Second)
+		for client.warningCause() != warnDraining {
+			if deadline.Before(time.Now()) {
+				t.Fatalf("%s did not drain its past-lifetime exit (warning %s)", c.name, client.warningCause())
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if slices.Contains(window.OrderedClients(), client) {
+			t.Fatalf("%s still offers its draining exit to new flows", c.name)
+		}
 	}
 }

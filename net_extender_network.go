@@ -110,8 +110,9 @@ type ExtenderNetworkClientSettings struct {
 	// the mesh deliver, and are never removed by policy.
 	ManualHosts []string
 
-	// DohSettings configures the bootstrap resolution. Nil takes the strategy
-	// settings.
+	// DohSettings configures the bootstrap resolution. Nil takes the DoH
+	// settings the strategy has in force at each pass, which a user's
+	// bootstrap DoH servers replace on a running strategy.
 	DohSettings *DohSettings
 
 	// The only clock this client reads. Tests install a fake one.
@@ -691,16 +692,16 @@ func (self *ExtenderNetworkClient) bootstrap() {
 	self.bootstrapDnsAddresses(ctx)
 }
 
-// The default bootstrap TXT resolution: over the strategy's DoH settings, with
-// the system resolver as the fallback when DoH yields nothing, mirroring
-// resolveDns.
+// The default bootstrap TXT resolution: over the strategy's DoH settings in
+// force, with the system resolver as the fallback when DoH yields nothing,
+// mirroring resolveDns.
 func (self *ExtenderNetworkClient) resolveDnsTxt(
 	ctx context.Context,
 	name string,
 ) ([]string, error) {
 	dohSettings := self.settings.DohSettings
 	if dohSettings == nil && self.clientStrategy != nil {
-		dohSettings = self.clientStrategy.settings.DohSettings
+		dohSettings = self.clientStrategy.DohSettings()
 	}
 	if dohSettings != nil {
 		if txts := DohQueryTxt(ctx, dohSettings, name); 0 < len(txts) {

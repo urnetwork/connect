@@ -15,7 +15,8 @@ package connect
 //   - an initial payload that looks fully encrypted/random AND is NOT a
 //     whitelisted standard (TLS, DTLS, QUIC, STUN/TURN, RTP/RTCP), an
 //     application standard (WireGuard, OpenVPN, RTMP, Levin, RakNet, Ethereum
-//     discovery v4 or RLPx), or an exact provider-scoped gaming endpoint -> Drop
+//     discovery v4 or RLPx), or an exact provider-scoped gaming or messaging
+//     endpoint -> Drop
 //   - anything else (plaintext unknown protocol, a sanctioned standard/provider
 //     endpoint, or budget exhausted without a hit) -> Allow
 //
@@ -29,7 +30,8 @@ package connect
 // QUIC RFC 9000/9369; STUN RFC 8489; TURN RFC 8656; RTP/RTCP RFC 3550 and
 // RFC 7983. The byte signatures are protocol facts, not derived from any
 // third-party implementation. Provider prefix/port facts live separately in
-// ip_security_gaming.go with their first-party sources.
+// ip_security_gaming.go and ip_security_messaging.go with their first-party
+// sources.
 
 import (
 	"bytes"
@@ -85,6 +87,13 @@ type DmcaSecurityPolicySettings struct {
 	// after positive BitTorrent signatures but before the encrypted heuristic.
 	// Nil disables all gaming exceptions.
 	Gaming *GamingSecurityPolicySettings
+
+	// Messaging configures provider-scoped messaging exceptions (WhatsApp on
+	// Meta's own address space). Like the gaming exceptions they are evaluated
+	// after positive BitTorrent signatures but before the encrypted heuristic,
+	// and an allowed flow keeps checking the signatures for its whole
+	// inspection budget. Nil disables all messaging exceptions.
+	Messaging *MessagingSecurityPolicySettings
 
 	// App configures the positive application-standard detectors (WireGuard,
 	// OpenVPN, RTMP, Levin, RakNet, Ethereum discovery v4 and RLPx). They are
@@ -142,6 +151,7 @@ func DefaultDmcaSecurityPolicySettings() *DmcaSecurityPolicySettings {
 		ReportBittorrentIncident:      true,
 		DropUnsanctionedEncrypted:     true,
 		Gaming:                        DefaultGamingSecurityPolicySettings(),
+		Messaging:                     DefaultMessagingSecurityPolicySettings(),
 		App:                           DefaultAppStandardSettings(),
 		InspectPrivilegedSignatures:   true,
 		InspectionPacketBudget:        8,
@@ -356,6 +366,13 @@ func (self *dmcaFlowState) advance(
 		// evidence for the Steam exception. The positive BitTorrent checks above
 		// intentionally retain precedence.
 		return self.setTerminal(dmcaAllow, SecurityPolicyReasonAllowGaming)
+	}
+	if isSanctionedMessagingEndpoint(settings.Messaging, ipPath) {
+		// Vendor prefix + transport + chat port admits the WhatsApp exception.
+		// Unlike the Steam exception the allow is not terminal at once: like
+		// an application standard it keeps the BitTorrent signatures above in
+		// force for the rest of the inspection budget.
+		return self.allowAppStandard(SecurityPolicyReasonAllowMessaging, settings)
 	}
 	if reason, ok := web.matchReason(ipPath, payload); ok {
 		// A sanctioned web/communication standard. Full framing is evaluated over

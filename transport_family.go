@@ -211,11 +211,11 @@ func udpAddrFamily(udpAddr *net.UDPAddr) int {
 }
 
 // NewDirectClientStrategy builds the client strategy a family-pinned platform
-// transport dials with: the caller's settings without extenders and without a
-// proxy, so every dial is direct and the observed remote family is the
-// family the provider actually has (A4), and with the pin enforced below name
-// resolution. Each pinned transport owns one, which also gives it connect
-// pacing independent of the process-wide strategy (A5).
+// transport dials with: the caller's settings without extenders, VLESS
+// servers or a proxy, so every dial is direct and the observed remote family
+// is the family the provider actually has (A4), and with the pin enforced
+// below name resolution. Each pinned transport owns one, which also gives it
+// connect pacing independent of the process-wide strategy (A5).
 //
 // The caller's settings are not mutated. An injected DialContextSettings
 // (headless hosts) is kept as the inner dial so a source-identity seam still
@@ -228,6 +228,8 @@ func NewDirectClientStrategy(ctx context.Context, settings *ClientStrategySettin
 	direct.ExpandExtenderProfileCount = 0
 	direct.MaxExtenderCount = 0
 	direct.ConnectSettings.ProxySettings = nil
+	// a VLESS server would prove its own family, as a proxy would
+	direct.VlessConfigs = nil
 
 	ipFamily = normalizeIpFamily(ipFamily)
 	// the alt carriers dial udp themselves, below any dial context, so the pin

@@ -4,7 +4,6 @@ package connect
 
 import (
 	"container/heap"
-	"context"
 	"errors"
 	"time"
 )
@@ -159,10 +158,7 @@ func (self *SendSequence) nextAckLifetime(now time.Time) (time.Time, error) {
 			heap.Fix(&self.ackLifetimes, 0)
 			continue
 		}
-		// Record the due identity here, including when a paced/route write
-		// will cancel this sequence before Run gets control back.
-		self.recordSendSequenceExit("ack_lifetime", item, deadline, context.DeadlineExceeded)
-		return deadline, context.DeadlineExceeded
+		return deadline, self.ackLifetimeDisposition(item, deadline)
 	}
 	return time.Time{}, nil
 }

@@ -939,6 +939,10 @@ func TestPeekClaim(t *testing.T) {
 		{"v6 tcp 53", mkv6(tcp, 53), peekDns},
 		{"v6 tcp 443", mkv6(tcp, 443), peekTls},
 		{"v6 udp 53", mkv6(udp, 53), peekDns},
+		{"v4 tcp 853", mkv4(tcp, 853), peekDot},
+		{"v6 tcp 853", mkv6(tcp, 853), peekDot},
+		{"v4 udp 853", mkv4(udp, 853), peekOther},
+		{"v6 udp 853", mkv6(udp, 853), peekOther},
 		{"v6 extension header", mkv6(hopopt, 80), peekUndecided},
 		{"short", []byte{0x45, 0x00}, peekUndecided},
 		{"empty", nil, peekUndecided},
@@ -1498,4 +1502,235 @@ func TestUpgradeMuxShedMemory(t *testing.T) {
 			t.Fatalf("resolver query cache survives shed: %d entries", len(dohCache.queryResultExpiration))
 		}
 	}()
+}
+
+// --- DoT toward the DNS stand-in (Android Private DNS) ---
+
+// dotTestSourcePort is the client port of the DoT probes below.
+const dotTestSourcePort = 47053
+
+// dotTestSyn is the first segment of a DoT dial: a TCP SYN from the tunnel to
+// port 853 of a destination, with a valid checksum so the reset built from it
+// can be checked end to end.
+func dotTestSyn(source netip.Addr, destination netip.Addr, seq uint32) []byte {
+	sourceIp := net.IP(source.AsSlice())
+	destinationIp := net.IP(destination.AsSlice())
+	headerByteCount := Ipv4HeaderSizeWithoutExtensions
+	if destination.Is6() {
+		headerByteCount = Ipv6HeaderSize
+	}
+	packet := make([]byte, headerByteCount+TcpHeaderSizeWithoutExtensions)
+	if destination.Is6() {
+		writeIpv6Header(packet, ipProtocolNumberTcp, sourceIp, destinationIp)
+	} else {
+		writeIpv4Header(packet, ipProtocolNumberTcp, sourceIp, destinationIp)
+	}
+	tcp := packet[headerByteCount:]
+	binary.BigEndian.PutUint16(tcp[0:2], dotTestSourcePort)
+	binary.BigEndian.PutUint16(tcp[2:4], 853)
+	binary.BigEndian.PutUint32(tcp[4:8], seq)
+	tcp[12] = byte(TcpHeaderSizeWithoutExtensions/4) << 4
+	tcp[13] = byte(tcpFlagSyn)
+	binary.BigEndian.PutUint16(tcp[14:16], 65535)
+	binary.BigEndian.PutUint16(tcp[16:18], transportChecksum(ipProtocolNumberTcp, sourceIp, destinationIp, tcp))
+	return packet
+}
+
+// dotTestStandIn is the default DNS stand-in of one family.
+func dotTestStandIn(ipVersion int) netip.Addr {
+	if ipVersion == 6 {
+		return netip.MustParseAddr(DefaultDnsUpgradeMaskAddressIpv6)
+	}
+	return netip.MustParseAddr(DefaultDnsUpgradeMaskAddress)
+}
+
+// dotTestResolver is a real DoT resolver of one family (Quad9).
+func dotTestResolver(ipVersion int) netip.Addr {
+	if ipVersion == 6 {
+		return netip.MustParseAddr("2620:fe::fe")
+	}
+	return netip.MustParseAddr("9.9.9.9")
+}
+
+// newDotTestMux is an UpgradeMux with the given settings over a recorder.
+func newDotTestMux(t *testing.T, settings *UpgradeMuxSettings) (*UpgradeMux, *ipMuxRecorder) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	rec := &ipMuxRecorder{}
+	mux, err := NewUpgradeMux(ctx, TransferPath{}, protocol.ProvideMode_Network, 0, rec.receive, settings, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mux.Close)
+	mux.SetUpstream(rec.upstream)
+	return mux, rec
+}
+
+// assertDotTestReset checks that the only downstream packet is the reset a
+// closed port answers a SYN with: RST|ACK acknowledging the SYN, from the
+// stand-in's 853 back to the probe's port, with a valid checksum.
+func assertDotTestReset(t *testing.T, rec *ipMuxRecorder, source netip.Addr, destination netip.Addr, seq uint32) {
+	t.Helper()
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.sent) != 0 {
+		t.Fatalf("the probe to %s:853 was forwarded to an exit (%d packets)", destination, len(rec.sent))
+	}
+	if len(rec.received) != 1 {
+		t.Fatalf("downstream got %d packets for the probe to %s:853, want the one reset", len(rec.received), destination)
+	}
+	reset := rec.received[0]
+	var ipProtocol ipProtocolNumber
+	var sourceIp, destinationIp net.IP
+	var transport []byte
+	var ok bool
+	if destination.Is6() {
+		ipProtocol, sourceIp, destinationIp, transport, ok = parseIpv6(reset)
+	} else {
+		ipProtocol, sourceIp, destinationIp, transport, ok = parseIpv4(reset)
+	}
+	if !ok || ipProtocol != ipProtocolNumberTcp {
+		t.Fatal("the local answer is not tcp")
+	}
+	var tcp parsedTcp
+	if !parseTcpPacket(sourceIp, destinationIp, transport, &tcp) {
+		t.Fatal("could not parse the local answer")
+	}
+	if !tcp.rst || !tcp.ack || tcp.syn || tcp.ackNumber != seq+1 {
+		t.Fatalf("local answer rst=%t ack=%t syn=%t ackNumber=%d, want the RST|ACK of a closed port acknowledging %d", tcp.rst, tcp.ack, tcp.syn, tcp.ackNumber, seq+1)
+	}
+	if !sourceIp.Equal(net.IP(destination.AsSlice())) || !destinationIp.Equal(net.IP(source.AsSlice())) {
+		t.Fatalf("reset addresses %s -> %s, want %s -> %s", sourceIp, destinationIp, destination, source)
+	}
+	if tcp.sourcePort != 853 || tcp.destinationPort != dotTestSourcePort {
+		t.Fatalf("reset ports %d -> %d, want 853 -> %d", tcp.sourcePort, tcp.destinationPort, dotTestSourcePort)
+	}
+	if checksum := transportChecksum(ipProtocolNumberTcp, sourceIp, destinationIp, transport); checksum != 0 {
+		t.Fatalf("reset checksum verification = %#x, want 0", checksum)
+	}
+}
+
+// Android in Automatic Private DNS mode probes DoT on 853 of the tunnel's DNS
+// server, which is the stand-in nothing serves. The probe used to be dialed
+// out through an exit and wait out its timeout; it is now refused locally at
+// once, on both families, so the device falls back to the :53 the mux owns.
+func TestUpgradeMuxDotToStandInIsResetLocally(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		mux, rec := newDotTestMux(t, DefaultUpgradeMuxSettings())
+		source := tunTestLocalAddress(t, mux.mux.Tun(), ipVersion)
+		standIn := dotTestStandIn(ipVersion)
+
+		if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dotTestSyn(source, standIn, 7000), 0) {
+			t.Fatal("the probe to the stand-in was not handled")
+		}
+		assertDotTestReset(t, rec, source, standIn, 7000)
+	})
+}
+
+// The batch path routes one exact flow at a time and refuses it the same way.
+func TestUpgradeMuxDotBatchToStandInIsResetLocally(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		mux, rec := newDotTestMux(t, DefaultUpgradeMuxSettings())
+		source := tunTestLocalAddress(t, mux.mux.Tun(), ipVersion)
+		standIn := dotTestStandIn(ipVersion)
+
+		if sent := mux.SendPacketBatch(TransferPath{}, protocol.ProvideMode_Network, [][]byte{dotTestSyn(source, standIn, 7100)}, 0); sent != 1 {
+			t.Fatalf("batch handled %d packets, want 1", sent)
+		}
+		assertDotTestReset(t, rec, source, standIn, 7100)
+	})
+}
+
+// An IPv6 probe behind an extension header is classified through the chain
+// and refused the same way.
+func TestUpgradeMuxDotToStandInWithIpv6ExtensionIsResetLocally(t *testing.T) {
+	mux, rec := newDotTestMux(t, DefaultUpgradeMuxSettings())
+	source := tunTestLocalAddress(t, mux.mux.Tun(), 6)
+	standIn := dotTestStandIn(6)
+	syn := testIpv6Tcp(
+		source.String(),
+		standIn.String(),
+		[]testIpv6Ext{{kind: ipv6NextHeaderDestinationOptions}},
+		dotTestSourcePort,
+		853,
+		byte(tcpFlagSyn),
+		7200,
+		nil,
+	)
+	if got := peekClaim(syn, &tlsSegment{}); got != peekDot {
+		t.Fatalf("fixture peeks as %d, want peekDot through the extension chain", got)
+	}
+	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, syn, 0) {
+		t.Fatal("the probe to the stand-in was not handled")
+	}
+	assertDotTestReset(t, rec, source, standIn, 7200)
+}
+
+// DoT to a real resolver -- strict Private DNS, or any app's own DoT -- is
+// never touched: it is forwarded byte for byte, singly and in a batch.
+func TestUpgradeMuxDotToResolverPassesThrough(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		mux, rec := newDotTestMux(t, DefaultUpgradeMuxSettings())
+		source := tunTestLocalAddress(t, mux.mux.Tun(), ipVersion)
+		resolver := dotTestResolver(ipVersion)
+
+		syn := dotTestSyn(source, resolver, 8000)
+		if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, slices.Clone(syn), 0) {
+			t.Fatal("the probe to the resolver was not forwarded")
+		}
+		if sent := mux.SendPacketBatch(TransferPath{}, protocol.ProvideMode_Network, [][]byte{slices.Clone(syn)}, 0); sent != 1 {
+			t.Fatalf("batch forwarded %d packets, want 1", sent)
+		}
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		if len(rec.received) != 0 {
+			t.Fatalf("DoT to %s was answered locally", resolver)
+		}
+		if len(rec.sent) != 2 {
+			t.Fatalf("DoT to %s forwarded %d packets, want 2", resolver, len(rec.sent))
+		}
+		for _, forwarded := range rec.sent {
+			if !slices.Equal(forwarded, syn) {
+				t.Fatalf("DoT to %s was rewritten on its way out", resolver)
+			}
+		}
+	})
+}
+
+// The stand-in is whatever the resolver settings advertise, plus the defaults
+// of both families. With DNS interception off the mux owns no stand-in, and
+// the probe passes through like any other flow.
+func TestUpgradeMuxDotStandInFollowsResolverSettings(t *testing.T) {
+	settings := DefaultUpgradeMuxSettings()
+	settings.Dns.Resolver.DnsUpgradeMaskAddress = "203.0.113.53"
+	mux, rec := newDotTestMux(t, settings)
+	source := tunTestLocalAddress(t, mux.mux.Tun(), 4)
+	customStandIn := netip.MustParseAddr("203.0.113.53")
+	mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dotTestSyn(source, customStandIn, 9000), 0)
+	assertDotTestReset(t, rec, source, customStandIn, 9000)
+
+	mux, rec = newDotTestMux(t, settings)
+	defaultStandIn := dotTestStandIn(4)
+	mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dotTestSyn(source, defaultStandIn, 9100), 0)
+	assertDotTestReset(t, rec, source, defaultStandIn, 9100)
+
+	passthrough := DefaultUpgradeMuxSettings()
+	passthrough.Dns = nil
+	mux, rec = newDotTestMux(t, passthrough)
+	mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, dotTestSyn(source, defaultStandIn, 9200), 0)
+	if sent, received := rec.counts(); sent != 1 || received != 0 {
+		t.Fatalf("with DNS interception off the probe was sent=%d answered=%d, want forwarded", sent, received)
+	}
+}
+
+// The default stand-ins are the literals the sdk advertises to the platform:
+// the IPv4 mask and the documentation-prefix IPv6 counterpart.
+func TestDefaultDnsStandIns(t *testing.T) {
+	v4 := netip.MustParseAddr(DefaultDnsUpgradeMaskAddress)
+	v6 := netip.MustParseAddr(DefaultDnsUpgradeMaskAddressIpv6)
+	AssertEqual(t, v4.Is4(), true)
+	AssertEqual(t, v6.Is6() && !v6.Is4In6(), true)
+	AssertEqual(t, netip.MustParsePrefix("2001:db8::/32").Contains(v6), true)
+	AssertEqual(t, defaultDnsStandIns[:], []netip.Addr{v4, v6})
 }

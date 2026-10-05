@@ -167,6 +167,18 @@ type MultiClientGeneratorWithIpFamily interface {
 	NextDestinationsWithIpFamily(count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error)
 }
 
+// MultiClientGeneratorWithClientId is an optional generator capability:
+// discover one named provider instead of the generator's own specs. A sticky
+// window (the user's Fixed IP) uses it to ask for the exit it lost to
+// transport loss before it falls back to discovery, so a provider that is
+// still online comes back with the same egress ip. The platform applies its
+// usual exclusions to the named provider: an answer without it means "not
+// that provider". A generator without the capability is never asked, and the
+// window discovers as before.
+type MultiClientGeneratorWithClientId interface {
+	NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error)
+}
+
 func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
 		SequenceBufferSize:  defaultTransferBufferSize,
@@ -9909,6 +9921,11 @@ func jitterClientLifetime(maxClientLifetime time.Duration) time.Duration {
 //     nothing beyond the set to hold in reserve, and asking for it would
 //     leave every expand pass waiting out its timeout on args that cannot
 //     arrive,
+//   - the window is the user's Fixed IP (stickyExit, see stickyExitProfile):
+//     a spare is a second selectable exit, so new flows could leave on
+//     another egress ip. The apps leave WindowSizeHardMax at 0, so the hard
+//     max never stopped it. Failover for a sticky window goes back to the
+//     backfill the reserve shortened, which is the trade the user chose,
 //   - the computed target is 0, which is how resize disables a non-active
 //     fixed-profile window -- a spare there would silently re-enable it.
 func standingReserveTarget(
@@ -9916,8 +9933,9 @@ func standingReserveTarget(
 	windowSizeHardMax int,
 	standingReserve bool,
 	fixedDestination bool,
+	stickyExit bool,
 ) int {
-	if !standingReserve || fixedDestination || targetWindowSize <= 0 {
+	if !standingReserve || fixedDestination || stickyExit || targetWindowSize <= 0 {
 		return targetWindowSize
 	}
 	reserveTargetWindowSize := targetWindowSize + standingReserveSpares
@@ -10128,6 +10146,12 @@ type multiClientWindow struct {
 	ipv6ProbeRequested bool
 	ipv6CandidateReady bool
 	ipv6FillFailures   int
+
+	// --- the user's Fixed IP (see ip_remote_multi_client_sticky.go) ---
+
+	// stickyRedial holds the exit a sticky window lost to transport loss,
+	// for the next discovery round to ask for first. Its own lock inside.
+	stickyRedial stickyRedial
 }
 
 func newMultiClientWindow(
@@ -10613,6 +10637,8 @@ func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *Perform
 		return
 	}
 	self.performanceProfile = performanceProfile
+	// a lost exit is only wanted back under the profile it was lost in
+	self.stickyRedial.Forget()
 	if self.resizeMonitor != nil {
 		self.resizeMonitor.NotifyAll()
 	}
@@ -10879,6 +10905,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						DestinationStats:               stats,
 						MultiClientGeneratorClientArgs: *clientArgs,
 						FixedDestination:               fixedDestination,
+						stickyRedial:                   enumerated.stickyRedial,
 					}
 					select {
 					case <-self.ctx.Done():
@@ -10913,6 +10940,9 @@ func (self *multiClientWindow) resize() {
 
 		var windowSize WindowSizeSettings
 		var fixedWindowType *WindowType
+		// read with the size, under the same lock, so one pass never sizes
+		// for one profile and rotates for another
+		var stickyExit bool
 		func() {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
@@ -10922,6 +10952,7 @@ func (self *multiClientWindow) resize() {
 			} else {
 				windowSize = self.settings.WindowSizes[self.windowType]
 			}
+			stickyExit = stickyExitProfile(self.performanceProfile)
 		}()
 
 		startTime := time.Now()
@@ -11014,6 +11045,10 @@ func (self *multiClientWindow) resize() {
 						"flows", self.flowCount(client),
 					),
 				)
+				// the user's Fixed IP lost its exit to transport loss, not to
+				// a verdict against the provider: ask for the same provider
+				// first (see stickyRedial)
+				self.rememberStickyRedial(client, err, stickyExit)
 				removeClient(client)
 			}
 		}
@@ -11097,7 +11132,7 @@ func (self *multiClientWindow) resize() {
 				// a client after its `removeTime` will be in a permananent warning state as long as it continues to route traffic
 				// this prevents new connections from using the client
 				if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
-					if !stats.removeTime.IsZero() && stats.removeTime.Before(startTime) {
+					if lifetimeDrainDue(stats, startTime, stickyExit) {
 						printStats("client drain")
 						// a past-lifetime client always warns, regardless of
 						// the remove-rank math above. `remove` is a health
@@ -11112,7 +11147,10 @@ func (self *multiClientWindow) resize() {
 						// rotation was silently a no-op for exactly the exit
 						// it matters most for. Draining is rotation policy,
 						// not a health verdict, so the rank shield does not
-						// apply. The warning only stops NEW flows from
+						// apply. The one window that never drains is the
+						// user's Fixed IP (stickyExit), and lifetimeDrainDue
+						// has already excluded it: there the stable egress ip
+						// is the point. The warning only stops NEW flows from
 						// choosing this client (established flows keep
 						// running until they finish or the collapse deadline
 						// passes), and warnClient counts it in
@@ -11451,12 +11489,15 @@ func (self *multiClientWindow) resize() {
 		// answers "how many exits does the traffic need", the reserve answers
 		// "how many failures can be absorbed without a connect in the
 		// recovery path". windowSizeMin is deliberately untouched -- the
-		// spare must never make the window read as unsatisfied.
+		// spare must never make the window read as unsatisfied. The user's
+		// Fixed IP holds no spare: a second selectable exit is a second
+		// egress ip (see standingReserveTarget).
 		targetWindowSize = standingReserveTarget(
 			targetWindowSize,
 			windowSize.WindowSizeHardMax,
 			self.reliabilitySettings().StandingReserve,
 			fixedDestination,
+			stickyExit,
 		)
 
 		// while the control API is unreachable, hold the window at its
@@ -12381,6 +12422,14 @@ requestCandidates:
 					}
 				})
 			}
+			if err == nil && args.stickyRedial {
+				// a sticky window's lost exit is evaluated alone: a second
+				// candidate in the pool would be admitted whenever it answers
+				// first, and the re-dial exists to keep the egress ip. A failed
+				// evaluation ends this pass empty, and the next pass discovers
+				// as usual (the enumerator took the re-dial).
+				break requestCandidates
+			}
 		case <-time.After(timeout):
 			self.log.V(2).Infof("[multi]expand window timeout waiting for args\n")
 			break requestCandidates
@@ -12751,6 +12800,8 @@ func (self *multiClientWindow) verdictRemovalAllowed(now time.Time) bool {
 }
 
 func (self *multiClientWindow) shuffle() {
+	// a shuffle asks for new exits, so a lost exit is not dialed again
+	self.stickyRedial.Forget()
 	for _, client := range self.unorderedClients() {
 		client.Cancel()
 	}
@@ -13134,6 +13185,12 @@ type multiClientChannelArgs struct {
 	// reads as v6 available, and it is never a family-swap victim
 	// (IPV6.md B1 exempts fixed windows from the soft minimum).
 	FixedDestination bool
+
+	// stickyRedial marks the exit a sticky window lost to transport loss,
+	// asked for again by name (enumerateStickyRedial). expand evaluates it
+	// alone, so a faster candidate cannot take the slot and change the
+	// egress ip the re-dial exists to keep.
+	stickyRedial bool
 
 	// contractStatus preserves the identity of the channel whose contract
 	// manager emitted a result. The public constructor callback does not carry

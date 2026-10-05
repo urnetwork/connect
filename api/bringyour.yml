@@ -1729,6 +1729,33 @@ paths:
               schema:
                 $ref: "#/components/schemas/GetNetworkReliabilityResult"
 
+  /network/provider-status:
+    get:
+      description: |
+        Why each of the caller network's own provider clients is or is not
+        offered to clients, with how often find-providers2 returned it per
+        minute over the last hour.
+
+        Admission and ranking are decided with the same rules and ranking
+        find-providers2 draws from, for the network's own providers only,
+        and are cached per network for about 5 minutes. The appearance
+        histograms are read fresh on every call. The caller's own client
+        comes first when it is a provider. At most 32 provider clients are
+        decided per answer; `truncated` is set when the network has more.
+
+        Anti-abuse checks are reported only as the generic reason
+        `not_eligible`. Which check applies is never returned.
+      operationId: Network Provider Status
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetProviderStatusResult"
+
   /network/user:
     get:
       description: |
@@ -3836,6 +3863,54 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SolanaPaymentIntentResult"
+        "401":
+          description: Missing or invalid bearer token.
+
+  /solana/payment-transaction:
+    post:
+      tags: [subscription]
+      summary: Build the browser-wallet transfer for a Solana Pay intent
+      description: |
+        The unsigned USDC transfer that pays an open Solana Pay intent of the
+        caller's network (from /solana/payment-intent, or from
+        /pay/data/solana-intent for the caller's own network), for a browser
+        wallet to sign and send through the Wallet Standard
+        `solana:signAndSendTransaction` feature. A desktop browser hands the
+        solana: payment url to an app, never to an extension wallet; with this
+        the page needs no Solana library and no rpc endpoint of its own.
+
+        The transaction is a legacy message with two instructions: a Memo of
+        the reference, then a TransferChecked of exactly the intent's quote
+        (the `amount_usd` it was quoted, 6 decimals) of USDC from `payer`'s
+        associated USDC account to the merchant's, with the reference appended
+        as a read-only account, the way a wallet builds it from the Solana Pay
+        url. The Helius webhook credits it by reference. The merchant, the mint
+        and the amount come from the server; `payer` is the fee payer and the
+        only signer, and the transaction comes back unsigned. Its recent
+        blockhash is good for about a minute, so build it when the buyer
+        clicks. A client should check that the transaction pays only the
+        merchant and the mint it expects, in the quoted amount, before handing
+        it to the wallet.
+
+        An unknown, paid or expired intent, another network's intent, an
+        address or reference that is not a Solana public key, or an
+        unreachable rpc return `error.message` with a 200. Per-ip rate limited.
+      operationId: solanaPaymentTransaction
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SolanaPaymentTransactionArgs"
+      responses:
+        "200":
+          description: The unsigned transaction, or an error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SolanaPaymentTransactionResult"
         "401":
           description: Missing or invalid bearer token.
 
@@ -10621,6 +10696,203 @@ components:
             message:
               type: string
 
+    GetProviderStatusResult:
+      type: object
+      required:
+        - providers
+      properties:
+        providers:
+          description: the caller's own client first when it is a provider, then the network's other provider clients in client id order
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderStatus"
+        truncated:
+          description: the network has more provider clients than one answer decides
+          type: boolean
+
+    ProviderStatus:
+      type: object
+      required:
+        - client_id
+        - reason
+        - reason_text
+        - admission
+        - ranking
+        - evaluate_time
+      properties:
+        client_id:
+          type: string
+          format: uuid
+        reason:
+          description: |
+            The first rule, in this order, that holds the provider back; `none`
+            when it passes them all. `not_eligible` covers every anti-abuse
+            check and never says which.
+          type: string
+          enum:
+            - not_providing
+            - not_connected
+            - location_invalid
+            - network_only
+            - reliability_warming_up
+            - reliability_low
+            - not_eligible
+            - egress_unprobed
+            - egress_failing
+            - speed_test_missing
+            - slow
+            - none
+        reason_text:
+          description: the reason in English
+          type: string
+        admission:
+          $ref: "#/components/schemas/ProviderAdmission"
+        ranking:
+          description: |
+            The numbers find-providers2 admits and orders the provider by, in
+            display order. The mode-level numbers (weight_*, tier_*) are left
+            out when the provider is in no pool (not_providing, not_connected,
+            location_invalid, not_eligible).
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderRankingNumber"
+        country:
+          $ref: "#/components/schemas/ProviderStatusCountry"
+        evaluate_time:
+          description: when the admission and ranking were decided
+          type: string
+          format: date-time
+        appearances:
+          $ref: "#/components/schemas/ProviderAppearanceHistogram"
+
+    ProviderAdmission:
+      type: object
+      required:
+        - connected
+        - location_valid
+        - provide_public
+        - reliability_ok
+        - speed_test_done
+        - egress
+      properties:
+        connected:
+          type: boolean
+        location_valid:
+          description: one current address and a known location
+          type: boolean
+        provide_public:
+          description: offered to every network, not only the provider's own
+          type: boolean
+        reliability_ok:
+          description: every reliability lookback at or above its floor
+          type: boolean
+        speed_test_done:
+          description: a completed speed and latency test
+          type: boolean
+        egress:
+          description: the network check verdict over the last 8 hours
+          type: string
+          enum:
+            - pass
+            - fail
+            - unprobed
+        egress_measured_at:
+          description: the latest network check in the window, absent when unprobed
+          type: string
+          format: date-time
+
+    ProviderRankingNumber:
+      type: object
+      required:
+        - name
+        - has_value
+        - value
+        - has_minimum
+        - minimum
+        - has_maximum
+        - maximum
+        - passes
+        - count
+        - total
+        - explanation
+      properties:
+        name:
+          description: |
+            reliability_5m, reliability_1h, reliability_12h (a share of steady
+            uptime, 0 to 1), url_checks (a share of loaded test sites, with
+            count of total), speed_test (bytes per second), latency
+            (milliseconds above the expected delay), weight_quality,
+            weight_speed (the relative selection weight), tier_quality,
+            tier_speed (0 is best; 3 is past the speed or delay cutoff). A
+            reliability lookback outside these is reliability_lookback_<index>.
+          type: string
+        has_value:
+          type: boolean
+        value:
+          type: number
+          format: double
+        has_minimum:
+          type: boolean
+        minimum:
+          description: the selection's floor
+          type: number
+          format: double
+        has_maximum:
+          type: boolean
+        maximum:
+          description: the selection's ceiling
+          type: number
+          format: double
+        passes:
+          description: false when the number holds the provider back
+          type: boolean
+        count:
+          type: integer
+        total:
+          type: integer
+        explanation:
+          description: what the number means and what raises it, in English
+          type: string
+
+    ProviderStatusCountry:
+      type: object
+      required:
+        - country_code
+        - country
+        - observed_country_code
+        - explanation
+      properties:
+        country_code:
+          description: the country clients are offered the provider under
+          type: string
+        country:
+          type: string
+        observed_country_code:
+          description: the country the latest network check saw the connection exit in, empty for none
+          type: string
+        explanation:
+          type: string
+
+    ProviderAppearanceHistogram:
+      type: object
+      required:
+        - start_minute
+        - bucket_seconds
+        - appearances_per_minute
+      properties:
+        start_minute:
+          description: the unix minute (unix seconds / 60) of the first, oldest bucket
+          type: integer
+          format: int64
+        bucket_seconds:
+          type: integer
+        appearances_per_minute:
+          description: how many times find-providers2 returned the provider in each minute, 60 buckets, oldest first; the last is the current, partial minute
+          type: array
+          items:
+            type: integer
+            format: int64
+
     SolanaPaymentIntentArgs:
       type: object
       required:
@@ -10672,6 +10944,33 @@ components:
         spl_token_mint:
           type: string
           description: the SPL token mint (base58) to pay in (USDC)
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/ErrorMessage"
+            - type: "null"
+
+    SolanaPaymentTransactionArgs:
+      type: object
+      required:
+        - reference
+        - payer
+      properties:
+        reference:
+          type: string
+          description: the reference of an open Solana Pay intent of the caller's network
+        payer:
+          type: string
+          description: the paying wallet's address (base58), as the wallet reported it
+
+    SolanaPaymentTransactionResult:
+      type: object
+      required: []
+      properties:
+        transaction:
+          type: string
+          description: >-
+            the unsigned transaction for the wallet to sign and send: base64 of
+            its wire format, a legacy message
         error:
           oneOf:
             - $ref: "#/components/schemas/ErrorMessage"

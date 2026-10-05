@@ -476,14 +476,15 @@ invariant from a public specification:
 | Ethereum discovery v4 | UDP, any packet while inspecting | `hash ‖ signature (65) ‖ packet-type ‖ packet-data`, 99–1280 bytes, type 1–6, data a canonical RLP list that fits; then `hash == keccak256(signature ‖ packet-type ‖ packet-data)` over the complete packet | devp2p `discv4.md` (Wire Protocol) |
 | Ethereum RLPx | TCP, first payload | the whole segment is the initiator's auth: EIP-8 `auth-size (BE u16) == len − 2`, `auth-size ≥ 282` (ECIES overhead 113 + the minimal RLP auth body 169), then `04 ‖ x ‖ y` an uncompressed secp256k1 point (`x, y < p`, `y² = x³ + 7 mod p`); or the pre-EIP-8 auth, exactly 307 bytes starting with such a point | devp2p `rlpx.md` (Initial Handshake, ECIES), EIP-8, SEC 2 (secp256k1) |
 
-Rules: they run after the BitTorrent signatures, the gaming exception and the web
+Rules: they run after the BitTorrent signatures, the provider exceptions and the web
 standards; an allowed flow keeps checking the BitTorrent signatures until its
 inspection budget is spent, and a single-packet match whose remaining bytes carry
 a BitTorrent signature is `bittorrent`. A two-packet opener is not counted as
 encrypted, so a random BitTorrent flow whose first blob happens to match an opener
 (≈ 2^-32 per flow) is dropped one packet later; repeated openers end at the budget.
 The WhatsApp Noise "WA" framing is **not implemented**: its bytes must first be
-confirmed against a capture. `AppStandardSettings` (`Dmca.App`) has `Enabled`,
+confirmed against a capture. Until then the Meta prefix exception (§4.4.1a) admits
+WhatsApp's TCP/5222. `AppStandardSettings` (`Dmca.App`) has `Enabled`,
 `WireGuard`, `OpenVpn`, `Rtmp`, `Levin`, `RakNet`, `EthereumDiscv4`,
 `EthereumRlpx`, all on by default; nil disables them.
 
@@ -536,6 +537,33 @@ The source data is Valve's
 the settings are nested under `DmcaSecurityPolicySettings.Gaming`. A nil `Gaming`
 setting disables all gaming exceptions.
 
+#### 4.4.1a Meta/WhatsApp provider exception (→ Allow)
+
+`ip_security_messaging.go` allows WhatsApp's chat session only when all three
+dimensions match:
+
+- destination belongs to the address space Meta registers for its own AS32934
+  (23 IPv4 prefixes or 5 IPv6 prefixes, snapshot 2026-10-04);
+- transport is TCP; and
+- the destination port is `5222`, the WhatsApp chat port. `5223` is not included
+  until a capture shows WhatsApp using it.
+
+WhatsApp runs Noise on 5222, and after its short framing header the payload is
+random, so the encrypted heuristic dropped it after `EncryptedDecisionPackets`
+payloads. The exception is evaluated right after the gaming exception. Unlike the
+Steam allow it is not terminal on its first payload: like an application standard
+the flow keeps checking the BitTorrent signatures for its whole inspection budget,
+so a recognized BitTorrent flow to Meta on 5222 is still `bittorrent`. This
+restores legitimate traffic the heuristic falsely drops; it disables no detector.
+
+The source data is the `route`/`route6` objects for origin AS32934 in RADb
+(`whois -h whois.radb.net -- '-i origin AS32934'`, the registry Meta documents for
+its address space), keeping only the objects Meta maintains itself (RADb
+`MAINT-AS32934` and the RIPE objects of its own maintainers), collapsed to their
+covering prefixes. `MessagingSecurityPolicySettings.Enabled` and `AllowWhatsApp`
+are both enabled by default under `DmcaSecurityPolicySettings.Messaging`; a nil
+`Messaging` setting disables all messaging exceptions.
+
 ### 4.5 The "fully encrypted" heuristic
 
 A payload is considered fully encrypted only if **all** hold over the inspected
@@ -561,6 +589,8 @@ can drop.
 | `DropUnsanctionedEncrypted` | `true` | Enforce the encrypted heuristic. |
 | `Gaming.Enabled` | `true` | Master switch for provider-scoped gaming exceptions. |
 | `Gaming.AllowSteam` | `true` | Allow Valve-prefix + documented-remote-port Steam traffic after BitTorrent checks. |
+| `Messaging.Enabled` | `true` | Master switch for provider-scoped messaging exceptions. |
+| `Messaging.AllowWhatsApp` | `true` | Allow TCP/5222 to Meta's own AS32934 prefixes after BitTorrent checks (§4.4.1a). |
 | `App.Enabled` | `true` | Master switch for application standards (§4.4.2). |
 | `App.WireGuard`, `.OpenVpn`, `.Rtmp`, `.Levin`, `.RakNet` | `true` | Individual application-standard detectors. |
 | `App.EthereumDiscv4`, `.EthereumRlpx` | `true` | Ethereum devp2p discovery v4 and RLPx auth (§4.4.2). |
@@ -621,8 +651,9 @@ the destination node id) and an RLPx auth split across TCP segments, obfs4, the
 RTMP digest handshake, and
 proprietary game/voice crypto outside a scoped exception. To spare one, add a
 positive protocol detector (§4.4, §4.4.2) or a provider-prefix + remote-port
-exception (§4.4.1). Quotas or a provider opt-in tier for the long tail are not
-implemented (IPSECURITY-UPDATE4 §6.5, §10).
+exception (§4.4.1, §4.4.1a). Quotas or a provider opt-in tier for the long tail are not
+implemented (IPSECURITY-UPDATE4 §6.5, §10). Ethereum node operators keep peer
+discovery by leaving discovery v4 enabled, which is admitted (§4.4.2).
 
 ---
 
@@ -640,6 +671,8 @@ implemented (IPSECURITY-UPDATE4 §6.5, §10).
   third-party implementation.
 - **Steam exception** is factual prefix and port data published by Valve/Steam;
   no client or server implementation code is incorporated.
+- **Meta exception** is factual prefix data from Meta's own AS32934 route
+  registrations; no client or server implementation code is incorporated.
 
 ---
 
@@ -660,8 +693,9 @@ implemented (IPSECURITY-UPDATE4 §6.5, §10).
   real apps (Roblox, WhatsApp on 5222, X Spaces, console/voice crypto) are still
   needed to confirm which of them trip the heuristic.
 - **Provider exceptions are snapshots.** Valve may update AS32590 prefixes or Steam
-  ports; refresh `ip_security_gaming.go` from the cited first-party lists when this
-  policy is maintained.
+  ports, and Meta its AS32934 registrations; refresh `ip_security_gaming.go` and
+  `ip_security_messaging.go` from the cited sources when this policy is maintained
+  (for example with the CFAA feed build).
 
 ---
 
