@@ -34,6 +34,9 @@ const defaultIpFamilyStarvedRetryTimeout = 60 * time.Second
 type enumeratedDestination struct {
 	destination MultiHopId
 	stats       DestinationStats
+	// stickyRedial marks a sticky window's lost exit, asked for by name
+	// ahead of discovery (see enumerateStickyRedial)
+	stickyRedial bool
 }
 
 // --- exit category ---
@@ -447,7 +450,9 @@ func (self *multiClientWindow) selectFamilySwapVictim(
 // is open. A generator without the capability is called exactly as before
 // and its destinations read as legacy. Every call carries the generator
 // deadline, so a hung platform surfaces as an error on the caller's ordinary
-// retry cadence.
+// retry cadence. Ahead of all of it, a sticky window's lost exit is asked
+// for by name, and a round that finds it is that one destination alone (see
+// enumerateStickyRedial).
 func (self *multiClientWindow) enumerateDestinations(excludeDestinations []MultiHopId, probeOnly bool) ([]enumeratedDestination, error) {
 	call := func(f func() (map[MultiHopId]DestinationStats, error)) (map[MultiHopId]DestinationStats, error) {
 		return windowGeneratorCall(
@@ -472,6 +477,16 @@ func (self *multiClientWindow) enumerateDestinations(excludeDestinations []Multi
 		}
 	}
 	rankMode := self.windowType.RankMode()
+
+	if !probeOnly {
+		redial, ok, err := self.enumerateStickyRedial(excludeDestinations, rankMode)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return append(ordered, redial), nil
+		}
+	}
 
 	familyGenerator, familyOk := self.generator.(MultiClientGeneratorWithIpFamily)
 	if !familyOk {
