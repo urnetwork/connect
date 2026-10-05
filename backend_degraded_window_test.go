@@ -164,6 +164,7 @@ func windowResizeMaxTarget(t *testing.T, degraded bool) int {
 		nil,
 		nil,
 		nil,
+		nil,
 	)
 
 	var stateLock sync.Mutex
