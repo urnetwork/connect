@@ -5702,7 +5702,7 @@ func (self *SendBuffer) createSendSequence(id sendSequenceId, sendPack *SendPack
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	if self.closed {
+	if self.closed || sendPack.Ctx.Err() != nil {
 		return nil
 	}
 	if sendSequence, ok := self.sendSequences[id]; ok {
