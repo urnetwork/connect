@@ -34,7 +34,9 @@ func newTestExtenderStartupProbeClient(
 	settings.ProbeCloseFloor = 10 * time.Millisecond
 	settings.IpVersionSupported = func(ipVersion int) bool { return ipVersion == 4 }
 	settings.Hello = func(context.Context) (*ExtenderHelloResult, error) { return nil, nil }
-	settings.Hint = func(context.Context) (string, error) { return "eu", nil }
+	settings.Hint = func(context.Context) (*ExtenderHintResult, error) {
+		return &ExtenderHintResult{ContinentCode: "eu"}, nil
+	}
 	settings.ResolveDns = func(context.Context, string) ([]netip.Addr, error) { return nil, nil }
 	settings.ResolveDnsTxt = func(context.Context, string) ([]string, error) { return nil, nil }
 	settings.Probe = func(ctx context.Context, candidate *ExtenderCandidate, attestor *ExtenderProbeAttestor) (time.Duration, ExtenderPingOutcome, error) {

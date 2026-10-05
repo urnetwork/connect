@@ -376,6 +376,12 @@ type ExtenderDirectory struct {
 	// the continent the candidate order prefers, upper case, empty until the
 	// network client learns one (DESIGNNOTES4.md §4)
 	continentHint string
+	// the country the operator's hint last placed this client in, lower
+	// case, empty until it has placed it, and whether that answer is current:
+	// given on the path this client is on now, by the latest hint. A failed
+	// hint and a path change leave the country stale (SpoofCountryCode)
+	countryHint        string
+	countryHintCurrent bool
 	// verified identities by hex public key
 	keyHexRecords map[string]*extenderDirectoryRecord
 	// every known address
@@ -1171,6 +1177,69 @@ func (self *ExtenderDirectory) ContinentHint() string {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.continentHint
+}
+
+// SetCountryHint records the country the operator's hint placed this client
+// in, current until the next failed hint or path change (ExpireCountryHint).
+// An empty answer is an operator that could not place the client, or one that
+// predates the country: it leaves the last country in place, stale. Reports
+// whether the country changed.
+func (self *ExtenderDirectory) SetCountryHint(countryCode string) (changed bool) {
+	countryCode = NormalizeSpoofCountryCode(countryCode)
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if countryCode == "" {
+		self.countryHintCurrent = false
+		return false
+	}
+	changed = self.countryHint != countryCode
+	self.countryHint = countryCode
+	self.countryHintCurrent = true
+	return changed
+}
+
+// ExpireCountryHint makes the operator's last country stale: the hint failed,
+// or the path changed and the answer placed the address of the old one. Until
+// the operator answers again, the network country the host reports stands in
+// for it (SpoofCountryCode).
+func (self *ExtenderDirectory) ExpireCountryHint() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.countryHintCurrent = false
+}
+
+// The country the extender dials through this directory draw their outer
+// names for (SpoofDomainsForCountry), lower case, empty for the global list:
+// the operator's country while its hint is current, else the network country
+// the host reports (SetNetworkCountryCode), else the operator's last country.
+// The host's report is the fallback rather than the rule because the operator
+// placed this client's own address; but when the operator cannot be asked --
+// on a whitelist-only mobile network no operator address is routable -- the
+// host's report is the only one there is.
+func (self *ExtenderDirectory) SpoofCountryCode() string {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.countryHintCurrent {
+		return self.countryHint
+	}
+	if networkCountryCode := NetworkCountryCode(); networkCountryCode != "" {
+		return networkCountryCode
+	}
+	return self.countryHint
+}
+
+// The spoof list the dials through one directory draw from, and the country
+// whose list it is (spoofDomainsForCountry). A nil directory places nothing
+// and draws from the global list.
+func directorySpoofDomains(directory *ExtenderDirectory) ([]string, string) {
+	countryCode := ""
+	if directory != nil {
+		countryCode = directory.SpoofCountryCode()
+	}
+	return spoofDomainsForCountry(countryCode)
 }
 
 // RecordLatency stores the outcome of one probe pass over an address: the

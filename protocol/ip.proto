@@ -35,4 +35,9 @@ message IpProviderDiagnostics {
     uint64 block_egress_packet_count = 5;
     uint64 block_egress_byte_count = 6;
     uint64 sequence = 7;
+    // The generation of the built-in security policy rules the provider
+    // enforces (connect SecurityPolicyRulesGeneration), which orders providers
+    // where the hash cannot. Absent or 0 is unknown: a provider from before
+    // this field, or a policy that is not the built-in one.
+    optional uint64 security_policy_generation = 8;
 }

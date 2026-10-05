@@ -160,7 +160,7 @@ func newExtenderFirstAnswerFixture(
 	settings.ProbeWindowCount = 0
 	settings.IpVersionSupported = func(int) bool { return true }
 	settings.Hello = func(context.Context) (*ExtenderHelloResult, error) { return nil, nil }
-	settings.Hint = func(context.Context) (string, error) { return "", nil }
+	settings.Hint = func(context.Context) (*ExtenderHintResult, error) { return &ExtenderHintResult{}, nil }
 	settings.ResolveDnsTxt = func(context.Context, string) ([]string, error) { return nil, nil }
 	if mode == "signed" {
 		txt := testExtenderDnsRecordTxt(t, rootPrivate, clock, self.readyAddr.String())

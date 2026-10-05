@@ -73,7 +73,10 @@ type extenderProxy struct {
 func newExtenderProxy(server *ExtenderServer) *extenderProxy {
 	spoofDomains := server.settings.SpoofDomains
 	if spoofDomains == nil {
-		spoofDomains = connect.SpoofDomains()
+		// every country's list as well as the global one: a client fronts
+		// with the list of its own country, and a prober that replays its
+		// name must still get the real site (A5, A10)
+		spoofDomains = connect.AllSpoofDomains()
 	}
 	whitelistPatterns := []string{}
 	for _, pattern := range slices.Concat(spoofDomains, server.allowedHosts) {
