@@ -267,6 +267,9 @@ type testHintRoutes struct {
 	clientStrategy *ClientStrategy
 
 	operatorUnroutable atomic.Bool
+	// a dial of the operator's address gets no answer at all and lasts until
+	// its context ends, as on a network that drops what it does not route
+	operatorBlackholed atomic.Bool
 	// dials of the operator's address through the strategy's dial seam: every
 	// direct attempt. The relay dials the operator on its own.
 	directDialCount atomic.Int64
@@ -293,6 +296,10 @@ func newTestHintRoutes(t *testing.T, configure func(settings *ClientStrategySett
 				self.directDialCount.Add(1)
 				if self.operatorUnroutable.Load() {
 					return nil, errors.New("the operator address is not routable on this network")
+				}
+				if self.operatorBlackholed.Load() {
+					<-ctx.Done()
+					return nil, ctx.Err()
 				}
 			}
 			dialer := &net.Dialer{}
@@ -332,10 +339,10 @@ func (self *testHintRoutes) preferTheExtender(t *testing.T) {
 }
 
 // A network client that reads the hint for real, through the client strategy
-// it is given, into a directory of its own. Its first pass reports on the
-// returned channel once it is past the hint: the bootstrap that follows the
-// hint resolves TXT first, synchronously. No later pass is due while a test
-// runs.
+// it is given, into a directory of its own. The returned channel closes once
+// its first hint read has ended and what it answered has been applied; the
+// read runs beside the refresh pass, so the pass is no measure of it. No
+// later read is due while a test runs.
 func newTestHintNetworkClient(
 	t *testing.T,
 	clientStrategy *ClientStrategy,
@@ -345,7 +352,6 @@ func newTestHintNetworkClient(
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	directory := NewExtenderDirectory(ctx, DefaultExtenderDirectorySettings())
-	hinted := make(chan struct{}, 1)
 	settings := DefaultExtenderNetworkClientSettings()
 	settings.ApiUrl = apiUrl
 	settings.ExtenderDnsName = "extender.space.example"
@@ -360,10 +366,6 @@ func newTestHintNetworkClient(
 		return nil, nil
 	}
 	settings.ResolveDnsTxt = func(ctx context.Context, name string) ([]string, error) {
-		select {
-		case hinted <- struct{}{}:
-		default:
-		}
 		return nil, nil
 	}
 	settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
@@ -375,15 +377,16 @@ func newTestHintNetworkClient(
 		directory.Close()
 		cancel()
 	})
-	return directory, hinted
+	return directory, networkClient.initialHintDone
 }
 
-func waitForTestHintPass(t *testing.T, hinted <-chan struct{}) {
+// Waits for the network client's first hint read to end.
+func waitForTestHintRead(t *testing.T, hinted <-chan struct{}) {
 	t.Helper()
 	select {
 	case <-hinted:
 	case <-time.After(30 * time.Second):
-		t.Fatal("the network client never got past its hint")
+		t.Fatal("the network client's first hint read never ended")
 	}
 }
 
@@ -412,12 +415,60 @@ func TestExtenderHintIsNotReadThroughAnExtender(t *testing.T) {
 	}
 
 	directory, hinted := newTestHintNetworkClient(t, routes.clientStrategy, routes.operator.url(), 2*time.Second)
-	waitForTestHintPass(t, hinted)
+	waitForTestHintRead(t, hinted)
 	if countryCode := directory.SpoofCountryCode(); countryCode != "ru" {
 		t.Errorf("spoof country = %q, expected the network country", countryCode)
 	}
 	if continentCode := directory.ContinentHint(); continentCode != "" {
 		t.Errorf("continent = %q, expected no hint", continentCode)
+	}
+	if _, hintCount, _ := routes.operator.counts(); hintCount != 0 {
+		t.Errorf("the operator answered %d hints, expected none to reach it", hintCount)
+	}
+}
+
+// Where the operator's address is black-holed -- a dial of it gets no answer
+// at all -- and an extender carries everything else, a direct read of the
+// hint lasts its whole budget. The read runs beside the refresh pass, so the
+// first pass completes while the read is still dialing, with the network
+// country in force.
+func TestExtenderHintReadDoesNotHoldThePassWhereTheOperatorIsBlackholed(t *testing.T) {
+	setTestNetworkCountryCode(t, "ru")
+	routes := newTestHintRoutes(t, func(settings *ClientStrategySettings) {
+		// a dial of the black-holed address lasts as long as the read
+		settings.ConnectSettings.ConnectTimeout = time.Hour
+		settings.ConnectSettings.TlsTimeout = time.Hour
+		settings.ConnectSettings.RequestTimeout = time.Hour
+	})
+	routes.operatorBlackholed.Store(true)
+
+	directory, hinted := newTestHintNetworkClient(t, routes.clientStrategy, routes.operator.url(), time.Hour)
+	timeout := time.After(30 * time.Second)
+	for {
+		state, update := directory.InitialSampleMonitor().Get()
+		if state == ExtenderInitialSampleDone {
+			break
+		}
+		select {
+		case <-update:
+		case <-timeout:
+			t.Fatal("the first pass waited for the hint read")
+		}
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for routes.directDialCount.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the hint was not tried directly")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-hinted:
+		t.Fatal("the hint read ended, expected it still dialing the black-holed address")
+	default:
+	}
+	if countryCode := directory.SpoofCountryCode(); countryCode != "ru" {
+		t.Errorf("spoof country = %q, expected the network country", countryCode)
 	}
 	if _, hintCount, _ := routes.operator.counts(); hintCount != 0 {
 		t.Errorf("the operator answered %d hints, expected none to reach it", hintCount)
@@ -446,7 +497,7 @@ func TestExtenderHintIsReadDirectly(t *testing.T) {
 	}
 
 	directory, hinted := newTestHintNetworkClient(t, routes.clientStrategy, routes.operator.url(), 10*time.Second)
-	waitForTestHintPass(t, hinted)
+	waitForTestHintRead(t, hinted)
 	if countryCode := directory.SpoofCountryCode(); countryCode != testHintDirectPlace.CountryCode {
 		t.Errorf("spoof country = %q, expected the operator's %q", countryCode, testHintDirectPlace.CountryCode)
 	}

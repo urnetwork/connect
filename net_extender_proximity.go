@@ -42,12 +42,13 @@ type ExtenderHintResult struct {
 // operator places is the relay's, not this client's. Each read builds a
 // direct-only strategy from the settings of the one passed in and closes it
 // after, so the read takes the DoH settings in force; the hint is read rarely
-// -- a start, a path change, the 6 hour refresh -- so none is kept between
-// reads. Where no direct path reaches the operator -- on a whitelist-only
-// network none does -- the read fails, and the directory takes the network
-// country the host reports instead (ExtenderDirectory.SpoofCountryCode). A
-// strategy that relays every request, through a manual extender or a proxy,
-// has no direct path to read through, so there the read fails without a dial.
+// -- a start, a path change, the 6 hour refresh, and after a failure once its
+// backoff has passed -- so none is kept between reads. Where no direct path
+// reaches the operator -- on a whitelist-only network none does -- the read
+// fails, and the directory takes the network country the host reports
+// instead (ExtenderDirectory.SpoofCountryCode). A strategy that relays every
+// request, through a manual extender or a proxy, has no direct path to read
+// through, so there the read fails without a dial.
 func GetExtenderHint(
 	ctx context.Context,
 	clientStrategy *ClientStrategy,
