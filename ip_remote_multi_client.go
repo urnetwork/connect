@@ -1348,10 +1348,35 @@ type WindowSizeSettings struct {
 }
 
 func (self *WindowSizeSettings) Validate() error {
-	if self.WindowSizeMinIpv6Capable < 0 {
+	// no size or count has a meaning below zero, and a performance profile
+	// carries these values from callers the window cannot trust
+	for _, count := range []struct {
+		name  string
+		value int
+	}{
+		{"min", self.WindowSizeMin},
+		{"min p2p only", self.WindowSizeMinP2pOnly},
+		{"min ipv6 capable", self.WindowSizeMinIpv6Capable},
+		{"max", self.WindowSizeMax},
+		{"hard max", self.WindowSizeHardMax},
+		{"fixed", self.FixedWindowSize},
+		{"keep healthiest count", self.KeepHealthiestCount},
+		{"ulimit", self.Ulimit},
+	} {
+		if count.value < 0 {
+			return fmt.Errorf(
+				"Window size %s =%d must be >= 0",
+				count.name,
+				count.value,
+			)
+		}
+	}
+	if self.WindowSizeReconnectScale < 0 ||
+		math.IsNaN(self.WindowSizeReconnectScale) ||
+		math.IsInf(self.WindowSizeReconnectScale, 0) {
 		return fmt.Errorf(
-			"Window size min ipv6 capable =%d must be >= 0",
-			self.WindowSizeMinIpv6Capable,
+			"Window size reconnect scale =%v must be finite and >= 0",
+			self.WindowSizeReconnectScale,
 		)
 	}
 	if self.WindowSizeMax < self.WindowSizeMin {
@@ -1408,6 +1433,14 @@ func (self *PerformanceProfile) Validate() error {
 	err := self.WindowSize.Validate()
 	if err != nil {
 		return err
+	}
+	// a fixed window carries all of the traffic, so a window that can hold
+	// no exit leaves no route at all (and reads as satisfied while empty)
+	if self.WindowType != WindowTypeAuto && self.WindowSize.WindowSizeMax < 1 {
+		return fmt.Errorf(
+			"Window size max =%d must be >= 1 for a fixed window",
+			self.WindowSize.WindowSizeMax,
+		)
 	}
 
 	return nil
@@ -2500,7 +2533,18 @@ func NewRemoteUserNatMultiClient(
 	if settings.IpAssocSettings != nil {
 		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
 	}
-	effectivePerformanceProfile := multiClient.overrideAllowDirect(settings.DefaultPerformanceProfile)
+	// a default profile that does not validate is refused the same as one
+	// set later (see SetPerformanceProfile): the windows start in auto rather
+	// than size themselves from an invalid window
+	defaultPerformanceProfile := settings.DefaultPerformanceProfile
+	if defaultPerformanceProfile != nil {
+		err := defaultPerformanceProfile.Validate()
+		if err != nil {
+			log.Warningf("[multi]default performance profile refused: %s\n", err)
+			defaultPerformanceProfile = nil
+		}
+	}
+	effectivePerformanceProfile := multiClient.overrideAllowDirect(defaultPerformanceProfile)
 	multiClient.config.Store(&multiClientConfig{
 		performanceProfile:  effectivePerformanceProfile,
 		localSecurityBypass: false,
@@ -2823,12 +2867,16 @@ func performanceProfilesEqual(a *PerformanceProfile, b *PerformanceProfile) bool
 	return a.WindowSize == b.WindowSize
 }
 
-func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
+// SetPerformanceProfile installs the profile on every window and resets the
+// windows. A profile that does not validate is refused with its error and the
+// previous profile stays in force: the window size comes from the caller, and
+// a bad one must never panic the connection or reach the windows.
+func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) error {
 	performanceProfile = self.overrideAllowDirect(performanceProfile)
 	if performanceProfile != nil {
 		err := performanceProfile.Validate()
 		if err != nil {
-			panic(err)
+			return err
 		}
 	}
 
@@ -2836,7 +2884,7 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 	// client, and presentation code commonly re-applies an equal profile on
 	// resume -- that must not tear the window down
 	if performanceProfilesEqual(self.config.Load().performanceProfile, performanceProfile) {
-		return
+		return nil
 	}
 
 	func() {
@@ -2858,6 +2906,7 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 		// reset the window
 		window.shuffle()
 	}
+	return nil
 }
 
 func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass bool) {

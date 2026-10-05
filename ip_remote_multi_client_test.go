@@ -552,3 +552,197 @@ func TestMultiClientChangedPerformanceProfilePublishesConfig(t *testing.T) {
 		t.Fatalf("changed profile was not installed: %+v", after.performanceProfile)
 	}
 }
+
+type testingInvalidPerformanceProfile struct {
+	name    string
+	profile *PerformanceProfile
+}
+
+// testingInvalidPerformanceProfiles are profiles a caller can send whose
+// window no window can install.
+func testingInvalidPerformanceProfiles() []testingInvalidPerformanceProfile {
+	fixed := func(windowSize WindowSizeSettings) *PerformanceProfile {
+		return &PerformanceProfile{
+			WindowType: WindowTypeQuality,
+			WindowSize: windowSize,
+		}
+	}
+	return []testingInvalidPerformanceProfile{
+		{"max below min", fixed(WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 1})},
+		{"negative max", fixed(WindowSizeSettings{WindowSizeMin: 0, WindowSizeMax: -1})},
+		{"negative min", fixed(WindowSizeSettings{WindowSizeMin: -3, WindowSizeMax: 2})},
+		{"negative fixed", fixed(WindowSizeSettings{WindowSizeMin: -1, WindowSizeMax: -1, FixedWindowSize: -1})},
+		{"negative min p2p only", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeMinP2pOnly: -1})},
+		{"negative hard max", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeHardMax: -1})},
+		{"negative keep healthiest count", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, KeepHealthiestCount: -1})},
+		{"negative ulimit", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, Ulimit: -1})},
+		{"negative reconnect scale", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeReconnectScale: -1})},
+		{"nan reconnect scale", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeReconnectScale: math.NaN()})},
+		{"infinite reconnect scale", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeReconnectScale: math.Inf(1)})},
+		{"fixed outside the window", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, FixedWindowSize: 3})},
+		{"fixed window with no exit", fixed(WindowSizeSettings{})},
+		{"auto with an invalid window", &PerformanceProfile{
+			WindowType: WindowTypeAuto,
+			WindowSize: WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 1},
+		}},
+	}
+}
+
+// testingWindowPerformanceProfiles reads the profile each window holds.
+func testingWindowPerformanceProfiles(multiClient *RemoteUserNatMultiClient) map[WindowType]*PerformanceProfile {
+	performanceProfiles := map[WindowType]*PerformanceProfile{}
+	for windowType, window := range multiClient.windows {
+		func() {
+			window.stateLock.Lock()
+			defer window.stateLock.Unlock()
+			performanceProfiles[windowType] = window.performanceProfile
+		}()
+	}
+	return performanceProfiles
+}
+
+// TestPerformanceProfileValidate pins the windows a profile may carry: the
+// profiles the apps send (auto; Fixed IP, a fixed window of exactly one exit;
+// a fixed window of two to four) and the default window sizes are valid, and
+// every profile in testingInvalidPerformanceProfiles is not.
+func TestPerformanceProfileValidate(t *testing.T) {
+	valid := []*PerformanceProfile{
+		{WindowType: WindowTypeAuto},
+		{WindowType: WindowTypeAuto, AllowDirect: true, PostQuantumEncryption: true},
+		{WindowType: WindowTypeQuality, WindowSize: WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 1, FixedWindowSize: 1}},
+		{WindowType: WindowTypeSpeed, WindowSize: WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 4}},
+		{WindowType: WindowTypeQuality, WindowSize: DefaultWindowSizeSettings()},
+	}
+	for windowType, windowSize := range DefaultMultiClientSettings().WindowSizes {
+		valid = append(valid, &PerformanceProfile{
+			WindowType: windowType,
+			WindowSize: windowSize,
+		})
+	}
+	for _, performanceProfile := range valid {
+		if err := performanceProfile.Validate(); err != nil {
+			t.Fatalf("valid profile %+v refused: %s", performanceProfile, err)
+		}
+	}
+	for _, invalid := range testingInvalidPerformanceProfiles() {
+		if err := invalid.profile.Validate(); err == nil {
+			t.Fatalf("%s: invalid profile validated: %+v", invalid.name, invalid.profile)
+		}
+	}
+}
+
+// TestMultiClientInvalidPerformanceProfileKeepsPrevious covers a caller that
+// sends a window no window can install. SetPerformanceProfile panicked on max
+// below min (after the device had already stored the profile) and installed a
+// negative window as is. It now refuses every invalid profile with an error,
+// without a panic, and the previous profile stays in force on the config and
+// on every window.
+func TestMultiClientInvalidPerformanceProfileKeepsPrevious(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultMultiClientSettings()
+	settings.DefaultPerformanceProfile = &PerformanceProfile{
+		WindowType: WindowTypeQuality,
+		WindowSize: WindowSizeSettings{
+			WindowSizeMin:   1,
+			WindowSizeMax:   1,
+			FixedWindowSize: 1,
+		},
+	}
+	multiClient := NewRemoteUserNatMultiClient(
+		ctx,
+		&testingEmptyMultiClientGenerator{},
+		func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+		},
+		protocol.ProvideMode_Public,
+		settings,
+	)
+	defer multiClient.Close()
+
+	before := multiClient.config.Load()
+	beforeWindows := testingWindowPerformanceProfiles(multiClient)
+	for _, invalid := range testingInvalidPerformanceProfiles() {
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("%s: SetPerformanceProfile panicked: %v", invalid.name, r)
+				}
+			}()
+			err = multiClient.SetPerformanceProfile(invalid.profile)
+		}()
+		if err == nil {
+			t.Fatalf("%s: invalid profile was accepted", invalid.name)
+		}
+		if after := multiClient.config.Load(); after != before {
+			t.Fatalf("%s: invalid profile replaced the profile in force: %+v", invalid.name, after.performanceProfile)
+		}
+		for windowType, performanceProfile := range testingWindowPerformanceProfiles(multiClient) {
+			if performanceProfile != beforeWindows[windowType] {
+				t.Fatalf("%s: invalid profile reached window %d: %+v", invalid.name, windowType, performanceProfile)
+			}
+		}
+	}
+
+	// the refusals leave the setter working
+	err := multiClient.SetPerformanceProfile(&PerformanceProfile{
+		WindowType: WindowTypeSpeed,
+		WindowSize: WindowSizeSettings{
+			WindowSizeMin: 2,
+			WindowSizeMax: 4,
+		},
+	})
+	if err != nil {
+		t.Fatalf("valid profile refused: %s", err)
+	}
+	if after := multiClient.config.Load(); after == before || after.performanceProfile.WindowType != WindowTypeSpeed {
+		t.Fatalf("valid profile was not installed: %+v", after.performanceProfile)
+	}
+}
+
+// TestMultiClientInvalidDefaultPerformanceProfileStartsAuto covers the
+// constructor, which never validated: a default profile with an invalid
+// window (a device restarting with a profile an older build saved) was
+// installed and sized the windows. It is now refused and the windows start
+// in auto. The allow-direct override still applies, as it does with no
+// profile.
+func TestMultiClientInvalidDefaultPerformanceProfileStartsAuto(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for _, invalid := range testingInvalidPerformanceProfiles() {
+		for _, provideMode := range []protocol.ProvideMode{protocol.ProvideMode_Public, protocol.ProvideMode_Network} {
+			settings := DefaultMultiClientSettings()
+			settings.DefaultPerformanceProfile = invalid.profile
+			multiClient := NewRemoteUserNatMultiClient(
+				ctx,
+				&testingEmptyMultiClientGenerator{},
+				func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+				},
+				provideMode,
+				settings,
+			)
+			performanceProfile := multiClient.config.Load().performanceProfile
+			switch provideMode {
+			case protocol.ProvideMode_Network:
+				// the same-network force fabricates an auto profile
+				if performanceProfile == nil || !performanceProfile.AllowDirect ||
+					performanceProfile.WindowType != WindowTypeAuto ||
+					performanceProfile.WindowSize != (WindowSizeSettings{}) {
+					t.Fatalf("%s: network default is not plain auto with direct: %+v", invalid.name, performanceProfile)
+				}
+			default:
+				if performanceProfile != nil {
+					t.Fatalf("%s: invalid default profile was installed: %+v", invalid.name, performanceProfile)
+				}
+			}
+			for windowType, windowPerformanceProfile := range testingWindowPerformanceProfiles(multiClient) {
+				if windowPerformanceProfile != performanceProfile {
+					t.Fatalf("%s: window %d holds %+v", invalid.name, windowType, windowPerformanceProfile)
+				}
+			}
+			multiClient.Close()
+		}
+	}
+}
