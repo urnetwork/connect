@@ -740,8 +740,27 @@ func TestSchedulerPauseDetectorSourceAnchors(t *testing.T) {
 	if strings.Contains(body, "WakeupAfter") {
 		t.Error("the detector uses the coalescing wakeup scheduler: a batched wakeup would read as a suspend")
 	}
+	if !strings.Contains(body, "self.observeSchedulerPause(armed, time.Now())") {
+		t.Error("the detector does not judge each wait from its two readings")
+	}
+
+	body, ok = functionBody(source, "func (self *RemoteUserNatMultiClient) observeSchedulerPause(")
+	if !ok {
+		t.Fatal("could not find observeSchedulerPause")
+	}
+	if !strings.Contains(body, "schedulerPauseElapsed(armed, now)") {
+		t.Error("the detector does not count the time the host slept, so a closed lid reads as a timer on time")
+	}
 	if !strings.Contains(body, "schedulerPauseDetected(") || !strings.Contains(body, "self.notifySchedulerPause(") {
 		t.Error("the detector does not route through the detection rule and the hold")
+	}
+
+	body, ok = functionBody(source, "func (self *multiClientChannel) busyLivenessProbe(")
+	if !ok {
+		t.Fatal("could not find busyLivenessProbe")
+	}
+	if !strings.Contains(body, "schedulerPauseElapsed(waitStart, now())") || strings.Contains(body, "time.Since(waitStart)") {
+		t.Error("the busy probe does not count the time the host slept in its wait")
 	}
 
 	body, ok = functionBody(source, "func (self *RemoteUserNatMultiClient) notifySchedulerPause(")

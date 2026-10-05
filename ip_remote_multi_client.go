@@ -999,7 +999,9 @@ type MultiClientSettings struct {
 	// SchedulerPauseTolerance is how much later than armed a timer may fire
 	// before the host is judged to have been suspended (doze, the app freezer,
 	// thermal throttling, a laptop lid). Concept ported from upstream main
-	// e05ecee's SchedulerPauseTolerance.
+	// e05ecee's SchedulerPauseTolerance. How late counts the time the host
+	// slept, which the monotonic clock under every timer does not count on
+	// darwin, linux and android (schedulerPauseElapsed).
 	//
 	// A suspended host looks exactly like a dead network from inside this
 	// process: no packets arrived, no acks landed, every clock aged. The uplink
@@ -7782,14 +7784,27 @@ func schedulerPauseDetected(elapsed time.Duration, expected time.Duration, toler
 	return expected+tolerance < elapsed
 }
 
+// How long a wait from `start` to `now` lasted, for the pause detector and the
+// busy probe: the monotonic time it took, plus the time the host slept. A
+// frozen process (doze, the app freezer, thermal throttling) shows as monotonic
+// time, its timer firing late. A sleeping host (a closed lid) does not: the
+// monotonic clock stops while the host sleeps on darwin, linux and android, and
+// every timer with it, so the timer fires on time by that clock and the sleep
+// shows only as the wall clock's lead over it (hostSlept). A wall clock set
+// back adds nothing; one set forward past the tolerance reads as a pause, and
+// costs one recovery hold or one refreshed probe budget.
+func schedulerPauseElapsed(start time.Time, now time.Time) time.Duration {
+	return now.Sub(start) + max(0, hostSlept(now, start))
+}
+
 // runSchedulerPauseDetector watches for the host stopping underneath us.
 //
 // The instrument is deliberately the crudest one available: arm a timer, see
-// how long it actually took. Everything else this process could measure went
-// away with the cpu -- no packets arrived, no acks landed, no verdict pass ran
-// -- so the only observable left is that wall-clock time passed while we were
-// not running. That is exactly what doze, the app freezer, thermal throttling
-// and a closed lid look like from in here.
+// how long it actually took (schedulerPauseElapsed). Everything else this
+// process could measure went away with the cpu -- no packets arrived, no acks
+// landed, no verdict pass ran -- so the only observable left is that wall-clock
+// time passed while we were not running. That is exactly what doze, the app
+// freezer, thermal throttling and a closed lid look like from in here.
 //
 // Plain time.After, NOT WakeupAfter: the wakeup scheduler intentionally
 // coalesces timers to save radio wakeups, and a coalesced fire is precisely the
@@ -7805,14 +7820,19 @@ func (self *RemoteUserNatMultiClient) runSchedulerPauseDetector() {
 			return
 		case <-time.After(schedulerPauseProbeInterval):
 		}
+		self.observeSchedulerPause(armed, time.Now())
+	}
+}
 
-		// read the tolerance AFTER the wait so the runtime toggle takes effect
-		// without a reconnect, the same discipline the other loops here use
-		tolerance := self.reliabilitySettings().SchedulerPauseTolerance
-		elapsed := time.Since(armed)
-		if schedulerPauseDetected(elapsed, schedulerPauseProbeInterval, tolerance) {
-			self.notifySchedulerPause(elapsed)
-		}
+// Judges one wait of the pause detector, from the reading taken when it armed
+// and the one taken when it fired.
+func (self *RemoteUserNatMultiClient) observeSchedulerPause(armed time.Time, now time.Time) {
+	// read the tolerance AFTER the wait so the runtime toggle takes effect
+	// without a reconnect, the same discipline the other loops here use
+	tolerance := self.reliabilitySettings().SchedulerPauseTolerance
+	elapsed := schedulerPauseElapsed(armed, now)
+	if schedulerPauseDetected(elapsed, schedulerPauseProbeInterval, tolerance) {
+		self.notifySchedulerPause(elapsed)
 	}
 }
 
@@ -13545,6 +13565,10 @@ type multiClientChannel struct {
 	// SendDetailedMessage(&protocol.IpPing{}) plumbing the cping loop uses --
 	// pinned by TestBusyProbeUsesTheControlPingPlumbing.
 	busyProbeSendFunc func(timeout time.Duration, ackCallback func(error)) (bool, error)
+	// Nil outside focused tests. Replaces time.Now in the busy probe's wait,
+	// so a test can show it a host clock whose sleep moves the wall reading
+	// alone (schedulerPauseElapsed).
+	busyProbeNowForTest func() time.Time
 	// Nil outside focused tests. The callback assumes the same conditional
 	// ownership as Transfer: success consumes every group packet.
 	sendGroupForTest func(*parsedPacketGroup, time.Duration, bool) (bool, error)
@@ -14914,7 +14938,8 @@ func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback
 //   - budget expires: convict, with the reason naming the probe. One fresh
 //     budget is granted first if the wait itself was suspended (see
 //     schedulerPauseDetected) -- a probe armed before a doze must not convict on
-//     wake, when neither the exit's answer nor this waiter had a cpu.
+//     wake, when neither the exit's answer nor this waiter had a cpu. A host
+//     sleep counts too (schedulerPauseElapsed).
 //   - the probe cannot be queued twice in one stale episode: convict. Once is
 //     not evidence (a congested exit drains between polls); twice, while the
 //     same data sits unacked, is.
@@ -14969,7 +14994,11 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 	self.metrics().busyProbeSent()
 
 	tolerance := self.reliabilitySettings().SchedulerPauseTolerance
-	waitStart := time.Now()
+	now := time.Now
+	if self.busyProbeNowForTest != nil {
+		now = self.busyProbeNowForTest
+	}
+	waitStart := now()
 	budgetRefreshed := false
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
@@ -15001,7 +15030,7 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 			self.metrics().busyProbeAcquitted()
 			return busyProbeVerdict{detail: "liveness probe answered"}
 		case <-timer.C:
-			if !budgetRefreshed && schedulerPauseDetected(time.Since(waitStart), budget, tolerance) {
+			if !budgetRefreshed && schedulerPauseDetected(schedulerPauseElapsed(waitStart, now()), budget, tolerance) {
 				// the host was suspended while this probe was in flight: the
 				// exit's answer and this waiter were both off the cpu, so the
 				// expiry says nothing about the exit. Grant the SAME probe one
@@ -15010,7 +15039,7 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 				// refresh would let a flapping scheduler suspend the verdict
 				// forever.
 				budgetRefreshed = true
-				waitStart = time.Now()
+				waitStart = now()
 				timer.Reset(budget)
 				loggerOrDefault(self.log).Infof("%s\n", relEvent(
 					"busy_probe",
