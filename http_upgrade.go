@@ -47,9 +47,10 @@ func (e *HTTPUpgradeError) Error() string {
 	return fmt.Sprintf("HTTP upgrade: %s (status %d)", e.Reason, e.StatusCode)
 }
 
+// A fresh negotiation is allowed only when every bounded original cause is
+// an actual nonterminal upgrade refusal. Joined cancellation cannot downgrade.
 func HTTPUpgradeAllowsFallback(err error) bool {
-	var upgradeErr *HTTPUpgradeError
-	return errors.As(err, &upgradeErr) && !upgradeErr.Terminal
+	return len(httpUpgradeFallbackCauses(err)) != 0
 }
 
 func headerContainsToken(h http.Header, name, token string) bool {
@@ -470,23 +471,22 @@ func FramedUpgradePermitted(address, protocol string) bool {
 }
 
 func RecordFramedUpgradeFailure(address, protocol string, err error) {
-	if !HTTPUpgradeAllowsFallback(err) {
+	upgradeTs := httpUpgradeFallbackCauses(err)
+	if len(upgradeTs) == 0 {
 		return
 	}
-	var upgradeErr *HTTPUpgradeError
-	if !errors.As(err, &upgradeErr) {
-		return
-	}
-	switch upgradeErr.Reason {
-	case "invalid-selection", "invalid-response":
-	case "rejected":
-		switch upgradeErr.StatusCode {
-		case 200, 400, 404, 405, 426, 501:
+	for _, upgrade := range upgradeTs {
+		switch upgrade.Reason {
+		case "invalid-selection", "invalid-response":
+		case "rejected":
+			switch upgrade.StatusCode {
+			case 200, 400, 404, 405, 426, 501:
+			default:
+				return
+			}
 		default:
 			return
 		}
-	default:
-		return
 	}
 	key := framedUpgradeCacheKey(address, protocol)
 	if key == "" {
