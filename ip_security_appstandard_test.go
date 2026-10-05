@@ -480,6 +480,7 @@ func appStandardFixtureFlows() []struct {
 			appTestBytes("e2e-raknet-2", 400),
 			appTestBytes("e2e-raknet-3", 400),
 		}},
+		{name: "whatsapp", transport: IpProtocolTcp, port: whatsAppChatPort, payloads: whatsAppTestNativeFlow("e2e-whatsapp")},
 	}
 }
 
@@ -566,6 +567,7 @@ func TestDmcaBittorrentPrecedenceOverAppStandards(t *testing.T) {
 		{name: "rtmp then handshake", transport: IpProtocolTcp, port: 1935, payloads: [][]byte{appTestRtmpC0C1("bt-rtmp"), btHandshake()}},
 		{name: "levin then handshake", transport: IpProtocolTcp, port: 18080, payloads: [][]byte{appTestLevin("bt-levin", 200), btHandshake()}},
 		{name: "raknet then dht", transport: IpProtocolUdp, port: 49152, payloads: [][]byte{appTestRakNetOpenConnection1(make([]byte, 600)), appTestDhtPing()}},
+		{name: "whatsapp hello then handshake", transport: IpProtocolTcp, port: whatsAppChatPort, payloads: [][]byte{whatsAppTestWebFlow("bt-wa")[0], btHandshake()}},
 		// a signature carried behind a single-packet standard's header
 		{name: "levin head carrying a handshake", transport: IpProtocolTcp, port: 18080, payloads: [][]byte{appTestCat(appTestLevin("bt-levin-h", 0), btHandshake())}},
 		{name: "raknet magic carrying dht", transport: IpProtocolUdp, port: 49152, payloads: [][]byte{appTestCat([]byte{rakNetIdOpenConnectionRequest1}, rakNetOfflineMagic, appTestDhtPing())}},
@@ -713,6 +715,7 @@ func TestDmcaAppStandardsDisabledRestoreDrop(t *testing.T) {
 		"rtmp":      func(settings *AppStandardSettings) { settings.Rtmp = false },
 		"levin":     func(settings *AppStandardSettings) { settings.Levin = false },
 		"raknet":    func(settings *AppStandardSettings) { settings.RakNet = false },
+		"whatsapp":  func(settings *AppStandardSettings) { settings.WhatsApp = false },
 	}
 	for i, flow := range appStandardFixtureFlows() {
 		configurations := map[string]func(*DmcaSecurityPolicySettings){
@@ -809,7 +812,7 @@ func TestAppStandardDetectorsZeroAlloc(t *testing.T) {
 	transport := appTestWireGuardTransport("alloc-wg-t", 1, 1, 96)
 	rtmp := appTestRtmpC0C1("alloc-rtmp")
 	if allocations := testing.AllocsPerRun(1000, func() {
-		candidate, ok := app.open(udp, initiation)
+		candidate, ok := app.open(udp, initiation, true)
 		if !ok {
 			t.Fatal("initiation did not open")
 		}
@@ -852,7 +855,7 @@ func FuzzAppStandardDetectors(f *testing.F) {
 		}
 		path := appTestPath(transport, 1, 9000, false)
 		app.match(path, payload, true)
-		if candidate, ok := app.open(path, payload); ok {
+		if candidate, ok := app.open(path, payload, true); ok {
 			app.confirm(&candidate, path, payload)
 		}
 		containsBittorrentSignature(payload)

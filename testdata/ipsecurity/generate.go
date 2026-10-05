@@ -26,6 +26,7 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"golang.org/x/crypto/sha3"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 type fixture struct {
@@ -267,6 +268,28 @@ func rlpxAuth(s *stream, eip8 bool, padding int) []byte {
 // || frame-ciphertext padded to 16 || frame-mac (16)
 func rlpxFrame(s *stream, frameSize int) []byte {
 	return s.bytes(16 + 16 + (frameSize+15)/16*16 + 16)
+}
+
+// WhatsApp's Noise transport as the public clients write it (whatsmeow,
+// Baileys, yowsup and consonance; see whatsAppStream in
+// ip_security_appstandard.go): a 3-byte big-endian length before every frame
+func whatsAppFrame(data []byte) []byte {
+	return cat([]byte{byte(len(data) >> 16), byte(len(data) >> 8), byte(len(data))}, data)
+}
+
+func protobufBytes(field protowire.Number, value []byte) []byte {
+	return protowire.AppendBytes(protowire.AppendTag(nil, field, protowire.BytesType), value)
+}
+
+// the client's first frame: HandshakeMessage{clientHello (2)} whose first
+// field is the 32-byte ephemeral key (1); Noise IK adds the encrypted static
+// key (2, 32 + 16 bytes) and payload (3)
+func whatsAppClientHello(s *stream, ik bool) []byte {
+	hello := protobufBytes(1, s.bytes(32))
+	if ik {
+		hello = cat(hello, protobufBytes(2, s.bytes(48)), protobufBytes(3, s.bytes(220)))
+	}
+	return protobufBytes(2, hello)
 }
 
 func main() {
@@ -706,6 +729,65 @@ func main() {
 			s.bytes(96+211),
 			s.bytes(120),
 			s.bytes(300),
+		)
+	}
+	{
+		s := newStream("whatsapp-noise-web")
+		hello := whatsAppClientHello(s, false)
+		finish := protobufBytes(4, cat(protobufBytes(1, s.bytes(48)), protobufBytes(2, s.bytes(180))))
+		add(fixture{
+			Name:            "whatsapp-noise-web",
+			Protocol:        "whatsapp-noise",
+			Provenance:      "WhatsApp Noise transport as the public web clients write it (whatsmeow socket WAConnHeader and SendFrame, Baileys noise-handler): header 'WA' 6 3 and the Noise XX clientHello frame in one write, then the clientFinish frame and transport frames, each behind a 3-byte big-endian length",
+			Transport:       "tcp",
+			DestinationPort: 5222,
+			ExpectBefore:    "drop",
+			ExpectAfter:     "allow",
+		},
+			cat([]byte{'W', 'A', 6, 3}, whatsAppFrame(hello)),
+			whatsAppFrame(finish),
+			whatsAppFrame(s.bytes(240)),
+			whatsAppFrame(s.bytes(320)),
+		)
+	}
+	{
+		s := newStream("whatsapp-noise-native-segmented")
+		routing := cat([]byte{0x08}, s.bytes(3))
+		add(fixture{
+			Name:            "whatsapp-noise-native-segmented",
+			Protocol:        "whatsapp-noise",
+			Provenance:      "WhatsApp mobile-protocol opening written as yowsup's noise layer writes it: edge header 'ED' 0 1, a 4-byte routing info starting 08 behind its 3-byte length (the prefix nDPI's whatsapp.c matches) and header 'WA' 4 0, each in its own segment; then the Noise IK clientHello frame (consonance) and transport frames",
+			Transport:       "tcp",
+			DestinationPort: 5222,
+			ExpectBefore:    "drop",
+			ExpectAfter:     "allow",
+		},
+			[]byte{'E', 'D', 0, 1},
+			whatsAppFrame(routing),
+			[]byte{'W', 'A', 4, 0},
+			whatsAppFrame(whatsAppClientHello(s, true)),
+			whatsAppFrame(s.bytes(260)),
+			whatsAppFrame(s.bytes(300)),
+			whatsAppFrame(s.bytes(200)),
+		)
+	}
+	{
+		s := newStream("whatsapp-noise-bad-length")
+		hello := whatsAppClientHello(s, true)
+		length := len(hello) + 1
+		add(fixture{
+			Name:            "whatsapp-noise-bad-length",
+			Protocol:        "whatsapp-noise",
+			Provenance:      "a WhatsApp-shaped opening whose 3-byte frame length is one more than the clientHello protobuf it carries; not matched by design",
+			Transport:       "tcp",
+			DestinationPort: 5222,
+			ExpectBefore:    "drop",
+			ExpectAfter:     "drop",
+			Note:            "the frame length must equal the length of the protobuf it carries",
+		},
+			cat([]byte{'W', 'A', 6, 3, byte(length >> 16), byte(length >> 8), byte(length)}, hello, s.bytes(1)),
+			whatsAppFrame(s.bytes(240)),
+			whatsAppFrame(s.bytes(320)),
 		)
 	}
 

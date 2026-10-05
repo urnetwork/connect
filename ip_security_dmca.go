@@ -15,8 +15,8 @@ package connect
 //   - an initial payload that looks fully encrypted/random AND is NOT a
 //     whitelisted standard (TLS, DTLS, QUIC, STUN/TURN, RTP/RTCP), an
 //     application standard (WireGuard, OpenVPN, RTMP, Levin, RakNet, Ethereum
-//     discovery v4 or RLPx), or an exact provider-scoped gaming or messaging
-//     endpoint -> Drop
+//     discovery v4 or RLPx, WhatsApp Noise), or an exact provider-scoped
+//     gaming or messaging endpoint -> Drop
 //   - anything else (plaintext unknown protocol, a sanctioned standard/provider
 //     endpoint, or budget exhausted without a hit) -> Allow
 //
@@ -89,16 +89,17 @@ type DmcaSecurityPolicySettings struct {
 	Gaming *GamingSecurityPolicySettings
 
 	// Messaging configures provider-scoped messaging exceptions (WhatsApp on
-	// Meta's own address space). Like the gaming exceptions they are evaluated
-	// after positive BitTorrent signatures but before the encrypted heuristic,
-	// and an allowed flow keeps checking the signatures for its whole
-	// inspection budget. Nil disables all messaging exceptions.
+	// Meta's own address space). They are evaluated after positive BitTorrent
+	// signatures and the application standards, as the backstop for the
+	// WhatsApp Noise detector, but before the encrypted heuristic, and an
+	// allowed flow keeps checking the signatures for its whole inspection
+	// budget. Nil disables all messaging exceptions.
 	Messaging *MessagingSecurityPolicySettings
 
 	// App configures the positive application-standard detectors (WireGuard,
-	// OpenVPN, RTMP, Levin, RakNet, Ethereum discovery v4 and RLPx). They are
-	// evaluated after the BitTorrent signatures, the gaming exceptions and the
-	// web standards. Nil disables them.
+	// OpenVPN, RTMP, Levin, RakNet, Ethereum discovery v4 and RLPx, WhatsApp
+	// Noise). They are evaluated after the BitTorrent signatures, the gaming
+	// exceptions and the web standards. Nil disables them.
 	App *AppStandardSettings
 
 	// InspectPrivilegedSignatures checks the stateless BitTorrent signatures on
@@ -367,13 +368,6 @@ func (self *dmcaFlowState) advance(
 		// intentionally retain precedence.
 		return self.setTerminal(dmcaAllow, SecurityPolicyReasonAllowGaming)
 	}
-	if isSanctionedMessagingEndpoint(settings.Messaging, ipPath) {
-		// Vendor prefix + transport + chat port admits the WhatsApp exception.
-		// Unlike the Steam exception the allow is not terminal at once: like
-		// an application standard it keeps the BitTorrent signatures above in
-		// force for the rest of the inspection budget.
-		return self.allowAppStandard(SecurityPolicyReasonAllowMessaging, settings)
-	}
 	if reason, ok := web.matchReason(ipPath, payload); ok {
 		// A sanctioned web/communication standard. Full framing is evaluated over
 		// the complete payload; MaxInspectionPayload only caps signature and entropy
@@ -396,20 +390,30 @@ func (self *dmcaFlowState) advance(
 	if self.appCandidate.kind != appCandidateNone {
 		candidate := self.appCandidate
 		self.appCandidate = appCandidate{}
-		if reason, ok := app.confirm(&candidate, ipPath, payload); ok {
+		reason, ok := app.confirm(&candidate, ipPath, payload)
+		if ok {
 			return self.allowAppStandard(reason, settings)
+		}
+		if reason == SecurityPolicyReasonInspecting {
+			// a WhatsApp stream prefix that continues in the next segment
+			return self.holdAppCandidate(candidate, settings)
 		}
 		// a failed candidate is judged normally below (or reopens one)
 	}
-	if candidate, ok := app.open(ipPath, payload); ok {
+	if candidate, ok := app.open(ipPath, payload, 1 == self.inspectedPackets); ok {
 		// The opening packet of a two-packet standard consumes budget but is not
 		// counted as encrypted: the next packet confirms it or is judged normally.
 		// A random flow whose blob happens to match an opener leaks one packet.
-		self.appCandidate = candidate
-		if settings.InspectionPacketBudget <= self.inspectedPackets {
-			return self.setTerminal(dmcaAllow, SecurityPolicyReasonAllowBudget)
-		}
-		return dmcaInspecting, SecurityPolicyReasonInspecting, false
+		return self.holdAppCandidate(candidate, settings)
+	}
+	if isSanctionedMessagingEndpoint(settings.Messaging, ipPath) {
+		// Vendor prefix + transport + chat port admits the WhatsApp exception.
+		// It runs after the application standards as the backstop for the
+		// WhatsApp flows the Noise detector did not recognize. Unlike the Steam
+		// exception the allow is not terminal at once: like an application
+		// standard it keeps the BitTorrent signatures above in force for the
+		// rest of the inspection budget.
+		return self.allowAppStandard(SecurityPolicyReasonAllowMessaging, settings)
 	}
 	if header, ok := web.rtpHeader(ipPath, payload); ok && self.observeRtp(header) {
 		// RTP/SRTP needs coherent headers from multiple packets before it is trusted;
@@ -459,6 +463,17 @@ func (self *dmcaFlowState) allowAppStandard(reason SecurityPolicyReason, setting
 		return self.setTerminal(dmcaAllow, reason)
 	}
 	return dmcaAllow, reason, false
+}
+
+// holdAppCandidate keeps a pending application candidate. Its packet consumes
+// budget but is not counted as encrypted, so the budget still ends the flow's
+// inspection.
+func (self *dmcaFlowState) holdAppCandidate(candidate appCandidate, settings *DmcaSecurityPolicySettings) (dmcaVerdict, SecurityPolicyReason, bool) {
+	self.appCandidate = candidate
+	if settings.InspectionPacketBudget <= self.inspectedPackets {
+		return self.setTerminal(dmcaAllow, SecurityPolicyReasonAllowBudget)
+	}
+	return dmcaInspecting, SecurityPolicyReasonInspecting, false
 }
 
 type dmcaFlowShard struct {
