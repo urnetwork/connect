@@ -267,6 +267,12 @@ type ClientStrategy struct {
 	// these take precedence over other extenders
 	extenderIpSecrets map[netip.Addr]string
 
+	// the DoH settings in force: what the internal DoH cache was built from
+	// and what the extender bootstrap queries. `SetInternalDohSettings`
+	// replaces them; `settings.DohSettings` stays what the strategy was built
+	// with.
+	dohSettings *DohSettings
+
 	nextConnectTime time.Time
 	// reconnectFastPathCount is the number of reconnect fast-path slots
 	// currently held (see NextReconnectTime). Guarded by mutex. The zero value
@@ -479,6 +485,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		internalDohResolver: internalDohResolver,
 		dialers:             dialers,
 		extenderIpSecrets:   map[netip.Addr]string{},
+		dohSettings:         settings.DohSettings,
 	}
 	// the alt dialers need the strategy itself, for its resolver and its
 	// lifetime, so they join the same map after it is built and before
@@ -678,6 +685,40 @@ func (self *ClientStrategy) VlessConfigs() []*VlessConfig {
 		}
 	}
 	return vlessConfigs
+}
+
+// The DoH settings in force (see `SetInternalDohSettings`). Nil for a strategy
+// built without any, whose extender bootstrap then resolves with the system
+// resolver.
+func (self *ClientStrategy) DohSettings() *DohSettings {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.dohSettings
+}
+
+// SetInternalDohSettings replaces the DoH settings of a running strategy: the
+// internal DoH cache its protected control names resolve through is rebuilt
+// from them, and the extender bootstrap queries them from its next pass. This
+// is how a user's bootstrap DoH servers (`ControlDohSettings`) apply without
+// rebuilding the strategy. Resolutions in flight on the replaced cache end,
+// and the next dial resolves through the new one. Nil restores the defaults.
+func (self *ClientStrategy) SetInternalDohSettings(dohSettings *DohSettings) {
+	if dohSettings == nil {
+		dohSettings = DefaultDohSettings()
+	}
+	replacedCache := func() *DohCache {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		self.dohSettings = dohSettings
+		if self.internalDohResolver == nil {
+			return nil
+		}
+		return self.internalDohResolver.replaceCache(NewDohCache(internalDohSettings(dohSettings)))
+	}()
+	// closed outside the lock: closing joins the requests in flight on it
+	if replacedCache != nil {
+		replacedCache.Close()
+	}
 }
 
 // nextConnectMaxLead caps how far the shared next-connect timestamp may run
