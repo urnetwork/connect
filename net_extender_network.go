@@ -343,13 +343,22 @@ type ExtenderNetworkClient struct {
 	dnsWorkers        sync.WaitGroup
 	dnsClosed         bool
 
-	// orders the two sources of the continent hint: the hint loop's operator
-	// answer and the bootstrap's dns inference run side by side, and an
-	// inference must not land after the operator's answer it checked for
+	// guards the continent hint's decision: the hint loop's operator answer
+	// and the bootstrap's dns inference decide side by side, and an inference
+	// must not be decided after the operator's answer (setContinentHint)
 	continentLock sync.Mutex
-	// true once the operator's hint has been applied, which the dns
+	// true once the operator's hint has been decided, which the dns
 	// inference then defers to
 	operatorHintApplied bool
+	// the continent last decided, the source that decided it, and a version
+	// that every decision advances
+	continentHintCode    string
+	continentHintSource  string
+	continentHintVersion uint64
+	// test seam only, nil otherwise: runs between reading a decision and
+	// setting the directory to it, where a newer decision can land
+	// (setContinentHint)
+	continentHintSetHook func()
 }
 
 // The client is running when this returns: the directory has been told a first
@@ -1424,12 +1433,7 @@ func (self *ExtenderNetworkClient) refreshHint() bool {
 	if continentCode == "" {
 		return true
 	}
-	func() {
-		self.continentLock.Lock()
-		defer self.continentLock.Unlock()
-		self.operatorHintApplied = true
-		self.applyContinentHintWithLock(continentCode, "operator")
-	}()
+	self.setContinentHint(continentCode, extenderContinentHintSourceOperator)
 	return true
 }
 
@@ -1458,31 +1462,75 @@ func (self *ExtenderNetworkClient) inferContinentHint(continentCounts map[string
 	if bestCount*2 <= total {
 		return
 	}
-	// checked and applied under one lock: the hint loop's answer may land
-	// while the bootstrap runs, and must not be overridden by an inference
-	// that checked before it
-	func() {
-		self.continentLock.Lock()
-		defer self.continentLock.Unlock()
-		if self.operatorHintApplied {
-			return
-		}
-		self.applyContinentHintWithLock(best, "dns")
-	}()
+	// the hint loop's answer may land while the bootstrap runs; once it is
+	// decided, an inference is not (setContinentHint)
+	self.setContinentHint(best, extenderContinentHintSourceDns)
 }
 
-// Applies a continent to the directory and the status. The caller holds
-// continentLock, which orders the operator's answer and the dns inference
-// across the directory update as well as the check before it.
-func (self *ExtenderNetworkClient) applyContinentHintWithLock(continentCode string, source string) {
-	if self.directory.SetContinentHint(continentCode) {
-		self.log.Infof("[extender]continent hint %s (%s)\n", continentCode, source)
-		// the order changed; what the pass should measure first may have too
-		self.probeWake.NotifyAll()
+// The sources of the continent hint, as its log names them.
+const (
+	extenderContinentHintSourceOperator = "operator"
+	extenderContinentHintSourceDns      = "dns"
+)
+
+// Decides the continent the candidate order prefers and brings the directory
+// and the status to it. The operator's answer always decides, and the dns
+// inference only until the operator has answered: the operator judged this
+// client's address, where the dns judged the resolver's.
+//
+// The two sources decide side by side, the hint loop and the bootstrap. A
+// decision is made under continentLock and advances a version, and the
+// directory and the status are set outside the lock, as any external call
+// is. A setter that read an older decision can set the directory after a
+// newer one has been set, so each setter checks under the lock, once it has
+// set them, that the version it set is still the latest, and sets the latest
+// again when it is not. The last set is therefore always of the latest
+// decision, and an older continent shows at most between the two sets. The
+// loop repeats only while decisions land faster than it sets them, which two
+// sources that decide once per read and once per bootstrap never sustain.
+func (self *ExtenderNetworkClient) setContinentHint(continentCode string, source string) {
+	decided := func() bool {
+		self.continentLock.Lock()
+		defer self.continentLock.Unlock()
+		if source == extenderContinentHintSourceOperator {
+			self.operatorHintApplied = true
+		} else if self.operatorHintApplied {
+			return false
+		}
+		self.continentHintCode = continentCode
+		self.continentHintSource = source
+		self.continentHintVersion += 1
+		return true
+	}()
+	if !decided {
+		return
 	}
-	self.updateStatus(func(status *ExtenderNetworkClientStatus) {
-		status.ContinentHint = continentCode
-	})
+	for {
+		decidedContinentCode, decidedSource, decidedVersion := func() (string, string, uint64) {
+			self.continentLock.Lock()
+			defer self.continentLock.Unlock()
+			return self.continentHintCode, self.continentHintSource, self.continentHintVersion
+		}()
+		if self.continentHintSetHook != nil {
+			self.continentHintSetHook()
+		}
+		if self.directory.SetContinentHint(decidedContinentCode) {
+			self.log.Infof("[extender]continent hint %s (%s)\n", decidedContinentCode, decidedSource)
+			// the order changed; what the pass should measure first may have too
+			self.probeWake.NotifyAll()
+		}
+		self.updateStatus(func(status *ExtenderNetworkClientStatus) {
+			status.ContinentHint = decidedContinentCode
+		})
+		latest := func() bool {
+			self.continentLock.Lock()
+			defer self.continentLock.Unlock()
+			return self.continentHintVersion == decidedVersion
+		}()
+		if latest {
+			return
+		}
+	}
 }
 
 // The continent a signed record carries, upper case, empty when it predates

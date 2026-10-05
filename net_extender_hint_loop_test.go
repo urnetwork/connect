@@ -506,3 +506,46 @@ func TestExtenderHintScheduleBacksOffAFailure(t *testing.T) {
 	hintSchedule.Fail(now)
 	assertNextDue(minBackoff)
 }
+
+// The operator's continent outranks the dns inference however the two
+// interleave around the directory, which is set outside continentLock. Here
+// the inference has read its decision when the operator answers, so the
+// inference sets the directory after the operator has: it then finds a newer
+// decision and sets that, and the directory and the status end at the
+// operator's continent. An inference decided after the operator's answer is
+// refused. A setter that did not check for a newer decision would leave the
+// inference's continent in force.
+func TestExtenderNetworkClientContinentHintKeepsTheOperatorsOverALateInference(t *testing.T) {
+	clock := newTestClock()
+	directory, _ := newTestExtenderDirectory(t, clock, nil)
+	networkClient := newTestBareExtenderNetworkClient(t, directory)
+	// the operator answers once, in the inference's window between reading
+	// its decision and setting the directory
+	operatorAnswered := false
+	networkClient.continentHintSetHook = func() {
+		if operatorAnswered {
+			return
+		}
+		operatorAnswered = true
+		networkClient.setContinentHint("EU", extenderContinentHintSourceOperator)
+	}
+	networkClient.setContinentHint("NA", extenderContinentHintSourceDns)
+	if !operatorAnswered {
+		t.Fatal("the operator did not answer in the inference's window")
+	}
+	if continentHint := directory.ContinentHint(); continentHint != "EU" {
+		t.Fatalf("directory hint = %q, expected the operator's EU over the inference set after it", continentHint)
+	}
+	if continentHint := networkClient.Status().ContinentHint; continentHint != "EU" {
+		t.Fatalf("status hint = %q, expected the operator's EU over the inference set after it", continentHint)
+	}
+
+	networkClient.continentHintSetHook = nil
+	networkClient.setContinentHint("AS", extenderContinentHintSourceDns)
+	if continentHint := directory.ContinentHint(); continentHint != "EU" {
+		t.Fatalf("directory hint = %q, expected an inference after the operator's answer refused", continentHint)
+	}
+	if continentHint := networkClient.Status().ContinentHint; continentHint != "EU" {
+		t.Fatalf("status hint = %q, expected an inference after the operator's answer refused", continentHint)
+	}
+}
