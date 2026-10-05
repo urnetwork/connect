@@ -34,6 +34,8 @@ type testBlackholedExtenderHint struct {
 	inFlight  int
 }
 
+// The settings seam: each read waits out its budget, as a black-holed dial
+// does.
 func (self *testBlackholedExtenderHint) Hint(ctx context.Context) (*ExtenderHintResult, error) {
 	func() {
 		self.stateLock.Lock()
@@ -70,6 +72,9 @@ type testHintLoop struct {
 	passCount atomic.Int64
 }
 
+// The network client of one test, run in its bubble, reading the hint
+// through hint; configure, when set, changes the settings before the client
+// starts.
 func newTestHintLoop(
 	t *testing.T,
 	hint func(ctx context.Context) (*ExtenderHintResult, error),
@@ -440,9 +445,11 @@ func TestExtenderNetworkClientFirstProbePassWaitsForTheHint(t *testing.T) {
 
 		close(releaseHint)
 		synctest.Wait()
-		probes.stateLock.Lock()
-		ips := slices.Clone(probes.ips)
-		probes.stateLock.Unlock()
+		ips := func() []string {
+			probes.stateLock.Lock()
+			defer probes.stateLock.Unlock()
+			return slices.Clone(probes.ips)
+		}()
 		slices.Sort(ips)
 		if !slices.Equal(ips, []string{"192.0.2.10", "192.0.2.11"}) {
 			t.Fatalf("probes = %v, expected exactly the two extenders on the operator's continent", ips)

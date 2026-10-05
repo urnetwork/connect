@@ -1395,7 +1395,7 @@ func (self *ExtenderNetworkClient) refreshHint() bool {
 		self.continentLock.Lock()
 		defer self.continentLock.Unlock()
 		self.operatorHintApplied = true
-		self.applyContinentHint(continentCode, "operator")
+		self.applyContinentHintWithLock(continentCode, "operator")
 	}()
 	return true
 }
@@ -1428,15 +1428,20 @@ func (self *ExtenderNetworkClient) inferContinentHint(continentCounts map[string
 	// checked and applied under one lock: the hint loop's answer may land
 	// while the bootstrap runs, and must not be overridden by an inference
 	// that checked before it
-	self.continentLock.Lock()
-	defer self.continentLock.Unlock()
-	if self.operatorHintApplied {
-		return
-	}
-	self.applyContinentHint(best, "dns")
+	func() {
+		self.continentLock.Lock()
+		defer self.continentLock.Unlock()
+		if self.operatorHintApplied {
+			return
+		}
+		self.applyContinentHintWithLock(best, "dns")
+	}()
 }
 
-func (self *ExtenderNetworkClient) applyContinentHint(continentCode string, source string) {
+// Applies a continent to the directory and the status. The caller holds
+// continentLock, which orders the operator's answer and the dns inference
+// across the directory update as well as the check before it.
+func (self *ExtenderNetworkClient) applyContinentHintWithLock(continentCode string, source string) {
 	if self.directory.SetContinentHint(continentCode) {
 		self.log.Infof("[extender]continent hint %s (%s)\n", continentCode, source)
 		// the order changed; what the pass should measure first may have too
