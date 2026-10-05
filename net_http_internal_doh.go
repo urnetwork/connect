@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -20,9 +21,14 @@ const internalDohDialFallbackDelay = DefaultDialFallbackDelay
 // passes only IP literals to the underlying dialer. TLS remains outside this
 // layer, where it still sees the original hostname.
 type internalDohResolver struct {
-	cache    *DohCache
 	domains  []string
 	nextAddr atomic.Uint64
+
+	// stateLock guards the cache, which `ClientStrategy.SetInternalDohSettings`
+	// replaces on a running strategy, and closed.
+	stateLock sync.Mutex
+	cache     *DohCache
+	closed    bool
 }
 
 // clientStrategySettingsWithInternalDoh installs the resolver ahead of every
@@ -130,6 +136,28 @@ func normalizeInternalDohName(name string) string {
 	return strings.ToLower(strings.TrimSuffix(ascii, "."))
 }
 
+// The cache resolutions go through now. A resolution keeps the cache it
+// started on; a replaced cache is closed, which ends it.
+func (self *internalDohResolver) getCache() *DohCache {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.cache
+}
+
+// replaceCache installs a cache and returns the one it replaced, for the
+// caller to close outside its own locks. A closed resolver installs nothing
+// and returns the new cache to be closed instead.
+func (self *internalDohResolver) replaceCache(cache *DohCache) *DohCache {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed {
+		return cache
+	}
+	replaced := self.cache
+	self.cache = cache
+	return replaced
+}
+
 func (self *internalDohResolver) matches(host string) bool {
 	host = normalizeInternalDohName(host)
 	if host == "" {
@@ -149,7 +177,7 @@ func (self *internalDohResolver) matches(host string) bool {
 // resolve answers a protected name for the families the (already narrowed)
 // network permits, ordered for the race. See resolveDohDialAddrs.
 func (self *internalDohResolver) resolve(ctx context.Context, network string, host string) ([]netip.Addr, error) {
-	return resolveDohDialAddrs(ctx, self.cache, network, host)
+	return resolveDohDialAddrs(ctx, self.getCache(), network, host)
 }
 
 // orderInternalDohAddrs is the shared race order (orderDialAddrs): families
@@ -165,11 +193,11 @@ func (self *internalDohResolver) wrapDialContext(dialContext DialContextFunction
 			return dialContext(ctx, network, address)
 		}
 		if isRaceableDialNetwork(network) {
-			return dialDohAddrsRace(ctx, self.cache, network, host, internalDohDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+			return dialDohAddrsRace(ctx, self.getCache(), network, host, internalDohDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 				return dialContext(ctx, familyDialNetwork(network, addr), net.JoinHostPort(addr.String(), port))
 			})
 		}
-		addrs, err := resolveFirstDohDialAddrs(ctx, self.cache, network, host)
+		addrs, err := resolveFirstDohDialAddrs(ctx, self.getCache(), network, host)
 		if err != nil {
 			return nil, err
 		}
@@ -213,7 +241,7 @@ func (self *internalDohResolver) resolveUDPAddr(ctx context.Context, address str
 	if err != nil {
 		return nil, err
 	}
-	addrs, err := resolveFirstDohDialAddrs(ctx, self.cache, network, host)
+	addrs, err := resolveFirstDohDialAddrs(ctx, self.getCache(), network, host)
 	if err != nil {
 		return nil, err
 	}
@@ -253,11 +281,17 @@ func (self *internalDohResolver) resolveUDPAddrs(ctx context.Context, address st
 }
 
 func (self *internalDohResolver) CloseIdleConnections() {
-	self.cache.CloseIdleConnections()
+	self.getCache().CloseIdleConnections()
 }
 
 func (self *internalDohResolver) Close() {
-	self.cache.Close()
+	cache := func() *DohCache {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.closed = true
+		return self.cache
+	}()
+	cache.Close()
 }
 
 // resolveControlUDPAddr applies the same protected-domain policy to QUIC and

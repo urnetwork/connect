@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -351,5 +353,103 @@ func TestInternalDohRawDialFallsBackAcrossAddressFamilies(t *testing.T) {
 	}
 	if got := attempts.Load(); got != 2 {
 		t.Fatalf("raw dial attempts = %d, expected IPv6 then IPv4", got)
+	}
+}
+
+// A protected name resolves through a user's bootstrap DoH server when every
+// default server is black-holed (P216). The named server is tried first, in
+// one of the internal cache's four request slots, rather than queued behind
+// defaults that never answer: without that every lookup that drew four
+// defaults first would time out.
+func TestInternalDohResolvesThroughControlDohWhenTheDefaultsAreUnreachable(t *testing.T) {
+	answer := netip.MustParseAddr("192.0.2.53")
+	var queries atomic.Int32
+	dohUrl, tlsConfig, address := newControlDohTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries.Add(1)
+		writeDohWire(w, r, []netip.Addr{answer}, 60, false)
+	}))
+	dialer := &controlDohTestDialer{allowedAddresses: []string{address}}
+
+	settings := DefaultClientStrategySettings()
+	settings.InternalDohDomains = []string{"space.example"}
+	settings.DohSettings = controlDohTestSettings(dohUrl, tlsConfig, dialer)
+	strategy := NewClientStrategy(t.Context(), settings)
+	defer strategy.Close()
+
+	// distinct names, so each lookup is a fresh query that must reach a server
+	for i := range 6 {
+		host := fmt.Sprintf("api%d.space.example", i)
+		addrs, err := strategy.internalDohResolver.resolve(t.Context(), "tcp4", host)
+		if err != nil {
+			t.Fatalf("%s: %v", host, err)
+		}
+		if !slices.Equal(addrs, []netip.Addr{answer}) {
+			t.Fatalf("%s = %v, expected %s", host, addrs, answer)
+		}
+	}
+	if n := queries.Load(); n < 6 {
+		t.Fatalf("the named server answered %d queries, expected one per name", n)
+	}
+	if dialer.blackholedCount.Load() == 0 {
+		t.Fatal("no default server was dialed, so nothing showed them unreachable")
+	}
+}
+
+// SetInternalDohSettings swaps the cache of a running strategy: a name the
+// black-holed defaults could not resolve resolves through the named server
+// once it is set, the replaced cache is retired, and the settings the extender
+// bootstrap reads are the new ones. A closed strategy keeps nothing it is
+// handed.
+func TestSetInternalDohSettingsReplacesTheCacheInPlace(t *testing.T) {
+	answer := netip.MustParseAddr("192.0.2.54")
+	dohUrl, tlsConfig, address := newControlDohTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeDohWire(w, r, []netip.Addr{answer}, 60, false)
+	}))
+	dialer := &controlDohTestDialer{allowedAddresses: []string{address}}
+
+	settings := DefaultClientStrategySettings()
+	settings.InternalDohDomains = []string{"space.example"}
+	settings.DohSettings = controlDohTestDefaultSettings(dialer)
+	strategy := NewClientStrategy(t.Context(), settings)
+	defer strategy.Close()
+
+	if addrs, err := strategy.internalDohResolver.resolve(t.Context(), "tcp4", "api.space.example"); err == nil {
+		t.Fatalf("resolved %v through black-holed defaults", addrs)
+	}
+	replacedCache := strategy.internalDohResolver.getCache()
+
+	controlSettings := controlDohTestSettings(dohUrl, tlsConfig, dialer)
+	strategy.SetInternalDohSettings(controlSettings)
+	if strategy.DohSettings() != controlSettings {
+		t.Fatal("the strategy does not report the settings it was given")
+	}
+	if strategy.internalDohResolver.getCache() == replacedCache {
+		t.Fatal("the internal DoH cache was not replaced")
+	}
+	if !replacedCache.lifecycle.retired.Load() {
+		t.Fatal("the replaced cache was left open")
+	}
+	addrs, err := strategy.internalDohResolver.resolve(t.Context(), "tcp4", "api.space.example")
+	if err != nil {
+		t.Fatalf("after the swap: %v", err)
+	}
+	if !slices.Equal(addrs, []netip.Addr{answer}) {
+		t.Fatalf("after the swap = %v, expected %s", addrs, answer)
+	}
+
+	// nil restores the defaults
+	strategy.SetInternalDohSettings(nil)
+	if dohUrls := strategy.DohSettings().DnsResolverSettings.RemoteDohUrlsIpv4; !slices.Equal(dohUrls, DefaultDnsResolverSettings().RemoteDohUrlsIpv4) {
+		t.Fatalf("nil settings = %v, expected the defaults", dohUrls)
+	}
+
+	strategy.Close()
+	closedCache := strategy.internalDohResolver.getCache()
+	if !closedCache.lifecycle.retired.Load() {
+		t.Fatal("closing the strategy left its cache open")
+	}
+	strategy.SetInternalDohSettings(controlDohTestSettings(dohUrl, tlsConfig, dialer))
+	if strategy.internalDohResolver.getCache() != closedCache {
+		t.Fatal("a closed strategy installed a new cache")
 	}
 }

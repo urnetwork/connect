@@ -61,6 +61,9 @@ func newCloseDeliveryTestClient(t *testing.T, ctx context.Context, oob OutOfBand
 	t.Helper()
 	settings := closeWaitClientSettings()
 	settings.ContractManagerSettings = DefaultContractManagerSettingsNoNetworkEvents()
+	// Keep the constructor worker parked until Close; hook installation then
+	// happens before cancellation releases its completion-hook read.
+	settings.ContractManagerSettings.ProvidePingTimeout = time.Hour
 	settings.ContractManagerSettings.CloseReportDomainHash = [32]byte{91}
 	settings.ClientKeySeed = bytes.Repeat([]byte{92}, 32)
 	client := NewClient(ctx, NewId(), oob, settings)

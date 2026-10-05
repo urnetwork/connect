@@ -376,7 +376,7 @@ func TestExtenderFeedConfigFollowsTheCarrier(t *testing.T) {
 		{connectMode: ExtenderConnectModeDns, port: 3053, dnsTld: "x.example."},
 	}
 	for _, c := range cases {
-		extenderConfig := extenderFeedConfig(candidate, c.connectMode)
+		extenderConfig := extenderFeedConfig(candidate, c.connectMode, SpoofDomains())
 		if extenderConfig == nil {
 			t.Errorf("%s yielded no config", c.connectMode)
 			continue
@@ -408,7 +408,7 @@ func TestExtenderFeedConfigFollowsTheCarrier(t *testing.T) {
 		ExtenderConnectModeQuic,
 		ExtenderConnectModeDns,
 	} {
-		if extenderConfig := extenderFeedConfig(portless, connectMode); extenderConfig != nil {
+		if extenderConfig := extenderFeedConfig(portless, connectMode, SpoofDomains()); extenderConfig != nil {
 			t.Errorf("%s yielded a config on port %d",
 				connectMode, extenderConfig.Profile.Port)
 		}

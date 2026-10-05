@@ -167,6 +167,18 @@ type MultiClientGeneratorWithIpFamily interface {
 	NextDestinationsWithIpFamily(count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error)
 }
 
+// MultiClientGeneratorWithClientId is an optional generator capability:
+// discover one named provider instead of the generator's own specs. A sticky
+// window (the user's Fixed IP) uses it to ask for the exit it lost to
+// transport loss before it falls back to discovery, so a provider that is
+// still online comes back with the same egress ip. The platform applies its
+// usual exclusions to the named provider: an answer without it means "not
+// that provider". A generator without the capability is never asked, and the
+// window discovers as before.
+type MultiClientGeneratorWithClientId interface {
+	NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error)
+}
+
 func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
 		SequenceBufferSize:  defaultTransferBufferSize,
@@ -462,6 +474,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		BlockActionDecisionMaxCount: 4096,
 		PolicyHintTtl:               10 * time.Minute,
 		PolicyHintMaxCount:          1024,
+		// long enough to cover an app's reconnect backoff after its stalled
+		// connection, short enough that the preference does not outlive the
+		// blocked flow by much
+		ProviderPolicyPreferenceTtl: 5 * time.Minute,
 		BlockActionAggMaxCount:      1024,
 		IpAssocSettings:             DefaultIpAssocSettings(),
 
@@ -1304,6 +1320,11 @@ type MultiClientSettings struct {
 	// 0 disables the hints
 	PolicyHintTtl      time.Duration
 	PolicyHintMaxCount int
+	// how long new flows prefer providers whose security policy generation is
+	// at least the client's own after a provider with an older or unknown
+	// generation dropped this client's traffic (providerPolicyPreference).
+	// Each further drop re-arms it. 0 disables the preference
+	ProviderPolicyPreferenceTtl time.Duration
 	// nil disables activity association (`IpAssoc`)
 	IpAssocSettings *IpAssocSettings
 
@@ -1336,10 +1357,35 @@ type WindowSizeSettings struct {
 }
 
 func (self *WindowSizeSettings) Validate() error {
-	if self.WindowSizeMinIpv6Capable < 0 {
+	// no size or count has a meaning below zero, and a performance profile
+	// carries these values from callers the window cannot trust
+	for _, count := range []struct {
+		name  string
+		value int
+	}{
+		{"min", self.WindowSizeMin},
+		{"min p2p only", self.WindowSizeMinP2pOnly},
+		{"min ipv6 capable", self.WindowSizeMinIpv6Capable},
+		{"max", self.WindowSizeMax},
+		{"hard max", self.WindowSizeHardMax},
+		{"fixed", self.FixedWindowSize},
+		{"keep healthiest count", self.KeepHealthiestCount},
+		{"ulimit", self.Ulimit},
+	} {
+		if count.value < 0 {
+			return fmt.Errorf(
+				"Window size %s =%d must be >= 0",
+				count.name,
+				count.value,
+			)
+		}
+	}
+	if self.WindowSizeReconnectScale < 0 ||
+		math.IsNaN(self.WindowSizeReconnectScale) ||
+		math.IsInf(self.WindowSizeReconnectScale, 0) {
 		return fmt.Errorf(
-			"Window size min ipv6 capable =%d must be >= 0",
-			self.WindowSizeMinIpv6Capable,
+			"Window size reconnect scale =%v must be finite and >= 0",
+			self.WindowSizeReconnectScale,
 		)
 	}
 	if self.WindowSizeMax < self.WindowSizeMin {
@@ -1396,6 +1442,14 @@ func (self *PerformanceProfile) Validate() error {
 	err := self.WindowSize.Validate()
 	if err != nil {
 		return err
+	}
+	// a fixed window carries all of the traffic, so a window that can hold
+	// no exit leaves no route at all (and reads as satisfied while empty)
+	if self.WindowType != WindowTypeAuto && self.WindowSize.WindowSizeMax < 1 {
+		return fmt.Errorf(
+			"Window size max =%d must be >= 1 for a fixed window",
+			self.WindowSize.WindowSizeMax,
+		)
 	}
 
 	return nil
@@ -1611,6 +1665,9 @@ type RemoteUserNatMultiClient struct {
 	// destinations whose flow was dropped as unsanctioned encrypted traffic;
 	// nil when disabled
 	policyLocalHints *policyHintCache
+	// shared with every window channel through its args, which arm it from
+	// provider diagnostics and read it in effectiveTier; nil when disabled
+	providerPolicyPreference *providerPolicyPreference
 
 	// the G-4b flow-owner seam: the platform's resolver for "which pinned
 	// app owns this flow", with its per-flow-key answer cache. Zero values
@@ -2490,7 +2547,23 @@ func NewRemoteUserNatMultiClient(
 	if settings.IpAssocSettings != nil {
 		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
 	}
-	effectivePerformanceProfile := multiClient.overrideAllowDirect(settings.DefaultPerformanceProfile)
+	multiClient.providerPolicyPreference = newProviderPolicyPreference(
+		SecurityPolicyGeneration(multiClient.securityPolicy),
+		settings.ProviderPolicyPreferenceTtl,
+		nil,
+	)
+	// a default profile that does not validate is refused the same as one
+	// set later (see SetPerformanceProfile): the windows start in auto rather
+	// than size themselves from an invalid window
+	defaultPerformanceProfile := settings.DefaultPerformanceProfile
+	if defaultPerformanceProfile != nil {
+		err := defaultPerformanceProfile.Validate()
+		if err != nil {
+			log.Warningf("[multi]default performance profile refused: %s\n", err)
+			defaultPerformanceProfile = nil
+		}
+	}
+	effectivePerformanceProfile := multiClient.overrideAllowDirect(defaultPerformanceProfile)
 	multiClient.config.Store(&multiClientConfig{
 		performanceProfile:  effectivePerformanceProfile,
 		localSecurityBypass: false,
@@ -2533,6 +2606,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.providerQualified,
 		multiClient.receivingChannelCount,
 		multiClient.recordProbePass,
+		multiClient.providerPolicyPreference,
 	)
 	multiClient.windows[WindowTypeQuality].clientMigrateFunc = multiClient.migrateClientFlows
 	if _, fixed := generator.FixedDestinationSize(); !fixed {
@@ -2556,6 +2630,7 @@ func NewRemoteUserNatMultiClient(
 			multiClient.providerQualified,
 			multiClient.receivingChannelCount,
 			multiClient.recordProbePass,
+			multiClient.providerPolicyPreference,
 		)
 		multiClient.windows[WindowTypeSpeed].clientMigrateFunc = multiClient.migrateClientFlows
 	}
@@ -2813,12 +2888,16 @@ func performanceProfilesEqual(a *PerformanceProfile, b *PerformanceProfile) bool
 	return a.WindowSize == b.WindowSize
 }
 
-func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
+// SetPerformanceProfile installs the profile on every window and resets the
+// windows. A profile that does not validate is refused with its error and the
+// previous profile stays in force: the window size comes from the caller, and
+// a bad one must never panic the connection or reach the windows.
+func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) error {
 	performanceProfile = self.overrideAllowDirect(performanceProfile)
 	if performanceProfile != nil {
 		err := performanceProfile.Validate()
 		if err != nil {
-			panic(err)
+			return err
 		}
 	}
 
@@ -2826,7 +2905,7 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 	// client, and presentation code commonly re-applies an equal profile on
 	// resume -- that must not tear the window down
 	if performanceProfilesEqual(self.config.Load().performanceProfile, performanceProfile) {
-		return
+		return nil
 	}
 
 	func() {
@@ -2848,6 +2927,7 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 		// reset the window
 		window.shuffle()
 	}
+	return nil
 }
 
 func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass bool) {
@@ -8731,11 +8811,14 @@ type ExitInfo struct {
 	ProviderDiagnosticsAvailable bool
 	ProviderBuildVersion         string
 	ProviderSecurityPolicyHash   string
-	ProviderBlockIngressPackets  int64
-	ProviderBlockIngressBytes    int64
-	ProviderBlockEgressPackets   int64
-	ProviderBlockEgressBytes     int64
-	ProviderDiagnosticsSequence  int64
+	// 0 is unknown: the provider predates the field or runs a custom policy
+	// (see SecurityPolicyRulesGeneration)
+	ProviderSecurityPolicyGeneration uint64
+	ProviderBlockIngressPackets      int64
+	ProviderBlockIngressBytes        int64
+	ProviderBlockEgressPackets       int64
+	ProviderBlockEgressBytes         int64
+	ProviderDiagnosticsSequence      int64
 }
 
 // Exits reports the provider channels across every window, with the number of
@@ -8806,6 +8889,7 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 				exitInfo.ProviderDiagnosticsAvailable = true
 				exitInfo.ProviderBuildVersion = diagnostics.BuildVersion
 				exitInfo.ProviderSecurityPolicyHash = diagnostics.SecurityPolicyHash
+				exitInfo.ProviderSecurityPolicyGeneration = diagnostics.SecurityPolicyGeneration
 				exitInfo.ProviderBlockIngressPackets = diagnostics.BlockIngressPacketCount
 				exitInfo.ProviderBlockIngressBytes = diagnostics.BlockIngressByteCount
 				exitInfo.ProviderBlockEgressPackets = diagnostics.BlockEgressPacketCount
@@ -9940,6 +10024,11 @@ func jitterClientLifetime(maxClientLifetime time.Duration) time.Duration {
 //     nothing beyond the set to hold in reserve, and asking for it would
 //     leave every expand pass waiting out its timeout on args that cannot
 //     arrive,
+//   - the window is the user's Fixed IP (stickyExit, see stickyExitProfile):
+//     a spare is a second selectable exit, so new flows could leave on
+//     another egress ip. The apps leave WindowSizeHardMax at 0, so the hard
+//     max never stopped it. Failover for a sticky window goes back to the
+//     backfill the reserve shortened, which is the trade the user chose,
 //   - the computed target is 0, which is how resize disables a non-active
 //     fixed-profile window -- a spare there would silently re-enable it.
 func standingReserveTarget(
@@ -9947,8 +10036,9 @@ func standingReserveTarget(
 	windowSizeHardMax int,
 	standingReserve bool,
 	fixedDestination bool,
+	stickyExit bool,
 ) int {
-	if !standingReserve || fixedDestination || targetWindowSize <= 0 {
+	if !standingReserve || fixedDestination || stickyExit || targetWindowSize <= 0 {
 		return targetWindowSize
 	}
 	reserveTargetWindowSize := targetWindowSize + standingReserveSpares
@@ -10062,6 +10152,10 @@ type multiClientWindow struct {
 	// qualificationRefreshFunc is handed to every channel for the receive-ack
 	// qualification refresh; see the channel field. nil on bare test windows.
 	qualificationRefreshFunc func(MultiHopId)
+	// providerPolicyPreference is the parent's, handed to every channel on its
+	// args (providerPolicyPreference). nil on bare test windows and when
+	// disabled, which leaves every channel at its rank.
+	providerPolicyPreference *providerPolicyPreference
 	// clientMigrateFunc is G-3's drain-time seam: the parent's
 	// migrateClientFlows, called once when the resize pass starts draining an
 	// exit so its movable flows leave while everything else finishes
@@ -10159,6 +10253,12 @@ type multiClientWindow struct {
 	ipv6ProbeRequested bool
 	ipv6CandidateReady bool
 	ipv6FillFailures   int
+
+	// --- the user's Fixed IP (see ip_remote_multi_client_sticky.go) ---
+
+	// stickyRedial holds the exit a sticky window lost to transport loss,
+	// for the next discovery round to ask for first. Its own lock inside.
+	stickyRedial stickyRedial
 }
 
 func newMultiClientWindow(
@@ -10181,6 +10281,7 @@ func newMultiClientWindow(
 	providerQualifiedFunc func(MultiHopId) bool,
 	receivingSiblingsFunc func(exclude *multiClientChannel) int,
 	qualificationRefreshFunc func(MultiHopId),
+	providerPolicyPreference *providerPolicyPreference,
 ) *multiClientWindow {
 	window := &multiClientWindow{
 		ctx:                          ctx,
@@ -10203,6 +10304,7 @@ func newMultiClientWindow(
 		providerQualifiedFunc:        providerQualifiedFunc,
 		receivingSiblingsFunc:        receivingSiblingsFunc,
 		qualificationRefreshFunc:     qualificationRefreshFunc,
+		providerPolicyPreference:     providerPolicyPreference,
 		clientChannelArgs:            make(chan *multiClientChannelArgs),
 		monitor:                      NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
 		contractStatusCallbacks:      NewCallbackList[*contractStatusCallbackWorker](),
@@ -10644,6 +10746,8 @@ func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *Perform
 		return
 	}
 	self.performanceProfile = performanceProfile
+	// a lost exit is only wanted back under the profile it was lost in
+	self.stickyRedial.Forget()
 	if self.resizeMonitor != nil {
 		self.resizeMonitor.NotifyAll()
 	}
@@ -10910,6 +11014,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						DestinationStats:               stats,
 						MultiClientGeneratorClientArgs: *clientArgs,
 						FixedDestination:               fixedDestination,
+						stickyRedial:                   enumerated.stickyRedial,
 					}
 					select {
 					case <-self.ctx.Done():
@@ -10944,6 +11049,9 @@ func (self *multiClientWindow) resize() {
 
 		var windowSize WindowSizeSettings
 		var fixedWindowType *WindowType
+		// read with the size, under the same lock, so one pass never sizes
+		// for one profile and rotates for another
+		var stickyExit bool
 		func() {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
@@ -10953,6 +11061,7 @@ func (self *multiClientWindow) resize() {
 			} else {
 				windowSize = self.settings.WindowSizes[self.windowType]
 			}
+			stickyExit = stickyExitProfile(self.performanceProfile)
 		}()
 
 		startTime := time.Now()
@@ -11045,6 +11154,10 @@ func (self *multiClientWindow) resize() {
 						"flows", self.flowCount(client),
 					),
 				)
+				// the user's Fixed IP lost its exit to transport loss, not to
+				// a verdict against the provider: ask for the same provider
+				// first (see stickyRedial)
+				self.rememberStickyRedial(client, err, stickyExit)
 				removeClient(client)
 			}
 		}
@@ -11128,7 +11241,7 @@ func (self *multiClientWindow) resize() {
 				// a client after its `removeTime` will be in a permananent warning state as long as it continues to route traffic
 				// this prevents new connections from using the client
 				if stats.unhealthyDuration < self.settings.StatsWindowWarnUnhealthyDuration {
-					if !stats.removeTime.IsZero() && stats.removeTime.Before(startTime) {
+					if lifetimeDrainDue(stats, startTime, stickyExit) {
 						printStats("client drain")
 						// a past-lifetime client always warns, regardless of
 						// the remove-rank math above. `remove` is a health
@@ -11143,7 +11256,10 @@ func (self *multiClientWindow) resize() {
 						// rotation was silently a no-op for exactly the exit
 						// it matters most for. Draining is rotation policy,
 						// not a health verdict, so the rank shield does not
-						// apply. The warning only stops NEW flows from
+						// apply. The one window that never drains is the
+						// user's Fixed IP (stickyExit), and lifetimeDrainDue
+						// has already excluded it: there the stable egress ip
+						// is the point. The warning only stops NEW flows from
 						// choosing this client (established flows keep
 						// running until they finish or the collapse deadline
 						// passes), and warnClient counts it in
@@ -11482,12 +11598,15 @@ func (self *multiClientWindow) resize() {
 		// answers "how many exits does the traffic need", the reserve answers
 		// "how many failures can be absorbed without a connect in the
 		// recovery path". windowSizeMin is deliberately untouched -- the
-		// spare must never make the window read as unsatisfied.
+		// spare must never make the window read as unsatisfied. The user's
+		// Fixed IP holds no spare: a second selectable exit is a second
+		// egress ip (see standingReserveTarget).
 		targetWindowSize = standingReserveTarget(
 			targetWindowSize,
 			windowSize.WindowSizeHardMax,
 			self.reliabilitySettings().StandingReserve,
 			fixedDestination,
+			stickyExit,
 		)
 
 		// while the control API is unreachable, hold the window at its
@@ -12111,6 +12230,7 @@ requestCandidates:
 			args.ReceivePackets = self.clientReceivePacketsCallback
 			args.NetworkPeerDestination = self.networkPeerDestination
 			args.contractStatus = self.contractStatusFromClient
+			args.providerPolicyPreference = self.providerPolicyPreference
 			args.providerEvaluation = &providerEvaluationAttempt{
 				owner:             &self.providerEvaluation,
 				destinationId:     args.Destination.Tail(),
@@ -12411,6 +12531,14 @@ requestCandidates:
 						fail(!args.providerEvaluation.localContractUnavailable(), initialPingError)
 					}
 				})
+			}
+			if err == nil && args.stickyRedial {
+				// a sticky window's lost exit is evaluated alone: a second
+				// candidate in the pool would be admitted whenever it answers
+				// first, and the re-dial exists to keep the egress ip. A failed
+				// evaluation ends this pass empty, and the next pass discovers
+				// as usual (the enumerator took the re-dial).
+				break requestCandidates
 			}
 		case <-time.After(timeout):
 			self.log.V(2).Infof("[multi]expand window timeout waiting for args\n")
@@ -12782,6 +12910,8 @@ func (self *multiClientWindow) verdictRemovalAllowed(now time.Time) bool {
 }
 
 func (self *multiClientWindow) shuffle() {
+	// a shuffle asks for new exits, so a lost exit is not dialed again
+	self.stickyRedial.Forget()
 	for _, client := range self.unorderedClients() {
 		client.Cancel()
 	}
@@ -13166,12 +13296,22 @@ type multiClientChannelArgs struct {
 	// (IPV6.md B1 exempts fixed windows from the soft minimum).
 	FixedDestination bool
 
+	// stickyRedial marks the exit a sticky window lost to transport loss,
+	// asked for again by name (enumerateStickyRedial). expand evaluates it
+	// alone, so a faster candidate cannot take the slot and change the
+	// egress ip the re-dial exists to keep.
+	stickyRedial bool
+
 	// contractStatus preserves the identity of the channel whose contract
 	// manager emitted a result. The public constructor callback does not carry
 	// that identity; the owning window needs it to retire only the failed route.
 	// nil keeps directly constructed test channels on the legacy relay path.
 	contractStatus     func(client *multiClientChannel, status *ContractStatus)
 	providerEvaluation *providerEvaluationAttempt
+	// providerPolicyPreference is the parent's, shared by every channel: armed
+	// from this channel's provider diagnostics, read by effectiveTier. nil
+	// (bare fixtures, or disabled) leaves the channel at its rank.
+	providerPolicyPreference *providerPolicyPreference
 }
 
 // clientReceivePacketsFunction is the batch form of
@@ -13988,6 +14128,15 @@ const quarantineMemoryDuration = 5 * time.Minute
 //     that has never coalesced stats (healthy's zero value is false) at its
 //     static tier.
 //
+//   - older security policy (+2): while the provider policy preference is
+//     armed (a provider with an older or unknown rules generation dropped
+//     this client's traffic; see providerPolicyPreference), a provider whose
+//     generation is not at least the client's own falls behind every current
+//     provider of the next tier, so the app's retry is not placed on older
+//     rules again. It depends on the generation alone, so it never ranks an
+//     older or unknown generation above a newer one, and it lapses with the
+//     preference's ttl.
+//
 // Demerits apply immediately -- the next selection pass reads them -- which
 // is the ~1s demotion the design asks for; every one of them decays toward
 // the static tier on its own slow, documented schedule. The +2 steps mean a
@@ -14025,6 +14174,9 @@ func (self *multiClientChannel) effectiveTier() int {
 	if reliabilitySettings.ProviderProbe && self.providerQualifiedFunc != nil {
 		unproven = !self.providerQualifiedFunc(self.probeDestination())
 	}
+
+	// lock-free atomics, read outside the lock like the lookup above
+	tier += self.policyPreference().demerit(self.providerPolicyGeneration())
 
 	now := time.Now()
 	self.stateLock.Lock()
@@ -17643,6 +17795,9 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 					break
 				}
 				if self.providerDiagnostics.CompareAndSwap(current, next) {
+					// the delta from the snapshot this one replaced, so
+					// each reported block is observed exactly once
+					self.observeProviderDiagnostics(current, next)
 					break
 				}
 			}

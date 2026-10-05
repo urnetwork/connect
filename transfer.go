@@ -5225,6 +5225,9 @@ type SendBufferSettings struct {
 	// Nil observers pin admission across an idle check without scheduler timing.
 	beforeRequiredEncryptionWaitForTest func(sendSequenceId)
 	afterIdleCloseForTest               func(sendSequenceId, bool)
+	// Nil observer marks an application Pack entering the Opportunistic
+	// establish hold's wait.
+	beforeEstablishHoldWaitForTest func(sendSequenceId)
 	// Runs after the caller-side no-acknowledgement stage decided, with
 	// whether an immediate write was attempted, whether it succeeded, and the
 	// timeout the pack then carries into admission (THROUGHPUTFIX §38.12).
@@ -5699,7 +5702,7 @@ func (self *SendBuffer) createSendSequence(id sendSequenceId, sendPack *SendPack
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	if self.closed {
+	if self.closed || sendPack.Ctx.Err() != nil {
 		return nil
 	}
 	if sendSequence, ok := self.sendSequences[id]; ok {
@@ -7096,6 +7099,64 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			// budget degrades to the non-blocking fast path below
 			timeout = max(time.Duration(0), timeout-time.Since(enterTime))
 		}
+	} else if !sendPack.ForceUnwrapped && self.session != nil && self.session.establishHoldPending() {
+		// Opportunistic establish hold
+		// (`EncryptionSettings.OpportunisticEstablishHold`): the gate above,
+		// at the same place for the same reason, with the opposite ending. An
+		// application pack waits for the session's first cipher and is sealed
+		// if it comes in time. At the hold's deadline, or as soon as an
+		// establishment attempt fails, the pack falls through to the plaintext
+		// Opportunistic sends; it is never refused for want of a cipher. The
+		// deadline runs from the session's first establishment attempt, not
+		// from this pack, so a peer that never answers costs one hold per
+		// session. A zero budget does not wait, and a budget that ends inside
+		// the hold returns not-sent with no error, as backpressure does, so
+		// the caller retries rather than gives up on the peer.
+		if self.sendBufferSettings.beforeEstablishHoldWaitForTest != nil {
+			self.sendBufferSettings.beforeEstablishHoldWaitForTest(self.id())
+		}
+		enterTime := time.Now()
+		for {
+			select {
+			case <-sendPack.Ctx.Done():
+				return false, errors.New("Done.")
+			case <-self.ctx.Done():
+				return false, errors.New("Done.")
+			case <-self.session.ctx.Done():
+				return false, errors.New("Done.")
+			default:
+			}
+			now := time.Now()
+			holding, changed, deadline := self.session.establishHoldState(now)
+			if !holding {
+				break
+			}
+			if timeout == 0 {
+				return false, nil
+			}
+			if 0 < timeout {
+				budgetEnd := enterTime.Add(timeout)
+				if !now.Before(budgetEnd) {
+					return false, nil
+				}
+				if budgetEnd.Before(deadline) {
+					deadline = budgetEnd
+				}
+			}
+			select {
+			case <-sendPack.Ctx.Done():
+				return false, errors.New("Done.")
+			case <-self.ctx.Done():
+				return false, errors.New("Done.")
+			case <-self.session.ctx.Done():
+				return false, errors.New("Done.")
+			case <-changed:
+			case <-time.After(deadline.Sub(now)):
+			}
+		}
+		if 0 < timeout {
+			timeout = max(time.Duration(0), timeout-time.Since(enterTime))
+		}
 	}
 
 	// The boundary is the write, not the queue.
@@ -8205,6 +8266,15 @@ func (self *SendSequence) writeNoAckFastPath(
 		if cipher == nil && self.session.RequireEncryption() {
 			snapshot.release(messageByteCount)
 			return false
+		}
+		if cipher == nil && self.session.establishHoldPending() {
+			// the Opportunistic establish hold, as Pack's entry applies it: a
+			// hold that began after that check (a server-role session whose
+			// peer's ClientHello landed in between) gets no write here
+			if holding, _, _ := self.session.establishHoldState(time.Now()); holding {
+				snapshot.release(messageByteCount)
+				return false
+			}
 		}
 		if cipher != nil && !self.companionContract {
 			// the loop verifies the peer's certificate against the contract
@@ -15527,6 +15597,13 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 // paced resend rather than on gap recovery. Bounded, and removed along with
 // the rest by the receive advertisement.
 func (self *ReceiveSequence) commitHeldPrefix() {
+	// The queue owns these items; the reusable slice only borrows pointers
+	// during this scan. An item embeds its decoded packet owner, which may
+	// otherwise stay rooted here after delivery, beyond the bounded free pool.
+	defer func() {
+		clear(self.heldScratch)
+		self.heldScratch = self.heldScratch[:0]
+	}()
 	capacity := self.receiveBufferSettings.ReceiveQueueMaxByteCount
 	frameByteCount := max(self.maxHeldByteCount, 1)
 
@@ -16658,7 +16735,7 @@ func (self *ForwardBuffer) Pack(forwardPack *ForwardPack, timeout time.Duration)
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
-		if self.closed {
+		if self.closed || forwardPack.Ctx.Err() != nil {
 			return nil
 		}
 		forwardSequence, ok := self.forwardSequences[forwardPack.Destination]

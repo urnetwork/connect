@@ -1085,8 +1085,12 @@ type ExtenderShareSettings struct {
 	GossipUrl string                 `protobuf:"bytes,2,opt,name=GossipUrl,proto3" json:"GossipUrl,omitempty"`
 	// ed25519 root public keys, 32 bytes each
 	RootPublicKeys [][]byte `protobuf:"bytes,3,rep,name=RootPublicKeys,proto3" json:"RootPublicKeys,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// the sharer's bootstrap DoH servers, `https://<ip literal>/...` urls of
+	// each family (net_http_doh_control.go). Empty leaves the importer's own.
+	ControlDohUrlsIpv4 []string `protobuf:"bytes,4,rep,name=ControlDohUrlsIpv4,proto3" json:"ControlDohUrlsIpv4,omitempty"`
+	ControlDohUrlsIpv6 []string `protobuf:"bytes,5,rep,name=ControlDohUrlsIpv6,proto3" json:"ControlDohUrlsIpv6,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *ExtenderShareSettings) Reset() {
@@ -1136,6 +1140,20 @@ func (x *ExtenderShareSettings) GetGossipUrl() string {
 func (x *ExtenderShareSettings) GetRootPublicKeys() [][]byte {
 	if x != nil {
 		return x.RootPublicKeys
+	}
+	return nil
+}
+
+func (x *ExtenderShareSettings) GetControlDohUrlsIpv4() []string {
+	if x != nil {
+		return x.ControlDohUrlsIpv4
+	}
+	return nil
+}
+
+func (x *ExtenderShareSettings) GetControlDohUrlsIpv6() []string {
+	if x != nil {
+		return x.ControlDohUrlsIpv6
 	}
 	return nil
 }
@@ -1300,11 +1318,13 @@ const file_extender_proto_rawDesc = "" +
 	"Revocation\x12\"\n" +
 	"\vEndOfSample\x18\x03 \x01(\bH\x00R\vEndOfSample\x12\x1e\n" +
 	"\tKeepalive\x18\x04 \x01(\bH\x00R\tKeepaliveB\a\n" +
-	"\x05Frame\"w\n" +
+	"\x05Frame\"\xd7\x01\n" +
 	"\x15ExtenderShareSettings\x12\x18\n" +
 	"\aDnsName\x18\x01 \x01(\tR\aDnsName\x12\x1c\n" +
 	"\tGossipUrl\x18\x02 \x01(\tR\tGossipUrl\x12&\n" +
-	"\x0eRootPublicKeys\x18\x03 \x03(\fR\x0eRootPublicKeys\"\xa7\x01\n" +
+	"\x0eRootPublicKeys\x18\x03 \x03(\fR\x0eRootPublicKeys\x12.\n" +
+	"\x12ControlDohUrlsIpv4\x18\x04 \x03(\tR\x12ControlDohUrlsIpv4\x12.\n" +
+	"\x12ControlDohUrlsIpv6\x18\x05 \x03(\tR\x12ControlDohUrlsIpv6\"\xa7\x01\n" +
 	"\rExtenderShare\x12\x18\n" +
 	"\aVersion\x18\x01 \x01(\rR\aVersion\x12 \n" +
 	"\vNetworkHost\x18\x02 \x01(\tR\vNetworkHost\x12\x1c\n" +

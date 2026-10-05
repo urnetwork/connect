@@ -284,7 +284,15 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 		}
 	}()
 	canceled := make(chan struct{})
-	stop := context.AfterFunc(responseCtx, func() { closeConnection(); close(canceled) })
+	stop := context.AfterFunc(responseCtx, func() {
+		// The installed socket deadline interrupts an expired probe. Closing
+		// first can replace that timeout with an unrelated closed-pipe error.
+		// Manual cancellation still needs an immediate physical interruption.
+		if responseCtx.Err() != context.DeadlineExceeded {
+			closeConnection()
+		}
+		close(canceled)
+	})
 	disarmed := false
 	defer func() {
 		if !disarmed && !stop() {

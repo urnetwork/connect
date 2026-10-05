@@ -251,6 +251,24 @@ translation first. Then A3, then the inner TLS as today. The quic and dns
 carriers adapt the request stream to `net.Conn` (the commented
 `streamConn`, revived).
 
+Country lists. A country may bundle a list of its own as
+`res/extender_spoof_<cc>.bin`, written by `scripts/extender_spoof -country
+<cc>`, for a network that routes only the names of its own country (a
+whitelist-only mobile network). `SpoofDomainsForCountry(cc)` answers that
+list, and the global list for a country without one. A dial takes the country
+of its directory, `ExtenderDirectory.SpoofCountryCode()`: the `country_code`
+of the operator's hint while the hint is current, else the network country the
+host reports through `SetNetworkCountryCode` (on Android the mobile network's
+country while the default network is cellular), else the hint's last country.
+The hint is read through direct dialers only (DESIGNNOTES4.md §4): where only
+an extender reaches the operator, the hint fails rather than placing it.
+A failed hint and a path change make the hint's country stale, and a path
+change asks for the hint again. When the list in force changes, the strategy
+drops its discovery extender dialers so every address is drawn again from the
+new list. The whitelist of A5 is every bundled list, `AllSpoofDomains()`. No
+country list is bundled yet; each needs a measurement of what its network lets
+through.
+
 A11. NLayer extenders. An NLayer extender relays a forward to one of a
 preset list of other extenders, its hops, instead of to the destination;
 the extenders a request crosses are its layers. The list is

@@ -22,6 +22,7 @@ require (
 	github.com/pion/webrtc/v4 v4.2.18
 	github.com/quic-go/qpack v0.6.0
 	github.com/quic-go/quic-go v0.61.0
+	github.com/refraction-networking/utls v1.8.2
 	github.com/rivo/uniseg v0.4.7
 	github.com/urnetwork/glog v0.0.0
 	github.com/wlynxg/anet v0.0.5
@@ -35,6 +36,7 @@ require (
 )
 
 require (
+	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -48,6 +50,7 @@ require (
 	github.com/ipfs/go-cid v0.6.2 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
 	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
+	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/koron/go-ssdp v0.9.1 // indirect
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect

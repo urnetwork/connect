@@ -113,8 +113,8 @@ type ClientStrategySettings struct {
 	// if true, enables non-ech
 	// TODO set this to default false
 	ExposeServerHostNames bool
-	// note that extenders and proxy are the only strategies that will be enabled if
-	// `ExposeServerIps == false` and `ExposeServerNames == false`
+	// note that extenders, vless and proxy are the only strategies that will be
+	// enabled if `ExposeServerIps == false` and `ExposeServerNames == false`
 
 	EnableNormal bool
 	// tls frag, retransmit, tls frag + retransmit
@@ -135,6 +135,12 @@ type ClientStrategySettings struct {
 	// Measurement fixtures use it for hermetic production extender paths. Nil
 	// retains normal discovery and selection. The strategy copies each entry.
 	ExtenderConfigs []*ExtenderConfig
+	// VlessConfigs are VLESS servers the user named (vless.go), each an
+	// additional persistent dialer that carries the strategy's connections
+	// through its server. The strategy copies each entry, and
+	// `SetVlessConfigs` replaces them on a running strategy. Empty is a
+	// strategy without VLESS.
+	VlessConfigs []*VlessConfig
 	// ExtenderDirectory is where discovered extenders come from (E1, E2). The
 	// strategy draws candidates from it, reports every dial outcome back to
 	// it, and drops the dialers of addresses it retires. Nil disables
@@ -249,6 +255,12 @@ type ClientStrategy struct {
 	log                Logger
 
 	settings *ClientStrategySettings
+	// baseSettings are a copy of the settings as the caller passed them, which
+	// a direct-only strategy derived from this one is built from
+	// (newDirectClientStrategy). `settings` will not do: there the internal
+	// DoH resolver wraps the caller's dial, proxy and all, and a strategy
+	// built over that wrapper would still dial through the proxy.
+	baseSettings *ClientStrategySettings
 	// internalDohResolver exists only when InternalDohDomains are configured
 	// and the caller did not install ConnectSettings.Resolver.
 	internalDohResolver *internalDohResolver
@@ -260,6 +272,15 @@ type ClientStrategy struct {
 	// custom extenders
 	// these take precedence over other extenders
 	extenderIpSecrets map[netip.Addr]string
+	// the country whose spoof list the outer names of the extender dialers
+	// were drawn from, "" for the global list (spoofDomainsForCountry)
+	extenderSpoofCountryCode string
+
+	// the DoH settings in force: what the internal DoH cache was built from
+	// and what the extender bootstrap queries. `SetInternalDohSettings`
+	// replaces them; `settings.DohSettings` stays what the strategy was built
+	// with.
+	dohSettings *DohSettings
 
 	nextConnectTime time.Time
 	// reconnectFastPathCount is the number of reconnect fast-path slots
@@ -336,6 +357,7 @@ func newNormalDialTlsContext(
 
 // extender udp 53 to platform extender
 func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *ClientStrategy {
+	baseSettings := *settings
 	settings, internalDohResolver := clientStrategySettingsWithInternalDoh(settings)
 
 	// propagate so a strategy-level logger covers dial logging. Copy instead
@@ -425,6 +447,11 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		}
 		dialers[dialer] = true
 	}
+	for _, vlessConfig := range settings.VlessConfigs {
+		if dialer := newVlessClientDialer(settings, vlessConfig); dialer != nil {
+			dialers[dialer] = true
+		}
+	}
 	// FIXME
 	/*
 		if settings.EnablePt {
@@ -465,9 +492,11 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		cancel:              strategyCancel,
 		log:                 loggerOrDefault(settings.Log),
 		settings:            settings,
+		baseSettings:        &baseSettings,
 		internalDohResolver: internalDohResolver,
 		dialers:             dialers,
 		extenderIpSecrets:   map[netip.Addr]string{},
+		dohSettings:         settings.DohSettings,
 	}
 	// the alt dialers need the strategy itself, for its resolver and its
 	// lifetime, so they join the same map after it is built and before
@@ -601,6 +630,123 @@ func (self *ClientStrategy) CustomExtenders() map[netip.Addr]string {
 	defer self.mutex.Unlock()
 
 	return maps.Clone(self.extenderIpSecrets)
+}
+
+// The VLESS dialer weight floor and rank. A server the user named is meant to
+// be used, so it keeps the floor of the direct dialer; among dialers that
+// last succeeded it ranks after the direct ones, which skip the extra hop when
+// they work, and before the resilient and extender ones.
+const (
+	vlessDialerMinimumWeight = float32(0.5)
+	vlessDialerPriority      = 30
+)
+
+// A persistent dialer for one VLESS server, or nil for a nil or invalid
+// configuration. The dialer keeps its own copy of the configuration.
+func newVlessClientDialer(settings *ClientStrategySettings, vlessConfig *VlessConfig) *clientDialer {
+	if vlessConfig == nil || vlessConfig.Validate() != nil {
+		return nil
+	}
+	copiedConfig := vlessConfig.Copy()
+	return &clientDialer{
+		description:        "vless",
+		createTime:         time.Now(),
+		persistent:         true,
+		minimumWeight:      vlessDialerMinimumWeight,
+		priority:           vlessDialerPriority,
+		dialTlsContext:     newVlessDialTlsContext(&settings.ConnectSettings, copiedConfig, clientWebSocketNextProtos),
+		httpDialTlsContext: newVlessDialTlsContext(&settings.ConnectSettings, copiedConfig, clientHttpNextProtos),
+		dialContext:        newVlessDialContext(&settings.ConnectSettings, copiedConfig),
+		vlessConfig:        copiedConfig,
+		settings:           settings,
+	}
+}
+
+// SetVlessConfigs replaces the strategy's VLESS dialers with one per valid
+// configuration; nil or empty removes them. The replaced dialers' pooled
+// connections close, and requests in flight finish on the connections they
+// have.
+func (self *ClientStrategy) SetVlessConfigs(vlessConfigs []*VlessConfig) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	for dialer := range self.dialers {
+		if dialer.vlessConfig != nil {
+			dialer.Close()
+			delete(self.dialers, dialer)
+		}
+	}
+	for _, vlessConfig := range vlessConfigs {
+		if dialer := newVlessClientDialer(self.settings, vlessConfig); dialer != nil {
+			self.dialers[dialer] = true
+		}
+	}
+}
+
+// Copies of the configurations of the strategy's VLESS dialers, in no
+// particular order.
+func (self *ClientStrategy) VlessConfigs() []*VlessConfig {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	vlessConfigs := []*VlessConfig{}
+	for dialer := range self.dialers {
+		if dialer.vlessConfig != nil {
+			vlessConfigs = append(vlessConfigs, dialer.vlessConfig.Copy())
+		}
+	}
+	return vlessConfigs
+}
+
+// The DoH settings in force (see `SetInternalDohSettings`). Nil for a strategy
+// built without any, whose extender bootstrap then resolves with the system
+// resolver.
+func (self *ClientStrategy) DohSettings() *DohSettings {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.dohSettings
+}
+
+// SetInternalDohSettings replaces the DoH settings of a running strategy: the
+// internal DoH cache its protected control names resolve through is rebuilt
+// from them, and the extender bootstrap queries them from its next pass. This
+// is how a user's bootstrap DoH servers (`ControlDohSettings`) apply without
+// rebuilding the strategy. Resolutions in flight on the replaced cache end,
+// and the next dial resolves through the new one. Nil restores the defaults.
+func (self *ClientStrategy) SetInternalDohSettings(dohSettings *DohSettings) {
+	if dohSettings == nil {
+		dohSettings = DefaultDohSettings()
+	}
+	replacedCache := func() *DohCache {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		self.dohSettings = dohSettings
+		if self.internalDohResolver == nil {
+			return nil
+		}
+		return self.internalDohResolver.replaceCache(NewDohCache(internalDohSettings(dohSettings)))
+	}()
+	// closed outside the lock: closing joins the requests in flight on it
+	if replacedCache != nil {
+		replacedCache.Close()
+	}
+}
+
+// newDirectClientStrategy builds a direct-only strategy from the settings this
+// one was built with (NewDirectClientStrategy, unpinned): no extender, VLESS
+// server or proxy, so a request reaches its destination from this host's own
+// address. It takes the DoH settings in force here, which a user's bootstrap
+// DoH servers replace on a running strategy (`SetInternalDohSettings`). The
+// caller closes it.
+func (self *ClientStrategy) newDirectClientStrategy(ctx context.Context) *ClientStrategy {
+	baseSettings := self.baseSettings
+	if baseSettings == nil {
+		// a strategy a test built without the constructor
+		baseSettings = self.settings
+	}
+	settings := *baseSettings
+	settings.DohSettings = self.DohSettings()
+	return NewDirectClientStrategy(ctx, &settings, 0)
 }
 
 // nextConnectMaxLead caps how far the shared next-connect timestamp may run
@@ -1806,14 +1952,25 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 // its addresses are dialed on the fixed carrier ports, and `dialerWeights`
 // already excludes every non-extender dialer while one is configured.
 //
-// The outer name is one random spoof domain per dialer (A10). With no bundled
-// spoof list the name is left empty and the dial presents no sni at all: the
-// operator name the inner TLS is for must never appear in the outer
+// The outer name is one random spoof domain per dialer (A10), from the list
+// of the country the directory places this client in (SpoofCountryCode). With
+// an empty spoof list the name is left empty and the dial presents no sni at
+// all: the operator name the inner TLS is for must never appear in the outer
 // ClientHello, and a connection to an ip literal carries no name anyway.
+//
+// When the list in force changes -- the client moved into or out of a country
+// with a list of its own -- the extender dialers drawn from the other list are
+// dropped first, so every address is drawn again from this one. Left in
+// place, they would keep their addresses out of the expand, and on a network
+// that refuses their names each failure would hold its address for the hold
+// timeout. A live connection keeps running; only the dialer goes.
 func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDialer) {
 	if self.settings.ExpandExtenderProfileCount <= 0 {
 		return []*clientDialer{}
 	}
+
+	// the directory is an external object; it is read with no lock held
+	spoofDomains, spoofCountryCode := directorySpoofDomains(self.settings.ExtenderDirectory)
 
 	visitedExtenderIpProfiles := map[extenderIpProfile]bool{}
 	visitedExtenderIps := []netip.Addr{}
@@ -1822,6 +1979,16 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 	func() {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
+
+		if self.extenderSpoofCountryCode != spoofCountryCode {
+			for dialer, _ := range self.dialers {
+				if dialer.IsExtender() && !dialer.persistent {
+					dialer.Close()
+					delete(self.dialers, dialer)
+				}
+			}
+			self.extenderSpoofCountryCode = spoofCountryCode
+		}
 
 		visitedExtenderProfileCount := 0
 		visitedExtenderProfiles := map[ExtenderProfile]bool{}
@@ -1869,7 +2036,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			}
 			extenderConfigs = append(
 				extenderConfigs,
-				extenderConfigsForCandidate(candidate, extenderIpSecrets[ip])...,
+				extenderConfigsForCandidate(candidate, extenderIpSecrets[ip], spoofDomains)...,
 			)
 		}
 	} else if directory := self.settings.ExtenderDirectory; directory != nil {
@@ -1897,7 +2064,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 					}
 					extenderConfigs = append(
 						extenderConfigs,
-						extenderConfigsForCandidate(candidates[i], "")...,
+						extenderConfigsForCandidate(candidates[i], "", spoofDomains)...,
 					)
 				}
 			}
@@ -1964,9 +2131,13 @@ func extenderDialerPriority(connectMode ExtenderConnectMode) int {
 // One extender config per carrier the candidate lists (E2, E5), and one per
 // dns port when the candidate offers several (L2): 53 is dialed before 4053.
 // The identity key of a verified record is carried into the config so the
-// outer leaf is checked against it (B3).
-func extenderConfigsForCandidate(candidate *ExtenderCandidate, secret string) []*ExtenderConfig {
-	spoofDomains := SpoofDomains()
+// outer leaf is checked against it (B3). Each config fronts with one random
+// name of `spoofDomains`, the list in force (directorySpoofDomains).
+func extenderConfigsForCandidate(
+	candidate *ExtenderCandidate,
+	secret string,
+	spoofDomains []string,
+) []*ExtenderConfig {
 	extenderConfigs := []*ExtenderConfig{}
 	appendConfig := func(profile ExtenderProfile) {
 		if 0 < len(spoofDomains) {
@@ -2079,6 +2250,9 @@ type clientDialer struct {
 	httpClientFactory func() *http.Client
 
 	extenderConfig *ExtenderConfig
+	// the server of a VLESS dialer, nil for every other dialer. Never changed
+	// after construction.
+	vlessConfig *VlessConfig
 
 	mutex           sync.Mutex
 	successCount    uint64

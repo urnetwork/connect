@@ -111,6 +111,9 @@ func TestSecurityPolicyReasonsAttributeEachRule(t *testing.T) {
 		{fixture: "ethereum-discv4", reason: SecurityPolicyReasonAllowEthereumDiscv4},
 		{fixture: "ethereum-rlpx-eip8", reason: SecurityPolicyReasonAllowEthereumRlpx},
 		{fixture: "ethereum-rlpx-off-curve", reason: SecurityPolicyReasonDropEncrypted},
+		{fixture: "whatsapp-noise-web", reason: SecurityPolicyReasonAllowWhatsApp},
+		{fixture: "whatsapp-noise-native-segmented", reason: SecurityPolicyReasonAllowWhatsApp},
+		{fixture: "whatsapp-noise-bad-length", reason: SecurityPolicyReasonDropEncrypted},
 	}
 	for i, c := range cases {
 		stats := DefaultSecurityPolicyStatsCollector()

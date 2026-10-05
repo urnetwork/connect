@@ -3,7 +3,8 @@ package connect
 // UpgradeMux is the concrete IpMux that intercepts local DNS (UDP/TCP 53) — resolving it over DoH
 // that egresses the tunnel and recording the IP→hostname reverse index for ServerName path
 // affinity — and applies the HTTP (TCP/80) policy: pass through to the egress, or drop. It
-// wraps the remote UserNat (the exit path) and is held by the SDK device.
+// also refuses DoT (TCP/853) toward its own DNS stand-in, where nothing listens. It wraps the
+// remote UserNat (the exit path) and is held by the SDK device.
 
 import (
 	"context"
@@ -970,12 +971,13 @@ func (self *UpgradeMux) onPump(packet []byte) bool {
 	return true
 }
 
-// onSend claims and terminates intercepted DNS (UDP/TCP 53) and HTTP (TCP/80); everything else
-// passes through to the upstream. TCP/443 passes through too, but is first observed for its
-// TLS SNI (never claimed). The claim decision is a pure function of (protocol, dst port), so
-// it is read from a cheap, allocation-free header peek — only a claimed flow (or a header the
-// peek can't classify, e.g. IPv6 extension headers) needs the allocating full parse. This
-// keeps the pass-through bulk off the parse/allocation path entirely.
+// onSend claims and terminates intercepted DNS (UDP/TCP 53) and HTTP (TCP/80), and refuses
+// TCP/853 toward the DNS stand-in (refuseStandInDot); everything else passes through to the
+// upstream. TCP/443 passes through too, but is first observed for its TLS SNI (never claimed).
+// The claim decision is a pure function of (protocol, dst port), plus the destination address
+// for TCP/853, so it is read from a cheap, allocation-free header peek — only a claimed flow
+// (or a header the peek can't classify, e.g. IPv6 extension headers) needs the allocating full
+// parse. This keeps the pass-through bulk off the parse/allocation path entirely.
 func (self *UpgradeMux) onSend(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
 	// first-load timeline: one atomic load once deactivated (see firstLoadTimeline)
 	self.firstLoad.observeSend(packet)
@@ -993,6 +995,9 @@ func (self *UpgradeMux) onSend(source TransferPath, provideMode protocol.Provide
 		// so the sniffer reassembles from that segment without re-walking the L4 headers.
 		self.sni.observeSegment(tls)
 		return false
+	case peekDot:
+		// DoT is claimed only toward the DNS stand-in, and only to refuse it
+		return self.refuseStandInDot(source, provideMode, packet)
 	}
 	// peekDns or peekUndecided — classify with the authoritative full parse
 	ipPath, payload, err := ParseIpPathWithPayload(packet)
@@ -1014,6 +1019,8 @@ func (self *UpgradeMux) onSend(source TransferPath, provideMode protocol.Provide
 		return false
 	case IpProtocolTcp == ipPath.Protocol && 80 == ipPath.DestinationPort:
 		return self.httpBlocked() // reached via peekUndecided (e.g. IPv6 extension headers)
+	case IpProtocolTcp == ipPath.Protocol && 853 == ipPath.DestinationPort:
+		return self.refuseStandInDot(source, provideMode, packet) // likewise, a header the peek deferred
 	}
 	return false
 }
@@ -1047,6 +1054,17 @@ func (self *UpgradeMux) onSendGroup(
 		return false
 	case ipPath.Protocol == IpProtocolTcp && ipPath.DestinationPort == 80:
 		return self.httpBlocked()
+	case ipPath.Protocol == IpProtocolTcp && ipPath.DestinationPort == 853:
+		// one exact flow: refused as a whole toward the DNS stand-in,
+		// otherwise passed through as a whole
+		destination, _ := netip.AddrFromSlice(ipPath.DestinationIp)
+		if !self.dnsStandIn(destination) {
+			return false
+		}
+		for _, packet := range group.packets {
+			self.refuseStandInDot(source, provideMode, packet)
+		}
+		return true
 	case ipPath.Protocol == IpProtocolUdp && ipPath.DestinationPort == 53:
 		settings := self.settings.Load()
 		if settings == nil || settings.Dns == nil || settings.Dns.Resolver == nil {
@@ -1081,6 +1099,55 @@ func (self *UpgradeMux) onSendGroup(
 func (self *UpgradeMux) httpBlocked() bool {
 	s := self.settings.Load()
 	return s.Http != nil && HttpUpgradeBlock == s.Http.Mode
+}
+
+// defaultDnsStandIns are the default DNS stand-ins of both families (see
+// DefaultDnsUpgradeMaskAddress and DefaultDnsUpgradeMaskAddressIpv6).
+var defaultDnsStandIns = [...]netip.Addr{
+	netip.MustParseAddr(DefaultDnsUpgradeMaskAddress),
+	netip.MustParseAddr(DefaultDnsUpgradeMaskAddressIpv6),
+}
+
+// dnsStandIn reports whether a destination is a DNS stand-in while the mux
+// owns DNS: the resolver's DnsUpgradeMaskAddress, or a default stand-in of
+// either family. These are the addresses the platform advertises as the
+// tunnel's DNS servers, and by design nothing serves DNS at them: the mux
+// claims :53 before a packet gets there. With DNS interception disabled the
+// mux owns no stand-in and every address passes through.
+func (self *UpgradeMux) dnsStandIn(addr netip.Addr) bool {
+	settings := self.settings.Load()
+	if settings == nil || settings.Dns == nil || settings.Dns.Resolver == nil || !addr.IsValid() {
+		return false
+	}
+	addr = addr.Unmap()
+	if maskAddr, err := netip.ParseAddr(settings.Dns.Resolver.DnsUpgradeMaskAddress); err == nil && addr == maskAddr.Unmap() {
+		return true
+	}
+	return slices.Contains(defaultDnsStandIns[:], addr)
+}
+
+// refuseStandInDot refuses DoT (TCP/853) toward a DNS stand-in with a local
+// TCP reset and never forwards it; it reports whether the segment was claimed.
+// Android in Automatic Private DNS mode probes DoT on 853 of every DNS server
+// it is given and uses cleartext :53 once the probe fails. Toward the stand-in
+// that probe used to be dialed out through an exit to an address with no
+// listener and waited out its timeout; refused here, it fails at once and the
+// device falls back to the :53 the mux resolves. DoT to any other address --
+// a resolver the user chose, such as strict Private DNS -- passes through
+// unchanged. The reset is the one a closed port answers with (RST|ACK for a
+// SYN), built and returned by deliverTcpPolicyReset.
+func (self *UpgradeMux) refuseStandInDot(source TransferPath, provideMode protocol.ProvideMode, packet []byte) bool {
+	// the stand-in check reads the header in place, so DoT to a real resolver
+	// passes through without the allocating parse
+	if _, destination, ok := ipPacketSourceDestinationAddrs(packet); !ok || !self.dnsStandIn(destination) {
+		return false
+	}
+	ipPath, err := ParseIpPath(packet)
+	if err != nil || ipPath.Protocol != IpProtocolTcp || ipPath.DestinationPort != 853 {
+		return false
+	}
+	deliverTcpPolicyReset(self.mux.deliverDownstream, source, provideMode, ipPath.Reverse(), packet)
+	return true
 }
 
 // SetBlocker installs (or, with nil, removes) the ad/tracker Blocker
@@ -1405,6 +1472,7 @@ const (
 	peekHttp                        // TCP/80 (HTTP)
 	peekTls                         // TCP/443 (observed for SNI, never claimed)
 	peekUndecided                   // header can't be classified cheaply → full parse
+	peekDot                         // TCP/853 (DoT: refused only toward the DNS stand-in)
 )
 
 // peekClaim classifies a packet from the fixed IP/L4 header offsets without allocating
@@ -1432,6 +1500,8 @@ func peekClaim(packet []byte, seg *tlsSegment) peekResult {
 				return peekDns
 			case 80:
 				return peekHttp
+			case 853:
+				return peekDot
 			case 443:
 				totalLen := int(packet[2])<<8 | int(packet[3])
 				if totalLen < ihl || len(packet) < totalLen {
@@ -1477,6 +1547,8 @@ func peekClaim(packet []byte, seg *tlsSegment) peekResult {
 				return peekDns
 			case 80:
 				return peekHttp
+			case 853:
+				return peekDot
 			case 443:
 				src, _ := netip.AddrFromSlice(packet[8:24])
 				dst, _ := netip.AddrFromSlice(packet[24:40])

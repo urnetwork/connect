@@ -24,7 +24,8 @@ import (
 // The optional settings block is the exception: it replaces the dns name, the
 // gossip url and the trust anchor, so an importer takes it only deliberately,
 // and the first hello over the platform's pinned TLS replaces the root keys
-// again.
+// again. It also carries the sharer's bootstrap DoH servers, so a setup that
+// works on a network that blocks the default DoH servers can be passed on.
 //
 // The text form is one line, `ur-ext:1:` and the serialized message in
 // base64url with no padding, so it survives a qr code, a chat message and a
@@ -115,6 +116,38 @@ func validateExtenderShare(share *protocol.ExtenderShare) error {
 		case 4, 16:
 		default:
 			return fmt.Errorf("an extender share address is %d bytes", len(addressBytes))
+		}
+	}
+	if share.Settings != nil {
+		if err := validateExtenderShareControlDohUrls(share.Settings.ControlDohUrlsIpv4, 4); err != nil {
+			return err
+		}
+		if err := validateExtenderShareControlDohUrls(share.Settings.ControlDohUrlsIpv6, 6); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// The bootstrap DoH servers of one family in a settings block: each a url the
+// DoH rule accepts (ParseControlDohUrl), of that family, at most
+// `ControlDohMaxUrlCount` of them.
+func validateExtenderShareControlDohUrls(dohUrls []string, ipVersion int) error {
+	if ControlDohMaxUrlCount < len(dohUrls) {
+		return fmt.Errorf(
+			"the extender share carries %d ipv%d DoH servers, at most %d",
+			len(dohUrls),
+			ipVersion,
+			ControlDohMaxUrlCount,
+		)
+	}
+	for _, dohUrl := range dohUrls {
+		_, addr, err := ParseControlDohUrl(dohUrl)
+		if err != nil {
+			return fmt.Errorf("an extender share DoH server is refused: %w", err)
+		}
+		if (ipVersion == 4) != addr.Is4() {
+			return fmt.Errorf("an extender share DoH server is not ipv%d: %s", ipVersion, dohUrl)
 		}
 	}
 	return nil
