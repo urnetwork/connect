@@ -619,6 +619,7 @@ func stickyTestWindow(
 		nil,
 		nil,
 		nil,
+		nil,
 	)
 }
 

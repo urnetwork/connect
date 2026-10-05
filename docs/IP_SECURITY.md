@@ -125,6 +125,44 @@ heuristic drops it. `RemoteUserNatMultiClient.securityRoute` therefore:
 
 None of this changes what a provider accepts or sends anything off the device.
 
+#### 2.4.2 Providers with older rules
+
+A provider runs whatever connect it was built with, so it can drop a flow the
+client's newer rules admit, and the client's fail fast never fires for it.
+Providers identify their rules in `IpProviderDiagnostics`, sent to each source
+on its first packet and after every block:
+
+- **`security_policy_generation`** (`SecurityPolicyRulesGeneration`): a number
+  connect raises with every change to the built-in rules (a detector, an
+  exception or its prefix snapshot, a default setting) and never lowers. It
+  orders providers where `security_policy_hash` cannot: a digest has no order,
+  and it differs between devices of one build because `MaxFlows` scales with
+  memory. Absent or 0 is unknown (a provider from before the field, or a custom
+  policy). The feed-generated CFAA tables are refreshed by every release build
+  and identified only by the hash. Adding a detector or an exception, or
+  changing a default, must raise it: raise `SecurityPolicyRulesGeneration`
+  (`ip_provider_diagnostics.go`) and add the digest that the failing
+  `TestSecurityPolicyRulesGenerationPin` prints under the new generation in
+  `securityPolicyRulesPins` (`ip_provider_diagnostics_test.go`). The test pins
+  the default settings and the exception tables; a change made only in
+  detector code must be raised by hand.
+- **Block counters** for this source. The provider counts the client's
+  outbound packets as its ingress (it runs `Reverse` of the client policy), so
+  `block_ingress_*` are the client's packets its policy dropped.
+
+When `block_ingress_packet_count` rises on a provider whose generation is older
+than the client's own or unknown, the multi-client prefers current providers
+for `ProviderPolicyPreferenceTtl` (5 min; each further block re-arms it):
+`effectiveTier` demotes every provider that is not current by 2, so the app's
+retry is placed on a provider with at least the client's rules when the window
+has one. The counters do not name the dropped flow, so the preference covers
+every new flow while it is armed; `MaxFlowsPerExit` still spills the overflow
+to the other providers. A provider whose generation is at least the client's
+own is never demoted, so the preference never ranks an older or unknown
+generation above a newer one; a block by a current provider does not arm it.
+With only older or unknown providers it changes nothing. It is local selection
+state only.
+
 ### 2.5 Statistics
 
 `SecurityPolicyStatsCollector` accumulates outcome counts. Egress uses
@@ -790,6 +828,14 @@ discovery by leaving discovery v4 enabled, which is admitted (§4.4.2).
   unreachable, retry routing, incidents never hinted) and
   `ip_policy_hint_test.go` (hint ttl/bound with an injected clock, ICMPv6, block
   action reasons, override and batch paths).
+- **Providers with older rules (§2.4.2):** `go test -run
+  'ProviderPolicy|SecurityPolicyGeneration|SecurityPolicyRulesGeneration|ProviderDiagnostics' ./`.
+  The generation order and the armed demerit, arming only on a rise of the
+  client's dropped outbound packets at a provider that is not current, the
+  retry offer holding only current providers (`TestProviderPolicyPreferenceSteersRetry`),
+  both directions of compatibility with peers that lack the field (a
+  descriptor without it), a real provider over in-memory transports, and the
+  rules-to-generation pin.
 - **Fixtures:** `ip_security_fixture_test.go` replays the packet fixtures in
   `testdata/ipsecurity/` (synthesized from protocol specifications; see its
   README) through `InspectEgress` as the multi-client send path does and checks

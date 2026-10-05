@@ -474,6 +474,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		BlockActionDecisionMaxCount: 4096,
 		PolicyHintTtl:               10 * time.Minute,
 		PolicyHintMaxCount:          1024,
+		// long enough to cover an app's reconnect backoff after its stalled
+		// connection, short enough that the preference does not outlive the
+		// blocked flow by much
+		ProviderPolicyPreferenceTtl: 5 * time.Minute,
 		BlockActionAggMaxCount:      1024,
 		IpAssocSettings:             DefaultIpAssocSettings(),
 
@@ -1316,6 +1320,11 @@ type MultiClientSettings struct {
 	// 0 disables the hints
 	PolicyHintTtl      time.Duration
 	PolicyHintMaxCount int
+	// how long new flows prefer providers whose security policy generation is
+	// at least the client's own after a provider with an older or unknown
+	// generation dropped this client's traffic (providerPolicyPreference).
+	// Each further drop re-arms it. 0 disables the preference
+	ProviderPolicyPreferenceTtl time.Duration
 	// nil disables activity association (`IpAssoc`)
 	IpAssocSettings *IpAssocSettings
 
@@ -1621,6 +1630,9 @@ type RemoteUserNatMultiClient struct {
 	// destinations whose flow was dropped as unsanctioned encrypted traffic;
 	// nil when disabled
 	policyLocalHints *policyHintCache
+	// shared with every window channel through its args, which arm it from
+	// provider diagnostics and read it in effectiveTier; nil when disabled
+	providerPolicyPreference *providerPolicyPreference
 
 	// the G-4b flow-owner seam: the platform's resolver for "which pinned
 	// app owns this flow", with its per-flow-key answer cache. Zero values
@@ -2500,6 +2512,11 @@ func NewRemoteUserNatMultiClient(
 	if settings.IpAssocSettings != nil {
 		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
 	}
+	multiClient.providerPolicyPreference = newProviderPolicyPreference(
+		SecurityPolicyGeneration(multiClient.securityPolicy),
+		settings.ProviderPolicyPreferenceTtl,
+		nil,
+	)
 	effectivePerformanceProfile := multiClient.overrideAllowDirect(settings.DefaultPerformanceProfile)
 	multiClient.config.Store(&multiClientConfig{
 		performanceProfile:  effectivePerformanceProfile,
@@ -2543,6 +2560,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.providerQualified,
 		multiClient.receivingChannelCount,
 		multiClient.recordProbePass,
+		multiClient.providerPolicyPreference,
 	)
 	multiClient.windows[WindowTypeQuality].clientMigrateFunc = multiClient.migrateClientFlows
 	if _, fixed := generator.FixedDestinationSize(); !fixed {
@@ -2566,6 +2584,7 @@ func NewRemoteUserNatMultiClient(
 			multiClient.providerQualified,
 			multiClient.receivingChannelCount,
 			multiClient.recordProbePass,
+			multiClient.providerPolicyPreference,
 		)
 		multiClient.windows[WindowTypeSpeed].clientMigrateFunc = multiClient.migrateClientFlows
 	}
@@ -8736,11 +8755,14 @@ type ExitInfo struct {
 	ProviderDiagnosticsAvailable bool
 	ProviderBuildVersion         string
 	ProviderSecurityPolicyHash   string
-	ProviderBlockIngressPackets  int64
-	ProviderBlockIngressBytes    int64
-	ProviderBlockEgressPackets   int64
-	ProviderBlockEgressBytes     int64
-	ProviderDiagnosticsSequence  int64
+	// 0 is unknown: the provider predates the field or runs a custom policy
+	// (see SecurityPolicyRulesGeneration)
+	ProviderSecurityPolicyGeneration uint64
+	ProviderBlockIngressPackets      int64
+	ProviderBlockIngressBytes        int64
+	ProviderBlockEgressPackets       int64
+	ProviderBlockEgressBytes         int64
+	ProviderDiagnosticsSequence      int64
 }
 
 // Exits reports the provider channels across every window, with the number of
@@ -8811,6 +8833,7 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 				exitInfo.ProviderDiagnosticsAvailable = true
 				exitInfo.ProviderBuildVersion = diagnostics.BuildVersion
 				exitInfo.ProviderSecurityPolicyHash = diagnostics.SecurityPolicyHash
+				exitInfo.ProviderSecurityPolicyGeneration = diagnostics.SecurityPolicyGeneration
 				exitInfo.ProviderBlockIngressPackets = diagnostics.BlockIngressPacketCount
 				exitInfo.ProviderBlockIngressBytes = diagnostics.BlockIngressByteCount
 				exitInfo.ProviderBlockEgressPackets = diagnostics.BlockEgressPacketCount
@@ -10049,6 +10072,10 @@ type multiClientWindow struct {
 	// qualificationRefreshFunc is handed to every channel for the receive-ack
 	// qualification refresh; see the channel field. nil on bare test windows.
 	qualificationRefreshFunc func(MultiHopId)
+	// providerPolicyPreference is the parent's, handed to every channel on its
+	// args (providerPolicyPreference). nil on bare test windows and when
+	// disabled, which leaves every channel at its rank.
+	providerPolicyPreference *providerPolicyPreference
 	// clientMigrateFunc is G-3's drain-time seam: the parent's
 	// migrateClientFlows, called once when the resize pass starts draining an
 	// exit so its movable flows leave while everything else finishes
@@ -10174,6 +10201,7 @@ func newMultiClientWindow(
 	providerQualifiedFunc func(MultiHopId) bool,
 	receivingSiblingsFunc func(exclude *multiClientChannel) int,
 	qualificationRefreshFunc func(MultiHopId),
+	providerPolicyPreference *providerPolicyPreference,
 ) *multiClientWindow {
 	window := &multiClientWindow{
 		ctx:                          ctx,
@@ -10196,6 +10224,7 @@ func newMultiClientWindow(
 		providerQualifiedFunc:        providerQualifiedFunc,
 		receivingSiblingsFunc:        receivingSiblingsFunc,
 		qualificationRefreshFunc:     qualificationRefreshFunc,
+		providerPolicyPreference:     providerPolicyPreference,
 		clientChannelArgs:            make(chan *multiClientChannelArgs),
 		monitor:                      NewRemoteUserNatMultiClientMonitor(&settings.RemoteUserNatMultiClientMonitorSettings),
 		contractStatusCallbacks:      NewCallbackList[*contractStatusCallbackWorker](),
@@ -12121,6 +12150,7 @@ requestCandidates:
 			args.ReceivePackets = self.clientReceivePacketsCallback
 			args.NetworkPeerDestination = self.networkPeerDestination
 			args.contractStatus = self.contractStatusFromClient
+			args.providerPolicyPreference = self.providerPolicyPreference
 			args.providerEvaluation = &providerEvaluationAttempt{
 				owner:             &self.providerEvaluation,
 				destinationId:     args.Destination.Tail(),
@@ -13198,6 +13228,10 @@ type multiClientChannelArgs struct {
 	// nil keeps directly constructed test channels on the legacy relay path.
 	contractStatus     func(client *multiClientChannel, status *ContractStatus)
 	providerEvaluation *providerEvaluationAttempt
+	// providerPolicyPreference is the parent's, shared by every channel: armed
+	// from this channel's provider diagnostics, read by effectiveTier. nil
+	// (bare fixtures, or disabled) leaves the channel at its rank.
+	providerPolicyPreference *providerPolicyPreference
 }
 
 // clientReceivePacketsFunction is the batch form of
@@ -14014,6 +14048,15 @@ const quarantineMemoryDuration = 5 * time.Minute
 //     that has never coalesced stats (healthy's zero value is false) at its
 //     static tier.
 //
+//   - older security policy (+2): while the provider policy preference is
+//     armed (a provider with an older or unknown rules generation dropped
+//     this client's traffic; see providerPolicyPreference), a provider whose
+//     generation is not at least the client's own falls behind every current
+//     provider of the next tier, so the app's retry is not placed on older
+//     rules again. It depends on the generation alone, so it never ranks an
+//     older or unknown generation above a newer one, and it lapses with the
+//     preference's ttl.
+//
 // Demerits apply immediately -- the next selection pass reads them -- which
 // is the ~1s demotion the design asks for; every one of them decays toward
 // the static tier on its own slow, documented schedule. The +2 steps mean a
@@ -14051,6 +14094,9 @@ func (self *multiClientChannel) effectiveTier() int {
 	if reliabilitySettings.ProviderProbe && self.providerQualifiedFunc != nil {
 		unproven = !self.providerQualifiedFunc(self.probeDestination())
 	}
+
+	// lock-free atomics, read outside the lock like the lookup above
+	tier += self.policyPreference().demerit(self.providerPolicyGeneration())
 
 	now := time.Now()
 	self.stateLock.Lock()
@@ -17669,6 +17715,9 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 					break
 				}
 				if self.providerDiagnostics.CompareAndSwap(current, next) {
+					// the delta from the snapshot this one replaced, so
+					// each reported block is observed exactly once
+					self.observeProviderDiagnostics(current, next)
 					break
 				}
 			}

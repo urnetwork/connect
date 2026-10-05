@@ -12,6 +12,36 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// SecurityPolicyRulesGeneration orders the built-in security policy rules.
+// Every change to what the built-in policy admits or drops must raise it by
+// one: adding a detector or an exception, changing an exception's prefix
+// snapshot, or changing a default setting. Never lower it. With the raise, pin
+// the new generation's rules digest in securityPolicyRulesPins
+// (ip_provider_diagnostics_test.go); TestSecurityPolicyRulesGenerationPin
+// fails and prints the digest when a default setting or an exception table
+// changed without one. Providers report the generation in
+// IpProviderDiagnostics so a client can tell a provider with older rules from
+// one with newer rules, which SecurityPolicyHash cannot: a digest has no
+// order, and it differs between devices of one build because MaxFlows scales
+// with memory. The feed-generated CFAA tables are refreshed by every release
+// build and are identified only by the hash.
+const SecurityPolicyRulesGeneration uint64 = 1
+
+// SecurityPolicyGeneration returns the rules generation a policy enforces:
+// SecurityPolicyRulesGeneration for the built-in policy in either direction,
+// whatever its memory-scaled settings, and 0 (unknown) for a disabled or
+// custom policy.
+func SecurityPolicyGeneration(policy SecurityPolicy) uint64 {
+	switch concrete := policy.(type) {
+	case *reverseSecurityPolicy:
+		return SecurityPolicyGeneration(concrete.policy)
+	case *securityPolicy:
+		return SecurityPolicyRulesGeneration
+	default:
+		return 0
+	}
+}
+
 // SecurityPolicyIdentity lets a custom provider policy publish an identity
 // for its effective rules. The value should change whenever enforcement
 // changes and should not contain secrets.
@@ -74,8 +104,15 @@ func writeSecurityPolicyIdentity(digest hash.Hash, policy SecurityPolicy) {
 // ProviderDiagnostics is the latest identity and source-scoped security
 // enforcement telemetry published by one provider exit.
 type ProviderDiagnostics struct {
-	BuildVersion            string
-	SecurityPolicyHash      string
+	BuildVersion       string
+	SecurityPolicyHash string
+	// 0 is unknown: the provider predates the field or runs a policy that is
+	// not the built-in one
+	SecurityPolicyGeneration uint64
+	// The provider counts the remote client's outbound packets as its
+	// ingress (it runs Reverse of the client policy), so BlockIngress* are
+	// this client's packets the provider policy dropped on the way out, and
+	// BlockEgress* are return packets dropped on the way back.
 	BlockIngressPacketCount int64
 	BlockIngressByteCount   int64
 	BlockEgressPacketCount  int64
@@ -141,7 +178,7 @@ func (self *RemoteUserNatProvider) providerDiagnosticsMessage(sourceId Id) *prot
 	if state.publishedSequence == state.sequence {
 		return nil
 	}
-	return &protocol.IpProviderDiagnostics{
+	message := &protocol.IpProviderDiagnostics{
 		BuildVersion:            self.buildVersion,
 		SecurityPolicyHash:      self.securityPolicyHash,
 		BlockIngressPacketCount: state.blockIngressPacketCount,
@@ -150,6 +187,11 @@ func (self *RemoteUserNatProvider) providerDiagnosticsMessage(sourceId Id) *prot
 		BlockEgressByteCount:    state.blockEgressByteCount,
 		Sequence:                state.sequence,
 	}
+	// an unknown generation stays absent, as from a provider that predates it
+	if self.securityPolicyGeneration != 0 {
+		message.SecurityPolicyGeneration = proto.Uint64(self.securityPolicyGeneration)
+	}
+	return message
 }
 
 func (self *RemoteUserNatProvider) markProviderDiagnosticsPublished(sourceId Id, sequence uint64) {
@@ -210,12 +252,13 @@ func providerDiagnosticsFromProtocol(message *protocol.IpProviderDiagnostics) *P
 		return nil
 	}
 	return &ProviderDiagnostics{
-		BuildVersion:            message.BuildVersion,
-		SecurityPolicyHash:      message.SecurityPolicyHash,
-		BlockIngressPacketCount: int64(message.BlockIngressPacketCount),
-		BlockIngressByteCount:   int64(message.BlockIngressByteCount),
-		BlockEgressPacketCount:  int64(message.BlockEgressPacketCount),
-		BlockEgressByteCount:    int64(message.BlockEgressByteCount),
-		Sequence:                int64(message.Sequence),
+		BuildVersion:             message.BuildVersion,
+		SecurityPolicyHash:       message.SecurityPolicyHash,
+		SecurityPolicyGeneration: message.GetSecurityPolicyGeneration(),
+		BlockIngressPacketCount:  int64(message.BlockIngressPacketCount),
+		BlockIngressByteCount:    int64(message.BlockIngressByteCount),
+		BlockEgressPacketCount:   int64(message.BlockEgressPacketCount),
+		BlockEgressByteCount:     int64(message.BlockEgressByteCount),
+		Sequence:                 int64(message.Sequence),
 	}
 }
