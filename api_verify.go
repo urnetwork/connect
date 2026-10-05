@@ -68,6 +68,8 @@ type SnSetWalletCallback ApiCallback[*SnSetWalletResult]
 type SnSetWalletArgs struct {
 	ColdkeySs58 string `json:"coldkey_ss58"`
 	ClientId    *Id    `json:"client_id,omitempty"`
+	Message     string `json:"message,omitempty"`
+	Signature   string `json:"signature,omitempty"`
 }
 
 type SnSetWalletError struct {
@@ -75,7 +77,9 @@ type SnSetWalletError struct {
 }
 
 type SnSetWalletResult struct {
-	Error *SnSetWalletError `json:"error,omitempty"`
+	Error             *SnSetWalletError `json:"error,omitempty"`
+	MappingHash       string            `json:"mapping_hash,omitempty"`
+	MappingGeneration uint64            `json:"mapping_generation,omitempty"`
 }
 
 // SnSetWallet sets the subnet wallet via the authenticated

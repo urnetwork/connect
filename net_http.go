@@ -1833,11 +1833,10 @@ func (self *ClientStrategy) H1DialContextWithDialer(ctx context.Context, address
 	causes := newHttpRequestCauses(ctx)
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		conn, err := dialH1MessagesWithinDeadline(handleCtx, address, requestHeader, dialer.WsDialer(self.settings), H1FramerProtocol, maximum, enabled, stats)
-		var upgradeErr *HTTPUpgradeError
-		terminal := errors.As(err, &upgradeErr) && upgradeErr.Terminal
+		terminal, refusalOnly := httpUpgradeTerminalCauses(err)
 		// An authorization denial is not an unhealthy extender. It is terminal
 		// for this logical dial and must not be retried across every strategy.
-		if !terminal {
+		if !refusalOnly {
 			dialer.Update(handleCtx, err)
 			observeDialAttempt(handleCtx, err)
 		}
@@ -2405,20 +2404,34 @@ func (self *clientDialer) Weight() float32 {
 // removal policy of E1. The directory is an external object, so it is called
 // with no lock held.
 func (self *clientDialer) Update(handleCtx context.Context, err error) {
-	// Local admission pressure says nothing about the extender's reachability.
-	// In particular it must not put a healthy relay on directory hold merely
-	// because another carrier currently owns this device's remaining memory.
-	if errors.Is(err, errExtenderMemoryBudget) {
-		return
-	}
-	// Neither does the extender's own admission limit (A12): a 429 is a
-	// backoff, never a failure, so nothing is counted against the dialer and
-	// the directory holds nothing. The address is left alone until the
-	// backoff passes.
-	var limitedErr *ExtenderLimitedError
-	if self.extenderConfig != nil && errors.As(err, &limitedErr) {
-		self.limit(limitedErr.RetryAfter)
-		return
+	if err != nil {
+		if handleCtx.Err() != nil {
+			return
+		}
+		// Admission pressure says nothing about reachability only when it is
+		// the complete original outcome. Inspect outside the dialer lock and
+		// do not let one memory/429 leaf hide a hard or canceled sibling.
+		causes := flattenHttpRequestCauses(err)
+		admissionOnly, limited := len(causes) != 0, false
+		var retryAfter time.Duration
+		for _, cause := range causes {
+			if cause.err == errExtenderMemoryBudget {
+				continue
+			}
+			if limit, ok := cause.err.(*ExtenderLimitedError); ok && limit != nil && self.extenderConfig != nil {
+				limited = true
+				retryAfter = max(retryAfter, limit.RetryAfter)
+				continue
+			}
+			admissionOnly = false
+			break
+		}
+		if admissionOnly {
+			if limited && handleCtx.Err() == nil {
+				self.limit(retryAfter)
+			}
+			return
+		}
 	}
 	recorded := false
 	func() {

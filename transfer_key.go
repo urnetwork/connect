@@ -64,6 +64,8 @@ type ClientKeyManager struct {
 
 	privateKey ed25519.PrivateKey
 	publicKey  ed25519.PublicKey
+	// The constructor owns this value alongside the original close-report domain.
+	historyDomainHash [32]byte
 
 	controlSync         *ControlSync
 	registrationSync    *ControlSyncOob
@@ -124,6 +126,9 @@ func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager
 		publicKey:   pub,
 		controlSync: NewControlSync(managerCtx, client, "client-key"),
 		workers:     newLifecycleAdmission(),
+	}
+	if client.settings.ContractManagerSettings != nil {
+		m.historyDomainHash = client.settings.ContractManagerSettings.CloseReportDomainHash
 	}
 	if client.settings.ClientKeyRegistrationRequired {
 		m.registrationSync = NewControlSyncOob(managerCtx, client, "client-key-registration")
@@ -354,12 +359,20 @@ func (self *ClientKeyManager) publishClientKey() {
 	if self.client.settings.beforeClientKeyPublishForTest != nil {
 		self.client.settings.beforeClientKeyPublishForTest()
 	}
-	frame, err := ToFrame(&protocol.ClientKey{
-		PublicKey: []byte(self.PublicKey()),
-	}, self.client.settings.ProtocolVersion)
+	frame, err := ToFrame(self.clientKeyMessage(self.PublicKey()), self.client.settings.ProtocolVersion)
 	if err != nil {
 		self.client.log.Errorf("[key]%s could not build ClientKey frame: %s\n", self.client.ClientTag(), err)
 		return
 	}
 	self.controlSync.Send(frame, nil, nil)
+}
+
+// Native and processed Http publication share one immutable domain. The zero
+// value omits the new field so existing peers retain exact legacy wire bytes.
+func (self *ClientKeyManager) clientKeyMessage(publicKey []byte) *protocol.ClientKey {
+	message := &protocol.ClientKey{PublicKey: bytes.Clone(publicKey)}
+	if self.historyDomainHash != ([32]byte{}) {
+		message.HistoryDomainHash = bytes.Clone(self.historyDomainHash[:])
+	}
+	return message
 }

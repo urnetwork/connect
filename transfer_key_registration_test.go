@@ -22,6 +22,7 @@ import (
 // Owns one actual pending Http request and its bounded response bytes.
 type clientKeyRegistrationHttpAttempt struct {
 	key      []byte
+	domain   []byte
 	response chan string
 	done     chan struct{}
 }
@@ -29,6 +30,11 @@ type clientKeyRegistrationHttpAttempt struct {
 // Construction uses the real ApiOutOfBandControl. The existing private
 // publisher barrier selects a zero retry delay before any send starts.
 func newClientKeyRegistrationHttpFixture(t *testing.T, ipVersion int) (*Client, *ApiOutOfBandControl, <-chan clientKeyRegistrationHttpAttempt, *atomic.Int64) {
+	return newClientKeyRegistrationDomainHttpFixture(t, ipVersion, [32]byte{})
+}
+
+// The actual control endpoint observes the optional domain with every key.
+func newClientKeyRegistrationDomainHttpFixture(t *testing.T, ipVersion int, domain [32]byte) (*Client, *ApiOutOfBandControl, <-chan clientKeyRegistrationHttpAttempt, *atomic.Int64) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	attempts := make(chan clientKeyRegistrationHttpAttempt, 4)
@@ -72,7 +78,7 @@ func newClientKeyRegistrationHttpFixture(t *testing.T, ipVersion int) (*Client, 
 			http.Error(w, "wrong control", 400)
 			return
 		}
-		attempt := clientKeyRegistrationHttpAttempt{key: bytes.Clone(key.PublicKey), response: make(chan string, 1), done: make(chan struct{})}
+		attempt := clientKeyRegistrationHttpAttempt{key: bytes.Clone(key.PublicKey), domain: bytes.Clone(key.HistoryDomainHash), response: make(chan string, 1), done: make(chan struct{})}
 		defer close(attempt.done)
 		count.Add(1)
 		select {
@@ -92,8 +98,14 @@ func newClientKeyRegistrationHttpFixture(t *testing.T, ipVersion int) (*Client, 
 	settings := closeWaitClientSettings()
 	settings.ClientKeyRegistrationRequired = true
 	settings.ClientKeySeed = bytes.Repeat([]byte{17}, ed25519.SeedSize)
+	settings.ContractManagerSettings.CloseReportDomainHash = domain
 	publish := make(chan struct{})
-	settings.beforeClientKeyPublishForTest = func() { <-publish }
+	settings.beforeClientKeyPublishForTest = func() {
+		select {
+		case <-publish:
+		case <-ctx.Done():
+		}
+	}
 	client := NewClient(ctx, NewId(), control, settings)
 	if client.ClientKeyManager() == nil {
 		cancel()

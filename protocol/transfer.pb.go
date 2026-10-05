@@ -2203,9 +2203,22 @@ type CloseContract struct {
 	AckedByteCount   uint64                 `protobuf:"varint,2,opt,name=acked_byte_count,json=ackedByteCount,proto3" json:"acked_byte_count,omitempty"`
 	UnackedByteCount uint64                 `protobuf:"varint,3,opt,name=unacked_byte_count,json=unackedByteCount,proto3" json:"unacked_byte_count,omitempty"`
 	Checkpoint       bool                   `protobuf:"varint,4,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
-	ReportId         []byte                 `protobuf:"bytes,5,opt,name=report_id,json=reportId,proto3" json:"report_id,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Stable identity for one logical report, preserved across transport retries.
+	// Empty keeps legacy incremental semantics. A backend must durably dedupe
+	// this ID with the exact party, amount and checkpoint flag before emission
+	// is enabled on hosted clients; older backends ignore the field.
+	ReportId []byte `protobuf:"bytes,5,opt,name=report_id,json=reportId,proto3" json:"report_id,omitempty"`
+	// Optional canonical original-close-report envelope signed by the client key.
+	// The versioned envelope binds its policy domain and this exact report tuple.
+	// Empty preserves legacy bytes; evidence-aware backends retain the original
+	// before counting it as authenticated work. A signature alone does not prove
+	// a complete contract, earning window, reliability or provider eligibility.
+	OriginalReport []byte `protobuf:"bytes,6,opt,name=original_report,json=originalReport,proto3" json:"original_report,omitempty"`
+	// Optional signed report-chain companion. Older routes may omit it; missing
+	// inventory remains unknown without changing the original close obligation.
+	OriginalInventory []byte `protobuf:"bytes,7,opt,name=original_inventory,json=originalInventory,proto3" json:"original_inventory,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *CloseContract) Reset() {
@@ -2269,6 +2282,20 @@ func (x *CloseContract) GetCheckpoint() bool {
 func (x *CloseContract) GetReportId() []byte {
 	if x != nil {
 		return x.ReportId
+	}
+	return nil
+}
+
+func (x *CloseContract) GetOriginalReport() []byte {
+	if x != nil {
+		return x.OriginalReport
+	}
+	return nil
+}
+
+func (x *CloseContract) GetOriginalInventory() []byte {
+	if x != nil {
+		return x.OriginalInventory
 	}
 	return nil
 }
@@ -2571,9 +2598,13 @@ func (x *EncryptedKey) GetClientKeySignedTlsCertificate() []byte {
 type ClientKey struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// 32-byte Ed25519 public key.
-	PublicKey     []byte `protobuf:"bytes,1,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PublicKey []byte `protobuf:"bytes,1,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
+	// Optional exact client-key history namespace; absent keeps the legacy
+	// operator-selected domain. A configured provider sends the same digest
+	// used by its original signed close reports on every key rotation.
+	HistoryDomainHash []byte `protobuf:"bytes,2,opt,name=history_domain_hash,json=historyDomainHash,proto3" json:"history_domain_hash,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *ClientKey) Reset() {
@@ -2609,6 +2640,13 @@ func (*ClientKey) Descriptor() ([]byte, []int) {
 func (x *ClientKey) GetPublicKey() []byte {
 	if x != nil {
 		return x.PublicKey
+	}
+	return nil
+}
+
+func (x *ClientKey) GetHistoryDomainHash() []byte {
+	if x != nil {
+		return x.HistoryDomainHash
 	}
 	return nil
 }
@@ -2961,7 +2999,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\x0f_destination_idB\f\n" +
 	"\n" +
 	"_stream_idB\v\n" +
-	"\t_priority\"\xc5\x01\n" +
+	"\t_priority\"\x9d\x02\n" +
 	"\rCloseContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12(\n" +
@@ -2970,7 +3008,9 @@ const file_transfer_proto_rawDesc = "" +
 	"\n" +
 	"checkpoint\x18\x04 \x01(\bR\n" +
 	"checkpoint\x12\x1b\n" +
-	"\treport_id\x18\x05 \x01(\fR\breportId\"\xf3\x03\n" +
+	"\treport_id\x18\x05 \x01(\fR\breportId\x12'\n" +
+	"\x0foriginal_report\x18\x06 \x01(\fR\x0eoriginalReport\x12-\n" +
+	"\x12original_inventory\x18\a \x01(\fR\x11originalInventory\"\xf3\x03\n" +
 	"\tPeerAudit\x12\x17\n" +
 	"\apeer_id\x18\x01 \x01(\fR\x06peerId\x12\x1a\n" +
 	"\bduration\x18\x02 \x01(\x04R\bduration\x12\x14\n" +
@@ -2991,10 +3031,11 @@ const file_transfer_proto_rawDesc = "" +
 	"\vProvidePing\"\x90\x01\n" +
 	"\fEncryptedKey\x126\n" +
 	"\x17provide_tls_certificate\x18\x01 \x03(\fR\x15provideTlsCertificate\x12H\n" +
-	"!client_key_signed_tls_certificate\x18\x02 \x01(\fR\x1dclientKeySignedTlsCertificate\"*\n" +
+	"!client_key_signed_tls_certificate\x18\x02 \x01(\fR\x1dclientKeySignedTlsCertificate\"Z\n" +
 	"\tClientKey\x12\x1d\n" +
 	"\n" +
-	"public_key\x18\x01 \x01(\fR\tpublicKey\"\xf7\x01\n" +
+	"public_key\x18\x01 \x01(\fR\tpublicKey\x12.\n" +
+	"\x13history_domain_hash\x18\x02 \x01(\fR\x11historyDomainHash\"\xf7\x01\n" +
 	"\x10EncryptedControl\x12B\n" +
 	"\fcontrol_type\x18\x01 \x01(\x0e2\x1f.bringyour.EncryptedControlTypeR\vcontrolType\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12:\n" +

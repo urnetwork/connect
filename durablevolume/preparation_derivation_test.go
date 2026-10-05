@@ -82,8 +82,19 @@ func preparationPhysicalTestAdapter() PreparationAdapter {
 // Source metadata is created before a new real physical export. Copied
 // original attributes are not authority for the new target's physical inodes.
 func newPreparationPhysicalFixture(t *testing.T) *preparationFixture {
+	return newPreparationPhysicalModeFixture(t, 0600)
+}
+
+// The census remains private mutable metadata while the independently copied
+// signed/public record can retain its actual immutable mode.
+func newPreparationPhysicalModeFixture(t *testing.T, mode os.FileMode) *preparationFixture {
 	t.Helper()
 	f := newPreparationRestoreFixture(t)
+	for _, root := range []string{f.volume.root, f.request.RestoreSource.Directory} {
+		if err := os.Chmod(filepath.Join(root, "record.bin"), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var stat syscall.Stat_t
 	if err := syscall.Stat(filepath.Join(f.volume.root, "record.bin"), &stat); err != nil {
 		t.Fatal(err)
@@ -138,6 +149,31 @@ func newPreparationPhysicalFixture(t *testing.T) *preparationFixture {
 		t.Fatal(err)
 	}
 	return f
+}
+
+func TestPreparationPhysicalMetadataPreservesImmutableOriginalMode(t *testing.T) {
+	f := newPreparationPhysicalModeFixture(t, 0400)
+	result, err := ApplyPreparationWithHost(t.Context(), f.accepted, preparationPhysicalTestAdapter(), f.volume.host)
+	if err != nil {
+		t.Fatal("physical derivation rejected an already-supported immutable original", err)
+	}
+	assertPreparationPhysicalResult(t, f, result)
+	for _, name := range []string{"record.bin", "census.json"} {
+		info, err := os.Stat(filepath.Join(f.request.RootPath, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := os.FileMode(0600)
+		if name == "record.bin" {
+			want = 0400
+		}
+		if info.Mode().Perm() != want {
+			t.Fatal("physical derivation broadened original mode", name, info.Mode())
+		}
+	}
+	if _, err := ApplyPreparationWithHost(t.Context(), f.accepted, preparationPhysicalTestAdapter(), f.volume.host); err != nil {
+		t.Fatal("exact completed restore did not continue", err)
+	}
 }
 
 // The actual declared owner accepts the new generation; signed/public member
