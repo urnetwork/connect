@@ -1360,7 +1360,7 @@ func (self *ExtenderDirectory) ExpireLatencies() {
 }
 
 // Drops every latency sample the host has slept at least `minSleep` through
-// since it was taken (extenderSlept): the host resumed from a sleep that long,
+// since it was taken (hostSlept): the host resumed from a sleep that long,
 // and a sample from before it is judged like one of another path
 // (DESIGNNOTES4.md §6), since the host may have woken where it measured
 // nothing. A sample taken since the host woke stays, and so does the rest of
@@ -1372,7 +1372,7 @@ func (self *ExtenderDirectory) ExpireSleptLatencies(minSleep time.Duration) {
 		return
 	}
 	self.expireLatencies(func(latencyTime time.Time, now time.Time) bool {
-		return minSleep <= extenderSlept(now, latencyTime)
+		return minSleep <= hostSlept(now, latencyTime)
 	})
 }
 
@@ -2796,17 +2796,6 @@ func extenderElapsed(now time.Time, t time.Time) time.Duration {
 // of extenderElapsed. A zero `t`, nothing set, is never in force.
 func extenderBefore(now time.Time, t time.Time) bool {
 	return now.Before(t) && now.Round(0).Before(t.Round(0))
-}
-
-// The time the host slept from `t` to `now`: how far the wall clock moved past
-// the monotonic one, which stood still while it slept (extenderElapsed).
-// Across awake time the two part only by what keeps the wall clock true, slews
-// and steps of a second or so. A wall clock set forward reads as a sleep, and
-// one set back hides as much sleep: nothing else tells them apart. Zero when
-// either time has no monotonic reading, since then both differences are the
-// wall clock's.
-func extenderSlept(now time.Time, t time.Time) time.Duration {
-	return now.Round(0).Sub(t.Round(0)) - now.Sub(t)
 }
 
 func extenderTimeMs(t time.Time) int64 {

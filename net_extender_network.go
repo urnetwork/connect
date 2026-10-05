@@ -121,12 +121,8 @@ type ExtenderNetworkClientSettings struct {
 	// while the host sleeps, so the probe loop reads the host clock every
 	// ResumeCheckTimeout while it waits, and acts on a resume once the host
 	// has stayed awake that long since the check that saw the sleep
-	// (extenderResumeWatch). The default minimum, fifteen minutes, is far past
-	// any correction of an awake host's wall clock, a second or so, and past
-	// the naps that leave a host where it measured: a screen lock, a lid
-	// closed between rooms. The default check, a minute, is a clock read per
-	// minute awake and none asleep, and acts one to two minutes after the host
-	// wakes, by when its network is back. <= 0 for either disables it.
+	// (hostResumeWatch). The defaults, fifteen minutes and a minute, are
+	// argued at defaultResumeMinSleep. <= 0 for either disables it.
 	ResumeCheckTimeout time.Duration
 	ResumeMinSleep     time.Duration
 
@@ -214,8 +210,8 @@ func DefaultExtenderNetworkClientSettings() *ExtenderNetworkClientSettings {
 		ProbeTimeout:           5 * time.Second,
 		ProbeCloseFactor:       2.0,
 		ProbeCloseFloor:        50 * time.Millisecond,
-		ResumeCheckTimeout:     1 * time.Minute,
-		ResumeMinSleep:         15 * time.Minute,
+		ResumeCheckTimeout:     defaultResumeCheckTimeout,
+		ResumeMinSleep:         defaultResumeMinSleep,
 		Now:                    time.Now,
 	}
 }
@@ -1397,7 +1393,7 @@ func (self *ExtenderNetworkClient) ProbeAttestor() (*ExtenderProbeAttestor, *Ext
 // so a host that woke on the same path would wait out the rest of the refresh
 // period in awake time, up to six hours, before it measured again. The loop
 // reads the host clock at every wakeup of its wait, and at least every
-// ResumeCheckTimeout, to tell a resume (extenderResumeWatch, hostResumed).
+// ResumeCheckTimeout, to tell a resume (hostResumeWatch, hostResumed).
 func (self *ExtenderNetworkClient) runProbes() {
 	if self.settings.ProbeWindowCount <= 0 {
 		<-self.ctx.Done()
@@ -1420,7 +1416,7 @@ func (self *ExtenderNetworkClient) runProbes() {
 	if probeAfter == nil {
 		probeAfter = time.After
 	}
-	resumeWatch := newExtenderResumeWatch(
+	resumeWatch := newHostResumeWatch(
 		self.settings.ResumeMinSleep,
 		self.settings.ResumeCheckTimeout,
 		self.settings.Now(),
