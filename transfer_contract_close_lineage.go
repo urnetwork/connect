@@ -8,6 +8,8 @@ import (
 	"math"
 	"sync"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -41,9 +43,11 @@ func (self *ContractManager) signOriginalCloseInventory(report *protocol.CloseCo
 	// Capture while the logical per-contract sequence still owns this lock.
 	// A concurrent checkpoint cannot publish its whole-owner head out of order.
 	defer func() {
-		owned := *report
+		// a protobuf message must not be copied by value (it carries its own
+		// state lock), so retain a clone with the inventory attached
+		owned := proto.Clone(report).(*protocol.CloseContract)
 		owned.OriginalInventory = inventoryRaw
-		self.retainOriginalWorkClose(&owned)
+		self.retainOriginalWorkClose(owned)
 	}()
 	manager.stateLock.RLock()
 	defer manager.stateLock.RUnlock()
