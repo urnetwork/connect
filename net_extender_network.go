@@ -114,6 +114,22 @@ type ExtenderNetworkClientSettings struct {
 	ProbeCloseFactor float64
 	ProbeCloseFloor  time.Duration
 
+	// A resume from a sleep of at least ResumeMinSleep is a path change for
+	// measurement (DESIGNNOTES4.md §6): the samples taken before the sleep are
+	// dropped, and the probe pass measures again once a sample has completed
+	// after it. Every timer here runs on the monotonic clock, which stops
+	// while the host sleeps, so the probe loop reads the host clock every
+	// ResumeCheckTimeout while it waits, and acts on a resume once the host
+	// has stayed awake that long since the check that saw the sleep
+	// (extenderResumeWatch). The default minimum, fifteen minutes, is far past
+	// any correction of an awake host's wall clock, a second or so, and past
+	// the naps that leave a host where it measured: a screen lock, a lid
+	// closed between rooms. The default check, a minute, is a clock read per
+	// minute awake and none asleep, and acts one to two minutes after the host
+	// wakes, by when its network is back. <= 0 for either disables it.
+	ResumeCheckTimeout time.Duration
+	ResumeMinSleep     time.Duration
+
 	// ManualHosts are hostnames or ip literals configured by hand (K6). An ip
 	// literal is added as a manual address at start; a hostname is resolved
 	// through the resolver seam below at start and on every rebootstrap, and
@@ -133,6 +149,11 @@ type ExtenderNetworkClientSettings struct {
 	// refresh loop. Tests read the wait the loop chose through it, and hold
 	// the loop on it without a sleep.
 	PassAfter func(wait time.Duration) <-chan time.Time
+	// When set, replaces time.After as the probe loop's waits: the refresh
+	// period between two passes, and each resume check while it waits
+	// (ResumeCheckTimeout). Tests fire the checks through it, and hold the
+	// loop on the period without a sleep.
+	ProbeAfter func(wait time.Duration) <-chan time.Time
 	// ResolveDns, when set, replaces the bootstrap resolution. Nil resolves A
 	// and AAAA over DoH with the system resolver as the fallback (E3).
 	ResolveDns func(ctx context.Context, name string) ([]netip.Addr, error)
@@ -193,6 +214,8 @@ func DefaultExtenderNetworkClientSettings() *ExtenderNetworkClientSettings {
 		ProbeTimeout:           5 * time.Second,
 		ProbeCloseFactor:       2.0,
 		ProbeCloseFloor:        50 * time.Millisecond,
+		ResumeCheckTimeout:     1 * time.Minute,
+		ResumeMinSleep:         15 * time.Minute,
 		Now:                    time.Now,
 	}
 }
@@ -282,6 +305,9 @@ type ExtenderNetworkClient struct {
 	// the open subscription, so a network change can end it at once rather
 	// than leaving the loop parked on a stream bound to the old path
 	feedStream *ExtenderFeedStream
+	// when it opened, so a resume ends it only when it predates the sleep
+	// (hostResumed)
+	feedStreamTime time.Time
 	// the manually configured hosts and the version that changes with them,
 	// which is what makes `SetManualHosts` re-resolve at once rather than at
 	// the next tick (K6)
@@ -438,11 +464,17 @@ func (self *ExtenderNetworkClient) takeHintRearmed() bool {
 	return hintRearmed
 }
 
-// Publishes the open subscription so a network change can end it.
+// Publishes the open subscription so a network change can end it, with when
+// it opened.
 func (self *ExtenderNetworkClient) setFeedStream(feedStream *ExtenderFeedStream) {
+	var feedStreamTime time.Time
+	if feedStream != nil {
+		feedStreamTime = self.settings.Now()
+	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.feedStream = feedStream
+	self.feedStreamTime = feedStreamTime
 }
 
 // Ends the loop and joins it.
@@ -1367,6 +1399,12 @@ func (self *ExtenderNetworkClient) ProbeAttestor() (*ExtenderProbeAttestor, *Ext
 // The probe loop: one pass on every wake -- a bootstrap, a completed sample,
 // a hint, an attestor -- and on the refresh cadence. A pass only measures
 // what has no current sample, so a burst of wakes costs little.
+//
+// Its timers run on the monotonic clock, which stops while the host sleeps,
+// so a host that woke on the same path would wait out the rest of the refresh
+// period in awake time, up to six hours, before it measured again. The loop
+// reads the host clock at every wakeup of its wait, and at least every
+// ResumeCheckTimeout, to tell a resume (extenderResumeWatch, hostResumed).
 func (self *ExtenderNetworkClient) runProbes() {
 	if self.settings.ProbeWindowCount <= 0 {
 		<-self.ctx.Done()
@@ -1385,6 +1423,15 @@ func (self *ExtenderNetworkClient) runProbes() {
 		return
 	case <-self.initialHintDone:
 	}
+	probeAfter := self.settings.ProbeAfter
+	if probeAfter == nil {
+		probeAfter = time.After
+	}
+	resumeWatch := newExtenderResumeWatch(
+		self.settings.ResumeMinSleep,
+		self.settings.ResumeCheckTimeout,
+		self.settings.Now(),
+	)
 	for {
 		// subscribe before the pass, so a wake that lands while it runs is
 		// carried into the next wait instead of being lost
@@ -1395,11 +1442,26 @@ func (self *ExtenderNetworkClient) runProbes() {
 		if wait <= 0 {
 			wait = DefaultExtenderNetworkClientSettings().RebootstrapTimeout
 		}
-		select {
-		case <-self.ctx.Done():
-			return
-		case <-wake:
-		case <-time.After(wait):
+		passAfter := probeAfter(wait)
+		for waiting := true; waiting; {
+			// nil, which never fires, when resumes are not watched
+			var checkAfter <-chan time.Time
+			if resumeWatch.Watching() {
+				checkAfter = probeAfter(self.settings.ResumeCheckTimeout)
+			}
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-wake:
+				waiting = false
+			case <-passAfter:
+				waiting = false
+			case <-checkAfter:
+			}
+			now := self.settings.Now()
+			if sleep, resumed := resumeWatch.Check(now); resumed {
+				self.hostResumed(now, sleep)
+			}
 		}
 	}
 }

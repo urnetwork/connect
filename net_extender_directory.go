@@ -177,9 +177,10 @@ type ExtenderDirectorySettings struct {
 	// measures the address again. The default is half the day the operator
 	// keeps pings for, so a provider's attested pings are renewed before the
 	// previous ones age out of what each derivation reads (GEOMAP §2.1). The
-	// age counts the time the host slept (extenderElapsed), and a path change
-	// drops every sample whatever its age (ExpireLatencies). <= 0 keeps a
-	// sample until the path changes.
+	// age counts the time the host slept (extenderElapsed), a path change
+	// drops every sample whatever its age (ExpireLatencies), and a resume from
+	// a long sleep drops those taken before it (ExpireSleptLatencies). <= 0
+	// keeps a sample until the path changes or the host resumes.
 	LatencyMaxAge time.Duration
 	// How long an address that answered 429 with no Retry-After is left alone
 	// before the jitter, which is the same +-50 % a Retry-After gets (A12). A
@@ -282,7 +283,8 @@ type extenderDirectoryAddress struct {
 	// the latest latency sample (DESIGNNOTES4.md): the lowest rtt of one
 	// probe pass, when it was taken and whether the target co-signed a claim
 	// of that pass (GEOMAP §2.3). Per process and per path: never stored, and
-	// dropped by a path change (ExpireLatencies).
+	// dropped by a path change (ExpireLatencies) and by a resume from a long
+	// sleep that followed it (ExpireSleptLatencies).
 	latency         time.Duration
 	latencyTime     time.Time
 	latencyAttested bool
@@ -1316,8 +1318,9 @@ func directorySpoofDomains(directory *ExtenderDirectory) ([]string, string) {
 // pass (DESIGNNOTES4.md, GEOMAP §2.3) -- a claim merely sent, refused or left
 // without a verdict does not count. The sample is per process and ages out
 // after LatencyMaxAge, the time the host slept included; it is never stored,
-// because yesterday's path is not today's, and a path change drops it for the
-// same reason (ExpireLatencies).
+// because yesterday's path is not today's, and a path change or a resume from
+// a long sleep drops it for the same reason (ExpireLatencies,
+// ExpireSleptLatencies).
 func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, attested bool) {
 	if !ip.IsValid() || rtt <= 0 {
 		return
@@ -1351,6 +1354,32 @@ func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, a
 // path, is empty and measures again. The rest of the local evidence --
 // successes, failures, holds and limits -- stays.
 func (self *ExtenderDirectory) ExpireLatencies() {
+	self.expireLatencies(func(time.Time, time.Time) bool {
+		return true
+	})
+}
+
+// Drops every latency sample the host has slept at least `minSleep` through
+// since it was taken (extenderSlept): the host resumed from a sleep that long,
+// and a sample from before it is judged like one of another path
+// (DESIGNNOTES4.md §6), since the host may have woken where it measured
+// nothing. A sample taken since the host woke stays, and so does the rest of
+// the local evidence, as for a path change. A wall clock set forward reads as
+// a sleep here, and one set back hides as much sleep. A `minSleep` <= 0 drops
+// nothing.
+func (self *ExtenderDirectory) ExpireSleptLatencies(minSleep time.Duration) {
+	if minSleep <= 0 {
+		return
+	}
+	self.expireLatencies(func(latencyTime time.Time, now time.Time) bool {
+		return minSleep <= extenderSlept(now, latencyTime)
+	})
+}
+
+// Drops each latency sample `expired` picks by when it was taken and the
+// time now, then rebuilds the tier index and publishes one change when any
+// went.
+func (self *ExtenderDirectory) expireLatencies(expired func(latencyTime time.Time, now time.Time) bool) {
 	now := self.settings.Now()
 
 	self.stateLock.Lock()
@@ -1358,7 +1387,7 @@ func (self *ExtenderDirectory) ExpireLatencies() {
 
 	changed := false
 	for _, address := range self.ipAddresses {
-		if address.latencyTime.IsZero() {
+		if address.latencyTime.IsZero() || !expired(address.latencyTime, now) {
 			continue
 		}
 		address.latency = 0
@@ -2767,6 +2796,17 @@ func extenderElapsed(now time.Time, t time.Time) time.Duration {
 // of extenderElapsed. A zero `t`, nothing set, is never in force.
 func extenderBefore(now time.Time, t time.Time) bool {
 	return now.Before(t) && now.Round(0).Before(t.Round(0))
+}
+
+// The time the host slept from `t` to `now`: how far the wall clock moved past
+// the monotonic one, which stood still while it slept (extenderElapsed).
+// Across awake time the two part only by what keeps the wall clock true, slews
+// and steps of a second or so. A wall clock set forward reads as a sleep, and
+// one set back hides as much sleep: nothing else tells them apart. Zero when
+// either time has no monotonic reading, since then both differences are the
+// wall clock's.
+func extenderSlept(now time.Time, t time.Time) time.Duration {
+	return now.Round(0).Sub(t.Round(0)) - now.Sub(t)
 }
 
 func extenderTimeMs(t time.Time) int64 {

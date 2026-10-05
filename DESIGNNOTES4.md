@@ -219,6 +219,18 @@ reorder them.
   of what the monotonic and the wall clock say, so a host that slept past
   `LatencyMaxAge` measures again (the monotonic clock stops while the host
   sleeps), and a wall clock set back keeps it no longer.
+- A resume from a sleep of at least `ResumeMinSleep` (15 min) is a path change
+  for measurement, so a host that wakes on the same path, with no path change
+  to wake its timers, measures again within minutes rather than at the end of
+  a refresh period of awake time. The probe loop reads the host clock every
+  `ResumeCheckTimeout` (1 min) while it waits, and the wall clock moving past
+  the monotonic one between two checks is the sleep. Once the host has stayed
+  awake a check since, the samples taken before the sleep go
+  (`ExpireSleptLatencies`), and the probe pass follows the first sample that
+  completes after the sleep, so it never probes a path that has not worked
+  since: a feed stream from before the sleep is replaced to take one. Holds,
+  the hint and its country stay. A wall clock set forward that far reads as a
+  sleep and costs one probe pass; one set back hides as much sleep.
 - The hint endpoint tells a client its own continent as the operator sees it.
   That is information the operator already holds and the client's own DNS
   resolver already acted on; it is not a new disclosure in either direction.
