@@ -3,6 +3,7 @@ package connect
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"net/netip"
 	"slices"
 	"strings"
@@ -226,6 +227,69 @@ func TestExtenderShareDecodeErrors(t *testing.T) {
 		t.Fatal(err)
 	} else if share.Version != ExtenderShareVersion {
 		t.Fatalf("version = %d, want %d", share.Version, ExtenderShareVersion)
+	}
+}
+
+// The settings block carries the sharer's bootstrap DoH servers (P216), so a
+// setup that works behind a block on the default DoH servers can be passed on.
+// A server the DoH rule refuses -- a host name, plain http, the wrong family,
+// too many -- can be neither written nor read.
+func TestExtenderShareCarriesControlDohUrls(t *testing.T) {
+	share := BuildExtenderShare(
+		nil,
+		testExtenderNetworkHost,
+		"extender.space.example",
+		"wss://gossip.space.example",
+		nil,
+		true,
+		0,
+	)
+	share.Settings.ControlDohUrlsIpv4 = []string{"https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"}
+	share.Settings.ControlDohUrlsIpv6 = []string{"https://[2001:db8::53]/dns-query"}
+	text, err := EncodeExtenderShare(share)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeExtenderShare(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(decoded.Settings.ControlDohUrlsIpv4, share.Settings.ControlDohUrlsIpv4) ||
+		!slices.Equal(decoded.Settings.ControlDohUrlsIpv6, share.Settings.ControlDohUrlsIpv6) {
+		t.Fatalf("decoded DoH servers = %v %v", decoded.Settings.ControlDohUrlsIpv4, decoded.Settings.ControlDohUrlsIpv6)
+	}
+
+	tooMany := []string{}
+	for i := range ControlDohMaxUrlCount + 1 {
+		tooMany = append(tooMany, fmt.Sprintf("https://192.0.2.%d/dns-query", i+1))
+	}
+	cases := []struct {
+		what        string
+		dohUrlsIpv4 []string
+		dohUrlsIpv6 []string
+	}{
+		{what: "a host name", dohUrlsIpv4: []string{"https://dns.alidns.com/dns-query"}},
+		{what: "plain http", dohUrlsIpv4: []string{"http://223.5.5.5/dns-query"}},
+		{what: "a v6 server in the v4 list", dohUrlsIpv4: []string{"https://[2001:db8::53]/dns-query"}},
+		{what: "a v4 server in the v6 list", dohUrlsIpv6: []string{"https://223.5.5.5/dns-query"}},
+		{what: "too many servers", dohUrlsIpv4: tooMany},
+	}
+	for _, c := range cases {
+		refused := &protocol.ExtenderShare{
+			Version:     ExtenderShareVersion,
+			NetworkHost: testExtenderNetworkHost,
+			Settings: &protocol.ExtenderShareSettings{
+				DnsName:            "extender.space.example",
+				ControlDohUrlsIpv4: c.dohUrlsIpv4,
+				ControlDohUrlsIpv6: c.dohUrlsIpv6,
+			},
+		}
+		if _, err := EncodeExtenderShare(refused); err == nil {
+			t.Errorf("%s encoded", c.what)
+		}
+		if decodedShare, err := DecodeExtenderShare(testExtenderShareText(t, refused)); err == nil {
+			t.Errorf("%s decoded as %+v", c.what, decodedShare)
+		}
 	}
 }
 
