@@ -631,19 +631,26 @@ func (self *ExtenderDirectory) ApplyRecord(
 	if len(body.PublicKey) == 0 {
 		return false, fmt.Errorf("extender record carries no public key")
 	}
-	return self.applyVerifiedRecord(record, body, source), nil
+	return self.applyVerifiedRecord(record, body, keySet, source)
 }
 
-// Applies one record whose body has been verified and whose network host is
-// allowed: what ApplyRecord does once the signature holds. Past
-// MaxActiveRecordCount a record new to the directory evicts one the directory
-// prefers less, which may be this one; the record is published to the
-// subscribers either way, whose own caps judge it.
+// Applies one record whose body has been verified under keySet and whose
+// network host is allowed: what ApplyRecord does once the signature holds.
+// Past MaxActiveRecordCount a record new to the directory evicts one the
+// directory prefers less, which may be this one; the record is published to
+// the subscribers either way, whose own caps judge it.
+//
+// The verification runs outside the lock, so SetRootKeys can replace the keys
+// between it and the store, after judging every record it held. A record
+// verified under keys that are no longer in force is judged again under the
+// lock, so it never lands after them. Keys change rarely, so the second
+// verification is rarely paid.
 func (self *ExtenderDirectory) applyVerifiedRecord(
 	record *protocol.ExtenderRecord,
 	body *protocol.ExtenderRecordBody,
+	keySet *ExtenderRootKeySet,
 	source string,
-) (changed bool) {
+) (changed bool, err error) {
 	if source == "" {
 		source = ExtenderSourceFeed
 	}
@@ -664,6 +671,11 @@ func (self *ExtenderDirectory) applyVerifiedRecord(
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if keySet != self.rootKeySet {
+		if _, err := self.rootKeySet.VerifyRecord(record); err != nil {
+			return false, err
+		}
+	}
 	keyRecord := self.keyHexRecords[keyHex]
 	if keyRecord == nil {
 		// the body is kept as the record's for as long as the key is, so its
@@ -674,7 +686,7 @@ func (self *ExtenderDirectory) applyVerifiedRecord(
 		self.keyHexRecords[keyHex] = keyRecord
 	} else if keyRecord.recordBody != nil && body.IssueTimeMs <= keyRecord.recordBody.IssueTimeMs {
 		// an older or identical record; the newest one already held wins
-		return false
+		return false, nil
 	}
 	keyRecord.record = record
 	keyRecord.recordBody = body
@@ -720,7 +732,7 @@ func (self *ExtenderDirectory) applyVerifiedRecord(
 		})
 	}
 	self.changedWithLock()
-	return true
+	return true, nil
 }
 
 // Applies one signed revocation that arrived over the feed, which is what
@@ -749,11 +761,30 @@ func (self *ExtenderDirectory) ApplyRevocationSource(
 	if len(body.PublicKey) == 0 {
 		return false, fmt.Errorf("extender revocation carries no public key")
 	}
+	return self.applyVerifiedRevocation(revocation, body, keySet, source)
+}
+
+// Applies one revocation whose body has been verified under keySet and whose
+// network host is allowed: what ApplyRevocationSource does once the signature
+// holds. A revocation verified under keys that SetRootKeys has replaced since
+// is judged again under the lock, as a record is (applyVerifiedRecord).
+func (self *ExtenderDirectory) applyVerifiedRevocation(
+	revocation *protocol.ExtenderRevocation,
+	body *protocol.ExtenderRevocationBody,
+	keySet *ExtenderRootKeySet,
+	source string,
+) (changed bool, err error) {
 	keyHex := hex.EncodeToString(body.PublicKey)
+	now := self.settings.Now()
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if keySet != self.rootKeySet {
+		if _, err := self.rootKeySet.VerifyRevocation(revocation); err != nil {
+			return false, err
+		}
+	}
 	keyRecord := self.keyHexRecords[keyHex]
 	if keyRecord == nil {
 		// keep the revocation even with no record, so a replayed older record
@@ -767,7 +798,6 @@ func (self *ExtenderDirectory) ApplyRevocationSource(
 	}
 	keyRecord.revocation = revocation
 	keyRecord.revocationBody = body
-	now := self.settings.Now()
 	self.tierUpdateWithLock(keyHex, now)
 	self.noteEventWithLock(source, now)
 	if 0 < len(self.subscriptions) {

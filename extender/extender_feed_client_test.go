@@ -404,18 +404,28 @@ func TestExtenderNetworkClientSamplesAnExtender(t *testing.T) {
 		return false
 	}, "the dns bootstrap never reached the directory")
 
-	status := networkClient.Status()
+	// the end of the sample is the frame after the record, and the status
+	// takes its time and the completed first attempt in two updates, so the
+	// status is waited for rather than read once
+	status := func() connect.ExtenderNetworkClientStatus {
+		timeout := time.After(60 * time.Second)
+		for {
+			status, changed := networkClient.StatusMonitor().Get()
+			if !status.LastSampleTime.IsZero() && status.InitialAttemptDone {
+				return status
+			}
+			select {
+			case <-changed:
+			case <-timeout:
+				t.Fatalf("the status never carried the sample time and the completed first attempt, status = %+v", status)
+			}
+		}
+	}()
 	if !status.FeedConnected {
 		t.Fatal("the status does not report the open feed")
 	}
 	if status.FeedIp != fixture.extenderIp {
 		t.Fatalf("feed ip = %s, expected %s", status.FeedIp, fixture.extenderIp)
-	}
-	if status.LastSampleTime.IsZero() {
-		t.Fatal("the status carries no sample time")
-	}
-	if !status.InitialAttemptDone {
-		t.Fatal("the status does not report the completed first attempt")
 	}
 
 	// a revocation pushed on the open subscription is applied
