@@ -172,6 +172,23 @@ func newTestUnanchoredExtenderDirectory(
 	return directory
 }
 
+// A network client built as a bare struct, with none of its loops running, as
+// a test builds one to drive a step by hand. It has the fields every client
+// has had since before the hello loop, and none of that loop's own.
+func newTestBareExtenderNetworkClient(t *testing.T, directory *ExtenderDirectory) *ExtenderNetworkClient {
+	t.Helper()
+	return &ExtenderNetworkClient{
+		ctx:           t.Context(),
+		log:           NewNoopLogger(),
+		directory:     directory,
+		settings:      DefaultExtenderNetworkClientSettings(),
+		statusMonitor: NewMonitorValue[ExtenderNetworkClientStatus](ExtenderNetworkClientStatus{}),
+		wakeMonitor:   NewMonitor(),
+		probeWake:     NewMonitor(),
+		hintWake:      NewMonitor(),
+	}
+}
+
 // A network client whose refresh loop passes only when the test lets it, with
 // hello read through the given seam and the bootstrap's TXT answer the given
 // records. Every other seam answers at once and the host has no family to
@@ -647,6 +664,32 @@ func TestExtenderNetworkClientProbesTheTxtRecordsThatWaitedForTheHelloKeys(t *te
 			t.Fatalf("probes = %v, expected the record that waited for hello's keys", ips)
 		}
 	})
+}
+
+// A path change wakes the hello loop through the wake it shares with the hint
+// loop, so every client that can take a path change wakes hello too: one
+// built bare included, as the probe tests build one to drive a pass by hand.
+// Before, the hello loop had a wake of its own, and a path change panicked on
+// a client built without it.
+func TestExtenderNetworkClientPathChangeWakesTheHelloLoopOfABareClient(t *testing.T) {
+	clock := newTestClock()
+	directory, _ := newTestExtenderDirectory(t, clock, nil)
+	networkClient := newTestBareExtenderNetworkClient(t, directory)
+	hintWake := networkClient.hintWake.NotifyChannel()
+	networkClient.networkChanged()
+	select {
+	case <-hintWake:
+	default:
+		t.Fatal("the path change did not wake the hint and hello loops")
+	}
+	helloRearmed := func() bool {
+		networkClient.stateLock.Lock()
+		defer networkClient.stateLock.Unlock()
+		return networkClient.helloRearmed
+	}()
+	if !helloRearmed {
+		t.Fatal("the path change did not ask for a failed hello again")
+	}
 }
 
 // A pass verifies under the keys in force while hello is out -- here a cached

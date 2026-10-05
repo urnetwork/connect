@@ -305,16 +305,18 @@ type ExtenderNetworkClient struct {
 	// closed by run after its first bootstrap/manual readiness and expiry,
 	// before sampling; early hints must not probe a partial bootstrap set
 	initialProbeReady chan struct{}
-	// the hint loop's join and wake (DESIGNNOTES4.md §4)
+	// the hint loop's join and wake (DESIGNNOTES4.md §4). The hello loop
+	// waits on the same wake: both look whether their read is due at each
+	// pass and at a path change, so whatever wakes the one wakes the other,
+	// even in a client built bare, without the hello loop's fields
 	hintDone chan struct{}
 	hintWake *Monitor
 	// closed by the hint loop once its first read has ended, answered or
 	// not; the first probe pass waits for it too, so the operator's
 	// continent is probed first
 	initialHintDone chan struct{}
-	// the hello loop's join and wake
+	// the hello loop's join; it waits on hintWake
 	helloDone chan struct{}
-	helloWake *Monitor
 	// the attesting provider, nil for a client that only ranks. Installed
 	// by the provider role and cleared when it stops.
 	probeAttestor *ExtenderProbeAttestor
@@ -380,7 +382,6 @@ func NewExtenderNetworkClient(
 		hintWake:          NewMonitor(),
 		initialHintDone:   make(chan struct{}),
 		helloDone:         make(chan struct{}),
-		helloWake:         NewMonitor(),
 	}
 	directory.SetInitialSamplePending()
 	// a path change invalidates the feed connection and the addresses that
@@ -447,8 +448,8 @@ func (self *ExtenderNetworkClient) networkChanged() {
 	if feedStream != nil {
 		feedStream.Close()
 	}
+	// the hint and the hello loops share the wake
 	self.hintWake.NotifyAll()
-	self.helloWake.NotifyAll()
 	self.wakeMonitor.NotifyAll()
 }
 
@@ -537,8 +538,8 @@ func (self *ExtenderNetworkClient) run() {
 		wake := self.wakeMonitor.NotifyChannel()
 
 		// each pass has the hello and hint loops look whether their read is
-		// due, and goes on without waiting for either (runHellos, runHints)
-		self.helloWake.NotifyAll()
+		// due, and goes on without waiting for either (runHellos, runHints);
+		// they share the wake
 		self.hintWake.NotifyAll()
 		if lastBootstrapTime.IsZero() ||
 			self.settings.RebootstrapTimeout <= now.Sub(lastBootstrapTime) ||
@@ -633,11 +634,11 @@ func (self *ExtenderNetworkClient) run() {
 // installs judge again what was judged under the old ones (refreshRootKeys).
 //
 // The loop has no clock of its own. It looks whether hello is due at its
-// start, at each pass, which wakes it, and at a path change, which is when
-// hello was read as part of the pass. A failed read waits out its backoff
-// (extenderReadSchedule), so a refresh loop that passes after every feed drop
-// does not read it at each one, and a path change clears the backoff. One
-// read is out at a time.
+// start, at each pass and at a path change -- it waits on the hint loop's
+// wake, which takes exactly those -- which is when hello was read as part of
+// the pass. A failed read waits out its backoff (extenderReadSchedule), so a
+// refresh loop that passes after every feed drop does not read it at each
+// one, and a path change clears the backoff. One read is out at a time.
 func (self *ExtenderNetworkClient) runHellos() {
 	helloSchedule := newExtenderReadSchedule(
 		self.settings.RebootstrapTimeout,
@@ -646,8 +647,9 @@ func (self *ExtenderNetworkClient) runHellos() {
 	)
 	for {
 		// subscribe before the read, so a pass or a path change that lands
-		// while it runs is carried into the next wait instead of being lost
-		wake := self.helloWake.NotifyChannel()
+		// while it runs is carried into the next wait instead of being lost;
+		// the wake is the hint loop's, which takes the same events
+		wake := self.hintWake.NotifyChannel()
 		// a path change since the last look asks for a failed hello at once
 		helloRearmed := func() bool {
 			self.stateLock.Lock()
