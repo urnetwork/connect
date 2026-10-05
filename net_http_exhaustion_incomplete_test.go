@@ -122,13 +122,16 @@ func (self *httpIncompleteWideTestError) Unwrap() []error {
 // Absent children neither multiply retained marker storage nor bypass finite
 // callback work through successive otherwise empty joined wrappers.
 func TestHttpRequestCausesChargeAbsentChildrenWithinOriginalBudget(t *testing.T) {
-	// The first callback admits 128 absent children; the second admits 125
-	// after truncation. The third callback consumes the final admitted node,
-	// with no allowance left for its children: 3 + 128 + 125 = 256.
-	const wantVisits = 3
-	const wantAbsentChildren = 128 + 125
-	if httpRequestCauseNodes != wantVisits+wantAbsentChildren {
-		t.Fatalf("fixture requires the original node budget: got %d want %d", httpRequestCauseNodes, wantVisits+wantAbsentChildren)
+	// The root callback and its 128 absent children leave 127 nodes. Visiting
+	// the admitted recursive child leaves 126, which cannot admit its complete
+	// 129-child frame. Refusal stops at two callbacks; the unused allowance
+	// cannot be spent on a truncated frame: 2 + 128 + 126 = 256.
+	const wantVisits = 2
+	const wantAbsentChildren = 128
+	const wantUnspentNodes = 126
+	const wantNodes = wantVisits + wantAbsentChildren + wantUnspentNodes
+	if httpRequestCauseNodes != wantNodes {
+		t.Fatalf("fixture requires the original node budget: got %d want %d", httpRequestCauseNodes, wantNodes)
 	}
 	cause := &httpIncompleteWideTestError{}
 	retained := flattenHttpRequestCauses(cause)

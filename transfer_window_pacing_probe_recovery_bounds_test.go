@@ -68,7 +68,7 @@ func testWindowPacingProbeRecoveryFixture(t *testing.T, configure func(*SendBuff
 			&h1SendClientTransportForGroupTest{sendClientTransport: NewSendClientTransport(DestinationId(destination))},
 			[]Route{route},
 		)
-		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination})
+		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination, Ctx: ctx})
 		synctest.Wait()
 		service := sequence.windowPacer.service
 		start := time.Now()

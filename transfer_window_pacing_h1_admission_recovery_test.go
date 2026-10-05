@@ -55,7 +55,7 @@ func testWindowPacingH1AdmissionOwnerProgress(t *testing.T, changeRoute bool) {
 		client.ContractManager().AddNoContractPeer(destination)
 		transport := NewSendGatewayTransportWithType(TransportTypeH1)
 		client.RouteManager().UpdateTransport(transport, []Route{route})
-		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination})
+		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination, Ctx: ctx})
 		synctest.Wait()
 		service := sequence.windowPacer.service
 		service.queueObservedAt = time.Now().Add(-time.Second)

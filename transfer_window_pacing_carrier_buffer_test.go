@@ -236,7 +236,7 @@ func runWindowCarrierBufferWorker(t *testing.T, stall bool, priorRate, physicalR
 				}
 			}
 		}()
-		sequence := sender.sendBuffer.createSendSequence(sendSequenceId{Destination: receiver.ClientId()}, &SendPack{Destination: receiver.ClientId()})
+		sequence := sender.sendBuffer.createSendSequence(sendSequenceId{Destination: receiver.ClientId()}, &SendPack{Destination: receiver.ClientId(), Ctx: ctx})
 		synctest.Wait()
 		service := sequence.windowPacer.service
 		start := time.Now()

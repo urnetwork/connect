@@ -28,7 +28,7 @@ func testWindowPacingConfiguredLongFlight(t *testing.T, mixed bool) {
 		client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 		defer func() { cancel(); client.CloseAndWait(context.Background()) }()
 		destination := NewId()
-		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination})
+		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination, Ctx: ctx})
 		if sequence == nil || sequence.windowPacer.service == nil {
 			t.Fatal("configured delivery-sized sequence did not acquire a shared service")
 		}
@@ -165,7 +165,7 @@ func TestWindowPacingDrainedProbeOutlivesStaleLaneTimer(t *testing.T) {
 			&h1SendClientTransportForGroupTest{sendClientTransport: NewSendClientTransport(DestinationId(destination))},
 			[]Route{route},
 		)
-		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination})
+		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination, Ctx: ctx})
 		synctest.Wait()
 		service := sequence.windowPacer.service
 		start := time.Now()

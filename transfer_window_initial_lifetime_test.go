@@ -93,7 +93,7 @@ func runWindowInitialLifetimeFixture(t *testing.T, delay, lifetime time.Duration
 		}()
 		fixture.client.ContractManager().AddNoContractPeer(destination)
 		fixture.client.RouteManager().UpdateTransport(&h1SendClientTransportForGroupTest{sendClientTransport: NewSendClientTransport(DestinationId(destination))}, []Route{fixture.route})
-		fixture.sequence = fixture.client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination})
+		fixture.sequence = fixture.client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination, Ctx: ctx})
 		if fixture.sequence == nil || fixture.sequence.windowPacer.service == nil {
 			t.Fatal("no shared pacing service")
 		}

@@ -184,6 +184,7 @@ func TestLogicalLanePinsCapabilitySequenceUntilLaneExit(t *testing.T) {
 	dataLane := client.sendBuffer.createSendSequence(id, &SendPack{
 		TransferOptions: settings.DefaultTransferOpts,
 		Destination:     destination,
+		Ctx:             ctx,
 		schedulingKey:   key,
 	})
 	if dataLane == nil {
