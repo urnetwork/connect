@@ -1494,7 +1494,7 @@ func (self *ContractManager) addContractToQueue(
 	// path, never repopulate a queue that no worker will consume or flush again.
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	if self.closed {
+	if self.closed || self.ctx.Err() != nil || self.client.IsDone() {
 		return errContractQueueDrained
 	}
 	if err := contractQueue.Add(contract, storedContract); err != nil {
