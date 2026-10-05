@@ -66,10 +66,10 @@ func (self *SendSequence) tryCloseRetiredSendContract(contract *sequenceContract
 		return
 	}
 	delete(self.pendingNoAckContractCloses, contract.contractId)
-	if contract.unackedByteCount != 0 || self.openSendContracts[contract.contractId] != contract {
+	if contract.unackedByteCount != contract.abandonedByteCount || self.openSendContracts[contract.contractId] != contract {
 		return
 	}
-	self.client.ContractManager().CloseContract(contract.contractId, contract.ackedByteCount, 0)
+	self.client.ContractManager().CloseContract(contract.contractId, contract.ackedByteCount, contract.unackedByteCount)
 	delete(self.openSendContracts, contract.contractId)
 }
 

@@ -33,7 +33,10 @@ func runWindowPacingLifetimeContractFeedback(t *testing.T, matching, fullProof, 
 		service.stateLock.Unlock()
 		frame := &protocol.Frame{MessageType: protocol.MessageType_TransferExchangeSignals, MessageBytes: MessagePoolGet(1280)}
 		clear(frame.MessageBytes)
-		if !fixture.client.SendWithTimeout(frame, fixture.sequence.destination, func(error) {}, time.Second, sendPackRecoveryOption{retainAfterAckTimeout: true}) {
+		youngerCompleted := make(chan error, 4)
+		if !fixture.client.SendWithTimeout(frame, fixture.sequence.destination, func(err error) {
+			youngerCompleted <- err
+		}, time.Second, sendPackRecoveryOption{retainAfterAckTimeout: true}) {
 			MessagePoolReturn(frame.MessageBytes)
 			t.Fatal("retained younger original was not admitted")
 		}
@@ -92,8 +95,12 @@ func runWindowPacingLifetimeContractFeedback(t *testing.T, matching, fullProof, 
 		default:
 			t.Fatal("one pending contract request renewed its lifetime more than once")
 		}
-		if len(fixture.route) != 0 || fixture.sequence.resendQueue.Len() != 0 {
-			t.Fatal("contract lifetime expiry dispatched or retained pending bytes")
+		if len(fixture.route) != 0 || fixture.sequence.ctx.Err() != nil || len(youngerCompleted) != 0 ||
+			fixture.sequence.resendQueue.Len() != 1 || fixture.sequence.resendQueue.GetByMessageId(olderId) != nil {
+			t.Fatal("contract lifetime expiry dispatched or failed the retained younger owner")
+		}
+		if younger := fixture.sequence.resendQueue.GetBySequenceNumber(1); younger == nil || !younger.acks.retainPastAckTimeout() {
+			t.Fatal("contract lifetime expiry lost the retained younger identity")
 		}
 	}, func(fixture *windowInitialLifetimeFixture) {
 		contractId = NewId()
