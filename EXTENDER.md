@@ -259,7 +259,13 @@ list, and the global list for a country without one. A dial takes the country
 of its directory, `ExtenderDirectory.SpoofCountryCode()`: the `country_code`
 of the operator's hint while the hint is current, else the network country the
 host reports through `SetNetworkCountryCode` (on Android the mobile network's
-country while the default network is cellular), else the hint's last country.
+country while the default network is cellular), else the hint's last country
+for a week after the operator last answered it (`CountryHintMaxAge`). The
+directory stores that country with its time (E1), so a restart keeps it: no
+Apple host reports a network country, nor Windows or Linux without a modem,
+and the iOS packet tunnel extension usually ends with its tunnel, so a tunnel
+started where the hint cannot be read would otherwise have no country. Every
+answer replaces and renews it; past the week it is never used.
 The hint is read through direct dialers only (DESIGNNOTES4.md §4): where only
 an extender reaches the operator, the hint fails rather than placing it.
 A failed hint and a path change make the hint's country stale, and a path
@@ -770,7 +776,12 @@ never-succeeded oldest first, then oldest last success. Manual entries are
 never removed by policy. A `MonitorValue` publishes change; `Snapshot`
 serves status. Persistence goes through a store interface `Load() ([]byte,
 error)` and `Save([]byte) error` with a JSON envelope `{version, records,
-addresses}`, saved coalesced at 1 s after a change.
+addresses, country_hint}`, saved coalesced at 1 s after a change.
+`country_hint` is the operator's last country and the time it last answered
+it, `{version, country_code, time_ms}` and nothing more (A10, country lists).
+It has a version of its own rather than a new envelope version, because a
+build discards an envelope of another version whole; a section a build cannot
+read is skipped alone.
 
 E2. Strategy. `ClientStrategySettings.ExtenderDirectory` replaces
 `ExtenderNetworks`, `ExtenderHostnames` and the profile enumeration, which

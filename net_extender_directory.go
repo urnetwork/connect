@@ -69,6 +69,11 @@ const (
 // discarded, exactly like an unreadable one.
 const ExtenderDirectoryStoreVersion = 1
 
+// Version of the operator's stored country, a section of the envelope with a
+// version of its own (extenderDirectoryStoreCountryHint). A section of another
+// version is skipped alone: the records and addresses beside it still load.
+const extenderDirectoryStoreCountryHintVersion = 1
+
 // The bounded buffer of one Subscribe consumer (D4). A consumer that falls
 // this far behind is cut off rather than waited on.
 const ExtenderDirectorySubscribeBufferCount = 64
@@ -172,6 +177,20 @@ type ExtenderDirectorySettings struct {
 	// limited address is never a failure: it orders after every healthy one
 	// until its backoff passes, and the probe pass and the feed dial skip it.
 	ExtenderLimitedBackoff time.Duration
+	// How long the operator's last country stands in once its hint is no
+	// longer current (SpoofCountryCode), by the wall clock from the operator's
+	// last answer. The country is stored, so a restart keeps it: the iOS packet
+	// tunnel extension usually ends with its tunnel, and a start where no
+	// direct hint read succeeds (a whitelist-only network) on a host that
+	// reports no network country would otherwise have none. Each answer renews
+	// it, and the operator is asked at each start, path change and refresh
+	// period, so this bounds only a client with no direct answer for that
+	// long, such as one that left the country; past it the country is never
+	// used. The default is a week: it outlasts the whitelist-only days between
+	// two answers, and it is the age at which this directory already stops
+	// trusting an address's last success (StaleSuccessRemoveTimeout). <= 0
+	// never uses the last country once its hint is stale.
+	CountryHintMaxAge time.Duration
 
 	// The only clock the policy reads. Tests install a fake one.
 	Now func() time.Time
@@ -198,6 +217,7 @@ func DefaultExtenderDirectorySettings() *ExtenderDirectorySettings {
 		EventWindowTimeout:             60 * time.Second,
 		LatencyMaxAge:                  12 * time.Hour,
 		ExtenderLimitedBackoff:         30 * time.Second,
+		CountryHintMaxAge:              7 * 24 * time.Hour,
 		Now:                            time.Now,
 	}
 }
@@ -377,10 +397,13 @@ type ExtenderDirectory struct {
 	// network client learns one (DESIGNNOTES4.md §4)
 	continentHint string
 	// the country the operator's hint last placed this client in, lower
-	// case, empty until it has placed it, and whether that answer is current:
-	// given on the path this client is on now, by the latest hint. A failed
-	// hint and a path change leave the country stale (SpoofCountryCode)
+	// case, empty until it has placed it; when the operator last answered it,
+	// by the wall clock alone, as the store keeps it; and whether that answer
+	// is current: given on the path this client is on now, by the latest
+	// hint. A failed hint and a path change leave the country stale, and a
+	// country loaded from the store is stale from the start (SpoofCountryCode)
 	countryHint        string
+	countryHintTime    time.Time
 	countryHintCurrent bool
 	// verified identities by hex public key
 	keyHexRecords map[string]*extenderDirectoryRecord
@@ -1179,13 +1202,18 @@ func (self *ExtenderDirectory) ContinentHint() string {
 	return self.continentHint
 }
 
-// SetCountryHint records the country the operator's hint placed this client
-// in, current until the next failed hint or path change (ExpireCountryHint).
-// An empty answer is an operator that could not place the client, or one that
-// predates the country: it leaves the last country in place, stale. Reports
-// whether the country changed.
+// Records the country the operator's hint placed this client in, current
+// until the next failed hint or path change (ExpireCountryHint). Every answer
+// renews the country and its time, which the directory stores, so the next
+// start has it (CountryHintMaxAge). An empty answer is an operator that could
+// not place the client, or one that predates the country: it leaves the last
+// country in place, stale, and does not renew it. Reports whether the country
+// changed.
 func (self *ExtenderDirectory) SetCountryHint(countryCode string) (changed bool) {
 	countryCode = NormalizeSpoofCountryCode(countryCode)
+	// the wall clock alone, as the store keeps it: the monotonic clock stops
+	// while the host sleeps, and a journey slept through must count
+	now := self.settings.Now().Round(0)
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -1196,14 +1224,18 @@ func (self *ExtenderDirectory) SetCountryHint(countryCode string) (changed bool)
 	}
 	changed = self.countryHint != countryCode
 	self.countryHint = countryCode
+	self.countryHintTime = now
 	self.countryHintCurrent = true
+	// the renewed time is saved whether or not the country changed
+	self.changedWithLock()
 	return changed
 }
 
-// ExpireCountryHint makes the operator's last country stale: the hint failed,
-// or the path changed and the answer placed the address of the old one. Until
-// the operator answers again, the network country the host reports stands in
-// for it (SpoofCountryCode).
+// Makes the operator's last country stale: the hint failed, or the path
+// changed and the answer placed the address of the old one. Until the operator
+// answers again, the network country the host reports stands in for it, and on
+// a host that reports none, the last country itself while it is within
+// CountryHintMaxAge (SpoofCountryCode).
 func (self *ExtenderDirectory) ExpireCountryHint() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -1213,12 +1245,17 @@ func (self *ExtenderDirectory) ExpireCountryHint() {
 // The country the extender dials through this directory draw their outer
 // names for (SpoofDomainsForCountry), lower case, empty for the global list:
 // the operator's country while its hint is current, else the network country
-// the host reports (SetNetworkCountryCode), else the operator's last country.
-// The host's report is the fallback rather than the rule because the operator
-// placed this client's own address; but when the operator cannot be asked --
-// on a whitelist-only mobile network no operator address is routable -- the
-// host's report is the only one there is.
+// the host reports (SetNetworkCountryCode), else the operator's last country
+// until CountryHintMaxAge has passed since the operator last answered it,
+// which a restart keeps, since the country is stored. The host's report is
+// the fallback rather than the rule because the operator placed this client's
+// own address; but when the operator cannot be asked -- on a whitelist-only
+// mobile network no operator address is routable -- the host's report is the
+// only current one there is, and on a host that reports none, the operator's
+// last answer is all there is.
 func (self *ExtenderDirectory) SpoofCountryCode() string {
+	now := self.settings.Now()
+
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -1228,7 +1265,24 @@ func (self *ExtenderDirectory) SpoofCountryCode() string {
 	if networkCountryCode := NetworkCountryCode(); networkCountryCode != "" {
 		return networkCountryCode
 	}
-	return self.countryHint
+	if self.countryHintWithinMaxAge(self.countryHintTime, now) {
+		return self.countryHint
+	}
+	return ""
+}
+
+// Whether the operator's last country, answered at `countryHintTime`, may still
+// stand in at `now`: younger than CountryHintMaxAge by the wall clock. A time
+// ahead of the clock cannot be aged -- the clock moved back, or the store is
+// not what this directory wrote -- so it is not used. It reads only its
+// arguments and the settings, so the state lock is neither needed nor taken,
+// as in holdTimeout.
+func (self *ExtenderDirectory) countryHintWithinMaxAge(countryHintTime time.Time, now time.Time) bool {
+	if countryHintTime.IsZero() {
+		return false
+	}
+	age := now.Sub(countryHintTime)
+	return 0 <= age && age < self.settings.CountryHintMaxAge
 }
 
 // The spoof list the dials through one directory draw from, and the country
@@ -2353,6 +2407,23 @@ type extenderDirectoryStoreState struct {
 	Version   int                              `json:"version"`
 	Records   []*extenderDirectoryStoreRecord  `json:"records"`
 	Addresses []*extenderDirectoryStoreAddress `json:"addresses"`
+	// The operator's last country, absent until the operator has placed this
+	// client. Kept raw and decoded on its own, so a section this build cannot
+	// read is dropped alone (extenderDirectoryStoreCountryHint).
+	CountryHint json.RawMessage `json:"country_hint,omitempty"`
+}
+
+// The operator's last country as the store keeps it (SpoofCountryCode): the
+// two-letter code and when the operator last answered it, and nothing else --
+// no address, path or network. It is a section with a version of its own
+// rather than a new envelope version, because a build that predates it
+// discards an envelope of another version whole, records and addresses with
+// it, while it skips a field it does not know; so a store this build writes
+// still loads in full on a build that predates it.
+type extenderDirectoryStoreCountryHint struct {
+	Version     int    `json:"version"`
+	CountryCode string `json:"country_code"`
+	TimeMs      int64  `json:"time_ms"`
 }
 
 // A stored identity carries the signed messages verbatim, so a later root key
@@ -2384,6 +2455,7 @@ func (self *ExtenderDirectory) save() {
 	if self.settings.Store == nil {
 		return
 	}
+	now := self.settings.Now()
 	var stateBytes []byte
 	var version uint64
 	err := func() error {
@@ -2441,6 +2513,18 @@ func (self *ExtenderDirectory) save() {
 		slices.SortFunc(state.Addresses, func(a *extenderDirectoryStoreAddress, b *extenderDirectoryStoreAddress) int {
 			return strings.Compare(a.Ip, b.Ip)
 		})
+		// a country past its max age is not written: no start would use it
+		if self.countryHint != "" && self.countryHintWithinMaxAge(self.countryHintTime, now) {
+			countryHintBytes, err := json.Marshal(&extenderDirectoryStoreCountryHint{
+				Version:     extenderDirectoryStoreCountryHintVersion,
+				CountryCode: self.countryHint,
+				TimeMs:      extenderTimeMs(self.countryHintTime),
+			})
+			if err != nil {
+				return err
+			}
+			state.CountryHint = countryHintBytes
+		}
 		var err error
 		stateBytes, err = json.Marshal(state)
 		return err
@@ -2560,13 +2644,46 @@ func (self *ExtenderDirectory) load() {
 			keyRecord.ips = append(keyRecord.ips, ip)
 		}
 	}
+	now := self.settings.Now()
+	// The operator's last country, a section of its own. No section, one of
+	// another version or one that does not decode, a code that is not two
+	// letters, and a time that is missing, ahead of the clock or past
+	// CountryHintMaxAge all leave no country, and none of them costs the
+	// records and addresses above. A restored country is stale: the operator
+	// gave it on a path of an earlier process, so it ranks after the network
+	// country the host reports (SpoofCountryCode).
+	func() {
+		if len(state.CountryHint) == 0 {
+			return
+		}
+		storeCountryHint := &extenderDirectoryStoreCountryHint{}
+		if err := json.Unmarshal(state.CountryHint, storeCountryHint); err != nil {
+			self.log.Infof("[extender]directory country load err = %s\n", err)
+			return
+		}
+		if storeCountryHint.Version != extenderDirectoryStoreCountryHintVersion {
+			return
+		}
+		countryCode := NormalizeSpoofCountryCode(storeCountryHint.CountryCode)
+		countryHintTime := extenderTimeFromMs(storeCountryHint.TimeMs)
+		if countryCode == "" || !self.countryHintWithinMaxAge(countryHintTime, now) {
+			return
+		}
+		self.countryHint = countryCode
+		self.countryHintTime = countryHintTime
+		self.countryHintCurrent = false
+		self.log.Infof(
+			"[extender]country hint %s (stored, %s old)\n",
+			countryCode,
+			now.Sub(countryHintTime).Round(time.Minute),
+		)
+	}()
 	self.pruneKeyRecordsWithLock()
 	// a load is the state the store already holds, so it is not a change to
 	// save back
 	self.savedVersion = self.version
 	// but a store written under a larger cap is brought within this one, and
 	// that is saved with the next change or the close
-	now := self.settings.Now()
 	self.tierRebuildWithLock(now)
 	if self.enforceActiveRecordCapWithLock(now) {
 		self.changedWithLock()

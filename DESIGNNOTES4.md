@@ -165,7 +165,12 @@ the relay's. Where the hint cannot be fetched -- on a whitelist-only mobile
 network no operator address is routable, and with a manual extender or a
 proxy configured the client makes no direct request at all -- the country
 falls back to the network country the host reports (`SetNetworkCountryCode`);
-a path change makes the hint's country stale and asks for the hint again.
+a path change makes the hint's country stale and asks for the hint again. On a
+host that reports none, the operator's last answered country stands in for a
+week after that answer (`CountryHintMaxAge`). It is stored with the directory,
+so a restart keeps it, and any direct answer replaces it. A path change does not
+drop it: the path change carries no network identity, and the move from home
+Wi-Fi onto a whitelist-only mobile network is itself a path change.
 
 The hint is read in a loop of its own beside the refresh pass, never ahead
 of it: the pass needs nothing from the answer (the country falls back, and
