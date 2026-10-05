@@ -186,11 +186,11 @@ func TestProviderDiagnosticsReportSecurityPolicyGeneration(t *testing.T) {
 	}
 }
 
-// securityPolicyRulesPreimage is what the built-in rules are made of apart
-// from code: the default settings, without the memory-scaled MaxFlows, and the
-// hand-maintained exception tables. The feed-generated tables are left out:
-// every release build regenerates the CFAA blocklists and the Meta prefixes,
-// and SecurityPolicyHash identifies them.
+// What the built-in rules are made of apart from code: the default settings,
+// without the memory-scaled MaxFlows, and the hand-maintained exception
+// tables. The feed-generated tables are left out: every release build
+// regenerates the CFAA blocklists and the Meta prefixes, and
+// SecurityPolicyHash identifies them.
 func securityPolicyRulesPreimage(t *testing.T) []byte {
 	t.Helper()
 	dmca := DefaultDmcaSecurityPolicySettings()
@@ -219,15 +219,16 @@ func securityPolicyRulesPreimage(t *testing.T) []byte {
 	return preimage.Bytes()
 }
 
+// The SHA-256 of the rules preimage, as the pins hold it.
 func securityPolicyRulesDigest(t *testing.T) string {
 	t.Helper()
 	digest := sha256.Sum256(securityPolicyRulesPreimage(t))
 	return hex.EncodeToString(digest[:])
 }
 
-// securityPolicyRulesPins records the rules digest each generation names.
-// Adding a detector or changing a default raises SecurityPolicyRulesGeneration
-// and adds the new generation's digest here, the one the failing test prints.
+// The rules digest each generation names. Adding a detector or changing a
+// default raises SecurityPolicyRulesGeneration and adds the new generation's
+// digest here, the one the failing test prints.
 // Earlier pins stay, as the record of what each generation enforced. Both
 // pins are of this digest, which leaves out the Meta prefixes since they
 // became a feed table; neither generation had shipped then, and the first

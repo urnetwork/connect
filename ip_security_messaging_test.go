@@ -17,9 +17,10 @@ func whatsAppTestPath(address string, transport IpProtocol, port int, syn bool) 
 // The table is generated (ip_security_messaging_meta.go) and every release
 // build refreshes it, so this checks its shape rather than its contents, as
 // for the CFAA tables: masked, sorted IPv4 then IPv6, pairwise disjoint and
-// collapsed (no two siblings one prefix would cover), and still covering
-// where WhatsApp's chat edge resolves, which the generator also refuses to
-// drop.
+// collapsed (no two siblings one prefix would cover). That it still covers
+// where WhatsApp's chat edge resolves is the generator's anchor check, which
+// security's TestCheckedInMetaSnapshot runs on this table, so no production
+// prefix is written into this test.
 func TestMetaNetworkPrefixInvariant(t *testing.T) {
 	v4Count, v6Count := 0, 0
 	for i, prefix := range metaNetworkPrefixes {
@@ -49,18 +50,6 @@ func TestMetaNetworkPrefixInvariant(t *testing.T) {
 	}
 	if v4Count == 0 || v6Count == 0 {
 		t.Fatalf("Meta prefixes = %d IPv4 / %d IPv6, want both families", v4Count, v6Count)
-	}
-	for _, anchor := range []string{"31.13.64.0/18", "157.240.0.0/16", "2a03:2880::/32"} {
-		edge := netip.MustParsePrefix(anchor)
-		covered := false
-		for _, prefix := range metaNetworkPrefixes {
-			if prefix.Bits() <= edge.Bits() && prefix.Contains(edge.Addr()) {
-				covered = true
-			}
-		}
-		if !covered {
-			t.Fatalf("WhatsApp edge %s is not covered by the Meta prefixes", edge)
-		}
 	}
 }
 

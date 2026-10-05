@@ -37,13 +37,13 @@ import (
 	"time"
 )
 
-// metaOutputFile is the generated table. Like outputFile, the generator only
-// ever owns this data file; the exception's logic is the hand-written
+// The generated table. Like outputFile, the generator only ever owns this
+// data file; the exception's logic is the hand-written
 // ip_security_messaging.go.
 const metaOutputFile = "ip_security_messaging_meta.go"
 
-// metaSource is where the snapshot comes from and the bounds a refreshed
-// snapshot must meet before it is written.
+// Where a snapshot comes from, and the bounds a refreshed snapshot must meet
+// before it is written.
 type metaSource struct {
 	name   string
 	server string // whois host:port
@@ -65,13 +65,13 @@ type metaSource struct {
 	minBits  int
 	minBits6 int
 	// must stay covered: where WhatsApp's chat edge resolves
-	anchors []netip.Prefix
+	anchorPrefixes []netip.Prefix
 	// bounds memory if the server misbehaves
 	maxResponseBytes int
 }
 
-// metaRadb was calibrated against live data (2026-10-05): 433 IPv4 and 648
-// IPv6 registrations collapsing to 23 and 5 prefixes, 531968 IPv4 addresses,
+// RADb, calibrated against live data (2026-10-05): 433 IPv4 and 648 IPv6
+// registrations collapsing to 23 and 5 prefixes, 531968 IPv4 addresses,
 // broadest registrations a /14 and a /32. Floors sit well under the observed
 // volume and caps well over it, so normal churn never trips them, but a dead,
 // truncated, reformatted or poisoned answer does. The anchors are where
@@ -86,33 +86,35 @@ var metaRadb = metaSource{
 		"RADB": {"MAINT-AS32934"},
 		"RIPE": {"fb-neteng", "facebook-neteng", "meta-mnt"},
 	},
-	minRoutes:     200,
-	minRoutes6:    300,
-	minPrefixes:   12,
-	minPrefixes6:  3,
-	minCoverage:   200_000,
-	maxCoverage:   4_194_304,
-	maxCoverage48: 1_048_576,
+	minRoutes:    200,
+	minRoutes6:   300,
+	minPrefixes:  12,
+	minPrefixes6: 3,
+	minCoverage:  200_000,
+	// a /10
+	maxCoverage: 4 * 1024 * 1024,
+	// 16 /32s
+	maxCoverage48: 16 * 64 * 1024,
 	minBits:       12,
 	minBits6:      24,
-	anchors: []netip.Prefix{
+	anchorPrefixes: []netip.Prefix{
 		netip.MustParsePrefix("31.13.64.0/18"),
 		netip.MustParsePrefix("157.240.0.0/16"),
 		netip.MustParsePrefix("2a03:2880::/32"),
 	},
-	maxResponseBytes: 16 << 20,
+	maxResponseBytes: 16 * 1024 * 1024,
 }
 
-// rpslObject is one registry object, keeping the attributes the snapshot
-// filters on. Attribute names are lower case; values have their end-of-line
-// comments removed.
+// One registry object, keeping the attributes the snapshot filters on.
+// Attribute names are lower case; values have their end-of-line comments
+// removed.
 type rpslObject struct {
-	class      string
-	key        string
-	attributes map[string][]string
+	class           string
+	key             string
+	attributeValues map[string][]string
 }
 
-// metaSnapshot is a validated refresh, ready to emit.
+// A validated refresh, ready to emit.
 type metaSnapshot struct {
 	// unique accepted registrations per family
 	routeCount  int
@@ -122,7 +124,7 @@ type metaSnapshot struct {
 	prefixes     []netip.Prefix
 }
 
-// metaReport counts what a response held, for the build log.
+// Counts of what a response held, for the build log.
 type metaReport struct {
 	objects            int
 	routes             int
@@ -134,6 +136,7 @@ type metaReport struct {
 	rejectedBad        int
 }
 
+// One line for the build log.
 func (self metaReport) String() string {
 	return fmt.Sprintf("objects=%d route=%d route6=%d accepted=%d rejected: source=%d maintainer=%d origin=%d bad=%d",
 		self.objects, self.routes, self.route6s, self.accepted,
@@ -163,8 +166,8 @@ func fetchWhois(server string, query string, timeout time.Duration, maxBytes int
 	return nil, lastErr
 }
 
-// whoisComplete reports whether a response ends at an object boundary (a
-// blank line). An empty response has no object to cut short.
+// Whether a response ends at an object boundary (a blank line). An empty
+// response has no object to cut short.
 func whoisComplete(data []byte) bool {
 	data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
 	return len(data) == 0 || bytes.HasSuffix(data, []byte("\n\n"))
@@ -194,10 +197,10 @@ func whoisQuery(server string, query string, timeout time.Duration, maxBytes int
 	return data, nil
 }
 
-// parseRpsl splits a whois response into its objects. Lines starting with %
-// are server messages (returned so an empty answer can say why), # lines are
-// comments, and a line starting with white space or + continues the previous
-// attribute. The first attribute of an object names its class.
+// Splits a whois response into its objects. Lines starting with % are server
+// messages (returned so an empty answer can say why), # lines are comments,
+// and a line starting with white space or + continues the previous attribute.
+// The first attribute of an object names its class.
 func parseRpsl(data []byte) (objects []rpslObject, messages []string) {
 	var object *rpslObject
 	var lastName string
@@ -207,6 +210,13 @@ func parseRpsl(data []byte) (objects []rpslObject, messages []string) {
 		}
 		object = nil
 		lastName = ""
+	}
+	// drops an end-of-line comment and the surrounding white space
+	value := func(text string) string {
+		if i := strings.IndexByte(text, '#'); i >= 0 {
+			text = text[:i]
+		}
+		return strings.TrimSpace(text)
 	}
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -220,8 +230,8 @@ func parseRpsl(data []byte) (objects []rpslObject, messages []string) {
 		case strings.HasPrefix(line, "#"):
 		case line[0] == ' ' || line[0] == '\t' || line[0] == '+':
 			if object != nil && lastName != "" {
-				values := object.attributes[lastName]
-				if continued := rpslValue(line[1:]); continued != "" {
+				values := object.attributeValues[lastName]
+				if continued := value(line[1:]); continued != "" {
 					values[len(values)-1] = strings.TrimSpace(values[len(values)-1] + " " + continued)
 				}
 			}
@@ -231,15 +241,15 @@ func parseRpsl(data []byte) (objects []rpslObject, messages []string) {
 				continue
 			}
 			name := strings.ToLower(strings.TrimSpace(line[:i]))
-			value := rpslValue(line[i+1:])
+			attributeValue := value(line[i+1:])
 			if object == nil {
 				object = &rpslObject{
-					class:      name,
-					key:        value,
-					attributes: map[string][]string{},
+					class:           name,
+					key:             attributeValue,
+					attributeValues: map[string][]string{},
 				}
 			}
-			object.attributes[name] = append(object.attributes[name], value)
+			object.attributeValues[name] = append(object.attributeValues[name], attributeValue)
 			lastName = name
 		}
 	}
@@ -247,32 +257,10 @@ func parseRpsl(data []byte) (objects []rpslObject, messages []string) {
 	return
 }
 
-// rpslValue drops an end-of-line comment and surrounding white space.
-func rpslValue(value string) string {
-	if i := strings.IndexByte(value, '#'); i >= 0 {
-		value = value[:i]
-	}
-	return strings.TrimSpace(value)
-}
-
-// rpslList splits a list attribute's values, which may also be comma
-// separated within one line.
-func rpslList(values []string) []string {
-	var items []string
-	for _, value := range values {
-		for _, item := range strings.Split(value, ",") {
-			if item = strings.TrimSpace(item); item != "" {
-				items = append(items, item)
-			}
-		}
-	}
-	return items
-}
-
 // Keeps the route and route6 objects Meta maintains itself. A registration
 // broader than the source allows is returned as a problem, since it can only
 // be corruption, never quietly dropped.
-func (self *metaSource) acceptObjects(objects []rpslObject) (routes []netip.Prefix, report metaReport, problems []string) {
+func (self *metaSource) acceptObjects(objects []rpslObject) (routePrefixes []netip.Prefix, report metaReport, problems []string) {
 	report.objects = len(objects)
 	for _, object := range objects {
 		var family int
@@ -286,7 +274,7 @@ func (self *metaSource) acceptObjects(objects []rpslObject) (routes []netip.Pref
 		default:
 			continue
 		}
-		sources := object.attributes["source"]
+		sources := object.attributeValues["source"]
 		if len(sources) != 1 {
 			report.rejectedSource++
 			continue
@@ -297,10 +285,13 @@ func (self *metaSource) acceptObjects(objects []rpslObject) (routes []netip.Pref
 			continue
 		}
 		maintained := false
-		for _, maintainer := range rpslList(object.attributes["mnt-by"]) {
-			for _, accepted := range maintainers {
-				if strings.EqualFold(maintainer, accepted) {
-					maintained = true
+		// mnt-by is a list attribute: one per line, or comma separated
+		for _, maintainerList := range object.attributeValues["mnt-by"] {
+			for _, maintainer := range strings.Split(maintainerList, ",") {
+				for _, accepted := range maintainers {
+					if strings.EqualFold(strings.TrimSpace(maintainer), accepted) {
+						maintained = true
+					}
 				}
 			}
 		}
@@ -308,7 +299,7 @@ func (self *metaSource) acceptObjects(objects []rpslObject) (routes []netip.Pref
 			report.rejectedMaintainer++
 			continue
 		}
-		if origins := object.attributes["origin"]; len(origins) != 1 || !strings.EqualFold(origins[0], self.origin) {
+		if origins := object.attributeValues["origin"]; len(origins) != 1 || !strings.EqualFold(origins[0], self.origin) {
 			report.rejectedOrigin++
 			continue
 		}
@@ -323,21 +314,42 @@ func (self *metaSource) acceptObjects(objects []rpslObject) (routes []netip.Pref
 				self.name, prefix, self.minBits, self.minBits6))
 			continue
 		}
-		routes = append(routes, prefix)
+		routePrefixes = append(routePrefixes, prefix)
 		report.accepted++
 	}
 	return
 }
 
-// collapsePrefixes returns the fewest prefixes covering exactly the union of
-// prefixes, sorted IPv4 then IPv6 by address: duplicates and contained
-// prefixes are dropped, and overlapping or adjacent ones merged.
+// The fewest prefixes covering exactly the union of prefixes, sorted IPv4
+// then IPv6 by address: duplicates and contained prefixes are dropped, and
+// overlapping or adjacent ones merged.
 func collapsePrefixes(prefixes []netip.Prefix) []netip.Prefix {
-	sorted := slices.Clone(prefixes)
-	slices.SortFunc(sorted, netip.Prefix.Compare)
-	var collapsed []netip.Prefix
+	var collapsedPrefixes []netip.Prefix
+	// splits the range lo..hi of one family into the fewest prefixes, each the
+	// widest aligned block that starts at the next uncovered address
+	appendRange := func(lo netip.Addr, hi netip.Addr) {
+		for {
+			bits := lo.BitLen()
+			for 0 < bits {
+				wider := netip.PrefixFrom(lo, bits-1).Masked()
+				if wider.Addr() != lo || hi.Compare(prefixLast(wider)) < 0 {
+					break
+				}
+				bits--
+			}
+			prefix := netip.PrefixFrom(lo, bits)
+			collapsedPrefixes = append(collapsedPrefixes, prefix)
+			last := prefixLast(prefix)
+			if hi.Compare(last) <= 0 {
+				return
+			}
+			lo = last.Next()
+		}
+	}
+	sortedPrefixes := slices.Clone(prefixes)
+	slices.SortFunc(sortedPrefixes, netip.Prefix.Compare)
 	var lo, hi netip.Addr
-	for i, prefix := range sorted {
+	for i, prefix := range sortedPrefixes {
 		first, last := prefix.Addr(), prefixLast(prefix)
 		if 0 < i && first.BitLen() == hi.BitLen() && (first.Compare(hi) <= 0 || first == hi.Next()) {
 			if hi.Compare(last) < 0 {
@@ -346,41 +358,17 @@ func collapsePrefixes(prefixes []netip.Prefix) []netip.Prefix {
 			continue
 		}
 		if 0 < i {
-			collapsed = append(collapsed, rangePrefixes(lo, hi)...)
+			appendRange(lo, hi)
 		}
 		lo, hi = first, last
 	}
-	if 0 < len(sorted) {
-		collapsed = append(collapsed, rangePrefixes(lo, hi)...)
+	if 0 < len(sortedPrefixes) {
+		appendRange(lo, hi)
 	}
-	return collapsed
+	return collapsedPrefixes
 }
 
-// rangePrefixes splits the address range lo..hi of one family into the
-// fewest prefixes, each the widest aligned block that starts at the next
-// uncovered address.
-func rangePrefixes(lo, hi netip.Addr) []netip.Prefix {
-	var prefixes []netip.Prefix
-	for {
-		bits := lo.BitLen()
-		for 0 < bits {
-			wider := netip.PrefixFrom(lo, bits-1).Masked()
-			if wider.Addr() != lo || hi.Compare(prefixLast(wider)) < 0 {
-				break
-			}
-			bits--
-		}
-		prefix := netip.PrefixFrom(lo, bits)
-		prefixes = append(prefixes, prefix)
-		last := prefixLast(prefix)
-		if hi.Compare(last) <= 0 {
-			return prefixes
-		}
-		lo = last.Next()
-	}
-}
-
-// prefixLast returns the last address of a prefix of either family.
+// The last address of a prefix of either family.
 func prefixLast(prefix netip.Prefix) netip.Addr {
 	prefix = prefix.Masked()
 	if prefix.Addr().Is4() {
@@ -394,45 +382,7 @@ func prefixLast(prefix netip.Prefix) netip.Addr {
 	return hi
 }
 
-// Coverage of collapsed prefixes: IPv4 addresses, and IPv6 in /48s (a
-// narrower prefix counts as one).
-func prefixCoverage(prefixes []netip.Prefix) (coverage uint64, coverage48 uint64) {
-	for _, prefix := range prefixes {
-		if prefix.Addr().Is4() {
-			coverage += uint64(1) << (32 - prefix.Bits())
-		} else if prefix.Bits() < 48 {
-			coverage48 += uint64(1) << (48 - prefix.Bits())
-		} else {
-			coverage48++
-		}
-	}
-	return
-}
-
-// newMetaSnapshot collapses the accepted registrations and checks every
-// bound; any problem means the snapshot must not be written.
-func (self *metaSource) newMetaSnapshot(routes []netip.Prefix) (*metaSnapshot, []string) {
-	unique := slices.Clone(routes)
-	slices.SortFunc(unique, netip.Prefix.Compare)
-	unique = slices.Compact(unique)
-	snapshot := &metaSnapshot{
-		prefixes: collapsePrefixes(unique),
-	}
-	digest := sha256.New()
-	for _, prefix := range unique {
-		if prefix.Addr().Is4() {
-			snapshot.routeCount++
-		} else {
-			snapshot.route6Count++
-		}
-		fmt.Fprintf(digest, "%s\n", prefix)
-	}
-	copy(snapshot.routesSha256[:], digest.Sum(nil))
-	return snapshot, self.validate(snapshot)
-}
-
-// validate returns every bound the snapshot misses; none means it may be
-// written.
+// Every bound the snapshot misses; none means it may be written.
 func (self *metaSource) validate(snapshot *metaSnapshot) []string {
 	var problems []string
 	if snapshot.routeCount < self.minRoutes {
@@ -443,12 +393,20 @@ func (self *metaSource) validate(snapshot *metaSnapshot) []string {
 		problems = append(problems, fmt.Sprintf("%s: only %d IPv6 registrations (min %d) — answer may be truncated or reformatted",
 			self.name, snapshot.route6Count, self.minRoutes6))
 	}
+	// IPv4 in addresses, IPv6 in /48s (a narrower prefix counts as one)
 	prefixCount, prefix6Count := 0, 0
+	var coverage, coverage48 uint64
 	for _, prefix := range snapshot.prefixes {
-		if prefix.Addr().Is4() {
+		switch {
+		case prefix.Addr().Is4():
 			prefixCount++
-		} else {
+			coverage += uint64(1) << (32 - prefix.Bits())
+		case prefix.Bits() < 48:
 			prefix6Count++
+			coverage48 += uint64(1) << (48 - prefix.Bits())
+		default:
+			prefix6Count++
+			coverage48++
 		}
 	}
 	if prefixCount < self.minPrefixes {
@@ -457,7 +415,6 @@ func (self *metaSource) validate(snapshot *metaSnapshot) []string {
 	if prefix6Count < self.minPrefixes6 {
 		problems = append(problems, fmt.Sprintf("%s: only %d collapsed IPv6 prefixes (min %d)", self.name, prefix6Count, self.minPrefixes6))
 	}
-	coverage, coverage48 := prefixCoverage(snapshot.prefixes)
 	if coverage < self.minCoverage {
 		problems = append(problems, fmt.Sprintf("%s: IPv4 coverage %d is under the floor %d — suspicious shrink", self.name, coverage, self.minCoverage))
 	}
@@ -467,45 +424,52 @@ func (self *metaSource) validate(snapshot *metaSnapshot) []string {
 	if self.maxCoverage48 < coverage48 {
 		problems = append(problems, fmt.Sprintf("%s: IPv6 coverage of %d /48s exceeds max %d — possible poisoned answer", self.name, coverage48, self.maxCoverage48))
 	}
-	for _, anchor := range self.anchors {
+	for _, anchorPrefix := range self.anchorPrefixes {
 		covered := false
 		for _, prefix := range snapshot.prefixes {
-			if prefix.Bits() <= anchor.Bits() && prefix.Contains(anchor.Addr()) {
+			if prefix.Bits() <= anchorPrefix.Bits() && prefix.Contains(anchorPrefix.Addr()) {
 				covered = true
 			}
 		}
 		if !covered {
-			problems = append(problems, fmt.Sprintf("%s: %s, where WhatsApp's chat edge resolves, is no longer covered — suspicious shrink", self.name, anchor))
+			problems = append(problems, fmt.Sprintf("%s: %s, where WhatsApp's chat edge resolves, is no longer covered — suspicious shrink", self.name, anchorPrefix))
 		}
 	}
 	return problems
 }
 
-// fetchMetaSnapshot queries the source and returns a validated snapshot, or
-// the problems that keep it from being written.
-func (self *metaSource) fetchMetaSnapshot(timeout time.Duration) (*metaSnapshot, metaReport, []string) {
-	data, err := fetchWhois(self.server, self.query, timeout, self.maxResponseBytes)
-	if err != nil {
-		return nil, metaReport{}, []string{fmt.Sprintf("%s: whois %s %q: %v", self.name, self.server, self.query, err)}
-	}
-	return self.parseMetaSnapshot(data)
-}
-
-// parseMetaSnapshot is fetchMetaSnapshot for a response already read.
+// Parses, filters, collapses and checks a whois response: a snapshot to
+// write, or the problems that keep it from being written.
 func (self *metaSource) parseMetaSnapshot(data []byte) (*metaSnapshot, metaReport, []string) {
 	objects, messages := parseRpsl(data)
-	routes, report, problems := self.acceptObjects(objects)
+	routePrefixes, report, problems := self.acceptObjects(objects)
 	if len(objects) == 0 && 0 < len(messages) {
 		problems = append(problems, fmt.Sprintf("%s: no objects, server said %q", self.name, messages[0]))
 	}
-	snapshot, validateProblems := self.newMetaSnapshot(routes)
-	problems = append(problems, validateProblems...)
+	uniquePrefixes := slices.Clone(routePrefixes)
+	slices.SortFunc(uniquePrefixes, netip.Prefix.Compare)
+	uniquePrefixes = slices.Compact(uniquePrefixes)
+	snapshot := &metaSnapshot{
+		prefixes: collapsePrefixes(uniquePrefixes),
+	}
+	digest := sha256.New()
+	for _, prefix := range uniquePrefixes {
+		if prefix.Addr().Is4() {
+			snapshot.routeCount++
+		} else {
+			snapshot.route6Count++
+		}
+		fmt.Fprintf(digest, "%s\n", prefix)
+	}
+	copy(snapshot.routesSha256[:], digest.Sum(nil))
+	problems = append(problems, self.validate(snapshot)...)
 	if 0 < len(problems) {
 		return nil, report, problems
 	}
 	return snapshot, report, nil
 }
 
+// Opens the generated file, up to its provenance record.
 const metaHeader = `// Code generated by security/main.go; DO NOT EDIT.
 //
 // Meta prefix snapshot for the WhatsApp exception (ip_security_messaging.go):
@@ -530,7 +494,7 @@ const metaHeader = `// Code generated by security/main.go; DO NOT EDIT.
 // Generated input provenance v1:
 `
 
-// metaPackage follows the provenance record and opens the table, IPv4 first.
+// Follows the provenance record and opens the table, IPv4 first.
 const metaPackage = `
 package connect
 
@@ -538,12 +502,14 @@ import (
 	"net/netip"
 )
 
+// Masked and collapsed, IPv4 then IPv6; the lookup scans the prefixes in
+// place rather than expanding them into addresses.
 var metaNetworkPrefixes = [...]netip.Prefix{
 	// IPv4
 `
 
-// emitMeta renders the generated file. It depends only on the snapshot, so
-// the same registrations always give the same bytes.
+// Renders the generated file. It depends only on the snapshot, so the same
+// registrations always give the same bytes.
 func (self *metaSource) emitMeta(snapshot *metaSnapshot) []byte {
 	var b strings.Builder
 	b.WriteString(metaHeader)

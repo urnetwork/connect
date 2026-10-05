@@ -11,7 +11,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// SecurityPolicyRulesGeneration orders the built-in security policy rules.
+// Orders the built-in security policy rules.
 // Every reviewed change to what the built-in policy admits or drops must
 // raise it by one: adding a detector or an exception, changing a
 // hand-maintained exception table (the Steam and Telegram snapshots), or
@@ -72,6 +72,10 @@ func SecurityPolicyHash(policy SecurityPolicy) string {
 	return hex.EncodeToString(digest.Sum(nil))
 }
 
+// Writes what identifies the policy's effective rules to digest: for the
+// built-in policy, in either direction, every setting and the feed-generated
+// tables; for a disabled policy its kind; for any other policy its type and
+// build.
 func writeSecurityPolicyIdentity(digest io.Writer, policy SecurityPolicy) {
 	io.WriteString(digest, "urnetwork-security-policy-v1\x00")
 	switch concrete := policy.(type) {

@@ -279,8 +279,15 @@ func main() {
 	}
 
 	// the Meta snapshot is checked before either file is written
+	fetchMeta := func() (*metaSnapshot, metaReport, []string) {
+		data, err := fetchWhois(metaRadb.server, metaRadb.query, *timeout, metaRadb.maxResponseBytes)
+		if err != nil {
+			return nil, metaReport{}, []string{fmt.Sprintf("%s: whois %s %q: %v", metaRadb.name, metaRadb.server, metaRadb.query, err)}
+		}
+		return metaRadb.parseMetaSnapshot(data)
+	}
 	fmt.Fprintln(os.Stderr, "\nmeta report:")
-	meta, report, metaProblems := metaRadb.fetchMetaSnapshot(*timeout)
+	meta, report, metaProblems := fetchMeta()
 	fmt.Fprintf(os.Stderr, "  %-14s %s\n", metaRadb.name, report)
 	var metaFormatted []byte
 	if len(metaProblems) == 0 {
@@ -915,7 +922,7 @@ func emit(ranges []iprange, ranges6 []ip6range, spamhausCredit string, results [
 // (outputFile and metaOutputFile).
 const outputFile = "ip_security_cfaa_block.go"
 
-// resolveOut returns flagVal, or name in the connect module root.
+// flagVal when set, else name in the connect module root.
 func resolveOut(flagVal string, name string) (string, error) {
 	if flagVal != "" {
 		return flagVal, nil

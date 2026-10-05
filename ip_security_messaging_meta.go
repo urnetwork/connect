@@ -28,6 +28,8 @@ import (
 	"net/netip"
 )
 
+// Masked and collapsed, IPv4 then IPv6; the lookup scans the prefixes in
+// place rather than expanding them into addresses.
 var metaNetworkPrefixes = [...]netip.Prefix{
 	// IPv4
 	netip.MustParsePrefix("31.13.24.0/21"),

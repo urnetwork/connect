@@ -61,6 +61,9 @@ func DefaultMessagingSecurityPolicySettings() *MessagingSecurityPolicySettings {
 // The WhatsApp chat port.
 const whatsAppChatPort = 5222
 
+// Reports whether the settings admit a flow as a sanctioned messaging
+// endpoint, which today is WhatsApp's chat port on Meta's own address space.
+// Nil settings admit nothing.
 func isSanctionedMessagingEndpoint(
 	settings *MessagingSecurityPolicySettings,
 	ipPath *IpPath,
