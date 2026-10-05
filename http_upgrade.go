@@ -428,18 +428,33 @@ func dialH1WebSocket(ctx context.Context, address string, header http.Header, di
 	attempt := *dialer
 	var stop func() bool
 	var canceled <-chan struct{}
+	var socket *httpUpgradeCloseConn
 	guard := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
 		return func(dialCtx context.Context, network, address string) (net.Conn, error) {
 			conn, err := dial(dialCtx, network, address)
 			if err != nil {
-				return conn, err
+				if conn != nil {
+					err = errors.Join(err, conn.Close())
+				}
+				return nil, err
 			}
+			owned := &httpUpgradeCloseConn{Conn: conn}
+			guarded := net.Conn(owned)
+			if batch, ok := conn.(*WebSocketWriteBatchConn); ok {
+				// The freshly dialed connection transfers exclusively here.
+				// Preserve the outer batching capability before either Gorilla
+				// or the cancellation callback can use the delegated socket.
+				owned.Conn = batch.conn
+				batch.conn = owned
+				guarded = batch
+			}
+			socket = owned
 			done := make(chan struct{})
 			canceled = done
 			// Use the outer ctx, not Gorilla's private handshake context,
 			// which it cancels before returning even on a successful 101.
-			stop = context.AfterFunc(ctx, func() { conn.Close(); close(done) })
-			return conn, nil
+			stop = context.AfterFunc(ctx, func() { owned.Close(); close(done) })
+			return guarded, nil
 		}
 	}
 	plainDial := dialer.NetDialContext
@@ -459,9 +474,19 @@ func dialH1WebSocket(ctx context.Context, address string, header http.Header, di
 	if stop != nil && !stop() {
 		<-canceled
 		if conn != nil {
-			conn.Close()
+			err = errors.Join(err, conn.Close())
+		} else {
+			err = errors.Join(err, socket.Close())
 		}
-		return nil, response, ctx.Err()
+		return nil, response, errors.Join(err, ctx.Err(), context.Cause(ctx))
+	}
+	if err != nil {
+		if socket != nil {
+			err = errors.Join(err, socket.Close())
+		}
+		if stopErr := ctx.Err(); stopErr != nil {
+			err = errors.Join(err, stopErr, context.Cause(ctx))
+		}
 	}
 	return conn, response, err
 }
