@@ -567,11 +567,108 @@ func TestExtenderNetworkClientPathChangeReadsTheHelloWhileAPassIsBusy(t *testing
 	})
 }
 
-// With no root keys in force nothing can verify, so the bootstrap's TXT
-// records wait for keys rather than being refused and lost: the pass neither
-// waits for hello nor resolves them. The keys hello installs wake the refresh
-// loop, whose bootstrap judges the records under them at once: what they sign
-// lands verified, and what another root signed is refused.
+// Where no root keys are in force nothing a pass applies can verify, so the
+// first pass waits for the first hello read, as it did when hello was read
+// ahead of it, and takes its bootstrap and its sample under the keys hello
+// brings: the TXT records land judged under them (another root's refused),
+// the first probe pass measures the whole set those keys vouch for, hinted
+// continent first, and the first attempt is one that had the records. The
+// keys landed before the pass looked at them, so they wake no second pass.
+//
+// The flake this replaces: the first pass went on without keys, released the
+// probe gate and the first attempt on a bootstrap that had judged nothing, and
+// the records landed in a pass the install woke, under probe passes that
+// measured whichever had landed and while the failure counts the test read
+// were still being written.
+func TestExtenderNetworkClientFirstPassWaitsForTheFirstHelloWithNoKeysInForce(t *testing.T) {
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		clock := newTestClock()
+		directory := newTestUnanchoredExtenderDirectory(t, clock, func(settings *ExtenderDirectorySettings) {
+			// a failed feed dial does not hold the records the probe measures
+			settings.HoldTimeout = 0
+			settings.MaxHoldTimeout = 0
+		})
+		rootPrivateKey, rootPublicKey := newTestRootKeyPair(t)
+		otherRootPrivateKey, _ := newTestRootKeyPair(t)
+		txts := []string{
+			testExtenderDnsRecordTxtWithContinent(t, rootPrivateKey, clock, "NA", "192.0.2.20"),
+			testExtenderDnsRecordTxtWithContinent(t, rootPrivateKey, clock, "NA", "192.0.2.21"),
+			testExtenderDnsRecordTxtWithContinent(t, rootPrivateKey, clock, "EU", "192.0.2.10"),
+			testExtenderDnsRecordTxtWithContinent(t, rootPrivateKey, clock, "EU", "192.0.2.11"),
+			testExtenderDnsRecordTxt(t, otherRootPrivateKey, clock, "192.0.2.84"),
+		}
+		probes := newTestProbeLog(map[string]time.Duration{
+			"192.0.2.10": 20 * time.Millisecond,
+			"192.0.2.11": 25 * time.Millisecond,
+			"192.0.2.20": 120 * time.Millisecond,
+			"192.0.2.21": 130 * time.Millisecond,
+		})
+		hello := newTestExtenderHello(testHelloResultWithRootKeys(rootPublicKey))
+		release := hello.Hold()
+		loop := newTestHelloLoop(t, clock, directory, hello.Hello, txts, func(settings *ExtenderNetworkClientSettings) {
+			settings.IpVersionSupported = func(ipVersion int) bool { return ipVersion == 4 }
+			settings.ProbeWindowCount = 2
+			settings.ProbeMaxCandidateCount = 8
+			settings.ProbeCountPerExtender = 1
+			settings.ProbeCloseFactor = 2
+			settings.ProbeCloseFloor = 10 * time.Millisecond
+			settings.Probe = probes.probe
+			settings.Hint = func(context.Context) (*ExtenderHintResult, error) {
+				return &ExtenderHintResult{ContinentCode: "eu"}, nil
+			}
+		})
+
+		synctest.Wait()
+		if loop.networkClient.Status().InitialAttemptDone {
+			t.Fatal("the first pass went on without keys while the first hello read was out")
+		}
+		if count, inFlight := hello.counts(); count != 1 || inFlight != 1 {
+			t.Fatalf("hello reads = %d, %d out; expected the first read, still out", count, inFlight)
+		}
+		if count := loop.txtCount.Load(); count != 0 {
+			t.Fatalf("txt resolutions = %d before hello answered, expected none", count)
+		}
+		if count := probes.count(); count != 0 {
+			t.Fatalf("%d probes ran before any record verified", count)
+		}
+
+		release()
+		synctest.Wait()
+		if !loop.networkClient.Status().InitialAttemptDone {
+			t.Fatal("the first pass did not go on once hello answered")
+		}
+		if count := loop.txtCount.Load(); count != 1 {
+			t.Fatalf("txt resolutions = %d, expected the first bootstrap's alone, under hello's keys", count)
+		}
+		if passCount := loop.passCount.Load(); passCount != 1 {
+			t.Fatalf("passes = %d, expected the first alone: its keys were in force before it looked", passCount)
+		}
+		for _, ip := range []string{"192.0.2.10", "192.0.2.11", "192.0.2.20", "192.0.2.21"} {
+			if !testDirectoryAddressVerified(directory, ip) {
+				t.Fatalf("the record of %s, which hello's keys sign, did not land verified", ip)
+			}
+		}
+		if testDirectoryAddressVerified(directory, "192.0.2.84") {
+			t.Fatal("the record another root signed landed")
+		}
+		ips := func() []string {
+			probes.stateLock.Lock()
+			defer probes.stateLock.Unlock()
+			return slices.Sorted(slices.Values(probes.ips))
+		}()
+		if !slices.Equal(ips, []string{"192.0.2.10", "192.0.2.11"}) {
+			t.Fatalf("probes = %v, expected exactly the two extenders of the hinted continent", ips)
+		}
+	})
+}
+
+// With no root keys in force the first pass waits for the first hello read
+// only as long as the read lasts: a black-holed read costs the first pass its
+// budget, and no pass after it. With no keys the TXT records wait, not
+// resolved, rather than being refused and lost, and the keys a later read
+// brings wake the refresh loop, whose bootstrap judges the records under them:
+// what they sign lands verified, what another root signed is refused.
 func TestExtenderNetworkClientTxtRecordsWaitForTheHelloKeys(t *testing.T) {
 	MessagePoolReturn(MessagePoolGet(1))
 	synctest.Test(t, func(t *testing.T) {
@@ -583,29 +680,42 @@ func TestExtenderNetworkClientTxtRecordsWaitForTheHelloKeys(t *testing.T) {
 			testExtenderDnsRecordTxt(t, rootPrivateKey, clock, "192.0.2.83"),
 			testExtenderDnsRecordTxt(t, otherRootPrivateKey, clock, "192.0.2.84"),
 		}
-		hello := newTestExtenderHello(testHelloResultWithRootKeys(rootPublicKey))
-		release := hello.Hold()
+		hello := newTestExtenderHello(&ExtenderHelloResult{})
+		hello.Blackhole()
 		loop := newTestHelloLoop(t, clock, directory, hello.Hello, txts, nil)
+		settings := DefaultExtenderNetworkClientSettings()
 
+		time.Sleep(settings.HelloTimeout - time.Second)
+		synctest.Wait()
+		if loop.networkClient.Status().InitialAttemptDone {
+			t.Fatal("the first pass went on without keys while the first hello read was out")
+		}
+		time.Sleep(2 * time.Second)
 		synctest.Wait()
 		if !loop.networkClient.Status().InitialAttemptDone {
-			t.Fatal("the first pass waited for hello")
-		}
-		if count, inFlight := hello.counts(); count != 1 || inFlight != 1 {
-			t.Fatalf("hello reads = %d, %d out; expected the first read, still out", count, inFlight)
+			t.Fatal("the first pass waited past the first hello read's budget")
 		}
 		if count := loop.txtCount.Load(); count != 0 {
 			t.Fatalf("txt resolutions = %d with no root keys in force, expected the records to wait", count)
 		}
 		if elapsed := loop.pass(t); elapsed != 0 {
-			t.Fatalf("a pass with hello out took %s", elapsed)
+			t.Fatalf("a pass after the failed read took %s", elapsed)
 		}
 		if count := loop.txtCount.Load(); count != 0 {
 			t.Fatalf("txt resolutions = %d with no root keys in force, expected the records to wait", count)
 		}
 
-		release()
+		// the operator answers once the failure's backoff has passed
+		hello.Answer(testHelloResultWithRootKeys(rootPublicKey))
+		loop.clock.advance(settings.HelloMinBackoff)
+		passCount := loop.passCount.Load()
+		loop.passes <- time.Time{}
 		synctest.Wait()
+		// the read went out with the pass that woke it, and the keys it
+		// installed woke one more
+		if passes := loop.passCount.Load() - passCount; passes != 2 {
+			t.Fatalf("passes = %d, expected the one let and the one the keys woke", passes)
+		}
 		if count := loop.txtCount.Load(); count != 1 {
 			t.Fatalf("txt resolutions = %d once hello's keys were in force, expected 1", count)
 		}
@@ -614,54 +724,6 @@ func TestExtenderNetworkClientTxtRecordsWaitForTheHelloKeys(t *testing.T) {
 		}
 		if testDirectoryAddressVerified(directory, "192.0.2.84") {
 			t.Fatal("the record another root signed landed")
-		}
-	})
-}
-
-// TXT records that waited for keys are measured once the keys arrive: the
-// first probe pass ran when no record had verified, and the bootstrap that
-// judges them under hello's keys wakes the probe pass, as any bootstrap that
-// leaves candidates does.
-func TestExtenderNetworkClientProbesTheTxtRecordsThatWaitedForTheHelloKeys(t *testing.T) {
-	MessagePoolReturn(MessagePoolGet(1))
-	synctest.Test(t, func(t *testing.T) {
-		clock := newTestClock()
-		directory := newTestUnanchoredExtenderDirectory(t, clock, func(settings *ExtenderDirectorySettings) {
-			// a failed feed dial does not hold the record the probe measures
-			settings.HoldTimeout = 0
-			settings.MaxHoldTimeout = 0
-		})
-		rootPrivateKey, rootPublicKey := newTestRootKeyPair(t)
-		txts := []string{
-			testExtenderDnsRecordTxtWithContinent(t, rootPrivateKey, clock, "EU", "192.0.2.95"),
-		}
-		probes := newTestProbeLog(map[string]time.Duration{
-			"192.0.2.95": 20 * time.Millisecond,
-		})
-		hello := newTestExtenderHello(testHelloResultWithRootKeys(rootPublicKey))
-		release := hello.Hold()
-		client := newTestExtenderStartupProbeClient(t, clock, directory, probes, func(settings *ExtenderNetworkClientSettings) {
-			settings.Hello = hello.Hello
-			settings.ResolveDnsTxt = func(context.Context, string) ([]string, error) {
-				return txts, nil
-			}
-		})
-
-		synctest.Wait()
-		if !client.Status().InitialAttemptDone {
-			t.Fatal("the first pass waited for hello")
-		}
-		if count := probes.count(); count != 0 {
-			t.Fatalf("%d probes ran before any record verified", count)
-		}
-
-		release()
-		synctest.Wait()
-		probes.stateLock.Lock()
-		ips := slices.Clone(probes.ips)
-		probes.stateLock.Unlock()
-		if !slices.Equal(ips, []string{"192.0.2.95"}) {
-			t.Fatalf("probes = %v, expected the record that waited for hello's keys", ips)
 		}
 	})
 }

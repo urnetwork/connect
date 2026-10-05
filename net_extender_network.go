@@ -317,6 +317,11 @@ type ExtenderNetworkClient struct {
 	initialHintDone chan struct{}
 	// the hello loop's join; it waits on hintWake
 	helloDone chan struct{}
+	// closed by the hello loop once its first read has ended, answered or
+	// not; a pass with no root keys in force waits for it, so it bootstraps
+	// and samples under the keys hello brings, as when hello was read ahead
+	// of it
+	initialHelloDone chan struct{}
 	// the attesting provider, nil for a client that only ranks. Installed
 	// by the provider role and cleared when it stops.
 	probeAttestor *ExtenderProbeAttestor
@@ -382,6 +387,7 @@ func NewExtenderNetworkClient(
 		hintWake:          NewMonitor(),
 		initialHintDone:   make(chan struct{}),
 		helloDone:         make(chan struct{}),
+		initialHelloDone:  make(chan struct{}),
 	}
 	directory.SetInitialSamplePending()
 	// a path change invalidates the feed connection and the addresses that
@@ -394,7 +400,8 @@ func NewExtenderNetworkClient(
 	// hello has its own loop too: a pass verifies under the root keys in
 	// force while a read is out, and where only extenders reach the operator
 	// a read ahead of the bootstrap could not answer before the bootstrap
-	// had found one (runHellos)
+	// had found one. Only a pass with no keys in force waits, for the first
+	// read alone (runHellos).
 	go HandleError(func() {
 		defer close(self.helloDone)
 		self.runHellos()
@@ -510,7 +517,8 @@ func (self *ExtenderNetworkClient) updateStatus(update func(*ExtenderNetworkClie
 
 // The refresh loop. One pass bootstraps when it is due and then takes a
 // sample, holding the subscription for the feed role. Every exit from a pass
-// goes through the backoff, which a success resets.
+// goes through the backoff, which a success resets. A pass that finds no root
+// keys in force first waits for the first hello read (runHellos).
 func (self *ExtenderNetworkClient) run() {
 	backoff := self.settings.MinBackoff
 	initialProbeReady := self.initialProbeReady
@@ -532,9 +540,23 @@ func (self *ExtenderNetworkClient) run() {
 		default:
 		}
 
+		// with no root keys in force nothing the pass applies can verify, so
+		// it waits for the first hello read, as when hello was read ahead of
+		// it, and for no read after that one (runHellos). With keys in force
+		// it never waits.
+		if self.directory.RootKeys().Len() == 0 {
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.initialHelloDone:
+			}
+		}
+
 		now := self.settings.Now()
 		// subscribe before the reads below, so a wake that lands while this
-		// pass runs is carried into the next wait instead of being lost
+		// pass runs is carried into the next wait instead of being lost. Keys
+		// that the first hello read installed before this are already in
+		// force for the pass, and wake no second one.
 		wake := self.wakeMonitor.NotifyChannel()
 
 		// each pass has the hello and hint loops look whether their read is
@@ -629,9 +651,11 @@ func (self *ExtenderNetworkClient) run() {
 // hosts are trusted by configuration, and a candidate is dialed only once it
 // was verified, or because it is manual. A pass judged under the keys in
 // force whenever hello failed ahead of it, and it does so too while a read
-// is out. Where no keys are in force nothing can verify, so the bootstrap's
-// TXT records wait for the first keys (bootstrap), and keys that hello
-// installs judge again what was judged under the old ones (refreshRootKeys).
+// is out. Where no keys are in force nothing can verify, so a pass waits for
+// the first read, as long as it lasts (run, initialHelloDone); after a read
+// that brought none, the bootstrap's TXT records wait for the first keys
+// (bootstrap). Keys that hello installs judge again what was judged under
+// the old ones (refreshRootKeys).
 //
 // The loop has no clock of its own. It looks whether hello is due at its
 // start, at each pass and at a path change -- it waits on the hint loop's
@@ -640,6 +664,7 @@ func (self *ExtenderNetworkClient) run() {
 // refresh loop that passes after every feed drop does not read it at each
 // one, and a path change clears the backoff. One read is out at a time.
 func (self *ExtenderNetworkClient) runHellos() {
+	initialHelloDone := self.initialHelloDone
 	helloSchedule := newExtenderReadSchedule(
 		self.settings.RebootstrapTimeout,
 		self.settings.HelloMinBackoff,
@@ -667,6 +692,12 @@ func (self *ExtenderNetworkClient) runHellos() {
 			} else {
 				helloSchedule.Fail(self.settings.Now())
 			}
+		}
+		if initialHelloDone != nil {
+			// after any keys the read installed, so a pass that waited for
+			// it finds them in force
+			close(initialHelloDone)
+			initialHelloDone = nil
 		}
 		select {
 		case <-self.ctx.Done():
