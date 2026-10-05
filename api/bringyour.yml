@@ -3656,7 +3656,11 @@ paths:
   /account/wallets/remove:
     post:
       description: |
-        Remove a wallet from your list of account wallets
+        Remove a wallet from your list of account wallets. Removing the
+        payout wallet makes another active Solana or Polygon wallet of the
+        network the payout wallet, when there is one, and names it in
+        `payout_wallet_id`; otherwise USDC payouts are held until a payout
+        wallet is set.
       operationId: Account Remove Wallet
       security:
         - BearerAuth: []
@@ -9774,6 +9778,16 @@ components:
         success:
           description: Wallet successfully removed
           type: boolean
+        payout_wallet_id:
+          description: |
+            udid. Set when the removed wallet was the network's payout wallet
+            and another of the network's active Solana or Polygon wallets
+            became the payout wallet in the same transaction (the newest,
+            preferring the removed wallet's chain; never a Bittensor wallet).
+            Absent when nothing was promoted, which leaves the network with no
+            payout wallet, and from older servers. Apps show where payouts go
+            now.
+          type: string
         error:
           type: object
           required:
