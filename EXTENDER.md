@@ -512,7 +512,8 @@ B4. Root key distribution. The network space values carry
 and `HelloResult` gains `extender_root_public_keys`. The hello list
 replaces the stored list, since it arrives over the platform's pinned TLS
 even through an untrusted extender. A record or revocation signed by a key
-not in the current list is rejected.
+not in the current list is rejected, also one verified under keys that were
+replaced before it was stored.
 
 B5. Directory semantics per key. Keep the newest record and the newest
 revocation by issue time. A key is active when it has a record, the
@@ -809,14 +810,24 @@ active entries remain (held addresses count as active here, unverified
 non-manual ones do not, so a client whose operator publishes no TXT
 records keeps re-resolving on the backoff until one appears; the startup
 gate of E4 counts only usable ones), refreshes the root keys from hello
-every 6 hours, and reconnects on network change. A subscribed stream that
-is silent for 90 s, three keepalive intervals, is treated as gone. A
-subscription that ends advances the backoff, which resets only after a
-stream stayed up for the maximum backoff, so an extender that accepts,
-samples and drops is not redialed every second. `Status()` reports feed
-connected, the feed ip, last sample time, last error and whether the
-initial attempt is done, which is set at `end_of_sample` so a served
-sample releases the gate at once.
+every 6 hours, and reconnects on network change. Hello is read beside the
+refresh pass, never ahead of it, since it reads through the strategy and
+where only extenders reach the operator it cannot answer before the
+bootstrap has found one; a failed hello is read again after a backoff (1
+minute doubling to 6 hours on the same path), or at once after a path
+change. A pass verifies under the keys in force, the configured or bundled
+ones or the last hello's; with none in force the TXT records wait for keys.
+Keys that hello installs make the bootstrap due again, stop the pass from
+dialing candidates it chose under the old keys, and end a stream to one
+once its sample is in, so both are taken again under them. A blank hello
+list is no list. A subscribed stream that is silent for 90 s, three
+keepalive intervals, is treated as gone. A subscription that ends
+advances the backoff, which resets only after a stream stayed up for the
+maximum backoff, so an extender that accepts, samples and drops is not
+redialed every second. `Status()` reports feed connected, the feed ip,
+last sample time, last error and whether the initial attempt is done,
+which is set at `end_of_sample` so a served sample releases the gate at
+once.
 
 E4. Startup gate. `parallelEval` waits for the initial sample to complete
 only while the directory has no usable entry and the network client is

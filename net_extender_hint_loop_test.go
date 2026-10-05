@@ -458,7 +458,7 @@ func TestExtenderHintScheduleBacksOffAFailure(t *testing.T) {
 	refreshTimeout := 6 * time.Hour
 	minBackoff := time.Minute
 	maxBackoff := 5 * time.Minute
-	hintSchedule := newExtenderHintSchedule(refreshTimeout, minBackoff, maxBackoff)
+	hintSchedule := newExtenderReadSchedule(refreshTimeout, minBackoff, maxBackoff)
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	assertNextDue := func(wait time.Duration) {
@@ -494,7 +494,7 @@ func TestExtenderHintScheduleBacksOffAFailure(t *testing.T) {
 	hintSchedule.Fail(now)
 	assertNextDue(minBackoff)
 
-	hintSchedule = newExtenderHintSchedule(refreshTimeout, minBackoff, 0)
+	hintSchedule = newExtenderReadSchedule(refreshTimeout, minBackoff, 0)
 	hintSchedule.Fail(now)
 	hintSchedule.Fail(now)
 	assertNextDue(minBackoff)

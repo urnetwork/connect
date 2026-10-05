@@ -432,6 +432,8 @@ func TestExtenderNetworkClientDefaultSettings(t *testing.T) {
 		{name: "LowWaterCount", got: settings.LowWaterCount, want: 4},
 		{name: "DialTimeout", got: settings.DialTimeout, want: 30 * time.Second},
 		{name: "HelloTimeout", got: settings.HelloTimeout, want: 30 * time.Second},
+		{name: "HelloMinBackoff", got: settings.HelloMinBackoff, want: time.Minute},
+		{name: "HelloMaxBackoff", got: settings.HelloMaxBackoff, want: 6 * time.Hour},
 		{name: "SubscribeIdleTimeout", got: settings.SubscribeIdleTimeout, want: 90 * time.Second},
 	}
 	for _, c := range cases {

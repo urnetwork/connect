@@ -27,11 +27,11 @@ import (
 //
 // The shape is one `run` loop started by the constructor. It bootstraps, takes
 // a sample, and then either holds the subscription open or sleeps until the
-// next tick; every failure path goes back through the same backoff. Three
+// next tick; every failure path goes back through the same backoff. Four
 // things wake it early: a network path change, a drop below the low-water
-// mark, and `Close`. The operator's hint and the latency probe pass each run
-// in a loop of their own beside it (`runHints`, `runProbes`), so neither
-// holds up a pass.
+// mark, new root keys from hello, and `Close`. The hello, the operator's hint
+// and the latency probe pass each run in a loop of their own beside it
+// (`runHellos`, `runHints`, `runProbes`), so none holds up a pass.
 //
 // Every clock and every side effect is a settings seam -- `Now`, `ResolveDns`,
 // `Hello` -- so the whole loop is deterministic in tests.
@@ -95,6 +95,15 @@ type ExtenderNetworkClientSettings struct {
 	// dials the operator's address directly (GetExtenderHint).
 	HintMinBackoff time.Duration
 	HintMaxBackoff time.Duration
+	// The same for a hello that failed: read again once this backoff has
+	// passed, doubling with each further failure on the same path up to
+	// HelloMaxBackoff, and at once after a path change. An answer is read
+	// again on the rebootstrap period, whatever the path, since neither the
+	// root keys nor the gossip identity depend on it. Hello reads through the
+	// client strategy, so on a network that routes only extenders it fails
+	// until the directory has one that reaches the operator.
+	HelloMinBackoff time.Duration
+	HelloMaxBackoff time.Duration
 
 	// The latency probe pass (DESIGNNOTES4.md §4). ProbeWindowCount is m:
 	// the pass stops once this many usable extenders of a family measure
@@ -187,6 +196,8 @@ func DefaultExtenderNetworkClientSettings() *ExtenderNetworkClientSettings {
 		SubscribeIdleTimeout:   90 * time.Second,
 		HintMinBackoff:         1 * time.Minute,
 		HintMaxBackoff:         6 * time.Hour,
+		HelloMinBackoff:        1 * time.Minute,
+		HelloMaxBackoff:        6 * time.Hour,
 		ProbeWindowCount:       4,
 		ProbeCountPerExtender:  2,
 		ProbeMaxCandidateCount: 16,
@@ -301,6 +312,9 @@ type ExtenderNetworkClient struct {
 	// not; the first probe pass waits for it too, so the operator's
 	// continent is probed first
 	initialHintDone chan struct{}
+	// the hello loop's join and wake
+	helloDone chan struct{}
+	helloWake *Monitor
 	// the attesting provider, nil for a client that only ranks. Installed
 	// by the provider role and cleared when it stops.
 	probeAttestor *ExtenderProbeAttestor
@@ -312,6 +326,9 @@ type ExtenderNetworkClient struct {
 	// loop reads it again at once rather than waiting out the refresh period
 	// or a failure's backoff
 	hintRearmed bool
+	// set by a path change too: a hello that failed on the old path is read
+	// again at once rather than waiting out its backoff
+	helloRearmed bool
 
 	// Resolver publications share this client's lifetime, never process state.
 	// stateLock guards registration and closure before dnsWorkers is joined.
@@ -362,6 +379,8 @@ func NewExtenderNetworkClient(
 		hintDone:          make(chan struct{}),
 		hintWake:          NewMonitor(),
 		initialHintDone:   make(chan struct{}),
+		helloDone:         make(chan struct{}),
+		helloWake:         NewMonitor(),
 	}
 	directory.SetInitialSamplePending()
 	// a path change invalidates the feed connection and the addresses that
@@ -370,6 +389,14 @@ func NewExtenderNetworkClient(
 	go HandleError(func() {
 		defer close(self.done)
 		self.run()
+	}, cancel)
+	// hello has its own loop too: a pass verifies under the root keys in
+	// force while a read is out, and where only extenders reach the operator
+	// a read ahead of the bootstrap could not answer before the bootstrap
+	// had found one (runHellos)
+	go HandleError(func() {
+		defer close(self.helloDone)
+		self.runHellos()
 	}, cancel)
 	// the hint has its own loop: a pass needs nothing from its answer, and a
 	// read the operator does not answer must not hold up the bootstrap and
@@ -406,12 +433,14 @@ func (self *ExtenderNetworkClient) StatusMonitor() *MonitorValue[ExtenderNetwork
 // path: the country goes stale at once, so the network country the host
 // reports for the new path stands in until the operator answers for it, and
 // the hint loop asks the operator again at once, whatever a failure on the
-// old path had it waiting for.
+// old path had it waiting for. A hello that failed on the old path is read
+// again at once as well.
 func (self *ExtenderNetworkClient) networkChanged() {
 	feedStream := func() *ExtenderFeedStream {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.hintRearmed = true
+		self.helloRearmed = true
 		return self.feedStream
 	}()
 	self.directory.ExpireCountryHint()
@@ -419,6 +448,7 @@ func (self *ExtenderNetworkClient) networkChanged() {
 		feedStream.Close()
 	}
 	self.hintWake.NotifyAll()
+	self.helloWake.NotifyAll()
 	self.wakeMonitor.NotifyAll()
 }
 
@@ -454,6 +484,7 @@ func (self *ExtenderNetworkClient) Close() {
 		<-self.done
 		<-self.probeDone
 		<-self.hintDone
+		<-self.helloDone
 		self.dnsWorkers.Wait()
 	})
 }
@@ -476,15 +507,18 @@ func (self *ExtenderNetworkClient) updateStatus(update func(*ExtenderNetworkClie
 	})
 }
 
-// The refresh loop. One pass bootstraps when it is due, refreshes the root
-// keys when they are due, and then takes a sample, holding the subscription
-// for the feed role. Every exit from a pass goes through the backoff, which a
-// success resets.
+// The refresh loop. One pass bootstraps when it is due and then takes a
+// sample, holding the subscription for the feed role. Every exit from a pass
+// goes through the backoff, which a success resets.
 func (self *ExtenderNetworkClient) run() {
 	backoff := self.settings.MinBackoff
 	initialProbeReady := self.initialProbeReady
 	var lastBootstrapTime time.Time
-	var lastHelloTime time.Time
+	// the root keys the last bootstrap judged its TXT records under. Keys
+	// that hello installs after it make the bootstrap due at the next pass,
+	// so the records the old keys refused, or that waited for keys, are
+	// judged under the new ones (refreshRootKeys)
+	var bootstrapRootKeySet *ExtenderRootKeySet
 	var lastManualTime time.Time
 	// the manual host list this loop has already applied; a reconfiguration
 	// changes the version and re-resolves at once (K6)
@@ -502,18 +536,15 @@ func (self *ExtenderNetworkClient) run() {
 		// pass runs is carried into the next wait instead of being lost
 		wake := self.wakeMonitor.NotifyChannel()
 
-		// each pass has the hint loop look whether the hint is due, and goes
-		// on without waiting for the read (runHints)
+		// each pass has the hello and hint loops look whether their read is
+		// due, and goes on without waiting for either (runHellos, runHints)
+		self.helloWake.NotifyAll()
 		self.hintWake.NotifyAll()
-		if lastHelloTime.IsZero() || self.settings.RebootstrapTimeout <= now.Sub(lastHelloTime) {
-			if self.refreshRootKeys() {
-				lastHelloTime = now
-			}
-		}
 		if lastBootstrapTime.IsZero() ||
 			self.settings.RebootstrapTimeout <= now.Sub(lastBootstrapTime) ||
-			self.directory.ActiveCount(0) < self.settings.LowWaterCount {
-			self.bootstrap()
+			self.directory.ActiveCount(0) < self.settings.LowWaterCount ||
+			self.directory.RootKeys() != bootstrapRootKeySet {
+			bootstrapRootKeySet = self.bootstrap()
 			lastBootstrapTime = now
 		}
 		if version := self.manualHostsVersionValue(); lastManualTime.IsZero() ||
@@ -583,11 +614,81 @@ func (self *ExtenderNetworkClient) run() {
 	}
 }
 
+// The hello loop (B4, C7). Hello is read beside the refresh pass, never ahead
+// of it: a read that cannot answer -- where only extenders reach the
+// operator, it fails until the bootstrap has found one -- must not hold up
+// the bootstrap that would find it.
+//
+// What a pass does with the root keys is apply signed messages -- the
+// bootstrap's TXT records, the feed's records and revocations -- and each is
+// verified as it is applied, under the keys in force then: the space's
+// configured or bundled keys, which are installed before the client starts,
+// until hello answers, and hello's after. Nothing else in a pass needs them:
+// the address answers stay unverified until a record names them, manual
+// hosts are trusted by configuration, and a candidate is dialed only once it
+// was verified, or because it is manual. A pass judged under the keys in
+// force whenever hello failed ahead of it, and it does so too while a read
+// is out. Where no keys are in force nothing can verify, so the bootstrap's
+// TXT records wait for the first keys (bootstrap), and keys that hello
+// installs judge again what was judged under the old ones (refreshRootKeys).
+//
+// The loop has no clock of its own. It looks whether hello is due at its
+// start, at each pass, which wakes it, and at a path change, which is when
+// hello was read as part of the pass. A failed read waits out its backoff
+// (extenderReadSchedule), so a refresh loop that passes after every feed drop
+// does not read it at each one, and a path change clears the backoff. One
+// read is out at a time.
+func (self *ExtenderNetworkClient) runHellos() {
+	helloSchedule := newExtenderReadSchedule(
+		self.settings.RebootstrapTimeout,
+		self.settings.HelloMinBackoff,
+		self.settings.HelloMaxBackoff,
+	)
+	for {
+		// subscribe before the read, so a pass or a path change that lands
+		// while it runs is carried into the next wait instead of being lost
+		wake := self.helloWake.NotifyChannel()
+		// a path change since the last look asks for a failed hello at once
+		helloRearmed := func() bool {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			helloRearmed := self.helloRearmed
+			self.helloRearmed = false
+			return helloRearmed
+		}()
+		if helloRearmed {
+			helloSchedule.ClearBackoff()
+		}
+		if helloSchedule.Due(self.settings.Now()) {
+			if self.refreshRootKeys() {
+				helloSchedule.Answer(self.settings.Now())
+			} else {
+				helloSchedule.Fail(self.settings.Now())
+			}
+		}
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-wake:
+		}
+	}
+}
+
 // Reads hello and applies what it carries (B4, C7). An empty root key list
 // leaves the stored anchor alone, which is what an operator that has not
 // configured keys yet answers; the gossip peer id is published on the status
-// either way, so the member role's node learns the operator as soon as the
-// operator serves one.
+// either way, once the keys it came with are in force, so the member role's
+// node learns the operator as soon as the operator serves one. Reports whether
+// hello answered.
+//
+// Keys that are not the keys in force replace them. The directory judges
+// everything it holds again under them (SetRootKeys), including a message
+// whose verification under the old keys was still out (applyVerifiedRecord),
+// and the refresh loop is woken to take the steps that judged signed messages
+// under the old keys again: the bootstrap, which is due once the keys in force
+// are not the ones its TXT records were judged under (run), and the sample,
+// since a pass dials no candidate it chose under the old keys after the
+// change, and a stream to one ends once its sample is in (sample).
 func (self *ExtenderNetworkClient) refreshRootKeys() bool {
 	hello := self.settings.Hello
 	if hello == nil {
@@ -606,19 +707,21 @@ func (self *ExtenderNetworkClient) refreshRootKeys() bool {
 	if helloResult == nil {
 		return true
 	}
+	answered := true
+	// a list of blank entries is as empty as no list: installed, it would
+	// refuse every record until the next answer
+	if keySet, err := NewExtenderRootKeySetFromHex(helloResult.RootPublicKeyHexes...); err != nil {
+		self.log.Infof("[extender]hello root keys err = %s\n", err)
+		answered = false
+	} else if 0 < keySet.Len() && !keySet.Equal(self.directory.RootKeys()) {
+		self.directory.SetRootKeys(keySet)
+		self.log.Infof("[extender]hello root keys installed (%d)\n", keySet.Len())
+		self.wakeMonitor.NotifyAll()
+	}
 	self.updateStatus(func(status *ExtenderNetworkClientStatus) {
 		status.GossipPeerId = helloResult.GossipPeerId
 	})
-	if len(helloResult.RootPublicKeyHexes) == 0 {
-		return true
-	}
-	keySet, err := NewExtenderRootKeySetFromHex(helloResult.RootPublicKeyHexes...)
-	if err != nil {
-		self.log.Infof("[extender]hello root keys err = %s\n", err)
-		return false
-	}
-	self.directory.SetRootKeys(keySet)
-	return true
+	return answered
 }
 
 func (self *ExtenderNetworkClient) hello(ctx context.Context) (*ExtenderHelloResult, error) {
@@ -702,9 +805,15 @@ func (self *ExtenderNetworkClient) applyManualHosts() uint64 {
 // A TXT answer that does not verify is dropped and logged, never applied: a
 // poisoned resolver can hand out any bytes it likes, and the whole point is
 // that only the root key decides what counts.
-func (self *ExtenderNetworkClient) bootstrap() {
+//
+// The records are judged under the root keys in force. With none in force no
+// record can verify, and one refused now would not be offered again until the
+// next bootstrap, so the TXT answers wait for keys and none is resolved.
+// Returns the keys read before any record was judged: keys that hello installs
+// after that make the bootstrap due again (run).
+func (self *ExtenderNetworkClient) bootstrap() *ExtenderRootKeySet {
 	if self.settings.ExtenderDnsName == "" {
-		return
+		return self.directory.RootKeys()
 	}
 	resolveTxt := self.settings.ResolveDnsTxt
 	if resolveTxt == nil {
@@ -715,10 +824,19 @@ func (self *ExtenderNetworkClient) bootstrap() {
 	ctx, cancel := context.WithTimeout(self.ctx, self.settings.HelloTimeout)
 	defer cancel()
 
-	txts, err := resolveTxt(ctx, self.settings.ExtenderDnsName)
-	if err != nil {
-		// not fatal: the address answers may still bootstrap, unverified
-		self.log.Infof("[extender]bootstrap txt err = %s\n", err)
+	rootKeySet := self.directory.RootKeys()
+	var txts []string
+	if rootKeySet.Len() == 0 {
+		self.log.V(1).Infof("[extender]bootstrap txt waits for root keys\n")
+	} else {
+		var err error
+		txts, err = resolveTxt(ctx, self.settings.ExtenderDnsName)
+		if err != nil {
+			// not fatal: the address answers may still bootstrap, unverified
+			self.log.Infof("[extender]bootstrap txt err = %s\n", err)
+		}
+		// keys installed while the answer was out judge it
+		rootKeySet = self.directory.RootKeys()
 	}
 	applied := 0
 	// the continents of the records that verified: the geo dns answered the
@@ -748,6 +866,7 @@ func (self *ExtenderNetworkClient) bootstrap() {
 	// The TXT trust/hint step is complete. Address families continue under
 	// this client's joined owner; one usable publication releases sampling.
 	self.bootstrapDnsAddresses(ctx)
+	return rootKeySet
 }
 
 // The default bootstrap TXT resolution: over the strategy's DoH settings in
@@ -824,7 +943,14 @@ func (self *ExtenderNetworkClient) ipVersionSupported(ipVersion int) bool {
 // every candidate is limited, the earliest time one stops being (A12). In the
 // feed role the same stream is then read until it ends, which is what makes a
 // pass long lived.
+//
+// The candidates are chosen under the root keys in force. Keys that hello
+// installs during the pass may no longer vouch for them, so no candidate is
+// dialed after the install (sampleCandidate), and a stream opened to one ends
+// once its sample is in (runFeed). The install woke the refresh loop, whose
+// next pass chooses under the new keys.
 func (self *ExtenderNetworkClient) sample() (bool, time.Time) {
+	candidateRootKeySet := self.directory.RootKeys()
 	candidates, limitedUntil := self.feedCandidates()
 	if len(candidates) == 0 {
 		// nothing to dial is not connecting, it is disconnected (K4)
@@ -857,7 +983,7 @@ func (self *ExtenderNetworkClient) sample() (bool, time.Time) {
 			return false, time.Time{}
 		default:
 		}
-		sampled, err := self.sampleCandidate(candidate)
+		sampled, err := self.sampleCandidate(candidate, candidateRootKeySet)
 		if sampled {
 			return true, time.Time{}
 		}
@@ -907,9 +1033,12 @@ func (self *ExtenderNetworkClient) feedCandidates() ([]*ExtenderCandidate, time.
 }
 
 // Tries the carriers of one candidate in order -- tcp, then quic, then dns --
-// and runs the feed on the first that answers.
+// and runs the feed on the first that answers. `candidateRootKeySet` is the
+// root keys the candidate was chosen under: once other keys are in force, no
+// carrier is dialed, and nothing is held against the candidate for it.
 func (self *ExtenderNetworkClient) sampleCandidate(
 	candidate *ExtenderCandidate,
+	candidateRootKeySet *ExtenderRootKeySet,
 ) (sampled bool, resultErr error) {
 	connectSettings := DefaultConnectSettings()
 	if self.clientStrategy != nil {
@@ -922,6 +1051,9 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 			return false, nil
 		default:
 		}
+		if self.directory.RootKeys() != candidateRootKeySet {
+			return false, nil
+		}
 		connectMode, ok := ExtenderConnectModeForCarrier(carrier)
 		if !ok {
 			continue
@@ -930,7 +1062,7 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 		if extenderConfig == nil {
 			continue
 		}
-		sampled, err := self.runFeed(connectSettings, extenderConfig)
+		sampled, err := self.runFeed(connectSettings, extenderConfig, candidateRootKeySet)
 		if sampled {
 			return true, nil
 		}
@@ -949,9 +1081,17 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 
 // Opens the feed, applies the sample, and in the feed role keeps applying
 // until the stream ends. It reports whether the sample completed.
+//
+// Root keys other than `candidateRootKeySet`, the keys the extender was
+// chosen under, judge every frame after them, and end the stream once its
+// sample is in, whether hello installed them during the dial or after it: the
+// next pass, which the install woke, samples under them, so the records the
+// old keys refused are judged again, and the stream does not stay with an
+// extender the new keys may not vouch for (refreshRootKeys).
 func (self *ExtenderNetworkClient) runFeed(
 	connectSettings *ConnectSettings,
 	extenderConfig *ExtenderConfig,
+	candidateRootKeySet *ExtenderRootKeySet,
 ) (sampled bool, resultErr error) {
 	dialCtx, dialCancel := context.WithTimeout(self.ctx, self.settings.DialTimeout)
 	defer dialCancel()
@@ -1036,6 +1176,9 @@ func (self *ExtenderNetworkClient) runFeed(
 		case frame.GetKeepalive():
 			// an idle subscription is still alive; nothing to apply
 		}
+		if sampled && self.directory.RootKeys() != candidateRootKeySet {
+			return true, nil
+		}
 	}
 }
 
@@ -1101,11 +1244,11 @@ func extenderFeedConfig(
 //
 // The loop has no clock of its own. It looks whether the hint is due at its
 // start, at each pass, which wakes it, and at a path change, which is the
-// cadence the hint was read at as part of the pass; extenderHintSchedule
+// cadence the hint was read at as part of the pass; extenderReadSchedule
 // decides what is due, so a failed read is not repeated at every pass.
 func (self *ExtenderNetworkClient) runHints() {
 	initialHintDone := self.initialHintDone
-	hintSchedule := newExtenderHintSchedule(
+	hintSchedule := newExtenderReadSchedule(
 		self.settings.RebootstrapTimeout,
 		self.settings.HintMinBackoff,
 		self.settings.HintMaxBackoff,
@@ -1136,16 +1279,19 @@ func (self *ExtenderNetworkClient) runHints() {
 	}
 }
 
-// When the hint is due. An answer is read again after the refresh timeout.
-// A failure is read again only once its backoff has passed, and the backoff
-// doubles with each further failure, up to the max: an operator that a direct
-// read cannot reach on a path does not answer at the next pass either, and
-// the backoff is what keeps a refresh loop that passes after every feed drop
-// from dialing it at each one. A path change is a fresh start: the hint is
-// due at once, and a failure on the new path backs off from the minimum.
+// When a read of the operator is due, the hint's (runHints) or hello's
+// (runHellos). An answer is read again after the refresh timeout. A failure
+// is read again only once its backoff has passed, and the backoff doubles
+// with each further failure, up to the max: an operator that a read cannot
+// reach on a path does not answer at the next pass either, and the backoff is
+// what keeps a refresh loop that passes after every feed drop from reading at
+// each one. A path change is a fresh start for a failure: the read is due at
+// once, and a failure on the new path backs off from the minimum. For the
+// hint, whose answer places the address of the path, it is a fresh start for
+// an answer too (Rearm); hello's answer holds on any path (ClearBackoff).
 //
-// Only the hint loop holds one, so it takes no lock.
-type extenderHintSchedule struct {
+// Only the loop that reads holds one, so it takes no lock.
+type extenderReadSchedule struct {
 	refreshTimeout time.Duration
 	minBackoff     time.Duration
 	maxBackoff     time.Duration
@@ -1160,12 +1306,14 @@ type extenderHintSchedule struct {
 	backoff time.Duration
 }
 
-func newExtenderHintSchedule(
+// A schedule with nothing read yet, so a read is due at once. A max below the
+// minimum is the minimum.
+func newExtenderReadSchedule(
 	refreshTimeout time.Duration,
 	minBackoff time.Duration,
 	maxBackoff time.Duration,
-) *extenderHintSchedule {
-	return &extenderHintSchedule{
+) *extenderReadSchedule {
+	return &extenderReadSchedule{
 		refreshTimeout: refreshTimeout,
 		minBackoff:     minBackoff,
 		maxBackoff:     max(minBackoff, maxBackoff),
@@ -1174,19 +1322,19 @@ func newExtenderHintSchedule(
 
 // Whether a read is due at `now`: none has ended on this path yet, or the
 // wait after the last has passed.
-func (self *extenderHintSchedule) Due(now time.Time) bool {
+func (self *extenderReadSchedule) Due(now time.Time) bool {
 	return self.readTime.IsZero() || self.wait <= now.Sub(self.readTime)
 }
 
 // The read that ended at `now` answered.
-func (self *extenderHintSchedule) Answer(now time.Time) {
+func (self *extenderReadSchedule) Answer(now time.Time) {
 	self.readTime = now
 	self.wait = self.refreshTimeout
 	self.backoff = 0
 }
 
 // The read that ended at `now` failed.
-func (self *extenderHintSchedule) Fail(now time.Time) {
+func (self *extenderReadSchedule) Fail(now time.Time) {
 	if self.backoff <= 0 {
 		self.backoff = self.minBackoff
 	} else {
@@ -1196,11 +1344,19 @@ func (self *extenderHintSchedule) Fail(now time.Time) {
 	self.wait = self.backoff
 }
 
-// The path changed.
-func (self *extenderHintSchedule) Rearm() {
+// The path changed, for a read whose answer depends on the path.
+func (self *extenderReadSchedule) Rearm() {
 	self.readTime = time.Time{}
 	self.wait = 0
 	self.backoff = 0
+}
+
+// The path changed, for a read whose answer does not: a failed read is due at
+// once, and an answer keeps its refresh timeout.
+func (self *extenderReadSchedule) ClearBackoff() {
+	if 0 < self.backoff {
+		self.Rearm()
+	}
 }
 
 // Reads the operator's hint and applies it to the directory. An empty

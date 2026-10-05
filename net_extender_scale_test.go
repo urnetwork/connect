@@ -142,6 +142,7 @@ func TestExtenderDirectoryScaleAMillionGossipRecords(t *testing.T) {
 	directory, now := newTestScaleDirectory(t, nil)
 	directory.SetContinentHint("EU")
 	record := &protocol.ExtenderRecord{}
+	rootKeySet := directory.RootKeys()
 
 	beforeByteCount := testHeapByteCount()
 	// the keys of the last 512 records of the hinted continent fed, oldest
@@ -154,7 +155,7 @@ func TestExtenderDirectoryScaleAMillionGossipRecords(t *testing.T) {
 			continent = "EU"
 		}
 		body, publicKey := testScaleRecord(i, continent, now)
-		if !directory.applyVerifiedRecord(record, body, ExtenderSourceGossip) {
+		if changed, err := directory.applyVerifiedRecord(record, body, rootKeySet, ExtenderSourceGossip); err != nil || !changed {
 			t.Fatalf("record %d was not applied", i)
 		}
 		if continent == "EU" {
@@ -219,6 +220,7 @@ func TestExtenderPeerPingerScaleAHundredThousandPeers(t *testing.T) {
 	})
 	directory.SetContinentHint("EU")
 	record := &protocol.ExtenderRecord{}
+	rootKeySet := directory.RootKeys()
 	nearIps := map[string]bool{}
 	buildStartTime := time.Now()
 	for i := range scaleSettings.PeerCount {
@@ -227,7 +229,7 @@ func TestExtenderPeerPingerScaleAHundredThousandPeers(t *testing.T) {
 			continent = "EU"
 		}
 		body, _ := testScaleRecord(i, continent, now)
-		directory.applyVerifiedRecord(record, body, ExtenderSourceGossip)
+		directory.applyVerifiedRecord(record, body, rootKeySet, ExtenderSourceGossip)
 		if continent == "EU" {
 			nearIps[body.Addresses[0].Ip] = true
 		}
