@@ -1063,6 +1063,14 @@ paths:
         limit the call answers 200 with `error.upgrade_required` -- a plan
         limit, not a hard cap -- and an agent can settle it inline with the
         x402 round trip below.
+
+        Like roles or a principal the call may not set, an invalid
+        `proxy_config.initial_device_state.performance_profile` (the rules
+        are on that field) is refused, and nothing is created: the call
+        answers 200 with `error.message` "Invalid performance profile: " and
+        the reason, for example "Invalid performance profile: Window size
+        [2, 1] invalid. Max must be >= min". A re-auth of an existing client
+        (`client_id` set) ignores `proxy_config`.
       operationId: authNetworkClient
       security:
         - BearerAuth: []
@@ -6818,6 +6826,19 @@ components:
                         a trusted peer, since it can be a public exit.
                       type: boolean
                 performance_profile:
+                  description: |
+                    Optional. Omitted, the device runs in auto mode. The call
+                    is refused (see the endpoint) unless the profile passes
+                    the check the device itself applies:
+                    - every `window_size` value is at least 0
+                    - `window_size_max` is at least `window_size_min`
+                    - a fixed window (`window_type` `quality` or `speed`) has
+                      a `window_size_max` of at least 1, since a window that
+                      can hold no provider leaves no route
+
+                    The check covers auto mode too, although auto ignores
+                    `window_size`. Without `window_size` the device uses its
+                    default window, which passes.
                   type: object
                   required: []
                   properties:
@@ -6831,9 +6852,15 @@ components:
                         fall back to plaintext at this layer.
                       type: boolean
                     window_type:
-                      description: Optional. The default is "quality"
+                      description: |
+                        Optional. `auto`, the default, balances traffic across
+                        the window types and ignores `window_size`. `quality`
+                        and `speed` fix the window type, sized by
+                        `window_size`.
                       type: string
                       oneOf:
+                        - title: WindowTypeAuto
+                          const: auto
                         - title: WindowTypeQuality
                           const: quality
                         - title: WindowTypeSpeed
