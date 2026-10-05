@@ -224,6 +224,7 @@ func securityPolicyRulesDigest(t *testing.T) string {
 // Earlier pins stay, as the record of what each generation enforced.
 var securityPolicyRulesPins = map[uint64]string{
 	1: "407caba79a8ec322fcd653892513e72b7add09eb98eefa40371c622daea6fbda",
+	2: "beb5d39cf504631b18651dd2ddd8b20f080626a3f4f38431501b6d7707820b5f",
 }
 
 // A change to the default settings or an exception table must come with a

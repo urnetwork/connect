@@ -25,7 +25,7 @@ import (
 // order, and it differs between devices of one build because MaxFlows scales
 // with memory. The feed-generated CFAA tables are refreshed by every release
 // build and are identified only by the hash.
-const SecurityPolicyRulesGeneration uint64 = 1
+const SecurityPolicyRulesGeneration uint64 = 2
 
 // SecurityPolicyGeneration returns the rules generation a policy enforces:
 // SecurityPolicyRulesGeneration for the built-in policy in either direction,
