@@ -380,6 +380,7 @@ func newTestHintNetworkClient(
 	return directory, networkClient.initialHintDone
 }
 
+// Waits for the network client's first hint read to end.
 func waitForTestHintRead(t *testing.T, hinted <-chan struct{}) {
 	t.Helper()
 	select {
