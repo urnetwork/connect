@@ -260,6 +260,8 @@ of its directory, `ExtenderDirectory.SpoofCountryCode()`: the `country_code`
 of the operator's hint while the hint is current, else the network country the
 host reports through `SetNetworkCountryCode` (on Android the mobile network's
 country while the default network is cellular), else the hint's last country.
+The hint is read through direct dialers only (DESIGNNOTES4.md §4): where only
+an extender reaches the operator, the hint fails rather than placing it.
 A failed hint and a path change make the hint's country stale, and a path
 change asks for the hint again. When the list in force changes, the strategy
 drops its discovery extender dialers so every address is drawn again from the
