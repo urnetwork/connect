@@ -3898,8 +3898,8 @@ paths:
         only signer, and the transaction comes back unsigned. Its recent
         blockhash is good for about a minute, so build it when the buyer
         clicks. A client should check that the transaction pays only the
-        merchant and the mint it expects, in the quoted amount, before handing
-        it to the wallet.
+        `recipient` and the `spl_token_mint` the intent quoted, in the quoted
+        amount, before handing it to the wallet.
 
         An unknown, paid or expired intent, another network's intent, an
         address or reference that is not a Solana public key, or an
@@ -4035,11 +4035,15 @@ paths:
         Buy a data pack with USDC on Solana, without signing in or giving an
         email: the data goes straight to the network named by `network_name`
         (matched like /pay/data/network-lookup). Records the payment intent and
-        returns the exact `amount_usd` to send in USDC. The client generates
-        `reference` (a Solana Pay reference: a fresh base58 public key) and
-        either opens a Solana Pay url carrying it, or shows the buyer the
-        receiving address, the amount and `memo` (which is the reference) to
-        send by hand from any wallet or exchange. The Helius webhook
+        returns the exact `amount_usd` to send in USDC and where to send it:
+        `recipient` (the receiving address, the same one /solana/payment-intent
+        quotes) and `spl_token_mint` (USDC). The client generates `reference`
+        (a Solana Pay reference: a fresh base58 public key) and either opens a
+        Solana Pay url built from these, or shows the buyer `recipient`, the
+        amount and `memo` (which is the reference) to send by hand from any
+        wallet or exchange. A client keeps no address of its own: a result
+        without `recipient` (from a server that predates it) cannot be paid.
+        The Helius webhook
         (/pay/solana) matches the transfer by the reference among the
         transaction's account keys OR by the memo text, then lands the data on
         the network (data only, valid for one year, no Pro) and emails the
@@ -12194,6 +12198,12 @@ components:
         network_id:
           type: string
           format: uuid
+        recipient:
+          type: string
+          description: the merchant address (base58) to pay, the same one /solana/payment-intent quotes; build the payment url and show the address from this, never a hardcoded address
+        spl_token_mint:
+          type: string
+          description: the SPL token mint (base58) to pay in (USDC)
         error:
           type: object
           required:
