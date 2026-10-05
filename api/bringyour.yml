@@ -4308,6 +4308,9 @@ paths:
         rejected. Not retroactive: the wallet applies from the next committed
         epoch's leaf set. This wallet is deliberately separate from the
         account payout wallet.
+
+        A well-formed signature that does not verify for `coldkey_ss58` over
+        `message` is refused with `error.code` `signature_mismatch`.
       operationId: Sn Set Wallet
       security:
         - BearerAuth: []
@@ -11476,6 +11479,20 @@ components:
           required:
             - message
           properties:
+            code:
+              description: |
+                A stable code for a refusal that has one, so a client can pick a
+                localized message.
+                `signature_mismatch`: the signature is well formed but does not
+                verify for `coldkey_ss58` over `message`. In practice the
+                wallet signed with another account than the address entered,
+                or signed other text. An sr25519 signature cannot be recovered
+                to the key that made it, so the server cannot name that
+                account. Sign the issued challenge with the entered address.
+                Malformed input and a wrong, used or expired challenge carry no
+                code. Absent from older servers and for other refusals; clients
+                fall back to `message` for an absent or unknown code.
+              type: string
             message:
               type: string
 

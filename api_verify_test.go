@@ -70,6 +70,17 @@ func TestSnSetWalletJson(t *testing.T) {
 	err = json.Unmarshal(errorResultJson, &parsedErrorResult)
 	AssertEqual(t, nil, err)
 	AssertEqual(t, "invalid ss58", parsedErrorResult.Error.Message)
+	AssertEqual(t, "", parsedErrorResult.Error.Code)
+
+	// the server's coded refusal keeps its code
+	var parsedCodedResult SnSetWalletResult
+	err = json.Unmarshal(
+		[]byte(`{"error":{"code":"signature_mismatch","message":"The signature does not match this coldkey address."}}`),
+		&parsedCodedResult,
+	)
+	AssertEqual(t, nil, err)
+	AssertEqual(t, SnSetWalletErrorCodeSignatureMismatch, parsedCodedResult.Error.Code)
+	AssertEqual(t, "The signature does not match this coldkey address.", parsedCodedResult.Error.Message)
 }
 
 // TestSnPoolClaimJson round-trips the `GET /sn/pool/claim` args and result
