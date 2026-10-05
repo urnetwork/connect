@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -185,11 +186,12 @@ func TestProviderDiagnosticsReportSecurityPolicyGeneration(t *testing.T) {
 	}
 }
 
-// securityPolicyRulesDigest digests what the built-in rules are made of apart
+// securityPolicyRulesPreimage is what the built-in rules are made of apart
 // from code: the default settings, without the memory-scaled MaxFlows, and the
-// hand-maintained exception tables. The CFAA tables are left out; every
-// release build regenerates them from the feeds.
-func securityPolicyRulesDigest(t *testing.T) string {
+// hand-maintained exception tables. The feed-generated tables are left out:
+// every release build regenerates the CFAA blocklists and the Meta prefixes,
+// and SecurityPolicyHash identifies them.
+func securityPolicyRulesPreimage(t *testing.T) []byte {
 	t.Helper()
 	dmca := DefaultDmcaSecurityPolicySettings()
 	dmca.MaxFlows = 0
@@ -205,32 +207,41 @@ func securityPolicyRulesDigest(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.New()
-	digest.Write(settings)
+	var preimage bytes.Buffer
+	preimage.Write(settings)
 	fmt.Fprintf(
-		digest,
-		"\x00steam %v\x00meta %v\x00telegram %v %d",
+		&preimage,
+		"\x00steam %v\x00telegram %v %d",
 		steamValveNetworkPrefixes,
-		metaNetworkPrefixes,
 		telegramCallReflectorIpv4Ranges,
 		telegramCallV12TcpFallbackIpv4,
 	)
-	return hex.EncodeToString(digest.Sum(nil))
+	return preimage.Bytes()
+}
+
+func securityPolicyRulesDigest(t *testing.T) string {
+	t.Helper()
+	digest := sha256.Sum256(securityPolicyRulesPreimage(t))
+	return hex.EncodeToString(digest[:])
 }
 
 // securityPolicyRulesPins records the rules digest each generation names.
 // Adding a detector or changing a default raises SecurityPolicyRulesGeneration
 // and adds the new generation's digest here, the one the failing test prints.
-// Earlier pins stay, as the record of what each generation enforced.
+// Earlier pins stay, as the record of what each generation enforced. Both
+// pins are of this digest, which leaves out the Meta prefixes since they
+// became a feed table; neither generation had shipped then, and the first
+// refresh equaled the snapshot generation 2 had. Generation 1's pin is of its
+// own default settings (connect 4138f101).
 var securityPolicyRulesPins = map[uint64]string{
-	1: "407caba79a8ec322fcd653892513e72b7add09eb98eefa40371c622daea6fbda",
-	2: "beb5d39cf504631b18651dd2ddd8b20f080626a3f4f38431501b6d7707820b5f",
+	1: "265961a0f2b445d75fd5a851ec49198f580e3778f4bbe27315af7f3290c7e8c9",
+	2: "2798a1cef586738de34759ff274f084e950cbd09b9c17b35a3baeba57d80141f",
 }
 
-// A change to the default settings or an exception table must come with a
-// generation the providers can report, or clients cannot tell providers with
-// the new rules from older ones. This cannot see a rule change made in code
-// alone; SecurityPolicyRulesGeneration says to raise it then too.
+// A change to the default settings or a hand-maintained exception table must
+// come with a generation the providers can report, or clients cannot tell
+// providers with the new rules from older ones. This cannot see a rule change
+// made in code alone; SecurityPolicyRulesGeneration says to raise it then too.
 func TestSecurityPolicyRulesGenerationPin(t *testing.T) {
 	digest := securityPolicyRulesDigest(t)
 	if pin := securityPolicyRulesPins[SecurityPolicyRulesGeneration]; digest != pin {
@@ -244,5 +255,48 @@ securityPolicyRulesPins, keeping the earlier pins.`,
 			SecurityPolicyRulesGeneration+1,
 			digest,
 		)
+	}
+}
+
+// The pin covers what only a reviewed change can alter, the default settings
+// and the hand-maintained exception tables, and not the feed-generated
+// tables, so a release build's refresh of the Meta prefixes needs no new
+// generation (and does not fail this pin in the release's own tests).
+func TestSecurityPolicyRulesPinCoversHandMaintainedTablesOnly(t *testing.T) {
+	preimage := securityPolicyRulesPreimage(t)
+	for _, prefix := range steamValveNetworkPrefixes {
+		if !bytes.Contains(preimage, []byte(prefix.String())) {
+			t.Fatalf("the rules pin does not cover the Steam prefix %s", prefix)
+		}
+	}
+	if !bytes.Contains(preimage, []byte(fmt.Sprint(telegramCallReflectorIpv4Ranges))) {
+		t.Fatal("the rules pin does not cover the Telegram reflector ranges")
+	}
+	for _, prefix := range metaNetworkPrefixes {
+		if bytes.Contains(preimage, []byte(prefix.String())) {
+			t.Fatalf("the rules pin covers the feed-generated Meta prefix %s", prefix)
+		}
+	}
+}
+
+// The feed-generated tables are identified by the hash instead, in both
+// directions: a provider whose release refreshed them reports a different
+// SecurityPolicyHash.
+func TestSecurityPolicyHashIdentifiesFeedTables(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for _, policy := range []SecurityPolicy{DefaultSecurityPolicy(ctx), DefaultProviderSecurityPolicy(ctx)} {
+		var identity bytes.Buffer
+		writeSecurityPolicyIdentity(&identity, policy)
+		if !bytes.Contains(identity.Bytes(), []byte(cfaaBlockedPrefixData)) ||
+			!bytes.Contains(identity.Bytes(), []byte(cfaaBlockedPrefix6Data)) {
+			t.Fatalf("the %T identity does not cover the CFAA tables", policy)
+		}
+		for _, prefix := range metaNetworkPrefixes {
+			if !bytes.Contains(identity.Bytes(), []byte(prefix.String()+"\n")) {
+				t.Fatalf("the %T identity does not cover the Meta prefix %s", policy, prefix)
+			}
+		}
 	}
 }

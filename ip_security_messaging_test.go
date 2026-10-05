@@ -14,62 +14,53 @@ func whatsAppTestPath(address string, transport IpProtocol, port int, syn bool) 
 	return steamTestPath(netip.MustParseAddr(address), transport, port, syn)
 }
 
-func TestMetaNetworkPrefixSnapshot(t *testing.T) {
-	expected := []string{
-		"31.13.24.0/21",
-		"31.13.64.0/18",
-		"45.64.40.0/22",
-		"57.141.0.0/20",
-		"57.141.16.0/21",
-		"57.141.24.0/23",
-		"57.144.0.0/14",
-		"66.220.144.0/20",
-		"69.63.176.0/20",
-		"69.171.224.0/19",
-		"74.119.76.0/22",
-		"102.132.96.0/20",
-		"103.4.96.0/22",
-		"129.134.0.0/16",
-		"147.75.208.0/20",
-		"157.240.0.0/16",
-		"163.70.128.0/17",
-		"163.77.128.0/17",
-		"173.252.64.0/18",
-		"179.60.192.0/22",
-		"185.60.216.0/22",
-		"185.89.216.0/22",
-		"204.15.20.0/22",
-		"2401:db00::/32",
-		"2620:0:1c00::/40",
-		"2a03:2880::/31",
-		"2a03:2887:ff2c::/47",
-		"2a03:83e0::/32",
-	}
-	if len(metaNetworkPrefixes) != len(expected) {
-		t.Fatalf("Meta prefix count = %d, want snapshot count %d", len(metaNetworkPrefixes), len(expected))
-	}
-
+// The table is generated (ip_security_messaging_meta.go) and every release
+// build refreshes it, so this checks its shape rather than its contents, as
+// for the CFAA tables: masked, sorted IPv4 then IPv6, pairwise disjoint and
+// collapsed (no two siblings one prefix would cover), and still covering
+// where WhatsApp's chat edge resolves, which the generator also refuses to
+// drop.
+func TestMetaNetworkPrefixInvariant(t *testing.T) {
 	v4Count, v6Count := 0, 0
 	for i, prefix := range metaNetworkPrefixes {
-		if prefix != prefix.Masked() {
+		if !prefix.IsValid() || prefix != prefix.Masked() {
 			t.Fatalf("prefix %d is not masked: %s", i, prefix)
 		}
-		if got := prefix.String(); got != expected[i] {
-			t.Fatalf("prefix %d = %s, want %s", i, got, expected[i])
-		}
 		if prefix.Addr().Is4() {
+			if 0 < v6Count {
+				t.Fatalf("IPv4 prefix %s follows the IPv6 prefixes", prefix)
+			}
 			v4Count++
 		} else {
 			v6Count++
 		}
-		for j, other := range metaNetworkPrefixes {
-			if i != j && prefix.Contains(other.Addr()) {
-				t.Fatalf("prefix %s contains prefix %s", prefix, other)
-			}
+		if i == 0 {
+			continue
+		}
+		previous := metaNetworkPrefixes[i-1]
+		if previous.Addr().BitLen() == prefix.Addr().BitLen() &&
+			lastAddressInPrefix(previous).Compare(prefix.Addr()) >= 0 {
+			t.Fatalf("prefixes %s and %s are not sorted and disjoint", previous, prefix)
+		}
+		if previous.Bits() == prefix.Bits() &&
+			netip.PrefixFrom(previous.Addr(), previous.Bits()-1).Masked() == netip.PrefixFrom(prefix.Addr(), prefix.Bits()-1).Masked() {
+			t.Fatalf("prefixes %s and %s are siblings left uncollapsed", previous, prefix)
 		}
 	}
-	if v4Count != 23 || v6Count != 5 {
-		t.Fatalf("Meta prefixes = %d IPv4 / %d IPv6, want 23 / 5", v4Count, v6Count)
+	if v4Count == 0 || v6Count == 0 {
+		t.Fatalf("Meta prefixes = %d IPv4 / %d IPv6, want both families", v4Count, v6Count)
+	}
+	for _, anchor := range []string{"31.13.64.0/18", "157.240.0.0/16", "2a03:2880::/32"} {
+		edge := netip.MustParsePrefix(anchor)
+		covered := false
+		for _, prefix := range metaNetworkPrefixes {
+			if prefix.Bits() <= edge.Bits() && prefix.Contains(edge.Addr()) {
+				covered = true
+			}
+		}
+		if !covered {
+			t.Fatalf("WhatsApp edge %s is not covered by the Meta prefixes", edge)
+		}
 	}
 }
 
