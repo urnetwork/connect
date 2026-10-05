@@ -154,10 +154,11 @@ type ExtenderNetworkClientSettings struct {
 		extenderConfig *ExtenderConfig,
 		attestor *ExtenderProbeAttestor,
 	) (*ExtenderLatencyProbe, error)
-	// Hint, when set, replaces the continent hint fetch. Nil reads
-	// /network/extender-hint through the client strategy. An empty answer
-	// with no error is an operator that cannot place the caller.
-	Hint func(ctx context.Context) (string, error)
+	// Hint, when set, replaces the hint fetch. Nil reads
+	// /network/extender-hint through the client strategy. An empty field with
+	// no error is an operator that cannot place the caller; an error is an
+	// operator that cannot be asked.
+	Hint func(ctx context.Context) (*ExtenderHintResult, error)
 }
 
 func DefaultExtenderNetworkClientSettings() *ExtenderNetworkClientSettings {
@@ -287,6 +288,9 @@ type ExtenderNetworkClient struct {
 	// true once the operator's hint has been applied, which the dns
 	// inference then defers to
 	operatorHintApplied bool
+	// set by a path change: the hint placed the address of the old path, so
+	// the next pass asks again rather than waiting out the refresh period
+	hintRearmed bool
 
 	// Resolver publications share this client's lifetime, never process state.
 	// stateLock guards registration and closure before dnsWorkers is joined.
@@ -358,16 +362,33 @@ func (self *ExtenderNetworkClient) StatusMonitor() *MonitorValue[ExtenderNetwork
 // A path change invalidates the open subscription: it is bound to the old
 // path, and the loop would otherwise sit on it until the idle timeout. The
 // stream is closed with no lock held, as any external object is.
+//
+// It invalidates the hint's country too, which placed the address of the old
+// path: the country goes stale at once, so the network country the host
+// reports for the new path stands in until the operator answers for it, and
+// the next pass asks the operator again.
 func (self *ExtenderNetworkClient) networkChanged() {
 	feedStream := func() *ExtenderFeedStream {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
+		self.hintRearmed = true
 		return self.feedStream
 	}()
+	self.directory.ExpireCountryHint()
 	if feedStream != nil {
 		feedStream.Close()
 	}
 	self.wakeMonitor.NotifyAll()
+}
+
+// Reports whether a path change asked for the hint again since the last call,
+// and clears the request.
+func (self *ExtenderNetworkClient) takeHintRearmed() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	hintRearmed := self.hintRearmed
+	self.hintRearmed = false
+	return hintRearmed
 }
 
 // Publishes the open subscription so a network change can end it.
@@ -446,7 +467,11 @@ func (self *ExtenderNetworkClient) run() {
 			}
 		}
 		// the hint before the bootstrap, so the dns inference below knows
-		// whether the operator has already said (DESIGNNOTES4.md §4)
+		// whether the operator has already said (DESIGNNOTES4.md §4). A path
+		// change asks again as a first start does, until it answers
+		if self.takeHintRearmed() {
+			lastHintTime = time.Time{}
+		}
 		if lastHintTime.IsZero() || self.settings.RebootstrapTimeout <= now.Sub(lastHintTime) {
 			if self.refreshHint() {
 				lastHintTime = now
@@ -857,6 +882,7 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 	if self.clientStrategy != nil {
 		connectSettings = &self.clientStrategy.settings.ConnectSettings
 	}
+	spoofDomains, _ := directorySpoofDomains(self.directory)
 	for _, carrier := range orderedExtenderCarriers(candidate.Carriers) {
 		select {
 		case <-self.ctx.Done():
@@ -867,7 +893,7 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 		if !ok {
 			continue
 		}
-		extenderConfig := extenderFeedConfig(candidate, connectMode)
+		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains)
 		if extenderConfig == nil {
 			continue
 		}
@@ -996,18 +1022,19 @@ func orderedExtenderCarriers(carriers []string) []string {
 }
 
 // The dial configuration of one candidate carrier. The outer name is one
-// random spoof domain (A10); with no bundled list the extender ip is presented,
-// which sends no sni at all rather than naming the destination -- a feed dial
-// has no destination host.
+// random name of the spoof list in force (A10, directorySpoofDomains); with an
+// empty list the extender ip is presented, which sends no sni at all rather
+// than naming the destination -- a feed dial has no destination host.
 func extenderFeedConfig(
 	candidate *ExtenderCandidate,
 	connectMode ExtenderConnectMode,
+	spoofDomains []string,
 ) *ExtenderConfig {
 	profile := ExtenderProfile{
 		ConnectMode: connectMode,
 		ServerName:  candidate.Ip.String(),
 	}
-	if spoofDomains := SpoofDomains(); 0 < len(spoofDomains) {
+	if 0 < len(spoofDomains) {
 		profile.ServerName = spoofDomains[mathrand.Intn(len(spoofDomains))]
 	}
 	switch connectMode {
@@ -1029,11 +1056,14 @@ func extenderFeedConfig(
 	}
 }
 
-// The continent hint (DESIGNNOTES4.md §4).
+// The hint (DESIGNNOTES4.md §4).
 
-// Reads the operator's continent hint and applies it to the directory. An
-// empty answer is an operator that cannot place this client, which leaves
-// whatever the dns inference said. Reports whether the fetch completed.
+// Reads the operator's hint and applies it to the directory. An empty
+// continent is an operator that cannot place this client, which leaves
+// whatever the dns inference said; an empty country leaves the last one, stale.
+// A hint that cannot be had makes the country stale, so the network country
+// the host reports stands in for it (SpoofCountryCode). Reports whether the
+// fetch completed.
 func (self *ExtenderNetworkClient) refreshHint() bool {
 	hint := self.settings.Hint
 	if hint == nil {
@@ -1044,12 +1074,19 @@ func (self *ExtenderNetworkClient) refreshHint() bool {
 	}
 	ctx, cancel := context.WithTimeout(self.ctx, self.settings.HelloTimeout)
 	defer cancel()
-	continentCode, err := hint(ctx)
+	result, err := hint(ctx)
 	if err != nil {
 		self.log.Infof("[extender]hint err = %s\n", err)
+		self.directory.ExpireCountryHint()
 		return false
 	}
-	continentCode = strings.ToUpper(strings.TrimSpace(continentCode))
+	if result == nil {
+		result = &ExtenderHintResult{}
+	}
+	if countryCode := NormalizeSpoofCountryCode(result.CountryCode); self.directory.SetCountryHint(countryCode) {
+		self.log.Infof("[extender]country hint %s (operator)\n", countryCode)
+	}
+	continentCode := strings.ToUpper(strings.TrimSpace(result.ContinentCode))
 	if continentCode == "" {
 		return true
 	}
@@ -1062,7 +1099,7 @@ func (self *ExtenderNetworkClient) refreshHint() bool {
 	return true
 }
 
-func (self *ExtenderNetworkClient) hint(ctx context.Context) (string, error) {
+func (self *ExtenderNetworkClient) hint(ctx context.Context) (*ExtenderHintResult, error) {
 	return GetExtenderHint(ctx, self.clientStrategy, self.settings.ApiUrl)
 }
 
@@ -1379,12 +1416,13 @@ func probeExtenderCandidate(
 ) (*extenderCandidateProbe, error) {
 	count = max(1, count)
 	var resultErr error
+	spoofDomains, _ := directorySpoofDomains(directory)
 	for _, carrier := range orderedExtenderCarriers(candidate.Carriers) {
 		connectMode, ok := ExtenderConnectModeForCarrier(carrier)
 		if !ok {
 			continue
 		}
-		extenderConfig := extenderFeedConfig(candidate, connectMode)
+		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains)
 		if extenderConfig == nil {
 			continue
 		}

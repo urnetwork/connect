@@ -157,6 +157,13 @@ geo-DNS handed back *is* the client's, as judged by the same database). A
 client that has neither ranks by latency alone, which is today's behaviour
 plus measurement.
 
+The hint also carries the caller's `country_code`, which picks the spoof list
+a dial fronts with (EXTENDER.md A10, country lists). Where the hint cannot be
+fetched -- on a whitelist-only mobile network no operator address is routable
+-- the country falls back to the network country the host reports
+(`SetNetworkCountryCode`); a path change makes the hint's country stale and
+asks for the hint again.
+
 The probe pass runs after bootstrap and before the feed dial: up to `n` probes
 per extender, stopping once `m` candidates are "close enough" — within
 `ProbeCloseFactor × best` or under `ProbeCloseFloor`, whichever admits more,

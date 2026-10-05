@@ -9,49 +9,85 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
 
 // The operator side of extender proximity (DESIGNNOTES4.md, GEOMAP §2.5): the
-// continent hint a client reads, and the ping report a pinger posts.
+// hint a client reads, and the ping report a pinger posts.
 
 // The hint endpoint, appended to the api url.
 const ExtenderHintPath = "/network/extender-hint"
 
 // The hint answer: the continent the operator places the caller's address on,
-// upper case, the same mapping the geo dns and the record tag use; empty when
-// it cannot place the caller.
+// upper case, the same mapping the geo dns and the record tag use, and the
+// country, the ISO 3166-1 alpha-2 code a dial picks its spoof list by
+// (SpoofDomainsForCountry). Each is empty when the operator cannot place the
+// caller, and an operator that predates the country answers none.
 type ExtenderHintResult struct {
 	ContinentCode string `json:"continent_code"`
+	CountryCode   string `json:"country_code"`
 }
 
-// GetExtenderHint reads the continent hint (DESIGNNOTES4.md §4). It carries
-// no credential: the answer is derived from the caller's address, which the
-// operator sees on every request anyway, and a client needs it before it has
-// logged in.
+// GetExtenderHint reads the hint (DESIGNNOTES4.md §4), the continent upper
+// case and the country lower case, each empty when the operator did not place
+// the caller. It carries no credential: the answer is derived from the
+// caller's address, which the operator sees on every request anyway, and a
+// client needs it before it has logged in.
 func GetExtenderHint(
 	ctx context.Context,
 	clientStrategy *ClientStrategy,
 	apiUrl string,
-) (string, error) {
+) (*ExtenderHintResult, error) {
 	if clientStrategy == nil {
-		return "", fmt.Errorf("the extender hint needs a client strategy")
+		return nil, fmt.Errorf("the extender hint needs a client strategy")
 	}
 	apiUrl = strings.TrimRight(strings.TrimSpace(apiUrl), "/")
 	if apiUrl == "" {
-		return "", fmt.Errorf("the extender hint needs an api url")
+		return nil, fmt.Errorf("the extender hint needs an api url")
 	}
 	bodyBytes, err := HttpGetWithStrategyRaw(ctx, clientStrategy, apiUrl+ExtenderHintPath, "")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	result := &ExtenderHintResult{}
 	if err := json.Unmarshal(bodyBytes, result); err != nil {
-		return "", err
+		return nil, err
 	}
-	return strings.ToUpper(strings.TrimSpace(result.ContinentCode)), nil
+	return &ExtenderHintResult{
+		ContinentCode: strings.ToUpper(strings.TrimSpace(result.ContinentCode)),
+		CountryCode:   NormalizeSpoofCountryCode(result.CountryCode),
+	}, nil
+}
+
+// The country of the network this host is on, as the host reports it: the
+// mobile network's country on a phone (Android's
+// TelephonyManager.networkCountryIso while the default network is cellular),
+// and empty on any network whose country the host does not know. It is one
+// value for the process, because every network space of the process is on the
+// same network, and it is set before the spaces are built so their first
+// dials already use it.
+//
+// It never leaves the process. A directory falls back to it while the
+// operator's hint cannot place this client -- most of all while the hint
+// endpoint cannot be reached, which on a whitelist-only mobile network is
+// every operator address -- so a dial still draws its outer name from the
+// list of the country it is in (ExtenderDirectory.SpoofCountryCode).
+var networkCountryCode atomic.Value
+
+// Sets the network country (lower or upper case ISO 3166-1 alpha-2); anything
+// else, and empty, clears it. A directory reads it at each dial, so the change
+// is in force from the next dial on.
+func SetNetworkCountryCode(countryCode string) {
+	networkCountryCode.Store(NormalizeSpoofCountryCode(countryCode))
+}
+
+// The network country the host last set, lower case, empty for none.
+func NetworkCountryCode() string {
+	countryCode, _ := networkCountryCode.Load().(string)
+	return countryCode
 }
 
 // The ping report endpoint, appended to the api url (GEOMAP §2.5). It takes

@@ -155,7 +155,12 @@ func (self *extenderTransport) dialWithScope(
 	conn, response, err := connect.DialExtender(
 		ctx,
 		self.settings.ConnectSettings,
-		extenderGossipConfig(ip, port, publicKey),
+		extenderGossipConfig(
+			ip,
+			port,
+			publicKey,
+			connect.SpoofDomainsForCountry(self.settings.Directory.SpoofCountryCode()),
+		),
 		&connect.ExtenderDial{
 			Service: connect.ExtenderServiceGossip,
 		},
@@ -250,15 +255,21 @@ func extenderDialArgs(addr ma.Multiaddr) (netip.Addr, int, error) {
 }
 
 // The dial configuration of one gossip carrier (A10, E5). The outer name is one
-// random spoof domain; with no bundled list the extender ip is presented, which
-// puts no name in the ClientHello at all rather than naming the operator.
-func extenderGossipConfig(ip netip.Addr, port int, publicKey []byte) *connect.ExtenderConfig {
+// random name of `spoofDomains`, the list of the country the directory places
+// this node in; with an empty list the extender ip is presented, which puts no
+// name in the ClientHello at all rather than naming the operator.
+func extenderGossipConfig(
+	ip netip.Addr,
+	port int,
+	publicKey []byte,
+	spoofDomains []string,
+) *connect.ExtenderConfig {
 	profile := connect.ExtenderProfile{
 		ConnectMode: connect.ExtenderConnectModeTcpTls,
 		ServerName:  ip.String(),
 		Port:        port,
 	}
-	if spoofDomains := connect.SpoofDomains(); 0 < len(spoofDomains) {
+	if 0 < len(spoofDomains) {
 		profile.ServerName = spoofDomains[mathrand.Intn(len(spoofDomains))]
 	}
 	return &connect.ExtenderConfig{

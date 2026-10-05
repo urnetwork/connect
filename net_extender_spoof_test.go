@@ -169,7 +169,7 @@ func TestExtenderConfigsForCandidateUseSpoofDomainsAndRecordPorts(t *testing.T) 
 		DnsPort:  5353,
 		DnsTld:   "x.example.",
 	}
-	extenderConfigs := extenderConfigsForCandidate(candidate, "")
+	extenderConfigs := extenderConfigsForCandidate(candidate, "", SpoofDomains())
 	if len(extenderConfigs) != 3 {
 		t.Fatalf("configs = %d, expected one per carrier", len(extenderConfigs))
 	}
@@ -231,7 +231,7 @@ func TestExtenderConfigsForCandidateWithoutSpoofDomains(t *testing.T) {
 		Carriers: []string{ExtenderCarrierTcp},
 		TcpPort:  ExtenderTcpPort,
 	}
-	extenderConfigs := extenderConfigsForCandidate(candidate, "")
+	extenderConfigs := extenderConfigsForCandidate(candidate, "", SpoofDomains())
 	if len(extenderConfigs) != 1 {
 		t.Fatalf("configs = %d, expected one", len(extenderConfigs))
 	}
@@ -251,7 +251,7 @@ func TestExtenderFeedConfigServerName(t *testing.T) {
 	}
 
 	restoreEmpty := setSpoofDomainsForTest(nil)
-	extenderConfig := extenderFeedConfig(candidate, ExtenderConnectModeTcpTls)
+	extenderConfig := extenderFeedConfig(candidate, ExtenderConnectModeTcpTls, SpoofDomains())
 	restoreEmpty()
 	if extenderConfig == nil {
 		t.Fatal("no feed config was built")
@@ -261,7 +261,7 @@ func TestExtenderFeedConfigServerName(t *testing.T) {
 	}
 
 	restoreSpoof := setSpoofDomainsForTest([]string{"one.example"})
-	extenderConfig = extenderFeedConfig(candidate, ExtenderConnectModeTcpTls)
+	extenderConfig = extenderFeedConfig(candidate, ExtenderConnectModeTcpTls, SpoofDomains())
 	restoreSpoof()
 	if extenderConfig == nil {
 		t.Fatal("no feed config was built")
