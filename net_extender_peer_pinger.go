@@ -70,7 +70,9 @@ type ExtenderPeerPingerSettings struct {
 	// A peer is pinged again this long after its last ping, moved by the
 	// jitter. The default is half the day the operator keeps pings for, and
 	// the jitter keeps every refresh under twice this, so a peer's pings are
-	// always renewed before the last ones age out.
+	// always renewed before the last ones age out. The time the host slept
+	// counts toward it, as it does toward the operator's day
+	// (extenderElapsed).
 	RefreshTimeout time.Duration
 	// The fraction of RefreshTimeout a refresh is moved by, either way, drawn
 	// uniformly per ping. Outside [0, 1) it is the default, so a refresh never
@@ -472,7 +474,7 @@ func (self *ExtenderPeerPinger) samplePeers(now time.Time) map[string]extenderPe
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		refresh = self.sampleTime.IsZero() || self.settings.RefreshTimeout <= now.Sub(self.sampleTime)
+		refresh = self.sampleTime.IsZero() || self.settings.RefreshTimeout <= extenderElapsed(now, self.sampleTime)
 		nearestKeyHexes = self.nearestKeyHexes
 		nearVersion = self.nearVersion
 		for keyHex, peer := range self.peers {
@@ -657,7 +659,9 @@ func (self *ExtenderPeerPinger) schedule(now time.Time, keyHexTargets map[string
 			pingingCount += 1
 			continue
 		}
-		if !now.Before(peer.dueTime) {
+		// due once either clock reaches it, so a host that slept through the
+		// refresh pings at the next pass (extenderBefore)
+		if !extenderBefore(now, peer.dueTime) {
 			duePeers = append(duePeers, keyHex)
 		}
 	}

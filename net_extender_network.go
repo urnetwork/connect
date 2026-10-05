@@ -407,6 +407,11 @@ func (self *ExtenderNetworkClient) StatusMonitor() *MonitorValue[ExtenderNetwork
 // reports for the new path stands in until the operator answers for it, and
 // the hint loop asks the operator again at once, whatever a failure on the
 // old path had it waiting for.
+//
+// And it drops the latency samples, each of which measured the old path
+// (ExpireLatencies): the candidate order stops ranking by them, and the probe
+// pass that follows the first sample on the new path measures it, where the
+// old samples would have filled its window and kept it from probing.
 func (self *ExtenderNetworkClient) networkChanged() {
 	feedStream := func() *ExtenderFeedStream {
 		self.stateLock.Lock()
@@ -415,6 +420,7 @@ func (self *ExtenderNetworkClient) networkChanged() {
 		return self.feedStream
 	}()
 	self.directory.ExpireCountryHint()
+	self.directory.ExpireLatencies()
 	if feedStream != nil {
 		feedStream.Close()
 	}

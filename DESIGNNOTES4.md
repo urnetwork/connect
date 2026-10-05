@@ -213,8 +213,12 @@ reorder them.
 - The prior is a continent, not a metro. Two extenders on the same continent
   can be 100 ms apart; the probe is what tells them apart, and the prior only
   decides who gets probed first.
-- A latency sample is per address and per process. It is not persisted:
-  yesterday's path is not today's.
+- A latency sample is per address, per process and per path. It is not
+  persisted, and a path change drops it (`ExpireLatencies`): yesterday's path
+  is not today's, nor is the one before a path change. Its age is the longer
+  of what the monotonic and the wall clock say, so a host that slept past
+  `LatencyMaxAge` measures again (the monotonic clock stops while the host
+  sleeps), and a wall clock set back keeps it no longer.
 - The hint endpoint tells a client its own continent as the operator sees it.
   That is information the operator already holds and the client's own DNS
   resolver already acted on; it is not a new disclosure in either direction.

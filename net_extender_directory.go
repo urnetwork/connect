@@ -30,7 +30,12 @@ import (
 //
 // The policy numbers are all settings so a test can pin every transition, and
 // `Now` is the only clock the policy reads, so a fake clock makes the whole
-// policy deterministic.
+// policy deterministic. A time.Now reading carries a monotonic reading beside
+// the wall one, and the monotonic clock stops while the host sleeps, so a
+// latency sample's age and when a hold or a limit lapses are judged by
+// whichever of the two clocks has moved further (extenderElapsed,
+// extenderBefore): a sleep counts toward them, and a wall clock set back does
+// not extend them.
 //
 // Methods are safe for concurrent use. The state lock is never held across a
 // call to the store or to a monitor consumer; the save runs on the internal
@@ -114,6 +119,8 @@ type ExtenderDirectorySettings struct {
 	NetworkHosts []string
 
 	// Hold after a failure, doubling per consecutive failure up to the max.
+	// A hold lapses once either clock has passed it (extenderBefore), so the
+	// time the host slept counts toward it.
 	HoldTimeout    time.Duration
 	MaxHoldTimeout time.Duration
 	// Consecutive failures that make an address a warning.
@@ -169,13 +176,16 @@ type ExtenderDirectorySettings struct {
 	// (DESIGNNOTES4.md §4): the ordering stops trusting it and a probe pass
 	// measures the address again. The default is half the day the operator
 	// keeps pings for, so a provider's attested pings are renewed before the
-	// previous ones age out of what each derivation reads (GEOMAP §2.1). <= 0
-	// keeps a sample for the life of the process.
+	// previous ones age out of what each derivation reads (GEOMAP §2.1). The
+	// age counts the time the host slept (extenderElapsed), and a path change
+	// drops every sample whatever its age (ExpireLatencies). <= 0 keeps a
+	// sample until the path changes.
 	LatencyMaxAge time.Duration
 	// How long an address that answered 429 with no Retry-After is left alone
 	// before the jitter, which is the same +-50 % a Retry-After gets (A12). A
 	// limited address is never a failure: it orders after every healthy one
 	// until its backoff passes, and the probe pass and the feed dial skip it.
+	// A backoff passes like a hold, by either clock.
 	ExtenderLimitedBackoff time.Duration
 	// How long the operator's last country stands in once its hint is no
 	// longer current (SpoofCountryCode), by the wall clock from the operator's
@@ -271,7 +281,8 @@ type extenderDirectoryAddress struct {
 
 	// the latest latency sample (DESIGNNOTES4.md): the lowest rtt of one
 	// probe pass, when it was taken and whether the target co-signed a claim
-	// of that pass (GEOMAP §2.3). Per process; never stored.
+	// of that pass (GEOMAP §2.3). Per process and per path: never stored, and
+	// dropped by a path change (ExpireLatencies).
 	latency         time.Duration
 	latencyTime     time.Time
 	latencyAttested bool
@@ -1103,8 +1114,11 @@ func (self *ExtenderDirectory) RecordFailure(ip netip.Addr, connectMode Extender
 // it answered with, or ExtenderLimitedBackoff when it gave none, jittered by
 // +-50 % and never past MaxHoldTimeout. A limit is not a failure: no failure
 // count, no hold, nothing toward removal. A later backoff is never shortened
-// by an earlier one. Returns when the address stops being limited, zero for an
-// address the directory does not know, which it records nothing for.
+// by an earlier one still in force; one that has passed by either clock is
+// replaced, even when the monotonic clock alone, stopped while the host slept,
+// would still place it after the new one. Returns when the address stops being
+// limited, zero for an address the directory does not know, which it records
+// nothing for.
 func (self *ExtenderDirectory) RecordLimited(ip netip.Addr, retryAfter time.Duration) time.Time {
 	if !ip.IsValid() {
 		return time.Time{}
@@ -1124,7 +1138,8 @@ func (self *ExtenderDirectory) RecordLimited(ip netip.Addr, retryAfter time.Dura
 		return time.Time{}
 	}
 	address.lastUseTime = now
-	if limitedUntilTime := now.Add(backoff); address.limitedUntilTime.Before(limitedUntilTime) {
+	if limitedUntilTime := now.Add(backoff); !extenderBefore(now, address.limitedUntilTime) ||
+		address.limitedUntilTime.Before(limitedUntilTime) {
 		address.limitedUntilTime = limitedUntilTime
 	}
 	if self.log.V(2).Enabled() {
@@ -1147,7 +1162,7 @@ func (self *ExtenderDirectory) AddressLimitedUntil(ip netip.Addr) time.Time {
 	defer self.stateLock.Unlock()
 
 	address := self.ipAddresses[ip]
-	if address == nil || !now.Before(address.limitedUntilTime) {
+	if address == nil || !extenderBefore(now, address.limitedUntilTime) {
 		return time.Time{}
 	}
 	return address.limitedUntilTime
@@ -1300,8 +1315,9 @@ func directorySpoofDomains(directory *ExtenderDirectory) ([]string, string) {
 // lowest rtt it measured and whether the target co-signed a claim of that
 // pass (DESIGNNOTES4.md, GEOMAP §2.3) -- a claim merely sent, refused or left
 // without a verdict does not count. The sample is per process and ages out
-// after LatencyMaxAge; it is never stored, because yesterday's path is not
-// today's.
+// after LatencyMaxAge, the time the host slept included; it is never stored,
+// because yesterday's path is not today's, and a path change drops it for the
+// same reason (ExpireLatencies).
 func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, attested bool) {
 	if !ip.IsValid() || rtt <= 0 {
 		return
@@ -1325,6 +1341,36 @@ func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, a
 	}
 	// a measured record is preferred by the active cap
 	self.tierUpdateAddressWithLock(address, now)
+	self.changedWithLock()
+}
+
+// Drops every latency sample: the path changed, and each one measured the old
+// path (DESIGNNOTES4.md §6). Every address counts as never measured from here,
+// so the candidate order stops ranking by the old path's rtt and the window
+// of the next probe pass, which follows the first sample taken on the new
+// path, is empty and measures again. The rest of the local evidence --
+// successes, failures, holds and limits -- stays.
+func (self *ExtenderDirectory) ExpireLatencies() {
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	changed := false
+	for _, address := range self.ipAddresses {
+		if address.latencyTime.IsZero() {
+			continue
+		}
+		address.latency = 0
+		address.latencyTime = time.Time{}
+		address.latencyAttested = false
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	// a measured record that is not near or kept falls back to the rest
+	self.tierRebuildWithLock(now)
 	self.changedWithLock()
 }
 
@@ -1477,7 +1523,7 @@ func splitExtenderLimitedAddresses(
 	healthyAddresses := []*extenderDirectoryAddress{}
 	limitedAddresses := []*extenderDirectoryAddress{}
 	for _, address := range addresses {
-		if now.Before(address.limitedUntilTime) {
+		if extenderBefore(now, address.limitedUntilTime) {
 			limitedAddresses = append(limitedAddresses, address)
 		} else {
 			healthyAddresses = append(healthyAddresses, address)
@@ -1528,7 +1574,7 @@ func (self *ExtenderDirectory) retainedExpiredAddressesWithLock(
 		if ipVersion != 0 && addressIpVersion(ip) != ipVersion {
 			continue
 		}
-		if now.Before(address.holdUntilTime) {
+		if extenderBefore(now, address.holdUntilTime) {
 			continue
 		}
 		if !retained[address.publicKeyHex] {
@@ -1554,7 +1600,7 @@ func (self *ExtenderDirectory) usableAddressesWithLock(
 		if ipVersion != 0 && addressIpVersion(ip) != ipVersion {
 			continue
 		}
-		if now.Before(address.holdUntilTime) {
+		if extenderBefore(now, address.holdUntilTime) {
 			continue
 		}
 		if !self.addressDialableWithLock(address) {
@@ -1624,7 +1670,8 @@ func (self *ExtenderDirectory) continentTierWithLock(address *extenderDirectoryA
 }
 
 // The current latency sample of an address, and whether there is one: a sample
-// exists, is younger than LatencyMaxAge and, when `attesting`, was attested.
+// exists, is younger than LatencyMaxAge by either clock and, when `attesting`,
+// was attested.
 func (self *ExtenderDirectory) latencyWithLock(
 	address *extenderDirectoryAddress,
 	now time.Time,
@@ -1636,7 +1683,7 @@ func (self *ExtenderDirectory) latencyWithLock(
 	if attesting && !address.latencyAttested {
 		return 0, false
 	}
-	if 0 < self.settings.LatencyMaxAge && self.settings.LatencyMaxAge <= now.Sub(address.latencyTime) {
+	if 0 < self.settings.LatencyMaxAge && self.settings.LatencyMaxAge <= extenderElapsed(now, address.latencyTime) {
 		return 0, false
 	}
 	return address.latency, true
@@ -1720,7 +1767,7 @@ func (self *ExtenderDirectory) candidateWithLock(
 		DnsTld:    DefaultExtenderDnsTld,
 		Source:    address.source,
 	}
-	if now.Before(address.limitedUntilTime) {
+	if extenderBefore(now, address.limitedUntilTime) {
 		candidate.LimitedUntil = address.limitedUntilTime
 	}
 	if latency, measured := self.latencyWithLock(address, now, false); measured {
@@ -2196,7 +2243,7 @@ func (self *ExtenderDirectory) UsableCount(ipVersion int) int {
 		if ipVersion != 0 && addressIpVersion(ip) != ipVersion {
 			continue
 		}
-		if now.Before(address.holdUntilTime) {
+		if extenderBefore(now, address.holdUntilTime) {
 			continue
 		}
 		if !self.addressDialableWithLock(address) {
@@ -2252,7 +2299,7 @@ func (self *ExtenderDirectory) AddressUsable(ip netip.Addr) bool {
 	if address == nil {
 		return false
 	}
-	if now.Before(address.holdUntilTime) {
+	if extenderBefore(now, address.holdUntilTime) {
 		return false
 	}
 	if !self.addressDialableWithLock(address) {
@@ -2280,7 +2327,7 @@ func (self *ExtenderDirectory) addressStateWithLock(
 			return ExtenderStateExpired
 		}
 	}
-	if now.Before(address.holdUntilTime) {
+	if extenderBefore(now, address.holdUntilTime) {
 		return ExtenderStateHold
 	}
 	if 0 < self.settings.WarningConsecutiveFailureCount &&
@@ -2700,6 +2747,26 @@ func addressIpVersion(ip netip.Addr) int {
 	default:
 		return 0
 	}
+}
+
+// The time from `t` to `now` as the directory's policy counts it: the longer of
+// what the monotonic clock and the wall clock say. Go compares two readings of
+// time.Now by their monotonic parts alone, and the monotonic clock stops while
+// the host sleeps (mach_absolute_time on darwin, CLOCK_MONOTONIC on linux and
+// android), so alone it would not count a sleep; the wall clock alone can be
+// set back, which would make what came before it young again. The longer of
+// the two counts a sleep and outlasts a clock set back. A time with no
+// monotonic reading -- one loaded from the store, or a fake clock's -- is
+// counted by the wall clock alone, as it always was.
+func extenderElapsed(now time.Time, t time.Time) time.Duration {
+	return max(now.Sub(t), now.Round(0).Sub(t.Round(0)))
+}
+
+// Whether `now` is before `t` by both clocks: what was set to last until `t`,
+// a hold or a limit, has lapsed once either clock reaches it, for the reasons
+// of extenderElapsed. A zero `t`, nothing set, is never in force.
+func extenderBefore(now time.Time, t time.Time) bool {
+	return now.Before(t) && now.Round(0).Before(t.Round(0))
 }
 
 func extenderTimeMs(t time.Time) int64 {
