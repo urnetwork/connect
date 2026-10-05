@@ -201,9 +201,9 @@ func (self *appStandardDetector) match(ipPath *IpPath, payload []byte, first boo
 	return SecurityPolicyReasonUnknown, 0, false
 }
 
-// open reports whether payload opens a candidate: the opener of a two-packet
-// standard, or a WhatsApp stream prefix that continues in later segments,
-// which only the flow's first payload (first) can start.
+// Reports whether payload opens a candidate: the opener of a two-packet
+// standard, or a WhatsApp stream prefix that continues in later segments, which
+// only the flow's first payload (first) can start.
 func (self *appStandardDetector) open(ipPath *IpPath, payload []byte, first bool) (appCandidate, bool) {
 	if !self.enabled() {
 		return appCandidate{}, false
@@ -238,9 +238,9 @@ func (self *appStandardDetector) open(ipPath *IpPath, payload []byte, first bool
 	return appCandidate{}, false
 }
 
-// confirm reports whether payload confirms candidate. A WhatsApp candidate
-// whose prefix continues in a later segment keeps its progress in candidate
-// and returns SecurityPolicyReasonInspecting.
+// Reports whether payload confirms candidate. A WhatsApp candidate whose prefix
+// continues in a later segment keeps its progress in candidate and returns
+// SecurityPolicyReasonInspecting.
 func (self *appStandardDetector) confirm(candidate *appCandidate, ipPath *IpPath, payload []byte) (SecurityPolicyReason, bool) {
 	if !self.enabled() {
 		return SecurityPolicyReasonUnknown, false
@@ -486,11 +486,13 @@ var (
 	whatsAppHeaderMagic = []byte{'W', 'A'}
 )
 
+// Reports whether a destination port is one the native apps reach the chat
+// service on: whatsAppChatPort or whatsAppHttpsPort.
 func isWhatsAppPort(port int) bool {
 	return port == whatsAppChatPort || port == whatsAppHttpsPort
 }
 
-// whatsAppField is the part of the stream prefix the parser reads next.
+// The part of the stream prefix the parser reads next.
 type whatsAppField uint8
 
 const (
@@ -506,6 +508,8 @@ const (
 	whatsAppFieldEphemeral
 )
 
+// How far the stream prefix has parsed: not WhatsApp's, continuing in a later
+// segment, or complete through the ephemeral key.
 type whatsAppProgress uint8
 
 const (
@@ -514,8 +518,8 @@ const (
 	whatsAppMatched
 )
 
-// whatsAppStream parses the start of a WhatsApp client stream. Between
-// segments it keeps only counters, never payload bytes.
+// Parses the start of a WhatsApp client stream. Between segments it keeps only
+// counters, never payload bytes.
 type whatsAppStream struct {
 	field whatsAppField
 	// bytes of the current fixed-size field read so far
@@ -528,8 +532,8 @@ type whatsAppStream struct {
 	frameLength uint32
 }
 
-// consume parses the next segment of the stream. Once the ephemeral key is
-// complete it returns whatsAppMatched and the offset in b where the key ends.
+// Parses the next segment of the stream. Once the ephemeral key is complete it
+// returns whatsAppMatched and the offset in b where the key ends.
 func (self *whatsAppStream) consume(b []byte) (whatsAppProgress, int) {
 	for i := 0; i < len(b); {
 		c := b[i]
@@ -656,8 +660,8 @@ func (self *whatsAppStream) consume(b []byte) (whatsAppProgress, int) {
 	return whatsAppNeedMore, len(b)
 }
 
-// whatsAppNoise recognizes a first payload that carries the whole stream
-// prefix and returns the end of the ephemeral key.
+// Recognizes a first payload that carries the whole stream prefix and returns
+// the end of the ephemeral key.
 func whatsAppNoise(b []byte) (int, bool) {
 	var stream whatsAppStream
 	progress, end := stream.consume(b)

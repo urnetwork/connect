@@ -433,27 +433,27 @@ func TestStandingReserveTargetTable(t *testing.T) {
 		want             int
 	}{
 		// the speed window's shape: fixed size 1, hard max 4
-		{"speed window", 1, 4, true, false, false, 2},
+		{name: "speed window", target: 1, hardMax: 4, standingReserve: true, fixedDestination: false, stickyExit: false, want: 2},
 		// the quality window's default shape: its memory ceiling prevents
 		// the reserve from adding a seventh full client graph
-		{"quality window at memory ceiling", 6, 6, true, false, false, 6},
+		{name: "quality window at memory ceiling", target: 6, hardMax: 6, standingReserve: true, fixedDestination: false, stickyExit: false, want: 6},
 		// the hard max is a hard bound: the spare never breaches it
-		{"at hard max", 4, 4, true, false, false, 4},
+		{name: "at hard max", target: 4, hardMax: 4, standingReserve: true, fixedDestination: false, stickyExit: false, want: 4},
 		// 0 hard max is unbounded, as everywhere else
-		{"no hard max", 2, 0, true, false, false, 3},
+		{name: "no hard max", target: 2, hardMax: 0, standingReserve: true, fixedDestination: false, stickyExit: false, want: 3},
 		// target 0 is a disabled window (a non-active fixed-profile window);
 		// a spare would silently re-enable it
-		{"disabled window", 0, 12, true, false, false, 0},
+		{name: "disabled window", target: 0, hardMax: 12, standingReserve: true, fixedDestination: false, stickyExit: false, want: 0},
 		// the A/B off switch restores exact-target sizing
-		{"reserve off", 3, 12, false, false, false, 3},
+		{name: "reserve off", target: 3, hardMax: 12, standingReserve: false, fixedDestination: false, stickyExit: false, want: 3},
 		// a fixed destination set cannot produce a spare; asking would leave
 		// every expand pass waiting out its timeout on args that cannot come
-		{"fixed destination", 3, 12, true, true, false, 3},
+		{name: "fixed destination", target: 3, hardMax: 12, standingReserve: true, fixedDestination: true, stickyExit: false, want: 3},
 		// the user's Fixed IP as the apps send it: size 1 and hard max 0, so
 		// the hard max never bounded the spare. A sticky window holds none
-		{"fixed ip window", 1, 0, true, false, true, 1},
+		{name: "fixed ip window", target: 1, hardMax: 0, standingReserve: true, fixedDestination: false, stickyExit: true, want: 1},
 		// a sticky window that is not the active one stays disabled
-		{"disabled fixed ip window", 0, 0, true, false, true, 0},
+		{name: "disabled fixed ip window", target: 0, hardMax: 0, standingReserve: true, fixedDestination: false, stickyExit: true, want: 0},
 	}
 
 	for _, c := range cases {
@@ -508,9 +508,9 @@ func TestStandingReserveSourceAnchor(t *testing.T) {
 
 // --- item 6: the user's Fixed IP (a sticky window) ---
 
-// fixedIpTestProfile is the profile every app sends for Fixed IP: a fixed
-// window type with window min = max = 1, which the sdk turns into
-// FixedWindowSize 1, and WindowSizeHardMax left at 0.
+// The profile every app sends for Fixed IP: a fixed window type with window min
+// = max = 1, which the sdk turns into FixedWindowSize 1, and WindowSizeHardMax
+// left at 0.
 func fixedIpTestProfile(windowType WindowType) *PerformanceProfile {
 	return &PerformanceProfile{
 		WindowType: windowType,
@@ -522,8 +522,8 @@ func fixedIpTestProfile(windowType WindowType) *PerformanceProfile {
 	}
 }
 
-// unfixedTestProfile is the apps' Quality or Speed profile without Fixed IP:
-// window min 2, max 4, which the sdk leaves unfixed.
+// The apps' Quality or Speed profile without Fixed IP: window min 2, max 4,
+// which the sdk leaves unfixed.
 func unfixedTestProfile(windowType WindowType) *PerformanceProfile {
 	return &PerformanceProfile{
 		WindowType: windowType,
@@ -580,9 +580,9 @@ func TestLifetimeDrainDue(t *testing.T) {
 	AssertEqual(t, lifetimeDrainDue(future, now, true), false)
 }
 
-// stickyTestWindow runs a live window -- resize, the enumerator and the
-// watchdogs -- of one type and profile against a generator, with the fast
-// passes of TestWindowResizeTargetHeldWhileDegraded.
+// A live window -- resize, the enumerator and the watchdogs -- of one type and
+// profile against a generator, with the fast passes of
+// TestWindowResizeTargetHeldWhileDegraded.
 func stickyTestWindow(
 	t *testing.T,
 	generator MultiClientGenerator,
@@ -623,10 +623,10 @@ func stickyTestWindow(
 	)
 }
 
-// stickyTestTarget is the resize target an empty live window publishes. An
-// empty window computes the same target on every pass, and publishes it for
-// the length of each expand, so the first published value decides it; a
-// short tail of further samples guards against reading a transient.
+// The resize target an empty live window publishes. An empty window computes
+// the same target on every pass, and publishes it for the length of each
+// expand, so the first published value decides it; a short tail of further
+// samples guards against reading a transient.
 func stickyTestTarget(t *testing.T, window *multiClientWindow) int {
 	t.Helper()
 	maxTarget := 0
@@ -672,9 +672,9 @@ func TestAutoAndUnfixedWindowsKeepStandingReserve(t *testing.T) {
 		// the computed target plus the one spare
 		want int
 	}{
-		{"auto speed window", WindowTypeSpeed, nil, 2},
-		{"speed without fixed ip", WindowTypeSpeed, unfixedTestProfile(WindowTypeSpeed), 3},
-		{"quality without fixed ip", WindowTypeQuality, unfixedTestProfile(WindowTypeQuality), 3},
+		{name: "auto speed window", windowType: WindowTypeSpeed, performanceProfile: nil, want: 2},
+		{name: "speed without fixed ip", windowType: WindowTypeSpeed, performanceProfile: unfixedTestProfile(WindowTypeSpeed), want: 3},
+		{name: "quality without fixed ip", windowType: WindowTypeQuality, performanceProfile: unfixedTestProfile(WindowTypeQuality), want: 3},
 	}
 	for _, c := range cases {
 		window := stickyTestWindow(t, &testingEmptyMultiClientGenerator{}, c.windowType, c.performanceProfile)
@@ -684,10 +684,9 @@ func TestAutoAndUnfixedWindowsKeepStandingReserve(t *testing.T) {
 	}
 }
 
-// stickyTestPastLifetimeChannel is a bare exit past its lifetime: its first
-// event was two lifetimes ago, so its removeTime has passed. It has no
-// transport, no traffic and no flows, which reads as healthy (0/0), so a
-// resize pass judges it on the lifetime alone.
+// A bare exit past its lifetime: its first event was two lifetimes ago, so its
+// removeTime has passed. It has no transport, no traffic and no flows, which
+// reads as healthy (0/0), so a resize pass judges it on the lifetime alone.
 func stickyTestPastLifetimeChannel() *multiClientChannel {
 	client := stallTestChannel()
 	client.ctx = context.Background()
@@ -705,8 +704,7 @@ func stickyTestPastLifetimeChannel() *multiClientChannel {
 	return client
 }
 
-// installStickyTestChannel puts an exit in the live window as expand admits
-// one, and wakes resize.
+// Puts an exit in the live window as expand admits one, and wakes resize.
 func installStickyTestChannel(window *multiClientWindow, client *multiClientChannel) {
 	func() {
 		window.stateLock.Lock()
@@ -717,12 +715,11 @@ func installStickyTestChannel(window *multiClientWindow, client *multiClientChan
 	window.resizeMonitor.NotifyAll()
 }
 
-// waitStickyTestResizePasses waits until resize has read the exit's stats on
-// at least `passes` separate passes. In a bare window only the resize pass
-// reads a bare exit's stats (it has no blackhole or ping loop of its own),
-// and every read of a traffic-free exit moves lastHealthyTime, so each
-// observed move is at least one pass; by the second, the first pass's
-// classification has finished.
+// Waits until resize has read the exit's stats on at least `passes` separate
+// passes. In a bare window only the resize pass reads a bare exit's stats (it
+// has no blackhole or ping loop of its own), and every read of a traffic-free
+// exit moves lastHealthyTime, so each observed move is at least one pass; by
+// the second, the first pass's classification has finished.
 func waitStickyTestResizePasses(t *testing.T, client *multiClientChannel, passes int) {
 	t.Helper()
 	lastHealthyTime := func() time.Time {
@@ -774,10 +771,10 @@ func TestAutoSpeedWindowStillDrains(t *testing.T) {
 		windowType         WindowType
 		performanceProfile *PerformanceProfile
 	}{
-		{"auto speed window", WindowTypeSpeed, nil},
-		{"auto quality window", WindowTypeQuality, nil},
-		{"speed without fixed ip", WindowTypeSpeed, unfixedTestProfile(WindowTypeSpeed)},
-		{"quality without fixed ip", WindowTypeQuality, unfixedTestProfile(WindowTypeQuality)},
+		{name: "auto speed window", windowType: WindowTypeSpeed, performanceProfile: nil},
+		{name: "auto quality window", windowType: WindowTypeQuality, performanceProfile: nil},
+		{name: "speed without fixed ip", windowType: WindowTypeSpeed, performanceProfile: unfixedTestProfile(WindowTypeSpeed)},
+		{name: "quality without fixed ip", windowType: WindowTypeQuality, performanceProfile: unfixedTestProfile(WindowTypeQuality)},
 	}
 	for _, c := range cases {
 		window := stickyTestWindow(t, &testingEmptyMultiClientGenerator{}, c.windowType, c.performanceProfile)

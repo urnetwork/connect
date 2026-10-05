@@ -304,12 +304,12 @@ func (self *DohSettings) ResolverIp() string {
 // before the destination is reached.
 const DefaultDnsUpgradeMaskAddress = "65.49.70.65"
 
-// DefaultDnsUpgradeMaskAddressIpv6 is the IPv6 counterpart of
-// DefaultDnsUpgradeMaskAddress: the plain-DNS destination the sdk advertises
-// for the tunnel's IPv6 DNS (sdk DefaultTunnelDnsAddressIpv6 carries the same
-// literal). It is a documentation-prefix address (RFC 3849), so a query that
-// ever escaped the tunnel could reach no host, and its host part mirrors the
-// IPv4 mask digits so the two are recognizable together.
+// The IPv6 counterpart of DefaultDnsUpgradeMaskAddress: the plain-DNS
+// destination the sdk advertises for the tunnel's IPv6 DNS (sdk
+// DefaultTunnelDnsAddressIpv6 carries the same literal). It is a
+// documentation-prefix address (RFC 3849), so a query that ever escaped the
+// tunnel could reach no host, and its host part mirrors the IPv4 mask digits so
+// the two are recognizable together.
 const DefaultDnsUpgradeMaskAddressIpv6 = "2001:db8::65:49:70:65"
 
 type DnsResolverSettings struct {

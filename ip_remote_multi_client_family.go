@@ -34,8 +34,8 @@ const defaultIpFamilyStarvedRetryTimeout = 60 * time.Second
 type enumeratedDestination struct {
 	destination MultiHopId
 	stats       DestinationStats
-	// stickyRedial marks a sticky window's lost exit, asked for by name
-	// ahead of discovery (see enumerateStickyRedial)
+	// Marks a sticky window's lost exit, asked for by name ahead of discovery
+	// (see enumerateStickyRedial)
 	stickyRedial bool
 }
 

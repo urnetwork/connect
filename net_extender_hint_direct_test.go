@@ -50,6 +50,7 @@ type testRelayExtender struct {
 	relayAddrs map[string]bool
 }
 
+// Listens on the v4 loopback and relays until the test ends.
 func newTestRelayExtender(t *testing.T) *testRelayExtender {
 	t.Helper()
 	certPem, keyPem, err := selfSign([]string{"127.0.0.1"}, "relay-extender", time.Hour, 24*time.Hour)
@@ -93,6 +94,7 @@ func newTestRelayExtender(t *testing.T) *testRelayExtender {
 	return self
 }
 
+// The port the extender listens on.
 func (self *testRelayExtender) port() int {
 	return self.listener.Addr().(*net.TCPAddr).Port
 }
@@ -108,6 +110,7 @@ func (self *testRelayExtender) track(conn net.Conn) bool {
 	return true
 }
 
+// Closes the listener and every connection, and joins the workers.
 func (self *testRelayExtender) close() {
 	self.listener.Close()
 	func() {
@@ -202,6 +205,8 @@ type testHintOperator struct {
 	relayedHintCount int
 }
 
+// Serves the operator on the v4 loopback until the test ends. With no
+// extender every request is placed as one that arrived directly.
 func newTestHintOperator(t *testing.T, extender *testRelayExtender) *testHintOperator {
 	t.Helper()
 	self := &testHintOperator{
@@ -212,14 +217,18 @@ func newTestHintOperator(t *testing.T, extender *testRelayExtender) *testHintOpe
 	return self
 }
 
+// The operator's base url.
 func (self *testHintOperator) url() string {
 	return self.server.URL
 }
 
+// The address the operator listens on, as a dial names it.
 func (self *testHintOperator) addr() string {
 	return self.server.Listener.Addr().String()
 }
 
+// Answers the hint with the place of the address the request arrived from,
+// and counts the requests.
 func (self *testHintOperator) serve(w http.ResponseWriter, r *http.Request) {
 	relayed := self.extender != nil && self.extender.relayed(r.RemoteAddr)
 	hint := r.URL.Path == ExtenderHintPath
@@ -272,6 +281,8 @@ type testHintRoutes struct {
 	directDialCount atomic.Int64
 }
 
+// The relay, the operator, and a client strategy over both routes. configure,
+// when set, changes the strategy settings before the strategy is built.
 func newTestHintRoutes(t *testing.T, configure func(settings *ClientStrategySettings)) *testHintRoutes {
 	t.Helper()
 	self := &testHintRoutes{}
@@ -463,53 +474,52 @@ func TestExtenderHintIsReadDirectly(t *testing.T) {
 // A strategy that relays every request -- a manual extender carries every
 // request of its strategy, a proxy every dial -- dials nothing direct. The
 // hint has no direct path there and fails without a dial, rather than being
-// the one request that goes direct.
-func TestExtenderHintHasNoDirectPathWhereEveryRequestIsRelayed(t *testing.T) {
-	t.Run("manual extender", func(t *testing.T) {
-		routes := newTestHintRoutes(t, func(settings *ClientStrategySettings) {
-			settings.ExtenderConfigs = nil
-		})
-		routes.clientStrategy.SetCustomExtenders(map[netip.Addr]string{
-			netip.MustParseAddr("192.0.2.1"): "",
-		})
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if result, err := GetExtenderHint(ctx, routes.clientStrategy, routes.operator.url()); err == nil {
-			t.Errorf("the hint answered %+v with a manual extender", *result)
-		}
-		if directDialCount := routes.directDialCount.Load(); directDialCount != 0 {
-			t.Errorf("the hint dialed the operator directly %d times with a manual extender", directDialCount)
-		}
-		if _, hintCount, _ := routes.operator.counts(); hintCount != 0 {
-			t.Errorf("the operator answered %d hints", hintCount)
-		}
+// the one request that goes direct. Here the manual extender.
+func TestExtenderHintHasNoDirectPathWhereEveryRequestIsRelayedByAManualExtender(t *testing.T) {
+	routes := newTestHintRoutes(t, func(settings *ClientStrategySettings) {
+		settings.ExtenderConfigs = nil
+	})
+	routes.clientStrategy.SetCustomExtenders(map[netip.Addr]string{
+		netip.MustParseAddr("192.0.2.1"): "",
 	})
 
-	t.Run("proxy", func(t *testing.T) {
-		operator := newTestHintOperator(t, nil)
-		proxy := newTestCountingListener(t)
-		// no dial seam: an injected dial would take the place of the proxy
-		settings := DefaultClientStrategySettings()
-		settings.ConnectSettings.ProxySettings = &ProxySettings{
-			Network: "tcp",
-			Address: proxy.listener.Addr().String(),
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		clientStrategy := NewClientStrategy(ctx, settings)
-		defer clientStrategy.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if result, err := GetExtenderHint(ctx, routes.clientStrategy, routes.operator.url()); err == nil {
+		t.Errorf("the hint answered %+v with a manual extender", *result)
+	}
+	if directDialCount := routes.directDialCount.Load(); directDialCount != 0 {
+		t.Errorf("the hint dialed the operator directly %d times with a manual extender", directDialCount)
+	}
+	if _, hintCount, _ := routes.operator.counts(); hintCount != 0 {
+		t.Errorf("the operator answered %d hints", hintCount)
+	}
+}
 
-		if result, err := GetExtenderHint(ctx, clientStrategy, operator.url()); err == nil {
-			t.Errorf("the hint answered %+v with a proxy", *result)
-		}
-		if count := proxy.count.Load(); count != 0 {
-			t.Errorf("the hint dialed the proxy %d times", count)
-		}
-		if _, hintCount, _ := operator.counts(); hintCount != 0 {
-			t.Errorf("the operator answered %d hints read past the proxy", hintCount)
-		}
-	})
+// The same for a strategy whose every dial crosses a proxy.
+func TestExtenderHintHasNoDirectPathWhereEveryRequestIsRelayedByAProxy(t *testing.T) {
+	operator := newTestHintOperator(t, nil)
+	proxy := newTestCountingListener(t)
+	// no dial seam: an injected dial would take the place of the proxy
+	settings := DefaultClientStrategySettings()
+	settings.ConnectSettings.ProxySettings = &ProxySettings{
+		Network: "tcp",
+		Address: proxy.listener.Addr().String(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	clientStrategy := NewClientStrategy(ctx, settings)
+	defer clientStrategy.Close()
+
+	if result, err := GetExtenderHint(ctx, clientStrategy, operator.url()); err == nil {
+		t.Errorf("the hint answered %+v with a proxy", *result)
+	}
+	if count := proxy.count.Load(); count != 0 {
+		t.Errorf("the hint dialed the proxy %d times", count)
+	}
+	if _, hintCount, _ := operator.counts(); hintCount != 0 {
+		t.Errorf("the operator answered %d hints read past the proxy", hintCount)
+	}
 }
 
 // A listener that counts the connections it is offered and closes each at
@@ -520,6 +530,7 @@ type testCountingListener struct {
 	count    atomic.Int64
 }
 
+// Listens on the v4 loopback until the test ends.
 func newTestCountingListener(t *testing.T) *testCountingListener {
 	t.Helper()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")

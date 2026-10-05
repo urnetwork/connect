@@ -170,10 +170,12 @@ func (self *ClientStrategy) MemoryOwnerCensus() ApiOwnerCensus {
 	self.mutex.Unlock()
 	if resolver := self.internalDohResolver; resolver != nil {
 		if cache := resolver.getCache(); cache != nil {
-			cache.stateLock.Lock()
-			out.InternalDnsEntries = int64(len(cache.queryResultExpiration))
-			out.InternalDnsInflight = int64(len(cache.inflight))
-			cache.stateLock.Unlock()
+			func() {
+				cache.stateLock.Lock()
+				defer cache.stateLock.Unlock()
+				out.InternalDnsEntries = int64(len(cache.queryResultExpiration))
+				out.InternalDnsInflight = int64(len(cache.inflight))
+			}()
 		}
 	}
 	return out

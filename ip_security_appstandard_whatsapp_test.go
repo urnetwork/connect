@@ -20,23 +20,24 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// The port the flows below are sent to.
 const whatsAppTestPort = whatsAppChatPort
 
+// Appends one length-delimited protobuf field to b.
 func whatsAppTestBytesField(b []byte, field protowire.Number, value []byte) []byte {
 	b = protowire.AppendTag(b, field, protowire.BytesType)
 	return protowire.AppendBytes(b, value)
 }
 
-// whatsAppTestXxHello is the Noise XX first message whatsmeow and Baileys
-// send: HandshakeMessage{clientHello (2): {ephemeral (1)}}, 36 bytes.
+// The Noise XX first message whatsmeow and Baileys send:
+// HandshakeMessage{clientHello (2): {ephemeral (1)}}, 36 bytes.
 func whatsAppTestXxHello(seed string) []byte {
 	hello := whatsAppTestBytesField(nil, 1, appTestBytes(seed+"-ephemeral", 32))
 	return whatsAppTestBytesField(nil, 2, hello)
 }
 
-// whatsAppTestIkHello is the Noise IK first message of the mobile protocol
-// (consonance): the ephemeral key, the encrypted static key (32 + 16) and the
-// encrypted payload.
+// The Noise IK first message of the mobile protocol (consonance): the ephemeral
+// key, the encrypted static key (32 + 16) and the encrypted payload.
 func whatsAppTestIkHello(seed string, payloadLength int) []byte {
 	hello := whatsAppTestBytesField(nil, 1, appTestBytes(seed+"-ephemeral", 32))
 	hello = whatsAppTestBytesField(hello, 2, appTestBytes(seed+"-static", 48))
@@ -44,9 +45,8 @@ func whatsAppTestIkHello(seed string, payloadLength int) []byte {
 	return whatsAppTestBytesField(nil, 2, hello)
 }
 
-// whatsAppTestLargeHello is a hello larger than one segment, with the newer
-// ClientHello fields of whatsmeow's waWa6 protobuf: pqMode (9) and
-// extendedEphemeral (10).
+// A hello larger than one segment, with the newer ClientHello fields of
+// whatsmeow's waWa6 protobuf: pqMode (9) and extendedEphemeral (10).
 func whatsAppTestLargeHello(seed string, extendedLength int) []byte {
 	hello := whatsAppTestBytesField(nil, 1, appTestBytes(seed+"-ephemeral", 32))
 	hello = protowire.AppendTag(hello, 9, protowire.VarintType)
@@ -55,7 +55,7 @@ func whatsAppTestLargeHello(seed string, extendedLength int) []byte {
 	return whatsAppTestBytesField(nil, 2, hello)
 }
 
-// whatsAppTestClientFinish is the XX third message:
+// The XX third message:
 // HandshakeMessage{clientFinish (4): {static (1), payload (2)}}.
 func whatsAppTestClientFinish(seed string, payloadLength int) []byte {
 	finish := whatsAppTestBytesField(nil, 1, appTestBytes(seed+"-static", 48))
@@ -63,35 +63,35 @@ func whatsAppTestClientFinish(seed string, payloadLength int) []byte {
 	return whatsAppTestBytesField(nil, 4, finish)
 }
 
-// whatsAppTestFrame prefixes a frame with its 3-byte big-endian length.
+// Prefixes a frame with its 3-byte big-endian length.
 func whatsAppTestFrame(data []byte) []byte {
 	return appTestCat([]byte{byte(len(data) >> 16), byte(len(data) >> 8), byte(len(data))}, data)
 }
 
+// The connection header: 'W','A' and the two version bytes.
 func whatsAppTestHeader(major byte, minor byte) []byte {
 	return []byte{'W', 'A', major, minor}
 }
 
-// whatsAppTestEdge is the edge routing prefix: 'E','D',0,1, then the routing
-// info with its 3-byte big-endian length.
+// The edge routing prefix: 'E','D',0,1, then the routing info with its 3-byte
+// big-endian length.
 func whatsAppTestEdge(routing []byte) []byte {
 	return appTestCat([]byte{'E', 'D', 0, 1}, whatsAppTestFrame(routing))
 }
 
-// whatsAppTestRouting is 4 bytes of routing info starting with 0x08, the
-// shape nDPI's WhatsApp signature matches.
+// 4 bytes of routing info starting with 0x08, the shape nDPI's WhatsApp
+// signature matches.
 func whatsAppTestRouting(seed string) []byte {
 	return appTestCat([]byte{0x08}, appTestBytes(seed+"-routing", 3))
 }
 
-// whatsAppTestTransport is a transport frame: ciphertext and its 16-byte tag.
+// A transport frame: ciphertext and its 16-byte tag.
 func whatsAppTestTransport(seed string, length int) []byte {
 	return whatsAppTestFrame(appTestBytes(seed, length))
 }
 
-// whatsAppTestWebFlow is the layout whatsmeow and Baileys write: the header
-// and the XX hello at once, the client finish after the server hello, then
-// transport frames.
+// The layout whatsmeow and Baileys write: the header and the XX hello at once,
+// the client finish after the server hello, then transport frames.
 func whatsAppTestWebFlow(seed string) [][]byte {
 	return [][]byte{
 		appTestCat(whatsAppTestHeader(6, 3), whatsAppTestFrame(whatsAppTestXxHello(seed))),
@@ -101,9 +101,9 @@ func whatsAppTestWebFlow(seed string) [][]byte {
 	}
 }
 
-// whatsAppTestNativeFlow is the mobile layout as yowsup writes it: the edge
-// header, the routing info and the header (yowsup's version 4.0) in separate
-// segments, then the IK hello and transport frames.
+// The mobile layout as yowsup writes it: the edge header, the routing info and
+// the header (yowsup's version 4.0) in separate segments, then the IK hello and
+// transport frames.
 func whatsAppTestNativeFlow(seed string) [][]byte {
 	return [][]byte{
 		{'E', 'D', 0, 1},
@@ -116,8 +116,8 @@ func whatsAppTestNativeFlow(seed string) [][]byte {
 	}
 }
 
-// requireWhatsAppEncrypted requires every payload long enough to judge to
-// exercise the encrypted heuristic; shorter prefix segments are inconclusive.
+// Requires every payload long enough to judge to exercise the encrypted
+// heuristic; shorter prefix segments are inconclusive.
 func requireWhatsAppEncrypted(t *testing.T, name string, payloads [][]byte) {
 	t.Helper()
 	for _, payload := range payloads {
@@ -127,8 +127,8 @@ func requireWhatsAppEncrypted(t *testing.T, name string, payloads [][]byte) {
 	}
 }
 
-// requireWhatsAppAllowed requires a flow whose payloads look encrypted to be
-// dropped without the detector, and admitted with it.
+// Requires a flow whose payloads look encrypted to be dropped without the
+// detector, and admitted with it.
 func requireWhatsAppAllowed(t *testing.T, name string, payloads [][]byte, allowAt int) {
 	t.Helper()
 	requireWhatsAppEncrypted(t, name, payloads)
@@ -141,8 +141,8 @@ func requireWhatsAppAllowed(t *testing.T, name string, payloads [][]byte, allowA
 	requireWhatsAppAdmitted(t, name, payloads, allowAt)
 }
 
-// requireWhatsAppAdmitted requires the flow to be admitted from packet allowAt
-// on, never dropped, for the whatsapp reason.
+// Requires the flow to be admitted from packet allowAt on, never dropped, for
+// the whatsapp reason.
 func requireWhatsAppAdmitted(t *testing.T, name string, payloads [][]byte, allowAt int) {
 	t.Helper()
 	detector := newAppTestDetector(nil)
@@ -161,6 +161,10 @@ func requireWhatsAppAdmitted(t *testing.T, name string, payloads [][]byte, allow
 	}
 }
 
+// Both public layouts, the edge prefix with the hello, a header or frame
+// length written ahead of the hello, a hello across segments and every
+// version byte below 16 are admitted, where without the detector the
+// encrypted heuristic drops them.
 func TestDmcaWhatsAppNoiseFlowsAllowed(t *testing.T) {
 	web := whatsAppTestWebFlow("wa-web")
 
@@ -208,6 +212,10 @@ func TestDmcaWhatsAppNoiseFlowsAllowed(t *testing.T) {
 	}
 }
 
+// Openings that leave the layout anywhere -- the header, the edge prefix, the
+// frame, the hello's fields or lengths, or the position in the flow -- are
+// dropped as encrypted, and so is a WhatsApp opening on another port or over
+// udp.
 func TestDmcaWhatsAppNoiseNearMissesDrop(t *testing.T) {
 	header := whatsAppTestHeader(6, 3)
 	ephemeral := whatsAppTestBytesField(nil, 1, appTestBytes("wa-near-ephemeral", 32))
@@ -233,30 +241,30 @@ func TestDmcaWhatsAppNoiseNearMissesDrop(t *testing.T) {
 		payloads [][]byte
 	}{
 		// a random 3-byte length prefix without the connection header
-		{"frames without the header", appTestCat2(frame, transports...)},
-		{"header with a random 3-byte length", first(appTestCat(header, appTestBytes("wa-near-random-length", 3), hello))},
+		{name: "frames without the header", payloads: appTestCat2(frame, transports...)},
+		{name: "header with a random 3-byte length", payloads: first(appTestCat(header, appTestBytes("wa-near-random-length", 3), hello))},
 		// near-miss headers
-		{"lowercase header", first(appTestCat([]byte{'w', 'a', 6, 3}, frame))},
-		{"swapped header", first(appTestCat([]byte{'A', 'W', 6, 3}, frame))},
-		{"protocol version 16", first(appTestCat(whatsAppTestHeader(16, 3), frame))},
-		{"dictionary version 16", first(appTestCat(whatsAppTestHeader(6, 16), frame))},
-		{"edge header version 2", first(appTestCat([]byte{'E', 'D', 0, 2}, whatsAppTestFrame(whatsAppTestRouting("wa-near")), header, frame))},
-		{"routing info past the bound", first(appTestCat([]byte{'E', 'D', 0, 1}, withLength(whatsAppMaxRoutingInfoLength+1, appTestBytes("wa-near-routing", 300))))},
-		{"routing length overruns the header", first(appTestCat([]byte{'E', 'D', 0, 1}, withLength(6, whatsAppTestRouting("wa-near")), header, frame))},
+		{name: "lowercase header", payloads: first(appTestCat([]byte{'w', 'a', 6, 3}, frame))},
+		{name: "swapped header", payloads: first(appTestCat([]byte{'A', 'W', 6, 3}, frame))},
+		{name: "protocol version 16", payloads: first(appTestCat(whatsAppTestHeader(16, 3), frame))},
+		{name: "dictionary version 16", payloads: first(appTestCat(whatsAppTestHeader(6, 16), frame))},
+		{name: "edge header version 2", payloads: first(appTestCat([]byte{'E', 'D', 0, 2}, whatsAppTestFrame(whatsAppTestRouting("wa-near")), header, frame))},
+		{name: "routing info past the bound", payloads: first(appTestCat([]byte{'E', 'D', 0, 1}, withLength(whatsAppMaxRoutingInfoLength+1, appTestBytes("wa-near-routing", 300))))},
+		{name: "routing length overruns the header", payloads: first(appTestCat([]byte{'E', 'D', 0, 1}, withLength(6, whatsAppTestRouting("wa-near")), header, frame))},
 		// near-miss frames
-		{"server hello first", first(appTestCat(header, whatsAppTestFrame(whatsAppTestBytesField(nil, 3, inner))))},
-		{"client finish first", first(appTestCat(header, whatsAppTestFrame(whatsAppTestBytesField(nil, 4, inner))))},
-		{"33-byte ephemeral", first(appTestCat(header, whatsAppTestFrame(whatsAppTestBytesField(nil, 2, appTestCat(whatsAppTestBytesField(nil, 1, appTestBytes("wa-near-33", 33)), static, payload)))))},
-		{"static before ephemeral", first(appTestCat(header, whatsAppTestFrame(whatsAppTestBytesField(nil, 2, appTestCat(static, ephemeral, payload)))))},
-		{"frame length one more", first(appTestCat(header, withLength(len(hello)+1, appTestCat(hello, []byte{0}))))},
-		{"frame length one less", first(appTestCat(header, withLength(len(hello)-1, hello)))},
-		{"padded clientHello length", first(appTestCat(header, whatsAppTestFrame(paddedVarint), appTestBytes("wa-near-padded", 220)))},
-		{"frame shorter than a hello", first(appTestCat(header, whatsAppTestFrame(shortKey), appTestBytes("wa-near-shortkey", 220)))},
-		{"frame longer than the bound", first(appTestCat(header, withLength(whatsAppMaxHelloFrameLength+1, hello)))},
+		{name: "server hello first", payloads: first(appTestCat(header, whatsAppTestFrame(whatsAppTestBytesField(nil, 3, inner))))},
+		{name: "client finish first", payloads: first(appTestCat(header, whatsAppTestFrame(whatsAppTestBytesField(nil, 4, inner))))},
+		{name: "33-byte ephemeral", payloads: first(appTestCat(header, whatsAppTestFrame(whatsAppTestBytesField(nil, 2, appTestCat(whatsAppTestBytesField(nil, 1, appTestBytes("wa-near-33", 33)), static, payload)))))},
+		{name: "static before ephemeral", payloads: first(appTestCat(header, whatsAppTestFrame(whatsAppTestBytesField(nil, 2, appTestCat(static, ephemeral, payload)))))},
+		{name: "frame length one more", payloads: first(appTestCat(header, withLength(len(hello)+1, appTestCat(hello, []byte{0}))))},
+		{name: "frame length one less", payloads: first(appTestCat(header, withLength(len(hello)-1, hello)))},
+		{name: "padded clientHello length", payloads: first(appTestCat(header, whatsAppTestFrame(paddedVarint), appTestBytes("wa-near-padded", 220)))},
+		{name: "frame shorter than a hello", payloads: first(appTestCat(header, whatsAppTestFrame(shortKey), appTestBytes("wa-near-shortkey", 220)))},
+		{name: "frame longer than the bound", payloads: first(appTestCat(header, withLength(whatsAppMaxHelloFrameLength+1, hello)))},
 		// the prefix only starts a flow and must keep its structure
-		{"header not first", [][]byte{appTestBytes("wa-near-lead", 300), appTestCat(header, frame), transports[0]}},
-		{"segmented prefix that diverges", [][]byte{{'E', 'D', 0, 1}, whatsAppTestFrame(whatsAppTestRouting("wa-near-div")), appTestBytes("wa-near-div", 300)}},
-		{"header alone then random", [][]byte{header, appTestBytes("wa-near-alone", 300)}},
+		{name: "header not first", payloads: [][]byte{appTestBytes("wa-near-lead", 300), appTestCat(header, frame), transports[0]}},
+		{name: "segmented prefix that diverges", payloads: [][]byte{{'E', 'D', 0, 1}, whatsAppTestFrame(whatsAppTestRouting("wa-near-div")), appTestBytes("wa-near-div", 300)}},
+		{name: "header alone then random", payloads: [][]byte{header, appTestBytes("wa-near-alone", 300)}},
 	}
 	for _, c := range cases {
 		if 32 <= len(c.payloads[0]) {
@@ -275,6 +283,8 @@ func TestDmcaWhatsAppNoiseNearMissesDrop(t *testing.T) {
 	requireDropWithoutAllow(t, "udp", IpProtocolUdp, whatsAppTestPort, first(appTestCat(header, frame)))
 }
 
+// A BitTorrent signature anywhere in an admitted WhatsApp flow, even right
+// behind the key, is an incident.
 func TestDmcaWhatsAppNoiseBittorrentPrecedence(t *testing.T) {
 	web := whatsAppTestWebFlow("wa-bt")
 	native := whatsAppTestNativeFlow("wa-bt-native")
@@ -289,11 +299,11 @@ func TestDmcaWhatsAppNoiseBittorrentPrecedence(t *testing.T) {
 		name     string
 		payloads [][]byte
 	}{
-		{"web hello then handshake", [][]byte{web[0], btHandshake()}},
-		{"hello carrying a handshake after the key", [][]byte{carrying}},
-		{"native prefix then handshake", [][]byte{native[0], native[1], btHandshake()}},
-		{"native flow then tracker", appTestCat2(native[0], append(append([][]byte{}, native[1:5]...), tracker)...)},
-		{"header alone then handshake", [][]byte{whatsAppTestHeader(6, 3), btHandshake()}},
+		{name: "web hello then handshake", payloads: [][]byte{web[0], btHandshake()}},
+		{name: "hello carrying a handshake after the key", payloads: [][]byte{carrying}},
+		{name: "native prefix then handshake", payloads: [][]byte{native[0], native[1], btHandshake()}},
+		{name: "native flow then tracker", payloads: appTestCat2(native[0], append(append([][]byte{}, native[1:5]...), tracker)...)},
+		{name: "header alone then handshake", payloads: [][]byte{whatsAppTestHeader(6, 3), btHandshake()}},
 	}
 	for _, c := range cases {
 		verdicts := classifyAll(newAppTestDetector(nil), IpProtocolTcp, 48100, whatsAppTestPort, c.payloads...)
@@ -303,6 +313,8 @@ func TestDmcaWhatsAppNoiseBittorrentPrecedence(t *testing.T) {
 	}
 }
 
+// The master switch, nil settings and the detector's own toggle each restore
+// the drop; the other detectors and the messaging exception do not gate it.
 func TestDmcaWhatsAppNoiseDisabledRestoreDrop(t *testing.T) {
 	flows := map[string][][]byte{
 		"web":    whatsAppTestWebFlow("wa-web"),
@@ -357,7 +369,7 @@ func TestDmcaWhatsAppNoiseBeforeMetaException(t *testing.T) {
 		}
 		return verdicts, reasons
 	}
-	const meta = "157.240.0.53"
+	meta := metaTestAddress(t, 4, 0)
 
 	_, webReasons := flow(meta, whatsAppTestWebFlow("wa-meta-web")...)
 	for i, reason := range webReasons {
@@ -389,13 +401,16 @@ func TestDmcaWhatsAppNoiseBeforeMetaException(t *testing.T) {
 				t.Fatalf("%s to Meta packet %d = %d/%s, want allow/allow-messaging", name, i, verdicts[i], reasons[i])
 			}
 		}
-		verdicts, _ = flow("8.8.8.8", payloads...)
+		verdicts, _ = flow(metaTestOutsideAddress, payloads...)
 		if _, verdict := firstDecision(verdicts); verdict != dmcaDropEncrypted {
 			t.Fatalf("%s outside Meta = %v, want drop", name, verdicts)
 		}
 	}
 }
 
+// The detector is consulted on the chat port and on 443, only for a flow's
+// first payload, and never on other ports or over udp; on 443 the policy
+// admits the flow as privileged before any detector runs.
 func TestWhatsAppNoisePorts(t *testing.T) {
 	app := newAppStandardDetector(DefaultAppStandardSettings())
 	opening := whatsAppTestWebFlow("wa-ports")[0]
@@ -566,6 +581,8 @@ func TestDmcaWhatsAppPendingPrefixIsBounded(t *testing.T) {
 	requireDropWithoutAllow(t, "routing info past the bound", IpProtocolTcp, whatsAppTestPort, [][]byte{tooLong})
 }
 
+// Seeded random payloads, alone and behind a valid header, frame length and
+// tag, never match.
 func TestWhatsAppNoiseRejectsRandomPayloads(t *testing.T) {
 	app := newAppStandardDetector(DefaultAppStandardSettings())
 	path := appTestPath(IpProtocolTcp, 1, whatsAppTestPort, false)
@@ -602,6 +619,7 @@ func TestWhatsAppNoiseRejectsRandomPayloads(t *testing.T) {
 	}
 }
 
+// Matching an opening and carrying a prefix across segments do not allocate.
 func TestWhatsAppNoiseDetectorZeroAlloc(t *testing.T) {
 	app := newAppStandardDetector(DefaultAppStandardSettings())
 	path := appTestPath(IpProtocolTcp, 1, whatsAppTestPort, false)
@@ -628,9 +646,8 @@ func TestWhatsAppNoiseDetectorZeroAlloc(t *testing.T) {
 	}
 }
 
-// FuzzWhatsAppNoiseDetector cross-checks every match against protowire's
-// parser, and checks that cutting the bytes into two segments never changes
-// the outcome.
+// Cross-checks every match against protowire's parser, and checks that cutting
+// the bytes into two segments never changes the outcome.
 func FuzzWhatsAppNoiseDetector(f *testing.F) {
 	for _, payloads := range [][][]byte{whatsAppTestWebFlow("fuzz-wa"), whatsAppTestNativeFlow("fuzz-wa")} {
 		for _, payload := range payloads {

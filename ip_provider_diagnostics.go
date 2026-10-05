@@ -27,7 +27,7 @@ import (
 // build and are identified only by the hash.
 const SecurityPolicyRulesGeneration uint64 = 2
 
-// SecurityPolicyGeneration returns the rules generation a policy enforces:
+// The rules generation a policy enforces:
 // SecurityPolicyRulesGeneration for the built-in policy in either direction,
 // whatever its memory-scaled settings, and 0 (unknown) for a disabled or
 // custom policy.

@@ -929,23 +929,23 @@ func TestPeekClaim(t *testing.T) {
 		packet []byte
 		want   peekResult
 	}{
-		{"v4 tcp 80", mkv4(tcp, 80), peekHttp},
-		{"v4 tcp 53", mkv4(tcp, 53), peekDns},
-		{"v4 tcp 443", mkv4(tcp, 443), peekTls},
-		{"v4 udp 53", mkv4(udp, 53), peekDns},
-		{"v4 udp 4500", mkv4(udp, 4500), peekOther},
-		{"v4 icmp", mkv4(icmp, 0), peekOther},
-		{"v6 tcp 80", mkv6(tcp, 80), peekHttp},
-		{"v6 tcp 53", mkv6(tcp, 53), peekDns},
-		{"v6 tcp 443", mkv6(tcp, 443), peekTls},
-		{"v6 udp 53", mkv6(udp, 53), peekDns},
-		{"v4 tcp 853", mkv4(tcp, 853), peekDot},
-		{"v6 tcp 853", mkv6(tcp, 853), peekDot},
-		{"v4 udp 853", mkv4(udp, 853), peekOther},
-		{"v6 udp 853", mkv6(udp, 853), peekOther},
-		{"v6 extension header", mkv6(hopopt, 80), peekUndecided},
-		{"short", []byte{0x45, 0x00}, peekUndecided},
-		{"empty", nil, peekUndecided},
+		{name: "v4 tcp 80", packet: mkv4(tcp, 80), want: peekHttp},
+		{name: "v4 tcp 53", packet: mkv4(tcp, 53), want: peekDns},
+		{name: "v4 tcp 443", packet: mkv4(tcp, 443), want: peekTls},
+		{name: "v4 udp 53", packet: mkv4(udp, 53), want: peekDns},
+		{name: "v4 udp 4500", packet: mkv4(udp, 4500), want: peekOther},
+		{name: "v4 icmp", packet: mkv4(icmp, 0), want: peekOther},
+		{name: "v6 tcp 80", packet: mkv6(tcp, 80), want: peekHttp},
+		{name: "v6 tcp 53", packet: mkv6(tcp, 53), want: peekDns},
+		{name: "v6 tcp 443", packet: mkv6(tcp, 443), want: peekTls},
+		{name: "v6 udp 53", packet: mkv6(udp, 53), want: peekDns},
+		{name: "v4 tcp 853", packet: mkv4(tcp, 853), want: peekDot},
+		{name: "v6 tcp 853", packet: mkv6(tcp, 853), want: peekDot},
+		{name: "v4 udp 853", packet: mkv4(udp, 853), want: peekOther},
+		{name: "v6 udp 853", packet: mkv6(udp, 853), want: peekOther},
+		{name: "v6 extension header", packet: mkv6(hopopt, 80), want: peekUndecided},
+		{name: "short", packet: []byte{0x45, 0x00}, want: peekUndecided},
+		{name: "empty", packet: nil, want: peekUndecided},
 	}
 	for _, c := range cases {
 		var seg tlsSegment
@@ -1506,12 +1506,12 @@ func TestUpgradeMuxShedMemory(t *testing.T) {
 
 // --- DoT toward the DNS stand-in (Android Private DNS) ---
 
-// dotTestSourcePort is the client port of the DoT probes below.
+// The client port of the DoT probes below.
 const dotTestSourcePort = 47053
 
-// dotTestSyn is the first segment of a DoT dial: a TCP SYN from the tunnel to
-// port 853 of a destination, with a valid checksum so the reset built from it
-// can be checked end to end.
+// The first segment of a DoT dial: a TCP SYN from the tunnel to port 853 of a
+// destination, with a valid checksum so the reset built from it can be checked
+// end to end.
 func dotTestSyn(source netip.Addr, destination netip.Addr, seq uint32) []byte {
 	sourceIp := net.IP(source.AsSlice())
 	destinationIp := net.IP(destination.AsSlice())
@@ -1536,7 +1536,7 @@ func dotTestSyn(source netip.Addr, destination netip.Addr, seq uint32) []byte {
 	return packet
 }
 
-// dotTestStandIn is the default DNS stand-in of one family.
+// The default DNS stand-in of one family.
 func dotTestStandIn(ipVersion int) netip.Addr {
 	if ipVersion == 6 {
 		return netip.MustParseAddr(DefaultDnsUpgradeMaskAddressIpv6)
@@ -1544,15 +1544,16 @@ func dotTestStandIn(ipVersion int) netip.Addr {
 	return netip.MustParseAddr(DefaultDnsUpgradeMaskAddress)
 }
 
-// dotTestResolver is a real DoT resolver of one family (Quad9).
+// A DoT resolver of one family that is not a DNS stand-in, at a documentation
+// address.
 func dotTestResolver(ipVersion int) netip.Addr {
 	if ipVersion == 6 {
-		return netip.MustParseAddr("2620:fe::fe")
+		return netip.MustParseAddr("2001:db8::853")
 	}
-	return netip.MustParseAddr("9.9.9.9")
+	return netip.MustParseAddr("198.51.100.53")
 }
 
-// newDotTestMux is an UpgradeMux with the given settings over a recorder.
+// An UpgradeMux with the given settings over a recorder.
 func newDotTestMux(t *testing.T, settings *UpgradeMuxSettings) (*UpgradeMux, *ipMuxRecorder) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1567,9 +1568,9 @@ func newDotTestMux(t *testing.T, settings *UpgradeMuxSettings) (*UpgradeMux, *ip
 	return mux, rec
 }
 
-// assertDotTestReset checks that the only downstream packet is the reset a
-// closed port answers a SYN with: RST|ACK acknowledging the SYN, from the
-// stand-in's 853 back to the probe's port, with a valid checksum.
+// Checks that the only downstream packet is the reset a closed port answers a
+// SYN with: RST|ACK acknowledging the SYN, from the stand-in's 853 back to the
+// probe's port, with a valid checksum.
 func assertDotTestReset(t *testing.T, rec *ipMuxRecorder, source netip.Addr, destination netip.Addr, seq uint32) {
 	t.Helper()
 	rec.mu.Lock()
@@ -1682,19 +1683,21 @@ func TestUpgradeMuxDotToResolverPassesThrough(t *testing.T) {
 		if sent := mux.SendPacketBatch(TransferPath{}, protocol.ProvideMode_Network, [][]byte{slices.Clone(syn)}, 0); sent != 1 {
 			t.Fatalf("batch forwarded %d packets, want 1", sent)
 		}
-		rec.mu.Lock()
-		defer rec.mu.Unlock()
-		if len(rec.received) != 0 {
-			t.Fatalf("DoT to %s was answered locally", resolver)
-		}
-		if len(rec.sent) != 2 {
-			t.Fatalf("DoT to %s forwarded %d packets, want 2", resolver, len(rec.sent))
-		}
-		for _, forwarded := range rec.sent {
-			if !slices.Equal(forwarded, syn) {
-				t.Fatalf("DoT to %s was rewritten on its way out", resolver)
+		func() {
+			rec.mu.Lock()
+			defer rec.mu.Unlock()
+			if len(rec.received) != 0 {
+				t.Fatalf("DoT to %s was answered locally", resolver)
 			}
-		}
+			if len(rec.sent) != 2 {
+				t.Fatalf("DoT to %s forwarded %d packets, want 2", resolver, len(rec.sent))
+			}
+			for _, forwarded := range rec.sent {
+				if !slices.Equal(forwarded, syn) {
+					t.Fatalf("DoT to %s was rewritten on its way out", resolver)
+				}
+			}
+		}()
 	})
 }
 

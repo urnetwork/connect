@@ -88,12 +88,12 @@ type DmcaSecurityPolicySettings struct {
 	// Nil disables all gaming exceptions.
 	Gaming *GamingSecurityPolicySettings
 
-	// Messaging configures provider-scoped messaging exceptions (WhatsApp on
-	// Meta's own address space). They are evaluated after positive BitTorrent
-	// signatures and the application standards, as the backstop for the
-	// WhatsApp Noise detector, but before the encrypted heuristic, and an
-	// allowed flow keeps checking the signatures for its whole inspection
-	// budget. Nil disables all messaging exceptions.
+	// Provider-scoped messaging exceptions (WhatsApp on Meta's own address
+	// space). They are evaluated after positive BitTorrent signatures and the
+	// application standards, as the backstop for the WhatsApp Noise detector,
+	// but before the encrypted heuristic, and an allowed flow keeps checking
+	// the signatures for its whole inspection budget. Nil disables all
+	// messaging exceptions.
 	Messaging *MessagingSecurityPolicySettings
 
 	// App configures the positive application-standard detectors (WireGuard,
@@ -465,9 +465,8 @@ func (self *dmcaFlowState) allowAppStandard(reason SecurityPolicyReason, setting
 	return dmcaAllow, reason, false
 }
 
-// holdAppCandidate keeps a pending application candidate. Its packet consumes
-// budget but is not counted as encrypted, so the budget still ends the flow's
-// inspection.
+// Keeps a pending application candidate. Its packet consumes budget but is not
+// counted as encrypted, so the budget still ends the flow's inspection.
 func (self *dmcaFlowState) holdAppCandidate(candidate appCandidate, settings *DmcaSecurityPolicySettings) (dmcaVerdict, SecurityPolicyReason, bool) {
 	self.appCandidate = candidate
 	if settings.InspectionPacketBudget <= self.inspectedPackets {

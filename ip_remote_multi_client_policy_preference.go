@@ -1,10 +1,5 @@
 package connect
 
-import (
-	"sync/atomic"
-	"time"
-)
-
 // Prefer providers that enforce at least the client's own security policy
 // rules after a provider with older rules blocked this client's traffic.
 //
@@ -30,12 +25,21 @@ import (
 // field and providers that have not reported yet; it never counts as current.
 // The inputs are what providers already send; nothing new leaves the device.
 
-// providerPolicyDemerit is a whole evidence-of-failure step (see
-// effectiveTier): a provider that is not current falls behind every current
-// provider of the next tier, so a retry is not raced back onto older rules in
-// preference to a slightly lower ranked current provider.
+import (
+	"sync/atomic"
+	"time"
+)
+
+// A whole evidence-of-failure step (see effectiveTier): a provider that is not
+// current falls behind every current provider of the next tier, so a retry is
+// not raced back onto older rules in preference to a slightly lower ranked
+// current provider.
 const providerPolicyDemerit = 2
 
+// The client's preference for current providers. Every window channel shares
+// one: the generation, ttl and clock are fixed at construction and the arm
+// time is atomic, so it is safe for concurrent use. A nil preference is no
+// preference.
 type providerPolicyPreference struct {
 	// the client's own rules generation, never 0
 	generation uint64
@@ -47,10 +51,9 @@ type providerPolicyPreference struct {
 	untilUnixNanos atomic.Int64
 }
 
-// newProviderPolicyPreference returns nil (no preference) when ttl is not
-// positive or the client's own generation is unknown, since a client with no
-// generation of its own has nothing to compare providers against. now nil
-// uses time.Now.
+// Returns nil (no preference) when ttl is not positive or the client's own
+// generation is unknown, since a client with no generation of its own has
+// nothing to compare providers against. now nil uses time.Now.
 func newProviderPolicyPreference(generation uint64, ttl time.Duration, now func() time.Time) *providerPolicyPreference {
 	if generation == 0 || ttl <= 0 {
 		return nil
@@ -65,9 +68,8 @@ func newProviderPolicyPreference(generation uint64, ttl time.Duration, now func(
 	}
 }
 
-// current reports whether a provider's generation is at least the client's
-// own. Unknown (0) is never current. With no preference every provider is
-// current.
+// Reports whether a provider's generation is at least the client's own. Unknown
+// (0) is never current. With no preference every provider is current.
 func (self *providerPolicyPreference) current(providerGeneration uint64) bool {
 	if self == nil {
 		return true
@@ -75,10 +77,10 @@ func (self *providerPolicyPreference) current(providerGeneration uint64) bool {
 	return providerGeneration != 0 && self.generation <= providerGeneration
 }
 
-// observe compares a provider's newly accepted diagnostics with its previous
-// snapshot (nil before the first) and arms the preference when the provider is
-// not current and reports more dropped outbound packets of this client than
-// before. Returns true when this call armed a lapsed preference.
+// Compares a provider's newly accepted diagnostics with its previous snapshot
+// (nil before the first) and arms the preference when the provider is not
+// current and reports more dropped outbound packets of this client than before.
+// Returns true when this call armed a lapsed preference.
 func (self *providerPolicyPreference) observe(previous *ProviderDiagnostics, next *ProviderDiagnostics) bool {
 	if self == nil || next == nil {
 		return false
@@ -106,6 +108,7 @@ func (self *providerPolicyPreference) observe(previous *ProviderDiagnostics, nex
 	}
 }
 
+// Reports whether the preference is armed now. A nil preference never is.
 func (self *providerPolicyPreference) active() bool {
 	if self == nil {
 		return false
@@ -113,7 +116,7 @@ func (self *providerPolicyPreference) active() bool {
 	return self.now().UnixNano() < self.untilUnixNanos.Load()
 }
 
-// demerit is the effectiveTier step for a provider of the given generation:
+// The effectiveTier step for a provider of the given generation:
 // providerPolicyDemerit while the preference is armed and the provider is not
 // current, else 0.
 func (self *providerPolicyPreference) demerit(providerGeneration uint64) int {
@@ -123,8 +126,8 @@ func (self *providerPolicyPreference) demerit(providerGeneration uint64) int {
 	return providerPolicyDemerit
 }
 
-// policyPreference is the parent's preference, which reaches the channel on its
-// args. nil (no preference) for bare fixtures.
+// The parent's preference, which reaches the channel on its args. nil (no
+// preference) for bare fixtures.
 func (self *multiClientChannel) policyPreference() *providerPolicyPreference {
 	if self.args == nil {
 		return nil
@@ -132,8 +135,8 @@ func (self *multiClientChannel) policyPreference() *providerPolicyPreference {
 	return self.args.providerPolicyPreference
 }
 
-// providerPolicyGeneration is the rules generation the provider last reported,
-// 0 (unknown) before its first diagnostics.
+// The rules generation the provider last reported, 0 (unknown) before its first
+// diagnostics.
 func (self *multiClientChannel) providerPolicyGeneration() uint64 {
 	if diagnostics := self.providerDiagnostics.Load(); diagnostics != nil {
 		return diagnostics.SecurityPolicyGeneration
@@ -141,8 +144,8 @@ func (self *multiClientChannel) providerPolicyGeneration() uint64 {
 	return 0
 }
 
-// observeProviderDiagnostics feeds one accepted diagnostics snapshot to the
-// preference and names the arming in the log.
+// Feeds one accepted diagnostics snapshot to the preference and names the
+// arming in the log.
 func (self *multiClientChannel) observeProviderDiagnostics(previous *ProviderDiagnostics, next *ProviderDiagnostics) {
 	preference := self.policyPreference()
 	if !preference.observe(previous, next) {

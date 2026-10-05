@@ -110,9 +110,9 @@ type ExtenderNetworkClientSettings struct {
 	// the mesh deliver, and are never removed by policy.
 	ManualHosts []string
 
-	// DohSettings configures the bootstrap resolution. Nil takes the DoH
-	// settings the strategy has in force at each pass, which a user's
-	// bootstrap DoH servers replace on a running strategy.
+	// The bootstrap resolution. Nil takes the DoH settings the strategy has in
+	// force at each pass, which a user's bootstrap DoH servers replace on a
+	// running strategy.
 	DohSettings *DohSettings
 
 	// The only clock this client reads. Tests install a fake one.
@@ -154,11 +154,10 @@ type ExtenderNetworkClientSettings struct {
 		extenderConfig *ExtenderConfig,
 		attestor *ExtenderProbeAttestor,
 	) (*ExtenderLatencyProbe, error)
-	// Hint, when set, replaces the hint fetch. Nil reads
-	// /network/extender-hint through direct dialers alone, built from the
-	// client strategy's settings (GetExtenderHint). An empty field with no
-	// error is an operator that cannot place the caller; an error is an
-	// operator that cannot be asked.
+	// When set, replaces the hint fetch. Nil reads /network/extender-hint
+	// through direct dialers alone, built from the client strategy's settings
+	// (GetExtenderHint). An empty field with no error is an operator that
+	// cannot place the caller; an error is an operator that cannot be asked.
 	Hint func(ctx context.Context) (*ExtenderHintResult, error)
 }
 
@@ -1100,6 +1099,8 @@ func (self *ExtenderNetworkClient) refreshHint() bool {
 	return true
 }
 
+// The hint fetch when settings.Hint is nil: GetExtenderHint through the
+// client strategy's direct dialers.
 func (self *ExtenderNetworkClient) hint(ctx context.Context) (*ExtenderHintResult, error) {
 	return GetExtenderHint(ctx, self.clientStrategy, self.settings.ApiUrl)
 }

@@ -54,6 +54,7 @@ type ControlDohUrlError struct {
 	Detail string
 }
 
+// The code, then the detail when there is one.
 func (self *ControlDohUrlError) Error() string {
 	if self.Detail == "" {
 		return fmt.Sprintf("control doh: %s", self.Code)
@@ -71,10 +72,9 @@ func ControlDohUrlErrorCode(err error) string {
 	return ""
 }
 
-// ParseControlDohUrl reads one bootstrap DoH server url. It returns the url in
-// the form the DoH client queries -- trimmed, a lower case scheme and the ip
-// in its canonical form -- and the server's ip, whose family is the list the
-// url belongs to.
+// Reads one bootstrap DoH server url. It returns the url in the form the DoH
+// client queries -- trimmed, a lower case scheme and the ip in its canonical
+// form -- and the server's ip, whose family is the list the url belongs to.
 func ParseControlDohUrl(dohUrl string) (string, netip.Addr, error) {
 	invalid := func(code string, detail string) (string, netip.Addr, error) {
 		return "", netip.Addr{}, &ControlDohUrlError{Code: code, Detail: detail}
@@ -126,9 +126,9 @@ func ParseControlDohUrl(dohUrl string) (string, netip.Addr, error) {
 	return u.String(), addr.Unmap(), nil
 }
 
-// ControlDohSettings is the DoH settings of a client strategy whose user named
-// bootstrap DoH servers: the defaults, with the named servers ahead of the
-// default servers of their family. With none named it is the defaults.
+// The DoH settings of a client strategy whose user named bootstrap DoH servers:
+// the defaults, with the named servers ahead of the default servers of their
+// family. With none named it is the defaults.
 //
 // The named servers are also seeded as the best recent performers
 // (`ServerStatsSeed`), because a query fans out in a weighted random order

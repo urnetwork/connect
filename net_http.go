@@ -255,11 +255,11 @@ type ClientStrategy struct {
 	log                Logger
 
 	settings *ClientStrategySettings
-	// baseSettings are a copy of the settings as the caller passed them, which
-	// a direct-only strategy derived from this one is built from
-	// (newDirectClientStrategy). `settings` will not do: there the internal
-	// DoH resolver wraps the caller's dial, proxy and all, and a strategy
-	// built over that wrapper would still dial through the proxy.
+	// A copy of the settings as the caller passed them, which a direct-only
+	// strategy derived from this one is built from (newDirectClientStrategy).
+	// `settings` will not do: there the internal DoH resolver wraps the
+	// caller's dial, proxy and all, and a strategy built over that wrapper
+	// would still dial through the proxy.
 	baseSettings *ClientStrategySettings
 	// internalDohResolver exists only when InternalDohDomains are configured
 	// and the caller did not install ConnectSettings.Resolver.
@@ -707,12 +707,12 @@ func (self *ClientStrategy) DohSettings() *DohSettings {
 	return self.dohSettings
 }
 
-// SetInternalDohSettings replaces the DoH settings of a running strategy: the
-// internal DoH cache its protected control names resolve through is rebuilt
-// from them, and the extender bootstrap queries them from its next pass. This
-// is how a user's bootstrap DoH servers (`ControlDohSettings`) apply without
-// rebuilding the strategy. Resolutions in flight on the replaced cache end,
-// and the next dial resolves through the new one. Nil restores the defaults.
+// Replaces the DoH settings of a running strategy: the internal DoH cache its
+// protected control names resolve through is rebuilt from them, and the
+// extender bootstrap queries them from its next pass. This is how a user's
+// bootstrap DoH servers (`ControlDohSettings`) apply without rebuilding the
+// strategy. Resolutions in flight on the replaced cache end, and the next dial
+// resolves through the new one. Nil restores the defaults.
 func (self *ClientStrategy) SetInternalDohSettings(dohSettings *DohSettings) {
 	if dohSettings == nil {
 		dohSettings = DefaultDohSettings()
@@ -732,12 +732,11 @@ func (self *ClientStrategy) SetInternalDohSettings(dohSettings *DohSettings) {
 	}
 }
 
-// newDirectClientStrategy builds a direct-only strategy from the settings this
-// one was built with (NewDirectClientStrategy, unpinned): no extender, VLESS
-// server or proxy, so a request reaches its destination from this host's own
-// address. It takes the DoH settings in force here, which a user's bootstrap
-// DoH servers replace on a running strategy (`SetInternalDohSettings`). The
-// caller closes it.
+// Builds a direct-only strategy from the settings this one was built with
+// (NewDirectClientStrategy, unpinned): no extender, VLESS server or proxy, so a
+// request reaches its destination from this host's own address. It takes the
+// DoH settings in force here, which a user's bootstrap DoH servers replace on a
+// running strategy (`SetInternalDohSettings`). The caller closes it.
 func (self *ClientStrategy) newDirectClientStrategy(ctx context.Context) *ClientStrategy {
 	baseSettings := self.baseSettings
 	if baseSettings == nil {

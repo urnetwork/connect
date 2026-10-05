@@ -24,8 +24,8 @@ type internalDohResolver struct {
 	domains  []string
 	nextAddr atomic.Uint64
 
-	// stateLock guards the cache, which `ClientStrategy.SetInternalDohSettings`
-	// replaces on a running strategy, and closed.
+	// Guards the cache, which `ClientStrategy.SetInternalDohSettings` replaces
+	// on a running strategy, and closed.
 	stateLock sync.Mutex
 	cache     *DohCache
 	closed    bool
@@ -144,9 +144,9 @@ func (self *internalDohResolver) getCache() *DohCache {
 	return self.cache
 }
 
-// replaceCache installs a cache and returns the one it replaced, for the
-// caller to close outside its own locks. A closed resolver installs nothing
-// and returns the new cache to be closed instead.
+// Installs a cache and returns the one it replaced, for the caller to close
+// outside its own locks. A closed resolver installs nothing and returns the new
+// cache to be closed instead.
 func (self *internalDohResolver) replaceCache(cache *DohCache) *DohCache {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
