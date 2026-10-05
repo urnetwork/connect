@@ -1064,13 +1064,21 @@ paths:
         limit, not a hard cap -- and an agent can settle it inline with the
         x402 round trip below.
 
-        Like roles or a principal the call may not set, an invalid
-        `proxy_config.initial_device_state.performance_profile` (the rules
-        are on that field) is refused, and nothing is created: the call
-        answers 200 with `error.message` "Invalid performance profile: " and
-        the reason, for example "Invalid performance profile: Window size
-        [2, 1] invalid. Max must be >= min". A re-auth of an existing client
-        (`client_id` set) ignores `proxy_config`.
+        Like roles or a principal the call may not set, a `proxy_config`
+        the call cannot use is refused before anything is created: the call
+        answers 200 with `error.message` and no `client_id` or
+        `by_client_jwt`. The refusals are:
+        - "Invalid performance profile: " and the reason, for an invalid
+          `initial_device_state.performance_profile` (the rules are on that
+          field), for example "Invalid performance profile: Window size
+          [2, 1] invalid. Max must be >= min"
+        - "Invalid location", when `initial_device_state` is omitted, or has
+          no `location` and no `country_code` that names a country
+        - "Could not parse lock ip " and the entry, for a `lock_ip_list`
+          entry that is neither an IP address nor a subnet
+
+        A re-auth of an existing client (`client_id` set) ignores
+        `proxy_config`.
       operationId: authNetworkClient
       security:
         - BearerAuth: []
@@ -6687,7 +6695,11 @@ components:
           description: udid. Optional. If this is given, it must currently exist in the network. Omit this to assign a new client id.
           type: string
         source_client_id:
-          description: udid. Optional. The source client id when creating an ancillary client id.
+          description: |
+            udid. Optional. The source client id when creating an ancillary
+            client id. It must be a client of the caller's network: any other
+            id is refused with `error.message` "Client does not exist.", and
+            nothing is created.
           type: string
         description:
           description: If this is a new device, sets the device name to the description of the device.
@@ -6736,7 +6748,8 @@ components:
             lock_ip_list:
               description: Optional. |
                 Allow only IPs/subnets in the list to access the proxy. |
-                The IPs/subnets are converted to the internal IP subnet width.
+                The IPs/subnets are converted to the internal IP subnet width. |
+                An entry that is neither an IP address nor a subnet is refused (see the endpoint).
               type: array
               items:
                 type: string
@@ -6749,7 +6762,12 @@ components:
                 If enabled, a WireGuard configuration will be created for the proxy.
               type: boolean
             initial_device_state:
-              description: Optional. |
+              description: |
+                Required when the call creates the client (`client_id`
+                omitted): without a `location`, or a `country_code` that
+                names a country, the call is refused with
+                "Invalid location" (see the endpoint).
+
                 Whenever the device is created, it will be set up with this initial state.
                 To configure the device beyond the initial state, the SDK ProxyDevice must be used.
                 Note that the SDK ProxyDevice must reconfigure the device each time it receives a change notice.
@@ -6757,10 +6775,19 @@ components:
               required: []
               properties:
                 country_code:
-                  description: Optional. Use one of country_code or location
+                  description: |
+                    Optional. Use one of `country_code` or `location`. A
+                    two-letter country code such as "de", upper or lower
+                    case. Without a `location`, the call is refused with
+                    "Invalid location" (see the endpoint) unless
+                    `country_code` names a country.
                   type: string
                 location:
-                  description: Optional. Use one of country_code or location
+                  description: |
+                    Optional. Use one of `country_code` or `location`. A
+                    location is used as given, ahead of `country_code`. For
+                    no particular location, set
+                    `connect_location_id.best_available` to true.
                   type: object
                   required: []
                   properties:
@@ -6778,7 +6805,7 @@ components:
                           description: udid. Optional.
                           type: string
                         best_available:
-                          description: udid. Optional.
+                          description: Optional. True connects through the best available providers, in no particular location.
                           type: boolean
                     name:
                       type: string
@@ -6843,13 +6870,22 @@ components:
                   required: []
                   properties:
                     allow_direct:
-                      description: Setting this exposes the real source IP to the provider.
+                      description: |
+                        Setting this exposes the real source IP to the
+                        provider. It has no effect here: the hosted proxy
+                        device always runs with direct mode off, because a
+                        direct connection would expose the proxy host's
+                        address, and with it that the client is hosted and
+                        where.
                       type: boolean
                     post_quantum_encryption:
                       description: |
-                        Opportunistic post-quantum end-to-end encryption to
-                        providers that support it; providers without support
-                        fall back to plaintext at this layer.
+                        Requires a post-quantum end-to-end encrypted session
+                        with each provider. Traffic to a provider waits for
+                        its session, and a provider that cannot establish one
+                        is skipped, never used without it, so fewer providers
+                        may qualify. Unset, the default, the device opens no
+                        such session.
                       type: boolean
                     window_type:
                       description: |
