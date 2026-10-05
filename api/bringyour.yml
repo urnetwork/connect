@@ -3854,6 +3854,8 @@ paths:
       summary: Create a Solana Pay intent for Pro
       description: |
         When paying for a subscription with Solana, we track the order through this intent.
+        A legacy guest network (no sign-in method) is refused with
+        `error.code` `guest_sign_in_required` (PurchaseError).
       operationId: solanaPaymentIntent
       security:
         - BearerAuth: []
@@ -3926,6 +3928,8 @@ paths:
       description: |
         When paying for a subscription with Stripe, create the payment intents,
         ephemeral key, and customer id needed to complete the purchase.
+        A legacy guest network (no sign-in method) is refused with
+        `error.code` `guest_sign_in_required` (PurchaseError).
       operationId: Stripe Payment Intent
       security:
         - BearerAuth: []
@@ -4106,6 +4110,9 @@ paths:
 
         The subscription is granted by the `invoice.paid` webhook, never by the
         client; the client only polls /subscription/balance afterwards.
+
+        A legacy guest network (no sign-in method) is refused with
+        `error.code` `guest_sign_in_required` (PurchaseError).
       operationId: Stripe Create Checkout Session
       security:
         - BearerAuth: []
@@ -5231,6 +5238,9 @@ paths:
         The charged tier is finalized from the card's billing country before
         the trial ends and the tier is recorded on the subscription.
         Calling again replaces a pending, unfinished sheet.
+
+        A legacy guest network (no sign-in method) is refused with
+        `error.code` `guest_sign_in_required` (PurchaseError).
       operationId: stripePaymentSheet
       security:
         - BearerAuth: []
@@ -7988,6 +7998,30 @@ components:
         message:
           type: string
 
+    PurchaseError:
+      type: object
+      description: |
+        Why a checkout or payment intent was refused (/stripe/create-checkout-session,
+        /stripe/payment-intent, /subscription/stripe/payment-sheet and
+        /solana/payment-intent).
+      required:
+        - message
+      properties:
+        code:
+          description: |
+            A stable code for a refusal that has one, so a client can pick a
+            localized message or flow.
+            `guest_sign_in_required`: the network is a legacy guest network
+            with no sign-in method, so nothing could sign back in to a plan
+            bought on it. Add a sign-in method (POST /auth/add-auth) first;
+            the apps open their add-sign-in sheet. Store-verified purchases
+            and webhooks are never refused this way.
+            Absent from older servers and for other refusals; clients fall
+            back to `message` for an absent or unknown code.
+          type: string
+        message:
+          type: string
+
     ClientEvent:
       description: |
         One product event. The schema is CLOSED: `name` selects exactly one
@@ -8599,7 +8633,7 @@ components:
           type: boolean
         error:
           oneOf:
-            - $ref: "#/components/schemas/ErrorMessage"
+            - $ref: "#/components/schemas/PurchaseError"
             - type: "null"
 
     StripePricesResult:
@@ -10963,7 +10997,7 @@ components:
           description: the SPL token mint (base58) to pay in (USDC)
         error:
           oneOf:
-            - $ref: "#/components/schemas/ErrorMessage"
+            - $ref: "#/components/schemas/PurchaseError"
             - type: "null"
 
     SolanaPaymentTransactionArgs:
@@ -12058,12 +12092,7 @@ components:
         publishable_key:
           type: string
         error:
-          type: object
-          required:
-            - message
-          properties:
-            message:
-              type: string
+          $ref: "#/components/schemas/PurchaseError"
 
     PayDataCheckoutArgs:
       type: object
@@ -12248,12 +12277,7 @@ components:
           type: string
           description: both modes; the caller can reconcile the purchase with this
         error:
-          type: object
-          required:
-            - message
-          properties:
-            message:
-              type: string
+          $ref: "#/components/schemas/PurchaseError"
 
     SubscriptionDetailsResult:
       type: object
