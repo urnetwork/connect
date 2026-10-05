@@ -24,6 +24,9 @@ type sendPackAdmissionObservations struct {
 	pending      []pendingSendPackAdmissionObservation
 	noAckPending []pendingNoAckAdmissionObservation
 	completed    bool
+	// Only a new TCP generation needs this inline observation. Reuse the
+	// optional scope, not every packet/group descriptor or a packet owner.
+	synAdmission tcpSynAdmission
 }
 
 // Called only by the serialized selection owner, before candidate goroutines
@@ -62,6 +65,7 @@ func (self *sendPackAdmissionObservations) wrap(observer func(SendPackLifecycleO
 // All candidate sends have returned before the owner calls this. Publication
 // happens before the native send returns, preserving source-boundary joins.
 func (self *sendPackAdmissionObservations) complete(accepted bool) {
+	self.synAdmission.clear()
 	self.mutex.Lock()
 	self.completed = true
 	pending := self.pending

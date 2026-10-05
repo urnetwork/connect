@@ -8,7 +8,10 @@ package connect
 // same instrument.
 
 import (
+	"context"
+	"fmt"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -220,6 +223,11 @@ func TestGapWritesOfDeferredItemsAreAttributed(t *testing.T) {
 	if testing.Short() {
 		t.Skip("mixed route with an inflating relay")
 	}
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, testGapWritesOfDeferredItemsAreAttributed)
+}
+
+func testGapWritesOfDeferredItemsAreAttributed(t *testing.T) {
 	const messageCount = 4000
 	harness := newMixedLaneHarnessWithOptions(t, mixedLaneOptions{
 		fastLatency:                20 * time.Millisecond,
@@ -234,7 +242,8 @@ func TestGapWritesOfDeferredItemsAreAttributed(t *testing.T) {
 		deferTimeoutResend:         true,
 	})
 	harness.startReverseLoad(5 * time.Millisecond)
-	stats := harness.run(t, messageCount)
+	// Virtual time uses the fixture's delivery bound, not the suite's clock.
+	stats := harness.run(struct{ testing.TB }{TB: t}, messageCount)
 	fromDeferredRelay := stats.SelectiveGapWritesOfDeferredItems[gapHoleCarrierReliable]
 	fromDeferredDirect := stats.SelectiveGapWritesOfDeferredItems[gapHoleCarrierUnreliable]
 	t.Logf(
@@ -260,5 +269,110 @@ func TestGapWritesOfDeferredItemsAreAttributed(t *testing.T) {
 				"relay-carried hole overtaken by direct-lane acknowledgements",
 			fromDeferredRelay, fromDeferredDirect,
 		)
+	}
+}
+
+// The gap belongs to the carrier observed before its retry. A successful retry
+// may change that carrier; a prior deferral remains part of the item's history.
+// Fill the other route so the real selector must use the requested recovery
+// lane, then let the real send worker account for exactly one due gap write.
+func TestDeferredGapWriteKeepsHoleCarrierAcrossRecovery(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, holeDirect := range []bool{false, true} {
+		for _, recoveryDirect := range []bool{false, true} {
+			for _, deferred := range []bool{false, true} {
+				t.Run(fmt.Sprintf("hole_direct_%t/recovery_direct_%t/deferred_%t", holeDirect, recoveryDirect, deferred), func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						ctx, cancel := context.WithCancel(context.Background())
+						settings := DefaultClientSettings()
+						settings.Log = NewNoopLogger()
+						settings.EncryptionSettings.Mode = EncryptionModeOff
+						// Keep platform registration from sharing the two fixture routes.
+						settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+						client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+						relay, direct := make(Route, 1), make(Route, 1)
+						t.Cleanup(func() {
+							cancel()
+							closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
+							defer closeCancel()
+							if err := client.CloseAndWait(closeCtx); err != nil {
+								t.Errorf("close attribution client: %v", err)
+							}
+							for _, route := range []Route{relay, direct} {
+								select {
+								case wire := <-route:
+									MessagePoolReturn(wire)
+								default:
+								}
+							}
+						})
+						client.RouteManager().UpdateTransport(NewSendGatewayTransportWithType(TransportTypeH1), []Route{relay})
+						client.RouteManager().UpdateTransportWithProperties(NewSendGatewayTransportWithType(TransportTypeP2p),
+							[]Route{direct}, TransferCarrierProperties{Unreliable: true})
+						destination := NewId()
+						client.ContractManager().AddNoContractPeer(destination)
+						sequence := NewSendSequence(ctx, client, nil, destination, MultiHopId{}, false, false, false,
+							sequenceTlsRoleClient, false, settings.SendBufferSettings)
+						sequence.contractMultiRouteWriter = client.RouteManager().OpenMultiRouteWriter(DestinationId(destination))
+						sequence.contractMultiRouteWriterDestination = DestinationId(destination)
+						item := &sendItem{
+							transferItem: transferItem{messageId: NewId()},
+							head:         true, forceUnwrapped: true, sendCount: 1, expectsAck: true,
+							sendTime: time.Now(), resendTime: time.Now(), ackTimeout: settings.SendBufferSettings.AckTimeout,
+							recoveryKind: sendRecoverySelectiveGap,
+						}
+						item.transferFrameBytes = marshalSendPackTransferFrame(&sendPackFrame{
+							path:      sendTransferPath(client.ClientId(), DestinationId(destination)),
+							messageId: item.messageId, sequenceId: sequence.sequenceId,
+						})
+						if deferred {
+							item.timeoutDeferCount = 1
+						}
+						holeRoute := relay
+						wantCarrier := gapHoleCarrierReliable
+						if holeDirect {
+							holeRoute, wantCarrier = direct, gapHoleCarrierUnreliable
+						}
+						sequence.observeCarrierWrite(item, transferWriteDisposition{
+							route: holeRoute, reliable: !holeDirect, unreliable: holeDirect,
+						})
+						sequence.sendItems = []*sendItem{item}
+						sequence.nextSequenceNumber = 1
+						sequence.addResendItem(item)
+						recoveryRoute := relay
+						if recoveryDirect {
+							recoveryRoute = direct
+							relay <- nil
+						} else {
+							direct <- nil
+						}
+						done := make(chan struct{})
+						go func() { defer close(done); sequence.Run() }()
+						t.Cleanup(func() { sequence.cancel(); <-done })
+						synctest.Wait()
+						select {
+						case wire := <-recoveryRoute:
+							MessagePoolReturn(wire)
+						default:
+							t.Fatal("the selected recovery lane did not receive the gap write")
+						}
+						if item.carrierRoute != recoveryRoute {
+							t.Fatal("the recovery did not update the item's carrier")
+						}
+						stats := client.SendRecoveryStats()
+						want := [gapHoleCarrierCount]uint64{}
+						if deferred {
+							want[wantCarrier] = 1
+						}
+						if stats.SelectiveGapWriteCount != 1 || stats.RecoveryWriteErrorCount != 0 ||
+							stats.SelectiveGapWritesOfDeferredItems != want {
+							t.Fatalf("gap=%d failed=%d hole attribution=%v, want one write with %v",
+								stats.SelectiveGapWriteCount, stats.RecoveryWriteErrorCount,
+								stats.SelectiveGapWritesOfDeferredItems, want)
+						}
+					})
+				})
+			}
+		}
 	}
 }

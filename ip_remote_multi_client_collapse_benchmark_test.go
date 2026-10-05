@@ -61,9 +61,15 @@ func BenchmarkTcpCollapseParsedAdmission(b *testing.B) {
 			paths := make([]IpPath, count)
 			path := icmpTcpTestPath(4)
 			template := ipOosTcpPacketSequence(path, tcpFlagAck, 100, []byte{1})
+			// The generic ICMP fixture starts with SYN=true. This benchmark
+			// measures healthy data, so derive metadata from its actual ACK-only
+			// bytes rather than silently offering a new SYN every iteration.
+			parsedPath, err := ParseIpPath(template)
+			if err != nil || parsedPath == nil || parsedPath.Syn || !parsedPath.Ack {
+				b.Fatalf("healthy TCP benchmark metadata does not match its ACK-only template: %v", err)
+			}
 			for i := range paths {
-				paths[i] = *path
-				paths[i].Ack = true
+				paths[i] = *parsedPath
 			}
 			source := SourceId(NewId())
 			sequence := uint32(100)

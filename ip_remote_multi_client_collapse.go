@@ -9,14 +9,98 @@ type tcpCollapseAdmission struct {
 	epoch  uint64
 }
 
+// One numeric receipt per in-flight group offering a new SYN generation. It
+// lives in that group's existing optional observation scope, never in a Pack's
+// asynchronous completion token. The native send's unconditional completion
+// unlinks and clears it, including on refusal or panic. No packet is retained.
+type tcpSynAdmission struct {
+	next           *tcpSynAdmission
+	update         *multiClientChannelUpdate
+	responseClient *multiClientChannel
+	sequence       uint32
+}
+
+func (admission *tcpSynAdmission) clear() {
+	update := admission.update
+	if update == nil {
+		return
+	}
+	update.stateLock.Lock()
+	defer update.stateLock.Unlock()
+	for link := &update.synAdmissions; *link != nil; link = &(*link).next {
+		if *link == admission {
+			*link = admission.next
+			break
+		}
+	}
+	// A Transfer completion can retain the observation scope. It must not
+	// retain this flow, another live offer, or that offer's selected client.
+	*admission = tcpSynAdmission{}
+}
+
 func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChannelUpdate) {
 	update.stateLock.Lock()
 	admission := tcpCollapseAdmission{update: update, epoch: update.sequenceAdmissionEpoch}
+	// Only an actually different generation needs pre-commit response proof.
+	// Generation identity survives coverage revocation and provider rebinding.
+	seen, sequence := update.synGenerationSeen, update.synGenerationNumber
+	hasPriorState := seen || update.sequencePacketCount != 0
+	newGeneration := false
+	for i := range group.packets {
+		path := group.packets[i].ipPath
+		if path.Syn {
+			newGeneration = newGeneration || hasPriorState && (!seen || sequence != path.SequenceNumber)
+			seen, sequence, hasPriorState = true, path.SequenceNumber, true
+		}
+	}
+	if newGeneration {
+		if group.admissionObservations == nil {
+			group.admissionObservations = &sendPackAdmissionObservations{}
+		}
+		observation := &group.admissionObservations.synAdmission
+		*observation = tcpSynAdmission{next: update.synAdmissions, update: update, sequence: sequence}
+		update.synAdmissions = observation
+	}
 	update.stateLock.Unlock()
 	group.collapseAdmission = admission
 	for i := range group.packets {
 		group.packets[i].collapseAdmission = admission
 	}
+}
+
+// Established non-SYN ingress keeps its lock-free fast path. First response
+// and SYN-ACK observations serialize with admission commit so an old response
+// cannot establish a newly accepted generation after the reset.
+func (update *multiClientChannelUpdate) markReceivedInbound(client *multiClientChannel, control tcpControlObservation) bool {
+	if !control.syn && update.receivedInbound.Load() {
+		return false
+	}
+	update.stateLock.Lock()
+	defer update.stateLock.Unlock()
+	return update.markReceivedInboundWithLock(client, control)
+}
+
+// The caller holds stateLock and has resolved this packet's committed owner.
+func (update *multiClientChannelUpdate) markReceivedInboundWithLock(client *multiClientChannel, control tcpControlObservation) bool {
+	if client != update.client.Load() {
+		return false
+	}
+	if control.syn && control.ack {
+		for admission := update.synAdmissions; admission != nil; admission = admission.next {
+			// The provider acknowledges the SYN at ISN+1, including a
+			// payload-bearing SYN. uint32 addition preserves wraparound.
+			if control.ackSequenceNumber == admission.sequence+1 {
+				admission.responseClient = client
+			}
+		}
+	}
+	if update.synGenerationAwaiting {
+		if !control.syn || !control.ack || control.ackSequenceNumber != update.synGenerationNumber+1 {
+			return false
+		}
+		update.synGenerationAwaiting = false
+	}
+	return update.receivedInbound.CompareAndSwap(false, true)
 }
 
 func (admission tcpCollapseAdmission) complete(err error) {

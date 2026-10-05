@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/urnetwork/connect/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 const maximumOriginalCloseInventoryContracts = 8192
@@ -41,9 +42,9 @@ func (self *ContractManager) signOriginalCloseInventory(report *protocol.CloseCo
 	// Capture while the logical per-contract sequence still owns this lock.
 	// A concurrent checkpoint cannot publish its whole-owner head out of order.
 	defer func() {
-		owned := *report
+		owned := proto.Clone(report).(*protocol.CloseContract)
 		owned.OriginalInventory = inventoryRaw
-		self.retainOriginalWorkClose(&owned)
+		self.retainOriginalWorkClose(owned)
 	}()
 	manager.stateLock.RLock()
 	defer manager.stateLock.RUnlock()

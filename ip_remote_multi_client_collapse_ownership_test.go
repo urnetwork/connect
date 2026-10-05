@@ -14,7 +14,7 @@ import (
 )
 
 func TestTcpCollapseStateLayout(t *testing.T) {
-	t.Logf("update=%d parsedPacket=%d parsedPacketGroup=%d", unsafe.Sizeof(multiClientChannelUpdate{}), unsafe.Sizeof(parsedPacket{}), unsafe.Sizeof(parsedPacketGroup{}))
+	t.Logf("update=%d parsedPacket=%d parsedPacketGroup=%d collapseAdmission=%d admissionObservations=%d tcpControl=%d receivePacket=%d pendingIngressControl=%d", unsafe.Sizeof(multiClientChannelUpdate{}), unsafe.Sizeof(parsedPacket{}), unsafe.Sizeof(parsedPacketGroup{}), unsafe.Sizeof(tcpCollapseAdmission{}), unsafe.Sizeof(sendPackAdmissionObservations{}), unsafe.Sizeof(tcpControlObservation{}), unsafe.Sizeof(receivePacket{}), unsafe.Sizeof(pendingIngressTcpControl{}))
 }
 
 func collapseOwnershipPublicSend(t *testing.T, parent *RemoteUserNatMultiClient, mode string, path *IpPath, seq uint32, flags byte, payload []byte) bool {
