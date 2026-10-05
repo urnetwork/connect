@@ -47,9 +47,10 @@ func (e *HTTPUpgradeError) Error() string {
 	return fmt.Sprintf("HTTP upgrade: %s (status %d)", e.Reason, e.StatusCode)
 }
 
+// A fresh negotiation requires complete original upgrade evidence. Only a
+// response-io refusal may retain transport causes; cancellation never downgrades.
 func HTTPUpgradeAllowsFallback(err error) bool {
-	var upgradeErr *HTTPUpgradeError
-	return errors.As(err, &upgradeErr) && !upgradeErr.Terminal
+	return len(httpUpgradeFallbackCauses(err)) != 0
 }
 
 func headerContainsToken(h http.Header, name, token string) bool {
@@ -157,6 +158,7 @@ func (c *httpUpgradeConn) Read(p []byte) (int, error) {
 type upgradeHeaderReader struct {
 	reader    io.Reader
 	remaining int
+	readErr   error
 }
 
 func (r *upgradeHeaderReader) Read(p []byte) (int, error) {
@@ -167,6 +169,9 @@ func (r *upgradeHeaderReader) Read(p []byte) (int, error) {
 		p = p[:r.remaining]
 	}
 	n, err := r.reader.Read(p)
+	if err != nil && r.readErr == nil {
+		r.readErr = err
+	}
 	if 0 < r.remaining {
 		r.remaining -= n
 	}
@@ -176,7 +181,7 @@ func (r *upgradeHeaderReader) Read(p []byte) (int, error) {
 // DialFramedUpgrade uses the same native H1 socket/TLS dial boundary as Gorilla.
 // It never follows redirects, sends application bytes, or converts a failed
 // upgrade socket into another carrier. Rejected connections are always closed.
-func DialFramedUpgrade(ctx context.Context, address string, header http.Header, dialer *websocket.Dialer, protocol string) (net.Conn, error) {
+func DialFramedUpgrade(ctx context.Context, address string, header http.Header, dialer *websocket.Dialer, protocol string) (_ net.Conn, resultErr error) {
 	if !H1PlusAvailable() || !supportedFramedProtocol(protocol) {
 		return nil, &HTTPUpgradeError{Reason: "unavailable"}
 	}
@@ -255,20 +260,31 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 	}
 	if err != nil {
 		if conn != nil {
-			conn.Close()
+			err = errors.Join(err, conn.Close())
+		}
+		if stopErr := attemptCtx.Err(); stopErr != nil {
+			err = errors.Join(err, stopErr, context.Cause(attemptCtx))
 		}
 		return nil, err
 	}
 	responseCtx, responseCancel := context.WithTimeout(attemptCtx, responseTimeout)
 	defer responseCancel()
+	// Cancellation and failed negotiation share one owned close. Its original
+	// failure joins the result after the cancellation callback has completed.
+	var closeOnce sync.Once
+	var closeErr error
+	closeConnection := func() error {
+		closeOnce.Do(func() { closeErr = conn.Close() })
+		return closeErr
+	}
 	success := false
 	defer func() {
 		if !success {
-			conn.Close()
+			resultErr = errors.Join(resultErr, closeConnection(), ctx.Err(), context.Cause(ctx), responseCtx.Err(), context.Cause(responseCtx))
 		}
 	}()
 	canceled := make(chan struct{})
-	stop := context.AfterFunc(responseCtx, func() { conn.Close(); close(canceled) })
+	stop := context.AfterFunc(responseCtx, func() { closeConnection(); close(canceled) })
 	disarmed := false
 	defer func() {
 		if !disarmed && !stop() {
@@ -295,15 +311,28 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 	buffered := bufio.NewReaderSize(limited, 4096)
 	response, err := http.ReadResponse(buffered, request)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		if callerErr := ctx.Err(); callerErr != nil {
+			return nil, errors.Join(err, limited.readErr, callerErr, context.Cause(ctx))
 		}
-		var networkError net.Error
-		if responseCtx.Err() != nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &networkError) {
-			// An intermediary may close an unknown upgrade, so allow one fresh
-			// WS attempt. This is not persistent protocol-capability evidence.
-			return nil, &HTTPUpgradeError{Reason: "response-io"}
+		if limited.readErr != nil {
+			// Preserve the actual socket outcome before interpreting the parser
+			// error. Only a complete transport interruption permits a fresh
+			// negotiation; cancellation and hard siblings remain authoritative.
+			causes := flattenHttpRequestCauses(limited.readErr)
+			transportOnly := len(causes) != 0
+			for _, cause := range causes {
+				if cause.kind < 2 {
+					transportOnly = false
+					break
+				}
+			}
+			if transportOnly {
+				return nil, errors.Join(&HTTPUpgradeError{Reason: "response-io"}, err, limited.readErr)
+			}
+			return nil, errors.Join(err, limited.readErr)
 		}
+		// With no failed physical read, this is the HTTP parser's own bounded
+		// protocol rejection, not evidence of a transport or custody failure.
 		return nil, &HTTPUpgradeError{Reason: "invalid-response"}
 	}
 	// No response body is drained: it can be unbounded or an upgraded socket.
@@ -355,6 +384,7 @@ func dialH1MessagesWithinDeadline(ctx context.Context, address string, header ht
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var upgradeErr error
 	if enabled && FramedUpgradePermitted(address, protocol) {
 		start := time.Now()
 		conn, err := DialFramedUpgrade(ctx, address, header, dialer, protocol)
@@ -362,19 +392,23 @@ func dialH1MessagesWithinDeadline(ctx context.Context, address string, header ht
 		if err == nil {
 			framed, frameErr := NewFramedMessageConn(conn, protocol, maximum, stats)
 			if frameErr != nil {
-				conn.Close()
+				return nil, errors.Join(frameErr, conn.Close())
 			}
-			return framed, frameErr
+			return framed, nil
 		}
 		if !HTTPUpgradeAllowsFallback(err) {
 			return nil, err
 		}
 		RecordFramedUpgradeFailure(address, protocol, err)
+		upgradeErr = err
 	}
 	ws, response, err := dialH1WebSocket(ctx, address, header, dialer)
 	if err != nil {
 		if response != nil && response.Body != nil {
-			response.Body.Close()
+			err = errors.Join(err, response.Body.Close())
+		}
+		if upgradeErr != nil {
+			return nil, errors.Join(upgradeErr, err)
 		}
 		return nil, err
 	}
@@ -394,18 +428,33 @@ func dialH1WebSocket(ctx context.Context, address string, header http.Header, di
 	attempt := *dialer
 	var stop func() bool
 	var canceled <-chan struct{}
+	var socket *httpUpgradeCloseConn
 	guard := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
 		return func(dialCtx context.Context, network, address string) (net.Conn, error) {
 			conn, err := dial(dialCtx, network, address)
 			if err != nil {
-				return conn, err
+				if conn != nil {
+					err = errors.Join(err, conn.Close())
+				}
+				return nil, err
 			}
+			owned := &httpUpgradeCloseConn{Conn: conn}
+			guarded := net.Conn(owned)
+			if batch, ok := conn.(*WebSocketWriteBatchConn); ok {
+				// The freshly dialed connection transfers exclusively here.
+				// Preserve the outer batching capability before either Gorilla
+				// or the cancellation callback can use the delegated socket.
+				owned.Conn = batch.conn
+				batch.conn = owned
+				guarded = batch
+			}
+			socket = owned
 			done := make(chan struct{})
 			canceled = done
 			// Use the outer ctx, not Gorilla's private handshake context,
 			// which it cancels before returning even on a successful 101.
-			stop = context.AfterFunc(ctx, func() { conn.Close(); close(done) })
-			return conn, nil
+			stop = context.AfterFunc(ctx, func() { owned.Close(); close(done) })
+			return guarded, nil
 		}
 	}
 	plainDial := dialer.NetDialContext
@@ -425,9 +474,19 @@ func dialH1WebSocket(ctx context.Context, address string, header http.Header, di
 	if stop != nil && !stop() {
 		<-canceled
 		if conn != nil {
-			conn.Close()
+			err = errors.Join(err, conn.Close())
+		} else {
+			err = errors.Join(err, socket.Close())
 		}
-		return nil, response, ctx.Err()
+		return nil, response, errors.Join(err, ctx.Err(), context.Cause(ctx))
+	}
+	if err != nil {
+		if socket != nil {
+			err = errors.Join(err, socket.Close())
+		}
+		if stopErr := ctx.Err(); stopErr != nil {
+			err = errors.Join(err, stopErr, context.Cause(ctx))
+		}
 	}
 	return conn, response, err
 }
@@ -470,23 +529,22 @@ func FramedUpgradePermitted(address, protocol string) bool {
 }
 
 func RecordFramedUpgradeFailure(address, protocol string, err error) {
-	if !HTTPUpgradeAllowsFallback(err) {
+	upgradeTs := httpUpgradeFallbackCauses(err)
+	if len(upgradeTs) == 0 {
 		return
 	}
-	var upgradeErr *HTTPUpgradeError
-	if !errors.As(err, &upgradeErr) {
-		return
-	}
-	switch upgradeErr.Reason {
-	case "invalid-selection", "invalid-response":
-	case "rejected":
-		switch upgradeErr.StatusCode {
-		case 200, 400, 404, 405, 426, 501:
+	for _, upgrade := range upgradeTs {
+		switch upgrade.Reason {
+		case "invalid-selection", "invalid-response":
+		case "rejected":
+			switch upgrade.StatusCode {
+			case 200, 400, 404, 405, 426, 501:
+			default:
+				return
+			}
 		default:
 			return
 		}
-	default:
-		return
 	}
 	key := framedUpgradeCacheKey(address, protocol)
 	if key == "" {

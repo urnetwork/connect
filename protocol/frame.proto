@@ -83,6 +83,28 @@ enum MessageType {
     // The answer to `TransferSubprotocolsQuery`. `Frame.message_bytes` is a
     // marshaled `SubprotocolsQueryResult`.
     TransferSubprotocolsQueryResult = 32;
+    // ── URmessage (beta/message). Block 1000-1099 reserved so parallel beta
+    // branches do not collide. Every operation lives in a oneof inside
+    // MessageServerRequest/Response/Push, NOT as its own MessageType.
+    //
+    // On the spelling, which is NOT the spelling Spec A §10.1 and Spec B §4.2 give:
+    // proto3 scopes enum VALUE names to the enum's PARENT scope, so a value named
+    // `MessageServerRequest` in package bringyour claims the same qualified name as
+    // `message MessageServerRequest` in message.proto, and protoc refuses the pair
+    // with `"bringyour.MessageServerRequest" is already defined in file
+    // "frame.proto"`. The message names are the normative ones — they are the oneof
+    // arm types the op-byte MAC of Spec B §4.3.8 is defined over — so the collision
+    // is resolved on the enum side, the same way this enum already resolves it for
+    // ip.proto: `IpIpPacketToProvider` for message `IpPacketToProvider`, `IpIpPing`
+    // for message `IpPing`. The domain prefix is simply repeated.
+    //
+    // The NUMBERS are the wire code points and are verbatim from both specs. Only
+    // the Go-visible spellings differ, and a spelling taken from the spec text is a
+    // compile error rather than a silent break.
+    MessageMessageServerRequest  = 1000;
+    MessageMessageServerResponse = 1001;
+    MessageMessageServerPush     = 1002;
+    MessageMessageServerFragment = 1003;
 }
 
 
