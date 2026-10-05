@@ -151,10 +151,11 @@ and are local diagnostics: nothing about them is sent off the device.
 | `ip_security_cfaa.go`        | yes | CFAA detector: settings, verdicts, port policy, `cfaaBlockedIp4`/`cfaaBlockedIp6` range lookups. |
 | `ip_security_telegram.go`    | yes | Exact Telegram call-reflector endpoint/port exception. |
 | `ip_security_gaming.go`      | yes | Provider-prefix + transport + documented-remote-port gaming exceptions. |
+| `ip_security_messaging.go`   | yes | Meta-prefix + TCP + port 5222 WhatsApp exception, the backstop behind the WhatsApp Noise detector. |
 | `ip_security_cfaa_block.go`  | **generated** | Packed IPv4 + IPv6 blocked-range tables + source attribution. |
 | `ip_security_dmca.go`        | yes | Per-flow DPI state machine, including BitTorrent signatures, RTP probation, and the encrypted heuristic. |
 | `ip_security_webstandard.go` | yes | TLS/DTLS/QUIC/STUN/TURN/RTP/RTCP framing and header classifier. |
-| `ip_security_appstandard.go` | yes | WireGuard/OpenVPN/RTMP/Levin/RakNet application-standard detectors. |
+| `ip_security_appstandard.go` | yes | WireGuard/OpenVPN/RTMP/Levin/RakNet and WhatsApp Noise application-standard detectors. |
 | `ip_security_appstandard_ethereum.go` | yes | Ethereum devp2p discovery v4 (keccak256 packet hash) and RLPx auth (length-exact, on-curve secp256k1 key) detectors. |
 | `security/main.go`           | yes | Generator for the block tables (`go generate ./...`). |
 | `*_test.go`                  | yes | Behavior, invariant, cross-check, and zero-alloc tests. |
@@ -364,6 +365,8 @@ these ports (that would break apps that work today; IPSECURITY-UPDATE4 §10.8).
 3. **Clean-room from public specs.** Every signature/constant derives from published
    protocol definitions (BitTorrent BEPs; TLS/DTLS/QUIC/STUN RFCs), never a
    third-party implementation. Byte signatures are non-copyrightable protocol facts.
+   WhatsApp publishes no wire format: its opening bytes are protocol facts read
+   from public interoperable clients (§5), and no client code is incorporated.
 4. **Egress only.**
 
 ### 4.2 State machine
@@ -395,10 +398,15 @@ On the **first** observation: TCP `sawFlowStart = (SYN present)`; UDP
    - single-packet application standard (§4.4.2), matched over the complete
      payload → `allow`, unless the bytes after its header carry any BitTorrent
      signature → terminal `bittorrent`;
-   - a pending two-packet application candidate confirmed → `allow`; a failed
+   - a pending two-packet application candidate confirmed → `allow`; a WhatsApp
+     stream prefix that continues in the next segment stays pending; a failed
      candidate is judged normally below;
-   - a packet that opens a two-packet application candidate → consumes budget,
+   - a packet that opens a two-packet application candidate, or starts a
+     WhatsApp stream prefix that continues in later segments → consumes budget,
      is **not** counted as encrypted, remain `inspecting`;
+   - provider-scoped messaging endpoint (§4.4.1a), the backstop behind the
+     WhatsApp Noise detector → `allow`, terminal once the budget is spent (the
+     BitTorrent check above keeps running until then);
    - structurally valid RTP/SRTP → keep up to two SSRC candidates; two coherent
      observations → terminal `allow`;
    - looks encrypted (§4.5) → increment `encryptedPackets`;
@@ -475,18 +483,41 @@ invariant from a public specification:
 | RakNet | UDP | open connection request 1/2 (`05`/`07`) with the 16-byte offline magic at offset 1, or unconnected ping (`01`) with it at offset 9 | RakNet `MessageIdentifiers.h`, `RakPeer.cpp` |
 | Ethereum discovery v4 | UDP, any packet while inspecting | `hash ‖ signature (65) ‖ packet-type ‖ packet-data`, 99–1280 bytes, type 1–6, data a canonical RLP list that fits; then `hash == keccak256(signature ‖ packet-type ‖ packet-data)` over the complete packet | devp2p `discv4.md` (Wire Protocol) |
 | Ethereum RLPx | TCP, first payload | the whole segment is the initiator's auth: EIP-8 `auth-size (BE u16) == len − 2`, `auth-size ≥ 282` (ECIES overhead 113 + the minimal RLP auth body 169), then `04 ‖ x ‖ y` an uncompressed secp256k1 point (`x, y < p`, `y² = x³ + 7 mod p`); or the pre-EIP-8 auth, exactly 307 bytes starting with such a point | devp2p `rlpx.md` (Initial Handshake, ECIES), EIP-8, SEC 2 (secp256k1) |
+| WhatsApp Noise | TCP 5222 and 443, from the first payload, in one or more segments | optional edge prefix `45 44 00 01` (`ED`, 0, 1) + routing info length (BE u24, ≤ 1024) + routing info; header `57 41` (`WA`) + two version bytes, each < 16; then the first Noise frame: length (BE u24, 36–65,536), `12` (HandshakeMessage.clientHello), its length as a canonical varint with `1 + varint size + length == frame length`, `0a 20` (ClientHello.ephemeral, 32 bytes) and the complete key. The frame may continue past the segment, and the verdict does not depend on where segments end | whatsmeow `socket` (`WAConnHeader`, `SendFrame`), `handshake.go`, `proto/waWa6`; Baileys `noise-handler.ts`, `Defaults`, `socket.ts`; yowsup noise layer; consonance `handshake.py` and `wa20`; nDPI `whatsapp.c` |
 
-Rules: they run after the BitTorrent signatures, the provider exceptions and the web
-standards; an allowed flow keeps checking the BitTorrent signatures until its
-inspection budget is spent, and a single-packet match whose remaining bytes carry
-a BitTorrent signature is `bittorrent`. A two-packet opener is not counted as
-encrypted, so a random BitTorrent flow whose first blob happens to match an opener
-(≈ 2^-32 per flow) is dropped one packet later; repeated openers end at the budget.
-The WhatsApp Noise "WA" framing is **not implemented**: its bytes must first be
-confirmed against a capture. Until then the Meta prefix exception (§4.4.1a) admits
-WhatsApp's TCP/5222. `AppStandardSettings` (`Dmca.App`) has `Enabled`,
-`WireGuard`, `OpenVpn`, `Rtmp`, `Levin`, `RakNet`, `EthereumDiscv4`,
-`EthereumRlpx`, all on by default; nil disables them.
+Rules: they run after the BitTorrent signatures, the gaming exception and the web
+standards, and before the messaging exception (§4.4.1a); an allowed flow keeps
+checking the BitTorrent signatures until its inspection budget is spent, and a
+single-packet match whose remaining bytes carry a BitTorrent signature is
+`bittorrent`. A two-packet opener is not counted as encrypted, so a random
+BitTorrent flow whose first blob happens to match an opener (≈ 2^-32 per flow) is
+dropped one packet later; repeated openers end at the budget.
+`AppStandardSettings` (`Dmca.App`) has `Enabled`, `WireGuard`, `OpenVpn`, `Rtmp`,
+`Levin`, `RakNet`, `EthereumDiscv4`, `EthereumRlpx`, `WhatsApp`, all on by default;
+nil disables them.
+
+**WhatsApp.** The chat transport is Noise Pipes (Meta's encryption whitepaper:
+Curve25519, AES-GCM, SHA256). The public web clients write the header `WA 6 3`
+(whatsmeow `WAMagicValue` 6 and `token.DictVersion` 3; Baileys `NOISE_WA_HEADER`),
+use it as the prologue of `Noise_XX_25519_AESGCM_SHA256` and send it with the first
+frame in one write: `57 41 06 03 00 00 24 12 22 0a 20` + the 32-byte key is their
+whole opening. The mobile protocol, as yowsup and consonance implement it, adds the
+edge prefix, uses the header `WA 4 0`, writes the edge header, the routing info and
+the header separately, and opens with a Noise IK hello (ephemeral, encrypted
+static key and payload) whose protobuf field numbers equal whatsmeow's.
+nDPI matches the edge prefix with a 2- or 4-byte routing info starting `08`. The
+detector therefore keeps a small parser state across the flow's first segments (no
+payload bytes are held), accepts any version byte below 16, and lets the hello
+frame span segments. A pending prefix is not counted as encrypted while its bytes
+keep the structure; leaving it (or a retransmitted or reordered segment inside it)
+fails the parse and the flow is judged as without the detector. The match is
+structural: false-match odds for random bytes are 2^-16 (`WA`) × 2^-8 (versions)
+× ≈ 2^-8 (frame length range) × 2^-8 (`12`) × ≤ 2^-8 (the two lengths agree) ×
+2^-16 (`0a 20`) ≤ 2^-64. A plain peer-wire handshake can never match (it starts
+with `13`), and MSE/PE's random `Ya` matches only as random bytes do. A modified
+client can forge the opening (the accepted disguise class, §4.8). Port 443 is a
+privileged port admitted before any flow state exists (§4.0), so on today's policy
+the detector decides 5222 flows.
 
 **Ethereum and the fan-out threat model.** Ethereum nodes talk to many peers on
 user ports with payloads random from byte 0 — the flow-level profile of
@@ -550,7 +581,12 @@ dimensions match:
 
 WhatsApp runs Noise on 5222, and after its short framing header the payload is
 random, so the encrypted heuristic dropped it after `EncryptedDecisionPackets`
-payloads. The exception is evaluated right after the gaming exception. Unlike the
+payloads. The WhatsApp Noise detector (§4.4.2) now recognizes the opening on any
+address; this exception is its backstop on Meta's own address space, for WhatsApp
+flows the detector does not recognize (a flow first seen mid-stream, an opening
+that differs from the public clients' layout). It is evaluated after the
+application standards and their pending candidates, so a recognized flow reports
+`allow-app-standard:whatsapp` and the rest report `allow-messaging`. Unlike the
 Steam allow it is not terminal on its first payload: like an application standard
 the flow keeps checking the BitTorrent signatures for its whole inspection budget,
 so a recognized BitTorrent flow to Meta on 5222 is still `bittorrent`. This
@@ -590,10 +626,11 @@ can drop.
 | `Gaming.Enabled` | `true` | Master switch for provider-scoped gaming exceptions. |
 | `Gaming.AllowSteam` | `true` | Allow Valve-prefix + documented-remote-port Steam traffic after BitTorrent checks. |
 | `Messaging.Enabled` | `true` | Master switch for provider-scoped messaging exceptions. |
-| `Messaging.AllowWhatsApp` | `true` | Allow TCP/5222 to Meta's own AS32934 prefixes after BitTorrent checks (§4.4.1a). |
+| `Messaging.AllowWhatsApp` | `true` | Allow TCP/5222 to Meta's own AS32934 prefixes after BitTorrent checks and the application standards, the backstop for the WhatsApp Noise detector (§4.4.1a). |
 | `App.Enabled` | `true` | Master switch for application standards (§4.4.2). |
 | `App.WireGuard`, `.OpenVpn`, `.Rtmp`, `.Levin`, `.RakNet` | `true` | Individual application-standard detectors. |
 | `App.EthereumDiscv4`, `.EthereumRlpx` | `true` | Ethereum devp2p discovery v4 and RLPx auth (§4.4.2). |
+| `App.WhatsApp` | `true` | WhatsApp's Noise transport on TCP 5222 and 443 (§4.4.2). |
 | `InspectPrivilegedSignatures` | `true` | Run the stateless BitTorrent signatures on privileged ports (§4.0); false restores the uninspected allow. |
 | `InspectionPacketBudget` | `8` | Max payload packets before giving up (→ Allow). |
 | `EncryptedDecisionPackets` | `3` | Encrypted-looking packets required before the heuristic drops. |
@@ -637,8 +674,8 @@ peer listening on 443 or a tracker announce on 80 is an incident.
 
 **Not caught / evasions:** forced encryption with DHT/LSD/PEX disabled behind a
 whitelisted-protocol disguise (a fake TLS ClientHello, a WireGuard/OpenVPN/RTMP
-header prefixed by a modified client, or a forged discv4 hash / RLPx curve
-point); encrypted BitTorrent on a privileged port
+header or a WhatsApp opening prefixed by a modified client, or a forged discv4
+hash / RLPx curve point); encrypted BitTorrent on a privileged port
 (the entropy heuristic does not run there by design); a UDP flow joined
 mid-stream (handshake missed; TCP is protected by `sawFlowStart`, UDP is not);
 nested tunneling (VPN-over-VPN — WireGuard and OpenVPN are now admitted
@@ -673,6 +710,15 @@ discovery by leaving discovery v4 enabled, which is admitted (§4.4.2).
   no client or server implementation code is incorporated.
 - **Meta exception** is factual prefix data from Meta's own AS32934 route
   registrations; no client or server implementation code is incorporated.
+- **WhatsApp Noise detector**: WhatsApp publishes no wire format. Meta's WhatsApp
+  encryption whitepaper names the transport (Noise Pipes with Curve25519, AES-GCM
+  and SHA256); the byte layout is read from public interoperable clients: whatsmeow
+  (`socket/constants.go` `WAConnHeader`, `socket/framesocket.go` `SendFrame`,
+  `handshake.go`, `proto/waWa6`, `binary/token` `DictVersion`), Baileys
+  (`src/Utils/noise-handler.ts`, `src/Defaults/index.ts`, `src/Socket/socket.ts`),
+  yowsup (`yowsup/layers/noise/layer.py`) and consonance (`consonance/handshake.py`,
+  `consonance/proto/wa20_pb2.py`), with nDPI's `src/lib/protocols/whatsapp.c` for
+  the edge prefix. Only layout facts are used; no code is incorporated.
 
 ---
 
@@ -692,6 +738,13 @@ discovery by leaving discovery v4 enabled, which is admitted (§4.4.2).
   `testdata/ipsecurity` are synthesized from the specifications; captures from the
   real apps (Roblox, WhatsApp on 5222, X Spaces, console/voice crypto) are still
   needed to confirm which of them trip the heuristic.
+- **The WhatsApp detector follows the public clients, not a capture.** The web
+  layout (whatsmeow, Baileys) is exact. For the iOS and Android apps the current
+  version bytes and write pattern are unknown, which is why any version below 16
+  and any segmentation of the opening are accepted. A capture of WhatsApp iOS and
+  Android sessions on 5222 and 443 through a provider build (or that build's local
+  reason statistics: `allow-app-standard:whatsapp` versus `allow-messaging` for
+  flows to Meta) should confirm the match and be reduced to a fixture.
 - **Provider exceptions are snapshots.** Valve may update AS32590 prefixes or Steam
   ports, and Meta its AS32934 registrations; refresh `ip_security_gaming.go` and
   `ip_security_messaging.go` from the cited sources when this policy is maintained
@@ -701,7 +754,7 @@ discovery by leaving discovery v4 enabled, which is admitted (§4.4.2).
 
 ## 7. Testing
 
-`go test -run 'Cfaa|Dmca|WebStandard|Security|Fixture' ./` covers both layers:
+`go test -run 'Cfaa|Dmca|WebStandard|Security|Fixture|WhatsApp' ./` covers both layers:
 
 - **CFAA:** `TestCfaaPortClassification` (full port table), `TestCfaaBlockedIps` (IP
   precedence), `TestCfaaDisabled`, `TestCfaaIngressMirrorsSourceDrops`,
@@ -727,7 +780,12 @@ discovery by leaving discovery v4 enabled, which is admitted (§4.4.2).
   BitTorrent variant (MSE/PE paddings including 148 and 211, look-alikes that
   pass every structural check, encrypted µTP, the plaintext signatures on 30303
   and on privileged ports), random payloads, a differential fuzz target and
-  zero allocation in `ip_security_appstandard_ethereum_test.go`.
+  zero allocation in `ip_security_appstandard_ethereum_test.go`; for WhatsApp,
+  the web and mobile layouts in one or several segments, every split of the
+  opening, near-miss headers and frames, other ports, BitTorrent precedence,
+  the Meta exception as the backstop, the provider policy end to end, random
+  payloads, a differential fuzz target against protowire and zero allocation in
+  `ip_security_appstandard_whatsapp_test.go`.
 - **Client fail fast:** `ip_remote_multi_client_policy_reject_test.go` (reset,
   unreachable, retry routing, incidents never hinted) and
   `ip_policy_hint_test.go` (hint ttl/bound with an injected clock, ICMPv6, block

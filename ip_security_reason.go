@@ -59,6 +59,9 @@ const (
 	SecurityPolicyReasonAllowEthereumRlpx
 	// a provider-scoped messaging endpoint (ip_security_messaging.go)
 	SecurityPolicyReasonAllowMessaging
+	// the WhatsApp Noise transport, an application standard
+	// (ip_security_appstandard.go)
+	SecurityPolicyReasonAllowWhatsApp
 
 	// one past the last reason
 	securityPolicyReasonEnd
@@ -124,6 +127,8 @@ func (self SecurityPolicyReason) String() string {
 		return "allow-app-standard:ethereum-rlpx"
 	case SecurityPolicyReasonAllowMessaging:
 		return "allow-messaging"
+	case SecurityPolicyReasonAllowWhatsApp:
+		return "allow-app-standard:whatsapp"
 	default:
 		return "unknown"
 	}

@@ -19,7 +19,10 @@ These fixtures are **synthesized from public protocol specifications, not
 captured from real apps**. Each fixture's `provenance` field names the facts it
 encodes (WireGuard whitepaper, OpenVPN protocol, Adobe RTMP 1.0, Monero
 `levin_base.h`, RakNet `MessageIdentifiers.h`, devp2p `discv4.md`/`rlpx.md`
-and EIP-8, the BitTorrent BEPs, RFC 8446).
+and EIP-8, the BitTorrent BEPs, RFC 8446). WhatsApp publishes no wire format,
+so the `whatsapp-noise-*` fixtures follow the opening bytes of public
+interoperable clients (whatsmeow, Baileys, yowsup, consonance) and the edge
+prefix nDPI matches; see `whatsAppStream` in `ip_security_appstandard.go`.
 Fields that are random on the wire (keys, ciphertext, padding, ids) are a
 SHA-256 counter stream keyed by the fixture name, so the files are
 reproducible. The Ethereum fixtures are complete protocol instances built from
@@ -33,7 +36,9 @@ the discv4 packets are RFC 5737 documentation addresses:
 No address, hostname, key, or identifier from a real device is retained. Packets
 are addressed with RFC 5737 documentation addresses by the harness.
 
-Captures from the real apps (Roblox, WhatsApp on 5222, X Spaces, Xbox/PSN,
-Genshin, Zoom) are still needed to settle the protocols the specifications
-cannot (see IPSECURITY-UPDATE4.md section 10). A capture added here must be
-reduced to protocol-fact bytes before it is committed.
+Captures from the real apps (Roblox, WhatsApp on 5222 and 443, X Spaces,
+Xbox/PSN, Genshin, Zoom) are still needed to settle the protocols the
+specifications cannot (see IPSECURITY-UPDATE4.md section 10); for WhatsApp a
+capture would confirm the mobile apps' version bytes and segmentation. A
+capture added here must be reduced to protocol-fact bytes before it is
+committed.
