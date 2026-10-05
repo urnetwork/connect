@@ -16,12 +16,28 @@
 #
 # Everything else, including every structural rule, is enforced. Run:
 #   npx -y @redocly/cli lint bringyour.yml
+#
+# One rule of our own, for descriptions, which every renderer reads as
+# CommonMark (ur.io's API reference, Redoc, GitHub):
+#
+#   rule/description-wildcards-as-code -- a wildcard name such as `weight_*`
+#     or `email.*` is written as code. Bare, its `*` reads as an emphasis
+#     marker: "(weight_*, tier_*)" renders "tier_" in italics. A description
+#     whose backticks pair up is checked outside its code spans.
 extends:
   - recommended
 
 rules:
   operation-operationId-url-safe: off
   operation-summary: off
+  rule/description-wildcards-as-code:
+    subject:
+      type: any
+      property: description
+    assertions:
+      notPattern: '/^(?:[^`]*`[^`]*`)*[^`]*?[A-Za-z][\w.]*[._]\*/'
+    message: Write a wildcard name such as `weight_*` as code, or its `*` reads as emphasis.
+    severity: error
 
 apis:
   bringyour:

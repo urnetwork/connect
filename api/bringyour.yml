@@ -8027,9 +8027,9 @@ components:
         One product event. The schema is CLOSED: `name` selects exactly one
         of the variants below and `props` may carry only that variant's
         keys (`additionalProperties: false`). A token is [A-Za-z0-9_.:+-],
-        at most 64 characters. Server-written names (landing.clicked,
-        app.opened, email.*, trial.*, refund, retention.*, connect.day) are
-        refused from clients.
+        at most 64 characters. Server-written names (`landing.clicked`,
+        `app.opened`, `email.*`, `trial.*`, `refund`, `retention.*`,
+        `connect.day`) are refused from clients.
       oneOf:
         - $ref: "#/components/schemas/ClientEventOnboardingStepShown"
         - $ref: "#/components/schemas/ClientEventOnboardingStepCompleted"
@@ -10801,9 +10801,9 @@ components:
         ranking:
           description: |
             The numbers find-providers2 admits and orders the provider by, in
-            display order. The mode-level numbers (weight_*, tier_*) are left
-            out when the provider is in no pool (not_providing, not_connected,
-            location_invalid, not_eligible).
+            display order. The mode-level numbers (`weight_*`, `tier_*`) are
+            left out when the provider is in no pool (not_providing,
+            not_connected, location_invalid, not_eligible).
           type: array
           items:
             $ref: "#/components/schemas/ProviderRankingNumber"
