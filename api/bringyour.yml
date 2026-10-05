@@ -801,8 +801,10 @@ paths:
         posts the result here as a form, and this endpoint answers `302` to the
         app's own scheme so the browser hands control back to the app:
 
-            <scheme>://oauth/apple?state=…&id_token=…&code=…&user=…
-            <scheme>://oauth/apple?state=…&error=…
+        ```
+        <scheme>://oauth/apple?state=…&id_token=…&code=…&user=…
+        <scheme>://oauth/apple?state=…&error=…
+        ```
 
         `user` is the JSON name/email Apple sends with the first authorization
         only. Nothing is stored or verified here: the app checks that `state`
@@ -902,8 +904,10 @@ paths:
         `302` to the app's own scheme so the browser hands control back to
         the app:
 
-            <scheme>://oauth/google?state=…&id_token=…
-            <scheme>://oauth/google?state=…&error=…
+        ```
+        <scheme>://oauth/google?state=…&id_token=…
+        <scheme>://oauth/google?state=…&error=…
+        ```
 
         Nothing is stored. The app checks that `state` is the attempt it
         started and that the identity token's `nonce` claim is the one it
@@ -3980,7 +3984,7 @@ paths:
         webhook as soon as the payment confirms, and the customer is emailed a
         note that the data is on the network (the code is included, already
         applied). The name is matched case-insensitively and exactly; an unknown
-        name returns `error.message` "No network named <name>".
+        name returns `error.message` `No network named <name>`.
 
         Without `network_name`, the customer receives a data code by email, as
         before. Stripe collects the email on its checkout page when `email` is
@@ -6936,11 +6940,11 @@ components:
             The following proxy URLs and auths may be used:
             | URL | Auth |
             |-----|------|
-            | https://<auth_token>.<proxy_host>:<https_proxy_port> | no auth needed when the client connects with TLS |
-            | https://<proxy_host>:<https_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
-            | http://<proxy_host>:<http_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
-            | tcp://<proxy_host>:<socks_proxy_port> | use `access_token` as the username (empty pass) |
-            | wg://<proxy_host>:<wg_proxy_port> | use `wg_config.config` as the full WireGuard config file content, which contains all the necessary keys |
+            | `https://<auth_token>.<proxy_host>:<https_proxy_port>` | no auth needed when the client connects with TLS |
+            | `https://<proxy_host>:<https_proxy_port>` | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
+            | `http://<proxy_host>:<http_proxy_port>` | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
+            | `tcp://<proxy_host>:<socks_proxy_port>` | use `access_token` as the username (empty pass) |
+            | `wg://<proxy_host>:<wg_proxy_port>` | use `wg_config.config` as the full WireGuard config file content, which contains all the necessary keys |
           allOf:
             - type: object
               required:
@@ -8801,7 +8805,7 @@ components:
           type: string
         surface:
           type: string
-          description: email.<step> | offer.in_app | offer.email | cadence
+          description: "`email.<step>` | `offer.in_app` | `offer.email` | `cadence`"
         status:
           type: string
           enum: [draft, running, paused, done]
@@ -8921,7 +8925,7 @@ components:
           type: string
         tags:
           type: array
-          description: the send's tags; the campaign sends carry [onboarding, <step>, <variant>]
+          description: the send's tags; the campaign sends carry `[onboarding, <step>, <variant>]`
           items:
             type: string
         tag:
@@ -10876,7 +10880,7 @@ components:
             (milliseconds above the expected delay), weight_quality,
             weight_speed (the relative selection weight), tier_quality,
             tier_speed (0 is best; 3 is past the speed or delay cutoff). A
-            reliability lookback outside these is reliability_lookback_<index>.
+            reliability lookback outside these is `reliability_lookback_<index>`.
           type: string
         has_value:
           type: boolean

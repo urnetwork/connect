@@ -17,13 +17,17 @@
 # Everything else, including every structural rule, is enforced. Run:
 #   npx -y @redocly/cli lint bringyour.yml
 #
-# One rule of our own, for descriptions, which every renderer reads as
-# CommonMark (ur.io's API reference, Redoc, GitHub):
+# Two rules of our own, for descriptions, which every renderer reads as
+# CommonMark (ur.io's API reference, Redoc, GitHub). A description whose
+# backticks pair up is checked outside its code spans and code blocks:
 #
 #   rule/description-wildcards-as-code -- a wildcard name such as `weight_*`
 #     or `email.*` is written as code. Bare, its `*` reads as an emphasis
-#     marker: "(weight_*, tier_*)" renders "tier_" in italics. A description
-#     whose backticks pair up is checked outside its code spans.
+#     marker: "(weight_*, tier_*)" renders "tier_" in italics.
+#
+#   rule/description-placeholders-as-code -- a placeholder such as `<name>`
+#     is written as code. Bare, it reads as an HTML tag, which renderers drop:
+#     "https://<proxy_host>:<https_proxy_port>" renders "https://:".
 extends:
   - recommended
 
@@ -37,6 +41,14 @@ rules:
     assertions:
       notPattern: '/^(?:[^`]*`[^`]*`)*[^`]*?[A-Za-z][\w.]*[._]\*/'
     message: Write a wildcard name such as `weight_*` as code, or its `*` reads as emphasis.
+    severity: error
+  rule/description-placeholders-as-code:
+    subject:
+      type: any
+      property: description
+    assertions:
+      notPattern: '/^(?:[^`]*`[^`]*`)*[^`]*?<[a-z][a-z0-9_]*>/'
+    message: Write a placeholder such as `<name>` as code, or it reads as an HTML tag and is dropped.
     severity: error
 
 apis:
