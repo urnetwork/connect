@@ -167,14 +167,13 @@ type MultiClientGeneratorWithIpFamily interface {
 	NextDestinationsWithIpFamily(count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error)
 }
 
-// MultiClientGeneratorWithClientId is an optional generator capability:
-// discover one named provider instead of the generator's own specs. A sticky
-// window (the user's Fixed IP) uses it to ask for the exit it lost to
-// transport loss before it falls back to discovery, so a provider that is
-// still online comes back with the same egress ip. The platform applies its
-// usual exclusions to the named provider: an answer without it means "not
-// that provider". A generator without the capability is never asked, and the
-// window discovers as before.
+// An optional generator capability: discover one named provider instead of the
+// generator's own specs. A sticky window (the user's Fixed IP) uses it to ask
+// for the exit it lost to transport loss before it falls back to discovery, so
+// a provider that is still online comes back with the same egress ip. The
+// platform applies its usual exclusions to the named provider: an answer
+// without it means "not that provider". A generator without the capability is
+// never asked, and the window discovers as before.
 type MultiClientGeneratorWithClientId interface {
 	NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error)
 }
@@ -1363,14 +1362,14 @@ func (self *WindowSizeSettings) Validate() error {
 		name  string
 		value int
 	}{
-		{"min", self.WindowSizeMin},
-		{"min p2p only", self.WindowSizeMinP2pOnly},
-		{"min ipv6 capable", self.WindowSizeMinIpv6Capable},
-		{"max", self.WindowSizeMax},
-		{"hard max", self.WindowSizeHardMax},
-		{"fixed", self.FixedWindowSize},
-		{"keep healthiest count", self.KeepHealthiestCount},
-		{"ulimit", self.Ulimit},
+		{name: "min", value: self.WindowSizeMin},
+		{name: "min p2p only", value: self.WindowSizeMinP2pOnly},
+		{name: "min ipv6 capable", value: self.WindowSizeMinIpv6Capable},
+		{name: "max", value: self.WindowSizeMax},
+		{name: "hard max", value: self.WindowSizeHardMax},
+		{name: "fixed", value: self.FixedWindowSize},
+		{name: "keep healthiest count", value: self.KeepHealthiestCount},
+		{name: "ulimit", value: self.Ulimit},
 	} {
 		if count.value < 0 {
 			return fmt.Errorf(
@@ -2888,10 +2887,10 @@ func performanceProfilesEqual(a *PerformanceProfile, b *PerformanceProfile) bool
 	return a.WindowSize == b.WindowSize
 }
 
-// SetPerformanceProfile installs the profile on every window and resets the
-// windows. A profile that does not validate is refused with its error and the
-// previous profile stays in force: the window size comes from the caller, and
-// a bad one must never panic the connection or reach the windows.
+// Installs the profile on every window and resets the windows. A profile that
+// does not validate is refused with its error and the previous profile stays in
+// force: the window size comes from the caller, and a bad one must never panic
+// the connection or reach the windows.
 func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) error {
 	performanceProfile = self.overrideAllowDirect(performanceProfile)
 	if performanceProfile != nil {
@@ -10152,8 +10151,8 @@ type multiClientWindow struct {
 	// qualificationRefreshFunc is handed to every channel for the receive-ack
 	// qualification refresh; see the channel field. nil on bare test windows.
 	qualificationRefreshFunc func(MultiHopId)
-	// providerPolicyPreference is the parent's, handed to every channel on its
-	// args (providerPolicyPreference). nil on bare test windows and when
+	// The parent's, handed to every channel on its args
+	// (providerPolicyPreference). nil on bare test windows and when
 	// disabled, which leaves every channel at its rank.
 	providerPolicyPreference *providerPolicyPreference
 	// clientMigrateFunc is G-3's drain-time seam: the parent's
@@ -10256,8 +10255,8 @@ type multiClientWindow struct {
 
 	// --- the user's Fixed IP (see ip_remote_multi_client_sticky.go) ---
 
-	// stickyRedial holds the exit a sticky window lost to transport loss,
-	// for the next discovery round to ask for first. Its own lock inside.
+	// The exit a sticky window lost to transport loss, for the next discovery
+	// round to ask for first. Its own lock inside.
 	stickyRedial stickyRedial
 }
 
@@ -11259,7 +11258,7 @@ func (self *multiClientWindow) resize() {
 						// apply. The one window that never drains is the
 						// user's Fixed IP (stickyExit), and lifetimeDrainDue
 						// has already excluded it: there the stable egress ip
-						// is the point. The warning only stops NEW flows from
+						// is the point. The warning only stops new flows from
 						// choosing this client (established flows keep
 						// running until they finish or the collapse deadline
 						// passes), and warnClient counts it in
@@ -13296,10 +13295,10 @@ type multiClientChannelArgs struct {
 	// (IPV6.md B1 exempts fixed windows from the soft minimum).
 	FixedDestination bool
 
-	// stickyRedial marks the exit a sticky window lost to transport loss,
-	// asked for again by name (enumerateStickyRedial). expand evaluates it
-	// alone, so a faster candidate cannot take the slot and change the
-	// egress ip the re-dial exists to keep.
+	// Marks the exit a sticky window lost to transport loss, asked for again by
+	// name (enumerateStickyRedial). expand evaluates it alone, so a faster
+	// candidate cannot take the slot and change the egress ip the re-dial
+	// exists to keep.
 	stickyRedial bool
 
 	// contractStatus preserves the identity of the channel whose contract
@@ -13308,9 +13307,9 @@ type multiClientChannelArgs struct {
 	// nil keeps directly constructed test channels on the legacy relay path.
 	contractStatus     func(client *multiClientChannel, status *ContractStatus)
 	providerEvaluation *providerEvaluationAttempt
-	// providerPolicyPreference is the parent's, shared by every channel: armed
-	// from this channel's provider diagnostics, read by effectiveTier. nil
-	// (bare fixtures, or disabled) leaves the channel at its rank.
+	// The parent's, shared by every channel: armed from this channel's provider
+	// diagnostics, read by effectiveTier. nil (bare fixtures, or disabled)
+	// leaves the channel at its rank.
 	providerPolicyPreference *providerPolicyPreference
 }
 

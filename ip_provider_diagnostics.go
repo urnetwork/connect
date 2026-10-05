@@ -33,7 +33,7 @@ import (
 // arm on any drop at most of the fleet (docs/IP_SECURITY.md §2.4.2).
 const SecurityPolicyRulesGeneration uint64 = 2
 
-// SecurityPolicyGeneration returns the rules generation a policy enforces:
+// The rules generation a policy enforces:
 // SecurityPolicyRulesGeneration for the built-in policy in either direction,
 // whatever its memory-scaled settings, and 0 (unknown) for a disabled or
 // custom policy.

@@ -57,9 +57,9 @@ var regionalControlDohServers = []*RegionalControlDohServer{
 	{CountryCode: "cn", Name: "DNSPod/Tencent", DohUrlIpv4: "https://120.53.53.53/dns-query"},
 }
 
-// RegionalControlDohUrls returns the bootstrap DoH server urls recommended for
-// a country, v4 and v6, or none when there is no recommendation. This is the
-// single source of the presets the apps offer (through the sdk).
+// The bootstrap DoH server urls recommended for a country, v4 and v6, or none
+// when there is no recommendation. This is the single source of the presets the
+// apps offer (through the sdk).
 func RegionalControlDohUrls(countryCode string) (dohUrlsIpv4 []string, dohUrlsIpv6 []string) {
 	countryCode = strings.ToLower(strings.TrimSpace(countryCode))
 	for _, server := range regionalControlDohServers {

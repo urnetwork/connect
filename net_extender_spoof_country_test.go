@@ -44,6 +44,7 @@ func setTestNetworkCountryCode(t *testing.T, countryCode string) {
 	})
 }
 
+// Waits until the directory's country is the expected one.
 func waitForSpoofCountryCode(t *testing.T, directory *ExtenderDirectory, expected string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -63,6 +64,7 @@ type testExtenderHint struct {
 	count     int
 }
 
+// An operator that answers with the result until a test changes it.
 func newTestExtenderHint(result *ExtenderHintResult) *testExtenderHint {
 	return &testExtenderHint{
 		result: result,
@@ -96,12 +98,14 @@ func (self *testExtenderHint) Fail(err error) {
 	self.err = err
 }
 
+// The asks so far.
 func (self *testExtenderHint) Count() int {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.count
 }
 
+// Waits until the hint has been asked at least count times.
 func (self *testExtenderHint) waitForCount(t *testing.T, count int) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)

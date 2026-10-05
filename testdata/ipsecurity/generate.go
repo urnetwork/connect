@@ -277,6 +277,8 @@ func whatsAppFrame(data []byte) []byte {
 	return cat([]byte{byte(len(data) >> 16), byte(len(data) >> 8), byte(len(data))}, data)
 }
 
+// One length-delimited protobuf field: its tag, then the value behind its
+// length.
 func protobufBytes(field protowire.Number, value []byte) []byte {
 	return protowire.AppendBytes(protowire.AppendTag(nil, field, protowire.BytesType), value)
 }

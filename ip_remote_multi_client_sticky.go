@@ -28,40 +28,38 @@ import (
 	"time"
 )
 
-// stickyExitProfile reports whether a performance profile is the user's
-// Fixed IP: a fixed window type sized to exactly one exit. It reads the
-// profile, never settings.WindowSizes: auto mode's internal speed window is
-// FixedWindowSize 1 too, and it keeps rotating as designed.
+// Reports whether a performance profile is the user's Fixed IP: a fixed window
+// type sized to exactly one exit. It reads the profile, never
+// settings.WindowSizes: auto mode's internal speed window is FixedWindowSize 1
+// too, and it keeps rotating as designed.
 func stickyExitProfile(performanceProfile *PerformanceProfile) bool {
 	_, windowSize, ok := performanceProfile.FixedWindow()
 	return ok && windowSize.FixedWindowSize == 1
 }
 
-// stickyExit reports whether this window holds the user's Fixed IP. See
-// stickyExitProfile.
+// Reports whether this window holds the user's Fixed IP. See stickyExitProfile.
 func (self *multiClientWindow) stickyExit() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return stickyExitProfile(self.performanceProfile)
 }
 
-// lifetimeDrainDue reports whether a healthy client is past its removeTime
-// and is drain-warned this pass. Draining is rotation policy, not a health
-// verdict (see the drain branch in resize). A sticky window never drains on
-// the clock: the user asked for a stable egress ip, so its exit is replaced
-// only when it is lost. A zero removeTime (MaxClientLifetime 0, rotation
-// disabled) never drains either.
+// Reports whether a healthy client is past its removeTime and is drain-warned
+// this pass. Draining is rotation policy, not a health verdict (see the drain
+// branch in resize). A sticky window never drains on the clock: the user asked
+// for a stable egress ip, so its exit is replaced only when it is lost. A zero
+// removeTime (MaxClientLifetime 0, rotation disabled) never drains either.
 func lifetimeDrainDue(stats *clientWindowStats, now time.Time, stickyExit bool) bool {
 	return !stickyExit && !stats.removeTime.IsZero() && stats.removeTime.Before(now)
 }
 
-// stickyRedial is the exit a sticky window lost to transport loss: the
-// window's own route to the provider stayed down for the whole migration
-// grace (errTransportDownTimeout), which says nothing against the provider.
-// The next discovery round asks the platform for that provider first (see
+// The exit a sticky window lost to transport loss: the window's own route to
+// the provider stayed down for the whole migration grace
+// (errTransportDownTimeout), which says nothing against the provider. The next
+// discovery round asks the platform for that provider first (see
 // enumerateStickyRedial). A verdict against the provider (blackhole, send
-// stall, sustained unhealthy) is never remembered: those exits are replaced
-// by discovery as before.
+// stall, sustained unhealthy) is never remembered: those exits are replaced by
+// discovery as before.
 //
 // One pending exit at most. The zero value is ready, so bare test windows
 // need no setup.
@@ -72,8 +70,8 @@ type stickyRedial struct {
 	pending     bool
 }
 
-// Remember holds a lost exit for the next discovery round, replacing any
-// exit already held.
+// Holds a lost exit for the next discovery round, replacing any exit already
+// held.
 func (self *stickyRedial) Remember(destination MultiHopId, stats DestinationStats) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -82,8 +80,8 @@ func (self *stickyRedial) Remember(destination MultiHopId, stats DestinationStat
 	self.pending = true
 }
 
-// Take hands the held exit to one discovery round and clears it, so an exit
-// that does not come back costs one platform round trip, not a retry loop.
+// Hands the held exit to one discovery round and clears it, so an exit that
+// does not come back costs one platform round trip, not a retry loop.
 func (self *stickyRedial) Take() (destination MultiHopId, stats DestinationStats, ok bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -97,8 +95,8 @@ func (self *stickyRedial) Take() (destination MultiHopId, stats DestinationStats
 	return
 }
 
-// Forget drops the held exit: the user changed the profile or asked for new
-// exits, and either way the old exit is no longer what they want back.
+// Drops the held exit: the user changed the profile or asked for new exits, and
+// either way the old exit is no longer what they want back.
 func (self *stickyRedial) Forget() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -107,9 +105,9 @@ func (self *stickyRedial) Forget() {
 	self.pending = false
 }
 
-// rememberStickyRedial records an exit the resize pass removes, when the
-// window is sticky and the removal is transport loss rather than a verdict.
-// Reports whether it was remembered.
+// Records an exit the resize pass removes, when the window is sticky and the
+// removal is transport loss rather than a verdict. Reports whether it was
+// remembered.
 func (self *multiClientWindow) rememberStickyRedial(client *multiClientChannel, err error, stickyExit bool) bool {
 	if !stickyExit || !errors.Is(err, errTransportDownTimeout) || client.args == nil {
 		return false
@@ -124,15 +122,15 @@ func (self *multiClientWindow) rememberStickyRedial(client *multiClientChannel, 
 	return true
 }
 
-// enumerateStickyRedial runs ahead of a discovery round: when the window
-// holds a lost exit (stickyRedial) it asks the generator for that provider by
-// client id, and ok reports a round of that one destination. The platform
-// still applies its exclusions to a named provider, so an answer without it
-// falls back to discovery in the same round. A platform that cannot be
-// reached keeps the exit pending for the enumerator's retry, which repeats
-// the round. The destination the window held is dialed with the stats it was
-// discovered with: a named answer carries no location or address family,
-// and the egress is the provider either way.
+// Runs ahead of a discovery round: when the window holds a lost exit
+// (stickyRedial) it asks the generator for that provider by client id, and ok
+// reports a round of that one destination. The platform still applies its
+// exclusions to a named provider, so an answer without it falls back to
+// discovery in the same round. A platform that cannot be reached keeps the exit
+// pending for the enumerator's retry, which repeats the round. The destination
+// the window held is dialed with the stats it was discovered with: a named
+// answer carries no location or address family, and the egress is the provider
+// either way.
 func (self *multiClientWindow) enumerateStickyRedial(
 	excludeDestinations []MultiHopId,
 	rankMode string,

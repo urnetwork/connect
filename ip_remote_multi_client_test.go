@@ -553,13 +553,13 @@ func TestMultiClientChangedPerformanceProfilePublishesConfig(t *testing.T) {
 	}
 }
 
+// A named profile a caller can send that Validate refuses.
 type testingInvalidPerformanceProfile struct {
 	name    string
 	profile *PerformanceProfile
 }
 
-// testingInvalidPerformanceProfiles are profiles a caller can send whose
-// window no window can install.
+// Profiles a caller can send whose window no window can install.
 func testingInvalidPerformanceProfiles() []testingInvalidPerformanceProfile {
 	fixed := func(windowSize WindowSizeSettings) *PerformanceProfile {
 		return &PerformanceProfile{
@@ -568,27 +568,27 @@ func testingInvalidPerformanceProfiles() []testingInvalidPerformanceProfile {
 		}
 	}
 	return []testingInvalidPerformanceProfile{
-		{"max below min", fixed(WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 1})},
-		{"negative max", fixed(WindowSizeSettings{WindowSizeMin: 0, WindowSizeMax: -1})},
-		{"negative min", fixed(WindowSizeSettings{WindowSizeMin: -3, WindowSizeMax: 2})},
-		{"negative fixed", fixed(WindowSizeSettings{WindowSizeMin: -1, WindowSizeMax: -1, FixedWindowSize: -1})},
-		{"negative min p2p only", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeMinP2pOnly: -1})},
-		{"negative hard max", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeHardMax: -1})},
-		{"negative keep healthiest count", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, KeepHealthiestCount: -1})},
-		{"negative ulimit", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, Ulimit: -1})},
-		{"negative reconnect scale", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeReconnectScale: -1})},
-		{"nan reconnect scale", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeReconnectScale: math.NaN()})},
-		{"infinite reconnect scale", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeReconnectScale: math.Inf(1)})},
-		{"fixed outside the window", fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, FixedWindowSize: 3})},
-		{"fixed window with no exit", fixed(WindowSizeSettings{})},
-		{"auto with an invalid window", &PerformanceProfile{
+		{name: "max below min", profile: fixed(WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 1})},
+		{name: "negative max", profile: fixed(WindowSizeSettings{WindowSizeMin: 0, WindowSizeMax: -1})},
+		{name: "negative min", profile: fixed(WindowSizeSettings{WindowSizeMin: -3, WindowSizeMax: 2})},
+		{name: "negative fixed", profile: fixed(WindowSizeSettings{WindowSizeMin: -1, WindowSizeMax: -1, FixedWindowSize: -1})},
+		{name: "negative min p2p only", profile: fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeMinP2pOnly: -1})},
+		{name: "negative hard max", profile: fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeHardMax: -1})},
+		{name: "negative keep healthiest count", profile: fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, KeepHealthiestCount: -1})},
+		{name: "negative ulimit", profile: fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, Ulimit: -1})},
+		{name: "negative reconnect scale", profile: fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeReconnectScale: -1})},
+		{name: "nan reconnect scale", profile: fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeReconnectScale: math.NaN()})},
+		{name: "infinite reconnect scale", profile: fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, WindowSizeReconnectScale: math.Inf(1)})},
+		{name: "fixed outside the window", profile: fixed(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 2, FixedWindowSize: 3})},
+		{name: "fixed window with no exit", profile: fixed(WindowSizeSettings{})},
+		{name: "auto with an invalid window", profile: &PerformanceProfile{
 			WindowType: WindowTypeAuto,
 			WindowSize: WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 1},
 		}},
 	}
 }
 
-// testingWindowPerformanceProfiles reads the profile each window holds.
+// The profile each window holds.
 func testingWindowPerformanceProfiles(multiClient *RemoteUserNatMultiClient) map[WindowType]*PerformanceProfile {
 	performanceProfiles := map[WindowType]*PerformanceProfile{}
 	for windowType, window := range multiClient.windows {
@@ -601,10 +601,10 @@ func testingWindowPerformanceProfiles(multiClient *RemoteUserNatMultiClient) map
 	return performanceProfiles
 }
 
-// TestPerformanceProfileValidate pins the windows a profile may carry: the
-// profiles the apps send (auto; Fixed IP, a fixed window of exactly one exit;
-// a fixed window of two to four) and the default window sizes are valid, and
-// every profile in testingInvalidPerformanceProfiles is not.
+// Pins the windows a profile may carry: the profiles the apps send (auto; Fixed
+// IP, a fixed window of exactly one exit; a fixed window of two to four) and
+// the default window sizes are valid, and every profile in
+// testingInvalidPerformanceProfiles is not.
 func TestPerformanceProfileValidate(t *testing.T) {
 	valid := []*PerformanceProfile{
 		{WindowType: WindowTypeAuto},
@@ -631,12 +631,11 @@ func TestPerformanceProfileValidate(t *testing.T) {
 	}
 }
 
-// TestMultiClientInvalidPerformanceProfileKeepsPrevious covers a caller that
-// sends a window no window can install. SetPerformanceProfile panicked on max
-// below min (after the device had already stored the profile) and installed a
-// negative window as is. It now refuses every invalid profile with an error,
-// without a panic, and the previous profile stays in force on the config and
-// on every window.
+// A caller that sends a window no window can install. SetPerformanceProfile
+// panicked on max below min (after the device had already stored the profile)
+// and installed a negative window as is. It now refuses every invalid profile
+// with an error, without a panic, and the previous profile stays in force on
+// the config and on every window.
 func TestMultiClientInvalidPerformanceProfileKeepsPrevious(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -661,7 +660,7 @@ func TestMultiClientInvalidPerformanceProfileKeepsPrevious(t *testing.T) {
 	defer multiClient.Close()
 
 	before := multiClient.config.Load()
-	beforeWindows := testingWindowPerformanceProfiles(multiClient)
+	beforeWindowPerformanceProfiles := testingWindowPerformanceProfiles(multiClient)
 	for _, invalid := range testingInvalidPerformanceProfiles() {
 		var err error
 		func() {
@@ -679,7 +678,7 @@ func TestMultiClientInvalidPerformanceProfileKeepsPrevious(t *testing.T) {
 			t.Fatalf("%s: invalid profile replaced the profile in force: %+v", invalid.name, after.performanceProfile)
 		}
 		for windowType, performanceProfile := range testingWindowPerformanceProfiles(multiClient) {
-			if performanceProfile != beforeWindows[windowType] {
+			if performanceProfile != beforeWindowPerformanceProfiles[windowType] {
 				t.Fatalf("%s: invalid profile reached window %d: %+v", invalid.name, windowType, performanceProfile)
 			}
 		}
@@ -701,12 +700,10 @@ func TestMultiClientInvalidPerformanceProfileKeepsPrevious(t *testing.T) {
 	}
 }
 
-// TestMultiClientInvalidDefaultPerformanceProfileStartsAuto covers the
-// constructor, which never validated: a default profile with an invalid
+// The constructor, which never validated: a default profile with an invalid
 // window (a device restarting with a profile an older build saved) was
-// installed and sized the windows. It is now refused and the windows start
-// in auto. The allow-direct override still applies, as it does with no
-// profile.
+// installed and sized the windows. It is now refused and the windows start in
+// auto. The allow-direct override still applies, as it does with no profile.
 func TestMultiClientInvalidDefaultPerformanceProfileStartsAuto(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

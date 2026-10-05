@@ -39,18 +39,19 @@ import (
 	"net/netip"
 )
 
-// MessagingSecurityPolicySettings controls provider-scoped messaging
-// exceptions. Use DefaultMessagingSecurityPolicySettings for reasonable
-// defaults.
+// Provider-scoped messaging exceptions. Use
+// DefaultMessagingSecurityPolicySettings for reasonable defaults.
 type MessagingSecurityPolicySettings struct {
-	// Enabled is the master switch for every messaging exception.
+	// The master switch for every messaging exception.
 	Enabled bool
 
-	// AllowWhatsApp permits TCP/5222 only when the destination is inside
-	// Meta's own AS32934 address space.
+	// Permits TCP/5222 only when the destination is inside Meta's own AS32934
+	// address space.
 	AllowWhatsApp bool
 }
 
+// Every messaging exception enabled, which today is WhatsApp on Meta's own
+// address space.
 func DefaultMessagingSecurityPolicySettings() *MessagingSecurityPolicySettings {
 	return &MessagingSecurityPolicySettings{
 		Enabled:       true,
@@ -72,6 +73,9 @@ func isSanctionedMessagingEndpoint(
 		isWhatsAppMetaEndpoint(ipPath)
 }
 
+// Reports whether a flow is TCP to the WhatsApp chat port at an address
+// inside metaNetworkPrefixes, in the family its IP version names: an
+// IPv4-mapped address under version 6 is not one. It does not allocate.
 func isWhatsAppMetaEndpoint(ipPath *IpPath) bool {
 	if ipPath == nil || ipPath.Protocol != IpProtocolTcp || ipPath.DestinationPort != whatsAppChatPort {
 		return false

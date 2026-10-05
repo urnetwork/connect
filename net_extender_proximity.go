@@ -31,11 +31,11 @@ type ExtenderHintResult struct {
 	CountryCode   string `json:"country_code"`
 }
 
-// GetExtenderHint reads the hint (DESIGNNOTES4.md §4), the continent upper
-// case and the country lower case, each empty when the operator did not place
-// the caller. It carries no credential: the answer is derived from the
-// caller's address, which the operator sees on every request anyway, and a
-// client needs it before it has logged in.
+// Reads the hint (DESIGNNOTES4.md §4), the continent upper case and the country
+// lower case, each empty when the operator did not place the caller. It carries
+// no credential: the answer is derived from the caller's address, which the
+// operator sees on every request anyway, and a client needs it before it has
+// logged in.
 //
 // For the same reason it is read through direct dialers only, never through
 // an extender, a VLESS server or a proxy: through any of those the address the

@@ -1,5 +1,11 @@
 package connect
 
+// Tests of the provider policy preference
+// (ip_remote_multi_client_policy_preference.go): the generation order, how the
+// preference arms and lapses, the demerit on the selection path, the optional
+// generation field in both directions, and the whole path over in-memory
+// transports.
+
 import (
 	"context"
 	"net"
@@ -16,26 +22,28 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// testPolicyClock is an injectable now for the preference's ttl.
+// An injectable now for the preference's ttl.
 type testPolicyClock struct {
 	stateLock sync.Mutex
 	now       time.Time
 }
 
+// The fake time.
 func (self *testPolicyClock) Now() time.Time {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.now
 }
 
+// Moves the fake time on by d.
 func (self *testPolicyClock) Advance(d time.Duration) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.now = self.now.Add(d)
 }
 
-// policyPreferenceTestChannel is a bare channel of the given static tier that
-// shares the preference, the way every window channel does through its args.
+// A bare channel of the given static tier that shares the preference, the way
+// every window channel does through its args.
 func policyPreferenceTestChannel(tier int, preference *providerPolicyPreference) *multiClientChannel {
 	return &multiClientChannel{
 		ctx: context.Background(),
@@ -48,6 +56,8 @@ func policyPreferenceTestChannel(tier int, preference *providerPolicyPreference)
 	}
 }
 
+// Delivers one diagnostics message to the channel the way its provider's
+// frame arrives.
 func receiveProviderDiagnostics(t *testing.T, channel *multiClientChannel, message *protocol.IpProviderDiagnostics) {
 	t.Helper()
 	frame := RequireToFrameWithDefaultProtocolVersion(message)
@@ -55,6 +65,7 @@ func receiveProviderDiagnostics(t *testing.T, channel *multiClientChannel, messa
 	channel.clientReceive(TransferPath{}, []*protocol.Frame{frame}, Peer{})
 }
 
+// The channels of an offer, as a set.
 func keptSet(clients []*multiClientChannel) map[*multiClientChannel]bool {
 	kept := map[*multiClientChannel]bool{}
 	for _, client := range clients {
@@ -74,12 +85,12 @@ func TestProviderPolicyGenerationOrdering(t *testing.T) {
 		generation uint64
 		current    bool
 	}{
-		{0, false},
-		{1, false},
-		{4, false},
-		{5, true},
-		{6, true},
-		{1 << 40, true},
+		{generation: 0, current: false},
+		{generation: 1, current: false},
+		{generation: 4, current: false},
+		{generation: 5, current: true},
+		{generation: 6, current: true},
+		{generation: 1 << 40, current: true},
 	} {
 		if got := preference.current(c.generation); got != c.current {
 			t.Errorf("current(%d) = %t, want %t (own generation 5)", c.generation, got, c.current)
@@ -270,8 +281,8 @@ func TestProviderPolicyPreferenceSteersRetry(t *testing.T) {
 	}
 }
 
-// oldProviderDiagnosticsDescriptor is IpProviderDiagnostics as a peer built
-// before security_policy_generation knows it.
+// IpProviderDiagnostics as a peer built before security_policy_generation
+// knows it.
 func oldProviderDiagnosticsDescriptor(t *testing.T) protoreflect.MessageDescriptor {
 	t.Helper()
 	fileProto := protodesc.ToFileDescriptorProto(protocol.File_ip_proto)
@@ -395,24 +406,26 @@ func TestProviderDiagnosticsGenerationBackwardCompatible(t *testing.T) {
 	AssertEqual(t, channel.effectiveTier(), providerPolicyDemerit)
 }
 
-// olderProviderTestPolicy stands in for a provider whose rules predate the
-// client's: a custom (generation unknown) policy that drops the client's
-// outbound UDP to one port in every relationship, which the client's own
-// policy admits.
+// Stands in for a provider whose rules predate the client's: a custom
+// (generation unknown) policy that drops the client's outbound UDP to one port
+// in every relationship, which the client's own policy admits.
 type olderProviderTestPolicy struct {
 	stats *SecurityPolicyStatsCollector
 	port  int
 }
 
+// The collector the provider passed in.
 func (self *olderProviderTestPolicy) Stats() *SecurityPolicyStatsCollector {
 	return self.stats
 }
 
+// Allows every return packet.
 func (self *olderProviderTestPolicy) InspectEgress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
 	return SecurityPolicyResultAllow, nil
 }
 
-// the provider's ingress is the client's outbound traffic
+// Drops the client's outbound UDP to the port: the provider's ingress is the
+// client's outbound traffic.
 func (self *olderProviderTestPolicy) InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
 	if ipPath.Protocol == IpProtocolUdp && ipPath.DestinationPort == self.port {
 		return SecurityPolicyResultDrop, nil
@@ -420,108 +433,115 @@ func (self *olderProviderTestPolicy) InspectIngress(provideMode protocol.Provide
 	return SecurityPolicyResultAllow, nil
 }
 
-func (self *olderProviderTestPolicy) RefreshEgress(ipPath *IpPath)  {}
+// Keeps no flow state.
+func (self *olderProviderTestPolicy) RefreshEgress(ipPath *IpPath) {}
+
+// Keeps no flow state.
 func (self *olderProviderTestPolicy) RefreshIngress(ipPath *IpPath) {}
 
-// The whole path over in-memory transports: a real provider reports its
-// generation and its drops of this client's packets in diagnostics, the
-// window hands its channels the multi-client's preference, and a drop by a
-// provider of unknown generation arms it while the built-in provider's own
-// report never does.
-func TestProviderPolicyPreferenceThroughTunnel(t *testing.T) {
-	const blockedPort = 40000
+// The UDP port the older provider's policy drops.
+const providerPolicyPreferenceTestBlockedPort = 40000
 
-	run := func(t *testing.T, providerPolicy func(context.Context, *SecurityPolicyStatsCollector) SecurityPolicy, destinationPort int) (*RemoteUserNatMultiClient, *multiClientChannel) {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		t.Cleanup(cancel)
+// The whole path over in-memory transports: a real provider with the given
+// policy reports its generation and its drops of this client's packets in
+// diagnostics, and the window hands its channels the multi-client's
+// preference. Sends to the destination port until a window channel holds the
+// provider's diagnostics, with its drops when the port is the blocked one,
+// and returns the multi-client and that channel.
+func runProviderPolicyPreferenceTunnel(t *testing.T, providerPolicy func(context.Context, *SecurityPolicyStatsCollector) SecurityPolicy, destinationPort int) (*RemoteUserNatMultiClient, *multiClientChannel) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
 
-		providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettingsWithBufferSize(32))
-		t.Cleanup(providerClient.Cancel)
-		providerLocalUserNat := NewLocalUserNatWithDefaults(ctx, "test-exit")
-		providerSettings := DefaultRemoteUserNatProviderSettings()
-		providerSettings.SecurityPolicyGenerator = providerPolicy
-		provider := NewRemoteUserNatProvider(providerClient, providerLocalUserNat, providerSettings)
-		t.Cleanup(provider.Close)
+	providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettingsWithBufferSize(32))
+	t.Cleanup(providerClient.Cancel)
+	providerLocalUserNat := NewLocalUserNatWithDefaults(ctx, "test-exit")
+	providerSettings := DefaultRemoteUserNatProviderSettings()
+	providerSettings.SecurityPolicyGenerator = providerPolicy
+	provider := NewRemoteUserNatProvider(providerClient, providerLocalUserNat, providerSettings)
+	t.Cleanup(provider.Close)
 
-		settings := DefaultMultiClientSettings()
-		settings.TcpCollapsePrevention = false
-		multi := NewRemoteUserNatMultiClient(
-			ctx,
-			testMultiClientGenerator(providerClient),
-			func(TransferPath, protocol.ProvideMode, *IpPath, []byte) {},
-			protocol.ProvideMode_Network,
-			settings,
-		)
-		t.Cleanup(multi.Close)
-		if multi.providerPolicyPreference == nil || multi.providerPolicyPreference.generation != SecurityPolicyRulesGeneration {
-			t.Fatalf("the multi-client preference does not compare against its own built-in generation: %+v", multi.providerPolicyPreference)
-		}
-
-		packet := ipOosPacket(&IpPath{
-			Version:         4,
-			Protocol:        IpProtocolUdp,
-			SourceIp:        net.ParseIP("10.0.0.1"),
-			SourcePort:      41000,
-			DestinationIp:   net.ParseIP("203.0.113.9"),
-			DestinationPort: destinationPort,
-		}, encryptedPayload(256))
-		source := SourceId(NewId())
-		for {
-			multi.SendPacket(source, protocol.ProvideMode_Network, packet, time.Second)
-			for _, window := range multi.windows {
-				for _, client := range window.unorderedClients() {
-					if diagnostics := client.providerDiagnosticsSnapshot(); diagnostics != nil &&
-						(destinationPort != blockedPort || 0 < diagnostics.BlockIngressPacketCount) {
-						return multi, client
-					}
-				}
-			}
-			select {
-			case <-ctx.Done():
-				t.Fatal("no provider diagnostics reached a window channel")
-			case <-time.After(50 * time.Millisecond):
-			}
-		}
+	settings := DefaultMultiClientSettings()
+	settings.TcpCollapsePrevention = false
+	multi := NewRemoteUserNatMultiClient(
+		ctx,
+		testMultiClientGenerator(providerClient),
+		func(TransferPath, protocol.ProvideMode, *IpPath, []byte) {},
+		protocol.ProvideMode_Network,
+		settings,
+	)
+	t.Cleanup(multi.Close)
+	if multi.providerPolicyPreference == nil || multi.providerPolicyPreference.generation != SecurityPolicyRulesGeneration {
+		t.Fatalf("the multi-client preference does not compare against its own built-in generation: %+v", multi.providerPolicyPreference)
 	}
 
-	t.Run("current provider", func(t *testing.T) {
-		multi, client := run(t, DefaultProviderSecurityPolicyWithStats, blockedPort+1)
-		if client.policyPreference() != multi.providerPolicyPreference {
-			t.Fatal("the window did not hand its channel the multi-client's preference")
+	packet := ipOosPacket(&IpPath{
+		Version:         4,
+		Protocol:        IpProtocolUdp,
+		SourceIp:        net.ParseIP("192.0.2.1"),
+		SourcePort:      41000,
+		DestinationIp:   net.ParseIP("203.0.113.9"),
+		DestinationPort: destinationPort,
+	}, encryptedPayload(256))
+	source := SourceId(NewId())
+	for {
+		multi.SendPacket(source, protocol.ProvideMode_Network, packet, time.Second)
+		for _, window := range multi.windows {
+			for _, client := range window.unorderedClients() {
+				if diagnostics := client.providerDiagnosticsSnapshot(); diagnostics != nil &&
+					(destinationPort != providerPolicyPreferenceTestBlockedPort || 0 < diagnostics.BlockIngressPacketCount) {
+					return multi, client
+				}
+			}
 		}
-		AssertEqual(t, client.providerPolicyGeneration(), SecurityPolicyRulesGeneration)
-		if multi.providerPolicyPreference.active() {
-			t.Fatal("a current provider armed the preference")
+		select {
+		case <-ctx.Done():
+			t.Fatal("no provider diagnostics reached a window channel")
+		case <-time.After(50 * time.Millisecond):
 		}
-	})
+	}
+}
 
-	t.Run("provider of unknown generation drops the flow", func(t *testing.T) {
-		multi, client := run(t, func(ctx context.Context, stats *SecurityPolicyStatsCollector) SecurityPolicy {
-			return &olderProviderTestPolicy{stats: stats, port: blockedPort}
-		}, blockedPort)
-		if client.policyPreference() != multi.providerPolicyPreference {
-			t.Fatal("the window did not hand its channel the multi-client's preference")
+// The built-in provider reports its own generation and never arms the
+// preference.
+func TestProviderPolicyPreferenceThroughTunnelCurrentProvider(t *testing.T) {
+	multi, client := runProviderPolicyPreferenceTunnel(t, DefaultProviderSecurityPolicyWithStats, providerPolicyPreferenceTestBlockedPort+1)
+	if client.policyPreference() != multi.providerPolicyPreference {
+		t.Fatal("the window did not hand its channel the multi-client's preference")
+	}
+	AssertEqual(t, client.providerPolicyGeneration(), SecurityPolicyRulesGeneration)
+	if multi.providerPolicyPreference.active() {
+		t.Fatal("a current provider armed the preference")
+	}
+}
+
+// A drop by a provider of unknown generation arms the preference, and the exit
+// readout shows the demerit.
+func TestProviderPolicyPreferenceThroughTunnelUnknownGenerationDrop(t *testing.T) {
+	multi, client := runProviderPolicyPreferenceTunnel(t, func(ctx context.Context, stats *SecurityPolicyStatsCollector) SecurityPolicy {
+		return &olderProviderTestPolicy{stats: stats, port: providerPolicyPreferenceTestBlockedPort}
+	}, providerPolicyPreferenceTestBlockedPort)
+	if client.policyPreference() != multi.providerPolicyPreference {
+		t.Fatal("the window did not hand its channel the multi-client's preference")
+	}
+	AssertEqual(t, client.providerPolicyGeneration(), uint64(0))
+	if !multi.providerPolicyPreference.active() {
+		t.Fatal("the provider's drop of the client's flow did not arm the preference")
+	}
+	AssertEqual(t, client.policyPreference().demerit(client.providerPolicyGeneration()), providerPolicyDemerit)
+	found := false
+	for _, exit := range multi.Exits() {
+		if exit.ClientId != client.ClientId() {
+			continue
 		}
-		AssertEqual(t, client.providerPolicyGeneration(), uint64(0))
-		if !multi.providerPolicyPreference.active() {
-			t.Fatal("the provider's drop of the client's flow did not arm the preference")
+		found = true
+		if !exit.ProviderDiagnosticsAvailable || exit.ProviderSecurityPolicyGeneration != 0 || exit.ProviderBlockIngressPackets == 0 {
+			t.Fatalf("exit readout diagnostics = %+v, want the unknown generation and its drops", exit)
 		}
-		AssertEqual(t, client.policyPreference().demerit(client.providerPolicyGeneration()), providerPolicyDemerit)
-		found := false
-		for _, exit := range multi.Exits() {
-			if exit.ClientId != client.ClientId() {
-				continue
-			}
-			found = true
-			if !exit.ProviderDiagnosticsAvailable || exit.ProviderSecurityPolicyGeneration != 0 || exit.ProviderBlockIngressPackets == 0 {
-				t.Fatalf("exit readout diagnostics = %+v, want the unknown generation and its drops", exit)
-			}
-			if exit.EffectiveTier < exit.Tier+providerPolicyDemerit {
-				t.Fatalf("exit readout tier %d -> %d, want the policy demerit applied", exit.Tier, exit.EffectiveTier)
-			}
+		if exit.EffectiveTier < exit.Tier+providerPolicyDemerit {
+			t.Fatalf("exit readout tier %d -> %d, want the policy demerit applied", exit.Tier, exit.EffectiveTier)
 		}
-		if !found {
-			t.Fatal("the blocking provider is missing from the exit readout")
-		}
-	})
+	}
+	if !found {
+		t.Fatal("the blocking provider is missing from the exit readout")
+	}
 }

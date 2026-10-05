@@ -726,11 +726,10 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 	return destinations, nil
 }
 
-// NextDestinationsForClientId implements MultiClientGeneratorWithClientId: one
-// find-providers2 request that names only clientId, so the platform's
-// exclusions decide whether the provider may be dialed again. An id this
-// generator excludes is answered empty without a request, as discovery would
-// never return it either.
+// Implements MultiClientGeneratorWithClientId: one find-providers2 request that
+// names only clientId, so the platform's exclusions decide whether the provider
+// may be dialed again. An id this generator excludes is answered empty without
+// a request, as discovery would never return it either.
 func (self *ApiMultiClientGenerator) NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
 	destinations := map[MultiHopId]DestinationStats{}
 	excludeClientIds := self.ExcludeClientIds()
@@ -757,8 +756,8 @@ func (self *ApiMultiClientGenerator) NextDestinationsForClientId(clientId Id, ex
 	return destinations, nil
 }
 
-// findProviders2 sends one discovery request through the injected provider
-// discovery when there is one, else the api.
+// Sends one discovery request through the injected provider discovery when
+// there is one, else the api.
 func (self *ApiMultiClientGenerator) findProviders2(ctx context.Context, findProviders2 *FindProviders2Args) (*FindProviders2Result, error) {
 	var result *FindProviders2Result
 	var err error
@@ -775,8 +774,7 @@ func (self *ApiMultiClientGenerator) findProviders2(ctx context.Context, findPro
 	return result, err
 }
 
-// addProviderDestinations adds each discovered provider as a destination with
-// its discovery stats.
+// Adds each discovered provider as a destination with its discovery stats.
 func addProviderDestinations(destinations map[MultiHopId]DestinationStats, providers []*FindProvidersProvider) {
 	for _, provider := range providers {
 		ids := []Id{}

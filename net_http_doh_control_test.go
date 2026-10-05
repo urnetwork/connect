@@ -45,6 +45,7 @@ type controlDohTestDialer struct {
 	blackholedCount  atomic.Int32
 }
 
+// The dial seam of a strategy or a DoH client on that network.
 func (self *controlDohTestDialer) dialContextSettings() *DialContextSettings {
 	return &DialContextSettings{
 		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
@@ -77,19 +78,22 @@ func controlDohTestSettings(dohUrl string, tlsConfig *tls.Config, dialer *contro
 	return settings
 }
 
+// The url rule: https to an ip literal with a path, read into its canonical
+// form, and one error code for each thing a user fixes. Every address here is
+// from the documentation ranges.
 func TestParseControlDohUrl(t *testing.T) {
 	valid := []struct {
 		dohUrl    string
 		expected  string
 		ipVersion int
 	}{
-		{dohUrl: "https://223.5.5.5/dns-query", expected: "https://223.5.5.5/dns-query", ipVersion: 4},
-		{dohUrl: "  https://1.12.12.12/dns-query\n", expected: "https://1.12.12.12/dns-query", ipVersion: 4},
-		{dohUrl: "HTTPS://223.6.6.6/dns-query", expected: "https://223.6.6.6/dns-query", ipVersion: 4},
-		{dohUrl: "https://120.53.53.53:8443/resolve", expected: "https://120.53.53.53:8443/resolve", ipVersion: 4},
-		{dohUrl: "https://[2400:3200::1]/dns-query", expected: "https://[2400:3200::1]/dns-query", ipVersion: 6},
+		{dohUrl: "https://192.0.2.53/dns-query", expected: "https://192.0.2.53/dns-query", ipVersion: 4},
+		{dohUrl: "  https://198.51.100.53/dns-query\n", expected: "https://198.51.100.53/dns-query", ipVersion: 4},
+		{dohUrl: "HTTPS://203.0.113.53/dns-query", expected: "https://203.0.113.53/dns-query", ipVersion: 4},
+		{dohUrl: "https://192.0.2.54:8443/resolve", expected: "https://192.0.2.54:8443/resolve", ipVersion: 4},
+		{dohUrl: "https://[2001:db8::53]/dns-query", expected: "https://[2001:db8::53]/dns-query", ipVersion: 6},
 		// the ip in its canonical form, so a list never holds one server twice
-		{dohUrl: "https://[2400:3200:0:0::ABCD]:443/dns-query", expected: "https://[2400:3200::abcd]:443/dns-query", ipVersion: 6},
+		{dohUrl: "https://[2001:db8:0:0::ABCD]:443/dns-query", expected: "https://[2001:db8::abcd]:443/dns-query", ipVersion: 6},
 	}
 	for _, c := range valid {
 		dohUrl, addr, err := ParseControlDohUrl(c.dohUrl)
@@ -112,22 +116,22 @@ func TestParseControlDohUrl(t *testing.T) {
 		{dohUrl: "", code: ControlDohErrorUrlInvalid},
 		{dohUrl: "   ", code: ControlDohErrorUrlInvalid},
 		// a host name would need a plaintext lookup of its own
-		{dohUrl: "https://dns.alidns.com/dns-query", code: ControlDohErrorIpRequired},
-		{dohUrl: "https://doh.pub/dns-query", code: ControlDohErrorIpRequired},
-		{dohUrl: "http://223.5.5.5/dns-query", code: ControlDohErrorHttpsRequired},
-		{dohUrl: "223.5.5.5/dns-query", code: ControlDohErrorHttpsRequired},
-		{dohUrl: "tls://223.5.5.5", code: ControlDohErrorHttpsRequired},
-		{dohUrl: "https://223.5.5.5", code: ControlDohErrorUrlInvalid},
-		{dohUrl: "https://223.5.5.5/", code: ControlDohErrorUrlInvalid},
-		{dohUrl: "https://223.5.5.5/dns-query?dns=x", code: ControlDohErrorUrlInvalid},
-		{dohUrl: "https://223.5.5.5/dns-query?", code: ControlDohErrorUrlInvalid},
-		{dohUrl: "https://223.5.5.5/dns-query#top", code: ControlDohErrorUrlInvalid},
-		{dohUrl: "https://user:secret@223.5.5.5/dns-query", code: ControlDohErrorUrlInvalid},
-		{dohUrl: "https://223.5.5.5:0/dns-query", code: ControlDohErrorUrlInvalid},
-		{dohUrl: "https://223.5.5.5:70000/dns-query", code: ControlDohErrorUrlInvalid},
+		{dohUrl: "https://dns.resolver.example/dns-query", code: ControlDohErrorIpRequired},
+		{dohUrl: "https://doh.example/dns-query", code: ControlDohErrorIpRequired},
+		{dohUrl: "http://192.0.2.53/dns-query", code: ControlDohErrorHttpsRequired},
+		{dohUrl: "192.0.2.53/dns-query", code: ControlDohErrorHttpsRequired},
+		{dohUrl: "tls://192.0.2.53", code: ControlDohErrorHttpsRequired},
+		{dohUrl: "https://192.0.2.53", code: ControlDohErrorUrlInvalid},
+		{dohUrl: "https://192.0.2.53/", code: ControlDohErrorUrlInvalid},
+		{dohUrl: "https://192.0.2.53/dns-query?dns=x", code: ControlDohErrorUrlInvalid},
+		{dohUrl: "https://192.0.2.53/dns-query?", code: ControlDohErrorUrlInvalid},
+		{dohUrl: "https://192.0.2.53/dns-query#top", code: ControlDohErrorUrlInvalid},
+		{dohUrl: "https://user:secret@192.0.2.53/dns-query", code: ControlDohErrorUrlInvalid},
+		{dohUrl: "https://192.0.2.53:0/dns-query", code: ControlDohErrorUrlInvalid},
+		{dohUrl: "https://192.0.2.53:70000/dns-query", code: ControlDohErrorUrlInvalid},
 		{dohUrl: "https://[fe80::1%25en0]/dns-query", code: ControlDohErrorUrlInvalid},
-		{dohUrl: "https://2400:3200::1/dns-query", code: ControlDohErrorUrlInvalid},
-		{dohUrl: "https:223.5.5.5/dns-query", code: ControlDohErrorUrlInvalid},
+		{dohUrl: "https://2001:db8::53/dns-query", code: ControlDohErrorUrlInvalid},
+		{dohUrl: "https:192.0.2.53/dns-query", code: ControlDohErrorUrlInvalid},
 	}
 	for _, c := range invalid {
 		dohUrl, _, err := ParseControlDohUrl(c.dohUrl)
@@ -150,25 +154,29 @@ func TestParseControlDohUrl(t *testing.T) {
 // the defaults.
 func TestControlDohSettingsPutsTheNamedServersFirst(t *testing.T) {
 	defaults := DefaultDnsResolverSettings()
+	namedDohUrlIpv4 := "https://192.0.2.53/dns-query"
+	namedDohUrlIpv6 := "https://[2001:db8::53]/dns-query"
+	// a named server that is also a default stays in the list once
+	defaultDohUrlIpv4 := defaults.RemoteDohUrlsIpv4[0]
 
 	settings := ControlDohSettings(
-		[]string{"https://223.5.5.5/dns-query", "https://1.1.1.1/dns-query"},
-		[]string{"https://[2400:3200::1]/dns-query"},
+		[]string{namedDohUrlIpv4, defaultDohUrlIpv4},
+		[]string{namedDohUrlIpv6},
 	)
-	expectedIpv4 := []string{"https://223.5.5.5/dns-query", "https://1.1.1.1/dns-query"}
+	expectedIpv4 := []string{namedDohUrlIpv4, defaultDohUrlIpv4}
 	for _, dohUrl := range defaults.RemoteDohUrlsIpv4 {
-		if dohUrl != "https://1.1.1.1/dns-query" {
+		if dohUrl != defaultDohUrlIpv4 {
 			expectedIpv4 = append(expectedIpv4, dohUrl)
 		}
 	}
 	if !slices.Equal(settings.DnsResolverSettings.RemoteDohUrlsIpv4, expectedIpv4) {
 		t.Fatalf("v4 servers = %v, expected %v", settings.DnsResolverSettings.RemoteDohUrlsIpv4, expectedIpv4)
 	}
-	expectedIpv6 := append([]string{"https://[2400:3200::1]/dns-query"}, defaults.RemoteDohUrlsIpv6...)
+	expectedIpv6 := append([]string{namedDohUrlIpv6}, defaults.RemoteDohUrlsIpv6...)
 	if !slices.Equal(settings.DnsResolverSettings.RemoteDohUrlsIpv6, expectedIpv6) {
 		t.Fatalf("v6 servers = %v, expected %v", settings.DnsResolverSettings.RemoteDohUrlsIpv6, expectedIpv6)
 	}
-	for _, dohUrl := range []string{"https://223.5.5.5/dns-query", "https://1.1.1.1/dns-query", "https://[2400:3200::1]/dns-query"} {
+	for _, dohUrl := range []string{namedDohUrlIpv4, defaultDohUrlIpv4, namedDohUrlIpv6} {
 		if score := settings.ServerStatsSeed[dohUrl]; score != dohSeedMaxScore {
 			t.Errorf("seed of %s = %v, expected %v", dohUrl, score, dohSeedMaxScore)
 		}
@@ -183,7 +191,7 @@ func TestControlDohSettingsPutsTheNamedServersFirst(t *testing.T) {
 	namedFirstCount := 0
 	for range 400 {
 		ordered := stats.order(remoteDohUrls(settings, 4))
-		if ordered[0] == "https://223.5.5.5/dns-query" || ordered[0] == "https://1.1.1.1/dns-query" {
+		if ordered[0] == namedDohUrlIpv4 || ordered[0] == defaultDohUrlIpv4 {
 			namedFirstCount += 1
 		}
 	}
@@ -205,19 +213,28 @@ func TestControlDohSettingsPutsTheNamedServersFirst(t *testing.T) {
 	}
 }
 
-// The cn presets are the checked v4 servers, read by the same rule a user's
-// url is, and a country without a recommendation has none.
+// The cn presets are v4 servers, in table order for any case and spacing of the
+// code, read by the same rule a user's url is, and a country without a
+// recommendation has none. The expected lists come from the table, so no
+// production address is written into the test.
 func TestRegionalControlDohUrls(t *testing.T) {
-	expected := []string{
-		"https://223.5.5.5/dns-query",
-		"https://223.6.6.6/dns-query",
-		"https://1.12.12.12/dns-query",
-		"https://120.53.53.53/dns-query",
+	expectedIpv4 := []string{}
+	for _, server := range regionalControlDohServers {
+		if server.CountryCode != "cn" {
+			continue
+		}
+		if server.DohUrlIpv6 != "" {
+			t.Fatalf("cn preset %s has a v6 url, expected the v4 presets only", server.Name)
+		}
+		expectedIpv4 = append(expectedIpv4, server.DohUrlIpv4)
+	}
+	if len(expectedIpv4) == 0 {
+		t.Fatal("no cn presets")
 	}
 	for _, countryCode := range []string{"cn", "CN", " Cn "} {
 		dohUrlsIpv4, dohUrlsIpv6 := RegionalControlDohUrls(countryCode)
-		if !slices.Equal(dohUrlsIpv4, expected) {
-			t.Fatalf("%q v4 = %v, expected %v", countryCode, dohUrlsIpv4, expected)
+		if !slices.Equal(dohUrlsIpv4, expectedIpv4) {
+			t.Fatalf("%q v4 = %v, expected %v", countryCode, dohUrlsIpv4, expectedIpv4)
 		}
 		if len(dohUrlsIpv6) != 0 {
 			t.Fatalf("%q v6 = %v, expected none", countryCode, dohUrlsIpv6)

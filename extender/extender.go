@@ -145,9 +145,9 @@ type ExtenderSettings struct {
 	// Budget for one upstream response header and for each further step of the
 	// relay, so a site that stops sending releases the proxied slot (A5).
 	ProxyIdleTimeout time.Duration
-	// SpoofDomains, when set, replaces connect.AllSpoofDomains() -- the global
-	// list and every country list -- in the whitelist (A5, A10). Tests install
-	// synthetic names through it.
+	// When set, replaces connect.AllSpoofDomains() -- the global list and every
+	// country list -- in the whitelist (A5, A10). Tests install synthetic names
+	// through it.
 	SpoofDomains []string
 	// ProxyTlsConfig, when set, is the upstream client configuration of the
 	// reverse proxy, which verifies normally. Tests inject the roots of their
