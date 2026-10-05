@@ -4137,6 +4137,7 @@ paths:
         The route accepts two body shapes:
         - SEED starts a new trail through the validator-chosen entry provider.
         - EXTEND claims the pending assigned hop of an active trail.
+
         The request must egress from the provider being claimed - the server
         resolves the hop from the request source IP, never from the body.
         Authentication is the protocol's own Ed25519 signatures (over the
