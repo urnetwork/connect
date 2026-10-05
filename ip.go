@@ -7566,8 +7566,9 @@ type RemoteUserNatProvider struct {
 	// Immutable provider identity sent to each authenticated source on its
 	// first packet. The policy digest is computed once at construction, never
 	// on a packet hot path.
-	buildVersion       string
-	securityPolicyHash string
+	buildVersion             string
+	securityPolicyHash       string
+	securityPolicyGeneration uint64
 	// Defense in depth at the exit. Client and provider policies are
 	// intentionally independent, and multiple tunnel clients can share an IP
 	// tuple, so smtpEgressGuard namespaces its state by the authenticated source.
@@ -7768,6 +7769,7 @@ func newAdmittedRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat
 		securityPolicy:           securityPolicy,
 		buildVersion:             BuildVersion(),
 		securityPolicyHash:       SecurityPolicyHash(securityPolicy),
+		securityPolicyGeneration: SecurityPolicyGeneration(securityPolicy),
 		settings:                 settings,
 		packetStatsCounters:      &packetStatsCounters{},
 		packetStatsCallbacks:     NewCallbackList[PacketStatsFunction](),

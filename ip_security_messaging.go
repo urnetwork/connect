@@ -5,11 +5,14 @@ package connect
 // WhatsApp's chat session runs Noise over TCP/5222 to Meta's own edge, and
 // after its short framing header the payload is random from the first
 // packets: the encrypted heuristic dropped it after three payloads, so
-// messages stopped while connected (support inbox 7787). A positive Noise "WA"
-// framing detector needs a packet capture first. Until then the exception is
-// the Steam shape (ip_security_gaming.go): the intersection of the vendor's
-// own destination prefixes, the transport, and the one port, and never any of
-// the three alone.
+// messages stopped while connected (support inbox 7787). The positive Noise
+// detector (whatsAppStream, ip_security_appstandard.go) now recognizes the
+// stream's opening bytes on any address. This exception stays as its
+// backstop on Meta's own address space, for WhatsApp flows the detector does
+// not recognize (a flow first seen mid-stream, an opening that differs from
+// the public clients' layout). It has the Steam shape (ip_security_gaming.go):
+// the intersection of the vendor's own destination prefixes, the transport,
+// and the one port, and never any of the three alone.
 //
 // Meta sources, snapshot 2026-10-04:
 //   - prefixes: the route and route6 objects for origin AS32934 in RADb, the
@@ -23,10 +26,11 @@ package connect
 //   - port: TCP 5222, the WhatsApp chat port. 5223 is not included until a
 //     capture shows WhatsApp using it.
 //
-// The exception runs after the positive BitTorrent signatures, and an
-// allowed flow keeps checking them for its whole inspection budget (like an
-// application standard), so a recognized BitTorrent flow to Meta address
-// space on 5222 is still an incident.
+// The exception runs after the positive BitTorrent signatures and the
+// application standards, and an allowed flow keeps checking the signatures
+// for its whole inspection budget (like an application standard), so a
+// recognized BitTorrent flow to Meta address space on 5222 is still an
+// incident.
 
 import (
 	"net/netip"

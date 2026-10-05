@@ -96,7 +96,10 @@ func flattenHttpRequestCauses(err error) []httpRequestCause {
 			available := remaining - len(pending)
 			if len(causes) > available {
 				overflow = true
-				causes = causes[:available]
+				// Admit the complete child frame before following any branch.
+				// Truncating first can discard absent slots yet visit a cyclic
+				// first child that the original allowance cannot cover.
+				continue
 			}
 			before := len(pending)
 			for index := len(causes) - 1; index >= 0; index-- {
@@ -107,7 +110,7 @@ func flattenHttpRequestCauses(err error) []httpRequestCause {
 					incomplete = true
 				}
 			}
-			if len(pending) == before && !overflow {
+			if len(pending) == before {
 				result = append(result, httpRequestCause{err: item.err})
 			}
 			continue
@@ -125,12 +128,17 @@ func flattenHttpRequestCauses(err error) []httpRequestCause {
 			}
 		}
 		if wrapped, ok := item.err.(interface{ Unwrap() error }); ok {
-			if cause := wrapped.Unwrap(); cause != nil {
-				if len(pending) >= remaining {
-					overflow = true
-				} else {
-					pending = append(pending, pendingCause{err: cause, depth: item.depth + 1})
-				}
+			cause := wrapped.Unwrap()
+			if len(pending) >= remaining {
+				overflow = true
+			} else if cause != nil {
+				pending = append(pending, pendingCause{err: cause, depth: item.depth + 1})
+			} else {
+				// An absent single child consumes the same allowance as an
+				// absent joined child, without taking an admitted sibling's slot.
+				remaining--
+			}
+			if cause != nil {
 				continue
 			}
 			// An absent wrapped cause cannot acquire transport authority from

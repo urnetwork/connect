@@ -2,7 +2,10 @@ package connect
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/urnetwork/connect/protocol"
@@ -112,5 +115,134 @@ func TestProviderDiagnosticsFrameAndChannelOrdering(t *testing.T) {
 	channel.clientReceive(TransferPath{}, []*protocol.Frame{equal}, Peer{})
 	if got := channel.providerDiagnosticsSnapshot(); got.BuildVersion != "provider-44" {
 		t.Fatalf("equal-generation diagnostics replaced immutable snapshot: %+v", got)
+	}
+}
+
+// The generation names the built-in rules, not settings or memory: the
+// memory-bounded provider policy differs from the default in its hash
+// (MaxFlows) and not in its generation. A disabled or custom policy is
+// unknown.
+func TestSecurityPolicyGenerationIdentifiesBuiltinRules(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	provider := DefaultProviderSecurityPolicy(ctx)
+	bounded := newNatProviderSecurityPolicy(ctx, DefaultRemoteUserNatProviderSettings(), true)
+	AssertEqual(t, SecurityPolicyGeneration(provider), SecurityPolicyRulesGeneration)
+	AssertEqual(t, SecurityPolicyGeneration(DefaultSecurityPolicy(ctx)), SecurityPolicyRulesGeneration)
+	AssertEqual(t, SecurityPolicyGeneration(bounded), SecurityPolicyRulesGeneration)
+	if SecurityPolicyHash(provider) == SecurityPolicyHash(bounded) {
+		t.Fatal("the memory-bounded policy hashed like the default; the hash no longer shows why it cannot order providers")
+	}
+	AssertEqual(t, SecurityPolicyGeneration(DisableSecurityPolicy()), uint64(0))
+	AssertEqual(t, SecurityPolicyGeneration(&olderProviderTestPolicy{stats: DefaultSecurityPolicyStatsCollector()}), uint64(0))
+	if SecurityPolicyRulesGeneration == 0 {
+		t.Fatal("generation 0 is reserved for unknown")
+	}
+}
+
+// A real provider computes its generation at construction and sends it with
+// its identity; a provider whose generation is unknown leaves the field absent,
+// as a provider from before the field does.
+func TestProviderDiagnosticsReportSecurityPolicyGeneration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	newProvider := func(settings *RemoteUserNatProviderSettings) *RemoteUserNatProvider {
+		clientSettings := DefaultClientSettings()
+		clientSettings.SendBufferSettings.SequenceBufferSize = 0
+		clientSettings.SendBufferSettings.AckBufferSize = 0
+		clientSettings.ReceiveBufferSettings.SequenceBufferSize = 0
+		clientSettings.ForwardBufferSettings.SequenceBufferSize = 0
+		providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), clientSettings)
+		t.Cleanup(providerClient.Cancel)
+		provider := NewRemoteUserNatProvider(providerClient, NewLocalUserNatWithDefaults(ctx, "test-exit"), settings)
+		t.Cleanup(provider.Close)
+		return provider
+	}
+
+	builtin := newProvider(DefaultRemoteUserNatProviderSettings())
+	identity := builtin.providerDiagnosticsMessage(NewId())
+	if identity == nil || identity.SecurityPolicyGeneration == nil {
+		t.Fatalf("the provider identity has no generation: %+v", identity)
+	}
+	AssertEqual(t, identity.GetSecurityPolicyGeneration(), SecurityPolicyRulesGeneration)
+	frame := RequireToFrameWithDefaultProtocolVersion(identity)
+	defer MessagePoolReturn(frame.MessageBytes)
+	roundTrip, err := FromFrame(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	AssertEqual(t, providerDiagnosticsFromProtocol(roundTrip.(*protocol.IpProviderDiagnostics)).SecurityPolicyGeneration, SecurityPolicyRulesGeneration)
+
+	customSettings := DefaultRemoteUserNatProviderSettings()
+	customSettings.SecurityPolicyGenerator = func(ctx context.Context, stats *SecurityPolicyStatsCollector) SecurityPolicy {
+		return &olderProviderTestPolicy{stats: stats}
+	}
+	custom := newProvider(customSettings)
+	if identity := custom.providerDiagnosticsMessage(NewId()); identity == nil || identity.SecurityPolicyGeneration != nil {
+		t.Fatalf("a provider of unknown generation reported one: %+v", identity)
+	}
+}
+
+// securityPolicyRulesDigest digests what the built-in rules are made of apart
+// from code: the default settings, without the memory-scaled MaxFlows, and the
+// hand-maintained exception tables. The CFAA tables are left out; every
+// release build regenerates them from the feeds.
+func securityPolicyRulesDigest(t *testing.T) string {
+	t.Helper()
+	dmca := DefaultDmcaSecurityPolicySettings()
+	dmca.MaxFlows = 0
+	settings, err := json.Marshal(struct {
+		Cfaa *CfaaSecurityPolicySettings `json:"cfaa"`
+		Dmca *DmcaSecurityPolicySettings `json:"dmca"`
+		Web  *WebStandardSettings        `json:"web"`
+	}{
+		Cfaa: DefaultCfaaSecurityPolicySettings(),
+		Dmca: dmca,
+		Web:  DefaultWebStandardSettings(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.New()
+	digest.Write(settings)
+	fmt.Fprintf(
+		digest,
+		"\x00steam %v\x00meta %v\x00telegram %v %d",
+		steamValveNetworkPrefixes,
+		metaNetworkPrefixes,
+		telegramCallReflectorIpv4Ranges,
+		telegramCallV12TcpFallbackIpv4,
+	)
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+// securityPolicyRulesPins records the rules digest each generation names.
+// Adding a detector or changing a default raises SecurityPolicyRulesGeneration
+// and adds the new generation's digest here, the one the failing test prints.
+// Earlier pins stay, as the record of what each generation enforced.
+var securityPolicyRulesPins = map[uint64]string{
+	1: "407caba79a8ec322fcd653892513e72b7add09eb98eefa40371c622daea6fbda",
+	2: "beb5d39cf504631b18651dd2ddd8b20f080626a3f4f38431501b6d7707820b5f",
+}
+
+// A change to the default settings or an exception table must come with a
+// generation the providers can report, or clients cannot tell providers with
+// the new rules from older ones. This cannot see a rule change made in code
+// alone; SecurityPolicyRulesGeneration says to raise it then too.
+func TestSecurityPolicyRulesGenerationPin(t *testing.T) {
+	digest := securityPolicyRulesDigest(t)
+	if pin := securityPolicyRulesPins[SecurityPolicyRulesGeneration]; digest != pin {
+		t.Fatalf(`the built-in security policy rules changed: digest %s, pinned %q for generation %d.
+Raise SecurityPolicyRulesGeneration to %d (ip_provider_diagnostics.go) and add %d: %q to
+securityPolicyRulesPins, keeping the earlier pins.`,
+			digest,
+			pin,
+			SecurityPolicyRulesGeneration,
+			SecurityPolicyRulesGeneration+1,
+			SecurityPolicyRulesGeneration+1,
+			digest,
+		)
 	}
 }

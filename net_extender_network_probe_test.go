@@ -150,8 +150,8 @@ func TestExtenderNetworkClientProbesTheHintedContinentFirstAndStops(t *testing.T
 				clock.advance(time.Second)
 				return probes.probe(ctx, candidate, attestor)
 			}
-			settings.Hint = func(ctx context.Context) (string, error) {
-				return "eu", nil
+			settings.Hint = func(ctx context.Context) (*ExtenderHintResult, error) {
+				return &ExtenderHintResult{ContinentCode: "eu"}, nil
 			}
 			settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
 				return nil, nil
@@ -401,7 +401,7 @@ func TestExtenderNetworkClientInfersTheContinentFromDns(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	newClient := func(t *testing.T, continents []string, hint func(ctx context.Context) (string, error)) *ExtenderDirectory {
+	newClient := func(t *testing.T, continents []string, hint func(ctx context.Context) (*ExtenderHintResult, error)) *ExtenderDirectory {
 		t.Helper()
 		clock := newTestClock()
 		rootPrivateKey, rootPublicKey := newTestRootKeyPair(t)
@@ -433,24 +433,24 @@ func TestExtenderNetworkClientInfersTheContinentFromDns(t *testing.T) {
 	}
 
 	// the operator cannot be reached: the dns says NA
-	directory := newClient(t, []string{"NA", "NA", "NA"}, func(ctx context.Context) (string, error) {
-		return "", fmt.Errorf("no operator in this test")
+	directory := newClient(t, []string{"NA", "NA", "NA"}, func(ctx context.Context) (*ExtenderHintResult, error) {
+		return nil, fmt.Errorf("no operator in this test")
 	})
 	waitForHint(t, directory, "NA")
 
 	// the operator cannot place the caller: the dns still says NA
-	directory = newClient(t, []string{"NA", "NA"}, func(ctx context.Context) (string, error) {
-		return "", nil
+	directory = newClient(t, []string{"NA", "NA"}, func(ctx context.Context) (*ExtenderHintResult, error) {
+		return &ExtenderHintResult{}, nil
 	})
 	waitForHint(t, directory, "NA")
 
 	// a majority is enough; a split is not a hint
-	directory = newClient(t, []string{"NA", "NA", "EU"}, func(ctx context.Context) (string, error) {
-		return "", fmt.Errorf("no operator in this test")
+	directory = newClient(t, []string{"NA", "NA", "EU"}, func(ctx context.Context) (*ExtenderHintResult, error) {
+		return nil, fmt.Errorf("no operator in this test")
 	})
 	waitForHint(t, directory, "NA")
-	directory = newClient(t, []string{"NA", "EU"}, func(ctx context.Context) (string, error) {
-		return "", fmt.Errorf("no operator in this test")
+	directory = newClient(t, []string{"NA", "EU"}, func(ctx context.Context) (*ExtenderHintResult, error) {
+		return nil, fmt.Errorf("no operator in this test")
 	})
 	// give the bootstrap time to have run, then check nothing was inferred
 	waitForDirectoryChanges(t, directory, 1)
@@ -460,8 +460,8 @@ func TestExtenderNetworkClientInfersTheContinentFromDns(t *testing.T) {
 	}
 
 	// the operator's hint wins over the dns
-	directory = newClient(t, []string{"NA", "NA"}, func(ctx context.Context) (string, error) {
-		return "AS", nil
+	directory = newClient(t, []string{"NA", "NA"}, func(ctx context.Context) (*ExtenderHintResult, error) {
+		return &ExtenderHintResult{ContinentCode: "AS"}, nil
 	})
 	waitForHint(t, directory, "AS")
 	time.Sleep(50 * time.Millisecond)

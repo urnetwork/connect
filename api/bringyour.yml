@@ -1208,20 +1208,23 @@ paths:
   /network/extender-hint:
     get:
       tags: [extenders]
-      summary: The continent to try extenders on first
+      summary: The continent to try extenders on first, and the country to front them for
       description: |
         The continent the operator places the caller's address on
         (connect/DESIGNNOTES4.md §4), upper case, from the same mapping the
         extender geo dns and the `continent_code` tag on signed extender
         records use -- so a client can order the records it holds by "on my
-        continent" before it has measured anything.
+        continent" before it has measured anything -- and the country of
+        that address, whose spoof list the client fronts its extender dials
+        with when the country has one (connect/EXTENDER.md A10).
 
         No credential. The answer is derived from the address this request
         arrived from, which the operator sees on every request anyway, and a
         client needs it before it has logged in. NEVER call it through an
         extender: the address placed is the address the request arrived
-        from. An empty `continent_code` is an address the operator cannot
-        place, which a client treats as no hint rather than as a continent.
+        from. An empty `continent_code` or `country_code` is an address the
+        operator cannot place, which a client treats as no hint rather than
+        as a place.
       operationId: Extender Hint
       security: []
       responses:
@@ -3653,7 +3656,11 @@ paths:
   /account/wallets/remove:
     post:
       description: |
-        Remove a wallet from your list of account wallets
+        Remove a wallet from your list of account wallets. Removing the
+        payout wallet makes another active Solana or Polygon wallet of the
+        network the payout wallet, when there is one, and names it in
+        `payout_wallet_id`; otherwise USDC payouts are held until a payout
+        wallet is set.
       operationId: Account Remove Wallet
       security:
         - BearerAuth: []
@@ -3847,6 +3854,8 @@ paths:
       summary: Create a Solana Pay intent for Pro
       description: |
         When paying for a subscription with Solana, we track the order through this intent.
+        A legacy guest network (no sign-in method) is refused with
+        `error.code` `guest_sign_in_required` (PurchaseError).
       operationId: solanaPaymentIntent
       security:
         - BearerAuth: []
@@ -3919,6 +3928,8 @@ paths:
       description: |
         When paying for a subscription with Stripe, create the payment intents,
         ephemeral key, and customer id needed to complete the purchase.
+        A legacy guest network (no sign-in method) is refused with
+        `error.code` `guest_sign_in_required` (PurchaseError).
       operationId: Stripe Payment Intent
       security:
         - BearerAuth: []
@@ -4099,6 +4110,9 @@ paths:
 
         The subscription is granted by the `invoice.paid` webhook, never by the
         client; the client only polls /subscription/balance afterwards.
+
+        A legacy guest network (no sign-in method) is refused with
+        `error.code` `guest_sign_in_required` (PurchaseError).
       operationId: Stripe Create Checkout Session
       security:
         - BearerAuth: []
@@ -5224,6 +5238,9 @@ paths:
         The charged tier is finalized from the card's billing country before
         the trial ends and the tier is recorded on the subscription.
         Calling again replaces a pending, unfinished sheet.
+
+        A legacy guest network (no sign-in method) is refused with
+        `error.code` `guest_sign_in_required` (PurchaseError).
       operationId: stripePaymentSheet
       security:
         - BearerAuth: []
@@ -7981,6 +7998,30 @@ components:
         message:
           type: string
 
+    PurchaseError:
+      type: object
+      description: |
+        Why a checkout or payment intent was refused (/stripe/create-checkout-session,
+        /stripe/payment-intent, /subscription/stripe/payment-sheet and
+        /solana/payment-intent).
+      required:
+        - message
+      properties:
+        code:
+          description: |
+            A stable code for a refusal that has one, so a client can pick a
+            localized message or flow.
+            `guest_sign_in_required`: the network is a legacy guest network
+            with no sign-in method, so nothing could sign back in to a plan
+            bought on it. Add a sign-in method (POST /auth/add-auth) first;
+            the apps open their add-sign-in sheet. Store-verified purchases
+            and webhooks are never refused this way.
+            Absent from older servers and for other refusals; clients fall
+            back to `message` for an absent or unknown code.
+          type: string
+        message:
+          type: string
+
     ClientEvent:
       description: |
         One product event. The schema is CLOSED: `name` selects exactly one
@@ -8592,7 +8633,7 @@ components:
           type: boolean
         error:
           oneOf:
-            - $ref: "#/components/schemas/ErrorMessage"
+            - $ref: "#/components/schemas/PurchaseError"
             - type: "null"
 
     StripePricesResult:
@@ -9771,6 +9812,16 @@ components:
         success:
           description: Wallet successfully removed
           type: boolean
+        payout_wallet_id:
+          description: |
+            udid. Set when the removed wallet was the network's payout wallet
+            and another of the network's active Solana or Polygon wallets
+            became the payout wallet in the same transaction (the newest,
+            preferring the removed wallet's chain; never a Bittensor wallet).
+            Absent when nothing was promoted, which leaves the network with no
+            payout wallet, and from older servers. Apps show where payouts go
+            now.
+          type: string
         error:
           type: object
           required:
@@ -10946,7 +10997,7 @@ components:
           description: the SPL token mint (base58) to pay in (USDC)
         error:
           oneOf:
-            - $ref: "#/components/schemas/ErrorMessage"
+            - $ref: "#/components/schemas/PurchaseError"
             - type: "null"
 
     SolanaPaymentTransactionArgs:
@@ -12041,12 +12092,7 @@ components:
         publishable_key:
           type: string
         error:
-          type: object
-          required:
-            - message
-          properties:
-            message:
-              type: string
+          $ref: "#/components/schemas/PurchaseError"
 
     PayDataCheckoutArgs:
       type: object
@@ -12231,12 +12277,7 @@ components:
           type: string
           description: both modes; the caller can reconcile the purchase with this
         error:
-          type: object
-          required:
-            - message
-          properties:
-            message:
-              type: string
+          $ref: "#/components/schemas/PurchaseError"
 
     SubscriptionDetailsResult:
       type: object
@@ -12569,12 +12610,19 @@ components:
       type: object
       required:
         - continent_code
+        - country_code
       properties:
         continent_code:
           description: |
             The continent of the caller's address, upper case: one of AF, AN,
             AS, EU, NA, OC, SA. Empty when the operator cannot place the
             caller.
+          type: string
+        country_code:
+          description: |
+            The country of the caller's address, a lower case ISO 3166-1
+            alpha-2 code like every location the api returns. Empty when the
+            operator cannot place the caller.
           type: string
 
     ExtenderLatencyAttestation:
