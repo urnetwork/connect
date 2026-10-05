@@ -3839,6 +3839,54 @@ paths:
         "401":
           description: Missing or invalid bearer token.
 
+  /solana/payment-transaction:
+    post:
+      tags: [subscription]
+      summary: Build the browser-wallet transfer for a Solana Pay intent
+      description: |
+        The unsigned USDC transfer that pays an open Solana Pay intent of the
+        caller's network (from /solana/payment-intent, or from
+        /pay/data/solana-intent for the caller's own network), for a browser
+        wallet to sign and send through the Wallet Standard
+        `solana:signAndSendTransaction` feature. A desktop browser hands the
+        solana: payment url to an app, never to an extension wallet; with this
+        the page needs no Solana library and no rpc endpoint of its own.
+
+        The transaction is a legacy message with two instructions: a Memo of
+        the reference, then a TransferChecked of exactly the intent's quote
+        (the `amount_usd` it was quoted, 6 decimals) of USDC from `payer`'s
+        associated USDC account to the merchant's, with the reference appended
+        as a read-only account, the way a wallet builds it from the Solana Pay
+        url. The Helius webhook credits it by reference. The merchant, the mint
+        and the amount come from the server; `payer` is the fee payer and the
+        only signer, and the transaction comes back unsigned. Its recent
+        blockhash is good for about a minute, so build it when the buyer
+        clicks. A client should check that the transaction pays only the
+        merchant and the mint it expects, in the quoted amount, before handing
+        it to the wallet.
+
+        An unknown, paid or expired intent, another network's intent, an
+        address or reference that is not a Solana public key, or an
+        unreachable rpc return `error.message` with a 200. Per-ip rate limited.
+      operationId: solanaPaymentTransaction
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SolanaPaymentTransactionArgs"
+      responses:
+        "200":
+          description: The unsigned transaction, or an error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SolanaPaymentTransactionResult"
+        "401":
+          description: Missing or invalid bearer token.
+
   /stripe/payment-intent:
     post:
       description: |
@@ -10672,6 +10720,33 @@ components:
         spl_token_mint:
           type: string
           description: the SPL token mint (base58) to pay in (USDC)
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/ErrorMessage"
+            - type: "null"
+
+    SolanaPaymentTransactionArgs:
+      type: object
+      required:
+        - reference
+        - payer
+      properties:
+        reference:
+          type: string
+          description: the reference of an open Solana Pay intent of the caller's network
+        payer:
+          type: string
+          description: the paying wallet's address (base58), as the wallet reported it
+
+    SolanaPaymentTransactionResult:
+      type: object
+      required: []
+      properties:
+        transaction:
+          type: string
+          description: >-
+            the unsigned transaction for the wallet to sign and send: base64 of
+            its wire format, a legacy message
         error:
           oneOf:
             - $ref: "#/components/schemas/ErrorMessage"
