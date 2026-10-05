@@ -134,15 +134,15 @@ func newTestResumeProbeClient(
 	return networkClient, armedChecks
 }
 
-// The next check the probe loop arms, which it does once it has finished
-// with `what`.
+// The next check the loop arms, which it does once it has finished with
+// `what`.
 func nextTestResumeCheck(t *testing.T, armedChecks <-chan chan time.Time, what string) chan time.Time {
 	t.Helper()
 	select {
 	case check := <-armedChecks:
 		return check
 	case <-time.After(10 * time.Second):
-		t.Fatalf("the probe loop armed no check after %s", what)
+		t.Fatalf("the loop armed no check after %s", what)
 		return nil
 	}
 }

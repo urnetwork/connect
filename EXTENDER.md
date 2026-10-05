@@ -950,7 +950,10 @@ Backoff on failure 10 minutes doubling to 6 hours; a refusal of any
 attempted family holds the whole pass and the retry reissues both, and a
 pass that attempted nothing retries on the backoff rather than the daily
 tick. A family without an address is skipped. The hourly address check is
-one hello for both families and compares the address, not the port.
+one hello for both families and compares the address, not the port. The
+24 hour tick, the hourly check and the backoff count the time the host
+slept: a minute after waking from a sleep of 15 minutes or more, what came
+due during the sleep is due.
 
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,
