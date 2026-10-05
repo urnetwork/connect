@@ -6762,7 +6762,12 @@ components:
                 If enabled, a WireGuard configuration will be created for the proxy.
               type: boolean
             initial_device_state:
-              description: Optional. |
+              description: |
+                Required when the call creates the client (`client_id`
+                omitted): without a `location`, or a `country_code` that
+                names a country, the call is refused with
+                "Invalid location" (see the endpoint).
+
                 Whenever the device is created, it will be set up with this initial state.
                 To configure the device beyond the initial state, the SDK ProxyDevice must be used.
                 Note that the SDK ProxyDevice must reconfigure the device each time it receives a change notice.
@@ -6771,16 +6776,18 @@ components:
               properties:
                 country_code:
                   description: |
-                    Optional. Use one of country_code or location. A
+                    Optional. Use one of `country_code` or `location`. A
                     two-letter country code such as "de", upper or lower
-                    case. Without a location, the call is refused with
+                    case. Without a `location`, the call is refused with
                     "Invalid location" (see the endpoint) unless
-                    country_code names a country.
+                    `country_code` names a country.
                   type: string
                 location:
                   description: |
-                    Optional. Use one of country_code or location. A
-                    location is used as given, ahead of country_code.
+                    Optional. Use one of `country_code` or `location`. A
+                    location is used as given, ahead of `country_code`. For
+                    no particular location, set
+                    `connect_location_id.best_available` to true.
                   type: object
                   required: []
                   properties:
@@ -6798,7 +6805,7 @@ components:
                           description: udid. Optional.
                           type: string
                         best_available:
-                          description: udid. Optional.
+                          description: Optional. True connects through the best available providers, in no particular location.
                           type: boolean
                     name:
                       type: string
