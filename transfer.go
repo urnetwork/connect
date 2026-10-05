@@ -1067,9 +1067,9 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 		EvictionNotice:           true,
 		ReceiveQueueMinByteCount: kib(320),
 		AllowLegacyNack:          true,
-		// THROUGHPUTFIX §39.1. Four open receive contracts is already the
-		// window a reorder needs; an announced successor occupies one of them
-		// for at most the tail of its predecessor.
+		// Four contracts cover the receive reorder window. Accepted successors
+		// remain stored until activation; that transition trims predecessors
+		// without closing the current contract or newer announcements.
 		AcceptContractAhead:    true,
 		MaxOpenReceiveContract: 4,
 		ProtocolVersion:        DefaultProtocolVersion,
@@ -1536,6 +1536,9 @@ type ClientSettings struct {
 	// Optional lifecycle-only memory accounting. Nil leaves it disabled. The
 	// pointer is captured at construction; do not mutate settings concurrently.
 	MemoryOwnerLedger *TransferMemoryOwnerLedger
+	// Optional payload lifetime charges; nil disables packet-path accounting.
+	// Captured at construction independently from the worker ledger above.
+	PayloadOwnerLedger *TransferPayloadOwnerLedger
 
 	SendBufferSize    int
 	ForwardBufferSize int
@@ -1878,8 +1881,9 @@ type Client struct {
 
 	log Logger
 
-	settings          *ClientSettings
-	memoryOwnerLedger *TransferMemoryOwnerLedger
+	settings           *ClientSettings
+	memoryOwnerLedger  *TransferMemoryOwnerLedger
+	payloadOwnerLedger *TransferPayloadOwnerLedger
 
 	receiveCallbacks *CallbackList[ReceiveFunction]
 	forwardCallbacks *CallbackList[ForwardFunction]
@@ -2120,6 +2124,7 @@ func NewClientWithTag(
 		log:                          log,
 		settings:                     settings,
 		memoryOwnerLedger:            settings.MemoryOwnerLedger,
+		payloadOwnerLedger:           settings.PayloadOwnerLedger,
 		receiveCallbacks:             NewCallbackList[ReceiveFunction](),
 		forwardCallbacks:             NewCallbackList[ForwardFunction](),
 		subprotocols:                 newSubprotocolRegistry(),
@@ -8986,11 +8991,10 @@ sendSequenceLoop:
 						self.recordSendSequenceExit("head_rewrite", item, time.Time{}, err)
 						return
 					}
-					MessagePoolReturn(item.transferFrameBytes)
+					self.replaceSendItemFrame(item, transferFrameBytes)
 					item.head = true
 					item.hasContractFrame = hasContractFrame
 					item.promotedHead = true
-					item.transferFrameBytes = transferFrameBytes
 				} else {
 					// var err error
 					// transferFrameBytes, err = self.setTag(item)
@@ -10406,7 +10410,7 @@ func (self *SendSequence) sendWithSetContractRecords(
 			self.client.sendNoAckDiscardCount.Add(uint64(noAckSends.count))
 		}
 		item.acks.invoke(admissionErr)
-		item.messagePoolReturn()
+		self.returnSendItem(item)
 		return
 	}
 	compactContractHead := head && self.sendContract != nil &&
@@ -10591,6 +10595,9 @@ func (self *SendSequence) sendWithSetContractRecords(
 	self.client.initialSendFrameCount.Add(uint64(len(sendFrames)))
 	self.client.initialSendMessageByteCount.Add(uint64(messageByteCount))
 	if ack {
+		if ledger := self.client.payloadOwnerLedger; ledger != nil {
+			ledger.update(transferPayloadOwnerSendAck, self.sequenceId[15], 1, int64(cap(item.transferFrameBytes)))
+		}
 		// Publish acknowledgement identity before any observer or route can expose
 		// the bytes to the peer. A direct route can return its Ack synchronously
 		// inside the write; validation must find the item instead of discarding that
@@ -10673,7 +10680,7 @@ func (self *SendSequence) sendWithSetContractRecords(
 			self.ackItem(item)
 		} else {
 			item.acks.invoke(err)
-			item.messagePoolReturn()
+			self.returnSendItem(item)
 		}
 	}
 }
@@ -10782,8 +10789,7 @@ func (self *SendSequence) receiveContractMissing(
 		)
 		return false
 	}
-	MessagePoolReturn(item.transferFrameBytes)
-	item.transferFrameBytes = transferFrameBytes
+	self.replaceSendItemFrame(item, transferFrameBytes)
 	item.head = true
 	item.hasContractFrame = hasContractFrame
 	item.sendTime = time.Now()
@@ -12203,7 +12209,7 @@ func (self *SendSequence) ackItem(item *sendItem) {
 		}
 	}
 	item.acks.invoke(nil)
-	item.messagePoolReturn()
+	self.returnSendItem(item)
 }
 
 func (self *SendSequence) releaseRetainedSendItems(err error) {
@@ -12216,14 +12222,14 @@ func (self *SendSequence) releaseRetainedSendItems(err error) {
 		if item != nil {
 			self.resendQueue.RemoveByMessageId(item.messageId)
 			item.acks.invoke(err)
-			item.messagePoolReturn()
+			self.returnSendItem(item)
 		}
 	}
 	self.sendItems = nil
 	// Also support direct/test queue construction without an identity list.
 	for _, item := range self.resendQueue.Clear() {
 		item.acks.invoke(err)
-		item.messagePoolReturn()
+		self.returnSendItem(item)
 	}
 }
 
@@ -16148,6 +16154,7 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		if superseded != nil && superseded != receiveContract {
 			self.client.ContractManager().closeContractStats(superseded.contractId)
 		}
+		self.trimReceiveContracts()
 		return nil
 	}
 
@@ -16180,6 +16187,15 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		self.client.ContractManager().closeContractStats(superseded.contractId)
 	}
 
+	self.trimReceiveContracts()
+	return nil
+}
+
+// Announced successors also need the existing retirement window when activated.
+// Keep the current contract and any newer accepted announcements: activation
+// may retire predecessors, but must not close a successor before its first use.
+// An excess of not-yet-activated announcements can still exceed the window.
+func (self *ReceiveSequence) trimReceiveContracts() {
 	if d := len(self.openReceiveContracts) - self.receiveBufferSettings.MaxOpenReceiveContract; 0 < d {
 		// remove the least recently added
 		orderedReceiveContracts := slices.Collect(maps.Values(self.openReceiveContracts))
@@ -16188,7 +16204,7 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 			return a.localId.Cmp(b.localId)
 		})
 		for _, receiveContract := range orderedReceiveContracts[:d] {
-			if receiveContract != self.receiveContract {
+			if receiveContract.localId.Cmp(self.receiveContract.localId) < 0 {
 				self.client.ContractManager().CloseContract(
 					receiveContract.contractId,
 					receiveContract.ackedByteCount,
@@ -16198,8 +16214,6 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 			}
 		}
 	}
-
-	return nil
 }
 
 // Tracks the verified stream that can carry destination-only ACK traffic back
@@ -16929,7 +16943,7 @@ func NewForwardSequence(
 }
 
 // success, error
-func (self *ForwardSequence) Pack(forwardPack *ForwardPack, timeout time.Duration) (bool, error) {
+func (self *ForwardSequence) Pack(forwardPack *ForwardPack, timeout time.Duration) (success bool, err error) {
 	self.packMutex.RLock()
 	defer self.packMutex.RUnlock()
 
@@ -16945,6 +16959,18 @@ func (self *ForwardSequence) Pack(forwardPack *ForwardPack, timeout time.Duratio
 		return false, errors.New("Done.")
 	}
 	defer self.idleCondition.UpdateClose()
+
+	if ledger := self.client.payloadOwnerLedger; ledger != nil {
+		// Charge before publication: the worker may return the payload before
+		// this sender resumes. A pending offer is included until refused.
+		bytes := int64(cap(forwardPack.TransferFrameBytes))
+		ledger.update(transferPayloadOwnerForward, self.destination.DestinationId[15], 1, bytes)
+		defer func() {
+			if !success {
+				ledger.update(transferPayloadOwnerForward, self.destination.DestinationId[15], -1, -bytes)
+			}
+		}()
+	}
 
 	// fast path without arming a timer
 	select {
@@ -17010,8 +17036,11 @@ func (self *ForwardSequence) Run() {
 					transferFrameBytes = MessagePoolCopy(forwardPack.TransferFrameBytes)
 					// the write proceeds on the copy; the original is done here
 					MessagePoolReturn(forwardPack.TransferFrameBytes)
+					if ledger := self.client.payloadOwnerLedger; ledger != nil {
+						ledger.update(transferPayloadOwnerForward, self.destination.DestinationId[15], 0, int64(cap(transferFrameBytes)-cap(forwardPack.TransferFrameBytes)))
+					}
 				}
-				defer MessagePoolReturn(transferFrameBytes)
+				defer self.returnForwardPayload(transferFrameBytes)
 				shared := MessagePoolShareReadOnly(transferFrameBytes)
 				err := self.multiRouteWriter.Write(
 					self.ctx,
@@ -17097,7 +17126,7 @@ func (self *ForwardSequence) Close() {
 				if !ok {
 					return
 				}
-				MessagePoolReturn(forwardPack.TransferFrameBytes)
+				self.returnForwardPayload(forwardPack.TransferFrameBytes)
 			default:
 				return
 			}

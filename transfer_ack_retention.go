@@ -75,7 +75,7 @@ func (self *SendSequence) expireSendItem(item *sendItem, now time.Time) {
 		}
 	}
 	item.acks.invoke(context.DeadlineExceeded)
-	item.messagePoolReturn()
+	self.returnSendItem(item)
 	if index == 0 {
 		self.scheduleAckTimeoutHead(now)
 	}
