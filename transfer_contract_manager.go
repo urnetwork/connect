@@ -430,6 +430,9 @@ type ContractManager struct {
 	provideMonitor *Monitor
 
 	destinationContracts map[ContractKey]*contractQueue
+	// Protected by mutex. Contract-free clients need no expiry worker; once
+	// a contract is queued, the worker remains owned through its final flush.
+	contractExpiryStarted bool
 
 	receiveNoContractClientIds map[Id]bool
 	sendNoContractClientIds    map[Id]bool
@@ -519,8 +522,6 @@ func NewContractManager(
 	if client.ClientId() != ControlId {
 		contractManager.startWorker("provide ping", contractManager.providePing)
 	}
-
-	contractManager.startWorker("contract expiry", contractManager.expireQueuedContracts)
 
 	return contractManager
 }
@@ -1496,7 +1497,15 @@ func (self *ContractManager) addContractToQueue(
 	if self.closed {
 		return errContractQueueDrained
 	}
-	return contractQueue.Add(contract, storedContract)
+	if err := contractQueue.Add(contract, storedContract); err != nil {
+		return err
+	}
+	if !self.contractExpiryStarted {
+		// This admission shares Close's lock, so a successfully queued result
+		// always has a joined final-flush owner, even when expiry is disabled.
+		self.contractExpiryStarted = self.startWorker("contract expiry", self.expireQueuedContracts)
+	}
+	return nil
 }
 
 // Coalesces an identical pending request within its exact queue generation.
