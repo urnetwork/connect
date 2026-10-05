@@ -1208,20 +1208,23 @@ paths:
   /network/extender-hint:
     get:
       tags: [extenders]
-      summary: The continent to try extenders on first
+      summary: The continent to try extenders on first, and the country to front them for
       description: |
         The continent the operator places the caller's address on
         (connect/DESIGNNOTES4.md §4), upper case, from the same mapping the
         extender geo dns and the `continent_code` tag on signed extender
         records use -- so a client can order the records it holds by "on my
-        continent" before it has measured anything.
+        continent" before it has measured anything -- and the country of
+        that address, whose spoof list the client fronts its extender dials
+        with when the country has one (connect/EXTENDER.md A10).
 
         No credential. The answer is derived from the address this request
         arrived from, which the operator sees on every request anyway, and a
         client needs it before it has logged in. NEVER call it through an
         extender: the address placed is the address the request arrived
-        from. An empty `continent_code` is an address the operator cannot
-        place, which a client treats as no hint rather than as a continent.
+        from. An empty `continent_code` or `country_code` is an address the
+        operator cannot place, which a client treats as no hint rather than
+        as a place.
       operationId: Extender Hint
       security: []
       responses:
@@ -12569,12 +12572,19 @@ components:
       type: object
       required:
         - continent_code
+        - country_code
       properties:
         continent_code:
           description: |
             The continent of the caller's address, upper case: one of AF, AN,
             AS, EU, NA, OC, SA. Empty when the operator cannot place the
             caller.
+          type: string
+        country_code:
+          description: |
+            The country of the caller's address, a lower case ISO 3166-1
+            alpha-2 code like every location the api returns. Empty when the
+            operator cannot place the caller.
           type: string
 
     ExtenderLatencyAttestation:

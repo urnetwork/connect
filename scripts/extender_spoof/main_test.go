@@ -215,3 +215,75 @@ func TestWriteSpoofResourceKeepsTheInputOrder(t *testing.T) {
 		}
 	}
 }
+
+// A country's own list (P052) is written under the name the connect module
+// reads it by, unless -out names another file. A code that is not two letters
+// would name a file nothing reads, and an empty country list would only fall
+// back to the global list; both are refused.
+func TestSpoofResourceOutPathNamesTheCountryList(t *testing.T) {
+	cases := []struct {
+		name         string
+		outPath      string
+		countryCode  string
+		empty        bool
+		resourcePath string
+		message      string
+	}{
+		{name: "the global list", resourcePath: "res/extender_spoof.bin"},
+		{name: "the empty global list", empty: true, resourcePath: "res/extender_spoof.bin"},
+		{name: "a country", countryCode: "RU", resourcePath: "res/extender_spoof_ru.bin"},
+		{name: "a padded country", countryCode: " ru ", resourcePath: "res/extender_spoof_ru.bin"},
+		{name: "a country with -out", outPath: "other.bin", countryCode: "ru", resourcePath: "other.bin"},
+		{name: "-out alone", outPath: "other.bin", resourcePath: "other.bin"},
+		{name: "a three letter code", countryCode: "rus", message: "not an ISO 3166-1 alpha-2 code"},
+		{name: "a code with a digit", countryCode: "r1", message: "not an ISO 3166-1 alpha-2 code"},
+		{name: "an empty country list", countryCode: "ru", empty: true, message: "fall back to the global list"},
+	}
+	for _, c := range cases {
+		resourcePath, err := spoofResourceOutPath(c.outPath, c.countryCode, c.empty)
+		if c.message != "" {
+			if err == nil || !strings.Contains(err.Error(), c.message) {
+				t.Errorf("%s: err = %v, expected %q", c.name, err, c.message)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: %s", c.name, err)
+			continue
+		}
+		if resourcePath != c.resourcePath {
+			t.Errorf("%s: resource = %q, expected %q", c.name, resourcePath, c.resourcePath)
+		}
+	}
+}
+
+// A country list the generator writes decodes to the list it was given.
+func TestWriteSpoofResourceWritesACountryList(t *testing.T) {
+	dir := t.TempDir()
+	inPath := filepath.Join(dir, "ru.txt")
+	if err := os.WriteFile(inPath, []byte("one.ru.example\nTwo.Ru.Example\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	resourcePath, err := spoofResourceOutPath("", "ru", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outPath := filepath.Join(dir, filepath.Base(resourcePath))
+	if err := writeSpoofResource(inPath, outPath, false); err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(outPath) != "extender_spoof_ru.bin" {
+		t.Fatalf("wrote %s", outPath)
+	}
+	resource, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoofDomains, err := connect.DecodeSpoofDomainsResource(resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(spoofDomains, []string{"one.ru.example", "two.ru.example"}) {
+		t.Fatalf("wrote %v", spoofDomains)
+	}
+}

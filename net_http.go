@@ -266,6 +266,9 @@ type ClientStrategy struct {
 	// custom extenders
 	// these take precedence over other extenders
 	extenderIpSecrets map[netip.Addr]string
+	// the country whose spoof list the outer names of the extender dialers
+	// were drawn from, "" for the global list (spoofDomainsForCountry)
+	extenderSpoofCountryCode string
 
 	// the DoH settings in force: what the internal DoH cache was built from
 	// and what the extender bootstrap queries. `SetInternalDohSettings`
@@ -1924,14 +1927,25 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 // its addresses are dialed on the fixed carrier ports, and `dialerWeights`
 // already excludes every non-extender dialer while one is configured.
 //
-// The outer name is one random spoof domain per dialer (A10). With no bundled
-// spoof list the name is left empty and the dial presents no sni at all: the
-// operator name the inner TLS is for must never appear in the outer
+// The outer name is one random spoof domain per dialer (A10), from the list
+// of the country the directory places this client in (SpoofCountryCode). With
+// an empty spoof list the name is left empty and the dial presents no sni at
+// all: the operator name the inner TLS is for must never appear in the outer
 // ClientHello, and a connection to an ip literal carries no name anyway.
+//
+// When the list in force changes -- the client moved into or out of a country
+// with a list of its own -- the extender dialers drawn from the other list are
+// dropped first, so every address is drawn again from this one. Left in
+// place, they would keep their addresses out of the expand, and on a network
+// that refuses their names each failure would hold its address for the hold
+// timeout. A live connection keeps running; only the dialer goes.
 func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDialer) {
 	if self.settings.ExpandExtenderProfileCount <= 0 {
 		return []*clientDialer{}
 	}
+
+	// the directory is an external object; it is read with no lock held
+	spoofDomains, spoofCountryCode := directorySpoofDomains(self.settings.ExtenderDirectory)
 
 	visitedExtenderIpProfiles := map[extenderIpProfile]bool{}
 	visitedExtenderIps := []netip.Addr{}
@@ -1940,6 +1954,16 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 	func() {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
+
+		if self.extenderSpoofCountryCode != spoofCountryCode {
+			for dialer, _ := range self.dialers {
+				if dialer.IsExtender() && !dialer.persistent {
+					dialer.Close()
+					delete(self.dialers, dialer)
+				}
+			}
+			self.extenderSpoofCountryCode = spoofCountryCode
+		}
 
 		visitedExtenderProfileCount := 0
 		visitedExtenderProfiles := map[ExtenderProfile]bool{}
@@ -1987,7 +2011,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			}
 			extenderConfigs = append(
 				extenderConfigs,
-				extenderConfigsForCandidate(candidate, extenderIpSecrets[ip])...,
+				extenderConfigsForCandidate(candidate, extenderIpSecrets[ip], spoofDomains)...,
 			)
 		}
 	} else if directory := self.settings.ExtenderDirectory; directory != nil {
@@ -2015,7 +2039,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 					}
 					extenderConfigs = append(
 						extenderConfigs,
-						extenderConfigsForCandidate(candidates[i], "")...,
+						extenderConfigsForCandidate(candidates[i], "", spoofDomains)...,
 					)
 				}
 			}
@@ -2082,9 +2106,13 @@ func extenderDialerPriority(connectMode ExtenderConnectMode) int {
 // One extender config per carrier the candidate lists (E2, E5), and one per
 // dns port when the candidate offers several (L2): 53 is dialed before 4053.
 // The identity key of a verified record is carried into the config so the
-// outer leaf is checked against it (B3).
-func extenderConfigsForCandidate(candidate *ExtenderCandidate, secret string) []*ExtenderConfig {
-	spoofDomains := SpoofDomains()
+// outer leaf is checked against it (B3). Each config fronts with one random
+// name of `spoofDomains`, the list in force (directorySpoofDomains).
+func extenderConfigsForCandidate(
+	candidate *ExtenderCandidate,
+	secret string,
+	spoofDomains []string,
+) []*ExtenderConfig {
 	extenderConfigs := []*ExtenderConfig{}
 	appendConfig := func(profile ExtenderProfile) {
 		if 0 < len(spoofDomains) {
