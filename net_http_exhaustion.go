@@ -112,6 +112,18 @@ func flattenHttpRequestCauses(err error) []httpRequestCause {
 			}
 			continue
 		}
+		if dns, ok := item.err.(*net.DNSError); ok {
+			// A concrete DNS error can be complete without a wrapped cause.
+			// Permanent DNS metadata still dominates any transient child.
+			if dns.IsNotFound || !dns.IsTimeout && !dns.IsTemporary {
+				result = append(result, httpRequestCause{err: item.err})
+				continue
+			}
+			if dns.UnwrapErr == nil {
+				result = append(result, classifyHttpRequestCause(item.err))
+				continue
+			}
+		}
 		if wrapped, ok := item.err.(interface{ Unwrap() error }); ok {
 			if cause := wrapped.Unwrap(); cause != nil {
 				if len(pending) >= remaining {
