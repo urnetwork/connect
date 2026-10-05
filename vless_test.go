@@ -656,3 +656,24 @@ func TestVlessRealityLeafProof(t *testing.T) {
 		t.Fatalf("another key must not be proven")
 	}
 }
+
+// The http host of the ws and httpupgrade transports: the configured host,
+// else the server name, else the address, with an ipv6 literal bracketed.
+func TestVlessHttpHost(t *testing.T) {
+	cases := []struct {
+		config   VlessConfig
+		expected string
+	}{
+		{config: VlessConfig{Address: "192.0.2.1", Host: "cdn.example", ServerName: "sni.example"}, expected: "cdn.example"},
+		{config: VlessConfig{Address: "192.0.2.1", ServerName: "sni.example"}, expected: "sni.example"},
+		{config: VlessConfig{Address: "vless.example"}, expected: "vless.example"},
+		{config: VlessConfig{Address: "192.0.2.1"}, expected: "192.0.2.1"},
+		{config: VlessConfig{Address: "2001:db8::1"}, expected: "[2001:db8::1]"},
+		{config: VlessConfig{Address: "2001:db8::1", Host: "2001:db8::2"}, expected: "[2001:db8::2]"},
+	}
+	for _, c := range cases {
+		if host := c.config.httpHost(); host != c.expected {
+			t.Errorf("%+v: host = %s, expected %s", c.config, host, c.expected)
+		}
+	}
+}

@@ -202,15 +202,20 @@ func (self *VlessConfig) serverName() string {
 	return self.Address
 }
 
-// The http host header of the ws and httpupgrade transports.
+// The http host header of the ws and httpupgrade transports. An ipv6 literal
+// is bracketed, as a host header and a url carry it.
 func (self *VlessConfig) httpHost() string {
-	if self.Host != "" {
-		return self.Host
+	host := self.Host
+	if host == "" {
+		host = self.serverName()
 	}
-	if serverName := self.serverName(); serverName != "" {
-		return serverName
+	if host == "" {
+		host = self.Address
 	}
-	return self.Address
+	if addr, err := netip.ParseAddr(host); err == nil && addr.Is6() {
+		return "[" + host + "]"
+	}
+	return host
 }
 
 // The server's dial address.
