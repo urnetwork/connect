@@ -155,8 +155,9 @@ type ExtenderNetworkClientSettings struct {
 		attestor *ExtenderProbeAttestor,
 	) (*ExtenderLatencyProbe, error)
 	// Hint, when set, replaces the hint fetch. Nil reads
-	// /network/extender-hint through the client strategy. An empty field with
-	// no error is an operator that cannot place the caller; an error is an
+	// /network/extender-hint through direct dialers alone, built from the
+	// client strategy's settings (GetExtenderHint). An empty field with no
+	// error is an operator that cannot place the caller; an error is an
 	// operator that cannot be asked.
 	Hint func(ctx context.Context) (*ExtenderHintResult, error)
 }

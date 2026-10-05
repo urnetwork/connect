@@ -255,6 +255,12 @@ type ClientStrategy struct {
 	log                Logger
 
 	settings *ClientStrategySettings
+	// baseSettings are a copy of the settings as the caller passed them, which
+	// a direct-only strategy derived from this one is built from
+	// (newDirectClientStrategy). `settings` will not do: there the internal
+	// DoH resolver wraps the caller's dial, proxy and all, and a strategy
+	// built over that wrapper would still dial through the proxy.
+	baseSettings *ClientStrategySettings
 	// internalDohResolver exists only when InternalDohDomains are configured
 	// and the caller did not install ConnectSettings.Resolver.
 	internalDohResolver *internalDohResolver
@@ -351,6 +357,7 @@ func newNormalDialTlsContext(
 
 // extender udp 53 to platform extender
 func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *ClientStrategy {
+	baseSettings := *settings
 	settings, internalDohResolver := clientStrategySettingsWithInternalDoh(settings)
 
 	// propagate so a strategy-level logger covers dial logging. Copy instead
@@ -485,6 +492,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		cancel:              strategyCancel,
 		log:                 loggerOrDefault(settings.Log),
 		settings:            settings,
+		baseSettings:        &baseSettings,
 		internalDohResolver: internalDohResolver,
 		dialers:             dialers,
 		extenderIpSecrets:   map[netip.Addr]string{},
@@ -722,6 +730,23 @@ func (self *ClientStrategy) SetInternalDohSettings(dohSettings *DohSettings) {
 	if replacedCache != nil {
 		replacedCache.Close()
 	}
+}
+
+// newDirectClientStrategy builds a direct-only strategy from the settings this
+// one was built with (NewDirectClientStrategy, unpinned): no extender, VLESS
+// server or proxy, so a request reaches its destination from this host's own
+// address. It takes the DoH settings in force here, which a user's bootstrap
+// DoH servers replace on a running strategy (`SetInternalDohSettings`). The
+// caller closes it.
+func (self *ClientStrategy) newDirectClientStrategy(ctx context.Context) *ClientStrategy {
+	baseSettings := self.baseSettings
+	if baseSettings == nil {
+		// a strategy a test built without the constructor
+		baseSettings = self.settings
+	}
+	settings := *baseSettings
+	settings.DohSettings = self.DohSettings()
+	return NewDirectClientStrategy(ctx, &settings, 0)
 }
 
 // nextConnectMaxLead caps how far the shared next-connect timestamp may run

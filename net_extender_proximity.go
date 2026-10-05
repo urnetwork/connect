@@ -36,6 +36,18 @@ type ExtenderHintResult struct {
 // the caller. It carries no credential: the answer is derived from the
 // caller's address, which the operator sees on every request anyway, and a
 // client needs it before it has logged in.
+//
+// For the same reason it is read through direct dialers only, never through
+// an extender, a VLESS server or a proxy: through any of those the address the
+// operator places is the relay's, not this client's. Each read builds a
+// direct-only strategy from the settings of the one passed in and closes it
+// after, so the read takes the DoH settings in force; the hint is read rarely
+// -- a start, a path change, the 6 hour refresh -- so none is kept between
+// reads. Where no direct path reaches the operator -- on a whitelist-only
+// network none does -- the read fails, and the directory takes the network
+// country the host reports instead (ExtenderDirectory.SpoofCountryCode). A
+// strategy that relays every request, through a manual extender or a proxy,
+// has no direct path to read through, so there the read fails without a dial.
 func GetExtenderHint(
 	ctx context.Context,
 	clientStrategy *ClientStrategy,
@@ -48,7 +60,15 @@ func GetExtenderHint(
 	if apiUrl == "" {
 		return nil, fmt.Errorf("the extender hint needs an api url")
 	}
-	bodyBytes, err := HttpGetWithStrategyRaw(ctx, clientStrategy, apiUrl+ExtenderHintPath, "")
+	if 0 < len(clientStrategy.CustomExtenders()) || clientStrategy.ConnectSettings().ProxySettings != nil {
+		// the strategy dials nothing direct -- a manual extender carries
+		// every request (dialerWeights), a proxy every dial -- and the hint
+		// is not the one request that does
+		return nil, fmt.Errorf("the extender hint has no direct path: the strategy relays every request")
+	}
+	directClientStrategy := clientStrategy.newDirectClientStrategy(ctx)
+	defer directClientStrategy.Close()
+	bodyBytes, err := HttpGetWithStrategyRaw(ctx, directClientStrategy, apiUrl+ExtenderHintPath, "")
 	if err != nil {
 		return nil, err
 	}
