@@ -773,8 +773,12 @@ consecutive failures reach 3; expiry per record with 5 minutes skew;
 revocation immediate; cap 2048 addresses (`MaxAddressCount`), the backstop
 beneath the active records' cap of E6, evicting expired, then
 never-succeeded oldest first, then oldest last success. Manual entries are
-never removed by policy. A `MonitorValue` publishes change; `Snapshot`
-serves status. Persistence goes through a store interface `Load() ([]byte,
+never removed by policy. A hold, a limit (A12) and a latency sample
+(DESIGNNOTES4.md §6) are judged by whichever of the monotonic and the wall
+clock has moved further: the monotonic clock stops while the host sleeps, so
+a sleep counts toward them, and a wall clock set back does not extend them.
+A path change drops the latency samples. A `MonitorValue` publishes change;
+`Snapshot` serves status. Persistence goes through a store interface `Load() ([]byte,
 error)` and `Save([]byte) error` with a JSON envelope `{version, records,
 addresses, country_hint}`, saved coalesced at 1 s after a change.
 `country_hint` is the operator's last country and the time it last answered
