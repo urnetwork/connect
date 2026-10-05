@@ -15487,6 +15487,13 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 // paced resend rather than on gap recovery. Bounded, and removed along with
 // the rest by the receive advertisement.
 func (self *ReceiveSequence) commitHeldPrefix() {
+	// The queue owns these items; the reusable slice only borrows pointers
+	// during this scan. An item embeds its decoded packet owner, which may
+	// otherwise stay rooted here after delivery, beyond the bounded free pool.
+	defer func() {
+		clear(self.heldScratch)
+		self.heldScratch = self.heldScratch[:0]
+	}()
 	capacity := self.receiveBufferSettings.ReceiveQueueMaxByteCount
 	frameByteCount := max(self.maxHeldByteCount, 1)
 
