@@ -3500,8 +3500,9 @@ instruction/cycle or energy result is claimed. All raw artifacts stay private.
 
 #### Next: Android CPU/energy qualification, not production adoption yet
 
-First resolve the SDK's documented gomobile/Go 1.27 `gotypesalias=0` toolchain
-boundary; keep SIMD helpers out of exported bindings. Use only the existing
+The SDK's gomobile/Go 1.27 `gotypesalias=0` toolchain boundary is resolved
+(sdk `f36da2ab`, 2026-10-05: the mobile binds no longer set that GODEBUG).
+Keep SIMD helpers out of exported bindings. Use only the existing
 two serial-allowlisted phones, with identical attested Go 1.27 builds differing
 only in masking. Predeclare CPU/energy metrics, practical margins and cohort
 size from pilot variance, then run order-balanced paired sessions on each
