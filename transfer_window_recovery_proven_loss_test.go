@@ -68,7 +68,7 @@ func TestWindowPacingSharedRawResidencePreservesProvenEndpointLoss(t *testing.T)
 		}()
 		client.ContractManager().AddNoContractPeer(destination)
 		client.RouteManager().UpdateTransport(&h1SendClientTransportForGroupTest{sendClientTransport: NewSendClientTransport(DestinationId(destination))}, []Route{route})
-		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination})
+		sequence := client.sendBuffer.createSendSequence(sendSequenceId{Destination: destination}, &SendPack{Destination: destination, Ctx: ctx})
 		start := time.Now()
 		// This earlier exact tuple represents a slow receiver callback, not
 		// changed propagation or proof that this new message was delivered.

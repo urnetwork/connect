@@ -966,7 +966,7 @@ func TestSendBufferSharesSequenceAcrossLocalRoutes(t *testing.T) {
 	intermediaryIds := RequireMultiHopId(NewId())
 	directSequence := sendBuffer.createSendSequence(
 		sequenceId,
-		&SendPack{Destination: destinationId},
+		&SendPack{Destination: destinationId, Ctx: ctx},
 	)
 	directMetadata := directSequence.contractMetadata()
 	if directMetadata.key.IntermediaryIds.Len() != 0 {
