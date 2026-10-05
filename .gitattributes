@@ -1,0 +1,109 @@
+# core.autocrlf=true is set at system scope on the Windows boxes that build this
+# repo, so a plain checkout writes CRLF into every file git touches, and a gate that
+# matches on the TEXT of a source file then matches nothing at all. That is not a gate
+# failing; it is a gate reporting the clean run of a complete gate having read nothing,
+# which is the most expensive failure mode this tree has. It has already happened here
+# once, to 84 source anchors that passed vacuously on Windows. Every repair to these
+# packages is made as an exact-string edit over source, and an edit anchored on one
+# ending matches nothing in a file using the other: it edits nothing, the suite then
+# passes, and that reads as "the change was made and was harmless".
+#
+# mls/vectors_runner_test.go holds the same property as a gate, over every package of the
+# module: it walks the module root, judges every directory holding Go source, and resolves
+# the ending each file is required to carry out of THIS file. It used to derive that scope by
+# following "../" path literals out of mls, which reached connect/message and
+# connect/messagegroup and could not reach a CHILD directory at all; connect/mls/syntax sat in
+# exactly that blind spot at 6 CRLF against 17 LF, and connect/message imports it. That
+# closure is gone as of 2026-09-05 and the scope is the module.
+#
+# The pin still reaches what no scan can: a file this working tree has not got, in a checkout
+# nobody has made yet. The gate reaches what the pin cannot: what the working tree actually
+# carries right now, which is the only place the drift is ever visible.
+#
+# It costs no git object. autocrlf cleans on the way in, so all 474 .go blobs were
+# already LF when this line was added; what it rewrites is the working tree, which is the
+# only place the drift was ever visible and the only place an anchored edit reads.
+#
+# msgrepo pins its Go the same way and names this same failure mode.
+#
+# *.pb.go below is SUBSUMED by this line rather than in conflict with it -- both say
+# eol=lf -- and it stays because the comment under it argues regenerate-and-diff, which is
+# about *.proto as much as about the generated Go.
+#
+# EOL=LF ACTS ONLY AT CHECKOUT, and that single fact explains the whole episode. All seven
+# *.pb.go files were already pinned by the rule below, and on 2026-09-05, before the
+# renormalisation that landed with this line, five of them were still CRLF on disk anyway: a
+# pin added after a file has been checked out does not go back and rewrite it. This file
+# governs what the NEXT checkout writes. The working tree is governed by whatever last wrote
+# it, which on this project is as often a tool as it is git.
+#
+# So a pin is never on its own evidence that a tree is clean, and that is why it is not left
+# on its own. mls/vectors_runner_test.go's TestThePackageSourceIsOneLineEndingThroughout READS
+# this file, derives lf from the line below rather than hard-coding it, and holds the working
+# tree of every package in this module to it. Delete that line and
+# every file it judges reports as pinned to nothing and the gate goes red -- which is the point
+# of deriving it: the pin and the gate are one mechanism and neither half was worth anything
+# alone. Until 2026-09-05 they were two, and deleting this line was invisible to all 7,495
+# tests in the suite.
+*.go text eol=lf
+
+# protoc emits LF and nothing downstream normalizes it back, so a checkout that
+# writes CRLF makes every regeneration rewrite every line ending. `git status`
+# then reports the generated files as modified while `git diff` reports nothing,
+# and the reproducibility check "regenerate and see an empty diff" stops meaning
+# what it says. core.autocrlf=true is set at system scope on the Windows boxes
+# that build this repo, which is exactly that checkout.
+#
+# Pinning the protobuf inputs and their generated Go to LF keeps the regenerate-
+# and-diff check honest: after this, a diff in a .pb.go is a real change.
+*.proto text eol=lf
+*.pb.go text eol=lf
+
+# The committed fuzz seed corpus is bytes, not text. core.autocrlf=true is set at
+# system scope on the Windows boxes that build this repo, and git decides text
+# versus binary by looking for a NUL octet in the first 8000: a seed that happens
+# to hold no NUL and does hold an 0x0a is rewritten on checkout, which silently
+# turns a valid encoding into one no decoder accepts. Marking the folder binary is
+# the only thing between "the corpus is evidence" and "the corpus is whatever the
+# checkout left behind".
+mls/testdata/corpus/** -text
+
+# message/testdata/fuzz/** IS THE SAME RULE ON THE SAME MACHINE and the line above did not
+# reach it, which was measured rather than reasoned about: `git add` on the fifteen entries
+# of FuzzParseEpochDigestAttachment answered "LF will be replaced by CRLF the next time Git
+# touches it", fifteen times. These entries are go's own fuzz corpus format -- a header line
+# and then []byte("\x00\x05…") -- so they are ASCII with no NUL in them, which is exactly
+# the shape the paragraph above says git rewrites. A CRLF checkout does not corrupt the
+# OCTETS they encode; it puts a carriage return on the end of the line, strconv.Unquote
+# refuses it, and every checked-in interop vector in these directories becomes unreadable on
+# a fresh Windows clone. The existing FuzzParseRecord and FuzzParseServerAttachment entries
+# are under the same exposure and are LF on disk today only because of whatever last wrote
+# them; this line is what makes that a property of the repository rather than of the tool.
+# It rewrites no git object -- all of them are LF in the index already.
+message/testdata/fuzz/** -text
+
+# messagegroup/testdata/eph-window-kat.txt is ONE HALF OF A PAIR. msgrepo carries the same 57
+# answers, byte for byte, at its own module root, and each repository drives its own copy of
+# MASTER section 8's sender formula over them. That is the only fastening available: Spec B
+# section 2.2 forbids the message-server module to link connect/messagegroup, so no import can
+# hold the two implementations together and what crosses a forbidden import is a value. The
+# other repository pins the same path with a *.txt rule to the same ending.
+#
+# Both gates fold CRLF to LF before hashing, so a CRLF checkout does not turn either of them
+# red. That is deliberate -- neither repository's checkout rules are the other's to set, and a
+# digest that cried wolf on a clean clone would be deleted rather than fixed. What this line
+# buys is the stronger statement: with core.autocrlf true at system scope on the Windows boxes
+# that build this repo, it is what makes "byte for byte identical to msgrepo's copy" true ON
+# DISK and not only after a fold, so cmp between the two working trees is an answer rather than
+# a smudge.
+messagegroup/testdata/eph-window-kat.txt text eol=lf
+
+# messagegroup/testdata/envelope-wrap-kat.txt is the device wrap door's known answers, and it is
+# pinned for a NARROWER reason than the table above it: it has no twin in another repository, so
+# there is nothing to cmp it against. What it is instead is an INTEROP VECTOR -- a second
+# implementation of MASTER section 7's wrap KDF checks itself against these octets -- and a file
+# checked out CRLF on one machine and LF on another is a file whose own digests are read out of
+# two different byte strings. wrap_test.go folds CRLF to LF before it reads a row, for the reason
+# the paragraph above gives, so a CRLF checkout does not turn the gate red; this line is what
+# keeps the OCTETS the same everywhere, which is the only thing an interop vector has to offer.
+messagegroup/testdata/envelope-wrap-kat.txt text eol=lf

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"reflect"
 	"slices"
 	"sync"
 	"syscall"
@@ -25,6 +26,7 @@ func (self *HttpRequestExhaustedError) Unwrap() []error { return slices.Clone(se
 
 var errHttpExhaustionAdditionalHardCauses = errors.New("http request exhausted with additional non-transient causes")
 var errHttpExhaustionCauseTraversal = errors.New("http request cause tree exceeds its finite inspection bound")
+var errHttpExhaustionCauseIncomplete = errors.New("http request cause tree contains an absent cause")
 
 const httpRequestCauseNodes = 256
 const httpRequestCauseDepth = 64
@@ -62,13 +64,23 @@ func flattenHttpRequestCauses(err error) []httpRequestCause {
 	pending := []pendingCause{{err: err, depth: 1}}
 	var result []httpRequestCause
 	overflow := false
+	incomplete := false
 	remaining := httpRequestCauseNodes
 	for len(pending) != 0 && remaining > 0 {
 		item := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
 		remaining--
 		if item.err == nil {
+			incomplete = true
 			continue
+		}
+		value := reflect.ValueOf(item.err)
+		switch value.Kind() {
+		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+			if value.IsNil() {
+				incomplete = true
+				continue
+			}
 		}
 		if item.depth > httpRequestCauseDepth {
 			overflow = true
@@ -90,12 +102,27 @@ func flattenHttpRequestCauses(err error) []httpRequestCause {
 			for index := len(causes) - 1; index >= 0; index-- {
 				if causes[index] != nil {
 					pending = append(pending, pendingCause{err: causes[index], depth: item.depth + 1})
+				} else {
+					remaining--
+					incomplete = true
 				}
 			}
 			if len(pending) == before && !overflow {
 				result = append(result, httpRequestCause{err: item.err})
 			}
 			continue
+		}
+		if dns, ok := item.err.(*net.DNSError); ok {
+			// Not-found is authoritative even with a transient child. Other
+			// flags classify only a leaf; actual children keep their meaning.
+			if dns.IsNotFound {
+				result = append(result, httpRequestCause{err: item.err})
+				continue
+			}
+			if dns.UnwrapErr == nil {
+				result = append(result, classifyHttpRequestCause(item.err))
+				continue
+			}
 		}
 		if wrapped, ok := item.err.(interface{ Unwrap() error }); ok {
 			if cause := wrapped.Unwrap(); cause != nil {
@@ -106,8 +133,16 @@ func flattenHttpRequestCauses(err error) []httpRequestCause {
 				}
 				continue
 			}
+			// An absent wrapped cause cannot acquire transport authority from
+			// the wrapper's net.Error methods. Retain its original hard cause.
+			result = append(result, httpRequestCause{err: item.err})
+			incomplete = true
+			continue
 		}
 		result = append(result, classifyHttpRequestCause(item.err))
+	}
+	if incomplete {
+		result = append(result, httpRequestCause{err: errHttpExhaustionCauseIncomplete})
 	}
 	if overflow || len(pending) != 0 {
 		result = append(result, httpRequestCause{err: errHttpExhaustionCauseTraversal})

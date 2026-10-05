@@ -226,7 +226,7 @@ func (self *ExtenderNetworkClient) resolveDnsProgress(
 ) ([]netip.Addr, error) {
 	dohSettings := self.settings.DohSettings
 	if dohSettings == nil && self.clientStrategy != nil {
-		dohSettings = self.clientStrategy.settings.DohSettings
+		dohSettings = self.clientStrategy.DohSettings()
 	}
 	var ips []netip.Addr
 	seen := map[netip.Addr]bool{}

@@ -4,12 +4,9 @@
 package connect
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"errors"
-
-	"github.com/urnetwork/connect/protocol"
 )
 
 // The local publication generation also distinguishes an a-b-a rotation.
@@ -73,7 +70,7 @@ func (self *ClientKeyManager) publishRegisteredClientKey() {
 		if self.ctx.Err() != nil {
 			return
 		}
-		frame, err := ToFrame(&protocol.ClientKey{PublicKey: bytes.Clone(generation.publicKey[:])}, self.client.settings.ProtocolVersion)
+		frame, err := ToFrame(self.clientKeyMessage(generation.publicKey[:]), self.client.settings.ProtocolVersion)
 		if err != nil {
 			self.client.log.Errorf("[key]%s could not build registration frame: %s", self.client.ClientTag(), err)
 			return

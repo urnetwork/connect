@@ -30,6 +30,10 @@ func ownerAttributeLimit(name string) (int, bool) {
 		return RootGenerationBytes, true
 	case ownerAttributeNamespace + "native-journal-custody", ownerAttributeNamespace + "attempt-ledger-custody", PreparationAttribute:
 		return 4096, true
+	case ownerAttributeNamespace + "validator.requests.v1", ownerAttributeNamespace + "sdk-work.v1":
+		return 4096, true
+	case ownerAttributeNamespace + "original-contracts.v1", ownerAttributeNamespace + "validator.publications.v1":
+		return 4096, true
 	}
 	if strings.HasPrefix(name, snapshotAttributePrefix) {
 		suffix := strings.TrimPrefix(name, snapshotAttributePrefix)

@@ -1,0 +1,986 @@
+syntax = "proto3";
+package bringyour;
+
+option go_package = "github.com/urnetwork/connect/protocol";
+
+
+// URmessage control plane (Spec B §4.3), carried in the MessageType code points
+// reserved in frame.proto per §4.2.
+//
+// Spec A owns this file and its codegen. Spec B owns the set of `oneof` arms and
+// their semantics. A change to the file is an A commit; a change to an arm's
+// meaning is a B decision recorded in SPEC-LEDGER.md.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THE FIELD NUMBERS OF `MessageServerRequest.body` ARE PROTOCOL CONSTANTS.
+//
+// Spec A §5.7 / Spec B §4.3.8 define the request authenticator as
+//
+//     req_auth = MAC(read_key[e], "URmessage/v1/req" ‖ LP(server_nonce)
+//                                 ‖ u8(op) ‖ LP(canonical_request_bytes))
+//
+// where `op` is "the field number of the selected `oneof body` arm in
+// MessageServerRequest, as a u8". Renumbering an arm therefore silently changes a
+// MAC input. It does not break compilation, it does not break parsing, and it
+// does not produce a wrong-looking message — it produces a REASON_REJECTED on one
+// operation, for one implementation, which §4.5 deliberately refuses to explain.
+//
+// Every arm number below is transcribed verbatim from Spec B §4.3 and
+// cross-checked against the op bytes §4.3.8 names explicitly. message_op_test.go
+// asserts the equality from the compiled descriptor, so a transposition is a test
+// failure rather than a field mystery.
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+message MessageServerRequest {
+    uint64 request_id = 1;              // client-scoped, monotonic, correlates the response
+    uint32 protocol_version = 2;
+    oneof body {
+        HelloRequest          hello           = 10;
+        CreateGroupRequest    create_group    = 11;
+        SubmitRequest         submit          = 12;
+        FetchRequest          fetch           = 13;
+        SubscribeRequest      subscribe       = 14;
+        UnsubscribeRequest    unsubscribe     = 15;
+        GroupStatusRequest    group_status    = 16;
+        BlobGrantRequest      blob_grant      = 17;
+        RecoveryFetchRequest  recovery_fetch  = 18;
+        WrapFetchRequest      wrap_fetch      = 19;
+        RendezvousRegisterRequest rendezvous_register = 20;
+        RendezvousOpenRequest     rendezvous_open     = 21;
+        RendezvousDepositRequest  rendezvous_deposit  = 22;
+        RendezvousCollectRequest  rendezvous_collect  = 23;
+        RendezvousRetireRequest   rendezvous_retire   = 24;
+    }
+}
+
+message MessageServerResponse {
+    uint64 request_id = 1;
+    Reason reason = 2;                  // REASON_OK on success
+    uint32 retry_after_ms = 3;          // Spec B §4.5. Meaningful ONLY when reason is
+                                        // REASON_RATE_LIMITED or REASON_CARD_RATE_LIMITED;
+                                        // zero and ignored otherwise. It is on the envelope
+                                        // rather than in a body because rate limiting can
+                                        // refuse ANY operation, including ones whose
+                                        // response body is empty or absent.
+                                        //
+                                        // Safe to add late for a narrow reason, NOT the
+                                        // general one: it is not on any signed field list.
+                                        // Response fields are not categorically additive —
+                                        // FetchAttestation.sig covers TEN FetchAttestation
+                                        // fields and MASTER §9.4 requires both sides to
+                                        // agree on that preimage byte for byte.
+                                        //
+                                        // (This line read "nine FetchResponse fields" until
+                                        // ruling 32. Both halves were wrong, and Spec B §4.5
+                                        // corrected itself the same way: its own list said
+                                        // nine and held eight, having omitted server_id —
+                                        // which is not a FetchResponse field at all — and
+                                        // read_epoch joined the preimage on 2026-09-22. The
+                                        // ten are transcribed at FetchAttestation below.)
+    oneof body {
+        HelloResponse         hello           = 10;
+        CreateGroupResponse   create_group    = 11;
+        SubmitResponse        submit          = 12;
+        FetchResponse         fetch           = 13;
+        SubscribeResponse     subscribe       = 14;
+        // NO ARM 15, DELIBERATELY. There is no UnsubscribeResponse: Spec B §4.3.8
+        // records that UnsubscribeRequest "reads no group state and cancels only
+        // the caller's own subscription", so the whole answer is carried by
+        // MessageServerResponse.reason and a body arm would say nothing. The gap
+        // is not an omission to tidy up. Filling 15 with anything else would break
+        // the invariant that a response arm and its request arm share a number,
+        // which is what makes the §4.3.8 op-byte cross-check readable in both
+        // directions. message_op_test.go asserts 15 is absent here, so a future
+        // reuse of the number fails a test instead of quietly shipping.
+        GroupStatusResponse   group_status    = 16;
+        BlobGrantResponse     blob_grant      = 17;
+        RecoveryFetchResponse recovery_fetch  = 18;
+        WrapFetchResponse     wrap_fetch      = 19;
+        RendezvousRegisterResponse rendezvous_register = 20;
+        RendezvousOpenResponse     rendezvous_open     = 21;
+        RendezvousDepositResponse  rendezvous_deposit  = 22;
+        RendezvousCollectResponse  rendezvous_collect  = 23;
+        RendezvousRetireResponse   rendezvous_retire   = 24;
+    }
+}
+
+message MessageServerPush {
+    oneof body {
+        RecordPush       records      = 1;
+        TransientPush    transient    = 2;   // EPH(0): never persisted
+        CapabilityChange capability   = 3;
+        Backpressure     backpressure = 4;
+        Drain            drain        = 5;   // §2.3 graceful shutdown
+        RendezvousPush   rendezvous   = 6;   // §4.3.11; {rendezvous_id, pending_count} only
+    }
+}
+
+
+// ── §4.3.1 Hello — capability advertisement and nonce issuance ───────────────
+
+message HelloRequest {
+    repeated uint32 supported_versions = 1;
+    bytes  client_epoch_hint = 2;        // opaque; lets the server pre-warm caches
+}
+
+message HelloResponse {
+    uint32 protocol_version      = 1;
+    bytes  server_id             = 2;    // 16 B, stable per fleet
+    repeated ServerKey server_keys = 3;  // current, plus at most one announced successor
+    uint64 server_time_ms        = 4;
+
+    // Issued here, scoped to THIS connection, valid for the life of the connection,
+    // never rotated, and NOT carried in requests (§5.1 check 2).
+    bytes  server_nonce          = 5;    // 32 B
+
+    Capabilities capabilities    = 6;
+    BlobEndpoint blob_endpoint   = 7;
+    KtGossip     kt_gossip       = 8;    // the operator STH this server independently observed
+}
+
+message ServerKey {
+    bytes  pub             = 1;   // Ed25519, 32 B
+    uint64 not_before_ms   = 2;
+    uint64 not_after_ms    = 3;   // 0 = no announced end
+    bytes  sig_by_previous = 4;   // Ed25519 by the outgoing key over
+                                  // "URmessage/v1/serverkeyrot" ‖ LP(new_pub)
+                                  //   ‖ u64(not_before_ms) ‖ u64(not_after_ms)
+                                  // empty on a key certified directly by the root
+    bytes  sig_by_root     = 5;   // Ed25519 by the FLEET ROOT key over
+                                  // "URmessage/v1/serverkeyroot" ‖ LP(server_id)
+                                  //   ‖ LP(pub) ‖ u64(not_before_ms) ‖ u64(not_after_ms)
+                                  // REQUIRED on the first key a client ever sees from
+                                  // this fleet; the client holds the root public key
+                                  // compiled in and verifies against it (Spec A §7.6)
+}
+
+message Capabilities {
+    uint64 max_blob_bytes                = 1;   // default 104857600 (100 MB), master spec §12.2
+    uint32 max_request_bytes             = 2;   // control-plane, post-fragmentation reassembly
+    uint32 max_records_per_submit        = 3;   // default 256
+    uint32 max_records_per_fetch         = 4;   // default 512
+    // ── the three advertised limits (MASTER §12.2). Every group operates inside
+    //    all three, and the client reads them before it acts.
+    uint32 media_ttl_default_seconds     = 5;   // media window default: 2592000 (30 days)
+    uint32 media_ttl_max_seconds         = 6;   // media window cap; policy above it is clamped down
+    uint32 durable_retention_min_seconds = 7;   // text minimum this server promises to honour
+    uint32 durable_ttl_default_seconds   = 16;  // text default: 31536000 (1 year)
+    uint32 durable_ttl_max_seconds       = 17;  // text storage cap; 0 = this server sets no maximum
+    bool   group_durable_override        = 18;  // false = groups may not raise text retention here
+    // max_blob_bytes (field 1) is the third limit: the file size limit.
+    repeated uint32 eph_bucket_seconds   = 8;   // [0, 3600, 28800, 86400, 604800, 2419200]
+    repeated uint32 size_bucket_bytes    = 9;   // [256, 1024, 4096, 16384, 65536]
+    uint32 blob_chunk_bytes              = 10;  // default 8388608 (8 MiB); see §8.3
+    uint32 blob_pad_multiple             = 11;  // 262144 (256 KiB), owned by Spec A §5.13
+    bool   attestation_supported         = 12;
+    uint32 max_submit_bytes              = 13;  // default 131072
+    uint32 max_response_bytes            = 14;  // default 1048576
+    uint64 capability_version            = 15;  // monotonic; see §10.2
+    string operator_host                 = 19;  // the operator THIS SERVER holds its account
+                                                // on, from message.yml. Not "the" operator:
+                                                // the client's may differ (§9.1)
+    string hosting_jurisdiction          = 20;  // where this server is hosted, from message.yml
+                                                // (§10.4). Advertised because "where is this
+                                                // server" has a legal answer and a user is
+                                                // entitled to it before choosing to use it.
+    uint32 read_key_window_seconds       = 21;  // how long this server retains each installed
+                                                // epoch read key. Default 7776000 (90 days).
+                                                // Advertised because the client names this number
+                                                // to a user who has been away (Spec C §9.8) and
+                                                // must not hardcode it.
+    // ── the contact rendezvous (§4.3.11, MASTER §9.8) ────────────────────────
+    uint32 rendezvous_deposit_bytes       = 22;  // 5238, asserted as an equality (§4.3.11)
+    uint32 rendezvous_mailbox_depth       = 23;  // 16 uncollected deposits per rendezvous
+    uint32 rendezvous_deposit_ttl_seconds = 24;  // 604800 (7 days)
+    uint32 rendezvous_ttl_seconds         = 25;  // 7776000 (90 days), refreshed on every collect
+}
+
+message BlobEndpoint {
+    string host                     = 1;
+    uint32 port                     = 2;
+    repeated bytes tls_spki_sha256  = 3;   // current plus one announced successor; pinned,
+                                           // and the client MUST NOT fall back to a CA path
+    string path_prefix              = 4;
+}
+
+
+// ── §4.3.2 Create group ──────────────────────────────────────────────────────
+
+message CreateGroupRequest {
+    bytes  group_id            = 1;   // 32 B, CSPRNG, client-chosen
+    Record initial_commit      = 2;   // is_commit = 1, epoch = 0
+    bytes  bootstrap_write_key = 3;   // write_key[0], EXACTLY 32 B. Used only to verify
+                                      // initial_commit. This is self-certification: it is
+                                      // protected solely by the 20/day per-client_id rate
+                                      // limit, and nothing else. Stated plainly, not implied.
+    EpochKeyDelivery epoch_keys = 4;  // ruling 33. write_key[1] and read_key[1] — the pair
+                                      // initial_commit's attachment is the DIGEST of. One
+                                      // and not repeated: this request carries exactly one
+                                      // record and it is always a commit.
+                                      //
+                                      // 4 is free because this message has never had a
+                                      // fourth field: Spec B §4.3.2 declares it with 1..3
+                                      // and nothing else, and 14/15 are the file-wide
+                                      // read_epoch/req_auth slots, which §4.3.8 exempts this
+                                      // arm from and which it does not carry.
+                                      //
+                                      // PRESENCE IS KEYED ON THE ATTACHMENT KIND, and it has
+                                      // to be while Spec B §5.4's acceptance window is open.
+                                      // REQUIRED under kind 0x0005: AN ABSENT epoch_keys IS
+                                      // REASON_REJECTED, for the reason a 0x0005 commit with
+                                      // no entry is on SubmitRequest — a commit whose keys
+                                      // never arrived is an epoch the server would install
+                                      // without having been handed what opens it. MUST BE
+                                      // ABSENT under kind 0x0001, where PRESENT IS
+                                      // REASON_REJECTED: the keys are in the attachment
+                                      // there, so a delivery beside it is a field the server
+                                      // would not read and that can disagree with the one the
+                                      // MAC covers. There is no empty case to leave room for
+                                      // on the record axis — this request's one record is
+                                      // always a commit (initial_commit, is_commit = 1,
+                                      // epoch = 0) and that commit always opens epoch 1 — so
+                                      // the kind is the only thing the presence turns on.
+                                      //
+                                      // THIS COMMENT READ "PRESENCE: REQUIRED. AN ABSENT
+                                      // epoch_keys IS REASON_REJECTED", UNCONDITIONAL, AND
+                                      // THAT FORM IS TRUE ONLY AFTER THE WINDOW CLOSES.
+                                      // THE DATED BOUNDARY, WRITTEN OUT RATHER THAN IMPLIED:
+                                      // from 2026-09-22 this server takes either kind on the
+                                      // founding commit, so both rows are live; from
+                                      // 2026-11-03 — OR the day the Remove arm first ships,
+                                      // WHICHEVER IS EARLIER — kind 0x0001 stops being
+                                      // accepted on a new commit and only the required row
+                                      // remains. Spec B §4.3.2 names the divergence from the
+                                      // other side and this is connect's half of closing it.
+                                      //
+                                      // AND HERE ABSENCE IS REPRESENTABLE, which it is not
+                                      // on SubmitRequest. This is a SINGULAR message field,
+                                      // so GetEpochKeys() answers nil for a request that
+                                      // omitted it and the server can tell that apart from a
+                                      // request that sent a zero delivery. Both are refused,
+                                      // and they are refused as DIFFERENT THINGS: a
+                                      // present-but-zero delivery is two EMPTY KEYS and not
+                                      // an absence — the REASON_OK = 0 hazard recorded at the
+                                      // foot of this file — so it is rejected as a malformed
+                                      // delivery and is never read as "no keys were sent".
+                                      // The two carriers state the same rule because the same
+                                      // hazard reaches both; stating it on one only is how
+                                      // the second one gets implemented by analogy and then
+                                      // by guess.
+    // initial_commit's server_attachment is a kind 0x0005 EpochDigest carrying
+    // LP(H(epoch_keys)) over the pair above — or, while §5.4's window is open, a kind 0x0001
+    // EpochAttachment carrying write_key[1] and read_key[1] inside itself, in which case the
+    // field above MUST be absent. (This read "a kind 0x0005 EpochDigest" alone, which is what
+    // a conforming client emits from 2026-10-06 and all this server takes once the window
+    // closes; it is not what this server accepts during it.) Ruling 27 is what took the two
+    // keys out of the served structure; the attachment still says everything about epoch 1
+    // that it said before, minus the keys.
+}
+message CreateGroupResponse {
+    uint64 current_epoch      = 1;    // always 1
+    uint64 record_id          = 2;    // always 1
+    RetentionApplied applied  = 3;
+}
+
+
+// ── the epoch key delivery (item 244, ruling 33) ─────────────────────────────
+//
+// The two keys the commit in this request opens its next epoch with, carried BESIDE the
+// record rather than inside it.
+//
+// Spec B §5.4 put write_key[n+1] and read_key[n+1] in the clear inside a structure the
+// server serves back verbatim, while §5.3 promises a member removed at epoch n loses
+// access when epoch n's read key ages out. Both cannot be true: the commit that removes
+// the member is sealed at n, is fetchable under read_key[n], and carries the keys of
+// n+1 — measured, twice, as a fetch and a forged write that both answered REASON_OK
+// under learned keys. Ruling 27 replaced the two keys in the attachment with
+// LP(H(epoch_keys)) under attachment kind 0x0005, and the keys have to arrive by some
+// other road. This is that road.
+//
+// IT IS A REQUEST FIELD AND NEVER A FIELD OF `Record`. That is ruling 33 and it is the
+// whole of what this type buys. `Record` is the server→client type in SIX places —
+// FetchResponse.records, SubmitResult.winning_commit, RecordPush.records,
+// TransientPush.records, WrapFetchResponse.records and GroupRecords.records — against
+// the two client→server carriers that reference this message. A key pair on `Record`
+// would be six serve paths that each have to remember to clear it, which is item 244
+// re-opened once per path; here the served type is structurally unable to carry a key
+// and there is nothing to remember. It also leaves `Record`'s projection contract alone:
+// submit checks proto.Equal(projectionOf(ParseRecord(record_bytes)), sent), and a key is
+// by construction not implied by a projection of record_bytes — which is the entire
+// point of the amendment — so a key on `Record` would answer REASON_REJECTED to every
+// commit rather than protecting one.
+//
+// NOTHING HERE IS INSIDE A MAC, AND IT DOES NOT NEED TO BE. Both carriers are on
+// §4.3.8's req_auth exemption list, so these two numbers are not protocol constants the
+// way MessageServerRequest.body's arm numbers are, and canonical_request_bytes is not
+// computed over either request. The binding is the digest instead, and it is free: the
+// attachment's octets are hashed into AAD_head and into the write_auth preimage, so the
+// MAC covers the attachment, the attachment covers LP(H(epoch_keys)), and the server
+// recomputes H(epoch_keys) over the two keys below and compares against a value the MAC
+// already authenticated. Altering either key fails that comparison. There is no second
+// authenticator to add and no new preimage term.
+//
+// THERE IS NO EPOCH AND NO group_id IN HERE, AND THAT IS NOT AN OMISSION. H(epoch_keys)
+// is taken over LP(group_id) ‖ u64(opens_epoch) ‖ LP(write_key) ‖ LP(read_key), and
+// connect/message gives the server no way to name either scope term itself:
+// message.CheckEpochKeysDigest reads opens_epoch out of the attachment's own body and
+// REFUSES to take one as a parameter, because three epochs are live at that call site —
+// the record header's, the attachment's, and the server's own current_epoch + 1 — and a
+// wrong choice among them type checks. The group is the enclosing request's own
+// group_id, which the server has already verified. A second copy of either value here
+// would be a field the checker will not read and that can disagree with the one the MAC
+// covers: exactly the defect message.NewEpochDigestAttachment exists to make
+// unrepresentable, re-created one layer out where this file cannot close it.
+message EpochKeyDelivery {
+    bytes write_key = 1;   // write_key[e], EXACTLY 32 B, where e is the epoch the record
+                           // this is aligned with OPENS — its kind 0x0005 attachment's own
+                           // `epoch` field, one above the epoch the record is sealed at
+    bytes read_key  = 2;   // read_key[e], EXACTLY 32 B
+}
+
+
+// ── §4.3.3 Submit ────────────────────────────────────────────────────────────
+
+message SubmitRequest {
+    bytes  group_id = 1;
+    repeated Record records = 2;    // at most Capabilities.max_records_per_submit
+
+    // Ruling 33. The epoch keys for the commit in this batch, POSITIONALLY ALIGNED with
+    // `records` — the alignment SubmitResponse.results already uses in the other
+    // direction, and the long form of what this type is for is at EpochKeyDelivery.
+    //
+    // 3 is free because this message has never had a third field: Spec B §4.3.3 declares
+    // it with 1 and 2 and nothing else, and 14/15 are the file-wide read_epoch/req_auth
+    // slots, which §4.3.8 exempts this arm from and which it does not carry.
+    //
+    // LENGTH: EMPTY, OR EXACTLY AS LONG AS `records`. `results` states the alignment and
+    // leaves the length implicit; this states both, because the two lists fail
+    // differently. A short `results` loses an answer the client can see is missing. A
+    // short `epoch_keys` silently re-aims every later entry at the wrong record, and what
+    // it re-aims is a key.
+    //
+    // AN ENTRY AGAINST A RECORD WITH is_commit = 0 IS REASON_REJECTED, whatever kind of
+    // attachment anything in the batch carries and on every date. Refusal, and not an empty
+    // entry: every field of EpochKeyDelivery has implicit presence, so a zero entry decodes
+    // as two EMPTY KEYS rather than as an absence — the REASON_OK = 0 hazard recorded at the
+    // foot of this file, one message over. It is decided on a value the server has already
+    // verified: `is_commit` is a projection field it checks against ParseRecord(record_bytes)
+    // before it gets here.
+    //
+    // AGAINST A COMMIT, THE RULE IS KEYED ON THE ATTACHMENT KIND, and it has to be while Spec
+    // B §5.4's acceptance window is open.
+    //
+    //   a kind 0x0005 commit with NO entry   → REASON_REJECTED. It is an epoch the server
+    //                                          would install without having been handed what
+    //                                          opens it.
+    //   a kind 0x0001 commit WITH an entry   → REASON_REJECTED. Its keys are in the
+    //                                          attachment, so a delivery beside it is a field
+    //                                          the server would not read and that can
+    //                                          disagree with the one the write_auth MAC
+    //                                          covers.
+    //
+    // THIS COMMENT READ "and so is a commit with no entry", KIND-FREE, AND THAT FORM IS TRUE
+    // ONLY AFTER THE WINDOW CLOSES. During the window a kind 0x0001 commit legitimately
+    // carries NO delivery — its keys are inside the attachment the MAC covers — so the
+    // kind-free sentence rejects every conforming 0x0001 commit there is. Spec B §4.3.3 names
+    // the divergence from the other side and this is connect's half of closing it.
+    //
+    // THE DATED BOUNDARY, WRITTEN OUT RATHER THAN IMPLIED (Spec B §5.4's acceptance window):
+    // from 2026-09-22 a server accepts EITHER kind on a commit, so both rows above are live;
+    // from 2026-10-06 a conforming client emits only 0x0005; and from 2026-11-03 — OR the day
+    // the Remove arm first ships, WHICHEVER IS EARLIER, which is the binding constraint
+    // because a member removed under a 0x0001 commit holds the chained keys forever — the
+    // server refuses 0x0001 on a new commit and the window is CLOSED. Only then is the second
+    // row unreachable and the kind-free sentence true. `0x0001` stays readable for every
+    // record already stored; what ends is its acceptance on a new commit.
+    //
+    // WHAT THOSE CLAUSES ADMIT, ENUMERATED — because they admit exactly two lengths and not a
+    // general batch. Spec B §4.3.3: "A batch containing a commit MUST contain exactly one
+    // record." So `epoch_keys` is EMPTY when `records` carries no commit AND when `records`
+    // is a single kind 0x0001 commit, and holds EXACTLY ONE ENTRY when `records` is a single
+    // kind 0x0005 commit. There is no third length. There are TWO ways to be empty while the
+    // window is open and ONE after it closes, and that is the whole of what the window
+    // changes here.
+    //
+    // AND THIS ALIGNMENT RESTS ON THAT BATCH RULE. Said plainly, because the opposite was
+    // written here first and it was false: take records = [kind 0x0005 commit, ordinary].
+    // Length 0 leaves the commit with no entry — refused. Length 2 puts an entry against a
+    // record with is_commit = 0 — refused. Any other length is refused by the length clause.
+    // No value satisfies the clauses, so for a mixed batch carrying a 0x0005 commit this
+    // field is not under-specified, it is UNSATISFIABLE. (Scoped to that kind deliberately:
+    // for a mixed batch carrying a 0x0001 commit, length 0 satisfies THIS field and §4.3.3's
+    // one-record rule refuses the batch anyway. It is the 0x0005 arm that makes the cost
+    // below a wire change, and after the window closes every commit is that arm.) The clause
+    // that removes the one encoding a mixed batch could have had is the same clause that has
+    // to be there: an "absent" entry would be a zero entry, and a zero entry is two empty
+    // keys.
+    //
+    // SO A RELAXATION OF §4.3.3 COSTS A WIRE CHANGE HERE, and naming the cost now is
+    // cheaper than discovering it. An entry would need explicit presence — a `bool
+    // present` on EpochKeyDelivery, or this list becoming map<uint32, EpochKeyDelivery>
+    // keyed by record index — and the REASON_OK = 0 hazard would have to be re-argued
+    // against whichever shape, since that hazard is the whole reason an empty entry is
+    // refused rather than read as "no keys for this record".
+    repeated EpochKeyDelivery epoch_keys = 3;
+}
+
+message Record {
+    // The canonical connect/message encoding of the whole record, produced by
+    // EncodeRecord and parsed by ParseRecord. AUTHORITATIVE for every field below.
+    // Carries ct_head, ct_body, server_attachment and write_auth.
+    bytes  record_bytes       = 1;
+
+    // Server-indexed projections of record_bytes. The server MUST verify that each
+    // equals the corresponding field of ParseRecord(record_bytes) and MUST reject the
+    // record with REASON_REJECTED if any differs. The client MUST populate all of them.
+    bytes  sender_handle      = 2;   // 16 B
+    uint64 epoch              = 3;
+    uint64 stream_index       = 4;
+    bool   is_commit          = 5;
+    uint32 retention_class    = 6;   // the retention-class wire byte of §3.1: 0, 1, 2, or 16..21
+    uint32 size_bucket        = 7;   // 0..5
+    uint64 expire_at_ms       = 8;   // unix MILLISECONDS, 0 = unset
+    bytes  body_hash          = 9;   // 32 B
+    bytes  blob_id            = 10;  // 32 B, present iff size_bucket == 5
+    bytes  wrap_target_handle = 11;  // 16 B, from server_attachment WrapTag; absent otherwise
+    bytes  recovery_handle    = 12;  // 16 B, from server_attachment RecoveryTag; absent otherwise
+
+    // Server-assigned. Ignored on submit, populated on read. Never authenticated.
+    uint64 record_id          = 13;
+
+    // NO FIELD 14, AND NO EPOCH KEYS. Both deliberate, and neither is a gap to fill.
+    //
+    // 14 is spoken for. Spec B §4.3.3 declares `uint64 eph_window = 14` on this message
+    // and this file does not carry it: the eph window landed in the record CODEC, at
+    // format version 0x02, and never in this projection. The number is not free, and
+    // giving it to something else would put a different field at 14 from the one every
+    // reader of §4.3.3 expects.
+    //
+    // The two epoch keys are NOT here — ruling 33 — and the long form is at
+    // EpochKeyDelivery. The short form is two facts about this type. It is the
+    // server→client record in six places, so a key field here would be six serve paths
+    // that must each remember to clear it. And every field below `record_bytes` is
+    // verified equal to the corresponding field of ParseRecord(record_bytes), which no
+    // key can satisfy: a key is by construction not implied by a projection of the
+    // record's own octets, which is the entire point of taking the keys out of them.
+}
+
+message SubmitResponse {
+    repeated SubmitResult results = 1;   // positionally aligned with the request
+}
+message SubmitResult {
+    Reason reason         = 1;
+    uint64 record_id      = 2;   // set when accepted or idempotently re-accepted
+    uint64 current_epoch  = 3;   // always set, so a stale client resynchronises in one round trip
+    Record winning_commit = 4;   // set on ANY rejection of a submission whose record has
+                                 // is_commit = 1, not only REASON_COMMIT_LOST (§6.2)
+    RetentionApplied applied = 5;
+}
+
+
+// ── §4.3.4 Fetch ─────────────────────────────────────────────────────────────
+
+message FetchRequest {
+    bytes  group_id        = 1;
+    uint64 since_record_id = 2;   // exclusive; 0 = from the beginning (decision B4)
+    uint32 limit           = 3;
+    bool   heads_only      = 4;   // skip ct_body; used for fast catch-up and for hole scans
+    uint32 class_mask      = 5;   // bitmask of retention_class values to include; 0 = all
+    uint64 read_epoch      = 14;  // §4.3.8. The epoch whose read key computed req_auth.
+                                  // Inside canonical_request_bytes, therefore inside the MAC.
+    bytes  req_auth        = 15;  // §4.3.8. REQUIRED
+}
+message FetchResponse {
+    repeated Record records       = 1;
+    uint64 next_record_id         = 2;
+    uint64 high_water_record_id   = 3;   // the group's max AT OR BELOW read_epoch — the epoch
+                                         // ceiling of §5.1.1, not the group's absolute max.
+                                         // (It read "the group's max at read time" until
+                                         // 2026-09-22; the ceiling landed and this line did
+                                         // not move. Spec B §4.3.4 amended itself the same
+                                         // day and this file is the copy a second
+                                         // implementation reads.)
+    bool   complete               = 4;   // false when truncated by limit OR by
+                                         // max_response_bytes; both are NORMAL. NOT false for
+                                         // the ceiling: a page the ceiling ends is complete,
+                                         // because what was asked for is bounded by the epoch
+                                         // the request authenticated. complete = false is how
+                                         // a client re-asks from the cursor it holds, so a
+                                         // reader that has ingested the record at its ceiling
+                                         // would otherwise re-ask, be served nothing, and
+                                         // raise a no-progress error against a server that
+                                         // did exactly what it was asked.
+    FetchAttestation attestation  = 5;
+}
+message FetchAttestation {
+    bytes  group_id             = 1;
+    uint64 since_record_id      = 2;
+    uint64 until_record_id      = 3;
+    repeated uint64 record_ids  = 4;
+    uint64 high_water_record_id = 5;    // the attested copy of FetchResponse.high_water_record_id
+                                        // above, and CEILING-RELATIVE exactly as that one is.
+                                        // Spec B C-4: compare attestations only within an
+                                        // identical (class_mask, heads_only, read_epoch)
+                                        // filter, because two HONEST answers taken at
+                                        // different read_epochs name different high waters,
+                                        // and reading that as a contradiction convicts a
+                                        // correct server.
+    uint64 server_time_ms       = 6;
+    bytes  server_id            = 7;
+    uint32 class_mask           = 8;
+    bool   heads_only           = 9;
+    uint64 read_epoch           = 11;   // §4.3.4, ruling 32. The epoch ceiling this answer
+                                        // was served under. §5.1.1's ceiling made
+                                        // high_water_record_id relative to the reader's own
+                                        // epoch, so a server applying a SHORTER ceiling than
+                                        // the request named produces an answer that
+                                        // proto.Equals the honest answer at that shorter
+                                        // ceiling — measured at 7 of 12 records, two whole
+                                        // epochs, withheld with no error and no hole, and the
+                                        // receiver's omission predicate answering "nothing
+                                        // omitted". It is in the preimage below for the
+                                        // reason §4.3.4 gives for class_mask and heads_only:
+                                        // "so that a filtered fetch is not
+                                        // byte-indistinguishable from a withholding one".
+                                        // The ceiling is the third filter, and those two are
+                                        // the inline control — they are values the client
+                                        // holds too, and they are signed. What a signature
+                                        // buys is not the value; it is the server's
+                                        // attributable commitment to having used it.
+                                        //
+                                        // AND THIS FIELD IS CHECKABLE WITHOUT THE SIGNATURE,
+                                        // BUT WHAT THE KEYLESS CHECK CATCHES IS NARROWER THAN
+                                        // THE WITHHOLDING ABOVE. Both halves are written down
+                                        // because the first was written alone first, and
+                                        // alone it is an overclaim an implementer would act
+                                        // on.
+                                        //
+                                        // THE CHECK. `group_id` and `since_record_id` above
+                                        // are already comparable with no key at all, against
+                                        // the FetchRequest the receiver itself sent, and
+                                        // `read_epoch` is the same kind of term —
+                                        // FetchRequest.read_epoch is field 14 of that
+                                        // request, so "the ceiling this answer was served
+                                        // under" and "the ceiling this request authenticated
+                                        // under" are both in the hands of whoever made the
+                                        // call. A server that TRUTHFULLY names a ceiling
+                                        // below the one the caller asked for is refusable
+                                        // TODAY, with no fleet key, no signature and no PKI.
+                                        // That refusal is real, it is free, and it is worth
+                                        // building.
+                                        //
+                                        // IT DOES NOT CATCH THE WITHHOLDING MEASURED ABOVE.
+                                        // This field is SERVER-CHOSEN, and ruling 32's
+                                        // adversary IS the server, so the transport's own
+                                        // authentication of the response says nothing about
+                                        // it: a clamping server writes the ceiling the caller
+                                        // ASKED FOR into this field and serves the shorter
+                                        // page underneath it, and the comparison passes.
+                                        // Measured on ruling 32's own scenario by
+                                        // TestTheKeylessCheckRefusesATruthfulClampAndNotALyingOne
+                                        // beside this file: of the fields a caller can
+                                        // compare with no key — derived there as the
+                                        // intersection of FetchRequest's field names with
+                                        // this message's — the truthful clamp differs in
+                                        // exactly `read_epoch` and is refused, and the lying
+                                        // clamp differs in NONE and is accepted while
+                                        // withholding 7 of 12 records. Spec B §5.1.1 says the
+                                        // same of its own ceiling: "a server claiming a
+                                        // shorter ceiling than the request named is
+                                        // byte-indistinguishable from an honest one unless
+                                        // `read_epoch` is in the attestation preimage, which
+                                        // is why it is."
+                                        //
+                                        // SO WHAT THE SIGNATURE ADDS IS THE BINDING, and not
+                                        // third-party provability of a refusal the caller
+                                        // could already make. Signed, `read_epoch` becomes a
+                                        // statement the server is attributably committed to,
+                                        // which is what lets Spec B C-4 pin an attestation
+                                        // and compare it against others taken under an
+                                        // IDENTICAL (class_mask, heads_only, read_epoch)
+                                        // filter: a server that answered high water 5 at
+                                        // ceiling 3 and later answers 12 at ceiling 3 has
+                                        // signed two statements that cannot both be true.
+                                        // Unsigned, it can always say the two answers were
+                                        // taken at different ceilings. That mechanism is
+                                        // CITED HERE AND NOT MEASURED: no Go file in this
+                                        // repository computes this signature, which
+                                        // TestNothingHereComputesTheAttestationPreimage
+                                        // states as a measurement with its own controls.
+                                        //
+                                        // 11, and 11 is free: this message has never had an
+                                        // eleventh field. NOT 10, because `sig` landed at 10
+                                        // and a landed field number is never renumbered. NOT
+                                        // 14, although 14 is the read_epoch slot everywhere
+                                        // else in this file: 14 is reserved on the REQUEST
+                                        // messages, whose every field number is inside
+                                        // canonical_request_bytes and therefore inside a MAC
+                                        // (Spec A §5.7). This is a response field, it is in
+                                        // no MAC, and its numbering is pinned by the explicit
+                                        // named field list below and by nothing else. Spec B
+                                        // §4.3.4 and MASTER §9.4 both number it 11.
+    bytes  sig                  = 10;   // Ed25519 over the §4.3.4 preimage:
+                                        //   "URmessage/v1/attest" ‖ LP(server_id) ‖ LP(group_id)
+                                        //     ‖ u64(since_record_id) ‖ u64(until_record_id)
+                                        //     ‖ u64(high_water_record_id)
+                                        //     ‖ u32(class_mask) ‖ u8(heads_only)
+                                        //     ‖ u64(read_epoch)
+                                        //     ‖ u32(count) ‖ u64(record_id[0]) ‖ …
+                                        //       ‖ u64(record_id[count-1])
+                                        //     ‖ u64(server_time_ms)
+                                        //
+                                        // THOSE ARE THE TEN ATTESTED FIELDS, AND NOTHING IN
+                                        // THIS REPOSITORY COMPUTES OR VERIFIES THIS
+                                        // SIGNATURE. The block above is a transcription of
+                                        // Spec B §4.3.4, not a Go function: the label
+                                        // "URmessage/v1/attest" appears in no .go file here,
+                                        // where "URmessage/v1/write" and "URmessage/v1/req"
+                                        // are both built in message/writeauth.go — the two
+                                        // preimages this repository DOES own, and the
+                                        // positive control for that absence. The message
+                                        // server's handler for it is unbuilt,
+                                        // Capabilities.attestation_supported is false, and no
+                                        // fleet key exists. read_epoch joins the preimage now
+                                        // so that whoever builds it builds it over the
+                                        // ceiling too, which is the argument FOR taking the
+                                        // field today rather than against.
+}
+
+
+// ── §4.3.5 Subscribe ─────────────────────────────────────────────────────────
+
+message SubscribeRequest {
+    repeated Subscription subscriptions = 1;
+    bool replace = 2;                   // true = this is the complete set for this connection
+    uint64 read_epoch = 14;             // §4.3.8. The epoch whose read key computed req_auth.
+                                        // Inside canonical_request_bytes, therefore inside the MAC.
+    bytes req_auth = 15;                // §4.3.8. REQUIRED
+}
+message Subscription {
+    bytes  group_id        = 1;
+    uint64 since_record_id = 2;
+}
+message SubscribeResponse {
+    repeated SubscriptionAck acks = 1;  // each carries snapshot_record_id (§4.4)
+}
+message RecordPush {
+    bytes  group_id = 1;
+    repeated Record records = 2;        // always contiguous in record_id
+    uint64 high_water_record_id = 3;    // §5.1.1's epoch ceiling applies to this arm too: a
+                                        // subscription serves no record above the read_epoch
+                                        // its req_auth was computed under, and this field is
+                                        // relative to that ceiling exactly as §4.3.4's is.
+                                        // UNIMPLEMENTED — Subscribe is unbuilt, and this line
+                                        // is the decision it INHERITS rather than re-takes.
+}
+message TransientPush {                 // EPH(0) — receipts, typing. Never touches disk.
+    bytes  group_id = 1;
+    repeated Record records = 2;
+}
+
+// SPEC GAP (Spec B §4.3). `UnsubscribeRequest` is bound as arm 15 of
+// MessageServerRequest.body and its req_auth exemption is stated in §4.3.8 and in
+// Spec A §5.7, but no ```proto block in either spec ever defines the message. The
+// arm cannot compile without a type, so the message is transcribed here from the
+// only normative sentences about it: §4.3.8's "reads no group state and cancels
+// only the caller's own subscription", and §4.4's model in which subscription
+// state is per-connection and never cross-connection (mirroring
+// SubscribeRequest.replace, which is likewise scoped to "this connection").
+//
+// The arm number 15 IS normative and is transcribed verbatim. The field numbers
+// INSIDE this message are not protocol constants: §4.3.8 exempts Unsubscribe from
+// req_auth, so nothing here is ever an input to a MAC, and a later correction that
+// renumbers these fields costs a wire-compatibility bump rather than a silent
+// authenticator break. Raised as a spec divergence; settle it against Spec B
+// before first ship.
+message UnsubscribeRequest {
+    repeated bytes group_ids = 1;       // cancel these subscriptions on THIS connection.
+                                        // Unknown ids are ignored, never refused: refusing
+                                        // would make this an existence oracle for the price
+                                        // of one request.
+    bool           all       = 2;       // true = cancel every subscription on this connection.
+                                        // When true, group_ids MUST be empty and is ignored.
+}
+
+
+// ── §4.3.6 Blob grant ────────────────────────────────────────────────────────
+
+message BlobGrantRequest {
+    bytes  group_id        = 1;
+    bytes  blob_id         = 2;   // 32 B, from Spec A §5.13 (content-independent; see §8.1)
+    Direction direction    = 3;   // DIRECTION_UPLOAD | DIRECTION_DOWNLOAD
+    uint64 declared_bytes  = 4;   // upload only; already padded per Capabilities
+    uint32 retention_class = 5;   // PERMANENT, DURABLE, MEDIA, or the parent's EPH class (§8.3)
+    uint64 read_epoch      = 14;  // §4.3.8. The epoch whose read key computed req_auth.
+                                  // Inside canonical_request_bytes, therefore inside the MAC.
+    bytes  req_auth        = 15;  // §4.3.8. REQUIRED — this is a read-path authorization,
+                                  // not a record, so it is req_auth and not write_auth
+}
+message BlobGrantResponse {
+    bytes  grant_token   = 1;   // opaque bearer capability; see §8.2
+    uint64 expires_ms    = 2;
+    uint32 chunk_bytes   = 3;
+    bytes  chunk_mask    = 4;   // upload: chunks already received, for resume
+    string path          = 5;   // path under BlobEndpoint.path_prefix, keyed on grant_ref
+}
+
+
+// ── §4.3.7 Recovery fetch (seed-only restore, master §5.4) ───────────────────
+
+message RecoveryFetchRequest {
+    bytes  recovery_handle = 1;   // 16 B
+    bytes proof = 2;   // Ed25519 over "URmessage/v1/recovery" ‖ LP(server_nonce)
+                       //   ‖ LP(recovery_handle), under recovery_sig_sk.
+                       // Verified against message_recovery.verify_pub (TOFU).
+    uint64 cursor          = 3;
+    uint32 limit           = 4;
+}
+message RecoveryFetchResponse {
+    repeated GroupRecords groups = 1;
+    uint64 next_cursor = 2;
+}
+
+
+// ── §4.3.9 Wrap fetch ────────────────────────────────────────────────────────
+//
+// §4.3.9 restates the two oneof arms as `wrap_fetch = 19` in both envelopes. That
+// agrees with §4.3 and with §4.3.8's op byte 19; the redundancy is the cross-check.
+
+message WrapFetchRequest {
+    bytes  group_id           = 1;
+    uint64 epoch              = 2;
+    bytes  wrap_target_handle = 3;   // 16 B
+    bool   want_snapshot      = 4;
+    uint64 read_epoch         = 14;  // §4.3.8. The epoch whose read key computed req_auth.
+                                     // Inside canonical_request_bytes, therefore inside the MAC.
+                                     // Independent of `epoch` above, which names the wrap wanted.
+    bytes  req_auth           = 15;
+}
+message WrapFetchResponse {
+    repeated Record records = 1;     // the device wrap and, if requested, the snapshot ref
+    bool   epoch_complete   = 2;
+}
+
+
+// ── §4.3.10 Supporting messages ──────────────────────────────────────────────
+//
+// `EpochAttachment`, `RecoveryTag`, `WrapTag` and `EpochComplete` are deliberately
+// NOT declared here. They are connect/message encodings owned by Spec A, restated
+// in Spec B §5.4, and are carried opaquely inside Record.record_bytes; the server
+// parses them with message.ParseServerAttachment and never reimplements them
+// (§12.1 A-2).
+
+enum Direction { DIRECTION_UNSPECIFIED = 0; DIRECTION_UPLOAD = 1; DIRECTION_DOWNLOAD = 2; }
+
+message GroupStatusRequest  { bytes group_id = 1; uint64 read_epoch = 14; bytes req_auth = 15; }
+message GroupStatusResponse {
+    uint64 current_epoch        = 1;
+    uint64 high_water_record_id = 2;   // ABSOLUTE, and NOT bounded by §5.1.1's epoch ceiling —
+                                       // this arm and `current_epoch` above are the one place
+                                       // the ceiling does not reach. §5.1.1: GroupStatus
+                                       // "serves no records, so the rule as written does not
+                                       // reach it". What the two absolute counters leak is
+                                       // OPEN, filed as ledger item 248: a party stuck at
+                                       // epoch n — which, after Remove ships, is an ex-member
+                                       // — polls this and watches both numbers climb. It is
+                                       // NOT fixed by clamping them, because §5.3's argument
+                                       // for the ninety-day read-key window names this arm
+                                       // first as the route out of a stale epoch, and the
+                                       // server cannot tell a removed member from a member
+                                       // who was away. Unbuilt on both sides; the decision is
+                                       // the lead's and must be taken before this arm is
+                                       // served, not by whoever serves it first.
+    bool   epoch_complete       = 3;   // §6.1 epoch publication step 3
+    bool   closed               = 4;
+    RetentionApplied applied    = 5;
+    uint64 oldest_read_epoch    = 6;   // the oldest epoch whose read key this server still
+                                       // holds. A client whose newest key is older than this
+                                       // is past the window and is told so rather than being
+                                       // refused without explanation (§5.3).
+}
+message CapabilityChange { Capabilities capabilities = 1; uint64 capability_version = 2;
+                           repeated ServerKey server_keys = 3; BlobEndpoint blob_endpoint = 4; }
+message Backpressure     { bytes group_id = 1; uint64 resume_from_record_id = 2; }
+message Drain            { uint32 reconnect_after_ms = 1; }
+message GroupRecords {
+    bytes  group_id             = 1;
+    repeated Record records     = 2;
+    uint64 high_water_record_id = 3;   // ABSOLUTE, and NOT ceiling-relative, unlike §4.3.4's
+                                       // and §4.3.5's. This type is carried by exactly one
+                                       // field in this file — RecoveryFetchResponse.groups —
+                                       // and §5.1.1 puts that arm "outside it entirely":
+                                       // §4.3.7 authorizes RecoveryFetch by the Ed25519
+                                       // recovery proof and not by req_auth, so a seed-only
+                                       // restorer holds no read key and NAMES NO EPOCH, and
+                                       // there is nothing for a ceiling to compare against.
+                                       // Its scope is the recovery_handle.
+                                       //
+                                       // Written down because the inheritance is the reader's
+                                       // obvious guess and it is wrong here: the three served
+                                       // high waters in this file do not agree, and which one
+                                       // a field is depends on how its arm is AUTHORIZED.
+    bool   complete             = 4;
+}
+message SubscriptionAck  { bytes group_id = 1; uint64 snapshot_record_id = 2; Reason reason = 3; }
+message KtGossip         { uint64 kt_epoch = 1; bytes root_hash = 2; bytes prev_root = 3;
+                           bytes history_root = 4; uint64 leaf_count = 5;
+                           uint64 sth_time_ms = 6; bytes sth_sig = 7; }
+
+message RetentionApplied {
+    uint32 media_ttl_seconds        = 1;   // what the server actually stored
+    uint32 durable_ttl_seconds      = 2;   // what the server actually stored. 4294967295 means
+                                           // indefinite; 0 never appears in an applied value,
+                                           // because "the group set nothing" is a request and
+                                           // not an outcome
+    bool   media_clamped_down       = 3;
+    bool   durable_floored_up       = 4;
+    uint32 requested_media_ttl_seconds   = 5;
+    uint32 requested_durable_ttl_seconds = 6;
+    bool   durable_clamped_down          = 7;   // text clamped to durable_ttl_max_seconds
+    bool   durable_defaulted             = 8;   // the group sent the unset sentinel and this
+                                                // value is the server's own advertised default
+}
+
+
+// ── §4.3.11 Contact rendezvous (MASTER §9.8) ─────────────────────────────────
+//
+// The one group-less surface in the system. A contact card is handed to someone
+// who is in none of the owner's groups, so no write_auth and no req_auth exist
+// between them, and every operation here is authorized by an Ed25519 signature
+// instead. The derivations, the card encoding, the sealed deposit and the five
+// preimages are Spec A §5.14; the server implements the verifiers and never the
+// signers. Each authenticator sits at field 15, the slot req_auth occupies on the
+// group-keyed requests.
+
+message RendezvousRegisterRequest {
+    bytes  rendezvous_id       = 1;   // 32 B
+    bytes  deposit_verify_pub  = 2;   // 32 B Ed25519, derived from the card's token
+    bytes  collect_verify_pub  = 3;   // 32 B Ed25519, held only by the card's owner
+    bytes  card_xwing_pub      = 4;   // 1216 B, disclosed on Open
+    uint32 alg_id              = 5;
+    bytes  register_auth       = 15;  // Ed25519 under collect_sig_sk over the §5.14 preimage
+}
+message RendezvousRegisterResponse {
+    uint64 expire_time_ms      = 1;   // when this registration lapses without a collect
+    uint32 mailbox_depth       = 2;   // uncollected deposits waiting right now
+}
+
+message RendezvousOpenRequest {
+    bytes  rendezvous_id       = 1;
+    bytes  open_auth           = 15;  // Ed25519 under deposit_sig_sk
+}
+message RendezvousOpenResponse {
+    bytes  card_xwing_pub      = 1;
+    uint32 alg_id              = 2;
+    uint32 deposit_bytes       = 3;   // echoes Capabilities.rendezvous_deposit_bytes
+}
+
+message RendezvousDepositRequest {
+    bytes  rendezvous_id       = 1;
+    bytes  deposit_ct          = 2;   // EXACTLY rendezvous_deposit_bytes
+    bytes  deposit_auth        = 15;  // Ed25519 under deposit_sig_sk over
+                                      //   rendezvous_id and H(deposit_ct)
+}
+message RendezvousDepositResponse {
+    uint64 deposit_id          = 1;   // the id assigned, or the existing one on an
+                                      // idempotent replay of identical bytes
+}
+
+message RendezvousCollectRequest {
+    bytes  rendezvous_id            = 1;
+    uint64 since_deposit_id         = 2;
+    uint64 ack_through_deposit_id   = 3;   // deletes everything through this id
+    uint32 limit                    = 4;
+    bool   subscribe                = 5;   // push while this connection lives
+    bytes  collect_auth             = 15;  // Ed25519 under collect_sig_sk
+}
+message RendezvousCollectResponse {
+    repeated RendezvousDeposit deposits = 1;
+    uint32 pending_count       = 2;
+    uint64 refused_count       = 3;   // refusals since the previous collect, then zeroed
+    uint64 expire_time_ms      = 4;   // refreshed by this call
+    bool   complete            = 5;
+}
+message RendezvousDeposit {
+    uint64 deposit_id          = 1;
+    bytes  deposit_ct          = 2;
+    uint64 create_time_ms      = 3;
+}
+
+message RendezvousRetireRequest {
+    bytes  rendezvous_id       = 1;
+    bytes  retire_auth         = 15;  // Ed25519 under collect_sig_sk
+}
+message RendezvousRetireResponse {
+    uint32 discarded_deposits  = 1;   // uncollected requests destroyed by the retirement
+}
+
+message RendezvousPush {
+    bytes  rendezvous_id       = 1;
+    uint32 pending_count       = 2;   // and nothing else; there is nothing else to say
+}
+
+
+// ── §4.5 Reason codes, and what they may not distinguish ─────────────────────
+
+// RECORDED HAZARD, NOT A DEVIATION — REASON_OK = 0, and 0 is what an unset field
+// decodes as.
+//
+// `reason` is a plain proto3 field on MessageServerResponse (2), SubmitResult (1)
+// and SubscriptionAck (3), so it has implicit presence: a reason that was never
+// populated — a partially-built SubmitResult inside a batch, a field lost to a
+// truncated or hand-rolled encoder — decodes as REASON_OK, which is to say as
+// success. Failing toward success is a poor default anywhere; it is a worse one on
+// a surface whose whole design is built around refusals being uninformative but
+// unambiguous (§4.5's deliberately non-specific REASON_REJECTED, §5.1's padded
+// latency on the reject path). `Direction`, twenty lines up, gets the sentinel
+// right: 0 is DIRECTION_UNSPECIFIED and means nothing.
+//
+// It is transcribed here exactly as §4.5 declares it, because it IS §4.5 — a
+// spec-level default, not an implementation slip. Renumbering it unilaterally
+// would move all eighteen values against a normative table that Spec C and the
+// §11.1 cross-implementation vectors also read. Raised as a spec divergence for a
+// Spec B ruling; message_wire_test.go pins the current numbering meanwhile, so the
+// ruling has to be recorded rather than slipped in.
+enum Reason {
+    REASON_OK                       = 0;
+    REASON_REJECTED                 = 1;  // deliberately non-specific; see below
+    REASON_EPOCH_STALE              = 2;  // carries current_epoch
+    REASON_COMMIT_LOST              = 3;  // carries the winning commit
+    REASON_STREAM_INDEX_REUSED      = 4;  // same index, different content
+    REASON_STREAM_INDEX_REGRESSED   = 5;  // index <= last accepted
+    REASON_OVERSIZE                 = 6;
+    REASON_QUOTA_EXCEEDED           = 7;
+    // SPEC GAP: §4.5 annotates this value "carries retry_after_ms", but no
+    // retry_after_ms field is defined on MessageServerResponse, on SubmitResult, or
+    // anywhere else in §4.3. Transcribed as §4.3 has it rather than invented here: a
+    // response field is never a MAC input, so adding one later is purely additive.
+    // Raised as a spec divergence.
+    REASON_RATE_LIMITED             = 8;  // carries retry_after_ms
+    REASON_RETENTION_CLAMPED        = 9;  // accepted; policy clamped DOWN to the advertised
+                                          // cap OR floored UP to the advertised minimum —
+                                          // see §7.3 and RetentionApplied
+    REASON_BLOB_UNKNOWN             = 10;
+    REASON_BLOB_INCOMPLETE          = 11;
+    REASON_UNSUPPORTED_VERSION      = 12;
+    REASON_INTERNAL                 = 13;
+    REASON_EPOCH_INCOMPLETE         = 14;  // the epoch's wrap set has not landed (§6.1, step 3 of
+                                           // the epoch publication sequence)
+    REASON_WRAP_TARGET_UNKNOWN      = 15;  // WrapFetch: no wrap for that target at that epoch
+    REASON_CARD_RETIRED             = 16;  // rendezvous retired, or never registered — the same
+                                           // answer for both, deliberately (§4.3.11)
+    REASON_CARD_RATE_LIMITED        = 17;  // per-rendezvous or per-client deposit limit, or the
+                                           // mailbox is at rendezvous_mailbox_depth
+}
+
+
+// ── §4.6 Fragmentation ───────────────────────────────────────────────────────
+
+// MessageType 1003, from the reserved block of §4.2. It previously had no code point at all.
+message MessageServerFragment {
+    uint64 request_id = 1;
+    uint32 index      = 2;
+    uint32 count      = 3;
+    bytes  part       = 4;
+}

@@ -52,6 +52,7 @@ func (self *ClientStrategy) startControlUdpCandidates(
 		return nil, nil, err
 	}
 	queryCtx, cancel := context.WithCancel(ctx)
+	cache := self.internalDohResolver.getCache()
 	recordTypes := dohDialRecordTypes(network)
 	results := make(chan dohDialQueryResult, len(recordTypes))
 	source := &udpDialCandidateSource{
@@ -64,7 +65,7 @@ func (self *ClientStrategy) startControlUdpCandidates(
 		source.queryWorkers.Add(1)
 		go func() {
 			defer source.queryWorkers.Done()
-			addrs, authoritative := self.internalDohResolver.cache.QueryResult(queryCtx, recordType, host)
+			addrs, authoritative := cache.QueryResult(queryCtx, recordType, host)
 			results <- dohDialQueryResult{
 				addrs:         dialAddrsMatchNetwork(network, addrs),
 				authoritative: authoritative,

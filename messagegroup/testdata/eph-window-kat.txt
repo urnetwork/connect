@@ -1,0 +1,130 @@
+# MASTER section 8's sender-side eph_window formula, as a table of KNOWN ANSWERS.
+#
+#   t = floor(sent_at_ms / (eph_bucket_seconds[b] * 1000))    for b in 1..5
+#   t = 0                                                      for b = 0, by definition
+#   refused                                                    for b off the ladder
+#
+# WHY A TABLE AND NOT A CALL. The formula exists at more than one site on purpose, and the
+# duplication is forced rather than careless: Spec B section 2.2 allows the message-server
+# module connect/message and connect/protocol and nothing else, so the harness that plays the
+# sender CANNOT link connect/messagegroup's shipped EphWindowAt, and section 12.1 hands it the
+# divisor without the division. A test that compared the two directly would need the import the
+# dependency rule forbids. What CAN cross a forbidden import is a value. This file is that
+# value: one table, pinned here, that each copy of the formula is driven over in its own
+# repository.
+#
+# THIS FILE IS ONE TABLE CARRIED BY TWO REPOSITORIES, BYTE FOR BYTE, AND NEITHER OF THEM OWNS IT.
+# It was msgrepo's alone until 2026-09-13. connect landed the other half on that day -- the same
+# bytes at connect/messagegroup/testdata/eph-window-kat.txt, driven over
+# connect/messagegroup.EphWindowAt by messagegroup/ephwindowkat_test.go -- so the paragraph that
+# stood here, which said connect "owes the other half ... until that lands", stopped being true and
+# is what this edit corrects. Each side pins the WHOLE of this file, its prose included, by SHA-256
+# over its canonical LF bytes: msgrepo in harness/ephkat_test.go, connect in ephwindowkat_test.go.
+# An edit here is therefore an edit both repositories have to make in the same change, and either
+# one alone turns the other's gate red on its next run -- which is exactly why correcting one stale
+# paragraph was itself a two-repository edit with two republished digests. Ledger item 193 carries
+# the digest and the procedure, and it remains FILED rather than closed: what is fastened is these
+# values, and no test in either repository can call the other's copy of the formula.
+#
+# THE ANSWERS WERE NOT READ OUT OF THE CODE THEY CHECK. They were computed from the sentence
+# above, independently, and then confirmed against connect/messagegroup.EphWindowAt in a
+# throwaway module outside both repositories -- the only place the two may be imported together.
+# A table generated from the implementation under test is a table that agrees with a bug.
+#
+# WHAT THIS TABLE IS FOR, historically. Before 2026-09-13 the harness copy read
+# `if seconds <= 0 { return 0, nil }`, which collapsed the off-ladder answer and the transient
+# rung's answer into one -- the sentinel collision M1-27's second half was ruled to eliminate,
+# reintroduced one repository over. Under that reading the two copies disagreed on 9 of the 32
+# (bucket, sent_at_ms) pairs probed from a module outside both repositories: (0, -1), and every
+# off-ladder pair. Restore that reading and rows of this table go red; the count that goes red
+# is asserted by name in the gate rather than written here, because a number in a data file is
+# a number nothing re-measures.
+#
+# FORMAT. Three whitespace-separated fields per row: the bucket byte, the sent_at_ms reading as
+# a signed decimal, and the answer -- either the window as an unsigned decimal, or the name of
+# the refusal. Lines beginning with # and blank lines are commentary. The refusal names are
+# the sentinel's identity and not its message text, because the two repositories prefix their
+# messages differently on purpose.
+#
+# THE PRODUCTION INSTANT, AND WHY ONE ROW OF THIS TABLE IS USED AS AN INPUT SOMEWHERE ELSE.
+# sent_at_ms 1767225600000 is 2026-01-01T00:00:00Z. It is the one reading below at which every
+# rung's answer is a window a REAL sender computes, and it is carried for all six rungs on purpose:
+#
+#   b = 0 -> 0        by definition; section 8.1 says bucket 0's window is never computed
+#   b = 1 -> 490896   hourly          b = 2 -> 61362    eight hourly     b = 3 -> 20454   daily
+#   b = 4 -> 2922     weekly          b = 5 -> 730      four weekly
+#
+# connect's EphKey known answers (messagegroup/ephkey_test.go) pin K_eph at those same five windows
+# under two eph_roots, and a gate there RECOMPUTES them from this instant rather than copying them,
+# so a digit fumbled in either place is a red test and not a difference nobody notices. Those rows
+# exist because a clock read fired only on 1000 < t < 1000000 -- the band buckets 1 to 4 compute in
+# for the whole of the 2020s and 2030s -- was measured green against every gate in connect's tree
+# while fifteen of that table's seventeen rows carried a window below 1000.
+#
+# NOTE WHAT BUCKET 5's ANSWER IS. 730 is BELOW 1000: a four-weekly window does not exceed 1000
+# until 2046-09-27, so that rung is outside the band this table's neighbours are worried about for
+# another twenty years, and no row here or there changes that.
+#
+# ORDER OF REFUSAL IS PART OF THE ANSWER. Rows (6, -1), (16, -1), (21, -1) and (255, -1) are
+# the ones that distinguish the two orders: a copy that tests the clock reading first answers
+# ERR_EPH_WINDOW_SENT_AT there, and a copy that tests the ladder first answers
+# ERR_EPH_BUCKET_OFF_LADDER. connect answers the second. So does this table.
+#
+# bucket  sent_at_ms            answer
+0       -1                    0
+0       0                     0
+0       1                     0
+0       1767225600000         0
+0       9223372036854775807   0
+1       -1                    ERR_EPH_WINDOW_SENT_AT
+1       0                     0
+1       1                     0
+1       3599999               0
+1       3600000               1
+1       3600001               1
+1       1767225600000         490896
+1       9223372036854775807   2562047788015
+2       -1                    ERR_EPH_WINDOW_SENT_AT
+2       0                     0
+2       1                     0
+2       28799999              0
+2       28800000              1
+2       28800001              1
+2       1767225600000         61362
+2       9223372036854775807   320255973501
+3       -1                    ERR_EPH_WINDOW_SENT_AT
+3       0                     0
+3       1                     0
+3       86399999              0
+3       86400000              1
+3       86400001              1
+3       1767225600000         20454
+3       9223372036854775807   106751991167
+4       -1                    ERR_EPH_WINDOW_SENT_AT
+4       0                     0
+4       1                     0
+4       604799999             0
+4       604800000             1
+4       604800001             1
+4       1767225600000         2922
+4       9223372036854775807   15250284452
+5       -1                    ERR_EPH_WINDOW_SENT_AT
+5       0                     0
+5       1                     0
+5       2419199999            0
+5       2419200000            1
+5       2419200001            1
+5       1767225600000         730
+5       9223372036854775807   3812571113
+6       -1                    ERR_EPH_BUCKET_OFF_LADDER
+6       0                     ERR_EPH_BUCKET_OFF_LADDER
+6       1767225600000         ERR_EPH_BUCKET_OFF_LADDER
+16      -1                    ERR_EPH_BUCKET_OFF_LADDER
+16      0                     ERR_EPH_BUCKET_OFF_LADDER
+16      1767225600000         ERR_EPH_BUCKET_OFF_LADDER
+21      -1                    ERR_EPH_BUCKET_OFF_LADDER
+21      0                     ERR_EPH_BUCKET_OFF_LADDER
+21      1767225600000         ERR_EPH_BUCKET_OFF_LADDER
+255     -1                    ERR_EPH_BUCKET_OFF_LADDER
+255     0                     ERR_EPH_BUCKET_OFF_LADDER
+255     1767225600000         ERR_EPH_BUCKET_OFF_LADDER

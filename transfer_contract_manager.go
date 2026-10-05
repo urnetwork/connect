@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "errors"
@@ -351,6 +352,14 @@ func DefaultContractManagerSettingsNoNetworkEvents() *ContractManagerSettings {
 type ContractManagerSettings struct {
 	SequenceBufferSize int
 
+	// Optional exact client-key-history policy domain digest. Zero leaves reports
+	// unsigned. The manager copies it once; retries never adopt another domain.
+	CloseReportDomainHash [32]byte
+	// Optional independently configured request/cut transport and durable outbox.
+	OriginalWorkCapture *OriginalWorkCaptureSettings
+	// Optional individual pre-send request and returned reservation custody.
+	OriginalContractCapture *OriginalContractCaptureSettings
+
 	// this should be enough to do a single ping
 	InitialContractTransferByteCount ByteCount
 	// InitialNetworkPeerContractTransferByteCount covers a bounded interactive
@@ -413,7 +422,12 @@ type ContractManager struct {
 	cancel context.CancelFunc
 	client *Client
 
-	settings *ContractManagerSettings
+	settings              *ContractManagerSettings
+	closeReportDomainHash [32]byte
+	closeInventory        originalCloseInventoryOwner
+	wholeWorkInventory    originalWorkInventoryOwner
+	originalWorkCapture   *OriginalWorkCaptureSettings
+	contractCreation      originalContractCreationOwner
 
 	mutex             sync.Mutex
 	closed            bool
@@ -467,6 +481,11 @@ type ContractManager struct {
 	// Nil test barriers expose callback admission and manager join entry.
 	beforeCallbackAdmissionLockForTest func()
 	beforeCloseWaitForTest             func()
+	// Nil in production; exposes completed original creation before route selection.
+	beforeOriginalCloseFrameForTest func(*protocol.CloseContract)
+	// Nil test barriers expose shutdown before retry admission and first send.
+	beforeCloseControlAdmissionForTest func(*protocol.Frame)
+	beforeCloseControlSendForTest      func(*protocol.Frame)
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
@@ -497,6 +516,8 @@ func NewContractManager(
 		cancel:                          cancel,
 		client:                          client,
 		settings:                        settings,
+		closeReportDomainHash:           settings.CloseReportDomainHash,
+		wholeWorkInventory:              originalWorkInventoryOwner{generation: NewId()},
 		provideSecretKeys:               map[protocol.ProvideMode][]byte{},
 		provideModes:                    map[protocol.ProvideMode]bool{},
 		providePaused:                   false,
@@ -521,6 +542,19 @@ func NewContractManager(
 	}
 
 	contractManager.startWorker("contract expiry", contractManager.expireQueuedContracts)
+	if directory, err := originalContractCreationDirectory(settings); err != nil {
+		client.log.Errorf("[contract]original request custody configuration unavailable: %v", err)
+	} else {
+		contractManager.contractCreation.directory = directory
+		if settings.OriginalContractCapture != nil {
+			contractManager.contractCreation.scope = OriginalContractStoreScope{DomainHash: contractManager.closeReportDomainHash, ClientId: [16]byte(client.ClientId()), PublicKey: settings.OriginalContractCapture.PublicKey, SourceGeneration: settings.OriginalContractCapture.SourceGeneration}
+		}
+	}
+	if settings.OriginalWorkCapture != nil {
+		capture := *settings.OriginalWorkCapture
+		contractManager.originalWorkCapture = &capture
+		contractManager.startWorker("original work capture", contractManager.runOriginalWorkCapture)
+	}
 
 	return contractManager
 }
@@ -1298,7 +1332,11 @@ func (self *ContractManager) Verify(storedContractHmac []byte, storedContractByt
 		return false
 	}
 
-	return VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
+	verified := VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
+	if verified {
+		self.admitOriginalWork(storedContractBytes)
+	}
+	return verified
 }
 
 func (self *ContractManager) GetProvideSecretKey(provideMode protocol.ProvideMode) ([]byte, bool) {
@@ -1483,6 +1521,7 @@ func (self *ContractManager) addContractToQueue(
 	if sourceId != self.client.ClientId() {
 		return fmt.Errorf("Contract source must be this client: %s<>%s", sourceId, self.client.ClientId())
 	}
+	self.admitOriginalWork(contract.StoredContractBytes)
 
 	if self.client.log.V(1).Enabled() {
 		self.client.log.Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
@@ -1560,10 +1599,14 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		self.client.log.Infof("[contract]create %s %s\n", self.client.ClientId(), contractKey.Destination)
 	}
 
+	self.beginOriginalWorkCreate()
+	originalRequest := self.captureOriginalContractRequest(frame)
 	self.client.ClientOob().SendControl(
 		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
 			defer finish()
+			defer self.finishOriginalWorkCreate(resultFrames, err)
+			self.captureOriginalContractAdmission(originalRequest, resultFrames, err)
 			if err == nil {
 				// the OOB round-trip completed: the backend is reachable
 				noteBackendSuccess()
@@ -1707,27 +1750,38 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	// retransfers and the closed-client OOB path keep the serialized frame;
 	// another equal-byte checkpoint is a different operation with a new ID.
 	// Deploy only after every backend route supports close-report identities.
-	frame, err := ToFrame(&protocol.CloseContract{
+	report := &protocol.CloseContract{
 		ContractId:       contractId.Bytes(),
 		AckedByteCount:   uint64(ackedByteCount),
 		UnackedByteCount: uint64(unackedByteCount),
 		Checkpoint:       checkpoint,
 		ReportId:         NewId().Bytes(),
-	}, self.settings.ProtocolVersion)
+	}
+	if self.closeReportDomainHash != ([32]byte{}) {
+		original, inventory, signErr := self.signOriginalCloseInventory(report)
+		if signErr != nil {
+			self.retainOriginalWorkClose(report)
+			// Optional evidence failure cannot erase the original close obligation.
+			// The empty envelope remains visibly unauthenticated to its consumer.
+			self.client.log.Errorf("[contract]original close evidence unavailable: %v", signErr)
+		} else {
+			report.OriginalReport = original
+			report.OriginalInventory = inventory
+		}
+	}
+	if self.beforeOriginalCloseFrameForTest != nil {
+		self.beforeOriginalCloseFrameForTest(report)
+	}
+	frame, err := ToFrame(report, self.settings.ProtocolVersion)
 	if err != nil {
 		self.client.log.Infof("[contract]could not create close contract frame = %s\n", err)
 		return
 	}
 
-	if self.ctx.Err() != nil || self.client.IsDone() {
-		// the client context is closed (the contract manager is closing).
-		// note the manager ctx is the client's parent ctx, so check both.
-		// `ControlSync` rides the in-band client transport, which is gone —
-		// it would drop the close without a single attempt. Send a one-shot
-		// cleanup over the out-of-band api on a Background context instead,
-		// since the lifecycle context is closed. One shot, never retried, so
-		// cleanup cannot run away; the server's expired-contract force-close
-		// remains the backstop if the single attempt fails.
+	// Takes the retained frame for one cleanup attempt after native delivery
+	// loses its lifecycle. The external OOB owner takes custody on return;
+	// server expiry remains the backstop if that attempt fails.
+	sendCleanup := func(cleanupFrame *protocol.Frame) {
 		sendCallback := func(resultFrames []*protocol.Frame, sendErr error) {
 			if sendErr == nil {
 				if self.client.log.V(1).Enabled() {
@@ -1737,39 +1791,64 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 				self.client.log.Infof("[contract]could not close %s after client close = %s\n", contractId, sendErr)
 			}
 		}
-		frames := []*protocol.Frame{frame}
+		frames := []*protocol.Frame{cleanupFrame}
 		if clientOob, ok := self.client.ClientOob().(OutOfBandControlWithCtx); ok {
 			clientOob.SendControlWithCtx(context.Background(), frames, sendCallback)
 		} else {
 			self.client.ClientOob().SendControl(frames, sendCallback)
 		}
+	}
+	if self.ctx.Err() != nil || self.client.IsDone() {
+		sendCleanup(frame)
 		return
 	}
 
 	closeControlSync := NewControlSync(self.ctx, self.client, fmt.Sprintf("close-contract-%s", contractId))
+	if self.beforeCloseControlAdmissionForTest != nil {
+		self.beforeCloseControlAdmissionForTest(frame)
+	}
 	self.mutex.Lock()
 	if self.closed {
 		self.mutex.Unlock()
 		closeControlSync.Close()
-		MessagePoolReturn(frame.MessageBytes)
+		sendCleanup(frame)
 		return
 	}
+	// Keep exact bytes until native acknowledgment or a single joined cleanup
+	// handoff. Close may cancel the sync before Send admits its first worker.
+	cleanupFrame := &protocol.Frame{
+		MessageType:  frame.MessageType,
+		MessageBytes: MessagePoolShareReadOnly(frame.MessageBytes),
+	}
+	var closeAcknowledged atomic.Bool
 	self.closeControlSyncs[closeControlSync] = true
 	if !self.startWorker("contract close sync", func() {
 		<-closeControlSync.workers.Done()
 		self.mutex.Lock()
 		delete(self.closeControlSyncs, closeControlSync)
 		self.mutex.Unlock()
+		if closeAcknowledged.Load() {
+			MessagePoolReturn(cleanupFrame.MessageBytes)
+		} else {
+			sendCleanup(cleanupFrame)
+		}
 	}) {
 		delete(self.closeControlSyncs, closeControlSync)
 		self.mutex.Unlock()
 		closeControlSync.Close()
-		MessagePoolReturn(frame.MessageBytes)
+		MessagePoolReturn(cleanupFrame.MessageBytes)
+		sendCleanup(frame)
 		return
 	}
 	self.mutex.Unlock()
+	if self.beforeCloseControlSendForTest != nil {
+		self.beforeCloseControlSendForTest(frame)
+	}
 	closeControlSync.Send(frame, nil, func(sendErr error) {
 		defer closeControlSync.Close()
+		if sendErr == nil {
+			closeAcknowledged.Store(true)
+		}
 		if sendErr == nil && opened {
 			contractQueue := self.openContractQueue(contractKey)
 			contractQueue.RemoveUsedContract(contractId)

@@ -5225,6 +5225,9 @@ type SendBufferSettings struct {
 	// Nil observers pin admission across an idle check without scheduler timing.
 	beforeRequiredEncryptionWaitForTest func(sendSequenceId)
 	afterIdleCloseForTest               func(sendSequenceId, bool)
+	// Nil observer marks an application Pack entering the Opportunistic
+	// establish hold's wait.
+	beforeEstablishHoldWaitForTest func(sendSequenceId)
 	// Runs after the caller-side no-acknowledgement stage decided, with
 	// whether an immediate write was attempted, whether it succeeded, and the
 	// timeout the pack then carries into admission (THROUGHPUTFIX §38.12).
@@ -6392,6 +6395,11 @@ type SendSequence struct {
 	// packAdmission counts both channel-resident and scheduler-resident Packs,
 	// so flow isolation cannot expand the configured memory bound.
 	packAdmission *sendPackAdmission
+	// Retained admission and ordinary ACK-timeout retirement arbitrate on one
+	// word. Once this generation has accepted non-regenerable ownership, an
+	// unrelated timeout can retire only its own item, including while the
+	// retained Pack still waits in ingress or the scheduler.
+	ackTimeoutDisposition atomic.Uint32
 	// The deadline of the pack the loop is writing, read by the write so it
 	// spends what the caller has left rather than a fresh write timeout.
 	// Owned by the sequence goroutine, which is the only writer and reader.
@@ -7091,6 +7099,64 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			// budget degrades to the non-blocking fast path below
 			timeout = max(time.Duration(0), timeout-time.Since(enterTime))
 		}
+	} else if !sendPack.ForceUnwrapped && self.session != nil && self.session.establishHoldPending() {
+		// Opportunistic establish hold
+		// (`EncryptionSettings.OpportunisticEstablishHold`): the gate above,
+		// at the same place for the same reason, with the opposite ending. An
+		// application pack waits for the session's first cipher and is sealed
+		// if it comes in time. At the hold's deadline, or as soon as an
+		// establishment attempt fails, the pack falls through to the plaintext
+		// Opportunistic sends; it is never refused for want of a cipher. The
+		// deadline runs from the session's first establishment attempt, not
+		// from this pack, so a peer that never answers costs one hold per
+		// session. A zero budget does not wait, and a budget that ends inside
+		// the hold returns not-sent with no error, as backpressure does, so
+		// the caller retries rather than gives up on the peer.
+		if self.sendBufferSettings.beforeEstablishHoldWaitForTest != nil {
+			self.sendBufferSettings.beforeEstablishHoldWaitForTest(self.id())
+		}
+		enterTime := time.Now()
+		for {
+			select {
+			case <-sendPack.Ctx.Done():
+				return false, errors.New("Done.")
+			case <-self.ctx.Done():
+				return false, errors.New("Done.")
+			case <-self.session.ctx.Done():
+				return false, errors.New("Done.")
+			default:
+			}
+			now := time.Now()
+			holding, changed, deadline := self.session.establishHoldState(now)
+			if !holding {
+				break
+			}
+			if timeout == 0 {
+				return false, nil
+			}
+			if 0 < timeout {
+				budgetEnd := enterTime.Add(timeout)
+				if !now.Before(budgetEnd) {
+					return false, nil
+				}
+				if budgetEnd.Before(deadline) {
+					deadline = budgetEnd
+				}
+			}
+			select {
+			case <-sendPack.Ctx.Done():
+				return false, errors.New("Done.")
+			case <-self.ctx.Done():
+				return false, errors.New("Done.")
+			case <-self.session.ctx.Done():
+				return false, errors.New("Done.")
+			case <-changed:
+			case <-time.After(deadline.Sub(now)):
+			}
+		}
+		if 0 < timeout {
+			timeout = max(time.Duration(0), timeout-time.Since(enterTime))
+		}
 	}
 
 	// The boundary is the write, not the queue.
@@ -7166,6 +7232,9 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			sendPack.releaseAdmission()
 		}
 	}()
+	if sendPack.ackRecord().retainPastAckTimeout() && !self.protectRetainedAdmission() {
+		return false, errors.New("Done.")
+	}
 
 	// fast path without arming a timer
 	select {
@@ -8198,6 +8267,15 @@ func (self *SendSequence) writeNoAckFastPath(
 			snapshot.release(messageByteCount)
 			return false
 		}
+		if cipher == nil && self.session.establishHoldPending() {
+			// the Opportunistic establish hold, as Pack's entry applies it: a
+			// hold that began after that check (a server-role session whose
+			// peer's ClientHello landed in between) gets no write here
+			if holding, _, _ := self.session.establishHoldState(time.Now()); holding {
+				snapshot.release(messageByteCount)
+				return false
+			}
+		}
 		if cipher != nil && !self.companionContract {
 			// the loop verifies the peer's certificate against the contract
 			// before it seals; here that has to be already settled
@@ -8563,6 +8641,15 @@ sendSequenceLoop:
 			drainPacks()
 		}
 
+		// A paced write may have yielded at a renewed ACK deadline. Retire
+		// that due ownership before an old pending SACK is consumed as fresh
+		// progress; pending cumulative delivery still wins in the lifetime index.
+		if self.ackTimeoutDisposition.Load() == sendAckTimeoutRetained {
+			if err := self.retireAckLifetimes(time.Now()); err != nil {
+				return
+			}
+		}
+
 		// apply the acks
 		ackSnapshot := ackWindow.Snapshot(true)
 		ackUpdated := 0 < ackSnapshot.ackUpdateCount || 0 < len(ackSnapshot.selectiveAcks)
@@ -8601,7 +8688,7 @@ sendSequenceLoop:
 		self.publishNoAckFastPath()
 
 		sendTime := time.Now()
-		if _, err := self.nextAckLifetime(sendTime); err != nil {
+		if err := self.retireAckLifetimes(sendTime); err != nil {
 			return
 		}
 		// before the recovery scans, so an evicted item is due on this pass
@@ -8649,9 +8736,11 @@ sendSequenceLoop:
 						// index removal alone cannot retire callbacks/credit/pools.
 						continue sendSequenceLoop
 					}
-					// message took too long to ack
-					// close the sequence
-					self.recordSendSequenceExit("ack_lifetime", item, item.sendTime.Add(item.ackTimeout), context.DeadlineExceeded)
+					if self.ackLifetimeDisposition(item, item.sendTime.Add(item.ackTimeout)) == errSendAckLifetime {
+						self.expireSendItem(item, sendTime)
+						continue sendSequenceLoop
+					}
+					// With no retained promise, preserve ordinary sequence retirement.
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[s]%s->%s...%s s(%s) exit ack timeout (%s) seq=%d sends=%d head=%t full_contract=%t compact_contract=%t promoted=%t selective=%t recovery=%d policy_limited=%t flight_limited=%t transport_write=%t pending=%d\n",
@@ -8954,7 +9043,7 @@ sendSequenceLoop:
 						}
 					}
 				}
-				if errors.Is(resendErr, errWindowPacingAcknowledged) {
+				if errors.Is(resendErr, errWindowPacingAcknowledged) || errors.Is(resendErr, errSendAckLifetime) {
 					continue sendSequenceLoop
 				}
 				self.detachResendItem(item.messageId)
@@ -9397,6 +9486,9 @@ sendSequenceLoop:
 		// a carrier with a reserve may send it immediately, while an isolation-only
 		// carrier gives it the next ordinary acknowledgement opening.
 		if deadline, err := self.nextAckLifetime(time.Now()); err != nil {
+			if errors.Is(err, errSendAckLifetime) {
+				continue sendSequenceLoop
+			}
 			return
 		} else if !deadline.IsZero() {
 			timeout = min(timeout, time.Until(deadline))
@@ -10503,6 +10595,9 @@ func (self *SendSequence) sendWithSetContractRecords(
 		// the bytes to the peer. A direct route can return its Ack synchronously
 		// inside the write; validation must find the item instead of discarding that
 		// progress and leaving resend admission closed until the recovery timer.
+		if acks.retainPastAckTimeout() {
+			self.protectRetainedAdmission()
+		}
 		self.sendItems = append(self.sendItems, item)
 		self.addResendItem(item)
 	}
@@ -12075,6 +12170,11 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		}
 	}
 	self.sendItems = self.sendItems[i:]
+	if len(self.sendItems) > 0 && self.sendItems[0].sequenceNumber > ackSequenceNumber+1 {
+		// An expired interior control becomes a skippable prefix only after
+		// every older live owner has actually been acknowledged.
+		self.scheduleAckTimeoutHead(self.lastCumulativeAckTime)
+	}
 	if promoteLanes != 0 {
 		self.promoteLaneHeads(promoteLanes, self.lastCumulativeAckTime)
 	}
@@ -12090,6 +12190,12 @@ func (self *SendSequence) ackItem(item *sendItem) {
 	if item.contractId != nil {
 		if itemSendContract, ok := self.openSendContracts[*item.contractId]; ok {
 			itemSendContract.ack(item.messageByteCount)
+			if item.hasContractFrame && !item.contractControl {
+				// A surviving data head can deliver the full proof after its
+				// original opening control expired. Ahead announcements carry
+				// a different contract's proof and retain their own callback.
+				self.setContractAcked(itemSendContract, true)
+			}
 			// not current and closed
 			if self.sendContract != itemSendContract {
 				self.retireSendContract(itemSendContract)
@@ -16336,6 +16442,9 @@ type sequenceContract struct {
 
 	ackedByteCount   ByteCount
 	unackedByteCount ByteCount
+	// Timed-out sends remain unacknowledged for reporting, but no longer
+	// own a retransmission that could keep an obsolete contract open.
+	abandonedByteCount ByteCount
 	// Activated by the send owner on first NoAck snapshot publication. Every
 	// later snapshot and ordinary debit reserves this same atomic headroom;
 	// delayed caller accounting therefore cannot be spent by another owner.

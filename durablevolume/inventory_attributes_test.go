@@ -3,6 +3,7 @@
 package durablevolume
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,42 @@ import (
 	"syscall"
 	"testing"
 )
+
+func TestInventoryOriginalRequestAndSdkOutboxSchemasAreExplicitlyBounded(t *testing.T) {
+	for _, name := range []string{"user.urnetwork.validator.requests.v1", "user.urnetwork.sdk-work.v1"} {
+		func() {
+			fixture := newVolumeFixture(t)
+			fixture.custody(t)
+			raw := bytes.Repeat([]byte{'a'}, 128)
+			if limit, known := ownerAttributeLimit(name); !known || limit != 4096 {
+				t.Fatal("owner schema lost its reviewed bound", limit, known)
+			}
+			if err := syscall.Setxattr(fixture.root, name, raw, 1); err != nil {
+				t.Fatal(err)
+			}
+			owner := fixture.open(t, Snapshot)
+			fence := fixture.fence(t)
+			report, err := owner.Inventory(t.Context(), fence, inventoryCustodyLimits(t))
+			if err != nil || report.TotalOwnerAttributes != 1 {
+				t.Fatal("actual original owner schema was omitted", report, err)
+			}
+			if len(report.Entries) == 0 || len(report.Entries[0].OwnerAttributes) != 1 || report.Entries[0].OwnerAttributes[0].Name != name || !bytes.Equal(report.Entries[0].OwnerAttributes[0].Value, raw) {
+				t.Fatal("original attribute bytes changed", report)
+			}
+			// An adjacent but unregistered name remains outside the fixed schema.
+			if err := owner.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Setxattr(fixture.root, name+".next", raw, 1); err != nil {
+				t.Fatal(err)
+			}
+			second := fixture.open(t, Snapshot)
+			if _, err := second.Inventory(t.Context(), fence, inventoryCustodyLimits(t)); err == nil {
+				t.Fatal("unknown adjacent schema acquired blanket owner authority")
+			}
+		}()
+	}
+}
 
 func TestInventoryOwnerAttributeBoundsRetainSameSnapshot(t *testing.T) {
 	fixture := newVolumeFixture(t)

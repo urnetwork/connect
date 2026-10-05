@@ -1,0 +1,262 @@
+# The device wrap's door, as KNOWN ANSWERS: env_key[k]'s ladder head, MASTER section 7's wrap KDF,
+# and the eleven-octet envelope's binding, one row at a time.
+#
+# WHAT THIS FILE IS FOR. m1 task 14's door is the first production caller of XwingEncapsulate and
+# XwingDecapsulate, and almost none of it is observable through a round trip: a sealer and an
+# opener written by one author agree about the order of wrap_key's nine info elements, about which
+# thirty two of the fifty six octets are the key, and about which octets of the envelope are bound,
+# whatever those answers are. Every one of those mistakes returns well formed octets, round trips
+# against itself, and is visible only to a second implementation. This file is what a second
+# implementation checks itself against, and what this one is driven over by wrap_test.go.
+#
+# HOW THESE ANSWERS WERE OBTAINED, stated rather than claimed. They were computed by running this
+# package. That is weaker than the eph-window table next door, whose answers were derived from the
+# spec sentence first and confirmed against the code afterwards, and the difference is not papered
+# over: wrap_test.go recomputes SOME of these rows a SECOND WAY, from RFC 5869 written out in
+# keyschedule_test.go over an info this file's own reader assembles from MASTER section 7's field
+# list rather than from WrapInfo.
+#
+# WHICH ROWS, exactly, because the previous version of this paragraph said "a row is held by two
+# derivations that share no code" and that was one sentence past what was done. The second
+# derivation covers INFO_SHA256 (a second encoder, assembled from MASTER's field list), WRAP_KEY
+# and WRAP_NONCE (RFC 5869 by hand over MASTER's salt), and the record_key[0] column of the LADDER
+# rows. It does NOT cover the rest: the key_body and nonce_body columns, AEAD_CT_SHA256,
+# WRAP_BODY_SHA256 and the digests in sections 4 and 5 are this package's own output, held against
+# this file and against nothing else. Those rows are a SNAPSHOT and are worth what a snapshot is
+# worth -- they pin the construction against future change and against a second implementation
+# that disagrees, and they do not independently establish that the construction is right. The
+# shared INPUTS below are taken on trust in both cases.
+#
+# FORMAT. Whitespace-separated fields, one row per line. Lines beginning with # and blank lines are
+# commentary. The first field is the row's name; what follows is named in the row's own paragraph
+# below. All octet strings are lower case hex. Lengths are decimal.
+#
+# ------------------------------------------------------------------------------------------------
+# SECTION 1 -- THE INPUTS
+# ------------------------------------------------------------------------------------------------
+#
+# Two of them are too long to print and are given as a RULE plus a digest of the octets that rule
+# produces, so a second implementation can build them exactly and check that it did:
+#
+#   ct_xwing         = 0x5a repeated 1120 times   (draft-connolly-cfrg-xwing-kem's ciphertext size)
+#   target_xwing_pub = 0xa3 repeated 1216 times   (the same draft's encapsulation key size)
+#
+# They are never parsed by anything below -- wrap_key's info takes both as LP-prefixed octets and
+# the KDF never looks inside either -- so a fill byte is as good as a real key here and says so.
+# The KEM's own construction is held against the draft's published vectors in
+# testdata/vectors/rfc/xwing-draft10.json and is not restated in this file.
+#
+# ENV_KEY, SS, GROUP_ID and TARGET_ID are ascending runs so that a transposition of any two inputs
+# is visible rather than symmetric, AND SO ARE THE THREE ENVELOPE OCTETS, for the same reason and
+# after the same rule was found not to have been applied to them. Every named input of this file
+# was checked pairwise against every other of its own width, since a transposition is only
+# well-formed between two values of one width: ENV_KEY, SS and GROUP_ID are the three thirty-two
+# octet inputs and no two are equal; TARGET_ID at sixteen, CT_XWING at 1120, TARGET_PUB at 1216 and
+# the payload at 132 have no same-width partner at all; the two long inputs differ in fill as well
+# as in length; and the three single octets -- wrap_format_version, target_type and payload_type --
+# were ALL 0x01 and are now 01 02 03. That last was the one collision, it made a transposition of
+# target_type and payload_type produce byte-identical answers everywhere below, and
+# TestNoTwoKnownAnswerInputsOfTheSameWidthAreEqual asserts the property rather than leaving this
+# paragraph to be re-checked by hand.
+
+INPUT_ENV_KEY          0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+INPUT_SS               4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60
+INPUT_GROUP_ID         2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40
+INPUT_TARGET_ID        7172737475767778797a7b7c7d7e7f80
+INPUT_CT_XWING_FILL    5a
+INPUT_CT_XWING_LEN     1120
+INPUT_CT_XWING_SHA256  7763f588a6a971767b4eb159f10df37e943c752fc115a383cefce105acd9707c
+INPUT_TARGET_PUB_FILL  a3
+INPUT_TARGET_PUB_LEN   1216
+INPUT_TARGET_PUB_SHA256 5c992a27b2bf010a04891bdac9c3be6944f6600d3e6e63ef56c7ef90a6b492fe
+
+# The envelope: u8(wrap_format_version) u8(target_type) u8(payload_type) u64(content_epoch).
+#
+# TARGET_TYPE AND PAYLOAD_TYPE ARE 0x02 AND 0x03 HERE BECAUSE THIS FILE NEEDED TWO OCTETS THAT ARE
+# NOT EACH OTHER, AND NEITHER IS A CODE POINT. MASTER section 7 names both as gaps it does not fill
+# -- "neither has a code point anywhere", and, in the clarification of 2026-09-19, "the domain is
+# not the encoding" -- and target_id is in the same list with four candidate byte strings. A second
+# implementation that reproduces the rows below has reproduced the CONSTRUCTION; it has not agreed
+# with anybody about which octet a device leaf is or which a pq_secret payload is, because no
+# document says. Open item MG-7 in messagegroup/OPENITEMS.md carries it.
+#
+# THEY WERE BOTH 0x01 UNTIL THIS COMMIT, and what that cost was MEASURED against a transposed
+# writer rather than argued. MASTER section 7's info writes u8(target_type) at one position and
+# u8(payload_type) four elements later; an implementation that swaps the two positions was run
+# against this file's inputs both ways round. With both octets 0x01 it reproduced EVERY PRIMARY
+# ROW exactly -- INFO_SHA256, WRAP_KEY, WRAP_NONCE, AEAD_CT_SHA256 and WRAP_BODY_SHA256 -- and of
+# the thirteen rows in sections 4 and 5 it was caught by three: ENVELOPE_OCTET 1, ENVELOPE_OCTET 2
+# and the GENUINE_OTHER payload_type row, each of which perturbs one of the two octets and so
+# breaks the symmetry the inputs had. So the file was not blind, but everything it calls an ANSWER
+# was, and a second implementation checking itself against section 3 alone would have agreed with
+# a transposed writer. With the octets at 01 02 03 the same transposed writer is separated by the
+# base row and by all thirteen: 11 of 11 in section 4 and 2 of 2 in section 5.
+
+INPUT_ENVELOPE_VERSION       01
+INPUT_ENVELOPE_TARGET_TYPE   02
+INPUT_ENVELOPE_PAYLOAD_TYPE  03
+INPUT_ENVELOPE_CONTENT_EPOCH 7
+INPUT_ENVELOPE_ENCODED       0102030000000000000007
+
+# The payload, which is what MASTER section 7 puts inside aead_ct:
+#
+#   aead_ct plaintext = secret | LP(identity_pub) | sig
+#
+# with secret 0x11 x 32, identity_pub 0x22 x 32 carried under a four octet big endian length, and
+# sig 0x33 x 64 -- 132 octets. The octets are fill because THIS DOOR DOES NOT BUILD THEM: task 14
+# step 3 is blocked by open item M1-52, which leaves the signature preimage at 1,320 or 1,356
+# octets with no document choosing, so nothing in this tree can sign a wrap yet. What the width
+# buys is the sizing check in section 3: a payload of exactly this shape is what makes
+# len(wrap_body) 1,289, which is the number MASTER section 8.2 publishes.
+
+INPUT_PAYLOAD_LEN     132
+INPUT_PAYLOAD_SHA256  5b71af2074e55a629bf6e9b533ad912774bb5c663a44b059420cd87a2f84c51e
+
+# ------------------------------------------------------------------------------------------------
+# SECTION 2 -- env_key[k]'S LADDER HEAD
+# ------------------------------------------------------------------------------------------------
+#
+# MASTER section 8.2's ruling of 2026-09-13 puts env_key[k] where the class key stands for every
+# other record, and changes nothing below it:
+#
+#   record_key[0]         = HKDF-Expand(env_key[k], "sender/v1" | LP(leaf_index), 32)
+#   key_body | nonce_body = HKDF-Expand(record_key[0], "rec/v1/body", 56)
+#
+# The exporter itself cannot be pinned here -- MLS-Exporter("URmessage/v1/envelope", "", 32) needs
+# live MLS epoch state -- so ENV_KEY above stands in for its answer and what these rows fix is what
+# this package does WITH an exporter output. The label is pinned separately, against MASTER's
+# literal, in wrap_test.go.
+#
+# THREE LEAVES AND NOT ONE, and the third is 0xffffffff because LP(leaf_index) is four octets and a
+# builder that wrote a varint there agrees with itself at every small leaf.
+#
+# FORMAT: LADDER <leaf index, decimal> <record_key[0]> <key_body> <nonce_body>
+
+LADDER 0          8dc39d5684a112beff718f6a2a6b20283aeffffebc2aeb4fd29b47548e47532d 95b163b107b3d481da39920a8f4391025824feb562a8e5549ab54ef37641a73f 0a9d6f03869d25f9c4c007983be2ec606b1c7c5f2e13a38f
+LADDER 3          74d369ef8f3d00a0a24bf69a5d5973b9087df94e063c14b317204d6a870522f1 a68671a00f8175e069eb7399625de40f1294c7a005e956fb33befb5c2c1d4765 40e31e66c67d7a19057f2c5339562d04c1c369abbbec1733
+LADDER 4294967295 b3550e0a0e9bef490a629ab5a370d17d81f86daded1085ce2e9f890d2dfa0f90 7234c7661321b6ec709449d5febd670329112b5cd56e3cd0b58fb82ed4d2e6b5 da8b802c585c67098bf4374cadc6967f3bfca808481ea943
+
+# ------------------------------------------------------------------------------------------------
+# SECTION 3 -- THE WRAP KDF AND THE SEALED BODY
+# ------------------------------------------------------------------------------------------------
+#
+# MASTER section 7, adopted 2026-09-18 from red-team finding M-15:
+#
+#   prk                   = HKDF-Extract(salt = "URmessage/v1/wrap-salt", ikm = ss)
+#   wrap_key | wrap_nonce = HKDF-Expand(prk, info, 56)                 // 32 key | 24 nonce
+#   info = "URmessage/v1/wrap" | LP(group_id) | u64(epoch) | u8(target_type) | LP(target_id)
+#          | u8(payload_type) | u16(alg_id) | LP(target_xwing_pub) | LP(ct_xwing)
+#   hybrid_ct = u16(alg_id) | LP(ct_xwing) | LP(aead_ct)
+#   wrap_body = wrap_envelope | hybrid_ct
+#
+# alg_id is 0x0014, MASTER section 7.1's registration for X-Wing, and it is inside the key as well
+# as on the wire -- which is M-15's anti-downgrade half: flipping the two octets on the wire yields
+# a different wrap_key and the AEAD fails, instead of the field being one nothing checks.
+#
+# aead_ct IS SEALED WITH NO ADDITIONAL AUTHENTICATED DATA. Spec A section 5.11 records that
+# "aead_ct still has no stated AAD", and everything an AAD would carry is already inside wrap_key's
+# nine elements. A second implementation that passed the envelope as an AAD would produce a
+# different tag and would not reproduce WRAP_BODY_SHA256.
+#
+# THE SIZING IS A CHECK AND NOT A CURIOSITY. MASTER section 8.2 publishes 1,289 octets of
+# wrap_body, 1,293 of the 4,096 rung once the LP32 body prefix is on it, and a 2,803-octet zero
+# tail. Those three numbers fall out of the widths above and of nothing else, so an implementation
+# that reproduces WRAP_BODY_LEN has agreed about every length prefix in the grammar.
+
+INFO_LEN              2429
+INFO_SHA256           01a58f925d3efd0082feb7f454ced7f7d197a8e3db4089a9f3759a8d257e8065
+PRK_SALT              URmessage/v1/wrap-salt
+INFO_LABEL            URmessage/v1/wrap
+ALG_ID                0014
+WRAP_KEY              d465ae85710c39a9d9bf1ecf678cbc97c0722c0eb5d9b39b3ea71896b2f9db19
+WRAP_NONCE            d3d5eb61e74b7f36a9967f278534d5aeb7b64b4fb1ef0907
+AEAD_CT_LEN           148
+AEAD_CT_SHA256        2c7e1ee24417336d639d691d637beaa8533cc5c221bf99018ab3aea2e0f86b87
+WRAP_BODY_LEN         1289
+WRAP_BODY_SHA256      24202f862f48a9a5624b173734e81a6b7a4197931671f2ab7d6bf21440a8e4de
+WRAP_BODY_OCCUPANCY   1293
+WRAP_BODY_RUNG        4096
+WRAP_BODY_ZERO_TAIL   2803
+
+# ------------------------------------------------------------------------------------------------
+# SECTION 4 -- THE FAILING DIRECTION: TEN OF THE ENVELOPE'S ELEVEN OCTETS ARE BOUND, AND ONE IS NOT
+# ------------------------------------------------------------------------------------------------
+#
+# THIS IS THE ROW SET THAT MATTERS, and it is here for the reason the epoch-digest corpus carries a
+# seed whose digest is valid for an epoch one past its keys: a door that answers "yes" is not the
+# same thing as a door that answered the whole question.
+#
+# The wrap envelope travels in the clear, outside hybrid_ct and outside the KEM seal. MASTER
+# section 7's nine-element info binds the content epoch, the target type and the payload type --
+# ten of the envelope's eleven octets -- so an attacker who changes any of those ten changes
+# wrap_key, and the AEAD refuses. The ELEVENTH octet, u8(wrap_format_version), is in no element of
+# info at all. The only construction in the corpus that ever covers it is the body signature, whose
+# preimage MASTER section 7 extends by LP(wrap_envelope) precisely so that the envelope is signed
+# by somebody -- and that signature is task 14 step 3, blocked by open item M1-52.
+#
+# So TODAY, at this commit, a wrap whose version octet has been changed on the wire opens to
+# exactly the payload it carried, under the same key, with no refusal anywhere. That is not a
+# defect of this door; it is the measured consequence of shipping the door before the signature,
+# and it is written down here so that nobody reads a green round trip as coverage of the envelope.
+# Open item MG-7. m1 task 14 property 9's four-cell table calls this row 1 of four, and says the
+# killing set there is the version octet alone -- reachable only behind the signature.
+#
+# HOW TO CHECK IT WITHOUT A KEM. Each row below flips every bit of ONE octet of
+# INPUT_ENVELOPE_ENCODED, rebuilds info from the flipped envelope and hashes it. If the digest
+# differs from INFO_SHA256 the octet reaches wrap_key and the AEAD is the authority over it; if the
+# digest is EQUAL, nothing in the key covers that octet. The verdict is stated per row so that a
+# reader who disagrees with the arithmetic can see which claim they are disagreeing with.
+#
+# FORMAT: ENVELOPE_OCTET <index, decimal> <bound|unbound> <sha256 of info after flipping it>
+
+ENVELOPE_OCTET 0  unbound 01a58f925d3efd0082feb7f454ced7f7d197a8e3db4089a9f3759a8d257e8065
+ENVELOPE_OCTET 1  bound   367be5c706646d831861b9109ad5e361c3d08b93bace3109b5cab72f7bb6b1d5
+ENVELOPE_OCTET 2  bound   7486900f4bc8a933513f5f680f3d70acc4be34d2ef2135eaacadc8feeb83c07d
+ENVELOPE_OCTET 3  bound   48a0b0752ad133d61a533bebc017b78cad0bd4aa2c518f7465a48aeafe7c7793
+ENVELOPE_OCTET 4  bound   55866ec107f0f625ac5e2f4e5e9e4efeaf3910c4466003910a33a6bfe0edca60
+ENVELOPE_OCTET 5  bound   12d192e7c174460ed1a4af64b8ae734364aa67d43be3891da3ff8c3783ba86c5
+ENVELOPE_OCTET 6  bound   99930ce0840a6a82a66d381e10c210245a41fac7136103e75b1e164e409bfc14
+ENVELOPE_OCTET 7  bound   ac9dce1c30b703c5eb5035442b32f13b0a01874f4afccda254f06ed760dbaa97
+ENVELOPE_OCTET 8  bound   f0f1fabaec0159178d48390aed419be4c1c732d92a8bb25303a6af67b98ae516
+ENVELOPE_OCTET 9  bound   d0996e7e09105cb822b1a36aecfdc8824268430f7ad4055eb4a5cd2bfec11f8c
+ENVELOPE_OCTET 10 bound   459b8fb2e5a3d7adcda5c7581018fcad6b9d6a61a611044ea8798db5e9c9b507
+
+# ------------------------------------------------------------------------------------------------
+# SECTION 5 -- THE OTHER FAILING DIRECTION: A GENUINE WRAP OF ANOTHER EPOCH IS NOT A TAMPERED ONE
+# ------------------------------------------------------------------------------------------------
+#
+# SECTION 4'S TEN "bound" ROWS SAY LESS THAN THEY LOOK LIKE THEY SAY, and this section is what
+# keeps a second implementation from reading them as more. Each of those rows edits an octet AFTER
+# the seal: the sealer used one envelope, the wire carries another, the opener derives a key the
+# sealer never used, and the tag fails. That is a DISAGREEMENT, and it is the case MASTER section 7
+# means when it says "a receiver that derives the key from the envelope's own values and finds
+# aead_ct does not open has detected the disagreement fail-closed".
+#
+# A WRAP OF ANOTHER EPOCH IS NOT THAT CASE. It is a wrap nobody edited. Its envelope and its key
+# agree with each other -- differently from this file's rows, but with each other -- so it opens,
+# and it opens to the payload it carries. The two rows below are exactly that: the section 1
+# envelope with ONE field moved, and the H(info) each produces. Both differ from INFO_SHA256, which
+# is the check -- a different key, not a broken one -- and a wrap sealed under either of them is a
+# perfectly good wrap that the AEAD has no reason to refuse.
+#
+# WHAT A SECOND IMPLEMENTATION OWES, and it is not an octet: the opener must compare the carried
+# envelope against the epoch it is restoring and the payload kind it asked for, and refuse a
+# mismatch, BEFORE it honours anything. Nothing in section 3 or section 4 can check that for it,
+# because the octets are correct in both directions. The second row is the one that bites soonest:
+# MASTER section 8.2's two device wraps for one leaf at one epoch land at ONE wrap_target_handle
+# and differ in u8(payload_type) alone, so an opener that does not compare will take pq_secret[k]
+# and eph_root[k] as interchangeable -- and they are not: one is PERMANENT and one is EPH(5), which
+# is what makes section 8.1's disappearing-message promise cryptographic.
+#
+# m1 task 14 property 4's headline is this section and not section 4: "a wrap for epoch n+1 does
+# not open as a wrap for epoch n". In this package the comparison is three required arguments of
+# OpenWrapBody -- u64(content_epoch), u8(target_type) and u8(payload_type), each a parameter with
+# no default, because a caller can leave a struct field unwritten and cannot leave an argument
+# unwritten -- and u8(wrap_format_version) is deliberately not a fourth: open item M1-54 leaves an
+# unrecognised version unruled, so nothing here refuses on it and section 4's row 0 still says
+# what it says.
+#
+# FORMAT: GENUINE_OTHER <the field that moved> <the eleven envelope octets> <sha256 of info>
+
+GENUINE_OTHER content_epoch 0102030000000000000008 272206af37b51d0400c4176ae5ac757cd101891b656522712b36036ee820bf96
+GENUINE_OTHER payload_type  0102040000000000000007 69792187579763573428b2d5127af2be5a83d845b4afebaa58cb24271ed9fc98

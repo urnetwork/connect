@@ -186,6 +186,10 @@ message ExtenderShareSettings {
     string GossipUrl = 2;
     // ed25519 root public keys, 32 bytes each
     repeated bytes RootPublicKeys = 3;
+    // the sharer's bootstrap DoH servers, `https://<ip literal>/...` urls of
+    // each family (net_http_doh_control.go). Empty leaves the importer's own.
+    repeated string ControlDohUrlsIpv4 = 4;
+    repeated string ControlDohUrlsIpv6 = 5;
 }
 
 // A shared set of extender addresses (K7). Addresses only: an imported address

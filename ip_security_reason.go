@@ -57,6 +57,8 @@ const (
 	SecurityPolicyReasonAllowRakNet
 	SecurityPolicyReasonAllowEthereumDiscv4
 	SecurityPolicyReasonAllowEthereumRlpx
+	// a provider-scoped messaging endpoint (ip_security_messaging.go)
+	SecurityPolicyReasonAllowMessaging
 
 	// one past the last reason
 	securityPolicyReasonEnd
@@ -120,6 +122,8 @@ func (self SecurityPolicyReason) String() string {
 		return "allow-app-standard:ethereum-discv4"
 	case SecurityPolicyReasonAllowEthereumRlpx:
 		return "allow-app-standard:ethereum-rlpx"
+	case SecurityPolicyReasonAllowMessaging:
+		return "allow-messaging"
 	default:
 		return "unknown"
 	}

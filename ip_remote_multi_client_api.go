@@ -712,18 +712,7 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 			IpFamily:            ipFamily,
 		}
 
-		var result *FindProviders2Result
-		var err error
-		if self.providerDiscovery != nil {
-			discoveryCtx, cancel := context.WithTimeout(ctx, self.clientStrategy.settings.RequestTimeout)
-			result, err = self.providerDiscovery.FindProviders2(discoveryCtx, self.api.ByJwt(), findProviders2)
-			cancel()
-		} else {
-			result, err = self.api.FindProviders2SyncWithCtx(ctx, findProviders2)
-		}
-		if err == nil && result == nil {
-			err = errors.New("provider discovery returned no result")
-		}
+		result, err := self.findProviders2(ctx, findProviders2)
 		if err != nil {
 			// prefer returning any fixed destinations over failing the whole call
 			if 0 < len(destinations) {
@@ -731,31 +720,85 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 			}
 			return nil, err
 		}
-
-		for _, provider := range result.Providers {
-			ids := []Id{}
-			if 0 < len(provider.IntermediaryIds) {
-				ids = append(ids, provider.IntermediaryIds...)
-			}
-			ids = append(ids, provider.ClientId)
-			// Keep the destination plus the nearest supported intermediaries.
-			if maximumMultiHopIdLength < len(ids) {
-				ids = ids[len(ids)-maximumMultiHopIdLength:]
-			}
-			if destination, err := NewMultiHopId(ids...); err == nil {
-				destinations[destination] = DestinationStats{
-					EstimatedBytesPerSecond: provider.EstimatedBytesPerSecond,
-					Tier:                    provider.Tier,
-					NetworkOnly:             provider.NetworkOnly,
-					ReputationFailures:      normalizeProviderReputationFailures(provider.ReputationFailedNames),
-					Location:                provider.Location,
-					IpFamily:                provider.IpFamily.Normalize(),
-				}
-			}
-		}
+		addProviderDestinations(destinations, result.Providers)
 	}
 
 	return destinations, nil
+}
+
+// NextDestinationsForClientId implements MultiClientGeneratorWithClientId: one
+// find-providers2 request that names only clientId, so the platform's
+// exclusions decide whether the provider may be dialed again. An id this
+// generator excludes is answered empty without a request, as discovery would
+// never return it either.
+func (self *ApiMultiClientGenerator) NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
+	destinations := map[MultiHopId]DestinationStats{}
+	excludeClientIds := self.ExcludeClientIds()
+	if slices.Contains(excludeClientIds, clientId) {
+		return destinations, nil
+	}
+	excludeDestinationsIds := [][]Id{}
+	for _, excludeDestination := range excludeDestinations {
+		excludeDestinationsIds = append(excludeDestinationsIds, excludeDestination.Ids())
+	}
+	result, err := self.findProviders2(self.ctx, &FindProviders2Args{
+		Specs: []*ProviderSpec{
+			{ClientId: &clientId},
+		},
+		ExcludeClientIds:    excludeClientIds,
+		ExcludeDestinations: excludeDestinationsIds,
+		Count:               1,
+		RankMode:            rankMode,
+	})
+	if err != nil {
+		return nil, err
+	}
+	addProviderDestinations(destinations, result.Providers)
+	return destinations, nil
+}
+
+// findProviders2 sends one discovery request through the injected provider
+// discovery when there is one, else the api.
+func (self *ApiMultiClientGenerator) findProviders2(ctx context.Context, findProviders2 *FindProviders2Args) (*FindProviders2Result, error) {
+	var result *FindProviders2Result
+	var err error
+	if self.providerDiscovery != nil {
+		discoveryCtx, cancel := context.WithTimeout(ctx, self.clientStrategy.settings.RequestTimeout)
+		result, err = self.providerDiscovery.FindProviders2(discoveryCtx, self.api.ByJwt(), findProviders2)
+		cancel()
+	} else {
+		result, err = self.api.FindProviders2SyncWithCtx(ctx, findProviders2)
+	}
+	if err == nil && result == nil {
+		err = errors.New("provider discovery returned no result")
+	}
+	return result, err
+}
+
+// addProviderDestinations adds each discovered provider as a destination with
+// its discovery stats.
+func addProviderDestinations(destinations map[MultiHopId]DestinationStats, providers []*FindProvidersProvider) {
+	for _, provider := range providers {
+		ids := []Id{}
+		if 0 < len(provider.IntermediaryIds) {
+			ids = append(ids, provider.IntermediaryIds...)
+		}
+		ids = append(ids, provider.ClientId)
+		// Keep the destination plus the nearest supported intermediaries.
+		if maximumMultiHopIdLength < len(ids) {
+			ids = ids[len(ids)-maximumMultiHopIdLength:]
+		}
+		if destination, err := NewMultiHopId(ids...); err == nil {
+			destinations[destination] = DestinationStats{
+				EstimatedBytesPerSecond: provider.EstimatedBytesPerSecond,
+				Tier:                    provider.Tier,
+				NetworkOnly:             provider.NetworkOnly,
+				ReputationFailures:      normalizeProviderReputationFailures(provider.ReputationFailedNames),
+				Location:                provider.Location,
+				IpFamily:                provider.IpFamily.Normalize(),
+			}
+		}
+	}
 }
 
 func (self *ApiMultiClientGenerator) NewClientArgs() (*MultiClientGeneratorClientArgs, error) {

@@ -34,6 +34,48 @@ func RegionalDnsServers() []*RegionalDnsServer {
 	return regionalDnsServers
 }
 
+// a well known regional DoH server a user can take as a bootstrap DoH server
+// for the control names (net_http_doh_control.go), associated to a country
+// code. DohUrlIpv6 is empty where the operator serves no v6 DoH endpoint whose
+// certificate names its v6 address.
+type RegionalControlDohServer struct {
+	CountryCode string
+	Name        string
+	DohUrlIpv4  string
+	DohUrlIpv6  string
+}
+
+// the presets of the bootstrap DoH setting. Each was checked to answer RFC
+// 8484 wire format (an application/dns-message GET and POST) with a
+// certificate whose SAN carries the url's ip, which is what the DoH client
+// verifies (2026-10-04). Alidns's v6 endpoints present a certificate without
+// their v6 addresses and DNSPod serves no v6 DoH, so the cn presets are v4.
+var regionalControlDohServers = []*RegionalControlDohServer{
+	{CountryCode: "cn", Name: "Alidns", DohUrlIpv4: "https://223.5.5.5/dns-query"},
+	{CountryCode: "cn", Name: "Alidns", DohUrlIpv4: "https://223.6.6.6/dns-query"},
+	{CountryCode: "cn", Name: "DNSPod/Tencent", DohUrlIpv4: "https://1.12.12.12/dns-query"},
+	{CountryCode: "cn", Name: "DNSPod/Tencent", DohUrlIpv4: "https://120.53.53.53/dns-query"},
+}
+
+// RegionalControlDohUrls returns the bootstrap DoH server urls recommended for
+// a country, v4 and v6, or none when there is no recommendation. This is the
+// single source of the presets the apps offer (through the sdk).
+func RegionalControlDohUrls(countryCode string) (dohUrlsIpv4 []string, dohUrlsIpv6 []string) {
+	countryCode = strings.ToLower(strings.TrimSpace(countryCode))
+	for _, server := range regionalControlDohServers {
+		if server.CountryCode != countryCode {
+			continue
+		}
+		if server.DohUrlIpv4 != "" {
+			dohUrlsIpv4 = append(dohUrlsIpv4, server.DohUrlIpv4)
+		}
+		if server.DohUrlIpv6 != "" {
+			dohUrlsIpv6 = append(dohUrlsIpv6, server.DohUrlIpv6)
+		}
+	}
+	return
+}
+
 // RegionalDnsResolverSettings is the recommended dns resolver settings for a
 // region where the strong-privacy defaults (DoH / cert-pinned) are known not to
 // work: unencrypted remote dns only, using the region's known-working servers

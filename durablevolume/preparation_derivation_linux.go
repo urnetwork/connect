@@ -36,11 +36,11 @@ func validatePreparationPhysicalMetadata(request PreparationRequest, owner Prepa
 	}
 	present := map[string]bool{}
 	for _, file := range owner.Files {
-		if file.Kind != "file" || file.Mode != 0600 || !preparationRelative(file.Path, 1, false) {
+		if file.Kind != "file" || file.Mode != 0600 && file.Mode != 0400 || !preparationRelative(file.Path, 1, false) {
 			return errors.New("physical metadata restore requires exact private flat members")
 		}
 		if preparationMetadataOwns(metadata, file.Path) {
-			if present[file.Path] || file.Bytes == 0 || file.Bytes > metadata.MaximumBytes {
+			if file.Mode != 0600 || present[file.Path] || file.Bytes == 0 || file.Bytes > metadata.MaximumBytes {
 				return errors.New("physical metadata census is duplicated or outside its reviewed capacity")
 			}
 			present[file.Path] = true
