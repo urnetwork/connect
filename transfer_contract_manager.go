@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "errors"
@@ -482,6 +483,9 @@ type ContractManager struct {
 	beforeCloseWaitForTest             func()
 	// Nil in production; exposes completed original creation before route selection.
 	beforeOriginalCloseFrameForTest func(*protocol.CloseContract)
+	// Nil test barriers expose shutdown before retry admission and first send.
+	beforeCloseControlAdmissionForTest func(*protocol.Frame)
+	beforeCloseControlSendForTest      func(*protocol.Frame)
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
@@ -1774,15 +1778,10 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 		return
 	}
 
-	if self.ctx.Err() != nil || self.client.IsDone() {
-		// the client context is closed (the contract manager is closing).
-		// note the manager ctx is the client's parent ctx, so check both.
-		// `ControlSync` rides the in-band client transport, which is gone —
-		// it would drop the close without a single attempt. Send a one-shot
-		// cleanup over the out-of-band api on a Background context instead,
-		// since the lifecycle context is closed. One shot, never retried, so
-		// cleanup cannot run away; the server's expired-contract force-close
-		// remains the backstop if the single attempt fails.
+	// Takes the retained frame for one cleanup attempt after native delivery
+	// loses its lifecycle. The external OOB owner takes custody on return;
+	// server expiry remains the backstop if that attempt fails.
+	sendCleanup := func(cleanupFrame *protocol.Frame) {
 		sendCallback := func(resultFrames []*protocol.Frame, sendErr error) {
 			if sendErr == nil {
 				if self.client.log.V(1).Enabled() {
@@ -1792,39 +1791,64 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 				self.client.log.Infof("[contract]could not close %s after client close = %s\n", contractId, sendErr)
 			}
 		}
-		frames := []*protocol.Frame{frame}
+		frames := []*protocol.Frame{cleanupFrame}
 		if clientOob, ok := self.client.ClientOob().(OutOfBandControlWithCtx); ok {
 			clientOob.SendControlWithCtx(context.Background(), frames, sendCallback)
 		} else {
 			self.client.ClientOob().SendControl(frames, sendCallback)
 		}
+	}
+	if self.ctx.Err() != nil || self.client.IsDone() {
+		sendCleanup(frame)
 		return
 	}
 
 	closeControlSync := NewControlSync(self.ctx, self.client, fmt.Sprintf("close-contract-%s", contractId))
+	if self.beforeCloseControlAdmissionForTest != nil {
+		self.beforeCloseControlAdmissionForTest(frame)
+	}
 	self.mutex.Lock()
 	if self.closed {
 		self.mutex.Unlock()
 		closeControlSync.Close()
-		MessagePoolReturn(frame.MessageBytes)
+		sendCleanup(frame)
 		return
 	}
+	// Keep exact bytes until native acknowledgment or a single joined cleanup
+	// handoff. Close may cancel the sync before Send admits its first worker.
+	cleanupFrame := &protocol.Frame{
+		MessageType:  frame.MessageType,
+		MessageBytes: MessagePoolShareReadOnly(frame.MessageBytes),
+	}
+	var closeAcknowledged atomic.Bool
 	self.closeControlSyncs[closeControlSync] = true
 	if !self.startWorker("contract close sync", func() {
 		<-closeControlSync.workers.Done()
 		self.mutex.Lock()
 		delete(self.closeControlSyncs, closeControlSync)
 		self.mutex.Unlock()
+		if closeAcknowledged.Load() {
+			MessagePoolReturn(cleanupFrame.MessageBytes)
+		} else {
+			sendCleanup(cleanupFrame)
+		}
 	}) {
 		delete(self.closeControlSyncs, closeControlSync)
 		self.mutex.Unlock()
 		closeControlSync.Close()
-		MessagePoolReturn(frame.MessageBytes)
+		MessagePoolReturn(cleanupFrame.MessageBytes)
+		sendCleanup(frame)
 		return
 	}
 	self.mutex.Unlock()
+	if self.beforeCloseControlSendForTest != nil {
+		self.beforeCloseControlSendForTest(frame)
+	}
 	closeControlSync.Send(frame, nil, func(sendErr error) {
 		defer closeControlSync.Close()
+		if sendErr == nil {
+			closeAcknowledged.Store(true)
+		}
 		if sendErr == nil && opened {
 			contractQueue := self.openContractQueue(contractKey)
 			contractQueue.RemoveUsedContract(contractId)
