@@ -766,7 +766,7 @@ secret included, to whoever answers at an address nothing has vouched
 for. Each
 address carries local state: success and failure counts, last success,
 last failure, first failure, consecutive failures, hold-until, last use,
-in-use count. Policy, all settings: hold after a failure 10 minutes
+in-use count (kept by ip beside the address, E7). Policy, all settings: hold after a failure 10 minutes
 doubling per consecutive failure to 6 hours; warning means consecutive
 failures at least 1; removal when never succeeded and the first failure
 is older than 24 hours, or when the last success is older than 7 days and
@@ -878,6 +878,70 @@ records sit in an index of pools (`net_extender_directory_tier.go`), so an
 apply, an eviction and a draw each take constant time, and a store written
 under a larger cap loads within the current one. `SetMaxActiveRecordCount`
 replaces the cap at run time; `<= 0` keeps every record.
+
+E7. Reset (2026-10-05). Extender knowledge is per installation, not per
+account, so a sign-out keeps it, and a local account can therefore poison
+what another account on the device dials; the account screen's Extenders
+section has a "Reset extenders" action instead (K6). `ExtenderDirectory.
+Reset(rootKeySet)` returns the directory to a fresh install's: every record
+and revocation learned from the feed, the mesh, the dns bootstrap, an
+activation's sample or a share, every address with its local evidence
+(successes, failures, holds, limits, latency samples), the manual
+addresses, the continent hint and the operator's last country go, and the
+given root keys replace the ones in force, which drops whatever a hello
+installed (nil is the unconfigured state, which waits for the first hello).
+It writes the store before it returns; a save that read the state before
+the reset is skipped rather than written over it, since a save never writes
+a state older than one already written. The startup gate goes back to no
+client, so the client started next waits out its first sample once (E4).
+It keeps what is not knowledge of other extenders: the identities the
+directory keeps (`KeepPublicKey`), this device's own extender record and
+any revocation of it, verified again under the new keys, with fresh
+evidence for its addresses; the settings, the active cap in force and the
+subscriptions; and the live use of each address, which is kept by ip
+whether or not the address is known, because a connection made through an
+extender outlives the reset: its release balances its hold, and an address
+learned again while it lives is reported in use. A record or revocation
+whose verification began before the reset is dropped when it reaches the
+apply. Everything else that writes learned state is stopped by its owner
+first. In the sdk, `NetworkSpace.ResetExtenders()` mints a reset id (a
+ULID) and, through the manager so the values are persisted, clears the
+user-added extender values (`NetExtender`, `ExtenderDnsName`, `GossipUrl`,
+`ExtenderRootPublicKeys`, `ExtenderHosts`) and sets
+`NetworkSpaceValues.ExtenderResetId`. The in-place apply closes and joins
+the network client and the node, resets the directory to the root keys of
+the values in force -- the bundled table for the host -- records the id in
+`.extender_reset_id` beside `.extenders` (after the directory's own write,
+so a process that ends in between resets again rather than not at all),
+sets the custom extenders, which drops every extender dialer drawn from the
+old directory, and starts a new client and node, which read hello and
+bootstrap as on a first run. One restart runs at a time. A live extender
+path keeps running: the platform transport's connection through it is not
+closed, an in-flight request finishes on its connection, the idle pooled
+api connections through the dropped dialers close, and every dial after the
+reset draws from the fresh directory.
+
+The id travels with the values, so every process that holds the space
+applies the reset once: a space applies one whose id is newer than the one
+its storage last applied -- at construction, in the in-place apply of an
+import, and before a rebuild, where the space being replaced is stopped and
+reset first so its close cannot write back what the reset cleared.
+`NetworkSpace.ApplyExtenderReset(resetId)` applies one minted elsewhere;
+an applied or older id changes nothing. A press always resets, even when a
+clock set back mints an id older than the applied one. Process paths: on
+ios and macos the app's `DeviceRemote.ResetExtenders` resets the app's
+space and hands the id to the packet tunnel extension
+(`DeviceLocalRpc.ApplyExtenderReset`), queued for the next sync while it
+cannot be reached; the windows service and the linux daemon take a
+`reset_extenders` control verb with the space key and the id and apply it
+to that space of theirs, which the session device and the provider-only
+device both run in; and in every case the next import of the space, which
+carries the id, applies it at the latest. On a daemon that several users
+share, an older id carried by another user's space applies nothing. A
+hosted device never resets: its space is the proxy host's. What a reset
+keeps beyond the directory's own list: `.extender_key`, the gossip mode,
+`.provide_extender` and the bootstrap DoH servers, which are not extender
+knowledge.
 
 ### F. SDK surface and network space
 
@@ -1129,7 +1193,9 @@ everything the feed and the mesh deliver. The legacy single private
 extender with a secret stays as an advanced field with its exclusive
 override. Saving restarts the space's network client and node in place;
 on iOS the tunnel extension picks the values up at its next start and the
-app says so.
+app says so. The section's "Reset extenders" action (E7), behind a
+confirmation that says the added extenders are removed and everything
+learned is cleared, clears these values and the directory together.
 
 K7. Share and import. The section has "share extenders" and "import
 extenders". The share payload is `ur-ext:1:` followed by base64url of
