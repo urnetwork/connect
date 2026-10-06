@@ -57,7 +57,7 @@ func TestPhysicalInventoryRetainsEveryOriginalMemberGeneration(t *testing.T) {
 		if err := syscall.Stat(filepath.Join(fixture.root, member.Path), &stat); err != nil {
 			t.Fatal(err)
 		}
-		if member.Physical == nil || member.Physical.Inode != stat.Ino || member.Physical.Device != deviceNumber(stat.Dev) {
+		if member.Physical == nil || member.Physical.Inode != stat.Ino || member.Physical.Device != deviceNumber(uint64(stat.Dev)) {
 			t.Fatal("inventory lacks the original member generation required to authenticate retained owner census", member.Path, member.Physical)
 		}
 	}

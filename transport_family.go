@@ -297,6 +297,10 @@ const (
 	PlatformTransportStateSleeping
 	// pinned: the control family policy forbids the pinned family
 	PlatformTransportStateIdlePolicy
+	// the platform closed the client for the network's client limit, and the
+	// transport holds its dials until the hold ends
+	// (transport_client_limit.go)
+	PlatformTransportStateClientLimit
 )
 
 func (self PlatformTransportState) String() string {
@@ -311,6 +315,8 @@ func (self PlatformTransportState) String() string {
 		return "sleeping"
 	case PlatformTransportStateIdlePolicy:
 		return "idle-policy"
+	case PlatformTransportStateClientLimit:
+		return "client-limit"
 	default:
 		return "unknown"
 	}
@@ -389,6 +395,13 @@ func (self *pinnedDialBackoff) reset() {
 	self.failures = 0
 }
 
+// ClientLimitBackoff is the client limit hold of this transport, shared with
+// the other transports of its client when its settings carried one
+// (transport_client_limit.go).
+func (self *PlatformTransport) ClientLimitBackoff() *ClientLimitBackoff {
+	return self.clientLimitBackoff
+}
+
 // IpFamily is the pinned family, 4 or 6, or 0 for a family-agnostic transport.
 func (self *PlatformTransport) IpFamily() int {
 	return self.ipFamily
@@ -411,7 +424,9 @@ func (self *PlatformTransport) Enabled() bool {
 }
 
 // State is the coarse lifecycle: the owner's hold and the pinned family's own
-// holds take precedence over connected, which takes precedence over connecting.
+// holds take precedence over connected, which takes precedence over a client
+// limit hold, which takes precedence over connecting. A connection that
+// outlives the close of a sibling connection still reads connected.
 func (self *PlatformTransport) State() PlatformTransportState {
 	if !self.enabled.Load() {
 		return PlatformTransportStateDisabled
@@ -421,6 +436,9 @@ func (self *PlatformTransport) State() PlatformTransportState {
 	}
 	if self.IsConnected() {
 		return PlatformTransportStateConnected
+	}
+	if clientLimitStatus, _ := self.clientLimitHold(); clientLimitStatus.Exceeded {
+		return PlatformTransportStateClientLimit
 	}
 	return PlatformTransportStateConnecting
 }
@@ -435,18 +453,33 @@ func (self *PlatformTransport) updateHold() {
 	}
 }
 
-// waitDialAdmission parks a mode runner while the transport is held. False
-// means the transport is closing.
+// waitDialAdmission parks a mode runner while the transport is held, by its
+// owner, by its pinned family, or by a client limit hold
+// (transport_client_limit.go). False means the transport is closing.
 func (self *PlatformTransport) waitDialAdmission(ctx context.Context) bool {
 	for {
 		held, notify := self.held.Get()
-		if !held {
+		if held {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-notify:
+			}
+			continue
+		}
+		clientLimitStatus, clientLimitNotify := self.clientLimitHold()
+		if !clientLimitStatus.Exceeded {
 			return true
 		}
+		if self.settings.clientLimitHoldForTest != nil {
+			self.settings.clientLimitHoldForTest()
+		}
+		// a change of either hold re-runs both checks
 		select {
 		case <-ctx.Done():
 			return false
 		case <-notify:
+		case <-clientLimitNotify:
 		}
 	}
 }
@@ -1074,6 +1107,14 @@ func NewFamilyPlatformTransportGroup(
 	if groupSettings == nil {
 		groupSettings = DefaultFamilyPlatformTransportGroupSettings()
 	}
+	if settings.ClientLimitBackoff == nil {
+		// the three transports are one client to the platform, so a client
+		// limit close of any of them holds all of them. The caller's settings
+		// are never mutated.
+		copied := *settings
+		copied.ClientLimitBackoff = NewClientLimitBackoff()
+		settings = &copied
+	}
 	cancelCtx, cancel := context.WithCancel(ctx)
 	group := &FamilyPlatformTransportGroup{
 		ctx:              cancelCtx,
@@ -1369,6 +1410,12 @@ func (self *FamilyPlatformTransportGroup) CanMakeBeforeBreakFrom(previous *Famil
 		return false
 	}
 	return true
+}
+
+// ClientLimitBackoff is the client limit hold every transport of the group
+// shares (transport_client_limit.go).
+func (self *FamilyPlatformTransportGroup) ClientLimitBackoff() *ClientLimitBackoff {
+	return self.standbyTransport.clientLimitBackoff
 }
 
 // Close stops every transport and the owned strategies. Nonblocking.

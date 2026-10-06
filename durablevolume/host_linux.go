@@ -123,7 +123,7 @@ func (self linuxHost) DeviceUuid(uuid string) (Device, error) {
 	if stat.Mode&syscall.S_IFMT != syscall.S_IFBLK {
 		return Device{}, errors.Join(ErrIdentity, errors.New("filesystem uuid does not resolve to a block device"))
 	}
-	return deviceNumber(stat.Rdev), nil
+	return deviceNumber(uint64(stat.Rdev)), nil
 }
 
 // Available blocks/inodes use the process's available allocation, not totals.
@@ -132,10 +132,15 @@ func (self linuxHost) Filesystem(directory *os.File) (Filesystem, error) {
 	if err := syscall.Fstatfs(int(directory.Fd()), &state); err != nil {
 		return Filesystem{}, err
 	}
+	return filesystemFromStatfs(state)
+}
+
+// Kernel magic numbers retain their unsigned 32-bit identity in signed fields.
+func filesystemFromStatfs(state syscall.Statfs_t) (Filesystem, error) {
 	if state.Bsize <= 0 || state.Bavail > math.MaxUint64/uint64(state.Bsize) {
 		return Filesystem{}, errors.New("filesystem available-byte arithmetic is invalid")
 	}
-	return Filesystem{Id: state.Fsid.X__val, Type: state.Type, ReadOnly: state.Flags&1 != 0,
+	return Filesystem{Id: state.Fsid.X__val, Type: int64(uint32(state.Type)), ReadOnly: state.Flags&1 != 0,
 		AvailableBytes: state.Bavail * uint64(state.Bsize), AvailableInodes: state.Ffree}, nil
 }
 
@@ -484,7 +489,7 @@ func (self *Owner) check(write bool) error {
 		if err := syscall.Fstat(int(entry.file.Fd()), &stat); err != nil {
 			return unavailableObservation("durable descriptor device could not be observed", err)
 		}
-		if deviceNumber(stat.Dev) != mount.Device {
+		if deviceNumber(uint64(stat.Dev)) != mount.Device {
 			return errors.Join(ErrIdentity, errors.New("durable descriptor belongs to another filesystem"))
 		}
 	}
@@ -613,7 +618,7 @@ func (self *Owner) openChild(relative string, create bool) (*os.File, error) {
 		if err := syscall.Fstat(next, &stat); err != nil {
 			return nil, errors.Join(&UnavailableError{Reason: "durable child device could not be observed"}, err, file.Close())
 		}
-		if deviceNumber(stat.Dev) != self.mount.Device {
+		if deviceNumber(uint64(stat.Dev)) != self.mount.Device {
 			return nil, errors.Join(ErrIdentity, errors.New("durable child enters another filesystem"), file.Close())
 		}
 		if err := self.childMount(path); err != nil {

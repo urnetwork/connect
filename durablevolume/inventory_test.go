@@ -269,7 +269,7 @@ func TestOwnerCrashReleasesLeaseAndRetainsCompletedBytes(t *testing.T) {
 		if err := syscall.Stat(input.Root, &stat); err != nil {
 			t.Fatal(err)
 		}
-		device := deviceNumber(stat.Dev)
+		device := deviceNumber(uint64(stat.Dev))
 		host := &fixtureHost{mounts: []Mount{{Id: 1, ParentId: 1, Device: Device{Major: device.Major ^ 1, Minor: device.Minor}, Root: "/", Path: "/", FilesystemType: "ext4"}, {Id: 7, ParentId: 1, Device: device, Root: "/", Path: input.Mount, FilesystemType: "ext4"}}, uuidDevice: device, filesystem: Filesystem{Id: [2]int32{17, 19}, Type: 0xef53, AvailableBytes: 1024 * 1024, AvailableInodes: 1024}}
 		owner, err := OpenWithHost(input.Reference, input.Root, ReadWrite, host)
 		if err != nil {
