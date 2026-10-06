@@ -2,12 +2,13 @@ package connect
 
 // Tests of the operator-backed client settings (operator_client_settings.go).
 //
-// The implementation was the sdk's private newDeviceClientSettings, and its
-// tests move with it: the install and preserve tests of the public key fetcher,
-// and the partial override half of the completion test. The rest pin what the
-// configuration is for: the fetchers it installs read the operator api's two key
-// routes, and a session built from it reaches the api for each verification it
-// performs.
+// The implementation has the body of the core sdk's private
+// newDeviceClientSettings, and some of these tests are copies of that
+// function's tests, which the sdk keeps: the install and preserve tests of the
+// public key fetcher, and the partial override half of the completion test. The
+// rest pin what the configuration is for: the fetchers it installs read the
+// operator api's two key routes, and a session built from it reaches the api for
+// each verification it performs.
 
 import (
 	"bytes"

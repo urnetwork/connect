@@ -7,11 +7,11 @@ package connect
 // unauthenticated `/key/<client_id>` route and its signed registration history
 // at `/key/<client_id>/history` (`GetClientKeyResult`,
 // `GetClientKeyHistoryResult`). A client created against that api checks its
-// peers against both routes. This file is the one place that configuration is
-// built, so every client an application creates (a device's provider, its
-// window clients, an application's own clients) gets the same verification
-// instead of a copy that can drift. It uses nothing outside this package and
-// the standard library.
+// peers against both routes. This file builds that configuration so that every
+// client an application creates (a device's provider, its window clients, an
+// application's own clients) gets the same verification instead of a copy that
+// can drift. One copy is left, named on `NewOperatorClientSettings`. It uses
+// nothing outside this package and the standard library.
 
 import (
 	"context"
@@ -48,6 +48,11 @@ import (
 //
 // Both are unauthenticated GETs through `clientStrategy`, made only when a
 // session runs the fetcher.
+//
+// The core sdk's private `newDeviceClientSettings` (device_local_provider.go)
+// is a copy of this function with the same body. The sdk keeps it until it
+// delegates here, which it can only do once this function has merged. Until
+// then, a change to either has to be made to both.
 func NewOperatorClientSettings(
 	settings *ClientSettings,
 	apiUrl string,
