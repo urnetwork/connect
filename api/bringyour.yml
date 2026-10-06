@@ -2533,7 +2533,8 @@ paths:
         `end_time`. Only `store` "stripe" (the default) is acted on: the other
         stores answer with `error.message` and, for Apple/Google, the store's
         subscriptions page in `manage_url`. Idempotent: an already-cancelling
-        subscription is not written again.
+        subscription is not written again. Every refusal carries a stable
+        `error.code` (SubscriptionError) beside its `error.message`.
       operationId: Subscription Cancel
       security:
         - BearerAuth: []
@@ -3908,7 +3909,9 @@ paths:
       description: |
         When paying for a subscription with Solana, we track the order through this intent.
         A legacy guest network (no sign-in method) is refused with
-        `error.code` `guest_sign_in_required` (PurchaseError).
+        `error.code` `guest_sign_in_required` (PurchaseError). Every other
+        refusal carries its own code too: `offer_unavailable`,
+        `plan_unavailable` or `start_failed`.
       operationId: solanaPaymentIntent
       security:
         - BearerAuth: []
@@ -3982,7 +3985,8 @@ paths:
         When paying for a subscription with Stripe, create the payment intents,
         ephemeral key, and customer id needed to complete the purchase.
         A legacy guest network (no sign-in method) is refused with
-        `error.code` `guest_sign_in_required` (PurchaseError).
+        `error.code` `guest_sign_in_required` (PurchaseError); a payment that
+        could not be started with `start_failed`.
       operationId: Stripe Payment Intent
       security:
         - BearerAuth: []
@@ -4004,7 +4008,9 @@ paths:
     post:
       description: |
         Create a Stripe customer portal URL for the caller to manage their
-        subscription.
+        subscription. A refusal carries a stable `error.code`
+        (SubscriptionError: `no_customer`, `store_unavailable`) beside its
+        `error.message`.
       operationId: Stripe Customer Portal
       security:
         - BearerAuth: []
@@ -4033,7 +4039,9 @@ paths:
         webhook as soon as the payment confirms, and the customer is emailed a
         note that the data is on the network (the code is included, already
         applied). The name is matched case-insensitively and exactly; an unknown
-        name returns `error.message` `No network named <name>`.
+        name returns `error.code` `network_not_found` with `error.message`
+        `No network named <name>`. Every refusal carries a stable `error.code`
+        (PurchaseError) beside its `error.message`.
 
         Without `network_name`, the customer receives a data code by email, as
         before. Stripe collects the email on its checkout page when `email` is
@@ -4112,7 +4120,9 @@ paths:
         the reference or memo and arrives late still credits as long as the
         intent has not been swept. A reused
         reference, an unknown item or an unknown network return `error.message`
-        with a 200. Unauthenticated, per-ip rate limited.
+        with a 200, and a stable `error.code` beside it (PurchaseError:
+        `invalid_request`, `network_not_found` and the others). Unauthenticated,
+        per-ip rate limited (`rate_limited`).
       operationId: Pay Data Solana Intent
       security: []
       requestBody:
@@ -4169,7 +4179,9 @@ paths:
         client; the client only polls /subscription/balance afterwards.
 
         A legacy guest network (no sign-in method) is refused with
-        `error.code` `guest_sign_in_required` (PurchaseError).
+        `error.code` `guest_sign_in_required` (PurchaseError). Every other
+        refusal carries its own code too, for example `already_subscribed`,
+        `plan_unavailable` or `start_failed`.
       operationId: Stripe Create Checkout Session
       security:
         - BearerAuth: []
@@ -5301,7 +5313,9 @@ paths:
         Calling again replaces a pending, unfinished sheet.
 
         A legacy guest network (no sign-in method) is refused with
-        `error.code` `guest_sign_in_required` (PurchaseError).
+        `error.code` `guest_sign_in_required` (PurchaseError). Every other
+        refusal carries its own code too, for example `already_subscribed`,
+        `plan_unavailable` or `start_failed`.
       operationId: stripePaymentSheet
       security:
         - BearerAuth: []
@@ -8148,22 +8162,75 @@ components:
       type: object
       description: |
         Why a checkout or payment intent was refused (/stripe/create-checkout-session,
-        /stripe/payment-intent, /subscription/stripe/payment-sheet and
-        /solana/payment-intent).
+        /stripe/payment-intent, /subscription/stripe/payment-sheet,
+        /solana/payment-intent, /pay/data/checkout and /pay/data/solana-intent).
+        Every refusal carries `message`, worded as before the codes, and a
+        stable `code` beside it.
       required:
         - message
       properties:
         code:
           description: |
-            A stable code for a refusal that has one, so a client can pick a
-            localized message or flow.
+            A stable code for the refusal, so a client can pick a localized
+            message or flow. One of:
             `guest_sign_in_required`: the network is a legacy guest network
             with no sign-in method, so nothing could sign back in to a plan
             bought on it. Add a sign-in method (POST /auth/add-auth) first;
             the apps open their add-sign-in sheet. Store-verified purchases
             and webhooks are never refused this way.
-            Absent from older servers and for other refusals; clients fall
-            back to `message` for an absent or unknown code.
+            `already_subscribed`: the network already has an active Pro
+            subscription; nothing was charged.
+            `plan_unavailable`: the plan cannot be sold now (no price or
+            product is configured for it).
+            `item_unavailable`: the data pack cannot be sold now.
+            `offer_unavailable`: the welcome offer is not, or no longer,
+            redeemable by this network.
+            `checkout_unavailable`: this deployment has no checkout configured.
+            `invalid_request`: the request names an item, plan, provider, ui
+            mode or reference the endpoint does not take (a client defect).
+            `invalid_email`: the email address the code goes to does not look
+            like one.
+            `network_name_required`: a data purchase for a network by name came
+            without the name.
+            `network_not_found`: no network has the given name.
+            `rate_limited`: too many attempts from this address; try again in a
+            minute.
+            `start_failed`: the payment could not be started (Stripe or the
+            database failed); a retry may work.
+            Absent from older servers; clients fall back to `message` for an
+            absent or unknown code.
+          type: string
+        message:
+          type: string
+
+    SubscriptionError:
+      type: object
+      description: |
+        Why a subscription change (/subscription/cancel, /subscription/resume)
+        or the billing portal (/stripe/customer-portal) was refused. Every
+        refusal carries `message`, worded as before the codes, and a stable
+        `code` beside it.
+      required:
+        - message
+      properties:
+        code:
+          description: |
+            A stable code for the refusal, so a client can pick a localized
+            message. One of:
+            `managed_by_app_store`: the App Store bills this subscription;
+            cancel it there (`manage_url`).
+            `managed_by_google_play`: Google Play bills this subscription;
+            cancel it there (`manage_url`).
+            `does_not_renew`: a USDC payment covers one period and never
+            renews, so there is nothing to cancel.
+            `not_cancelable`: a store the server cannot act on.
+            `no_subscription`: no Stripe subscription is billing this network.
+            `no_customer`: this network has no Stripe customer, so there is no
+            billing portal.
+            `store_unavailable`: Stripe did not answer or refused the change; a
+            retry may work.
+            Absent from older servers; clients fall back to `message` for an
+            absent or unknown code.
           type: string
         message:
           type: string
@@ -12300,12 +12367,7 @@ components:
           format: uuid
           description: the resolved network when network_name was given
         error:
-          type: object
-          required:
-            - message
-          properties:
-            message:
-              type: string
+          $ref: "#/components/schemas/PurchaseError"
     PayDataNetworkLookupArgs:
       type: object
       required:
@@ -12373,12 +12435,7 @@ components:
           type: string
           description: the SPL token mint (base58) to pay in (USDC)
         error:
-          type: object
-          required:
-            - message
-          properties:
-            message:
-              type: string
+          $ref: "#/components/schemas/PurchaseError"
     PayDataSolanaStatusArgs:
       type: object
       required:
@@ -12540,12 +12597,7 @@ components:
           type: string
           description: For a store the server cannot act on, where the customer cancels.
         error:
-          type: object
-          required:
-            - message
-          properties:
-            message:
-              type: string
+          $ref: "#/components/schemas/SubscriptionError"
 
     StripeCreateCustomerPortalArgs:
       type: object
@@ -12559,12 +12611,7 @@ components:
         url:
           type: string
         error:
-          type: object
-          required:
-            - message
-          properties:
-            message:
-              type: string
+          $ref: "#/components/schemas/SubscriptionError"
 
     WarpStatusResult:
       type: object

@@ -1932,6 +1932,19 @@ func (self *MultiRouteSelector) observeRouteAckProgress(route Route) {
 		clock.(*atomic.Int64).Store(now)
 		return
 	}
+	// ACKs can arrive after their transport was removed. Serialize only new
+	// clocks with route publication, so terminal ACK bookkeeping cannot root
+	// a retired route channel again. Updating an already detached clock above
+	// is harmless: it does not republish the channel into this map.
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if _, registered := self.routeActive[route]; !registered {
+		return
+	}
+	if clock, ok := self.routeAckProgress.Load(route); ok {
+		clock.(*atomic.Int64).Store(now)
+		return
+	}
 	clock := &atomic.Int64{}
 	clock.Store(now)
 	self.routeAckProgress.Store(route, clock)
@@ -2499,6 +2512,7 @@ func (self *MultiRouteSelector) updateTransportWithProperties(
 					delete(self.routeStats, currentRoute)
 					delete(self.routeActive, currentRoute)
 					delete(self.routeWeight, currentRoute)
+					self.routeAckProgress.Delete(currentRoute)
 				}
 			}
 			for _, route := range routes {
