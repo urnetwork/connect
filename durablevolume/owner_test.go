@@ -126,7 +126,7 @@ func newVolumeFixture(t *testing.T) *volumeFixture {
 	if err := syscall.Stat(root, &stat); err != nil {
 		t.Fatal(err)
 	}
-	device := deviceNumber(stat.Dev)
+	device := deviceNumber(uint64(stat.Dev))
 	rootDevice := Device{Major: device.Major ^ 1, Minor: device.Minor}
 	host := &fixtureHost{
 		mounts: []Mount{

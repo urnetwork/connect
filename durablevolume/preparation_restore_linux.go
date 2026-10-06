@@ -393,7 +393,7 @@ func (self *preparationRestoreArchive) walk(enroll bool) error {
 		if entry.Kind == "directory" {
 			kind = syscall.S_IFDIR
 		}
-		if before.Dev != self.identity.Device || before.Mode&syscall.S_IFMT != kind || before.Mode&07777 != entry.Mode ||
+		if uint64(before.Dev) != self.identity.Device || before.Mode&syscall.S_IFMT != kind || before.Mode&07777 != entry.Mode ||
 			entry.Kind == "file" && (before.Size < 0 || uint64(before.Size) != entry.Size || before.Nlink != 1) {
 			return errors.Join(ErrIdentity, errors.New("restore archive member metadata differs"))
 		}

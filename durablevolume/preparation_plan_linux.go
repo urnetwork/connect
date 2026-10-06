@@ -200,7 +200,7 @@ func preparationIdentity(file *os.File) (PreparationIdentity, error) {
 	if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
 		return PreparationIdentity{}, unavailableObservation("preparation inode could not be observed", err)
 	}
-	return PreparationIdentity{Device: stat.Dev, Inode: stat.Ino, Mode: stat.Mode, Uid: stat.Uid, Gid: stat.Gid}, nil
+	return PreparationIdentity{Device: uint64(stat.Dev), Inode: stat.Ino, Mode: stat.Mode, Uid: stat.Uid, Gid: stat.Gid}, nil
 }
 
 // Mount selection is identical to runtime admission and independently covers

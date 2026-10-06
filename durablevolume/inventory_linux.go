@@ -43,7 +43,7 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) (resultErr 
 	if err != nil {
 		return unavailableObservation("inventory root metadata could not be observed", err)
 	}
-	result.PhysicalRoot = PhysicalRoot{Device: deviceNumber(rootStat.Dev), Inode: rootStat.Ino}
+	result.PhysicalRoot = PhysicalRoot{Device: deviceNumber(uint64(rootStat.Dev)), Inode: rootStat.Ino}
 	generation, err := self.rootGeneration()
 	if err != nil {
 		return err
@@ -80,7 +80,7 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) (resultErr 
 		if err := protected(file, directory); err != nil {
 			return err
 		}
-		if deviceNumber(before.Dev) != self.mount.Device {
+		if deviceNumber(uint64(before.Dev)) != self.mount.Device {
 			return errors.Join(ErrIdentity, errors.New("inventory entered another filesystem"))
 		}
 		if err := self.childMount(filepath.Join(self.rootPath, relative)); err != nil {
@@ -88,7 +88,7 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) (resultErr 
 		}
 		entry := InventoryEntry{Path: relative, Mode: before.Mode & 07777, Uid: before.Uid, Gid: before.Gid}
 		if result.Schema == PhysicalInventorySchema {
-			entry.Physical = &PhysicalRoot{Device: deviceNumber(before.Dev), Inode: before.Ino}
+			entry.Physical = &PhysicalRoot{Device: deviceNumber(uint64(before.Dev)), Inode: before.Ino}
 		}
 		entry.OwnerAttributes, err = self.inventoryAttributes(ctx, file, relative, result)
 		if err != nil {

@@ -49,7 +49,7 @@ func TestOwnerWriteHealthUsesFreshAnonymousProbe(t *testing.T) {
 				if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
 					return err
 				}
-				if file != probe || stat.Size <= 0 || stat.Size > 4096 || stat.Nlink != 0 || stat.Mode&07777 != 0600 || deviceNumber(stat.Dev) != fixture.host.uuidDevice {
+				if file != probe || stat.Size <= 0 || stat.Size > 4096 || stat.Nlink != 0 || stat.Mode&07777 != 0600 || deviceNumber(uint64(stat.Dev)) != fixture.host.uuidDevice {
 					return errors.New("probe lacks a bounded actual write to a private anonymous inode")
 				}
 			case "file-close":
