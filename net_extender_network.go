@@ -1280,7 +1280,10 @@ func orderedExtenderCarriers(carriers []string) []string {
 // The dial configuration of one candidate carrier. The outer name is one
 // random name of the spoof list in force (A10, directorySpoofDomains); with an
 // empty list the extender ip is presented, which sends no sni at all rather
-// than naming the destination -- a feed dial has no destination host.
+// than naming the destination -- a feed dial has no destination host. The dns
+// carrier is one dial that races its ports (L2, net_extender_dns_ports.go),
+// so the feed, the probe and the peer pinger try both 53 and 4053 as the
+// strategy does.
 func extenderFeedConfig(
 	candidate *ExtenderCandidate,
 	connectMode ExtenderConnectMode,
@@ -1293,11 +1296,15 @@ func extenderFeedConfig(
 	if 0 < len(spoofDomains) {
 		profile.ServerName = spoofDomains[mathrand.Intn(len(spoofDomains))]
 	}
+	var dnsPorts []int
 	switch connectMode {
 	case ExtenderConnectModeQuic:
 		profile.Port = candidate.UdpPort
 	case ExtenderConnectModeDns:
-		profile.Port = candidate.DnsPort
+		dnsPorts = candidate.dnsCarrierPorts()
+		if 0 < len(dnsPorts) {
+			profile.Port = dnsPorts[0]
+		}
 		profile.DnsTld = candidate.DnsTld
 	default:
 		profile.Port = candidate.TcpPort
@@ -1309,6 +1316,7 @@ func extenderFeedConfig(
 		Profile:   profile,
 		Ip:        candidate.Ip,
 		PublicKey: candidate.PublicKey,
+		DnsPorts:  dnsPorts,
 	}
 }
 

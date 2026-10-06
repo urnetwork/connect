@@ -2172,18 +2172,20 @@ func extenderDialerPriority(connectMode ExtenderConnectMode) int {
 	}
 }
 
-// One extender config per carrier the candidate lists (E2, E5), and one per
-// dns port when the candidate offers several (L2): 53 is dialed before 4053.
-// The identity key of a verified record is carried into the config so the
-// outer leaf is checked against it (B3). Each config fronts with one random
-// name of `spoofDomains`, the list in force (directorySpoofDomains).
+// One extender config per carrier the candidate lists (E2, E5). The dns
+// config is one dial that races every port of the carrier (L2,
+// net_extender_dns_ports.go): the ports the record lists, then whichever of
+// 4053 and 53 it does not. The identity key of a verified record is carried
+// into the config so the outer leaf is checked against it (B3). Each config
+// fronts with one random name of `spoofDomains`, the list in force
+// (directorySpoofDomains).
 func extenderConfigsForCandidate(
 	candidate *ExtenderCandidate,
 	secret string,
 	spoofDomains []string,
 ) []*ExtenderConfig {
 	extenderConfigs := []*ExtenderConfig{}
-	appendConfig := func(profile ExtenderProfile) {
+	appendConfig := func(profile ExtenderProfile, dnsPorts []int) {
 		if 0 < len(spoofDomains) {
 			profile.ServerName = spoofDomains[mathrand.Intn(len(spoofDomains))]
 		}
@@ -2195,6 +2197,7 @@ func extenderConfigsForCandidate(
 			Ip:        candidate.Ip,
 			Secret:    secret,
 			PublicKey: slices.Clone(candidate.PublicKey),
+			DnsPorts:  dnsPorts,
 		})
 	}
 	for _, carrier := range candidate.Carriers {
@@ -2208,19 +2211,20 @@ func extenderConfigsForCandidate(
 		switch connectMode {
 		case ExtenderConnectModeQuic:
 			profile.Port = candidate.UdpPort
-			appendConfig(profile)
+			appendConfig(profile, nil)
 		case ExtenderConnectModeDns:
 			profile.DnsTld = candidate.DnsTld
-			for _, dnsPort := range candidate.dnsCarrierPorts() {
-				profile.Port = dnsPort
-				appendConfig(profile)
+			dnsPorts := candidate.dnsCarrierPorts()
+			if 0 < len(dnsPorts) {
+				profile.Port = dnsPorts[0]
 			}
+			appendConfig(profile, dnsPorts)
 		default:
 			profile.Port = candidate.TcpPort
 			// fragment and reorder apply to tcp only
 			profile.Fragment = mathrand.Intn(2) != 0
 			profile.Reorder = mathrand.Intn(2) != 0
-			appendConfig(profile)
+			appendConfig(profile, nil)
 		}
 	}
 	return extenderConfigs
