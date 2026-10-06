@@ -32,9 +32,7 @@ jobs:
         run: git clone --depth 1 --branch go https://github.com/urnetwork/gvisor.git ../gvisor
 
       # go.mod's toolchain line names the Go this module is built and tested
-      # with, and mls's TestPinnedToolchain holds the test binary to it, as the
-      # URmessage master design (§7.2) requires for the crypto code. `stable`
-      # installed the newest release instead, and that test failed under it.
+      # with. `stable` installs the newest release instead.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
