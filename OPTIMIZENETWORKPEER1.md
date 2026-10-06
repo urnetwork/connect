@@ -306,7 +306,7 @@ reported and safely retryable instead of hanging, but no benchmark obtained
 without a running packet-tunnel extension is labeled as network-peer data.
 
 The connected Apple endpoint for that matrix is an iPhone 16 Pro Max
-(`iPhone17,2`), UDID `00008140-001679DE0893C01C`. The current signed Debug build
+(`iPhone17,2`). The current signed Debug build
 passes its physical-device build and install gates; only the system-owned VPN
 authorization remains before bidirectional traffic measurement.
 
@@ -401,7 +401,7 @@ Current authorized physical endpoints are:
 |------|-------|---------------------|--------|
 | Android | Pixel 8 Pro (`husky`) | first in `android.performance_device_serials` (`$PIXEL` below) | Authorized; every command must use `adb -s "$PIXEL"` |
 | Android | Samsung S24 Ultra (`SM-S928U1`) | second in `android.performance_device_serials` (`$SAMSUNG` below) | Authorized for the 2026-07-28 bidirectional contract/page matrix; every command must use `adb -s "$SAMSUNG"` |
-| Apple | iPhone 16 Pro Max (`iPhone17,2`) | `00008140-001679DE0893C01C` | Authorized when physically connected and available for required taps |
+| Apple | iPhone 16 Pro Max (`iPhone17,2`) | the attached iPhone 16 Pro Max | Authorized when physically connected and available for required taps |
 
 Do not use an unscoped `adb` discovery or mutation command. Address only the
 explicit device under test:

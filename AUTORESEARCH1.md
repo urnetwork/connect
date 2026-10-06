@@ -1414,8 +1414,8 @@ allows a safe foreground retry; iOS does not permit code or test automation to
 bypass that authorization. No direct or pre-tunnel page result will be
 misreported as network-peer performance.
 
-The connected Apple endpoint is the iPhone 16 Pro Max (`iPhone17,2`) with UDID
-`00008140-001679DE0893C01C`; the Android endpoint is the Pixel 8 Pro (device-a,
+The connected Apple endpoint is the iPhone 16 Pro Max (`iPhone17,2`); the
+Android endpoint is the Pixel 8 Pro (device-a,
 the first serial in `android.performance_device_serials` in tests.yml). Both
 requested directions are retained as explicit physical
 release-gate rows rather than inferring one direction from the other.
