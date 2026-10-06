@@ -22,11 +22,9 @@ import (
 	"time"
 )
 
-// The PERFVAR RUN-MAIN allowlist. Public output uses the roles only.
-var allowedDevices = map[string]string{
-	"3B161FDJG001KT": "device-a",
-	"R5CX21FY6ND":    "device-b",
-}
+// The PERFVAR RUN-MAIN allowlist, serial to role, filled from tests.yml by
+// loadAllowedDevices. Public output uses the roles only.
+var allowedDevices = map[string]string{}
 
 const (
 	appPackage     = "com.bringyour.network"
@@ -45,6 +43,16 @@ func main() {
 	command := os.Args[1]
 	args := os.Args[2:]
 	var err error
+	// the device commands address the allowlisted phones, which tests.yml
+	// lists; the report and build commands work offline
+	switch command {
+	case "preflight", "profile", "install", "load-build", "login", "provide", "connect-peer", "disconnect", "status",
+		"allow-direct", "defer-timeout-resend", "lane-rule", "heap-profile", "run", "campaign", "memsteady", "memsteady-series":
+		if err := loadAllowedDevices(devicesWorkspaceRoot()); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", command, err)
+			os.Exit(1)
+		}
+	}
 	// Validate both allowlisted devices before setup, not only when
 	// the operator remembers to invoke the standalone preflight command.
 	switch command {
