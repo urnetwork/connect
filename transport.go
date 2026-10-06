@@ -145,6 +145,9 @@ type TransportControl = byte
 const (
 	TransportControlSpeedStart TransportControl = 1
 	TransportControlSpeedStop  TransportControl = 2
+	// the platform is closing the connection: the 5-byte h1 control carries a
+	// big-endian uint32 close reason (transport_client_limit.go)
+	TransportControlClose TransportControl = 3
 )
 
 type TransportMode string
@@ -338,6 +341,11 @@ type ClientAuth struct {
 	// ClientId Id
 	InstanceId Id
 	AppVersion string
+	// ProvideIntent declares that the client intends to provide publicly, so
+	// the platform judges it as a provider instead of counting it toward the
+	// network's client limit (transport_provide_intent.go). A connection
+	// carries the value of the auth generation it dialed with.
+	ProvideIntent bool
 }
 
 func (self *ClientAuth) ClientId() (Id, error) {
@@ -637,6 +645,13 @@ type PlatformTransportSettings struct {
 	// Nil gives the transport a counter of its own.
 	ExtenderIpsMonitor *MonitorValue[uint64]
 
+	// ClientLimitBackoff, when set, is the client limit hold this transport
+	// shares with the other transports of its client: a provider's transport
+	// group and every generation an owner migrates to pass the same one, so a
+	// client limit close on any of them holds the dials of all of them
+	// (transport_client_limit.go). Nil gives the transport a hold of its own.
+	ClientLimitBackoff *ClientLimitBackoff
+
 	// Nil outside package tests. A barrier here can hold the exact seam after
 	// logical route removal and before connection and writer cleanup.
 	afterRoutesRemovedForTest func()
@@ -656,6 +671,10 @@ type PlatformTransportSettings struct {
 	// Nil outside package tests. Replaces plain-H3 name resolution so the
 	// family race can be driven against chosen addresses.
 	resolveH3AddrsForTest func(ctx context.Context, address string, ipFamily int) ([]*net.UDPAddr, error)
+	// Nil outside package tests. Called each time a mode runner parks on a
+	// client limit hold, right before it waits, so a test can hold the exact
+	// point after which no dial can happen until the hold changes.
+	clientLimitHoldForTest func()
 	// The constrained mobile policy composes receive, send, socket, and queue
 	// ownership inside one carrier claim. H1 keeps its independent queue depth.
 	h3RetainedByteAccounting bool
@@ -1009,6 +1028,12 @@ type PlatformTransport struct {
 	// attempt failed because the hostname does not resolve; the group reads
 	// it to release the standby early. See noteDialError.
 	unresolvable atomic.Bool
+	// clientLimitBackoff holds every mode runner's dials after a client limit
+	// close, shared with the client's other transports when the settings
+	// carry one. The constructor always sets it; read it through
+	// clientLimitHold, which tolerates a fixture that skipped the
+	// constructor. See transport_client_limit.go.
+	clientLimitBackoff *ClientLimitBackoff
 }
 
 // newPlatformQuicConfig keeps H3's memory and path-MTU behavior explicit and
@@ -1417,6 +1442,10 @@ func NewPlatformTransportWithTargetMode(
 	}
 	if transport.extenderIpsMonitor == nil {
 		transport.extenderIpsMonitor = NewMonitorValue[uint64](0)
+	}
+	transport.clientLimitBackoff = settings.ClientLimitBackoff
+	if transport.clientLimitBackoff == nil {
+		transport.clientLimitBackoff = NewClientLimitBackoff()
 	}
 	transport.ipFamily = normalizeIpFamily(settings.IpFamily)
 	transport.enabled.Store(!settings.StartDisabled)
@@ -2029,6 +2058,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			return
 		}
 		auth := self.authSnapshot()
+		// read after the auth snapshot (transport_client_limit.go)
+		clientLimitResetGeneration := self.clientLimitResetGeneration()
 		clientId, _ := auth.ClientId()
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
@@ -2044,6 +2075,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				header.Add("X-UR-InstanceId", auth.InstanceId.String())
 				header.Add("X-UR-TransportVersion", fmt.Sprintf("%d", TransportVersion))
 				self.applyIntentHeader(header)
+				applyProvideIntentHeader(header, auth)
 			}
 
 			ws, dialerInfo, err := self.clientStrategy.H1DialContextWithDialer(
@@ -2071,10 +2103,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			if !self.settings.V2H1Auth {
 				authBytes, err := EncodeFrame(&protocol.Auth{
-					ByJwt:      auth.ByJwt,
-					AppVersion: auth.AppVersion,
-					InstanceId: auth.InstanceId.Bytes(),
-					IpFamily:   self.authIntent(),
+					ByJwt:         auth.ByJwt,
+					AppVersion:    auth.AppVersion,
+					InstanceId:    auth.InstanceId.Bytes(),
+					IpFamily:      self.authIntent(),
+					ProvideIntent: auth.ProvideIntent,
 				}, self.settings.ProtocolVersion)
 				if err != nil {
 					return nil, err
@@ -2209,18 +2242,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			}
 
 			// a network-change kick closes this connection so the loop
-			// re-dials over the new path immediately (see Kick). the ws.Close
-			// is what unblocks a reader/writer parked in a socket call that
-			// handleCancel alone cannot wake.
+			// re-dials over the new path immediately (see Kick), and a client
+			// limit hold closes it with the rest of the client
+			// (transport_client_limit.go). the ws.Close is what unblocks a
+			// reader/writer parked in a socket call that handleCancel alone
+			// cannot wake.
 			kick := self.kickMonitor.NotifyChannel()
 			startConnectionWorker(func() {
-				select {
-				case <-handleCtx.Done():
-				case <-kick:
-					self.log.Infof("[t]kick: closing connection for re-dial\n")
+				self.runConnectionWatch(handleCtx, kick, func(reason string) {
 					handleCancel()
 					ws.Close()
-				}
+				})
 			})
 
 			var readCounter atomic.Uint64
@@ -2670,6 +2702,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
 						}
+						// the WebSocket close code is the second indicator of
+						// the client limit close, after the close control
+						if isClientLimitCloseError(err) {
+							self.noteClientLimitClose(TransportModeH1, auth.ProvideIntent, clientLimitResetGeneration)
+						}
 						return
 					}
 					readProgress := h1Progress.event("h1_read", message, true, nil)
@@ -2698,6 +2735,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 									if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 										return
 									}
+								case TransportControlClose:
+									// the platform closes the connection after
+									// this message; end it now. Only the client
+									// limit reason holds the client's dials, and
+									// any other reason is an ordinary close
+									reason, _ := transportCloseReason(message)
+									MessagePoolReturn(message)
+									if reason == TransportCloseReasonClientLimitExceeded {
+										self.noteClientLimitClose(TransportModeH1, auth.ProvideIntent, clientLimitResetGeneration)
+									}
+									return
 								default:
 									MessagePoolReturn(message)
 								}
@@ -2834,6 +2882,8 @@ func (self *PlatformTransport) runH3(
 			return
 		}
 		auth := self.authSnapshot()
+		// read after the auth snapshot (transport_client_limit.go)
+		clientLimitResetGeneration := self.clientLimitResetGeneration()
 		clientId, _ := auth.ClientId()
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
@@ -2851,11 +2901,14 @@ func (self *PlatformTransport) runH3(
 			// quicConfig := &quic.Config{
 			// 	HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
 			// }
+			// the frame form of the h1 provide intent header
+			// (transport_provide_intent.go)
 			authMessage := &protocol.Auth{
-				ByJwt:      auth.ByJwt,
-				AppVersion: auth.AppVersion,
-				InstanceId: auth.InstanceId.Bytes(),
-				IpFamily:   self.authIntent(),
+				ByJwt:         auth.ByJwt,
+				AppVersion:    auth.AppVersion,
+				InstanceId:    auth.InstanceId.Bytes(),
+				IpFamily:      self.authIntent(),
+				ProvideIntent: auth.ProvideIntent,
 			}
 			SetH3DatagramAuthOffer(authMessage, self.settings.EnableH3Datagrams)
 			authBytes, err := EncodeFrame(authMessage, self.settings.ProtocolVersion)
@@ -3032,6 +3085,15 @@ func (self *PlatformTransport) runH3(
 		if err != nil {
 			attemptCanceled := attemptCtx.Err() != nil
 			releaseAttempt()
+			// the platform may close for the client limit right after the
+			// handshake, before the auth exchange completes. That is no
+			// backend failure: the loop parks in waitDialAdmission for the
+			// hold instead
+			if isClientLimitCloseError(err) {
+				self.noteClientLimitClose(ptMode, auth.ProvideIntent, clientLimitResetGeneration)
+				hadConnection = true
+				continue
+			}
 			// a canceled dial is local teardown -- this transport or its owner
 			// shutting down mid-connect -- not a backend signal. Without this
 			// carve-out, closing a multi-client window cancels many transports
@@ -3103,18 +3165,17 @@ func (self *PlatformTransport) runH3(
 			}
 
 			// a network-change kick closes this connection so the loop
-			// re-dials over the new path immediately (see Kick). closing the
-			// QUIC connection is what unblocks a reader/writer parked in a
-			// stream call that handleCancel alone cannot wake.
+			// re-dials over the new path immediately (see Kick), and a client
+			// limit hold closes it with the rest of the client
+			// (transport_client_limit.go). closing the QUIC connection is what
+			// unblocks a reader/writer parked in a stream call that
+			// handleCancel alone cannot wake.
 			kick := self.kickMonitor.NotifyChannel()
 			startConnectionWorker(func() {
-				select {
-				case <-handleCtx.Done():
-				case <-kick:
-					self.log.Infof("[t]kick: closing connection for re-dial\n")
+				self.runConnectionWatch(handleCtx, kick, func(reason string) {
 					handleCancel()
-					conn.CloseWithError(0, "network change")
-				}
+					conn.CloseWithError(0, reason)
+				})
 			})
 
 			framer := NewFramer(self.framerSettings)
@@ -3255,6 +3316,12 @@ func (self *PlatformTransport) runH3(
 				// Like the websocket path, break blocked socket I/O before
 				// joining every owned connection worker.
 				conn.CloseWithError(0, "transport teardown")
+				// CloseWithError returns once the connection is closed, and
+				// the first close wins its cause: the platform's client limit
+				// close reads here whichever worker saw it first
+				if isClientLimitCloseError(context.Cause(conn.Context())) {
+					self.noteClientLimitClose(ptMode, auth.ProvideIntent, clientLimitResetGeneration)
+				}
 				connectionWaitGroup.Wait()
 				// Route removal and the worker join leave no producer that can
 				// enqueue after these deterministic pooled-message drains.

@@ -986,6 +986,16 @@ F3. Provider status. `DeviceLocal.GetExtenderProvideStatus()
 `.provide_extender` (default true), and a change listener. These follow
 the `GetProviderFamilyTransportStatus` precedent on `DeviceLocal` only,
 since the role exists only on desktop builds where the device is local.
+Refined 2026-10-06 (owner: "make it configurable so the devicelocal can
+set the default extender on or off ... default to be on"): the default is
+the device's, `DeviceLocalSettings.DefaultProvideExtender`, on in
+`DefaultDeviceLocalSettings`, and applies while the space stores no
+`.provide_extender`. Only an explicit `true` or `false` is a stored value;
+a missing, unreadable or corrupt file defers to the device default. A
+space that keeps no local state (`NewNetworkSpaceManagerNoStorage`, a
+url-only space) holds the value `SetProvideExtender` sets on the device
+for the device's life, where it was previously dropped and the setting
+always read on. The order is in G1.
 
 ### G. Provider extender role
 
@@ -994,7 +1004,22 @@ G1. Eligibility. Compiled for desktop and connectctl only, build tags
 server nor the role. Default on with the opt-out of F3, plus an embedder
 switch `DeviceLocalSettings.ProvideExtenderEnabled` for a process that runs
 many providers, which the miner swarm turns off, and never on a hosted
-device, which cannot provide.
+device, which cannot provide. With the device default of F3 the role runs
+while the device provides in this order: never with the embedder switch
+off, whatever the setting says (the status reads `not_providing`); else as
+the user's setting says, when the space stores one or the device holds
+one; else as `DeviceLocalSettings.DefaultProvideExtender` says. An
+embedder that wants the role only after the user opts in turns the default
+off. `NewDeviceLocalWithProvideExtender(..., keyMaterial,
+provideExtenderEnabled, defaultProvideExtender)` carries both controls with
+the key material, also over the c abi
+(`urnet_new_device_local_with_provide_extender`) and the language bindings
+on it. Hosts that build the settings set the two fields: Go and gomobile on
+the settings of `NewDeviceLocal`, a c host in the settings json it reads from
+`urnet_default_device_local_settings` and passes to `urnet_new_device_local`,
+which decodes it over the defaults. Every other constructor keeps both on.
+The role's state is re-read after each hand-over to the provider until it
+stands, so a change racing another is never undone by the older one.
 
 G2. Lifecycle in `deviceLocalProvider`. When provide is on and the setting
 is on: load or create the identity key, which belongs to the network space:
@@ -1673,7 +1698,9 @@ The setting is read from its file once per space and cached in
 `LocalState`; every write goes through the same cache, so a write that
 fails on disk still applies for the session and is logged. A hosted
 device ignores the write, in process and over the rpc, as it ignores the
-provide mode.
+provide mode. Until the user toggles, the toggle shows the device default
+(F3, G1); on a space with no local state a toggle lasts for the device's
+life.
 
 N5. Strings. Keys for the apple, linux and windows platforms: `extender`
 (the row title), `extender_setting_description` (what turning it on does
@@ -2795,6 +2822,7 @@ with the database.
 | `sdk.ExtenderProvideStatus` | `Supported`, `State`, `ErrorCase`, `Reason`, `StartError`, `LastActivationRefused` added |
 | `sdk.Device` | `GetExtenderProvideStatus`, `AddExtenderProvideStatusChangeListener`, `GetProvideExtender`, `SetProvideExtender` added; mirrored on `DeviceRemote` |
 | `sdk.DeviceRemoteState` | `ProvideExtender` queued and last-known, applied at sync; the rpc version does not change |
+| `sdk.DeviceLocalSettings` | `DefaultProvideExtender` added, default on (F3, G1); `NewDeviceLocalWithProvideExtender` and the c abi `urnet_new_device_local_with_provide_extender` added |
 | localization keys | the extender row strings of N5 |
 | `extender.ExtenderServer` | `Stats()` and `ExtenderStats` (O1) |
 | `sdk.Device` | `GetExtenderStats` added; mirrored on `DeviceRemote` |

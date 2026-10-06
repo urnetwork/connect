@@ -1101,6 +1101,20 @@ paths:
         limit, not a hard cap -- and an agent can settle it inline with the
         x402 round trip below.
 
+        A provider install (a device that only provides, such as an embedded
+        provider) sets `provide_intent`. Creating a top-level client with it is
+        exempt from the 100 top-level client cap and from the concurrent
+        connected client check, because providers do not count toward the
+        plan's client limit. The client is a provider install for its life: it
+        never appears in the network's peer list (`/network/peers`), does not
+        receive it, and does not count toward the 100 top-level clients that
+        keep the peer list enabled. Connecting keeps the flag honest: a client
+        that connects with provide intent (`X-UR-Provide-Intent: 1`) must
+        qualify as a public provider within a grace period, or it takes a
+        normal client slot if one is free, or it is disconnected with the
+        client limit exceeded close. A person's device that also provides
+        declares intent on its connections instead and stays a network peer.
+
         Like roles or a principal the call may not set, a `proxy_config`
         the call cannot use is refused before anything is created: the call
         answers 200 with `error.message` and no `client_id` or
@@ -4365,6 +4379,15 @@ paths:
 
         A well-formed signature that does not verify for `coldkey_ss58` over
         `message` is refused with `error.code` `signature_mismatch`.
+
+        A `message` issued by POST /sn/wallet/consent (it starts with
+        "Approve URnetwork provider wallet mapping") is a per-provider wallet
+        mapping consent, and one issued by POST /sn/wallet/network-consent (it
+        starts with "Approve URnetwork network wallet mapping") is a network
+        consent. A consent is retained as signed and the result carries its
+        `mapping_hash` and `mapping_generation`; submitting the same consent
+        again returns the same values. A network consent is accepted only from
+        the network owner's session (a network JWT) and without `client_id`.
       operationId: Sn Set Wallet
       security:
         - BearerAuth: []
@@ -4383,11 +4406,17 @@ paths:
                 $ref: "#/components/schemas/SnSetWalletResult"
     get:
       description: |
-        The coldkeys attached inside the caller's network: the network-level
-        wallet (no `client_id`) and every provider client's wallet. `wallet` is
-        the session's effective wallet (the client-scoped wallet for a client
-        session when set, else the network wallet); absent when none is
-        attached. An empty `wallets` list is not an error.
+        The coldkeys attached inside the caller's network: the network consent
+        and the network-level wallet (no `client_id`) and every provider
+        client's wallet. `consent_scope` is `provider` or `network` for an
+        entry that is a wallet mapping consent, and absent for a wallet set by
+        a login proof and for the network-level copy; release settlement pays
+        consents only. The network consent is listed before the network-level
+        copy. `wallet` is the session's effective wallet in settlement's
+        precedence: for a client session its own provider consent, else the
+        network consent, else its own wallet, else the network-level copy; for
+        a network session the network consent, else the network-level copy.
+        Absent when none is attached. An empty `wallets` list is not an error.
       operationId: Sn Get Wallet
       security:
         - BearerAuth: []
@@ -4398,6 +4427,112 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnGetWalletResult"
+
+  /sn/wallet/consent:
+    post:
+      description: |
+        Issue a per-provider wallet mapping consent: the exact message the
+        coldkey signs to receive one provider client's earnings for the
+        inclusive epochs `from_epoch` to `through_epoch`. A client-scoped JWT
+        names its own client; a network JWT may name a client of its network
+        with `client_id`. The message is valid for 5 minutes and is submitted
+        unchanged, with the coldkey's sr25519 signature, to POST /sn/wallet.
+        A provider's own consent effective at an epoch takes precedence over
+        the network consent.
+      operationId: Sn Wallet Mapping Challenge
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnWalletMappingChallengeArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnWalletMappingChallengeResult"
+
+  /sn/wallet/consent/history:
+    post:
+      description: |
+        The retained signed consents of one provider client, generation 1
+        through `generation`, for a caller that already holds the chain head
+        (`head_hash`, `generation`) from an independent source. A head that
+        does not match is refused; the server never selects the newest
+        consent as authority. No authentication: the consents are public
+        evidence.
+      operationId: Sn Wallet Mapping History
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnWalletMappingHistoryArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnWalletMappingHistoryResult"
+
+  /sn/wallet/network-consent:
+    post:
+      description: |
+        Issue a network wallet mapping consent: the exact message the coldkey
+        signs once to receive the earnings of every provider client of the
+        caller's network, current and future, for the inclusive epochs
+        `from_epoch` to `through_epoch`. Only the network owner's session (a
+        network JWT) may request it; a client-scoped JWT is refused. A client
+        with its own provider consent effective at an epoch earns to that
+        consent instead. The message is valid for 5 minutes and is submitted
+        unchanged, with the coldkey's sr25519 signature and without
+        `client_id`, to POST /sn/wallet. A later consent replaces the earlier
+        one from its `from_epoch`; there is no unsigned revocation.
+      operationId: Sn Network Wallet Mapping Challenge
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnNetworkWalletMappingChallengeArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnWalletMappingChallengeResult"
+
+  /sn/wallet/network-consent/history:
+    post:
+      description: |
+        The retained signed network consents of one network, generation 1
+        through `generation`, for a caller that already holds the chain head
+        from an independent source. As for /sn/wallet/consent/history, a head
+        that does not match is refused and no authentication is required.
+      operationId: Sn Network Wallet Mapping History
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnNetworkWalletMappingHistoryArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnWalletMappingHistoryResult"
 
   /sn/wallet/validate:
     post:
@@ -6830,6 +6965,20 @@ components:
             Identity principal assigned to the client at creation, immutable after. |
             Only a network session may set this; when omitted, the session's own principal is inherited.
           type: string
+        provide_intent:
+          description: |
+            Optional, default false. The new client is a provider install: it
+            only provides publicly (public provide mode), like an embedded
+            provider. A new top-level client created with this set is exempt
+            from the 100 top-level client cap and the concurrent connected
+            client check, and is never a network peer (it is not in the peer
+            list, does not receive it, and does not count toward the 100
+            top-level clients that keep the peer list enabled). The platform
+            judges it as a provider when it connects with provide intent; see
+            `/network/auth-client`. Do not set it for a person's device that
+            also provides. Ignored when `client_id` or `source_client_id` is
+            set.
+          type: boolean
         # the proxy auth will be the by_client_jwt as username, no password
         proxy_config:
           description: Optional. |
@@ -11654,6 +11803,12 @@ components:
               type: string
             message:
               type: string
+        mapping_hash:
+          description: For an accepted wallet mapping consent, the hex sha256 of the retained signed consent; the chain head at `mapping_generation`.
+          type: string
+        mapping_generation:
+          description: For an accepted wallet mapping consent, its generation in its chain (1 for the first consent).
+          type: integer
 
     SnWallet:
       type: object
@@ -11668,6 +11823,18 @@ components:
           type: string
         set_at_millis:
           description: Unix time in milliseconds the wallet was set.
+          type: integer
+        consent_scope:
+          description: |
+            `provider` for a provider client's wallet mapping consent, `network`
+            for the network consent (no `client_id`). Absent for a wallet that
+            is not a consent.
+          type: string
+        from_epoch:
+          description: For a consent, the first epoch it pays.
+          type: integer
+        through_epoch:
+          description: For a consent, the last epoch it pays.
           type: integer
 
     SnGetWalletResult:
@@ -11688,6 +11855,120 @@ components:
           properties:
             message:
               type: string
+
+    SnWalletMappingChallengeArgs:
+      type: object
+      required:
+        - coldkey_ss58
+        - from_epoch
+        - through_epoch
+      properties:
+        client_id:
+          description: uuid of the provider client. Defaults to the session client for a client-scoped JWT; must belong to the caller's network.
+          type: string
+        coldkey_ss58:
+          description: The coldkey as an ss58 address (Bittensor prefix 42).
+          type: string
+        from_epoch:
+          description: The first epoch the consent pays. It must be after the operator's current finalized epoch.
+          type: integer
+        through_epoch:
+          description: The last epoch the consent pays, at most 65535 epochs after `from_epoch`.
+          type: integer
+
+    SnNetworkWalletMappingChallengeArgs:
+      type: object
+      required:
+        - coldkey_ss58
+        - from_epoch
+        - through_epoch
+      properties:
+        coldkey_ss58:
+          description: The coldkey as an ss58 address (Bittensor prefix 42).
+          type: string
+        from_epoch:
+          description: The first epoch the consent pays. It must be after the operator's current finalized epoch.
+          type: integer
+        through_epoch:
+          description: The last epoch the consent pays, at most 65535 epochs after `from_epoch`.
+          type: integer
+
+    SnWalletMappingChallengeResult:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          description: The exact text the coldkey signs (sr25519, substrate context, raw or in the `<Bytes>` wrapper). Submit it unchanged.
+          type: string
+
+    SnWalletMappingHistoryArgs:
+      type: object
+      required:
+        - domain
+        - client_id
+        - head_hash
+        - generation
+      properties:
+        domain:
+          description: The deployment domain the consents were issued in, as it appears in each signed consent.
+          type: object
+        client_id:
+          description: uuid of the provider client.
+          type: string
+        head_hash:
+          description: The 32 bytes of the chain head (sha256 of the retained consent), as an array of integers.
+          type: array
+          items:
+            type: integer
+        generation:
+          description: The head's generation.
+          type: integer
+
+    SnNetworkWalletMappingHistoryArgs:
+      type: object
+      required:
+        - domain
+        - network_id
+        - head_hash
+        - generation
+      properties:
+        domain:
+          description: The deployment domain the consents were issued in, as it appears in each signed consent.
+          type: object
+        network_id:
+          description: uuid of the network.
+          type: string
+        head_hash:
+          description: The 32 bytes of the chain head (sha256 of the retained consent), as an array of integers.
+          type: array
+          items:
+            type: integer
+        generation:
+          description: The head's generation.
+          type: integer
+
+    SnWalletMappingHistoryResult:
+      type: object
+      required:
+        - originals
+      properties:
+        originals:
+          description: The signed consents in generation order.
+          type: array
+          items:
+            type: object
+            required:
+              - message
+              - signature
+            properties:
+              message:
+                type: string
+              signature:
+                description: The 64-byte sr25519 signature as an array of integers.
+                type: array
+                items:
+                  type: integer
 
     SnValidateWalletArgs:
       type: object
