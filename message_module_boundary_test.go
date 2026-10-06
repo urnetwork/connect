@@ -6,10 +6,16 @@
 //   - the module files of this repository (go.mod and go.sum, nested modules included);
 //   - every go file of this repository, its imports parsed with no build constraint applied, so
 //     test, platform and ignored files are read as well;
-//   - the go command's answer, `go list -deps -test ./...`, under every platform build connect
-//     ships (platformBuildVariants), which also sees what is linked transitively. It reads this
-//     module only, so the go source it never reports (nested modules, testdata) is printed by the
-//     rule that leaves it out, and the first two readings hold it.
+//   - the go command's answer, `go list -deps -test ./...`, under each GOOS/GOARCH of
+//     platformBuildVariants, which also sees what is linked transitively. It reads this module
+//     only, so the go source it never reports (nested modules, testdata) is printed by the rule
+//     that leaves it out, and the first two readings hold it. It lists with cgo on and no build
+//     tags, so a file that only a cgo-off build compiles (the js/wasm build ships without cgo) or
+//     that only a tagged build compiles (flightgate_next, acklineagetrace, race) is not in its
+//     answer. The import reading applies no build constraint, so it holds those files.
+//
+// The go list reading needs every variant's dependencies in the module cache, or the network to
+// fetch them. Like TestPlatformBuildVariantsCompile, it is skipped under -short.
 //
 // A path is in the module when it is the module path or below it. A bare prefix would also match
 // github.com/urnetwork/message-server, a separate module this rule does not cover, so the control
@@ -207,6 +213,9 @@ func TestConnectHasNoMessageModuleDependency(t *testing.T) {
 }
 
 func TestNoConnectBuildLinksAMessageModulePackage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("lists every platform variant, which needs each variant's dependencies in the module cache or the network")
+	}
 	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
 		t.Skip("no toolchain subprocess under wasm")
 	}
