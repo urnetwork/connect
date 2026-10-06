@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Unavailable metadata refuses admission without inventing a changed identity.
 package durablevolume

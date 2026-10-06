@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // A cohort emits one usable declaration, preserving every unselected root.
 // Existing mount authority stays exact while it still serves a healthy root;

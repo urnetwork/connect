@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Host facts are synthetic; plan parsing, physical roots, retained steps,
 // xattrs, no-replace publication, child exits and production guard reopening
@@ -17,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Each case owns distinct real roots, policy bytes and synthetic kernel facts.
@@ -31,17 +33,17 @@ type preparationFixture struct {
 // The fixed synthetic adapter stages only public bytes and checks them on readback.
 func preparationTestAdapter() PreparationAdapter {
 	return PreparationAdapter{Build: func(ctx context.Context, parent *os.File, name string, owner PreparationOwner) (PreparationOwnerPlan, error) {
-		if err := syscall.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
+		if err := unix.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
 			return PreparationOwnerPlan{}, err
 		}
-		fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		fd, err := unix.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 		if err != nil {
 			return PreparationOwnerPlan{}, err
 		}
 		directory := os.NewFile(uintptr(fd), filepath.Join(parent.Name(), name))
 		defer directory.Close()
 		raw := []byte("exact reviewed public bytes\n")
-		fileFd, err := syscall.Openat(fd, "record.bin", syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
+		fileFd, err := unix.Openat(fd, "record.bin", syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
 		if err != nil {
 			return PreparationOwnerPlan{}, err
 		}
@@ -52,7 +54,7 @@ func preparationTestAdapter() PreparationAdapter {
 		}
 		return PreparationOwnerPlan{Owner: owner, StagingName: name, Files: []PreparationFile{{Path: "record.bin", Kind: "file", Mode: 0600, Bytes: uint64(len(raw)), Sha256: testDigest(raw)}}, Attributes: []PreparationAttributeSpec{{Path: ".", Name: "user.urnetwork.attempt-ledger-custody"}}, Census: json.RawMessage(`{"purpose":"synthetic-no-signing"}`)}, nil
 	}, Inspect: func(ctx context.Context, root *os.File, owner PreparationOwnerPlan) ([]PreparedAttribute, error) {
-		fd, err := syscall.Openat(int(root.Fd()), "record.bin", syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+		fd, err := unix.Openat(int(root.Fd()), "record.bin", syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -90,9 +92,9 @@ func newPreparationFixture(t *testing.T) *preparationFixture {
 			t.Fatal(err)
 		}
 	}
-	request := PreparationRequest{Schema: PreparationRequestSchema, Purpose: "fresh", Scope: "daemon", MountPath: volume.mount, FilesystemUuid: "1234-abcd", FilesystemType: "ext4", MinAvailableBytes: 1024, MinAvailableInodes: 8, RootPath: root, MarkerPath: filepath.Join(metadata, "identity"), LeasePath: filepath.Join(metadata, "lease"), DeclarationPath: filepath.Join(metadata, "declaration.json"), ControlPath: filepath.Join(metadata, "control.jsonl"), StagingDirectory: staging, Limits: PreparationLimits{MaxEntries: 16, MaxBytes: 1024 * 1024, MaxDepth: 4, MaxOwnerAttributes: 4, MaxOwnerAttributeBytes: 16384, MaxPlanBytes: 128 * 1024}, Owners: []PreparationOwner{{Kind: "synthetic-test-only", RelativePath: ".", Purpose: "fresh", Inputs: json.RawMessage(`{"public":true}`)}}}
-	var stat syscall.Stat_t
-	if err := syscall.Stat(root, &stat); err != nil {
+	request := PreparationRequest{Schema: PreparationRequestSchema, Purpose: "fresh", Scope: "daemon", MountPath: volume.mount, FilesystemUuid: "1234-abcd", FilesystemType: testFilesystemType, MinAvailableBytes: 1024, MinAvailableInodes: 8, RootPath: root, MarkerPath: filepath.Join(metadata, "identity"), LeasePath: filepath.Join(metadata, "lease"), DeclarationPath: filepath.Join(metadata, "declaration.json"), ControlPath: filepath.Join(metadata, "control.jsonl"), StagingDirectory: staging, Limits: PreparationLimits{MaxEntries: 16, MaxBytes: 1024 * 1024, MaxDepth: 4, MaxOwnerAttributes: 4, MaxOwnerAttributeBytes: 16384, MaxPlanBytes: 128 * 1024}, Owners: []PreparationOwner{{Kind: "synthetic-test-only", RelativePath: ".", Purpose: "fresh", Inputs: json.RawMessage(`{"public":true}`)}}}
+	var stat unix.Stat_t
+	if err := unix.Stat(root, &stat); err != nil {
 		t.Fatal(err)
 	}
 	fence, err := json.Marshal(PreparationFence{Schema: PreparationFenceSchema, RootPath: root, RootInode: stat.Ino, Purpose: "fresh", FormerWritersStopped: true, NoPreviousOwnerState: true, Evidence: "synthetic fixture, never a live service"})
@@ -315,11 +317,11 @@ func TestPreparationCompletedCustodyCannotBeRecreated(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "generation":
-				if err := syscall.Removexattr(f.request.RootPath, RootGenerationAttribute); err != nil {
+				if err := unix.Removexattr(f.request.RootPath, RootGenerationAttribute); err != nil {
 					t.Fatal(err)
 				}
 			case "checkpoint":
-				if err := syscall.Removexattr(f.request.RootPath, "user.urnetwork.attempt-ledger-custody"); err != nil {
+				if err := unix.Removexattr(f.request.RootPath, "user.urnetwork.attempt-ledger-custody"); err != nil {
 					t.Fatal(err)
 				}
 			case "declaration":
@@ -450,7 +452,7 @@ func TestPreparationChildCrashJoinsBeforeExactResume(t *testing.T) {
 		if err := json.Unmarshal(raw, &plan); err != nil {
 			t.Fatal(err)
 		}
-		host := &fixtureHost{mounts: []Mount{{Id: 1, ParentId: 1, Device: Device{Major: plan.Mount.Device.Major ^ 1, Minor: plan.Mount.Device.Minor}, Root: "/", Path: "/", FilesystemType: "ext4"}, plan.Mount}, uuidDevice: plan.Mount.Device, filesystem: plan.Filesystem}
+		host := &fixtureHost{mounts: []Mount{{Id: 1, ParentId: 1, Device: Device{Major: plan.Mount.Device.Major ^ 1, Minor: plan.Mount.Device.Minor}, Root: "/", Path: "/", FilesystemType: testFilesystemType}, plan.Mount}, uuidDevice: plan.Mount.Device, filesystem: plan.Filesystem}
 		_, err = applyPreparation(t.Context(), Reference{Path: path, Sha256: testDigest(raw)}, preparationTestAdapter(), host, daemonScope, &preparationHooks{after: func(stage, path string) error {
 			if stage == os.Getenv("URNETWORK_PREPARATION_CRASH_STAGE") {
 				os.Exit(73)
@@ -597,10 +599,10 @@ func TestPreparationEscapedControlCapacityPrecedesTargetMutation(t *testing.T) {
 	f.writeRequest(t)
 	adapter := preparationTestAdapter()
 	adapter.Build = func(ctx context.Context, parent *os.File, name string, owner PreparationOwner) (PreparationOwnerPlan, error) {
-		if err := syscall.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
+		if err := unix.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
 			return PreparationOwnerPlan{}, err
 		}
-		fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		fd, err := unix.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 		if err != nil {
 			return PreparationOwnerPlan{}, err
 		}
@@ -610,10 +612,10 @@ func TestPreparationEscapedControlCapacityPrecedesTargetMutation(t *testing.T) {
 		relative := ""
 		for index := 0; index < 15; index++ {
 			part := strings.Repeat("\x01", 240)
-			if err := syscall.Mkdirat(int(directory.Fd()), part, 0700); err != nil {
+			if err := unix.Mkdirat(int(directory.Fd()), part, 0700); err != nil {
 				return PreparationOwnerPlan{}, err
 			}
-			next, err := syscall.Openat(int(directory.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+			next, err := unix.Openat(int(directory.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 			if err != nil {
 				return PreparationOwnerPlan{}, err
 			}
@@ -625,7 +627,7 @@ func TestPreparationEscapedControlCapacityPrecedesTargetMutation(t *testing.T) {
 			relative = filepath.Join(relative, part)
 			files = append(files, PreparationFile{Path: relative, Kind: "directory", Mode: 0700})
 		}
-		fileFd, err := syscall.Openat(int(directory.Fd()), "record.bin", syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
+		fileFd, err := unix.Openat(int(directory.Fd()), "record.bin", syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
 		if err != nil {
 			return PreparationOwnerPlan{}, err
 		}
@@ -677,7 +679,7 @@ func TestPreparationRemountAndUnknownOwnerMetadataRefuse(t *testing.T) {
 				if _, err := f.apply(t.Context(), nil); err != nil {
 					t.Fatal(err)
 				}
-				if err := syscall.Setxattr(f.request.RootPath, "user.urnetwork.foreign-unreviewed", []byte("unreviewed"), 1); err != nil {
+				if err := unix.Setxattr(f.request.RootPath, "user.urnetwork.foreign-unreviewed", []byte("unreviewed"), unix.XATTR_CREATE); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -685,7 +687,7 @@ func TestPreparationRemountAndUnknownOwnerMetadataRefuse(t *testing.T) {
 					if mode == "remount" {
 						f.volume.host.mounts[1].Id++
 					} else {
-						f.volume.host.mounts = append(f.volume.host.mounts, Mount{Id: 17, ParentId: 7, Device: f.volume.host.uuidDevice, Root: "/", Path: filepath.Dir(f.request.ControlPath), FilesystemType: "ext4"})
+						f.volume.host.mounts = append(f.volume.host.mounts, Mount{Id: 17, ParentId: 7, Device: f.volume.host.uuidDevice, Root: "/", Path: filepath.Dir(f.request.ControlPath), FilesystemType: testFilesystemType})
 					}
 				})
 			}

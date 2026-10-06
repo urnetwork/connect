@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Counts and serialized bytes are independent runtime limits. These compact
 // synthetic declarations exercise the accepted count edges without real mounts.
@@ -13,8 +13,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Each separate planned declaration names one root on a shared synthetic mount.
@@ -24,7 +25,7 @@ func preparationCohortCompactRoots(mounts, roots int) []preparationCohortDeclara
 		mount := fmt.Sprintf("/%c", 'a'+m)
 		for index := 0; index < roots; index++ {
 			root := StateRootSpec{Path: fmt.Sprintf("%s/r%x", mount, index), LeasePath: fmt.Sprintf("%s/l%x", mount, index), LeaseSha256: testDigest([]byte("synthetic lease")), RootInode: uint64(index + 1), GenerationSha256: testDigest([]byte("synthetic root generation"))}
-			volume := VolumeSpec{MountPath: mount, FilesystemUuid: "abcd", FilesystemType: "ext4", MarkerPath: mount + "/m", MarkerSha256: testDigest([]byte("synthetic marker")), StateRoots: []StateRootSpec{root}, MinAvailableBytes: 1, MinAvailableInodes: 1}
+			volume := VolumeSpec{MountPath: mount, FilesystemUuid: "abcd", FilesystemType: testFilesystemType, MarkerPath: mount + "/m", MarkerSha256: testDigest([]byte("synthetic marker")), StateRoots: []StateRootSpec{root}, MinAvailableBytes: 1, MinAvailableInodes: 1}
 			result = append(result, preparationCohortDeclarationRoot{volume: volume})
 		}
 	}
@@ -118,7 +119,7 @@ func TestPreparationCohortCombinedDeclarationPreservesHealthyOwner(t *testing.T)
 	// The fixture's existing declared root is independent of both fresh plans.
 	ref := volume.reference
 	originalCohort := []byte(`{"schema":"synthetic-retained-root-cohort","cohort_sha256":"` + testDigest([]byte("original unrelated cohort")) + `"}`)
-	if err := syscall.Setxattr(volume.root, PreparationAttribute, originalCohort, 1); err != nil {
+	if err := unix.Setxattr(volume.root, PreparationAttribute, originalCohort, unix.XATTR_CREATE); err != nil {
 		t.Fatal(err)
 	}
 	f.cohort.RetainedDeclaration = &ref
@@ -170,7 +171,7 @@ func TestPreparationCohortCombinedDeclarationPreservesHealthyOwner(t *testing.T)
 		t.Fatal("healthy owner lost admission", err)
 	}
 	retainedAnchor := make([]byte, len(originalCohort))
-	if size, err := syscall.Getxattr(volume.root, PreparationAttribute, retainedAnchor); err != nil || size != len(originalCohort) || !bytes.Equal(retainedAnchor, originalCohort) {
+	if size, err := unix.Getxattr(volume.root, PreparationAttribute, retainedAnchor); err != nil || size != len(originalCohort) || !bytes.Equal(retainedAnchor, originalCohort) {
 		t.Fatal("untouched original per-root cohort authority changed", err)
 	}
 	checked, err := CheckPreparationCohortWithHost(t.Context(), f.reference, preparationTestAdapter(), volume.host)

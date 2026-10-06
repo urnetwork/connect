@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Every accepted public plan fits its fixed control grammar before target
 // effects. JSON escaping and pending/completed metadata are counted explicitly.

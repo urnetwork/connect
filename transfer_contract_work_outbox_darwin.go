@@ -21,5 +21,5 @@ func replaceOriginalWorkOutboxAttribute(file *os.File, raw []byte, fresh bool) e
 	if fresh {
 		flags = unix.XATTR_CREATE
 	}
-	return unix.Fsetxattr(int(file.Fd()), OriginalWorkOutboxAttribute, raw, flags)
+	return setDescriptorAttribute(int(file.Fd()), OriginalWorkOutboxAttribute, raw, flags)
 }
