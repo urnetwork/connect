@@ -81,10 +81,11 @@ func newCfaaDetector(settings *CfaaSecurityPolicySettings) *cfaaDetector {
 //   - ntp (123), ike+nat-t (500, 4500), dns/udp     -> allow (never inspected)
 //   - Telegram reflector IPv4s on TCP/UDP 596-599,
 //     plus its exact TCP/595 v12 fallback           -> allow (explicit exception)
-//   - https/quic (443), dot (853), email (465/587/993/995), http/tcp (80),
+//   - https/quic (443), dot (853), http/tcp (80),
+//     email (465, 587/tcp, 993, 995),
 //     and user/ephemeral ports (>=1024)             -> pass (to DPI)
 //   - every other privileged port (<1024),
-//     dns/tcp and 80/udp                            -> drop
+//     dns/tcp, 587/udp and 80/udp                   -> drop
 func (self *cfaaDetector) inspect(ip net.IP, port int, protocol IpProtocol, version int) cfaaVerdict {
 	verdict, _ := self.inspectReason(ip, port, protocol, version)
 	return verdict
