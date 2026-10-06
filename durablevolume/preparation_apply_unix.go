@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // A private write-ahead control binds one accepted plan to one original root.
 // Lost acknowledgements reconcile exact complete bytes; unknown partial data,
@@ -6,6 +6,9 @@
 package durablevolume
 
 import (
+	"github.com/urnetwork/connect/durablesys"
+	"golang.org/x/sys/unix"
+
 	"bufio"
 	"bytes"
 	"context"
@@ -18,7 +21,6 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
-	"unsafe"
 )
 
 const preparationControlSchema = "urnetwork-storage-preparation-control-v1"
@@ -74,7 +76,7 @@ type preparationApply struct {
 	plan        PreparationPlan
 	reference   Reference
 	control     *os.File
-	controlStat syscall.Stat_t
+	controlStat unix.Stat_t
 	header      preparationControlHeader
 	anchor      []byte
 	previous    string
@@ -82,7 +84,7 @@ type preparationApply struct {
 	completed   []preparationControlRecord
 	pending     *preparationControlRecord
 	position    int
-	retained    map[string]syscall.Stat_t
+	retained    map[string]unix.Stat_t
 	attributes  map[string][]byte
 	moveSources map[string]PreparationSource
 	hooks       *preparationHooks
@@ -97,7 +99,7 @@ type preparationApply struct {
 
 // Absence is legal only for a separately reviewed, still-fresh plan target.
 func preparationAbsent(parent *os.File, name string) error {
-	fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	fd, err := unix.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, syscall.ENOENT) {
 		return nil
 	}
@@ -129,15 +131,10 @@ func preparationCreateAttribute(file *os.File, name string, raw []byte) error {
 	if len(raw) == 0 || len(raw) > 4096 {
 		return errors.New("preparation attribute exceeds its fixed capacity")
 	}
-	key, err := syscall.BytePtrFromString(name)
+	err := durablesys.SetAttribute(int(file.Fd()), name, raw, durablesys.AttributeCreate)
+	runtime.KeepAlive(file)
 	if err != nil {
 		return err
-	}
-	_, _, errno := syscall.Syscall6(syscall.SYS_FSETXATTR, file.Fd(), uintptr(unsafe.Pointer(key)), uintptr(unsafe.Pointer(&raw[0])), uintptr(len(raw)), 1, 0)
-	runtime.KeepAlive(file)
-	runtime.KeepAlive(raw)
-	if errno != 0 {
-		return errno
 	}
 	return file.Sync()
 }
@@ -172,7 +169,7 @@ func (self *preparationApply) parent(path string) (_ *os.File, name string, resu
 		if part == "." {
 			continue
 		}
-		next, openErr := syscall.Openat(int(file.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+		next, openErr := unix.Openat(int(file.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 		closeErr := file.Close()
 		if openErr != nil {
 			return nil, "", errors.Join(namedObservation("preparation parent could not be opened", openErr), closeErr)
@@ -181,8 +178,8 @@ func (self *preparationApply) parent(path string) (_ *os.File, name string, resu
 		if err := errors.Join(closeErr, preparationPrivate(file, true)); err != nil {
 			return nil, "", errors.Join(err, file.Close())
 		}
-		var observed syscall.Stat_t
-		if err := syscall.Fstat(next, &observed); err != nil {
+		var observed unix.Stat_t
+		if err := unix.Fstat(next, &observed); err != nil {
 			return nil, "", errors.Join(err, file.Close())
 		}
 		retained, present := self.retained[file.Name()]
@@ -194,12 +191,12 @@ func (self *preparationApply) parent(path string) (_ *os.File, name string, resu
 }
 
 // Byte changes are checked separately from physical and protection identity.
-func preparationSameIdentity(a, b syscall.Stat_t) bool {
+func preparationSameIdentity(a, b unix.Stat_t) bool {
 	return a.Dev == b.Dev && a.Ino == b.Ino && a.Mode == b.Mode && a.Uid == b.Uid && a.Gid == b.Gid
 }
 
 // Unchanged retained file metadata avoids rereading an acknowledged prefix.
-func preparationSameFile(a, b syscall.Stat_t) bool {
+func preparationSameFile(a, b unix.Stat_t) bool {
 	return preparationSameIdentity(a, b) && a.Size == b.Size && a.Mtim == b.Mtim && a.Ctim == b.Ctim && a.Nlink == 1 && b.Nlink == 1
 }
 
@@ -220,8 +217,8 @@ func (self *preparationApply) check() error {
 		if err := sameNamedFile(self.control, self.admission.request.ControlPath); err != nil {
 			return err
 		}
-		var stat syscall.Stat_t
-		if err := syscall.Fstat(int(self.control.Fd()), &stat); err != nil {
+		var stat unix.Stat_t
+		if err := unix.Fstat(int(self.control.Fd()), &stat); err != nil {
 			return unavailableObservation("preparation control could not be observed", err)
 		}
 		if !preparationSameFile(self.controlStat, stat) {
@@ -292,7 +289,7 @@ func (self *preparationApply) append(phase string, step preparationStep, identit
 	if err := self.after("control-"+phase, step.Path); err != nil {
 		return self.uncertain(err)
 	}
-	if err := syscall.Fstat(int(self.control.Fd()), &self.controlStat); err != nil {
+	if err := unix.Fstat(int(self.control.Fd()), &self.controlStat); err != nil {
 		return self.uncertain(err)
 	}
 	self.sequence, self.previous = record.Sequence, record.Sha256
@@ -319,7 +316,7 @@ func (self *preparationApply) openControl() (resultErr error) {
 	}()
 	request := self.admission.request
 	parent := self.admission.directories[filepath.Dir(request.ControlPath)]
-	fd, err := syscall.Openat(int(parent.Fd()), filepath.Base(request.ControlPath), syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	fd, err := unix.Openat(int(parent.Fd()), filepath.Base(request.ControlPath), syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	created := false
 	if errors.Is(err, syscall.ENOENT) {
 		if err := errors.Join(preparationEmpty(self.admission.ctx, self.admission.root), preparationRequireNoAttributes(self.admission.root)); err != nil {
@@ -333,7 +330,7 @@ func (self *preparationApply) openControl() (resultErr error) {
 		if err := self.check(); err != nil {
 			return err
 		}
-		fd, err = syscall.Openat(int(parent.Fd()), filepath.Base(request.ControlPath), syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
+		fd, err = unix.Openat(int(parent.Fd()), filepath.Base(request.ControlPath), syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
 		created = err == nil
 		mutated = created
 	}
@@ -378,7 +375,7 @@ func (self *preparationApply) openControl() (resultErr error) {
 	if self.header.Schema != preparationControlSchema || self.header.PlanSha256 != self.reference.Sha256 || self.header.CohortSha256 != self.cohort.Sha256 || self.header.Root != self.plan.Root || self.header.Control != identity {
 		return errors.Join(ErrIdentity, errors.New("preparation control belongs to another plan or physical generation"))
 	}
-	if err := syscall.Fstat(fd, &self.controlStat); err != nil {
+	if err := unix.Fstat(fd, &self.controlStat); err != nil {
 		return err
 	}
 	return self.reserveControl()
@@ -399,7 +396,7 @@ func (self *preparationApply) reserveControl() (resultErr error) {
 		return err
 	}
 	retained, err := readInventoryAttribute(self.admission.root, PreparationAttribute, 4096)
-	if errors.Is(err, syscall.ENODATA) {
+	if errors.Is(err, durablesys.ErrNoAttribute) {
 		if self.sequence != 0 {
 			return errors.Join(ErrIdentity, errors.New("existing preparation control lost its root reservation"))
 		}
@@ -544,7 +541,7 @@ func (self *preparationApply) requireAbsent(step preparationStep) error {
 		}
 		defer file.Close()
 		_, err = readInventoryAttribute(file, step.Attribute, 4096)
-		if errors.Is(err, syscall.ENODATA) {
+		if errors.Is(err, durablesys.ErrNoAttribute) {
 			return nil
 		}
 		if err != nil {
@@ -576,13 +573,13 @@ func (self *preparationApply) attributeTarget(path string) (*os.File, error) {
 		return nil, err
 	}
 	defer parent.Close()
-	fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	fd, err := unix.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, namedObservation("preparation attribute target could not be observed", err)
 	}
 	file := os.NewFile(uintptr(fd), path)
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(fd, &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
 		return nil, errors.Join(err, file.Close())
 	}
 	old, present := self.retained[path]
@@ -619,20 +616,20 @@ func (self *preparationApply) observe(step preparationStep, pending bool) (_ Pre
 	if step.Kind == "directory" {
 		flags |= syscall.O_DIRECTORY
 	}
-	fd, err := syscall.Openat(int(parent.Fd()), name, flags, 0)
+	fd, err := unix.Openat(int(parent.Fd()), name, flags, 0)
 	created := false
 	if errors.Is(err, syscall.ENOENT) && pending {
 		if err := self.check(); err != nil {
 			return PreparationIdentity{}, err
 		}
 		if step.Kind == "directory" {
-			if err := syscall.Mkdirat(int(parent.Fd()), name, step.Mode); err != nil {
+			if err := unix.Mkdirat(int(parent.Fd()), name, step.Mode); err != nil {
 				return PreparationIdentity{}, self.uncertain(err)
 			}
 			mutated = true
-			fd, err = syscall.Openat(int(parent.Fd()), name, flags, 0)
+			fd, err = unix.Openat(int(parent.Fd()), name, flags, 0)
 		} else {
-			fd, err = syscall.Openat(int(parent.Fd()), name, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, step.Mode)
+			fd, err = unix.Openat(int(parent.Fd()), name, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, step.Mode)
 		}
 		created = err == nil
 		mutated = mutated || created
@@ -685,8 +682,8 @@ func (self *preparationApply) observe(step preparationStep, pending bool) (_ Pre
 	if err := self.sameMember(file, parent, name); err != nil {
 		return PreparationIdentity{}, err
 	}
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(fd, &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
 		return PreparationIdentity{}, err
 	}
 	self.retained[step.Path] = stat
@@ -698,7 +695,7 @@ func (self *preparationApply) observe(step preparationStep, pending bool) (_ Pre
 
 // Real named and opened descriptors must still identify the same original member.
 func (self *preparationApply) sameMember(file, parent *os.File, name string) error {
-	fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	fd, err := unix.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return namedObservation("preparation named member could not be observed", err)
 	}
@@ -778,7 +775,7 @@ func (self *preparationApply) observeAttribute(step preparationStep, pending boo
 		return PreparationIdentity{}, err
 	}
 	retained, err := readInventoryAttribute(file, step.Attribute, 4096)
-	if errors.Is(err, syscall.ENODATA) && pending {
+	if errors.Is(err, durablesys.ErrNoAttribute) && pending {
 		if err := self.check(); err != nil {
 			return PreparationIdentity{}, err
 		}
@@ -805,8 +802,8 @@ func (self *preparationApply) observeAttribute(step preparationStep, pending boo
 	}
 	self.attributes[step.Path+"\x00"+step.Attribute] = append([]byte(nil), retained...)
 	if _, present := self.retained[step.Path]; present {
-		var stat syscall.Stat_t
-		if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
+		var stat unix.Stat_t
+		if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
 			return PreparationIdentity{}, err
 		}
 		self.retained[step.Path] = stat
@@ -874,7 +871,7 @@ func (self *preparationApply) census(partial bool) error {
 		if depth > request.Limits.MaxDepth {
 			return errors.New("prepared namespace depth exceeds its capacity")
 		}
-		fd, err := syscall.Openat(int(directory.Fd()), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+		fd, err := unix.Openat(int(directory.Fd()), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			return err
 		}
@@ -907,8 +904,8 @@ func (self *preparationApply) census(partial bool) error {
 			if err != nil {
 				return err
 			}
-			var stat syscall.Stat_t
-			err = syscall.Fstat(int(file.Fd()), &stat)
+			var stat unix.Stat_t
+			err = unix.Fstat(int(file.Fd()), &stat)
 			if err == nil && (!preparationSameIdentity(retained, stat) || stat.Mode&syscall.S_IFMT == syscall.S_IFREG && !preparationSameFile(retained, stat)) {
 				err = errors.Join(ErrIdentity, errors.New("prepared member changed after acknowledgement"))
 			}
@@ -996,7 +993,7 @@ func openPreparationApplication(ctx context.Context, reference Reference, adapte
 	if err := admission.fence(); err != nil {
 		return nil, err
 	}
-	self := &preparationApply{admission: admission, plan: plan, reference: reference, retained: map[string]syscall.Stat_t{}, attributes: map[string][]byte{}, moveSources: preparationMoveSources(plan), hooks: hooks, adapter: adapter, inventory: inventory}
+	self := &preparationApply{admission: admission, plan: plan, reference: reference, retained: map[string]unix.Stat_t{}, attributes: map[string][]byte{}, moveSources: preparationMoveSources(plan), hooks: hooks, adapter: adapter, inventory: inventory}
 	if request.Purpose == "restore" {
 		self.archive, err = openPreparationRestoreArchive(ctx, request, host)
 		if err != nil {
@@ -1152,17 +1149,4 @@ func (self *preparationApply) run() (result PreparationResult, resultErr error) 
 		return result, err
 	}
 	return PreparationResult{Schema: PreparationResultSchema, Plan: reference, Declaration: Reference{Path: request.DeclarationPath, Sha256: preparationDigest(raw)}, RestartAuthorized: false}, nil
-}
-
-// Filesystem type constants have exactly the same daemon/owner-local meaning.
-func filesystemMagic(name string) int64 {
-	switch name {
-	case "ext4":
-		return 0xef53
-	case "xfs":
-		return 0x58465342
-	case "btrfs":
-		return 0x9123683e
-	}
-	return -1
 }

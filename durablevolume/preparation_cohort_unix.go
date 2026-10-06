@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // A cohort holds all root leases and authenticates all retained prefixes before
 // its first mutation. Publication is incremental, never an atomic rollback: a

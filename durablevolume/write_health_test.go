@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Failure-only host hooks retain real anonymous allocation, descriptor writes,
 // syncs and closure while exposing admission and cleanup at exact boundaries.
@@ -8,10 +8,13 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Every explicit admission owns a new bounded anonymous write. Ordinary
@@ -45,11 +48,11 @@ func TestOwnerWriteHealthUsesFreshAnonymousProbe(t *testing.T) {
 			case "file-write":
 				probe = file
 			case "file-sync":
-				var stat syscall.Stat_t
-				if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
+				var stat unix.Stat_t
+				if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
 					return err
 				}
-				if file != probe || stat.Size <= 0 || stat.Size > 4096 || stat.Nlink != 0 || stat.Mode&07777 != 0600 || deviceNumber(stat.Dev) != fixture.host.uuidDevice {
+				if file != probe || stat.Size <= 0 || stat.Size > 4096 || stat.Nlink != 0 || stat.Mode&07777 != 0600 || statDevice(&stat) != fixture.host.uuidDevice {
 					return errors.New("probe lacks a bounded actual write to a private anonymous inode")
 				}
 			case "file-close":
@@ -95,6 +98,7 @@ func TestOwnerWriteHealthUsesFreshAnonymousProbe(t *testing.T) {
 			if err != nil || len(entries) != 0 {
 				t.Fatal("probe published or retained a name", entries, err)
 			}
+			requireNoProbeNames(t, fixture)
 		}
 	}
 }
@@ -158,6 +162,7 @@ func TestOwnerWriteHealthRefusesIoFailuresAndRetainsRetry(t *testing.T) {
 		if err != nil || len(entries) != 0 {
 			t.Fatal("failed probe left namespace cleanup", entries, err)
 		}
+		requireNoProbeNames(t, fixture)
 		if err := owner.CheckRead(); err != nil {
 			t.Fatal("failed write health prevented read-only inspection", err)
 		}
@@ -201,6 +206,7 @@ func TestOwnerWriteHealthPartialWritePreservesCleanupFailures(t *testing.T) {
 	if err != nil || len(entries) != 0 {
 		t.Fatal("partial probe retained a name", entries, err)
 	}
+	requireNoProbeNames(t, fixture)
 	fixture.host.writeHealthHook = nil
 	if err := owner.CheckWrite(); err != nil {
 		t.Fatal("same owner could not retry after failed probe cleanup", err)
@@ -472,5 +478,22 @@ func TestOwnerWriteHealthFailureLeavesIndependentOwnerUsable(t *testing.T) {
 	}
 	if err := healthyOwner.CheckWrite(); err != nil {
 		t.Fatal("closing a failed owner changed independent admission", err)
+	}
+}
+
+// Darwin names its probe beside the external lease before unlinking it; no
+// platform may leave that name, or any probe, behind after a check returns.
+func requireNoProbeNames(t *testing.T, fixture *volumeFixture) {
+	t.Helper()
+	for _, directory := range []string{fixture.root, filepath.Dir(fixture.config.Volumes[0].StateRoots[0].LeasePath)} {
+		entries, err := os.ReadDir(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".urnetwork-write-health-") {
+				t.Fatal("write probe retained its name", directory, entry.Name())
+			}
+		}
 	}
 }

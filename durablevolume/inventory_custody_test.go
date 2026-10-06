@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Retained file bytes are insufficient when owner acknowledgement lives in
 // descriptor attributes. These controls keep the real directory and file data.
@@ -10,8 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // JSON keeps this exact control compilable against the prior limits struct.
@@ -37,7 +38,7 @@ func TestInventoryRetainsOwnerCustodyMetadata(t *testing.T) {
 		{filepath.Join(fixture.root, "journal", "empty-lock"), "user.urnetwork.snapshot." + strings.Repeat("a", 64), []byte(`{"pending":"actual-retained-temporary-member"}`)},
 	}
 	for _, value := range values {
-		if err := syscall.Setxattr(value.path, value.name, value.raw, 1); err != nil {
+		if err := unix.Setxattr(value.path, value.name, value.raw, unix.XATTR_CREATE); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -89,7 +90,7 @@ func TestVerifyInventoryRefusesLostOwnerCustodyMetadata(t *testing.T) {
 	fixture.custody(t)
 	path, name := filepath.Join(fixture.root, "journal", "empty-lock"), "user.urnetwork.snapshot."+strings.Repeat("b", 64)
 	original := []byte(`{"committed":"retained-completed-history"}`)
-	if err := syscall.Setxattr(path, name, original, 1); err != nil {
+	if err := unix.Setxattr(path, name, original, unix.XATTR_CREATE); err != nil {
 		t.Fatal(err)
 	}
 	owner := fixture.open(t, Snapshot)
@@ -108,19 +109,19 @@ func TestVerifyInventoryRefusesLostOwnerCustodyMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	expected := Reference{Path: retained, Sha256: testDigest(raw)}
-	if err := syscall.Removexattr(path, name); err != nil {
+	if err := unix.Removexattr(path, name); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := owner.VerifyInventory(t.Context(), expected, fence, limits); err == nil {
 		t.Fatal("missing acknowledged owner anchor passed exact restore verification")
 	}
-	if err := syscall.Setxattr(path, name, []byte(`{"committed":"different-history"}`), 1); err != nil {
+	if err := unix.Setxattr(path, name, []byte(`{"committed":"different-history"}`), unix.XATTR_CREATE); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := owner.VerifyInventory(t.Context(), expected, fence, limits); err == nil {
 		t.Fatal("different acknowledged owner anchor passed exact restore verification")
 	}
-	if err := syscall.Setxattr(path, name, original, 2); err != nil {
+	if err := unix.Setxattr(path, name, original, unix.XATTR_REPLACE); err != nil {
 		t.Fatal(err)
 	}
 	verified, err := owner.VerifyInventory(t.Context(), expected, fence, limits)
@@ -132,7 +133,7 @@ func TestVerifyInventoryRefusesLostOwnerCustodyMetadata(t *testing.T) {
 func TestInventoryRefusesUnknownOwnerCustodyMetadata(t *testing.T) {
 	fixture := newVolumeFixture(t)
 	fixture.custody(t)
-	if err := syscall.Setxattr(fixture.root, "user.urnetwork.future-custody-owner", []byte("unrecognized-retained-authority"), 1); err != nil {
+	if err := unix.Setxattr(fixture.root, "user.urnetwork.future-custody-owner", []byte("unrecognized-retained-authority"), unix.XATTR_CREATE); err != nil {
 		t.Fatal(err)
 	}
 	owner := fixture.open(t, Snapshot)

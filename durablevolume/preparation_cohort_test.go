@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Cohort controls exercise real roots, locks, journals, synced pending bytes,
 // physical replacement and reopened production admission with synthetic facts.
@@ -14,6 +14,8 @@ import (
 	"reflect"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 type preparationCohortFixture struct {
@@ -42,8 +44,8 @@ func newPreparationCohortFixture(t *testing.T, private bool) *preparationCohortF
 	second.request.FormerWriterFence.Path = filepath.Join(metadata, "fence.json")
 	f := &preparationCohortFixture{members: []*preparationFixture{first, second}}
 	for _, member := range f.members {
-		var identity syscall.Stat_t
-		if err := syscall.Stat(member.request.RootPath, &identity); err != nil {
+		var identity unix.Stat_t
+		if err := unix.Stat(member.request.RootPath, &identity); err != nil {
 			t.Fatal(err)
 		}
 		fence := PreparationFence{Schema: PreparationFenceSchema, RootPath: member.request.RootPath, RootInode: identity.Ino, Purpose: "fresh", FormerWritersStopped: true, NoPreviousOwnerState: true, Evidence: "synthetic joined cohort root"}
@@ -51,7 +53,7 @@ func newPreparationCohortFixture(t *testing.T, private bool) *preparationCohortF
 			if err := os.Remove(member.request.RootPath); err != nil {
 				t.Fatal(err)
 			}
-			if err := syscall.Stat(filepath.Dir(member.request.RootPath), &identity); err != nil {
+			if err := unix.Stat(filepath.Dir(member.request.RootPath), &identity); err != nil {
 				t.Fatal(err)
 			}
 			fence.RootInode, fence.ParentInode = 0, identity.Ino
@@ -270,8 +272,8 @@ func TestPreparationCohortCreatesSiblingRootsFromOriginalStagedInodes(t *testing
 		t.Fatal("cohort self-conflicted on shared private parent", err)
 	}
 	for _, member := range f.members {
-		var stat syscall.Stat_t
-		if err := syscall.Stat(member.request.RootPath, &stat); err != nil || stat.Ino != member.plan.Root.Inode || stat.Mode&0777 != 0700 {
+		var stat unix.Stat_t
+		if err := unix.Stat(member.request.RootPath, &stat); err != nil || stat.Ino != member.plan.Root.Inode || stat.Mode&0777 != 0700 {
 			t.Fatal("staged root lost its reviewed inode or protection", err)
 		}
 	}

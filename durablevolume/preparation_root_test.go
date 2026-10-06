@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Root creation tests force exact source/parent/control transitions. Empty
 // replacement paths never substitute for a reviewed original root generation.
@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Only this fixture's known fresh root is removed. The new parent remains
@@ -30,8 +32,8 @@ func newPrivateRootPreparationFixture(t *testing.T) *preparationFixture {
 	}
 	f.request.RootPath = filepath.Join(parent, "new-root")
 	f.request.RootCreation = "create-private"
-	var stat syscall.Stat_t
-	if err := syscall.Stat(parent, &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Stat(parent, &stat); err != nil {
 		t.Fatal(err)
 	}
 	fence, err := json.Marshal(PreparationFence{Schema: PreparationFenceSchema, RootPath: f.request.RootPath, ParentInode: stat.Ino, Purpose: "fresh", FormerWritersStopped: true, NoPreviousOwnerState: true, Evidence: "synthetic private root, no former owner"})
@@ -138,7 +140,7 @@ func TestPreparationPrivateRootRefusesChangedCustody(t *testing.T) {
 				t.Fatal(err)
 			}
 		case "source-attribute":
-			if err := syscall.Setxattr(f.plan.RootSource, "user.urnetwork.unknown-custody", []byte("retained"), 1); err != nil {
+			if err := unix.Setxattr(f.plan.RootSource, "user.urnetwork.unknown-custody", []byte("retained"), unix.XATTR_CREATE); err != nil {
 				t.Fatal(err)
 			}
 		case "parent-replaced":
@@ -256,7 +258,7 @@ func TestPreparationPrivateRootChildCrashJoinsBeforeResume(t *testing.T) {
 		if err := json.Unmarshal(raw, &plan); err != nil {
 			t.Fatal(err)
 		}
-		host := &fixtureHost{mounts: []Mount{{Id: 1, ParentId: 1, Device: Device{Major: plan.Mount.Device.Major ^ 1, Minor: plan.Mount.Device.Minor}, Root: "/", Path: "/", FilesystemType: "ext4"}, plan.Mount}, uuidDevice: plan.Mount.Device, filesystem: plan.Filesystem}
+		host := &fixtureHost{mounts: []Mount{{Id: 1, ParentId: 1, Device: Device{Major: plan.Mount.Device.Major ^ 1, Minor: plan.Mount.Device.Minor}, Root: "/", Path: "/", FilesystemType: testFilesystemType}, plan.Mount}, uuidDevice: plan.Mount.Device, filesystem: plan.Filesystem}
 		_, err = applyPreparation(t.Context(), Reference{Path: path, Sha256: testDigest(raw)}, preparationTestAdapter(), host, daemonScope, &preparationHooks{after: func(stage, path string) error {
 			if stage == os.Getenv("URNETWORK_PRIVATE_ROOT_CRASH_STAGE") {
 				os.Exit(74)

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Restored physical censuses bind reviewed staging inodes. Their members move
 // without replacement; a retry joins only the exact source/target transition,
@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // Every move is already a hash-linked pending step before its first syscall.
@@ -42,7 +44,7 @@ func (self *preparationApply) observeMovedRestoreFile(step preparationStep, pend
 	}
 	defer func() { resultErr = errors.Join(resultErr, targetParent.Close()) }()
 	open := func(parent *os.File, name string) (*os.File, error) {
-		fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		fd, err := unix.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 		if errors.Is(err, syscall.ENOENT) {
 			return nil, nil
 		}
@@ -126,8 +128,8 @@ func (self *preparationApply) observeMovedRestoreFile(step preparationStep, pend
 	if err := errors.Join(self.sameMember(file, targetParent, targetName), sameNamedFile(sourceParent, filepath.Dir(step.Source.Path))); err != nil {
 		return PreparationIdentity{}, err
 	}
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
 		return PreparationIdentity{}, unavailableObservation("published physical member could not be observed", err)
 	}
 	self.retained[step.Path] = stat

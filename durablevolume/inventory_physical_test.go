@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Physical export retains each original leaf generation needed by owner census
 // rebinding. Ordinary byte inventory remains a distinct historical report.
@@ -10,8 +10,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // An interface keeps the exact old inventory source usable as a causal control;
@@ -53,11 +54,11 @@ func TestPhysicalInventoryRetainsEveryOriginalMemberGeneration(t *testing.T) {
 		t.Fatal("physical export lost original members", len(observed.Entries))
 	}
 	for _, member := range observed.Entries {
-		var stat syscall.Stat_t
-		if err := syscall.Stat(filepath.Join(fixture.root, member.Path), &stat); err != nil {
+		var stat unix.Stat_t
+		if err := unix.Stat(filepath.Join(fixture.root, member.Path), &stat); err != nil {
 			t.Fatal(err)
 		}
-		if member.Physical == nil || member.Physical.Inode != stat.Ino || member.Physical.Device != deviceNumber(stat.Dev) {
+		if member.Physical == nil || member.Physical.Inode != stat.Ino || member.Physical.Device != statDevice(&stat) {
 			t.Fatal("inventory lacks the original member generation required to authenticate retained owner census", member.Path, member.Physical)
 		}
 	}

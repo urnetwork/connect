@@ -1,10 +1,12 @@
-//go:build linux
+//go:build linux || darwin
 
 // Custody attributes stay on the same no-follow descriptors as file contents.
 // Unknown protocol metadata prevents a misleading complete backup report.
 package durablevolume
 
 import (
+	"github.com/urnetwork/connect/durablesys"
+
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -16,7 +18,6 @@ import (
 	"sort"
 	"strings"
 	"syscall"
-	"unsafe"
 )
 
 const ownerAttributeNamespace = "user.urnetwork."
@@ -48,15 +49,15 @@ func ownerAttributeLimit(name string) (int, bool) {
 // Fixed buffers bound even a filesystem with many unrelated attribute names.
 func listInventoryAttributes(file *os.File) ([]string, error) {
 	raw := make([]byte, 64*1024)
-	count, _, errno := syscall.Syscall(syscall.SYS_FLISTXATTR, file.Fd(), uintptr(unsafe.Pointer(&raw[0])), uintptr(len(raw)))
+	count, err := durablesys.ListAttributes(int(file.Fd()), raw)
 	runtime.KeepAlive(file)
-	if errno != 0 {
-		if errno == syscall.ERANGE {
-			return nil, errors.Join(errors.New("inventory attribute-name bound exhausted"), errno)
+	if err != nil {
+		if errors.Is(err, syscall.ERANGE) {
+			return nil, errors.Join(errors.New("inventory attribute-name bound exhausted"), err)
 		}
-		return nil, inventoryAttributeObservation(errno)
+		return nil, inventoryAttributeObservation(err)
 	}
-	if count > uintptr(len(raw)) {
+	if count < 0 || count > len(raw) {
 		return nil, errors.New("inventory attribute-name census exceeded its buffer")
 	}
 	if count == 0 {
@@ -77,23 +78,19 @@ func listInventoryAttributes(file *os.File) ([]string, error) {
 }
 
 func readInventoryAttribute(file *os.File, name string, maximum int) ([]byte, error) {
-	key, err := syscall.BytePtrFromString(name)
-	if err != nil {
-		return nil, err
-	}
 	raw := make([]byte, maximum+1)
-	count, _, errno := syscall.Syscall6(syscall.SYS_FGETXATTR, file.Fd(), uintptr(unsafe.Pointer(key)), uintptr(unsafe.Pointer(&raw[0])), uintptr(len(raw)), 0, 0)
+	count, err := durablesys.GetAttribute(int(file.Fd()), name, raw)
 	runtime.KeepAlive(file)
-	if errno != 0 {
-		if errno == syscall.ERANGE {
-			return nil, errors.Join(errors.New("inventory owner attribute exceeds its reviewed byte bound"), errno)
+	if err != nil {
+		if errors.Is(err, syscall.ERANGE) {
+			return nil, errors.Join(errors.New("inventory owner attribute exceeds its reviewed byte bound"), err)
 		}
-		if errno == syscall.ENODATA {
-			return nil, errors.Join(ErrIdentity, errors.New("inventory attribute disappeared after enumeration"), errno)
+		if errors.Is(err, durablesys.ErrNoAttribute) {
+			return nil, errors.Join(ErrIdentity, errors.New("inventory attribute disappeared after enumeration"), err)
 		}
-		return nil, inventoryAttributeObservation(errno)
+		return nil, inventoryAttributeObservation(err)
 	}
-	if count > uintptr(maximum) {
+	if count < 0 || count > maximum {
 		return nil, errors.New("inventory owner attribute exceeds its reviewed byte bound")
 	}
 	return raw[:count], nil
@@ -104,7 +101,7 @@ func inventoryAttributeObservation(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOSYS) {
+	if durablesys.AttributeUnsupported(err) {
 		return errors.Join(ErrUnsupported, unavailableObservation("inventory attributes are unsupported", err))
 	}
 	return unavailableObservation("inventory attributes could not be observed", err)

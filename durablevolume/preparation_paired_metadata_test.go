@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // A checkpoint exchange has two independently retained physical censuses.
 // Both retain their original bytes and derive only the reviewed member inode.
@@ -12,8 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 type preparationPairedTestCensus struct {
@@ -92,8 +93,8 @@ func preparationPairedTestAdapter() PreparationAdapter {
 				return nil, err
 			}
 			var census preparationPairedTestCensus
-			var stat syscall.Stat_t
-			if err := syscall.Stat(filepath.Join(root.Name(), "record.bin"), &stat); err != nil {
+			var stat unix.Stat_t
+			if err := unix.Stat(filepath.Join(root.Name(), "record.bin"), &stat); err != nil {
 				return nil, err
 			}
 			if json.Unmarshal(raw, &census) != nil || census.Inode != stat.Ino || census.Revision != 1 || census.Sha256 != report.Entries[len(report.Entries)-1].Sha256 {

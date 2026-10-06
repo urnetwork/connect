@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 // Unsupported hosts cannot claim the Linux volume and descriptor contract.
 package durablevolume

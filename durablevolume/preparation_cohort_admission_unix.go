@@ -1,10 +1,13 @@
-//go:build linux
+//go:build linux || darwin
 
 // Cohort admission retains every original control and verifies its exact plan
 // prefix without appending, syncing, creating or repairing any target member.
 package durablevolume
 
 import (
+	"github.com/urnetwork/connect/durablesys"
+	"golang.org/x/sys/unix"
+
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -21,7 +24,7 @@ var errPreparationIncomplete = errors.New("preparation has an unacknowledged nex
 func (self *preparationApply) preflightControl() error {
 	request := self.admission.request
 	parent := self.admission.directories[filepath.Dir(request.ControlPath)]
-	fd, err := syscall.Openat(int(parent.Fd()), filepath.Base(request.ControlPath), syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	fd, err := unix.Openat(int(parent.Fd()), filepath.Base(request.ControlPath), syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, syscall.ENOENT) {
 		if err := errors.Join(preparationEmpty(self.admission.ctx, self.admission.root), preparationRequireNoAttributes(self.admission.root)); err != nil {
 			return err
@@ -53,7 +56,7 @@ func (self *preparationApply) preflightControl() error {
 	if self.header.Schema != preparationControlSchema || self.header.PlanSha256 != self.reference.Sha256 || self.header.CohortSha256 != self.cohort.Sha256 || self.header.Root != self.plan.Root || self.header.Control != identity {
 		return errors.Join(ErrIdentity, errors.New("cohort control differs from its accepted plan and generation"))
 	}
-	if err := syscall.Fstat(fd, &self.controlStat); err != nil {
+	if err := unix.Fstat(fd, &self.controlStat); err != nil {
 		return unavailableObservation("cohort control stat is unavailable", err)
 	}
 	anchor, err := json.Marshal(preparationAnchor{Schema: preparationAnchorSchema, PlanSha256: self.reference.Sha256, CohortSha256: self.cohort.Sha256, RootInode: self.plan.Root.Inode, Control: identity})
@@ -61,7 +64,7 @@ func (self *preparationApply) preflightControl() error {
 		return err
 	}
 	retained, err := readInventoryAttribute(self.admission.root, PreparationAttribute, 4096)
-	if errors.Is(err, syscall.ENODATA) {
+	if errors.Is(err, durablesys.ErrNoAttribute) {
 		if self.sequence != 0 {
 			return errors.Join(ErrIdentity, errors.New("cohort control lost its completed root reservation"))
 		}
@@ -116,7 +119,7 @@ func (self *preparationApply) preflightNextStep(step preparationStep) error {
 		return errPreparationIncomplete
 	}
 	_, err := self.observe(step, false)
-	if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENODATA) {
+	if errors.Is(err, syscall.ENOENT) || errors.Is(err, durablesys.ErrNoAttribute) {
 		// Absence must belong to this exact pending destination. Missing
 		// acknowledged ancestors or a present competing target still refuse.
 		if err := self.requireAbsent(step); err != nil {

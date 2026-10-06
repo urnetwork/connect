@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Real staged plans and interrupted root moves distinguish failed observations
 // from observed different bytes. Every recovery retains its original journal.
@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestPreparationPlanRetentionReadFailurePreservesOriginalInputs(t *testing.T) {
@@ -126,12 +128,12 @@ func newPreparationMovedReadFixture(t *testing.T) *preparationMovedReadFixture {
 		t.Fatal(err)
 	}
 	anchor := make([]byte, 4096)
-	n, err := syscall.Getxattr(f.request.RootPath, PreparationAttribute, anchor)
+	n, err := unix.Getxattr(f.request.RootPath, PreparationAttribute, anchor)
 	if err != nil || n == 0 {
 		t.Fatal("moved root did not retain its original reservation", n, err)
 	}
-	var stat syscall.Stat_t
-	if err := syscall.Stat(f.request.RootPath, &stat); err != nil || stat.Ino != f.plan.Root.Inode {
+	var stat unix.Stat_t
+	if err := unix.Stat(f.request.RootPath, &stat); err != nil || stat.Ino != f.plan.Root.Inode {
 		t.Fatal("actual pending move changed its admitted inode", err)
 	}
 	return &preparationMovedReadFixture{fixture: f, control: control, anchor: anchor[:n], inode: stat.Ino}
@@ -145,12 +147,12 @@ func (self *preparationMovedReadFixture) unchanged(t *testing.T) {
 		t.Fatal("failed observation changed original pending journal", err)
 	}
 	raw := make([]byte, 4096)
-	n, err := syscall.Getxattr(f.request.RootPath, PreparationAttribute, raw)
+	n, err := unix.Getxattr(f.request.RootPath, PreparationAttribute, raw)
 	if err != nil || !bytes.Equal(raw[:n], self.anchor) {
 		t.Fatal("failed observation changed original root reservation", err)
 	}
-	var stat syscall.Stat_t
-	if err := syscall.Stat(f.request.RootPath, &stat); err != nil || stat.Ino != self.inode {
+	var stat unix.Stat_t
+	if err := unix.Stat(f.request.RootPath, &stat); err != nil || stat.Ino != self.inode {
 		t.Fatal("failed observation replaced original moved inode", err)
 	}
 }
@@ -171,8 +173,8 @@ func (self *preparationMovedReadFixture) resume(t *testing.T) {
 	if err != nil || readErr != nil || result != again || !bytes.Equal(control, after) {
 		t.Fatal("completed exact replay changed custody or duplicated journal", err, readErr)
 	}
-	var stat syscall.Stat_t
-	if err := syscall.Stat(f.request.RootPath, &stat); err != nil || stat.Ino != self.inode {
+	var stat unix.Stat_t
+	if err := unix.Stat(f.request.RootPath, &stat); err != nil || stat.Ino != self.inode {
 		t.Fatal("healthy recovery replaced original moved root", err)
 	}
 }
@@ -228,11 +230,11 @@ func TestPreparationMovedRootObservedReservationLossRemainsIdentity(t *testing.T
 		var err error
 		switch fault {
 		case "absent":
-			err = syscall.Removexattr(root, PreparationAttribute)
+			err = unix.Removexattr(root, PreparationAttribute)
 		case "empty":
-			err = syscall.Setxattr(root, PreparationAttribute, nil, 2)
+			err = unix.Setxattr(root, PreparationAttribute, nil, unix.XATTR_REPLACE)
 		case "different":
-			err = syscall.Setxattr(root, PreparationAttribute, []byte(`{"synthetic":"different reservation"}`), 2)
+			err = unix.Setxattr(root, PreparationAttribute, []byte(`{"synthetic":"different reservation"}`), unix.XATTR_REPLACE)
 		}
 		if err != nil {
 			t.Fatal(err)
@@ -245,7 +247,7 @@ func TestPreparationMovedRootObservedReservationLossRemainsIdentity(t *testing.T
 		if err != nil || !bytes.Equal(control, f.control) {
 			t.Fatal("observed missing reservation changed original control", fault, err)
 		}
-		if err := syscall.Setxattr(root, PreparationAttribute, f.anchor, 0); err != nil {
+		if err := unix.Setxattr(root, PreparationAttribute, f.anchor, 0); err != nil {
 			t.Fatal(err)
 		}
 		f.unchanged(t)

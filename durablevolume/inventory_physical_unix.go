@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Physical source reports preserve original inode-bearing owner censuses.
 // Strict loading authenticates the reviewed bytes; it does not grant a writer.

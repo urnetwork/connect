@@ -132,7 +132,9 @@ func (self Config) validateForScope(scope ownerScope) error {
 		}
 		mounts[volume.MountPath] = true
 		identityPaths = append(identityPaths, volume.MarkerPath)
-		if volume.FilesystemType != "ext4" && volume.FilesystemType != "xfs" && volume.FilesystemType != "btrfs" {
+		// The declaration format is platform-neutral; each host admits only
+		// its own qualified types (ext4/xfs/btrfs on Linux, apfs on Darwin).
+		if volume.FilesystemType != "ext4" && volume.FilesystemType != "xfs" && volume.FilesystemType != "btrfs" && volume.FilesystemType != "apfs" {
 			return errors.New("durable volume filesystem type is unsupported")
 		}
 		if len(volume.FilesystemUuid) < 4 || len(volume.FilesystemUuid) > 64 {
