@@ -5,7 +5,8 @@
 // and not only mls's; the message repository keeps its own copy for its own tree, and this file
 // keeps the half that stays here. The functions are that file's, with their assertions unchanged;
 // what changed is the scope's anchor (lineEndingScanRoots), the file the pin's live check reads,
-// and the comments.
+// the comments, and two points of CODESTYLE.md: the control tables name their fields, and the two
+// helpers only the gate calls are closures inside it.
 //
 // core.autocrlf=true is set at system scope on the windows boxes that build this repo. A text
 // gate or an exact-string edit anchored on one line ending matches nothing in a file carrying the
@@ -46,12 +47,61 @@ import (
 // by name, a depth limit and a walk rooted somewhere else. What it cannot refuse is the same
 // narrowing written into both enumerations, which is why they share no helper.
 func TestThePackageSourceIsOneLineEndingThroughout(t *testing.T) {
+	// Every directory of this module holding go source, derived by walking the module root, as paths
+	// relative to this package. A package added to the module is in scope without anyone adding it
+	// here, and nothing is excluded: not testdata, and not a nested module, whose files a checkout
+	// writes like any other. A directory that ever had to be left out would be a finding about this
+	// repository, not an entry here.
+	lineEndingScanRoots := func() []string {
+		t.Helper()
+		moduleRoot := moduleRootDir(t)
+		here, err := filepath.Abs(".")
+		if err != nil {
+			t.Fatalf("resolve this package's own directory: %v", err)
+		}
+		roots, err := goSourceDirsUnder(moduleRoot, here)
+		if err != nil {
+			t.Fatalf("walk %s for the go source of this module: %v", moduleRoot, err)
+		}
+		if len(roots) == 0 {
+			t.Fatal("the walk found no directory with go source under the module root, so the gate below judged nothing")
+		}
+		// where the walk starts is the one thing a module walk can still get wrong. mls checked it
+		// against directories beside that package. this package is the module root, so a walk started
+		// below the root cannot return the root itself, and one started above it is refused by the
+		// judged-file assertion in the gate.
+		if here != moduleRoot {
+			t.Fatalf("this scope is anchored at the module root %s, but the gate runs in %s", moduleRoot, here)
+		}
+		if !slices.Contains(roots, ".") {
+			t.Fatalf("the walk returned %v, which does not hold the module root's own package, so it is not rooted at this module", roots)
+		}
+		return roots
+	}
+	// Every go file at the top level of one package directory, sorted.
+	//
+	// It does not recurse, because lineEndingScanRoots already returns every directory holding go
+	// source at any depth, so a nested directory arrives as a root of its own. Testdata go is source,
+	// and is judged like any other. A directory holding no go source is fatal and not an empty
+	// result, because a scope that resolved to nothing looks like every file agreeing.
+	packageSourcePathsIn := func(dir string) []string {
+		t.Helper()
+		paths, err := filepath.Glob(filepath.Join(dir, "*.go"))
+		if err != nil {
+			t.Fatalf("list the source of %s: %v", dir, err)
+		}
+		if len(paths) == 0 {
+			t.Fatalf("%s holds no go files, so whatever scans it scanned nothing", dir)
+		}
+		slices.Sort(paths)
+		return paths
+	}
 	moduleRoot := moduleRootDir(t)
-	roots := lineEndingScanRoots(t)
+	roots := lineEndingScanRoots()
 	t.Logf("the derived scope is %v", roots)
 	judged := []string{}
 	for _, root := range roots {
-		paths := packageSourcePathsIn(t, root)
+		paths := packageSourcePathsIn(root)
 		heldTo := map[string]int{}
 		decidedBy := map[string]bool{}
 		unpinned := []string{}
@@ -152,38 +202,6 @@ func TestThePackageSourceIsOneLineEndingThroughout(t *testing.T) {
 	t.Logf("the gate judged %d files, against %d go files under %s", len(judged), len(inModule), moduleRoot)
 }
 
-// Every directory of this module holding go source, derived by walking the module root, as paths
-// relative to this package. A package added to the module is in scope without anyone adding it
-// here, and nothing is excluded: not testdata, and not a nested module, whose files a checkout
-// writes like any other. A directory that ever had to be left out would be a finding about this
-// repository, not an entry here.
-func lineEndingScanRoots(t *testing.T) []string {
-	t.Helper()
-	moduleRoot := moduleRootDir(t)
-	here, err := filepath.Abs(".")
-	if err != nil {
-		t.Fatalf("resolve this package's own directory: %v", err)
-	}
-	roots, err := goSourceDirsUnder(moduleRoot, here)
-	if err != nil {
-		t.Fatalf("walk %s for the go source of this module: %v", moduleRoot, err)
-	}
-	if len(roots) == 0 {
-		t.Fatal("the walk found no directory with go source under the module root, so the gate below judged nothing")
-	}
-	// where the walk starts is the one thing a module walk can still get wrong. mls checked it
-	// against directories beside that package. this package is the module root, so a walk started
-	// below the root cannot return the root itself, and one started above it is refused by the
-	// judged-file assertion in the gate.
-	if here != moduleRoot {
-		t.Fatalf("this scope is anchored at the module root %s, but the gate runs in %s", moduleRoot, here)
-	}
-	if !slices.Contains(roots, ".") {
-		t.Fatalf("the walk returned %v, which does not hold the module root's own package, so it is not rooted at this module", roots)
-	}
-	return roots
-}
-
 // The directory this module's go.mod sits in, walked up to rather than written down.
 func moduleRootDir(t *testing.T) string {
 	t.Helper()
@@ -279,25 +297,6 @@ func everyGoSourceFileUnder(t *testing.T, root string, from string) []string {
 	}
 	slices.Sort(files)
 	return files
-}
-
-// Every go file at the top level of one package directory, sorted.
-//
-// It does not recurse, because lineEndingScanRoots already returns every directory holding go
-// source at any depth, so a nested directory arrives as a root of its own. Testdata go is source,
-// and is judged like any other. A directory holding no go source is fatal and not an empty
-// result, because a scope that resolved to nothing looks like every file agreeing.
-func packageSourcePathsIn(t *testing.T, dir string) []string {
-	t.Helper()
-	paths, err := filepath.Glob(filepath.Join(dir, "*.go"))
-	if err != nil {
-		t.Fatalf("list the source of %s: %v", dir, err)
-	}
-	if len(paths) == 0 {
-		t.Fatalf("%s holds no go files, so whatever scans it scanned nothing", dir)
-	}
-	slices.Sort(paths)
-	return paths
 }
 
 // One scanned file's pin across every rule set between it and the module root, nearest first,
@@ -566,16 +565,16 @@ func TestTheLineEndingPinIsReadTheWayGitResolvesIt(t *testing.T) {
 		decides bool
 		why     string
 	}{
-		{pin, "mls/group.go", "lf", true, "the rule this repository carries, on a path it covers"},
-		{pin, "protocol/message.proto", "", false, "and one it does not"},
-		{"", "mls/group.go", "", false, "no rule at all is no pin, which is what deleting the line looks like"},
-		{"# " + pin, "mls/group.go", "", false, "a commented out rule is not a rule"},
-		{"/*.go text eol=lf", "group.go", "lf", true, "the same rule anchored at the root"},
-		{"**/*.go text eol=lf", "mls/group.go", "lf", true, "and spelled with a leading globstar"},
-		{pin + "\n*.go text eol=crlf", "mls/group.go", "crlf", true, "the last matching line wins, which is git's resolution and not a preference"},
-		{pin + "\nmls/** -text", "mls/group.go", "", true, "-text turns conversion off and clears the eol an earlier line asked for -- and DECIDES, so no outer rule set answers for it"},
-		{pin + "\nmls/** binary", "mls/group.go", "", true, "and binary is git's macro for the same thing"},
-		{"*.go text", "mls/group.go", "", false, "text with no eol says the file is text, not which ending a checkout writes, so an outer rule set still answers"},
+		{body: pin, path: "mls/group.go", want: "lf", decides: true, why: "the rule this repository carries, on a path it covers"},
+		{body: pin, path: "protocol/message.proto", want: "", decides: false, why: "and one it does not"},
+		{body: "", path: "mls/group.go", want: "", decides: false, why: "no rule at all is no pin, which is what deleting the line looks like"},
+		{body: "# " + pin, path: "mls/group.go", want: "", decides: false, why: "a commented out rule is not a rule"},
+		{body: "/*.go text eol=lf", path: "group.go", want: "lf", decides: true, why: "the same rule anchored at the root"},
+		{body: "**/*.go text eol=lf", path: "mls/group.go", want: "lf", decides: true, why: "and spelled with a leading globstar"},
+		{body: pin + "\n*.go text eol=crlf", path: "mls/group.go", want: "crlf", decides: true, why: "the last matching line wins, which is git's resolution and not a preference"},
+		{body: pin + "\nmls/** -text", path: "mls/group.go", want: "", decides: true, why: "-text turns conversion off and clears the eol an earlier line asked for -- and DECIDES, so no outer rule set answers for it"},
+		{body: pin + "\nmls/** binary", path: "mls/group.go", want: "", decides: true, why: "and binary is git's macro for the same thing"},
+		{body: "*.go text", path: "mls/group.go", want: "", decides: false, why: "text with no eol says the file is text, not which ending a checkout writes, so an outer rule set still answers"},
 	} {
 		ending, decidedBy := pinnedLineEndingFor(probe.body, probe.path)
 		if ending != probe.want || (decidedBy != "") != probe.decides {
@@ -606,9 +605,9 @@ func TestTheLineEndingPinIsReadTheWayGitResolvesIt(t *testing.T) {
 		want string
 		why  string
 	}{
-		{"*.go text eol=crlf\n", "crlf", "a nearer rule set with an opinion overrides the module root's"},
-		{"*.json -text\n", "lf", "a nearer rule set saying nothing about this path defers outward"},
-		{"*.go -text\n", "", "a nearer rule set marking it binary decides, and the root's eol does not answer for it"},
+		{body: "*.go text eol=crlf\n", want: "crlf", why: "a nearer rule set with an opinion overrides the module root's"},
+		{body: "*.json -text\n", want: "lf", why: "a nearer rule set saying nothing about this path defers outward"},
+		{body: "*.go -text\n", want: "", why: "a nearer rule set marking it binary decides, and the root's eol does not answer for it"},
 	} {
 		if err := os.WriteFile(filepath.Join(nested, ".gitattributes"), []byte(nearer.body), 0o644); err != nil {
 			t.Fatalf("build the nesting fixture: %v", err)
@@ -637,16 +636,16 @@ func TestTheGitAttributesPatternMatcherAnswersGitsQuestion(t *testing.T) {
 		matches bool
 		why     string
 	}{
-		{"mls/testdata/corpus/**", seed, true, "the spelling this repository uses"},
-		{"/mls/testdata/corpus/**", seed, true, "the same rule anchored at the root, which is what the old prefix comparison rejected"},
-		{"**/corpus/**", seed, true, "a leading ** skips any number of components"},
-		{"mls/testdata/corpus/*", seed, false, "a single star does not cross a separator, so this rule reaches the folders and not the seeds"},
-		{"mls/testdata/corpus/", seed, false, "a directory pattern does not recursively cover the paths inside it"},
-		{"message/testdata/corpus/**", seed, false, "another package's corpus"},
-		{"seed001", seed, true, "a pattern with no slash matches the base name at any depth"},
-		{"seed001", "mls/testdata/corpus/FuzzGroupContextRoundTrip/seed002", false, "and only that base name"},
-		{"*.proto", "protocol/message.proto", true, "the repository's other rule, on a path it covers"},
-		{"*.proto", "protocol/message.pb.go", false, "and one it does not"},
+		{pattern: "mls/testdata/corpus/**", path: seed, matches: true, why: "the spelling this repository uses"},
+		{pattern: "/mls/testdata/corpus/**", path: seed, matches: true, why: "the same rule anchored at the root, which is what the old prefix comparison rejected"},
+		{pattern: "**/corpus/**", path: seed, matches: true, why: "a leading ** skips any number of components"},
+		{pattern: "mls/testdata/corpus/*", path: seed, matches: false, why: "a single star does not cross a separator, so this rule reaches the folders and not the seeds"},
+		{pattern: "mls/testdata/corpus/", path: seed, matches: false, why: "a directory pattern does not recursively cover the paths inside it"},
+		{pattern: "message/testdata/corpus/**", path: seed, matches: false, why: "another package's corpus"},
+		{pattern: "seed001", path: seed, matches: true, why: "a pattern with no slash matches the base name at any depth"},
+		{pattern: "seed001", path: "mls/testdata/corpus/FuzzGroupContextRoundTrip/seed002", matches: false, why: "and only that base name"},
+		{pattern: "*.proto", path: "protocol/message.proto", matches: true, why: "the repository's other rule, on a path it covers"},
+		{pattern: "*.proto", path: "protocol/message.pb.go", matches: false, why: "and one it does not"},
 	} {
 		if matched := gitAttributesPatternMatches(probe.pattern, probe.path); matched != probe.matches {
 			t.Errorf("%q against %q answered %v, want %v: %s", probe.pattern, probe.path, matched, probe.matches, probe.why)
