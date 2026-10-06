@@ -657,8 +657,8 @@ func (self *ExtenderActivator) byJwt() string {
 	return self.settings.ByJwt()
 }
 
-// The dns ports this extender is listening on, in dial order (L2). Nil when
-// the caller offers none, which leaves the operator on DnsPort alone.
+// The dns ports this extender is listening on, ascending (L2). Nil when the
+// caller offers none, which leaves the operator on DnsPort alone.
 func (self *ExtenderActivator) dnsPorts() []int {
 	if self.settings.DnsPorts == nil {
 		return nil

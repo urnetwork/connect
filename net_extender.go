@@ -38,10 +38,12 @@ import (
 // hostname of the destination, so an extender sees only ciphertext.
 //
 // Three carriers reach one extender, and all three yield one reliable byte
-// stream: tcp 443 terminated TLS, udp 443 QUIC with ALPN h3, and udp 53 the
-// same QUIC over the dns packet translation. On every carrier the client sends
-// one `POST /` with the serialized ExtenderHeader as the body and reads an
-// ExtenderResponse; after that the stream carries the inner bytes raw.
+// stream: tcp 443 terminated TLS, udp 443 QUIC with ALPN h3, and the dns
+// carrier, the same QUIC over the dns packet translation on udp 4053 and, where
+// the extender binds it, on 53; one dial tries both (net_extender_dns_ports.go).
+// On every carrier the client sends one `POST /` with the serialized
+// ExtenderHeader as the body and reads an ExtenderResponse; after that the
+// stream carries the inner bytes raw.
 //
 // The outer TLS is always InsecureSkipVerify: the extender presents a
 // certificate for a spoof name it does not own. When the caller knows the
@@ -66,9 +68,10 @@ const (
 
 // Fixed carrier ports (A1, L2). The old multi-port personas are removed. A
 // record may name other ports (B2); these are what an address with no record
-// is dialed on. The dns carrier moved to the unprivileged 4053, which every
-// extender binds; 53 is reached only through a record that lists it, since
-// only the platforms that can bind it without privilege offer it.
+// is dialed on. The dns carrier is on the unprivileged 4053, which every
+// extender binds; only the sn miner also binds 53, and a client tries both
+// for every extender, whether or not a record lists 53
+// (net_extender_dns_ports.go).
 const (
 	ExtenderTcpPort  = 443
 	ExtenderQuicPort = 443
@@ -145,6 +148,13 @@ type ExtenderConfig struct {
 	// record. The outer leaf certificate must be signed by it (B3). Empty
 	// keeps the unauthenticated outer TLS of a manually configured extender.
 	PublicKey []byte
+	// The ports one dns carrier dial races, in launch order (L2), with
+	// Profile.Port the first of them. A config drawn from a directory or
+	// manual address carries the ports its record lists and then whichever
+	// of 4053 and 53 it does not (ExtenderCandidate.dnsCarrierPorts). Empty
+	// dials Profile.Port alone, which is what an exact endpoint names:
+	// ExtenderConfigs, an NLayer hop, the operator's probe of one port.
+	DnsPorts []int
 }
 
 func NewExtenderHttpClient(
@@ -432,8 +442,10 @@ func dialExtenderStream(
 	switch extenderConfig.Profile.ConnectMode {
 	case ExtenderConnectModeTcpTls:
 		return dialExtenderTcp(ctx, connectSettings, extenderConfig, extenderTlsConfig, headerBytes, extenderDial.RoundTrip)
-	case ExtenderConnectModeQuic, ExtenderConnectModeDns:
+	case ExtenderConnectModeQuic:
 		return dialExtenderQuic(ctx, connectSettings, extenderConfig, extenderTlsConfig, headerBytes, extenderDial.RoundTrip)
+	case ExtenderConnectModeDns:
+		return dialExtenderDns(ctx, connectSettings, extenderConfig, extenderTlsConfig, headerBytes, extenderDial.RoundTrip)
 	default:
 		return nil, nil, fmt.Errorf("bad connect mode %s", extenderConfig.Profile.ConnectMode)
 	}
@@ -651,7 +663,8 @@ func dialExtenderTcp(
 
 // The udp carriers: one QUIC connection with ALPN h3 straight to the extender
 // ip, the dns carrier over the packet translation first, then one H3 request
-// stream that becomes the byte stream.
+// stream that becomes the byte stream. It dials Profile.Port alone; the dns
+// carrier's ports are raced over it by dialExtenderDns.
 func dialExtenderQuic(
 	ctx context.Context,
 	connectSettings *ConnectSettings,

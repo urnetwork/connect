@@ -28,10 +28,12 @@ import (
 // single label, a bare space host -- derives nothing, and the caller then runs
 // without alt rather than dialing a guess.
 
-// The dns carrier ports (L2). 53 needs privilege to bind and reaches a host
+// The dns carrier ports (L2). 53 needs privilege to bind and reaches alt
 // through the router or the lb; 4053 is the unprivileged port alt, the connect
-// dns listener and every extender bind. A client dials 53 first when it is
-// offered, then 4053.
+// dns listener and every extender bind, and only the sn miner binds 53 as
+// well. A client dials alt on 53 first, then 4053, and an extender on the
+// ports its record lists first, then whichever of 4053 and 53 it does not
+// (net_extender_dns_ports.go).
 const (
 	DefaultDnsPort    = 53
 	DefaultWhodisPort = 4053
@@ -128,8 +130,8 @@ func altDnsPorts(altPort int, dnsPort int) []int {
 	return []int{dnsPort, DefaultWhodisPort}
 }
 
-// Dedupes and orders dns ports ascending, which is the dial order of L2: 53
-// before 4053 when both are offered. Non-positive ports are dropped.
+// Dedupes and orders dns ports ascending, which puts 53 before 4053 when both
+// are offered (L2). Ports out of range are dropped.
 func orderedDnsPorts(dnsPorts []int) []int {
 	ordered := []int{}
 	for _, dnsPort := range dnsPorts {
