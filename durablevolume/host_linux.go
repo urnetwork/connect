@@ -136,7 +136,7 @@ func (self linuxHost) DeviceUuid(uuid string) (Device, error) {
 	if stat.Mode&syscall.S_IFMT != syscall.S_IFBLK {
 		return Device{}, errors.Join(ErrIdentity, errors.New("filesystem uuid does not resolve to a block device"))
 	}
-	return deviceNumber(stat.Rdev), nil
+	return deviceNumber(uint64(stat.Rdev)), nil
 }
 
 // Available blocks/inodes use the process's available allocation, not totals.
@@ -145,10 +145,15 @@ func (self linuxHost) Filesystem(directory *os.File) (Filesystem, error) {
 	if err := syscall.Fstatfs(int(directory.Fd()), &state); err != nil {
 		return Filesystem{}, err
 	}
+	return filesystemFromStatfs(state)
+}
+
+// Kernel magic numbers retain their unsigned 32-bit identity in signed fields.
+func filesystemFromStatfs(state syscall.Statfs_t) (Filesystem, error) {
 	if state.Bsize <= 0 || state.Bavail > math.MaxUint64/uint64(state.Bsize) {
 		return Filesystem{}, errors.New("filesystem available-byte arithmetic is invalid")
 	}
-	return Filesystem{Id: state.Fsid.X__val, Type: state.Type, ReadOnly: state.Flags&1 != 0,
+	return Filesystem{Id: state.Fsid.X__val, Type: int64(uint32(state.Type)), ReadOnly: state.Flags&1 != 0,
 		AvailableBytes: state.Bavail * uint64(state.Bsize), AvailableInodes: state.Ffree}, nil
 }
 
