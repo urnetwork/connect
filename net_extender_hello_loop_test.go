@@ -992,7 +992,7 @@ func TestExtenderDirectoryJudgesARecordAgainUnderKeysReplacedBeforeItsStore(t *t
 		t.Fatal(err)
 	}
 	directory.SetRootKeys(NewExtenderRootKeySet(rootPublicKey))
-	if changed, err := directory.applyVerifiedRecord(record, body, verifiedRootKeySet, ExtenderSourceFeed); err == nil || changed {
+	if changed, err := directory.applyVerifiedRecord(record, body, verifiedRootKeySet, 0, ExtenderSourceFeed); err == nil || changed {
 		t.Fatalf("changed = %t, err = %v; expected the record refused under the keys in force", changed, err)
 	}
 	if testDirectoryAddressVerified(directory, "192.0.2.92") {
@@ -1008,7 +1008,7 @@ func TestExtenderDirectoryJudgesARecordAgainUnderKeysReplacedBeforeItsStore(t *t
 		t.Fatal(err)
 	}
 	directory.SetRootKeys(NewExtenderRootKeySet(rootPublicKey, retiredRootPublicKey))
-	if changed, err := directory.applyVerifiedRecord(record, body, verifiedRootKeySet, ExtenderSourceFeed); err != nil || !changed {
+	if changed, err := directory.applyVerifiedRecord(record, body, verifiedRootKeySet, 0, ExtenderSourceFeed); err != nil || !changed {
 		t.Fatalf("changed = %t, err = %v; expected the record to land under keys that keep its signer", changed, err)
 	}
 	if !testDirectoryAddressVerified(directory, "192.0.2.93") {
@@ -1046,7 +1046,7 @@ func TestExtenderDirectoryJudgesARevocationAgainUnderKeysReplacedBeforeItsStore(
 	}
 	// the rotation completes, retiring the key that signed the revocation
 	directory.SetRootKeys(NewExtenderRootKeySet(rootPublicKey))
-	if changed, err := directory.applyVerifiedRevocation(revocation, body, retiringRootKeySet, ExtenderSourceFeed); err == nil || changed {
+	if changed, err := directory.applyVerifiedRevocation(revocation, body, retiringRootKeySet, 0, ExtenderSourceFeed); err == nil || changed {
 		t.Fatalf("changed = %t, err = %v; expected the revocation refused under the keys in force", changed, err)
 	}
 	if state := testDirectoryState(t, directory, netip.MustParseAddr("192.0.2.94")); state != ExtenderStateActive {
