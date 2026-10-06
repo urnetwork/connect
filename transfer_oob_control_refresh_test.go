@@ -192,7 +192,6 @@ func TestApiOutOfBandControlCloseAndWaitJoinsCanceledSendControlCallback(t *test
 		releaseServer := make(chan struct{})
 		var requestEnteredOnce sync.Once
 		var releaseServerOnce sync.Once
-		defer releaseServerOnce.Do(func() { close(releaseServer) })
 		server := newFamilyHttptestServer(t, ipVersion, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 			if request.URL.Path == "/hello" {
 				response.WriteHeader(http.StatusOK)
@@ -205,7 +204,10 @@ func TestApiOutOfBandControlCloseAndWaitJoinsCanceledSendControlCallback(t *test
 			requestEnteredOnce.Do(func() { close(requestEntered) })
 			<-releaseServer
 		}))
-		defer server.Close()
+		defer closeOobHandlerFixture(
+			func() { releaseServerOnce.Do(func() { close(releaseServer) }) },
+			server.Close,
+		)
 
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()

@@ -500,9 +500,11 @@ func (r *reassemblyQueue) findCompleteUnorderedChunkSet() *chunkSet {
 	var chunks []*chunkPayloadData
 	chunks = append(chunks, r.unorderedChunks[startIdx:startIdx+nChunks]...)
 
-	r.unorderedChunks = append(
+	remainingChunks := append(
 		r.unorderedChunks[:startIdx],
 		r.unorderedChunks[startIdx+nChunks:]...)
+	clear(r.unorderedChunks[len(remainingChunks):])
+	r.unorderedChunks = remainingChunks
 
 	chunkSet := newChunkSet(0, chunks[0].payloadType)
 	chunkSet.chunks = chunks
@@ -583,8 +585,10 @@ func (r *reassemblyQueue) read(buf []byte) (int, PayloadProtocolIdentifier, erro
 		case err != nil:
 			return nTotal, 0, err
 		case isUnordered:
+			r.unorderedMID[0] = nil
 			r.unorderedMID = r.unorderedMID[1:]
 		default:
+			r.orderedMID[0] = nil
 			r.orderedMID = r.orderedMID[1:]
 			delete(r.orderedMIDMap, iSet.mid)
 			if iSet.mid == r.nextMID {
@@ -627,8 +631,10 @@ func (r *reassemblyQueue) read(buf []byte) (int, PayloadProtocolIdentifier, erro
 	case err != nil:
 		return nTotal, 0, err
 	case isUnordered:
+		r.unordered[0] = nil
 		r.unordered = r.unordered[1:]
 	default:
+		r.ordered[0] = nil
 		r.ordered = r.ordered[1:]
 		if cset.ssn == r.nextSSN {
 			r.nextSSN++
@@ -682,6 +688,7 @@ func (r *reassemblyQueue) forwardTSNForUnordered(newCumulativeTSN uint32) {
 		for _, c := range r.unorderedChunks[0 : lastIdx+1] {
 			r.subtractNumBytes(len(c.userData))
 		}
+		clear(r.unorderedChunks[:lastIdx+1])
 		r.unorderedChunks = r.unorderedChunks[lastIdx+1:]
 	}
 }

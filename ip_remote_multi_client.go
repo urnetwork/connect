@@ -17515,7 +17515,7 @@ func (self *multiClientChannel) coalesceEventBuckets() {
 		self.eventBuckets[i] = nil
 		i += 1
 	}
-	for i < len(self.eventBuckets) && minBucketCount < len(self.eventBuckets) {
+	for i < len(self.eventBuckets) && minBucketCount < len(self.eventBuckets)-i {
 		removeEventBucket(self.eventBuckets[i])
 		self.eventBuckets[i] = nil
 		i += 1
