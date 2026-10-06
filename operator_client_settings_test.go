@@ -113,7 +113,9 @@ func TestOperatorClientSettingsCompletesPartialSettingsWithoutMutatingInput(t *t
 		partial.WebRtcSettings != nil {
 		t.Fatal("completing partial settings mutated the caller")
 	}
-	if settings.ForwardBufferSettings == originalForward ||
+	if settings.ForwardBufferSettings == nil ||
+		settings.ContractManagerSettings == nil ||
+		settings.ForwardBufferSettings == originalForward ||
 		settings.ContractManagerSettings == originalContract {
 		t.Fatal("nested ownership settings were not copied")
 	}
@@ -230,6 +232,10 @@ func TestOperatorClientSettingsCopiesExactlyTheNestedSettingsItOwns(t *testing.T
 		case ownedFields[field.Name]:
 			if field.Type.Kind() != reflect.Pointer {
 				t.Errorf("%s (%s) is not a struct pointer and cannot be copied", field.Name, field.Type)
+				continue
+			}
+			if got.IsNil() {
+				t.Errorf("%s was dropped instead of copied", field.Name)
 				continue
 			}
 			if got.Pointer() == supplied.Pointer() {
