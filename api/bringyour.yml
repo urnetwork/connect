@@ -1101,6 +1101,20 @@ paths:
         limit, not a hard cap -- and an agent can settle it inline with the
         x402 round trip below.
 
+        A provider install (a device that only provides, such as an embedded
+        provider) sets `provide_intent`. Creating a top-level client with it is
+        exempt from the 100 top-level client cap and from the concurrent
+        connected client check, because providers do not count toward the
+        plan's client limit. The client is a provider install for its life: it
+        never appears in the network's peer list (`/network/peers`), does not
+        receive it, and does not count toward the 100 top-level clients that
+        keep the peer list enabled. Connecting keeps the flag honest: a client
+        that connects with provide intent (`X-UR-Provide-Intent: 1`) must
+        qualify as a public provider within a grace period, or it takes a
+        normal client slot if one is free, or it is disconnected with the
+        client limit exceeded close. A person's device that also provides
+        declares intent on its connections instead and stays a network peer.
+
         Like roles or a principal the call may not set, a `proxy_config`
         the call cannot use is refused before anything is created: the call
         answers 200 with `error.message` and no `client_id` or
@@ -6951,6 +6965,20 @@ components:
             Identity principal assigned to the client at creation, immutable after. |
             Only a network session may set this; when omitted, the session's own principal is inherited.
           type: string
+        provide_intent:
+          description: |
+            Optional, default false. The new client is a provider install: it
+            only provides publicly (public provide mode), like an embedded
+            provider. A new top-level client created with this set is exempt
+            from the 100 top-level client cap and the concurrent connected
+            client check, and is never a network peer (it is not in the peer
+            list, does not receive it, and does not count toward the 100
+            top-level clients that keep the peer list enabled). The platform
+            judges it as a provider when it connects with provide intent; see
+            `/network/auth-client`. Do not set it for a person's device that
+            also provides. Ignored when `client_id` or `source_client_id` is
+            set.
+          type: boolean
         # the proxy auth will be the by_client_jwt as username, no password
         proxy_config:
           description: Optional. |

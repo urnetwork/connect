@@ -313,6 +313,14 @@ message Auth {
     // platform counts as v4. The platform ignores the intent unless the
     // family it observed the connection arrive on agrees.
     int32 ip_family = 6;
+
+    // the client intends to provide publicly on this connection. The platform
+    // then judges the client as a provider instead of counting it toward the
+    // network's concurrent client limit. This is the frame form of the H1
+    // `X-UR-Provide-Intent: 1` header, for transports that authenticate with
+    // this frame (H3, DNS-carried H3 and the legacy H1 first frame). An old
+    // server ignores the unknown field, which counts as no intent.
+    bool provide_intent = 7;
 }
 
 
