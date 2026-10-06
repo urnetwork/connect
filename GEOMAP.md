@@ -24,7 +24,8 @@ After this program, the network locates itself from exactly three things:
 1. **GeoLite2** — city, region, country, continent, lat/lon, accuracy radius,
    ASN. Free, one license, one `geoipupdate` run. It is the *genesis* of every
    location: the prior we start from and never fully abandon.
-2. **Our operator probes** — the egress prober (`operator-proxy/egresshealth`)
+2. **Our operator probes** — the egress prober
+   (`server/qualityprobe/egresshealth`, run by taskworker)
    that routes lookups through a provider and cross-checks them, for ip
    *quality* (hosting, proxy, mobile) and egress country.
 3. **Our own pings** — provider→extender and extender→extender round trips,

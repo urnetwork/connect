@@ -213,24 +213,33 @@ reorder them.
 - The prior is a continent, not a metro. Two extenders on the same continent
   can be 100 ms apart; the probe is what tells them apart, and the prior only
   decides who gets probed first.
-- A latency sample is per address, per process and per path. It is not
-  persisted, and a path change drops it (`ExpireLatencies`): yesterday's path
-  is not today's, nor is the one before a path change. Its age is the longer
-  of what the monotonic and the wall clock say, so a host that slept past
-  `LatencyMaxAge` measures again (the monotonic clock stops while the host
-  sleeps), and a wall clock set back keeps it no longer.
+- A latency sample is per address and per process. It is not persisted:
+  yesterday's path is not today's. A path change -- a network, link or
+  quality change the host reports as one -- keeps it, and keeps every hold,
+  limit and failure count beside it: an extender that answered, failed or was
+  fast before most likely still is, and learning it all again after every
+  change costs dials and time. The sample becomes due a refresh
+  (`RefreshLatencies`): the candidate order keeps ranking by it, and the probe
+  pass that follows the first sample on the new path measures it again, the
+  new sample replacing it as it lands, so there is no time with no samples. A
+  pass counts no sample due a refresh toward its window and measures those
+  first, lowest first, so it spends its window on the samples the order ranks
+  by. Its age is the longer of what the monotonic and the wall clock say, so a
+  host that slept past `LatencyMaxAge` measures again (the monotonic clock
+  stops while the host sleeps), and a wall clock set back keeps it no longer.
 - A resume from a sleep of at least `ResumeMinSleep` (15 min) is a path change
   for measurement, so a host that wakes on the same path, with no path change
   to wake its timers, measures again within minutes rather than at the end of
   a refresh period of awake time. The probe loop reads the host clock every
   `ResumeCheckTimeout` (1 min) while it waits, and the wall clock moving past
   the monotonic one between two checks is the sleep. Once the host has stayed
-  awake a check since, the samples taken before the sleep go
-  (`ExpireSleptLatencies`), and the probe pass follows the first sample that
-  completes after the sleep, so it never probes a path that has not worked
-  since: a feed stream from before the sleep is replaced to take one. Holds,
-  the hint and its country stay. A wall clock set forward that far reads as a
-  sleep and costs one probe pass; one set back hides as much sleep.
+  awake a check since, the samples taken before the sleep are due a refresh
+  (`RefreshSleptLatencies`), still ranking until measured again, and the probe
+  pass follows the first sample that completes after the sleep, so it never
+  probes a path that has not worked since: a feed stream from before the sleep
+  is replaced to take one. Holds, limits, failure counts, the hint and its
+  country stay. A wall clock set forward that far reads as a sleep and costs
+  one probe pass; one set back hides as much sleep.
 - The hint endpoint tells a client its own continent as the operator sees it.
   That is information the operator already holds and the client's own DNS
   resolver already acted on; it is not a new disclosure in either direction.

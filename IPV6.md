@@ -265,7 +265,7 @@ wrapping rows of widget-sized dots) on 2026-09-21 on every app. Apps: android
 
 D3. Tests. A shared dual-stack helper runs a test body for v4 and v6 and
 requires IPv6 loopback; a host without it fails loudly. Tests run on
-dual-stack hosts, not GitHub CI. Scope: every connect and server/connect test
+dual-stack hosts. Scope: every connect and server/connect test
 that touches addresses, sockets or packets. Pure-logic tests are unchanged.
 
 ## 4. Wire and schema changes

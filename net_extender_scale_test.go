@@ -155,7 +155,7 @@ func TestExtenderDirectoryScaleAMillionGossipRecords(t *testing.T) {
 			continent = "EU"
 		}
 		body, publicKey := testScaleRecord(i, continent, now)
-		if changed, err := directory.applyVerifiedRecord(record, body, rootKeySet, ExtenderSourceGossip); err != nil || !changed {
+		if changed, err := directory.applyVerifiedRecord(record, body, rootKeySet, 0, ExtenderSourceGossip); err != nil || !changed {
 			t.Fatalf("record %d was not applied", i)
 		}
 		if continent == "EU" {
@@ -229,7 +229,7 @@ func TestExtenderPeerPingerScaleAHundredThousandPeers(t *testing.T) {
 			continent = "EU"
 		}
 		body, _ := testScaleRecord(i, continent, now)
-		directory.applyVerifiedRecord(record, body, rootKeySet, ExtenderSourceGossip)
+		directory.applyVerifiedRecord(record, body, rootKeySet, 0, ExtenderSourceGossip)
 		if continent == "EU" {
 			nearIps[body.Addresses[0].Ip] = true
 		}

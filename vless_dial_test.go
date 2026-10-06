@@ -404,3 +404,40 @@ func TestDirectClientStrategyDropsVless(t *testing.T) {
 		t.Fatalf("the caller's settings must not change")
 	}
 }
+
+// A strategy that refuses VLESS, as a hosted device's does, holds no VLESS
+// dialer whichever way the configurations arrive: with its settings or from
+// `SetVlessConfigs` later. With no dialer it can never dial the server. The
+// same settings without the refusal take the server.
+func TestClientStrategyDisableVlessRefusesVless(t *testing.T) {
+	vlessConfig := &VlessConfig{
+		Address:  "192.0.2.1",
+		Port:     443,
+		Id:       testVlessUserId,
+		Network:  VlessNetworkTcp,
+		Security: VlessSecurityNone,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	allowingSettings := DefaultClientStrategySettings()
+	allowingSettings.VlessConfigs = []*VlessConfig{vlessConfig}
+	allowing := NewClientStrategy(ctx, allowingSettings)
+	defer allowing.Close()
+	if vlessConfigs := allowing.VlessConfigs(); len(vlessConfigs) != 1 {
+		t.Fatalf("a strategy that allows VLESS has %d VLESS dialers, expected 1", len(vlessConfigs))
+	}
+
+	refusingSettings := DefaultClientStrategySettings()
+	refusingSettings.VlessConfigs = []*VlessConfig{vlessConfig}
+	refusingSettings.DisableVless = true
+	refusing := NewClientStrategy(ctx, refusingSettings)
+	defer refusing.Close()
+	if vlessConfigs := refusing.VlessConfigs(); len(vlessConfigs) != 0 {
+		t.Fatalf("a strategy that refuses VLESS took %d VLESS dialers from its settings", len(vlessConfigs))
+	}
+	refusing.SetVlessConfigs([]*VlessConfig{vlessConfig})
+	if vlessConfigs := refusing.VlessConfigs(); len(vlessConfigs) != 0 {
+		t.Fatalf("a strategy that refuses VLESS took %d VLESS dialers from SetVlessConfigs", len(vlessConfigs))
+	}
+}

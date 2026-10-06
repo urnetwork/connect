@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	mathrand "math/rand"
 	"net/netip"
@@ -40,7 +41,10 @@ import (
 // Methods are safe for concurrent use. The state lock is never held across a
 // call to the store or to a monitor consumer; the save runs on the internal
 // `run` goroutine started by the constructor, coalesced one save timeout after
-// a change, so a burst of applied records costs one write.
+// a change, so a burst of applied records costs one write. `Reset` writes the
+// store itself before it returns, and a save never writes a state older than
+// one already written, so the state a save read before a reset never lands
+// after it.
 
 // Where an address was learned (F2). The source is descriptive: it never
 // changes once an address is known, so an upgrade to verified keeps the origin
@@ -86,6 +90,10 @@ const ExtenderDirectorySubscribeBufferCount = 64
 // Cap of the apply-time ring (K4). The window prunes it long before this on
 // any normal feed; the cap is what bounds a flood.
 const ExtenderDirectoryEventRingCount = 1024
+
+// The answer to a record or revocation whose verification began before a
+// reset and ended after it (Reset): it is not applied.
+var errExtenderDirectoryReset = errors.New("the extender directory was reset while the message was verified")
 
 // The progress of the network client's first feed sample, which is what the
 // startup gate waits on (E4). `None` means no network client is running, so
@@ -177,10 +185,10 @@ type ExtenderDirectorySettings struct {
 	// measures the address again. The default is half the day the operator
 	// keeps pings for, so a provider's attested pings are renewed before the
 	// previous ones age out of what each derivation reads (GEOMAP §2.1). The
-	// age counts the time the host slept (extenderElapsed), a path change
-	// drops every sample whatever its age (ExpireLatencies), and a resume from
-	// a long sleep drops those taken before it (ExpireSleptLatencies). <= 0
-	// keeps a sample until the path changes or the host resumes.
+	// age counts the time the host slept (extenderElapsed). A path change, and
+	// a resume from a long sleep for the samples taken before it, keep every
+	// sample in use until a probe replaces it (RefreshLatencies,
+	// RefreshSleptLatencies). <= 0 keeps a sample until a probe replaces it.
 	LatencyMaxAge time.Duration
 	// How long an address that answered 429 with no Retry-After is left alone
 	// before the jitter, which is the same +-50 % a Retry-After gets (A12). A
@@ -275,20 +283,21 @@ type extenderDirectoryAddress struct {
 	consecutiveFailureCount int
 	holdUntilTime           time.Time
 	lastUseTime             time.Time
-	inUseCount              int
 	// the address answered 429 and is left alone until then (A12); per
 	// process, never stored, and never a failure
 	limitedUntilTime time.Time
 
 	// the latest latency sample (DESIGNNOTES4.md): the lowest rtt of one
 	// probe pass, when it was taken and whether the target co-signed a claim
-	// of that pass (GEOMAP §2.3). Per process and per path: never stored, and
-	// dropped by a path change (ExpireLatencies) and by a resume from a long
-	// sleep that followed it (ExpireSleptLatencies).
-	latency         time.Duration
-	latencyTime     time.Time
-	latencyAttested bool
-	probeCount      int
+	// of that pass (GEOMAP §2.3). Per process: never stored. A path change,
+	// and a resume from a long sleep that followed it, keep it and make it
+	// due a refresh (RefreshLatencies, RefreshSleptLatencies): it still ranks,
+	// and the probe pass measures it again, the next sample replacing it.
+	latency           time.Duration
+	latencyTime       time.Time
+	latencyAttested   bool
+	latencyRefreshDue bool
+	probeCount        int
 }
 
 // One dialable endpoint handed to the strategy and to the network client. The
@@ -322,8 +331,13 @@ type ExtenderCandidate struct {
 	// (GEOMAP §2.3), which a provider's probe pass reads to find what it has
 	// no co-signed measurement of yet.
 	LatencyAttested bool
-	Source          string
-	Verified        bool
+	// Whether the sample is due a refresh: it was taken before the last path
+	// change, or before a long sleep the host resumed from (RefreshLatencies).
+	// It still ranks, and a probe pass measures it again, as it does an
+	// address with none.
+	LatencyRefreshDue bool
+	Source            string
+	Verified          bool
 	// Whether the record has expired: the candidate is one of the retained
 	// expired identities (MaxExpiredRecordCount), which only the last tier of
 	// Candidates carries.
@@ -396,8 +410,29 @@ type ExtenderDirectory struct {
 	// the startup gate's rendezvous with the network client (E4)
 	initialSampleMonitor *MonitorValue[ExtenderInitialSampleState]
 
+	// orders the writes through the store: a save holds it from judging
+	// whether what it read is still the newest to the store's answer, so a
+	// save that read the state before a reset never lands after the reset's
+	// own (save). Taken before the state lock, never inside it.
+	saveLock sync.Mutex
+	// test seam only, nil otherwise: runs between a save's read of the state
+	// and its write, where a reset and its own save can land
+	saveReadHook func()
+
 	stateLock  sync.Mutex
 	rootKeySet *ExtenderRootKeySet
+	// advances with every Reset, which is how a record or revocation whose
+	// verification began before a reset is told apart from one that began
+	// after it (applyVerifiedRecord)
+	resetVersion uint64
+	// test seam only, nil otherwise: runs between the verification of an
+	// applied message and its apply, where a reset can land
+	applyVerifiedHook func()
+	// the live connections through each address (SetInUse), by ip whether or
+	// not the address is known: a connection outlives a reset that dropped
+	// its address, and its release must still balance its hold once the
+	// address is known again
+	ipInUseCounts map[netip.Addr]int
 	// The apply times of the records and revocations that arrived over the
 	// feed or the mesh, oldest first from eventHead, pruned to the event
 	// window (K4). Only those two sources count: a stored record loaded at
@@ -480,6 +515,7 @@ func NewExtenderDirectory(
 		changeMonitor:        NewMonitorValue[uint64](0),
 		initialSampleMonitor: NewMonitorValue[ExtenderInitialSampleState](ExtenderInitialSampleNone),
 		rootKeySet:           NewExtenderRootKeySet(),
+		ipInUseCounts:        map[netip.Addr]int{},
 		keyHexRecords:        map[string]*extenderDirectoryRecord{},
 		ipAddresses:          map[netip.Addr]*extenderDirectoryAddress{},
 		subscriptions:        map[*extenderDirectorySubscription]bool{},
@@ -587,6 +623,22 @@ func (self *ExtenderDirectory) RootKeys() *ExtenderRootKeySet {
 	return self.rootKeySet
 }
 
+// The root keys a message is verified under and the reset it is verified in,
+// read together, so the apply can tell whether a reset landed in between
+// (applyVerifiedRecord).
+func (self *ExtenderDirectory) rootKeysAndResetVersion() (*ExtenderRootKeySet, uint64) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.rootKeySet, self.resetVersion
+}
+
+// Runs the test seam between a verification and its apply, when one is set.
+func (self *ExtenderDirectory) verified() {
+	if self.applyVerifiedHook != nil {
+		self.applyVerifiedHook()
+	}
+}
+
 // Applies one signed gossip message, verifying it under the current root keys
 // and the allowed network hosts. Records applied in this phase arrive over the
 // feed; the gossip node of phase 5a applies with its own source.
@@ -620,7 +672,7 @@ func (self *ExtenderDirectory) ApplyRecord(
 	record *protocol.ExtenderRecord,
 	source string,
 ) (changed bool, err error) {
-	keySet := self.RootKeys()
+	keySet, resetVersion := self.rootKeysAndResetVersion()
 	body, err := keySet.VerifyRecord(record)
 	if err != nil {
 		return false, err
@@ -631,7 +683,8 @@ func (self *ExtenderDirectory) ApplyRecord(
 	if len(body.PublicKey) == 0 {
 		return false, fmt.Errorf("extender record carries no public key")
 	}
-	return self.applyVerifiedRecord(record, body, keySet, source)
+	self.verified()
+	return self.applyVerifiedRecord(record, body, keySet, resetVersion, source)
 }
 
 // Applies one record whose body has been verified under keySet and whose
@@ -644,11 +697,15 @@ func (self *ExtenderDirectory) ApplyRecord(
 // between it and the store, after judging every record it held. A record
 // verified under keys that are no longer in force is judged again under the
 // lock, so it never lands after them. Keys change rarely, so the second
-// verification is rarely paid.
+// verification is rarely paid. A record verified before a reset (`resetVersion`
+// is not the directory's) is dropped: it was taken from what the reset
+// cleared -- a stream or a mesh the owner is replacing -- and landing it would
+// leave the reset incomplete.
 func (self *ExtenderDirectory) applyVerifiedRecord(
 	record *protocol.ExtenderRecord,
 	body *protocol.ExtenderRecordBody,
 	keySet *ExtenderRootKeySet,
+	resetVersion uint64,
 	source string,
 ) (changed bool, err error) {
 	if source == "" {
@@ -671,6 +728,9 @@ func (self *ExtenderDirectory) applyVerifiedRecord(
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if resetVersion != self.resetVersion {
+		return false, errExtenderDirectoryReset
+	}
 	if keySet != self.rootKeySet {
 		if _, err := self.rootKeySet.VerifyRecord(record); err != nil {
 			return false, err
@@ -750,7 +810,7 @@ func (self *ExtenderDirectory) ApplyRevocationSource(
 	revocation *protocol.ExtenderRevocation,
 	source string,
 ) (changed bool, err error) {
-	keySet := self.RootKeys()
+	keySet, resetVersion := self.rootKeysAndResetVersion()
 	body, err := keySet.VerifyRevocation(revocation)
 	if err != nil {
 		return false, err
@@ -761,17 +821,20 @@ func (self *ExtenderDirectory) ApplyRevocationSource(
 	if len(body.PublicKey) == 0 {
 		return false, fmt.Errorf("extender revocation carries no public key")
 	}
-	return self.applyVerifiedRevocation(revocation, body, keySet, source)
+	self.verified()
+	return self.applyVerifiedRevocation(revocation, body, keySet, resetVersion, source)
 }
 
 // Applies one revocation whose body has been verified under keySet and whose
 // network host is allowed: what ApplyRevocationSource does once the signature
 // holds. A revocation verified under keys that SetRootKeys has replaced since
-// is judged again under the lock, as a record is (applyVerifiedRecord).
+// is judged again under the lock, and one verified before a reset is dropped,
+// as a record is (applyVerifiedRecord).
 func (self *ExtenderDirectory) applyVerifiedRevocation(
 	revocation *protocol.ExtenderRevocation,
 	body *protocol.ExtenderRevocationBody,
 	keySet *ExtenderRootKeySet,
+	resetVersion uint64,
 	source string,
 ) (changed bool, err error) {
 	keyHex := hex.EncodeToString(body.PublicKey)
@@ -780,6 +843,9 @@ func (self *ExtenderDirectory) applyVerifiedRevocation(
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if resetVersion != self.resetVersion {
+		return false, errExtenderDirectoryReset
+	}
 	if keySet != self.rootKeySet {
 		if _, err := self.rootKeySet.VerifyRevocation(revocation); err != nil {
 			return false, err
@@ -1201,7 +1267,10 @@ func (self *ExtenderDirectory) AddressLimitedUntil(ip netip.Addr) time.Time {
 }
 
 // Adjusts the in-use count of one address, which the status reports. A
-// positive delta also stamps the last use.
+// positive delta also stamps the last use. The count is kept by ip whether or
+// not the address is known, since a connection outlives a reset that dropped
+// its address (Reset): its release balances its hold, and an address learned
+// again while it lives is reported in use.
 func (self *ExtenderDirectory) SetInUse(ip netip.Addr, delta int) {
 	if !ip.IsValid() || delta == 0 {
 		return
@@ -1212,11 +1281,16 @@ func (self *ExtenderDirectory) SetInUse(ip netip.Addr, delta int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if inUseCount := max(0, self.ipInUseCounts[ip]+delta); 0 < inUseCount {
+		self.ipInUseCounts[ip] = inUseCount
+	} else {
+		delete(self.ipInUseCounts, ip)
+	}
 	address := self.ipAddresses[ip]
 	if address == nil {
+		// nothing the status shows has changed
 		return
 	}
-	address.inUseCount = max(0, address.inUseCount+delta)
 	if 0 < delta {
 		address.lastUseTime = now
 	}
@@ -1348,9 +1422,9 @@ func directorySpoofDomains(directory *ExtenderDirectory) ([]string, string) {
 // pass (DESIGNNOTES4.md, GEOMAP §2.3) -- a claim merely sent, refused or left
 // without a verdict does not count. The sample is per process and ages out
 // after LatencyMaxAge, the time the host slept included; it is never stored,
-// because yesterday's path is not today's, and a path change or a resume from
-// a long sleep drops it for the same reason (ExpireLatencies,
-// ExpireSleptLatencies).
+// because yesterday's path is not today's. It replaces the address's last
+// sample, which is how one due a refresh after a path change or a resume is
+// replaced (RefreshLatencies).
 func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, attested bool) {
 	if !ip.IsValid() || rtt <= 0 {
 		return
@@ -1368,6 +1442,7 @@ func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, a
 	address.latency = rtt
 	address.latencyTime = now
 	address.latencyAttested = attested
+	address.latencyRefreshDue = false
 	address.probeCount += 1
 	if self.log.V(2).Enabled() {
 		self.log.Infof("[extender]latency %s %s attested=%t\n", ip, rtt, attested)
@@ -1377,60 +1452,53 @@ func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, a
 	self.changedWithLock()
 }
 
-// Drops every latency sample: the path changed, and each one measured the old
-// path (DESIGNNOTES4.md §6). Every address counts as never measured from here,
-// so the candidate order stops ranking by the old path's rtt and the window
-// of the next probe pass, which follows the first sample taken on the new
-// path, is empty and measures again. The rest of the local evidence --
-// successes, failures, holds and limits -- stays.
-func (self *ExtenderDirectory) ExpireLatencies() {
-	self.expireLatencies(func(time.Time, time.Time) bool {
+// Makes every latency sample due a refresh: the path changed, and each one
+// measured the old path (DESIGNNOTES4.md §6). A sample due a refresh stays in
+// use -- the candidate order still ranks by it and the active cap still counts
+// its record measured -- until a probe measures the address again and the new
+// sample replaces it (RecordLatency), so a path change leaves no time with no
+// samples. A probe pass measures the samples due a refresh first and does not
+// count them toward its window (ProbeCandidates, probeWindowLatencies), so the
+// pass that follows the first sample on the new path measures them again. The
+// rest of the local evidence -- successes, failures, holds and limits -- stays
+// too. Nothing the order, the status or the store reads moves, so no change is
+// published.
+func (self *ExtenderDirectory) RefreshLatencies() {
+	self.refreshLatencies(func(time.Time, time.Time) bool {
 		return true
 	})
 }
 
-// Drops every latency sample the host has slept at least `minSleep` through
-// since it was taken (hostSlept): the host resumed from a sleep that long,
-// and a sample from before it is judged like one of another path
-// (DESIGNNOTES4.md §6), since the host may have woken where it measured
-// nothing. A sample taken since the host woke stays, and so does the rest of
-// the local evidence, as for a path change. A wall clock set forward reads as
-// a sleep here, and one set back hides as much sleep. A `minSleep` <= 0 drops
-// nothing.
-func (self *ExtenderDirectory) ExpireSleptLatencies(minSleep time.Duration) {
+// Makes due a refresh every latency sample the host has slept at least
+// `minSleep` through since it was taken (hostSlept): the host resumed from a
+// sleep that long, and may have woken where it measured nothing, so a sample
+// from before it is measured again as one of another path is
+// (RefreshLatencies), and stays in use until then. A sample taken since the
+// host woke is not due. A wall clock set forward reads as a sleep here, and
+// one set back hides as much sleep. A `minSleep` <= 0 makes nothing due.
+func (self *ExtenderDirectory) RefreshSleptLatencies(minSleep time.Duration) {
 	if minSleep <= 0 {
 		return
 	}
-	self.expireLatencies(func(latencyTime time.Time, now time.Time) bool {
+	self.refreshLatencies(func(latencyTime time.Time, now time.Time) bool {
 		return minSleep <= hostSlept(now, latencyTime)
 	})
 }
 
-// Drops each latency sample `expired` picks by when it was taken and the
-// time now, then rebuilds the tier index and publishes one change when any
-// went.
-func (self *ExtenderDirectory) expireLatencies(expired func(latencyTime time.Time, now time.Time) bool) {
+// Makes due a refresh each latency sample `due` picks by when it was taken and
+// the time now. Every sample stays where it is.
+func (self *ExtenderDirectory) refreshLatencies(due func(latencyTime time.Time, now time.Time) bool) {
 	now := self.settings.Now()
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	changed := false
 	for _, address := range self.ipAddresses {
-		if address.latencyTime.IsZero() || !expired(address.latencyTime, now) {
+		if address.latencyTime.IsZero() || !due(address.latencyTime, now) {
 			continue
 		}
-		address.latency = 0
-		address.latencyTime = time.Time{}
-		address.latencyAttested = false
-		changed = true
+		address.latencyRefreshDue = true
 	}
-	if !changed {
-		return
-	}
-	// a measured record that is not near or kept falls back to the rest
-	self.tierRebuildWithLock(now)
-	self.changedWithLock()
 }
 
 // The hold after `consecutiveFailureCount` failures: the base doubling per
@@ -1503,6 +1571,30 @@ func (self *ExtenderDirectory) Candidates(
 	count int,
 	exclude ...netip.Addr,
 ) []*ExtenderCandidate {
+	return self.candidates(ipVersion, count, false, exclude)
+}
+
+// The candidates of `Candidates` that a signed record verifies, in the same
+// order: a manual address no record verifies, the one unverified kind
+// `Candidates` offers, is left out. A strategy that refuses extenders
+// configured by hand (`ClientStrategySettings.DisableManualExtenders`) draws
+// from here.
+func (self *ExtenderDirectory) VerifiedCandidates(
+	ipVersion int,
+	count int,
+	exclude ...netip.Addr,
+) []*ExtenderCandidate {
+	return self.candidates(ipVersion, count, true, exclude)
+}
+
+// The candidates of `Candidates`, or of `VerifiedCandidates` with
+// `verifiedOnly`.
+func (self *ExtenderDirectory) candidates(
+	ipVersion int,
+	count int,
+	verifiedOnly bool,
+	exclude []netip.Addr,
+) []*ExtenderCandidate {
 	if count <= 0 {
 		return []*ExtenderCandidate{}
 	}
@@ -1542,10 +1634,14 @@ func (self *ExtenderDirectory) Candidates(
 			return compare(a, b)
 		}
 	}
-	usableAddresses, limitedUsableAddresses := splitExtenderLimitedAddresses(
-		self.usableAddressesWithLock(ipVersion, now, excludeIps),
-		now,
-	)
+	usable := self.usableAddressesWithLock(ipVersion, now, excludeIps)
+	if verifiedOnly {
+		// the retained expired addresses below are verified by construction
+		usable = slices.DeleteFunc(usable, func(address *extenderDirectoryAddress) bool {
+			return address.publicKeyHex == ""
+		})
+	}
+	usableAddresses, limitedUsableAddresses := splitExtenderLimitedAddresses(usable, now)
 	expiredAddresses, limitedExpiredAddresses := splitExtenderLimitedAddresses(
 		self.retainedExpiredAddressesWithLock(ipVersion, now, excludeIps),
 		now,
@@ -1688,9 +1784,11 @@ func compareExtenderVerified(a *extenderDirectoryAddress, b *extenderDirectoryAd
 
 // The proximity order of DESIGNNOTES4.md §4: the hinted continent before the
 // others before unknown, then within a tier a measured address before an
-// unmeasured one and ascending by rtt. `explore` puts the unmeasured first
-// instead, which is the probe pass asking for what it has not measured yet;
-// `attesting` counts only an attested sample as a measurement.
+// unmeasured one and ascending by rtt, a sample due a refresh ranking as it
+// stands. `explore` is the probe pass asking for what to measure: the samples
+// due a refresh first, ascending, since they lead the order until they are
+// measured again, then the unmeasured, then the rest; `attesting` counts only
+// an attested sample as a measurement.
 func (self *ExtenderDirectory) compareProximityWithLock(
 	a *extenderDirectoryAddress,
 	b *extenderDirectoryAddress,
@@ -1705,8 +1803,22 @@ func (self *ExtenderDirectory) compareProximityWithLock(
 	}
 	aLatency, aMeasured := self.latencyWithLock(a, now, attesting)
 	bLatency, bMeasured := self.latencyWithLock(b, now, attesting)
-	if aMeasured != bMeasured {
-		if aMeasured != explore {
+	if explore {
+		exploreRank := func(address *extenderDirectoryAddress, measured bool) int {
+			switch {
+			case measured && address.latencyRefreshDue:
+				return 0
+			case !measured:
+				return 1
+			default:
+				return 2
+			}
+		}
+		if aRank, bRank := exploreRank(a, aMeasured), exploreRank(b, bMeasured); aRank != bRank {
+			return aRank - bRank
+		}
+	} else if aMeasured != bMeasured {
+		if aMeasured {
 			return -1
 		}
 		return 1
@@ -1750,11 +1862,12 @@ func (self *ExtenderDirectory) latencyWithLock(
 
 // ProbeCandidates is what a probe pass measures, in the order it should
 // (DESIGNNOTES4.md §4): the hinted continent first, and within a tier the
-// addresses with no current sample before those with one, so the prior saves
-// probes rather than merely reordering them. `attesting` treats an unattested
-// sample as none, which is what a provider's pass has yet to do. A limited
-// address is left out until its backoff passes (A12): a probe of it would be
-// turned away again, and a limit is never a measurement.
+// samples due a refresh lowest first (RefreshLatencies), then the addresses
+// with no current sample, then those with one, so the prior saves probes
+// rather than merely reordering them. `attesting` treats an unattested sample
+// as none, which is what a provider's pass has yet to do. A limited address
+// is left out until its backoff passes (A12): a probe of it would be turned
+// away again, and a limit is never a measurement.
 func (self *ExtenderDirectory) ProbeCandidates(
 	ipVersion int,
 	count int,
@@ -1793,9 +1906,23 @@ func (self *ExtenderDirectory) ProbeCandidates(
 }
 
 // MeasuredLatencies is every current latency sample of a usable address of
-// one family (0 for any), which is what the probe pass counts its window
-// over. With `attesting` only attested samples count.
+// one family (0 for any), due a refresh or not, which is what the candidate
+// order ranks by. With `attesting` only attested samples count.
 func (self *ExtenderDirectory) MeasuredLatencies(ipVersion int, attesting bool) []time.Duration {
+	return self.usableLatencies(ipVersion, attesting, true)
+}
+
+// The latency samples a probe pass counts its window over (DESIGNNOTES4.md
+// §4): every current sample of a usable address of one family (0 for any)
+// that is not due a refresh, since one that is will be measured again
+// (RefreshLatencies). With `attesting` only attested samples count.
+func (self *ExtenderDirectory) probeWindowLatencies(ipVersion int, attesting bool) []time.Duration {
+	return self.usableLatencies(ipVersion, attesting, false)
+}
+
+// The current latency samples of the usable addresses of one family, with or
+// without the samples due a refresh.
+func (self *ExtenderDirectory) usableLatencies(ipVersion int, attesting bool, includeRefreshDue bool) []time.Duration {
 	now := self.settings.Now()
 
 	self.stateLock.Lock()
@@ -1803,6 +1930,9 @@ func (self *ExtenderDirectory) MeasuredLatencies(ipVersion int, attesting bool) 
 
 	latencies := []time.Duration{}
 	for _, address := range self.usableAddressesWithLock(ipVersion, now, nil) {
+		if address.latencyRefreshDue && !includeRefreshDue {
+			continue
+		}
 		if latency, measured := self.latencyWithLock(address, now, attesting); measured {
 			latencies = append(latencies, latency)
 		}
@@ -1832,6 +1962,7 @@ func (self *ExtenderDirectory) candidateWithLock(
 	if latency, measured := self.latencyWithLock(address, now, false); measured {
 		candidate.Latency = latency
 		candidate.LatencyAttested = address.latencyAttested
+		candidate.LatencyRefreshDue = address.latencyRefreshDue
 	}
 	keyRecord := self.keyHexRecords[address.publicKeyHex]
 	if keyRecord == nil || keyRecord.recordBody == nil {
@@ -2232,7 +2363,7 @@ func (self *ExtenderDirectory) Snapshot() *ExtenderDirectorySnapshot {
 			LastFailureTime: address.lastFailureTime,
 			SuccessCount:    address.successCount,
 			FailureCount:    address.failureCount,
-			InUse:           address.inUseCount,
+			InUse:           self.ipInUseCounts[address.ip],
 			LimitedUntil:    candidate.LimitedUntil,
 		}
 		if keyRecord := self.keyHexRecords[address.publicKeyHex]; keyRecord != nil && keyRecord.recordBody != nil {
@@ -2473,6 +2604,101 @@ func (self *ExtenderDirectory) changedWithLock() {
 	self.changeMonitor.Set(self.version)
 }
 
+// Returns the directory to what a fresh install starts with (the reset of the
+// account screen's extender section). Everything it learned goes: the records
+// and revocations from the feed, the mesh, the dns bootstrap, an activation's
+// sample and a share, every address with its local evidence -- successes,
+// failures, holds, limits, latency samples -- the manual addresses, the
+// continent hint and the operator's last country. `rootKeySet` replaces the
+// root keys in force, which drops whatever a hello installed; nil or empty is
+// the unconfigured state, which waits for the first hello. The store is
+// written before this returns, so a process that ends right after it starts
+// as fresh as the directory now is, and the startup gate is back where a
+// directory with no network client has it, so the client started next waits
+// it out once, as on a first run (E4).
+//
+// What stays is not knowledge of other extenders: the identities this
+// directory was told to keep (KeepPublicKey), which are this device's own
+// extender identity -- its record and any revocation, verified again under
+// the new keys, with fresh evidence for its addresses, which take the source
+// an activation applies them with -- and the settings, the active cap in
+// force, the subscriptions and the live use of each address (SetInUse).
+//
+// A record or revocation whose verification began before the reset is not
+// applied after it (applyVerifiedRecord). Anything else that writes learned
+// state -- a network client's bootstrap and feed, a gossip node -- is stopped
+// by its owner before the reset and started again after it, which is how the
+// sdk's network space makes the client relearn from scratch: an address a
+// stopped writer added after the reset would be one the reset never cleared.
+func (self *ExtenderDirectory) Reset(rootKeySet *ExtenderRootKeySet) {
+	if rootKeySet == nil {
+		rootKeySet = NewExtenderRootKeySet()
+	}
+	now := self.settings.Now()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		self.resetVersion += 1
+		self.rootKeySet = rootKeySet
+		keyHexRecords := map[string]*extenderDirectoryRecord{}
+		ipAddresses := map[netip.Addr]*extenderDirectoryAddress{}
+		for keyHex := range self.keptKeyHexes {
+			keyRecord := self.keyHexRecords[keyHex]
+			if keyRecord == nil {
+				continue
+			}
+			// judged again as SetRootKeys judges, an empty set judging nothing
+			if 0 < rootKeySet.Len() {
+				if keyRecord.record != nil {
+					if _, err := rootKeySet.VerifyRecord(keyRecord.record); err != nil {
+						keyRecord.record = nil
+						keyRecord.recordBody = nil
+					}
+				}
+				if keyRecord.revocation != nil {
+					if _, err := rootKeySet.VerifyRevocation(keyRecord.revocation); err != nil {
+						keyRecord.revocation = nil
+						keyRecord.revocationBody = nil
+					}
+				}
+			}
+			if keyRecord.record == nil && keyRecord.revocation == nil {
+				continue
+			}
+			keptIps := []netip.Addr{}
+			for _, ip := range keyRecord.ips {
+				if address := self.ipAddresses[ip]; address == nil || address.publicKeyHex != keyHex {
+					continue
+				}
+				ipAddresses[ip] = &extenderDirectoryAddress{
+					ip:           ip,
+					source:       ExtenderSourceBootstrap,
+					publicKeyHex: keyHex,
+					addTime:      now,
+				}
+				keptIps = append(keptIps, ip)
+			}
+			keyRecord.ips = keptIps
+			keyHexRecords[keyHex] = keyRecord
+		}
+		self.keyHexRecords = keyHexRecords
+		self.ipAddresses = ipAddresses
+		self.continentHint = ""
+		self.countryHint = ""
+		self.countryHintTime = time.Time{}
+		self.countryHintCurrent = false
+		clear(self.eventTimes)
+		self.eventTimes = self.eventTimes[:0]
+		self.eventHead = 0
+		self.tierRebuildWithLock(now)
+		self.changedWithLock()
+	}()
+	self.initialSampleMonitor.Set(ExtenderInitialSampleNone)
+	self.log.Infof("[extender]directory reset\n")
+	self.save()
+}
+
 // Ends the save loop after one last save of anything the loop has not written
 // yet, so a directory closed inside the coalescing window is still durable.
 func (self *ExtenderDirectory) Close() {
@@ -2557,6 +2783,12 @@ type extenderDirectoryStoreAddress struct {
 
 // Writes the current state through the store. A store failure is logged and
 // dropped: the directory is a cache, and losing a write costs a rediscovery.
+//
+// Two saves can be out at once -- the loop's and a reset's (Reset) -- and the
+// state is read before the store is called, so a save that read an older state
+// than one already written is skipped rather than written over it. The check
+// and the write are one step under the save lock, so the last write is always
+// of the newest state read.
 func (self *ExtenderDirectory) save() {
 	if self.settings.Store == nil {
 		return
@@ -2640,6 +2872,22 @@ func (self *ExtenderDirectory) save() {
 		return
 	}
 	if stateBytes == nil {
+		return
+	}
+	if self.saveReadHook != nil {
+		self.saveReadHook()
+	}
+
+	self.saveLock.Lock()
+	defer self.saveLock.Unlock()
+
+	stale := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		return version <= self.savedVersion
+	}()
+	if stale {
+		// a newer state was written since this one was read
 		return
 	}
 	// the store is an external object, so it is called with no state lock

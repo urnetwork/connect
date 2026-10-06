@@ -15,13 +15,13 @@ import (
 // path change does to the latency samples (DESIGNNOTES4.md §6).
 //
 // A latency sample aged on the monotonic clock alone, which stops while the
-// host sleeps, and a path change left it in place, so after a night's sleep
-// or a move to another network a sample of the old path still ranked as
-// fresh and filled the probe pass's window. A hold and a limit lapsed on the
-// same clock. These tests run the directory on a model of the host's clock
-// that carries a monotonic reading, as time.Now's readings do, since a fake
-// clock of wall readings alone already compares by the wall clock and cannot
-// show any of it.
+// host sleeps, so after a night's sleep a sample still ranked as fresh and
+// filled the probe pass's window. A hold and a limit lapsed on the same clock.
+// A path change keeps every sample in use but due a refresh, so the candidate
+// order still ranks by it and the probe pass measures it again. These tests
+// run the directory on a model of the host's clock that carries a monotonic
+// reading, as time.Now's readings do, since a fake clock of wall readings
+// alone already compares by the wall clock and cannot show any of it.
 
 // A host's clock as time.Now reads it in a running process: each reading
 // carries a monotonic reading beside its wall one, and Go compares and
@@ -328,57 +328,150 @@ func TestExtenderDirectoryCountryAgesWhileTheHostSleeps(t *testing.T) {
 	}
 }
 
-// A path change drops every sample, attested or not, and nothing else: each
-// one measured the old path. The successes, holds and limits stay, the change
-// is published once, and a sample taken on the new path is current.
-func TestExtenderDirectoryExpireLatenciesDropsEverySample(t *testing.T) {
+// The samples each candidate carries, by ip, and which of them are due a
+// refresh.
+func testCandidateSamples(candidates []*ExtenderCandidate) (map[string]time.Duration, map[string]bool) {
+	ipLatencies := map[string]time.Duration{}
+	ipRefreshDues := map[string]bool{}
+	for _, candidate := range candidates {
+		ipLatencies[candidate.Ip.String()] = candidate.Latency
+		ipRefreshDues[candidate.Ip.String()] = candidate.LatencyRefreshDue
+	}
+	return ipLatencies, ipRefreshDues
+}
+
+// Fails unless the candidates carry exactly the expected samples, each due a
+// refresh as expected, and none for any other candidate.
+func assertTestCandidateSamples(
+	t *testing.T,
+	what string,
+	candidates []*ExtenderCandidate,
+	expectedIpLatencies map[string]time.Duration,
+	expectedIpRefreshDues map[string]bool,
+) {
+	t.Helper()
+	ipLatencies, ipRefreshDues := testCandidateSamples(candidates)
+	for _, candidate := range candidates {
+		ip := candidate.Ip.String()
+		if ipLatencies[ip] != expectedIpLatencies[ip] || ipRefreshDues[ip] != expectedIpRefreshDues[ip] {
+			t.Fatalf(
+				"%s: samples = %v, due a refresh = %v, expected %v due %v",
+				what,
+				ipLatencies,
+				ipRefreshDues,
+				expectedIpLatencies,
+				expectedIpRefreshDues,
+			)
+		}
+	}
+}
+
+// The bug: a path change dropped every sample, so the candidate order fell
+// back to the last success and the probe pass had to measure every extender
+// again before any ranked by rtt. A path change keeps every sample in use, due
+// a refresh, and the rest of the local evidence with it: the order still ranks
+// by the samples, the status shows them and nothing is published. The probe
+// pass counts none of them toward its window and measures them first, lowest
+// first, and a sample taken on the new path replaces one.
+func TestExtenderDirectoryRefreshLatenciesKeepsEverySample(t *testing.T) {
 	directory, _ := newTestProximityDirectory(t)
 	heldIp := netip.MustParseAddr("192.0.2.4")
+	limitedIp := netip.MustParseAddr("192.0.2.5")
 	directory.AddManual(heldIp)
+	directory.AddManual(limitedIp)
+	directory.RecordFailure(heldIp, ExtenderConnectModeTcpTls)
 	directory.RecordFailure(heldIp, ExtenderConnectModeTcpTls)
 	directory.RecordLatency(netip.MustParseAddr("192.0.2.3"), 20*time.Millisecond, true)
 	directory.RecordLatency(netip.MustParseAddr("192.0.2.1"), 80*time.Millisecond, false)
 	directory.RecordSuccess(netip.MustParseAddr("192.0.2.1"), ExtenderConnectModeTcpTls)
-	limitedUntil := directory.RecordLimited(netip.MustParseAddr("192.0.2.2"), 30*time.Second)
-	assertIpOrder(t, directory.Candidates(4, 8), "192.0.2.3", "192.0.2.1", "192.0.2.2")
+	limitedUntil := directory.RecordLimited(limitedIp, 30*time.Second)
+	assertIpOrder(t, directory.Candidates(4, 8), "192.0.2.3", "192.0.2.1", "192.0.2.2", "192.0.2.5")
+	heldEntry := testDirectoryEntry(t, directory, heldIp)
 	version, _ := directory.ChangeMonitor().Get()
 
-	directory.ExpireLatencies()
-	if after, _ := directory.ChangeMonitor().Get(); after != version+1 {
-		t.Fatalf("version = %d after the drop, expected one change from %d", after, version)
-	}
-	// unmeasured, the order falls to the last success, and the limited
-	// address stays last
+	directory.RefreshLatencies()
+	// the order still ranks by the samples, and the limited address stays
+	// last
 	candidates := directory.Candidates(4, 8)
-	assertIpOrder(t, candidates, "192.0.2.1", "192.0.2.3", "192.0.2.2")
-	for _, candidate := range candidates {
-		if candidate.Latency != 0 || candidate.LatencyAttested {
-			t.Fatalf("%s keeps a sample of the old path: %s attested=%t", candidate.Ip, candidate.Latency, candidate.LatencyAttested)
+	assertIpOrder(t, candidates, "192.0.2.3", "192.0.2.1", "192.0.2.2", "192.0.2.5")
+	assertTestCandidateSamples(
+		t,
+		"after the path change",
+		candidates,
+		map[string]time.Duration{"192.0.2.3": 20 * time.Millisecond, "192.0.2.1": 80 * time.Millisecond},
+		map[string]bool{"192.0.2.3": true, "192.0.2.1": true},
+	)
+	if !candidates[0].LatencyAttested {
+		t.Fatal("the attested sample lost its attestation")
+	}
+	if after, _ := directory.ChangeMonitor().Get(); after != version {
+		t.Fatalf("version = %d after the path change, expected no change from %d", after, version)
+	}
+	if entry := testDirectoryEntry(t, directory, netip.MustParseAddr("192.0.2.3")); entry.Latency != 20*time.Millisecond {
+		t.Fatalf("the status shows %s, expected the sample kept", entry.Latency)
+	}
+	for _, c := range []struct {
+		attesting bool
+		count     int
+	}{
+		{attesting: false, count: 2},
+		{attesting: true, count: 1},
+	} {
+		if latencies := directory.MeasuredLatencies(4, c.attesting); len(latencies) != c.count {
+			t.Fatalf("latencies = %v attesting=%t, expected %d kept", latencies, c.attesting, c.count)
+		}
+		if latencies := directory.probeWindowLatencies(4, c.attesting); len(latencies) != 0 {
+			t.Fatalf("window = %v attesting=%t, expected no sample due a refresh to count", latencies, c.attesting)
 		}
 	}
-	for _, attesting := range []bool{false, true} {
-		if latencies := directory.MeasuredLatencies(4, attesting); len(latencies) != 0 {
-			t.Fatalf("latencies = %v attesting=%t, expected none", latencies, attesting)
-		}
-	}
-	assertIpOrder(t, directory.ProbeCandidates(4, 8, true), "192.0.2.1", "192.0.2.3")
+	// the probe pass measures the samples due a refresh first, lowest first,
+	// then the unmeasured; a provider's pass counts the unattested one as none
+	assertIpOrder(t, directory.ProbeCandidates(4, 8, false), "192.0.2.3", "192.0.2.1", "192.0.2.2")
+	assertIpOrder(t, directory.ProbeCandidates(4, 8, true), "192.0.2.3", "192.0.2.1", "192.0.2.2")
+	// the rest of the local evidence stays
 	if entry := testDirectoryEntry(t, directory, netip.MustParseAddr("192.0.2.1")); entry.SuccessCount != 1 {
 		t.Fatalf("success count = %d, expected the success to stay", entry.SuccessCount)
 	}
-	if until := directory.AddressLimitedUntil(netip.MustParseAddr("192.0.2.2")); !until.Equal(limitedUntil) {
+	if until := directory.AddressLimitedUntil(limitedIp); !until.Equal(limitedUntil) {
 		t.Fatalf("limited until %s, expected the limit to stay at %s", until, limitedUntil)
 	}
 	if state := testDirectoryState(t, directory, heldIp); state != ExtenderStateHold {
 		t.Fatalf("state = %s, expected the hold to stay", state)
 	}
-
-	// nothing left to drop is no change
-	directory.ExpireLatencies()
-	if after, _ := directory.ChangeMonitor().Get(); after != version+1 {
-		t.Fatalf("version = %d after a drop of nothing, expected %d", after, version+1)
+	if entry := testDirectoryEntry(t, directory, heldIp); entry.FailureCount != heldEntry.FailureCount || !entry.LastFailureTime.Equal(heldEntry.LastFailureTime) {
+		t.Fatalf("failures = %d at %s, expected %d at %s", entry.FailureCount, entry.LastFailureTime, heldEntry.FailureCount, heldEntry.LastFailureTime)
 	}
-	directory.RecordLatency(netip.MustParseAddr("192.0.2.3"), 10*time.Millisecond, false)
-	assertIpOrder(t, directory.Candidates(4, 8), "192.0.2.3", "192.0.2.1", "192.0.2.2")
+
+	// a sample on the new path replaces the old one and counts toward the
+	// window; the other stays due
+	directory.RecordLatency(netip.MustParseAddr("192.0.2.1"), 10*time.Millisecond, false)
+	candidates = directory.Candidates(4, 8)
+	assertIpOrder(t, candidates, "192.0.2.1", "192.0.2.3", "192.0.2.2", "192.0.2.5")
+	assertTestCandidateSamples(
+		t,
+		"after a sample on the new path",
+		candidates,
+		map[string]time.Duration{"192.0.2.1": 10 * time.Millisecond, "192.0.2.3": 20 * time.Millisecond},
+		map[string]bool{"192.0.2.3": true},
+	)
+	if latencies := directory.probeWindowLatencies(4, false); len(latencies) != 1 || latencies[0] != 10*time.Millisecond {
+		t.Fatalf("window = %v, expected the new sample alone", latencies)
+	}
+	assertIpOrder(t, directory.ProbeCandidates(4, 8, false), "192.0.2.3", "192.0.2.2", "192.0.2.1")
+
+	// another path change makes the new sample due too, and changes nothing
+	// else either
+	directory.RefreshLatencies()
+	if after, _ := directory.ChangeMonitor().Get(); after != version+1 {
+		t.Fatalf("version = %d, expected the one change of the sample from %d", after, version)
+	}
+	assertTestCandidateSamples(
+		t,
+		"after a second path change",
+		directory.Candidates(4, 8),
+		map[string]time.Duration{"192.0.2.1": 10 * time.Millisecond, "192.0.2.3": 20 * time.Millisecond},
+		map[string]bool{"192.0.2.1": true, "192.0.2.3": true},
+	)
 }
 
 // A network client that owns its probe pass, with no goroutines: the pass and
@@ -428,15 +521,24 @@ func newTestSampleClockProbeLog() *testProbeLog {
 	})
 }
 
-// The bug's other half: a path change left the samples of the old path in
-// place, so the probe pass that follows the first sample on the new path found
-// its window full of them and measured nothing, and the candidate order kept
-// ranking the new path by the old one's rtt. The path change drops them now,
-// and that pass measures again.
+// Sets the rtt each ip answers the probes with from here on.
+func (self *testProbeLog) setRtts(rtts map[string]time.Duration) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.rtts = rtts
+}
+
+// A path change keeps the samples of the old path in use: the candidate order
+// ranks by them at once. Before, it dropped them, and the order fell back to
+// the unmeasured one until the probe pass had measured again. The pass that
+// follows the first sample on the new path measures both again, though both
+// were current, and each new sample replaces an old one as it lands, so no
+// candidate goes without one in between. Here the new path reverses the two.
 func TestExtenderNetworkClientMeasuresAgainAfterAPathChange(t *testing.T) {
 	clock := newTestClock()
 	probes := newTestSampleClockProbeLog()
 	networkClient := newTestSampleClockProbeClient(t, clock.Now, clock.advance, probes)
+	directory := networkClient.directory
 
 	networkClient.probePass()
 	if count := probes.count(); count != 2 {
@@ -448,18 +550,55 @@ func TestExtenderNetworkClientMeasuresAgainAfterAPathChange(t *testing.T) {
 		t.Fatalf("probes = %d, expected none with the window full", count)
 	}
 
+	probes.setRtts(map[string]time.Duration{
+		"192.0.2.10": 40 * time.Millisecond,
+		"192.0.2.11": 15 * time.Millisecond,
+	})
 	networkClient.networkChanged()
-	for _, candidate := range networkClient.directory.Candidates(4, 8) {
-		if candidate.Latency != 0 {
-			t.Fatalf("%s keeps the old path's sample %s", candidate.Ip, candidate.Latency)
-		}
+	candidates := directory.Candidates(4, 8)
+	assertIpOrder(t, candidates, "192.0.2.10", "192.0.2.11")
+	assertTestCandidateSamples(
+		t,
+		"after the path change",
+		candidates,
+		map[string]time.Duration{"192.0.2.10": 20 * time.Millisecond, "192.0.2.11": 25 * time.Millisecond},
+		map[string]bool{"192.0.2.10": true, "192.0.2.11": true},
+	)
+
+	// the samples the candidates carry as each probe of the next pass starts
+	probeIpLatencies := []map[string]time.Duration{}
+	probe := networkClient.settings.Probe
+	networkClient.settings.Probe = func(ctx context.Context, candidate *ExtenderCandidate, attestor *ExtenderProbeAttestor) (time.Duration, ExtenderPingOutcome, error) {
+		ipLatencies, _ := testCandidateSamples(directory.Candidates(4, 8))
+		probeIpLatencies = append(probeIpLatencies, ipLatencies)
+		return probe(ctx, candidate, attestor)
 	}
 	networkClient.probePass()
 	if count := probes.count(); count != 4 {
 		t.Fatalf("probes = %d, expected the pass after the path change to measure both again", count)
 	}
-	if latencies := networkClient.directory.MeasuredLatencies(4, false); len(latencies) != 2 {
-		t.Fatalf("latencies = %v, expected the new path's two", latencies)
+	// the lowest sample due a refresh is measured first, and the other keeps
+	// its old sample until its own probe
+	if len(probeIpLatencies) != 2 ||
+		probeIpLatencies[0]["192.0.2.10"] != 20*time.Millisecond ||
+		probeIpLatencies[0]["192.0.2.11"] != 25*time.Millisecond ||
+		probeIpLatencies[1]["192.0.2.10"] != 40*time.Millisecond ||
+		probeIpLatencies[1]["192.0.2.11"] != 25*time.Millisecond {
+		t.Fatalf("samples at each probe = %v, expected both old ones at the first, then .10's new one beside .11's old one", probeIpLatencies)
+	}
+	candidates = directory.Candidates(4, 8)
+	assertIpOrder(t, candidates, "192.0.2.11", "192.0.2.10")
+	assertTestCandidateSamples(
+		t,
+		"after the pass",
+		candidates,
+		map[string]time.Duration{"192.0.2.10": 40 * time.Millisecond, "192.0.2.11": 15 * time.Millisecond},
+		map[string]bool{},
+	)
+	// nothing is due any more: the next pass measures nothing
+	networkClient.probePass()
+	if count := probes.count(); count != 4 {
+		t.Fatalf("probes = %d, expected one pass to measure again", count)
 	}
 }
 

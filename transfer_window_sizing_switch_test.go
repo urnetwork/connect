@@ -32,9 +32,9 @@ func TestTheWindowSizingSwitchOffIsTodaysBehaviour(t *testing.T) {
 	// Both facts in one place: what the tree ships today, and that the
 	// rollback still reaches exactly what it shipped before. Reading the
 	// default and asserting it was off is what made this row red the moment
-	// the rule landed, which §0.2 of THROUGHPUT-TESTGAPS is about — the
-	// workflow runs the whole package on every push, so one row red by
-	// construction masks every genuine failure in a full run.
+	// the rule landed, which §0.2 of THROUGHPUT-TESTGAPS is about — one row
+	// red by construction masks every genuine failure in a full run of the
+	// package.
 	if shipped := DefaultSendBufferSettings().WindowSizing; shipped != WindowSizingFromDelivery {
 		t.Errorf(
 			"the shipping window sizing policy is %d rather than from-delivery. If the rule was rolled back deliberately, this row's framing is what needs updating; if it changed by accident, the whole program's landing is off",

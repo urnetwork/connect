@@ -532,7 +532,7 @@ func TestExtenderDirectoryEventRingStaysBoundedUnderAFlood(t *testing.T) {
 	rootKeySet := directory.RootKeys()
 	for i := range 10 * ExtenderDirectoryEventRingCount {
 		body, _ := testScaleRecord(i, "NA", now)
-		directory.applyVerifiedRecord(record, body, rootKeySet, ExtenderSourceGossip)
+		directory.applyVerifiedRecord(record, body, rootKeySet, 0, ExtenderSourceGossip)
 		directory.stateLock.Lock()
 		eventCount := len(directory.eventTimes)
 		directory.stateLock.Unlock()

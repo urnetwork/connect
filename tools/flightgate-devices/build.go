@@ -102,10 +102,8 @@ func buildItem(args []string) error {
 			return fmt.Errorf("apply %s source patch: %v: %s", name, err, out)
 		}
 	}
-	for _, sibling := range []string{"glog", "goidenticons", "proxy", "operator-proxy", "userwireguard", "sn", "warp"} {
-		if err := os.Symlink(filepath.Join(*tree, sibling), filepath.Join(root, sibling)); err != nil {
-			return err
-		}
+	if err := linkBuildSiblings(*tree, root); err != nil {
+		return err
 	}
 	androidApp := filepath.Join(root, "android", "app")
 	androidHome := os.Getenv("ANDROID_HOME")
@@ -188,6 +186,20 @@ func buildItem(args []string) error {
 		return err
 	}
 	fmt.Printf("AAR SHA-256: %s\nAPK SHA-256: %s\n%s\n", aarHash, apkHash, kept)
+	return nil
+}
+
+// Links the shared sibling checkouts from tree into a frozen build root, beside
+// its detached connect, sdk and android worktrees, so their relative paths
+// resolve: the module replace directives (the sdk build module replaces glog,
+// goidenticons and gvisor with ../../<name>) and BRINGYOUR_HOME/warp, where the
+// Android build runs warpctl.
+func linkBuildSiblings(tree string, root string) error {
+	for _, sibling := range []string{"glog", "goidenticons", "gvisor", "proxy", "userwireguard", "sn", "warp"} {
+		if err := os.Symlink(filepath.Join(tree, sibling), filepath.Join(root, sibling)); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
