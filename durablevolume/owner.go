@@ -9,6 +9,7 @@ import (
 )
 
 // Access determines the lease and whether available write reserve is required.
+// Initial writable admission also observes an actual bounded write and sync.
 type Access uint8
 
 const (
@@ -73,7 +74,8 @@ type Filesystem struct {
 }
 
 // Host supplies kernel facts only. It cannot replace protected file reads,
-// marker hashes, path checks, leases or descriptor ownership with a verdict.
+// write probes, marker hashes, path checks, leases or descriptor ownership
+// with a verdict.
 // Implementations must support concurrent calls and return finite snapshots.
 type Host interface {
 	Mounts() ([]Mount, error)
@@ -201,7 +203,8 @@ func (self *Owner) Check() error {
 	return self.release(self.check(self.access == ReadWrite))
 }
 
-// A read-only or snapshot lease never admits a custody mutation.
+// Fresh bounded write/sync health is required before publication or external
+// handoff. A read-only or snapshot lease never admits a custody mutation.
 func (self *Owner) CheckWrite() error {
 	if err := self.borrow(); err != nil {
 		return err
@@ -209,7 +212,19 @@ func (self *Owner) CheckWrite() error {
 	if self.access != ReadWrite {
 		return self.release(errors.New("durable volume owner does not permit writes"))
 	}
-	return self.release(self.check(true))
+	return self.release(self.checkWrite())
+}
+
+// Probe only explicit write admission; ordinary identity/capacity checks do
+// not mutate storage. A slow probe cannot acknowledge replaced custody.
+func (self *Owner) checkWrite() error {
+	if err := self.check(true); err != nil {
+		return err
+	}
+	if err := self.writeHealth(); err != nil {
+		return err
+	}
+	return self.check(true)
 }
 
 // Identity-only admission permits inspection under read-only/full conditions.
