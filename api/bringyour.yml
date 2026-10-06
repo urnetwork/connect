@@ -12578,6 +12578,9 @@ components:
         chain_id:
           description: EVM chain id of the subnet contract chain.
           type: integer
+        genesis_hash:
+          description: Genesis block hash of the subnet chain, 0x and 64 lowercase hex digits, which with chain_id and netuid names the subnet; absent when unset.
+          type: string
         contract_address:
           description: 0x-hex EVM address of the subnet contract.
           type: string
