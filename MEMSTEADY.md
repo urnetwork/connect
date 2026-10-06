@@ -331,8 +331,12 @@ Every MEMSTEADY device measurement is restricted to this exact allowlist:
 
 | Role | Serial | Model |
 |---|---|---|
-| `device-a` | `3B161FDJG001KT` | Pixel 8 Pro |
-| `device-b` | `R5CX21FY6ND` | Galaxy S24 Ultra |
+| `device-a` | first in `android.performance_device_serials` | Pixel 8 Pro |
+| `device-b` | second in `android.performance_device_serials` | Galaxy S24 Ultra |
+
+The serials live in tests.yml (`vault/main/tests.yml`, beside
+`android.unlock_code`) and are read through `tests/read-tests-config.sh`; no
+repository writes them.
 
 Preflight must require both serials in `adb devices -l` with state `device`.
 Per the audit owner's 2026-09-17 instruction, ignore all other attached serials

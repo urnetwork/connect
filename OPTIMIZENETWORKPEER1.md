@@ -399,16 +399,19 @@ Current authorized physical endpoints are:
 
 | Role | Model | Explicit identifier | Status |
 |------|-------|---------------------|--------|
-| Android | Pixel 8 Pro (`husky`) | `3B161FDJG001KT` | Authorized; every command must use `adb -s 3B161FDJG001KT` |
-| Android | Samsung S24 Ultra (`SM-S928U1`) | `R5CX21FY6ND` | Authorized for the 2026-07-28 bidirectional contract/page matrix; every command must use `adb -s R5CX21FY6ND` |
+| Android | Pixel 8 Pro (`husky`) | first in `android.performance_device_serials` (`$PIXEL` below) | Authorized; every command must use `adb -s "$PIXEL"` |
+| Android | Samsung S24 Ultra (`SM-S928U1`) | second in `android.performance_device_serials` (`$SAMSUNG` below) | Authorized for the 2026-07-28 bidirectional contract/page matrix; every command must use `adb -s "$SAMSUNG"` |
 | Apple | iPhone 16 Pro Max (`iPhone17,2`) | `00008140-001679DE0893C01C` | Authorized when physically connected and available for required taps |
 
 Do not use an unscoped `adb` discovery or mutation command. Address only the
 explicit device under test:
 
 ```bash
-adb -s 3B161FDJG001KT get-state
-adb -s R5CX21FY6ND get-state
+# from the workspace root: the serials live in tests.yml, not in the repositories
+SERIALS=$(tests/read-tests-config.sh get android.performance_device_serials)
+PIXEL=${SERIALS%% *}; SAMSUNG=${SERIALS##* }
+adb -s "$PIXEL" get-state
+adb -s "$SAMSUNG" get-state
 ```
 
 Notes that matter for reproduction:
@@ -465,8 +468,8 @@ which is present locally — so `install -r` over the store build keeps app data
 
 ```bash
 APK=$(ls -t /Users/brien/urnetwork/android/app/app/build/outputs/apk/play/release/*arm64*.apk | head -1)
-adb -s 3B161FDJG001KT install -r "$APK"
-adb -s 3B161FDJG001KT shell monkey \
+adb -s "$PIXEL" install -r "$APK"
+adb -s "$PIXEL" shell monkey \
   -p com.bringyour.network -c android.intent.category.LAUNCHER 1
 ```
 
@@ -531,8 +534,8 @@ Rebuild + redeploy after changing verbosity (it is compiled in).
 Capture the authorized Pixel log:
 
 ```bash
-adb -s 3B161FDJG001KT logcat -v threadtime -s GoLog > pixel.log &
-# clear first with: adb -s 3B161FDJG001KT logcat -c
+adb -s "$PIXEL" logcat -v threadtime -s GoLog > pixel.log &
+# clear first with: adb -s "$PIXEL" logcat -c
 ```
 
 ---
@@ -557,7 +560,7 @@ range is reserved and never publicly routable, so nothing real is shadowed.
   - `POST http://198.18.0.1/…` with a body → upload sink, replies with the count.
 - Drive a URL from the client with:
   ```bash
-  adb -s 3B161FDJG001KT shell "am start -a android.intent.action.VIEW -d 'http://198.18.0.1/download/500000000'"
+  adb -s "$PIXEL" shell "am start -a android.intent.action.VIEW -d 'http://198.18.0.1/download/500000000'"
   ```
 - Confirm it lands on the explicitly selected provider using that provider's
   own log/diagnostic surface.
@@ -569,8 +572,8 @@ over a fixed window during a sustained download; that is the app-visible tunnel
 throughput.
 
 ```bash
-read_rx(){ adb -s 3B161FDJG001KT shell "cat /proc/net/dev" | grep -E "tun1:" | sed 's/.*tun1: *//' | awk '{print $1}'; }
-adb -s 3B161FDJG001KT shell "am start -a android.intent.action.VIEW -d 'http://198.18.0.1/download/800000000'"
+read_rx(){ adb -s "$PIXEL" shell "cat /proc/net/dev" | grep -E "tun1:" | sed 's/.*tun1: *//' | awk '{print $1}'; }
+adb -s "$PIXEL" shell "am start -a android.intent.action.VIEW -d 'http://198.18.0.1/download/800000000'"
 sleep 3; R1=$(read_rx); T1=$(date +%s.%N)
 sleep 8; R2=$(read_rx); T2=$(date +%s.%N)
 python3 -c "print(f'{($R2-$R1)/($T2-$T1)/1024/1024:.2f} MiB/s')"
@@ -595,11 +598,11 @@ authorized network peer:
 
 ```bash
 # dump the current screen's tappable text + bounds:
-adb -s 3B161FDJG001KT exec-out uiautomator dump /dev/tty | \
+adb -s "$PIXEL" exec-out uiautomator dump /dev/tty | \
   python3 -c 'import sys,re;[print(repr(m.group(1)),m.group(2)) for m in re.finditer(r"text=\"([^\"]{1,40})\"[^>]*bounds=\"(\[[0-9,\[\]]+\])\"",sys.stdin.read()) if m.group(1).strip()]'
 # tap "Change" (center of its bounds), then the intended current
 # "Network peers" row.
-adb -s 3B161FDJG001KT shell input tap <cx> <cy>
+adb -s "$PIXEL" shell input tap <cx> <cy>
 ```
 Verify with a UI dump showing "Connected to 1 provider" and with `routing ok`
 for the peer selected in the current session. Never reuse a historical peer id
@@ -660,8 +663,8 @@ Installed via `SettingEngine.SetNet(iceNet)`; a no-op on desktop/server where
 
 **Verify on-device** after redeploy:
 ```bash
-adb -s 3B161FDJG001KT logcat -d -s GoLog | grep "\[ice-if\]"   # synthetic en0 addrs=[192.168.1.217/32]
-adb -s 3B161FDJG001KT logcat -d -s GoLog | grep -iE "state changed: connected|valid candidate pair|pion:sctp.*sending ppi"
+adb -s "$PIXEL" logcat -d -s GoLog | grep "\[ice-if\]"   # synthetic en0 addrs=[192.168.1.217/32]
+adb -s "$PIXEL" logcat -d -s GoLog | grep -iE "state changed: connected|valid candidate pair|pion:sctp.*sending ppi"
 ```
 
 **Measured outcome (2026-07-25):** the fix works at the ICE/data layer.
@@ -1421,8 +1424,8 @@ successfully before the physical install. No ordinary `t.Run` was added.
 The first physical network-peer matrix run on **cellular** rather than the
 home Wi-Fi lab of §1. Both authorized devices were on T-Mobile IPv6-only
 cellular with 464XLAT (global IPv6 on `rmnet`, RFC 7335 `192.0.0.x` from the
-CLAT), on the same signed release. Samsung `R5CX21FY6ND` selected the Pixel
-`3B161FDJG001KT` under **Network peers**; the UI confirmed "Connected to 1
+CLAT), on the same signed release. The Samsung selected the Pixel under
+**Network peers**; the UI confirmed "Connected to 1
 provider".
 
 Chrome was cleared to a cold profile and each site loaded once. Load time is
@@ -1740,8 +1743,8 @@ hop the platform retired cannot be resurrected by a later proof.
 
 ### 11.3 Measured on the two authorized cellular devices
 
-Same devices, same topology, same method as §10.1 — Samsung `R5CX21FY6ND`
-client, Pixel `3B161FDJG001KT` provider, cold Chrome, each site once:
+Same devices, same topology, same method as §10.1 — Samsung client, Pixel
+provider, cold Chrome, each site once:
 
 | Site | §10 relay | With P2P | Change |
 |---|---:|---:|---:|

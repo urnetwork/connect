@@ -827,8 +827,8 @@ func memsteadyReport(args []string) error {
 // are "label=apk-path" pairs, in order.
 func runMemsteadySeries(args []string) error {
 	fs := flag.NewFlagSet("memsteady-series", flag.ContinueOnError)
-	deviceA := fs.String("device-a", "3B161FDJG001KT", "device-a serial")
-	deviceB := fs.String("device-b", "R5CX21FY6ND", "device-b serial")
+	deviceA := fs.String("device-a", serialForRole("device-a"), "device-a serial (default: the first in android.performance_device_serials)")
+	deviceB := fs.String("device-b", serialForRole("device-b"), "device-b serial (default: the second in android.performance_device_serials)")
 	nameA := fs.String("name-a", "Pixel", "device-a's device name substring as a peer")
 	nameB := fs.String("name-b", "Samsung", "device-b's device name substring as a peer")
 	out := fs.String("out", "", "series directory")
