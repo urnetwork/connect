@@ -18,14 +18,23 @@ package protocol_test
 // The collision still exists in any binary that links connect and the message module, because
 // message.proto keeps its proto package and its message names. The message repository checks
 // that these names still diverge from those messages; here the names are pinned by the
-// transcription below, and the last test checks that connect no longer registers the schema.
+// transcription below. The last two tests check that connect registers neither the schema nor any
+// name the schema declared.
 
 import (
 	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"slices"
 	"testing"
 
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -156,10 +165,127 @@ func TestUrmessageCodePointsStayInsideTheReservedBlock(t *testing.T) {
 	}
 }
 
+// The package-scoped full names message.proto declared when it left connect: its 52 messages, its
+// 2 enums, and the 21 values of those enums, which proto3 scopes to the proto package and not to
+// the enum. They are transcribed from the descriptor connect b65ce856 registered for message.proto
+// (sha256 fba4eba3...b302), and a text reading of that file gives the same 75. It declares no
+// service, no extension and no nested type, so no other name of it can collide except through one
+// of these.
+//
+// message.proto keeps proto package bringyour in github.com/urnetwork/message/protocol, and so do
+// connect's own proto files. Before the move, protoc compiled message.proto together with them
+// (protocol/Makefile builds *.proto), so a second declaration of one of these names failed the
+// generation. Now nothing in connect sees message.proto, and this list is what holds the rule.
+// The message repository's schema is append-only, so a name it adds later is held there, by its
+// single-registration check and by the init of every binary that links both modules.
+var messagingSchemaNames = []protoreflect.FullName{
+	// messages
+	"bringyour.Backpressure",
+	"bringyour.BlobEndpoint",
+	"bringyour.BlobGrantRequest",
+	"bringyour.BlobGrantResponse",
+	"bringyour.Capabilities",
+	"bringyour.CapabilityChange",
+	"bringyour.CreateGroupRequest",
+	"bringyour.CreateGroupResponse",
+	"bringyour.Drain",
+	"bringyour.EpochKeyDelivery",
+	"bringyour.FetchAttestation",
+	"bringyour.FetchRequest",
+	"bringyour.FetchResponse",
+	"bringyour.GroupRecords",
+	"bringyour.GroupStatusRequest",
+	"bringyour.GroupStatusResponse",
+	"bringyour.HelloRequest",
+	"bringyour.HelloResponse",
+	"bringyour.KtGossip",
+	"bringyour.MessageServerFragment",
+	"bringyour.MessageServerPush",
+	"bringyour.MessageServerRequest",
+	"bringyour.MessageServerResponse",
+	"bringyour.Record",
+	"bringyour.RecordPush",
+	"bringyour.RecoveryFetchRequest",
+	"bringyour.RecoveryFetchResponse",
+	"bringyour.RendezvousCollectRequest",
+	"bringyour.RendezvousCollectResponse",
+	"bringyour.RendezvousDeposit",
+	"bringyour.RendezvousDepositRequest",
+	"bringyour.RendezvousDepositResponse",
+	"bringyour.RendezvousOpenRequest",
+	"bringyour.RendezvousOpenResponse",
+	"bringyour.RendezvousPush",
+	"bringyour.RendezvousRegisterRequest",
+	"bringyour.RendezvousRegisterResponse",
+	"bringyour.RendezvousRetireRequest",
+	"bringyour.RendezvousRetireResponse",
+	"bringyour.RetentionApplied",
+	"bringyour.ServerKey",
+	"bringyour.SubmitRequest",
+	"bringyour.SubmitResponse",
+	"bringyour.SubmitResult",
+	"bringyour.SubscribeRequest",
+	"bringyour.SubscribeResponse",
+	"bringyour.Subscription",
+	"bringyour.SubscriptionAck",
+	"bringyour.TransientPush",
+	"bringyour.UnsubscribeRequest",
+	"bringyour.WrapFetchRequest",
+	"bringyour.WrapFetchResponse",
+	// enums
+	"bringyour.Direction",
+	"bringyour.Reason",
+	// the values of those enums
+	"bringyour.DIRECTION_DOWNLOAD",
+	"bringyour.DIRECTION_UNSPECIFIED",
+	"bringyour.DIRECTION_UPLOAD",
+	"bringyour.REASON_BLOB_INCOMPLETE",
+	"bringyour.REASON_BLOB_UNKNOWN",
+	"bringyour.REASON_CARD_RATE_LIMITED",
+	"bringyour.REASON_CARD_RETIRED",
+	"bringyour.REASON_COMMIT_LOST",
+	"bringyour.REASON_EPOCH_INCOMPLETE",
+	"bringyour.REASON_EPOCH_STALE",
+	"bringyour.REASON_INTERNAL",
+	"bringyour.REASON_OK",
+	"bringyour.REASON_OVERSIZE",
+	"bringyour.REASON_QUOTA_EXCEEDED",
+	"bringyour.REASON_RATE_LIMITED",
+	"bringyour.REASON_REJECTED",
+	"bringyour.REASON_RETENTION_CLAMPED",
+	"bringyour.REASON_STREAM_INDEX_REGRESSED",
+	"bringyour.REASON_STREAM_INDEX_REUSED",
+	"bringyour.REASON_UNSUPPORTED_VERSION",
+	"bringyour.REASON_WRAP_TARGET_UNKNOWN",
+}
+
+// The members of messagingSchemaNames that files declares, each with the file declaring it, sorted.
+func messagingSchemaNamesDeclaredIn(t *testing.T, files *protoregistry.Files) []string {
+	t.Helper()
+	declared := []string{}
+	for _, name := range messagingSchemaNames {
+		descriptor, err := files.FindDescriptorByName(name)
+		switch {
+		case err == nil:
+			declared = append(declared, fmt.Sprintf("%s is declared by %s", name, descriptor.ParentFile().Path()))
+		case !errors.Is(err, protoregistry.NotFound):
+			t.Errorf("looking up %s: %v", name, err)
+		}
+	}
+	slices.Sort(declared)
+	return declared
+}
+
 // The messaging schema is registered by github.com/urnetwork/message/protocol and by nothing in
 // connect. Two registrations of message.proto in one process are a conflict that protobuf-go
 // panics on at init, so a copy left or restored here, for example by merging a branch from before
 // the move, would stop every binary that links connect and the message module from starting.
+//
+// So would a connect proto file that declared any name of messagingSchemaNames, and no connect
+// test would notice, because no connect binary links the message module. The names are looked up
+// in every proto file this repository holds: the files are found by walking the repository, and
+// each has to be one this binary registers, so a proto file this package does not generate cannot
+// declare a name unread.
 func TestConnectRegistersNoMessagingSchema(t *testing.T) {
 	// control: the same lookups find what connect does register
 	if _, err := protoregistry.GlobalFiles.FindFileByPath(protocol.File_frame_proto.Path()); err != nil {
@@ -167,18 +293,129 @@ func TestConnectRegistersNoMessagingSchema(t *testing.T) {
 	}
 	messageTypeEnum(t)
 
+	// the scope: every proto file of the repository, against the files this binary registers in
+	// proto package bringyour
+	root, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("resolve this package's own directory: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
+			break
+		}
+		parent := filepath.Dir(root)
+		if parent == root {
+			t.Fatal("no go.mod above this package, so the repository holding its proto files cannot be found")
+		}
+		root = parent
+	}
+	protoFiles := []string{}
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(path) != ".proto" {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		protoFiles = append(protoFiles, filepath.ToSlash(relative))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s for proto files: %v", root, err)
+	}
+	registered := []string{}
+	protoregistry.GlobalFiles.RangeFilesByPackage("bringyour", func(file protoreflect.FileDescriptor) bool {
+		registered = append(registered, "protocol/"+file.Path())
+		return true
+	})
+	slices.Sort(protoFiles)
+	slices.Sort(registered)
+	if !slices.Contains(protoFiles, "protocol/"+protocol.File_frame_proto.Path()) {
+		t.Fatalf("the walk of %s found the proto files %v, which do not hold frame.proto, so it did not read this repository", root, protoFiles)
+	}
+	for _, file := range protoFiles {
+		if !slices.Contains(registered, file) {
+			t.Errorf("%s is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package", file)
+		}
+	}
+	for _, file := range registered {
+		if !slices.Contains(protoFiles, file) {
+			t.Errorf("this binary registers %s in proto package bringyour, and the repository holds no such proto file", file)
+		}
+	}
+	t.Logf("the names are looked up in the %d proto files of this repository: %v", len(protoFiles), protoFiles)
+
 	if file, err := protoregistry.GlobalFiles.FindFileByPath("message.proto"); err == nil {
 		t.Errorf("connect registers message.proto (proto package %s); the messaging schema belongs to github.com/urnetwork/message/protocol", file.Package())
 	} else if !errors.Is(err, protoregistry.NotFound) {
 		t.Errorf("looking up message.proto: %v", err)
 	}
-	// the messages the reserved code points carry, named as the specs name them
+	for _, declared := range messagingSchemaNamesDeclaredIn(t, protoregistry.GlobalFiles) {
+		t.Errorf("%s; message.proto declared that name, and the two schemas share proto package bringyour, so a binary that links connect and github.com/urnetwork/message/protocol panics at init on the second declaration", declared)
+	}
+	t.Logf("looked up the %d names message.proto declared", len(messagingSchemaNames))
+}
+
+// Controls the name check against a registry built here, in both directions: a file in proto
+// package bringyour that declares a message and an enum value of messagingSchemaNames is reported
+// for exactly those two, and its own names are not. Then holds the transcription to what its
+// comment says it is.
+func TestTheMessagingNameCheckFindsAPlantedDeclaration(t *testing.T) {
+	planted, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:    proto.String("planted.proto"),
+		Package: proto.String("bringyour"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{
+			{Name: proto.String("Capabilities")},
+			{Name: proto.String("PlantedMessage")},
+		},
+		EnumType: []*descriptorpb.EnumDescriptorProto{
+			{
+				Name: proto.String("PlantedReason"),
+				Value: []*descriptorpb.EnumValueDescriptorProto{
+					{Name: proto.String("REASON_OK"), Number: proto.Int32(0)},
+					{Name: proto.String("PLANTED_REASON_OTHER"), Number: proto.Int32(1)},
+				},
+			},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("build the planted file: %v", err)
+	}
+	files := &protoregistry.Files{}
+	if err := files.RegisterFile(planted); err != nil {
+		t.Fatalf("register the planted file: %v", err)
+	}
+	want := []string{
+		"bringyour.Capabilities is declared by planted.proto",
+		"bringyour.REASON_OK is declared by planted.proto",
+	}
+	if got := messagingSchemaNamesDeclaredIn(t, files); !slices.Equal(got, want) {
+		t.Errorf("the name check over the planted file reported %q, want %q", got, want)
+	}
+
+	// the transcription: 75 distinct names, each directly in proto package bringyour, holding every
+	// message a reserved code point carries
+	if len(messagingSchemaNames) != 75 {
+		t.Errorf("the transcription holds %d names; message.proto declared 75 (52 messages, 2 enums, 21 enum values)", len(messagingSchemaNames))
+	}
+	seen := map[protoreflect.FullName]bool{}
+	for _, name := range messagingSchemaNames {
+		if seen[name] {
+			t.Errorf("%s is transcribed twice", name)
+		}
+		seen[name] = true
+		if !name.IsValid() || name.Parent() != "bringyour" {
+			t.Errorf("%s is not a name directly in proto package bringyour", name)
+		}
+	}
 	for name, want := range specUrmessageCodePoints {
-		full := protoreflect.FullName("bringyour." + want.specName)
-		if descriptor, err := protoregistry.GlobalFiles.FindDescriptorByName(full); err == nil {
-			t.Errorf("%s, which the code point %s carries, is registered here by %s; it belongs to github.com/urnetwork/message/protocol", full, name, descriptor.ParentFile().Path())
-		} else if !errors.Is(err, protoregistry.NotFound) {
-			t.Errorf("looking up %s: %v", full, err)
+		if !seen[protoreflect.FullName("bringyour."+want.specName)] {
+			t.Errorf("the code point %s carries bringyour.%s, which the transcription does not hold", name, want.specName)
 		}
 	}
 }
