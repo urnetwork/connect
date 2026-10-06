@@ -70,3 +70,43 @@ func TestWalletMappingApiLegacyRequestRetainsMissingConsent(t *testing.T) {
 		t.Fatal("legacy request became authenticated mapping evidence", value, err)
 	}
 }
+
+// The network consent is requested from its own route with no client, and
+// submitted through the same wallet route without a client.
+func TestNetworkWalletMappingApiRequestsWithoutClient(t *testing.T) {
+	message := "Approve URnetwork network wallet mapping\nsynthetic exact original bytes"
+	posts := 0
+	api, _ := authObservationTestApi(t.Context(), nil, true, serialTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+		posts++
+		if request.Method != http.MethodPost || request.Header.Get("Authorization") != "Bearer synthetic-network-wallet-token" {
+			return nil, fmt.Errorf("network mapping request lost authenticated post")
+		}
+		raw, err := io.ReadAll(request.Body)
+		if err != nil {
+			return nil, err
+		}
+		if posts == 1 {
+			var args map[string]any
+			if request.URL.Path != "/sn/wallet/network-consent" || json.Unmarshal(raw, &args) != nil || args["client_id"] != nil || args["coldkey_ss58"] != "synthetic-wallet" || args["from_epoch"] != float64(7) || args["through_epoch"] != float64(107) {
+				return nil, fmt.Errorf("network mapping challenge changed its selection: %s", raw)
+			}
+			body, _ := json.Marshal(SnWalletMappingChallengeResult{Message: message})
+			return authObservationTestResponse(request, http.StatusOK, string(body)), nil
+		}
+		var args SnSetWalletArgs
+		if posts != 2 || request.URL.Path != "/sn/wallet" || json.Unmarshal(raw, &args) != nil || args.ClientId != nil || args.Message != message {
+			return nil, fmt.Errorf("network mapping submission changed signed original")
+		}
+		return authObservationTestResponse(request, http.StatusOK, `{"mapping_hash":"synthetic-network-hash","mapping_generation":1}`), nil
+	}))
+	defer api.Close()
+	api.SetByJwt("synthetic-network-wallet-token")
+	challenge, err := api.SnNetworkWalletMappingChallengeSync(&SnNetworkWalletMappingChallengeArgs{ColdkeySs58: "synthetic-wallet", FromEpoch: 7, ThroughEpoch: 107})
+	if err != nil || challenge == nil || challenge.Message != message || posts != 1 {
+		t.Fatal("network challenge was changed", challenge, posts, err)
+	}
+	result, err := api.SnSetWalletSync(&SnSetWalletArgs{ColdkeySs58: "synthetic-wallet", Message: challenge.Message, Signature: "0x" + strings.Repeat("12", 64)})
+	if err != nil || result == nil || result.MappingHash != "synthetic-network-hash" || result.MappingGeneration != 1 || posts != 2 {
+		t.Fatal("network mapping acknowledgement was lost", result, posts, err)
+	}
+}
