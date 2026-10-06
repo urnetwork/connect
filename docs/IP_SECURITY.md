@@ -264,10 +264,12 @@ false, `inspect` always returns `cfaaPass`.
 2. **IP reputation takes precedence over the port policy.** If the address is in the
    blocked-range table (§3.3) → `cfaaDrop` — IPv4 via `cfaaBlockedIp4`, IPv6 via
    `cfaaBlockedIp6`, each a binary search over its packed range table.
-3. If `AllowTelegramCalls` is enabled and the endpoint is one of Telegram's
+3. ICMP → `cfaaAllow`. It has no ports, so the port policy does not apply (only
+   echo is parsed, `ICMP.md`); the blocklist check in step 2 has already run.
+4. If `AllowTelegramCalls` is enabled and the endpoint is one of Telegram's
    published call-reflector IPv4 addresses on TCP or UDP 596–599, or the exact
    official protocol-v12 fallback at `91.108.9.38:595/TCP` → `cfaaAllow`.
-4. Otherwise apply the port policy:
+5. Otherwise apply the port policy:
 
 | Port(s)                                | Protocol | Verdict     | Rationale |
 |----------------------------------------|----------|-------------|-----------|
@@ -278,6 +280,8 @@ false, `inspect` always returns `cfaaPass`.
 | 595                                    | TCP      | `cfaaAllow` | only for Telegram's exact `91.108.9.38` protocol-v12 fallback |
 | 596–599                                | TCP/UDP  | `cfaaAllow` | only for exact published Telegram call-reflector IPv4s; all other hosts retain the privileged-port drop |
 | 443, 853, 465, 993, 995                | any      | `cfaaPass`  | HTTPS/QUIC, DoT, secure email → DPI's privileged-port rule (§4.0): stateless BitTorrent signatures → Incident, anything else Allow |
+| 587                                    | TCP      | `cfaaPass`  | SMTP submission → DPI's privileged-port rule (§4.0), as for 465; the SMTP guard (below) runs first and holds the flow to STARTTLS and TLS |
+| 587                                    | UDP      | `cfaaDrop`  | not SMTP |
 | 80                                     | TCP      | `cfaaPass`  | HTTP → DPI (catches HTTP-tracker announces; plaintext web passes; FIXME upgrade to HTTPS inline) |
 | 80                                     | UDP      | `cfaaDrop`  | not HTTP |
 | < 1024 (any other privileged port)     | any      | `cfaaDrop`  | e.g. 22 (SSH), 179 (BGP) — insecure low ports stay blocked |
@@ -287,6 +291,16 @@ false, `inspect` always returns `cfaaPass`.
 > of ports `≥ 11000`. Legitimate plaintext / web-standard high-port traffic (games,
 > WebRTC, QUIC/HTTP-3) now passes (and is then judged by DPI on its payload), while
 > BitTorrent and sketchy-encrypted non-web traffic on those ports is still dropped.
+
+**The SMTP guard.** `ip_smtp_policy.go` runs before this policy on the client
+egress paths (`RemoteUserNatClient.SendPacket`, `RemoteUserNatMultiClient.SendPacket`)
+and, for 465 and 587, again on the provider (`RemoteUserNatProvider.ClientReceive`).
+TCP/25 goes out over the device's own connection with the kill switch on or off
+(a block rule or the blocker can still stop it), so it never reaches a provider;
+a provider that is sent TCP/25 drops it here as a privileged port. TCP/465 must
+open with a TLS ClientHello. TCP/587 may carry only `EHLO`, `HELO`, `QUIT` and
+`STARTTLS` (2 KiB at most) until `STARTTLS`, and then a TLS ClientHello. A
+segment that breaks these rules is dropped and the connection is reset.
 
 The exhaustive, authoritative port→verdict table is `TestCfaaPortClassification`.
 
@@ -460,7 +474,7 @@ per-flow (5-tuple) state object and advances it one packet at a time until a
 
 ### 4.0 Privileged destination ports
 
-A destination port below 1024 that the CFAA layer passes (443, 853, 465, 587,
+A destination port below 1024 that the CFAA layer passes (443, 853, 465, 587/tcp,
 993, 995, 80/tcp) is a **trusted service port**: no flow state is created and the
 encrypted heuristic does not run, so non-TLS encrypted services there (Telegram
 MTProto, OpenVPN/TCP, Noise messengers on 443) are allowed. A peer can still
