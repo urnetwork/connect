@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Exact physical export is a new authority format. A byte-only historical
 // report, changed totals or invented original generation cannot substitute.

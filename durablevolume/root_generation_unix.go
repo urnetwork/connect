@@ -1,17 +1,19 @@
-//go:build linux
+//go:build linux || darwin
 
 // An externally bound inode and nonce authenticate state roots across restarts.
 // Admission reads only: provisioning and restore rebinding are separate acts.
 package durablevolume
 
 import (
+	"github.com/urnetwork/connect/durablesys"
+	"golang.org/x/sys/unix"
+
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"os"
 	"runtime"
 	"syscall"
-	"unsafe"
 )
 
 // Exact descriptor-relative xattrs cannot follow a substituted pathname.
@@ -19,15 +21,11 @@ func readRootGeneration(file *os.File) ([]byte, error) {
 	if file == nil {
 		return nil, ErrClosed
 	}
-	name, err := syscall.BytePtrFromString(RootGenerationAttribute)
-	if err != nil {
-		return nil, err
-	}
 	raw := make([]byte, RootGenerationBytes+1)
-	count, _, errno := syscall.Syscall6(syscall.SYS_FGETXATTR, file.Fd(), uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(&raw[0])), uintptr(len(raw)), 0, 0)
+	count, err := durablesys.GetAttribute(int(file.Fd()), RootGenerationAttribute, raw)
 	runtime.KeepAlive(file)
-	if errno != 0 {
-		return nil, generationObservation(errno)
+	if err != nil {
+		return nil, generationObservation(err)
 	}
 	if count != RootGenerationBytes {
 		return nil, errors.Join(ErrIdentity, errors.New("durable root generation has another length"))
@@ -37,10 +35,10 @@ func readRootGeneration(file *os.File) ([]byte, error) {
 
 // Missing/malformed authority is proven loss; unsupported/failed probes are not.
 func generationObservation(err error) error {
-	if errors.Is(err, syscall.ENODATA) || errors.Is(err, syscall.ERANGE) {
+	if errors.Is(err, durablesys.ErrNoAttribute) || errors.Is(err, syscall.ERANGE) {
 		return errors.Join(ErrIdentity, err)
 	}
-	if errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOSYS) {
+	if durablesys.AttributeUnsupported(err) {
 		return errors.Join(ErrUnsupported, unavailableObservation("durable root generation cannot be observed on this filesystem", err))
 	}
 	return unavailableObservation("durable root generation could not be observed", err)
@@ -48,8 +46,8 @@ func generationObservation(err error) error {
 
 // Recycled inode numbers do not inherit a former root's nonce authority.
 func (self *Owner) rootGeneration() ([]byte, error) {
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(int(self.rootFile.Fd()), &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(self.rootFile.Fd()), &stat); err != nil {
 		return nil, unavailableObservation("durable root inode could not be observed", err)
 	}
 	if stat.Ino != self.rootSpec.RootInode {

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Original read-only evidence keeps its exact mode through physical export,
 // private staging, publication and resumed completion. No permission is inferred.

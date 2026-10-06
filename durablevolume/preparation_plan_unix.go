@@ -1,10 +1,12 @@
-//go:build linux
+//go:build linux || darwin
 
 // Planning retains protected physical descriptors and hashes bounded public
 // staging bytes. It never enrolls a target, changes old custody or starts work.
 package durablevolume
 
 import (
+	"github.com/urnetwork/connect/durablesys"
+
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -20,6 +22,8 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 const maximumPreparationRequestBytes = 1024 * 1024
@@ -86,11 +90,6 @@ func (self PreparationRequest) validate(scope ownerScope) error {
 	}
 	if self.RootCreation != "" && self.RootCreation != "create-private" {
 		return errors.New("preparation root creation profile is unsupported")
-	}
-	if self.RootCreation == "create-private" {
-		if _, err := preparationRootRenameNumber(); err != nil {
-			return err
-		}
 	}
 	limit := self.Limits
 	maximumOwners, maximumOwnerAttributes := 32, uint64(128)
@@ -184,8 +183,8 @@ func preparationPrivate(file *os.File, directory bool) error {
 	if err := protected(file, directory); err != nil {
 		return err
 	}
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
 		return unavailableObservation("preparation protection could not be observed", err)
 	}
 	if stat.Mode&0077 != 0 || stat.Uid != uint32(os.Geteuid()) {
@@ -196,11 +195,11 @@ func preparationPrivate(file *os.File, directory bool) error {
 
 // Inode facts come from a retained descriptor, never a pathname-derived claim.
 func preparationIdentity(file *os.File) (PreparationIdentity, error) {
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
 		return PreparationIdentity{}, unavailableObservation("preparation inode could not be observed", err)
 	}
-	return PreparationIdentity{Device: uint64(stat.Dev), Inode: stat.Ino, Mode: stat.Mode, Uid: stat.Uid, Gid: stat.Gid}, nil
+	return PreparationIdentity{Device: durablesys.StatDevice(&stat), Inode: stat.Ino, Mode: uint32(stat.Mode), Uid: stat.Uid, Gid: stat.Gid}, nil
 }
 
 // Mount selection is identical to runtime admission and independently covers
@@ -396,7 +395,7 @@ func preparationEmpty(ctx context.Context, file *os.File) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	fd, err := syscall.Openat(int(file.Fd()), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(file.Fd()), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}
@@ -712,8 +711,8 @@ func preparationVerifyFile(ctx context.Context, file *os.File, size uint64, dige
 // The optional observer reports actual bytes read and cannot supply data or
 // change an admission verdict. Ordinary callers do not install an observer.
 func preparationVerifyFileWithRead(ctx context.Context, file *os.File, size uint64, digest string, read func(int)) error {
-	var before, after syscall.Stat_t
-	if err := syscall.Fstat(int(file.Fd()), &before); err != nil {
+	var before, after unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &before); err != nil {
 		return unavailableObservation("preparation file size could not be observed", err)
 	}
 	if before.Size < 0 || uint64(before.Size) != size {
@@ -736,7 +735,7 @@ func preparationVerifyFileWithRead(ctx context.Context, file *os.File, size uint
 		_, _ = hash.Write(part)
 		offset += uint64(n)
 	}
-	if err := syscall.Fstat(int(file.Fd()), &after); err != nil {
+	if err := unix.Fstat(int(file.Fd()), &after); err != nil {
 		return unavailableObservation("preparation file could not be reobserved", err)
 	}
 	if before.Dev != after.Dev || before.Ino != after.Ino || before.Mode != after.Mode || before.Size != after.Size || before.Mtim != after.Mtim || before.Ctim != after.Ctim || before.Uid != after.Uid || before.Gid != after.Gid || before.Nlink != 1 || after.Nlink != 1 || "sha256:"+hex.EncodeToString(hash.Sum(nil)) != digest {

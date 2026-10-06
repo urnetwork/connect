@@ -1,11 +1,12 @@
-//go:build linux
+//go:build linux || darwin
 
 package durablevolume
 
 import (
 	"bytes"
-	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Exact newly prepared namespaces enter full inventory; nearby schemas do not.
@@ -18,7 +19,7 @@ func TestInventoryCreationAndProviderPublicationBirthSchemasAreBounded(t *testin
 			if limit, known := ownerAttributeLimit(name); !known || limit != 4096 {
 				t.Fatal("new original birth schema lost exact capacity", name, limit, known)
 			}
-			if err := syscall.Setxattr(fixture.root, name, raw, 1); err != nil {
+			if err := unix.Setxattr(fixture.root, name, raw, unix.XATTR_CREATE); err != nil {
 				t.Fatal(err)
 			}
 			owner := fixture.open(t, Snapshot)
@@ -29,7 +30,7 @@ func TestInventoryCreationAndProviderPublicationBirthSchemasAreBounded(t *testin
 			if err := owner.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if err := syscall.Setxattr(fixture.root, name+".other", raw, 1); err != nil {
+			if err := unix.Setxattr(fixture.root, name+".other", raw, unix.XATTR_CREATE); err != nil {
 				t.Fatal(err)
 			}
 			second := fixture.open(t, Snapshot)

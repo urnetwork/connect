@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Complete shared coverage is checked before staging. Synthetic fixed owners
 // exercise the real public plan/apply, retained heads and joined recovery.
@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 const preparationUnionSecondAttribute = "user.urnetwork.snapshot.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -56,7 +58,7 @@ func preparationUnionTestAdapter() PreparationAdapter {
 		},
 		InspectRestore: func(ctx context.Context, root *os.File, owner PreparationOwnerPlan, report Inventory) ([]PreparedAttribute, error) {
 			member := owner.Files[0]
-			fd, err := syscall.Openat(int(root.Fd()), member.Path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+			fd, err := unix.Openat(int(root.Fd()), member.Path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -89,8 +91,8 @@ func newPreparationUnionFixture(t *testing.T) *preparationFixture {
 			t.Fatal(err)
 		}
 	}
-	var stat syscall.Stat_t
-	if err := syscall.Stat(f.volume.root, &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Stat(f.volume.root, &stat); err != nil {
 		t.Fatal(err)
 	}
 	checkpoint, err := json.Marshal(struct {
@@ -102,7 +104,7 @@ func newPreparationUnionFixture(t *testing.T) *preparationFixture {
 		t.Fatal(err)
 	}
 	for _, root := range []string{f.volume.root, f.request.RestoreSource.Directory} {
-		if err := syscall.Setxattr(root, preparationUnionSecondAttribute, checkpoint, 1); err != nil {
+		if err := unix.Setxattr(root, preparationUnionSecondAttribute, checkpoint, unix.XATTR_CREATE); err != nil {
 			t.Fatal(err)
 		}
 	}

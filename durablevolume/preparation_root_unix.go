@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Explicit fresh root creation stages one private inode for review. Accepted
 // apply reserves that original inode/control before a no-replace move; a lost
@@ -6,6 +6,9 @@
 package durablevolume
 
 import (
+	"github.com/urnetwork/connect/durablesys"
+	"golang.org/x/sys/unix"
+
 	"encoding/hex"
 	"errors"
 	"os"
@@ -14,45 +17,15 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
-	"unsafe"
 )
 
-// Linux amd64/arm64 are the prepared runtime targets. No rename fallback may
-// overwrite a competing target on an unqualified platform.
-func preparationRootRenameNumber() (uintptr, error) {
-	switch runtime.GOARCH {
-	case "amd64":
-		return 316, nil
-	case "arm64":
-		return 276, nil
-	default:
-		return 0, ErrUnsupported
-	}
-}
-
-// Only the atomic Linux no-replace operation may publish a reviewed root.
+// Only an atomic no-replace rename may publish a reviewed root: renameat2 on
+// Linux, renameatx_np on Darwin. No fallback may overwrite a competing target.
 func preparationRenameRoot(source *os.File, sourceName string, target *os.File, targetName string) error {
-	number, err := preparationRootRenameNumber()
-	if err != nil {
-		return err
-	}
-	old, err := syscall.BytePtrFromString(sourceName)
-	if err != nil {
-		return err
-	}
-	next, err := syscall.BytePtrFromString(targetName)
-	if err != nil {
-		return err
-	}
-	_, _, errno := syscall.Syscall6(number, source.Fd(), uintptr(unsafe.Pointer(old)), target.Fd(), uintptr(unsafe.Pointer(next)), 1, 0)
+	err := durablesys.RenameNoReplace(int(source.Fd()), sourceName, int(target.Fd()), targetName)
 	runtime.KeepAlive(source)
 	runtime.KeepAlive(target)
-	runtime.KeepAlive(old)
-	runtime.KeepAlive(next)
-	if errno != 0 {
-		return errno
-	}
-	return nil
+	return err
 }
 
 // The accepted nonce selects a single stage; user paths cannot name another.
@@ -92,7 +65,7 @@ func (self *preparationAdmission) stageRoot(nonce []byte) error {
 	parent := self.directories[self.request.StagingDirectory]
 	path := preparationStagedRootPath(self.request, nonce)
 	name := filepath.Base(path)
-	if err := syscall.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
+	if err := unix.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
 		return err
 	}
 	file, err := preparationOpenAbsolute(path, true)

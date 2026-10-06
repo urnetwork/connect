@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Synthetic physical metadata models an inode-bearing unsigned census. The
 // public core still owns actual exports, staged bytes, moves, fsyncs and guards.
@@ -11,8 +11,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 type preparationSyntheticCensus struct {
@@ -62,8 +63,8 @@ func preparationPhysicalTestAdapter() PreparationAdapter {
 				return nil, err
 			}
 			var census preparationSyntheticCensus
-			var stat syscall.Stat_t
-			if err := syscall.Stat(filepath.Join(root.Name(), "record.bin"), &stat); err != nil {
+			var stat unix.Stat_t
+			if err := unix.Stat(filepath.Join(root.Name(), "record.bin"), &stat); err != nil {
 				return nil, err
 			}
 			if json.Unmarshal(raw, &census) != nil || census.Inode != stat.Ino || census.Sha256 != report.Entries[2].Sha256 {
@@ -95,8 +96,8 @@ func newPreparationPhysicalModeFixture(t *testing.T, mode os.FileMode) *preparat
 			t.Fatal(err)
 		}
 	}
-	var stat syscall.Stat_t
-	if err := syscall.Stat(filepath.Join(f.volume.root, "record.bin"), &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Stat(filepath.Join(f.volume.root, "record.bin"), &stat); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := json.Marshal(preparationSyntheticCensus{Schema: "synthetic-physical-census", Inode: stat.Ino, Sha256: testDigest([]byte("exact reviewed public bytes\n"))})
@@ -106,7 +107,7 @@ func newPreparationPhysicalModeFixture(t *testing.T, mode os.FileMode) *preparat
 	if err := os.WriteFile(filepath.Join(f.volume.root, "census.json"), raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Stat(f.volume.root, &stat); err != nil {
+	if err := unix.Stat(f.volume.root, &stat); err != nil {
 		t.Fatal(err)
 	}
 	checkpoint, err := json.Marshal(preparationSyntheticCensus{Schema: "synthetic-physical-checkpoint", Inode: stat.Ino, Sha256: testDigest(raw)})
@@ -114,7 +115,7 @@ func newPreparationPhysicalModeFixture(t *testing.T, mode os.FileMode) *preparat
 		t.Fatal(err)
 	}
 	for _, root := range []string{f.volume.root, f.request.RestoreSource.Directory} {
-		if err := syscall.Setxattr(root, "user.urnetwork.attempt-ledger-custody", checkpoint, 0); err != nil {
+		if err := unix.Setxattr(root, "user.urnetwork.attempt-ledger-custody", checkpoint, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -188,9 +189,9 @@ func assertPreparationPhysicalResult(t *testing.T, f *preparationFixture, result
 		t.Fatal("new physical census did not bind different member inodes")
 	}
 	for _, source := range f.plan.Sources {
-		var stat syscall.Stat_t
+		var stat unix.Stat_t
 		path := filepath.Join(f.request.RootPath, source.File.Path)
-		if err := syscall.Stat(path, &stat); err != nil || stat.Ino != source.Identity.Inode || uint64(stat.Dev) != source.Identity.Device {
+		if err := unix.Stat(path, &stat); err != nil || stat.Ino != source.Identity.Inode || uint64(stat.Dev) != source.Identity.Device {
 			t.Fatal("published member did not preserve its reviewed staging inode", path, err)
 		}
 		if _, err := os.Lstat(source.Path); !os.IsNotExist(err) {

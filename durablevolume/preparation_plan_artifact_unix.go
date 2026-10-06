@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Cohort planners retain each exact public plan under its already approved
 // staging parent. This is not target enrollment and never replaces an artifact.
@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // Borrows the plan value and retains only canonical public bytes. The digest
@@ -130,10 +132,10 @@ func retainPreparationArtifact(ctx context.Context, staging, kind string, raw []
 	digest := preparationDigest(raw)
 	name := "cohort-" + kind + "-" + strings.TrimPrefix(digest, "sha256:") + ".json"
 	path := filepath.Join(staging, name)
-	fd, err := syscall.Openat(int(directory.Fd()), name, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
+	fd, err := unix.Openat(int(directory.Fd()), name, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
 	created := err == nil
 	if errors.Is(err, syscall.EEXIST) {
-		fd, err = syscall.Openat(int(directory.Fd()), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
+		fd, err = unix.Openat(int(directory.Fd()), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 	}
 	if err != nil {
 		return result, namedObservation("cohort plan artifact could not be opened", err)

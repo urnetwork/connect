@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 // No non-Linux path silently substitutes weaker physical custody semantics.
 package durablevolume

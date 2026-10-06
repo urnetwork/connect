@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Initial kernel observations have the same retry contract as retained owner
 // checks. Constructor failure must also release its already-acquired lease.

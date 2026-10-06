@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // The explicit larger profile retains a complete archive-sized owner census.
 // No owner, per-record bound or accepted-plan dimension is inferred from absence.
@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Independent marker inodes avoid attributing aggregate xattr capacity to the
@@ -22,7 +24,7 @@ import (
 func preparationManyOwnersAdapter() PreparationAdapter {
 	inspect := func(ctx context.Context, root *os.File, owner PreparationOwnerPlan) ([]PreparedAttribute, error) {
 		member := owner.Files[0]
-		fd, err := syscall.Openat(int(root.Fd()), member.Path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+		fd, err := unix.Openat(int(root.Fd()), member.Path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -45,16 +47,16 @@ func preparationManyOwnersAdapter() PreparationAdapter {
 			if err := json.Unmarshal(owner.Inputs, &input); err != nil || input.Name == "" || filepath.Base(input.Name) != input.Name {
 				return PreparationOwnerPlan{}, errors.New("synthetic owner name is invalid")
 			}
-			if err := syscall.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
+			if err := unix.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
 				return PreparationOwnerPlan{}, err
 			}
-			fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+			fd, err := unix.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 			if err != nil {
 				return PreparationOwnerPlan{}, err
 			}
 			directory := os.NewFile(uintptr(fd), name)
 			defer directory.Close()
-			memberFd, err := syscall.Openat(fd, input.Name, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
+			memberFd, err := unix.Openat(fd, input.Name, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
 			if err != nil {
 				return PreparationOwnerPlan{}, err
 			}
@@ -148,7 +150,7 @@ func TestPreparationManyOwnersPublishesCompleteArchiveSizedCensus(t *testing.T) 
 		if err != nil || testDigest(actual) != member.Sha256 {
 			t.Fatal("many-owner apply lost original member", member.Path, err)
 		}
-		if count, err := syscall.Getxattr(path, owner.Attributes[0].Name, nil); err != nil || count == 0 {
+		if count, err := unix.Getxattr(path, owner.Attributes[0].Name, nil); err != nil || count == 0 {
 			t.Fatal("many-owner apply lost original head", member.Path, err)
 		}
 	}
@@ -257,11 +259,11 @@ func TestPreparationManyOwnersReconcilesOriginalPartialHeadUnion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identities := make(map[string]syscall.Stat_t)
+	identities := make(map[string]unix.Stat_t)
 	for _, owner := range plan.Owners[:33] {
 		path := filepath.Join(f.request.RootPath, owner.Files[0].Path)
-		var identity syscall.Stat_t
-		if err := syscall.Stat(path, &identity); err != nil {
+		var identity unix.Stat_t
+		if err := unix.Stat(path, &identity); err != nil {
 			t.Fatal(err)
 		}
 		identities[path] = identity
@@ -272,8 +274,8 @@ func TestPreparationManyOwnersReconcilesOriginalPartialHeadUnion(t *testing.T) {
 		t.Fatal("joined partial union discarded original control", err, readErr)
 	}
 	for path, original := range identities {
-		var current syscall.Stat_t
-		if err := syscall.Stat(path, &current); err != nil || current.Ino != original.Ino || current.Dev != original.Dev {
+		var current unix.Stat_t
+		if err := unix.Stat(path, &current); err != nil || current.Ino != original.Ino || current.Dev != original.Dev {
 			t.Fatal("joined partial union replaced an acknowledged member", path, err)
 		}
 	}

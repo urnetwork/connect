@@ -4382,12 +4382,17 @@ paths:
 
         A `message` issued by POST /sn/wallet/consent (it starts with
         "Approve URnetwork provider wallet mapping") is a per-provider wallet
-        mapping consent, and one issued by POST /sn/wallet/network-consent (it
+        mapping consent, one issued by POST /sn/wallet/network-consent (it
         starts with "Approve URnetwork network wallet mapping") is a network
-        consent. A consent is retained as signed and the result carries its
-        `mapping_hash` and `mapping_generation`; submitting the same consent
-        again returns the same values. A network consent is accepted only from
-        the network owner's session (a network JWT) and without `client_id`.
+        consent, and one issued by POST /sn/wallet/hotkey-delegation (it starts
+        with "Delegate URnetwork network wallet to hotkey") is a hotkey
+        delegation. A consent or delegation is retained as signed and the
+        result carries its `mapping_hash` and `mapping_generation`; submitting
+        the same one again returns the same values. A network consent and a
+        hotkey delegation are accepted only from the network owner's session
+        (a network JWT) and without `client_id`. A hotkey delegation is signed
+        by the hotkey it names, not by a coldkey: `signature` is the hotkey's
+        sr25519 signature and `coldkey_ss58` is the hotkey's ss58 address.
       operationId: Sn Set Wallet
       security:
         - BearerAuth: []
@@ -4406,17 +4411,22 @@ paths:
                 $ref: "#/components/schemas/SnSetWalletResult"
     get:
       description: |
-        The coldkeys attached inside the caller's network: the network consent
-        and the network-level wallet (no `client_id`) and every provider
-        client's wallet. `consent_scope` is `provider` or `network` for an
-        entry that is a wallet mapping consent, and absent for a wallet set by
-        a login proof and for the network-level copy; release settlement pays
-        consents only. The network consent is listed before the network-level
-        copy. `wallet` is the session's effective wallet in settlement's
-        precedence: for a client session its own provider consent, else the
-        network consent, else its own wallet, else the network-level copy; for
-        a network session the network consent, else the network-level copy.
-        Absent when none is attached. An empty `wallets` list is not an error.
+        The coldkeys attached inside the caller's network: the network consent,
+        the hotkey entry and the network-level wallet (no `client_id`) and
+        every provider client's wallet. `consent_scope` is `provider` or
+        `network` for an entry that is a wallet mapping consent, `hotkey` for
+        the network's accepted hotkey delegation, and absent for a wallet set
+        by a login proof and for the network-level copy; release settlement
+        pays only the entries with a scope. The network consent is listed
+        before the hotkey entry, and both before the network-level copy, so a
+        client that takes the first network-level entry follows settlement's
+        order.
+        `wallet` is the session's effective wallet in settlement's precedence:
+        for a client session its own provider consent, else the network
+        consent, else the hotkey entry, else its own wallet without a consent,
+        else the network-level copy; for a network session the network
+        consent, else the hotkey entry, else the network-level copy. Absent
+        when none is attached. An empty `wallets` list is not an error.
       operationId: Sn Get Wallet
       security:
         - BearerAuth: []
@@ -4526,6 +4536,127 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/SnNetworkWalletMappingHistoryArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnWalletMappingHistoryResult"
+
+  /sn/wallet/hotkey-consent:
+    post:
+      description: |
+        Store a hotkey wallet consent chain: a coldkey's approval, signed once
+        for every operator of the subnet, that the networks which delegate to
+        a hotkey earn to that coldkey. `originals` is the complete chain from
+        generation 1, each consent signed by both the coldkey and the hotkey.
+        The chain is verified and must name this operator's subnet. It is
+        stored idempotently, so submitting it again returns the same head; a
+        chain whose consent at a stored generation differs (a fork) is
+        refused. A later generation replaces the earlier one from its
+        `from_epoch` and may name another coldkey. Storing a chain attaches no
+        wallet: a network earns through it only from a hotkey delegation (POST
+        /sn/wallet/hotkey-delegation) that adopts its head. Requires a network
+        JWT of the network's administrator; a client JWT is refused.
+
+        Nothing issues these chains, so storage is bounded per submitting
+        network: a network may link at most 8 distinct hotkeys (a ninth is
+        refused with 403), and one request may add at most 64 generations the
+        operator doesn't have yet (more is refused with 400; submit successive
+        prefixes of the chain instead). Resubmitting or extending a hotkey the
+        network already linked is always allowed.
+      operationId: Sn Hotkey Wallet Mapping Consent
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnHotkeyWalletMappingConsentArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnHotkeyWalletMappingConsentResult"
+
+  /sn/wallet/hotkey-consent/history:
+    post:
+      description: |
+        The stored hotkey wallet consents of one hotkey on this operator's
+        subnet, generation 1 through `generation`, for a caller that already
+        holds the chain head from an independent source. As for
+        /sn/wallet/consent/history, a head that does not match is refused and
+        no authentication is required.
+      operationId: Sn Hotkey Wallet Mapping History
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnHotkeyWalletMappingHistoryArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnHotkeyWalletMappingHistoryResult"
+
+  /sn/wallet/hotkey-delegation:
+    post:
+      description: |
+        Issue a hotkey delegation: the exact message the hotkey signs to
+        receive the earnings of every provider client of the caller's network,
+        current and future, for the inclusive epochs `from_epoch` to
+        `through_epoch`. Each epoch earns to the coldkey that the hotkey's
+        stored wallet consent chain, through the head `consent_head_hash`,
+        makes effective at it. That chain must be stored first (POST
+        /sn/wallet/hotkey-consent) and name `hotkey_ss58`. Only the network
+        owner's session (a network JWT) may request it; a client-scoped JWT is
+        refused. A client with its own provider consent, or a network with a
+        network consent, effective at an epoch earns to that consent instead.
+        The message is valid for 5 minutes and is submitted unchanged, with
+        the hotkey's sr25519 signature and without `client_id`, to POST
+        /sn/wallet. A later delegation replaces the earlier one from its
+        `from_epoch` and may name another hotkey.
+      operationId: Sn Hotkey Network Delegation Challenge
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnHotkeyNetworkDelegationChallengeArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnWalletMappingChallengeResult"
+
+  /sn/wallet/hotkey-delegation/history:
+    post:
+      description: |
+        The retained signed hotkey delegations of one network, generation 1
+        through `generation`, for a caller that already holds the chain head
+        from an independent source. Each original's `signature` is the
+        hotkey's. As for /sn/wallet/consent/history, a head that does not
+        match is refused and no authentication is required.
+      operationId: Sn Hotkey Network Delegation History
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnHotkeyNetworkDelegationHistoryArgs"
       responses:
         "200":
           description: OK.
@@ -11817,6 +11948,10 @@ components:
         - set_at_millis
       properties:
         coldkey_ss58:
+          description: |
+            The coldkey as an ss58 address. For the hotkey entry, the coldkey of
+            the hotkey wallet consent generation effective at the current epoch,
+            or of the head generation when none is effective yet.
           type: string
         client_id:
           description: uuid of the provider client; absent for the network-level wallet.
@@ -11827,14 +11962,30 @@ components:
         consent_scope:
           description: |
             `provider` for a provider client's wallet mapping consent, `network`
-            for the network consent (no `client_id`). Absent for a wallet that
-            is not a consent.
+            for the network consent (no `client_id`), `hotkey` for the network's
+            accepted hotkey delegation (no `client_id`). Absent for a wallet
+            that is not a consent.
           type: string
         from_epoch:
-          description: For a consent, the first epoch it pays.
+          description: For a consent, the first epoch it pays. For the hotkey entry, the delegation's.
           type: integer
         through_epoch:
-          description: For a consent, the last epoch it pays.
+          description: For a consent, the last epoch it pays. For the hotkey entry, the delegation's.
+          type: integer
+        hotkey_ss58:
+          description: For the hotkey entry, the delegated hotkey as an ss58 address. Absent for the other scopes.
+          type: string
+        consent_head_hash:
+          description: For the hotkey entry, the hotkey wallet consent head the delegation adopts, as `0x` and 64 hex digits. Absent for the other scopes.
+          type: string
+        consent_generation:
+          description: For the hotkey entry, the generation of that consent head. Absent for the other scopes.
+          type: integer
+        mapping_hash:
+          description: For the hotkey entry, the delegation chain head (sha256 of the retained delegation), as `0x` and 64 hex digits. Absent for the other scopes.
+          type: string
+        mapping_generation:
+          description: For the hotkey entry, the generation of the delegation chain head. Absent for the other scopes.
           type: integer
 
     SnGetWalletResult:
@@ -11954,7 +12105,7 @@ components:
         - originals
       properties:
         originals:
-          description: The signed consents in generation order.
+          description: The signed consents, or hotkey delegations, in generation order.
           type: array
           items:
             type: object
@@ -11969,6 +12120,137 @@ components:
                 type: array
                 items:
                   type: integer
+
+    SnHotkeyWalletMappingConsent:
+      type: object
+      required:
+        - message
+        - coldkey_signature
+        - hotkey_signature
+      properties:
+        message:
+          description: The exact consent text both keys signed. It starts with "Approve URnetwork hotkey wallet mapping".
+          type: string
+        coldkey_signature:
+          description: The coldkey's 64-byte sr25519 signature over `message` (substrate context, raw or in the `<Bytes>` wrapper), as an array of integers.
+          type: array
+          items:
+            type: integer
+        hotkey_signature:
+          description: The hotkey's 64-byte sr25519 signature over `message`, made the same way, as an array of integers.
+          type: array
+          items:
+            type: integer
+
+    SnHotkeyWalletMappingConsentArgs:
+      type: object
+      required:
+        - originals
+      properties:
+        originals:
+          description: The complete chain of signed consents in generation order, from generation 1.
+          type: array
+          items:
+            $ref: "#/components/schemas/SnHotkeyWalletMappingConsent"
+
+    SnHotkeyWalletMappingConsentResult:
+      type: object
+      required:
+        - hotkey_ss58
+        - head_hash
+        - generation
+      properties:
+        hotkey_ss58:
+          description: The hotkey the chain names, as an ss58 address (Bittensor prefix 42).
+          type: string
+        head_hash:
+          description: The 32 bytes of the chain head (sha256 of the head consent), as an array of integers.
+          type: array
+          items:
+            type: integer
+        generation:
+          description: The head's generation.
+          type: integer
+
+    SnHotkeyWalletMappingHistoryArgs:
+      type: object
+      required:
+        - hotkey_ss58
+        - head_hash
+        - generation
+      properties:
+        hotkey_ss58:
+          description: The hotkey as an ss58 address (Bittensor prefix 42).
+          type: string
+        head_hash:
+          description: The 32 bytes of the chain head (sha256 of the retained consent), as an array of integers.
+          type: array
+          items:
+            type: integer
+        generation:
+          description: The head's generation.
+          type: integer
+
+    SnHotkeyWalletMappingHistoryResult:
+      type: object
+      required:
+        - originals
+      properties:
+        originals:
+          description: The signed consents in generation order.
+          type: array
+          items:
+            $ref: "#/components/schemas/SnHotkeyWalletMappingConsent"
+
+    SnHotkeyNetworkDelegationChallengeArgs:
+      type: object
+      required:
+        - hotkey_ss58
+        - consent_head_hash
+        - consent_generation
+        - from_epoch
+        - through_epoch
+      properties:
+        hotkey_ss58:
+          description: The hotkey as an ss58 address (Bittensor prefix 42); the stored consent chain must name it.
+          type: string
+        consent_head_hash:
+          description: The 32 bytes of the hotkey wallet consent head the delegation adopts (sha256 of that consent), as an array of integers.
+          type: array
+          items:
+            type: integer
+        consent_generation:
+          description: The consent head's generation.
+          type: integer
+        from_epoch:
+          description: The first epoch the delegation pays. It must be after the operator's current finalized epoch.
+          type: integer
+        through_epoch:
+          description: The last epoch the delegation pays, at most 65535 epochs after `from_epoch`.
+          type: integer
+
+    SnHotkeyNetworkDelegationHistoryArgs:
+      type: object
+      required:
+        - domain
+        - network_id
+        - head_hash
+        - generation
+      properties:
+        domain:
+          description: The deployment domain the delegations were issued in, as it appears in each signed delegation.
+          type: object
+        network_id:
+          description: uuid of the network.
+          type: string
+        head_hash:
+          description: The 32 bytes of the chain head (sha256 of the retained delegation), as an array of integers.
+          type: array
+          items:
+            type: integer
+        generation:
+          description: The head's generation.
+          type: integer
 
     SnValidateWalletArgs:
       type: object

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Traversal stays on real no-follow descriptors and refuses partial inventories.
 // Bounded reads and context checks permit a stopped owner to cancel the work.
@@ -16,17 +16,19 @@ import (
 	"sort"
 	"syscall"
 	"unicode/utf8"
+
+	"golang.org/x/sys/unix"
 )
 
 // Exact file metadata guards detect concurrent mutation without changing bytes.
-func inventoryStat(file *os.File) (syscall.Stat_t, error) {
-	var stat syscall.Stat_t
-	err := syscall.Fstat(int(file.Fd()), &stat)
+func inventoryStat(file *os.File) (unix.Stat_t, error) {
+	var stat unix.Stat_t
+	err := unix.Fstat(int(file.Fd()), &stat)
 	return stat, err
 }
 
 // Changing times, size, links or identity during a read defeats completeness.
-func unchangedInventoryStat(before, after syscall.Stat_t) bool {
+func unchangedInventoryStat(before, after unix.Stat_t) bool {
 	return before.Dev == after.Dev && before.Ino == after.Ino && before.Mode == after.Mode && before.Uid == after.Uid && before.Gid == after.Gid && before.Size == after.Size && before.Nlink == after.Nlink && before.Mtim == after.Mtim && before.Ctim == after.Ctim
 }
 
@@ -43,7 +45,7 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) (resultErr 
 	if err != nil {
 		return unavailableObservation("inventory root metadata could not be observed", err)
 	}
-	result.PhysicalRoot = PhysicalRoot{Device: deviceNumber(uint64(rootStat.Dev)), Inode: rootStat.Ino}
+	result.PhysicalRoot = PhysicalRoot{Device: statDevice(&rootStat), Inode: rootStat.Ino}
 	generation, err := self.rootGeneration()
 	if err != nil {
 		return err
@@ -80,15 +82,15 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) (resultErr 
 		if err := protected(file, directory); err != nil {
 			return err
 		}
-		if deviceNumber(uint64(before.Dev)) != self.mount.Device {
+		if statDevice(&before) != self.mount.Device {
 			return errors.Join(ErrIdentity, errors.New("inventory entered another filesystem"))
 		}
 		if err := self.childMount(filepath.Join(self.rootPath, relative)); err != nil {
 			return err
 		}
-		entry := InventoryEntry{Path: relative, Mode: before.Mode & 07777, Uid: before.Uid, Gid: before.Gid}
+		entry := InventoryEntry{Path: relative, Mode: uint32(before.Mode) & 07777, Uid: before.Uid, Gid: before.Gid}
 		if result.Schema == PhysicalInventorySchema {
-			entry.Physical = &PhysicalRoot{Device: deviceNumber(uint64(before.Dev)), Inode: before.Ino}
+			entry.Physical = &PhysicalRoot{Device: statDevice(&before), Inode: before.Ino}
 		}
 		entry.OwnerAttributes, err = self.inventoryAttributes(ctx, file, relative, result)
 		if err != nil {
@@ -122,7 +124,7 @@ func (self *Owner) inventory(ctx context.Context, result *Inventory) (resultErr 
 				if err := self.check(false); err != nil {
 					return err
 				}
-				fd, err := syscall.Openat(int(file.Fd()), child.Name(), syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+				fd, err := unix.Openat(int(file.Fd()), child.Name(), syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 				if err != nil {
 					return namedObservation("inventory child could not be opened", err)
 				}
