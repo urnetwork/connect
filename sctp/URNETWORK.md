@@ -2,7 +2,9 @@
 
 This directory is the unmodified source distribution of
 `github.com/pion/sctp v1.11.1`, except for the narrowly scoped change in
-`association.go` and the added `association_cwnd_limited_test.go`.
+`association.go`, the added `association_cwnd_limited_test.go`, and the
+removed upstream `.github/` directory (pion's GitHub workflows and git hook
+scripts; we do not use GitHub Actions).
 The upstream MIT license and source headers are preserved.
 
 Blocking SCTP writes admit one message at a time. A writer scheduling gap can

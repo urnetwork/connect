@@ -95,8 +95,7 @@ func addSharedCorpus(f *testing.F) {
 // slice of a mutated corpus it was handed, where reaching nothing is an ordinary
 // outcome for a run that is working. Either would make the gate fire on a healthy
 // fuzz run, so the gate is restricted to the seed corpus pass under plain go test,
-// which is the pass the per commit CI job runs and the one where the seeds are
-// exactly the ones written here.
+// the one where the seeds are exactly the ones written here.
 func fuzzingEngineSuppliesInputs() bool {
 	if fl := flag.Lookup("test.fuzzworker"); fl != nil && fl.Value.String() == "true" {
 		return true

@@ -52,7 +52,6 @@ message/
   go.mod
   go.sum
   CODESTYLE.md
-  .github/workflows/
   message/       records, attachments, authentication preimages
   messagegroup/  group sessions, ratchets, record encryption, MLS adapter
   mls/           MLS implementation
@@ -62,7 +61,7 @@ message/
     urmessage/   device/group orchestration and durable MLS state
 ```
 
-The repository root contains module metadata, documentation, and CI, with no Go
+The repository root contains module metadata and documentation, with no Go
 package or facade importing the directories beneath it. The six immediate packages are
 peers, consistent with [CODESTYLE.md](CODESTYLE.md): a package may import a peer
 but must never import its own descendants. Promote the current `mls/syntax` codec
@@ -354,8 +353,7 @@ packages in one module. Update hard-coded import paths, source fixture strings,
 module-derived scan scopes, and test expectations together; do not weaken a
 check merely because its path changed.
 
-Move MLS, syntax, record, and group tests and their CI into the new repository.
-Syntax's workflow path changes when it moves from `mls/syntax` to `syntax`.
+Move MLS, syntax, record, and group tests into the new repository.
 Preserve vector, fuzz, race, interop, and cross-platform coverage and the
 appropriate toolchain pin.
 
