@@ -165,3 +165,32 @@ func controlDohUrlsFirst(dohUrls []string, defaultDohUrls []string) []string {
 	}
 	return merged
 }
+
+// A copy of DoH settings that names only the built-in servers: the server
+// lists of `DefaultDnsResolverSettings`, and no seed, which only ever favors a
+// named server. Everything else is kept as given. A strategy that refuses
+// custom DoH servers (`ClientStrategySettings.DisableCustomDohServers`) takes
+// this in place of any settings it is handed, `ControlDohSettings` included.
+func builtInDohServerSettings(settings *DohSettings) *DohSettings {
+	if settings == nil {
+		return DefaultDohSettings()
+	}
+	copied := *settings
+	defaultResolverSettings := DefaultDnsResolverSettings()
+	if settings.DnsResolverSettings == nil {
+		copied.DnsResolverSettings = defaultResolverSettings
+	} else {
+		resolverSettings := *settings.DnsResolverSettings
+		resolverSettings.RemoteDohUrlsIpv4 = defaultResolverSettings.RemoteDohUrlsIpv4
+		resolverSettings.RemoteDohUrlsIpv6 = defaultResolverSettings.RemoteDohUrlsIpv6
+		resolverSettings.LocalDohUrlsIpv4 = defaultResolverSettings.LocalDohUrlsIpv4
+		resolverSettings.LocalDohUrlsIpv6 = defaultResolverSettings.LocalDohUrlsIpv6
+		resolverSettings.RemoteDnsIpv4 = defaultResolverSettings.RemoteDnsIpv4
+		resolverSettings.RemoteDnsIpv6 = defaultResolverSettings.RemoteDnsIpv6
+		resolverSettings.LocalDnsIpv4 = defaultResolverSettings.LocalDnsIpv4
+		resolverSettings.LocalDnsIpv6 = defaultResolverSettings.LocalDnsIpv6
+		copied.DnsResolverSettings = &resolverSettings
+	}
+	copied.ServerStatsSeed = nil
+	return &copied
+}

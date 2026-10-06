@@ -220,16 +220,21 @@ func udpAddrFamily(udpAddr *net.UDPAddr) int {
 // The caller's settings are not mutated. An injected DialContextSettings
 // (headless hosts) is kept as the inner dial so a source-identity seam still
 // applies; a configured ProxySettings is dropped, because a pinned dial through
-// a proxy would prove the proxy's family, not the provider's.
+// a proxy would prove the proxy's family, not the provider's. The extenders and
+// VLESS servers stay dropped: the strategy refuses those a later
+// `SetCustomExtenders` or `SetVlessConfigs` names (`DisableManualExtenders`,
+// `DisableVless`).
 func NewDirectClientStrategy(ctx context.Context, settings *ClientStrategySettings, ipFamily int) *ClientStrategy {
 	direct := *settings
 	direct.ExtenderConfigs = nil
 	direct.ExtenderDirectory = nil
 	direct.ExpandExtenderProfileCount = 0
 	direct.MaxExtenderCount = 0
+	direct.DisableManualExtenders = true
 	direct.ConnectSettings.ProxySettings = nil
 	// a VLESS server would prove its own family, as a proxy would
 	direct.VlessConfigs = nil
+	direct.DisableVless = true
 
 	ipFamily = normalizeIpFamily(ipFamily)
 	// the alt carriers dial udp themselves, below any dial context, so the pin

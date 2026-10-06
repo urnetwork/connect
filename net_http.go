@@ -135,6 +135,14 @@ type ClientStrategySettings struct {
 	// Measurement fixtures use it for hermetic production extender paths. Nil
 	// retains normal discovery and selection. The strategy copies each entry.
 	ExtenderConfigs []*ExtenderConfig
+	// Refuses extenders configured by hand whatever path they arrive by:
+	// `ExtenderConfigs`, the custom extenders of `SetCustomExtenders`, and the
+	// manual addresses of the directory that no signed record verifies (a
+	// manual address is the one kind the directory offers unverified). The
+	// strategy draws only the addresses a signed record verifies. A hosted
+	// (cloud) device's strategy sets it, because an extender is dialed from
+	// the host and a user must not choose what the host dials.
+	DisableManualExtenders bool
 	// VlessConfigs are VLESS servers the user named (vless.go), each an
 	// additional persistent dialer that carries the strategy's connections
 	// through its server. The strategy copies each entry, and
@@ -175,6 +183,13 @@ type ClientStrategySettings struct {
 	DnsTlds [][]byte
 
 	DohSettings *DohSettings
+	// Refuses DoH servers other than the built-in ones, whatever path they
+	// arrive by: the server lists of `DohSettings` and of
+	// `SetInternalDohSettings` are replaced by the defaults'
+	// (`DefaultDnsResolverSettings`), which drops the bootstrap DoH servers a
+	// user names (`ControlDohSettings`). A hosted (cloud) device's strategy
+	// sets it, because a DoH server is queried from the host.
+	DisableCustomDohServers bool
 	// InternalDohDomains are network-space domains whose exact host and
 	// subdomains resolve through the strategy's direct DoH cache before a
 	// control connection is dialed by raw IP. The request hostname remains
@@ -362,6 +377,12 @@ func newNormalDialTlsContext(
 
 // extender udp 53 to platform extender
 func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *ClientStrategy {
+	if settings.DisableCustomDohServers {
+		// copied: the caller's settings are never written
+		copied := *settings
+		copied.DohSettings = builtInDohServerSettings(settings.DohSettings)
+		settings = &copied
+	}
 	baseSettings := *settings
 	settings, internalDohResolver := clientStrategySettingsWithInternalDoh(settings)
 
@@ -434,7 +455,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		}
 	}
 	for _, extenderConfig := range settings.ExtenderConfigs {
-		if extenderConfig == nil {
+		if extenderConfig == nil || settings.DisableManualExtenders {
 			continue
 		}
 		copiedConfig := *extenderConfig
@@ -578,10 +599,16 @@ func (self *ClientStrategy) networkChanged() {
 	self.CloseIdleConnections()
 }
 
+// Replaces the custom extenders, which override discovery while any are set.
+// A strategy that refuses extenders configured by hand
+// (`DisableManualExtenders`) keeps none.
 func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]string) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
+	if self.settings.DisableManualExtenders {
+		return
+	}
 	self.extenderIpSecrets = maps.Clone(extenderIpSecrets)
 	for dialer, _ := range self.dialers {
 		if dialer.IsExtender() && !dialer.persistent {
@@ -605,9 +632,10 @@ func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]
 // pinned to h3 whose only way out is an extender.
 //
 // Racing a direct h3 dial against an extender one, the way the stream dialers
-// race, would be the fuller answer and is not what this does.
+// race, would be the fuller answer and is not what this does. A strategy that
+// refuses extenders configured by hand (`DisableManualExtenders`) answers nil.
 func (self *ClientStrategy) H3ExtenderConfig() *ExtenderConfig {
-	if self.settings.EnableNormal || self.settings.EnableResilient {
+	if self.settings.EnableNormal || self.settings.EnableResilient || self.settings.DisableManualExtenders {
 		return nil
 	}
 	for _, extenderConfig := range self.settings.ExtenderConfigs {
@@ -719,10 +747,15 @@ func (self *ClientStrategy) DohSettings() *DohSettings {
 // extender bootstrap queries them from its next pass. This is how a user's
 // bootstrap DoH servers (`ControlDohSettings`) apply without rebuilding the
 // strategy. Resolutions in flight on the replaced cache end, and the next dial
-// resolves through the new one. Nil restores the defaults.
+// resolves through the new one. Nil restores the defaults. A strategy that
+// refuses custom DoH servers (`DisableCustomDohServers`) keeps the built-in
+// servers.
 func (self *ClientStrategy) SetInternalDohSettings(dohSettings *DohSettings) {
 	if dohSettings == nil {
 		dohSettings = DefaultDohSettings()
+	}
+	if self.settings.DisableCustomDohServers {
+		dohSettings = builtInDohServerSettings(dohSettings)
 	}
 	replacedCache := func() *DohCache {
 		self.mutex.Lock()
@@ -2047,13 +2080,18 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 		}
 	} else if directory := self.settings.ExtenderDirectory; directory != nil {
 		familyCandidates := [][]*ExtenderCandidate{}
+		candidates := directory.Candidates
+		if self.settings.DisableManualExtenders {
+			// never a manual address no signed record verifies
+			candidates = directory.VerifiedCandidates
+		}
 		for _, ipVersion := range []int{4, 6} {
 			if !controlFamilyProbe(ipVersion) {
 				continue
 			}
 			familyCandidates = append(
 				familyCandidates,
-				directory.Candidates(ipVersion, maxNewDialerCount, visitedExtenderIps...),
+				candidates(ipVersion, maxNewDialerCount, visitedExtenderIps...),
 			)
 		}
 		// interleave the families, so a dual-stack host does not spend its

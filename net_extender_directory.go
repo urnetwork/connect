@@ -1503,6 +1503,30 @@ func (self *ExtenderDirectory) Candidates(
 	count int,
 	exclude ...netip.Addr,
 ) []*ExtenderCandidate {
+	return self.candidates(ipVersion, count, false, exclude)
+}
+
+// The candidates of `Candidates` that a signed record verifies, in the same
+// order: a manual address no record verifies, the one unverified kind
+// `Candidates` offers, is left out. A strategy that refuses extenders
+// configured by hand (`ClientStrategySettings.DisableManualExtenders`) draws
+// from here.
+func (self *ExtenderDirectory) VerifiedCandidates(
+	ipVersion int,
+	count int,
+	exclude ...netip.Addr,
+) []*ExtenderCandidate {
+	return self.candidates(ipVersion, count, true, exclude)
+}
+
+// The candidates of `Candidates`, or of `VerifiedCandidates` with
+// `verifiedOnly`.
+func (self *ExtenderDirectory) candidates(
+	ipVersion int,
+	count int,
+	verifiedOnly bool,
+	exclude []netip.Addr,
+) []*ExtenderCandidate {
 	if count <= 0 {
 		return []*ExtenderCandidate{}
 	}
@@ -1542,10 +1566,14 @@ func (self *ExtenderDirectory) Candidates(
 			return compare(a, b)
 		}
 	}
-	usableAddresses, limitedUsableAddresses := splitExtenderLimitedAddresses(
-		self.usableAddressesWithLock(ipVersion, now, excludeIps),
-		now,
-	)
+	usable := self.usableAddressesWithLock(ipVersion, now, excludeIps)
+	if verifiedOnly {
+		// the retained expired addresses below are verified by construction
+		usable = slices.DeleteFunc(usable, func(address *extenderDirectoryAddress) bool {
+			return address.publicKeyHex == ""
+		})
+	}
+	usableAddresses, limitedUsableAddresses := splitExtenderLimitedAddresses(usable, now)
 	expiredAddresses, limitedExpiredAddresses := splitExtenderLimitedAddresses(
 		self.retainedExpiredAddressesWithLock(ipVersion, now, excludeIps),
 		now,
