@@ -4558,7 +4558,14 @@ paths:
         `from_epoch` and may name another coldkey. Storing a chain attaches no
         wallet: a network earns through it only from a hotkey delegation (POST
         /sn/wallet/hotkey-delegation) that adopts its head. Requires a network
-        JWT.
+        JWT of the network's administrator; a client JWT is refused.
+
+        Nothing issues these chains, so storage is bounded per submitting
+        network: a network may link at most 8 distinct hotkeys (a ninth is
+        refused with 403), and one request may add at most 64 generations the
+        operator doesn't have yet (more is refused with 400; submit successive
+        prefixes of the chain instead). Resubmitting or extending a hotkey the
+        network already linked is always allowed.
       operationId: Sn Hotkey Wallet Mapping Consent
       security:
         - BearerAuth: []
