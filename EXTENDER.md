@@ -1011,11 +1011,15 @@ the user's setting says, when the space stores one or the device holds
 one; else as `DeviceLocalSettings.DefaultProvideExtender` says. An
 embedder that wants the role only after the user opts in turns the default
 off. `NewDeviceLocalWithProvideExtender(..., keyMaterial,
-provideExtenderEnabled, defaultProvideExtender)` carries both controls for
-hosts that cannot build the settings, the c abi
+provideExtenderEnabled, defaultProvideExtender)` carries both controls with
+the key material, also over the c abi
 (`urnet_new_device_local_with_provide_extender`) and the language bindings
-over it; Go and gomobile hosts may also set the fields on the settings of
-`NewDeviceLocal`. Every other constructor keeps both on.
+on it. Hosts that build the settings set the two fields: Go and gomobile on
+the settings of `NewDeviceLocal`, a c host in the settings json it reads from
+`urnet_default_device_local_settings` and passes to `urnet_new_device_local`,
+which decodes it over the defaults. Every other constructor keeps both on.
+The role's state is re-read after each hand-over to the provider until it
+stands, so a change racing another is never undone by the older one.
 
 G2. Lifecycle in `deviceLocalProvider`. When provide is on and the setting
 is on: load or create the identity key, which belongs to the network space:
