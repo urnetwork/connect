@@ -3,14 +3,13 @@
 // this package's own sentinels — never accepted, never coerced, never a panic, and never
 // an allocation sized from a length nobody bounded.
 //
-// What continuous integration runs is the seed corpus and nothing else. test.yml runs
-// go test with no -fuzz, and f.Fuzz explores nothing beyond its seeds without it, so
-// under continuous integration the three targets here are a table of exactly the inputs
-// f.Add was given. That is the reason the seeds are generated as a field by alteration
-// cross product over the published vectors rather than hand picked, and the reason every
-// seed carries the outcome it is expected to produce instead of only being fed in. The
-// mutation search these targets are shaped for is a -fuzz run somebody starts on purpose;
-// the table is what they are worth the rest of the time.
+// What a plain go test run exercises is the seed corpus and nothing else. f.Fuzz explores
+// nothing beyond its seeds without -fuzz, so in that run the three targets here are a
+// table of exactly the inputs f.Add was given. That is the reason the seeds are generated
+// as a field by alteration cross product over the published vectors rather than hand
+// picked, and the reason every seed carries the outcome it is expected to produce instead
+// of only being fed in. The mutation search these targets are shaped for is a -fuzz run
+// somebody starts on purpose; the table is what they are worth the rest of the time.
 //
 // Random bytes do not reach the property on their own. p1 task 14 measured uniform random
 // input reaching the round trip 14 times in 4096 — 0.34% — against the simplest wire type
@@ -106,7 +105,7 @@ const hpkeFuzzExportCollisionWidth = 16
 // would otherwise add an entry per execution and take the worker's memory with it, so past
 // this many the claim is made against the inputs already held rather than against every
 // input a search has ever produced — which still fails on any collapse that lands on one
-// of them, and which is the whole corpus in the run continuous integration performs.
+// of them, and which is the whole corpus in a plain go test run.
 const hpkeFuzzDerivationsTracked = 4096
 
 // The over long length every field is grown to. Large enough that an implementation
@@ -655,8 +654,8 @@ func hpkeFuzzIsTypedRefusal(err error) bool {
 // The target's own name is what this is keyed on, because -fuzz names one target and the
 // three here are accounted for separately. Reading the flag as a process wide yes or no
 // would let a search of any one of them report success for the other two over a corpus
-// that had stopped reaching the code under test — and a workflow that runs -fuzz once per
-// target, which is the shape p1's syntax workflow already has, would do exactly that.
+// that had stopped reaching the code under test — and running -fuzz once per target
+// would do exactly that.
 //
 // The pattern is matched the way testing matches it: split on "/" and the first element
 // treated as an unanchored regexp over the top level name. A pattern that will not compile
@@ -685,8 +684,7 @@ func hpkeFuzzSearchRequested(target string) bool {
 // reaches for when one seed fails.
 //
 // A pattern with a single element either selects a target whole or does not run it at all,
-// and leaves the accounting live. That is what keeps continuous integration covered:
-// test.yml passes no -run.
+// and leaves the accounting live, which is what keeps a run of the whole package covered.
 func hpkeFuzzCorpusNarrowed() bool {
 	requested := flag.Lookup("test.run")
 	return requested != nil && strings.Contains(requested.Value.String(), "/")
@@ -695,7 +693,7 @@ func hpkeFuzzCorpusNarrowed() bool {
 // FuzzHpkeOpenBase drives the whole receiving half — decapsulation, key schedule and aead
 // open — from bytes a peer chose, and holds it to the four claims in this file's comment.
 //
-// The seed corpus is the coverage under continuous integration, so it is generated rather
+// The seed corpus is the coverage a plain go test run gets, so it is generated rather
 // than listed: for each registered suite the published message and this package's own seal
 // of every plaintext class under every info and aad pairing, each crossed with its four
 // wire fields and eight alterations, an input with nothing in it, and the wrong recipient
@@ -745,7 +743,7 @@ func FuzzHpkeOpenBase(f *testing.F) {
 	// each suite's published message offered to the other suite's recipient, seeded
 	// without an expectation on purpose. Every other seed is one the corpus recorded, so
 	// the branch that refuses a success nobody wrote down would otherwise be reachable
-	// only under -fuzz — which is to say, never in continuous integration. These are the
+	// only under -fuzz — which is to say, never in a plain go test run. These are the
 	// rows that keep it live: what holds them is the rule that an input the corpus never
 	// recorded must not open, and nothing else.
 	for _, message := range messages {

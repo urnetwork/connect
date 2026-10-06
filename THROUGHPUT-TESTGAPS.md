@@ -88,10 +88,9 @@ the same on a reliable and an unreliable carrier. The tree ships
 (`transfer.go:11048`), so the row failed by construction, and its commit said
 so: "It fails on the tree as it stands, which is the point of it."
 
-That is worse than no row. `.github/workflows/test.yml:39` runs the whole
-package on every push with no skip, so the job is red regardless of what else
-breaks, and one permanently failing row masks every genuine failure in a full
-run.
+That is worse than no row. A full run of the package has no skip for it, so
+the run is red regardless of what else breaks, and one permanently failing row
+masks every genuine failure in it.
 
 **Status: LANDED.** The row is now
 `TestTheHandoffWaitAsymmetryIsWhatItIs` (`transfer_ack_handoff_transport_test.go:39`).
@@ -346,9 +345,8 @@ as liveness.
 ## 2.1 The invariant rows that were declined, and why
 
 Recorded so they are not re-attempted as written. Section 0.2's lesson governs:
-a row that fails with no fix behind it is worse than no row, because
-`.github/workflows/test.yml` runs the package on every push and one permanently
-red row masks every genuine failure.
+a row that fails with no fix behind it is worse than no row, because one
+permanently red row masks every genuine failure in a full run of the package.
 
 **U-05, U-06, U-08 · defect rows with no landing.** Each states a contract the
 tree contradicts and that no branch is fixing. U-05's shape test wants the H3,
@@ -874,8 +872,8 @@ the round trip doubles.
 | C-34 | The heap-backed floors fit the smallest supported host | `TestTheBudgetFloorsFitTheSmallestSupportedHost` `tun_budget_draw_test.go:234` |
 | C-35 | A steady upload is acknowledged on a cadence, not on the window having grown, and never short of its spacing | `ip_tcp_steady_ack_cadence_test.go` |
 
-Notes. C-19 to C-23 are `//go:build linux` and do not run on a darwin
-workstation; CI runs `ubuntu-latest`, so they do run there. C-18 sits at exactly
+Notes. C-19 to C-23 are `//go:build linux`: they run on a Linux host, not on a
+darwin workstation. C-18 sits at exactly
 its boundary - 50 ms against `tcp.MinRTO`/4 of 50 ms - so any increase in the
 compression timeout or decrease in the vendored floor fails it, which is its
 purpose.
