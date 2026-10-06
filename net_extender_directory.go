@@ -315,9 +315,9 @@ type ExtenderCandidate struct {
 	UdpPort   int
 	// The first dns port, kept for a caller that predates DnsPorts.
 	DnsPort int
-	// Every dns port the record offers, in dial order (L2): ascending, so 53
-	// is dialed before 4053 when both are listed. Empty falls back to
-	// DnsPort.
+	// Every dns port the record offers, ascending (L2). A dial tries these
+	// first and then whichever of 4053 and 53 they do not include
+	// (dnsCarrierPorts). Empty falls back to DnsPort.
 	DnsPorts    []int
 	DnsTld      string
 	CountryCode string
@@ -347,17 +347,28 @@ type ExtenderCandidate struct {
 	LimitedUntil time.Time
 }
 
-// The dns carrier ports of one candidate in dial order (L2). DnsPorts when it
-// has them -- a record may offer 53 and 4053 -- else the single DnsPort, which
-// is what a candidate built before DnsPorts carries.
+// The dns carrier ports one dial of this candidate races, in launch order
+// (L2, net_extender_dns_ports.go): the ports it offers, ascending -- DnsPorts
+// when it has them, else the single DnsPort a candidate built before DnsPorts
+// carries -- and then whichever of 4053 and 53 those do not include, 4053
+// first. Every extender binds 4053 and only the sn miner also binds 53, so a
+// record that lists 4053 alone, which is every app extender's, and an
+// address with no record are both dialed on 4053 first. A candidate that
+// offers no dns port has no dns carrier to dial (E3).
 func (self *ExtenderCandidate) dnsCarrierPorts() []int {
-	if dnsPorts := orderedDnsPorts(self.DnsPorts); 0 < len(dnsPorts) {
-		return dnsPorts
+	dnsPorts := orderedDnsPorts(self.DnsPorts)
+	if len(dnsPorts) == 0 {
+		dnsPorts = orderedDnsPorts([]int{self.DnsPort})
 	}
-	if 0 < self.DnsPort {
-		return []int{self.DnsPort}
+	if len(dnsPorts) == 0 {
+		return nil
 	}
-	return nil
+	for _, dnsPort := range []int{ExtenderDnsPort, DefaultDnsPort} {
+		if !slices.Contains(dnsPorts, dnsPort) {
+			dnsPorts = append(dnsPorts, dnsPort)
+		}
+	}
+	return dnsPorts
 }
 
 // One address as the status reports it (F2).
@@ -1995,9 +2006,10 @@ func (self *ExtenderDirectory) candidateWithLock(
 	return candidate
 }
 
-// The dns ports one record offers, in dial order (L2). DnsPorts when it has
-// them, else the single DnsPort, else nothing, which leaves the candidate on
-// the carrier default.
+// The dns ports one record offers, ascending (L2). DnsPorts when it has them,
+// else the single DnsPort, else nothing, which leaves the candidate on the
+// carrier default. A dial adds whichever of 4053 and 53 these do not include
+// (ExtenderCandidate.dnsCarrierPorts).
 func recordDnsPorts(body *protocol.ExtenderRecordBody) []int {
 	dnsPorts := []int{}
 	for _, dnsPort := range body.DnsPorts {
