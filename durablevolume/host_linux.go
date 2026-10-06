@@ -451,7 +451,10 @@ func (self *Owner) open() error {
 	if err != nil {
 		return unavailableObservation("initial durable filesystem facts could not be observed", err)
 	}
-	return self.check(self.access == ReadWrite)
+	if self.access == ReadWrite {
+		return self.checkWrite()
+	}
+	return self.check(false)
 }
 
 // Every admission rechecks the kernel namespace, current uuid and marker bytes.
