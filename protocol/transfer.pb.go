@@ -1108,7 +1108,14 @@ type Auth struct {
 	// 4 or 6. Zero (absent) is a legacy family-agnostic transport, which the
 	// platform counts as v4. The platform ignores the intent unless the
 	// family it observed the connection arrive on agrees.
-	IpFamily      int32 `protobuf:"varint,6,opt,name=ip_family,json=ipFamily,proto3" json:"ip_family,omitempty"`
+	IpFamily int32 `protobuf:"varint,6,opt,name=ip_family,json=ipFamily,proto3" json:"ip_family,omitempty"`
+	// the client intends to provide publicly on this connection. The platform
+	// then judges the client as a provider instead of counting it toward the
+	// network's concurrent client limit. This is the frame form of the H1
+	// `X-UR-Provide-Intent: 1` header, for transports that authenticate with
+	// this frame (H3, DNS-carried H3 and the legacy H1 first frame). An old
+	// server ignores the unknown field, which counts as no intent.
+	ProvideIntent bool `protobuf:"varint,7,opt,name=provide_intent,json=provideIntent,proto3" json:"provide_intent,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1183,6 +1190,13 @@ func (x *Auth) GetIpFamily() int32 {
 		return x.IpFamily
 	}
 	return 0
+}
+
+func (x *Auth) GetProvideIntent() bool {
+	if x != nil {
+		return x.ProvideIntent
+	}
+	return false
 }
 
 type Provide struct {
@@ -2898,7 +2912,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\x1c_ack_compress_timeout_microsB\x1c\n" +
 	"\x1a_receiver_ack_delay_micros\"\"\n" +
 	"\x03Tag\x12\x1b\n" +
-	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\xed\x01\n" +
+	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\x94\x02\n" +
 	"\x04Auth\x12\x15\n" +
 	"\x06by_jwt\x18\x01 \x01(\tR\x05byJwt\x12\x1f\n" +
 	"\vapp_version\x18\x02 \x01(\tR\n" +
@@ -2907,7 +2921,8 @@ const file_transfer_proto_rawDesc = "" +
 	"instanceId\x12.\n" +
 	"\x13h3_datagram_version\x18\x04 \x01(\rR\x11h3DatagramVersion\x12?\n" +
 	"\x1ch3_datagram_accepted_version\x18\x05 \x01(\rR\x19h3DatagramAcceptedVersion\x12\x1b\n" +
-	"\tip_family\x18\x06 \x01(\x05R\bipFamily\"4\n" +
+	"\tip_family\x18\x06 \x01(\x05R\bipFamily\x12%\n" +
+	"\x0eprovide_intent\x18\a \x01(\bR\rprovideIntent\"4\n" +
 	"\aProvide\x12)\n" +
 	"\x04keys\x18\x01 \x03(\v2\x15.bringyour.ProvideKeyR\x04keys\"f\n" +
 	"\n" +

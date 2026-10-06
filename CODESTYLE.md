@@ -65,6 +65,7 @@ actually use.
 
 ## Bug fixes
 
+- Every bug fix in every repository must include a deterministic regression test that exercises its root cause.
 - When a bug is found, look for adjacent and similar issues before considering the fix complete. A bug represents a flaw in the reasoning that produced it, and the same flaw may be applied elsewhere — check the surrounding code, sibling call sites, and other copies of the same pattern.
 
 ## Routing keys
