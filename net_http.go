@@ -141,6 +141,11 @@ type ClientStrategySettings struct {
 	// `SetVlessConfigs` replaces them on a running strategy. Empty is a
 	// strategy without VLESS.
 	VlessConfigs []*VlessConfig
+	// Refuses VLESS whatever path the configurations arrive by: neither
+	// `VlessConfigs` nor `SetVlessConfigs` adds a dialer. A hosted (cloud)
+	// device's strategy sets it, because a VLESS server is dialed from the
+	// host, which is not cloud safe.
+	DisableVless bool
 	// ExtenderDirectory is where discovered extenders come from (E1, E2). The
 	// strategy draws candidates from it, reports every dial outcome back to
 	// it, and drops the dialers of addresses it retires. Nil disables
@@ -642,9 +647,11 @@ const (
 )
 
 // A persistent dialer for one VLESS server, or nil for a nil or invalid
-// configuration. The dialer keeps its own copy of the configuration.
+// configuration and for a strategy that refuses VLESS (`DisableVless`). Every
+// VLESS dialer a strategy holds is made here. The dialer keeps its own copy of
+// the configuration.
 func newVlessClientDialer(settings *ClientStrategySettings, vlessConfig *VlessConfig) *clientDialer {
-	if vlessConfig == nil || vlessConfig.Validate() != nil {
+	if settings.DisableVless || vlessConfig == nil || vlessConfig.Validate() != nil {
 		return nil
 	}
 	copiedConfig := vlessConfig.Copy()
@@ -663,9 +670,9 @@ func newVlessClientDialer(settings *ClientStrategySettings, vlessConfig *VlessCo
 }
 
 // SetVlessConfigs replaces the strategy's VLESS dialers with one per valid
-// configuration; nil or empty removes them. The replaced dialers' pooled
-// connections close, and requests in flight finish on the connections they
-// have.
+// configuration; nil or empty removes them. A strategy that refuses VLESS
+// (`DisableVless`) keeps none. The replaced dialers' pooled connections close,
+// and requests in flight finish on the connections they have.
 func (self *ClientStrategy) SetVlessConfigs(vlessConfigs []*VlessConfig) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
