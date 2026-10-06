@@ -55,8 +55,8 @@ func AttributeUnsupported(err error) bool {
 	return errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOSYS)
 }
 
-// Raw dev_t of a descriptor or path stat. Linux reports all 64 bits.
-func StatDevice(stat *unix.Stat_t) uint64 { return stat.Dev }
+// Raw dev_t of a descriptor or path stat, widened from an unsigned 32/64-bit field.
+func StatDevice(stat *unix.Stat_t) uint64 { return uint64(stat.Dev) }
 
 // Raw dev_t of a FileInfo returned by os.Stat, os.Lstat or File.Stat.
 func FileInfoDevice(info os.FileInfo) (uint64, bool) {
@@ -64,5 +64,5 @@ func FileInfoDevice(info os.FileInfo) (uint64, bool) {
 	if !ok {
 		return 0, false
 	}
-	return stat.Dev, true
+	return uint64(stat.Dev), true
 }
