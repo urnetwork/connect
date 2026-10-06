@@ -177,10 +177,10 @@ type ExtenderDirectorySettings struct {
 	// measures the address again. The default is half the day the operator
 	// keeps pings for, so a provider's attested pings are renewed before the
 	// previous ones age out of what each derivation reads (GEOMAP §2.1). The
-	// age counts the time the host slept (extenderElapsed), a path change
-	// drops every sample whatever its age (ExpireLatencies), and a resume from
-	// a long sleep drops those taken before it (ExpireSleptLatencies). <= 0
-	// keeps a sample until the path changes or the host resumes.
+	// age counts the time the host slept (extenderElapsed). A path change, and
+	// a resume from a long sleep for the samples taken before it, keep every
+	// sample in use until a probe replaces it (RefreshLatencies,
+	// RefreshSleptLatencies). <= 0 keeps a sample until a probe replaces it.
 	LatencyMaxAge time.Duration
 	// How long an address that answered 429 with no Retry-After is left alone
 	// before the jitter, which is the same +-50 % a Retry-After gets (A12). A
@@ -282,13 +282,15 @@ type extenderDirectoryAddress struct {
 
 	// the latest latency sample (DESIGNNOTES4.md): the lowest rtt of one
 	// probe pass, when it was taken and whether the target co-signed a claim
-	// of that pass (GEOMAP §2.3). Per process and per path: never stored, and
-	// dropped by a path change (ExpireLatencies) and by a resume from a long
-	// sleep that followed it (ExpireSleptLatencies).
-	latency         time.Duration
-	latencyTime     time.Time
-	latencyAttested bool
-	probeCount      int
+	// of that pass (GEOMAP §2.3). Per process: never stored. A path change,
+	// and a resume from a long sleep that followed it, keep it and make it
+	// due a refresh (RefreshLatencies, RefreshSleptLatencies): it still ranks,
+	// and the probe pass measures it again, the next sample replacing it.
+	latency           time.Duration
+	latencyTime       time.Time
+	latencyAttested   bool
+	latencyRefreshDue bool
+	probeCount        int
 }
 
 // One dialable endpoint handed to the strategy and to the network client. The
@@ -322,8 +324,13 @@ type ExtenderCandidate struct {
 	// (GEOMAP §2.3), which a provider's probe pass reads to find what it has
 	// no co-signed measurement of yet.
 	LatencyAttested bool
-	Source          string
-	Verified        bool
+	// Whether the sample is due a refresh: it was taken before the last path
+	// change, or before a long sleep the host resumed from (RefreshLatencies).
+	// It still ranks, and a probe pass measures it again, as it does an
+	// address with none.
+	LatencyRefreshDue bool
+	Source            string
+	Verified          bool
 	// Whether the record has expired: the candidate is one of the retained
 	// expired identities (MaxExpiredRecordCount), which only the last tier of
 	// Candidates carries.
@@ -1348,9 +1355,9 @@ func directorySpoofDomains(directory *ExtenderDirectory) ([]string, string) {
 // pass (DESIGNNOTES4.md, GEOMAP §2.3) -- a claim merely sent, refused or left
 // without a verdict does not count. The sample is per process and ages out
 // after LatencyMaxAge, the time the host slept included; it is never stored,
-// because yesterday's path is not today's, and a path change or a resume from
-// a long sleep drops it for the same reason (ExpireLatencies,
-// ExpireSleptLatencies).
+// because yesterday's path is not today's. It replaces the address's last
+// sample, which is how one due a refresh after a path change or a resume is
+// replaced (RefreshLatencies).
 func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, attested bool) {
 	if !ip.IsValid() || rtt <= 0 {
 		return
@@ -1368,6 +1375,7 @@ func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, a
 	address.latency = rtt
 	address.latencyTime = now
 	address.latencyAttested = attested
+	address.latencyRefreshDue = false
 	address.probeCount += 1
 	if self.log.V(2).Enabled() {
 		self.log.Infof("[extender]latency %s %s attested=%t\n", ip, rtt, attested)
@@ -1377,60 +1385,53 @@ func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, a
 	self.changedWithLock()
 }
 
-// Drops every latency sample: the path changed, and each one measured the old
-// path (DESIGNNOTES4.md §6). Every address counts as never measured from here,
-// so the candidate order stops ranking by the old path's rtt and the window
-// of the next probe pass, which follows the first sample taken on the new
-// path, is empty and measures again. The rest of the local evidence --
-// successes, failures, holds and limits -- stays.
-func (self *ExtenderDirectory) ExpireLatencies() {
-	self.expireLatencies(func(time.Time, time.Time) bool {
+// Makes every latency sample due a refresh: the path changed, and each one
+// measured the old path (DESIGNNOTES4.md §6). A sample due a refresh stays in
+// use -- the candidate order still ranks by it and the active cap still counts
+// its record measured -- until a probe measures the address again and the new
+// sample replaces it (RecordLatency), so a path change leaves no time with no
+// samples. A probe pass measures the samples due a refresh first and does not
+// count them toward its window (ProbeCandidates, probeWindowLatencies), so the
+// pass that follows the first sample on the new path measures them again. The
+// rest of the local evidence -- successes, failures, holds and limits -- stays
+// too. Nothing the order, the status or the store reads moves, so no change is
+// published.
+func (self *ExtenderDirectory) RefreshLatencies() {
+	self.refreshLatencies(func(time.Time, time.Time) bool {
 		return true
 	})
 }
 
-// Drops every latency sample the host has slept at least `minSleep` through
-// since it was taken (hostSlept): the host resumed from a sleep that long,
-// and a sample from before it is judged like one of another path
-// (DESIGNNOTES4.md §6), since the host may have woken where it measured
-// nothing. A sample taken since the host woke stays, and so does the rest of
-// the local evidence, as for a path change. A wall clock set forward reads as
-// a sleep here, and one set back hides as much sleep. A `minSleep` <= 0 drops
-// nothing.
-func (self *ExtenderDirectory) ExpireSleptLatencies(minSleep time.Duration) {
+// Makes due a refresh every latency sample the host has slept at least
+// `minSleep` through since it was taken (hostSlept): the host resumed from a
+// sleep that long, and may have woken where it measured nothing, so a sample
+// from before it is measured again as one of another path is
+// (RefreshLatencies), and stays in use until then. A sample taken since the
+// host woke is not due. A wall clock set forward reads as a sleep here, and
+// one set back hides as much sleep. A `minSleep` <= 0 makes nothing due.
+func (self *ExtenderDirectory) RefreshSleptLatencies(minSleep time.Duration) {
 	if minSleep <= 0 {
 		return
 	}
-	self.expireLatencies(func(latencyTime time.Time, now time.Time) bool {
+	self.refreshLatencies(func(latencyTime time.Time, now time.Time) bool {
 		return minSleep <= hostSlept(now, latencyTime)
 	})
 }
 
-// Drops each latency sample `expired` picks by when it was taken and the
-// time now, then rebuilds the tier index and publishes one change when any
-// went.
-func (self *ExtenderDirectory) expireLatencies(expired func(latencyTime time.Time, now time.Time) bool) {
+// Makes due a refresh each latency sample `due` picks by when it was taken and
+// the time now. Every sample stays where it is.
+func (self *ExtenderDirectory) refreshLatencies(due func(latencyTime time.Time, now time.Time) bool) {
 	now := self.settings.Now()
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	changed := false
 	for _, address := range self.ipAddresses {
-		if address.latencyTime.IsZero() || !expired(address.latencyTime, now) {
+		if address.latencyTime.IsZero() || !due(address.latencyTime, now) {
 			continue
 		}
-		address.latency = 0
-		address.latencyTime = time.Time{}
-		address.latencyAttested = false
-		changed = true
+		address.latencyRefreshDue = true
 	}
-	if !changed {
-		return
-	}
-	// a measured record that is not near or kept falls back to the rest
-	self.tierRebuildWithLock(now)
-	self.changedWithLock()
 }
 
 // The hold after `consecutiveFailureCount` failures: the base doubling per
@@ -1688,9 +1689,11 @@ func compareExtenderVerified(a *extenderDirectoryAddress, b *extenderDirectoryAd
 
 // The proximity order of DESIGNNOTES4.md §4: the hinted continent before the
 // others before unknown, then within a tier a measured address before an
-// unmeasured one and ascending by rtt. `explore` puts the unmeasured first
-// instead, which is the probe pass asking for what it has not measured yet;
-// `attesting` counts only an attested sample as a measurement.
+// unmeasured one and ascending by rtt, a sample due a refresh ranking as it
+// stands. `explore` is the probe pass asking for what to measure: the samples
+// due a refresh first, ascending, since they lead the order until they are
+// measured again, then the unmeasured, then the rest; `attesting` counts only
+// an attested sample as a measurement.
 func (self *ExtenderDirectory) compareProximityWithLock(
 	a *extenderDirectoryAddress,
 	b *extenderDirectoryAddress,
@@ -1705,8 +1708,22 @@ func (self *ExtenderDirectory) compareProximityWithLock(
 	}
 	aLatency, aMeasured := self.latencyWithLock(a, now, attesting)
 	bLatency, bMeasured := self.latencyWithLock(b, now, attesting)
-	if aMeasured != bMeasured {
-		if aMeasured != explore {
+	if explore {
+		exploreRank := func(address *extenderDirectoryAddress, measured bool) int {
+			switch {
+			case measured && address.latencyRefreshDue:
+				return 0
+			case !measured:
+				return 1
+			default:
+				return 2
+			}
+		}
+		if aRank, bRank := exploreRank(a, aMeasured), exploreRank(b, bMeasured); aRank != bRank {
+			return aRank - bRank
+		}
+	} else if aMeasured != bMeasured {
+		if aMeasured {
 			return -1
 		}
 		return 1
@@ -1750,11 +1767,12 @@ func (self *ExtenderDirectory) latencyWithLock(
 
 // ProbeCandidates is what a probe pass measures, in the order it should
 // (DESIGNNOTES4.md §4): the hinted continent first, and within a tier the
-// addresses with no current sample before those with one, so the prior saves
-// probes rather than merely reordering them. `attesting` treats an unattested
-// sample as none, which is what a provider's pass has yet to do. A limited
-// address is left out until its backoff passes (A12): a probe of it would be
-// turned away again, and a limit is never a measurement.
+// samples due a refresh lowest first (RefreshLatencies), then the addresses
+// with no current sample, then those with one, so the prior saves probes
+// rather than merely reordering them. `attesting` treats an unattested sample
+// as none, which is what a provider's pass has yet to do. A limited address
+// is left out until its backoff passes (A12): a probe of it would be turned
+// away again, and a limit is never a measurement.
 func (self *ExtenderDirectory) ProbeCandidates(
 	ipVersion int,
 	count int,
@@ -1793,9 +1811,23 @@ func (self *ExtenderDirectory) ProbeCandidates(
 }
 
 // MeasuredLatencies is every current latency sample of a usable address of
-// one family (0 for any), which is what the probe pass counts its window
-// over. With `attesting` only attested samples count.
+// one family (0 for any), due a refresh or not, which is what the candidate
+// order ranks by. With `attesting` only attested samples count.
 func (self *ExtenderDirectory) MeasuredLatencies(ipVersion int, attesting bool) []time.Duration {
+	return self.usableLatencies(ipVersion, attesting, true)
+}
+
+// The latency samples a probe pass counts its window over (DESIGNNOTES4.md
+// §4): every current sample of a usable address of one family (0 for any)
+// that is not due a refresh, since one that is will be measured again
+// (RefreshLatencies). With `attesting` only attested samples count.
+func (self *ExtenderDirectory) probeWindowLatencies(ipVersion int, attesting bool) []time.Duration {
+	return self.usableLatencies(ipVersion, attesting, false)
+}
+
+// The current latency samples of the usable addresses of one family, with or
+// without the samples due a refresh.
+func (self *ExtenderDirectory) usableLatencies(ipVersion int, attesting bool, includeRefreshDue bool) []time.Duration {
 	now := self.settings.Now()
 
 	self.stateLock.Lock()
@@ -1803,6 +1835,9 @@ func (self *ExtenderDirectory) MeasuredLatencies(ipVersion int, attesting bool) 
 
 	latencies := []time.Duration{}
 	for _, address := range self.usableAddressesWithLock(ipVersion, now, nil) {
+		if address.latencyRefreshDue && !includeRefreshDue {
+			continue
+		}
 		if latency, measured := self.latencyWithLock(address, now, attesting); measured {
 			latencies = append(latencies, latency)
 		}
@@ -1832,6 +1867,7 @@ func (self *ExtenderDirectory) candidateWithLock(
 	if latency, measured := self.latencyWithLock(address, now, false); measured {
 		candidate.Latency = latency
 		candidate.LatencyAttested = address.latencyAttested
+		candidate.LatencyRefreshDue = address.latencyRefreshDue
 	}
 	keyRecord := self.keyHexRecords[address.publicKeyHex]
 	if keyRecord == nil || keyRecord.recordBody == nil {

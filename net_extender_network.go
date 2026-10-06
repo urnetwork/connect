@@ -124,14 +124,15 @@ type ExtenderNetworkClientSettings struct {
 	ProbeCloseFloor  time.Duration
 
 	// A resume from a sleep of at least ResumeMinSleep is a path change for
-	// measurement (DESIGNNOTES4.md §6): the samples taken before the sleep are
-	// dropped, and the probe pass measures again once a sample has completed
-	// after it. Every timer here runs on the monotonic clock, which stops
-	// while the host sleeps, so the probe loop reads the host clock every
-	// ResumeCheckTimeout while it waits, and acts on a resume once the host
-	// has stayed awake that long since the check that saw the sleep
-	// (hostResumeWatch). The defaults, fifteen minutes and a minute, are
-	// argued at defaultResumeMinSleep. <= 0 for either disables it.
+	// measurement (DESIGNNOTES4.md §6): the samples taken before the sleep
+	// stay in use, due a refresh, and the probe pass measures them again once
+	// a sample has completed after it. Every timer here runs on the monotonic
+	// clock, which stops while the host sleeps, so the probe loop reads the
+	// host clock every ResumeCheckTimeout while it waits, and acts on a
+	// resume once the host has stayed awake that long since the check that
+	// saw the sleep (hostResumeWatch). The defaults, fifteen minutes and a
+	// minute, are argued at defaultResumeMinSleep. <= 0 for either disables
+	// it.
 	ResumeCheckTimeout time.Duration
 	ResumeMinSleep     time.Duration
 
@@ -474,10 +475,14 @@ func (self *ExtenderNetworkClient) StatusMonitor() *MonitorValue[ExtenderNetwork
 // old path had it waiting for. A hello that failed on the old path is read
 // again at once as well.
 //
-// And it drops the latency samples, each of which measured the old path
-// (ExpireLatencies): the candidate order stops ranking by them, and the probe
-// pass that follows the first sample on the new path measures it, where the
-// old samples would have filled its window and kept it from probing.
+// The extender evidence stays: holds, limits, failure counts and latency
+// samples are kept, since an extender that answered, failed or was fast on
+// the old path most likely is on the new one too, and learning it all again
+// would cost dials and time after every network or link change. The samples
+// measured the old path, so they are due a refresh (RefreshLatencies): the
+// candidate order keeps ranking by them, and the probe pass that follows the
+// first sample on the new path measures them again, each new sample replacing
+// an old one as it lands.
 func (self *ExtenderNetworkClient) networkChanged() {
 	feedStream := func() *ExtenderFeedStream {
 		self.stateLock.Lock()
@@ -487,7 +492,7 @@ func (self *ExtenderNetworkClient) networkChanged() {
 		return self.feedStream
 	}()
 	self.directory.ExpireCountryHint()
-	self.directory.ExpireLatencies()
+	self.directory.RefreshLatencies()
 	if feedStream != nil {
 		feedStream.Close()
 	}
@@ -1630,7 +1635,8 @@ func (self *ExtenderNetworkClient) ProbeAttestor() (*ExtenderProbeAttestor, *Ext
 
 // The probe loop: one pass on every wake -- a bootstrap, a completed sample,
 // a hint, an attestor -- and on the refresh cadence. A pass only measures
-// what has no current sample, so a burst of wakes costs little.
+// what has no current sample, or one due a refresh, so a burst of wakes costs
+// little.
 //
 // Its timers run on the monotonic clock, which stops while the host sleeps,
 // so a host that woke on the same path would wait out the rest of the refresh
@@ -1718,13 +1724,16 @@ func (self *ExtenderNetworkClient) probePass() {
 	}
 }
 
-// Measures the candidates of one family that have no current sample, hinted
-// continent first, until the window holds enough close extenders
-// (DESIGNNOTES4.md §4). With an attestor a sample counts only once the target
-// co-signed it (GEOMAP §2.3), so a provider that just started measures -- and
-// attests -- what a ranking pass already measured, and a target that refused
-// or sent no verdict is measured again on the next pass. Reports whether
-// anything was probed.
+// Measures the candidates of one family that have no current sample, or one
+// due a refresh, hinted continent first, until the window holds enough close
+// extenders (DESIGNNOTES4.md §4). A sample due a refresh -- one from before a
+// path change or a long sleep -- keeps ranking but does not count toward the
+// window, so the pass measures it again, and the new sample replaces it as it
+// lands. With an attestor a sample counts only once the target co-signed it
+// (GEOMAP §2.3), so a provider that just started measures -- and attests --
+// what a ranking pass already measured, and a target that refused or sent no
+// verdict is measured again on the next pass. Reports whether anything was
+// probed.
 func (self *ExtenderNetworkClient) probeFamily(
 	ipVersion int,
 	attestor *ExtenderProbeAttestor,
@@ -1733,7 +1742,7 @@ func (self *ExtenderNetworkClient) probeFamily(
 	attesting := attestor != nil
 	closeCount := func() int {
 		return extenderCloseCount(
-			self.directory.MeasuredLatencies(ipVersion, attesting),
+			self.directory.probeWindowLatencies(ipVersion, attesting),
 			self.settings.ProbeCloseFactor,
 			self.settings.ProbeCloseFloor,
 		)
@@ -1758,8 +1767,9 @@ func (self *ExtenderNetworkClient) probeFamily(
 		if self.settings.ProbeWindowCount <= closeCount() {
 			return probed
 		}
-		if 0 < candidate.Latency && (!attesting || candidate.LatencyAttested) {
-			// a current sample; the pass is for what has none
+		if 0 < candidate.Latency && !candidate.LatencyRefreshDue && (!attesting || candidate.LatencyAttested) {
+			// a current sample; the pass is for what has none, or one due a
+			// refresh
 			continue
 		}
 		probed = true
