@@ -34,9 +34,11 @@ import (
 // The loop runs on five triggers (G3): start, the 24 hour tick, the own key
 // observed revoked in the directory, a changed caller address from hello, and a
 // network change. Everything else is backoff: a refusal holds the next attempt
-// for ten minutes, doubling to six hours, and a success resets it.
+// for ten minutes, doubling to six hours, and a success resets it. The tick,
+// the address check and the backoff count the time the host slept, from the
+// first minute it is awake after a sleep of fifteen minutes or more.
 //
-// Every clock and every side effect is a settings seam -- `Now`,
+// Every clock and every side effect is a settings seam -- `Now`, `PassAfter`,
 // `IpVersionSupported`, `AddNetworkChangeListener` -- so the whole loop is
 // deterministic in tests.
 //
@@ -179,9 +181,23 @@ type ExtenderActivatorSettings struct {
 	MaxBackoff time.Duration
 	// Budget of one activation post and of one hello.
 	RequestTimeout time.Duration
+	// A resume from a sleep of at least ResumeMinSleep pulls the address
+	// check and the re-activation forward by the time slept, so each comes
+	// due as it would have had its timer run through the sleep: the loop's
+	// timers run on the monotonic clock, which stops while the host sleeps.
+	// The loop reads the host clock every ResumeCheckTimeout while it waits,
+	// and acts once per resume, when the host has stayed awake that long
+	// since the check that saw the sleep (hostResumeWatch). The defaults are
+	// argued at defaultResumeMinSleep. <= 0 for either disables it.
+	ResumeCheckTimeout time.Duration
+	ResumeMinSleep     time.Duration
 
 	// The only clock this loop reads. Tests install a fake one.
 	Now func() time.Time
+	// When set, replaces time.After as the loop's waits: until the next pass
+	// is due, and each resume check while it waits (ResumeCheckTimeout).
+	// Tests fire the checks through it, and hold the loop without a sleep.
+	PassAfter func(wait time.Duration) <-chan time.Time
 	// IpVersionSupported, when set, replaces the host family probe. Nil uses
 	// FamilySupported, which is what a family without a global address answers
 	// no for (G3).
@@ -202,6 +218,8 @@ func DefaultExtenderActivatorSettings() *ExtenderActivatorSettings {
 		MinBackoff:          10 * time.Minute,
 		MaxBackoff:          6 * time.Hour,
 		RequestTimeout:      60 * time.Second,
+		ResumeCheckTimeout:  defaultResumeCheckTimeout,
+		ResumeMinSleep:      defaultResumeMinSleep,
 		Now:                 time.Now,
 	}
 }
@@ -426,11 +444,26 @@ func (self *ExtenderActivator) changedWithLock() {
 // or a trigger says so. Everything the pass needs is read after the subscribe
 // above it, so a trigger that lands while the pass runs is carried into the
 // next wait rather than lost.
+//
+// The deadlines are monotonic, and the monotonic clock stops while the host
+// sleeps, so the wait reads the host clock at every wakeup, and at least every
+// ResumeCheckTimeout, to tell a resume (hostResumeWatch). A resume pulls both
+// deadlines forward by the time slept and starts a pass.
 func (self *ExtenderActivator) run() {
 	backoff := self.settings.MinBackoff
 	var nextActivateTime time.Time
 	var nextAddressCheckTime time.Time
 	var clientAddress string
+
+	passAfter := self.settings.PassAfter
+	if passAfter == nil {
+		passAfter = time.After
+	}
+	resumeWatch := newHostResumeWatch(
+		self.settings.ResumeMinSleep,
+		self.settings.ResumeCheckTimeout,
+		self.settings.Now(),
+	)
 
 	for {
 		select {
@@ -496,12 +529,37 @@ func (self *ExtenderActivator) run() {
 			wait = self.settings.MinBackoff
 		}
 
-		select {
-		case <-self.ctx.Done():
-			return
-		case <-wake:
-		case <-directoryChange:
-		case <-time.After(wait):
+		dueAfter := passAfter(wait)
+		for waiting := true; waiting; {
+			// nil, which never fires, when resumes are not watched
+			var checkAfter <-chan time.Time
+			if resumeWatch.Watching() {
+				checkAfter = passAfter(self.settings.ResumeCheckTimeout)
+			}
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-wake:
+				waiting = false
+			case <-directoryChange:
+				waiting = false
+			case <-dueAfter:
+				waiting = false
+			case <-checkAfter:
+			}
+			if sleep, resumed := resumeWatch.Check(self.settings.Now()); resumed {
+				// what came due while the host slept is due now
+				pullForward := func(deadline time.Time) time.Time {
+					if deadline.IsZero() {
+						return deadline
+					}
+					return deadline.Add(-sleep)
+				}
+				nextActivateTime = pullForward(nextActivateTime)
+				nextAddressCheckTime = pullForward(nextAddressCheckTime)
+				self.log.Infof("[extender]activate resumed after %s asleep\n", sleep.Round(time.Second))
+				waiting = false
+			}
 		}
 	}
 }

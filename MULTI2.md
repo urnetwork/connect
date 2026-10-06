@@ -264,7 +264,11 @@ one bad pass cannot strip the window. `StandingReserve` and
 ## 7. Device-side reality
 
 - `schedulerPauseDetected`: a host that slept between polls defers stale
-  evidence for a recovery window instead of convicting on the gap.
+  evidence for a recovery window instead of convicting on the gap. A wait
+  counts the time the host slept as well as its monotonic time
+  (`schedulerPauseElapsed`): the monotonic clock under every timer stops while
+  the host sleeps on darwin, linux and android, so a closed lid shows only as
+  the wall clock's lead.
 - `DegradedLivenessScale`: low-power/thermal/constrained hosts stretch the
   probe and idle-ping cadences — a false removal (flow RSTs + reconnect
   churn) costs more than late detection.

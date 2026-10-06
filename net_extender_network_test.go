@@ -156,8 +156,6 @@ func TestExtenderNetworkClientBootstrapsAndAppliesHelloRootKeys(t *testing.T) {
 		t.Fatal("the bootstrap never resolved")
 	}
 
-	// the change monitor is the barrier; the pass applies the hello keys before
-	// it adds the bootstrap addresses, so these landing proves the keys did
 	waitForDirectoryAddresses(t, directory, map[string]string{
 		"192.0.2.200":   ExtenderSourceDns,
 		"2001:db8::200": ExtenderSourceDns,
@@ -169,6 +167,19 @@ func TestExtenderNetworkClientBootstrapsAndAppliesHelloRootKeys(t *testing.T) {
 	if entry.State != ExtenderStateUnverified && entry.State != ExtenderStateHold && entry.State != ExtenderStateWarning {
 		t.Fatalf("state = %s, expected an unverified bootstrap address", entry.State)
 	}
+
+	// the same answer carries the operator's gossip identity, which the member
+	// role's node dials (C6, D3). Hello runs beside the pass, and the status
+	// names the identity once the keys that came with it are in force, so it
+	// is the barrier for them too.
+	waitForExtenderNetworkStatus(
+		t,
+		networkClient,
+		"the operator gossip peer id",
+		func(status ExtenderNetworkClientStatus) bool {
+			return status.GossipPeerId == testExtenderGossipPeerId
+		},
+	)
 
 	// the hello keys are the anchor now, so a record signed by them applies
 	record := signTestRecord(
@@ -182,17 +193,6 @@ func TestExtenderNetworkClientBootstrapsAndAppliesHelloRootKeys(t *testing.T) {
 	if _, err := directory.ApplyRecord(record, ExtenderSourceFeed); err != nil {
 		t.Fatalf("the hello root keys were never applied: %v", err)
 	}
-
-	// the same answer carries the operator's gossip identity, which the member
-	// role's node dials (C6, D3)
-	waitForExtenderNetworkStatus(
-		t,
-		networkClient,
-		"the operator gossip peer id",
-		func(status ExtenderNetworkClientStatus) bool {
-			return status.GossipPeerId == testExtenderGossipPeerId
-		},
-	)
 }
 
 // The first attempt is marked complete even when nothing answers, so the

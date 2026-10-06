@@ -72,7 +72,15 @@ type SnSetWalletArgs struct {
 	Signature   string `json:"signature,omitempty"`
 }
 
+// A refused set's stable code, when it has one ("" otherwise).
+// The signature is well formed but does not verify for the coldkey over the
+// challenge (in practice: signed with another account than the address).
+const SnSetWalletErrorCodeSignatureMismatch = "signature_mismatch"
+
 type SnSetWalletError struct {
+	// one of the `SnSetWalletErrorCode*` values; absent from older servers
+	// and for other refusals
+	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
 }
 

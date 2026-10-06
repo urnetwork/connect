@@ -191,7 +191,7 @@ func (self *ExtenderDirectory) tierUpdateWithLock(keyHex string, now time.Time) 
 			if address.source == ExtenderSourceManual {
 				manual = true
 			}
-			if now.Before(address.holdUntilTime) {
+			if extenderBefore(now, address.holdUntilTime) {
 				holdLapseTime = earliest(holdLapseTime, address.holdUntilTime)
 			} else {
 				held = false
@@ -288,9 +288,10 @@ func (self *ExtenderDirectory) tierRebuildWithLock(now time.Time) {
 }
 
 // Rebuilds the index when a pooled record has changed pool with the clock
-// alone since it was last built.
+// alone since it was last built: when either clock has reached the sweep time,
+// as for the hold and the sample it was taken from (extenderBefore).
 func (self *ExtenderDirectory) tierSweepIfDueWithLock(now time.Time) {
-	if !self.tierSweepTime.IsZero() && !now.Before(self.tierSweepTime) {
+	if !self.tierSweepTime.IsZero() && !extenderBefore(now, self.tierSweepTime) {
 		self.tierRebuildWithLock(now)
 	}
 }
@@ -429,7 +430,7 @@ func (self *ExtenderDirectory) nearPeerKeyHexes(count int, ownKeyHex string) ([]
 		var bestAddress *extenderDirectoryAddress
 		for _, ip := range self.keyHexRecords[keyHex].ips {
 			address := self.ipAddresses[ip]
-			if address == nil || address.publicKeyHex != keyHex || now.Before(address.holdUntilTime) {
+			if address == nil || address.publicKeyHex != keyHex || extenderBefore(now, address.holdUntilTime) {
 				continue
 			}
 			if bestAddress == nil || self.compareCandidateWithLock(address, bestAddress, now) < 0 {
@@ -592,7 +593,7 @@ func (self *ExtenderDirectory) peerCandidate(keyHex string, ipVersion int) *Exte
 		if ipVersion != 0 && addressIpVersion(ip) != ipVersion {
 			continue
 		}
-		if now.Before(address.holdUntilTime) || now.Before(address.limitedUntilTime) {
+		if extenderBefore(now, address.holdUntilTime) || extenderBefore(now, address.limitedUntilTime) {
 			continue
 		}
 		if bestAddress == nil || self.compareCandidateWithLock(address, bestAddress, now) < 0 {

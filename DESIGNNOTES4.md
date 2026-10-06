@@ -165,7 +165,21 @@ the relay's. Where the hint cannot be fetched -- on a whitelist-only mobile
 network no operator address is routable, and with a manual extender or a
 proxy configured the client makes no direct request at all -- the country
 falls back to the network country the host reports (`SetNetworkCountryCode`);
-a path change makes the hint's country stale and asks for the hint again.
+a path change makes the hint's country stale and asks for the hint again. On a
+host that reports none, the operator's last answered country stands in for a
+week after that answer (`CountryHintMaxAge`). It is stored with the directory,
+so a restart keeps it, and any direct answer replaces it. A path change does not
+drop it: the path change carries no network identity, and the move from home
+Wi-Fi onto a whitelist-only mobile network is itself a path change.
+
+The hint is read in a loop of its own beside the refresh pass, never ahead
+of it: the pass needs nothing from the answer (the country falls back, and
+the operator's continent overrides the DNS inference whenever it lands), so
+an operator that only extenders reach costs the bootstrap and the sample
+nothing. A failed read is asked again only once its backoff has passed, one
+minute doubling with each further failure on the same path up to six hours;
+a path change asks again at once. The first probe pass waits for the first
+read, so it still probes the operator's continent first.
 
 The probe pass runs after bootstrap and before the feed dial: up to `n` probes
 per extender, stopping once `m` candidates are "close enough" — within
@@ -199,8 +213,24 @@ reorder them.
 - The prior is a continent, not a metro. Two extenders on the same continent
   can be 100 ms apart; the probe is what tells them apart, and the prior only
   decides who gets probed first.
-- A latency sample is per address and per process. It is not persisted:
-  yesterday's path is not today's.
+- A latency sample is per address, per process and per path. It is not
+  persisted, and a path change drops it (`ExpireLatencies`): yesterday's path
+  is not today's, nor is the one before a path change. Its age is the longer
+  of what the monotonic and the wall clock say, so a host that slept past
+  `LatencyMaxAge` measures again (the monotonic clock stops while the host
+  sleeps), and a wall clock set back keeps it no longer.
+- A resume from a sleep of at least `ResumeMinSleep` (15 min) is a path change
+  for measurement, so a host that wakes on the same path, with no path change
+  to wake its timers, measures again within minutes rather than at the end of
+  a refresh period of awake time. The probe loop reads the host clock every
+  `ResumeCheckTimeout` (1 min) while it waits, and the wall clock moving past
+  the monotonic one between two checks is the sleep. Once the host has stayed
+  awake a check since, the samples taken before the sleep go
+  (`ExpireSleptLatencies`), and the probe pass follows the first sample that
+  completes after the sleep, so it never probes a path that has not worked
+  since: a feed stream from before the sleep is replaced to take one. Holds,
+  the hint and its country stay. A wall clock set forward that far reads as a
+  sleep and costs one probe pass; one set back hides as much sleep.
 - The hint endpoint tells a client its own continent as the operator sees it.
   That is information the operator already holds and the client's own DNS
   resolver already acted on; it is not a new disclosure in either direction.

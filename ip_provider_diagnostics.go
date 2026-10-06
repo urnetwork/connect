@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"hash"
 	"io"
 	"reflect"
 
@@ -12,22 +11,29 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// SecurityPolicyRulesGeneration orders the built-in security policy rules.
-// Every change to what the built-in policy admits or drops must raise it by
-// one: adding a detector or an exception, changing an exception's prefix
-// snapshot, or changing a default setting. Never lower it. With the raise, pin
-// the new generation's rules digest in securityPolicyRulesPins
+// Orders the built-in security policy rules.
+// Every reviewed change to what the built-in policy admits or drops must
+// raise it by one: adding a detector or an exception, changing a
+// hand-maintained exception table (the Steam and Telegram snapshots), or
+// changing a default setting. Never lower it. With the raise, pin the new
+// generation's rules digest in securityPolicyRulesPins
 // (ip_provider_diagnostics_test.go); TestSecurityPolicyRulesGenerationPin
-// fails and prints the digest when a default setting or an exception table
-// changed without one. Providers report the generation in
+// fails and prints the digest when a default setting or a hand-maintained
+// exception table changed without one. Providers report the generation in
 // IpProviderDiagnostics so a client can tell a provider with older rules from
 // one with newer rules, which SecurityPolicyHash cannot: a digest has no
 // order, and it differs between devices of one build because MaxFlows scales
-// with memory. The feed-generated CFAA tables are refreshed by every release
-// build and are identified only by the hash.
+// with memory.
+//
+// The feed-generated tables, the CFAA blocklists and the Meta prefixes of the
+// WhatsApp exception, are refreshed by every release build and are identified
+// only by the hash. A release orders them by itself, and raising the
+// generation for a registry refresh would mark every provider not yet on that
+// release as older to the clients that are, so the client preference would
+// arm on any drop at most of the fleet (docs/IP_SECURITY.md §2.4.2).
 const SecurityPolicyRulesGeneration uint64 = 2
 
-// SecurityPolicyGeneration returns the rules generation a policy enforces:
+// The rules generation a policy enforces:
 // SecurityPolicyRulesGeneration for the built-in policy in either direction,
 // whatever its memory-scaled settings, and 0 (unknown) for a disabled or
 // custom policy.
@@ -50,10 +56,11 @@ type SecurityPolicyIdentity interface {
 }
 
 // SecurityPolicyHash returns a stable digest for the effective policy. The
-// built-in digest includes every policy setting and both generated endpoint
-// tables. Opaque custom policies may implement SecurityPolicyIdentity; the
-// fallback identifies their concrete type and build, which is deliberately
-// less authoritative but still detects stale binaries.
+// built-in digest includes every policy setting and the feed-generated
+// tables (the CFAA blocklists and the Meta prefixes). Opaque custom policies
+// may implement SecurityPolicyIdentity; the fallback identifies their
+// concrete type and build, which is deliberately less authoritative but still
+// detects stale binaries.
 func SecurityPolicyHash(policy SecurityPolicy) string {
 	if identity, ok := policy.(SecurityPolicyIdentity); ok {
 		if value := identity.SecurityPolicyHash(); value != "" {
@@ -65,7 +72,11 @@ func SecurityPolicyHash(policy SecurityPolicy) string {
 	return hex.EncodeToString(digest.Sum(nil))
 }
 
-func writeSecurityPolicyIdentity(digest hash.Hash, policy SecurityPolicy) {
+// Writes what identifies the policy's effective rules to digest: for the
+// built-in policy, in either direction, every setting and the feed-generated
+// tables; for a disabled policy its kind; for any other policy its type and
+// build.
+func writeSecurityPolicyIdentity(digest io.Writer, policy SecurityPolicy) {
 	io.WriteString(digest, "urnetwork-security-policy-v1\x00")
 	switch concrete := policy.(type) {
 	case *reverseSecurityPolicy:
@@ -91,6 +102,11 @@ func writeSecurityPolicyIdentity(digest hash.Hash, policy SecurityPolicy) {
 		io.WriteString(digest, cfaaBlockedPrefixData)
 		io.WriteString(digest, "\x00cfaa6\x00")
 		io.WriteString(digest, cfaaBlockedPrefix6Data)
+		io.WriteString(digest, "\x00meta\x00")
+		for _, prefix := range metaNetworkPrefixes {
+			io.WriteString(digest, prefix.String())
+			io.WriteString(digest, "\n")
+		}
 	case *disableSecurityPolicy:
 		io.WriteString(digest, "disabled\x00")
 	default:

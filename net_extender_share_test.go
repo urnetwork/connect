@@ -244,7 +244,7 @@ func TestExtenderShareCarriesControlDohUrls(t *testing.T) {
 		true,
 		0,
 	)
-	share.Settings.ControlDohUrlsIpv4 = []string{"https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"}
+	share.Settings.ControlDohUrlsIpv4 = []string{"https://192.0.2.53/dns-query", "https://198.51.100.53/dns-query"}
 	share.Settings.ControlDohUrlsIpv6 = []string{"https://[2001:db8::53]/dns-query"}
 	text, err := EncodeExtenderShare(share)
 	if err != nil {
@@ -268,10 +268,10 @@ func TestExtenderShareCarriesControlDohUrls(t *testing.T) {
 		dohUrlsIpv4 []string
 		dohUrlsIpv6 []string
 	}{
-		{what: "a host name", dohUrlsIpv4: []string{"https://dns.alidns.com/dns-query"}},
-		{what: "plain http", dohUrlsIpv4: []string{"http://223.5.5.5/dns-query"}},
+		{what: "a host name", dohUrlsIpv4: []string{"https://dns.resolver.example/dns-query"}},
+		{what: "plain http", dohUrlsIpv4: []string{"http://192.0.2.53/dns-query"}},
 		{what: "a v6 server in the v4 list", dohUrlsIpv4: []string{"https://[2001:db8::53]/dns-query"}},
-		{what: "a v4 server in the v6 list", dohUrlsIpv6: []string{"https://223.5.5.5/dns-query"}},
+		{what: "a v4 server in the v6 list", dohUrlsIpv6: []string{"https://192.0.2.53/dns-query"}},
 		{what: "too many servers", dohUrlsIpv4: tooMany},
 	}
 	for _, c := range cases {

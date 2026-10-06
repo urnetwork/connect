@@ -17,49 +17,52 @@ import (
 // provider that is still online comes back with the same egress ip. Exits
 // lost to a verdict, and every window that is not sticky, discover as before.
 
-// stickyRedialTestGenerator answers plain discovery with a fixed set, and a
-// named request with the named provider while it is online.
+// Answers plain discovery with a fixed set, and a named request with the named
+// provider while it is online.
 type stickyRedialTestGenerator struct {
 	testingEmptyMultiClientGenerator
 
-	stateLock      sync.Mutex
-	discovered     map[MultiHopId]DestinationStats
-	online         map[Id]bool
-	namedErr       error
-	namedRequests  []Id
-	discoveryCount int
+	stateLock              sync.Mutex
+	discoveredDestinations map[MultiHopId]DestinationStats
+	onlineClientIds        map[Id]bool
+	namedErr               error
+	namedClientIds         []Id
+	discoveryCount         int
 }
 
+// Plain discovery: the fixed set, counted.
 func (self *stickyRedialTestGenerator) NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.discoveryCount += 1
-	return maps.Clone(self.discovered), nil
+	return maps.Clone(self.discoveredDestinations), nil
 }
 
+// A named request: the named provider while it is online, else nothing, as
+// the platform answers a provider it excludes.
 func (self *stickyRedialTestGenerator) NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	self.namedRequests = append(self.namedRequests, clientId)
+	self.namedClientIds = append(self.namedClientIds, clientId)
 	if self.namedErr != nil {
 		return nil, self.namedErr
 	}
 	destinations := map[MultiHopId]DestinationStats{}
-	if self.online[clientId] {
+	if self.onlineClientIds[clientId] {
 		// a named answer carries no discovery stats
 		destinations[RequireMultiHopId(clientId)] = DestinationStats{}
 	}
 	return destinations, nil
 }
 
-func (self *stickyRedialTestGenerator) requests() (namedRequests []Id, discoveryCount int) {
+// The client ids asked for by name so far, and the plain discoveries.
+func (self *stickyRedialTestGenerator) requests() (namedClientIds []Id, discoveryCount int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return slices.Clone(self.namedRequests), self.discoveryCount
+	return slices.Clone(self.namedClientIds), self.discoveryCount
 }
 
-// stickyRedialTestWindow is a bare window holding a profile, for one
-// discovery round at a time.
+// A bare window holding a profile, for one discovery round at a time.
 func stickyRedialTestWindow(generator MultiClientGenerator, performanceProfile *PerformanceProfile) *multiClientWindow {
 	return &multiClientWindow{
 		ctx:                context.Background(),
@@ -72,7 +75,7 @@ func stickyRedialTestWindow(generator MultiClientGenerator, performanceProfile *
 	}
 }
 
-// stickyRedialTestStats are the discovery stats a lost exit was dialed with.
+// The discovery stats a lost exit was dialed with.
 func stickyRedialTestStats() DestinationStats {
 	return DestinationStats{
 		Tier:     1,
@@ -81,6 +84,8 @@ func stickyRedialTestStats() DestinationStats {
 	}
 }
 
+// The re-dial holds one exit, the latest remembered, until a round takes it
+// or a forget drops it.
 func TestStickyRedialHoldsOneExitUntilTaken(t *testing.T) {
 	redial := &stickyRedial{}
 	if _, _, ok := redial.Take(); ok {
@@ -145,8 +150,8 @@ func TestStickyRedialEnumeratesTheLostExitAlone(t *testing.T) {
 	lost := RequireMultiHopId(NewId())
 	other := RequireMultiHopId(NewId())
 	generator := &stickyRedialTestGenerator{
-		discovered: map[MultiHopId]DestinationStats{other: {}},
-		online:     map[Id]bool{lost.Tail(): true},
+		discoveredDestinations: map[MultiHopId]DestinationStats{other: {}},
+		onlineClientIds:        map[Id]bool{lost.Tail(): true},
 	}
 	window := stickyRedialTestWindow(generator, fixedIpTestProfile(WindowTypeSpeed))
 	window.stickyRedial.Remember(lost, stickyRedialTestStats())
@@ -158,8 +163,8 @@ func TestStickyRedialEnumeratesTheLostExitAlone(t *testing.T) {
 	AssertEqual(t, ordered[0].stickyRedial, true)
 	AssertEqual(t, ordered[0].stats.IpFamily, IpFamilyDualstack)
 	AssertEqual(t, ordered[0].stats.Location.CountryCode, "de")
-	namedRequests, discoveryCount := generator.requests()
-	AssertEqual(t, namedRequests, []Id{lost.Tail()})
+	namedClientIds, discoveryCount := generator.requests()
+	AssertEqual(t, namedClientIds, []Id{lost.Tail()})
 	AssertEqual(t, discoveryCount, 0)
 
 	// taken: the next round discovers as usual
@@ -168,8 +173,8 @@ func TestStickyRedialEnumeratesTheLostExitAlone(t *testing.T) {
 	AssertEqual(t, len(ordered), 1)
 	AssertEqual(t, ordered[0].destination, other)
 	AssertEqual(t, ordered[0].stickyRedial, false)
-	namedRequests, discoveryCount = generator.requests()
-	AssertEqual(t, len(namedRequests), 1)
+	namedClientIds, discoveryCount = generator.requests()
+	AssertEqual(t, len(namedClientIds), 1)
 	AssertEqual(t, discoveryCount, 1)
 }
 
@@ -179,7 +184,7 @@ func TestStickyRedialFallsBackWhenTheProviderIsGone(t *testing.T) {
 	lost := RequireMultiHopId(NewId())
 	other := RequireMultiHopId(NewId())
 	generator := &stickyRedialTestGenerator{
-		discovered: map[MultiHopId]DestinationStats{other: {}},
+		discoveredDestinations: map[MultiHopId]DestinationStats{other: {}},
 	}
 	window := stickyRedialTestWindow(generator, fixedIpTestProfile(WindowTypeSpeed))
 	window.stickyRedial.Remember(lost, stickyRedialTestStats())
@@ -189,8 +194,8 @@ func TestStickyRedialFallsBackWhenTheProviderIsGone(t *testing.T) {
 	AssertEqual(t, len(ordered), 1)
 	AssertEqual(t, ordered[0].destination, other)
 	AssertEqual(t, ordered[0].stickyRedial, false)
-	namedRequests, discoveryCount := generator.requests()
-	AssertEqual(t, namedRequests, []Id{lost.Tail()})
+	namedClientIds, discoveryCount := generator.requests()
+	AssertEqual(t, namedClientIds, []Id{lost.Tail()})
 	AssertEqual(t, discoveryCount, 1)
 	if _, _, ok := window.stickyRedial.Take(); ok {
 		t.Fatal("a provider the platform did not return stayed pending")
@@ -223,8 +228,8 @@ func TestStickyRedialIgnoredOutsideAStickyWindow(t *testing.T) {
 	lost := RequireMultiHopId(NewId())
 	other := RequireMultiHopId(NewId())
 	generator := &stickyRedialTestGenerator{
-		discovered: map[MultiHopId]DestinationStats{other: {}},
-		online:     map[Id]bool{lost.Tail(): true},
+		discoveredDestinations: map[MultiHopId]DestinationStats{other: {}},
+		onlineClientIds:        map[Id]bool{lost.Tail(): true},
 	}
 	window := stickyRedialTestWindow(generator, unfixedTestProfile(WindowTypeSpeed))
 	window.stickyRedial.Remember(lost, stickyRedialTestStats())
@@ -233,8 +238,8 @@ func TestStickyRedialIgnoredOutsideAStickyWindow(t *testing.T) {
 	AssertEqual(t, err, nil)
 	AssertEqual(t, len(ordered), 1)
 	AssertEqual(t, ordered[0].destination, other)
-	namedRequests, _ := generator.requests()
-	AssertEqual(t, len(namedRequests), 0)
+	namedClientIds, _ := generator.requests()
+	AssertEqual(t, len(namedClientIds), 0)
 
 	sticky := stickyRedialTestWindow(generator, fixedIpTestProfile(WindowTypeSpeed))
 	sticky.stickyRedial.Remember(lost, stickyRedialTestStats())
@@ -249,8 +254,8 @@ func TestStickyRedialIgnoredOutsideAStickyWindow(t *testing.T) {
 	}
 }
 
-// stickyTestLostChannel is an exit whose window stats now fail with err, as
-// the channel's own detector leaves it when it ends.
+// An exit whose window stats now fail with err, as the channel's own detector
+// leaves it when it ends.
 func stickyTestLostChannel(err error) *multiClientChannel {
 	client := stickyTestPastLifetimeChannel()
 	// a fresh exit, so only the loss can remove it
@@ -259,9 +264,8 @@ func stickyTestLostChannel(err error) *multiClientChannel {
 	return client
 }
 
-// waitStickyTestDiscoveries waits until plain discovery has run `count`
-// more times, which in a live window means its enumerator has started that
-// many more rounds after the loss.
+// Waits until plain discovery has run `count` more times, which in a live
+// window means its enumerator has started that many more rounds after the loss.
 func waitStickyTestDiscoveries(t *testing.T, generator *stickyRedialTestGenerator, count int) {
 	t.Helper()
 	_, start := generator.requests()
@@ -283,8 +287,8 @@ func waitStickyTestDiscoveries(t *testing.T, generator *stickyRedialTestGenerato
 // on whatever provider ranked first, with a new egress ip.
 func TestStickyExitTransportLossRedialsTheSameProvider(t *testing.T) {
 	generator := &stickyRedialTestGenerator{
-		discovered: map[MultiHopId]DestinationStats{},
-		online:     map[Id]bool{},
+		discoveredDestinations: map[MultiHopId]DestinationStats{},
+		onlineClientIds:        map[Id]bool{},
 	}
 	window := stickyTestWindow(t, generator, WindowTypeSpeed, fixedIpTestProfile(WindowTypeSpeed))
 	client := stickyTestLostChannel(errTransportDownTimeout)
@@ -292,7 +296,7 @@ func TestStickyExitTransportLossRedialsTheSameProvider(t *testing.T) {
 
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		if namedRequests, _ := generator.requests(); slices.Contains(namedRequests, client.Destination().Tail()) {
+		if namedClientIds, _ := generator.requests(); slices.Contains(namedClientIds, client.Destination().Tail()) {
 			break
 		}
 		if deadline.Before(time.Now()) {
@@ -315,28 +319,28 @@ func TestStickyExitVerdictAndUnstickyLossDiscoverAsBefore(t *testing.T) {
 		err                error
 	}{
 		{
-			"Fixed IP exit lost to a blackhole verdict",
-			WindowTypeSpeed,
-			fixedIpTestProfile(WindowTypeSpeed),
-			errors.New("Blackhole no-receive-ack (send 4/400B recv 0/0B syn 1/0 nackAge 0s synAge 0s dsts=2)"),
+			name:               "Fixed IP exit lost to a blackhole verdict",
+			windowType:         WindowTypeSpeed,
+			performanceProfile: fixedIpTestProfile(WindowTypeSpeed),
+			err:                errors.New("Blackhole no-receive-ack (send 4/400B recv 0/0B syn 1/0 nackAge 0s synAge 0s dsts=2)"),
 		},
 		{
-			"speed exit without Fixed IP lost to transport loss",
-			WindowTypeSpeed,
-			unfixedTestProfile(WindowTypeSpeed),
-			errTransportDownTimeout,
+			name:               "speed exit without Fixed IP lost to transport loss",
+			windowType:         WindowTypeSpeed,
+			performanceProfile: unfixedTestProfile(WindowTypeSpeed),
+			err:                errTransportDownTimeout,
 		},
 		{
-			"auto speed exit lost to transport loss",
-			WindowTypeSpeed,
-			nil,
-			errTransportDownTimeout,
+			name:               "auto speed exit lost to transport loss",
+			windowType:         WindowTypeSpeed,
+			performanceProfile: nil,
+			err:                errTransportDownTimeout,
 		},
 	}
 	for _, c := range cases {
 		generator := &stickyRedialTestGenerator{
-			discovered: map[MultiHopId]DestinationStats{},
-			online:     map[Id]bool{},
+			discoveredDestinations: map[MultiHopId]DestinationStats{},
+			onlineClientIds:        map[Id]bool{},
 		}
 		window := stickyTestWindow(t, generator, c.windowType, c.performanceProfile)
 		client := stickyTestLostChannel(c.err)
@@ -350,7 +354,7 @@ func TestStickyExitVerdictAndUnstickyLossDiscoverAsBefore(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 		waitStickyTestDiscoveries(t, generator, 2)
-		if namedRequests, _ := generator.requests(); 0 < len(namedRequests) {
+		if namedClientIds, _ := generator.requests(); 0 < len(namedClientIds) {
 			t.Fatalf("%s: the window asked for the lost provider by name", c.name)
 		}
 	}

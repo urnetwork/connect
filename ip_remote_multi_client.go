@@ -167,14 +167,13 @@ type MultiClientGeneratorWithIpFamily interface {
 	NextDestinationsWithIpFamily(count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error)
 }
 
-// MultiClientGeneratorWithClientId is an optional generator capability:
-// discover one named provider instead of the generator's own specs. A sticky
-// window (the user's Fixed IP) uses it to ask for the exit it lost to
-// transport loss before it falls back to discovery, so a provider that is
-// still online comes back with the same egress ip. The platform applies its
-// usual exclusions to the named provider: an answer without it means "not
-// that provider". A generator without the capability is never asked, and the
-// window discovers as before.
+// An optional generator capability: discover one named provider instead of the
+// generator's own specs. A sticky window (the user's Fixed IP) uses it to ask
+// for the exit it lost to transport loss before it falls back to discovery, so
+// a provider that is still online comes back with the same egress ip. The
+// platform applies its usual exclusions to the named provider: an answer
+// without it means "not that provider". A generator without the capability is
+// never asked, and the window discovers as before.
 type MultiClientGeneratorWithClientId interface {
 	NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error)
 }
@@ -1000,7 +999,9 @@ type MultiClientSettings struct {
 	// SchedulerPauseTolerance is how much later than armed a timer may fire
 	// before the host is judged to have been suspended (doze, the app freezer,
 	// thermal throttling, a laptop lid). Concept ported from upstream main
-	// e05ecee's SchedulerPauseTolerance.
+	// e05ecee's SchedulerPauseTolerance. How late counts the time the host
+	// slept, which the monotonic clock under every timer does not count on
+	// darwin, linux and android (schedulerPauseElapsed).
 	//
 	// A suspended host looks exactly like a dead network from inside this
 	// process: no packets arrived, no acks landed, every clock aged. The uplink
@@ -1363,14 +1364,14 @@ func (self *WindowSizeSettings) Validate() error {
 		name  string
 		value int
 	}{
-		{"min", self.WindowSizeMin},
-		{"min p2p only", self.WindowSizeMinP2pOnly},
-		{"min ipv6 capable", self.WindowSizeMinIpv6Capable},
-		{"max", self.WindowSizeMax},
-		{"hard max", self.WindowSizeHardMax},
-		{"fixed", self.FixedWindowSize},
-		{"keep healthiest count", self.KeepHealthiestCount},
-		{"ulimit", self.Ulimit},
+		{name: "min", value: self.WindowSizeMin},
+		{name: "min p2p only", value: self.WindowSizeMinP2pOnly},
+		{name: "min ipv6 capable", value: self.WindowSizeMinIpv6Capable},
+		{name: "max", value: self.WindowSizeMax},
+		{name: "hard max", value: self.WindowSizeHardMax},
+		{name: "fixed", value: self.FixedWindowSize},
+		{name: "keep healthiest count", value: self.KeepHealthiestCount},
+		{name: "ulimit", value: self.Ulimit},
 	} {
 		if count.value < 0 {
 			return fmt.Errorf(
@@ -2888,10 +2889,10 @@ func performanceProfilesEqual(a *PerformanceProfile, b *PerformanceProfile) bool
 	return a.WindowSize == b.WindowSize
 }
 
-// SetPerformanceProfile installs the profile on every window and resets the
-// windows. A profile that does not validate is refused with its error and the
-// previous profile stays in force: the window size comes from the caller, and
-// a bad one must never panic the connection or reach the windows.
+// Installs the profile on every window and resets the windows. A profile that
+// does not validate is refused with its error and the previous profile stays in
+// force: the window size comes from the caller, and a bad one must never panic
+// the connection or reach the windows.
 func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) error {
 	performanceProfile = self.overrideAllowDirect(performanceProfile)
 	if performanceProfile != nil {
@@ -7783,14 +7784,27 @@ func schedulerPauseDetected(elapsed time.Duration, expected time.Duration, toler
 	return expected+tolerance < elapsed
 }
 
+// How long a wait from `start` to `now` lasted, for the pause detector and the
+// busy probe: the monotonic time it took, plus the time the host slept. A
+// frozen process (doze, the app freezer, thermal throttling) shows as monotonic
+// time, its timer firing late. A sleeping host (a closed lid) does not: the
+// monotonic clock stops while the host sleeps on darwin, linux and android, and
+// every timer with it, so the timer fires on time by that clock and the sleep
+// shows only as the wall clock's lead over it (hostSlept). A wall clock set
+// back adds nothing; one set forward past the tolerance reads as a pause, and
+// costs one recovery hold or one refreshed probe budget.
+func schedulerPauseElapsed(start time.Time, now time.Time) time.Duration {
+	return now.Sub(start) + max(0, hostSlept(now, start))
+}
+
 // runSchedulerPauseDetector watches for the host stopping underneath us.
 //
 // The instrument is deliberately the crudest one available: arm a timer, see
-// how long it actually took. Everything else this process could measure went
-// away with the cpu -- no packets arrived, no acks landed, no verdict pass ran
-// -- so the only observable left is that wall-clock time passed while we were
-// not running. That is exactly what doze, the app freezer, thermal throttling
-// and a closed lid look like from in here.
+// how long it actually took (schedulerPauseElapsed). Everything else this
+// process could measure went away with the cpu -- no packets arrived, no acks
+// landed, no verdict pass ran -- so the only observable left is that wall-clock
+// time passed while we were not running. That is exactly what doze, the app
+// freezer, thermal throttling and a closed lid look like from in here.
 //
 // Plain time.After, NOT WakeupAfter: the wakeup scheduler intentionally
 // coalesces timers to save radio wakeups, and a coalesced fire is precisely the
@@ -7806,14 +7820,19 @@ func (self *RemoteUserNatMultiClient) runSchedulerPauseDetector() {
 			return
 		case <-time.After(schedulerPauseProbeInterval):
 		}
+		self.observeSchedulerPause(armed, time.Now())
+	}
+}
 
-		// read the tolerance AFTER the wait so the runtime toggle takes effect
-		// without a reconnect, the same discipline the other loops here use
-		tolerance := self.reliabilitySettings().SchedulerPauseTolerance
-		elapsed := time.Since(armed)
-		if schedulerPauseDetected(elapsed, schedulerPauseProbeInterval, tolerance) {
-			self.notifySchedulerPause(elapsed)
-		}
+// Judges one wait of the pause detector, from the reading taken when it armed
+// and the one taken when it fired.
+func (self *RemoteUserNatMultiClient) observeSchedulerPause(armed time.Time, now time.Time) {
+	// read the tolerance AFTER the wait so the runtime toggle takes effect
+	// without a reconnect, the same discipline the other loops here use
+	tolerance := self.reliabilitySettings().SchedulerPauseTolerance
+	elapsed := schedulerPauseElapsed(armed, now)
+	if schedulerPauseDetected(elapsed, schedulerPauseProbeInterval, tolerance) {
+		self.notifySchedulerPause(elapsed)
 	}
 }
 
@@ -10152,8 +10171,8 @@ type multiClientWindow struct {
 	// qualificationRefreshFunc is handed to every channel for the receive-ack
 	// qualification refresh; see the channel field. nil on bare test windows.
 	qualificationRefreshFunc func(MultiHopId)
-	// providerPolicyPreference is the parent's, handed to every channel on its
-	// args (providerPolicyPreference). nil on bare test windows and when
+	// The parent's, handed to every channel on its args
+	// (providerPolicyPreference). nil on bare test windows and when
 	// disabled, which leaves every channel at its rank.
 	providerPolicyPreference *providerPolicyPreference
 	// clientMigrateFunc is G-3's drain-time seam: the parent's
@@ -10256,8 +10275,8 @@ type multiClientWindow struct {
 
 	// --- the user's Fixed IP (see ip_remote_multi_client_sticky.go) ---
 
-	// stickyRedial holds the exit a sticky window lost to transport loss,
-	// for the next discovery round to ask for first. Its own lock inside.
+	// The exit a sticky window lost to transport loss, for the next discovery
+	// round to ask for first. Its own lock inside.
 	stickyRedial stickyRedial
 }
 
@@ -11259,7 +11278,7 @@ func (self *multiClientWindow) resize() {
 						// apply. The one window that never drains is the
 						// user's Fixed IP (stickyExit), and lifetimeDrainDue
 						// has already excluded it: there the stable egress ip
-						// is the point. The warning only stops NEW flows from
+						// is the point. The warning only stops new flows from
 						// choosing this client (established flows keep
 						// running until they finish or the collapse deadline
 						// passes), and warnClient counts it in
@@ -13296,10 +13315,10 @@ type multiClientChannelArgs struct {
 	// (IPV6.md B1 exempts fixed windows from the soft minimum).
 	FixedDestination bool
 
-	// stickyRedial marks the exit a sticky window lost to transport loss,
-	// asked for again by name (enumerateStickyRedial). expand evaluates it
-	// alone, so a faster candidate cannot take the slot and change the
-	// egress ip the re-dial exists to keep.
+	// Marks the exit a sticky window lost to transport loss, asked for again by
+	// name (enumerateStickyRedial). expand evaluates it alone, so a faster
+	// candidate cannot take the slot and change the egress ip the re-dial
+	// exists to keep.
 	stickyRedial bool
 
 	// contractStatus preserves the identity of the channel whose contract
@@ -13308,9 +13327,9 @@ type multiClientChannelArgs struct {
 	// nil keeps directly constructed test channels on the legacy relay path.
 	contractStatus     func(client *multiClientChannel, status *ContractStatus)
 	providerEvaluation *providerEvaluationAttempt
-	// providerPolicyPreference is the parent's, shared by every channel: armed
-	// from this channel's provider diagnostics, read by effectiveTier. nil
-	// (bare fixtures, or disabled) leaves the channel at its rank.
+	// The parent's, shared by every channel: armed from this channel's provider
+	// diagnostics, read by effectiveTier. nil (bare fixtures, or disabled)
+	// leaves the channel at its rank.
 	providerPolicyPreference *providerPolicyPreference
 }
 
@@ -13546,6 +13565,10 @@ type multiClientChannel struct {
 	// SendDetailedMessage(&protocol.IpPing{}) plumbing the cping loop uses --
 	// pinned by TestBusyProbeUsesTheControlPingPlumbing.
 	busyProbeSendFunc func(timeout time.Duration, ackCallback func(error)) (bool, error)
+	// Nil outside focused tests. Replaces time.Now in the busy probe's wait,
+	// so a test can show it a host clock whose sleep moves the wall reading
+	// alone (schedulerPauseElapsed).
+	busyProbeNowForTest func() time.Time
 	// Nil outside focused tests. The callback assumes the same conditional
 	// ownership as Transfer: success consumes every group packet.
 	sendGroupForTest func(*parsedPacketGroup, time.Duration, bool) (bool, error)
@@ -14915,7 +14938,8 @@ func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback
 //   - budget expires: convict, with the reason naming the probe. One fresh
 //     budget is granted first if the wait itself was suspended (see
 //     schedulerPauseDetected) -- a probe armed before a doze must not convict on
-//     wake, when neither the exit's answer nor this waiter had a cpu.
+//     wake, when neither the exit's answer nor this waiter had a cpu. A host
+//     sleep counts too (schedulerPauseElapsed).
 //   - the probe cannot be queued twice in one stale episode: convict. Once is
 //     not evidence (a congested exit drains between polls); twice, while the
 //     same data sits unacked, is.
@@ -14970,7 +14994,11 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 	self.metrics().busyProbeSent()
 
 	tolerance := self.reliabilitySettings().SchedulerPauseTolerance
-	waitStart := time.Now()
+	now := time.Now
+	if self.busyProbeNowForTest != nil {
+		now = self.busyProbeNowForTest
+	}
+	waitStart := now()
 	budgetRefreshed := false
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
@@ -15002,7 +15030,7 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 			self.metrics().busyProbeAcquitted()
 			return busyProbeVerdict{detail: "liveness probe answered"}
 		case <-timer.C:
-			if !budgetRefreshed && schedulerPauseDetected(time.Since(waitStart), budget, tolerance) {
+			if !budgetRefreshed && schedulerPauseDetected(schedulerPauseElapsed(waitStart, now()), budget, tolerance) {
 				// the host was suspended while this probe was in flight: the
 				// exit's answer and this waiter were both off the cpu, so the
 				// expiry says nothing about the exit. Grant the SAME probe one
@@ -15011,7 +15039,7 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 				// refresh would let a flapping scheduler suspend the verdict
 				// forever.
 				budgetRefreshed = true
-				waitStart = time.Now()
+				waitStart = now()
 				timer.Reset(budget)
 				loggerOrDefault(self.log).Infof("%s\n", relEvent(
 					"busy_probe",

@@ -971,7 +971,7 @@ func (self *UpgradeMux) onPump(packet []byte) bool {
 	return true
 }
 
-// onSend claims and terminates intercepted DNS (UDP/TCP 53) and HTTP (TCP/80), and refuses
+// Claims and terminates intercepted DNS (UDP/TCP 53) and HTTP (TCP/80), and refuses
 // TCP/853 toward the DNS stand-in (refuseStandInDot); everything else passes through to the
 // upstream. TCP/443 passes through too, but is first observed for its TLS SNI (never claimed).
 // The claim decision is a pure function of (protocol, dst port), plus the destination address
@@ -1101,19 +1101,19 @@ func (self *UpgradeMux) httpBlocked() bool {
 	return s.Http != nil && HttpUpgradeBlock == s.Http.Mode
 }
 
-// defaultDnsStandIns are the default DNS stand-ins of both families (see
-// DefaultDnsUpgradeMaskAddress and DefaultDnsUpgradeMaskAddressIpv6).
+// The default DNS stand-ins of both families (see DefaultDnsUpgradeMaskAddress
+// and DefaultDnsUpgradeMaskAddressIpv6).
 var defaultDnsStandIns = [...]netip.Addr{
 	netip.MustParseAddr(DefaultDnsUpgradeMaskAddress),
 	netip.MustParseAddr(DefaultDnsUpgradeMaskAddressIpv6),
 }
 
-// dnsStandIn reports whether a destination is a DNS stand-in while the mux
-// owns DNS: the resolver's DnsUpgradeMaskAddress, or a default stand-in of
-// either family. These are the addresses the platform advertises as the
-// tunnel's DNS servers, and by design nothing serves DNS at them: the mux
-// claims :53 before a packet gets there. With DNS interception disabled the
-// mux owns no stand-in and every address passes through.
+// Reports whether a destination is a DNS stand-in while the mux owns DNS: the
+// resolver's DnsUpgradeMaskAddress, or a default stand-in of either family.
+// These are the addresses the platform advertises as the tunnel's DNS servers,
+// and by design nothing serves DNS at them: the mux claims :53 before a packet
+// gets there. With DNS interception disabled the mux owns no stand-in and every
+// address passes through.
 func (self *UpgradeMux) dnsStandIn(addr netip.Addr) bool {
 	settings := self.settings.Load()
 	if settings == nil || settings.Dns == nil || settings.Dns.Resolver == nil || !addr.IsValid() {
@@ -1126,16 +1126,16 @@ func (self *UpgradeMux) dnsStandIn(addr netip.Addr) bool {
 	return slices.Contains(defaultDnsStandIns[:], addr)
 }
 
-// refuseStandInDot refuses DoT (TCP/853) toward a DNS stand-in with a local
-// TCP reset and never forwards it; it reports whether the segment was claimed.
-// Android in Automatic Private DNS mode probes DoT on 853 of every DNS server
-// it is given and uses cleartext :53 once the probe fails. Toward the stand-in
-// that probe used to be dialed out through an exit to an address with no
-// listener and waited out its timeout; refused here, it fails at once and the
-// device falls back to the :53 the mux resolves. DoT to any other address --
-// a resolver the user chose, such as strict Private DNS -- passes through
-// unchanged. The reset is the one a closed port answers with (RST|ACK for a
-// SYN), built and returned by deliverTcpPolicyReset.
+// Refuses DoT (TCP/853) toward a DNS stand-in with a local TCP reset and never
+// forwards it; it reports whether the segment was claimed. Android in Automatic
+// Private DNS mode probes DoT on 853 of every DNS server it is given and uses
+// cleartext :53 once the probe fails. Toward the stand-in that probe used to be
+// dialed out through an exit to an address with no listener and waited out its
+// timeout; refused here, it fails at once and the device falls back to the :53
+// the mux resolves. DoT to any other address -- a resolver the user chose, such
+// as strict Private DNS -- passes through unchanged. The reset is the one a
+// closed port answers with (RST|ACK for a SYN), built and returned by
+// deliverTcpPolicyReset.
 func (self *UpgradeMux) refuseStandInDot(source TransferPath, provideMode protocol.ProvideMode, packet []byte) bool {
 	// the stand-in check reads the header in place, so DoT to a real resolver
 	// passes through without the allocating parse

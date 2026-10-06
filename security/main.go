@@ -3,6 +3,10 @@
 // Command gen aggregates public IPv4 threat-intelligence feeds into a packed,
 // sorted, pairwise-disjoint blocklist and writes it to
 // ip_security_cfaa_block.go as a zero-allocation, binary-searchable table.
+// In the same run it refreshes the Meta prefix snapshot of the WhatsApp
+// exception from RADb and writes it to ip_security_messaging_meta.go (see
+// meta.go). Both are validated before either is written, so a release build
+// refreshes both or neither.
 //
 // It replaces the old security/gen.sh pipeline. Unlike that script it:
 //   - preserves CIDR ranges instead of collapsing them to their network address
@@ -184,8 +188,9 @@ type aggregation struct {
 
 func main() {
 	out := flag.String("out", "", "output .go path (default: <connect module root>/ip_security_cfaa_block.go)")
-	timeout := flag.Duration("timeout", 90*time.Second, "per-feed HTTP timeout")
-	allowStale := flag.Bool("allow-stale", false, "generate even if some feeds fail or fall below min-count (skips them)")
+	metaOut := flag.String("meta-out", "", "Meta prefix output .go path (default: <connect module root>/ip_security_messaging_meta.go)")
+	timeout := flag.Duration("timeout", 90*time.Second, "per-feed HTTP and whois timeout")
+	allowStale := flag.Bool("allow-stale", false, "generate even if some feeds fail or fall below min-count (skips them; a failed Meta refresh keeps the existing Meta file)")
 	maxCoverage := flag.Uint64("max-coverage", 64_000_000, "fail if total blocked address count exceeds this (poison guard)")
 	minRanges := flag.Int("min-ranges", 10_000, "fail if fewer than this many merged ranges result")
 	minRanges6 := flag.Int("min-ranges6", 100, "fail if fewer than this many merged IPv6 ranges result")
@@ -193,11 +198,18 @@ func main() {
 	force := flag.Bool("force", false, "overwrite the output even if it lacks a generated-file marker")
 	flag.Parse()
 
-	outPath, err := resolveOut(*out)
+	outPath, err := resolveOut(*out, outputFile)
 	if err != nil {
 		fatal(err)
 	}
 	if err := guardOutput(outPath, *force); err != nil {
+		fatal(err)
+	}
+	metaPath, err := resolveOut(*metaOut, metaOutputFile)
+	if err != nil {
+		fatal(err)
+	}
+	if err := guardOutput(metaPath, *force); err != nil {
 		fatal(err)
 	}
 
@@ -266,6 +278,39 @@ func main() {
 			embedded, float64(embedded)/(1<<20), *maxBytes, float64(*maxBytes)/(1<<20)))
 	}
 
+	// the Meta snapshot is checked before either file is written
+	fetchMeta := func() (*metaSnapshot, metaReport, []string) {
+		data, err := fetchWhois(metaRadb.server, metaRadb.query, *timeout, metaRadb.maxResponseBytes)
+		if err != nil {
+			return nil, metaReport{}, []string{fmt.Sprintf("%s: whois %s %q: %v", metaRadb.name, metaRadb.server, metaRadb.query, err)}
+		}
+		return metaRadb.parseMetaSnapshot(data)
+	}
+	fmt.Fprintln(os.Stderr, "\nmeta report:")
+	meta, report, metaProblems := fetchMeta()
+	fmt.Fprintf(os.Stderr, "  %-14s %s\n", metaRadb.name, report)
+	var metaFormatted []byte
+	if len(metaProblems) == 0 {
+		metaFormatted, err = format.Source(metaRadb.emitMeta(meta))
+		if err != nil {
+			metaProblems = append(metaProblems, fmt.Sprintf("%s: generated source does not format: %v", metaRadb.name, err))
+		}
+	}
+	if 0 < len(metaProblems) {
+		if !*allowStale {
+			fmt.Fprintln(os.Stderr, "\nABORT: Meta prefix sanity checks failed (pass -allow-stale to keep the existing Meta file):")
+			for _, p := range metaProblems {
+				fmt.Fprintln(os.Stderr, "  - "+p)
+			}
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "\nWARNING: keeping the existing Meta file; its refresh failed:")
+		for _, p := range metaProblems {
+			fmt.Fprintln(os.Stderr, "  - "+p)
+		}
+		metaFormatted = nil
+	}
+
 	src := emit(final, final6, aggregated.spamhausCredit, results)
 	formatted, ferr := format.Source(src)
 	if ferr != nil {
@@ -276,6 +321,12 @@ func main() {
 		fatal(err)
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s (%d ranges, %d bytes)\n", outPath, len(final), len(formatted))
+	if metaFormatted != nil {
+		if err := os.WriteFile(metaPath, metaFormatted, 0o644); err != nil {
+			fatal(err)
+		}
+		fmt.Fprintf(os.Stderr, "wrote %s (%d prefixes, %d bytes)\n", metaPath, len(meta.prefixes), len(metaFormatted))
+	}
 }
 
 // Records feed disposition and excludes unusable inputs.
@@ -867,10 +918,12 @@ func emit(ranges []iprange, ranges6 []ip6range, spamhausCredit string, results [
 
 // outputFile is the generated data file. It deliberately is NOT
 // ip_security_cfaa.go: that file is hand-written (the detector and the range
-// lookup live there). This generator only ever owns the data file.
+// lookup live there). This generator only ever owns the data files
+// (outputFile and metaOutputFile).
 const outputFile = "ip_security_cfaa_block.go"
 
-func resolveOut(flagVal string) (string, error) {
+// flagVal when set, else name in the connect module root.
+func resolveOut(flagVal string, name string) (string, error) {
 	if flagVal != "" {
 		return flagVal, nil
 	}
@@ -881,7 +934,7 @@ func resolveOut(flagVal string) (string, error) {
 	for {
 		if b, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil {
 			if bytes.Contains(b, []byte("module github.com/urnetwork/connect")) {
-				return filepath.Join(dir, outputFile), nil
+				return filepath.Join(dir, name), nil
 			}
 		}
 		parent := filepath.Dir(dir)

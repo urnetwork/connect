@@ -1,5 +1,9 @@
 package connect
 
+// Tests of the provider-scoped messaging exception (ip_security_messaging.go):
+// the Meta prefix table, the exception's scope and settings, and its place in
+// the dmca detector and the provider policy.
+
 import (
 	"context"
 	"net/netip"
@@ -8,71 +12,53 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// whatsAppTestPath is a client -> destination tuple; the Steam fixture
-// builder is generic over address, transport and port.
+// A client -> destination tuple; the Steam fixture builder is generic over
+// address, transport and port.
 func whatsAppTestPath(address string, transport IpProtocol, port int, syn bool) *IpPath {
 	return steamTestPath(netip.MustParseAddr(address), transport, port, syn)
 }
 
-func TestMetaNetworkPrefixSnapshot(t *testing.T) {
-	expected := []string{
-		"31.13.24.0/21",
-		"31.13.64.0/18",
-		"45.64.40.0/22",
-		"57.141.0.0/20",
-		"57.141.16.0/21",
-		"57.141.24.0/23",
-		"57.144.0.0/14",
-		"66.220.144.0/20",
-		"69.63.176.0/20",
-		"69.171.224.0/19",
-		"74.119.76.0/22",
-		"102.132.96.0/20",
-		"103.4.96.0/22",
-		"129.134.0.0/16",
-		"147.75.208.0/20",
-		"157.240.0.0/16",
-		"163.70.128.0/17",
-		"163.77.128.0/17",
-		"173.252.64.0/18",
-		"179.60.192.0/22",
-		"185.60.216.0/22",
-		"185.89.216.0/22",
-		"204.15.20.0/22",
-		"2401:db00::/32",
-		"2620:0:1c00::/40",
-		"2a03:2880::/31",
-		"2a03:2887:ff2c::/47",
-		"2a03:83e0::/32",
-	}
-	if len(metaNetworkPrefixes) != len(expected) {
-		t.Fatalf("Meta prefix count = %d, want snapshot count %d", len(metaNetworkPrefixes), len(expected))
-	}
-
+// The table is generated (ip_security_messaging_meta.go) and every release
+// build refreshes it, so this checks its shape rather than its contents, as
+// for the CFAA tables: masked, sorted IPv4 then IPv6, pairwise disjoint and
+// collapsed (no two siblings one prefix would cover). That it still covers
+// where WhatsApp's chat edge resolves is the generator's anchor check, which
+// security's TestCheckedInMetaSnapshot runs on this table, so no production
+// prefix is written into this test.
+func TestMetaNetworkPrefixInvariant(t *testing.T) {
 	v4Count, v6Count := 0, 0
 	for i, prefix := range metaNetworkPrefixes {
-		if prefix != prefix.Masked() {
+		if !prefix.IsValid() || prefix != prefix.Masked() {
 			t.Fatalf("prefix %d is not masked: %s", i, prefix)
 		}
-		if got := prefix.String(); got != expected[i] {
-			t.Fatalf("prefix %d = %s, want %s", i, got, expected[i])
-		}
 		if prefix.Addr().Is4() {
+			if 0 < v6Count {
+				t.Fatalf("IPv4 prefix %s follows the IPv6 prefixes", prefix)
+			}
 			v4Count++
 		} else {
 			v6Count++
 		}
-		for j, other := range metaNetworkPrefixes {
-			if i != j && prefix.Contains(other.Addr()) {
-				t.Fatalf("prefix %s contains prefix %s", prefix, other)
-			}
+		if i == 0 {
+			continue
+		}
+		previous := metaNetworkPrefixes[i-1]
+		if previous.Addr().BitLen() == prefix.Addr().BitLen() &&
+			lastAddressInPrefix(previous).Compare(prefix.Addr()) >= 0 {
+			t.Fatalf("prefixes %s and %s are not sorted and disjoint", previous, prefix)
+		}
+		if previous.Bits() == prefix.Bits() &&
+			netip.PrefixFrom(previous.Addr(), previous.Bits()-1).Masked() == netip.PrefixFrom(prefix.Addr(), prefix.Bits()-1).Masked() {
+			t.Fatalf("prefixes %s and %s are siblings left uncollapsed", previous, prefix)
 		}
 	}
-	if v4Count != 23 || v6Count != 5 {
-		t.Fatalf("Meta prefixes = %d IPv4 / %d IPv6, want 23 / 5", v4Count, v6Count)
+	if v4Count == 0 || v6Count == 0 {
+		t.Fatalf("Meta prefixes = %d IPv4 / %d IPv6, want both families", v4Count, v6Count)
 	}
 }
 
+// Every prefix's first and last address match, and the addresses just outside
+// it do not, unless they are the edge of a neighboring prefix.
 func TestMetaNetworkPrefixBoundaries(t *testing.T) {
 	inSnapshot := func(address netip.Addr) bool {
 		for _, prefix := range metaNetworkPrefixes {
@@ -109,13 +95,14 @@ func TestMetaNetworkPrefixBoundaries(t *testing.T) {
 // port: any one of the three alone admits nothing.
 func TestWhatsAppMetaEndpointScopeAndSettings(t *testing.T) {
 	settings := DefaultMessagingSecurityPolicySettings()
-	for _, address := range []string{"157.240.0.53", "31.13.64.51", "2a03:2880:f20c:e3:face:b00c:0:167"} {
+	meta := metaTestAddress(t, 4, 0)
+	for _, address := range []string{meta, metaTestAddress(t, 4, -1), metaTestAddress(t, 6, 0)} {
 		if !isSanctionedMessagingEndpoint(settings, whatsAppTestPath(address, IpProtocolTcp, 5222, false)) {
 			t.Fatalf("default WhatsApp exception did not match %s:5222", address)
 		}
 	}
 
-	path := whatsAppTestPath("157.240.0.53", IpProtocolTcp, 5222, false)
+	path := whatsAppTestPath(meta, IpProtocolTcp, 5222, false)
 	if isSanctionedMessagingEndpoint(settings, path.Reverse()) {
 		t.Fatal("reverse-direction tuple matched the destination-scoped WhatsApp exception")
 	}
@@ -123,11 +110,11 @@ func TestWhatsAppMetaEndpointScopeAndSettings(t *testing.T) {
 		name string
 		path *IpPath
 	}{
-		{"non-Meta destination", whatsAppTestPath("8.8.8.8", IpProtocolTcp, 5222, false)},
-		{"non-Meta IPv6 destination", whatsAppTestPath("2001:4860:4860::8888", IpProtocolTcp, 5222, false)},
-		{"port 5223 before a capture confirms it", whatsAppTestPath("157.240.0.53", IpProtocolTcp, 5223, false)},
-		{"another Meta port", whatsAppTestPath("157.240.0.53", IpProtocolTcp, 4244, false)},
-		{"udp", whatsAppTestPath("157.240.0.53", IpProtocolUdp, 5222, false)},
+		{name: "non-Meta destination", path: whatsAppTestPath(metaTestOutsideAddress, IpProtocolTcp, 5222, false)},
+		{name: "non-Meta IPv6 destination", path: whatsAppTestPath(metaTestOutsideAddressIpv6, IpProtocolTcp, 5222, false)},
+		{name: "port 5223 before a capture confirms it", path: whatsAppTestPath(meta, IpProtocolTcp, 5223, false)},
+		{name: "another Meta port", path: whatsAppTestPath(meta, IpProtocolTcp, 4244, false)},
+		{name: "udp", path: whatsAppTestPath(meta, IpProtocolUdp, 5222, false)},
 	} {
 		if isSanctionedMessagingEndpoint(settings, near.path) {
 			t.Fatalf("%s matched the WhatsApp exception", near.name)
@@ -153,8 +140,9 @@ func TestWhatsAppMetaEndpointScopeAndSettings(t *testing.T) {
 	}
 }
 
+// The lookup on the flow path does not allocate.
 func TestWhatsAppMetaEndpointZeroAlloc(t *testing.T) {
-	path := whatsAppTestPath("157.240.0.53", IpProtocolTcp, 5222, false)
+	path := whatsAppTestPath(metaTestAddress(t, 4, 0), IpProtocolTcp, 5222, false)
 	if allocations := testing.AllocsPerRun(1000, func() {
 		if !isWhatsAppMetaEndpoint(path) {
 			t.Fatal("WhatsApp endpoint did not match")
@@ -164,8 +152,35 @@ func TestWhatsAppMetaEndpointZeroAlloc(t *testing.T) {
 	}
 }
 
-// dmcaTestTcpFlow drives one TCP flow from its SYN, as a provider sees it,
-// and returns the verdict after each payload.
+// Addresses outside the Meta prefixes, from the documentation ranges.
+const (
+	metaTestOutsideAddress     = "192.0.2.53"
+	metaTestOutsideAddressIpv6 = "2001:db8::53"
+)
+
+// An address inside the Meta prefixes, taken from the table so that no
+// production address is written into the tests: the first address after the
+// network address of the family's prefix at the index, counted from the end
+// when negative.
+func metaTestAddress(t *testing.T, ipVersion int, index int) string {
+	t.Helper()
+	familyPrefixes := []netip.Prefix{}
+	for _, prefix := range metaNetworkPrefixes {
+		if prefix.Addr().Is4() == (ipVersion == 4) {
+			familyPrefixes = append(familyPrefixes, prefix)
+		}
+	}
+	if index < 0 {
+		index += len(familyPrefixes)
+	}
+	if index < 0 || len(familyPrefixes) <= index {
+		t.Fatalf("the Meta prefixes hold %d ipv%d prefixes, no index %d", len(familyPrefixes), ipVersion, index)
+	}
+	return familyPrefixes[index].Masked().Addr().Next().String()
+}
+
+// Drives one TCP flow from its SYN, as a provider sees it, and returns the
+// verdict after each payload.
 func dmcaTestTcpFlow(detector *dmcaDetector, syn *IpPath, payloads ...[]byte) []dmcaVerdict {
 	detector.classify(syn, nil)
 	data := *syn
@@ -182,54 +197,54 @@ func dmcaTestTcpFlow(detector *dmcaDetector, syn *IpPath, payloads ...[]byte) []
 // now allowed through the whole inspection budget and beyond, while the
 // BitTorrent signatures keep precedence on every inspected packet.
 func TestDmcaWhatsAppMetaExceptionAndPrecedence(t *testing.T) {
-	t.Run("encrypted TCP to Meta 5222 allowed", func(t *testing.T) {
-		for _, address := range []string{"157.240.0.53", "2a03:2880:f20c:e3:face:b00c:0:167"} {
-			settings := DefaultDmcaSecurityPolicySettings()
-			detector := newDmcaDetector(nil, settings, newWebStandardDetector(DefaultWebStandardSettings()))
-			payloads := [][]byte{}
-			for i := 0; i < settings.InspectionPacketBudget+2; i++ {
-				payloads = append(payloads, encryptedPayload(512))
-			}
-			if !payloadLooksEncrypted(payloads[0], settings) {
-				t.Fatal("fixture must exercise the encrypted heuristic")
-			}
-			for i, verdict := range dmcaTestTcpFlow(detector, whatsAppTestPath(address, IpProtocolTcp, 5222, true), payloads...) {
-				if verdict != dmcaAllow {
-					t.Fatalf("WhatsApp payload %d to %s = %d, want allow", i, address, verdict)
-				}
+	meta := metaTestAddress(t, 4, 0)
+
+	// encrypted TCP to Meta 5222 is allowed
+	for _, address := range []string{meta, metaTestAddress(t, 6, 0)} {
+		settings := DefaultDmcaSecurityPolicySettings()
+		detector := newDmcaDetector(nil, settings, newWebStandardDetector(DefaultWebStandardSettings()))
+		payloads := [][]byte{}
+		for i := 0; i < settings.InspectionPacketBudget+2; i++ {
+			payloads = append(payloads, encryptedPayload(512))
+		}
+		if !payloadLooksEncrypted(payloads[0], settings) {
+			t.Fatal("fixture must exercise the encrypted heuristic")
+		}
+		for i, verdict := range dmcaTestTcpFlow(detector, whatsAppTestPath(address, IpProtocolTcp, 5222, true), payloads...) {
+			if verdict != dmcaAllow {
+				t.Fatalf("WhatsApp payload %d to %s = %d, want allow", i, address, verdict)
 			}
 		}
-	})
+	}
 
-	t.Run("BitTorrent signature wins", func(t *testing.T) {
-		detector := newDmcaDetector(nil, DefaultDmcaSecurityPolicySettings(), newWebStandardDetector(DefaultWebStandardSettings()))
-		verdicts := dmcaTestTcpFlow(detector, whatsAppTestPath("157.240.0.53", IpProtocolTcp, 5222, true), btHandshake())
-		if verdicts[0] != dmcaBittorrent {
-			t.Fatalf("BitTorrent on the Meta endpoint = %d, want bittorrent", verdicts[0])
-		}
-	})
+	// a BitTorrent signature wins
+	detector := newDmcaDetector(nil, DefaultDmcaSecurityPolicySettings(), newWebStandardDetector(DefaultWebStandardSettings()))
+	verdicts := dmcaTestTcpFlow(detector, whatsAppTestPath(meta, IpProtocolTcp, 5222, true), btHandshake())
+	if verdicts[0] != dmcaBittorrent {
+		t.Fatalf("BitTorrent on the Meta endpoint = %d, want bittorrent", verdicts[0])
+	}
 
-	t.Run("BitTorrent signature after the allow still wins", func(t *testing.T) {
-		detector := newDmcaDetector(nil, DefaultDmcaSecurityPolicySettings(), newWebStandardDetector(DefaultWebStandardSettings()))
-		verdicts := dmcaTestTcpFlow(detector, whatsAppTestPath("157.240.0.53", IpProtocolTcp, 5222, true), encryptedPayload(512), btHandshake())
-		if verdicts[0] != dmcaAllow || verdicts[1] != dmcaBittorrent {
-			t.Fatalf("allowed Meta flow carrying BitTorrent = %v, want allow then bittorrent", verdicts)
-		}
-	})
+	// a BitTorrent signature after the allow still wins
+	detector = newDmcaDetector(nil, DefaultDmcaSecurityPolicySettings(), newWebStandardDetector(DefaultWebStandardSettings()))
+	verdicts = dmcaTestTcpFlow(detector, whatsAppTestPath(meta, IpProtocolTcp, 5222, true), encryptedPayload(512), btHandshake())
+	if verdicts[0] != dmcaAllow || verdicts[1] != dmcaBittorrent {
+		t.Fatalf("allowed Meta flow carrying BitTorrent = %v, want allow then bittorrent", verdicts)
+	}
 
-	tests := []struct {
+	// near misses are judged by the encrypted heuristic
+	cases := []struct {
 		name      string
 		address   string
 		transport IpProtocol
 		port      int
 		configure func(*DmcaSecurityPolicySettings)
 	}{
-		{name: "non-Meta destination", address: "8.8.8.8", transport: IpProtocolTcp, port: 5222},
-		{name: "Meta port 5223", address: "157.240.0.53", transport: IpProtocolTcp, port: 5223},
-		{name: "Meta udp 5222", address: "157.240.0.53", transport: IpProtocolUdp, port: 5222},
+		{name: "non-Meta destination", address: metaTestOutsideAddress, transport: IpProtocolTcp, port: 5222},
+		{name: "Meta port 5223", address: meta, transport: IpProtocolTcp, port: 5223},
+		{name: "Meta udp 5222", address: meta, transport: IpProtocolUdp, port: 5222},
 		{
 			name:      "WhatsApp disabled",
-			address:   "157.240.0.53",
+			address:   meta,
 			transport: IpProtocolTcp,
 			port:      5222,
 			configure: func(settings *DmcaSecurityPolicySettings) {
@@ -238,7 +253,7 @@ func TestDmcaWhatsAppMetaExceptionAndPrecedence(t *testing.T) {
 		},
 		{
 			name:      "messaging disabled",
-			address:   "157.240.0.53",
+			address:   meta,
 			transport: IpProtocolTcp,
 			port:      5222,
 			configure: func(settings *DmcaSecurityPolicySettings) {
@@ -247,7 +262,7 @@ func TestDmcaWhatsAppMetaExceptionAndPrecedence(t *testing.T) {
 		},
 		{
 			name:      "nil messaging settings",
-			address:   "157.240.0.53",
+			address:   meta,
 			transport: IpProtocolTcp,
 			port:      5222,
 			configure: func(settings *DmcaSecurityPolicySettings) {
@@ -255,28 +270,26 @@ func TestDmcaWhatsAppMetaExceptionAndPrecedence(t *testing.T) {
 			},
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			settings := DefaultDmcaSecurityPolicySettings()
-			if tt.configure != nil {
-				tt.configure(settings)
-			}
-			detector := newDmcaDetector(nil, settings, newWebStandardDetector(DefaultWebStandardSettings()))
-			path := whatsAppTestPath(tt.address, tt.transport, tt.port, tt.transport == IpProtocolTcp)
-			if tt.transport == IpProtocolTcp {
-				detector.classify(path, nil)
-				data := *path
-				data.Syn = false
-				path = &data
-			}
-			var verdict dmcaVerdict
-			for i := 0; i < settings.EncryptedDecisionPackets; i++ {
-				verdict = detector.classify(path, encryptedPayload(512))
-			}
-			if verdict != dmcaDropEncrypted {
-				t.Fatalf("near-miss WhatsApp flow verdict = %d, want encrypted drop", verdict)
-			}
-		})
+	for _, c := range cases {
+		settings := DefaultDmcaSecurityPolicySettings()
+		if c.configure != nil {
+			c.configure(settings)
+		}
+		detector := newDmcaDetector(nil, settings, newWebStandardDetector(DefaultWebStandardSettings()))
+		path := whatsAppTestPath(c.address, c.transport, c.port, c.transport == IpProtocolTcp)
+		if c.transport == IpProtocolTcp {
+			detector.classify(path, nil)
+			data := *path
+			data.Syn = false
+			path = &data
+		}
+		var verdict dmcaVerdict
+		for i := 0; i < settings.EncryptedDecisionPackets; i++ {
+			verdict = detector.classify(path, encryptedPayload(512))
+		}
+		if verdict != dmcaDropEncrypted {
+			t.Fatalf("%s: near-miss WhatsApp flow verdict = %d, want encrypted drop", c.name, verdict)
+		}
 	}
 }
 
@@ -312,18 +325,18 @@ func TestSecurityPolicyWhatsAppMetaException(t *testing.T) {
 	for i := 0; i < DefaultDmcaSecurityPolicySettings().InspectionPacketBudget+2; i++ {
 		payloads = append(payloads, encryptedPayload(512))
 	}
-	for i, result := range flow("157.240.0.53", payloads...) {
+	for i, result := range flow(metaTestAddress(t, 4, 0), payloads...) {
 		if result != SecurityPolicyResultAllow {
 			t.Fatalf("WhatsApp packet %d = %v, want allow", i, result)
 		}
 	}
 
-	results := flow("157.240.0.54", btHandshake())
+	results := flow(metaTestAddress(t, 4, 1), btHandshake())
 	if results[1] != SecurityPolicyResultIncident {
 		t.Fatalf("BitTorrent on the Meta endpoint = %v, want incident", results[1])
 	}
 
-	results = flow("8.8.8.8", payloads[:DefaultDmcaSecurityPolicySettings().EncryptedDecisionPackets]...)
+	results = flow(metaTestOutsideAddress, payloads[:DefaultDmcaSecurityPolicySettings().EncryptedDecisionPackets]...)
 	if last := results[len(results)-1]; last != SecurityPolicyResultDrop {
 		t.Fatalf("encrypted 5222 flow outside Meta = %v, want drop", last)
 	}

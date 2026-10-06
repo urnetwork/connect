@@ -32,6 +32,9 @@ func (self *Owner) open() error { return ErrUnsupported }
 // Unsupported owners cannot produce successful admission.
 func (self *Owner) check(bool) error { return ErrUnsupported }
 
+// No successful write-health observation exists on unsupported hosts.
+func (self *Owner) writeHealth() error { return ErrUnsupported }
+
 // No descendant descriptor is exposed without the platform contract.
 func (self *Owner) openDirectory(string, bool) (*os.File, error) { return nil, ErrUnsupported }
 

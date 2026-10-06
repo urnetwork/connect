@@ -220,6 +220,26 @@ func (self *ExtenderRootKeySet) Len() int {
 	return len(self.rootPublicKeys)
 }
 
+// Whether both sets accept exactly the same keys, in whatever order.
+func (self *ExtenderRootKeySet) Equal(other *ExtenderRootKeySet) bool {
+	contains := func(keySet *ExtenderRootKeySet, publicKey ed25519.PublicKey) bool {
+		return slices.ContainsFunc(keySet.rootPublicKeys, func(rootPublicKey ed25519.PublicKey) bool {
+			return rootPublicKey.Equal(publicKey)
+		})
+	}
+	for _, publicKey := range self.rootPublicKeys {
+		if !contains(other, publicKey) {
+			return false
+		}
+	}
+	for _, publicKey := range other.rootPublicKeys {
+		if !contains(self, publicKey) {
+			return false
+		}
+	}
+	return true
+}
+
 // Verify checks a domain-separated signature over opaque bytes. The key id is
 // a hint: the keys that carry it are tried first and every other accepted key
 // after, so a stale or wrong id costs time but never a false rejection. The

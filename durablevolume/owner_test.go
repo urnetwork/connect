@@ -21,14 +21,15 @@ import (
 
 // A private host instance never changes facts outside its own test owner.
 type fixtureHost struct {
-	stateLock      sync.Mutex
-	mounts         []Mount
-	uuidDevice     Device
-	filesystem     Filesystem
-	filesystemHook func(*os.File)
-	mountsErr      error
-	uuidErr        error
-	filesystemErr  error
+	stateLock       sync.Mutex
+	mounts          []Mount
+	uuidDevice      Device
+	filesystem      Filesystem
+	filesystemHook  func(*os.File)
+	writeHealthHook func(string, *os.File) error
+	mountsErr       error
+	uuidErr         error
+	filesystemErr   error
 }
 
 // Returns a copy so readers cannot mutate or race the next census.
@@ -56,6 +57,19 @@ func (self *fixtureHost) Filesystem(file *os.File) (Filesystem, error) {
 		hook(file)
 	}
 	return facts, err
+}
+
+// Refusal hooks cannot replace the successful write-health kernel operations.
+func (self *fixtureHost) observeWriteHealth(operation string, file *os.File) error {
+	hook := func() func(string, *os.File) error {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		return self.writeHealthHook
+	}()
+	if hook != nil {
+		return hook(operation, file)
+	}
+	return nil
 }
 
 // Changes facts at a chosen causal boundary without process-global hooks.

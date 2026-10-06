@@ -259,11 +259,19 @@ list, and the global list for a country without one. A dial takes the country
 of its directory, `ExtenderDirectory.SpoofCountryCode()`: the `country_code`
 of the operator's hint while the hint is current, else the network country the
 host reports through `SetNetworkCountryCode` (on Android the mobile network's
-country while the default network is cellular), else the hint's last country.
+country while the default network is cellular), else the hint's last country
+for a week after the operator last answered it (`CountryHintMaxAge`). The
+directory stores that country with its time (E1), so a restart keeps it: no
+Apple host reports a network country, nor Windows or Linux without a modem,
+and the iOS packet tunnel extension usually ends with its tunnel, so a tunnel
+started where the hint cannot be read would otherwise have no country. Every
+answer replaces and renews it; past the week it is never used.
 The hint is read through direct dialers only (DESIGNNOTES4.md §4): where only
 an extender reaches the operator, the hint fails rather than placing it.
 A failed hint and a path change make the hint's country stale, and a path
-change asks for the hint again. When the list in force changes, the strategy
+change asks for the hint again at once; a failed hint is asked again after a
+backoff (1 min doubling to 6 h on the same path), and no read holds up the
+refresh pass. When the list in force changes, the strategy
 drops its discovery extender dialers so every address is drawn again from the
 new list. The whitelist of A5 is every bundled list, `AllSpoofDomains()`. No
 country list is bundled yet; each needs a measurement of what its network lets
@@ -510,7 +518,8 @@ B4. Root key distribution. The network space values carry
 and `HelloResult` gains `extender_root_public_keys`. The hello list
 replaces the stored list, since it arrives over the platform's pinned TLS
 even through an untrusted extender. A record or revocation signed by a key
-not in the current list is rejected.
+not in the current list is rejected, also one verified under keys that were
+replaced before it was stored.
 
 B5. Directory semantics per key. Keep the newest record and the newest
 revocation by issue time. A key is active when it has a record, the
@@ -765,10 +774,20 @@ consecutive failures reach 3; expiry per record with 5 minutes skew;
 revocation immediate; cap 2048 addresses (`MaxAddressCount`), the backstop
 beneath the active records' cap of E6, evicting expired, then
 never-succeeded oldest first, then oldest last success. Manual entries are
-never removed by policy. A `MonitorValue` publishes change; `Snapshot`
-serves status. Persistence goes through a store interface `Load() ([]byte,
+never removed by policy. A hold, a limit (A12) and a latency sample
+(DESIGNNOTES4.md §6) are judged by whichever of the monotonic and the wall
+clock has moved further: the monotonic clock stops while the host sleeps, so
+a sleep counts toward them, and a wall clock set back does not extend them.
+A path change drops the latency samples, and a resume from a sleep of at
+least 15 minutes drops those taken before it. A `MonitorValue` publishes change;
+`Snapshot` serves status. Persistence goes through a store interface `Load() ([]byte,
 error)` and `Save([]byte) error` with a JSON envelope `{version, records,
-addresses}`, saved coalesced at 1 s after a change.
+addresses, country_hint}`, saved coalesced at 1 s after a change.
+`country_hint` is the operator's last country and the time it last answered
+it, `{version, country_code, time_ms}` and nothing more (A10, country lists).
+It has a version of its own rather than a new envelope version, because a
+build discards an envelope of another version whole; a section a build cannot
+read is skipped alone.
 
 E2. Strategy. `ClientStrategySettings.ExtenderDirectory` replaces
 `ExtenderNetworks`, `ExtenderHostnames` and the profile enumeration, which
@@ -807,8 +826,19 @@ active entries remain (held addresses count as active here, unverified
 non-manual ones do not, so a client whose operator publishes no TXT
 records keeps re-resolving on the backoff until one appears; the startup
 gate of E4 counts only usable ones), refreshes the root keys from hello
-every 6 hours, and reconnects on network change. A subscribed stream that
-is silent for 90 s, three keepalive intervals, is treated as gone. A
+every 6 hours, and reconnects on network change. Hello is read beside the
+refresh pass, never ahead of it, since it reads through the strategy and
+where only extenders reach the operator it cannot answer before the
+bootstrap has found one; a failed hello is read again after a backoff (1
+minute doubling to 6 hours on the same path), or at once after a path
+change. A pass verifies under the keys in force, the configured or bundled
+ones or the last hello's; with none in force it waits for the first hello
+read, as long as that lasts, and after a read that brought none the TXT
+records wait for keys. Keys that hello installs make the bootstrap due
+again, stop the pass from dialing candidates it chose under the old keys,
+and end a stream to one once its sample is in, so both are taken again
+under them. A blank hello list is no list. A subscribed stream that is
+silent for 90 s, three keepalive intervals, is treated as gone. A
 subscription that ends advances the backoff, which resets only after a
 stream stayed up for the maximum backoff, so an extender that accepts,
 samples and drops is not redialed every second. `Status()` reports feed
@@ -932,7 +962,10 @@ Backoff on failure 10 minutes doubling to 6 hours; a refusal of any
 attempted family holds the whole pass and the retry reissues both, and a
 pass that attempted nothing retries on the backoff rather than the daily
 tick. A family without an address is skipped. The hourly address check is
-one hello for both families and compares the address, not the port.
+one hello for both families and compares the address, not the port. The
+24 hour tick, the hourly check and the backoff count the time the host
+slept: a minute after waking from a sleep of 15 minutes or more, what came
+due during the sleep is due.
 
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,

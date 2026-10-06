@@ -475,6 +475,13 @@ paths:
           and the client continues to /auth/network-create with a fresh
           challenge.
         - a seedphrase
+
+        A well-formed wallet signature that does not verify for
+        `wallet_address` over the challenge (in practice the wallet signed
+        with another account than the address entered) is refused with
+        `error.code` `signature_mismatch` when the request sets
+        `result_errors`, as a 200. Without it, that refusal is a 401 with a
+        plain text body. Every other wallet refusal keeps its HTTP status.
       operationId: Auth Login
       security: []
       requestBody:
@@ -726,6 +733,15 @@ paths:
       description: |
         Create a new network.
         A user authority can be associated with at most one network.
+
+        A well-formed wallet signature that does not verify for
+        `wallet_address` over the challenge (in practice the wallet signed
+        with another account than the address entered) is refused with a
+        401. When the request sets `result_errors`, the 401's body is the
+        JSON result with `error.code` `signature_mismatch`; without it, the
+        body is the plain text message. A 2xx is always a created network or
+        its pending state, never a refusal. Every other refusal keeps its
+        HTTP status and plain text body.
       operationId: authNetworkCreate
       security: []
       requestBody:
@@ -743,6 +759,18 @@ paths:
                 $ref: "#/components/schemas/NetworkCreateResult"
         "400":
           description: The request was malformed, the network name is taken, or the referral code is invalid.
+        "401":
+          description: |
+            The wallet signature does not verify for `wallet_address`. With
+            `result_errors` the body is the result, with `error.code`
+            `signature_mismatch`; without it, the plain text message.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkCreateResult"
+            text/plain:
+              schema:
+                type: string
 
   /auth/network-delete:
     post:
@@ -801,8 +829,10 @@ paths:
         posts the result here as a form, and this endpoint answers `302` to the
         app's own scheme so the browser hands control back to the app:
 
-            <scheme>://oauth/apple?state=…&id_token=…&code=…&user=…
-            <scheme>://oauth/apple?state=…&error=…
+        ```
+        <scheme>://oauth/apple?state=…&id_token=…&code=…&user=…
+        <scheme>://oauth/apple?state=…&error=…
+        ```
 
         `user` is the JSON name/email Apple sends with the first authorization
         only. Nothing is stored or verified here: the app checks that `state`
@@ -902,8 +932,10 @@ paths:
         `302` to the app's own scheme so the browser hands control back to
         the app:
 
-            <scheme>://oauth/google?state=…&id_token=…
-            <scheme>://oauth/google?state=…&error=…
+        ```
+        <scheme>://oauth/google?state=…&id_token=…
+        <scheme>://oauth/google?state=…&error=…
+        ```
 
         Nothing is stored. The app checks that `state` is the attempt it
         started and that the identity token's `nonce` claim is the one it
@@ -978,6 +1010,11 @@ paths:
         must sign the single-use challenge from /auth/wallet-challenge, the
         same proof as wallet login; one wallet address binds to one user.
         Subject to the account action rate limit.
+
+        Refusals come back in the result `error` as a 200. A well-formed
+        wallet signature that does not verify for `wallet_address` over the
+        challenge (in practice the wallet signed with another account than
+        the address entered) has `error.code` `signature_mismatch`.
       operationId: Auth Add Auth
       security:
         - BearerAuth: []
@@ -1063,6 +1100,22 @@ paths:
         limit the call answers 200 with `error.upgrade_required` -- a plan
         limit, not a hard cap -- and an agent can settle it inline with the
         x402 round trip below.
+
+        Like roles or a principal the call may not set, a `proxy_config`
+        the call cannot use is refused before anything is created: the call
+        answers 200 with `error.message` and no `client_id` or
+        `by_client_jwt`. The refusals are:
+        - "Invalid performance profile: " and the reason, for an invalid
+          `initial_device_state.performance_profile` (the rules are on that
+          field), for example "Invalid performance profile: Window size
+          [2, 1] invalid. Max must be >= min"
+        - "Invalid location", when `initial_device_state` is omitted, or has
+          no `location` and no `country_code` that names a country
+        - "Could not parse lock ip " and the entry, for a `lock_ip_list`
+          entry that is neither an IP address nor a subnet
+
+        A re-auth of an existing client (`client_id` set) ignores
+        `proxy_config`.
       operationId: authNetworkClient
       security:
         - BearerAuth: []
@@ -3898,8 +3951,8 @@ paths:
         only signer, and the transaction comes back unsigned. Its recent
         blockhash is good for about a minute, so build it when the buyer
         clicks. A client should check that the transaction pays only the
-        merchant and the mint it expects, in the quoted amount, before handing
-        it to the wallet.
+        `recipient` and the `spl_token_mint` the intent quoted, in the quoted
+        amount, before handing it to the wallet.
 
         An unknown, paid or expired intent, another network's intent, an
         address or reference that is not a Solana public key, or an
@@ -3980,7 +4033,7 @@ paths:
         webhook as soon as the payment confirms, and the customer is emailed a
         note that the data is on the network (the code is included, already
         applied). The name is matched case-insensitively and exactly; an unknown
-        name returns `error.message` "No network named <name>".
+        name returns `error.message` `No network named <name>`.
 
         Without `network_name`, the customer receives a data code by email, as
         before. Stripe collects the email on its checkout page when `email` is
@@ -4035,11 +4088,15 @@ paths:
         Buy a data pack with USDC on Solana, without signing in or giving an
         email: the data goes straight to the network named by `network_name`
         (matched like /pay/data/network-lookup). Records the payment intent and
-        returns the exact `amount_usd` to send in USDC. The client generates
-        `reference` (a Solana Pay reference: a fresh base58 public key) and
-        either opens a Solana Pay url carrying it, or shows the buyer the
-        receiving address, the amount and `memo` (which is the reference) to
-        send by hand from any wallet or exchange. The Helius webhook
+        returns the exact `amount_usd` to send in USDC and where to send it:
+        `recipient` (the receiving address, the same one /solana/payment-intent
+        quotes) and `spl_token_mint` (USDC). The client generates `reference`
+        (a Solana Pay reference: a fresh base58 public key) and either opens a
+        Solana Pay url built from these, or shows the buyer `recipient`, the
+        amount and `memo` (which is the reference) to send by hand from any
+        wallet or exchange. A client keeps no address of its own: a result
+        without `recipient` (from a server that predates it) cannot be paid.
+        The Helius webhook
         (/pay/solana) matches the transfer by the reference among the
         transaction's account keys OR by the memo text, then lands the data on
         the network (data only, valid for one year, no Pro) and emails the
@@ -4137,6 +4194,7 @@ paths:
         The route accepts two body shapes:
         - SEED starts a new trail through the validator-chosen entry provider.
         - EXTEND claims the pending assigned hop of an active trail.
+
         The request must egress from the provider being claimed - the server
         resolves the hop from the request source IP, never from the body.
         Authentication is the protocol's own Ed25519 signatures (over the
@@ -4292,6 +4350,9 @@ paths:
         rejected. Not retroactive: the wallet applies from the next committed
         epoch's leaf set. This wallet is deliberately separate from the
         account payout wallet.
+
+        A well-formed signature that does not verify for `coldkey_ss58` over
+        `message` is refused with `error.code` `signature_mismatch`.
       operationId: Sn Set Wallet
       security:
         - BearerAuth: []
@@ -6275,6 +6336,11 @@ components:
         seedphrase:
           description: The recovery seedphrase, for a seedphrase login.
           type: string
+        result_errors:
+          description: |
+            Report a refusal that has a code (`signature_mismatch`) in the
+            result `error` with a 200, instead of a 401. New clients set this.
+          type: boolean
 
     AuthLoginResult:
       type: object
@@ -6310,6 +6376,20 @@ components:
                 - password
                 - apple
                 - google
+            code:
+              description: |
+                A stable code for a refusal that has one, so a client can pick
+                a localized message. Only with `result_errors`.
+                `signature_mismatch`: the wallet signature is well formed but
+                does not verify for `wallet_address` over the challenge. In
+                practice the wallet signed with another account than the
+                address entered (an sr25519 signature cannot be recovered to
+                the key that made it, so the server cannot name that account),
+                or signed other text. Sign the issued challenge with the
+                entered address. The challenge is not used up. Absent for
+                every other refusal; clients fall back to `message` for an
+                absent or unknown code.
+              type: string
             message:
               type: string
         network:
@@ -6548,6 +6628,12 @@ components:
             is ever sent. Honored on every create path, including sign-ups
             that complete through /auth/verify. The server records a
             `signup.optout_changed` event with the value.
+        result_errors:
+          description: |
+            Answer a refusal that has a code (`signature_mismatch`) with the
+            result as the JSON body of its 401, instead of the plain text
+            message. New clients set this.
+          type: boolean
 
     NetworkCreateResult:
       type: object
@@ -6595,6 +6681,19 @@ components:
           required:
             - message
           properties:
+            code:
+              description: |
+                A stable code for a refusal that has one, so a client can pick
+                a localized message. Only with `result_errors`, in the body of
+                the refusal's 401.
+                `signature_mismatch`: the wallet signature is well formed but
+                does not verify for `wallet_address` over the challenge. In
+                practice the wallet signed with another account than the
+                address entered, or signed other text. Sign the issued
+                challenge with the entered address. The challenge is not used
+                up. Clients fall back to `message` for an absent or unknown
+                code.
+              type: string
             message:
               type: string
 
@@ -6679,7 +6778,11 @@ components:
           description: udid. Optional. If this is given, it must currently exist in the network. Omit this to assign a new client id.
           type: string
         source_client_id:
-          description: udid. Optional. The source client id when creating an ancillary client id.
+          description: |
+            udid. Optional. The source client id when creating an ancillary
+            client id. It must be a client of the caller's network: any other
+            id is refused with `error.message` "Client does not exist.", and
+            nothing is created.
           type: string
         description:
           description: If this is a new device, sets the device name to the description of the device.
@@ -6728,7 +6831,8 @@ components:
             lock_ip_list:
               description: Optional. |
                 Allow only IPs/subnets in the list to access the proxy. |
-                The IPs/subnets are converted to the internal IP subnet width.
+                The IPs/subnets are converted to the internal IP subnet width. |
+                An entry that is neither an IP address nor a subnet is refused (see the endpoint).
               type: array
               items:
                 type: string
@@ -6741,7 +6845,12 @@ components:
                 If enabled, a WireGuard configuration will be created for the proxy.
               type: boolean
             initial_device_state:
-              description: Optional. |
+              description: |
+                Required when the call creates the client (`client_id`
+                omitted): without a `location`, or a `country_code` that
+                names a country, the call is refused with
+                "Invalid location" (see the endpoint).
+
                 Whenever the device is created, it will be set up with this initial state.
                 To configure the device beyond the initial state, the SDK ProxyDevice must be used.
                 Note that the SDK ProxyDevice must reconfigure the device each time it receives a change notice.
@@ -6749,10 +6858,19 @@ components:
               required: []
               properties:
                 country_code:
-                  description: Optional. Use one of country_code or location
+                  description: |
+                    Optional. Use one of `country_code` or `location`. A
+                    two-letter country code such as "de", upper or lower
+                    case. Without a `location`, the call is refused with
+                    "Invalid location" (see the endpoint) unless
+                    `country_code` names a country.
                   type: string
                 location:
-                  description: Optional. Use one of country_code or location
+                  description: |
+                    Optional. Use one of `country_code` or `location`. A
+                    location is used as given, ahead of `country_code`. For
+                    no particular location, set
+                    `connect_location_id.best_available` to true.
                   type: object
                   required: []
                   properties:
@@ -6770,7 +6888,7 @@ components:
                           description: udid. Optional.
                           type: string
                         best_available:
-                          description: udid. Optional.
+                          description: Optional. True connects through the best available providers, in no particular location.
                           type: boolean
                     name:
                       type: string
@@ -6818,22 +6936,50 @@ components:
                         a trusted peer, since it can be a public exit.
                       type: boolean
                 performance_profile:
+                  description: |
+                    Optional. Omitted, the device runs in auto mode. The call
+                    is refused (see the endpoint) unless the profile passes
+                    the check the device itself applies:
+                    - every `window_size` value is at least 0
+                    - `window_size_max` is at least `window_size_min`
+                    - a fixed window (`window_type` `quality` or `speed`) has
+                      a `window_size_max` of at least 1, since a window that
+                      can hold no provider leaves no route
+
+                    The check covers auto mode too, although auto ignores
+                    `window_size`. Without `window_size` the device uses its
+                    default window, which passes.
                   type: object
                   required: []
                   properties:
                     allow_direct:
-                      description: Setting this exposes the real source IP to the provider.
+                      description: |
+                        Setting this exposes the real source IP to the
+                        provider. It has no effect here: the hosted proxy
+                        device always runs with direct mode off, because a
+                        direct connection would expose the proxy host's
+                        address, and with it that the client is hosted and
+                        where.
                       type: boolean
                     post_quantum_encryption:
                       description: |
-                        Opportunistic post-quantum end-to-end encryption to
-                        providers that support it; providers without support
-                        fall back to plaintext at this layer.
+                        Requires a post-quantum end-to-end encrypted session
+                        with each provider. Traffic to a provider waits for
+                        its session, and a provider that cannot establish one
+                        is skipped, never used without it, so fewer providers
+                        may qualify. Unset, the default, the device opens no
+                        such session.
                       type: boolean
                     window_type:
-                      description: Optional. The default is "quality"
+                      description: |
+                        Optional. `auto`, the default, balances traffic across
+                        the window types and ignores `window_size`. `quality`
+                        and `speed` fix the window type, sized by
+                        `window_size`.
                       type: string
                       oneOf:
+                        - title: WindowTypeAuto
+                          const: auto
                         - title: WindowTypeQuality
                           const: quality
                         - title: WindowTypeSpeed
@@ -6935,11 +7081,11 @@ components:
             The following proxy URLs and auths may be used:
             | URL | Auth |
             |-----|------|
-            | https://<auth_token>.<proxy_host>:<https_proxy_port> | no auth needed when the client connects with TLS |
-            | https://<proxy_host>:<https_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
-            | http://<proxy_host>:<http_proxy_port> | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
-            | tcp://<proxy_host>:<socks_proxy_port> | use `access_token` as the username (empty pass) |
-            | wg://<proxy_host>:<wg_proxy_port> | use `wg_config.config` as the full WireGuard config file content, which contains all the necessary keys |
+            | `https://<auth_token>.<proxy_host>:<https_proxy_port>` | no auth needed when the client connects with TLS |
+            | `https://<proxy_host>:<https_proxy_port>` | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
+            | `http://<proxy_host>:<http_proxy_port>` | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
+            | `tcp://<proxy_host>:<socks_proxy_port>` | use `access_token` as the username (empty pass) |
+            | `wg://<proxy_host>:<wg_proxy_port>` | use `wg_config.config` as the full WireGuard config file content, which contains all the necessary keys |
           allOf:
             - type: object
               required:
@@ -8027,9 +8173,9 @@ components:
         One product event. The schema is CLOSED: `name` selects exactly one
         of the variants below and `props` may carry only that variant's
         keys (`additionalProperties: false`). A token is [A-Za-z0-9_.:+-],
-        at most 64 characters. Server-written names (landing.clicked,
-        app.opened, email.*, trial.*, refund, retention.*, connect.day) are
-        refused from clients.
+        at most 64 characters. Server-written names (`landing.clicked`,
+        `app.opened`, `email.*`, `trial.*`, `refund`, `retention.*`,
+        `connect.day`) are refused from clients.
       oneOf:
         - $ref: "#/components/schemas/ClientEventOnboardingStepShown"
         - $ref: "#/components/schemas/ClientEventOnboardingStepCompleted"
@@ -8800,7 +8946,7 @@ components:
           type: string
         surface:
           type: string
-          description: email.<step> | offer.in_app | offer.email | cadence
+          description: "`email.<step>` | `offer.in_app` | `offer.email` | `cadence`"
         status:
           type: string
           enum: [draft, running, paused, done]
@@ -8920,7 +9066,7 @@ components:
           type: string
         tags:
           type: array
-          description: the send's tags; the campaign sends carry [onboarding, <step>, <variant>]
+          description: the send's tags; the campaign sends carry `[onboarding, <step>, <variant>]`
           items:
             type: string
         tag:
@@ -9902,6 +10048,18 @@ components:
           required:
             - message
           properties:
+            code:
+              description: |
+                A stable code for a refusal that has one, so a client can pick
+                a localized message.
+                `signature_mismatch`: the wallet signature is well formed but
+                does not verify for `wallet_address` over the challenge. In
+                practice the wallet signed with another account than the
+                address entered, or signed other text. Sign the issued
+                challenge with the entered address. The challenge is not used
+                up. Absent from older servers and for every other refusal;
+                clients fall back to `message` for an absent or unknown code.
+              type: string
             message:
               type: string
     RemoveAuthArgs:
@@ -10801,9 +10959,9 @@ components:
         ranking:
           description: |
             The numbers find-providers2 admits and orders the provider by, in
-            display order. The mode-level numbers (weight_*, tier_*) are left
-            out when the provider is in no pool (not_providing, not_connected,
-            location_invalid, not_eligible).
+            display order. The mode-level numbers (`weight_*`, `tier_*`) are
+            left out when the provider is in no pool (not_providing,
+            not_connected, location_invalid, not_eligible).
           type: array
           items:
             $ref: "#/components/schemas/ProviderRankingNumber"
@@ -10875,7 +11033,7 @@ components:
             (milliseconds above the expected delay), weight_quality,
             weight_speed (the relative selection weight), tier_quality,
             tier_speed (0 is best; 3 is past the speed or delay cutoff). A
-            reliability lookback outside these is reliability_lookback_<index>.
+            reliability lookback outside these is `reliability_lookback_<index>`.
           type: string
         has_value:
           type: boolean
@@ -11413,6 +11571,20 @@ components:
           required:
             - message
           properties:
+            code:
+              description: |
+                A stable code for a refusal that has one, so a client can pick a
+                localized message.
+                `signature_mismatch`: the signature is well formed but does not
+                verify for `coldkey_ss58` over `message`. In practice the
+                wallet signed with another account than the address entered,
+                or signed other text. An sr25519 signature cannot be recovered
+                to the key that made it, so the server cannot name that
+                account. Sign the issued challenge with the entered address.
+                Malformed input and a wrong, used or expired challenge carry no
+                code. Absent from older servers and for other refusals; clients
+                fall back to `message` for an absent or unknown code.
+              type: string
             message:
               type: string
 
@@ -12194,6 +12366,12 @@ components:
         network_id:
           type: string
           format: uuid
+        recipient:
+          type: string
+          description: the merchant address (base58) to pay, the same one /solana/payment-intent quotes; build the payment url and show the address from this, never a hardcoded address
+        spl_token_mint:
+          type: string
+          description: the SPL token mint (base58) to pay in (USDC)
         error:
           type: object
           required:
