@@ -19,7 +19,7 @@ reliability, packet format, congestion-avoidance increment, or loss timer.
 Every main module consuming Connect must explicitly replace
 `github.com/pion/sctp` with this directory; Go does not inherit replacements
 from dependency modules. Connect, SDK main/build/cgo/js, server, proxy,
-operator-proxy, and sn declare the replacement. Do not patch the Go module
+and sn declare the replacement. Do not patch the Go module
 cache or rely on an untracked
 temporary modfile. Before distributing Connect outside this workspace,
 publish/pin the reviewed upstream or maintained fork revision, or carry an

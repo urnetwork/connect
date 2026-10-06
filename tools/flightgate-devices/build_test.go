@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -93,5 +95,100 @@ func TestLoadCompletionRequiresOneValidSummary(t *testing.T) {
 				t.Fatalf("summary %d, %d, %v", bytes, count, err)
 			}
 		})
+	}
+}
+
+// The sdk build module's replace directives as of the sdk's local gVisor fork
+// (2026-10-02): every local path resolves beside the frozen sdk worktree.
+const buildSiblingTestSdkBuildGoMod = `module github.com/urnetwork/sdk/build
+
+go 1.26
+
+replace github.com/urnetwork/sdk => ..
+
+replace github.com/urnetwork/connect => ../../connect
+
+replace github.com/pion/sctp => ../../connect/sctp
+
+replace github.com/urnetwork/glog => ../../glog
+
+replace github.com/urnetwork/goidenticons => ../../goidenticons
+
+replace gvisor.dev/gvisor => ../../gvisor
+`
+
+// Creates a shared checkout tree as it stands after operator-proxy's
+// retirement, and an empty build root holding the detached connect and sdk
+// worktrees that build-item adds before it links the siblings.
+func newBuildSiblingTestDirs(t *testing.T) (string, string) {
+	tree, root := t.TempDir(), t.TempDir()
+	for _, name := range []string{"android", "connect", "glog", "goidenticons", "gvisor", "proxy", "sdk", "server", "sn", "userwireguard", "warp"} {
+		if err := os.MkdirAll(filepath.Join(tree, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{filepath.Join("connect", "sctp"), filepath.Join("sdk", "build")} {
+		if err := os.MkdirAll(filepath.Join(root, path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return tree, root
+}
+
+// Since the sdk pinned its local gVisor fork, the sdk build module replaces
+// gvisor with ../../gvisor; without that link the frozen build fails at its
+// first go command.
+func TestLinkBuildSiblingsResolvesSdkBuildModuleReplacements(t *testing.T) {
+	tree, root := newBuildSiblingTestDirs(t)
+	sdkBuild := filepath.Join(root, "sdk", "build")
+	if err := os.WriteFile(filepath.Join(sdkBuild, "go.mod"), []byte(buildSiblingTestSdkBuildGoMod), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := linkBuildSiblings(tree, root); err != nil {
+		t.Fatal(err)
+	}
+	editCmd := exec.Command("go", "mod", "edit", "-json", "go.mod")
+	editCmd.Dir = sdkBuild
+	out, err := editCmd.Output()
+	if err != nil {
+		t.Fatalf("go mod edit -json: %v", err)
+	}
+	var goMod struct {
+		Replace []struct {
+			Old struct{ Path string }
+			New struct{ Path string }
+		}
+	}
+	if err := json.Unmarshal(out, &goMod); err != nil {
+		t.Fatal(err)
+	}
+	if len(goMod.Replace) != 6 {
+		t.Fatalf("parsed %d replace directives, want 6", len(goMod.Replace))
+	}
+	for _, replace := range goMod.Replace {
+		if _, err := os.Stat(filepath.Join(sdkBuild, replace.New.Path)); err != nil {
+			t.Errorf("%s => %s does not resolve in the build root: %v", replace.Old.Path, replace.New.Path, err)
+		}
+	}
+}
+
+// operator-proxy is retired and gone from the shared tree, so the build root
+// must not link it: every link in the root resolves.
+func TestLinkBuildSiblingsLeavesNoDanglingLink(t *testing.T) {
+	tree, root := newBuildSiblingTestDirs(t)
+	if err := linkBuildSiblings(tree, root); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if _, err := os.Stat(filepath.Join(root, entry.Name())); err != nil {
+			t.Errorf("build root link %s does not resolve: %v", entry.Name(), err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(root, "operator-proxy")); !os.IsNotExist(err) {
+		t.Errorf("build root links the retired operator-proxy checkout: %v", err)
 	}
 }
