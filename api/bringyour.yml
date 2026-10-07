@@ -171,6 +171,7 @@ paths:
   /privacy.txt:
     get:
       tags: [Other]
+      summary: Privacy Txt
       description: |
         Redirect (303) to the canonical privacy policy on bringyour.com.
         The api serves the redirect so a client that only knows the api host
@@ -188,6 +189,7 @@ paths:
   /terms.txt:
     get:
       tags: [Other]
+      summary: Terms Txt
       description: |
         Redirect (303) to the canonical terms of service on bringyour.com.
       operationId: termsTxt
@@ -203,6 +205,7 @@ paths:
   /vdp.txt:
     get:
       tags: [Other]
+      summary: Vdp Txt
       description: |
         Redirect (303) to the vulnerability disclosure policy on
         bringyour.com.
@@ -219,6 +222,7 @@ paths:
   /status:
     get:
       tags: [Other]
+      summary: Warp Status
       description: |
         The serving status of the api process that answered, used by the
         deploy poll and by fleet status sampling. `status` is a latched value
@@ -242,6 +246,7 @@ paths:
   /clock:
     get:
       tags: [Other]
+      summary: Clock
       description: |
         Get the cumulative destination-reported bytes for contracts finalized
         on or after the start of subnet block 9.
@@ -262,6 +267,7 @@ paths:
   /stats/last-90:
     get:
       tags: [Stats]
+      summary: Stats Last 90
       description: |
         Get network statistics for the last 90 days.
         The statistics are updated approximately every 60s.
@@ -317,6 +323,7 @@ paths:
   /stats/providers:
     get:
       tags: [Stats]
+      summary: Stats Providers
       description: |
         Get all providers in the caller network.
         Each provider includes stats from the last 24 hours.
@@ -334,6 +341,7 @@ paths:
   /stats/providers-last-n:
     post:
       tags: [Stats]
+      summary: Stats Providers Last N hours
       description: |
         Get all providers in the caller network.
         Each provider includes stats from the last n hours.
@@ -357,6 +365,7 @@ paths:
   /stats/provider-last-n:
     post:
       tags: [Stats]
+      summary: Stats Provider Last N hours
       description: |
         Get detailed stats on a single provider in the caller network.
         This is meant to give the user complete visibility over usage.
@@ -380,6 +389,7 @@ paths:
   /stats/providers-overview-last-n:
     post:
       tags: [Stats]
+      summary: Stats Providers Overview Last N hours
       description: |
         Get a network-wide time series aggregated across all providers in the
         caller network, over the last n hours.
@@ -403,6 +413,7 @@ paths:
   /stats/providers-overview-last-90:
     get:
       tags: [Stats]
+      summary: Stats Providers Overview Last 90
       description: |
         Legacy alias of `/stats/providers-overview-last-n` with the lookback
         fixed at 90 days, kept for callers that predate the route migration.
@@ -421,6 +432,7 @@ paths:
   /stats/provider-last-90:
     post:
       tags: [Stats]
+      summary: Stats Provider Last 90
       description: |
         Legacy alias of `/stats/provider-last-n`, kept for callers that
         predate the route migration. A request that names neither `last_n` nor
@@ -447,6 +459,7 @@ paths:
   /stats/leaderboard:
     post:
       tags: [Stats]
+      summary: Stats Leaderboard
       description: |
         Fetches top 100 current leaderboard. This data is refreshed every payout.
       operationId: statsLeaderboard
@@ -469,6 +482,7 @@ paths:
   /stats/points-leaderboard:
     post:
       tags: [Stats]
+      summary: Stats Points Leaderboard
       description: |
         Page the all-time points leaderboard. Every network with points is
         ranked on three dimensions (total points, finalized epochs with points
@@ -515,6 +529,7 @@ paths:
   /auth/login:
     post:
       tags: [Authentication]
+      summary: Auth Login
       description: |
         Start a login for a user authority.
         The user authority may be:
@@ -554,6 +569,7 @@ paths:
   /auth/wallet-challenge:
     post:
       tags: [Authentication]
+      summary: Auth Wallet Challenge
       description: |
         Issue a single-use wallet sign-in challenge. The wallet signs the
         returned `message_template` byte for byte; the signature is then
@@ -587,6 +603,7 @@ paths:
   /auth/wallet-nonce:
     post:
       tags: [Authentication]
+      summary: Auth Wallet Nonce
       description: |
         Issue a fresh single-use, short-lived (5 minute) nonce for wallet
         login. The client embeds the returned nonce in the message it signs
@@ -611,6 +628,7 @@ paths:
   /auth/login-with-password:
     post:
       tags: [Authentication]
+      summary: Auth Login With Password
       description: |
         Password login for email and phone number.
       operationId: authLoginWithPassword
@@ -632,6 +650,7 @@ paths:
   /auth/verify:
     post:
       tags: [Authentication]
+      summary: Auth Verify
       description: |
         Verify ownership of email or phone number.
       operationId: authVerify
@@ -653,6 +672,7 @@ paths:
   /auth/refresh:
     get:
       tags: [Authentication]
+      summary: Auth Refresh Token
       description: |
         Refresh the client JWT (by_jwt) for the caller's client.
         Requires a client JWT (from `/network/auth-client`).
@@ -670,6 +690,7 @@ paths:
   /auth/verify-send:
     post:
       tags: [Authentication]
+      summary: Auth Verify Send
       description: |
         Send verification code to email or phone number.
 
@@ -706,6 +727,7 @@ paths:
   /auth/password-reset:
     post:
       tags: [Authentication]
+      summary: Auth Password Reset
       description: |
         Send password reset code to email or phone number.
 
@@ -743,6 +765,7 @@ paths:
   /auth/password-set:
     post:
       tags: [Authentication]
+      summary: Auth Password Set
       description: |
         Change password.
       operationId: authPasswordSet
@@ -764,6 +787,7 @@ paths:
   /auth/network-check:
     post:
       tags: [Authentication]
+      summary: Auth Network Check
       description: |
         Check if the network name is available.
         The name is normalized before it is checked: trimmed, lower-cased, and
@@ -837,6 +861,7 @@ paths:
   /auth/network-delete:
     post:
       tags: [Authentication]
+      summary: Auth Network Delete
       description: |
         Delete network
       operationId: authNetworkDelete
@@ -853,6 +878,7 @@ paths:
   /auth/code-create:
     post:
       tags: [Authentication]
+      summary: Auth Code Create
       description: |
         Create a limited use code (auth code) to share authentication
         with connected apps and tools.
@@ -1046,6 +1072,7 @@ paths:
   /auth/code-login:
     post:
       tags: [Authentication]
+      summary: Auth Code Login
       description: |
         Authenticate with an auth code.
         The returned session is tied to the session that created the auth code,
@@ -1070,6 +1097,7 @@ paths:
   /auth/add-auth:
     post:
       tags: [Authentication]
+      summary: Auth Add Auth
       description: |
         Add an authentication method (email/phone + password, SSO, or wallet)
         to the calling user. A wallet (`wallet_auth`, Solana or Bittensor)
@@ -1101,6 +1129,7 @@ paths:
   /auth/remove-auth:
     post:
       tags: [Authentication]
+      summary: Auth Remove Auth
       description: |
         Remove an authentication method from the calling user. The last
         remaining method cannot be removed.
@@ -1124,6 +1153,7 @@ paths:
   /auth/generate-seedphrase:
     post:
       tags: [Authentication]
+      summary: Auth Generate Seedphrase
       description: |
         Generate a recovery seedphrase for the calling user. Fails if a
         seedphrase auth already exists; see /auth/regenerate-seedphrase.
@@ -1141,6 +1171,7 @@ paths:
   /auth/regenerate-seedphrase:
     post:
       tags: [Authentication]
+      summary: Auth Regenerate Seedphrase
       description: |
         Replace the calling user's recovery seedphrase with a new one,
         invalidating the previous seedphrase.
@@ -1221,6 +1252,7 @@ paths:
   /network/remove-client:
     post:
       tags: [Network]
+      summary: Remove Network Client
       description: |
         Remove a client from the network.
       operationId: removeNetworkClient
@@ -1243,6 +1275,7 @@ paths:
   /network/remove-clients:
     post:
       tags: [Network]
+      summary: Remove Network Clients
       description: |
         Remove many clients from the caller's network in one call, so a
         network with hundreds of thousands of offline clients can be cleared
@@ -1486,6 +1519,7 @@ paths:
   /network/clients:
     get:
       tags: [Network]
+      summary: Network Clients
       description: |
         Get the latest status of the network's devices: every top-level
         client (no source_client_id) that is not a hosted proxy device, with
@@ -1516,6 +1550,7 @@ paths:
   /network/proxies:
     get:
       tags: [Network]
+      summary: Network Proxies
       description: |
         The network's cloud proxy devices: the clients that carry a hosted
         proxy device (created with `proxy_config` on `/network/auth-client`),
@@ -1536,6 +1571,7 @@ paths:
   /network/peers:
     get:
       tags: [Network]
+      summary: Network Peers
       description: |
         Fast network peer discovery.
 
@@ -1560,6 +1596,7 @@ paths:
   /preferences/set-preferences:
     post:
       tags: [Preferences]
+      summary: Preferences Set
       description: |
         Set account preferences.
       operationId: preferencesSet
@@ -1582,6 +1619,7 @@ paths:
   /preferences:
     get:
       tags: [Preferences]
+      summary: Preferences Get
       description: |
         Get account preferences.
       operationId: preferencesGet
@@ -1598,6 +1636,7 @@ paths:
   /feedback/send-feedback:
     post:
       tags: [Feedback]
+      summary: Feedback Send
       description: |
         Feedback.
       operationId: feedbackSend
@@ -1620,6 +1659,7 @@ paths:
   /log/{clientId}/upload:
     post:
       tags: [Other]
+      summary: Log Upload
       description: |
         Upload a log file for the caller, associated with a feedback id.
         The request body is the raw log file content, streamed to storage.
@@ -1653,6 +1693,7 @@ paths:
   /network/provider-locations:
     get:
       tags: [Network]
+      summary: Network Provider Locations
       description: |
         A list of locations and groups where there is at least one active
         provider in good health.
@@ -1673,6 +1714,7 @@ paths:
   /network/find-provider-locations:
     post:
       tags: [Network]
+      summary: Network Find Provider Locations
       description: |
         Search for locations and groups that match a query,
         where there are at least one active provider in good health.
@@ -1699,6 +1741,7 @@ paths:
   /network/find-providers2:
     post:
       tags: [Network]
+      summary: Network Find Providers 2
       description: |
         Randomly sample providers for locations, groups, or devices,
         which are active and in good health.
@@ -1723,6 +1766,7 @@ paths:
   /network/ranking:
     get:
       tags: [Network]
+      summary: Network Get Ranking
       description: |
         Get leaderboard ranking of current network. Besides the data
         leaderboard rank, the result carries the network's points leaderboard
@@ -1744,6 +1788,7 @@ paths:
   /network/ranking-visibility:
     post:
       tags: [Network]
+      summary: Network Ranking Visibility
       description: |
         Allow network to toggle leaderboard ranking visibility
       operationId: networkRankingVisibility
@@ -1766,6 +1811,7 @@ paths:
   /network/points-ranking-visibility:
     post:
       tags: [Network]
+      summary: Network Points Ranking Visibility
       description: |
         Turn the network's name on or off on the points leaderboard. Every
         network with points is ranked and listed either way; this switch only
@@ -1791,6 +1837,7 @@ paths:
   /network/emoji:
     post:
       tags: [Network]
+      summary: Network Set Emoji Tag
       description: |
         Set the network's emoji tag: 1 to 6 emoji (each grapheme cluster must
         be a single emoji: pictographs with skin tones, ZWJ sequences, keycaps,
@@ -1817,6 +1864,7 @@ paths:
   /network/block-location:
     post:
       tags: [Network]
+      summary: Network Block Location
       description: |
         Block providing to a location
       operationId: networkBlockLocation
@@ -1839,6 +1887,7 @@ paths:
   /network/unblock-location:
     post:
       tags: [Network]
+      summary: Network Unblock Location
       description: |
         Unblock providing to a location
       operationId: networkUnblockLocation
@@ -1861,6 +1910,7 @@ paths:
   /network/blocked-locations:
     get:
       tags: [Network]
+      summary: Network Blocked Locations
       description: Get list locations to block from providing for the network
       operationId: networkBlockedLocations
       security:
@@ -1876,6 +1926,7 @@ paths:
   /network/reliability:
     get:
       tags: [Network]
+      summary: Network Reliability
       description: Get network reliability stats
       operationId: networkReliability
       security:
@@ -1891,6 +1942,7 @@ paths:
   /network/provider-status:
     get:
       tags: [Network]
+      summary: Network Provider Status
       description: |
         Why each of the caller network's own provider clients is or is not
         offered to clients, with how often find-providers2 returned it per
@@ -1919,6 +1971,7 @@ paths:
   /network/user:
     get:
       tags: [Network]
+      summary: Get Network User
       description: |
         Get the user and configured auth methods for the caller network.
       operationId: getNetworkUser
@@ -1935,6 +1988,7 @@ paths:
   /network/user/update:
     post:
       tags: [Network]
+      summary: Update Network Name
       description: |
         Update the caller network's name.
       operationId: updateNetworkName
@@ -2498,6 +2552,7 @@ paths:
   /wallet/balance:
     get:
       tags: [Wallet]
+      summary: Wallet Balance
       description: |
         Get the balance for the USDC user custody wallet.
         The user custody wallet allows URnetwork to query the balance,
@@ -2516,6 +2571,7 @@ paths:
   /wallet/validate-address:
     post:
       tags: [Wallet]
+      summary: Wallet Validate Address
       description: |
         Validate a USDC wallet address on the user custody wallet chain.
         This can be used to check whether an address can receive
@@ -2541,6 +2597,7 @@ paths:
   /wallet/circle-init:
     post:
       tags: [Wallet]
+      summary: Wallet Circle Init
       description: |
         Initialize the Circle USDC user self custody wallet.
         This starts a process that must be completed by the user.
@@ -2558,6 +2615,7 @@ paths:
   /wallet/circle-transfer-out:
     post:
       tags: [Wallet]
+      summary: Wallet Circle Transfer Out
       description: |
         Set up a transfer from the Circle USDC user self custody wallet
         to an address.
@@ -2621,6 +2679,7 @@ paths:
   /subscription/details:
     get:
       tags: [Subscription]
+      summary: Subscription Details
       description: |
         The "Manage subscription" screen: every store currently billing the
         caller's network, one entry per store, with the window it bought
@@ -2652,6 +2711,7 @@ paths:
   /subscription/cancel:
     post:
       tags: [Subscription]
+      summary: Subscription Cancel
       description: |
         Stop the Stripe subscription billing the caller's network at the end of
         the paid period (`cancel_at_period_end`); the customer keeps Pro until
@@ -2680,6 +2740,7 @@ paths:
   /subscription/resume:
     post:
       tags: [Subscription]
+      summary: Subscription Resume
       description: |
         Undo /subscription/cancel while the paid period is still running: the
         Stripe subscription renews again. Same request and result shapes.
@@ -2703,6 +2764,7 @@ paths:
   /subscription/check-balance-code:
     post:
       tags: [Subscription]
+      summary: Subscription Check Balance Code
       description: |
         Check if the balance code is valid.
       operationId: subscriptionCheckBalanceCode
@@ -2725,6 +2787,7 @@ paths:
   /subscription/redeem-balance-code:
     post:
       tags: [Subscription]
+      summary: Subscription Redeem Balance Code
       description: |
         Redeem the balance code and add the transfer balance to the caller network.
       operationId: subscriptionRedeemBalanceCode
@@ -2747,6 +2810,7 @@ paths:
   /subscription/create-payment-id:
     post:
       tags: [Subscription]
+      summary: Subscription Create Payment Id
       description: |
         Creates an anonymous payment identifier to be used with purchases.
         This keeps network information out of the payment processor system.
@@ -3168,6 +3232,7 @@ paths:
   /device/add:
     post:
       tags: [Device]
+      summary: Device Add
       description: |
         Add a device, which can either be owned by the network or shared with the network.
         The code provided can be either adoption code or a share code.
@@ -3193,6 +3258,7 @@ paths:
   /device/create-share-code:
     post:
       tags: [Device]
+      summary: Device Create Share Code
       description: |
         Creates a code to share a device.
       operationId: deviceCreateShareCode
@@ -3215,6 +3281,7 @@ paths:
   /device/share-code/{code}/qr.png:
     get:
       tags: [Device]
+      summary: Device Share Code QR
       description: |
         A QR code that maps to a URL to add the shared device.
         Send it to someone to scan to add the device.
@@ -3240,6 +3307,7 @@ paths:
   /device/share-status:
     post:
       tags: [Device]
+      summary: Device Share Status
       description: |
         The status of the shared device.
         The status can be one of:
@@ -3266,6 +3334,7 @@ paths:
   /device/confirm-share:
     post:
       tags: [Device]
+      summary: Device Confirm Share
       description: |
         Confirm the share of a device.
         This must be called from the side that initiates the share.
@@ -3289,6 +3358,7 @@ paths:
   /device/create-adopt-code:
     post:
       tags: [Device]
+      summary: Device Create Adopt Code
       description: |
         Creates a code to adopt a device.
         The adopt code is valid for a limited time.
@@ -3311,6 +3381,7 @@ paths:
   /device/adopt-code/{code}/qr.png:
     get:
       tags: [Device]
+      summary: Device Adopt Code QR
       description: |
         A QR code that maps to a URL to adopt the device.
         Send it to someone to scan to adopt the device.
@@ -3335,6 +3406,7 @@ paths:
   /device/adopt-status:
     post:
       tags: [Device]
+      summary: Device Adopt Status
       description: |
         The status of the adopt-code device.
         The status can be one of:
@@ -3360,6 +3432,7 @@ paths:
   /device/confirm-adopt:
     post:
       tags: [Device]
+      summary: Device Confirm Adopt
       description: |
         Confirm the adoption of a device.
         This must be called from the side that initiates the adoption.
@@ -3382,6 +3455,7 @@ paths:
   /device/remove-adopt-code:
     post:
       tags: [Device]
+      summary: Remove Adopt Code
       description: |
         Remove an adopt code.
         This must be called from the side that initiates the adoption.
@@ -3404,6 +3478,7 @@ paths:
   /device/associations:
     get:
       tags: [Device]
+      summary: Device Associations
       description: |
         The devices associated with the caller network.
         Associated devices are:
@@ -3424,6 +3499,7 @@ paths:
   /device/remove-association:
     post:
       tags: [Device]
+      summary: Device Remove Association
       description: |
         Remove a device association.
         The association can be any of:
@@ -3450,6 +3526,7 @@ paths:
   /device/set-association-name:
     post:
       tags: [Device]
+      summary: Device Set Association Name
       description: |
         Set the name of the association.
         To set the name of devices owned by the network, use `/device/set-name`.
@@ -3473,6 +3550,7 @@ paths:
   /device/set-name:
     post:
       tags: [Device]
+      summary: Network Set Device Name
       description: |
         Sets the name of a device owned by the network.
         To set the name of devices shared with the network, use `/device/set-association-name`.
@@ -3496,6 +3574,7 @@ paths:
   /connect:
     get:
       tags: [Connect protocol]
+      summary: Auth Connect
       description: |
         Redirect (303) to the single sign-on (SSO) start URL.
         Used to begin the browser SSO/OAuth flow.
@@ -3510,6 +3589,7 @@ paths:
                 type: string
     post:
       tags: [Connect protocol]
+      summary: Auth Connect Post
       description: |
         Redirect (303) to the single sign-on (SSO) start URL.
         Used to begin the browser SSO/OAuth flow.
@@ -3526,6 +3606,7 @@ paths:
   /connect/control:
     post:
       tags: [Connect protocol]
+      summary: Connect Control
       description: |
         Out-of-band control messages for the connect protocol.
         Blocking request-response control messages need to be handled out-of-band
@@ -3550,6 +3631,7 @@ paths:
   /key/{clientId}:
     get:
       tags: [Other]
+      summary: Get Client Key
       description: |
         Fetch the published Ed25519 public key for a client id.
         Unauthenticated by design - the value is a public key meant to be
@@ -3575,6 +3657,7 @@ paths:
   /key/{clientId}/history:
     get:
       tags: [Other]
+      summary: Get Client Key History
       description: |
         Fetch the operator-signed registration history of a client's public
         key: the ordered signed registrations, generation 1 first, each an
@@ -3639,6 +3722,7 @@ paths:
   /my-ip-info:
     get:
       tags: [Other]
+      summary: My IP Info
       description: |
         Information about the caller's IP as seen by the platform: its
         geolocation, and whether the IP is currently connected to the network.
@@ -3660,6 +3744,7 @@ paths:
   /account/change-name:
     post:
       tags: [Account]
+      summary: Account Change Name
       description: |
         Change the network name of the calling network. The previous name
         enters a reclaim cooldown. Subject to the account action rate limit.
@@ -3683,6 +3768,7 @@ paths:
   /account/claim-name:
     post:
       tags: [Account]
+      summary: Account Claim Name
       description: |
         Claim an unused network name for the calling network. Claiming and
         changing have SEPARATE daily budgets: a first-time claim does not
@@ -3709,6 +3795,7 @@ paths:
   /account/api-key:
     post:
       tags: [Account]
+      summary: Account Create API Key
       description: |
         Create an API key for the account.
       operationId: accountCreateApiKey
@@ -3731,6 +3818,7 @@ paths:
   /account/api-key/remove:
     post:
       tags: [Account]
+      summary: Account Remove API Key
       description: |
         Remove an API key for the account.
       operationId: accountRemoveApiKey
@@ -3753,6 +3841,7 @@ paths:
   /account/api-keys:
     get:
       tags: [Account]
+      summary: Account Get API Keys
       description: |
         Fetches a list of API keys associated with the account.
         The list does not include the API key secrets, only metadata.
@@ -3770,6 +3859,7 @@ paths:
   /account/payout-wallet:
     post:
       tags: [Account]
+      summary: Account Set Payout Wallet
       description: |
         Set an existing account wallet as the wallet to receive network payments.
       operationId: accountSetPayoutWallet
@@ -3790,6 +3880,7 @@ paths:
                 $ref: "#/components/schemas/SetPayoutWalletResult"
     get:
       tags: [Account]
+      summary: Account Get Payout Wallet
       description: |
         Fetches the payout wallet associated with the network
       operationId: accountGetPayoutWallet
@@ -3806,6 +3897,7 @@ paths:
   /account/points:
     get:
       tags: [Account]
+      summary: Account Get Points
       description: |
         Retrieves account points earned. Eventually, users will be able to convert points for tokens
       operationId: accountGetPoints
@@ -3822,6 +3914,7 @@ paths:
   /account/payments:
     get:
       tags: [Account]
+      summary: Account Get Payouts
       description: |
         Retrieves list of account payments
       operationId: accountGetPayouts
@@ -3838,6 +3931,7 @@ paths:
   /account/wallet:
     post:
       tags: [Account]
+      summary: Account Create Wallet
       description: |
         Create a new wallet for your network. You can then use it as a payout wallet
         by posting to /account/payout-wallet.
@@ -3861,6 +3955,7 @@ paths:
   /account/wallets:
     get:
       tags: [Account]
+      summary: Account Get Wallets
       description: |
         Get a list of wallets associated with your network
       operationId: accountGetWallets
@@ -3877,6 +3972,7 @@ paths:
   /account/wallets/remove:
     post:
       tags: [Account]
+      summary: Account Remove Wallet
       description: |
         Remove a wallet from your list of account wallets. Removing the
         payout wallet makes another active Solana or Polygon wallet of the
@@ -3903,6 +3999,7 @@ paths:
   /account/wallets/verify-seeker:
     post:
       tags: [Account]
+      summary: Account Verify Seeker Token
       description: |
         Verify that a wallet holds a Seeker or Saga Genesis token by
         validating a signed message. Either holding succeeds; a wallet with
@@ -3928,6 +4025,7 @@ paths:
   /account/balance-codes:
     get:
       tags: [Account]
+      summary: Account Balance Codes
       description: |
         Fetch balance codes redeemed by network
       operationId: accountBalanceCodes
@@ -3944,6 +4042,7 @@ paths:
   /account/epochs:
     get:
       tags: [Account]
+      summary: Account Epochs
       description: |
         The caller network's finalized epochs, newest first: the points earned
         inside each epoch's wall-clock window and the network's share of the
@@ -3969,6 +4068,7 @@ paths:
   /account/referral-code:
     get:
       tags: [Account]
+      summary: Account Referral Code
       description: |
         Unique network code to refer new users
       operationId: accountReferralCode
@@ -3985,6 +4085,7 @@ paths:
   /referral-code/validate:
     post:
       tags: [Referral codes]
+      summary: Validate Referral Code
       description: |
         Validate a referral (bonus) code: whether it exists and whether it has
         been used up. The sign-up screens call this before an account exists,
@@ -4012,6 +4113,7 @@ paths:
   /account/referral-network:
     get:
       tags: [Account]
+      summary: Account Referral Network
       description: |
         Get the network that was referred the authenticated network
       operationId: accountReferralNetwork
@@ -4028,6 +4130,7 @@ paths:
   /account/unlink-referral-network:
     get:
       tags: [Account]
+      summary: Account Unlink Referral Network
       description: |
         Unlink the referral network from the authenticated network.
       operationId: accountUnlinkReferralNetwork
@@ -4044,6 +4147,7 @@ paths:
   /account/set-referral:
     post:
       tags: [Account]
+      summary: Account Set Referral
       description: |
         Set the parent referral network for the authenticated network.
       operationId: accountSetReferral
@@ -4066,6 +4170,7 @@ paths:
   /transfer/stats:
     get:
       tags: [Transfer]
+      summary: Transfer Stats
       description: |
         Retrieves the paid and unpaid byte count provided to the network
       operationId: transferStats
@@ -4159,6 +4264,7 @@ paths:
   /stripe/payment-intent:
     post:
       tags: [Other]
+      summary: Stripe Payment Intent
       description: |
         When paying for a subscription with Stripe, create the payment intents,
         ephemeral key, and customer id needed to complete the purchase.
@@ -4185,6 +4291,7 @@ paths:
   /stripe/customer-portal:
     post:
       tags: [Other]
+      summary: Stripe Customer Portal
       description: |
         Create a Stripe customer portal URL for the caller to manage their
         subscription. A refusal carries a stable `error.code`
@@ -4210,6 +4317,7 @@ paths:
   /pay/data/checkout:
     post:
       tags: [Other]
+      summary: Pay Data Checkout
       description: |
         Buy a data pack with a card without signing in (the ur.io buy-data
         page). Starts a hosted Stripe checkout and returns the url to send the
@@ -4249,6 +4357,7 @@ paths:
   /pay/data/network-lookup:
     post:
       tags: [Other]
+      summary: Pay Data Network Lookup
       description: |
         Whether a network with exactly this name exists, for the buy-data page.
         Matched the same way /pay/data/checkout resolves `network_name`
@@ -4274,6 +4383,7 @@ paths:
   /pay/data/solana-intent:
     post:
       tags: [Other]
+      summary: Pay Data Solana Intent
       description: |
         Buy a data pack with USDC on Solana, without signing in or giving an
         email: the data goes straight to the network named by `network_name`
@@ -4323,6 +4433,7 @@ paths:
   /pay/data/solana-status:
     post:
       tags: [Other]
+      summary: Pay Data Solana Status
       description: |
         The state of a data pack payment started with /pay/data/solana-intent,
         for the buy-data page to poll while it waits: `pending` until the USDC
@@ -4348,6 +4459,7 @@ paths:
   /stripe/create-checkout-session:
     post:
       tags: [Other]
+      summary: Stripe Create Checkout Session
       description: |
         Create a Stripe Checkout Session for a subscription or data pack.
 
@@ -4386,6 +4498,7 @@ paths:
   /verify:
     post:
       tags: [Other]
+      summary: Verify
       description: |
         One step of the validator's routing-verification protocol.
         The route accepts two body shapes:
@@ -4426,6 +4539,7 @@ paths:
   /verify/keys:
     get:
       tags: [Other]
+      summary: Verify Keys
       description: |
         The published server Ed25519 verify keys, by server_key_id.
         All historical keys are listed so old proofs remain verifiable
@@ -4539,6 +4653,7 @@ paths:
   /sn/wallet:
     post:
       tags: [Other]
+      summary: Sn Set Wallet
       description: |
         Attach the caller's subnet coldkey - the ss58 address that pool payouts
         are claimable by. Proof of key possession is required: `message` is the
@@ -4584,6 +4699,7 @@ paths:
                 $ref: "#/components/schemas/SnSetWalletResult"
     get:
       tags: [Other]
+      summary: Sn Get Wallet
       description: |
         The coldkeys attached inside the caller's network: the network consent,
         the hotkey entry and the network-level wallet (no `client_id`) and
@@ -4615,6 +4731,7 @@ paths:
   /sn/wallet/consent:
     post:
       tags: [Other]
+      summary: Sn Wallet Mapping Challenge
       description: |
         Issue a per-provider wallet mapping consent: the exact message the
         coldkey signs to receive one provider client's earnings for the
@@ -4644,6 +4761,7 @@ paths:
   /sn/wallet/consent/history:
     post:
       tags: [Other]
+      summary: Sn Wallet Mapping History
       description: |
         The retained signed consents of one provider client, generation 1
         through `generation`, for a caller that already holds the chain head
@@ -4670,6 +4788,7 @@ paths:
   /sn/wallet/network-consent:
     post:
       tags: [Other]
+      summary: Sn Network Wallet Mapping Challenge
       description: |
         Issue a network wallet mapping consent: the exact message the coldkey
         signs once to receive the earnings of every provider client of the
@@ -4701,6 +4820,7 @@ paths:
   /sn/wallet/network-consent/history:
     post:
       tags: [Other]
+      summary: Sn Network Wallet Mapping History
       description: |
         The retained signed network consents of one network, generation 1
         through `generation`, for a caller that already holds the chain head
@@ -4725,6 +4845,7 @@ paths:
   /sn/wallet/hotkey-consent:
     post:
       tags: [Other]
+      summary: Sn Hotkey Wallet Mapping Consent
       description: |
         Store a hotkey wallet consent chain: a coldkey's approval, signed once
         for every operator of the subnet, that the networks which delegate to
@@ -4765,6 +4886,7 @@ paths:
   /sn/wallet/hotkey-consent/history:
     post:
       tags: [Other]
+      summary: Sn Hotkey Wallet Mapping History
       description: |
         The stored hotkey wallet consents of one hotkey on this operator's
         subnet, generation 1 through `generation`, for a caller that already
@@ -4790,6 +4912,7 @@ paths:
   /sn/wallet/hotkey-delegation:
     post:
       tags: [Other]
+      summary: Sn Hotkey Network Delegation Challenge
       description: |
         Issue a hotkey delegation: the exact message the hotkey signs to
         receive the earnings of every provider client of the caller's network,
@@ -4825,6 +4948,7 @@ paths:
   /sn/wallet/hotkey-delegation/history:
     post:
       tags: [Other]
+      summary: Sn Hotkey Network Delegation History
       description: |
         The retained signed hotkey delegations of one network, generation 1
         through `generation`, for a caller that already holds the chain head
@@ -4850,6 +4974,7 @@ paths:
   /sn/wallet/validate:
     post:
       tags: [Other]
+      summary: Sn Validate Wallet
       description: |
         Checks an address before it is attached: ss58 syntax with the Bittensor
         prefix, the operator ban list, and whether the account exists on the
@@ -4876,6 +5001,7 @@ paths:
   /sn/head:
     get:
       tags: [Other]
+      summary: Sn Head
       description: |
         The caller network's standing for a head mining spot (Top 200,
         WHITEPAPER 8.4). `score` is the server's estimate of split-adjusted
@@ -4899,6 +5025,7 @@ paths:
   /sn/head/binding:
     post:
       tags: [Other]
+      summary: Sn Head Binding
       description: |
         Store a device's consent for a fleet binding (WHITEPAPER 11.4): the
         canonical binding payload and the client's Ed25519 signature over its
@@ -4926,6 +5053,7 @@ paths:
   /sn/pool/claim:
     get:
       tags: [Other]
+      summary: Sn Pool Claim
       description: |
         The caller network's merkle pool-payout claim for an epoch:
         everything needed to call claim on the subnet contract.
@@ -4953,6 +5081,7 @@ paths:
   /sn/epoch:
     get:
       tags: [Other]
+      summary: Sn Epoch
       description: |
         The current subnet epoch index, boundaries, and deadlines mirrored
         from chain, so clients do not need their own RPC.

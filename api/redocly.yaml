@@ -1,15 +1,13 @@
 # Lint configuration for bringyour.yml.
 #
-# The recommended ruleset is kept as-is apart from one rule that describes a
-# house style this document does not follow:
-#
-#   operation-summary -- this document carries its prose in `description`, and
-#     only some operations add a `summary` on top of it. Requiring a summary
-#     everywhere would mean inventing over a hundred one-liners that repeat
-#     the first line of each description.
-#
-# Everything else, including every structural rule, is enforced. Run:
+# The recommended ruleset is kept as-is, including every structural rule. Run:
 #   npx -y @redocly/cli lint bringyour.yml
+#
+# Its operation-summary rule keeps the operations readable: Redoc and ur.io's
+# api.md title an operation by its `summary` and fall back to the operationId,
+# so an operation without one would be listed as "statsLast90". The older
+# operations' summaries are their names from before the camelCase rename
+# ("Stats Last 90"); the prose stays in `description`.
 #
 # Rules of our own for operations, so the document stays usable by client and
 # agent-tool generators and agrees with the ur.io API reference:
@@ -51,7 +49,6 @@ extends:
   - recommended
 
 rules:
-  operation-summary: off
   operation-singular-tag: error
   operation-tag-defined: error
   rule/operation-id-camel-case:
