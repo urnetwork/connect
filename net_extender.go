@@ -64,6 +64,13 @@ const (
 	ExtenderCarrierTcp  = "tcp"
 	ExtenderCarrierQuic = "quic"
 	ExtenderCarrierDns  = "dns"
+	// The peer-to-peer webrtc carrier (EXTENDER.md C2a, webrtc extender
+	// section). It is not an ip:port carrier: it is reached through the
+	// exchange signaling and ICE/STUN, so it is never dialed by
+	// dialExtenderStream. The dial and serve live in net_extender_webrtc.go
+	// (not built for js/wasm). The name appears in records and the acceptance
+	// path so clients, the uptime task, and the strategy can name it.
+	ExtenderCarrierWebRtc = "webrtc"
 )
 
 // Fixed carrier ports (A1, L2). The old multi-port personas are removed. A
