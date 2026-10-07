@@ -279,10 +279,14 @@ func (self *combineQueue) Swap(i int, j int) {
 }
 
 type pumpItem struct {
-	addr       net.Addr
-	id         uint16
-	header     [18]byte
-	tld        []byte
+	addr   net.Addr
+	id     uint16
+	header [18]byte
+	tld    []byte
+	// the request carried an edns0 opt record, so the response paired with
+	// it carries one too (RFC 6891 section 7). clear for a request from
+	// before the single-question shape and for a synthesized item.
+	edns       bool
 	updateTime time.Time
 	// insertion order within the owning pumpQueue, assigned by Add.
 	// zero for an item that was never added.

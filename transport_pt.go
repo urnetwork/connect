@@ -155,6 +155,10 @@ type packetTranslation struct {
 	writeDeadlineMonitor *Monitor
 
 	deadlineAfterForTest func(time.Duration) <-chan time.Time
+	// runs on the pump consumer after each pump item is offered to the pump
+	// queue, so a test can wait for the exact items a request produced
+	// instead of polling the queue. nil in production.
+	pumpAddedForTest func(item *pumpItem, limit bool)
 }
 
 func NewPacketTranslation(
@@ -494,7 +498,10 @@ func (self *packetTranslation) encodeDns() {
 						}
 						pumpItems[i] = item
 					}
-					// fill the rest with new headers
+					// fill the rest with new headers. a synthesized item answers
+					// the way the client's latest real request asked to be
+					// answered, so one client sees one response shape.
+					fillEdns := 0 < i && pumpItems[0].edns
 					for ; i < c; i += 1 {
 						header := self.newHeader()
 						tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
@@ -502,6 +509,7 @@ func (self *packetTranslation) encodeDns() {
 							id:     id,
 							header: header,
 							tld:    tld,
+							edns:   fillEdns,
 						}
 						pumpItems[i] = item
 						id += 1
@@ -527,6 +535,7 @@ func (self *packetTranslation) encodeDns() {
 						p.data[n:],
 						buf,
 						item.tld,
+						item.edns,
 					)
 					n += m
 					if err != nil {
@@ -736,8 +745,11 @@ func (self *packetTranslation) decodeDns() {
 				minUpdateTime := time.Now().Add(-self.settings.DnsStateTimeout)
 				self.dnsPumpQueue.RemoveOlder(minUpdateTime)
 				// if limit, drop the pump header but continue to process the packet
-				self.dnsPumpQueue.Add(item)
+				limit := self.dnsPumpQueue.Add(item)
 				resetExpiry()
+				if self.pumpAddedForTest != nil {
+					self.pumpAddedForTest(item, limit)
+				}
 			}
 		}
 	})
@@ -771,7 +783,8 @@ func (self *packetTranslation) decodeDns() {
 		} else {
 			var id uint16
 			var otherData bool
-			id, header, data, tld, err, otherData = decodeDnsRequest(
+			var edns bool
+			id, header, data, tld, err, otherData, edns = decodeDnsRequest(
 				packetData[:n],
 				buf,
 				self.settings.DnsTlds,
@@ -796,6 +809,7 @@ func (self *packetTranslation) decodeDns() {
 				id:     id,
 				header: header,
 				tld:    tld,
+				edns:   edns,
 			}
 
 			select {
