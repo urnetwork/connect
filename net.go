@@ -102,7 +102,8 @@ func DefaultConnectSettings() *ConnectSettings {
 		ControlFamilyFirstHandshakeTimeout: 8 * time.Second,
 		ControlFamilyRetryReserve:          5 * time.Second,
 
-		TlsConfig: tlsConfig,
+		TlsConfig:                 tlsConfig,
+		TlsClientHelloFingerprint: TlsClientHelloFingerprintChrome,
 	}
 }
 
@@ -171,6 +172,16 @@ type ConnectSettings struct {
 	ControlFamilyRetryReserve time.Duration
 
 	TlsConfig *tls.Config
+
+	// The tls client hello of the normal and resilient dialers
+	// (net_tls_hello.go). Empty or `TlsClientHelloFingerprintChrome`, the
+	// default, is a current Chrome hello through uTLS.
+	// `TlsClientHelloFingerprintGo`, or any other value, restores Go's own
+	// crypto/tls hello: the kill switch, should the Chrome hello be refused
+	// somewhere. Either way a dial keeps its server name, certificate
+	// verification, application protocols and timeouts. The extender, VLESS
+	// and alt dialers, DoH and the streaming post keep their own hellos.
+	TlsClientHelloFingerprint string
 
 	ProxySettings *ProxySettings
 	Resolver      *net.Resolver

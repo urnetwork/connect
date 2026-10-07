@@ -420,7 +420,9 @@ func TestClientDialerWebSocketForcesHttp11Alpn(t *testing.T) {
 		if !ok {
 			t.Fatalf("unexpected WebSocket transport type %T", connection.UnderlyingConn())
 		}
-		tlsConnection, ok := batchConnection.conn.(*tls.Conn)
+		// Go's or the Chrome hello's connection (net_tls_hello.go); both answer
+		// in crypto/tls's connection state
+		tlsConnection, ok := batchConnection.conn.(interface{ ConnectionState() tls.ConnectionState })
 		if !ok {
 			t.Fatalf("unexpected batched WebSocket transport type %T", batchConnection.conn)
 		}

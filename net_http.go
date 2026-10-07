@@ -3,7 +3,6 @@ package connect
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -319,6 +318,8 @@ func newNormalDialTlsContext(
 	nextProtos []string,
 ) DialTlsContextFunction {
 	tlsConfig := newClientTlsConfig(settings.TlsConfig, nextProtos)
+	// the Chrome hello, or Go's (net_tls_hello.go)
+	tlsHandshaker := newClientTlsHandshaker(settings.TlsClientHelloFingerprint, tlsConfig)
 	// Every dial takes the explicit path below, including the mobile shape
 	// (no proxy, no injected dial context) that used to shortcut to a raw
 	// tls.Dialer here. That shortcut bypassed ConnectSettings.DialContext, so
@@ -359,14 +360,9 @@ func newNormalDialTlsContext(
 			if config.ServerName == "" {
 				config.ServerName = host
 			}
-			tlsConn := tls.Client(conn, config)
 			tlsCtx, tlsCancel := context.WithTimeout(ctx, settings.TlsTimeout)
 			defer tlsCancel()
-			if err := tlsConn.HandshakeContext(tlsCtx); err != nil {
-				tlsConn.Close()
-				return nil, err
-			}
-			return tlsConn, nil
+			return tlsHandshaker.handshake(tlsCtx, conn, config)
 		}
 		// DialContext preserves injected userspace networks in tests and proxy
 		// routing in production before wrapping the resulting connection in TLS.
