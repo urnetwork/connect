@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Owner-local custody uses real protected descriptors on the test data volume.
 // Only kernel mount facts model a laptop whose state shares its system device.
@@ -113,7 +113,7 @@ func TestOwnerLocalRootMountKeepsPathAndMountBounds(t *testing.T) {
 	}
 	fixture.host.change(func() { fixture.host.uuidDevice.Major ^= 1 })
 	fixture.host.change(func() {
-		fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 9, ParentId: 1, Device: fixture.host.uuidDevice, Root: "/", Path: fixture.root, FilesystemType: "ext4"})
+		fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 9, ParentId: 1, Device: fixture.host.uuidDevice, Root: "/", Path: fixture.root, FilesystemType: testFilesystemType})
 	})
 	if _, err := owner.mountFacts(); err == nil {
 		t.Fatal("nested same-device mount concealed the selected state root")

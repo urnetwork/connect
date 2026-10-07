@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 // Unsupported hosts cannot produce a weaker backup completeness claim.
 package durablevolume

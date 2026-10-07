@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Restore planning authenticates a stopped source archive before staging exact
 // old payloads. Only fixed adapters may compute new physical checkpoint bytes;
@@ -17,6 +17,9 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+
+	"github.com/urnetwork/connect/durablesys"
+	"golang.org/x/sys/unix"
 )
 
 // Restore is a new empty target with known historical source, never a renamed
@@ -214,7 +217,7 @@ type preparationRestoreArchive struct {
 	mount     Mount
 	inventory Inventory
 	entries   map[string]InventoryEntry
-	observed  map[string]syscall.Stat_t
+	observed  map[string]unix.Stat_t
 }
 
 // Admission is completed before staging any restored owner payload.
@@ -228,7 +231,7 @@ func openPreparationRestoreArchive(ctx context.Context, request PreparationReque
 		return nil, err
 	}
 	self := &preparationRestoreArchive{ctx: ctx, host: host, path: request.RestoreSource.Directory, root: root, inventory: report,
-		entries: map[string]InventoryEntry{}, observed: map[string]syscall.Stat_t{}}
+		entries: map[string]InventoryEntry{}, observed: map[string]unix.Stat_t{}}
 	defer func() {
 		if resultErr != nil {
 			resultErr = errors.Join(resultErr, self.close())
@@ -293,7 +296,7 @@ func (self *preparationRestoreArchive) open(relative string, directory bool) (*o
 	if relative != "" && !preparationRelative(relative, self.inventory.Limits.MaxDepth, false) {
 		return nil, errors.New("restore member path is outside the reviewed source")
 	}
-	fd, err := syscall.Openat(int(self.root.Fd()), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(self.root.Fd()), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, unavailableObservation("restore archive descriptor could not be borrowed", err)
 	}
@@ -311,7 +314,7 @@ func (self *preparationRestoreArchive) open(relative string, directory bool) (*o
 		if isDirectory {
 			flags |= syscall.O_DIRECTORY
 		}
-		next, openErr := syscall.Openat(int(file.Fd()), part, flags, 0)
+		next, openErr := unix.Openat(int(file.Fd()), part, flags, 0)
 		path := filepath.Join(file.Name(), part)
 		closeErr := file.Close()
 		if openErr != nil {
@@ -393,7 +396,7 @@ func (self *preparationRestoreArchive) walk(enroll bool) error {
 		if entry.Kind == "directory" {
 			kind = syscall.S_IFDIR
 		}
-		if before.Dev != self.identity.Device || before.Mode&syscall.S_IFMT != kind || before.Mode&07777 != entry.Mode ||
+		if durablesys.StatDevice(&before) != self.identity.Device || uint32(before.Mode)&syscall.S_IFMT != kind || uint32(before.Mode)&07777 != entry.Mode ||
 			entry.Kind == "file" && (before.Size < 0 || uint64(before.Size) != entry.Size || before.Nlink != 1) {
 			return errors.Join(ErrIdentity, errors.New("restore archive member metadata differs"))
 		}
@@ -510,10 +513,10 @@ func (self *preparationRestoreArchive) stage(parent *os.File, name string, owner
 	if name == "" || filepath.Base(name) != name || name == "." || name == ".." {
 		return errors.New("restore staging requires one private named namespace")
 	}
-	if err := syscall.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
+	if err := unix.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
 		return err
 	}
-	fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}
@@ -556,7 +559,7 @@ func (self *preparationRestoreArchive) stageMember(stage *os.File, member Prepar
 	defer func() { resultErr = errors.Join(resultErr, parent.Close()) }()
 	name := filepath.Base(member.Path)
 	if member.Kind == "directory" {
-		if err := syscall.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
+		if err := unix.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
 			return err
 		}
 		child, err := view.open(member.Path, true)
@@ -577,7 +580,7 @@ func (self *preparationRestoreArchive) stageMember(stage *os.File, member Prepar
 	if !unchangedInventoryStat(self.observed[member.Path], before) {
 		return errors.Join(ErrIdentity, errors.New("restore source file changed before copying"))
 	}
-	fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
+	fd, err := unix.Openat(int(parent.Fd()), name, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return err
 	}

@@ -577,6 +577,11 @@ message StoredContract {
     // `provide_mode` is `Network`; empty for all other provide modes.
     string principal = 11;
 
+    // Absolute admission deadline, sealed into the platform-signed bytes.
+    // Missing preserves legacy contracts without a time limit. At or after
+    // this Unix millisecond timestamp no new transfer bytes may be debited.
+    optional int64 expiration_time_unix_milli = 12;
+
     // FIXME companion contract id
 }
 

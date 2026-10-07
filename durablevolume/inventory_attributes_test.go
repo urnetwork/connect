@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package durablevolume
 
@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestInventoryOriginalRequestAndSdkOutboxSchemasAreExplicitlyBounded(t *testing.T) {
@@ -23,7 +25,7 @@ func TestInventoryOriginalRequestAndSdkOutboxSchemasAreExplicitlyBounded(t *test
 			if limit, known := ownerAttributeLimit(name); !known || limit != 4096 {
 				t.Fatal("owner schema lost its reviewed bound", limit, known)
 			}
-			if err := syscall.Setxattr(fixture.root, name, raw, 1); err != nil {
+			if err := unix.Setxattr(fixture.root, name, raw, unix.XATTR_CREATE); err != nil {
 				t.Fatal(err)
 			}
 			owner := fixture.open(t, Snapshot)
@@ -39,7 +41,7 @@ func TestInventoryOriginalRequestAndSdkOutboxSchemasAreExplicitlyBounded(t *test
 			if err := owner.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if err := syscall.Setxattr(fixture.root, name+".next", raw, 1); err != nil {
+			if err := unix.Setxattr(fixture.root, name+".next", raw, unix.XATTR_CREATE); err != nil {
 				t.Fatal(err)
 			}
 			second := fixture.open(t, Snapshot)
@@ -55,7 +57,7 @@ func TestInventoryOwnerAttributeBoundsRetainSameSnapshot(t *testing.T) {
 	fixture.custody(t)
 	name := "user.urnetwork.native-journal-custody"
 	for _, path := range []string{fixture.root, filepath.Join(fixture.root, "journal")} {
-		if err := syscall.Setxattr(path, name, []byte("retained-original-custody"), 1); err != nil {
+		if err := unix.Setxattr(path, name, []byte("retained-original-custody"), unix.XATTR_CREATE); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -135,7 +137,7 @@ func TestInventoryConcurrentOwnerAttributeChangePoisonsSnapshot(t *testing.T) {
 	fixture.custody(t)
 	path, name := filepath.Join(fixture.root, "journal", "empty-lock"), "user.urnetwork.snapshot."+strings.Repeat("c", 64)
 	original := []byte("retained-before-admission")
-	if err := syscall.Setxattr(path, name, original, 1); err != nil {
+	if err := unix.Setxattr(path, name, original, unix.XATTR_CREATE); err != nil {
 		t.Fatal(err)
 	}
 	owner := fixture.open(t, Snapshot)
@@ -143,7 +145,7 @@ func TestInventoryConcurrentOwnerAttributeChangePoisonsSnapshot(t *testing.T) {
 	owner.observeFile = func(stage string, _ *os.File, observed string) error {
 		if stage == "inventory-attribute-read" && observed == path && !changed {
 			changed = true
-			return syscall.Setxattr(path, name, []byte("changed-after-retained-stat"), 2)
+			return unix.Setxattr(path, name, []byte("changed-after-retained-stat"), unix.XATTR_REPLACE)
 		}
 		return nil
 	}
@@ -152,7 +154,7 @@ func TestInventoryConcurrentOwnerAttributeChangePoisonsSnapshot(t *testing.T) {
 		t.Fatal("concurrent metadata mutation produced a complete inventory", changed, report, err)
 	}
 	owner.observeFile = nil
-	if err := syscall.Setxattr(path, name, original, 2); err != nil {
+	if err := unix.Setxattr(path, name, original, unix.XATTR_REPLACE); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := owner.Inventory(t.Context(), fixture.fence(t), inventoryCustodyLimits(t)); !errors.Is(err, ErrIdentity) {
@@ -167,7 +169,7 @@ func TestInventoryAttributeCallerFailureAndCapacityRemainDistinct(t *testing.T) 
 		t.Fatal(err)
 	}
 	name := "user.urnetwork.native-journal-custody"
-	if err := syscall.Setxattr(path, name, []byte("more-than-four-bytes"), 1); err != nil {
+	if err := unix.Setxattr(path, name, []byte("more-than-four-bytes"), unix.XATTR_CREATE); err != nil {
 		t.Fatal(err)
 	}
 	file, err := os.Open(path)
@@ -208,13 +210,13 @@ func TestInventoryRefusesPriorSchemaAndMalformedCustodyNames(t *testing.T) {
 		t.Fatal("old file-only schema became complete owner custody")
 	}
 	for _, name := range []string{"user.urnetwork.snapshot.short", "user.urnetwork.snapshot." + strings.Repeat("A", 64)} {
-		if err := syscall.Setxattr(fixture.root, name, []byte("original"), 1); err != nil {
+		if err := unix.Setxattr(fixture.root, name, []byte("original"), unix.XATTR_CREATE); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := owner.Inventory(t.Context(), fence, limits); err == nil {
 			t.Fatal("malformed owner attribute was omitted", name)
 		}
-		if err := syscall.Removexattr(fixture.root, name); err != nil {
+		if err := unix.Removexattr(fixture.root, name); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package durablevolume
 
@@ -11,6 +11,8 @@ import (
 	"reflect"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // The accepted plan already contains the copied archive's physical identity.
@@ -33,9 +35,9 @@ func TestPreparationRestoreRechecksOriginalArchiveBeforeEffects(t *testing.T) {
 			raw[0] ^= 1
 			err = os.WriteFile(filepath.Join(archive, "record.bin"), raw, 0600)
 		case "missing-head":
-			err = syscall.Removexattr(archive, "user.urnetwork.attempt-ledger-custody")
+			err = unix.Removexattr(archive, "user.urnetwork.attempt-ledger-custody")
 		case "missing-generation":
-			err = syscall.Removexattr(archive, RootGenerationAttribute)
+			err = unix.Removexattr(archive, RootGenerationAttribute)
 		case "replaced-archive":
 			err = os.Rename(archive, archive+".retained")
 			if err == nil {
@@ -157,7 +159,7 @@ func TestPreparationRestoreLostSourceKeepsOriginalTargetProgress(t *testing.T) {
 		if err := errors.Join(readErr, file.Close()); err != nil {
 			t.Fatal(err)
 		}
-		if err := syscall.Removexattr(f.request.RestoreSource.Directory, attribute); err != nil {
+		if err := unix.Removexattr(f.request.RestoreSource.Directory, attribute); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := ApplyPreparationWithHost(t.Context(), f.accepted, preparationRestoreTestAdapter(), f.volume.host); !errors.Is(err, ErrIdentity) {
@@ -167,7 +169,7 @@ func TestPreparationRestoreLostSourceKeepsOriginalTargetProgress(t *testing.T) {
 		if err != nil || !bytes.Equal(before, after) {
 			t.Fatal("source refusal reset retained target progress", stop, err)
 		}
-		if err := syscall.Setxattr(f.request.RestoreSource.Directory, attribute, raw, 1); err != nil {
+		if err := unix.Setxattr(f.request.RestoreSource.Directory, attribute, raw, unix.XATTR_CREATE); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := ApplyPreparationWithHost(t.Context(), f.accepted, preparationRestoreTestAdapter(), f.volume.host); err != nil {

@@ -99,17 +99,20 @@ Clarifications given during review, which the decisions below implement:
 ### A. Carriers and the extender protocol
 
 A1. Three carriers, one stream contract. The extender listens on tcp 443,
-udp 443 and udp 53. Each carrier yields one reliable byte stream from the
+udp 443 and the dns carrier's udp 4053, and the sn miner on udp 53 as well
+(L2). Tcp 443 is the one port an extender requires; the udp carriers are
+optional (G2). Each carrier yields one reliable byte stream from the
 client:
 
 - tcp 443: TLS, terminated by the extender with a cert for the requested
   SNI (B3).
 - udp 443: QUIC with ALPN `h3`, terminated the same way. The client's H3
   request stream is the byte stream.
-- udp 53: the same QUIC server over the decode53 packet translation on the
-  udp 53 socket, exactly `listenH3Dns`. The client wraps its UDP socket in
-  the dns packet translation and dials QUIC to the extender ip on port 53,
-  exactly `h3DialCandidates` for the h3dns mode. The client talks to the
+- dns, udp 4053 (and 53 on the sn miner): the same QUIC server over the
+  decode53 packet translation on each dns socket, exactly `listenH3Dns`.
+  The client wraps its UDP socket in the dns packet translation and dials
+  QUIC to the extender ip, exactly `h3DialCandidates` for the h3dns mode,
+  on both 53 and 4053 in one staggered race (L2). The client talks to the
   extender ip directly, so the pump variant does not apply. The encoding
   tld is carried in the record (B2) and defaults to `ur.xyz.`.
 
@@ -194,14 +197,15 @@ opened; the relayed-bytes bound cuts the body, whose upstream content
 length is therefore not relayed. `ExtenderSettings.SpoofDomains` overrides
 the bundled list for tests and private deployments.
 
-A6. udp 53. The decode53 translation carries the dns carrier. Every query
+A6. The dns carrier's sockets, udp 4053 and on the sn miner udp 53 (L2).
+The decode53 translation carries the dns carrier. Every query
 that is not the translation reaches a new `PacketTranslationSettings.
 DnsOtherHandler(query []byte, addr net.Addr)` hook, which the extender sets
 to a forwarder: parse the query, refuse `ANY`, resolve the question through
 the extender's own DoH cache (`DohCache.Forward` for the raw response, with
 the connect default DoH server list, overridable in `ExtenderSettings`),
-rewrite the message id, and write the answer on the udp 53 socket
-directly. Per-source limit 10 queries per second with burst 20, total 500
+rewrite the message id, and write the answer on the dns socket it came
+in on directly. Per-source limit 10 queries per second with burst 20, total 500
 per second with the same burst, one in-flight query per source address, a
 bounded worker pool of 64 so the translation's read loop never blocks,
 a 5 s forward timeout, and a response cap of 4096 bytes with the TC bit
@@ -1026,17 +1030,31 @@ is on: load or create the identity key, which belongs to the network space:
 local state's `.extender_key` when the space has storage, otherwise the
 seed an embedder passes through `DeviceLocalKeyMaterial`, otherwise one
 the space generates and hands back through the same key material for the
-embedder to persist (the miner keeps it beside its client key seed); start `extender.Server` on tcp
-443, udp 443 and udp 53, each bound independently, a failed bind disabling
-that carrier, with all failed meaning not listening; the forward dialer is
+embedder to persist (the miner keeps it beside its client key seed); bind
+tcp 443 first, the one port an extender requires, and only then start
+`extender.Server` on it and on udp 443 and udp 4053, plus udp 53 when the
+device opts in (`DeviceLocalSettings.ProvideExtenderDnsPrivilegedPort`,
+L2), each udp carrier bound independently and a failed udp bind disabling
+that carrier alone; the forward dialer is
 the device's egress-aware connect dial narrowed by family; the whitelist is
 A5 from the space hosts plus the spoof list; the space's node is rebuilt
 with the extender role, the in-process listener, the feed server and the
 listen addresses of the activated families, so it becomes a listening
 node. Bind failures log
 once and are reflected in the provide status, never as a user-visible
-error; a failed carrier stays down until the role restarts with provide
-or the setting. The feed server is wired to the extender's feed handler,
+error; a failed udp carrier stays down until the role restarts with provide
+or the setting. Decided 2026-10-06 (owner, relayed by the sn session: "the
+miner should try to acquire the required extender ports and if it can't
+then turn off extender. The only required extender port is port 443 tcp.
+443 udp and 4053 udp and 53 udp are optional."), for every app platform and
+the miner alike: while the tcp 443 bind fails the role is off -- no udp
+carrier, no node, no activation, no peer pings -- the status says why
+(`TcpUnavailableError`, N2, N3), and the bind is tried again every 3
+minutes, the role starting the moment it holds the port. So of several
+provider processes on one host, such as the miner's per-operator children,
+the first to take tcp 443 serves the extender, the others turn it off, and
+the role moves to one of them within a retry of the holder exiting. The
+feed server is wired to the extender's feed handler,
 and the node carries the in-process gossip listener; the node is rebuilt
 whenever the set of activated addresses changes so no stale address is
 advertised. When the user has chosen the feed-only gossip mode, the role
@@ -1306,9 +1324,15 @@ aliases and no capabilities, added to `host_services` of both proxy hosts,
 and carried as a new version v22. The whodis port is 4053 everywhere, which is already the
 connect service's dns listener behind the lb (8053 kept for old lbs), so
 alt listens on 4053 and nothing moves; and an extender listens on 4053 always and on 53 only where
-the platform allows it without privilege, the linux daemon and the windows
-service; macOS binds 4053 only. Records carry the list of dns ports that passed the activation probe (`DnsPorts`, the ascending union over the extender's active addresses, with `DnsPort` kept for old readers as the extender's configured port, 4053 by default); each listed port is probed on its own 3 s sub-budget inside the 10 s activation budget, the ports that answer are recorded per address, and a dns carrier with no answering port refuses the activation; a client dials 53 first when listed, then 4053, and a manual or
-unverified address is dialed on 4053 only. Alt is dialed on 53 first,
+it opts in. Decided 2026-10-06 (owner: "the extender should bind 4053 on
+all app platforms: apple, android, windows, linux. Only the cli sn/miner
+should try to bind 53 in addition to 4053. Extender clients should try
+both port 53 and 4053"): every app binds 4053 alone, on every platform
+that carries the role (G1); only the sn miner sets
+`DeviceLocalSettings.ProvideExtenderDnsPrivilegedPort` (default off, a
+plain boolean on gomobile and in the c abi settings json) to also try 53,
+and a 53 bind that fails leaves the carrier serving on 4053; connectctl's
+standalone extender binds 53 only under `--dns_privileged_port`. Records carry the list of dns ports that passed the activation probe (`DnsPorts`, the ascending union over the extender's active addresses, with `DnsPort` kept for old readers as the extender's configured port, 4053 by default); each listed port is probed on its own 3 s sub-budget inside the 10 s activation budget, the ports that answer are recorded per address, and a dns carrier with no answering port refuses the activation. A client tries both 53 and 4053 on every extender, whether or not its record lists 53: the ports the record lists first, ascending, then whichever of 4053 and 53 it does not list, 4053 first. So a record that lists 53 is dialed on 53 first, and an app extender's record, which lists 4053 alone, and a manual address no record names yet are dialed on 4053 first with 53 behind it. The ports are one dial, a staggered race (`connect/net_extender_dns_ports.go`): the first port at once, each next port one stagger (250 ms, the stagger of the alt race below) after the last while nothing has answered, or at once when every attempt out has failed; the first port to answer wins and every other attempt is canceled and joined; an answer that refuses or limits the request (A4, A12) ends the race, since the extender answers the same on every port; a port the client's memory budget refused goes again once an attempt that held the budget ends. One dial means one dns dialer per extender, one slot of the strategy's parallel block and expand budget, and one carrier outcome for the directory, so a 53 that never answers on an app extender neither holds the address nor delays its 4053 dial. The feed, the probe and the peer pinger dial the dns carrier the same way. An exact endpoint -- `ExtenderConfigs`, an NLayer hop, the operator's per-port activation probe -- is dialed on the one port it names. Alt is dialed on 53 first,
 then 4053. The extender binds the configured dns port, 4053 in the sdk and
 connectctl, plus 53 under `DnsPrivilegedPort`, and reports what it bound
 so the activator advertises exactly that.
@@ -1614,8 +1638,10 @@ daemon cannot take. Extenders stay out of the phone builds; G1 stands.
 N2. Status source. `ExtenderProvideStatus` gains `Supported`, true only in
 a process built with the role, `State`, `ErrorCase` and `Reason` (N3),
 `StartError` (why a role that was asked for could not start, empty
-otherwise) and `LastActivationRefused` (true when `LastActivationError`
-is the operator's refusal rather than a request failure). connect's
+otherwise), `TcpUnavailableError` (the tcp 443 bind error while the role
+is off for want of that port and retrying it, G2, empty otherwise) and
+`LastActivationRefused` (true when `LastActivationError` is the operator's
+refusal rather than a request failure). connect's
 `ExtenderFamilyActivationStatus` gains the matching `LastRefused`, set by
 `recordFailure` from the refused branch of the activation call, false
 from every other failure, and cleared with `LastError` on success; the
@@ -1662,6 +1688,14 @@ in this order, the first match winning:
   directory, no usable identity). A role that never started has no
   revocation, family or bind to report, and an outcome exists. Red;
   `Could not start: ` and the reason.
+- `error`, tcp_unavailable: the setting is on and the device is providing,
+  but tcp 443, the one port an extender requires (G2), could not be
+  bound -- another process holds it, such as another provider process of
+  the host, or the host refuses the bind -- so the role is off and tries
+  the port again every 3 minutes. `Enabled` and `Listening` read false and
+  `ListenError` names the tcp carrier. Red; `TCP port 443 is in use by
+  another program. Trying again every few minutes: ` and the reason (the
+  bind error).
 - `error`, revoked: the role runs and the operator revoked the key.
   Red; `Revoked by the operator`.
 - `active`: at least one family is activated. Green; `Active · IPv4 and
@@ -1679,7 +1713,8 @@ During the activator's backoff after a refusal the state stays `error`
 with the reason, since an outcome exists; yellow is only ever the time
 before the first outcome. `Reason` carries the raw error text, and the
 apps prefix the localized case label. `ErrorCase` names the error case
-(`revoked`, `start`, `listen`, `activation_failed`, `activation_refused`)
+(`revoked`, `start`, `tcp_unavailable`, `listen`, `activation_failed`,
+`activation_refused`)
 so an app picks its label without re-deriving the rule; it is empty in
 every other state, including `active`, where `Reason` alone carries the
 other family's text and `LastActivationRefused` says whether that text is
@@ -1707,8 +1742,8 @@ N5. Strings. Keys for the apple, linux and windows platforms: `extender`
 and the ports it uses), `extender_not_providing`, `extender_setting_up`,
 `extender_active` with a `{families}` placeholder filled from the existing
 `ipv4`, `ipv6` and `ipv4_and_ipv6` keys, `extender_revoked`,
-`extender_start_failed`, `extender_listen_failed` and
-`extender_activation_failed` with an `{error}` placeholder,
+`extender_start_failed`, `extender_listen_failed`, `extender_tcp_unavailable`
+and `extender_activation_failed` with an `{error}` placeholder,
 `extender_activation_refused` with `{error}`; `Off` reuses the existing
 `off` key, and `extender_not_providing` is listed for linux and windows
 only, since the apple catalog is keyed by the English text and already
@@ -1762,7 +1797,8 @@ and never names a case the sdk did not pick:
   `LastActivationRefused` is true, else `extender_activation_failed` with
   `Reason`.
 - `error`, by `ErrorCase`: `revoked` gives `extender_revoked`; `start`
-  gives `extender_start_failed` with `Reason`; `listen` gives
+  gives `extender_start_failed` with `Reason`; `tcp_unavailable` gives
+  `extender_tcp_unavailable` with `Reason`; `listen` gives
   `extender_listen_failed` with `Reason`; `activation_refused` gives
   `extender_activation_refused` with `Reason`; `activation_failed` gives
   `extender_activation_failed` with `Reason`. A case the app does not know
@@ -2790,7 +2826,7 @@ with the database.
 | `protocol.ExtenderResponse` | new |
 | `protocol.ExtenderAddress`, `ExtenderRecordBody`, `ExtenderRecord`, `ExtenderRevocationBody`, `ExtenderRevocation`, `ExtenderGossipMessage`, `ExtenderFeedRequest`, `ExtenderFeedFrame` | new |
 | extender tcp 443 | HTTP/1.1 inside TLS; v1 framing accepted one release |
-| extender udp 443, udp 53 | new carriers, H3 inside QUIC |
+| extender udp 443, udp 4053 (and udp 53 on the sn miner) | new carriers, H3 inside QUIC |
 | `GET /hello` | `extender_root_public_keys` |
 | `POST /network/extender-activate` | new |
 | `network_extender`, `network_extender_address`, `network_extender_publish` | new tables |
@@ -2948,7 +2984,9 @@ Phase 5b follows 4 because both touch the server.
    following. Acceptance: the strategy reaches an in-process alt fixture
    over h3 and whodis in the stated order; the platform H3 modes dial the
    alt host and H1 the platform host; an extender advertising 4053 only is
-   dialed on 4053; records with both ports are dialed 53 first.
+   dialed on 4053; records with both ports are dialed 53 first. (Revised
+   2026-10-06, L2: only the sn miner binds 53, and a client races 53 and
+   4053 on every extender, the record's ports first.)
    Operations: the router DNAT of 53 to 4053 on the proxy hosts and the
    DNS records of L3.
 10. Statistics and the map: M1 to M10. 10a (server): the two schema

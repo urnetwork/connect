@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Empty fresh owners still require an exact bounded checkpoint; absence of
 // payload files is not absence of custody or permission to infer a new owner.
@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // The synthetic fixed profile has no payload until its first runtime commit.
@@ -21,7 +23,7 @@ func preparationEmptyHeadAdapter() PreparationAdapter {
 		if err := ctx.Err(); err != nil {
 			return PreparationOwnerPlan{}, err
 		}
-		if err := syscall.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
+		if err := unix.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
 			return PreparationOwnerPlan{}, err
 		}
 		return PreparationOwnerPlan{Owner: owner, StagingName: name,
@@ -80,7 +82,7 @@ func TestPreparationAttributeOnlyOwnerPublishesExactAbsentHead(t *testing.T) {
 		t.Fatal("empty-head apply fabricated payload", err)
 	}
 	raw := make([]byte, 4096)
-	n, err := syscall.Getxattr(f.request.RootPath, "user.urnetwork.snapshot.synthetic-empty", raw)
+	n, err := unix.Getxattr(f.request.RootPath, "user.urnetwork.snapshot.synthetic-empty", raw)
 	if err != nil || n == 0 {
 		t.Fatal("empty-head checkpoint was not retained", err)
 	}
@@ -151,7 +153,7 @@ func TestPreparationAttributeOnlyOwnerResumesExactPendingHead(t *testing.T) {
 		t.Fatal("did not retain exact empty-head uncertainty", fired, err)
 	}
 	raw := make([]byte, 4096)
-	n, err := syscall.Getxattr(f.request.RootPath, "user.urnetwork.snapshot.synthetic-empty", raw)
+	n, err := unix.Getxattr(f.request.RootPath, "user.urnetwork.snapshot.synthetic-empty", raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,11 +161,11 @@ func TestPreparationAttributeOnlyOwnerResumesExactPendingHead(t *testing.T) {
 	if _, err := ApplyPreparationWithHost(t.Context(), f.accepted, preparationEmptyHeadAdapter(), f.volume.host); err != nil {
 		t.Fatal("exact empty-head readback cannot resume", err)
 	}
-	n, err = syscall.Getxattr(f.request.RootPath, "user.urnetwork.snapshot.synthetic-empty", raw)
+	n, err = unix.Getxattr(f.request.RootPath, "user.urnetwork.snapshot.synthetic-empty", raw)
 	if err != nil || string(raw[:n]) != retained {
 		t.Fatal("resume rewrote original empty head", err)
 	}
-	if err := syscall.Removexattr(f.request.RootPath, "user.urnetwork.snapshot.synthetic-empty"); err != nil {
+	if err := unix.Removexattr(f.request.RootPath, "user.urnetwork.snapshot.synthetic-empty"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ApplyPreparationWithHost(t.Context(), f.accepted, preparationEmptyHeadAdapter(), f.volume.host); !errors.Is(err, ErrIdentity) {

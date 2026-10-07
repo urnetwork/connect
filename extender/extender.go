@@ -185,10 +185,12 @@ type ExtenderSettings struct {
 	DnsTlds []string
 
 	// DnsPrivilegedPort also binds the dns carrier on 53, beside the
-	// unprivileged port the caller configured (L2). Only the platforms that
-	// can take 53 without privilege set it -- the linux daemon and the windows
-	// service -- and the bind is never required: a failure is reported through
-	// ListenErrorHandler and the carrier keeps serving on its other port.
+	// unprivileged port the caller configured (L2). Only an extender that
+	// runs where it can take 53 sets it: the sn miner, through its device
+	// setting, and connectctl under --dns_privileged_port. Every app leaves
+	// it off and binds 4053 alone. The bind is never required: a failure is
+	// reported through ListenErrorHandler and the carrier keeps serving on its
+	// other port. A client tries both ports whichever this extender binds.
 	DnsPrivilegedPort bool
 
 	// IdentityKeySeed, when set, is the ed25519 seed of the extender identity
@@ -377,8 +379,8 @@ type ExtenderServer struct {
 	// not be offered to a client or to an activation (G2).
 	carriers []string
 	// the dns ports whose bind succeeded, ascending, which is the order a
-	// client dials them in (L2). What the activation advertises, so a port
-	// that did not bind is never probed.
+	// client dials the ports a record lists in (L2). What the activation
+	// advertises, so a port that did not bind is never probed.
 	dnsPorts []int
 	// the last bind failure of each carrier that has one, which is what a
 	// provider role renders beside the carrier list (G2, F3). A carrier that
@@ -968,10 +970,10 @@ func (self *ExtenderServer) markListening() {
 	})
 }
 
-// The ports to bind: the configured ones, plus 53 for the dns carrier when the
-// platform can take it without privilege (L2). The extra bind is additive --
-// the configured unprivileged port is bound either way -- and its failure is
-// reported like any other carrier bind failure without ending the serve.
+// The ports to bind: the configured ones, plus 53 for the dns carrier under
+// DnsPrivilegedPort (L2). The extra bind is additive -- the configured
+// unprivileged port is bound either way -- and its failure is reported like
+// any other carrier bind failure without ending the serve.
 func (self *ExtenderServer) listenPorts() map[int][]connect.ExtenderConnectMode {
 	ports := maps.Clone(self.ports)
 	if ports == nil {
@@ -1014,8 +1016,10 @@ func (self *ExtenderServer) addDnsPort(port int) {
 }
 
 // The dns ports this extender is listening on, ascending, which is the order a
-// client dials them in (L2). Complete once Listening has closed, and what the
-// activation advertises so the operator never probes a port that did not bind.
+// client dials the ports a record lists in, before whichever of 4053 and 53
+// the record does not list (L2). Complete once Listening has closed, and what
+// the activation advertises so the operator never probes a port that did not
+// bind.
 func (self *ExtenderServer) DnsPorts() []int {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()

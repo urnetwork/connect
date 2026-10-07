@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // A closed process cannot silently enroll an empty replacement state root.
 package durablevolume
@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Filesystem and external lease identity alone do not prove journal continuity.
@@ -57,14 +59,14 @@ func TestOwnerRootGenerationMismatchPoisonsSameInode(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var before, after syscall.Stat_t
-		if err := syscall.Stat(fixture.root, &before); err != nil {
+		var before, after unix.Stat_t
+		if err := unix.Stat(fixture.root, &before); err != nil {
 			t.Fatal(err)
 		}
 		var raw []byte
 		switch replacement {
 		case "missing":
-			err = syscall.Removexattr(fixture.root, RootGenerationAttribute)
+			err = unix.Removexattr(fixture.root, RootGenerationAttribute)
 		case "wrong":
 			raw = make([]byte, RootGenerationBytes)
 		case "short":
@@ -75,18 +77,18 @@ func TestOwnerRootGenerationMismatchPoisonsSameInode(t *testing.T) {
 			raw = make([]byte, 128)
 		}
 		if raw != nil {
-			err = syscall.Setxattr(fixture.root, RootGenerationAttribute, raw, 0)
+			err = unix.Setxattr(fixture.root, RootGenerationAttribute, raw, 0)
 		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := syscall.Stat(fixture.root, &after); err != nil || before.Ino != after.Ino {
+		if err := unix.Stat(fixture.root, &after); err != nil || before.Ino != after.Ino {
 			t.Fatal("test changed inode", err)
 		}
 		if err := owner.CheckRead(); !errors.Is(err, ErrIdentity) {
 			t.Errorf("%s admitted reused inode without original nonce: %v", replacement, err)
 		}
-		if err := syscall.Setxattr(fixture.root, RootGenerationAttribute, original, 0); err != nil {
+		if err := unix.Setxattr(fixture.root, RootGenerationAttribute, original, 0); err != nil {
 			t.Fatal(err)
 		}
 		if err := owner.CheckWrite(); !errors.Is(err, ErrIdentity) {
@@ -116,7 +118,7 @@ func TestOwnerCopiedNonceCannotAuthorizeReplacementRoot(t *testing.T) {
 	if err := os.Mkdir(fixture.root, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Setxattr(fixture.root, RootGenerationAttribute, nonce, 0); err != nil {
+	if err := unix.Setxattr(fixture.root, RootGenerationAttribute, nonce, 0); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := OpenWithHost(fixture.reference, fixture.root, ReadWrite, fixture.host)

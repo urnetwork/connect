@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Backup controls use real retained files and a private child writer; no live
 // mount, database, deployment key or service participates in these tests.
@@ -15,8 +15,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // The retained assertion is outside the journal and binds its precise lease.
@@ -169,7 +170,7 @@ func TestInventoryRestoredRootReportsChangedPhysicalIdentity(t *testing.T) {
 	fixture.custody(t)
 	ownerName := "user.urnetwork.native-journal-custody"
 	ownerBytes := []byte("opaque-original-inode-bound-acknowledgement")
-	if err := syscall.Setxattr(fixture.root, ownerName, ownerBytes, 1); err != nil {
+	if err := unix.Setxattr(fixture.root, ownerName, ownerBytes, unix.XATTR_CREATE); err != nil {
 		t.Fatal(err)
 	}
 	fence := fixture.fence(t)
@@ -211,7 +212,7 @@ func TestInventoryRestoredRootReportsChangedPhysicalIdentity(t *testing.T) {
 	if _, err := restored.VerifyReboundInventory(t.Context(), Reference{Path: path, Sha256: testDigest(raw)}, fence, limits); err == nil {
 		t.Fatal("explicit root rebind omitted original owner custody attributes")
 	}
-	if err := syscall.Setxattr(fixture.root, ownerName, ownerBytes, 1); err != nil {
+	if err := unix.Setxattr(fixture.root, ownerName, ownerBytes, unix.XATTR_CREATE); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := restored.VerifyInventory(t.Context(), Reference{Path: path, Sha256: testDigest(raw)}, fence, limits); err == nil {
@@ -239,12 +240,12 @@ func TestInventoryRejectsAliasesAndNestedMounts(t *testing.T) {
 				t.Fatal(err)
 			}
 		case "fifo":
-			if err := syscall.Mkfifo(filepath.Join(fixture.root, "pipe"), 0600); err != nil {
+			if err := unix.Mkfifo(filepath.Join(fixture.root, "pipe"), 0600); err != nil {
 				t.Fatal(err)
 			}
 		case "nested-mount":
 			fixture.host.change(func() {
-				fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 9, ParentId: 7, Device: fixture.host.uuidDevice, Root: "/", Path: filepath.Join(fixture.root, "journal"), FilesystemType: "ext4"})
+				fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 9, ParentId: 7, Device: fixture.host.uuidDevice, Root: "/", Path: filepath.Join(fixture.root, "journal"), FilesystemType: testFilesystemType})
 			})
 		}
 		if _, err := snapshot.Inventory(t.Context(), fixture.fence(t), InventoryLimits{MaxEntries: 16, MaxBytes: 4096, MaxDepth: 4, MaxOwnerAttributes: 16, MaxOwnerAttributeBytes: 16384}); !errors.Is(err, ErrIdentity) {
@@ -265,12 +266,12 @@ func TestOwnerCrashReleasesLeaseAndRetainsCompletedBytes(t *testing.T) {
 		if err := json.Unmarshal([]byte(payload), &input); err != nil {
 			t.Fatal(err)
 		}
-		var stat syscall.Stat_t
-		if err := syscall.Stat(input.Root, &stat); err != nil {
+		var stat unix.Stat_t
+		if err := unix.Stat(input.Root, &stat); err != nil {
 			t.Fatal(err)
 		}
-		device := deviceNumber(stat.Dev)
-		host := &fixtureHost{mounts: []Mount{{Id: 1, ParentId: 1, Device: Device{Major: device.Major ^ 1, Minor: device.Minor}, Root: "/", Path: "/", FilesystemType: "ext4"}, {Id: 7, ParentId: 1, Device: device, Root: "/", Path: input.Mount, FilesystemType: "ext4"}}, uuidDevice: device, filesystem: Filesystem{Id: [2]int32{17, 19}, Type: 0xef53, AvailableBytes: 1024 * 1024, AvailableInodes: 1024}}
+		device := statDevice(&stat)
+		host := &fixtureHost{mounts: []Mount{{Id: 1, ParentId: 1, Device: Device{Major: device.Major ^ 1, Minor: device.Minor}, Root: "/", Path: "/", FilesystemType: testFilesystemType}, {Id: 7, ParentId: 1, Device: device, Root: "/", Path: input.Mount, FilesystemType: testFilesystemType}}, uuidDevice: device, filesystem: Filesystem{Id: [2]int32{17, 19}, Type: filesystemMagic(testFilesystemType), AvailableBytes: 1024 * 1024, AvailableInodes: 1024}}
 		owner, err := OpenWithHost(input.Reference, input.Root, ReadWrite, host)
 		if err != nil {
 			t.Fatal(err)

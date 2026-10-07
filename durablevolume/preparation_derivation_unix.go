@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // A fixed restore profile may derive at most two unsigned physical censuses while every
 // signed member stays byte-exact. Both census generations remain bound by the
@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // Physical metadata has a fixed flat namespace. Shared ownership requires the
@@ -30,9 +32,6 @@ func validatePreparationPhysicalMetadata(request PreparationRequest, owner Prepa
 	}
 	if metadata.CompanionPath != "" && (!preparationRelative(metadata.CompanionPath, 1, false) || metadata.CompanionPath == metadata.Path) {
 		return errors.New("physical metadata companion is invalid or aliases the original census")
-	}
-	if _, err := preparationRootRenameNumber(); err != nil {
-		return err
 	}
 	present := map[string]bool{}
 	for _, file := range owner.Files {
@@ -192,7 +191,7 @@ func preparePhysicalMetadata(ctx context.Context, admission *preparationAdmissio
 			return err
 		}
 		if err := func() (writeErr error) {
-			fd, err := syscall.Openat(int(parent.Fd()), path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
+			fd, err := unix.Openat(int(parent.Fd()), path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
 			if err != nil {
 				return err
 			}

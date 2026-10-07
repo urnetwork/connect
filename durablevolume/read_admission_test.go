@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Read-only evidence admission keeps identity without requiring write capacity.
 // Cancellation is checked before opening or hashing externally supplied files.
