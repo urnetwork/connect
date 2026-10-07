@@ -2098,9 +2098,13 @@ type StoredContract struct {
 	// identity principal assigned to the source client at creation.
 	// Sealed into the platform-signed contract bytes. Set only when
 	// `provide_mode` is `Network`; empty for all other provide modes.
-	Principal     string `protobuf:"bytes,11,opt,name=principal,proto3" json:"principal,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Principal string `protobuf:"bytes,11,opt,name=principal,proto3" json:"principal,omitempty"`
+	// Absolute admission deadline, sealed into the platform-signed bytes.
+	// Missing preserves legacy contracts without a time limit. At or after
+	// this Unix millisecond timestamp no new transfer bytes may be debited.
+	ExpirationTimeUnixMilli *int64 `protobuf:"varint,12,opt,name=expiration_time_unix_milli,json=expirationTimeUnixMilli,proto3,oneof" json:"expiration_time_unix_milli,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *StoredContract) Reset() {
@@ -2208,6 +2212,13 @@ func (x *StoredContract) GetPrincipal() string {
 		return x.Principal
 	}
 	return ""
+}
+
+func (x *StoredContract) GetExpirationTimeUnixMilli() int64 {
+	if x != nil && x.ExpirationTimeUnixMilli != nil {
+		return *x.ExpirationTimeUnixMilli
+	}
+	return 0
 }
 
 // control message
@@ -2994,7 +3005,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\fprovide_mode\x18\x03 \x01(\x0e2\x16.bringyour.ProvideModeR\vprovideMode\x126\n" +
 	"\x17provide_tls_certificate\x18\x04 \x03(\fR\x15provideTlsCertificate\x12A\n" +
 	"\x1ddestination_client_public_key\x18\x05 \x01(\fR\x1adestinationClientPublicKey\x12_\n" +
-	"-destination_client_key_signed_tls_certificate\x18\x06 \x01(\fR(destinationClientKeySignedTlsCertificate\"\xbe\x04\n" +
+	"-destination_client_key_signed_tls_certificate\x18\x06 \x01(\fR(destinationClientKeySignedTlsCertificate\"\x9f\x05\n" +
 	"\x0eStoredContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12.\n" +
@@ -3008,13 +3019,15 @@ const file_transfer_proto_rawDesc = "" +
 	"-destination_client_key_signed_tls_certificate\x18\t \x01(\fR(destinationClientKeySignedTlsCertificate\x12\x14\n" +
 	"\x05roles\x18\n" +
 	" \x03(\tR\x05roles\x12\x1c\n" +
-	"\tprincipal\x18\v \x01(\tR\tprincipalB\f\n" +
+	"\tprincipal\x18\v \x01(\tR\tprincipal\x12@\n" +
+	"\x1aexpiration_time_unix_milli\x18\f \x01(\x03H\x04R\x17expirationTimeUnixMilli\x88\x01\x01B\f\n" +
 	"\n" +
 	"_source_idB\x11\n" +
 	"\x0f_destination_idB\f\n" +
 	"\n" +
 	"_stream_idB\v\n" +
-	"\t_priority\"\x9d\x02\n" +
+	"\t_priorityB\x1d\n" +
+	"\x1b_expiration_time_unix_milli\"\x9d\x02\n" +
 	"\rCloseContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12(\n" +
