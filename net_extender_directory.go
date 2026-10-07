@@ -214,6 +214,14 @@ type ExtenderDirectorySettings struct {
 	// never uses the last country once its hint is stale.
 	CountryHintMaxAge time.Duration
 
+	// WebRtcCarrierEnabled lets a candidate carry the peer-to-peer webrtc
+	// carrier its record lists (EXTENDER.md S). Off by default: without a
+	// signaling path a webrtc dial can only fail, and a failure counts
+	// against the address's other carriers. The owner that installs a
+	// carrier on its connect settings turns it on, here or at run time
+	// (SetWebRtcCarrierEnabled).
+	WebRtcCarrierEnabled bool
+
 	// The secret the feed sample this directory serves is partitioned by
 	// (Q2, net_extender_directory_partition.go): which open records a feed
 	// client at one vantage is sampled from, and in what order each epoch.
@@ -328,8 +336,13 @@ type ExtenderCandidate struct {
 	// leaf is checked against it (B3, E5).
 	PublicKey []byte
 	Carriers  []string
-	TcpPort   int
-	UdpPort   int
+	// The exchange rendezvous id of the webrtc carrier the record lists
+	// (EXTENDER.md S), zero when the record carries none. Carriers names
+	// the carrier only when the directory has it enabled and the record
+	// carries this id.
+	WebRtcClientId Id
+	TcpPort        int
+	UdpPort        int
 	// The first dns port, kept for a caller that predates DnsPorts.
 	DnsPort int
 	// Every dns port the record offers, ascending (L2). A dial tries these
@@ -455,6 +468,9 @@ type ExtenderDirectory struct {
 
 	stateLock  sync.Mutex
 	rootKeySet *ExtenderRootKeySet
+	// whether candidates carry the webrtc carrier their records list
+	// (ExtenderDirectorySettings.WebRtcCarrierEnabled, SetWebRtcCarrierEnabled)
+	webRtcCarrierEnabled bool
 	// advances with every Reset, which is how a record or revocation whose
 	// verification began before a reset is told apart from one that began
 	// after it (applyVerifiedRecord)
@@ -559,6 +575,7 @@ func NewExtenderDirectory(
 		keptKeyHexes:         map[string]bool{},
 		maxActiveRecordCount: settings.MaxActiveRecordCount,
 		partitionSecret:      slices.Clone(settings.PartitionSecret),
+		webRtcCarrierEnabled: settings.WebRtcCarrierEnabled,
 	}
 	if len(self.partitionSecret) == 0 {
 		// one per directory: a vantage is bound to one partition for the life
@@ -2091,7 +2108,63 @@ func (self *ExtenderDirectory) candidateWithLock(
 	if carriers := recordAddressCarriers(body, address.ip); carriers != nil {
 		candidate.Carriers = carriers
 	}
+	// the webrtc carrier needs the record's rendezvous id and a signaling
+	// path on this host, which the enable says the owner has (S)
+	if webRtcClientId, err := IdFromBytes(body.WebRtcClientId); err == nil {
+		candidate.WebRtcClientId = webRtcClientId
+	}
+	if !self.webRtcCarrierEnabled || candidate.WebRtcClientId == (Id{}) {
+		candidate.Carriers = slices.DeleteFunc(
+			slices.Clone(candidate.Carriers),
+			func(carrier string) bool { return carrier == ExtenderCarrierWebRtc },
+		)
+	}
 	return candidate
+}
+
+// SetWebRtcCarrierEnabled turns the webrtc carrier of every candidate on or
+// off at run time (EXTENDER.md S): on when the owner has installed a carrier
+// with a signaling path on its connect settings, off again when it loses it.
+func (self *ExtenderDirectory) SetWebRtcCarrierEnabled(enabled bool) {
+	changed := false
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.webRtcCarrierEnabled == enabled {
+			return
+		}
+		self.webRtcCarrierEnabled = enabled
+		changed = true
+	}()
+	if changed {
+		self.changeMonitor.Update(func(version uint64) uint64 { return version + 1 })
+	}
+}
+
+// WebRtcCarrierEnabled reports whether candidates carry the webrtc carrier.
+func (self *ExtenderDirectory) WebRtcCarrierEnabled() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.webRtcCarrierEnabled
+}
+
+// WebRtcClientId is the exchange rendezvous id the verified record of one
+// identity carries for its webrtc carrier (EXTENDER.md S), which the dial
+// side's resolver signals to. false for an unknown key, a key with no record,
+// and a record that carries no id.
+func (self *ExtenderDirectory) WebRtcClientId(publicKey []byte) (Id, bool) {
+	keyHex := hex.EncodeToString(publicKey)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	keyRecord := self.keyHexRecords[keyHex]
+	if keyRecord == nil || keyRecord.recordBody == nil {
+		return Id{}, false
+	}
+	webRtcClientId, err := IdFromBytes(keyRecord.recordBody.WebRtcClientId)
+	if err != nil || webRtcClientId == (Id{}) {
+		return Id{}, false
+	}
+	return webRtcClientId, true
 }
 
 // The dns ports one record offers, ascending (L2). DnsPorts when it has them,
@@ -2123,7 +2196,7 @@ func recordAddressCarriers(body *protocol.ExtenderRecordBody, ip netip.Addr) []s
 		carriers := []string{}
 		for _, carrier := range recordAddress.Carriers {
 			switch carrier {
-			case ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns:
+			case ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns, ExtenderCarrierWebRtc:
 				carriers = append(carriers, carrier)
 			}
 		}

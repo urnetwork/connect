@@ -1649,8 +1649,16 @@ type ExchangeSignals struct {
 	// initial WaitingForSdpOffer from a newly restarted passive association.
 	// Older peers omit/ignore it and retain the legacy compatibility path.
 	SenderGenerationId []byte `protobuf:"bytes,4,opt,name=sender_generation_id,json=senderGenerationId,proto3" json:"sender_generation_id,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// True for the signaling of the peer-to-peer webrtc extender carrier
+	// (EXTENDER.md S): a dialer's SDP offer to an extender and the extender's
+	// SDP answer, keyed by stream_id like a p2p negotiation but never bound
+	// to a transport peer connection. A receiver that predates the field
+	// sees an offer for a stream it has no peer connection for and drops it,
+	// which is the compatibility path: an old extender simply does not
+	// answer.
+	ExtenderCarrier bool `protobuf:"varint,5,opt,name=extender_carrier,json=extenderCarrier,proto3" json:"extender_carrier,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ExchangeSignals) Reset() {
@@ -1709,6 +1717,13 @@ func (x *ExchangeSignals) GetSenderGenerationId() []byte {
 		return x.SenderGenerationId
 	}
 	return nil
+}
+
+func (x *ExchangeSignals) GetExtenderCarrier() bool {
+	if x != nil {
+		return x.ExtenderCarrier
+	}
+	return false
 }
 
 // signals are sent in real time to the destination of the peer pair
@@ -2965,12 +2980,13 @@ const file_transfer_proto_rawDesc = "" +
 	"\x10_disconnect_time\"\x13\n" +
 	"\x11NetworkPeersReset\"B\n" +
 	"\x12NetworkPeersUpdate\x12,\n" +
-	"\x05peers\x18\x01 \x03(\v2\x16.bringyour.NetworkPeerR\x05peers\"\xba\x01\n" +
+	"\x05peers\x18\x01 \x03(\v2\x16.bringyour.NetworkPeerR\x05peers\"\xe5\x01\n" +
 	"\x0fExchangeSignals\x12\x1b\n" +
 	"\tstream_id\x18\x01 \x01(\fR\bstreamId\x12#\n" +
 	"\rreset_signals\x18\x02 \x01(\bR\fresetSignals\x123\n" +
 	"\asignals\x18\x03 \x03(\v2\x19.bringyour.ExchangeSignalR\asignals\x120\n" +
-	"\x14sender_generation_id\x18\x04 \x01(\fR\x12senderGenerationId\"\xa3\x01\n" +
+	"\x14sender_generation_id\x18\x04 \x01(\fR\x12senderGenerationId\x12)\n" +
+	"\x10extender_carrier\x18\x05 \x01(\bR\x0fextenderCarrier\"\xa3\x01\n" +
 	"\x0eExchangeSignal\x126\n" +
 	"\vsignal_type\x18\x03 \x01(\x0e2\x15.bringyour.SignalTypeR\n" +
 	"signalType\x12\x15\n" +

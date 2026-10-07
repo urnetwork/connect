@@ -532,8 +532,15 @@ type ExtenderRecordBody struct {
 	// authenticated identity and carried by no open channel. A reader that
 	// predates the field sees 0, and a record that predates it is open.
 	DirectoryTier uint32 `protobuf:"varint,13,opt,name=DirectoryTier,proto3" json:"DirectoryTier,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// The 16 byte client id the extender's device is reachable under on the
+	// exchange, which is the rendezvous of its peer-to-peer webrtc carrier
+	// (EXTENDER.md S, C2a): a dialer sends its SDP offer to this id through
+	// the exchange signaling and the extender answers. Set only when an
+	// address of the record lists the webrtc carrier; empty on every other
+	// record and on records that predate the field.
+	WebRtcClientId []byte `protobuf:"bytes,14,opt,name=WebRtcClientId,proto3" json:"WebRtcClientId,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ExtenderRecordBody) Reset() {
@@ -655,6 +662,13 @@ func (x *ExtenderRecordBody) GetDirectoryTier() uint32 {
 		return x.DirectoryTier
 	}
 	return 0
+}
+
+func (x *ExtenderRecordBody) GetWebRtcClientId() []byte {
+	if x != nil {
+		return x.WebRtcClientId
+	}
+	return nil
 }
 
 type ExtenderRecord struct {
@@ -1288,7 +1302,7 @@ const file_extender_proto_rawDesc = "" +
 	"\x0fExtenderAddress\x12\x0e\n" +
 	"\x02Ip\x18\x01 \x01(\tR\x02Ip\x12\x1c\n" +
 	"\tIpVersion\x18\x02 \x01(\rR\tIpVersion\x12\x1a\n" +
-	"\bCarriers\x18\x03 \x03(\tR\bCarriers\"\xc4\x03\n" +
+	"\bCarriers\x18\x03 \x03(\tR\bCarriers\"\xec\x03\n" +
 	"\x12ExtenderRecordBody\x12\x1c\n" +
 	"\tPublicKey\x18\x01 \x01(\fR\tPublicKey\x128\n" +
 	"\tAddresses\x18\x02 \x03(\v2\x1a.bringyour.ExtenderAddressR\tAddresses\x12\x18\n" +
@@ -1303,7 +1317,8 @@ const file_extender_proto_rawDesc = "" +
 	" \x01(\tR\vNetworkHost\x12\x1a\n" +
 	"\bDnsPorts\x18\v \x03(\rR\bDnsPorts\x12$\n" +
 	"\rContinentCode\x18\f \x01(\tR\rContinentCode\x12$\n" +
-	"\rDirectoryTier\x18\r \x01(\rR\rDirectoryTier\"h\n" +
+	"\rDirectoryTier\x18\r \x01(\rR\rDirectoryTier\x12&\n" +
+	"\x0eWebRtcClientId\x18\x0e \x01(\fR\x0eWebRtcClientId\"h\n" +
 	"\x0eExtenderRecord\x12\x12\n" +
 	"\x04Body\x18\x01 \x01(\fR\x04Body\x12$\n" +
 	"\rRootSignature\x18\x02 \x01(\fR\rRootSignature\x12\x1c\n" +
