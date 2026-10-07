@@ -295,6 +295,7 @@ type testTlsHelloDialer struct {
 	resilient   bool
 	fragment    bool
 	reorder     bool
+	segment     bool
 }
 
 var testTlsHelloDialers = []testTlsHelloDialer{
@@ -302,6 +303,7 @@ var testTlsHelloDialers = []testTlsHelloDialer{
 	{description: "fragment", resilient: true, fragment: true},
 	{description: "reorder", resilient: true, reorder: true},
 	{description: "fragment+reorder", resilient: true, fragment: true, reorder: true},
+	{description: "fragment+segment", resilient: true, fragment: true, segment: true},
 }
 
 // The strategy dialer of this kind over settings, built as NewClientStrategy
@@ -312,8 +314,8 @@ func (self testTlsHelloDialer) clientDialer(settings *ClientStrategySettings) *c
 		settings:    settings,
 	}
 	if self.resilient {
-		dialer.dialTlsContext = newResilientDialTlsContext(&settings.ConnectSettings, self.fragment, self.reorder, clientWebSocketNextProtos)
-		dialer.httpDialTlsContext = newResilientDialTlsContext(&settings.ConnectSettings, self.fragment, self.reorder, clientHttpNextProtos)
+		dialer.dialTlsContext = newResilientDialTlsContext(&settings.ConnectSettings, self.fragment, self.reorder, self.segment, clientWebSocketNextProtos)
+		dialer.httpDialTlsContext = newResilientDialTlsContext(&settings.ConnectSettings, self.fragment, self.reorder, self.segment, clientHttpNextProtos)
 	} else {
 		dialer.dialTlsContext = newNormalDialTlsContext(settings, clientWebSocketNextProtos)
 		dialer.httpDialTlsContext = newNormalDialTlsContext(settings, clientHttpNextProtos)
