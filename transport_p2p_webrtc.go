@@ -1084,6 +1084,17 @@ type WebRtcSettings struct {
 	// Nil in production; tests inject a seeded source so the per-session subset
 	// is deterministic (see selectIceServerUrls).
 	iceServerRandForTest *mathrand.Rand
+
+	// DtlsClientHelloMimicry shapes the emitted DTLS ClientHello to a rotating
+	// browser profile on the SDP answerer (the DTLS client), so the handshake
+	// does not carry pion's default fingerprint. Off by default so the existing
+	// direct-p2p transport is unchanged; the webrtc extender carrier enables it
+	// on the censorship-circumvention path. No-op on js/wasm (browser owns DTLS).
+	// See transport_p2p_webrtc_dtls.go.
+	DtlsClientHelloMimicry bool
+	// Nil in production; tests inject a seeded source so the fingerprint choice
+	// is deterministic (see dtlsClientHelloMimicryHook).
+	dtlsClientHelloRandForTest *mathrand.Rand
 }
 
 func webRtcDataChannelInit(settings *WebRtcSettings) *webrtc.DataChannelInit {

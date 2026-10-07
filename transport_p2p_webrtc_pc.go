@@ -232,6 +232,17 @@ func newWebRtcPeerConnectionFactory(
 			peerSettingEngine.SetSCTPMaxReceiveBufferSize(
 				uint32(receiveBufferByteCount),
 			)
+			if settings.DtlsClientHelloMimicry {
+				// Shape the DTLS ClientHello to a browser profile on whichever
+				// side becomes the DTLS client (the SDP answerer). pion fires the
+				// hook only on the client flight, so it is a no-op on the offerer.
+				// One fingerprint per peer connection, rotating across connections.
+				if hook := dtlsClientHelloMimicryHook(
+					settings.dtlsClientHelloRandForTest,
+				); hook != nil {
+					peerSettingEngine.SetDTLSClientHelloMessageHook(hook)
+				}
+			}
 			api := webrtc.NewAPI(
 				webrtc.WithSettingEngine(peerSettingEngine),
 				webrtc.WithMediaEngine(mediaEngine),
