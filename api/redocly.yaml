@@ -11,14 +11,25 @@
 # Everything else, including every structural rule, is enforced. Run:
 #   npx -y @redocly/cli lint bringyour.yml
 #
-# A rule of our own for operations, so the document stays usable by client and
-# agent-tool generators:
+# Rules of our own for operations, so the document stays usable by client and
+# agent-tool generators and agrees with the ur.io API reference:
 #
 #   rule/operation-id-camel-case -- an operationId is lowerCamelCase
 #     ("authLogin"). The sdk's JS generator (sdk js/gen_openapi.go
 #     methodName) turns an operationId into a client method name; a renamed
 #     id must normalize to the same method name, or the generated client
 #     changes.
+#
+#   rule/operation-one-tag, operation-singular-tag, operation-tag-defined --
+#     every operation has exactly one tag, one of the groups under `tags`.
+#     The groups are the ur.io API reference's, which files an operation
+#     under its first path segment (a known group, else Other).
+#
+#   rule/internal-scheme-is-x-internal -- an operation secured by an internal
+#     scheme (AdminBearerAuth, OperatorSecret, BrevoWebhookAuth) is marked
+#     `x-internal: true`, which keeps it out of the public API reference.
+#     Webhooks and operator-only routes without one of those schemes are
+#     marked by hand.
 #
 # Rules of our own for descriptions, which every renderer reads as CommonMark
 # (ur.io's API reference, Redoc, GitHub). A description whose backticks pair
@@ -36,6 +47,8 @@ extends:
 
 rules:
   operation-summary: off
+  operation-singular-tag: error
+  operation-tag-defined: error
   rule/operation-id-camel-case:
     subject:
       type: Operation
@@ -43,6 +56,31 @@ rules:
     assertions:
       casing: camelCase
     message: Write the operationId in lowerCamelCase, normalizing to the sdk client's existing method name.
+    severity: error
+  rule/operation-one-tag:
+    subject:
+      type: Operation
+      property: tags
+    assertions:
+      defined: true
+      minLength: 1
+    message: Tag the operation with its ur.io API reference group.
+    severity: error
+  rule/internal-scheme-is-x-internal:
+    subject:
+      type: SecurityRequirement
+    where:
+      - subject:
+          type: Operation
+          property: x-internal
+        assertions:
+          defined: false
+    assertions:
+      disallowed:
+        - AdminBearerAuth
+        - OperatorSecret
+        - BrevoWebhookAuth
+    message: "Mark an operation secured by an internal scheme `x-internal: true`."
     severity: error
   rule/description-wildcards-as-code:
     subject:

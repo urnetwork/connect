@@ -33,6 +33,13 @@ info:
     with their own opaque role-scoped tokens, and they are documented in
     `sn/api/competition.yml`, not here.
 
+    Operations marked `x-internal: true` are not part of the public API:
+    the server-to-server webhooks (payment processors, app stores and the
+    email provider), the operator's provider probe control plane, the admin
+    reports and the operator's own evidence publishing. They stay in this
+    document so the server's route and conformance checks cover them; the
+    public API reference leaves them out.
+
   termsOfService: https://ur.io/terms
   contact:
     name: URnetwork
@@ -61,77 +68,100 @@ servers:
 security:
   - BearerAuth: []
 
+# One tag per operation: the ur.io API reference group it is filed under, in
+# the reference's order. The reference groups by first path segment (a known
+# group, else Other), so a new operation takes the tag of its first segment.
 tags:
-  - name: onboarding
+  - name: Authentication
     description: |
-      The new-user onboarding program (mmm/onboarding/PLAN.md): the welcome
-      offer, the campaign landing and feedback links, and the sign-up
-      preferences the campaign honors.
-  - name: analytics
+      Sign-in and the network's sign-in methods: login with an email or a
+      phone number (password or verification code), an Apple or Google
+      identity token, a wallet signature or a seed phrase; network creation
+      and deletion; auth codes; and the Apple and Google sign-in returns for
+      the apps that sign in through the system browser. The login routes
+      return a network JWT (`by_jwt`).
+  - name: Network
     description: |
-      Product events and experiment results behind the onboarding
-      optimization loop: the closed client event schema, the experiment
-      registry and the aggregated results the analysis script reads.
-  - name: subscription
-    description: Pro subscriptions, prices and the store purchase paths.
-  - name: store webhooks
-    description: |
-      The server-to-server notifications the payment processors and the app
-      stores post here. None of them carries a URnetwork JWT: each is
-      authenticated by the sender's own scheme, checked before the body is
-      parsed -- the Stripe signature header, the Coinbase and Helius shared
-      secrets, the Google Pub/Sub push claim, the Circle ECDSA notification
-      signature, and, for the App Store, a JWS chain that must terminate at a
-      pinned Apple root. The bodies below list only the fields the server
-      reads; every sender posts more, and a sender may add more at any time.
-  - name: extenders
-    description: |
-      The extender network (connect/EXTENDER.md): volunteer relays that carry
-      the connect protocol over an ordinary-looking carrier (tls, quic or dns)
+      The network's clients, cloud proxy devices and peers; provider
+      locations and provider search; rankings, the emoji tag, blocked
+      locations, reliability and provider status; and the network user.
+      `POST /network/auth-client` exchanges a network JWT for the client JWT
+      the `connect` protocol needs.
+
+      The extender network lives here too: volunteer relays that carry the
+      `connect` protocol over an ordinary-looking carrier (tls, quic or dns)
       into the platform, so a client on a network that blocks URnetwork still
       reaches it. An extender proves itself by being probed from the outside
       before it is published, and clients discover extenders from signed
       records -- their own on activation, everyone else's over gossip.
-  - name: provider probing
+  - name: Stats
     description: |
-      The operator-to-server control plane of the provider probe fleet: the
-      queues of which providers are due to be probed, the measurements the
-      prober submits back (egress location, egress health, blackhole checks,
-      bandwidth), and the credential and certificate pins the prober itself
-      fetches. These routes are NOT authenticated by a network JWT. They carry
-      the shared operator secret in an `X-UR-Operator-Secret` header, checked
-      in constant time against `provider_egress.yml` `ingest_secret`; a
-      deployment whose vault has no such resource rejects every request. The
-      one exception is `POST /network/provider-verdict`, which a real client
-      network calls with its own session.
-  - name: x402
+      Public network statistics and the provider and extender density map,
+      the caller network's provider statistics, and the leaderboards.
+  - name: Subscription
     description: |
-      Inline agent payments over the x402 header protocol: an agent asks for a
-      sku, is answered `402` with the payment terms, and retries the same
-      request with a signed payment in `X-PAYMENT`. Both routes answer `404`
-      while x402 is not configured and enabled (vault `x402.yml`).
-  - name: subnet evidence
+      Pro subscriptions: status and balance, prices, cancel and resume,
+      balance codes, and the Stripe, Google Play and App Store purchase
+      paths.
+  - name: Wallet
     description: |
-      The public, content-addressed evidence surface of the subnet: immutable
-      payout artifacts and signed release-evidence envelopes, addressed by
-      their sha256 content hash and paged by their history prefix, plus the
-      client-key observation endpoints a client uses to publish and read a
-      signed key history. Reads are public and immutable; writes are either an
-      authenticated client session under a byte budget or the operator's own
-      artifact signature.
-  - name: oauth
+      The network's Circle USDC user custody wallet: balance, address
+      validation, setup and transfers out.
+  - name: Device
     description: |
-      The OAuth 2.1 / OpenID Connect authorization server (server/IDP.md).
-      Its issuer is a separate hostname that the load balancer routes to this
-      same service, so these paths answer on either host; the issuer published
-      in the discovery documents is the one clients use. Authentication here
-      is the OAuth mechanism of each endpoint -- a PKCE code, a refresh token,
-      an access token -- except `/oauth/authorize` and `/oauth/consent`, which
-      the ur.io consent page calls with the signed-in user's URnetwork JWT.
+      Device sharing and adoption with share and adopt codes (and their QR
+      images), and the network's device associations and device names.
+  - name: Account
+    description: |
+      API keys, payout and account wallets, points, payments, redeemed
+      balance codes, subnet epochs, referrals and the network name.
+  - name: Preferences
+    description: The account's preferences, such as product update emails.
+  - name: Feedback
+    description: Send feedback about URnetwork.
+  - name: Connect protocol
+    description: |
+      The browser single sign-on redirect (`/connect`) and the out-of-band
+      control messages of the `connect` protocol (`/connect/control`).
+  - name: Transfer
+    description: The network's paid and unpaid transfer byte counts.
+  - name: Solana
+    description: Paying for Pro with Solana Pay.
+  - name: Referral codes
+    description: Check a referral code before an account exists.
+  - name: Other
+    description: |
+      Everything outside the groups above:
+
+      - discovery and status: `/hello`, `/status`, `/clock`, `/my-ip-info`
+        and the policy redirects (`/privacy.txt`, `/terms.txt`, `/vdp.txt`)
+      - client public keys (`/key`) and client log upload (`/log`)
+      - Stripe checkout and the customer portal (`/stripe`), and data packs
+        bought without signing in (`/pay/data`)
+      - inline agent payments over the x402 header protocol (`/x402`): an
+        agent asks for a sku, is answered `402` with the payment terms, and
+        retries the same request with a signed payment in `X-PAYMENT`
+      - the subnet (`/sn`): payout wallets and their consents, head mining,
+        pool claims and epochs, and the public, content-addressed payout
+        artifacts and release evidence, addressed by their sha256 content
+        hash
+      - the routing-verification protocol with its public statistics and
+        proofs (`/verify`)
+      - the new-user onboarding program and product events (`/onboarding`,
+        `/client/events`)
+      - the OAuth 2.1 / OpenID Connect authorization server (`/.well-known`,
+        `/oauth`). Its issuer is a separate hostname that the load balancer
+        routes to this same service, so these paths answer on either host;
+        the issuer published in the discovery documents is the one clients
+        use. Authentication there is the OAuth mechanism of each endpoint --
+        a PKCE code, a refresh token, an access token -- except
+        `/oauth/authorize` and `/oauth/consent`, which the ur.io consent page
+        calls with the signed-in user's URnetwork JWT.
 
 paths:
   /privacy.txt:
     get:
+      tags: [Other]
       description: |
         Redirect (303) to the canonical privacy policy on bringyour.com.
         The api serves the redirect so a client that only knows the api host
@@ -148,6 +178,7 @@ paths:
 
   /terms.txt:
     get:
+      tags: [Other]
       description: |
         Redirect (303) to the canonical terms of service on bringyour.com.
       operationId: termsTxt
@@ -162,6 +193,7 @@ paths:
 
   /vdp.txt:
     get:
+      tags: [Other]
       description: |
         Redirect (303) to the vulnerability disclosure policy on
         bringyour.com.
@@ -177,6 +209,7 @@ paths:
 
   /status:
     get:
+      tags: [Other]
       description: |
         The serving status of the api process that answered, used by the
         deploy poll and by fleet status sampling. `status` is a latched value
@@ -199,6 +232,7 @@ paths:
 
   /clock:
     get:
+      tags: [Other]
       description: |
         Get the cumulative destination-reported bytes for contracts finalized
         on or after the start of subnet block 9.
@@ -218,6 +252,7 @@ paths:
 
   /stats/last-90:
     get:
+      tags: [Stats]
       description: |
         Get network statistics for the last 90 days.
         The statistics are updated approximately every 60s.
@@ -233,7 +268,7 @@ paths:
 
   /stats/providers-map:
     get:
-      tags: [extenders]
+      tags: [Stats]
       summary: Provider and extender density by region
       description: |
         The provider-density map behind the public map page: how many public
@@ -272,6 +307,7 @@ paths:
 
   /stats/providers:
     get:
+      tags: [Stats]
       description: |
         Get all providers in the caller network.
         Each provider includes stats from the last 24 hours.
@@ -288,6 +324,7 @@ paths:
 
   /stats/providers-last-n:
     post:
+      tags: [Stats]
       description: |
         Get all providers in the caller network.
         Each provider includes stats from the last n hours.
@@ -310,6 +347,7 @@ paths:
 
   /stats/provider-last-n:
     post:
+      tags: [Stats]
       description: |
         Get detailed stats on a single provider in the caller network.
         This is meant to give the user complete visibility over usage.
@@ -332,6 +370,7 @@ paths:
 
   /stats/providers-overview-last-n:
     post:
+      tags: [Stats]
       description: |
         Get a network-wide time series aggregated across all providers in the
         caller network, over the last n hours.
@@ -354,6 +393,7 @@ paths:
 
   /stats/providers-overview-last-90:
     get:
+      tags: [Stats]
       description: |
         Legacy alias of `/stats/providers-overview-last-n` with the lookback
         fixed at 90 days, kept for callers that predate the route migration.
@@ -371,6 +411,7 @@ paths:
 
   /stats/provider-last-90:
     post:
+      tags: [Stats]
       description: |
         Legacy alias of `/stats/provider-last-n`, kept for callers that
         predate the route migration. A request that names neither `last_n` nor
@@ -396,6 +437,7 @@ paths:
 
   /stats/leaderboard:
     post:
+      tags: [Stats]
       description: |
         Fetches top 100 current leaderboard. This data is refreshed every payout.
       operationId: statsLeaderboard
@@ -417,6 +459,7 @@ paths:
 
   /stats/points-leaderboard:
     post:
+      tags: [Stats]
       description: |
         Page the all-time points leaderboard. Every network with points is
         ranked on three dimensions (total points, finalized epochs with points
@@ -462,6 +505,7 @@ paths:
 
   /auth/login:
     post:
+      tags: [Authentication]
       description: |
         Start a login for a user authority.
         The user authority may be:
@@ -500,6 +544,7 @@ paths:
 
   /auth/wallet-challenge:
     post:
+      tags: [Authentication]
       description: |
         Issue a single-use wallet sign-in challenge. The wallet signs the
         returned `message_template` byte for byte; the signature is then
@@ -532,6 +577,7 @@ paths:
 
   /auth/wallet-nonce:
     post:
+      tags: [Authentication]
       description: |
         Issue a fresh single-use, short-lived (5 minute) nonce for wallet
         login. The client embeds the returned nonce in the message it signs
@@ -555,6 +601,7 @@ paths:
 
   /auth/login-with-password:
     post:
+      tags: [Authentication]
       description: |
         Password login for email and phone number.
       operationId: authLoginWithPassword
@@ -575,6 +622,7 @@ paths:
 
   /auth/verify:
     post:
+      tags: [Authentication]
       description: |
         Verify ownership of email or phone number.
       operationId: authVerify
@@ -595,6 +643,7 @@ paths:
 
   /auth/refresh:
     get:
+      tags: [Authentication]
       description: |
         Refresh the client JWT (by_jwt) for the caller's client.
         Requires a client JWT (from `/network/auth-client`).
@@ -611,6 +660,7 @@ paths:
 
   /auth/verify-send:
     post:
+      tags: [Authentication]
       description: |
         Send verification code to email or phone number.
 
@@ -646,6 +696,7 @@ paths:
 
   /auth/password-reset:
     post:
+      tags: [Authentication]
       description: |
         Send password reset code to email or phone number.
 
@@ -682,6 +733,7 @@ paths:
 
   /auth/password-set:
     post:
+      tags: [Authentication]
       description: |
         Change password.
       operationId: authPasswordSet
@@ -702,6 +754,7 @@ paths:
 
   /auth/network-check:
     post:
+      tags: [Authentication]
       description: |
         Check if the network name is available.
         The name is normalized before it is checked: trimmed, lower-cased, and
@@ -728,7 +781,7 @@ paths:
 
   /auth/network-create:
     post:
-      tags: [onboarding]
+      tags: [Authentication]
       summary: Create a network
       description: |
         Create a new network.
@@ -774,6 +827,7 @@ paths:
 
   /auth/network-delete:
     post:
+      tags: [Authentication]
       description: |
         Delete network
       operationId: authNetworkDelete
@@ -789,13 +843,14 @@ paths:
 
   /auth/code-create:
     post:
+      tags: [Authentication]
       description: |
         Create a limited use code (auth code) to share authentication
         with connected apps and tools.
         The code is tied to the caller session,
         and will be expired with any of the caller's sessions.
         This is a subset of an OAuth flow. For the full OAuth 2.1 / OpenID
-        Connect flow see the `oauth` routes.
+        Connect flow see the `/oauth` routes.
       operationId: authCodeCreate
       security:
         - BearerAuth: []
@@ -815,7 +870,7 @@ paths:
 
   /auth/apple/callback:
     post:
-      tags: [auth]
+      tags: [Authentication]
       summary: Sign in with Apple return for android, windows and linux
       operationId: authAppleCallback
       # a browser redirect from the identity provider; no bearer
@@ -880,7 +935,7 @@ paths:
         '400':
           description: No `state` in the form, or a body over 64 KiB.
     get:
-      tags: [auth]
+      tags: [Authentication]
       summary: Sign in with Apple return (query form, for manual testing)
       operationId: authAppleCallbackGet
       # a browser redirect from the identity provider; no bearer
@@ -914,7 +969,7 @@ paths:
           description: No `state`.
   /auth/google/callback:
     get:
-      tags: [auth]
+      tags: [Authentication]
       summary: Sign in with Google return for windows and linux
       operationId: authGoogleCallback
       # a browser redirect from the identity provider; no bearer
@@ -981,6 +1036,7 @@ paths:
           description: Not a `GET`.
   /auth/code-login:
     post:
+      tags: [Authentication]
       description: |
         Authenticate with an auth code.
         The returned session is tied to the session that created the auth code,
@@ -1004,6 +1060,7 @@ paths:
 
   /auth/add-auth:
     post:
+      tags: [Authentication]
       description: |
         Add an authentication method (email/phone + password, SSO, or wallet)
         to the calling user. A wallet (`wallet_auth`, Solana or Bittensor)
@@ -1034,6 +1091,7 @@ paths:
 
   /auth/remove-auth:
     post:
+      tags: [Authentication]
       description: |
         Remove an authentication method from the calling user. The last
         remaining method cannot be removed.
@@ -1056,6 +1114,7 @@ paths:
 
   /auth/generate-seedphrase:
     post:
+      tags: [Authentication]
       description: |
         Generate a recovery seedphrase for the calling user. Fails if a
         seedphrase auth already exists; see /auth/regenerate-seedphrase.
@@ -1072,6 +1131,7 @@ paths:
 
   /auth/regenerate-seedphrase:
     post:
+      tags: [Authentication]
       description: |
         Replace the calling user's recovery seedphrase with a new one,
         invalidating the previous seedphrase.
@@ -1088,7 +1148,7 @@ paths:
 
   /network/auth-client:
     post:
-      tags: [onboarding]
+      tags: [Network]
       summary: Authenticate a client on the network
       description: |
         Gain permission to use the `connect` protocol as the requested clientId,
@@ -1151,6 +1211,7 @@ paths:
 
   /network/remove-client:
     post:
+      tags: [Network]
       description: |
         Remove a client from the network.
       operationId: removeNetworkClient
@@ -1172,6 +1233,7 @@ paths:
 
   /network/remove-clients:
     post:
+      tags: [Network]
       description: |
         Remove many clients from the caller's network in one call, so a
         network with hundreds of thousands of offline clients can be cleared
@@ -1210,7 +1272,7 @@ paths:
 
   /network/extender-activate:
     post:
-      tags: [extenders]
+      tags: [Network]
       summary: Offer this client as an extender
       description: |
         Offer the calling client as an extender and, if it proves out, publish
@@ -1274,7 +1336,7 @@ paths:
 
   /network/extender-hint:
     get:
-      tags: [extenders]
+      tags: [Network]
       summary: The continent to try extenders on first, and the country to front them for
       description: |
         The continent the operator places the caller's address on
@@ -1304,7 +1366,7 @@ paths:
 
   /network/extender-latency:
     post:
-      tags: [extenders]
+      tags: [Network]
       summary: Forward provider latency attestations
       description: |
         Forward the latency attestations providers made to this client's
@@ -1357,7 +1419,7 @@ paths:
 
   /network/ping-report:
     post:
-      tags: [extenders]
+      tags: [Network]
       summary: Report the pings this client measured
       description: |
         Report the pings this client measured of extenders, and what each
@@ -1414,6 +1476,7 @@ paths:
 
   /network/clients:
     get:
+      tags: [Network]
       description: |
         Get the latest status of the network's devices: every top-level
         client (no source_client_id) that is not a hosted proxy device, with
@@ -1443,6 +1506,7 @@ paths:
 
   /network/proxies:
     get:
+      tags: [Network]
       description: |
         The network's cloud proxy devices: the clients that carry a hosted
         proxy device (created with `proxy_config` on `/network/auth-client`),
@@ -1462,6 +1526,7 @@ paths:
 
   /network/peers:
     get:
+      tags: [Network]
       description: |
         Fast network peer discovery.
 
@@ -1485,6 +1550,7 @@ paths:
 
   /preferences/set-preferences:
     post:
+      tags: [Preferences]
       description: |
         Set account preferences.
       operationId: preferencesSet
@@ -1506,6 +1572,7 @@ paths:
 
   /preferences:
     get:
+      tags: [Preferences]
       description: |
         Get account preferences.
       operationId: preferencesGet
@@ -1521,6 +1588,7 @@ paths:
 
   /feedback/send-feedback:
     post:
+      tags: [Feedback]
       description: |
         Feedback.
       operationId: feedbackSend
@@ -1542,6 +1610,7 @@ paths:
 
   /log/{clientId}/upload:
     post:
+      tags: [Other]
       description: |
         Upload a log file for the caller, associated with a feedback id.
         The request body is the raw log file content, streamed to storage.
@@ -1574,6 +1643,7 @@ paths:
 
   /network/provider-locations:
     get:
+      tags: [Network]
       description: |
         A list of locations and groups where there is at least one active
         provider in good health.
@@ -1593,6 +1663,7 @@ paths:
 
   /network/find-provider-locations:
     post:
+      tags: [Network]
       description: |
         Search for locations and groups that match a query,
         where there are at least one active provider in good health.
@@ -1618,6 +1689,7 @@ paths:
 
   /network/find-providers2:
     post:
+      tags: [Network]
       description: |
         Randomly sample providers for locations, groups, or devices,
         which are active and in good health.
@@ -1641,6 +1713,7 @@ paths:
 
   /network/ranking:
     get:
+      tags: [Network]
       description: |
         Get leaderboard ranking of current network. Besides the data
         leaderboard rank, the result carries the network's points leaderboard
@@ -1661,6 +1734,7 @@ paths:
 
   /network/ranking-visibility:
     post:
+      tags: [Network]
       description: |
         Allow network to toggle leaderboard ranking visibility
       operationId: networkRankingVisibility
@@ -1682,6 +1756,7 @@ paths:
 
   /network/points-ranking-visibility:
     post:
+      tags: [Network]
       description: |
         Turn the network's name on or off on the points leaderboard. Every
         network with points is ranked and listed either way; this switch only
@@ -1706,6 +1781,7 @@ paths:
 
   /network/emoji:
     post:
+      tags: [Network]
       description: |
         Set the network's emoji tag: 1 to 6 emoji (each grapheme cluster must
         be a single emoji: pictographs with skin tones, ZWJ sequences, keycaps,
@@ -1731,6 +1807,7 @@ paths:
 
   /network/block-location:
     post:
+      tags: [Network]
       description: |
         Block providing to a location
       operationId: networkBlockLocation
@@ -1752,6 +1829,7 @@ paths:
 
   /network/unblock-location:
     post:
+      tags: [Network]
       description: |
         Unblock providing to a location
       operationId: networkUnblockLocation
@@ -1773,6 +1851,7 @@ paths:
 
   /network/blocked-locations:
     get:
+      tags: [Network]
       description: Get list locations to block from providing for the network
       operationId: networkBlockedLocations
       security:
@@ -1787,6 +1866,7 @@ paths:
 
   /network/reliability:
     get:
+      tags: [Network]
       description: Get network reliability stats
       operationId: networkReliability
       security:
@@ -1801,6 +1881,7 @@ paths:
 
   /network/provider-status:
     get:
+      tags: [Network]
       description: |
         Why each of the caller network's own provider clients is or is not
         offered to clients, with how often find-providers2 returned it per
@@ -1828,6 +1909,7 @@ paths:
 
   /network/user:
     get:
+      tags: [Network]
       description: |
         Get the user and configured auth methods for the caller network.
       operationId: getNetworkUser
@@ -1843,6 +1925,7 @@ paths:
 
   /network/user/update:
     post:
+      tags: [Network]
       description: |
         Update the caller network's name.
       operationId: updateNetworkName
@@ -1866,7 +1949,8 @@ paths:
 
   /network/provider-egress-due:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Which providers are due an egress-location probe
       description: |
         The providers to probe next: those whose stored egress location or
@@ -1922,7 +2006,8 @@ paths:
 
   /network/provider-egress-location:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Submit a probed provider egress location
       description: |
         Store where a provider's traffic exits: `exit_ip`, the address the
@@ -1965,7 +2050,8 @@ paths:
 
   /network/provider-egress-attempt:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Record a probe attempt
       description: |
         Record that the prober TRIED to probe a provider, whether or not the
@@ -1998,7 +2084,8 @@ paths:
 
   /network/provider-blackhole-due:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Which providers are due a blackhole check
       description: |
         The blackhole sweep queue: every provider whose next check has come
@@ -2043,7 +2130,8 @@ paths:
 
   /network/provider-blackhole-checks:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Submit a batch of blackhole checks
       description: |
         Submit up to 10,000 blackhole results at once: for each provider, did
@@ -2085,7 +2173,8 @@ paths:
 
   /network/provider-bandwidth-test:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: The active bandwidth probe's download target
       description: |
         Stream a bounded number of arbitrary bytes, so the prober has
@@ -2120,7 +2209,8 @@ paths:
 
   /network/provider-bandwidth-reserve:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Reserve byte budget for one bandwidth probe
       description: |
         Take deployment-wide byte budget before spending any probe bytes.
@@ -2163,7 +2253,8 @@ paths:
 
   /network/provider-bandwidth-result:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Submit an active bandwidth measurement
       description: |
         Store one active bandwidth measurement taken over a provider's tunnel.
@@ -2203,7 +2294,8 @@ paths:
 
   /network/provider-egress-health:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Submit an egress-health run
       description: |
         Store one egress-health run: over the provider's tunnel, how many of
@@ -2252,7 +2344,8 @@ paths:
 
   /network/provider-egress-destinations:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: The prober's destination pool
       description: |
         The sites the prober loads (connect/GEOMAP.md §11.4): the active
@@ -2284,14 +2377,15 @@ paths:
 
   /network/provider-verdict:
     post:
-      tags: [provider probing]
+      tags: [Network]
       summary: Report that a provider carried nothing
       description: |
-        A real client network reporting that a provider carried nothing. This
-        is the ONE route in this group that is not operator-secret authed: the
-        reporter is a network, and the network is the unit the quorum counts,
-        so the reporting network is taken from the session jwt and never from
-        the body. A met quorum only brings the provider's next probe forward.
+        A real client network reporting that a provider carried nothing. It
+        feeds the provider probe control plane, but unlike that plane's
+        routes it is not authenticated by the operator secret: the reporter
+        is a network, and the network is the unit the quorum counts, so the
+        reporting network is taken from the session jwt and never from the
+        body. A met quorum only brings the provider's next probe forward.
         Unknown fields in the body are rejected.
       operationId: providerClientVerdictSubmit
       security:
@@ -2314,7 +2408,8 @@ paths:
 
   /network/prober-credential:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: The prober's own network client jwt
       description: |
         The network client jwt the bootstrap task minted for the operator's
@@ -2348,7 +2443,8 @@ paths:
 
   /network/geolocation-source-pins:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Certificate pins for the geolocation source hosts
       description: |
         Retired with the geolocation sources (connect/GEOMAP.md D24): the
@@ -2392,6 +2488,7 @@ paths:
 
   /wallet/balance:
     get:
+      tags: [Wallet]
       description: |
         Get the balance for the USDC user custody wallet.
         The user custody wallet allows URnetwork to query the balance,
@@ -2409,6 +2506,7 @@ paths:
 
   /wallet/validate-address:
     post:
+      tags: [Wallet]
       description: |
         Validate a USDC wallet address on the user custody wallet chain.
         This can be used to check whether an address can receive
@@ -2433,6 +2531,7 @@ paths:
 
   /wallet/circle-init:
     post:
+      tags: [Wallet]
       description: |
         Initialize the Circle USDC user self custody wallet.
         This starts a process that must be completed by the user.
@@ -2449,6 +2548,7 @@ paths:
 
   /wallet/circle-transfer-out:
     post:
+      tags: [Wallet]
       description: |
         Set up a transfer from the Circle USDC user self custody wallet
         to an address.
@@ -2472,7 +2572,7 @@ paths:
 
   /subscription/balance:
     get:
-      tags: [subscription]
+      tags: [Subscription]
       summary: Subscription status, balance and the onboarding plan data
       description: |
         Get the current subscription status and transfer balance. This is also
@@ -2511,6 +2611,7 @@ paths:
 
   /subscription/details:
     get:
+      tags: [Subscription]
       description: |
         The "Manage subscription" screen: every store currently billing the
         caller's network, one entry per store, with the window it bought
@@ -2541,6 +2642,7 @@ paths:
 
   /subscription/cancel:
     post:
+      tags: [Subscription]
       description: |
         Stop the Stripe subscription billing the caller's network at the end of
         the paid period (`cancel_at_period_end`); the customer keeps Pro until
@@ -2568,6 +2670,7 @@ paths:
 
   /subscription/resume:
     post:
+      tags: [Subscription]
       description: |
         Undo /subscription/cancel while the paid period is still running: the
         Stripe subscription renews again. Same request and result shapes.
@@ -2590,6 +2693,7 @@ paths:
 
   /subscription/check-balance-code:
     post:
+      tags: [Subscription]
       description: |
         Check if the balance code is valid.
       operationId: subscriptionCheckBalanceCode
@@ -2611,6 +2715,7 @@ paths:
 
   /subscription/redeem-balance-code:
     post:
+      tags: [Subscription]
       description: |
         Redeem the balance code and add the transfer balance to the caller network.
       operationId: subscriptionRedeemBalanceCode
@@ -2632,6 +2737,7 @@ paths:
 
   /subscription/create-payment-id:
     post:
+      tags: [Subscription]
       description: |
         Creates an anonymous payment identifier to be used with purchases.
         This keeps network information out of the payment processor system.
@@ -2655,7 +2761,7 @@ paths:
 
   /subscription/verify-play-purchase:
     post:
-      tags: [subscription]
+      tags: [Subscription]
       summary: Report a Play purchase for verification
       description: |
         The android app reports its purchase token BEFORE acknowledging it.
@@ -2699,7 +2805,7 @@ paths:
 
   /subscription/verify-apple-transaction:
     post:
-      tags: [subscription]
+      tags: [Subscription]
       summary: Report a StoreKit transaction for verification
       description: |
         The Apple app reports its StoreKit transaction JWS
@@ -2746,7 +2852,7 @@ paths:
 
   /x402/skus:
     get:
-      tags: [x402]
+      tags: [Other]
       summary: What an agent can buy
       description: |
         The catalog an agent can buy from, so a skill can discover it without
@@ -2767,7 +2873,7 @@ paths:
 
   /x402/purchase:
     post:
-      tags: [x402]
+      tags: [Other]
       summary: Quote or settle an inline payment
       description: |
         Buy a sku inline. Without an `X-PAYMENT` header the answer is `402`
@@ -2826,7 +2932,8 @@ paths:
 
   /pay/stripe:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: Stripe webhook
       description: |
         The Stripe webhook. Authenticated by the `Stripe-Signature` header
@@ -2852,7 +2959,8 @@ paths:
 
   /pay/coinbase:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: Coinbase Commerce webhook
       description: |
         The Coinbase Commerce webhook, authenticated by the
@@ -2877,7 +2985,8 @@ paths:
 
   /pay/play:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: Google Play real-time developer notification
       description: |
         The Play RTDN push, delivered through Google Pub/Sub and
@@ -2905,7 +3014,8 @@ paths:
 
   /pay/solana:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: Helius USDC transfer webhook
       description: |
         The Helius webhook for USDC transfers on Solana. Authenticated by the
@@ -2949,7 +3059,8 @@ paths:
 
   /pay/circle:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: Circle notification (deprecated)
       description: |
         The Circle programmable-wallets notification, authenticated by the
@@ -2974,7 +3085,8 @@ paths:
 
   /account/circle-wallet:
     post:
-      tags: [store webhooks]
+      tags: [Account]
+      x-internal: true
       summary: Circle wallet challenge notification
       description: |
         The Circle notification that a user-custody wallet challenge
@@ -3002,7 +3114,8 @@ paths:
 
   /apple/notification:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: App Store Server Notification V2
       description: |
         The App Store Server Notification V2 endpoint. The envelope carries
@@ -3045,6 +3158,7 @@ paths:
 
   /device/add:
     post:
+      tags: [Device]
       description: |
         Add a device, which can either be owned by the network or shared with the network.
         The code provided can be either adoption code or a share code.
@@ -3069,6 +3183,7 @@ paths:
 
   /device/create-share-code:
     post:
+      tags: [Device]
       description: |
         Creates a code to share a device.
       operationId: deviceCreateShareCode
@@ -3090,6 +3205,7 @@ paths:
 
   /device/share-code/{code}/qr.png:
     get:
+      tags: [Device]
       description: |
         A QR code that maps to a URL to add the shared device.
         Send it to someone to scan to add the device.
@@ -3114,6 +3230,7 @@ paths:
 
   /device/share-status:
     post:
+      tags: [Device]
       description: |
         The status of the shared device.
         The status can be one of:
@@ -3139,6 +3256,7 @@ paths:
 
   /device/confirm-share:
     post:
+      tags: [Device]
       description: |
         Confirm the share of a device.
         This must be called from the side that initiates the share.
@@ -3161,6 +3279,7 @@ paths:
 
   /device/create-adopt-code:
     post:
+      tags: [Device]
       description: |
         Creates a code to adopt a device.
         The adopt code is valid for a limited time.
@@ -3182,6 +3301,7 @@ paths:
 
   /device/adopt-code/{code}/qr.png:
     get:
+      tags: [Device]
       description: |
         A QR code that maps to a URL to adopt the device.
         Send it to someone to scan to adopt the device.
@@ -3205,6 +3325,7 @@ paths:
 
   /device/adopt-status:
     post:
+      tags: [Device]
       description: |
         The status of the adopt-code device.
         The status can be one of:
@@ -3229,6 +3350,7 @@ paths:
 
   /device/confirm-adopt:
     post:
+      tags: [Device]
       description: |
         Confirm the adoption of a device.
         This must be called from the side that initiates the adoption.
@@ -3250,6 +3372,7 @@ paths:
 
   /device/remove-adopt-code:
     post:
+      tags: [Device]
       description: |
         Remove an adopt code.
         This must be called from the side that initiates the adoption.
@@ -3271,6 +3394,7 @@ paths:
 
   /device/associations:
     get:
+      tags: [Device]
       description: |
         The devices associated with the caller network.
         Associated devices are:
@@ -3290,6 +3414,7 @@ paths:
 
   /device/remove-association:
     post:
+      tags: [Device]
       description: |
         Remove a device association.
         The association can be any of:
@@ -3315,6 +3440,7 @@ paths:
 
   /device/set-association-name:
     post:
+      tags: [Device]
       description: |
         Set the name of the association.
         To set the name of devices owned by the network, use `/device/set-name`.
@@ -3337,6 +3463,7 @@ paths:
 
   /device/set-name:
     post:
+      tags: [Device]
       description: |
         Sets the name of a device owned by the network.
         To set the name of devices shared with the network, use `/device/set-association-name`.
@@ -3359,6 +3486,7 @@ paths:
 
   /connect:
     get:
+      tags: [Connect protocol]
       description: |
         Redirect (303) to the single sign-on (SSO) start URL.
         Used to begin the browser SSO/OAuth flow.
@@ -3372,6 +3500,7 @@ paths:
               schema:
                 type: string
     post:
+      tags: [Connect protocol]
       description: |
         Redirect (303) to the single sign-on (SSO) start URL.
         Used to begin the browser SSO/OAuth flow.
@@ -3387,6 +3516,7 @@ paths:
 
   /connect/control:
     post:
+      tags: [Connect protocol]
       description: |
         Out-of-band control messages for the connect protocol.
         Blocking request-response control messages need to be handled out-of-band
@@ -3410,6 +3540,7 @@ paths:
 
   /key/{clientId}:
     get:
+      tags: [Other]
       description: |
         Fetch the published Ed25519 public key for a client id.
         Unauthenticated by design - the value is a public key meant to be
@@ -3434,6 +3565,7 @@ paths:
 
   /key/{clientId}/history:
     get:
+      tags: [Other]
       description: |
         Fetch the operator-signed registration history of a client's public
         key: the ordered signed registrations, generation 1 first, each an
@@ -3472,7 +3604,7 @@ paths:
 
   /hello:
     get:
-      tags: [extenders]
+      tags: [Other]
       summary: Discovery
       description: |
         Simple hello to the network that returns some useful information.
@@ -3497,6 +3629,7 @@ paths:
 
   /my-ip-info:
     get:
+      tags: [Other]
       description: |
         Information about the caller's IP as seen by the platform: its
         geolocation, and whether the IP is currently connected to the network.
@@ -3517,6 +3650,7 @@ paths:
 
   /account/change-name:
     post:
+      tags: [Account]
       description: |
         Change the network name of the calling network. The previous name
         enters a reclaim cooldown. Subject to the account action rate limit.
@@ -3539,6 +3673,7 @@ paths:
 
   /account/claim-name:
     post:
+      tags: [Account]
       description: |
         Claim an unused network name for the calling network. Claiming and
         changing have SEPARATE daily budgets: a first-time claim does not
@@ -3564,6 +3699,7 @@ paths:
 
   /account/api-key:
     post:
+      tags: [Account]
       description: |
         Create an API key for the account.
       operationId: accountCreateApiKey
@@ -3585,6 +3721,7 @@ paths:
 
   /account/api-key/remove:
     post:
+      tags: [Account]
       description: |
         Remove an API key for the account.
       operationId: accountRemoveApiKey
@@ -3606,6 +3743,7 @@ paths:
 
   /account/api-keys:
     get:
+      tags: [Account]
       description: |
         Fetches a list of API keys associated with the account.
         The list does not include the API key secrets, only metadata.
@@ -3622,6 +3760,7 @@ paths:
 
   /account/payout-wallet:
     post:
+      tags: [Account]
       description: |
         Set an existing account wallet as the wallet to receive network payments.
       operationId: accountSetPayoutWallet
@@ -3641,6 +3780,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/SetPayoutWalletResult"
     get:
+      tags: [Account]
       description: |
         Fetches the payout wallet associated with the network
       operationId: accountGetPayoutWallet
@@ -3656,6 +3796,7 @@ paths:
 
   /account/points:
     get:
+      tags: [Account]
       description: |
         Retrieves account points earned. Eventually, users will be able to convert points for tokens
       operationId: accountGetPoints
@@ -3671,6 +3812,7 @@ paths:
 
   /account/payments:
     get:
+      tags: [Account]
       description: |
         Retrieves list of account payments
       operationId: accountGetPayouts
@@ -3686,6 +3828,7 @@ paths:
 
   /account/wallet:
     post:
+      tags: [Account]
       description: |
         Create a new wallet for your network. You can then use it as a payout wallet
         by posting to /account/payout-wallet.
@@ -3708,6 +3851,7 @@ paths:
 
   /account/wallets:
     get:
+      tags: [Account]
       description: |
         Get a list of wallets associated with your network
       operationId: accountGetWallets
@@ -3723,6 +3867,7 @@ paths:
 
   /account/wallets/remove:
     post:
+      tags: [Account]
       description: |
         Remove a wallet from your list of account wallets. Removing the
         payout wallet makes another active Solana or Polygon wallet of the
@@ -3748,6 +3893,7 @@ paths:
 
   /account/wallets/verify-seeker:
     post:
+      tags: [Account]
       description: |
         Verify that a wallet holds a Seeker or Saga Genesis token by
         validating a signed message. Either holding succeeds; a wallet with
@@ -3772,6 +3918,7 @@ paths:
 
   /account/balance-codes:
     get:
+      tags: [Account]
       description: |
         Fetch balance codes redeemed by network
       operationId: accountBalanceCodes
@@ -3787,6 +3934,7 @@ paths:
 
   /account/epochs:
     get:
+      tags: [Account]
       description: |
         The caller network's finalized epochs, newest first: the points earned
         inside each epoch's wall-clock window and the network's share of the
@@ -3811,6 +3959,7 @@ paths:
 
   /account/referral-code:
     get:
+      tags: [Account]
       description: |
         Unique network code to refer new users
       operationId: accountReferralCode
@@ -3826,6 +3975,7 @@ paths:
 
   /referral-code/validate:
     post:
+      tags: [Referral codes]
       description: |
         Validate a referral (bonus) code: whether it exists and whether it has
         been used up. The sign-up screens call this before an account exists,
@@ -3852,6 +4002,7 @@ paths:
 
   /account/referral-network:
     get:
+      tags: [Account]
       description: |
         Get the network that was referred the authenticated network
       operationId: accountReferralNetwork
@@ -3867,6 +4018,7 @@ paths:
 
   /account/unlink-referral-network:
     get:
+      tags: [Account]
       description: |
         Unlink the referral network from the authenticated network.
       operationId: accountUnlinkReferralNetwork
@@ -3882,6 +4034,7 @@ paths:
 
   /account/set-referral:
     post:
+      tags: [Account]
       description: |
         Set the parent referral network for the authenticated network.
       operationId: accountSetReferral
@@ -3903,6 +4056,7 @@ paths:
 
   /transfer/stats:
     get:
+      tags: [Transfer]
       description: |
         Retrieves the paid and unpaid byte count provided to the network
       operationId: transferStats
@@ -3918,7 +4072,7 @@ paths:
 
   /solana/payment-intent:
     post:
-      tags: [subscription]
+      tags: [Solana]
       summary: Create a Solana Pay intent for Pro
       description: |
         When paying for a subscription with Solana, we track the order through this intent.
@@ -3947,7 +4101,7 @@ paths:
 
   /solana/payment-transaction:
     post:
-      tags: [subscription]
+      tags: [Solana]
       summary: Build the browser-wallet transfer for a Solana Pay intent
       description: |
         The unsigned USDC transfer that pays an open Solana Pay intent of the
@@ -3995,6 +4149,7 @@ paths:
 
   /stripe/payment-intent:
     post:
+      tags: [Other]
       description: |
         When paying for a subscription with Stripe, create the payment intents,
         ephemeral key, and customer id needed to complete the purchase.
@@ -4020,6 +4175,7 @@ paths:
 
   /stripe/customer-portal:
     post:
+      tags: [Other]
       description: |
         Create a Stripe customer portal URL for the caller to manage their
         subscription. A refusal carries a stable `error.code`
@@ -4044,6 +4200,7 @@ paths:
 
   /pay/data/checkout:
     post:
+      tags: [Other]
       description: |
         Buy a data pack with a card without signing in (the ur.io buy-data
         page). Starts a hosted Stripe checkout and returns the url to send the
@@ -4082,6 +4239,7 @@ paths:
 
   /pay/data/network-lookup:
     post:
+      tags: [Other]
       description: |
         Whether a network with exactly this name exists, for the buy-data page.
         Matched the same way /pay/data/checkout resolves `network_name`
@@ -4106,6 +4264,7 @@ paths:
 
   /pay/data/solana-intent:
     post:
+      tags: [Other]
       description: |
         Buy a data pack with USDC on Solana, without signing in or giving an
         email: the data goes straight to the network named by `network_name`
@@ -4154,6 +4313,7 @@ paths:
 
   /pay/data/solana-status:
     post:
+      tags: [Other]
       description: |
         The state of a data pack payment started with /pay/data/solana-intent,
         for the buy-data page to poll while it waits: `pending` until the USDC
@@ -4178,6 +4338,7 @@ paths:
 
   /stripe/create-checkout-session:
     post:
+      tags: [Other]
       description: |
         Create a Stripe Checkout Session for a subscription or data pack.
 
@@ -4215,6 +4376,7 @@ paths:
 
   /verify:
     post:
+      tags: [Other]
       description: |
         One step of the validator's routing-verification protocol.
         The route accepts two body shapes:
@@ -4254,6 +4416,7 @@ paths:
 
   /verify/keys:
     get:
+      tags: [Other]
       description: |
         The published server Ed25519 verify keys, by server_key_id.
         All historical keys are listed so old proofs remain verifiable
@@ -4274,7 +4437,7 @@ paths:
 
   /verify/stats:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Public per-provider verification statistics
       description: |
         The public reproducibility index of the routing-verification protocol:
@@ -4323,7 +4486,7 @@ paths:
 
   /verify/proofs:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Published trail proofs
       description: |
         The published completed trails, so anyone can re-verify them against
@@ -4366,6 +4529,7 @@ paths:
 
   /sn/wallet:
     post:
+      tags: [Other]
       description: |
         Attach the caller's subnet coldkey - the ss58 address that pool payouts
         are claimable by. Proof of key possession is required: `message` is the
@@ -4410,6 +4574,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/SnSetWalletResult"
     get:
+      tags: [Other]
       description: |
         The coldkeys attached inside the caller's network: the network consent,
         the hotkey entry and the network-level wallet (no `client_id`) and
@@ -4440,6 +4605,7 @@ paths:
 
   /sn/wallet/consent:
     post:
+      tags: [Other]
       description: |
         Issue a per-provider wallet mapping consent: the exact message the
         coldkey signs to receive one provider client's earnings for the
@@ -4468,6 +4634,7 @@ paths:
 
   /sn/wallet/consent/history:
     post:
+      tags: [Other]
       description: |
         The retained signed consents of one provider client, generation 1
         through `generation`, for a caller that already holds the chain head
@@ -4493,6 +4660,7 @@ paths:
 
   /sn/wallet/network-consent:
     post:
+      tags: [Other]
       description: |
         Issue a network wallet mapping consent: the exact message the coldkey
         signs once to receive the earnings of every provider client of the
@@ -4523,6 +4691,7 @@ paths:
 
   /sn/wallet/network-consent/history:
     post:
+      tags: [Other]
       description: |
         The retained signed network consents of one network, generation 1
         through `generation`, for a caller that already holds the chain head
@@ -4546,6 +4715,7 @@ paths:
 
   /sn/wallet/hotkey-consent:
     post:
+      tags: [Other]
       description: |
         Store a hotkey wallet consent chain: a coldkey's approval, signed once
         for every operator of the subnet, that the networks which delegate to
@@ -4585,6 +4755,7 @@ paths:
 
   /sn/wallet/hotkey-consent/history:
     post:
+      tags: [Other]
       description: |
         The stored hotkey wallet consents of one hotkey on this operator's
         subnet, generation 1 through `generation`, for a caller that already
@@ -4609,6 +4780,7 @@ paths:
 
   /sn/wallet/hotkey-delegation:
     post:
+      tags: [Other]
       description: |
         Issue a hotkey delegation: the exact message the hotkey signs to
         receive the earnings of every provider client of the caller's network,
@@ -4643,6 +4815,7 @@ paths:
 
   /sn/wallet/hotkey-delegation/history:
     post:
+      tags: [Other]
       description: |
         The retained signed hotkey delegations of one network, generation 1
         through `generation`, for a caller that already holds the chain head
@@ -4667,6 +4840,7 @@ paths:
 
   /sn/wallet/validate:
     post:
+      tags: [Other]
       description: |
         Checks an address before it is attached: ss58 syntax with the Bittensor
         prefix, the operator ban list, and whether the account exists on the
@@ -4692,6 +4866,7 @@ paths:
 
   /sn/head:
     get:
+      tags: [Other]
       description: |
         The caller network's standing for a head mining spot (Top 200,
         WHITEPAPER 8.4). `score` is the server's estimate of split-adjusted
@@ -4714,6 +4889,7 @@ paths:
 
   /sn/head/binding:
     post:
+      tags: [Other]
       description: |
         Store a device's consent for a fleet binding (WHITEPAPER 11.4): the
         canonical binding payload and the client's Ed25519 signature over its
@@ -4740,6 +4916,7 @@ paths:
 
   /sn/pool/claim:
     get:
+      tags: [Other]
       description: |
         The caller network's merkle pool-payout claim for an epoch:
         everything needed to call claim on the subnet contract.
@@ -4766,6 +4943,7 @@ paths:
 
   /sn/epoch:
     get:
+      tags: [Other]
       description: |
         The current subnet epoch index, boundaries, and deadlines mirrored
         from chain, so clients do not need their own RPC.
@@ -4783,7 +4961,7 @@ paths:
 
   /sn/artifact:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: One immutable payout artifact by content hash
       description: |
         Serve a canonical payout artifact addressed by its sha256 content
@@ -4816,7 +4994,7 @@ paths:
 
   /sn/artifacts:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Page the payout artifact history
       description: |
         List immutable payout artifact keys under a deployment and netuid
@@ -4881,7 +5059,7 @@ paths:
 
   /sn/attempt-artifact:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Stream one typed attempt object
       description: |
         Stream the exact immutable bytes of one attempt object. `kind` selects
@@ -4940,7 +5118,7 @@ paths:
         "503":
           description: The artifact reader or store is unavailable.
     post:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Stage one typed attempt object
       description: |
         Upload the exact bytes of one attempt object. Requires a CLIENT jwt.
@@ -5021,7 +5199,7 @@ paths:
 
   /sn/evidence:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: One signed release-evidence envelope
       description: |
         Serve a signed release-evidence envelope by its content hash. The
@@ -5052,7 +5230,8 @@ paths:
         "503":
           description: The artifact store is unavailable.
     post:
-      tags: [subnet evidence]
+      tags: [Other]
+      x-internal: true
       summary: Publish a signed release-evidence envelope
       description: |
         Publish a release-evidence envelope. There is no header credential:
@@ -5081,7 +5260,7 @@ paths:
 
   /sn/evidence/history:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Page one run's evidence history
       description: |
         List the evidence objects of ONE signed run. Both `kind` and `run_id`
@@ -5152,7 +5331,7 @@ paths:
 
   /sn/client-key/observation:
     post:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Publish one client-key observation
       description: |
         Publish one signed client-key observation and read back that client's
@@ -5193,7 +5372,7 @@ paths:
 
   /sn/client-key/observations:
     post:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Publish a batch of client-key observations
       description: |
         The plural form of `/sn/client-key/observation`, with the same
@@ -5238,7 +5417,7 @@ paths:
 
   /onboarding/offer/issue:
     post:
-      tags: [onboarding]
+      tags: [Other]
       summary: Issue the welcome offer
       description: |
         Issue the caller's welcome offer: 25% off the first year of Pro (3
@@ -5323,7 +5502,7 @@ paths:
 
   /client/events:
     post:
-      tags: [analytics]
+      tags: [Other]
       summary: Store a batch of product events
       description: |
         Store a batch of product events (at most 200 per call) against the
@@ -5418,7 +5597,7 @@ paths:
 
   /onboarding/click:
     post:
-      tags: [onboarding, analytics]
+      tags: [Other]
       summary: Record a campaign landing click
       description: |
         Record a campaign landing-page click. Every onboarding email link is
@@ -5483,7 +5662,7 @@ paths:
 
   /onboarding/feedback/{token}:
     get:
-      tags: [onboarding]
+      tags: [Other]
       summary: Resolve a feedback link token
       description: |
         Resolve a feedback link token (`https://ur.io/f/<token>?r=n` or
@@ -5555,7 +5734,7 @@ paths:
 
   /subscription/stripe/payment-sheet:
     post:
-      tags: [subscription, onboarding]
+      tags: [Subscription]
       summary: Prepare an inline Stripe payment sheet
       description: |
         Prepare an inline Stripe PaymentSheet purchase of Pro (the non-Play
@@ -5640,7 +5819,7 @@ paths:
 
   /subscription/stripe/prices:
     get:
-      tags: [subscription, onboarding]
+      tags: [Subscription]
       summary: Stripe prices for the caller's tier
       description: |
         The Stripe price ids (and USD amounts) of the caller's regional tier,
@@ -5684,7 +5863,8 @@ paths:
 
   /admin/onboarding/results:
     get:
-      tags: [analytics]
+      tags: [Other]
+      x-internal: true
       summary: Aggregated onboarding experiment results
       description: |
         The nightly aggregate the analysis script (mmm/onboarding/analyze.mjs)
@@ -5840,7 +6020,8 @@ paths:
 
   /admin/onboarding/email-tracker:
     get:
-      tags: [analytics]
+      tags: [Other]
+      x-internal: true
       summary: Per-flow-step email send and engagement aggregate
       description: |
         The durable per-flow-step send and engagement aggregate of the
@@ -5928,7 +6109,8 @@ paths:
 
   /admin/onboarding/experiments:
     get:
-      tags: [analytics]
+      tags: [Other]
+      x-internal: true
       summary: The experiment registry as loaded
       description: |
         The onboarding experiment registry (config/main/onboarding.yml
@@ -5984,7 +6166,8 @@ paths:
 
   /updates/brevo:
     post:
-      tags: [analytics]
+      tags: [Other]
+      x-internal: true
       summary: Brevo transactional webhook
       description: |
         The Brevo transactional-email webhook. Brevo is registered
@@ -6042,7 +6225,7 @@ paths:
 
   /.well-known/oauth-authorization-server:
     get:
-      tags: [oauth]
+      tags: [Other]
       summary: Authorization server metadata
       description: |
         The rfc 8414 authorization server metadata. Served with
@@ -6062,7 +6245,7 @@ paths:
 
   /.well-known/openid-configuration:
     get:
-      tags: [oauth]
+      tags: [Other]
       summary: OpenID Connect discovery
       description: |
         The OpenID Connect discovery document. The same document as
@@ -6079,7 +6262,7 @@ paths:
 
   /.well-known/jwks.json:
     get:
-      tags: [oauth]
+      tags: [Other]
       summary: The signing keys
       description: |
         The authorization server's public signing keys as a JWK set. All
@@ -6096,7 +6279,7 @@ paths:
 
   /oauth/token:
     post:
-      tags: [oauth]
+      tags: [Other]
       summary: Exchange a code or refresh token
       description: |
         The rfc 6749 token endpoint, as a form post. Two grants are supported:
@@ -6170,7 +6353,7 @@ paths:
 
   /oauth/register:
     post:
-      tags: [oauth]
+      tags: [Other]
       summary: Dynamic client registration
       description: |
         Dynamic client registration (rfc 7591). Deprecated by the MCP
@@ -6213,7 +6396,7 @@ paths:
 
   /oauth/revoke:
     post:
-      tags: [oauth]
+      tags: [Other]
       summary: Revoke a refresh token
       description: |
         Token revocation (rfc 7009), as a form post. Always answers `200` with
@@ -6243,7 +6426,7 @@ paths:
 
   /oauth/userinfo:
     get:
-      tags: [oauth]
+      tags: [Other]
       summary: OpenID Connect userinfo
       description: |
         The OpenID Connect userinfo endpoint. Authenticated by an ACCESS TOKEN
@@ -6276,7 +6459,7 @@ paths:
 
   /oauth/consent:
     post:
-      tags: [oauth]
+      tags: [Other]
       summary: Describe an authorization request to the consent page
       description: |
         What the consent page on the ur.io origin needs to render: who is
@@ -6323,7 +6506,7 @@ paths:
 
   /oauth/authorize:
     post:
-      tags: [oauth]
+      tags: [Other]
       summary: Mint an authorization code for an approved request
       description: |
         Mint the authorization code for a request the user approved, and
