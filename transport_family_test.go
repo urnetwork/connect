@@ -947,6 +947,8 @@ func TestControlFamilyPolicyChangeNotifies(t *testing.T) {
 type testingH3Connection struct {
 	remoteFamily int
 	intent       int32
+	// the QUIC version the connection negotiated (A13)
+	version quic.Version
 }
 
 // testingH3Platform is a QUIC platform bound to one loopback address. It
@@ -962,6 +964,13 @@ type testingH3Platform struct {
 }
 
 func newTestingH3Platform(t *testing.T, ipVersion int) *testingH3Platform {
+	t.Helper()
+	return newTestingH3PlatformWithVersions(t, ipVersion, nil)
+}
+
+// The same platform accepting only the QUIC versions given; nil accepts
+// quic-go's default of both (A13).
+func newTestingH3PlatformWithVersions(t *testing.T, ipVersion int, versions []quic.Version) *testingH3Platform {
 	t.Helper()
 	host := testLoopbackIp(ipVersion)
 	certPem, keyPem, err := selfSign([]string{host}, host, 24*time.Hour, 24*time.Hour)
@@ -979,7 +988,10 @@ func newTestingH3Platform(t *testing.T, ipVersion int) *testingH3Platform {
 			Certificates: []tls.Certificate{cert},
 			NextProtos:   []string{nextProto},
 		},
-		&quic.Config{MaxIdleTimeout: 30 * time.Second},
+		&quic.Config{
+			MaxIdleTimeout: 30 * time.Second,
+			Versions:       versions,
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1024,7 +1036,11 @@ func newTestingH3Platform(t *testing.T, ipVersion int) *testingH3Platform {
 				if writeErr != nil {
 					return
 				}
-				platform.remotes <- testingH3Connection{remoteFamily: remoteFamily, intent: intent}
+				platform.remotes <- testingH3Connection{
+					remoteFamily: remoteFamily,
+					intent:       intent,
+					version:      conn.ConnectionState().Version,
+				}
 				for {
 					message, err := framer.Read(stream)
 					if err != nil {

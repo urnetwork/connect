@@ -102,6 +102,8 @@ func DefaultConnectSettings() *ConnectSettings {
 		ControlFamilyFirstHandshakeTimeout: 8 * time.Second,
 		ControlFamilyRetryReserve:          5 * time.Second,
 
+		QuicVersionPolicy: QuicVersionPolicyPreferV2,
+
 		TlsConfig:                 tlsConfig,
 		TlsClientHelloFingerprint: TlsClientHelloFingerprintChrome,
 	}
@@ -170,6 +172,11 @@ type ConnectSettings struct {
 	//
 	// <= 0 disables the bound.
 	ControlFamilyRetryReserve time.Duration
+
+	// The QUIC versions the extender udp and dns carriers and the alt api
+	// dialers offer (A13, net_quic_version.go). The zero value and an unknown
+	// value offer version 2 first with version 1 behind it.
+	QuicVersionPolicy QuicVersionPolicy
 
 	TlsConfig *tls.Config
 

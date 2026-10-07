@@ -36,10 +36,24 @@ const (
 type testAltServer struct {
 	altUrl  string
 	rootCAs *x509.CertPool
+	// the version each accepted connection negotiated, in accept order (A13)
+	versions chan quic.Version
 
 	stateLock   sync.Mutex
 	serverNames []string
 	alpns       [][]string
+}
+
+// The version the next accepted connection negotiated.
+func (self *testAltServer) nextVersion(t *testing.T) quic.Version {
+	t.Helper()
+	select {
+	case version := <-self.versions:
+		return version
+	case <-time.After(10 * time.Second):
+		t.Fatal("alt accepted no connection")
+		return 0
+	}
 }
 
 // Records one client hello, which is where the sni and the offered alpn are
@@ -72,6 +86,18 @@ func newTestAltServer(t *testing.T, whodis bool) *testAltServer {
 // udp endpoint per dial and must narrow it to the destination's family.
 func newTestAltServerFamily(t *testing.T, whodis bool, loopbackIp string) *testAltServer {
 	t.Helper()
+	return newTestAltServerWithVersions(t, whodis, loopbackIp, nil)
+}
+
+// The same fixture accepting only the QUIC versions given; nil accepts
+// quic-go's default of both (A13).
+func newTestAltServerWithVersions(
+	t *testing.T,
+	whodis bool,
+	loopbackIp string,
+	versions []quic.Version,
+) *testAltServer {
+	t.Helper()
 	certPem, keyPem, err := selfSign([]string{testAltApiHost}, "alt-test", 1*time.Hour, 24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +110,10 @@ func newTestAltServerFamily(t *testing.T, whodis bool, loopbackIp string) *testA
 	if !rootCAs.AppendCertsFromPEM(certPem) {
 		t.Fatal("the fixture certificate is not a usable root")
 	}
-	altServer := &testAltServer{rootCAs: rootCAs}
+	altServer := &testAltServer{
+		rootCAs:  rootCAs,
+		versions: make(chan quic.Version, 16),
+	}
 
 	packetConn, err := net.ListenPacket("udp", net.JoinHostPort(loopbackIp, "0"))
 	if err != nil {
@@ -129,7 +158,10 @@ func newTestAltServerFamily(t *testing.T, whodis bool, loopbackIp string) *testA
 				return nil, nil
 			},
 		},
-		&quic.Config{MaxIdleTimeout: 30 * time.Second},
+		&quic.Config{
+			MaxIdleTimeout: 30 * time.Second,
+			Versions:       versions,
+		},
 	)
 	if err != nil {
 		cancel()
@@ -142,6 +174,10 @@ func newTestAltServerFamily(t *testing.T, whodis bool, loopbackIp string) *testA
 			quicConn, err := listener.Accept(ctx)
 			if err != nil {
 				return
+			}
+			select {
+			case altServer.versions <- quicConn.ConnectionState().Version:
+			default:
 			}
 			go func() {
 				defer quicConn.CloseWithError(0, "")
@@ -164,6 +200,17 @@ func newTestAltServerFamily(t *testing.T, whodis bool, loopbackIp string) *testA
 // one path to take.
 func newTestAltStrategy(t *testing.T, altServer *testAltServer) *ClientStrategy {
 	t.Helper()
+	return newTestAltStrategyWithSettings(t, altServer, nil)
+}
+
+// The same strategy with configure run over its settings after the fixture's
+// own, before the strategy is built.
+func newTestAltStrategyWithSettings(
+	t *testing.T,
+	altServer *testAltServer,
+	configure func(settings *ClientStrategySettings),
+) *ClientStrategy {
+	t.Helper()
 	settings := DefaultClientStrategySettings()
 	settings.EnableNormal = false
 	settings.EnableResilient = false
@@ -173,6 +220,9 @@ func newTestAltStrategy(t *testing.T, altServer *testAltServer) *ClientStrategy 
 	settings.ConnectSettings.TlsConfig = &tls.Config{
 		RootCAs:    altServer.rootCAs,
 		MinVersion: tls.VersionTLS13,
+	}
+	if configure != nil {
+		configure(settings)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	clientStrategy := NewClientStrategy(ctx, settings)

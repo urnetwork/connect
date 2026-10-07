@@ -3643,3 +3643,72 @@ migration, no services version, no rpc version.
   negative = off) and publishes the counts. Known-failing at HEAD and
   unrelated: the root package's mobile memory-accounting test that the
   `Admission` test pattern also selects.
+
+- **A13, QUIC version 2 on the udp carriers and the h3 dialers
+  (2026-10-07).** What changed: the client dial of the udp 443 and dns
+  carriers (A1; `dialExtenderQuic`, whose config `newExtenderQuicMemoryPolicy`
+  builds), the alt h3 and whodis dialers (L4; `dialAltQuicAttemptWithReservation`)
+  and the platform h3 transport (`newPlatformQuicConfig`) offer QUIC version
+  2 (RFC 9369, `0x6b3343cf`) first with version 1 behind it, and the
+  extender's udp carrier listener (`serveQuicCarrier`, the udp 443 and the
+  dns socket alike since they share the loop per A1) accepts both. Why: the
+  GFW (since 2024-04-07) and the TSPU decrypt a version 1 Initial with the
+  RFC 9001 salt to read the sni and drop a forbidden name; both parsers key
+  on that salt, so a version 2 Initial is not decrypted and the carrier
+  survives in both countries as of 2026. quic-go v0.61.0 offers `Versions[0]`
+  in the first Initial, accepts every version listed, and on a Version
+  Negotiation packet re-dials with the first of its own list the server
+  named, so a version 1 only peer is still reached at the cost of one round
+  trip and a version 1 only client (an older app) is still accepted.
+  Decisions: one policy per owner, `QuicVersionPolicy` (`net_quic_version.go`;
+  `prefer-v2` the default, `v1`, `v2`) on `ConnectSettings` for the extender
+  carriers and the alt dialers, on `PlatformTransportSettings` for the
+  platform h3 transport, and on `ExtenderSettings` for the listener, which
+  its NLayer hop dials (A11) inherit so one switch governs a whole extender;
+  the zero value and an unknown value are the default, so a settings struct
+  built without its defaults function, or a misspelled switch, offers version
+  2 rather than disabling a carrier; the extender dial takes the offer of its
+  own connect settings, not of the platform transport whose settings size
+  its windows; the policy is applied where each config is finalized, not on
+  the http3 template alt hands down, so the bare `quic.Config` fallback of
+  `altQuicBoundedTransport` cannot leave an attempt on version 1. Carrier
+  priorities are unchanged: QUIC stays one racer among many, since version
+  2 helps in China and Russia only (QUIC is blocked outright in Iran's
+  shutdowns and volume-banned in Turkmenistan). Source port rotation: a
+  failed attempt poisons its 4-tuple for 180 s at the GFW and 420 s at the
+  TSPU; each `dialExtenderQuic` already opens its own endpoint
+  (`openExtenderPacketConn`: the injected factory, else a fresh wildcard
+  socket) and closes it on failure before any retry runs, so a retry never
+  reuses the poisoned 4-tuple and no code changed; a host that injects a
+  `PacketConnFactory` decides its own ports. quic-go's own re-dial after a
+  Version Negotiation packet stays on the same endpoint, which is right: the
+  server answered, nothing is poisoned. Not guarded: the operating system
+  reissuing a just-closed ephemeral port (random on Linux, sequential on
+  Apple platforms). The sdk inherits the default through
+  `DefaultConnectSettings`, `DefaultPlatformTransportSettings` and
+  `extender.DefaultExtenderSettings` with no change; the switch is not
+  exposed to the apps. The platform server and alt (server repo, the same
+  quic-go, no `Versions` set) accept both by quic-go's default, so the h3
+  transport and the alt dialers handshake on version 2 against them without
+  a negotiation. Tests (connect `net_quic_version_test.go`, extender
+  `extender_quic_version_test.go`), every observation on the wire bytes of
+  the client's own udp endpoint or on the version the peer negotiated: the
+  first datagram's long-header version per policy at every construction
+  site -- the extender udp carrier, the alt h3 dialer, the platform h3
+  transport -- and the peer's negotiated version; the fallback against a
+  version 1 only extender, alt and platform (version 2 first, a Version
+  Negotiation packet read, version 1 negotiated); forced `v2` against a
+  version 1 only extender failing with `VersionNegotiationError` and never
+  sending a version 1 Initial; the listener accepting what its policy lists
+  and answering a Version Negotiation packet that names the accepted
+  versions for an excluded one; the full carrier handshaking on version 2
+  against the extender fixture with no negotiation; the hop dial inheriting
+  the policy; the defaults; and the rotation, against an in-process extender
+  that refuses the first source port for good with the failed endpoint kept
+  bound, so the retry's different port is the dial's doing. With the five
+  wiring lines reverted the first datagram is `0x00000001` at every site and
+  12 of the 14 tests fail; with the endpoint memoized across dials the
+  rotation test fails on the refused retry. Phased: nothing in connect. Not
+  done: an app setting for the switch, and a wire-level test of the dns
+  carrier's offer (its datagrams are dns-encoded; it dials the same
+  `policy.quicConfig` the udp carrier is proven on).

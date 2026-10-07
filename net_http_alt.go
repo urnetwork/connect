@@ -361,6 +361,9 @@ func dialAltQuicAttemptWithReservation(
 	// per attempt: a race runs several dials against one config
 	boundedQuicConfig := quicConfig.Clone()
 	policy.boundReceiveConfig(boundedQuicConfig)
+	// the version offer is the dial's whatever template http3 handed down,
+	// so no alt attempt stays on the decryptable version 1 Initial (A13)
+	boundedQuicConfig.Versions = connectSettings.QuicVersionPolicy.Versions()
 	installQuicSendFlight(boundedQuicConfig)
 	conn, err := attempt.quicTransport.Dial(ctx, udpAddr, tlsConfig.Clone(), boundedQuicConfig)
 	if err != nil {

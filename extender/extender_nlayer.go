@@ -146,6 +146,9 @@ func (self *ExtenderServer) newNLayerConnectSettings() *connect.ConnectSettings 
 		connectSettings.HandshakeTimeout = min(connectSettings.HandshakeTimeout, dialTimeout)
 		connectSettings.RequestTimeout = min(connectSettings.RequestTimeout, dialTimeout)
 	}
+	// one kill switch per extender: a hop dial offers what this extender's
+	// own carriers accept (A13)
+	connectSettings.QuicVersionPolicy = self.settings.QuicVersionPolicy
 	return connectSettings
 }
 
