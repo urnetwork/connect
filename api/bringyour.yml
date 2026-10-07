@@ -136,7 +136,7 @@ paths:
         Redirect (303) to the canonical privacy policy on bringyour.com.
         The api serves the redirect so a client that only knows the api host
         can still reach the policy.
-      operationId: Privacy Txt
+      operationId: privacyTxt
       security: []
       responses:
         "303":
@@ -150,7 +150,7 @@ paths:
     get:
       description: |
         Redirect (303) to the canonical terms of service on bringyour.com.
-      operationId: Terms Txt
+      operationId: termsTxt
       security: []
       responses:
         "303":
@@ -165,7 +165,7 @@ paths:
       description: |
         Redirect (303) to the vulnerability disclosure policy on
         bringyour.com.
-      operationId: Vdp Txt
+      operationId: vdpTxt
       security: []
       responses:
         "303":
@@ -187,7 +187,7 @@ paths:
         an error, so an operator-initiated drain is not counted as a service
         error). `host`, `service` and `block` name the process that answered,
         and `client_address` is the caller address it observed.
-      operationId: Warp Status
+      operationId: warpStatus
       security: []
       responses:
         "200":
@@ -204,7 +204,7 @@ paths:
         on or after the start of subnet block 9.
         The counter advances when contracts reach a final outcome and is
         intended for public clients polling every 1-5 seconds.
-      operationId: Clock
+      operationId: clock
       security: []
       responses:
         "200":
@@ -221,7 +221,7 @@ paths:
       description: |
         Get network statistics for the last 90 days.
         The statistics are updated approximately every 60s.
-      operationId: Stats Last 90
+      operationId: statsLast90
       security: []
       responses:
         "200":
@@ -258,7 +258,7 @@ paths:
         Like `/stats/last-90` this serves a redis-exported blob rather than a
         live query, refreshed every 5 minutes by the `ExportProvidersMap`
         task, so it never touches the database on the request path.
-      operationId: Stats Providers Map
+      operationId: statsProvidersMap
       security: []
       responses:
         "200":
@@ -275,7 +275,7 @@ paths:
       description: |
         Get all providers in the caller network.
         Each provider includes stats from the last 24 hours.
-      operationId: Stats Providers
+      operationId: statsProviders
       security:
         - BearerAuth: []
       responses:
@@ -291,7 +291,7 @@ paths:
       description: |
         Get all providers in the caller network.
         Each provider includes stats from the last n hours.
-      operationId: Stats Providers Last N hours
+      operationId: statsProvidersLastNHours
       security:
         - BearerAuth: []
       requestBody:
@@ -313,7 +313,7 @@ paths:
       description: |
         Get detailed stats on a single provider in the caller network.
         This is meant to give the user complete visibility over usage.
-      operationId: Stats Provider Last N hours
+      operationId: statsProviderLastNHours
       security:
         - BearerAuth: []
       requestBody:
@@ -335,7 +335,7 @@ paths:
       description: |
         Get a network-wide time series aggregated across all providers in the
         caller network, over the last n hours.
-      operationId: Stats Providers Overview Last N hours
+      operationId: statsProvidersOverviewLastNHours
       security:
         - BearerAuth: []
       requestBody:
@@ -358,7 +358,7 @@ paths:
         Legacy alias of `/stats/providers-overview-last-n` with the lookback
         fixed at 90 days, kept for callers that predate the route migration.
         New callers should use `/stats/providers-overview-last-n`.
-      operationId: Stats Providers Overview Last 90
+      operationId: statsProvidersOverviewLast90
       security:
         - BearerAuth: []
       responses:
@@ -377,7 +377,7 @@ paths:
         `lookback` is served with a 90-day lookback; otherwise it behaves
         exactly like `/stats/provider-last-n`. New callers should use
         `/stats/provider-last-n`.
-      operationId: Stats Provider Last 90
+      operationId: statsProviderLast90
       security:
         - BearerAuth: []
       requestBody:
@@ -398,7 +398,7 @@ paths:
     post:
       description: |
         Fetches top 100 current leaderboard. This data is refreshed every payout.
-      operationId: Stats Leaderboard
+      operationId: statsLeaderboard
       security:
         - BearerAuth: []
       requestBody:
@@ -441,7 +441,7 @@ paths:
         In the list itself the caller's row is anonymous like everyone
         else's until it opts in: the caller sees what everyone sees, and the
         apps only highlight that row.
-      operationId: Stats Points Leaderboard
+      operationId: statsPointsLeaderboard
       # optional auth: anonymous callers get the list, a bearer adds `me`
       security:
         - {}
@@ -482,7 +482,7 @@ paths:
         `error.code` `signature_mismatch` when the request sets
         `result_errors`, as a 200. Without it, that refusal is a 401 with a
         plain text body. Every other wallet refusal keeps its HTTP status.
-      operationId: Auth Login
+      operationId: authLogin
       security: []
       requestBody:
         required: true
@@ -514,7 +514,7 @@ paths:
         both the raw text and the polkadot-js `<Bytes>…</Bytes>`-wrapped form
         of the signature verify, and the unwrapped text is what the client
         submits. Rate limited per client address. See server/BITTENSOR-LOGIN.md.
-      operationId: Auth Wallet Challenge
+      operationId: authWalletChallenge
       security: []
       requestBody:
         required: true
@@ -543,7 +543,7 @@ paths:
         This is the older, narrower anti-replay token. `/auth/wallet-challenge`
         supersedes it: that one returns the exact message text to sign and
         binds the challenge to a blockchain and an address.
-      operationId: Auth Wallet Nonce
+      operationId: authWalletNonce
       security: []
       responses:
         "200":
@@ -557,7 +557,7 @@ paths:
     post:
       description: |
         Password login for email and phone number.
-      operationId: Auth Login With Password
+      operationId: authLoginWithPassword
       security: []
       requestBody:
         required: true
@@ -577,7 +577,7 @@ paths:
     post:
       description: |
         Verify ownership of email or phone number.
-      operationId: Auth Verify
+      operationId: authVerify
       security: []
       requestBody:
         required: true
@@ -598,7 +598,7 @@ paths:
       description: |
         Refresh the client JWT (by_jwt) for the caller's client.
         Requires a client JWT (from `/network/auth-client`).
-      operationId: Auth Refresh Token
+      operationId: authRefreshToken
       security:
         - BearerAuth: []
       responses:
@@ -619,7 +619,7 @@ paths:
         `retry_after_seconds`). Without it, a rate limit is a 429 and a failed
         send is a 502, both with a plain text body. Clients must not report a
         code as sent unless the response is a 200 without `error`.
-      operationId: Auth Verify Send
+      operationId: authVerifySend
       security: []
       requestBody:
         required: true
@@ -655,7 +655,7 @@ paths:
         failed send is a 502, both with a plain text body. Clients must not
         report a reset code as sent unless the response is a 200 without
         `error`.
-      operationId: Auth Password Reset
+      operationId: authPasswordReset
       security: []
       requestBody:
         required: true
@@ -684,7 +684,7 @@ paths:
     post:
       description: |
         Change password.
-      operationId: Auth Password Set
+      operationId: authPasswordSet
       security: []
       requestBody:
         required: true
@@ -710,7 +710,7 @@ paths:
         - at most 50 characters
         - only lowercase letters, digits and dashes
         and must not be within one edit of an existing network name.
-      operationId: Auth Network Check
+      operationId: authNetworkCheck
       security: []
       requestBody:
         required: true
@@ -776,7 +776,7 @@ paths:
     post:
       description: |
         Delete network
-      operationId: Auth Network Delete
+      operationId: authNetworkDelete
       security:
         - BearerAuth: []
       responses:
@@ -796,7 +796,7 @@ paths:
         and will be expired with any of the caller's sessions.
         This is a subset of an OAuth flow. For the full OAuth 2.1 / OpenID
         Connect flow see the `oauth` routes.
-      operationId: Auth Code Create
+      operationId: authCodeCreate
       security:
         - BearerAuth: []
       requestBody:
@@ -986,7 +986,7 @@ paths:
         The returned session is tied to the session that created the auth code,
         and will be expired with any of the creator's sessions.
         This is a subset of an OAuth flow.
-      operationId: Auth Code Login
+      operationId: authCodeLogin
       security: []
       requestBody:
         required: true
@@ -1015,7 +1015,7 @@ paths:
         wallet signature that does not verify for `wallet_address` over the
         challenge (in practice the wallet signed with another account than
         the address entered) has `error.code` `signature_mismatch`.
-      operationId: Auth Add Auth
+      operationId: authAddAuth
       security:
         - BearerAuth: []
       requestBody:
@@ -1037,7 +1037,7 @@ paths:
       description: |
         Remove an authentication method from the calling user. The last
         remaining method cannot be removed.
-      operationId: Auth Remove Auth
+      operationId: authRemoveAuth
       security:
         - BearerAuth: []
       requestBody:
@@ -1059,7 +1059,7 @@ paths:
       description: |
         Generate a recovery seedphrase for the calling user. Fails if a
         seedphrase auth already exists; see /auth/regenerate-seedphrase.
-      operationId: Auth Generate Seedphrase
+      operationId: authGenerateSeedphrase
       security:
         - BearerAuth: []
       responses:
@@ -1075,7 +1075,7 @@ paths:
       description: |
         Replace the calling user's recovery seedphrase with a new one,
         invalidating the previous seedphrase.
-      operationId: Auth Regenerate Seedphrase
+      operationId: authRegenerateSeedphrase
       security:
         - BearerAuth: []
       responses:
@@ -1153,7 +1153,7 @@ paths:
     post:
       description: |
         Remove a client from the network.
-      operationId: Remove Network Client
+      operationId: removeNetworkClient
       security:
         - BearerAuth: []
       requestBody:
@@ -1191,7 +1191,7 @@ paths:
         `already_in_progress` when this network already has a background run
         going, and `too_many_concurrent_runs` when the deployment-wide cap on
         concurrent runs is reached.
-      operationId: Remove Network Clients
+      operationId: removeNetworkClients
       security:
         - BearerAuth: []
       requestBody:
@@ -1251,7 +1251,7 @@ paths:
         carries the extender's own freshly signed record and up to 8 signed
         records of other active extenders, which is the only bootstrap an app
         has before it has any peer.
-      operationId: Extender Activate
+      operationId: extenderActivate
       security:
         - BearerAuth: []
       requestBody:
@@ -1292,7 +1292,7 @@ paths:
         from. An empty `continent_code` or `country_code` is an address the
         operator cannot place, which a client treats as no hint rather than
         as a place.
-      operationId: Extender Hint
+      operationId: extenderHint
       security: []
       responses:
         "200":
@@ -1335,7 +1335,7 @@ paths:
         or repeats one already stored (same extender, provider and nonce) is
         counted in `rejected` and not named. A report of more than 256
         attestations is refused whole.
-      operationId: Extender Latency Report
+      operationId: extenderLatencyReport
       security:
         - BearerAuth: []
       requestBody:
@@ -1430,7 +1430,7 @@ paths:
         - Provide status
 
         `proxy_client` is never present on this list.
-      operationId: Network Clients
+      operationId: networkClients
       security:
         - BearerAuth: []
       responses:
@@ -1449,7 +1449,7 @@ paths:
         each with its `proxy_client` credentials (proxy URLs, auth token,
         WireGuard details). Same row shape as `/network/clients` otherwise:
         resident status, connections, provide status.
-      operationId: Network Proxies
+      operationId: networkProxies
       security:
         - BearerAuth: []
       responses:
@@ -1472,7 +1472,7 @@ paths:
 
         Allowed for network sessions and top-level client sessions.
         A client session's own client is excluded from the list.
-      operationId: Network Peers
+      operationId: networkPeers
       security:
         - BearerAuth: []
       responses:
@@ -1487,7 +1487,7 @@ paths:
     post:
       description: |
         Set account preferences.
-      operationId: Preferences Set
+      operationId: preferencesSet
       security:
         - BearerAuth: []
       requestBody:
@@ -1508,7 +1508,7 @@ paths:
     get:
       description: |
         Get account preferences.
-      operationId: Preferences Get
+      operationId: preferencesGet
       security:
         - BearerAuth: []
       responses:
@@ -1523,7 +1523,7 @@ paths:
     post:
       description: |
         Feedback.
-      operationId: Feedback Send
+      operationId: feedbackSend
       security:
         - BearerAuth: []
       requestBody:
@@ -1547,7 +1547,7 @@ paths:
         The request body is the raw log file content, streamed to storage.
         Note the `{clientId}` path segment is actually the feedback id the log
         is attached to.
-      operationId: Log Upload
+      operationId: logUpload
       security:
         - BearerAuth: []
       parameters:
@@ -1581,7 +1581,7 @@ paths:
         provider using `/network/find-providers2`.
         `groups` carries the promoted location groups that apply to the caller;
         `/network/find-provider-locations` always returns it empty.
-      operationId: Network Provider Locations
+      operationId: networkProviderLocations
       security: []
       responses:
         "200":
@@ -1600,7 +1600,7 @@ paths:
         and the tolerance can be tuned in the input.
         Note that a location or group will need to be mapped to an actual provider
         using `/network/find-providers2`.
-      operationId: Network Find Provider Locations
+      operationId: networkFindProviderLocations
       security: []
       requestBody:
         required: true
@@ -1623,7 +1623,7 @@ paths:
         which are active and in good health.
         This allows random iteration by using the exclude input to mark
         visited providers.
-      operationId: Network Find Providers 2
+      operationId: networkFindProviders2
       security: []
       requestBody:
         required: true
@@ -1647,7 +1647,7 @@ paths:
         settings (`points_leaderboard_public`, `emoji_tag`) and its points
         ranks (`rank_points`, `rank_blocks`, `rank_streak`; 0 until the
         network has points and a ranking snapshot exists).
-      operationId: Network Get Ranking
+      operationId: networkGetRanking
       security:
         - BearerAuth: []
 
@@ -1663,7 +1663,7 @@ paths:
     post:
       description: |
         Allow network to toggle leaderboard ranking visibility
-      operationId: Network Ranking Visibility
+      operationId: networkRankingVisibility
       security:
         - BearerAuth: []
       requestBody:
@@ -1687,7 +1687,7 @@ paths:
         network with points is ranked and listed either way; this switch only
         decides whether its row shows the network name or "Anonymous". The
         emoji tag (/network/emoji) shows on the row regardless.
-      operationId: Network Points Ranking Visibility
+      operationId: networkPointsRankingVisibility
       security:
         - BearerAuth: []
       requestBody:
@@ -1712,7 +1712,7 @@ paths:
         flags). Letters, digits and punctuation are rejected with the message
         "Use 1 to 6 emoji.". An empty string clears the tag. The tag is shown
         on the points leaderboard row and in the network's own header.
-      operationId: Network Set Emoji Tag
+      operationId: networkSetEmojiTag
       security:
         - BearerAuth: []
       requestBody:
@@ -1733,7 +1733,7 @@ paths:
     post:
       description: |
         Block providing to a location
-      operationId: Network Block Location
+      operationId: networkBlockLocation
       security:
         - BearerAuth: []
       requestBody:
@@ -1754,7 +1754,7 @@ paths:
     post:
       description: |
         Unblock providing to a location
-      operationId: Network Unblock Location
+      operationId: networkUnblockLocation
       security:
         - BearerAuth: []
       requestBody:
@@ -1774,7 +1774,7 @@ paths:
   /network/blocked-locations:
     get:
       description: Get list locations to block from providing for the network
-      operationId: Network Blocked Locations
+      operationId: networkBlockedLocations
       security:
         - BearerAuth: []
       responses:
@@ -1788,7 +1788,7 @@ paths:
   /network/reliability:
     get:
       description: Get network reliability stats
-      operationId: Network Reliability
+      operationId: networkReliability
       security:
         - BearerAuth: []
       responses:
@@ -1815,7 +1815,7 @@ paths:
 
         Anti-abuse checks are reported only as the generic reason
         `not_eligible`. Which check applies is never returned.
-      operationId: Network Provider Status
+      operationId: networkProviderStatus
       security:
         - BearerAuth: []
       responses:
@@ -1830,7 +1830,7 @@ paths:
     get:
       description: |
         Get the user and configured auth methods for the caller network.
-      operationId: Get Network User
+      operationId: getNetworkUser
       security:
         - BearerAuth: []
       responses:
@@ -1845,7 +1845,7 @@ paths:
     post:
       description: |
         Update the caller network's name.
-      operationId: Update Network Name
+      operationId: updateNetworkName
       security:
         - BearerAuth: []
       requestBody:
@@ -1882,7 +1882,7 @@ paths:
         Each provider carries the country and region it is published under,
         so the prober draws its sample only from the destinations compatible
         with that place.
-      operationId: Provider Egress Location Due
+      operationId: providerEgressLocationDue
       security:
         - OperatorSecret: []
       parameters:
@@ -1937,7 +1937,7 @@ paths:
         A submission without `exit_ip` -- the retired vendor-consensus shape
         -- is refused with a 400; the legacy fields are accepted and ignored
         for one release. The body is capped at 16 KiB.
-      operationId: Provider Egress Location Submit
+      operationId: providerEgressLocationSubmit
       security:
         - OperatorSecret: []
       requestBody:
@@ -1973,7 +1973,7 @@ paths:
         is already implied by the stored location. Without this, a provider
         that can never be probed successfully would sort to the head of the
         due queue on every poll forever.
-      operationId: Provider Egress Location Attempt
+      operationId: providerEgressLocationAttempt
       security:
         - OperatorSecret: []
       requestBody:
@@ -2009,7 +2009,7 @@ paths:
         provider carries the place it is published under. A check is three
         small loads through the provider's tunnel, so the batches are much
         larger than the egress-location ones.
-      operationId: Provider Blackhole Check Due
+      operationId: providerBlackholeCheckDue
       security:
         - OperatorSecret: []
       parameters:
@@ -2062,7 +2062,7 @@ paths:
         once. A check marked `not_measured` -- its tunnel was gone and could
         not be re-created -- counts nothing and only reschedules the
         provider.
-      operationId: Submit Provider Blackhole Checks
+      operationId: submitProviderBlackholeChecks
       security:
         - OperatorSecret: []
       requestBody:
@@ -2093,7 +2093,7 @@ paths:
         byte count matters; the content is a small repeating block streamed
         under a limit reader and never materialized. Operator-gated so the
         deployment is not a free public speed-test target.
-      operationId: Provider Bandwidth Test
+      operationId: providerBandwidthTest
       security:
         - OperatorSecret: []
       parameters:
@@ -2133,7 +2133,7 @@ paths:
         reservation that lands in a LATER bucket is cancelled again and the
         request answered 429 with `Retry-After` pointing at the bucket that
         does have room; without that the hourly ceiling would be decorative.
-      operationId: Provider Bandwidth Reserve
+      operationId: providerBandwidthReserve
       security:
         - OperatorSecret: []
       requestBody:
@@ -2178,7 +2178,7 @@ paths:
         one would let this endpoint overwrite a derived figure with an
         asserted one. A non-positive rate or sample size is refused rather
         than allowed to overwrite a real measurement.
-      operationId: Provider Bandwidth Result
+      operationId: providerBandwidthResult
       security:
         - OperatorSecret: []
       requestBody:
@@ -2227,7 +2227,7 @@ paths:
         `reputation_failed_names` are accepted, always zero from a current
         prober, and ignored, and a `reputation` key inside `class_results` is
         still refused.
-      operationId: Provider Egress Health Result
+      operationId: providerEgressHealthResult
       security:
         - OperatorSecret: []
       requestBody:
@@ -2267,7 +2267,7 @@ paths:
 
         The first request seeds an empty pool from the prober's built-in
         table, so the route never serves nothing for want of a refresh.
-      operationId: Provider Egress Destinations
+      operationId: providerEgressDestinations
       security:
         - OperatorSecret: []
       responses:
@@ -2293,7 +2293,7 @@ paths:
         so the reporting network is taken from the session jwt and never from
         the body. A met quorum only brings the provider's next probe forward.
         Unknown fields in the body are rejected.
-      operationId: Provider Client Verdict Submit
+      operationId: providerClientVerdictSubmit
       security:
         - BearerAuth: []
       requestBody:
@@ -2331,7 +2331,7 @@ paths:
         client jwt has not been minted or was cleared for re-provisioning),
         which the prober must be able to tell from a failure -- so it is a 404
         rather than an empty 200.
-      operationId: Prober Credential
+      operationId: proberCredential
       security:
         - OperatorSecret: []
       responses:
@@ -2377,7 +2377,7 @@ paths:
         indistinguishable from "this server does not implement the endpoint".
         This endpoint is read-only; nothing here ever accepts a pin from a
         request.
-      operationId: Geolocation Source Pins
+      operationId: geolocationSourcePins
       security:
         - OperatorSecret: []
       responses:
@@ -2396,7 +2396,7 @@ paths:
         Get the balance for the USDC user custody wallet.
         The user custody wallet allows URnetwork to query the balance,
         but the user must take actions against the wallet.
-      operationId: Wallet Balance
+      operationId: walletBalance
       security:
         - BearerAuth: []
       responses:
@@ -2414,7 +2414,7 @@ paths:
         This can be used to check whether an address can receive
         a transfer out from the user custody wallet.
         Please use this before initiating any transfer out to avoid lost funds.
-      operationId: Wallet Validate Address
+      operationId: walletValidateAddress
       security:
         - BearerAuth: []
       requestBody:
@@ -2436,7 +2436,7 @@ paths:
       description: |
         Initialize the Circle USDC user self custody wallet.
         This starts a process that must be completed by the user.
-      operationId: Wallet Circle Init
+      operationId: walletCircleInit
       security:
         - BearerAuth: []
       responses:
@@ -2453,7 +2453,7 @@ paths:
         Set up a transfer from the Circle USDC user self custody wallet
         to an address.
         This starts a process that must be completed by the user.
-      operationId: Wallet Circle Transfer Out
+      operationId: walletCircleTransferOut
       security:
         - BearerAuth: []
       requestBody:
@@ -2528,7 +2528,7 @@ paths:
 
         The result is cached per network for 60 seconds; cancel and resume
         invalidate it.
-      operationId: Subscription Details
+      operationId: subscriptionDetails
       security:
         - BearerAuth: []
       responses:
@@ -2549,7 +2549,7 @@ paths:
         subscriptions page in `manage_url`. Idempotent: an already-cancelling
         subscription is not written again. Every refusal carries a stable
         `error.code` (SubscriptionError) beside its `error.message`.
-      operationId: Subscription Cancel
+      operationId: subscriptionCancel
       security:
         - BearerAuth: []
       requestBody:
@@ -2571,7 +2571,7 @@ paths:
       description: |
         Undo /subscription/cancel while the paid period is still running: the
         Stripe subscription renews again. Same request and result shapes.
-      operationId: Subscription Resume
+      operationId: subscriptionResume
       security:
         - BearerAuth: []
       requestBody:
@@ -2592,7 +2592,7 @@ paths:
     post:
       description: |
         Check if the balance code is valid.
-      operationId: Subscription Check Balance Code
+      operationId: subscriptionCheckBalanceCode
       security:
         - BearerAuth: []
       requestBody:
@@ -2613,7 +2613,7 @@ paths:
     post:
       description: |
         Redeem the balance code and add the transfer balance to the caller network.
-      operationId: Subscription Redeem Balance Code
+      operationId: subscriptionRedeemBalanceCode
       security:
         - BearerAuth: []
       requestBody:
@@ -2636,7 +2636,7 @@ paths:
         Creates an anonymous payment identifier to be used with purchases.
         This keeps network information out of the payment processor system.
         For example in Google Play this is called the "obfuscated account id".
-      operationId: Subscription Create Payment Id
+      operationId: subscriptionCreatePaymentId
       security:
         - BearerAuth: []
       requestBody:
@@ -2676,7 +2676,7 @@ paths:
 
         Shares a per-account budget with the Apple endpoint; every attempt
         counts, including failures.
-      operationId: Subscription Verify Play Purchase
+      operationId: subscriptionVerifyPlayPurchase
       security:
         - BearerAuth: []
       requestBody:
@@ -2721,7 +2721,7 @@ paths:
         Cheap validation runs first, then the shared per-account budget, then
         the cryptographic verification -- so a malformed request burns no
         budget and an over-budget caller burns no CPU.
-      operationId: Subscription Verify Apple Transaction
+      operationId: subscriptionVerifyAppleTransaction
       security:
         - BearerAuth: []
       requestBody:
@@ -2753,7 +2753,7 @@ paths:
         triggering a `402`. Prices come from `pro.yml`, never from the x402
         configuration, so an agent is quoted the same number a human pays by
         card; a sku with no price is not offered at all.
-      operationId: X402 Skus
+      operationId: x402Skus
       security: []
       responses:
         "200":
@@ -2779,7 +2779,7 @@ paths:
         The same 402 round trip is also carried inline by
         `POST /network/auth-client`, where an agent meets the plan's
         concurrent-client limit.
-      operationId: X402 Purchase
+      operationId: x402Purchase
       security:
         - BearerAuth: []
       parameters:
@@ -2834,7 +2834,7 @@ paths:
         URnetwork JWT. The subscription is granted here, never by the client.
         Only the fields the server reads are listed; Stripe sends a much
         larger event.
-      operationId: Stripe Webhook
+      operationId: stripeWebhook
       security: []
       requestBody:
         required: true
@@ -2859,7 +2859,7 @@ paths:
         `X-CC-Webhook-Signature` HMAC over the raw body with the shared
         secret, checked before the event is parsed. Only the fields the server
         reads are listed.
-      operationId: Coinbase Webhook
+      operationId: coinbaseWebhook
       security: []
       requestBody:
         required: true
@@ -2887,7 +2887,7 @@ paths:
         itself is base64 inside `message.data`; the server decodes it and
         credits the renewal through the same advisory-lock gate as
         `/subscription/verify-play-purchase` and the payment reconciler.
-      operationId: Play Webhook
+      operationId: playWebhook
       security: []
       requestBody:
         required: true
@@ -2928,7 +2928,7 @@ paths:
         failure is reported only after the whole batch is examined, as a
         non-2xx, so Helius redelivers everything; the already-credited
         intents are no-ops on the retry.
-      operationId: Helius Webhook
+      operationId: heliusWebhook
       security: []
       requestBody:
         required: true
@@ -2956,7 +2956,7 @@ paths:
         `X-Circle-Signature` ECDSA signature over the raw body under the key
         named by `X-Circle-Key-Id`. Deprecated; it is the same handler as
         `POST /account/circle-wallet`.
-      operationId: Circle Webhook
+      operationId: circleWebhook
       security: []
       requestBody:
         required: true
@@ -2984,7 +2984,7 @@ paths:
         whose event is a completed `INITIALIZE` links the created wallet to
         the network named by the challenge's correlation id. Same handler as
         `POST /pay/circle`.
-      operationId: Circle Wallet Webhook
+      operationId: circleWalletWebhook
       security: []
       requestBody:
         required: true
@@ -3023,7 +3023,7 @@ paths:
         Anything that fails is a `400` with no detail. A verified notification
         answers `200` with an empty object, whether or not it changed
         anything.
-      operationId: Apple Notification
+      operationId: appleNotification
       security: []
       requestBody:
         required: true
@@ -3050,7 +3050,7 @@ paths:
         The code provided can be either adoption code or a share code.
         Once a code is added, the device becomes an associated device until confirmation.
         If the device is a shared device, it will remain an associated device after confirmation.
-      operationId: Device Add
+      operationId: deviceAdd
       security:
         - BearerAuth: []
       requestBody:
@@ -3071,7 +3071,7 @@ paths:
     post:
       description: |
         Creates a code to share a device.
-      operationId: Device Create Share Code
+      operationId: deviceCreateShareCode
       security:
         - BearerAuth: []
       requestBody:
@@ -3093,7 +3093,7 @@ paths:
       description: |
         A QR code that maps to a URL to add the shared device.
         Send it to someone to scan to add the device.
-      operationId: Device Share Code QR
+      operationId: deviceShareCodeQr
       security:
         - BearerAuth: []
       parameters:
@@ -3120,7 +3120,7 @@ paths:
         - unassociated
         - associated pending confirmation
         - associated
-      operationId: Device Share Status
+      operationId: deviceShareStatus
       security:
         - BearerAuth: []
       requestBody:
@@ -3142,7 +3142,7 @@ paths:
       description: |
         Confirm the share of a device.
         This must be called from the side that initiates the share.
-      operationId: Device Confirm Share
+      operationId: deviceConfirmShare
       security:
         - BearerAuth: []
       requestBody:
@@ -3164,7 +3164,7 @@ paths:
       description: |
         Creates a code to adopt a device.
         The adopt code is valid for a limited time.
-      operationId: Device Create Adopt Code
+      operationId: deviceCreateAdoptCode
       security: []
       requestBody:
         required: true
@@ -3185,7 +3185,7 @@ paths:
       description: |
         A QR code that maps to a URL to adopt the device.
         Send it to someone to scan to adopt the device.
-      operationId: Device Adopt Code QR
+      operationId: deviceAdoptCodeQr
       security: []
       parameters:
         - in: path
@@ -3211,7 +3211,7 @@ paths:
         - unassociated
         - associated pending confirmation
         - associated
-      operationId: Device Adopt Status
+      operationId: deviceAdoptStatus
       security: []
       requestBody:
         required: true
@@ -3232,7 +3232,7 @@ paths:
       description: |
         Confirm the adoption of a device.
         This must be called from the side that initiates the adoption.
-      operationId: Device Confirm Adopt
+      operationId: deviceConfirmAdopt
       security: []
       requestBody:
         required: true
@@ -3253,7 +3253,7 @@ paths:
       description: |
         Remove an adopt code.
         This must be called from the side that initiates the adoption.
-      operationId: Remove Adopt Code
+      operationId: removeAdoptCode
       security: []
       requestBody:
         required: true
@@ -3277,7 +3277,7 @@ paths:
         - pending adoption devices
         - incoming shared devices (not owned by the caller network)
         - outgoing shared devices (owned by the caller network)
-      operationId: Device Associations
+      operationId: deviceAssociations
       security:
         - BearerAuth: []
       responses:
@@ -3296,7 +3296,7 @@ paths:
         - pending adoption device
         - incoming shared device (not owned by the caller network)
         - outgoing shared device (owned by the caller network)
-      operationId: Device Remove Association
+      operationId: deviceRemoveAssociation
       security:
         - BearerAuth: []
       requestBody:
@@ -3318,7 +3318,7 @@ paths:
       description: |
         Set the name of the association.
         To set the name of devices owned by the network, use `/device/set-name`.
-      operationId: Device Set Association Name
+      operationId: deviceSetAssociationName
       security:
         - BearerAuth: []
       requestBody:
@@ -3340,7 +3340,7 @@ paths:
       description: |
         Sets the name of a device owned by the network.
         To set the name of devices shared with the network, use `/device/set-association-name`.
-      operationId: Network Set Device Name
+      operationId: networkSetDeviceName
       security:
         - BearerAuth: []
       requestBody:
@@ -3362,7 +3362,7 @@ paths:
       description: |
         Redirect (303) to the single sign-on (SSO) start URL.
         Used to begin the browser SSO/OAuth flow.
-      operationId: Auth Connect
+      operationId: authConnect
       security: []
       responses:
         "303":
@@ -3375,7 +3375,7 @@ paths:
       description: |
         Redirect (303) to the single sign-on (SSO) start URL.
         Used to begin the browser SSO/OAuth flow.
-      operationId: Auth Connect Post
+      operationId: authConnectPost
       security: []
       responses:
         "303":
@@ -3391,7 +3391,7 @@ paths:
         Out-of-band control messages for the connect protocol.
         Blocking request-response control messages need to be handled out-of-band
         to resolve the possibility of dedlocks in the client sequence.
-      operationId: Connect Control
+      operationId: connectControl
       security:
         - BearerAuth: []
       requestBody:
@@ -3415,7 +3415,7 @@ paths:
         Unauthenticated by design - the value is a public key meant to be
         fetchable by any peer. A client that has never published a key
         returns `{"public_key": null}` with HTTP 200.
-      operationId: Get Client Key
+      operationId: getClientKey
       security: []
       parameters:
         - in: path
@@ -3453,7 +3453,7 @@ paths:
         error: an error is an availability signal, and a consumer must not
         confuse the two. At most 64 registrations, and at most 1 MiB, are
         returned.
-      operationId: Get Client Key History
+      operationId: getClientKeyHistory
       security: []
       parameters:
         - in: path
@@ -3485,7 +3485,7 @@ paths:
         request itself travelled through an untrusted extender -- and the
         extender activation probe forwards a real `GET /hello` through the
         candidate's tcp carrier to prove the forward works.
-      operationId: Hello
+      operationId: hello
       security: []
       responses:
         "200":
@@ -3505,7 +3505,7 @@ paths:
         GeoLite2 data created by MaxMind, available from
         https://www.maxmind.com. The database has no privacy/VPN
         classification, so none is returned.
-      operationId: My IP Info
+      operationId: myIpInfo
       security: []
       responses:
         "200":
@@ -3520,7 +3520,7 @@ paths:
       description: |
         Change the network name of the calling network. The previous name
         enters a reclaim cooldown. Subject to the account action rate limit.
-      operationId: Account Change Name
+      operationId: accountChangeName
       security:
         - BearerAuth: []
       requestBody:
@@ -3545,7 +3545,7 @@ paths:
         consume any of the rename budget, and vice versa. Renaming a name that
         is still inside its reclaim cooldown is charged to the change-name
         budget instead.
-      operationId: Account Claim Name
+      operationId: accountClaimName
       security:
         - BearerAuth: []
       requestBody:
@@ -3566,7 +3566,7 @@ paths:
     post:
       description: |
         Create an API key for the account.
-      operationId: Account Create API Key
+      operationId: accountCreateApiKey
       security:
         - BearerAuth: []
       requestBody:
@@ -3587,7 +3587,7 @@ paths:
     post:
       description: |
         Remove an API key for the account.
-      operationId: Account Remove API Key
+      operationId: accountRemoveApiKey
       security:
         - BearerAuth: []
       requestBody:
@@ -3609,7 +3609,7 @@ paths:
       description: |
         Fetches a list of API keys associated with the account.
         The list does not include the API key secrets, only metadata.
-      operationId: Account Get API Keys
+      operationId: accountGetApiKeys
       security:
         - BearerAuth: []
       responses:
@@ -3624,7 +3624,7 @@ paths:
     post:
       description: |
         Set an existing account wallet as the wallet to receive network payments.
-      operationId: Account Set Payout Wallet
+      operationId: accountSetPayoutWallet
       security:
         - BearerAuth: []
       requestBody:
@@ -3643,7 +3643,7 @@ paths:
     get:
       description: |
         Fetches the payout wallet associated with the network
-      operationId: Account Get Payout Wallet
+      operationId: accountGetPayoutWallet
       security:
         - BearerAuth: []
       responses:
@@ -3658,7 +3658,7 @@ paths:
     get:
       description: |
         Retrieves account points earned. Eventually, users will be able to convert points for tokens
-      operationId: Account Get Points
+      operationId: accountGetPoints
       security:
         - BearerAuth: []
       responses:
@@ -3673,7 +3673,7 @@ paths:
     get:
       description: |
         Retrieves list of account payments
-      operationId: Account Get Payouts
+      operationId: accountGetPayouts
       security:
         - BearerAuth: []
       responses:
@@ -3689,7 +3689,7 @@ paths:
       description: |
         Create a new wallet for your network. You can then use it as a payout wallet
         by posting to /account/payout-wallet.
-      operationId: Account Create Wallet
+      operationId: accountCreateWallet
       security:
         - BearerAuth: []
       requestBody:
@@ -3710,7 +3710,7 @@ paths:
     get:
       description: |
         Get a list of wallets associated with your network
-      operationId: Account Get Wallets
+      operationId: accountGetWallets
       security:
         - BearerAuth: []
       responses:
@@ -3729,7 +3729,7 @@ paths:
         network the payout wallet, when there is one, and names it in
         `payout_wallet_id`; otherwise USDC payouts are held until a payout
         wallet is set.
-      operationId: Account Remove Wallet
+      operationId: accountRemoveWallet
       security:
         - BearerAuth: []
       requestBody:
@@ -3753,7 +3753,7 @@ paths:
         validating a signed message. Either holding succeeds; a wallet with
         neither is refused with `error.message` and `error.code`
         `seeker_token_not_found`.
-      operationId: Account Verify Seeker Token
+      operationId: accountVerifySeekerToken
       security:
         - BearerAuth: []
       requestBody:
@@ -3774,7 +3774,7 @@ paths:
     get:
       description: |
         Fetch balance codes redeemed by network
-      operationId: Account Balance Codes
+      operationId: accountBalanceCodes
       security:
         - BearerAuth: []
       responses:
@@ -3792,7 +3792,7 @@ paths:
         inside each epoch's wall-clock window and the network's share of the
         operator pool in basis points (0 when no coldkey was attached, i.e.
         points only). `limit` defaults to 26 and is capped at 104.
-      operationId: Account Epochs
+      operationId: accountEpochs
       security:
         - BearerAuth: []
       parameters:
@@ -3813,7 +3813,7 @@ paths:
     get:
       description: |
         Unique network code to refer new users
-      operationId: Account Referral Code
+      operationId: accountReferralCode
       security:
         - BearerAuth: []
       responses:
@@ -3832,7 +3832,7 @@ paths:
         so no authentication is required; a bearer token, if sent, is ignored.
         Checks are budgeted per caller address (60 per 10 minutes) and across
         all callers; over budget the response is 429 with a Retry-After header.
-      operationId: Validate Referral Code
+      operationId: validateReferralCode
       security: []
       requestBody:
         required: true
@@ -3854,7 +3854,7 @@ paths:
     get:
       description: |
         Get the network that was referred the authenticated network
-      operationId: Account Referral Network
+      operationId: accountReferralNetwork
       security:
         - BearerAuth: []
       responses:
@@ -3869,7 +3869,7 @@ paths:
     get:
       description: |
         Unlink the referral network from the authenticated network.
-      operationId: Account Unlink Referral Network
+      operationId: accountUnlinkReferralNetwork
       security:
         - BearerAuth: []
       responses:
@@ -3884,7 +3884,7 @@ paths:
     post:
       description: |
         Set the parent referral network for the authenticated network.
-      operationId: Account Set Referral
+      operationId: accountSetReferral
       security:
         - BearerAuth: []
       requestBody:
@@ -3905,7 +3905,7 @@ paths:
     get:
       description: |
         Retrieves the paid and unpaid byte count provided to the network
-      operationId: Transfer Stats
+      operationId: transferStats
       security:
         - BearerAuth: []
       responses:
@@ -4001,7 +4001,7 @@ paths:
         A legacy guest network (no sign-in method) is refused with
         `error.code` `guest_sign_in_required` (PurchaseError); a payment that
         could not be started with `start_failed`.
-      operationId: Stripe Payment Intent
+      operationId: stripePaymentIntent
       security:
         - BearerAuth: []
       requestBody:
@@ -4025,7 +4025,7 @@ paths:
         subscription. A refusal carries a stable `error.code`
         (SubscriptionError: `no_customer`, `store_unavailable`) beside its
         `error.message`.
-      operationId: Stripe Customer Portal
+      operationId: stripeCustomerPortal
       security:
         - BearerAuth: []
       requestBody:
@@ -4065,7 +4065,7 @@ paths:
         `item=<item_id>` and, when applying to a network, `network=<name>`.
         Unauthenticated, per-ip rate limited. Errors are returned as
         `error.message` with a 200.
-      operationId: Pay Data Checkout
+      operationId: payDataCheckout
       security: []
       requestBody:
         content:
@@ -4089,7 +4089,7 @@ paths:
         similarity check, a name within a few characters of an existing one is
         NOT reported as existing. Returns only the canonical name, no id.
         Unauthenticated, per-ip rate limited.
-      operationId: Pay Data Network Lookup
+      operationId: payDataNetworkLookup
       security: []
       requestBody:
         content:
@@ -4137,7 +4137,7 @@ paths:
         with a 200, and a stable `error.code` beside it (PurchaseError:
         `invalid_request`, `network_not_found` and the others). Unauthenticated,
         per-ip rate limited (`rate_limited`).
-      operationId: Pay Data Solana Intent
+      operationId: payDataSolanaIntent
       security: []
       requestBody:
         content:
@@ -4161,7 +4161,7 @@ paths:
         when the intent passed `expires_at` unpaid, `unknown` for a reference
         that is not a data pack intent (plan intents made by a signed-in wallet
         are not reported here). Unauthenticated, per-ip rate limited.
-      operationId: Pay Data Solana Status
+      operationId: payDataSolanaStatus
       security: []
       requestBody:
         content:
@@ -4196,7 +4196,7 @@ paths:
         `error.code` `guest_sign_in_required` (PurchaseError). Every other
         refusal carries its own code too, for example `already_subscribed`,
         `plan_unavailable` or `start_failed`.
-      operationId: Stripe Create Checkout Session
+      operationId: stripeCreateCheckoutSession
       security:
         - BearerAuth: []
       requestBody:
@@ -4228,7 +4228,7 @@ paths:
         A non-final step returns the assign result (the server's signed
         commitment to the next hop); the final step returns status "complete"
         and the published proof.
-      operationId: Verify
+      operationId: verify
       security: []
       requestBody:
         required: true
@@ -4258,7 +4258,7 @@ paths:
         The published server Ed25519 verify keys, by server_key_id.
         All historical keys are listed so old proofs remain verifiable
         across key rotations.
-      operationId: Verify Keys
+      operationId: verifyKeys
       security: []
       responses:
         "200":
@@ -4287,7 +4287,7 @@ paths:
 
         Unauthenticated, and it does not participate in validator scoring.
         `503` while the subnet subsystem is disabled.
-      operationId: Verify Stats
+      operationId: verifyStats
       security: []
       parameters:
         - in: query
@@ -4330,7 +4330,7 @@ paths:
         the keys from `/verify/keys`. Same window parameters, profile and
         policy hash as `/verify/stats`. Unauthenticated; `503` while the
         subnet subsystem is disabled.
-      operationId: Verify Proofs
+      operationId: verifyProofs
       security: []
       parameters:
         - in: query
@@ -4393,7 +4393,7 @@ paths:
         (a network JWT) and without `client_id`. A hotkey delegation is signed
         by the hotkey it names, not by a coldkey: `signature` is the hotkey's
         sr25519 signature and `coldkey_ss58` is the hotkey's ss58 address.
-      operationId: Sn Set Wallet
+      operationId: snSetWallet
       security:
         - BearerAuth: []
       requestBody:
@@ -4427,7 +4427,7 @@ paths:
         else the network-level copy; for a network session the network
         consent, else the hotkey entry, else the network-level copy. Absent
         when none is attached. An empty `wallets` list is not an error.
-      operationId: Sn Get Wallet
+      operationId: snGetWallet
       security:
         - BearerAuth: []
       responses:
@@ -4449,7 +4449,7 @@ paths:
         unchanged, with the coldkey's sr25519 signature, to POST /sn/wallet.
         A provider's own consent effective at an epoch takes precedence over
         the network consent.
-      operationId: Sn Wallet Mapping Challenge
+      operationId: snWalletMappingChallenge
       security:
         - BearerAuth: []
       requestBody:
@@ -4475,7 +4475,7 @@ paths:
         does not match is refused; the server never selects the newest
         consent as authority. No authentication: the consents are public
         evidence.
-      operationId: Sn Wallet Mapping History
+      operationId: snWalletMappingHistory
       security: []
       requestBody:
         required: true
@@ -4504,7 +4504,7 @@ paths:
         unchanged, with the coldkey's sr25519 signature and without
         `client_id`, to POST /sn/wallet. A later consent replaces the earlier
         one from its `from_epoch`; there is no unsigned revocation.
-      operationId: Sn Network Wallet Mapping Challenge
+      operationId: snNetworkWalletMappingChallenge
       security:
         - BearerAuth: []
       requestBody:
@@ -4528,7 +4528,7 @@ paths:
         through `generation`, for a caller that already holds the chain head
         from an independent source. As for /sn/wallet/consent/history, a head
         that does not match is refused and no authentication is required.
-      operationId: Sn Network Wallet Mapping History
+      operationId: snNetworkWalletMappingHistory
       security: []
       requestBody:
         required: true
@@ -4566,7 +4566,7 @@ paths:
         operator doesn't have yet (more is refused with 400; submit successive
         prefixes of the chain instead). Resubmitting or extending a hotkey the
         network already linked is always allowed.
-      operationId: Sn Hotkey Wallet Mapping Consent
+      operationId: snHotkeyWalletMappingConsent
       security:
         - BearerAuth: []
       requestBody:
@@ -4591,7 +4591,7 @@ paths:
         holds the chain head from an independent source. As for
         /sn/wallet/consent/history, a head that does not match is refused and
         no authentication is required.
-      operationId: Sn Hotkey Wallet Mapping History
+      operationId: snHotkeyWalletMappingHistory
       security: []
       requestBody:
         required: true
@@ -4624,7 +4624,7 @@ paths:
         the hotkey's sr25519 signature and without `client_id`, to POST
         /sn/wallet. A later delegation replaces the earlier one from its
         `from_epoch` and may name another hotkey.
-      operationId: Sn Hotkey Network Delegation Challenge
+      operationId: snHotkeyNetworkDelegationChallenge
       security:
         - BearerAuth: []
       requestBody:
@@ -4649,7 +4649,7 @@ paths:
         from an independent source. Each original's `signature` is the
         hotkey's. As for /sn/wallet/consent/history, a head that does not
         match is refused and no authentication is required.
-      operationId: Sn Hotkey Network Delegation History
+      operationId: snHotkeyNetworkDelegationHistory
       security: []
       requestBody:
         required: true
@@ -4674,7 +4674,7 @@ paths:
         `exists_on_chain: true` with a message, so an outage never blocks a
         user. No authentication; chain lookups are rate limited per source
         address.
-      operationId: Sn Validate Wallet
+      operationId: snValidateWallet
       security: []
       requestBody:
         required: true
@@ -4701,7 +4701,7 @@ paths:
         `bound`/`hotkey`/`uid` reflect an active head binding. `source` is
         "server" until validators publish consensus scores on chain; a chain
         outage degrades to the estimate, never an error.
-      operationId: Sn Head
+      operationId: snHead
       security:
         - BearerAuth: []
       responses:
@@ -4721,7 +4721,7 @@ paths:
         When both signatures verify the response carries the
         `bindFleetMember` calldata for the operator to submit from their own
         key. The server never submits on chain.
-      operationId: Sn Head Binding
+      operationId: snHeadBinding
       security:
         - BearerAuth: []
       requestBody:
@@ -4744,7 +4744,7 @@ paths:
         The caller network's merkle pool-payout claim for an epoch:
         everything needed to call claim on the subnet contract.
         Claims are served once the epoch is finalized on chain.
-      operationId: Sn Pool Claim
+      operationId: snPoolClaim
       security:
         - BearerAuth: []
       parameters:
@@ -4769,7 +4769,7 @@ paths:
       description: |
         The current subnet epoch index, boundaries, and deadlines mirrored
         from chain, so clients do not need their own RPC.
-      operationId: Sn Epoch
+      operationId: snEpoch
       security: []
       responses:
         "200":
@@ -4791,7 +4791,7 @@ paths:
         returned, so a corrupt object store cannot silently substitute a
         different payout tree. Public and immutable: the answer carries the
         content hash as its `ETag` and a one-year immutable cache directive.
-      operationId: Sn Artifact
+      operationId: snArtifact
       security: []
       parameters:
         - in: query
@@ -4826,7 +4826,7 @@ paths:
         served: keys must be strictly increasing, inside the requested prefix,
         and named by a canonical lowercase 32-byte hex hash with a `.json`
         suffix.
-      operationId: Sn Artifact History
+      operationId: snArtifactHistory
       security: []
       parameters:
         - in: query
@@ -4897,7 +4897,7 @@ paths:
         `Retry-After`. A stream that fails after any bytes have been written
         is aborted without a clean end-of-body rather than ending in a
         truncated object that looks complete.
-      operationId: Sn Attempt Artifact
+      operationId: snAttemptArtifact
       security: []
       parameters:
         - in: query
@@ -4963,7 +4963,7 @@ paths:
         client authentication.
 
         The answer is `204` with the content hash in `ETag`.
-      operationId: Sn Upload Attempt Artifact
+      operationId: snUploadAttemptArtifact
       security:
         - BearerAuth: []
       parameters:
@@ -5028,7 +5028,7 @@ paths:
         envelope's signature is re-verified and its content hash re-checked
         against the requested one before the bytes are returned. Public and
         immutable, with the content hash as `ETag`.
-      operationId: Sn Evidence
+      operationId: snEvidence
       security: []
       parameters:
         - in: query
@@ -5061,7 +5061,7 @@ paths:
         id, netuid, deployment id and genesis hash must all match this
         operator. The body is capped at 64 MiB. Every rejection is the same
         `400`, so a caller cannot probe which check failed.
-      operationId: Sn Publish Evidence
+      operationId: snPublishEvidence
       security: []
       requestBody:
         required: true
@@ -5092,7 +5092,7 @@ paths:
         (signature, deployment, netuid, kind, run and content hash) rather
         than merely listed, and `after` may not be combined with it. The
         legacy empty-run namespace is readable only by exact hash.
-      operationId: Sn Evidence History
+      operationId: snEvidenceHistory
       security: []
       parameters:
         - in: query
@@ -5168,7 +5168,7 @@ paths:
         re-encoding are refused -- and the full maximum response size is
         charged against the account's byte budget before any operator
         signature or public write, so a failed call still pays its admission.
-      operationId: Sn Client Key Observation
+      operationId: snClientKeyObservation
       security:
         - BearerAuth: []
       requestBody:
@@ -5205,7 +5205,7 @@ paths:
 
         A batch whose chain work cannot be admitted is refused with `413` and
         an `X-Ur-Client-Key-Batch-Admission: work` header.
-      operationId: Sn Client Key Observations
+      operationId: snClientKeyObservations
       security:
         - BearerAuth: []
       requestBody:
@@ -6050,7 +6050,7 @@ paths:
         discovery document below. The `issuer` it publishes is the hostname
         clients must use, which is not necessarily the api host this request
         reached.
-      operationId: Oauth Server Metadata
+      operationId: oauthServerMetadata
       security: []
       responses:
         "200":
@@ -6067,7 +6067,7 @@ paths:
       description: |
         The OpenID Connect discovery document. The same document as
         `/.well-known/oauth-authorization-server`.
-      operationId: Oauth Openid Configuration
+      operationId: oauthOpenidConfiguration
       security: []
       responses:
         "200":
@@ -6084,7 +6084,7 @@ paths:
       description: |
         The authorization server's public signing keys as a JWK set. All
         current keys are listed so tokens stay verifiable across a rotation.
-      operationId: Oauth Jwks
+      operationId: oauthJwks
       security: []
       responses:
         "200":
@@ -6109,7 +6109,7 @@ paths:
         deliberately terse and the detail is logged rather than returned, so
         an error cannot be used to probe which check failed. The response is
         never cached by a shared cache.
-      operationId: Oauth Token
+      operationId: oauthToken
       security: []
       requestBody:
         required: true
@@ -6179,7 +6179,7 @@ paths:
         metered per caller address before the body is parsed or anything is
         stored; over budget it answers `429` with `Retry-After`. Registered
         clients are public, so no secret is issued.
-      operationId: Oauth Register
+      operationId: oauthRegister
       security: []
       requestBody:
         required: true
@@ -6219,7 +6219,7 @@ paths:
         Token revocation (rfc 7009), as a form post. Always answers `200` with
         an empty body: per the rfc a client must not be able to tell an
         unknown token from a revoked one.
-      operationId: Oauth Revoke
+      operationId: oauthRevoke
       security: []
       requestBody:
         required: true
@@ -6251,7 +6251,7 @@ paths:
         a URnetwork network JWT. The token's audience is the resource it was
         minted for rather than this issuer, so the audience is deliberately
         not constrained here.
-      operationId: Oauth Userinfo
+      operationId: oauthUserinfo
       security:
         - BearerAuth: []
       responses:
@@ -6292,7 +6292,7 @@ paths:
         forces the screen even when the scopes are already approved. `issuer`
         is returned so the page can echo `iss` when the user declines, as
         rfc 9207 requires on error responses too.
-      operationId: Oauth Consent
+      operationId: oauthConsent
       security:
         - BearerAuth: []
       requestBody:
@@ -6333,7 +6333,7 @@ paths:
         abandoned screen grants nothing. The redirect carries `code`, the
         request's `state` when it had one, and `iss` per rfc 9207 so the
         client can detect a mix-up attack.
-      operationId: Oauth Authorize
+      operationId: oauthAuthorize
       security:
         - BearerAuth: []
       requestBody:

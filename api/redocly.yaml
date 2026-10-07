@@ -1,25 +1,28 @@
 # Lint configuration for bringyour.yml.
 #
-# The recommended ruleset is kept as-is apart from two rules that describe a
-# house style this document does not follow, and that cannot be changed
-# without breaking consumers or rewriting the whole file:
-#
-#   operation-operationId-url-safe -- most operationIds here are human-readable
-#     phrases with spaces ("Auth Login"). They are part of the published
-#     contract that client generators key off, so renaming them is a breaking
-#     change, not a lint fix. New operations use camelCase; the old names stay.
+# The recommended ruleset is kept as-is apart from one rule that describes a
+# house style this document does not follow:
 #
 #   operation-summary -- this document carries its prose in `description`, and
-#     only the newer tagged operations add a `summary` on top of it. Requiring
-#     a summary everywhere would mean inventing 120 one-liners that repeat the
-#     first line of each description.
+#     only some operations add a `summary` on top of it. Requiring a summary
+#     everywhere would mean inventing over a hundred one-liners that repeat
+#     the first line of each description.
 #
 # Everything else, including every structural rule, is enforced. Run:
 #   npx -y @redocly/cli lint bringyour.yml
 #
-# Two rules of our own, for descriptions, which every renderer reads as
-# CommonMark (ur.io's API reference, Redoc, GitHub). A description whose
-# backticks pair up is checked outside its code spans and code blocks:
+# A rule of our own for operations, so the document stays usable by client and
+# agent-tool generators:
+#
+#   rule/operation-id-camel-case -- an operationId is lowerCamelCase
+#     ("authLogin"). The sdk's JS generator (sdk js/gen_openapi.go
+#     methodName) turns an operationId into a client method name; a renamed
+#     id must normalize to the same method name, or the generated client
+#     changes.
+#
+# Rules of our own for descriptions, which every renderer reads as CommonMark
+# (ur.io's API reference, Redoc, GitHub). A description whose backticks pair
+# up is checked outside its code spans and code blocks:
 #
 #   rule/description-wildcards-as-code -- a wildcard name such as `weight_*`
 #     or `email.*` is written as code. Bare, its `*` reads as an emphasis
@@ -32,8 +35,15 @@ extends:
   - recommended
 
 rules:
-  operation-operationId-url-safe: off
   operation-summary: off
+  rule/operation-id-camel-case:
+    subject:
+      type: Operation
+      property: operationId
+    assertions:
+      casing: camelCase
+    message: Write the operationId in lowerCamelCase, normalizing to the sdk client's existing method name.
+    severity: error
   rule/description-wildcards-as-code:
     subject:
       type: any
