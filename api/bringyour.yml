@@ -7720,9 +7720,9 @@ components:
             | URL | Auth |
             |-----|------|
             | `https://<auth_token>.<proxy_host>:<https_proxy_port>` | no auth needed when the client connects with TLS |
-            | `https://<proxy_host>:<https_proxy_port>` | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
-            | `http://<proxy_host>:<http_proxy_port>` | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
-            | `tcp://<proxy_host>:<socks_proxy_port>` | use `access_token` as the username (empty pass) |
+            | `https://<proxy_host>:<https_proxy_port>` | use HTTP Proxy-Authorization Basic with `auth_token` as the username (empty pass), or Bearer with `auth_token` as the bearer token |
+            | `http://<proxy_host>:<http_proxy_port>` | use HTTP Proxy-Authorization Basic with `auth_token` as the username (empty pass), or Bearer with `auth_token` as the bearer token |
+            | `tcp://<proxy_host>:<socks_proxy_port>` | use `auth_token` as the username (empty pass) |
             | `wg://<proxy_host>:<wg_proxy_port>` | use `wg_config.config` as the full WireGuard config file content, which contains all the necessary keys |
           allOf:
             - type: object
