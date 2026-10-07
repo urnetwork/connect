@@ -232,13 +232,11 @@ func TestExtenderCamouflageHelloConformance(t *testing.T) {
 	t.Skip("waits on the extender camouflage carrier-hello implementation branch; Layer A wired when it is on origin/main (fingerprint/README.md)")
 }
 
-// The quic Initial: the long-header version (v2), the transport parameters set
-// and order, and the first datagram's frame layout vs. Chrome's h3 Initial.
-// waits on feat/quicv2-extender-udp; needs the quic/h3 half of the shared
-// endpoint, which is itself gated on that branch (fingerprint/README.md).
-func TestQuicInitialConformance(t *testing.T) {
-	t.Skip("waits on feat/quicv2-extender-udp (quic Initial + the quic/h3 endpoint); fingerprint/README.md")
-}
+// The quic Initial comparison is WIRED, not a placeholder: feat/quicv2-extender-udp
+// has merged, so net_quic_initial_conformance_test.go drives connect's merged
+// QuicVersionPolicy to the shared QUIC endpoint and gates the first Initial's
+// long-header version. the transport parameters and frame layout remain a
+// documented next increment there (they need Initial decryption).
 
 // The egress syn / ip ttl (JA4T): that the egress SYN's OS profile is
 // consistent with the client ClientHello's OS. waits on connect/IPREAL.md's
