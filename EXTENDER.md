@@ -2865,8 +2865,9 @@ already builds it (vless_reality.go vlessRealitySealSessionId). The pieces:
   `"ur-extender-reality-x25519-v1"`, 32 bytes, through `crypto/ecdh`
   X25519().NewPrivateKey, so there is no new secret to persist and the static
   key rotates with the identity. Its public half is published in the record
-  (P6). The derivation is a pure function of the seed, so the extender, the
-  activator and the client all reach the same key from what they already hold.
+  (P6). Only the extender holds the seed, so only the extender derives the
+  private key; the activator learns the public half from the activation args
+  and the client from the signed record (P6).
 - shortId. The 8-byte `ExtenderKeyId(ed25519 public key)` that already exists
   (extender_record.go, first 8 bytes of sha256 of the key). It is not a new
   stored or published value: both ends compute it from the record's identity
@@ -3104,8 +3105,14 @@ camouflaged attempt is tried only when the config carries a `RealityPublicKey`
 (from a verified record, E5) and the fingerprint switch is not `"go"`; a config
 with no camouflage key runs the legacy attempt alone. Clock skew past the time
 window (P1) makes the camouflaged attempt fail its auth and the race fall to
-legacy, so a skewed client still reaches the extender, just without the
-camouflage. The outcome the directory records is the tcp carrier's, as the dns
+legacy. In Phase A that still reaches the extender, just without the
+camouflage. In Phase B the legacy attempt is spliced to the borrowed site and
+fails the B3 leaf check, so a skewed client loses the tcp carrier and reaches
+the extender over its udp carriers only. To keep that rare, the client seals
+with its clock corrected by a server-time offset learned from a verified source
+(the Date header of an authenticated platform API response or of a verified
+DoH answer); connect keeps no such offset today, so 14a adds one. The outcome
+the directory records is the tcp carrier's, as the dns
 race records one carrier outcome however many ports it tried, so a camouflaged
 attempt that fails neither holds the address nor spends a second slot. The
 resilient fragment and reorder wrapping (net_resilient.go) applies to the
@@ -3409,7 +3416,11 @@ Phase 5b follows 4 because both touch the server.
   catch by address (REALITY shares this); the borrowed-names list is curated
   for names plausibly hosted anywhere to narrow it, not to erase it (P5), and
   the directory stays enumerable regardless, so camouflage helps against a
-  censor that classifies traffic, not one that harvests addresses.
+  censor that classifies traffic, not one that harvests addresses. The
+  mismatch is exploited, not theoretical: users reported China blocking
+  hundreds of REALITY server addresses on 4 to 12 March 2026, apparently
+  because the borrowed name did not belong to the server's address range
+  (community reports, not a published measurement).
 - The splice sends a prober's bytes to a third-party borrowed site from many
   extender addresses; the per-subnet, per-connection byte, idle, total and
   per-target bounds of P3 keep it bounded, and the posture is off by default
