@@ -419,8 +419,8 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 				createTime:         time.Now(),
 				minimumWeight:      0.25,
 				priority:           50,
-				dialTlsContext:     newResilientDialTlsContext(&settings.ConnectSettings, true, true, clientWebSocketNextProtos),
-				httpDialTlsContext: newResilientDialTlsContext(&settings.ConnectSettings, true, true, clientHttpNextProtos),
+				dialTlsContext:     newResilientDialTlsContext(&settings.ConnectSettings, true, true, false, clientWebSocketNextProtos),
+				httpDialTlsContext: newResilientDialTlsContext(&settings.ConnectSettings, true, true, false, clientHttpNextProtos),
 				settings:           settings,
 			}
 			// fragment
@@ -430,8 +430,8 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 				createTime:         time.Now(),
 				minimumWeight:      0.25,
 				priority:           0,
-				dialTlsContext:     newResilientDialTlsContext(&settings.ConnectSettings, true, false, clientWebSocketNextProtos),
-				httpDialTlsContext: newResilientDialTlsContext(&settings.ConnectSettings, true, false, clientHttpNextProtos),
+				dialTlsContext:     newResilientDialTlsContext(&settings.ConnectSettings, true, false, false, clientWebSocketNextProtos),
+				httpDialTlsContext: newResilientDialTlsContext(&settings.ConnectSettings, true, false, false, clientHttpNextProtos),
 				settings:           settings,
 			}
 			// reorder
@@ -440,14 +440,32 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 				createTime:         time.Now(),
 				minimumWeight:      0.25,
 				priority:           50,
-				dialTlsContext:     newResilientDialTlsContext(&settings.ConnectSettings, false, true, clientWebSocketNextProtos),
-				httpDialTlsContext: newResilientDialTlsContext(&settings.ConnectSettings, false, true, clientHttpNextProtos),
+				dialTlsContext:     newResilientDialTlsContext(&settings.ConnectSettings, false, true, false, clientWebSocketNextProtos),
+				httpDialTlsContext: newResilientDialTlsContext(&settings.ConnectSettings, false, true, false, clientHttpNextProtos),
+				settings:           settings,
+			}
+			// fragment+segment: the combined mode (tls-record AND tcp-segment
+			// fragmentation). It is the one desync that beats a reassembling
+			// middlebox like russia's tspu, where record fragmentation alone
+			// or tcp segmentation alone each lose (foci 2025). It needs no raw
+			// sockets, so it is the combined mode that works inside the ios
+			// network extension and on non-root android. Priority 50, the
+			// resilient tier: it is tried after the zero-cost "fragment" dialer
+			// and alongside "reorder"/"fragment+reorder".
+			dialer4 := &clientDialer{
+				description:        "fragment+segment",
+				createTime:         time.Now(),
+				minimumWeight:      0.25,
+				priority:           50,
+				dialTlsContext:     newResilientDialTlsContext(&settings.ConnectSettings, true, false, true, clientWebSocketNextProtos),
+				httpDialTlsContext: newResilientDialTlsContext(&settings.ConnectSettings, true, false, true, clientHttpNextProtos),
 				settings:           settings,
 			}
 
 			dialers[dialer1] = true
 			dialers[dialer2] = true
 			dialers[dialer3] = true
+			dialers[dialer4] = true
 		}
 	}
 	for _, extenderConfig := range settings.ExtenderConfigs {
