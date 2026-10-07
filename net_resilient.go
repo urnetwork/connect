@@ -12,7 +12,6 @@ import (
 	// "strconv"
 	// "slices"
 
-	"crypto/tls"
 	"io"
 	// "crypto/ecdsa"
 	// "crypto/ed25519"
@@ -91,6 +90,9 @@ func newResilientDialTlsContext(
 	nextProtos []string,
 ) DialTlsContextFunction {
 	baseTlsConfig := newClientTlsConfig(connectSettings.TlsConfig, nextProtos)
+	// the Chrome hello, or Go's (net_tls_hello.go); either goes out through the
+	// fragment/reorder layer as one handshake record
+	tlsHandshaker := newClientTlsHandshaker(connectSettings.TlsClientHelloFingerprint, baseTlsConfig)
 	return func(
 		ctx context.Context,
 		network string,
@@ -117,16 +119,16 @@ func newResilientDialTlsContext(
 			// copy and extend
 			tlsConfig := baseTlsConfig.Clone()
 			tlsConfig.ServerName = host
-			tlsConn := tls.Client(rconn, tlsConfig)
 
+			var tlsConn net.Conn
 			var err error
 			func() {
 				tlsCtx, tlsCancel := context.WithTimeout(ctx, connectSettings.TlsTimeout)
 				defer tlsCancel()
-				err = tlsConn.HandshakeContext(tlsCtx)
+				// closes the tls connection, and rconn under it, on error
+				tlsConn, err = tlsHandshaker.handshake(tlsCtx, rconn, tlsConfig)
 			}()
 			if err != nil {
-				tlsConn.Close()
 				return nil, err
 			}
 			// once the stream is established, no longer need the resilient features
