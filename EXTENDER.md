@@ -1693,8 +1693,9 @@ in this order, the first match winning:
   bound -- another process holds it, such as another provider process of
   the host, or the host refuses the bind -- so the role is off and tries
   the port again every 3 minutes. `Enabled` and `Listening` read false and
-  `ListenError` names the tcp carrier. Red; the reason is the bind error.
-  An app without a label for the case renders the reason bare.
+  `ListenError` names the tcp carrier. Red; `TCP port 443 is in use by
+  another program. Trying again every few minutes: ` and the reason (the
+  bind error).
 - `error`, revoked: the role runs and the operator revoked the key.
   Red; `Revoked by the operator`.
 - `active`: at least one family is activated. Green; `Active · IPv4 and
@@ -1741,8 +1742,8 @@ N5. Strings. Keys for the apple, linux and windows platforms: `extender`
 and the ports it uses), `extender_not_providing`, `extender_setting_up`,
 `extender_active` with a `{families}` placeholder filled from the existing
 `ipv4`, `ipv6` and `ipv4_and_ipv6` keys, `extender_revoked`,
-`extender_start_failed`, `extender_listen_failed` and
-`extender_activation_failed` with an `{error}` placeholder,
+`extender_start_failed`, `extender_listen_failed`, `extender_tcp_unavailable`
+and `extender_activation_failed` with an `{error}` placeholder,
 `extender_activation_refused` with `{error}`; `Off` reuses the existing
 `off` key, and `extender_not_providing` is listed for linux and windows
 only, since the apple catalog is keyed by the English text and already
@@ -1796,7 +1797,8 @@ and never names a case the sdk did not pick:
   `LastActivationRefused` is true, else `extender_activation_failed` with
   `Reason`.
 - `error`, by `ErrorCase`: `revoked` gives `extender_revoked`; `start`
-  gives `extender_start_failed` with `Reason`; `listen` gives
+  gives `extender_start_failed` with `Reason`; `tcp_unavailable` gives
+  `extender_tcp_unavailable` with `Reason`; `listen` gives
   `extender_listen_failed` with `Reason`; `activation_refused` gives
   `extender_activation_refused` with `Reason`; `activation_failed` gives
   `extender_activation_failed` with `Reason`. A case the app does not know
