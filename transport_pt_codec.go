@@ -11,6 +11,30 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
+// The dns carrier's wire codec. A request is one standard query (opcode 0,
+// no flags) with a single TXT question whose labels are the base32hex of
+// the 18-byte pt header followed by packet bytes, under one of the carrier
+// tlds, plus an edns0 opt record in the additional section. A response is an
+// authoritative answer whose TXT records carry the base64 of the pt header
+// and packet bytes, under a name that encodes the request header it is
+// paired with, plus an opt record when the paired request carried one
+// (RFC 6891 section 7).
+//
+// Until 2026-10 a request set the aa bit and carried a second "pump"
+// question that only repeated the header, which RFC 9619 makes malformed
+// (qdcount > 1) and which a dpi box can match on. The carrier has no version
+// on the wire, so compatibility holds by construction instead: the old
+// decoder never read the header flags or the additional section and
+// discarded the pump question, so the new request decodes on it unchanged;
+// and decodeDnsRequest keeps discarding a header-only question after the
+// data question, so the old request decodes here. The opt record doubles as
+// the capability signal: a request that carries one is answered with one.
+
+// the edns0 udp payload size a request advertises and a response repeats.
+// 1232 is the fragmentation-safe size the dns community settled on (dns flag
+// day 2020) and the default of other dns carriers.
+const dnsEdnsUdpPayloadByteCount = 1232
+
 // returns the number of passes of encode needed for the packet and tld
 func encodeDnsRequestCount(packet []byte, tld []byte) int {
 
@@ -28,10 +52,12 @@ func encodeDnsRequestCount(packet []byte, tld []byte) int {
 func encodeDnsRequest(id uint16, header [18]byte, packet []byte, buf [1024]byte, tld []byte) (n int, out []byte, err error) {
 	enc := base32.HexEncoding.WithPadding(base32.NoPadding)
 
+	// a plain query: opcode 0 and no flags. aa is a response bit and rd stays
+	// clear so the exchange reads as an iterative query to an authoritative
+	// server, which is what the unchanged response (aa set, rd clear) answers.
 	b := dnsmessage.NewBuilder(buf[:0], dnsmessage.Header{
-		ID:            id,
-		OpCode:        0,
-		Authoritative: true,
+		ID:     id,
+		OpCode: 0,
 	})
 	b.EnableCompression()
 	err = b.StartQuestions()
@@ -59,6 +85,9 @@ func encodeDnsRequest(id uint16, header [18]byte, packet []byte, buf [1024]byte,
 	nameBuf = append(nameBuf, tld...)
 	name.Length = uint8(len(nameBuf))
 
+	// the one question carries the header in its first label, which is all
+	// the decoder pairs a response with. a pump request is this with no
+	// packet bytes.
 	err = b.Question(dnsmessage.Question{
 		Name:  name,
 		Type:  dnsmessage.TypeTXT,
@@ -68,21 +97,11 @@ func encodeDnsRequest(id uint16, header [18]byte, packet []byte, buf [1024]byte,
 		return
 	}
 
-	// add the header as a second question, so that each request gets a response
-	// the dns spec does not specify how two questions should be answered
-	// we add it second so that it can be dropped, but it will look like an implementation/spec error
-	// when the pump response comes to the second question instead of the first
-	pumpName := dnsmessage.Name{}
-	pumpNameBuf := pumpName.Data[:0]
-	pumpNameBuf = enc.AppendEncode(pumpNameBuf, header[:])
-	pumpNameBuf = append(pumpNameBuf, []byte(".")...)
-	pumpNameBuf = append(pumpNameBuf, tld...)
-	pumpName.Length = uint8(len(pumpNameBuf))
-	err = b.Question(dnsmessage.Question{
-		Name:  pumpName,
-		Type:  dnsmessage.TypeTXT,
-		Class: dnsmessage.ClassINET,
-	})
+	err = b.StartAdditionals()
+	if err != nil {
+		return
+	}
+	err = b.OPTResource(dnsEdnsResourceHeader(), dnsmessage.OPTResource{})
 	if err != nil {
 		return
 	}
@@ -91,7 +110,18 @@ func encodeDnsRequest(id uint16, header [18]byte, packet []byte, buf [1024]byte,
 	return
 }
 
-func decodeDnsRequest(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, header [18]byte, out []byte, tld []byte, err error, otherData bool) {
+// the opt record both ends emit: root name, the advertised udp payload size,
+// extended rcode 0, version 0, do clear.
+func dnsEdnsResourceHeader() dnsmessage.ResourceHeader {
+	var h dnsmessage.ResourceHeader
+	h.SetEDNS0(dnsEdnsUdpPayloadByteCount, dnsmessage.RCodeSuccess, false)
+	return h
+}
+
+// edns reports whether the request carried an opt record, which marks a
+// client that expects one in the paired response. A request from before
+// the single-question shape carries none.
+func decodeDnsRequest(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, header [18]byte, out []byte, tld []byte, err error, otherData bool, edns bool) {
 	enc := base32.HexEncoding.WithPadding(base32.NoPadding)
 
 	p := &dnsmessage.Parser{}
@@ -146,7 +176,10 @@ func decodeDnsRequest(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, 
 					return
 				}
 				if 0 < n && i == 0 && m <= 18 {
-					// header with no data, ignore this record
+					// a header-only question after the data question is the
+					// pump question of a request from before the
+					// single-question shape; it repeats the header already
+					// read, so ignore it. keep this while such clients exist.
 					break
 				}
 				n += m
@@ -157,12 +190,51 @@ func decodeDnsRequest(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, 
 
 	}
 
+	if !otherData {
+		edns, err = dnsAdditionalsHaveEdns(p)
+		if err != nil {
+			return
+		}
+	}
+
 	if 18 <= n {
 		header = [18]byte(out[0:18])
 		out = out[18:n]
 	}
 
 	return
+}
+
+// reports whether the message's additional section holds an opt record. The
+// parser must be positioned after the question section; the answer and
+// authority sections are skipped, which a request leaves empty.
+func dnsAdditionalsHaveEdns(p *dnsmessage.Parser) (edns bool, err error) {
+	err = p.SkipAllAnswers()
+	if err != nil {
+		return
+	}
+	err = p.SkipAllAuthorities()
+	if err != nil {
+		return
+	}
+	for {
+		var rh dnsmessage.ResourceHeader
+		rh, err = p.AdditionalHeader()
+		if err == dnsmessage.ErrSectionDone {
+			err = nil
+			return
+		}
+		if err != nil {
+			return
+		}
+		if rh.Type == dnsmessage.TypeOPT {
+			edns = true
+		}
+		err = p.SkipAdditional()
+		if err != nil {
+			return
+		}
+	}
 }
 
 // returns the number of passes of encode needed for the packet and tld
@@ -180,8 +252,11 @@ func encodeDnsResponseCount(packet []byte, tld []byte) int {
 
 // https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml#dns-parameters-5
 
-// returns number of bytes read from packet, output buffer, error
-func encodeDnsResponse(id uint16, pumpHeader [18]byte, header [18]byte, packet []byte, buf [1024]byte, tld []byte) (n int, out []byte, err error) {
+// returns number of bytes read from packet, output buffer, error.
+// edns adds the opt record a request that carried one must be answered with;
+// a response to a request without one is unchanged from before, so a client
+// from before the single-question shape sees what it always saw.
+func encodeDnsResponse(id uint16, pumpHeader [18]byte, header [18]byte, packet []byte, buf [1024]byte, tld []byte, edns bool) (n int, out []byte, err error) {
 	enc := base32.StdEncoding.WithPadding(base64.NoPadding)
 	rEnc := base64.StdEncoding.WithPadding(base64.NoPadding)
 
@@ -249,11 +324,25 @@ func encodeDnsResponse(id uint16, pumpHeader [18]byte, header [18]byte, packet [
 		n += m
 	}
 
+	if edns {
+		err = b.StartAdditionals()
+		if err != nil {
+			return
+		}
+		err = b.OPTResource(dnsEdnsResourceHeader(), dnsmessage.OPTResource{})
+		if err != nil {
+			return
+		}
+	}
+
 	out, err = b.Finish()
 	// fmt.Printf("F (%d) %d = %s\n", n, len(out), string(out))
 	return
 }
 
+// The client decoder reads the answers only, so a response with or without
+// the opt record decodes the same; a server from before the single-question
+// shape answers without one.
 func decodeDnsResponse(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, pumpHeader [18]byte, header [18]byte, out []byte, err error) {
 	enc := base32.StdEncoding.WithPadding(base32.NoPadding)
 	rEnc := base64.StdEncoding.WithPadding(base64.NoPadding)

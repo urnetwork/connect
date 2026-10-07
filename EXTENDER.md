@@ -3198,6 +3198,81 @@ tcp carrier and the leaf verifies under the record key; a wrong key and a
 replay are spliced to the fake borrowed site; a legacy client works in Phase A;
 a skewed client falls back; the record grows by one field that old readers skip.
 
+### Q. The dns carrier's query shape (RFC 9619 and EDNS0)
+
+Q1. The dns carrier of A1 talks to the extender ip directly, so the pump
+variant does not apply, but the request shape does. Until 2026-10 a
+carrier request (`transport_pt_codec.go`, `encodeDnsRequest`) set the aa
+bit on the query and carried two TXT questions: the data question, whose first label holds the 18-byte pt
+header, and a second header-only "pump" question added so that each
+request would have a question for its response to answer. RFC 9619 (2024)
+makes a query with qdcount above 1 a malformed message, which a compliant
+resolver answers FORMERR and a firewall may drop, and the pair is a clean
+dpi match; there was no EDNS0 opt record. The server never used the pump
+question: `decodeDnsRequest` discards a header-only question that follows
+the data question, and the pump item a response is paired with
+(`decodeDns`, `pumpItem`) is the message id plus the header read from the
+data question.
+
+Q2. A request is now one standard query: opcode 0 and no flags (aa is a
+response bit; rd stays clear so the unchanged response, aa set and rd
+clear, reads as an authoritative answer to an iterative query), a single
+TXT question in the form of the old data question, and an EDNS0 opt record
+advertising a 1232-byte udp payload, the fragmentation-safe size of dns
+flag day 2020 and the default of other dns carriers. A response carries an
+opt record when, and only when, the paired request carried one (RFC 6891
+section 7); a pump item the decode53 mode synthesizes answers the way the
+client's latest real request asked. Everything else on the wire -- the
+header layout, the label encoding, the 157-byte request budget, the
+response's TXT answers -- is unchanged. Direct mode only: a recursive mode
+(resolver traversal, a delegated zone, rd set) is a separate design.
+
+Q3. Compatibility holds by construction, since the carrier has no version
+on the wire and a client's first datagram is already a QUIC initial, so
+nothing can be negotiated first. New client, old extender: the old decoder
+read the message id and the question section only, never the header flags
+or the additional section, so the new request decodes on it unchanged, and
+the response it sends is one the new client already accepts. Old client,
+new extender: `decodeDnsRequest` keeps discarding a header-only question
+after the data question, and a request without an opt record is answered
+byte for byte as before. The opt record is the capability signal. The
+legacy discard in the decoder can go once no deployed client emits the
+pump question.
+
+Q4. Tests, in-process only (`transport_pt_query_shape_test.go`,
+`transport_pt_roundtrip_test.go`, `transport_pt_codec_legacy_test.go`,
+`transport_pt_codec_test.go`): the raw header fields of every emitted
+request (qdcount 1, aa clear, one opt record of 1232) at the codec and at
+the socket the client translation wraps; frozen copies of the pre-change
+encoder and decoder for both interop directions; a round trip over an
+in-memory packet network with the server in require-pump mode, so a
+response proves the pairing, with the opt record echoed for a new client
+and absent for a legacy one; and edns detection that reads the opt record,
+not arcount. A1's forwarder split (A6) is unchanged: a TXT question
+outside every encoding tld is still a forwarder query.
+
+Q5. Decisions. The query keeps rd clear and the response is not touched:
+a response that copies rd (RFC 1035) and echoes its question is a
+response-side pass of its own, and with rd clear both halves of the
+exchange are consistent as they stand. No version field and no
+negotiation: the opt record marks a new client, which is all the server
+needs to know, and a negotiation would cost a round trip before the QUIC
+initial. The decoder stays tolerant of the legacy pump question rather
+than enforcing qdcount 1, which would strand every deployed client; a
+test pins that. A synthesized decode53 pump item follows the client's
+latest real request, so one client sees one response shape. The
+advertised payload is 1232 rather than 4096: nothing in the carrier needs
+more, and it is the size that passes every path.
+
+Q6. Phased. Nothing in connect. The server's `listenH3Dns` uses the
+exported constructor and takes the change on rebuild; no sdk surface
+changes. Still open on the response side: it answers with qdcount 0 and
+does not copy rd, which the recursive-mode design should take together
+with its delegated zone, since both are shape changes a resolver would
+notice. The legacy discard in `decodeDnsRequest`, and the frozen legacy
+codec the tests keep, can go once no deployed client emits the pump
+question.
+
 ### I. Tests
 
 Every phase ships tests with it. In-process fixtures only: the extender
@@ -3284,6 +3359,7 @@ with the database.
 | connect root | `res/extender_borrow[_<cc>].bin`, a splice-friendly borrowed-names list in the spoof-resource form, bundled; the X25519 static-key HKDF derivation from the identity seed (P1, P5) |
 | `connect.ExtenderConfig` | the camouflaged tcp dial folds in as a camo-first-then-legacy staggered race on the existing tcp carrier, driven by `RealityPublicKey`; kill switch is the sibling branch's `ConnectSettings.TlsClientHelloFingerprint="go"` (P8) |
 | `sdk.DeviceLocalSettings` | `DefaultCamouflage` added, default following `DefaultProvideExtender` (P7) |
+| extender udp 4053 and udp 53 (dns carrier) | a request is one TXT question with no aa bit and an EDNS0 opt record (udp payload 1232); a response repeats the opt record only for a request that carried one (Q2); old peers unchanged in both directions (Q3) |
 
 Old clients keep working: the header's new fields are optional, the hello
 field is additive, the tables are new, and a v1 extender client still
