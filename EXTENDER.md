@@ -4228,3 +4228,107 @@ suite in `fingerprint/`, all hermetic and in the normal `go test`; a
 deliberately-stale golden is shown to fail the diff and the correct one to
 pass it. Phased: the per-dialer camouflage comparison and the IPREAL egress
 SYN/TTL comparison, each a skipped placeholder naming its branch.
+
+## Design note: camouflage implementation, phase 14a (2026-10-07)
+
+Phase 14a of section P (the authenticated hello and the splice, REALITY) is
+implemented in connect. This note records what landed, the decisions made while
+building it, the tests that prove each P10 property, and what is phased to 14b
+(server) and 14c (sdk). It references section P and the C2a acceptance; it does
+not restate or revise them.
+
+What landed (connect core, 14a):
+- The native reality construction (P0, P1) in `extender_reality.go`: the X25519
+  static key HKDF-derived from the ed25519 identity seed
+  (`ExtenderRealityStaticPrivateKey`/`ExtenderRealityStaticPublicKey`, info
+  `"ur-extender-reality-x25519-v1"`), the auth key
+  (`extenderRealityAuthKey`, salt `helloRandom[:20]`, info
+  `"ur-extender-reality-v1"`), the 16-byte plaintext (version `{2,0,0}`, a
+  reserved zero, the unix time, the 8-byte `ExtenderKeyId` short id), and the
+  server open (`ExtenderRealityOpenSessionId`) with the version-bound, short-id
+  and time-window checks (`ExtenderRealitySessionId{Authorized,InWindow}`). The
+  seal and the session-id offset are reused from `vless_reality.go`, not copied;
+  only the derivations, the info strings and the client version differ. xtls/
+  reality is not imported.
+- The server peek, demultiplex and splice (P2, P3, P4) in
+  `extender/extender_camouflage.go`: `peekClientHello` reassembles the first
+  handshake record or records into the complete ClientHello through
+  `utls.UnmarshalClientHello` (the package already links uTLS) without consuming
+  the bytes, which are replayed through the existing `connWithInitialBytes`; the
+  authenticated hello goes to `tls.Server` with the identity leaf and a
+  `{"http/1.1"}`-alone config; an unauthenticated hello is spliced to the real
+  borrowed site (splice on) or terminated as today (splice off). The bounded,
+  time-windowed seen-tag set closes REALITY's replay gap. The splice reuses the
+  A5 per-connection byte and idle bounds and adds the total and per-target
+  concurrent caps; a spliced byte is never added to the O1 relay counters.
+- The borrowed-names list (P5) in `net_extender_borrow.go`: a separate
+  `res/extender_borrow[_<cc>].bin` in the spoof resource's xor-masked gzip form
+  with the same per-country override, plus `VerifyExtenderBorrowDomain` for the
+  role-start verification (reachable, TLS 1.3, X25519/X25519MLKEM768, not a
+  shared CDN). No list is bundled yet, as P5 says it needs measurement first:
+  the bundled resource decodes to an empty list, which degrades the splice and
+  the client's front-name selection to the legacy path rather than breaking.
+- The client camo-first-then-legacy tcp race (P7, P8) in
+  `net_extender_camouflage.go`: folded into `dialExtenderTcp` as one dialer and
+  one carrier reservation, modelled on `raceExtenderDnsPorts`. The camouflaged
+  attempt is a faithful Chrome hello (the merged `chromeClientHelloSpec`) with
+  the sealed session id and the B3 leaf check; it is tried only when the config
+  carries a `RealityPublicKey` and the kill switch
+  `ConnectSettings.TlsClientHelloFingerprint` is not `"go"`. An attempt that the
+  server did not authenticate negotiates h2 (Phase A) or fails the B3 check
+  (Phase B), so the race falls to the legacy attempt; a refusal or limit ends the
+  race with that answer.
+
+Decisions:
+- Record field number. Section P names `RealityPublicKey` field 13, written
+  before the tiered directory and the webrtc carrier merged. Those took fields 13
+  (`DirectoryTier`) and 14 (`WebRtcClientId`), so the implemented field is 15,
+  the next free number. Old readers skip it exactly as P6 requires. This is the
+  only deviation from P's letter and it is forced by field-number collision, not
+  a design change.
+- The client ephemeral is read preferring the standalone X25519 key share
+  (group 29) over the X25519MLKEM768 hybrid (group 4588, trailing 32 bytes), on
+  both ends, so a Chrome hello that carries both agrees on one ephemeral without
+  a second ECDH.
+- The splice default resolves the borrowed name over a DoH cache on the client's
+  family and dials the result over the forward egress, with an egress-by-name
+  fallback; a test seam (`CamouflageSpliceDialContext`) overrides it for the
+  in-process fake borrowed site. Resolution is a detail that does not change the
+  P10 observables.
+- Phase A is the default (`CamouflageEnabled` off, `ExtenderCamouflageSplice`
+  off), per P3/P7.
+
+Tests (deterministic, in-process, synthetic `.example` names and the fixture's
+RFC-doc addresses; each shown failing on a faithful revert of its mechanism and
+passing with it):
+- auth ok + B3: `TestExtenderCamouflageAuthenticatedReachesDestination`.
+- ALPN (http/1.1 negotiated, not on the wire):
+  `TestExtenderCamouflageAuthenticatedNegotiatesHttp11`.
+- wrong key spliced: `TestExtenderCamouflageWrongKeySplicedPhaseB`, with the
+  crypto root cause `TestExtenderRealityOpenRejectsAWrongStaticKey`.
+- replay refused: `TestExtenderCamouflageReplaySet{RefusesReplay,EvictsOldestPastTheCap}`.
+- skew fallback: `TestExtenderCamouflageSkewedClientFallsToLegacyPhaseA` and
+  `...LosesTcpPhaseB`.
+- legacy client: `TestExtenderCamouflageLegacyClientPhase{A,B}`.
+- fragmented hello reassembled: `TestExtenderCamouflagePeekReassemblesFragmentedHello`
+  and `TestExtenderCamouflageFragmentedHelloAuthenticated`.
+- bounded splice (byte, total, per-target, and a spliced byte never counted as
+  O1 relay): `TestExtenderCamouflageSplice{ByteBound,TotalCap,PerTargetCap,NotCountedAsRelay}`.
+- the client race and kill switch: `TestRaceExtenderTcpCamouflage*`,
+  `TestExtenderCamouflageApplies`; the seal/open crypto: `TestExtenderReality*`;
+  the borrow list and verification: `TestBorrowDomains*`,
+  `TestVerifyExtenderBorrowDomain*`.
+
+Phased (not in 14a):
+- 14b server: `reality_public_key_hex` in the activation args, storing and
+  signing the key into the record, and the optional splice probe. The server
+  runtime already exposes `ExtenderServer.RealityPublicKey()` and
+  `CamouflageStats()`; the controller/model wiring and any migration are the
+  server repo's.
+- 14c sdk: the provider role deriving and publishing the static key (HKDF from
+  the identity seed, no new persistence), running `VerifyExtenderBorrowDomain`
+  at start and feeding `CamouflageBorrowNames`, `DeviceLocalSettings.DefaultCamouflage`,
+  the status counts and the bindings.
+- The fingerprint-drift harness's `TestExtenderCamouflageHelloConformance`
+  placeholder (the note above) can now be wired to the camouflaged dial's uTLS
+  hello; that is the harness owner's change, not this one.

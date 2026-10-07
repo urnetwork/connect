@@ -114,6 +114,12 @@ func DefaultExtenderSettings() *ExtenderSettings {
 		AdmissionIpv4PrefixBitCount:         29,
 		AdmissionIpv6PrefixBitCount:         56,
 		AdmissionMinSubnetCount:             4096,
+
+		ExtenderCamouflageTimeWindow:         2 * time.Minute,
+		ExtenderCamouflageReplayTagCount:     65536,
+		ExtenderCamouflageHelloMaxByteCount:  16 * 1024,
+		ExtenderCamouflageSpliceMaxCount:     256,
+		ExtenderCamouflageSpliceMaxPerTarget: 32,
 	}
 }
 
@@ -317,6 +323,55 @@ type ExtenderSettings struct {
 	// windows with it. Nil is time.Now.
 	AdmissionNow func() time.Time
 
+	// The camouflage of the tcp carrier (EXTENDER.md P). CamouflageEnabled
+	// gates whether the server recognizes the authenticated-hello tag, offers
+	// the authenticated http/1.1 config and publishes a RealityPublicKey; it is
+	// off by default, as the owner asked. It needs the identity key
+	// (IdentityKeySeed), from which the X25519 static key is derived; without
+	// one it does nothing. ExtenderCamouflageSplice is the Phase-A -> B flip
+	// (P3): off, an unauthenticated hello is terminated as today; on, it is
+	// spliced to the real borrowed site. Meaningful only while
+	// CamouflageEnabled, off by default and the legacy-safe posture.
+	CamouflageEnabled        bool
+	ExtenderCamouflageSplice bool
+	// The tolerated clock skew each way of a sealed hello time (P1); a client
+	// outside it is not authenticated. <= 0 takes the default.
+	ExtenderCamouflageTimeWindow time.Duration
+	// The bounded, time-windowed seen-tag set that refuses replays (P2). Entries
+	// expire after twice the time window and the set is capped here, oldest
+	// evicted. <= 0 takes the default.
+	ExtenderCamouflageReplayTagCount int
+	// The most handshake bytes the peek reassembles before parsing the
+	// ClientHello (P3); a hello that does not complete within it is dropped. <=
+	// 0 takes the default.
+	ExtenderCamouflageHelloMaxByteCount int
+	// The total concurrent splices and the per-target concurrent splices (P3),
+	// so no one borrowed site is hammered. A splice over either bound is refused
+	// and the connection is terminated instead. <= 0 disables each.
+	ExtenderCamouflageSpliceMaxCount     int
+	ExtenderCamouflageSpliceMaxPerTarget int
+	// The borrowed names this extender has verified and will splice to (P5),
+	// the role-start-verified subset of the bundled borrow list. Empty leaves
+	// the splice with no target, so an unauthenticated hello in splice mode
+	// degrades to the A5 reverse proxy. Copied at construction.
+	CamouflageBorrowNames []string
+	// CamouflageSpliceDialContext, when set, opens the tcp connection to a
+	// borrowed site for the splice (P3), its address the borrowed name and port
+	// 443 and its network the client's family (A7). Tests inject the fake
+	// borrowed-site here. Nil resolves the name over a DoH cache on the client's
+	// family and dials the result over the forward egress.
+	CamouflageSpliceDialContext connect.DialContextFunction
+	// CamouflageNow, when set, is the only clock the camouflage reads for the
+	// time window and the replay expiry. Tests slide the window with it. Nil is
+	// time.Now.
+	CamouflageNow func() time.Time
+	// CamouflageHandler, when set, receives the classification of every peeked
+	// ClientHello the camouflage parsed (P3, P4): its sni, the alpn it offered on
+	// the wire, and the outcome (authenticated, spliced or terminated). Tests use
+	// it to prove what a dial presented and how it was classified. It runs
+	// synchronously, must not block, and must not keep the slices.
+	CamouflageHandler func(outcome ExtenderCamouflageOutcome)
+
 	// Listen, when set, binds the outer TLS listener. Userspace integration
 	// tests use it to place the production extender on a simulated TUN. Nil
 	// retains net.Listen. The extender owns and closes returned listeners.
@@ -384,6 +439,18 @@ type ExtenderServer struct {
 	egressByteCount  atomic.Int64
 	egressReadCount  atomic.Int64
 
+	// the camouflage counts of P7, cumulative for the life of the server and
+	// surfaced beside the admission counts. A spliced byte is never added to the
+	// O1 relay counters above (P10), so the two sets never double count a
+	// connection.
+	camouflageAuthenticatedCount    atomic.Int64
+	camouflageSplicedCount          atomic.Int64
+	camouflageTerminatedCount       atomic.Int64
+	camouflageReplayRefusedCount    atomic.Int64
+	camouflageTimeWindowFailedCount atomic.Int64
+	camouflageSpliceDialFailedCount atomic.Int64
+	camouflageBorrowVerifyFailCount atomic.Int64
+
 	allowedSecrets []string
 	// exact (x) or wildcard (*.x)
 	// wildcard *.x does not match exact x
@@ -431,6 +498,10 @@ type ExtenderServer struct {
 
 	// the admission limits of A12, under their own lock
 	admission *extenderAdmission
+
+	// the tcp carrier camouflage of P, nil when the server has no identity key;
+	// its recognition, splice and publishing are gated on CamouflageEnabled
+	camouflage *extenderCamouflage
 
 	proxy *extenderProxy
 
@@ -515,6 +586,16 @@ func NewExtenderServer(
 	// constructor keeps its shape for callers that cannot handle an error.
 	self.certificates, self.certificatesErr = newExtenderCertificates(settings.IdentityKeySeed, settings)
 	self.proxy = newExtenderProxy(self)
+	// the camouflage derives its static key from the same identity seed; a
+	// construction error is reported the way a certificate error is, when
+	// serving starts, so the constructor keeps its shape
+	if camouflage, err := newExtenderCamouflage(self, settings); err != nil {
+		if self.certificatesErr == nil {
+			self.certificatesErr = err
+		}
+	} else {
+		self.camouflage = camouflage
+	}
 
 	handler := &extenderHandler{server: self}
 	// an idle h2 connection is reclaimed on the same budget a connection has to
@@ -1236,6 +1317,9 @@ func (self *ExtenderServer) Close() {
 	}
 	self.httpServer.Close()
 	self.proxy.close()
+	if self.camouflage != nil {
+		self.camouflage.close()
+	}
 }
 
 // CloseAndWait interrupts and joins every listener and connection worker.
@@ -1366,6 +1450,64 @@ func (self *ExtenderServer) Stats() ExtenderStats {
 	}
 }
 
+// The three classifications the camouflage gives a peeked ClientHello (P3).
+const (
+	ExtenderCamouflageOutcomeAuthenticated = "authenticated"
+	ExtenderCamouflageOutcomeSpliced       = "spliced"
+	ExtenderCamouflageOutcomeTerminated    = "terminated"
+)
+
+// ExtenderCamouflageOutcome is what the CamouflageHandler seam reports for one
+// peeked ClientHello: its sni, the alpn it offered on the wire, and how the
+// camouflage classified it (P3, P4).
+type ExtenderCamouflageOutcome struct {
+	ServerName    string
+	AlpnProtocols []string
+	Outcome       string
+}
+
+// ExtenderCamouflageStats is the tcp carrier camouflage activity, cumulative
+// for the life of the server and surfaced beside the admission counts (P7).
+// AuthenticatedCount, SplicedCount and TerminatedCount partition the tcp
+// connections the camouflage classified; the rest name the refusals and the
+// failure paths. A spliced byte is never in the O1 relay counts (P10).
+type ExtenderCamouflageStats struct {
+	AuthenticatedCount    int64
+	SplicedCount          int64
+	TerminatedCount       int64
+	ReplayRefusedCount    int64
+	TimeWindowFailedCount int64
+	SpliceDialFailedCount int64
+	BorrowVerifyFailCount int64
+}
+
+// A snapshot of the camouflage counts (P7). Each counter is read independently,
+// as with Stats, so the series that samples them reads deltas and never a total
+// that must agree across counters.
+func (self *ExtenderServer) CamouflageStats() ExtenderCamouflageStats {
+	return ExtenderCamouflageStats{
+		AuthenticatedCount:    self.camouflageAuthenticatedCount.Load(),
+		SplicedCount:          self.camouflageSplicedCount.Load(),
+		TerminatedCount:       self.camouflageTerminatedCount.Load(),
+		ReplayRefusedCount:    self.camouflageReplayRefusedCount.Load(),
+		TimeWindowFailedCount: self.camouflageTimeWindowFailedCount.Load(),
+		SpliceDialFailedCount: self.camouflageSpliceDialFailedCount.Load(),
+		BorrowVerifyFailCount: self.camouflageBorrowVerifyFailCount.Load(),
+	}
+}
+
+// RealityPublicKey is the 32-byte X25519 static public key the record publishes
+// (P1, P6), derived from the identity seed, or nil when the extender has no
+// identity key or camouflage is off. The record builder and the activation read
+// it from here so the published key always matches the key the server opens
+// tags under.
+func (self *ExtenderServer) RealityPublicKey() []byte {
+	if self.camouflage == nil || !self.settings.CamouflageEnabled {
+		return nil
+	}
+	return self.camouflage.StaticPublicKey()
+}
+
 // Connection errors are observable only when a caller installs the test seam.
 func (self *ExtenderServer) reportError(stage string, err error) {
 	if self.settings.ErrorHandler != nil {
@@ -1387,13 +1529,29 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 		return
 	}
 
+	// the camouflage peek classifies the raw ClientHello in front of tls.Server
+	// (P3): an authenticated hello is terminated with http/1.1 alone (P4), an
+	// unauthenticated hello is spliced to the real borrowed site in splice mode
+	// (and the connection is then already handled) or terminated as today. With
+	// camouflage off it returns the connection unchanged.
+	termConn, authenticated, handled := self.camouflageDemultiplex(handleCtx, conn)
+	if handled {
+		return
+	}
+
 	tlsConfig := &tls.Config{
 		GetCertificate: self.certificates.GetCertificate,
 		// a prober that asks for h2 gets it (A3); the extender's own client
 		// offers no alpn, so it negotiates http/1.1
 		NextProtos: []string{"h2", "http/1.1"},
 	}
-	clientConn := tls.Server(conn, tlsConfig)
+	if authenticated {
+		// the authenticated path offers http/1.1 alone, so a faithful Chrome
+		// hello that offered {h2,http/1.1} negotiates http/1.1 and the choice is
+		// not on the wire (P4)
+		tlsConfig.NextProtos = []string{"http/1.1"}
+	}
+	clientConn := tls.Server(termConn, tlsConfig)
 	defer clientConn.Close()
 
 	// one budget covers the handshake and the request that follows (A9)

@@ -146,6 +146,15 @@ message ExtenderRecordBody {
     // address of the record lists the webrtc carrier; empty on every other
     // record and on records that predate the field.
     bytes WebRtcClientId = 14;
+    // The 32 byte X25519 static public key of the extender camouflage
+    // (EXTENDER.md P1, P6), derived from the identity seed. A client fronts the
+    // tcp carrier with an authenticated browser hello sealed under it. Signed
+    // with the rest of the body; a reader that predates the field skips it and
+    // simply does not dial the camouflaged carrier. Empty on an extender with
+    // camouflage off and on records that predate the field. Field 13 and 14
+    // were taken by DirectoryTier and WebRtcClientId after P was written, so
+    // this is field 15, not the 13 section P names.
+    bytes RealityPublicKey = 15;
 }
 
 message ExtenderRecord {

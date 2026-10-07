@@ -165,6 +165,16 @@ type ExtenderConfig struct {
 	// record. The outer leaf certificate must be signed by it (B3). Empty
 	// keeps the unauthenticated outer TLS of a manually configured extender.
 	PublicKey []byte
+	// RealityPublicKey, when set, is the 32 byte X25519 static public key of
+	// the extender camouflage from a verified record (EXTENDER.md P1, P6,
+	// field 15). The tcp carrier then runs a camo-first-then-legacy staggered
+	// race (P8): the camouflaged attempt fronts a borrowed name with an
+	// authenticated browser hello sealed under this key, the legacy attempt is
+	// today's Go-TLS dial. The camouflaged attempt is tried only when the
+	// identity PublicKey is also known (the B3 check needs it) and the kill
+	// switch ConnectSettings.TlsClientHelloFingerprint is not "go". Empty, or
+	// an identity-only config, dials the legacy attempt alone.
+	RealityPublicKey []byte
 	// The ports one dns carrier dial races, in launch order (L2), with
 	// Profile.Port the first of them. A config drawn from a directory or
 	// manual address carries the ports its record lists and then whichever
@@ -560,6 +570,12 @@ func newExtenderRequest(
 // The tcp carrier: terminated outer TLS, then one HTTP/1.1 request. The
 // buffered reader that read the response is kept, because it may already hold
 // the first bytes the extender sent after it.
+//
+// One tcp carrier memory reservation covers the whole dial, held once however
+// the dial reaches the extender (P8): when the config carries a camouflage key
+// the dial is a camo-first-then-legacy staggered race, and the winning
+// attempt's stream is wrapped in that one reservation, so a camouflaged attempt
+// that fails neither holds the address nor spends a second carrier slot.
 func dialExtenderTcp(
 	ctx context.Context,
 	connectSettings *ConnectSettings,
@@ -578,6 +594,44 @@ func dialExtenderTcp(
 			reservation.Release()
 		}
 	}()
+
+	legacyDial := func(ctx context.Context, roundTrip *ExtenderRoundTrip) (net.Conn, *protocol.ExtenderResponse, error) {
+		return dialExtenderTcpLegacyConn(ctx, connectSettings, extenderConfig, extenderTlsConfig, headerBytes, roundTrip)
+	}
+
+	var streamConn net.Conn
+	var response *protocol.ExtenderResponse
+	if frontName := extenderCamouflageFrontName(extenderConfig); extenderCamouflageApplies(connectSettings, extenderConfig) && frontName != "" {
+		camoDial := func(ctx context.Context, roundTrip *ExtenderRoundTrip) (net.Conn, *protocol.ExtenderResponse, error) {
+			return dialExtenderTcpCamouflageConn(ctx, connectSettings, extenderConfig, frontName, headerBytes, roundTrip)
+		}
+		streamConn, response, err = raceExtenderTcpCamouflage(ctx, roundTrip, extenderTcpCamouflageStaggerC, camoDial, legacyDial)
+	} else {
+		streamConn, response, err = legacyDial(ctx, roundTrip)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	owned = true
+	return &extenderBudgetConn{
+		Conn:        streamConn,
+		reservation: reservation,
+	}, response, nil
+}
+
+// The legacy tcp attempt: today's Go-TLS dial to the extender ip, terminated
+// outer TLS, then the A3 exchange. It returns the raw stream; the carrier's one
+// memory reservation is wrapped around the winning attempt by dialExtenderTcp,
+// so this neither acquires nor releases it.
+func dialExtenderTcpLegacyConn(
+	ctx context.Context,
+	connectSettings *ConnectSettings,
+	extenderConfig *ExtenderConfig,
+	extenderTlsConfig *tls.Config,
+	headerBytes []byte,
+	roundTrip *ExtenderRoundTrip,
+) (net.Conn, *protocol.ExtenderResponse, error) {
 	authority := net.JoinHostPort(
 		extenderConfig.Ip.String(),
 		strconv.Itoa(extenderConfig.Profile.Port),
@@ -652,11 +706,7 @@ func dialExtenderTcp(
 	}
 
 	success = true
-	owned = true
-	return &extenderBudgetConn{
-		Conn:        streamConn,
-		reservation: reservation,
-	}, response, nil
+	return streamConn, response, nil
 }
 
 // The A3 exchange of the stream carriers on an established, terminated
