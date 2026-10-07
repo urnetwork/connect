@@ -564,7 +564,11 @@ func TestSignedContractExpirationRenewsReverseCompanionIndependently(t *testing.
 		f.finishSend(f.startSend("forward-opening"))
 		f.finishSend(f.startClientSend(f.receiver, f.sender.ClientId(), "companion-opening", CompanionContract()))
 		forward, _ := f.sequences()
-		returnKey := sendSequenceId{Destination: f.sender.ClientId(), CompanionContract: true}
+		// The public companion option selects both contract and session
+		// identity, including when payload encryption is disabled.
+		returnKey := sendSequenceId{
+			Destination: f.sender.ClientId(), CompanionContract: true, EncryptionCompanion: true,
+		}
 		reverse := f.receiver.sendBuffer.lookupSendSequence(returnKey, nil)
 		if reverse == nil || reverse.sendContract == nil || !reverse.sendContractAcked {
 			t.Fatal("reverse companion never established its independent signed contract")
