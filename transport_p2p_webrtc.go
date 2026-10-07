@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mathrand "math/rand"
 	"net"
 	"os"
 	"runtime"
@@ -928,14 +929,14 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// that is intentional receiver backpressure, not a dead path. The
 		// worker is lazy and has no idle timer/radio wakeups.
 		SctpNoProgressTimeout: 10 * time.Second,
-		// openrelay.metered.ca and stun.stunprotocol.org are defunct — every
-		// gather against them burned a multi-second i/o timeout per attempt
-		// (observed on-device 2026-07-25) and delayed candidate gathering.
-		// Keep a small set of live anycast servers.
-		IceServerUrls: []string{
-			"stun:stun.cloudflare.com:3478",
-			"stun:stun.l.google.com:19302",
-		},
+		// Offer a fresh random subset of the high-collateral pool per session
+		// instead of the same fixed pair, which is a cheap dns/stun prefilter
+		// signal. A dead/slow pool entry still costs at most one StunGatherTimeout
+		// (openrelay.metered.ca and stun.stunprotocol.org were dropped from the
+		// pool for burning that timeout, observed on-device 2026-07-25), and only
+		// IceServerSampleCount are drawn per session, so gather stays bounded.
+		IceServerPoolUrls:    defaultStunServerUrls,
+		IceServerSampleCount: defaultIceServerSampleCount,
 	}
 }
 
@@ -1070,8 +1071,19 @@ type WebRtcSettings struct {
 	// Nil in production; tests observe reception of one exact warmup version.
 	afterFastPathWarmupReceiveForTest func(byte)
 
-	// add stun:xxx urls here
+	// IceServerUrls, when non-empty, pins the exact ICE/STUN servers offered and
+	// overrides the pool. Leave it empty in production to get a per-session
+	// random subset; set it to pin servers (operator override, or a test).
 	IceServerUrls []string
+	// IceServerPoolUrls is the pool a per-session subset is drawn from when
+	// IceServerUrls is empty. See defaultStunServerUrls.
+	IceServerPoolUrls []string
+	// IceServerSampleCount is how many pool servers to offer per session. 0 or a
+	// value past the pool size offers the whole pool.
+	IceServerSampleCount int
+	// Nil in production; tests inject a seeded source so the per-session subset
+	// is deterministic (see selectIceServerUrls).
+	iceServerRandForTest *mathrand.Rand
 }
 
 func webRtcDataChannelInit(settings *WebRtcSettings) *webrtc.DataChannelInit {
