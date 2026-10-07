@@ -1,13 +1,21 @@
 openapi: "3.1.0"
 info:
-  version: 2026.9.14
+  # Not a release or date stamp: the api is not versioned, and this document
+  # describes the current deployment. Releases do not rewrite this field. A
+  # client that needs to pin the document pins its content hash, as the sdk's
+  # generated client does (it records the sha256 of the spec it was built from).
+  version: "1.0.0"
   title: URnetwork
   description: |
     URnetwork is a web-standards VPN marketplace with an emphasis on
-    fast, secure internet everwhere.
+    fast, secure internet everywhere.
 
     The API for URnetwork bootstraps the `connect` protocol,
     and is the source of JWTs and other match-making transactions.
+
+    Authenticated routes take `Authorization: Bearer <token>`, where the
+    token is a URnetwork JWT or an API key. The BearerAuth security scheme
+    describes how to get either.
 
     The JWT returned by /auth routes does not have a clientId.
     The `connect` protocol requires a JWT with a clientId.
@@ -79,7 +87,8 @@ tags:
       identity token, a wallet signature or a seed phrase; network creation
       and deletion; auth codes; and the Apple and Google sign-in returns for
       the apps that sign in through the system browser. The login routes
-      return a network JWT (`by_jwt`).
+      return a network JWT (`by_jwt`); the BearerAuth security scheme
+      describes the shortest way to a token.
   - name: Network
     description: |
       The network's clients, cloud proxy devices and peers; provider
@@ -983,9 +992,8 @@ paths:
         (android signs in with play services and ur.io in the page; neither
         uses this). Google redirects the browser here with the authorization
         code; this endpoint exchanges it at Google's token endpoint with the
-        web client's secret (vault `google.yml` `sign_in_oauth`) and answers
-        `302` to the app's own scheme so the browser hands control back to
-        the app:
+        web client's secret and answers `302` to the app's own scheme so the
+        browser hands control back to the app:
 
         ```
         <scheme>://oauth/google?state=…&id_token=…
@@ -1004,7 +1012,8 @@ paths:
         `urnetwork://`); without it the android scheme is used. Google's own
         `error` (e.g. `access_denied`) is passed through; a failed exchange
         or a missing client configuration comes back as `error` too
-        (`not_configured` when the vault has no `sign_in_oauth`).
+        (`not_configured` when the server has no Google sign-in client
+        configured).
       parameters:
         - in: query
           name: state
@@ -1975,7 +1984,7 @@ paths:
           required: false
           description: |
             Batch size, default 100, clamped to the deployment ceiling
-            (`provider_egress_due.yml` `max_due_limit`, default 500). A
+            (default 500). A
             non-integer or non-positive value is a 400 rather than a clamp,
             because an empty list must not be confused with "nothing is due".
           schema:
@@ -2856,9 +2865,9 @@ paths:
       summary: What an agent can buy
       description: |
         The catalog an agent can buy from, so a skill can discover it without
-        triggering a `402`. Prices come from `pro.yml`, never from the x402
-        configuration, so an agent is quoted the same number a human pays by
-        card; a sku with no price is not offered at all.
+        triggering a `402`. Prices come from the Pro price list, never from
+        the x402 configuration, so an agent is quoted the same number a human
+        pays by card; a sku with no price is not offered at all.
       operationId: x402Skus
       security: []
       responses:
@@ -3520,7 +3529,7 @@ paths:
       description: |
         Out-of-band control messages for the connect protocol.
         Blocking request-response control messages need to be handled out-of-band
-        to resolve the possibility of dedlocks in the client sequence.
+        to resolve the possibility of deadlocks in the client sequence.
       operationId: connectControl
       security:
         - BearerAuth: []
@@ -5870,7 +5879,7 @@ paths:
         The nightly aggregate the analysis script (mmm/onboarding/analyze.mjs)
         reads: `onboarding_results_daily`, recomputed at 02:00 UTC by the
         `OnboardingResultsRollup` task for the last `onboarding.results.rollup_days`
-        cohort days (config/main/onboarding.yml). One row per cohort day
+        cohort days. One row per cohort day
         (the network's sign-up day, UTC), experiment, variant, surface,
         platform, price tier and path. Counts are networks, never events.
 
@@ -5910,10 +5919,10 @@ paths:
         is returned. Ordered by the dimension tuple; keyset paged by
         `cursor`.
 
-        Auth: `Authorization: Bearer <token>` where the token is listed in
-        vault `onboarding.yml` under `onboarding.admin_bearers` (compared in
-        constant time). A missing or unknown token is 401; a network JWT is
-        403. Without the vault entry the endpoint is closed.
+        Auth: `Authorization: Bearer <token>` where the token is one of the
+        deployment's configured admin bearers (compared in constant time). A
+        missing or unknown token is 401; a network JWT is 403. Without an
+        admin bearer configured the endpoint is closed.
       operationId: adminOnboardingResults
       security:
         - AdminBearerAuth: []
@@ -6039,8 +6048,9 @@ paths:
         one flow step. The `definitions` block returns these rules with the
         data, so a reader never has to assume them.
 
-        Same auth as `/admin/onboarding/results`: an admin bearer from vault
-        `onboarding.yml`, compared in constant time. Keyset paged by `cursor`.
+        Same auth as `/admin/onboarding/results`: one of the deployment's
+        configured admin bearers, compared in constant time. Keyset paged by
+        `cursor`.
       operationId: adminOnboardingEmailTracker
       security:
         - AdminBearerAuth: []
@@ -6113,9 +6123,9 @@ paths:
       x-internal: true
       summary: The experiment registry as loaded
       description: |
-        The onboarding experiment registry (config/main/onboarding.yml
-        `onboarding.experiments`) as the server loaded it, so the analysis
-        script judges results against the same allocation, primary metric,
+        The onboarding experiment registry (`onboarding.experiments`) as the
+        server loaded it, so the analysis script judges results against the
+        same allocation, primary metric,
         guardrails and minimum exposures the server applied, plus each
         experiment's live variant states from the pause overlay
         (`network_onboarding_experiment_state`: a variant the nightly
@@ -6176,8 +6186,8 @@ paths:
 
         Authentication is HTTP BASIC, not bearer and not a network token: the
         request must carry `Authorization: Basic base64(<secret>:)` where
-        `<secret>` is one of the account's `webhook_bearers` (vault
-        `brevo.yml`) and the password half is empty.
+        `<secret>` is one of the account's configured webhook secrets and the
+        password half is empty.
 
         `unsubscribe` turns the account's product-updates preference off (the
         existing behavior). For the onboarding campaign the remaining events
@@ -6550,31 +6560,53 @@ components:
     BearerAuth:
       type: http
       scheme: bearer
-      description: URnetwork JWT
+      description: |
+        `Authorization: Bearer <token>`, where the token is a URnetwork JWT
+        or an API key. The OAuth routes say where they take something else
+        (`GET /oauth/userinfo` takes an access token from `POST /oauth/token`).
+
+        JWT: the login routes under `/auth` return a network JWT in
+        `network.by_jwt` (`POST /auth/login`, `POST /auth/login-with-password`,
+        `POST /auth/verify`, `POST /auth/network-create`). The shortest way
+        for a script or an agent is an auth code: a signed-in person creates
+        one at https://ur.io/app/account/settings (a session can also create
+        one with `POST /auth/code-create`), and `POST /auth/code-login` with
+        `{"auth_code": "<auth code>"}`, which needs no authentication, returns
+        `{"by_jwt": "<jwt>"}`. An auth code is short-lived and limited use,
+        and the JWT it returns expires with the session that created the code.
+
+        A network JWT names no client. The `connect` protocol, and the routes
+        that say they require a client JWT, take one that does: exchange the
+        network JWT for it with `POST /network/auth-client`
+        (`by_client_jwt`).
+
+        API key: `POST /account/api-key`, called with a JWT, returns a
+        long-lived key beginning `urn_` in `api_key`, shown only in that
+        response. Send it the same way, `Authorization: Bearer urn_...`. It
+        authenticates as the network, like a network JWT, until it is removed
+        with `POST /account/api-key/remove`.
     BrevoWebhookAuth:
       type: http
       scheme: basic
       description: |
-        HTTP Basic with a secret from the account's `webhook_bearers` list
-        (vault `brevo.yml`) as the username and an empty password. Not a
-        URnetwork JWT.
+        HTTP Basic with one of the account's configured webhook secrets as
+        the username and an empty password. Not a URnetwork JWT.
     AdminBearerAuth:
       type: http
       scheme: bearer
       description: |
-        An admin bearer listed in vault `onboarding.yml` under
-        `onboarding.admin_bearers`, compared in constant time. It is NOT a
-        URnetwork JWT: a network JWT here is a 403, and without the vault
-        entry the endpoint is closed.
+        An admin bearer configured for the deployment, compared in constant
+        time. It is not a URnetwork JWT: a network JWT here is a 403, and a
+        deployment without an admin bearer keeps these routes closed.
     OperatorSecret:
       type: apiKey
       in: header
       name: X-UR-Operator-Secret
       description: |
-        The shared operator secret of the provider probe control plane, from
-        vault `provider_egress.yml` `ingest_secret`, compared in constant
-        time. This is not a JWT and names no network. A deployment whose vault
-        has no such resource rejects every request to these routes.
+        The shared operator secret of the provider probe control plane,
+        compared in constant time. This is not a JWT and names no network. A
+        deployment without the secret configured rejects every request to
+        these routes.
 
   schemas:
     ClockResult:
@@ -8414,11 +8446,10 @@ components:
     PriceTier:
       type: object
       description: |
-        A regional price tier of Pro (config/all/pro.yml pro.price_tiers):
-        `standard` ($40/year, $5/month) for the developed-country list,
-        `regional` ($4/year, $0.50/month) everywhere else. Prices are USD;
-        the store or Stripe shows the local-currency figure. The 14-day
-        trial and the welcome offer apply on every tier.
+        A regional price tier of Pro: `standard` ($40/year, $5/month) for the
+        developed-country list, `regional` ($4/year, $0.50/month) everywhere
+        else. Prices are USD; the store or Stripe shows the local-currency
+        figure. The 14-day trial and the welcome offer apply on every tier.
       required:
         - name
         - yearly_usd
@@ -9462,7 +9493,7 @@ components:
 
     OnboardingExperiment:
       type: object
-      description: One registry entry (config/main/onboarding.yml onboarding.experiments).
+      description: One entry of the onboarding experiment registry (`onboarding.experiments`).
       required:
         - id
         - surface
@@ -10524,8 +10555,8 @@ components:
           type: integer
         max_referrals:
           description: |
-            Referrals a network is paid for (pro.yml referral.max_referrals).
-            0 when the server has no pro.yml (uncapped); clients treat 0 as unknown.
+            Referrals a network is paid for. 0 when the server has no
+            referral cap configured (uncapped); clients treat 0 as unknown.
           type: integer
         bonus_per_referral_bytes:
           description: Bytes granted to the referrer per referral, per bonus period. 0 when unknown.

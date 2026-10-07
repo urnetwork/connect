@@ -32,8 +32,8 @@
 #     marked by hand.
 #
 # Rules of our own for descriptions, which every renderer reads as CommonMark
-# (ur.io's API reference, Redoc, GitHub). A description whose backticks pair
-# up is checked outside its code spans and code blocks:
+# (ur.io's API reference, Redoc, GitHub). The first two check a description
+# whose backticks pair up outside its code spans and code blocks:
 #
 #   rule/description-wildcards-as-code -- a wildcard name such as `weight_*`
 #     or `email.*` is written as code. Bare, its `*` reads as an emphasis
@@ -42,6 +42,11 @@
 #   rule/description-placeholders-as-code -- a placeholder such as `<name>`
 #     is written as code. Bare, it reads as an HTML tag, which renderers drop:
 #     "https://<proxy_host>:<https_proxy_port>" renders "https://:".
+#
+#   rule/description-no-deployment-files -- a description does not name the
+#     deployment's vault or config files (`pro.yml`); it says what is
+#     configured instead. The cross-reference to the competition spec,
+#     `sn/api/competition.yml`, is the one yml name allowed.
 extends:
   - recommended
 
@@ -97,6 +102,14 @@ rules:
     assertions:
       notPattern: '/^(?:[^`]*`[^`]*`)*[^`]*?<[a-z][a-z0-9_]*>/'
     message: Write a placeholder such as `<name>` as code, or it reads as an HTML tag and is dropped.
+    severity: error
+  rule/description-no-deployment-files:
+    subject:
+      type: any
+      property: description
+    assertions:
+      notPattern: '/(?<!sn\/api\/)\b[\w-]+\.ya?ml\b/'
+    message: Do not name a deployment vault or config file; say what is configured.
     severity: error
 
 apis:
