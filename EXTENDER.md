@@ -2808,6 +2808,357 @@ Checklist and tests.
   the chart bindings and the rest are reviewed, not compiled, on the
   macOS build host, as the windows tree has been.
 
+### P. Camouflage: the authenticated hello and the splice (REALITY)
+
+Added 2026-10-07 at the owner's request ("incorporate the best parts of
+reality into the extender; the extender does almost all of what reality does
+already"). The extender already terminates the outer TLS for a borrowed server
+name, issues a per-name leaf under its identity key, and the client already
+pins that leaf to the record key (A2, A3, B3, net_extender.go newExtenderTlsConfig).
+What REALITY adds over that is three things the extender does not yet have: the
+client's own ClientHello is a browser's rather than Go's; the proof that the
+client holds the extender's key is hidden inside that browser hello, so there
+is no distinguishing first flight; and a hello that does not carry the proof is
+spliced to the real borrowed site, so an active prober sees the real site with
+its real certificate rather than a self-signed leaf for a name the extender
+does not own. This section folds those three into the tcp carrier. It is tcp
+only (P9); the udp carriers keep A1 to A12 unchanged. Where it changes an
+earlier decision for the tcp carrier it says so: it supersedes A2's "always
+terminated, no splice" for the tcp carrier in splice mode (P3), and it narrows
+A5's reverse proxy to the degraded fallback and the non-tcp carriers (P3). It
+reuses, not imports, REALITY: the construction is native to the extender
+protocol (P0), built from connect's own X25519, HKDF and AES-GCM and from the
+reality client helpers that already live in connect for VLESS
+(vless_reality.go), on the extender's own certificate issuer, demultiplexer,
+admission limiter (A12) and whitelist. xtls/reality is not imported (P0).
+
+P0. Why native, not the library. xtls/reality's `Server` is a fork of
+crypto/tls that dials the borrowed site on every connection and mirrors the
+whole handshake to it (its `MirrorConn`), keeps its post-handshake record
+lengths in a process-global `sync.Map` filled by a background dial per server
+name (`DetectPostHandshakeRecordsLens`), carries juju/ratelimit and
+go-proxyproto, and has no replay cache and no demultiplexer for the three
+client shapes the extender serves (v1-framed, v2 http, and now camouflaged).
+The extender already owns every piece the library reimplements: TLS
+termination with a cached per-name leaf (extender_cert.go), a three-way
+demultiplex in front of it (extender.go HandleExtenderConnection), the A12
+admission limiter, the A5 whitelist and reverse proxy, and the reality client
+half (vless_reality.go: the session-id seal, the browser hello through utls,
+the leaf-proves-key verifier). The camouflage layer is therefore a peek and an
+auth check in front of the existing `tls.Server`, a splice path that reuses the
+A5 bounds, and a client dial that reuses the vless seal — not a second TLS
+stack. utls is already linked (vless_dial.go, vless_reality.go), so there is no
+new module and no size cost. The feat/chrome-client-hello branch (owner request
+2026-10-07, a sibling change) brings the browser hello to the normal and
+resilient dialers and adds the kill switch `ConnectSettings.TlsClientHelloFingerprint`;
+this design reuses that switch for the camouflaged carrier and takes that
+branch's uTLS plumbing as the precedent, and it resolves the "a Chrome ALPN
+would get 403, separate change" note that branch left for the extender (P4).
+
+P1. The authenticated hello. The proof rides in the 32-byte legacy session id
+of the client's ClientHello, exactly as REALITY and exactly as the VLESS client
+already builds it (vless_reality.go vlessRealitySealSessionId). The pieces:
+
+- Server static key. The extender identity is an ed25519 seed
+  (extender_record.go ExtenderPrivateKeyFromSeed). The X25519 static key the
+  ECDH needs is derived from that same seed with HKDF-SHA256, salt empty, info
+  `"ur-extender-reality-x25519-v1"`, 32 bytes, through `crypto/ecdh`
+  X25519().NewPrivateKey, so there is no new secret to persist and the static
+  key rotates with the identity. Its public half is published in the record
+  (P6). Only the extender holds the seed, so only the extender derives the
+  private key; the activator learns the public half from the activation args
+  and the client from the signed record (P6).
+- shortId. The 8-byte `ExtenderKeyId(ed25519 public key)` that already exists
+  (extender_record.go, first 8 bytes of sha256 of the key). It is not a new
+  stored or published value: both ends compute it from the record's identity
+  key. It is sealed in the plaintext so the server can confirm the tag was
+  built for this extender and not resealed from a tag captured at another.
+- Key agreement. The client's ephemeral X25519 is the one its TLS 1.3
+  ClientHello already carries as a key share (reused, as vless_reality.go reuses
+  `HandshakeState.State13.KeyShareKeys.Ecdhe`/`MlkemEcdhe`), so nothing extra
+  goes on the wire. `sharedSecret = ECDH(client ephemeral, server static pub)`
+  on the client and `ECDH(server static priv, client ephemeral pub)` on the
+  server, both reading the ephemeral from the hello's X25519 or X25519MLKEM768
+  key share.
+- KDF. `authKey = HKDF-SHA256(sharedSecret, salt = helloRandom[:20],
+  info = "ur-extender-reality-v1", 32)`.
+- Plaintext (16 bytes): a 3-byte client version `{2,0,0}` so the server can
+  bound min and max client versions as REALITY does, one reserved zero, a
+  4-byte big-endian unix time, and the 8-byte shortId.
+- Seal. AES-256-GCM under authKey (a 32-byte key), nonce `helloRandom[20:]`
+  (12 bytes), additional data the marshaled ClientHello with its session-id
+  field zeroed, output 16 + 16 = 32 bytes, which is exactly the session-id
+  length it replaces.
+
+What it binds: the identity, because only the holder of the matching static
+private key derives authKey, and the shortId in the plaintext ties the tag to
+this extender's key; and the time, in the plaintext, checked against a window.
+The additional data is the whole hello, so a tag cannot be lifted onto a
+different hello: a different random or key share changes both the data and the
+nonce, and the open fails. `ExtenderCamouflageTimeWindow` (default 2 minutes)
+is the tolerated skew each way; a client whose clock is outside it seals a time
+the server rejects and falls back to the legacy dial (P4, E/client).
+
+P2. Replay protection — the one thing REALITY lacks. REALITY accepts any hello
+whose tag opens and whose time is in window; it keeps no record of tags it has
+seen, so a prober that captures one authenticated hello and resends it
+verbatim is handled on the authenticated path rather than spliced, which tells
+the prober the server is not the borrowed site (the server does not fall back
+to it). The extender closes this: a bounded, time-windowed seen-tag set keyed
+on the 32-byte sealed session id. On a hello whose tag opens and whose time is
+in window, the server checks and inserts the tag; a tag already present is a
+replay and is handled exactly as an unauthenticated hello — spliced to the real
+site (P3) — so a replay is indistinguishable to the prober from any other
+probe. Entries expire after `2 × ExtenderCamouflageTimeWindow` (a tag older
+than that fails the time check anyway, so nothing older need be remembered) and
+the set is capped at `ExtenderCamouflageReplayTagCount` (default 65536, oldest
+evicted); an eviction under flood can at worst let one replay through as a
+fresh auth, which is harmless, because the replayer holds the client ephemeral
+public key but not its private half and so cannot finish the TLS 1.3 handshake
+or send any inner byte — the replay buys nothing but the handshake the server
+would complete for any authenticated hello, and the seen-tag set removes even
+that signal in the common case. The set keys on the session id, which is a
+deterministic function of the client's 32-byte random, so two genuine dials
+never collide.
+
+Verification cost on the server (the prototype measured 0.48 us to parse the
+hello and 43 us for the auth check, the X25519 ECDH being almost all of the
+43 us). The ECDH is spent only on a hello that could be authenticated: the
+session id is exactly 32 bytes and the hello carries an X25519 or
+X25519MLKEM768 key share. A plain Go client with no session id, a legacy
+extender client, and most probers skip the ECDH on that gate. After it, the
+AES-GCM open is cheap, the time check and the seen-tag check are a map
+operation. The whole check sits behind the A12 admission limiter and its
+per-subnet and refusal caps, so the ECDH rate is bounded under flood by the
+same machinery that bounds every other action.
+
+P3. The demultiplex and the splice. The tcp carrier's accept path gains a peek
+in front of `tls.Server`. The server reassembles the first TLS handshake
+record or records into the complete ClientHello without consuming them — the
+resilient client fragments the hello across records and segments
+(net_resilient.go), and a Chrome hello with an ML-KEM key share is ~1.7 to
+2 KB, so the reassembly reads TLS record headers (type 22, a handshake) and
+accumulates handshake bytes up to a bound (`ExtenderCamouflageHelloMaxByteCount`,
+16 KiB) before parsing — then parses it (through the utls/tlshacks parser the
+package already links) for the random, the session id, the key shares, the SNI
+and the ALPN, and keeps the read bytes to hand to whatever serves the
+connection next, exactly as newConnWithInitialBytes already prepends read bytes
+today. The first bytes that are a v1 length prefix (≤ 1024) are still the v1
+path (A3); the camouflage peek applies only to a TLS ClientHello, which is what
+the tcp carrier's outer bytes always are.
+
+The three outcomes:
+
+- Authenticated (tag opens, time in window, not a replay). The buffered-and-
+  following bytes go to `tls.Server` with the identity certificate
+  (GetCertificate, unchanged) and an authenticated `tls.Config` whose
+  `NextProtos` is `{"http/1.1"}` alone (P4). The handshake completes with the
+  identity leaf — encrypted in TLS 1.3, so a passive observer never sees it —
+  and the existing v2 http request path (A3) runs inside unchanged: the client
+  still sends the extender header, and the whitelist (A5), the admission
+  limiter (A12), the services (A8) and everything else apply as before. The
+  client still verifies the leaf under the record key (B3). The session-id tag
+  is an outer gate that makes the first flight look like a browser's visit to
+  the borrowed site; it does not replace any inner check.
+- Unauthenticated, splice mode on (`ExtenderCamouflageSplice`, P7). The SNI
+  names a borrowed site on the bundled splice list (P5); the extender resolves
+  it over its DoH cache on the client's family (A7), opens a tcp connection to
+  it on 443, writes the buffered ClientHello to it and relays raw bytes both
+  ways. The real site completes its own handshake with its own CA-valid
+  certificate, so an active prober — including a prober replaying a captured
+  authenticated hello (P2) — sees the real site, which is what REALITY's
+  fallback achieves and what closes the "a prober that validates certificates
+  sees a misconfigured host" limitation (section 6). The relay is raw tcp (the
+  bytes are the prober's TLS to the real site; the extender cannot and does not
+  inspect them), so the only in-band controls are byte and time bounds: the A5
+  bounds reused — relayed bytes per connection 8 MiB, idle 30 s — plus the A12
+  per-subnet rate, a total concurrent-splice cap
+  (`ExtenderCamouflageSpliceMaxCount`), and a per-target cap
+  (`ExtenderCamouflageSpliceMaxPerTarget`) so no one borrowed site is hammered
+  by one extender. A borrowed SNI the extender cannot reach falls to another
+  reachable borrowed target of the same family, so the prober still gets a real
+  site; only when none is reachable does it degrade to the A5 reverse proxy
+  (terminate, self-signed, real content), the one case the old tell returns.
+- Unauthenticated, splice mode off (`ExtenderCamouflageSplice` false — the
+  migration default and the legacy-safe posture). The hello is terminated as
+  today: GetCertificate issues the per-name leaf, and the inner v1 or v2 http
+  path or the A5 reverse proxy serves it. A legacy extender client (Go TLS, a
+  spoof SNI, no tag) is indistinguishable from a prober at the ClientHello, so
+  it can only be served while unauthenticated hellos are terminated; this is
+  why splice is a flag and not the first posture.
+
+Migration and retirement. Two phases, parallel to A3's "v1 acceptance dropped
+one release later". Phase A, `ExtenderCamouflageSplice` off: new clients send
+authenticated (browser) hellos and get the camouflage path; legacy clients send
+unauthenticated hellos and are terminated and served as today; probers get
+today's posture (a self-signed leaf for any name), unchanged. The passive win —
+no more Go fingerprint on a new client's first flight — lands in Phase A alone.
+Phase B, `ExtenderCamouflageSplice` on, flipped one release after new clients
+ship and legacy clients are retired: unauthenticated hellos are spliced, so
+probers get the real site, and any remaining legacy client breaks, which the
+retirement schedule already accounts for. The flip is an operator setting, not
+a code change.
+
+P4. The ALPN problem, resolved server-side. The server offers `{"h2","http/1.1"}`
+so a prober that asks for h2 gets it (A3); the extender protocol needs
+http/1.1, since the connection is hijacked and h2 cannot be (A3 refuses an
+extender request over h2 with 403). A real Chrome hello advertises
+`{"h2","http/1.1"}`, h2 first. The resolution is not to rewrite the client's
+ALPN — rewriting it to http/1.1 alone is a tell, a "Chrome hello that offers
+only http/1.1", which is why this design does not follow the VLESS dialer's
+ALPN rewrite (vless_dial.go) here — but to let the client send a faithful Chrome
+hello and have the server negotiate http/1.1 on the authenticated path: its
+authenticated `tls.Config` offers `{"http/1.1"}` alone, so the intersection
+with the client's `{"h2","http/1.1"}` is http/1.1 whatever the order. The
+selected protocol travels in the TLS 1.3 EncryptedExtensions, which are
+encrypted, so a passive observer sees the client's faithful `{"h2","http/1.1"}`
+in the plaintext hello and never sees the server's choice. The server knows a
+connection is authenticated before it hands it to `tls.Server` (the tag opened
+during the peek), so it picks the authenticated config then. A prober is never
+on the authenticated path, so its h2 request is unaffected: in Phase A it is
+terminated with `{"h2","http/1.1"}` as today, in Phase B it is the real site's
+own ALPN.
+
+P5. Borrowed names. The splice relays to the real site, so the borrowed name
+must be a site that is actually reachable, speaks TLS 1.3, offers an X25519 or
+X25519MLKEM768 key share (so the spliced handshake is as modern as the Chrome
+hello that fronted it), and is plausibly hosted on an arbitrary address rather
+than pinned to a well-known CDN range. The existing spoof list (A10,
+net_extender_spoof.go, the v1 service and mail names) is the wrong list for
+this: those are big-site names whose addresses a censor knows, so an extender
+on a home address claiming one is an obvious SNI-to-IP mismatch (section 6, and
+a limit REALITY shares). The camouflage splice therefore draws from a separate
+bundled list, `res/extender_borrow[_<cc>].bin`, in the same xor-masked gzip
+form as the spoof resource and with the same per-country override
+(SpoofDomainsForCountry's shape), curated for splice-friendliness — reachable,
+modern-TLS, not CDN-pinned, plausible in the region. The list is bundled in
+connect root, so the client draws its front SNI from it and the server
+validates and splices to it from one shared source; there is nothing per-
+extender to agree on. At role start the extender verifies each candidate it
+would use — a TLS 1.3 dial that reaches X25519/MLKEM and is not a shared CDN —
+and keeps only the ones that pass; an extender with none verified publishes no
+camouflage key and serves the legacy terminate path alone, so a bad list
+degrades to today rather than breaking. No borrowed list is bundled yet; like
+the country spoof lists it needs measurement first.
+
+P6. Records, activation, operator, gossip and TXT size. One new signed field
+on `ExtenderRecordBody`, `RealityPublicKey` (field 13, the 32-byte X25519
+static public key of P1). The shortId and the borrowed names are not in the
+record: the shortId is derived from the identity key both ends already have,
+and the front SNI is drawn from the bundled list (P5), which keeps the record
+and therefore the TXT value small. The body is signed opaquely
+(ExtenderRecord.Body, "ur-extender-record-v1"), so the new field is covered by
+the root signature and a reader that predates it skips it as an unknown proto3
+field and simply does not dial the camouflaged carrier — old clients skip
+unknown carriers by having no key to front with, which is non-fatal by
+construction. Activation gains one arg, `reality_public_key_hex`
+(ExtenderActivateArgs); an operator on an older binary ignores the unknown JSON
+field (Go's decoder does, without DisallowUnknownFields) and signs a record
+without the camouflage key, so activation stays non-fatal. Critically the
+camouflage does not add a new carrier string: it rides the existing `"tcp"`
+carrier, so the operator's `unknown carrier` refusal (server
+controller/extender_controller.go, the carrier loop) never fires on it. The
+activation probe is unchanged — it proves tcp forwards over the terminated path
+as today; the camouflage auth is proven client-side by the B3 leaf check, so
+the operator need not act as a camouflage client. Optionally the operator also
+dials the splice path with an unauthenticated hello and a borrowed SNI and
+expects the real site, a nice-to-have that verifies Phase B before it is
+flipped.
+
+TXT size. The record grows by the 32-byte key, ~44 base64 characters, so a
+dual-stack value moves from about 340 to about 384 characters, not the ~452 a
+borrowed name in the record would have cost — the reason the name is bundled
+rather than published. A location's TXT set holds up to `sample_count`
+(default 8) values, so the largest set stays near 8 × 384 ≈ 3 KB, at the C5
+bound; if a future field pushes past it, the extender TXT set's sample_count
+drops to 6 before the record carries anything larger, since EDNS0's 4 KB is the
+hard ceiling the C5 note set 3 KB inside of.
+
+P7. Flags, roles and metrics. `ExtenderSettings.CamouflageEnabled` (default
+false) gates whether the server recognizes auth tags, publishes a
+`RealityPublicKey` and negotiates the authenticated http/1.1 config;
+`ExtenderSettings.ExtenderCamouflageSplice` (default false) is the Phase-A→B
+flip of P3, meaningful only while CamouflageEnabled. The operator flag is off
+by default, as the owner asked; the provider-extender role carries a device
+default `DeviceLocalSettings.DefaultCamouflage` in the shape of
+`DefaultProvideExtender` (F3, G1), so an embedder sets the posture its users
+want. The client needs no flag: it uses the camouflaged tcp dial for any record
+that carries a `RealityPublicKey`, and the kill switch is the sibling branch's
+`ConnectSettings.TlsClientHelloFingerprint` set to `"go"`, which drops the
+camouflaged variant back to the legacy Go-TLS dial. Metrics: the extender
+counts authenticated, spliced and terminated tcp connections, replay-cache hits
+(replays refused), auth opens that failed the time window, splice-target dial
+failures and borrowed-name verification failures, carried on `ExtenderStats`
+and surfaced in the provide status beside the A12 admission counts.
+
+P8. Client dial. The camouflaged variant folds into the existing tcp carrier as
+one dialer, one strategy slot and one directory outcome — not a second carrier
+and not a second priority — the way the dns-port race is one dial over several
+ports (net_extender_dns_ports.go, the 250 ms stagger). The tcp dial becomes a
+camo-first-then-legacy staggered race: it launches the camouflaged attempt (a
+uTLS Chrome hello with the sealed session id of P1, through the vless_reality
+helpers generalized to the extender domain labels) at once, and the legacy
+attempt (today's Go-TLS dial, newExtenderTlsConfig) one stagger later while the
+first is pending, or at once if the first fails; the first to answer wins and
+the other is canceled and joined, exactly raceExtenderDnsPorts' shape. The
+camouflaged attempt is tried only when the config carries a `RealityPublicKey`
+(from a verified record, E5) and the fingerprint switch is not `"go"`; a config
+with no camouflage key runs the legacy attempt alone. Clock skew past the time
+window (P1) makes the camouflaged attempt fail its auth and the race fall to
+legacy. In Phase A that still reaches the extender, just without the
+camouflage. In Phase B the legacy attempt is spliced to the borrowed site and
+fails the B3 leaf check, so a skewed client loses the tcp carrier and reaches
+the extender over its udp carriers only. To keep that rare, the client seals
+with its clock corrected by a server-time offset learned from a verified source
+(the Date header of an authenticated platform API response or of a verified
+DoH answer); connect keeps no such offset today, so 14a adds one. The outcome
+the directory records is the tcp carrier's, as the dns
+race records one carrier outcome however many ports it tried, so a camouflaged
+attempt that fails neither holds the address nor spends a second slot. The
+resilient fragment and reorder wrapping (net_resilient.go) applies to the
+camouflaged attempt as it does to the legacy one; the server reassembles the
+fragmented Chrome hello during the peek (P3).
+
+P9. tcp only. REALITY is a TLS-over-tcp technique: the tag rides the TLS 1.3
+ClientHello and the splice is a tcp relay to the borrowed site. The udp
+carriers (quic on 443, the dns carrier on 4053 and 53) keep A1 to A12
+unchanged; QUIC has its own fingerprinting surface and the splice does not map
+onto it cleanly, so they stay identifiable on the same address (section 6,
+unchanged). The camouflage is a tcp-carrier property; a client that reaches an
+extender over quic or dns is exactly as it is today.
+
+P10. Tests. Deterministic, in-process, with a fake borrowed-site TLS server as
+the splice target, synthetic `.example` borrowed names and RFC 5737/3849
+addresses. Auth ok: a sealed hello whose tag opens and whose time is in window
+takes the authenticated path, terminates with the identity leaf, and the client's
+B3 check passes. Wrong key: a tag sealed against a different static key fails
+the open and is spliced (Phase B) or terminated (Phase A). Replay refused: the
+same authenticated hello twice is authenticated once and spliced the second
+time, and the replay counter increments. Skew fallback: a tag whose time is
+outside the window is not authenticated, and the client's race falls to the
+legacy attempt. Legacy client: a Go-TLS hello with no tag is terminated and
+served in Phase A and spliced in Phase B. Fragmented hello: a resilient client
+that fragments the Chrome hello across records is reassembled and authenticated.
+Bounded splice: the per-subnet, byte, idle, total and per-target caps each
+refuse past their bound, and a spliced byte is never counted as relay traffic
+(O1). ALPN: an authenticated connection negotiates http/1.1 though the client
+offered `{"h2","http/1.1"}`, and the selection is not on the wire.
+
+Phase (adds to section 5, after phase 9, independent of the gossip and alt
+work): 14. Camouflage. 14a (connect root, connect/extender, protocol): P1 to
+P10 — the seal and open generalized from vless_reality, the ClientHello peek,
+reassembly and parse, the authenticated http/1.1 config, the replay set, the
+splice with its bounds, the bundled borrow list, the `RealityPublicKey` record
+field and the X25519 static-key derivation, and the client's camo-first-then-
+legacy tcp race. 14b (server): `reality_public_key_hex` in activation, the
+stored and signed key, the optional splice probe. 14c (sdk): the role derives
+and publishes the static key (HKDF from the identity seed, no new persistence),
+`DefaultCamouflage`, the status counts, bindings. Acceptance: P10's tests pass;
+an authenticated client reaches an in-process operator through the camouflaged
+tcp carrier and the leaf verifies under the record key; a wrong key and a
+replay are spliced to the fake borrowed site; a legacy client works in Phase A;
+a skewed client falls back; the record grows by one field that old readers skip.
+
 ### I. Tests
 
 Every phase ships tests with it. In-process fixtures only: the extender
@@ -2886,6 +3237,14 @@ with the database.
 | `connect.ExtenderPeerPingerSettings` | `PeerSampleSize` (64) added (G5, GEOMAP §2.1) |
 | `connect.ExtenderPeerPingerStatus` | `SampleSize`, `SampledPeerCount` added; `ExtenderPeerPinger.SampledPeers` (G5) |
 | sdk native extender role | `PeerSampleSize`, `MaxActiveRecordCount` on its settings (G5, E6) |
+| `protocol.ExtenderRecordBody` | `RealityPublicKey` added (field 13), the 32-byte X25519 static key; signed, old readers skip it (P1, P6) |
+| `POST /network/extender-activate` args | `reality_public_key_hex`; unknown to old operators, so non-fatal (P6) |
+| extender tcp 443 | a browser ClientHello whose session id seals the client's proof (P1); an unauthenticated hello is spliced to the real borrowed site in splice mode, else terminated as today (P3); authenticated connections negotiate http/1.1 server-side (P4) |
+| `extender.ExtenderSettings` | `CamouflageEnabled` (default off), `ExtenderCamouflageSplice` (default off), `ExtenderCamouflageTimeWindow` (2 min), `ExtenderCamouflageReplayTagCount` (65536), `ExtenderCamouflageHelloMaxByteCount` (16 KiB), `ExtenderCamouflageSpliceMaxCount`, `ExtenderCamouflageSpliceMaxPerTarget` added (P1, P2, P3, P7) |
+| `extender.ExtenderStats` | authenticated/spliced/terminated tcp connection counts, replays refused, auth time-window failures, splice-target and borrow-verify failures (P7) |
+| connect root | `res/extender_borrow[_<cc>].bin`, a splice-friendly borrowed-names list in the spoof-resource form, bundled; the X25519 static-key HKDF derivation from the identity seed (P1, P5) |
+| `connect.ExtenderConfig` | the camouflaged tcp dial folds in as a camo-first-then-legacy staggered race on the existing tcp carrier, driven by `RealityPublicKey`; kill switch is the sibling branch's `ConnectSettings.TlsClientHelloFingerprint="go"` (P8) |
+| `sdk.DeviceLocalSettings` | `DefaultCamouflage` added, default following `DefaultProvideExtender` (P7) |
 
 Old clients keep working: the header's new fields are optional, the hello
 field is additive, the tables are new, and a v1 extender client still
@@ -3045,7 +3404,30 @@ Phase 5b follows 4 because both touch the server.
   attribution to a dedicated edge port is a later phase.
 - The reverse proxy answers probers behind a self-signed cert; an active
   prober that validates certificates sees a misconfigured host, which is
-  the accepted posture.
+  the accepted posture. The camouflage splice (P3) closes this on the tcp
+  carrier in Phase B: an unauthenticated prober is spliced to the real
+  borrowed site and sees its real certificate. The self-signed posture
+  remains for the udp carriers (P9), for the tcp carrier in Phase A (the
+  migration default), and as the degraded fallback when no borrowed target
+  is reachable (P3).
+- Camouflage is a classifier defense, not an address defense. The borrowed
+  site is not hosted at the extender's address, so an extender on a home
+  address claiming a big-site name is an SNI-to-IP mismatch a censor can
+  catch by address (REALITY shares this); the borrowed-names list is curated
+  for names plausibly hosted anywhere to narrow it, not to erase it (P5), and
+  the directory stays enumerable regardless, so camouflage helps against a
+  censor that classifies traffic, not one that harvests addresses. The
+  mismatch is exploited, not theoretical: users reported China blocking
+  hundreds of REALITY server addresses on 4 to 12 March 2026, apparently
+  because the borrowed name did not belong to the server's address range
+  (community reports, not a published measurement).
+- The splice sends a prober's bytes to a third-party borrowed site from many
+  extender addresses; the per-subnet, per-connection byte, idle, total and
+  per-target bounds of P3 keep it bounded, and the posture is off by default
+  (P7) until an operator accepts it.
+- Camouflage is tcp only (P9). QUIC on udp 443 and the dns carrier stay
+  identifiable on the same address, and TLS-in-TLS detection applies to every
+  carrier, the camouflaged one included.
 - H3 to the operator is unavailable through an extender; the H1 websocket
   runs inside the carriers.
 - Records lag reality by up to one drip rotation; the directory's local
