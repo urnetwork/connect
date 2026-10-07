@@ -413,3 +413,11 @@ func (self *WebRtcManager) ExtenderCarrierExchanger(extenderClientId Id) WebRtcE
 func (self *WebRtcManager) ExtenderCarrierSignalingStats() WebRtcExtenderSignalingStats {
 	return self.extenderCarrier.stats()
 }
+
+// HasExtenderCarrierAnswerer reports whether an extender answerer is
+// installed, which is whether this client serves the webrtc carrier.
+func (self *WebRtcManager) HasExtenderCarrierAnswerer() bool {
+	self.extenderCarrier.stateLock.Lock()
+	defer self.extenderCarrier.stateLock.Unlock()
+	return self.extenderCarrier.answerer != nil
+}
