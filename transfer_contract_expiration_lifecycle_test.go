@@ -128,8 +128,8 @@ func (self *expirationLifecycleAuthority) terminalReports(contractId Id) []*prot
 	return reports
 }
 
-// Holds an actual payload before delivery, preserving its outstanding head
-// while the next application send reaches the ahead-announcement decision.
+// Holds a payload or returning ack before delivery. Releasing it orders test
+// snapshots before the receiver or sender resumes mutating sequence state.
 type expirationLifecycleWireBarrier struct {
 	content string
 	entered chan struct{}
@@ -151,6 +151,7 @@ type expirationLifecycleFixture struct {
 	droppedAcks      atomic.Int32
 	lostAckWrites    atomic.Int32
 	forwardBarrier   atomic.Pointer[expirationLifecycleWireBarrier]
+	ackBarrier       atomic.Pointer[expirationLifecycleWireBarrier]
 	stateLock        sync.Mutex
 	deliveries       map[string]int
 	routes           []Route
@@ -224,6 +225,17 @@ func newExpirationLifecycleFixture(t *testing.T, announceAhead bool, configure .
 					f.droppedAcks.Add(1)
 					MessagePoolReturn(wire)
 					continue
+				}
+				if ackRoute && transfer.Ack != nil {
+					if barrier := f.ackBarrier.Load(); barrier != nil {
+						barrier.once.Do(func() { close(barrier.entered) })
+						select {
+						case <-barrier.release:
+						case <-ctx.Done():
+							MessagePoolReturn(wire)
+							return
+						}
+					}
 				}
 				if !ackRoute && transfer.Pack != nil {
 					for _, frame := range transfer.Pack.Frames {
@@ -436,6 +448,10 @@ func TestSignedContractExpirationLostAckRetryPreservesAccounting(t *testing.T) {
 		f.finishSend(f.startSend("opening"))
 		sender, receiver := f.sequences()
 		active, received := sender.sendContract, receiver.receiveContract
+		barrier := &expirationLifecycleWireBarrier{
+			entered: make(chan struct{}), release: make(chan struct{}),
+		}
+		f.ackBarrier.Store(barrier)
 		f.dropAcksBefore.Store(f.deadline.UnixNano())
 		ack := f.startSend("lost-ack")
 		synctest.Wait()
@@ -451,6 +467,14 @@ func TestSignedContractExpirationLostAckRetryPreservesAccounting(t *testing.T) {
 			t.Fatal("lost acknowledgement completed before the post-expiry retry")
 		default:
 		}
+		select {
+		case <-barrier.entered:
+		case <-time.After(20 * time.Second):
+			t.Fatal("post-expiry retry never reached the acknowledgement barrier")
+		}
+		// Quiescence precedes the snapshots; this release also orders them before
+		// the timer-driven retry ack updates the pending queue and byte counts.
+		close(barrier.release)
 		f.finishSend(ack)
 		if f.droppedAcks.Load() == 0 || f.lostAckWrites.Load() < 2 || len(sender.sendItems) != 0 {
 			t.Fatal("the duplicate did not recover the lost acknowledgement after expiry")
