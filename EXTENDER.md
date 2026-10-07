@@ -100,9 +100,9 @@ Clarifications given during review, which the decisions below implement:
 
 A1. Three carriers, one stream contract. The extender listens on tcp 443,
 udp 443 and the dns carrier's udp 4053, and the sn miner on udp 53 as well
-(L2). Tcp 443 is the one port an extender requires; the udp carriers are
-optional (G2). Each carrier yields one reliable byte stream from the
-client:
+(L2). Acceptance requires public tcp 443 or a peer-to-peer webrtc
+connection (C2a); the udp carriers are optional (G2). Each carrier yields
+one reliable byte stream from the client:
 
 - tcp 443: TLS, terminated by the extender with a cert for the requested
   SNI (B3).
@@ -598,16 +598,55 @@ random, `allowed_hosts` the operator patterns of A5. On success the row
 and the family's address row are upserted active, `record_issue_time` is
 set, and a record publish row is inserted. The country comes from the ip
 geolocation of the caller. A probe failure returns `activated: false` with
-the failing carrier in `error` and stores nothing. The tcp carrier is
-required, since only it can prove the forward. Zero ports and an empty tld
+the failing carrier in `error` and stores nothing. Acceptance requires
+public tcp 443 or peer-to-peer webrtc, each of which proves the forward
+(C2a). Zero ports and an empty tld
 take the C1 defaults. The configuration check precedes the rate limit so
 an unconfigured operator never spends a caller's budget. A failed
 geolocation leaves the country empty rather than failing the activation.
 The bootstrap records are signed fresh at each activation. Probe requests
 name the api host on port 443 as their destination.
 
+C2a. Acceptance criteria (owner, 2026-10-07). An extender is accepted when
+it passes at least one required test. Every other carrier is optional.
+
+- Required, at least one of:
+  - Public tcp 443. The activation probe dials the caller's public address
+    on the tcp carrier, verifies the challenge signature against
+    `public_key_hex`, and proves the forward with a verified `GET /hello`
+    through it (C2).
+  - Peer-to-peer webrtc. The operator opens a webrtc data channel to the
+    extender through the exchange signaling (ICE and STUN traversal, the
+    webrtc carrier), verifies the same challenge signature over it, and
+    proves the forward with the same verified `GET /hello` through the data
+    channel. This is the path for an extender behind NAT, which has no
+    public inbound address. It lands with the webrtc carrier.
+- Optional, probed only when offered, never gating: udp 443 (quic), the dns
+  carrier on udp 4053, and udp 53 on the sn miner. An optional carrier that
+  fails its probe is left out of the stored `carriers`; it does not fail an
+  activation that passed a required test.
+- Not accepted: an extender that passes neither required test. Activation
+  returns `activated: false` with the failed required tests in `error` and
+  stores nothing.
+- Uptime follows acceptance. C3 probes each address over the required path
+  it was accepted on: the tcp challenge for a public-tcp extender, a webrtc
+  challenge for a webrtc extender. A webrtc extender is never deactivated
+  for lacking a public tcp port.
+- The stored address and the signed record carry which required path the
+  extender passed, so clients and the uptime task use the right one.
+- Provider role (G2). The role's `tcp_unavailable` error applies only when
+  the webrtc path is also unavailable; a provider that cannot bind tcp 443
+  but can complete the webrtc test still extends.
+- Tests (deterministic, per CODESTYLE.md): accepted on tcp alone; accepted
+  on webrtc alone; accepted when both pass; not accepted when neither
+  passes; a failing optional carrier is left out of `carriers` without
+  failing an activation that passed a required test; the uptime task probes
+  a webrtc-accepted address over webrtc and does not deactivate it for a
+  missing tcp port.
+
 C3. Uptime probes. Taskworker task every 5 minutes over every active
-address, batched, concurrency 16, tcp challenge probe only, 15 s timeout.
+address, batched, concurrency 16, a challenge probe over the required path
+the address was accepted on (C2a), 15 s timeout.
 A failure increments `consecutive_probe_failures`; at 6 the address is
 deactivated. When an extender has no active address it becomes inactive,
 `revoke_time` is set and a revocation publish row is inserted. A success
