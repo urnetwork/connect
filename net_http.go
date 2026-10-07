@@ -307,6 +307,17 @@ type ClientStrategy struct {
 	// means all slots free, so a bare test-constructed strategy works
 	// unchanged.
 	reconnectFastPathCount int
+
+	// scores is the per-network, delivery-verified, decayed ranking layer over
+	// the race (net_strategy_score.go). It multiplies each dialer's shuffle
+	// weight by what that dialer has delivered on the current network, blended
+	// with any injected prior; empty or absent it is neutral (1.0), so a
+	// strategy that has learned nothing -- and a bare test-constructed one whose
+	// scores is nil -- races exactly as before. currentNetworkId keys it and is
+	// client-only: it is derived from the host's wifi bssid / cellular mcc-mnc
+	// and is NEVER uploaded. Guarded by mutex.
+	scores           *networkStrategyScores
+	currentNetworkId string
 }
 
 func NewClientStrategyWithDefaults(ctx context.Context) *ClientStrategy {
@@ -544,6 +555,12 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 	for _, dialer := range newAltDialers(clientStrategy, settings) {
 		dialers[dialer] = true
 	}
+	// the delivery-verified per-network ranking layer, set up once the dialer
+	// set is complete and before any external callback can read it. The config
+	// hash baseline is the live dialer set plus the tls fingerprint, so a later
+	// config change clears learned winners (net_strategy_score.go).
+	clientStrategy.scores = newNetworkStrategyScores()
+	clientStrategy.scores.setConfigHash(clientStrategy.strategyConfigHashWithLock())
 	// a host network path change drops the dialers' pooled http connections:
 	// they are bound to the old path, and the next api call (auth,
 	// find-providers) would otherwise stall on a dead socket until its
@@ -630,6 +647,9 @@ func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]
 			delete(self.dialers, dialer)
 		}
 	}
+	// the set of custom extenders is part of the strategy config; a change
+	// invalidates per-network winners learned under the old set
+	self.invalidateScoresForConfigChangeWithLock()
 }
 
 // ExtenderDirectory is the directory this strategy draws extenders from, nil
@@ -730,6 +750,9 @@ func (self *ClientStrategy) SetVlessConfigs(vlessConfigs []*VlessConfig) {
 			self.dialers[dialer] = true
 		}
 	}
+	// vless servers are part of the strategy config; a change invalidates
+	// per-network winners learned under the old set
+	self.invalidateScoresForConfigChangeWithLock()
 }
 
 // Copies of the configurations of the strategy's VLESS dialers, in no
@@ -948,9 +971,12 @@ func (self *ClientStrategy) dialerWeights(webSocketOnly bool) map[*clientDialer]
 // (A12), which a dial would only be turned away by again, and the earliest
 // time one of those stops being limited, zero when none is.
 func (self *ClientStrategy) dialerWeightsUnlimited(webSocketOnly bool) (map[*clientDialer]float32, time.Time) {
+	var networkId string
 	weights := func() map[*clientDialer]float32 {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
+
+		networkId = self.currentNetworkId
 
 		weights := map[*clientDialer]float32{}
 
@@ -971,6 +997,18 @@ func (self *ClientStrategy) dialerWeightsUnlimited(webSocketOnly bool) (map[*cli
 		}
 		return weights
 	}()
+
+	// Bias each dialer by what it has DELIVERED on the current network (decayed,
+	// ttl-bounded, blended with any injected prior). The score is an external
+	// object with its own lock, so it is consulted with the strategy lock
+	// released; it is neutral (1.0) for a dialer with no verdicts and no prior,
+	// so this leaves the race unchanged until delivery evidence accrues. A bare
+	// test-constructed strategy has no scores and is skipped entirely.
+	if self.scores != nil {
+		for dialer := range weights {
+			weights[dialer] *= self.scores.weight(networkId, dialer.dialerKey())
+		}
+	}
 
 	// the directory is an external object, so the limits are read with no
 	// lock held
