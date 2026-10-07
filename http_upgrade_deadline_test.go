@@ -232,7 +232,7 @@ func TestH1StrategyHandshakeRTTBudgets(t *testing.T) {
 						if len(attempts) != wantAttempts || attempts[0].budget != 5*time.Second {
 							t.Fatalf("native handshake budget/attempts: %+v", attempts)
 						}
-						_, websocketSelected := conn.(*websocket.Conn)
+						_, websocketSelected := unobservedH1MessageConn(conn).(*websocket.Conn)
 						if websocketSelected != legacy {
 							t.Fatalf("carrier %T, legacy=%t", conn, legacy)
 						}

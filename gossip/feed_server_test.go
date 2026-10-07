@@ -11,9 +11,10 @@ package gossip
 import (
 	"context"
 	"crypto/ed25519"
-	"fmt"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -203,20 +204,38 @@ func TestGossipFeedDisconnectsASlowSubscriber(t *testing.T) {
 	feed := NewFeedServer(ctx, directory, nil, settings)
 	t.Cleanup(feed.Close)
 
-	client := newTestFeedClient(t, feed, true)
+	clientConn, serverConn := net.Pipe()
+	barrier := &testFeedWriteBarrierConn{Conn: serverConn, entered: make(chan struct{}), proceed: make(chan struct{})}
+	client := &testFeedClient{conn: clientConn, done: make(chan struct{})}
+	go func() {
+		defer close(client.done)
+		defer serverConn.Close()
+		feed.Serve(barrier)
+	}()
+	t.Cleanup(func() { barrier.release(); clientConn.Close(); <-client.done })
+	if err := connect.WriteExtenderFeedRequest(client.conn, &protocol.ExtenderFeedRequest{Subscribe: true}); err != nil {
+		t.Fatal(err)
+	}
 	client.readEndOfSample(t)
+	barrier.armed.Store(true)
 
 	// the server takes one message and blocks writing it, the buffer takes the
 	// next, and the one after that overflows and cuts the subscription off
 	issueTime := time.Now()
-	for i := range connect.ExtenderDirectorySubscribeBufferCount + 2 {
+	extenderKey := newTestKey(t)
+	first := signTestRecord(t, rootKey, extenderKey, "198.51.100.1", 443, issueTime)
+	if _, err := directory.ApplyRecord(first, connect.ExtenderSourceGossip); err != nil {
+		t.Fatal(err)
+	}
+	<-barrier.entered
+	for i := range connect.ExtenderDirectorySubscribeBufferCount + 1 {
 		record := signTestRecord(
 			t,
 			rootKey,
-			newTestKey(t),
-			fmt.Sprintf("198.51.100.%d", i),
+			extenderKey,
+			"198.51.100.1",
 			443,
-			issueTime,
+			issueTime.Add(time.Duration(i+1)*time.Millisecond),
 		)
 		if _, err := directory.ApplyRecord(record, connect.ExtenderSourceGossip); err != nil {
 			t.Fatal(err)
@@ -224,6 +243,7 @@ func TestGossipFeedDisconnectsASlowSubscriber(t *testing.T) {
 	}
 	// releasing the blocked write is what lets the server see the closed
 	// subscription
+	barrier.release()
 	if _, err := connect.ReadExtenderFeedFrame(client.conn); err != nil {
 		t.Fatal(err)
 	}
@@ -232,6 +252,31 @@ func TestGossipFeedDisconnectsASlowSubscriber(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("a subscriber that fell behind was not disconnected")
 	}
+}
+
+// Pins the first live write after the sample so queue overflow cannot depend
+// on the server's scheduling or on changing partition membership.
+type testFeedWriteBarrierConn struct {
+	net.Conn
+	armed       atomic.Bool
+	entered     chan struct{}
+	proceed     chan struct{}
+	enterOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+// Blocks an armed write before touching the underlying pipe.
+func (self *testFeedWriteBarrierConn) Write(message []byte) (int, error) {
+	if self.armed.Load() {
+		self.enterOnce.Do(func() { close(self.entered) })
+		<-self.proceed
+	}
+	return self.Conn.Write(message)
+}
+
+// Cleanup also releases the barrier if an assertion ends the test early.
+func (self *testFeedWriteBarrierConn) release() {
+	self.releaseOnce.Do(func() { close(self.proceed) })
 }
 
 // One feed client over a pipe, with the server half served in its own

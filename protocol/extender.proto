@@ -155,6 +155,10 @@ message ExtenderRecordBody {
     // were taken by DirectoryTier and WebRtcClientId after P was written, so
     // this is field 15, not the 13 section P names.
     bytes RealityPublicKey = 15;
+    // Exclusive discovery channel of an operator canary. Empty preserves
+    // ordinary tier behavior. Canary records also use the gated wire tier
+    // so older tier-aware readers cannot relay them on open channels.
+    string CanaryChannel = 16;
 }
 
 message ExtenderRecord {

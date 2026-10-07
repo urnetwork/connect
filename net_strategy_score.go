@@ -23,8 +23,8 @@ package connect
 //     with no stall counts as success; a handshake, or a transfer that froze
 //     short of it, does not;
 //   - per-network keying: scores are keyed by a client-only network id
-//     (derived from wifi bssid / cellular mcc-mnc), which is NEVER uploaded, so
-//     a winner on one network is not reused on another;
+//     (a platform path generation by default, optionally a hashed stable
+//     host identifier), which is NEVER uploaded;
 //   - decay + ttl: evidence decays by a half-life and expires past a ttl, so a
 //     stale winner loses weight and reverts toward neutral;
 //   - retain a failed winner with probability ~0.5, so one transient stall does
@@ -33,23 +33,28 @@ package connect
 //     (they need a server channel, not built here); the scoring accepts an
 //     injected prior so that phase can plug in.
 //
-// The score is a MULTIPLIER on the dialer's shuffle weight. With no verdicts
-// and no prior it is exactly 1.0 -- neutral -- so a strategy that has learned
-// nothing races exactly as before.
+// The score multiplies the dialer's static configured weight. The lifetime
+// handshake ratio never enters production ranking. HTTP bodies and H1/WS
+// message reads supply payload evidence; short clean responses stay neutral.
 //
 // Concurrency: `networkStrategyScores` is safe for concurrent use; every method
 // takes `stateLock`. No external calls are made under the lock.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"math"
 	mathrand "math/rand"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // deliveryVerifiedByteCount is the payload a dial must deliver, with no stall
@@ -144,6 +149,13 @@ type networkScoreKey struct {
 	dialerKey string
 }
 
+// A stable configuration hash plus its activation generation prevents a late
+// attempt from repopulating an earlier configuration after it returns.
+type strategyScoreConfig struct {
+	hash       string
+	generation uint64
+}
+
 // decayedScore holds the delivered and total evidence mass as of updateTime.
 // The ratio alone is decay-invariant, so ranking uses the absolute masses
 // blended with the prior (`strategyScorePriorMass`): as the masses decay the
@@ -192,7 +204,8 @@ type networkStrategyScores struct {
 	// configHash invalidates the whole store when the strategy config changes
 	// (a new app version, new server-pushed tactics): a winner learned under
 	// the old strategy set must not be replayed under the new one.
-	configHash string
+	configHash       string
+	configGeneration uint64
 
 	halfLife                time.Duration
 	ttl                     time.Duration
@@ -243,6 +256,15 @@ func (self *networkStrategyScores) setConfigHash(configHash string) {
 		self.scores = map[networkScoreKey]*decayedScore{}
 	}
 	self.configHash = configHash
+	self.configGeneration++
+}
+
+// Snapshots immutable attempt ownership before consulting the strategy's live
+// dialers. A concurrent configuration change can only make this snapshot stale.
+func (self *networkStrategyScores) configuration() strategyScoreConfig {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return strategyScoreConfig{hash: self.configHash, generation: self.configGeneration}
 }
 
 // recordVerdict folds one finalized dial outcome into the per-network record.
@@ -251,6 +273,11 @@ func (self *networkStrategyScores) setConfigHash(configHash string) {
 // penalizes, except that a proven winner is retained with
 // `retainFailedProbability` so one transient stall does not flip it.
 func (self *networkStrategyScores) recordVerdict(networkId string, dialerKey string, verdict strategyVerdict) {
+	self.recordVerdictForConfig(nil, networkId, dialerKey, verdict)
+}
+
+// Late deliveries cannot repopulate scores after their strategy set changed.
+func (self *networkStrategyScores) recordVerdictForConfig(config *strategyScoreConfig, networkId string, dialerKey string, verdict strategyVerdict) {
 	if verdict == verdictHandshake {
 		return
 	}
@@ -262,6 +289,9 @@ func (self *networkStrategyScores) recordVerdict(networkId string, dialerKey str
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if config != nil && (config.hash != self.configHash || config.generation != self.configGeneration) {
+		return
+	}
 
 	now := self.now()
 	key := networkScoreKey{networkId: networkId, dialerKey: dialerKey}
@@ -387,13 +417,33 @@ func (self *networkStrategyScores) setPrior(prior func(networkId string, dialerK
 	self.prior = prior
 }
 
-// dialerKey is the per-network scoring identity of a dialer: its description,
-// qualified by the extender address so each extender address scores on its
-// own. The description already encodes the carrier ("extender tcptls" /
-// "extender quic" / "extender dns"), so the address alone separates addresses.
-// The family (`strategyFamilyOf`) is the description before the "|", which
-// carries NO address -- so the report never emits an extender ip.
+// The opaque vless configuration identity includes every dialing field while
+// omitting its display name and unused crawl hint. Normalized defaults and user
+// ids keep equivalent configurations stable. Only the hash is retained.
+func vlessStrategyKey(config *VlessConfig) string {
+	identity := config.Copy()
+	identity.Name, identity.SpiderX = "", ""
+	identity.Network, identity.Security = config.network(), config.security()
+	identity.ServerName, identity.Host = config.serverName(), config.httpHost()
+	identity.Path = vlessHttpRequestUrl(config).String()
+	if id, err := vlessId(config.Id); err == nil {
+		identity.Id = hex.EncodeToString(id[:])
+	}
+	if len(identity.Alpns) == 0 {
+		identity.Alpns = nil
+	}
+	// VlessConfig contains only json-compatible scalar and slice fields.
+	encoded, _ := json.Marshal(identity)
+	sum := sha256.Sum256(encoded)
+	return "vless|" + hex.EncodeToString(sum[:])
+}
+
+// The scoring identity separates endpoint configurations without changing the
+// description before "|", which is the only part family telemetry publishes.
 func (self *clientDialer) dialerKey() string {
+	if self.strategyKey != "" {
+		return self.strategyKey
+	}
 	if self.extenderConfig != nil {
 		return self.description + "|" + self.extenderConfig.Ip.Unmap().String()
 	}
@@ -403,36 +453,129 @@ func (self *clientDialer) dialerKey() string {
 // strategyDialerKey rebuilds the scoring key from the info a completed dial
 // reports, so a delivery outcome lands on the same record the ranking reads.
 func (self *DialerInfo) strategyDialerKey() string {
+	if self.strategyKey != "" {
+		return self.strategyKey
+	}
 	if self.ExtenderIp.IsValid() {
 		return self.Description + "|" + self.ExtenderIp.Unmap().String()
 	}
 	return self.Description
 }
 
-// RecordDeliveryOutcome finalizes a dial's outcome AFTER the delivery canary,
-// where the "a path must deliver" rule lives: the transport reports how many
-// bytes the dial carried and whether it stalled, and `classifyDelivery` turns
-// that into a verdict keyed by the current client-only network. A handshake
-// that then froze at 16 KiB is a stall, not a success. The server-prior phase
-// aside, this is the one entry the transport calls on the first real transfer
-// reaching `deliveryVerifiedByteCount` (or stalling short of it).
+// Finalizes a stamped attempt at most once, against its original network and
+// strategy configuration. HTTP and H1/WS reads report automatically. Consumers
+// of the raw WebSocket API can use its returned DialerInfo to report delivery;
+// a manually constructed description cannot be attributed and is ignored.
 func (self *ClientStrategy) RecordDeliveryOutcome(info *DialerInfo, bytesDelivered int64, stalled bool) {
-	if self == nil || self.scores == nil || info == nil {
+	if self == nil || self.scores == nil || info == nil || info.delivery == nil || info.delivery.scores != self.scores {
 		return
 	}
-	networkId := func() string {
-		self.mutex.Lock()
-		defer self.mutex.Unlock()
-		return self.currentNetworkId
-	}()
-	self.scores.recordVerdict(networkId, info.strategyDialerKey(), classifyDelivery(bytesDelivered, stalled))
+	info.delivery.finish(classifyDelivery(bytesDelivered, stalled))
 }
 
-// SetNetworkId sets the client-only network context the delivery scores are
-// keyed by, derived from the host-reported wifi bssid / cellular mcc-mnc. The
-// id is hashed and used only as a local key; it is NEVER uploaded. Empty clears
-// it to the unknown-network bucket. A change does not clear the store -- a
-// winner on one network is simply not consulted on another.
+// Owns one attempt's immutable network/config identity and one delivery verdict.
+// Reads and explicit outcome reports may run concurrently.
+type strategyDeliveryAttempt struct {
+	scores         *networkStrategyScores
+	networkId      string
+	dialerKey      string
+	config         strategyScoreConfig
+	stateLock      sync.Mutex
+	bytesDelivered int64
+	finished       bool
+}
+
+// Captures attribution before dialing, including for attempts that finish after
+// a network transition. An unstamped DialerInfo is never evidence.
+func (self *ClientStrategy) dialerInfo(dialer *clientDialer) *DialerInfo {
+	info := dialer.Info()
+	if info == nil || self.scores == nil {
+		return info
+	}
+	config := self.scores.configuration()
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		if !self.dialers[dialer] {
+			// A selection retired before stamping owns no current attempt.
+			return
+		}
+		info.delivery = &strategyDeliveryAttempt{
+			scores:    self.scores,
+			networkId: self.currentNetworkId,
+			dialerKey: info.strategyDialerKey(),
+			config:    config,
+		}
+	}()
+	return info
+}
+
+// Serial preference uses the same decayed network evidence as weighted racing.
+func (self *ClientStrategy) dialerDelivered(dialer *clientDialer) bool {
+	if self.scores == nil {
+		return dialer.IsLastSuccess()
+	}
+	info := self.dialerInfo(dialer)
+	if info == nil || info.delivery == nil {
+		return false
+	}
+	return 1 < self.scores.weight(info.delivery.networkId, info.delivery.dialerKey)
+}
+
+// Finalizes at most once, with the score store called outside the attempt lock.
+func (self *strategyDeliveryAttempt) finish(verdict strategyVerdict) {
+	finished := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.finished {
+			return false
+		}
+		self.finished = true
+		return true
+	}()
+	if finished {
+		self.scores.recordVerdictForConfig(&self.config, self.networkId, self.dialerKey, verdict)
+	}
+}
+
+// Only received payload credits delivery. Clean short responses are neutral;
+// canceled race losers are neutral; read failures and deadlines are stalls.
+func (self *DialerInfo) observeRead(ctx context.Context, count int, err error, finalEof bool) {
+	if self == nil || self.delivery == nil {
+		return
+	}
+	attempt := self.delivery
+	bytesDelivered := func() int64 {
+		attempt.stateLock.Lock()
+		defer attempt.stateLock.Unlock()
+		if attempt.finished {
+			return -1
+		}
+		attempt.bytesDelivered += int64(count)
+		return attempt.bytesDelivered
+	}()
+	if bytesDelivered < 0 {
+		return
+	}
+	cleanEnd := errors.Is(err, io.EOF) || websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
+	switch {
+	case errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled):
+		attempt.finish(verdictHandshake)
+	case err != nil && !cleanEnd:
+		attempt.finish(verdictStalled)
+	case deliveryVerifiedByteCount <= bytesDelivered:
+		attempt.finish(verdictDelivered)
+	case cleanEnd:
+		if finalEof {
+			attempt.finish(verdictHandshake)
+		}
+	}
+}
+
+// Optionally supplies stable host identifiers to revisit a network's evidence.
+// Raw identifiers are hashed and never uploaded. Without this optional hint,
+// the existing NetworkChanged platform signal supplies a fresh local generation.
+// Existing attempts retain their original identity after either kind of change.
 func (self *ClientStrategy) SetNetworkId(identifiers ...string) {
 	networkId := deriveNetworkId(identifiers...)
 	self.mutex.Lock()

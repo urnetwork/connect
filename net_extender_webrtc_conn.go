@@ -15,8 +15,8 @@ package connect
 //
 // Closing the stream closes the data channel, the peer connection that owns
 // it, and the per-connection address resolution of the factory, so a carrier
-// stream is one resource to the code that holds it. Safe for one reader and
-// one writer at a time, which is what net.Conn promises.
+// stream is one resource to the code that holds it. Safe for concurrent
+// net.Conn calls: reads and complete writes each serialize independently.
 
 import (
 	"context"
@@ -26,6 +26,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -74,8 +75,12 @@ type webRtcDataChannelConn struct {
 	localAddr      net.Addr
 	remoteAddr     net.Addr
 
-	readBuffer  []byte
-	readPending []byte
+	readBuffer   []byte
+	readPending  []byte
+	readLock     sync.Mutex
+	writeLock    sync.Mutex
+	deadlineLock sync.Mutex
+	closing      atomic.Bool
 	// the close's bound on waiting for acknowledgement
 	// (webRtcExtenderCloseDrainTimeout); tests shorten or lengthen it
 	drainTimeout time.Duration
@@ -154,6 +159,11 @@ func webRtcSelectedPairAddrs(peerConnection *webrtc.PeerConnection) (net.Addr, n
 // advertised bound: the channel has already consumed it, so the stream is
 // corrupt from here and the read fails rather than skipping bytes.
 func (self *webRtcDataChannelConn) Read(b []byte) (int, error) {
+	self.readLock.Lock()
+	defer self.readLock.Unlock()
+	if self.closing.Load() {
+		return 0, net.ErrClosed
+	}
 	if len(b) == 0 {
 		return 0, nil
 	}
@@ -186,6 +196,11 @@ func (self *webRtcDataChannelConn) Read(b []byte) (int, error) {
 
 // Write cuts b into messages of at most webRtcExtenderMaxMessageByteCount.
 func (self *webRtcDataChannelConn) Write(b []byte) (int, error) {
+	self.writeLock.Lock()
+	defer self.writeLock.Unlock()
+	if self.closing.Load() {
+		return 0, net.ErrClosed
+	}
 	written := 0
 	for written < len(b) {
 		message := b[written:min(len(b), written+webRtcExtenderMaxMessageByteCount)]
@@ -209,7 +224,19 @@ func (self *webRtcDataChannelConn) Write(b []byte) (int, error) {
 // wrote, is otherwise lost behind the abort.
 func (self *webRtcDataChannelConn) Close() error {
 	self.closeOnce.Do(func() {
-		self.drain()
+		// Wake calls already in the channel before taking their serialization
+		// locks. Deadline setters finish before shutdown takes ownership, so
+		// an in-flight setter cannot clear the interruption afterward.
+		func() {
+			self.deadlineLock.Lock()
+			defer self.deadlineLock.Unlock()
+			self.closing.Store(true)
+			_ = self.channel.SetReadDeadline(time.Now())
+			_ = self.channel.SetWriteDeadline(time.Now())
+		}()
+		self.writeLock.Lock()
+		defer self.writeLock.Unlock()
+		readDone := self.drain()
 		self.closeErr = self.channel.Close()
 		if self.peerConnection != nil {
 			if err := self.peerConnection.Close(); self.closeErr == nil {
@@ -218,6 +245,9 @@ func (self *webRtcDataChannelConn) Close() error {
 		}
 		if self.cancel != nil {
 			self.cancel()
+		}
+		if readDone != nil {
+			<-readDone
 		}
 	})
 	return self.closeErr
@@ -236,11 +266,12 @@ func webRtcExtenderDeadlineError(err error) error {
 	return err
 }
 
-// drain waits, bounded, until the channel reports nothing unacknowledged.
-func (self *webRtcDataChannelConn) drain() {
+// Waits, bounded, for acknowledgement or association failure. The caller
+// closes the channel afterward and joins the returned reader completion.
+func (self *webRtcDataChannelConn) drain() <-chan struct{} {
 	buffered, ok := self.channel.(webRtcExtenderBufferedChannel)
 	if !ok {
-		return
+		return nil
 	}
 	drained := make(chan struct{}, 1)
 	buffered.SetBufferedAmountLowThreshold(0)
@@ -251,7 +282,7 @@ func (self *webRtcDataChannelConn) drain() {
 		}
 	})
 	if buffered.BufferedAmount() == 0 {
-		return
+		return nil
 	}
 	// a dead association never acknowledges, and nothing on the peer
 	// connection says it died: a read on it fails at once, where a live one
@@ -259,16 +290,36 @@ func (self *webRtcDataChannelConn) drain() {
 	// peer's own half-close (EOF) is not death: its acknowledgements still
 	// arrive, so the wait goes on for them.
 	dead := make(chan struct{})
+	readDone := make(chan struct{})
+	stop := make(chan struct{})
+	defer close(stop)
 	go func() {
-		defer close(dead)
+		defer close(readDone)
+		self.readLock.Lock()
+		defer self.readLock.Unlock()
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		// A caller's expired deadline is reversible, and Close interrupted
+		// any prior reader with one. Neither means the association died.
+		func() {
+			self.deadlineLock.Lock()
+			defer self.deadlineLock.Unlock()
+			_ = self.channel.SetReadDeadline(time.Time{})
+		}()
 		discard := make([]byte, len(self.readBuffer))
 		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
 			if _, err := self.channel.Read(discard); err != nil {
-				if errors.Is(err, io.EOF) {
-					select {
-					case <-drained:
-					case <-time.After(self.drainTimeout):
-					}
+				var netErr net.Error
+				if !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrDeadlineExceeded) && !(errors.As(err, &netErr) && netErr.Timeout()) {
+					close(dead)
 				}
 				return
 			}
@@ -279,12 +330,18 @@ func (self *webRtcDataChannelConn) drain() {
 	case <-dead:
 	case <-time.After(self.drainTimeout):
 	}
+	return readDone
 }
 
 func (self *webRtcDataChannelConn) LocalAddr() net.Addr  { return self.localAddr }
 func (self *webRtcDataChannelConn) RemoteAddr() net.Addr { return self.remoteAddr }
 
 func (self *webRtcDataChannelConn) SetDeadline(t time.Time) error {
+	self.deadlineLock.Lock()
+	defer self.deadlineLock.Unlock()
+	if self.closing.Load() {
+		return net.ErrClosed
+	}
 	if err := self.channel.SetReadDeadline(t); err != nil {
 		return err
 	}
@@ -292,10 +349,20 @@ func (self *webRtcDataChannelConn) SetDeadline(t time.Time) error {
 }
 
 func (self *webRtcDataChannelConn) SetReadDeadline(t time.Time) error {
+	self.deadlineLock.Lock()
+	defer self.deadlineLock.Unlock()
+	if self.closing.Load() {
+		return net.ErrClosed
+	}
 	return self.channel.SetReadDeadline(t)
 }
 
 func (self *webRtcDataChannelConn) SetWriteDeadline(t time.Time) error {
+	self.deadlineLock.Lock()
+	defer self.deadlineLock.Unlock()
+	if self.closing.Load() {
+		return net.ErrClosed
+	}
 	return self.channel.SetWriteDeadline(t)
 }
 

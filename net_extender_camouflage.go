@@ -303,7 +303,9 @@ func raceExtenderTcpCamouflage(
 		attemptWorkers.Wait()
 	}()
 
-	attempts := make(chan *extenderTcpCamouflageAttempt, 2)
+	// A result transfers ownership only when the race receives it. An attempt
+	// that finishes after the race ends keeps and closes its connection itself.
+	attempts := make(chan *extenderTcpCamouflageAttempt)
 	launch := func(camo bool, dial func(ctx context.Context, roundTrip *ExtenderRoundTrip) (net.Conn, *protocol.ExtenderResponse, error)) {
 		attempt := &extenderTcpCamouflageAttempt{camo: camo}
 		if roundTrip != nil {

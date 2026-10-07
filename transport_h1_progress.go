@@ -24,7 +24,7 @@ func newH1PhysicalProgress(observer func(TransferProgressEvent), client Id, conn
 		return nil
 	}
 	kind := "websocket"
-	if _, framed := conn.(*FramedMessageConn); framed {
+	if _, framed := unobservedH1MessageConn(conn).(*FramedMessageConn); framed {
 		kind = "h1plus"
 	}
 	p := &h1PhysicalProgress{observer: observer, client: client, connection: NewId(), kind: kind}

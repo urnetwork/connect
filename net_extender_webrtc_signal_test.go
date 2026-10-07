@@ -41,6 +41,13 @@ func (self *testSignalBridge) manager(id Id) *WebRtcManager {
 	return self.managers[id]
 }
 
+// Installation and delivery can overlap when an earlier offer is answering.
+func (self *testSignalBridge) setAfterDeliver(afterDeliver func(fromId Id, toId Id)) {
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	self.afterDeliver = afterDeliver
+}
+
 // Builds one manager on the bridge under its own id.
 func (self *testSignalBridge) newManager(t *testing.T, ctx context.Context, configure func(settings *WebRtcSettings)) (*WebRtcManager, Id) {
 	t.Helper()
@@ -78,8 +85,13 @@ func (self *testSignalSender) SendSignal(destinationId Id, signal *protocol.Fram
 		TransferKey{},
 		signal,
 	)
-	if self.bridge.afterDeliver != nil {
-		self.bridge.afterDeliver(self.selfId, destinationId)
+	afterDeliver := func() func(Id, Id) {
+		self.bridge.lock.Lock()
+		defer self.bridge.lock.Unlock()
+		return self.bridge.afterDeliver
+	}()
+	if afterDeliver != nil {
+		afterDeliver(self.selfId, destinationId)
 	}
 }
 
@@ -164,12 +176,12 @@ func TestWebRtcExtenderSignalingDeclinesWithoutAnAnswerer(t *testing.T) {
 
 	dialCtx, dialCancel := context.WithCancel(ctx)
 	defer dialCancel()
-	bridge.afterDeliver = func(fromId Id, toId Id) {
+	bridge.setAfterDeliver(func(fromId Id, toId Id) {
 		if toId == extenderId {
 			// the offer has been applied and declined; nothing will answer
 			dialCancel()
 		}
-	}
+	})
 	_, err := dialer.ExtenderCarrierExchanger(extenderId).ExchangeOffer(dialCtx, testOffer)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want the dialer's cancellation", err)
@@ -206,11 +218,11 @@ func TestWebRtcExtenderSignalingBoundsTheAnswersInFlight(t *testing.T) {
 
 	secondCtx, secondCancel := context.WithCancel(ctx)
 	defer secondCancel()
-	bridge.afterDeliver = func(fromId Id, toId Id) {
+	bridge.setAfterDeliver(func(fromId Id, toId Id) {
 		if toId == extenderId {
 			secondCancel()
 		}
-	}
+	})
 	_, err := dialer.ExtenderCarrierExchanger(extenderId).ExchangeOffer(secondCtx, testOffer)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("second offer err = %v, want the dialer's cancellation", err)

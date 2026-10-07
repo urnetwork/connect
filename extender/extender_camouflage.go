@@ -61,13 +61,15 @@ type extenderCamouflage struct {
 
 	replay *extenderCamouflageReplaySet
 
-	// the live splice slots of the total and per-target caps (P3)
-	spliceLock         sync.Mutex
+	// retirement and the live splice slots of the total and per-target caps
+	// (P3); resolver construction and shutdown never hold this lock
+	stateLock          sync.Mutex
+	closed             bool
 	spliceCount        int
 	spliceTargetCounts map[string]int
 
-	// the lazily built DoH cache the default splice dial resolves over, and the
-	// once that builds it
+	// the lazily built DoH cache the default splice dial resolves over; every
+	// access follows dohOnce.Do, including retirement joining its constructor
 	dohOnce  sync.Once
 	dohCache *connect.DohCache
 }
@@ -112,12 +114,23 @@ func (self *extenderCamouflage) StaticPublicKey() []byte {
 	return slices.Clone(self.staticPublicKey)
 }
 
-// Releases the DoH cache the default splice dial built, if any.
+// Retires splice admission before joining lazy construction and closing the
+// resolver. A cold owner stays cold, and an in-flight constructor is joined.
 func (self *extenderCamouflage) close() {
+	self.stateLock.Lock()
+	self.closed = true
+	self.stateLock.Unlock()
 	self.dohOnce.Do(func() {})
 	if self.dohCache != nil {
 		self.dohCache.Close()
 	}
+}
+
+// Reports retirement without holding a splice lock during resolver or dial I/O.
+func (self *extenderCamouflage) isClosed() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.closed
 }
 
 // The clock the camouflage reads (P1, P2).
@@ -143,12 +156,25 @@ func (self *ExtenderServer) camouflageDemultiplex(ctx context.Context, conn net.
 	// the peek reads under the same budget the handshake has (A9); tls.Server
 	// resets the deadline for the handshake and the request that follow
 	conn.SetDeadline(time.Now().Add(self.settings.HeaderTimeout))
+	peekCanceled := make(chan struct{})
+	stopPeekCancel := context.AfterFunc(ctx, func() {
+		defer close(peekCanceled)
+		conn.Close()
+	})
 
 	maxByteCount := self.settings.ExtenderCamouflageHelloMaxByteCount
 	if maxByteCount <= 0 {
 		maxByteCount = DefaultExtenderSettings().ExtenderCamouflageHelloMaxByteCount
 	}
 	readBytes, parsed, ok := peekClientHello(conn, maxByteCount)
+	// Join a running cancellation before handing the connection to tls or the
+	// splice, so no late callback can interfere with the next phase's deadline.
+	if !stopPeekCancel() {
+		<-peekCanceled
+	}
+	if ctx.Err() != nil {
+		return nil, false, true
+	}
 	if !ok {
 		// not a parseable ClientHello: terminate it as today, the peeked bytes
 		// replayed so tls.Server sees whatever the peer sent
@@ -323,8 +349,11 @@ func (self *extenderCamouflage) spliceTargets(serverName string) []string {
 // full, which refuses the splice to that target.
 func (self *extenderCamouflage) beginSplice(target string) bool {
 	settings := self.settings
-	self.spliceLock.Lock()
-	defer self.spliceLock.Unlock()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed {
+		return false
+	}
 	if 0 < settings.ExtenderCamouflageSpliceMaxCount && settings.ExtenderCamouflageSpliceMaxCount <= self.spliceCount {
 		return false
 	}
@@ -338,8 +367,8 @@ func (self *extenderCamouflage) beginSplice(target string) bool {
 
 // Releases a splice slot.
 func (self *extenderCamouflage) endSplice(target string) {
-	self.spliceLock.Lock()
-	defer self.spliceLock.Unlock()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 	self.spliceCount -= 1
 	if count := self.spliceTargetCounts[target] - 1; 0 < count {
 		self.spliceTargetCounts[target] = count
@@ -353,6 +382,12 @@ func (self *extenderCamouflage) endSplice(target string) {
 // client's family and dials the result over the forward egress, falling back to
 // an egress dial by name.
 func (self *extenderCamouflage) spliceDial(ctx context.Context, network string, target string) (net.Conn, error) {
+	if self.isClosed() {
+		return nil, net.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if self.settings.CamouflageSpliceDialContext != nil {
 		return self.settings.CamouflageSpliceDialContext(ctx, network, net.JoinHostPort(target, "443"))
 	}
@@ -360,10 +395,27 @@ func (self *extenderCamouflage) spliceDial(ctx context.Context, network string, 
 	if network == "tcp6" {
 		recordType = "AAAA"
 	}
-	for _, addr := range self.spliceDohCache().Query(ctx, recordType, target) {
+	dohCache := self.spliceDohCache()
+	if dohCache == nil {
+		return nil, net.ErrClosed
+	}
+	addrs := dohCache.Query(ctx, recordType, target)
+	if self.isClosed() {
+		return nil, net.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for _, addr := range addrs {
 		if conn, err := self.server.dialContext()(ctx, network, net.JoinHostPort(addr.String(), "443")); err == nil {
 			return conn, nil
 		}
+	}
+	if self.isClosed() {
+		return nil, net.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	// the egress resolver, so a borrowed name the DoH cache could not resolve
 	// still reaches its site over the family-narrowed egress
@@ -371,37 +423,70 @@ func (self *extenderCamouflage) spliceDial(ctx context.Context, network string, 
 }
 
 // The DoH cache the default splice dial resolves over, built once from the
-// server's DoH settings.
+// server's DoH settings. Retirement may consume the once before first use;
+// callers must treat nil as a closed owner, never as a missing initialization.
 func (self *extenderCamouflage) spliceDohCache() *connect.DohCache {
 	self.dohOnce.Do(func() {
+		if self.isClosed() {
+			return
+		}
 		dohSettings := self.settings.DohSettings
 		if dohSettings == nil {
 			dohSettings = connect.DefaultDohSettings()
 		}
 		self.dohCache = connect.NewDohCache(dohSettings)
 	})
+	if self.isClosed() {
+		return nil
+	}
 	return self.dohCache
 }
 
 // relaySplice copies the spliced bytes both ways until either side ends or a
 // bound is hit (P3): the peeked ClientHello is written to the site first, then
 // each direction is copied with the A5 per-connection byte bound and idle
-// timeout. None of it touches the O1 relay counters (P10).
+// timeout. Owns and joins cancellation from before the first write, including
+// failed and partial hello writes. None of it touches the O1 relay counters (P10).
 func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.Conn, siteConn net.Conn, initialBytes []byte) {
 	idle := self.settings.ProxyIdleTimeout
 	maxByteCount := self.settings.ProxyMaxResponseByteCount
 
-	if 0 < len(initialBytes) {
-		if 0 < idle {
-			siteConn.SetWriteDeadline(time.Now().Add(idle))
-		}
-		if _, err := siteConn.Write(initialBytes); err != nil {
-			return
-		}
-	}
-
 	relayCtx, relayCancel := context.WithCancel(ctx)
 	var relayWorkers sync.WaitGroup
+	connectionsClosed := make(chan struct{})
+	context.AfterFunc(relayCtx, func() {
+		defer close(connectionsClosed)
+		clientConn.Close()
+		siteConn.Close()
+	})
+	defer func() {
+		relayCancel()
+		<-connectionsClosed
+		relayWorkers.Wait()
+	}()
+	// The peek's header budget ends at this handoff. Relay I/O installs its
+	// own idle deadlines, including leaving them unset when idle is disabled.
+	clientConn.SetDeadline(time.Time{})
+	writeAll := func(dst net.Conn, writeBytes []byte) bool {
+		for 0 < len(writeBytes) {
+			if relayCtx.Err() != nil {
+				return false
+			}
+			if 0 < idle {
+				dst.SetWriteDeadline(time.Now().Add(idle))
+			}
+			n, err := dst.Write(writeBytes)
+			if err != nil || n <= 0 {
+				return false
+			}
+			writeBytes = writeBytes[n:]
+		}
+		return true
+	}
+	if !writeAll(siteConn, initialBytes) {
+		return
+	}
+
 	var relayedByteCount atomicInt64
 	copyDirection := func(dst net.Conn, src net.Conn) {
 		defer relayWorkers.Done()
@@ -423,18 +508,8 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 					// splice, never counting the byte as O1 relay traffic
 					return
 				}
-				if 0 < idle {
-					dst.SetWriteDeadline(time.Now().Add(idle))
-				}
-				toWrite := buffer[0:n]
-				for 0 < len(toWrite) {
-					nw, werr := dst.Write(toWrite)
-					if 0 < nw {
-						toWrite = toWrite[nw:]
-					}
-					if werr != nil {
-						return
-					}
+				if !writeAll(dst, buffer[:n]) {
+					return
 				}
 			}
 			if err != nil {
@@ -446,9 +521,6 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 	go connect.HandleError(func() { copyDirection(siteConn, clientConn) }, relayCancel)
 	go connect.HandleError(func() { copyDirection(clientConn, siteConn) }, relayCancel)
 	<-relayCtx.Done()
-	clientConn.Close()
-	siteConn.Close()
-	relayWorkers.Wait()
 }
 
 // A small atomic int64 so the splice relay sums its two directions without a
@@ -478,10 +550,11 @@ func peekClientHello(conn net.Conn, maxByteCount int) ([]byte, *utls.PubClientHe
 	handshakeBytes := []byte{}
 	for {
 		recordHeader := make([]byte, 5)
-		if _, err := io.ReadFull(conn, recordHeader); err != nil {
+		n, err := io.ReadFull(conn, recordHeader)
+		readBytes = append(readBytes, recordHeader[:n]...)
+		if err != nil {
 			return readBytes, nil, false
 		}
-		readBytes = append(readBytes, recordHeader...)
 		// tls record: content type 22 is handshake; anything else is not a
 		// ClientHello flight
 		if recordHeader[0] != 22 {
@@ -492,10 +565,11 @@ func peekClientHello(conn net.Conn, maxByteCount int) ([]byte, *utls.PubClientHe
 			return readBytes, nil, false
 		}
 		fragment := make([]byte, recordByteCount)
-		if _, err := io.ReadFull(conn, fragment); err != nil {
+		n, err = io.ReadFull(conn, fragment)
+		readBytes = append(readBytes, fragment[:n]...)
+		if err != nil {
 			return readBytes, nil, false
 		}
-		readBytes = append(readBytes, fragment...)
 		handshakeBytes = append(handshakeBytes, fragment...)
 
 		if len(handshakeBytes) < 4 {

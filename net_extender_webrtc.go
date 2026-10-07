@@ -64,14 +64,23 @@ type WebRtcExtenderCarrier struct {
 	settings *WebRtcSettings
 	resolver WebRtcExtenderExchangerResolver
 
-	stateLock  sync.Mutex
-	factory    *webRtcPeerConnectionFactory
-	factoryErr error
-	closed     bool
+	stateLock    sync.Mutex
+	factory      *webRtcPeerConnectionFactory
+	factoryErr   error
+	closed       bool
+	pendingDials map[*webRtcExtenderPendingDial]bool
+	closeDone    chan struct{}
 
 	// Nil in production; tests observe the answer side releasing a peer
 	// connection whose data channel never opened.
 	answerReleasedForTest func()
+}
+
+// The carrier owns cancellation until a dial has returned its stream or
+// released its failed peer connection. Close joins that ownership boundary.
+type webRtcExtenderPendingDial struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // DefaultWebRtcExtenderSettings are the peer connection settings of the
@@ -98,11 +107,13 @@ func NewWebRtcExtenderCarrier(
 	}
 	cancelCtx, cancel := context.WithCancel(ctx)
 	return &WebRtcExtenderCarrier{
-		ctx:      cancelCtx,
-		cancel:   cancel,
-		log:      loggerOrDefault(settings.Log),
-		settings: settings,
-		resolver: resolver,
+		ctx:          cancelCtx,
+		cancel:       cancel,
+		log:          loggerOrDefault(settings.Log),
+		settings:     settings,
+		resolver:     resolver,
+		pendingDials: map[*webRtcExtenderPendingDial]bool{},
+		closeDone:    make(chan struct{}),
 	}
 }
 
@@ -110,6 +121,8 @@ func NewWebRtcExtenderCarrier(
 // already handed out keep their peer connections until they are closed.
 func (self *WebRtcExtenderCarrier) Close() {
 	var factory *webRtcPeerConnectionFactory
+	var pendingDials []*webRtcExtenderPendingDial
+	closing := false
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -117,13 +130,63 @@ func (self *WebRtcExtenderCarrier) Close() {
 			return
 		}
 		self.closed = true
+		closing = true
 		factory = self.factory
 		self.factory = nil
+		for pendingDial := range self.pendingDials {
+			pendingDials = append(pendingDials, pendingDial)
+		}
 	}()
+	if !closing {
+		<-self.closeDone
+		return
+	}
 	self.cancel()
+	for _, pendingDial := range pendingDials {
+		pendingDial.cancel()
+	}
+	for _, pendingDial := range pendingDials {
+		<-pendingDial.done
+	}
 	if factory != nil && factory.close != nil {
 		_ = factory.close()
 	}
+	close(self.closeDone)
+}
+
+// Joins caller and carrier cancellation without transferring either to a
+// successfully returned stream. The returned cleanup also joins the callback.
+func (self *WebRtcExtenderCarrier) beginDial(ctx context.Context) (context.Context, func(), error) {
+	dialCtx, cancel := context.WithCancel(ctx)
+	pendingDial := &webRtcExtenderPendingDial{cancel: cancel, done: make(chan struct{})}
+	admitted := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.closed {
+			return false
+		}
+		self.pendingDials[pendingDial] = true
+		return true
+	}()
+	if !admitted {
+		cancel()
+		return nil, nil, ErrWebRtcExtenderCarrierUnavailable
+	}
+	carrierCanceled := make(chan struct{})
+	stopCarrierCancel := context.AfterFunc(self.ctx, func() {
+		cancel()
+		close(carrierCanceled)
+	})
+	return dialCtx, func() {
+		cancel()
+		if !stopCarrierCancel() {
+			<-carrierCanceled
+		}
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		delete(self.pendingDials, pendingDial)
+		close(pendingDial.done)
+	}, nil
 }
 
 // The shared factory, built once. An error is retried on the next session
@@ -202,6 +265,11 @@ func (self *WebRtcExtenderCarrier) DialWithExchanger(
 	if exchanger == nil {
 		return nil, nil, ErrWebRtcExtenderNoSignaling
 	}
+	ctx, finishDial, err := self.beginDial(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer finishDial()
 	dial := ExtenderDial{}
 	if extenderDial != nil {
 		dial = *extenderDial
@@ -294,12 +362,15 @@ func (self *WebRtcExtenderCarrier) DialWithExchanger(
 }
 
 // negotiateOffer creates the offer, gathers its candidates, exchanges it for
-// the extender's answer and applies the answer. Every wait is bounded by ctx.
+// the extender's answer and applies the answer. Gathering and signaling share
+// the carrier's open bound, even when the caller has no deadline.
 func (self *WebRtcExtenderCarrier) negotiateOffer(
 	ctx context.Context,
 	peerConnection *webrtc.PeerConnection,
 	exchanger WebRtcExtenderOfferExchanger,
 ) error {
+	ctx, cancel := context.WithTimeout(ctx, self.openTimeout())
+	defer cancel()
 	offer, err := peerConnection.CreateOffer(nil)
 	if err != nil {
 		return fmt.Errorf("create extender offer: %w", err)

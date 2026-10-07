@@ -63,6 +63,7 @@ const (
 var (
 	ErrExtenderReleaseIdentityLimited = errors.New("the identity has reached its release request limit")
 	ErrExtenderReleaseVantageLimited  = errors.New("the vantage has reached its release request limit")
+	ErrExtenderReleaseLedgerFull      = errors.New("the release ledger is full")
 )
 
 // The policy numbers, all settings so a test pins every transition.
@@ -96,9 +97,16 @@ func DefaultExtenderReleaseSettings() *ExtenderReleaseSettings {
 	}
 }
 
-// What the policy reads and writes. Every method is called without a policy
-// lock held; an implementation is safe for concurrent use.
+// Serializes one admission across every identity, vantage and country/key it
+// touches. Replicas must share this transaction boundary in their durable store.
 type ExtenderReleaseLedger interface {
+	Transact(identity []byte, vantage string, countryCode string, keyHexes []string, apply func(ExtenderReleaseLedgerTx))
+	IssuedKeyHexes(identity []byte, epoch uint64) ([]string, error)
+}
+
+// A transaction-local ledger view. Counts, reservations and epoch history are
+// read and written together; the view must not escape its callback.
+type ExtenderReleaseLedgerTx interface {
 	// Requests by the identity, and by the vantage, at or after `since`.
 	RequestCounts(identity []byte, vantage string, since time.Time) (identityCount int, vantageCount int)
 	// Records one request, admitted or refused: a refused request counts, so
@@ -109,11 +117,19 @@ type ExtenderReleaseLedger interface {
 	ClientCount(keyHex string, countryCode string, identity []byte, since time.Time) int
 	// Records one release of a record to an identity in a country.
 	RecordRelease(identity []byte, keyHex string, countryCode string, epoch uint64, now time.Time)
+	// Every key already disclosed to the identity in this epoch, including
+	// keys that have since become unavailable, blocked or ineligible.
+	IssuedKeyHexes(identity []byte, epoch uint64) ([]string, error)
 }
 
 // Where blocked state comes from (Q4). Nil skips nothing.
 type ExtenderReleaseBlockedSource interface {
 	Blocked(keyHex string, countryCode string) bool
+}
+
+// A durable source can evaluate the bounded candidate set in one query.
+type ExtenderReleaseBlockedBatchSource interface {
+	BlockedKeys(keyHexes []string, countryCode string) map[string]bool
 }
 
 // One release request.
@@ -196,20 +212,6 @@ func (self *ExtenderReleasePolicy) Release(
 	now := self.settings.Now()
 	countryCode := strings.ToLower(strings.TrimSpace(request.CountryCode))
 
-	// the limits, counted before this request and stamped with it either way
-	identityCount, vantageCount := self.ledger.RequestCounts(
-		request.Identity,
-		request.Vantage,
-		now.Add(-self.settings.RequestWindow),
-	)
-	self.ledger.RecordRequest(request.Identity, request.Vantage, now)
-	if 0 < self.settings.IdentityRequestLimit && self.settings.IdentityRequestLimit <= identityCount {
-		return nil, ErrExtenderReleaseIdentityLimited
-	}
-	if 0 < self.settings.VantageRequestLimit && self.settings.VantageRequestLimit <= vantageCount {
-		return nil, ErrExtenderReleaseVantageLimited
-	}
-
 	probation := request.IdentityCreateTime.IsZero() ||
 		now.Sub(request.IdentityCreateTime) < self.settings.ProbationTimeout
 	count := self.settings.TrustedIdentityCount
@@ -231,30 +233,87 @@ func (self *ExtenderReleasePolicy) Release(
 		Count:          count,
 		Probation:      probation,
 	}
-	clientSince := now.Add(-self.settings.ClientWindow)
-	for _, keyHex := range ExtenderPartitionOrder(self.secret, ExtenderChannelGated, request.Identity, epoch, members) {
-		if count <= len(result.KeyHexes) {
-			break
+	// External eligibility and blocked-state reads happen before taking the
+	// ledger transaction. The transaction owns only admission and accounting.
+	// The snapshot bounds those reads to one partition plus prior disclosures.
+	// A concurrent disclosure is re-read in the transaction; an unavailable
+	// snapshot can only withhold that record until the next request.
+	previousKeyHexes, snapshotErr := self.ledger.IssuedKeyHexes(request.Identity, epoch)
+	candidateKeyHexes := append(slices.Clone(members), previousKeyHexes...)
+	slices.Sort(candidateKeyHexes)
+	candidateKeyHexes = slices.Compact(candidateKeyHexes)
+	availableKeyHexes := map[string]bool{}
+	for _, keyHex := range keyHexes {
+		availableKeyHexes[strings.ToLower(keyHex)] = true
+	}
+	eligibleKeyHexes := map[string]bool{}
+	var blockedKeyHexes map[string]bool
+	batchBlocked, batch := self.blocked.(ExtenderReleaseBlockedBatchSource)
+	if batch {
+		blockedKeyHexes = batchBlocked.BlockedKeys(candidateKeyHexes, countryCode)
+	}
+	for _, keyHex := range candidateKeyHexes {
+		keyHex = strings.ToLower(keyHex)
+		if !availableKeyHexes[keyHex] {
+			continue
 		}
 		if request.Eligible != nil && !request.Eligible(keyHex) {
 			continue
 		}
-		if self.blocked != nil && self.blocked.Blocked(keyHex, countryCode) {
+		if blockedKeyHexes[keyHex] || (!batch && self.blocked != nil && self.blocked.Blocked(keyHex, countryCode)) {
 			continue
 		}
-		if 0 < self.settings.MaxClientsPerExtenderPerCountry {
-			// the identity's own earlier release of the same record takes
-			// no slot, so a repeated request within the epoch is the same
-			// release and a new epoch can deal the record again
-			clientCount := self.ledger.ClientCount(keyHex, countryCode, request.Identity, clientSince)
-			if self.settings.MaxClientsPerExtenderPerCountry <= clientCount {
+		eligibleKeyHexes[keyHex] = true
+	}
+	var releaseErr error
+	self.ledger.Transact(request.Identity, request.Vantage, countryCode, candidateKeyHexes, func(ledger ExtenderReleaseLedgerTx) {
+		// Durable transactions may retry after a serialization/commit error.
+		result.KeyHexes = result.KeyHexes[:0]
+		releaseErr = nil
+		identityCount, vantageCount := ledger.RequestCounts(request.Identity, request.Vantage, now.Add(-self.settings.RequestWindow))
+		// Refusals commit too, so retrying cannot reopen a closed gate.
+		ledger.RecordRequest(request.Identity, request.Vantage, now)
+		if 0 < self.settings.IdentityRequestLimit && self.settings.IdentityRequestLimit <= identityCount {
+			releaseErr = ErrExtenderReleaseIdentityLimited
+			return
+		}
+		if 0 < self.settings.VantageRequestLimit && self.settings.VantageRequestLimit <= vantageCount {
+			releaseErr = ErrExtenderReleaseVantageLimited
+			return
+		}
+		if snapshotErr != nil {
+			releaseErr = snapshotErr
+			return
+		}
+		issuedKeyHexes, err := ledger.IssuedKeyHexes(request.Identity, epoch)
+		if err != nil {
+			releaseErr = err
+			return
+		}
+		orderedKeyHexes := append(slices.Clone(issuedKeyHexes), ExtenderPartitionOrder(self.secret, ExtenderChannelGated, request.Identity, epoch, members)...)
+		for _, keyHex := range orderedKeyHexes {
+			if count <= len(result.KeyHexes) {
+				break
+			}
+			if !eligibleKeyHexes[keyHex] || slices.Contains(result.KeyHexes, keyHex) {
 				continue
 			}
+			issued := slices.Contains(issuedKeyHexes, keyHex)
+			if !issued && count <= len(issuedKeyHexes) {
+				continue
+			}
+			if 0 < self.settings.MaxClientsPerExtenderPerCountry && self.settings.MaxClientsPerExtenderPerCountry <= ledger.ClientCount(keyHex, countryCode, request.Identity, now.Add(-self.settings.ClientWindow)) {
+				continue
+			}
+			ledger.RecordRelease(request.Identity, keyHex, countryCode, epoch, now)
+			result.KeyHexes = append(result.KeyHexes, keyHex)
+			if !issued {
+				issuedKeyHexes = append(issuedKeyHexes, keyHex)
+			}
 		}
-		result.KeyHexes = append(result.KeyHexes, keyHex)
-	}
-	for _, keyHex := range result.KeyHexes {
-		self.ledger.RecordRelease(request.Identity, keyHex, countryCode, epoch, now)
+	})
+	if releaseErr != nil {
+		return nil, releaseErr
 	}
 	return result, nil
 }
@@ -265,6 +324,12 @@ func (self *ExtenderReleasePolicy) Release(
 // cheapest to lose; a vantage forgotten starts its count again, so the bound
 // is set well above what one process serves.
 type ExtenderReleaseMemoryLedger struct {
+	extenderReleaseMemoryTx
+	stateLock sync.Mutex
+}
+
+// The in-memory transaction view is protected by its owner's stateLock.
+type extenderReleaseMemoryTx struct {
 	// identities and vantages tracked at most, and the request window the
 	// tables are pruned to, which is the longest window a policy reads
 	maxIdentityCount int
@@ -273,13 +338,19 @@ type ExtenderReleaseMemoryLedger struct {
 	requestWindow    time.Duration
 	clientWindow     time.Duration
 
-	stateLock sync.Mutex
 	// by identity hex: request times, oldest first
 	identityRequestTimes map[string][]time.Time
 	// by vantage: request times, oldest first
 	vantageRequestTimes map[string][]time.Time
 	// by key hex, by country, by identity hex: the last release time
 	releaseTimes map[string]map[string]map[string]time.Time
+	issuedKeys   map[string]*extenderReleaseEpochKeys
+}
+
+// Disclosure history outlives a record's eligibility and country changes.
+type extenderReleaseEpochKeys struct {
+	epoch    uint64
+	keyHexes []string
 }
 
 // The ledger's own bounds, chosen for a process serving one operator.
@@ -293,15 +364,49 @@ const (
 // is never what the policy would still read.
 func NewExtenderReleaseMemoryLedger(requestWindow time.Duration, clientWindow time.Duration) *ExtenderReleaseMemoryLedger {
 	return &ExtenderReleaseMemoryLedger{
-		maxIdentityCount:     ExtenderReleaseLedgerMaxIdentityCount,
-		maxVantageCount:      ExtenderReleaseLedgerMaxVantageCount,
-		maxRecordCount:       ExtenderReleaseLedgerMaxRecordCount,
-		requestWindow:        requestWindow,
-		clientWindow:         clientWindow,
-		identityRequestTimes: map[string][]time.Time{},
-		vantageRequestTimes:  map[string][]time.Time{},
-		releaseTimes:         map[string]map[string]map[string]time.Time{},
+		extenderReleaseMemoryTx: extenderReleaseMemoryTx{
+			maxIdentityCount:     ExtenderReleaseLedgerMaxIdentityCount,
+			maxVantageCount:      ExtenderReleaseLedgerMaxVantageCount,
+			maxRecordCount:       ExtenderReleaseLedgerMaxRecordCount,
+			requestWindow:        requestWindow,
+			clientWindow:         clientWindow,
+			identityRequestTimes: map[string][]time.Time{},
+			vantageRequestTimes:  map[string][]time.Time{},
+			releaseTimes:         map[string]map[string]map[string]time.Time{},
+			issuedKeys:           map[string]*extenderReleaseEpochKeys{},
+		},
 	}
+}
+
+// The same lock covers the complete read/decide/write admission callback.
+func (self *ExtenderReleaseMemoryLedger) Transact(_ []byte, _ string, _ string, _ []string, apply func(ExtenderReleaseLedgerTx)) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	apply(&self.extenderReleaseMemoryTx)
+}
+
+// Returns a bounded eligibility snapshot; admission rechecks it in Transact.
+func (self *ExtenderReleaseMemoryLedger) IssuedKeyHexes(identity []byte, epoch uint64) ([]string, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.extenderReleaseMemoryTx.IssuedKeyHexes(identity, epoch)
+}
+
+// Active epoch disclosures are never evicted to admit another identity.
+func (self *extenderReleaseMemoryTx) IssuedKeyHexes(identity []byte, epoch uint64) ([]string, error) {
+	identityHex := hex.EncodeToString(identity)
+	for key, entry := range self.issuedKeys {
+		if entry.epoch < epoch {
+			delete(self.issuedKeys, key)
+		}
+	}
+	if entry := self.issuedKeys[identityHex]; entry != nil && entry.epoch == epoch {
+		return slices.Clone(entry.keyHexes), nil
+	}
+	if 0 < self.maxIdentityCount && self.maxIdentityCount <= len(self.issuedKeys) {
+		return nil, ErrExtenderReleaseLedgerFull
+	}
+	return nil, nil
 }
 
 // Replaces the table bounds, for a test that fills them.
@@ -314,10 +419,14 @@ func (self *ExtenderReleaseMemoryLedger) SetBounds(maxIdentityCount int, maxVant
 }
 
 func (self *ExtenderReleaseMemoryLedger) RequestCounts(identity []byte, vantage string, since time.Time) (int, int) {
-	identityHex := hex.EncodeToString(identity)
-
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.extenderReleaseMemoryTx.RequestCounts(identity, vantage, since)
+}
+
+// Counts request evidence while the admission transaction owns the lock.
+func (self *extenderReleaseMemoryTx) RequestCounts(identity []byte, vantage string, since time.Time) (int, int) {
+	identityHex := hex.EncodeToString(identity)
 
 	count := func(times []time.Time) int {
 		n := 0
@@ -332,10 +441,14 @@ func (self *ExtenderReleaseMemoryLedger) RequestCounts(identity []byte, vantage 
 }
 
 func (self *ExtenderReleaseMemoryLedger) RecordRequest(identity []byte, vantage string, now time.Time) {
-	identityHex := hex.EncodeToString(identity)
-
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.extenderReleaseMemoryTx.RecordRequest(identity, vantage, now)
+}
+
+// Appends a request within the admission transaction.
+func (self *extenderReleaseMemoryTx) RecordRequest(identity []byte, vantage string, now time.Time) {
+	identityHex := hex.EncodeToString(identity)
 
 	windowStart := now.Add(-self.requestWindow)
 	record := func(times map[string][]time.Time, key string, maxCount int) {
@@ -383,10 +496,14 @@ func extenderReleaseEvictOldestWithLock(times map[string][]time.Time, windowStar
 }
 
 func (self *ExtenderReleaseMemoryLedger) ClientCount(keyHex string, countryCode string, identity []byte, since time.Time) int {
-	identityHex := hex.EncodeToString(identity)
-
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.extenderReleaseMemoryTx.ClientCount(keyHex, countryCode, identity, since)
+}
+
+// Counts other identities while reservations are excluded.
+func (self *extenderReleaseMemoryTx) ClientCount(keyHex string, countryCode string, identity []byte, since time.Time) int {
+	identityHex := hex.EncodeToString(identity)
 
 	count := 0
 	for otherIdentityHex, releaseTime := range self.releaseTimes[strings.ToLower(keyHex)][countryCode] {
@@ -398,12 +515,24 @@ func (self *ExtenderReleaseMemoryLedger) ClientCount(keyHex string, countryCode 
 	return count
 }
 
-func (self *ExtenderReleaseMemoryLedger) RecordRelease(identity []byte, keyHex string, countryCode string, _ uint64, now time.Time) {
-	identityHex := hex.EncodeToString(identity)
-	keyHex = strings.ToLower(keyHex)
-
+func (self *ExtenderReleaseMemoryLedger) RecordRelease(identity []byte, keyHex string, countryCode string, epoch uint64, now time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.extenderReleaseMemoryTx.RecordRelease(identity, keyHex, countryCode, epoch, now)
+}
+
+// Reserves country capacity and permanently charges the epoch disclosure.
+func (self *extenderReleaseMemoryTx) RecordRelease(identity []byte, keyHex string, countryCode string, epoch uint64, now time.Time) {
+	identityHex := hex.EncodeToString(identity)
+	keyHex = strings.ToLower(keyHex)
+	issued := self.issuedKeys[identityHex]
+	if issued == nil || issued.epoch != epoch {
+		issued = &extenderReleaseEpochKeys{epoch: epoch}
+		self.issuedKeys[identityHex] = issued
+	}
+	if !slices.Contains(issued.keyHexes, keyHex) {
+		issued.keyHexes = append(issued.keyHexes, keyHex)
+	}
 
 	windowStart := now.Add(-self.clientWindow)
 	countryReleaseTimes, ok := self.releaseTimes[keyHex]

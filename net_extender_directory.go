@@ -852,7 +852,7 @@ func (self *ExtenderDirectory) applyVerifiedRecord(
 	// record goes to no subscriber whatever source it came from (Q1): the
 	// subscribers are the feed stream and the mesh, the open channels, and a
 	// durable record that reached them once would be enumerable from then on
-	if 0 < len(self.subscriptions) && !ExtenderRecordGated(body) {
+	if 0 < len(self.subscriptions) && ExtenderRecordOpen(body) {
 		self.publishWithLock(&protocol.ExtenderGossipMessage{
 			Message: &protocol.ExtenderGossipMessage_Record{Record: record},
 		})
@@ -1033,7 +1033,6 @@ func (self *ExtenderDirectory) SampleRecords(
 		keyRecord := self.keyHexRecords[keyHex]
 		if 0 < len(ownPublicKey) && keyHex == ownKeyHex {
 			ownRecord = keyRecord.record
-			continue
 		}
 		keyHexes = append(keyHexes, keyHex)
 		keyHexRecords[keyHex] = keyRecord.record
@@ -1042,6 +1041,9 @@ func (self *ExtenderDirectory) SampleRecords(
 	members, _, _ := ExtenderPartitionMembers(self.partitionSecret, ExtenderChannelFeed, vantage, keyHexes)
 	records := []*protocol.ExtenderRecord{}
 	for _, keyHex := range ExtenderPartitionOrder(self.partitionSecret, ExtenderChannelFeed, vantage, epoch, members) {
+		if keyHex == ownKeyHex {
+			continue
+		}
 		records = append(records, keyHexRecords[keyHex])
 	}
 	records = balanceRecordsByIpFamily(records, recordBodies)
@@ -1074,7 +1076,7 @@ func (self *ExtenderDirectory) openKeyHexesWithLock(now time.Time) []string {
 		if self.keyRecordRevokedWithLock(keyRecord) || self.keyRecordExpiredWithLock(keyRecord, now) {
 			continue
 		}
-		if ExtenderRecordGated(keyRecord.recordBody) {
+		if !ExtenderRecordOpen(keyRecord.recordBody) {
 			continue
 		}
 		keyHexes = append(keyHexes, keyHex)

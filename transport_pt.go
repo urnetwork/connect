@@ -487,22 +487,11 @@ func (self *packetTranslation) encodeDns() {
 						return nil
 					}
 				} else {
-
-					pumpItems = make([]*pumpItem, c)
-
-					i := 0
-					for ; i < c; i += 1 {
-						item := self.dnsPumpQueue.RemoveLast(p.addr)
-						if item == nil {
-							break
-						}
-						pumpItems[i] = item
-					}
-					// fill the rest with new headers. a synthesized item answers
-					// the way the client's latest real request asked to be
-					// answered, so one client sees one response shape.
-					fillEdns := 0 < i && pumpItems[0].edns
-					for ; i < c; i += 1 {
+					var fillEdns bool
+					pumpItems, fillEdns = self.dnsPumpQueue.RemoveAvailable(p.addr, c)
+					// All synthesized fragments use one latest-request snapshot,
+					// even when its paired header was consumed by an earlier write.
+					for len(pumpItems) < c {
 						header := self.newHeader()
 						tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
 						item := &pumpItem{
@@ -511,7 +500,7 @@ func (self *packetTranslation) encodeDns() {
 							tld:    tld,
 							edns:   fillEdns,
 						}
-						pumpItems[i] = item
+						pumpItems = append(pumpItems, item)
 						id += 1
 					}
 				}
@@ -1171,6 +1160,9 @@ func (self *packetTranslation) close() error {
 		self.closeErr = self.packetConn.Close()
 		self.operationWg.Wait()
 		self.workerWg.Wait()
+		if self.dnsPumpQueue != nil {
+			self.dnsPumpQueue.Clear()
+		}
 		returnPacketTranslationQueue(self.in)
 		returnPacketTranslationQueue(self.out)
 		returnPacketTranslationQueue(self.forward)

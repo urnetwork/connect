@@ -1,15 +1,16 @@
 # Provider egress transport and IP realism (IPREAL)
 
-Design only, 2026-10-07, at the owner's request: "Any work done to make
+Originally designed on 2026-10-07, at the owner's request: "Any work done to make
 client-strategy tcp/udp connections look more like chrome/other browser/os
 connections should also be done for connect/ip egress to make provider egress
 tcp/udp connections look more like chrome/other browser connections. Keep a
-design document for this in connect/IPREAL.md." No code and no tests were
-written or run for this document. It is modeled on EXTENDER.md section P:
+design document for this in connect/IPREAL.md." The original document was
+design only. The implementation status below records the subsequently
+authorized subset; the remaining numbered items are future design. It is modeled on EXTENDER.md section P:
 numbered items, a verified-facts block, phases, the deterministic tests the
 implementation has to pass, and a decisions list with a recommendation each.
 
-How to review it. Every code claim carries `verify <file>:<lines>`. The lines
+How to review the original design. Its code claims carry `verify <file>:<lines>`. The lines
 were read on connect `origin/main` at `93d5b219` (the merge of the Chrome
 client hello, 2026-10-07); sdk claims were read at sdk `92006578`, server
 claims at server `fe8ef986`, and gVisor claims at the fork `../gvisor` at
@@ -20,6 +21,222 @@ with the kernel source file named, since it is not in this repository, and
 every network-stack profile value in R4 is a literature value that the
 implementation must confirm by capture before the profile is enabled (R4,
 T14).
+
+## Implementation status, 2026-10-07
+
+Initially implemented the small provider-egress subset on connect `f43d155a`,
+then integrated it with the reviewed client-strategy changes at `3fd67304`
+and the WebRTC/camouflage merges through `840e28d5`.
+The owner explicitly selected **`EgressTtlModeMirror` as the default** for both
+TCP and UDP, replacing the original shadow-first recommendation for this
+subset. This is TTL/hop-limit mirroring, not a complete browser TCP profile.
+
+- `TcpBufferSettings.EgressTtlMode` and `UdpBufferSettings.EgressTtlMode`
+  select `mirror`, `shadow`, or `native`. Default constructors, including the
+  provider profiles, select `mirror`. Empty or unknown values in custom
+  settings retain native behavior. Shadow mode reads the actual socket TTL
+  and counts matches/mismatches without setting any socket option.
+- IPv4 TTL and IPv6 hop limit are retained in the ordinary NAT dispatcher
+  and the separate reliable-provider TCP ingress parser. TCP captures the
+  initial SYN's value; UDP captures the first datagram's value before either
+  the shared or legacy socket lifecycle starts. Later UDP datagrams do not
+  change the flow's target, and retransmitted TCP SYNs retain the initial
+  target. Values 1..255 are preserved, including low probe
+  limits; zero is counted as invalid and leaves the native option intact.
+- A private dial-context target reaches `ConnectSettings.NetDialer()`'s
+  pre-connect hook after its existing buffer and egress-interface controls.
+  Context-preserving host wrappers reach that hook too. Truly opaque dials
+  get a best-effort post-connect fallback: it cannot change an already-sent
+  TCP SYN, but precedes the first ordinary UDP write. Socket-option refusal
+  never fails the flow; existing control-chain errors retain their behavior.
+  Ordinary client-strategy dials have no provider target and are unchanged.
+- `TcpBufferSettings.ProviderKeepAliveConfig *net.KeepAliveConfig` optionally
+  overrides keepalive after connect, including explicit disablement. Nil
+  preserves existing behavior. No unverified Chrome timing is selected:
+  default `ConnectSettings` still explicitly use 5-second idle/interval and
+  one probe. Provider overrides do not change client-strategy recovery.
+- `LocalUserNat.EgressRealismStats()` exposes fixed-size, cumulative atomic
+  counters shared across protocols, families, and dispatch shards: observed
+  flows, mode, invalid TTL, pre/post-connect sockets, native TTL agreement,
+  failed reads/applies, unavailable sockets, and keepalive override failures.
+  These are local aggregate diagnostics, not new per-source protocol fields.
+  Socket counts can exceed flow counts if dialing creates multiple sockets;
+  snapshots are concurrent-safe but not atomic across all fields.
+
+Implementation: `ip_egress_realism.go`, the platform-specific
+`ip_egress_realism_sockopt_*.go`, and the wiring in `ip.go`, `net.go`, and
+`ip_provider_reliable_ingress.go`. Application TLS/QUIC payloads, TCP option
+layout, MSS, window scale, DF, source-port policy, and the synthetic
+client-facing stack are unchanged. Client-strategy Chrome ClientHello support
+remains the existing normal/resilient dialer implementation.
+
+Deterministic regression coverage in `ip_egress_realism_test.go` exercises real
+NAT TCP/UDP sockets in both address families, reliable receipt delivery,
+shared/legacy UDP lifecycles, first-datagram retention, the default settings,
+shadow/native modes, invalid and low TTLs, host wrappers, opaque fallback,
+refused options, and preservation of existing control failures. Actual
+keepalive options are checked in `ip_egress_keepalive_unix_test.go` with
+Linux/Darwin-specific option constants. `ip_egress_syn_linux_test.go` uses
+`TCP_SAVE_SYN`/`TCP_SAVED_SYN` on loopback to distinguish pre-connect
+mirroring from post-connect fallback for ordinary/reliable IPv4/IPv6 flows.
+The dedicated
+`TestProviderReliableDeliveryPreservesTtlBeforeSocketCreation` drives the
+reliable receipt path to the actual upstream socket; ordinary packet delivery
+cannot substitute for this test. Mutation validation removed only the two
+TTL-capture assignments in `ip_provider_reliable_ingress.go`: the ordinary
+TCP regression still passed, while the reliable regression failed with TTL
+64 instead of 123. Both assignments were restored.
+
+Validation so far on Darwin/arm64: the complete focused suite and focused
+race suite pass (`go test [-race] . -run
+'TestProvider(Egress|ReliableDeliveryPreservesTtl)' -count=1`). Linux/amd64
+test-binary compilation passes, including the saved-SYN oracle. Windows/amd64
+test-binary compilation also passes. Linux and Windows tests were compiled,
+not executed, on this Darwin host.
+
+The bounded broader check, `go test -short ./... -timeout=180s`, was not
+green: the root package reported
+`TestMultiClientPeerReplacementContinuesWhileMonitorObserverStalls` failing
+to form initial peers, then exhausted its package time limit during
+`TestFramerSpeedup`; `durablevolume` also exhausted its package time limit;
+`mls.TestPinnedToolchain` requires Go 1.26.5 but the host uses Go 1.27.1.
+The peer-replacement test passed when rerun in isolation (1.148 seconds),
+so its broad-run failure was not reproduced there. These results do not
+establish a passing full repository suite. The focused feature and race
+results above remain the validation for this change; the broader failures
+were not repaired as part of the TTL/keepalive subset.
+
+The subsequent Astra max review fixes preserve this provider subset, including
+the reliable-ingress TTL regression and the mirror default. Client-strategy
+ranking now observes received HTTP and H1/WebSocket payload, captures the
+attempt's network/configuration, and uses expiring delivery evidence rather
+than lifetime handshake success. Existing network-change notifications isolate
+new paths; hosts may supply a stable private identifier to revisit prior scores.
+The extender-directory fixes make release admission atomic across replicas,
+retain epoch disclosure budgets across eligibility changes, sign canary channel
+restrictions, publish canary-only regional DNS sets, align feed sample/stream
+partitions, and retain blocked reports through same-key eviction. Their
+deterministic regressions live in `net_extender_review_regression_test.go`,
+`net_extender_release_admission_test.go`, `net_strategy_delivery_test.go`,
+`gossip/canary_channel_test.go`, and the server's release/publisher tests.
+These changes do not establish a complete Chrome wire fingerprint. Server
+migrations 794 and 795 remain pending for persistent databases; validation uses
+leased private test databases.
+
+Validation of the integrated review fixes on Darwin/arm64 passed: the focused
+root regression/TTL race suite, the broader HTTP/H1/extender/client-strategy
+suite, the complete gossip suite with and without the race detector, the
+fingerprint suite, and server release-model/DNS-publisher tests. The server
+checks exercised actual PostgreSQL transactions and publication with migrations
+applied only to leased private test databases. Linux/amd64 and Windows/amd64
+root test binaries also compile. This is affected-suite validation; the earlier
+full-repository limitations above still apply.
+An isolated Go overlay reverting the regional DNS guard makes
+`TestReviewDnsCanaryIsPublishedWithoutOrdinaryRegionalPeers` fail with the
+original omission. The working-tree implementation was not changed by this
+counterfactual check.
+
+The follow-up parallel Astra max implementation review covers the WebRTC and
+camouflage merges through `840e28d5`, as well as the remaining strategy/DNS
+issues. Its fixes preserve the provider behavior above:
+
+- WebRTC stream reads and complete writes serialize independently. Close owns
+  the drain reader, joins it, and distinguishes reversible deadlines from
+  association failure. Deadline changes serialize with shutdown. Answer
+  delivery and waiter closure share one nonblocking lifecycle boundary, and
+  carrier-owned cancellation bounds outstanding offer exchanges.
+- Camouflage shutdown retires lazy resolver admission safely. Cancellation
+  interrupts hello reads and the initial borrowed-site write; relay ownership
+  covers cleanup before that write, and short or zero-progress writes are
+  handled explicitly. Relay ownership clears the inherited hello deadline,
+  including when relay idle timeouts are disabled. Partial record reads retain
+  every consumed byte for fallback replay. The TCP race transfers connection
+  ownership only when the result is received, so terminal answers and
+  cancellation close losing dials.
+- Vless delivery evidence uses a private configuration identity, while public
+  family telemetry remains `vless`. Replacement invalidates evidence, retired
+  selections cannot stamp a new attempt, and configuration generations reject
+  late completions even when an earlier configuration returns.
+- Synthesized DNS responses retain the peer's latest EDNS capability after
+  queued request headers drain. Peer state is bounded, expires on the existing
+  state timer, handles transitions to legacy independently per endpoint, and
+  is released when its translation closes.
+- The signed-record wire fields are distinct: `WebRtcClientId` remains 14,
+  `RealityPublicKey` remains 15, and the unpublished `CanaryChannel` uses 16.
+  Generated bindings preserve those assignments.
+
+Permanent deterministic regressions are in
+`net_extender_webrtc_lifecycle_regression_test.go`,
+`net_extender_camouflage_lifecycle_test.go`,
+`extender/extender_camouflage_lifecycle_test.go`,
+`net_strategy_vless_identity_test.go`, and
+`transport_pt_edns_state_test.go`, with signed-record wire coverage in
+`extender_record_wire_test.go` and `protocol/extender_wire_test.go`.
+Each root cause was reproduced against the pre-fix mechanism before checking
+the corrected behavior; concurrent ownership tests use barriers or Go's virtual
+clock rather than scheduler luck. Adjacent write, drain, deadline, and stale
+configuration failures receive their own regression coverage.
+
+Final follow-up validation on Darwin/arm64 passed: the combined
+strategy/DNS/directory/provider regression race gate, the full WebRTC stream
+and signaling race suite, extender camouflage and WebRTC integration race
+suites, protocol wire tests, and the complete gossip/fingerprint suites with
+the race detector. The broader affected root suite passed with `-short`
+(142.616 seconds), covering HTTP/H1, extenders, client strategy, DNS codecs,
+queues, packet-translation lifecycle, and provider regressions. The extender
+WebRTC integration race suite passed in 23.979 seconds. Server release-model
+and DNS-publisher checks passed against leased PostgreSQL databases after
+adding the merged WebRTC dependency to the server module checksums.
+Linux/amd64, Windows/amd64, and JavaScript/Wasm root test binaries compile;
+they were not executed on this host. `git diff --check` passes in both repos.
+
+A broader run without `-short` reached its 180-second package limit in the
+DNS/QUIC stress paths. The bounded short suite skips those long stress loops;
+its passing result does not certify that stress run or resolve the earlier
+full-repository limitations above. Persistent server migrations 794 and 795
+remain pending; private test migration application does not deploy them.
+
+Continuation checks: the complete provider-egress TTL/keepalive suite also
+passes on Linux/arm64 in an isolated local Docker container, with no skipped
+tests. This executes `TestProviderEgressSavedSynCarriesClientTtl` against the
+kernel's saved SYN headers for ordinary/reliable IPv4/IPv6 flows and opaque
+dials, rather than merely compiling that oracle. Windows and Linux/amd64
+remain compilation-only checks. Standalone `TestPtDnsEncodeDecode` passes all
+32 iterations without retries (85.561 seconds). Combined with the affected
+short suite's 142.616 seconds, that test alone exceeds the earlier combined
+180-second budget; the aggregate timeout does not establish a DNS defect.
+
+These correctness fixes do not complete the phased server WebRTC acceptance,
+production rendezvous wiring, server publication of the camouflage key, SDK
+provider activation, or population of the borrowed-domain resource. Those
+rollout dependencies remain explicit in `EXTENDER.md`; an enabled local carrier
+or passing fixture does not establish end-to-end production availability.
+
+Not implemented: the R4 profile registry/capture corpus, full SYN fingerprint
+matching, MSS/window clamping, UDP DF/PMTU feedback, source-port policy,
+Source P signaling, B-lite/B-full, gVisor profile encoders, and per-source
+protocol publication. No full phase in the original plan is marked complete
+by this narrower subset.
+
+Review corrections to the remaining design:
+
+1. A socket has one `SO_MARK`; B-lite must preserve the host's routing
+   exclusion identity and coordinate a discriminator with host policy rather
+   than overwrite that mark with the distinct value proposed in R10.1.
+2. Go's socket `Control` hook precedes bind/connect. An automatically
+   allocated source port is unavailable there; the proposed B-lite SYN-table
+   registration requires a reservation or another correlation mechanism.
+3. nftables queue `bypass` covers an absent queue listener. Queue overflow
+   needs `NFQA_CFG_F_FAIL_OPEN`; a pure-byte test cannot verify kernel overflow
+   behavior. A live stalled listener also needs an explicit lifecycle policy.
+4. R3.5's per-source profile ID alone cannot distinguish synthesized flows
+   from device flows sharing that source. Source P needs an explicit selector
+   and ordering before the initial SYN.
+5. `applyPathMtuFor` consumes client-side ICMP feedback to reduce the return
+   path's packet size. It does not construct a client-directed ICMP error for
+   upstream `EMSGSIZE`; that future work needs its own constructor/MTU source.
+6. Port-range policy must run before bind. Applying it after `ListenUDP`
+   cannot alter the already-allocated source port.
 
 ## R0. Verified facts
 
@@ -157,8 +374,10 @@ T14).
   :4248-4252, call at :5884-5888; the fallback NAT at
   sdk/device_local_provider.go:251-258). The server wraps every dial in a
   `DialContextSettings` (`ForceIPv4ConnectSettings`, verify server/sdk.go:30-41).
-  On those hosts the dial is opaque to `DialControl` (R0.2), which is exactly
-  the asymmetry the buffer rule already lives with (R0.4).
+  The server wrapper delegates to a copied `base.DialContext`, so a normal
+  base still reaches `NetDialer` and its control hook (verify server/sdk.go:30-41).
+  A host-supplied dial is opaque only if its implementation bypasses that
+  hook; the presence of `DialContextSettings` alone does not establish this.
 - R0.14 Memory scaling: `MemoryScaledByteCount` and `MemoryScaledCount`
   (verify memory_budget.go:105-117); the provider flow cost model
   `providerUdpFlowByteCount = 2 KiB`, `providerTcpFlowByteCount = 8 KiB`
@@ -356,7 +575,10 @@ sources were considered.
   `IpPacketToProvider`: a per-packet field would be parsed on the hot path for
   every packet to carry a value that changes once per session. An unknown
   message type on an old provider is skipped as today. The id registry is
-  R4.1; 0 means unspecified, i.e. mirror.
+  R4.1; 0 means unspecified, i.e. mirror. This proposal is incomplete: a
+  per-source value alone cannot enforce R3.2's synthesized-only scope for
+  mixed flows. Specify a flow selector or separate source identity, and
+  delivery ordering before the initial SYN, before implementation.
 - R3.6 Recommendation (D2, D3). Source M is the default for every flow that
   arrives from a device tun; Source P for flows connect originates from a
   user-space stack with a browser hello, and as an owner override; Source H
@@ -493,15 +715,17 @@ sources were considered.
   leaves the kernel's choice, counted. 11,848 ports per destination tuple is
   ample. Nothing on Darwin and Windows, whose defaults already sit in that
   range. (D6.)
-- R5.6 Keepalive. The egress socket today enables keepalive with Go's default
-  period (`tcpConn.SetKeepAlive(true)`, verify upstream_socket_buffer.go:106),
-  which is observable on an idle connection as a probe cadence no browser OS
-  emits by default (Go's default idle is 15 s; `?` for the exact value in the
-  pinned toolchain, verify net.KeepAliveConfig defaults). The applier sets
+- R5.6 Keepalive. The default dialer explicitly configures 5-second idle and
+  interval with one probe (verify net.go:94-100); the post-connect setup also
+  enables keepalive (`tcpConn.SetKeepAlive(true)`, verify
+  upstream_socket_buffer.go:106). A truly opaque host dial may use other
+  timings. The future profile applier sets
   `KeepAliveConfig` from the profile (R4.2) after connect through the existing
   `configureUpstreamTcpConn`, with the profile's idle and the kernel's
   interval; a profile with no fixed value keeps a 45 s idle (Chrome's socket
-  setting on Windows and Linux, `?`), never Go's 15 s.
+  setting on Windows and Linux, `?`, requiring capture before adoption).
+  The implemented subset exposes an independent optional provider override
+  and preserves existing defaults rather than guessing that profile timing.
 - R5.7 The same applier on the client-strategy sockets. The owner's parallel:
   the normal and resilient dialers already dial through `NetDialer()` (R0.2),
   so installing the applier on `ConnectSettings.DialControlContext` with a
@@ -510,8 +734,9 @@ sources were considered.
   port range without touching net_http.go or net_resilient.go. The
   client-strategy UDP sockets (the H3 platform transport's `ListenUDP` plus
   `applyEgress`, verify transport_family.go:900-917; the alt api's packet conn,
-  verify net_http_alt.go:341-350) take the post-creation subset (TTL, DF, port
-  range) through an `applyEgressProfile(conn, target)` beside `applyEgress`.
+  verify net_http_alt.go:341-350) can take the post-creation subset (TTL, DF)
+  through an `applyEgressProfile(conn, target)` beside `applyEgress`. Source
+  port-range policy instead requires a pre-bind control hook.
   Those sockets face the platform and the extender, not a bot-management
   stack; the value is that a client-strategy connection does not read as "a
   Chrome hello on a Go socket" on the wire.
@@ -521,14 +746,16 @@ sources were considered.
   Windows egress interface pin, which fails the dial on purpose because an
   unpinned socket would loop into the tunnel (verify egress_windows.go:30-42),
   keeps its behavior; the profile applier is not a reason to fail.
-- R5.9 Opaque host dials (R0.13). The sdk's `ProviderDialContextSettings` and
-  the server's `ForceIPv4ConnectSettings` wrapper bypass the hook, so the SYN
-  of such a flow is the host's. `configureUpstreamTcpConn` gains the
+- R5.9 Opaque host dials (R0.13). A host implementation that bypasses
+  `NetDialer` also bypasses the hook, so the SYN of such a flow is the host's.
+  The server's context-preserving `ForceIPv4ConnectSettings` wrapper around a
+  normal base is not such a bypass. `configureUpstreamTcpConn` gains the
   post-connect subset for that case, the way it has the send pin today
   (verify upstream_socket_buffer.go:94-112): TTL and keepalive after connect,
   which fixes the data packets but not the SYN, counted as `opaqueDial`. The
-  real fix is for those hosts to wrap `NetDialer()` rather than replace it,
-  so the hook runs; that is server and sdk work (phase 4, D12).
+  real fix for a truly opaque host is to preserve the dial context and call
+  through `NetDialer()` rather than replace it (phase 4, D12). The implemented
+  TTL subset detects actual hook execution and already supplies the fallback.
 
 ## R6. UDP and QUIC egress
 
@@ -540,9 +767,10 @@ sources were considered.
   (verify ip.go:3563-3575) stays; it has no wire visibility.
 - R6.2 A DF datagram the path cannot carry fails the send with `EMSGSIZE`
   under `PMTUDISC_DO`, which is what the client's own OS would see as an ICMP
-  too-big; the NAT already synthesizes path-MTU signals toward the source
-  (`applyPathMtuFor`, verify ip.go:2747-2756). Phase 3 wires the `EMSGSIZE`
-  result to that path (confirm its current trigger before relying on it) so
+  too-big. `applyPathMtuFor` instead consumes client-side ICMP feedback and
+  lowers the return-path packet size (verify ip.go:2747-2756); it does not
+  generate this signal. Phase 3 must construct the client-directed ICMP
+  response, with the path MTU and a quote of the offending packet, so
   the client's QUIC performs its own PMTU reduction as it would on a real
   network. Today's socket, with DF left to the kernel default, may fragment
   silently where the client expected a too-big signal; DF realism also fixes
@@ -594,9 +822,10 @@ applying.
   touches different options; order between them is irrelevant and the pin's
   semantics are unchanged (R0.3, R5.3). The cgroup-BPF fwmark on urnetwork-linux
   is stamped at `inet_create` before any hook runs and is untouched (R0.3).
-  B-lite adds a second mark on managed sockets to select their SYNs (R10.1),
-  set in the same hook, which needs `CAP_NET_ADMIN` and so exists only on the
-  privileged daemon.
+  B-lite needs a discriminator on managed sockets to select their SYNs
+  (R10.1). There is only one socket mark, so a distinct `SO_MARK` value must
+  not overwrite the routing-exclusion identity. Coordinate the discriminator
+  and host routing policy before choosing a mark mask or another mechanism.
 - R9.2 Memory. Level A adds one `egressSynTarget` (under 32 bytes) per
   sequence and a fixed set of counters per NAT; no budget changes. The window
   clamp bounds the kernel's receive window at `2^(16+ws)`: 4 MiB for the
@@ -621,11 +850,13 @@ applying.
   probe: open an NFQUEUE (a pure-Go netlink binding, D9), install one
   nftables rule in the output chain, `meta mark == egressProfileMark tcp flags
   & (syn|ack) == syn queue num N bypass`, and remove it at role stop; any
-  failure leaves B-lite off for the process, logged once. Per managed flow the
-  Control hook sets `SO_MARK = egressProfileMark` (distinct from the
-  cgroup-BPF mark so control dials are not queued) and inserts
-  `(sourcePort, destination) -> target` into the SYN table before `connect()`
-  returns, so the entry exists before the SYN can be queued; the entry is
+  failure leaves B-lite off for the process, logged once. The discriminator
+  must preserve the routing-exclusion behavior described in R9.1. Register
+  the flow before its first SYN can be queued. The originally proposed
+  `(sourcePort, destination) -> target` insertion in `Control` cannot work
+  with automatic port allocation: Go calls the hook before bind/connect and
+  the source port is still zero. Design a reservation or alternate correlation
+  mechanism before implementing this path. Once correlated, the entry is
   removed when the dial completes or fails. The handler rewrites a queued SYN
   to the target: option order and padding exactly as the layout says,
   timestamps and SACK-permitted dropped when the layout omits them, the
@@ -638,9 +869,11 @@ applying.
   Kernel SYN retransmissions are queued again and rewritten the same way. A
   stripped timestamps or SACK option is safe: a compliant peer answers
   without the option and the kernel then runs the connection without it, the
-  standard RFC 7323 and RFC 2018 negotiation. `bypass` on the rule means a
-  dead or full queue passes the SYN unrewritten: fail-open to Level A, with
-  a counter. Queue length bounded at 1024; the handler goroutine takes the
+  standard RFC 7323 and RFC 2018 negotiation. `bypass` on the rule covers an
+  absent listener; queue overflow separately requires `NFQA_CFG_F_FAIL_OPEN`.
+  A stalled live handler needs a lifecycle policy as well. Verify these
+  fail-open paths with kernel integration tests, not only pure packet bytes.
+  Queue length bounded at 1024; the handler goroutine takes the
   provider context and is joined at role stop.
 - R10.2 B-full, user-space stack. The gVisor fork's netstack as the egress
   TCP, a profile-driven `makeSynOptions` (R0.12) with the layout, the stack's
@@ -666,7 +899,9 @@ applying.
   `profile` (apply `ProfileId` to every flow, the owner override of R3.2(iii)),
   or `native` (nothing derived, nothing counted; today). The defaults in
   `DefaultTcpBufferSettingsWithBufferSize` and the UDP twin are `off` for the
-  first release and `mirror` thereafter (D8). The sdk exposes one
+  first full-profile release and `mirror` thereafter (D8). The implemented
+  TTL-only subset instead defaults to `EgressTtlModeMirror` immediately,
+  at the owner's explicit request. The sdk exposes one
   `DeviceLocalSettings.ProviderEgressRealism` in the shape of
   `DefaultProvideExtender` (EXTENDER.md F3, G1) that the provider wiring
   copies into both settings; the server's hosts opt in explicitly.
@@ -808,8 +1043,10 @@ a hermetic `go test`.
   profile, nothing elsewhere. Recommendation: yes (R5.5).
 - D7. DoH: keep Go's hello and the mirrored gVisor SYN until the Tun can emit
   a profile SYN, then move both together. Recommendation: yes (R7.3).
-- D8. First-release posture: `off` (shadow counters) for one release, then
-  `mirror` by default; `native` is the kill switch. Recommendation: yes; the
+- D8. TTL subset decision: `EgressTtlModeMirror` by default immediately,
+  selected explicitly by the owner; `shadow` and `native` remain available.
+  Original full-profile recommendation: `off` (shadow counters) for one
+  release, then `mirror` by default; `native` is the kill switch. The
   counters tell what the fleet's hosts can reach before anything changes on
   the wire.
 - D9. B-lite dependency: a pure-Go netlink NFQUEUE binding and nftables
@@ -824,12 +1061,14 @@ a hermetic `go test`.
   window, `rmem_max`/`tcp_rmem[2]` for window scale 8): document in the
   urnetwork-linux installer, never set by connect. Recommendation: document
   only.
-- D12. Opaque host dials (server `ForceIPv4ConnectSettings`, sdk
-  `ProviderDialContextSettings`): wrap `NetDialer()` so the hook runs.
+- D12. Truly opaque host dials: preserve context and wrap `NetDialer()` so
+  the hook runs. The server's normal `ForceIPv4ConnectSettings` wrapper
+  already delegates to the base dial and does not inherently need changing.
   Recommendation: yes, phase 4; until then they get the post-connect subset
   and a counter.
 - D13. IPv6 flow label realism: defer until a capture shows a mismatch; Linux
   and Windows already randomize. Recommendation: defer.
-- D14. Keepalive: set the profile's idle on the egress socket instead of Go's
-  default. Recommendation: yes, it is free and the default is a tell on idle
-  connections (R5.6); confirm Chrome's values by capture first.
+- D14. Keepalive: expose an independent optional provider setting now
+  (implemented); preserve the explicit 5-second default until a browser
+  reference justifies changing it. Future profile timing requires a capture
+  (R5.6).

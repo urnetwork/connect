@@ -214,6 +214,8 @@ func (self *ExtenderBlockedState) Report(keyHex string, countryCode string, repo
 		if 0 < self.settings.MaxEntryCount && self.settings.MaxEntryCount <= self.entryCount {
 			self.evictOldestEntryWithLock()
 		}
+		// Evicting this key's last country removes its outer map too.
+		self.entries[keyHex] = countryEntries
 		entry = &extenderBlockedEntry{
 			reporterTimes: map[string]time.Time{},
 		}

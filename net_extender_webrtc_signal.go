@@ -54,7 +54,8 @@ var ErrWebRtcExtenderNoSignaling = errors.New("the extender has no webrtc signal
 // returns its SDP answer. Production is the exchange signaling
 // (WebRtcManager.ExtenderCarrierExchanger); tests inject an in-memory bridge.
 // The offer carries its gathered ICE candidates (no trickle), so one round
-// trip is enough.
+// trip is enough. Implementations must return when ctx ends; carrier shutdown
+// joins an outstanding exchange before releasing its negotiation resources.
 type WebRtcExtenderOfferExchanger interface {
 	ExchangeOffer(ctx context.Context, offer webrtc.SessionDescription) (webrtc.SessionDescription, error)
 }
@@ -116,6 +117,8 @@ type webRtcExtenderSignaling struct {
 	// Nil in production; tests observe one answer, successful or not, after
 	// its outcome is counted and its reply, if any, is sent.
 	afterAnswerForTest func()
+	// Nil in production; tests hold an answer at its lifecycle boundary.
+	afterWaiterLookupForTest func()
 }
 
 func newWebRtcExtenderSignaling(
@@ -288,12 +291,12 @@ func (self *webRtcExtenderSignaling) receiveAnswer(
 		PeerId:   source.SourceId,
 		StreamId: streamId,
 	}
-	var waiter chan *protocol.ExchangeSignal
-	func() {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-		waiter = self.waiters[key]
-	}()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	waiter := self.waiters[key]
+	if self.afterWaiterLookupForTest != nil {
+		self.afterWaiterLookupForTest()
+	}
 	if waiter == nil {
 		self.unknownAnswerCount.Add(1)
 		return

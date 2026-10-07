@@ -9,7 +9,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -160,6 +162,7 @@ func TestWebRtcExtenderStreamWriteSplitsAtTheMessageBound(t *testing.T) {
 // when the test says the peer acknowledged.
 type testBufferedMessageChannel struct {
 	testMessageChannel
+	stateLock      sync.Mutex
 	bufferedAmount uint64
 	threshold      uint64
 	onLow          func()
@@ -168,33 +171,73 @@ type testBufferedMessageChannel struct {
 	// reports the association gone, as a detached pion channel does
 	readBlocked chan struct{}
 	// a dead association answers every read with this at once
-	readErr error
+	readErr     error
+	readChanged chan struct{}
 }
 
 func newTestBufferedMessageChannel(bufferedAmount uint64) *testBufferedMessageChannel {
 	return &testBufferedMessageChannel{
 		bufferedAmount: bufferedAmount,
 		readBlocked:    make(chan struct{}),
+		readChanged:    make(chan struct{}),
 	}
 }
 
 func (self *testBufferedMessageChannel) Read(b []byte) (int, error) {
-	if self.readErr != nil {
-		return 0, self.readErr
+	for {
+		self.stateLock.Lock()
+		readErr, deadline, changed := self.readErr, self.readDeadline, self.readChanged
+		self.stateLock.Unlock()
+		if readErr != nil {
+			return 0, readErr
+		}
+		var expired <-chan time.Time
+		if !deadline.IsZero() {
+			if !time.Now().Before(deadline) {
+				return 0, fmt.Errorf("read deadline exceeded: %w", os.ErrDeadlineExceeded)
+			}
+			expired = time.After(time.Until(deadline))
+		}
+		select {
+		case <-self.readBlocked:
+			return 0, errors.New("association closed")
+		case <-changed:
+		case <-expired:
+		}
 	}
-	<-self.readBlocked
-	return 0, errors.New("association closed")
 }
 
-func (self *testBufferedMessageChannel) BufferedAmount() uint64 { return self.bufferedAmount }
+// Deadline changes wake the same reader, as the real detached channel does.
+func (self *testBufferedMessageChannel) SetReadDeadline(deadline time.Time) error {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.readDeadline = deadline
+	close(self.readChanged)
+	self.readChanged = make(chan struct{})
+	return nil
+}
+
+func (self *testBufferedMessageChannel) BufferedAmount() uint64 {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.bufferedAmount
+}
 
 func (self *testBufferedMessageChannel) SetBufferedAmountLowThreshold(threshold uint64) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 	self.threshold = threshold
 }
 
-func (self *testBufferedMessageChannel) OnBufferedAmountLow(f func()) { self.onLow = f }
+func (self *testBufferedMessageChannel) OnBufferedAmountLow(f func()) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.onLow = f
+}
 
 func (self *testBufferedMessageChannel) Close() error {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 	self.closedWhile = self.bufferedAmount
 	err := self.testMessageChannel.Close()
 	if self.closeCount == 1 {
@@ -205,9 +248,15 @@ func (self *testBufferedMessageChannel) Close() error {
 
 // acknowledge releases every buffered byte, as a peer's acknowledgement does.
 func (self *testBufferedMessageChannel) acknowledge() {
-	self.bufferedAmount = 0
-	if self.onLow != nil {
-		self.onLow()
+	var onLow func()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.bufferedAmount = 0
+		onLow = self.onLow
+	}()
+	if onLow != nil {
+		onLow()
 	}
 }
 
@@ -217,26 +266,28 @@ func (self *testBufferedMessageChannel) acknowledge() {
 // Observable: the close waits for the channel to report nothing
 // unacknowledged before it closes anything.
 func TestWebRtcExtenderStreamCloseDrainsBeforeClosing(t *testing.T) {
-	channel := newTestBufferedMessageChannel(300)
-	conn := newWebRtcDataChannelConn(channel, nil, nil, 0)
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- conn.Close() }()
-	// the close is waiting on the acknowledgement, not racing it
-	select {
-	case err := <-closeDone:
-		t.Fatalf("close returned %v with %d bytes unacknowledged", err, channel.bufferedAmount)
-	case <-time.After(100 * time.Millisecond):
-	}
-	channel.acknowledge()
-	if err := <-closeDone; err != nil {
-		t.Fatal(err)
-	}
-	if channel.closedWhile != 0 {
-		t.Fatalf("the channel was closed with %d bytes unacknowledged", channel.closedWhile)
-	}
-	if channel.threshold != 0 {
-		t.Fatalf("drain threshold = %d, want 0", channel.threshold)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		channel := newTestBufferedMessageChannel(300)
+		conn := newWebRtcDataChannelConn(channel, nil, nil, 0)
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- conn.Close() }()
+		synctest.Wait()
+		select {
+		case err := <-closeDone:
+			t.Fatalf("close returned %v with %d bytes unacknowledged", err, channel.bufferedAmount)
+		default:
+		}
+		channel.acknowledge()
+		if err := <-closeDone; err != nil {
+			t.Fatal(err)
+		}
+		if channel.closedWhile != 0 {
+			t.Fatalf("the channel was closed with %d bytes unacknowledged", channel.closedWhile)
+		}
+		if channel.threshold != 0 {
+			t.Fatalf("drain threshold = %d, want 0", channel.threshold)
+		}
+	})
 }
 
 // Root cause: an aborted association never acknowledges, and nothing on the
@@ -267,23 +318,26 @@ func TestWebRtcExtenderStreamCloseGivesUpOnADeadChannel(t *testing.T) {
 // The peer's half-close is not death: the close keeps waiting for the
 // acknowledgement, which still arrives on a live association.
 func TestWebRtcExtenderStreamCloseWaitsPastThePeersHalfClose(t *testing.T) {
-	channel := newTestBufferedMessageChannel(300)
-	channel.readErr = io.EOF
-	conn := newWebRtcDataChannelConn(channel, nil, nil, 0)
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- conn.Close() }()
-	select {
-	case err := <-closeDone:
-		t.Fatalf("close returned %v on the peer's half-close with bytes unacknowledged", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	channel.acknowledge()
-	if err := <-closeDone; err != nil {
-		t.Fatal(err)
-	}
-	if channel.closedWhile != 0 {
-		t.Fatalf("the channel was closed with %d bytes unacknowledged", channel.closedWhile)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		channel := newTestBufferedMessageChannel(300)
+		channel.readErr = io.EOF
+		conn := newWebRtcDataChannelConn(channel, nil, nil, 0)
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- conn.Close() }()
+		synctest.Wait()
+		select {
+		case err := <-closeDone:
+			t.Fatalf("close returned %v on the peer's half-close with bytes unacknowledged", err)
+		default:
+		}
+		channel.acknowledge()
+		if err := <-closeDone; err != nil {
+			t.Fatal(err)
+		}
+		if channel.closedWhile != 0 {
+			t.Fatalf("the channel was closed with %d bytes unacknowledged", channel.closedWhile)
+		}
+	})
 }
 
 // Root cause: pion reports a passed deadline as a plain error wrapping

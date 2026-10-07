@@ -3335,6 +3335,9 @@ extender's own record first when it is open, then the epoch's order of the
 vantage's partition interleaved by family (`balanceRecordsByIpFamily`, which
 keeps the order it is given); the stream forwards an applied open record only
 when `OpenPartitionContains(vantage, key)`, and every revocation. The sample
+and stream partition the same complete open pool, including the server's own
+record; placing that record first happens after partitioning and never changes
+the partition count. The sample
 cap is 8 (was 32) and the client's default 8 (was 16): the partition is the
 bound, the cap the pace. The secret is per directory, drawn at construction
 (`PartitionSecret` pins it), never stored and never on the wire: a restart
@@ -3363,7 +3366,11 @@ partition each epoch of a week (`ExtenderReleaseEpochTimeout`), of which it
 takes the first eligible: one record while the identity is new, three once
 it has served thirty days (`ExtenderReleaseProbationTimeout`, the Lox shape;
 the client's creation time is the age). Asking again in the same epoch
-returns the same records, so a repeat learns nothing. Requests are counted
+returns previously issued records that remain eligible. The ledger retains
+the complete issued set for the epoch: changing `ip_versions`, country,
+blocked status, or fleet availability cannot refund a disclosure. A blocked
+or removed record may therefore leave an empty answer until the next epoch.
+Requests are counted
 per identity (8 an hour) and per vantage -- the requester's asn as text, or
 its prefix (`ExtenderVantagePrefix`) where none is known (4096 an hour),
 refused requests counting too. A record is released to at most ten distinct
@@ -3376,7 +3383,17 @@ country (R4) and a record of a family the client cannot dial
 `ExtenderReleaseLedger`: `ExtenderReleaseMemoryLedger` is the bounded
 in-process one (an operator of one process, and every test); the server's is
 `model.NetworkExtenderReleaseLedger` over `network_extender_release` and
-`network_extender_release_request`. The released records are signed fresh at
+`network_extender_release_request`. Request counts, request stamps, country
+reservations and epoch history are one admission transaction. The memory
+implementation holds one lock; replicas share PostgreSQL transaction advisory
+locks for identity, vantage and country, acquired in a stable order.
+Country-wide serialization keeps lock use constant at three locks per
+admission. Read-committed statement snapshots ensure a waiting replica sees
+the previous commit. Eligibility is checked for one partition plus previously
+issued keys before admission, with one batched database query for blocked
+flags. Migration 795 indexes the identity/epoch disclosure lookup; removed
+fleet rows retain disclosure tombstones for the epoch.
+The released records are signed fresh at
 each release, so a client refreshes a record by asking again within its
 epoch, and applies them with source `release`, which is not a K4 event. The
 answer is `{records, epoch, count, probation}` with base64 records
@@ -3386,9 +3403,16 @@ R4. Canaries and blocked state (`net_extender_directory_canary.go`). A
 canary is an operator-run extender in exactly one place: a dns canary is in
 its continent's sets every epoch, pinned, never filled into another
 location's set and never dripped; a gated canary is in the gated partition
-its key hashes to and in no open channel. Nothing on the wire marks one, and
-it behaves like any record there, so a censor that blocks it learned it from
-that one place: `ExtenderCanaryPlace` names the channel and the partition or
+its key hashes to and in no open channel. The signed `CanaryChannel` field
+(field 16; fields 14 and 15 remain `WebRtcClientId` and `RealityPublicKey`)
+restricts redistribution even after a DNS record enters a client's directory.
+Canaries also use the gated wire tier, so older tier-aware readers suppress
+their open relays without understanding the new field. Ordinary records with
+an empty channel retain their existing tier behavior. Feed samples, streams,
+gossip validation and local gossip publication exclude channel-restricted
+records. DNS publishes a healthy regional canary even when it is the region's
+or address family's only record, with its matching TXT set; it never fills
+another region or the default set. `ExtenderCanaryPlace` names the channel and the partition or
 region, and `ExtenderAttributeBlockedCanaries` names each leaked place once
 for a set of blocked keys. The server holds the designation in
 `network_extender.canary_channel`. Blocked state is per country
@@ -4332,3 +4356,30 @@ Phased (not in 14a):
 - The fingerprint-drift harness's `TestExtenderCamouflageHelloConformance`
   placeholder (the note above) can now be wired to the camouflaged dial's uTLS
   hello; that is the harness owner's change, not this one.
+
+Implementation review follow-up, 2026-10-07:
+- Camouflage retirement refuses new splice admission and safely joins lazy
+  resolver construction. Hello peeking observes handler cancellation and joins
+  its callback before handing the connection to the next phase. Replay retains
+  partial record headers and bodies even when a read returns an error.
+- The splice owns cleanup before its initial write, retries short writes,
+  terminates zero-progress writes, clears the inherited hello deadline, and
+  joins its cancellation and relay workers.
+  The client race transfers ownership through an unbuffered result handoff;
+  completed losing attempts close their own connections after cancellation.
+- The WebRTC stream adapter supports concurrent net.Conn calls. Read ownership,
+  write chunk ordering, deadline changes, and close draining are coordinated;
+  close joins the drain reader and does not mistake an expired read deadline for
+  a dead association. Signaling answer delivery is nonblocking and atomic with
+  waiter retirement. Carrier shutdown cancels and joins pending dials, and offer
+  exchange receives a finite negotiation deadline.
+- Vless strategy evidence separates private configurations and rejects stale
+  attempts across replacements, including an A-to-B-to-A change. DNS synthesis
+  retains bounded, expiring per-peer EDNS capability independently of queued
+  request headers. Signed canary restrictions use record field 16 without
+  changing the merged WebRTC or camouflage field numbers.
+
+The permanent lifecycle, strategy-identity, DNS-state, and signed-record tests
+cover these root causes with synthetic fixtures and explicit ordering. This
+review preserves the phased server/SDK and empty borrowed-resource limitations
+listed above; it does not change their deployment status.

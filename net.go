@@ -306,14 +306,14 @@ func (self *ConnectSettings) NetDialer() *net.Dialer {
 	// FallbackDelay is explicit so any hostname dial that still reaches
 	// the stdlib race (a caller-injected use of this dialer) paces its
 	// families the same way raceDialContext does
-	return egressDialer(&net.Dialer{
+	return providerEgressDialer(egressDialer(&net.Dialer{
 		Timeout:         self.ConnectTimeout,
 		KeepAlive:       self.KeepAliveTimeout,
 		KeepAliveConfig: self.KeepAliveConfig,
 		FallbackDelay:   DefaultDialFallbackDelay,
 		Resolver:        egressAwareResolver(self.Resolver),
 		Control:         self.DialControl,
-	})
+	}))
 }
 
 type ProxySettings struct {

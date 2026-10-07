@@ -460,6 +460,7 @@ func DefaultUdpBufferSettingsWithBufferSize(bufferSize int) *UdpBufferSettings {
 		// explicit profile below.
 		GlobalLimit:     globalLimit,
 		MaxWindowSize:   uint32(MemoryScaledByteCount(mib(1), kib(256))),
+		EgressTtlMode:   EgressTtlModeMirror,
 		ConnectSettings: *DefaultConnectSettings(),
 	}
 }
@@ -522,6 +523,7 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		// on by default: the benchmark range is reserved (RFC 2544) and the
 		// synthetic server only ever answers flows explicitly addressed to it
 		EnableSyntheticSpeed: true,
+		EgressTtlMode:        EgressTtlModeMirror,
 		ConnectSettings:      *DefaultConnectSettings(),
 	}
 	// the upstream socket buffers are the kernel's unless an explicit request
@@ -765,6 +767,8 @@ type LocalUserNat struct {
 	// (THROUGHPUTFIX §12). Read from the socket's own counter at close on
 	// Linux; zero elsewhere. Invisible to every layer above the socket.
 	udpKernelReceiveDropCount atomic.Uint64
+	// Fixed-size local diagnostics, shared by all dispatch shards and families.
+	egressRealism egressRealismCounters
 
 	sendPackets      chan *SendPacket
 	reliableCapacity receiveCapacitySignal
@@ -1620,6 +1624,10 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	udp6Buffer := newUdp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.UdpBufferSettings)
 	tcp4Buffer := newTcp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.TcpBufferSettings)
 	tcp6Buffer := newTcp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.TcpBufferSettings)
+	udp4Buffer.egressRealism = &self.egressRealism
+	udp6Buffer.egressRealism = &self.egressRealism
+	tcp4Buffer.egressRealism = &self.egressRealism
+	tcp6Buffer.egressRealism = &self.egressRealism
 	tcp4Buffer.admissionCapacity = &self.reliableCapacity
 	tcp6Buffer.admissionCapacity = &self.reliableCapacity
 	tcp4Buffer.flowCloseCallback = self.closeTcpFlow
@@ -1701,6 +1709,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					MessagePoolReturn(ipPacket)
 					return
 				}
+				udpPacket.ttl = ipPacket[8]
 				c := func() bool {
 					success, err := udp4Buffer.sendTransferKey(
 						source,
@@ -1731,6 +1740,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					MessagePoolReturn(ipPacket)
 					return
 				}
+				tcpPacket.ttl = ipPacket[8]
 				c := func() bool {
 					success, err := tcp4Buffer.sendTransferKey(
 						source,
@@ -1823,6 +1833,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					MessagePoolReturn(ipPacket)
 					return
 				}
+				udpPacket.ttl = ipPacket[7]
 				c := func() bool {
 					success, err := udp6Buffer.sendTransferKey(
 						source,
@@ -1853,6 +1864,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					MessagePoolReturn(ipPacket)
 					return
 				}
+				tcpPacket.ttl = ipPacket[7]
 				c := func() bool {
 					success, err := tcp6Buffer.sendTransferKey(
 						source,
@@ -2135,6 +2147,9 @@ func applyPathMtu(
 
 type UdpBufferSettings struct {
 	MemoryBudget *TransferMemoryBudget
+	// Shadow observes the socket default; mirror applies the first datagram's
+	// TTL/hop limit. Native (including the zero value) leaves sockets untouched.
+	EgressTtlMode EgressTtlMode
 	// nil resolves to the local user nat `Log`
 	Log                 Logger
 	ReadTimeout         time.Duration
@@ -2172,6 +2187,9 @@ type UdpBufferSettings struct {
 	// 0 (the default) is no limit.
 	GlobalLimit   int
 	MaxWindowSize uint32
+	// Tests inspect the configured socket before the first datagram is written.
+	// Runs on the flow's opener; nil is a production no-op.
+	afterSocketOpenForTest func(*UdpSequence, net.Conn)
 
 	ConnectSettings
 }
@@ -2198,6 +2216,7 @@ const (
 type parsedUdp struct {
 	sourceIp        net.IP
 	destinationIp   net.IP
+	ttl             uint8
 	sourcePort      uint16
 	destinationPort uint16
 	payload         []byte
@@ -2206,6 +2225,7 @@ type parsedUdp struct {
 type parsedTcp struct {
 	sourceIp          net.IP
 	destinationIp     net.IP
+	ttl               uint8
 	sourcePort        uint16
 	destinationPort   uint16
 	fin               bool
@@ -2873,6 +2893,7 @@ type UdpBuffer[BufferId comparable] struct {
 	// the owning NAT's kernel receive-drop counter, handed to each sequence
 	// for its socket close; nil leaves the drops uncounted
 	kernelReceiveDropCount *atomic.Uint64
+	egressRealism          *egressRealismCounters
 
 	mutex sync.Mutex
 
@@ -2999,6 +3020,10 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		if sequence == nil {
 			return nil
 		}
+		// Shared lifecycle opens the socket here, before any send item exists.
+		sequence.egressTarget = newProviderEgressTarget(
+			self.udpBufferSettings.EgressTtlMode, udp.ttl, ipProtocolNumberUdp, self.egressRealism,
+		)
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
 		sequence.prepareReturnReadCallback = self.prepareReturnReadCallback
 		sequence.providerReturnCapacity = self.providerReturnCapacity
@@ -3261,6 +3286,7 @@ type UdpSequence struct {
 	sharedSocketLifecycle          bool
 	sharedLifecycleWake            chan struct{}
 	udpBufferSettings              *UdpBufferSettings
+	egressTarget                   providerEgressTarget
 	sharedSocket                   net.Conn
 	sharedSocketErr                error
 	closeOnce                      sync.Once
@@ -3543,8 +3569,9 @@ func (self *UdpSequence) receiveBatch(packets [][]byte) {
 
 func (self *UdpSequence) openSocket() (net.Conn, error) {
 	self.log.V(2).Infof("[init]udp connect\n")
+	dialCtx, egressDial := self.egressTarget.dialContext(self.ctx)
 	socket, err := self.udpBufferSettings.DialContext(
-		self.ctx,
+		dialCtx,
 		"udp",
 		self.IpPath().DestinationHostPort(),
 	)
@@ -3558,6 +3585,7 @@ func (self *UdpSequence) openSocket() (net.Conn, error) {
 		}
 		return nil, err
 	}
+	egressDial.afterConnect(socket)
 	self.UpdateLastActivityTime()
 	self.log.V(2).Infof("[init]connect success\n")
 	if udpConn, ok := socket.(*net.UDPConn); ok {
@@ -3572,6 +3600,9 @@ func (self *UdpSequence) openSocket() (net.Conn, error) {
 		// (closeSocket).
 		udpConn.SetReadBuffer(int(self.udpBufferSettings.MaxWindowSize))
 		udpConn.SetWriteBuffer(int(self.udpBufferSettings.MaxWindowSize))
+	}
+	if self.udpBufferSettings.afterSocketOpenForTest != nil {
+		self.udpBufferSettings.afterSocketOpenForTest(self, socket)
 	}
 	return socket, nil
 }
@@ -4010,6 +4041,13 @@ func (self *StreamState) udpPacket(payload []byte) []byte {
 
 type TcpBufferSettings struct {
 	MemoryBudget *TransferMemoryBudget
+	// Shadow observes the socket default; mirror applies the first SYN's
+	// TTL/hop limit. Native (including the zero value) leaves sockets untouched.
+	EgressTtlMode EgressTtlMode
+	// Nil preserves existing provider keepalive settings (5s by default).
+	// An explicit config, including Enable:false, applies after connect and is
+	// independent of the control-plane ConnectSettings keepalive cadence.
+	ProviderKeepAliveConfig *net.KeepAliveConfig
 	// Shared retained origin bytes awaiting inner TCP acknowledgement. Defaults
 	// share one pool across this NAT's flows. Zero per-flow maximum borrows up
 	// to the shared pool; nil budget uses the configured TCP window per flow.
@@ -4372,6 +4410,7 @@ type TcpBuffer[BufferId comparable] struct {
 	receiveCallback                receiveTransferPacketFunction
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 	tcpBufferSettings              *TcpBufferSettings
+	egressRealism                  *egressRealismCounters
 	flowCloseCallback              tcpFlowCloseFunction
 	admissionCapacity              *receiveCapacitySignal
 
@@ -4632,6 +4671,7 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		}
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
 		sequence.admissionCapacity = self.admissionCapacity
+		sequence.egressRealism = self.egressRealism
 		sequence.flowCloseCallback = self.flowCloseCallback
 		flowMemory := sequence.memory
 		sequence.memory = natMemoryReservation{}
@@ -4954,6 +4994,8 @@ type TcpSequence struct {
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 
 	tcpBufferSettings *TcpBufferSettings
+	egressRealism     *egressRealismCounters
+	egressTarget      providerEgressTarget
 
 	// Guarded by the connection mutex. Chunk copies survive Transfer delivery
 	// until the source's inner cumulative TCP acknowledgement releases them.
@@ -5259,6 +5301,9 @@ func (self *TcpSequence) applyEstablishedPureAck(
 // initializeSynWithLock establishes sequence and window state from the first
 // SYN. The sequence mutex must be held.
 func (self *TcpSequence) initializeSynWithLock(tcp *parsedTcp) {
+	self.egressTarget = newProviderEgressTarget(
+		self.tcpBufferSettings.EgressTtlMode, tcp.ttl, ipProtocolNumberTcp, self.egressRealism,
+	)
 	// SYN and FIN consume one sequence number.
 	self.sendSeq = tcp.seq + 1
 	// The synthetic return sequence may start at the sender's sequence because
@@ -5448,6 +5493,7 @@ func (self *TcpSequence) Run() {
 	self.log.V(2).Infof("[init]tcp connect\n")
 	var socket net.Conn
 	var err error
+	var egressDial *providerEgressDial
 	if self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp) {
 		// benchmark-range destination: terminate at the in-memory synthetic
 		// speed server (see ip_synthetic_speed.go)
@@ -5456,8 +5502,10 @@ func (self *TcpSequence) Run() {
 		}
 		socket = newSyntheticSpeedConn()
 	} else {
+		var dialCtx context.Context
+		dialCtx, egressDial = self.egressTarget.dialContext(self.ctx)
 		socket, err = self.tcpBufferSettings.DialContext(
-			self.ctx,
+			dialCtx,
 			"tcp",
 			self.IpPath().DestinationHostPort(),
 		)
@@ -5506,6 +5554,7 @@ func (self *TcpSequence) Run() {
 	self.log.V(2).Infof("[init]connect success\n")
 
 	defer socket.Close()
+	egressDial.afterConnect(socket)
 	if tcpConn, ok := socket.(*net.TCPConn); ok {
 		// the default dialer ran the buffer control hook before connecting;
 		// a host-supplied dial is opaque and gets the post-connect subset
@@ -5515,6 +5564,9 @@ func (self *TcpSequence) Run() {
 			defaultSocketBufferPolicy(),
 			self.tcpBufferSettings.DialContextSettings == nil,
 		)
+	}
+	configureProviderKeepAlive(socket, self.tcpBufferSettings.ProviderKeepAliveConfig, self.egressRealism)
+	if tcpConn, ok := socket.(*net.TCPConn); ok {
 		if self.tcpBufferSettings.afterUpstreamConnectForTest != nil {
 			self.tcpBufferSettings.afterUpstreamConnectForTest(tcpConn)
 		}

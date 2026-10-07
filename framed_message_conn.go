@@ -164,6 +164,11 @@ func (c *FramedMessageConn) ReadMessage() (int, []byte, error) {
 }
 
 func ReadH1PooledMessage(conn H1MessageConn, limit int64) (int, []byte, error) {
+	if observed, ok := conn.(*strategyDeliveryMessageConn); ok {
+		kind, message, err := ReadH1PooledMessage(observed.H1MessageConn, limit)
+		observed.info.observeRead(observed.ctx, len(message), err, false)
+		return kind, message, err
+	}
 	if framed, ok := conn.(*FramedMessageConn); ok {
 		return framed.readPooledMessage(limit)
 	}

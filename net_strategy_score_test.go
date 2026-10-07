@@ -323,7 +323,7 @@ func TestStrategyRankingBiasedByDeliveryPerNetwork(t *testing.T) {
 	}
 
 	// the fragment dialer delivered on the current (unknown) network
-	strategy.RecordDeliveryOutcome(fragmentDialer.Info(), deliveryVerifiedByteCount, false)
+	strategy.RecordDeliveryOutcome(strategy.dialerInfo(fragmentDialer), deliveryVerifiedByteCount, false)
 	biased := strategy.dialerWeights(false)
 	if biased[fragmentDialer] <= biased[normalDialer] {
 		t.Fatalf("a delivering dialer was not ranked higher: fragment %f, normal %f", biased[fragmentDialer], biased[normalDialer])

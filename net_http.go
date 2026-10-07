@@ -308,16 +308,14 @@ type ClientStrategy struct {
 	// unchanged.
 	reconnectFastPathCount int
 
-	// scores is the per-network, delivery-verified, decayed ranking layer over
-	// the race (net_strategy_score.go). It multiplies each dialer's shuffle
-	// weight by what that dialer has delivered on the current network, blended
-	// with any injected prior; empty or absent it is neutral (1.0), so a
-	// strategy that has learned nothing -- and a bare test-constructed one whose
-	// scores is nil -- races exactly as before. currentNetworkId keys it and is
-	// client-only: it is derived from the host's wifi bssid / cellular mcc-mnc
-	// and is NEVER uploaded. Guarded by mutex.
-	scores           *networkStrategyScores
-	currentNetworkId string
+	// Delivery evidence scales static route weights and controls serial
+	// preference. NetworkChanged advances a private path generation; hosts
+	// may supply a stable local identity through SetNetworkId. Each attempt
+	// captures its network before I/O. None of these keys are uploaded.
+	// Guarded by mutex.
+	scores            *networkStrategyScores
+	currentNetworkId  string
+	networkGeneration uint64
 }
 
 func NewClientStrategyWithDefaults(ctx context.Context) *ClientStrategy {
@@ -627,6 +625,14 @@ func (self *ClientStrategy) Close() {
 // to the old network path); in-flight requests finish on their own
 // connections, and the http clients rebuild lazily on next use.
 func (self *ClientStrategy) networkChanged() {
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		// Hosts without a stable network identifier still isolate every path
+		// transition. This generation is private and never sent to a server.
+		self.networkGeneration++
+		self.currentNetworkId = deriveNetworkId("network-change", fmt.Sprint(self.networkGeneration))
+	}()
 	self.CloseIdleConnections()
 }
 
@@ -719,6 +725,7 @@ func newVlessClientDialer(settings *ClientStrategySettings, vlessConfig *VlessCo
 	copiedConfig := vlessConfig.Copy()
 	return &clientDialer{
 		description:        "vless",
+		strategyKey:        vlessStrategyKey(copiedConfig),
 		createTime:         time.Now(),
 		persistent:         true,
 		minimumWeight:      vlessDialerMinimumWeight,
@@ -985,7 +992,10 @@ func (self *ClientStrategy) dialerWeightsUnlimited(webSocketOnly bool) (map[*cli
 				if webSocketOnly && !dialer.supportsWebSocket() {
 					continue
 				}
-				w := dialer.Weight()
+				w := dialer.minimumWeight
+				if self.scores == nil {
+					w = dialer.Weight()
+				}
 				weights[dialer] = w
 			}
 		} else {
@@ -1038,11 +1048,12 @@ type httpResult struct {
 }
 
 type evalResult struct {
-	dialer   *clientDialer
-	wsConn   *websocket.Conn
-	h1Conn   H1MessageConn
-	terminal bool
-	err      error
+	dialer     *clientDialer
+	dialerInfo *DialerInfo
+	wsConn     *websocket.Conn
+	h1Conn     H1MessageConn
+	terminal   bool
+	err        error
 	// materialize is run only for the selected HTTP response. A canceled
 	// parallel HTTP response is released by its attempt context instead.
 	materialize func() error
@@ -1355,7 +1366,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 			WeightedShuffle(dialers, dialerWeights)
 
 			for _, dialer := range dialers {
-				if dialer.IsLastSuccess() {
+				if self.dialerDelivered(dialer) {
 					serialDialers = append(serialDialers, dialer)
 				} else {
 					parallelDialers = append(parallelDialers, dialer)
@@ -1599,7 +1610,9 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 		}, handleCancel)
 	}()
 
-	// keep trying as long as there is time left
+	// A short hello can establish this operation without becoming lasting
+	// delivery evidence for future races.
+	var discoveredDialer *clientDialer
 	for {
 		select {
 		case <-handleCtx.Done():
@@ -1614,7 +1627,7 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 		serialDialers := []*clientDialer{}
 
 		for dialer, _ := range dialerWeights {
-			if dialer.IsLastSuccess() {
+			if dialer == discoveredDialer || self.dialerDelivered(dialer) {
 				serialDialers = append(serialDialers, dialer)
 			}
 		}
@@ -1663,6 +1676,9 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 			helloStartTime := time.Now()
 			result := self.parallelEval(handleCtx, false, helloEval)
 			if result != nil {
+				if result.err == nil {
+					discoveredDialer = result.dialer
+				}
 				// The nested evaluation cancels its selected attempt before
 				// returning. Let net/http own that response cleanup rather
 				// than synchronously closing an HTTP/2 body after cancellation.
@@ -1673,7 +1689,7 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 			// check if any dialer succeeded
 			successCount := 0
 			for dialer, _ := range self.dialerWeights(false) {
-				if dialer.IsLastSuccess() {
+				if dialer == discoveredDialer || self.dialerDelivered(dialer) {
 					successCount += 1
 				}
 			}
@@ -1763,12 +1779,14 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 	}
 
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		info := self.dialerInfo(dialer)
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
 		if err != nil {
 			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
+		self.observeHttpResponse(handleCtx, info, response, err)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, err)
@@ -1826,12 +1844,14 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		handleCtx, authProgress := traceAuthPostAttempt(handleCtx)
+		info := self.dialerInfo(dialer)
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
 		if err != nil {
 			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
+		self.observeHttpResponse(handleCtx, info, response, err)
 		authProgress.responseHeaders(response, err)
 		if self.log.V(2).Enabled() {
 			if err != nil {
@@ -1846,12 +1866,14 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		return causes.track(newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes))
 	}
 	helloEval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		info := self.dialerInfo(dialer)
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, helloRequest)
 		if err != nil {
 			return causes.track(&evalResult{err: err})
 		}
 		httpClient := dialer.HttpClient()
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
+		self.observeHttpResponse(handleCtx, info, response, err)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, err)
@@ -1879,6 +1901,10 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 type DialerInfo struct {
 	Description string
 	ExtenderIp  netip.Addr
+	// The scoring identity is private; public telemetry keeps the family name.
+	strategyKey string
+	// Private attempt ownership is never serialized or uploaded.
+	delivery *strategyDeliveryAttempt
 }
 
 // WsDialContext dials without reporting the winning dialer, which is every
@@ -1904,8 +1930,10 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 
 	causes := newHttpRequestCauses(ctx)
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		info := self.dialerInfo(dialer)
 		wsDialer := dialer.WsDialer(self.settings)
 		wsConn, response, err := wsDialer.DialContext(handleCtx, url, requestHeader)
+		refused := response != nil && (response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]ws dial %s = %s\n", url, err)
@@ -1914,14 +1942,19 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 			}
 		}
 
-		dialer.Update(handleCtx, err)
+		if !refused {
+			dialer.Update(handleCtx, err)
+			info.observeRead(handleCtx, 0, err, false)
+		}
 		// A pinned platform transport observes each typed attempt before the
 		// operation owner snapshots the retained exhaustion causes.
 		observeDialAttempt(handleCtx, err)
 
 		return causes.track(&evalResult{
-			wsConn: wsConn,
-			err:    err,
+			dialerInfo: info,
+			terminal:   refused,
+			wsConn:     wsConn,
+			err:        err,
 			httpResult: httpResult{
 				// status: response.Status,
 				// statusCode: response.StatusCode,
@@ -1935,7 +1968,7 @@ func (self *ClientStrategy) WsDialContextWithDialer(ctx context.Context, url str
 	if result == nil {
 		return nil, nil, nil, causes.exhausted(ctx, self.ctx)
 	}
-	return result.wsConn, result.response, result.dialer.Info(), result.err
+	return result.wsConn, result.response, result.dialerInfo, result.err
 }
 
 // H1DialContextWithDialer keeps custom-upgrade negotiation and its fresh WS
@@ -1951,21 +1984,26 @@ func (self *ClientStrategy) H1DialContextWithDialer(ctx context.Context, address
 	}
 	causes := newHttpRequestCauses(ctx)
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		info := self.dialerInfo(dialer)
 		conn, err := dialH1MessagesWithinDeadline(handleCtx, address, requestHeader, dialer.WsDialer(self.settings), H1FramerProtocol, maximum, enabled, stats)
 		terminal, refusalOnly := httpUpgradeTerminalCauses(err)
 		// An authorization denial is not an unhealthy extender. It is terminal
 		// for this logical dial and must not be retried across every strategy.
 		if !refusalOnly {
 			dialer.Update(handleCtx, err)
+			info.observeRead(handleCtx, 0, err, false)
 			observeDialAttempt(handleCtx, err)
 		}
-		return causes.track(&evalResult{h1Conn: conn, err: err, terminal: terminal})
+		return causes.track(&evalResult{h1Conn: conn, dialerInfo: info, err: err, terminal: terminal})
 	}
 	result := self.parallelEval(ctx, true, eval)
 	if result == nil {
 		return nil, nil, causes.exhausted(ctx, self.ctx)
 	}
-	return result.h1Conn, result.dialer.Info(), result.err
+	if result.h1Conn != nil {
+		result.h1Conn = &strategyDeliveryMessageConn{H1MessageConn: result.h1Conn, ctx: ctx, info: result.dialerInfo}
+	}
+	return result.h1Conn, result.dialerInfo, result.err
 }
 
 func (self *ClientStrategy) collapseExtenderDialers() {
@@ -2353,6 +2391,9 @@ type clientDialer struct {
 	// the server of a VLESS dialer, nil for every other dialer. Never changed
 	// after construction.
 	vlessConfig *VlessConfig
+	// Immutable configuration identity for routes whose description is shared.
+	// This opaque key never replaces the public description or telemetry family.
+	strategyKey string
 
 	mutex           sync.Mutex
 	successCount    uint64
@@ -2388,6 +2429,7 @@ func (self *clientDialer) Info() *DialerInfo {
 	}
 	info := &DialerInfo{
 		Description: self.description,
+		strategyKey: self.dialerKey(),
 	}
 	if self.extenderConfig != nil {
 		info.ExtenderIp = self.extenderConfig.Ip.Unmap()

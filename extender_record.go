@@ -55,6 +55,12 @@ func ExtenderRecordGated(body *protocol.ExtenderRecordBody) bool {
 	return body != nil && body.DirectoryTier == ExtenderDirectoryTierGated
 }
 
+// Open relays carry ordinary open records only. A channel designation fails
+// closed even when a sender omitted the compatibility gated tier.
+func ExtenderRecordOpen(body *protocol.ExtenderRecordBody) bool {
+	return body != nil && body.DirectoryTier == ExtenderDirectoryTierOpen && body.CanaryChannel == ""
+}
+
 // Parses the base64 of a serialized record, the form an api answer carries a
 // record in (C2 bootstrap, Q3 release).
 func DecodeExtenderRecordBase64(recordBase64 string) (*protocol.ExtenderRecord, error) {

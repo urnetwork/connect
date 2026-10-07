@@ -2361,7 +2361,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			releaseExtenderIp := self.holdExtenderIp(dialExtenderIp)
 			releaseH1ConnectionStats := self.settings.H1ConnectionStats.connected(ws)
 			h1Progress := newH1PhysicalProgress(self.settings.ProgressObserver, clientId, ws)
-			if framed, ok := ws.(*FramedMessageConn); ok {
+			if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
 				framed.progress = h1Progress
 			}
 			self.setRegistered(true)
@@ -2473,7 +2473,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					firstMessage []byte,
 					firstPriority bool,
 				) (sendOpen bool, err error) {
-					if framed, ok := ws.(*FramedMessageConn); ok {
+					if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
 						return writeH1FramedReadyBatch(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, self.settings.WriteTimeout, func() { writeCounter.Add(1) })
 					}
 					if writeBatchConn == nil {
