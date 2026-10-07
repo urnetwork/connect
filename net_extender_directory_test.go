@@ -1035,7 +1035,7 @@ func TestExtenderDirectorySampleRecordsOwnFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messages := directory.SampleRecords(8, ownKey)
+	messages := directory.SampleRecords(8, ownKey, nil)
 	if len(messages) != 2 {
 		t.Fatalf("sample = %d records, expected the two active ones", len(messages))
 	}
@@ -1048,7 +1048,7 @@ func TestExtenderDirectorySampleRecordsOwnFirst(t *testing.T) {
 	}
 
 	// the cap is honored, and the node's own record is the one that survives it
-	capped := directory.SampleRecords(1, ownKey)
+	capped := directory.SampleRecords(1, ownKey, nil)
 	if len(capped) != 1 {
 		t.Fatalf("sample = %d records, expected 1", len(capped))
 	}
@@ -1061,7 +1061,7 @@ func TestExtenderDirectorySampleRecordsOwnFirst(t *testing.T) {
 	}
 
 	// a node with no record of its own simply samples the others
-	if messages := directory.SampleRecords(8, nil); len(messages) != 2 {
+	if messages := directory.SampleRecords(8, nil, nil); len(messages) != 2 {
 		t.Fatalf("sample = %d records, expected the two active ones", len(messages))
 	}
 }

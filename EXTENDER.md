@@ -3273,6 +3273,162 @@ notice. The legacy discard in `decodeDnsRequest`, and the frozen legacy
 codec the tests keep, can go once no deployed client emits the pump
 question.
 
+### R. Directory tiers: the sacrificial open tier, the gated tier, canaries (2026-10-07)
+
+The three discovery channels of D and E each hand an observer most of the
+fleet within about a week: the geo dns answers eight addresses per family per
+continent and rotates them every tick, the feed serves thirty-two random
+records to anyone, and gossip republishes every record to every member
+within a rotation. Camouflage (P) defends classification, not address
+harvesting, so the directory is tiered: an open tier that is sacrificial by
+design, served in small keyed partitions, and a gated tier the open channels
+never carry. The pure core -- partitions, the release policy, canaries and
+blocked state -- lives in connect so the server and every test run the same
+functions; the server wires it to its tables, the dns publisher and two
+routes.
+
+R1. Tiers. A record is signed into one tier: `ExtenderRecordBody.DirectoryTier`
+(field 13, additive; 0 open, which every record that predates the field is,
+1 gated; `ExtenderRecordGated`). The open tier is what the dns sets and TXT
+records, the feed sample and stream, and the cleartext gossip carry, and it
+is populated by volunteer extenders only, never operator hosts. The gated
+tier is the durable fleet: operator hosts, released only by the operator to
+an authenticated identity (R3) and carried by no open channel whatever
+source it arrived from -- the directory never publishes a gated record to
+its subscribers (the feed stream, the mesh), the feed never samples one, the
+gossip validator ignores one rather than relaying it, and the server never
+drips one, publishes one in dns, or hands one back as activation bootstrap.
+A gated record applied from a release, or leaked in from anywhere, is a
+candidate like any other, marked by `ExtenderCandidate.DirectoryTier` and the
+status entry. Revocations name a key and no address, so they flow on every
+channel as before, which is how a client holding a gated record learns it was
+withdrawn. The server assigns the tier at activation from `extender.yml`:
+`directory: {durable_network_ids: [...]}` names the operator's own account
+networks, whose extenders are gated; every other activation is open. A gated
+activation inserts no publish row and `network_extender.directory_tier`
+holds the tier.
+
+R2. Keyed partitions on the open channels (`net_extender_directory_partition.go`),
+in the shape of Psiphon's classic discovery. A channel pool of n records has
+`ExtenderPartitionCount(n)` partitions: the power of two at or above
+ceil(sqrt(n)), cut no finer than `ExtenderPartitionMinSize` (4) records per
+partition, so a fleet under eight is one partition and a fleet of a thousand
+is thirty-two. A record is placed by HMAC(secret, channel, "record", key)
+mod the count, so its place is stable while the count is; a vantage by
+HMAC(secret, channel, "vantage", vantage); an empty partition hands the
+vantage the next one around the ring; and each epoch deals a partition in
+the order of HMAC(secret, channel, "order", vantage, epoch, key)
+(`ExtenderPartitionMembers`, `ExtenderPartitionOrder`,
+`ExtenderPartitionSample`). A vantage therefore sees at most its partition --
+about sqrt(n) -- however often it polls, and the answer size only sets the
+pace. The channels `dns`, `feed` and `gated` are separate key spaces, so a
+partition that leaks on one says nothing about the others (R4). The epoch of
+the open channels is an hour (`ExtenderOpenEpochTimeout`); the count moves
+only when the fleet quadruples or quarters, and every placement is dealt
+again when it does.
+
+Feed. The vantage is the client's address prefix, /24 for v4 and /48 for v6
+(`ExtenderVantageKey`, from the stream's remote address), so a poller cannot
+change partition by changing its last octets; a stream with no address, a
+pipe, is a vantage of its own. `SampleRecords(count, own, vantage)` serves the
+extender's own record first when it is open, then the epoch's order of the
+vantage's partition interleaved by family (`balanceRecordsByIpFamily`, which
+keeps the order it is given); the stream forwards an applied open record only
+when `OpenPartitionContains(vantage, key)`, and every revocation. The sample
+cap is 8 (was 32) and the client's default 8 (was 16): the partition is the
+bound, the cap the pace. The secret is per directory, drawn at construction
+(`PartitionSecret` pins it), never stored and never on the wire: a restart
+deals the partitions again, which costs nothing.
+
+Dns (server, `taskworker/work/extender_dns_publish.go`). Route 53 keys
+answers by the resolver's location, not its address, so the vantage of a
+set is its location: each continent and the default are one vantage of the
+`dns` channel with the operator's secret, derived from the root key
+(`ExtenderConfig.DirectorySecret`, HMAC of the seed under a fixed domain,
+never stored). A set is the epoch's sample of the location's partition of
+the open tier of that family, `sample_count` 3 per family (was 8), filled
+from the family's partition members elsewhere and then from the next
+partitions when short, so a short continent is still bound to few partitions
+rather than to the global pool. The tick stays ten minutes; the sets change
+only when the epoch turns, and an unchanged upsert is a no-op. The TXT sets
+vouch for exactly the addresses answered, as before. A resolver-keyed answer
+-- HMAC of the resolver or ECS /24 -- needs an authoritative answerer the
+operator runs; the same functions serve it with that vantage (R5).
+
+R3. Gated tier release (`net_extender_directory_release.go`; server
+`POST /network/extender-release`, client jwt). The identity is the account
+and the device together (network id and client id as bytes); it is placed in
+one partition of the gated fleet on the `gated` channel and dealt that
+partition each epoch of a week (`ExtenderReleaseEpochTimeout`), of which it
+takes the first eligible: one record while the identity is new, three once
+it has served thirty days (`ExtenderReleaseProbationTimeout`, the Lox shape;
+the client's creation time is the age). Asking again in the same epoch
+returns the same records, so a repeat learns nothing. Requests are counted
+per identity (8 an hour) and per vantage -- the requester's asn as text, or
+its prefix (`ExtenderVantagePrefix`) where none is known (4096 an hour),
+refused requests counting too. A record is released to at most ten distinct
+identities per country over thirty days (Salmon's ten,
+`ExtenderReleaseMaxClientsPerExtenderPerCountry`), the identity's own earlier
+release never counting against it, so a long-lived host is never the one
+everyone in a country is told about. A record blocked in the requester's
+country (R4) and a record of a family the client cannot dial
+(`ip_versions`) are skipped. The policy reads and writes an
+`ExtenderReleaseLedger`: `ExtenderReleaseMemoryLedger` is the bounded
+in-process one (an operator of one process, and every test); the server's is
+`model.NetworkExtenderReleaseLedger` over `network_extender_release` and
+`network_extender_release_request`. The released records are signed fresh at
+each release, so a client refreshes a record by asking again within its
+epoch, and applies them with source `release`, which is not a K4 event. The
+answer is `{records, epoch, count, probation}` with base64 records
+(`DecodeExtenderRecordBase64`), or `{error}` for a refused request.
+
+R4. Canaries and blocked state (`net_extender_directory_canary.go`). A
+canary is an operator-run extender in exactly one place: a dns canary is in
+its continent's sets every epoch, pinned, never filled into another
+location's set and never dripped; a gated canary is in the gated partition
+its key hashes to and in no open channel. Nothing on the wire marks one, and
+it behaves like any record there, so a censor that blocks it learned it from
+that one place: `ExtenderCanaryPlace` names the channel and the partition or
+region, and `ExtenderAttributeBlockedCanaries` names each leaked place once
+for a set of blocked keys. The server holds the designation in
+`network_extender.canary_channel`. Blocked state is per country
+(`ExtenderBlockedState`): a record is blocked in a country when at least
+three distinct identities there reported it unreachable within a day
+(`POST /network/extender-block-report`, the reporter's country from its
+address) while the operator's own uptime probe reached it within the hour,
+so an outage is not a block and one reporter is not enough. Tables are
+bounded; the oldest reporter or entry goes. The server's view is a query
+over `network_extender_block_report` joined to the probe stamps. What a leak
+does beyond the release skipping blocked records -- suspicion on the
+partition's identities, migration of trusted ones -- is phased (R5).
+
+R5. Phased, in order: the sdk's release fetch, which calls the route with
+its client jwt on each refresh pass and applies the answer with
+`ExtenderDirectory.ApplyRecord(record, ExtenderSourceRelease)` (the
+directory side is in place); a reaper for the release and report tables;
+`bringyourctl` commands that set a tier and a canary; the per-partition
+suspicion and migration policy (Lox: migrate trusted users, hold new ones);
+an authoritative dns answerer keyed by the resolver or ECS /24; the
+unlisted share-code compartments (capped, expiring invites, never gossiped);
+and encrypted-blob gossip with liveness and revocation keyed by opaque ids,
+decryptable at the member's trust level, in place of cleartext record gossip
+-- until it lands, the mesh carries the open tier only, in cleartext, bound
+by nothing but the tier.
+
+R6. Tests. `net_extender_directory_tiers_test.go`: the partition count and
+its floor, stable channel-separated placement, the empty-partition ring, the
+epoch rotation, a vantage polling for a week seeing exactly its partition of
+sixty-four records, the open channels excluding a gated record that arrived
+over the mesh while it stays a candidate, the additive tier, the vantage
+prefix, the release policy's determinism and identity cap, vantage cap,
+probation, per-country client cap, blocked skip and ledger bounds, blocked
+state per country with the probe rule and its bounds, and a blocked canary
+mapping to exactly one place. `gossip/feed_server_tiers_test.go`: the feed
+sample and stream bound to the client's remote prefix at the served stream, a
+leaked gated record served by neither, and the validator ignoring one on the
+mesh. Server: the dns sampler excluding the gated tier, keyed by epoch and
+location, pinning a canary in its one region.
+
 ### I. Tests
 
 Every phase ships tests with it. In-process fixtures only: the extender
@@ -3788,3 +3944,17 @@ migration, no services version, no rpc version.
   done: an app setting for the switch, and a wire-level test of the dns
   carrier's offer (its datagrams are dns-encoded; it dials the same
   `policy.quicConfig` the udp carrier is proven on).
+- **Q, directory tiers (2026-10-07).** connect: the `DirectoryTier` record
+  field, `net_extender_directory_partition.go` (keyed partitions, vantage
+  keys), `net_extender_directory_release.go` (the gated release policy and
+  the in-process ledger), `net_extender_directory_canary.go` (canary
+  placement, attribution, per-country blocked state), the directory's keyed
+  `SampleRecords`, `OpenPartitionContains`, the no-publish rule for gated
+  records, the `release` source, the feed caps of 8, the feed server's
+  vantage-bound sample and stream, the validator ignoring gated records.
+  Server, written and compile-verified but not integration-built against a
+  database (the migration is unmerged): `directory_tier` and
+  `canary_channel` on `network_extender`, the release and block-report
+  tables, the tier in every signed record, open-only drip, dns and bootstrap,
+  the keyed dns sampler, the release and block-report routes, the
+  `directory` block of `extender.yml`. Phased per R5.

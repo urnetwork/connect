@@ -505,6 +505,13 @@ func (self *Node) validate(ctx context.Context, from peer.ID, message *pubsub.Me
 		if err != nil {
 			return pubsub.ValidationReject
 		}
+		if connect.ExtenderRecordGated(body) {
+			// a gated record has no business on the mesh (Q1): the operator
+			// never publishes one, so it is a leak, and relaying it would
+			// make the leak the whole mesh's. Ignored rather than rejected,
+			// since the peer that relayed it may hold it from a leak too
+			return pubsub.ValidationIgnore
+		}
 		networkHost = body.NetworkHost
 	case gossipMessage.GetRevocation() != nil:
 		body, err := keySet.VerifyRevocation(gossipMessage.GetRevocation())

@@ -464,7 +464,7 @@ func TestExtenderDirectoryExpiredIsNeverActive(t *testing.T) {
 	}
 
 	// never sampled, the node's own included
-	messages := directory.SampleRecords(8, ownKey)
+	messages := directory.SampleRecords(8, ownKey, nil)
 	if len(messages) != 1 {
 		t.Fatalf("sample = %d records, expected only the current one", len(messages))
 	}
@@ -475,7 +475,7 @@ func TestExtenderDirectoryExpiredIsNeverActive(t *testing.T) {
 	if !ed25519.PublicKey(body.PublicKey).Equal(activeKey) {
 		t.Fatal("an expired record was sampled")
 	}
-	for _, message := range directory.SampleRecords(8, otherKey) {
+	for _, message := range directory.SampleRecords(8, otherKey, nil) {
 		body, err := directory.RootKeys().VerifyRecord(message.GetRecord())
 		if err != nil {
 			t.Fatal(err)
