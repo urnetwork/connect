@@ -74,6 +74,7 @@ func DefaultExtenderSettings() *ExtenderSettings {
 
 		HeaderTimeout:               10 * time.Second,
 		QuicIdleTimeout:             30 * time.Second,
+		QuicVersionPolicy:           connect.QuicVersionPolicyPreferV2,
 		MaxConnectionCountPerSource: 64,
 		MaxConnectionCount:          4096,
 
@@ -128,6 +129,12 @@ type ExtenderSettings struct {
 	HeaderTimeout time.Duration
 	// Idle quic connections close after this (A9).
 	QuicIdleTimeout time.Duration
+	// The QUIC versions the udp and dns carriers accept, and the NLayer hop
+	// dials offer (A13, connect/net_quic_version.go). The zero value and an
+	// unknown value accept both with version 2 first. A client that offers a
+	// version this policy excludes is answered with a Version Negotiation
+	// packet naming the versions it does accept.
+	QuicVersionPolicy connect.QuicVersionPolicy
 	// Concurrent connections from one source address (A9). <= 0 disables.
 	MaxConnectionCountPerSource int
 	// Concurrent connections over every carrier (A9). <= 0 disables.
@@ -1119,6 +1126,9 @@ func (self *ExtenderServer) serveQuicCarrier(
 	}
 	quicConfig := &quic.Config{
 		MaxIdleTimeout: self.settings.QuicIdleTimeout,
+		// accept the version 2 Initial a client past the filters sends first,
+		// and version 1 from an older client (A13)
+		Versions: self.settings.QuicVersionPolicy.Versions(),
 	}
 	// a subnet past its refusals is refused on its Initial packet, before the
 	// handshake (A12)
