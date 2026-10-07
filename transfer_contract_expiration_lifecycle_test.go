@@ -16,6 +16,7 @@ import (
 // Takes request buffers, lends responses for their callback, and records exact
 // terminal reports. The first grant cohort shares one absolute deadline.
 type expirationLifecycleAuthority struct {
+	ctx                   context.Context
 	sourceId              Id
 	peer                  func() *Client
 	initialDeadline       time.Time
@@ -28,9 +29,10 @@ type expirationLifecycleAuthority struct {
 	renewalOnce           sync.Once
 }
 
-// Non-contextual cleanup contains only close reports and cannot wait for a grant.
+// Normal requests belong to the OOB lifecycle. Shutdown cleanup explicitly
+// supplies its independent context through SendControlWithCtx.
 func (self *expirationLifecycleAuthority) SendControl(frames []*protocol.Frame, callback OobResultFunction) {
-	self.SendControlWithCtx(context.Background(), frames, callback)
+	self.SendControlWithCtx(self.ctx, frames, callback)
 }
 
 // An explicit barrier models cancellation while the replacement is in flight.
@@ -126,6 +128,15 @@ func (self *expirationLifecycleAuthority) terminalReports(contractId Id) []*prot
 	return reports
 }
 
+// Holds an actual payload before delivery, preserving its outstanding head
+// while the next application send reaches the ahead-announcement decision.
+type expirationLifecycleWireBarrier struct {
+	content string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
 // Both directions use ordinary Client wire codecs, ownership, and ACK workers.
 // Fake time advances only after explicit quiescence or a request barrier.
 type expirationLifecycleFixture struct {
@@ -139,6 +150,7 @@ type expirationLifecycleFixture struct {
 	dropAcksBefore   atomic.Int64
 	droppedAcks      atomic.Int32
 	lostAckWrites    atomic.Int32
+	forwardBarrier   atomic.Pointer[expirationLifecycleWireBarrier]
 	stateLock        sync.Mutex
 	deliveries       map[string]int
 	routes           []Route
@@ -182,11 +194,11 @@ func newExpirationLifecycleFixture(t *testing.T, announceAhead bool, configure .
 	}
 	senderId, receiverId := NewId(), NewId()
 	f.authority = &expirationLifecycleAuthority{
-		sourceId: senderId, peer: func() *Client { return f.receiver },
+		ctx: ctx, sourceId: senderId, peer: func() *Client { return f.receiver },
 		initialDeadline: f.deadline, grantDeadlines: map[Id]time.Time{}, renewalEntered: make(chan struct{}),
 	}
 	f.reverseAuthority = &expirationLifecycleAuthority{
-		sourceId: receiverId, peer: func() *Client { return f.sender },
+		ctx: ctx, sourceId: receiverId, peer: func() *Client { return f.sender },
 		initialDeadline: f.deadline, grantDeadlines: map[Id]time.Time{}, renewalEntered: make(chan struct{}),
 	}
 	f.sender = NewClient(ctx, senderId, f.authority, settings())
@@ -217,7 +229,19 @@ func newExpirationLifecycleFixture(t *testing.T, announceAhead bool, configure .
 					for _, frame := range transfer.Pack.Frames {
 						if frame.MessageType == protocol.MessageType_TestSimpleMessage {
 							var message protocol.SimpleMessage
-							if proto.Unmarshal(frame.MessageBytes, &message) == nil && message.Content == "lost-ack" {
+							if err := proto.Unmarshal(frame.MessageBytes, &message); err != nil {
+								panic(err)
+							}
+							if barrier := f.forwardBarrier.Load(); barrier != nil && message.Content == barrier.content {
+								barrier.once.Do(func() { close(barrier.entered) })
+								select {
+								case <-barrier.release:
+								case <-ctx.Done():
+									MessagePoolReturn(wire)
+									return
+								}
+							}
+							if message.Content == "lost-ack" {
 								f.lostAckWrites.Add(1)
 							}
 						}
@@ -338,11 +362,26 @@ func TestSignedContractExpirationRenewsActiveAndAheadWithoutLosingSequence(t *te
 		f := newExpirationLifecycleFixture(t, true)
 		defer f.close()
 		f.finishSend(f.startSend("opening"))
-		f.finishSend(f.startSend("announce-successor"))
+		barrier := &expirationLifecycleWireBarrier{
+			content: "pending-head", entered: make(chan struct{}), release: make(chan struct{}),
+		}
+		f.forwardBarrier.Store(barrier)
+		pending := f.startSend(barrier.content)
+		select {
+		case <-barrier.entered:
+		case <-time.After(20 * time.Second):
+			t.Fatal("fixture never held an outstanding contract head")
+		}
+		announcement := f.startSend("announce-successor")
+		synctest.Wait()
+		close(barrier.release)
+		f.finishSend(pending)
+		f.finishSend(announcement)
 		sender, receiver := f.sequences()
 		active, ahead := sender.sendContract, sender.aheadSendContract
 		if active == nil || ahead == nil || !ahead.acknowledgedAhead || len(sender.sendItems) != 0 {
-			t.Fatal("fixture did not establish an active contract and acknowledged successor")
+			t.Fatalf("fixture did not establish an active contract and acknowledged successor: active=%t ahead=%t supported=%t attempted=%t pending=%d",
+				active != nil, ahead != nil, sender.contractAheadSupported.Load(), sender.aheadSendContractAttempted, len(sender.sendItems))
 		}
 		activeUsed := active.ackedByteCount + active.unackedByteCount
 		if activeUsed >= active.effectiveTransferByteCount {
