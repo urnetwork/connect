@@ -3958,3 +3958,42 @@ migration, no services version, no rpc version.
   tables, the tier in every signed record, open-only drip, dns and bootstrap,
   the keyed dns sampler, the release and block-report routes, the
   `directory` block of `extender.yml`. Phased per R5.
+
+## Design note: fingerprint-drift conformance harness (2026-10-07)
+
+A hermetic harness gates the chrome tcp/udp carriers against silent
+fingerprint drift from real Chrome. It is a new self-contained package,
+`connect/fingerprint/`, documented in its own `fingerprint/README.md` and
+linked from IPREAL.md's test section; it touches no carrier code. What it
+adds for the extender surface:
+
+- The udp carrier's QUIC Initial (section A, `net_quic_version.go`): a
+  Layer-A test (`net_quic_initial_conformance_test.go`) drives the merged
+  `QuicVersionPolicy.Versions()` — the same offer the extender udp and dns
+  carriers and the alt dialers hand quic-go — to a shared local QUIC endpoint
+  and asserts the first Initial's long-header version is the policy's first
+  offer. A silent regression of the default to a version 1 Initial, which the
+  GFW/TSPU decrypt and filter by sni, fails the test and names the version;
+  the v1-only policy is the faithful pre-version-2 revert that drifts against
+  the expected version 2. The transport parameters and CRYPTO-frame layout
+  live inside the AEAD-encrypted Initial and are the documented next increment.
+- The camouflage carrier hello (section P): a skipped placeholder
+  (`TestExtenderCamouflageHelloConformance`) names the camouflage impl branch
+  it waits on. When that branch is on origin/main the placeholder becomes the
+  real Layer-A comparison of the carrier's uTLS hello against the Chrome
+  golden, plus that the sealed session occupies the 32-byte legacy session-id
+  field and the rest matches Chrome. It is not stubbed against the dialer
+  meanwhile.
+
+Decisions: goldens are versioned and committed; the shipped golden is
+synthetic (uTLS `HelloChrome_133`, not real Chrome) and is upgraded to a
+real-Chrome capture by the opt-in Docker Layer B, gated out of `go test` by
+the `fingerprint_capture` build tag. The TCP SYN / IP TTL (JA4T) ground truth
+is the OS kernel, so Docker-Chrome yields only the Linux profile; non-Linux
+egress profiles are owner-supplied captures. Tests that prove it: the Layer-A
+version gate above, the tls client-hello gate
+(`net_tls_hello_conformance_test.go`), and the engine's own discrimination
+suite in `fingerprint/`, all hermetic and in the normal `go test`; a
+deliberately-stale golden is shown to fail the diff and the correct one to
+pass it. Phased: the per-dialer camouflage comparison and the IPREAL egress
+SYN/TTL comparison, each a skipped placeholder naming its branch.

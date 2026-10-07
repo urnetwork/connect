@@ -772,6 +772,19 @@ cause and passes with the fix; the table names the observable that changes.
 | Table drifts from reality | no fixture check (R4.4) | `TestEgressProfileTableMatchesTheCaptures` | JA4T derived from each fixture equals the table row |
 | Targets wrong in shadow mode | derivation (R5.2) | `TestEgressSynTargetDerivationFromRealSyns` (T0) | targets from a corpus of sanitized real SYNs match expected values; `off` applies nothing (socket options read back equal the kernel defaults) |
 
+The client-facing half of this surface — that connect's own TLS ClientHello
+and QUIC Initial do not drift from real Chrome — is gated by a separate
+hermetic conformance harness, documented in `fingerprint/README.md`. Its
+Layer A diffs connect's emitted hello against a versioned Chrome golden
+(GREASE positions masked, `X25519MLKEM768` asserted) and its QUIC Initial
+against the merged `QuicVersionPolicy`; its opt-in Docker Layer B refreshes
+the goldens from real Chrome. The egress SYN/TTL (JA4T) consistency check
+above is the provider-side complement: its per-dialer wiring in the harness
+waits on the Level A egress implementation of this design, carried there as a
+skipped placeholder (`TestEgressSynTtlConformance`) that names it, because the
+SYN's ground truth is the OS kernel and the check needs root — a Layer-B, not
+a hermetic `go test`.
+
 ## Decisions for the owner
 
 - D1. Build order: Level A on every provider first, B-lite on privileged Linux
