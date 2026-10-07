@@ -140,6 +140,14 @@ type ExtenderSettings struct {
 	// Concurrent connections over every carrier (A9). <= 0 disables.
 	MaxConnectionCount int
 
+	// WebRtcCarrier serves the peer-to-peer webrtc carrier (EXTENDER.md S,
+	// C2a): the role has a signaling path and installs this server as the
+	// carrier's stream handler (HandleWebRtcExtenderStream), so the carrier
+	// is listed in Carriers, offered to the activation, and the server stays
+	// up on it alone when no socket carrier binds (G2). Off by default;
+	// nothing is bound for it.
+	WebRtcCarrier bool
+
 	// Bounds of the reverse proxy that answers everything that is not an
 	// extender request (A5). The request body and the concurrency bounds
 	// refuse with 503 before anything is relayed; the response bound cuts a
@@ -559,6 +567,7 @@ var extenderCarrierOrder = []string{
 	connect.ExtenderCarrierTcp,
 	connect.ExtenderCarrierQuic,
 	connect.ExtenderCarrierDns,
+	connect.ExtenderCarrierWebRtc,
 }
 
 // extenderLogWriter keeps the http server's internal errors on the same log as
@@ -886,7 +895,12 @@ func (self *ExtenderServer) ListenAndServe() error {
 		}
 	}
 
-	if len(boundListeners) == 0 && len(boundPacketConns) == 0 {
+	if self.settings.WebRtcCarrier {
+		// served through the carrier's signaling, nothing bound (S); an
+		// extender with no socket carrier stays up on it alone (G2)
+		self.addCarrier(connect.ExtenderCarrierWebRtc)
+	}
+	if len(boundListeners) == 0 && len(boundPacketConns) == 0 && !self.settings.WebRtcCarrier {
 		if 0 < len(bindErrs) {
 			return errors.Join(bindErrs...)
 		}
@@ -1390,6 +1404,75 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 		return
 	}
 
+	// the terminated connection is the only place the requested name survives:
+	// what the http server serves from here is no longer a *tls.Conn (A3, A5)
+	connectionState := clientConn.ConnectionState()
+	self.serveTerminatedConnection(
+		handleCtx,
+		handleCancel,
+		clientConn,
+		connectionState.ServerName,
+		connectionState.NegotiatedProtocol,
+	)
+}
+
+// HandleWebRtcExtenderStream serves one stream of the peer-to-peer webrtc
+// carrier (EXTENDER.md S), which is connect.WebRtcExtenderStreamHandler. The
+// data channel is already authenticated dtls, so there is no outer handshake:
+// the stream is served exactly as a terminated tcp connection is, from the
+// first bytes, under the same connection accounting, admission and
+// interruption at Close (A9, A12). Synchronous: the carrier owns the
+// goroutine and releases the peer connection when this returns.
+func (self *ExtenderServer) HandleWebRtcExtenderStream(ctx context.Context, conn net.Conn) {
+	if self.closedAtAccept(conn.RemoteAddr()) {
+		// a subnet past its refusals is not worth serving (A12)
+		conn.Close()
+		return
+	}
+	if !self.beginConnection(conn.RemoteAddr()) {
+		conn.Close()
+		return
+	}
+	ownedConnection := &extenderOwnedConnection{connection: conn}
+	self.stateLock.Lock()
+	if self.closing {
+		self.stateLock.Unlock()
+		self.endConnection(conn.RemoteAddr())
+		conn.Close()
+		return
+	}
+	self.connections[ownedConnection] = true
+	self.workers.Add(1)
+	self.stateLock.Unlock()
+	defer func() {
+		self.stateLock.Lock()
+		delete(self.connections, ownedConnection)
+		self.stateLock.Unlock()
+		self.endConnection(conn.RemoteAddr())
+		self.workers.Done()
+	}()
+
+	handleCtx, handleCancel := context.WithCancel(ctx)
+	defer handleCancel()
+	defer conn.Close()
+	// the carrier has no name and negotiates no protocol: http/1.1, the one
+	// the extender's own client speaks (A3)
+	conn.SetDeadline(time.Now().Add(self.settings.HeaderTimeout))
+	self.serveTerminatedConnection(handleCtx, handleCancel, conn, "", "")
+}
+
+// Serves one terminated stream from its first bytes: a v1 length-prefixed
+// header, else the http server (A3). The stream's deadline is the header
+// budget on entry (A9) and is cleared once the request is known to be http,
+// whose server keeps its own. serverName is the requested name of a tls
+// carrier, empty on the webrtc carrier; negotiatedProtocol selects h2.
+func (self *ExtenderServer) serveTerminatedConnection(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	clientConn net.Conn,
+	serverName string,
+	negotiatedProtocol string,
+) {
 	initialBytes := make([]byte, 4)
 	for i := 0; i < len(initialBytes); {
 		n, err := clientConn.Read(initialBytes[i:])
@@ -1404,7 +1487,7 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 	if headerByteCount <= connect.ExtenderMaxHeaderByteCount {
 		// v1: a length-prefixed header and no response frame. No http method
 		// and no tls record begins with such a length.
-		self.handleV1Connection(handleCtx, handleCancel, clientConn, headerByteCount)
+		self.handleV1Connection(ctx, cancel, clientConn, headerByteCount)
 		return
 	}
 
@@ -1412,11 +1495,8 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 		self.reportError("header length", err)
 		return
 	}
-	// the terminated connection is the only place the requested name survives:
-	// what the http server serves from here is no longer a *tls.Conn (A3, A5)
-	connectionState := clientConn.ConnectionState()
-	requestConn := newConnWithInitialBytes(clientConn, initialBytes, connectionState.ServerName)
-	self.serveHttpConnection(handleCtx, requestConn, connectionState.NegotiatedProtocol)
+	requestConn := newConnWithInitialBytes(clientConn, initialBytes, serverName)
+	self.serveHttpConnection(ctx, requestConn, negotiatedProtocol)
 }
 
 // Serves one terminated connection with the http server. h2 is dispatched

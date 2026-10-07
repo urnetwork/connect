@@ -1266,7 +1266,9 @@ func (self *ExtenderNetworkClient) runFeed(
 // not list is not tried.
 func orderedExtenderCarriers(carriers []string) []string {
 	ordered := []string{}
-	for _, carrier := range []string{ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns} {
+	// the webrtc carrier last: it is the least ordinary looking traffic and
+	// needs a signaling path the others do not (EXTENDER.md S)
+	for _, carrier := range []string{ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns, ExtenderCarrierWebRtc} {
 		for _, candidateCarrier := range carriers {
 			if candidateCarrier == carrier {
 				ordered = append(ordered, carrier)

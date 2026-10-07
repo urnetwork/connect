@@ -178,6 +178,14 @@ type ConnectSettings struct {
 	// value offer version 2 first with version 1 behind it.
 	QuicVersionPolicy QuicVersionPolicy
 
+	// WebRtcExtenderCarrier, when set, is the dial side of the peer-to-peer
+	// webrtc extender carrier (EXTENDER.md S, net_extender_webrtc.go): it
+	// resolves an extender's exchange signaling by the identity key a
+	// profile in ExtenderConnectModeWebRtc carries. Nil, the default, leaves
+	// such a profile undialable; the owner that has signaling -- a device
+	// with a client on the exchange, the operator's probe -- installs one.
+	WebRtcExtenderCarrier *WebRtcExtenderCarrier
+
 	TlsConfig *tls.Config
 
 	// The tls client hello of the normal and resilient dialers

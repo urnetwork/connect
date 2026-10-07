@@ -937,6 +937,9 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// IceServerSampleCount are drawn per session, so gather stays bounded.
 		IceServerPoolUrls:    defaultStunServerUrls,
 		IceServerSampleCount: defaultIceServerSampleCount,
+
+		ExtenderCarrierAnswerConcurrency: defaultWebRtcExtenderCarrierAnswerConcurrency,
+		ExtenderCarrierOpenTimeout:       defaultWebRtcExtenderCarrierOpenTimeout,
 	}
 }
 
@@ -1095,6 +1098,17 @@ type WebRtcSettings struct {
 	// Nil in production; tests inject a seeded source so the fingerprint choice
 	// is deterministic (see dtlsClientHelloMimicryHook).
 	dtlsClientHelloRandForTest *mathrand.Rand
+
+	// ExtenderCarrierAnswerConcurrency bounds the offers of the peer-to-peer
+	// webrtc extender carrier an extender answers at once (EXTENDER.md S,
+	// net_extender_webrtc_signal.go): an answer gathers candidates, which
+	// is seconds of work, so offers past the bound are dropped and counted
+	// rather than queued. <= 0 takes the default of 8.
+	ExtenderCarrierAnswerConcurrency int
+	// ExtenderCarrierOpenTimeout bounds the wait for the carrier's data
+	// channel to open once the SDP exchange is done, on both sides
+	// (net_extender_webrtc.go). <= 0 takes the default of 30 s.
+	ExtenderCarrierOpenTimeout time.Duration
 }
 
 func webRtcDataChannelInit(settings *WebRtcSettings) *webrtc.DataChannelInit {
@@ -1387,6 +1401,10 @@ type WebRtcManager struct {
 	log          Logger
 	signalSender SignalSender
 	settings     *WebRtcSettings
+	// the signaling of the peer-to-peer webrtc extender carrier, which rides
+	// the same frames as p2p negotiation under its own flag (EXTENDER.md S,
+	// net_extender_webrtc_signal.go)
+	extenderCarrier *webRtcExtenderSignaling
 
 	stateLock         sync.Mutex
 	closed            bool
@@ -1492,6 +1510,7 @@ func NewWebRtcManager(ctx context.Context, signalSender SignalSender, settings *
 		admissionStateMonitor:      NewMonitor(),
 		newPeerConnectionFactory:   newWebRtcPeerConnectionFactory,
 	}
+	manager.extenderCarrier = newWebRtcExtenderSignaling(managerCtx, manager.log, signalSender, settings)
 	if 0 < settings.MaxPeerConnectionCount {
 		// A token represents one released peerConns map slot. Limit retained
 		// stale tokens even if an embedder configures an unusually large cap;
@@ -1553,6 +1572,7 @@ func (self *WebRtcManager) Close() {
 		})
 	}
 	self.cancel()
+	self.extenderCarrier.close()
 	self.peerConnLifecycle.close()
 	networkChangeWorker := self.stopNetworkChangeWorker()
 
@@ -2394,6 +2414,12 @@ func (self *WebRtcManager) ReceiveExchangeSignals(
 	streamId, err := IdFromBytes(v.StreamId)
 	if err != nil {
 		return err
+	}
+	if v.ExtenderCarrier {
+		// the webrtc extender carrier's rendezvous: never a transport peer
+		// connection, so it is routed before the keyed lookup below
+		// (net_extender_webrtc_signal.go)
+		return self.extenderCarrier.receive(source, transferKey, streamId, v.Signals)
 	}
 	var senderGenerationId Id
 	senderGenerationSet := false

@@ -139,6 +139,13 @@ message ExtenderRecordBody {
     // authenticated identity and carried by no open channel. A reader that
     // predates the field sees 0, and a record that predates it is open.
     uint32 DirectoryTier = 13;
+    // The 16 byte client id the extender's device is reachable under on the
+    // exchange, which is the rendezvous of its peer-to-peer webrtc carrier
+    // (EXTENDER.md S, C2a): a dialer sends its SDP offer to this id through
+    // the exchange signaling and the extender answers. Set only when an
+    // address of the record lists the webrtc carrier; empty on every other
+    // record and on records that predate the field.
+    bytes WebRtcClientId = 14;
 }
 
 message ExtenderRecord {
