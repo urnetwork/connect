@@ -8101,6 +8101,7 @@ func (self *noAckFastPathSnapshot) reserve(byteCount ByteCount) bool {
 		return true
 	}
 	if !self.contract.acquireNoAckWriter() {
+		self.notifySettled()
 		return false
 	}
 	effective := self.effectiveByteCount(byteCount)
@@ -8157,7 +8158,7 @@ func (self *SendSequence) publishNoAckFastPath() {
 			return
 		}
 		contract = self.sendContract
-		if contract.noAckWriterState.Load()&noAckContractRetired != 0 {
+		if contract.expired() || contract.noAckWriterState.Load()&noAckContractRetired != 0 {
 			self.retireNoAckFastPath()
 			return
 		}
@@ -9818,11 +9819,19 @@ func (self *SendSequence) updateContractWithAckPromotion(
 		}
 
 		if self.sendContract != nil {
-			// there should be a queued up contract
-			if traceNextContract(min(self.sendBufferSettings.CreateContractTimeout, retryInterval)) {
+			// Expired prefetches cannot become usable while we wait. Poll once
+			// for a live successor, then request renewal without spending the
+			// caller's admission timeout on the ordinary exhaustion retry.
+			initialWait := min(self.sendBufferSettings.CreateContractTimeout, retryInterval)
+			if self.sendContract.expired() {
+				initialWait = 0
+			}
+			if traceNextContract(initialWait) {
 				return true
 			}
-			retryInterval = nextCreateContractRetryInterval(retryInterval, maxRetryInterval)
+			if 0 < initialWait {
+				retryInterval = nextCreateContractRetryInterval(retryInterval, maxRetryInterval)
+			}
 		}
 
 		for {
@@ -9968,6 +9977,9 @@ func (self *SendSequence) sendContractRemainingByteCount() ByteCount {
 // has stopped advertising it, a successor is already announced, or the
 // destination queue has no contract ready. Nothing here blocks.
 func (self *SendSequence) maybeAnnounceContractAhead() {
+	if self.aheadSendContract != nil && self.aheadSendContract.expired() {
+		self.discardAheadContract()
+	}
 	if self.sendContract == nil || self.aheadSendContract != nil {
 		return
 	}
@@ -10033,6 +10045,7 @@ func (self *SendSequence) announceContractAhead() {
 	// the successor's own opening debit, the same one `setNextContract` makes,
 	// so the contract that becomes current is accounted identically
 	if !aheadContract.update(0) {
+		self.sendContract.rollbackUnwritten(0)
 		self.client.ContractManager().CloseContract(aheadContract.contractId, 0, 0)
 		return
 	}
@@ -10089,13 +10102,14 @@ func (self *SendSequence) setAheadContract(messageByteCount ByteCount) bool {
 		return false
 	}
 	metadata := self.contractMetadata()
-	if self.aheadSendContractMetadataGeneration != metadata.generation {
-		// the contract path changed under it; it is still tracked in
-		// `openSendContracts` and closes on its acknowledgements
-		self.aheadSendContract = nil
+	if self.aheadSendContractMetadataGeneration != metadata.generation || aheadContract.expired() {
+		self.discardAheadContract()
 		return false
 	}
 	if !aheadContract.update(messageByteCount) {
+		if aheadContract.expired() {
+			self.discardAheadContract()
+		}
 		return false
 	}
 	self.aheadSendContract = nil
@@ -16053,6 +16067,16 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 		})
 		return errors.New("Contract path does not match receive path.")
 	}
+	// A valid signature cannot extend its signed admission deadline. Late
+	// traffic is refused without treating an ordinary expiry as a trust fault.
+	if nextReceiveContract.expired() {
+		if item.contractAhead {
+			// Ignore stale successor metadata. The enclosing control Pack
+			// still needs an unexpired current contract for its own debit.
+			return nil
+		}
+		return errContractExpired
+	}
 
 	// THROUGHPUTFIX §39.1. An announced successor is verified exactly as an
 	// opening contract is — the same hmac, the same path check above — and
@@ -16066,6 +16090,9 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 	// early path finds the id already open and makes it current.
 	if item.contractAhead {
 		if err := self.registerContractAhead(nextReceiveContract); err != nil {
+			if errors.Is(err, errContractExpired) {
+				return nil
+			}
 			self.rejectRetransmits = true
 			self.peerAudit.Update(func(a *PeerAudit) {
 				a.badContract()
@@ -16075,6 +16102,9 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 		return nil
 	}
 	if err := self.setContract(nextReceiveContract); err != nil {
+		if errors.Is(err, errContractExpired) {
+			return err
+		}
 		self.rejectRetransmits = true
 		// the next contract has already been used
 		// bad contract
@@ -16121,7 +16151,13 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 func (self *ReceiveSequence) registerContractAhead(
 	aheadReceiveContract *sequenceContract,
 ) error {
+	if aheadReceiveContract.expired() {
+		return errContractExpired
+	}
 	if existing, ok := self.openReceiveContracts[aheadReceiveContract.contractId]; ok {
+		if existing.expired() {
+			return errContractExpired
+		}
 		// a retransmitted announcement: idempotent, and the stored contract
 		// keeps whatever it has already accounted
 		if existing != aheadReceiveContract {
@@ -16141,12 +16177,21 @@ func (self *ReceiveSequence) registerContractAhead(
 }
 
 func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) error {
+	if nextReceiveContract.expired() {
+		return errContractExpired
+	}
 	// contract already set
 	if self.receiveContract != nil && self.receiveContract.contractId == nextReceiveContract.contractId {
+		if self.receiveContract.expired() {
+			return errContractExpired
+		}
 		return nil
 	}
 
 	if receiveContract, ok := self.openReceiveContracts[nextReceiveContract.contractId]; ok {
+		if receiveContract.expired() {
+			return errContractExpired
+		}
 		// switch to the current contract
 		superseded := self.receiveContract
 		self.receiveContract = receiveContract
@@ -16258,12 +16303,22 @@ func (self *ReceiveSequence) updateContract(item *receiveItem) bool {
 	// always use a contract if present
 	// the sender may send contracts even if `receiveNoContract` is set locally
 	if item.contractId != nil {
-		if receiveContract, ok := self.openReceiveContracts[*item.contractId]; ok && receiveContract.update(item.messageByteCount) {
+		if receiveContract, ok := self.openReceiveContracts[*item.contractId]; ok {
+			if receiveContract.expired() {
+				return false
+			}
+			if receiveContract.update(item.messageByteCount) {
+				return true
+			}
+		}
+	} else if self.receiveContract != nil {
+		if self.receiveContract.expired() {
+			return false
+		}
+		if self.receiveContract.update(item.messageByteCount) {
+			item.contractId = &self.receiveContract.contractId
 			return true
 		}
-	} else if self.receiveContract != nil && self.receiveContract.update(item.messageByteCount) {
-		item.contractId = &self.receiveContract.contractId
-		return true
 	}
 	// `receiveNoContract` is a mutual configuration
 	// both sides must configure themselves to require no contract from each other
@@ -16453,6 +16508,7 @@ type sequenceContract struct {
 	transferByteCount          ByteCount
 	effectiveTransferByteCount ByteCount
 	provideMode                protocol.ProvideMode
+	expirationTimeUnixMilli    *int64
 
 	minUpdateByteCount ByteCount
 
@@ -16580,6 +16636,7 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 		transferByteCount:                        ByteCount(storedContract.TransferByteCount),
 		effectiveTransferByteCount:               ByteCount(float32(storedContract.TransferByteCount) * contractFillFraction),
 		provideMode:                              contract.ProvideMode,
+		expirationTimeUnixMilli:                  storedContract.ExpirationTimeUnixMilli,
 		minUpdateByteCount:                       minUpdateByteCount,
 		path:                                     path,
 		ackedByteCount:                           ByteCount(0),
@@ -16593,6 +16650,9 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 }
 
 func (self *sequenceContract) update(byteCount ByteCount) bool {
+	if self.expired() {
+		return false
+	}
 	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
 
 	fits := self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.effectiveTransferByteCount
@@ -16640,7 +16700,7 @@ func (self *sequenceContract) update(byteCount ByteCount) bool {
 // can push an otherwise-small batch over the transport message limit.
 func (self *sequenceContract) canUpdate(byteCount ByteCount) bool {
 	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
-	return self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.effectiveTransferByteCount &&
+	return !self.expired() && self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.effectiveTransferByteCount &&
 		(!self.noAckBudgetPublished || int64(effectiveByteCount) <= self.noAckRemainingByteCount.Load())
 }
 

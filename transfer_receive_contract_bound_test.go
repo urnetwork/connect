@@ -87,13 +87,17 @@ func newReceiveContractBoundHarness(t *testing.T) *receiveContractBoundHarness {
 	return h
 }
 
-func (h *receiveContractBoundHarness) newFrame() *protocol.Frame {
+func (h *receiveContractBoundHarness) newFrame(expirationTimes ...int64) *protocol.Frame {
 	h.t.Helper()
 	id := NewId()
-	stored, err := ProtoMarshal(&protocol.StoredContract{
+	storedContract := &protocol.StoredContract{
 		ContractId: id.Bytes(), TransferByteCount: uint64(mib(1)),
 		SourceId: h.source.Bytes(), DestinationId: h.client.ClientId().Bytes(),
-	})
+	}
+	if len(expirationTimes) != 0 {
+		storedContract.ExpirationTimeUnixMilli = &expirationTimes[0]
+	}
+	stored, err := ProtoMarshal(storedContract)
 	if err != nil {
 		h.t.Fatal(err)
 	}

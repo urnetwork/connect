@@ -8,10 +8,16 @@ const noAckContractRetired = uint64(1) << 63
 func (self *sequenceContract) acquireNoAckWriter() bool {
 	for {
 		state := self.noAckWriterState.Load()
-		if state&noAckContractRetired != 0 {
+		if state&noAckContractRetired != 0 || self.expired() {
 			return false
 		}
 		if self.noAckWriterState.CompareAndSwap(state, state+1) {
+			// A caller can cross the deadline between loading and reserving.
+			// Only a lease admitted before expiry may finish its pending write.
+			if self.expired() {
+				self.releaseNoAckWriter()
+				return false
+			}
 			return true
 		}
 	}
