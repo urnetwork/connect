@@ -526,6 +526,12 @@ type ExtenderRecordBody struct {
 	// CountryCode at signing, the same mapping the geo dns uses. Empty on
 	// records that predate it.
 	ContinentCode string `protobuf:"bytes,12,opt,name=ContinentCode,proto3" json:"ContinentCode,omitempty"`
+	// The directory tier the operator placed the extender in (EXTENDER.md
+	// Q1): 0 is the open tier, which the geo dns sets, the feed and the
+	// cleartext gossip carry, and 1 is the gated tier, released only to an
+	// authenticated identity and carried by no open channel. A reader that
+	// predates the field sees 0, and a record that predates it is open.
+	DirectoryTier uint32 `protobuf:"varint,13,opt,name=DirectoryTier,proto3" json:"DirectoryTier,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -642,6 +648,13 @@ func (x *ExtenderRecordBody) GetContinentCode() string {
 		return x.ContinentCode
 	}
 	return ""
+}
+
+func (x *ExtenderRecordBody) GetDirectoryTier() uint32 {
+	if x != nil {
+		return x.DirectoryTier
+	}
+	return 0
 }
 
 type ExtenderRecord struct {
@@ -1275,7 +1288,7 @@ const file_extender_proto_rawDesc = "" +
 	"\x0fExtenderAddress\x12\x0e\n" +
 	"\x02Ip\x18\x01 \x01(\tR\x02Ip\x12\x1c\n" +
 	"\tIpVersion\x18\x02 \x01(\rR\tIpVersion\x12\x1a\n" +
-	"\bCarriers\x18\x03 \x03(\tR\bCarriers\"\x9e\x03\n" +
+	"\bCarriers\x18\x03 \x03(\tR\bCarriers\"\xc4\x03\n" +
 	"\x12ExtenderRecordBody\x12\x1c\n" +
 	"\tPublicKey\x18\x01 \x01(\fR\tPublicKey\x128\n" +
 	"\tAddresses\x18\x02 \x03(\v2\x1a.bringyour.ExtenderAddressR\tAddresses\x12\x18\n" +
@@ -1289,7 +1302,8 @@ const file_extender_proto_rawDesc = "" +
 	"\vNetworkHost\x18\n" +
 	" \x01(\tR\vNetworkHost\x12\x1a\n" +
 	"\bDnsPorts\x18\v \x03(\rR\bDnsPorts\x12$\n" +
-	"\rContinentCode\x18\f \x01(\tR\rContinentCode\"h\n" +
+	"\rContinentCode\x18\f \x01(\tR\rContinentCode\x12$\n" +
+	"\rDirectoryTier\x18\r \x01(\rR\rDirectoryTier\"h\n" +
 	"\x0eExtenderRecord\x12\x12\n" +
 	"\x04Body\x18\x01 \x01(\fR\x04Body\x12$\n" +
 	"\rRootSignature\x18\x02 \x01(\fR\rRootSignature\x12\x1c\n" +

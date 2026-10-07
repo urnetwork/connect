@@ -424,10 +424,12 @@ func TestExtenderFeedCountsAreTheDesignBounds(t *testing.T) {
 	if ExtenderFeedMaxFrameByteCount != 64*1024 {
 		t.Errorf("the frame cap is %d", ExtenderFeedMaxFrameByteCount)
 	}
-	if DefaultExtenderFeedSampleCount != 16 {
+	// the open tier's sample (Q2): one epoch's draw from the client's
+	// partition, so the cap is the pace and the partition is the bound
+	if DefaultExtenderFeedSampleCount != 8 {
 		t.Errorf("the default sample is %d", DefaultExtenderFeedSampleCount)
 	}
-	if ExtenderFeedMaxSampleCount != 32 {
+	if ExtenderFeedMaxSampleCount != 8 {
 		t.Errorf("the sample cap is %d", ExtenderFeedMaxSampleCount)
 	}
 	if ExtenderShareDefaultAddressCount != 48 {

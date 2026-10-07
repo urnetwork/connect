@@ -32,8 +32,9 @@ func TestGossipFeedServerDefaults(t *testing.T) {
 			connect.ExtenderFeedMaxSampleCount,
 		)
 	}
-	if connect.ExtenderFeedMaxSampleCount != 32 {
-		t.Errorf("the protocol sample cap is %d, expected 32", connect.ExtenderFeedMaxSampleCount)
+	// the open tier's cap (Q2): one epoch's draw from the client's partition
+	if connect.ExtenderFeedMaxSampleCount != 8 {
+		t.Errorf("the protocol sample cap is %d, expected 8", connect.ExtenderFeedMaxSampleCount)
 	}
 	if settings.MaxSubscriberCount != 256 {
 		t.Errorf("max subscribers = %d, expected 256", settings.MaxSubscriberCount)

@@ -34,10 +34,14 @@ import (
 // The largest feed frame, request and response alike (D4).
 const ExtenderFeedMaxFrameByteCount = 64 * 1024
 
-// Sample size a client asks for by default, and the server cap (D4).
+// Sample size a client asks for by default, and the server cap (D4, Q2). The
+// feed is an open channel: a sample is one epoch's draw from the client's
+// partition, so the cap sets how fast a client reaches its partition, not how
+// much of the fleet it can reach, and it is kept small so a vantage that polls
+// many extenders in one epoch still learns little per extender.
 const (
-	DefaultExtenderFeedSampleCount = 16
-	ExtenderFeedMaxSampleCount     = 32
+	DefaultExtenderFeedSampleCount = 8
+	ExtenderFeedMaxSampleCount     = 8
 )
 
 // Writes one length-prefixed protobuf frame.

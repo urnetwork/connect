@@ -10,12 +10,17 @@
 // life of the subscription, so the extender does not close a stream the client
 // is still reading.
 //
-// One stream is: the client's request, up to `SampleCount` random active
-// records with this node's own record first, `end_of_sample`, and then, when
-// the client subscribed, every record and revocation the directory applies,
-// with a keepalive on an idle stream. A subscriber that cannot keep up is
-// disconnected rather than waited on -- the directory's bounded subscription
-// closes underneath it -- because one slow client must never hold up an apply.
+// One stream is: the client's request, up to `SampleCount` open records of
+// the client's partition for this epoch with this node's own record first
+// (Q2), `end_of_sample`, and then, when the client subscribed, every
+// revocation the directory applies and every open record it applies that is
+// in the client's partition, with a keepalive on an idle stream. The client's
+// vantage is its address prefix (connect.ExtenderVantageKeyOfAddr): a client
+// that polls or stays subscribed forever learns its partition of this
+// extender's open tier and no more, and a gated record is never served (Q1).
+// A subscriber that cannot keep up is disconnected rather than waited on --
+// the directory's bounded subscription closes underneath it -- because one
+// slow client must never hold up an apply.
 //
 // The server is safe for concurrent use.
 
@@ -26,6 +31,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/connect/protocol"
@@ -147,11 +154,15 @@ func (self *FeedServer) Serve(conn net.Conn) {
 		defer self.endSubscriber()
 	}
 
+	// the client's vantage, which binds it to one partition of the open tier
+	// for the sample and the stream alike (Q2)
+	vantage := connect.ExtenderVantageKeyOfAddr(conn.RemoteAddr())
+
 	sampleCount := int(request.SampleCount)
 	if self.settings.MaxSampleCount < sampleCount {
 		sampleCount = self.settings.MaxSampleCount
 	}
-	for _, message := range self.directory.SampleRecords(sampleCount, self.ownPublicKey) {
+	for _, message := range self.directory.SampleRecords(sampleCount, self.ownPublicKey, vantage) {
 		frame := &protocol.ExtenderFeedFrame{}
 		switch {
 		case message.GetRecord() != nil:
@@ -192,6 +203,11 @@ func (self *FeedServer) Serve(conn net.Conn) {
 			frame := &protocol.ExtenderFeedFrame{}
 			switch {
 			case message.GetRecord() != nil:
+				if !self.streamsRecord(message.GetRecord(), vantage) {
+					// outside the client's partition: as unseen on the
+					// stream as in the sample (Q2)
+					continue
+				}
 				frame.Frame = &protocol.ExtenderFeedFrame_Record{Record: message.GetRecord()}
 			case message.GetRevocation() != nil:
 				frame.Frame = &protocol.ExtenderFeedFrame_Revocation{Revocation: message.GetRevocation()}
@@ -209,6 +225,19 @@ func (self *FeedServer) Serve(conn net.Conn) {
 			}
 		}
 	}
+}
+
+// Whether one applied record is streamed to a subscriber at `vantage` (Q2):
+// the directory holds it in the open tier and in the vantage's partition. The
+// body is decoded here without verifying it again -- the directory applied
+// it, so its signature held -- and a body that does not decode is not
+// streamed.
+func (self *FeedServer) streamsRecord(record *protocol.ExtenderRecord, vantage []byte) bool {
+	body := &protocol.ExtenderRecordBody{}
+	if err := proto.Unmarshal(record.Body, body); err != nil {
+		return false
+	}
+	return self.directory.OpenPartitionContains(vantage, body.PublicKey)
 }
 
 // Writes one frame under the write budget, so a client that stops reading does
