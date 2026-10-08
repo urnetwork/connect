@@ -1249,6 +1249,124 @@ paths:
         "401":
           description: Missing or invalid bearer token.
 
+  /network/client-data-cap:
+    get:
+      tags: [Network]
+      summary: Get a client's data caps and usage
+      description: |
+        Read a client's optional data caps and its usage against them.
+
+        The network's root JWT (a network JWT with no `client_id`) reads any
+        client in the network, named by `client_id`. A client's own scoped JWT
+        reads only that client: `client_id` may be omitted, and must match the
+        JWT's client when given.
+
+        Usage counts the billable bytes the client consumes, including its
+        child clients, and is accounted when transfer contracts settle, so a
+        client can pass a cap by up to the size of its contracts still in
+        flight. `capped` is true once a cap is reached; the client then gets no
+        new transfer contracts until the monthly period rolls over, the cap is
+        raised or cleared, or the running total is reset.
+      operationId: getNetworkClientDataCap
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: client_id
+          schema:
+            type: string
+            format: uuid
+          required: false
+          description: |
+            The client to read. Required with the root JWT; optional with the
+            client's own JWT.
+      responses:
+        "200":
+          description: The client's data caps and usage.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientDataCapResult"
+        "401":
+          description: Missing or invalid bearer token.
+    post:
+      tags: [Network]
+      summary: Set a client's data caps
+      description: |
+        Set a client's optional data caps. The two caps are independent and
+        each is optional. Each field merges: omit it to keep the current value,
+        send `null` to clear that cap, or send a byte count to set it. A cap of
+        `0` pauses the client at once, which pauses one user without removing
+        the client.
+
+        - `monthly_byte_limit` caps usage in each UTC calendar month and resets
+          on its own at 00:00 UTC on the first of the month.
+        - `total_byte_limit` caps a running total that never resets on its own.
+          Raise or clear it, or send `reset_total: true` to zero the running
+          total and start a new period.
+
+        At a cap the client gets no new transfer contracts (a hard stop) until
+        the month rolls over, the cap is raised or cleared, or the total is
+        reset. Only the network's root JWT may set caps, and `client_id` must
+        belong to the caller's network; a client-scoped JWT is refused.
+      operationId: setNetworkClientDataCap
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClientDataCapArgs"
+      responses:
+        "200":
+          description: The client's data caps and usage after the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientDataCapResult"
+        "401":
+          description: Missing or invalid bearer token.
+
+  /network/client-data-caps:
+    get:
+      tags: [Network]
+      summary: List clients' data caps and usage
+      description: |
+        List the data caps and usage of every client in the caller's network
+        that has a cap set, in a stable order, a page at a time. Pass the
+        returned `next_cursor` as `cursor` to read the next page; it is `null`
+        on the last page. Only the network's root JWT may list; a
+        client-scoped JWT is refused.
+      operationId: listNetworkClientDataCaps
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: cursor
+          schema:
+            type: string
+          required: false
+          description: The `next_cursor` from the previous page; omit for the first page.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+          required: false
+          description: The page size.
+      responses:
+        "200":
+          description: A page of clients' data caps and usage.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientDataCapListResult"
+        "401":
+          description: Missing or invalid bearer token.
+
   /network/remove-client:
     post:
       tags: [Network]
@@ -1655,6 +1773,33 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/FeedbackSendResult"
+
+  /services/contact-sales:
+    post:
+      tags: [Other]
+      summary: Contact sales about Services
+      description: |
+        Send a Services inquiry, about embedding URnetwork or any custom use of
+        it, to the URnetwork team. This is the endpoint behind the Services
+        page form, and it needs no authentication. Requests are rate limited
+        per source address.
+      operationId: servicesContactSales
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ServicesContactSalesArgs"
+      responses:
+        "200":
+          description: The inquiry was received.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServicesContactSalesResult"
+        "429":
+          description: Too many inquiries from this source address; try again later.
 
   /log/{clientId}/upload:
     post:
@@ -7759,6 +7904,104 @@ components:
             message:
               type: string
 
+    ClientDataCapArgs:
+      type: object
+      required:
+        - client_id
+      properties:
+        client_id:
+          description: The client to set caps for. It must belong to the caller's network.
+          type: string
+          format: uuid
+        monthly_byte_limit:
+          description: |
+            Bytes the client may use in each UTC calendar month; resets at
+            00:00 UTC on the first of the month. Omit to keep the current
+            value, `null` to clear the cap, `0` to pause the client.
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+        total_byte_limit:
+          description: |
+            Bytes the client may use in the running total, which does not reset
+            on its own. Omit to keep the current value, `null` to clear the
+            cap, `0` to pause the client.
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+        reset_total:
+          description: Zero the running total and start a new total period.
+          type: boolean
+
+    ClientDataCapResult:
+      type: object
+      required: []
+      properties:
+        client_id:
+          type: string
+          format: uuid
+        monthly_byte_limit:
+          description: The monthly cap in bytes, or `null` for none.
+          type: [integer, "null"]
+          format: int64
+        monthly_used_byte_count:
+          description: Bytes used in the current UTC calendar month.
+          type: integer
+          format: int64
+        monthly_period_start:
+          description: Start of the current monthly period (UTC).
+          type: string
+          format: date-time
+        monthly_period_end:
+          description: End of the current monthly period (UTC), when monthly usage resets.
+          type: string
+          format: date-time
+        total_byte_limit:
+          description: The running-total cap in bytes, or `null` for none.
+          type: [integer, "null"]
+          format: int64
+        total_used_byte_count:
+          description: Bytes used since the running total last reset.
+          type: integer
+          format: int64
+        total_period_start:
+          description: When the running total last reset, or began.
+          type: string
+          format: date-time
+        capped:
+          description: True when the client has reached a cap and gets no new transfer contracts.
+          type: boolean
+        capped_reason:
+          description: Which cap was reached, or empty when the client is not capped.
+          type: string
+          enum: ["", monthly, total]
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+
+    ClientDataCapListResult:
+      type: object
+      required: []
+      properties:
+        clients:
+          type: array
+          items:
+            $ref: "#/components/schemas/ClientDataCapResult"
+        next_cursor:
+          description: Pass as `cursor` to read the next page; `null` on the last page.
+          type: [string, "null"]
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+
     RemoveNetworkClientArgs:
       type: object
       required:
@@ -7994,6 +8237,50 @@ components:
         feedback_id:
           description: udid
           type: string
+
+    ServicesContactSalesArgs:
+      type: object
+      required:
+        - name
+        - email
+        - company
+        - monthly_active_users
+        - monthly_data_budget_byte_count
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        company:
+          type: string
+        monthly_active_users:
+          description: Expected monthly active users of the embedded or custom deployment.
+          type: integer
+          minimum: 1
+        monthly_data_budget_byte_count:
+          description: Expected total monthly data budget, in bytes.
+          type: integer
+          format: int64
+          minimum: 0
+        message:
+          description: Optional notes about the use case.
+          type: string
+
+    ServicesContactSalesResult:
+      type: object
+      required: []
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
 
     FindLocationsArgs:
       type: object
