@@ -243,14 +243,12 @@ func TestOwnerRefusesMissingRootWithoutRecreation(t *testing.T) {
 }
 
 // A uuid result must identify the exact currently mounted device.
-func TestOwnerRefusesWrongUuidAndRootFilesystem(t *testing.T) {
-	for _, kind := range []string{"uuid", "root-device", "nested", "duplicate"} {
+func TestOwnerRefusesWrongUuidAndAmbiguousMounts(t *testing.T) {
+	for _, kind := range []string{"uuid", "nested", "duplicate"} {
 		fixture := newVolumeFixture(t)
 		switch kind {
 		case "uuid":
 			fixture.host.uuidDevice.Minor++
-		case "root-device":
-			fixture.host.mounts[0].Device = fixture.host.uuidDevice
 		case "nested":
 			fixture.host.mounts = append(fixture.host.mounts, Mount{Id: 8, ParentId: 7, Device: fixture.host.uuidDevice, Root: "/", Path: fixture.root, FilesystemType: testFilesystemType})
 		case "duplicate":
@@ -261,6 +259,18 @@ func TestOwnerRefusesWrongUuidAndRootFilesystem(t *testing.T) {
 			t.Fatalf("%s admitted", kind)
 		}
 	}
+}
+
+// A declared volume may share the root filesystem's device; its uuid, marker
+// and lease still identify it.
+func TestOwnerAdmitsDeclaredVolumeOnRootDevice(t *testing.T) {
+	fixture := newVolumeFixture(t)
+	fixture.host.mounts[0].Device = fixture.host.uuidDevice
+	owner, err := OpenWithHost(fixture.reference, fixture.root, ReadWrite, fixture.host)
+	if err != nil {
+		t.Fatal("declared volume on the root device was refused:", err)
+	}
+	owner.Close()
 }
 
 // Each admission checks both allocation dimensions and each read-only source.
