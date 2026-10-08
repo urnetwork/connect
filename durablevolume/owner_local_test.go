@@ -87,8 +87,8 @@ func TestOwnerLocalPolicyCannotAuthorizeDaemon(t *testing.T) {
 	}
 }
 
-// A literal root mount is admitted only in the owner-local parser and kernel
-// census. Physical-device checks are exercised above without writing root disk.
+// A literal root mount is admitted by both scopes' parsers and kernel census.
+// Physical-device checks are exercised above without writing root disk.
 func TestOwnerLocalRootMountKeepsPathAndMountBounds(t *testing.T) {
 	fixture := newOwnerLocalFixture(t)
 	fixture.config.Volumes[0].MountPath = "/"
@@ -103,8 +103,8 @@ func TestOwnerLocalRootMountKeepsPathAndMountBounds(t *testing.T) {
 		t.Fatalf("declared system mount was refused: %+v %v", mount, err)
 	}
 	owner.scope = daemonScope
-	if _, err := owner.mountFacts(); err == nil {
-		t.Fatal("daemon kernel admission accepted the system filesystem")
+	if mount, err := owner.mountFacts(); err != nil || mount.Path != "/" {
+		t.Fatalf("daemon kernel admission refused the declared system mount: %+v %v", mount, err)
 	}
 	owner.scope = ownerLocalScope
 	fixture.host.change(func() { fixture.host.uuidDevice.Major ^= 1 })

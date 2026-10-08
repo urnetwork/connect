@@ -268,11 +268,11 @@ func (self *Owner) mountFacts() (Mount, error) {
 	if len(mounts) == 0 || len(mounts) > 8192 {
 		return Mount{}, errors.Join(ErrIdentity, errors.New("durable mount census is empty or unbounded"))
 	}
-	var selected, root Mount
+	var selected Mount
 	selectedCount, rootCount := 0, 0
 	for _, mount := range mounts {
 		if mount.Path == "/" {
-			root, rootCount = mount, rootCount+1
+			rootCount++
 		}
 		if mount.Path == self.spec.MountPath {
 			selected, selectedCount = mount, selectedCount+1
@@ -280,9 +280,6 @@ func (self *Owner) mountFacts() (Mount, error) {
 	}
 	if selectedCount != 1 || rootCount != 1 || selected.Id == 0 || selected.FilesystemType != self.spec.FilesystemType {
 		return Mount{}, errors.Join(ErrIdentity, errors.New("approved durable mount is absent, ambiguous or has another filesystem type"))
-	}
-	if self.scope != ownerLocalScope && rootFilesystem(selected, root) {
-		return Mount{}, errors.Join(ErrIdentity, errors.New("daemon durable mount is on the root filesystem"))
 	}
 	for _, mount := range mounts {
 		if mount.Path != selected.Path && beneath(selected.Path, mount.Path) && (beneath(mount.Path, self.rootPath) || beneath(mount.Path, self.spec.MarkerPath) || beneath(mount.Path, self.rootSpec.LeasePath)) {

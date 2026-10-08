@@ -150,22 +150,3 @@ func TestDarwinQualificationRequiresLocalOwnedApfs(t *testing.T) {
 		}
 	}
 }
-
-// Daemon custody shares the boot group's container; it needs its own volume.
-func TestDarwinRootFilesystemCoversSystemVolumes(t *testing.T) {
-	root := Mount{Path: "/", Device: Device{Major: 1, Minor: 19}}
-	for _, entry := range []struct {
-		mount  Mount
-		shared bool
-	}{
-		{mount: Mount{Path: "/System/Volumes/Data", Device: Device{Major: 1, Minor: 17}}, shared: true},
-		{mount: Mount{Path: "/System/Volumes/Data/custody", Device: Device{Major: 1, Minor: 17}}, shared: true},
-		{mount: Mount{Path: "/Volumes/Custody", Device: Device{Major: 1, Minor: 40}}, shared: false},
-		{mount: Mount{Path: "/Volumes/Custody", Device: root.Device}, shared: true},
-		{mount: Mount{Path: "/System/VolumesCustody", Device: Device{Major: 1, Minor: 41}}, shared: false},
-	} {
-		if rootFilesystem(entry.mount, root) != entry.shared {
-			t.Errorf("%s root filesystem sharing %v, want %v", entry.mount.Path, !entry.shared, entry.shared)
-		}
-	}
-}
