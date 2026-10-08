@@ -363,7 +363,11 @@ func newExtenderDialTlsContext(
 		if innerTlsConfig.ServerName == "" {
 			innerTlsConfig.ServerName = host
 		}
-		tlsServerConn := tls.Client(serverConn, innerTlsConfig)
+		ownedConn, err := ownClientHttpPoolConn(ctx, serverConn)
+		if err != nil {
+			return nil, err
+		}
+		tlsServerConn := tls.Client(ownedConn, innerTlsConfig)
 
 		// inner handshake; bound the timeout so a slow/malicious extender cannot
 		// hold the dial open indefinitely

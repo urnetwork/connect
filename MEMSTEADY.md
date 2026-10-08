@@ -14,7 +14,7 @@ useful TTFB and goodput across every live carrier?**
 Reducing allocation churn creates spendable headroom; queue, root, carrier, and
 topology budgets decide whether that headroom can do useful work.
 
-Current profiles, authorized 2026-09-30: iOS uses **32/32 MiB** DeviceLocal
+Current profiles, reconfirmed 2026-10-06: iOS uses **32/32 MiB** DeviceLocal
 admission/Go soft limit; normal Android uses **64/64 MiB**, with both inputs
 clamped to the effective three-quarters-memory-class allowance. An unavailable
 or invalid Android memory class retains the 24/24-MiB fallback. The debug-only
@@ -34,6 +34,57 @@ Desktop constructors retain their existing classification. Returned pools remain
 These are admission and GC settings, not a guarantee that every byte of live
 runtime fits those numbers. DNS singleton progress, carrier handoff overlap,
 runtime metadata, returned pools, and native/OS memory require separate telemetry.
+
+Current physical teardown qualification requires actual DeviceLocal cancellation
+and joined shutdown, not stopped roles, AM exit or a successful `finish` status.
+The test-owned native observer keeps the existing 15-second sampler cadence plus
+immediate begin/cancel/join/terminal observations. Its fixed primitive ring is
+sized from a 150-second lifetime (currently 16 entries); its allocation is part
+of observed memory. One owner serializes reads and publication. Drops, timeouts,
+export failures and incomplete joins fail. Join outside the device worker tree
+and UI callbacks, then drain the original ring, release scoped Go/Java device
+holders, and force a fresh terminal read. App Close stays asynchronous; do not
+force GC, raise profile32/rate0, subtract observer cost or reuse old quiet rows.
+After each completed native read the sole owner publishes a copied immutable
+header over the never-rewritten, capacity-limited prefix of that same fixed
+ring. A blocked later read or caller timeout exports only this completed prefix
+as failed/unjoined evidence; it does not erase earlier highs, read mutable state,
+fabricate a terminal sample or become successful after a late reader returns.
+
+Retain four separate runtime-event scopes: `physical-memory.ndjson` device
+primitives, `physical-memory-teardown.json` process-only lifecycle primitives,
+`physical-memory-status.ndjson` existing GetMemoryStats calls, and the existing
+`physical-diagnostics.ndjson` atomic batches' `part=memory` rows. The fourth
+scope copies the actual profiling rate from the same native runtime snapshot;
+it adds no native call. Gate every retained total-minus-released value against
+33,554,432 bytes. Status's separate same-snapshot MemStats Sys minus HeapReleased
+also enters the peak and has its own snapshot count. Retained last-trim before/
+after values and diagnostic owner-census runtime values are auxiliary retained
+representations: report their values/counts/breaches separately, including
+repetition and any prior-profile ambiguity. A readable high value survives an
+invalid neighboring field. Never invent unique-read/independence counts or
+silently assign an earlier maintenance value to the current profile. Retain
+identity-bound producer-summary maxima from the existing summary file and
+native envelope as separately counted, possibly duplicate auxiliary evidence;
+they can be the only surviving high after append/flush failure. Emergency native
+receipts are archived and never qualify. Select only one exact-identity native
+stream; nonduplicate conflicting or foreign readable native values remain
+auxiliary, with foreign provenance explicitly unqualified. None pads primary
+or quiet counts, and a low later receipt cannot erase a known earlier high.
+
+Unrecorded internal pressure-policy reads are outside this instrumentation;
+observed sampling is not an unsampled continuous-peak guarantee. Quiet still
+requires the original uninterrupted >=21 device primitives spanning >=300,000
+ms; none of the other scopes or auxiliary values pads that count. The schema-4
+eligible live gate binds immutable memory/status/diagnostic prefixes and counts.
+Offline qualification additionally requires the exact finish/observer identity,
+complete native-input and instrumentation-owner proof, normal host join, and
+the fresh native terminal receipt. A failed live proof cannot be requalified.
+All-phase sampler drops and every writer open/append/flush/close failure remain
+sticky. Summary failure still attempts the raw native receipt independently.
+New native methods/fields require fresh writer-before/after/current-source,
+writer/consumer and all-ABI APK/AAR linkage attestation. Historical artifacts
+stay historical; the normal Android 64/64 profile remains a separate cohort.
 The signed iOS Network Extension **kernel lifetime `phys_footprint` peak must
 remain strictly below 50 MiB (52,428,800 bytes)**. No current physical-iPhone
 run qualifies that requirement. Android proxy and host measurements cannot do so.
@@ -528,7 +579,8 @@ generation (544 KiB at the mobile default):
 Thus the supported worst overlap is one fallback NAT, one retiring provider's
 local NAT, one replacement provider's local NAT, and both old/new providers
 with their required stats subscriptions: **3 × 256 + 2 × (544 + 1) = 1858 KiB**.
-It leaves **190 KiB** in the 2-MiB child for actual packet/flow admission.
+At the historical 20-MiB calibration target, it leaves **190 KiB** in the
+2-MiB child for actual packet/flow admission.
 The deterministic tests keep this graph live and complete a real UDP echo;
 the SDK repeats the same graph and progress at the 20-MiB and 28-MiB targets
 (the latter has a 2.8-MiB NAT child). These are overlapping claims against the
@@ -584,16 +636,22 @@ profiles on both sides are dominated by runtime thread/goroutine allocation,
 message pools and Transfer state; they show no candidate-specific provider
 policy hotspot at the default sampling resolution and do not profile the
 runtime peak itself. No ceiling was raised, and this check does not replace
-the mobile all-sample 24-MiB runtime acceptance gate.
+the then-current mobile all-sample 24-MiB runtime acceptance gate.
 
-The 5-MiB carrier share is one aggregate per-DeviceLocal ceiling, not 5 MiB per
-mode or per layer. Under the 32-MiB iOS process profile, every low-memory device
+### Historical v1 carrier calibration
+
+The following 20/32-MiB iOS and 28/40- or 28/64-MiB Android calculations
+retain their original calibration inputs. They are not the current 32/32-MiB
+iOS or 64/64-MiB Android policy, and cannot qualify a current MEMSTEADY block.
+
+The historical 5-MiB carrier share is one aggregate per-DeviceLocal ceiling,
+not 5 MiB per mode or per layer. Under the 32-MiB iOS process profile, every low-memory device
 carrier budget is also a child of one 8-MiB / 16-carrier-slot process root. Standalone
 NetworkSpace API, feed, probe, and extender claims attach directly to that root.
 Thus two devices in one process, an inner carrier plus its extender, and an
 Auto race cannot each spend an independent allowance.
 
-Current ordinary Android's **28/64-MiB** inputs yield a **7-MiB explicit
+Historical ordinary Android's **28/64-MiB** inputs yield a **7-MiB explicit
 device carrier budget / 16-MiB process-sized default carrier budget**, both
 with the unchanged 16-slot cap (`memory_budget.go` uses one quarter of the
 respective target here). The former **28/40 → 7/10-MiB** mapping is historical.
@@ -603,7 +661,7 @@ the shared-process-root description above is an older design, not the current
 PlatformTransport/carrier graph; it is not a raw file-descriptor count. Every
 physical socket, concurrent dial candidate, and inner/outer layer in that graph
 still contributes its full byte working set to the claim. Deterministic tests pin both
-20/32, historical 28/40, and current 28/64. The physical acceptance threshold in this campaign remains
+20/32, historical 28/40, and historical 28/64. Those comparisons used
 the iOS-profile 20/32 inputs and all-sample 28-MiB runtime cap.
 
 The 2-MiB DNS row covers DeviceLocal name-resolution/cache admission. It is not
@@ -617,9 +675,18 @@ inner H3 window.
 These are admission ceilings, not eager allocations or a proof that mapped
 runtime fits. Runtime includes allocator spans, goroutine stacks, GC metadata,
 and all simultaneously retained ownership, so the independent hard <=28-MiB
-observed runtime gate still applies. The process GC soft limit is 32 MiB.
+observed runtime gate applied to that historical profile. Its process GC soft
+limit was 32 MiB.
 
 ### Required live-carrier budget matrix
+
+Current qualification uses `ios-memory-audit-v2`: 32-MiB DeviceLocal admission,
+32-MiB Go soft limit, and an all-sample 32-MiB observed Go ceiling on both
+allowlisted Android PERF phones. The current admission ledger above is
+authoritative. The older window calculations below are retained as calibration
+history; the current qualification matrix and assertions follow them.
+
+#### Historical carrier-window examples
 
 The mobile H3 claim includes **1600 KiB of fixed retained ownership**, additive
 to connection receive credit:
@@ -647,36 +714,38 @@ not an additional allocation on top of it.
 
 Without an explicit owner, `DefaultPlatformTransportSettings()` uses the
 process target, so `MemoryBudget = 32 MiB` selects the 5696-KiB claim above;
-the actual 20-MiB DeviceLocal uses `WithMemoryTarget(20 MiB)` and its 3072-KiB
+the historical 20-MiB DeviceLocal uses `WithMemoryTarget(20 MiB)` and its 3072-KiB
 claim under a 5-MiB child of the same 8-MiB process root.
 
-This is a deliberate piecewise policy: targets through 24 MiB keep the
-3-MiB inner claim and subtract the fixed envelope before advertising receive
-credit. Above 24 MiB through 32 MiB, the claim instead includes the full
+That historical finite-profile policy was piecewise: targets through 24 MiB
+kept the 3-MiB inner claim and subtracted the fixed envelope before advertising
+receive credit. Above 24 MiB through 32 MiB, the claim included the full
 `target / 8` connection credit plus 1600 KiB. Unbudgeted and larger/server
-profiles retain their historical receive-window policy; this finite-profile
-ledger does not certify their unbounded working sets. Initial credit is also
+profiles retained their historical receive-window policy; this finite-profile
+ledger does not certify their unbounded working sets. Initial credit was also
 owner-scoped: 128/256 KiB stream/connection on the finite profile and the
 historical 256/512 KiB on larger owners, irrespective of process sizing.
 
-The worst admitted iOS nesting is **3072 + 1408 + 2 × 144 + 256 = 5024 KiB**:
+The historical 20-MiB iOS nesting is **3072 + 1408 + 2 × 144 + 256 = 5024 KiB**:
 inner H3, outer QUIC, separate inner/outer DNS translation claims, and the
 pending H1 carrier. It leaves **96 KiB** of the unchanged 5-MiB child. The
-normal Android counterpart is **5184 + 1408 + 288 + 256 = 7136 KiB**, leaving
-32 KiB of its 7-MiB child. Each live claim also draws on the process root.
+historical 28-MiB Android counterpart is **5184 + 1408 + 288 + 256 = 7136 KiB**,
+leaving 32 KiB of its 7-MiB child. Each live claim also draws on the process root.
 
 The older THROUGHPUTFIX share table treated the entire H3 reservation as
 receive credit. That receive-only equation is superseded on the finite mobile
 surface, not restored by removing real retained owners. At the table's
 200-ms carrier-loop design point and its existing framing factor, 1104 KiB
 permits about **38.2 Mbit/s**, not the former 66/80-Mbit/s predictions for the
-20/24-MiB targets; normal Android's 2688 KiB permits about **93.0 Mbit/s**.
+20/24-MiB targets; historical Android's 2688 KiB permits about **93.0 Mbit/s**.
 These are arithmetic window bounds, not measured throughput or an acceptance
 claim. Restoring the old 20-MiB connection credit while charging its fixed
 owners would need a 4160-KiB inner claim and **6112 KiB** for the nested graph,
-992 KiB beyond the child. The 20-MiB device target, 32-MiB process soft limit,
-and live-carrier progress tests are unchanged; the
-current observed runtime gate is <=28 MiB.
+992 KiB beyond the child. These calculations used the 20-MiB device target,
+32-MiB process soft limit, and <=28-MiB observed runtime gate; they do not
+replace current v2 qualification.
+
+#### Current v2 qualification matrix
 
 The deterministic gate and the Android campaign together cover both axes
 below. The extender axis is the complete 4 x 3 cross-product of inner
@@ -698,7 +767,7 @@ claim on normal close, dial failure, cancellation, and role teardown.
 | Production Auto race and carrier replacement | Every simultaneous candidate; one explicitly paired H1-involved overage loan per level, bounded by that level's H1 overlap, with up to two distinct cross-level pair identities fully reflected in child/root evidence |
 | NetworkSpace API/feed/probe without a DeviceLocal owner | A direct process-root claim; it must coexist or wait/refuse under the same 8-MiB / 16-slot root rather than escaping accounting or disabling restricted-underlay fallback |
 
-Run the matrix with the exact 20-MiB device / 32-MiB process profile, not a
+Run the matrix with the exact 32-MiB device / 32-MiB process profile, not a
 larger surrogate. For every row assert all of the following:
 
 1. The complete claim is acquired before opening a socket, allocating a QUIC
@@ -708,7 +777,7 @@ larger surrogate. For every row assert all of the following:
 2. Useful bytes make progress when the graph fits. In particular, first acquire
    the inner claim, then prove each intended outer carrier still fits; testing
    an outer claim alone misses a missized composite budget.
-3. Outside a handoff, child use never exceeds 5 MiB and aggregate process use
+3. Outside a handoff, child use never exceeds 8 MiB and aggregate process use
    never exceeds 8 MiB or 16 carrier slots. Each level permits at most one
    H1-involved overage loan, bounded by its own reported old/new H1 overlap
    (at most 256 KiB and one logical slot in this profile). Independent carrier
@@ -733,12 +802,13 @@ larger surrogate. For every row assert all of the following:
    gate and must report only the carrier it actually used.
 6. The two-phone production-Auto blocks record process-root total/used bytes and
    carrier-slot counts in every diagnostic sample, exercise both provider/client role
-   assignments, transfer payload, and remain under the all-sample 28-MiB runtime
+   assignments, transfer payload, and remain under the all-sample 32-MiB runtime
    cap. Forced-mode results are reported separately so one winning fallback
    cannot be mistaken for coverage of the other live paths.
-7. Every phone sample also records the 13-MiB transfer/topology root and its
+7. Every phone sample also records the 20.8-MiB transfer/topology root and its
    client, provider, NAT, and Pack subsets in a same-timestamp joined
-   `memory_device_transfer` part. Root/NAT totals must be exactly 13/2 MiB;
+   `memory_device_transfer` part. Root/NAT totals must be exactly
+   21,810,380 / 3,355,443 bytes (the current 32-MiB target's integer shares);
    each stays within its cap and cumulative reserved minus released bytes
    equals current use. Every child stays within its own cap and root usage;
    child values are not added together or to the root a second time. Report
@@ -761,9 +831,9 @@ larger surrogate. For every row assert all of the following:
    drain-only, early-quiet or single-sample dip cannot justify late growth.
    All-sample runtime/admission caps, carrier end checks, temporary-client
    release, traffic and five-minute coverage gates remain unchanged.
-   The deterministic gate repeats this at the normal
-   Android 28-MiB target, where the same ratios scale the root to 18.2 MiB and
-   the NAT child to 2.8 MiB.
+   Historical calibration also exercised the Android 28-MiB target, where the
+   same ratios scale the root to 18.2 MiB and the NAT child to 2.8 MiB. Those
+   inputs are not the current normal Android 64-MiB target or the v2 surrogate.
 
 Classify any failure before changing a limit:
 
@@ -772,11 +842,11 @@ Classify any failure before changing a limit:
   root. Add ownership/accounting and a lifecycle regression; do not hide it by
   enlarging a budget.
 - **Missized budget:** the complete required graph is accounted, but a live
-  production path cannot fit the 5-MiB child or the shared 8-MiB root under the
-  exact 20/32 profile. Reconcile the full inner-plus-outer working set and the
+  production path cannot fit the 8-MiB child or the shared 8-MiB root under the
+  exact 32/32 profile. Reconcile the full inner-plus-outer working set and the
   ledger together; testing either layer alone is insufficient.
 - **Inefficient algorithm:** accounting is complete and within its admission
-  ceilings, but actual retained/runtime memory crosses 28 MiB or useful work
+  ceilings, but actual retained/runtime memory crosses 32 MiB or useful work
   cannot progress at a reasonable rate. Remove duplication, reduce retained
   roots/topology, or change the algorithm; admission bookkeeping alone is not
   a fix.
@@ -788,7 +858,7 @@ Classify any failure before changing a limit:
 
 The following research ledger records earlier 24-MiB DeviceLocal calibration
 and a superseded share split. Keep it as history; the current iOS proxy uses the
-20-MiB ledger immediately above.
+32-MiB v2 ledger above.
 
 At a 24 MiB target the SDK divides the tracked budget into 2.4 MiB DNS,
 16.8 MiB client, and 4.8 MiB provider shares. These are admission ceilings,
@@ -3693,3 +3763,94 @@ it does not add an unbounded history or move estimation into every packet write.
 The fresh SDK memory cohort and its telemetry helpers also passed with the
 race detector (13.854 s); instrumented memory values are diagnostic, not an
 alternative to the normal-build ceiling.
+
+### 2026-10-08 H1 recovery and physical qualification checkpoint
+
+Current qualification still uses the 32/32-MiB iOS profile on the allowlisted
+Android devices and the separate 64/64-MiB normal Android profile. No new
+physical steady-memory result is qualified: the latest Pixel arm failed during
+authentication discovery, before traffic or runtime samples. Its normal
+instrumentation exit is not a passing workload or memory measurement.
+
+Private H1 recovery research exposed a deterministic mixed-prefix defect.
+When a cumulative ACK covers an accepted retry followed by an unresent
+original, treating any recovered item as permission for another early retry
+erases genuine original progress deferral. The RED control failed with a new
+grant and immediate retry; the complementary recovered-final-position control
+passed. Evidence:
+`/private/tmp/urnetwork-h1-progress-v16-exec.tmRTCM/`. The proposed correction
+uses the newest cumulatively covered position per exact route for early-retry
+funding, while keeping legacy lane promotion separate. It adds no payload
+queue or memory allowance; correctness and measured performance approval
+remain required before adoption.
+
+The preceding full private Connect parent failed twelve tests and reached its
+overall 20-minute bound. Focused ownership/race passes therefore do not qualify
+that candidate. See `tests/PERFVAR-MEASUREMENTS.md` for the failure matrix and
+raw evidence. Startup diagnostics and narrowly owned failed-arm cleanup are
+being verified before a fresh native device build; they do not substitute for
+active, burst, drain and quiet-window measurements under the profile ceilings.
+
+### 2026-10-08 physical iOS32 subgate and unresolved traffic collapse
+
+Fresh native/AAR/APK inputs were attested for the Pixel iOS-v2 32/32-MiB,
+rate-zero arm. It passed startup, profile and H1 readiness, and collected real
+traffic plus a complete 21-primitive quiet window spanning 300,001 ms. The
+retained memory subgate passed:
+
+| Retained measurement | MiB |
+| --- | ---: |
+| Overall runtime peak | 24.500 |
+| Quiet peak | 24.313 |
+| Teardown peak | 22.883 |
+
+There were 159 retained events across primary/status/diagnostic/teardown scopes,
+zero observed breaches and zero sampler/observer drops. Device, observer and
+drainer joins/flushes completed. This is sampled evidence, not a continuous
+peak or iOS kernel-footprint guarantee. Artifacts:
+`/private/tmp/urnetwork-h1-ios32-pixel-wifi-v4.MDIwEN/`.
+
+The full arm nevertheless failed and is **not qualified**. Five Wikipedia
+loads completed (median load/TTFB 1006.1/531.8 ms). Fast #1 displayed 11 Mbit/s
+and its whole-interface interval received about 23.68 MB; Fast #2/#3 exhausted
+their unchanged 90-second display deadlines, with only about 1.82/0.20 MB
+received. These interval totals are not page-exact. Page-only CDP throughput
+(for example 0.05 Mbit/s) excludes worker downloads and must not be reported
+as Fast's measured speed. A separate host API connection timeout left one
+owned client-cleanup marker; normal credential cleanup succeeded.
+
+Wi-Fi/VPN identities stayed stable and thermal status remained zero. No
+recorded packet-pressure, H1 queue/Pack handoff drop or route-write error
+explains the decline. Carrier reservation approached 8,339,456/8,388,608 bytes,
+while transfer ownership peaked around 4.18/21.81 MB. ACK-stall/retransmit
+observations are not bound to the failed page flows, so neither carrier pressure
+nor a specific provider is yet established as the cause. Investigate exact
+claim/flow lifetime and preserve fixed request-error categories before changing
+budgets, timeouts or routing. This is meaningful memory evidence under some
+delivered load, not a completed full-workload or Android64 qualification.
+
+Private deterministic capacity research also isolated an inherited H1 limiter:
+after a 64-KiB-to-2-MiB permission increase, compressed startup feedback kept
+pacing near 705,144 B/s. RED reproduced the release failure. The reviewed
+owner-local requalification candidate delivered about 95.83 Mbit/s versus the
+old 46.63 Mbit/s in the unchanged compressed-ACK growth cell; all six cells and
+adjacent negatives passed ordinary/race, with zero measurement/relay drops.
+It retains the 90% criterion, shared service evidence, congestion revocation
+and budgets. Struct/allocator measurements remain 2,432/2,688 bytes, one
+allocation per sequence, by using existing padding. Evidence:
+`/private/tmp/urnetwork-h1-permission-green-exec.IYDGLk/`. This is a private
+component improvement; full-parent, repeat confirmations and real-device
+performance/memory qualification still precede adoption.
+
+### 2026-10-08 fresh-process capacity confirmation
+
+The private H1 permission-growth correction passed three additional
+fresh-process ordinary/race confirmation rounds: 258 top-level checks across
+12 processes, no failures/skips, unchanged six-cell 90% throughput criterion,
+and no relay/measurement drops or timeout resend writes. Resource guards held.
+Evidence: `/private/tmp/urnetwork-h1-permission-confirm3.gseMwJ/`.
+
+This establishes repeatability of the component result, not live adoption.
+The candidate includes other accumulated private H1 corrections, so integration
+must isolate the intended production changes and qualify their composed parent
+and physical workload. Do not copy diagnostic overlays wholesale into live code.

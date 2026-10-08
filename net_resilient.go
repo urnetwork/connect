@@ -122,14 +122,17 @@ func newResilientDialTlsContext(
 			// copy and extend
 			tlsConfig := baseTlsConfig.Clone()
 			tlsConfig.ServerName = host
+			ownedConn, err := ownClientHttpPoolConn(ctx, rconn)
+			if err != nil {
+				return nil, err
+			}
 
 			var tlsConn net.Conn
-			var err error
 			func() {
 				tlsCtx, tlsCancel := context.WithTimeout(ctx, connectSettings.TlsTimeout)
 				defer tlsCancel()
 				// closes the tls connection, and rconn under it, on error
-				tlsConn, err = tlsHandshaker.handshake(tlsCtx, rconn, tlsConfig)
+				tlsConn, err = tlsHandshaker.handshake(tlsCtx, ownedConn, tlsConfig)
 			}()
 			if err != nil {
 				return nil, err

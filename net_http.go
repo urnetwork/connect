@@ -285,12 +285,24 @@ type ClientStrategy struct {
 	internalDohResolver *internalDohResolver
 
 	mutex sync.Mutex
+	// Closing prevents a concurrent configuration update from adding owners
+	// after the terminal retirement sweep.
+	closed bool
 	// dialers are only updated inside the mutex
 	dialers map[*clientDialer]bool
+	// Changes with membership so stale snapshots can refresh once without
+	// treating local retirement as a failed network attempt.
+	dialerGeneration uint64
+	// Immutable per instance. Nil keeps ordinary jitter; tests can inject a
+	// paced reconnect to prove retry timing without random outcomes.
+	reconnectFactory func(time.Duration) *Reconnect
 
 	// custom extenders
 	// these take precedence over other extenders
 	extenderIpSecrets map[netip.Addr]string
+	// Every accepted replacement fences pending expansion, even when no
+	// published dialer was removed. Guarded by mutex with the custom map.
+	customExtenderGeneration uint64
 	// the country whose spoof list the outer names of the extender dialers
 	// were drawn from, "" for the global list (spoofDomainsForCountry)
 	extenderSpoofCountryCode string
@@ -369,9 +381,13 @@ func newNormalDialTlsContext(
 			if config.ServerName == "" {
 				config.ServerName = host
 			}
+			ownedConn, err := ownClientHttpPoolConn(ctx, conn)
+			if err != nil {
+				return nil, err
+			}
 			tlsCtx, tlsCancel := context.WithTimeout(ctx, settings.TlsTimeout)
 			defer tlsCancel()
-			return tlsHandshaker.handshake(tlsCtx, conn, config)
+			return tlsHandshaker.handshake(tlsCtx, ownedConn, config)
 		}
 		// DialContext preserves injected userspace networks in tests and proxy
 		// routing in production before wrapping the resulting connection in TLS.
@@ -577,9 +593,12 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 // strategy terminal. Network changes use the same operation before lazy
 // redial on the new path.
 func (self *ClientStrategy) CloseIdleConnections() {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	for dialer := range self.dialers {
+	dialers := func() []*clientDialer {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		return slices.Collect(maps.Keys(self.dialers))
+	}()
+	for _, dialer := range dialers {
 		dialer.Close()
 	}
 	if self.internalDohResolver != nil {
@@ -591,9 +610,12 @@ func (self *ClientStrategy) CloseIdleConnections() {
 // reusable transport owner. Keeping that owner also preserves path-local TLS
 // tickets and lets the next sweep find streams that were active in this one.
 func (self *ClientStrategy) shedMemory() {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	for dialer := range self.dialers {
+	dialers := func() []*clientDialer {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		return slices.Collect(maps.Keys(self.dialers))
+	}()
+	for _, dialer := range dialers {
 		dialer.shedMemory()
 	}
 	if self.internalDohResolver != nil {
@@ -605,6 +627,13 @@ func (self *ClientStrategy) shedMemory() {
 // sharing the strategy must be closed first; repeated calls are safe.
 func (self *ClientStrategy) Close() {
 	self.closeOnce.Do(func() {
+		dialers := func() []*clientDialer {
+			self.mutex.Lock()
+			defer self.mutex.Unlock()
+			self.closed = true
+			self.dialerGeneration++
+			return slices.Collect(maps.Keys(self.dialers))
+		}()
 		if self.cancel != nil {
 			self.cancel()
 		}
@@ -614,7 +643,9 @@ func (self *ClientStrategy) Close() {
 		if self.unsubMemoryShed != nil {
 			self.unsubMemoryShed()
 		}
-		self.CloseIdleConnections()
+		for _, dialer := range dialers {
+			dialer.retire()
+		}
 		if self.internalDohResolver != nil {
 			self.internalDohResolver.Close()
 		}
@@ -640,22 +671,32 @@ func (self *ClientStrategy) networkChanged() {
 // A strategy that refuses extenders configured by hand
 // (`DisableManualExtenders`) keeps none.
 func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]string) {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
+	retiredDialers := []*clientDialer{}
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
 
-	if self.settings.DisableManualExtenders {
-		return
-	}
-	self.extenderIpSecrets = maps.Clone(extenderIpSecrets)
-	for dialer, _ := range self.dialers {
-		if dialer.IsExtender() && !dialer.persistent {
-			dialer.Close()
-			delete(self.dialers, dialer)
+		if self.closed || self.settings.DisableManualExtenders {
+			return
 		}
+		self.extenderIpSecrets = maps.Clone(extenderIpSecrets)
+		self.customExtenderGeneration++
+		for dialer := range self.dialers {
+			if dialer.IsExtender() && !dialer.persistent {
+				retiredDialers = append(retiredDialers, dialer)
+				delete(self.dialers, dialer)
+			}
+		}
+		if len(retiredDialers) != 0 {
+			self.dialerGeneration++
+		}
+		// the set of custom extenders is part of the strategy config; a change
+		// invalidates per-network winners learned under the old set
+		self.invalidateScoresForConfigChangeWithLock()
+	}()
+	for _, dialer := range retiredDialers {
+		dialer.retire()
 	}
-	// the set of custom extenders is part of the strategy config; a change
-	// invalidates per-network winners learned under the old set
-	self.invalidateScoresForConfigChangeWithLock()
 }
 
 // ExtenderDirectory is the directory this strategy draws extenders from, nil
@@ -743,23 +784,37 @@ func newVlessClientDialer(settings *ClientStrategySettings, vlessConfig *VlessCo
 // (`DisableVless`) keeps none. The replaced dialers' pooled connections close,
 // and requests in flight finish on the connections they have.
 func (self *ClientStrategy) SetVlessConfigs(vlessConfigs []*VlessConfig) {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
+	retiredDialers := []*clientDialer{}
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		if self.closed {
+			return
+		}
 
-	for dialer := range self.dialers {
-		if dialer.vlessConfig != nil {
-			dialer.Close()
-			delete(self.dialers, dialer)
+		for dialer := range self.dialers {
+			if dialer.vlessConfig != nil {
+				retiredDialers = append(retiredDialers, dialer)
+				delete(self.dialers, dialer)
+			}
 		}
-	}
-	for _, vlessConfig := range vlessConfigs {
-		if dialer := newVlessClientDialer(self.settings, vlessConfig); dialer != nil {
-			self.dialers[dialer] = true
+		changed := len(retiredDialers) != 0
+		for _, vlessConfig := range vlessConfigs {
+			if dialer := newVlessClientDialer(self.settings, vlessConfig); dialer != nil {
+				self.dialers[dialer] = true
+				changed = true
+			}
 		}
+		if changed {
+			self.dialerGeneration++
+		}
+		// vless servers are part of the strategy config; a change invalidates
+		// per-network winners learned under the old set
+		self.invalidateScoresForConfigChangeWithLock()
+	}()
+	for _, dialer := range retiredDialers {
+		dialer.retire()
 	}
-	// vless servers are part of the strategy config; a change invalidates
-	// per-network winners learned under the old set
-	self.invalidateScoresForConfigChangeWithLock()
 }
 
 // Copies of the configurations of the strategy's VLESS dialers, in no
@@ -978,14 +1033,24 @@ func (self *ClientStrategy) dialerWeights(webSocketOnly bool) map[*clientDialer]
 // (A12), which a dial would only be turned away by again, and the earliest
 // time one of those stops being limited, zero when none is.
 func (self *ClientStrategy) dialerWeightsUnlimited(webSocketOnly bool) (map[*clientDialer]float32, time.Time) {
+	weights, limitedUntil, _ := self.dialerWeightsSnapshot(webSocketOnly)
+	return weights, limitedUntil
+}
+
+// Captures membership and generation in one locked scope. The directory's
+// temporary limits are still read outside the strategy lock.
+func (self *ClientStrategy) dialerWeightsSnapshot(webSocketOnly bool) (map[*clientDialer]float32, time.Time, uint64) {
 	var networkId string
-	weights := func() map[*clientDialer]float32 {
+	weights, generation := func() (map[*clientDialer]float32, uint64) {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
 		networkId = self.currentNetworkId
 
 		weights := map[*clientDialer]float32{}
+		if self.closed {
+			return weights, self.dialerGeneration
+		}
 
 		if len(self.extenderIpSecrets) == 0 {
 			for dialer, _ := range self.dialers {
@@ -1005,7 +1070,7 @@ func (self *ClientStrategy) dialerWeightsUnlimited(webSocketOnly bool) (map[*cli
 				}
 			}
 		}
-		return weights
+		return weights, self.dialerGeneration
 	}()
 
 	// Bias each dialer by what it has DELIVERED on the current network (decayed,
@@ -1034,7 +1099,17 @@ func (self *ClientStrategy) dialerWeightsUnlimited(webSocketOnly bool) (map[*cli
 			}
 		}
 	}
-	return weights, limitedUntil
+	return weights, limitedUntil, generation
+}
+
+// Refreshes only a changed, usable generation. Each evaluator spends this
+// allowance once; ordinary errors and repeated churn retain their backoff.
+func (self *ClientStrategy) canRefreshRetiredSnapshot(generation uint64, webSocketOnly bool) bool {
+	if self.ctx != nil && self.ctx.Err() != nil {
+		return false
+	}
+	weights, _, currentGeneration := self.dialerWeightsSnapshot(webSocketOnly)
+	return generation != currentGeneration && len(weights) != 0
 }
 
 type httpResult struct {
@@ -1057,6 +1132,9 @@ type evalResult struct {
 	// materialize is run only for the selected HTTP response. A canceled
 	// parallel HTTP response is released by its attempt context instead.
 	materialize func() error
+	// The acquired HTTP owner stays with the lazy result through response
+	// consumption or cancellation, including results from removed dialers.
+	httpPool *clientHttpPool
 
 	httpResult
 }
@@ -1144,6 +1222,7 @@ func (self *evalResult) Selected() *evalResult {
 // Close synchronously releases a live result. Canceled HTTP results must use
 // discardAfterContextCancellation because their transport already owns cleanup.
 func (self *evalResult) Close() {
+	defer self.releaseHttpClient()
 	self.materialize = nil
 	if self.h1Conn != nil {
 		self.h1Conn.Close()
@@ -1168,6 +1247,7 @@ func (self *evalResult) Close() {
 // connection write mutex. A WebSocket has escaped its handshake context once
 // DialContext returns, so it still needs an explicit close.
 func (self *evalResult) discardAfterContextCancellation() {
+	defer self.releaseHttpClient()
 	self.materialize = nil
 	if self.h1Conn != nil {
 		self.h1Conn.Close()
@@ -1180,6 +1260,16 @@ func (self *evalResult) discardAfterContextCancellation() {
 	}
 	if self.response != nil {
 		self.response.Body = nil
+	}
+}
+
+// Transfers a removed or reset client's final idle sweep to result cleanup,
+// after the selected body was consumed or its attempt was canceled.
+func (self *evalResult) releaseHttpClient() {
+	if self.httpPool != nil {
+		httpPool := self.httpPool
+		self.httpPool = nil
+		httpPool.release()
 	}
 }
 
@@ -1340,6 +1430,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 		}
 	}
 	run := func(dialer *clientDialer) { runWithContext(handleCtx, dialer) }
+	retirementRefreshed := false
 
 	// keep trying as long as there is time left
 	for {
@@ -1350,13 +1441,17 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 		}
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
+		if self.reconnectFactory != nil {
+			reconnect = self.reconnectFactory(self.settings.ReconnectTimeout)
+		}
+		retiredSnapshot := false
 
 		self.collapseExtenderDialers()
 
 		// the number of runs with pending out
 		p := 0
 
-		dialerWeights, limitedUntil := self.dialerWeightsUnlimited(webSocketOnly)
+		dialerWeights, limitedUntil, dialerGeneration := self.dialerWeightsSnapshot(webSocketOnly)
 
 		if 0 < len(dialerWeights) {
 			serialDialers := []*clientDialer{}
@@ -1429,6 +1524,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 					case result := <-out:
 						p--
 						if result != nil {
+							retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
 							if result.Selected().err == nil || result.terminal {
 								timer.Stop()
 								return result
@@ -1453,6 +1549,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 				)
 				result := eval(attemptCtx, dialer)
 				if result != nil {
+					retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
 					result.dialer = dialer
 					if result.Selected().err == nil || result.terminal {
 						attemptCancel()
@@ -1491,6 +1588,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 					return nil
 				case result := <-out:
 					if result != nil {
+						retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
 						if result.Selected().err == nil || result.terminal {
 							if self.log.V(2).Enabled() {
 								self.log.Infof("[net][p]select: %s\n", result.dialer.String())
@@ -1523,6 +1621,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 					return nil
 				case result := <-out:
 					if result != nil {
+						retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
 						if result.Selected().err == nil || result.terminal {
 							if self.log.V(2).Enabled() {
 								self.log.Infof("[net][p]select: %s\n", result.dialer.String())
@@ -1547,12 +1646,18 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 				return nil
 			case result := <-out:
 				if result != nil {
+					retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
 					if result.Selected().err == nil || result.terminal {
 						return result
 					}
 					result.releaseAfterUse(handleCtx)
 				}
 			}
+		}
+
+		if !retirementRefreshed && retiredSnapshot && self.canRefreshRetiredSnapshot(dialerGeneration, webSocketOnly) {
+			retirementRefreshed = true
+			continue
 		}
 
 		// the rate limit is important when when the connect timeout is small
@@ -1613,6 +1718,8 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 	// A short hello can establish this operation without becoming lasting
 	// delivery evidence for future races.
 	var discoveredDialer *clientDialer
+	retirementRefreshed := false
+	// keep trying as long as there is time left
 	for {
 		select {
 		case <-handleCtx.Done():
@@ -1622,7 +1729,8 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 
 		self.collapseExtenderDialers()
 
-		dialerWeights := self.dialerWeights(false)
+		dialerWeights, _, dialerGeneration := self.dialerWeightsSnapshot(false)
+		retiredSnapshot := false
 
 		serialDialers := []*clientDialer{}
 
@@ -1648,6 +1756,7 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 			)
 			result := eval(attemptCtx, dialer)
 			if result != nil {
+				retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
 				result.dialer = dialer
 				if result.Selected().err == nil || result.terminal {
 					attemptCancel()
@@ -1667,6 +1776,24 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 				// See parallelEval: a private attempt timeout is a route
 				// failure, not cancellation of the caller's request.
 				dialer.Update(handleCtx, attemptErr)
+			}
+		}
+
+		if !retirementRefreshed && retiredSnapshot && self.canRefreshRetiredSnapshot(dialerGeneration, false) {
+			retirementRefreshed = true
+			continue
+		}
+		if retiredSnapshot {
+			// A successful hello must not bypass pacing when each data
+			// attempt retires its route after the one immediate refresh.
+			reconnect := NewReconnect(self.settings.ReconnectTimeout)
+			if self.reconnectFactory != nil {
+				reconnect = self.reconnectFactory(self.settings.ReconnectTimeout)
+			}
+			select {
+			case <-handleCtx.Done():
+				return nil
+			case <-reconnect.After():
 			}
 		}
 
@@ -1784,7 +1911,13 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 		if err != nil {
 			return causes.track(&evalResult{err: err})
 		}
-		httpClient := dialer.HttpClient()
+		httpClient, httpPool := dialer.acquireHttpClient()
+		if httpClient == nil {
+			if attemptRequest.Body != nil {
+				attemptRequest.Body.Close()
+			}
+			return causes.track(&evalResult{err: errClientDialerRetired})
+		}
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
 		self.observeHttpResponse(handleCtx, info, response, err)
 		if self.log.V(2).Enabled() {
@@ -1797,7 +1930,10 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 
 		dialer.Update(handleCtx, err)
 
-		return causes.track(newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes))
+		result := newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
+		result.dialer = dialer
+		result.httpPool = httpPool
+		return causes.track(result)
 	}
 
 	var preferredHedgeDelay time.Duration
@@ -1849,7 +1985,13 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		if err != nil {
 			return causes.track(&evalResult{err: err})
 		}
-		httpClient := dialer.HttpClient()
+		httpClient, httpPool := dialer.acquireHttpClient()
+		if httpClient == nil {
+			if attemptRequest.Body != nil {
+				attemptRequest.Body.Close()
+			}
+			return causes.track(&evalResult{err: errClientDialerRetired})
+		}
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
 		self.observeHttpResponse(handleCtx, info, response, err)
 		authProgress.responseHeaders(response, err)
@@ -1863,7 +2005,10 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 		dialer.Update(handleCtx, err)
 
-		return causes.track(newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes))
+		result := newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
+		result.dialer = dialer
+		result.httpPool = httpPool
+		return causes.track(result)
 	}
 	helloEval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		info := self.dialerInfo(dialer)
@@ -1871,7 +2016,13 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		if err != nil {
 			return causes.track(&evalResult{err: err})
 		}
-		httpClient := dialer.HttpClient()
+		httpClient, httpPool := dialer.acquireHttpClient()
+		if httpClient == nil {
+			if attemptRequest.Body != nil {
+				attemptRequest.Body.Close()
+			}
+			return causes.track(&evalResult{err: errClientDialerRetired})
+		}
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
 		self.observeHttpResponse(handleCtx, info, response, err)
 		if self.log.V(2).Enabled() {
@@ -1884,7 +2035,10 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 		dialer.Update(handleCtx, err)
 
-		return causes.track(newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes))
+		result := newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
+		result.dialer = dialer
+		result.httpPool = httpPool
+		return causes.track(result)
 	}
 
 	result := self.serialEvalWithAttemptContext(request.Context(), eval, helloEval, preferredHttpAttemptContext)
@@ -2062,6 +2216,7 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 	if len(dropDialers) == 0 {
 		return
 	}
+	retiredDialers := []*clientDialer{}
 	func() {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
@@ -2070,10 +2225,16 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 			if _, ok := self.dialers[dialer]; !ok {
 				continue
 			}
-			dialer.Close()
+			retiredDialers = append(retiredDialers, dialer)
 			delete(self.dialers, dialer)
 		}
+		if len(retiredDialers) != 0 {
+			self.dialerGeneration++
+		}
 	}()
+	for _, dialer := range retiredDialers {
+		dialer.retire()
+	}
 }
 
 // expandExtenderDialers adds one dialer per directory candidate address and
@@ -2104,19 +2265,27 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 	visitedExtenderIpProfiles := map[extenderIpProfile]bool{}
 	visitedExtenderIps := []netip.Addr{}
 	extenderIpSecrets := map[netip.Addr]string{}
+	customExtenderGeneration := uint64(0)
 	maxNewDialerCount := 0
+	retiredDialers := []*clientDialer{}
 	func() {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
+		if self.closed {
+			return
+		}
 
 		if self.extenderSpoofCountryCode != spoofCountryCode {
 			for dialer, _ := range self.dialers {
 				if dialer.IsExtender() && !dialer.persistent {
-					dialer.Close()
+					retiredDialers = append(retiredDialers, dialer)
 					delete(self.dialers, dialer)
 				}
 			}
 			self.extenderSpoofCountryCode = spoofCountryCode
+		}
+		if len(retiredDialers) != 0 {
+			self.dialerGeneration++
 		}
 
 		visitedExtenderProfileCount := 0
@@ -2138,7 +2307,11 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			self.settings.MaxExtenderCount-visitedExtenderProfileCount,
 		)
 		extenderIpSecrets = maps.Clone(self.extenderIpSecrets)
+		customExtenderGeneration = self.customExtenderGeneration
 	}()
+	for _, dialer := range retiredDialers {
+		dialer.retire()
+	}
 	if maxNewDialerCount <= 0 {
 		// at maximum extenders
 		return []*clientDialer{}
@@ -2211,6 +2384,22 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 	func() {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
+		// The returned slice is immediately selectable too; reject stale
+		// construction before either publication or that fast path.
+		if self.closed || customExtenderGeneration != self.customExtenderGeneration || spoofCountryCode != self.extenderSpoofCountryCode {
+			return
+		}
+
+		// Another expansion may have published while candidates were built.
+		// Keep the same address/profile uniqueness at the publication boundary.
+		for dialer := range self.dialers {
+			if extenderConfig := dialer.extenderConfig; extenderConfig != nil {
+				visitedExtenderIpProfiles[extenderIpProfile{
+					ip:      extenderConfig.Ip,
+					profile: extenderConfig.Profile,
+				}] = true
+			}
+		}
 
 		for _, extenderConfig := range extenderConfigs {
 			if maxNewDialerCount <= len(expandedDialers) {
@@ -2236,6 +2425,9 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			}
 			expandedDialers = append(expandedDialers, dialer)
 			self.dialers[dialer] = true
+		}
+		if len(expandedDialers) != 0 {
+			self.dialerGeneration++
 		}
 	}()
 
@@ -2406,7 +2598,11 @@ type clientDialer struct {
 	limitedUntil time.Time
 
 	httpClient      *http.Client
+	httpPool        *clientHttpPool
 	websocketDialer *websocket.Dialer
+	// Retired dialers can still be held by an evaluation snapshot. They may
+	// finish an acquired request, but must never construct another HTTP pool.
+	retired bool
 
 	settings *ClientStrategySettings
 }
@@ -2437,13 +2633,43 @@ func (self *clientDialer) Info() *DialerInfo {
 	return info
 }
 
+var errClientDialerRetired = errors.New("client dialer retired")
+
+// Returns the reusable HTTP owner, or nil after terminal retirement. Pool
+// resets remain reusable; an acquired request releases its owner after the
+// complete response has been materialized.
 func (self *clientDialer) HttpClient() *http.Client {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
+	return self.httpClientWithLock()
+}
+
+// The evaluation lease covers lazy response consumption and cancellation,
+// not just the client.Do call that returns response headers.
+func (self *clientDialer) acquireHttpClient() (*http.Client, *clientHttpPool) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	httpClient := self.httpClientWithLock()
+	if httpClient == nil || !self.httpPool.acquire() {
+		return nil, nil
+	}
+	return httpClient, self.httpPool
+}
+
+// Constructs one owner with the cached client under the dialer lock.
+func (self *clientDialer) httpClientWithLock() *http.Client {
+	if self.retired {
+		return nil
+	}
+	if self.httpPool == nil {
+		self.httpPool = newClientHttpPool()
+		self.httpPool.httpClient = self.httpClient
+	}
 
 	if self.httpClient == nil {
 		if self.httpClientFactory != nil {
 			self.httpClient = self.httpClientFactory()
+			self.httpPool.httpClient = self.httpClient
 			return self.httpClient
 		}
 		dialTlsContext := self.httpDialTlsContext
@@ -2456,7 +2682,7 @@ func (self *clientDialer) HttpClient() *http.Client {
 		// egress_dial.go; a no-op everywhere else.
 		dialTlsContext = wrapControlDial("api", self.settings.ConnectSettings.Log, true, dialTlsContext)
 		transport := &http.Transport{
-			DialTLSContext:        dialTlsContext,
+			DialTLSContext:        self.httpPool.dialContext(dialTlsContext, true),
 			IdleConnTimeout:       self.settings.ConnectSettings.IdleConnTimeout,
 			TLSHandshakeTimeout:   self.settings.ConnectSettings.TlsTimeout,
 			ResponseHeaderTimeout: self.settings.ConnectTimeout,
@@ -2508,14 +2734,15 @@ func (self *clientDialer) HttpClient() *http.Client {
 		// The shared settings dial goes straight to the destination, which for
 		// an extender dialer is the one thing it must not do.
 		if self.dialContext != nil {
-			transport.DialContext = self.dialContext
+			transport.DialContext = self.httpPool.dialContext(self.dialContext, false)
 		} else {
-			transport.DialContext = self.settings.ConnectSettings.DialContext
+			transport.DialContext = self.httpPool.dialContext(self.settings.ConnectSettings.DialContext, false)
 		}
 		self.httpClient = &http.Client{
 			Transport: transport,
 			Timeout:   self.settings.RequestTimeout,
 		}
+		self.httpPool.httpClient = self.httpClient
 	}
 	return self.httpClient
 }
@@ -2747,21 +2974,45 @@ func (self *clientDialer) String() string {
 	}
 }
 
+// Resets the pooled owner while leaving the dialer available after a network
+// change. Requests that already acquired the old owner release it separately.
 func (self *clientDialer) Close() {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-
-	if self.httpClient != nil {
-		self.httpClient.CloseIdleConnections()
+	httpPool := func() *clientHttpPool {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		httpPool := self.httpPool
+		if httpPool == nil && self.httpClient != nil {
+			httpPool = newClientHttpPool()
+			httpPool.httpClient = self.httpClient
+		}
 		self.httpClient = nil
+		self.httpPool = nil
+		return httpPool
+	}()
+	if httpPool != nil {
+		httpPool.retire()
 	}
 }
 
+// Permanently removes the pool owner. An evaluation that already acquired
+// it may finish; the last result releases the retired pool's native streams.
+func (self *clientDialer) retire() {
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		self.retired = true
+	}()
+	self.Close()
+}
+
 func (self *clientDialer) shedMemory() {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	if self.httpClient != nil {
-		self.httpClient.CloseIdleConnections()
+	httpClient := func() *http.Client {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		return self.httpClient
+	}()
+	if httpClient != nil {
+		httpClient.CloseIdleConnections()
 	}
 }
 

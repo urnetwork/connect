@@ -1840,9 +1840,13 @@ func (self *PlatformTransport) run() {
 	defer func() {
 		self.cancel()
 		self.runWaitGroup.Wait()
+		// Keep H1 admission until every mode has closed its native graph.
+		// A separate later defer would release it before this join.
+		self.h1BudgetReservation.Release()
+		// H3 may never start when required H1 admission is canceled.
+		self.h3BudgetReservation.Release()
 	}()
 	if self.h1BudgetReservation != nil {
-		defer self.h1BudgetReservation.Release()
 		if !self.h1BudgetReservation.Acquire(self.ctx) {
 			return
 		}
