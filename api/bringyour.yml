@@ -1262,9 +1262,9 @@ paths:
         JWT's client when given.
 
         Usage counts the billable bytes the client consumes, including its
-        child clients, and is accounted when transfer contracts settle, so a
-        client can pass a cap by up to the size of its contracts still in
-        flight. `capped` is true once a cap is reached; the client then gets no
+        child clients. It is accounted when transfer contracts settle and
+        rolled up within about two minutes, so a client can pass a cap by up
+        to the size of its contracts still in flight. `capped` is true once a cap is reached; the client then gets no
         new transfer contracts until the monthly period rolls over, the cap is
         raised or cleared, or the running total is reset.
       operationId: getNetworkClientDataCap
@@ -7965,8 +7965,11 @@ components:
           type: integer
           format: int64
         total_period_start:
-          description: When the running total last reset, or began.
-          type: string
+          description: |
+            When the running total began: the client's first cap request, or its
+            last `reset_total`. `null` for a client that has never had a cap
+            request.
+          type: [string, "null"]
           format: date-time
         capped:
           description: True when the client has reached a cap and gets no new transfer contracts.
