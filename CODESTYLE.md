@@ -184,6 +184,7 @@ from a different-language reproduction without cross-validating it in Go.
 
 ## Locking
 
+- Never nest database transactions. A model function running inside a caller's transaction must call the callee's `...InTx` variant and pass that same transaction; it must not call a model entry point that opens another transaction, directly or through helpers. Keep transaction creation at the outer boundary, and add an `...InTx` variant when one is missing.
 - Minimize contention wherever possible; allow eventual consistency and asynchronous exception cleanup when they reduce contention, and document the consistency tradeoff and recovery behavior.
 - Functions that are expected to be called with one or more state locks should be named "*WithLock". Inversely, functions that do not have "*WithLock" should expect to be called with no state locks.
 - Operations on locked state should be as tightly scoped as possible.
