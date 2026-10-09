@@ -18,16 +18,19 @@ package protocol_test
 // The collision still exists in any binary that links connect and the message module, because
 // message.proto keeps its proto package and its message names. The message repository checks
 // that these names still diverge from those messages; here the names are pinned by the
-// transcription below. The last two tests check that connect registers neither the schema nor any
-// name the schema declared.
+// transcription below. The last three tests check that connect registers neither the schema nor
+// any name the schema declared, in every proto file of the repository, whichever directory protoc
+// ran in when it generated the file.
 
 import (
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
@@ -276,6 +279,58 @@ func messagingSchemaNamesDeclaredIn(t *testing.T, files *protoregistry.Files) []
 	return declared
 }
 
+// What keeps the paths a binary registers in proto package bringyour and the proto files of the
+// repository from pairing off one to one, sorted. Both lists are slash-separated, and the proto
+// files and packageDir are counted from the repository root.
+//
+// protoc registers a file under its path from its include directory, which is the directory it
+// runs in, by default and in protocol/Makefile (-I=.). With paths=source_relative, which the
+// Makefile also sets, it writes the generated code beside the proto file, so a file a go package
+// registers is a proto file of that package's own directory. The directory in a registered path
+// is then the part of the package's directory below where protoc ran: none of it when protoc ran
+// in the package's directory, as the Makefile does, and all of it when protoc ran at the
+// repository root. A registered path with any other directory names no file of the package.
+//
+// A proto file left without a registered path is one whose names no lookup reads, wherever it is
+// and whatever it is called: a second frame.proto outside the package is not the registered one.
+func protoFileScopeProblems(packageDir string, registeredPaths []string, protoFilePaths []string) []string {
+	problems := []string{}
+	protoFilePathRegisteredPaths := map[string][]string{}
+	for _, registeredPath := range registeredPaths {
+		// the directory protoc ran in: the package's, less the directory it registered
+		protocDir := ""
+		switch registeredDir := path.Dir(registeredPath); {
+		case registeredDir == ".":
+			protocDir = packageDir
+		case registeredDir == packageDir:
+			// the repository root
+		case strings.HasSuffix(packageDir, "/"+registeredDir):
+			protocDir = strings.TrimSuffix(packageDir, "/"+registeredDir)
+		default:
+			problems = append(problems, fmt.Sprintf("this binary registers %s in proto package bringyour, and %s is neither this package's directory, %s, nor the end of it, so that path names no proto file of this package", registeredPath, registeredDir, packageDir))
+			continue
+		}
+		protoFilePath := path.Join(protocDir, registeredPath)
+		protoFilePathRegisteredPaths[protoFilePath] = append(protoFilePathRegisteredPaths[protoFilePath], registeredPath)
+	}
+	for protoFilePath, fileRegisteredPaths := range protoFilePathRegisteredPaths {
+		registered := strings.Join(fileRegisteredPaths, " and ")
+		if !slices.Contains(protoFilePaths, protoFilePath) {
+			problems = append(problems, fmt.Sprintf("this binary registers %s in proto package bringyour, which is %s in the repository, and the repository holds no such proto file", registered, protoFilePath))
+		}
+		if 1 < len(fileRegisteredPaths) {
+			problems = append(problems, fmt.Sprintf("this binary registers %s in proto package bringyour, and each is %s in the repository, which only one of them was generated from", registered, protoFilePath))
+		}
+	}
+	for _, protoFilePath := range protoFilePaths {
+		if _, ok := protoFilePathRegisteredPaths[protoFilePath]; !ok {
+			problems = append(problems, fmt.Sprintf("%s is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package", protoFilePath))
+		}
+	}
+	slices.Sort(problems)
+	return problems
+}
+
 // The messaging schema is registered by github.com/urnetwork/message/protocol and by nothing in
 // connect. Two registrations of message.proto in one process are a conflict that protobuf-go
 // panics on at init, so a copy left or restored here, for example by merging a branch from before
@@ -285,20 +340,32 @@ func messagingSchemaNamesDeclaredIn(t *testing.T, files *protoregistry.Files) []
 // test would notice, because no connect binary links the message module. The names are looked up
 // in every proto file this repository holds: the files are found by walking the repository, and
 // each has to be one this binary registers, so a proto file this package does not generate cannot
-// declare a name unread.
+// declare a name unread. protoFileScopeProblems pairs the two, by the path each file is registered
+// under.
 func TestConnectRegistersNoMessagingSchema(t *testing.T) {
-	// control: the same lookups find what connect does register
-	if _, err := protoregistry.GlobalFiles.FindFileByPath(protocol.File_frame_proto.Path()); err != nil {
-		t.Fatalf("%s is not registered, so the lookups below prove nothing: %v", protocol.File_frame_proto.Path(), err)
+	// control: the walk of the registry and the lookup by name find what connect does register.
+	// frame.proto is reached through its generated enum type and not through File_frame_proto,
+	// because that variable is named after the path the file is registered under
+	frameFile := protocol.MessageType(0).Descriptor().ParentFile()
+	registeredFiles := []protoreflect.FileDescriptor{}
+	protoregistry.GlobalFiles.RangeFiles(func(file protoreflect.FileDescriptor) bool {
+		registeredFiles = append(registeredFiles, file)
+		return true
+	})
+	if !slices.ContainsFunc(registeredFiles, func(file protoreflect.FileDescriptor) bool {
+		return file.Path() == frameFile.Path()
+	}) {
+		t.Fatalf("the walk of the registry did not return %s, so the checks below prove nothing", frameFile.Path())
 	}
 	messageTypeEnum(t)
 
 	// the scope: every proto file of the repository, against the files this binary registers in
 	// proto package bringyour
-	root, err := filepath.Abs(".")
+	here, err := filepath.Abs(".")
 	if err != nil {
 		t.Fatalf("resolve this package's own directory: %v", err)
 	}
+	root := here
 	for {
 		if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
 			break
@@ -309,55 +376,163 @@ func TestConnectRegistersNoMessagingSchema(t *testing.T) {
 		}
 		root = parent
 	}
-	protoFiles := []string{}
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+	protoFilePaths := []string{}
+	err = filepath.WalkDir(root, func(walkPath string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if entry.IsDir() || filepath.Ext(path) != ".proto" {
+		if entry.IsDir() || filepath.Ext(walkPath) != ".proto" {
 			return nil
 		}
-		relative, err := filepath.Rel(root, path)
+		relative, err := filepath.Rel(root, walkPath)
 		if err != nil {
 			return err
 		}
-		protoFiles = append(protoFiles, filepath.ToSlash(relative))
+		protoFilePaths = append(protoFilePaths, filepath.ToSlash(relative))
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("walk %s for proto files: %v", root, err)
 	}
-	registered := []string{}
-	protoregistry.GlobalFiles.RangeFilesByPackage("bringyour", func(file protoreflect.FileDescriptor) bool {
-		registered = append(registered, "protocol/"+file.Path())
-		return true
-	})
-	slices.Sort(protoFiles)
-	slices.Sort(registered)
-	if !slices.Contains(protoFiles, "protocol/"+protocol.File_frame_proto.Path()) {
-		t.Fatalf("the walk of %s found the proto files %v, which do not hold frame.proto, so it did not read this repository", root, protoFiles)
+	packageDir, err := filepath.Rel(root, here)
+	if err != nil {
+		t.Fatalf("resolve this package's directory in the repository: %v", err)
 	}
-	for _, file := range protoFiles {
-		if !slices.Contains(registered, file) {
-			t.Errorf("%s is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package", file)
+	packageDir = filepath.ToSlash(packageDir)
+	registeredPaths := []string{}
+	for _, file := range registeredFiles {
+		if file.Package() == "bringyour" {
+			registeredPaths = append(registeredPaths, file.Path())
 		}
 	}
-	for _, file := range registered {
-		if !slices.Contains(protoFiles, file) {
-			t.Errorf("this binary registers %s in proto package bringyour, and the repository holds no such proto file", file)
-		}
+	slices.Sort(protoFilePaths)
+	slices.Sort(registeredPaths)
+	if !slices.Contains(protoFilePaths, path.Join(packageDir, path.Base(frameFile.Path()))) {
+		t.Fatalf("the walk of %s found the proto files %v, which do not hold frame.proto, so it did not read this repository", root, protoFilePaths)
 	}
-	t.Logf("the names are looked up in the %d proto files of this repository: %v", len(protoFiles), protoFiles)
+	for _, problem := range protoFileScopeProblems(packageDir, registeredPaths, protoFilePaths) {
+		t.Error(problem)
+	}
+	t.Logf("the names are looked up in the %d proto files of this repository: %v, registered as %v", len(protoFilePaths), protoFilePaths, registeredPaths)
 
-	if file, err := protoregistry.GlobalFiles.FindFileByPath("message.proto"); err == nil {
-		t.Errorf("connect registers message.proto (proto package %s); the messaging schema belongs to github.com/urnetwork/message/protocol", file.Package())
-	} else if !errors.Is(err, protoregistry.NotFound) {
-		t.Errorf("looking up message.proto: %v", err)
+	// message.proto under any directory: generated at the repository root, a restored schema is
+	// registered as protocol/message.proto, which a lookup of the path message.proto does not find
+	for _, file := range registeredFiles {
+		if file.Path() == "message.proto" || (file.Package() == "bringyour" && path.Base(file.Path()) == "message.proto") {
+			t.Errorf("connect registers %s (proto package %s); the messaging schema belongs to github.com/urnetwork/message/protocol", file.Path(), file.Package())
+		}
 	}
 	for _, declared := range messagingSchemaNamesDeclaredIn(t, protoregistry.GlobalFiles) {
 		t.Errorf("%s; message.proto declared that name, and the two schemas share proto package bringyour, so a binary that links connect and github.com/urnetwork/message/protocol panics at init on the second declaration", declared)
 	}
 	t.Logf("looked up the %d names message.proto declared", len(messagingSchemaNames))
+}
+
+// Controls the pairing of registered paths and proto files against lists planted here, in both
+// directions. The two ways connect's files are registered pair off, in a package at any depth.
+// Each way the pairing breaks is reported for the path that breaks it, and for no other.
+func TestTheProtoFileScopeFollowsTheRegisteredPath(t *testing.T) {
+	cases := []struct {
+		name            string
+		packageDir      string
+		registeredPaths []string
+		protoFilePaths  []string
+		problems        []string
+	}{
+		{
+			name:            "every file generated in the package's directory, as protocol/Makefile generates them",
+			packageDir:      "protocol",
+			registeredPaths: []string{"audit.proto", "frame.proto"},
+			protoFilePaths:  []string{"protocol/audit.proto", "protocol/frame.proto"},
+			problems:        []string{},
+		},
+		{
+			// the case the check once failed: it put the package's directory before every
+			// registered path, and so looked for protocol/protocol/extender.proto
+			name:            "one file generated at the repository root, as extender.proto is",
+			packageDir:      "protocol",
+			registeredPaths: []string{"frame.proto", "protocol/extender.proto"},
+			protoFilePaths:  []string{"protocol/extender.proto", "protocol/frame.proto"},
+			problems:        []string{},
+		},
+		{
+			name:            "a package two directories down, generated in its own directory and in each one above it",
+			packageDir:      "wire/protocol",
+			registeredPaths: []string{"audit.proto", "protocol/frame.proto", "wire/protocol/ip.proto"},
+			protoFilePaths:  []string{"wire/protocol/audit.proto", "wire/protocol/frame.proto", "wire/protocol/ip.proto"},
+			problems:        []string{},
+		},
+		{
+			name:            "a proto file in the package's directory that nothing registers",
+			packageDir:      "protocol",
+			registeredPaths: []string{"frame.proto"},
+			protoFilePaths:  []string{"protocol/frame.proto", "protocol/unregistered.proto"},
+			problems: []string{
+				"protocol/unregistered.proto is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package",
+			},
+		},
+		{
+			// a registered path is not matched to whichever file ends with it
+			name:            "proto files outside the package's directory, each ending with a registered path",
+			packageDir:      "protocol",
+			registeredPaths: []string{"frame.proto", "protocol/extender.proto"},
+			protoFilePaths:  []string{"elsewhere/frame.proto", "elsewhere/protocol/extender.proto", "protocol/extender.proto", "protocol/frame.proto"},
+			problems: []string{
+				"elsewhere/frame.proto is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package",
+				"elsewhere/protocol/extender.proto is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package",
+			},
+		},
+		{
+			name:            "registered paths whose proto files the repository does not hold",
+			packageDir:      "protocol",
+			registeredPaths: []string{"frame.proto", "gone.proto", "protocol/moved.proto"},
+			protoFilePaths:  []string{"elsewhere/gone.proto", "moved.proto", "protocol/frame.proto"},
+			problems: []string{
+				"elsewhere/gone.proto is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package",
+				"moved.proto is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package",
+				"this binary registers gone.proto in proto package bringyour, which is protocol/gone.proto in the repository, and the repository holds no such proto file",
+				"this binary registers protocol/moved.proto in proto package bringyour, which is protocol/moved.proto in the repository, and the repository holds no such proto file",
+			},
+		},
+		{
+			name:            "a registered directory that is not the package's",
+			packageDir:      "protocol",
+			registeredPaths: []string{"elsewhere/frame.proto"},
+			protoFilePaths:  []string{"elsewhere/frame.proto", "protocol/frame.proto"},
+			problems: []string{
+				"elsewhere/frame.proto is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package",
+				"protocol/frame.proto is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package",
+				"this binary registers elsewhere/frame.proto in proto package bringyour, and elsewhere is neither this package's directory, protocol, nor the end of it, so that path names no proto file of this package",
+			},
+		},
+		{
+			// the end of a directory is whole path elements, and no more of them than it has
+			name:            "registered directories that end like the package's and are not its end",
+			packageDir:      "wire/protocol",
+			registeredPaths: []string{"protocol/protocol/ip.proto", "re/protocol/frame.proto"},
+			protoFilePaths:  []string{"wire/protocol/frame.proto", "wire/protocol/ip.proto"},
+			problems: []string{
+				"this binary registers protocol/protocol/ip.proto in proto package bringyour, and protocol/protocol is neither this package's directory, wire/protocol, nor the end of it, so that path names no proto file of this package",
+				"this binary registers re/protocol/frame.proto in proto package bringyour, and re/protocol is neither this package's directory, wire/protocol, nor the end of it, so that path names no proto file of this package",
+				"wire/protocol/frame.proto is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package",
+				"wire/protocol/ip.proto is a proto file this binary does not register, so the names it declares are not looked up below; generate it into this package",
+			},
+		},
+		{
+			name:            "one proto file registered twice, once from each directory",
+			packageDir:      "protocol",
+			registeredPaths: []string{"frame.proto", "protocol/frame.proto"},
+			protoFilePaths:  []string{"protocol/frame.proto"},
+			problems: []string{
+				"this binary registers frame.proto and protocol/frame.proto in proto package bringyour, and each is protocol/frame.proto in the repository, which only one of them was generated from",
+			},
+		},
+	}
+	for _, c := range cases {
+		if problems := protoFileScopeProblems(c.packageDir, c.registeredPaths, c.protoFilePaths); !slices.Equal(problems, c.problems) {
+			t.Errorf("%s: reported %q, want %q", c.name, problems, c.problems)
+		}
+	}
 }
 
 // Controls the name check against a registry built here, in both directions: a file in proto
