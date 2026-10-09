@@ -180,63 +180,6 @@ paths:
       operationId: privacyTxt
       security: []
       responses:
-        "303":
-          description: Redirect to https://bringyour.com/privacy.txt
-          headers:
-            Location:
-              schema:
-                type: string
-
-  /terms.txt:
-    get:
-      tags: [Other]
-      summary: Terms Txt
-      description: |
-        Redirect (303) to the canonical terms of service on bringyour.com.
-      operationId: termsTxt
-      security: []
-      responses:
-        "303":
-          description: Redirect to https://bringyour.com/terms.txt
-          headers:
-            Location:
-              schema:
-                type: string
-
-  /vdp.txt:
-    get:
-      tags: [Other]
-      summary: Vdp Txt
-      description: |
-        Redirect (303) to the vulnerability disclosure policy on
-        bringyour.com.
-      operationId: vdpTxt
-      security: []
-      responses:
-        "303":
-          description: Redirect to https://bringyour.com/vdp.txt
-          headers:
-            Location:
-              schema:
-                type: string
-
-  /status:
-    get:
-      tags: [Other]
-      summary: Warp Status
-      description: |
-        The serving status of the api process that answered, used by the
-        deploy poll and by fleet status sampling. `status` is a latched value
-        rather than a per-request health check, so this route stays O(1) and
-        never couples a deploy poll to database load: "ok" while the process
-        serves, a string beginning `error` while it is not ready (which fails
-        a deploy poll), and "draining" from SIGTERM onwards (deliberately not
-        an error, so an operator-initiated drain is not counted as a service
-        error). `host`, `service` and `block` name the process that answered,
-        and `client_address` is the caller address it observed.
-      operationId: warpStatus
-      security: []
-      responses:
         "200":
           description: OK.
           content:
@@ -1133,8 +1076,11 @@ paths:
       summary: Auth Code Login
       description: |
         Authenticate with an auth code.
-        The returned session is tied to the session that created the auth code,
-        and will be expired with any of the creator's sessions.
+        Redemption creates an independent sign-in. An unredeemed code is
+        invalidated when its creator's session is revoked; a completed
+        redemption is governed by its own session thereafter. Reuse the same
+        request_id after a lost response. Reusing it with another code returns
+        a generic request_id_conflict without exposing the prior redemption.
         This is a subset of an OAuth flow.
       operationId: authCodeLogin
       security: []
@@ -1151,6 +1097,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthCodeLoginResult"
+        "409":
+          description: The request_id was already used with a different auth code (request_id_conflict).
 
   /auth/add-auth:
     post:
@@ -1974,6 +1922,179 @@ paths:
                 $ref: "#/components/schemas/ExtenderPingReportResult"
         "401":
           description: Missing or invalid client bearer token.
+
+  /network/sessions:
+    get:
+      tags: [Network]
+      summary: List tracked sign-ins
+      operationId: networkSessions
+      description: |
+        Requires a network JWT or account API key. Returns all tracked,
+        non-revoked sessions still inside the acceptance horizon, current
+        first. Untagged historical JWTs have partial coverage and cannot be
+        individually revoked. Last use is sampled authenticated activity,
+        not presence; it may lag ongoing use by 120 seconds plus polling.
+      parameters:
+        - $ref: "#/components/parameters/ClientInfo"
+      responses:
+        "200":
+          description: Complete tracked session inventory (at most 1000).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkSessionsResult"
+        "401":
+          description: Current sign-in is no longer valid.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Authentication or session storage is temporarily unavailable. Keep credentials and retry.
+
+  /network/revoke-session:
+    post:
+      tags: [Network]
+      summary: Revoke a tracked sign-in
+      operationId: networkRevokeSession
+      description: |
+        A network JWT or account API key may revoke one tracked session,
+        including its own. Reuse the operation ID after an ambiguous result.
+        Revocation removes the session from inventory atomically; associated
+        client cleanup is durable and may finish later. Limit 100 new actions
+        per network per day; replay and confirmed no-op are free.
+      parameters:
+        - $ref: "#/components/parameters/ClientInfo"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevokeNetworkSessionArgs"
+      responses:
+        "200":
+          description: Authoritative outcome and durable cleanup progress.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionOperationResult"
+        "202":
+          description: Prepared operation pending enforcement; poll with the same operation_id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionOperationResult"
+        "400":
+          description: Malformed session or operation ID.
+        "401":
+          description: Current sign-in is no longer valid.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "404":
+          description: Session is unknown or expired in this network.
+        "409":
+          description: Operation ID was already used for a different action.
+        "429":
+          description: Daily operation quota reached; honor Retry-After.
+        "503":
+          description: Dependency unavailable and enforcement outcome unknown; retain operation_id and credentials for retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionOperationResult"
+
+  /network/revoke-other-sessions:
+    post:
+      tags: [Network]
+      summary: Revoke other tracked sign-ins
+      operationId: networkRevokeOtherSessions
+      description: |
+        Requires a tagged network JWT; the kept ID comes only from that JWT.
+        Untagged credentials must refresh first (session_upgrade_required).
+        API keys and unsigned OAuth identities have no current sign-in
+        (current_session_required). One atomic cutoff revokes every other
+        tracked session. A later independent sign-in remains allowed. Limit
+        20 new actions per network per day; reuse operation_id on retry.
+      parameters:
+        - $ref: "#/components/parameters/ClientInfo"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevokeOtherNetworkSessionsArgs"
+      responses:
+        "200":
+          description: Authoritative outcome and durable cleanup progress.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionOperationResult"
+        "202":
+          description: Prepared operation pending enforcement; poll with the same operation_id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionOperationResult"
+        "400":
+          description: Malformed operation ID.
+        "401":
+          description: Current sign-in is no longer valid.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "409":
+          description: A tagged current sign-in is required, or the operation ID conflicts.
+        "429":
+          description: Daily operation quota reached; honor Retry-After.
+        "503":
+          description: Dependency unavailable and enforcement outcome unknown; retain operation_id and credentials for retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionOperationResult"
+
+  /network/session-operations/{operation_id}:
+    get:
+      tags: [Network]
+      summary: Recover a session revocation outcome
+      operationId: networkSessionOperation
+      description: |
+        Requires current network authentication. Returns only this network's
+        operation. A self-revoked caller may get 401 while the worker completes
+        its durable cleanup. Prepared work is pending; enforcement is success
+        even when client cleanup has not finished.
+      parameters:
+        - in: path
+          name: operation_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Authoritative outcome and durable cleanup progress.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionOperationResult"
+        "202":
+          description: Prepared operation pending enforcement; poll with the same operation_id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionOperationResult"
+        "400":
+          description: Malformed operation ID.
+        "401":
+          description: Current sign-in is no longer valid.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "404":
+          description: Operation does not exist in this network.
+        "503":
+          description: Dependency unavailable and enforcement outcome unknown; retain operation_id and credentials for retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionOperationResult"
 
   /network/clients:
     get:
@@ -7572,6 +7693,18 @@ paths:
 
 components:
   parameters:
+    ClientInfo:
+      in: header
+      name: X-UR-ClientInfo
+      required: false
+      description: |
+        Optional JSON ClientInfo v1, at most 512 UTF-8 bytes. Advisory display
+        metadata only. Duplicate headers/fields, unsupported version or invalid
+        fields become unknown metadata without rejecting authentication.
+        App and SDK version strings are at most 64 UTF-8 bytes.
+      schema:
+        type: string
+      example: '{"v":1,"device_type":"android","app_version":"1.2.3","sdk_version":"1.2.3"}'
     ProviderWorkDomain:
       in: query
       name: domain
@@ -7594,6 +7727,84 @@ components:
       required: true
       description: 64 hex digits, the SDK client's public key.
   responses:
+    SessionOperationResult:
+      description: Authoritative outcome, including asynchronous cleanup progress.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SessionOperationResult"
+    SessionOperationPending:
+      description: Prepared operation pending enforcement. Poll its status and retain operation_id.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SessionOperationResult"
+    SessionOperationUnavailable:
+      description: |
+        Dependency unavailable; enforcement outcome is unknown. The safe body
+        retains operation_id with status/state unknown. Do not sign out; poll
+        or retry the same operation ID after Retry-After.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SessionOperationResult"
+        "303":
+          description: Redirect to https://bringyour.com/privacy.txt
+          headers:
+            Location:
+              schema:
+                type: string
+
+  /terms.txt:
+    get:
+      tags: [Other]
+      summary: Terms Txt
+      description: |
+        Redirect (303) to the canonical terms of service on bringyour.com.
+      operationId: termsTxt
+      security: []
+      responses:
+        "303":
+          description: Redirect to https://bringyour.com/terms.txt
+          headers:
+            Location:
+              schema:
+                type: string
+
+  /vdp.txt:
+    get:
+      tags: [Other]
+      summary: Vdp Txt
+      description: |
+        Redirect (303) to the vulnerability disclosure policy on
+        bringyour.com.
+      operationId: vdpTxt
+      security: []
+      responses:
+        "303":
+          description: Redirect to https://bringyour.com/vdp.txt
+          headers:
+            Location:
+              schema:
+                type: string
+
+  /status:
+    get:
+      tags: [Other]
+      summary: Warp Status
+      description: |
+        The serving status of the api process that answered, used by the
+        deploy poll and by fleet status sampling. `status` is a latched value
+        rather than a per-request health check, so this route stays O(1) and
+        never couples a deploy poll to database load: "ok" while the process
+        serves, a string beginning `error` while it is not ready (which fails
+        a deploy poll), and "draining" from SIGTERM onwards (deliberately not
+        an error, so an operator-initiated drain is not counted as a service
+        error). `host`, `service` and `block` name the process that answered,
+        and `client_address` is the caller address it observed.
+      operationId: warpStatus
+      security: []
+      responses:
     ClientJwtRefused:
       description: |
         The bearer token is a client JWT (`by_client_jwt`, from
@@ -7683,6 +7894,146 @@ components:
         these routes.
 
   schemas:
+    ClientInfo:
+      type: object
+      required: [v, device_type, app_version]
+      properties:
+        v:
+          type: integer
+          const: 1
+        device_type:
+          type: string
+          enum: [android, ios, macos, windows, linux, web, cli, server, unknown]
+        app_version:
+          type: string
+          maxLength: 64
+        sdk_version:
+          type: string
+          maxLength: 64
+    SessionLastUsed:
+      type: object
+      required: [unix_time, city, region, country, country_code, device_type, app_version]
+      properties:
+        unix_time:
+          type: integer
+          format: int64
+          description: Server-observed UTC Unix seconds.
+        city:
+          type: string
+        region:
+          type: string
+        country:
+          type: string
+          description: GeoLite2 English country name, or empty.
+        country_code:
+          type: string
+          description: Lower-case ISO alpha-2, or empty.
+        device_type:
+          type: string
+        app_version:
+          type: string
+    NetworkSessionInfo:
+      type: object
+      required: [session_id, current, kind, create_time, last_mint_time, token_expire_time, accept_until, origin_session_id, last_used]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        current:
+          type: boolean
+        kind:
+          type: string
+        create_time:
+          type: string
+          format: date-time
+        last_mint_time:
+          type: string
+          format: date-time
+        token_expire_time:
+          type: string
+          format: date-time
+        accept_until:
+          type: string
+          format: date-time
+          description: Terminal effective horizon, including permitted grace and descendant mints.
+        origin_session_id:
+          type: [string, "null"]
+          format: uuid
+        last_used:
+          oneOf:
+            - $ref: "#/components/schemas/SessionLastUsed"
+            - type: "null"
+    NetworkSessionsResult:
+      type: object
+      required: [sessions, generation, event_id, current_session_id, legacy_coverage]
+      properties:
+        sessions:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/NetworkSessionInfo"
+        generation:
+          type: string
+          format: uuid
+        event_id:
+          type: integer
+          format: int64
+        current_session_id:
+          type: [string, "null"]
+          format: uuid
+        legacy_coverage:
+          type: string
+          const: partial
+    RevokeNetworkSessionArgs:
+      type: object
+      required: [session_id, operation_id]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        operation_id:
+          type: string
+          format: uuid
+    RevokeOtherNetworkSessionsArgs:
+      type: object
+      required: [operation_id]
+      properties:
+        operation_id:
+          type: string
+          format: uuid
+    SessionOperationResult:
+      type: object
+      required: [operation_id, status]
+      properties:
+        operation_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [revoked, already_revoked, pending, cancelled, failed, unknown]
+        state:
+          type: string
+          enum: [prepared, enforced, complete, cancelled, failed, unknown]
+        session_id:
+          type: [string, "null"]
+          format: uuid
+        kept_session_id:
+          type: [string, "null"]
+          format: uuid
+        revoked_count:
+          type: integer
+        cleanup_pending:
+          type: boolean
+        generation:
+          type: string
+          format: uuid
+        event_id:
+          type: integer
+          format: int64
+        code:
+          type: string
+        error:
+          type: string
     ClockResult:
       type: object
       required:
@@ -8279,6 +8630,7 @@ components:
               type: string
 
     AuthCodeCreateArgs:
+      description: Codes expire no later than their creator session acceptance horizon and 24 hours. Initial redemption is fenced by creator revocation; a completed independent sign-in is not.
       type: object
       required: []
       properties:
@@ -8325,6 +8677,10 @@ components:
       properties:
         auth_code:
           type: string
+        request_id:
+          type: [string, "null"]
+          format: uuid
+          description: Stable redemption identity reused after a lost response; redemption creates an independent sign-in.
 
     AuthCodeLoginResult:
       type: object

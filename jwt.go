@@ -5,10 +5,12 @@ import (
 )
 
 type ByJwt struct {
-	UserId      Id
-	NetworkName string
-	NetworkId   Id
-	ClientId    Id
+	UserId       Id
+	NetworkName  string
+	NetworkId    Id
+	ClientId     Id
+	SessionId    *Id
+	RootClientId *Id
 }
 
 func ParseByJwtUnverified(byJwtStr string) (*ByJwt, error) {
@@ -22,24 +24,29 @@ func ParseByJwtUnverified(byJwtStr string) (*ByJwt, error) {
 
 	byJwt := &ByJwt{}
 
-	if userIdStr, ok := claims["user_id"]; ok {
-		if userId, err := ParseId(userIdStr.(string)); err == nil {
-			byJwt.UserId = userId
+	readId := func(name string) *Id {
+		value, ok := claims[name].(string)
+		if !ok {
+			return nil
 		}
-	}
-	if networkName, ok := claims["network_name"]; ok {
-		byJwt.NetworkName = networkName.(string)
-	}
-	if networkIdStr, ok := claims["network_name"]; ok {
-		if networkId, err := ParseId(networkIdStr.(string)); err == nil {
-			byJwt.NetworkId = networkId
+		id, err := ParseId(value)
+		if err != nil {
+			return nil
 		}
+		return &id
 	}
-	if clientIdStr, ok := claims["client_id"]; ok {
-		if clientId, err := ParseId(clientIdStr.(string)); err == nil {
-			byJwt.ClientId = clientId
-		}
+	if id := readId("user_id"); id != nil {
+		byJwt.UserId = *id
 	}
+	if id := readId("network_id"); id != nil {
+		byJwt.NetworkId = *id
+	}
+	if id := readId("client_id"); id != nil {
+		byJwt.ClientId = *id
+	}
+	byJwt.NetworkName, _ = claims["network_name"].(string)
+	byJwt.SessionId = readId("session_id")
+	byJwt.RootClientId = readId("root_client_id")
 
 	return byJwt, nil
 }

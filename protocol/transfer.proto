@@ -321,6 +321,8 @@ message Auth {
     // this frame (H3, DNS-carried H3 and the legacy H1 first frame). An old
     // server ignores the unknown field, which counts as no intent.
     bool provide_intent = 7;
+    string client_info = 8;
+    uint32 stream_lease_version = 9;
 }
 
 
@@ -356,6 +358,9 @@ message ProvideKey {
 // including the first and last hops
 // this is sent each time a stream contract is created
 message StreamOpen {
+    bytes authorization_generation = 4;
+    uint32 authorization_lease_millis = 5;
+    int64 authorization_deadline_unix_millis = 6;
     // ulid
     optional bytes source_id = 2;
     // ulid
@@ -367,6 +372,7 @@ message StreamOpen {
 // each hop on the stream receives this to configure its state
 // this is sent when all open contracts for the stream are closed
 message StreamClose {
+    bytes authorization_generation = 4;
     // ulid
     bytes stream_id = 3;
 }
@@ -796,4 +802,21 @@ message ResidentMigrate {
     // the server jitters this across the drain migrate window so the
     // clients do not thundering-herd the siblings
     uint64 migrate_time = 1;
+}
+
+// A hint; receivers refetch an authoritative snapshot before replacing state.
+message NetworkSessionsChanged {
+ string generation = 1;
+ int64 event_id = 2;
+}
+// Accepted only from authenticated platform control. A retired generation cannot
+// be revived by a delayed renew, StreamOpen, or resident migration snapshot.
+message StreamAuthorization {
+ bytes stream_id = 1;
+ bytes authorization_generation = 2;
+ uint32 lease_millis = 3;
+ bool retired = 4;
+ bytes clock_id = 5;
+ int64 clock_unix_millis = 6;
+ int64 deadline_unix_millis = 7;
 }

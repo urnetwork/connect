@@ -3092,6 +3092,7 @@ func httpPostWithStrategyRaw(
 	}
 
 	request.Header.Add("Content-Type", "text/json")
+	setClientInfoHeader(ctx, request.Header)
 	if probeControl {
 		request.Header.Set(ControlProbeTelemetryHeader, "1")
 	}
@@ -3248,6 +3249,7 @@ func HttpGetWithStrategyRaw(
 		}
 
 		request.Header.Add("Content-Type", "text/json")
+		setClientInfoHeader(ctx, request.Header)
 
 		if byJwt != "" {
 			auth := fmt.Sprintf("Bearer %s", byJwt)
@@ -3375,6 +3377,7 @@ func HttpPostStreamWithStrategyRaw(
 
 	if byJwt != "" {
 		req.Header.Set("Authorization", "Bearer "+byJwt)
+		setClientInfoHeader(ctx, req.Header)
 	}
 
 	// NOT http.DefaultClient: on the machine that provides a tunnel, the
