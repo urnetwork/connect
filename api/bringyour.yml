@@ -1342,6 +1342,10 @@ paths:
         to the size of its contracts still in flight. `capped` is true once a cap is reached; the client then gets no
         new transfer contracts until the monthly period rolls over, the cap is
         raised or cleared, or the running total is reset.
+
+        Refused with `error.message` "Embed isn't enabled for this network."
+        unless the caller's network is Embed-enabled: an Embed plan, which the
+        URnetwork team enables network by network (see `GET /network/embed`).
       operationId: getNetworkClientDataCap
       security:
         - BearerAuth: []
@@ -1384,6 +1388,10 @@ paths:
         the month rolls over, the cap is raised or cleared, or the total is
         reset. Only the network's root JWT may set caps, and `client_id` must
         belong to the caller's network; a client-scoped JWT is refused.
+
+        Refused with `error.message` "Embed isn't enabled for this network."
+        unless the caller's network is Embed-enabled: an Embed plan, which the
+        URnetwork team enables network by network (see `GET /network/embed`).
       operationId: setNetworkClientDataCap
       security:
         - BearerAuth: []
@@ -1413,6 +1421,10 @@ paths:
         returned `next_cursor` as `cursor` to read the next page; it is `null`
         on the last page. Only the network's root JWT may list; a
         client-scoped JWT is refused.
+
+        Refused with `error.message` "Embed isn't enabled for this network."
+        unless the caller's network is Embed-enabled: an Embed plan, which the
+        URnetwork team enables network by network (see `GET /network/embed`).
       operationId: listNetworkClientDataCaps
       security:
         - BearerAuth: []
@@ -1453,6 +1465,10 @@ paths:
         `client_id`. A client's own scoped JWT reads only that client:
         `client_id` may be omitted, and must match the JWT's client when
         given.
+
+        Refused with `error.message` "Embed isn't enabled for this network."
+        unless the caller's network is Embed-enabled: an Embed plan, which the
+        URnetwork team enables network by network (see `GET /network/embed`).
       operationId: getNetworkClientAclGroup
       security:
         - BearerAuth: []
@@ -1493,6 +1509,10 @@ paths:
         Only the network's root JWT (or an API key) may set the group, and
         `client_id` must belong to the caller's network; a client-scoped JWT
         is refused.
+
+        Refused with `error.message` "Embed isn't enabled for this network."
+        unless the caller's network is Embed-enabled: an Embed plan, which the
+        URnetwork team enables network by network (see `GET /network/embed`).
       operationId: setNetworkClientAclGroup
       security:
         - BearerAuth: []
@@ -1509,6 +1529,40 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ClientAclGroupResult"
+        "401":
+          description: Missing or invalid bearer token.
+
+  /network/embed:
+    get:
+      tags: [Network]
+      summary: Get the network's Embed state
+      description: |
+        Read whether the caller's network is Embed-enabled, its client
+        allowance and how many clients count toward it.
+
+        Embed plans are sold through a review and a contract, and the
+        URnetwork team then enables Embed network by network. Until then the
+        data-cap and ACL-group operations refuse the network with
+        `error.message` "Embed isn't enabled for this network." This read is
+        not gated: a network without Embed reads `enabled: false`.
+
+        `client_limit` is the network's top-level client allowance: its Embed
+        plan allowance, or the default of 100. `active_client_count` counts
+        exactly what that limit counts: the network's active top-level
+        clients, not counting provider installs.
+
+        Only the network's root JWT (or an API key) may read it; a
+        client-scoped JWT is refused.
+      operationId: getNetworkEmbed
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: The network's Embed state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkEmbedResult"
         "401":
           description: Missing or invalid bearer token.
 
@@ -8614,6 +8668,27 @@ components:
         acl_group:
           type: string
           enum: [default, isolated]
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+
+    NetworkEmbedResult:
+      type: object
+      required: []
+      properties:
+        enabled:
+          description: True when the URnetwork team has enabled Embed for the network.
+          type: boolean
+        client_limit:
+          description: The network's top-level client allowance; 100 without an Embed plan allowance.
+          type: integer
+        active_client_count:
+          description: The network's active top-level clients that count toward `client_limit` (provider installs do not).
+          type: integer
         error:
           type: object
           required:
