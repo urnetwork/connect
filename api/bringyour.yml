@@ -338,6 +338,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProvidersResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/providers-last-n:
     post:
@@ -362,6 +364,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProvidersResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/provider-last-n:
     post:
@@ -386,6 +390,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProviderResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/providers-overview-last-n:
     post:
@@ -410,6 +416,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProvidersOverviewResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/providers-overview-last-90:
     get:
@@ -429,6 +437,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProvidersOverviewResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/provider-last-90:
     post:
@@ -456,6 +466,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProviderResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/leaderboard:
     post:
@@ -875,6 +887,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkDeleteResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /auth/code-create:
     post:
@@ -903,6 +917,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthCodeCreateResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /auth/apple/callback:
     post:
@@ -1126,6 +1142,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AddAuthResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /auth/remove-auth:
     post:
@@ -1150,6 +1168,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RemoveAuthResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /auth/generate-seedphrase:
     post:
@@ -1168,6 +1188,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GenerateSeedphraseResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /auth/regenerate-seedphrase:
     post:
@@ -1186,6 +1208,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RegenerateSeedphraseResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/auth-client:
     post:
@@ -1323,6 +1347,8 @@ paths:
                 $ref: "#/components/schemas/RegisterNetworkClientResult"
         "401":
           description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /network/client-data-cap:
     get:
@@ -1410,6 +1436,8 @@ paths:
                 $ref: "#/components/schemas/ClientDataCapResult"
         "401":
           description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /network/client-data-caps:
     get:
@@ -1453,6 +1481,8 @@ paths:
                 $ref: "#/components/schemas/ClientDataCapListResult"
         "401":
           description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /network/client-acl-group:
     get:
@@ -1531,6 +1561,8 @@ paths:
                 $ref: "#/components/schemas/ClientAclGroupResult"
         "401":
           description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /network/embed:
     get:
@@ -1565,6 +1597,8 @@ paths:
                 $ref: "#/components/schemas/NetworkEmbedResult"
         "401":
           description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /network/remove-client:
     post:
@@ -1628,6 +1662,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RemoveNetworkClientsResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /network/extender-activate:
     post:
@@ -1928,6 +1964,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkClientsResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/proxies:
     get:
@@ -1949,6 +1987,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkClientsResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /network/peers:
     get:
@@ -1997,6 +2037,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PreferencesSetResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /preferences:
     get:
@@ -2216,6 +2258,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetNetworkRankingVisibilityResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/points-ranking-visibility:
     post:
@@ -2242,6 +2286,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetNetworkPointsRankingVisibilityResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/emoji:
     post:
@@ -2269,6 +2315,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetNetworkEmojiTagResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/block-location:
     post:
@@ -2292,6 +2340,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkBlockLocationResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/unblock-location:
     post:
@@ -2315,6 +2365,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkUnblockLocationResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/blocked-locations:
     get:
@@ -2393,6 +2445,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetNetworkUserResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/user/update:
     post:
@@ -2416,6 +2470,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UpdateNetworkNameResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   # ----- provider probe control plane (operator-to-server) -----
 
@@ -2976,6 +3032,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WalletBalanceResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /wallet/validate-address:
     post:
@@ -3020,6 +3078,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WalletCircleInitResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /wallet/circle-transfer-out:
     post:
@@ -3045,6 +3105,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WalletCircleTransferOutResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /subscription/balance:
     get:
@@ -3122,7 +3184,11 @@ paths:
         "401":
           description: Missing or invalid bearer token.
         "403":
-          description: The caller's network may not drain.
+          $ref: "#/components/responses/ClientJwtRefused"
+          description: |
+            The caller's network may not drain, or the bearer token is a client
+            JWT, which this route refuses like every route that administers the
+            network (`ClientJwtRefused`). Either body is plain text.
 
   /test/balance-restore:
     post:
@@ -3150,6 +3216,8 @@ paths:
                 $ref: "#/components/schemas/TestBalanceRestoreResult"
         "401":
           description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /subscription/details:
     get:
@@ -3182,6 +3250,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SubscriptionDetailsResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /subscription/cancel:
     post:
@@ -3211,6 +3281,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SubscriptionCancelResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /subscription/resume:
     post:
@@ -3235,6 +3307,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SubscriptionCancelResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /subscription/check-balance-code:
     post:
@@ -3729,6 +3803,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceAddResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/create-share-code:
     post:
@@ -3752,6 +3828,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceCreateShareCodeResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/share-code/{code}/qr.png:
     get:
@@ -3778,6 +3856,8 @@ paths:
               schema:
                 type: string
                 format: binary
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/share-status:
     post:
@@ -3805,6 +3885,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceShareStatusResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/confirm-share:
     post:
@@ -3829,6 +3911,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceConfirmShareResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/create-adopt-code:
     post:
@@ -3970,6 +4054,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceAssociationsResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/remove-association:
     post:
@@ -3997,6 +4083,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceRemoveAssociationResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/set-association-name:
     post:
@@ -4021,6 +4109,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceSetAssociationNameResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/set-name:
     post:
@@ -4239,6 +4329,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ChangeNetworkNameResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/claim-name:
     post:
@@ -4266,6 +4358,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ChangeNetworkNameResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/api-key:
     post:
@@ -4289,6 +4383,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateApiKeyResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /account/api-key/remove:
     post:
@@ -4312,6 +4408,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeleteApiKeyResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /account/api-keys:
     get:
@@ -4330,6 +4428,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetApiKeysResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /account/payout-wallet:
     post:
@@ -4353,6 +4453,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetPayoutWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
     get:
       tags: [Account]
       summary: Account Get Payout Wallet
@@ -4368,6 +4470,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetPayoutWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/points:
     get:
@@ -4402,6 +4506,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetNetworkAccountPaymentsResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/wallet:
     post:
@@ -4426,6 +4532,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateAccountWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/wallets:
     get:
@@ -4443,6 +4551,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetAccountWalletsResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/wallets/remove:
     post:
@@ -4470,6 +4580,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RemoveWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/wallets/verify-seeker:
     post:
@@ -4496,6 +4608,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/VerifySeekerNftHolderResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/balance-codes:
     get:
@@ -4513,6 +4627,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkBalanceCodesResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/epochs:
     get:
@@ -4618,6 +4734,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UnlinkReferralNetworkResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/set-referral:
     post:
@@ -4641,6 +4759,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetNetworkReferralResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /transfer/stats:
     get:
@@ -4788,6 +4908,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StripeCreateCustomerPortalResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /pay/data/checkout:
     post:
@@ -5402,6 +5524,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnSetWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
     get:
       tags: [Other]
       summary: Sn Get Wallet
@@ -5432,6 +5556,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnGetWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /sn/wallet/consent:
     post:
@@ -5462,6 +5588,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnWalletMappingChallengeResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /sn/wallet/consent/history:
     post:
@@ -5521,6 +5649,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnWalletMappingChallengeResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /sn/wallet/network-consent/history:
     post:
@@ -5587,6 +5717,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnHotkeyWalletMappingConsentResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /sn/wallet/hotkey-consent/history:
     post:
@@ -5649,6 +5781,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnWalletMappingChallengeResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /sn/wallet/hotkey-delegation/history:
     post:
@@ -5754,6 +5888,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnHeadBindingResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /sn/pool/claim:
     get:
@@ -7347,6 +7483,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/OauthError"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /oauth/authorize:
     post:
@@ -7388,6 +7526,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/OauthError"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
 components:
   parameters:
@@ -7412,6 +7552,37 @@ components:
         type: string
       required: true
       description: 64 hex digits, the SDK client's public key.
+  responses:
+    ClientJwtRefused:
+      description: |
+        The bearer token is a client JWT (`by_client_jwt`, from
+        `POST /network/auth-client`), and this route administers the network
+        or the account, which a client JWT never does. Call it with the
+        network's root token (a network JWT) or an API key. The route did
+        nothing. The body is the plain text message "A client token cannot
+        administer the network. Use the network's root token or an API key."
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: A client token cannot administer the network. Use the network's root token or an API key.
+    EmbedClientJwtRefused:
+      description: |
+        The bearer token is a client JWT (`by_client_jwt`, from
+        `POST /network/auth-client`) of an Embed network: one with Embed
+        enabled now or at any time before, or with an Embed plan client
+        allowance. An Embed network hands its client JWTs to a third party's
+        users, so none of them may administer the network or the account, or
+        redirect a client's payout. Call the route with the network's root
+        token (a network JWT) or an API key. A client JWT of any other
+        network is served. The route did nothing. The body is the plain text
+        message "A client token cannot administer the network. Use the
+        network's root token or an API key."
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: A client token cannot administer the network. Use the network's root token or an API key.
   securitySchemes:
     BearerAuth:
       type: http
@@ -7435,6 +7606,12 @@ components:
         that say they require a client JWT, take one that does: exchange the
         network JWT for it with `POST /network/auth-client`
         (`by_client_jwt`).
+
+        A client JWT never administers the network or the account. The routes
+        that do answer it with 403 (`ClientJwtRefused`). The routes the
+        URnetwork apps call with their client JWT, and a client's own payout
+        routes, refuse only the client JWTs of an Embed network
+        (`EmbedClientJwtRefused`).
 
         API key: `POST /account/api-key`, called with a JWT, returns a
         long-lived key beginning `urn_` in `api_key`, shown only in that
