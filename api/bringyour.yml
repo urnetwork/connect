@@ -44,9 +44,10 @@ info:
     Operations marked `x-internal: true` are not part of the public API:
     the server-to-server webhooks (payment processors, app stores and the
     email provider), the operator's provider probe control plane, the admin
-    reports and the operator's own evidence publishing. They stay in this
-    document so the server's route and conformance checks cover them; the
-    public API reference leaves them out.
+    reports, the operator's own evidence publishing, the acceptance-test
+    routes and the extender directory calls the SDK makes on its own. They
+    stay in this document so the server's route and conformance checks
+    cover them; the public API reference leaves them out.
 
   termsOfService: https://ur.io/terms
   contact:
@@ -1194,12 +1195,24 @@ paths:
         Gain permission to use the `connect` protocol as the requested clientId,
         or assign a new clientId.
 
-        When the deployment enforces concurrent clients, a network is limited
-        to 100 TOP-LEVEL clients (clients with no `source_client_id`, which are
-        the network's peers); ancillary clients are not counted. Over the
-        limit the call answers 200 with `error.upgrade_required` -- a plan
-        limit, not a hard cap -- and an agent can settle it inline with the
-        x402 round trip below.
+        Two limits apply to creating a top-level client (a client with no
+        `source_client_id`; top-level clients are the network's peers). Both
+        are enforced only while the deployment enforces concurrent clients,
+        and ancillary clients (with a `source_client_id`) count toward
+        neither:
+        - The client limit: 100 active top-level clients. Over it the call
+          answers 200 with `error.client_limit_exceeded` and the message
+          "Client limit exceeded."
+        - The plan's limit on concurrently connected top-level clients. Over
+          it the call answers with `error.client_limit_exceeded` and
+          `error.upgrade_required` -- a plan limit, not a hard cap. When x402
+          inline payments are enabled and a price can be quoted, the answer
+          is HTTP 402 with the terms for a Pro month instead, so an agent can
+          pay and retry the same request (see `/x402`); otherwise it is 200
+          with the error.
+
+        A network on an Embed plan has a per-network client allowance that
+        sets both limits.
 
         A provider install (a device that only provides, such as an embedded
         provider) sets `provide_intent`. Creating a top-level client with it is
@@ -1246,6 +1259,68 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthNetworkClientResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "402":
+          description: |
+            The plan's concurrent connected client limit is reached and x402
+            inline payments are enabled: the body carries the x402 payment
+            terms for a Pro month. Pay, then retry the same request with
+            `X-PAYMENT` (see `/x402`).
+
+  /network/register-client-v1:
+    post:
+      tags: [Network]
+      summary: Register a network client (versioned, idempotent)
+      description: |
+        Create, or recover after a lost answer, one top-level client and its
+        device under a caller-chosen registration key. It is the versioned,
+        idempotent alternative to `/network/auth-client` for creating a
+        client: an older server that lacks this route answers 404 rather than
+        silently allocating another client.
+
+        The call needs a network JWT (no `client_id` and no device). The body
+        is exactly these five string fields, with no unknown or duplicate
+        fields and at most 16 KiB:
+        - `schema`: `urnetwork-client-registration-v1`.
+        - `registration_id` and `scope_sha256`: 64 lowercase hex digits each
+          (a SHA-256), not all zeros. Within a network, either one binds to
+          exactly one client and device.
+        - `description` (at most 1024 bytes) and `device_spec` (at most 4096
+          bytes).
+
+        Replaying the same request answers with the same client and device
+        and a fresh client JWT. A replay never recreates a removed or
+        inactive identity, and a key bound to a different request or
+        authority is refused. Proxy and payment options are not part of this
+        route. The client limits described on `/network/auth-client` apply.
+
+        Refusals answer 200 with `error.code`:
+        - `invalid_request`: the body is incomplete or unsupported.
+        - `network_authority_required`: the session is not a network session.
+        - `client_limit`: the network is over a client limit.
+        - `authentication_refused`: client creation was refused for another
+          reason; `error.message` says why.
+        - `registration_conflict`: the key is bound to a different request or
+          authority.
+        - `identity_unavailable`: the registered client or device was removed,
+          is inactive, or no longer matches its original device or roles.
+      operationId: registerNetworkClient
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterNetworkClientArgs"
+      responses:
+        "200":
+          description: The registered client, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterNetworkClientResult"
         "401":
           description: Missing or invalid bearer token.
 
@@ -1364,6 +1439,76 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ClientDataCapListResult"
+        "401":
+          description: Missing or invalid bearer token.
+
+  /network/client-acl-group:
+    get:
+      tags: [Network]
+      summary: Get a client's ACL group
+      description: |
+        Read a client's ACL group, `default` or `isolated`.
+
+        The network's root JWT reads any client in the network, named by
+        `client_id`. A client's own scoped JWT reads only that client:
+        `client_id` may be omitted, and must match the JWT's client when
+        given.
+      operationId: getNetworkClientAclGroup
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: client_id
+          schema:
+            type: string
+            format: uuid
+          required: false
+          description: |
+            The client to read. Required with the root JWT; optional with the
+            client's own JWT.
+      responses:
+        "200":
+          description: The client's ACL group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientAclGroupResult"
+        "401":
+          description: Missing or invalid bearer token.
+    post:
+      tags: [Network]
+      summary: Set a client's ACL group
+      description: |
+        Set a client's ACL group: `default` or `isolated`. New clients are
+        `default`.
+
+        An `isolated` client never appears in the network's peer list
+        (`/network/peers` and the peer change stream) and does not receive
+        the list. It does not count toward the recently active top-level
+        clients that keep the peer list enabled. It still counts toward the
+        network's client limit and its concurrent connection limit. Messages
+        between clients need the peer list, so an isolated client cannot use
+        them.
+
+        Only the network's root JWT (or an API key) may set the group, and
+        `client_id` must belong to the caller's network; a client-scoped JWT
+        is refused.
+      operationId: setNetworkClientAclGroup
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClientAclGroupArgs"
+      responses:
+        "200":
+          description: The client's ACL group after the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientAclGroupResult"
         "401":
           description: Missing or invalid bearer token.
 
@@ -1576,6 +1721,71 @@ paths:
                 $ref: "#/components/schemas/ExtenderLatencyReportResult"
         "401":
           description: Missing or invalid client bearer token.
+
+  /network/extender-release:
+    post:
+      tags: [Network]
+      x-internal: true
+      summary: Release extender records to the calling client
+      description: |
+        A directory call the SDK makes on its own: the server deals extender
+        records to the calling client for the current epoch. Needs a client
+        JWT; the release is keyed by the account and the device, and the
+        caller's address is part of the decision.
+
+        `ip_versions` lists the address families the client can dial (4, 6);
+        empty means any. The answer carries base64 serialized
+        `protocol.ExtenderRecord` messages, the epoch, how many records the
+        identity is entitled to this epoch, and `probation`. A refusal
+        answers 200 with `error` and no records.
+      operationId: extenderRelease
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtenderReleaseArgs"
+      responses:
+        "200":
+          description: The released records, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderReleaseResult"
+        "401":
+          description: Missing or invalid bearer token.
+
+  /network/extender-block-report:
+    post:
+      tags: [Network]
+      x-internal: true
+      summary: Report an unreachable extender
+      description: |
+        A report the SDK makes on its own when it could not reach an extender.
+        Needs a client JWT; the server records it against the country the
+        caller's address places it in, once per client, and rate limits
+        reports per user. An unknown extender key answers `recorded: false`
+        without an error. A refusal answers 200 with `error`.
+      operationId: extenderBlockReport
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtenderBlockReportArgs"
+      responses:
+        "200":
+          description: Whether the report was recorded, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderBlockReportResult"
+        "401":
+          description: Missing or invalid bearer token.
 
   /network/ping-report:
     post:
@@ -2820,6 +3030,72 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SubscriptionBalanceResult"
+
+  /test/balance-drain:
+    post:
+      tags: [Other]
+      x-internal: true
+      summary: Drain the caller's balance for an acceptance test
+      description: |
+        Acceptance-test only. Makes the caller's own network's available
+        balance read as zero for a bounded window, so the apps' insufficient
+        balance state can be reproduced against a live deployment. The
+        network is always the caller's own; no parameter names another.
+
+        Refused with 403 unless the caller's network is allowlisted in the
+        vault, or one of its sign-in emails is on a test bypass domain.
+        `duration_seconds` is clamped to 60-1800 and defaults to 900. While
+        the window is open, new positive-byte contracts paid by the network
+        are refused with the normal "Insufficient balance" error and the
+        balance reads zero; balances, escrow and payments are untouched, and
+        contracts already open settle normally.
+      operationId: testBalanceDrain
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TestBalanceDrainArgs"
+      responses:
+        "200":
+          description: The drain window.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestBalanceDrainResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          description: The caller's network may not drain.
+
+  /test/balance-restore:
+    post:
+      tags: [Other]
+      x-internal: true
+      summary: End the caller's acceptance-test balance drain
+      description: |
+        Acceptance-test only. Ends the caller's own network's open drains
+        early; an unrestored drain ends by itself at its end time.
+      operationId: testBalanceRestore
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TestBalanceRestoreArgs"
+      responses:
+        "200":
+          description: How many drains were ended.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestBalanceRestoreResult"
+        "401":
+          description: Missing or invalid bearer token.
 
   /subscription/details:
     get:
@@ -4794,6 +5070,236 @@ paths:
           description: A query parameter is not a valid RFC 3339 time or integer.
         "503":
           description: The verification subsystem is not enabled.
+
+  /verify/original:
+    post:
+      tags: [Other]
+      summary: Verify Original Request
+      description: |
+        Recover the first signed answer to a verification request after a
+        lost reply. The body locates the original request: its `client_id`,
+        the exact request `message` (base64, at most 2048 bytes), its
+        `signature` (base64, 64 bytes) and, when the original was scoped, its
+        `scope`. No JWT: the request signature must verify. At most 16 KiB.
+
+        The answer's `original` carries the retained signed transition (its
+        exact `body` and `signature`, both base64) or `null` when none is
+        retained. It is not a signed assertion that an absent request did
+        not run; readers verify the returned signature, scope and bytes
+        themselves.
+      operationId: getVerifyOriginalRequest
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyOriginalRequestArgs"
+      responses:
+        "200":
+          description: The retained original, or `null`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyOriginalRequestResult"
+        "400":
+          description: The locator is invalid or its signature does not verify.
+        "503":
+          description: |
+            The verification subsystem is not enabled on this deployment.
+            `Retry-After: 3600`. The body is plain text, not JSON.
+
+  /provider-work/v1/owners:
+    get:
+      tags: [Other]
+      summary: Provider Work Owners
+      description: |
+        Read the retained owner statements of one SDK client and key, for the
+        subnet provider work protocol. Public and self-authenticating: the
+        returned originals carry their own signatures.
+
+        The query takes exactly `domain` (64 hex), `client` (32 hex) and
+        `key` (64 hex), plus an optional `generation` (32 hex); selectors are
+        lowercase hex, not all zeros, each given once, with no other
+        parameters, and `domain` must be this deployment's.
+        - With `generation`: the exact original owner statement, with an
+          `ETag` of its SHA-256 and `Cache-Control: public, immutable`.
+        - Without: an index of the retained statements, at most 1024, with
+          no completeness or "current" flag.
+      operationId: getProviderWorkOwners
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ProviderWorkDomain"
+        - $ref: "#/components/parameters/ProviderWorkClient"
+        - $ref: "#/components/parameters/ProviderWorkKey"
+        - in: query
+          name: generation
+          schema:
+            type: string
+          required: false
+          description: 32 hex digits. Selects one exact owner statement.
+      responses:
+        "200":
+          description: |
+            The exact owner statement (with `generation`), or the index of
+            retained statements (`schema`
+            `urnetwork-sdk-whole-work-owner-index-v1`; `owners` holds each
+            original, base64).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ProviderWorkOwnerIndex"
+                  - type: object
+                    description: The exact original owner statement.
+        "400":
+          description: A selector is missing, duplicated, malformed or unexpected.
+        "404":
+          description: Nothing is retained for the selection.
+        "429":
+          description: The provider work transport is busy.
+        "503":
+          description: Provider work is unavailable on this deployment.
+
+  /provider-work/v1/requests:
+    get:
+      tags: [Other]
+      summary: Provider Work Requests
+      description: |
+        List the outstanding original work requests for one SDK client,
+        generation and key. The query takes exactly `domain` (64 hex),
+        `client` (32 hex), `generation` (32 hex) and `key` (64 hex), with
+        the same selector rules as `/provider-work/v1/owners`.
+      operationId: listProviderWorkRequests
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ProviderWorkDomain"
+        - $ref: "#/components/parameters/ProviderWorkClient"
+        - in: query
+          name: generation
+          schema:
+            type: string
+          required: true
+          description: 32 hex digits.
+        - $ref: "#/components/parameters/ProviderWorkKey"
+      responses:
+        "200":
+          description: The original requests, each base64.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWorkRequests"
+        "400":
+          description: A selector is missing, duplicated, malformed or unexpected.
+        "429":
+          description: The provider work transport is busy.
+        "503":
+          description: Provider work is unavailable on this deployment.
+
+  /provider-work/v1/requests/{requestHash}:
+    get:
+      tags: [Other]
+      summary: Provider Work Request
+      description: |
+        Read one original work request by the SHA-256 of its exact bytes. The
+        answer is the original JSON, with an `ETag` of the hash and
+        `Cache-Control: public, immutable`. No query parameters.
+      operationId: getProviderWorkRequest
+      security: []
+      parameters:
+        - in: path
+          name: requestHash
+          schema:
+            type: string
+          required: true
+          description: 64 lowercase hex digits.
+      responses:
+        "200":
+          description: The original request.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: The hash is malformed, or a query was given.
+        "404":
+          description: No original is retained under the hash.
+
+  /provider-work/v1/cuts/{cutHash}:
+    get:
+      tags: [Other]
+      summary: Provider Work Cut
+      description: |
+        Read one original work cut by the SHA-256 of its exact bytes. The
+        answer is the original JSON, with an `ETag` of the hash and
+        `Cache-Control: public, immutable`. No query parameters.
+      operationId: getProviderWorkCut
+      security: []
+      parameters:
+        - in: path
+          name: cutHash
+          schema:
+            type: string
+          required: true
+          description: 64 lowercase hex digits.
+      responses:
+        "200":
+          description: The original cut.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: The hash is malformed, or a query was given.
+        "404":
+          description: No original is retained under the hash.
+
+  /provider-work/v1/windows:
+    get:
+      tags: [Other]
+      summary: Provider Work Window
+      description: |
+        Read the closed-work whole inventory published for one subnet payout
+        artifact. The query takes exactly `domain` (64 hex), `epoch` (a
+        canonical decimal uint64) and `artifact` (64 hex), plus an optional
+        `authority` (64 hex) that selects an exact authority. A historical
+        absence is answered as missing; it is never rebuilt from current
+        state.
+      operationId: getProviderWorkWindow
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ProviderWorkDomain"
+        - in: query
+          name: epoch
+          schema:
+            type: string
+          required: true
+          description: A canonical decimal uint64.
+        - in: query
+          name: artifact
+          schema:
+            type: string
+          required: true
+          description: 64 hex digits, the artifact's content hash.
+        - in: query
+          name: authority
+          schema:
+            type: string
+          required: false
+          description: 64 hex digits. Selects an exact authority.
+      responses:
+        "200":
+          description: The whole inventory, as published.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: A selector is missing, duplicated, malformed or unexpected.
+        "404":
+          description: No inventory is retained for the selection.
+        "503":
+          description: Provider work is unavailable on this deployment.
 
   /sn/wallet:
     post:
@@ -6830,6 +7336,28 @@ paths:
                 $ref: "#/components/schemas/OauthError"
 
 components:
+  parameters:
+    ProviderWorkDomain:
+      in: query
+      name: domain
+      schema:
+        type: string
+      required: true
+      description: 64 hex digits; must be this deployment's work domain.
+    ProviderWorkClient:
+      in: query
+      name: client
+      schema:
+        type: string
+      required: true
+      description: 32 hex digits, the SDK client id.
+    ProviderWorkKey:
+      in: query
+      name: key
+      schema:
+        type: string
+      required: true
+      description: 64 hex digits, the SDK client's public key.
   securitySchemes:
     BearerAuth:
       type: http
@@ -8004,6 +8532,250 @@ components:
           properties:
             message:
               type: string
+
+    RegisterNetworkClientArgs:
+      type: object
+      required:
+        - schema
+        - registration_id
+        - scope_sha256
+        - description
+        - device_spec
+      additionalProperties: false
+      properties:
+        schema:
+          type: string
+          enum: [urnetwork-client-registration-v1]
+        registration_id:
+          description: 64 lowercase hex digits, not all zeros.
+          type: string
+        scope_sha256:
+          description: 64 lowercase hex digits, not all zeros. Immutable caller-owned provenance.
+          type: string
+        description:
+          description: At most 1024 bytes.
+          type: string
+        device_spec:
+          description: At most 4096 bytes.
+          type: string
+
+    RegisterNetworkClientResult:
+      type: object
+      required: []
+      properties:
+        schema:
+          type: string
+        registration_id:
+          type: string
+        request_sha256:
+          description: The SHA-256 of the canonical request.
+          type: string
+        client_id:
+          type: string
+          format: uuid
+        device_id:
+          type: string
+          format: uuid
+        by_client_jwt:
+          type: string
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              enum: [invalid_request, network_authority_required, client_limit, authentication_refused, registration_conflict, identity_unavailable]
+            message:
+              type: string
+
+    ClientAclGroupArgs:
+      type: object
+      required:
+        - client_id
+        - acl_group
+      properties:
+        client_id:
+          description: The client to set. It must belong to the caller's network.
+          type: string
+          format: uuid
+        acl_group:
+          type: string
+          enum: [default, isolated]
+
+    ClientAclGroupResult:
+      type: object
+      required: []
+      properties:
+        client_id:
+          type: string
+          format: uuid
+        acl_group:
+          type: string
+          enum: [default, isolated]
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+
+    ExtenderReleaseArgs:
+      type: object
+      required: []
+      properties:
+        ip_versions:
+          description: The address families the client can dial; empty means any.
+          type: array
+          items:
+            type: integer
+            enum: [4, 6]
+
+    ExtenderReleaseResult:
+      type: object
+      required: []
+      properties:
+        records:
+          description: Base64 serialized `protocol.ExtenderRecord` messages.
+          type: array
+          items:
+            type: string
+        epoch:
+          description: The epoch the release was dealt in.
+          type: integer
+        count:
+          description: How many records the identity is entitled to this epoch.
+          type: integer
+        probation:
+          type: boolean
+        error:
+          description: Why the release was refused; absent on success.
+          type: string
+
+    ExtenderBlockReportArgs:
+      type: object
+      required:
+        - public_key_hex
+      properties:
+        public_key_hex:
+          description: The unreachable extender's public key, hex.
+          type: string
+
+    ExtenderBlockReportResult:
+      type: object
+      required: []
+      properties:
+        recorded:
+          type: boolean
+        error:
+          description: Why the report was not recorded; absent when it was, or for an unknown key.
+          type: string
+
+    TestBalanceDrainArgs:
+      type: object
+      required: []
+      properties:
+        duration_seconds:
+          description: Clamped to 60-1800; default 900.
+          type: integer
+
+    TestBalanceDrainResult:
+      type: object
+      required: []
+      properties:
+        drain_id:
+          type: string
+          format: uuid
+        start_time:
+          type: string
+          format: date-time
+        end_time:
+          type: string
+          format: date-time
+        drained_balance_byte_count:
+          description: The available balance hidden when the drain began.
+          type: integer
+          format: int64
+
+    TestBalanceRestoreArgs:
+      type: object
+      required: []
+      properties: {}
+
+    TestBalanceRestoreResult:
+      type: object
+      required: []
+      properties:
+        restored_count:
+          type: integer
+          format: int64
+
+    VerifyOriginalRequestArgs:
+      type: object
+      required:
+        - client_id
+        - message
+        - signature
+      properties:
+        scope:
+          description: The original's deployment scope, as the original was signed; omit for an unscoped original.
+          type: object
+        client_id:
+          type: string
+          format: uuid
+        message:
+          description: The exact original request message, base64; at most 2048 bytes.
+          type: string
+        signature:
+          description: The request signature, base64; 64 bytes.
+          type: string
+
+    VerifyOriginalRequestResult:
+      type: object
+      required:
+        - original
+      properties:
+        original:
+          description: The retained signed transition, or `null` when none is retained.
+          type: [object, "null"]
+          properties:
+            body:
+              description: The exact signed body, base64.
+              type: string
+            signature:
+              description: The transition signature, base64.
+              type: string
+
+    ProviderWorkOwnerIndex:
+      type: object
+      required:
+        - schema
+        - owners
+      properties:
+        schema:
+          type: string
+          enum: [urnetwork-sdk-whole-work-owner-index-v1]
+        owners:
+          description: Each retained original owner statement, base64.
+          type: array
+          items:
+            type: string
+
+    ProviderWorkRequests:
+      type: object
+      required:
+        - schema
+        - requests
+      properties:
+        schema:
+          type: string
+        requests:
+          description: Each original request, base64.
+          type: array
+          items:
+            type: string
 
     RemoveNetworkClientArgs:
       type: object
