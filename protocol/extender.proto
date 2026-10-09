@@ -133,6 +133,32 @@ message ExtenderRecordBody {
     // CountryCode at signing, the same mapping the geo dns uses. Empty on
     // records that predate it.
     string ContinentCode = 12;
+    // The directory tier the operator placed the extender in (EXTENDER.md
+    // Q1): 0 is the open tier, which the geo dns sets, the feed and the
+    // cleartext gossip carry, and 1 is the gated tier, released only to an
+    // authenticated identity and carried by no open channel. A reader that
+    // predates the field sees 0, and a record that predates it is open.
+    uint32 DirectoryTier = 13;
+    // The 16 byte client id the extender's device is reachable under on the
+    // exchange, which is the rendezvous of its peer-to-peer webrtc carrier
+    // (EXTENDER.md S, C2a): a dialer sends its SDP offer to this id through
+    // the exchange signaling and the extender answers. Set only when an
+    // address of the record lists the webrtc carrier; empty on every other
+    // record and on records that predate the field.
+    bytes WebRtcClientId = 14;
+    // The 32 byte X25519 static public key of the extender camouflage
+    // (EXTENDER.md P1, P6), derived from the identity seed. A client fronts the
+    // tcp carrier with an authenticated browser hello sealed under it. Signed
+    // with the rest of the body; a reader that predates the field skips it and
+    // simply does not dial the camouflaged carrier. Empty on an extender with
+    // camouflage off and on records that predate the field. Field 13 and 14
+    // were taken by DirectoryTier and WebRtcClientId after P was written, so
+    // this is field 15, not the 13 section P names.
+    bytes RealityPublicKey = 15;
+    // Exclusive discovery channel of an operator canary. Empty preserves
+    // ordinary tier behavior. Canary records also use the gated wire tier
+    // so older tier-aware readers cannot relay them on open channels.
+    string CanaryChannel = 16;
 }
 
 message ExtenderRecord {

@@ -102,7 +102,10 @@ func DefaultConnectSettings() *ConnectSettings {
 		ControlFamilyFirstHandshakeTimeout: 8 * time.Second,
 		ControlFamilyRetryReserve:          5 * time.Second,
 
-		TlsConfig: tlsConfig,
+		QuicVersionPolicy: QuicVersionPolicyPreferV2,
+
+		TlsConfig:                 tlsConfig,
+		TlsClientHelloFingerprint: TlsClientHelloFingerprintChrome,
 	}
 }
 
@@ -170,7 +173,30 @@ type ConnectSettings struct {
 	// <= 0 disables the bound.
 	ControlFamilyRetryReserve time.Duration
 
+	// The QUIC versions the extender udp and dns carriers and the alt api
+	// dialers offer (A13, net_quic_version.go). The zero value and an unknown
+	// value offer version 2 first with version 1 behind it.
+	QuicVersionPolicy QuicVersionPolicy
+
+	// WebRtcExtenderCarrier, when set, is the dial side of the peer-to-peer
+	// webrtc extender carrier (EXTENDER.md S, net_extender_webrtc.go): it
+	// resolves an extender's exchange signaling by the identity key a
+	// profile in ExtenderConnectModeWebRtc carries. Nil, the default, leaves
+	// such a profile undialable; the owner that has signaling -- a device
+	// with a client on the exchange, the operator's probe -- installs one.
+	WebRtcExtenderCarrier *WebRtcExtenderCarrier
+
 	TlsConfig *tls.Config
+
+	// The tls client hello of the normal and resilient dialers
+	// (net_tls_hello.go). Empty or `TlsClientHelloFingerprintChrome`, the
+	// default, is a current Chrome hello through uTLS.
+	// `TlsClientHelloFingerprintGo`, or any other value, restores Go's own
+	// crypto/tls hello: the kill switch, should the Chrome hello be refused
+	// somewhere. Either way a dial keeps its server name, certificate
+	// verification, application protocols and timeouts. The extender, VLESS
+	// and alt dialers, DoH and the streaming post keep their own hellos.
+	TlsClientHelloFingerprint string
 
 	ProxySettings *ProxySettings
 	Resolver      *net.Resolver
@@ -280,14 +306,14 @@ func (self *ConnectSettings) NetDialer() *net.Dialer {
 	// FallbackDelay is explicit so any hostname dial that still reaches
 	// the stdlib race (a caller-injected use of this dialer) paces its
 	// families the same way raceDialContext does
-	return egressDialer(&net.Dialer{
+	return providerEgressDialer(egressDialer(&net.Dialer{
 		Timeout:         self.ConnectTimeout,
 		KeepAlive:       self.KeepAliveTimeout,
 		KeepAliveConfig: self.KeepAliveConfig,
 		FallbackDelay:   DefaultDialFallbackDelay,
 		Resolver:        egressAwareResolver(self.Resolver),
 		Control:         self.DialControl,
-	})
+	}))
 }
 
 type ProxySettings struct {

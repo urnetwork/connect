@@ -57,6 +57,12 @@ const (
 	ExtenderConnectModeTcpTls ExtenderConnectMode = "tcptls"
 	ExtenderConnectModeQuic   ExtenderConnectMode = "quic"
 	ExtenderConnectModeDns    ExtenderConnectMode = "dns"
+	// The peer-to-peer webrtc carrier (EXTENDER.md S, C2a). Not an ip:port
+	// dial: the extender is reached through the exchange signaling and
+	// ICE/STUN, by the rendezvous id its record carries, so a config in this
+	// mode needs ConnectSettings.WebRtcExtenderCarrier and ignores its port,
+	// fragment and reorder (net_extender_webrtc.go).
+	ExtenderConnectModeWebRtc ExtenderConnectMode = "webrtc"
 )
 
 // Carrier names as they appear in an ExtenderResponse and a record (A4, B2).
@@ -64,6 +70,13 @@ const (
 	ExtenderCarrierTcp  = "tcp"
 	ExtenderCarrierQuic = "quic"
 	ExtenderCarrierDns  = "dns"
+	// The peer-to-peer webrtc carrier (EXTENDER.md C2a, webrtc extender
+	// section). It is not an ip:port carrier: it is reached through the
+	// exchange signaling and ICE/STUN, so it is never dialed by
+	// dialExtenderStream. The dial and serve live in net_extender_webrtc.go
+	// (not built for js/wasm). The name appears in records and the acceptance
+	// path so clients, the uptime task, and the strategy can name it.
+	ExtenderCarrierWebRtc = "webrtc"
 )
 
 // Fixed carrier ports (A1, L2). The old multi-port personas are removed. A
@@ -88,6 +101,8 @@ func ExtenderConnectModeForCarrier(carrier string) (ExtenderConnectMode, bool) {
 		return ExtenderConnectModeQuic, true
 	case ExtenderCarrierDns:
 		return ExtenderConnectModeDns, true
+	case ExtenderCarrierWebRtc:
+		return ExtenderConnectModeWebRtc, true
 	default:
 		return "", false
 	}
@@ -123,6 +138,8 @@ func ExtenderCarrierForConnectMode(connectMode ExtenderConnectMode) string {
 		return ExtenderCarrierQuic
 	case ExtenderConnectModeDns:
 		return ExtenderCarrierDns
+	case ExtenderConnectModeWebRtc:
+		return ExtenderCarrierWebRtc
 	default:
 		return ExtenderCarrierTcp
 	}
@@ -148,6 +165,16 @@ type ExtenderConfig struct {
 	// record. The outer leaf certificate must be signed by it (B3). Empty
 	// keeps the unauthenticated outer TLS of a manually configured extender.
 	PublicKey []byte
+	// RealityPublicKey, when set, is the 32 byte X25519 static public key of
+	// the extender camouflage from a verified record (EXTENDER.md P1, P6,
+	// field 15). The tcp carrier then runs a camo-first-then-legacy staggered
+	// race (P8): the camouflaged attempt fronts a borrowed name with an
+	// authenticated browser hello sealed under this key, the legacy attempt is
+	// today's Go-TLS dial. The camouflaged attempt is tried only when the
+	// identity PublicKey is also known (the B3 check needs it) and the kill
+	// switch ConnectSettings.TlsClientHelloFingerprint is not "go". Empty, or
+	// an identity-only config, dials the legacy attempt alone.
+	RealityPublicKey []byte
 	// The ports one dns carrier dial races, in launch order (L2), with
 	// Profile.Port the first of them. A config drawn from a directory or
 	// manual address carries the ports its record lists and then whichever
@@ -336,7 +363,11 @@ func newExtenderDialTlsContext(
 		if innerTlsConfig.ServerName == "" {
 			innerTlsConfig.ServerName = host
 		}
-		tlsServerConn := tls.Client(serverConn, innerTlsConfig)
+		ownedConn, err := ownClientHttpPoolConn(ctx, serverConn)
+		if err != nil {
+			return nil, err
+		}
+		tlsServerConn := tls.Client(ownedConn, innerTlsConfig)
 
 		// inner handshake; bound the timeout so a slow/malicious extender cannot
 		// hold the dial open indefinitely
@@ -434,6 +465,13 @@ func dialExtenderStream(
 	extenderDial *ExtenderDial,
 	extenderTlsConfig *tls.Config,
 ) (net.Conn, *protocol.ExtenderResponse, error) {
+	if extenderConfig.Profile.ConnectMode == ExtenderConnectModeWebRtc {
+		// the webrtc carrier builds its own header: with no outer leaf to
+		// pin, it challenges the extender itself when the config names its
+		// key (net_extender_webrtc.go)
+		return dialExtenderWebRtc(ctx, connectSettings, extenderConfig, extenderDial)
+	}
+
 	headerBytes, err := extenderRequestHeaderBytes(extenderConfig, extenderDial)
 	if err != nil {
 		return nil, nil, err
@@ -499,8 +537,15 @@ func newExtenderRequest(
 	headerBytes []byte,
 	body io.ReadCloser,
 ) *http.Request {
+	authorityHost := extenderConfig.Ip.String()
+	if !extenderConfig.Ip.IsValid() {
+		// the webrtc carrier has no ip: the request rides an already
+		// authenticated data channel, and the extender reads only the
+		// method, path and content type of it (A3)
+		authorityHost = ExtenderCarrierForConnectMode(extenderConfig.Profile.ConnectMode)
+	}
 	authority := net.JoinHostPort(
-		extenderConfig.Ip.String(),
+		authorityHost,
 		strconv.Itoa(extenderConfig.Profile.Port),
 	)
 	requestHost := extenderConfig.Profile.ServerName
@@ -529,6 +574,12 @@ func newExtenderRequest(
 // The tcp carrier: terminated outer TLS, then one HTTP/1.1 request. The
 // buffered reader that read the response is kept, because it may already hold
 // the first bytes the extender sent after it.
+//
+// One tcp carrier memory reservation covers the whole dial, held once however
+// the dial reaches the extender (P8): when the config carries a camouflage key
+// the dial is a camo-first-then-legacy staggered race, and the winning
+// attempt's stream is wrapped in that one reservation, so a camouflaged attempt
+// that fails neither holds the address nor spends a second carrier slot.
 func dialExtenderTcp(
 	ctx context.Context,
 	connectSettings *ConnectSettings,
@@ -547,6 +598,44 @@ func dialExtenderTcp(
 			reservation.Release()
 		}
 	}()
+
+	legacyDial := func(ctx context.Context, roundTrip *ExtenderRoundTrip) (net.Conn, *protocol.ExtenderResponse, error) {
+		return dialExtenderTcpLegacyConn(ctx, connectSettings, extenderConfig, extenderTlsConfig, headerBytes, roundTrip)
+	}
+
+	var streamConn net.Conn
+	var response *protocol.ExtenderResponse
+	if frontName := extenderCamouflageFrontName(extenderConfig); extenderCamouflageApplies(connectSettings, extenderConfig) && frontName != "" {
+		camoDial := func(ctx context.Context, roundTrip *ExtenderRoundTrip) (net.Conn, *protocol.ExtenderResponse, error) {
+			return dialExtenderTcpCamouflageConn(ctx, connectSettings, extenderConfig, frontName, headerBytes, roundTrip)
+		}
+		streamConn, response, err = raceExtenderTcpCamouflage(ctx, roundTrip, extenderTcpCamouflageStaggerC, camoDial, legacyDial)
+	} else {
+		streamConn, response, err = legacyDial(ctx, roundTrip)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	owned = true
+	return &extenderBudgetConn{
+		Conn:        streamConn,
+		reservation: reservation,
+	}, response, nil
+}
+
+// The legacy tcp attempt: today's Go-TLS dial to the extender ip, terminated
+// outer TLS, then the A3 exchange. It returns the raw stream; the carrier's one
+// memory reservation is wrapped around the winning attempt by dialExtenderTcp,
+// so this neither acquires nor releases it.
+func dialExtenderTcpLegacyConn(
+	ctx context.Context,
+	connectSettings *ConnectSettings,
+	extenderConfig *ExtenderConfig,
+	extenderTlsConfig *tls.Config,
+	headerBytes []byte,
+	roundTrip *ExtenderRoundTrip,
+) (net.Conn, *protocol.ExtenderResponse, error) {
 	authority := net.JoinHostPort(
 		extenderConfig.Ip.String(),
 		strconv.Itoa(extenderConfig.Profile.Port),
@@ -608,6 +697,38 @@ func dialExtenderTcp(
 		serverConn = tlsServerConn
 	}
 
+	streamConn, response, err := extenderStreamRequest(
+		ctx,
+		connectSettings,
+		extenderConfig,
+		serverConn,
+		headerBytes,
+		roundTrip,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	success = true
+	return streamConn, response, nil
+}
+
+// The A3 exchange of the stream carriers on an established, terminated
+// stream: one HTTP/1.1 request carrying the header, then the response frame.
+// The tcp carrier runs it after its outer tls and the webrtc carrier after its
+// data channel opens (net_extender_webrtc.go), so both are refused, limited
+// and answered by exactly the same extender handler. On success the returned
+// connection is positioned at the first byte after the response; it keeps the
+// buffered reader, which may already hold the first bytes the extender sent
+// after the response. On an error the caller still owns serverConn.
+func extenderStreamRequest(
+	ctx context.Context,
+	connectSettings *ConnectSettings,
+	extenderConfig *ExtenderConfig,
+	serverConn net.Conn,
+	headerBytes []byte,
+	roundTrip *ExtenderRoundTrip,
+) (net.Conn, *protocol.ExtenderResponse, error) {
 	request := newExtenderRequest(
 		extenderConfig,
 		headerBytes,
@@ -637,7 +758,7 @@ func dialExtenderTcp(
 		if httpResponse.StatusCode != http.StatusOK {
 			return &ExtenderRefusedError{StatusCode: httpResponse.StatusCode}
 		}
-		// A TCP extender sends exactly one bounded, length-delimited frame
+		// A stream extender sends exactly one bounded, length-delimited frame
 		// before handing the connection over. Reject chunked bodies/trailers:
 		// Body.Close would otherwise parse unbounded trailer MIME headers.
 		if len(httpResponse.TransferEncoding) != 0 || httpResponse.ContentLength < 4 || httpResponse.ContentLength > 4+ExtenderMaxHeaderByteCount {
@@ -652,13 +773,7 @@ func dialExtenderTcp(
 	}); err != nil {
 		return nil, nil, err
 	}
-
-	success = true
-	owned = true
-	return &extenderBudgetConn{
-		Conn:        newBufferedConn(serverConn, reader),
-		reservation: reservation,
-	}, response, nil
+	return newBufferedConn(serverConn, reader), response, nil
 }
 
 // The udp carriers: one QUIC connection with ALPN h3 straight to the extender

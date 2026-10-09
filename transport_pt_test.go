@@ -1279,7 +1279,7 @@ func TestPacketTranslationDeliversTxtQueriesOutsideTheEncodingTld(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	_, _, _, tld, err, otherData := decodeDnsRequest(queryBytes, decodeBuf, tlds)
+	_, _, _, tld, err, otherData, _ := decodeDnsRequest(queryBytes, decodeBuf, tlds)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,11 +3,11 @@ package connect
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	mathrand "math/rand"
 	"net/netip"
 	"slices"
 	"strings"
@@ -60,6 +60,9 @@ const (
 	// upgrades when a record naming it arrives -- and is kept distinct from
 	// `manual` so the status can say where it came from.
 	ExtenderSourceImport = "import"
+	// A record the operator released to this client's authenticated identity
+	// (Q3): the gated tier. Not a network event (K4), like a bootstrap.
+	ExtenderSourceRelease = "release"
 )
 
 // The address states reported by the status (F2), in precedence order: trust
@@ -211,6 +214,27 @@ type ExtenderDirectorySettings struct {
 	// never uses the last country once its hint is stale.
 	CountryHintMaxAge time.Duration
 
+	// WebRtcCarrierEnabled lets a candidate carry the peer-to-peer webrtc
+	// carrier its record lists (EXTENDER.md S). Off by default: without a
+	// signaling path a webrtc dial can only fail, and a failure counts
+	// against the address's other carriers. The owner that installs a
+	// carrier on its connect settings turns it on, here or at run time
+	// (SetWebRtcCarrierEnabled).
+	WebRtcCarrierEnabled bool
+
+	// The secret the feed sample this directory serves is partitioned by
+	// (Q2, net_extender_directory_partition.go): which open records a feed
+	// client at one vantage is sampled from, and in what order each epoch.
+	// Nil draws one at random for the life of the directory, which is all an
+	// extender needs: a vantage is bound to one partition for as long as the
+	// process runs, and a restart deals the partitions again. Never on the
+	// wire. Tests pin it.
+	PartitionSecret []byte
+	// The epoch of the feed sample (Q2): within one epoch a vantage is
+	// served the same sample of its partition, and the next epoch another.
+	// <= 0 is one epoch forever. The default is ExtenderOpenEpochTimeout.
+	OpenEpochTimeout time.Duration
+
 	// The only clock the policy reads. Tests install a fake one.
 	Now func() time.Time
 	// When set, draws the uniform [0, 1) the active cap picks a random record
@@ -237,6 +261,7 @@ func DefaultExtenderDirectorySettings() *ExtenderDirectorySettings {
 		LatencyMaxAge:                  12 * time.Hour,
 		ExtenderLimitedBackoff:         30 * time.Second,
 		CountryHintMaxAge:              7 * 24 * time.Hour,
+		OpenEpochTimeout:               ExtenderOpenEpochTimeout,
 		Now:                            time.Now,
 	}
 }
@@ -311,8 +336,13 @@ type ExtenderCandidate struct {
 	// leaf is checked against it (B3, E5).
 	PublicKey []byte
 	Carriers  []string
-	TcpPort   int
-	UdpPort   int
+	// The exchange rendezvous id of the webrtc carrier the record lists
+	// (EXTENDER.md S), zero when the record carries none. Carriers names
+	// the carrier only when the directory has it enabled and the record
+	// carries this id.
+	WebRtcClientId Id
+	TcpPort        int
+	UdpPort        int
 	// The first dns port, kept for a caller that predates DnsPorts.
 	DnsPort int
 	// Every dns port the record offers, ascending (L2). A dial tries these
@@ -325,6 +355,10 @@ type ExtenderCandidate struct {
 	// for a record that predates it and for an unverified address
 	// (DESIGNNOTES4.md §2).
 	ContinentCode string
+	// The directory tier the record is signed into (Q1):
+	// ExtenderDirectoryTierOpen for a record that predates the field and for
+	// an unverified address, ExtenderDirectoryTierGated for a released one.
+	DirectoryTier int
 	// The current latency sample, zero when there is none (DESIGNNOTES4.md).
 	Latency time.Duration
 	// Whether the target co-signed a claim of the pass that took the sample
@@ -373,12 +407,14 @@ func (self *ExtenderCandidate) dnsCarrierPorts() []int {
 
 // One address as the status reports it (F2).
 type ExtenderDirectoryEntry struct {
-	Ip              netip.Addr
-	IpVersion       int
-	PublicKey       []byte
-	Carriers        []string
-	CountryCode     string
-	ContinentCode   string
+	Ip            netip.Addr
+	IpVersion     int
+	PublicKey     []byte
+	Carriers      []string
+	CountryCode   string
+	ContinentCode string
+	// the directory tier of the record (Q1), open for an unverified address
+	DirectoryTier   int
 	Latency         time.Duration
 	State           string
 	Source          string
@@ -432,6 +468,9 @@ type ExtenderDirectory struct {
 
 	stateLock  sync.Mutex
 	rootKeySet *ExtenderRootKeySet
+	// whether candidates carry the webrtc carrier their records list
+	// (ExtenderDirectorySettings.WebRtcCarrierEnabled, SetWebRtcCarrierEnabled)
+	webRtcCarrierEnabled bool
 	// advances with every Reset, which is how a record or revocation whose
 	// verification began before a reset is told apart from one that began
 	// after it (applyVerifiedRecord)
@@ -487,6 +526,9 @@ type ExtenderDirectory struct {
 	maxActiveRecordCount int
 	// the serial the next applied record takes
 	nextApplySerial uint64
+	// the secret the feed sample is partitioned by (Q2): the setting, or one
+	// drawn at construction
+	partitionSecret []byte
 }
 
 // One live subscription to the applied messages (D4). The channel is the
@@ -532,6 +574,16 @@ func NewExtenderDirectory(
 		subscriptions:        map[*extenderDirectorySubscription]bool{},
 		keptKeyHexes:         map[string]bool{},
 		maxActiveRecordCount: settings.MaxActiveRecordCount,
+		partitionSecret:      slices.Clone(settings.PartitionSecret),
+		webRtcCarrierEnabled: settings.WebRtcCarrierEnabled,
+	}
+	if len(self.partitionSecret) == 0 {
+		// one per directory: a vantage is bound to one partition for the life
+		// of the process, and nothing outside it can compute the placement
+		self.partitionSecret = make([]byte, 32)
+		if _, err := rand.Read(self.partitionSecret); err != nil {
+			panic(err)
+		}
 	}
 	self.load()
 	// arm the save loop's subscription here, not inside the goroutine: a
@@ -796,8 +848,11 @@ func (self *ExtenderDirectory) applyVerifiedRecord(
 	self.enforceAddressCapWithLock(now)
 	self.noteEventWithLock(source, now)
 	// the message is built only for a subscriber, since a directory fed a
-	// record a millisecond pays for everything it builds per record
-	if 0 < len(self.subscriptions) {
+	// record a millisecond pays for everything it builds per record. A gated
+	// record goes to no subscriber whatever source it came from (Q1): the
+	// subscribers are the feed stream and the mesh, the open channels, and a
+	// durable record that reached them once would be enumerable from then on
+	if 0 < len(self.subscriptions) && ExtenderRecordOpen(body) {
 		self.publishWithLock(&protocol.ExtenderGossipMessage{
 			Message: &protocol.ExtenderGossipMessage_Record{Record: record},
 		})
@@ -945,39 +1000,51 @@ func (self *ExtenderDirectory) publishWithLock(message *protocol.ExtenderGossipM
 	}
 }
 
-// SampleRecords returns up to `count` signed records of active verified
-// identities in random order, with the record of `ownPublicKey` first when the
-// directory holds one (D4). The messages carry the record exactly as it was
-// received, so a relayed sample is still verifiable under the root keys.
+// SampleRecords returns up to `count` signed records of the open tier for one
+// vantage (D4, Q2), with the record of `ownPublicKey` first when the directory
+// holds one and it is open. The rest are the vantage's feed partition
+// (ExtenderPartitionMembers), in the order of the current epoch
+// (ExtenderPartitionOrder) interleaved by family, so a vantage that polls
+// forever sees its partition and no more, and two polls in one epoch see the
+// same sample. A gated record is never sampled, whatever source it arrived
+// from (Q1). The messages carry the record exactly as it was received, so a
+// relayed sample is still verifiable under the root keys. `vantage` is the
+// caller's (ExtenderVantageKeyOfAddr); nil is a vantage of its own.
 func (self *ExtenderDirectory) SampleRecords(
 	count int,
 	ownPublicKey []byte,
+	vantage []byte,
 ) []*protocol.ExtenderGossipMessage {
 	if count <= 0 {
 		return []*protocol.ExtenderGossipMessage{}
 	}
 	ownKeyHex := hex.EncodeToString(ownPublicKey)
 	now := self.settings.Now()
+	epoch := ExtenderEpoch(now, self.settings.OpenEpochTimeout)
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
 	var ownRecord *protocol.ExtenderRecord
-	records := []*protocol.ExtenderRecord{}
+	keyHexes := []string{}
+	keyHexRecords := map[string]*protocol.ExtenderRecord{}
 	recordBodies := map[*protocol.ExtenderRecord]*protocol.ExtenderRecordBody{}
-	for keyHex, keyRecord := range self.keyHexRecords {
-		if keyRecord.record == nil || keyRecord.recordBody == nil {
-			continue
-		}
-		if self.keyRecordRevokedWithLock(keyRecord) || self.keyRecordExpiredWithLock(keyRecord, now) {
-			continue
-		}
+	for _, keyHex := range self.openKeyHexesWithLock(now) {
+		keyRecord := self.keyHexRecords[keyHex]
 		if 0 < len(ownPublicKey) && keyHex == ownKeyHex {
 			ownRecord = keyRecord.record
+		}
+		keyHexes = append(keyHexes, keyHex)
+		keyHexRecords[keyHex] = keyRecord.record
+		recordBodies[keyRecord.record] = keyRecord.recordBody
+	}
+	members, _, _ := ExtenderPartitionMembers(self.partitionSecret, ExtenderChannelFeed, vantage, keyHexes)
+	records := []*protocol.ExtenderRecord{}
+	for _, keyHex := range ExtenderPartitionOrder(self.partitionSecret, ExtenderChannelFeed, vantage, epoch, members) {
+		if keyHex == ownKeyHex {
 			continue
 		}
-		records = append(records, keyRecord.record)
-		recordBodies[keyRecord.record] = keyRecord.recordBody
+		records = append(records, keyHexRecords[keyHex])
 	}
 	records = balanceRecordsByIpFamily(records, recordBodies)
 	if ownRecord != nil {
@@ -996,12 +1063,58 @@ func (self *ExtenderDirectory) SampleRecords(
 	return messages
 }
 
+// The keys of the open tier the feed may serve (Q1, Q2): every held record
+// that is not revoked, not expired and not gated, in key order. The order is
+// what makes the partitions reproducible whatever order the map hands the
+// keys in.
+func (self *ExtenderDirectory) openKeyHexesWithLock(now time.Time) []string {
+	keyHexes := []string{}
+	for keyHex, keyRecord := range self.keyHexRecords {
+		if keyRecord.record == nil || keyRecord.recordBody == nil {
+			continue
+		}
+		if self.keyRecordRevokedWithLock(keyRecord) || self.keyRecordExpiredWithLock(keyRecord, now) {
+			continue
+		}
+		if !ExtenderRecordOpen(keyRecord.recordBody) {
+			continue
+		}
+		keyHexes = append(keyHexes, keyHex)
+	}
+	slices.Sort(keyHexes)
+	return keyHexes
+}
+
+// Whether the feed may stream the record of `publicKey` to a subscriber at
+// `vantage` (Q2): it is in the open tier and in the vantage's feed partition,
+// as SampleRecords would place it now. A record outside the partition is as
+// unseen on the stream as it is in the sample, so a subscriber that stays
+// connected through a whole drip rotation still learns its partition and no
+// more. A key the directory does not hold, or holds revoked, expired or
+// gated, is not streamed.
+func (self *ExtenderDirectory) OpenPartitionContains(vantage []byte, publicKey []byte) bool {
+	keyHex := hex.EncodeToString(publicKey)
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	keyHexes := self.openKeyHexesWithLock(now)
+	if !slices.Contains(keyHexes, keyHex) {
+		return false
+	}
+	members, _, _ := ExtenderPartitionMembers(self.partitionSecret, ExtenderChannelFeed, vantage, keyHexes)
+	return slices.Contains(members, keyHex)
+}
+
 // balanceRecordsByIpFamily orders records so that taking a prefix of any length
 // yields as close to an equal number of v4-reachable and v6-reachable extenders
-// as the directory can supply.
+// as the directory can supply, keeping the relative order the caller gave
+// within each family -- the epoch's keyed order (SampleRecords), so the result
+// is as deterministic as its input.
 //
-// A plain shuffle does not do this. A directory that is mostly v4 -- which is
-// the normal case, since v4 addresses are easier to come by -- hands a v6-only
+// A plain cut does not do this. A directory that is mostly v4 -- which is the
+// normal case, since v4 addresses are easier to come by -- hands a v6-only
 // client a sample it cannot dial, and the client has no way to ask for more.
 //
 // Reachability, not exclusivity: a dual-stack extender is in both buckets and
@@ -1038,13 +1151,6 @@ func balanceRecordsByIpFamily(
 			unreachable = append(unreachable, record)
 		}
 	}
-	shuffle := func(pool []*protocol.ExtenderRecord) {
-		mathrand.Shuffle(len(pool), func(i int, j int) {
-			pool[i], pool[j] = pool[j], pool[i]
-		})
-	}
-	shuffle(ipv4Capable)
-	shuffle(ipv6Capable)
 
 	balanced := make([]*protocol.ExtenderRecord, 0, len(records))
 	taken := map[*protocol.ExtenderRecord]bool{}
@@ -1985,6 +2091,7 @@ func (self *ExtenderDirectory) candidateWithLock(
 	candidate.PublicKey = slices.Clone(keyRecord.publicKey)
 	candidate.CountryCode = body.CountryCode
 	candidate.ContinentCode = strings.ToUpper(strings.TrimSpace(body.ContinentCode))
+	candidate.DirectoryTier = int(body.DirectoryTier)
 	if 0 < body.TcpPort {
 		candidate.TcpPort = int(body.TcpPort)
 	}
@@ -2003,7 +2110,63 @@ func (self *ExtenderDirectory) candidateWithLock(
 	if carriers := recordAddressCarriers(body, address.ip); carriers != nil {
 		candidate.Carriers = carriers
 	}
+	// the webrtc carrier needs the record's rendezvous id and a signaling
+	// path on this host, which the enable says the owner has (S)
+	if webRtcClientId, err := IdFromBytes(body.WebRtcClientId); err == nil {
+		candidate.WebRtcClientId = webRtcClientId
+	}
+	if !self.webRtcCarrierEnabled || candidate.WebRtcClientId == (Id{}) {
+		candidate.Carriers = slices.DeleteFunc(
+			slices.Clone(candidate.Carriers),
+			func(carrier string) bool { return carrier == ExtenderCarrierWebRtc },
+		)
+	}
 	return candidate
+}
+
+// SetWebRtcCarrierEnabled turns the webrtc carrier of every candidate on or
+// off at run time (EXTENDER.md S): on when the owner has installed a carrier
+// with a signaling path on its connect settings, off again when it loses it.
+func (self *ExtenderDirectory) SetWebRtcCarrierEnabled(enabled bool) {
+	changed := false
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.webRtcCarrierEnabled == enabled {
+			return
+		}
+		self.webRtcCarrierEnabled = enabled
+		changed = true
+	}()
+	if changed {
+		self.changeMonitor.Update(func(version uint64) uint64 { return version + 1 })
+	}
+}
+
+// WebRtcCarrierEnabled reports whether candidates carry the webrtc carrier.
+func (self *ExtenderDirectory) WebRtcCarrierEnabled() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.webRtcCarrierEnabled
+}
+
+// WebRtcClientId is the exchange rendezvous id the verified record of one
+// identity carries for its webrtc carrier (EXTENDER.md S), which the dial
+// side's resolver signals to. false for an unknown key, a key with no record,
+// and a record that carries no id.
+func (self *ExtenderDirectory) WebRtcClientId(publicKey []byte) (Id, bool) {
+	keyHex := hex.EncodeToString(publicKey)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	keyRecord := self.keyHexRecords[keyHex]
+	if keyRecord == nil || keyRecord.recordBody == nil {
+		return Id{}, false
+	}
+	webRtcClientId, err := IdFromBytes(keyRecord.recordBody.WebRtcClientId)
+	if err != nil || webRtcClientId == (Id{}) {
+		return Id{}, false
+	}
+	return webRtcClientId, true
 }
 
 // The dns ports one record offers, ascending (L2). DnsPorts when it has them,
@@ -2035,7 +2198,7 @@ func recordAddressCarriers(body *protocol.ExtenderRecordBody, ip netip.Addr) []s
 		carriers := []string{}
 		for _, carrier := range recordAddress.Carriers {
 			switch carrier {
-			case ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns:
+			case ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns, ExtenderCarrierWebRtc:
 				carriers = append(carriers, carrier)
 			}
 		}
@@ -2368,6 +2531,7 @@ func (self *ExtenderDirectory) Snapshot() *ExtenderDirectorySnapshot {
 			Carriers:        candidate.Carriers,
 			CountryCode:     candidate.CountryCode,
 			ContinentCode:   candidate.ContinentCode,
+			DirectoryTier:   candidate.DirectoryTier,
 			Latency:         candidate.Latency,
 			State:           state,
 			Source:          address.source,

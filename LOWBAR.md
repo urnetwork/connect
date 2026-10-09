@@ -3,15 +3,32 @@
 Status: living implementation plan
 Last updated: 2026-09-04
 
-Current iOS-profile memory gate (2026-09-30): every observed Go-runtime sample
-must be at most **28 MiB (29,360,128 bytes)**, including startup, traffic,
-drain, role transition and five-minute quiet recovery. Android MEMSTEADY must
-explicitly select and report `ios-memory-audit-v1`, with unchanged 20-MiB
-admission and 32-MiB Go soft-limit inputs; ordinary Android 28/40 is not that
-profile. This authorized cap change is not a performance improvement or a
-budget increase. Dated 24-MiB results below retain their original verdicts;
-new allocations require paired H1/default-path evidence and the current
-[MEMSTEADY gate](MEMSTEADY.md#scope-and-acceptance-signals).
+Current memory policy (reconfirmed 2026-10-06): normal Android uses **64/64
+MiB** DeviceLocal admission / Go soft limit, both clamped to its effective
+memory-class allowance. iOS uses **32/32 MiB**. MEMSTEADY must exercise that
+iOS profile on **both allowlisted Android PERF phones** below, explicitly
+selecting and observing `ios-memory-audit-v2`. Every Go-runtime sample must
+be at most **32 MiB (33,554,432 bytes)**, including startup, traffic, drain,
+role transition, five-minute quiet recovery, and teardown. An ordinary Android
+build cannot qualify, even if its sampled runtime is below 32 MiB.
+Historical v1 retains its 20/32/28-MiB meaning; dated 24/28-MiB and Android
+28/40, 28/64, and 64/64 measurements below keep their original inputs and
+verdicts and do not become current-profile receipts. New allocations require
+paired H1/default-path evidence and the current
+[MEMSTEADY gate](MEMSTEADY.md#scope-and-acceptance-signals). Android proxy
+evidence does not qualify the separate signed-iOS kernel-peak
+`phys_footprint <50 MiB` requirement.
+
+Memory acceptance includes actual DeviceLocal cancellation/join and a fresh
+native terminal read after the original exporter/ring drain and holder-scope
+release, with profile32/rate0 unchanged. Finish acknowledgement and an unchanged
+quiet file are insufficient. Gate all retained same-metric values from device,
+teardown, status and diagnostic scopes, plus separately counted MemStats/trim/
+owner-census representations; ambiguous prior-profile values do not qualify.
+Do not call these independent samples or every internal policy read. Quiet's
+21-sample/300-second primitive window is unchanged. Require the eligible live
+prefix proof and normal joined instrumentation/native-owner evidence described
+in MEMSTEADY; retain failure peaks and incomplete evidence before classification.
 
 ## Outcome
 

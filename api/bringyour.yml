@@ -1,13 +1,21 @@
 openapi: "3.1.0"
 info:
-  version: 2026.9.14
+  # Not a release or date stamp: the api is not versioned, and this document
+  # describes the current deployment. Releases do not rewrite this field. A
+  # client that needs to pin the document pins its content hash, as the sdk's
+  # generated client does (it records the sha256 of the spec it was built from).
+  version: "1.0.0"
   title: URnetwork
   description: |
     URnetwork is a web-standards VPN marketplace with an emphasis on
-    fast, secure internet everwhere.
+    fast, secure internet everywhere.
 
     The API for URnetwork bootstraps the `connect` protocol,
     and is the source of JWTs and other match-making transactions.
+
+    Authenticated routes take `Authorization: Bearer <token>`, where the
+    token is a URnetwork JWT or an API key. The BearerAuth security scheme
+    describes how to get either.
 
     The JWT returned by /auth routes does not have a clientId.
     The `connect` protocol requires a JWT with a clientId.
@@ -32,6 +40,14 @@ info:
     `/competition`. Those routes are a separate, fail-closed security domain
     with their own opaque role-scoped tokens, and they are documented in
     `sn/api/competition.yml`, not here.
+
+    Operations marked `x-internal: true` are not part of the public API:
+    the server-to-server webhooks (payment processors, app stores and the
+    email provider), the operator's provider probe control plane, the admin
+    reports, the operator's own evidence publishing, the acceptance-test
+    routes and the extender directory calls the SDK makes on its own. They
+    stay in this document so the server's route and conformance checks
+    cover them; the public API reference leaves them out.
 
   termsOfService: https://ur.io/terms
   contact:
@@ -61,82 +77,107 @@ servers:
 security:
   - BearerAuth: []
 
+# One tag per operation: the ur.io API reference group it is filed under, in
+# the reference's order. The reference groups by first path segment (a known
+# group, else Other), so a new operation takes the tag of its first segment.
 tags:
-  - name: onboarding
+  - name: Authentication
     description: |
-      The new-user onboarding program (mmm/onboarding/PLAN.md): the welcome
-      offer, the campaign landing and feedback links, and the sign-up
-      preferences the campaign honors.
-  - name: analytics
+      Sign-in and the network's sign-in methods: login with an email or a
+      phone number (password or verification code), an Apple or Google
+      identity token, a wallet signature or a seed phrase; network creation
+      and deletion; auth codes; and the Apple and Google sign-in returns for
+      the apps that sign in through the system browser. The login routes
+      return a network JWT (`by_jwt`); the BearerAuth security scheme
+      describes the shortest way to a token.
+  - name: Network
     description: |
-      Product events and experiment results behind the onboarding
-      optimization loop: the closed client event schema, the experiment
-      registry and the aggregated results the analysis script reads.
-  - name: subscription
-    description: Pro subscriptions, prices and the store purchase paths.
-  - name: store webhooks
-    description: |
-      The server-to-server notifications the payment processors and the app
-      stores post here. None of them carries a URnetwork JWT: each is
-      authenticated by the sender's own scheme, checked before the body is
-      parsed -- the Stripe signature header, the Coinbase and Helius shared
-      secrets, the Google Pub/Sub push claim, the Circle ECDSA notification
-      signature, and, for the App Store, a JWS chain that must terminate at a
-      pinned Apple root. The bodies below list only the fields the server
-      reads; every sender posts more, and a sender may add more at any time.
-  - name: extenders
-    description: |
-      The extender network (connect/EXTENDER.md): volunteer relays that carry
-      the connect protocol over an ordinary-looking carrier (tls, quic or dns)
+      The network's clients, cloud proxy devices and peers; provider
+      locations and provider search; rankings, the emoji tag, blocked
+      locations, reliability and provider status; and the network user.
+      `POST /network/auth-client` exchanges a network JWT for the client JWT
+      the `connect` protocol needs.
+
+      The extender network lives here too: volunteer relays that carry the
+      `connect` protocol over an ordinary-looking carrier (tls, quic or dns)
       into the platform, so a client on a network that blocks URnetwork still
       reaches it. An extender proves itself by being probed from the outside
       before it is published, and clients discover extenders from signed
       records -- their own on activation, everyone else's over gossip.
-  - name: provider probing
+  - name: Stats
     description: |
-      The operator-to-server control plane of the provider probe fleet: the
-      queues of which providers are due to be probed, the measurements the
-      prober submits back (egress location, egress health, blackhole checks,
-      bandwidth), and the credential and certificate pins the prober itself
-      fetches. These routes are NOT authenticated by a network JWT. They carry
-      the shared operator secret in an `X-UR-Operator-Secret` header, checked
-      in constant time against `provider_egress.yml` `ingest_secret`; a
-      deployment whose vault has no such resource rejects every request. The
-      one exception is `POST /network/provider-verdict`, which a real client
-      network calls with its own session.
-  - name: x402
+      Public network statistics and the provider and extender density map,
+      the caller network's provider statistics, and the leaderboards.
+  - name: Subscription
     description: |
-      Inline agent payments over the x402 header protocol: an agent asks for a
-      sku, is answered `402` with the payment terms, and retries the same
-      request with a signed payment in `X-PAYMENT`. Both routes answer `404`
-      while x402 is not configured and enabled (vault `x402.yml`).
-  - name: subnet evidence
+      Pro subscriptions: status and balance, prices, cancel and resume,
+      balance codes, and the Stripe, Google Play and App Store purchase
+      paths.
+  - name: Wallet
     description: |
-      The public, content-addressed evidence surface of the subnet: immutable
-      payout artifacts and signed release-evidence envelopes, addressed by
-      their sha256 content hash and paged by their history prefix, plus the
-      client-key observation endpoints a client uses to publish and read a
-      signed key history. Reads are public and immutable; writes are either an
-      authenticated client session under a byte budget or the operator's own
-      artifact signature.
-  - name: oauth
+      The network's Circle USDC user custody wallet: balance, address
+      validation, setup and transfers out.
+  - name: Device
     description: |
-      The OAuth 2.1 / OpenID Connect authorization server (server/IDP.md).
-      Its issuer is a separate hostname that the load balancer routes to this
-      same service, so these paths answer on either host; the issuer published
-      in the discovery documents is the one clients use. Authentication here
-      is the OAuth mechanism of each endpoint -- a PKCE code, a refresh token,
-      an access token -- except `/oauth/authorize` and `/oauth/consent`, which
-      the ur.io consent page calls with the signed-in user's URnetwork JWT.
+      Device sharing and adoption with share and adopt codes (and their QR
+      images), and the network's device associations and device names.
+  - name: Account
+    description: |
+      API keys, payout and account wallets, points, payments, redeemed
+      balance codes, subnet epochs, referrals and the network name.
+  - name: Preferences
+    description: The account's preferences, such as product update emails.
+  - name: Feedback
+    description: Send feedback about URnetwork.
+  - name: Connect protocol
+    description: |
+      The browser single sign-on redirect (`/connect`) and the out-of-band
+      control messages of the `connect` protocol (`/connect/control`).
+  - name: Transfer
+    description: The network's paid and unpaid transfer byte counts.
+  - name: Solana
+    description: Paying for Pro with Solana Pay.
+  - name: Referral codes
+    description: Check a referral code before an account exists.
+  - name: Other
+    description: |
+      Everything outside the groups above:
+
+      - discovery and status: `/hello`, `/status`, `/clock`, `/my-ip-info`
+        and the policy redirects (`/privacy.txt`, `/terms.txt`, `/vdp.txt`)
+      - client public keys (`/key`) and client log upload (`/log`)
+      - Stripe checkout and the customer portal (`/stripe`), and data packs
+        bought without signing in (`/pay/data`)
+      - inline agent payments over the x402 header protocol (`/x402`): an
+        agent asks for a sku, is answered `402` with the payment terms, and
+        retries the same request with a signed payment in `X-PAYMENT`
+      - the subnet (`/sn`): payout wallets and their consents, head mining,
+        pool claims and epochs, and the public, content-addressed payout
+        artifacts and release evidence, addressed by their sha256 content
+        hash
+      - the routing-verification protocol with its public statistics and
+        proofs (`/verify`)
+      - the new-user onboarding program and product events (`/onboarding`,
+        `/client/events`)
+      - the OAuth 2.1 / OpenID Connect authorization server (`/.well-known`,
+        `/oauth`). Its issuer is a separate hostname that the load balancer
+        routes to this same service, so these paths answer on either host;
+        the issuer published in the discovery documents is the one clients
+        use. Authentication there is the OAuth mechanism of each endpoint --
+        a PKCE code, a refresh token, an access token -- except
+        `/oauth/authorize` and `/oauth/consent`, which the ur.io consent page
+        calls with the signed-in user's URnetwork JWT.
 
 paths:
   /privacy.txt:
     get:
+      tags: [Other]
+      summary: Privacy Txt
       description: |
         Redirect (303) to the canonical privacy policy on bringyour.com.
         The api serves the redirect so a client that only knows the api host
         can still reach the policy.
-      operationId: Privacy Txt
+      operationId: privacyTxt
       security: []
       responses:
         "303":
@@ -148,9 +189,11 @@ paths:
 
   /terms.txt:
     get:
+      tags: [Other]
+      summary: Terms Txt
       description: |
         Redirect (303) to the canonical terms of service on bringyour.com.
-      operationId: Terms Txt
+      operationId: termsTxt
       security: []
       responses:
         "303":
@@ -162,10 +205,12 @@ paths:
 
   /vdp.txt:
     get:
+      tags: [Other]
+      summary: Vdp Txt
       description: |
         Redirect (303) to the vulnerability disclosure policy on
         bringyour.com.
-      operationId: Vdp Txt
+      operationId: vdpTxt
       security: []
       responses:
         "303":
@@ -177,6 +222,8 @@ paths:
 
   /status:
     get:
+      tags: [Other]
+      summary: Warp Status
       description: |
         The serving status of the api process that answered, used by the
         deploy poll and by fleet status sampling. `status` is a latched value
@@ -187,7 +234,7 @@ paths:
         an error, so an operator-initiated drain is not counted as a service
         error). `host`, `service` and `block` name the process that answered,
         and `client_address` is the caller address it observed.
-      operationId: Warp Status
+      operationId: warpStatus
       security: []
       responses:
         "200":
@@ -199,12 +246,14 @@ paths:
 
   /clock:
     get:
+      tags: [Other]
+      summary: Clock
       description: |
         Get the cumulative destination-reported bytes for contracts finalized
         on or after the start of subnet block 9.
         The counter advances when contracts reach a final outcome and is
         intended for public clients polling every 1-5 seconds.
-      operationId: Clock
+      operationId: clock
       security: []
       responses:
         "200":
@@ -218,10 +267,12 @@ paths:
 
   /stats/last-90:
     get:
+      tags: [Stats]
+      summary: Stats Last 90
       description: |
         Get network statistics for the last 90 days.
         The statistics are updated approximately every 60s.
-      operationId: Stats Last 90
+      operationId: statsLast90
       security: []
       responses:
         "200":
@@ -233,7 +284,7 @@ paths:
 
   /stats/providers-map:
     get:
-      tags: [extenders]
+      tags: [Stats]
       summary: Provider and extender density by region
       description: |
         The provider-density map behind the public map page: how many public
@@ -258,7 +309,7 @@ paths:
         Like `/stats/last-90` this serves a redis-exported blob rather than a
         live query, refreshed every 5 minutes by the `ExportProvidersMap`
         task, so it never touches the database on the request path.
-      operationId: Stats Providers Map
+      operationId: statsProvidersMap
       security: []
       responses:
         "200":
@@ -272,10 +323,12 @@ paths:
 
   /stats/providers:
     get:
+      tags: [Stats]
+      summary: Stats Providers
       description: |
         Get all providers in the caller network.
         Each provider includes stats from the last 24 hours.
-      operationId: Stats Providers
+      operationId: statsProviders
       security:
         - BearerAuth: []
       responses:
@@ -285,13 +338,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProvidersResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/providers-last-n:
     post:
+      tags: [Stats]
+      summary: Stats Providers Last N hours
       description: |
         Get all providers in the caller network.
         Each provider includes stats from the last n hours.
-      operationId: Stats Providers Last N hours
+      operationId: statsProvidersLastNHours
       security:
         - BearerAuth: []
       requestBody:
@@ -307,13 +364,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProvidersResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/provider-last-n:
     post:
+      tags: [Stats]
+      summary: Stats Provider Last N hours
       description: |
         Get detailed stats on a single provider in the caller network.
         This is meant to give the user complete visibility over usage.
-      operationId: Stats Provider Last N hours
+      operationId: statsProviderLastNHours
       security:
         - BearerAuth: []
       requestBody:
@@ -329,13 +390,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProviderResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/providers-overview-last-n:
     post:
+      tags: [Stats]
+      summary: Stats Providers Overview Last N hours
       description: |
         Get a network-wide time series aggregated across all providers in the
         caller network, over the last n hours.
-      operationId: Stats Providers Overview Last N hours
+      operationId: statsProvidersOverviewLastNHours
       security:
         - BearerAuth: []
       requestBody:
@@ -351,14 +416,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProvidersOverviewResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/providers-overview-last-90:
     get:
+      tags: [Stats]
+      summary: Stats Providers Overview Last 90
       description: |
         Legacy alias of `/stats/providers-overview-last-n` with the lookback
         fixed at 90 days, kept for callers that predate the route migration.
         New callers should use `/stats/providers-overview-last-n`.
-      operationId: Stats Providers Overview Last 90
+      operationId: statsProvidersOverviewLast90
       security:
         - BearerAuth: []
       responses:
@@ -368,16 +437,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProvidersOverviewResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/provider-last-90:
     post:
+      tags: [Stats]
+      summary: Stats Provider Last 90
       description: |
         Legacy alias of `/stats/provider-last-n`, kept for callers that
         predate the route migration. A request that names neither `last_n` nor
         `lookback` is served with a 90-day lookback; otherwise it behaves
         exactly like `/stats/provider-last-n`. New callers should use
         `/stats/provider-last-n`.
-      operationId: Stats Provider Last 90
+      operationId: statsProviderLast90
       security:
         - BearerAuth: []
       requestBody:
@@ -393,12 +466,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsProviderResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /stats/leaderboard:
     post:
+      tags: [Stats]
+      summary: Stats Leaderboard
       description: |
         Fetches top 100 current leaderboard. This data is refreshed every payout.
-      operationId: Stats Leaderboard
+      operationId: statsLeaderboard
       security:
         - BearerAuth: []
       requestBody:
@@ -417,6 +494,8 @@ paths:
 
   /stats/points-leaderboard:
     post:
+      tags: [Stats]
+      summary: Stats Points Leaderboard
       description: |
         Page the all-time points leaderboard. Every network with points is
         ranked on three dimensions (total points, finalized epochs with points
@@ -441,7 +520,7 @@ paths:
         In the list itself the caller's row is anonymous like everyone
         else's until it opts in: the caller sees what everyone sees, and the
         apps only highlight that row.
-      operationId: Stats Points Leaderboard
+      operationId: statsPointsLeaderboard
       # optional auth: anonymous callers get the list, a bearer adds `me`
       security:
         - {}
@@ -462,6 +541,8 @@ paths:
 
   /auth/login:
     post:
+      tags: [Authentication]
+      summary: Auth Login
       description: |
         Start a login for a user authority.
         The user authority may be:
@@ -482,7 +563,7 @@ paths:
         `error.code` `signature_mismatch` when the request sets
         `result_errors`, as a 200. Without it, that refusal is a 401 with a
         plain text body. Every other wallet refusal keeps its HTTP status.
-      operationId: Auth Login
+      operationId: authLogin
       security: []
       requestBody:
         required: true
@@ -500,6 +581,8 @@ paths:
 
   /auth/wallet-challenge:
     post:
+      tags: [Authentication]
+      summary: Auth Wallet Challenge
       description: |
         Issue a single-use wallet sign-in challenge. The wallet signs the
         returned `message_template` byte for byte; the signature is then
@@ -514,7 +597,7 @@ paths:
         both the raw text and the polkadot-js `<Bytes>…</Bytes>`-wrapped form
         of the signature verify, and the unwrapped text is what the client
         submits. Rate limited per client address. See server/BITTENSOR-LOGIN.md.
-      operationId: Auth Wallet Challenge
+      operationId: authWalletChallenge
       security: []
       requestBody:
         required: true
@@ -532,6 +615,8 @@ paths:
 
   /auth/wallet-nonce:
     post:
+      tags: [Authentication]
+      summary: Auth Wallet Nonce
       description: |
         Issue a fresh single-use, short-lived (5 minute) nonce for wallet
         login. The client embeds the returned nonce in the message it signs
@@ -543,7 +628,7 @@ paths:
         This is the older, narrower anti-replay token. `/auth/wallet-challenge`
         supersedes it: that one returns the exact message text to sign and
         binds the challenge to a blockchain and an address.
-      operationId: Auth Wallet Nonce
+      operationId: authWalletNonce
       security: []
       responses:
         "200":
@@ -555,9 +640,11 @@ paths:
 
   /auth/login-with-password:
     post:
+      tags: [Authentication]
+      summary: Auth Login With Password
       description: |
         Password login for email and phone number.
-      operationId: Auth Login With Password
+      operationId: authLoginWithPassword
       security: []
       requestBody:
         required: true
@@ -575,9 +662,11 @@ paths:
 
   /auth/verify:
     post:
+      tags: [Authentication]
+      summary: Auth Verify
       description: |
         Verify ownership of email or phone number.
-      operationId: Auth Verify
+      operationId: authVerify
       security: []
       requestBody:
         required: true
@@ -595,10 +684,12 @@ paths:
 
   /auth/refresh:
     get:
+      tags: [Authentication]
+      summary: Auth Refresh Token
       description: |
         Refresh the client JWT (by_jwt) for the caller's client.
         Requires a client JWT (from `/network/auth-client`).
-      operationId: Auth Refresh Token
+      operationId: authRefreshToken
       security:
         - BearerAuth: []
       responses:
@@ -611,6 +702,8 @@ paths:
 
   /auth/verify-send:
     post:
+      tags: [Authentication]
+      summary: Auth Verify Send
       description: |
         Send verification code to email or phone number.
 
@@ -619,7 +712,7 @@ paths:
         `retry_after_seconds`). Without it, a rate limit is a 429 and a failed
         send is a 502, both with a plain text body. Clients must not report a
         code as sent unless the response is a 200 without `error`.
-      operationId: Auth Verify Send
+      operationId: authVerifySend
       security: []
       requestBody:
         required: true
@@ -646,6 +739,8 @@ paths:
 
   /auth/password-reset:
     post:
+      tags: [Authentication]
+      summary: Auth Password Reset
       description: |
         Send password reset code to email or phone number.
 
@@ -655,7 +750,7 @@ paths:
         failed send is a 502, both with a plain text body. Clients must not
         report a reset code as sent unless the response is a 200 without
         `error`.
-      operationId: Auth Password Reset
+      operationId: authPasswordReset
       security: []
       requestBody:
         required: true
@@ -682,9 +777,11 @@ paths:
 
   /auth/password-set:
     post:
+      tags: [Authentication]
+      summary: Auth Password Set
       description: |
         Change password.
-      operationId: Auth Password Set
+      operationId: authPasswordSet
       security: []
       requestBody:
         required: true
@@ -702,6 +799,8 @@ paths:
 
   /auth/network-check:
     post:
+      tags: [Authentication]
+      summary: Auth Network Check
       description: |
         Check if the network name is available.
         The name is normalized before it is checked: trimmed, lower-cased, and
@@ -710,7 +809,7 @@ paths:
         - at most 50 characters
         - only lowercase letters, digits and dashes
         and must not be within one edit of an existing network name.
-      operationId: Auth Network Check
+      operationId: authNetworkCheck
       security: []
       requestBody:
         required: true
@@ -728,7 +827,7 @@ paths:
 
   /auth/network-create:
     post:
-      tags: [onboarding]
+      tags: [Authentication]
       summary: Create a network
       description: |
         Create a new network.
@@ -774,9 +873,11 @@ paths:
 
   /auth/network-delete:
     post:
+      tags: [Authentication]
+      summary: Auth Network Delete
       description: |
         Delete network
-      operationId: Auth Network Delete
+      operationId: authNetworkDelete
       security:
         - BearerAuth: []
       responses:
@@ -786,17 +887,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkDeleteResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /auth/code-create:
     post:
+      tags: [Authentication]
+      summary: Auth Code Create
       description: |
         Create a limited use code (auth code) to share authentication
         with connected apps and tools.
         The code is tied to the caller session,
         and will be expired with any of the caller's sessions.
         This is a subset of an OAuth flow. For the full OAuth 2.1 / OpenID
-        Connect flow see the `oauth` routes.
-      operationId: Auth Code Create
+        Connect flow see the `/oauth` routes.
+      operationId: authCodeCreate
       security:
         - BearerAuth: []
       requestBody:
@@ -812,10 +917,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthCodeCreateResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /auth/apple/callback:
     post:
-      tags: [auth]
+      tags: [Authentication]
       summary: Sign in with Apple return for android, windows and linux
       operationId: authAppleCallback
       # a browser redirect from the identity provider; no bearer
@@ -880,7 +987,7 @@ paths:
         '400':
           description: No `state` in the form, or a body over 64 KiB.
     get:
-      tags: [auth]
+      tags: [Authentication]
       summary: Sign in with Apple return (query form, for manual testing)
       operationId: authAppleCallbackGet
       # a browser redirect from the identity provider; no bearer
@@ -914,7 +1021,7 @@ paths:
           description: No `state`.
   /auth/google/callback:
     get:
-      tags: [auth]
+      tags: [Authentication]
       summary: Sign in with Google return for windows and linux
       operationId: authGoogleCallback
       # a browser redirect from the identity provider; no bearer
@@ -928,9 +1035,8 @@ paths:
         (android signs in with play services and ur.io in the page; neither
         uses this). Google redirects the browser here with the authorization
         code; this endpoint exchanges it at Google's token endpoint with the
-        web client's secret (vault `google.yml` `sign_in_oauth`) and answers
-        `302` to the app's own scheme so the browser hands control back to
-        the app:
+        web client's secret and answers `302` to the app's own scheme so the
+        browser hands control back to the app:
 
         ```
         <scheme>://oauth/google?state=…&id_token=…
@@ -949,7 +1055,8 @@ paths:
         `urnetwork://`); without it the android scheme is used. Google's own
         `error` (e.g. `access_denied`) is passed through; a failed exchange
         or a missing client configuration comes back as `error` too
-        (`not_configured` when the vault has no `sign_in_oauth`).
+        (`not_configured` when the server has no Google sign-in client
+        configured).
       parameters:
         - in: query
           name: state
@@ -981,12 +1088,14 @@ paths:
           description: Not a `GET`.
   /auth/code-login:
     post:
+      tags: [Authentication]
+      summary: Auth Code Login
       description: |
         Authenticate with an auth code.
         The returned session is tied to the session that created the auth code,
         and will be expired with any of the creator's sessions.
         This is a subset of an OAuth flow.
-      operationId: Auth Code Login
+      operationId: authCodeLogin
       security: []
       requestBody:
         required: true
@@ -1004,6 +1113,8 @@ paths:
 
   /auth/add-auth:
     post:
+      tags: [Authentication]
+      summary: Auth Add Auth
       description: |
         Add an authentication method (email/phone + password, SSO, or wallet)
         to the calling user. A wallet (`wallet_auth`, Solana or Bittensor)
@@ -1015,7 +1126,7 @@ paths:
         wallet signature that does not verify for `wallet_address` over the
         challenge (in practice the wallet signed with another account than
         the address entered) has `error.code` `signature_mismatch`.
-      operationId: Auth Add Auth
+      operationId: authAddAuth
       security:
         - BearerAuth: []
       requestBody:
@@ -1031,13 +1142,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AddAuthResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /auth/remove-auth:
     post:
+      tags: [Authentication]
+      summary: Auth Remove Auth
       description: |
         Remove an authentication method from the calling user. The last
         remaining method cannot be removed.
-      operationId: Auth Remove Auth
+      operationId: authRemoveAuth
       security:
         - BearerAuth: []
       requestBody:
@@ -1053,13 +1168,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RemoveAuthResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /auth/generate-seedphrase:
     post:
+      tags: [Authentication]
+      summary: Auth Generate Seedphrase
       description: |
         Generate a recovery seedphrase for the calling user. Fails if a
         seedphrase auth already exists; see /auth/regenerate-seedphrase.
-      operationId: Auth Generate Seedphrase
+      operationId: authGenerateSeedphrase
       security:
         - BearerAuth: []
       responses:
@@ -1069,13 +1188,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GenerateSeedphraseResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /auth/regenerate-seedphrase:
     post:
+      tags: [Authentication]
+      summary: Auth Regenerate Seedphrase
       description: |
         Replace the calling user's recovery seedphrase with a new one,
         invalidating the previous seedphrase.
-      operationId: Auth Regenerate Seedphrase
+      operationId: authRegenerateSeedphrase
       security:
         - BearerAuth: []
       responses:
@@ -1085,21 +1208,35 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RegenerateSeedphraseResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/auth-client:
     post:
-      tags: [onboarding]
+      tags: [Network]
       summary: Authenticate a client on the network
       description: |
         Gain permission to use the `connect` protocol as the requested clientId,
         or assign a new clientId.
 
-        When the deployment enforces concurrent clients, a network is limited
-        to 100 TOP-LEVEL clients (clients with no `source_client_id`, which are
-        the network's peers); ancillary clients are not counted. Over the
-        limit the call answers 200 with `error.upgrade_required` -- a plan
-        limit, not a hard cap -- and an agent can settle it inline with the
-        x402 round trip below.
+        Two limits apply to creating a top-level client (a client with no
+        `source_client_id`; top-level clients are the network's peers). Both
+        are enforced only while the deployment enforces concurrent clients,
+        and ancillary clients (with a `source_client_id`) count toward
+        neither:
+        - The client limit: 100 active top-level clients. Over it the call
+          answers 200 with `error.client_limit_exceeded` and the message
+          "Client limit exceeded."
+        - The plan's limit on concurrently connected top-level clients. Over
+          it the call answers with `error.client_limit_exceeded` and
+          `error.upgrade_required` -- a plan limit, not a hard cap. When x402
+          inline payments are enabled and a price can be quoted, the answer
+          is HTTP 402 with the terms for a Pro month instead, so an agent can
+          pay and retry the same request (see `/x402`); otherwise it is 200
+          with the error.
+
+        A network on an Embed plan has a per-network client allowance that
+        sets both limits.
 
         A provider install (a device that only provides, such as an embedded
         provider) sets `provide_intent`. Creating a top-level client with it is
@@ -1148,12 +1285,328 @@ paths:
                 $ref: "#/components/schemas/AuthNetworkClientResult"
         "401":
           description: Missing or invalid bearer token.
+        "402":
+          description: |
+            The plan's concurrent connected client limit is reached and x402
+            inline payments are enabled: the body carries the x402 payment
+            terms for a Pro month. Pay, then retry the same request with
+            `X-PAYMENT` (see `/x402`).
+
+  /network/register-client-v1:
+    post:
+      tags: [Network]
+      summary: Register a network client (versioned, idempotent)
+      description: |
+        Create, or recover after a lost answer, one top-level client and its
+        device under a caller-chosen registration key. It is the versioned,
+        idempotent alternative to `/network/auth-client` for creating a
+        client: an older server that lacks this route answers 404 rather than
+        silently allocating another client.
+
+        The call needs a network JWT (no `client_id` and no device). The body
+        is exactly these five string fields, with no unknown or duplicate
+        fields and at most 16 KiB:
+        - `schema`: `urnetwork-client-registration-v1`.
+        - `registration_id` and `scope_sha256`: 64 lowercase hex digits each
+          (a SHA-256), not all zeros. Within a network, either one binds to
+          exactly one client and device.
+        - `description` (at most 1024 bytes) and `device_spec` (at most 4096
+          bytes).
+
+        Replaying the same request answers with the same client and device
+        and a fresh client JWT. A replay never recreates a removed or
+        inactive identity, and a key bound to a different request or
+        authority is refused. Proxy and payment options are not part of this
+        route. The client limits described on `/network/auth-client` apply.
+
+        Refusals answer 200 with `error.code`:
+        - `invalid_request`: the body is incomplete or unsupported.
+        - `network_authority_required`: the session is not a network session.
+        - `client_limit`: the network is over a client limit.
+        - `authentication_refused`: client creation was refused for another
+          reason; `error.message` says why.
+        - `registration_conflict`: the key is bound to a different request or
+          authority.
+        - `identity_unavailable`: the registered client or device was removed,
+          is inactive, or no longer matches its original device or roles.
+      operationId: registerNetworkClient
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterNetworkClientArgs"
+      responses:
+        "200":
+          description: The registered client, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterNetworkClientResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /network/client-data-cap:
+    get:
+      tags: [Network]
+      summary: Get a client's data caps and usage
+      description: |
+        Read a client's optional data caps and its usage against them.
+
+        The network's root JWT (a network JWT with no `client_id`) reads any
+        client in the network, named by `client_id`. A client's own scoped JWT
+        reads only that client: `client_id` may be omitted, and must match the
+        JWT's client when given.
+
+        Usage counts the billable bytes the client consumes, including its
+        child clients. It is accounted when transfer contracts settle and
+        rolled up within about two minutes, so a client can pass a cap by up
+        to the size of its contracts still in flight. `capped` is true once a cap is reached; the client then gets no
+        new transfer contracts until the monthly period rolls over, the cap is
+        raised or cleared, or the running total is reset.
+
+        Refused with `error.message` "Embed isn't enabled for this network."
+        unless the caller's network is Embed-enabled: an Embed plan, which the
+        URnetwork team enables network by network (see `GET /network/embed`).
+      operationId: getNetworkClientDataCap
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: client_id
+          schema:
+            type: string
+            format: uuid
+          required: false
+          description: |
+            The client to read. Required with the root JWT; optional with the
+            client's own JWT.
+      responses:
+        "200":
+          description: The client's data caps and usage.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientDataCapResult"
+        "401":
+          description: Missing or invalid bearer token.
+    post:
+      tags: [Network]
+      summary: Set a client's data caps
+      description: |
+        Set a client's optional data caps. The two caps are independent and
+        each is optional. Each field merges: omit it to keep the current value,
+        send `null` to clear that cap, or send a byte count to set it. A cap of
+        `0` pauses the client at once, which pauses one user without removing
+        the client.
+
+        - `monthly_byte_limit` caps usage in each UTC calendar month and resets
+          on its own at 00:00 UTC on the first of the month.
+        - `total_byte_limit` caps a running total that never resets on its own.
+          Raise or clear it, or send `reset_total: true` to zero the running
+          total and start a new period.
+
+        At a cap the client gets no new transfer contracts (a hard stop) until
+        the month rolls over, the cap is raised or cleared, or the total is
+        reset. Only the network's root JWT may set caps, and `client_id` must
+        belong to the caller's network; a client-scoped JWT is refused.
+
+        Refused with `error.message` "Embed isn't enabled for this network."
+        unless the caller's network is Embed-enabled: an Embed plan, which the
+        URnetwork team enables network by network (see `GET /network/embed`).
+      operationId: setNetworkClientDataCap
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClientDataCapArgs"
+      responses:
+        "200":
+          description: The client's data caps and usage after the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientDataCapResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /network/client-data-caps:
+    get:
+      tags: [Network]
+      summary: List clients' data caps and usage
+      description: |
+        List the data caps and usage of every client in the caller's network
+        that has a cap set, in a stable order, a page at a time. Pass the
+        returned `next_cursor` as `cursor` to read the next page; it is `null`
+        on the last page. Only the network's root JWT may list; a
+        client-scoped JWT is refused.
+
+        Refused with `error.message` "Embed isn't enabled for this network."
+        unless the caller's network is Embed-enabled: an Embed plan, which the
+        URnetwork team enables network by network (see `GET /network/embed`).
+      operationId: listNetworkClientDataCaps
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: cursor
+          schema:
+            type: string
+          required: false
+          description: The `next_cursor` from the previous page; omit for the first page.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+          required: false
+          description: The page size.
+      responses:
+        "200":
+          description: A page of clients' data caps and usage.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientDataCapListResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /network/client-acl-group:
+    get:
+      tags: [Network]
+      summary: Get a client's ACL group
+      description: |
+        Read a client's ACL group, `default` or `isolated`.
+
+        The network's root JWT reads any client in the network, named by
+        `client_id`. A client's own scoped JWT reads only that client:
+        `client_id` may be omitted, and must match the JWT's client when
+        given.
+
+        Refused with `error.message` "Embed isn't enabled for this network."
+        unless the caller's network is Embed-enabled: an Embed plan, which the
+        URnetwork team enables network by network (see `GET /network/embed`).
+      operationId: getNetworkClientAclGroup
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: client_id
+          schema:
+            type: string
+            format: uuid
+          required: false
+          description: |
+            The client to read. Required with the root JWT; optional with the
+            client's own JWT.
+      responses:
+        "200":
+          description: The client's ACL group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientAclGroupResult"
+        "401":
+          description: Missing or invalid bearer token.
+    post:
+      tags: [Network]
+      summary: Set a client's ACL group
+      description: |
+        Set a client's ACL group: `default` or `isolated`. New clients are
+        `default`.
+
+        An `isolated` client never appears in the network's peer list
+        (`/network/peers` and the peer change stream) and does not receive
+        the list. It does not count toward the recently active top-level
+        clients that keep the peer list enabled. It still counts toward the
+        network's client limit and its concurrent connection limit. Messages
+        between clients need the peer list, so an isolated client cannot use
+        them.
+
+        Only the network's root JWT (or an API key) may set the group, and
+        `client_id` must belong to the caller's network; a client-scoped JWT
+        is refused.
+
+        Refused with `error.message` "Embed isn't enabled for this network."
+        unless the caller's network is Embed-enabled: an Embed plan, which the
+        URnetwork team enables network by network (see `GET /network/embed`).
+      operationId: setNetworkClientAclGroup
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClientAclGroupArgs"
+      responses:
+        "200":
+          description: The client's ACL group after the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientAclGroupResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /network/embed:
+    get:
+      tags: [Network]
+      summary: Get the network's Embed state
+      description: |
+        Read whether the caller's network is Embed-enabled, its client
+        allowance and how many clients count toward it.
+
+        Embed plans are sold through a review and a contract, and the
+        URnetwork team then enables Embed network by network. Until then the
+        data-cap and ACL-group operations refuse the network with
+        `error.message` "Embed isn't enabled for this network." This read is
+        not gated: a network without Embed reads `enabled: false`.
+
+        `client_limit` is the network's top-level client allowance: its Embed
+        plan allowance, or the default of 100. `active_client_count` counts
+        exactly what that limit counts: the network's active top-level
+        clients, not counting provider installs.
+
+        Only the network's root JWT (or an API key) may read it; a
+        client-scoped JWT is refused.
+      operationId: getNetworkEmbed
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: The network's Embed state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkEmbedResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /network/remove-client:
     post:
+      tags: [Network]
+      summary: Remove Network Client
       description: |
         Remove a client from the network.
-      operationId: Remove Network Client
+      operationId: removeNetworkClient
       security:
         - BearerAuth: []
       requestBody:
@@ -1172,6 +1625,8 @@ paths:
 
   /network/remove-clients:
     post:
+      tags: [Network]
+      summary: Remove Network Clients
       description: |
         Remove many clients from the caller's network in one call, so a
         network with hundreds of thousands of offline clients can be cleared
@@ -1191,7 +1646,7 @@ paths:
         `already_in_progress` when this network already has a background run
         going, and `too_many_concurrent_runs` when the deployment-wide cap on
         concurrent runs is reached.
-      operationId: Remove Network Clients
+      operationId: removeNetworkClients
       security:
         - BearerAuth: []
       requestBody:
@@ -1207,10 +1662,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RemoveNetworkClientsResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /network/extender-activate:
     post:
-      tags: [extenders]
+      tags: [Network]
       summary: Offer this client as an extender
       description: |
         Offer the calling client as an extender and, if it proves out, publish
@@ -1251,7 +1708,7 @@ paths:
         carries the extender's own freshly signed record and up to 8 signed
         records of other active extenders, which is the only bootstrap an app
         has before it has any peer.
-      operationId: Extender Activate
+      operationId: extenderActivate
       security:
         - BearerAuth: []
       requestBody:
@@ -1274,7 +1731,7 @@ paths:
 
   /network/extender-hint:
     get:
-      tags: [extenders]
+      tags: [Network]
       summary: The continent to try extenders on first, and the country to front them for
       description: |
         The continent the operator places the caller's address on
@@ -1292,7 +1749,7 @@ paths:
         from. An empty `continent_code` or `country_code` is an address the
         operator cannot place, which a client treats as no hint rather than
         as a place.
-      operationId: Extender Hint
+      operationId: extenderHint
       security: []
       responses:
         "200":
@@ -1304,7 +1761,7 @@ paths:
 
   /network/extender-latency:
     post:
-      tags: [extenders]
+      tags: [Network]
       summary: Forward provider latency attestations
       description: |
         Forward the latency attestations providers made to this client's
@@ -1335,7 +1792,7 @@ paths:
         or repeats one already stored (same extender, provider and nonce) is
         counted in `rejected` and not named. A report of more than 256
         attestations is refused whole.
-      operationId: Extender Latency Report
+      operationId: extenderLatencyReport
       security:
         - BearerAuth: []
       requestBody:
@@ -1355,9 +1812,74 @@ paths:
         "401":
           description: Missing or invalid client bearer token.
 
+  /network/extender-release:
+    post:
+      tags: [Network]
+      x-internal: true
+      summary: Release extender records to the calling client
+      description: |
+        A directory call the SDK makes on its own: the server deals extender
+        records to the calling client for the current epoch. Needs a client
+        JWT; the release is keyed by the account and the device, and the
+        caller's address is part of the decision.
+
+        `ip_versions` lists the address families the client can dial (4, 6);
+        empty means any. The answer carries base64 serialized
+        `protocol.ExtenderRecord` messages, the epoch, how many records the
+        identity is entitled to this epoch, and `probation`. A refusal
+        answers 200 with `error` and no records.
+      operationId: extenderRelease
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtenderReleaseArgs"
+      responses:
+        "200":
+          description: The released records, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderReleaseResult"
+        "401":
+          description: Missing or invalid bearer token.
+
+  /network/extender-block-report:
+    post:
+      tags: [Network]
+      x-internal: true
+      summary: Report an unreachable extender
+      description: |
+        A report the SDK makes on its own when it could not reach an extender.
+        Needs a client JWT; the server records it against the country the
+        caller's address places it in, once per client, and rate limits
+        reports per user. An unknown extender key answers `recorded: false`
+        without an error. A refusal answers 200 with `error`.
+      operationId: extenderBlockReport
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtenderBlockReportArgs"
+      responses:
+        "200":
+          description: Whether the report was recorded, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderBlockReportResult"
+        "401":
+          description: Missing or invalid bearer token.
+
   /network/ping-report:
     post:
-      tags: [extenders]
+      tags: [Network]
       summary: Report the pings this client measured
       description: |
         Report the pings this client measured of extenders, and what each
@@ -1414,6 +1936,8 @@ paths:
 
   /network/clients:
     get:
+      tags: [Network]
+      summary: Network Clients
       description: |
         Get the latest status of the network's devices: every top-level
         client (no source_client_id) that is not a hosted proxy device, with
@@ -1430,7 +1954,7 @@ paths:
         - Provide status
 
         `proxy_client` is never present on this list.
-      operationId: Network Clients
+      operationId: networkClients
       security:
         - BearerAuth: []
       responses:
@@ -1440,16 +1964,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkClientsResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/proxies:
     get:
+      tags: [Network]
+      summary: Network Proxies
       description: |
         The network's cloud proxy devices: the clients that carry a hosted
         proxy device (created with `proxy_config` on `/network/auth-client`),
         each with its `proxy_client` credentials (proxy URLs, auth token,
         WireGuard details). Same row shape as `/network/clients` otherwise:
         resident status, connections, provide status.
-      operationId: Network Proxies
+      operationId: networkProxies
       security:
         - BearerAuth: []
       responses:
@@ -1459,9 +1987,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkClientsResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /network/peers:
     get:
+      tags: [Network]
+      summary: Network Peers
       description: |
         Fast network peer discovery.
 
@@ -1472,7 +2004,7 @@ paths:
 
         Allowed for network sessions and top-level client sessions.
         A client session's own client is excluded from the list.
-      operationId: Network Peers
+      operationId: networkPeers
       security:
         - BearerAuth: []
       responses:
@@ -1485,9 +2017,11 @@ paths:
 
   /preferences/set-preferences:
     post:
+      tags: [Preferences]
+      summary: Preferences Set
       description: |
         Set account preferences.
-      operationId: Preferences Set
+      operationId: preferencesSet
       security:
         - BearerAuth: []
       requestBody:
@@ -1503,12 +2037,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PreferencesSetResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /preferences:
     get:
+      tags: [Preferences]
+      summary: Preferences Get
       description: |
         Get account preferences.
-      operationId: Preferences Get
+      operationId: preferencesGet
       security:
         - BearerAuth: []
       responses:
@@ -1521,9 +2059,11 @@ paths:
 
   /feedback/send-feedback:
     post:
+      tags: [Feedback]
+      summary: Feedback Send
       description: |
         Feedback.
-      operationId: Feedback Send
+      operationId: feedbackSend
       security:
         - BearerAuth: []
       requestBody:
@@ -1540,14 +2080,43 @@ paths:
               schema:
                 $ref: "#/components/schemas/FeedbackSendResult"
 
+  /services/contact-sales:
+    post:
+      tags: [Other]
+      summary: Contact sales about Services
+      description: |
+        Send a Services inquiry, about embedding URnetwork or any custom use of
+        it, to the URnetwork team. This is the endpoint behind the Services
+        page form, and it needs no authentication. Requests are rate limited
+        per source address.
+      operationId: servicesContactSales
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ServicesContactSalesArgs"
+      responses:
+        "200":
+          description: The inquiry was received.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServicesContactSalesResult"
+        "429":
+          description: Too many inquiries from this source address; try again later.
+
   /log/{clientId}/upload:
     post:
+      tags: [Other]
+      summary: Log Upload
       description: |
         Upload a log file for the caller, associated with a feedback id.
         The request body is the raw log file content, streamed to storage.
         Note the `{clientId}` path segment is actually the feedback id the log
         is attached to.
-      operationId: Log Upload
+      operationId: logUpload
       security:
         - BearerAuth: []
       parameters:
@@ -1574,6 +2143,8 @@ paths:
 
   /network/provider-locations:
     get:
+      tags: [Network]
+      summary: Network Provider Locations
       description: |
         A list of locations and groups where there is at least one active
         provider in good health.
@@ -1581,7 +2152,7 @@ paths:
         provider using `/network/find-providers2`.
         `groups` carries the promoted location groups that apply to the caller;
         `/network/find-provider-locations` always returns it empty.
-      operationId: Network Provider Locations
+      operationId: networkProviderLocations
       security: []
       responses:
         "200":
@@ -1593,6 +2164,8 @@ paths:
 
   /network/find-provider-locations:
     post:
+      tags: [Network]
+      summary: Network Find Provider Locations
       description: |
         Search for locations and groups that match a query,
         where there are at least one active provider in good health.
@@ -1600,7 +2173,7 @@ paths:
         and the tolerance can be tuned in the input.
         Note that a location or group will need to be mapped to an actual provider
         using `/network/find-providers2`.
-      operationId: Network Find Provider Locations
+      operationId: networkFindProviderLocations
       security: []
       requestBody:
         required: true
@@ -1618,12 +2191,14 @@ paths:
 
   /network/find-providers2:
     post:
+      tags: [Network]
+      summary: Network Find Providers 2
       description: |
         Randomly sample providers for locations, groups, or devices,
         which are active and in good health.
         This allows random iteration by using the exclude input to mark
         visited providers.
-      operationId: Network Find Providers 2
+      operationId: networkFindProviders2
       security: []
       requestBody:
         required: true
@@ -1641,13 +2216,15 @@ paths:
 
   /network/ranking:
     get:
+      tags: [Network]
+      summary: Network Get Ranking
       description: |
         Get leaderboard ranking of current network. Besides the data
         leaderboard rank, the result carries the network's points leaderboard
         settings (`points_leaderboard_public`, `emoji_tag`) and its points
         ranks (`rank_points`, `rank_blocks`, `rank_streak`; 0 until the
         network has points and a ranking snapshot exists).
-      operationId: Network Get Ranking
+      operationId: networkGetRanking
       security:
         - BearerAuth: []
 
@@ -1661,9 +2238,11 @@ paths:
 
   /network/ranking-visibility:
     post:
+      tags: [Network]
+      summary: Network Ranking Visibility
       description: |
         Allow network to toggle leaderboard ranking visibility
-      operationId: Network Ranking Visibility
+      operationId: networkRankingVisibility
       security:
         - BearerAuth: []
       requestBody:
@@ -1679,15 +2258,19 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetNetworkRankingVisibilityResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/points-ranking-visibility:
     post:
+      tags: [Network]
+      summary: Network Points Ranking Visibility
       description: |
         Turn the network's name on or off on the points leaderboard. Every
         network with points is ranked and listed either way; this switch only
         decides whether its row shows the network name or "Anonymous". The
         emoji tag (/network/emoji) shows on the row regardless.
-      operationId: Network Points Ranking Visibility
+      operationId: networkPointsRankingVisibility
       security:
         - BearerAuth: []
       requestBody:
@@ -1703,16 +2286,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetNetworkPointsRankingVisibilityResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/emoji:
     post:
+      tags: [Network]
+      summary: Network Set Emoji Tag
       description: |
         Set the network's emoji tag: 1 to 6 emoji (each grapheme cluster must
         be a single emoji: pictographs with skin tones, ZWJ sequences, keycaps,
         flags). Letters, digits and punctuation are rejected with the message
         "Use 1 to 6 emoji.". An empty string clears the tag. The tag is shown
         on the points leaderboard row and in the network's own header.
-      operationId: Network Set Emoji Tag
+      operationId: networkSetEmojiTag
       security:
         - BearerAuth: []
       requestBody:
@@ -1728,12 +2315,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetNetworkEmojiTagResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/block-location:
     post:
+      tags: [Network]
+      summary: Network Block Location
       description: |
         Block providing to a location
-      operationId: Network Block Location
+      operationId: networkBlockLocation
       security:
         - BearerAuth: []
       requestBody:
@@ -1749,12 +2340,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkBlockLocationResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/unblock-location:
     post:
+      tags: [Network]
+      summary: Network Unblock Location
       description: |
         Unblock providing to a location
-      operationId: Network Unblock Location
+      operationId: networkUnblockLocation
       security:
         - BearerAuth: []
       requestBody:
@@ -1770,11 +2365,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkUnblockLocationResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/blocked-locations:
     get:
+      tags: [Network]
+      summary: Network Blocked Locations
       description: Get list locations to block from providing for the network
-      operationId: Network Blocked Locations
+      operationId: networkBlockedLocations
       security:
         - BearerAuth: []
       responses:
@@ -1787,8 +2386,10 @@ paths:
 
   /network/reliability:
     get:
+      tags: [Network]
+      summary: Network Reliability
       description: Get network reliability stats
-      operationId: Network Reliability
+      operationId: networkReliability
       security:
         - BearerAuth: []
       responses:
@@ -1801,6 +2402,8 @@ paths:
 
   /network/provider-status:
     get:
+      tags: [Network]
+      summary: Network Provider Status
       description: |
         Why each of the caller network's own provider clients is or is not
         offered to clients, with how often find-providers2 returned it per
@@ -1815,7 +2418,7 @@ paths:
 
         Anti-abuse checks are reported only as the generic reason
         `not_eligible`. Which check applies is never returned.
-      operationId: Network Provider Status
+      operationId: networkProviderStatus
       security:
         - BearerAuth: []
       responses:
@@ -1828,9 +2431,11 @@ paths:
 
   /network/user:
     get:
+      tags: [Network]
+      summary: Get Network User
       description: |
         Get the user and configured auth methods for the caller network.
-      operationId: Get Network User
+      operationId: getNetworkUser
       security:
         - BearerAuth: []
       responses:
@@ -1840,12 +2445,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetNetworkUserResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /network/user/update:
     post:
+      tags: [Network]
+      summary: Update Network Name
       description: |
         Update the caller network's name.
-      operationId: Update Network Name
+      operationId: updateNetworkName
       security:
         - BearerAuth: []
       requestBody:
@@ -1861,12 +2470,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UpdateNetworkNameResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   # ----- provider probe control plane (operator-to-server) -----
 
   /network/provider-egress-due:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Which providers are due an egress-location probe
       description: |
         The providers to probe next: those whose stored egress location or
@@ -1882,7 +2494,7 @@ paths:
         Each provider carries the country and region it is published under,
         so the prober draws its sample only from the destinations compatible
         with that place.
-      operationId: Provider Egress Location Due
+      operationId: providerEgressLocationDue
       security:
         - OperatorSecret: []
       parameters:
@@ -1891,7 +2503,7 @@ paths:
           required: false
           description: |
             Batch size, default 100, clamped to the deployment ceiling
-            (`provider_egress_due.yml` `max_due_limit`, default 500). A
+            (default 500). A
             non-integer or non-positive value is a 400 rather than a clamp,
             because an empty list must not be confused with "nothing is due".
           schema:
@@ -1922,7 +2534,8 @@ paths:
 
   /network/provider-egress-location:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Submit a probed provider egress location
       description: |
         Store where a provider's traffic exits: `exit_ip`, the address the
@@ -1937,7 +2550,7 @@ paths:
         A submission without `exit_ip` -- the retired vendor-consensus shape
         -- is refused with a 400; the legacy fields are accepted and ignored
         for one release. The body is capped at 16 KiB.
-      operationId: Provider Egress Location Submit
+      operationId: providerEgressLocationSubmit
       security:
         - OperatorSecret: []
       requestBody:
@@ -1965,7 +2578,8 @@ paths:
 
   /network/provider-egress-attempt:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Record a probe attempt
       description: |
         Record that the prober TRIED to probe a provider, whether or not the
@@ -1973,7 +2587,7 @@ paths:
         is already implied by the stored location. Without this, a provider
         that can never be probed successfully would sort to the head of the
         due queue on every poll forever.
-      operationId: Provider Egress Location Attempt
+      operationId: providerEgressLocationAttempt
       security:
         - OperatorSecret: []
       requestBody:
@@ -1998,7 +2612,8 @@ paths:
 
   /network/provider-blackhole-due:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Which providers are due a blackhole check
       description: |
         The blackhole sweep queue: every provider whose next check has come
@@ -2009,7 +2624,7 @@ paths:
         provider carries the place it is published under. A check is three
         small loads through the provider's tunnel, so the batches are much
         larger than the egress-location ones.
-      operationId: Provider Blackhole Check Due
+      operationId: providerBlackholeCheckDue
       security:
         - OperatorSecret: []
       parameters:
@@ -2043,7 +2658,8 @@ paths:
 
   /network/provider-blackhole-checks:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Submit a batch of blackhole checks
       description: |
         Submit up to 10,000 blackhole results at once: for each provider, did
@@ -2062,7 +2678,7 @@ paths:
         once. A check marked `not_measured` -- its tunnel was gone and could
         not be re-created -- counts nothing and only reschedules the
         provider.
-      operationId: Submit Provider Blackhole Checks
+      operationId: submitProviderBlackholeChecks
       security:
         - OperatorSecret: []
       requestBody:
@@ -2085,7 +2701,8 @@ paths:
 
   /network/provider-bandwidth-test:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: The active bandwidth probe's download target
       description: |
         Stream a bounded number of arbitrary bytes, so the prober has
@@ -2093,7 +2710,7 @@ paths:
         byte count matters; the content is a small repeating block streamed
         under a limit reader and never materialized. Operator-gated so the
         deployment is not a free public speed-test target.
-      operationId: Provider Bandwidth Test
+      operationId: providerBandwidthTest
       security:
         - OperatorSecret: []
       parameters:
@@ -2120,7 +2737,8 @@ paths:
 
   /network/provider-bandwidth-reserve:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Reserve byte budget for one bandwidth probe
       description: |
         Take deployment-wide byte budget before spending any probe bytes.
@@ -2133,7 +2751,7 @@ paths:
         reservation that lands in a LATER bucket is cancelled again and the
         request answered 429 with `Retry-After` pointing at the bucket that
         does have room; without that the hourly ceiling would be decorative.
-      operationId: Provider Bandwidth Reserve
+      operationId: providerBandwidthReserve
       security:
         - OperatorSecret: []
       requestBody:
@@ -2163,7 +2781,8 @@ paths:
 
   /network/provider-bandwidth-result:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Submit an active bandwidth measurement
       description: |
         Store one active bandwidth measurement taken over a provider's tunnel.
@@ -2178,7 +2797,7 @@ paths:
         one would let this endpoint overwrite a derived figure with an
         asserted one. A non-positive rate or sample size is refused rather
         than allowed to overwrite a real measurement.
-      operationId: Provider Bandwidth Result
+      operationId: providerBandwidthResult
       security:
         - OperatorSecret: []
       requestBody:
@@ -2203,7 +2822,8 @@ paths:
 
   /network/provider-egress-health:
     post:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Submit an egress-health run
       description: |
         Store one egress-health run: over the provider's tunnel, how many of
@@ -2227,7 +2847,7 @@ paths:
         `reputation_failed_names` are accepted, always zero from a current
         prober, and ignored, and a `reputation` key inside `class_results` is
         still refused.
-      operationId: Provider Egress Health Result
+      operationId: providerEgressHealthResult
       security:
         - OperatorSecret: []
       requestBody:
@@ -2252,7 +2872,8 @@ paths:
 
   /network/provider-egress-destinations:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: The prober's destination pool
       description: |
         The sites the prober loads (connect/GEOMAP.md §11.4): the active
@@ -2267,7 +2888,7 @@ paths:
 
         The first request seeds an empty pool from the prober's built-in
         table, so the route never serves nothing for want of a refresh.
-      operationId: Provider Egress Destinations
+      operationId: providerEgressDestinations
       security:
         - OperatorSecret: []
       responses:
@@ -2284,16 +2905,17 @@ paths:
 
   /network/provider-verdict:
     post:
-      tags: [provider probing]
+      tags: [Network]
       summary: Report that a provider carried nothing
       description: |
-        A real client network reporting that a provider carried nothing. This
-        is the ONE route in this group that is not operator-secret authed: the
-        reporter is a network, and the network is the unit the quorum counts,
-        so the reporting network is taken from the session jwt and never from
-        the body. A met quorum only brings the provider's next probe forward.
+        A real client network reporting that a provider carried nothing. It
+        feeds the provider probe control plane, but unlike that plane's
+        routes it is not authenticated by the operator secret: the reporter
+        is a network, and the network is the unit the quorum counts, so the
+        reporting network is taken from the session jwt and never from the
+        body. A met quorum only brings the provider's next probe forward.
         Unknown fields in the body are rejected.
-      operationId: Provider Client Verdict Submit
+      operationId: providerClientVerdictSubmit
       security:
         - BearerAuth: []
       requestBody:
@@ -2314,7 +2936,8 @@ paths:
 
   /network/prober-credential:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: The prober's own network client jwt
       description: |
         The network client jwt the bootstrap task minted for the operator's
@@ -2331,7 +2954,7 @@ paths:
         client jwt has not been minted or was cleared for re-provisioning),
         which the prober must be able to tell from a failure -- so it is a 404
         rather than an empty 200.
-      operationId: Prober Credential
+      operationId: proberCredential
       security:
         - OperatorSecret: []
       responses:
@@ -2348,7 +2971,8 @@ paths:
 
   /network/geolocation-source-pins:
     get:
-      tags: [provider probing]
+      tags: [Network]
+      x-internal: true
       summary: Certificate pins for the geolocation source hosts
       description: |
         Retired with the geolocation sources (connect/GEOMAP.md D24): the
@@ -2377,7 +3001,7 @@ paths:
         indistinguishable from "this server does not implement the endpoint".
         This endpoint is read-only; nothing here ever accepts a pin from a
         request.
-      operationId: Geolocation Source Pins
+      operationId: geolocationSourcePins
       security:
         - OperatorSecret: []
       responses:
@@ -2392,11 +3016,13 @@ paths:
 
   /wallet/balance:
     get:
+      tags: [Wallet]
+      summary: Wallet Balance
       description: |
         Get the balance for the USDC user custody wallet.
         The user custody wallet allows URnetwork to query the balance,
         but the user must take actions against the wallet.
-      operationId: Wallet Balance
+      operationId: walletBalance
       security:
         - BearerAuth: []
       responses:
@@ -2406,15 +3032,19 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WalletBalanceResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /wallet/validate-address:
     post:
+      tags: [Wallet]
+      summary: Wallet Validate Address
       description: |
         Validate a USDC wallet address on the user custody wallet chain.
         This can be used to check whether an address can receive
         a transfer out from the user custody wallet.
         Please use this before initiating any transfer out to avoid lost funds.
-      operationId: Wallet Validate Address
+      operationId: walletValidateAddress
       security:
         - BearerAuth: []
       requestBody:
@@ -2433,10 +3063,12 @@ paths:
 
   /wallet/circle-init:
     post:
+      tags: [Wallet]
+      summary: Wallet Circle Init
       description: |
         Initialize the Circle USDC user self custody wallet.
         This starts a process that must be completed by the user.
-      operationId: Wallet Circle Init
+      operationId: walletCircleInit
       security:
         - BearerAuth: []
       responses:
@@ -2446,14 +3078,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WalletCircleInitResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /wallet/circle-transfer-out:
     post:
+      tags: [Wallet]
+      summary: Wallet Circle Transfer Out
       description: |
         Set up a transfer from the Circle USDC user self custody wallet
         to an address.
         This starts a process that must be completed by the user.
-      operationId: Wallet Circle Transfer Out
+      operationId: walletCircleTransferOut
       security:
         - BearerAuth: []
       requestBody:
@@ -2469,10 +3105,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WalletCircleTransferOutResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /subscription/balance:
     get:
-      tags: [subscription]
+      tags: [Subscription]
       summary: Subscription status, balance and the onboarding plan data
       description: |
         Get the current subscription status and transfer balance. This is also
@@ -2509,8 +3147,82 @@ paths:
               schema:
                 $ref: "#/components/schemas/SubscriptionBalanceResult"
 
+  /test/balance-drain:
+    post:
+      tags: [Other]
+      x-internal: true
+      summary: Drain the caller's balance for an acceptance test
+      description: |
+        Acceptance-test only. Makes the caller's own network's available
+        balance read as zero for a bounded window, so the apps' insufficient
+        balance state can be reproduced against a live deployment. The
+        network is always the caller's own; no parameter names another.
+
+        Refused with 403 unless the caller's network is allowlisted in the
+        vault, or one of its sign-in emails is on a test bypass domain.
+        `duration_seconds` is clamped to 60-1800 and defaults to 900. While
+        the window is open, new positive-byte contracts paid by the network
+        are refused with the normal "Insufficient balance" error and the
+        balance reads zero; balances, escrow and payments are untouched, and
+        contracts already open settle normally.
+      operationId: testBalanceDrain
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TestBalanceDrainArgs"
+      responses:
+        "200":
+          description: The drain window.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestBalanceDrainResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+          description: |
+            The caller's network may not drain, or the bearer token is a client
+            JWT, which this route refuses like every route that administers the
+            network (`ClientJwtRefused`). Either body is plain text.
+
+  /test/balance-restore:
+    post:
+      tags: [Other]
+      x-internal: true
+      summary: End the caller's acceptance-test balance drain
+      description: |
+        Acceptance-test only. Ends the caller's own network's open drains
+        early; an unrestored drain ends by itself at its end time.
+      operationId: testBalanceRestore
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TestBalanceRestoreArgs"
+      responses:
+        "200":
+          description: How many drains were ended.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestBalanceRestoreResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
   /subscription/details:
     get:
+      tags: [Subscription]
+      summary: Subscription Details
       description: |
         The "Manage subscription" screen: every store currently billing the
         caller's network, one entry per store, with the window it bought
@@ -2528,7 +3240,7 @@ paths:
 
         The result is cached per network for 60 seconds; cancel and resume
         invalidate it.
-      operationId: Subscription Details
+      operationId: subscriptionDetails
       security:
         - BearerAuth: []
       responses:
@@ -2538,9 +3250,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SubscriptionDetailsResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /subscription/cancel:
     post:
+      tags: [Subscription]
+      summary: Subscription Cancel
       description: |
         Stop the Stripe subscription billing the caller's network at the end of
         the paid period (`cancel_at_period_end`); the customer keeps Pro until
@@ -2549,7 +3265,7 @@ paths:
         subscriptions page in `manage_url`. Idempotent: an already-cancelling
         subscription is not written again. Every refusal carries a stable
         `error.code` (SubscriptionError) beside its `error.message`.
-      operationId: Subscription Cancel
+      operationId: subscriptionCancel
       security:
         - BearerAuth: []
       requestBody:
@@ -2565,13 +3281,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SubscriptionCancelResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /subscription/resume:
     post:
+      tags: [Subscription]
+      summary: Subscription Resume
       description: |
         Undo /subscription/cancel while the paid period is still running: the
         Stripe subscription renews again. Same request and result shapes.
-      operationId: Subscription Resume
+      operationId: subscriptionResume
       security:
         - BearerAuth: []
       requestBody:
@@ -2587,12 +3307,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SubscriptionCancelResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /subscription/check-balance-code:
     post:
+      tags: [Subscription]
+      summary: Subscription Check Balance Code
       description: |
         Check if the balance code is valid.
-      operationId: Subscription Check Balance Code
+      operationId: subscriptionCheckBalanceCode
       security:
         - BearerAuth: []
       requestBody:
@@ -2611,9 +3335,11 @@ paths:
 
   /subscription/redeem-balance-code:
     post:
+      tags: [Subscription]
+      summary: Subscription Redeem Balance Code
       description: |
         Redeem the balance code and add the transfer balance to the caller network.
-      operationId: Subscription Redeem Balance Code
+      operationId: subscriptionRedeemBalanceCode
       security:
         - BearerAuth: []
       requestBody:
@@ -2632,11 +3358,13 @@ paths:
 
   /subscription/create-payment-id:
     post:
+      tags: [Subscription]
+      summary: Subscription Create Payment Id
       description: |
         Creates an anonymous payment identifier to be used with purchases.
         This keeps network information out of the payment processor system.
         For example in Google Play this is called the "obfuscated account id".
-      operationId: Subscription Create Payment Id
+      operationId: subscriptionCreatePaymentId
       security:
         - BearerAuth: []
       requestBody:
@@ -2655,7 +3383,7 @@ paths:
 
   /subscription/verify-play-purchase:
     post:
-      tags: [subscription]
+      tags: [Subscription]
       summary: Report a Play purchase for verification
       description: |
         The android app reports its purchase token BEFORE acknowledging it.
@@ -2676,7 +3404,7 @@ paths:
 
         Shares a per-account budget with the Apple endpoint; every attempt
         counts, including failures.
-      operationId: Subscription Verify Play Purchase
+      operationId: subscriptionVerifyPlayPurchase
       security:
         - BearerAuth: []
       requestBody:
@@ -2699,7 +3427,7 @@ paths:
 
   /subscription/verify-apple-transaction:
     post:
-      tags: [subscription]
+      tags: [Subscription]
       summary: Report a StoreKit transaction for verification
       description: |
         The Apple app reports its StoreKit transaction JWS
@@ -2721,7 +3449,7 @@ paths:
         Cheap validation runs first, then the shared per-account budget, then
         the cryptographic verification -- so a malformed request burns no
         budget and an over-budget caller burns no CPU.
-      operationId: Subscription Verify Apple Transaction
+      operationId: subscriptionVerifyAppleTransaction
       security:
         - BearerAuth: []
       requestBody:
@@ -2746,14 +3474,14 @@ paths:
 
   /x402/skus:
     get:
-      tags: [x402]
+      tags: [Other]
       summary: What an agent can buy
       description: |
         The catalog an agent can buy from, so a skill can discover it without
-        triggering a `402`. Prices come from `pro.yml`, never from the x402
-        configuration, so an agent is quoted the same number a human pays by
-        card; a sku with no price is not offered at all.
-      operationId: X402 Skus
+        triggering a `402`. Prices come from the Pro price list, never from
+        the x402 configuration, so an agent is quoted the same number a human
+        pays by card; a sku with no price is not offered at all.
+      operationId: x402Skus
       security: []
       responses:
         "200":
@@ -2767,7 +3495,7 @@ paths:
 
   /x402/purchase:
     post:
-      tags: [x402]
+      tags: [Other]
       summary: Quote or settle an inline payment
       description: |
         Buy a sku inline. Without an `X-PAYMENT` header the answer is `402`
@@ -2779,7 +3507,7 @@ paths:
         The same 402 round trip is also carried inline by
         `POST /network/auth-client`, where an agent meets the plan's
         concurrent-client limit.
-      operationId: X402 Purchase
+      operationId: x402Purchase
       security:
         - BearerAuth: []
       parameters:
@@ -2826,7 +3554,8 @@ paths:
 
   /pay/stripe:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: Stripe webhook
       description: |
         The Stripe webhook. Authenticated by the `Stripe-Signature` header
@@ -2834,7 +3563,7 @@ paths:
         URnetwork JWT. The subscription is granted here, never by the client.
         Only the fields the server reads are listed; Stripe sends a much
         larger event.
-      operationId: Stripe Webhook
+      operationId: stripeWebhook
       security: []
       requestBody:
         required: true
@@ -2852,14 +3581,15 @@ paths:
 
   /pay/coinbase:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: Coinbase Commerce webhook
       description: |
         The Coinbase Commerce webhook, authenticated by the
         `X-CC-Webhook-Signature` HMAC over the raw body with the shared
         secret, checked before the event is parsed. Only the fields the server
         reads are listed.
-      operationId: Coinbase Webhook
+      operationId: coinbaseWebhook
       security: []
       requestBody:
         required: true
@@ -2877,7 +3607,8 @@ paths:
 
   /pay/play:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: Google Play real-time developer notification
       description: |
         The Play RTDN push, delivered through Google Pub/Sub and
@@ -2887,7 +3618,7 @@ paths:
         itself is base64 inside `message.data`; the server decodes it and
         credits the renewal through the same advisory-lock gate as
         `/subscription/verify-play-purchase` and the payment reconciler.
-      operationId: Play Webhook
+      operationId: playWebhook
       security: []
       requestBody:
         required: true
@@ -2905,7 +3636,8 @@ paths:
 
   /pay/solana:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: Helius USDC transfer webhook
       description: |
         The Helius webhook for USDC transfers on Solana. Authenticated by the
@@ -2928,7 +3660,7 @@ paths:
         failure is reported only after the whole batch is examined, as a
         non-2xx, so Helius redelivers everything; the already-credited
         intents are no-ops on the retry.
-      operationId: Helius Webhook
+      operationId: heliusWebhook
       security: []
       requestBody:
         required: true
@@ -2949,14 +3681,15 @@ paths:
 
   /pay/circle:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: Circle notification (deprecated)
       description: |
         The Circle programmable-wallets notification, authenticated by the
         `X-Circle-Signature` ECDSA signature over the raw body under the key
         named by `X-Circle-Key-Id`. Deprecated; it is the same handler as
         `POST /account/circle-wallet`.
-      operationId: Circle Webhook
+      operationId: circleWebhook
       security: []
       requestBody:
         required: true
@@ -2974,7 +3707,8 @@ paths:
 
   /account/circle-wallet:
     post:
-      tags: [store webhooks]
+      tags: [Account]
+      x-internal: true
       summary: Circle wallet challenge notification
       description: |
         The Circle notification that a user-custody wallet challenge
@@ -2984,7 +3718,7 @@ paths:
         whose event is a completed `INITIALIZE` links the created wallet to
         the network named by the challenge's correlation id. Same handler as
         `POST /pay/circle`.
-      operationId: Circle Wallet Webhook
+      operationId: circleWalletWebhook
       security: []
       requestBody:
         required: true
@@ -3002,7 +3736,8 @@ paths:
 
   /apple/notification:
     post:
-      tags: [store webhooks]
+      tags: [Other]
+      x-internal: true
       summary: App Store Server Notification V2
       description: |
         The App Store Server Notification V2 endpoint. The envelope carries
@@ -3023,7 +3758,7 @@ paths:
         Anything that fails is a `400` with no detail. A verified notification
         answers `200` with an empty object, whether or not it changed
         anything.
-      operationId: Apple Notification
+      operationId: appleNotification
       security: []
       requestBody:
         required: true
@@ -3045,12 +3780,14 @@ paths:
 
   /device/add:
     post:
+      tags: [Device]
+      summary: Device Add
       description: |
         Add a device, which can either be owned by the network or shared with the network.
         The code provided can be either adoption code or a share code.
         Once a code is added, the device becomes an associated device until confirmation.
         If the device is a shared device, it will remain an associated device after confirmation.
-      operationId: Device Add
+      operationId: deviceAdd
       security:
         - BearerAuth: []
       requestBody:
@@ -3066,12 +3803,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceAddResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/create-share-code:
     post:
+      tags: [Device]
+      summary: Device Create Share Code
       description: |
         Creates a code to share a device.
-      operationId: Device Create Share Code
+      operationId: deviceCreateShareCode
       security:
         - BearerAuth: []
       requestBody:
@@ -3087,13 +3828,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceCreateShareCodeResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/share-code/{code}/qr.png:
     get:
+      tags: [Device]
+      summary: Device Share Code QR
       description: |
         A QR code that maps to a URL to add the shared device.
         Send it to someone to scan to add the device.
-      operationId: Device Share Code QR
+      operationId: deviceShareCodeQr
       security:
         - BearerAuth: []
       parameters:
@@ -3111,16 +3856,20 @@ paths:
               schema:
                 type: string
                 format: binary
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/share-status:
     post:
+      tags: [Device]
+      summary: Device Share Status
       description: |
         The status of the shared device.
         The status can be one of:
         - unassociated
         - associated pending confirmation
         - associated
-      operationId: Device Share Status
+      operationId: deviceShareStatus
       security:
         - BearerAuth: []
       requestBody:
@@ -3136,13 +3885,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceShareStatusResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/confirm-share:
     post:
+      tags: [Device]
+      summary: Device Confirm Share
       description: |
         Confirm the share of a device.
         This must be called from the side that initiates the share.
-      operationId: Device Confirm Share
+      operationId: deviceConfirmShare
       security:
         - BearerAuth: []
       requestBody:
@@ -3158,13 +3911,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceConfirmShareResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/create-adopt-code:
     post:
+      tags: [Device]
+      summary: Device Create Adopt Code
       description: |
         Creates a code to adopt a device.
         The adopt code is valid for a limited time.
-      operationId: Device Create Adopt Code
+      operationId: deviceCreateAdoptCode
       security: []
       requestBody:
         required: true
@@ -3182,10 +3939,12 @@ paths:
 
   /device/adopt-code/{code}/qr.png:
     get:
+      tags: [Device]
+      summary: Device Adopt Code QR
       description: |
         A QR code that maps to a URL to adopt the device.
         Send it to someone to scan to adopt the device.
-      operationId: Device Adopt Code QR
+      operationId: deviceAdoptCodeQr
       security: []
       parameters:
         - in: path
@@ -3205,13 +3964,15 @@ paths:
 
   /device/adopt-status:
     post:
+      tags: [Device]
+      summary: Device Adopt Status
       description: |
         The status of the adopt-code device.
         The status can be one of:
         - unassociated
         - associated pending confirmation
         - associated
-      operationId: Device Adopt Status
+      operationId: deviceAdoptStatus
       security: []
       requestBody:
         required: true
@@ -3229,10 +3990,12 @@ paths:
 
   /device/confirm-adopt:
     post:
+      tags: [Device]
+      summary: Device Confirm Adopt
       description: |
         Confirm the adoption of a device.
         This must be called from the side that initiates the adoption.
-      operationId: Device Confirm Adopt
+      operationId: deviceConfirmAdopt
       security: []
       requestBody:
         required: true
@@ -3250,10 +4013,12 @@ paths:
 
   /device/remove-adopt-code:
     post:
+      tags: [Device]
+      summary: Remove Adopt Code
       description: |
         Remove an adopt code.
         This must be called from the side that initiates the adoption.
-      operationId: Remove Adopt Code
+      operationId: removeAdoptCode
       security: []
       requestBody:
         required: true
@@ -3271,13 +4036,15 @@ paths:
 
   /device/associations:
     get:
+      tags: [Device]
+      summary: Device Associations
       description: |
         The devices associated with the caller network.
         Associated devices are:
         - pending adoption devices
         - incoming shared devices (not owned by the caller network)
         - outgoing shared devices (owned by the caller network)
-      operationId: Device Associations
+      operationId: deviceAssociations
       security:
         - BearerAuth: []
       responses:
@@ -3287,16 +4054,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceAssociationsResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/remove-association:
     post:
+      tags: [Device]
+      summary: Device Remove Association
       description: |
         Remove a device association.
         The association can be any of:
         - pending adoption device
         - incoming shared device (not owned by the caller network)
         - outgoing shared device (owned by the caller network)
-      operationId: Device Remove Association
+      operationId: deviceRemoveAssociation
       security:
         - BearerAuth: []
       requestBody:
@@ -3312,13 +4083,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceRemoveAssociationResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/set-association-name:
     post:
+      tags: [Device]
+      summary: Device Set Association Name
       description: |
         Set the name of the association.
         To set the name of devices owned by the network, use `/device/set-name`.
-      operationId: Device Set Association Name
+      operationId: deviceSetAssociationName
       security:
         - BearerAuth: []
       requestBody:
@@ -3334,13 +4109,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceSetAssociationNameResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /device/set-name:
     post:
+      tags: [Device]
+      summary: Network Set Device Name
       description: |
         Sets the name of a device owned by the network.
         To set the name of devices shared with the network, use `/device/set-association-name`.
-      operationId: Network Set Device Name
+      operationId: networkSetDeviceName
       security:
         - BearerAuth: []
       requestBody:
@@ -3359,10 +4138,12 @@ paths:
 
   /connect:
     get:
+      tags: [Connect protocol]
+      summary: Auth Connect
       description: |
         Redirect (303) to the single sign-on (SSO) start URL.
         Used to begin the browser SSO/OAuth flow.
-      operationId: Auth Connect
+      operationId: authConnect
       security: []
       responses:
         "303":
@@ -3372,10 +4153,12 @@ paths:
               schema:
                 type: string
     post:
+      tags: [Connect protocol]
+      summary: Auth Connect Post
       description: |
         Redirect (303) to the single sign-on (SSO) start URL.
         Used to begin the browser SSO/OAuth flow.
-      operationId: Auth Connect Post
+      operationId: authConnectPost
       security: []
       responses:
         "303":
@@ -3387,11 +4170,13 @@ paths:
 
   /connect/control:
     post:
+      tags: [Connect protocol]
+      summary: Connect Control
       description: |
         Out-of-band control messages for the connect protocol.
         Blocking request-response control messages need to be handled out-of-band
-        to resolve the possibility of dedlocks in the client sequence.
-      operationId: Connect Control
+        to resolve the possibility of deadlocks in the client sequence.
+      operationId: connectControl
       security:
         - BearerAuth: []
       requestBody:
@@ -3410,12 +4195,14 @@ paths:
 
   /key/{clientId}:
     get:
+      tags: [Other]
+      summary: Get Client Key
       description: |
         Fetch the published Ed25519 public key for a client id.
         Unauthenticated by design - the value is a public key meant to be
         fetchable by any peer. A client that has never published a key
         returns `{"public_key": null}` with HTTP 200.
-      operationId: Get Client Key
+      operationId: getClientKey
       security: []
       parameters:
         - in: path
@@ -3434,6 +4221,8 @@ paths:
 
   /key/{clientId}/history:
     get:
+      tags: [Other]
+      summary: Get Client Key History
       description: |
         Fetch the operator-signed registration history of a client's public
         key: the ordered signed registrations, generation 1 first, each an
@@ -3453,7 +4242,7 @@ paths:
         error: an error is an availability signal, and a consumer must not
         confuse the two. At most 64 registrations, and at most 1 MiB, are
         returned.
-      operationId: Get Client Key History
+      operationId: getClientKeyHistory
       security: []
       parameters:
         - in: path
@@ -3472,7 +4261,7 @@ paths:
 
   /hello:
     get:
-      tags: [extenders]
+      tags: [Other]
       summary: Discovery
       description: |
         Simple hello to the network that returns some useful information.
@@ -3485,7 +4274,7 @@ paths:
         request itself travelled through an untrusted extender -- and the
         extender activation probe forwards a real `GET /hello` through the
         candidate's tcp carrier to prove the forward works.
-      operationId: Hello
+      operationId: hello
       security: []
       responses:
         "200":
@@ -3497,6 +4286,8 @@ paths:
 
   /my-ip-info:
     get:
+      tags: [Other]
+      summary: My IP Info
       description: |
         Information about the caller's IP as seen by the platform: its
         geolocation, and whether the IP is currently connected to the network.
@@ -3505,7 +4296,7 @@ paths:
         GeoLite2 data created by MaxMind, available from
         https://www.maxmind.com. The database has no privacy/VPN
         classification, so none is returned.
-      operationId: My IP Info
+      operationId: myIpInfo
       security: []
       responses:
         "200":
@@ -3517,10 +4308,12 @@ paths:
 
   /account/change-name:
     post:
+      tags: [Account]
+      summary: Account Change Name
       description: |
         Change the network name of the calling network. The previous name
         enters a reclaim cooldown. Subject to the account action rate limit.
-      operationId: Account Change Name
+      operationId: accountChangeName
       security:
         - BearerAuth: []
       requestBody:
@@ -3536,16 +4329,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ChangeNetworkNameResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/claim-name:
     post:
+      tags: [Account]
+      summary: Account Claim Name
       description: |
         Claim an unused network name for the calling network. Claiming and
         changing have SEPARATE daily budgets: a first-time claim does not
         consume any of the rename budget, and vice versa. Renaming a name that
         is still inside its reclaim cooldown is charged to the change-name
         budget instead.
-      operationId: Account Claim Name
+      operationId: accountClaimName
       security:
         - BearerAuth: []
       requestBody:
@@ -3561,12 +4358,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ChangeNetworkNameResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/api-key:
     post:
+      tags: [Account]
+      summary: Account Create API Key
       description: |
         Create an API key for the account.
-      operationId: Account Create API Key
+      operationId: accountCreateApiKey
       security:
         - BearerAuth: []
       requestBody:
@@ -3582,12 +4383,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateApiKeyResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /account/api-key/remove:
     post:
+      tags: [Account]
+      summary: Account Remove API Key
       description: |
         Remove an API key for the account.
-      operationId: Account Remove API Key
+      operationId: accountRemoveApiKey
       security:
         - BearerAuth: []
       requestBody:
@@ -3603,13 +4408,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeleteApiKeyResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /account/api-keys:
     get:
+      tags: [Account]
+      summary: Account Get API Keys
       description: |
         Fetches a list of API keys associated with the account.
         The list does not include the API key secrets, only metadata.
-      operationId: Account Get API Keys
+      operationId: accountGetApiKeys
       security:
         - BearerAuth: []
       responses:
@@ -3619,12 +4428,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetApiKeysResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /account/payout-wallet:
     post:
+      tags: [Account]
+      summary: Account Set Payout Wallet
       description: |
         Set an existing account wallet as the wallet to receive network payments.
-      operationId: Account Set Payout Wallet
+      operationId: accountSetPayoutWallet
       security:
         - BearerAuth: []
       requestBody:
@@ -3640,10 +4453,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetPayoutWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
     get:
+      tags: [Account]
+      summary: Account Get Payout Wallet
       description: |
         Fetches the payout wallet associated with the network
-      operationId: Account Get Payout Wallet
+      operationId: accountGetPayoutWallet
       security:
         - BearerAuth: []
       responses:
@@ -3653,12 +4470,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetPayoutWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/points:
     get:
+      tags: [Account]
+      summary: Account Get Points
       description: |
         Retrieves account points earned. Eventually, users will be able to convert points for tokens
-      operationId: Account Get Points
+      operationId: accountGetPoints
       security:
         - BearerAuth: []
       responses:
@@ -3671,9 +4492,11 @@ paths:
 
   /account/payments:
     get:
+      tags: [Account]
+      summary: Account Get Payouts
       description: |
         Retrieves list of account payments
-      operationId: Account Get Payouts
+      operationId: accountGetPayouts
       security:
         - BearerAuth: []
       responses:
@@ -3683,13 +4506,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetNetworkAccountPaymentsResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/wallet:
     post:
+      tags: [Account]
+      summary: Account Create Wallet
       description: |
         Create a new wallet for your network. You can then use it as a payout wallet
         by posting to /account/payout-wallet.
-      operationId: Account Create Wallet
+      operationId: accountCreateWallet
       security:
         - BearerAuth: []
       requestBody:
@@ -3705,12 +4532,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateAccountWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/wallets:
     get:
+      tags: [Account]
+      summary: Account Get Wallets
       description: |
         Get a list of wallets associated with your network
-      operationId: Account Get Wallets
+      operationId: accountGetWallets
       security:
         - BearerAuth: []
       responses:
@@ -3720,16 +4551,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetAccountWalletsResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/wallets/remove:
     post:
+      tags: [Account]
+      summary: Account Remove Wallet
       description: |
         Remove a wallet from your list of account wallets. Removing the
         payout wallet makes another active Solana or Polygon wallet of the
         network the payout wallet, when there is one, and names it in
         `payout_wallet_id`; otherwise USDC payouts are held until a payout
         wallet is set.
-      operationId: Account Remove Wallet
+      operationId: accountRemoveWallet
       security:
         - BearerAuth: []
       requestBody:
@@ -3745,15 +4580,19 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RemoveWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/wallets/verify-seeker:
     post:
+      tags: [Account]
+      summary: Account Verify Seeker Token
       description: |
         Verify that a wallet holds a Seeker or Saga Genesis token by
         validating a signed message. Either holding succeeds; a wallet with
         neither is refused with `error.message` and `error.code`
         `seeker_token_not_found`.
-      operationId: Account Verify Seeker Token
+      operationId: accountVerifySeekerToken
       security:
         - BearerAuth: []
       requestBody:
@@ -3769,12 +4608,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/VerifySeekerNftHolderResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/balance-codes:
     get:
+      tags: [Account]
+      summary: Account Balance Codes
       description: |
         Fetch balance codes redeemed by network
-      operationId: Account Balance Codes
+      operationId: accountBalanceCodes
       security:
         - BearerAuth: []
       responses:
@@ -3784,15 +4627,19 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkBalanceCodesResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/epochs:
     get:
+      tags: [Account]
+      summary: Account Epochs
       description: |
         The caller network's finalized epochs, newest first: the points earned
         inside each epoch's wall-clock window and the network's share of the
         operator pool in basis points (0 when no coldkey was attached, i.e.
         points only). `limit` defaults to 26 and is capped at 104.
-      operationId: Account Epochs
+      operationId: accountEpochs
       security:
         - BearerAuth: []
       parameters:
@@ -3811,9 +4658,11 @@ paths:
 
   /account/referral-code:
     get:
+      tags: [Account]
+      summary: Account Referral Code
       description: |
         Unique network code to refer new users
-      operationId: Account Referral Code
+      operationId: accountReferralCode
       security:
         - BearerAuth: []
       responses:
@@ -3826,13 +4675,15 @@ paths:
 
   /referral-code/validate:
     post:
+      tags: [Referral codes]
+      summary: Validate Referral Code
       description: |
         Validate a referral (bonus) code: whether it exists and whether it has
         been used up. The sign-up screens call this before an account exists,
         so no authentication is required; a bearer token, if sent, is ignored.
         Checks are budgeted per caller address (60 per 10 minutes) and across
         all callers; over budget the response is 429 with a Retry-After header.
-      operationId: Validate Referral Code
+      operationId: validateReferralCode
       security: []
       requestBody:
         required: true
@@ -3852,9 +4703,11 @@ paths:
 
   /account/referral-network:
     get:
+      tags: [Account]
+      summary: Account Referral Network
       description: |
         Get the network that was referred the authenticated network
-      operationId: Account Referral Network
+      operationId: accountReferralNetwork
       security:
         - BearerAuth: []
       responses:
@@ -3867,9 +4720,11 @@ paths:
 
   /account/unlink-referral-network:
     get:
+      tags: [Account]
+      summary: Account Unlink Referral Network
       description: |
         Unlink the referral network from the authenticated network.
-      operationId: Account Unlink Referral Network
+      operationId: accountUnlinkReferralNetwork
       security:
         - BearerAuth: []
       responses:
@@ -3879,12 +4734,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UnlinkReferralNetworkResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /account/set-referral:
     post:
+      tags: [Account]
+      summary: Account Set Referral
       description: |
         Set the parent referral network for the authenticated network.
-      operationId: Account Set Referral
+      operationId: accountSetReferral
       security:
         - BearerAuth: []
       requestBody:
@@ -3900,12 +4759,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetNetworkReferralResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /transfer/stats:
     get:
+      tags: [Transfer]
+      summary: Transfer Stats
       description: |
         Retrieves the paid and unpaid byte count provided to the network
-      operationId: Transfer Stats
+      operationId: transferStats
       security:
         - BearerAuth: []
       responses:
@@ -3918,7 +4781,7 @@ paths:
 
   /solana/payment-intent:
     post:
-      tags: [subscription]
+      tags: [Solana]
       summary: Create a Solana Pay intent for Pro
       description: |
         When paying for a subscription with Solana, we track the order through this intent.
@@ -3947,7 +4810,7 @@ paths:
 
   /solana/payment-transaction:
     post:
-      tags: [subscription]
+      tags: [Solana]
       summary: Build the browser-wallet transfer for a Solana Pay intent
       description: |
         The unsigned USDC transfer that pays an open Solana Pay intent of the
@@ -3995,13 +4858,15 @@ paths:
 
   /stripe/payment-intent:
     post:
+      tags: [Other]
+      summary: Stripe Payment Intent
       description: |
         When paying for a subscription with Stripe, create the payment intents,
         ephemeral key, and customer id needed to complete the purchase.
         A legacy guest network (no sign-in method) is refused with
         `error.code` `guest_sign_in_required` (PurchaseError); a payment that
         could not be started with `start_failed`.
-      operationId: Stripe Payment Intent
+      operationId: stripePaymentIntent
       security:
         - BearerAuth: []
       requestBody:
@@ -4020,12 +4885,14 @@ paths:
 
   /stripe/customer-portal:
     post:
+      tags: [Other]
+      summary: Stripe Customer Portal
       description: |
         Create a Stripe customer portal URL for the caller to manage their
         subscription. A refusal carries a stable `error.code`
         (SubscriptionError: `no_customer`, `store_unavailable`) beside its
         `error.message`.
-      operationId: Stripe Customer Portal
+      operationId: stripeCustomerPortal
       security:
         - BearerAuth: []
       requestBody:
@@ -4041,9 +4908,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StripeCreateCustomerPortalResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /pay/data/checkout:
     post:
+      tags: [Other]
+      summary: Pay Data Checkout
       description: |
         Buy a data pack with a card without signing in (the ur.io buy-data
         page). Starts a hosted Stripe checkout and returns the url to send the
@@ -4065,7 +4936,7 @@ paths:
         `item=<item_id>` and, when applying to a network, `network=<name>`.
         Unauthenticated, per-ip rate limited. Errors are returned as
         `error.message` with a 200.
-      operationId: Pay Data Checkout
+      operationId: payDataCheckout
       security: []
       requestBody:
         content:
@@ -4082,6 +4953,8 @@ paths:
 
   /pay/data/network-lookup:
     post:
+      tags: [Other]
+      summary: Pay Data Network Lookup
       description: |
         Whether a network with exactly this name exists, for the buy-data page.
         Matched the same way /pay/data/checkout resolves `network_name`
@@ -4089,7 +4962,7 @@ paths:
         similarity check, a name within a few characters of an existing one is
         NOT reported as existing. Returns only the canonical name, no id.
         Unauthenticated, per-ip rate limited.
-      operationId: Pay Data Network Lookup
+      operationId: payDataNetworkLookup
       security: []
       requestBody:
         content:
@@ -4106,6 +4979,8 @@ paths:
 
   /pay/data/solana-intent:
     post:
+      tags: [Other]
+      summary: Pay Data Solana Intent
       description: |
         Buy a data pack with USDC on Solana, without signing in or giving an
         email: the data goes straight to the network named by `network_name`
@@ -4137,7 +5012,7 @@ paths:
         with a 200, and a stable `error.code` beside it (PurchaseError:
         `invalid_request`, `network_not_found` and the others). Unauthenticated,
         per-ip rate limited (`rate_limited`).
-      operationId: Pay Data Solana Intent
+      operationId: payDataSolanaIntent
       security: []
       requestBody:
         content:
@@ -4154,6 +5029,8 @@ paths:
 
   /pay/data/solana-status:
     post:
+      tags: [Other]
+      summary: Pay Data Solana Status
       description: |
         The state of a data pack payment started with /pay/data/solana-intent,
         for the buy-data page to poll while it waits: `pending` until the USDC
@@ -4161,7 +5038,7 @@ paths:
         when the intent passed `expires_at` unpaid, `unknown` for a reference
         that is not a data pack intent (plan intents made by a signed-in wallet
         are not reported here). Unauthenticated, per-ip rate limited.
-      operationId: Pay Data Solana Status
+      operationId: payDataSolanaStatus
       security: []
       requestBody:
         content:
@@ -4178,6 +5055,8 @@ paths:
 
   /stripe/create-checkout-session:
     post:
+      tags: [Other]
+      summary: Stripe Create Checkout Session
       description: |
         Create a Stripe Checkout Session for a subscription or data pack.
 
@@ -4196,7 +5075,7 @@ paths:
         `error.code` `guest_sign_in_required` (PurchaseError). Every other
         refusal carries its own code too, for example `already_subscribed`,
         `plan_unavailable` or `start_failed`.
-      operationId: Stripe Create Checkout Session
+      operationId: stripeCreateCheckoutSession
       security:
         - BearerAuth: []
       requestBody:
@@ -4215,6 +5094,8 @@ paths:
 
   /verify:
     post:
+      tags: [Other]
+      summary: Verify
       description: |
         One step of the validator's routing-verification protocol.
         The route accepts two body shapes:
@@ -4228,7 +5109,7 @@ paths:
         A non-final step returns the assign result (the server's signed
         commitment to the next hop); the final step returns status "complete"
         and the published proof.
-      operationId: Verify
+      operationId: verify
       security: []
       requestBody:
         required: true
@@ -4254,11 +5135,13 @@ paths:
 
   /verify/keys:
     get:
+      tags: [Other]
+      summary: Verify Keys
       description: |
         The published server Ed25519 verify keys, by server_key_id.
         All historical keys are listed so old proofs remain verifiable
         across key rotations.
-      operationId: Verify Keys
+      operationId: verifyKeys
       security: []
       responses:
         "200":
@@ -4274,7 +5157,7 @@ paths:
 
   /verify/stats:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Public per-provider verification statistics
       description: |
         The public reproducibility index of the routing-verification protocol:
@@ -4287,7 +5170,7 @@ paths:
 
         Unauthenticated, and it does not participate in validator scoring.
         `503` while the subnet subsystem is disabled.
-      operationId: Verify Stats
+      operationId: verifyStats
       security: []
       parameters:
         - in: query
@@ -4323,14 +5206,14 @@ paths:
 
   /verify/proofs:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Published trail proofs
       description: |
         The published completed trails, so anyone can re-verify them against
         the keys from `/verify/keys`. Same window parameters, profile and
         policy hash as `/verify/stats`. Unauthenticated; `503` while the
         subnet subsystem is disabled.
-      operationId: Verify Proofs
+      operationId: verifyProofs
       security: []
       parameters:
         - in: query
@@ -4364,8 +5247,240 @@ paths:
         "503":
           description: The verification subsystem is not enabled.
 
+  /verify/original:
+    post:
+      tags: [Other]
+      summary: Verify Original Request
+      description: |
+        Recover the first signed answer to a verification request after a
+        lost reply. The body locates the original request: its `client_id`,
+        the exact request `message` (base64, at most 2048 bytes), its
+        `signature` (base64, 64 bytes) and, when the original was scoped, its
+        `scope`. No JWT: the request signature must verify. At most 16 KiB.
+
+        The answer's `original` carries the retained signed transition (its
+        exact `body` and `signature`, both base64) or `null` when none is
+        retained. It is not a signed assertion that an absent request did
+        not run; readers verify the returned signature, scope and bytes
+        themselves.
+      operationId: getVerifyOriginalRequest
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyOriginalRequestArgs"
+      responses:
+        "200":
+          description: The retained original, or `null`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyOriginalRequestResult"
+        "400":
+          description: The locator is invalid or its signature does not verify.
+        "503":
+          description: |
+            The verification subsystem is not enabled on this deployment.
+            `Retry-After: 3600`. The body is plain text, not JSON.
+
+  /provider-work/v1/owners:
+    get:
+      tags: [Other]
+      summary: Provider Work Owners
+      description: |
+        Read the retained owner statements of one SDK client and key, for the
+        subnet provider work protocol. Public and self-authenticating: the
+        returned originals carry their own signatures.
+
+        The query takes exactly `domain` (64 hex), `client` (32 hex) and
+        `key` (64 hex), plus an optional `generation` (32 hex); selectors are
+        lowercase hex, not all zeros, each given once, with no other
+        parameters, and `domain` must be this deployment's.
+        - With `generation`: the exact original owner statement, with an
+          `ETag` of its SHA-256 and `Cache-Control: public, immutable`.
+        - Without: an index of the retained statements, at most 1024, with
+          no completeness or "current" flag.
+      operationId: getProviderWorkOwners
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ProviderWorkDomain"
+        - $ref: "#/components/parameters/ProviderWorkClient"
+        - $ref: "#/components/parameters/ProviderWorkKey"
+        - in: query
+          name: generation
+          schema:
+            type: string
+          required: false
+          description: 32 hex digits. Selects one exact owner statement.
+      responses:
+        "200":
+          description: |
+            The exact owner statement (with `generation`), or the index of
+            retained statements (`schema`
+            `urnetwork-sdk-whole-work-owner-index-v1`; `owners` holds each
+            original, base64).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ProviderWorkOwnerIndex"
+                  - type: object
+                    description: The exact original owner statement.
+        "400":
+          description: A selector is missing, duplicated, malformed or unexpected.
+        "404":
+          description: Nothing is retained for the selection.
+        "429":
+          description: The provider work transport is busy.
+        "503":
+          description: Provider work is unavailable on this deployment.
+
+  /provider-work/v1/requests:
+    get:
+      tags: [Other]
+      summary: Provider Work Requests
+      description: |
+        List the outstanding original work requests for one SDK client,
+        generation and key. The query takes exactly `domain` (64 hex),
+        `client` (32 hex), `generation` (32 hex) and `key` (64 hex), with
+        the same selector rules as `/provider-work/v1/owners`.
+      operationId: listProviderWorkRequests
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ProviderWorkDomain"
+        - $ref: "#/components/parameters/ProviderWorkClient"
+        - in: query
+          name: generation
+          schema:
+            type: string
+          required: true
+          description: 32 hex digits.
+        - $ref: "#/components/parameters/ProviderWorkKey"
+      responses:
+        "200":
+          description: The original requests, each base64.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWorkRequests"
+        "400":
+          description: A selector is missing, duplicated, malformed or unexpected.
+        "429":
+          description: The provider work transport is busy.
+        "503":
+          description: Provider work is unavailable on this deployment.
+
+  /provider-work/v1/requests/{requestHash}:
+    get:
+      tags: [Other]
+      summary: Provider Work Request
+      description: |
+        Read one original work request by the SHA-256 of its exact bytes. The
+        answer is the original JSON, with an `ETag` of the hash and
+        `Cache-Control: public, immutable`. No query parameters.
+      operationId: getProviderWorkRequest
+      security: []
+      parameters:
+        - in: path
+          name: requestHash
+          schema:
+            type: string
+          required: true
+          description: 64 lowercase hex digits.
+      responses:
+        "200":
+          description: The original request.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: The hash is malformed, or a query was given.
+        "404":
+          description: No original is retained under the hash.
+
+  /provider-work/v1/cuts/{cutHash}:
+    get:
+      tags: [Other]
+      summary: Provider Work Cut
+      description: |
+        Read one original work cut by the SHA-256 of its exact bytes. The
+        answer is the original JSON, with an `ETag` of the hash and
+        `Cache-Control: public, immutable`. No query parameters.
+      operationId: getProviderWorkCut
+      security: []
+      parameters:
+        - in: path
+          name: cutHash
+          schema:
+            type: string
+          required: true
+          description: 64 lowercase hex digits.
+      responses:
+        "200":
+          description: The original cut.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: The hash is malformed, or a query was given.
+        "404":
+          description: No original is retained under the hash.
+
+  /provider-work/v1/windows:
+    get:
+      tags: [Other]
+      summary: Provider Work Window
+      description: |
+        Read the closed-work whole inventory published for one subnet payout
+        artifact. The query takes exactly `domain` (64 hex), `epoch` (a
+        canonical decimal uint64) and `artifact` (64 hex), plus an optional
+        `authority` (64 hex) that selects an exact authority. A historical
+        absence is answered as missing; it is never rebuilt from current
+        state.
+      operationId: getProviderWorkWindow
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ProviderWorkDomain"
+        - in: query
+          name: epoch
+          schema:
+            type: string
+          required: true
+          description: A canonical decimal uint64.
+        - in: query
+          name: artifact
+          schema:
+            type: string
+          required: true
+          description: 64 hex digits, the artifact's content hash.
+        - in: query
+          name: authority
+          schema:
+            type: string
+          required: false
+          description: 64 hex digits. Selects an exact authority.
+      responses:
+        "200":
+          description: The whole inventory, as published.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: A selector is missing, duplicated, malformed or unexpected.
+        "404":
+          description: No inventory is retained for the selection.
+        "503":
+          description: Provider work is unavailable on this deployment.
+
   /sn/wallet:
     post:
+      tags: [Other]
+      summary: Sn Set Wallet
       description: |
         Attach the caller's subnet coldkey - the ss58 address that pool payouts
         are claimable by. Proof of key possession is required: `message` is the
@@ -4393,7 +5508,7 @@ paths:
         (a network JWT) and without `client_id`. A hotkey delegation is signed
         by the hotkey it names, not by a coldkey: `signature` is the hotkey's
         sr25519 signature and `coldkey_ss58` is the hotkey's ss58 address.
-      operationId: Sn Set Wallet
+      operationId: snSetWallet
       security:
         - BearerAuth: []
       requestBody:
@@ -4409,7 +5524,11 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnSetWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
     get:
+      tags: [Other]
+      summary: Sn Get Wallet
       description: |
         The coldkeys attached inside the caller's network: the network consent,
         the hotkey entry and the network-level wallet (no `client_id`) and
@@ -4427,7 +5546,7 @@ paths:
         else the network-level copy; for a network session the network
         consent, else the hotkey entry, else the network-level copy. Absent
         when none is attached. An empty `wallets` list is not an error.
-      operationId: Sn Get Wallet
+      operationId: snGetWallet
       security:
         - BearerAuth: []
       responses:
@@ -4437,9 +5556,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnGetWalletResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /sn/wallet/consent:
     post:
+      tags: [Other]
+      summary: Sn Wallet Mapping Challenge
       description: |
         Issue a per-provider wallet mapping consent: the exact message the
         coldkey signs to receive one provider client's earnings for the
@@ -4449,7 +5572,7 @@ paths:
         unchanged, with the coldkey's sr25519 signature, to POST /sn/wallet.
         A provider's own consent effective at an epoch takes precedence over
         the network consent.
-      operationId: Sn Wallet Mapping Challenge
+      operationId: snWalletMappingChallenge
       security:
         - BearerAuth: []
       requestBody:
@@ -4465,9 +5588,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnWalletMappingChallengeResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /sn/wallet/consent/history:
     post:
+      tags: [Other]
+      summary: Sn Wallet Mapping History
       description: |
         The retained signed consents of one provider client, generation 1
         through `generation`, for a caller that already holds the chain head
@@ -4475,7 +5602,7 @@ paths:
         does not match is refused; the server never selects the newest
         consent as authority. No authentication: the consents are public
         evidence.
-      operationId: Sn Wallet Mapping History
+      operationId: snWalletMappingHistory
       security: []
       requestBody:
         required: true
@@ -4493,6 +5620,8 @@ paths:
 
   /sn/wallet/network-consent:
     post:
+      tags: [Other]
+      summary: Sn Network Wallet Mapping Challenge
       description: |
         Issue a network wallet mapping consent: the exact message the coldkey
         signs once to receive the earnings of every provider client of the
@@ -4504,7 +5633,7 @@ paths:
         unchanged, with the coldkey's sr25519 signature and without
         `client_id`, to POST /sn/wallet. A later consent replaces the earlier
         one from its `from_epoch`; there is no unsigned revocation.
-      operationId: Sn Network Wallet Mapping Challenge
+      operationId: snNetworkWalletMappingChallenge
       security:
         - BearerAuth: []
       requestBody:
@@ -4520,15 +5649,19 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnWalletMappingChallengeResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /sn/wallet/network-consent/history:
     post:
+      tags: [Other]
+      summary: Sn Network Wallet Mapping History
       description: |
         The retained signed network consents of one network, generation 1
         through `generation`, for a caller that already holds the chain head
         from an independent source. As for /sn/wallet/consent/history, a head
         that does not match is refused and no authentication is required.
-      operationId: Sn Network Wallet Mapping History
+      operationId: snNetworkWalletMappingHistory
       security: []
       requestBody:
         required: true
@@ -4546,6 +5679,8 @@ paths:
 
   /sn/wallet/hotkey-consent:
     post:
+      tags: [Other]
+      summary: Sn Hotkey Wallet Mapping Consent
       description: |
         Store a hotkey wallet consent chain: a coldkey's approval, signed once
         for every operator of the subnet, that the networks which delegate to
@@ -4566,7 +5701,7 @@ paths:
         operator doesn't have yet (more is refused with 400; submit successive
         prefixes of the chain instead). Resubmitting or extending a hotkey the
         network already linked is always allowed.
-      operationId: Sn Hotkey Wallet Mapping Consent
+      operationId: snHotkeyWalletMappingConsent
       security:
         - BearerAuth: []
       requestBody:
@@ -4582,16 +5717,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnHotkeyWalletMappingConsentResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /sn/wallet/hotkey-consent/history:
     post:
+      tags: [Other]
+      summary: Sn Hotkey Wallet Mapping History
       description: |
         The stored hotkey wallet consents of one hotkey on this operator's
         subnet, generation 1 through `generation`, for a caller that already
         holds the chain head from an independent source. As for
         /sn/wallet/consent/history, a head that does not match is refused and
         no authentication is required.
-      operationId: Sn Hotkey Wallet Mapping History
+      operationId: snHotkeyWalletMappingHistory
       security: []
       requestBody:
         required: true
@@ -4609,6 +5748,8 @@ paths:
 
   /sn/wallet/hotkey-delegation:
     post:
+      tags: [Other]
+      summary: Sn Hotkey Network Delegation Challenge
       description: |
         Issue a hotkey delegation: the exact message the hotkey signs to
         receive the earnings of every provider client of the caller's network,
@@ -4624,7 +5765,7 @@ paths:
         the hotkey's sr25519 signature and without `client_id`, to POST
         /sn/wallet. A later delegation replaces the earlier one from its
         `from_epoch` and may name another hotkey.
-      operationId: Sn Hotkey Network Delegation Challenge
+      operationId: snHotkeyNetworkDelegationChallenge
       security:
         - BearerAuth: []
       requestBody:
@@ -4640,16 +5781,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnWalletMappingChallengeResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /sn/wallet/hotkey-delegation/history:
     post:
+      tags: [Other]
+      summary: Sn Hotkey Network Delegation History
       description: |
         The retained signed hotkey delegations of one network, generation 1
         through `generation`, for a caller that already holds the chain head
         from an independent source. Each original's `signature` is the
         hotkey's. As for /sn/wallet/consent/history, a head that does not
         match is refused and no authentication is required.
-      operationId: Sn Hotkey Network Delegation History
+      operationId: snHotkeyNetworkDelegationHistory
       security: []
       requestBody:
         required: true
@@ -4667,6 +5812,8 @@ paths:
 
   /sn/wallet/validate:
     post:
+      tags: [Other]
+      summary: Sn Validate Wallet
       description: |
         Checks an address before it is attached: ss58 syntax with the Bittensor
         prefix, the operator ban list, and whether the account exists on the
@@ -4674,7 +5821,7 @@ paths:
         `exists_on_chain: true` with a message, so an outage never blocks a
         user. No authentication; chain lookups are rate limited per source
         address.
-      operationId: Sn Validate Wallet
+      operationId: snValidateWallet
       security: []
       requestBody:
         required: true
@@ -4692,6 +5839,8 @@ paths:
 
   /sn/head:
     get:
+      tags: [Other]
+      summary: Sn Head
       description: |
         The caller network's standing for a head mining spot (Top 200,
         WHITEPAPER 8.4). `score` is the server's estimate of split-adjusted
@@ -4701,7 +5850,7 @@ paths:
         `bound`/`hotkey`/`uid` reflect an active head binding. `source` is
         "server" until validators publish consensus scores on chain; a chain
         outage degrades to the estimate, never an error.
-      operationId: Sn Head
+      operationId: snHead
       security:
         - BearerAuth: []
       responses:
@@ -4714,6 +5863,8 @@ paths:
 
   /sn/head/binding:
     post:
+      tags: [Other]
+      summary: Sn Head Binding
       description: |
         Store a device's consent for a fleet binding (WHITEPAPER 11.4): the
         canonical binding payload and the client's Ed25519 signature over its
@@ -4721,7 +5872,7 @@ paths:
         When both signatures verify the response carries the
         `bindFleetMember` calldata for the operator to submit from their own
         key. The server never submits on chain.
-      operationId: Sn Head Binding
+      operationId: snHeadBinding
       security:
         - BearerAuth: []
       requestBody:
@@ -4737,14 +5888,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnHeadBindingResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
 
   /sn/pool/claim:
     get:
+      tags: [Other]
+      summary: Sn Pool Claim
       description: |
         The caller network's merkle pool-payout claim for an epoch:
         everything needed to call claim on the subnet contract.
         Claims are served once the epoch is finalized on chain.
-      operationId: Sn Pool Claim
+      operationId: snPoolClaim
       security:
         - BearerAuth: []
       parameters:
@@ -4766,10 +5921,12 @@ paths:
 
   /sn/epoch:
     get:
+      tags: [Other]
+      summary: Sn Epoch
       description: |
         The current subnet epoch index, boundaries, and deadlines mirrored
         from chain, so clients do not need their own RPC.
-      operationId: Sn Epoch
+      operationId: snEpoch
       security: []
       responses:
         "200":
@@ -4783,7 +5940,7 @@ paths:
 
   /sn/artifact:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: One immutable payout artifact by content hash
       description: |
         Serve a canonical payout artifact addressed by its sha256 content
@@ -4791,7 +5948,7 @@ paths:
         returned, so a corrupt object store cannot silently substitute a
         different payout tree. Public and immutable: the answer carries the
         content hash as its `ETag` and a one-year immutable cache directive.
-      operationId: Sn Artifact
+      operationId: snArtifact
       security: []
       parameters:
         - in: query
@@ -4816,7 +5973,7 @@ paths:
 
   /sn/artifacts:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Page the payout artifact history
       description: |
         List immutable payout artifact keys under a deployment and netuid
@@ -4826,7 +5983,7 @@ paths:
         served: keys must be strictly increasing, inside the requested prefix,
         and named by a canonical lowercase 32-byte hex hash with a `.json`
         suffix.
-      operationId: Sn Artifact History
+      operationId: snArtifactHistory
       security: []
       parameters:
         - in: query
@@ -4881,7 +6038,7 @@ paths:
 
   /sn/attempt-artifact:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Stream one typed attempt object
       description: |
         Stream the exact immutable bytes of one attempt object. `kind` selects
@@ -4897,7 +6054,7 @@ paths:
         `Retry-After`. A stream that fails after any bytes have been written
         is aborted without a clean end-of-body rather than ending in a
         truncated object that looks complete.
-      operationId: Sn Attempt Artifact
+      operationId: snAttemptArtifact
       security: []
       parameters:
         - in: query
@@ -4940,7 +6097,7 @@ paths:
         "503":
           description: The artifact reader or store is unavailable.
     post:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Stage one typed attempt object
       description: |
         Upload the exact bytes of one attempt object. Requires a CLIENT jwt.
@@ -4963,7 +6120,7 @@ paths:
         client authentication.
 
         The answer is `204` with the content hash in `ETag`.
-      operationId: Sn Upload Attempt Artifact
+      operationId: snUploadAttemptArtifact
       security:
         - BearerAuth: []
       parameters:
@@ -5021,14 +6178,14 @@ paths:
 
   /sn/evidence:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: One signed release-evidence envelope
       description: |
         Serve a signed release-evidence envelope by its content hash. The
         envelope's signature is re-verified and its content hash re-checked
         against the requested one before the bytes are returned. Public and
         immutable, with the content hash as `ETag`.
-      operationId: Sn Evidence
+      operationId: snEvidence
       security: []
       parameters:
         - in: query
@@ -5052,7 +6209,8 @@ paths:
         "503":
           description: The artifact store is unavailable.
     post:
-      tags: [subnet evidence]
+      tags: [Other]
+      x-internal: true
       summary: Publish a signed release-evidence envelope
       description: |
         Publish a release-evidence envelope. There is no header credential:
@@ -5061,7 +6219,7 @@ paths:
         id, netuid, deployment id and genesis hash must all match this
         operator. The body is capped at 64 MiB. Every rejection is the same
         `400`, so a caller cannot probe which check failed.
-      operationId: Sn Publish Evidence
+      operationId: snPublishEvidence
       security: []
       requestBody:
         required: true
@@ -5081,7 +6239,7 @@ paths:
 
   /sn/evidence/history:
     get:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Page one run's evidence history
       description: |
         List the evidence objects of ONE signed run. Both `kind` and `run_id`
@@ -5092,7 +6250,7 @@ paths:
         (signature, deployment, netuid, kind, run and content hash) rather
         than merely listed, and `after` may not be combined with it. The
         legacy empty-run namespace is readable only by exact hash.
-      operationId: Sn Evidence History
+      operationId: snEvidenceHistory
       security: []
       parameters:
         - in: query
@@ -5152,7 +6310,7 @@ paths:
 
   /sn/client-key/observation:
     post:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Publish one client-key observation
       description: |
         Publish one signed client-key observation and read back that client's
@@ -5168,7 +6326,7 @@ paths:
         re-encoding are refused -- and the full maximum response size is
         charged against the account's byte budget before any operator
         signature or public write, so a failed call still pays its admission.
-      operationId: Sn Client Key Observation
+      operationId: snClientKeyObservation
       security:
         - BearerAuth: []
       requestBody:
@@ -5193,7 +6351,7 @@ paths:
 
   /sn/client-key/observations:
     post:
-      tags: [subnet evidence]
+      tags: [Other]
       summary: Publish a batch of client-key observations
       description: |
         The plural form of `/sn/client-key/observation`, with the same
@@ -5205,7 +6363,7 @@ paths:
 
         A batch whose chain work cannot be admitted is refused with `413` and
         an `X-Ur-Client-Key-Batch-Admission: work` header.
-      operationId: Sn Client Key Observations
+      operationId: snClientKeyObservations
       security:
         - BearerAuth: []
       requestBody:
@@ -5238,7 +6396,7 @@ paths:
 
   /onboarding/offer/issue:
     post:
-      tags: [onboarding]
+      tags: [Other]
       summary: Issue the welcome offer
       description: |
         Issue the caller's welcome offer: 25% off the first year of Pro (3
@@ -5323,7 +6481,7 @@ paths:
 
   /client/events:
     post:
-      tags: [analytics]
+      tags: [Other]
       summary: Store a batch of product events
       description: |
         Store a batch of product events (at most 200 per call) against the
@@ -5418,7 +6576,7 @@ paths:
 
   /onboarding/click:
     post:
-      tags: [onboarding, analytics]
+      tags: [Other]
       summary: Record a campaign landing click
       description: |
         Record a campaign landing-page click. Every onboarding email link is
@@ -5483,7 +6641,7 @@ paths:
 
   /onboarding/feedback/{token}:
     get:
-      tags: [onboarding]
+      tags: [Other]
       summary: Resolve a feedback link token
       description: |
         Resolve a feedback link token (`https://ur.io/f/<token>?r=n` or
@@ -5555,7 +6713,7 @@ paths:
 
   /subscription/stripe/payment-sheet:
     post:
-      tags: [subscription, onboarding]
+      tags: [Subscription]
       summary: Prepare an inline Stripe payment sheet
       description: |
         Prepare an inline Stripe PaymentSheet purchase of Pro (the non-Play
@@ -5640,7 +6798,7 @@ paths:
 
   /subscription/stripe/prices:
     get:
-      tags: [subscription, onboarding]
+      tags: [Subscription]
       summary: Stripe prices for the caller's tier
       description: |
         The Stripe price ids (and USD amounts) of the caller's regional tier,
@@ -5684,13 +6842,14 @@ paths:
 
   /admin/onboarding/results:
     get:
-      tags: [analytics]
+      tags: [Other]
+      x-internal: true
       summary: Aggregated onboarding experiment results
       description: |
         The nightly aggregate the analysis script (mmm/onboarding/analyze.mjs)
         reads: `onboarding_results_daily`, recomputed at 02:00 UTC by the
         `OnboardingResultsRollup` task for the last `onboarding.results.rollup_days`
-        cohort days (config/main/onboarding.yml). One row per cohort day
+        cohort days. One row per cohort day
         (the network's sign-up day, UTC), experiment, variant, surface,
         platform, price tier and path. Counts are networks, never events.
 
@@ -5730,10 +6889,10 @@ paths:
         is returned. Ordered by the dimension tuple; keyset paged by
         `cursor`.
 
-        Auth: `Authorization: Bearer <token>` where the token is listed in
-        vault `onboarding.yml` under `onboarding.admin_bearers` (compared in
-        constant time). A missing or unknown token is 401; a network JWT is
-        403. Without the vault entry the endpoint is closed.
+        Auth: `Authorization: Bearer <token>` where the token is one of the
+        deployment's configured admin bearers (compared in constant time). A
+        missing or unknown token is 401; a network JWT is 403. Without an
+        admin bearer configured the endpoint is closed.
       operationId: adminOnboardingResults
       security:
         - AdminBearerAuth: []
@@ -5840,7 +6999,8 @@ paths:
 
   /admin/onboarding/email-tracker:
     get:
-      tags: [analytics]
+      tags: [Other]
+      x-internal: true
       summary: Per-flow-step email send and engagement aggregate
       description: |
         The durable per-flow-step send and engagement aggregate of the
@@ -5858,8 +7018,9 @@ paths:
         one flow step. The `definitions` block returns these rules with the
         data, so a reader never has to assume them.
 
-        Same auth as `/admin/onboarding/results`: an admin bearer from vault
-        `onboarding.yml`, compared in constant time. Keyset paged by `cursor`.
+        Same auth as `/admin/onboarding/results`: one of the deployment's
+        configured admin bearers, compared in constant time. Keyset paged by
+        `cursor`.
       operationId: adminOnboardingEmailTracker
       security:
         - AdminBearerAuth: []
@@ -5928,12 +7089,13 @@ paths:
 
   /admin/onboarding/experiments:
     get:
-      tags: [analytics]
+      tags: [Other]
+      x-internal: true
       summary: The experiment registry as loaded
       description: |
-        The onboarding experiment registry (config/main/onboarding.yml
-        `onboarding.experiments`) as the server loaded it, so the analysis
-        script judges results against the same allocation, primary metric,
+        The onboarding experiment registry (`onboarding.experiments`) as the
+        server loaded it, so the analysis script judges results against the
+        same allocation, primary metric,
         guardrails and minimum exposures the server applied, plus each
         experiment's live variant states from the pause overlay
         (`network_onboarding_experiment_state`: a variant the nightly
@@ -5984,7 +7146,8 @@ paths:
 
   /updates/brevo:
     post:
-      tags: [analytics]
+      tags: [Other]
+      x-internal: true
       summary: Brevo transactional webhook
       description: |
         The Brevo transactional-email webhook. Brevo is registered
@@ -5993,8 +7156,8 @@ paths:
 
         Authentication is HTTP BASIC, not bearer and not a network token: the
         request must carry `Authorization: Basic base64(<secret>:)` where
-        `<secret>` is one of the account's `webhook_bearers` (vault
-        `brevo.yml`) and the password half is empty.
+        `<secret>` is one of the account's configured webhook secrets and the
+        password half is empty.
 
         `unsubscribe` turns the account's product-updates preference off (the
         existing behavior). For the onboarding campaign the remaining events
@@ -6042,7 +7205,7 @@ paths:
 
   /.well-known/oauth-authorization-server:
     get:
-      tags: [oauth]
+      tags: [Other]
       summary: Authorization server metadata
       description: |
         The rfc 8414 authorization server metadata. Served with
@@ -6050,7 +7213,7 @@ paths:
         discovery document below. The `issuer` it publishes is the hostname
         clients must use, which is not necessarily the api host this request
         reached.
-      operationId: Oauth Server Metadata
+      operationId: oauthServerMetadata
       security: []
       responses:
         "200":
@@ -6062,12 +7225,12 @@ paths:
 
   /.well-known/openid-configuration:
     get:
-      tags: [oauth]
+      tags: [Other]
       summary: OpenID Connect discovery
       description: |
         The OpenID Connect discovery document. The same document as
         `/.well-known/oauth-authorization-server`.
-      operationId: Oauth Openid Configuration
+      operationId: oauthOpenidConfiguration
       security: []
       responses:
         "200":
@@ -6079,12 +7242,12 @@ paths:
 
   /.well-known/jwks.json:
     get:
-      tags: [oauth]
+      tags: [Other]
       summary: The signing keys
       description: |
         The authorization server's public signing keys as a JWK set. All
         current keys are listed so tokens stay verifiable across a rotation.
-      operationId: Oauth Jwks
+      operationId: oauthJwks
       security: []
       responses:
         "200":
@@ -6096,7 +7259,7 @@ paths:
 
   /oauth/token:
     post:
-      tags: [oauth]
+      tags: [Other]
       summary: Exchange a code or refresh token
       description: |
         The rfc 6749 token endpoint, as a form post. Two grants are supported:
@@ -6109,7 +7272,7 @@ paths:
         deliberately terse and the detail is logged rather than returned, so
         an error cannot be used to probe which check failed. The response is
         never cached by a shared cache.
-      operationId: Oauth Token
+      operationId: oauthToken
       security: []
       requestBody:
         required: true
@@ -6170,7 +7333,7 @@ paths:
 
   /oauth/register:
     post:
-      tags: [oauth]
+      tags: [Other]
       summary: Dynamic client registration
       description: |
         Dynamic client registration (rfc 7591). Deprecated by the MCP
@@ -6179,7 +7342,7 @@ paths:
         metered per caller address before the body is parsed or anything is
         stored; over budget it answers `429` with `Retry-After`. Registered
         clients are public, so no secret is issued.
-      operationId: Oauth Register
+      operationId: oauthRegister
       security: []
       requestBody:
         required: true
@@ -6213,13 +7376,13 @@ paths:
 
   /oauth/revoke:
     post:
-      tags: [oauth]
+      tags: [Other]
       summary: Revoke a refresh token
       description: |
         Token revocation (rfc 7009), as a form post. Always answers `200` with
         an empty body: per the rfc a client must not be able to tell an
         unknown token from a revoked one.
-      operationId: Oauth Revoke
+      operationId: oauthRevoke
       security: []
       requestBody:
         required: true
@@ -6243,7 +7406,7 @@ paths:
 
   /oauth/userinfo:
     get:
-      tags: [oauth]
+      tags: [Other]
       summary: OpenID Connect userinfo
       description: |
         The OpenID Connect userinfo endpoint. Authenticated by an ACCESS TOKEN
@@ -6251,7 +7414,7 @@ paths:
         a URnetwork network JWT. The token's audience is the resource it was
         minted for rather than this issuer, so the audience is deliberately
         not constrained here.
-      operationId: Oauth Userinfo
+      operationId: oauthUserinfo
       security:
         - BearerAuth: []
       responses:
@@ -6276,7 +7439,7 @@ paths:
 
   /oauth/consent:
     post:
-      tags: [oauth]
+      tags: [Other]
       summary: Describe an authorization request to the consent page
       description: |
         What the consent page on the ur.io origin needs to render: who is
@@ -6292,7 +7455,7 @@ paths:
         forces the screen even when the scopes are already approved. `issuer`
         is returned so the page can echo `iss` when the user declines, as
         rfc 9207 requires on error responses too.
-      operationId: Oauth Consent
+      operationId: oauthConsent
       security:
         - BearerAuth: []
       requestBody:
@@ -6320,10 +7483,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/OauthError"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /oauth/authorize:
     post:
-      tags: [oauth]
+      tags: [Other]
       summary: Mint an authorization code for an approved request
       description: |
         Mint the authorization code for a request the user approved, and
@@ -6333,7 +7498,7 @@ paths:
         abandoned screen grants nothing. The redirect carries `code`, the
         request's `state` when it had one, and `iss` per rfc 9207 so the
         client can detect a mix-up attack.
-      operationId: Oauth Authorize
+      operationId: oauthAuthorize
       security:
         - BearerAuth: []
       requestBody:
@@ -6361,37 +7526,120 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/OauthError"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
 components:
+  parameters:
+    ProviderWorkDomain:
+      in: query
+      name: domain
+      schema:
+        type: string
+      required: true
+      description: 64 hex digits; must be this deployment's work domain.
+    ProviderWorkClient:
+      in: query
+      name: client
+      schema:
+        type: string
+      required: true
+      description: 32 hex digits, the SDK client id.
+    ProviderWorkKey:
+      in: query
+      name: key
+      schema:
+        type: string
+      required: true
+      description: 64 hex digits, the SDK client's public key.
+  responses:
+    ClientJwtRefused:
+      description: |
+        The bearer token is a client JWT (`by_client_jwt`, from
+        `POST /network/auth-client`), and this route administers the network
+        or the account, which a client JWT never does. Call it with the
+        network's root token (a network JWT) or an API key. The route did
+        nothing. The body is the plain text message "A client token cannot
+        administer the network. Use the network's root token or an API key."
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: A client token cannot administer the network. Use the network's root token or an API key.
+    EmbedClientJwtRefused:
+      description: |
+        The bearer token is a client JWT (`by_client_jwt`, from
+        `POST /network/auth-client`) of an Embed network: one with Embed
+        enabled now or at any time before, or with an Embed plan client
+        allowance. An Embed network hands its client JWTs to a third party's
+        users, so none of them may administer the network or the account, or
+        redirect a client's payout. Call the route with the network's root
+        token (a network JWT) or an API key. A client JWT of any other
+        network is served. The route did nothing. The body is the plain text
+        message "A client token cannot administer the network. Use the
+        network's root token or an API key."
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: A client token cannot administer the network. Use the network's root token or an API key.
   securitySchemes:
     BearerAuth:
       type: http
       scheme: bearer
-      description: URnetwork JWT
+      description: |
+        `Authorization: Bearer <token>`, where the token is a URnetwork JWT
+        or an API key. The OAuth routes say where they take something else
+        (`GET /oauth/userinfo` takes an access token from `POST /oauth/token`).
+
+        JWT: the login routes under `/auth` return a network JWT in
+        `network.by_jwt` (`POST /auth/login`, `POST /auth/login-with-password`,
+        `POST /auth/verify`, `POST /auth/network-create`). The shortest way
+        for a script or an agent is an auth code: a signed-in person creates
+        one at https://ur.io/app/account/settings (a session can also create
+        one with `POST /auth/code-create`), and `POST /auth/code-login` with
+        `{"auth_code": "<auth code>"}`, which needs no authentication, returns
+        `{"by_jwt": "<jwt>"}`. An auth code is short-lived and limited use,
+        and the JWT it returns expires with the session that created the code.
+
+        A network JWT names no client. The `connect` protocol, and the routes
+        that say they require a client JWT, take one that does: exchange the
+        network JWT for it with `POST /network/auth-client`
+        (`by_client_jwt`).
+
+        A client JWT never administers the network or the account. The routes
+        that do answer it with 403 (`ClientJwtRefused`). The routes the
+        URnetwork apps call with their client JWT, and a client's own payout
+        routes, refuse only the client JWTs of an Embed network
+        (`EmbedClientJwtRefused`).
+
+        API key: `POST /account/api-key`, called with a JWT, returns a
+        long-lived key beginning `urn_` in `api_key`, shown only in that
+        response. Send it the same way, `Authorization: Bearer urn_...`. It
+        authenticates as the network, like a network JWT, until it is removed
+        with `POST /account/api-key/remove`.
     BrevoWebhookAuth:
       type: http
       scheme: basic
       description: |
-        HTTP Basic with a secret from the account's `webhook_bearers` list
-        (vault `brevo.yml`) as the username and an empty password. Not a
-        URnetwork JWT.
+        HTTP Basic with one of the account's configured webhook secrets as
+        the username and an empty password. Not a URnetwork JWT.
     AdminBearerAuth:
       type: http
       scheme: bearer
       description: |
-        An admin bearer listed in vault `onboarding.yml` under
-        `onboarding.admin_bearers`, compared in constant time. It is NOT a
-        URnetwork JWT: a network JWT here is a 403, and without the vault
-        entry the endpoint is closed.
+        An admin bearer configured for the deployment, compared in constant
+        time. It is not a URnetwork JWT: a network JWT here is a 403, and a
+        deployment without an admin bearer keeps these routes closed.
     OperatorSecret:
       type: apiKey
       in: header
       name: X-UR-Operator-Secret
       description: |
-        The shared operator secret of the provider probe control plane, from
-        vault `provider_egress.yml` `ingest_secret`, compared in constant
-        time. This is not a JWT and names no network. A deployment whose vault
-        has no such resource rejects every request to these routes.
+        The shared operator secret of the provider probe control plane,
+        compared in constant time. This is not a JWT and names no network. A
+        deployment without the secret configured rejects every request to
+        these routes.
 
   schemas:
     ClockResult:
@@ -7376,9 +8624,9 @@ components:
             | URL | Auth |
             |-----|------|
             | `https://<auth_token>.<proxy_host>:<https_proxy_port>` | no auth needed when the client connects with TLS |
-            | `https://<proxy_host>:<https_proxy_port>` | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
-            | `http://<proxy_host>:<http_proxy_port>` | use HTTP Proxy-Authorization Basic with `access_token` as the username (empty pass), or Bearer with `access_token` as the bearer token |
-            | `tcp://<proxy_host>:<socks_proxy_port>` | use `access_token` as the username (empty pass) |
+            | `https://<proxy_host>:<https_proxy_port>` | use HTTP Proxy-Authorization Basic with `auth_token` as the username (empty pass), or Bearer with `auth_token` as the bearer token |
+            | `http://<proxy_host>:<http_proxy_port>` | use HTTP Proxy-Authorization Basic with `auth_token` as the username (empty pass), or Bearer with `auth_token` as the bearer token |
+            | `tcp://<proxy_host>:<socks_proxy_port>` | use `auth_token` as the username (empty pass) |
             | `wg://<proxy_host>:<wg_proxy_port>` | use `wg_config.config` as the full WireGuard config file content, which contains all the necessary keys |
           allOf:
             - type: object
@@ -7414,6 +8662,372 @@ components:
               type: boolean
             message:
               type: string
+
+    ClientDataCapArgs:
+      type: object
+      required:
+        - client_id
+      properties:
+        client_id:
+          description: The client to set caps for. It must belong to the caller's network.
+          type: string
+          format: uuid
+        monthly_byte_limit:
+          description: |
+            Bytes the client may use in each UTC calendar month; resets at
+            00:00 UTC on the first of the month. Omit to keep the current
+            value, `null` to clear the cap, `0` to pause the client.
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+        total_byte_limit:
+          description: |
+            Bytes the client may use in the running total, which does not reset
+            on its own. Omit to keep the current value, `null` to clear the
+            cap, `0` to pause the client.
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+        reset_total:
+          description: Zero the running total and start a new total period.
+          type: boolean
+
+    ClientDataCapResult:
+      type: object
+      required: []
+      properties:
+        client_id:
+          type: string
+          format: uuid
+        monthly_byte_limit:
+          description: The monthly cap in bytes, or `null` for none.
+          type: [integer, "null"]
+          format: int64
+        monthly_used_byte_count:
+          description: Bytes used in the current UTC calendar month.
+          type: integer
+          format: int64
+        monthly_period_start:
+          description: Start of the current monthly period (UTC).
+          type: string
+          format: date-time
+        monthly_period_end:
+          description: End of the current monthly period (UTC), when monthly usage resets.
+          type: string
+          format: date-time
+        total_byte_limit:
+          description: The running-total cap in bytes, or `null` for none.
+          type: [integer, "null"]
+          format: int64
+        total_used_byte_count:
+          description: Bytes used since the running total last reset.
+          type: integer
+          format: int64
+        total_period_start:
+          description: |
+            When the running total began: the client's first cap request, or its
+            last `reset_total`. `null` for a client that has never had a cap
+            request.
+          type: [string, "null"]
+          format: date-time
+        capped:
+          description: True when the client has reached a cap and gets no new transfer contracts.
+          type: boolean
+        capped_reason:
+          description: Which cap was reached, or empty when the client is not capped.
+          type: string
+          enum: ["", monthly, total]
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+
+    ClientDataCapListResult:
+      type: object
+      required: []
+      properties:
+        clients:
+          type: array
+          items:
+            $ref: "#/components/schemas/ClientDataCapResult"
+        next_cursor:
+          description: Pass as `cursor` to read the next page; `null` on the last page.
+          type: [string, "null"]
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+
+    RegisterNetworkClientArgs:
+      type: object
+      required:
+        - schema
+        - registration_id
+        - scope_sha256
+        - description
+        - device_spec
+      additionalProperties: false
+      properties:
+        schema:
+          type: string
+          enum: [urnetwork-client-registration-v1]
+        registration_id:
+          description: 64 lowercase hex digits, not all zeros.
+          type: string
+        scope_sha256:
+          description: 64 lowercase hex digits, not all zeros. Immutable caller-owned provenance.
+          type: string
+        description:
+          description: At most 1024 bytes.
+          type: string
+        device_spec:
+          description: At most 4096 bytes.
+          type: string
+
+    RegisterNetworkClientResult:
+      type: object
+      required: []
+      properties:
+        schema:
+          type: string
+        registration_id:
+          type: string
+        request_sha256:
+          description: The SHA-256 of the canonical request.
+          type: string
+        client_id:
+          type: string
+          format: uuid
+        device_id:
+          type: string
+          format: uuid
+        by_client_jwt:
+          type: string
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              enum: [invalid_request, network_authority_required, client_limit, authentication_refused, registration_conflict, identity_unavailable]
+            message:
+              type: string
+
+    ClientAclGroupArgs:
+      type: object
+      required:
+        - client_id
+        - acl_group
+      properties:
+        client_id:
+          description: The client to set. It must belong to the caller's network.
+          type: string
+          format: uuid
+        acl_group:
+          type: string
+          enum: [default, isolated]
+
+    ClientAclGroupResult:
+      type: object
+      required: []
+      properties:
+        client_id:
+          type: string
+          format: uuid
+        acl_group:
+          type: string
+          enum: [default, isolated]
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+
+    NetworkEmbedResult:
+      type: object
+      required: []
+      properties:
+        enabled:
+          description: True when the URnetwork team has enabled Embed for the network.
+          type: boolean
+        client_limit:
+          description: The network's top-level client allowance; 100 without an Embed plan allowance.
+          type: integer
+        active_client_count:
+          description: The network's active top-level clients that count toward `client_limit` (provider installs do not).
+          type: integer
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+
+    ExtenderReleaseArgs:
+      type: object
+      required: []
+      properties:
+        ip_versions:
+          description: The address families the client can dial; empty means any.
+          type: array
+          items:
+            type: integer
+            enum: [4, 6]
+
+    ExtenderReleaseResult:
+      type: object
+      required: []
+      properties:
+        records:
+          description: Base64 serialized `protocol.ExtenderRecord` messages.
+          type: array
+          items:
+            type: string
+        epoch:
+          description: The epoch the release was dealt in.
+          type: integer
+        count:
+          description: How many records the identity is entitled to this epoch.
+          type: integer
+        probation:
+          type: boolean
+        error:
+          description: Why the release was refused; absent on success.
+          type: string
+
+    ExtenderBlockReportArgs:
+      type: object
+      required:
+        - public_key_hex
+      properties:
+        public_key_hex:
+          description: The unreachable extender's public key, hex.
+          type: string
+
+    ExtenderBlockReportResult:
+      type: object
+      required: []
+      properties:
+        recorded:
+          type: boolean
+        error:
+          description: Why the report was not recorded; absent when it was, or for an unknown key.
+          type: string
+
+    TestBalanceDrainArgs:
+      type: object
+      required: []
+      properties:
+        duration_seconds:
+          description: Clamped to 60-1800; default 900.
+          type: integer
+
+    TestBalanceDrainResult:
+      type: object
+      required: []
+      properties:
+        drain_id:
+          type: string
+          format: uuid
+        start_time:
+          type: string
+          format: date-time
+        end_time:
+          type: string
+          format: date-time
+        drained_balance_byte_count:
+          description: The available balance hidden when the drain began.
+          type: integer
+          format: int64
+
+    TestBalanceRestoreArgs:
+      type: object
+      required: []
+      properties: {}
+
+    TestBalanceRestoreResult:
+      type: object
+      required: []
+      properties:
+        restored_count:
+          type: integer
+          format: int64
+
+    VerifyOriginalRequestArgs:
+      type: object
+      required:
+        - client_id
+        - message
+        - signature
+      properties:
+        scope:
+          description: The original's deployment scope, as the original was signed; omit for an unscoped original.
+          type: object
+        client_id:
+          type: string
+          format: uuid
+        message:
+          description: The exact original request message, base64; at most 2048 bytes.
+          type: string
+        signature:
+          description: The request signature, base64; 64 bytes.
+          type: string
+
+    VerifyOriginalRequestResult:
+      type: object
+      required:
+        - original
+      properties:
+        original:
+          description: The retained signed transition, or `null` when none is retained.
+          type: [object, "null"]
+          properties:
+            body:
+              description: The exact signed body, base64.
+              type: string
+            signature:
+              description: The transition signature, base64.
+              type: string
+
+    ProviderWorkOwnerIndex:
+      type: object
+      required:
+        - schema
+        - owners
+      properties:
+        schema:
+          type: string
+          enum: [urnetwork-sdk-whole-work-owner-index-v1]
+        owners:
+          description: Each retained original owner statement, base64.
+          type: array
+          items:
+            type: string
+
+    ProviderWorkRequests:
+      type: object
+      required:
+        - schema
+        - requests
+      properties:
+        schema:
+          type: string
+        requests:
+          description: Each original request, base64.
+          type: array
+          items:
+            type: string
 
     RemoveNetworkClientArgs:
       type: object
@@ -7650,6 +9264,50 @@ components:
         feedback_id:
           description: udid
           type: string
+
+    ServicesContactSalesArgs:
+      type: object
+      required:
+        - name
+        - email
+        - company
+        - monthly_active_users
+        - monthly_data_budget_byte_count
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        company:
+          type: string
+        monthly_active_users:
+          description: Expected monthly active users of the embedded or custom deployment.
+          type: integer
+          minimum: 1
+        monthly_data_budget_byte_count:
+          description: Expected total monthly data budget, in bytes.
+          type: integer
+          format: int64
+          minimum: 0
+        message:
+          description: Optional notes about the use case.
+          type: string
+
+    ServicesContactSalesResult:
+      type: object
+      required: []
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
 
     FindLocationsArgs:
       type: object
@@ -8231,11 +9889,10 @@ components:
     PriceTier:
       type: object
       description: |
-        A regional price tier of Pro (config/all/pro.yml pro.price_tiers):
-        `standard` ($40/year, $5/month) for the developed-country list,
-        `regional` ($4/year, $0.50/month) everywhere else. Prices are USD;
-        the store or Stripe shows the local-currency figure. The 14-day
-        trial and the welcome offer apply on every tier.
+        A regional price tier of Pro: `standard` ($40/year, $5/month) for the
+        developed-country list, `regional` ($4/year, $0.50/month) everywhere
+        else. Prices are USD; the store or Stripe shows the local-currency
+        figure. The 14-day trial and the welcome offer apply on every tier.
       required:
         - name
         - yearly_usd
@@ -9279,7 +10936,7 @@ components:
 
     OnboardingExperiment:
       type: object
-      description: One registry entry (config/main/onboarding.yml onboarding.experiments).
+      description: One entry of the onboarding experiment registry (`onboarding.experiments`).
       required:
         - id
         - surface
@@ -10341,8 +11998,8 @@ components:
           type: integer
         max_referrals:
           description: |
-            Referrals a network is paid for (pro.yml referral.max_referrals).
-            0 when the server has no pro.yml (uncapped); clients treat 0 as unknown.
+            Referrals a network is paid for. 0 when the server has no
+            referral cap configured (uncapped); clients treat 0 as unknown.
           type: integer
         bonus_per_referral_bytes:
           description: Bytes granted to the referrer per referral, per bonus period. 0 when unknown.

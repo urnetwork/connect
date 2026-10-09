@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"slices"
@@ -37,6 +38,42 @@ const (
 
 // Length of a key id, the leading bytes of the sha256 of a public key.
 const ExtenderKeyIdByteCount = 8
+
+// The directory tiers a record is signed into (EXTENDER.md Q1). Open is the
+// sacrificial tier every open channel carries -- the geo dns sets, the feed
+// sample and stream, the cleartext gossip -- and the tier a record that
+// predates the field is in. Gated is the durable tier: released only to an
+// authenticated identity by the operator (Q3) and carried by no open channel,
+// whatever source it arrived from.
+const (
+	ExtenderDirectoryTierOpen  = 0
+	ExtenderDirectoryTierGated = 1
+)
+
+// Whether a record body is in the gated tier (Q1). A nil body is not.
+func ExtenderRecordGated(body *protocol.ExtenderRecordBody) bool {
+	return body != nil && body.DirectoryTier == ExtenderDirectoryTierGated
+}
+
+// Open relays carry ordinary open records only. A channel designation fails
+// closed even when a sender omitted the compatibility gated tier.
+func ExtenderRecordOpen(body *protocol.ExtenderRecordBody) bool {
+	return body != nil && body.DirectoryTier == ExtenderDirectoryTierOpen && body.CanaryChannel == ""
+}
+
+// Parses the base64 of a serialized record, the form an api answer carries a
+// record in (C2 bootstrap, Q3 release).
+func DecodeExtenderRecordBase64(recordBase64 string) (*protocol.ExtenderRecord, error) {
+	recordBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(recordBase64))
+	if err != nil {
+		return nil, err
+	}
+	record := &protocol.ExtenderRecord{}
+	if err := proto.Unmarshal(recordBytes, record); err != nil {
+		return nil, err
+	}
+	return record, nil
+}
 
 // Length of the challenge a prober sends in the extender header (A4).
 const ExtenderChallengeByteCount = 32

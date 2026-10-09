@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mathrand "math/rand"
 	"net"
 	"os"
 	"runtime"
@@ -928,14 +929,17 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// that is intentional receiver backpressure, not a dead path. The
 		// worker is lazy and has no idle timer/radio wakeups.
 		SctpNoProgressTimeout: 10 * time.Second,
-		// openrelay.metered.ca and stun.stunprotocol.org are defunct — every
-		// gather against them burned a multi-second i/o timeout per attempt
-		// (observed on-device 2026-07-25) and delayed candidate gathering.
-		// Keep a small set of live anycast servers.
-		IceServerUrls: []string{
-			"stun:stun.cloudflare.com:3478",
-			"stun:stun.l.google.com:19302",
-		},
+		// Offer a fresh random subset of the high-collateral pool per session
+		// instead of the same fixed pair, which is a cheap dns/stun prefilter
+		// signal. A dead/slow pool entry still costs at most one StunGatherTimeout
+		// (openrelay.metered.ca and stun.stunprotocol.org were dropped from the
+		// pool for burning that timeout, observed on-device 2026-07-25), and only
+		// IceServerSampleCount are drawn per session, so gather stays bounded.
+		IceServerPoolUrls:    defaultStunServerUrls,
+		IceServerSampleCount: defaultIceServerSampleCount,
+
+		ExtenderCarrierAnswerConcurrency: defaultWebRtcExtenderCarrierAnswerConcurrency,
+		ExtenderCarrierOpenTimeout:       defaultWebRtcExtenderCarrierOpenTimeout,
 	}
 }
 
@@ -1070,8 +1074,41 @@ type WebRtcSettings struct {
 	// Nil in production; tests observe reception of one exact warmup version.
 	afterFastPathWarmupReceiveForTest func(byte)
 
-	// add stun:xxx urls here
+	// IceServerUrls, when non-empty, pins the exact ICE/STUN servers offered and
+	// overrides the pool. Leave it empty in production to get a per-session
+	// random subset; set it to pin servers (operator override, or a test).
 	IceServerUrls []string
+	// IceServerPoolUrls is the pool a per-session subset is drawn from when
+	// IceServerUrls is empty. See defaultStunServerUrls.
+	IceServerPoolUrls []string
+	// IceServerSampleCount is how many pool servers to offer per session. 0 or a
+	// value past the pool size offers the whole pool.
+	IceServerSampleCount int
+	// Nil in production; tests inject a seeded source so the per-session subset
+	// is deterministic (see selectIceServerUrls).
+	iceServerRandForTest *mathrand.Rand
+
+	// DtlsClientHelloMimicry shapes the emitted DTLS ClientHello to a rotating
+	// browser profile on the SDP answerer (the DTLS client), so the handshake
+	// does not carry pion's default fingerprint. Off by default so the existing
+	// direct-p2p transport is unchanged; the webrtc extender carrier enables it
+	// on the censorship-circumvention path. No-op on js/wasm (browser owns DTLS).
+	// See transport_p2p_webrtc_dtls.go.
+	DtlsClientHelloMimicry bool
+	// Nil in production; tests inject a seeded source so the fingerprint choice
+	// is deterministic (see dtlsClientHelloMimicryHook).
+	dtlsClientHelloRandForTest *mathrand.Rand
+
+	// ExtenderCarrierAnswerConcurrency bounds the offers of the peer-to-peer
+	// webrtc extender carrier an extender answers at once (EXTENDER.md S,
+	// net_extender_webrtc_signal.go): an answer gathers candidates, which
+	// is seconds of work, so offers past the bound are dropped and counted
+	// rather than queued. <= 0 takes the default of 8.
+	ExtenderCarrierAnswerConcurrency int
+	// ExtenderCarrierOpenTimeout bounds the wait for the carrier's data
+	// channel to open once the SDP exchange is done, on both sides
+	// (net_extender_webrtc.go). <= 0 takes the default of 30 s.
+	ExtenderCarrierOpenTimeout time.Duration
 }
 
 func webRtcDataChannelInit(settings *WebRtcSettings) *webrtc.DataChannelInit {
@@ -1364,6 +1401,10 @@ type WebRtcManager struct {
 	log          Logger
 	signalSender SignalSender
 	settings     *WebRtcSettings
+	// the signaling of the peer-to-peer webrtc extender carrier, which rides
+	// the same frames as p2p negotiation under its own flag (EXTENDER.md S,
+	// net_extender_webrtc_signal.go)
+	extenderCarrier *webRtcExtenderSignaling
 
 	stateLock         sync.Mutex
 	closed            bool
@@ -1469,6 +1510,7 @@ func NewWebRtcManager(ctx context.Context, signalSender SignalSender, settings *
 		admissionStateMonitor:      NewMonitor(),
 		newPeerConnectionFactory:   newWebRtcPeerConnectionFactory,
 	}
+	manager.extenderCarrier = newWebRtcExtenderSignaling(managerCtx, manager.log, signalSender, settings)
 	if 0 < settings.MaxPeerConnectionCount {
 		// A token represents one released peerConns map slot. Limit retained
 		// stale tokens even if an embedder configures an unusually large cap;
@@ -1530,6 +1572,7 @@ func (self *WebRtcManager) Close() {
 		})
 	}
 	self.cancel()
+	self.extenderCarrier.close()
 	self.peerConnLifecycle.close()
 	networkChangeWorker := self.stopNetworkChangeWorker()
 
@@ -2371,6 +2414,12 @@ func (self *WebRtcManager) ReceiveExchangeSignals(
 	streamId, err := IdFromBytes(v.StreamId)
 	if err != nil {
 		return err
+	}
+	if v.ExtenderCarrier {
+		// the webrtc extender carrier's rendezvous: never a transport peer
+		// connection, so it is routed before the keyed lookup below
+		// (net_extender_webrtc_signal.go)
+		return self.extenderCarrier.receive(source, transferKey, streamId, v.Signals)
 	}
 	var senderGenerationId Id
 	senderGenerationSet := false

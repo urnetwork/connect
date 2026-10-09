@@ -33,12 +33,6 @@ func deviceNumber(number uint64) Device {
 	return Device{Major: unix.Major(number), Minor: unix.Minor(number)}
 }
 
-// The boot volume group shares its APFS container and data volume with the
-// operating system. Daemon custody belongs on a dedicated volume, as on Linux.
-func rootFilesystem(selected Mount, root Mount) bool {
-	return selected.Device == root.Device || beneath("/System/Volumes", selected.Path)
-}
-
 // APFS has no statfs magic number; "apfs" in ASCII stands in for qualified
 // volumes so the shared type checks keep one meaning on both platforms.
 func filesystemMagic(name string) int64 {

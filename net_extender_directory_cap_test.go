@@ -415,17 +415,28 @@ func TestExtenderDirectoryActiveCapBoundsGossipAndFeed(t *testing.T) {
 		}
 	}
 	connectAssertCount(t, "retained", len(retainedKeyHexes), 32)
-	sample := directory.SampleRecords(64, nil)
-	connectAssertCount(t, "sample", len(sample), 32)
-	for _, message := range sample {
-		body := &protocol.ExtenderRecordBody{}
-		if err := proto.Unmarshal(message.GetRecord().GetBody(), body); err != nil {
-			t.Fatal(err)
+	// a vantage is sampled its partition of the retained records (Q2); over
+	// enough vantages every partition is seen, and the union is exactly the
+	// retained set, never a record the cap evicted
+	sampledKeyHexes := map[string]bool{}
+	for i := 0; i < 4096 && len(sampledKeyHexes) < 32; i += 1 {
+		sample := directory.SampleRecords(64, nil, []byte(fmt.Sprintf("vantage-%d", i)))
+		if len(sample) == 0 {
+			t.Fatalf("vantage %d was sampled nothing", i)
 		}
-		if !retainedKeyHexes[hex.EncodeToString(body.PublicKey)] {
-			t.Fatal("the sample served a record the cap evicted")
+		for _, message := range sample {
+			body := &protocol.ExtenderRecordBody{}
+			if err := proto.Unmarshal(message.GetRecord().GetBody(), body); err != nil {
+				t.Fatal(err)
+			}
+			keyHex := hex.EncodeToString(body.PublicKey)
+			if !retainedKeyHexes[keyHex] {
+				t.Fatal("the sample served a record the cap evicted")
+			}
+			sampledKeyHexes[keyHex] = true
 		}
 	}
+	connectAssertCount(t, "sampled over every vantage", len(sampledKeyHexes), 32)
 
 	directory.SetMaxActiveRecordCount(8)
 	connectAssertCount(t, "cap", directory.MaxActiveRecordCount(), 8)

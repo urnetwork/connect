@@ -426,6 +426,14 @@ message ExchangeSignals {
     // initial WaitingForSdpOffer from a newly restarted passive association.
     // Older peers omit/ignore it and retain the legacy compatibility path.
     bytes sender_generation_id = 4;
+    // True for the signaling of the peer-to-peer webrtc extender carrier
+    // (EXTENDER.md S): a dialer's SDP offer to an extender and the extender's
+    // SDP answer, keyed by stream_id like a p2p negotiation but never bound
+    // to a transport peer connection. A receiver that predates the field
+    // sees an offer for a stream it has no peer connection for and drops it,
+    // which is the compatibility path: an old extender simply does not
+    // answer.
+    bool extender_carrier = 5;
 }
 
 // signals are sent in real time to the destination of the peer pair

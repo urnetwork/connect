@@ -181,7 +181,9 @@ func newWebRtcPeerConnectionFactory(
 	configuration := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
-				URLs: settings.IceServerUrls,
+				// per-session random subset of the high-collateral pool (or the
+				// pinned override); resolved once for this manager-scoped factory
+				URLs: settings.selectIceServerUrls(),
 			},
 		},
 		Certificates: []webrtc.Certificate{*certificate},
@@ -230,6 +232,17 @@ func newWebRtcPeerConnectionFactory(
 			peerSettingEngine.SetSCTPMaxReceiveBufferSize(
 				uint32(receiveBufferByteCount),
 			)
+			if settings.DtlsClientHelloMimicry {
+				// Shape the DTLS ClientHello to a browser profile on whichever
+				// side becomes the DTLS client (the SDP answerer). pion fires the
+				// hook only on the client flight, so it is a no-op on the offerer.
+				// One fingerprint per peer connection, rotating across connections.
+				if hook := dtlsClientHelloMimicryHook(
+					settings.dtlsClientHelloRandForTest,
+				); hook != nil {
+					peerSettingEngine.SetDTLSClientHelloMessageHook(hook)
+				}
+			}
 			api := webrtc.NewAPI(
 				webrtc.WithSettingEngine(peerSettingEngine),
 				webrtc.WithMediaEngine(mediaEngine),

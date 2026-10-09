@@ -32,8 +32,9 @@ func TestGossipFeedServerDefaults(t *testing.T) {
 			connect.ExtenderFeedMaxSampleCount,
 		)
 	}
-	if connect.ExtenderFeedMaxSampleCount != 32 {
-		t.Errorf("the protocol sample cap is %d, expected 32", connect.ExtenderFeedMaxSampleCount)
+	// the open tier's cap (Q2): one epoch's draw from the client's partition
+	if connect.ExtenderFeedMaxSampleCount != 8 {
+		t.Errorf("the protocol sample cap is %d, expected 8", connect.ExtenderFeedMaxSampleCount)
 	}
 	if settings.MaxSubscriberCount != 256 {
 		t.Errorf("max subscribers = %d, expected 256", settings.MaxSubscriberCount)
@@ -152,6 +153,15 @@ func TestGossipFeedStreamsRevocations(t *testing.T) {
 
 	issueTime := time.Now()
 	applyTestFeedRecord(t, directory, rootKey, extenderKey, "198.51.100.21")
+	// Consume the live record before revoking it. A queued record is correctly
+	// withheld once the current directory no longer permits it on the feed.
+	recordFrame, err := connect.ReadExtenderFeedFrame(client.conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recordFrame.GetRecord() == nil {
+		t.Fatalf("the stream carried %v, expected a record", recordFrame)
+	}
 	revocation, err := connect.SignExtenderRevocation(
 		rootKey.privateKey,
 		&protocol.ExtenderRevocationBody{
@@ -167,14 +177,6 @@ func TestGossipFeedStreamsRevocations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// the record and the revocation arrive in the order they were applied
-	recordFrame, err := connect.ReadExtenderFeedFrame(client.conn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if recordFrame.GetRecord() == nil {
-		t.Fatalf("the stream carried %v, expected a record", recordFrame)
-	}
 	revocationFrame, err := connect.ReadExtenderFeedFrame(client.conn)
 	if err != nil {
 		t.Fatal(err)

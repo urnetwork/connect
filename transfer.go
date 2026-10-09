@@ -3004,6 +3004,14 @@ func (self *Client) PeerManager() *PeerManager {
 	return self.peerManager
 }
 
+// WebRtcManager is the peer connection manager of this client, which the
+// peer-to-peer webrtc extender carrier signals through: an extender role
+// installs its answerer on it, and a dialer takes its exchanger for one
+// extender from it (EXTENDER.md S).
+func (self *Client) WebRtcManager() *WebRtcManager {
+	return self.webRtcManager
+}
+
 // NetworkPeers enumerates the connected peers and the count of
 // recently disconnected peers.
 // The platform announces peers only to top-level clients;

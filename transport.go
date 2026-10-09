@@ -622,6 +622,10 @@ type PlatformTransportSettings struct {
 	// same version on the authenticated control stream. A legacy peer retains
 	// the existing reliable-stream path on this same connection.
 	EnableH3Datagrams bool
+	// The QUIC versions the h3 carriers offer (EXTENDER.md A13,
+	// net_quic_version.go). The zero value and an unknown value offer version
+	// 2 first with version 1 behind it.
+	QuicVersionPolicy QuicVersionPolicy
 	// Nil selects conservative bounded defaults. Callers may inject a stats
 	// collector to aggregate reconnect generations in a larger measurement.
 	H3DatagramSettings *H3DatagramSettings
@@ -734,6 +738,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		H3MaxConnectionReceiveWindowByteCount:     defaultH3MaxConnectionReceiveWindowByteCount(),
 		PtDnsSlowMultiple:                         4,
 		EnableH3Datagrams:                         true,
+		QuicVersionPolicy:                         QuicVersionPolicyPreferV2,
 		H3DatagramSettings:                        DefaultH3DatagramSettings(),
 		H3QuicPacketStats:                         &H3QuicPacketStats{},
 	}
@@ -1078,6 +1083,9 @@ func newPlatformQuicConfig(
 		MaxIncomingStreams:             8,
 		MaxIncomingUniStreams:          8,
 		EnableDatagrams:                settings.EnableH3Datagrams,
+		// version 2 first, so the Initial is not the one the filters decrypt
+		// for its sni (A13)
+		Versions: settings.QuicVersionPolicy.Versions(),
 	}
 	if settings.H3QuicPacketStats != nil {
 		config.Tracer = settings.H3QuicPacketStats.Tracer
@@ -1832,9 +1840,13 @@ func (self *PlatformTransport) run() {
 	defer func() {
 		self.cancel()
 		self.runWaitGroup.Wait()
+		// Keep H1 admission until every mode has closed its native graph.
+		// A separate later defer would release it before this join.
+		self.h1BudgetReservation.Release()
+		// H3 may never start when required H1 admission is canceled.
+		self.h3BudgetReservation.Release()
 	}()
 	if self.h1BudgetReservation != nil {
-		defer self.h1BudgetReservation.Release()
 		if !self.h1BudgetReservation.Acquire(self.ctx) {
 			return
 		}
@@ -2353,7 +2365,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			releaseExtenderIp := self.holdExtenderIp(dialExtenderIp)
 			releaseH1ConnectionStats := self.settings.H1ConnectionStats.connected(ws)
 			h1Progress := newH1PhysicalProgress(self.settings.ProgressObserver, clientId, ws)
-			if framed, ok := ws.(*FramedMessageConn); ok {
+			if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
 				framed.progress = h1Progress
 			}
 			self.setRegistered(true)
@@ -2465,7 +2477,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					firstMessage []byte,
 					firstPriority bool,
 				) (sendOpen bool, err error) {
-					if framed, ok := ws.(*FramedMessageConn); ok {
+					if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
 						return writeH1FramedReadyBatch(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, self.settings.WriteTimeout, func() { writeCounter.Add(1) })
 					}
 					if writeBatchConn == nil {

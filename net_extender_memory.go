@@ -120,6 +120,9 @@ func newExtenderQuicMemoryPolicy(ctx context.Context, connectSettings *ConnectSe
 	transport := &PlatformTransport{settings: settings}
 	config := newPlatformQuicConfig(settings, 1)
 	config.HandshakeIdleTimeout = connectSettings.ConnectTimeout + connectSettings.TlsTimeout + connectSettings.HandshakeTimeout
+	// the offer is the dial's, not the platform transport's that sized the
+	// windows: an extender carrier crosses the filter in the clear (A13)
+	config.Versions = connectSettings.QuicVersionPolicy.Versions()
 	// The outer carrier is one HTTP/3 request stream, never a QUIC DATAGRAM
 	// lane. Keep its flow-control limits explicit even when the inner lane is H1.
 	config.EnableDatagrams = false

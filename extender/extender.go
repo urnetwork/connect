@@ -74,6 +74,7 @@ func DefaultExtenderSettings() *ExtenderSettings {
 
 		HeaderTimeout:               10 * time.Second,
 		QuicIdleTimeout:             30 * time.Second,
+		QuicVersionPolicy:           connect.QuicVersionPolicyPreferV2,
 		MaxConnectionCountPerSource: 64,
 		MaxConnectionCount:          4096,
 
@@ -113,6 +114,12 @@ func DefaultExtenderSettings() *ExtenderSettings {
 		AdmissionIpv4PrefixBitCount:         29,
 		AdmissionIpv6PrefixBitCount:         56,
 		AdmissionMinSubnetCount:             4096,
+
+		ExtenderCamouflageTimeWindow:         2 * time.Minute,
+		ExtenderCamouflageReplayTagCount:     65536,
+		ExtenderCamouflageHelloMaxByteCount:  16 * 1024,
+		ExtenderCamouflageSpliceMaxCount:     256,
+		ExtenderCamouflageSpliceMaxPerTarget: 32,
 	}
 }
 
@@ -128,10 +135,24 @@ type ExtenderSettings struct {
 	HeaderTimeout time.Duration
 	// Idle quic connections close after this (A9).
 	QuicIdleTimeout time.Duration
+	// The QUIC versions the udp and dns carriers accept, and the NLayer hop
+	// dials offer (A13, connect/net_quic_version.go). The zero value and an
+	// unknown value accept both with version 2 first. A client that offers a
+	// version this policy excludes is answered with a Version Negotiation
+	// packet naming the versions it does accept.
+	QuicVersionPolicy connect.QuicVersionPolicy
 	// Concurrent connections from one source address (A9). <= 0 disables.
 	MaxConnectionCountPerSource int
 	// Concurrent connections over every carrier (A9). <= 0 disables.
 	MaxConnectionCount int
+
+	// WebRtcCarrier serves the peer-to-peer webrtc carrier (EXTENDER.md S,
+	// C2a): the role has a signaling path and installs this server as the
+	// carrier's stream handler (HandleWebRtcExtenderStream), so the carrier
+	// is listed in Carriers, offered to the activation, and the server stays
+	// up on it alone when no socket carrier binds (G2). Off by default;
+	// nothing is bound for it.
+	WebRtcCarrier bool
 
 	// Bounds of the reverse proxy that answers everything that is not an
 	// extender request (A5). The request body and the concurrency bounds
@@ -302,6 +323,55 @@ type ExtenderSettings struct {
 	// windows with it. Nil is time.Now.
 	AdmissionNow func() time.Time
 
+	// The camouflage of the tcp carrier (EXTENDER.md P). CamouflageEnabled
+	// gates whether the server recognizes the authenticated-hello tag, offers
+	// the authenticated http/1.1 config and publishes a RealityPublicKey; it is
+	// off by default, as the owner asked. It needs the identity key
+	// (IdentityKeySeed), from which the X25519 static key is derived; without
+	// one it does nothing. ExtenderCamouflageSplice is the Phase-A -> B flip
+	// (P3): off, an unauthenticated hello is terminated as today; on, it is
+	// spliced to the real borrowed site. Meaningful only while
+	// CamouflageEnabled, off by default and the legacy-safe posture.
+	CamouflageEnabled        bool
+	ExtenderCamouflageSplice bool
+	// The tolerated clock skew each way of a sealed hello time (P1); a client
+	// outside it is not authenticated. <= 0 takes the default.
+	ExtenderCamouflageTimeWindow time.Duration
+	// The bounded, time-windowed seen-tag set that refuses replays (P2). Entries
+	// expire after twice the time window and the set is capped here, oldest
+	// evicted. <= 0 takes the default.
+	ExtenderCamouflageReplayTagCount int
+	// The most handshake bytes the peek reassembles before parsing the
+	// ClientHello (P3); a hello that does not complete within it is dropped. <=
+	// 0 takes the default.
+	ExtenderCamouflageHelloMaxByteCount int
+	// The total concurrent splices and the per-target concurrent splices (P3),
+	// so no one borrowed site is hammered. A splice over either bound is refused
+	// and the connection is terminated instead. <= 0 disables each.
+	ExtenderCamouflageSpliceMaxCount     int
+	ExtenderCamouflageSpliceMaxPerTarget int
+	// The borrowed names this extender has verified and will splice to (P5),
+	// the role-start-verified subset of the bundled borrow list. Empty leaves
+	// the splice with no target, so an unauthenticated hello in splice mode
+	// degrades to the A5 reverse proxy. Copied at construction.
+	CamouflageBorrowNames []string
+	// CamouflageSpliceDialContext, when set, opens the tcp connection to a
+	// borrowed site for the splice (P3), its address the borrowed name and port
+	// 443 and its network the client's family (A7). Tests inject the fake
+	// borrowed-site here. Nil resolves the name over a DoH cache on the client's
+	// family and dials the result over the forward egress.
+	CamouflageSpliceDialContext connect.DialContextFunction
+	// CamouflageNow, when set, is the only clock the camouflage reads for the
+	// time window and the replay expiry. Tests slide the window with it. Nil is
+	// time.Now.
+	CamouflageNow func() time.Time
+	// CamouflageHandler, when set, receives the classification of every peeked
+	// ClientHello the camouflage parsed (P3, P4): its sni, the alpn it offered on
+	// the wire, and the outcome (authenticated, spliced or terminated). Tests use
+	// it to prove what a dial presented and how it was classified. It runs
+	// synchronously, must not block, and must not keep the slices.
+	CamouflageHandler func(outcome ExtenderCamouflageOutcome)
+
 	// Listen, when set, binds the outer TLS listener. Userspace integration
 	// tests use it to place the production extender on a simulated TUN. Nil
 	// retains net.Listen. The extender owns and closes returned listeners.
@@ -369,6 +439,18 @@ type ExtenderServer struct {
 	egressByteCount  atomic.Int64
 	egressReadCount  atomic.Int64
 
+	// the camouflage counts of P7, cumulative for the life of the server and
+	// surfaced beside the admission counts. A spliced byte is never added to the
+	// O1 relay counters above (P10), so the two sets never double count a
+	// connection.
+	camouflageAuthenticatedCount    atomic.Int64
+	camouflageSplicedCount          atomic.Int64
+	camouflageTerminatedCount       atomic.Int64
+	camouflageReplayRefusedCount    atomic.Int64
+	camouflageTimeWindowFailedCount atomic.Int64
+	camouflageSpliceDialFailedCount atomic.Int64
+	camouflageBorrowVerifyFailCount atomic.Int64
+
 	allowedSecrets []string
 	// exact (x) or wildcard (*.x)
 	// wildcard *.x does not match exact x
@@ -416,6 +498,10 @@ type ExtenderServer struct {
 
 	// the admission limits of A12, under their own lock
 	admission *extenderAdmission
+
+	// the tcp carrier camouflage of P, nil when the server has no identity key;
+	// its recognition, splice and publishing are gated on CamouflageEnabled
+	camouflage *extenderCamouflage
 
 	proxy *extenderProxy
 
@@ -500,6 +586,16 @@ func NewExtenderServer(
 	// constructor keeps its shape for callers that cannot handle an error.
 	self.certificates, self.certificatesErr = newExtenderCertificates(settings.IdentityKeySeed, settings)
 	self.proxy = newExtenderProxy(self)
+	// the camouflage derives its static key from the same identity seed; a
+	// construction error is reported the way a certificate error is, when
+	// serving starts, so the constructor keeps its shape
+	if camouflage, err := newExtenderCamouflage(self, settings); err != nil {
+		if self.certificatesErr == nil {
+			self.certificatesErr = err
+		}
+	} else {
+		self.camouflage = camouflage
+	}
 
 	handler := &extenderHandler{server: self}
 	// an idle h2 connection is reclaimed on the same budget a connection has to
@@ -552,6 +648,7 @@ var extenderCarrierOrder = []string{
 	connect.ExtenderCarrierTcp,
 	connect.ExtenderCarrierQuic,
 	connect.ExtenderCarrierDns,
+	connect.ExtenderCarrierWebRtc,
 }
 
 // extenderLogWriter keeps the http server's internal errors on the same log as
@@ -879,7 +976,12 @@ func (self *ExtenderServer) ListenAndServe() error {
 		}
 	}
 
-	if len(boundListeners) == 0 && len(boundPacketConns) == 0 {
+	if self.settings.WebRtcCarrier {
+		// served through the carrier's signaling, nothing bound (S); an
+		// extender with no socket carrier stays up on it alone (G2)
+		self.addCarrier(connect.ExtenderCarrierWebRtc)
+	}
+	if len(boundListeners) == 0 && len(boundPacketConns) == 0 && !self.settings.WebRtcCarrier {
 		if 0 < len(bindErrs) {
 			return errors.Join(bindErrs...)
 		}
@@ -1119,6 +1221,9 @@ func (self *ExtenderServer) serveQuicCarrier(
 	}
 	quicConfig := &quic.Config{
 		MaxIdleTimeout: self.settings.QuicIdleTimeout,
+		// accept the version 2 Initial a client past the filters sends first,
+		// and version 1 from an older client (A13)
+		Versions: self.settings.QuicVersionPolicy.Versions(),
 	}
 	// a subnet past its refusals is refused on its Initial packet, before the
 	// handshake (A12)
@@ -1212,6 +1317,9 @@ func (self *ExtenderServer) Close() {
 	}
 	self.httpServer.Close()
 	self.proxy.close()
+	if self.camouflage != nil {
+		self.camouflage.close()
+	}
 }
 
 // CloseAndWait interrupts and joins every listener and connection worker.
@@ -1342,6 +1450,64 @@ func (self *ExtenderServer) Stats() ExtenderStats {
 	}
 }
 
+// The three classifications the camouflage gives a peeked ClientHello (P3).
+const (
+	ExtenderCamouflageOutcomeAuthenticated = "authenticated"
+	ExtenderCamouflageOutcomeSpliced       = "spliced"
+	ExtenderCamouflageOutcomeTerminated    = "terminated"
+)
+
+// ExtenderCamouflageOutcome is what the CamouflageHandler seam reports for one
+// peeked ClientHello: its sni, the alpn it offered on the wire, and how the
+// camouflage classified it (P3, P4).
+type ExtenderCamouflageOutcome struct {
+	ServerName    string
+	AlpnProtocols []string
+	Outcome       string
+}
+
+// ExtenderCamouflageStats is the tcp carrier camouflage activity, cumulative
+// for the life of the server and surfaced beside the admission counts (P7).
+// AuthenticatedCount, SplicedCount and TerminatedCount partition the tcp
+// connections the camouflage classified; the rest name the refusals and the
+// failure paths. A spliced byte is never in the O1 relay counts (P10).
+type ExtenderCamouflageStats struct {
+	AuthenticatedCount    int64
+	SplicedCount          int64
+	TerminatedCount       int64
+	ReplayRefusedCount    int64
+	TimeWindowFailedCount int64
+	SpliceDialFailedCount int64
+	BorrowVerifyFailCount int64
+}
+
+// A snapshot of the camouflage counts (P7). Each counter is read independently,
+// as with Stats, so the series that samples them reads deltas and never a total
+// that must agree across counters.
+func (self *ExtenderServer) CamouflageStats() ExtenderCamouflageStats {
+	return ExtenderCamouflageStats{
+		AuthenticatedCount:    self.camouflageAuthenticatedCount.Load(),
+		SplicedCount:          self.camouflageSplicedCount.Load(),
+		TerminatedCount:       self.camouflageTerminatedCount.Load(),
+		ReplayRefusedCount:    self.camouflageReplayRefusedCount.Load(),
+		TimeWindowFailedCount: self.camouflageTimeWindowFailedCount.Load(),
+		SpliceDialFailedCount: self.camouflageSpliceDialFailedCount.Load(),
+		BorrowVerifyFailCount: self.camouflageBorrowVerifyFailCount.Load(),
+	}
+}
+
+// RealityPublicKey is the 32-byte X25519 static public key the record publishes
+// (P1, P6), derived from the identity seed, or nil when the extender has no
+// identity key or camouflage is off. The record builder and the activation read
+// it from here so the published key always matches the key the server opens
+// tags under.
+func (self *ExtenderServer) RealityPublicKey() []byte {
+	if self.camouflage == nil || !self.settings.CamouflageEnabled {
+		return nil
+	}
+	return self.camouflage.StaticPublicKey()
+}
+
 // Connection errors are observable only when a caller installs the test seam.
 func (self *ExtenderServer) reportError(stage string, err error) {
 	if self.settings.ErrorHandler != nil {
@@ -1363,13 +1529,29 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 		return
 	}
 
+	// the camouflage peek classifies the raw ClientHello in front of tls.Server
+	// (P3): an authenticated hello is terminated with http/1.1 alone (P4), an
+	// unauthenticated hello is spliced to the real borrowed site in splice mode
+	// (and the connection is then already handled) or terminated as today. With
+	// camouflage off it returns the connection unchanged.
+	termConn, authenticated, handled := self.camouflageDemultiplex(handleCtx, conn)
+	if handled {
+		return
+	}
+
 	tlsConfig := &tls.Config{
 		GetCertificate: self.certificates.GetCertificate,
 		// a prober that asks for h2 gets it (A3); the extender's own client
 		// offers no alpn, so it negotiates http/1.1
 		NextProtos: []string{"h2", "http/1.1"},
 	}
-	clientConn := tls.Server(conn, tlsConfig)
+	if authenticated {
+		// the authenticated path offers http/1.1 alone, so a faithful Chrome
+		// hello that offered {h2,http/1.1} negotiates http/1.1 and the choice is
+		// not on the wire (P4)
+		tlsConfig.NextProtos = []string{"http/1.1"}
+	}
+	clientConn := tls.Server(termConn, tlsConfig)
 	defer clientConn.Close()
 
 	// one budget covers the handshake and the request that follows (A9)
@@ -1380,6 +1562,75 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 		return
 	}
 
+	// the terminated connection is the only place the requested name survives:
+	// what the http server serves from here is no longer a *tls.Conn (A3, A5)
+	connectionState := clientConn.ConnectionState()
+	self.serveTerminatedConnection(
+		handleCtx,
+		handleCancel,
+		clientConn,
+		connectionState.ServerName,
+		connectionState.NegotiatedProtocol,
+	)
+}
+
+// HandleWebRtcExtenderStream serves one stream of the peer-to-peer webrtc
+// carrier (EXTENDER.md S), which is connect.WebRtcExtenderStreamHandler. The
+// data channel is already authenticated dtls, so there is no outer handshake:
+// the stream is served exactly as a terminated tcp connection is, from the
+// first bytes, under the same connection accounting, admission and
+// interruption at Close (A9, A12). Synchronous: the carrier owns the
+// goroutine and releases the peer connection when this returns.
+func (self *ExtenderServer) HandleWebRtcExtenderStream(ctx context.Context, conn net.Conn) {
+	if self.closedAtAccept(conn.RemoteAddr()) {
+		// a subnet past its refusals is not worth serving (A12)
+		conn.Close()
+		return
+	}
+	if !self.beginConnection(conn.RemoteAddr()) {
+		conn.Close()
+		return
+	}
+	ownedConnection := &extenderOwnedConnection{connection: conn}
+	self.stateLock.Lock()
+	if self.closing {
+		self.stateLock.Unlock()
+		self.endConnection(conn.RemoteAddr())
+		conn.Close()
+		return
+	}
+	self.connections[ownedConnection] = true
+	self.workers.Add(1)
+	self.stateLock.Unlock()
+	defer func() {
+		self.stateLock.Lock()
+		delete(self.connections, ownedConnection)
+		self.stateLock.Unlock()
+		self.endConnection(conn.RemoteAddr())
+		self.workers.Done()
+	}()
+
+	handleCtx, handleCancel := context.WithCancel(ctx)
+	defer handleCancel()
+	defer conn.Close()
+	// the carrier has no name and negotiates no protocol: http/1.1, the one
+	// the extender's own client speaks (A3)
+	conn.SetDeadline(time.Now().Add(self.settings.HeaderTimeout))
+	self.serveTerminatedConnection(handleCtx, handleCancel, conn, "", "")
+}
+
+// Serves one terminated stream from its first bytes: a v1 length-prefixed
+// header, else the http server (A3). The stream's deadline is the header
+// budget on entry (A9) and is cleared once the request is known to be http,
+// whose server keeps its own. serverName is the requested name of a tls
+// carrier, empty on the webrtc carrier; negotiatedProtocol selects h2.
+func (self *ExtenderServer) serveTerminatedConnection(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	clientConn net.Conn,
+	serverName string,
+	negotiatedProtocol string,
+) {
 	initialBytes := make([]byte, 4)
 	for i := 0; i < len(initialBytes); {
 		n, err := clientConn.Read(initialBytes[i:])
@@ -1394,7 +1645,7 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 	if headerByteCount <= connect.ExtenderMaxHeaderByteCount {
 		// v1: a length-prefixed header and no response frame. No http method
 		// and no tls record begins with such a length.
-		self.handleV1Connection(handleCtx, handleCancel, clientConn, headerByteCount)
+		self.handleV1Connection(ctx, cancel, clientConn, headerByteCount)
 		return
 	}
 
@@ -1402,11 +1653,8 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 		self.reportError("header length", err)
 		return
 	}
-	// the terminated connection is the only place the requested name survives:
-	// what the http server serves from here is no longer a *tls.Conn (A3, A5)
-	connectionState := clientConn.ConnectionState()
-	requestConn := newConnWithInitialBytes(clientConn, initialBytes, connectionState.ServerName)
-	self.serveHttpConnection(handleCtx, requestConn, connectionState.NegotiatedProtocol)
+	requestConn := newConnWithInitialBytes(clientConn, initialBytes, serverName)
+	self.serveHttpConnection(ctx, requestConn, negotiatedProtocol)
 }
 
 // Serves one terminated connection with the http server. h2 is dispatched

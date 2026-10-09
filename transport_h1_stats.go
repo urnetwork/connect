@@ -31,7 +31,7 @@ func (s *H1ConnectionStats) connected(conn H1MessageConn) func() {
 	}
 	// The compact framed connection only exists after the dialer validates the
 	// custom 101 response. A rejected/mismatched upgrade returns a WebSocket.
-	_, framed := conn.(*FramedMessageConn)
+	_, framed := unobservedH1MessageConn(conn).(*FramedMessageConn)
 	s.mu.Lock()
 	if framed {
 		s.snapshot.H1PlusConnectionCount++

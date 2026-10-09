@@ -2,6 +2,7 @@ package connect
 
 import (
 	"container/heap"
+	"container/list"
 	"fmt"
 	"net"
 	"sync"
@@ -279,10 +280,14 @@ func (self *combineQueue) Swap(i int, j int) {
 }
 
 type pumpItem struct {
-	addr       net.Addr
-	id         uint16
-	header     [18]byte
-	tld        []byte
+	addr   net.Addr
+	id     uint16
+	header [18]byte
+	tld    []byte
+	// the request carried an edns0 opt record, so the response paired with
+	// it carries one too (rfc 6891 section 7). A synthesized item takes the
+	// latest real request's capability from its peer's bounded state.
+	edns       bool
 	updateTime time.Time
 	// insertion order within the owning pumpQueue, assigned by Add.
 	// zero for an item that was never added.
@@ -292,13 +297,23 @@ type pumpItem struct {
 	maxHeapIndex int
 }
 
-// safe to call from multiple goroutines
-// FIXME maintain max heap also
+// The latest real request's capability outlives its consumable pump header.
+// The queue owns this state, its hard peer bound, expiry and shutdown cleanup.
+type pumpPeerState struct {
+	addrKey    string
+	edns       bool
+	updateTime time.Time
+}
+
+// Safe for concurrent use. Queued headers and recently observed peer
+// capabilities have independent bounds of DnsMaxPumpHosts each.
 type pumpQueue struct {
 	stateLock    sync.Mutex
 	orderedItems []*pumpItem
 
-	addrMaxHeap map[string]*pumpQueueMaxHeap
+	addrMaxHeap       map[string]*pumpQueueMaxHeap
+	peerStateEntries  map[string]*list.Element
+	orderedPeerStates list.List
 
 	// counter for pumpItem.seq, which breaks ties between items stamped with the
 	// same updateTime. updateTime alone is only a partial order, and a heap over
@@ -313,36 +328,43 @@ type pumpQueue struct {
 
 func newPumpQueue(settings *PacketTranslationSettings) *pumpQueue {
 	pq := &pumpQueue{
-		orderedItems: []*pumpItem{},
-		addrMaxHeap:  map[string]*pumpQueueMaxHeap{},
-		settings:     settings,
+		orderedItems:     []*pumpItem{},
+		addrMaxHeap:      map[string]*pumpQueueMaxHeap{},
+		peerStateEntries: map[string]*list.Element{},
+		settings:         settings,
 	}
 	heap.Init(pq)
 	return pq
 }
 
 func (self *pumpQueue) RemoveLast(addr net.Addr) *pumpItem {
+	addrKey := addr.String()
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.removeLastWithLock(addrKey)
+}
 
-	maxHeap, ok := self.addrMaxHeap[addr.String()]
+// Removes one paired header without forgetting the latest peer capability.
+func (self *pumpQueue) removeLastWithLock(addrKey string) *pumpItem {
+	maxHeap, ok := self.addrMaxHeap[addrKey]
 	if !ok {
 		return nil
 	}
 
 	item := maxHeap.RemoveFirst()
 	if maxHeap.Len() == 0 {
-		delete(self.addrMaxHeap, addr.String())
+		delete(self.addrMaxHeap, addrKey)
 	}
 	heap.Remove(self, item.heapIndex)
 	return item
 }
 
 func (self *pumpQueue) RemoveLastN(addr net.Addr, n int) []*pumpItem {
+	addrKey := addr.String()
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	maxHeap, ok := self.addrMaxHeap[addr.String()]
+	maxHeap, ok := self.addrMaxHeap[addrKey]
 	if !ok {
 		return nil
 	}
@@ -353,14 +375,28 @@ func (self *pumpQueue) RemoveLastN(addr net.Addr, n int) []*pumpItem {
 
 	items := make([]*pumpItem, n)
 	for i := range n {
-		item := maxHeap.RemoveFirst()
-		if maxHeap.Len() == 0 {
-			delete(self.addrMaxHeap, addr.String())
-		}
-		heap.Remove(self, item.heapIndex)
-		items[i] = item
+		items[i] = self.removeLastWithLock(addrKey)
 	}
 	return items
+}
+
+// Takes up to n paired headers and one coherent latest-capability snapshot for
+// every synthesized tail. An older queued request retains its own edns bit.
+func (self *pumpQueue) RemoveAvailable(addr net.Addr, n int) (items []*pumpItem, edns bool) {
+	addrKey := addr.String()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if entry := self.peerStateEntries[addrKey]; entry != nil {
+		edns = entry.Value.(*pumpPeerState).edns
+	}
+	for range n {
+		item := self.removeLastWithLock(addrKey)
+		if item == nil {
+			break
+		}
+		items = append(items, item)
+	}
+	return items, edns
 }
 
 // removes every item that was updated at or before minUpdateTime.
@@ -379,20 +415,39 @@ func (self *pumpQueue) RemoveOlder(minUpdateTime time.Time) {
 			}
 		}
 	}
+	for entry := self.orderedPeerStates.Front(); entry != nil; entry = self.orderedPeerStates.Front() {
+		if entry.Value.(*pumpPeerState).updateTime.After(minUpdateTime) {
+			break
+		}
+		self.removePeerWithLock(entry)
+	}
 }
 
+// Includes drained peers, so the existing expiry worker keeps their timer armed.
 func (self *pumpQueue) OldestUpdateTime() (time.Time, bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if len(self.orderedItems) == 0 {
-		return time.Time{}, false
+	var oldest time.Time
+	ok := false
+	if len(self.orderedItems) != 0 {
+		oldest, ok = self.orderedItems[0].updateTime, true
 	}
-	return self.orderedItems[0].updateTime, true
+	if entry := self.orderedPeerStates.Front(); entry != nil {
+		updated := entry.Value.(*pumpPeerState).updateTime
+		if !ok || updated.Before(oldest) {
+			oldest, ok = updated, true
+		}
+	}
+	return oldest, ok
 }
 
 func (self *pumpQueue) Add(item *pumpItem) (limit bool) {
+	addrKey := item.addr.String()
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	// Peer list order and timestamp order must agree even for concurrent adds.
+	now := time.Now()
+	self.rememberPeerWithLock(addrKey, item.edns, now)
 
 	// note a hard limit is enforced rather than replacing older with newer
 	// this is to prevent unlimited abuse where pump headers can be added forever
@@ -402,10 +457,10 @@ func (self *pumpQueue) Add(item *pumpItem) (limit bool) {
 		return
 	}
 
-	maxHeap, ok := self.addrMaxHeap[item.addr.String()]
+	maxHeap, ok := self.addrMaxHeap[addrKey]
 	if !ok {
 		maxHeap = newPumpQueueMaxHeap()
-		self.addrMaxHeap[item.addr.String()] = maxHeap
+		self.addrMaxHeap[addrKey] = maxHeap
 	}
 
 	if self.settings.DnsMaxPumpHostsPerAddress <= maxHeap.Len() {
@@ -413,13 +468,49 @@ func (self *pumpQueue) Add(item *pumpItem) (limit bool) {
 		return
 	}
 
-	item.updateTime = time.Now()
+	item.updateTime = now
 	self.seq += 1
 	item.seq = self.seq
 
 	heap.Push(self, item)
 	heap.Push(maxHeap, item)
 	return
+}
+
+// Refreshes capability even when header admission is full: the latest real
+// request, including a transition back to legacy, governs synthetic replies.
+// Oldest peer metadata is evicted independently of consumable queued headers.
+func (self *pumpQueue) rememberPeerWithLock(addrKey string, edns bool, now time.Time) {
+	if entry := self.peerStateEntries[addrKey]; entry != nil {
+		state := entry.Value.(*pumpPeerState)
+		state.edns, state.updateTime = edns, now
+		self.orderedPeerStates.MoveToBack(entry)
+		return
+	}
+	if self.settings.DnsMaxPumpHosts <= 0 {
+		return
+	}
+	if self.settings.DnsMaxPumpHosts <= int64(len(self.peerStateEntries)) {
+		self.removePeerWithLock(self.orderedPeerStates.Front())
+	}
+	state := &pumpPeerState{addrKey: addrKey, edns: edns, updateTime: now}
+	self.peerStateEntries[addrKey] = self.orderedPeerStates.PushBack(state)
+}
+
+// Removes one bounded peer entry from both indexes.
+func (self *pumpQueue) removePeerWithLock(entry *list.Element) {
+	delete(self.peerStateEntries, entry.Value.(*pumpPeerState).addrKey)
+	self.orderedPeerStates.Remove(entry)
+}
+
+// Drops all non-pooled state after the owning translation joins its workers.
+func (self *pumpQueue) Clear() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.orderedItems = nil
+	clear(self.addrMaxHeap)
+	clear(self.peerStateEntries)
+	self.orderedPeerStates.Init()
 }
 
 // heap.Interface

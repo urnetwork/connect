@@ -139,7 +139,11 @@ func newVlessDialTlsContext(
 		if innerTlsConfig.ServerName == "" {
 			innerTlsConfig.ServerName = host
 		}
-		tlsConn := tls.Client(streamConn, innerTlsConfig)
+		ownedConn, err := ownClientHttpPoolConn(ctx, streamConn)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(ownedConn, innerTlsConfig)
 		// bounded so a slow or hostile VLESS server cannot hold the dial open
 		innerCtx, innerCancel := context.WithTimeout(ctx, connectSettings.TlsTimeout)
 		defer innerCancel()

@@ -10,6 +10,7 @@ package connect
 
 import (
 	"fmt"
+	mathrand "math/rand"
 	"testing"
 
 	"github.com/urnetwork/connect/protocol"
@@ -119,12 +120,18 @@ func TestGossipSampleWithDualStackOnly(t *testing.T) {
 }
 
 // Dual-stack extenders are the most useful ones and must not be held back in
-// favour of single-family records.
+// favour of single-family records. The balancer keeps the order it is given
+// within each family (Q2: the epoch's keyed order), so the orders a directory
+// hands it over many epochs are stood in for by shuffles here.
 func TestGossipSampleDoesNotStarveDualStack(t *testing.T) {
 	records, bodies := balanceTestRecords(50, 50, 4)
 
+	random := mathrand.New(mathrand.NewSource(7))
 	dualSeen := 0
 	for range 50 {
+		random.Shuffle(len(records), func(i int, j int) {
+			records[i], records[j] = records[j], records[i]
+		})
 		balanced := balanceRecordsByIpFamily(records, bodies)
 		for i := 0; i < 8 && i < len(balanced); i += 1 {
 			hasIpv4, hasIpv6 := recordIpFamilies(bodies[balanced[i]])

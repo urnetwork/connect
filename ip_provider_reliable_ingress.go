@@ -202,6 +202,7 @@ func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer
 			owner.operation.complete(false)
 			return
 		}
+		tcp.ttl = packet[8]
 		attempt = func() (bool, error) {
 			return tcp4.sendTransferKeyWithOwner(owner.source, owner.peer.TransferKey, owner.peer.ProvideMode, &tcp, 0, owner.packet, &owner.credit, owner)
 		}
@@ -211,6 +212,7 @@ func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer
 			owner.operation.complete(false)
 			return
 		}
+		tcp.ttl = packet[7]
 		attempt = func() (bool, error) {
 			return tcp6.sendTransferKeyWithOwner(owner.source, owner.peer.TransferKey, owner.peer.ProvideMode, &tcp, 0, owner.packet, &owner.credit, owner)
 		}

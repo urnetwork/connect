@@ -712,7 +712,7 @@ func TestResilientDialGoesThroughTheFamilyFallback(t *testing.T) {
 	}
 
 	// the "fragment" dialer: priority 0, the first one serialEval reaches
-	dialTls := newResilientDialTlsContext(settings, true, false, nil)
+	dialTls := newResilientDialTlsContext(settings, true, false, false, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

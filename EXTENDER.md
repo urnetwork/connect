@@ -100,9 +100,9 @@ Clarifications given during review, which the decisions below implement:
 
 A1. Three carriers, one stream contract. The extender listens on tcp 443,
 udp 443 and the dns carrier's udp 4053, and the sn miner on udp 53 as well
-(L2). Tcp 443 is the one port an extender requires; the udp carriers are
-optional (G2). Each carrier yields one reliable byte stream from the
-client:
+(L2). Acceptance requires public tcp 443 or a peer-to-peer webrtc
+connection (C2a); the udp carriers are optional (G2). Each carrier yields
+one reliable byte stream from the client:
 
 - tcp 443: TLS, terminated by the extender with a cert for the requested
   SNI (B3).
@@ -598,16 +598,55 @@ random, `allowed_hosts` the operator patterns of A5. On success the row
 and the family's address row are upserted active, `record_issue_time` is
 set, and a record publish row is inserted. The country comes from the ip
 geolocation of the caller. A probe failure returns `activated: false` with
-the failing carrier in `error` and stores nothing. The tcp carrier is
-required, since only it can prove the forward. Zero ports and an empty tld
+the failing carrier in `error` and stores nothing. Acceptance requires
+public tcp 443 or peer-to-peer webrtc, each of which proves the forward
+(C2a). Zero ports and an empty tld
 take the C1 defaults. The configuration check precedes the rate limit so
 an unconfigured operator never spends a caller's budget. A failed
 geolocation leaves the country empty rather than failing the activation.
 The bootstrap records are signed fresh at each activation. Probe requests
 name the api host on port 443 as their destination.
 
+C2a. Acceptance criteria (owner, 2026-10-07). An extender is accepted when
+it passes at least one required test. Every other carrier is optional.
+
+- Required, at least one of:
+  - Public tcp 443. The activation probe dials the caller's public address
+    on the tcp carrier, verifies the challenge signature against
+    `public_key_hex`, and proves the forward with a verified `GET /hello`
+    through it (C2).
+  - Peer-to-peer webrtc. The operator opens a webrtc data channel to the
+    extender through the exchange signaling (ICE and STUN traversal, the
+    webrtc carrier), verifies the same challenge signature over it, and
+    proves the forward with the same verified `GET /hello` through the data
+    channel. This is the path for an extender behind NAT, which has no
+    public inbound address. It lands with the webrtc carrier.
+- Optional, probed only when offered, never gating: udp 443 (quic), the dns
+  carrier on udp 4053, and udp 53 on the sn miner. An optional carrier that
+  fails its probe is left out of the stored `carriers`; it does not fail an
+  activation that passed a required test.
+- Not accepted: an extender that passes neither required test. Activation
+  returns `activated: false` with the failed required tests in `error` and
+  stores nothing.
+- Uptime follows acceptance. C3 probes each address over the required path
+  it was accepted on: the tcp challenge for a public-tcp extender, a webrtc
+  challenge for a webrtc extender. A webrtc extender is never deactivated
+  for lacking a public tcp port.
+- The stored address and the signed record carry which required path the
+  extender passed, so clients and the uptime task use the right one.
+- Provider role (G2). The role's `tcp_unavailable` error applies only when
+  the webrtc path is also unavailable; a provider that cannot bind tcp 443
+  but can complete the webrtc test still extends.
+- Tests (deterministic, per CODESTYLE.md): accepted on tcp alone; accepted
+  on webrtc alone; accepted when both pass; not accepted when neither
+  passes; a failing optional carrier is left out of `carriers` without
+  failing an activation that passed a required test; the uptime task probes
+  a webrtc-accepted address over webrtc and does not deactivate it for a
+  missing tcp port.
+
 C3. Uptime probes. Taskworker task every 5 minutes over every active
-address, batched, concurrency 16, tcp challenge probe only, 15 s timeout.
+address, batched, concurrency 16, a challenge probe over the required path
+the address was accepted on (C2a), 15 s timeout.
 A failure increments `consecutive_probe_failures`; at 6 the address is
 deactivated. When an extender has no active address it becomes inactive,
 `revoke_time` is set and a revocation publish row is inserted. A success
@@ -2808,6 +2847,833 @@ Checklist and tests.
   the chart bindings and the rest are reviewed, not compiled, on the
   macOS build host, as the windows tree has been.
 
+### P. Camouflage: the authenticated hello and the splice (REALITY)
+
+Added 2026-10-07 at the owner's request ("incorporate the best parts of
+reality into the extender; the extender does almost all of what reality does
+already"). The extender already terminates the outer TLS for a borrowed server
+name, issues a per-name leaf under its identity key, and the client already
+pins that leaf to the record key (A2, A3, B3, net_extender.go newExtenderTlsConfig).
+What REALITY adds over that is three things the extender does not yet have: the
+client's own ClientHello is a browser's rather than Go's; the proof that the
+client holds the extender's key is hidden inside that browser hello, so there
+is no distinguishing first flight; and a hello that does not carry the proof is
+spliced to the real borrowed site, so an active prober sees the real site with
+its real certificate rather than a self-signed leaf for a name the extender
+does not own. This section folds those three into the tcp carrier. It is tcp
+only (P9); the udp carriers keep A1 to A12 unchanged. Where it changes an
+earlier decision for the tcp carrier it says so: it supersedes A2's "always
+terminated, no splice" for the tcp carrier in splice mode (P3), and it narrows
+A5's reverse proxy to the degraded fallback and the non-tcp carriers (P3). It
+reuses, not imports, REALITY: the construction is native to the extender
+protocol (P0), built from connect's own X25519, HKDF and AES-GCM and from the
+reality client helpers that already live in connect for VLESS
+(vless_reality.go), on the extender's own certificate issuer, demultiplexer,
+admission limiter (A12) and whitelist. xtls/reality is not imported (P0).
+
+P0. Why native, not the library. xtls/reality's `Server` is a fork of
+crypto/tls that dials the borrowed site on every connection and mirrors the
+whole handshake to it (its `MirrorConn`), keeps its post-handshake record
+lengths in a process-global `sync.Map` filled by a background dial per server
+name (`DetectPostHandshakeRecordsLens`), carries juju/ratelimit and
+go-proxyproto, and has no replay cache and no demultiplexer for the three
+client shapes the extender serves (v1-framed, v2 http, and now camouflaged).
+The extender already owns every piece the library reimplements: TLS
+termination with a cached per-name leaf (extender_cert.go), a three-way
+demultiplex in front of it (extender.go HandleExtenderConnection), the A12
+admission limiter, the A5 whitelist and reverse proxy, and the reality client
+half (vless_reality.go: the session-id seal, the browser hello through utls,
+the leaf-proves-key verifier). The camouflage layer is therefore a peek and an
+auth check in front of the existing `tls.Server`, a splice path that reuses the
+A5 bounds, and a client dial that reuses the vless seal — not a second TLS
+stack. utls is already linked (vless_dial.go, vless_reality.go), so there is no
+new module and no size cost. The feat/chrome-client-hello branch (owner request
+2026-10-07, a sibling change) brings the browser hello to the normal and
+resilient dialers and adds the kill switch `ConnectSettings.TlsClientHelloFingerprint`;
+this design reuses that switch for the camouflaged carrier and takes that
+branch's uTLS plumbing as the precedent, and it resolves the "a Chrome ALPN
+would get 403, separate change" note that branch left for the extender (P4).
+
+P1. The authenticated hello. The proof rides in the 32-byte legacy session id
+of the client's ClientHello, exactly as REALITY and exactly as the VLESS client
+already builds it (vless_reality.go vlessRealitySealSessionId). The pieces:
+
+- Server static key. The extender identity is an ed25519 seed
+  (extender_record.go ExtenderPrivateKeyFromSeed). The X25519 static key the
+  ECDH needs is derived from that same seed with HKDF-SHA256, salt empty, info
+  `"ur-extender-reality-x25519-v1"`, 32 bytes, through `crypto/ecdh`
+  X25519().NewPrivateKey, so there is no new secret to persist and the static
+  key rotates with the identity. Its public half is published in the record
+  (P6). Only the extender holds the seed, so only the extender derives the
+  private key; the activator learns the public half from the activation args
+  and the client from the signed record (P6).
+- shortId. The 8-byte `ExtenderKeyId(ed25519 public key)` that already exists
+  (extender_record.go, first 8 bytes of sha256 of the key). It is not a new
+  stored or published value: both ends compute it from the record's identity
+  key. It is sealed in the plaintext so the server can confirm the tag was
+  built for this extender and not resealed from a tag captured at another.
+- Key agreement. The client's ephemeral X25519 is the one its TLS 1.3
+  ClientHello already carries as a key share (reused, as vless_reality.go reuses
+  `HandshakeState.State13.KeyShareKeys.Ecdhe`/`MlkemEcdhe`), so nothing extra
+  goes on the wire. `sharedSecret = ECDH(client ephemeral, server static pub)`
+  on the client and `ECDH(server static priv, client ephemeral pub)` on the
+  server, both reading the ephemeral from the hello's X25519 or X25519MLKEM768
+  key share.
+- KDF. `authKey = HKDF-SHA256(sharedSecret, salt = helloRandom[:20],
+  info = "ur-extender-reality-v1", 32)`.
+- Plaintext (16 bytes): a 3-byte client version `{2,0,0}` so the server can
+  bound min and max client versions as REALITY does, one reserved zero, a
+  4-byte big-endian unix time, and the 8-byte shortId.
+- Seal. AES-256-GCM under authKey (a 32-byte key), nonce `helloRandom[20:]`
+  (12 bytes), additional data the marshaled ClientHello with its session-id
+  field zeroed, output 16 + 16 = 32 bytes, which is exactly the session-id
+  length it replaces.
+
+What it binds: the identity, because only the holder of the matching static
+private key derives authKey, and the shortId in the plaintext ties the tag to
+this extender's key; and the time, in the plaintext, checked against a window.
+The additional data is the whole hello, so a tag cannot be lifted onto a
+different hello: a different random or key share changes both the data and the
+nonce, and the open fails. `ExtenderCamouflageTimeWindow` (default 2 minutes)
+is the tolerated skew each way; a client whose clock is outside it seals a time
+the server rejects and falls back to the legacy dial (P4, E/client).
+
+P2. Replay protection — the one thing REALITY lacks. REALITY accepts any hello
+whose tag opens and whose time is in window; it keeps no record of tags it has
+seen, so a prober that captures one authenticated hello and resends it
+verbatim is handled on the authenticated path rather than spliced, which tells
+the prober the server is not the borrowed site (the server does not fall back
+to it). The extender closes this: a bounded, time-windowed seen-tag set keyed
+on the 32-byte sealed session id. On a hello whose tag opens and whose time is
+in window, the server checks and inserts the tag; a tag already present is a
+replay and is handled exactly as an unauthenticated hello — spliced to the real
+site (P3) — so a replay is indistinguishable to the prober from any other
+probe. Entries expire after `2 × ExtenderCamouflageTimeWindow` (a tag older
+than that fails the time check anyway, so nothing older need be remembered) and
+the set is capped at `ExtenderCamouflageReplayTagCount` (default 65536, oldest
+evicted); an eviction under flood can at worst let one replay through as a
+fresh auth, which is harmless, because the replayer holds the client ephemeral
+public key but not its private half and so cannot finish the TLS 1.3 handshake
+or send any inner byte — the replay buys nothing but the handshake the server
+would complete for any authenticated hello, and the seen-tag set removes even
+that signal in the common case. The set keys on the session id, which is a
+deterministic function of the client's 32-byte random, so two genuine dials
+never collide.
+
+Verification cost on the server (the prototype measured 0.48 us to parse the
+hello and 43 us for the auth check, the X25519 ECDH being almost all of the
+43 us). The ECDH is spent only on a hello that could be authenticated: the
+session id is exactly 32 bytes and the hello carries an X25519 or
+X25519MLKEM768 key share. A plain Go client with no session id, a legacy
+extender client, and most probers skip the ECDH on that gate. After it, the
+AES-GCM open is cheap, the time check and the seen-tag check are a map
+operation. The whole check sits behind the A12 admission limiter and its
+per-subnet and refusal caps, so the ECDH rate is bounded under flood by the
+same machinery that bounds every other action.
+
+P3. The demultiplex and the splice. The tcp carrier's accept path gains a peek
+in front of `tls.Server`. The server reassembles the first TLS handshake
+record or records into the complete ClientHello without consuming them — the
+resilient client fragments the hello across records and segments
+(net_resilient.go), and a Chrome hello with an ML-KEM key share is ~1.7 to
+2 KB, so the reassembly reads TLS record headers (type 22, a handshake) and
+accumulates handshake bytes up to a bound (`ExtenderCamouflageHelloMaxByteCount`,
+16 KiB) before parsing — then parses it (through the utls/tlshacks parser the
+package already links) for the random, the session id, the key shares, the SNI
+and the ALPN, and keeps the read bytes to hand to whatever serves the
+connection next, exactly as newConnWithInitialBytes already prepends read bytes
+today. The first bytes that are a v1 length prefix (≤ 1024) are still the v1
+path (A3); the camouflage peek applies only to a TLS ClientHello, which is what
+the tcp carrier's outer bytes always are.
+
+The three outcomes:
+
+- Authenticated (tag opens, time in window, not a replay). The buffered-and-
+  following bytes go to `tls.Server` with the identity certificate
+  (GetCertificate, unchanged) and an authenticated `tls.Config` whose
+  `NextProtos` is `{"http/1.1"}` alone (P4). The handshake completes with the
+  identity leaf — encrypted in TLS 1.3, so a passive observer never sees it —
+  and the existing v2 http request path (A3) runs inside unchanged: the client
+  still sends the extender header, and the whitelist (A5), the admission
+  limiter (A12), the services (A8) and everything else apply as before. The
+  client still verifies the leaf under the record key (B3). The session-id tag
+  is an outer gate that makes the first flight look like a browser's visit to
+  the borrowed site; it does not replace any inner check.
+- Unauthenticated, splice mode on (`ExtenderCamouflageSplice`, P7). The SNI
+  names a borrowed site on the bundled splice list (P5); the extender resolves
+  it over its DoH cache on the client's family (A7), opens a tcp connection to
+  it on 443, writes the buffered ClientHello to it and relays raw bytes both
+  ways. The real site completes its own handshake with its own CA-valid
+  certificate, so an active prober — including a prober replaying a captured
+  authenticated hello (P2) — sees the real site, which is what REALITY's
+  fallback achieves and what closes the "a prober that validates certificates
+  sees a misconfigured host" limitation (section 6). The relay is raw tcp (the
+  bytes are the prober's TLS to the real site; the extender cannot and does not
+  inspect them), so the only in-band controls are byte and time bounds: the A5
+  bounds reused — relayed bytes per connection 8 MiB, idle 30 s — plus the A12
+  per-subnet rate, a total concurrent-splice cap
+  (`ExtenderCamouflageSpliceMaxCount`), and a per-target cap
+  (`ExtenderCamouflageSpliceMaxPerTarget`) so no one borrowed site is hammered
+  by one extender. A borrowed SNI the extender cannot reach falls to another
+  reachable borrowed target of the same family, so the prober still gets a real
+  site; only when none is reachable does it degrade to the A5 reverse proxy
+  (terminate, self-signed, real content), the one case the old tell returns.
+- Unauthenticated, splice mode off (`ExtenderCamouflageSplice` false — the
+  migration default and the legacy-safe posture). The hello is terminated as
+  today: GetCertificate issues the per-name leaf, and the inner v1 or v2 http
+  path or the A5 reverse proxy serves it. A legacy extender client (Go TLS, a
+  spoof SNI, no tag) is indistinguishable from a prober at the ClientHello, so
+  it can only be served while unauthenticated hellos are terminated; this is
+  why splice is a flag and not the first posture.
+
+Migration and retirement. Two phases, parallel to A3's "v1 acceptance dropped
+one release later". Phase A, `ExtenderCamouflageSplice` off: new clients send
+authenticated (browser) hellos and get the camouflage path; legacy clients send
+unauthenticated hellos and are terminated and served as today; probers get
+today's posture (a self-signed leaf for any name), unchanged. The passive win —
+no more Go fingerprint on a new client's first flight — lands in Phase A alone.
+Phase B, `ExtenderCamouflageSplice` on, flipped one release after new clients
+ship and legacy clients are retired: unauthenticated hellos are spliced, so
+probers get the real site, and any remaining legacy client breaks, which the
+retirement schedule already accounts for. The flip is an operator setting, not
+a code change.
+
+P4. The ALPN problem, resolved server-side. The server offers `{"h2","http/1.1"}`
+so a prober that asks for h2 gets it (A3); the extender protocol needs
+http/1.1, since the connection is hijacked and h2 cannot be (A3 refuses an
+extender request over h2 with 403). A real Chrome hello advertises
+`{"h2","http/1.1"}`, h2 first. The resolution is not to rewrite the client's
+ALPN — rewriting it to http/1.1 alone is a tell, a "Chrome hello that offers
+only http/1.1", which is why this design does not follow the VLESS dialer's
+ALPN rewrite (vless_dial.go) here — but to let the client send a faithful Chrome
+hello and have the server negotiate http/1.1 on the authenticated path: its
+authenticated `tls.Config` offers `{"http/1.1"}` alone, so the intersection
+with the client's `{"h2","http/1.1"}` is http/1.1 whatever the order. The
+selected protocol travels in the TLS 1.3 EncryptedExtensions, which are
+encrypted, so a passive observer sees the client's faithful `{"h2","http/1.1"}`
+in the plaintext hello and never sees the server's choice. The server knows a
+connection is authenticated before it hands it to `tls.Server` (the tag opened
+during the peek), so it picks the authenticated config then. A prober is never
+on the authenticated path, so its h2 request is unaffected: in Phase A it is
+terminated with `{"h2","http/1.1"}` as today, in Phase B it is the real site's
+own ALPN.
+
+P5. Borrowed names. The splice relays to the real site, so the borrowed name
+must be a site that is actually reachable, speaks TLS 1.3, offers an X25519 or
+X25519MLKEM768 key share (so the spliced handshake is as modern as the Chrome
+hello that fronted it), and is plausibly hosted on an arbitrary address rather
+than pinned to a well-known CDN range. The existing spoof list (A10,
+net_extender_spoof.go, the v1 service and mail names) is the wrong list for
+this: those are big-site names whose addresses a censor knows, so an extender
+on a home address claiming one is an obvious SNI-to-IP mismatch (section 6, and
+a limit REALITY shares). The camouflage splice therefore draws from a separate
+bundled list, `res/extender_borrow[_<cc>].bin`, in the same xor-masked gzip
+form as the spoof resource and with the same per-country override
+(SpoofDomainsForCountry's shape), curated for splice-friendliness — reachable,
+modern-TLS, not CDN-pinned, plausible in the region. The list is bundled in
+connect root, so the client draws its front SNI from it and the server
+validates and splices to it from one shared source; there is nothing per-
+extender to agree on. At role start the extender verifies each candidate it
+would use — a TLS 1.3 dial that reaches X25519/MLKEM and is not a shared CDN —
+and keeps only the ones that pass; an extender with none verified publishes no
+camouflage key and serves the legacy terminate path alone, so a bad list
+degrades to today rather than breaking. No borrowed list is bundled yet; like
+the country spoof lists it needs measurement first.
+
+P6. Records, activation, operator, gossip and TXT size. One new signed field
+on `ExtenderRecordBody`, `RealityPublicKey` (field 13, the 32-byte X25519
+static public key of P1). The shortId and the borrowed names are not in the
+record: the shortId is derived from the identity key both ends already have,
+and the front SNI is drawn from the bundled list (P5), which keeps the record
+and therefore the TXT value small. The body is signed opaquely
+(ExtenderRecord.Body, "ur-extender-record-v1"), so the new field is covered by
+the root signature and a reader that predates it skips it as an unknown proto3
+field and simply does not dial the camouflaged carrier — old clients skip
+unknown carriers by having no key to front with, which is non-fatal by
+construction. Activation gains one arg, `reality_public_key_hex`
+(ExtenderActivateArgs); an operator on an older binary ignores the unknown JSON
+field (Go's decoder does, without DisallowUnknownFields) and signs a record
+without the camouflage key, so activation stays non-fatal. Critically the
+camouflage does not add a new carrier string: it rides the existing `"tcp"`
+carrier, so the operator's `unknown carrier` refusal (server
+controller/extender_controller.go, the carrier loop) never fires on it. The
+activation probe is unchanged — it proves tcp forwards over the terminated path
+as today; the camouflage auth is proven client-side by the B3 leaf check, so
+the operator need not act as a camouflage client. Optionally the operator also
+dials the splice path with an unauthenticated hello and a borrowed SNI and
+expects the real site, a nice-to-have that verifies Phase B before it is
+flipped.
+
+TXT size. The record grows by the 32-byte key, ~44 base64 characters, so a
+dual-stack value moves from about 340 to about 384 characters, not the ~452 a
+borrowed name in the record would have cost — the reason the name is bundled
+rather than published. A location's TXT set holds up to `sample_count`
+(default 8) values, so the largest set stays near 8 × 384 ≈ 3 KB, at the C5
+bound; if a future field pushes past it, the extender TXT set's sample_count
+drops to 6 before the record carries anything larger, since EDNS0's 4 KB is the
+hard ceiling the C5 note set 3 KB inside of.
+
+P7. Flags, roles and metrics. `ExtenderSettings.CamouflageEnabled` (default
+false) gates whether the server recognizes auth tags, publishes a
+`RealityPublicKey` and negotiates the authenticated http/1.1 config;
+`ExtenderSettings.ExtenderCamouflageSplice` (default false) is the Phase-A→B
+flip of P3, meaningful only while CamouflageEnabled. The operator flag is off
+by default, as the owner asked; the provider-extender role carries a device
+default `DeviceLocalSettings.DefaultCamouflage` in the shape of
+`DefaultProvideExtender` (F3, G1), so an embedder sets the posture its users
+want. The client needs no flag: it uses the camouflaged tcp dial for any record
+that carries a `RealityPublicKey`, and the kill switch is the sibling branch's
+`ConnectSettings.TlsClientHelloFingerprint` set to `"go"`, which drops the
+camouflaged variant back to the legacy Go-TLS dial. Metrics: the extender
+counts authenticated, spliced and terminated tcp connections, replay-cache hits
+(replays refused), auth opens that failed the time window, splice-target dial
+failures and borrowed-name verification failures, carried on `ExtenderStats`
+and surfaced in the provide status beside the A12 admission counts.
+
+P8. Client dial. The camouflaged variant folds into the existing tcp carrier as
+one dialer, one strategy slot and one directory outcome — not a second carrier
+and not a second priority — the way the dns-port race is one dial over several
+ports (net_extender_dns_ports.go, the 250 ms stagger). The tcp dial becomes a
+camo-first-then-legacy staggered race: it launches the camouflaged attempt (a
+uTLS Chrome hello with the sealed session id of P1, through the vless_reality
+helpers generalized to the extender domain labels) at once, and the legacy
+attempt (today's Go-TLS dial, newExtenderTlsConfig) one stagger later while the
+first is pending, or at once if the first fails; the first to answer wins and
+the other is canceled and joined, exactly raceExtenderDnsPorts' shape. The
+camouflaged attempt is tried only when the config carries a `RealityPublicKey`
+(from a verified record, E5) and the fingerprint switch is not `"go"`; a config
+with no camouflage key runs the legacy attempt alone. Clock skew past the time
+window (P1) makes the camouflaged attempt fail its auth and the race fall to
+legacy. In Phase A that still reaches the extender, just without the
+camouflage. In Phase B the legacy attempt is spliced to the borrowed site and
+fails the B3 leaf check, so a skewed client loses the tcp carrier and reaches
+the extender over its udp carriers only. To keep that rare, the client seals
+with its clock corrected by a server-time offset learned from a verified source
+(the Date header of an authenticated platform API response or of a verified
+DoH answer); connect keeps no such offset today, so 14a adds one. The outcome
+the directory records is the tcp carrier's, as the dns
+race records one carrier outcome however many ports it tried, so a camouflaged
+attempt that fails neither holds the address nor spends a second slot. The
+resilient fragment and reorder wrapping (net_resilient.go) applies to the
+camouflaged attempt as it does to the legacy one; the server reassembles the
+fragmented Chrome hello during the peek (P3).
+
+P9. tcp only. REALITY is a TLS-over-tcp technique: the tag rides the TLS 1.3
+ClientHello and the splice is a tcp relay to the borrowed site. The udp
+carriers (quic on 443, the dns carrier on 4053 and 53) keep A1 to A12
+unchanged; QUIC has its own fingerprinting surface and the splice does not map
+onto it cleanly, so they stay identifiable on the same address (section 6,
+unchanged). The camouflage is a tcp-carrier property; a client that reaches an
+extender over quic or dns is exactly as it is today.
+
+P10. Tests. Deterministic, in-process, with a fake borrowed-site TLS server as
+the splice target, synthetic `.example` borrowed names and RFC 5737/3849
+addresses. Auth ok: a sealed hello whose tag opens and whose time is in window
+takes the authenticated path, terminates with the identity leaf, and the client's
+B3 check passes. Wrong key: a tag sealed against a different static key fails
+the open and is spliced (Phase B) or terminated (Phase A). Replay refused: the
+same authenticated hello twice is authenticated once and spliced the second
+time, and the replay counter increments. Skew fallback: a tag whose time is
+outside the window is not authenticated, and the client's race falls to the
+legacy attempt. Legacy client: a Go-TLS hello with no tag is terminated and
+served in Phase A and spliced in Phase B. Fragmented hello: a resilient client
+that fragments the Chrome hello across records is reassembled and authenticated.
+Bounded splice: the per-subnet, byte, idle, total and per-target caps each
+refuse past their bound, and a spliced byte is never counted as relay traffic
+(O1). ALPN: an authenticated connection negotiates http/1.1 though the client
+offered `{"h2","http/1.1"}`, and the selection is not on the wire.
+
+Phase (adds to section 5, after phase 9, independent of the gossip and alt
+work): 14. Camouflage. 14a (connect root, connect/extender, protocol): P1 to
+P10 — the seal and open generalized from vless_reality, the ClientHello peek,
+reassembly and parse, the authenticated http/1.1 config, the replay set, the
+splice with its bounds, the bundled borrow list, the `RealityPublicKey` record
+field and the X25519 static-key derivation, and the client's camo-first-then-
+legacy tcp race. 14b (server): `reality_public_key_hex` in activation, the
+stored and signed key, the optional splice probe. 14c (sdk): the role derives
+and publishes the static key (HKDF from the identity seed, no new persistence),
+`DefaultCamouflage`, the status counts, bindings. Acceptance: P10's tests pass;
+an authenticated client reaches an in-process operator through the camouflaged
+tcp carrier and the leaf verifies under the record key; a wrong key and a
+replay are spliced to the fake borrowed site; a legacy client works in Phase A;
+a skewed client falls back; the record grows by one field that old readers skip.
+
+### Q. The dns carrier's query shape (RFC 9619 and EDNS0)
+
+Q1. The dns carrier of A1 talks to the extender ip directly, so the pump
+variant does not apply, but the request shape does. Until 2026-10 a
+carrier request (`transport_pt_codec.go`, `encodeDnsRequest`) set the aa
+bit on the query and carried two TXT questions: the data question, whose first label holds the 18-byte pt
+header, and a second header-only "pump" question added so that each
+request would have a question for its response to answer. RFC 9619 (2024)
+makes a query with qdcount above 1 a malformed message, which a compliant
+resolver answers FORMERR and a firewall may drop, and the pair is a clean
+dpi match; there was no EDNS0 opt record. The server never used the pump
+question: `decodeDnsRequest` discards a header-only question that follows
+the data question, and the pump item a response is paired with
+(`decodeDns`, `pumpItem`) is the message id plus the header read from the
+data question.
+
+Q2. A request is now one standard query: opcode 0 and no flags (aa is a
+response bit; rd stays clear so the unchanged response, aa set and rd
+clear, reads as an authoritative answer to an iterative query), a single
+TXT question in the form of the old data question, and an EDNS0 opt record
+advertising a 1232-byte udp payload, the fragmentation-safe size of dns
+flag day 2020 and the default of other dns carriers. A response carries an
+opt record when, and only when, the paired request carried one (RFC 6891
+section 7); a pump item the decode53 mode synthesizes answers the way the
+client's latest real request asked. Everything else on the wire -- the
+header layout, the label encoding, the 157-byte request budget, the
+response's TXT answers -- is unchanged. Direct mode only: a recursive mode
+(resolver traversal, a delegated zone, rd set) is a separate design.
+
+Q3. Compatibility holds by construction, since the carrier has no version
+on the wire and a client's first datagram is already a QUIC initial, so
+nothing can be negotiated first. New client, old extender: the old decoder
+read the message id and the question section only, never the header flags
+or the additional section, so the new request decodes on it unchanged, and
+the response it sends is one the new client already accepts. Old client,
+new extender: `decodeDnsRequest` keeps discarding a header-only question
+after the data question, and a request without an opt record is answered
+byte for byte as before. The opt record is the capability signal. The
+legacy discard in the decoder can go once no deployed client emits the
+pump question.
+
+Q4. Tests, in-process only (`transport_pt_query_shape_test.go`,
+`transport_pt_roundtrip_test.go`, `transport_pt_codec_legacy_test.go`,
+`transport_pt_codec_test.go`): the raw header fields of every emitted
+request (qdcount 1, aa clear, one opt record of 1232) at the codec and at
+the socket the client translation wraps; frozen copies of the pre-change
+encoder and decoder for both interop directions; a round trip over an
+in-memory packet network with the server in require-pump mode, so a
+response proves the pairing, with the opt record echoed for a new client
+and absent for a legacy one; and edns detection that reads the opt record,
+not arcount. A1's forwarder split (A6) is unchanged: a TXT question
+outside every encoding tld is still a forwarder query.
+
+Q5. Decisions. The query keeps rd clear and the response is not touched:
+a response that copies rd (RFC 1035) and echoes its question is a
+response-side pass of its own, and with rd clear both halves of the
+exchange are consistent as they stand. No version field and no
+negotiation: the opt record marks a new client, which is all the server
+needs to know, and a negotiation would cost a round trip before the QUIC
+initial. The decoder stays tolerant of the legacy pump question rather
+than enforcing qdcount 1, which would strand every deployed client; a
+test pins that. A synthesized decode53 pump item follows the client's
+latest real request, so one client sees one response shape. The
+advertised payload is 1232 rather than 4096: nothing in the carrier needs
+more, and it is the size that passes every path.
+
+Q6. Phased. Nothing in connect. The server's `listenH3Dns` uses the
+exported constructor and takes the change on rebuild; no sdk surface
+changes. Still open on the response side: it answers with qdcount 0 and
+does not copy rd, which the recursive-mode design should take together
+with its delegated zone, since both are shape changes a resolver would
+notice. The legacy discard in `decodeDnsRequest`, and the frozen legacy
+codec the tests keep, can go once no deployed client emits the pump
+question.
+
+### R. Directory tiers: the sacrificial open tier, the gated tier, canaries (2026-10-07)
+
+The three discovery channels of D and E each hand an observer most of the
+fleet within about a week: the geo dns answers eight addresses per family per
+continent and rotates them every tick, the feed serves thirty-two random
+records to anyone, and gossip republishes every record to every member
+within a rotation. Camouflage (P) defends classification, not address
+harvesting, so the directory is tiered: an open tier that is sacrificial by
+design, served in small keyed partitions, and a gated tier the open channels
+never carry. The pure core -- partitions, the release policy, canaries and
+blocked state -- lives in connect so the server and every test run the same
+functions; the server wires it to its tables, the dns publisher and two
+routes.
+
+R1. Tiers. A record is signed into one tier: `ExtenderRecordBody.DirectoryTier`
+(field 13, additive; 0 open, which every record that predates the field is,
+1 gated; `ExtenderRecordGated`). The open tier is what the dns sets and TXT
+records, the feed sample and stream, and the cleartext gossip carry, and it
+is populated by volunteer extenders only, never operator hosts. The gated
+tier is the durable fleet: operator hosts, released only by the operator to
+an authenticated identity (R3) and carried by no open channel whatever
+source it arrived from -- the directory never publishes a gated record to
+its subscribers (the feed stream, the mesh), the feed never samples one, the
+gossip validator ignores one rather than relaying it, and the server never
+drips one, publishes one in dns, or hands one back as activation bootstrap.
+A gated record applied from a release, or leaked in from anywhere, is a
+candidate like any other, marked by `ExtenderCandidate.DirectoryTier` and the
+status entry. Revocations name a key and no address, so they flow on every
+channel as before, which is how a client holding a gated record learns it was
+withdrawn. The server assigns the tier at activation from `extender.yml`:
+`directory: {durable_network_ids: [...]}` names the operator's own account
+networks, whose extenders are gated; every other activation is open. A gated
+activation inserts no publish row and `network_extender.directory_tier`
+holds the tier.
+
+R2. Keyed partitions on the open channels (`net_extender_directory_partition.go`),
+in the shape of Psiphon's classic discovery. A channel pool of n records has
+`ExtenderPartitionCount(n)` partitions: the power of two at or above
+ceil(sqrt(n)), cut no finer than `ExtenderPartitionMinSize` (4) records per
+partition, so a fleet under eight is one partition and a fleet of a thousand
+is thirty-two. A record is placed by HMAC(secret, channel, "record", key)
+mod the count, so its place is stable while the count is; a vantage by
+HMAC(secret, channel, "vantage", vantage); an empty partition hands the
+vantage the next one around the ring; and each epoch deals a partition in
+the order of HMAC(secret, channel, "order", vantage, epoch, key)
+(`ExtenderPartitionMembers`, `ExtenderPartitionOrder`,
+`ExtenderPartitionSample`). A vantage therefore sees at most its partition --
+about sqrt(n) -- however often it polls, and the answer size only sets the
+pace. The channels `dns`, `feed` and `gated` are separate key spaces, so a
+partition that leaks on one says nothing about the others (R4). The epoch of
+the open channels is an hour (`ExtenderOpenEpochTimeout`); the count moves
+only when the fleet quadruples or quarters, and every placement is dealt
+again when it does.
+
+Feed. The vantage is the client's address prefix, /24 for v4 and /48 for v6
+(`ExtenderVantageKey`, from the stream's remote address), so a poller cannot
+change partition by changing its last octets; a stream with no address, a
+pipe, is a vantage of its own. `SampleRecords(count, own, vantage)` serves the
+extender's own record first when it is open, then the epoch's order of the
+vantage's partition interleaved by family (`balanceRecordsByIpFamily`, which
+keeps the order it is given); the stream forwards an applied open record only
+when `OpenPartitionContains(vantage, key)`, and every revocation. The sample
+and stream partition the same complete open pool, including the server's own
+record; placing that record first happens after partitioning and never changes
+the partition count. The sample
+cap is 8 (was 32) and the client's default 8 (was 16): the partition is the
+bound, the cap the pace. The secret is per directory, drawn at construction
+(`PartitionSecret` pins it), never stored and never on the wire: a restart
+deals the partitions again, which costs nothing.
+
+Dns (server, `taskworker/work/extender_dns_publish.go`). Route 53 keys
+answers by the resolver's location, not its address, so the vantage of a
+set is its location: each continent and the default are one vantage of the
+`dns` channel with the operator's secret, derived from the root key
+(`ExtenderConfig.DirectorySecret`, HMAC of the seed under a fixed domain,
+never stored). A set is the epoch's sample of the location's partition of
+the open tier of that family, `sample_count` 3 per family (was 8), filled
+from the family's partition members elsewhere and then from the next
+partitions when short, so a short continent is still bound to few partitions
+rather than to the global pool. The tick stays ten minutes; the sets change
+only when the epoch turns, and an unchanged upsert is a no-op. The TXT sets
+vouch for exactly the addresses answered, as before. A resolver-keyed answer
+-- HMAC of the resolver or ECS /24 -- needs an authoritative answerer the
+operator runs; the same functions serve it with that vantage (R5).
+
+R3. Gated tier release (`net_extender_directory_release.go`; server
+`POST /network/extender-release`, client jwt). The identity is the account
+and the device together (network id and client id as bytes); it is placed in
+one partition of the gated fleet on the `gated` channel and dealt that
+partition each epoch of a week (`ExtenderReleaseEpochTimeout`), of which it
+takes the first eligible: one record while the identity is new, three once
+it has served thirty days (`ExtenderReleaseProbationTimeout`, the Lox shape;
+the client's creation time is the age). Asking again in the same epoch
+returns previously issued records that remain eligible. The ledger retains
+the complete issued set for the epoch: changing `ip_versions`, country,
+blocked status, or fleet availability cannot refund a disclosure. A blocked
+or removed record may therefore leave an empty answer until the next epoch.
+Requests are counted
+per identity (8 an hour) and per vantage -- the requester's asn as text, or
+its prefix (`ExtenderVantagePrefix`) where none is known (4096 an hour),
+refused requests counting too. A record is released to at most ten distinct
+identities per country over thirty days (Salmon's ten,
+`ExtenderReleaseMaxClientsPerExtenderPerCountry`), the identity's own earlier
+release never counting against it, so a long-lived host is never the one
+everyone in a country is told about. A record blocked in the requester's
+country (R4) and a record of a family the client cannot dial
+(`ip_versions`) are skipped. The policy reads and writes an
+`ExtenderReleaseLedger`: `ExtenderReleaseMemoryLedger` is the bounded
+in-process one (an operator of one process, and every test); the server's is
+`model.NetworkExtenderReleaseLedger` over `network_extender_release` and
+`network_extender_release_request`. Request counts, request stamps, country
+reservations and epoch history are one admission transaction. The memory
+implementation holds one lock; replicas share PostgreSQL transaction advisory
+locks for identity, vantage and country, acquired in a stable order.
+Country-wide serialization keeps lock use constant at three locks per
+admission. Read-committed statement snapshots ensure a waiting replica sees
+the previous commit. Eligibility is checked for one partition plus previously
+issued keys before admission, with one batched database query for blocked
+flags. Migration 795 indexes the identity/epoch disclosure lookup; removed
+fleet rows retain disclosure tombstones for the epoch.
+The released records are signed fresh at
+each release, so a client refreshes a record by asking again within its
+epoch, and applies them with source `release`, which is not a K4 event. The
+answer is `{records, epoch, count, probation}` with base64 records
+(`DecodeExtenderRecordBase64`), or `{error}` for a refused request.
+
+R4. Canaries and blocked state (`net_extender_directory_canary.go`). A
+canary is an operator-run extender in exactly one place: a dns canary is in
+its continent's sets every epoch, pinned, never filled into another
+location's set and never dripped; a gated canary is in the gated partition
+its key hashes to and in no open channel. The signed `CanaryChannel` field
+(field 16; fields 14 and 15 remain `WebRtcClientId` and `RealityPublicKey`)
+restricts redistribution even after a DNS record enters a client's directory.
+Canaries also use the gated wire tier, so older tier-aware readers suppress
+their open relays without understanding the new field. Ordinary records with
+an empty channel retain their existing tier behavior. Feed samples, streams,
+gossip validation and local gossip publication exclude channel-restricted
+records. DNS publishes a healthy regional canary even when it is the region's
+or address family's only record, with its matching TXT set; it never fills
+another region or the default set. `ExtenderCanaryPlace` names the channel and the partition or
+region, and `ExtenderAttributeBlockedCanaries` names each leaked place once
+for a set of blocked keys. The server holds the designation in
+`network_extender.canary_channel`. Blocked state is per country
+(`ExtenderBlockedState`): a record is blocked in a country when at least
+three distinct identities there reported it unreachable within a day
+(`POST /network/extender-block-report`, the reporter's country from its
+address) while the operator's own uptime probe reached it within the hour,
+so an outage is not a block and one reporter is not enough. Tables are
+bounded; the oldest reporter or entry goes. The server's view is a query
+over `network_extender_block_report` joined to the probe stamps. What a leak
+does beyond the release skipping blocked records -- suspicion on the
+partition's identities, migration of trusted ones -- is phased (R5).
+
+R5. Phased, in order: the sdk's release fetch, which calls the route with
+its client jwt on each refresh pass and applies the answer with
+`ExtenderDirectory.ApplyRecord(record, ExtenderSourceRelease)` (the
+directory side is in place); a reaper for the release and report tables;
+`bringyourctl` commands that set a tier and a canary; the per-partition
+suspicion and migration policy (Lox: migrate trusted users, hold new ones);
+an authoritative dns answerer keyed by the resolver or ECS /24; the
+unlisted share-code compartments (capped, expiring invites, never gossiped);
+and encrypted-blob gossip with liveness and revocation keyed by opaque ids,
+decryptable at the member's trust level, in place of cleartext record gossip
+-- until it lands, the mesh carries the open tier only, in cleartext, bound
+by nothing but the tier.
+
+R6. Tests. `net_extender_directory_tiers_test.go`: the partition count and
+its floor, stable channel-separated placement, the empty-partition ring, the
+epoch rotation, a vantage polling for a week seeing exactly its partition of
+sixty-four records, the open channels excluding a gated record that arrived
+over the mesh while it stays a candidate, the additive tier, the vantage
+prefix, the release policy's determinism and identity cap, vantage cap,
+probation, per-country client cap, blocked skip and ledger bounds, blocked
+state per country with the probe rule and its bounds, and a blocked canary
+mapping to exactly one place. `gossip/feed_server_tiers_test.go`: the feed
+sample and stream bound to the client's remote prefix at the served stream, a
+leaked gated record served by neither, and the validator ignoring one on the
+mesh. Server: the dns sampler excluding the gated tier, keyed by epoch and
+location, pinning a canary in its one region.
+
+### S. The peer-to-peer webrtc carrier and acceptance (2026-10-07)
+
+A home extender behind NAT has no public inbound address, so it serves none
+of the socket carriers of A1 and, under C2 as first written, could never be
+accepted. Volunteer relays behind NAT are the family that measurably kept
+users online in 2025-2026 (Conduit, Snowflake; reports/Circumvention
+strategies for connect.md, "Peer proxies and refraction"), and connect
+already carries a webrtc transport with ICE/STUN signaling over the
+exchange, so the carrier here is a rendezvous and a stream adapter, not a
+new transport. Two fingerprint lessons from the same research bound it:
+pion's default dtls ClientHello was block-listed by Russia's TSPU on
+2026-03-30, and two fixed STUN servers are a cheap prefilter signal. Both
+are addressed first (S4). The acceptance rule it lands with is C2a, which
+this section implements and does not restate.
+
+S1. The carrier. A dialer -- a client, or the operator's activation probe
+-- creates a peer connection with one ordered data channel labelled
+`ur-extender`, gathers its candidates, sends the SDP offer to the
+extender's rendezvous id through the exchange signaling (S2), applies the
+answer, and the data channel that ICE/STUN opens is one reliable byte
+stream: the ordinary A3 request (`POST /`, the header, the response frame)
+runs over it and the inner bytes follow, through the same handler as the
+tcp carrier, so a stream is refused, limited (A12), answered and forwarded
+exactly as a terminated tcp connection is. The extender server's
+`HandleWebRtcExtenderStream` serves the stream from its first bytes under
+the same connection accounting, with the ICE pair's remote address as the
+source the admission keys on and the forward family follows (A7). There is
+no outer tls and so no leaf to pin (B3): the data channel is already
+authenticated dtls, and the extender's identity is the challenge signature
+of its response, so a dial that knows the extender's key -- a verified
+record, a probe -- always challenges and verifies it itself, whatever the
+caller brought. `ExtenderConnectModeWebRtc` ("webrtc" in records and
+responses) is the carrier's connect mode; `dialExtenderStream` hands a
+profile in it to the carrier before it builds a header, so the strategy,
+the feed, the probes and the http client reach it through the dial they
+already use. The dial side is owner installed:
+`ConnectSettings.WebRtcExtenderCarrier` is a `WebRtcExtenderCarrier` the
+owner built with a resolver from an extender's identity key to its
+signaling; nil, the default, leaves a webrtc profile undialable. One
+carrier holds one peer connection factory, so its sessions share one
+certificate and inherit the STUN pool and the dtls mimicry of S4. A
+detached pion data channel is message oriented and a short read loses the
+rest of a message, so the stream adapter takes whole messages into a
+buffer sized to the advertised maximum and serves them out, cuts writes
+into 16 KiB messages (the size every implementation accepts), reports a
+passed deadline as the `net.Error` timeout every `net.Conn` does (net/http
+asserts exactly that on the read it interrupts at a hijack, and cancels
+the request context -- the extender's forward -- when it is not), and on
+close waits, bounded by 5 s, for what it wrote to be acknowledged before
+it closes the peer connection, since that close aborts the association and
+drops what is in flight; a dead association, which never acknowledges and
+which nothing on the peer connection reports, ends the wait through a
+read that fails at once. Not built for js/wasm: the browser owns webrtc
+there (stub). The carrier is off by default everywhere it can be turned on
+(S3, S6) until it is proven in the field.
+
+S2. Signaling. The rendezvous rides the `ExchangeSignals` frames the p2p
+transport negotiates with, routed by the exchange to the extender's client
+id, under a new `extender_carrier` flag (field 5, additive): a flagged
+offer is for an extender and never for a transport peer connection, so the
+manager routes it, before its keyed lookup, to the answerer the extender
+role installed (`WebRtcManager.SetExtenderCarrierAnswerer`); a receiver
+that predates the flag sees an offer for a stream it has no peer connection
+for and drops it, which is how an old extender declines. An answer gathers
+candidates, which is seconds, so offers are answered on a bounded worker
+pool (`WebRtcSettings.ExtenderCarrierAnswerConcurrency`, 8) and never on
+the signal receive worker; past the bound an offer is dropped and counted.
+The answer is sent back on the companion of the dialer's contract exactly
+as a passive p2p peer replies. The dial side
+(`WebRtcManager.ExtenderCarrierExchanger(extenderClientId)`) allocates a
+stream id, sends the offer and waits for the answer under that id, bounded
+by the caller's context and the manager's life. The carrier trickles
+nothing: an offer and an answer each carry their gathered candidates.
+`ExtenderCarrierSignalingStats` counts what was declined, dropped, unknown
+or failed.
+
+S3. Records, directory, strategy. `ExtenderRecordBody.WebRtcClientId`
+(field 14, additive) is the client id the extender's device is reachable
+under on the exchange, which the operator signs from `network_extender.
+client_id` when an address of the record lists the webrtc carrier -- no
+migration; the stored `carriers` of an address already says which required
+path it passed. A record's address may list "webrtc" beside the socket
+carriers; the directory keeps it only while the owner has enabled the
+carrier (`ExtenderDirectorySettings.WebRtcCarrierEnabled`, off by default,
+`SetWebRtcCarrierEnabled` at run time) and the record carries the
+rendezvous id, since a webrtc dial with no signaling path can only fail
+and a failure counts against the address's other carriers.
+`ExtenderDirectory.WebRtcClientId(publicKey)` is the lookup a device's
+resolver signals by. With the carrier enabled the strategy expands a
+webrtc dialer per candidate that lists it through the mode dispatch it
+already has (`extenderConfigsForCandidate` in net_http.go is untouched:
+the dialer takes the tcp carrier's priority and port, which is a follow-up
+once that file is free -- the carrier belongs after dns, as
+`orderedExtenderCarriers` already orders it for the feed and the probes).
+
+S4. Fingerprints. The STUN pool: ten high-collateral servers
+(`defaultStunServerUrls`), a random `IceServerSampleCount` (3) of them
+offered per manager-scoped factory, `IceServerUrls` as the pinned
+override. The dtls hello: `WebRtcSettings.DtlsClientHelloMimicry` replays
+a real browser webrtc ClientHello from the covert-dtls corpus (MIT,
+github.com/theodorsm/covert-dtls) on the SDP answerer, which is the dtls
+client and the side that sends the hello -- on this carrier the extender --
+rotating the fingerprint per peer connection, with the live random, session
+id and cookie spliced in so the handshake completes. Off by default on the
+direct p2p transport, on by default for the carrier
+(`DefaultWebRtcExtenderSettings`). No-op on js/wasm.
+
+S5. Acceptance and uptime on the operator (C2a, C3), server. An activation
+may offer "webrtc" among its carriers and must offer tcp or webrtc. Each
+required path offered is proved on its own, the challenge on its carrier
+and then the verified `GET /hello` through it, with the family check of
+A7 per path; a path that fails is left out, and the activation is refused
+only when every required path offered failed, with each failure named. An
+optional carrier (quic; dns per port) is probed when offered and left out
+when it fails, never refusing an activation a required path passed -- the
+two activation tests that asserted the old refusal now assert the drop.
+The stored carriers are the ones that passed, in the order offered; the
+record carries them and the rendezvous. The webrtc tests run connect's
+`ProbeExtenderWebRtcCarrier` and `ProbeExtenderWebRtcForward` through a
+seam, `extenderWebRtcProbeConnectSettings(clientId)`, whose production
+default answers no settings: this deployment has no relay from an api
+process to the exchange resident that holds the extender's client, so
+every webrtc test fails with `ErrExtenderWebRtcSignalingUnavailable` and
+an extender offering only webrtc is refused with that reason until the
+relay lands (S8). Uptime probes an address over the required path it was
+accepted on: the tcp challenge when the address lists tcp, and the webrtc
+challenge when it lists webrtc -- also when its tcp stopped answering, so
+an address is live while any required path it was accepted on answers and
+a webrtc-accepted extender is never deactivated for a public tcp port it
+may not have (`NetworkExtenderProbeTarget.ClientId`, read from the
+extender row).
+
+S6. The role (G2), sdk. `DeviceLocalSettings.ProvideExtenderWebRtc`
+(default off; gomobile and the c abi json carry it) turns the carrier on
+for the provider extender role; the role needs a manager to signal through,
+the provider client's (`deviceLocalExtenderSettings.SignalingManager`),
+and installs its answerer on it when it starts serving, removing it when
+it closes. With the carrier available a role that cannot bind tcp 443
+runs anyway: the udp carriers bind, the server lists webrtc, the
+activation offers it, and the tcp bind failure is one more carrier's in
+`ListenError` rather than the role being off; `tcp_unavailable` applies
+only when the webrtc path is also unavailable, which is the setting off or
+no manager. `ExtenderProvideStatus.WebRtcCarrier` says the carrier is
+served. The port is tried again only by the role's next start (a provide or
+setting change), not every three minutes as the off role tries it.
+
+S7. Tests, every one in process and deterministic (barriers, injected
+signaling, pion's virtual network -- a WAN with the dialer and a LAN behind
+an endpoint-independent NAT with the extender, no STUN, so the join is the
+extender's own check crossing the NAT and the dialer learning the mapped
+address). connect: the stream adapter's root causes
+(`net_extender_webrtc_conn_test.go`: a short read keeps the rest of a
+message, which is the abort the first carrier draft died of; writes split
+at the bound; an oversized message is refused, not skipped; deadline errors
+are net timeouts; a close drains to acknowledgement, gives up on a dead
+association and waits past the peer's half-close); the carrier
+(`net_extender_webrtc_test.go`: the round trip behind the NAT with the
+challenge, the forwarded hello and the ICE pair addresses on both sides;
+no carrier; no signaling path; another key published or signed; a dial
+that brings no challenge still challenges; 403 and 429 carried as the
+typed refusals; the caller's context; another data channel label reset;
+an unopened answer released; a closed carrier); the signaling
+(`net_extender_webrtc_signal_test.go`: a flagged offer answered through
+the bridged exchange path, declined without an answerer, bounded,
+an answer nobody waits for, p2p offers left to the peer connections, a
+failed answer, the manager closing, and the whole rendezvous over the
+bridged path behind the NAT); the directory gate and lookup and the
+strategy's webrtc dialer (`net_extender_webrtc_directory_test.go`); the
+real server over the carrier (`extender/extender_webrtc_test.go`: the
+served stream with the https forward on the ICE pair's family, the two
+probes, a forward off the whitelist refused, admission by the ICE remote
+address, the carrier listed only when enabled and a server up on it
+alone). server: accepted on webrtc alone, on tcp when webrtc has no path,
+on both with every optional carrier, refused when neither passes and
+without a required path, the optional drops, the record's rendezvous
+(`controller/extender_webrtc_controller_test.go`, the two rewritten tests
+in `extender_controller_test.go`), and the uptime task judging a webrtc
+address over webrtc through more ticks than the budget, keeping a dual
+path address while webrtc answers, never signaling a tcp address, and
+deactivating a webrtc address that stops answering
+(`taskworker/work/extender_probe_webrtc_work_test.go`). sdk: a role with
+tcp 443 taken running on the carrier, offering it, reporting the bind
+failure beside the others, installing and removing its answerer; staying
+off without a signaling manager; offering the carrier beside tcp
+(`device_local_extender_webrtc_test.go`).
+
+S8. Phased and not done. The operator-side signaling relay: an api process
+has no path to the exchange resident that holds the extender's client, so
+the seam of S5 answers nothing in production and the webrtc test is refused
+-- the relay (api to resident, the resident forwarding the flagged offer to
+its client as it forwards a peers update, the answer back) is the piece
+that makes acceptance on webrtc real, and it is designed but not written.
+The device's dial side: installing a carrier on a device's connect settings
+and enabling its directory, with a resolver from the record's rendezvous
+id through the provider client's manager; a client needs an exchange
+connection to signal, so the carrier is a second path for a device that has
+one and never the bootstrap -- the socket carriers and the dns carrier
+remain the paths where udp is dead or nothing else reaches the operator.
+connectctl's extender gains no flag yet. The webrtc dialer's priority and
+port in `extenderConfigsForCandidate` (net_http.go, in flight elsewhere).
+UPnP-IGD, NAT-PMP and PCP port mapping, which would also let today's socket
+carriers activate on many home routers, scoped as a follow-on: a mapping
+of tcp 443 and udp 443/4053 attempted by the role before its binds, with
+the mapped external port offered to the activation (a port field per
+carrier the record already has), through an MIT or BSD library only. A
+TURN fallback for the symmetric NATs hole punching cannot cross. The apps'
+setting for `ProvideExtenderWebRtc`.
+
+S9. Decisions. The flag on `ExchangeSignals` rather than a new message
+type: the frames already reach the manager through the client's signal
+dispatcher, old receivers drop a flagged offer harmlessly, and nothing new
+has to be registered on the wire. The carrier dispatched before the header
+is built: with no outer leaf the dial must own the challenge. The shared
+request after the handshake (`extenderStreamRequest`): one A3 exchange for
+tcp and webrtc, so the server's refusals, limits and framing cannot
+diverge. The directory gate rather than a dial-time check: a failed webrtc
+dial would hold the address's other carriers. The answerer on the manager
+rather than a second signal receiver: one receive path, one ownership. The
+uptime fallback from tcp to webrtc rather than one path per address: an
+extender accepted on both is live while either answers.
+
 ### I. Tests
 
 Every phase ships tests with it. In-process fixtures only: the extender
@@ -2886,6 +3752,15 @@ with the database.
 | `connect.ExtenderPeerPingerSettings` | `PeerSampleSize` (64) added (G5, GEOMAP §2.1) |
 | `connect.ExtenderPeerPingerStatus` | `SampleSize`, `SampledPeerCount` added; `ExtenderPeerPinger.SampledPeers` (G5) |
 | sdk native extender role | `PeerSampleSize`, `MaxActiveRecordCount` on its settings (G5, E6) |
+| `protocol.ExtenderRecordBody` | `RealityPublicKey` added (field 13), the 32-byte X25519 static key; signed, old readers skip it (P1, P6) |
+| `POST /network/extender-activate` args | `reality_public_key_hex`; unknown to old operators, so non-fatal (P6) |
+| extender tcp 443 | a browser ClientHello whose session id seals the client's proof (P1); an unauthenticated hello is spliced to the real borrowed site in splice mode, else terminated as today (P3); authenticated connections negotiate http/1.1 server-side (P4) |
+| `extender.ExtenderSettings` | `CamouflageEnabled` (default off), `ExtenderCamouflageSplice` (default off), `ExtenderCamouflageTimeWindow` (2 min), `ExtenderCamouflageReplayTagCount` (65536), `ExtenderCamouflageHelloMaxByteCount` (16 KiB), `ExtenderCamouflageSpliceMaxCount`, `ExtenderCamouflageSpliceMaxPerTarget` added (P1, P2, P3, P7) |
+| `extender.ExtenderStats` | authenticated/spliced/terminated tcp connection counts, replays refused, auth time-window failures, splice-target and borrow-verify failures (P7) |
+| connect root | `res/extender_borrow[_<cc>].bin`, a splice-friendly borrowed-names list in the spoof-resource form, bundled; the X25519 static-key HKDF derivation from the identity seed (P1, P5) |
+| `connect.ExtenderConfig` | the camouflaged tcp dial folds in as a camo-first-then-legacy staggered race on the existing tcp carrier, driven by `RealityPublicKey`; kill switch is the sibling branch's `ConnectSettings.TlsClientHelloFingerprint="go"` (P8) |
+| `sdk.DeviceLocalSettings` | `DefaultCamouflage` added, default following `DefaultProvideExtender` (P7) |
+| extender udp 4053 and udp 53 (dns carrier) | a request is one TXT question with no aa bit and an EDNS0 opt record (udp payload 1232); a response repeats the opt record only for a request that carried one (Q2); old peers unchanged in both directions (Q3) |
 
 Old clients keep working: the header's new fields are optional, the hello
 field is additive, the tables are new, and a v1 extender client still
@@ -3045,7 +3920,30 @@ Phase 5b follows 4 because both touch the server.
   attribution to a dedicated edge port is a later phase.
 - The reverse proxy answers probers behind a self-signed cert; an active
   prober that validates certificates sees a misconfigured host, which is
-  the accepted posture.
+  the accepted posture. The camouflage splice (P3) closes this on the tcp
+  carrier in Phase B: an unauthenticated prober is spliced to the real
+  borrowed site and sees its real certificate. The self-signed posture
+  remains for the udp carriers (P9), for the tcp carrier in Phase A (the
+  migration default), and as the degraded fallback when no borrowed target
+  is reachable (P3).
+- Camouflage is a classifier defense, not an address defense. The borrowed
+  site is not hosted at the extender's address, so an extender on a home
+  address claiming a big-site name is an SNI-to-IP mismatch a censor can
+  catch by address (REALITY shares this); the borrowed-names list is curated
+  for names plausibly hosted anywhere to narrow it, not to erase it (P5), and
+  the directory stays enumerable regardless, so camouflage helps against a
+  censor that classifies traffic, not one that harvests addresses. The
+  mismatch is exploited, not theoretical: users reported China blocking
+  hundreds of REALITY server addresses on 4 to 12 March 2026, apparently
+  because the borrowed name did not belong to the server's address range
+  (community reports, not a published measurement).
+- The splice sends a prober's bytes to a third-party borrowed site from many
+  extender addresses; the per-subnet, per-connection byte, idle, total and
+  per-target bounds of P3 keep it bounded, and the posture is off by default
+  (P7) until an operator accepts it.
+- Camouflage is tcp only (P9). QUIC on udp 443 and the dns carrier stay
+  identifiable on the same address, and TLS-in-TLS detection applies to every
+  carrier, the camouflaged one included.
 - H3 to the operator is unavailable through an extender; the H1 websocket
   runs inside the carriers.
 - Records lag reality by up to one drip rotation; the directory's local
@@ -3222,3 +4120,266 @@ migration, no services version, no rpc version.
   negative = off) and publishes the counts. Known-failing at HEAD and
   unrelated: the root package's mobile memory-accounting test that the
   `Admission` test pattern also selects.
+
+- **A13, QUIC version 2 on the udp carriers and the h3 dialers
+  (2026-10-07).** What changed: the client dial of the udp 443 and dns
+  carriers (A1; `dialExtenderQuic`, whose config `newExtenderQuicMemoryPolicy`
+  builds), the alt h3 and whodis dialers (L4; `dialAltQuicAttemptWithReservation`)
+  and the platform h3 transport (`newPlatformQuicConfig`) offer QUIC version
+  2 (RFC 9369, `0x6b3343cf`) first with version 1 behind it, and the
+  extender's udp carrier listener (`serveQuicCarrier`, the udp 443 and the
+  dns socket alike since they share the loop per A1) accepts both. Why: the
+  GFW (since 2024-04-07) and the TSPU decrypt a version 1 Initial with the
+  RFC 9001 salt to read the sni and drop a forbidden name; both parsers key
+  on that salt, so a version 2 Initial is not decrypted and the carrier
+  survives in both countries as of 2026. quic-go v0.61.0 offers `Versions[0]`
+  in the first Initial, accepts every version listed, and on a Version
+  Negotiation packet re-dials with the first of its own list the server
+  named, so a version 1 only peer is still reached at the cost of one round
+  trip and a version 1 only client (an older app) is still accepted.
+  Decisions: one policy per owner, `QuicVersionPolicy` (`net_quic_version.go`;
+  `prefer-v2` the default, `v1`, `v2`) on `ConnectSettings` for the extender
+  carriers and the alt dialers, on `PlatformTransportSettings` for the
+  platform h3 transport, and on `ExtenderSettings` for the listener, which
+  its NLayer hop dials (A11) inherit so one switch governs a whole extender;
+  the zero value and an unknown value are the default, so a settings struct
+  built without its defaults function, or a misspelled switch, offers version
+  2 rather than disabling a carrier; the extender dial takes the offer of its
+  own connect settings, not of the platform transport whose settings size
+  its windows; the policy is applied where each config is finalized, not on
+  the http3 template alt hands down, so the bare `quic.Config` fallback of
+  `altQuicBoundedTransport` cannot leave an attempt on version 1. Carrier
+  priorities are unchanged: QUIC stays one racer among many, since version
+  2 helps in China and Russia only (QUIC is blocked outright in Iran's
+  shutdowns and volume-banned in Turkmenistan). Source port rotation: a
+  failed attempt poisons its 4-tuple for 180 s at the GFW and 420 s at the
+  TSPU; each `dialExtenderQuic` already opens its own endpoint
+  (`openExtenderPacketConn`: the injected factory, else a fresh wildcard
+  socket) and closes it on failure before any retry runs, so a retry never
+  reuses the poisoned 4-tuple and no code changed; a host that injects a
+  `PacketConnFactory` decides its own ports. quic-go's own re-dial after a
+  Version Negotiation packet stays on the same endpoint, which is right: the
+  server answered, nothing is poisoned. Not guarded: the operating system
+  reissuing a just-closed ephemeral port (random on Linux, sequential on
+  Apple platforms). The sdk inherits the default through
+  `DefaultConnectSettings`, `DefaultPlatformTransportSettings` and
+  `extender.DefaultExtenderSettings` with no change; the switch is not
+  exposed to the apps. The platform server and alt (server repo, the same
+  quic-go, no `Versions` set) accept both by quic-go's default, so the h3
+  transport and the alt dialers handshake on version 2 against them without
+  a negotiation. Tests (connect `net_quic_version_test.go`, extender
+  `extender_quic_version_test.go`), every observation on the wire bytes of
+  the client's own udp endpoint or on the version the peer negotiated: the
+  first datagram's long-header version per policy at every construction
+  site -- the extender udp carrier, the alt h3 dialer, the platform h3
+  transport -- and the peer's negotiated version; the fallback against a
+  version 1 only extender, alt and platform (version 2 first, a Version
+  Negotiation packet read, version 1 negotiated); forced `v2` against a
+  version 1 only extender failing with `VersionNegotiationError` and never
+  sending a version 1 Initial; the listener accepting what its policy lists
+  and answering a Version Negotiation packet that names the accepted
+  versions for an excluded one; the full carrier handshaking on version 2
+  against the extender fixture with no negotiation; the hop dial inheriting
+  the policy; the defaults; and the rotation, against an in-process extender
+  that refuses the first source port for good with the failed endpoint kept
+  bound, so the retry's different port is the dial's doing. With the five
+  wiring lines reverted the first datagram is `0x00000001` at every site and
+  12 of the 14 tests fail; with the endpoint memoized across dials the
+  rotation test fails on the refused retry. Phased: nothing in connect. Not
+  done: an app setting for the switch, and a wire-level test of the dns
+  carrier's offer (its datagrams are dns-encoded; it dials the same
+  `policy.quicConfig` the udp carrier is proven on).
+- **Q, directory tiers (2026-10-07).** connect: the `DirectoryTier` record
+  field, `net_extender_directory_partition.go` (keyed partitions, vantage
+  keys), `net_extender_directory_release.go` (the gated release policy and
+  the in-process ledger), `net_extender_directory_canary.go` (canary
+  placement, attribution, per-country blocked state), the directory's keyed
+  `SampleRecords`, `OpenPartitionContains`, the no-publish rule for gated
+  records, the `release` source, the feed caps of 8, the feed server's
+  vantage-bound sample and stream, the validator ignoring gated records.
+  Server, written and compile-verified but not integration-built against a
+  database (the migration is unmerged): `directory_tier` and
+  `canary_channel` on `network_extender`, the release and block-report
+  tables, the tier in every signed record, open-only drip, dns and bootstrap,
+  the keyed dns sampler, the release and block-report routes, the
+  `directory` block of `extender.yml`. Phased per R5.
+- **S, the peer-to-peer webrtc carrier (2026-10-07).** connect, on branch
+  `feat/webrtc-extender`: the STUN pool and the dtls hello mimicry (S4),
+  the carrier, its stream adapter and signaling, the record's rendezvous,
+  the directory gate, the operator probes and the extender server's stream
+  entry (S1-S3), with the tests of S7. Server, written and run against the
+  local database (no migration): the C2a acceptance, the record's
+  rendezvous and the uptime path (S5), behind a signaling seam that
+  production does not yet fill. sdk, written and its role tests run: the
+  carrier in the role under G2 (S6). Phased per S8, the operator-side
+  signaling relay first.
+
+## Design note: fingerprint-drift conformance harness (2026-10-07)
+
+A hermetic harness gates the chrome tcp/udp carriers against silent
+fingerprint drift from real Chrome. It is a new self-contained package,
+`connect/fingerprint/`, documented in its own `fingerprint/README.md` and
+linked from IPREAL.md's test section; it touches no carrier code. What it
+adds for the extender surface:
+
+- The udp carrier's QUIC Initial (section A, `net_quic_version.go`): a
+  Layer-A test (`net_quic_initial_conformance_test.go`) drives the merged
+  `QuicVersionPolicy.Versions()` — the same offer the extender udp and dns
+  carriers and the alt dialers hand quic-go — to a shared local QUIC endpoint
+  and asserts the first Initial's long-header version is the policy's first
+  offer. A silent regression of the default to a version 1 Initial, which the
+  GFW/TSPU decrypt and filter by sni, fails the test and names the version;
+  the v1-only policy is the faithful pre-version-2 revert that drifts against
+  the expected version 2. The transport parameters and CRYPTO-frame layout
+  live inside the AEAD-encrypted Initial and are the documented next increment.
+- The camouflage carrier hello (section P): a skipped placeholder
+  (`TestExtenderCamouflageHelloConformance`) names the camouflage impl branch
+  it waits on. When that branch is on origin/main the placeholder becomes the
+  real Layer-A comparison of the carrier's uTLS hello against the Chrome
+  golden, plus that the sealed session occupies the 32-byte legacy session-id
+  field and the rest matches Chrome. It is not stubbed against the dialer
+  meanwhile.
+
+Decisions: goldens are versioned and committed; the shipped golden is
+synthetic (uTLS `HelloChrome_133`, not real Chrome) and is upgraded to a
+real-Chrome capture by the opt-in Docker Layer B, gated out of `go test` by
+the `fingerprint_capture` build tag. The TCP SYN / IP TTL (JA4T) ground truth
+is the OS kernel, so Docker-Chrome yields only the Linux profile; non-Linux
+egress profiles are owner-supplied captures. Tests that prove it: the Layer-A
+version gate above, the tls client-hello gate
+(`net_tls_hello_conformance_test.go`), and the engine's own discrimination
+suite in `fingerprint/`, all hermetic and in the normal `go test`; a
+deliberately-stale golden is shown to fail the diff and the correct one to
+pass it. Phased: the per-dialer camouflage comparison and the IPREAL egress
+SYN/TTL comparison, each a skipped placeholder naming its branch.
+
+## Design note: camouflage implementation, phase 14a (2026-10-07)
+
+Phase 14a of section P (the authenticated hello and the splice, REALITY) is
+implemented in connect. This note records what landed, the decisions made while
+building it, the tests that prove each P10 property, and what is phased to 14b
+(server) and 14c (sdk). It references section P and the C2a acceptance; it does
+not restate or revise them.
+
+What landed (connect core, 14a):
+- The native reality construction (P0, P1) in `extender_reality.go`: the X25519
+  static key HKDF-derived from the ed25519 identity seed
+  (`ExtenderRealityStaticPrivateKey`/`ExtenderRealityStaticPublicKey`, info
+  `"ur-extender-reality-x25519-v1"`), the auth key
+  (`extenderRealityAuthKey`, salt `helloRandom[:20]`, info
+  `"ur-extender-reality-v1"`), the 16-byte plaintext (version `{2,0,0}`, a
+  reserved zero, the unix time, the 8-byte `ExtenderKeyId` short id), and the
+  server open (`ExtenderRealityOpenSessionId`) with the version-bound, short-id
+  and time-window checks (`ExtenderRealitySessionId{Authorized,InWindow}`). The
+  seal and the session-id offset are reused from `vless_reality.go`, not copied;
+  only the derivations, the info strings and the client version differ. xtls/
+  reality is not imported.
+- The server peek, demultiplex and splice (P2, P3, P4) in
+  `extender/extender_camouflage.go`: `peekClientHello` reassembles the first
+  handshake record or records into the complete ClientHello through
+  `utls.UnmarshalClientHello` (the package already links uTLS) without consuming
+  the bytes, which are replayed through the existing `connWithInitialBytes`; the
+  authenticated hello goes to `tls.Server` with the identity leaf and a
+  `{"http/1.1"}`-alone config; an unauthenticated hello is spliced to the real
+  borrowed site (splice on) or terminated as today (splice off). The bounded,
+  time-windowed seen-tag set closes REALITY's replay gap. The splice reuses the
+  A5 per-connection byte and idle bounds and adds the total and per-target
+  concurrent caps; a spliced byte is never added to the O1 relay counters.
+- The borrowed-names list (P5) in `net_extender_borrow.go`: a separate
+  `res/extender_borrow[_<cc>].bin` in the spoof resource's xor-masked gzip form
+  with the same per-country override, plus `VerifyExtenderBorrowDomain` for the
+  role-start verification (reachable, TLS 1.3, X25519/X25519MLKEM768, not a
+  shared CDN). No list is bundled yet, as P5 says it needs measurement first:
+  the bundled resource decodes to an empty list, which degrades the splice and
+  the client's front-name selection to the legacy path rather than breaking.
+- The client camo-first-then-legacy tcp race (P7, P8) in
+  `net_extender_camouflage.go`: folded into `dialExtenderTcp` as one dialer and
+  one carrier reservation, modelled on `raceExtenderDnsPorts`. The camouflaged
+  attempt is a faithful Chrome hello (the merged `chromeClientHelloSpec`) with
+  the sealed session id and the B3 leaf check; it is tried only when the config
+  carries a `RealityPublicKey` and the kill switch
+  `ConnectSettings.TlsClientHelloFingerprint` is not `"go"`. An attempt that the
+  server did not authenticate negotiates h2 (Phase A) or fails the B3 check
+  (Phase B), so the race falls to the legacy attempt; a refusal or limit ends the
+  race with that answer.
+
+Decisions:
+- Record field number. Section P names `RealityPublicKey` field 13, written
+  before the tiered directory and the webrtc carrier merged. Those took fields 13
+  (`DirectoryTier`) and 14 (`WebRtcClientId`), so the implemented field is 15,
+  the next free number. Old readers skip it exactly as P6 requires. This is the
+  only deviation from P's letter and it is forced by field-number collision, not
+  a design change.
+- The client ephemeral is read preferring the standalone X25519 key share
+  (group 29) over the X25519MLKEM768 hybrid (group 4588, trailing 32 bytes), on
+  both ends, so a Chrome hello that carries both agrees on one ephemeral without
+  a second ECDH.
+- The splice default resolves the borrowed name over a DoH cache on the client's
+  family and dials the result over the forward egress, with an egress-by-name
+  fallback; a test seam (`CamouflageSpliceDialContext`) overrides it for the
+  in-process fake borrowed site. Resolution is a detail that does not change the
+  P10 observables.
+- Phase A is the default (`CamouflageEnabled` off, `ExtenderCamouflageSplice`
+  off), per P3/P7.
+
+Tests (deterministic, in-process, synthetic `.example` names and the fixture's
+RFC-doc addresses; each shown failing on a faithful revert of its mechanism and
+passing with it):
+- auth ok + B3: `TestExtenderCamouflageAuthenticatedReachesDestination`.
+- ALPN (http/1.1 negotiated, not on the wire):
+  `TestExtenderCamouflageAuthenticatedNegotiatesHttp11`.
+- wrong key spliced: `TestExtenderCamouflageWrongKeySplicedPhaseB`, with the
+  crypto root cause `TestExtenderRealityOpenRejectsAWrongStaticKey`.
+- replay refused: `TestExtenderCamouflageReplaySet{RefusesReplay,EvictsOldestPastTheCap}`.
+- skew fallback: `TestExtenderCamouflageSkewedClientFallsToLegacyPhaseA` and
+  `...LosesTcpPhaseB`.
+- legacy client: `TestExtenderCamouflageLegacyClientPhase{A,B}`.
+- fragmented hello reassembled: `TestExtenderCamouflagePeekReassemblesFragmentedHello`
+  and `TestExtenderCamouflageFragmentedHelloAuthenticated`.
+- bounded splice (byte, total, per-target, and a spliced byte never counted as
+  O1 relay): `TestExtenderCamouflageSplice{ByteBound,TotalCap,PerTargetCap,NotCountedAsRelay}`.
+- the client race and kill switch: `TestRaceExtenderTcpCamouflage*`,
+  `TestExtenderCamouflageApplies`; the seal/open crypto: `TestExtenderReality*`;
+  the borrow list and verification: `TestBorrowDomains*`,
+  `TestVerifyExtenderBorrowDomain*`.
+
+Phased (not in 14a):
+- 14b server: `reality_public_key_hex` in the activation args, storing and
+  signing the key into the record, and the optional splice probe. The server
+  runtime already exposes `ExtenderServer.RealityPublicKey()` and
+  `CamouflageStats()`; the controller/model wiring and any migration are the
+  server repo's.
+- 14c sdk: the provider role deriving and publishing the static key (HKDF from
+  the identity seed, no new persistence), running `VerifyExtenderBorrowDomain`
+  at start and feeding `CamouflageBorrowNames`, `DeviceLocalSettings.DefaultCamouflage`,
+  the status counts and the bindings.
+- The fingerprint-drift harness's `TestExtenderCamouflageHelloConformance`
+  placeholder (the note above) can now be wired to the camouflaged dial's uTLS
+  hello; that is the harness owner's change, not this one.
+
+Implementation review follow-up, 2026-10-07:
+- Camouflage retirement refuses new splice admission and safely joins lazy
+  resolver construction. Hello peeking observes handler cancellation and joins
+  its callback before handing the connection to the next phase. Replay retains
+  partial record headers and bodies even when a read returns an error.
+- The splice owns cleanup before its initial write, retries short writes,
+  terminates zero-progress writes, clears the inherited hello deadline, and
+  joins its cancellation and relay workers.
+  The client race transfers ownership through an unbuffered result handoff;
+  completed losing attempts close their own connections after cancellation.
+- The WebRTC stream adapter supports concurrent net.Conn calls. Read ownership,
+  write chunk ordering, deadline changes, and close draining are coordinated;
+  close joins the drain reader and does not mistake an expired read deadline for
+  a dead association. Signaling answer delivery is nonblocking and atomic with
+  waiter retirement. Carrier shutdown cancels and joins pending dials, and offer
+  exchange receives a finite negotiation deadline.
+- Vless strategy evidence separates private configurations and rejects stale
+  attempts across replacements, including an A-to-B-to-A change. DNS synthesis
+  retains bounded, expiring per-peer EDNS capability independently of queued
+  request headers. Signed canary restrictions use record field 16 without
+  changing the merged WebRTC or camouflage field numbers.
+
+The permanent lifecycle, strategy-identity, DNS-state, and signed-record tests
+cover these root causes with synthetic fixtures and explicit ordering. This
+review preserves the phased server/SDK and empty borrowed-resource limitations
+listed above; it does not change their deployment status.

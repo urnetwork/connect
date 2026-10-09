@@ -51,9 +51,14 @@ const ExtenderActivatePath = "/network/extender-activate"
 // names are the wire and are not ours to rename.
 type ExtenderActivateArgs struct {
 	PublicKeyHex string `json:"public_key_hex"`
-	TcpPort      int    `json:"tcp_port"`
-	UdpPort      int    `json:"udp_port"`
-	DnsPort      int    `json:"dns_port"`
+	// the hex X25519 static public key of the camouflage (EXTENDER.md P1, P6),
+	// derived from the identity seed. Empty on an extender with camouflage off;
+	// an operator that predates the field ignores it (Go's decoder drops an
+	// unknown field), so activation stays non-fatal.
+	RealityPublicKeyHex string `json:"reality_public_key_hex,omitempty"`
+	TcpPort             int    `json:"tcp_port"`
+	UdpPort             int    `json:"udp_port"`
+	DnsPort             int    `json:"dns_port"`
 	// every dns port that is listening, which the operator probes one by one
 	// and the record then lists (L2). Empty leaves the operator on DnsPort
 	// alone, which is what an extender that predates the list offers.
@@ -144,6 +149,14 @@ type ExtenderActivatorSettings struct {
 	// This extender's identity key (B1), which the operator probes back
 	// against and signs the record for.
 	PublicKey []byte
+
+	// This extender's X25519 static public key of the camouflage (EXTENDER.md
+	// P1, P6), which the operator signs into the record so a client can front
+	// the tcp carrier with an authenticated hello. The role derives it from the
+	// identity seed (ExtenderRealityStaticPublicKey) and sets it only when
+	// camouflage is on and at least one borrowed name verified; empty leaves the
+	// extender on the legacy terminate path and publishes no camouflage key.
+	RealityPublicKey []byte
 
 	// The carrier ports and the encoding tld this extender serves (C1, C2).
 	// Zero ports and an empty tld take the operator's defaults.
@@ -747,6 +760,11 @@ func (self *ExtenderActivator) activateUrl(
 		DnsPorts:     self.dnsPorts(),
 		DnsTld:       self.settings.DnsTld,
 		Carriers:     carriers,
+	}
+	// publish the camouflage key only when the role set it (EXTENDER.md P6); an
+	// empty key is left off the args so an operator sees no camouflage key
+	if 0 < len(self.settings.RealityPublicKey) {
+		args.RealityPublicKeyHex = hex.EncodeToString(self.settings.RealityPublicKey)
 	}
 	ctx, cancel := context.WithTimeout(self.ctx, self.settings.RequestTimeout)
 	defer cancel()
