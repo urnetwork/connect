@@ -688,7 +688,12 @@ paths:
       summary: Auth Refresh Token
       description: |
         Refresh the client JWT (by_jwt) for the caller's client.
-        Requires a client JWT (from `/network/auth-client`).
+        Requires a client JWT (from `/network/auth-client`). A network JWT
+        (the network's sign-in token, with no client) is refused here with a
+        result `error`; renew it with `POST /auth/network-refresh`.
+
+        The refreshed JWT keeps the create time of the JWT it refreshes, so a
+        password reset that expires one expires the other.
       operationId: authRefreshToken
       security:
         - BearerAuth: []
@@ -699,6 +704,42 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RefreshTokenResult"
+
+  /auth/network-refresh:
+    post:
+      tags: [Authentication]
+      summary: Auth Network Refresh Token
+      description: |
+        Renew the network's sign-in token: a network JWT, with no client.
+        Every JWT lives 30 days. The result is a new network JWT for the same
+        network and user, with a new expiration, the network's current name
+        and its current Pro state. It keeps the create time of the JWT it
+        renews, so a password reset that expires one expires the other.
+
+        Renew a network JWT before it expires. While the server still accepts
+        expired JWTs, an expired network JWT renews too; once it does not, the
+        user signs in again.
+
+        A client JWT (`by_client_jwt`, from `POST /network/auth-client`) is
+        refused with 403, because a client JWT never obtains a network JWT;
+        refresh a client JWT with `GET /auth/refresh`. An API key does not
+        expire, and is refused with a result `error`.
+      operationId: authNetworkRefresh
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: The renewed network JWT, or an `error` (an API key).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkRefreshTokenResult"
+        "401":
+          description: |
+            Missing, invalid or expired bearer token, or one that a password
+            reset has expired. The user signs in again.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   /auth/verify-send:
     post:
@@ -14259,6 +14300,21 @@ components:
       properties:
         by_jwt:
           description: The refreshed client JWT.
+          type: string
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+
+    NetworkRefreshTokenResult:
+      type: object
+      required: []
+      properties:
+        by_jwt:
+          description: The renewed network JWT.
           type: string
         error:
           type: object
