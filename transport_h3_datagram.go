@@ -157,10 +157,12 @@ func AcceptH3DatagramAuthOffer(
 	accepted := enabled && localQuicSupport && remoteQuicSupport &&
 		auth.H3DatagramVersion == H3DatagramProtocolVersion
 	response := &protocol.Auth{
-		ByJwt:             auth.ByJwt,
-		AppVersion:        auth.AppVersion,
-		InstanceId:        bytes.Clone(auth.InstanceId),
-		H3DatagramVersion: auth.H3DatagramVersion,
+		ByJwt:              auth.ByJwt,
+		AppVersion:         auth.AppVersion,
+		ClientInfo:         auth.ClientInfo,
+		StreamLeaseVersion: auth.StreamLeaseVersion,
+		InstanceId:         bytes.Clone(auth.InstanceId),
+		H3DatagramVersion:  auth.H3DatagramVersion,
 	}
 	if accepted {
 		response.H3DatagramAcceptedVersion = H3DatagramProtocolVersion
@@ -180,6 +182,8 @@ func ValidateH3DatagramAuthResponse(
 ) (bool, error) {
 	if response == nil || response.ByJwt != request.ByJwt ||
 		response.AppVersion != request.AppVersion ||
+		response.ClientInfo != request.ClientInfo ||
+		response.StreamLeaseVersion != request.StreamLeaseVersion ||
 		!bytes.Equal(response.InstanceId, request.InstanceId) ||
 		response.H3DatagramVersion != request.H3DatagramVersion {
 		return false, fmt.Errorf("H3 auth response mismatched identity or capability offer")

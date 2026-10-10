@@ -337,7 +337,9 @@ func tryOfferPooledReceive(
 }
 
 type ClientAuth struct {
-	ByJwt string
+	ClientInfo         ClientInfo
+	StreamLeaseVersion uint32
+	ByJwt              string
 	// ClientId Id
 	InstanceId Id
 	AppVersion string
@@ -486,6 +488,8 @@ func noteBackendSuccess() {
 // type DialContextFunc func(ctx context.Context, network string, address string) (net.Conn, error)
 
 type PlatformTransportSettings struct {
+	// Nonblocking notification. Only a subsequent confirmed API rejection logs out.
+	AuthorizationClosed func(AuthorizationCloseCause)
 	// Log, when set, is used by the platform transport and its framer
 	// (used for the framer when `FramerSettings.Log` is nil, via a private
 	// copy — the caller's `FramerSettings` is never mutated).
@@ -2084,6 +2088,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			if self.settings.V2H1Auth {
 				header.Add("Authorization", fmt.Sprintf("Bearer %s", auth.ByJwt))
 				header.Add("X-UR-AppVersion", auth.AppVersion)
+				header.Set(ClientInfoHeader, auth.ClientInfo.Json())
+				header.Set("X-UR-StreamLeaseVersion", "1")
 				header.Add("X-UR-InstanceId", auth.InstanceId.String())
 				header.Add("X-UR-TransportVersion", fmt.Sprintf("%d", TransportVersion))
 				self.applyIntentHeader(header)
@@ -2115,11 +2121,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			if !self.settings.V2H1Auth {
 				authBytes, err := EncodeFrame(&protocol.Auth{
-					ByJwt:         auth.ByJwt,
-					AppVersion:    auth.AppVersion,
-					InstanceId:    auth.InstanceId.Bytes(),
-					IpFamily:      self.authIntent(),
-					ProvideIntent: auth.ProvideIntent,
+					ByJwt:              auth.ByJwt,
+					AppVersion:         auth.AppVersion,
+					ClientInfo:         auth.ClientInfo.Json(),
+					StreamLeaseVersion: 1,
+					InstanceId:         auth.InstanceId.Bytes(),
+					IpFamily:           self.authIntent(),
+					ProvideIntent:      auth.ProvideIntent,
 				}, self.settings.ProtocolVersion)
 				if err != nil {
 					return nil, err
@@ -2716,6 +2724,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						}
 						// the WebSocket close code is the second indicator of
 						// the client limit close, after the close control
+						self.noteAuthorizationClose(authorizationCloseCause(err))
 						if isClientLimitCloseError(err) {
 							self.noteClientLimitClose(TransportModeH1, auth.ProvideIntent, clientLimitResetGeneration)
 						}
@@ -2753,6 +2762,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 									// limit reason holds the client's dials, and
 									// any other reason is an ordinary close
 									reason, _ := transportCloseReason(message)
+									self.noteAuthorizationClose(validAuthorizationClose(int(reason) + 4000))
 									MessagePoolReturn(message)
 									if reason == TransportCloseReasonClientLimitExceeded {
 										self.noteClientLimitClose(TransportModeH1, auth.ProvideIntent, clientLimitResetGeneration)
@@ -2916,11 +2926,13 @@ func (self *PlatformTransport) runH3(
 			// the frame form of the h1 provide intent header
 			// (transport_provide_intent.go)
 			authMessage := &protocol.Auth{
-				ByJwt:         auth.ByJwt,
-				AppVersion:    auth.AppVersion,
-				InstanceId:    auth.InstanceId.Bytes(),
-				IpFamily:      self.authIntent(),
-				ProvideIntent: auth.ProvideIntent,
+				ByJwt:              auth.ByJwt,
+				AppVersion:         auth.AppVersion,
+				ClientInfo:         auth.ClientInfo.Json(),
+				StreamLeaseVersion: 1,
+				InstanceId:         auth.InstanceId.Bytes(),
+				IpFamily:           self.authIntent(),
+				ProvideIntent:      auth.ProvideIntent,
 			}
 			SetH3DatagramAuthOffer(authMessage, self.settings.EnableH3Datagrams)
 			authBytes, err := EncodeFrame(authMessage, self.settings.ProtocolVersion)
@@ -3101,6 +3113,7 @@ func (self *PlatformTransport) runH3(
 			// handshake, before the auth exchange completes. That is no
 			// backend failure: the loop parks in waitDialAdmission for the
 			// hold instead
+			self.noteAuthorizationClose(authorizationCloseCause(err))
 			if isClientLimitCloseError(err) {
 				self.noteClientLimitClose(ptMode, auth.ProvideIntent, clientLimitResetGeneration)
 				hadConnection = true
@@ -3331,6 +3344,7 @@ func (self *PlatformTransport) runH3(
 				// CloseWithError returns once the connection is closed, and
 				// the first close wins its cause: the platform's client limit
 				// close reads here whichever worker saw it first
+				self.noteAuthorizationClose(authorizationCloseCause(context.Cause(conn.Context())))
 				if isClientLimitCloseError(context.Cause(conn.Context())) {
 					self.noteClientLimitClose(ptMode, auth.ProvideIntent, clientLimitResetGeneration)
 				}

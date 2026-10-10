@@ -29,9 +29,6 @@ func deviceNumber(number uint64) Device {
 	return Device{Major: uint32((number>>8)&0xfff | (number>>32)&0xfffff000), Minor: uint32(number&0xff | (number>>12)&0xffffff00)}
 }
 
-// Daemon custody may not share the device of the root filesystem.
-func rootFilesystem(selected Mount, root Mount) bool { return selected.Device == root.Device }
-
 // Filesystem type constants have exactly the same daemon/owner-local meaning.
 func filesystemMagic(name string) int64 {
 	switch name {

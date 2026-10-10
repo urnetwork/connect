@@ -32,7 +32,8 @@ type StreamManagerSettings struct {
 }
 
 type StreamManager struct {
-	ctx context.Context
+	authorization *streamAuthorizationState
+	ctx           context.Context
 
 	client *Client
 
@@ -57,6 +58,9 @@ type StreamManager struct {
 
 // Close retires stream admission and requests teardown without waiting.
 func (self *StreamManager) Close() {
+	if self.authorization != nil {
+		self.closeAuthorizations()
+	}
 	self.streamBuffer.Close()
 }
 
@@ -69,6 +73,7 @@ func (self *StreamManager) closeAndWait(ctx context.Context) error {
 
 func NewStreamManager(ctx context.Context, client *Client, webRtcManager *WebRtcManager, streamManagerSettings *StreamManagerSettings) *StreamManager {
 	streamManager := &StreamManager{
+		authorization:         newStreamAuthorizationState(),
 		ctx:                   ctx,
 		client:                client,
 		streamManagerSettings: streamManagerSettings,
@@ -237,18 +242,20 @@ func (self *StreamManager) reconsiderRejectedStreamOpens() {
 				p.rejected.destinationId,
 			)
 		}
-		if _, err := self.streamBuffer.OpenStream(
-			p.rejected.sourceId,
-			p.rejected.destinationId,
-			p.streamId,
-		); err != nil {
-			self.client.log.Infof(
-				"[sm]%s reconsider s(%s) open err = %s\n",
-				self.client.ClientTag(),
+		self.withStreamAuthorization(p.streamId, func() {
+			if _, err := self.streamBuffer.OpenStream(
+				p.rejected.sourceId,
+				p.rejected.destinationId,
 				p.streamId,
-				err,
-			)
-		}
+			); err != nil {
+				self.client.log.Infof(
+					"[sm]%s reconsider s(%s) open err = %s\n",
+					self.client.ClientTag(),
+					p.streamId,
+					err,
+				)
+			}
+		})
 	}
 }
 
@@ -307,6 +314,19 @@ func (self *StreamManager) Receive(source TransferPath, frames []*protocol.Frame
 
 func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 	switch frame.MessageType {
+	case protocol.MessageType_TransferStreamAuthorization:
+		message, err := FromFrame(frame)
+		if err != nil {
+			return err
+		}
+		value := message.(*protocol.StreamAuthorization)
+		id, err := IdFromBytes(value.StreamId)
+		if err != nil {
+			return nil
+		}
+		if value.Retired {
+			self.retireStreamAuthorization(id, value.AuthorizationGeneration)
+		}
 	case protocol.MessageType_TransferStreamOpen, protocol.MessageType_TransferStreamClose, protocol.MessageType_TransferStreamReset:
 		if message, err := FromFrame(frame); err == nil {
 
@@ -338,42 +358,42 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 				if err != nil {
 					return err
 				}
-				if !self.allowStreamOpen(sourceId, destinationId) {
-					// Retained so the first verified Network contract or peer
-					// update from this identity can reconsider it. The proof
-					// can legitimately arrive after the StreamOpen.
-					self.retainRejectedStreamOpen(sourceId, destinationId, streamId)
-					logged := false
-					self.rejectedStreamLogOnce.Do(func() {
-						logged = true
-						self.client.log.Infof(
-							"[sm]%s reject disabled provider s(%s) source=%v destination=%v (retained for reconsideration)\n",
-							self.client.ClientTag(),
-							streamId,
-							sourceId,
-							destinationId,
-						)
-					})
-					if !logged && self.client.log.V(1).Enabled() {
-						self.client.log.Infof(
-							"[sm]%s reject disabled provider s(%s) source=%v destination=%v\n",
-							self.client.ClientTag(),
-							streamId,
-							sourceId,
-							destinationId,
-						)
+				return self.authorizeStreamOpen(v, func() error {
+					if !self.allowStreamOpen(sourceId, destinationId) {
+						// Retained so the first verified Network contract or peer
+						// update from this identity can reconsider it. The proof
+						// can legitimately arrive after the StreamOpen.
+						self.retainRejectedStreamOpen(sourceId, destinationId, streamId)
+						logged := false
+						self.rejectedStreamLogOnce.Do(func() {
+							logged = true
+							self.client.log.Infof(
+								"[sm]%s reject disabled provider s(%s) source=%v destination=%v (retained for reconsideration)\n",
+								self.client.ClientTag(),
+								streamId,
+								sourceId,
+								destinationId,
+							)
+						})
+						if !logged && self.client.log.V(1).Enabled() {
+							self.client.log.Infof(
+								"[sm]%s reject disabled provider s(%s) source=%v destination=%v\n",
+								self.client.ClientTag(),
+								streamId,
+								sourceId,
+								destinationId,
+							)
+						}
+						return nil
 					}
-					return nil
-				}
-				self.forgetRejectedStreamOpen(streamId)
+					self.forgetRejectedStreamOpen(streamId)
 
-				if self.client.log.V(1).Enabled() {
-					self.client.log.Infof("[sm]%s open s(%s) %v->%v\n", self.client.ClientTag(), streamId, sourceId, destinationId)
-				}
-				if _, err := self.streamBuffer.OpenStream(sourceId, destinationId, streamId); err != nil {
+					if self.client.log.V(1).Enabled() {
+						self.client.log.Infof("[sm]%s open s(%s) %v->%v\n", self.client.ClientTag(), streamId, sourceId, destinationId)
+					}
+					_, err := self.streamBuffer.OpenStream(sourceId, destinationId, streamId)
 					return err
-				}
-				return nil
+				})
 			}
 
 			switch v := message.(type) {
@@ -394,8 +414,7 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 				}
 				// The platform retired this hop; a later proof must not
 				// resurrect it.
-				self.forgetRejectedStreamOpen(streamId)
-				self.streamBuffer.CloseStream(streamId)
+				self.retireStreamAuthorization(streamId, v.AuthorizationGeneration)
 
 			case *protocol.StreamReset:
 				// reconcile instead of tear down:
@@ -409,7 +428,7 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 					if err != nil {
 						continue
 					}
-					if !self.allowStreamOpen(sourceId, destinationId) {
+					if !self.allowStreamOpen(sourceId, destinationId) || !self.streamAuthorizationActive(streamId) {
 						continue
 					}
 					keep[newStreamSequenceId(sourceId, destinationId, streamId)] = true
@@ -417,6 +436,13 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 				if self.client.log.V(1).Enabled() {
 					self.client.log.Infof("[sm]%s reset streams = %d\n", self.client.ClientTag(), len(v.Streams))
 				}
+				authorizations := map[Id]bool{}
+				for _, open := range v.Streams {
+					if id, err := IdFromBytes(open.StreamId); err == nil {
+						authorizations[id] = true
+					}
+				}
+				self.retireAbsentAuthorizations(authorizations)
 				self.streamBuffer.ResetStreams(keep)
 				for _, m := range v.Streams {
 					if err := streamOpen(m); err != nil {

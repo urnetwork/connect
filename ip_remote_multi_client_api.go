@@ -840,6 +840,7 @@ func (self *ApiMultiClientGenerator) NewClientArgsContext(ctx context.Context) (
 		}
 
 		clientAuth := &ClientAuth{
+			ClientInfo: ClientInfoFromContext(self.ctx), StreamLeaseVersion: 1,
 			ByJwt:      byJwtStr,
 			InstanceId: NewId(),
 			AppVersion: self.appVersion,
@@ -886,6 +887,7 @@ func (self *ApiMultiClientGenerator) NewClientArgsForDestinationContext(ctx cont
 		return &MultiClientGeneratorClientArgs{
 			ClientId: identity.ClientId,
 			ClientAuth: &ClientAuth{
+				ClientInfo: ClientInfoFromContext(self.ctx), StreamLeaseVersion: 1,
 				ByJwt:      identity.ByJwt,
 				InstanceId: identity.InstanceId,
 				AppVersion: self.appVersion,
