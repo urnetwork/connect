@@ -102,15 +102,15 @@ func TestWindowPathWindowMismatchChanges(t *testing.T) {
 
 // The reference and delivery arms use identical endpoint limits and offered
 // traffic. Only the window and pacing rule differs.
-func checkWindowMismatchCell(t *testing.T, cell windowPathCell) {
+func checkWindowMismatchCell(t *testing.T, cell windowPathCell, observe ...func(windowPathCell, *Client, *Client)) windowPathReading {
 	t.Helper()
-	checkWindowMismatchCellWithMinimumDuration(t, cell, time.Second)
+	return checkWindowMismatchCellWithMinimumDuration(t, cell, time.Second, observe...)
 }
 
 // The pairwise sweep uses the same short-path floor as the adjacent path
 // matrix. Window-limited flights retain twenty full residences; callers that
 // measure changing budgets keep their original one-second minimum.
-func checkWindowMismatchCellWithMinimumDuration(t *testing.T, cell windowPathCell, minimumDuration time.Duration) {
+func checkWindowMismatchCellWithMinimumDuration(t *testing.T, cell windowPathCell, minimumDuration time.Duration, observe ...func(windowPathCell, *Client, *Client)) windowPathReading {
 	t.Helper()
 	cell.Budget, cell.Payload = mib(48), 1280
 	cell.RoundRobinOffer = true
@@ -136,7 +136,7 @@ func checkWindowMismatchCellWithMinimumDuration(t *testing.T, cell windowPathCel
 				trial.CalibrationWindow = min(cell.SendWindow, finalReceive)
 				trial.ReceiveWindow, trial.ReceiveWindowAfter = finalReceive, 0
 			}
-			reading := measureWindowPathCell(t, trial, duration)
+			reading := measureWindowPathCell(t, trial, duration, observe...)
 			logWindowServiceReading(t, reading)
 			if arm == "ceiling" {
 				ceiling = reading
@@ -150,4 +150,5 @@ func checkWindowMismatchCellWithMinimumDuration(t *testing.T, cell windowPathCel
 	if ceiling.Mbps < .85*min(float64(cell.Rate), windowRate)*8/1e6 || fixed.Mbps < .90*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.Window.Window > min(cell.SendWindow, finalReceive) || fixed.MeasurementRelayDrops != 0 || fixed.Receiver.ReceiveQueueDropCount != 0 || fixed.Receiver.ReceiveQueueEvictionCount != 0 {
 		t.Error("mismatched windows lost attainable capacity, violated a limit, dropped data or stalled a flow")
 	}
+	return fixed
 }

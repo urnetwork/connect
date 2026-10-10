@@ -110,9 +110,9 @@ func (self *SendSequence) retainedSendPackByteCountWithContractBytes(pack *SendP
 		frameCount = nextSendGroupChunkEndWithLimits(pack.Frames, pack.groupFrameIndex,
 			maxFrames, maxMessageByteCount) - pack.groupFrameIndex
 	}
-	return (&sendItem{}).retainedMemoryByteCount(
+	return addReceiveQueueByteCount(pack.dispositionRange(0, len(frames)).memoryByteCount(), (&sendItem{}).retainedMemoryByteCount(
 		addReceiveQueueByteCount(pack.nextSerializedMessageByteCount(), 512+32*ByteCount(frameCount)+contractBytes),
-		frameCount, self.sendBufferSettings.ProtocolVersion < 2)
+		frameCount, self.sendBufferSettings.ProtocolVersion < 2))
 }
 
 func (self *SendSequence) retainedSendPackFits(pack *SendPack) bool {

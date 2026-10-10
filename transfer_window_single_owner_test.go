@@ -33,10 +33,17 @@ import (
 // which is exact for this file's formatting (gofmt puts every declaration at
 // column zero) and would need a real parser if that changed.
 func TestTheWindowHasOneOwner(t *testing.T) {
-	source, err := os.ReadFile("transfer.go")
-	if err != nil {
-		t.Fatalf("read transfer.go: %v", err)
+	// Go's build overlay does not redirect runtime source reads. The private
+	// source gate binds this path explicitly; ordinary integration reads live source.
+	sourcePath := os.Getenv("CONNECT_TEST_WINDOW_OWNER_SOURCE")
+	if sourcePath == "" {
+		sourcePath = "transfer.go"
 	}
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", sourcePath, err)
+	}
+	t.Logf("window source: %s", sourcePath)
 	lines := strings.Split(string(source), "\n")
 
 	// the function each line belongs to, derived by scanning back to the
@@ -134,8 +141,8 @@ func TestTheWindowHasOneOwner(t *testing.T) {
 		}
 	}
 
-	// and the positive half: the estimator is reached by the two consumers
-	// that need a window, admission and the stats snapshot
+	// The same estimator serves admission, its physical pacing projection,
+	// and read-only statistics; no consumer duplicates window arithmetic.
 	consumers := map[string]bool{}
 	for i, line := range lines {
 		if strings.Contains(line, "estimateSendWindow(") &&
@@ -145,9 +152,9 @@ func TestTheWindowHasOneOwner(t *testing.T) {
 		}
 	}
 	t.Logf("window consumers: %v", consumers)
-	if len(consumers) != 2 || !consumers["sendWindowEstimate"] || !consumers["sendWindowSnapshot"] {
+	if len(consumers) != 3 || !consumers["sendWindowEstimate"] || !consumers["sendWindowPacingEstimate"] || !consumers["sendWindowSnapshot"] {
 		t.Errorf(
-			"%d functions reach the window arithmetic; admission and the read-only stats snapshot must each use its sole owner",
+			"%d functions reach the window arithmetic; admission, physical pacing and read-only statistics must use the same owner",
 			len(consumers),
 		)
 	}

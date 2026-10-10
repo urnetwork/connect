@@ -10,6 +10,7 @@ import "time"
 type windowServiceAckTiming struct {
 	receivedAtNanos int64
 	receiverDelay   time.Duration
+	headSentAtNanos int64
 }
 
 // Every credited envelope retains the earliest physical offer in its group.
@@ -17,7 +18,13 @@ type windowServiceAckTiming struct {
 type windowServiceAckCredit struct {
 	bytes                  ByteCount
 	firstSentAtNanos       int64
+	lastSentAtNanos        int64
+	maximumOfferGap        time.Duration
+	offerRecorded          bool
+	offerComplete          bool
+	receiverTimingObserved bool
 	receiverTiming         windowServiceAckTiming
+	receiverHeadAtNanos    int64
 	receiverTimingEligible bool
 	receiverHeldPrefix     bool
 }
@@ -29,12 +36,22 @@ func (self *windowServiceAckCredit) add(other windowServiceAckCredit) {
 	}
 	if self.bytes == 0 {
 		self.receiverTimingEligible = other.receiverTimingEligible
+		self.offerComplete = other.offerComplete
+		self.maximumOfferGap = other.maximumOfferGap
 	} else {
 		self.receiverTimingEligible = self.receiverTimingEligible && other.receiverTimingEligible
+		self.offerComplete = self.offerComplete && other.offerComplete
+		// Overlapping summaries may fill an old gap, but never erase it.
+		gap := max(int64(0), other.firstSentAtNanos-self.lastSentAtNanos,
+			self.firstSentAtNanos-other.lastSentAtNanos)
+		self.maximumOfferGap = max(self.maximumOfferGap, other.maximumOfferGap, time.Duration(gap))
 	}
 	if self.bytes == 0 || other.firstSentAtNanos < self.firstSentAtNanos {
 		self.firstSentAtNanos = other.firstSentAtNanos
 	}
+	self.lastSentAtNanos = max(self.lastSentAtNanos, other.lastSentAtNanos)
+	self.offerRecorded = self.offerRecorded || other.offerRecorded
+	self.receiverTimingObserved = self.receiverTimingObserved || other.receiverTimingObserved
 	self.receiverHeldPrefix = self.receiverHeldPrefix || other.receiverHeldPrefix
 	self.bytes += other.bytes
 }
@@ -46,6 +63,9 @@ func (self *windowServiceAckCredit) addItemWithLock(item *sendItem) {
 	}
 	item.serviceCreditObserved = true
 	self.add(windowServiceAckCredit{bytes: item.pacingByteCount, firstSentAtNanos: item.pacingSentAtNanos,
+		lastSentAtNanos: item.pacingSentAtNanos, offerRecorded: true,
+		offerComplete: item.pacingSentAtNanos > 0 && item.sendCount == 1 && item.rttH1 &&
+			(item.rttState == sendItemRttWriteConfirmed || item.rttState == sendItemRttObserved),
 		receiverTimingEligible: item.rttH1 && (item.rttState == sendItemRttWriteConfirmed || item.rttState == sendItemRttObserved)})
 }
 
@@ -78,6 +98,7 @@ func (self *SendSequence) publishAckServiceCreditWithTiming(messageId Id, select
 	credit := windowServiceAckCredit{}
 	headCredited := false
 	headByteCount := ByteCount(0)
+	headSentAtNanos := int64(0)
 	func() {
 		self.resendQueue.stateLock.Lock()
 		defer self.resendQueue.stateLock.Unlock()
@@ -88,6 +109,7 @@ func (self *SendSequence) publishAckServiceCreditWithTiming(messageId Id, select
 		}
 		headCredited = !item.serviceCreditObserved && item.pacingByteCount > 0
 		headByteCount = item.pacingByteCount
+		headSentAtNanos = item.pacingSentAtNanos
 		if selective {
 			credit.addItemWithLock(item)
 			return
@@ -117,11 +139,20 @@ func (self *SendSequence) publishAckServiceCreditWithTiming(messageId Id, select
 		}
 		self.serviceAckHeadNumber, self.serviceAckHeadSet = head, true
 	}()
+	credit.receiverTimingObserved = timing.receivedAtNanos != 0 && timing.receivedAtNanos == at.UnixNano()
+	// The validated head retains its own arrival boundary even when its
+	// wait cannot retime every byte in the newly acknowledged prefix.
+	if headCredited && timing.receivedAtNanos == at.UnixNano() && timing.receivedAtNanos > 0 &&
+		timing.receiverDelay >= 0 && int64(timing.receiverDelay) <= timing.receivedAtNanos &&
+		headSentAtNanos > 0 && headSentAtNanos <= timing.receivedAtNanos-int64(timing.receiverDelay) {
+		credit.receiverHeadAtNanos = timing.receivedAtNanos - int64(timing.receiverDelay)
+	}
 	// A relayed head can arrive before an earlier sequence hole. Its own
 	// wait cannot remove time spent receiving that newly credited prefix.
 	if headCredited && credit.receiverTimingEligible && (timing.receiverDelay == 0 || credit.bytes == headByteCount) &&
 		timing.receivedAtNanos != 0 && timing.receivedAtNanos == at.UnixNano() {
 		credit.receiverTiming = timing
+		credit.receiverTiming.headSentAtNanos = headSentAtNanos
 	}
 	// Refusing to retime a multi-item prefix must not discard evidence that
 	// it was held behind a hole or receiver backpressure. Its raw release is
@@ -156,5 +187,5 @@ func (self *SendSequence) observePacingServiceCredit(credit windowServiceAckCred
 		service.receiverHeldPrefixAtNanos = max(service.receiverHeldPrefixAtNanos, at.UnixNano())
 	}
 	service.observeAggregateDeliveryWithLock(credit, at)
-	service.observeAckWithLock(credit.bytes, at, credit.receiverTiming)
+	service.observeAckWithLock(credit, at)
 }

@@ -15,6 +15,11 @@ import (
 func runWindowPacingLifetimeFeedback(t *testing.T, selective bool) {
 	t.Helper()
 	runWindowRetryClockFixture(t, 4*time.Second, 500*time.Millisecond, func(t *testing.T, fixture *windowRetryClockFixture) {
+		// ACK preemption can re-inspect recovery without another physical
+		// write. These rows must not pause inside that inspection hook.
+		resumeSecondDue := make(chan struct{})
+		close(resumeSecondDue)
+		fixture.resumeSecondDue = resumeSecondDue
 		older := fixture.sequence.resendQueue.PeekFirst()
 		olderId := older.messageId
 		time.Sleep(100 * time.Millisecond)

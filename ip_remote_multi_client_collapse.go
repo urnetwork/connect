@@ -2,8 +2,8 @@ package connect
 
 // A value copied into the existing send completion closure, not a separately
 // allocated recovery owner. It records only a flow and its admission epoch;
-// it retains no IP bytes or frame. An unwritten expiry invalidates proof rather
-// than pretending the byte range remains owned by a selected Transfer queue.
+// it retains no IP bytes or frame. An explicit unwritten failure invalidates
+// proof rather than pretending the byte range remains owned by Transfer.
 type tcpCollapseAdmission struct {
 	update *multiClientChannelUpdate
 	epoch  uint64
@@ -38,19 +38,35 @@ func (admission *tcpSynAdmission) clear() {
 	*admission = tcpSynAdmission{}
 }
 
-func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChannelUpdate) {
+func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChannelUpdate, parents ...*RemoteUserNatMultiClient) bool {
 	update.stateLock.Lock()
+	if len(parents) != 0 {
+		update.sequenceParent = parents[0]
+	}
 	admission := tcpCollapseAdmission{update: update, epoch: update.sequenceAdmissionEpoch}
 	// Only an actually different generation needs pre-commit response proof.
 	// Generation identity survives coverage revocation and provider rebinding.
 	seen, sequence := update.synGenerationSeen, update.synGenerationNumber
 	hasPriorState := seen || update.sequencePacketCount != 0
 	newGeneration := false
+	hasSyn := false
 	for i := range group.packets {
 		path := group.packets[i].ipPath
 		if path.Syn {
+			hasSyn = true
 			newGeneration = newGeneration || hasPriorState && (!seen || sequence != path.SequenceNumber)
 			seen, sequence, hasPriorState = true, path.SequenceNumber, true
+		}
+	}
+	if hasSyn && len(parents) != 0 {
+		if update.IsDone() {
+			update.stateLock.Unlock()
+			return false
+		}
+		// The existing send defer releases this scalar; no descriptor is
+		// linked and no bytes are reserved before successful admission.
+		if group.completionFlags.Or(groupCompletionSynOffer)&groupCompletionSynOffer == 0 {
+			update.sequenceSynOffers++
 		}
 	}
 	if newGeneration {
@@ -66,6 +82,7 @@ func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChan
 	for i := range group.packets {
 		group.packets[i].collapseAdmission = admission
 	}
+	return true
 }
 
 // Established non-SYN ingress keeps its lock-free fast path. First response
@@ -104,7 +121,8 @@ func (update *multiClientChannelUpdate) markReceivedInboundWithLock(client *mult
 }
 
 func (admission tcpCollapseAdmission) complete(err error) {
-	if admission.update == nil || !packetTransferExpiredUnwritten(err) {
+	if admission.update == nil ||
+		!packetTransferExpiredUnwritten(err) && !sendPackFailedUnwritten(err) {
 		return
 	}
 	update := admission.update
@@ -137,9 +155,13 @@ func (update *multiClientChannelUpdate) sequenceCoversWithLock(packet *parsedPac
 // Keep a single contiguous accepted interval inline. Overlap and adjacency
 // merge; a disjoint range replaces the proof instead of covering the gap.
 // Pure ACKs retain their own point and do not erase existing data coverage.
-func (update *multiClientChannelUpdate) updateSequenceCoverageWithLock(packet *parsedPacket) bool {
+func (update *multiClientChannelUpdate) updateSequenceCoverageWithLock(packet *parsedPacket, payloadByteCounts ...int) bool {
 	start := packet.ipPath.SequenceNumber
-	end := tcpPacketNextSequenceNumber(packet.ipPath, packet.payload)
+	payloadByteCount := len(packet.payload)
+	if len(payloadByteCounts) != 0 {
+		payloadByteCount = payloadByteCounts[0]
+	}
+	end := tcpPacketNextSequenceNumberWithPayloadByteCount(packet.ipPath, payloadByteCount)
 	if start == end {
 		changed := !update.sequenceAckPositionSeen || update.sequenceAckPosition != start
 		update.sequenceAckPosition, update.sequenceAckPositionSeen = start, true

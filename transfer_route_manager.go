@@ -361,6 +361,9 @@ type transferWriteDisposition struct {
 	initialWaitDuration time.Duration
 }
 
+// A policy mismatch consumes no share and performs no dispatch observation.
+var errTransferRoutePolicyChanged = errors.New("transfer route policy changed")
+
 type transferCarrierMultiRouteWriter interface {
 	writeDetailedWithCarrier(
 		ctx context.Context,
@@ -1662,6 +1665,10 @@ type transferFlightPolicySnapshot struct {
 	flowIsolation bool
 	flowReserve   bool
 	h1Only        bool
+	// Dispatch eligibility is narrower than the aggregate grouping policy.
+	// Both facts come from this generation and preserve existing affinity.
+	h1WriteOnly         bool
+	h1ReliableWriteOnly bool
 	// reliableRouteAvailable is true while at least one active carrier is not
 	// potentially unreliable. A full unreliable flight then writes the
 	// overflow reliable-only instead of gating the whole sequence.
@@ -1680,6 +1687,8 @@ func (self *MultiRouteSelector) transferFlightPolicy() transferFlightPolicySnaps
 		flowIsolation:          snapshot.unreliableFlowIsolation,
 		flowReserve:            snapshot.unreliableFlowReserve,
 		h1Only:                 snapshot.h1Only,
+		h1WriteOnly:            snapshot.writeH1Only(false),
+		h1ReliableWriteOnly:    snapshot.writeH1Only(true),
 		reliableRouteAvailable: 0 < len(snapshot.reliableRoutes),
 		notify:                 snapshot.notify,
 	}
@@ -1832,6 +1841,27 @@ func (self *routeSnapshot) writeRoutesFor(
 		return self.writeRoutesReliableOnly()
 	}
 	return self.writeRoutesForTransport(preferredTransportType)
+}
+
+// Classify the exact ordinary/reliable-only write set without shuffling or
+// allocating it. Bound SendSequence writes use no transport-type preference;
+// reply affinities and priority lanes keep their separate selection contract.
+func (self *routeSnapshot) writeH1Only(reliableOnly bool) bool {
+	if reliableOnly && len(self.reliableRoutes) > 0 {
+		if self.preferDirectRoute != nil && !self.routeCarrierProperties[self.preferDirectRoute].Unreliable {
+			return self.transportType(self.preferDirectRoute) == TransportTypeH1
+		}
+		for _, route := range self.reliableRoutes {
+			if self.transportType(route) != TransportTypeH1 {
+				return false
+			}
+		}
+		return true
+	}
+	if self.preferDirectRoute != nil {
+		return self.transportType(self.preferDirectRoute) == TransportTypeH1
+	}
+	return self.h1Only
 }
 
 // writeRoutesForTransport keeps a reply eligible for every active carrier of
@@ -2936,6 +2966,37 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicy(
 	preferredTransportType TransportType,
 	reliableOnly bool,
 ) (bool, transferWriteDisposition, error) {
+	return self.writeDetailedWithRoutePolicyGeneration(ctx, transferFrameBytes, timeout, preferredTransportType, reliableOnly, 0, false, nil)
+}
+
+// A retained selector snapshot remains the dispatch lifetime boundary. A new
+// snapshot requires owner revalidation instead of silently changing carriers.
+// Takes transferFrameBytes on success; failure, including a policy mismatch,
+// leaves that same unconsumed share with the caller.
+func (self *MultiRouteSelector) writeDetailedWithPolicyGeneration(
+	ctx context.Context,
+	transferFrameBytes []byte,
+	timeout time.Duration,
+	reliableOnly bool,
+	generation uint64,
+	beforeWrite func(),
+) (bool, transferWriteDisposition, error) {
+	return self.writeDetailedWithRoutePolicyGeneration(ctx, transferFrameBytes, timeout, TransportTypeUnknown, reliableOnly, generation, true, beforeWrite)
+}
+
+// Legacy callers keep the same acquisition and timeout semantics. The optional
+// generation check uses the existing snapshot and adds no worker or lock.
+// Takes transferFrameBytes only on success; every failure leaves it with the caller.
+func (self *MultiRouteSelector) writeDetailedWithRoutePolicyGeneration(
+	ctx context.Context,
+	transferFrameBytes []byte,
+	timeout time.Duration,
+	preferredTransportType TransportType,
+	reliableOnly bool,
+	generation uint64,
+	checkGeneration bool,
+	beforeWrite func(),
+) (bool, transferWriteDisposition, error) {
 	enterTime := time.Now()
 	preferredBlockedObserved := false
 
@@ -2943,6 +3004,13 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicy(
 	// writer selector and writes its ordered stream serially; the mutex below is
 	// only needed when a write must retain and reuse the selector timer.
 	initialSnapshot := self.acquireWriterSnapshot()
+	if checkGeneration && initialSnapshot.generation != generation {
+		initialSnapshot.releaseWriter()
+		return false, transferWriteDisposition{}, errTransferRoutePolicyChanged
+	}
+	if beforeWrite != nil {
+		beforeWrite()
+	}
 	initialRoutes := initialSnapshot.writeRoutesFor(preferredTransportType, reliableOnly)
 	if self.log.V(2).Enabled() {
 		self.log.Infof("[mrw] %s->%s s(%s) routes = %d\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId, len(initialRoutes))
@@ -2999,6 +3067,13 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicy(
 		// lock-free snapshot instead of taking the selector and monitor locks
 		// on every packet
 		snapshot := self.acquireWriterSnapshot()
+		if checkGeneration && snapshot.generation != generation {
+			snapshot.releaseWriter()
+			return false, transferWriteDisposition{}, errTransferRoutePolicyChanged
+		}
+		if beforeWrite != nil {
+			beforeWrite()
+		}
 		notify := snapshot.notify
 		activeRoutes := snapshot.writeRoutesFor(preferredTransportType, reliableOnly)
 

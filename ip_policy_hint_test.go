@@ -4,7 +4,6 @@
 package connect
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"testing"
@@ -222,6 +221,7 @@ func TestMultiClientRouteOverrideFlowNotResetOnDrop(t *testing.T) {
 	for i := 0; i < 3; i += 1 {
 		policyRejectSend(multi, IpProtocolTcp, sourcePort, false, encryptedPayload(512))
 	}
+	multi.waitLocal(t, 4)
 	if packets := capture.take(); len(packets) != 0 {
 		t.Fatalf("a locally routed flow received %d rejects", len(packets))
 	}
@@ -242,7 +242,8 @@ func TestMultiClientFirstDropGroupPathResets(t *testing.T) {
 		for i, packet := range packets {
 			pooled[i] = MessagePoolCopy(packet)
 		}
-		multi.SendPacketBatch(SourceId(NewId()), protocol.ProvideMode_Public, pooled, 0)
+		// The batch API consumes every input, including rejected groups.
+		multi.SendPacketBatch(multi.source, protocol.ProvideMode_Public, pooled, 0)
 	}
 	craft := func(port int, syn bool, payload []byte) []byte {
 		return craftSecurityPacket(IpProtocolTcp, policyRejectSourceIp, port, policyRejectDestinationIp, policyRejectPort, syn, payload)
@@ -263,14 +264,9 @@ func TestMultiClientFirstDropGroupPathResets(t *testing.T) {
 // exactly as before when the hint cache is off.
 func TestMultiClientPolicyHintsDisabled(t *testing.T) {
 	capture := &policyRejectCapture{}
-	settings := DefaultMultiClientSettings()
-	settings.EventEpoch = 10 * time.Millisecond
-	settings.HeartbeatInterval = 0
-	settings.ProviderProbe = false
-	settings.IpAssocSettings = nil
-	settings.PolicyHintTtl = 0
-	multi := NewRemoteUserNatMultiClient(context.Background(), &testingEmptyMultiClientGenerator{}, capture.receive, protocol.ProvideMode_Public, settings)
-	defer multi.Close()
+	multi := newPolicyRejectMulti(t, capture, false, func(settings *MultiClientSettings) {
+		settings.PolicyHintTtl = 0
+	})
 	policyRejectEncryptedTcpFlow(t, multi, capture, 47031)
 	policyRejectSend(multi, IpProtocolTcp, 47032, true, nil)
 	if packets := capture.take(); len(packets) != 0 {

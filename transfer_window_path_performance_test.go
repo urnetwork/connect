@@ -327,7 +327,134 @@ func TestWindowPathSlowLinkKeepsCapacity(t *testing.T) {
 	}
 }
 
+// Value snapshots belong to the fixture owner; they retain no packet or error.
+type windowReferenceCompletionSnapshot struct {
+	Started     uint64
+	FirstWrites uint64
+	Successes   uint64
+	Errors      uint64
+}
+
+// Callbacks only increment the chosen phase's atomic value counters.
+type windowReferenceCompletionCounts struct {
+	started     atomic.Uint64
+	firstWrites atomic.Uint64
+	successes   atomic.Uint64
+	errors      atomic.Uint64
+}
+
+// A nullable per-fixture observer keeps the default per-Packet path unchanged.
+// Phase selection precedes publication; snapshots wait for the existing join.
+type windowReferenceCompletions struct {
+	cleanup      atomic.Bool
+	phases       [2]windowReferenceCompletionCounts
+	preCleanup   windowReferenceCompletionSnapshot
+	afterCleanup windowReferenceCompletionSnapshot
+	joined       bool
+}
+
+// Install only before NewClient. Nil leaves the existing observer untouched.
+func (self *windowReferenceCompletions) configure(settings *SendBufferSettings) {
+	if self != nil {
+		settings.SendPackLifecycleObserver = self.observe
+	}
+}
+
+// No payload, client, callback error, timer, goroutine or per-event allocation.
+func (self *windowReferenceCompletions) observe(event SendPackLifecycleObservation) {
+	if event.MessageType != protocol.MessageType_IpIpPacketFromProvider {
+		return
+	}
+	phase := 0
+	if self.cleanup.Load() {
+		phase = 1
+	}
+	counts := &self.phases[phase]
+	switch event.Phase {
+	case SendPackLifecyclePhaseStarted:
+		counts.started.Add(1)
+	case SendPackLifecyclePhaseFirstRouteWrite:
+		counts.firstWrites.Add(1)
+	case SendPackLifecyclePhaseTerminal:
+		if event.Err == nil {
+			counts.successes.Add(1)
+		} else {
+			counts.errors.Add(1)
+		}
+	}
+}
+
+// Mark the existing cleanup boundary before its first cancellation.
+func (self *windowReferenceCompletions) beginCleanup() {
+	if self != nil {
+		self.cleanup.Store(true)
+	}
+}
+
+// Read after producers and clients join, including publication that began before
+// cleanup but finished later. A failed join retains values, never a valid verdict.
+func (self *windowReferenceCompletions) finish(joined bool) {
+	if self == nil {
+		return
+	}
+	var snapshots [2]windowReferenceCompletionSnapshot
+	for phase := range snapshots {
+		counts := &self.phases[phase]
+		snapshots[phase] = windowReferenceCompletionSnapshot{
+			Started: counts.started.Load(), FirstWrites: counts.firstWrites.Load(),
+			Successes: counts.successes.Load(), Errors: counts.errors.Load(),
+		}
+	}
+	self.preCleanup, self.afterCleanup, self.joined = snapshots[0], snapshots[1], joined
+}
+
+// The unselected fixture installs no callback and allocates no observer.
+func TestWindowReferenceCompletionObserverDisabled(t *testing.T) {
+	settings := DefaultClientSettings().SendBufferSettings
+	var completions *windowReferenceCompletions
+	if allocations := testing.AllocsPerRun(100, func() { completions.configure(settings) }); allocations != 0 ||
+		settings.SendPackLifecycleObserver != nil {
+		t.Fatal("disabled completion observation changed the default send path")
+	}
+}
+
+// Phase counters own values, retain cleanup separately, and fail closed on join.
+func TestWindowReferenceCompletionObserverPhaseOwnership(t *testing.T) {
+	completions := &windowReferenceCompletions{}
+	event := SendPackLifecycleObservation{
+		Phase: SendPackLifecyclePhaseTerminal, MessageType: protocol.MessageType_IpIpPacketFromProvider,
+		Err: context.DeadlineExceeded,
+	}
+	completions.observe(event)
+	// A producer may select this phase before cleanup and publish after it.
+	selectedBeforeCleanup := &completions.phases[0]
+	completions.beginCleanup()
+	event.Err = nil
+	completions.observe(event)
+	completions.finish(false)
+	if completions.joined || completions.preCleanup.Errors != 1 {
+		t.Fatal("unjoined completion counts were accepted")
+	}
+	selectedBeforeCleanup.errors.Add(1)
+	completions.finish(true)
+	if !completions.joined || completions.preCleanup.Errors != 2 ||
+		completions.preCleanup.Successes != 0 || completions.afterCleanup.Errors != 0 ||
+		completions.afterCleanup.Successes != 1 {
+		t.Fatalf("completion phases or late publication were lost: %+v %+v", completions.preCleanup, completions.afterCleanup)
+	}
+	before := completions.preCleanup
+	if allocations := testing.AllocsPerRun(100, func() { completions.observe(event) }); allocations != 0 {
+		t.Fatalf("completion observation allocated %.0f objects", allocations)
+	}
+	if completions.preCleanup != before || completions.afterCleanup.Successes != 1 {
+		t.Fatal("published value snapshots retained mutable counter ownership")
+	}
+}
+
 type windowPathCell struct {
+	// Opt-in test observation; nil adds no per-Packet callback or token work.
+	referenceCompletions *windowReferenceCompletions
+
 	// Optional explicit opening for a controlled comparison. It does not
 	// change byte permissions, the serializer, or measurement duration.
 	BootstrapWindow          ByteCount                  `json:",omitempty"`
@@ -427,7 +554,7 @@ func holdWindowPathAckCompression(ctx context.Context, t *testing.T, settings *R
 // Measures receiver bytes over one common interval. Construction, warmup and
 // draining are outside the interval. This is a Transfer/FIFO instrument, not
 // a measurement of H1 sockets, a native kernel TUN, or provider TCP.
-func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Duration) windowPathReading {
+func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Duration, observe ...func(windowPathCell, *Client, *Client)) windowPathReading {
 	t.Helper()
 	if cell.Bidirectional && cell.Tcp {
 		t.Fatal("bidirectional fixture currently requires the raw Transfer workload")
@@ -544,6 +671,7 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		dataReceiverSettings.ReceiveBufferSettings.ReceiveQueueBudget = NewTransferMemoryBudget(cell.ReceiveWindow)
 		dataReceiverSettings.ReceiveBufferSettings.ReceiveQueueMaxByteCount = max(cell.ReceiveWindow, cell.ReceiveWindowAfter)
 	}
+	cell.referenceCompletions.configure(dataSenderSettings.SendBufferSettings)
 	sender := NewClient(ctx, NewId(), NewNoContractClientOob(), senderSettings)
 	receiver := NewClient(ctx, NewId(), NewNoContractClientOob(), receiverSettings)
 	sender.ContractManager().AddNoContractPeer(receiver.ClientId())
@@ -553,6 +681,10 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	sender.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransportWithType(TransportTypeH1), []Route{sendIn}, TransferCarrierProperties{ReceiveReliability: CarrierReliabilityReliable})
 	receiver.RouteManager().UpdateTransport(NewSendGatewayTransportWithType(TransportTypeH1), []Route{receiveOut})
 	receiver.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransportWithType(TransportTypeH1), []Route{receiveIn}, TransferCarrierProperties{ReceiveReliability: CarrierReliabilityReliable})
+	// Optional observers install existing hooks before any offered data or link worker.
+	for _, observer := range observe {
+		observer(cell, sender, receiver)
+	}
 	var workers sync.WaitGroup
 	if cell.ReceiveWindowAfter > 0 {
 		workers.Go(func() {
@@ -661,13 +793,16 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		}
 	}
 	defer func() {
+		cell.referenceCompletions.beginCleanup()
 		cancel()
 		cleanupWorkload()
 		workers.Wait()
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer closeCancel()
+		clientsJoined := true
 		for _, client := range []*Client{sender, receiver} {
 			if err := client.CloseAndWait(closeCtx); err != nil {
+				clientsJoined = false
 				t.Errorf("performance client cleanup: %v", err)
 			}
 		}
@@ -684,6 +819,7 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 				}
 			}
 		}
+		cell.referenceCompletions.finish(clientsJoined)
 	}()
 	// Allow the blind RTT, the peer-capacity step and two complete delivery
 	// horizons to settle. A 2-RTT warmup included startup in 400-ms cells.

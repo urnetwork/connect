@@ -8,23 +8,42 @@ import (
 	"time"
 )
 
+// The candidate's constant flight is distinct from the 48 MiB memory budget.
+// Its 256 KiB floor covers this final-path BDP and a large packet without the
+// multi-RTO FIFO backlog; the zero control retains the old budget-sized flight.
+const windowSettledLargeReferenceCalibration ByteCount = 256 * 1024
+
+const windowSettledLargeReferenceConfiguration = "settled-large-reference-v3-calibration-256kib"
+
+// The real matrix and causal regression construct the same final-path reference.
+func windowSettledLargeMessageCell(arm string, rates [2]ByteCount, payload int) windowPathCell {
+	cell := windowPathCell{
+		Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond,
+		Flows: 8, RoundRobinOffer: true, Payload: payload, Budget: mib(48), Rate: rates[1],
+		Warmup: 40500*time.Millisecond + time.Duration(2*int64(mib(2))*int64(time.Second)/int64(min(rates[0], rates[1]))),
+	}
+	if arm == "ceiling" {
+		cell.CalibrationWindow = windowSettledLargeReferenceCalibration
+	}
+	if arm == "delivery" {
+		cell.Rate, cell.RateAfter, cell.RateChangeAfter, cell.Drop = rates[0], rates[1], 40*time.Second, true
+	}
+	return cell
+}
+
 // Move the original capacity transition and its measurement forward by 36 s,
 // so the slow opening train has drained before the change. Preserve the same
 // post-change allowance, ninety-percent gate and sixty-four-message interval.
 func TestWindowPathServiceSettledLargeMessageCapacityChanges(t *testing.T) {
 	assertMessagePoolOwnership(t)
+	t.Logf("reference-configuration=%s calibration-flight-bytes=%d", windowSettledLargeReferenceConfiguration, windowSettledLargeReferenceCalibration)
 	for _, rates := range [][2]ByteCount{{125000, 1250000}, {1250000, 125000}} {
 		for _, payload := range []int{16 * 1024, 64 * 1024} {
 			var ceiling, candidate windowPathReading
-			warmup := 40500*time.Millisecond + time.Duration(2*int64(mib(2))*int64(time.Second)/int64(min(rates[0], rates[1])))
 			measurement := max(2*time.Second, time.Duration(64*int64(payload)*int64(time.Second)/int64(rates[1])))
 			for _, arm := range []string{"ceiling", "delivery"} {
 				synctest.Test(t, func(t *testing.T) {
-					cell := windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond,
-						Flows: 8, RoundRobinOffer: true, Payload: payload, Budget: mib(48), Rate: rates[1], Warmup: warmup}
-					if arm == "delivery" {
-						cell.Rate, cell.RateAfter, cell.RateChangeAfter, cell.Drop = rates[0], rates[1], 40*time.Second, true
-					}
+					cell := windowSettledLargeMessageCell(arm, rates, payload)
 					reading := measureWindowPathCell(t, cell, measurement)
 					logWindowServiceReading(t, reading)
 					if arm == "ceiling" {

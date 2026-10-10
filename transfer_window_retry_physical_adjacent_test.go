@@ -22,16 +22,17 @@ type windowRetryClockBoundary struct {
 
 // One initial H1 write is held until a test releases its real send worker.
 type windowRetryClockFixture struct {
-	start          time.Time
-	client         *Client
-	sequence       *SendSequence
-	transport      *h1SendClientTransportForGroupTest
-	route          Route
-	otherRoutes    []Route
-	releaseInitial chan struct{}
-	secondDue      chan windowRetryClockBoundary
-	ackFailedAt    chan time.Time
-	cancel         context.CancelFunc
+	start           time.Time
+	client          *Client
+	sequence        *SendSequence
+	transport       *h1SendClientTransportForGroupTest
+	route           Route
+	otherRoutes     []Route
+	releaseInitial  chan struct{}
+	secondDue       chan windowRetryClockBoundary
+	resumeSecondDue <-chan struct{}
+	ackFailedAt     chan time.Time
+	cancel          context.CancelFunc
 }
 
 // Runs each row with owned workers and pooled route buffers fully joined.
@@ -79,7 +80,11 @@ func runWindowRetryClockFixture(t *testing.T, maximum, ackTimeout time.Duration,
 					deadline: item.resendTime, copies: item.sendCount,
 					unreliable: item.unreliableCarrierObserved, carrierChanged: item.carrierChanged,
 				}
-				<-ctx.Done()
+				// Existing tests leave this nil and keep the original hold.
+				select {
+				case <-ctx.Done():
+				case <-fixture.resumeSecondDue:
+				}
 			}
 		}
 		fixture.client = NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
@@ -229,9 +234,60 @@ func TestWindowPacingFailedRetryIgnoresWaiter(t *testing.T) {
 func TestWindowPacingChangedCarrierRetryIgnoresH1Waiter(t *testing.T) {
 	for _, unreliable := range []bool{false, true} {
 		runWindowRetryClockFixture(t, 4*time.Second, time.Minute, func(t *testing.T, fixture *windowRetryClockFixture) {
+			head := fixture.sequence.resendQueue.PeekFirst()
+			if head == nil || head.sendCount != 1 || !head.transportWriteObserved {
+				t.Fatal("fixture lost its accepted initial H1 head")
+			}
+			messageId, number := head.messageId, head.sequenceNumber
+			lifetime := head.sendTime.Add(head.ackTimeout)
+			if unreliable {
+				lifetime = head.sendTime.Add(max(head.ackTimeout, fixture.sequence.sendBufferSettings.UnreliableAckTimeout))
+			}
+			previousH1 := fixture.sequence.windowPacer.waiter.sentAt
+			resumeSecondDue := make(chan struct{})
+			fixture.resumeSecondDue = resumeSecondDue
+			// This owner callback is installed while releaseInitial still holds
+			// the worker. Copy the completed retry before a later loop can renew
+			// its mutable lifetime; Wait alone does not order that future write.
+			type retryObservation struct {
+				messageId                                 Id
+				number                                    uint64
+				at, created, deadline, lifetime, physical time.Time
+				copies                                    int
+				unreliable, carrierChanged                bool
+				route                                     Route
+			}
+			firstRetry := make(chan retryObservation, 1)
+			retryObserved := false
+			fixture.sequence.sendBuffer.afterApplyAckSnapshotForTest = func(id sendSequenceId) {
+				if id != fixture.sequence.id() || retryObserved {
+					return
+				}
+				item := fixture.sequence.resendQueue.GetByMessageId(messageId)
+				if item == nil || item.sendCount != 2 || !item.transportWriteObserved || fixture.sequence.resendWriteCount.Load() != 1 {
+					return
+				}
+				retryObserved = true
+				firstRetry <- retryObservation{
+					messageId: item.messageId, number: item.sequenceNumber, at: time.Now(), created: item.sendTime,
+					deadline: item.resendTime, lifetime: item.sendTime.Add(item.ackTimeout), physical: fixture.sequence.windowPacer.waiter.sentAt,
+					copies: item.sendCount, unreliable: item.unreliableCarrierObserved, carrierChanged: item.carrierChanged, route: item.carrierRoute,
+				}
+			}
 			fixture.delayRetry(1200 * time.Millisecond)
-			time.Sleep(400 * time.Millisecond)
+			time.Sleep(time.Until(fixture.start.Add(400 * time.Millisecond)))
 			synctest.Wait()
+			service := fixture.sequence.windowPacer.service
+			service.stateLock.Lock()
+			next, probe, sent := service.next, service.probeSent, service.sent
+			// A retry owns one FIFO reservation, not a second copy of the
+			// original's lifetime byte charge.
+			held := service.pacingReservations == 1 && service.reservedByteCount == 0 && service.sent == head.pacingByteCount &&
+				service.waiterHead == &fixture.sequence.windowPacer.waiter && service.waiterTail == &fixture.sequence.windowPacer.waiter
+			service.stateLock.Unlock()
+			if !held || fixture.sequence.resendWriteCount.Load() != 0 || len(fixture.route) != 0 {
+				t.Fatal("fixture did not retain the first retry's charged H1 reservation")
+			}
 			h3 := &h3SendClientTransportForGroupTest{sendClientTransport: NewSendClientTransport(DestinationId(fixture.sequence.destination))}
 			h3Route := make(Route, 8)
 			fixture.otherRoutes = append(fixture.otherRoutes, h3Route)
@@ -249,22 +305,65 @@ func TestWindowPacingChangedCarrierRetryIgnoresH1Waiter(t *testing.T) {
 				<-withdrawn
 			}()
 			// Withdrawal publishes immediately but joins readers of the old
-			// snapshot. The paced sender is one of those readers.
+			// snapshot. The actual H3 acceptance must retire that H1 wait.
 			synctest.Wait()
 			if fixture.sequence.transferFlightPolicy().h1Only {
 				t.Fatal("carrier change was not published during the pacing wait")
 			}
-			time.Sleep(800 * time.Millisecond)
+			accept := func(at time.Time, copies uint64) {
+				t.Helper()
+				if time.Now() != at || len(h3Route) != 1 || len(fixture.route) != 0 ||
+					fixture.sequence.resendWriteCount.Load() != copies {
+					t.Fatalf("unreliable=%t missing actual H3 copy: at=%s want=%s route=%d writes=%d",
+						unreliable, time.Since(fixture.start), at.Sub(fixture.start), len(h3Route), fixture.sequence.resendWriteCount.Load())
+				}
+				wire := <-h3Route
+				defer MessagePoolReturn(wire)
+				pack := decodeSendPackLifecycleWirePack(t, wire)
+				id, err := IdFromBytes(pack.MessageId)
+				if err != nil || id != messageId || pack.SequenceNumber != number {
+					t.Fatal("changed carrier accepted a different logical recovery")
+				}
+			}
+			accept(fixture.start.Add(400*time.Millisecond), 1)
+			var observed retryObservation
+			select {
+			case observed = <-firstRetry:
+			default:
+				t.Fatal("actual H3 retry did not publish its completed owner boundary")
+			}
+			service.stateLock.Lock()
+			keptDebt := service.next == next && service.probeSent == probe && service.sent == sent &&
+				service.pacingReservations == 0 && service.reservedByteCount == 0 && service.waiterHead == nil && service.waiterTail == nil
+			service.stateLock.Unlock()
+			if observed.messageId != messageId || observed.number != number || observed.at != fixture.start.Add(400*time.Millisecond) ||
+				observed.copies != 2 || observed.deadline != fixture.start.Add(900*time.Millisecond) ||
+				observed.unreliable != unreliable || !observed.carrierChanged || observed.route != h3Route ||
+				observed.lifetime != lifetime || observed.physical != previousH1 || !keptDebt {
+				t.Fatal("changed carrier borrowed the H1 clock, refunded paid debt or changed retained ownership/lifetime")
+			}
+			time.Sleep(time.Until(fixture.start.Add(900*time.Millisecond - time.Nanosecond)))
+			synctest.Wait()
+			if len(h3Route) != 0 || len(fixture.secondDue) != 0 || fixture.sequence.resendWriteCount.Load() != 1 {
+				t.Fatal("changed carrier retried before its original 900ms boundary")
+			}
+			time.Sleep(time.Nanosecond)
 			synctest.Wait()
 			select {
 			case boundary := <-fixture.secondDue:
-				t.Logf("physical=%s deadline=%s due=%s changed=%t unreliable=%t", boundary.physical.Sub(fixture.start), boundary.deadline.Sub(fixture.start), boundary.at.Sub(fixture.start), boundary.carrierChanged, boundary.unreliable)
-				if boundary.unreliable != unreliable || !boundary.carrierChanged || boundary.physical != fixture.start.Add(1200*time.Millisecond) || boundary.deadline != fixture.start.Add(900*time.Millisecond) || boundary.at != fixture.start.Add(1200*time.Millisecond) {
+				if boundary.unreliable != unreliable || !boundary.carrierChanged || boundary.physical != previousH1 ||
+					boundary.deadline != fixture.start.Add(900*time.Millisecond) || boundary.at != boundary.deadline || boundary.copies != 2 ||
+					len(h3Route) != 0 || fixture.sequence.resendWriteCount.Load() != 1 {
 					t.Fatalf("changed carrier borrowed the H1 physical interval: %+v", boundary)
 				}
 			default:
-				t.Fatal("changed carrier incorrectly acquired a fresh H1 recovery interval")
+				t.Fatal("changed carrier missed its original 900ms recovery interval")
 			}
+			close(resumeSecondDue)
+			synctest.Wait()
+			accept(fixture.start.Add(900*time.Millisecond), 2)
+			t.Logf("unreliable=%t actual_h3_acceptances=400ms,900ms old_h1_waiter=%s original_lifetime=%s",
+				unreliable, previousH1.Sub(fixture.start), lifetime.Sub(observed.created))
 		})
 	}
 }

@@ -76,12 +76,17 @@ func (self *windowPacingService) networkQualityChanged(at time.Time) time.Time {
 		return self.qualityChangedAt
 	}
 	self.qualityLastNotification = at
-	rate, _, latest := self.measureWithLock(time.Second, at, false)
-	self.serviceHoldRate = max(rate, latest, self.serviceHoldRate)
+	rate, _, latest, bytes := self.measureWithLock(time.Second, at, false)
+	self.serviceHoldByteCount = self.heldServiceByteCountWithLock()
+	if measured := max(rate, latest); measured > self.serviceHoldRate {
+		self.serviceHoldRate = measured
+		self.serviceHoldByteCount, self.serviceHoldEpochAt = bytes, self.serviceEpochAt
+	}
 	self.qualityChangedAt = at
 	self.qualityRoundTripPending = true
 	self.qualityServiceMeasured = false
 	self.serviceEpochAt = at
+	self.serviceEpochByteBase = self.total
 	self.windowDeliveryAfterNanos = at.UnixNano()
 	clear(self.samples[:])
 	self.aggregate = windowServiceDeliveryRing{}

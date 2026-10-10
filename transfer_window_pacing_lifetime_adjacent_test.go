@@ -15,6 +15,11 @@ import (
 // into a failed application callback during sequence cleanup.
 func TestWindowPacingLifetimeAcknowledgedPrefixSurvivesYoungerExpiry(t *testing.T) {
 	runWindowRetryClockFixture(t, 4*time.Second, 500*time.Millisecond, func(t *testing.T, fixture *windowRetryClockFixture) {
+		// ACK preemption can re-inspect recovery without another physical
+		// write. These rows must not pause inside that inspection hook.
+		resumeSecondDue := make(chan struct{})
+		close(resumeSecondDue)
+		fixture.resumeSecondDue = resumeSecondDue
 		olderId := fixture.sequence.resendQueue.PeekFirst().messageId
 		time.Sleep(100 * time.Millisecond)
 		service := fixture.sequence.windowPacer.service

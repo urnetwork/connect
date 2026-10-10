@@ -6,9 +6,11 @@ import "time"
 
 // Finalize after retained admission and on every earlier return. Statistics
 // read the same evidence without publishing a new hold or learning capacity.
-func (self *SendSequence) finalizeWindowPacing(at time.Time, retain bool, generation time.Time, estimate *SendWindowEstimate) {
+func (self *SendSequence) finalizeWindowPacing(at time.Time, retain bool, generation time.Time, h1PacingWrite bool, estimate *SendWindowEstimate) {
 	service := self.windowPacer.service
-	paced := service != nil && self.transferFlightPolicy().h1Only
+	// Only dispatch may supply a narrower H1 eligibility scope. Ordinary
+	// admission/statistics retain their aggregate carrier-policy boundary.
+	paced := service != nil && (h1PacingWrite || self.transferFlightPolicy().h1Only)
 	residence := estimate.WindowRoundTrip
 	if paced {
 		if residence <= 0 {

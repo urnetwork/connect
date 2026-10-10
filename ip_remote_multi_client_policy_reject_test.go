@@ -6,14 +6,15 @@
 // a UDP sender got no unreachable, and the app's retry to the same destination
 // repeated the cycle. These tests use only the public multi-client API with
 // the default policy, so they run unchanged on the code before the fix. The
-// inputs are fixed bytes; the receive callback is synchronous, so every
-// assertion is made right after the SendPacket call that must cause it.
+// inputs are fixed bytes. Policy rejection is inline; local-nat replies are
+// asynchronous and must reach their completed-disposition edge before assertions.
 package connect
 
 import (
 	"context"
 	"encoding/binary"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,21 +28,38 @@ var (
 
 const policyRejectPort = 50000
 
+// Owns copies of borrowed callback bytes; local-nat callbacks may race a take.
 type policyRejectCapture struct {
-	packets [][]byte
+	stateLock sync.Mutex
+	packets   [][]byte
 }
 
+// Borrows the input only for this call and retains an independent copy.
 func (self *policyRejectCapture) receive(_ TransferPath, _ protocol.ProvideMode, _ *IpPath, packet []byte) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 	self.packets = append(self.packets, append([]byte(nil), packet...))
 }
 
+// Transfers the captured copies without sharing a future append's backing.
 func (self *policyRejectCapture) take() [][]byte {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 	packets := self.packets
 	self.packets = nil
 	return packets
 }
 
-func newPolicyRejectMulti(t *testing.T, capture *policyRejectCapture, localSecurityBypass bool) *RemoteUserNatMultiClient {
+// One app identity owns every packet of this fixture's flows. Local dispatch
+// completion and cancellation belong to this fixture, never the host network.
+type policyRejectMulti struct {
+	*RemoteUserNatMultiClient
+	source         TransferPath
+	localProcessed chan struct{}
+}
+
+// Constructs a network-isolated policy fixture and joins its local workers.
+func newPolicyRejectMulti(t *testing.T, capture *policyRejectCapture, localSecurityBypass bool, configure ...func(*MultiClientSettings)) *policyRejectMulti {
 	t.Helper()
 	settings := DefaultMultiClientSettings()
 	settings.EventEpoch = 10 * time.Millisecond
@@ -49,6 +67,9 @@ func newPolicyRejectMulti(t *testing.T, capture *policyRejectCapture, localSecur
 	settings.ProviderProbe = false
 	settings.IpAssocSettings = nil
 	settings.SecurityPolicyGenerator = DefaultSecurityPolicyWithStats
+	for _, apply := range configure {
+		apply(settings)
+	}
 	multi := NewRemoteUserNatMultiClient(
 		context.Background(),
 		&testingEmptyMultiClientGenerator{},
@@ -57,13 +78,48 @@ func newPolicyRejectMulti(t *testing.T, capture *policyRejectCapture, localSecur
 		settings,
 	)
 	multi.SetLocalSecurityBypass(localSecurityBypass)
-	t.Cleanup(multi.Close)
-	return multi
+	fixture := &policyRejectMulti{
+		RemoteUserNatMultiClient: multi,
+		source:                   SourceId(NewId()),
+		localProcessed:           make(chan struct{}, 16),
+	}
+	// Install these existing seams before any packet is published. A pending
+	// upstream can neither inject a reply nor depend on real network timing.
+	dialSettings := &DialContextSettings{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	multi.localUserNat.settings.TcpBufferSettings.DialContextSettings = dialSettings
+	multi.localUserNat.settings.UdpBufferSettings.DialContextSettings = dialSettings
+	multi.localUserNat.afterSendPacketForTest = func() { fixture.localProcessed <- struct{}{} }
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := multi.CloseAndWait(ctx); err != nil {
+			t.Errorf("policy fixture local workers did not join: %v", err)
+		}
+	})
+	return fixture
 }
 
-func policyRejectSend(multi *RemoteUserNatMultiClient, transport IpProtocol, sourcePort int, syn bool, payload []byte) {
-	packet := craftSecurityPacket(transport, policyRejectSourceIp, sourcePort, policyRejectDestinationIp, policyRejectPort, syn, payload)
-	multi.SendPacket(SourceId(NewId()), protocol.ProvideMode_Public, packet, 0)
+// Waits for actual nat dispositions, including any synchronous orphan reply.
+func (self *policyRejectMulti) waitLocal(t *testing.T, packetCount int) {
+	t.Helper()
+	for i := 0; i < packetCount; i += 1 {
+		select {
+		case <-self.localProcessed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("local packet %d/%d did not reach its disposition", i+1, packetCount)
+		}
+	}
+}
+
+// Transfers a pooled packet on success and returns the caller's rejected owner.
+func policyRejectSend(multi *policyRejectMulti, transport IpProtocol, sourcePort int, syn bool, payload []byte) {
+	packet := MessagePoolCopy(craftSecurityPacket(transport, policyRejectSourceIp, sourcePort, policyRejectDestinationIp, policyRejectPort, syn, payload))
+	if !multi.SendPacket(multi.source, protocol.ProvideMode_Public, packet, 0) {
+		MessagePoolReturn(packet)
+	}
 }
 
 func requireTcpReset(t *testing.T, name string, packets [][]byte, sourcePort int) {
@@ -109,7 +165,7 @@ func requireIcmpPortUnreachable(t *testing.T, name string, packets [][]byte, sou
 
 // the third encrypted segment decides the flow; the first two pass while the
 // policy is inspecting
-func policyRejectEncryptedTcpFlow(t *testing.T, multi *RemoteUserNatMultiClient, capture *policyRejectCapture, sourcePort int) {
+func policyRejectEncryptedTcpFlow(t *testing.T, multi *policyRejectMulti, capture *policyRejectCapture, sourcePort int) {
 	t.Helper()
 	policyRejectSend(multi, IpProtocolTcp, sourcePort, true, nil)
 	policyRejectSend(multi, IpProtocolTcp, sourcePort, false, encryptedPayload(512))
@@ -146,6 +202,7 @@ func TestRootCauseFirstDropResetsTcpAndRetryRoutesLocally(t *testing.T) {
 	before := multi.PacketStats()
 	policyRejectSend(multi, IpProtocolTcp, 46012, true, nil)
 	policyRejectSend(multi, IpProtocolTcp, 46012, false, encryptedPayload(512))
+	multi.waitLocal(t, 2)
 	after := multi.PacketStats()
 	if after.LocalEgressPacketCount-before.LocalEgressPacketCount != 2 {
 		t.Fatalf("retry local packets = %d, want 2", after.LocalEgressPacketCount-before.LocalEgressPacketCount)

@@ -12,11 +12,13 @@ import (
 // A queued UDP expiry is a local refusal and must not retire the channel that
 // also owns an outstanding TCP send. No callback error is injected here.
 func TestQueuedNoAckExpiryKeepsSharedTcpChannel(t *testing.T) {
+	assertMessagePoolOwnership(t)
 	for _, grouped := range []bool{false, true} {
 		t.Run(fmt.Sprintf("grouped=%t", grouped), func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			harness := newNoAckFastPathHarness(t, ctx, 0)
+			t.Cleanup(func() { closeTransferGroupTestClient(t, harness.client) })
 			channel := newPacketTransferTestChannel()
 			channel.client = harness.client
 			channel.args = &multiClientChannelArgs{Destination: RequireMultiHopId(harness.destinationId)}
@@ -41,11 +43,47 @@ func TestQueuedNoAckExpiryKeepsSharedTcpChannel(t *testing.T) {
 			// The sequence has not started; move the actual queued Pack past
 			// its deadline to pin the expiry branch without waiting or racing.
 			queued.deadline = time.Now().Add(-time.Second)
-			originalCallback := queued.AckCallback
-			completed := make(chan error, 1)
-			queued.AckCallback = func(err error) {
-				originalCallback(err)
-				completed <- err
+			if queued.AckCallback == nil && queued.ackTarget == nil {
+				t.Fatal("queued packet has no completion owner")
+			}
+			// Terminal follows either the real callback or the typed group target.
+			// Leave both untouched; wrapping only AckCallback misses target-backed sends.
+			originalObserver := queued.lifecycleObserver
+			type expiryCompletion struct {
+				err          error
+				pendingCount int
+				pendingBytes ByteCount
+				ackedCount   int
+			}
+			completed := make(chan expiryCompletion, 1)
+			terminalCount := 0
+			terminalOverflow := false
+			queued.lifecycleObserver = func(observation SendPackLifecycleObservation) {
+				if originalObserver != nil {
+					originalObserver(observation)
+				}
+				if observation.Phase != SendPackLifecyclePhaseTerminal {
+					return
+				}
+				channel.stateLock.Lock()
+				completion := expiryCompletion{
+					err:          observation.Err,
+					pendingCount: channel.packetStats.sendNackCount,
+					pendingBytes: channel.packetStats.sendNackByteCount,
+					ackedCount:   channel.packetStats.sendAckCount,
+				}
+				channel.stateLock.Unlock()
+				terminalCount++
+				select {
+				case completed <- completion:
+				default:
+					terminalOverflow = true
+				}
+			}
+			budget := harness.sequence.resendQueue.budget
+			var budgetBefore TransferMemoryBudgetStats
+			if budget != nil {
+				budgetBefore = budget.Stats()
 			}
 			harness.sequence.packs <- queued
 			done := make(chan struct{})
@@ -59,12 +97,50 @@ func TestQueuedNoAckExpiryKeepsSharedTcpChannel(t *testing.T) {
 				case <-done:
 				case <-time.After(time.Second):
 					t.Error("expired-packet sequence did not join")
+					return
+				}
+				// Run owns these fields until its actual join, including pool return.
+				if terminalCount != 1 || terminalOverflow {
+					t.Errorf("terminal observations=%d overflow=%t, want one", terminalCount, terminalOverflow)
+				}
+				sequence := harness.sequence
+				if count, bytes := sequence.resendQueue.QueueSize(); count != 0 || bytes != 0 {
+					t.Errorf("expired packet retained queue owners=%d/%d", count, bytes)
+				}
+				if len(sequence.packs) != 0 || len(sequence.ackLifetimes.items) != 0 ||
+					sequence.currentPreparedHandoff != nil || sequence.writeCount.Load() != 0 {
+					t.Error("expired packet retained admission/lifetime/prepared ownership or reached a writer")
+				}
+				for _, item := range sequence.sendItems {
+					if item != nil {
+						t.Error("expired packet retained a send item after Run joined")
+					}
+				}
+				if admission := sequence.packAdmission; admission != nil {
+					admission.mutex.Lock()
+					count, keys := admission.count, len(admission.byKey)
+					admission.mutex.Unlock()
+					if count != 0 || keys != 0 {
+						t.Errorf("expired packet retained admission credits=%d keys=%d", count, keys)
+					}
+				}
+				if budget != nil {
+					if after := budget.Stats(); after.UsedByteCount != budgetBefore.UsedByteCount ||
+						after.ReservedByteCount != budgetBefore.ReservedByteCount ||
+						after.ReleasedByteCount != budgetBefore.ReleasedByteCount {
+						t.Errorf("unserialized expiry changed retained credit: before=%+v after=%+v", budgetBefore, after)
+					}
 				}
 			}()
 			select {
-			case err := <-completed:
+			case completion := <-completed:
+				err := completion.err
 				if !errors.Is(err, ErrSendPackNotAdmitted) {
 					t.Fatalf("deadline disposition=%v", err)
+				}
+				if completion.pendingCount != 1 || completion.pendingBytes != tcpBytes || completion.ackedCount != 0 {
+					t.Fatalf("terminal preceded callback/target accounting: pending=%d/%d ACK=%d",
+						completion.pendingCount, completion.pendingBytes, completion.ackedCount)
 				}
 			case <-time.After(time.Second):
 				t.Fatal("queued datagram never reached deadline disposition")

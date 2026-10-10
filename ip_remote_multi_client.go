@@ -6986,11 +6986,13 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 		if observations := sendPacketGroup.admissionObservations; observations != nil {
 			observations.complete(success)
 		}
+		sendPacketGroup.finishCollapseSynOffer()
 	}()
 	firstPacket := &sendPacketGroup.packets[0]
 	ipPath := sendPacketGroup.ipPath
 	var sentUpdate *multiClientChannelUpdate
 	self.sendClientPath(ipPath, sendPacketGroup.pin, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
+		defer update.releaseCollapseClaims()
 		sentUpdate = update
 		enterTime := time.Now()
 
@@ -7039,7 +7041,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 		// Generation response ownership is also required when duplicate
 		// suppression is disabled: a new SYN may receive its reply inline.
 		if ipPath.Protocol == IpProtocolTcp {
-			sendPacketGroup.prepareCollapseAdmission(update)
+			if !sendPacketGroup.prepareCollapseAdmission(update, self) {
+				return
+			}
 		}
 
 		// Send through a committed client and preserve the selected-client error
@@ -7182,7 +7186,8 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 				// A one-candidate formation still has an initial race/probe
 				// attempt. Keep that first group reliable; once committed,
 				// sendBoundClient applies the ordinary NoAck UDP policy.
-				sent := client.SendGroupWithAck(sendPacketGroup, sendTimeout, true)
+				sent, sendErr := client.SendGroupDetailedWithAck(sendPacketGroup, sendTimeout, true, race.collapseOrder)
+				sent = sent && sendErr == nil
 				var abandonedClients []*multiClientChannel
 				var receivePackets []*receivePacket
 				var returnPackets []*receivePacket
@@ -7324,6 +7329,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 								client,
 								sendPacketGroup,
 								sendTimeout,
+								race.collapseOrder,
 							)
 						}
 					}
@@ -7364,8 +7370,10 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 									abandonedClients = append(abandonedClients, abandonedClient)
 								}
 							}
-							update.clearRaceWithLock()
 							update.client.Store(client)
+							update.sequenceCommittedRaceOrder = race.collapseOrder
+							update.commitCollapseClaimsWithLock(client)
+							update.clearRaceWithLock()
 						}
 					}()
 
@@ -8361,6 +8369,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	var boundUpdate *multiClientChannelUpdate
 	var resolvedUpdate *multiClientChannelUpdate
 	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
+		defer update.releaseCollapseClaims()
 		resolvedUpdate = update
 		// steady-state fast path: the flow is already committed to this client,
 		// so deliver without taking any lock (client is atomic). this is the
@@ -8465,8 +8474,10 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 				}
 			}
 
-			update.clearRaceWithLock()
 			update.client.Store(sourceClient)
+			update.sequenceCommittedRaceOrder = race.collapseOrder
+			update.commitCollapseClaimsWithLock(sourceClient)
+			update.clearRaceWithLock()
 			boundUpdate = update
 			receivePacket := &receivePacket{
 				Source:      source,
@@ -8684,6 +8695,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		var connectClient *multiClientChannel
 		var connectPath *IpPath
 		self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
+			defer update.releaseCollapseClaims()
 			// race state is guarded by the per-flow stateLock (a leaf); client
 			// is atomic
 			update.stateLock.Lock()
@@ -9302,6 +9314,29 @@ type multiClientChannelUpdate struct {
 	// captured epoch prevents callback-before-return from being recommitted.
 	sequenceAdmissionEpoch uint64
 	sequenceClient         *multiClientChannel
+	// Admitted raw groups and unselected, still-retained race completions.
+	// Selected materialized coverage stays in the inline interval above.
+	sequenceClaims         *parsedPacketGroup
+	sequenceClaimsTail     *parsedPacketGroup
+	sequenceReleasedClaims atomic.Pointer[parsedPacketGroup]
+	sequenceCloseReady     atomic.Bool
+	sequenceParent         *RemoteUserNatMultiClient
+	// Only a scalar close barrier spans a SYN offer; no packet or descriptor
+	// is linked before admission. The existing public-send defer releases it.
+	sequenceSynOffers int
+	// Latest accepted control state is independent of materialized coverage.
+	// A pending older zero-window/ack state cannot suppress a later transition.
+	sequenceAdmissionAck       uint32
+	sequenceAdmissionWindow    uint16
+	sequenceAdmissionStateSeen bool
+	sequenceSourceId           Id
+	sequenceResetSourceId      Id
+	sequenceSourceOrder        uint64
+	sequenceCommittedRaceOrder uint64
+	sequenceControlOrder       uint64
+	sequenceResetOrder         uint64
+	sequenceMetricSynNumber    uint32
+	sequenceMetricSynSeen      bool
 
 	// TCP close observations let the shared reaper retire a completed flow
 	// immediately instead of retaining its route, affinity entries, context,
@@ -9500,39 +9535,40 @@ func (self *multiClientChannelUpdate) resetSequenceGroup(sendPacketGroup *parsed
 func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPacket) {
 	ipPath := sendPacket.ipPath
 	if ipPath.Syn && (!self.synGenerationSeen || self.synGenerationNumber != ipPath.SequenceNumber) {
-		// A source port can be reused before the old tuple's idle deadline.
-		// A fresh SYN is a new TCP generation and must not inherit either FIN or
-		// ACK edge from the previous connection.
-		self.egressFinSequence = 0
-		self.ingressFinSequence = 0
-		self.egressAckSequence = 0
-		self.ingressAckSequence = 0
-		self.egressFinSeen = false
-		self.ingressFinSeen = false
-		self.egressAckSeen = false
-		self.ingressAckSeen = false
-		self.openTime = time.Now()
-		self.ackPerformance.reset()
-		if self.synGenerationSeen || self.sequencePacketCount != 0 {
-			self.receivedInbound.Store(false)
-			self.synGenerationAwaiting = true
-		}
-		self.synGenerationSeen, self.synGenerationNumber = true, ipPath.SequenceNumber
-		self.synWaitClient = self.client.Load()
-		self.synWaitStart = time.Now()
-		self.synWaitSendCount = 1
+		self.resetSynGenerationWithLock(ipPath.SequenceNumber)
 	}
 	self.sequenceAdmissionEpoch++
+	self.sequenceCloseReady.Store(false)
 	self.sequenceCovered = false
 	self.sequenceAckPositionSeen = false
 	self.sequenceSynSeen = ipPath.Syn
 	self.sequenceSynNumber = ipPath.SequenceNumber
+	self.sequenceAdmissionStateSeen = false
 
 	self.ackSequenceNumber = ipPath.AckSequenceNumber
 	self.sequenceNumber = ipPath.SequenceNumber
 	self.tcpWindowSize = ipPath.TcpWindowSize
 	self.sequencePacketCount = 0
 	self.sequenceTime = time.Now()
+}
+
+// A real new source cohort clears both close directions. Candidate promotion
+// can force this transition even when an intervening unwritten SYN reused an ISN.
+func (self *multiClientChannelUpdate) resetSynGenerationWithLock(sequence uint32) {
+	self.egressFinSequence, self.ingressFinSequence = 0, 0
+	self.egressAckSequence, self.ingressAckSequence = 0, 0
+	self.egressFinSeen, self.ingressFinSeen = false, false
+	self.egressAckSeen, self.ingressAckSeen = false, false
+	self.openTime = time.Now()
+	self.ackPerformance.reset()
+	if self.synGenerationSeen || self.sequencePacketCount != 0 {
+		self.receivedInbound.Store(false)
+		self.synGenerationAwaiting = true
+	}
+	self.synGenerationSeen, self.synGenerationNumber = true, sequence
+	self.synWaitClient = self.client.Load()
+	self.synWaitStart = time.Now()
+	self.synWaitSendCount = 1
 }
 
 func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
@@ -9554,6 +9590,9 @@ func (self *multiClientChannelUpdate) commitSequenceGroup(sendPacketGroup *parse
 func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGroup *parsedPacketGroup, client *multiClientChannel) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if sendPacketGroup.completionFlags.Load()&groupCompletionTracked != 0 {
+		return
+	}
 	if admission := sendPacketGroup.collapseAdmission; admission.update != nil &&
 		admission.epoch != self.sequenceAdmissionEpoch {
 		return
@@ -9587,9 +9626,10 @@ func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGro
 
 // Must be called with stateLock.
 func (self *multiClientChannelUpdate) updateSequenceWithLock(sendPacket *parsedPacket) {
-
+	self.sequenceAdmissionAck = sendPacket.ipPath.AckSequenceNumber
+	self.sequenceAdmissionWindow = sendPacket.ipPath.TcpWindowSize
+	self.sequenceAdmissionStateSeen = true
 	ipPath := sendPacket.ipPath
-	update := self.sequencePacketCount == 0
 	var now time.Time
 	if ipPath.Protocol == IpProtocolTcp {
 		if self.ackPerformance.needsTimestamp(ipPath.Ack, ipPath.AckSequenceNumber) {
@@ -9597,6 +9637,22 @@ func (self *multiClientChannelUpdate) updateSequenceWithLock(sendPacket *parsedP
 		}
 		self.ackPerformance.observe(now, ipPath.Ack, ipPath.AckSequenceNumber)
 	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	self.sequenceTime = now
+	self.updateMaterializedSequenceWithLock(sendPacket)
+}
+
+// Retained range publication changes coverage only. Performance and the
+// positive hold clock describe successful admission, before serialization.
+func (self *multiClientChannelUpdate) updateMaterializedSequenceWithLock(sendPacket *parsedPacket, payloadByteCounts ...int) {
+	ipPath := sendPacket.ipPath
+	payloadByteCount := len(sendPacket.payload)
+	if len(payloadByteCounts) != 0 {
+		payloadByteCount = payloadByteCounts[0]
+	}
+	update := self.sequencePacketCount == 0
 
 	nextAckSequenceNumber := ipPath.AckSequenceNumber
 	if self.ackSequenceNumber != nextAckSequenceNumber {
@@ -9608,7 +9664,7 @@ func (self *multiClientChannelUpdate) updateSequenceWithLock(sendPacket *parsedP
 		update = true
 	}
 
-	nextSequenceNumber := tcpPacketNextSequenceNumber(ipPath, sendPacket.payload)
+	nextSequenceNumber := tcpPacketNextSequenceNumberWithPayloadByteCount(ipPath, payloadByteCount)
 	// signed-delta comparison is wraparound-tolerant: > 0 means nextSequenceNumber
 	// is later in TCP sequence space than self.sequenceNumber
 	if self.sequencePacketCount == 0 || 0 < int32(nextSequenceNumber-self.sequenceNumber) {
@@ -9616,18 +9672,12 @@ func (self *multiClientChannelUpdate) updateSequenceWithLock(sendPacket *parsedP
 		update = true
 	}
 
-	if self.updateSequenceCoverageWithLock(sendPacket) {
+	if self.updateSequenceCoverageWithLock(sendPacket, payloadByteCount) {
 		update = true
 	}
 	if update {
 		self.sequencePacketCount += 1
 	}
-	// Even an identical hold escape restarts the bound, but only after real
-	// successful admission. A refusal leaves the retry immediately eligible.
-	if now.IsZero() {
-		now = time.Now()
-	}
-	self.sequenceTime = now
 }
 
 // tcpPacketNextSequenceNumber returns the right edge occupied by this segment.
@@ -9635,7 +9685,12 @@ func (self *multiClientChannelUpdate) updateSequenceWithLock(sendPacket *parsedP
 // omitting FIN here lets collapse prevention discard the only close signal as
 // an apparent retransmission of the preceding data edge.
 func tcpPacketNextSequenceNumber(ipPath *IpPath, payload []byte) uint32 {
-	next := ipPath.SequenceNumber + uint32(len(payload))
+	return tcpPacketNextSequenceNumberWithPayloadByteCount(ipPath, len(payload))
+}
+
+// Promotion keeps parsed payload length after all original roots are returned.
+func tcpPacketNextSequenceNumberWithPayloadByteCount(ipPath *IpPath, payloadByteCount int) uint32 {
+	next := ipPath.SequenceNumber + uint32(payloadByteCount)
 	if ipPath.Syn {
 		next += 1
 	}
@@ -9673,6 +9728,14 @@ func (self *multiClientChannelUpdate) observeTcpControl(
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.observeTcpControlWithLock(control, ingress)
+}
+
+// Source dequeue and winner promotion already hold the generation lock.
+func (self *multiClientChannelUpdate) observeTcpControlWithLock(control tcpControlObservation, ingress bool) bool {
+	if !control.valid || ingress && self.pendingCollapseResetWithLock() {
+		return false
+	}
 
 	if control.rst {
 		return true
@@ -9701,6 +9764,9 @@ func (self *multiClientChannelUpdate) observeTcpControl(
 }
 
 func (self *multiClientChannelUpdate) observeEgressTcpGroup(sendPacketGroup *parsedPacketGroup) bool {
+	if sendPacketGroup.completionFlags.Load()&(groupCompletionTracked|groupCompletionSourceControls) != 0 {
+		return false
+	}
 	for packetIndex := range sendPacketGroup.packets {
 		if self.observeTcpControl(tcpControlFromIpPath(sendPacketGroup.packets[packetIndex].ipPath), false) {
 			return true
@@ -9724,9 +9790,23 @@ func (self *multiClientChannelUpdate) releaseSequenceHold(maxHold time.Duration)
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	// nothing committed yet: canUpdateSequence already allows these
-	if self.sequencePacketCount == 0 || self.sequenceTime.IsZero() {
+	// A raw admitted group can also suppress a duplicate. The explicit hold
+	// keeps its admission clock without claiming it was already serialized.
+	if self.sequenceTime.IsZero() {
 		return false
+	}
+	if self.sequencePacketCount == 0 {
+		pending := false
+		for group := self.sequenceClaims; group != nil; group = group.collapseNext {
+			if group.collapseAdmission.epoch == self.sequenceAdmissionEpoch &&
+				group.completionClient == self.client.Load() {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			return false
+		}
 	}
 
 	now := time.Now()
@@ -9742,6 +9822,9 @@ func (self *multiClientChannelUpdate) releaseSequenceHold(maxHold time.Duration)
 func (self *multiClientChannelUpdate) sourceRstSequence() uint32 {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if self.sequenceAdmissionStateSeen {
+		return self.sequenceAdmissionAck
+	}
 	return self.ackSequenceNumber
 }
 
@@ -9753,6 +9836,40 @@ func (self *multiClientChannelUpdate) canUpdateSequenceForClient(sendPacket *par
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	path := sendPacket.ipPath
+	if self.sequenceSourceOrder == 1<<48-1 {
+		return true
+	}
+	if path.Syn && self.pendingSequenceCoversWithLock(sendPacket, client) {
+		return false
+	}
+	// A different SYN always establishes a new cohort, even when its byte
+	// range happens to overlap retained data from the previous generation.
+	if path.Syn && (!self.synGenerationSeen || self.synGenerationNumber != path.SequenceNumber) {
+		return true
+	}
+	// Empty same-generation SYN retries are independent of later ack/window
+	// changes; every other control transition follows the latest admission.
+	if !(path.Syn && len(sendPacket.payload) == 0) && self.sequenceAdmissionStateSeen &&
+		(self.sequenceAdmissionAck != path.AckSequenceNumber ||
+			self.sequenceAdmissionWindow != path.TcpWindowSize) {
+		return true
+	}
+	if self.pendingSequenceCoversWithLock(sendPacket, client) {
+		return false
+	}
+	// Conflicting pre-dequeue controls have no proven FIFO order. Their raw
+	// membership cannot make older durable control state authoritative.
+	for group := self.sequenceClaims; group != nil; group = group.collapseNext {
+		if group.completionClient == client && group.collapseOrder() == 0 {
+			for index := range group.packets {
+				prior := group.packets[index].ipPath
+				if prior.Rst || prior.Syn || prior.AckSequenceNumber != path.AckSequenceNumber || prior.TcpWindowSize != path.TcpWindowSize {
+					return true
+				}
+			}
+		}
+	}
 	if self.sequencePacketCount == 0 || self.sequenceClient != nil && self.sequenceClient != client {
 		return true
 	}
@@ -9820,8 +9937,10 @@ func (self *multiClientChannelUpdate) commitRaceClientWithLock(
 		}
 	}
 
-	self.clearRaceWithLock()
 	self.client.Store(client)
+	self.sequenceCommittedRaceOrder = race.collapseOrder
+	self.commitCollapseClaimsWithLock(client)
+	self.clearRaceWithLock()
 	for _, packet := range receivePackets {
 		if self.markReceivedInboundWithLock(client, packet.tcpControl) {
 			connectSucceeded = true
@@ -9834,12 +9953,14 @@ func (self *multiClientChannelUpdate) commitRaceClientWithLock(
 func (self *multiClientChannelUpdate) initRaceWithLock() {
 	if self.race == nil {
 		self.race = newMultiClientChannelUpdateRace(self.ctx)
+		self.race.collapseOrder = self.nextCollapseOrderWithLock()
 	}
 }
 
 // must be called with `stateLock`
 func (self *multiClientChannelUpdate) clearRaceWithLock() {
 	if self.race != nil {
+		self.abandonCollapseClaimsWithLock()
 		self.race.Close()
 		self.race = nil
 	}
@@ -9862,9 +9983,11 @@ func (self *multiClientChannelUpdate) IsDone() bool {
 
 func (self *multiClientChannelUpdate) Close() {
 	self.cancel()
+	defer self.releaseCollapseClaims()
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.clearRaceWithLock()
+	self.abandonCollapseClaimsWithLock()
 }
 
 type multiClientChannelUpdateRace struct {
@@ -9876,6 +9999,7 @@ type multiClientChannelUpdateRace struct {
 	clientsWithPacketCount int
 	completeMonitor        *Monitor
 	responseWindowElapsed  bool
+	collapseOrder          uint64
 }
 
 func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpdateRace {
@@ -9907,6 +10031,7 @@ func (self *multiClientChannelUpdateRace) Close() {
 			}
 		}
 		state.packets = nil
+		state.collapseControl = tcpCandidateControlState{}
 	}
 	clear(self.clientStates)
 }
@@ -9921,6 +10046,9 @@ type multiClientChannelRaceClientState struct {
 	// attempt can delete the response target of another attempt still in
 	// flight on the same flow.
 	pendingSendCount int
+	// Bounded semantic state belongs to this exact race/provider, not to
+	// retained packet proof. Race close clears the containing map.
+	collapseControl tcpCandidateControlState
 }
 
 type parsedPacket struct {
@@ -9946,6 +10074,12 @@ type parsedPacketGroup struct {
 	transportAttribution  *transportPacketAttribution
 	admissionObservations *sendPackAdmissionObservations
 	collapseAdmission     tcpCollapseAdmission
+	collapseOwner         *tcpCollapseGroup
+	completionClient      *multiClientChannel
+	collapseNext          *parsedPacketGroup
+	collapseSource        *SendSequence
+	admissionTime         time.Time
+	completionFlags       atomic.Uint64
 }
 
 // flowPin is what a pin rule resolved to for one flow: the owning pinned
@@ -13572,6 +13706,8 @@ type multiClientChannel struct {
 	// Nil outside focused tests. The callback assumes the same conditional
 	// ownership as Transfer: success consumes every group packet.
 	sendGroupForTest func(*parsedPacketGroup, time.Duration, bool) (bool, error)
+	// Holds a registered producer before its typed completion is prepared.
+	beforeGroupCompletionForTest func()
 	// Nil outside focused tests. Replaces only concrete Client admission after
 	// the real packet/group callback is built, since Client is not an interface.
 	sendTransferForTest func(AckFunction) (bool, error)
@@ -15601,6 +15737,7 @@ func sendMultiClientGroupRaceAttempt(
 	client *multiClientChannel,
 	sendPacketGroup *parsedPacketGroup,
 	timeout time.Duration,
+	raceOrder uint64,
 ) bool {
 	sharedGroup := &parsedPacketGroup{
 		packets:               make([]parsedPacket, len(sendPacketGroup.packets)),
@@ -15609,6 +15746,7 @@ func sendMultiClientGroupRaceAttempt(
 		byteCount:             sendPacketGroup.byteCount,
 		transportAttribution:  sendPacketGroup.transportAttribution,
 		admissionObservations: sendPacketGroup.admissionObservations,
+		collapseAdmission:     sendPacketGroup.collapseAdmission,
 	}
 	for packetIndex := range sendPacketGroup.packets {
 		sharedGroup.packets[packetIndex] = sendPacketGroup.packets[packetIndex]
@@ -15616,7 +15754,10 @@ func sendMultiClientGroupRaceAttempt(
 			sendPacketGroup.packets[packetIndex].packet,
 		)
 	}
-	if client.SendGroupWithAck(sharedGroup, timeout, true) {
+	if accepted, err := client.SendGroupDetailedWithAck(sharedGroup, timeout, true, raceOrder); accepted && err == nil {
+		if sharedGroup.completionFlags.Load()&groupCompletionTracked != 0 {
+			sendPacketGroup.completionFlags.Or(groupCompletionSourceControls)
+		}
 		return true
 	}
 	for packetIndex := range sharedGroup.packets {
@@ -15664,6 +15805,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	sendPacketGroup *parsedPacketGroup,
 	timeout time.Duration,
 	ack bool,
+	raceOrders ...uint64,
 ) (bool, error) {
 	// Enforce TCP ACK recovery at the final grouped boundary; no caller can
 	// demote it to NoAck or weaken an affirmative reliable commit.
@@ -15700,13 +15842,15 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 		return true, nil
 	}
 
-	var completionOnce sync.Once
-	ackCallback := func(err error) {
-		completionOnce.Do(func() {
-			sendPacketGroup.collapseAdmission.complete(err)
-			self.observePacketGroupTransferCompletion(sendPacketGroup, ack, err)
-		})
+	if self.beforeGroupCompletionForTest != nil {
+		self.beforeGroupCompletionForTest()
 	}
+	var raceOrder uint64
+	if len(raceOrders) != 0 {
+		raceOrder = raceOrders[0]
+	}
+	self.prepareGroupCompletion(sendPacketGroup, ack, raceOrder)
+	defer sendPacketGroup.finishGroupOffer()
 	opts := []any{scheduleIpFlow(sendPacketGroup.ipPath)}
 	if sendPacketGroup.admissionObservations != nil && self.client != nil {
 		if observer := self.client.settings.SendBufferSettings.SendPackLifecycleObserver; observer != nil {
@@ -15730,12 +15874,17 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	var success bool
 	var err error
 	if self.sendTransferForTest != nil {
-		success, err = self.sendTransferForTest(ackCallback)
+		success, err = self.sendTransferForTest(func(err error) { sendPacketGroup.sendAckResult(0, err) })
+	} else if self.args.Destination.Len() == 0 {
+		err = errors.New("Must have at least one destination id.")
 	} else {
-		success, err = self.client.sendMultiHopGroupWithTimeoutDetailed(
+		intermediaryIds, destinationId := self.args.Destination.SplitTail()
+		success, err = self.client.sendGroupToTargetWithTimeoutDetailed(
 			frames,
-			self.args.Destination,
-			ackCallback,
+			destinationId,
+			intermediaryIds,
+			nil,
+			sendPacketGroup,
 			timeout,
 			opts...,
 		)
@@ -15966,7 +16115,7 @@ func (self *multiClientChannel) observePacketGroupTransferCompletion(
 		self.addSendGroupCompletion(sendPacketGroup, ack)
 		return
 	}
-	if packetTransferExpiredUnwritten(err) {
+	if packetTransferExpiredUnwritten(err) || sendGroupCapacityFailure(err) {
 		self.addSendAbandonedGroup(sendPacketGroup)
 		return
 	}
