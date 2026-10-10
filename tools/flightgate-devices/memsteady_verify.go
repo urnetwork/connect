@@ -1,3 +1,5 @@
+// Validates the fixed memory profiles and the ownership evidence shared by
+// standalone iOS audits and the two-profile physical campaign.
 package main
 
 import (
@@ -24,7 +26,56 @@ const (
 	iosTransferRootBytes     = iosClientTransferBytes + iosProviderShareBytes
 	iosNatBudgetBytes        = iosProviderShareBytes / 2
 	iosPeerPinBudgetBytes    = 1024 * 1024
+	androidMemoryProfile     = "android"
 )
+
+// Every ceiling comes from the selected profile, never from reported limits.
+// The process soft limit and observed runtime ceiling are equal in both profiles.
+type memsteadyMemoryPolicy struct {
+	MemoryProfile         string
+	DeviceTargetBytes     int64
+	ProcessSoftLimitBytes int64
+	GoRuntimeLimitBytes   int64
+	CarrierRootBytes      int64
+	CarrierRootMaxCount   int64
+	CarrierDeviceBytes    int64
+	CarrierH1OverlapBytes int64
+	TransferRootBytes     int64
+	NatBudgetBytes        int64
+}
+
+// Only the current iOS audit and normal Android profiles qualify. Carrier
+// constructors keep 16 slots at both targets; H1 scales from 512 KiB at 64 MiB
+// to its 256-KiB floor at 32 MiB (connect/memory_budget.go and transport.go).
+func memsteadyPolicyForProfile(profile string) (memsteadyMemoryPolicy, error) {
+	var targetBytes, h1Bytes int64
+	switch profile {
+	case iosMemoryAuditProfile:
+		targetBytes, h1Bytes = iosDeviceTargetBytes, iosCarrierH1OverlapBytes
+	case androidMemoryProfile:
+		targetBytes, h1Bytes = 64*1024*1024, 512*1024
+	default:
+		return memsteadyMemoryPolicy{}, fmt.Errorf("unsupported explicit memory profile %q", profile)
+	}
+	return memsteadyMemoryPolicy{
+		MemoryProfile: profile, DeviceTargetBytes: targetBytes,
+		ProcessSoftLimitBytes: targetBytes, GoRuntimeLimitBytes: targetBytes,
+		CarrierRootBytes: targetBytes / 4, CarrierRootMaxCount: 16,
+		CarrierDeviceBytes: targetBytes / 4, CarrierH1OverlapBytes: h1Bytes,
+		TransferRootBytes: targetBytes*9/20 + targetBytes/5, NatBudgetBytes: targetBytes / 10,
+	}, nil
+}
+
+// Exact metadata binding prevents a known label from authorizing custom limits.
+func (self memsteadyMemoryPolicy) validateMeta(meta memsteadyMeta) error {
+	if meta.MemoryProfile != self.MemoryProfile || meta.DeviceMemoryTargetBytes != self.DeviceTargetBytes ||
+		meta.ProcessMemoryLimitBytes != self.ProcessSoftLimitBytes || meta.ProcessTransportBytes != self.CarrierRootBytes ||
+		meta.ProcessTransportCount != self.CarrierRootMaxCount {
+		return fmt.Errorf("memory profile %q requires target/soft limit %d/%d bytes and shared carrier root %d bytes/%d slots",
+			self.MemoryProfile, self.DeviceTargetBytes, self.ProcessSoftLimitBytes, self.CarrierRootBytes, self.CarrierRootMaxCount)
+	}
+	return nil
+}
 
 type transferByteBudgetSample struct {
 	TotalBytes    int64
@@ -51,10 +102,16 @@ func isTransferBudgetField(key string) bool {
 	return false
 }
 
+// Retains the standalone iOS validator used by existing audit callers.
+func validateDeviceTransferBudget(payload map[string]any) (deviceTransferBudgetSample, error) {
+	policy, _ := memsteadyPolicyForProfile(iosMemoryAuditProfile)
+	return validateDeviceTransferBudgetForPolicy(payload, policy)
+}
+
 // These child budgets are diagnostic subsets of the same root, not extra
 // memory. Check each independently; adding them would double-count Pack and
 // could also mistake overlapping permission ceilings for reservations.
-func validateDeviceTransferBudget(payload map[string]any) (deviceTransferBudgetSample, error) {
+func validateDeviceTransferBudgetForPolicy(payload map[string]any, policy memsteadyMemoryPolicy) (deviceTransferBudgetSample, error) {
 	var sample deviceTransferBudgetSample
 	for _, budget := range []struct {
 		prefix   string
@@ -62,12 +119,12 @@ func validateDeviceTransferBudget(payload map[string]any) (deviceTransferBudgetS
 		ledger   bool
 		expected int64
 	}{
-		{"transfer_root_", &sample.Root, true, iosTransferRootBytes},
-		{"client_transfer_", &sample.Client, false, 0},
-		{"provider_transfer_", &sample.Provider, false, 0},
-		{"nat_budget_", &sample.Nat, true, iosNatBudgetBytes},
-		{"pack_queue_", &sample.Pack, false, 0},
-		{"peer_pin_", &sample.Pins, true, iosPeerPinBudgetBytes},
+		{prefix: "transfer_root_", sample: &sample.Root, ledger: true, expected: policy.TransferRootBytes},
+		{prefix: "client_transfer_", sample: &sample.Client},
+		{prefix: "provider_transfer_", sample: &sample.Provider},
+		{prefix: "nat_budget_", sample: &sample.Nat, ledger: true, expected: policy.NatBudgetBytes},
+		{prefix: "pack_queue_", sample: &sample.Pack},
+		{prefix: "peer_pin_", sample: &sample.Pins, ledger: true, expected: iosPeerPinBudgetBytes},
 	} {
 		fields := []struct {
 			key    string
@@ -180,7 +237,14 @@ func validateProcessCarrierBudget(payload map[string]any) (processCarrierBudgetS
 	return validateCarrierBudget(payload, "transport_budget_", iosCarrierRootBytes)
 }
 
+// Retains the iOS slot and handoff contract for standalone audit callers.
 func validateCarrierBudget(payload map[string]any, prefix string, expectedBytes int64) (processCarrierBudgetSample, error) {
+	policy, _ := memsteadyPolicyForProfile(iosMemoryAuditProfile)
+	return validateCarrierBudgetForPolicy(payload, prefix, expectedBytes, policy)
+}
+
+// Checks the complete root or device snapshot against the selected profile.
+func validateCarrierBudgetForPolicy(payload map[string]any, prefix string, expectedBytes int64, policy memsteadyMemoryPolicy) (processCarrierBudgetSample, error) {
 	keys := []string{
 		"total_bytes", "used_bytes", "max_count", "used_count", "pending_h1", "pending_h1_bytes",
 		"reserved_bytes", "released_bytes", "active_handoff_count", "active_handoff_bytes", "active_handoff_slots",
@@ -215,9 +279,9 @@ func validateCarrierBudget(payload map[string]any, prefix string, expectedBytes 
 		}
 		*target = value
 	}
-	if sample.TotalBytes != expectedBytes || sample.MaxCount != iosCarrierRootMaxCount {
+	if sample.TotalBytes != expectedBytes || sample.MaxCount != policy.CarrierRootMaxCount {
 		return sample, fmt.Errorf("%s is %d bytes/%d slots, want %d/%d",
-			prefix, sample.TotalBytes, sample.MaxCount, expectedBytes, iosCarrierRootMaxCount)
+			prefix, sample.TotalBytes, sample.MaxCount, expectedBytes, policy.CarrierRootMaxCount)
 	}
 	if sample.ReleasedBytes > sample.ReservedBytes || sample.ReservedBytes-sample.ReleasedBytes != sample.UsedBytes {
 		return sample, fmt.Errorf("%s reserve/release accounting is not balanced", prefix)
@@ -234,7 +298,7 @@ func validateCarrierBudget(payload map[string]any, prefix string, expectedBytes 
 			return sample, fmt.Errorf("%s has inactive pair residue or an unpaired loan", prefix)
 		}
 	} else {
-		if err := validateCarrierHandoffPair(sample.Pair); err != nil {
+		if err := validateCarrierHandoffPairForPolicy(sample.Pair, policy); err != nil {
 			return sample, fmt.Errorf("%s: %w", prefix, err)
 		}
 		if sample.UsedBytes < 2*sample.Pair.Bytes || sample.UsedCount < 2*sample.Pair.Slots {
@@ -255,7 +319,7 @@ func validateCarrierBudget(payload map[string]any, prefix string, expectedBytes 
 		if sample.Pair.ID == 0 || sample.AdditionalPair.ID == sample.Pair.ID {
 			return sample, fmt.Errorf("%s has an orphaned or duplicate additional pair", prefix)
 		}
-		if err := validateCarrierHandoffPair(sample.AdditionalPair); err != nil {
+		if err := validateCarrierHandoffPairForPolicy(sample.AdditionalPair, policy); err != nil {
 			return sample, fmt.Errorf("%s additional pair: %w", prefix, err)
 		}
 		if sample.UsedBytes < 2*sample.AdditionalPair.Bytes || sample.UsedCount < 2*sample.AdditionalPair.Slots {
@@ -269,29 +333,42 @@ func validateCarrierBudget(payload map[string]any, prefix string, expectedBytes 
 	return sample, nil
 }
 
+// Retains the exact iOS H1 claim for standalone audit callers.
 func validateCarrierHandoffPair(pair carrierHandoffPairSample) error {
+	policy, _ := memsteadyPolicyForProfile(iosMemoryAuditProfile)
+	return validateCarrierHandoffPairForPolicy(pair, policy)
+}
+
+// Requires the exact H1 claim at every primary, additional and active handoff.
+func validateCarrierHandoffPairForPolicy(pair carrierHandoffPairSample, policy memsteadyMemoryPolicy) error {
 	validClass := func(class string) bool {
 		return class == "h1" || class == "h3_auto" || class == "h3_explicit"
 	}
-	// This audit has one fixed iOS profile: an H1 endpoint always owns one
-	// physical carrier slot and exactly 256 KiB. Upper bounds alone would
-	// certify consistently underreported primary/additional/active evidence.
+	// An H1 endpoint owns one physical carrier slot and the profile's exact
+	// byte claim. Upper bounds would certify coherently underreported evidence.
 	if pair.ID <= 0 || !validClass(pair.From) || !validClass(pair.To) ||
 		(pair.From != "h1" && pair.To != "h1") ||
-		pair.H1Bytes != iosCarrierH1OverlapBytes || pair.Slots != 1 ||
+		pair.H1Bytes != policy.CarrierH1OverlapBytes || pair.Slots != 1 ||
 		pair.Bytes <= 0 || pair.H1Bytes < pair.Bytes ||
 		(pair.Owner != "device" && pair.Owner != "process" && pair.Owner != "other_device") {
-		return errors.New("handoff pair requires valid identity, exactly one slot and a 256-KiB H1 claim, with overlap no larger than that claim")
+		return fmt.Errorf("handoff pair requires valid identity, exactly one slot and a %d-byte H1 claim, with overlap no larger than that claim", policy.CarrierH1OverlapBytes)
 	}
 	return nil
 }
 
+// Retains the complete iOS hierarchy checks for standalone audit callers.
 func validateCarrierBudgetHierarchy(payload map[string]any) (processCarrierBudgetSample, processCarrierBudgetSample, error) {
-	root, err := validateProcessCarrierBudget(payload)
+	policy, _ := memsteadyPolicyForProfile(iosMemoryAuditProfile)
+	return validateCarrierBudgetHierarchyForPolicy(payload, policy)
+}
+
+// Both levels must prove the same owners and loans under one fixed profile.
+func validateCarrierBudgetHierarchyForPolicy(payload map[string]any, policy memsteadyMemoryPolicy) (processCarrierBudgetSample, processCarrierBudgetSample, error) {
+	root, err := validateCarrierBudgetForPolicy(payload, "transport_budget_", policy.CarrierRootBytes, policy)
 	if err != nil {
 		return root, processCarrierBudgetSample{}, err
 	}
-	child, err := validateCarrierBudget(payload, "device_transport_budget_", iosCarrierDeviceBytes)
+	child, err := validateCarrierBudgetForPolicy(payload, "device_transport_budget_", policy.CarrierDeviceBytes, policy)
 	if err != nil {
 		return root, child, err
 	}

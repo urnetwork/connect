@@ -19,13 +19,18 @@
 // in a comment or a string, and would miss an aliased or dot import entirely. Build
 // tags are deliberately not applied — a forbidden import inside a _windows.go file is
 // still a forbidden import.
+// Package clauses are retained: connect's internal tests belong to connect,
+// while connect_test files are a separate consumer package in the test binary.
+// An external package clause in a non-test file is not that Go test boundary.
 package connect
 
 import (
+	"fmt"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,19 +43,22 @@ const (
 	messagegroupPath = modulePath + "/messagegroup"
 )
 
-// importsInDir returns every import path appearing in the go files directly inside
-// dir, test files included, with the surrounding quotes removed. It does not recurse:
-// each package is judged on its own files, so a violation is reported against the
-// package that actually contains it rather than against its parent. A directory that
-// cannot be read is an error rather than an empty result, because a gate that silently
-// scans nothing passes forever.
-func importsInDir(t *testing.T, dir string) map[string][]string {
+// Package clauses and source filenames retain the real internal/external test
+// boundary. Import paths are still parsed, including aliases and build tags.
+type sourcePackageImports struct {
+	files   []string
+	imports map[string][]string
+}
+
+// Read every direct Go source, without build-tag filtering. Missing, empty or
+// malformed source cannot silently turn a dependency gate into an empty pass.
+func importsByPackageInDir(t *testing.T, dir string) map[string]*sourcePackageImports {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("reading %s: %v", dir, err)
 	}
-	found := map[string][]string{}
+	found := map[string]*sourcePackageImports{}
 	files := 0
 	fset := token.NewFileSet()
 	for _, entry := range entries {
@@ -63,16 +71,36 @@ func importsInDir(t *testing.T, dir string) map[string][]string {
 			t.Fatalf("parsing %s: %v", path, err)
 		}
 		files += 1
+		packageName := file.Name.Name
+		packageImports := found[packageName]
+		if packageImports == nil {
+			packageImports = &sourcePackageImports{imports: map[string][]string{}}
+			found[packageName] = packageImports
+		}
+		packageImports.files = append(packageImports.files, entry.Name())
 		for _, spec := range file.Imports {
 			unquoted, err := strconv.Unquote(spec.Path.Value)
 			if err != nil {
 				t.Fatalf("%s: import path %s is not a quoted string: %v", path, spec.Path.Value, err)
 			}
-			found[unquoted] = append(found[unquoted], entry.Name())
+			packageImports.imports[unquoted] = append(packageImports.imports[unquoted], entry.Name())
 		}
 	}
 	if files == 0 {
 		t.Fatalf("scanned %s and found no go files, so this gate proved nothing", dir)
+	}
+	return found
+}
+
+// Keep the existing whole-directory import contract for the scanner positive
+// control. No source or test file is excluded there.
+func importsInDir(t *testing.T, dir string) map[string][]string {
+	t.Helper()
+	found := map[string][]string{}
+	for _, packageImports := range importsByPackageInDir(t, dir) {
+		for path, files := range packageImports.imports {
+			found[path] = append(found[path], files...)
+		}
 	}
 	return found
 }
@@ -95,10 +123,39 @@ var knownSubpackageImports = map[string]string{
 }
 
 func TestConnectDoesNotImportItsOwnSubpackages(t *testing.T) {
-	imports := importsInDir(t, ".")
+	for _, violation := range connectImportViolations(importsByPackageInDir(t, ".")) {
+		t.Error(violation)
+	}
+}
+
+// Apply the same parent-to-child rule to connect's actual compiled package,
+// internal tests included. Only Go's separate connect_test consumer is distinct;
+// neither a changed namespace nor an external clause in ordinary source bypasses it.
+func connectImportViolations(packages map[string]*sourcePackageImports) []string {
+	var violations []string
+	for name, packageImports := range packages {
+		switch name {
+		case "connect":
+		case "connect_test":
+			for _, file := range packageImports.files {
+				if !strings.HasSuffix(file, "_test.go") {
+					violations = append(violations, fmt.Sprintf("%s declares external test package connect_test outside a _test.go file", file))
+				}
+			}
+		default:
+			violations = append(violations, fmt.Sprintf("unexpected package %s in connect source files %v", name, packageImports.files))
+		}
+	}
+	root := packages["connect"]
+	if root == nil {
+		violations = append(violations, "no connect package was scanned, so the parent import gate proved nothing")
+		slices.Sort(violations)
+		return violations
+	}
+	imports := root.imports
 	for _, forbidden := range []string{mlsPath, messagePath, messagegroupPath} {
 		if files, ok := imports[forbidden]; ok {
-			t.Errorf("connect imports %s from %v: the data path must not depend on the messenger", forbidden, files)
+			violations = append(violations, fmt.Sprintf("connect imports %s from %v: the data path must not depend on the messenger", forbidden, files))
 		}
 	}
 	for path, files := range imports {
@@ -108,13 +165,15 @@ func TestConnectDoesNotImportItsOwnSubpackages(t *testing.T) {
 		if _, known := knownSubpackageImports[path]; known {
 			continue
 		}
-		t.Errorf("connect imports its own subpackage %s from %v, which CODESTYLE section Package layering forbids", path, files)
+		violations = append(violations, fmt.Sprintf("connect imports its own subpackage %s from %v, which CODESTYLE section Package layering forbids", path, files))
 	}
 	for path, reason := range knownSubpackageImports {
 		if _, ok := imports[path]; !ok {
-			t.Errorf("%s is allow-listed as %q but is no longer imported: drop it from the allow-list rather than leaving it to license a future import", path, reason)
+			violations = append(violations, fmt.Sprintf("%s is allow-listed as %q but is no longer imported: drop it from the allow-list rather than leaving it to license a future import", path, reason))
 		}
 	}
+	slices.Sort(violations)
+	return violations
 }
 
 // TestImportScannerFindsAForbiddenImport is the positive control, and it is the only
@@ -141,5 +200,97 @@ func TestImportScannerFindsAForbiddenImport(t *testing.T) {
 		if _, ok := imports[want]; !ok {
 			t.Errorf("the scanner missed %s, so the gates above prove nothing", want)
 		}
+	}
+}
+
+// Supply the pre-existing generated-protocol edge so each fixture isolates the
+// package-identity rule instead of tripping the unchanged stale-allow-list check.
+func connectImportFixture(t *testing.T, filename, source string) map[string]*sourcePackageImports {
+	t.Helper()
+	dir := t.TempDir()
+	base := "package connect\nimport _ \"" + modulePath + "/protocol\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "base.go"), []byte(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, filename), []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return importsByPackageInDir(t, dir)
+}
+
+// The original production package cannot borrow an external consumer's import
+// direction, including when the child is reached through an alias.
+func TestConnectImportGateRejectsProductionChild(t *testing.T) {
+	packages := connectImportFixture(t, "conformance.go", "package connect\nimport alias \""+modulePath+"/fingerprint\"\n")
+	violations := connectImportViolations(packages)
+	if len(violations) != 1 || !strings.Contains(violations[0], "conformance.go") || !strings.Contains(violations[0], modulePath+"/fingerprint") {
+		t.Fatalf("production child import was not rejected exactly: %v", violations)
+	}
+}
+
+// An internal test is compiled into connect's test variant, not a separate
+// consumer. A _test.go suffix and a dot import cannot exempt its child edge.
+func TestConnectImportGateRejectsInternalTestChild(t *testing.T) {
+	packages := connectImportFixture(t, "conformance_test.go", "package connect\nimport . \""+modulePath+"/fingerprint\"\n")
+	violations := connectImportViolations(packages)
+	if len(violations) != 1 || !strings.Contains(violations[0], "conformance_test.go") || !strings.Contains(violations[0], modulePath+"/fingerprint") {
+		t.Fatalf("internal-test child import was not rejected exactly: %v", violations)
+	}
+}
+
+// The external test is a real consumer of both packages. Parse and retain its
+// imports rather than hiding test files or allow-listing a conformance path.
+func TestConnectImportGateAcceptsExternalTestConsumer(t *testing.T) {
+	source := "package connect_test\nimport (\n parent \"" + modulePath + "\"\n child \"" + modulePath + "/fingerprint\"\n)\n"
+	packages := connectImportFixture(t, "conformance_test.go", source)
+	consumer := packages["connect_test"]
+	if consumer == nil || len(consumer.imports[modulePath]) != 1 || len(consumer.imports[modulePath+"/fingerprint"]) != 1 {
+		t.Fatal("external consumer imports disappeared from the parsed package graph")
+	}
+	if violations := connectImportViolations(packages); len(violations) != 0 {
+		t.Fatalf("separate external consumer changed the parent dependency graph: %v", violations)
+	}
+}
+
+// All platform/build-tagged files are scanned, regardless of the current host;
+// both production and internal-test imports keep the strict parent rule.
+func TestConnectImportGateRejectsTaggedChild(t *testing.T) {
+	for _, filename := range []string{"conformance_windows.go", "conformance_windows_test.go"} {
+		source := "//go:build windows\n\npackage connect\nimport _ \"" + modulePath + "/fingerprint\"\n"
+		violations := connectImportViolations(connectImportFixture(t, filename, source))
+		if len(violations) != 1 || !strings.Contains(violations[0], filename) || !strings.Contains(violations[0], modulePath+"/fingerprint") {
+			t.Fatalf("%s escaped the import gate: %v", filename, violations)
+		}
+	}
+}
+
+// Only connect_test in a _test.go file is Go's separate root test package.
+// A mismatched namespace or a package clause hidden behind a tag still fails.
+func TestConnectImportGateRejectsPackageMismatch(t *testing.T) {
+	cases := []struct {
+		filename string
+		name     string
+	}{
+		{filename: "consumer.go", name: "connect_test"},
+		{filename: "consumer_windows.go", name: "connect_test"},
+		{filename: "consumer_test.go", name: "other_test"},
+		{filename: "consumer_test.go", name: "connect_test_test"},
+		{filename: "consumer.go", name: "other"},
+	}
+	for _, c := range cases {
+		source := "//go:build windows\n\npackage " + c.name + "\nimport _ \"" + modulePath + "/fingerprint\"\n"
+		violations := connectImportViolations(connectImportFixture(t, c.filename, source))
+		if len(violations) != 1 || !strings.Contains(violations[0], c.filename) || !strings.Contains(violations[0], c.name) {
+			t.Fatalf("%s package %s bypassed package identity: %v", c.filename, c.name, violations)
+		}
+	}
+}
+
+// Comments and ordinary string literals describe imports without adding an
+// edge. The parser, not a filename or text-pattern exception, decides this.
+func TestConnectImportGateIgnoresNonImportText(t *testing.T) {
+	source := "package connect\n// import \"" + modulePath + "/fingerprint\"\nvar example = \"" + modulePath + "/fingerprint\"\n"
+	if violations := connectImportViolations(connectImportFixture(t, "comment_test.go", source)); len(violations) != 0 {
+		t.Fatalf("non-import text created a dependency: %v", violations)
 	}
 }

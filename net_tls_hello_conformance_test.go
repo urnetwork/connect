@@ -1,4 +1,4 @@
-package connect
+package connect_test
 
 // net_tls_hello_conformance_test.go -- Layer A of the fingerprint-drift
 // conformance harness (fingerprint/README.md). it points connect's own merged
@@ -21,23 +21,27 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/urnetwork/connect"
 	"github.com/urnetwork/connect/fingerprint"
 )
+
+// Copy the actual dialers' protocol lists; the oracle does not restate them.
+var conformanceHttpNextProtos, conformanceWebSocketNextProtos = connect.TlsHelloConformanceProtocolsForTest()
 
 // fingerprintEndpointSettings is strategy settings whose dials reach the shared
 // endpoint whatever name they dial, trusting its private ca -- the Layer-A
 // mirror of the harness endpoint real Chrome hits in Layer B.
-func fingerprintEndpointSettings(t *testing.T, endpoint *fingerprint.Endpoint) *ClientStrategySettings {
+func fingerprintEndpointSettings(t *testing.T, endpoint *fingerprint.Endpoint) *connect.ClientStrategySettings {
 	t.Helper()
-	tlsConfig, err := DefaultTlsConfig()
+	tlsConfig, err := connect.DefaultTlsConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
 	tlsConfig.RootCAs = endpoint.CaCertPool()
-	settings := DefaultClientStrategySettings()
+	settings := connect.DefaultClientStrategySettings()
 	settings.TlsConfig = tlsConfig
 	addr := endpoint.Addr()
-	settings.ConnectSettings.DialContextSettings = &DialContextSettings{
+	settings.ConnectSettings.DialContextSettings = &connect.DialContextSettings{
 		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp4", addr)
 		},
@@ -71,13 +75,10 @@ func diffOptionsForPath(nextProtos []string, expectSingleRecord bool) fingerprin
 // captureDialerHellos runs one api request (h2) and one websocket dial
 // (http/1.1) of dialer against endpoint and returns the two client hellos the
 // endpoint captured, parsed, in that order.
-func captureDialerHellos(t *testing.T, endpoint *fingerprint.Endpoint, dialer *clientDialer) (api *fingerprint.ClientHelloFingerprint, webSocket *fingerprint.ClientHelloFingerprint) {
+func captureDialerHellos(t *testing.T, endpoint *fingerprint.Endpoint, dialer connect.TlsHelloConformanceDialerForTest, settings *connect.ClientStrategySettings) (api *fingerprint.ClientHelloFingerprint, webSocket *fingerprint.ClientHelloFingerprint) {
 	t.Helper()
 	authority := fingerprintEndpointAuthority(endpoint)
-	client := dialer.HttpClient()
-	testTlsHelloApiRequest(t, client, authority)
-	client.CloseIdleConnections()
-	testTlsHelloWebSocket(t, dialer, authority)
+	dialer.Capture(t, settings, authority)
 
 	captures := endpoint.CapturedClientHellos()
 	if len(captures) != 2 {
@@ -94,7 +95,7 @@ func captureDialerHellos(t *testing.T, endpoint *fingerprint.Endpoint, dialer *c
 	return parse(captures[0]), parse(captures[1])
 }
 
-// Every merged dialer -- the normal one and the three resilient ones -- emits
+// Every merged dialer -- the normal one and the four resilient ones -- emits
 // the committed Chrome golden's fingerprint to the shared endpoint: the api
 // path on go 1.27, where net/http reads the uTLS connection state, and the
 // websocket path on every toolchain. the fragmenting dialers reshape records on
@@ -105,26 +106,25 @@ func TestConnectDialersPresentChromeGoldenFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, testDialer := range testTlsHelloDialers {
-		endpoint, err := fingerprint.NewEndpoint(fingerprint.EndpointOptions{Handler: testTlsHelloHandler()})
+	for _, testDialer := range connect.TlsHelloConformanceDialersForTest() {
+		endpoint, err := fingerprint.NewEndpoint(fingerprint.EndpointOptions{Handler: connect.TlsHelloConformanceHandlerForTest()})
 		if err != nil {
 			t.Fatal(err)
 		}
-		dialer := testDialer.clientDialer(fingerprintEndpointSettings(t, endpoint))
-		apiHello, webSocketHello := captureDialerHellos(t, endpoint, dialer)
+		apiHello, webSocketHello := captureDialerHellos(t, endpoint, testDialer, fingerprintEndpointSettings(t, endpoint))
 		endpoint.Close()
 
-		expectSingleRecord := !testDialer.fragment
+		expectSingleRecord := !testDialer.Fragment
 		// the websocket path presents the Chrome hello on any toolchain.
-		if drifts := fingerprint.Diff(golden.Fingerprint, webSocketHello, diffOptionsForPath(clientWebSocketNextProtos, expectSingleRecord)); len(drifts) != 0 {
-			t.Errorf("%s websocket path: %s", testDialer.description, fingerprint.FormatDrift(fingerprint.GoldenChrome133Synthetic, drifts))
+		if drifts := fingerprint.Diff(golden.Fingerprint, webSocketHello, diffOptionsForPath(conformanceWebSocketNextProtos, expectSingleRecord)); len(drifts) != 0 {
+			t.Errorf("%s websocket path: %s", testDialer.Description, fingerprint.FormatDrift(fingerprint.GoldenChrome133Synthetic, drifts))
 		}
 		// the api path offers h2, which presents the Chrome hello only where
 		// net/http reads the negotiated protocol off the uTLS connection
 		// (net_tls_hello_go127.go); before go 1.27 it keeps Go's hello there.
-		if httpTransportReadsTlsConnectionState {
-			if drifts := fingerprint.Diff(golden.Fingerprint, apiHello, diffOptionsForPath(clientHttpNextProtos, expectSingleRecord)); len(drifts) != 0 {
-				t.Errorf("%s api path: %s", testDialer.description, fingerprint.FormatDrift(fingerprint.GoldenChrome133Synthetic, drifts))
+		if connect.TlsHelloConformanceHttpStateForTest {
+			if drifts := fingerprint.Diff(golden.Fingerprint, apiHello, diffOptionsForPath(conformanceHttpNextProtos, expectSingleRecord)); len(drifts) != 0 {
+				t.Errorf("%s api path: %s", testDialer.Description, fingerprint.FormatDrift(fingerprint.GoldenChrome133Synthetic, drifts))
 			}
 		}
 	}
@@ -140,17 +140,15 @@ func TestConformanceGateCatchesGoHelloRevert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	endpoint, err := fingerprint.NewEndpoint(fingerprint.EndpointOptions{Handler: testTlsHelloHandler()})
+	endpoint, err := fingerprint.NewEndpoint(fingerprint.EndpointOptions{Handler: connect.TlsHelloConformanceHandlerForTest()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer endpoint.Close()
 	settings := fingerprintEndpointSettings(t, endpoint)
-	settings.TlsClientHelloFingerprint = TlsClientHelloFingerprintGo
-	dialer := testTlsHelloDialers[0].clientDialer(settings)
-
-	_, webSocketHello := captureDialerHellos(t, endpoint, dialer)
-	drifts := fingerprint.Diff(golden.Fingerprint, webSocketHello, diffOptionsForPath(clientWebSocketNextProtos, true))
+	settings.TlsClientHelloFingerprint = connect.TlsClientHelloFingerprintGo
+	_, webSocketHello := captureDialerHellos(t, endpoint, connect.TlsHelloConformanceDialersForTest()[0], settings)
+	drifts := fingerprint.Diff(golden.Fingerprint, webSocketHello, diffOptionsForPath(conformanceWebSocketNextProtos, true))
 	if len(drifts) == 0 {
 		t.Fatal("Go's hello did not drift from the Chrome golden, so the gate would not catch a parrot regression")
 	}
@@ -174,13 +172,12 @@ func TestConformanceGateCatchesStaleGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	endpoint, err := fingerprint.NewEndpoint(fingerprint.EndpointOptions{Handler: testTlsHelloHandler()})
+	endpoint, err := fingerprint.NewEndpoint(fingerprint.EndpointOptions{Handler: connect.TlsHelloConformanceHandlerForTest()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer endpoint.Close()
-	dialer := testTlsHelloDialers[0].clientDialer(fingerprintEndpointSettings(t, endpoint))
-	_, webSocketHello := captureDialerHellos(t, endpoint, dialer)
+	_, webSocketHello := captureDialerHellos(t, endpoint, connect.TlsHelloConformanceDialersForTest()[0], fingerprintEndpointSettings(t, endpoint))
 
 	stale := *golden.Fingerprint
 	stale.SupportedGroups = slices.DeleteFunc(slices.Clone(golden.Fingerprint.SupportedGroups), func(group uint16) bool {
@@ -190,10 +187,10 @@ func TestConformanceGateCatchesStaleGolden(t *testing.T) {
 		return group == uint16(0x11ec)
 	})
 
-	if drifts := fingerprint.Diff(&stale, webSocketHello, diffOptionsForPath(clientWebSocketNextProtos, true)); len(drifts) == 0 {
+	if drifts := fingerprint.Diff(&stale, webSocketHello, diffOptionsForPath(conformanceWebSocketNextProtos, true)); len(drifts) == 0 {
 		t.Fatal("connect's hello did not drift from a stale golden missing the pq key share")
 	}
-	if drifts := fingerprint.Diff(golden.Fingerprint, webSocketHello, diffOptionsForPath(clientWebSocketNextProtos, true)); len(drifts) != 0 {
+	if drifts := fingerprint.Diff(golden.Fingerprint, webSocketHello, diffOptionsForPath(conformanceWebSocketNextProtos, true)); len(drifts) != 0 {
 		t.Fatalf("connect's hello drifted from the correct golden: %s", fingerprint.FormatDrift(fingerprint.GoldenChrome133Synthetic, drifts))
 	}
 }
@@ -203,13 +200,12 @@ func TestConformanceGateCatchesStaleGolden(t *testing.T) {
 // the fragmenting dialers deliberately differ, which the test above does not
 // assert for them; this pins the normal dialer's shape explicitly.
 func TestNormalDialerSendsSingleRecordHello(t *testing.T) {
-	endpoint, err := fingerprint.NewEndpoint(fingerprint.EndpointOptions{Handler: testTlsHelloHandler()})
+	endpoint, err := fingerprint.NewEndpoint(fingerprint.EndpointOptions{Handler: connect.TlsHelloConformanceHandlerForTest()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer endpoint.Close()
-	dialer := testTlsHelloDialers[0].clientDialer(fingerprintEndpointSettings(t, endpoint))
-	_, webSocketHello := captureDialerHellos(t, endpoint, dialer)
+	_, webSocketHello := captureDialerHellos(t, endpoint, connect.TlsHelloConformanceDialersForTest()[0], fingerprintEndpointSettings(t, endpoint))
 	if webSocketHello.RecordCount != 1 {
 		t.Fatalf("the normal dialer sent the hello in %d records, want 1", webSocketHello.RecordCount)
 	}
