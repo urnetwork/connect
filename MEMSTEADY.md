@@ -3854,3 +3854,142 @@ This establishes repeatability of the component result, not live adoption.
 The candidate includes other accumulated private H1 corrections, so integration
 must isolate the intended production changes and qualify their composed parent
 and physical workload. Do not copy diagnostic overlays wholesale into live code.
+
+### 2026-10-08: cold flight size trades loaded latency for bulk speed
+
+Four private, source-frozen H1 diagnostic cells used the unchanged 65,536-byte
+download, original application MTU, 8-second TCP/Transfer retransmit caps and
+version-2 probe deadlines. The treatment changed only the provider's configured
+resend-window maximum/minimum from 2 MiB/256 KiB to 16 KiB/16 KiB.
+This PERFVAR provider has **no memory budget**, so the treatment is a fixed
+window, not an adaptive opening. Pure controls proved that delivery evidence
+and a larger peer advertisement do not make this nil-budget window grow.
+
+| Diagnostic cell | Bulk duration | Goodput, MB/s | Loaded probes, successful/offered | Successful loaded p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Cell-edge control | 10.292 s | 0.006368 | 32/61 | 6.075 s |
+| Cell-edge fixed 16 KiB | 12.765 s | 0.005134 | 75/75 | 3.178 s |
+| Clean control | 7.163 ms | 9.149 | 8/8 | 4.673 ms |
+| Clean fixed 16 KiB | 55.973 ms | 1.171 | 56/56 | 4.595 ms |
+
+All cells delivered the correct payload with complete, zero-overflow causal
+recorders. The clean control nevertheless **failed calibration**: its direct
+underlay was slower than its tunnel. Preserve that exit-1 record; the clean pair
+is not qualified performance evidence. All four are traced, single-process
+diagnostics, not statistical comparisons or baseline promotions. Probe counts
+depend on bulk duration, so the changed denominators are not themselves wins.
+
+The impaired-link timing does demonstrate earlier reply interleaving. Before
+the first reply existed, control wrote 23 original bulk frames (71,624 bytes);
+treatment wrote one (3,444 bytes). The first reply's edge-write-to-device-read
+age fell from about 9.266 s to 0.619 s. The treatment still had packet loss and
+more inner TCP repeated bytes; it did not win merely by eliminating retries.
+Provider Transfer resends remained zero in both cells. Keep inner TCP repeats,
+Transfer retries and outer TCP retransmissions as separate counters.
+
+There is also a coupled effect: changing the window reduced the derived startup
+pacing allowance from 2,958,580 to 32,768 bytes. This experiment does not isolate
+flight size from that allowance. A small established service-rate snapshot does
+not prove the body is paced at that rate while startup allowance remains.
+
+**Reject fixed 16 KiB as a product fix.** It improved impaired-link latency but
+slowed that bulk transfer about 24%, and the clean diagnostic shows a substantial
+startup cost. Next research must distinguish a bounded startup allowance from an
+adaptive opening that demonstrably grows under a matched explicit owner budget.
+Reuse the separately qualified permission-growth component where applicable;
+do not combine it with accumulated private overlays without composed validation.
+Require trace-off repeats, sustained clean throughput and physical measurements
+before adopting a change. No production window/default changed in this study.
+
+Raw evidence beneath `/private/tmp/urnetwork-h1-round03-replay.lXjhtE/`:
+`fixed16k-control-loaded.5mOBxD/traffic.json`,
+`fixed16k-loaded.XnaKIB/traffic.json`, `control-clean.s9xBnI/traffic.json`,
+and `fixed16k-clean.r4dWFD/traffic.json`. Source plan:
+`/private/tmp/urnetwork-h1-fixed16k-diagnostic.CCgroC/plan.json`.
+These host results do not qualify the iOS 32 MiB or Android 64 MiB device limits.
+
+### 2026-10-08: startup capacity correction exposes adjacent owner waits
+
+Two deterministic tests now reproduce startup defects on unchanged production:
+opening credit is still spent after queued service ends discovery, and sparse
+drained control traffic establishes capacity from lifetime bytes rather than
+the selected measurement epoch. In the latter fixture, 4,896 control bytes
+produce a held estimate of 510 B/s and pace of 561 B/s, pricing the first bulk
+message at **6.139037433 seconds**. These are actual semantic failures, not
+build, timeout or resource failures.
+
+The isolated private correction passes all 17 focused controls. Two unchanged
+clean first-flight controls also pass: a 65,536-byte body completes in about
+2.544 ms before its first ACK, with and without a preceding tiny control.
+This is a deterministic finite-flight model, not measured website speed or
+statistically qualified throughput.
+
+The broader candidate run is **not qualified**: 399 top-level tests ran,
+397 passed and two failed; all 24 nested subtests passed. The failures are
+`TestWindowPacingH1CreditAdmissionCannotStarveResend` and
+`TestWindowPacingH1CreditAdmissionCannotHideRouteChange`. An exact no-overlay
+comparison on unchanged production passes both. Thus the candidate introduces
+these assertion failures; the focused pass cannot replace the parent gate.
+
+The nested pacing wait observes cancellation, service changes and ACK lifetime
+but not the immutable route-generation notification. The route replacement
+fixture consequently sends zero messages after H1 retirement versus ten on
+production. A minimal route-wakeup correction and adjacent wait audit are open.
+The retry failure needs a physical-write chronology before attributing scheduler
+starvation: recovery is correctly anchored to first physical write plus its
+existing interval, whereas the fixture observes offer plus three seconds.
+Do not increase timers or force estimate refresh merely to make that test pass.
+
+All processes joined and tested source pins held. Production Go source remains
+unchanged. Raw evidence under `/private/tmp/urnetwork-h1-round03-replay.lXjhtE/`:
+`startup-live-red2.nlYW8h/causal.json`, `startup-live-clean2.XSAvh6/clean.json`,
+`startup-green17.vKeFV3/focused.json`,
+`startup-ordinary399-1.iFychM/ordinary.json`, and
+`startup-live-h1-admission2.Kdn7Hx/baseline.json`.
+Fresh normal/race confirmations, end-to-end trace-off performance, and physical
+32/32-MiB iOS-surrogate and separate 64/64-MiB Android qualification remain open.
+
+### 2026-10-08: recovery ownership and trace-off loaded diagnostics
+
+The route-eligibility correction passes 83 focused top-level controls, including
+zero-allocation ready-send checks. That correctness result is not a performance
+clearance. Original-workload trace-off, single-process diagnostics yielded:
+
+| Source | Reported transfer duration | Goodput, MB/s | Loaded probes successful/offered |
+| --- | ---: | ---: | ---: |
+| Unchanged LIVE | 9.399 s | 0.006972 | 37/56 |
+| Unchanged LIVE repeat | 9.437 s | 0.006944 | 32/56 |
+| Private eligibility/startup candidate | 14.515 s | 0.004515 | 52/86 |
+| Known-bad opening-credit counterfactual | 8.237 s | 0.007956 | 41/49 |
+
+Each delivered the correct body. These are diagnostic arms, not a statistical
+comparison or baseline update. The candidate is held out: its reported duration
+increased and goodput decreased. The counterfactual restores unconditional
+opening credit after queue evidence and deterministically fails the adaptive
+reservation-price invariant; it must not be integrated despite its faster arm.
+
+Reported download duration includes the reverse completion-byte exchange, not
+just body delivery. Separate three-event captures both failed calibration and
+remain unqualified. Their body-to-server-completion intervals were 0.817 s LIVE
+and 1.124 s candidate; the additional 0.307 s did not explain their full reported
+duration difference. Sampled body delivery also slowed. Do not attribute the
+whole post-workload sampler tail to body transfer or use these captures as a win.
+
+Deterministic timing tests confirm an independent recovery scheduling defect:
+a younger charged pacing reservation due at 3 s hides an older accepted Pack's
+physical-write-plus-2-s recovery boundary. Original 60 s ACK lifetime and debt
+remain intact. Fixes must select recovery at its own due time, preserve the
+younger FIFO reservation, and prove eventual actual retry after service is paid.
+Selection alone or an extended timeout is not a sufficient regression test.
+
+The ownership successor passes 56 focused tests in three fresh normal processes
+and one race process. It remains private and needs composed validation and real
+retained-allocation measurements. Budget charges are not measured heap usage.
+No result here qualifies the 32 MiB iOS profile or 64 MiB Android device profile.
+
+Receiver-baseline ACK ordering is the next deterministic hypothesis: production
+observes receiver RTT before confirming the exact unloaded probe, so one ACK may
+first retire startup credit as congestion and later raise the unloaded baseline.
+The proposed correction stages only that exact tuple until successful H1/ACK
+confirmation; genuine prior or sibling congestion must remain sticky. No proven
+root cause or performance improvement is claimed before execution.

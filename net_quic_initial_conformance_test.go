@@ -1,4 +1,4 @@
-package connect
+package connect_test
 
 // net_quic_initial_conformance_test.go -- Layer A of the fingerprint-drift
 // harness for the udp carriers (fingerprint/README.md, net_quic_version.go).
@@ -26,13 +26,14 @@ import (
 
 	quic "github.com/quic-go/quic-go"
 
+	"github.com/urnetwork/connect"
 	"github.com/urnetwork/connect/fingerprint"
 )
 
 // dialAndCaptureQuicInitial dials the shared QUIC endpoint with a quic.Config
 // whose version offer is exactly connect's policy, and returns the first
 // Initial datagram the endpoint captured, parsed.
-func dialAndCaptureQuicInitial(t *testing.T, policy QuicVersionPolicy) *fingerprint.QuicInitialFingerprint {
+func dialAndCaptureQuicInitial(t *testing.T, policy connect.QuicVersionPolicy) *fingerprint.QuicInitialFingerprint {
 	t.Helper()
 	endpoint, err := fingerprint.NewQuicEndpoint(fingerprint.QuicEndpointOptions{})
 	if err != nil {
@@ -82,12 +83,12 @@ func dialAndCaptureQuicInitial(t *testing.T, policy QuicVersionPolicy) *fingerpr
 func TestConnectQuicPolicyOffersPolicyVersionInInitial(t *testing.T) {
 	cases := []struct {
 		description string
-		policy      QuicVersionPolicy
+		policy      connect.QuicVersionPolicy
 		wantVersion uint32
 	}{
-		{description: "prefer-v2", policy: QuicVersionPolicyPreferV2, wantVersion: fingerprint.QuicVersion2},
-		{description: "v2 only", policy: QuicVersionPolicyV2, wantVersion: fingerprint.QuicVersion2},
-		{description: "v1 only", policy: QuicVersionPolicyV1, wantVersion: fingerprint.QuicVersion1},
+		{description: "prefer-v2", policy: connect.QuicVersionPolicyPreferV2, wantVersion: fingerprint.QuicVersion2},
+		{description: "v2 only", policy: connect.QuicVersionPolicyV2, wantVersion: fingerprint.QuicVersion2},
+		{description: "v1 only", policy: connect.QuicVersionPolicyV1, wantVersion: fingerprint.QuicVersion1},
 	}
 	for _, c := range cases {
 		got := dialAndCaptureQuicInitial(t, c.policy)
@@ -110,8 +111,8 @@ func TestConnectQuicPolicyOffersPolicyVersionInInitial(t *testing.T) {
 // is the faithful pre-A13 revert whose Initial drifts against the expected
 // version 2.
 func TestConnectQuicDefaultInitialIsVersion2(t *testing.T) {
-	policy := DefaultConnectSettings().QuicVersionPolicy
-	if policy != QuicVersionPolicyPreferV2 {
+	policy := connect.DefaultConnectSettings().QuicVersionPolicy
+	if policy != connect.QuicVersionPolicyPreferV2 {
 		t.Fatalf("default quic version policy = %q, want prefer-v2", policy)
 	}
 	got := dialAndCaptureQuicInitial(t, policy)

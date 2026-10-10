@@ -27,6 +27,15 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 a subpackage may import its parent or a peer, never a child. This is the same rule
 the Go standard library follows.
 
+The package clause, not just the directory, determines this boundary. An
+internal `_test.go` file declaring `package connect` is part of connect and must
+obey the same rule. A root `_test.go` file declaring `package connect_test` is a
+separately compiled consumer package; it may import connect and its subpackages
+without adding those imports to connect. This is not a test-file exemption:
+non-test files and mismatched package names cannot claim that boundary. Keep any
+bridge to private fixtures in a `_test.go` file; do not export production APIs
+solely to make external tests reach private code.
+
 The reason is that a parent importing a child inverts the dependency: the child is
 supposed to be a detail of the parent, but the compiler now treats the parent as
 depending on it, so the child's API is frozen by its own parent, cycles become easy
