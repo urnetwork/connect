@@ -10,7 +10,13 @@ iOS profile on **both allowlisted Android PERF phones** below, explicitly
 selecting and observing `ios-memory-audit-v2`. Every Go-runtime sample must
 be at most **32 MiB (33,554,432 bytes)**, including startup, traffic, drain,
 role transition, five-minute quiet recovery, and teardown. An ordinary Android
-build cannot qualify, even if its sampled runtime is below 32 MiB.
+build cannot qualify that iOS axis, even if its runtime is below 32 MiB. Full
+PERFVAR/LOWBAR additionally requires the complete same census on both phones
+under normal `android`: exact 64/64-MiB target/soft limit and an independent
+64-MiB observed runtime ceiling in every phase and final retained teardown.
+Each profile has separate attested builds, sessions, samples and seven (or the
+frozen eleven) comparison pairs; neither replaces or pads the other. Missing
+Android steady/performance coverage fails, even after a full iOS-profile pass.
 Historical v1 retains its 20/32/28-MiB meaning; dated 24/28-MiB and Android
 28/40, 28/64, and 64/64 measurements below keep their original inputs and
 verdicts and do not become current-profile receipts. New allocations require
@@ -21,7 +27,7 @@ evidence does not qualify the separate signed-iOS kernel-peak
 
 Memory acceptance includes actual DeviceLocal cancellation/join and a fresh
 native terminal read after the original exporter/ring drain and holder-scope
-release, with profile32/rate0 unchanged. Finish acknowledgement and an unchanged
+release, with the selected 32- or 64-MiB policy/rate0 unchanged. Finish acknowledgement and an unchanged
 quiet file are insufficient. Gate all retained same-metric values from device,
 teardown, status and diagnostic scopes, plus separately counted MemStats/trim/
 owner-census representations; ambiguous prior-profile values do not qualify.
