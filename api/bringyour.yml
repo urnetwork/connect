@@ -180,6 +180,63 @@ paths:
       operationId: privacyTxt
       security: []
       responses:
+        "303":
+          description: Redirect to https://bringyour.com/privacy.txt
+          headers:
+            Location:
+              schema:
+                type: string
+
+  /terms.txt:
+    get:
+      tags: [Other]
+      summary: Terms Txt
+      description: |
+        Redirect (303) to the canonical terms of service on bringyour.com.
+      operationId: termsTxt
+      security: []
+      responses:
+        "303":
+          description: Redirect to https://bringyour.com/terms.txt
+          headers:
+            Location:
+              schema:
+                type: string
+
+  /vdp.txt:
+    get:
+      tags: [Other]
+      summary: Vdp Txt
+      description: |
+        Redirect (303) to the vulnerability disclosure policy on
+        bringyour.com.
+      operationId: vdpTxt
+      security: []
+      responses:
+        "303":
+          description: Redirect to https://bringyour.com/vdp.txt
+          headers:
+            Location:
+              schema:
+                type: string
+
+  /status:
+    get:
+      tags: [Other]
+      summary: Warp Status
+      description: |
+        The serving status of the api process that answered, used by the
+        deploy poll and by fleet status sampling. `status` is a latched value
+        rather than a per-request health check, so this route stays O(1) and
+        never couples a deploy poll to database load: "ok" while the process
+        serves, a string beginning `error` while it is not ready (which fails
+        a deploy poll), and "draining" from SIGTERM onwards (deliberately not
+        an error, so an operator-initiated drain is not counted as a service
+        error). `host`, `service` and `block` name the process that answered,
+        and `client_address` is the caller address it observed.
+      operationId: warpStatus
+      security: []
+      responses:
         "200":
           description: OK.
           content:
@@ -7748,63 +7805,6 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/SessionOperationResult"
-        "303":
-          description: Redirect to https://bringyour.com/privacy.txt
-          headers:
-            Location:
-              schema:
-                type: string
-
-  /terms.txt:
-    get:
-      tags: [Other]
-      summary: Terms Txt
-      description: |
-        Redirect (303) to the canonical terms of service on bringyour.com.
-      operationId: termsTxt
-      security: []
-      responses:
-        "303":
-          description: Redirect to https://bringyour.com/terms.txt
-          headers:
-            Location:
-              schema:
-                type: string
-
-  /vdp.txt:
-    get:
-      tags: [Other]
-      summary: Vdp Txt
-      description: |
-        Redirect (303) to the vulnerability disclosure policy on
-        bringyour.com.
-      operationId: vdpTxt
-      security: []
-      responses:
-        "303":
-          description: Redirect to https://bringyour.com/vdp.txt
-          headers:
-            Location:
-              schema:
-                type: string
-
-  /status:
-    get:
-      tags: [Other]
-      summary: Warp Status
-      description: |
-        The serving status of the api process that answered, used by the
-        deploy poll and by fleet status sampling. `status` is a latched value
-        rather than a per-request health check, so this route stays O(1) and
-        never couples a deploy poll to database load: "ok" while the process
-        serves, a string beginning `error` while it is not ready (which fails
-        a deploy poll), and "draining" from SIGTERM onwards (deliberately not
-        an error, so an operator-initiated drain is not counted as a service
-        error). `host`, `service` and `block` name the process that answered,
-        and `client_address` is the caller address it observed.
-      operationId: warpStatus
-      security: []
-      responses:
     ClientJwtRefused:
       description: |
         The bearer token is a client JWT (`by_client_jwt`, from
