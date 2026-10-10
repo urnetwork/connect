@@ -69,6 +69,19 @@ func (self *sendPackAdmission) tryAcquire(
 	return false, false, self.notify
 }
 
+// An immediate whole-group write cannot overtake an earlier admitted Pack.
+// Its one slot also bounds concurrent caller-side wire materialization.
+func (self *sendPackAdmission) tryAcquireEmpty(key sendSchedulingKey) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.closed || self.count != 0 {
+		return false
+	}
+	self.count = 1
+	self.byKey[key] = 1
+	return true
+}
+
 func (self *sendPackAdmission) broadcastWithLock() {
 	close(self.notify)
 	self.notify = make(chan struct{})

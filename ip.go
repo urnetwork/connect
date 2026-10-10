@@ -277,6 +277,8 @@ type ipPacketGroup struct {
 	ipPaths   []IpPath
 	payloads  [][]byte
 	byteCount ByteCount
+	// Present only during one synchronous batch offer/retry scope.
+	batchAdmission *ipPacketGroupAdmission
 }
 
 // Returns a comparable flow key and a path with owned canonical addresses.

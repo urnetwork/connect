@@ -71,6 +71,9 @@ func TestEveryPoolBufferEntryPointDeclaresItsOwnership(t *testing.T) {
 		{"Client.SendWithTimeout", takesOnSuccess},
 		{"Client.SendWithTimeoutDetailed", takesOnSuccess},
 		{name: "Client.sendWithTimeoutAdmissionDetailed", rule: takesOnSuccess},
+		{name: "ipPacketGroupBatch.offer", rule: takes},
+		{name: "RemoteUserNatMultiClient.sendPreparedPacketGroup", rule: takesOnSuccess},
+		{name: "RemoteUserNatMultiClient.sendParsedPacketGroupAttempt", rule: takesOnSuccess},
 	}
 
 	docs := packageDocComments(t)

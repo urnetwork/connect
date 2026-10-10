@@ -8302,10 +8302,40 @@ func (self *SendSequence) applyNoAckFastPathAccounting() {
 // rule out — a contract switch published between the read and the write — can
 // be driven deterministically.
 func (self *SendSequence) readNoAckFastPath(sendPack *SendPack) *noAckFastPathSnapshot {
-	if sendPack.Ack || sendPack.Frame == nil || sendPack.ForceUnwrapped || sendPack.logicalGroup {
+	if len(sendPack.noAckFastPathFrames()) == 0 {
 		return nil
 	}
 	return self.noAckFastPath.Load()
+}
+
+// Only an untouched whole UDP group fitting the conservative shared chunk
+// bounds can use one direct write. Split, reliable and compatibility groups
+// retain their ordinary source-owned cursor and completion path.
+func (self *SendPack) noAckFastPathFrames() []*protocol.Frame {
+	if self.Ack || self.ForceUnwrapped {
+		return nil
+	}
+	if !self.logicalGroup {
+		if self.Frame == nil || self.Frames != nil {
+			return nil
+		}
+		return self.frameList()
+	}
+	group, ok := self.ackTarget.(*parsedPacketGroup)
+	if !ok || group.ipPath == nil || group.ipPath.Protocol != IpProtocolUdp ||
+		self.groupFrameIndex != 0 || self.groupCompletion != nil ||
+		len(self.Frames) == 0 || sendPackBatchMaxFrames < len(self.Frames) {
+		return nil
+	}
+	for _, frame := range self.Frames {
+		if frame == nil || !frame.Raw {
+			return nil
+		}
+	}
+	if sendPackBatchMaxMessageByteCount < MessageByteCount(self.Frames) {
+		return nil
+	}
+	return self.Frames
 }
 
 // The immediate write: one non-blocking try at the writer with the snapshot's
@@ -8314,9 +8344,32 @@ func (self *SendSequence) readNoAckFastPath(sendPack *SendPack) *noAckFastPathSn
 func (self *SendSequence) writeNoAckFastPath(
 	snapshot *noAckFastPathSnapshot,
 	sendPack *SendPack,
-) bool {
-	frame := sendPack.Frame
-	messageByteCount := ByteCount(len(frame.MessageBytes))
+) (written bool) {
+	frames := sendPack.noAckFastPathFrames()
+	if len(frames) == 0 {
+		return false
+	}
+	if sendPack.logicalGroup {
+		// Admission spans channel, scheduler and in-progress writes. Requiring
+		// it empty preserves prior in-flow ownership, including split groups.
+		if self.packAdmission == nil {
+			return false
+		}
+		admissionKey := sendPack.schedulingKey
+		if !self.flowIsolation.Load() {
+			admissionKey = sendSchedulingKey{}
+		}
+		if !self.packAdmission.tryAcquireEmpty(admissionKey) {
+			return false
+		}
+		sendPack.admission, sendPack.admissionKey = self.packAdmission, admissionKey
+		defer func() {
+			if !written {
+				sendPack.releaseAdmission()
+			}
+		}()
+	}
+	messageByteCount := MessageByteCount(frames)
 	if !snapshot.reserve(messageByteCount) {
 		return false
 	}
@@ -8357,7 +8410,7 @@ func (self *SendSequence) writeNoAckFastPath(
 			messageId:         messageId,
 			sequenceId:        self.sequenceId,
 			nack:              true,
-			frames:            []*protocol.Frame{frame},
+			frames:            frames,
 			tagSendTime:       uint64(sendTime.UnixMilli()),
 			contractId:        snapshot.contractId,
 			forceStream:       self.forceStream,
@@ -8376,7 +8429,7 @@ func (self *SendSequence) writeNoAckFastPath(
 		pack := &protocol.Pack{
 			MessageId:         messageId.Bytes(),
 			SequenceId:        self.sequenceId.Bytes(),
-			Frames:            []*protocol.Frame{frame},
+			Frames:            frames,
 			Nack:              true,
 			Tag:               &protocol.Tag{SendTime: uint64(sendTime.UnixMilli())},
 			ForceStream:       self.forceStream,
@@ -8442,11 +8495,18 @@ func (self *SendSequence) writeNoAckFastPath(
 
 	// written: the frame is consumed, and the pack completes exactly as the
 	// loop completes a no-acknowledgement item after its write
-	MessagePoolReturn(frame.MessageBytes)
+	if sendPack.logicalGroup {
+		target, _ := sendPack.ackTarget.(sendGroupAdmissionTarget)
+		self.groupAdmitted(target)
+		sendPack.dispositionRange(0, len(frames)).complete(false)
+	}
+	for _, frame := range frames {
+		MessagePoolReturn(frame.MessageBytes)
+	}
 	self.writeCount.Add(1)
 	self.writeByteCount.Add(uint64(len(wireBytes)))
 	self.client.initialSendWriteCount.Add(1)
-	self.client.initialSendFrameCount.Add(1)
+	self.client.initialSendFrameCount.Add(uint64(len(frames)))
 	self.client.initialSendMessageByteCount.Add(uint64(messageByteCount))
 	self.client.sendNoAckWriteCount.Add(1)
 	self.client.sendNoAckFastPathWriteCount.Add(1)

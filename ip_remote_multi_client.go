@@ -6504,8 +6504,28 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 	}
 
 	sentPacketCount := 0
+	batch := ipPacketGroupBatch{
+		timeout:   timeout,
+		readyPass: 1 < len(groups) && timeout != 0,
+		send: func(group *ipPacketGroup, sendTimeout time.Duration) bool {
+			return self.sendPacketGroup(source, provideMode, group, sendTimeout)
+		},
+		complete: func(group *ipPacketGroup, success bool) {
+			if success {
+				sentPacketCount += len(group.packets)
+				for _, packetIndex := range packetIndexes[group] {
+					accepted[packetIndex] = true
+				}
+			} else {
+				for _, packet := range group.packets {
+					MessagePoolReturn(packet)
+				}
+			}
+		},
+	}
 	for _, group := range groups {
 		if smtpNeedsOrderedSend(group.ipPath) {
+			batch.finishPending()
 			// SMTP validation is stream-ordered and may accept an earlier
 			// negotiation segment while rejecting a later plaintext segment.
 			// Preserve that per-packet result instead of applying the ordinary
@@ -6522,17 +6542,9 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 			}
 			continue
 		}
-		if self.sendPacketGroup(source, provideMode, group, timeout) {
-			sentPacketCount += len(group.packets)
-			for _, packetIndex := range packetIndexes[group] {
-				accepted[packetIndex] = true
-			}
-			continue
-		}
-		for _, packet := range group.packets {
-			MessagePoolReturn(packet)
-		}
+		batch.offer(group)
 	}
+	batch.finishPending()
 	return sentPacketCount
 }
 
@@ -6544,6 +6556,15 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 	group *ipPacketGroup,
 	timeout time.Duration,
 ) bool {
+	if group != nil && group.batchAdmission != nil {
+		admission := group.batchAdmission
+		if admission.prepared {
+			return self.sendPreparedPacketGroup(
+				source, provideMode, group, admission.parsed, admission.local, timeout, false,
+			)
+		}
+		admission.prepared = true
+	}
 	if group == nil || group.ipPath == nil || len(group.packets) == 0 ||
 		len(group.ipPaths) != len(group.packets) ||
 		len(group.payloads) != len(group.packets) {
@@ -6632,17 +6653,10 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 		return false
 	}
 	if local {
-		if self.localUserNat == nil || !self.localUserNat.SendPackets(
-			source,
-			provideMode,
-			group.packets,
-			timeout,
-		) {
-			return false
+		if admission := group.batchAdmission; admission != nil {
+			admission.local = true
 		}
-		self.packetStatsCounters.localEgressPacketCount.Add(int64(len(group.packets)))
-		self.packetStatsCounters.localEgressByteCount.Add(int64(group.byteCount))
-		return true
+		return self.sendPreparedPacketGroup(source, provideMode, group, nil, true, timeout, true)
 	}
 
 	pin := flowPin{
@@ -6662,7 +6676,41 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 			group.byteCount,
 		),
 	}
-	if !self.sendParsedPacketGroup(source, provideMode, parsedGroup, timeout) {
+	completeObservations := true
+	if admission := group.batchAdmission; admission != nil {
+		admission.parsed = parsedGroup
+		completeObservations = false
+	}
+	return self.sendPreparedPacketGroup(
+		source, provideMode, group, parsedGroup, false, timeout, completeObservations,
+	)
+}
+
+// Takes on success; refusal keeps the complete group caller-owned.
+// Batch retries reuse policy preparation but re-enter current collapse, client,
+// encryption and bounded queue admission on every actual offer.
+func (self *RemoteUserNatMultiClient) sendPreparedPacketGroup(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	group *ipPacketGroup,
+	parsedGroup *parsedPacketGroup,
+	local bool,
+	timeout time.Duration,
+	completeObservations bool,
+) bool {
+	if local {
+		if self.localUserNat == nil || !self.localUserNat.SendPackets(
+			source, provideMode, group.packets, timeout,
+		) {
+			return false
+		}
+		self.packetStatsCounters.localEgressPacketCount.Add(int64(len(group.packets)))
+		self.packetStatsCounters.localEgressByteCount.Add(int64(group.byteCount))
+		return true
+	}
+	if parsedGroup == nil || !self.sendParsedPacketGroupAttempt(
+		source, provideMode, parsedGroup, timeout, completeObservations, group.batchAdmission,
+	) {
 		return false
 	}
 	parsedGroup.transportAttribution.admit()
@@ -6981,10 +7029,30 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 	provideMode protocol.ProvideMode,
 	sendPacketGroup *parsedPacketGroup,
 	timeout time.Duration,
+) bool {
+	return self.sendParsedPacketGroupAttempt(source, provideMode, sendPacketGroup, timeout, true, nil)
+}
+
+// Takes on success; refusal leaves every original with the caller.
+// The synchronous batch owner joins optional refusal observations only after
+// its final attempt; collapse offer cleanup still runs after every refusal.
+func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	sendPacketGroup *parsedPacketGroup,
+	timeout time.Duration,
+	completeObservations bool,
+	batchAdmission *ipPacketGroupAdmission,
 ) (success bool) {
 	defer func() {
 		if observations := sendPacketGroup.admissionObservations; observations != nil {
-			observations.complete(success)
+			if completeObservations {
+				observations.complete(success)
+			} else {
+				// A retry has a new synchronous SYN offer, not a second
+				// insertion of this scope's still-linked proof node.
+				observations.synAdmission.clear()
+			}
 		}
 		sendPacketGroup.finishCollapseSynOffer()
 	}()
@@ -7031,6 +7099,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 			}
 		}
 		if !self.canSendPacketGroup(sendPacketGroup, update, currentClient) {
+			if batchAdmission != nil {
+				batchAdmission.stop = true
+			}
 			self.tcpCollapseDropCount.Add(uint64(len(sendPacketGroup.packets)))
 			return
 		}
@@ -7042,6 +7113,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 		// suppression is disabled: a new SYN may receive its reply inline.
 		if ipPath.Protocol == IpProtocolTcp {
 			if !sendPacketGroup.prepareCollapseAdmission(update, self) {
+				if batchAdmission != nil {
+					batchAdmission.stop = true
+				}
 				return
 			}
 		}
@@ -7060,6 +7134,15 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(
 				// sequence state is guarded by the per-flow `stateLock`
 				update.commitSequenceGroupForClient(sendPacketGroup, client)
 			} else if err != nil {
+				if batchAdmission != nil && batchAdmission.probing &&
+					errors.Is(err, ErrEncryptionRequiredNotEstablished) {
+					// A readiness visit cannot turn the caller's still-live
+					// encryption wait into a provider reset.
+					return true
+				}
+				if batchAdmission != nil {
+					batchAdmission.stop = true
+				}
 				// reset the path.
 				//
 				// COMPARE-AND-SWAP, not a bare Store: `client` here is a

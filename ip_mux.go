@@ -221,6 +221,22 @@ func (self *IpMux) SendPacketBatch(
 	}
 	sentPacketCount := 0
 	upstream, upstreamGroupSend := self.getUpstreams()
+	batch := ipPacketGroupBatch{
+		timeout:   timeout,
+		readyPass: 1 < len(groups) && timeout != 0,
+		send: func(group *ipPacketGroup, sendTimeout time.Duration) bool {
+			return upstreamGroupSend(source, provideMode, group, sendTimeout)
+		},
+		complete: func(group *ipPacketGroup, success bool) {
+			if success {
+				sentPacketCount += len(group.packets)
+			} else {
+				for _, packet := range group.packets {
+					MessagePoolReturn(packet)
+				}
+			}
+		},
+	}
 	for _, group := range groups {
 		claimed := false
 		if self.onSendGroup != nil {
@@ -240,6 +256,7 @@ func (self *IpMux) SendPacketBatch(
 			continue
 		}
 		if smtpNeedsOrderedSend(group.ipPath) {
+			batch.finishPending()
 			// SMTP's route/encryption decision advances per TCP segment and can
 			// accept an early negotiation segment while rejecting a later one.
 			// The exact-flow batch fast path enters RemoteUserNatMultiClient at
@@ -262,15 +279,10 @@ func (self *IpMux) SendPacketBatch(
 			continue
 		}
 		if upstreamGroupSend != nil {
-			if upstreamGroupSend(source, provideMode, group, timeout) {
-				sentPacketCount += len(group.packets)
-			} else {
-				for _, packet := range group.packets {
-					MessagePoolReturn(packet)
-				}
-			}
+			batch.offer(group)
 			continue
 		}
+		batch.finishPending()
 		if upstream == nil {
 			for _, packet := range group.packets {
 				MessagePoolReturn(packet)
@@ -285,6 +297,7 @@ func (self *IpMux) SendPacketBatch(
 			}
 		}
 	}
+	batch.finishPending()
 	return sentPacketCount
 }
 
