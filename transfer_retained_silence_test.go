@@ -32,8 +32,9 @@ func newRetainedSilenceFixture(t *testing.T, configure func(*SendBufferSettings)
 	return fixture
 }
 
-// Admits one socket-owned return and drops its first physical write, so the
-// destination never sees it. The callback channel reports the terminal result.
+// Admits one socket-owned return and takes its first physical write, which the
+// caller drops so the destination never sees it. The callback channel reports
+// the terminal result.
 func writeSilentRetainedReturn(t *testing.T, fixture *windowRoundFixture, content string) (*windowRoundFrame, chan error) {
 	t.Helper()
 	completed := make(chan error, 1)

@@ -5027,15 +5027,15 @@ type SendBufferSettings struct {
 	// after it has used a carrier without payload retransmission. Zero preserves
 	// AckTimeout. The extension is sticky per item across route changes.
 	UnreliableAckTimeout time.Duration
-	// RetainedAckTimeout bounds a sequence that keeps items past AckTimeout
-	// because their upstream owner cannot regenerate them (provider TCP and
-	// prepared datagram returns). It is how long the destination may
-	// acknowledge nothing, measured from the first successful physical write
-	// after its last acknowledgement; any acknowledgement restarts it, so a
-	// slow live peer is never cut off. When it runs out the sequence exits as
-	// an ordinary ACK timeout does and fails every retained owner. Zero keeps
-	// the historical unbounded retention, which rewrites a dead destination's
-	// whole window every MaxResendInterval until the client closes.
+	// Bounds a sequence that keeps items past AckTimeout because their
+	// upstream owner cannot regenerate them (provider TCP and prepared
+	// datagram returns): how long the destination may acknowledge nothing,
+	// measured from the first successful physical write after its last
+	// acknowledgement. Any acknowledgement restarts it, so a slow live peer is
+	// never cut off. When it runs out the sequence exits as an ordinary ACK
+	// timeout does and fails every retained owner. Zero keeps the historical
+	// unbounded retention, which rewrites a dead destination's whole window
+	// every MaxResendInterval until the client closes.
 	RetainedAckTimeout time.Duration
 	IdleTimeout        time.Duration
 
