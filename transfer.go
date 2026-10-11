@@ -895,7 +895,14 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// liveness watchdog owns early dead-exit conviction; this is only the
 		// final reliable-delivery lifetime and must not bypass those gates.
 		UnreliableAckTimeout: 90 * time.Second,
-		IdleTimeout:          300 * time.Second,
+		// twice the provider's own unreachable-source bound
+		// (RemoteUserNatProviderSettings.ReturnSendAbandonTimeout, 120s), so
+		// its full source release normally acts first. This is the backstop
+		// for the cases that release cannot see: no parked producer, and a
+		// degraded backend, when every dead destination would otherwise be
+		// rewritten every MaxResendInterval indefinitely.
+		RetainedAckTimeout: 240 * time.Second,
+		IdleTimeout:        300 * time.Second,
 		// pause on resend for selectively acknowledged messages
 		SelectiveAckTimeout: 60 * time.Second,
 		// Three distinct later deliveries are the conventional reordering-safe
@@ -5020,7 +5027,17 @@ type SendBufferSettings struct {
 	// after it has used a carrier without payload retransmission. Zero preserves
 	// AckTimeout. The extension is sticky per item across route changes.
 	UnreliableAckTimeout time.Duration
-	IdleTimeout          time.Duration
+	// RetainedAckTimeout bounds a sequence that keeps items past AckTimeout
+	// because their upstream owner cannot regenerate them (provider TCP and
+	// prepared datagram returns). It is how long the destination may
+	// acknowledge nothing, measured from the first successful physical write
+	// after its last acknowledgement; any acknowledgement restarts it, so a
+	// slow live peer is never cut off. When it runs out the sequence exits as
+	// an ordinary ACK timeout does and fails every retained owner. Zero keeps
+	// the historical unbounded retention, which rewrites a dead destination's
+	// whole window every MaxResendInterval until the client closes.
+	RetainedAckTimeout time.Duration
+	IdleTimeout        time.Duration
 
 	SelectiveAckTimeout time.Duration
 	// The number of distinct later selectively acknowledged Packs required to
@@ -6539,6 +6556,10 @@ type SendSequence struct {
 	serviceAckHeadSet    bool
 	// lastHeadAckTime is when the cumulative (head) ACK last advanced.
 	lastHeadAckTime time.Time
+	// The first successful acknowledged-lane write since the destination last
+	// acknowledged an outstanding item, zero while nothing written is
+	// unanswered. Owned by the send worker; RetainedAckTimeout runs from here.
+	retainedSilenceStart time.Time
 	// what this sequence has put on the wire: first writes and recovery
 	// rewrites, counted at the write, so a destination's egress can be
 	// split into delivery and retransmission (THROUGHPUTFIX §13)
@@ -8813,6 +8834,9 @@ sendSequenceLoop:
 		if err := self.retireAckLifetimes(sendTime); err != nil {
 			return
 		}
+		if self.retainedDestinationSilent(sendTime) {
+			return
+		}
 		// before the recovery scans, so an evicted item is due on this pass
 		self.resendEvicted(self.takePendingEvictions())
 		if flightPolicyChanged {
@@ -9325,6 +9349,9 @@ sendSequenceLoop:
 			}
 			return
 		} else if !deadline.IsZero() {
+			timeout = min(timeout, time.Until(deadline))
+		}
+		if deadline, ok := self.retainedSilenceDeadline(); ok {
 			timeout = min(timeout, time.Until(deadline))
 		}
 		idleTimer.Reset(timeout)
@@ -10718,6 +10745,10 @@ func (self *SendSequence) observeCarrierWrite(
 	item *sendItem,
 	disposition transferWriteDisposition,
 ) {
+	// A written item awaits an answer; silence runs until any acknowledgement.
+	if self.retainedSilenceStart.IsZero() {
+		self.retainedSilenceStart = time.Now()
+	}
 	departedLane := uint32(0)
 	if item.carrierRoute != nil && item.carrierRoute != disposition.route {
 		// A changed-carrier item no longer owns its old lane's probe. Read
@@ -11935,6 +11966,8 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		// message not pending ack
 		return
 	}
+	// Any acknowledgement of an outstanding item proves the destination live.
+	self.retainedSilenceStart = time.Time{}
 
 	if !receiverTiming {
 		self.observeAckRtt(item, tag)
