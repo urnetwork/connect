@@ -39,6 +39,42 @@ func (self *SendSequence) ackLifetimeDisposition(item *sendItem, deadline time.T
 	return context.DeadlineExceeded
 }
 
+// When a sequence holding retained items must stop rewriting them. Only a
+// sequence that admitted a retained Pack qualifies; every other sequence is
+// already bounded by its items' ordinary ACK lifetimes.
+func (self *SendSequence) retainedSilenceDeadline() (time.Time, bool) {
+	timeout := self.sendBufferSettings.RetainedAckTimeout
+	if timeout <= 0 || self.retainedSilenceStart.IsZero() || len(self.sendItems) == 0 ||
+		self.ackTimeoutDisposition.Load() != sendAckTimeoutRetained {
+		return time.Time{}, false
+	}
+	return self.retainedSilenceStart.Add(timeout), true
+}
+
+// A destination that has acknowledged nothing written to it for
+// RetainedAckTimeout is unreachable for this sequence. Retention promised to
+// keep socket-owned bytes through slow and lossy delivery, not to rewrite them
+// forever: without this, a retired window, a closed probe client or a lease
+// the platform refuses keeps the whole retained window on the wire every
+// MaxResendInterval. Closing the disposition first refuses a concurrent
+// retained admission, whose caller keeps its bytes and retries through the
+// SendBuffer; the ordinary exit then fails every retained owner.
+func (self *SendSequence) retainedDestinationSilent(now time.Time) bool {
+	if len(self.sendItems) == 0 {
+		// Nothing written is unanswered, so no earlier silence carries over
+		// to the next write, including after item-local expiry.
+		self.retainedSilenceStart = time.Time{}
+		return false
+	}
+	deadline, ok := self.retainedSilenceDeadline()
+	if !ok || now.Before(deadline) {
+		return false
+	}
+	self.ackTimeoutDisposition.Store(sendAckTimeoutClosing)
+	self.recordSendSequenceExit("retained_silence", self.sendItems[0], deadline, context.DeadlineExceeded)
+	return true
+}
+
 // Called only between writes, before applying a pending ACK snapshot. The
 // index reconciles delivery and arrival-anchored renewals before each expiry.
 func (self *SendSequence) retireAckLifetimes(now time.Time) error {

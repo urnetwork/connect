@@ -454,8 +454,9 @@ func (self *PlatformTransport) updateHold() {
 }
 
 // waitDialAdmission parks a mode runner while the transport is held, by its
-// owner, by its pinned family, or by a client limit hold
-// (transport_client_limit.go). False means the transport is closing.
+// owner, by its pinned family, by a client limit hold
+// (transport_client_limit.go), or by a hold on its refused credential
+// (transport_credential_refusal.go). False means the transport is closing.
 func (self *PlatformTransport) waitDialAdmission(ctx context.Context) bool {
 	for {
 		held, notify := self.held.Get()
@@ -468,18 +469,23 @@ func (self *PlatformTransport) waitDialAdmission(ctx context.Context) bool {
 			continue
 		}
 		clientLimitStatus, clientLimitNotify := self.clientLimitHold()
-		if !clientLimitStatus.Exceeded {
+		credentialRefused, credentialRefusalNotify := self.credentialRefused()
+		if !clientLimitStatus.Exceeded && !credentialRefused {
 			return true
 		}
-		if self.settings.clientLimitHoldForTest != nil {
+		if clientLimitStatus.Exceeded && self.settings.clientLimitHoldForTest != nil {
 			self.settings.clientLimitHoldForTest()
 		}
-		// a change of either hold re-runs both checks
+		if credentialRefused && self.settings.credentialRefusalHoldForTest != nil {
+			self.settings.credentialRefusalHoldForTest()
+		}
+		// a change of any hold re-runs every check
 		select {
 		case <-ctx.Done():
 			return false
 		case <-notify:
 		case <-clientLimitNotify:
+		case <-credentialRefusalNotify:
 		}
 	}
 }

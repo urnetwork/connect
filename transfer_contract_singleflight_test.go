@@ -105,9 +105,10 @@ func newPendingContractClient(t *testing.T, settings *ClientSettings) (*Client, 
 	return client, oob
 }
 
-// The real sequence's fourth queue wait occurs after its 1s, 2s, and 4s retry
-// intervals. Its original OOB request is still pending at that exact barrier.
-// A fresh subprocess isolates the legacy process-wide backend-health signal.
+// The real sequence's fifth queue wait occurs after its opening poll and its
+// 1s, 2s, and 4s retry intervals. Its original OOB request is still pending at
+// that exact barrier. A fresh subprocess isolates the legacy process-wide
+// backend-health signal.
 func TestSendSequenceCoalescesPendingContractCreates(t *testing.T) {
 	const childEnv = "URNETWORK_TEST_CONTRACT_CREATE_FLIGHT"
 	if os.Getenv(childEnv) == "" {
@@ -141,7 +142,7 @@ func TestSendSequenceCoalescesPendingContractCreates(t *testing.T) {
 		settings.SendBufferSettings.beforeTakeContractForTest = func(id sendSequenceId) {
 			if id.Destination == destination {
 				waitCount++
-				if waitCount == 4 {
+				if waitCount == 5 {
 					close(waitEntered)
 					<-releaseWait
 				}

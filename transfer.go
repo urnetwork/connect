@@ -895,7 +895,14 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// liveness watchdog owns early dead-exit conviction; this is only the
 		// final reliable-delivery lifetime and must not bypass those gates.
 		UnreliableAckTimeout: 90 * time.Second,
-		IdleTimeout:          300 * time.Second,
+		// twice the provider's own unreachable-source bound
+		// (RemoteUserNatProviderSettings.ReturnSendAbandonTimeout, 120s), so
+		// its full source release normally acts first. This is the backstop
+		// for the cases that release cannot see: no parked producer, and a
+		// degraded backend, when every dead destination would otherwise be
+		// rewritten every MaxResendInterval indefinitely.
+		RetainedAckTimeout: 240 * time.Second,
+		IdleTimeout:        300 * time.Second,
 		// pause on resend for selectively acknowledged messages
 		SelectiveAckTimeout: 60 * time.Second,
 		// Three distinct later deliveries are the conventional reordering-safe
@@ -973,7 +980,15 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		ContractAheadScale:          2,
 		ContractAheadFloorByteCount: kib(256),
 		PrewarmOpeningContract:      true,
-		CompactContractHead:         true,
+		// A quarter of the queue expiry. A contract that would run out within
+		// this asks at its minimum charge, close to where it asked at take,
+		// and a successor that lands this far ahead is used before the
+		// expiry would discard it.
+		ContractPrefetchLeadTime: 30 * time.Second,
+		// A continuous ping charges the one-byte minimum, a few hundred bytes
+		// an hour; a transfer reaches this within a few round trips.
+		ContractPrefetchMinUsedByteCount: kib(64),
+		CompactContractHead:              true,
 		// Disabled until the 1/4/8-lane low-bar campaign selects a measured
 		// default. Receivers always understand and advertise bounded lanes, so a
 		// rollout can enable senders independently without breaking legacy peers.
@@ -5020,7 +5035,17 @@ type SendBufferSettings struct {
 	// after it has used a carrier without payload retransmission. Zero preserves
 	// AckTimeout. The extension is sticky per item across route changes.
 	UnreliableAckTimeout time.Duration
-	IdleTimeout          time.Duration
+	// Bounds a sequence that keeps items past AckTimeout because their
+	// upstream owner cannot regenerate them (provider TCP and prepared
+	// datagram returns): how long the destination may acknowledge nothing,
+	// measured from the first successful physical write after its last
+	// acknowledgement. Any acknowledgement restarts it, so a slow live peer is
+	// never cut off. When it runs out the sequence exits as an ordinary ACK
+	// timeout does and fails every retained owner. Zero keeps the historical
+	// unbounded retention, which rewrites a dead destination's whole window
+	// every MaxResendInterval until the client closes.
+	RetainedAckTimeout time.Duration
+	IdleTimeout        time.Duration
 
 	SelectiveAckTimeout time.Duration
 	// The number of distinct later selectively acknowledged Packs required to
@@ -5312,6 +5337,33 @@ type SendBufferSettings struct {
 	//
 	// off restores the previous behavior of requesting it on demand.
 	PrewarmOpeningContract bool
+
+	// How long before the current contract is projected to run out its
+	// successor is requested. The projection is the contract's own
+	// consumption rate since it became current, against the room left above
+	// the ahead-announcement floor, so the successor lands and is announced
+	// before the switch needs it.
+	//
+	// The successor used to be requested the moment a contract was taken.
+	// Most sequences never exhaust their contract: a quality window's
+	// continuous pings, the provider's echo of them, a probe to a provider
+	// that never answers, a short exchange. Their successor sat in the queue
+	// until it was closed at zero, at sequence end or after the queue expiry,
+	// and it was the larger contract of the two, since the size ramp jumps
+	// from the opening megabyte to a quarter of the standard size. A
+	// successor that lands more than the queue expiry before it is needed is
+	// discarded the same way, so the lead stays well below that expiry.
+	//
+	// Zero or negative restores the request at take. Contracts to a
+	// same-network peer always keep it: they escrow nothing and the queue
+	// retains their newest successor past the expiry.
+	ContractPrefetchLeadTime time.Duration
+	// The least a contract must have carried before its successor is
+	// requested at all, capped at half of the contract. Below it a sequence
+	// is carrying pings or probes, which never exhaust a contract within its
+	// life; above it the request goes out within a few milliseconds for any
+	// transfer fast enough to need it.
+	ContractPrefetchMinUsedByteCount ByteCount
 
 	// CompactContractHead replaces a repeated full contract on a new head with
 	// the id of the contract the receiver already acknowledged. This keeps an
@@ -6418,6 +6470,15 @@ type SendSequence struct {
 	// contract. One attempt per contract, and a miss falls back to today's
 	// path for that contract only. Reset when a contract becomes current.
 	aheadSendContractAttempted bool
+	// Whether the current contract's successor has been requested, and when
+	// the current contract became current, which is where its consumption
+	// rate is measured from (see `ContractPrefetchLeadTime`). Both reset when
+	// a contract becomes current. Owned by the sequence goroutine.
+	successorContractRequested bool
+	sendContractSetTime        time.Time
+	// Whether the current contract's successor is requested at take and at
+	// announcement rather than once it is due (`successorContractEagerForKey`).
+	successorContractEager bool
 	// Set when a contract became current without an opening Pack of its own,
 	// so the next Pack carries its contract frame and the receiver switches
 	// where it switches today. Owned by the sequence goroutine.
@@ -6528,6 +6589,9 @@ type SendSequence struct {
 	// contractTakenForTest is a nil production seam that lets regressions pause
 	// after queue ownership transfers but before the contract becomes the head.
 	contractTakenForTest func(sendContractMetadata)
+	// Nil in production; a row's clock for the successor projection
+	// (`successorContractDue`).
+	successorContractNowForTest func() time.Time
 
 	idleCondition *IdleCondition
 
@@ -6539,6 +6603,10 @@ type SendSequence struct {
 	serviceAckHeadSet    bool
 	// lastHeadAckTime is when the cumulative (head) ACK last advanced.
 	lastHeadAckTime time.Time
+	// The first successful acknowledged-lane write since the destination last
+	// acknowledged an outstanding item, zero while nothing written is
+	// unanswered. Owned by the send worker; RetainedAckTimeout runs from here.
+	retainedSilenceStart time.Time
 	// what this sequence has put on the wire: first writes and recovery
 	// rewrites, counted at the write, so a destination's egress can be
 	// split into delivery and retransmission (THROUGHPUTFIX §13)
@@ -8165,7 +8233,25 @@ func (self *noAckFastPathSnapshot) reserve(byteCount ByteCount) bool {
 		return false
 	}
 	self.reservedByteCount.Add(effective)
+	self.wakeForSuccessorCheck()
 	return true
+}
+
+// Wakes the owner once when a reservation has brought the contract's room down
+// to its armed successor check. Nonblocking: the owner's wake channel holds
+// one signal, and a full channel already means a pass is coming.
+func (self *noAckFastPathSnapshot) wakeForSuccessorCheck() {
+	level := self.contract.successorCheckRemainingByteCount.Load()
+	if level <= 0 || level < self.remainingByteCount.Load() {
+		return
+	}
+	if !self.contract.successorCheckRemainingByteCount.CompareAndSwap(level, 0) {
+		return
+	}
+	select {
+	case self.settled <- struct{}{}:
+	default:
+	}
 }
 
 func reserveNoAckContractBytes(remainingByteCount *atomic.Int64, effective int64) bool {
@@ -8808,9 +8894,15 @@ sendSequenceLoop:
 		// against next is published after (THROUGHPUTFIX §38.12)
 		self.applyNoAckFastPathAccounting()
 		self.publishNoAckFastPath()
+		// fast-path writes are charged only here, so this is where they can
+		// bring the current contract's successor due
+		self.maybeRequestSuccessorContract(0)
 
 		sendTime := time.Now()
 		if err := self.retireAckLifetimes(sendTime); err != nil {
+			return
+		}
+		if self.retainedDestinationSilent(sendTime) {
 			return
 		}
 		// before the recovery scans, so an evicted item is due on this pass
@@ -9327,6 +9419,9 @@ sendSequenceLoop:
 		} else if !deadline.IsZero() {
 			timeout = min(timeout, time.Until(deadline))
 		}
+		if deadline, ok := self.retainedSilenceDeadline(); ok {
+			timeout = min(timeout, time.Until(deadline))
+		}
 		idleTimer.Reset(timeout)
 		select {
 		case <-self.ctx.Done():
@@ -9486,6 +9581,9 @@ func (self *SendSequence) updateContractWithAckPromotion(
 	if self.sendContract != nil &&
 		(allowAckPromotion || self.sendContractAcked) &&
 		self.sendContract.update(messageByteCount) {
+		// the successor is requested once this contract is projected to run
+		// out soon, ahead of its announcement below
+		self.maybeRequestSuccessorContract(messageByteCount)
 		// THROUGHPUTFIX §39.1: the successor is announced while the current
 		// contract still has a threshold of room, so its acknowledgement is
 		// back before the switch needs it.
@@ -9499,6 +9597,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 	// permission as creating a contract: a Pack that may not promote may not
 	// change the contract under the sequence either.
 	if allowAckPromotion && self.setAheadContract(messageByteCount) {
+		self.maybeRequestSuccessorContract(messageByteCount)
 		self.maybeAnnounceContractAhead()
 		return true, false, nil
 	}
@@ -9597,21 +9696,13 @@ func (self *SendSequence) updateContractWithAckPromotion(
 			}
 			if setNextContract(contract, metadata) {
 				self.contractSeqIndex += 1
-				// async queue up the next contract.
-				//
-				// Skipped while the backend is unreachable. A sequence that
-				// still holds queued contracts keeps satisfying TakeContract,
-				// so without this check it would keep prefetching and keep the
-				// OOB storm going for exactly the sequences that still have
-				// work to do. The contract just taken is unaffected: only the
-				// prefetch of the following one waits for the backend.
-				if !isBackendDegraded() {
-					prefetchMetadata := self.contractMetadata()
-					self.client.ContractManager().CreateContract(
-						prefetchMetadata.key,
-						self.contractSeqIndex,
-						ByteCount(32+float32(messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
-					)
+				// async queue up the next contract: here where successors are
+				// requested eagerly, otherwise once this one is projected to
+				// run out (see `ContractPrefetchLeadTime`)
+				if self.successorContractEager {
+					self.requestSuccessorContract(self.contractMetadata().key, messageByteCount)
+				} else {
+					self.maybeRequestSuccessorContract(messageByteCount)
 				}
 				return true
 			}
@@ -9658,6 +9749,15 @@ func (self *SendSequence) updateContractWithAckPromotion(
 			if 0 < initialWait {
 				retryInterval = nextCreateContractRetryInterval(retryInterval, maxRetryInterval)
 			}
+		} else if self.sendBufferSettings.PrewarmOpeningContract &&
+			self.sendBufferSettings.CreateContractTimeout > 0 &&
+			traceNextContract(0) {
+			// The opening contract requested as the sequence started
+			// (`PrewarmOpeningContract`) may already be queued. Take it before
+			// requesting: once that request has completed the one below is not
+			// absorbed by it, and would mint a second opening contract that the
+			// queue then holds unused.
+			return true
 		}
 
 		for {
@@ -9744,6 +9844,120 @@ func nextCreateContractRetryInterval(current time.Duration, maximum time.Duratio
 		return maximum
 	}
 	return min(2*current, maximum)
+}
+
+// Whether this sequence requests a contract's successor as soon as it takes or
+// announces the contract, which is how every sequence requested it before
+// `ContractPrefetchLeadTime`. A same-network peer keeps that: its contracts
+// escrow nothing, and the queue retains its newest successor past the expiry,
+// so the early request is what makes its rollover immediate at any rate.
+func (self *SendSequence) successorContractEagerForKey(key ContractKey) bool {
+	return self.sendBufferSettings.ContractPrefetchLeadTime <= 0 ||
+		self.client.ContractManager().isNetworkPeerContract(key)
+}
+
+// Queues one more contract for this sequence at the next sequence index, sized
+// by the manager's ramp. An identical request still in flight absorbs it, which
+// includes the one the exhaustion path makes for the same index.
+//
+// Skipped while the backend is unreachable. A sequence that still holds queued
+// contracts keeps satisfying TakeContract, so without this check it would keep
+// requesting and keep the OOB storm going for exactly the sequences that still
+// have work to do. The contract in use is unaffected: only its successor waits
+// for the backend.
+func (self *SendSequence) requestSuccessorContract(key ContractKey, messageByteCount ByteCount) bool {
+	if isBackendDegraded() {
+		return false
+	}
+	self.client.ContractManager().CreateContract(
+		key,
+		self.contractSeqIndex,
+		ByteCount(32+float32(messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
+	)
+	return true
+}
+
+// Requests the current contract's successor the first time it is due (see
+// `successorContractDue`), and otherwise rearms the check that a caller's
+// no-acknowledgement write makes. A successor already in the queue counts as
+// requested. An eager sequence requests at take and at announcement instead,
+// and a contract made obsolete by a route promotion is left to the exhaustion
+// path, which retires it. Nothing here blocks.
+func (self *SendSequence) maybeRequestSuccessorContract(messageByteCount ByteCount) {
+	contract := self.sendContract
+	if contract == nil || self.successorContractEager || self.successorContractRequested {
+		return
+	}
+	due, checkRemainingByteCount := self.successorContractDue(contract)
+	if due {
+		metadata := self.contractMetadata()
+		if self.sendContractMetadataGeneration != metadata.generation {
+			return
+		}
+		if self.client.ContractManager().hasQueuedContract(metadata.key) ||
+			self.requestSuccessorContract(metadata.key, messageByteCount) {
+			self.successorContractRequested = true
+			checkRemainingByteCount = 0
+		}
+	}
+	contract.successorCheckRemainingByteCount.Store(int64(checkRemainingByteCount))
+}
+
+// The successor is due once the contract has carried
+// `ContractPrefetchMinUsedByteCount` (at most half of it) and, at the rate it
+// has been consumed since it became current, the room left above the
+// ahead-announcement floor would run out within `ContractPrefetchLeadTime`.
+// Room at or below that floor is due at any rate.
+//
+// The second value is the room left at which to check again if no request goes
+// out now: where the minimum is reached, or else where the projection would
+// come due at the current rate, and no lower than half the room left so that a
+// rate that rises is noticed within a halving. It is always below the room left
+// now, so arming it cannot wake the owner on the very next write.
+//
+// Room is counted the way a caller's no-acknowledgement reservation counts it,
+// including reservations whose writes have not been charged yet.
+func (self *SendSequence) successorContractDue(contract *sequenceContract) (bool, ByteCount) {
+	usedByteCount := contract.ackedByteCount + contract.unackedByteCount
+	if contract.noAckBudgetPublished {
+		usedByteCount = max(
+			usedByteCount,
+			contract.effectiveTransferByteCount-ByteCount(contract.noAckRemainingByteCount.Load()),
+		)
+	}
+	remainingByteCount := contract.effectiveTransferByteCount - usedByteCount
+	minUsedByteCount := min(
+		self.sendBufferSettings.ContractPrefetchMinUsedByteCount,
+		contract.effectiveTransferByteCount/2,
+	)
+	if usedByteCount < minUsedByteCount {
+		return false, contract.effectiveTransferByteCount - minUsedByteCount
+	}
+	floorByteCount := ByteCount(0)
+	if 0 < self.sendBufferSettings.ContractAheadScale {
+		floorByteCount = self.sendBufferSettings.ContractAheadFloorByteCount
+	}
+	headroomByteCount := remainingByteCount - floorByteCount
+	if headroomByteCount <= 0 {
+		return true, max(0, remainingByteCount/2)
+	}
+	elapsed := self.successorContractNow().Sub(self.sendContractSetTime).Seconds()
+	leadTime := self.sendBufferSettings.ContractPrefetchLeadTime.Seconds()
+	// headroom / (used / elapsed) <= lead, without dividing by either
+	if float64(headroomByteCount)*elapsed <= leadTime*float64(usedByteCount) {
+		return true, remainingByteCount / 2
+	}
+	// the room at which the projection comes due if the rate holds
+	dueRemainingByteCount := floorByteCount + ByteCount(leadTime*float64(usedByteCount)/elapsed)
+	return false, max(dueRemainingByteCount, remainingByteCount/2)
+}
+
+// The clock the successor projection reads.
+func (self *SendSequence) successorContractNow() time.Time {
+	if self.successorContractNowForTest != nil {
+		return self.successorContractNowForTest()
+	}
+	return time.Now()
 }
 
 // THROUGHPUTFIX §39.1's threshold, derived from the sequence's own rate ring
@@ -9886,14 +10100,11 @@ func (self *SendSequence) announceContractAhead() {
 		aheadContract,
 		self.contractAheadAckCallback(aheadContract),
 	)
-	// queue the one after it, the same prefetch a take makes
-	if !isBackendDegraded() {
-		prefetchMetadata := self.contractMetadata()
-		self.client.ContractManager().CreateContract(
-			prefetchMetadata.key,
-			self.contractSeqIndex,
-			ByteCount(32+float32(self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
-		)
+	// Queue the one after it where successors are requested eagerly, the
+	// same request a take makes. Otherwise the announced contract requests its
+	// own successor once it is current and projected to run out.
+	if self.successorContractEager {
+		self.requestSuccessorContract(self.contractMetadata().key, 0)
 	}
 }
 
@@ -9967,6 +10178,15 @@ func (self *SendSequence) setContract(
 	self.sendContractAcked = false
 	// a new contract announces its own successor (THROUGHPUTFIX §39.1)
 	self.aheadSendContractAttempted = false
+	// and requests it, at take when eager, otherwise once it is due; its
+	// consumption rate is measured from here
+	self.sendContractSetTime = self.successorContractNow()
+	self.successorContractEager = self.successorContractEagerForKey(self.contractMetadata().key)
+	self.successorContractRequested = false
+	if !self.successorContractEager {
+		_, checkRemainingByteCount := self.successorContractDue(nextSendContract)
+		nextSendContract.successorCheckRemainingByteCount.Store(int64(checkRemainingByteCount))
+	}
 	self.sendContractMetadataGeneration = metadataGeneration
 	// an unacknowledged contract is nothing a caller may write against
 	self.publishNoAckFastPath()
@@ -10718,6 +10938,10 @@ func (self *SendSequence) observeCarrierWrite(
 	item *sendItem,
 	disposition transferWriteDisposition,
 ) {
+	// A written item awaits an answer; silence runs until any acknowledgement.
+	if self.retainedSilenceStart.IsZero() {
+		self.retainedSilenceStart = time.Now()
+	}
 	departedLane := uint32(0)
 	if item.carrierRoute != nil && item.carrierRoute != disposition.route {
 		// A changed-carrier item no longer owns its old lane's probe. Read
@@ -11935,6 +12159,8 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		// message not pending ack
 		return
 	}
+	// Any acknowledgement of an outstanding item proves the destination live.
+	self.retainedSilenceStart = time.Time{}
 
 	if !receiverTiming {
 		self.observeAckRtt(item, tag)
@@ -16578,6 +16804,14 @@ type sequenceContract struct {
 	// High bit retires admission; lower bits count accepted writers through
 	// accounting settlement, including zero-byte writes.
 	noAckWriterState atomic.Uint64
+	// The room left, in the terms of `noAckRemainingByteCount`, at or below
+	// which a caller's reservation wakes the owner to decide whether to
+	// request this contract's successor; zero is disarmed. Callers' writes
+	// are charged only on the owner's next pass, so without the wake a
+	// sequence carrying nothing but no-acknowledgement Packs would not decide
+	// until the contract refused a write. The owner arms it and the caller
+	// that crosses it disarms it, so each arming wakes the owner once.
+	successorCheckRemainingByteCount atomic.Int64
 
 	// Set on the send side when this contract was announced ahead of its data
 	// and the announcement was acknowledged (THROUGHPUTFIX §39.1). The

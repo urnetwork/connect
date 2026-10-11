@@ -13,7 +13,8 @@ import (
 // The degradation state is package-level, so these must not run in parallel.
 
 // Site: SendSequence.updateContract, "if !isBackendDegraded() { CreateContract(...) }"
-// (both the retry-loop call and the nextContract prefetch call).
+// (the retry-loop call), and SendSequence.requestSuccessorContract, which every
+// successor request goes through.
 func TestGate_ContractCreationSuppressedOnlyWhileDegraded(t *testing.T) {
 	resetBackendDegraded()
 	defer resetBackendDegraded()

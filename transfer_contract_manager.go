@@ -1479,6 +1479,26 @@ func (self *ContractManager) TakeContract(
 	}
 }
 
+// Whether the queue for this key holds a contract that a take would hand out
+// now: enqueued within the expiry window and before its signed deadline. A
+// sequence whose successor is already queued has nothing to request. Read-only:
+// it neither creates a queue nor expires anything.
+func (self *ContractManager) hasQueuedContract(contractKey ContractKey) bool {
+	if self.settings.LegacyCreateContract {
+		contractKey = contractKey.Legacy()
+	}
+	var minEnqueueTime time.Time
+	if 0 < self.settings.ContractQueueExpireTimeout {
+		minEnqueueTime = time.Now().Add(-self.settings.ContractQueueExpireTimeout)
+	}
+	contractQueue := func() *contractQueue {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		return self.destinationContracts[contractKey]
+	}()
+	return contractQueue != nil && contractQueue.hasContract(minEnqueueTime)
+}
+
 func (self *ContractManager) hasOpenContractForKey(contractKey ContractKey) bool {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -2143,6 +2163,23 @@ func (self *contractQueue) Poll(minEnqueueTime time.Time) (*protocol.Contract, [
 		return queuedContract.contract, expired
 	}
 	return nil, expired
+}
+
+// Whether Poll at `minEnqueueTime` would return a contract, without removing
+// or expiring any.
+func (self *contractQueue) hasContract(minEnqueueTime time.Time) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	currentTimeUnixMilli := time.Now().UnixMilli()
+	for _, queuedContract := range self.contracts {
+		if queuedContract.enqueueTime.Before(minEnqueueTime) ||
+			(queuedContract.expirationTimeUnixMilli != nil && *queuedContract.expirationTimeUnixMilli <= currentTimeUnixMilli) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // Removes contracts past their signed deadline or enqueue-age cutoff.
