@@ -683,6 +683,13 @@ type PlatformTransportSettings struct {
 	// client limit hold, right before it waits, so a test can hold the exact
 	// point after which no dial can happen until the hold changes.
 	clientLimitHoldForTest func()
+	// Nil outside package tests. Replaces the transport's own credential
+	// refusal hold, so a test can drive its clock.
+	credentialRefusalHold *credentialRefusalHold
+	// Nil outside package tests. Called each time a mode runner parks on a
+	// credential refusal hold, right before it waits, so a test can hold the
+	// exact point after which no dial with the refused credential can happen.
+	credentialRefusalHoldForTest func()
 	// The constrained mobile policy composes receive, send, socket, and queue
 	// ownership inside one carrier claim. H1 keeps its independent queue depth.
 	h3RetainedByteAccounting bool
@@ -1043,6 +1050,10 @@ type PlatformTransport struct {
 	// clientLimitHold, which tolerates a fixture that skipped the
 	// constructor. See transport_client_limit.go.
 	clientLimitBackoff *ClientLimitBackoff
+	// credentialRefusalHold holds every mode runner's dials on a credential
+	// the platform definitively refused. The constructor always sets it; read
+	// it through credentialRefused. See transport_credential_refusal.go.
+	credentialRefusalHold *credentialRefusalHold
 }
 
 // newPlatformQuicConfig keeps H3's memory and path-MTU behavior explicit and
@@ -1459,6 +1470,10 @@ func NewPlatformTransportWithTargetMode(
 	if transport.clientLimitBackoff == nil {
 		transport.clientLimitBackoff = NewClientLimitBackoff()
 	}
+	transport.credentialRefusalHold = settings.credentialRefusalHold
+	if transport.credentialRefusalHold == nil {
+		transport.credentialRefusalHold = newCredentialRefusalHold()
+	}
 	transport.ipFamily = normalizeIpFamily(settings.IpFamily)
 	transport.enabled.Store(!settings.StartDisabled)
 	transport.held = NewMonitorValue(settings.StartDisabled)
@@ -1552,12 +1567,19 @@ func (self *PlatformTransport) authSnapshot() ClientAuth {
 }
 
 // SetAuth installs an immutable snapshot for future connections. An existing
-// authenticated connection keeps its generation until it reconnects.
+// authenticated connection keeps its generation until it reconnects. A
+// different credential ends the hold on a refused one
+// (transport_credential_refusal.go).
 func (self *PlatformTransport) SetAuth(auth *ClientAuth) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
 
-	self.auth = cloneClientAuth(auth)
+		self.auth = cloneClientAuth(auth)
+	}()
+	if self.credentialRefusalHold != nil {
+		self.credentialRefusalHold.release(auth.ByJwt)
+	}
 }
 
 // setModeAvailable records whether a mode has a live connection, waking the
@@ -2152,6 +2174,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					// verify the auth echo
 					switch messageType {
 					case websocket.BinaryMessage:
+						if reason, ok := transportCloseReason(message); ok {
+							// the platform refused the credential instead of
+							// echoing it (transport_credential_refusal.go)
+							if cause := validAuthorizationClose(int(reason) + 4000); definitiveAuthorizationClose(cause) {
+								return nil, &transportAuthorizationRefusal{cause: cause}
+							}
+						}
 						if !bytes.Equal(authBytes, message) {
 							return nil, fmt.Errorf("Auth response error: bad bytes.")
 						}
@@ -2198,6 +2227,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		}
 		releaseReconnect()
 		if err != nil {
+			// a definitive refusal of the credential holds it before the next
+			// dial; the backend answered, so it is no dial failure either
+			// (transport_credential_refusal.go)
+			refusal := credentialRefusalCause(err)
+			if refusal != 0 {
+				self.noteCredentialRefusal(TransportModeH1, auth.ByJwt, refusal)
+			}
 			// a canceled dial is local teardown -- this transport or its owner
 			// shutting down mid-connect -- not a backend signal. Without this
 			// carve-out, closing a multi-client window cancels many transports
@@ -2205,7 +2241,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// threshold with fresh timestamps, so the NEXT session starts
 			// gated. The contract OOB path makes the same carve-out on
 			// client.Done.
-			if self.ctx.Err() == nil {
+			if self.ctx.Err() == nil && refusal == 0 {
 				self.noteDialFailure()
 			}
 			// err here is the strategy's flattened "Timeout."; a pinned
@@ -2724,7 +2760,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						}
 						// the WebSocket close code is the second indicator of
 						// the client limit close, after the close control
-						self.noteAuthorizationClose(authorizationCloseCause(err))
+						self.noteConnectionAuthorizationClose(TransportModeH1, auth.ByJwt, authorizationCloseCause(err))
 						if isClientLimitCloseError(err) {
 							self.noteClientLimitClose(TransportModeH1, auth.ProvideIntent, clientLimitResetGeneration)
 						}
@@ -2762,7 +2798,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 									// limit reason holds the client's dials, and
 									// any other reason is an ordinary close
 									reason, _ := transportCloseReason(message)
-									self.noteAuthorizationClose(validAuthorizationClose(int(reason) + 4000))
+									self.noteConnectionAuthorizationClose(TransportModeH1, auth.ByJwt, validAuthorizationClose(int(reason)+4000))
 									MessagePoolReturn(message)
 									if reason == TransportCloseReasonClientLimitExceeded {
 										self.noteClientLimitClose(TransportModeH1, auth.ProvideIntent, clientLimitResetGeneration)
@@ -3109,11 +3145,12 @@ func (self *PlatformTransport) runH3(
 		if err != nil {
 			attemptCanceled := attemptCtx.Err() != nil
 			releaseAttempt()
-			// the platform may close for the client limit right after the
-			// handshake, before the auth exchange completes. That is no
-			// backend failure: the loop parks in waitDialAdmission for the
-			// hold instead
-			self.noteAuthorizationClose(authorizationCloseCause(err))
+			// the platform may close for the client limit or refuse the
+			// credential right after the handshake, before the auth exchange
+			// completes. That is no backend failure: the loop parks in
+			// waitDialAdmission for the hold instead
+			refusal := credentialRefusalCause(err)
+			self.noteConnectionAuthorizationClose(ptMode, auth.ByJwt, authorizationCloseCause(err))
 			if isClientLimitCloseError(err) {
 				self.noteClientLimitClose(ptMode, auth.ProvideIntent, clientLimitResetGeneration)
 				hadConnection = true
@@ -3126,7 +3163,7 @@ func (self *PlatformTransport) runH3(
 			// threshold with fresh timestamps, so the NEXT session starts
 			// gated. The contract OOB path makes the same carve-out on
 			// client.Done.
-			if ctx.Err() == nil {
+			if ctx.Err() == nil && refusal == 0 {
 				if !attemptCanceled {
 					self.noteDialFailure()
 					// the h3 resolve error reaches here typed, unlike the
@@ -3344,7 +3381,7 @@ func (self *PlatformTransport) runH3(
 				// CloseWithError returns once the connection is closed, and
 				// the first close wins its cause: the platform's client limit
 				// close reads here whichever worker saw it first
-				self.noteAuthorizationClose(authorizationCloseCause(context.Cause(conn.Context())))
+				self.noteConnectionAuthorizationClose(ptMode, auth.ByJwt, authorizationCloseCause(context.Cause(conn.Context())))
 				if isClientLimitCloseError(context.Cause(conn.Context())) {
 					self.noteClientLimitClose(ptMode, auth.ProvideIntent, clientLimitResetGeneration)
 				}
