@@ -1,3 +1,5 @@
+// Stream authority remains fail-closed until one bounded, owned clock attempt
+// establishes a conservative anchor; pending grants preserve exact identities.
 package connect
 
 import (
@@ -16,6 +18,11 @@ const MaxStreamAuthorizationLease = 90 * time.Second
 // conservative. Client wall clock is never used in lease conversion.
 const StreamAuthorizationClockMargin = 30 * time.Second
 const maxStreamAuthorizationRecords = 4096
+const maxPendingStreamAuthorizations = 128
+
+// Match the ordinary API request budget, including an unproven route's hello.
+// Acquisition does not extend the grant's absolute deadline or start retries.
+const streamAuthorizationClockTimeout = 15 * time.Second
 
 type streamAuthorizationRecord struct {
 	generation  Id
@@ -30,19 +37,34 @@ type streamAuthorizationState struct {
 	clockServer  int64
 	clockLocal   time.Time
 	clockPending bool
-	pending      map[Id]*protocol.StreamOpen
-	closed       bool
-	now          func() time.Time
+	clockCancel  context.CancelFunc
+	clockWorkers *lifecycleAdmission
+	// Instance-private barriers expose result commit and replay ordering only.
+	beforeClockPublishForTest func()
+	beforeClockReplayForTest  func()
+	afterClockRequestForTest  func()
+	pending                   map[Id]*protocol.StreamOpen
+	closed                    bool
+	now                       func() time.Time
 }
 
 func newStreamAuthorizationState() *streamAuthorizationState {
-	return &streamAuthorizationState{records: map[Id]*streamAuthorizationRecord{}, pending: map[Id]*protocol.StreamOpen{}, now: time.Now}
+	return &streamAuthorizationState{
+		records:      map[Id]*streamAuthorizationRecord{},
+		pending:      map[Id]*protocol.StreamOpen{},
+		clockWorkers: newLifecycleAdmission(),
+		now:          time.Now,
+	}
 }
 func (self *StreamManager) closeAuthorizations() {
 	state := self.authorization
 	state.Lock()
 	defer state.Unlock()
 	state.closed = true
+	if state.clockCancel != nil {
+		state.clockCancel()
+	}
+	state.clockWorkers.close()
 	for _, record := range state.records {
 		record.retired = true
 		if record.timer != nil {
@@ -58,7 +80,7 @@ func (self *StreamManager) authorizeStreamOpen(open *protocol.StreamOpen, run fu
 	state := self.authorization
 	state.Lock()
 	defer state.Unlock()
-	if state.closed {
+	if state.closed || self.ctx.Err() != nil {
 		return nil
 	}
 	id, err := IdFromBytes(open.StreamId)
@@ -76,7 +98,7 @@ func (self *StreamManager) authorizeStreamOpen(open *protocol.StreamOpen, run fu
 	}
 	previous := state.records[id]
 	if len(open.AuthorizationGeneration) == 0 {
-		if previous != nil {
+		if previous != nil || state.pending[id] != nil {
 			return nil
 		}
 		return run()
@@ -91,16 +113,37 @@ func (self *StreamManager) authorizeStreamOpen(open *protocol.StreamOpen, run fu
 	if open.AuthorizationLeaseMillis == 0 || open.AuthorizationLeaseMillis > uint32(MaxStreamAuthorizationLease/time.Millisecond) {
 		return nil
 	}
+	pending := state.pending[id]
+	// A stream binding is immutable on the server. Apply the same generation
+	// fence before a grant can occupy or replace the pre-clock slot.
+	if pending != nil && !bytes.Equal(pending.AuthorizationGeneration, open.AuthorizationGeneration) {
+		return nil
+	}
 	if state.clockLocal.IsZero() {
-		if len(state.pending) < 128 {
+		// Same-generation refresh remains admissible at capacity; a delayed
+		// older grant must not replace a later absolute authorization deadline.
+		canRetain := pending != nil || (len(state.pending) < maxPendingStreamAuthorizations && len(state.records)+len(state.pending) < maxStreamAuthorizationRecords)
+		if canRetain && (pending == nil || pending.AuthorizationDeadlineUnixMillis <= open.AuthorizationDeadlineUnixMillis) {
 			state.pending[id] = proto.Clone(open).(*protocol.StreamOpen)
 		}
-		if !state.clockPending {
+		// A fresh control can retry retained work even when its own new slot
+		// is refused. There is no timer or internal retry owner.
+		if len(state.pending) > 0 && !state.clockPending && state.clockWorkers.start() {
 			state.clockPending = true
-			go self.requestAuthorizationClock()
+			go func() {
+				defer state.clockWorkers.finish()
+				self.requestAuthorizationClock()
+			}()
 		}
 		return nil
 	}
+	// An expired straggler cannot consume a fresher pending reservation.
+	if pending != nil && open.AuthorizationDeadlineUnixMillis < pending.AuthorizationDeadlineUnixMillis {
+		return nil
+	}
+	// Keep pending visible until this lock owns admission, so reset/revoke
+	// can retire it even after a clock result has selected it for replay.
+	delete(state.pending, id)
 	// Wire absolute deadline is converted relative to a monotonic request-start
 	// anchor. A queued/replayed control frame cannot restart a 90-second timer.
 	deadline := state.clockLocal.Add(time.Duration(open.AuthorizationDeadlineUnixMillis-state.clockServer)*time.Millisecond - StreamAuthorizationClockMargin)
@@ -109,10 +152,15 @@ func (self *StreamManager) authorizeStreamOpen(open *protocol.StreamOpen, run fu
 		deadline = maxDeadline
 	}
 	if !now.Before(deadline) {
+		// Expiry consumes the reserved slot as retirement, not free capacity.
+		// A later close must not lose this known binding when the table fills.
+		if pending != nil && previous == nil {
+			state.records[id] = &streamAuthorizationRecord{generation: generation, retired: true, retainUntil: now.Add(8*time.Hour + MaxStreamAuthorizationLease + StreamAuthorizationClockMargin)}
+		}
 		return nil
 	}
 	if previous == nil {
-		if len(state.records) >= maxStreamAuthorizationRecords {
+		if len(state.records)+len(state.pending) >= maxStreamAuthorizationRecords {
 			return nil
 		}
 		previous = &streamAuthorizationRecord{generation: generation, retainUntil: now.Add(8*time.Hour + MaxStreamAuthorizationLease + StreamAuthorizationClockMargin)}
@@ -153,6 +201,13 @@ func (self *StreamManager) retireStreamAuthorization(id Id, generation []byte) {
 	state.Lock()
 	defer state.Unlock()
 	record := state.records[id]
+	pending := state.pending[id]
+	if record == nil && pending != nil {
+		if len(generation) > 0 && !bytes.Equal(pending.AuthorizationGeneration, generation) {
+			return
+		}
+		generation = pending.AuthorizationGeneration
+	}
 	if record != nil {
 		if len(generation) > 0 && !bytes.Equal(record.generation.Bytes(), generation) {
 			return
@@ -161,7 +216,7 @@ func (self *StreamManager) retireStreamAuthorization(id Id, generation []byte) {
 		if record.timer != nil {
 			record.timer.Stop()
 		}
-	} else if gen, err := IdFromBytes(generation); err == nil && len(state.records) < maxStreamAuthorizationRecords {
+	} else if gen, err := IdFromBytes(generation); err == nil && (pending != nil || len(state.records)+len(state.pending) < maxStreamAuthorizationRecords) {
 		state.records[id] = &streamAuthorizationRecord{generation: gen, retired: true, retainUntil: state.now().Add(8*time.Hour + MaxStreamAuthorizationLease + StreamAuthorizationClockMargin)}
 	}
 	delete(state.pending, id)
@@ -177,9 +232,20 @@ func (self *StreamManager) streamAuthorizationActive(id Id) bool {
 }
 func (self *StreamManager) requestAuthorizationClock() {
 	state := self.authorization
+	if state.afterClockRequestForTest != nil {
+		defer state.afterClockRequestForTest()
+	}
 	id := NewId()
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(self.ctx, 2*time.Second)
+	state.Lock()
+	if state.closed || self.ctx.Err() != nil {
+		state.clockPending = false
+		state.Unlock()
+		return
+	}
+	ctx, cancel := context.WithTimeout(self.ctx, streamAuthorizationClockTimeout)
+	state.clockCancel = cancel
+	state.Unlock()
 	defer cancel()
 	request := RequireToFrameWithDefaultProtocolVersion(&protocol.StreamAuthorization{ClockId: id.Bytes()})
 	// OOB responses are borrowed for the callback only. Decode before returning;
@@ -213,21 +279,30 @@ func (self *StreamManager) requestAuthorizationClock() {
 	case <-ctx.Done():
 	case serverMillis = <-result:
 	}
+	if state.beforeClockPublishForTest != nil {
+		state.beforeClockPublishForTest()
+	}
 	state.Lock()
 	state.clockPending = false
-	if !state.closed && serverMillis > 0 {
+	state.clockCancel = nil
+	if state.closed || ctx.Err() != nil || serverMillis == 0 {
+		state.Unlock()
+		return
+	}
+	if serverMillis > 0 {
 		// Re-anchoring may only shorten deadlines, including a resident migration.
 		if state.clockLocal.IsZero() || start.Before(state.clockLocal.Add(time.Duration(serverMillis-state.clockServer)*time.Millisecond)) {
 			state.clockLocal = start
 			state.clockServer = serverMillis
 		}
 	}
-	pending := state.pending
-	state.pending = map[Id]*protocol.StreamOpen{}
-	closed := state.closed
+	pending := make([]*protocol.StreamOpen, 0, len(state.pending))
+	for _, open := range state.pending {
+		pending = append(pending, open)
+	}
 	state.Unlock()
-	if closed || serverMillis == 0 {
-		return
+	if state.beforeClockReplayForTest != nil {
+		state.beforeClockReplayForTest()
 	}
 	for _, open := range pending {
 		frame := RequireToFrameWithDefaultProtocolVersion(open)
@@ -249,6 +324,19 @@ func (self *StreamManager) retireAbsentAuthorizations(keep map[Id]bool) {
 	state := self.authorization
 	state.Lock()
 	defer state.Unlock()
+	// Pending slots reserve record capacity, so omission can create a durable
+	// retirement fence before a selected clock replay reaches admission.
+	for id, open := range state.pending {
+		if !keep[id] {
+			if state.records[id] == nil {
+				generation, err := IdFromBytes(open.AuthorizationGeneration)
+				if err == nil {
+					state.records[id] = &streamAuthorizationRecord{generation: generation, retired: true, retainUntil: state.now().Add(8*time.Hour + MaxStreamAuthorizationLease + StreamAuthorizationClockMargin)}
+				}
+			}
+			delete(state.pending, id)
+		}
+	}
 	for id, record := range state.records {
 		if !keep[id] {
 			record.retired = true

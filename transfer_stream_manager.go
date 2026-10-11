@@ -65,10 +65,14 @@ func (self *StreamManager) Close() {
 }
 
 // closeAndWait retires every stream generation and joins its lifecycle and
-// transport workers, or returns when ctx expires.
+// transport and clock-launcher workers, or returns when ctx expires.
 func (self *StreamManager) closeAndWait(ctx context.Context) error {
 	self.Close()
-	return self.streamBuffer.closeAndWait(ctx)
+	result := self.streamBuffer.closeAndWait(ctx)
+	if self.authorization != nil {
+		result = errors.Join(result, waitForLifecycleDone(ctx, self.authorization.clockWorkers.Done(), "stream authorization clock"))
+	}
+	return result
 }
 
 func NewStreamManager(ctx context.Context, client *Client, webRtcManager *WebRtcManager, streamManagerSettings *StreamManagerSettings) *StreamManager {
