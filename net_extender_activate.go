@@ -816,7 +816,12 @@ func (self *ExtenderActivator) reportedIpVersions() []int {
 // than the pass left active -- or that had none to name, which is every first
 // pass, since an address is known only once the operator reports it -- with
 // one more pass at once, when the request for the active addresses is still
-// wanted (C4). Without it the request would wait for the 24 hour tick.
+// wanted. Without it the request would wait for the 24 hour tick.
+//
+// lag.dev/PLAN.md C4 sends the request at activation, but an extender cannot
+// name an address before the operator reports it; this one extra pass, on the
+// first activation and after an address change, is the smallest change that
+// lets the request name exactly the active addresses.
 func (self *ExtenderActivator) followMeasurementCsr(ipVersions []int, csrAddrs []netip.Addr) {
 	if self.settings.MeasurementCsr == nil {
 		return

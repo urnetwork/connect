@@ -253,7 +253,10 @@ func (self *extenderLagReporter) post(reportBatch [][]byte) bool {
 			log.Printf("[extender] lag: %d reports refused = %s", len(reportBatch), err)
 			return true
 		}
-		log.Printf("[extender] lag: report post err = %s", err)
+		// a post the close interrupted is no failure worth a line
+		if self.server.ctx.Err() == nil {
+			log.Printf("[extender] lag: report post err = %s", err)
+		}
 		return false
 	}
 

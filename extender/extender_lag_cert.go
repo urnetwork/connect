@@ -696,7 +696,10 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 
 	result, err := self.getCertificate()
 	if err != nil {
-		log.Printf("[extender] lag: measurement certificate poll err = %s", err)
+		// a read the close interrupted is no failure worth a line
+		if self.server.ctx.Err() == nil {
+			log.Printf("[extender] lag: measurement certificate poll err = %s", err)
+		}
 		return now.Add(backoff), nextBackoff
 	}
 
