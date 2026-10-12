@@ -147,8 +147,7 @@ func (self *extenderLagReporter) run() {
 	// no post before this, set by a post that failed
 	var retryTime time.Time
 	for {
-		wake := self.wakeMonitor.NotifyChannel()
-		reportBatch, wait := self.takeBatch(settings.Now(), retryTime)
+		reportBatch, wait, wake := self.takeBatch(settings.Now(), retryTime)
 		if 0 < len(reportBatch) {
 			if self.post(reportBatch) {
 				backoff = settings.ReportMinBackoff
@@ -176,21 +175,25 @@ func (self *extenderLagReporter) run() {
 	}
 }
 
-// The next batch when one is due, else how long until one could be. Zero with
-// no batch means nothing is pending.
-func (self *extenderLagReporter) takeBatch(now time.Time, retryTime time.Time) ([][]byte, time.Duration) {
+// The next batch when one is due, else how long until one could be, and the
+// channel the next report closes. Zero with no batch means nothing is pending.
+// The channel is subscribed in the same locked scope as the read, as a submit
+// notifies in the same scope as its append, so a report is either in this read
+// or wakes the wait after it, never both.
+func (self *extenderLagReporter) takeBatch(now time.Time, retryTime time.Time) ([][]byte, time.Duration, chan struct{}) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	wake := self.wakeMonitor.NotifyChannel()
 	if len(self.pendingReports) == 0 {
-		return nil, 0
+		return nil, 0, wake
 	}
 	if now.Before(retryTime) {
-		return nil, retryTime.Sub(now)
+		return nil, retryTime.Sub(now), wake
 	}
 	flushTime := self.firstPendingTime.Add(self.settings.ReportFlushTimeout)
 	if len(self.pendingReports) < self.settings.ReportMaxBatchCount && now.Before(flushTime) {
-		return nil, flushTime.Sub(now)
+		return nil, flushTime.Sub(now), wake
 	}
 	count := min(len(self.pendingReports), self.settings.ReportMaxBatchCount)
 	reportBatch := slices.Clone(self.pendingReports[0:count])
@@ -200,7 +203,7 @@ func (self *extenderLagReporter) takeBatch(now time.Time, retryTime time.Time) (
 		// rather than being owed the whole timeout again
 		self.firstPendingTime = now
 	}
-	return reportBatch, 0
+	return reportBatch, 0, wake
 }
 
 // Puts a batch the operator did not answer back at the front. Beyond the cap

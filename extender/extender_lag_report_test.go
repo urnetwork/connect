@@ -190,7 +190,7 @@ func TestLagReportDropsTheOldest(t *testing.T) {
 	}
 	expectPending(reports[44:300], 44)
 
-	reportBatch, _ := reporter.takeBatch(settings.Now().Add(time.Hour), time.Time{})
+	reportBatch, _, _ := reporter.takeBatch(settings.Now().Add(time.Hour), time.Time{})
 	if len(reportBatch) != 32 {
 		t.Fatalf("batch = %d, expected 32", len(reportBatch))
 	}
