@@ -195,8 +195,11 @@ func (self *ExtenderMeasurementCert) ActivationCsr(addrs []netip.Addr) string {
 		defer self.stateLock.Unlock()
 		self.csrNames = names
 		self.csr = csr
-		self.offeredNames = names
-		self.offerMonitor.NotifyAll()
+		if !slices.Equal(self.offeredNames, names) {
+			// a new offer; the poll is already reading for one outstanding
+			self.offeredNames = names
+			self.offerMonitor.NotifyAll()
+		}
 	}()
 	return csr
 }

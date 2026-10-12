@@ -207,6 +207,8 @@ type testLagApi struct {
 
 	polls chan struct{}
 	posts chan []string
+	// the measurement request of each activation that carried one
+	activationCsrs chan string
 
 	stateLock    sync.Mutex
 	certResult   *extenderMeasurementCertResult
@@ -217,10 +219,11 @@ type testLagApi struct {
 func newTestLagApi(t *testing.T) *testLagApi {
 	t.Helper()
 	api := &testLagApi{
-		t:          t,
-		polls:      make(chan struct{}, 1024),
-		posts:      make(chan []string, 1024),
-		certResult: &extenderMeasurementCertResult{State: ExtenderMeasurementCertStateNone},
+		t:              t,
+		polls:          make(chan struct{}, 1024),
+		posts:          make(chan []string, 1024),
+		activationCsrs: make(chan string, 1024),
+		certResult:     &extenderMeasurementCertResult{State: ExtenderMeasurementCertStateNone},
 	}
 	api.server = httptest.NewServer(http.HandlerFunc(api.serve))
 	t.Cleanup(api.server.Close)
@@ -239,6 +242,28 @@ func (self *testLagApi) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.Method == http.MethodPost && r.URL.Path == connect.ExtenderActivatePath:
+		// every activation is of the one v4 address, and a request it carries
+		// is pending until the test issues it (A10)
+		args := &connect.ExtenderActivateArgs{}
+		if err := json.NewDecoder(r.Body).Decode(args); err != nil {
+			w.WriteHeader(http.StatusTeapot)
+			return
+		}
+		if args.MeasurementCsr != "" {
+			request := parseTestLagCsr(self.t, args.MeasurementCsr)
+			self.setCertResult(&extenderMeasurementCertResult{
+				State: ExtenderMeasurementCertStatePending,
+				Names: request.DNSNames,
+			})
+		}
+		json.NewEncoder(w).Encode(&connect.ExtenderActivateResult{
+			Activated: true,
+			Ip:        testLagActivateIp,
+			IpVersion: 4,
+			Carriers:  args.Carriers,
+		})
+		self.activationCsrs <- args.MeasurementCsr
 	case r.Method == http.MethodGet && r.URL.Path == ExtenderMeasurementCertPath:
 		self.stateLock.Lock()
 		certResult := *self.certResult
@@ -301,6 +326,18 @@ func (self *testLagApi) waitPost() []string {
 	case <-time.After(30 * time.Second):
 		self.t.Fatal("the lifecycle did not post reports")
 		return nil
+	}
+}
+
+// Waits for one activation post, and returns the request it carried.
+func (self *testLagApi) waitActivation() string {
+	self.t.Helper()
+	select {
+	case csr := <-self.activationCsrs:
+		return csr
+	case <-time.After(30 * time.Second):
+		self.t.Fatal("the activator did not post an activation")
+		return ""
 	}
 }
 
@@ -380,6 +417,9 @@ func waitTestLagInstall(t *testing.T, certificate *ExtenderMeasurementCert, vers
 		}
 	}
 }
+
+// The address the test operator activates.
+const testLagActivateIp = "198.51.100.7"
 
 // The addresses of the name vectors, and their names under the default zone
 // (N1).
@@ -765,6 +805,101 @@ func TestLagCertOfferPollsSoon(t *testing.T) {
 		t.Fatal("a refused request was not asked for again")
 	}
 	api.expectQuiet()
+}
+
+// The whole of C4 with the real activation loop: the first activation cannot
+// name the address the operator has not reported yet, so the pass that
+// follows carries the request; the lifecycle polls once that post has landed,
+// installs the chain the operator issued for it, and a later activation asks
+// for nothing new while the operator holds the certificate.
+func TestLagCertFromActivationToInstall(t *testing.T) {
+	clock := newTestLagClock()
+	api := newTestLagApi(t)
+	ca := newTestLagCa(t)
+	certificate := newTestLagCertificate(t)
+	lifecycle := newTestLagLifecycle(t, api, clock, certificate, nil)
+	api.waitPoll()
+	if wait := clock.nextWait(t); wait != 24*time.Hour {
+		t.Fatalf("idle wait = %s, expected the check timeout", wait)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	strategySettings := connect.DefaultClientStrategySettings()
+	strategySettings.EnableResilient = false
+	clientStrategy := connect.NewDirectClientStrategy(ctx, strategySettings, 0)
+	defer clientStrategy.Close()
+	// the activation loop's own clock never moves: only its triggers run it
+	activatorNow := clock.Now()
+	activatorSettings := connect.DefaultExtenderActivatorSettings()
+	activatorSettings.ApiUrlV4 = api.server.URL
+	activatorSettings.ByJwt = func() string {
+		return testLagJwt
+	}
+	activatorSettings.ClientStrategy = clientStrategy
+	activatorSettings.PublicKey = make([]byte, 32)
+	activatorSettings.Carriers = func() []string {
+		return []string{connect.ExtenderCarrierTcp}
+	}
+	activatorSettings.MeasurementCsr = certificate.ActivationCsr
+	activatorSettings.Now = func() time.Time {
+		return activatorNow
+	}
+	activatorSettings.PassAfter = func(wait time.Duration) <-chan time.Time {
+		return nil
+	}
+	activatorSettings.ResumeCheckTimeout = 0
+	activatorSettings.IpVersionSupported = func(ipVersion int) bool {
+		return ipVersion == 4
+	}
+	var networkChanged func()
+	activatorSettings.AddNetworkChangeListener = func(listener func()) func() {
+		networkChanged = listener
+		return func() {}
+	}
+	activator := connect.NewExtenderActivator(ctx, activatorSettings)
+	defer activator.Close()
+
+	if csr := api.waitActivation(); csr != "" {
+		t.Fatalf("the first activation carried %q before its address was known", csr)
+	}
+	csr := api.waitActivation()
+	request := parseTestLagCsr(t, csr)
+	names := []string{"198-51-100-7.extender.bringyour.com"}
+	if !slices.Equal(request.DNSNames, names) {
+		t.Fatalf("request names = %v, expected %v", request.DNSNames, names)
+	}
+
+	// the request woke the poll, which reads once the post has landed
+	if wait := clock.nextWait(t); wait != 15*time.Second {
+		t.Fatalf("offer wait = %s, expected the offer poll timeout", wait)
+	}
+	clock.advance(15 * time.Second)
+	api.waitPoll()
+	if wait := clock.nextWait(t); wait != 30*time.Second {
+		t.Fatalf("pending wait = %s, expected the min backoff", wait)
+	}
+
+	now := clock.Now()
+	api.setCertResult(&extenderMeasurementCertResult{
+		State:    ExtenderMeasurementCertStateIssued,
+		Names:    names,
+		ChainPem: ca.issue(t, csr, now, now.Add(90*24*time.Hour)),
+	})
+	version, _ := certificate.installMonitor.Get()
+	clock.advance(30 * time.Second)
+	api.waitPoll()
+	waitTestLagInstall(t, certificate, version)
+	servedNames, tlsCertificate := lifecycle.Certificate()
+	if !slices.Equal(servedNames, names) || tlsCertificate == nil {
+		t.Fatalf("served names = %v, expected %v", servedNames, names)
+	}
+
+	// the operator holds the certificate: a later activation asks for nothing
+	networkChanged()
+	if csr := api.waitActivation(); csr != "" {
+		t.Fatalf("an activation asked again with %q for the installed names", csr)
+	}
 }
 
 // A chain issued for another key, or for a name outside the measurement zone,
