@@ -387,6 +387,11 @@ func newRemoveClientTestGenerator(t *testing.T, ipVersion int, generatorCtx cont
 	strategy := NewClientStrategy(strategyCtx, settings)
 
 	clientId := NewId()
+	// These tests pin retirement itself; a fixed generator's identity reuse
+	// would park the current generation instead. Reuse has its own tests in
+	// ip_remote_multi_client_identity_reuse_test.go.
+	generatorSettings := DefaultApiMultiClientGeneratorSettings()
+	generatorSettings.ReuseFixedDestinationIdentities = false
 	generator := NewApiMultiClientGenerator(
 		generatorCtx,
 		[]*ProviderSpec{{ClientId: &clientId}},
@@ -400,7 +405,7 @@ func newRemoveClientTestGenerator(t *testing.T, ipVersion int, generatorCtx cont
 		"0.0.0-test",
 		nil,
 		DefaultClientSettings,
-		DefaultApiMultiClientGeneratorSettings(),
+		generatorSettings,
 	)
 	return generator, removeCount, server.Close
 }
