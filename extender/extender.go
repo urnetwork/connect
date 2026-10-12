@@ -120,6 +120,8 @@ func DefaultExtenderSettings() *ExtenderSettings {
 		ExtenderCamouflageHelloMaxByteCount:  16 * 1024,
 		ExtenderCamouflageSpliceMaxCount:     256,
 		ExtenderCamouflageSpliceMaxPerTarget: 32,
+
+		Measurement: DefaultExtenderLagSettings(),
 	}
 }
 
@@ -413,6 +415,14 @@ type ExtenderSettings struct {
 	// a chain of NLayer extenders delivered to its last layer (A11). It runs
 	// synchronously, must not block, and must not keep or change the header.
 	HeaderHandler func(header *protocol.ExtenderHeader)
+
+	// The lag.dev measurement API on the tcp carrier (lag.dev/PLAN.md M10):
+	// Measurement is its `measurement:` settings block, and LagLifecycle the
+	// role's settings of the lifecycle that keeps its certificate, queues its
+	// reports and serves the feed it mounts. Nil LagLifecycle keeps no
+	// certificate, so the API never serves.
+	Measurement  ExtenderLagSettings
+	LagLifecycle *ExtenderLagLifecycleSettings
 }
 
 type ExtenderServer struct {
@@ -502,6 +512,10 @@ type ExtenderServer struct {
 	// the tcp carrier camouflage of P, nil when the server has no identity key;
 	// its recognition, splice and publishing are gated on CamouflageEnabled
 	camouflage *extenderCamouflage
+
+	// the lag.dev measurement API (lag.dev/PLAN.md M1 to M7, M10), nil when it
+	// is off or the server has no identity key
+	lag *extenderLagApi
 
 	proxy *extenderProxy
 
@@ -596,6 +610,21 @@ func NewExtenderServer(
 	} else {
 		self.camouflage = camouflage
 	}
+	// the lag.dev measurement API and the lifecycle behind it, each side's one
+	// wiring function (lag.dev/PLAN.md M10)
+	lagLifecycle := newExtenderLagLifecycle(self, settings.LagLifecycle)
+	measurementZone := ""
+	if settings.LagLifecycle != nil && settings.LagLifecycle.Certificate != nil {
+		measurementZone = settings.LagLifecycle.Certificate.Zone()
+	}
+	self.lag = newExtenderLagApi(
+		self,
+		settings.Measurement,
+		lagLifecycle,
+		lagLifecycle,
+		lagLifecycle.FeedHandler(),
+		measurementZone,
+	)
 
 	handler := &extenderHandler{server: self}
 	// an idle h2 connection is reclaimed on the same budget a connection has to
@@ -1216,7 +1245,8 @@ func (self *ExtenderServer) serveQuicCarrier(
 	}()
 
 	tlsConfig := &tls.Config{
-		GetCertificate: self.certificates.GetCertificate,
+		// never an identity leaf for a measurement name (lag.dev/PLAN.md M1)
+		GetCertificate: self.carrierCertificate,
 		NextProtos:     []string{http3.NextProtoH3},
 	}
 	quicConfig := &quic.Config{
@@ -1320,6 +1350,7 @@ func (self *ExtenderServer) Close() {
 	if self.camouflage != nil {
 		self.camouflage.close()
 	}
+	self.lag.close()
 }
 
 // CloseAndWait interrupts and joins every listener and connection worker.
@@ -1540,7 +1571,9 @@ func (self *ExtenderServer) HandleExtenderConnection(ctx context.Context, conn n
 	}
 
 	tlsConfig := &tls.Config{
-		GetCertificate: self.certificates.GetCertificate,
+		// never an identity leaf for a measurement name, even for a hello the
+		// peek could not read (lag.dev/PLAN.md M1)
+		GetCertificate: self.carrierCertificate,
 		// a prober that asks for h2 gets it (A3); the extender's own client
 		// offers no alpn, so it negotiates http/1.1
 		NextProtos: []string{"h2", "http/1.1"},
