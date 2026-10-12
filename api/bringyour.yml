@@ -1980,6 +1980,64 @@ paths:
         "401":
           description: Missing or invalid client bearer token.
 
+  /network/extender-measurement-cert:
+    get:
+      tags: [Network]
+      summary: The extender's lag.dev measurement certificate
+      description: |
+        What became of the certificate request an activation carried
+        (lag.dev/PLAN.md A8, C4). An open tier extender serves the lag.dev
+        measurement API under one name, its `extender_id` under the
+        measurement zone, and asks for a certificate for that name in
+        `measurement_csr` on an activation; the operator orders it from the
+        CA and keeps the zone's address records for the name (C5, C8).
+
+        Requires a CLIENT jwt: the one the extender activated with. The
+        answer is for an extender that client activated -- the one with
+        `public_key_hex` when given, else its active, most recently activated
+        one -- and never for another client's.
+
+        `state` is one of:
+        - `none`: no request was ever stored. Send one with an activation.
+        - `pending`: the request waits to be issued, under the weekly cap
+          (C7) or a backoff after a failed order; `reason` says which. Poll
+          again on a backoff, and keep serving an installed certificate.
+        - `issued`: `chain_pem` is the chain for `names`, the leaf first.
+          Install it. A renewal at two thirds of its lifetime answers
+          `issued` with a new chain (C6). Read the expiry from the leaf.
+        - `refused`: the request cannot be issued, and `reason` says why.
+          Keep serving an installed certificate until it expires.
+        - `withdrawn`: the certificate for `names` was withdrawn and is
+          being revoked, because the extender was deactivated or an operator
+          moved it to the gated tier or a canary (C9). Drop it at once and
+          stop answering to the name. The answer stays `withdrawn` until the
+          extender sends a request again.
+
+        A request for the name and key already held, pending or issued,
+        changes nothing, and an activation without `measurement_csr` leaves
+        the stored request as it is.
+      operationId: extenderMeasurementCert
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: public_key_hex
+          required: false
+          description: |
+            The extender's identity public key, hex, which picks one of
+            several extenders the calling client activated.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderMeasurementCertResult"
+        "401":
+          description: Missing or invalid client bearer token.
+
   /network/sessions:
     get:
       tags: [Network]
@@ -15406,6 +15464,16 @@ components:
           items:
             type: string
             enum: [tcp, quic, dns]
+        measurement_csr:
+          description: |
+            Standard base64 of the DER certificate request for the extender's
+            lag.dev measurement name, `<extender_id>.<zone>`, whose only name
+            is that one, under an ECDSA P-256 key (lag.dev/PLAN.md C4, A10).
+            Omitted on most activations, which leaves a stored request as it
+            is. A request carried by a successful activation is stored as the
+            extender's; its outcome is read from
+            `/network/extender-measurement-cert`, never from this answer.
+          type: string
 
     ExtenderActivateResult:
       type: object
@@ -15417,6 +15485,13 @@ components:
       properties:
         activated:
           type: boolean
+        extender_id:
+          description: |
+            The operator's id of the extender, one per identity key and the
+            same at every activation. The extender's lag.dev measurement name
+            is this id under the measurement zone (lag.dev/PLAN.md N1, N4).
+          type: string
+          format: uuid
         ip:
           description: The caller address that was probed and published.
           type: string
@@ -15668,6 +15743,42 @@ components:
           type: integer
         error:
           description: Why the report was refused whole; empty otherwise.
+          type: string
+
+    ExtenderMeasurementCertResult:
+      type: object
+      description: |
+        The extender's lag.dev measurement certificate and where its request
+        stands (lag.dev/PLAN.md A8).
+      required:
+        - state
+        - names
+      properties:
+        state:
+          type: string
+          enum: [none, pending, issued, refused, withdrawn]
+        names:
+          description: |
+            The extender's one measurement name, `<extender_id>.<zone>`:
+            the request's when `pending` or `refused`, the certificate's when
+            `issued`, the withdrawn certificate's when `withdrawn`. Empty for
+            `none`, and for a request that could not be read.
+          type: array
+          items:
+            type: string
+        chain_pem:
+          description: The certificate chain, PEM, the leaf first. Only when `issued`.
+          type: string
+        not_after:
+          description: |
+            The leaf's expiry. Only when `issued`; the leaf itself is
+            authoritative.
+          type: string
+          format: date-time
+        reason:
+          description: |
+            Why a request is `refused` or a certificate `withdrawn`, or what a
+            `pending` request waits for.
           type: string
 
     # ----- provider probing -----
