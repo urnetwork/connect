@@ -191,6 +191,14 @@ func TestNormalTlsDialHonorsFamilyPolicyWithNoInjectedDialContext(t *testing.T) 
 			defer mutex.Unlock()
 			networks = append(networks, network)
 		}
+		// the name is looked up in the process, never by the system resolver;
+		// the hook has recorded the network by then
+		settings.Resolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(context.Context, string, string) (net.Conn, error) {
+				return nil, errors.New("the test resolves no name off the machine")
+			},
+		}
 
 		dialTls := newNormalDialTlsContext(settings, clientHttpNextProtos)
 		// the host is never reached: .invalid is reserved by RFC 2606 and never
