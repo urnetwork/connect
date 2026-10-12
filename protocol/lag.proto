@@ -1,0 +1,66 @@
+syntax = "proto3";
+package bringyour;
+option go_package = "github.com/urnetwork/connect/protocol";
+
+// One lag.dev test on one extender, admitted by the operator
+// (lag.dev/PLAN.md M3, A6).
+message LagTicketBody {
+    bytes TicketId = 1;            // 16 bytes
+    bytes ClientId = 2;            // 16 bytes, the lag guest client
+    bytes ExtenderPublicKey = 3;   // the extender's ed25519 identity key
+    string NetworkHost = 4;        // the network space, as on records
+    uint64 IssueTimeMs = 5;
+    uint64 ExpireTimeMs = 6;       // a test must start before this
+    uint32 LatencySamples = 7;     // 4
+    bool LoadedLatency = 8;        // sample latency during transfers (Q4)
+    uint32 DownloadMs = 9;         // 15000
+    uint32 UploadMs = 10;          // 15000
+    uint32 MaxStreams = 11;        // per direction, 4
+    uint64 MaxDownloadBytes = 12;
+    uint64 MaxUploadBytes = 13;
+}
+
+message LagTicket {
+    // serialized LagTicketBody, signed opaquely
+    bytes Body = 1;
+    // ed25519 over "ur-lag-ticket-v1" || Body, by the key that signs records
+    bytes RootSignature = 2;
+    // first 8 bytes of sha256 of the signing public key
+    bytes RootKeyId = 3;
+}
+
+enum LagEndReason {
+    LAG_END_COMPLETE = 0;
+    LAG_END_CLIENT_CLOSED = 1;
+    LAG_END_CAP = 2;
+    LAG_END_UPLOAD_MISMATCH = 3;
+    LAG_END_TIMEOUT = 4;
+    LAG_END_ERROR = 5;
+}
+
+// What one extender measured in one test (lag.dev/PLAN.md M8, A7).
+message LagReportBody {
+    bytes TicketId = 1;
+    bytes ExtenderPublicKey = 2;
+    // 4 or 16 bytes: the browser's address as the extender saw it
+    bytes ClientIp = 3;
+    uint64 StartTimeMs = 4;
+    uint64 EndTimeMs = 5;
+    repeated uint32 LatencyMicros = 6;          // idle round trips
+    repeated uint32 LoadedLatencyMicros = 7;    // round trips during transfers
+    uint32 IntervalMs = 8;                      // 250
+    repeated uint64 DownloadReceivedBytes = 9;  // per interval, as the browser reported
+    repeated uint64 DownloadSentBytes = 10;     // per interval, as the extender wrote
+    repeated uint64 UploadBytes = 11;           // per interval, received and verified
+    uint32 DownloadStreams = 12;
+    uint32 UploadStreams = 13;
+    bool UploadVerified = 14;
+    LagEndReason EndReason = 15;
+}
+
+message LagReport {
+    // serialized LagReportBody
+    bytes Body = 1;
+    // ed25519 by the extender identity key over "ur-lag-report-v1" || Body
+    bytes Signature = 2;
+}
