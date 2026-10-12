@@ -4,6 +4,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -211,7 +212,7 @@ func TestFixedDestinationStaleGenerationCannotParkReplacement(t *testing.T) {
 		fixture.generator.identityState.Record(replacement)
 		fixture.generator.RemoveClientArgs(&MultiClientGeneratorClientArgs{ClientId: clientId, ClientAuth: &ClientAuth{InstanceId: stale.InstanceId}})
 		synctest.Wait()
-		if fixture.retireCount.Load() != 0 || fixture.generator.identityState.TakeParked(fixture.destination) != nil {
+		if parked, _ := fixture.generator.identityState.TakeParked(fixture.destination); fixture.retireCount.Load() != 0 || parked != nil {
 			t.Fatal("a stale generation retired or parked the live replacement")
 		}
 		fixture.generator.RemoveClientArgs(&MultiClientGeneratorClientArgs{ClientId: clientId, ClientAuth: &ClientAuth{InstanceId: replacement.InstanceId}})
@@ -315,22 +316,75 @@ func TestWindowIdentityParkingClosesWithTheParkedSet(t *testing.T) {
 	second := &WindowClientIdentity{ClientId: NewId(), InstanceId: NewId(), Destination: destination}
 	state.Record(first)
 	state.Record(second)
-	if state.Park(first.ClientId, NewId()) {
+	if state.Park(first.ClientId, NewId(), nil) {
 		t.Fatal("a superseded generation parked")
 	}
-	if !state.Park(first.ClientId, first.InstanceId) {
+	if !state.Park(first.ClientId, first.InstanceId, nil) {
 		t.Fatal("the current generation did not park")
 	}
-	if state.Park(second.ClientId, second.InstanceId) {
+	if state.Park(second.ClientId, second.InstanceId, nil) {
 		t.Fatal("a destination parked a second identity")
 	}
 	if parked := state.CloseParking(); len(parked) != 1 || parked[0].ClientId != first.ClientId {
 		t.Fatalf("close took %d parked identities", len(parked))
 	}
-	if state.Park(second.ClientId, second.InstanceId) {
+	if state.Park(second.ClientId, second.InstanceId, nil) {
 		t.Fatal("an identity parked after close")
 	}
-	if state.TakeParked(destination) != nil {
+	if parked, _ := state.TakeParked(destination); parked != nil {
 		t.Fatal("a closed state handed out a parked identity")
 	}
+}
+
+// Local control that refuses every frame, so a candidate's setup fails after
+// its client and key exist, the way a failed attempt tears a client down.
+type refusingIdentityReuseControl struct{}
+
+func (self *refusingIdentityReuseControl) ConnectControl(context.Context, string, *ConnectControlArgs) (*ConnectControlResult, error) {
+	return nil, errors.New("synthetic control unavailable")
+}
+
+// Every client generated a fresh identity key, and each registration of a
+// different key for the same client id appends a signed generation to its
+// history, which has a finite lifetime bound. A reused identity's next client
+// must carry the same key, so its re-registration is idempotent.
+func TestFixedDestinationReusedIdentityKeepsItsKey(t *testing.T) {
+	// the process-wide message pool worker must not start inside the bubble
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newIdentityReuseFixture(t, t.Context(), nil, func(settings *ApiMultiClientGeneratorSettings) {
+			settings.ClientControl = &refusingIdentityReuseControl{}
+		})
+		type constructed struct {
+			clientId Id
+			keySeed  []byte
+		}
+		clients := []constructed{}
+		fixture.generator.newPlatformTransport = func(client *Client, _ *ClientAuth, _ TransportMode, _ *PlatformTransportSettings) apiWindowPlatformTransport {
+			clients = append(clients, constructed{clientId: client.ClientId(), keySeed: client.ClientKeyManager().Seed()})
+			return newFakeWindowPlatformTransport(true)
+		}
+		for range 3 {
+			args, err := fixture.generator.NewClientArgsForDestinationContext(t.Context(), fixture.destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client, err := fixture.generator.NewClientContext(t.Context(), t.Context(), args, closeWaitClientSettings()); client != nil || err == nil {
+				t.Fatal("a refused setup returned a client")
+			}
+			synctest.Wait()
+		}
+		if len(clients) != 3 || fixture.mintCount.Load() != 1 {
+			t.Errorf("three attempts constructed %d clients over %d registrations, want 3 over 1", len(clients), fixture.mintCount.Load())
+		} else {
+			for _, client := range clients[1:] {
+				if client.clientId != clients[0].clientId || !bytes.Equal(client.keySeed, clients[0].keySeed) {
+					t.Errorf("a reused identity's client registered a different identity key")
+				}
+			}
+		}
+		if err := fixture.generator.CloseAndWait(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
