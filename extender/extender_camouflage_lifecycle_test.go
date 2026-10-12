@@ -274,9 +274,12 @@ func TestExtenderCamouflageShutdownJoinsResolverAndRefusesFallback(t *testing.T)
 		releaseDial := make(chan struct{})
 		settings := DefaultExtenderSettings()
 		settings.DohSettings = connect.DefaultDohSettings()
+		// A custom net.Resolver Dial still initializes Go's process-global DNS
+		// semaphore inside this bubble. Keep this owner-lifecycle fixture on
+		// its injected DoH dial so it owns no system resolver state or sockets.
 		settings.DohSettings.DnsResolverSettings = &connect.DnsResolverSettings{
-			EnableRemoteDns: true,
-			RemoteDnsIpv4:   []string{"192.0.2.53"},
+			EnableRemoteDoh:   true,
+			RemoteDohUrlsIpv4: []string{"https://192.0.2.53/dns-query"},
 		}
 		settings.DohSettings.DialContextSettings = &connect.DialContextSettings{
 			DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {

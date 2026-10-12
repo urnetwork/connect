@@ -847,7 +847,7 @@ func TestFormationPollTimeoutDefaults(t *testing.T) {
 }
 
 // TestFormationFastPollGuardsEmptyWindowOnly pins where the fast poll applies:
-// sendParsedPacketGroup's retry loop consults FormationPollTimeout only on the
+// sendParsedPacketGroupAttempt's retry loop consults FormationPollTimeout only on the
 // zero-candidates branch (the window has no offer at all), never as a general
 // retry accelerant — candidates that exist, including the benched fallback,
 // keep the SendRetryTimeout pacing.
@@ -857,18 +857,18 @@ func TestFormationFastPollGuardsEmptyWindowOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(")
+	body, ok := packetGroupSendAttemptBody(source)
 	if !ok {
-		t.Fatal("could not find sendParsedPacketGroup")
+		t.Fatal("could not find the packet-group attempt through both owning entry points")
 	}
 
 	emptyBranch := "if len(orderedClients) == 0 {"
 	branchStart := strings.Index(body, emptyBranch)
 	if branchStart < 0 {
-		t.Fatal("sendParsedPacketGroup's retry loop has no empty-candidates branch")
+		t.Fatal("sendParsedPacketGroupAttempt's retry loop has no empty-candidates branch")
 	}
 	if !strings.Contains(body, "FormationPollTimeout") {
-		t.Fatal("sendParsedPacketGroup does not consult FormationPollTimeout")
+		t.Fatal("sendParsedPacketGroupAttempt does not consult FormationPollTimeout")
 	}
 	// the consult must live inside the empty branch: after its start, before
 	// the race call that only runs with candidates
@@ -1235,4 +1235,94 @@ func functionBody(source string, signature string) (string, bool) {
 		return rest[:end], true
 	}
 	return "", false
+}
+
+// These are the two real callers of the shared attempt. Checking their bodies
+// separately prevents policy text in an unreachable helper from satisfying a guard.
+const packetGroupScalarSourceDelegation = "\n\treturn self.sendParsedPacketGroupAttempt(source, provideMode, sendPacketGroup, timeout, true, nil)"
+const packetGroupPreparedSourceDelegation = "\n\tif parsedGroup == nil || !self.sendParsedPacketGroupAttempt(\n\t\tsource, provideMode, parsedGroup, timeout, completeObservations, group.batchAdmission,\n\t) {"
+
+// Resolves only the shared implementation after both owning entry points have
+// delegated with their original timeout, observation, and admission ownership.
+func packetGroupSendAttemptBody(source string) (string, bool) {
+	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(")
+	if !ok || !strings.Contains(body, packetGroupScalarSourceDelegation) {
+		return "", false
+	}
+	body, ok = functionBody(source, "func (self *RemoteUserNatMultiClient) sendPreparedPacketGroup(")
+	if !ok || !strings.Contains(body, packetGroupPreparedSourceDelegation) {
+		return "", false
+	}
+	return functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(")
+}
+
+// The current source is the positive control. Removing a delegation or changing
+// its owner/budget cannot turn these call-path guards into helper-only checks.
+func TestPacketGroupSendSourceAnchorsRequireBothDelegations(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := packetGroupSendAttemptBody(source); !ok {
+		t.Fatal("current packet-group entry points do not reach their shared attempt")
+	}
+	for _, change := range []struct {
+		name string
+		from string
+		to   string
+	}{
+		{name: "scalar delegation missing", from: packetGroupScalarSourceDelegation, to: "\n\treturn false\n"},
+		{name: "scalar timeout changed", from: packetGroupScalarSourceDelegation, to: strings.Replace(packetGroupScalarSourceDelegation, "timeout, true, nil", "0, true, nil", 1)},
+		{name: "scalar observations not completed", from: packetGroupScalarSourceDelegation, to: strings.Replace(packetGroupScalarSourceDelegation, "timeout, true, nil", "timeout, false, nil", 1)},
+		{name: "prepared delegation missing", from: packetGroupPreparedSourceDelegation, to: "\n\tif parsedGroup == nil {"},
+		{name: "prepared observation owner changed", from: packetGroupPreparedSourceDelegation, to: strings.Replace(packetGroupPreparedSourceDelegation, "completeObservations, group.batchAdmission", "true, group.batchAdmission", 1)},
+		{name: "prepared admission owner lost", from: packetGroupPreparedSourceDelegation, to: strings.Replace(packetGroupPreparedSourceDelegation, "completeObservations, group.batchAdmission", "completeObservations, nil", 1)},
+		{name: "attempt missing", from: "func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(", to: "func (self *RemoteUserNatMultiClient) unrelatedPacketGroupAttempt("},
+	} {
+		if strings.Count(source, change.from) != 1 {
+			t.Fatalf("%s: control no longer selects exactly one source site", change.name)
+		}
+		mutated := strings.Replace(source, change.from, change.to, 1)
+		if _, ok := packetGroupSendAttemptBody(mutated); ok {
+			t.Errorf("%s: disconnected or ownership-changing delegation satisfied the source guards", change.name)
+		}
+	}
+}
+
+// Keep every policy marker elsewhere in the file while the real attempt is a
+// stub. A whole-file search or a widened function boundary must not rescue it.
+func TestPacketGroupSendSourceAnchorsExcludeUnrelatedPolicyText(t *testing.T) {
+	source, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := packetGroupSendAttemptBody(source)
+	if !ok {
+		t.Fatal("current packet-group entry points do not reach their shared attempt")
+	}
+	const opening = ") (success bool) {"
+	start := strings.Index(body, opening)
+	if start < 0 {
+		t.Fatal("attempt signature changed; update the explicit misplaced-policy control")
+	}
+	stub := body[:start+len(opening)] + "\n\treturn false"
+	unrelated := strings.Replace(body, "sendParsedPacketGroupAttempt(", "unrelatedPacketGroupAttempt(", 1)
+	mutated := strings.Replace(source, body, stub, 1) + "\n" + unrelated + "\n}\n"
+	resolved, ok := packetGroupSendAttemptBody(mutated)
+	if !ok {
+		t.Fatal("misplaced-policy control changed the valid entry-point delegations")
+	}
+	for _, marker := range []string{
+		"FormationPollTimeout",
+		"dialProbePacket(ipPath)",
+		"orderedClients[:multiRaceClientCount(",
+		"self.raceCandidates(window, ipPath.Version, offerChanged)",
+	} {
+		if !strings.Contains(body, marker) || !strings.Contains(mutated, marker) {
+			t.Fatalf("control lost policy marker %q instead of moving it", marker)
+		}
+		if strings.Contains(resolved, marker) {
+			t.Errorf("policy marker %q outside the real attempt satisfied its source scope", marker)
+		}
+	}
 }

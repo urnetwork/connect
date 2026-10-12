@@ -514,11 +514,11 @@ func TestSendPathInferenceUsesDialProbePacket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroup(")
+	body, ok := packetGroupSendAttemptBody(source)
 	if !ok {
-		t.Fatal("could not find sendParsedPacketGroup")
+		t.Fatal("could not find the packet-group attempt through both owning entry points")
 	}
 	if !strings.Contains(body, "dialProbePacket(ipPath)") {
-		t.Error("sendParsedPacketGroup does not gate the dial-failure inference on dialProbePacket: udp handshakes have lost their early escape")
+		t.Error("sendParsedPacketGroupAttempt does not gate the dial-failure inference on dialProbePacket: udp handshakes have lost their early escape")
 	}
 }

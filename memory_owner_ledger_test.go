@@ -26,7 +26,7 @@ func TestTransferMemoryOwnerLedgerJoinedLifecycle(t *testing.T) {
 			onCleanup := func() { cleanupOnce.Do(func() { close(cleaning) }); <-releaseCleanup }
 			destination, source, sequenceID := NewId(), SourceId(NewId()), NewId()
 			forwardPath := DestinationId(destination)
-			settings := closeWaitClientSettings()
+			settings, publisher := ledgerFixtureClientSettings()
 			settings.MemoryOwnerLedger = &ledger
 			settings.SendBufferSettings.SequenceBufferSize = 5
 			settings.SendBufferSettings.AckBufferSize = 11
@@ -73,8 +73,10 @@ func TestTransferMemoryOwnerLedgerJoinedLifecycle(t *testing.T) {
 			// The optional scope is captured once, not reread from mutable settings
 			// independently at admission and exit.
 			settings.MemoryOwnerLedger = &laterSettingsLedger
-			message := newCloseWaitPoolWitness(t)
+			var message *closeWaitPoolWitness
 			defer func() {
+				client.Close()
+				publisher.release()
 				releaseRunOnce.Do(func() { close(releaseRun) })
 				releaseCleanupOnce.Do(func() { close(releaseCleanup) })
 				cleanupCtx, done := context.WithTimeout(context.Background(), 10*time.Second)
@@ -82,8 +84,12 @@ func TestTransferMemoryOwnerLedgerJoinedLifecycle(t *testing.T) {
 				if err := client.CloseAndWait(cleanupCtx); err != nil {
 					t.Error(err)
 				}
-				message.cleanup()
+				if message != nil {
+					message.cleanup()
+				}
 			}()
+			message = newCloseWaitPoolWitness(t)
+			publisher.waitForEntry(t, ctx)
 			var accepted bool
 			var err error
 			switch kind {
@@ -139,6 +145,7 @@ func TestTransferMemoryOwnerLedgerJoinedLifecycle(t *testing.T) {
 				t.Fatal("control did not reach actual lookup removal")
 			}
 			releaseCleanupOnce.Do(func() { close(releaseCleanup) })
+			publisher.release()
 			if err := client.CloseAndWait(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -171,7 +178,9 @@ func ledgerTestGroup(s TransferMemoryOwnerSnapshot, kind string) TransferMemoryO
 	}
 }
 
-func ledgerSnapshotAgainstOwners(t *testing.T, c *Client, l *TransferMemoryOwnerLedger) TransferMemoryOwnerSnapshot {
+// The caller must hold lifecycle owners separately: map locks do not exclude
+// beginCleanup updates. The optional sampler is only a matched cause-control seam.
+func ledgerSnapshotAgainstOwners(t *testing.T, c *Client, l *TransferMemoryOwnerLedger, samplers ...func() TransferMemoryOwnerSnapshot) TransferMemoryOwnerSnapshot {
 	t.Helper()
 	c.sendBuffer.mutex.Lock()
 	defer c.sendBuffer.mutex.Unlock()
@@ -179,8 +188,15 @@ func ledgerSnapshotAgainstOwners(t *testing.T, c *Client, l *TransferMemoryOwner
 	defer c.receiveBuffer.mutex.Unlock()
 	c.forwardBuffer.mutex.Lock()
 	defer c.forwardBuffer.mutex.Unlock()
+	sample := l.Snapshot
+	if len(samplers) > 1 || (len(samplers) == 1 && samplers[0] == nil) {
+		t.Fatal("invalid ledger fixture sampler")
+	}
+	if len(samplers) == 1 {
+		sample = samplers[0]
+	}
 	result := make(chan TransferMemoryOwnerSnapshot, 1)
-	go func() { result <- l.Snapshot() }()
+	go func() { result <- sample() }()
 	var s TransferMemoryOwnerSnapshot
 	select {
 	case s = <-result:
@@ -252,7 +268,8 @@ func TestTransferMemoryOwnerLedgerHealthyExchange(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	var ledger TransferMemoryOwnerLedger
-	settingsA, settingsB := closeWaitClientSettings(), closeWaitClientSettings()
+	settingsA, publisherA := ledgerFixtureClientSettings()
+	settingsB, publisherB := ledgerFixtureClientSettings()
 	settingsA.MemoryOwnerLedger, settingsB.MemoryOwnerLedger = &ledger, &ledger
 	a := NewClient(ctx, NewId(), NewNoContractClientOob(), settingsA)
 	b := NewClient(ctx, NewId(), NewNoContractClientOob(), settingsB)
@@ -266,6 +283,8 @@ func TestTransferMemoryOwnerLedgerHealthyExchange(t *testing.T) {
 	defer func() {
 		a.Close()
 		b.Close()
+		publisherA.release()
+		publisherB.release()
 		cleanup, done := context.WithTimeout(context.Background(), 10*time.Second)
 		defer done()
 		if err := a.CloseAndWait(cleanup); err != nil {
@@ -280,6 +299,8 @@ func TestTransferMemoryOwnerLedgerHealthyExchange(t *testing.T) {
 			}
 		}
 	}()
+	publisherA.waitForEntry(t, ctx)
+	publisherB.waitForEntry(t, ctx)
 	const count = 16
 	acks, received := make(chan error, count), make(chan struct{}, count)
 	b.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
@@ -329,6 +350,8 @@ func TestTransferMemoryOwnerLedgerHealthyExchange(t *testing.T) {
 	}
 	a.Close()
 	b.Close()
+	publisherA.release()
+	publisherB.release()
 	if err := a.CloseAndWait(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -366,4 +389,13 @@ func BenchmarkTransferMemoryOwnerLedger(b *testing.B) {
 			}
 		})
 	})
+}
+
+// Keep constructor publication owned but unadmitted during lifecycle samples.
+// Release only after Client.Close, before joining the publisher and its buffers.
+func ledgerFixtureClientSettings() (*ClientSettings, *ledgerFixturePublisher) {
+	settings := closeWaitClientSettings()
+	publisher := newLedgerFixturePublisher()
+	settings.beforeClientKeyPublishForTest = publisher.wait
+	return settings, publisher
 }
