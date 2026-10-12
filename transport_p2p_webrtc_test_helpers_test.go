@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +32,11 @@ func closeTestWebRtcManager(t testing.TB, manager *WebRtcManager) {
 // Registers the join at construction so an early Fatal, timeout, or partial
 // setup cannot bypass the owner boundary. Individual tests may still exercise
 // Close or closeAndWait directly; the final cleanup is idempotent.
+//
+// A test manager never offers the shipped STUN pool, whose servers are public
+// hosts: clearing IceServerUrls leaves the pool in force, so a test that names
+// no server gathers host candidates only, and one that wants STUN names its
+// own servers (IceServerUrls) or pool.
 func newTestWebRtcManager(
 	t testing.TB,
 	ctx context.Context,
@@ -38,11 +44,36 @@ func newTestWebRtcManager(
 	settings *WebRtcSettings,
 ) *WebRtcManager {
 	t.Helper()
+	if slices.Equal(settings.IceServerPoolUrls, defaultStunServerUrls) {
+		settings.IceServerPoolUrls = nil
+	}
 	manager := NewWebRtcManager(ctx, signalSender, settings)
 	t.Cleanup(func() {
 		closeTestWebRtcManager(t, manager)
 	})
 	return manager
+}
+
+// A test manager offers no server of the shipped STUN pool: one that clears
+// IceServerUrls gathers host candidates only, and one that names its own pool
+// keeps it.
+func TestWebRtcTestManagersOfferNoPublicStunPool(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cleared := DefaultWebRtcSettings()
+	cleared.Log = NewNoopLogger()
+	cleared.IceServerUrls = nil
+	newTestWebRtcManager(t, ctx, newSignalPipe(nil), cleared)
+	if urls := cleared.selectIceServerUrls(); len(urls) != 0 {
+		t.Fatalf("a test manager offers %v", urls)
+	}
+	named := DefaultWebRtcSettings()
+	named.Log = NewNoopLogger()
+	named.IceServerPoolUrls = []string{"stun:127.0.0.1:3478"}
+	newTestWebRtcManager(t, ctx, newSignalPipe(nil), named)
+	if urls := named.selectIceServerUrls(); !slices.Equal(urls, []string{"stun:127.0.0.1:3478"}) {
+		t.Fatalf("a test manager dropped its own pool, offers %v", urls)
+	}
 }
 
 // Every test and benchmark manager must be registered with the joining owner
