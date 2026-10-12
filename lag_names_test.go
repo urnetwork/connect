@@ -1,10 +1,17 @@
 package connect
 
 import (
+	"bytes"
 	"math/rand/v2"
 	"regexp"
 	"strings"
 	"testing"
+
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // The N1 example of lag.dev/PLAN.md: the id's bytes in order, as lower case
@@ -67,6 +74,53 @@ func TestExtenderMeasurementNameUnsetId(t *testing.T) {
 	}
 	if extenderId, ok := ParseExtenderMeasurementName(Id{}.String()+"."+ExtenderMeasurementZone, ExtenderMeasurementZone); ok {
 		t.Fatalf("the zero Id's spelling parsed as %v", extenderId)
+	}
+}
+
+// A record carries the measurement id as the id's 16 raw bytes on field 17
+// (C10), which is all a reader of the feed or gossip needs for the name (N4).
+// A record without it names no measurement API.
+func TestExtenderMeasurementIdOnRecord(t *testing.T) {
+	body := &protocol.ExtenderRecordBody{MeasurementId: testExtenderMeasurementId.Bytes()}
+	field := body.ProtoReflect().Descriptor().Fields().ByName("MeasurementId")
+	if field == nil || field.Number() != 17 || field.Kind() != protoreflect.BytesKind {
+		t.Fatal("MeasurementId is not bytes field 17")
+	}
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := protowire.AppendBytes(protowire.AppendTag(nil, 17, protowire.BytesType), testExtenderMeasurementId.Bytes())
+	if !bytes.Equal(encoded, expected) {
+		t.Fatalf("record measurement id bytes = %x, want %x", encoded, expected)
+	}
+
+	rootPrivateKey, rootPublicKey := newTestLagKey(t)
+	record, err := SignExtenderRecord(rootPrivateKey, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifiedBody, err := NewExtenderRootKeySet(rootPublicKey).VerifyRecord(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extenderId, err := IdFromBytes(verifiedBody.MeasurementId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name := ExtenderMeasurementName(extenderId, ExtenderMeasurementZone); name != testExtenderMeasurementName {
+		t.Fatalf("name from the record = %q, want %q", name, testExtenderMeasurementName)
+	}
+
+	var without protocol.ExtenderRecordBody
+	if err := proto.Unmarshal(nil, &without); err != nil {
+		t.Fatal(err)
+	}
+	if len(without.MeasurementId) != 0 {
+		t.Fatalf("a record without the field has measurement id %x", without.MeasurementId)
+	}
+	if extenderId, err := IdFromBytes(without.MeasurementId); err == nil {
+		t.Fatalf("a record without the field yields the id %v", extenderId)
 	}
 }
 
