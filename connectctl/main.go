@@ -134,6 +134,8 @@ Usage:
         [--admission_actions_per_subnet_per_minute=<count>]
         [--admission_unlimited_source=<cidr>]...
         [--state_dir=<dir>]
+        [--no_measurement]
+        [--measurement_zone=<zone>]
     
 Options:
     -h --help                        Show this screen.
@@ -167,7 +169,12 @@ Options:
                                      Actions one source subnet may take a minute (default 8, 0 disables).
     --admission_unlimited_source=<cidr>
                                      A source prefix exempt from both limits, such as an NLayer front. Repeatable.
-    --state_dir=<dir>                Directory for the extender key and the known extenders.`,
+    --state_dir=<dir>                Directory for the extender key and the known extenders.
+    --no_measurement                 Do not serve the lag.dev measurement API, and ask the
+                                     operator for no measurement certificate. The API needs an
+                                     identity kept by --extender_key_file or --state_dir.
+    --measurement_zone=<zone>        Zone of the extender's measurement name
+                                     (default extender.bringyour.com).`,
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)
