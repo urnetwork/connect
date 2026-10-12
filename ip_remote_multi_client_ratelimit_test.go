@@ -25,11 +25,40 @@ func newRateLimitTestWindow() *multiClientWindow {
 	}
 }
 
-func TestWindowRetryDelayNonRateLimitIsUnchanged(t *testing.T) {
-	w := newRateLimitTestWindow()
+// The same herd formed on dependency failures: when the hosted control
+// database slowed down, every device's window re-minted every second and kept
+// the connection pool exhausted. Every other class now doubles from the 1s
+// floor to WindowErrorBackoffMax with downward jitter, on its own streak.
+func TestWindowRetryDelayDependencyFailureBacksOff(t *testing.T) {
 	for _, class := range []windowFailureClass{windowFailurePlatform, windowFailureProvider, windowFailureAuth} {
-		if d := w.windowRetryDelay(class); d != w.settings.WindowEnumerateErrorTimeout {
-			t.Fatalf("class %v must keep the flat cadence, got %s", class, d)
+		w := newRateLimitTestWindow()
+		w.retryJitterForTest = func(time.Duration) time.Duration { return 0 }
+		floor := w.settings.WindowEnumerateErrorTimeout
+		// 1s, 2s, 4s, 8s, then the 15s cap, at the jitter floor
+		want := []time.Duration{floor / 2, floor, 2 * floor, 4 * floor, w.settings.WindowErrorBackoffMax / 2, w.settings.WindowErrorBackoffMax / 2}
+		for i, delay := range want {
+			if d := w.windowRetryDelay(class); d != delay {
+				t.Fatalf("class %v failure %d: delay %s, want %s", class, i+1, d, delay)
+			}
+		}
+		// the rate-limit streak is untouched by dependency failures
+		if d := w.windowRetryDelay(windowFailureRateLimit); w.settings.WindowRateLimitBackoffMin <= d {
+			t.Fatalf("class %v advanced the rate-limit streak: %s", class, d)
+		}
+		w.windowRetryReset()
+		if d := w.windowRetryDelay(class); d != floor/2 {
+			t.Fatalf("class %v after reset: %s, want %s", class, d, floor/2)
+		}
+	}
+}
+
+// A settings literal without WindowErrorBackoffMax keeps the flat cadence.
+func TestWindowRetryDelayLegacySettingsKeepFlatCadence(t *testing.T) {
+	w := newRateLimitTestWindow()
+	w.settings.WindowErrorBackoffMax = 0
+	for i := 0; i < 4; i++ {
+		if d := w.windowRetryDelay(windowFailurePlatform); d != w.settings.WindowEnumerateErrorTimeout {
+			t.Fatalf("legacy failure %d: delay %s, want the flat %s", i+1, d, w.settings.WindowEnumerateErrorTimeout)
 		}
 	}
 }
