@@ -504,6 +504,11 @@ type MultiClientSettings struct {
 	// Log, when set, is used by the multi client, its windows, channels, and
 	// internal local user nat. nil resolves to `DefaultLogger()`.
 	Log Logger
+	// LocalDialContextSettings, when set, is applied to the TCP and UDP sockets
+	// of the internal local user nat, which carries what this client routes
+	// locally: the local route, an un-blocked destination, and SMTP. Nil dials
+	// from the host. Tests keep a locally routed packet in the process with it.
+	LocalDialContextSettings *DialContextSettings
 
 	SequenceBufferSize  int
 	SequenceIdleTimeout time.Duration
@@ -2514,6 +2519,10 @@ func NewRemoteUserNatMultiClient(
 	localUserNatSettings.UdpBufferSettings.UserLimit = 0
 	localUserNatSettings.TcpBufferSettings.UserLimit = 0
 	localUserNatSettings.Log = log
+	if settings.LocalDialContextSettings != nil {
+		localUserNatSettings.UdpBufferSettings.DialContextSettings = settings.LocalDialContextSettings
+		localUserNatSettings.TcpBufferSettings.DialContextSettings = settings.LocalDialContextSettings
+	}
 	localUserNat := NewLocalUserNat(cancelCtx, "multi local", localUserNatSettings)
 
 	multiClient := &RemoteUserNatMultiClient{
