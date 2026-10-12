@@ -189,6 +189,11 @@ func TestExtenderNetworkClientSamplesAgainWhenHelloInstallsKeysDuringTheDial(t *
 			}
 		})
 	}
+	// the sampled record's documentation address is never dialed
+	strategySettings.ConnectSettings.DialContextSettings = &connect.DialContextSettings{
+		DialContext:       testLoopbackDial,
+		PacketConnFactory: testLoopbackPacketConn,
+	}
 	strategySettings.ExtenderDirectory = directory
 	clientStrategy := connect.NewClientStrategy(ctx, strategySettings)
 	t.Cleanup(clientStrategy.Close)
