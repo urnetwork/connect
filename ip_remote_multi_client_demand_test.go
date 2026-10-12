@@ -78,8 +78,9 @@ func newDemandExpansionFixture(t *testing.T, fixed bool, windowType WindowType) 
 	return fixture, generator, minted, entered
 }
 
-// A failed construction leaves the fixed destination eligible for the next
-// request. Its healthy retry is admitted, without a prefetched third mint.
+// A failed construction defers the fixed destination's re-dial instead of
+// dropping it. Once the deferral ends its healthy retry is admitted, without a
+// prefetched third mint.
 func TestFixedCandidateFailureKeepsHealthyReplacement(t *testing.T) {
 	fixture, generator, minted, entered := newDemandExpansionFixture(t, true, WindowTypeQuality)
 	newClient := generator.newClient
@@ -94,6 +95,10 @@ func TestFixedCandidateFailureKeepsHealthyReplacement(t *testing.T) {
 	if added := <-fixture.start(); added != 0 {
 		t.Fatalf("failed setup added=%d", added)
 	}
+	if _, deferred := fixture.window.fixedRetryDeferral(1, time.Now()); !deferred {
+		t.Fatal("a failed fixed destination was not deferred")
+	}
+	expireFixedDestinationRetries(fixture.window)
 	done := fixture.start()
 	fixture.wait(t, "replacement constructed", entered)
 	fixture.wait(t, "replacement ping held", fixture.pingResultEntered)
@@ -344,8 +349,10 @@ func TestFixedCandidateCancellationRetiresPartialMint(t *testing.T) {
 	testFixedCandidateCancellation(t, errors.New("synthetic post-mint failure"))
 }
 
-// Transient, nil-result and partial-result failures retain retry cadence and
-// destination, retiring only the partial identity before the successful mint.
+// Transient, nil-result and partial-result failures retain the destination
+// and retry on the doubling dependency backoff (1.5s, 3s and 6s at the jitter
+// floor of a 3s base), retiring only the partial identity before the
+// successful mint.
 func TestFixedCandidateMintRetriesWithinDemand(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		calls, retired := 0, 0
@@ -375,9 +382,10 @@ func TestFixedCandidateMintRetriesWithinDemand(t *testing.T) {
 		}
 		window := outcomeEnumeratorTestWindow(t.Context(), newRecordingLogger(), generator)
 		window.settings.WindowEnumerateErrorTimeout = 3 * time.Second
+		window.retryJitterForTest = func(time.Duration) time.Duration { return 0 }
 		started := time.Now()
 		args, err := window.fixedClientArgs(t.Context(), destination)
-		if err != nil || args == nil || args.ClientId != id || calls != 4 || retired != 1 || time.Since(started) != 9*time.Second {
+		if err != nil || args == nil || args.ClientId != id || calls != 4 || retired != 1 || time.Since(started) != 10500*time.Millisecond {
 			t.Fatalf("retry lost demand: calls=%d retired=%d elapsed=%s error=%v", calls, retired, time.Since(started), err)
 		}
 	})
