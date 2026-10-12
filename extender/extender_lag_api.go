@@ -95,9 +95,11 @@ type ExtenderLagSettings struct {
 	// Loads running at once (M3); a load past it is refused as busy and its
 	// session goes on pinging. <= 0 takes the default.
 	ConcurrentLoads int
-	// Bytes loads may move in one UTC day, both directions together (M3);
-	// past it loads are refused as budget, and a load under way is cut. <= 0
-	// takes the default.
+	// Bytes loads may move in one UTC day, both directions together (M3).
+	// 0, the default, is no budget: providers have no budget of any kind
+	// today, so a load is never refused or cut for its bytes (decision 18,
+	// Q6). An operator who sets one gets loads past it refused as budget, and
+	// a load under way cut as a cap; the day's count is kept in memory.
 	DailyBudgetBytes int64
 
 	// lag.dev/PLAN.md M3, M10: the trust admission checks a ticket against,
@@ -117,7 +119,7 @@ func DefaultExtenderLagSettings() ExtenderLagSettings {
 		AllowedOrigins:   []string{"https://lag.dev", "https://ur.io"},
 		MaxSessions:      512,
 		ConcurrentLoads:  2,
-		DailyBudgetBytes: 20 * 1024 * 1024 * 1024,
+		DailyBudgetBytes: 0,
 	}
 }
 
@@ -275,9 +277,8 @@ func newExtenderLagApi(
 	if self.settings.ConcurrentLoads <= 0 {
 		self.settings.ConcurrentLoads = defaultSettings.ConcurrentLoads
 	}
-	if self.settings.DailyBudgetBytes <= 0 {
-		self.settings.DailyBudgetBytes = defaultSettings.DailyBudgetBytes
-	}
+	// a budget of 0 or less is no budget, never the default's: it is what
+	// the default is (decision 18)
 	self.settings.NetworkHosts = slices.Clone(self.settings.NetworkHosts)
 	self.budget = newLagApiBudget(self.settings.DailyBudgetBytes)
 	self.tlsConfig = &tls.Config{

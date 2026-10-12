@@ -772,8 +772,9 @@ func (self *lagTestSession) runLoad(options lagTestLoadOptions) *lagTestLoad {
 func TestLagApiDefaultSettings(t *testing.T) {
 	settings := DefaultExtenderSettings()
 	measurement := settings.Measurement
+	// no daily budget by default (decision 18, Q6)
 	if !measurement.Enabled || measurement.MaxSessions != 512 || measurement.ConcurrentLoads != 2 ||
-		measurement.DailyBudgetBytes != 21474836480 ||
+		measurement.DailyBudgetBytes != 0 ||
 		!slices.Equal(measurement.AllowedOrigins, []string{"https://lag.dev", "https://ur.io"}) {
 		t.Errorf("measurement defaults %+v", measurement)
 	}
@@ -806,7 +807,8 @@ func TestLagApiDefaultSettings(t *testing.T) {
 	if server.lag.peeks() || server.lag.claims(testLagName) {
 		t.Error("the api recognizes a name with no certificate to keep")
 	}
-	if server.lag.settings.MaxSessions != 512 || server.lag.settings.ConcurrentLoads != 2 {
+	if server.lag.settings.MaxSessions != 512 || server.lag.settings.ConcurrentLoads != 2 ||
+		server.lag.settings.DailyBudgetBytes != 0 || server.lag.budget.limit != 0 {
 		t.Errorf("api settings %+v", server.lag.settings)
 	}
 	if len(server.lag.allowedOrigins) != 2 || !server.lag.allowedOrigins["https://lag.dev"] || !server.lag.allowedOrigins["https://ur.io"] {
@@ -815,13 +817,21 @@ func TestLagApiDefaultSettings(t *testing.T) {
 	if server.lag.ticketExpireSkew != 5*time.Minute {
 		t.Errorf("ticket expiry skew %s", server.lag.ticketExpireSkew)
 	}
-	// zero limits take the defaults rather than refusing everything
+	// zero limits take the defaults rather than refusing everything, and a
+	// zero budget stays no budget rather than taking any default
 	server = newServer(func(settings *ExtenderSettings) {
 		settings.Measurement = ExtenderLagSettings{Enabled: true}
 	})
 	if server.lag.settings.MaxSessions != 512 || server.lag.settings.ConcurrentLoads != 2 ||
-		server.lag.budget.limit != 21474836480 {
+		server.lag.settings.DailyBudgetBytes != 0 || server.lag.budget.limit != 0 {
 		t.Errorf("zero settings became %+v", server.lag.settings)
+	}
+	// a budget an operator sets is kept as set
+	server = newServer(func(settings *ExtenderSettings) {
+		settings.Measurement.DailyBudgetBytes = 1 << 30
+	})
+	if server.lag.budget.limit != 1<<30 {
+		t.Errorf("an operator's budget became %d", server.lag.budget.limit)
 	}
 
 	// turned off, or with no identity to sign a report with: no api, and
@@ -1359,11 +1369,37 @@ func TestLagApiLoadBusy(t *testing.T) {
 // M3: past the daily budget, loads are refused as budget until the next UTC
 // midnight.
 func TestLagApiLoadBudget(t *testing.T) {
+	// a budget an operator set (decision 18, Q6): a load under way that runs
+	// it out is cut and ends as a cap
+	const budgetByteCount = 4 * 1024 * 1024
 	fixture := newLagApiFixture(t, func(settings *ExtenderLagSettings) {
-		settings.DailyBudgetBytes = 1024
+		settings.DailyBudgetBytes = budgetByteCount
 	})
-	session := fixture.openHelloSession(fixture.ticket(nil))
-	fixture.api.budget.take(time.Now(), 1024)
+	ticket := func() string {
+		return fixture.ticket(func(body *protocol.LagTicketBody) {
+			body.DownloadMs = 2000
+			body.UploadMs = 2000
+		})
+	}
+	session := fixture.openHelloSession(ticket())
+	load := session.runLoad(lagTestLoadOptions{})
+	if load.result.EndReason != "cap" {
+		t.Errorf("result %+v", load.result.raw)
+	}
+	if load.downloadedByteCount <= 0 || budgetByteCount < load.downloadedByteCount {
+		t.Errorf("downloaded %d under a budget of %d", load.downloadedByteCount, budgetByteCount)
+	}
+	if !fixture.api.budget.exhausted(time.Now()) {
+		t.Error("the budget is not spent")
+	}
+	session.close()
+	if body := fixture.nextReport(5 * time.Second); body.EndReason != protocol.LagEndReason_LAG_END_CAP {
+		t.Errorf("report %v", body.EndReason)
+	}
+
+	// past it, the next load is refused as budget until the next UTC
+	// midnight, and the session goes on pinging
+	session = fixture.openHelloSession(ticket())
 	session.load("download")
 	message := session.next("error", 5*time.Second)
 	if message.Code != lagApiErrorBudget || message.RetryAfterMs == nil ||
@@ -1372,6 +1408,55 @@ func TestLagApiLoadBudget(t *testing.T) {
 	}
 	if rtts := session.rttsFor(600 * time.Millisecond); len(rtts) < 2 {
 		t.Errorf("%d rtts after budget", len(rtts))
+	}
+}
+
+// Decision 18, Q6, M3: with the default settings an extender has no daily
+// budget, so whatever the bytes moved, a load is never refused or cut for
+// them.
+func TestLagApiNoBudgetByDefault(t *testing.T) {
+	fixture := newLagApiFixture(t, nil)
+	if fixture.api.settings.DailyBudgetBytes != 0 || fixture.api.budget.limit != 0 {
+		t.Fatalf("budget %d", fixture.api.budget.limit)
+	}
+	now := time.Now()
+	// far more than any day's loads, already counted today
+	const byteCount = int64(1) << 60
+	if granted := fixture.api.budget.take(now, byteCount); granted != byteCount {
+		t.Errorf("granted %d of %d", granted, byteCount)
+	}
+	if fixture.api.budget.exhausted(now) {
+		t.Error("exhausted with no budget")
+	}
+	if code, _ := fixture.api.beginLoad(now); code != "" {
+		t.Errorf("refused as %s", code)
+	} else {
+		fixture.api.endLoad()
+	}
+
+	// neither direction is cut for its bytes
+	session := fixture.directSession(1)
+	download := fixture.directPhase(session, lagApiDirectionDownload, time.Minute, 1<<62)
+	if granted := download.reserve(now, lagApiBufferByteCount); granted != lagApiBufferByteCount {
+		t.Errorf("reserved %d", granted)
+	}
+	upload := fixture.directPhase(session, lagApiDirectionUpload, time.Minute, 1<<62)
+	upload.window(now)
+	upload.receive(now, lagApiBufferByteCount)
+	for _, phase := range []*lagApiPhase{download, upload} {
+		if _, _, end := phase.state(); end != lagApiPhaseRunning {
+			t.Errorf("a phase was cut: %d", end)
+		}
+	}
+
+	// and a whole load runs to its end
+	controlSession := fixture.openHelloSession(fixture.ticket(func(body *protocol.LagTicketBody) {
+		body.DownloadMs = 300
+		body.UploadMs = 300
+	}))
+	load := controlSession.runLoad(lagTestLoadOptions{})
+	if load.result.EndReason != "complete" || !load.result.UploadVerified {
+		t.Errorf("result %+v", load.result.raw)
 	}
 }
 
