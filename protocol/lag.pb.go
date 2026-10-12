@@ -21,15 +21,18 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// How a session's load ended
 type LagEndReason int32
 
 const (
-	LagEndReason_LAG_END_COMPLETE        LagEndReason = 0
-	LagEndReason_LAG_END_CLIENT_CLOSED   LagEndReason = 1
+	LagEndReason_LAG_END_COMPLETE        LagEndReason = 0 // the load ran to the end
+	LagEndReason_LAG_END_CLIENT_CLOSED   LagEndReason = 1 // the browser closed the session during the load
 	LagEndReason_LAG_END_CAP             LagEndReason = 2
 	LagEndReason_LAG_END_UPLOAD_MISMATCH LagEndReason = 3
 	LagEndReason_LAG_END_TIMEOUT         LagEndReason = 4
 	LagEndReason_LAG_END_ERROR           LagEndReason = 5
+	LagEndReason_LAG_END_NO_LOAD         LagEndReason = 6 // the session closed before its load
+	LagEndReason_LAG_END_BUSY            LagEndReason = 7 // the load was refused: concurrent loads or the daily budget
 )
 
 // Enum value maps for LagEndReason.
@@ -41,6 +44,8 @@ var (
 		3: "LAG_END_UPLOAD_MISMATCH",
 		4: "LAG_END_TIMEOUT",
 		5: "LAG_END_ERROR",
+		6: "LAG_END_NO_LOAD",
+		7: "LAG_END_BUSY",
 	}
 	LagEndReason_value = map[string]int32{
 		"LAG_END_COMPLETE":        0,
@@ -49,6 +54,8 @@ var (
 		"LAG_END_UPLOAD_MISMATCH": 3,
 		"LAG_END_TIMEOUT":         4,
 		"LAG_END_ERROR":           5,
+		"LAG_END_NO_LOAD":         6,
+		"LAG_END_BUSY":            7,
 	}
 )
 
@@ -79,7 +86,8 @@ func (LagEndReason) EnumDescriptor() ([]byte, []int) {
 	return file_lag_proto_rawDescGZIP(), []int{0}
 }
 
-// One lag.dev test on one extender, admitted by the operator
+// One lag.dev session on one extender, admitted by the operator: pings for
+// as long as the session is open, and at most one load
 // (lag.dev/PLAN.md M3, A6).
 type LagTicketBody struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
@@ -88,14 +96,15 @@ type LagTicketBody struct {
 	ExtenderPublicKey []byte                 `protobuf:"bytes,3,opt,name=ExtenderPublicKey,proto3" json:"ExtenderPublicKey,omitempty"` // the extender's ed25519 identity key
 	NetworkHost       string                 `protobuf:"bytes,4,opt,name=NetworkHost,proto3" json:"NetworkHost,omitempty"`             // the network space, as on records
 	IssueTimeMs       uint64                 `protobuf:"varint,5,opt,name=IssueTimeMs,proto3" json:"IssueTimeMs,omitempty"`
-	ExpireTimeMs      uint64                 `protobuf:"varint,6,opt,name=ExpireTimeMs,proto3" json:"ExpireTimeMs,omitempty"`     // a test must start before this
-	LatencySamples    uint32                 `protobuf:"varint,7,opt,name=LatencySamples,proto3" json:"LatencySamples,omitempty"` // 4
-	LoadedLatency     bool                   `protobuf:"varint,8,opt,name=LoadedLatency,proto3" json:"LoadedLatency,omitempty"`   // sample latency during transfers (Q4)
-	DownloadMs        uint32                 `protobuf:"varint,9,opt,name=DownloadMs,proto3" json:"DownloadMs,omitempty"`         // 15000
-	UploadMs          uint32                 `protobuf:"varint,10,opt,name=UploadMs,proto3" json:"UploadMs,omitempty"`            // 15000
-	MaxStreams        uint32                 `protobuf:"varint,11,opt,name=MaxStreams,proto3" json:"MaxStreams,omitempty"`        // per direction, 4
-	MaxDownloadBytes  uint64                 `protobuf:"varint,12,opt,name=MaxDownloadBytes,proto3" json:"MaxDownloadBytes,omitempty"`
-	MaxUploadBytes    uint64                 `protobuf:"varint,13,opt,name=MaxUploadBytes,proto3" json:"MaxUploadBytes,omitempty"`
+	ExpireTimeMs      uint64                 `protobuf:"varint,6,opt,name=ExpireTimeMs,proto3" json:"ExpireTimeMs,omitempty"`     // the session must open before this; once open it has no time limit
+	TrackId           []byte                 `protobuf:"bytes,7,opt,name=TrackId,proto3" json:"TrackId,omitempty"`                // 16 bytes, shared by the track's sessions
+	TrackPosition     uint32                 `protobuf:"varint,8,opt,name=TrackPosition,proto3" json:"TrackPosition,omitempty"`   // the dot's place: 0-7, spares 8-11
+	PingIntervalMs    uint32                 `protobuf:"varint,9,opt,name=PingIntervalMs,proto3" json:"PingIntervalMs,omitempty"` // 250, the target; back to back when the round trip is longer
+	DownloadMs        uint32                 `protobuf:"varint,10,opt,name=DownloadMs,proto3" json:"DownloadMs,omitempty"`        // 5000
+	UploadMs          uint32                 `protobuf:"varint,11,opt,name=UploadMs,proto3" json:"UploadMs,omitempty"`            // 5000
+	MaxStreams        uint32                 `protobuf:"varint,12,opt,name=MaxStreams,proto3" json:"MaxStreams,omitempty"`        // per direction, 4
+	MaxDownloadBytes  uint64                 `protobuf:"varint,13,opt,name=MaxDownloadBytes,proto3" json:"MaxDownloadBytes,omitempty"`
+	MaxUploadBytes    uint64                 `protobuf:"varint,14,opt,name=MaxUploadBytes,proto3" json:"MaxUploadBytes,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -172,18 +181,25 @@ func (x *LagTicketBody) GetExpireTimeMs() uint64 {
 	return 0
 }
 
-func (x *LagTicketBody) GetLatencySamples() uint32 {
+func (x *LagTicketBody) GetTrackId() []byte {
 	if x != nil {
-		return x.LatencySamples
+		return x.TrackId
+	}
+	return nil
+}
+
+func (x *LagTicketBody) GetTrackPosition() uint32 {
+	if x != nil {
+		return x.TrackPosition
 	}
 	return 0
 }
 
-func (x *LagTicketBody) GetLoadedLatency() bool {
+func (x *LagTicketBody) GetPingIntervalMs() uint32 {
 	if x != nil {
-		return x.LoadedLatency
+		return x.PingIntervalMs
 	}
-	return false
+	return 0
 }
 
 func (x *LagTicketBody) GetDownloadMs() uint32 {
@@ -284,25 +300,34 @@ func (x *LagTicket) GetRootKeyId() []byte {
 	return nil
 }
 
-// What one extender measured in one test (lag.dev/PLAN.md M8, A7).
+// One minute of one session, reported by the extender (lag.dev/PLAN.md M8,
+// A7): the minute around the session's load, or its last minute when it
+// had none.
 type LagReportBody struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	TicketId          []byte                 `protobuf:"bytes,1,opt,name=TicketId,proto3" json:"TicketId,omitempty"`
 	ExtenderPublicKey []byte                 `protobuf:"bytes,2,opt,name=ExtenderPublicKey,proto3" json:"ExtenderPublicKey,omitempty"`
+	TrackId           []byte                 `protobuf:"bytes,3,opt,name=TrackId,proto3" json:"TrackId,omitempty"`
+	TrackPosition     uint32                 `protobuf:"varint,4,opt,name=TrackPosition,proto3" json:"TrackPosition,omitempty"`
 	// 4 or 16 bytes: the browser's address as the extender saw it
-	ClientIp              []byte       `protobuf:"bytes,3,opt,name=ClientIp,proto3" json:"ClientIp,omitempty"`
-	StartTimeMs           uint64       `protobuf:"varint,4,opt,name=StartTimeMs,proto3" json:"StartTimeMs,omitempty"`
-	EndTimeMs             uint64       `protobuf:"varint,5,opt,name=EndTimeMs,proto3" json:"EndTimeMs,omitempty"`
-	LatencyMicros         []uint32     `protobuf:"varint,6,rep,packed,name=LatencyMicros,proto3" json:"LatencyMicros,omitempty"`                 // idle round trips
-	LoadedLatencyMicros   []uint32     `protobuf:"varint,7,rep,packed,name=LoadedLatencyMicros,proto3" json:"LoadedLatencyMicros,omitempty"`     // round trips during transfers
-	IntervalMs            uint32       `protobuf:"varint,8,opt,name=IntervalMs,proto3" json:"IntervalMs,omitempty"`                              // 250
-	DownloadReceivedBytes []uint64     `protobuf:"varint,9,rep,packed,name=DownloadReceivedBytes,proto3" json:"DownloadReceivedBytes,omitempty"` // per interval, as the browser reported
-	DownloadSentBytes     []uint64     `protobuf:"varint,10,rep,packed,name=DownloadSentBytes,proto3" json:"DownloadSentBytes,omitempty"`        // per interval, as the extender wrote
-	UploadBytes           []uint64     `protobuf:"varint,11,rep,packed,name=UploadBytes,proto3" json:"UploadBytes,omitempty"`                    // per interval, received and verified
-	DownloadStreams       uint32       `protobuf:"varint,12,opt,name=DownloadStreams,proto3" json:"DownloadStreams,omitempty"`
-	UploadStreams         uint32       `protobuf:"varint,13,opt,name=UploadStreams,proto3" json:"UploadStreams,omitempty"`
-	UploadVerified        bool         `protobuf:"varint,14,opt,name=UploadVerified,proto3" json:"UploadVerified,omitempty"`
-	EndReason             LagEndReason `protobuf:"varint,15,opt,name=EndReason,proto3,enum=bringyour.LagEndReason" json:"EndReason,omitempty"`
+	ClientIp           []byte   `protobuf:"bytes,5,opt,name=ClientIp,proto3" json:"ClientIp,omitempty"`
+	SessionStartTimeMs uint64   `protobuf:"varint,6,opt,name=SessionStartTimeMs,proto3" json:"SessionStartTimeMs,omitempty"` // extender clock
+	WindowStartTimeMs  uint64   `protobuf:"varint,7,opt,name=WindowStartTimeMs,proto3" json:"WindowStartTimeMs,omitempty"`   // the reported minute starts here
+	PingOffsetMs       []uint32 `protobuf:"varint,8,rep,packed,name=PingOffsetMs,proto3" json:"PingOffsetMs,omitempty"`      // each ping's send time, ms after WindowStartTimeMs
+	PingMicros         []uint32 `protobuf:"varint,9,rep,packed,name=PingMicros,proto3" json:"PingMicros,omitempty"`          // its round trip; 0 when lost (no pong within 5 s)
+	// the session's load, in ms after WindowStartTimeMs; a zero duration means none
+	DownloadStartMs       uint32       `protobuf:"varint,10,opt,name=DownloadStartMs,proto3" json:"DownloadStartMs,omitempty"`
+	DownloadMs            uint32       `protobuf:"varint,11,opt,name=DownloadMs,proto3" json:"DownloadMs,omitempty"`
+	UploadStartMs         uint32       `protobuf:"varint,12,opt,name=UploadStartMs,proto3" json:"UploadStartMs,omitempty"`
+	UploadMs              uint32       `protobuf:"varint,13,opt,name=UploadMs,proto3" json:"UploadMs,omitempty"`
+	IntervalMs            uint32       `protobuf:"varint,14,opt,name=IntervalMs,proto3" json:"IntervalMs,omitempty"`                              // 250
+	DownloadReceivedBytes []uint64     `protobuf:"varint,15,rep,packed,name=DownloadReceivedBytes,proto3" json:"DownloadReceivedBytes,omitempty"` // per interval, as the browser reported
+	DownloadSentBytes     []uint64     `protobuf:"varint,16,rep,packed,name=DownloadSentBytes,proto3" json:"DownloadSentBytes,omitempty"`         // per interval, as the extender wrote
+	UploadBytes           []uint64     `protobuf:"varint,17,rep,packed,name=UploadBytes,proto3" json:"UploadBytes,omitempty"`                     // per interval, received and verified
+	DownloadStreams       uint32       `protobuf:"varint,18,opt,name=DownloadStreams,proto3" json:"DownloadStreams,omitempty"`
+	UploadStreams         uint32       `protobuf:"varint,19,opt,name=UploadStreams,proto3" json:"UploadStreams,omitempty"`
+	UploadVerified        bool         `protobuf:"varint,20,opt,name=UploadVerified,proto3" json:"UploadVerified,omitempty"`
+	EndReason             LagEndReason `protobuf:"varint,21,opt,name=EndReason,proto3,enum=bringyour.LagEndReason" json:"EndReason,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -351,6 +376,20 @@ func (x *LagReportBody) GetExtenderPublicKey() []byte {
 	return nil
 }
 
+func (x *LagReportBody) GetTrackId() []byte {
+	if x != nil {
+		return x.TrackId
+	}
+	return nil
+}
+
+func (x *LagReportBody) GetTrackPosition() uint32 {
+	if x != nil {
+		return x.TrackPosition
+	}
+	return 0
+}
+
 func (x *LagReportBody) GetClientIp() []byte {
 	if x != nil {
 		return x.ClientIp
@@ -358,32 +397,60 @@ func (x *LagReportBody) GetClientIp() []byte {
 	return nil
 }
 
-func (x *LagReportBody) GetStartTimeMs() uint64 {
+func (x *LagReportBody) GetSessionStartTimeMs() uint64 {
 	if x != nil {
-		return x.StartTimeMs
+		return x.SessionStartTimeMs
 	}
 	return 0
 }
 
-func (x *LagReportBody) GetEndTimeMs() uint64 {
+func (x *LagReportBody) GetWindowStartTimeMs() uint64 {
 	if x != nil {
-		return x.EndTimeMs
+		return x.WindowStartTimeMs
 	}
 	return 0
 }
 
-func (x *LagReportBody) GetLatencyMicros() []uint32 {
+func (x *LagReportBody) GetPingOffsetMs() []uint32 {
 	if x != nil {
-		return x.LatencyMicros
+		return x.PingOffsetMs
 	}
 	return nil
 }
 
-func (x *LagReportBody) GetLoadedLatencyMicros() []uint32 {
+func (x *LagReportBody) GetPingMicros() []uint32 {
 	if x != nil {
-		return x.LoadedLatencyMicros
+		return x.PingMicros
 	}
 	return nil
+}
+
+func (x *LagReportBody) GetDownloadStartMs() uint32 {
+	if x != nil {
+		return x.DownloadStartMs
+	}
+	return 0
+}
+
+func (x *LagReportBody) GetDownloadMs() uint32 {
+	if x != nil {
+		return x.DownloadMs
+	}
+	return 0
+}
+
+func (x *LagReportBody) GetUploadStartMs() uint32 {
+	if x != nil {
+		return x.UploadStartMs
+	}
+	return 0
+}
+
+func (x *LagReportBody) GetUploadMs() uint32 {
+	if x != nil {
+		return x.UploadMs
+	}
+	return 0
 }
 
 func (x *LagReportBody) GetIntervalMs() uint32 {
@@ -500,59 +567,72 @@ var File_lag_proto protoreflect.FileDescriptor
 
 const file_lag_proto_rawDesc = "" +
 	"\n" +
-	"\tlag.proto\x12\tbringyour\"\xdb\x03\n" +
+	"\tlag.proto\x12\tbringyour\"\xf5\x03\n" +
 	"\rLagTicketBody\x12\x1a\n" +
 	"\bTicketId\x18\x01 \x01(\fR\bTicketId\x12\x1a\n" +
 	"\bClientId\x18\x02 \x01(\fR\bClientId\x12,\n" +
 	"\x11ExtenderPublicKey\x18\x03 \x01(\fR\x11ExtenderPublicKey\x12 \n" +
 	"\vNetworkHost\x18\x04 \x01(\tR\vNetworkHost\x12 \n" +
 	"\vIssueTimeMs\x18\x05 \x01(\x04R\vIssueTimeMs\x12\"\n" +
-	"\fExpireTimeMs\x18\x06 \x01(\x04R\fExpireTimeMs\x12&\n" +
-	"\x0eLatencySamples\x18\a \x01(\rR\x0eLatencySamples\x12$\n" +
-	"\rLoadedLatency\x18\b \x01(\bR\rLoadedLatency\x12\x1e\n" +
+	"\fExpireTimeMs\x18\x06 \x01(\x04R\fExpireTimeMs\x12\x18\n" +
+	"\aTrackId\x18\a \x01(\fR\aTrackId\x12$\n" +
+	"\rTrackPosition\x18\b \x01(\rR\rTrackPosition\x12&\n" +
+	"\x0ePingIntervalMs\x18\t \x01(\rR\x0ePingIntervalMs\x12\x1e\n" +
 	"\n" +
-	"DownloadMs\x18\t \x01(\rR\n" +
+	"DownloadMs\x18\n" +
+	" \x01(\rR\n" +
 	"DownloadMs\x12\x1a\n" +
-	"\bUploadMs\x18\n" +
-	" \x01(\rR\bUploadMs\x12\x1e\n" +
+	"\bUploadMs\x18\v \x01(\rR\bUploadMs\x12\x1e\n" +
 	"\n" +
-	"MaxStreams\x18\v \x01(\rR\n" +
+	"MaxStreams\x18\f \x01(\rR\n" +
 	"MaxStreams\x12*\n" +
-	"\x10MaxDownloadBytes\x18\f \x01(\x04R\x10MaxDownloadBytes\x12&\n" +
-	"\x0eMaxUploadBytes\x18\r \x01(\x04R\x0eMaxUploadBytes\"c\n" +
+	"\x10MaxDownloadBytes\x18\r \x01(\x04R\x10MaxDownloadBytes\x12&\n" +
+	"\x0eMaxUploadBytes\x18\x0e \x01(\x04R\x0eMaxUploadBytes\"c\n" +
 	"\tLagTicket\x12\x12\n" +
 	"\x04Body\x18\x01 \x01(\fR\x04Body\x12$\n" +
 	"\rRootSignature\x18\x02 \x01(\fR\rRootSignature\x12\x1c\n" +
-	"\tRootKeyId\x18\x03 \x01(\fR\tRootKeyId\"\xe2\x04\n" +
+	"\tRootKeyId\x18\x03 \x01(\fR\tRootKeyId\"\xb8\x06\n" +
 	"\rLagReportBody\x12\x1a\n" +
 	"\bTicketId\x18\x01 \x01(\fR\bTicketId\x12,\n" +
-	"\x11ExtenderPublicKey\x18\x02 \x01(\fR\x11ExtenderPublicKey\x12\x1a\n" +
-	"\bClientIp\x18\x03 \x01(\fR\bClientIp\x12 \n" +
-	"\vStartTimeMs\x18\x04 \x01(\x04R\vStartTimeMs\x12\x1c\n" +
-	"\tEndTimeMs\x18\x05 \x01(\x04R\tEndTimeMs\x12$\n" +
-	"\rLatencyMicros\x18\x06 \x03(\rR\rLatencyMicros\x120\n" +
-	"\x13LoadedLatencyMicros\x18\a \x03(\rR\x13LoadedLatencyMicros\x12\x1e\n" +
+	"\x11ExtenderPublicKey\x18\x02 \x01(\fR\x11ExtenderPublicKey\x12\x18\n" +
+	"\aTrackId\x18\x03 \x01(\fR\aTrackId\x12$\n" +
+	"\rTrackPosition\x18\x04 \x01(\rR\rTrackPosition\x12\x1a\n" +
+	"\bClientIp\x18\x05 \x01(\fR\bClientIp\x12.\n" +
+	"\x12SessionStartTimeMs\x18\x06 \x01(\x04R\x12SessionStartTimeMs\x12,\n" +
+	"\x11WindowStartTimeMs\x18\a \x01(\x04R\x11WindowStartTimeMs\x12\"\n" +
+	"\fPingOffsetMs\x18\b \x03(\rR\fPingOffsetMs\x12\x1e\n" +
 	"\n" +
-	"IntervalMs\x18\b \x01(\rR\n" +
+	"PingMicros\x18\t \x03(\rR\n" +
+	"PingMicros\x12(\n" +
+	"\x0fDownloadStartMs\x18\n" +
+	" \x01(\rR\x0fDownloadStartMs\x12\x1e\n" +
+	"\n" +
+	"DownloadMs\x18\v \x01(\rR\n" +
+	"DownloadMs\x12$\n" +
+	"\rUploadStartMs\x18\f \x01(\rR\rUploadStartMs\x12\x1a\n" +
+	"\bUploadMs\x18\r \x01(\rR\bUploadMs\x12\x1e\n" +
+	"\n" +
+	"IntervalMs\x18\x0e \x01(\rR\n" +
 	"IntervalMs\x124\n" +
-	"\x15DownloadReceivedBytes\x18\t \x03(\x04R\x15DownloadReceivedBytes\x12,\n" +
-	"\x11DownloadSentBytes\x18\n" +
-	" \x03(\x04R\x11DownloadSentBytes\x12 \n" +
-	"\vUploadBytes\x18\v \x03(\x04R\vUploadBytes\x12(\n" +
-	"\x0fDownloadStreams\x18\f \x01(\rR\x0fDownloadStreams\x12$\n" +
-	"\rUploadStreams\x18\r \x01(\rR\rUploadStreams\x12&\n" +
-	"\x0eUploadVerified\x18\x0e \x01(\bR\x0eUploadVerified\x125\n" +
-	"\tEndReason\x18\x0f \x01(\x0e2\x17.bringyour.LagEndReasonR\tEndReason\"=\n" +
+	"\x15DownloadReceivedBytes\x18\x0f \x03(\x04R\x15DownloadReceivedBytes\x12,\n" +
+	"\x11DownloadSentBytes\x18\x10 \x03(\x04R\x11DownloadSentBytes\x12 \n" +
+	"\vUploadBytes\x18\x11 \x03(\x04R\vUploadBytes\x12(\n" +
+	"\x0fDownloadStreams\x18\x12 \x01(\rR\x0fDownloadStreams\x12$\n" +
+	"\rUploadStreams\x18\x13 \x01(\rR\rUploadStreams\x12&\n" +
+	"\x0eUploadVerified\x18\x14 \x01(\bR\x0eUploadVerified\x125\n" +
+	"\tEndReason\x18\x15 \x01(\x0e2\x17.bringyour.LagEndReasonR\tEndReason\"=\n" +
 	"\tLagReport\x12\x12\n" +
 	"\x04Body\x18\x01 \x01(\fR\x04Body\x12\x1c\n" +
-	"\tSignature\x18\x02 \x01(\fR\tSignature*\x95\x01\n" +
+	"\tSignature\x18\x02 \x01(\fR\tSignature*\xbc\x01\n" +
 	"\fLagEndReason\x12\x14\n" +
 	"\x10LAG_END_COMPLETE\x10\x00\x12\x19\n" +
 	"\x15LAG_END_CLIENT_CLOSED\x10\x01\x12\x0f\n" +
 	"\vLAG_END_CAP\x10\x02\x12\x1b\n" +
 	"\x17LAG_END_UPLOAD_MISMATCH\x10\x03\x12\x13\n" +
 	"\x0fLAG_END_TIMEOUT\x10\x04\x12\x11\n" +
-	"\rLAG_END_ERROR\x10\x05B'Z%github.com/urnetwork/connect/protocolb\x06proto3"
+	"\rLAG_END_ERROR\x10\x05\x12\x13\n" +
+	"\x0fLAG_END_NO_LOAD\x10\x06\x12\x10\n" +
+	"\fLAG_END_BUSY\x10\aB'Z%github.com/urnetwork/connect/protocolb\x06proto3"
 
 var (
 	file_lag_proto_rawDescOnce sync.Once
