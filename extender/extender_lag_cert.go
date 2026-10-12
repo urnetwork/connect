@@ -10,12 +10,13 @@ package extender
 //   - the measurement key and its certificate (C4). The key is ECDSA P-256 and
 //     used for nothing else -- not the identity key, not the camouflage key --
 //     and lives in `extender-measurement-key.pem`, mode 0600, beside the
-//     extender key file. An activation carries a certificate request whose
-//     names are exactly the measurement names of the addresses the operator
-//     activated (N3); the lifecycle polls the operator until the certificate is
-//     issued, installs the chain without a restart, and polls again for each
-//     renewal (C6). A changed address or a new family asks for a new request at
-//     the next activation;
+//     extender key file. An activation carries a certificate request whose one
+//     name is the extender's measurement name, its id under the measurement
+//     zone (N1), which it learns from its activation answer (N4); the
+//     lifecycle polls the operator until the certificate is issued, installs
+//     the chain without a restart, and polls again for each renewal (C6). The
+//     name outlives every address change, so an address change asks for
+//     nothing. A certificate the operator withdraws is dropped at once (C9);
 //   - the report queue (M8, extender_lag_report.go), which posts what each
 //     session measured under the activation credential;
 //   - the feed over websocket (M9, extender_lag_feed.go).
@@ -39,13 +40,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -70,6 +71,9 @@ const (
 	ExtenderMeasurementCertStatePending = "pending"
 	ExtenderMeasurementCertStateIssued  = "issued"
 	ExtenderMeasurementCertStateRefused = "refused"
+	// the operator withdrew the certificate (C9): the extender was deactivated,
+	// or overridden to the gated tier or a canary
+	ExtenderMeasurementCertStateWithdrawn = "withdrawn"
 )
 
 // The measurement key file beside an extender key file (C4).
@@ -92,7 +96,7 @@ type ExtenderMeasurementCert struct {
 	// the installed certificate, swapped whole so a handshake never sees half
 	// of one (M1)
 	installed atomic.Pointer[extenderMeasurementInstalled]
-	// counts every install and removal; tests wait on it
+	// counts every install and removal (ChangeMonitor)
 	installMonitor *connect.MonitorValue[uint64]
 
 	stateLock sync.Mutex
@@ -155,19 +159,21 @@ func (self *ExtenderMeasurementCert) PublicKey() *ecdsa.PublicKey {
 }
 
 // The activation's MeasurementCsr hook (connect.ExtenderActivatorSettings, C4):
-// the standard base64 of the DER certificate request whose names are exactly
-// the measurement names of `addrs` (N3), signed by the measurement key, which
-// never leaves the extender. "" when there is no name, or when the operator
-// already holds a request or a certificate for exactly those names under this
-// key, so a daily activation asks for nothing new. A request for new names --
-// a changed address, a new family -- is made once and kept while they stand.
-// Being asked wakes the lifecycle's poll, which reads what the operator made of
-// the request once the post has landed.
-func (self *ExtenderMeasurementCert) ActivationCsr(addrs []netip.Addr) string {
-	names := extenderMeasurementNames(addrs, self.zone)
-	if len(names) == 0 {
+// the standard base64 of the DER certificate request whose one name is the
+// measurement name of `extenderId` (N1), this extender's id as the operator's
+// activation answer reported it (N4), signed by the measurement key, which
+// never leaves the extender. "" for the zero id, which has no name, and when
+// the operator already holds a request or a certificate for that name under
+// this key, so a routine activation asks for nothing new. The request is made
+// once and kept, since the id never changes. Being asked for a request wakes
+// the lifecycle's poll, which reads what the operator made of it once the post
+// has landed.
+func (self *ExtenderMeasurementCert) ActivationCsr(extenderId connect.Id) string {
+	name := connect.ExtenderMeasurementName(extenderId, self.zone)
+	if name == "" {
 		return ""
 	}
+	names := []string{name}
 	held, csr := func() (bool, string) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -204,8 +210,16 @@ func (self *ExtenderMeasurementCert) ActivationCsr(addrs []netip.Addr) string {
 	return csr
 }
 
-// The installed certificate and the names it serves (M10's lagCertificates),
-// or nil when none is installed or it has expired.
+// A counter of every install and removal of the certificate, so a role can
+// say what the extender serves when it changes: read Certificate and wait on
+// the channel the same Get returned.
+func (self *ExtenderMeasurementCert) ChangeMonitor() *connect.MonitorValue[uint64] {
+	return self.installMonitor
+}
+
+// The installed certificate and the one name it serves (M10's
+// lagCertificates), or nil when none is installed, it has expired, or the
+// operator withdrew it.
 func (self *ExtenderMeasurementCert) Certificate() (names []string, certificate *tls.Certificate) {
 	return self.certificateAt(time.Now())
 }
@@ -281,10 +295,22 @@ func (self *ExtenderMeasurementCert) dropExpired(now time.Time) {
 	}
 }
 
+// Removes the installed certificate at once, so the next handshake for its
+// name is no longer the API's (C9), and returns it; nil when none was.
+func (self *ExtenderMeasurementCert) drop() *extenderMeasurementInstalled {
+	installed := self.installed.Swap(nil)
+	if installed != nil {
+		self.installMonitor.Update(func(version uint64) uint64 {
+			return version + 1
+		})
+	}
+	return installed
+}
+
 // Checks a chain the operator issued (A8) for this key and zone: PEM
 // certificates, leaf first, each signed by the next; the leaf for this key,
-// unexpired, and named only with measurement names of the zone, so the
-// dispatch never presents it for anything else (M1).
+// unexpired, and named with one measurement name of the zone and nothing
+// else, so the dispatch never presents it for anything else (M1).
 func (self *ExtenderMeasurementCert) parseChain(chainPem string, now time.Time) (*extenderMeasurementInstalled, error) {
 	certificateDers := [][]byte{}
 	certificates := []*x509.Certificate{}
@@ -315,13 +341,11 @@ func (self *ExtenderMeasurementCert) parseChain(chainPem string, now time.Time) 
 	if !now.Before(leaf.NotAfter) {
 		return nil, fmt.Errorf("the certificate expired at %s", leaf.NotAfter.Format(time.RFC3339))
 	}
-	if len(leaf.DNSNames) == 0 || 0 < len(leaf.IPAddresses)+len(leaf.EmailAddresses)+len(leaf.URIs) {
-		return nil, fmt.Errorf("the certificate is not for measurement names alone")
+	if len(leaf.DNSNames) != 1 || 0 < len(leaf.IPAddresses)+len(leaf.EmailAddresses)+len(leaf.URIs) {
+		return nil, fmt.Errorf("the certificate is not for one measurement name alone")
 	}
-	for _, name := range leaf.DNSNames {
-		if _, ok := connect.ParseExtenderMeasurementName(name, self.zone); !ok {
-			return nil, fmt.Errorf("%q is not a measurement name under %s", name, self.zone)
-		}
+	if _, ok := connect.ParseExtenderMeasurementName(leaf.DNSNames[0], self.zone); !ok {
+		return nil, fmt.Errorf("%q is not a measurement name under %s", leaf.DNSNames[0], self.zone)
 	}
 	for i := 0; i+1 < len(certificates); i += 1 {
 		if err := certificates[i].CheckSignatureFrom(certificates[i+1]); err != nil {
@@ -341,29 +365,6 @@ func (self *ExtenderMeasurementCert) parseChain(chainPem string, now time.Time) 
 }
 
 var errExtenderMeasurementKeyMismatch = errors.New("the certificate is for another key")
-
-// The measurement names of a set of addresses (N1, N3): v4 before v6, each
-// address once, an invalid one left out.
-func extenderMeasurementNames(addrs []netip.Addr, zone string) []string {
-	canonicalAddrs := []netip.Addr{}
-	for _, addr := range addrs {
-		if !addr.IsValid() {
-			continue
-		}
-		addr = addr.WithZone("").Unmap()
-		if !slices.Contains(canonicalAddrs, addr) {
-			canonicalAddrs = append(canonicalAddrs, addr)
-		}
-	}
-	slices.SortFunc(canonicalAddrs, func(a netip.Addr, b netip.Addr) int {
-		return a.Compare(b)
-	})
-	names := []string{}
-	for _, addr := range canonicalAddrs {
-		names = append(names, connect.ExtenderMeasurementName(addr, zone))
-	}
-	return names
-}
 
 // A certificate request for exactly `names`, in the subject alternative names
 // and nowhere else, as standard base64 of its DER (C4).
@@ -475,8 +476,10 @@ type ExtenderLagLifecycleSettings struct {
 	// The measurement key and certificate (C4), which the role also hands to
 	// the activation as ExtenderActivatorSettings.MeasurementCsr =
 	// Certificate.ActivationCsr. Nil polls for no certificate, so the API never
-	// serves. The role makes one only when `measurement.enabled` is set, since
-	// a certificate publishes the extender's measurement names (§2).
+	// serves. The role makes one only when `measurement.enabled` is set and
+	// the extender keeps its identity in a file, since a certificate publishes
+	// the extender's measurement name (§2) and an identity that is new at every
+	// start would ask for a new one each time.
 	Certificate *ExtenderMeasurementCert
 
 	// The plain api url the certificate is read from (A8) and reports are
@@ -496,10 +499,11 @@ type ExtenderLagLifecycleSettings struct {
 	// A request an activation carries is first polled CertOfferPollTimeout
 	// after it was asked for, once the post has landed. With nothing pending
 	// the state is read again at least every CertCheckTimeout, which is how a
-	// withdrawal is seen; an installed certificate is read again at two thirds
-	// of its life, when the operator renews it, and from then on at a quarter
-	// of the time it has left, but never further apart than CertCheckTimeout or
-	// closer than CertPollMaxBackoff.
+	// withdrawal is seen and so bounds how long the extender goes on answering
+	// to a withdrawn name (C9); an installed certificate is read again at two
+	// thirds of its life, when the operator renews it, and from then on at a
+	// quarter of the time it has left, but never further apart than
+	// CertCheckTimeout or closer than CertPollMaxBackoff.
 	CertPollMinBackoff   time.Duration
 	CertPollMaxBackoff   time.Duration
 	CertOfferPollTimeout time.Duration
@@ -528,7 +532,7 @@ func DefaultExtenderLagLifecycleSettings() *ExtenderLagLifecycleSettings {
 		CertPollMinBackoff:   30 * time.Second,
 		CertPollMaxBackoff:   30 * time.Minute,
 		CertOfferPollTimeout: 15 * time.Second,
-		CertCheckTimeout:     24 * time.Hour,
+		CertCheckTimeout:     1 * time.Hour,
 
 		ReportMaxBatchCount:   32,
 		ReportMaxPendingCount: 256,
@@ -628,8 +632,8 @@ func newExtenderLagLifecycle(server *ExtenderServer, settings *ExtenderLagLifecy
 	return self
 }
 
-// The installed certificate and the names it serves now (lagCertificates), or
-// nil when none is installed or it has expired.
+// The installed certificate and the one name it serves now (lagCertificates),
+// or nil when none is installed, it has expired, or the operator withdrew it.
 func (self *extenderLagLifecycle) Certificate() (names []string, certificate *tls.Certificate) {
 	if self == nil || self.certificate == nil {
 		return nil, nil
@@ -655,12 +659,13 @@ func (self *extenderLagLifecycle) FeedHandler() http.Handler {
 	return self.feedHandler
 }
 
-// The certificate poll (C4, C6, A8). It reads the operator's state at start;
-// when an activation carries a request, once the post has landed; on a backoff
-// while a request is pending, a read fails, or an offered request has not been
-// answered for; ahead of each renewal of the installed certificate; and at
-// least every CertCheckTimeout otherwise. A newly issued chain is installed at
-// once, which is a swap the next handshake sees.
+// The certificate poll (C4, C6, C9, A8). It reads the operator's state at
+// start; when an activation carries a request, once the post has landed; on a
+// backoff while a request is pending, a read fails, or an offered request has
+// not been answered for; ahead of each renewal of the installed certificate;
+// and at least every CertCheckTimeout otherwise. A newly issued chain is
+// installed at once and a withdrawn one dropped at once, each a swap the next
+// handshake sees.
 func (self *extenderLagLifecycle) run() {
 	settings := self.settings
 	backoff := settings.CertPollMinBackoff
@@ -738,15 +743,32 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 		}
 		return nextPollTime, settings.CertPollMinBackoff
 
+	case ExtenderMeasurementCertStateWithdrawn:
+		// the operator withdrew the certificate (C9): the extender was
+		// deactivated, or overridden to the gated tier or a canary, and must
+		// stop answering to the name the certificate logs list. Whatever is
+		// installed goes at once, whichever name the answer carries: while the
+		// operator answers withdrawn it publishes nothing for this extender.
+		// Nothing is held, so the next activation asks again, and an extender
+		// that qualifies again is issued a new one.
+		if dropped := self.certificate.drop(); dropped != nil {
+			log.Printf(
+				"[extender] lag: measurement certificate for %s withdrawn by the operator = %s",
+				strings.Join(dropped.names, ","),
+				result.Reason,
+			)
+		}
+		self.certificate.setHeld(nil, result.Names)
+		return self.idlePollTime(now, backoff)
+
 	case ExtenderMeasurementCertStateNone, ExtenderMeasurementCertStateRefused:
 		answeredNames := []string(nil)
 		if result.State == ExtenderMeasurementCertStateRefused {
 			log.Printf("[extender] lag: measurement certificate refused by the operator = %s", result.Reason)
 			answeredNames = result.Names
 		}
-		// the installed certificate, if any, is served until it expires: its
-		// name is withdrawn from dns with it (C9), and a transient answer
-		// must not take a valid one down
+		// the installed certificate, if any, is served until it expires or is
+		// withdrawn: a transient answer must not take a valid one down (C4)
 		self.certificate.setHeld(nil, answeredNames)
 		return self.idlePollTime(now, backoff)
 
@@ -795,7 +817,8 @@ func (self *extenderLagLifecycle) installedPollTime(installed *extenderMeasureme
 	return now.Add(min(wait, settings.CertCheckTimeout))
 }
 
-// Reads the certificate state under the activation credential (A8).
+// Reads the certificate state of this extender under the activation
+// credential (A8).
 func (self *extenderLagLifecycle) getCertificate() (*extenderMeasurementCertResult, error) {
 	ctx, cancel := context.WithTimeout(self.server.ctx, self.settings.RequestTimeout)
 	defer cancel()
@@ -803,11 +826,16 @@ func (self *extenderLagLifecycle) getCertificate() (*extenderMeasurementCertResu
 	if self.settings.ByJwt != nil {
 		byJwt = self.settings.ByJwt()
 	}
-	apiUrl := strings.TrimRight(strings.TrimSpace(self.settings.ApiUrl), "/")
+	certUrl := strings.TrimRight(strings.TrimSpace(self.settings.ApiUrl), "/") + ExtenderMeasurementCertPath
+	if publicKey := self.server.PublicKey(); 0 < len(publicKey) {
+		// a client may have activated more than one extender; the identity key
+		// picks this one
+		certUrl += "?public_key_hex=" + hex.EncodeToString(publicKey)
+	}
 	result, err := connect.HttpGetWithStrategy(
 		ctx,
 		self.settings.ClientStrategy,
-		apiUrl+ExtenderMeasurementCertPath,
+		certUrl,
 		byJwt,
 		&extenderMeasurementCertResult{},
 		connect.NewNoopApiCallback[*extenderMeasurementCertResult](),
@@ -824,7 +852,8 @@ func (self *extenderLagLifecycle) getCertificate() (*extenderMeasurementCertResu
 // The certificate route's answer (A8). The json is the server's contract.
 type extenderMeasurementCertResult struct {
 	State string `json:"state"`
-	// the names of the pending request or of the issued certificate
+	// the extender's one measurement name: the request's when pending or
+	// refused, the certificate's when issued or withdrawn
 	Names []string `json:"names,omitempty"`
 	// the issued chain, leaf first
 	ChainPem string `json:"chain_pem,omitempty"`

@@ -66,9 +66,9 @@ type ExtenderActivateArgs struct {
 	DnsTld   string   `json:"dns_tld"`
 	Carriers []string `json:"carriers"`
 	// the certificate request of the extender's measurement key
-	// (lag.dev/PLAN.md C4): standard base64 of the DER, whose names are
-	// exactly the measurement names of its active addresses (N3). Empty when
-	// the extender asks for no certificate; an operator that predates the
+	// (lag.dev/PLAN.md C4): standard base64 of the DER, whose one name is the
+	// extender's measurement name (N1). Empty when the extender asks for no
+	// certificate, which is most activations; an operator that predates the
 	// field ignores it.
 	MeasurementCsr string `json:"measurement_csr,omitempty"`
 }
@@ -77,9 +77,15 @@ type ExtenderActivateArgs struct {
 // false and `Error` naming the carrier that failed its probe, not a request
 // error, so the caller can act on it rather than on an http status.
 type ExtenderActivateResult struct {
-	Activated bool   `json:"activated"`
-	Ip        string `json:"ip,omitempty"`
-	IpVersion int    `json:"ip_version,omitempty"`
+	Activated bool `json:"activated"`
+	// the operator's id of this extender, one per identity key and the same at
+	// every activation (lag.dev/PLAN.md N4). The extender's measurement name
+	// is this id under the measurement zone (N1), so it is how an extender
+	// learns the name its certificate request asks for (C4). Nil from an
+	// operator that predates it, and on a refusal.
+	ExtenderId *Id    `json:"extender_id,omitempty"`
+	Ip         string `json:"ip,omitempty"`
+	IpVersion  int    `json:"ip_version,omitempty"`
 	// the carriers that passed their probe, which is what the signed record
 	// lists
 	Carriers   []string   `json:"carriers,omitempty"`
@@ -192,18 +198,18 @@ type ExtenderActivatorSettings struct {
 	OnActivated func(ipVersion int, result *ExtenderActivateResult)
 
 	// MeasurementCsr, when set, is asked for the measurement certificate
-	// request a pass carries (lag.dev/PLAN.md C4): the base64 DER request
-	// whose names are exactly those of `addrs`, the addresses the operator is
-	// to hold active for this extender, one per family in ip version order; or
-	// "" for none, because measurement is off or the operator already holds a
-	// request or a certificate for exactly those names. Only the last post of
-	// a pass carries a request, by which every earlier family has reported its
-	// address. A family that has never reported one leaves the pass with no
-	// request, and a pass that ends with other addresses active than its
-	// request named is followed at once by one more pass, which carries the
-	// request for them unless this returns "" -- so it may be asked with no
-	// post following. It runs on the loop goroutine and must not block.
-	MeasurementCsr func(addrs []netip.Addr) string
+	// request a post carries (lag.dev/PLAN.md C4): the base64 DER request
+	// whose one name is the measurement name of `extenderId`, this extender's
+	// id as the operator's answers report it (N4); or "" for none, because
+	// measurement is off or the operator already holds a request or a
+	// certificate for that name. It is asked only once an answer has reported
+	// the id, so the first post of a new identity carries none and the request
+	// rides the next post, and a pass carries at most one. A pass that learned
+	// the id from its last answer has no next post: when a request is wanted
+	// then, one more pass follows at once to carry it -- so this may be asked
+	// with no post following. It runs on the loop goroutine and must not
+	// block.
+	MeasurementCsr func(extenderId Id) string
 
 	// The re-activation period (G3).
 	ActivateTimeout time.Duration
@@ -328,9 +334,11 @@ type ExtenderActivator struct {
 	// set by a network change, taken by the next pass
 	forcedActivate bool
 
-	// set when a pass forced the next one to carry the measurement request
-	// for the addresses it activated (C4), so that one is followed by no
-	// other. Read and written by the loop goroutine alone.
+	// this extender's id as the operator's last answer reported it, zero
+	// until one has (lag.dev/PLAN.md N4), and whether the last pass forced this
+	// one to carry the measurement request (C4), so that it is followed by no
+	// other. Both are read and written by the loop goroutine alone.
+	extenderId          Id
 	measurementFollowUp bool
 }
 
@@ -723,115 +731,70 @@ func (self *ExtenderActivator) activate(now time.Time) bool {
 	followUp := self.measurementFollowUp
 	self.measurementFollowUp = false
 
+	succeeded := false
+	// whether a post of this pass delivered the measurement request
+	measurementCarried := false
 	if self.fallback {
-		succeeded, csrAddrs := self.activateFallback(carriers, now)
-		if succeeded && !followUp {
-			self.followMeasurementCsr(self.reportedIpVersions(), csrAddrs)
+		succeeded, measurementCarried = self.activateFallback(carriers, now)
+	} else {
+		attempted := false
+		succeeded = true
+		for _, ipVersion := range self.ipVersions() {
+			if !self.ipVersionSupported(ipVersion) {
+				// a family with no global address on this host cannot be probed
+				// back, so it is skipped rather than refused (G3)
+				continue
+			}
+			attempted = true
+			if len(carriers) == 0 {
+				self.recordFailure(ipVersion, now, "no carrier is listening", false)
+				succeeded = false
+				continue
+			}
+			// one request a pass, on the first post that can carry it (C4)
+			measurementCsr := ""
+			if !measurementCarried {
+				measurementCsr = self.measurementCsr()
+			}
+			if self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, measurementCsr, now) {
+				measurementCarried = measurementCarried || measurementCsr != ""
+			} else {
+				succeeded = false
+			}
 		}
-		return succeeded
+		succeeded = attempted && succeeded
 	}
-
-	ipVersions := []int{}
-	for _, ipVersion := range self.ipVersions() {
-		// a family with no global address on this host cannot be probed back,
-		// so it is skipped rather than refused (G3)
-		if self.ipVersionSupported(ipVersion) {
-			ipVersions = append(ipVersions, ipVersion)
-		}
-	}
-	succeeded := true
-	var csrAddrs []netip.Addr
-	for i, ipVersion := range ipVersions {
-		if len(carriers) == 0 {
-			self.recordFailure(ipVersion, now, "no carrier is listening", false)
-			succeeded = false
-			continue
-		}
-		measurementCsr := ""
-		if i == len(ipVersions)-1 {
-			// the pass's one measurement request rides on its last post, by
-			// which every earlier family has reported its address (C4)
-			csrAddrs, measurementCsr = self.measurementCsr(ipVersions)
-		}
-		if !self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, measurementCsr, now) {
-			succeeded = false
-		}
-	}
-	succeeded = 0 < len(ipVersions) && succeeded
-	if succeeded && !followUp {
-		self.followMeasurementCsr(ipVersions, csrAddrs)
+	if succeeded && !followUp && !measurementCarried {
+		self.followMeasurementCsr()
 	}
 	return succeeded
 }
 
-// The measurement request a pass's last post carries (lag.dev/PLAN.md C4), and
-// the addresses it names: one per family the pass activates, the address just
-// reported for each family posted before and the last one reported for the
-// family being posted, which is what the operator will hold if it has not
-// moved. While one of them has never reported an address there is no request:
-// one for fewer names than the operator will hold is refused at issuance, and
-// the pass that follows carries the right one.
-func (self *ExtenderActivator) measurementCsr(ipVersions []int) ([]netip.Addr, string) {
-	if self.settings.MeasurementCsr == nil {
-		return nil, ""
+// The measurement request a post carries (lag.dev/PLAN.md C4): what the
+// extender asks for under its id, and nothing until an answer has reported
+// that id (N4), since the request's one name is made from it.
+func (self *ExtenderActivator) measurementCsr() string {
+	if self.settings.MeasurementCsr == nil || self.extenderId == (Id{}) {
+		return ""
 	}
-	addrs, ok := self.measurementAddrs(ipVersions)
-	if !ok {
-		return nil, ""
-	}
-	return addrs, self.settings.MeasurementCsr(addrs)
+	return self.settings.MeasurementCsr(self.extenderId)
 }
 
-// The last reported address of each family, in the order given; false when one
-// has none.
-func (self *ExtenderActivator) measurementAddrs(ipVersions []int) ([]netip.Addr, bool) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	addrs := []netip.Addr{}
-	for _, ipVersion := range ipVersions {
-		family, ok := self.families[ipVersion]
-		if !ok || !family.Ip.IsValid() {
-			return nil, false
-		}
-		addrs = append(addrs, family.Ip)
-	}
-	return addrs, 0 < len(addrs)
-}
-
-// The families an answer has named, in ip version order, which is what an
-// activation through the plain api url knows of itself (C2).
-func (self *ExtenderActivator) reportedIpVersions() []int {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	ipVersions := []int{}
-	for _, ipVersion := range []int{4, 6} {
-		if family, ok := self.families[ipVersion]; ok && family.Ip.IsValid() {
-			ipVersions = append(ipVersions, ipVersion)
-		}
-	}
-	return ipVersions
-}
-
-// Follows a successful pass whose measurement request named other addresses
-// than the pass left active -- or that had none to name, which is every first
-// pass, since an address is known only once the operator reports it -- with
-// one more pass at once, when the request for the active addresses is still
-// wanted. Without it the request would wait for the 24 hour tick.
+// Follows a successful pass that delivered no measurement request with one
+// more pass at once, when a request is wanted now. That is the first pass of
+// a new identity with a single post -- one family, or the plain api url --
+// which learned this extender's id from the answer to that post and so had no
+// later post to carry the request on.
 //
-// lag.dev/PLAN.md C4 sends the request at activation, but an extender cannot
-// name an address before the operator reports it; this one extra pass, on the
-// first activation and after an address change, is the smallest change that
-// lets the request name exactly the active addresses.
-func (self *ExtenderActivator) followMeasurementCsr(ipVersions []int, csrAddrs []netip.Addr) {
-	if self.settings.MeasurementCsr == nil {
-		return
-	}
-	addrs, ok := self.measurementAddrs(ipVersions)
-	if !ok || slices.Equal(addrs, csrAddrs) {
-		return
-	}
-	if self.settings.MeasurementCsr(addrs) == "" {
-		// the operator already holds a request or a certificate for them
+// lag.dev/PLAN.md C4 has a new identity's request ride its next activation
+// post. With one post a pass that next post is the 24 hour tick away, and a
+// process that restarts more often than that would never reach it, since the
+// id is learned again from the first answer of each run. This one extra post
+// is the smallest change that makes the next post follow the first.
+func (self *ExtenderActivator) followMeasurementCsr() {
+	if self.measurementCsr() == "" {
+		// nothing is wanted: measurement is off, the id is not known, or the
+		// operator already holds a request or a certificate for the name
 		return
 	}
 	self.measurementFollowUp = true
@@ -855,19 +818,20 @@ func (self *ExtenderActivator) ipVersionSupported(ipVersion int) bool {
 // the other family with, and the operator derives the family from the caller
 // address, so the answer names whichever family this host's egress used. A host
 // with no global address of either family is skipped exactly as a family
-// without one is (G3). The one post carries the measurement request for the
-// families answered so far, and the addresses it names come back with the
-// outcome (C4).
-func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time) (bool, []netip.Addr) {
+// without one is (G3). The one post carries the measurement request when one
+// is wanted and this extender's id is known, and whether it delivered one
+// comes back with the outcome (C4).
+func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time) (succeeded bool, measurementCarried bool) {
 	if !self.ipVersionSupported(4) && !self.ipVersionSupported(6) {
-		return false, nil
+		return false, false
 	}
 	if len(carriers) == 0 {
 		self.recordFailure(0, now, "no carrier is listening", false)
-		return false, nil
+		return false, false
 	}
-	csrAddrs, measurementCsr := self.measurementCsr(self.reportedIpVersions())
-	return self.activateUrl(0, self.fallbackApiUrl(), carriers, measurementCsr, now), csrAddrs
+	measurementCsr := self.measurementCsr()
+	succeeded = self.activateUrl(0, self.fallbackApiUrl(), carriers, measurementCsr, now)
+	return succeeded, succeeded && measurementCsr != ""
 }
 
 // Posts one activation and records what came back (C2). `ipVersion` is the
@@ -925,6 +889,13 @@ func (self *ExtenderActivator) activateUrl(
 		self.log.Infof("[extender]activate v%d refused = %s\n", ipVersion, message)
 		self.recordFailure(ipVersion, now, message, true)
 		return false
+	}
+
+	// the operator's id of this extender, the same at every activation, which
+	// is what its measurement certificate request is named by (lag.dev/PLAN.md
+	// N4, C4)
+	if result.ExtenderId != nil && *result.ExtenderId != (Id{}) {
+		self.extenderId = *result.ExtenderId
 	}
 
 	// the record is applied either way: it is signed and carries its own

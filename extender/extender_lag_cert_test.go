@@ -4,7 +4,8 @@ package extender
 // C6, A8, M10).
 //
 // The operator is an httptest server that answers the certificate route from
-// a state the test sets and issues chains from a test certificate authority.
+// a state the test sets, issues chains from a test certificate authority, and
+// knows the extender by one id, which names its certificate (N1).
 // The lifecycle reads a test clock and waits on it, so nothing sleeps: each
 // wait the lifecycle starts is reported to the test, which moves the clock
 // past it to fire it.
@@ -19,13 +20,13 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -210,10 +211,13 @@ type testLagApi struct {
 	// the measurement request of each activation that carried one
 	activationCsrs chan string
 
-	stateLock    sync.Mutex
-	certResult   *extenderMeasurementCertResult
-	reportStatus int
-	reportResult *extenderLagReportResult
+	stateLock sync.Mutex
+	// what the certificate route answers; nil answers 404
+	certResult *extenderMeasurementCertResult
+	// the identity key the last read of the certificate route named
+	certPublicKeyHexValue string
+	reportStatus          int
+	reportResult          *extenderLagReportResult
 }
 
 func newTestLagApi(t *testing.T) *testLagApi {
@@ -243,8 +247,9 @@ func (self *testLagApi) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == connect.ExtenderActivatePath:
-		// every activation is of the one v4 address, and a request it carries
-		// is pending until the test issues it (A10)
+		// every activation is of the one v4 address and answers the extender's
+		// id (N4), and a request it carries is pending until the test issues
+		// it (A10)
 		args := &connect.ExtenderActivateArgs{}
 		if err := json.NewDecoder(r.Body).Decode(args); err != nil {
 			w.WriteHeader(http.StatusTeapot)
@@ -257,18 +262,25 @@ func (self *testLagApi) serve(w http.ResponseWriter, r *http.Request) {
 				Names: request.DNSNames,
 			})
 		}
+		extenderId := testLagCertExtenderId
 		json.NewEncoder(w).Encode(&connect.ExtenderActivateResult{
-			Activated: true,
-			Ip:        testLagActivateIp,
-			IpVersion: 4,
-			Carriers:  args.Carriers,
+			Activated:  true,
+			ExtenderId: &extenderId,
+			Ip:         testLagActivateIp,
+			IpVersion:  4,
+			Carriers:   args.Carriers,
 		})
 		self.activationCsrs <- args.MeasurementCsr
 	case r.Method == http.MethodGet && r.URL.Path == ExtenderMeasurementCertPath:
 		self.stateLock.Lock()
-		certResult := *self.certResult
+		certResult := self.certResult
+		self.certPublicKeyHexValue = r.URL.Query().Get("public_key_hex")
 		self.stateLock.Unlock()
-		json.NewEncoder(w).Encode(&certResult)
+		if certResult == nil {
+			w.WriteHeader(http.StatusNotFound)
+		} else {
+			json.NewEncoder(w).Encode(certResult)
+		}
 		self.polls <- struct{}{}
 	case r.Method == http.MethodPost && r.URL.Path == ExtenderLagReportPath:
 		args := &extenderLagReportArgs{}
@@ -298,6 +310,13 @@ func (self *testLagApi) setCertResult(certResult *extenderMeasurementCertResult)
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.certResult = certResult
+}
+
+// The identity key the last read of the certificate route named.
+func (self *testLagApi) certPublicKeyHex() string {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.certPublicKeyHexValue
 }
 
 func (self *testLagApi) setReportAnswer(reportStatus int, reportResult *extenderLagReportResult) {
@@ -368,7 +387,14 @@ func newTestLagLifecycle(
 	strategySettings := connect.DefaultClientStrategySettings()
 	strategySettings.EnableResilient = false
 	clientStrategy := connect.NewDirectClientStrategy(ctx, strategySettings, 0)
-	server := NewExtenderServer(ctx, nil, nil, nil, &net.Dialer{}, DefaultExtenderSettings())
+	// an extender with an identity, which is what its reads name it by
+	identityKeySeed, err := connect.NewExtenderKeySeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverSettings := DefaultExtenderSettings()
+	serverSettings.IdentityKeySeed = identityKeySeed
+	server := NewExtenderServer(ctx, nil, nil, nil, &net.Dialer{}, serverSettings)
 
 	settings := DefaultExtenderLagLifecycleSettings()
 	settings.Certificate = certificate
@@ -405,14 +431,14 @@ func newTestLagCertificate(t *testing.T) *ExtenderMeasurementCert {
 func waitTestLagInstall(t *testing.T, certificate *ExtenderMeasurementCert, version uint64) uint64 {
 	t.Helper()
 	for {
-		current, change := certificate.installMonitor.Get()
+		current, change := certificate.ChangeMonitor().Get()
 		if version < current {
 			return current
 		}
 		select {
 		case <-change:
 		case <-time.After(30 * time.Second):
-			t.Fatal("the lifecycle did not install a certificate")
+			t.Fatal("the lifecycle did not install or drop a certificate")
 			return 0
 		}
 	}
@@ -421,18 +447,14 @@ func waitTestLagInstall(t *testing.T, certificate *ExtenderMeasurementCert, vers
 // The address the test operator activates.
 const testLagActivateIp = "198.51.100.7"
 
-// The addresses of the name vectors, and their names under the default zone
-// (N1).
-var testLagNameVectors = []struct {
-	addr string
-	name string
-}{
-	{addr: "203.0.113.7", name: "203-0-113-7.extender.bringyour.com"},
-	{addr: "::ffff:203.0.113.7", name: "203-0-113-7.extender.bringyour.com"},
-	{addr: "2001:db8::1", name: "2001-db8--1.extender.bringyour.com"},
-	{addr: "2001:db8:0:1:1:1:1:1", name: "2001-db8-0-1-1-1-1-1.extender.bringyour.com"},
-	{addr: "2001:db8::", name: "2001-db8--0.extender.bringyour.com"},
-}
+// The id the test operator knows this extender by, and its measurement name
+// under the default zone (N1).
+var testLagCertExtenderId = connect.RequireIdFromBytes([]byte{
+	0x01, 0x92, 0xe4, 0xa1, 0x7b, 0x3c, 0x7d, 0x2e,
+	0x9f, 0x10, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f,
+})
+
+const testLagCertName = "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.extender.bringyour.com"
 
 // The key is made once, kept beside the extender key file with mode 0600 as
 // PKCS #8 PEM, and the same key is loaded from it again (C4).
@@ -561,34 +583,22 @@ func TestLagCertKeyRefusesAnotherKey(t *testing.T) {
 	}
 }
 
-// The request names exactly the measurement names of the addresses (N1, N3,
-// C4): one per address in ip version order, a v4-mapped address as its v4,
-// nothing else in the request, and signed by the measurement key.
-func TestLagCertCsrNames(t *testing.T) {
-	for _, vector := range testLagNameVectors {
-		names := extenderMeasurementNames([]netip.Addr{netip.MustParseAddr(vector.addr)}, connect.ExtenderMeasurementZone)
-		if !slices.Equal(names, []string{vector.name}) {
-			t.Errorf("names of %s = %v, expected %s", vector.addr, names, vector.name)
-		}
+// The request names exactly the extender's measurement name, its id under the
+// zone (N1, C4): one name, nothing else in the request, and signed by the
+// measurement key.
+func TestLagCertCsrName(t *testing.T) {
+	if name := connect.ExtenderMeasurementName(testLagCertExtenderId, ""); name != testLagCertName {
+		t.Fatalf("measurement name = %s, expected %s", name, testLagCertName)
 	}
 
 	certificate := newTestLagCertificate(t)
-	addrs := []netip.Addr{
-		netip.MustParseAddr("2001:db8::1"),
-		netip.MustParseAddr("::ffff:203.0.113.7"),
-		netip.MustParseAddr("203.0.113.7"),
-		{},
-	}
-	request := parseTestLagCsr(t, certificate.ActivationCsr(addrs))
-	expectedNames := []string{
-		"203-0-113-7.extender.bringyour.com",
-		"2001-db8--1.extender.bringyour.com",
-	}
-	if !slices.Equal(request.DNSNames, expectedNames) {
-		t.Fatalf("request names = %v, expected %v", request.DNSNames, expectedNames)
+	csr := certificate.ActivationCsr(testLagCertExtenderId)
+	request := parseTestLagCsr(t, csr)
+	if !slices.Equal(request.DNSNames, []string{testLagCertName}) {
+		t.Fatalf("request names = %v, expected %s alone", request.DNSNames, testLagCertName)
 	}
 	if 0 < len(request.IPAddresses)+len(request.EmailAddresses)+len(request.URIs) || request.Subject.CommonName != "" {
-		t.Fatalf("request = %+v, expected the dns names alone", request)
+		t.Fatalf("request = %+v, expected the one dns name alone", request)
 	}
 	if publicKey, ok := request.PublicKey.(*ecdsa.PublicKey); !ok || !publicKey.Equal(certificate.PublicKey()) {
 		t.Fatal("the request is not for the measurement key")
@@ -597,12 +607,13 @@ func TestLagCertCsrNames(t *testing.T) {
 		t.Fatalf("request signature = %s", request.SignatureAlgorithm)
 	}
 
-	// the same names ask with the same request; no address asks for nothing
-	if again := certificate.ActivationCsr(addrs[0:3]); again != certificate.ActivationCsr(addrs) {
-		t.Fatal("the same names were asked for with another request")
+	// the id never changes, so the request is made once and kept; no id asks
+	// for nothing
+	if again := certificate.ActivationCsr(testLagCertExtenderId); again != csr {
+		t.Fatal("the same id was asked for with another request")
 	}
-	if csr := certificate.ActivationCsr(nil); csr != "" {
-		t.Fatalf("no address asked with %q", csr)
+	if csr := certificate.ActivationCsr(connect.Id{}); csr != "" {
+		t.Fatalf("no id asked with %q", csr)
 	}
 
 	// a configured zone names under it
@@ -610,45 +621,44 @@ func TestLagCertCsrNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request = parseTestLagCsr(t, zoned.ActivationCsr([]netip.Addr{netip.MustParseAddr("198.51.100.7")}))
-	if !slices.Equal(request.DNSNames, []string{"198-51-100-7.measure.example"}) {
-		t.Fatalf("zoned names = %v", request.DNSNames)
+	request = parseTestLagCsr(t, zoned.ActivationCsr(testLagCertExtenderId))
+	zonedName := "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.measure.example"
+	if !slices.Equal(request.DNSNames, []string{zonedName}) {
+		t.Fatalf("zoned names = %v, expected %s", request.DNSNames, zonedName)
 	}
 }
 
 // The operator's state decides whether an activation asks: nothing while the
-// operator holds a request or a certificate for the names, and a new request
-// once the names change (C4).
-func TestLagCertCsrAsksOnlyForNewNames(t *testing.T) {
+// operator holds a request for the name, whatever the address the extender is
+// at, and a request again once the operator holds none (C4).
+func TestLagCertCsrAsksOnlyWhileTheOperatorHoldsNone(t *testing.T) {
 	clock := newTestLagClock()
 	api := newTestLagApi(t)
 	certificate := newTestLagCertificate(t)
-	v4 := netip.MustParseAddr("198.51.100.7")
-	v6 := netip.MustParseAddr("2001:db8::7")
-	names := []string{"198-51-100-7.extender.bringyour.com", "2001-db8--7.extender.bringyour.com"}
 
 	api.setCertResult(&extenderMeasurementCertResult{
 		State: ExtenderMeasurementCertStatePending,
-		Names: names,
+		Names: []string{testLagCertName},
 	})
 	newTestLagLifecycle(t, api, clock, certificate, nil)
 	api.waitPoll()
 	clock.nextWait(t)
+	if csr := certificate.ActivationCsr(testLagCertExtenderId); csr != "" {
+		t.Fatalf("asked with %q for the name the operator holds a request for", csr)
+	}
 
-	if csr := certificate.ActivationCsr([]netip.Addr{v4, v6}); csr != "" {
-		t.Fatalf("asked with %q for names the operator holds a request for", csr)
-	}
-	// a new address is a new request, for exactly the new names
-	moved := netip.MustParseAddr("198.51.100.8")
-	request := parseTestLagCsr(t, certificate.ActivationCsr([]netip.Addr{moved, v6}))
-	movedNames := []string{"198-51-100-8.extender.bringyour.com", "2001-db8--7.extender.bringyour.com"}
-	if !slices.Equal(request.DNSNames, movedNames) {
-		t.Fatalf("request names = %v, expected %v", request.DNSNames, movedNames)
-	}
-	// so is a family the operator holds none for
-	request = parseTestLagCsr(t, certificate.ActivationCsr([]netip.Addr{v4}))
-	if !slices.Equal(request.DNSNames, names[0:1]) {
-		t.Fatalf("request names = %v, expected %v", request.DNSNames, names[0:1])
+	// refused: the operator holds nothing, and the next activation asks again
+	api.setCertResult(&extenderMeasurementCertResult{
+		State:  ExtenderMeasurementCertStateRefused,
+		Names:  []string{testLagCertName},
+		Reason: "the extender has no public inbound address",
+	})
+	clock.advance(30 * time.Second)
+	api.waitPoll()
+	clock.nextWait(t)
+	request := parseTestLagCsr(t, certificate.ActivationCsr(testLagCertExtenderId))
+	if !slices.Equal(request.DNSNames, []string{testLagCertName}) {
+		t.Fatalf("request names = %v, expected %s", request.DNSNames, testLagCertName)
 	}
 }
 
@@ -660,15 +670,18 @@ func TestLagCertPollInstallRenew(t *testing.T) {
 	api := newTestLagApi(t)
 	ca := newTestLagCa(t)
 	certificate := newTestLagCertificate(t)
-	addrs := []netip.Addr{netip.MustParseAddr("198.51.100.7"), netip.MustParseAddr("2001:db8::7")}
-	names := []string{"198-51-100-7.extender.bringyour.com", "2001-db8--7.extender.bringyour.com"}
-	csr := certificate.ActivationCsr(addrs)
+	names := []string{testLagCertName}
+	csr := certificate.ActivationCsr(testLagCertExtenderId)
 
 	api.setCertResult(&extenderMeasurementCertResult{
 		State: ExtenderMeasurementCertStatePending,
 		Names: names,
 	})
-	lifecycle := newTestLagLifecycle(t, api, clock, certificate, nil)
+	lifecycle := newTestLagLifecycle(t, api, clock, certificate, func(settings *ExtenderLagLifecycleSettings) {
+		// a day between idle reads, so the read after an install is the
+		// renewal's rather than the hourly check
+		settings.CertCheckTimeout = 24 * time.Hour
+	})
 	// the first read is at start, and a pending request is read again on the
 	// backoff, which doubles
 	api.waitPoll()
@@ -677,6 +690,11 @@ func TestLagCertPollInstallRenew(t *testing.T) {
 	}
 	if names, tlsCertificate := lifecycle.Certificate(); names != nil || tlsCertificate != nil {
 		t.Fatal("a certificate was presented before one was issued")
+	}
+	// the read names this extender, which a client that activated several
+	// needs
+	if publicKeyHex := api.certPublicKeyHex(); publicKeyHex != hex.EncodeToString(lifecycle.server.PublicKey()) {
+		t.Fatalf("poll public key = %q, expected the extender's identity key", publicKeyHex)
 	}
 	clock.advance(30 * time.Second)
 	api.waitPoll()
@@ -695,7 +713,7 @@ func TestLagCertPollInstallRenew(t *testing.T) {
 		ChainPem: ca.issue(t, csr, issueTime, issueTime.Add(lifetime)),
 		NotAfter: issueTime.Add(lifetime).Format(time.RFC3339),
 	})
-	version, _ := certificate.installMonitor.Get()
+	version, _ := certificate.ChangeMonitor().Get()
 	clock.advance(60 * time.Second)
 	api.waitPoll()
 	version = waitTestLagInstall(t, certificate, version)
@@ -754,22 +772,139 @@ func TestLagCertPollInstallRenew(t *testing.T) {
 	}
 }
 
+// A lifecycle with a certificate installed, its wait for the next read
+// already taken.
+type testLagInstalled struct {
+	clock       *testLagClock
+	api         *testLagApi
+	certificate *ExtenderMeasurementCert
+	lifecycle   *extenderLagLifecycle
+	// what the operator answered to install it
+	issued *extenderMeasurementCertResult
+}
+
+func newTestLagInstalled(t *testing.T) *testLagInstalled {
+	t.Helper()
+	clock := newTestLagClock()
+	api := newTestLagApi(t)
+	certificate := newTestLagCertificate(t)
+	now := clock.Now()
+	issued := &extenderMeasurementCertResult{
+		State: ExtenderMeasurementCertStateIssued,
+		Names: []string{testLagCertName},
+		ChainPem: newTestLagCa(t).issue(
+			t, certificate.ActivationCsr(testLagCertExtenderId), now, now.Add(90*24*time.Hour)),
+	}
+	api.setCertResult(issued)
+	version, _ := certificate.ChangeMonitor().Get()
+	lifecycle := newTestLagLifecycle(t, api, clock, certificate, nil)
+	api.waitPoll()
+	waitTestLagInstall(t, certificate, version)
+	// with a certificate installed and far from its renewal, the state is read
+	// again every hour, which is how soon a withdrawal is seen
+	if wait := clock.nextWait(t); wait != time.Hour {
+		t.Fatalf("installed wait = %s, expected the check timeout", wait)
+	}
+	if names, tlsCertificate := lifecycle.Certificate(); !slices.Equal(names, []string{testLagCertName}) || tlsCertificate == nil {
+		t.Fatalf("served names = %v, expected %s", names, testLagCertName)
+	}
+	return &testLagInstalled{
+		clock:       clock,
+		api:         api,
+		certificate: certificate,
+		lifecycle:   lifecycle,
+		issued:      issued,
+	}
+}
+
+// A withdrawn answer drops the installed certificate at once, so the extender
+// stops answering to its measurement name, whichever name the answer carries;
+// and the operator then holds nothing, so the next activation asks again (C9).
+func TestLagCertWithdrawnDropsAtOnce(t *testing.T) {
+	otherName := connect.ExtenderMeasurementName(connect.NewId(), "")
+	for _, withdrawnNames := range [][]string{{testLagCertName}, nil, {otherName}} {
+		installed := newTestLagInstalled(t)
+		installed.api.setCertResult(&extenderMeasurementCertResult{
+			State:  ExtenderMeasurementCertStateWithdrawn,
+			Names:  withdrawnNames,
+			Reason: "the extender is gated",
+		})
+		version, _ := installed.certificate.ChangeMonitor().Get()
+		installed.clock.advance(time.Hour)
+		installed.api.waitPoll()
+		waitTestLagInstall(t, installed.certificate, version)
+		if names, tlsCertificate := installed.lifecycle.Certificate(); names != nil || tlsCertificate != nil {
+			t.Errorf("withdrawn %v: the certificate is still presented for %v", withdrawnNames, names)
+		}
+		if names, tlsCertificate := installed.certificate.Certificate(); names != nil || tlsCertificate != nil {
+			t.Errorf("withdrawn %v: the certificate is still held for %v", withdrawnNames, names)
+		}
+		if wait := installed.clock.nextWait(t); wait != time.Hour {
+			t.Errorf("withdrawn %v: wait = %s, expected the check timeout", withdrawnNames, wait)
+		}
+		if csr := installed.certificate.ActivationCsr(testLagCertExtenderId); csr == "" {
+			t.Errorf("withdrawn %v: the next activation did not ask again", withdrawnNames)
+		}
+	}
+}
+
+// An installed, unexpired certificate is kept through a none, pending or
+// refused answer, an answer in no known state and a read that failed, so a
+// transient answer cannot take a valid one down; and the same chain answered
+// again is not installed twice (C4).
+func TestLagCertKeepsThroughATransientAnswer(t *testing.T) {
+	for _, transient := range []*extenderMeasurementCertResult{
+		{State: ExtenderMeasurementCertStateNone},
+		{State: ExtenderMeasurementCertStatePending, Names: []string{testLagCertName}},
+		{State: ExtenderMeasurementCertStateRefused, Names: []string{testLagCertName}, Reason: "the operator does not issue now"},
+		{State: "unsettled"},
+		// answered 404, which is a read that failed
+		nil,
+	} {
+		installed := newTestLagInstalled(t)
+		_, installedCertificate := installed.lifecycle.Certificate()
+		version, _ := installed.certificate.ChangeMonitor().Get()
+
+		installed.api.setCertResult(transient)
+		installed.clock.advance(time.Hour)
+		installed.api.waitPoll()
+		// the wait the lifecycle starts next is after it took the answer in
+		wait := installed.clock.nextWait(t)
+		names, tlsCertificate := installed.lifecycle.Certificate()
+		if !slices.Equal(names, []string{testLagCertName}) || tlsCertificate != installedCertificate {
+			t.Errorf("transient %+v: served %v, expected the installed certificate kept", transient, names)
+		}
+
+		// the operator answers issued again: nothing changes
+		installed.api.setCertResult(installed.issued)
+		installed.clock.advance(wait)
+		installed.api.waitPoll()
+		installed.clock.nextWait(t)
+		if _, tlsCertificate := installed.lifecycle.Certificate(); tlsCertificate != installedCertificate {
+			t.Errorf("transient %+v: the same chain was installed again", transient)
+		}
+		if current, _ := installed.certificate.ChangeMonitor().Get(); current != version {
+			t.Errorf("transient %+v: the certificate changed %d times", transient, current-version)
+		}
+	}
+}
+
 // An activation that carries a request wakes the poll, which reads the
 // operator once the post has landed (C4).
 func TestLagCertOfferPollsSoon(t *testing.T) {
 	clock := newTestLagClock()
 	api := newTestLagApi(t)
 	certificate := newTestLagCertificate(t)
+	names := []string{testLagCertName}
 
 	newTestLagLifecycle(t, api, clock, certificate, nil)
 	api.waitPoll()
-	// nothing is pending or installed: the next read is a day away
-	if wait := clock.nextWait(t); wait != 24*time.Hour {
+	// nothing is pending or installed: the next read is the hourly check
+	if wait := clock.nextWait(t); wait != time.Hour {
 		t.Fatalf("idle wait = %s, expected the check timeout", wait)
 	}
 
-	names := []string{"198-51-100-7.extender.bringyour.com"}
-	certificate.ActivationCsr([]netip.Addr{netip.MustParseAddr("198.51.100.7")})
+	certificate.ActivationCsr(testLagCertExtenderId)
 	if wait := clock.nextWait(t); wait != 15*time.Second {
 		t.Fatalf("offer wait = %s, expected the offer poll timeout", wait)
 	}
@@ -789,8 +924,8 @@ func TestLagCertOfferPollsSoon(t *testing.T) {
 		t.Fatalf("pending wait = %s, expected the doubled backoff", wait)
 	}
 
-	// a refusal of exactly that request settles it: the next read is a day
-	// away, and the next activation asks again
+	// a refusal of exactly that request settles it: the next read is the
+	// hourly check, and the next activation asks again
 	api.setCertResult(&extenderMeasurementCertResult{
 		State:  ExtenderMeasurementCertStateRefused,
 		Names:  names,
@@ -798,18 +933,19 @@ func TestLagCertOfferPollsSoon(t *testing.T) {
 	})
 	clock.advance(60 * time.Second)
 	api.waitPoll()
-	if wait := clock.nextWait(t); wait != 24*time.Hour {
+	if wait := clock.nextWait(t); wait != time.Hour {
 		t.Fatalf("refused wait = %s, expected the check timeout", wait)
 	}
-	if csr := certificate.ActivationCsr([]netip.Addr{netip.MustParseAddr("198.51.100.7")}); csr == "" {
+	if csr := certificate.ActivationCsr(testLagCertExtenderId); csr == "" {
 		t.Fatal("a refused request was not asked for again")
 	}
 	api.expectQuiet()
 }
 
-// The whole of C4 with the real activation loop: the first activation cannot
-// name the address the operator has not reported yet, so the pass that
-// follows carries the request; the lifecycle polls once that post has landed,
+// The whole of C4 with the real activation loop. A new identity learns its id
+// from its first activation answer, so that post carries no request; with one
+// post a pass, one more pass follows at once and carries the request for the
+// one name of that id. The lifecycle polls once the post has landed and
 // installs the chain the operator issued for it, and a later activation asks
 // for nothing new while the operator holds the certificate.
 func TestLagCertFromActivationToInstall(t *testing.T) {
@@ -819,7 +955,7 @@ func TestLagCertFromActivationToInstall(t *testing.T) {
 	certificate := newTestLagCertificate(t)
 	lifecycle := newTestLagLifecycle(t, api, clock, certificate, nil)
 	api.waitPoll()
-	if wait := clock.nextWait(t); wait != 24*time.Hour {
+	if wait := clock.nextWait(t); wait != time.Hour {
 		t.Fatalf("idle wait = %s, expected the check timeout", wait)
 	}
 
@@ -861,11 +997,11 @@ func TestLagCertFromActivationToInstall(t *testing.T) {
 	defer activator.Close()
 
 	if csr := api.waitActivation(); csr != "" {
-		t.Fatalf("the first activation carried %q before its address was known", csr)
+		t.Fatalf("the first activation carried %q before its id was known", csr)
 	}
 	csr := api.waitActivation()
 	request := parseTestLagCsr(t, csr)
-	names := []string{"198-51-100-7.extender.bringyour.com"}
+	names := []string{testLagCertName}
 	if !slices.Equal(request.DNSNames, names) {
 		t.Fatalf("request names = %v, expected %v", request.DNSNames, names)
 	}
@@ -886,7 +1022,7 @@ func TestLagCertFromActivationToInstall(t *testing.T) {
 		Names:    names,
 		ChainPem: ca.issue(t, csr, now, now.Add(90*24*time.Hour)),
 	})
-	version, _ := certificate.installMonitor.Get()
+	version, _ := certificate.ChangeMonitor().Get()
 	clock.advance(30 * time.Second)
 	api.waitPoll()
 	waitTestLagInstall(t, certificate, version)
@@ -898,19 +1034,19 @@ func TestLagCertFromActivationToInstall(t *testing.T) {
 	// the operator holds the certificate: a later activation asks for nothing
 	networkChanged()
 	if csr := api.waitActivation(); csr != "" {
-		t.Fatalf("an activation asked again with %q for the installed names", csr)
+		t.Fatalf("an activation asked again with %q for the installed name", csr)
 	}
 }
 
-// A chain issued for another key, or for a name outside the measurement zone,
-// is never installed, and the next activation asks for a request for this key.
+// A chain issued for another key, for a name outside the measurement zone, for
+// a name under it that is no extender's, or for more than the one name, is
+// never installed, and the next activation asks for a request for this key.
 func TestLagCertRefusesAChainItCannotServe(t *testing.T) {
 	clock := newTestLagClock()
 	api := newTestLagApi(t)
 	ca := newTestLagCa(t)
 	certificate := newTestLagCertificate(t)
-	addrs := []netip.Addr{netip.MustParseAddr("198.51.100.7")}
-	names := []string{"198-51-100-7.extender.bringyour.com"}
+	names := []string{testLagCertName}
 
 	otherKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -928,7 +1064,7 @@ func TestLagCertRefusesAChainItCannotServe(t *testing.T) {
 	if _, tlsCertificate := lifecycle.Certificate(); tlsCertificate != nil {
 		t.Fatal("a chain for another key was installed")
 	}
-	if csr := certificate.ActivationCsr(addrs); csr == "" {
+	if csr := certificate.ActivationCsr(testLagCertExtenderId); csr == "" {
 		t.Fatal("no request was asked for after a chain for another key")
 	}
 	if wait := clock.nextWait(t); wait != 15*time.Second {
@@ -936,15 +1072,16 @@ func TestLagCertRefusesAChainItCannotServe(t *testing.T) {
 	}
 
 	for _, chainNames := range [][]string{
-		{"198-51-100-7.other.example"},
-		{"198-51-100-7.extender.bringyour.com", "www.example.com"},
+		{"0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.other.example"},
+		{"www.extender.bringyour.com"},
+		{testLagCertName, connect.ExtenderMeasurementName(connect.NewId(), "")},
 	} {
 		api.setCertResult(&extenderMeasurementCertResult{
 			State:    ExtenderMeasurementCertStateIssued,
 			Names:    chainNames,
 			ChainPem: ca.issueFor(t, certificate.PublicKey(), chainNames, now, now.Add(90*time.Hour)),
 		})
-		clock.advance(24 * time.Hour)
+		clock.advance(time.Hour)
 		api.waitPoll()
 		clock.nextWait(t)
 		if _, tlsCertificate := lifecycle.Certificate(); tlsCertificate != nil {
