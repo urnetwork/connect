@@ -119,7 +119,7 @@ type windowIdentityState struct {
 	// torn-down identities of a fixed generator awaiting the next dial of
 	// their destination, at most one per destination; each also stays in
 	// live. See ip_remote_multi_client_identity_reuse.go.
-	parked map[MultiHopId]*WindowClientIdentity
+	parked map[MultiHopId]*parkedWindowIdentity
 	// set once by the owning generator's close; no identity parks after it
 	parkingClosed bool
 

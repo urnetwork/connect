@@ -18,9 +18,18 @@
 // it like any live identity. The generator retires parked identities when it
 // closes, except at process shutdown with a store, which keeps them for the
 // restarted process.
+//
+// The next client of a reused identity reuses its identity key too. Every
+// client otherwise generates a fresh key, and each registration of a different
+// key appends one signed generation to the client id's history: one write per
+// attempt again, a chain peers must verify from generation 1, and a finite
+// lifetime bound (1024 generations) after which registration fails and the
+// identity could never set up again. Re-registering the same key is idempotent.
+// The seed is held in memory only; the persisted identity never carries it.
 package connect
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -33,10 +42,17 @@ import (
 // before, so lifetime rotation still yields a fresh identity.
 const windowIdentityReuseMaxClientAge = 5 * time.Minute
 
+// A parked identity and, when known, its last client's identity key seed.
+type parkedWindowIdentity struct {
+	identity      *WindowClientIdentity
+	clientKeySeed []byte
+}
+
 // Parks the current generation of a live identity for the next dial of its
-// destination. False when parking has closed, the identity is unknown or
-// superseded, or its destination already holds a parked identity.
-func (self *windowIdentityState) Park(clientId Id, instanceId Id) bool {
+// destination, with its key seed when known. False when parking has closed,
+// the identity is unknown or superseded, or its destination already holds a
+// parked identity.
+func (self *windowIdentityState) Park(clientId Id, instanceId Id, clientKeySeed []byte) bool {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 	if self.parkingClosed || instanceId == (Id{}) {
@@ -47,22 +63,28 @@ func (self *windowIdentityState) Park(clientId Id, instanceId Id) bool {
 		return false
 	}
 	if self.parked == nil {
-		self.parked = map[MultiHopId]*WindowClientIdentity{}
+		self.parked = map[MultiHopId]*parkedWindowIdentity{}
 	}
 	if _, ok := self.parked[identity.Destination]; ok {
 		return false
 	}
-	self.parked[identity.Destination] = identity
+	self.parked[identity.Destination] = &parkedWindowIdentity{
+		identity:      identity,
+		clientKeySeed: bytes.Clone(clientKeySeed),
+	}
 	return true
 }
 
-// Takes the identity parked for a destination, if any.
-func (self *windowIdentityState) TakeParked(destination MultiHopId) *WindowClientIdentity {
+// Takes the identity parked for a destination and its key seed, if any.
+func (self *windowIdentityState) TakeParked(destination MultiHopId) (*WindowClientIdentity, []byte) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	identity := self.parked[destination]
+	parked := self.parked[destination]
 	delete(self.parked, destination)
-	return identity
+	if parked == nil {
+		return nil, nil
+	}
+	return parked.identity, parked.clientKeySeed
 }
 
 // Closes parking and takes every parked identity, atomically, so no identity
@@ -72,29 +94,29 @@ func (self *windowIdentityState) CloseParking() []*WindowClientIdentity {
 	defer self.mutex.Unlock()
 	self.parkingClosed = true
 	identities := make([]*WindowClientIdentity, 0, len(self.parked))
-	for _, identity := range self.parked {
-		identities = append(identities, identity)
+	for _, parked := range self.parked {
+		identities = append(identities, parked.identity)
 	}
 	self.parked = nil
 	return identities
 }
 
-// Parks a torn-down identity of an open fixed generator. `reusable` is false
-// when the platform refused the identity.
-func (self *ApiMultiClientGenerator) parkIdentity(args *MultiClientGeneratorClientArgs, reusable bool) bool {
+// Parks a torn-down identity of an open fixed generator with its last key
+// seed. `reusable` is false when the platform refused the identity.
+func (self *ApiMultiClientGenerator) parkIdentity(args *MultiClientGeneratorClientArgs, reusable bool, clientKeySeed []byte) bool {
 	if !self.reuseFixedIdentities || !reusable || args == nil || args.ClientAuth == nil || self.ctx.Err() != nil {
 		return false
 	}
 	if size, fixed := self.FixedDestinationSize(); !fixed || size == 0 {
 		return false
 	}
-	return self.identityState.Park(args.ClientId, args.ClientAuth.InstanceId)
+	return self.identityState.Park(args.ClientId, args.ClientAuth.InstanceId, clientKeySeed)
 }
 
 // The parked identity for a destination as fresh client args, under a new
-// instance id, or nil.
+// instance id and with its key seed, or nil.
 func (self *ApiMultiClientGenerator) takeParkedIdentity(destination MultiHopId) *MultiClientGeneratorClientArgs {
-	parked := self.identityState.TakeParked(destination)
+	parked, clientKeySeed := self.identityState.TakeParked(destination)
 	if parked == nil {
 		return nil
 	}
@@ -109,6 +131,7 @@ func (self *ApiMultiClientGenerator) takeParkedIdentity(destination MultiHopId) 
 			InstanceId: identity.InstanceId,
 			AppVersion: self.appVersion,
 		},
+		clientKeySeed: clientKeySeed,
 	}
 }
 
@@ -136,7 +159,7 @@ func (self *ApiMultiClientGenerator) retireParkedIdentities() {
 			}
 			retireCtx, retireCancel := context.WithTimeout(context.Background(), retireTimeout)
 			defer retireCancel()
-			self.recordRetirementError("identity", self.removeClientArgsAndWait(retireCtx, args, false))
+			self.recordRetirementError("identity", self.removeClientArgsAndWait(retireCtx, args, false, nil))
 		})
 	}
 }

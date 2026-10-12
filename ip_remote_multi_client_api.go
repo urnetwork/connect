@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -21,6 +22,9 @@ type MultiClientGeneratorClientArgs struct {
 	ClientId   Id
 	ClientAuth *ClientAuth
 	P2pOnly    bool
+	// The identity key seed of a reused identity, so its next Client
+	// re-registers the same key. In memory only; never persisted or logged.
+	clientKeySeed []byte
 }
 
 // NetworkClientCredentials is an optional in-process authority for the
@@ -946,7 +950,7 @@ func (self *ApiMultiClientGenerator) RemoveClientArgs(args *MultiClientGenerator
 		}
 		removeCtx, removeCancel := context.WithTimeout(context.Background(), retireTimeout)
 		defer removeCancel()
-		self.recordRetirementError("identity", self.removeClientArgsAndWait(removeCtx, args, true))
+		self.recordRetirementError("identity", self.removeClientArgsAndWait(removeCtx, args, true, args.clientKeySeed))
 	})
 }
 
@@ -961,6 +965,7 @@ func (self *ApiMultiClientGenerator) removeClientArgsAndWait(
 	ctx context.Context,
 	args *MultiClientGeneratorClientArgs,
 	reusable bool,
+	clientKeySeed []byte,
 	afterRetirement ...func(context.Context) error,
 ) error {
 	// Preserve restartable identities when the generator's parent is already
@@ -974,7 +979,7 @@ func (self *ApiMultiClientGenerator) removeClientArgsAndWait(
 		}
 	default:
 		// the identity stays registered and live; no resident cleanup runs
-		if self.parkIdentity(args, reusable) {
+		if self.parkIdentity(args, reusable, clientKeySeed) {
 			return nil
 		}
 		instanceId := Id{}
@@ -1100,6 +1105,12 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 			self.recordRetirementError("drain", drainErr)
 			return
 		}
+		// A parked identity keeps this client's key, so its next client
+		// re-registers the same key instead of appending a signed generation.
+		var clientKeySeed []byte
+		if clientKeyManager := client.ClientKeyManager(); clientKeyManager != nil {
+			clientKeySeed = clientKeyManager.Seed()
+		}
 		retireTimeout := self.clientStrategy.settings.RequestTimeout
 		if retireTimeout < 30*time.Second {
 			retireTimeout = 30 * time.Second
@@ -1107,7 +1118,7 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 		retireCtx, retireCancel := context.WithTimeout(context.Background(), retireTimeout)
 		defer retireCancel()
 
-		self.recordRetirementError("identity", self.removeClientArgsAndWait(retireCtx, args, reusable, residentRetirement))
+		self.recordRetirementError("identity", self.removeClientArgsAndWait(retireCtx, args, reusable, clientKeySeed, residentRetirement))
 	})
 }
 
@@ -1151,6 +1162,11 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 	}
 	defer self.transportCreation.end()
 	clientOob := self.newClientOob(ctx, args.ClientAuth.ByJwt)
+	if 0 < len(args.clientKeySeed) {
+		// a reused identity keeps its registered key; the settings are this
+		// client's own copy
+		clientSettings.ClientKeySeed = bytes.Clone(args.clientKeySeed)
+	}
 	client := NewClient(ctx, args.ClientId, clientOob, clientSettings)
 	settings := self.newPlatformTransportSettings()
 	// propagate so the client-level logger covers the platform transport
