@@ -200,6 +200,8 @@ func TestPlatformTransportAltUrlKeepsH1OnThePlatformHost(t *testing.T) {
 	strategySettings.ConnectSettings.DialNetworkHook = func(network string, addr string) {
 		note(&wsAddrs, addr)
 	}
+	// the hook notes the platform host before it is looked up, in the process
+	strategySettings.Resolver = testOfflineResolver()
 	clientStrategy := NewClientStrategy(ctx, strategySettings)
 	defer clientStrategy.Close()
 
@@ -300,13 +302,17 @@ func TestFamilyPlatformTransportGroupDerivesFamilyAltUrls(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			clientStrategy := NewClientStrategyWithDefaults(ctx)
+			// the transports dial the space's names, which are looked up in
+			// the process; what is read is the urls they derived
+			strategySettings := DefaultClientStrategySettings()
+			strategySettings.Resolver = testOfflineResolver()
+			clientStrategy := NewClientStrategy(ctx, strategySettings)
 			defer clientStrategy.Close()
 			settings := testingFamilyTransportSettings()
 			settings.AltUrl = c.altUrl
 			group := NewFamilyPlatformTransportGroup(
 				ctx,
-				DefaultClientStrategySettings(),
+				strategySettings,
 				clientStrategy,
 				NewRouteManager(ctx, "alt-group"),
 				testAltPlatformUrl,
