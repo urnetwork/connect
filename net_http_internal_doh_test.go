@@ -254,6 +254,51 @@ func TestInternalDohDoesNotOverrideCustomResolver(t *testing.T) {
 	}
 }
 
+// The resolver takes the stream dial only. A host's injected packet endpoint
+// still opens the udp carriers' sockets of a strategy that protects its
+// domains, so the host keeps its source identity on quic and dns, and nothing
+// falls back to a wildcard socket of the machine's.
+func TestInternalDohKeepsTheInjectedPacketConnFactory(t *testing.T) {
+	var streamDials atomic.Int64
+	var packetSockets atomic.Int64
+	settings := DefaultClientStrategySettings()
+	settings.InternalDohDomains = []string{"service.test"}
+	settings.ConnectSettings.DialContextSettings = &DialContextSettings{
+		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+			streamDials.Add(1)
+			return nil, fmt.Errorf("the test dials nothing")
+		},
+		PacketConnFactory: func(ctx context.Context) (net.PacketConn, error) {
+			packetSockets.Add(1)
+			return nil, fmt.Errorf("the test opens no socket")
+		},
+	}
+	original := settings.ConnectSettings.DialContextSettings
+	strategy := NewClientStrategy(t.Context(), settings)
+	defer strategy.Close()
+	if strategy.internalDohResolver == nil {
+		t.Fatal("the strategy installed no internal DoH")
+	}
+	if settings.ConnectSettings.DialContextSettings != original {
+		t.Fatal("the strategy wrote the caller's settings")
+	}
+
+	udpAddr := &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}
+	if _, err := openExtenderPacketConn(t.Context(), strategy.ConnectSettings(), udpAddr); err == nil {
+		t.Fatal("a udp carrier opened a socket the injected endpoint refused")
+	}
+	if packetSockets.Load() != 1 {
+		t.Fatalf("injected packet sockets = %d, want 1", packetSockets.Load())
+	}
+	// a literal is not a protected name, so it reaches the injected dial as is
+	if _, err := strategy.ConnectSettings().DialContext(t.Context(), "tcp", "192.0.2.1:443"); err == nil {
+		t.Fatal("a stream dial the injected dial refused succeeded")
+	}
+	if streamDials.Load() != 1 {
+		t.Fatalf("injected stream dials = %d, want 1", streamDials.Load())
+	}
+}
+
 // Protected-domain UDP resolution is the direct QUIC/packet-translation path;
 // it does not pass through ConnectSettings.DialContext. The family policy is
 // therefore read inside resolveUDPAddr, on every call, rather than captured
