@@ -152,9 +152,10 @@ tags:
         agent asks for a sku, is answered `402` with the payment terms, and
         retries the same request with a signed payment in `X-PAYMENT`
       - the subnet (`/sn`): payout wallets and their consents, head mining,
-        pool claims and epochs, and the public, content-addressed payout
-        artifacts and release evidence, addressed by their sha256 content
-        hash
+        pool claims and epochs, the public, content-addressed payout
+        artifacts, settlement v2 ledger objects and release evidence,
+        addressed by their sha256 content hash, and a coldkey's public
+        settlement v2 accounts with their claim proofs
       - the routing-verification protocol with its public statistics and
         proofs (`/verify`)
       - the new-user onboarding program and product events (`/onboarding`,
@@ -4858,6 +4859,12 @@ paths:
         inside each epoch's wall-clock window and the network's share of the
         operator pool in basis points (0 when no coldkey was attached, i.e.
         points only). `limit` defaults to 26 and is capped at 104.
+
+        While settlement v2 is configured, an epoch it settles is listed from
+        the ledger instead of its v1 row, once a finalized v2 root covering it
+        has been recorded: it carries `amount_rao`, the network's amount of
+        the epoch, and its `share_bps` is that amount's share of the epoch's
+        amounts.
       operationId: accountEpochs
       security:
         - BearerAuth: []
@@ -4865,8 +4872,10 @@ paths:
         - in: query
           name: limit
           required: false
+          description: Epochs to list; absent or 0 means 26, and above 104 means 104.
           schema:
             type: integer
+            minimum: 0
       responses:
         "200":
           description: OK.
@@ -4874,6 +4883,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AccountEpochsResult"
+        "400":
+          description: The limit is not an integer, or is negative.
 
   /account/referral-code:
     get:
@@ -6254,6 +6265,101 @@ paths:
           description: The history could not be listed, or the page failed its integrity check.
         "503":
           description: The artifact store is unavailable, or does not support paging.
+
+  /sn/ledger/object:
+    get:
+      tags: [Other]
+      summary: One immutable settlement v2 ledger object by content hash
+      description: |
+        Serve a settlement v2 ledger object addressed by its sha256: a root's
+        ledger header, or one of the provider or account chunks the header
+        names. A root's `ledgerHash` on chain is the raw sha256 of its header
+        bytes, and the header names each chunk by the same `sha256:`
+        reference, so a reader checks every object against the hash it asked
+        for. The server checks it too, and never serves bytes whose sha256
+        differs from the hash. Served whether or not settlement v2 is
+        configured.
+
+        Public and immutable: the answer carries the hash as its `ETag` and
+        `Cache-Control: public, immutable, max-age=31536000`.
+      operationId: snLedgerObject
+      security: []
+      parameters:
+        - in: query
+          name: hash
+          required: true
+          description: '`sha256:` followed by the 64 lowercase hex digits of the object''s sha256.'
+          schema:
+            type: string
+            pattern: "^sha256:[0-9a-f]{64}$"
+      responses:
+        "200":
+          description: The object's immutable bytes.
+          headers:
+            ETag:
+              description: The requested hash in double quotes.
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: The hash is missing, or is not `sha256:` and 64 lowercase hex digits.
+        "404":
+          description: No object is stored under this hash.
+        "502":
+          description: The ledger object store is unavailable, or the object could not be read or does not match its hash.
+
+  /sn/ledger/account:
+    get:
+      tags: [Other]
+      summary: A coldkey's settlement v2 accounts with their claim proofs
+      description: |
+        The coldkey's settlement v2 account in each pool that holds it, one
+        entry per pool in ascending `no_id`, with what a claim needs: the
+        latest finalized root's cumulative, its bottom-up proof, and vault2's
+        `claimed`, read at the finalized block tag. The pools are this
+        operator's pool, when its latest finalized root or its pending root
+        holds the coldkey, and any other pool where this server has recorded
+        an account for the coldkey. Amounts are decimal strings of rao.
+
+        An account only in the pending root has a null `root_index` and
+        `proof`, and a `cumulative` and `claimed` of "0". A coldkey that no
+        root holds, like every coldkey while settlement v2 is not configured,
+        has `"accounts": []`. The answer is whole or a 502, never partial, and
+        carries `Cache-Control: no-store`.
+
+        Public: a proof only reveals published data, and a claim always pays
+        the leaf's coldkey.
+      operationId: snLedgerAccount
+      security: []
+      parameters:
+        - in: query
+          name: coldkey
+          required: true
+          description: |
+            The coldkey: an ss58 address with the Bittensor prefix (42) and a
+            valid checksum, or `0x` and 64 hex digits in either case.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnLedgerAccountResult"
+        "400":
+          description: The coldkey is missing, or is neither an ss58 address with the Bittensor prefix nor `0x` and 64 hex digits.
+        "502":
+          description: |
+            The ledger is unavailable, so nothing is answered: a root's ledger
+            objects cannot be read or do not rebuild its committed root, there
+            is no chain client or vault2's `claimed` cannot be read, `claimed`
+            is above the finalized cumulative, or an account the server
+            recorded is not at its index in the finalized root.
 
   /sn/attempt-artifact:
     get:
@@ -14356,8 +14462,19 @@ components:
           type: number
           format: double
         share_bps:
-          description: The network's share of the operator pool in basis points; 0 when no coldkey was attached.
+          description: |
+            The network's share of the operator pool in basis points; 0 when
+            no coldkey was attached. For a settlement v2 epoch, the share of
+            the epoch's amounts that `amount_rao` is, rounded down; 0 when the
+            epoch has no amounts.
           type: integer
+        amount_rao:
+          description: |
+            Settlement v2 epochs only, absent for a v1 epoch: the network's
+            amount of the epoch from the ledger, a decimal string of rao; "0"
+            when the network has none.
+          type: string
+          pattern: "^[0-9]+$"
 
     AccountEpochsResult:
       type: object
@@ -16616,6 +16733,97 @@ components:
         next_after:
           description: The cursor for the next page; empty on the last page.
           type: string
+
+    SnLedgerAccountResult:
+      type: object
+      required:
+        - coldkey
+        - accounts
+      properties:
+        coldkey:
+          description: The coldkey, `0x` and 64 lowercase hex digits.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        accounts:
+          description: |
+            The coldkey's account in each pool that holds it, one entry per
+            pool in ascending `no_id`; `[]`, never null, for a coldkey that no
+            root holds and while settlement v2 is not configured.
+          type: array
+          items:
+            $ref: "#/components/schemas/SnLedgerAccount"
+
+    SnLedgerAccount:
+      type: object
+      required:
+        - vault
+        - no_id
+        - index
+        - root_index
+        - cumulative
+        - proof
+        - claimed
+        - pending_cumulative
+      properties:
+        vault:
+          description: The pool's settlement vault (vault2), `0x` and 40 lowercase hex digits.
+          type: string
+          pattern: "^0x[0-9a-f]{40}$"
+        no_id:
+          description: The pool's operator id.
+          type: integer
+        index:
+          description: The account's fixed position in the pool's sum tree.
+          type: integer
+        root_index:
+          description: |
+            The latest finalized root's index in vault2's roots for the pool;
+            null when the account is only in the pending root.
+          type: [integer, "null"]
+        cumulative:
+          description: |
+            The account's cumulative in the latest finalized root, a decimal
+            string of rao; "0" when the account is only in the pending root.
+          type: string
+          pattern: "^[0-9]+$"
+        proof:
+          description: |
+            The claim proof against the latest finalized root: the siblings
+            from the leaf up, one per tree level, `[]` at depth 0 (a root of
+            one account); null when the account is only in the pending root.
+          type: [array, "null"]
+          items:
+            $ref: "#/components/schemas/SnLedgerProofNode"
+        claimed:
+          description: |
+            What vault2 has already paid the account, read at the finalized
+            block tag, a decimal string of rao, never above `cumulative`; "0"
+            when the account is only in the pending root, which needs no chain
+            read.
+          type: string
+          pattern: "^[0-9]+$"
+        pending_cumulative:
+          description: |
+            The account's cumulative in the pending root, a decimal string of
+            rao; null when there is no pending root or the account is not in
+            it.
+          type: [string, "null"]
+          pattern: "^[0-9]+$"
+
+    SnLedgerProofNode:
+      type: object
+      required:
+        - hash
+        - sum
+      properties:
+        hash:
+          description: The sibling's node hash, `0x` and 64 lowercase hex digits.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        sum:
+          description: The sibling's sum, a decimal string of rao.
+          type: string
+          pattern: "^[0-9]+$"
 
     SnEvidenceEnvelope:
       type: object
