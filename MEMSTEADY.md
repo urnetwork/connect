@@ -4122,3 +4122,65 @@ ownership, per-flow order, whole-group/partial-success accounting and reliable
 TCP delivery. Enlarging queues or changing timeouts is not a demonstrated fix.
 The reviewed correctness composition is now integrated, but default-source
 parents and fresh physical iOS32/Android64 qualification remain pending.
+
+### 2026-10-13 UTC: first-cell collector publication failure; qualification pending
+
+The fresh canonical physical lane reached its first iOS32/control Wi-Fi cell
+but readiness exited 2 with `collector-session-owner-required` before workload
+collection. Its retained launcher published the required owner receipt
+429.134 ms after the failed check, then later joined with exit 0. The reader
+had no publication handshake across the launcher's asynchronous role/identity
+checks. This is a harness startup-ordering failure, not a demonstrated memory
+budget failure.
+
+The retained partial summary peaked at 18,792,464 B (17.92 MiB), with zero
+sampled 32-MiB breaches, but it is **INELIGIBLE**:
+`eligible=false` / `INCOMPLETE_TEARDOWN`. Its 29 retained runtime reads are
+not independent workload observations or a completed steady/teardown proof.
+Physical, LOWBAR and MEMSTEADY checks failed; owned cleanup passed. Cleanup
+success must not be used to waive missing live-gate/prefix/teardown evidence.
+
+The private repair keeps the actual retained launcher identity while awaiting
+publication, including the adjacent instrumentation-owner ordering, within the
+original collector 15-second and instrumentation remaining 180-second budgets.
+Observed owner/terminal/identity and invalid completed-prefix failures still
+refuse; no memory or teardown gate changes. Repair/fresh-parent qualification
+and integration remain provisional here, not a physical acceptance claim.
+
+This attempt contributes **zero qualified cells out of 168 and zero required
+observations out of 560**. Fresh full qualification still requires seven blocks,
+280 observations independently for iOS32 and normal Android64, both arms and
+phones, Wi-Fi/cellular/P2P roles, workload/quiet/lifecycle/teardown coverage,
+and every retained runtime peak at or below its matching 32/64-MiB limit.
+The DeviceLocal target and Go soft limit remain 32/32 MiB and 64/64 MiB;
+there is no budget tuning or measured Android64 performance gain in this record.
+Android surrogate measurements cannot prove a signed iOS extension's total
+`phys_footprint` below 50 MiB. No baseline is promoted.
+
+Source epoch, exact chronology and retained incident fingerprints are recorded
+in [the measurement ledger](../tests/PERFVAR-MEASUREMENTS.md#2026-10-13-utc--pcp-7kv2yp-01--collector-publication-failure).
+
+### 2026-10-13 UTC: collector repair private QA accepted; device replay pending
+
+Root and the sole executor accepted all 27 private repair-qualification arms
+with natural joins and intact source/native/resource/cleanup custody.
+The three original causal controls retained exactly 2/2/3 expected semantic
+failures. Candidate Node focused 18, whole-file 59 and complete 26-file
+preflight parent 536 each passed initially and in three fresh confirmations.
+Candidate Go focused 4 passed initial normal/race and three fresh normal/race
+pairs. Unfiltered backend normal/race each passed 328 top-level plus 601 nested
+tests; the six-file outer runner normal/race each passed 95 top-level plus
+180 nested tests. Candidate runs had no test failures, skips or race reports;
+earlier failed attempts are preserved, not relabeled.
+
+These receipts qualify the exact private XrQpLJ/MbXTNN source combination,
+not a new default-source/full-runner or real-device run. Fresh default-source
+validation and full iOS32/Android64 physical qualification remain pending.
+The earlier attempt remains INELIGIBLE at 0/168 cells and 0/560 required
+observations; its 17.92-MiB partial peak is not a memory PASS.
+The seven-block dual-profile census and every 32/64-MiB all-phase gate are
+unchanged. There is no Android64 performance/utilization result, baseline
+promotion or signed-iOS total-footprint claim.
+
+See [the accepted private-QA ledger addendum](../tests/PERFVAR-MEASUREMENTS.md#collector-publication-repair--accepted-private-qa-not-device-qualification)
+for exact scopes and retained source/evidence references.
