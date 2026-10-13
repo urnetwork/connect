@@ -1883,6 +1883,41 @@ func TestDialFailureInterceptIgnoresUnrelatedSignal(t *testing.T) {
 	}
 }
 
+// RR-10. A signal whose outer header does not run from the flow's destination
+// back to its source is not the provider's signal for the flow: another host
+// as the outer source or destination is spoofed.
+func TestDialFailureInterceptIgnoresSignalWithForeignOuterAddresses(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	rewrite := func(source bool) func(t *testing.T, path *IpPath) []byte {
+		return func(t *testing.T, path *IpPath) []byte {
+			packet := reraceProviderSignal(t, path)
+			var address []byte
+			switch packet[0] >> 4 {
+			case 4:
+				address = packet[16:20]
+				if source {
+					address = packet[12:16]
+				}
+			default:
+				address = packet[24:40]
+				if source {
+					address = packet[8:24]
+				}
+			}
+			address[len(address)-1] ^= 0x55
+			return resealDialFailureSignal(packet)
+		}
+	}
+	for _, version := range []int{4, 6} {
+		t.Run(fmt.Sprintf("ipv%d", version), func(t *testing.T) {
+			reraceAssertIcmpIgnored(t, version, []reraceIcmpCase{
+				{name: "outer source is not the destination", intercepted: -1, packet: rewrite(true)},
+				{name: "outer destination is not the source", intercepted: -1, packet: rewrite(false)},
+			})
+		})
+	}
+}
+
 // RR-10. Malformed packets are ignored: a bad outer or embedded header
 // length, an unknown version, an embed that is not tcp or udp, and an embed
 // of the other ip family than the icmp carrying it.
@@ -1915,6 +1950,38 @@ func TestDialFailureInterceptIgnoresMalformedSignal(t *testing.T) {
 			{name: "embedded next header icmpv6", packet: edit(func(packet []byte, embed int) { packet[embed+6] = byte(ipProtocolNumberIcmp6) })},
 		})
 	})
+}
+
+// RR-10. An embed carried by an icmp of the other ip family -- a v6 flow's
+// embed in an icmpv4 unreachable, a v4 flow's in an icmpv6 one -- is
+// malformed and is ignored.
+func TestDialFailureInterceptIgnoresEmbedOfTheOtherFamily(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	for _, version := range []int{4, 6} {
+		t.Run(fmt.Sprintf("ipv%d flow", version), func(t *testing.T) {
+			reraceAssertIcmpIgnored(t, version, []reraceIcmpCase{
+				{name: "embed in the other family's icmp", intercepted: -1, packet: reraceCrossFamilySignal},
+			})
+		})
+	}
+}
+
+// reraceCrossFamilySignal is the provider's signal for path with its embed
+// carried by a destination-unreachable of the other ip family, between
+// addresses of that family.
+func reraceCrossFamilySignal(t *testing.T, path *IpPath) []byte {
+	signal := reraceProviderSignal(t, path)
+	embed := signal[dialFailureIcmpOffset(signal)+icmpUnreachableHeaderSize:]
+	outer := &IpPath{Version: 4, SourceIp: net.IPv4(203, 0, 113, 99).To4(), DestinationIp: net.IPv4(10, 1, 0, 2).To4()}
+	protocolNumber, icmpType, code := ipProtocolNumberIcmp4, byte(icmpv4TypeDestinationUnreachable), byte(icmpv4CodeHostUnreachable)
+	if path.Version == 4 {
+		outer = &IpPath{Version: 6, SourceIp: net.ParseIP("2001:db8::99"), DestinationIp: net.ParseIP("fd00:1::2")}
+		protocolNumber, icmpType, code = ipProtocolNumberIcmp6, byte(icmpv6TypeDestinationUnreachable), byte(icmpv6CodeNoRoute)
+	}
+	packet, icmp := ipTransportPacket(outer, protocolNumber, icmpUnreachableHeaderSize+len(embed))
+	icmp[0], icmp[1] = icmpType, code
+	copy(icmp[icmpUnreachableHeaderSize:], embed)
+	return resealDialFailureSignal(packet)
 }
 
 // RR-10. Truncated packets are ignored: cut inside the outer header, inside
@@ -1972,6 +2039,49 @@ func TestDialFailureInterceptIgnoresOtherIcmpTypes(t *testing.T) {
 			{name: "time exceeded", packet: retype(3, 0)},
 			{name: "parameter problem", packet: retype(4, 0)},
 			{name: "echo reply", data: true, packet: retype(129, 0)},
+		})
+	})
+}
+
+// RR-10. A destination-unreachable naming the flow with any code but the one
+// a provider's failed dial carries -- host unreachable (v4) or no route (v6)
+// for tcp, port unreachable for udp -- is not the signal and is ignored.
+func TestDialFailureInterceptIgnoresOtherIcmpCodes(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	recode := func(code byte) func(t *testing.T, path *IpPath) []byte {
+		return func(t *testing.T, path *IpPath) []byte {
+			signal := reraceProviderSignal(t, path)
+			return reraceIcmpRetype(signal, signal[dialFailureIcmpOffset(signal)], code)
+		}
+	}
+	t.Run("ipv4", func(t *testing.T) {
+		reraceAssertIcmpIgnored(t, 4, []reraceIcmpCase{
+			{name: "net unreachable", intercepted: -1, packet: recode(0)},
+			{name: "protocol unreachable", intercepted: -1, packet: recode(2)},
+			{name: "port unreachable", intercepted: -1, packet: recode(3)},
+			{name: "fragmentation needed", intercepted: -1, packet: recode(4)},
+			{name: "administratively prohibited", intercepted: -1, packet: recode(13)},
+		})
+	})
+	t.Run("ipv6", func(t *testing.T) {
+		reraceAssertIcmpIgnored(t, 6, []reraceIcmpCase{
+			{name: "administratively prohibited", intercepted: -1, packet: recode(1)},
+			{name: "address unreachable", intercepted: -1, packet: recode(3)},
+			{name: "port unreachable", intercepted: -1, packet: recode(4)},
+			{name: "reject route", intercepted: -1, packet: recode(6)},
+		})
+	})
+	// a quic flow's signal is port unreachable; the tcp signal's code is not it
+	t.Run("ipv4 quic", func(t *testing.T) {
+		reraceAssertIcmpIgnored(t, 4, []reraceIcmpCase{
+			{name: "host unreachable", udp: true, intercepted: -1, packet: recode(1)},
+			{name: "administratively prohibited", udp: true, intercepted: -1, packet: recode(13)},
+		})
+	})
+	t.Run("ipv6 quic", func(t *testing.T) {
+		reraceAssertIcmpIgnored(t, 6, []reraceIcmpCase{
+			{name: "no route", udp: true, intercepted: -1, packet: recode(0)},
+			{name: "administratively prohibited", udp: true, intercepted: -1, packet: recode(1)},
 		})
 	})
 }
