@@ -252,17 +252,23 @@ engine alternates the family each hop's tun tries first along a trail, and
 starts each trail on the family the trail before it did not, the first trail
 on IPv4 (sn `validator/trail.go` `hopFirstIpFamily`,
 `TunSettings.DialFirstIpFamily`). Over any two consecutive trails every
-depth tries each family first once, whatever the trail's depth, and a retry
-keeps its hop's family. Alternating per request, as first built, tied the
-family to the depth: at an even depth every SEED was IPv4-first, and at a
-depth of 8 the recorded hops split 4:3. The first family's address starts
-first; a ready answer of the other family waits at most
-`DefaultDialFallbackDelay` for the first family's answer. The other family
-starts one fallback delay after the first, or at once when the first fails
-or has no address, all inside the dial's existing deadlines. A narrowed
-network, an IPv4-only tun and an IP literal keep their family. Every other
-tun keeps C6 unchanged (`DialFirstIpFamily` 0). The provider's egress is
-untouched: it dials the literal the validator chose.
+depth tries each family first once, whatever the trail's depth. A retry
+keeps its hop's family, except after the server's retryable answer: until
+pinned per-family transports (A2 to A4), a dual-stack provider's one
+transport has only the family it landed on indexed, a hop that lands on the
+other family resolves to no provider, and the server answers it HTTP 421
+`source-egress-unresolved`, at most twice per step. The step then resends
+the identical body through the same hop trying the other family first,
+within its deadline (sn VALIDATOR.md §8.2). Alternating per request, as
+first built, tied the family to the depth: at an even depth every SEED was
+IPv4-first, and at a depth of 8 the recorded hops split 4:3. The first
+family's address starts first; a ready answer of the other family waits at
+most `DefaultDialFallbackDelay` for the first family's answer. The other
+family starts one fallback delay after the first, or at once when the first
+fails or has no address, all inside the dial's existing deadlines. A
+narrowed network, an IPv4-only tun and an IP literal keep their family.
+Every other tun keeps C6 unchanged (`DialFirstIpFamily` 0). The provider's
+egress is untouched: it dials the literal the validator chose.
 
 A provider whose TCP dial fails at once (no route, unreachable, out of
 sockets, its own upstream refusing) answers the SYN with an ICMP
