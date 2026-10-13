@@ -132,8 +132,9 @@ transports each feed their observed address to the server's verify egress
 index. While that index allowed one live egress per provider, a provider with
 both pinned transports connected was neither eligible for validator trails
 nor resolvable from either address. The index now holds one live egress per
-family per provider (server verify egress v3, sn VALIDATOR.md §8.2), and that
-change is a prerequisite for enabling pinned transports (A2 to A4).
+family per provider, an IPv6 egress being its /64 (server verify egress index
+v4, sn VALIDATOR.md §8.2), and that change is a prerequisite for enabling
+pinned transports (A2 to A4).
 
 ### B. Discovery and routing
 
