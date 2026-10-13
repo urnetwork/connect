@@ -7,10 +7,12 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -55,15 +57,18 @@ type testMeasurementOperator struct {
 	inner  *testExtenderOperator
 	server *httptest.Server
 
-	extenderId     connect.Id
-	caKey          *ecdsa.PrivateKey
-	caCertificate  *x509.Certificate
-	activationCsrs chan string
+	extenderId    connect.Id
+	caKey         *ecdsa.PrivateKey
+	caCertificate *x509.Certificate
+	activations   chan *connect.ExtenderActivateArgs
 
 	stateLock sync.Mutex
 	// what the certificate route answers
 	certResult map[string]any
 	certPolls  int
+	// whether a request an activation carries is issued at once, else held
+	// pending
+	issueOnRequest bool
 }
 
 func newTestMeasurementOperator(t *testing.T) *testMeasurementOperator {
@@ -95,8 +100,9 @@ func newTestMeasurementOperator(t *testing.T) *testMeasurementOperator {
 		extenderId:     connect.NewId(),
 		caKey:          caKey,
 		caCertificate:  caCertificate,
-		activationCsrs: make(chan string, 64),
+		activations:    make(chan *connect.ExtenderActivateArgs, 64),
 		certResult:     map[string]any{"state": "none", "names": []string{}},
+		issueOnRequest: true,
 	}
 	operator.server = httptest.NewServer(http.HandlerFunc(operator.handle))
 	t.Cleanup(operator.server.Close)
@@ -130,12 +136,12 @@ func (self *testMeasurementOperator) handle(w http.ResponseWriter, r *http.Reque
 		}
 		if args.MeasurementCsr != "" {
 			// issued at once, so the next read of the certificate route
-			// installs it (A10, C5)
-			self.issue(args.MeasurementCsr)
+			// installs it, or held pending (A10, C5)
+			self.request(args.MeasurementCsr)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
-		self.activationCsrs <- args.MeasurementCsr
+		self.activations <- args
 	case extender.ExtenderMeasurementCertPath:
 		self.stateLock.Lock()
 		self.certPolls += 1
@@ -148,8 +154,9 @@ func (self *testMeasurementOperator) handle(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// Issues a chain for a request: its key and its one name, the extender's (C5).
-func (self *testMeasurementOperator) issue(csr string) {
+// Takes a request: issues a chain for its key and its one name, the
+// extender's, or holds it pending (C5).
+func (self *testMeasurementOperator) request(csr string) {
 	csrBytes, err := base64.StdEncoding.DecodeString(csr)
 	if err != nil {
 		self.t.Error(err)
@@ -165,27 +172,66 @@ func (self *testMeasurementOperator) issue(csr string) {
 		self.t.Errorf("request names = %v, expected %s", request.DNSNames, name)
 		return
 	}
+	self.stateLock.Lock()
+	issueOnRequest := self.issueOnRequest
+	self.stateLock.Unlock()
+	if !issueOnRequest {
+		self.setCertResult(map[string]any{
+			"state":      "pending",
+			"names":      request.DNSNames,
+			"key_sha256": testMeasurementKeySha256(self.t, request.PublicKey),
+		})
+		return
+	}
+	self.issueFor(request.PublicKey, request.DNSNames)
+}
+
+// Answers the certificate route with a chain for a key and names.
+func (self *testMeasurementOperator) issueFor(publicKey any, names []string) {
 	leafBytes, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		DNSNames:     request.DNSNames,
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		DNSNames:     names,
 		NotBefore:    time.Now().Add(-time.Minute),
 		NotAfter:     time.Now().Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}, self.caCertificate, request.PublicKey, self.caKey)
+	}, self.caCertificate, publicKey, self.caKey)
 	if err != nil {
 		self.t.Error(err)
 		return
 	}
 	chainPem := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafBytes})) +
 		string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: self.caCertificate.Raw}))
+	self.setCertResult(map[string]any{
+		"state":      "issued",
+		"names":      names,
+		"chain_pem":  chainPem,
+		"key_sha256": testMeasurementKeySha256(self.t, publicKey),
+	})
+}
+
+func (self *testMeasurementOperator) setCertResult(certResult map[string]any) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	self.certResult = map[string]any{
-		"state":     "issued",
-		"names":     request.DNSNames,
-		"chain_pem": chainPem,
+	self.certResult = certResult
+}
+
+func (self *testMeasurementOperator) setIssueOnRequest(issueOnRequest bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.issueOnRequest = issueOnRequest
+}
+
+// How the operator names a key (A8): the hex sha-256 of its
+// SubjectPublicKeyInfo DER.
+func testMeasurementKeySha256(t *testing.T, publicKey any) string {
+	publicKeyDer, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		t.Error(err)
+		return ""
 	}
+	keySha256 := sha256.Sum256(publicKeyDer)
+	return hex.EncodeToString(keySha256[:])
 }
 
 func (self *testMeasurementOperator) certPollCount() int {
@@ -194,15 +240,15 @@ func (self *testMeasurementOperator) certPollCount() int {
 	return self.certPolls
 }
 
-// Waits for one activation post, and returns the request it carried.
-func (self *testMeasurementOperator) waitActivation() string {
+// Waits for one activation post, and returns what it carried.
+func (self *testMeasurementOperator) waitActivation() *connect.ExtenderActivateArgs {
 	self.t.Helper()
 	select {
-	case csr := <-self.activationCsrs:
-		return csr
+	case args := <-self.activations:
+		return args
 	case <-time.After(60 * time.Second):
 		self.t.Fatal("the extender did not activate")
-		return ""
+		return nil
 	}
 }
 
@@ -532,10 +578,10 @@ func TestExtenderCommandMeasurementAdmitsATicket(t *testing.T) {
 	}
 
 	// the first post learns the id; the request rides the next one
-	if csr := operator.waitActivation(); csr != "" {
-		t.Fatalf("the first activation carried %q before its id was known", csr)
+	if args := operator.waitActivation(); args.MeasurementCsr != "" || args.MeasurementDisabled {
+		t.Fatalf("the first activation carried %q, disabled %t", args.MeasurementCsr, args.MeasurementDisabled)
 	}
-	if csr := operator.waitActivation(); csr == "" {
+	if args := operator.waitActivation(); args.MeasurementCsr == "" || args.MeasurementDisabled {
 		t.Fatal("the activation after the first carried no request")
 	}
 	name := connect.ExtenderMeasurementName(operator.extenderId, "")
@@ -578,26 +624,34 @@ func TestExtenderCommandMeasurementAdmitsATicket(t *testing.T) {
 }
 
 // With measurement off, or with an ephemeral identity, the command keeps no
-// certificate, asks for none and never reads the certificate route.
+// certificate, asks for none and never reads the certificate route. Off with
+// a kept identity, every activation says measurement_disabled, so a name the
+// extender had is withdrawn (C4, C9); an ephemeral identity has none to
+// withdraw and says nothing.
 func TestExtenderCommandMeasurementOff(t *testing.T) {
 	for _, c := range []struct {
-		keep      bool
-		configure func(options *extenderOptions)
+		keep             bool
+		measurement      bool
+		expectedDisabled bool
 	}{
-		{keep: true, configure: func(options *extenderOptions) {
-			options.measurementEnabled = false
-		}},
-		{keep: false, configure: func(options *extenderOptions) {
-			options.measurementEnabled = true
-		}},
+		{keep: true, measurement: false, expectedDisabled: true},
+		{keep: false, measurement: false, expectedDisabled: false},
+		{keep: false, measurement: true, expectedDisabled: false},
 	} {
 		operator := newTestMeasurementOperator(t)
-		started := startTestMeasurementExtender(t, operator, c.keep, c.configure)
+		started := startTestMeasurementExtender(t, operator, c.keep, func(options *extenderOptions) {
+			options.measurementEnabled = c.measurement
+		})
 		if started.run.measurementCert != nil {
 			t.Fatalf("keep %v: a measurement certificate with measurement off", c.keep)
 		}
-		if csr := operator.waitActivation(); csr != "" {
+		args := operator.waitActivation()
+		if args.MeasurementCsr != "" {
 			t.Fatalf("keep %v: the activation carried a request", c.keep)
+		}
+		if args.MeasurementDisabled != c.expectedDisabled {
+			t.Fatalf("keep %v, measurement %v: measurement_disabled = %t, expected %t",
+				c.keep, c.measurement, args.MeasurementDisabled, c.expectedDisabled)
 		}
 		if count := operator.certPollCount(); count != 0 {
 			t.Fatalf("keep %v: the certificate route was read %d times", c.keep, count)
@@ -607,6 +661,38 @@ func TestExtenderCommandMeasurementOff(t *testing.T) {
 				t.Fatalf("keep %v: a measurement key was kept with measurement off", c.keep)
 			}
 		}
+	}
+}
+
+// A chain the operator issued for another key asks the activation for a pass
+// at once, which carries this key's request again (C4): the lifecycle's ask
+// reaches the command's activator.
+func TestExtenderCommandMeasurementAsksForAPassOnAnotherKey(t *testing.T) {
+	operator := newTestMeasurementOperator(t)
+	operator.setIssueOnRequest(false)
+	started := startTestMeasurementExtender(t, operator, true, func(options *extenderOptions) {
+		options.measurementEnabled = true
+	})
+	// the passes of the start: the request rides the post after the first
+	operator.waitActivation()
+	if args := operator.waitActivation(); args.MeasurementCsr == "" {
+		t.Fatal("the activation after the first carried no request")
+	}
+
+	otherKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operator.issueFor(&otherKey.PublicKey, []string{connect.ExtenderMeasurementName(operator.extenderId, "")})
+	// nothing else would activate before the 24 hour tick
+	for {
+		args := operator.waitActivation()
+		if args.MeasurementCsr != "" {
+			break
+		}
+	}
+	if _, certificate := started.run.measurementCert.Certificate(); certificate != nil {
+		t.Fatal("a chain for another key was installed")
 	}
 }
 

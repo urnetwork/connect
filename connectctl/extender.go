@@ -656,8 +656,20 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 		// the activation carries the measurement certificate request, named by
 		// the id its answers report (lag.dev/PLAN.md C4, N4)
 		activatorSettings.MeasurementCsr = run.measurementCert.ActivationCsr
+	} else if !options.measurementEnabled && run.identityKeyFile() != "" {
+		// the owner opted out: every activation says so, so an extender that
+		// measured before has its name withdrawn (C4, C9). An ephemeral
+		// identity has no name to withdraw.
+		activatorSettings.MeasurementDisabled = func() bool {
+			return true
+		}
 	}
 	run.activator = connect.NewExtenderActivator(ctx, activatorSettings)
+	if run.measurementCert != nil {
+		// the operator holding another key's request or certificate asks for a
+		// pass at once, which carries this key's request (C4)
+		run.measurementCert.SetReactivate(run.activator.Reactivate)
+	}
 	run.closers = append(run.closers, run.activator.Close)
 
 	if networkClientSettings := run.networkClientSettings(); networkClientSettings != nil {
