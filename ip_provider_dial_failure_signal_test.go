@@ -162,8 +162,8 @@ func TestRemoteUserNatProviderReturnDropsForeignIcmp(t *testing.T) {
 }
 
 // providerDialFailureRig is a real provider (a LocalUserNat behind a
-// RemoteUserNatProvider) whose every upstream dial fails with dialErr, and a
-// single-destination client wired to it in memory. signals receives every
+// RemoteUserNatProvider) whose every upstream dial fails with dialErr after
+// dialDelay, and a single-destination client wired to it in memory. signals receives every
 // icmp unreachable the provider sends the client; delivered, every packet the
 // client hands its local stack.
 type providerDialFailureRig struct {
@@ -174,7 +174,7 @@ type providerDialFailureRig struct {
 	close     func()
 }
 
-func newProviderDialFailureRig(t *testing.T, dialErr error) *providerDialFailureRig {
+func newProviderDialFailureRig(t *testing.T, dialErr error, dialDelay time.Duration) *providerDialFailureRig {
 	ctx, cancel := context.WithCancel(t.Context())
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
 	providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
@@ -188,6 +188,7 @@ func newProviderDialFailureRig(t *testing.T, dialErr error) *providerDialFailure
 	natSettings := DefaultLocalUserNatSettings()
 	fail := &DialContextSettings{
 		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+			time.Sleep(dialDelay)
 			return nil, dialErr
 		},
 	}
@@ -256,7 +257,7 @@ func providerNoRouteError() error {
 // client hands a tcp signal to its local stack.
 func TestRemoteUserNatProviderDialFailureSignalReachesClient(t *testing.T) {
 	for _, flow := range providerSignalTestCases() {
-		rig := newProviderDialFailureRig(t, providerNoRouteError())
+		rig := newProviderDialFailureRig(t, providerNoRouteError(), 0)
 		rig.open(t, flow)
 		flowPath := *flow
 		flowPath.SequenceNumber = 0
@@ -286,9 +287,11 @@ func TestRemoteUserNatProviderDialFailureSignalReachesClient(t *testing.T) {
 // IPV6.md C7. A provider whose upstream dial times out sends the client
 // nothing, for tcp and udp of both families: the signal would land at the
 // dialer's timeout, 15s after the SYN, when it can only strike the exit for a
-// flow the app has abandoned. A dial that fails at once is answered
-// (TestRemoteUserNatProviderDialFailureSignalReachesClient); in the same
-// bubble it is the control that the path would have carried a signal.
+// flow the app has abandoned. Nor does a dial that fails another way only
+// after dialFailureSignalHorizon, as one through a host dialer without a
+// deadline can. A dial that fails at once, or within the horizon, is
+// answered (TestRemoteUserNatProviderDialFailureSignalReachesClient); in the
+// same bubble it is the control that the path would have carried a signal.
 func TestRemoteUserNatProviderDialTimeoutSendsNothing(t *testing.T) {
 	timeout := dialTimeoutError(t)
 	GetMessagePoolAggregateStats()
@@ -298,13 +301,18 @@ func TestRemoteUserNatProviderDialTimeoutSendsNothing(t *testing.T) {
 				for _, c := range []struct {
 					name   string
 					err    error
+					delay  time.Duration
 					signal bool
 				}{
-					{"no route", providerNoRouteError(), true},
-					{"timeout", timeout, false},
+					{"no route", providerNoRouteError(), 0, true},
+					{"timeout", timeout, 0, false},
+					{"no route inside the horizon", providerNoRouteError(), dialFailureSignalHorizon - 100*time.Millisecond, true},
+					{"no route past the horizon", providerNoRouteError(), dialFailureSignalHorizon + 100*time.Millisecond, false},
 				} {
-					rig := newProviderDialFailureRig(t, c.err)
+					rig := newProviderDialFailureRig(t, c.err, c.delay)
 					rig.open(t, flow)
+					// past the dial, in the bubble's time
+					time.Sleep(c.delay + time.Second)
 					synctest.Wait()
 					select {
 					case signal := <-rig.signals:

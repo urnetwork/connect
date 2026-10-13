@@ -1719,7 +1719,7 @@ func TestDialTimeoutOfAbandonedFlowsKeepsHealthyIpv6Exit(t *testing.T) {
 		// the provider's dials time out, and it answers each as it decides
 		harness.sleep(connectTimeout)
 		for _, loser := range losers {
-			if _, signal := classifyDialFailure(reraceProviderFlowPath(loser), timeout); signal != nil {
+			if _, signal := classifyDialFailure(reraceProviderFlowPath(loser), timeout, connectTimeout); signal != nil {
 				harness.inject("a", signal)
 			}
 		}

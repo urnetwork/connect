@@ -83,7 +83,7 @@ func TestClassifyDialFailure(t *testing.T) {
 					want = dialFailureUnreachable
 				}
 
-				action, packet := classifyDialFailure(ipPath, c.err)
+				action, packet := classifyDialFailure(ipPath, c.err, 0)
 				if action != want {
 					t.Errorf("%s: action = %d, want %d", label, action, want)
 					continue
@@ -134,13 +134,43 @@ func TestClassifyDialFailure(t *testing.T) {
 // A nil path and an unsupported protocol both classify to none with no packet,
 // so the dial sites emit nothing rather than panicking on a malformed flow.
 func TestClassifyDialFailureNoSignal(t *testing.T) {
-	if action, packet := classifyDialFailure(nil, syscall.ECONNREFUSED); action != dialFailureNone || packet != nil {
+	if action, packet := classifyDialFailure(nil, syscall.ECONNREFUSED, 0); action != dialFailureNone || packet != nil {
 		t.Errorf("nil path: action = %d, packet = %v, want none/nil", action, packet)
 	}
 	for _, ipVersion := range testIpVersions {
 		unknown := &IpPath{Version: ipVersion, Protocol: IpProtocolUnknown}
-		if action, packet := classifyDialFailure(unknown, errors.New("x")); action != dialFailureNone || packet != nil {
+		if action, packet := classifyDialFailure(unknown, errors.New("x"), 0); action != dialFailureNone || packet != nil {
 			t.Errorf("v%d unknown protocol: action = %d, packet = %v, want none/nil", ipVersion, action, packet)
+		}
+	}
+}
+
+// A dial that fails in any other way than a timeout is answered only within
+// dialFailureSignalHorizon, the multi client's silence-inference horizon:
+// a host-supplied dialer with no deadline can fail as late as a timeout, and
+// its signal would land after the source's own recovery. Just inside the
+// horizon the failure is answered; at it, nothing is, for tcp and udp.
+func TestClassifyDialFailureAnswersOnlyWithinTheSignalHorizon(t *testing.T) {
+	if dialFailureSignalHorizon != inferredDialFailureTimeout {
+		t.Fatalf("signal horizon %s, want the silence-inference horizon %s", dialFailureSignalHorizon, inferredDialFailureTimeout)
+	}
+	for _, protocol := range []IpProtocol{IpProtocolTcp, IpProtocolUdp} {
+		for _, version := range []int{4, 6} {
+			ipPath := dialFailureTestPath(protocol, version)
+			for _, err := range []error{
+				&net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ENETUNREACH)},
+				syscall.ECONNREFUSED,
+				errors.New("socks: general failure"),
+			} {
+				if action, _ := classifyDialFailure(ipPath, err, dialFailureSignalHorizon-time.Millisecond); action == dialFailureNone {
+					t.Errorf("%s v%d %v just inside the horizon: no answer", protocol, version, err)
+				}
+				for _, late := range []time.Duration{dialFailureSignalHorizon, 15 * time.Second} {
+					if action, packet := classifyDialFailure(ipPath, err, late); action != dialFailureNone || packet != nil {
+						t.Errorf("%s v%d %v after %s: action %d, want none", protocol, version, err, late, action)
+					}
+				}
+			}
 		}
 	}
 }

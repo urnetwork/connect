@@ -3573,6 +3573,7 @@ func (self *UdpSequence) receiveBatch(packets [][]byte) {
 func (self *UdpSequence) openSocket() (net.Conn, error) {
 	self.log.V(2).Infof("[init]udp connect\n")
 	dialCtx, egressDial := self.egressTarget.dialContext(self.ctx)
+	dialStart := time.Now()
 	socket, err := self.udpBufferSettings.DialContext(
 		dialCtx,
 		"udp",
@@ -3583,7 +3584,7 @@ func (self *UdpSequence) openSocket() (net.Conn, error) {
 			self.log.Infof("[init]udp connect error = %s\n", err)
 		}
 		// A UDP dial cannot yield a meaningful refusal to the inner source.
-		if _, signal := classifyDialFailure(self.IpPath(), err); signal != nil {
+		if _, signal := classifyDialFailure(self.IpPath(), err, time.Since(dialStart)); signal != nil {
 			self.receivePacket(MessagePoolCopy(signal))
 		}
 		return nil, err
@@ -5497,6 +5498,7 @@ func (self *TcpSequence) Run() {
 	var socket net.Conn
 	var err error
 	var egressDial *providerEgressDial
+	var dialDuration time.Duration
 	if self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp) {
 		// benchmark-range destination: terminate at the in-memory synthetic
 		// speed server (see ip_synthetic_speed.go)
@@ -5507,11 +5509,13 @@ func (self *TcpSequence) Run() {
 	} else {
 		var dialCtx context.Context
 		dialCtx, egressDial = self.egressTarget.dialContext(self.ctx)
+		dialStart := time.Now()
 		socket, err = self.tcpBufferSettings.DialContext(
 			dialCtx,
 			"tcp",
 			self.IpPath().DestinationHostPort(),
 		)
+		dialDuration = time.Since(dialStart)
 	}
 	if err != nil {
 		// The source has not seen our synthetic syn-ack yet. Abandoning the
@@ -5533,7 +5537,7 @@ func (self *TcpSequence) Run() {
 		// classifyDialFailure cannot tell a canceled parent from a capacity
 		// failure, and teardown must not generate new output.
 		if self.ctx.Err() == nil {
-			switch action, signal := classifyDialFailure(self.IpPath(), err); action {
+			switch action, signal := classifyDialFailure(self.IpPath(), err, dialDuration); action {
 			case dialFailureRst:
 				var rstPacket []byte
 				var rstErr error
@@ -10965,23 +10969,26 @@ const (
 	dialFailureUnreachable
 )
 
-// classifyDialFailure maps an upstream DialContext error to the signal the
-// provider should return in place of a SynAck. It is pure -- no live socket, no
-// ConnectionState -- so the errno logic is unit-testable.
+// classifyDialFailure maps an upstream DialContext error, and how long the dial
+// took to fail, to the signal the provider should return in place of a SynAck.
+// It is pure -- no live socket, no ConnectionState, no clock -- so the errno
+// logic is unit-testable.
 //
 // For dialFailureUnreachable the built icmp packet is returned as well (a fresh
 // non-pool buffer from ipOosUnreachable; the caller copies it into the pool
 // before delivery). For dialFailureRst and dialFailureNone the packet is nil --
 // a RST needs the ConnectionState's sequence state, so the caller builds it.
 //
-// A dial that timed out gets nothing (isDialTimeout). It fails at the
-// dialer's ConnectTimeout, 15s after the SYN. By then the source has
-// retransmitted at 1s and 3s, the multi client's silence inference has
-// re-raced a flow that is still waiting, and an app racing address families
-// has connected over the other family 250ms in and abandoned this attempt. A
-// signal that late speeds nothing up. It only strikes the exit for a flow no
-// one waits on, and three such strikes for a blackholed AAAA downgrade a
-// healthy dual-stack exit to v4-only (IPV6.md C7).
+// A dial that timed out gets nothing (isDialTimeout), and neither does one
+// that failed in any other way only after dialFailureSignalHorizon. A timed
+// out dial fails at the dialer's ConnectTimeout, 15s after the SYN; a dial
+// through a host-supplied dialer without a deadline can fail as late. By then
+// the source has retransmitted at 1s and 3s, the multi client's silence
+// inference has re-raced a flow that is still waiting, and an app racing
+// address families has connected over the other family 250ms in and
+// abandoned this attempt. A signal that late speeds nothing up. It only
+// strikes the exit for a flow no one waits on, and three such strikes for a
+// blackholed AAAA downgrade a healthy dual-stack exit to v4-only (IPV6.md C7).
 //
 // Every other failure is immediate and answered. tcp + ECONNREFUSED means the
 // destination refused: RST+ACK. Anything else on tcp (no route, unreachable,
@@ -10993,8 +11000,8 @@ const (
 // are almost all linux, so linux errno semantics are what matter. udp "dial"
 // cannot produce a meaningful ECONNREFUSED at connect time, so udp is always
 // capacity-class.
-func classifyDialFailure(ipPath *IpPath, err error) (dialFailureAction, []byte) {
-	if ipPath == nil || isDialTimeout(err) {
+func classifyDialFailure(ipPath *IpPath, err error, dialDuration time.Duration) (dialFailureAction, []byte) {
+	if ipPath == nil || isDialTimeout(err) || dialFailureSignalHorizon <= dialDuration {
 		return dialFailureNone, nil
 	}
 	switch ipPath.Protocol {
@@ -11013,6 +11020,13 @@ func classifyDialFailure(ipPath *IpPath, err error) (dialFailureAction, []byte) 
 	}
 	return dialFailureNone, nil
 }
+
+// dialFailureSignalHorizon is how long a dial may take to fail and still be
+// answered with the dial-failure signal: the multi client's silence-inference
+// horizon, the retransmit at which it re-races a flow on its own. A later
+// failure reaches the source after the inference, or an app's family
+// fallback, has acted.
+const dialFailureSignalHorizon = inferredDialFailureTimeout
 
 // isDialTimeout reports whether a dial failed by running out of time rather
 // than at once. The dialer's own timeout surfaces as context.DeadlineExceeded
