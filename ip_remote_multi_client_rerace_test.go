@@ -410,8 +410,17 @@ type reraceHarness struct {
 // newReraceHarness starts a multi client with default settings (except as
 // configure changes them) over one test provider per spec and waits until
 // the quality window carries all of them. Must run inside a synctest bubble.
+//
+// It starts from a clean backend-degraded state and leaves one. The state is
+// process-wide and stamped in clock time, and a degraded backend holds the
+// window's size: failures an earlier test recorded -- every contract request
+// on a NoContractClientOob is one, stamped in real time or in another
+// bubble's -- must not decide whether this window forms.
 func newReraceHarness(t *testing.T, specs []reraceExitSpec, configure func(*MultiClientSettings)) *reraceHarness {
 	t.Helper()
+	resetBackendDegraded()
+	// registered first, so it runs last: after the clients below have closed
+	t.Cleanup(resetBackendDegraded)
 	ctx, cancel := context.WithCancel(t.Context())
 	harness := &reraceHarness{
 		t:         t,
@@ -795,6 +804,49 @@ func reraceAssertNoErrorDelivered(t *testing.T, harness *reraceHarness, path *Ip
 	t.Helper()
 	for _, packet := range harness.errorsDelivered(path) {
 		t.Errorf("an icmp error reached the app at +%s", packet.at.Sub(harness.start))
+	}
+}
+
+// The harness forms its window whatever backend failures earlier tests left
+// in the process-wide degraded state, which holds a window's size: failures
+// stamped in real time, which a synctest bubble's clock (it starts in 2000)
+// reads as after now, and failures stamped in a bubble's own time, which a
+// later bubble's clock reaches. It leaves the state clean behind it.
+func TestReraceHarnessIgnoresEarlierBackendFailures(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+	GetMessagePoolAggregateStats()
+	specs := []reraceExitSpec{
+		{name: "a", tier: 0},
+		{name: "b", tier: 1},
+	}
+	t.Run("real time", func(t *testing.T) {
+		for range backendDegradedFailThreshold {
+			noteBackendFailure()
+		}
+		synctest.Test(t, func(t *testing.T) {
+			newReraceHarness(t, specs, nil)
+		})
+	})
+	t.Run("bubble time", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			for range backendDegradedFailThreshold {
+				noteBackendFailure()
+			}
+			newReraceHarness(t, specs, nil)
+		})
+	})
+	t.Run("left behind", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			newReraceHarness(t, specs, nil)
+			// failures the harness's own clients record in bubble time
+			for range backendDegradedFailThreshold {
+				noteBackendFailure()
+			}
+		})
+	})
+	if got, last := consecutiveBackendFails.Load(), lastBackendFailNano.Load(); got != 0 || last != 0 {
+		t.Errorf("the harness left %d backend failures behind, the last stamped %d", got, last)
 	}
 }
 
