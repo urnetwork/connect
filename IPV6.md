@@ -127,6 +127,14 @@ Regenerate certs and nginx via warpctl. `sdk.NetworkSpace` gains
 service label so `g2-connect` becomes `g2-connect-v4`; explicit override URLs
 and IP literals return no family URL and disable pinned transports.
 
+A10. Verification attribution per family (2026-10-13). A provider's pinned
+transports each feed their observed address to the server's verify egress
+index. While that index allowed one live egress per provider, a provider with
+both pinned transports connected was neither eligible for validator trails
+nor resolvable from either address. The index now holds one live egress per
+family per provider (server verify egress v3, sn VALIDATOR.md §8.2), and that
+change is a prerequisite for enabling pinned transports (A2 to A4).
+
 ### B. Discovery and routing
 
 B1. No new windows. Each window tracks the category of every exit
@@ -271,7 +279,12 @@ eligibility, and at most 256 SYNs are tracked. Unrelated, spoofed, malformed
 or late ICMP and every other ICMP type stay dropped
 (`ip_remote_user_nat_dial_failure.go`). The multi client's existing
 intercept re-races the failed flow (`clientDialFailure`); through older
-providers it keeps relying on its SYN silence inference.
+providers it keeps relying on its SYN silence inference. Rollout order: the
+server's API and taskworker first (they read both verify egress index
+versions), then its connect service (which writes the per-family index, A10),
+then validators, so an alternating validator's IPv6 hop through a dual-stack
+provider is attributed when it arrives. Providers and clients gain the
+dial-failure signal as they upgrade, in any order.
 
 ### D. SDK, apps, tests
 
