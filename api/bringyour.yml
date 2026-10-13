@@ -4728,14 +4728,18 @@ paths:
         one, or a pair the track does not hold is `unavailable`.
 
         Requires a CLIENT jwt. New tracks are limited to 12 an hour per
-        client and 60 an hour per /24 (IPv6 /48) of the caller; reissues do
-        not count toward them. A refusal is a 200 with `error`.
+        client, 60 an hour per /24 (IPv6 /48) of the caller, and 30 an hour
+        per signing agent (a request's `Signature-Agent`, Web Bot Auth),
+        wherever that agent's browsers run; reissues do not count toward
+        them. A refusal is a 200 with `error`.
 
         A new track keeps the caller's network (its autonomous system) and
         the GeoLite2 City place of the caller's address, with the city's
         coordinates when the place names a city, looked up when the track is
         issued. The address itself, a prefix of it or a hash of it is never
-        stored.
+        stored. A track from a signing agent, or from an address in a hosting
+        or cloud network, is marked automated, with which of the two it was
+        and nothing more; its results count in no aggregate.
       operationId: lagTrack
       security:
         - BearerAuth: []
