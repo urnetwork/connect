@@ -145,6 +145,8 @@ tags:
 
       - discovery and status: `/hello`, `/status`, `/clock`, `/my-ip-info`
         and the policy redirects (`/privacy.txt`, `/terms.txt`, `/vdp.txt`)
+      - lag.dev (`/lag`): a guest session, the extenders it can measure and
+        the tickets of a track
       - client public keys (`/key`) and client log upload (`/log`)
       - Stripe checkout and the customer portal (`/stripe`), and data packs
         bought without signing in (`/pay/data`)
@@ -1979,6 +1981,119 @@ paths:
                 $ref: "#/components/schemas/ExtenderPingReportResult"
         "401":
           description: Missing or invalid client bearer token.
+
+  /network/extender-measurement-cert:
+    get:
+      tags: [Network]
+      summary: The extender's lag.dev measurement certificate
+      description: |
+        What became of the certificate request an activation carried
+        (lag.dev/PLAN.md A8, C4). An open tier extender serves the lag.dev
+        measurement API under one name, its `extender_id` under the
+        measurement zone, and asks for a certificate for that name in
+        `measurement_csr` on an activation; the operator orders it from the
+        CA and keeps the zone's address records for the name (C5, C8).
+
+        Requires a CLIENT jwt: the one the extender activated with. The
+        answer is for an extender that client activated -- the one with
+        `public_key_hex` when given, else its active, most recently activated
+        one -- and never for another client's.
+
+        `state` is one of:
+        - `none`: no request was ever stored. Send one with an activation.
+        - `pending`: the request waits to be issued, under the weekly cap
+          (C7) or a backoff after a failed order; `reason` says which. Poll
+          again on a backoff, and keep serving an installed certificate.
+        - `issued`: `chain_pem` is the chain for `names`, the leaf first.
+          Install it. A renewal at two thirds of its lifetime answers
+          `issued` with a new chain (C6). Read the expiry from the leaf.
+        - `refused`: the request cannot be issued, and `reason` says why.
+          Keep serving an installed certificate until it expires.
+        - `withdrawn`: the certificate for `names` was withdrawn and is
+          being revoked, because the extender was deactivated, its owner
+          opted out (`measurement_disabled` on an activation), or an operator
+          moved it to the gated tier or a canary (C9). Drop it at once and
+          stop answering to the name. The answer stays `withdrawn` until the
+          extender sends a request again without `measurement_disabled`.
+
+        `key_sha256` names the key the answer is for, so an extender whose
+        measurement key changed can tell that what is held is not for its
+        key, and send a request for the new one. A request for the same
+        name under another key replaces a pending one in its place in the
+        queue; one for the name and key already held, pending or issued,
+        changes nothing. An activation without `measurement_csr` leaves the
+        stored request as it is.
+      operationId: extenderMeasurementCert
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: public_key_hex
+          required: false
+          description: |
+            The extender's identity public key, hex, which picks one of
+            several extenders the calling client activated.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderMeasurementCertResult"
+        "401":
+          description: Missing or invalid client bearer token.
+
+  /network/extender-lag-report:
+    post:
+      tags: [Network]
+      summary: Report what lag.dev sessions measured
+      description: |
+        An extender's reports of its lag.dev measurement sessions
+        (lag.dev/PLAN.md A7, M8), in batches of up to 32. Each report is a
+        serialized `LagReport`, base64: one minute of one session's pings,
+        around its load or its last minute without one, with the load's
+        series, signed by the extender's identity key.
+
+        Requires a CLIENT jwt: the extender's activation credential, as for
+        `/network/ping-report`. A report is stored only when it verifies
+        under the identity key of an extender the calling client activated,
+        its ticket was issued for that extender at that track and position
+        and has no report yet, it arrives within a day of its ticket's
+        issue, its minute sits inside its session in the extender's own
+        clock, and its series are bounded: at most 600 pings, offsets within
+        60 s, at most 40 intervals per direction, and no interval above what
+        10 Gbps allows plus slack. Every other report is named in
+        `rejected` by its index, with why. A report names no client
+        address, only the address family the browser reached the extender
+        on; nothing of the browser's address is stored.
+
+        A post of more than 32 reports is refused whole with 400. Posts are
+        rate limited per client; past the limit the answer is 429 with
+        `Retry-After`, and the reporter keeps its queue and retries.
+      operationId: extenderLagReport
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtenderLagReportArgs"
+      responses:
+        "200":
+          description: How many reports were stored, and which were not and why.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderLagReportResult"
+        "400":
+          description: More reports than one post carries.
+        "401":
+          description: Missing or invalid client bearer token.
+        "429":
+          description: Too many posts from this client; retry after `Retry-After`.
 
   /network/sessions:
     get:
@@ -4511,10 +4626,11 @@ paths:
         Information about the caller's IP as seen by the platform: its
         geolocation, and whether the IP is currently connected to the network.
 
-        The location comes from MaxMind GeoLite2 City. This product includes
-        GeoLite2 data created by MaxMind, available from
-        https://www.maxmind.com. The database has no privacy/VPN
-        classification, so none is returned.
+        The location comes from MaxMind GeoLite2 City, and the network the
+        ip is announced by (`asn`) from GeoLite2 ASN when the operator has
+        it. This product includes GeoLite2 data created by MaxMind,
+        available from https://www.maxmind.com. The database has no
+        privacy/VPN classification, so none is returned.
       operationId: myIpInfo
       security: []
       responses:
@@ -4524,6 +4640,133 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MyIPInfoResult"
+
+  /lag/session:
+    post:
+      tags: [Other]
+      summary: Start a lag.dev guest session
+      description: |
+        Create a lag.dev guest: a guest network marked to expire, with one
+        client, and answer that client's JWT (lag.dev/PLAN.md A1). lag.dev
+        keeps the JWT and reuses it until `expires_at`, when the operator
+        removes the guest network and the JWT stops working (A2).
+
+        No credential. Any request body is ignored; lag.dev sends `{}`.
+        Guest sessions are limited to 10 an hour per /24 (IPv6 /48) of the
+        caller, shared by everyone in it. A refusal is a 200 with `error`:
+        `limit` with the rest of the window in `retry_after_ms`, or
+        `unavailable` when the guest could not be created.
+      operationId: lagSession
+      security: []
+      responses:
+        "200":
+          description: The guest session, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagSessionResult"
+
+  /lag/extenders:
+    get:
+      tags: [Other]
+      summary: Extenders lag.dev can measure
+      description: |
+        A sample of up to 64 extenders that serve the lag.dev measurement
+        API now, randomized per request and spread across countries
+        (lag.dev/PLAN.md A4). An extender is offered only while its
+        measurement certificate is issued, unexpired and not withdrawn, and
+        its measurement name is published, meaning Route 53 answers for it
+        (C8): an extender that is deactivated, gated, a canary, opted out by
+        its owner, waiting on a new certificate request, or whose name is
+        not yet published is not.
+
+        There is one entry per extender. `host` is its measurement name,
+        its id under the measurement zone, which resolves to its active
+        addresses `ips`, IPv4 first, so the browser connects to the name on
+        whichever family it has. `location` is where the operator places
+        it: its derived location, else MaxMind GeoLite2 City for its first
+        address. These extenders are already public through certificate
+        transparency and DNS.
+
+        Requires a CLIENT jwt, the lag.dev guest's or any other client's.
+      operationId: lagExtenders
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagExtendersResult"
+        "401":
+          description: Missing or invalid client bearer token.
+
+  /lag/track:
+    post:
+      tags: [Other]
+      summary: Tickets for a lag.dev track
+      description: |
+        Every ticket of a lag.dev track in one call (lag.dev/PLAN.md A6). A
+        track is up to 12 extenders, the 8 dots and then up to 4 spares; a
+        ticket's `position` is its extender's place in the request. Each
+        ticket admits one measurement session on its extender: it must open
+        within 2 minutes (`expires_at`), and once open it pings for as long
+        as the browser keeps it, with at most one load of 5 s down and 5 s
+        up. Tickets are signed by the operator's root key, the one that
+        signs extender records. An extender that cannot be measured now is
+        left out, so a position can be missing; none at all is
+        `unavailable`.
+
+        With `track_id`, the call reissues tickets in that track instead,
+        for a dot whose session dropped, so it reconnects without leaving
+        its track: each extender is given with its `position`, and each
+        pair must be one the track already holds. Only the client the track
+        was issued to can reissue it, within an hour of its issue. A track
+        gets one reissue per position and 8 in all; past either, the call is
+        refused with `limit`. An unknown track, another client's, an older
+        one, or a pair the track does not hold is `unavailable`.
+
+        Requires a CLIENT jwt. New tracks are limited to 12 an hour per
+        client, 60 an hour per /24 (IPv6 /48) of the caller, and 30 an hour
+        per signing agent (a request's `Signature-Agent`, Web Bot Auth),
+        wherever that agent's browsers run; reissues do not count toward
+        them. A refusal is a 200 with `error`.
+
+        A new track keeps the caller's network (its autonomous system) and
+        the GeoLite2 City place of the caller's address, with the city's
+        coordinates when the place names a city, looked up when the track is
+        issued. The address itself, a prefix of it or a hash of it is never
+        stored. A track from a signing agent, or from an address in a hosting
+        or cloud network, is marked automated, with which of the two it was
+        and nothing more; its results count in no aggregate.
+
+        The lagdev command line and MCP server name themselves with an
+        `X-Lag-Client` header, `cli` or `mcp`, and the track keeps which
+        client ran it. A browser sends none, which means `web`; the header is
+        not among the allowed CORS request headers.
+      operationId: lagTrack
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LagTrackArgs"
+      responses:
+        "200":
+          description: The track's tickets, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagTrackResult"
+        "400":
+          description: |
+            No extender, more than 12, or a reissue that does not give each
+            extender's position.
+        "401":
+          description: Missing or invalid client bearer token.
 
   /account/change-name:
     post:
@@ -14761,8 +15004,234 @@ components:
                 timezone:
                   description: IANA time zone, e.g. `Europe/London`.
                   type: string
+            asn:
+              description: |
+                The autonomous system the ip is announced by, from MaxMind
+                GeoLite2 ASN (lag.dev/PLAN.md A3). Left out when the
+                operator has no ASN database or it has no record for the ip.
+              type: object
+              required:
+                - number
+                - organization
+              properties:
+                number:
+                  type: integer
+                  format: int64
+                  example: 64500
+                organization:
+                  type: string
+                  example: Example
         connected_to_network:
           type: boolean
+
+    LagError:
+      description: |
+        A refusal of a lag.dev call, answered with status 200
+        (lag.dev/PLAN.md A1, A6).
+      type: object
+      required:
+        - code
+        - retry_after_ms
+      properties:
+        code:
+          description: |
+            `limit`: a rate limit or a cap was reached. `unavailable`:
+            there is nothing to answer with now.
+          type: string
+          enum: [limit, unavailable]
+        message:
+          type: string
+        retry_after_ms:
+          description: How long to wait before asking again; 0 when there is no wait to name.
+          type: integer
+          format: int64
+
+    LagSessionResult:
+      type: object
+      required: []
+      properties:
+        by_client_jwt:
+          description: The guest client's JWT, for `/lag/extenders` and `/lag/track`.
+          type: string
+        network_id:
+          type: string
+        client_id:
+          type: string
+        expires_at:
+          description: |
+            When the guest is removed and the JWT stops working: RFC 3339,
+            whole seconds, UTC.
+          type: string
+          format: date-time
+        error:
+          $ref: "#/components/schemas/LagError"
+
+    LagExtenderLocation:
+      type: object
+      required:
+        - country_code
+        - latitude
+        - longitude
+      properties:
+        city:
+          type: string
+        region:
+          type: string
+        country_code:
+          description: ISO 3166-1 alpha-2, lower case.
+          type: string
+        country_name:
+          type: string
+        latitude:
+          type: number
+        longitude:
+          type: number
+
+    LagExtender:
+      type: object
+      required:
+        - extender_id
+        - public_key
+        - host
+        - ips
+        - location
+      properties:
+        extender_id:
+          type: string
+        public_key:
+          description: The extender's ed25519 identity key, hex.
+          type: string
+        host:
+          description: |
+            The extender's measurement name, `<extender_id>.<zone>`, which
+            the browser connects to.
+          type: string
+          example: 0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.extender.bringyour.com
+        ips:
+          description: The extender's active addresses, IPv4 first; the name resolves to these.
+          type: array
+          items:
+            type: string
+        location:
+          $ref: "#/components/schemas/LagExtenderLocation"
+
+    LagExtendersResult:
+      type: object
+      required:
+        - extenders
+      properties:
+        extenders:
+          type: array
+          items:
+            $ref: "#/components/schemas/LagExtender"
+
+    LagTrackExtender:
+      type: object
+      required:
+        - extender_id
+      properties:
+        extender_id:
+          type: string
+        position:
+          description: |
+            For a reissue, the dot's position in its track. Ignored for a
+            new track, whose positions are the request order.
+          type: integer
+
+    LagTrackArgs:
+      type: object
+      required:
+        - extenders
+      properties:
+        track_id:
+          description: Set to reissue tickets in a track issued to the caller within the last hour.
+          type: string
+        extenders:
+          description: The 8 dots, then up to 4 spares.
+          type: array
+          minItems: 1
+          maxItems: 12
+          items:
+            $ref: "#/components/schemas/LagTrackExtender"
+
+    LagTrackTicket:
+      type: object
+      required:
+        - extender_id
+        - host
+        - position
+        - ticket
+      properties:
+        extender_id:
+          type: string
+        host:
+          description: The extender's measurement name, which the session connects to.
+          type: string
+        position:
+          description: The dot's position in the track, 0-7 for the dots and 8-11 for the spares.
+          type: integer
+        ticket:
+          description: |
+            The ticket text for the session url: base64url, without padding,
+            of the signed `LagTicket`.
+          type: string
+
+    LagTrackResult:
+      type: object
+      required: []
+      properties:
+        track_id:
+          type: string
+        tickets:
+          type: array
+          items:
+            $ref: "#/components/schemas/LagTrackTicket"
+        expires_at:
+          description: |
+            Every session must open before this: RFC 3339, whole seconds,
+            UTC.
+          type: string
+          format: date-time
+        error:
+          $ref: "#/components/schemas/LagError"
+
+    ExtenderLagReportArgs:
+      type: object
+      required:
+        - reports
+      properties:
+        reports:
+          type: array
+          maxItems: 32
+          items:
+            description: A serialized `LagReport`, base64.
+            type: string
+
+    ExtenderLagReportRejection:
+      type: object
+      required:
+        - index
+        - reason
+      properties:
+        index:
+          description: The report's index in the post.
+          type: integer
+        reason:
+          type: string
+          enum: [malformed, extender, signature, ticket, bounds, duplicate]
+
+    ExtenderLagReportResult:
+      type: object
+      required:
+        - accepted
+        - rejected
+      properties:
+        accepted:
+          type: integer
+        rejected:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtenderLagReportRejection"
 
     GetNetworkUserResult:
       type: object
@@ -15406,6 +15875,27 @@ components:
           items:
             type: string
             enum: [tcp, quic, dns]
+        measurement_csr:
+          description: |
+            Standard base64 of the DER certificate request for the extender's
+            lag.dev measurement name, `<extender_id>.<zone>`, whose only name
+            is that one, under an ECDSA P-256 key (lag.dev/PLAN.md C4, A10).
+            Omitted on most activations, which leaves a stored request as it
+            is. A request carried by a successful activation is stored as the
+            extender's; its outcome is read from
+            `/network/extender-measurement-cert`, never from this answer.
+          type: string
+        measurement_disabled:
+          description: |
+            Sent on every activation while the extender's owner has opted out
+            of lag.dev measurement (lag.dev/PLAN.md C4, C9). The operator
+            withdraws the extender's measurement name: its address records go,
+            its certificate is revoked, its records carry no measurement id,
+            and nothing is issued for it. A `measurement_csr` beside it is not
+            stored. Omitted, the default, changes nothing on its own: a later
+            activation without it and with `measurement_csr` makes the
+            extender eligible again.
+          type: boolean
 
     ExtenderActivateResult:
       type: object
@@ -15417,6 +15907,13 @@ components:
       properties:
         activated:
           type: boolean
+        extender_id:
+          description: |
+            The operator's id of the extender, one per identity key and the
+            same at every activation. The extender's lag.dev measurement name
+            is this id under the measurement zone (lag.dev/PLAN.md N1, N4).
+          type: string
+          format: uuid
         ip:
           description: The caller address that was probed and published.
           type: string
@@ -15668,6 +16165,49 @@ components:
           type: integer
         error:
           description: Why the report was refused whole; empty otherwise.
+          type: string
+
+    ExtenderMeasurementCertResult:
+      type: object
+      description: |
+        The extender's lag.dev measurement certificate and where its request
+        stands (lag.dev/PLAN.md A8).
+      required:
+        - state
+        - names
+      properties:
+        state:
+          type: string
+          enum: [none, pending, issued, refused, withdrawn]
+        names:
+          description: |
+            The extender's one measurement name, `<extender_id>.<zone>`:
+            the request's when `pending` or `refused`, the certificate's when
+            `issued`, the withdrawn certificate's when `withdrawn`. Empty for
+            `none`, and for a request that could not be read.
+          type: array
+          items:
+            type: string
+        key_sha256:
+          description: |
+            Hex SHA-256 of the SubjectPublicKeyInfo (DER) of the key the
+            answer is for: the certificate's when `issued`, else the
+            request's. Absent for `none` and for a request that could not be
+            read.
+          type: string
+        chain_pem:
+          description: The certificate chain, PEM, the leaf first. Only when `issued`.
+          type: string
+        not_after:
+          description: |
+            The leaf's expiry. Only when `issued`; the leaf itself is
+            authoritative.
+          type: string
+          format: date-time
+        reason:
+          description: |
+            Why a request is `refused` or a certificate `withdrawn`, or what a
+            `pending` request waits for.
           type: string
 
     # ----- provider probing -----

@@ -159,6 +159,16 @@ message ExtenderRecordBody {
     // ordinary tier behavior. Canary records also use the gated wire tier
     // so older tier-aware readers cannot relay them on open channels.
     string CanaryChannel = 16;
+    // The 16 byte id of the extender, set when the operator signs the record
+    // of an extender that holds an issued, unexpired measurement certificate
+    // whose measurement name is published, so the name already resolves
+    // (lag.dev/PLAN.md C8, C10). A feed or gossip reader then knows the
+    // extender serves the lag.dev measurement API (M), and that its
+    // measurement name is this id in the measurement zone (N1). Only open
+    // tier extenders that are not canaries ever hold a certificate. Empty on
+    // an extender that does not serve the API or whose name is not published,
+    // and on records that predate the field.
+    bytes MeasurementId = 17;
 }
 
 message ExtenderRecord {

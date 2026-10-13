@@ -552,6 +552,16 @@ type ExtenderRecordBody struct {
 	// ordinary tier behavior. Canary records also use the gated wire tier
 	// so older tier-aware readers cannot relay them on open channels.
 	CanaryChannel string `protobuf:"bytes,16,opt,name=CanaryChannel,proto3" json:"CanaryChannel,omitempty"`
+	// The 16 byte id of the extender, set when the operator signs the record
+	// of an extender that holds an issued, unexpired measurement certificate
+	// whose measurement name is published, so the name already resolves
+	// (lag.dev/PLAN.md C8, C10). A feed or gossip reader then knows the
+	// extender serves the lag.dev measurement API (M), and that its
+	// measurement name is this id in the measurement zone (N1). Only open
+	// tier extenders that are not canaries ever hold a certificate. Empty on
+	// an extender that does not serve the API or whose name is not published,
+	// and on records that predate the field.
+	MeasurementId []byte `protobuf:"bytes,17,opt,name=MeasurementId,proto3" json:"MeasurementId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -696,6 +706,13 @@ func (x *ExtenderRecordBody) GetCanaryChannel() string {
 		return x.CanaryChannel
 	}
 	return ""
+}
+
+func (x *ExtenderRecordBody) GetMeasurementId() []byte {
+	if x != nil {
+		return x.MeasurementId
+	}
+	return nil
 }
 
 type ExtenderRecord struct {
@@ -1329,7 +1346,7 @@ const file_extender_proto_rawDesc = "" +
 	"\x0fExtenderAddress\x12\x0e\n" +
 	"\x02Ip\x18\x01 \x01(\tR\x02Ip\x12\x1c\n" +
 	"\tIpVersion\x18\x02 \x01(\rR\tIpVersion\x12\x1a\n" +
-	"\bCarriers\x18\x03 \x03(\tR\bCarriers\"\xbe\x04\n" +
+	"\bCarriers\x18\x03 \x03(\tR\bCarriers\"\xe4\x04\n" +
 	"\x12ExtenderRecordBody\x12\x1c\n" +
 	"\tPublicKey\x18\x01 \x01(\fR\tPublicKey\x128\n" +
 	"\tAddresses\x18\x02 \x03(\v2\x1a.bringyour.ExtenderAddressR\tAddresses\x12\x18\n" +
@@ -1347,7 +1364,8 @@ const file_extender_proto_rawDesc = "" +
 	"\rDirectoryTier\x18\r \x01(\rR\rDirectoryTier\x12&\n" +
 	"\x0eWebRtcClientId\x18\x0e \x01(\fR\x0eWebRtcClientId\x12*\n" +
 	"\x10RealityPublicKey\x18\x0f \x01(\fR\x10RealityPublicKey\x12$\n" +
-	"\rCanaryChannel\x18\x10 \x01(\tR\rCanaryChannel\"h\n" +
+	"\rCanaryChannel\x18\x10 \x01(\tR\rCanaryChannel\x12$\n" +
+	"\rMeasurementId\x18\x11 \x01(\fR\rMeasurementId\"h\n" +
 	"\x0eExtenderRecord\x12\x12\n" +
 	"\x04Body\x18\x01 \x01(\fR\x04Body\x12$\n" +
 	"\rRootSignature\x18\x02 \x01(\fR\rRootSignature\x12\x1c\n" +

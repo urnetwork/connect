@@ -145,11 +145,17 @@ func (self *extenderCamouflage) now() time.Time {
 // connection (P3). It returns the connection the rest of the handler should
 // terminate with the peeked bytes replayed, whether that termination is the
 // authenticated path (http/1.1 alone, P4), and whether the connection was
-// already handled (a splice). When camouflage is off it is a no-op returning the
-// connection unchanged.
+// already handled (a splice, or the measurement api's). A hello for a
+// measurement name goes to the measurement api before any camouflage check
+// (lag.dev/PLAN.md M1). When camouflage is off and the measurement api has no
+// name to recognize it is a no-op returning the connection unchanged.
 func (self *ExtenderServer) camouflageDemultiplex(ctx context.Context, conn net.Conn) (net.Conn, bool, bool) {
 	camouflage := self.camouflage
-	if camouflage == nil || !self.settings.CamouflageEnabled || camouflage.staticPrivateKey == nil {
+	camouflageOn := camouflage != nil && self.settings.CamouflageEnabled && camouflage.staticPrivateKey != nil
+	// the measurement api is chosen by sni, so the hello is also peeked while
+	// the api has a name to recognize (lag.dev/PLAN.md M1)
+	lagOn := self.lag.peeks()
+	if !camouflageOn && !lagOn {
 		return conn, false, false
 	}
 
@@ -174,6 +180,16 @@ func (self *ExtenderServer) camouflageDemultiplex(ctx context.Context, conn net.
 	}
 	if ctx.Err() != nil {
 		return nil, false, true
+	}
+	// a measurement name is the measurement api's, which holds the connection
+	// until it is done with it (lag.dev/PLAN.md M1)
+	if ok && lagOn && self.lag.dispatch(ctx, conn, readBytes, parsed.ServerName) {
+		return nil, false, true
+	}
+	if !camouflageOn {
+		// every other hello takes the existing path unchanged: the peeked bytes
+		// replayed to tls.Server, and no camouflage outcome (lag.dev/PLAN.md M1)
+		return newConnWithInitialBytes(conn, readBytes, ""), false, false
 	}
 	if !ok {
 		// not a parseable ClientHello: terminate it as today, the peeked bytes

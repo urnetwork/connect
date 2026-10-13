@@ -1,0 +1,85 @@
+syntax = "proto3";
+package bringyour;
+option go_package = "github.com/urnetwork/connect/protocol";
+
+// One lag.dev session on one extender, admitted by the operator: pings for
+// as long as the session is open, and at most one load
+// (lag.dev/PLAN.md M3, A6).
+message LagTicketBody {
+    bytes TicketId = 1;            // 16 bytes
+    bytes ClientId = 2;            // 16 bytes, the lag guest client
+    bytes ExtenderPublicKey = 3;   // the extender's ed25519 identity key
+    string NetworkHost = 4;        // the network space, as on records
+    uint64 IssueTimeMs = 5;
+    uint64 ExpireTimeMs = 6;       // the session must open before this; once open it has no time limit
+    bytes TrackId = 7;             // 16 bytes, shared by the track's sessions
+    uint32 TrackPosition = 8;      // the dot's place: 0-7, spares 8-11
+    uint32 PingIntervalMs = 9;     // 250, the target; back to back when the round trip is longer
+    uint32 DownloadMs = 10;        // 5000
+    uint32 UploadMs = 11;          // 5000
+    uint32 MaxStreams = 12;        // per direction, 4
+    uint64 MaxDownloadBytes = 13;
+    uint64 MaxUploadBytes = 14;
+}
+
+message LagTicket {
+    // serialized LagTicketBody, signed opaquely
+    bytes Body = 1;
+    // ed25519 over "ur-lag-ticket-v1" || Body, by the key that signs records
+    bytes RootSignature = 2;
+    // first 8 bytes of sha256 of the signing public key
+    bytes RootKeyId = 3;
+}
+
+// How a session's load ended
+enum LagEndReason {
+    LAG_END_COMPLETE = 0;          // the load ran to the end
+    LAG_END_CLIENT_CLOSED = 1;     // the browser closed the session during the load
+    LAG_END_CAP = 2;
+    LAG_END_UPLOAD_MISMATCH = 3;
+    LAG_END_TIMEOUT = 4;
+    LAG_END_ERROR = 5;
+    LAG_END_NO_LOAD = 6;           // the session closed before its load
+    LAG_END_BUSY = 7;              // the load was refused: concurrent loads or the daily budget
+}
+
+// One minute of one session, reported by the extender (lag.dev/PLAN.md M8,
+// A7): the minute around the session's load, or its last minute when it
+// had none.
+message LagReportBody {
+    bytes TicketId = 1;
+    bytes ExtenderPublicKey = 2;
+    bytes TrackId = 3;
+    uint32 TrackPosition = 4;
+    // was ClientIp: a report never carries the browser's address
+    // (lag.dev/PLAN.md amendment 9)
+    reserved 5;
+    reserved "ClientIp";
+    uint64 SessionStartTimeMs = 6;              // extender clock
+    uint64 WindowStartTimeMs = 7;               // the reported minute starts here
+    repeated uint32 PingOffsetMs = 8;           // each ping's send time, ms after WindowStartTimeMs
+    repeated uint32 PingMicros = 9;             // its round trip; 0 when lost (no pong within 5 s)
+    // the session's load, in ms after WindowStartTimeMs; a zero duration means none
+    uint32 DownloadStartMs = 10;
+    uint32 DownloadMs = 11;
+    uint32 UploadStartMs = 12;
+    uint32 UploadMs = 13;
+    uint32 IntervalMs = 14;                     // 250
+    repeated uint64 DownloadReceivedBytes = 15; // per interval, as the browser reported
+    repeated uint64 DownloadSentBytes = 16;     // per interval, as the extender wrote
+    repeated uint64 UploadBytes = 17;           // per interval, received and verified
+    uint32 DownloadStreams = 18;
+    uint32 UploadStreams = 19;
+    bool UploadVerified = 20;
+    LagEndReason EndReason = 21;
+    // 4 or 6: the address family the browser reached this extender's name on
+    // (lag.dev/PLAN.md N3). The family only, never the address (amendment 9).
+    uint32 IpFamily = 22;
+}
+
+message LagReport {
+    // serialized LagReportBody
+    bytes Body = 1;
+    // ed25519 by the extender identity key over "ur-lag-report-v1" || Body
+    bytes Signature = 2;
+}
