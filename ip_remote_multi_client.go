@@ -5182,6 +5182,16 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 				delete(self.demotionStates, key)
 			}
 		}
+		// likewise above the early return: drop the exit from every flow's
+		// record of the exits that failed it, whatever the flow is bound to,
+		// so a long-lived flow (a udp stream may never idle) does not keep
+		// the removed channel reachable
+		for _, update := range self.ip4PathUpdates {
+			update.forgetDialFailedClient(client)
+		}
+		for _, update := range self.ip6PathUpdates {
+			update.forgetDialFailedClient(client)
+		}
 
 		updates, ok := self.clientUpdates[client]
 		if !ok {
@@ -7085,6 +7095,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 		defer update.releaseCollapseClaims()
 		sentUpdate = update
 		enterTime := time.Now()
+		for packetIndex := range sendPacketGroup.packets {
+			update.noteConnectAttempt(sendPacketGroup.packets[packetIndex].ipPath)
+		}
 
 		// Client-side dial-failure inference. A connection attempt
 		// retransmitting on an exit that has answered nothing is the silent
@@ -7270,6 +7283,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					}
 					if update.race == nil {
 						update.initRaceWithLock()
+						// the race commits on the send: a signal that beats
+						// the commit undoes it (withdrawRaceCandidateWithLock)
+						update.race.single = true
 					}
 					race = update.race
 					state := race.clientStates[client]
@@ -8671,7 +8687,13 @@ func (self *RemoteUserNatMultiClient) clientDialFailureSignal(sourceClient *mult
 // late or stale signal happens to name. When those hold and DialFailureRerace
 // is on, it unbinds the flow (the removeClient per-update idiom, minus teardown
 // and minus cancelling the update) so the application's own retransmit re-races
-// it onto another exit within ~1s. With the knob off it rebuilds the icmp with
+// it onto another exit within ~1s. A signal can also land while the flow is
+// still racing, before a race commits it (the send has not even returned when
+// a provider fails the dial at once): with the re-race on, the exit is then
+// taken out of the race, with its strike and its service failure, so the
+// commit cannot bind the flow to the exit that failed it. The one candidate
+// of a race of one taken out this way counts as a re-race, as it would had
+// the commit come first; one candidate of several does not. With the knob off it rebuilds the icmp with
 // the flow's SYN sequence and forwards it to the app (removeClient's teardown
 // convention) for a visible-but-fast failure. Each exit strikes a flow once:
 // a failure the same exit already reported for the flow re-races or forwards
@@ -8715,7 +8737,7 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 
 	rerace := self.reliabilitySettings().DialFailureRerace
 
-	matched := false
+	standing := dialFailureStale
 	// firstFromExit is whether this is the exit's first failure of the flow
 	firstFromExit := false
 	// the sequence of the flow's SYN, which the icmp forwarded with the knob
@@ -8736,28 +8758,24 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 			return
 		}
 
-		// act only on the flow this very client owns that has not yet received
-		// inbound data. a nil update (gone), a different client (already
-		// re-raced onto another exit), or an established flow (receivedInbound)
-		// all mean this signal is stale and must not disturb a working flow.
-		if update == nil || update.client.Load() != sourceClient || update.receivedInbound.Load() {
+		// act only on a flow that has not yet received inbound data, for the
+		// exit it is bound to or, with the re-race on, an exit still racing
+		// for it (dialFailureStanding). a nil update (gone), another exit's
+		// flow (already re-raced onto it), or an established flow
+		// (receivedInbound) all mean this signal is stale and must not
+		// disturb a working flow.
+		if update == nil || update.receivedInbound.Load() {
 			return
 		}
-
-		matched = true
-		// A flow re-raced back onto an exit that already failed it -- the only
-		// candidate, or the oldest failure once every candidate has failed it
-		// (filterDestinationServiceFailures) -- fails there again, on every
-		// retransmit and, for udp, on every datagram. The exit strikes the
-		// flow once: a strike or a counted re-race per repeat would grow with
-		// the packet rate instead of the connection attempts. The repeat still
-		// refreshes the destination service failure and re-races, which keeps
-		// the rotation that re-tests every failed exit.
-		if !slices.Contains(update.dialFailedClients, sourceClient) {
-			update.dialFailedClients = append(update.dialFailedClients, sourceClient)
-			firstFromExit = true
+		standing, firstFromExit = update.dialFailureStanding(sourceClient, rerace)
+		if standing == dialFailureStale {
+			return
 		}
 		self.recordDestinationServiceFailureWithLock(sourceClient, egressIpPath)
+		if standing != dialFailureBound {
+			// taken out of the race: nothing was bound, so nothing to unbind
+			return
+		}
 
 		if rerace {
 			// unbind exactly like removeClient does per-update, minus teardown
@@ -8779,7 +8797,7 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 		}
 	}()
 
-	if !matched {
+	if standing == dialFailureStale {
 		// no live flow for this signal: dropped here, already counted above.
 		return false
 	}
@@ -8800,6 +8818,15 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 		}
 	}
 
+	if standing == dialFailureWithdrawn {
+		// the race goes on without the exit, or, left empty, ends so the
+		// flow's next packet races afresh. one candidate of several was never
+		// the flow's exit, so this is no counted re-race
+		return false
+	}
+
+	// bound, or the one candidate of a race withdrawn before its commit: the
+	// flow leaves the exit that failed it either way
 	if rerace {
 		if firstFromExit {
 			self.reliabilityMetrics.flowReraced()
@@ -9428,12 +9455,16 @@ type multiClientChannelUpdate struct {
 	// stateLock alongside the clock it qualifies.
 	synWaitSendCount int
 
-	// dialFailedClients are the exits that have failed this flow's connect,
-	// by signal or by inference. Each strikes the flow once
-	// (clientDialFailure). Like synWaitClient the pointers are only compared,
-	// never dereferenced. At most one per exit the flow was ever bound to.
-	// Guarded by the parent stateLock.
+	// dialFailedClients are the exits that have failed this flow's current
+	// connect attempt, by signal or by inference. Each strikes the flow once
+	// (clientDialFailure). The app's SYN with a new sequence starts the
+	// record afresh (noteConnectAttempt; dialFailedSyn is that attempt's
+	// sequence), and removeClient drops a removed exit from it, so it holds
+	// at most one entry per live exit. The pointers are only compared,
+	// never dereferenced. All guarded by stateLock.
 	dialFailedClients []*multiClientChannel
+	dialFailedSyn     uint32
+	dialFailedSynSeen bool
 
 	// stateLock guards the per-flow mutable state below: the active race and the
 	// tcp collapse-prevention sequence counters. it is a leaf — its holders
@@ -9984,6 +10015,105 @@ func (self *multiClientChannelUpdate) releaseSequenceHold(maxHold time.Duration)
 	return true
 }
 
+// dialFailureStanding is what a failed connect means for one flow.
+type dialFailureStanding int
+
+const (
+	// the signal names a flow the exit neither carries nor races for
+	dialFailureStale dialFailureStanding = iota
+	// the flow is bound to the exit that failed it
+	dialFailureBound
+	// the exit was a candidate of the flow's race and is taken out of it;
+	// the race goes on without it, or, left empty, ends
+	dialFailureWithdrawn
+	// the exit was the one candidate of a race that commits on its send, and
+	// is taken out of it before the commit: the flow races afresh on its
+	// next packet, as when a bound flow is unbound
+	dialFailureWithdrawnBeforeCommit
+)
+
+// dialFailureStanding settles, under the flow's leaf lock, what a failed
+// connect reported by client means for the flow: the exit it is bound to, a
+// candidate of its race that withdraw takes out of the race, or neither. For
+// the first two it records client among the exits that failed the flow and
+// reports whether this was client's first failure of it.
+func (self *multiClientChannelUpdate) dialFailureStanding(client *multiClientChannel, withdraw bool) (standing dialFailureStanding, first bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	bound := self.client.Load()
+	switch {
+	case bound != nil && bound == client:
+		standing = dialFailureBound
+	case bound == nil && withdraw:
+		standing = self.withdrawRaceCandidateWithLock(client)
+		if standing == dialFailureStale {
+			return dialFailureStale, false
+		}
+	default:
+		return dialFailureStale, false
+	}
+	if !slices.Contains(self.dialFailedClients, client) {
+		self.dialFailedClients = append(self.dialFailedClients, client)
+		first = true
+	}
+	return standing, first
+}
+
+// withdrawRaceCandidateWithLock takes client out of the flow's race when it
+// is a candidate that has answered nothing, and ends a race it leaves empty,
+// so the flow's next packet starts a fresh one. It reports
+// dialFailureWithdrawnBeforeCommit for the candidate of a race of one,
+// dialFailureWithdrawn for one of several, and dialFailureStale when client
+// is no candidate. Must be called with stateLock.
+func (self *multiClientChannelUpdate) withdrawRaceCandidateWithLock(client *multiClientChannel) dialFailureStanding {
+	race := self.race
+	if race == nil {
+		return dialFailureStale
+	}
+	state, ok := race.clientStates[client]
+	if !ok || 0 < len(state.packets) {
+		return dialFailureStale
+	}
+	delete(race.clientStates, client)
+	if 0 < len(race.clientStates) {
+		return dialFailureWithdrawn
+	}
+	self.clearRaceWithLock()
+	if race.single {
+		return dialFailureWithdrawnBeforeCommit
+	}
+	return dialFailureWithdrawn
+}
+
+// noteConnectAttempt starts the record of the exits that failed the flow
+// afresh when ipPath is the app's SYN with a new sequence: a new connect
+// attempt on the same 5-tuple, which the exits that failed the last one may
+// serve, and strike, again. A retransmit, with the attempt's own sequence,
+// keeps the record. It runs before the SYN is sent, so the record belongs to
+// the attempt by the time an exit can answer it.
+func (self *multiClientChannelUpdate) noteConnectAttempt(ipPath *IpPath) {
+	if ipPath.Protocol != IpProtocolTcp || !ipPath.Syn || ipPath.Ack {
+		return
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.dialFailedSynSeen && self.dialFailedSyn == ipPath.SequenceNumber {
+		return
+	}
+	self.dialFailedSynSeen, self.dialFailedSyn = true, ipPath.SequenceNumber
+	self.dialFailedClients = nil
+}
+
+// forgetDialFailedClient drops a removed exit from the exits that failed the
+// flow, so the record does not keep the channel reachable.
+func (self *multiClientChannelUpdate) forgetDialFailedClient(client *multiClientChannel) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.dialFailedClients = slices.DeleteFunc(self.dialFailedClients, func(failed *multiClientChannel) bool {
+		return failed == client
+	})
+}
+
 // synSequence is the sequence number of the flow's current SYN, which a
 // kernel stack checks an icmp error's embed against, and whether a SYN was
 // seen at all.
@@ -10168,9 +10298,12 @@ func (self *multiClientChannelUpdate) Close() {
 }
 
 type multiClientChannelUpdateRace struct {
-	ctx                    context.Context
-	cancel                 context.CancelFunc
-	clientStates           map[*multiClientChannel]*multiClientChannelRaceClientState
+	ctx          context.Context
+	cancel       context.CancelFunc
+	clientStates map[*multiClientChannel]*multiClientChannelRaceClientState
+	// single marks a race of one candidate, which commits as soon as its send
+	// is admitted rather than on a winner decision
+	single                 bool
 	sentPacketCount        int
 	packetCount            int
 	clientsWithPacketCount int

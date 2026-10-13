@@ -951,6 +951,195 @@ func TestDialFailureReraceRetransmitCompletesOnAnotherExit(t *testing.T) {
 	}
 }
 
+// RR-1. A provider whose dial fails at once can answer before a race commits
+// the flow: the send returns once the SYN is queued, and the exit's signal
+// may already have landed. The exit is then taken out of the race, with its
+// strike, so the one-candidate race cannot commit the flow to the exit that
+// failed it, and the app's next SYN goes to another exit and completes. It
+// counts as the re-race it would have been had the commit come first. The
+// send hook delivers the signal before the send returns, deterministically.
+func TestDialFailureSignalBeforeTheCommitWithdrawsTheExit(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
+			{name: "b", tier: 1},
+		}, nil)
+		a := harness.channel("a")
+		path := reraceFlow(4, 0, 47000)
+		a.sendGroupForTest = reraceSignalDuringSend(t, harness, a, path)
+		harness.syn(path)
+		a.sendGroupForTest = nil
+		if got := harness.metrics().DialFailuresIntercepted; got != 1 {
+			t.Fatalf("setup: DialFailuresIntercepted = %d, want the signal", got)
+		}
+		if harness.boundTo(path) == a {
+			t.Fatal("the signal that landed before the commit was dropped: the flow is bound to the exit that failed it")
+		}
+		if got := a.dialFailureCount(); got != 1 {
+			t.Errorf("A carries %d strikes, want the signal's 1", got)
+		}
+		harness.sleep(time.Second)
+		harness.syn(path)
+		if _, ok := harness.synAck(path); !ok || harness.boundTo(path) != harness.channel("b") {
+			t.Error("the next SYN did not complete on B")
+		}
+		// whether the signal beats the commit or follows it, the flow leaves
+		// the exit that failed it once, and counts once
+		if got := harness.metrics().FlowsReraced; got != 1 {
+			t.Errorf("FlowsReraced = %d, want 1, as when the commit comes first", got)
+		}
+	})
+}
+
+// RR-1. In a race of several exits, a candidate whose signal lands is taken
+// out of the race, with its strike, and the race goes on: the other candidate
+// answers and wins.
+func TestDialFailureRaceCandidateSignalLeavesTheRaceToTheOthers(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
+			{name: "b", tier: 0},
+		}, nil)
+		a, b := harness.channel("a"), harness.channel("b")
+		path := reraceFlow(4, 0, 47001)
+		// A's signal lands during its send; B answers once it has
+		signaled := make(chan struct{})
+		var signaledOnce sync.Once
+		signal := reraceSignalDuringSend(t, harness, a, path)
+		a.sendGroupForTest = func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+			defer signaledOnce.Do(func() { close(signaled) })
+			return signal(group, timeout, ack)
+		}
+		b.sendGroupForTest = reraceAnswerDuringSend(t, harness, b, reraceSynAck(path), signaled)
+		synCount, _, ok := harness.connect(path)
+		a.sendGroupForTest, b.sendGroupForTest = nil, nil
+		if !ok || synCount != 1 {
+			t.Fatalf("the connect completed on SYN %d (%t), want on the first", synCount, ok)
+		}
+		if harness.boundTo(path) != b {
+			t.Error("the flow is not on B")
+		}
+		if got := a.dialFailureCount(); got != 1 {
+			t.Errorf("A carries %d strikes, want 1", got)
+		}
+		if got := harness.metrics().FlowsReraced; got != 0 {
+			t.Errorf("FlowsReraced = %d, want 0: a race candidate's signal unbinds nothing", got)
+		}
+	})
+}
+
+// RR-1. A race whose every candidate signals is left empty and ends, so the
+// flow's next SYN starts a race of its own, which completes on another exit.
+func TestDialFailureWithdrawnRaceStartsAfresh(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
+			{name: "b", tier: 0, answer: reraceAlways(reraceSignal)},
+			{name: "c", tier: 1},
+			{name: "d", tier: 1},
+		}, nil)
+		a, b := harness.channel("a"), harness.channel("b")
+		path := reraceFlow(4, 0, 47002)
+		a.sendGroupForTest = reraceSignalDuringSend(t, harness, a, path)
+		b.sendGroupForTest = reraceSignalDuringSend(t, harness, b, path)
+		synCount, _, ok := harness.connect(path)
+		a.sendGroupForTest, b.sendGroupForTest = nil, nil
+		if !ok || synCount != 2 {
+			t.Fatalf("the connect completed on SYN %d (%t), want on the second", synCount, ok)
+		}
+		if bound := harness.boundTo(path); bound != harness.channel("c") && bound != harness.channel("d") {
+			t.Error("the flow is not on C or D")
+		}
+		for _, channel := range []*multiClientChannel{a, b} {
+			if got := channel.dialFailureCount(); got != 1 {
+				t.Errorf("an exit that failed the race carries %d strikes, want 1", got)
+			}
+		}
+	})
+}
+
+// RR-1. An emptied race ends rather than lingering for the next SYN: when that
+// SYN finds a single exit, it gets a race of one of its own, which commits on
+// the send, so that exit's signal before the commit counts as the re-race it
+// is, as for a race of one from the start.
+func TestDialFailureEmptiedRaceGivesTheNextSynARaceOfItsOwn(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
+			{name: "b", tier: 0, answer: reraceAlways(reraceSignal)},
+			{name: "c", tier: 1, answer: reraceAlways(reraceSignal)},
+		}, nil)
+		a, b, c := harness.channel("a"), harness.channel("b"), harness.channel("c")
+		path := reraceFlow(4, 0, 47003)
+		for _, channel := range []*multiClientChannel{a, b, c} {
+			channel.sendGroupForTest = reraceSignalDuringSend(t, harness, channel, path)
+		}
+		// the first SYN races A and B, which both fail it
+		harness.syn(path)
+		if got := harness.metrics().FlowsReraced; got != 0 {
+			t.Fatalf("FlowsReraced = %d after the race of two, want 0", got)
+		}
+		// the retransmit finds only C, which fails it before the commit
+		harness.sleep(time.Second)
+		harness.syn(path)
+		for _, channel := range []*multiClientChannel{a, b, c} {
+			channel.sendGroupForTest = nil
+		}
+		if got := harness.metrics().DialFailuresIntercepted; got != 3 {
+			t.Fatalf("setup: DialFailuresIntercepted = %d, want the three signals", got)
+		}
+		if got := harness.metrics().FlowsReraced; got != 1 {
+			t.Errorf("FlowsReraced = %d, want C's 1: its race of one was its own", got)
+		}
+		if harness.boundTo(path) != nil {
+			t.Error("the flow is bound to an exit that failed it")
+		}
+	})
+}
+
+// reraceSignalDuringSend is a send hook for an exit's channel: the exit's
+// provider fails the flow's dial at once, and its signal lands before the
+// send returns.
+func reraceSignalDuringSend(t *testing.T, harness *reraceHarness, channel *multiClientChannel, path *IpPath) func(*parsedPacketGroup, time.Duration, bool) (bool, error) {
+	t.Helper()
+	return reraceAnswerDuringSend(t, harness, channel, reraceProviderSignal(t, path), nil)
+}
+
+// reraceAnswerDuringSend is a send hook for an exit's channel: the exit's
+// provider answers the sent packet with answer before the send returns,
+// once after is closed when it is not nil.
+func reraceAnswerDuringSend(t *testing.T, harness *reraceHarness, channel *multiClientChannel, answer []byte, after <-chan struct{}) func(*parsedPacketGroup, time.Duration, bool) (bool, error) {
+	t.Helper()
+	var provider Id
+	for _, exit := range harness.generator.exitList() {
+		if exit.destination == channel.Destination() {
+			provider = exit.provider.ClientId()
+		}
+	}
+	if provider == (Id{}) {
+		t.Fatal("no provider behind the channel")
+	}
+	return func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+		if after != nil {
+			<-after
+		}
+		frame, err := ipPacketFromProviderFrame(answer, DefaultProtocolVersion)
+		if err != nil {
+			t.Errorf("answer frame: %s", err)
+		} else {
+			channel.clientReceive(SourceId(provider), []*protocol.Frame{frame}, Peer{})
+		}
+		for packetIndex := range group.packets {
+			MessagePoolReturn(group.packets[packetIndex].packet)
+		}
+		return true, nil
+	}
+}
+
 // --- RR-2: established flows ---
 
 // RR-2. A flow that has received inbound data is never disturbed by a
@@ -1493,6 +1682,36 @@ func TestDialFailureStrikesOncePerFlowAndExit(t *testing.T) {
 				t.Errorf("FlowsReraced=%d DialFailuresIntercepted=%d, want 1 and one per SYN (%d)", metrics.FlowsReraced, metrics.DialFailuresIntercepted, syns)
 			}
 		})
+	})
+}
+
+// RR-6. An exit strikes each connect attempt of a flow once: a SYN with a new
+// sequence on the same 5-tuple starts a new attempt, which the exit that
+// failed the old one may serve, and strike, again.
+func TestDialFailureNewSynGenerationStrikesAgain(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
+		}, nil)
+		a := harness.channel("a")
+		path := reraceFlow(4, 1, 46003)
+		harness.syn(path)
+		harness.sleep(time.Second)
+		harness.syn(path)
+		if got := a.dialFailureCount(); got != 1 {
+			t.Fatalf("A carries %d strikes after two SYNs of one attempt, want 1", got)
+		}
+		reconnect := *path
+		reconnect.SequenceNumber += 1000
+		harness.sleep(time.Second)
+		harness.syn(&reconnect)
+		if got := len(harness.exit("a").syns(path)); got != 3 {
+			t.Fatalf("A received %d SYNs, want 3", got)
+		}
+		if got := a.dialFailureCount(); got != 2 {
+			t.Errorf("A carries %d strikes after a second connect attempt on the 5-tuple, want 2", got)
+		}
 	})
 }
 

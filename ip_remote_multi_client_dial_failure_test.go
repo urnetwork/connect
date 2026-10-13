@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -219,6 +220,30 @@ func TestDialFailureReraceOffForwards(t *testing.T) {
 		if want, _ := ipOosUnreachable(egress); !bytes.Equal(fwd.Packet, want) {
 			t.Errorf("%s: forwarded %x, want %x", label, fwd.Packet, want)
 		}
+	}
+}
+
+// Removing an exit drops it from every flow's record of the exits that
+// failed it, whatever the flow is bound to, so a flow that outlives the exit
+// does not keep the removed channel reachable.
+func TestRemoveClientDropsTheExitFromFailureRecords(t *testing.T) {
+	settings := DefaultMultiClientSettings()
+	live := rebindTestCandidate(settings)
+	parent, dying, _, _ := rebindTestParent(t, false, nil)
+	moved := rebindTestFlow(parent, live, rebindTcpPath(20, 41000), false)
+	unbound := rebindTestFlow(parent, live, rebindTcpPath(21, 41001), false)
+	unbound.client.Store(nil)
+	other := rebindTestCandidate(settings)
+	moved.dialFailedClients = []*multiClientChannel{dying, other}
+	unbound.dialFailedClients = []*multiClientChannel{dying}
+
+	parent.removeClient(dying)
+
+	if !slices.Equal(moved.dialFailedClients, []*multiClientChannel{other}) {
+		t.Errorf("a flow on another exit records %v, want only the live exit that failed it", moved.dialFailedClients)
+	}
+	if len(unbound.dialFailedClients) != 0 {
+		t.Errorf("an unbound flow still records %d exits after the removal", len(unbound.dialFailedClients))
 	}
 }
 
