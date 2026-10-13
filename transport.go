@@ -434,7 +434,10 @@ func isBackendDegraded() bool {
 	if consecutiveBackendFails.Load() < backendDegradedFailThreshold {
 		return false
 	}
-	return backendFailRecent(time.Now().UnixNano(), lastBackendFailNano.Load())
+	// the stamp before the clock: a failure stamped between the two reads
+	// would otherwise read as after now
+	last := lastBackendFailNano.Load()
+	return backendFailRecent(time.Now().UnixNano(), last)
 }
 
 // backendFailRecent reports whether a failure stamped lastNanos is within
@@ -465,11 +468,13 @@ var backendFailMu sync.Mutex
 // "consecutive failures within the window", so a gap that invalidates the
 // streak for isBackendDegraded must also reset it here.
 func noteBackendFailure() {
-	now := time.Now().UnixNano()
-
 	backendFailMu.Lock()
 	defer backendFailMu.Unlock()
 
+	// the clock under the lock: concurrent failures then stamp in the order
+	// they record, so none finds the stamp before it after its now and
+	// restarts the streak
+	now := time.Now().UnixNano()
 	last := lastBackendFailNano.Load()
 	if last != 0 && !backendFailRecent(now, last) {
 		consecutiveBackendFails.Store(1)

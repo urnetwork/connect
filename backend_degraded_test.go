@@ -259,24 +259,31 @@ func TestBackendDegraded_ConcurrentSuccessAndFailureNeverLeaveInvalidState(t *te
 }
 
 func TestBackendDegraded_ConcurrentFailuresReachThreshold(t *testing.T) {
-	resetBackendDegraded()
 	defer resetBackendDegraded()
 
-	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			noteBackendFailure()
-		}()
-	}
-	wg.Wait()
+	// rounds, because one round of a lost increment is a scheduling accident
+	// that a single pass can miss: a failure that read the clock before
+	// waiting for the lock found the stamp of the one that overtook it after
+	// its now, and restarted the streak
+	for round := 0; round < 50; round++ {
+		resetBackendDegraded()
 
-	if got := consecutiveBackendFails.Load(); got != 32 {
-		t.Fatalf("consecutive failures = %d after 32 concurrent failures, want 32", got)
-	}
-	if !isBackendDegraded() {
-		t.Fatal("not degraded after 32 concurrent failures")
+		var wg sync.WaitGroup
+		for i := 0; i < 32; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				noteBackendFailure()
+			}()
+		}
+		wg.Wait()
+
+		if got := consecutiveBackendFails.Load(); got != 32 {
+			t.Fatalf("round %d: consecutive failures = %d after 32 concurrent failures, want 32", round, got)
+		}
+		if !isBackendDegraded() {
+			t.Fatalf("round %d: not degraded after 32 concurrent failures", round)
+		}
 	}
 }
 
