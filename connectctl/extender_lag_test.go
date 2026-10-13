@@ -21,7 +21,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -342,11 +341,10 @@ func startTestMeasurementExtender(
 		}
 		return (&net.Dialer{}).DialContext(ctx, "tcp", operatorAddress)
 	}
-	options.configureNetworkClient = func(settings *connect.ExtenderNetworkClientSettings) {
-		settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
-			return nil, nil
-		}
-	}
+	// the udp carrier dials send to loopback only, and the dns bootstrap stays
+	// in the process, as in the extender command's own fixture
+	options.packetConnFactory = testLoopbackPacketConn
+	options.configureNetworkClient = testHermeticNetworkClient
 	// a read once the request has landed, and soon after on a backoff
 	options.configureLagLifecycle = func(settings *extender.ExtenderLagLifecycleSettings) {
 		settings.CertOfferPollTimeout = 20 * time.Millisecond
