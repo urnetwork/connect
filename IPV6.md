@@ -131,10 +131,13 @@ A10. Verification attribution per family (2026-10-13). A provider's pinned
 transports each feed their observed address to the server's verify egress
 index. While that index allowed one live egress per provider, a provider with
 both pinned transports connected was neither eligible for validator trails
-nor resolvable from either address. The index now holds one live egress per
-family per provider, an IPv6 egress being its /64 (server verify egress index
-v4, sn VALIDATOR.md §8.2), and that change is a prerequisite for enabling
-pinned transports (A2 to A4).
+nor resolvable from either address. The index (server verify egress index
+v4, sn VALIDATOR.md §8.1, §8.2) now holds one live egress per family per
+provider: an IPv4 address, or an IPv6 /64. It indexes exact addresses in both
+families, and each IPv6 address also under its /64. A source resolves by its
+exact address first; an IPv6 source falls back to its /64 only when no client
+holds the address and exactly one client holds the /64. That change is a
+prerequisite for enabling pinned transports (A2 to A4).
 
 ### B. Discovery and routing
 
@@ -258,19 +261,27 @@ keeps its hop's family, except after the server's retryable answer: until
 pinned per-family transports (A2 to A4), a dual-stack provider's one
 transport has only the family it landed on indexed, a hop that lands on the
 other family resolves to no provider, and the server answers it HTTP 421
-`source-egress-unresolved`, at most twice per step. The step then resends
-the identical body through the same hop pinned to the other family, never
-returning to one a 421 ruled out, within its deadline (sn VALIDATOR.md
-§8.2). Alternating per request, as first built, tied the family to the
-depth: at an even depth every SEED was IPv4-first, and at a depth of 8 the
-recorded hops split 4:3. The first family's address starts first; a ready
-answer of the other family waits at most `DefaultDialFallbackDelay` for the
-first family's answer. The other family starts one fallback delay after the
-first, or at once when the first fails or has no address, all inside the
-dial's existing deadlines. A narrowed network, an IPv4-only tun and an IP
-literal keep their family. Every other tun keeps C6 unchanged
-(`DialFirstIpFamily` 0). The provider's egress is untouched: it dials the
-literal the validator chose.
+`source-egress-unresolved`, at most twice per step. A source that resolves
+to another provider than the pending one, a co-located provider's address
+behind one NAT or in one /64, gets the same capped answer before the step
+fails as a mismatch. A SEED gets it only under a registered validator key;
+any other SEED is poisoned whatever its source resolves to. The step then
+resends the identical body through the same hop pinned to the other family,
+never returning to one a 421 ruled out, within its deadline (sn VALIDATOR.md
+§8.2). The validator times the resend alone, and with the server setting
+`hop_latency_from_attributed_attempt` on the server does too: it records the
+step's last 421 as the confirmed hop's `assigned_ms`, never past its
+`confirmed_ms`, which sn's receipt census accepts while still counting the
+assignment at its own time. Alternating per request, as first built, tied
+the family to the depth: at an even depth every SEED was IPv4-first, and at
+a depth of 8 the recorded hops split 4:3. The first family's address starts
+first; a ready answer of the other family waits at most
+`DefaultDialFallbackDelay` for the first family's answer. The other family
+starts one fallback delay after the first, or at once when the first fails
+or has no address, all inside the dial's existing deadlines. A narrowed
+network, an IPv4-only tun and an IP literal keep their family. Every other
+tun keeps C6 unchanged (`DialFirstIpFamily` 0). The provider's egress is
+untouched: it dials the literal the validator chose.
 
 A provider whose TCP dial fails at once (no route, unreachable, out of
 sockets, its own upstream refusing) answers the SYN with an ICMP
@@ -320,9 +331,14 @@ the flow's SYN sequence: the provider's signal embeds sequence zero, and a
 kernel drops an ICMP error whose embedded sequence is outside its send
 window. Rollout order: the server's API and taskworker first (they read both
 verify egress index versions), then its connect service (which writes the
-per-family index, A10), then validators, so an alternating validator's IPv6
-hop through a dual-stack provider is attributed when it arrives. Providers
-and clients gain the dial-failure signal as they upgrade, in any order.
+per-family index, A10), then validators, which handle the retryable answer,
+so an alternating validator's IPv6 hop through a dual-stack provider is
+attributed when it arrives. `hop_latency_from_attributed_attempt` goes on
+only after every validator, third-party ones included, runs the receipt
+check that accepts the moved `assigned_ms`. Rollback: that setting off
+first, then the connect service, so the writers return to the old index
+while the readers still read it, then the API and taskworker. Providers and
+clients gain the dial-failure signal as they upgrade, in any order.
 
 ### D. SDK, apps, tests
 
