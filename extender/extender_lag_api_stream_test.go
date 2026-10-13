@@ -97,12 +97,19 @@ type lagTestUpload struct {
 
 func (self *lagApiFixture) openUpload(session *lagApiSession, streamIndex int) *lagTestUpload {
 	self.t.Helper()
+	// one frame per message, as a browser sends it
+	return self.openUploadWithWriteBuffer(session, streamIndex, lagApiBufferByteCount+16)
+}
+
+// An upload stream whose messages go out in frames of at most
+// writeBufferSize, so one message can arrive in parts over time.
+func (self *lagApiFixture) openUploadWithWriteBuffer(session *lagApiSession, streamIndex int, writeBufferSize int) *lagTestUpload {
+	self.t.Helper()
 	dialer := &websocket.Dialer{
 		NetDialContext:   self.dialContext,
 		TLSClientConfig:  self.httpClient().Transport.(*http.Transport).TLSClientConfig.Clone(),
 		HandshakeTimeout: 5 * time.Second,
-		// one frame per message, as a browser sends it
-		WriteBufferSize: lagApiBufferByteCount + 16,
+		WriteBufferSize:  writeBufferSize,
 	}
 	dialer.TLSClientConfig.ServerName = testLagName
 	header := http.Header{}
@@ -303,6 +310,153 @@ func TestLagApiUploadExact(t *testing.T) {
 		if phase.total() != expected {
 			t.Errorf("%s: counted %d, expected %d", name, phase.total(), expected)
 		}
+	}
+}
+
+// A message that arrives in parts of partSize bytes, then ends.
+type testLagPartReader struct {
+	partSize  int
+	remaining int
+}
+
+func (self *testLagPartReader) Read(buffer []byte) (int, error) {
+	if self.remaining <= 0 {
+		return 0, io.EOF
+	}
+	n := min(self.partSize, self.remaining, len(buffer))
+	self.remaining -= n
+	return n, nil
+}
+
+// M8: an upload message's parts count in the interval they arrived in. A
+// 64 KiB message that straddles an interval boundary is split across the two
+// intervals by its parts' arrival, rather than counted whole where it ends;
+// a part on the far side of the window's end is a run of its own, which the
+// phase does not count; and a message never holds more runs than its fixed
+// size (M7).
+func TestLagApiUploadRunsSplitByArrival(t *testing.T) {
+	startTime := time.Unix(1_700_000_000, 0)
+	at := func(offsets ...time.Duration) func() time.Time {
+		i := 0
+		return func() time.Time {
+			now := startTime.Add(offsets[min(i, len(offsets)-1)])
+			i += 1
+			return now
+		}
+	}
+	buffer := make([]byte, lagApiBufferByteCount)
+	runs := &lagApiRuns{}
+
+	// four 16 KiB parts, two either side of the 250 ms boundary
+	series := newLagApiSeries(startTime, lagApiInterval, 5*time.Second)
+	endTime := startTime.Add(5 * time.Second)
+	byteCount, err := lagApiReadMessage(
+		&testLagPartReader{partSize: 16 * 1024, remaining: 65536},
+		buffer,
+		series,
+		endTime,
+		at(200*time.Millisecond, 240*time.Millisecond, 260*time.Millisecond, 300*time.Millisecond),
+		runs,
+	)
+	if err != nil || byteCount != 65536 {
+		t.Fatalf("read %d: %v", byteCount, err)
+	}
+	if runs.count != 2 || runs.runs[0].byteCount != 32768 || runs.runs[1].byteCount != 32768 {
+		t.Fatalf("runs %+v", runs.runs[:runs.count])
+	}
+	for _, run := range runs.runs[:runs.count] {
+		series.add(run.time, run.byteCount)
+	}
+	if values := series.values(); len(values) != 2 || values[0] != 32768 || values[1] != 32768 {
+		t.Errorf("series %v, expected the message split 32768 and 32768", values)
+	}
+
+	// a window ending mid-interval: the part after its end is a run of its own
+	endTime = startTime.Add(4900 * time.Millisecond)
+	byteCount, err = lagApiReadMessage(
+		&testLagPartReader{partSize: 32 * 1024, remaining: 65536},
+		buffer,
+		series,
+		endTime,
+		at(4850*time.Millisecond, 4950*time.Millisecond),
+		runs,
+	)
+	if err != nil || byteCount != 65536 {
+		t.Fatalf("read %d: %v", byteCount, err)
+	}
+	if runs.count != 2 || !runs.runs[0].time.Before(endTime) || runs.runs[1].time.Before(endTime) {
+		t.Errorf("runs %+v, expected one each side of the window's end", runs.runs[:runs.count])
+	}
+
+	// a message slow enough to span more intervals than a message holds runs:
+	// the rest join its last run, and nothing is lost
+	offsets := []time.Duration{}
+	for i := 0; i < 64; i += 1 {
+		offsets = append(offsets, time.Duration(i)*lagApiInterval)
+	}
+	byteCount, err = lagApiReadMessage(
+		&testLagPartReader{partSize: 1024, remaining: 65536},
+		buffer,
+		series,
+		startTime.Add(time.Hour),
+		at(offsets...),
+		runs,
+	)
+	if err != nil || byteCount != 65536 {
+		t.Fatalf("read %d: %v", byteCount, err)
+	}
+	if runs.count != lagApiMaxRunCount || runs.byteCount() != 65536 {
+		t.Errorf("%d runs of %d bytes", runs.count, runs.byteCount())
+	}
+}
+
+// M8, through a stream: one 64 KiB message sent slowly, in frames over about a
+// second, as a slow uplink delivers it, is counted across the intervals its
+// parts arrived in -- not whole in the one interval where it ended, which read
+// as steps of 64 KiB per interval, 2.1 Mbps -- and still in full once checked.
+// Exact and sampled checking count the same way.
+func TestLagApiUploadCountsBytesWhereTheyArrive(t *testing.T) {
+	for _, exact := range []bool{true, false} {
+		fixture := newLagApiFixture(t, nil)
+		fixture.api.exactVerification = exact
+		session := fixture.directSession(1)
+		phase := fixture.directPhase(session, lagApiDirectionUpload, 5*time.Second, 1<<30)
+		upload := fixture.openUploadWithWriteBuffer(session, 0, 4096)
+		message := testLagUploadMessages(t, session.uploadKey, 0, lagApiBufferByteCount)[0]
+
+		writer, err := upload.conn.NextWriter(websocket.BinaryMessage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 8; i += 1 {
+			if _, err := writer.Write(message[i*8192 : (i+1)*8192]); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(150 * time.Millisecond)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool {
+			return phase.total() == lagApiBufferByteCount
+		})
+		values := phase.seriesValues()
+		counted := 0
+		for _, value := range values {
+			if value == lagApiBufferByteCount {
+				t.Errorf("exact %t: the message was counted whole in one interval: %v", exact, values)
+			}
+			if 0 < value {
+				counted += 1
+			}
+		}
+		if counted < 3 {
+			t.Errorf("exact %t: counted in %d intervals, expected the parts spread over at least 3: %v", exact, counted, values)
+		}
+		if _, _, end := phase.state(); end != lagApiPhaseRunning {
+			t.Errorf("exact %t: ended %d", exact, end)
+		}
+		upload.close()
 	}
 }
 

@@ -41,6 +41,10 @@ const lagApiBufferByteCount = 64 * 1024
 // direction.
 const lagApiMaxIntervalCount = 40
 
+// The most runs one upload message is split into by arrival: one per interval
+// of the series, and one each side of the window's end to spare (M6, M7).
+const lagApiMaxRunCount = lagApiMaxIntervalCount + 2
+
 // How long past a download window a write already under way may take to
 // finish, counted where it finishes. Nothing starts in it.
 const lagApiPhaseGrace = 2 * time.Second
@@ -406,19 +410,38 @@ func (self *lagApiPhase) count(now time.Time, byteCount int) {
 	}
 }
 
-// Takes bytes an upload message brought from the ticket's cap and the daily
-// budget, and counts them into their interval when they arrived inside the
-// window (M6). They are counted only while the phase runs, under its lock, so
+// Takes bytes an upload message brought, all of them arriving at now, as one
+// run (see receiveRuns).
+func (self *lagApiPhase) receive(now time.Time, byteCount int) {
+	runs := &lagApiRuns{}
+	runs.reset()
+	runs.add(nil, time.Time{}, now, byteCount)
+	self.receiveRuns(now, runs, byteCount)
+}
+
+// Takes the bytes of a verified upload message from the ticket's cap and the
+// daily budget, and counts each run of them into the interval it arrived in,
+// when it arrived inside the window (M6, M8). So a message that spans
+// intervals is split across them by arrival, rather than counted whole in the
+// interval it ended in, which on a slow uplink read as steps of one message
+// per interval. Runs are counted only while the phase runs, under its lock, so
 // nothing is added once it has ended: the total the browser is then told is
 // the total the report holds. The bytes are already here, so they draw on the
 // cap and the budget either way; past either the phase ends as capped.
-func (self *lagApiPhase) receive(now time.Time, byteCount int) {
+func (self *lagApiPhase) receiveRuns(now time.Time, runs *lagApiRuns, byteCount int) {
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		if self.end == lagApiPhaseRunning && now.Before(self.endTime) {
-			if series := self.series.Load(); series != nil {
-				series.add(now, byteCount)
+		if self.end != lagApiPhaseRunning {
+			return
+		}
+		series := self.series.Load()
+		if series == nil {
+			return
+		}
+		for _, run := range runs.runs[:runs.count] {
+			if run.time.Before(self.endTime) {
+				series.add(run.time, run.byteCount)
 			}
 		}
 	}()
@@ -428,6 +451,58 @@ func (self *lagApiPhase) receive(now time.Time, byteCount int) {
 	if self.api.budget.take(now, int64(byteCount)) < int64(byteCount) {
 		self.finish(lagApiPhaseEndCap)
 	}
+}
+
+// One run of an upload message's bytes: those that arrived in one interval of
+// the window, on one side of its end, and when the first of them arrived.
+type lagApiRun struct {
+	time      time.Time
+	byteCount int
+}
+
+// The bytes of one upload message by when they arrived (M6, M8). Its size is
+// fixed, so a stream holds no more for a slow message than a fast one (M7); a
+// message that spans more intervals than it holds adds the rest to its last
+// run, which already lies past every interval a series counts.
+type lagApiRuns struct {
+	runs  [lagApiMaxRunCount]lagApiRun
+	count int
+}
+
+func (self *lagApiRuns) reset() {
+	self.count = 0
+}
+
+// Adds byteCount bytes that arrived at arrivedTime, joining the last run when
+// they arrived in the same interval of series and on the same side of
+// endTime. With no series every part joins one run.
+func (self *lagApiRuns) add(series *lagApiSeries, endTime time.Time, arrivedTime time.Time, byteCount int) {
+	if byteCount <= 0 {
+		return
+	}
+	if 0 < self.count {
+		last := &self.runs[self.count-1]
+		sameRun := series == nil || (series.index(last.time) == series.index(arrivedTime) &&
+			last.time.Before(endTime) == arrivedTime.Before(endTime))
+		if sameRun || self.count == len(self.runs) {
+			last.byteCount += byteCount
+			return
+		}
+	}
+	self.runs[self.count] = lagApiRun{
+		time:      arrivedTime,
+		byteCount: byteCount,
+	}
+	self.count += 1
+}
+
+// The bytes of all runs.
+func (self *lagApiRuns) byteCount() int {
+	byteCount := 0
+	for _, run := range self.runs[:self.count] {
+		byteCount += run.byteCount
+	}
+	return byteCount
 }
 
 // Bytes per interval from a window's first byte (M8). Sized once and bounded
@@ -450,12 +525,16 @@ func newLagApiSeries(startTime time.Time, interval time.Duration, duration time.
 	}
 }
 
+// The interval of the window that now falls in, from 0 at the first byte.
+func (self *lagApiSeries) index(now time.Time) int {
+	return int(max(0, now.Sub(self.startTime)) / self.interval)
+}
+
 func (self *lagApiSeries) add(now time.Time, byteCount int) {
 	if byteCount <= 0 {
 		return
 	}
-	elapsed := max(0, now.Sub(self.startTime))
-	index := int(elapsed / self.interval)
+	index := self.index(now)
 	if len(self.counts) <= index {
 		return
 	}
@@ -689,9 +768,10 @@ func (self *extenderLagApi) serveUp(w http.ResponseWriter, r *http.Request, orig
 // message is compared with the keystream regenerated at its offset; without, a
 // random 1 in 16, chosen after it arrives. A mismatch, a text message or a
 // message after a short one ends the phase as a mismatch, which ends the load.
-// The first message opens the window, and only bytes inside it are counted.
-// When the phase ends the stream is closed -- 1000, or 4400 for a mismatch --
-// and drained until the browser's own close.
+// The first message opens the window, and only bytes inside it are counted:
+// each part of a message in the interval it arrived in, once the whole message
+// has passed its check (M8). When the phase ends the stream is closed -- 1000,
+// or 4400 for a mismatch -- and drained until the browser's own close.
 func (self *extenderLagApi) readUpload(
 	conn *websocket.Conn,
 	uploadKey [16]byte,
@@ -725,9 +805,11 @@ func (self *extenderLagApi) readUpload(
 		}
 	}()
 
-	// one data buffer and one keystream buffer for the stream's life (M7)
+	// one data buffer, one keystream buffer and one message's runs for the
+	// stream's life (M7)
 	data := make([]byte, lagApiBufferByteCount)
 	keystream := make([]byte, lagApiBufferByteCount)
+	runs := &lagApiRuns{}
 	exact := self.exactVerification
 	var running cipher.Stream
 	if exact {
@@ -742,7 +824,8 @@ func (self *extenderLagApi) readUpload(
 			// the browser's close, the drain's deadline, or a broken connection
 			return
 		}
-		if _, ok := phase.window(time.Now()); !ok {
+		endTime, ok := phase.window(time.Now())
+		if !ok {
 			// past the window: drained, not counted
 			continue
 		}
@@ -750,13 +833,12 @@ func (self *extenderLagApi) readUpload(
 			phase.finish(lagApiPhaseEndMismatch)
 			continue
 		}
-		byteCount, err := lagApiReadMessage(reader, data)
+		byteCount, err := lagApiReadMessage(reader, data, phase.series.Load(), endTime, time.Now, runs)
 		if err != nil {
 			return
 		}
 		// only the last message may be shorter
 		short = byteCount < len(data)
-		receivedTime := time.Now()
 
 		if exact || self.sampleMessage() {
 			stream := running
@@ -771,17 +853,31 @@ func (self *extenderLagApi) readUpload(
 			}
 		}
 		offset += uint64(byteCount)
-		phase.receive(receivedTime, byteCount)
+		phase.receiveRuns(time.Now(), runs, byteCount)
 	}
 }
 
-// Reads one message into buffer (M6). A full buffer is the whole message,
-// since the read limit refuses a longer one before its bytes arrive.
-func lagApiReadMessage(reader io.Reader, buffer []byte) (int, error) {
+// Reads one message into buffer (M6), noting into runs when each part arrived,
+// by the interval of series it arrived in and the side of endTime (M8). A
+// read returns what the connection has delivered, so a part's time is its
+// arrival, to within a TLS record. A full buffer is the whole message, since
+// the read limit refuses a longer one before its bytes arrive.
+func lagApiReadMessage(
+	reader io.Reader,
+	buffer []byte,
+	series *lagApiSeries,
+	endTime time.Time,
+	now func() time.Time,
+	runs *lagApiRuns,
+) (int, error) {
+	runs.reset()
 	byteCount := 0
 	for byteCount < len(buffer) {
 		n, err := reader.Read(buffer[byteCount:])
-		byteCount += n
+		if 0 < n {
+			runs.add(series, endTime, now(), n)
+			byteCount += n
+		}
 		if err == io.EOF {
 			return byteCount, nil
 		}
