@@ -149,6 +149,10 @@ func newLagApiFixture(t *testing.T, configure func(settings *ExtenderLagSettings
 	settings := DefaultExtenderSettings()
 	settings.IdentityKeySeed = seed
 	settings.HeaderTimeout = 5 * time.Second
+	// every client of a test is one loopback subnet, which the per-subnet
+	// action limit would count as one flooding client; the per-subnet tests
+	// set their own (A12)
+	settings.AdmissionActionsPerSubnetPerMinute = 0
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture.server = NewExtenderServer(ctx, nil, nil, nil, &net.Dialer{}, settings)
 
@@ -1451,14 +1455,14 @@ func TestLagApiNoBudgetByDefault(t *testing.T) {
 	if fixture.api.budget.exhausted(now) {
 		t.Error("exhausted with no budget")
 	}
-	if code, _ := fixture.api.beginLoad(now); code != "" {
+	session := fixture.directSession(1)
+	if code, _ := fixture.api.beginLoad(now, session); code != "" {
 		t.Errorf("refused as %s", code)
 	} else {
-		fixture.api.endLoad()
+		fixture.api.endLoad(session)
 	}
 
 	// neither direction is cut for its bytes
-	session := fixture.directSession(1)
 	download := fixture.directPhase(session, lagApiDirectionDownload, time.Minute, 1<<62)
 	if granted := download.reserve(now, lagApiBufferByteCount); granted != lagApiBufferByteCount {
 		t.Errorf("reserved %d", granted)

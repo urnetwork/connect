@@ -77,6 +77,13 @@ const lagApiMaxHeaderByteCount = 16 * 1024
 // later load, so an idle one is only a slot held (M2).
 const lagApiIdleTimeout = 5 * time.Second
 
+// The most sessions one source subnet holds open at once, and the most loads
+// it runs at once (M3).
+const (
+	lagApiMaxSessionsPerSubnet = 16
+	lagApiMaxLoadsPerSubnet    = 1
+)
+
 // The most measurement connections one source subnet holds at once: its 16
 // sessions (M3), one load's streams each way, and a few left idle or opened
 // again after a refusal. It keeps one subnet from pinning the connection slots
@@ -232,6 +239,12 @@ type extenderLagApi struct {
 	// most it may; tests lower the bound
 	subnetConnectionCounts  map[extenderSubnetHash]int
 	maxConnectionsPerSubnet int
+	// the sessions and loads each source subnet holds now (M3), and the most
+	// it may
+	subnetSessionCounts  map[extenderSubnetHash]int
+	subnetLoadCounts     map[extenderSubnetHash]int
+	maxSessionsPerSubnet int
+	maxLoadsPerSubnet    int
 }
 
 // Builds the measurement API of a server (M10), the API side's one wiring
@@ -297,6 +310,10 @@ func newExtenderLagApi(
 
 		subnetConnectionCounts:  map[extenderSubnetHash]int{},
 		maxConnectionsPerSubnet: lagApiMaxConnectionsPerSubnet,
+		subnetSessionCounts:     map[extenderSubnetHash]int{},
+		subnetLoadCounts:        map[extenderSubnetHash]int{},
+		maxSessionsPerSubnet:    lagApiMaxSessionsPerSubnet,
+		maxLoadsPerSubnet:       lagApiMaxLoadsPerSubnet,
 	}
 	defaultSettings := DefaultExtenderLagSettings()
 	if self.settings.MaxSessions <= 0 {

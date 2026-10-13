@@ -348,8 +348,12 @@ type lagApiSession struct {
 	ticketExpire  time.Time
 	trackId       []byte
 	trackPosition uint32
-	// the browser's address on the control connection (M8)
-	clientIp []byte
+	// the browser's address on the control connection (M8), and its
+	// admission subnet when the per-subnet limits apply to it (M3)
+	clientIp      []byte
+	remoteAddress string
+	subnet        extenderSubnetHash
+	subnetLimited bool
 
 	pingInterval     time.Duration
 	downloadDuration time.Duration
@@ -457,6 +461,13 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 		self.refuseSession(conn, lagApiErrorOrigin)
 		return
 	}
+	// an admission is one action of its subnet (M3, A12), counted before the
+	// ticket is so much as read
+	if limit, _ := self.server.admitAction(r.RemoteAddr, false); limit != extenderAdmitted {
+		self.server.reportError(extenderAdmissionStage(limit), fmt.Errorf("the source is over its admission limit"))
+		self.refuseSession(conn, lagApiErrorSessions)
+		return
+	}
 	body, err := self.verifyTicket(r.URL.Query().Get("ticket"), time.Now())
 	if err != nil {
 		self.server.reportError("lag ticket", err)
@@ -476,6 +487,8 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	session.serverName = r.TLS.ServerName
+	session.remoteAddress = r.RemoteAddr
+	session.subnet, session.subnetLimited = self.subnetOf(r.RemoteAddr)
 	if code := self.admitSession(session); code != "" {
 		// a refused admission releases what it built, the session's context
 		// above all, so refusals cannot accumulate (M3)
@@ -578,11 +591,18 @@ func (self *extenderLagApi) admitSession(session *lagApiSession) string {
 	if self.settings.MaxSessions <= len(self.sessions) {
 		return lagApiErrorSessions
 	}
+	if session.subnetLimited && 0 < self.maxSessionsPerSubnet &&
+		self.maxSessionsPerSubnet <= self.subnetSessionCounts[session.subnet] {
+		return lagApiErrorSessions
+	}
 	self.usedTickets[ticketId] = self.usedTicketOrder.PushBack(&lagApiUsedTicket{
 		ticketId:   ticketId,
 		expireTime: session.ticketExpire,
 	})
 	self.sessions[session.id] = session
+	if session.subnetLimited {
+		self.subnetSessionCounts[session.subnet] += 1
+	}
 	close(self.sessionAdmitted)
 	self.sessionAdmitted = make(chan struct{})
 	return ""
@@ -597,8 +617,21 @@ type lagApiUsedTicket struct {
 func (self *extenderLagApi) removeSession(session *lagApiSession) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if self.sessions[session.id] == session {
-		delete(self.sessions, session.id)
+	if self.sessions[session.id] != session {
+		return
+	}
+	delete(self.sessions, session.id)
+	if session.subnetLimited {
+		lagApiReleaseSubnetCount(self.subnetSessionCounts, session.subnet)
+	}
+}
+
+// Releases one of a subnet's counted sessions or loads.
+func lagApiReleaseSubnetCount(counts map[extenderSubnetHash]int, subnet extenderSubnetHash) {
+	if count := counts[subnet] - 1; 0 < count {
+		counts[subnet] = count
+	} else {
+		delete(counts, subnet)
 	}
 }
 
@@ -609,26 +642,41 @@ func (self *extenderLagApi) session(sessionId lagApiSessionId) *lagApiSession {
 	return self.sessions[sessionId]
 }
 
-// Admits a load (M3): refused as budget when today's budget is spent, and as
-// busy when concurrent_loads are running, each with how long to wait. Returns
-// "" when admitted; the caller then ends it with endLoad.
-func (self *extenderLagApi) beginLoad(now time.Time) (string, time.Duration) {
+// Admits a session's load (M3): refused as budget when today's budget is
+// spent, and as busy when the session's subnet is over its admission limit,
+// already runs its load, or concurrent_loads are running, each with how long
+// to wait. A load is one action of its subnet (A12). Returns "" when
+// admitted; the caller then ends it with endLoad.
+func (self *extenderLagApi) beginLoad(now time.Time, session *lagApiSession) (string, time.Duration) {
 	if self.budget.exhausted(now) {
 		return lagApiErrorBudget, self.budget.renewTime(now).Sub(now)
+	}
+	if limit, retryAfter := self.server.admitAction(session.remoteAddress, false); limit != extenderAdmitted {
+		return lagApiErrorBusy, retryAfter
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if self.settings.ConcurrentLoads <= self.loadCount {
 		return lagApiErrorBusy, self.timings.busyRetryAfter
 	}
+	if session.subnetLimited && 0 < self.maxLoadsPerSubnet &&
+		self.maxLoadsPerSubnet <= self.subnetLoadCounts[session.subnet] {
+		return lagApiErrorBusy, self.timings.busyRetryAfter
+	}
 	self.loadCount += 1
+	if session.subnetLimited {
+		self.subnetLoadCounts[session.subnet] += 1
+	}
 	return "", 0
 }
 
-func (self *extenderLagApi) endLoad() {
+func (self *extenderLagApi) endLoad(session *lagApiSession) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.loadCount -= 1
+	if session.subnetLimited {
+		lagApiReleaseSubnetCount(self.subnetLoadCounts, session.subnet)
+	}
 }
 
 // Serves an admitted session until the browser closes it or the extender ends
@@ -919,7 +967,7 @@ func (self *lagApiSession) run() {
 		if load.upload != nil {
 			load.upload.finish(lagApiPhaseEndClosed)
 		}
-		self.api.endLoad()
+		self.api.endLoad(self)
 		phaseWaitTimer.Stop()
 		phaseWaitC = nil
 		progressTimer.Stop()
@@ -1028,7 +1076,7 @@ func (self *lagApiSession) run() {
 				retryAfterMs := int64(0)
 				return self.write(&lagApiErrorMessage{Type: "error", Code: lagApiErrorBusy, RetryAfterMs: &retryAfterMs})
 			}
-			if code, retryAfter := self.api.beginLoad(now); code != "" {
+			if code, retryAfter := self.api.beginLoad(now, self); code != "" {
 				self.refused = true
 				retryAfterMs := retryAfter.Milliseconds()
 				return self.write(&lagApiErrorMessage{Type: "error", Code: code, RetryAfterMs: &retryAfterMs})
@@ -1253,7 +1301,7 @@ func (self *lagApiSession) finish() {
 			if load.upload != nil {
 				load.upload.finish(lagApiPhaseEndClosed)
 			}
-			self.api.endLoad()
+			self.api.endLoad(self)
 		}
 		load.ended = true
 	}

@@ -262,3 +262,71 @@ func TestLagApiRefusedAdmissionsGrowNothing(t *testing.T) {
 		t.Errorf("%d used tickets", usedCount)
 	}
 }
+
+// M3: one source subnet holds at most 16 open sessions and 1 load at a time,
+// and each admission and each load is one action under the extender's
+// per-subnet admission limit (A12).
+func TestLagApiPerSubnetLimits(t *testing.T) {
+	fixture := newLagApiFixture(t, nil)
+	if fixture.api.maxSessionsPerSubnet != 16 || fixture.api.maxLoadsPerSubnet != 1 {
+		t.Errorf("per subnet %d sessions, %d loads", fixture.api.maxSessionsPerSubnet, fixture.api.maxLoadsPerSubnet)
+	}
+
+	// 16 sessions, and the 17th is refused
+	sessions := []*lagTestSession{}
+	for i := 0; i < 16; i += 1 {
+		sessions = append(sessions, fixture.openHelloSession(fixture.ticket(nil)))
+	}
+	refused := fixture.openSession(fixture.ticket(nil), testLagOrigin)
+	if message := refused.next("error", 5*time.Second); message.Code != lagApiErrorSessions {
+		t.Errorf("17th session: %+v", message.raw)
+	}
+	if code, _ := refused.waitClosed(5 * time.Second); code != lagApiCloseCodeLimited {
+		t.Errorf("17th session closed %d", code)
+	}
+
+	// one load at a time, though the extender runs two
+	sessions[0].load("download")
+	waitFor(t, func() bool {
+		return fixture.api.loadCountNow() == 1
+	})
+	sessions[1].load("download")
+	if message := sessions[1].next("error", 5*time.Second); message.Code != lagApiErrorBusy ||
+		message.RetryAfterMs == nil || *message.RetryAfterMs != 5000 {
+		t.Errorf("second load of the subnet: %+v", message.raw)
+	}
+	// a session that closes frees its place
+	sessions[15].close()
+	fixture.nextReport(5 * time.Second)
+	fixture.openHelloSession(fixture.ticket(nil))
+}
+
+// M3, A12: each admission and each load is one action of its subnet: past the
+// subnet's actions a minute, a session is refused as sessions and a load as
+// busy, with the admission limit's wait.
+func TestLagApiPerSubnetActions(t *testing.T) {
+	fixture := newLagApiFixture(t, nil)
+	fixture.server.settings.AdmissionActionsPerSubnetPerMinute = 3
+	first := fixture.openHelloSession(fixture.ticket(nil))
+	second := fixture.openHelloSession(fixture.ticket(nil))
+	// the third action: a load
+	first.load("download")
+	waitFor(t, func() bool {
+		return fixture.api.loadCountNow() == 1
+	})
+	first.load("done")
+	if message := first.nextResult(5 * time.Second); message.Type != "loadResult" {
+		t.Fatalf("result %+v", message.raw)
+	}
+	// the fourth: refused, a load as busy with the admission's wait
+	second.load("download")
+	message := second.next("error", 5*time.Second)
+	if message.Code != lagApiErrorBusy || message.RetryAfterMs == nil || *message.RetryAfterMs < 15000 {
+		t.Errorf("load past the subnet's actions: %+v", message.raw)
+	}
+	// and a session as sessions
+	refused := fixture.openSession(fixture.ticket(nil), testLagOrigin)
+	if message := refused.next("error", 5*time.Second); message.Code != lagApiErrorSessions {
+		t.Errorf("session past the subnet's actions: %+v", message.raw)
+	}
+}
