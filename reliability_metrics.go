@@ -634,10 +634,11 @@ type ReliabilityMetricsSnapshot struct {
 	// at the moment of the snapshot.
 	RecoveryPending int
 
-	// DialFailuresIntercepted counts provider could-not-connect signals;
-	// FlowsReraced counts the flows quietly moved to another exit in
-	// response. These are the events the user never sees -- each one would
-	// previously have been a 3-63s syn-backoff hang.
+	// DialFailuresIntercepted counts the provider could-not-connect signals
+	// that arrived. FlowsReraced counts the flows quietly moved to another
+	// exit in response to a signal or to the silence inference, once per
+	// flow and exit that failed it. These are the events the user never
+	// sees -- each one would previously have been a 3-63s syn-backoff hang.
 	DialFailuresIntercepted uint64
 	FlowsReraced            uint64
 

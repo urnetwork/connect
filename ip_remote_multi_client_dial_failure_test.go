@@ -1,7 +1,9 @@
 package connect
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -65,7 +67,7 @@ func TestDialFailureMatchedUnbindsAndSwallows(t *testing.T) {
 		egress := icmpTcpTestPath(version)
 		parent, client, update, forwarded := dialFailureTestParent(t, true, egress)
 
-		parent.clientDialFailure(client, egress)
+		parent.clientDialFailureSignal(client, egress)
 
 		if update.client.Load() != nil {
 			t.Errorf("v%d: flow was not unbound; client is still %p", version, update.client.Load())
@@ -100,7 +102,7 @@ func TestDialFailureNoFlowIsUnmatched(t *testing.T) {
 	stray := icmpTcpTestPath(4)
 	stray.SourcePort = egress.SourcePort + 1
 
-	parent.clientDialFailure(client, stray)
+	parent.clientDialFailureSignal(client, stray)
 
 	if got := parent.reliabilityMetrics.dialFailures.Load(); got != 1 {
 		t.Errorf("dialFailuresIntercepted = %d, want 1 (counted even when unmatched)", got)
@@ -120,7 +122,7 @@ func TestDialFailureDifferentClientIsUnmatched(t *testing.T) {
 	parent, client, update, forwarded := dialFailureTestParent(t, true, egress)
 
 	other := &multiClientChannel{settings: DefaultMultiClientSettings()}
-	parent.clientDialFailure(other, egress)
+	parent.clientDialFailureSignal(other, egress)
 
 	if update.client.Load() != client {
 		t.Error("a signal from a non-owning client unbound the flow")
@@ -146,7 +148,7 @@ func TestDialFailureEstablishedFlowGuard(t *testing.T) {
 	// the flow already carried inbound data -- it is established
 	update.receivedInbound.Store(true)
 
-	parent.clientDialFailure(client, egress)
+	parent.clientDialFailureSignal(client, egress)
 
 	if update.client.Load() != client {
 		t.Error("an established flow (receivedInbound) was unbound by a dial-failure signal")
@@ -162,47 +164,60 @@ func TestDialFailureEstablishedFlowGuard(t *testing.T) {
 	}
 }
 
-// With the knob off, a matched failure is not swallowed: the flow stays bound
-// and the raw icmp is delivered to the app (visible but fast failure), using
-// the egress ipPath -- the same convention removeClient uses for teardown.
+// With the re-race off the signal is forwarded to the app, rebuilt over the
+// flow's own SYN sequence: the provider's signal embeds sequence 0, and a
+// kernel stack drops an icmp error whose embedded sequence is outside its
+// send window, so forwarding the provider's bytes would fail nothing. A udp
+// flow has no sequence and gets the provider's packet as built.
 func TestDialFailureReraceOffForwards(t *testing.T) {
-	for _, version := range []int{4, 6} {
-		egress := icmpTcpTestPath(version)
+	for _, egress := range []*IpPath{icmpTcpTestPath(4), icmpTcpTestPath(6), udpTestPath(4), udpTestPath(6)} {
+		label := fmt.Sprintf("%s v%d", egress.Protocol, egress.Version)
 		parent, client, update, forwarded := dialFailureTestParent(t, false, egress)
+		if egress.Protocol == IpProtocolTcp {
+			// the app's SYN opened the flow with egress's sequence
+			func() {
+				update.stateLock.Lock()
+				defer update.stateLock.Unlock()
+				update.resetSynGenerationWithLock(egress.SequenceNumber)
+			}()
+		}
+		// the provider names the flow by its 5-tuple, with sequence 0
+		signalPath := *egress
+		signalPath.SequenceNumber = 0
 
-		parent.clientDialFailure(client, egress)
+		parent.clientDialFailureSignal(client, &signalPath)
 
 		if update.client.Load() != client {
-			t.Errorf("v%d: rerace off must not unbind the flow", version)
+			t.Errorf("%s: rerace off must not unbind the flow", label)
 		}
 		if got := parent.reliabilityMetrics.flowsReraced.Load(); got != 0 {
-			t.Errorf("v%d: flowsReraced = %d, want 0 with rerace off", version, got)
+			t.Errorf("%s: flowsReraced = %d, want 0 with rerace off", label, got)
 		}
 		if got := parent.reliabilityMetrics.dialFailures.Load(); got != 1 {
-			t.Errorf("v%d: dialFailuresIntercepted = %d, want 1", version, got)
+			t.Errorf("%s: dialFailuresIntercepted = %d, want 1", label, got)
 		}
 		if len(*forwarded) != 1 {
-			t.Fatalf("v%d: forwarded %d packet(s), want exactly 1 (the icmp)", version, len(*forwarded))
+			t.Fatalf("%s: forwarded %d packet(s), want exactly 1 (the icmp)", label, len(*forwarded))
 		}
 		fwd := (*forwarded)[0]
 		// delivered with the egress-oriented ipPath, per the teardown convention
-		if fwd.IpPath != egress {
-			t.Errorf("v%d: forwarded with the wrong ipPath", version)
+		if fwd.IpPath != &signalPath {
+			t.Errorf("%s: forwarded with the wrong ipPath", label)
 		}
-		// and it is a real icmp unreachable naming exactly this flow
+		// and it is the provider's builder over the flow with its SYN's
+		// sequence, naming exactly this flow
 		parsed, ok := ipParseIcmpUnreachable(fwd.Packet)
 		if !ok {
-			t.Fatalf("v%d: forwarded packet is not a parseable icmp unreachable", version)
+			t.Fatalf("%s: forwarded packet is not a parseable icmp unreachable", label)
 		}
-		switch version {
-		case 4:
-			if parsed.ToIp4Path() != egress.ToIp4Path() {
-				t.Errorf("v4: forwarded icmp names the wrong flow")
-			}
-		case 6:
-			if parsed.ToIp6Path() != egress.ToIp6Path() {
-				t.Errorf("v6: forwarded icmp names the wrong flow")
-			}
+		if !reraceSameFlow(parsed, egress) {
+			t.Errorf("%s: forwarded icmp names the wrong flow", label)
+		}
+		if parsed.SequenceNumber != egress.SequenceNumber {
+			t.Errorf("%s: forwarded icmp embeds sequence %#x, want the SYN's %#x", label, parsed.SequenceNumber, egress.SequenceNumber)
+		}
+		if want, _ := ipOosUnreachable(egress); !bytes.Equal(fwd.Packet, want) {
+			t.Errorf("%s: forwarded %x, want %x", label, fwd.Packet, want)
 		}
 	}
 }
@@ -420,7 +435,7 @@ func TestDialFailureQuicFlowReraces(t *testing.T) {
 	egress := udpTestPath(4)
 	parent, client, update, forwarded := dialFailureTestParent(t, true, egress)
 
-	parent.clientDialFailure(client, egress)
+	parent.clientDialFailureSignal(client, egress)
 
 	if update.client.Load() != nil {
 		t.Error("quic flow was not unbound")

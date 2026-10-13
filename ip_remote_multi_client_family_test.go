@@ -789,12 +789,15 @@ func TestClientDialFailureDowngradesAndRepublishes(t *testing.T) {
 	}
 	multiClient.SetReceivePacketCallback(func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {})
 
-	// two v6 flows to distinct destinations, both bound to the exit
+	// three v6 flows, to two distinct destinations, all bound to the exit: an
+	// exit strikes each flow once, so three strikes take three flows
 	first := icmpTcpTestPath(6)
 	second := icmpTcpTestPath(6)
 	second.DestinationIp = udpTestPath(6).SourceIp
+	third := icmpTcpTestPath(6)
+	third.SourcePort += 1
 	multiClient.clientUpdates[client] = map[*multiClientChannelUpdate]bool{}
-	for _, path := range []*IpPath{first, second} {
+	for _, path := range []*IpPath{first, second, third} {
 		update := &multiClientChannelUpdate{ipPath: path}
 		update.client.Store(client)
 		multiClient.ip6PathUpdates[path.ToIp6Path()] = update
@@ -805,12 +808,14 @@ func TestClientDialFailureDowngradesAndRepublishes(t *testing.T) {
 	addedAt := window.monitor.ProviderEvents()[client.ClientId()].EventTime
 	resizeNotify := window.resizeMonitor.NotifyChannel()
 
-	multiClient.clientDialFailure(client, first)
-	multiClient.clientDialFailure(client, second)
+	multiClient.clientDialFailureSignal(client, first)
+	multiClient.clientDialFailureSignal(client, second)
+	// a repeat of the first flow's failure is no strike
+	multiClient.clientDialFailureSignal(client, first)
 	if got := client.IpFamily(); got != IpFamilyDualstack {
 		t.Fatalf("family after two strikes = %q, want dualstack", got)
 	}
-	multiClient.clientDialFailure(client, first)
+	multiClient.clientDialFailureSignal(client, third)
 
 	if got := client.IpFamily(); got != IpFamilyV4Only {
 		t.Fatalf("family after three strikes = %q, want v4-only", got)

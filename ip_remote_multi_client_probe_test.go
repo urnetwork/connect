@@ -485,7 +485,7 @@ func TestProbeDialFailureRecordsFailureWithoutStrike(t *testing.T) {
 		egress := update.probe.ipPath
 
 		startTime := time.Now()
-		if reraced := parent.clientDialFailure(client, egress); reraced {
+		if reraced := parent.clientDialFailureSignal(client, egress); reraced {
 			t.Errorf("rerace=%v: a probe flow reported as re-raced", rerace)
 		}
 
@@ -524,7 +524,7 @@ func TestProbeDialFailureLeavesRealFlowsAlone(t *testing.T) {
 	egress := icmpTcpTestPath(4)
 	parent, client, update, forwarded := dialFailureTestParent(t, true, egress)
 
-	parent.clientDialFailure(client, egress)
+	parent.clientDialFailureSignal(client, egress)
 
 	if update.client.Load() != nil {
 		t.Error("a real flow was no longer re-raced after the probe intercept was added")

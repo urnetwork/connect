@@ -10,6 +10,7 @@ package connect
 // The IDs RR-1..RR-12 are the items of the re-race test matrix.
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -1172,7 +1173,7 @@ func TestProbeDialFailureThroughChannelFeedsNothing(t *testing.T) {
 		t.Run(fmt.Sprintf("rerace=%t", rerace), func(t *testing.T) {
 			parent, client, forwarded := probeTestParent(t)
 			parent.settings.DialFailureRerace = rerace
-			client.dialFailureCallback = parent.clientDialFailure
+			client.dialFailureCallback = parent.clientDialFailureSignal
 			client.clientReceivePacketCallback = parent.clientReceivePacket
 
 			resultCh := make(chan probeResult, 1)
@@ -1223,7 +1224,8 @@ func TestProbeDialFailureThroughChannelFeedsNothing(t *testing.T) {
 // --- RR-5: the knob off ---
 
 // RR-5. With DialFailureRerace off the signal is handed to the app at once,
-// once per failed dial, and nothing re-races: through the retransmits at 1s,
+// once per failed dial, rebuilt over the SYN's sequence so a kernel stack
+// accepts it, and nothing re-races: through the retransmits at 1s,
 // 3s and 7s -- the 3s and 7s ones past the silence inference, which the knob
 // turns off too -- the flow stays on its exit and the other exit never sees
 // it. (Blackhole detection benches an exit that never answers later; that is
@@ -1262,6 +1264,16 @@ func TestDialFailureReraceOffForwardsSignalAndKeepsExit(t *testing.T) {
 					embedded, _ := ipParseIcmpUnreachable(packet.packet)
 					if !reraceSameFlow(embedded, path) {
 						t.Errorf("icmp error %d names %+v, want the flow", i, embedded)
+					}
+					// the provider's signal embeds sequence 0; the app's stack
+					// accepts only its SYN's
+					if embedded.SequenceNumber != path.SequenceNumber {
+						t.Errorf("icmp error %d embeds sequence %d, want the SYN's %d", i, embedded.SequenceNumber, path.SequenceNumber)
+					}
+					want := reraceProviderFlowPath(path)
+					want.SequenceNumber = path.SequenceNumber
+					if wantPacket, _ := ipOosUnreachable(want); !bytes.Equal(packet.packet, wantPacket) {
+						t.Errorf("icmp error %d is %x, want %x", i, packet.packet, wantPacket)
 					}
 				}
 				if got := len(harness.delivered(path)); got != len(errorsDelivered) {
@@ -1416,6 +1428,114 @@ func TestDialStarvedConnectSuccessAgesOut(t *testing.T) {
 	if len(client.connectSuccessTimes) != 0 || len(client.connectSuccessVersions) != 0 {
 		t.Error("the aged success was not pruned with its version")
 	}
+}
+
+// RR-6. An exit strikes a flow once, however often it fails it. A provider
+// whose udp socket open fails at once answers every datagram with its signal,
+// and a flow with one candidate exit re-races straight back onto it; a tcp
+// flow does the same on every retransmit. Each repeat is counted as a signal
+// but not as a strike or a re-race, so the strikes grow with the flows, not
+// the packet rate.
+func TestDialFailureStrikesOncePerFlowAndExit(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	t.Run("udp datagrams", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			harness := newReraceHarness(t, []reraceExitSpec{
+				{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
+			}, nil)
+			a := harness.channel("a")
+			path := reraceUdpFlow(4, 1, 46000)
+			// an rtp stream, not a watched handshake port
+			path.DestinationPort = 5004
+			for range 100 {
+				harness.send(ipOosUdpPacket(path, []byte("rtp")))
+				harness.sleep(20 * time.Millisecond)
+			}
+			datagrams := len(harness.exit("a").received(path))
+			if datagrams != 100 {
+				t.Errorf("A received %d of the flow's 100 datagrams", datagrams)
+			}
+			if got := a.dialFailureCount(); got != 1 {
+				t.Errorf("one udp flow left %d strikes on A, want 1", got)
+			}
+			metrics := harness.metrics()
+			if metrics.FlowsReraced != 1 || metrics.DialFailuresIntercepted != uint64(datagrams) {
+				t.Errorf("FlowsReraced=%d DialFailuresIntercepted=%d, want 1 and one per datagram (%d)", metrics.FlowsReraced, metrics.DialFailuresIntercepted, datagrams)
+			}
+			if got := len(harness.delivered(path)); got != 0 {
+				t.Errorf("the app received %d packets, want none", got)
+			}
+		})
+	})
+	t.Run("tcp retransmits", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			harness := newReraceHarness(t, []reraceExitSpec{
+				{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
+			}, nil)
+			a := harness.channel("a")
+			path := reraceFlow(4, 1, 46001)
+			// the SYNs inside the strike window, before blackhole detection
+			// benches an exit that has received nothing
+			start := time.Now()
+			for _, offset := range reraceSynSchedule[:4] {
+				time.Sleep(start.Add(offset).Sub(time.Now()))
+				harness.syn(path)
+			}
+			syns := len(harness.exit("a").syns(path))
+			if syns != 4 {
+				t.Errorf("A received %d of the app's 4 SYNs", syns)
+			}
+			if got := a.dialFailureCount(); got != 1 {
+				t.Errorf("one tcp flow left %d strikes on A over 4 SYNs, want 1", got)
+			}
+			metrics := harness.metrics()
+			if metrics.FlowsReraced != 1 || metrics.DialFailuresIntercepted != uint64(syns) {
+				t.Errorf("FlowsReraced=%d DialFailuresIntercepted=%d, want 1 and one per SYN (%d)", metrics.FlowsReraced, metrics.DialFailuresIntercepted, syns)
+			}
+		})
+	})
+}
+
+// RR-6. A repeat still re-races. A flow whose only exit keeps failing it is
+// left unbound after each failure, as after the first, so the moment an exit
+// that can reach the destination joins, the next retransmit takes it. The
+// repeat only adds no strike and no counted re-race.
+func TestDialFailureRepeatOnTheOnlyExitStillReraces(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
+		}, nil)
+		a := harness.channel("a")
+		path := reraceFlow(4, 1, 46002)
+		harness.syn(path)
+		harness.sleep(time.Second)
+		// the retransmit goes back to A, the only exit, and fails again
+		harness.syn(path)
+		if got := len(harness.exit("a").syns(path)); got != 2 {
+			t.Fatalf("A received %d SYNs, want both", got)
+		}
+		if got := a.dialFailureCount(); got != 1 {
+			t.Errorf("A carries %d strikes for one flow, want 1", got)
+		}
+		if harness.boundTo(path) != nil {
+			t.Error("the repeat left the flow bound to the exit that failed it")
+		}
+
+		// an exit that can reach the destination joins
+		harness.addExit(reraceExitSpec{name: "c", tier: 0})
+		harness.waitForExits(2)
+		harness.syn(path)
+		if _, ok := harness.synAck(path); !ok {
+			t.Fatal("the retransmit after the exit joined did not complete")
+		}
+		if harness.boundTo(path) != harness.channel("c") {
+			t.Error("the flow did not complete on the exit that joined")
+		}
+		if got := harness.metrics().FlowsReraced; got != 1 {
+			t.Errorf("FlowsReraced = %d, want 1: the repeat is not counted again", got)
+		}
+	})
 }
 
 // --- RR-7: the v6 downgrade ---
@@ -2443,6 +2563,55 @@ func TestDialFailureSilentProviderRecoversAtTheInference(t *testing.T) {
 		}
 		if metrics := harness.metrics(); metrics.FlowsReraced != 1 {
 			t.Errorf("FlowsReraced = %d, want the one inferred re-race", metrics.FlowsReraced)
+		}
+	})
+}
+
+// RR-12. The silence inference is not uplink ingress: it fires on the send
+// path because nothing came back, so it neither stamps the uplink as
+// delivering nor counts as an intercepted signal. While apps retransmit into
+// a dead local uplink, a stamp would hold the uplink staleness gate open, and
+// silence verdicts against exits stay admissible through the very outage the
+// gate exists for.
+func TestDialFailureInferenceIsNotUplinkIngress(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: func(path *IpPath) reraceAnswer {
+				if path.DestinationIp[len(path.DestinationIp)-1] == 11 {
+					return reraceSilent
+				}
+				return reraceAccept
+			}},
+			{name: "b", tier: 1, answer: reraceAlways(reraceSilent)},
+		}, nil)
+		live := reraceFlow(4, 0, 45000)
+		if _, _, ok := harness.connect(live); !ok {
+			t.Fatal("setup: the live flow did not connect")
+		}
+		lastIngress := harness.multiClient.uplinkLastIngressNanos.Load()
+		if lastIngress == 0 {
+			t.Fatal("setup: no ingress was stamped")
+		}
+
+		// from here on nothing arrives from any exit
+		harness.sleep(10 * time.Second)
+		path := reraceFlow(4, 1, 45001)
+		harness.syn(path)
+		harness.sleep(time.Second)
+		harness.syn(path)
+		harness.sleep(2 * time.Second)
+		// the 3s retransmit trips the silence inference
+		harness.syn(path)
+		if got := harness.metrics().FlowsReraced; got != 1 {
+			t.Fatalf("setup: FlowsReraced = %d, want the inferred re-race", got)
+		}
+
+		if got := harness.multiClient.uplinkLastIngressNanos.Load(); got != lastIngress {
+			t.Errorf("the silence inference stamped uplink ingress %s after the last packet arrived", time.Duration(got-lastIngress))
+		}
+		if got := harness.metrics().DialFailuresIntercepted; got != 0 {
+			t.Errorf("DialFailuresIntercepted = %d, but no signal was intercepted", got)
 		}
 	})
 }
