@@ -22,6 +22,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/urnetwork/connect"
+	"github.com/urnetwork/connect/protocol"
 )
 
 // A raw tls connection to the measurement name, for requests no well-behaved
@@ -597,5 +598,52 @@ func TestLagApiZoneNamesNeverGetIdentityLeaves(t *testing.T) {
 	}
 	if err := dial("other.example"); err != nil {
 		t.Errorf("an unknown name: %v", err)
+	}
+}
+
+// M4: the browser's download progress counts only inside the download's
+// window: a report from past it and half an interval is ignored, and none is
+// binned past the window's ceil(downloadMs / intervalMs) intervals, so a report
+// never carries intervals the download did not have.
+func TestLagApiReceivedStaysInTheWindow(t *testing.T) {
+	fixture := newLagApiFixture(t, nil)
+	session := fixture.openHelloSession(fixture.ticket(func(body *protocol.LagTicketBody) {
+		body.DownloadMs = 500
+		body.UploadMs = 500
+	}))
+	session.load("download")
+	waitFor(t, func() bool {
+		return fixture.api.loadCountNow() == 1
+	})
+	response := fixture.get(fmt.Sprintf("/lag/v1/down?session=%s&stream=0", session.hello.Session), testLagOrigin)
+	downloadedByteCount, _ := io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if downloadedByteCount < 4000 {
+		t.Fatalf("downloaded %d", downloadedByteCount)
+	}
+	step := uint64(downloadedByteCount / 4)
+	for _, report := range []struct {
+		ms    int64
+		bytes uint64
+	}{
+		{ms: 250, bytes: step},
+		{ms: 500, bytes: 2 * step},
+		// late by less than half an interval: counted, in the last interval
+		{ms: 600, bytes: 3 * step},
+		// past the window and half an interval: ignored
+		{ms: 700, bytes: 4 * step},
+		{ms: 2000, bytes: 4 * step},
+	} {
+		session.send(map[string]any{"type": "received", "bytes": report.bytes, "ms": report.ms})
+	}
+	// the messages are read in order, so the close comes after them
+	time.Sleep(200 * time.Millisecond)
+	session.close()
+	body := fixture.nextReport(5 * time.Second)
+	if len(body.DownloadReceivedBytes) != 2 {
+		t.Fatalf("received %v", body.DownloadReceivedBytes)
+	}
+	if body.DownloadReceivedBytes[0] != step || body.DownloadReceivedBytes[1] != 2*step {
+		t.Errorf("received %v, steps of %d", body.DownloadReceivedBytes, step)
 	}
 }

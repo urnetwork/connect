@@ -270,29 +270,36 @@ func (self *lagApiPingRing) between(startTime time.Time, endTime time.Time) []la
 	return pings
 }
 
-// The download bytes per interval as the browser reported them (M8). Each
+// The download bytes per interval as the browser reported them (M4, M8). Each
 // report is cumulative from the browser's first byte; the growth since the one
-// before goes to the interval the report's time closes. Bounded like the
-// other series, and never past what the extender wrote.
+// before goes to the interval the report's time closes. It holds no more
+// intervals than the download's window has, a report from past the window and
+// half an interval is not counted, and nothing is ever past what the extender
+// wrote.
 type lagApiReceivedSeries struct {
 	counts         [lagApiMaxIntervalCount]uint64
 	lastCumulative uint64
 	lastIndex      int
 }
 
-func (self *lagApiReceivedSeries) add(ms float64, cumulative float64, writtenByteCount uint64) {
+func (self *lagApiReceivedSeries) add(ms float64, cumulative float64, writtenByteCount uint64, downloadDuration time.Duration) {
 	if math.IsNaN(ms) || math.IsInf(ms, 0) || ms < 0 ||
 		math.IsNaN(cumulative) || math.IsInf(cumulative, 0) || cumulative < 0 {
+		return
+	}
+	intervalMs := float64(lagApiInterval / time.Millisecond)
+	downloadMs := float64(downloadDuration / time.Millisecond)
+	// a report from past the window counts for nothing (M4)
+	if downloadMs+intervalMs/2 < ms {
 		return
 	}
 	cumulativeByteCount := uint64(min(cumulative, float64(writtenByteCount)))
 	if cumulativeByteCount <= self.lastCumulative {
 		return
 	}
-	index := max(0, int(math.Round(ms/float64(lagApiInterval/time.Millisecond)))-1)
-	if len(self.counts) <= index {
-		return
-	}
+	// never past the window's intervals, ceil(downloadMs / intervalMs)
+	intervalCount := min(len(self.counts), max(1, int(math.Ceil(downloadMs/intervalMs))))
+	index := min(intervalCount-1, max(0, int(math.Round(ms/intervalMs))-1))
 	self.counts[index] += cumulativeByteCount - self.lastCumulative
 	self.lastCumulative = cumulativeByteCount
 	self.lastIndex = max(self.lastIndex, index+1)
@@ -1247,7 +1254,7 @@ func (self *lagApiSession) run() {
 			case "received":
 				if load := self.load; load != nil && !self.reported {
 					if firstByteTime, _, _ := load.download.state(); !firstByteTime.IsZero() {
-						load.received.add(message.Ms, message.Bytes, load.download.consumed())
+						load.received.add(message.Ms, message.Bytes, load.download.consumed(), self.downloadDuration)
 					}
 				}
 			}
