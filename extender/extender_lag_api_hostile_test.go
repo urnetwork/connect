@@ -15,6 +15,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/connect"
 )
 
 // A raw tls connection to the measurement name, for requests no well-behaved
@@ -328,5 +330,69 @@ func TestLagApiPerSubnetActions(t *testing.T) {
 	refused := fixture.openSession(fixture.ticket(nil), testLagOrigin)
 	if message := refused.next("error", 5*time.Second); message.Code != lagApiErrorSessions {
 		t.Errorf("session past the subnet's actions: %+v", message.raw)
+	}
+}
+
+// M1: under camouflage splicing, a name under the measurement zone that the
+// API is not serving now -- another id, or any while no certificate is
+// installed -- is spliced to a borrowed site exactly as an unknown name is, so
+// a prober cannot tell an extender that keeps a measurement zone. With
+// splicing off it is closed, and only the name being served reaches the API.
+func TestLagApiZoneNamesLookUnknown(t *testing.T) {
+	restore := connect.Testing_SetBorrowDomains([]string{testBorrowName})
+	defer restore()
+	for _, splice := range []bool{true, false} {
+		t.Run(fmt.Sprintf("splice %t", splice), func(t *testing.T) {
+			site := newFakeBorrowSite(t, tlsBorrowSiteHandler(t))
+			fixture := newLagApiFixture(t, nil)
+			fixture.api.zone = "extender.example"
+			address := fixture.serveExtender(func(settings *ExtenderSettings) {
+				settings.CamouflageEnabled = true
+				settings.ExtenderCamouflageSplice = splice
+				settings.CamouflageSpliceDialContext = site.dialContext()
+			})
+			fixture.server.camouflage.borrowNames = []string{testBorrowName}
+			// the leaf a name is answered with: its organization, or "" when
+			// there was no handshake
+			answer := func(serverName string) string {
+				conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", address, &tls.Config{
+					ServerName:         serverName,
+					InsecureSkipVerify: true,
+				})
+				if err != nil {
+					return ""
+				}
+				defer conn.Close()
+				leaf := conn.ConnectionState().PeerCertificates[0]
+				if leaf.Equal(fixture.certificate.Leaf) {
+					return "measurement"
+				}
+				if 0 < len(leaf.Subject.Organization) {
+					return leaf.Subject.Organization[0]
+				}
+				return "?"
+			}
+			unknown := answer("www.random.example")
+			if splice && unknown != "Borrow Test" {
+				t.Fatalf("an unknown name: %q", unknown)
+			}
+			if answer(testLagName) != "measurement" {
+				t.Error("the name served did not reach the api")
+			}
+			otherZoneName := "0192e4a1-0000-7000-8000-000000000009.extender.example"
+			expected := ""
+			if splice {
+				expected = "Borrow Test"
+			}
+			if got := answer(otherZoneName); got != expected {
+				t.Errorf("another zone name: %q, expected %q", got, expected)
+			}
+			fixture.certificates.set(nil, nil)
+			for _, serverName := range []string{testLagName, otherZoneName} {
+				if got := answer(serverName); got != expected {
+					t.Errorf("%s with no certificate: %q, expected %q", serverName, got, expected)
+				}
+			}
+		})
 	}
 }

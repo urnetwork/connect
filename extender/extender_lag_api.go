@@ -432,19 +432,15 @@ func (self *extenderLagApi) claims(serverName string) bool {
 	return lagApiNameIn(names, serverName)
 }
 
-// Whether the accept path should peek the ClientHello for this API (M1): while
-// the extender keeps a measurement certificate, or the lifecycle has a name to
-// recognize. Nil-safe, so the accept path asks whether or not the API was
-// built.
+// Whether the accept path should peek the ClientHello for this API (M1): only
+// while a certificate is installed for a name to serve. Nil-safe, so the
+// accept path asks whether or not the API was built.
 func (self *extenderLagApi) peeks() bool {
 	if self == nil {
 		return false
 	}
-	if self.zone != "" {
-		return true
-	}
-	names, _ := self.certificates.Certificate()
-	return 0 < len(names)
+	names, certificate := self.certificates.Certificate()
+	return certificate != nil && 0 < len(names)
 }
 
 // dispatch serves a connection whose ClientHello named a measurement name
@@ -452,19 +448,21 @@ func (self *extenderLagApi) peeks() bool {
 // certificate and http/1.1 alone, which the in-process listener hands to the
 // measurement server; dispatch holds the connection until that server is done
 // with it, so the accept path's accounting and shutdown cover it for its whole
-// life. False when the name is not the API's, which leaves the connection to
-// the existing path unchanged. A measurement name that cannot be served -- no
-// certificate is installed for it, or the api is closing -- is closed rather
-// than answered with an identity-ca leaf.
+// life. Only a name an installed certificate serves now is the API's: every
+// other name, one under the measurement zone included, is left to the
+// existing path unchanged (false), which splices it like any unknown name when
+// splicing is on and otherwise closes it, since no carrier gives a zone name
+// an identity leaf. Closing a zone name here would tell a prober which
+// extenders keep a measurement zone, gated and canary ones included.
 func (self *extenderLagApi) dispatch(ctx context.Context, conn net.Conn, readBytes []byte, serverName string) bool {
 	if self == nil || serverName == "" {
 		return false
 	}
 	names, certificate := self.certificates.Certificate()
-	if !lagApiNameIn(names, serverName) {
-		return self.underZone(serverName)
+	if certificate == nil || !lagApiNameIn(names, serverName) {
+		return false
 	}
-	if certificate == nil || !self.start() {
+	if !self.start() {
 		return true
 	}
 	// a subnet holds a bounded share of the connection slots (M2)

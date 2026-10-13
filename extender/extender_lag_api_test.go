@@ -1110,7 +1110,9 @@ func TestLagApiDispatchNames(t *testing.T) {
 	conn.Close()
 	<-fixture.dispatches
 
-	// the name, with no certificate installed: closed
+	// the name, with no certificate installed: not the api's, so the existing
+	// path takes it like any unknown name (M1), which this fixture's accept
+	// path, having none, closes
 	fixture.certificates.set([]string{testLagName}, nil)
 	_, err = tls.Dial("tcp", fixture.address, &tls.Config{
 		InsecureSkipVerify: true,
@@ -1119,11 +1121,11 @@ func TestLagApiDispatchNames(t *testing.T) {
 	if err == nil {
 		t.Error("a measurement name was answered without its certificate")
 	}
-	if dispatch := <-fixture.dispatches; !dispatch.dispatched {
+	if dispatch := <-fixture.dispatches; dispatch.dispatched {
 		t.Errorf("dispatch %+v", dispatch)
 	}
-	if fixture.api.peeks() != true {
-		t.Error("names without a certificate are still recognized")
+	if fixture.api.peeks() {
+		t.Error("peeks with no certificate installed")
 	}
 
 	// no names: nothing to recognize
