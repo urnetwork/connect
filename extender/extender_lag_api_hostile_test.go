@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/gorilla/websocket"
 
@@ -112,7 +113,7 @@ func TestLagApiRefusalsCloseConnection(t *testing.T) {
 			status: http.StatusBadRequest,
 		},
 	} {
-		conn := fixture.dialRaw(fixture.address)
+		conn := fixture.dialRaw(fixture.dialAddress())
 		fmt.Fprintf(conn, request.head, testLagName)
 		response, closed := testLagRawResponse(t, conn)
 		if response.StatusCode != request.status || !response.Close {
@@ -124,7 +125,7 @@ func TestLagApiRefusalsCloseConnection(t *testing.T) {
 	}
 
 	// a preflight succeeds and keeps its connection
-	conn := fixture.dialRaw(fixture.address)
+	conn := fixture.dialRaw(fixture.dialAddress())
 	preflight := "OPTIONS /lag/v1/down HTTP/1.1\r\nHost: %s\r\nOrigin: https://lag.dev\r\nAccess-Control-Request-Method: GET\r\n\r\n"
 	fmt.Fprintf(conn, preflight, testLagName)
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -169,7 +170,7 @@ func TestLagApiReadDeadline(t *testing.T) {
 	}
 
 	// a head that never ends
-	conn := fixture.dialRaw(fixture.address)
+	conn := fixture.dialRaw(fixture.dialAddress())
 	fmt.Fprintf(conn, "GET /lag/v1/down HTTP/1.1\r\nHost: %s\r\n", testLagName)
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	startTime = time.Now()
@@ -189,7 +190,7 @@ func TestLagApiSubnetConnectionCap(t *testing.T) {
 	}
 	fixture.api.maxConnectionsPerSubnet = 3
 	dial := func() (*tls.Conn, error) {
-		return tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", fixture.address, &tls.Config{
+		return tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", fixture.dialAddress(), &tls.Config{
 			ServerName: testLagName,
 			RootCAs:    fixture.rootCas,
 		})
@@ -220,8 +221,8 @@ func TestLagApiSubnetConnectionCap(t *testing.T) {
 	}
 }
 
-// The live children of a cancel context, read through its internals: what a
-// context that is never canceled leaves behind.
+// The live children of a cancel context, read through its internals, under
+// its own lock: what a context that is never canceled leaves behind.
 func testLagContextChildCount(t *testing.T, ctx context.Context) int {
 	t.Helper()
 	value := reflect.ValueOf(ctx)
@@ -229,9 +230,13 @@ func testLagContextChildCount(t *testing.T, ctx context.Context) int {
 		value = value.Elem()
 	}
 	children := value.FieldByName("children")
-	if !children.IsValid() {
-		t.Fatalf("%T has no children", ctx)
+	lock := value.FieldByName("mu")
+	if !children.IsValid() || !lock.IsValid() || !lock.CanAddr() {
+		t.Fatalf("%T has no children to count", ctx)
 	}
+	mutex := (*sync.Mutex)(unsafe.Pointer(lock.UnsafeAddr()))
+	mutex.Lock()
+	defer mutex.Unlock()
 	return children.Len()
 }
 
@@ -356,8 +361,10 @@ func TestLagApiZoneNamesLookUnknown(t *testing.T) {
 				settings.CamouflageEnabled = true
 				settings.ExtenderCamouflageSplice = splice
 				settings.CamouflageSpliceDialContext = site.dialContext()
+				// copied from the settings when the server was built: set
+				// before it serves
+				fixture.server.camouflage.borrowNames = []string{testBorrowName}
 			})
-			fixture.server.camouflage.borrowNames = []string{testBorrowName}
 			// the leaf a name is answered with: its organization, or "" when
 			// there was no handshake
 			answer := func(serverName string) string {

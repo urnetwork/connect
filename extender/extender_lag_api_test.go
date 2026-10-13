@@ -102,6 +102,10 @@ type lagApiFixture struct {
 	api      *extenderLagApi
 	listener net.Listener
 	address  string
+	// starts the accept loop on the first dial, so whatever a test sets up
+	// before it dials is ordered before every connection the loop serves
+	startOnce sync.Once
+	startLoop func()
 	// the server names the accept path saw and whether the api took them
 	dispatches chan testLagDispatch
 }
@@ -187,7 +191,11 @@ func newLagApiFixture(t *testing.T, configure func(settings *ExtenderLagSettings
 	fixture.address = fixture.listener.Addr().String()
 	var acceptWorkers sync.WaitGroup
 	acceptWorkers.Add(1)
-	go func() {
+	var acceptLoop func()
+	fixture.startLoop = func() {
+		go acceptLoop()
+	}
+	acceptLoop = func() {
 		defer acceptWorkers.Done()
 		for {
 			conn, err := fixture.listener.Accept()
@@ -211,8 +219,10 @@ func newLagApiFixture(t *testing.T, configure func(settings *ExtenderLagSettings
 				}
 			}()
 		}
-	}()
+	}
 	t.Cleanup(func() {
+		// a fixture never dialed still runs and ends its loop
+		fixture.start()
 		fixture.listener.Close()
 		fixture.api.close()
 		fixture.server.CloseAndWait()
@@ -228,8 +238,19 @@ func (self *lagApiFixture) setTimings(configure func(timings *lagApiTimings)) {
 	configure(&self.api.timings)
 }
 
+// Starts the accept loop, once.
+func (self *lagApiFixture) start() {
+	self.startOnce.Do(self.startLoop)
+}
+
+// The address of the fixture's accept path, started.
+func (self *lagApiFixture) dialAddress() string {
+	self.start()
+	return self.address
+}
+
 func (self *lagApiFixture) dialContext(ctx context.Context, network string, address string) (net.Conn, error) {
-	return (&net.Dialer{}).DialContext(ctx, "tcp", self.address)
+	return (&net.Dialer{}).DialContext(ctx, "tcp", self.dialAddress())
 }
 
 // An https client that resolves every name to the fixture and offers h2 too,
@@ -1069,7 +1090,7 @@ func TestLagApiFeedMount(t *testing.T) {
 func TestLagApiDispatchNames(t *testing.T) {
 	fixture := newLagApiFixture(t, nil)
 
-	conn, err := tls.Dial("tcp", fixture.address, &tls.Config{
+	conn, err := tls.Dial("tcp", fixture.dialAddress(), &tls.Config{
 		RootCAs:    fixture.rootCas,
 		ServerName: testLagName,
 		NextProtos: []string{"h2", "http/1.1"},
@@ -1090,7 +1111,7 @@ func TestLagApiDispatchNames(t *testing.T) {
 	}
 
 	// another name: not the api's
-	_, err = tls.Dial("tcp", fixture.address, &tls.Config{
+	_, err = tls.Dial("tcp", fixture.dialAddress(), &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         "other.example",
 	})
@@ -1102,7 +1123,7 @@ func TestLagApiDispatchNames(t *testing.T) {
 	}
 
 	// names compare without case, as dns names do
-	conn, err = tls.Dial("tcp", fixture.address, &tls.Config{
+	conn, err = tls.Dial("tcp", fixture.dialAddress(), &tls.Config{
 		RootCAs:    fixture.rootCas,
 		ServerName: "0192E4A1-7B3C-7D2E-9F10-5A6B7C8D9E0F.EXTENDER.example",
 	})
@@ -1116,7 +1137,7 @@ func TestLagApiDispatchNames(t *testing.T) {
 	// path takes it like any unknown name (M1), which this fixture's accept
 	// path, having none, closes
 	fixture.certificates.set([]string{testLagName}, nil)
-	_, err = tls.Dial("tcp", fixture.address, &tls.Config{
+	_, err = tls.Dial("tcp", fixture.dialAddress(), &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         testLagName,
 	})
@@ -1945,7 +1966,7 @@ func TestLagApiUnservedNameClosesSessions(t *testing.T) {
 	if status := get(); status != http.StatusMisdirectedRequest {
 		t.Errorf("after: %d", status)
 	}
-	if _, err := tls.Dial("tcp", fixture.address, &tls.Config{RootCAs: fixture.rootCas, ServerName: testLagName}); err == nil {
+	if _, err := tls.Dial("tcp", fixture.dialAddress(), &tls.Config{RootCAs: fixture.rootCas, ServerName: testLagName}); err == nil {
 		t.Error("a withdrawn name was answered")
 	}
 

@@ -556,7 +556,7 @@ func testLagMemory() (uint64, uint64) {
 // allocates, the client's side included, stays a small fraction of the bytes,
 // and the heap does not grow with the stream.
 func TestLagApiDownloadFlatMemory(t *testing.T) {
-	if testing.Short() {
+	if testing.Short() || testLagRaceEnabled {
 		t.Skip("a 1 GiB stream")
 	}
 	const byteCount = 1 << 30
@@ -596,7 +596,7 @@ func TestLagApiDownloadFlatMemory(t *testing.T) {
 // M7: a 1 GiB upload is read and verified through one data buffer and one
 // keystream buffer.
 func TestLagApiUploadFlatMemory(t *testing.T) {
-	if testing.Short() {
+	if testing.Short() || testLagRaceEnabled {
 		t.Skip("a 1 GiB stream")
 	}
 	const byteCount = 1 << 30
