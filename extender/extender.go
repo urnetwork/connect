@@ -514,8 +514,10 @@ type ExtenderServer struct {
 	camouflage *extenderCamouflage
 
 	// the lag.dev measurement API (lag.dev/PLAN.md M1 to M7, M10), nil when it
-	// is off or the server has no identity key
-	lag *extenderLagApi
+	// is off or the server has no identity key, and the zone of measurement
+	// names, which no carrier gives an identity leaf whether or not it is on
+	lag             *extenderLagApi
+	measurementZone string
 
 	proxy *extenderProxy
 
@@ -613,10 +615,9 @@ func NewExtenderServer(
 	// the lag.dev measurement API and the lifecycle behind it, each side's one
 	// wiring function (lag.dev/PLAN.md M10)
 	lagLifecycle := newExtenderLagLifecycle(self, settings.LagLifecycle)
-	measurementZone := ""
+	self.measurementZone = lagApiMeasurementZone(settings.LagLifecycle)
 	var measurementChanges *connect.MonitorValue[uint64]
 	if settings.LagLifecycle != nil && settings.LagLifecycle.Certificate != nil {
-		measurementZone = settings.LagLifecycle.Certificate.Zone()
 		measurementChanges = settings.LagLifecycle.Certificate.ChangeMonitor()
 	}
 	self.lag = newExtenderLagApi(
@@ -625,7 +626,6 @@ func NewExtenderServer(
 		lagLifecycle,
 		lagLifecycle,
 		lagLifecycle.FeedHandler(),
-		measurementZone,
 		measurementChanges,
 	)
 

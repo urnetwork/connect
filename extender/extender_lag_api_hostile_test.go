@@ -350,7 +350,7 @@ func TestLagApiZoneNamesLookUnknown(t *testing.T) {
 		t.Run(fmt.Sprintf("splice %t", splice), func(t *testing.T) {
 			site := newFakeBorrowSite(t, tlsBorrowSiteHandler(t))
 			fixture := newLagApiFixture(t, nil)
-			fixture.api.zone = "extender.example"
+			fixture.server.measurementZone = "extender.example"
 			address := fixture.serveExtender(func(settings *ExtenderSettings) {
 				settings.CamouflageEnabled = true
 				settings.ExtenderCamouflageSplice = splice
@@ -502,5 +502,100 @@ func TestLagApiForgedPongsNeverCount(t *testing.T) {
 			t.Errorf("payload %x", payload)
 		}
 		seen[payload] = true
+	}
+}
+
+// M1: no carrier gives an identity leaf to a name under the measurement zone,
+// with the API off as with it on: the default zone when the extender keeps no
+// measurement certificate, its lifecycle's own zone when it does. The tcp and
+// QUIC carriers both take their certificate through this one choice.
+func TestLagApiZoneNamesNeverGetIdentityLeaves(t *testing.T) {
+	seed, err := connect.NewExtenderKeySeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newServer := func(configure func(settings *ExtenderSettings)) *ExtenderServer {
+		settings := DefaultExtenderSettings()
+		settings.IdentityKeySeed = seed
+		if configure != nil {
+			configure(settings)
+		}
+		server := NewExtenderServer(context.Background(), nil, nil, nil, &net.Dialer{}, settings)
+		t.Cleanup(server.CloseAndWait)
+		return server
+	}
+	refused := func(server *ExtenderServer, serverName string) bool {
+		certificate, err := server.carrierCertificate(&tls.ClientHelloInfo{ServerName: serverName})
+		return err != nil && certificate == nil
+	}
+	measurementName := "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f." + connect.ExtenderMeasurementZone
+	for name, configure := range map[string]func(settings *ExtenderSettings){
+		"api off": func(settings *ExtenderSettings) {
+			settings.Measurement.Enabled = false
+		},
+		"api on": nil,
+	} {
+		server := newServer(configure)
+		for _, serverName := range []string{
+			measurementName,
+			"0192E4A1-7B3C-7D2E-9F10-5A6B7C8D9E0F.EXTENDER.BRINGYOUR.COM",
+			"anything." + connect.ExtenderMeasurementZone,
+		} {
+			if !refused(server, serverName) {
+				t.Errorf("%s: an identity leaf for %q", name, serverName)
+			}
+		}
+		for _, serverName := range []string{"other.example", "notextender.bringyour.com", connect.ExtenderMeasurementZone} {
+			if refused(server, serverName) {
+				t.Errorf("%s: %q refused", name, serverName)
+			}
+		}
+	}
+
+	// a lifecycle's own zone
+	certificate, err := NewExtenderMeasurementCert("", "Extender.Example.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newServer(func(settings *ExtenderSettings) {
+		settings.LagLifecycle = &ExtenderLagLifecycleSettings{Certificate: certificate}
+	})
+	if server.measurementZone != "extender.example" || !refused(server, "0192e4a1-1111-7000-8000-000000000001.extender.example") {
+		t.Errorf("the lifecycle's zone %q", server.measurementZone)
+	}
+
+	// through the tcp accept path with the api off: a zone name is closed,
+	// and an unknown name answered as ever
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	server = newServer(func(settings *ExtenderSettings) {
+		settings.Measurement.Enabled = false
+		settings.Listen = func(network string, address string) (net.Listener, error) {
+			return listener, nil
+		}
+	})
+	server.ports = map[int][]connect.ExtenderConnectMode{
+		listener.Addr().(*net.TCPAddr).Port: {connect.ExtenderConnectModeTcpTls},
+	}
+	go server.ListenAndServe()
+	<-server.Listening()
+	dial := func(serverName string) error {
+		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", listener.Addr().String(), &tls.Config{
+			ServerName:         serverName,
+			InsecureSkipVerify: true,
+		})
+		if err == nil {
+			conn.Close()
+		}
+		return err
+	}
+	if dial(measurementName) == nil {
+		t.Error("the api off, a measurement name was answered")
+	}
+	if err := dial("other.example"); err != nil {
+		t.Errorf("an unknown name: %v", err)
 	}
 }

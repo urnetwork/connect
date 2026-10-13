@@ -199,9 +199,6 @@ type extenderLagApi struct {
 	identityPrivateKey ed25519.PrivateKey
 	identityPublicKey  ed25519.PublicKey
 	allowedOrigins     map[string]bool
-	// the zone every measurement name is under, lower case, or empty when the
-	// extender has no measurement certificate to keep (N1)
-	zone string
 	// the clock skew a ticket's expiry is allowed, the one records are (M3)
 	ticketExpireSkew time.Duration
 
@@ -251,9 +248,6 @@ type extenderLagApi struct {
 // function. Nil when the API cannot serve: it is turned off, there is no
 // lifecycle to present a certificate, or the extender has no identity key to
 // sign a report with. The identity key and the header budget are the server's.
-// zone, when the extender keeps a measurement certificate, is the zone its
-// names are under: a name there is the API's whether or not a certificate is
-// installed for it now, so it is never answered with an identity-ca leaf (M1).
 // certificateChanges, when the lifecycle has one, counts every change to the
 // installed certificate, so open sessions close the moment their name stops
 // being served (C4, C9); without it they close at the next check.
@@ -263,7 +257,6 @@ func newExtenderLagApi(
 	certificates lagCertificates,
 	reports lagReports,
 	feedHandler http.Handler,
-	zone string,
 	certificateChanges *connect.MonitorValue[uint64],
 ) *extenderLagApi {
 	settings := server.settings
@@ -295,7 +288,6 @@ func newExtenderLagApi(
 		identityPrivateKey: identityPrivateKey,
 		identityPublicKey:  identityPrivateKey.Public().(ed25519.PublicKey),
 		allowedOrigins:     allowedOrigins,
-		zone:               strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), ".")),
 		ticketExpireSkew:   connect.DefaultExtenderDirectorySettings().RecordExpireSkew,
 		ctx:                ctx,
 		cancel:             cancel,
@@ -390,14 +382,44 @@ var errLagApiNoCertificate = errors.New("no measurement certificate for the name
 var errLagApiMeasurementName = errors.New("a measurement name is never answered with an identity leaf")
 
 // The certificate of a carrier handshake the measurement dispatch did not take
-// -- a udp carrier's, or a tcp hello the peek could not read -- which is the
-// identity-ca leaf of the existing path, refused for a name that is the
-// measurement API's (M1).
+// -- a udp carrier's, or a tcp hello for a name the API is not serving -- which
+// is the identity-ca leaf of the existing path, refused for a measurement name
+// (M1).
 func (self *ExtenderServer) carrierCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	if self.lag.claims(hello.ServerName) {
+	if self.measurementName(hello.ServerName) {
 		return nil, errLagApiMeasurementName
 	}
 	return self.certificates.GetCertificate(hello)
+}
+
+// Whether a name is a measurement name (N1, M1): any name under the
+// measurement zone, whether or not the API is on or serves it, or one the API
+// serves now. No carrier gives one an identity leaf, so a measurement name the
+// API is not serving fails its handshake where an unknown name would be
+// answered, unless the camouflage splices it as it splices any unknown name.
+func (self *ExtenderServer) measurementName(serverName string) bool {
+	if serverName == "" {
+		return false
+	}
+	if zone := self.measurementZone; zone != "" && strings.HasSuffix(strings.ToLower(serverName), "."+zone) {
+		return true
+	}
+	return self.lag.servesName(serverName)
+}
+
+// The measurement zone of a server (N1): its lifecycle's, when it keeps a
+// measurement certificate, and otherwise the default, so even an extender
+// with the API off never gives a name under the zone an identity leaf (M1).
+func lagApiMeasurementZone(lifecycleSettings *ExtenderLagLifecycleSettings) string {
+	zone := ""
+	if lifecycleSettings != nil && lifecycleSettings.Certificate != nil {
+		zone = lifecycleSettings.Certificate.Zone()
+	}
+	zone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), "."))
+	if zone == "" {
+		zone = connect.ExtenderMeasurementZone
+	}
+	return zone
 }
 
 // Whether a server name is one of the measurement names. Names compare without
@@ -414,22 +436,13 @@ func lagApiNameIn(names []string, serverName string) bool {
 	return false
 }
 
-// Whether a name is under the measurement zone (N1).
-func (self *extenderLagApi) underZone(serverName string) bool {
-	return self.zone != "" && strings.HasSuffix(strings.ToLower(serverName), "."+self.zone)
-}
-
-// Whether a server name is the API's (M1): one of the installed certificate's
-// names, or any name under the measurement zone. Nil-safe.
-func (self *extenderLagApi) claims(serverName string) bool {
-	if self == nil || serverName == "" {
+// Whether the API serves a name now, read from the certificate as installed
+// at this moment (M1). Nil-safe.
+func (self *extenderLagApi) servesName(serverName string) bool {
+	if self == nil {
 		return false
 	}
-	if self.underZone(serverName) {
-		return true
-	}
-	names, _ := self.certificates.Certificate()
-	return lagApiNameIn(names, serverName)
+	return self.serves(serverName)
 }
 
 // Whether the accept path should peek the ClientHello for this API (M1): only

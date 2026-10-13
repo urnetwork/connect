@@ -170,7 +170,6 @@ func newLagApiFixture(t *testing.T, configure func(settings *ExtenderLagSettings
 		fixture.certificates,
 		fixture.reports,
 		nil,
-		"",
 		fixture.certificates.changes,
 	)
 	if fixture.api == nil {
@@ -831,8 +830,11 @@ func TestLagApiDefaultSettings(t *testing.T) {
 	if server.lag == nil {
 		t.Fatal("no api for an extender with an identity")
 	}
-	if server.lag.peeks() || server.lag.claims(testLagName) {
+	if server.lag.peeks() || server.lag.servesName(testLagName) {
 		t.Error("the api recognizes a name with no certificate to keep")
+	}
+	if server.measurementZone != connect.ExtenderMeasurementZone {
+		t.Errorf("measurement zone %q", server.measurementZone)
 	}
 	if server.lag.settings.MaxSessions != 512 || server.lag.settings.ConcurrentLoads != 2 ||
 		server.lag.settings.DailyBudgetBytes != 0 || server.lag.budget.limit != 0 {
@@ -875,7 +877,7 @@ func TestLagApiDefaultSettings(t *testing.T) {
 		if server.lag != nil {
 			t.Errorf("%s: an api", name)
 		}
-		if server.lag.peeks() || server.lag.claims(testLagName) || server.lag.dispatch(context.Background(), nil, nil, testLagName) {
+		if server.lag.peeks() || server.lag.servesName(testLagName) || server.lag.dispatch(context.Background(), nil, nil, testLagName) {
 			t.Errorf("%s: the missing api takes a connection", name)
 		}
 		server.lag.close()
@@ -2042,7 +2044,7 @@ func TestLagApiDispatchThroughExtender(t *testing.T) {
 	for _, camouflageEnabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("camouflage %t", camouflageEnabled), func(t *testing.T) {
 			fixture := newLagApiFixture(t, nil)
-			fixture.api.zone = "extender.example"
+			fixture.server.measurementZone = "extender.example"
 			// every name an identity leaf is selected for
 			serverNames := make(chan string, 16)
 			fixture.server.certificates.certificateHandler = func(serverName string) {
