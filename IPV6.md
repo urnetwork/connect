@@ -233,6 +233,23 @@ semantics replaces the bare `net.Dialer` in `DefaultHttpClient`, redis, the
 exchange connection and the bare `http.Client` sites; `server/proxy` inherits
 the tun fix.
 
+C7. Validator hops alternate the first family (2026-10-13). The shared race
+starts the first DNS answer at once and prefers IPv6 only between answers
+that are ready together, so the validator's provider traffic landed on
+whichever family answered first, and on IPv4 wherever the provider has no
+IPv6. The validator gives IPv4 and IPv6 equal attempts instead. A hop is one request through a provider: a trail SEED or
+EXTEND `/verify` post, retries included, each over its own tun (sn
+`validator/transport.go`). One counter per `TunnelTransport` alternates the
+family each request's tun tries first, IPv4 for the first request, then
+IPv6, and so on (`TunSettings.DialFirstIpFamily`). The first family's address
+starts first; a ready answer of the other family waits at most
+`DefaultDialFallbackDelay` for the first family's answer. The other family
+starts one fallback delay after the first, or at once when the first fails
+or has no address, all inside the dial's existing deadlines. A narrowed
+network, an IPv4-only tun and an IP literal keep their family. Every other
+tun keeps C6 unchanged (`DialFirstIpFamily` 0). The provider's egress is
+untouched: it dials the literal the validator chose.
+
 ### D. SDK, apps, tests
 
 D1. Plumbing. `ProviderEvent.IpFamily` and `ExitInfo.IpFamily` in connect;

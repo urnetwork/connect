@@ -49,7 +49,7 @@ func checkDohFirstAnswerTcp(t *testing.T, readyIpv6 bool) {
 		dialed := make(chan netip.Addr, 1)
 		done := make(chan error, 1)
 		go func() {
-			conn, err := dialDohAddrsRace(ctx, cache, "tcp", "first-answer.example", time.Hour, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+			conn, err := dialDohAddrsRace(ctx, cache, "tcp", "first-answer.example", 0, time.Hour, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 				dialed <- addr
 				client, peer := net.Pipe()
 				_ = peer.Close()
