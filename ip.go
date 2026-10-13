@@ -9,6 +9,7 @@ import (
 	"math"
 	mathrand "math/rand"
 	"net"
+	"os"
 	// "runtime/debug"
 	"slices"
 	"strconv"
@@ -5524,12 +5525,13 @@ func (self *TcpSequence) Run() {
 			self.log.Infof("[init]tcp connect error = %s\n", err)
 		}
 		// answer the source instead of going silent: a refused destination gets
-		// an honest RST+ACK, everything else a capacity-class unreachable. both
-		// ride the same receive callback the SynAck uses (from-destination
-		// orientation); then return as before -- no socket exists. the ctx
-		// guard implements the comment above: classifyDialFailure cannot tell
-		// a canceled parent from a capacity failure, and teardown must not
-		// generate new output.
+		// an honest RST+ACK, any other immediate failure a capacity-class
+		// unreachable, and a timed-out dial nothing (classifyDialFailure says
+		// why). both answers ride the same receive callback the SynAck uses
+		// (from-destination orientation); then return as before -- no socket
+		// exists. the ctx guard implements the comment above:
+		// classifyDialFailure cannot tell a canceled parent from a capacity
+		// failure, and teardown must not generate new output.
 		if self.ctx.Err() == nil {
 			switch action, signal := classifyDialFailure(self.IpPath(), err); action {
 			case dialFailureRst:
@@ -10945,11 +10947,14 @@ func (self *IpPath) ToIp6Path() Ip6Path {
 // the provider sends back to the source in place of the SynAck. Without a
 // signal the source sits in syn-retransmit backoff (3s..63s) and the blackhole
 // timeout eventually removes the provider along with its working flows -- the
-// bug this replaces.
+// bug this replaces for a dial that fails at once. A dial that times out is
+// left to the source's own backoff and the client's silence inference (see
+// classifyDialFailure).
 type dialFailureAction int
 
 const (
-	// dialFailureNone: send nothing (nil path / unsupported ip version).
+	// dialFailureNone: send nothing (a timed-out dial, a nil path, an
+	// unsupported protocol or ip version).
 	dialFailureNone dialFailureAction = iota
 	// dialFailureRst: the destination itself refused the connection. The caller
 	// answers with ConnectionState.RstAck() -- honest tcp semantics, forwarded
@@ -10969,17 +10974,27 @@ const (
 // before delivery). For dialFailureRst and dialFailureNone the packet is nil --
 // a RST needs the ConnectionState's sequence state, so the caller builds it.
 //
-// tcp + ECONNREFUSED means the destination refused: RST+ACK. Anything else on
-// tcp (timeouts, EMFILE/ENFILE, EADDRNOTAVAIL, unreachable, unrecognized) is
-// capacity-class and gets an unreachable; defaulting unrecognized errors to the
-// capacity class is deliberate -- new clients intercept the signal and old ones
-// drop it at ParseIpPath, so a misclassification is cheap. errors.Is folds the
-// Windows WSAECONNREFUSED onto syscall.ECONNREFUSED, but the providers this runs
-// on are almost all linux, so linux errno semantics are what matter. udp "dial"
+// A dial that timed out gets nothing (isDialTimeout). It fails at the
+// dialer's ConnectTimeout, 15s after the SYN. By then the source has
+// retransmitted at 1s and 3s, the multi client's silence inference has
+// re-raced a flow that is still waiting, and an app racing address families
+// has connected over the other family 250ms in and abandoned this attempt. A
+// signal that late speeds nothing up. It only strikes the exit for a flow no
+// one waits on, and three such strikes for a blackholed AAAA downgrade a
+// healthy dual-stack exit to v4-only (IPV6.md C7).
+//
+// Every other failure is immediate and answered. tcp + ECONNREFUSED means the
+// destination refused: RST+ACK. Anything else on tcp (no route, unreachable,
+// EMFILE/ENFILE, EADDRNOTAVAIL, unrecognized) is capacity-class and gets an
+// unreachable; defaulting unrecognized errors to the capacity class is
+// deliberate -- new clients intercept the signal and old ones drop it at
+// ParseIpPath, so a misclassification is cheap. errors.Is folds the Windows
+// WSAECONNREFUSED onto syscall.ECONNREFUSED, but the providers this runs on
+// are almost all linux, so linux errno semantics are what matter. udp "dial"
 // cannot produce a meaningful ECONNREFUSED at connect time, so udp is always
 // capacity-class.
 func classifyDialFailure(ipPath *IpPath, err error) (dialFailureAction, []byte) {
-	if ipPath == nil {
+	if ipPath == nil || isDialTimeout(err) {
 		return dialFailureNone, nil
 	}
 	switch ipPath.Protocol {
@@ -10997,6 +11012,17 @@ func classifyDialFailure(ipPath *IpPath, err error) (dialFailureAction, []byte) 
 		return dialFailureUnreachable, packet
 	}
 	return dialFailureNone, nil
+}
+
+// isDialTimeout reports whether a dial failed by running out of time rather
+// than at once. The dialer's own timeout surfaces as context.DeadlineExceeded
+// (net's "i/o timeout" matches it), or as os.ErrDeadlineExceeded when the
+// socket's write deadline fires before the context's timer; the kernel's own
+// connect timeout is ETIMEDOUT.
+func isDialTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) ||
+		errors.Is(err, syscall.ETIMEDOUT)
 }
 
 func (self *IpPath) Source() *IpPath {

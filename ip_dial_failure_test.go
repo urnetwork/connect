@@ -1,10 +1,14 @@
 package connect
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func dialFailureTestPath(protocol IpProtocol, version int) *IpPath {
@@ -16,27 +20,53 @@ func dialFailureTestPath(protocol IpProtocol, version int) *IpPath {
 	return udpTestPath(version)
 }
 
+// dialTimeoutError is the error a dialer returns when its timeout expires:
+// "dial tcp ...: i/o timeout". The dial runs on a context whose deadline has
+// passed, so it fails before any socket is opened.
+func dialTimeoutError(t *testing.T) error {
+	t.Helper()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", "127.0.0.1:9")
+	if conn != nil {
+		conn.Close()
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("a dial past its deadline returned %v, want a timeout", err)
+	}
+	return err
+}
+
 // classifyDialFailure is the single home of the dial-failure errno logic: both
 // ip.go dial sites and this test call it, so the test never restates the
-// classification. ECONNREFUSED on tcp is the one case that becomes a RST (the
-// destination refused); everything else -- and all of udp, ECONNREFUSED
-// included -- is capacity-class and gets an icmp unreachable, with unrecognized
-// errors defaulting to capacity deliberately.
+// classification. A dial that timed out gets nothing, on tcp and udp: its
+// signal would land 15s late. ECONNREFUSED on tcp is the one case that becomes
+// a RST (the destination refused); every other immediate failure -- and all of
+// udp, ECONNREFUSED included -- is capacity-class and gets an icmp unreachable,
+// with unrecognized errors defaulting to capacity deliberately.
 func TestClassifyDialFailure(t *testing.T) {
 	cases := []struct {
 		name string
 		err  error
-		// wantTcp is the action for a tcp path; udp is always unreachable.
+		// wantTcp is the action for a tcp path; udp is unreachable for every
+		// failure that is not a timeout.
 		wantTcp dialFailureAction
 	}{
 		{"econnrefused", syscall.ECONNREFUSED, dialFailureRst},
 		// real net dials wrap the errno (*net.OpError -> *os.SyscallError ->
 		// syscall.Errno); errors.Is must still see through it.
 		{"econnrefused wrapped", fmt.Errorf("dial tcp 93.184.216.34:443: connect: %w", syscall.ECONNREFUSED), dialFailureRst},
-		{"etimedout", syscall.ETIMEDOUT, dialFailureUnreachable},
+		{"enetunreach", &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ENETUNREACH)}, dialFailureUnreachable},
+		{"ehostunreach", &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.EHOSTUNREACH)}, dialFailureUnreachable},
 		{"emfile", syscall.EMFILE, dialFailureUnreachable},
 		{"eaddrnotavail", syscall.EADDRNOTAVAIL, dialFailureUnreachable},
 		{"generic", errors.New("some non-syscall dial failure"), dialFailureUnreachable},
+		// timeouts: the dialer's own, its socket deadline, the kernel's
+		{"dial timeout", dialTimeoutError(t), dialFailureNone},
+		{"context deadline", fmt.Errorf("dial: %w", context.DeadlineExceeded), dialFailureNone},
+		{"socket deadline", &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}, dialFailureNone},
+		{"etimedout", &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ETIMEDOUT)}, dialFailureNone},
 	}
 
 	for _, protocol := range []IpProtocol{IpProtocolTcp, IpProtocolUdp} {
@@ -47,10 +77,9 @@ func TestClassifyDialFailure(t *testing.T) {
 				ipPath := dialFailureTestPath(protocol, version)
 
 				want := c.wantTcp
-				if protocol == IpProtocolUdp {
+				if protocol == IpProtocolUdp && want == dialFailureRst {
 					// udp "dial" never yields a meaningful refusal at connect
-					// time, so every error -- ECONNREFUSED included -- is
-					// capacity-class.
+					// time, so ECONNREFUSED is capacity-class there.
 					want = dialFailureUnreachable
 				}
 
@@ -90,9 +119,9 @@ func TestClassifyDialFailure(t *testing.T) {
 							parsed.SourceHostPort(), parsed.DestinationHostPort(),
 							ipPath.SourceHostPort(), ipPath.DestinationHostPort())
 					}
-				case dialFailureRst:
+				case dialFailureRst, dialFailureNone:
 					if packet != nil {
-						t.Errorf("%s: rst action must not carry a packet, got %d bytes", label, len(packet))
+						t.Errorf("%s: action %d must not carry a packet, got %d bytes", label, action, len(packet))
 					}
 				default:
 					t.Errorf("%s: unexpected action %d", label, action)

@@ -755,11 +755,10 @@ func reraceSegment(path *IpPath, offset uint32, payload []byte) []byte {
 	return reraceTcpPacket(path, tcpFlagAck|tcpFlagPsh, path.SequenceNumber+1+offset, reraceServerIsn+1, payload)
 }
 
-// reraceProviderSignal is the packet a provider sends when its upstream dial
-// for the flow fails: ipOosUnreachable over the provider's flow path, which
-// carries the 5-tuple and sequence zero.
-func reraceProviderSignal(t *testing.T, path *IpPath) []byte {
-	flowPath := &IpPath{
+// reraceProviderFlowPath is the provider's path for the flow: the 5-tuple,
+// with sequence zero.
+func reraceProviderFlowPath(path *IpPath) *IpPath {
+	return &IpPath{
 		Version:         path.Version,
 		Protocol:        path.Protocol,
 		SourceIp:        path.SourceIp,
@@ -767,7 +766,12 @@ func reraceProviderSignal(t *testing.T, path *IpPath) []byte {
 		DestinationIp:   path.DestinationIp,
 		DestinationPort: path.DestinationPort,
 	}
-	signal, ok := ipOosUnreachable(flowPath)
+}
+
+// reraceProviderSignal is the packet a provider sends when its upstream dial
+// for the flow fails at once: ipOosUnreachable over the provider's flow path.
+func reraceProviderSignal(t *testing.T, path *IpPath) []byte {
+	signal, ok := ipOosUnreachable(reraceProviderFlowPath(path))
 	if !ok {
 		t.Errorf("could not build the dial-failure signal for %+v", path)
 	}
@@ -1490,6 +1494,72 @@ func TestDialFailureNeverDowngradesIpv6OnlyExit(t *testing.T) {
 		}
 		if !v6.dialStarved() {
 			t.Error("the v6-only exit's strikes did not read as starvation")
+		}
+	})
+}
+
+// RR-7, IPV6.md C7. A dual-stack exit whose IPv6 works keeps it when two
+// hosts have a blackholed AAAA. The app sends each IPv6 SYN, connects over
+// IPv4 250ms later and abandons the IPv6 attempt (happy eyeballs), so it never
+// retransmits and the silence inference never fires. The provider's dials
+// time out at its ConnectTimeout, and it answers each as classifyDialFailure
+// decides: with nothing. A signal then could speed nothing up; it would only
+// strike the exit for a flow no one waits on, and three strikes across the
+// two hosts would make the exit v4-only for the life of the window and here
+// take IPv6 out of the session.
+func TestDialTimeoutOfAbandonedFlowsKeepsHealthyIpv6Exit(t *testing.T) {
+	timeout := dialTimeoutError(t)
+	connectTimeout := DefaultConnectSettings().ConnectTimeout
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, family: IpFamilyDualstack, answer: func(path *IpPath) reraceAnswer {
+				if path.Version == 6 && path.DestinationIp[len(path.DestinationIp)-1] != 10 {
+					// the provider's dial to the blackholed AAAA is pending
+					return reraceSilent
+				}
+				return reraceAccept
+			}},
+			{name: "b", tier: 1, family: IpFamilyV4Only},
+		}, nil)
+		a := harness.channel("a")
+
+		// A's IPv6 works
+		healthy := reraceFlow(6, 0, 44000)
+		if _, _, ok := harness.connect(healthy); !ok || harness.boundTo(healthy) != a {
+			t.Fatal("setup: A's IPv6 connect did not complete")
+		}
+		harness.sleep(dialStrikeWindow + time.Second)
+
+		losers := []*IpPath{reraceFlow(6, 1, 44001), reraceFlow(6, 2, 44002), reraceFlow(6, 1, 44003)}
+		for i, loser := range losers {
+			harness.syn(loser)
+			harness.sleep(250 * time.Millisecond)
+			winner := reraceFlow(4, 1+i%2, 44101+i)
+			if _, _, ok := harness.connect(winner); !ok {
+				t.Fatalf("setup: IPv4 connect %d did not complete", i)
+			}
+		}
+		if got := harness.metrics().FlowsReraced; got != 0 {
+			t.Fatalf("setup: %d re-races before the dials timed out", got)
+		}
+
+		// the provider's dials time out, and it answers each as it decides
+		harness.sleep(connectTimeout)
+		for _, loser := range losers {
+			if _, signal := classifyDialFailure(reraceProviderFlowPath(loser), timeout); signal != nil {
+				harness.inject("a", signal)
+			}
+		}
+
+		if got := a.IpFamily(); got != IpFamilyDualstack {
+			t.Errorf("A's category = %q after dial timeouts of abandoned flows to two broken hosts, want dualstack: A's IPv6 works", got)
+		}
+		if !harness.multiClient.Ipv6Available() {
+			t.Error("IPv6 is no longer available through the window")
+		}
+		if got := a.dialFailureCount(); got != 0 {
+			t.Errorf("A carries %d dial strikes for flows the app had abandoned", got)
 		}
 	})
 }
