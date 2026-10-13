@@ -463,6 +463,12 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 		self.refuseSession(conn, lagApiErrorTicket)
 		return
 	}
+	// a used ticket is refused before anything is built for it, so a replay
+	// costs only its check (M3)
+	if self.ticketUsed(body.TicketId) {
+		self.refuseSession(conn, lagApiErrorReused)
+		return
+	}
 	session, err := newLagApiSession(self, conn, body, lagApiClientIp(r.RemoteAddr))
 	if err != nil {
 		self.server.reportError("lag session", err)
@@ -471,10 +477,21 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 	}
 	session.serverName = r.TLS.ServerName
 	if code := self.admitSession(session); code != "" {
+		// a refused admission releases what it built, the session's context
+		// above all, so refusals cannot accumulate (M3)
+		session.cancel()
 		self.refuseSession(conn, code)
 		return
 	}
 	session.serve()
+}
+
+// Whether a ticket's id is one an admitted session used (M3).
+func (self *extenderLagApi) ticketUsed(ticketId []byte) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	_, ok := self.usedTickets[string(ticketId)]
+	return ok
 }
 
 // Ends a session that was never admitted with its error and close (M4).

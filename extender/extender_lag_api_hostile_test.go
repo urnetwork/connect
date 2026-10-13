@@ -5,11 +5,14 @@ package extender
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -206,5 +209,56 @@ func TestLagApiSubnetConnectionCap(t *testing.T) {
 	})
 	for _, conn := range conns {
 		conn.Close()
+	}
+}
+
+// The live children of a cancel context, read through its internals: what a
+// context that is never canceled leaves behind.
+func testLagContextChildCount(t *testing.T, ctx context.Context) int {
+	t.Helper()
+	value := reflect.ValueOf(ctx)
+	for value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
+		value = value.Elem()
+	}
+	children := value.FieldByName("children")
+	if !children.IsValid() {
+		t.Fatalf("%T has no children", ctx)
+	}
+	return children.Len()
+}
+
+// M3: a refused admission releases everything it built, so replaying one
+// ticket, or knocking while the sessions are full, grows nothing, however many
+// times it is refused.
+func TestLagApiRefusedAdmissionsGrowNothing(t *testing.T) {
+	fixture := newLagApiFixture(t, func(settings *ExtenderLagSettings) {
+		settings.MaxSessions = 1
+	})
+	ticketText := fixture.ticket(nil)
+	fixture.openHelloSession(ticketText)
+	childCount := testLagContextChildCount(t, fixture.api.ctx)
+
+	refuse := func(ticketText string, code string) {
+		conn, _, err := fixture.dialWebSocket("/lag/v1/session?ticket="+url.QueryEscape(ticketText), testLagOrigin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		message := testLagMessage{}
+		if err := conn.ReadJSON(&message); err != nil || message.Type != "error" || message.Code != code {
+			t.Fatalf("refused as %+v: %v", message, err)
+		}
+	}
+	for i := 0; i < 100; i += 1 {
+		// the used ticket, replayed
+		refuse(ticketText, lagApiErrorReused)
+		// a fresh ticket, while the sessions are full
+		refuse(fixture.ticket(nil), lagApiErrorSessions)
+	}
+	waitFor(t, func() bool {
+		return testLagContextChildCount(t, fixture.api.ctx) <= childCount
+	})
+	if usedCount := fixture.api.usedTicketOrder.Len(); usedCount != 1 {
+		t.Errorf("%d used tickets", usedCount)
 	}
 }
