@@ -4184,3 +4184,68 @@ promotion or signed-iOS total-footprint claim.
 
 See [the accepted private-QA ledger addendum](../tests/PERFVAR-MEASUREMENTS.md#collector-publication-repair--accepted-private-qa-not-device-qualification)
 for exact scopes and retained source/evidence references.
+
+## Public-playback failure and lost H1 bracket — private, unqualified proposal
+
+The frozen 2026-10-13 UTC attempt
+`physical-first-runner-setup-collector-checkpoint.TnULxC/campaign.current/round-perf-collector-01`
+failed its first Pixel/iOS32/control/Wi-Fi public H1 bracket at 03:23:35.
+The physical report retained only the preceding Direct observation; it
+reported failed workload children and an incomplete matrix. Both public
+CNN/Bloomberg children completed with exit 2, committed navigation and observed
+nonempty samples, but no playback progress. Their raw failures remain failures
+in the retained child denominator. The three H1 fast.com readings were 76,
+36 and 1.5 Mbps: the 36-Mbps median also fails the unchanged 40-Mbps floor.
+
+The session retained 71 primitive memory samples, peaking at 26,320,912 bytes
+(25.10158 MiB). The auxiliary/combined retained peak was 27,009,040 bytes
+(25.75783 MiB). The passing H1 live quiet gate reported a 26,009,616-byte peak
+over 22 samples spanning 315 seconds. These sampled values were below 32 MiB;
+they are not a qualified memory result. The workload failure occurred before
+the H1 observation/bracket was registered, so the finalizer omitted H1's
+bracket-specific teardown replay. The retained eligible Direct replay is not
+an H1 replay or a full-session/full-matrix substitute. Raw memory and teardown
+artifacts remain available; the frozen failed report is not rewritten.
+
+The proposed source packet `review-physical-public-playback.djHZWR` is PRIVATE
+and UNQUALIFIED: no candidate formatting, tests, device run or performance
+improvement is claimed. It proposes only the previously user-authorized,
+fixed public-playback policy: completed owned exit-2 nonprogress is diagnostic
+when navigation is committed and samples are observed/nonempty, without
+signals or interruption. Both public probes still run; raw child exits,
+results and failed-child counts remain, with a separate diagnostic count.
+Launch/deadline/identity/invalid-result/cleanup failures remain fatal.
+P2P video playback remains mandatory. The H1 speed floor remains mandatory,
+so this policy alone would not make the frozen 36-Mbps bracket pass.
+
+The separate retention repair proposes registering failed public brackets
+and invalid observations before final teardown checks, preserving late peaks
+and replay failures under both exact budgets. A peer failure before quiet
+retains both roles' raw evidence without fabricating an uncollected quiet
+window. Physical coverage/row version 3 would bind the exact policy
+`public-observed-nonprogress-diagnostic-v1`; historical strict version-2
+results stay immutable and cannot be relabeled.
+
+Fresh full physical qualification is pending: zero qualified cells out of
+168 and zero qualified required observations out of 560. Both profiles retain
+seven blocks/280 observations each, separate control/candidate builds,
+both allowlisted phones, Wi-Fi/cellular and P2P roles, all memory phases and
+absolute 32/64-MiB runtime/teardown gates. There is no Android64 measured
+performance/utilization improvement, baseline promotion, or signed-iOS
+total-`phys_footprint` claim from this Android surrogate.
+
+See [the matching measurement-ledger incident note](../tests/PERFVAR-MEASUREMENTS.md#public-playback-failure-and-lost-h1-bracket--private-unqualified-proposal)
+for the retained failed-run and private source-proposal scope.
+
+### Harness repair qualification update (2026-10-13)
+
+The public-playback policy and failed-bracket retention repair is now integrated.
+Its deterministic pre-fix controls reproduced both defects. Private candidate
+validation passed the 20 focused tests in eight fresh normal/race processes,
+the full backend (337 top-level and 601 nested tests) in normal/race mode, and
+the outer runner (95 top-level and 180 nested tests) in normal/race mode.
+Live code matches those tested postimages. This qualifies the harness repair,
+not physical performance or memory: the fresh full 168-cell/560-observation
+campaign for the 32 MiB iOS surrogate and 64 MiB Android profile is still pending.
+The prior 36 Mbps H1 median remains below the unchanged 40 Mbps floor; neither
+this repair nor Android measurements establish native iOS footprint below 50 MiB.
