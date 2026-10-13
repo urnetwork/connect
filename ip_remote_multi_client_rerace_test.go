@@ -1861,7 +1861,10 @@ func TestDialFailureEveryExitFailsReracesOncePerRetransmit(t *testing.T) {
 // RR-8. In the default wide race, where every exit of the best tier gets the
 // SYN, a destination every exit fails costs at most one attempt per exit per
 // app SYN: the signals of race candidates re-race nothing, and the app hears
-// nothing before its own timeout.
+// nothing before its own timeout. Exits that answer nothing but signals are
+// benched for silence and replaced as the SYNs go on, so a later SYN can find
+// a single exit; a race of one commits at once, and that exit's signal does
+// re-race the flow. Only those SYNs may account for a re-race.
 func TestDialFailureEveryExitFailsInWideRaceStaysBounded(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
@@ -1876,15 +1879,34 @@ func TestDialFailureEveryExitFailsInWideRaceStaysBounded(t *testing.T) {
 			t.Fatal("the connect completed although every exit fails")
 		}
 		exitSyns := 0
+		sent := harness.sentSyns(path)
+		// how many exits each app SYN reached: the last app SYN sent before
+		// an exit's SYN is the one it forwards
+		receivers := make([]int, len(sent))
 		for _, name := range []string{"a", "b", "c"} {
-			exitSyns += len(harness.exit(name).syns(path))
+			for _, packet := range harness.exit(name).syns(path) {
+				exitSyns += 1
+				j := len(sent) - 1
+				for 0 <= j && packet.at.Before(sent[j]) {
+					j -= 1
+				}
+				if 0 <= j {
+					receivers[j] += 1
+				}
+			}
 		}
 		if exitSyns == 0 || 3*synCount < exitSyns {
 			t.Errorf("the exits received %d SYNs for %d app SYNs, want at most one per exit each", exitSyns, synCount)
 		}
+		unraced := 0
+		for _, count := range receivers {
+			if count == 1 {
+				unraced += 1
+			}
+		}
 		metrics := harness.metrics()
-		if metrics.FlowsReraced != 0 {
-			t.Errorf("FlowsReraced = %d, want 0: a race candidate's signal unbinds nothing", metrics.FlowsReraced)
+		if uint64(unraced) < metrics.FlowsReraced {
+			t.Errorf("FlowsReraced = %d, but only %d app SYNs reached a single exit (per SYN %v): a race candidate's signal unbinds nothing", metrics.FlowsReraced, unraced, receivers)
 		}
 		if metrics.DialFailuresIntercepted != uint64(exitSyns) {
 			t.Errorf("DialFailuresIntercepted = %d, want one per failed dial (%d)", metrics.DialFailuresIntercepted, exitSyns)
