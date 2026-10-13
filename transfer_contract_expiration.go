@@ -17,6 +17,7 @@ func (self *sequenceContract) expired() bool {
 
 // An announcement's wire debit belongs to the current contract. The unused
 // successor owns only an opening reservation, which has no pending data ack.
+// The current contract is left with no successor, so it may request another.
 func (self *SendSequence) discardAheadContract() {
 	ahead := self.aheadSendContract
 	if ahead == nil {
@@ -24,6 +25,7 @@ func (self *SendSequence) discardAheadContract() {
 	}
 	self.aheadSendContract = nil
 	self.aheadSendContractAttempted = false
+	self.successorContractRequested = false
 	ahead.rollbackUnwritten(0)
 	self.retireSendContract(ahead)
 }

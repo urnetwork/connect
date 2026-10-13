@@ -204,7 +204,7 @@ func TestApiMultiClientResidentRetirementRequiresActualAuthoritySuccess(t *testi
 					generator.SetIdentityStore(&fakeIdentityStore{})
 					generator.cancel()
 				}
-				err := generator.removeClientArgsAndWait(t.Context(), args, func(context.Context) error { commits++; return nil })
+				err := generator.removeClientArgsAndWait(t.Context(), args, true, nil, func(context.Context) error { commits++; return nil })
 				if commits != 0 || ((scenario == "replacement" || scenario == "restart") && calls != 0) {
 					t.Fatal("non-retirement removed resident")
 				}

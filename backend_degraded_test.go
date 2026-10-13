@@ -1,6 +1,10 @@
 package connect
 
 import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"sync"
 	"testing"
@@ -225,43 +229,22 @@ func TestBackendDegraded_ConcurrentFailuresReachThreshold(t *testing.T) {
 	}
 }
 
-// The auth sites must make the same local-teardown carve-out the contract OOB
-// path makes on client.Done: a canceled dial is this process shutting a
-// transport down, not the backend failing. Closing a multi-client window
-// cancels many transports at once, and without the guard that burst of
-// canceled dials trips the threshold with fresh timestamps -- so the NEXT
-// session starts gated. runH1/runH3 are connect loops that need a live server
-// to drive, so this pins the call-site shape the way the resize-pass anchors
-// do, for both transports at once.
+// Auth failure accounting must remain inside the actual local-teardown and
+// credential-refusal guards. Extra conjuncts must not break this source check.
 func TestAuthCancellationIsNotBackendFailure(t *testing.T) {
 	source, err := readSource("transport.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
-		fn    string
-		guard string
+		method string
+		guards []string
 	}{
-		{
-			fn:    "func (self *PlatformTransport) runH1(",
-			guard: "if self.ctx.Err() == nil {",
-		},
-		{
-			fn:    "func (self *PlatformTransport) runH3(",
-			guard: "if ctx.Err() == nil {",
-		},
+		{method: "runH1", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
+		{method: "runH3", guards: []string{"ctx.Err() == nil", "refusal == 0", "!attemptCanceled"}},
 	} {
-		body, ok := functionBody(source, test.fn)
-		if !ok {
-			t.Fatalf("could not find %s", test.fn)
-		}
-		note := strings.Index(body, "self.noteDialFailure()")
-		if note < 0 {
-			t.Fatalf("%s no longer records auth failures; the degraded signal lost its transport half", test.fn)
-		}
-		guarded := strings.Index(body, test.guard)
-		if guarded < 0 || note < guarded {
-			t.Fatalf("%s records auth failures without the local-teardown carve-out: a canceled dial would count as a backend failure", test.fn)
+		if err := authFailureSourceGuards(source, test.method, test.guards); err != nil {
+			t.Errorf("%s: %v", test.method, err)
 		}
 	}
 
@@ -286,5 +269,193 @@ func TestAuthCancellationIsNotBackendFailure(t *testing.T) {
 	pinned := strings.Index(body, "if self.pinned() {")
 	if pinned < 0 || note < pinned {
 		t.Fatal("noteDialFailure counts a family-pinned transport's dial failure as a backend failure")
+	}
+}
+
+// Inspect only the platform runner's real call ancestors. A required expression
+// must be a mandatory conjunction on the true branch containing every call;
+// unrelated branches and deferred/asynchronous execution are not authority.
+func authFailureSourceGuards(source string, method string, required []string) error {
+	file, err := parser.ParseFile(token.NewFileSet(), "transport.go", source, 0)
+	if err != nil {
+		return fmt.Errorf("cannot parse transport source: %w", err)
+	}
+	var body *ast.BlockStmt
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != method || function.Recv == nil || len(function.Recv.List) != 1 {
+			continue
+		}
+		receiver := function.Recv.List[0]
+		pointer, ok := receiver.Type.(*ast.StarExpr)
+		if !ok || len(receiver.Names) != 1 || receiver.Names[0].Name != "self" {
+			continue
+		}
+		name, ok := pointer.X.(*ast.Ident)
+		if ok && name.Name == "PlatformTransport" {
+			body = function.Body
+			break
+		}
+	}
+	if body == nil || len(required) == 0 {
+		return fmt.Errorf("missing platform runner or required guards")
+	}
+	guards := make([]ast.Expr, len(required))
+	for index, condition := range required {
+		guards[index], err = parser.ParseExpr(condition)
+		if err != nil {
+			return fmt.Errorf("cannot parse required auth guard: %w", err)
+		}
+	}
+	unparen := func(expression ast.Expr) ast.Expr {
+		for {
+			parenthesized, ok := expression.(*ast.ParenExpr)
+			if !ok {
+				return expression
+			}
+			expression = parenthesized.X
+		}
+	}
+	// Only the expression shapes used by these three auth guards are accepted.
+	var sameExpression func(ast.Expr, ast.Expr) bool
+	sameExpression = func(left ast.Expr, right ast.Expr) bool {
+		left, right = unparen(left), unparen(right)
+		switch left := left.(type) {
+		case *ast.Ident:
+			right, ok := right.(*ast.Ident)
+			return ok && left.Name == right.Name
+		case *ast.BasicLit:
+			right, ok := right.(*ast.BasicLit)
+			return ok && left.Kind == right.Kind && left.Value == right.Value
+		case *ast.SelectorExpr:
+			right, ok := right.(*ast.SelectorExpr)
+			return ok && left.Sel.Name == right.Sel.Name && sameExpression(left.X, right.X)
+		case *ast.CallExpr:
+			right, ok := right.(*ast.CallExpr)
+			return ok && len(left.Args) == 0 && len(right.Args) == 0 && sameExpression(left.Fun, right.Fun)
+		case *ast.UnaryExpr:
+			right, ok := right.(*ast.UnaryExpr)
+			return ok && left.Op == right.Op && sameExpression(left.X, right.X)
+		case *ast.BinaryExpr:
+			right, ok := right.(*ast.BinaryExpr)
+			return ok && left.Op == right.Op && sameExpression(left.X, right.X) && sameExpression(left.Y, right.Y)
+		default:
+			return false
+		}
+	}
+	var mandatoryConjunct func(ast.Expr, ast.Expr) bool
+	mandatoryConjunct = func(condition ast.Expr, guard ast.Expr) bool {
+		if sameExpression(condition, guard) {
+			return true
+		}
+		conjunction, ok := unparen(condition).(*ast.BinaryExpr)
+		return ok && conjunction.Op == token.LAND &&
+			(mandatoryConjunct(conjunction.X, guard) || mandatoryConjunct(conjunction.Y, guard))
+	}
+	callCount, unsafeCount := 0, 0
+	var ancestors []ast.Node
+	ast.Inspect(body, func(node ast.Node) bool {
+		if node == nil {
+			ancestors = ancestors[:len(ancestors)-1]
+			return true
+		}
+		if call, ok := node.(*ast.CallExpr); ok {
+			selector, selected := unparen(call.Fun).(*ast.SelectorExpr)
+			if selected && selector.Sel.Name == "noteDialFailure" {
+				self, own := unparen(selector.X).(*ast.Ident)
+				if own && self.Name == "self" {
+					callCount++
+					guarded := make([]bool, len(guards))
+				ancestorsLoop:
+					for index := len(ancestors) - 1; 0 <= index; index-- {
+						switch ancestor := ancestors[index].(type) {
+						case *ast.FuncLit, *ast.GoStmt, *ast.DeferStmt:
+							break ancestorsLoop
+						case *ast.IfStmt:
+							if ancestor.Body.Pos() < call.Pos() && call.End() < ancestor.Body.End() {
+								for guardIndex, guard := range guards {
+									guarded[guardIndex] = guarded[guardIndex] || mandatoryConjunct(ancestor.Cond, guard)
+								}
+							}
+						}
+					}
+					for _, present := range guarded {
+						if !present {
+							unsafeCount++
+							break
+						}
+					}
+				}
+			}
+		}
+		ancestors = append(ancestors, node)
+		return true
+	})
+	if callCount == 0 || unsafeCount != 0 {
+		return fmt.Errorf("auth failure calls=%d without required containing guards=%d", callCount, unsafeCount)
+	}
+	return nil
+}
+
+// The old exact-brace anchor rejected the current stronger conjunction. Both
+// that form and a nested/reordered guard must retain their mandatory meaning.
+func TestAuthFailureSourceGuardAcceptsMandatoryConjuncts(t *testing.T) {
+	for _, test := range []struct {
+		name, method, body string
+		guards             []string
+	}{
+		{name: "old bare guard", method: "runH1", body: "if self.ctx.Err() == nil { self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil"}},
+		{name: "current h1 guard", method: "runH1", body: "if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
+		{name: "reordered and parenthesized", method: "runH1", body: "if ((refusal == 0) && ((self.ctx.Err()) == (nil))) { self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
+		{name: "nested h3 attempt", method: "runH3", body: "if ctx.Err() == nil && refusal == 0 { if !attemptCanceled { self.noteDialFailure() } }", guards: []string{"ctx.Err() == nil", "refusal == 0", "!attemptCanceled"}},
+		{name: "both guarded calls", method: "runH1", body: "if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure(); self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
+	} {
+		source := "package connect\nfunc (self *PlatformTransport) " + test.method + "() { " + test.body + " }\n"
+		if err := authFailureSourceGuards(source, test.method, test.guards); err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+	}
+}
+
+// Syntax near a call is not evidence that local teardown is excluded. These
+// controls fail deterministically without dialing, waiting, or changing runtime.
+func TestAuthFailureSourceGuardRejectsUnsafeMutants(t *testing.T) {
+	for _, test := range []struct{ name, body string }{
+		{name: "no guard", body: "self.noteDialFailure()"},
+		{name: "or allows cancellation", body: "if self.ctx.Err() == nil || refusal == 0 { self.noteDialFailure() }"},
+		{name: "unrelated earlier guard", body: "if self.ctx.Err() == nil && refusal == 0 {}; self.noteDialFailure()"},
+		{name: "else is not live", body: "if self.ctx.Err() == nil && refusal == 0 {} else { self.noteDialFailure() }"},
+		{name: "missing context", body: "if refusal == 0 { self.noteDialFailure() }"},
+		{name: "missing refusal", body: "if self.ctx.Err() == nil { self.noteDialFailure() }"},
+		{name: "second unguarded call", body: "if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure() }; self.noteDialFailure()"},
+		{name: "parenthesized unguarded call", body: "if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure() }; (self.noteDialFailure)()"},
+		{name: "late callback", body: "if self.ctx.Err() == nil && refusal == 0 { callback = func() { self.noteDialFailure() } }"},
+		{name: "spawned call", body: "if self.ctx.Err() == nil && refusal == 0 { go self.noteDialFailure() }"},
+		{name: "deferred call", body: "if self.ctx.Err() == nil && refusal == 0 { defer self.noteDialFailure() }"},
+		{name: "guard only in comment", body: "/* if self.ctx.Err() == nil && refusal == 0 { */ self.noteDialFailure()"},
+		{name: "no accounting call", body: "if self.ctx.Err() == nil && refusal == 0 {}"},
+	} {
+		source := "package connect\nfunc (self *PlatformTransport) runH1() { " + test.body + " }\n"
+		if err := authFailureSourceGuards(source, "runH1", []string{"self.ctx.Err() == nil", "refusal == 0"}); err == nil {
+			t.Fatalf("%s admitted unsafe auth accounting", test.name)
+		}
+	}
+	for _, body := range []string{
+		"if ctx.Err() == nil && refusal == 0 { self.noteDialFailure() }",
+		"if ctx.Err() == nil && refusal == 0 { if !attemptCanceled || other { self.noteDialFailure() } }",
+	} {
+		source := "package connect\nfunc (self *PlatformTransport) runH3() { " + body + " }\n"
+		if err := authFailureSourceGuards(source, "runH3", []string{"ctx.Err() == nil", "refusal == 0", "!attemptCanceled"}); err == nil {
+			t.Fatal("h3 accounting admitted a canceled attempt")
+		}
+	}
+	for _, source := range []string{
+		"package connect\nfunc (self *OtherTransport) runH1() { if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure() } }",
+		"package connect\nfunc (self *PlatformTransport) other() { if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure() } }",
+		"package connect\nfunc (",
+	} {
+		if err := authFailureSourceGuards(source, "runH1", []string{"self.ctx.Err() == nil", "refusal == 0"}); err == nil {
+			t.Fatal("missing or malformed runner passed the guard check")
+		}
 	}
 }

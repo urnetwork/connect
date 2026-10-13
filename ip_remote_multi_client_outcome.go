@@ -2,10 +2,10 @@ package connect
 
 import (
 	"context"
-	mathrand "math/rand"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -331,27 +331,42 @@ func (self *multiClientWindow) recordEvaluationFailure(fallback windowFailureCla
 // windowRetryDelay converts a recorded failure into how long the expander
 // should wait before asking again.
 //
-// Everything except a rate limit keeps the flat WindowEnumerateErrorTimeout.
 // A rate limit doubles from WindowRateLimitBackoffMin toward
-// WindowRateLimitBackoffMax per CONSECUTIVE rate limit, then takes uniform
-// jitter across [delay/2, delay). The counter is shared by every expander in
-// the window and is reset by windowRetryReset on any successful generator
-// call, so a one-off 429 costs one backoff and a genuine storm decays.
+// WindowRateLimitBackoffMax per CONSECUTIVE rate limit. Every other failure
+// (a deadline, an exhausted pool, a 503, an auth refusal) doubles the same way
+// from WindowEnumerateErrorTimeout toward WindowErrorBackoffMax on its own
+// streak. Both take uniform jitter across [delay/2, delay). The counters are
+// shared by every expander in the window and are reset by windowRetryReset on
+// any successful platform call, so a one-off failure costs one short wait and
+// a sustained dependency outage is not re-asked every second by every window.
 func (self *multiClientWindow) windowRetryDelay(class windowFailureClass) time.Duration {
 	if class != windowFailureRateLimit {
-		return self.settings.WindowEnumerateErrorTimeout
+		max := self.settings.WindowErrorBackoffMax
+		if max <= 0 {
+			// legacy settings literal: the flat cadence
+			return self.settings.WindowEnumerateErrorTimeout
+		}
+		return self.windowBackoff(&self.errorStreak, self.settings.WindowEnumerateErrorTimeout, max)
 	}
 	min := self.settings.WindowRateLimitBackoffMin
 	if min <= 0 {
 		min = self.settings.WindowEnumerateErrorTimeout
 	}
-	max := self.settings.WindowRateLimitBackoffMax
+	return self.windowBackoff(&self.rateLimitStreak, min, self.settings.WindowRateLimitBackoffMax)
+}
+
+// Doubles from min toward max per consecutive count on `streak`, jittered.
+func (self *multiClientWindow) windowBackoff(streak *atomic.Uint64, min time.Duration, max time.Duration) time.Duration {
+	if min <= 0 {
+		// a zero floor (test fixtures) retries at once without doubling
+		return 0
+	}
 	if max < min {
 		max = min
 	}
 	// Bounded shift: consecutive counts climb without limit during a long
 	// outage, and 1<<64 is not a delay.
-	n := self.rateLimitStreak.Add(1) - 1
+	n := streak.Add(1) - 1
 	delay := min
 	for i := uint64(0); i < n && delay < max; i++ {
 		delay *= 2
@@ -361,18 +376,15 @@ func (self *multiClientWindow) windowRetryDelay(class windowFailureClass) time.D
 	}
 	// Jitter DOWNWARD only, so the cap is a real ceiling: dozens of expanders
 	// that failed in the same instant must not retry in lockstep.
-	half := delay / 2
-	if half <= 0 {
-		return delay
-	}
-	return half + time.Duration(mathrand.Int63n(int64(half)))
+	return self.retryJitter(delay)
 }
 
-// windowRetryReset clears the rate-limit streak after a generator call that
-// did NOT fail. Without this the window would stay in a long backoff after the
+// windowRetryReset clears both failure streaks after a platform call that did
+// NOT fail. Without this the window would stay in a long backoff after the
 // platform recovered.
 func (self *multiClientWindow) windowRetryReset() {
 	self.rateLimitStreak.Store(0)
+	self.errorStreak.Store(0)
 }
 
 // stallReason derives the current diagnosis.

@@ -280,8 +280,16 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// wait this time before enumerating potential clients again
 		// WindowEnumerateEmptyTimeout: 5 * time.Second,
 		WindowEnumerateErrorTimeout: 1 * time.Second,
-		WindowRateLimitBackoffMin:   5 * time.Second,
-		WindowRateLimitBackoffMax:   2 * time.Minute,
+		// a dependency failure (deadline, pool exhaustion, 503) doubles the
+		// retry from WindowEnumerateErrorTimeout to this, jittered; short
+		// enough that a client on a recovering network reconnects promptly
+		WindowErrorBackoffMax:     15 * time.Second,
+		WindowRateLimitBackoffMin: 5 * time.Second,
+		WindowRateLimitBackoffMax: 2 * time.Minute,
+		// an unreachable fixed destination is re-dialed after 7.5-15s, then
+		// half as often per failure down to once per 2.5-5 minutes
+		FixedDestinationRetryMin: 15 * time.Second,
+		FixedDestinationRetryMax: 5 * time.Minute,
 		// long enough for a slow-but-alive platform API round trip; a hung
 		// API must never wedge the enumerate/expand machinery
 		WindowGeneratorTimeout:      20 * time.Second,
@@ -836,6 +844,20 @@ type MultiClientSettings struct {
 	// lockstep no matter how long the delay. Any success resets it.
 	WindowRateLimitBackoffMin time.Duration
 	WindowRateLimitBackoffMax time.Duration
+	// WindowErrorBackoffMax bounds the same jittered doubling for every other
+	// generator failure, from WindowEnumerateErrorTimeout: a deadline, an
+	// exhausted connection pool, a 503 or an auth refusal. The flat 1s retry
+	// was the same herd as above. A hosted host runs a window per device, so
+	// when its control database slowed down, every device re-minted every
+	// second and kept the pool exhausted. Nonpositive keeps the legacy flat
+	// cadence.
+	WindowErrorBackoffMax time.Duration
+	// FixedDestinationRetryMin / Max pace re-dials of a fixed destination
+	// after consecutive failed attempts, doubling from Min to Max with
+	// jitter; a Reliability verdict defers by Max at once. See
+	// ip_remote_multi_client_fixed_retry.go. Nonpositive Min disables pacing.
+	FixedDestinationRetryMin time.Duration
+	FixedDestinationRetryMax time.Duration
 	// WindowGeneratorTimeout bounds each generator call the window's
 	// enumerate/expand machinery makes (NextDestinations, NewClientArgs,
 	// NewClientArgsForDestination). The generator wraps a platform API that
@@ -10341,6 +10363,11 @@ type multiClientWindow struct {
 	// property of the window rather than of each goroutine. See
 	// windowRetryDelay.
 	rateLimitStreak atomic.Uint64
+	// Consecutive non-rate-limit generator failures, shared the same way.
+	errorStreak atomic.Uint64
+	// Replaces the uniform jitter offset in [0, half) with a deterministic
+	// one. Production leaves it unset.
+	retryJitterForTest func(half time.Duration) time.Duration
 
 	generator                    MultiClientGenerator
 	clientReceivePacketCallback  clientReceivePacketFunction
@@ -10440,6 +10467,9 @@ type multiClientWindow struct {
 	// -- user action, cleanup of already-dead clients, lifetime drains, and
 	// capacity collapse never touch it. See verdictRemovalAllowed.
 	verdictRemovalTimes []time.Time
+	// Re-dial pacing of a fixed window's failed destinations. Guarded by
+	// stateLock. See ip_remote_multi_client_fixed_retry.go.
+	fixedRetries map[MultiHopId]*fixedDestinationRetry
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
@@ -10937,6 +10967,12 @@ func (self *multiClientWindow) contractStatusFromClient(client *multiClientChann
 					if excluder, ok := self.generator.(MultiClientGeneratorExcluder); ok {
 						excluder.ExcludeClientId(client.args.Destination.Tail())
 					}
+				} else {
+					// A fixed destination cannot be excluded: it is the only
+					// choice for its slot. The verdict (its client is inactive
+					// and never reactivated) defers the re-dial by the maximum
+					// instead of minting another identity against it at once.
+					self.noteFixedDestinationFailed(client.args.Destination, true, time.Now())
 				}
 			}
 			client.setWarning(true, warnUnhealthy)
@@ -11154,9 +11190,13 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			}
 			continue
 		}
-		// The platform answered. Any success clears the rate-limit backoff so
-		// the window returns to its normal cadence once the limit lifts.
-		self.windowRetryReset()
+		// The platform answered. Any success clears the backoff so the window
+		// returns to its normal cadence once the platform recovers. A fixed
+		// destination set is listed locally without asking the platform, so
+		// it proves nothing about the mint that is backing off.
+		if _, fixed := self.generator.FixedDestinationSize(); !fixed {
+			self.windowRetryReset()
+		}
 
 		// unconditional (V0): the platform answered with ZERO candidates. Only
 		// a failure while the window is empty — a full window legitimately
@@ -11182,6 +11222,12 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			for _, enumerated := range destinations {
 				destination, stats := enumerated.destination, enumerated.stats
 				if _, fixed := self.generator.FixedDestinationSize(); fixed {
+					// A destination waiting out its re-dial backoff is not
+					// offered; the expansion that follows the deferral
+					// re-enumerates it.
+					if self.fixedDestinationDeferred(destination, time.Now()) {
+						continue
+					}
 					// Fixed membership has no useful speculative identity. Offer
 					// only the destination; expand owns any subsequent mint.
 					args := &multiClientChannelArgs{
@@ -11950,7 +11996,16 @@ func (self *multiClientWindow) resize() {
 		}
 
 		addedCount := 0
-		if len(clients) < targetWindowSize {
+		// A fixed window whose every missing destination is waiting out its
+		// re-dial backoff mints nothing this pass. Health, rotation and
+		// collapse above keep their cadence; the wait below ends with the
+		// first deferral.
+		var redialTime time.Time
+		redialDeferred := false
+		if fixedDestination && len(clients) < targetWindowSize {
+			redialTime, redialDeferred = self.fixedRetryDeferral(targetWindowSize-len(clients), time.Now())
+		}
+		if len(clients) < targetWindowSize && !redialDeferred {
 			// expand
 			neededCount := targetWindowSize - len(clients)
 			plannedAdmitCount, _ := multiClientExpandPlan(
@@ -12002,6 +12057,9 @@ func (self *multiClientWindow) resize() {
 		}
 
 		timeout := self.settings.WindowResizeTimeout - time.Now().Sub(startTime)
+		if redialDeferred {
+			timeout = min(timeout, time.Until(redialTime))
+		}
 		if timeout <= 0 {
 			select {
 			case <-self.ctx.Done():
@@ -12139,6 +12197,9 @@ func (self *multiClientWindow) expand(
 	pendingPingFailures := []pendingPingFailure{}
 	expandEnded := false
 	passDeadlineExpired := false
+	// The fixed destinations this pass attempted, and whether each was
+	// admitted. Guarded by mutex.
+	fixedAttempts := map[MultiHopId]bool{}
 
 	// admitCandidate installs one evaluated candidate into the window, running
 	// the same-clientId replacement gate exactly as the pre-pooling install
@@ -12252,6 +12313,10 @@ func (self *multiClientWindow) expand(
 		// the outcome watchdog stands down: this window has proven it can
 		// install a provider (and a latched failed state is cleared)
 		self.noteClientAdded(client)
+		if _, attempted := fixedAttempts[args.Destination]; attempted {
+			fixedAttempts[args.Destination] = true
+			self.noteFixedDestinationAdmitted(args.Destination)
+		}
 		// K1: the extenders carrying this exit ride its dot from here on
 		go HandleError(func() {
 			self.watchExtenderIps(client)
@@ -12377,6 +12442,14 @@ func (self *multiClientWindow) expand(
 				observedBudgetMax = observedBudget
 			}
 		}
+		// every attempted fixed destination that was not admitted, whatever
+		// failed: the mint, setup, contract or the initial ping
+		failedFixedDestinations := []MultiHopId{}
+		for destination, admitted := range fixedAttempts {
+			if !admitted {
+				failedFixedDestinations = append(failedFixedDestinations, destination)
+			}
+		}
 		mutex.Unlock()
 
 		self.recordEvaluationBudgetExhausted(
@@ -12384,6 +12457,13 @@ func (self *multiClientWindow) expand(
 			effectiveBudgetMin,
 			observedBudgetMax,
 		)
+		// window teardown is lifecycle, not evidence against a destination
+		if self.ctx.Err() == nil {
+			now := time.Now()
+			for _, destination := range failedFixedDestinations {
+				self.noteFixedDestinationFailed(destination, false, now)
+			}
+		}
 	}()
 
 	requestEndTime, passEndTime := multiClientExpandDeadlines(
@@ -12437,6 +12517,19 @@ requestCandidates:
 					i--
 					continue requestCandidates
 				}
+				if self.fixedDestinationDeferred(args.Destination, candidateTime) {
+					// Offered before its last attempt failed. The deferral
+					// owns its next attempt; the enumerator no longer offers it.
+					i--
+					continue requestCandidates
+				}
+				// From here the pass owns this destination's attempt. Unless it
+				// is admitted, the pass end defers its next one.
+				func() {
+					mutex.Lock()
+					defer mutex.Unlock()
+					fixedAttempts[args.Destination] = false
+				}()
 				requestCtx, cancelRequest := context.WithDeadline(self.ctx, requestEndTime)
 				clientArgs, err := self.fixedClientArgs(requestCtx, args.Destination)
 				cancelRequest()

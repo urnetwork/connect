@@ -368,10 +368,14 @@ func (self *expirationLifecycleFixture) sequences() (*SendSequence, *ReceiveSequ
 
 // The same sequence renews an unspent active contract and retires an already
 // acknowledged, unused successor. Neither can survive by being prefetched.
+// The announced successor is the one requested at take: this row's pings never
+// bring a successor due, so the lead time is zero.
 func TestSignedContractExpirationRenewsActiveAndAheadWithoutLosingSequence(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		f := newExpirationLifecycleFixture(t, true)
+		f := newExpirationLifecycleFixture(t, true, func(settings *ClientSettings) {
+			settings.SendBufferSettings.ContractPrefetchLeadTime = 0
+		})
 		defer f.close()
 		f.finishSend(f.startSend("opening"))
 		barrier := &expirationLifecycleWireBarrier{

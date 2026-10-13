@@ -380,6 +380,15 @@ func TestExtenderNetworkClientSamplesAnExtender(t *testing.T) {
 
 	bootstrapIp := netip.MustParseAddr("198.51.100.40")
 	networkClient := fixture.newNetworkClient(t, ctx, directory, func(settings *connect.ExtenderNetworkClientSettings) {
+		if settings.ResolveDns == nil || settings.ResolveDnsTxt == nil {
+			t.Fatal("feed fixture left a bootstrap resolver on the host network")
+		}
+		if addrs, err := settings.ResolveDns(ctx, settings.ExtenderDnsName); err != nil || len(addrs) != 0 {
+			t.Fatal("default feed address resolver must return an empty synthetic answer")
+		}
+		if txts, err := settings.ResolveDnsTxt(ctx, settings.ExtenderDnsName); err != nil || len(txts) != 0 {
+			t.Fatal("default feed TXT resolver must return an empty synthetic answer")
+		}
 		settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
 			return []netip.Addr{bootstrapIp}, nil
 		}
@@ -550,6 +559,10 @@ func (self *feedFixture) newNetworkClient(
 	settings.DialTimeout = 20 * time.Second
 	settings.HelloTimeout = 20 * time.Second
 	settings.IpVersionSupported = func(ipVersion int) bool { return true }
+	// Feed tests own both bootstrap record types. Individual tests may supply
+	// answers below; an omitted seam must never fall back to the host DNS.
+	settings.ResolveDns = func(context.Context, string) ([]netip.Addr, error) { return nil, nil }
+	settings.ResolveDnsTxt = func(context.Context, string) ([]string, error) { return nil, nil }
 	settings.Hello = func(ctx context.Context) (*connect.ExtenderHelloResult, error) {
 		return &connect.ExtenderHelloResult{
 			RootPublicKeyHexes: []string{hex.EncodeToString(self.rootPublic)},
