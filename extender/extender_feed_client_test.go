@@ -568,15 +568,6 @@ func (self *feedFixture) newNetworkClient(
 			RootPublicKeyHexes: []string{hex.EncodeToString(self.rootPublic)},
 		}, nil
 	}
-	// the bootstrap answers nothing unless a test answers it, so neither the
-	// address nor the TXT resolution reaches a public DoH server or the
-	// system resolver
-	settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
-		return nil, nil
-	}
-	settings.ResolveDnsTxt = func(ctx context.Context, name string) ([]string, error) {
-		return nil, nil
-	}
 	if configure != nil {
 		configure(settings)
 	}
