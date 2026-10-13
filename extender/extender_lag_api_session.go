@@ -36,7 +36,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -366,9 +365,9 @@ type lagApiSession struct {
 	ticketExpire  time.Time
 	trackId       []byte
 	trackPosition uint32
-	// the browser's address on the control connection (M8), and its
-	// admission subnet when the per-subnet limits apply to it (M3)
-	clientIp      []byte
+	// the control connection's address and its admission subnet when the
+	// per-subnet limits apply to it (M3). Both are held in memory for
+	// admission only: no report or log carries them (M8, amendment 9).
 	remoteAddress string
 	subnet        extenderSubnetHash
 	subnetLimited bool
@@ -417,7 +416,6 @@ func newLagApiSession(
 	api *extenderLagApi,
 	conn *websocket.Conn,
 	body *protocol.LagTicketBody,
-	clientIp []byte,
 ) (*lagApiSession, error) {
 	sessionId, err := newLagApiSessionId()
 	if err != nil {
@@ -453,7 +451,6 @@ func newLagApiSession(
 		ticketExpire:     time.UnixMilli(int64(min(body.ExpireTimeMs, math.MaxInt64))).Add(api.ticketExpireSkew),
 		trackId:          body.TrackId,
 		trackPosition:    body.TrackPosition,
-		clientIp:         clientIp,
 		pingInterval:     durationOf(body.PingIntervalMs, lagApiDefaultPingInterval, lagApiMinPingInterval, lagApiMaxPingInterval),
 		downloadDuration: durationOf(body.DownloadMs, lagApiDefaultPhaseDuration, lagApiInterval, lagApiMaxPhaseDuration),
 		uploadDuration:   durationOf(body.UploadMs, lagApiDefaultPhaseDuration, lagApiInterval, lagApiMaxPhaseDuration),
@@ -501,7 +498,7 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 		self.refuseSession(conn, lagApiErrorReused)
 		return
 	}
-	session, err := newLagApiSession(self, conn, body, lagApiClientIp(r.RemoteAddr))
+	session, err := newLagApiSession(self, conn, body)
 	if err != nil {
 		self.server.reportError("lag session", err)
 		self.refuseSession(conn, lagApiErrorInternal)
@@ -535,15 +532,6 @@ func (self *extenderLagApi) refuseSession(conn *websocket.Conn, code string) {
 		conn.WriteMessage(websocket.TextMessage, messageBytes)
 	}
 	lagApiCloseWebSocket(conn, lagApiErrorCloseCode(code), code)
-}
-
-// The browser's address as the extender saw it, 4 or 16 bytes (M8).
-func lagApiClientIp(remoteAddr string) []byte {
-	addrPort, err := netip.ParseAddrPort(remoteAddr)
-	if err != nil {
-		return nil
-	}
-	return addrPort.Addr().Unmap().AsSlice()
 }
 
 // Checks a ticket (M3): the root signature under the ticket domain with the
@@ -1370,7 +1358,6 @@ func (self *lagApiSession) reportBody(now time.Time) *protocol.LagReportBody {
 		ExtenderPublicKey:  self.api.identityPublicKey,
 		TrackId:            self.trackId,
 		TrackPosition:      self.trackPosition,
-		ClientIp:           self.clientIp,
 		SessionStartTimeMs: uint64(self.startTime.UnixMilli()),
 		IntervalMs:         uint32(lagApiInterval.Milliseconds()),
 	}

@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"sync"
@@ -36,6 +37,8 @@ import (
 
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/connect/protocol"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 )
 
 // The synthetic measurement name -- an extender id under a zone (N1) --
@@ -1617,9 +1620,8 @@ func TestLagApiLoadAndReport(t *testing.T) {
 	if string(body.TicketId) == "" || body.TrackPosition != 3 || len(body.TrackId) != 16 {
 		t.Errorf("ticket fields %x %d %x", body.TicketId, body.TrackPosition, body.TrackId)
 	}
-	if !net.IP(body.ClientIp).Equal(net.IPv4(127, 0, 0, 1)) || len(body.ClientIp) != 4 {
-		t.Errorf("client ip %v", body.ClientIp)
-	}
+	// the browser's address appears nowhere in the report (amendment 9)
+	assertLagReportCarriesNoAddress(t, body, netip.MustParseAddr("127.0.0.1"))
 	if body.WindowStartTimeMs+500 < body.SessionStartTimeMs+700 {
 		t.Errorf("window at %d, session at %d", body.WindowStartTimeMs, body.SessionStartTimeMs)
 	}
@@ -2156,4 +2158,49 @@ func TestLagApiDispatchThroughExtender(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A report names no client address (lag.dev/PLAN.md M8, amendment 9): its
+// encoding holds no field 5, where ClientIp was, and no unknown field, and
+// neither the peer address's bytes nor its text appear anywhere in it.
+func assertLagReportCarriesNoAddress(t *testing.T, body *protocol.LagReportBody, peer netip.Addr) {
+	t.Helper()
+	if unknown := body.ProtoReflect().GetUnknown(); len(unknown) != 0 {
+		t.Errorf("the report holds %d bytes of unknown fields", len(unknown))
+	}
+	bodyBytes, err := proto.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for b := bodyBytes; 0 < len(b); {
+		number, _, n := protowire.ConsumeField(b)
+		if n < 0 {
+			t.Fatalf("the report does not parse: %v", protowire.ParseError(n))
+		}
+		if number == 5 {
+			t.Errorf("the report holds field 5, where the client address was")
+		}
+		b = b[n:]
+	}
+	forms := [][]byte{
+		peer.AsSlice(),
+		[]byte(peer.String()),
+	}
+	if peer.Is4() {
+		forms = append(forms, netip.AddrFrom16(peer.As16()).AsSlice())
+	}
+	for _, form := range forms {
+		if bytesContain(bodyBytes, form) {
+			t.Errorf("the report holds the peer address as %x", form)
+		}
+	}
+}
+
+func bytesContain(b []byte, sub []byte) bool {
+	for i := 0; i+len(sub) <= len(b); i++ {
+		if string(b[i:i+len(sub)]) == string(sub) {
+			return true
+		}
+	}
+	return false
 }

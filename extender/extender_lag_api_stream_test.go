@@ -31,7 +31,7 @@ func (self *lagApiFixture) directSession(maxStreamCount uint32) *lagApiSession {
 		ExpireTimeMs: uint64(time.Now().Add(2 * time.Minute).UnixMilli()),
 		MaxStreams:   maxStreamCount,
 	}
-	session, err := newLagApiSession(self.api, nil, body, nil)
+	session, err := newLagApiSession(self.api, nil, body)
 	if err != nil {
 		self.t.Fatal(err)
 	}

@@ -304,17 +304,15 @@ func (x *LagTicket) GetRootKeyId() []byte {
 // A7): the minute around the session's load, or its last minute when it
 // had none.
 type LagReportBody struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	TicketId          []byte                 `protobuf:"bytes,1,opt,name=TicketId,proto3" json:"TicketId,omitempty"`
-	ExtenderPublicKey []byte                 `protobuf:"bytes,2,opt,name=ExtenderPublicKey,proto3" json:"ExtenderPublicKey,omitempty"`
-	TrackId           []byte                 `protobuf:"bytes,3,opt,name=TrackId,proto3" json:"TrackId,omitempty"`
-	TrackPosition     uint32                 `protobuf:"varint,4,opt,name=TrackPosition,proto3" json:"TrackPosition,omitempty"`
-	// 4 or 16 bytes: the browser's address as the extender saw it
-	ClientIp           []byte   `protobuf:"bytes,5,opt,name=ClientIp,proto3" json:"ClientIp,omitempty"`
-	SessionStartTimeMs uint64   `protobuf:"varint,6,opt,name=SessionStartTimeMs,proto3" json:"SessionStartTimeMs,omitempty"` // extender clock
-	WindowStartTimeMs  uint64   `protobuf:"varint,7,opt,name=WindowStartTimeMs,proto3" json:"WindowStartTimeMs,omitempty"`   // the reported minute starts here
-	PingOffsetMs       []uint32 `protobuf:"varint,8,rep,packed,name=PingOffsetMs,proto3" json:"PingOffsetMs,omitempty"`      // each ping's send time, ms after WindowStartTimeMs
-	PingMicros         []uint32 `protobuf:"varint,9,rep,packed,name=PingMicros,proto3" json:"PingMicros,omitempty"`          // its round trip; 0 when lost (no pong within 5 s)
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	TicketId           []byte                 `protobuf:"bytes,1,opt,name=TicketId,proto3" json:"TicketId,omitempty"`
+	ExtenderPublicKey  []byte                 `protobuf:"bytes,2,opt,name=ExtenderPublicKey,proto3" json:"ExtenderPublicKey,omitempty"`
+	TrackId            []byte                 `protobuf:"bytes,3,opt,name=TrackId,proto3" json:"TrackId,omitempty"`
+	TrackPosition      uint32                 `protobuf:"varint,4,opt,name=TrackPosition,proto3" json:"TrackPosition,omitempty"`
+	SessionStartTimeMs uint64                 `protobuf:"varint,6,opt,name=SessionStartTimeMs,proto3" json:"SessionStartTimeMs,omitempty"` // extender clock
+	WindowStartTimeMs  uint64                 `protobuf:"varint,7,opt,name=WindowStartTimeMs,proto3" json:"WindowStartTimeMs,omitempty"`   // the reported minute starts here
+	PingOffsetMs       []uint32               `protobuf:"varint,8,rep,packed,name=PingOffsetMs,proto3" json:"PingOffsetMs,omitempty"`      // each ping's send time, ms after WindowStartTimeMs
+	PingMicros         []uint32               `protobuf:"varint,9,rep,packed,name=PingMicros,proto3" json:"PingMicros,omitempty"`          // its round trip; 0 when lost (no pong within 5 s)
 	// the session's load, in ms after WindowStartTimeMs; a zero duration means none
 	DownloadStartMs       uint32       `protobuf:"varint,10,opt,name=DownloadStartMs,proto3" json:"DownloadStartMs,omitempty"`
 	DownloadMs            uint32       `protobuf:"varint,11,opt,name=DownloadMs,proto3" json:"DownloadMs,omitempty"`
@@ -388,13 +386,6 @@ func (x *LagReportBody) GetTrackPosition() uint32 {
 		return x.TrackPosition
 	}
 	return 0
-}
-
-func (x *LagReportBody) GetClientIp() []byte {
-	if x != nil {
-		return x.ClientIp
-	}
-	return nil
 }
 
 func (x *LagReportBody) GetSessionStartTimeMs() uint64 {
@@ -591,13 +582,12 @@ const file_lag_proto_rawDesc = "" +
 	"\tLagTicket\x12\x12\n" +
 	"\x04Body\x18\x01 \x01(\fR\x04Body\x12$\n" +
 	"\rRootSignature\x18\x02 \x01(\fR\rRootSignature\x12\x1c\n" +
-	"\tRootKeyId\x18\x03 \x01(\fR\tRootKeyId\"\xb8\x06\n" +
+	"\tRootKeyId\x18\x03 \x01(\fR\tRootKeyId\"\xac\x06\n" +
 	"\rLagReportBody\x12\x1a\n" +
 	"\bTicketId\x18\x01 \x01(\fR\bTicketId\x12,\n" +
 	"\x11ExtenderPublicKey\x18\x02 \x01(\fR\x11ExtenderPublicKey\x12\x18\n" +
 	"\aTrackId\x18\x03 \x01(\fR\aTrackId\x12$\n" +
-	"\rTrackPosition\x18\x04 \x01(\rR\rTrackPosition\x12\x1a\n" +
-	"\bClientIp\x18\x05 \x01(\fR\bClientIp\x12.\n" +
+	"\rTrackPosition\x18\x04 \x01(\rR\rTrackPosition\x12.\n" +
 	"\x12SessionStartTimeMs\x18\x06 \x01(\x04R\x12SessionStartTimeMs\x12,\n" +
 	"\x11WindowStartTimeMs\x18\a \x01(\x04R\x11WindowStartTimeMs\x12\"\n" +
 	"\fPingOffsetMs\x18\b \x03(\rR\fPingOffsetMs\x12\x1e\n" +
@@ -620,7 +610,7 @@ const file_lag_proto_rawDesc = "" +
 	"\x0fDownloadStreams\x18\x12 \x01(\rR\x0fDownloadStreams\x12$\n" +
 	"\rUploadStreams\x18\x13 \x01(\rR\rUploadStreams\x12&\n" +
 	"\x0eUploadVerified\x18\x14 \x01(\bR\x0eUploadVerified\x125\n" +
-	"\tEndReason\x18\x15 \x01(\x0e2\x17.bringyour.LagEndReasonR\tEndReason\"=\n" +
+	"\tEndReason\x18\x15 \x01(\x0e2\x17.bringyour.LagEndReasonR\tEndReasonJ\x04\b\x05\x10\x06R\bClientIp\"=\n" +
 	"\tLagReport\x12\x12\n" +
 	"\x04Body\x18\x01 \x01(\fR\x04Body\x12\x1c\n" +
 	"\tSignature\x18\x02 \x01(\fR\tSignature*\xbc\x01\n" +

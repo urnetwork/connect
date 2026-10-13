@@ -51,7 +51,6 @@ func newTestLagReportBody(extenderPublicKey ed25519.PublicKey, now time.Time) *p
 		ExtenderPublicKey:     extenderPublicKey,
 		TrackId:               bytes.Repeat([]byte{0x33}, 16),
 		TrackPosition:         3,
-		ClientIp:              []byte{203, 0, 113, 7},
 		SessionStartTimeMs:    uint64(now.Add(-90 * time.Second).UnixMilli()),
 		WindowStartTimeMs:     uint64(now.Add(-time.Minute).UnixMilli()),
 		PingOffsetMs:          []uint32{0, 250, 500, 750},

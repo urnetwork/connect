@@ -51,8 +51,10 @@ message LagReportBody {
     bytes ExtenderPublicKey = 2;
     bytes TrackId = 3;
     uint32 TrackPosition = 4;
-    // 4 or 16 bytes: the browser's address as the extender saw it
-    bytes ClientIp = 5;
+    // was ClientIp: a report never carries the browser's address
+    // (lag.dev/PLAN.md amendment 9)
+    reserved 5;
+    reserved "ClientIp";
     uint64 SessionStartTimeMs = 6;              // extender clock
     uint64 WindowStartTimeMs = 7;               // the reported minute starts here
     repeated uint32 PingOffsetMs = 8;           // each ping's send time, ms after WindowStartTimeMs
