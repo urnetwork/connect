@@ -259,7 +259,7 @@ delivers that signal to the local stack only when it is well formed and
 bounded, carries the provider's dial-failure type and code, comes from the
 provider the SYN went to, is addressed back from the SYN's destination to
 its source, and its embedded header names an outstanding SYN of the client
-by 5-tuple and initial sequence number. A reply on the flow, admission or
+by 5-tuple (providers embed sequence zero). A reply on the flow, admission or
 the SYN's 30 s lifetime ends that eligibility, and at most 256 SYNs are
 tracked. Unrelated, spoofed, malformed or late ICMP and every other ICMP
 type stay dropped; the multi client keeps its own intercept

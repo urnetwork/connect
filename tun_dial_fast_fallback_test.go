@@ -113,8 +113,11 @@ func newTunFastFallbackFixture(t *testing.T, signalFrom func(provider Id) Id) *t
 				_, _ = right.Write(egress)
 				MessagePoolReturn(egress)
 			case ipPath.Syn && !ipPath.Ack:
-				// the provider cannot dial IPv6 and says so
-				if signal, ok := ipOosUnreachable(ipPath); ok {
+				// the provider cannot dial IPv6 and says so, from its flow
+				// path, which carries no sequence number
+				flowPath := *ipPath
+				flowPath.SequenceNumber = 0
+				if signal, ok := ipOosUnreachable(&flowPath); ok {
 					deliver(signalFrom(provider), signal)
 				}
 			}

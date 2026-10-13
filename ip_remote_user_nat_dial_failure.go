@@ -11,9 +11,11 @@ package connect
 // well-formed, bounded unreachable with the provider's dial-failure code,
 // addressed back from the SYN's destination to its source, sent by the
 // provider the SYN went to, and its embedded header must name an outstanding
-// SYN of this client by 5-tuple and initial sequence number. Admission
-// consumes that SYN; any reply on the flow clears it. Every other ICMP stays
-// dropped. The multi client keeps its own intercept (ip_remote_multi_client.go).
+// SYN of this client by 5-tuple. The embedded sequence number is not
+// compared: providers embed their flow path, whose sequence is zero.
+// Admission consumes that SYN; any reply on the flow clears it. Every other
+// ICMP stays dropped. The multi client keeps its own intercept
+// (ip_remote_multi_client.go).
 
 import (
 	"encoding/binary"
@@ -44,7 +46,6 @@ type remoteUserNatSynKey struct {
 
 type remoteUserNatPendingSyn struct {
 	provider Id
-	sequence uint32
 	expires  time.Time
 }
 
@@ -95,7 +96,6 @@ func (self *remoteUserNatDialFailures) syn(ipPath *IpPath, provider Id) {
 	}
 	self.pending[key] = remoteUserNatPendingSyn{
 		provider: provider,
-		sequence: ipPath.SequenceNumber,
 		expires:  now.Add(remoteUserNatPendingSynLifetime),
 	}
 }
@@ -137,7 +137,7 @@ func (self *remoteUserNatDialFailures) admit(provider Id, packet []byte) (*IpPat
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	pending, tracked := self.pending[key]
-	if !tracked || pending.provider != provider || pending.sequence != egress.SequenceNumber {
+	if !tracked || pending.provider != provider {
 		return nil, false
 	}
 	delete(self.pending, key)

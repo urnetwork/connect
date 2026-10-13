@@ -69,9 +69,25 @@ func TestRemoteUserNatDialFailureAdmitsProviderSignalForOutstandingSyn(t *testin
 	}
 }
 
+// IPV6.md C7. A deployed provider builds its signal from its flow path,
+// whose sequence number is zero, so the gate matches the 5-tuple alone.
+func TestRemoteUserNatDialFailureAdmitsDeployedProviderSignal(t *testing.T) {
+	for _, version := range []int{4, 6} {
+		var gate remoteUserNatDialFailures
+		provider := NewId()
+		syn := icmpTcpTestPath(version)
+		gate.syn(syn, provider)
+		flowPath := *syn
+		flowPath.SequenceNumber = 0
+		if _, ok := gate.admit(provider, dialFailureSignal(t, &flowPath)); !ok {
+			t.Fatalf("v%d: the deployed provider's signal was not admitted", version)
+		}
+	}
+}
+
 // IPV6.md C7. Only the SYN's own flow is admitted: no recorded SYN, another
-// port, another destination or another sequence number is unrelated, and
-// none of them consumes the real SYN.
+// port or another destination is unrelated, and none of them consumes the
+// real SYN.
 func TestRemoteUserNatDialFailureIgnoresUnrelatedSignal(t *testing.T) {
 	for _, version := range []int{4, 6} {
 		provider := NewId()
@@ -82,11 +98,10 @@ func TestRemoteUserNatDialFailureIgnoresUnrelatedSignal(t *testing.T) {
 		}
 		var gate remoteUserNatDialFailures
 		gate.syn(syn, provider)
-		otherPort, otherDestination, otherSequence := *syn, *syn, *syn
+		otherPort, otherDestination := *syn, *syn
 		otherPort.SourcePort++
 		otherDestination.DestinationPort++
-		otherSequence.SequenceNumber++
-		for name, unrelated := range map[string]*IpPath{"port": &otherPort, "destination": &otherDestination, "sequence": &otherSequence} {
+		for name, unrelated := range map[string]*IpPath{"port": &otherPort, "destination": &otherDestination} {
 			if _, ok := gate.admit(provider, dialFailureSignal(t, unrelated)); ok {
 				t.Fatalf("v%d: admitted a signal for another %s", version, name)
 			}
