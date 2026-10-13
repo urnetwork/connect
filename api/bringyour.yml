@@ -4740,6 +4740,11 @@ paths:
         stored. A track from a signing agent, or from an address in a hosting
         or cloud network, is marked automated, with which of the two it was
         and nothing more; its results count in no aggregate.
+
+        The lagdev command line and MCP server name themselves with an
+        `X-Lag-Client` header, `cli` or `mcp`, and the track keeps which
+        client ran it. A browser sends none, which means `web`; the header is
+        not among the allowed CORS request headers.
       operationId: lagTrack
       security:
         - BearerAuth: []
