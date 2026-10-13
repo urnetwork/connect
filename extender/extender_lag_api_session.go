@@ -31,7 +31,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,6 +39,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -73,6 +73,11 @@ const lagApiMaxUsedTicketCount = 64 * 1024
 
 // The pings a session keeps: a minute at the fastest cadence, with room.
 const lagApiPingRingCount = 320
+
+// The random payload of each ping (M4): unpredictable, so no client can answer
+// a ping before it arrives and have the extender sign a round trip below the
+// path's.
+const lagApiPingPayloadByteCount = 16
 
 // The timings of a session (M4, M8). Tests shorten them.
 type lagApiTimings struct {
@@ -226,6 +231,12 @@ type lagApiPong struct {
 	arrivalTime time.Time
 }
 
+// The ping in flight (M4): its random payload and when it was sent.
+type lagApiInFlightPing struct {
+	payload  string
+	sendTime time.Time
+}
+
 // One ping's result (M4, M8).
 type lagApiPing struct {
 	sendTime time.Time
@@ -370,6 +381,9 @@ type lagApiSession struct {
 	messages chan lagApiControlMessage
 	pongs    chan lagApiPong
 	wake     chan struct{}
+	// the ping in flight, which the loop sets before it sends and the pong
+	// handler matches against; nil when none is (M4)
+	inFlight atomic.Pointer[lagApiInFlightPing]
 
 	stateLock sync.Mutex
 	// the session's load, nil before it; streams read it here
@@ -687,8 +701,16 @@ func (self *lagApiSession) serve() {
 	conn.SetReadLimit(lagApiMaxControlMessageByteCount)
 	// stamped as it is read, so the round trip does not wait on the loop
 	conn.SetPongHandler(func(appData string) error {
+		arrivalTime := time.Now()
+		// only a pong that echoes the ping in flight, arriving after it was
+		// sent, counts (M4): a stale, forged or early one is dropped here, so
+		// no flood of them can crowd out the one that answers
+		inFlight := self.inFlight.Load()
+		if inFlight == nil || appData != inFlight.payload || arrivalTime.Before(inFlight.sendTime) {
+			return nil
+		}
 		select {
-		case self.pongs <- lagApiPong{appData: appData, arrivalTime: time.Now()}:
+		case self.pongs <- lagApiPong{appData: appData, arrivalTime: arrivalTime}:
 		default:
 		}
 		return nil
@@ -900,7 +922,6 @@ func (self *lagApiSession) run() {
 	defer lossTimer.Stop()
 	pingC := pingTimer.C
 	var lossC <-chan time.Time
-	pingCount := uint64(0)
 	inFlightPayload := ""
 	var inFlightSendTime time.Time
 	lastPongTime := self.startTime
@@ -1160,11 +1181,15 @@ func (self *lagApiSession) run() {
 
 		case <-pingC:
 			pingC = nil
-			pingCount += 1
-			payload := make([]byte, 8)
-			binary.BigEndian.PutUint64(payload, pingCount)
+			payload := make([]byte, lagApiPingPayloadByteCount)
+			if _, err := rand.Read(payload); err != nil {
+				self.api.server.reportError("lag ping", err)
+				ok = false
+				break
+			}
 			inFlightPayload = string(payload)
 			inFlightSendTime = time.Now()
+			self.inFlight.Store(&lagApiInFlightPing{payload: inFlightPayload, sendTime: inFlightSendTime})
 			if err := self.conn.WriteControl(websocket.PingMessage, payload, inFlightSendTime.Add(timings.writeTimeout)); err != nil {
 				self.api.server.reportError("lag ping", err)
 				ok = false
@@ -1174,11 +1199,12 @@ func (self *lagApiSession) run() {
 			lossC = lossTimer.C
 
 		case pong := <-self.pongs:
-			lastPongTime = pong.arrivalTime
-			if lossC == nil || pong.appData != inFlightPayload {
+			if lossC == nil || pong.appData != inFlightPayload || pong.arrivalTime.Before(inFlightSendTime) {
 				// a pong for a ping already counted as lost
 				break
 			}
+			self.inFlight.Store(nil)
+			lastPongTime = pong.arrivalTime
 			lossTimer.Stop()
 			lossC = nil
 			rtt := pong.arrivalTime.Sub(inFlightSendTime)
@@ -1198,6 +1224,7 @@ func (self *lagApiSession) run() {
 
 		case <-lossC:
 			lossC = nil
+			self.inFlight.Store(nil)
 			self.pings.add(lagApiPing{sendTime: inFlightSendTime, lost: true})
 			ok = self.write(&lagApiRttMessage{
 				Type: "rtt",

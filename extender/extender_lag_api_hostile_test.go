@@ -7,14 +7,19 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/urnetwork/connect"
 )
@@ -394,5 +399,108 @@ func TestLagApiZoneNamesLookUnknown(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// M4: a client cannot forge the round trips the extender signs. Each ping
+// carries 16 random bytes, and only a pong echoing the ping in flight, arriving
+// after it was sent, counts: a flood of pongs sent ahead of the ping they would
+// answer -- predicting its payload, guessing it, or replaying an earlier
+// ping's -- changes nothing, and every round trip is the one the honest pong
+// takes, here at least the 200 ms it is held for.
+func TestLagApiForgedPongsNeverCount(t *testing.T) {
+	fixture := newLagApiFixture(t, nil)
+	conn, _, err := fixture.dialWebSocket("/lag/v1/session?ticket="+url.QueryEscape(fixture.ticket(nil)), testLagOrigin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	const pathDelay = 200 * time.Millisecond
+	payloads := make(chan string, 1024)
+	// the payload of the ping received last, and of the one before it
+	var lastPayload atomic.Pointer[string]
+	var earlierPayload atomic.Pointer[string]
+	conn.SetPingHandler(func(appData string) error {
+		payloads <- appData
+		earlierPayload.Store(lastPayload.Load())
+		lastPayload.Store(&appData)
+		go func() {
+			time.Sleep(pathDelay)
+			conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+		}()
+		return nil
+	})
+	stop := make(chan struct{})
+	var flood sync.WaitGroup
+	flood.Add(1)
+	go func() {
+		defer flood.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+			// a guess, an earlier ping's payload, and, were the payloads a
+			// counter, the next ping's; never the ping just received, which
+			// would be an honest answer
+			forged := [][]byte{testLagRandomBytes(16)}
+			if earlier := earlierPayload.Load(); earlier != nil {
+				forged = append(forged, []byte(*earlier))
+			}
+			if last := lastPayload.Load(); last != nil && len(*last) == 8 {
+				next := make([]byte, 8)
+				binary.BigEndian.PutUint64(next, binary.BigEndian.Uint64([]byte(*last))+1)
+				forged = append(forged, next)
+			}
+			for _, payload := range forged {
+				if err := conn.WriteControl(websocket.PongMessage, payload, time.Now().Add(time.Second)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	rtts := []float64{}
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			message := testLagMessage{}
+			if err := conn.ReadJSON(&message); err != nil {
+				return
+			}
+			if message.Type == "rtt" && message.Ms != nil {
+				rtts = append(rtts, *message.Ms)
+			}
+		}
+	}()
+	time.Sleep(3 * time.Second)
+	close(stop)
+	flood.Wait()
+	conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+	<-readDone
+	body := fixture.nextReport(10 * time.Second)
+
+	if len(rtts) < 3 {
+		t.Fatalf("%d rtts", len(rtts))
+	}
+	for _, ms := range rtts {
+		if ms < float64(pathDelay/time.Millisecond)-1 {
+			t.Errorf("a round trip of %f ms, below the path's %s", ms, pathDelay)
+		}
+	}
+	for _, pingMicros := range body.PingMicros {
+		if pingMicros != 0 && pingMicros < uint32((pathDelay-time.Millisecond)/time.Microsecond) {
+			t.Errorf("a signed round trip of %d us, below the path's %s", pingMicros, pathDelay)
+		}
+	}
+	// the payloads: 16 bytes, none repeated
+	close(payloads)
+	seen := map[string]bool{}
+	for payload := range payloads {
+		if len(payload) != lagApiPingPayloadByteCount || seen[payload] {
+			t.Errorf("payload %x", payload)
+		}
+		seen[payload] = true
 	}
 }
