@@ -4732,9 +4732,10 @@ paths:
         not count toward them. A refusal is a 200 with `error`.
 
         A new track keeps the caller's network (its autonomous system) and
-        the GeoLite2 City place of the caller's address, looked up when the
-        track is issued. The address itself, a prefix of it or a hash of it
-        is never stored.
+        the GeoLite2 City place of the caller's address, with the city's
+        coordinates when the place names a city, looked up when the track is
+        issued. The address itself, a prefix of it or a hash of it is never
+        stored.
       operationId: lagTrack
       security:
         - BearerAuth: []
