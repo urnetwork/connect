@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -357,5 +358,81 @@ func TestExtenderActivateResultExtenderId(t *testing.T) {
 	}
 	if bytes.Contains(resultBytes, []byte("extender_id")) {
 		t.Fatalf("answer = %s, expected no extender id", resultBytes)
+	}
+}
+
+// While the owner has opted out of measurement every post says so and carries
+// no request, and nothing follows a pass; once the opt-out ends a pass asked
+// for at once carries the request again and no longer says so (lag.dev/PLAN.md
+// C4).
+func TestExtenderActivatorMeasurementDisabled(t *testing.T) {
+	hook := &testMeasurementCsrHook{}
+	extenderId := NewId()
+	var disabled atomic.Bool
+	disabled.Store(true)
+	fixture := newTestMeasurementActivatorFixture(t, hook, extenderId, func(settings *ExtenderActivatorSettings) {
+		settings.MeasurementDisabled = disabled.Load
+	})
+
+	fixture.waitPass()
+	for i := range 2 {
+		post := fixture.waitPost()
+		if !post.args.MeasurementDisabled || post.args.MeasurementCsr != "" {
+			t.Fatalf("post %d = disabled %t, request %q, expected the opt-out alone", i, post.args.MeasurementDisabled, post.args.MeasurementCsr)
+		}
+	}
+	fixture.expectMeasurementPostCounts(1, 1)
+	if asks := hook.takeAsks(); len(asks) != 0 {
+		t.Fatalf("asks = %v, expected none while opted out", asks)
+	}
+
+	disabled.Store(false)
+	fixture.activator.Reactivate()
+	for i, expected := range []testMeasurementPost{
+		{ipVersion: 4, csr: testMeasurementCsr(extenderId)},
+		{ipVersion: 6},
+	} {
+		post := fixture.waitPost()
+		if post.ipVersion != expected.ipVersion || post.args.MeasurementCsr != expected.csr || post.args.MeasurementDisabled {
+			t.Fatalf("post %d = v%d disabled %t %q, expected v%d %q", i, post.ipVersion, post.args.MeasurementDisabled, post.args.MeasurementCsr, expected.ipVersion, expected.csr)
+		}
+	}
+	fixture.expectMeasurementPostCounts(2, 2)
+}
+
+// Reactivate runs a pass at once, without the clock moving: what the
+// measurement lifecycle asks for when the operator holds another key, and the
+// role when the owner opts out or back in (C4).
+func TestExtenderActivatorReactivate(t *testing.T) {
+	fixture := newTestActivatorFixture(t, nil)
+	fixture.waitPass()
+	fixture.expectMeasurementPosts(
+		testMeasurementPost{ipVersion: 4},
+		testMeasurementPost{ipVersion: 6},
+	)
+	fixture.activator.Reactivate()
+	fixture.expectMeasurementPosts(
+		testMeasurementPost{ipVersion: 4},
+		testMeasurementPost{ipVersion: 6},
+	)
+	fixture.expectMeasurementPostCounts(2, 2)
+}
+
+// The opt-out rides the activation as the operator reads it, and an activation
+// without it writes none (A10).
+func TestExtenderActivateArgsMeasurementDisabled(t *testing.T) {
+	argsBytes, err := json.Marshal(&ExtenderActivateArgs{MeasurementDisabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(argsBytes, []byte(`"measurement_disabled":true`)) {
+		t.Fatalf("args = %s, expected measurement_disabled", argsBytes)
+	}
+	argsBytes, err = json.Marshal(&ExtenderActivateArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(argsBytes, []byte("measurement_disabled")) {
+		t.Fatalf("args = %s, expected no measurement_disabled", argsBytes)
 	}
 }

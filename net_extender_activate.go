@@ -71,6 +71,11 @@ type ExtenderActivateArgs struct {
 	// certificate, which is most activations; an operator that predates the
 	// field ignores it.
 	MeasurementCsr string `json:"measurement_csr,omitempty"`
+	// the owner opted out of lag.dev measurement (lag.dev/PLAN.md C4, decision
+	// 18), so the operator withdraws the measurement name (C9). Set on every
+	// activation while the opt-out stands, and only by an extender that keeps
+	// its identity, which is all that can have a name to withdraw.
+	MeasurementDisabled bool `json:"measurement_disabled,omitempty"`
 }
 
 // The activation answer (C2). A refusal is a normal answer with `Activated`
@@ -210,6 +215,11 @@ type ExtenderActivatorSettings struct {
 	// with no post following. It runs on the loop goroutine and must not
 	// block.
 	MeasurementCsr func(extenderId Id) string
+	// MeasurementDisabled, when set, reports whether the owner has opted out of
+	// measurement (lag.dev/PLAN.md C4): every post made while it reports true
+	// carries measurement_disabled and no request, so the operator withdraws the
+	// measurement name (C9). It runs on the loop goroutine and must not block.
+	MeasurementDisabled func() bool
 
 	// The re-activation period (G3).
 	ActivateTimeout time.Duration
@@ -454,6 +464,14 @@ func (self *ExtenderActivator) Status() *ExtenderActivatorStatus {
 // separating.
 func (self *ExtenderActivator) ChangeMonitor() *MonitorValue[uint64] {
 	return self.changeMonitor
+}
+
+// Starts a pass at once, as a network change does (G3), for something the
+// operator should hear now rather than at the next tick: a measurement request
+// for a key it does not hold, or an owner's opt-out of measurement or its end
+// (lag.dev/PLAN.md C4). Safe to call from any goroutine.
+func (self *ExtenderActivator) Reactivate() {
+	self.networkChanged()
 }
 
 // Wakes the loop, which re-activates every family (G3). A path change can move
@@ -774,10 +792,15 @@ func (self *ExtenderActivator) activate(now time.Time) bool {
 // extender asks for under its id, and nothing until an answer has reported
 // that id (N4), since the request's one name is made from it.
 func (self *ExtenderActivator) measurementCsr() string {
-	if self.settings.MeasurementCsr == nil || self.extenderId == (Id{}) {
+	if self.settings.MeasurementCsr == nil || self.extenderId == (Id{}) || self.measurementDisabled() {
 		return ""
 	}
 	return self.settings.MeasurementCsr(self.extenderId)
+}
+
+// Whether the owner has opted out of measurement (lag.dev/PLAN.md C4).
+func (self *ExtenderActivator) measurementDisabled() bool {
+	return self.settings.MeasurementDisabled != nil && self.settings.MeasurementDisabled()
 }
 
 // Follows a successful pass that delivered no measurement request with one
@@ -846,14 +869,15 @@ func (self *ExtenderActivator) activateUrl(
 	now time.Time,
 ) bool {
 	args := &ExtenderActivateArgs{
-		PublicKeyHex:   hex.EncodeToString(self.settings.PublicKey),
-		TcpPort:        self.settings.TcpPort,
-		UdpPort:        self.settings.UdpPort,
-		DnsPort:        self.settings.DnsPort,
-		DnsPorts:       self.dnsPorts(),
-		DnsTld:         self.settings.DnsTld,
-		Carriers:       carriers,
-		MeasurementCsr: measurementCsr,
+		PublicKeyHex:        hex.EncodeToString(self.settings.PublicKey),
+		TcpPort:             self.settings.TcpPort,
+		UdpPort:             self.settings.UdpPort,
+		DnsPort:             self.settings.DnsPort,
+		DnsPorts:            self.dnsPorts(),
+		DnsTld:              self.settings.DnsTld,
+		Carriers:            carriers,
+		MeasurementCsr:      measurementCsr,
+		MeasurementDisabled: self.measurementDisabled(),
 	}
 	// publish the camouflage key only when the role set it (EXTENDER.md P6); an
 	// empty key is left off the args so an operator sees no camouflage key
