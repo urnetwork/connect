@@ -2065,10 +2065,9 @@ paths:
         clock, and its series are bounded: at most 600 pings, offsets within
         60 s, at most 40 intervals per direction, and no interval above what
         10 Gbps allows plus slack. Every other report is named in
-        `rejected` by its index, with why. The browser's address in a
-        report is reduced to the track's client fields (a peppered hash,
-        the /24 or /48, the network and the GeoLite2 City place) and is not
-        stored.
+        `rejected` by its index, with why. A report names no client
+        address, only the address family the browser reached the extender
+        on; nothing of the browser's address is stored.
 
         A post of more than 32 reports is refused whole with 400. Posts are
         rate limited per client; past the limit the answer is 429 with
@@ -4731,6 +4730,11 @@ paths:
         Requires a CLIENT jwt. New tracks are limited to 12 an hour per
         client and 60 an hour per /24 (IPv6 /48) of the caller; reissues do
         not count toward them. A refusal is a 200 with `error`.
+
+        A new track keeps the caller's network (its autonomous system) and
+        the GeoLite2 City place of the caller's address, looked up when the
+        track is issued. The address itself, a prefix of it or a hash of it
+        is never stored.
       operationId: lagTrack
       security:
         - BearerAuth: []
