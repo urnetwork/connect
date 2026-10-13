@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -133,7 +134,9 @@ const (
 // consumed by the client's channel intercept (`ipParseIcmpUnreachable`) and
 // deliberately carries a different code from teardown, because the two mean
 // opposite things: "your exit died, reconnect" versus "this provider could
-// not open the upstream, quietly race another".
+// not open the upstream, quietly race another". the provider's return path
+// passes it only as this exact packet for the flow that failed
+// (`providerDialFailureReturnPath`); providers before that check dropped it.
 //
 // the embedded datagram mirrors the original egress packet: the ip header
 // plus the 8 transport bytes rfc 792 requires. for tcp the embedded sequence
@@ -248,6 +251,24 @@ func ipParseIcmpUnreachable(packet []byte) (*IpPath, bool) {
 		}
 	}
 	return ipParseIcmpEmbeddedPath(icmp[icmpUnreachableHeaderSize:])
+}
+
+// providerDialFailureReturnPath is the return direction of flowPath when
+// packet is exactly the dial-failure signal the provider builds for that flow
+// (ipOosUnreachable over the flow's own path, as a failed upstream dial
+// sends it). The return path's inspection cannot parse an icmp error, so the
+// provider inspects its own signal as the flow's return instead. Any other
+// packet, an unreachable naming another flow, a different code or a single
+// changed byte, returns false and stays dropped (IPV6.md C7).
+func providerDialFailureReturnPath(flowPath *IpPath, packet []byte) (*IpPath, bool) {
+	if flowPath == nil {
+		return nil, false
+	}
+	signal, ok := ipOosUnreachable(flowPath)
+	if !ok || !bytes.Equal(signal, packet) {
+		return nil, false
+	}
+	return flowPath.Reverse(), true
 }
 
 // ipIcmpBody finds the icmp message of a packet whose transport is icmp (v4)

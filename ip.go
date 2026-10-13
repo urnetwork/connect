@@ -9622,7 +9622,23 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 		[][]byte{packet},
 	)
 	if err != nil {
-		return
+		// ParseIpPath rejects icmp errors. The one this provider originates
+		// for this very flow, its dial-failure signal, is inspected as the
+		// flow's return instead; anything else stays dropped (IPV6.md C7).
+		returnIpPath, ok := providerDialFailureReturnPath(ipPath, packet)
+		if !ok {
+			return
+		}
+		r, err = inspectAndRefreshEgressForSenderBorrowed(
+			self.securityPolicy,
+			source.SourceId,
+			provideMode,
+			*returnIpPath,
+			nil,
+		)
+		if err != nil {
+			return
+		}
 	}
 	if r != SecurityPolicyResultAllow {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)

@@ -253,17 +253,24 @@ literal the validator chose.
 
 A provider that cannot open a TCP dial answers the SYN with an ICMP
 destination-unreachable (`ipOosUnreachable`), so a family the provider
-lacks fails at once instead of costing the fallback delay. The
-single-destination client that carries the hops (`RemoteUserNatClient`)
-delivers that signal to the local stack only when it is well formed and
-bounded, carries the provider's dial-failure type and code, comes from the
-provider the SYN went to, is addressed back from the SYN's destination to
-its source, and its embedded header names an outstanding SYN of the client
-by 5-tuple (providers embed sequence zero). A reply on the flow, admission or
-the SYN's 30 s lifetime ends that eligibility, and at most 256 SYNs are
-tracked. Unrelated, spoofed, malformed or late ICMP and every other ICMP
-type stay dropped; the multi client keeps its own intercept
-(`ip_remote_user_nat_dial_failure.go`).
+lacks fails at once instead of costing the fallback delay. The provider's
+return path cannot parse an ICMP error, so it passes exactly the signal it
+builds for the flow that failed, inspected as that flow's return, and drops
+every other ICMP as before (`providerDialFailureReturnPath`). Providers
+before that fix drop their own signal: through them a dead family still
+costs the fallback delay. The single-destination client that carries the
+hops (`RemoteUserNatClient`) delivers the signal to the local stack only
+when it is well formed and bounded, carries the provider's dial-failure type
+and code, comes from the provider the SYN went to, is addressed back from
+the SYN's destination to its source, and its embedded header names an
+outstanding SYN of the client by 5-tuple (providers embed sequence zero). A
+reply on the flow, admission or the SYN's 30 s lifetime ends that
+eligibility, and at most 256 SYNs are tracked. Unrelated, spoofed, malformed
+or late ICMP and every other ICMP type stay dropped
+(`ip_remote_user_nat_dial_failure.go`). The same signal now also reaches the
+multi client, whose existing intercept re-races the failed flow
+(`clientDialFailure`); through older providers it keeps relying on its SYN
+silence inference.
 
 ### D. SDK, apps, tests
 

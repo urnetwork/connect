@@ -8650,7 +8650,8 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 // sourceClient's channel: an icmp destination-unreachable whose embed named the
 // egress flow egressIpPath. The provider could not open the upstream for that
 // flow and answered instead of going silent, so the source is not left in
-// syn-retransmit backoff.
+// syn-retransmit backoff. Only providers whose return path passes their own
+// signal send it (IPV6.md C7); an older provider's failed dial stays silent.
 //
 // It acts only on a flow that is (a) still known, (b) still pinned to the very
 // client that reported the failure, and (c) has never received inbound data --
