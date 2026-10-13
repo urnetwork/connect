@@ -36,6 +36,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -367,8 +368,10 @@ type lagApiSession struct {
 	trackPosition uint32
 	// the control connection's address and its admission subnet when the
 	// per-subnet limits apply to it (M3). Both are held in memory for
-	// admission only: no report or log carries them (M8, amendment 9).
+	// admission only: no report or log carries them (M8, amendment 9). The
+	// report names only the address family, 4 or 6.
 	remoteAddress string
+	ipFamily      uint32
 	subnet        extenderSubnetHash
 	subnetLimited bool
 
@@ -506,6 +509,7 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 	}
 	session.serverName = r.TLS.ServerName
 	session.remoteAddress = r.RemoteAddr
+	session.ipFamily = lagApiIpFamily(r.RemoteAddr)
 	session.subnet, session.subnetLimited = self.subnetOf(r.RemoteAddr)
 	if code := self.admitSession(session); code != "" {
 		// a refused admission releases what it built, the session's context
@@ -532,6 +536,19 @@ func (self *extenderLagApi) refuseSession(conn *websocket.Conn, code string) {
 		conn.WriteMessage(websocket.TextMessage, messageBytes)
 	}
 	lagApiCloseWebSocket(conn, lagApiErrorCloseCode(code), code)
+}
+
+// The address family of a connection's remote address, 4 or 6, after
+// unmapping a v4-mapped address; 0 when it does not parse.
+func lagApiIpFamily(remoteAddr string) uint32 {
+	addrPort, err := netip.ParseAddrPort(remoteAddr)
+	if err != nil {
+		return 0
+	}
+	if addrPort.Addr().Unmap().Is4() {
+		return 4
+	}
+	return 6
 }
 
 // Checks a ticket (M3): the root signature under the ticket domain with the
@@ -1358,6 +1375,7 @@ func (self *lagApiSession) reportBody(now time.Time) *protocol.LagReportBody {
 		ExtenderPublicKey:  self.api.identityPublicKey,
 		TrackId:            self.trackId,
 		TrackPosition:      self.trackPosition,
+		IpFamily:           self.ipFamily,
 		SessionStartTimeMs: uint64(self.startTime.UnixMilli()),
 		IntervalMs:         uint32(lagApiInterval.Milliseconds()),
 	}

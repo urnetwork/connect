@@ -72,6 +72,9 @@ message LagReportBody {
     uint32 UploadStreams = 19;
     bool UploadVerified = 20;
     LagEndReason EndReason = 21;
+    // 4 or 6: the address family the browser reached this extender's name on
+    // (lag.dev/PLAN.md N3). The family only, never the address (amendment 9).
+    uint32 IpFamily = 22;
 }
 
 message LagReport {

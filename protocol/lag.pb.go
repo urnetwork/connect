@@ -326,8 +326,11 @@ type LagReportBody struct {
 	UploadStreams         uint32       `protobuf:"varint,19,opt,name=UploadStreams,proto3" json:"UploadStreams,omitempty"`
 	UploadVerified        bool         `protobuf:"varint,20,opt,name=UploadVerified,proto3" json:"UploadVerified,omitempty"`
 	EndReason             LagEndReason `protobuf:"varint,21,opt,name=EndReason,proto3,enum=bringyour.LagEndReason" json:"EndReason,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// 4 or 6: the address family the browser reached this extender's name on
+	// (lag.dev/PLAN.md N3). The family only, never the address (amendment 9).
+	IpFamily      uint32 `protobuf:"varint,22,opt,name=IpFamily,proto3" json:"IpFamily,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *LagReportBody) Reset() {
@@ -500,6 +503,13 @@ func (x *LagReportBody) GetEndReason() LagEndReason {
 	return LagEndReason_LAG_END_COMPLETE
 }
 
+func (x *LagReportBody) GetIpFamily() uint32 {
+	if x != nil {
+		return x.IpFamily
+	}
+	return 0
+}
+
 type LagReport struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// serialized LagReportBody
@@ -582,7 +592,7 @@ const file_lag_proto_rawDesc = "" +
 	"\tLagTicket\x12\x12\n" +
 	"\x04Body\x18\x01 \x01(\fR\x04Body\x12$\n" +
 	"\rRootSignature\x18\x02 \x01(\fR\rRootSignature\x12\x1c\n" +
-	"\tRootKeyId\x18\x03 \x01(\fR\tRootKeyId\"\xac\x06\n" +
+	"\tRootKeyId\x18\x03 \x01(\fR\tRootKeyId\"\xc8\x06\n" +
 	"\rLagReportBody\x12\x1a\n" +
 	"\bTicketId\x18\x01 \x01(\fR\bTicketId\x12,\n" +
 	"\x11ExtenderPublicKey\x18\x02 \x01(\fR\x11ExtenderPublicKey\x12\x18\n" +
@@ -610,7 +620,8 @@ const file_lag_proto_rawDesc = "" +
 	"\x0fDownloadStreams\x18\x12 \x01(\rR\x0fDownloadStreams\x12$\n" +
 	"\rUploadStreams\x18\x13 \x01(\rR\rUploadStreams\x12&\n" +
 	"\x0eUploadVerified\x18\x14 \x01(\bR\x0eUploadVerified\x125\n" +
-	"\tEndReason\x18\x15 \x01(\x0e2\x17.bringyour.LagEndReasonR\tEndReasonJ\x04\b\x05\x10\x06R\bClientIp\"=\n" +
+	"\tEndReason\x18\x15 \x01(\x0e2\x17.bringyour.LagEndReasonR\tEndReason\x12\x1a\n" +
+	"\bIpFamily\x18\x16 \x01(\rR\bIpFamilyJ\x04\b\x05\x10\x06R\bClientIp\"=\n" +
 	"\tLagReport\x12\x12\n" +
 	"\x04Body\x18\x01 \x01(\fR\x04Body\x12\x1c\n" +
 	"\tSignature\x18\x02 \x01(\fR\tSignature*\xbc\x01\n" +

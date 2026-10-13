@@ -1620,8 +1620,12 @@ func TestLagApiLoadAndReport(t *testing.T) {
 	if string(body.TicketId) == "" || body.TrackPosition != 3 || len(body.TrackId) != 16 {
 		t.Errorf("ticket fields %x %d %x", body.TicketId, body.TrackPosition, body.TrackId)
 	}
-	// the browser's address appears nowhere in the report (amendment 9)
+	// the browser's address appears nowhere in the report, only its family
+	// (amendment 9)
 	assertLagReportCarriesNoAddress(t, body, netip.MustParseAddr("127.0.0.1"))
+	if body.IpFamily != 4 {
+		t.Errorf("ip family %d", body.IpFamily)
+	}
 	if body.WindowStartTimeMs+500 < body.SessionStartTimeMs+700 {
 		t.Errorf("window at %d, session at %d", body.WindowStartTimeMs, body.SessionStartTimeMs)
 	}
@@ -2203,4 +2207,19 @@ func bytesContain(b []byte, sub []byte) bool {
 		}
 	}
 	return false
+}
+
+// A report names the browser's address family and nothing more of its
+// address (amendment 9): a v4-mapped address counts as 4.
+func TestLagApiIpFamily(t *testing.T) {
+	for remoteAddr, family := range map[string]uint32{
+		"203.0.113.77:51000":          4,
+		"[::ffff:203.0.113.77]:51000": 4,
+		"[2001:db8::77]:51000":        6,
+		"not an address":              0,
+	} {
+		if got := lagApiIpFamily(remoteAddr); got != family {
+			t.Errorf("%q: family %d, want %d", remoteAddr, got, family)
+		}
+	}
 }
