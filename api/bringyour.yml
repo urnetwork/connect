@@ -2008,14 +2008,19 @@ paths:
         - `refused`: the request cannot be issued, and `reason` says why.
           Keep serving an installed certificate until it expires.
         - `withdrawn`: the certificate for `names` was withdrawn and is
-          being revoked, because the extender was deactivated or an operator
+          being revoked, because the extender was deactivated, its owner
+          opted out (`measurement_disabled` on an activation), or an operator
           moved it to the gated tier or a canary (C9). Drop it at once and
           stop answering to the name. The answer stays `withdrawn` until the
-          extender sends a request again.
+          extender sends a request again without `measurement_disabled`.
 
-        A request for the name and key already held, pending or issued,
-        changes nothing, and an activation without `measurement_csr` leaves
-        the stored request as it is.
+        `key_sha256` names the key the answer is for, so an extender whose
+        measurement key changed can tell that what is held is not for its
+        key, and send a request for the new one. A request for the same
+        name under another key replaces a pending one in its place in the
+        queue; one for the name and key already held, pending or issued,
+        changes nothing. An activation without `measurement_csr` leaves the
+        stored request as it is.
       operationId: extenderMeasurementCert
       security:
         - BearerAuth: []
@@ -15474,6 +15479,17 @@ components:
             extender's; its outcome is read from
             `/network/extender-measurement-cert`, never from this answer.
           type: string
+        measurement_disabled:
+          description: |
+            Sent on every activation while the extender's owner has opted out
+            of lag.dev measurement (lag.dev/PLAN.md C4, C9). The operator
+            withdraws the extender's measurement name: its address records go,
+            its certificate is revoked, its records carry no measurement id,
+            and nothing is issued for it. A `measurement_csr` beside it is not
+            stored. Omitted, the default, changes nothing on its own: a later
+            activation without it and with `measurement_csr` makes the
+            extender eligible again.
+          type: boolean
 
     ExtenderActivateResult:
       type: object
@@ -15766,6 +15782,13 @@ components:
           type: array
           items:
             type: string
+        key_sha256:
+          description: |
+            Hex SHA-256 of the SubjectPublicKeyInfo (DER) of the key the
+            answer is for: the certificate's when `issued`, else the
+            request's. Absent for `none` and for a request that could not be
+            read.
+          type: string
         chain_pem:
           description: The certificate chain, PEM, the leaf first. Only when `issued`.
           type: string
