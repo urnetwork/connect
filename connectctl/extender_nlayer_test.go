@@ -534,11 +534,8 @@ func TestExtenderCommandRelaysToNLayerHops(t *testing.T) {
 		dialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", operatorAddress)
 		},
-		configureNetworkClient: func(settings *connect.ExtenderNetworkClientSettings) {
-			settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
-				return nil, nil
-			}
-		},
+		packetConnFactory:      testLoopbackPacketConn,
+		configureNetworkClient: testHermeticNetworkClient,
 		onStart: func(run *extenderRun) {
 			runs <- run
 		},

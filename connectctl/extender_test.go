@@ -31,8 +31,9 @@ import (
 // One in-process operator, one extender on ephemeral loopback sockets, and a
 // phase 3 feed client that reaches the running extender over its tcp carrier.
 // Nothing binds a privileged port and nothing leaves the machine: the operator
-// names resolve through the injected dial, and the dns bootstrap through an
-// in-process resolver that answers with nothing.
+// names resolve through the injected dial, the dns bootstrap through an
+// in-process resolver that answers with nothing, and the udp carrier dials
+// through an endpoint that sends to loopback only.
 
 // The space this fixture operator serves. The api host carries the service
 // label, so the extender derives `extender.space.example` and the space host
@@ -45,6 +46,44 @@ const (
 	testExtenderIpv4 = "198.51.100.7"
 	testExtenderIpv6 = "2001:db8::7"
 )
+
+// testHermeticNetworkClient keeps the network client's dns bootstrap in the
+// process. The bootstrap name does not resolve in this fixture, and nothing may
+// reach a real resolver: neither the address nor the TXT resolution answers,
+// so neither falls back to a public DoH server or the system resolver.
+func testHermeticNetworkClient(settings *connect.ExtenderNetworkClientSettings) {
+	settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
+		return nil, nil
+	}
+	settings.ResolveDnsTxt = func(ctx context.Context, name string) ([]string, error) {
+		return nil, nil
+	}
+}
+
+// testLoopbackPacketConn is the udp endpoint of the command's quic and dns
+// carrier dials. The records here carry documentation addresses (the
+// activation's testExtenderIpv4), which the network client samples and probes
+// over every carrier, so the endpoint refuses any destination but loopback.
+func testLoopbackPacketConn(ctx context.Context) (net.PacketConn, error) {
+	packetConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	return &loopbackPacketConn{PacketConn: packetConn}, nil
+}
+
+// Only the net.PacketConn methods, so quic-go writes through WriteTo rather
+// than the udp socket's own message writes.
+type loopbackPacketConn struct {
+	net.PacketConn
+}
+
+func (self *loopbackPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if udpAddr, ok := addr.(*net.UDPAddr); !ok || !udpAddr.IP.IsLoopback() {
+		return 0, fmt.Errorf("the fixture sends nothing off the machine, refused %s", addr)
+	}
+	return self.PacketConn.WriteTo(b, addr)
+}
 
 // testExtenderOperator serves `/hello` and `/network/extender-activate` for
 // both family hosts (C2, C7).
@@ -274,13 +313,8 @@ func extenderCommandServesAndActivates(t *testing.T, loopbackIp string) {
 			}
 			return (&net.Dialer{}).DialContext(ctx, "tcp", operatorAddress)
 		},
-		configureNetworkClient: func(settings *connect.ExtenderNetworkClientSettings) {
-			// the bootstrap name does not resolve in this fixture, and nothing
-			// may reach a real resolver
-			settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
-				return nil, nil
-			}
-		},
+		packetConnFactory:      testLoopbackPacketConn,
+		configureNetworkClient: testHermeticNetworkClient,
 		onStart: func(run *extenderRun) {
 			runs <- run
 		},

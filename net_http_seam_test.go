@@ -191,6 +191,9 @@ func TestNormalTlsDialHonorsFamilyPolicyWithNoInjectedDialContext(t *testing.T) 
 			defer mutex.Unlock()
 			networks = append(networks, network)
 		}
+		// the name is looked up in the process, never by the system resolver;
+		// the hook has recorded the network by then
+		settings.Resolver = testOfflineResolver()
 
 		dialTls := newNormalDialTlsContext(settings, clientHttpNextProtos)
 		// the host is never reached: .invalid is reserved by RFC 2606 and never
@@ -758,4 +761,16 @@ func TestHttpClientHttp2WriteTimeoutReleasesCanceledBodyRead(t *testing.T) {
 		_ = waitForHttp2BodyRead(t, blockedRead.readDone)
 		_ = blockedRead.response.Body.Close()
 	})
+}
+
+// testOfflineResolver looks every name up in the process and answers none, so
+// a test whose names never resolve never asks the system resolver, which
+// forwards off the machine.
+func testOfflineResolver() *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("the test resolves no name off the machine")
+		},
+	}
 }

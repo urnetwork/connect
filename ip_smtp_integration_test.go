@@ -58,6 +58,9 @@ func newSmtpIntegrationMulti(
 	) SecurityPolicy {
 		return policy
 	}
+	// SMTP egresses through the local nat; the documentation addresses
+	// here are dialed in the process, never sent to
+	settings.LocalDialContextSettings, _ = testRefusingLocalDialContextSettings()
 	return NewRemoteUserNatMultiClient(
 		context.Background(),
 		&testingEmptyMultiClientGenerator{},
@@ -633,7 +636,7 @@ func newSmtpIntegrationProvider(
 	clientSettings.ReceiveBufferSettings.SequenceBufferSize = 0
 	clientSettings.ForwardBufferSettings.SequenceBufferSize = 0
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), clientSettings)
-	localUserNat := NewLocalUserNatWithDefaults(ctx, "smtp-provider-test")
+	localUserNat := newTestRefusingLocalUserNat(ctx, "smtp-provider-test")
 	settings := DefaultRemoteUserNatProviderSettings()
 	if policy != nil {
 		settings.SecurityPolicyGenerator = func(

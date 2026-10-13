@@ -55,7 +55,7 @@ func newProviderSourceLifecycleTestFixtureWithClientSettings(
 		clientOob,
 		clientSettings,
 	)
-	localUserNat := NewLocalUserNatWithDefaults(ctx, "source-lifecycle-test")
+	localUserNat := newTestRefusingLocalUserNat(ctx, "source-lifecycle-test")
 	settings := DefaultRemoteUserNatProviderSettings()
 	settings.EventEpoch = time.Hour
 	if configure != nil {

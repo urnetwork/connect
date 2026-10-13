@@ -99,8 +99,14 @@ type extenderOptions struct {
 	listen       func(network string, address string) (net.Listener, error)
 	listenPacket func(network string, address string) (net.PacketConn, error)
 	// dialContext, when set, is the inner dial of every control request this
-	// command makes. The test maps its synthetic operator names to loopback.
+	// command makes, and of every tcp carrier dial: the network client's, the
+	// peer pinger's and the mesh's. The test maps its synthetic operator names
+	// to loopback.
 	dialContext connect.DialContextFunction
+	// packetConnFactory, when set with dialContext, opens the udp endpoint of
+	// every quic and dns carrier dial. The test refuses through it every
+	// destination off the machine, such as the address an activation returns.
+	packetConnFactory func(ctx context.Context) (net.PacketConn, error)
 	// configureNetworkClient, when set, adjusts the network client settings
 	// before it is built. The test installs an in-process resolver so the dns
 	// bootstrap never leaves the machine.
@@ -506,7 +512,8 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	strategySettings := connect.DefaultClientStrategySettings()
 	if options.dialContext != nil {
 		strategySettings.ConnectSettings.DialContextSettings = &connect.DialContextSettings{
-			DialContext: options.dialContext,
+			DialContext:       options.dialContext,
+			PacketConnFactory: options.packetConnFactory,
 		}
 	}
 	run.clientStrategy = connect.NewDirectClientStrategy(ctx, strategySettings, 0)
@@ -540,6 +547,11 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	// the mesh addresses are published per activated family, which has not
 	// happened yet (D2)
 	nodeSettings.ExtenderListener = run.listener
+	if options.dialContext != nil {
+		// the mesh dials its peers through the same seams as the strategy
+		nodeSettings.ConnectSettings = connect.DefaultConnectSettings()
+		nodeSettings.ConnectSettings.DialContextSettings = strategySettings.ConnectSettings.DialContextSettings
+	}
 	if run.node, err = gossip.NewNode(ctx, nodeSettings); err != nil {
 		return nil, err
 	}

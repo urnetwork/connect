@@ -52,9 +52,14 @@ func clientStrategySettingsWithInternalDoh(settings *ClientStrategySettings) (*C
 		cache:   NewDohCache(internalDohSettings(settings.DohSettings)),
 		domains: domains,
 	}
-	copied.ConnectSettings.DialContextSettings = &DialContextSettings{
-		DialContext: resolver.wrapDialContext(baseConnectSettings.DialContext),
+	// the wrapper replaces the stream dial only: an injected packet endpoint
+	// (PacketConnFactory) still opens every udp carrier's socket
+	dialContextSettings := DialContextSettings{}
+	if baseConnectSettings.DialContextSettings != nil {
+		dialContextSettings = *baseConnectSettings.DialContextSettings
 	}
+	dialContextSettings.DialContext = resolver.wrapDialContext(baseConnectSettings.DialContext)
+	copied.ConnectSettings.DialContextSettings = &dialContextSettings
 	return &copied, resolver
 }
 
