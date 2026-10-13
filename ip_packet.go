@@ -271,6 +271,27 @@ func providerDialFailureReturnPath(flowPath *IpPath, packet []byte) (*IpPath, bo
 	return flowPath.Reverse(), true
 }
 
+// providerDialFailureEgressPath is the failed flow a provider's dial-failure
+// signal names, accepted only as the exact packet a provider sends for it:
+// ipOosUnreachable rebuilt for the flow the embed names, compared byte for
+// byte. That fixes the type and the code for the flow's protocol (host
+// unreachable or no route for tcp, port unreachable for udp), outer
+// addresses running from the flow's destination back to its source, one
+// family throughout, lengths and checksums. The embed's own sequence number
+// is kept, so only its 5-tuple is the flow. Anything else is not the signal
+// and both client intercepts drop it (IPV6.md C7).
+func providerDialFailureEgressPath(packet []byte) (*IpPath, bool) {
+	egressIpPath, ok := ipParseIcmpUnreachable(packet)
+	if !ok {
+		return nil, false
+	}
+	signal, ok := ipOosUnreachable(egressIpPath)
+	if !ok || !bytes.Equal(signal, packet) {
+		return nil, false
+	}
+	return egressIpPath, true
+}
+
 // ipIcmpBody finds the icmp message of a packet whose transport is icmp (v4)
 // or icmpv6 (v6), walking any v6 extension headers. ok is false for any other
 // protocol or a malformed header.

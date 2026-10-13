@@ -8648,7 +8648,8 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 
 // clientDialFailure handles a provider dial-failure signal intercepted on
 // sourceClient's channel: an icmp destination-unreachable whose embed named the
-// egress flow egressIpPath. The provider could not open the upstream for that
+// egress flow egressIpPath, accepted by the channel only as the exact packet a
+// provider builds for that flow (providerDialFailureEgressPath). The provider could not open the upstream for that
 // flow and answered instead of going silent, so the source is not left in
 // syn-retransmit backoff. Only providers whose return path passes their own
 // signal send it (IPV6.md C7); an older provider's failed dial stays silent.
@@ -18231,11 +18232,15 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 							packet,
 						)
 					}
-				} else if egressIpPath, ok := ipParseIcmpUnreachable(packet); ok {
+				} else if egressIpPath, ok := providerDialFailureEgressPath(packet); ok {
 					// a provider dial-failure signal: an icmp
 					// destination-unreachable that ParseIpPath rejects ("No
 					// support for protocol 1"), carrying the failed flow's
 					// egress key in its embed. Hand it to the parent to re-race.
+					// Only the exact packet a provider builds for the flow it
+					// names is the signal: its code for the flow's protocol,
+					// outer addresses from the flow's destination back to its
+					// source, one family. Any other icmp is dropped here.
 					//
 					// Deliberately NOT counted as received data: the
 					// addReceiveAck / addReceiveSyn above are in the err == nil

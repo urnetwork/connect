@@ -258,19 +258,20 @@ return path cannot parse an ICMP error, so it passes exactly the signal it
 builds for the flow that failed, inspected as that flow's return, and drops
 every other ICMP as before (`providerDialFailureReturnPath`). Providers
 before that fix drop their own signal: through them a dead family still
-costs the fallback delay. The single-destination client that carries the
-hops (`RemoteUserNatClient`) delivers the signal to the local stack only
-when it is well formed and bounded, carries the provider's dial-failure type
-and code, comes from the provider the SYN went to, is addressed back from
-the SYN's destination to its source, and its embedded header names an
+costs the fallback delay. Both clients accept a dial-failure signal only as
+the exact packet a provider builds for the flow its embed names, rebuilt and
+compared byte for byte (`providerDialFailureEgressPath`): the code for the
+flow's protocol, outer addresses from the flow's destination back to its
+source, one family, and its lengths and checksums. The single-destination
+client that carries the hops (`RemoteUserNatClient`) delivers a TCP signal
+to the local stack only from the provider the SYN went to and only for an
 outstanding SYN of the client by 5-tuple (providers embed sequence zero). A
 reply on the flow, admission or the SYN's 30 s lifetime ends that
 eligibility, and at most 256 SYNs are tracked. Unrelated, spoofed, malformed
 or late ICMP and every other ICMP type stay dropped
-(`ip_remote_user_nat_dial_failure.go`). The same signal now also reaches the
-multi client, whose existing intercept re-races the failed flow
-(`clientDialFailure`); through older providers it keeps relying on its SYN
-silence inference.
+(`ip_remote_user_nat_dial_failure.go`). The multi client's existing
+intercept re-races the failed flow (`clientDialFailure`); through older
+providers it keeps relying on its SYN silence inference.
 
 ### D. SDK, apps, tests
 

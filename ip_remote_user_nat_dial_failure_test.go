@@ -168,7 +168,7 @@ func TestRemoteUserNatDialFailureIgnoresMalformedSignal(t *testing.T) {
 		}
 		// seven of the eight transport bytes an embed must carry
 		cases["short embed"] = setLength(append([]byte(nil), signal[:icmpOffset+icmpUnreachableHeaderSize+embeddedHeader+7]...))
-		cases["oversized"] = setLength(append(append([]byte(nil), signal...), make([]byte, remoteUserNatDialFailureMaxSize)...))
+		cases["oversized"] = setLength(append(append([]byte(nil), signal...), make([]byte, 1280)...))
 		badIcmpChecksum := append([]byte(nil), signal...)
 		badIcmpChecksum[icmpOffset+2] ^= 0xff
 		cases["icmp checksum"] = badIcmpChecksum

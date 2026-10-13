@@ -7,18 +7,16 @@ package connect
 // ICMP destination-unreachable (ipOosUnreachable). ParseIpPath drops every
 // ICMP, so the local stack never heard it: a family the provider cannot dial
 // cost the full race fallback delay before the other family started. This
-// gate admits exactly that signal and nothing else. The packet must be a
-// well-formed, bounded unreachable with the provider's dial-failure code,
-// addressed back from the SYN's destination to its source, sent by the
-// provider the SYN went to, and its embedded header must name an outstanding
-// SYN of this client by 5-tuple. The embedded sequence number is not
-// compared: providers embed their flow path, whose sequence is zero.
+// gate admits exactly that signal and nothing else. The packet must be the
+// exact signal a provider builds for the TCP flow its embed names
+// (providerDialFailureEgressPath: code, outer addresses, family, lengths and
+// checksums), sent by the provider the SYN went to, and the flow must be an
+// outstanding SYN of this client by 5-tuple; providers embed sequence zero.
 // Admission consumes that SYN; any reply on the flow clears it. Every other
-// ICMP stays dropped. The multi client keeps its own intercept
-// (ip_remote_multi_client.go).
+// ICMP stays dropped. The multi client applies the same signal rule to its own
+// intercept (ip_remote_multi_client.go).
 
 import (
-	"encoding/binary"
 	"net/netip"
 	"sync"
 	"time"
@@ -32,10 +30,6 @@ const (
 	// A SYN older than this is no longer a live connect, and its unreachable
 	// is late. This is the default tun dial timeout.
 	remoteUserNatPendingSynLifetime = 30 * time.Second
-	// The provider's signal is a header, the 8-byte ICMP header and the
-	// embedded header with 8 transport bytes. RFC 4443 bounds any ICMPv6
-	// error by the IPv6 minimum mtu, and that bound applies to both families.
-	remoteUserNatDialFailureMaxSize = 1280
 )
 
 // The flow of one outgoing SYN, source to destination.
@@ -118,19 +112,12 @@ func (self *remoteUserNatDialFailures) reply(ipPath *IpPath) {
 // for an outstanding SYN, and consumes that SYN. The returned path is the
 // failed flow in the ingress direction.
 func (self *remoteUserNatDialFailures) admit(provider Id, packet []byte) (*IpPath, bool) {
-	if len(packet) == 0 || remoteUserNatDialFailureMaxSize < len(packet) {
-		return nil, false
-	}
-	outerSource, outerDestination, ok := remoteUserNatDialFailureOuter(packet)
-	if !ok {
-		return nil, false
-	}
-	egress, ok := ipParseIcmpUnreachable(packet)
+	egress, ok := providerDialFailureEgressPath(packet)
 	if !ok || egress.Protocol != IpProtocolTcp {
 		return nil, false
 	}
 	key, ok := remoteUserNatSynKeyOf(egress.SourceIp, egress.SourcePort, egress.DestinationIp, egress.DestinationPort)
-	if !ok || outerSource != key.destination.Addr() || outerDestination != key.source.Addr() {
+	if !ok {
 		return nil, false
 	}
 	now := time.Now()
@@ -145,38 +132,4 @@ func (self *remoteUserNatDialFailures) admit(provider Id, packet []byte) (*IpPat
 		return nil, false
 	}
 	return egress.Reverse(), true
-}
-
-// remoteUserNatDialFailureOuter validates the outer packet of a provider
-// dial-failure signal: an exact length, no fragment, verified checksums, and
-// the ICMP type and code that ipOosUnreachable writes for a failed TCP dial.
-// It returns the outer addresses, which the caller matches to the embed.
-func remoteUserNatDialFailureOuter(packet []byte) (source netip.Addr, destination netip.Addr, ok bool) {
-	icmp, ok := ipIcmpBody(packet)
-	if !ok || len(icmp) < icmpUnreachableHeaderSize {
-		return netip.Addr{}, netip.Addr{}, false
-	}
-	switch packet[0] >> 4 {
-	case 4:
-		ihl := int(packet[0]&0x0f) * 4
-		if int(binary.BigEndian.Uint16(packet[2:4])) != len(packet) || packet[6]&0x3f != 0 || packet[7] != 0 ||
-			checksumFinish(checksumAdd(0, packet[:ihl])) != 0 ||
-			icmp[0] != icmpv4TypeDestinationUnreachable || icmp[1] != icmpv4CodeHostUnreachable ||
-			checksumFinish(checksumAdd(0, icmp)) != 0 {
-			return netip.Addr{}, netip.Addr{}, false
-		}
-		source = netip.AddrFrom4([4]byte(packet[12:16]))
-		destination = netip.AddrFrom4([4]byte(packet[16:20]))
-	case 6:
-		if Ipv6HeaderSize+int(binary.BigEndian.Uint16(packet[4:6])) != len(packet) ||
-			icmp[0] != icmpv6TypeDestinationUnreachable || icmp[1] != icmpv6CodeNoRoute ||
-			transportChecksum(ipProtocolNumberIcmp6, packet[8:24], packet[24:40], icmp) != 0 {
-			return netip.Addr{}, netip.Addr{}, false
-		}
-		source = netip.AddrFrom16([16]byte(packet[8:24])).Unmap()
-		destination = netip.AddrFrom16([16]byte(packet[24:40])).Unmap()
-	default:
-		return netip.Addr{}, netip.Addr{}, false
-	}
-	return source, destination, true
 }
