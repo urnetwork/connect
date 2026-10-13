@@ -37,6 +37,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -90,8 +91,16 @@ type ExtenderMeasurementCert struct {
 	key     *ecdsa.PrivateKey
 	keyFile string
 	zone    string
+	// hex sha-256 of the key's SubjectPublicKeyInfo DER, which is how the
+	// operator says which key it holds a request or a certificate for (A8)
+	keySha256 string
 
-	// wakes the lifecycle's poll when an activation carries a request
+	// whether the owner opted out of measurement (SetEnabled); while it stands
+	// no certificate is served and no request is asked for
+	disabled atomic.Bool
+
+	// wakes the lifecycle's poll when an activation carries a request, or
+	// measurement is turned back on
 	offerMonitor *connect.Monitor
 	// the installed certificate, swapped whole so a handshake never sees half
 	// of one (M1)
@@ -101,8 +110,8 @@ type ExtenderMeasurementCert struct {
 
 	stateLock sync.Mutex
 	// the names the operator holds a request or a certificate for under this
-	// key, from the last poll. Nil while it holds none, or before a poll has
-	// answered.
+	// key -- its names and its key both -- from the last poll. Nil while it
+	// holds none, or one for another key, or before a poll has answered.
 	heldNames []string
 	// the names of the last request an activation carried, until the operator
 	// answers for them
@@ -110,6 +119,8 @@ type ExtenderMeasurementCert struct {
 	// the request for csrNames, kept so each pass does not sign anew
 	csrNames []string
 	csr      string
+	// asks the activation for a pass at once (SetReactivate); nil asks nothing
+	reactivate func()
 }
 
 // One installed certificate.
@@ -134,13 +145,89 @@ func NewExtenderMeasurementCert(keyFile string, zone string) (*ExtenderMeasureme
 	if zone == "" {
 		zone = connect.ExtenderMeasurementZone
 	}
+	keySha256, err := extenderMeasurementKeySha256(&key.PublicKey)
+	if err != nil {
+		return nil, err
+	}
 	return &ExtenderMeasurementCert{
 		key:            key,
 		keyFile:        keyFile,
 		zone:           zone,
+		keySha256:      keySha256,
 		offerMonitor:   connect.NewMonitor(),
 		installMonitor: connect.NewMonitorValue[uint64](0),
 	}, nil
+}
+
+// How the operator names a key (A8): the hex sha-256 of its
+// SubjectPublicKeyInfo DER.
+func extenderMeasurementKeySha256(publicKey any) (string, error) {
+	publicKeyDer, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		return "", err
+	}
+	keySha256 := sha256.Sum256(publicKeyDer)
+	return hex.EncodeToString(keySha256[:]), nil
+}
+
+// Sets whether this extender serves the measurement API (lag.dev/PLAN.md C4,
+// decision 18), which is on until the owner opts out. Off takes the
+// certificate down at once -- Certificate answers nil, so the dispatch admits
+// no new session, and the API closes the open ones on the change -- and asks
+// for no request; the activation then says measurement_disabled, and the
+// operator withdraws the name (C9). On again asks for the request at the next
+// activation: an operator that withdrew the name issues it again, as a renewal
+// of the same name, and one that never heard of the opt-out holds the request
+// already. Neither waits for a restart.
+func (self *ExtenderMeasurementCert) SetEnabled(enabled bool) {
+	if self.disabled.Swap(!enabled) == !enabled {
+		return
+	}
+	// what the operator held may be withdrawn by now: ask again once on
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.heldNames = nil
+		self.offeredNames = nil
+	}()
+	if enabled {
+		// read the operator's state soon, in case it never withdrew
+		self.offerMonitor.NotifyAll()
+	} else {
+		self.drop()
+	}
+	self.installMonitor.Update(func(version uint64) uint64 {
+		return version + 1
+	})
+}
+
+// Whether this extender serves the measurement API: true until the owner opts
+// out (SetEnabled).
+func (self *ExtenderMeasurementCert) Enabled() bool {
+	return !self.disabled.Load()
+}
+
+// Sets what asks the activation for a pass at once (C4): the role's
+// connect.ExtenderActivator.Reactivate, once its activator exists. The
+// lifecycle asks when the operator holds a request or a certificate for
+// another key, so this key's request goes out now rather than at the next
+// tick. Nil asks for nothing.
+func (self *ExtenderMeasurementCert) SetReactivate(reactivate func()) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.reactivate = reactivate
+}
+
+// Asks for an activation pass at once, when something can.
+func (self *ExtenderMeasurementCert) requestReactivate() {
+	reactivate := func() func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		return self.reactivate
+	}()
+	if reactivate != nil {
+		reactivate()
+	}
 }
 
 // The zone the measurement names are under.
@@ -162,13 +249,18 @@ func (self *ExtenderMeasurementCert) PublicKey() *ecdsa.PublicKey {
 // the standard base64 of the DER certificate request whose one name is the
 // measurement name of `extenderId` (N1), this extender's id as the operator's
 // activation answer reported it (N4), signed by the measurement key, which
-// never leaves the extender. "" for the zero id, which has no name, and when
-// the operator already holds a request or a certificate for that name under
-// this key, so a routine activation asks for nothing new. The request is made
+// never leaves the extender. "" for the zero id, which has no name; while the
+// owner has opted out; and when the operator already holds a request or a
+// certificate for that name under this key, so a routine activation asks for
+// nothing new. The request is made
 // once and kept, since the id never changes. Being asked for a request wakes
 // the lifecycle's poll, which reads what the operator made of it once the post
 // has landed.
 func (self *ExtenderMeasurementCert) ActivationCsr(extenderId connect.Id) string {
+	if self.disabled.Load() {
+		// opted out: the activation says so instead (SetEnabled)
+		return ""
+	}
 	name := connect.ExtenderMeasurementName(extenderId, self.zone)
 	if name == "" {
 		return ""
@@ -218,13 +310,16 @@ func (self *ExtenderMeasurementCert) ChangeMonitor() *connect.MonitorValue[uint6
 }
 
 // The installed certificate and the one name it serves (M10's
-// lagCertificates), or nil when none is installed, it has expired, or the
-// operator withdrew it.
+// lagCertificates), or nil when none is installed, it has expired, the
+// operator withdrew it, or the owner opted out.
 func (self *ExtenderMeasurementCert) Certificate() (names []string, certificate *tls.Certificate) {
 	return self.certificateAt(time.Now())
 }
 
 func (self *ExtenderMeasurementCert) certificateAt(now time.Time) ([]string, *tls.Certificate) {
+	if self.disabled.Load() {
+		return nil, nil
+	}
 	installed := self.installed.Load()
 	if installed == nil || !now.Before(installed.notAfter) {
 		return nil, nil
@@ -433,6 +528,12 @@ func loadExtenderMeasurementKey(keyFile string) (*ecdsa.PrivateKey, error) {
 			return nil, err
 		}
 	}
+	// the new name is durable once its directory is; a platform that cannot
+	// sync a directory keeps what it keeps
+	if directory, err := os.Open(filepath.Dir(keyFile)); err == nil {
+		directory.Sync()
+		directory.Close()
+	}
 	return key, nil
 }
 
@@ -555,6 +656,9 @@ type extenderLagLifecycle struct {
 	reporter *extenderLagReporter
 	// nil when the server serves no feed
 	feedHandler http.Handler
+	// the last key mismatch an activation pass was asked for, so a mismatch
+	// that stands asks once. Read and written by the poll loop alone.
+	keyMismatch string
 }
 
 // Builds the lifecycle of a server (lag.dev/PLAN.md M10), the lifecycle side's
@@ -701,6 +805,11 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 	settings := self.settings
 	nextBackoff := min(2*backoff, settings.CertPollMaxBackoff)
 	self.certificate.dropExpired(now)
+	if !self.certificate.Enabled() {
+		// opted out: nothing is served or asked for, so there is nothing to
+		// read until the owner turns measurement back on, which wakes this
+		return now.Add(settings.CertCheckTimeout), settings.CertPollMinBackoff
+	}
 
 	result, err := self.getCertificate()
 	if err != nil {
@@ -713,6 +822,15 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 
 	switch result.State {
 	case ExtenderMeasurementCertStatePending:
+		if result.KeySha256 != self.certificate.keySha256 {
+			// a request for another key -- one this extender made before its key
+			// was replaced -- holds nothing for this key, whose request goes
+			// out with a pass now
+			self.certificate.setHeld(nil, nil)
+			self.askForKey("request pending", result.KeySha256)
+			return now.Add(backoff), nextBackoff
+		}
+		self.keyMismatch = ""
 		self.certificate.setHeld(result.Names, result.Names)
 		return now.Add(backoff), nextBackoff
 
@@ -720,11 +838,16 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 		installed, err := self.certificate.parseChain(result.ChainPem, now)
 		if err != nil {
 			// a chain this key cannot serve is of no use: the operator needs a
-			// request for this key, which the next activation carries
+			// request for this key, which a chain for another key asks for
+			// with a pass now
 			log.Printf("[extender] lag: measurement certificate not installed = %s", err)
 			self.certificate.setHeld(nil, nil)
+			if errors.Is(err, errExtenderMeasurementKeyMismatch) {
+				self.askForKey("certificate issued", result.KeySha256)
+			}
 			return self.idlePollTime(now, backoff)
 		}
+		self.keyMismatch = ""
 		self.certificate.setHeld(installed.names, installed.names)
 		if self.certificate.install(installed) {
 			log.Printf(
@@ -765,7 +888,14 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 		answeredNames := []string(nil)
 		if result.State == ExtenderMeasurementCertStateRefused {
 			log.Printf("[extender] lag: measurement certificate refused by the operator = %s", result.Reason)
-			answeredNames = result.Names
+			if result.KeySha256 == "" || result.KeySha256 == self.certificate.keySha256 {
+				// the refusal of this key's request settles it
+				answeredNames = result.Names
+			} else {
+				// a refusal of another key's request says nothing of this key's,
+				// which goes out with a pass now
+				self.askForKey("request refused", result.KeySha256)
+			}
 		}
 		// the installed certificate, if any, is served until it expires or is
 		// withdrawn: a transient answer must not take a valid one down (C4)
@@ -776,6 +906,20 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 		log.Printf("[extender] lag: measurement certificate state %q is not known", result.State)
 		return now.Add(backoff), nextBackoff
 	}
+}
+
+// Asks for an activation pass at once because the operator holds or answered
+// for another key than this one (lag.dev/PLAN.md C4): the pass carries this
+// key's request, instead of the 24 hour tick. A mismatch that stands asks
+// once, however often it is read.
+func (self *extenderLagLifecycle) askForKey(what string, keySha256 string) {
+	keyMismatch := what + " " + keySha256
+	if keyMismatch == self.keyMismatch {
+		return
+	}
+	self.keyMismatch = keyMismatch
+	log.Printf("[extender] lag: the operator has a measurement %s for another key; asking for a pass now", what)
+	self.certificate.requestReactivate()
 }
 
 // When to read again with nothing pending: on the backoff while an offered
@@ -861,4 +1005,7 @@ type extenderMeasurementCertResult struct {
 	NotAfter string `json:"not_after,omitempty"`
 	// why a request was refused
 	Reason string `json:"reason,omitempty"`
+	// hex sha-256 of the SubjectPublicKeyInfo DER of the key the request or
+	// the certificate is for: what is held is held for that key alone
+	KeySha256 string `json:"key_sha256,omitempty"`
 }
