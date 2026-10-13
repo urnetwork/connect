@@ -26,6 +26,7 @@ package extender
 // side presents, the reports it submits and the feed it mounts.
 
 import (
+	"bufio"
 	"container/list"
 	"context"
 	"crypto/ed25519"
@@ -71,8 +72,16 @@ const (
 // session url is a few hundred bytes, and no cookie is ever set for the host.
 const lagApiMaxHeaderByteCount = 16 * 1024
 
-// How long a kept-alive measurement connection may sit between requests.
-const lagApiIdleTimeout = 30 * time.Second
+// How long a kept-alive measurement connection may sit between requests. A
+// browser's streams each hold their own connection, and none is reused for a
+// later load, so an idle one is only a slot held (M2).
+const lagApiIdleTimeout = 5 * time.Second
+
+// The most measurement connections one source subnet holds at once: its 16
+// sessions (M3), one load's streams each way, and a few left idle or opened
+// again after a refusal. It keeps one subnet from pinning the connection slots
+// every carrier shares (M2).
+const lagApiMaxConnectionsPerSubnet = 32
 
 // ExtenderLagSettings are the extender's settings for the measurement API, the
 // `measurement:` block of lag.dev/PLAN.md M10, plus the two things admission
@@ -219,6 +228,10 @@ type extenderLagApi struct {
 	// closed and replaced when a session is admitted, which starts the check
 	// of the sessions' name (C9)
 	sessionAdmitted chan struct{}
+	// the measurement connections each source subnet holds now (M2), and the
+	// most it may; tests lower the bound
+	subnetConnectionCounts  map[extenderSubnetHash]int
+	maxConnectionsPerSubnet int
 }
 
 // Builds the measurement API of a server (M10), the API side's one wiring
@@ -281,6 +294,9 @@ func newExtenderLagApi(
 		usedTickets:        map[string]*list.Element{},
 		usedTicketOrder:    list.New(),
 		sessionAdmitted:    make(chan struct{}),
+
+		subnetConnectionCounts:  map[extenderSubnetHash]int{},
+		maxConnectionsPerSubnet: lagApiMaxConnectionsPerSubnet,
 	}
 	defaultSettings := DefaultExtenderLagSettings()
 	if self.settings.MaxSessions <= 0 {
@@ -308,10 +324,13 @@ func newExtenderLagApi(
 	}
 	self.httpServer = &http.Server{
 		Handler: self,
-		// the handshake and each request head on the header budget of A9; a
-		// stream sets its own deadlines, since it outlives any fixed read or
-		// write timeout
+		// the handshake and each request on the header budget of A9. No
+		// request has a body, so the whole request is read within it; a
+		// download clears its read deadline and sets its own write deadline,
+		// since it outlives any fixed timeout, and a websocket sets its own
+		// once it is taken over (M2)
 		ReadHeaderTimeout: headerTimeout,
+		ReadTimeout:       headerTimeout,
 		IdleTimeout:       lagApiIdleTimeout,
 		MaxHeaderBytes:    lagApiMaxHeaderByteCount,
 		Protocols:         protocols,
@@ -431,6 +450,11 @@ func (self *extenderLagApi) dispatch(ctx context.Context, conn net.Conn, readByt
 	if certificate == nil || !self.start() {
 		return true
 	}
+	// a subnet holds a bounded share of the connection slots (M2)
+	if !self.beginSubnetConnection(conn.RemoteAddr()) {
+		return true
+	}
+	defer self.endSubnetConnection(conn.RemoteAddr())
 	requestConn := newConnWithInitialBytes(conn, readBytes, serverName)
 	if !self.listener.push(ctx, tls.Server(requestConn, self.tlsConfig)) {
 		requestConn.Close()
@@ -442,6 +466,47 @@ func (self *extenderLagApi) dispatch(ctx context.Context, conn net.Conn, readByt
 		requestConn.Close()
 	}
 	return true
+}
+
+// Takes one of a source subnet's measurement connections (M2), false when it
+// holds its share already. The subnet is the extender's admission subnet
+// (A12), and an unlimited source or one with no address is not counted.
+func (self *extenderLagApi) beginSubnetConnection(remoteAddr net.Addr) bool {
+	subnetHash, ok := self.subnetOf(remoteAddressString(remoteAddr))
+	if !ok {
+		return true
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if 0 < self.maxConnectionsPerSubnet && self.maxConnectionsPerSubnet <= self.subnetConnectionCounts[subnetHash] {
+		return false
+	}
+	self.subnetConnectionCounts[subnetHash] += 1
+	return true
+}
+
+func (self *extenderLagApi) endSubnetConnection(remoteAddr net.Addr) {
+	subnetHash, ok := self.subnetOf(remoteAddressString(remoteAddr))
+	if !ok {
+		return
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if count := self.subnetConnectionCounts[subnetHash] - 1; 0 < count {
+		self.subnetConnectionCounts[subnetHash] = count
+	} else {
+		delete(self.subnetConnectionCounts, subnetHash)
+	}
+}
+
+// The admission subnet of a source (A12), false for a source the per-subnet
+// limits do not apply to: an unlimited one, or one with no address.
+func (self *extenderLagApi) subnetOf(remoteAddress string) (extenderSubnetHash, bool) {
+	admission := self.server.admission
+	if admission.unlimitedSource(remoteAddress) {
+		return extenderSubnetHash{}, false
+	}
+	return admission.subnetHashOf(remoteAddress)
 }
 
 // Starts the measurement server on first use, as a worker the extender joins
@@ -566,8 +631,11 @@ func (self *extenderLagApi) close() {
 
 // Serves one request (M2). Every response is no-store and varies by origin;
 // an allowed origin is echoed for cors and resource timing, and no response
-// ever allows credentials. No cookie is read or set.
-func (self *extenderLagApi) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// ever allows credentials. No cookie is read or set. No request has a body:
+// one that declares one is refused, and every refusal closes its connection,
+// so nothing waits on bytes a client declared and never sends.
+func (self *extenderLagApi) ServeHTTP(responseWriter http.ResponseWriter, r *http.Request) {
+	w := &lagApiResponseWriter{ResponseWriter: responseWriter}
 	header := w.Header()
 	header.Set("Cache-Control", "no-store")
 	header.Add("Vary", "Origin")
@@ -579,10 +647,18 @@ func (self *extenderLagApi) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer self.server.endWorker()
 
+	// a declared body, which no request to the api has: refused before
+	// anything could wait for it (M2). net/http still drains a body when the
+	// request finishes, up to the read deadline; with the deadline moved to
+	// now, the connection closes as soon as the refusal is out.
+	if r.ContentLength != 0 || 0 < len(r.TransferEncoding) {
+		w.WriteHeader(http.StatusBadRequest)
+		http.NewResponseController(w).SetReadDeadline(time.Now())
+		return
+	}
 	// a name withdrawn or opted out of since the connection was opened is
 	// not answered (C4, C9): misdirected, and the connection closed
 	if r.TLS == nil || !self.serves(r.TLS.ServerName) {
-		header.Set("Connection", "close")
 		w.WriteHeader(http.StatusMisdirectedRequest)
 		return
 	}
@@ -672,6 +748,33 @@ func (self *extenderLagApi) upgrade(w http.ResponseWriter, r *http.Request) (*we
 		return nil, err
 	}
 	return conn, nil
+}
+
+// The response writer of every request to the api (M2): any response that is
+// not a success closes its connection, so a refused client cannot keep it
+// open, and net/http never waits to discard a body it declared. It passes the
+// take over a websocket needs, and the deadlines and flush a download needs.
+type lagApiResponseWriter struct {
+	http.ResponseWriter
+}
+
+func (self *lagApiResponseWriter) WriteHeader(status int) {
+	if status < 200 || 300 <= status {
+		self.Header().Set("Connection", "close")
+	}
+	self.ResponseWriter.WriteHeader(status)
+}
+
+func (self *lagApiResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(self.ResponseWriter).Hijack()
+}
+
+func (self *lagApiResponseWriter) Flush() {
+	http.NewResponseController(self.ResponseWriter).Flush()
+}
+
+func (self *lagApiResponseWriter) Unwrap() http.ResponseWriter {
+	return self.ResponseWriter
 }
 
 // The in-process listener the dispatch feeds the measurement server through

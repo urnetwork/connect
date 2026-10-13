@@ -1859,10 +1859,12 @@ func TestLagApiUnservedNameClosesSessions(t *testing.T) {
 	fixture.setTimings(func(timings *lagApiTimings) {
 		timings.certificateCheck = 300 * time.Millisecond
 	})
+	// a preflight succeeds, so its connection is kept for the next request
 	client := fixture.httpClient()
 	get := func() int {
-		request, _ := http.NewRequest(http.MethodGet, "https://"+testLagName+"/lag/v1/down?session=AAAAAAAAAAAAAAAAAAAAAA&stream=0", nil)
+		request, _ := http.NewRequest(http.MethodOptions, "https://"+testLagName+"/lag/v1/down", nil)
 		request.Header.Set("Origin", testLagOrigin)
+		request.Header.Set("Access-Control-Request-Method", "GET")
 		response, err := client.Do(request)
 		if err != nil {
 			return 0
@@ -1893,10 +1895,7 @@ func TestLagApiUnservedNameClosesSessions(t *testing.T) {
 	default:
 	}
 
-	// withdrawn, with a load running: a connection opened before is kept idle
-	if status := get(); status != http.StatusNotFound {
-		t.Fatalf("before: %d", status)
-	}
+	// withdrawn, with a load running
 	session.load("download")
 	waitFor(t, func() bool {
 		return fixture.api.loadCountNow() == 1
@@ -1906,6 +1905,10 @@ func TestLagApiUnservedNameClosesSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(200 * time.Millisecond)
+	// a connection opened before, kept idle
+	if status := get(); status != http.StatusNoContent {
+		t.Fatalf("before: %d", status)
+	}
 	withdrawnTime := time.Now()
 	fixture.certificates.set(nil, nil)
 	code, text := session.waitClosed(5 * time.Second)

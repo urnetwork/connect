@@ -617,6 +617,12 @@ func (self *extenderLagApi) writeDownload(
 	keystream cipher.Stream,
 ) {
 	controller := http.NewResponseController(w)
+	// the request is read; a stream outlives the server's read deadline,
+	// which would otherwise end it (M2)
+	if err := controller.SetReadDeadline(time.Time{}); err != nil {
+		self.server.reportError("lag download", err)
+		return
+	}
 	buffer := make([]byte, lagApiBufferByteCount)
 	deadlineSet := false
 	for ctx.Err() == nil {
