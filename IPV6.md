@@ -237,18 +237,33 @@ C7. Validator hops alternate the first family (2026-10-13). The shared race
 starts the first DNS answer at once and prefers IPv6 only between answers
 that are ready together, so the validator's provider traffic landed on
 whichever family answered first, and on IPv4 wherever the provider has no
-IPv6. The validator gives IPv4 and IPv6 equal attempts instead. A hop is one request through a provider: a trail SEED or
-EXTEND `/verify` post, retries included, each over its own tun (sn
-`validator/transport.go`). One counter per `TunnelTransport` alternates the
-family each request's tun tries first, IPv4 for the first request, then
-IPv6, and so on (`TunSettings.DialFirstIpFamily`). The first family's address
-starts first; a ready answer of the other family waits at most
-`DefaultDialFallbackDelay` for the first family's answer. The other family
-starts one fallback delay after the first, or at once when the first fails
-or has no address, all inside the dial's existing deadlines. A narrowed
-network, an IPv4-only tun and an IP literal keep their family. Every other
-tun keeps C6 unchanged (`DialFirstIpFamily` 0). The provider's egress is
-untouched: it dials the literal the validator chose.
+IPv6. The validator gives IPv4 and IPv6 equal attempts instead. A hop is one
+request through a provider: a trail SEED or EXTEND `/verify` post, retries
+included, each over its own tun (sn `validator/transport.go`). One counter
+per `TunnelTransport` alternates the family each request's tun tries first,
+IPv4 for the first request, then IPv6, and so on
+(`TunSettings.DialFirstIpFamily`). The first family's address starts first;
+a ready answer of the other family waits at most `DefaultDialFallbackDelay`
+for the first family's answer. The other family starts one fallback delay
+after the first, or at once when the first fails or has no address, all
+inside the dial's existing deadlines. A narrowed network, an IPv4-only tun
+and an IP literal keep their family. Every other tun keeps C6 unchanged
+(`DialFirstIpFamily` 0). The provider's egress is untouched: it dials the
+literal the validator chose.
+
+A provider that cannot open a TCP dial answers the SYN with an ICMP
+destination-unreachable (`ipOosUnreachable`), so a family the provider
+lacks fails at once instead of costing the fallback delay. The
+single-destination client that carries the hops (`RemoteUserNatClient`)
+delivers that signal to the local stack only when it is well formed and
+bounded, carries the provider's dial-failure type and code, comes from the
+provider the SYN went to, is addressed back from the SYN's destination to
+its source, and its embedded header names an outstanding SYN of the client
+by 5-tuple and initial sequence number. A reply on the flow, admission or
+the SYN's 30 s lifetime ends that eligibility, and at most 256 SYNs are
+tracked. Unrelated, spoofed, malformed or late ICMP and every other ICMP
+type stay dropped; the multi client keeps its own intercept
+(`ip_remote_user_nat_dial_failure.go`).
 
 ### D. SDK, apps, tests
 

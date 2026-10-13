@@ -10150,7 +10150,10 @@ type RemoteUserNatClient struct {
 	smtpEgressGuard       smtpEgressGuard
 	egressIpv4Fragments   ipv4FragmentGate
 	ingressIpv4Fragments  ipv4FragmentGate
-	pathTable             *pathTable
+	// the provider dial-failure signals admitted to the local stack
+	// (ip_remote_user_nat_dial_failure.go)
+	dialFailures remoteUserNatDialFailures
+	pathTable    *pathTable
 	// the provide mode of the source packets
 	// for locally generated packets this is `ProvideMode_Network`
 	provideMode       protocol.ProvideMode
@@ -10291,6 +10294,10 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 		if err != nil {
 			// drop
 			return false
+		}
+		if 0 < destination.Len() {
+			// before the send consumes the packet that ipPath borrows
+			self.dialFailures.syn(&ipPath, destination.Tail())
 		}
 
 		// The default v2 path embeds the raw frame in the pooled SendPack. It
@@ -10501,6 +10508,7 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 			if err == nil {
 				self.smtpEgressGuard.retireReturn(ipPath)
 				self.securityPolicy.RefreshIngress(ipPath)
+				self.dialFailures.reply(ipPath)
 				// Deliberate device-TUN exception from CODESTYLE.md: Transfer
 				// acknowledges only after this borrowed packet returns, so the
 				// synchronous final injection is its receive-side flow control.
@@ -10510,6 +10518,17 @@ func (self *RemoteUserNatClient) ClientReceive(source TransferPath, frames []*pr
 						source,
 						peer.ProvideMode,
 						ipPath,
+						packet,
+					)
+				})
+			} else if ingressIpPath, ok := self.dialFailures.admit(source.SourceId, packet); ok {
+				// the provider could not dial an outstanding syn: the local
+				// stack fails that connect at once (IPV6.md C7)
+				HandleError(func() {
+					self.receivePacketCallback(
+						source,
+						peer.ProvideMode,
+						ingressIpPath,
 						packet,
 					)
 				})
