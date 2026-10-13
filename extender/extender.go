@@ -614,8 +614,10 @@ func NewExtenderServer(
 	// wiring function (lag.dev/PLAN.md M10)
 	lagLifecycle := newExtenderLagLifecycle(self, settings.LagLifecycle)
 	measurementZone := ""
+	var measurementChanges *connect.MonitorValue[uint64]
 	if settings.LagLifecycle != nil && settings.LagLifecycle.Certificate != nil {
 		measurementZone = settings.LagLifecycle.Certificate.Zone()
+		measurementChanges = settings.LagLifecycle.Certificate.ChangeMonitor()
 	}
 	self.lag = newExtenderLagApi(
 		self,
@@ -624,6 +626,7 @@ func NewExtenderServer(
 		lagLifecycle,
 		lagLifecycle.FeedHandler(),
 		measurementZone,
+		measurementChanges,
 	)
 
 	handler := &extenderHandler{server: self}

@@ -92,6 +92,9 @@ type lagApiTimings struct {
 	// a stream that arrives before the control message of its phase waits
 	// this long for it
 	streamWait time.Duration
+	// while a session is open, how often the API checks that its name is
+	// still served, beside the lifecycle's change monitor (C9)
+	certificateCheck time.Duration
 	// after an upload ran out its window, the result waits this long for the
 	// browser's done before it goes anyway (M4)
 	doneWait time.Duration
@@ -103,16 +106,17 @@ type lagApiTimings struct {
 
 func defaultLagApiTimings() lagApiTimings {
 	return lagApiTimings{
-		pingLost:       5 * time.Second,
-		pongTimeout:    30 * time.Second,
-		reportBefore:   25 * time.Second,
-		reportAfter:    25 * time.Second,
-		reportWindow:   60 * time.Second,
-		phaseWait:      10 * time.Second,
-		streamWait:     2 * time.Second,
-		doneWait:       5 * time.Second,
-		busyRetryAfter: 5 * time.Second,
-		writeTimeout:   10 * time.Second,
+		pingLost:         5 * time.Second,
+		pongTimeout:      30 * time.Second,
+		reportBefore:     25 * time.Second,
+		reportAfter:      25 * time.Second,
+		reportWindow:     60 * time.Second,
+		phaseWait:        10 * time.Second,
+		streamWait:       2 * time.Second,
+		certificateCheck: 2 * time.Second,
+		doneWait:         5 * time.Second,
+		busyRetryAfter:   5 * time.Second,
+		writeTimeout:     10 * time.Second,
 	}
 }
 
@@ -336,7 +340,10 @@ type lagApiSession struct {
 	id        lagApiSessionId
 	uploadKey [16]byte
 
-	ticketId []byte
+	// the measurement name the control connection was opened for, which the
+	// session lasts no longer than (C9)
+	serverName string
+	ticketId   []byte
 	// until when the ticket's id is kept as used: its expiry and the skew (M3)
 	ticketExpire  time.Time
 	trackId       []byte
@@ -366,9 +373,11 @@ type lagApiSession struct {
 	// closed and replaced whenever the load or a phase is set, for a stream
 	// that arrives before its phase
 	changed chan struct{}
-	// the close the extender sends when it ends the session
-	closeCode int
-	closeText string
+	// the close the extender sends when it ends the session, and how that
+	// ends a load still running
+	closeCode          int
+	closeText          string
+	closeLoadEndReason protocol.LagEndReason
 
 	// the loop's own, and the handler's once the loop has returned
 	startTime time.Time
@@ -460,6 +469,7 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 		self.refuseSession(conn, lagApiErrorInternal)
 		return
 	}
+	session.serverName = r.TLS.ServerName
 	if code := self.admitSession(session); code != "" {
 		self.refuseSession(conn, code)
 		return
@@ -556,6 +566,8 @@ func (self *extenderLagApi) admitSession(session *lagApiSession) string {
 		expireTime: session.ticketExpire,
 	})
 	self.sessions[session.id] = session
+	close(self.sessionAdmitted)
+	self.sessionAdmitted = make(chan struct{})
 	return ""
 }
 
@@ -650,7 +662,7 @@ func (self *lagApiSession) serve() {
 		}()
 	} else {
 		close(loopDone)
-		self.end(lagApiCloseCodeInternal, lagApiErrorInternal)
+		self.end(lagApiCloseCodeInternal, lagApiErrorInternal, protocol.LagEndReason_LAG_END_ERROR)
 	}
 
 	for {
@@ -680,18 +692,34 @@ func (self *lagApiSession) serve() {
 	self.finish()
 }
 
-// Ends the session from the extender's side with a close (M4). The first
-// close wins.
-func (self *lagApiSession) end(code int, text string) {
+// Ends the session from the extender's side with a close (M4), and a load
+// still running with loadEndReason. The first close wins.
+func (self *lagApiSession) end(code int, text string, loadEndReason protocol.LagEndReason) {
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		if self.closeCode == 0 {
 			self.closeCode = code
 			self.closeText = text
+			self.closeLoadEndReason = loadEndReason
 		}
 	}()
 	self.cancel()
+}
+
+// How the session's end ends a load still running: as the extender ended it,
+// as an error when the api closed, and otherwise as the browser closing it.
+func (self *lagApiSession) loadEndReason() protocol.LagEndReason {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	switch {
+	case self.closeCode != 0:
+		return self.closeLoadEndReason
+	case self.api.ctx.Err() != nil:
+		return protocol.LagEndReason_LAG_END_ERROR
+	default:
+		return protocol.LagEndReason_LAG_END_CLIENT_CLOSED
+	}
 }
 
 // The close the extender sends: the one it ended the session with, else going
@@ -1114,7 +1142,7 @@ func (self *lagApiSession) run() {
 			if timings.pongTimeout <= time.Since(lastPongTime) {
 				// the page is gone (M4)
 				// lag.dev/PLAN.md M4: names no close code for this end
-				self.end(lagApiCloseCodeTimeout, "timeout")
+				self.end(lagApiCloseCodeTimeout, "timeout", protocol.LagEndReason_LAG_END_CLIENT_CLOSED)
 				return
 			}
 			pingTimer.Reset(0)
@@ -1165,7 +1193,7 @@ func (self *lagApiSession) run() {
 			self.report(time.Now())
 		}
 		if !ok {
-			self.end(lagApiCloseCodeInternal, lagApiErrorInternal)
+			self.end(lagApiCloseCodeInternal, lagApiErrorInternal, protocol.LagEndReason_LAG_END_ERROR)
 			return
 		}
 	}
@@ -1195,15 +1223,15 @@ func (self *lagApiSession) reportStartTime(load *lagApiLoad) time.Time {
 }
 
 // Ends the session after the read side is done and the loop has returned: a
-// load still running ends as the browser closing it, and the report goes out
-// with what it has (M8).
+// load still running ends with the session -- as the browser closing it, or as
+// the extender ended it -- and the report goes out with what it has (M8).
 func (self *lagApiSession) finish() {
 	now := time.Now()
 	if load := self.load; load != nil {
 		if !load.settled {
 			load.settled = true
 			load.endTime = now
-			load.endReason = protocol.LagEndReason_LAG_END_CLIENT_CLOSED
+			load.endReason = self.loadEndReason()
 			load.download.finish(lagApiPhaseEndClosed)
 			if load.upload != nil {
 				load.upload.finish(lagApiPhaseEndClosed)

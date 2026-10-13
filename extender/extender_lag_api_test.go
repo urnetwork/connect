@@ -46,11 +46,13 @@ const (
 	testLagOrigin      = "https://lag.dev"
 )
 
-// The lifecycle's certificate, as a fake that tests swap (M10).
+// The lifecycle's certificate, as a fake that tests swap (M10), with the
+// change monitor the lifecycle keeps (C4, C9).
 type testLagCertificates struct {
 	stateLock   sync.Mutex
 	names       []string
 	certificate *tls.Certificate
+	changes     *connect.MonitorValue[uint64]
 }
 
 func (self *testLagCertificates) Certificate() ([]string, *tls.Certificate) {
@@ -59,7 +61,18 @@ func (self *testLagCertificates) Certificate() ([]string, *tls.Certificate) {
 	return slices.Clone(self.names), self.certificate
 }
 
+// Swaps the certificate and says so on the change monitor, as an install, a
+// withdrawal or a drop does.
 func (self *testLagCertificates) set(names []string, certificate *tls.Certificate) {
+	self.setQuietly(names, certificate)
+	self.changes.Update(func(version uint64) uint64 {
+		return version + 1
+	})
+}
+
+// Swaps the certificate with no word on the monitor, as a change the API only
+// sees by reading Certificate again.
+func (self *testLagCertificates) setQuietly(names []string, certificate *tls.Certificate) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.names = names
@@ -123,11 +136,13 @@ func newLagApiFixture(t *testing.T, configure func(settings *ExtenderLagSettings
 		t:                 t,
 		identityPublicKey: identityPublicKey,
 		rootPrivateKey:    rootPrivateKey,
-		certificates:      &testLagCertificates{},
-		certificate:       certificate,
-		rootCas:           rootCas,
-		reports:           &testLagReports{reports: make(chan *protocol.LagReport, 64)},
-		dispatches:        make(chan testLagDispatch, 64),
+		certificates: &testLagCertificates{
+			changes: connect.NewMonitorValue[uint64](0),
+		},
+		certificate: certificate,
+		rootCas:     rootCas,
+		reports:     &testLagReports{reports: make(chan *protocol.LagReport, 64)},
+		dispatches:  make(chan testLagDispatch, 64),
 	}
 	fixture.certificates.set([]string{testLagName}, certificate)
 
@@ -145,7 +160,15 @@ func newLagApiFixture(t *testing.T, configure func(settings *ExtenderLagSettings
 	if configure != nil {
 		configure(&lagSettings)
 	}
-	fixture.api = newExtenderLagApi(fixture.server, lagSettings, fixture.certificates, fixture.reports, nil, "")
+	fixture.api = newExtenderLagApi(
+		fixture.server,
+		lagSettings,
+		fixture.certificates,
+		fixture.reports,
+		nil,
+		"",
+		fixture.certificates.changes,
+	)
 	if fixture.api == nil {
 		t.Fatal("the lag api was not built")
 	}
@@ -1748,11 +1771,15 @@ func TestLagApiLoadResultFollowsDone(t *testing.T) {
 	if load.result.EndReason != "complete" || !load.result.UploadVerified {
 		t.Errorf("result after an early done %+v", load.result.raw)
 	}
-	if first, last := load.uploaded[0], load.uploaded[len(load.uploaded)-1]; 500 < *first.Ms || *last.Ms != 750 {
-		t.Errorf("progress from %f to %f ms", *first.Ms, *last.Ms)
+	if last := load.uploaded[len(load.uploaded)-1]; *last.Ms != 750 {
+		t.Errorf("last progress at %f ms", *last.Ms)
 	}
-	if wait := load.resultTime.Sub(load.doneTime); wait < 200*time.Millisecond {
-		t.Errorf("result %s after an early done", wait)
+	// done went with the first progress; when that came well before the
+	// window's end, the result waited for the end rather than following done
+	if first := load.uploaded[0]; *first.Ms <= 500 {
+		if wait := load.resultTime.Sub(load.doneTime); wait < 150*time.Millisecond {
+			t.Errorf("result %s after a done at %f ms", wait, *first.Ms)
+		}
 	}
 	session.close()
 	if body := fixture.nextReport(5 * time.Second); body.UploadMs != 750 || body.EndReason != protocol.LagEndReason_LAG_END_COMPLETE {
@@ -1818,6 +1845,123 @@ func TestLagApiStreamBeforeLoadMessage(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the upload did not open")
 	}
+}
+
+// C4, C9: once the certificate stops naming a session's name, the session
+// closes as its dot going away -- 1001, with no error of the session's own --
+// and a load it is running ends with it, as an error. That is so whether the
+// lifecycle withdrew the certificate and its change monitor said so, the
+// owner opted out in a way only a fresh read of the certificate shows, or the
+// certificate now names another name. The name is then not answered even on a
+// connection opened before. A renewal of the same name closes nothing.
+func TestLagApiUnservedNameClosesSessions(t *testing.T) {
+	fixture := newLagApiFixture(t, nil)
+	fixture.setTimings(func(timings *lagApiTimings) {
+		timings.certificateCheck = 300 * time.Millisecond
+	})
+	client := fixture.httpClient()
+	get := func() int {
+		request, _ := http.NewRequest(http.MethodGet, "https://"+testLagName+"/lag/v1/down?session=AAAAAAAAAAAAAAAAAAAAAA&stream=0", nil)
+		request.Header.Set("Origin", testLagOrigin)
+		response, err := client.Do(request)
+		if err != nil {
+			return 0
+		}
+		io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		return response.StatusCode
+	}
+
+	// a renewal: the same name, a new certificate
+	session := fixture.openHelloSession(fixture.ticket(nil))
+	renewed, err := selfSignedCertificate([]string{testLagName}, "Lag", time.Hour, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.certificates.set([]string{testLagName}, renewed)
+	if rtts := session.rttsFor(900 * time.Millisecond); len(rtts) < 2 {
+		t.Errorf("%d rtts after a renewal", len(rtts))
+	}
+	// and back to the certificate the clients trust, the same name again
+	fixture.certificates.set([]string{testLagName}, fixture.certificate)
+	if rtts := session.rttsFor(600 * time.Millisecond); len(rtts) < 1 {
+		t.Errorf("%d rtts after a second renewal", len(rtts))
+	}
+	select {
+	case <-session.done:
+		t.Fatal("a renewal closed the session")
+	default:
+	}
+
+	// withdrawn, with a load running: a connection opened before is kept idle
+	if status := get(); status != http.StatusNotFound {
+		t.Fatalf("before: %d", status)
+	}
+	session.load("download")
+	waitFor(t, func() bool {
+		return fixture.api.loadCountNow() == 1
+	})
+	download := fixture.get(fmt.Sprintf("/lag/v1/down?session=%s&stream=0", session.hello.Session), testLagOrigin)
+	if _, err := io.ReadFull(download.Body, make([]byte, 64*1024)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	withdrawnTime := time.Now()
+	fixture.certificates.set(nil, nil)
+	code, text := session.waitClosed(5 * time.Second)
+	if code != lagApiCloseCodeAway || text != "withdrawn" {
+		t.Errorf("closed %d %q", code, text)
+	}
+	// the monitor said so: no wait for the check
+	if wait := time.Since(withdrawnTime); 250*time.Millisecond < wait {
+		t.Errorf("closed %s after the withdrawal", wait)
+	}
+	select {
+	case message := <-session.messages:
+		t.Errorf("a message with the close: %+v", message.raw)
+	default:
+	}
+	body := fixture.nextReport(5 * time.Second)
+	if body.EndReason != protocol.LagEndReason_LAG_END_ERROR || body.DownloadMs == 0 {
+		t.Errorf("report %v, download for %d ms", body.EndReason, body.DownloadMs)
+	}
+	io.Copy(io.Discard, download.Body)
+	download.Body.Close()
+	waitFor(t, func() bool {
+		return fixture.api.loadCountNow() == 0
+	})
+	// not answered on the connection opened before, nor on a new one
+	if status := get(); status != http.StatusMisdirectedRequest {
+		t.Errorf("after: %d", status)
+	}
+	if _, err := tls.Dial("tcp", fixture.address, &tls.Config{RootCAs: fixture.rootCas, ServerName: testLagName}); err == nil {
+		t.Error("a withdrawn name was answered")
+	}
+
+	// opted out in a way only a fresh read shows: the check closes it
+	fixture.certificates.set([]string{testLagName}, fixture.certificate)
+	session = fixture.openHelloSession(fixture.ticket(nil))
+	fixture.certificates.setQuietly(nil, nil)
+	if code, text := session.waitClosed(3 * time.Second); code != lagApiCloseCodeAway || text != "withdrawn" {
+		t.Errorf("opted out: closed %d %q", code, text)
+	}
+	if body := fixture.nextReport(5 * time.Second); body.EndReason != protocol.LagEndReason_LAG_END_NO_LOAD {
+		t.Errorf("opted out: report %v", body.EndReason)
+	}
+
+	// another name: the sessions of the old one close
+	fixture.certificates.set([]string{testLagName}, fixture.certificate)
+	session = fixture.openHelloSession(fixture.ticket(nil))
+	otherName := "0192e4a1-1111-7000-8000-000000000001.extender.example"
+	other, err := selfSignedCertificate([]string{otherName}, "Lag", time.Hour, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.certificates.set([]string{otherName}, other)
+	if code, _ := session.waitClosed(3 * time.Second); code != lagApiCloseCodeAway {
+		t.Errorf("another name: closed %d", code)
+	}
+	fixture.nextReport(5 * time.Second)
 }
 
 // waitFor polls a condition for a few seconds.

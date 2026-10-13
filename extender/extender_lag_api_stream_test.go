@@ -35,6 +35,7 @@ func (self *lagApiFixture) directSession(maxStreamCount uint32) *lagApiSession {
 	if err != nil {
 		self.t.Fatal(err)
 	}
+	session.serverName = testLagName
 	if code := self.api.admitSession(session); code != "" {
 		self.t.Fatalf("admit %s", code)
 	}

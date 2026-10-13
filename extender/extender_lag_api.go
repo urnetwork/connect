@@ -173,7 +173,10 @@ type extenderLagApi struct {
 	server       *ExtenderServer
 	settings     ExtenderLagSettings
 	certificates lagCertificates
-	reports      lagReports
+	// counts every change to the installed certificate, nil when the
+	// lifecycle has none to watch (C4, C9)
+	certificateChanges *connect.MonitorValue[uint64]
+	reports            lagReports
 	// the lifecycle's feed over websocket (M9); nil answers 404
 	feedHandler http.Handler
 
@@ -213,6 +216,9 @@ type extenderLagApi struct {
 	usedTicketOrder *list.List
 	// loads running now (M3)
 	loadCount int
+	// closed and replaced when a session is admitted, which starts the check
+	// of the sessions' name (C9)
+	sessionAdmitted chan struct{}
 }
 
 // Builds the measurement API of a server (M10), the API side's one wiring
@@ -222,6 +228,9 @@ type extenderLagApi struct {
 // zone, when the extender keeps a measurement certificate, is the zone its
 // names are under: a name there is the API's whether or not a certificate is
 // installed for it now, so it is never answered with an identity-ca leaf (M1).
+// certificateChanges, when the lifecycle has one, counts every change to the
+// installed certificate, so open sessions close the moment their name stops
+// being served (C4, C9); without it they close at the next check.
 func newExtenderLagApi(
 	server *ExtenderServer,
 	lagSettings ExtenderLagSettings,
@@ -229,6 +238,7 @@ func newExtenderLagApi(
 	reports lagReports,
 	feedHandler http.Handler,
 	zone string,
+	certificateChanges *connect.MonitorValue[uint64],
 ) *extenderLagApi {
 	settings := server.settings
 	if !lagSettings.Enabled || certificates == nil || len(settings.IdentityKeySeed) == 0 {
@@ -253,6 +263,7 @@ func newExtenderLagApi(
 		server:             server,
 		settings:           lagSettings,
 		certificates:       certificates,
+		certificateChanges: certificateChanges,
 		reports:            reports,
 		feedHandler:        feedHandler,
 		identityPrivateKey: identityPrivateKey,
@@ -269,6 +280,7 @@ func newExtenderLagApi(
 		sessions:           map[lagApiSessionId]*lagApiSession{},
 		usedTickets:        map[string]*list.Element{},
 		usedTicketOrder:    list.New(),
+		sessionAdmitted:    make(chan struct{}),
 	}
 	defaultSettings := DefaultExtenderLagSettings()
 	if self.settings.MaxSessions <= 0 {
@@ -446,6 +458,10 @@ func (self *extenderLagApi) start() bool {
 	if !self.server.beginWorker() {
 		return false
 	}
+	if !self.server.beginWorker() {
+		self.server.endWorker()
+		return false
+	}
 	self.serving = true
 	go func() {
 		defer self.server.endWorker()
@@ -453,7 +469,75 @@ func (self *extenderLagApi) start() bool {
 			self.httpServer.Serve(self.listener)
 		})
 	}()
+	go func() {
+		defer self.server.endWorker()
+		connect.HandleError(self.watchCertificate)
+	}()
 	return true
+}
+
+// Whether the API serves a name now: the installed certificate names it (M1).
+// Read at every request, so a name withdrawn or opted out of (C4, C9) is not
+// answered even on a connection opened before.
+func (self *extenderLagApi) serves(serverName string) bool {
+	names, certificate := self.certificates.Certificate()
+	return certificate != nil && lagApiNameIn(names, serverName)
+}
+
+// Closes the sessions of a name the API no longer serves (C4 opting out, C9
+// withdrawal): at once when the lifecycle's change monitor says the
+// certificate changed, and in any case within the certificate check while a
+// session is open, which also covers an expiry and a change no monitor saw.
+// Nothing runs while no session is open but the wait.
+func (self *extenderLagApi) watchCertificate() {
+	checkTimer := time.NewTimer(self.timings.certificateCheck)
+	checkTimer.Stop()
+	defer checkTimer.Stop()
+	for {
+		// subscribe before reading the certificate, so a change in between
+		// wakes the wait below
+		var changed chan struct{}
+		if self.certificateChanges != nil {
+			_, changed = self.certificateChanges.Get()
+		}
+		sessionCount, sessionAdmitted := self.closeUnservedSessions()
+		var checkC <-chan time.Time
+		if 0 < sessionCount {
+			checkTimer.Reset(self.timings.certificateCheck)
+			checkC = checkTimer.C
+		}
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-changed:
+		case <-sessionAdmitted:
+		case <-checkC:
+		}
+		checkTimer.Stop()
+	}
+}
+
+// Ends every open session whose name the API no longer serves, as its dot
+// going away: a close of 1001, which a page reads as the extender gone rather
+// than as an error of its own, and a running load ended with it (C9). Returns
+// the sessions open before, and the channel that says the next is admitted.
+func (self *extenderLagApi) closeUnservedSessions() (int, chan struct{}) {
+	names, certificate := self.certificates.Certificate()
+	unserved := []*lagApiSession{}
+	sessionCount, sessionAdmitted := func() (int, chan struct{}) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for _, session := range self.sessions {
+			if certificate == nil || !lagApiNameIn(names, session.serverName) {
+				unserved = append(unserved, session)
+			}
+		}
+		return len(self.sessions), self.sessionAdmitted
+	}()
+	for _, session := range unserved {
+		session.end(lagApiCloseCodeAway, "withdrawn", protocol.LagEndReason_LAG_END_ERROR)
+	}
+	return sessionCount, sessionAdmitted
 }
 
 // Ends every session and connection of the API. Idempotent. A websocket
@@ -494,6 +578,14 @@ func (self *extenderLagApi) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer self.server.endWorker()
+
+	// a name withdrawn or opted out of since the connection was opened is
+	// not answered (C4, C9): misdirected, and the connection closed
+	if r.TLS == nil || !self.serves(r.TLS.ServerName) {
+		header.Set("Connection", "close")
+		w.WriteHeader(http.StatusMisdirectedRequest)
+		return
+	}
 
 	origin, originAllowed := self.requestOrigin(r)
 	if originAllowed {
