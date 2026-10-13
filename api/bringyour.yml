@@ -4675,9 +4675,11 @@ paths:
         A sample of up to 64 extenders that serve the lag.dev measurement
         API now, randomized per request and spread across countries
         (lag.dev/PLAN.md A4). An extender is offered only while its
-        measurement certificate is issued, unexpired and not withdrawn: an
-        extender that is deactivated, gated, a canary, opted out by its
-        owner, or waiting on a new certificate request is not.
+        measurement certificate is issued, unexpired and not withdrawn, and
+        its measurement name is published, meaning Route 53 answers for it
+        (C8): an extender that is deactivated, gated, a canary, opted out by
+        its owner, waiting on a new certificate request, or whose name is
+        not yet published is not.
 
         There is one entry per extender. `host` is its measurement name,
         its id under the measurement zone, which resolves to its active

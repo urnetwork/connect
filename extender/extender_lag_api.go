@@ -333,11 +333,11 @@ func newExtenderLagApi(
 	}
 	self.httpServer = &http.Server{
 		Handler: self,
-		// the handshake and each request on the header budget of A9. No
-		// request has a body, so the whole request is read within it; a
-		// download clears its read deadline and sets its own write deadline,
-		// since it outlives any fixed timeout, and a websocket sets its own
-		// once it is taken over (M2)
+		// the handshake and each request on the header budget of
+		// EXTENDER.md A9. No request has a body, so the whole request is read
+		// within it; a download clears its read deadline and sets its own
+		// write deadline, since it outlives any fixed timeout, and a
+		// websocket sets its own once it is taken over (M2)
 		ReadHeaderTimeout: headerTimeout,
 		ReadTimeout:       headerTimeout,
 		IdleTimeout:       lagApiIdleTimeout,
@@ -498,7 +498,8 @@ func (self *extenderLagApi) dispatch(ctx context.Context, conn net.Conn, readByt
 
 // Takes one of a source subnet's measurement connections (M2), false when it
 // holds its share already. The subnet is the extender's admission subnet
-// (A12), and an unlimited source or one with no address is not counted.
+// (EXTENDER.md A12), and an unlimited source or one with no address is not
+// counted.
 func (self *extenderLagApi) beginSubnetConnection(remoteAddr net.Addr) bool {
 	subnetHash, ok := self.subnetOf(remoteAddressString(remoteAddr))
 	if !ok {
@@ -527,8 +528,8 @@ func (self *extenderLagApi) endSubnetConnection(remoteAddr net.Addr) {
 	}
 }
 
-// The admission subnet of a source (A12), false for a source the per-subnet
-// limits do not apply to: an unlimited one, or one with no address.
+// The admission subnet of a source (EXTENDER.md A12), false for a source the
+// per-subnet limits do not apply to: an unlimited one, or one with no address.
 func (self *extenderLagApi) subnetOf(remoteAddress string) (extenderSubnetHash, bool) {
 	admission := self.server.admission
 	if admission.unlimitedSource(remoteAddress) {

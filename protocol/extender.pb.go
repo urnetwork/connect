@@ -554,11 +554,13 @@ type ExtenderRecordBody struct {
 	CanaryChannel string `protobuf:"bytes,16,opt,name=CanaryChannel,proto3" json:"CanaryChannel,omitempty"`
 	// The 16 byte id of the extender, set when the operator signs the record
 	// of an extender that holds an issued, unexpired measurement certificate
-	// (lag.dev/PLAN.md C10). A feed or gossip reader then knows the extender
-	// serves the lag.dev measurement API (M), and that its measurement name
-	// is this id in the measurement zone (N1). Only open tier extenders that
-	// are not canaries ever hold a certificate. Empty on an extender that
-	// does not serve the API and on records that predate the field.
+	// whose measurement name is published, so the name already resolves
+	// (lag.dev/PLAN.md C8, C10). A feed or gossip reader then knows the
+	// extender serves the lag.dev measurement API (M), and that its
+	// measurement name is this id in the measurement zone (N1). Only open
+	// tier extenders that are not canaries ever hold a certificate. Empty on
+	// an extender that does not serve the API or whose name is not published,
+	// and on records that predate the field.
 	MeasurementId []byte `protobuf:"bytes,17,opt,name=MeasurementId,proto3" json:"MeasurementId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -482,8 +482,8 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 		self.refuseSession(conn, lagApiErrorOrigin)
 		return
 	}
-	// an admission is one action of its subnet (M3, A12), counted before the
-	// ticket is so much as read
+	// an admission is one action of its subnet (M3, EXTENDER.md A12),
+	// counted before the ticket is so much as read
 	if limit, _ := self.server.admitAction(r.RemoteAddr, false); limit != extenderAdmitted {
 		self.server.reportError(extenderAdmissionStage(limit), fmt.Errorf("the source is over its admission limit"))
 		self.refuseSession(conn, lagApiErrorSessions)
@@ -666,8 +666,8 @@ func (self *extenderLagApi) session(sessionId lagApiSessionId) *lagApiSession {
 // Admits a session's load (M3): refused as budget when today's budget is
 // spent, and as busy when the session's subnet is over its admission limit,
 // already runs its load, or concurrent_loads are running, each with how long
-// to wait. A load is one action of its subnet (A12). Returns "" when
-// admitted; the caller then ends it with endLoad.
+// to wait. A load is one action of its subnet (EXTENDER.md A12). Returns ""
+// when admitted; the caller then ends it with endLoad.
 func (self *extenderLagApi) beginLoad(now time.Time, session *lagApiSession) (string, time.Duration) {
 	if self.budget.exhausted(now) {
 		return lagApiErrorBudget, self.budget.renewTime(now).Sub(now)
@@ -1098,9 +1098,9 @@ func (self *lagApiSession) run() {
 					// the load is already running
 					return true
 				}
-				// one load per session (M3): refused as busy, with no time
-				// after which it would be admitted
-				// lag.dev/PLAN.md M3: M4 names no refusal of its own for it
+				// one load per session: a second is refused as busy with
+				// retryAfterMs 0, since no wait would admit it
+				// (lag.dev/PLAN.md M3)
 				retryAfterMs := int64(0)
 				return self.write(&lagApiErrorMessage{Type: "error", Code: lagApiErrorBusy, RetryAfterMs: &retryAfterMs})
 			}
@@ -1239,8 +1239,8 @@ func (self *lagApiSession) run() {
 				Lost: true,
 			})
 			if timings.pongTimeout <= time.Since(lastPongTime) {
-				// the page is gone (M4)
-				// lag.dev/PLAN.md M4: names no close code for this end
+				// the page is gone: no pong for pongTimeout ends the session
+				// with 4408 (lag.dev/PLAN.md M4)
 				self.end(lagApiCloseCodeTimeout, "timeout", protocol.LagEndReason_LAG_END_CLIENT_CLOSED)
 				return
 			}

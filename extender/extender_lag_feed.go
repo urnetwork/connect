@@ -16,8 +16,8 @@ package extender
 //
 // The API checks the origin before the handler is reached, as it checks every
 // upgrade's (M2), so the upgrader here admits any. A feed stream is one action
-// of its source subnet under the extender's admission limits (A12), as on the
-// carriers. The handler is safe for concurrent use.
+// of its source subnet under the extender's admission limits (EXTENDER.md
+// A12), as on the carriers. The handler is safe for concurrent use.
 
 import (
 	"context"
@@ -73,7 +73,8 @@ func (self *extenderLagFeedHandler) ServeHTTP(w http.ResponseWriter, r *http.Req
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	// one feed stream is one action of its subnet, as on the carriers (A12)
+	// one feed stream is one action of its subnet, as on the carriers
+	// (EXTENDER.md A12)
 	if limit, retryAfter := self.server.admitAction(r.RemoteAddr, false); limit != extenderAdmitted {
 		if seconds := int64((retryAfter + time.Second - 1) / time.Second); 0 < seconds {
 			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
@@ -104,7 +105,7 @@ func (self *extenderLagFeedHandler) ServeHTTP(w http.ResponseWriter, r *http.Req
 		conn.Close()
 	})()
 
-	// the feed server owns the stream until it returns (A8)
+	// the feed server owns the stream until it returns (EXTENDER.md A8)
 	self.feedConnHandler(conn)
 	conn.closeNormally()
 }
