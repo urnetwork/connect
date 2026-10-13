@@ -27,7 +27,8 @@ type tunFastFallbackFixture struct {
 }
 
 // signalFrom names the provider the IPv6 dial-failure signal claims to come
-// from; the client's own provider is the honest case.
+// from; the client's own provider is the honest case, and the zero id sends
+// no signal at all, as a provider from before the return-path fix.
 func newTunFastFallbackFixture(t *testing.T, signalFrom func(provider Id) Id) *tunFastFallbackFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
@@ -117,7 +118,7 @@ func newTunFastFallbackFixture(t *testing.T, signalFrom func(provider Id) Id) *t
 				// path, which carries no sequence number
 				flowPath := *ipPath
 				flowPath.SequenceNumber = 0
-				if signal, ok := ipOosUnreachable(&flowPath); ok {
+				if signal, ok := ipOosUnreachable(&flowPath); ok && signalFrom(provider) != (Id{}) {
 					deliver(signalFrom(provider), signal)
 				}
 			}
@@ -178,6 +179,16 @@ func TestTunDialFastFallbackOnProviderDialFailure(t *testing.T) {
 // IPv6 connect waits out the fallback delay before IPv4 starts.
 func TestTunDialFastFallbackIgnoresSpoofedSignal(t *testing.T) {
 	self := newTunFastFallbackFixture(t, func(Id) Id { return NewId() })
+	landed, gap := self.dial(t)
+	if landed != 4 || gap < DefaultDialFallbackDelay*4/5 {
+		t.Fatalf("landed v%d with IPv4 %s after IPv6, want the %s fallback delay", landed, gap, DefaultDialFallbackDelay)
+	}
+}
+
+// IPV6.md C7. A provider from before the return-path fix drops its signal, so
+// the IPv6 connect gets no answer and IPv4 starts after the fallback delay.
+func TestTunDialFastFallbackWithoutSignalWaitsFallbackDelay(t *testing.T) {
+	self := newTunFastFallbackFixture(t, func(Id) Id { return Id{} })
 	landed, gap := self.dial(t)
 	if landed != 4 || gap < DefaultDialFallbackDelay*4/5 {
 		t.Fatalf("landed v%d with IPv4 %s after IPv6, want the %s fallback delay", landed, gap, DefaultDialFallbackDelay)
