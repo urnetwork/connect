@@ -541,6 +541,11 @@ func TestSendSequenceReorderingAcrossCarriersIsNotLoss(t *testing.T) {
 	if Id(resent.MessageId) != Id(afterDrop[0].MessageId) {
 		t.Fatalf("gap recovery resent %v, want the dropped Pack", resent.MessageId)
 	}
+	// the sender counts a recovery when its route write returns, so the
+	// resent Pack can be taken before it is counted
+	waitForCondition(5*time.Second, func() bool {
+		return client.SendRecoveryStats().SelectiveGapWriteCount != gapWritesBefore
+	})
 	recovery = client.SendRecoveryStats()
 	if recovery.SelectiveGapWriteCount != gapWritesBefore+1 {
 		t.Fatalf("real loss must produce exactly one gap recovery: %+v", recovery)
