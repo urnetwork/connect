@@ -29,6 +29,26 @@ const (
 // against the process. Its sockets are joined before the outer claim releases.
 type platformTransportNestedBudgetContextKey struct{}
 
+// The same complete retained graph charged
+// before the carrier starts, including DNS translation and a configured
+// outer carrier. It neither acquires memory nor starts transport work.
+// Owners use it to compose feasible window sizes, not to bypass admission.
+func (self *PlatformTransportSettings) H3MemoryReservationByteCount(
+	mode TransportMode,
+	clientStrategy *ClientStrategy,
+) ByteCount {
+	if self == nil {
+		return 0
+	}
+	transport := &PlatformTransport{
+		settings:        self,
+		targetMode:      mode,
+		modePreferences: normalizeTransportModePreferences(self.ModePreferences),
+		clientStrategy:  clientStrategy,
+	}
+	return transport.h3BudgetByteCount() + transport.h3NestedMemoryByteCount()
+}
+
 // Reserve one complete graph before starting its runners. Acquiring only the
 // inner QUIC claim can fill the aggregate with carriers that all still need
 // translation/outer memory, while pending explicit peers block those additions.

@@ -15,6 +15,10 @@ import (
 type MonitorEventFunction = func(windowExpandEvent *WindowExpandEvent, providerEvents map[Id]*ProviderEvent, reset bool)
 
 type WindowExpandEvent struct {
+	// Resize alone marks a class excluded by the selected profile. Retained
+	// clients and provider events still exist, but cannot satisfy admission.
+	// The zero value keeps legacy/custom publishers active.
+	inactive bool
 	// EventTime   time.Time
 	// CurrentSize int
 	TargetSize   int
@@ -225,6 +229,13 @@ func cloneWindowExpandEvent(event *WindowExpandEvent) *WindowExpandEvent {
 		return nil
 	}
 	cloned := *event
+	if cloned.inactive {
+		cloned.TargetSize = 0
+		cloned.MinSatisfied = false
+		cloned.Failed = false
+		cloned.Reason = WindowStallEvaluating
+		// Family availability describes retained exits, not new-flow admission.
+	}
 	return &cloned
 }
 
@@ -371,18 +382,14 @@ func (self *RemoteUserNatMultiClientMonitor) Events() (*WindowExpandEvent, map[I
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	// make a copy
-	windowExpandEvent := self.windowExpandEvent
-	return &windowExpandEvent, maps.Clone(self.clientIdProviderEvents)
+	return cloneWindowExpandEvent(&self.windowExpandEvent), maps.Clone(self.clientIdProviderEvents)
 }
 
 func (self *RemoteUserNatMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	// make a copy
-	windowExpandEvent := self.windowExpandEvent
-	return &windowExpandEvent
+	return cloneWindowExpandEvent(&self.windowExpandEvent)
 
 }
 
@@ -395,6 +402,13 @@ func (self *RemoteUserNatMultiClientMonitor) ProviderEvents() map[Id]*ProviderEv
 }
 
 func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied bool, targetSize int, ipv6Available bool) {
+	self.addWindowExpandEvent(minSatisfied, targetSize, ipv6Available, false)
+}
+
+// Resize publishes profile activity with the same snapshot as its size. Keep
+// the raw state for later outcome/provider updates; every public copy masks
+// inactive admission fields, including queued and coalesced callbacks.
+func (self *RemoteUserNatMultiClientMonitor) addWindowExpandEvent(minSatisfied bool, targetSize int, ipv6Available bool, inactive bool) {
 	var windowExpandEvent WindowExpandEvent
 	changed := false
 	func() {
@@ -404,6 +418,7 @@ func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied b
 		windowExpandEvent = WindowExpandEvent{
 			// EventTime:   time.Now(),
 			// CurrentSize: currentSize,
+			inactive:      inactive,
 			TargetSize:    targetSize,
 			MinSatisfied:  minSatisfied,
 			Ipv6Available: ipv6Available,

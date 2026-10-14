@@ -525,6 +525,9 @@ type MultiClientSettings struct {
 	// behavior. See `sequenceIdleTimeout`.
 	TcpSequenceIdleTimeout time.Duration
 	WindowSizes            map[WindowType]WindowSizeSettings
+	// Positive limits cap only default windows; explicit profiles and fixed
+	// destinations keep their caller-selected topology. Zero is unchanged.
+	WindowSizeLimit int
 	// StrictWindowSizeHardMax makes WindowSizeHardMax an admission ceiling as
 	// well as a resize target. When a flow-carrying warned client cannot yet be
 	// collapsed, a new identity is declined instead of temporarily growing the
@@ -10655,6 +10658,7 @@ type multiClientWindow struct {
 	stateLock          sync.Mutex
 	clients            map[Id]*multiClientChannel
 	performanceProfile *PerformanceProfile
+	windowSizeLimit    int
 	// Nil test seams expose one initial-evaluation callback across the exact
 	// expand-pass phase and terminal boundaries. Production leaves all five
 	// unset.
@@ -10776,6 +10780,7 @@ func newMultiClientWindow(
 		clientRemoveCallback:         clientRemoveCallback,
 		windowType:                   windowType,
 		performanceProfile:           initialPerformanceProfile,
+		windowSizeLimit:              settings.WindowSizeLimit,
 		settings:                     settings,
 		reliabilitySettingsFunc:      reliabilitySettingsFunc,
 		uplinkGateFunc:               uplinkGateFunc,
@@ -11555,7 +11560,7 @@ func (self *multiClientWindow) resize() {
 				fixedWindowType = &profileWindowType
 				windowSize = profileWindowSize
 			} else {
-				windowSize = self.settings.WindowSizes[self.windowType]
+				windowSize = self.defaultWindowSizeWithLock()
 			}
 			stickyExit = stickyExitProfile(self.performanceProfile)
 		}()
@@ -12044,6 +12049,9 @@ func (self *multiClientWindow) resize() {
 		var windowSizeMin int
 		var targetWindowSize int
 		fixedDestinationSize, fixedDestination := self.generator.FixedDestinationSize()
+		// A fixed peer always routes through its sole quality window. Other
+		// profiles admit new flows only through the selected window class.
+		inactive := !fixedDestination && fixedWindowType != nil && self.windowType != *fixedWindowType
 		if fixedDestination {
 			targetWindowSize = fixedDestinationSize
 			windowSizeMin = targetWindowSize
@@ -12218,10 +12226,11 @@ func (self *multiClientWindow) resize() {
 				self.reliabilitySettings().EvaluationPoolMultiple,
 				fixedDestination,
 			)
-			self.monitor.AddWindowExpandEvent(
+			self.monitor.addWindowExpandEvent(
 				minSatisfied(hardMinimumCount),
 				targetWindowSize+len(warnedClients),
 				self.ipv6Available(),
+				inactive,
 			)
 			addedCount = self.expand(
 				windowSize,
@@ -12244,20 +12253,22 @@ func (self *multiClientWindow) resize() {
 			}
 		}
 		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
-			self.monitor.AddWindowExpandEvent(
+			self.monitor.addWindowExpandEvent(
 				minSatisfied(self.hardMinimumClientCount(fixedDestination)),
 				windowSize.WindowSizeHardMax,
 				self.ipv6Available(),
+				inactive,
 			)
 			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
 			if self.log.V(1).Enabled() {
 				self.log.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-windowSize.WindowSizeHardMax, windowSize.WindowSizeHardMax)
 			}
 		} else {
-			self.monitor.AddWindowExpandEvent(
+			self.monitor.addWindowExpandEvent(
 				minSatisfied(self.hardMinimumClientCount(fixedDestination)),
 				len(clients)+len(warnedClients)+addedCount,
 				self.ipv6Available(),
+				inactive,
 			)
 		}
 
@@ -13525,7 +13536,8 @@ func (self *multiClientWindow) lastResortClientsForIpVersion(ipVersion int) []*m
 // clients toward the presentation minimum only when the ceiling is saturated
 // and at least one unwarned client remains selectable. This keeps the monitor
 // consistent with the admission policy without declaring an all-warned window
-// connected or concealing a replacement slot that can still be filled.
+// connected or concealing a replacement slot that can still be filled. A zero
+// configured minimum is not evidence of a usable provider in an empty window.
 func windowMinSatisfied(
 	windowSizeMin int,
 	clientCount int,
@@ -13535,7 +13547,10 @@ func windowMinSatisfied(
 	windowSizeHardMax int,
 ) bool {
 	if fixedDestination {
-		return windowSizeMin <= clientCount+warnedCount
+		return 0 < clientCount+warnedCount && windowSizeMin <= clientCount+warnedCount
+	}
+	if clientCount <= 0 {
+		return false
 	}
 	if windowSizeMin <= clientCount {
 		return true
@@ -13592,7 +13607,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, ipVersion int, cha
 		if _, profileWindowSize, ok := self.performanceProfile.FixedWindow(); ok {
 			windowSize = profileWindowSize
 		} else {
-			windowSize = self.settings.WindowSizes[self.windowType]
+			windowSize = self.defaultWindowSizeWithLock()
 		}
 	}()
 
