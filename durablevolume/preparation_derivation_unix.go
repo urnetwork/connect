@@ -251,7 +251,9 @@ func preparationMoveSources(plan PreparationPlan) map[string]PreparationSource {
 
 // Accepted derivation replays the fixed pure transformation over the retained
 // original census and reviewed member identities. No runtime alias is added.
-func validatePhysicalMetadataDerivations(ctx context.Context, request PreparationRequest, plan PreparationPlan, adapter PreparationAdapter, report Inventory) error {
+// A completed apply has moved those same inodes into the target, so its replay
+// borrows the published names; an incomplete apply borrows the staged sources.
+func validatePhysicalMetadataDerivations(ctx context.Context, request PreparationRequest, plan PreparationPlan, adapter PreparationAdapter, report Inventory, complete bool) error {
 	derivations := map[int]map[string]PreparationDerivation{}
 	for _, derivation := range plan.Derivations {
 		if derivation.OwnerIndex < 0 || derivation.OwnerIndex >= len(plan.Owners) {
@@ -313,6 +315,9 @@ func validatePhysicalMetadataDerivations(ctx context.Context, request Preparatio
 		targets := make([]PreparationSource, 0, len(owner.Files)-len(paths))
 		for _, source := range plan.Sources {
 			if filepath.Base(filepath.Dir(source.Path)) == owner.StagingName && !preparationMetadataOwns(owner.PhysicalMetadata, source.File.Path) {
+				if complete {
+					source.Path = filepath.Join(request.RootPath, source.File.Path)
+				}
 				targets = append(targets, source)
 			}
 		}
