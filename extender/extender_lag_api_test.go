@@ -1470,7 +1470,7 @@ func TestLagApiLoadBudget(t *testing.T) {
 // budget, so whatever the bytes moved, a load is never refused or cut for
 // them.
 func TestLagApiNoBudgetByDefault(t *testing.T) {
-	fixture := newLagApiFixture(t, nil)
+	fixture := newLagApiDurationFixture(t, nil)
 	if fixture.api.settings.DailyBudgetBytes != 0 || fixture.api.budget.limit != 0 {
 		t.Fatalf("budget %d", fixture.api.budget.limit)
 	}
@@ -1509,7 +1509,7 @@ func TestLagApiNoBudgetByDefault(t *testing.T) {
 		body.DownloadMs = 300
 		body.UploadMs = 300
 	}))
-	load := controlSession.runLoad(lagTestLoadOptions{})
+	load := controlSession.runLoad(lagTestLoadOptions{uploadByteCount: testLagDurationByteCount})
 	if load.result.EndReason != "complete" || !load.result.UploadVerified {
 		t.Errorf("result %+v", load.result.raw)
 	}
@@ -1519,7 +1519,7 @@ func TestLagApiNoBudgetByDefault(t *testing.T) {
 // one load per session, and the report of the minute around the load, sent
 // when the minute closes with the session still open.
 func TestLagApiLoadAndReport(t *testing.T) {
-	fixture := newLagApiFixture(t, nil)
+	fixture := newLagApiDurationFixture(t, nil)
 	fixture.setTimings(func(timings *lagApiTimings) {
 		timings.reportBefore = 500 * time.Millisecond
 		timings.reportAfter = 500 * time.Millisecond
@@ -1535,7 +1535,7 @@ func TestLagApiLoadAndReport(t *testing.T) {
 	}
 	time.Sleep(700 * time.Millisecond)
 
-	load := session.runLoad(lagTestLoadOptions{})
+	load := session.runLoad(lagTestLoadOptions{uploadByteCount: testLagDurationByteCount})
 	if load.result.Type != "loadResult" || !load.result.UploadVerified || load.result.EndReason != "complete" {
 		t.Fatalf("result %+v", load.result.raw)
 	}
@@ -1748,7 +1748,7 @@ func TestLagApiLoadTimeouts(t *testing.T) {
 // done wait, and in either case the load's slot is free as soon as the window
 // closes.
 func TestLagApiLoadResultFollowsDone(t *testing.T) {
-	fixture := newLagApiFixture(t, func(settings *ExtenderLagSettings) {
+	fixture := newLagApiDurationFixture(t, func(settings *ExtenderLagSettings) {
 		settings.ConcurrentLoads = 1
 	})
 	fixture.setTimings(func(timings *lagApiTimings) {
@@ -1762,6 +1762,7 @@ func TestLagApiLoadResultFollowsDone(t *testing.T) {
 	}
 	loadCounts := make(chan int, 2)
 	options := lagTestLoadOptions{
+		uploadByteCount: testLagDurationByteCount,
 		windowClosed: func() {
 			loadCounts <- fixture.api.loadCountNow()
 		},
@@ -1802,7 +1803,7 @@ func TestLagApiLoadResultFollowsDone(t *testing.T) {
 		body.DownloadMs = 250
 		body.UploadMs = 750
 	}))
-	load = session.runLoad(lagTestLoadOptions{earlyDone: true})
+	load = session.runLoad(lagTestLoadOptions{earlyDone: true, uploadByteCount: testLagDurationByteCount})
 	if load.result.EndReason != "complete" || !load.result.UploadVerified {
 		t.Errorf("result after an early done %+v", load.result.raw)
 	}

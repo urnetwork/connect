@@ -194,7 +194,7 @@ func TestExtenderNetworkClientSamplesAgainWhenHelloInstallsKeysDuringTheDial(t *
 	t.Cleanup(clientStrategy.Close)
 
 	releaseHello := make(chan struct{})
-	settings := connect.DefaultExtenderNetworkClientSettings()
+	settings := feedRootKeyDialSettings()
 	settings.ExtenderDnsName = "extender.space.example"
 	settings.MinBackoff = 10 * time.Millisecond
 	settings.MaxBackoff = 200 * time.Millisecond
@@ -263,4 +263,13 @@ func TestExtenderNetworkClientSamplesAgainWhenHelloInstallsKeysDuringTheDial(t *
 	case <-time.After(10 * time.Second):
 		t.Fatal("the stream to the extender the replaced keys chose stayed open")
 	}
+}
+
+// Only the feed owns the address-only dial barrier in the root-key rotation test.
+func feedRootKeyDialSettings() *connect.ExtenderNetworkClientSettings {
+	settings := connect.DefaultExtenderNetworkClientSettings()
+	settings.Probe = func(context.Context, *connect.ExtenderCandidate, *connect.ExtenderProbeAttestor) (time.Duration, connect.ExtenderPingOutcome, error) {
+		return 20 * time.Millisecond, connect.ExtenderPingUnattested, nil
+	}
+	return settings
 }

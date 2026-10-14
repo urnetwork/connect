@@ -42,6 +42,45 @@ These are admission and GC settings, not a guarantee that every byte of live
 runtime fits those numbers. DNS singleton progress, carrier handoff overlap,
 runtime metadata, returned pools, and native/OS memory require separate telemetry.
 
+### Shared iOS / hosted-proxy low profile (2026-10-14)
+
+The SDK now exposes `DefaultLowMemoryDeviceLocalSettings()` and the shared
+`LowMemoryDeviceTargetByteCount = 32 MiB`. iOS defaults and `server/proxy`
+explicitly select this per-owner policy. Merely setting a numeric target on
+Linux previously left hosted devices on the desktop queue/window policy.
+Normal Android's explicit 64-MiB policy remains unchanged; ordinary desktop
+constructors still do not opt into the low profile.
+
+The proxy default, `config/main/proxy.yml`, and canonical monitor expectation
+change from 24 to 32 MiB. Positive configured overrides retain the low policy;
+metrics report their actual targets. An intentional nondefault target therefore
+requires reconciling the monitor warning, not a runtime admission waiver.
+With providing disabled, the source-derived 32-MiB capacities are a 21,810,380-B
+shared transfer root, 2,181,038-B Pack handoff child, and 8,388,608-B carrier
+budget. Child capacities overlap, so they must not be added to their root.
+
+This selection does **not** impose a 32-MiB server process limit, retune global
+pools, enable mobile-only runtime samplers on servers, or alter separate proxy
+TUN socket buffers. Those allocations and total RSS remain outside the SDK
+tracked-use sum. Profile parity is not a measured total-memory guarantee.
+
+An adjacent settings-ownership defect was fixed: constructors now clone mutable
+client-settings containers before assigning owner budgets. Two deterministic
+controls fail on the old implementation because caller settings are mutated
+and a second construction replaces the first live owner's budget pointers.
+The new tests also saturate one owner's Pack budget and verify the other owner
+can still admit, release, and survive the first owner's close.
+
+Initial focused native-host validation passed **7 SDK, 41 proxy, and 10 monitor
+tests in each of normal and race-enabled fresh processes**, with no failures or
+skips; proxy also has five nested checks. Old proxy/default and monitor controls
+fail semantically as expected. This is one normal/race pair, not three-run
+confirmation, full parent qualification, or a performance result. Smaller
+queue/window caps can change throughput and latency. Fresh proxy/PERFVAR
+comparisons and complete Android-device iOS32/Android64 MEMSTEADY qualification
+remain required; no speed improvement, baseline promotion, or native iOS
+`phys_footprint <50 MiB` result is claimed.
+
 Current physical teardown qualification requires actual DeviceLocal cancellation
 and joined shutdown, not stopped roles, AM exit or a successful `finish` status.
 The test-owned native observer keeps the existing 15-second sampler cadence plus
@@ -4249,3 +4288,79 @@ not physical performance or memory: the fresh full 168-cell/560-observation
 campaign for the 32 MiB iOS surrogate and 64 MiB Android profile is still pending.
 The prior 36 Mbps H1 median remains below the unchanged 40 Mbps floor; neither
 this repair nor Android measurements establish native iOS footprint below 50 MiB.
+
+### 2026-10-13: first 32 MiB physical H1 session — memory pass, speed miss
+
+The fresh full runner `round-full-go1272-tools-01` measured the allowlisted Pixel
+(device-a) on Wi-Fi, control arm, `ios-memory-audit-v2`. Both the observed
+Go soft limit and DeviceLocal target were 33,554,432 bytes. These are Android
+surrogate observations, not native iOS total-footprint measurements.
+
+| Measurement | Direct baseline | H1 |
+| --- | ---: | ---: |
+| Fast.com display, three runs (Mbps) | 890 / 930 / 1100 | 18 / 38 / 38 |
+| Display median (Mbps) | 930 | 38 |
+| Wikipedia median load, five runs (ms) | 251.4 | 611.4 |
+| Wikipedia median TTFB (ms) | 73.8 | 263.6 |
+| Quiet Go peak (MiB) | 16.66 | 25.55 |
+
+The H1 live memory gate passed after a 331,161-ms quiet boundary, with 68
+device primitives and zero recorded 32 MiB breaches. Retained session-wide
+Go peak was 29,335,568 bytes (27.98 MiB); final teardown passed, with four
+teardown primitives and a teardown peak of 24,887,312 bytes (23.73 MiB).
+The final ledger conservatively assigns the session-wide producer peak to
+both observations, including late retained events. These are sampled runtime
+observations, not proof of an unsampled instantaneous maximum.
+
+Fast.com's display is the existing authoritative speed metric. The separate
+page-target byte counter reports only completed responses, omitting canceled,
+unfinished and worker-target traffic; its H1 values 0.05 / 8.74 / 0.05 Mbps
+must not be interpreted as aggregate exit throughput. Native H1 counters
+increased by 216,399,702 ingress bytes across the whole workload, corroborating
+substantial traffic but not attributing bytes to individual Fast repetitions.
+
+The cell failed the unchanged 40 Mbps H1 floor. It is not a qualified baseline
+or a statistically established code regression. Canonical first-failure stop
+retained only two of 560 required observations; the other 167 cells, Galaxy,
+cellular/P2P, candidate arm and Android 64 MiB profile remain unmeasured here.
+No memory/performance improvement or baseline promotion is claimed. A narrow
+safe continuation policy for validated speed misses is under review, not
+implemented; memory, ownership and malformed-workload failures remain fatal.
+The full runner was stopped at a correctness-command boundary, with raced
+commands recorded CANCELED and canonical cleanup PASS. See the matching
+[measurement ledger](../tests/PERFVAR-MEASUREMENTS.md#2026-10-13--round-full-go1272-tools-01--first-physical-h1-memory-result).
+
+### 2026-10-14: continuation quiet-memory results — shared teardown failed
+
+Fresh PERF-only continuation on allowlisted Pixel (device-a), Wi-Fi, control,
+retained exact 32 MiB DeviceLocal target, Go soft limit and observed-runtime
+gate. The full device plan still requires both phones, Wi-Fi/cellular/P2P,
+control/candidate and separate iOS32/Android64 profiles. Numeric H1 speed misses
+now permit safe evidence collection; memory/ownership/cleanup failures remain fatal.
+
+| Live quiet-gate measurement | DIRECT | H1 | Auto |
+| --- | ---: | ---: | ---: |
+| Observed Go peak (MiB) | 17.63 | 24.86 | 27.62 |
+| Quiet Go peak (MiB) | 16.94 | 24.86 | 27.26 |
+| Quiet samples / recorded 32 MiB breaches | 22 / 0 | 22 / 0 | 22 / 0 |
+| Fast.com median display (Mbps) | 910 | 12 | 0.6 |
+| Wikipedia median load / TTFB (ms) | 230.4 / 55.1 | 1057.3 / 402.4 | 1066.3 / 452.5 |
+
+All three live gates passed their five-minute intervals. These are partial
+sampled-runtime observations, not final session peaks or qualified profiles:
+H3 timed out waiting for provider-window admission before any egress probe,
+finish/shared teardown failed, and all four retained observations are invalid.
+Android64 was not reached. No native iOS under-50-MiB footprint claim follows.
+
+Auto initially selected H1 and later H1+H3, predominantly H1 by ingress bytes.
+One Fast3 interval had a seven-second overall-TUN RX plateau while Wi-Fi counters
+advanced; continuous per-flow offered load is unproved. Its enclosing interval
+recorded only 630.218 ms total Go STW pause, not a seven-second GC freeze.
+Missing provider and sender-side ACK/window/pacing diagnostics prevent causal
+attribution. Do not tune timers or spend additional budget based on these samples
+alone; paired performance/utilization qualification remains pending.
+
+Canonical cleanup passed and all owners joined; correctness separately found a
+test-fixture pool-ownership error. Bounded readiness diagnostics and deterministic
+fixture regression tests are under review. The failed evidence remains preserved,
+with no baseline promotion. See the [matching measurement ledger](../tests/PERFVAR-MEASUREMENTS.md#2026-10-14--device-continuation-round-02--partial-quiet-passes-failed-cell).
