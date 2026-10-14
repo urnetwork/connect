@@ -733,6 +733,10 @@ Test-infrastructure lessons (reusable):
 - **Reading the evidence:**
   - Flags are sticky for the recorder's life: each records something the peer
     did. A false flag is absence of evidence unless its precondition holds.
+  - Times are read inside the recording's critical section, so recording order
+    is time order: `LastObservationTime` never moves backwards, and "most
+    recent" in the rules below means recorded last
+    (`TestPeerCapabilityRecorderTimesFollowRecordingOrder`).
   - `E2eAttempted && !E2eNegotiated` is a ClientHello nobody answered — the
     shape a provider without the responder (or with its sessions off) leaves,
     and also what any provider looks like before its answer arrives, or when

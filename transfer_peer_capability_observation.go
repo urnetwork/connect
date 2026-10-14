@@ -144,7 +144,8 @@ type PeerCapabilityRecorder struct {
 	peerIdCapabilities      map[Id]*peerCapability
 	droppedObservationCount uint64
 
-	// Nil in production; tests pin the observation clock.
+	// Nil in production; tests pin the observation clock. Called under
+	// stateLock, so it must not call back into the recorder.
 	nowForTest func() time.Time
 	// Nil in production; tests rendezvous after a recorded observation,
 	// outside the state lock.
@@ -249,7 +250,6 @@ func (self *PeerCapabilityRecorder) observeE2eAttempt(peerId Id) {
 	if self == nil || peerId == (Id{}) {
 		return
 	}
-	now := self.now()
 	recorded := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -257,6 +257,7 @@ func (self *PeerCapabilityRecorder) observeE2eAttempt(peerId Id) {
 		if capability == nil {
 			return false
 		}
+		now := self.now()
 		if !capability.e2eAttempted {
 			capability.e2eAttempted = true
 			capability.e2eFirstAttemptTime = now
@@ -273,7 +274,6 @@ func (self *PeerCapabilityRecorder) observeE2eHandshake(peerId Id, keyExchange t
 	if self == nil || peerId == (Id{}) {
 		return
 	}
-	now := self.now()
 	recorded := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -281,6 +281,7 @@ func (self *PeerCapabilityRecorder) observeE2eHandshake(peerId Id, keyExchange t
 		if capability == nil {
 			return false
 		}
+		now := self.now()
 		capability.e2eNegotiated = true
 		if !capability.keyExchangeSealed {
 			capability.keyExchange = keyExchange
@@ -297,7 +298,6 @@ func (self *PeerCapabilityRecorder) observeE2eSealed(peerId Id, keyExchange tls.
 	if self == nil || peerId == (Id{}) {
 		return
 	}
-	now := self.now()
 	recorded := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -305,6 +305,7 @@ func (self *PeerCapabilityRecorder) observeE2eSealed(peerId Id, keyExchange tls.
 		if capability == nil {
 			return false
 		}
+		now := self.now()
 		// a seal implies the handshake it verified
 		capability.e2eNegotiated = true
 		capability.e2eSealed = true
@@ -321,7 +322,6 @@ func (self *PeerCapabilityRecorder) observeAck(peerId Id) {
 	if self == nil || peerId == (Id{}) {
 		return
 	}
-	now := self.now()
 	recorded := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -329,6 +329,7 @@ func (self *PeerCapabilityRecorder) observeAck(peerId Id) {
 		if capability == nil {
 			return false
 		}
+		now := self.now()
 		capability.ackObserved = true
 		capability.lastObservationTime = now
 		return true
@@ -342,7 +343,6 @@ func (self *PeerCapabilityRecorder) observeReceiveWindow(peerId Id, receiveWindo
 	if self == nil || peerId == (Id{}) {
 		return
 	}
-	now := self.now()
 	recorded := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -350,6 +350,7 @@ func (self *PeerCapabilityRecorder) observeReceiveWindow(peerId Id, receiveWindo
 		if capability == nil {
 			return false
 		}
+		now := self.now()
 		// an advertisement only ever arrives on an acknowledgement
 		capability.ackObserved = true
 		if !capability.windowAdvertised || capability.maxReceiveWindowByteCount < receiveWindowByteCount {
@@ -384,6 +385,11 @@ func (self *PeerCapabilityRecorder) capabilityWithLock(peerId Id) *peerCapabilit
 	return capability
 }
 
+// Every recording reads its time here, inside its critical section, so
+// recording order is time order: LastObservationTime never moves backwards and
+// the most recent observation is the one recorded last. A time read before the
+// lock would let an observation delayed between the two record an older time
+// over a newer one.
 func (self *PeerCapabilityRecorder) now() time.Time {
 	if self.nowForTest != nil {
 		return self.nowForTest()

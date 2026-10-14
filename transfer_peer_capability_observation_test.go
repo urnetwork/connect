@@ -324,6 +324,64 @@ func TestPeerCapabilityRecorderNilAndZeroValue(t *testing.T) {
 	}
 }
 
+// An observation's time is read inside the critical section that records it,
+// so recording order is time order: LastObservationTime never moves backwards
+// and "most recent" names the observation recorded last. Read before the
+// lock, an observation delayed between its clock read and its lock records an
+// older time over a newer one.
+//
+// The first observation is held inside its clock read. If it holds the record's
+// lock there, nothing can record ahead of it and the second observation runs
+// after it; if it does not, the second records first, which is the delay the
+// earlier clock read allowed. The barrier decides which, not the scheduler.
+func TestPeerCapabilityRecorderTimesFollowRecordingOrder(t *testing.T) {
+	recorder := NewPeerCapabilityRecorder(0)
+	peerId := NewId()
+	firstTime := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	secondTime := firstTime.Add(time.Second)
+	firstClockRead := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var clockLock sync.Mutex
+	clockReadCount := 0
+	recorder.nowForTest = func() time.Time {
+		clockLock.Lock()
+		clockReadCount += 1
+		n := clockReadCount
+		clockLock.Unlock()
+		if n == 1 {
+			close(firstClockRead)
+			<-releaseFirst
+			return firstTime
+		}
+		return secondTime
+	}
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		recorder.observeAck(peerId)
+	}()
+	<-firstClockRead
+	secondRecorded := false
+	if recorder.stateLock.TryLock() {
+		// the first observation read its time outside the lock
+		recorder.stateLock.Unlock()
+		recorder.observeReceiveWindow(peerId, 4096)
+		secondRecorded = true
+	}
+	close(releaseFirst)
+	<-firstDone
+	if !secondRecorded {
+		recorder.observeReceiveWindow(peerId, 4096)
+	}
+
+	observation, _ := recorder.Get(peerId)
+	if observation.LastObservationTime != secondTime {
+		t.Fatalf("the last observation time is %s after observations at %s and %s: a time read before the lock was recorded over a later one",
+			observation.LastObservationTime, firstTime, secondTime)
+	}
+}
+
 // Writers on every recording edge race readers of Get and Snapshot. Every read
 // is one consistent record, the largest window never moves backwards for a
 // reader, and because the writes commute the final state is exact.
