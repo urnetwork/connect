@@ -1554,6 +1554,13 @@ type ClientSettings struct {
 	// Optional payload lifetime charges; nil disables packet-path accounting.
 	// Captured at construction independently from the worker ledger above.
 	PayloadOwnerLedger *TransferPayloadOwnerLedger
+	// Optional per-peer evidence of what each peer negotiates on the wire: the
+	// end-to-end session's key exchange and seal, and receive window
+	// advertisement on its acknowledgements (see PeerCapabilityObservations).
+	// Nil, the default, records nothing. Captured at construction; clients of
+	// one owner may share it. It never changes behaviour: whether an
+	// end-to-end session is attempted is `EncryptionSettings.Mode`.
+	PeerCapabilityObservations *PeerCapabilityObservations
 
 	SendBufferSize    int
 	ForwardBufferSize int
@@ -1899,6 +1906,8 @@ type Client struct {
 	settings           *ClientSettings
 	memoryOwnerLedger  *TransferMemoryOwnerLedger
 	payloadOwnerLedger *TransferPayloadOwnerLedger
+	// from settings at construction; nil records nothing
+	peerCapabilityObservations *PeerCapabilityObservations
 
 	receiveCallbacks *CallbackList[ReceiveFunction]
 	forwardCallbacks *CallbackList[ForwardFunction]
@@ -2140,6 +2149,7 @@ func NewClientWithTag(
 		settings:                     settings,
 		memoryOwnerLedger:            settings.MemoryOwnerLedger,
 		payloadOwnerLedger:           settings.PayloadOwnerLedger,
+		peerCapabilityObservations:   settings.PeerCapabilityObservations,
 		receiveCallbacks:             NewCallbackList[ReceiveFunction](),
 		forwardCallbacks:             NewCallbackList[ForwardFunction](),
 		subprotocols:                 newSubprotocolRegistry(),
@@ -6657,6 +6667,9 @@ type SendSequence struct {
 	// whether any acknowledgement has arrived at all, which is what separates
 	// a sender that is still blind from one whose peer does not advertise
 	ackSeen atomic.Bool
+	// The client's capability evidence, captured at construction and told the
+	// first acknowledgement and each window step above. Nil records nothing.
+	peerCapabilityObservations *PeerCapabilityObservations
 	// Whether the peer advertised that it registers a contract announced ahead
 	// of its data (THROUGHPUTFIX §39.1). Written from the acknowledgement
 	// worker on every delivery acknowledgement and read by the sequence
@@ -6830,6 +6843,7 @@ func newSendSequenceWithLogicalLane(
 		rttWindow:                      rttWindow,
 		windowPacer:                    windowBurstPacer{afterWaitForTest: sendBufferSettings.afterWindowPacingWaitForTest},
 		contractSeqIndex:               0,
+		peerCapabilityObservations:     client.peerCapabilityObservations,
 	}
 	if sendBufferSettings.ResendQueueRetainedByteAccounting {
 		seq.resendQueue.setLifetimeBudget()
@@ -11248,7 +11262,12 @@ func (self *SendSequence) observeReceiveWindowAdvertisement(ack receiveAckMessag
 	// without the field has a peer that does not advertise and takes its own
 	// constant. Those are different facts and the window is different for
 	// each (THROUGHPUTFIX §37.21).
-	self.ackSeen.Store(true)
+	if !self.ackSeen.Load() && !self.ackSeen.Swap(true) {
+		// the sequence's first acknowledgement, once: capability evidence
+		// that the peer answers, without which a missing advertisement below
+		// says nothing about it
+		self.peerCapabilityObservations.observeAck(self.destination)
+	}
 	if ack.ackCompressTimeoutSet {
 		self.receiveAckCompressMicros.Store(uint64(ack.ackCompressTimeoutMicros) + 1)
 	}
@@ -11257,6 +11276,9 @@ func (self *SendSequence) observeReceiveWindowAdvertisement(ack receiveAckMessag
 	}
 	if !self.receiveWindowSet.Load() || self.receiveWindowByteCount.Load() < uint64(ack.receiveWindowByteCount) {
 		self.receiveWindowSetAtNanos.Store(time.Now().UnixNano())
+		// the first advertisement or an increase, the only acknowledgements
+		// that can raise the peer's largest advertised value
+		self.peerCapabilityObservations.observeReceiveWindow(self.destination, ByteCount(ack.receiveWindowByteCount))
 	}
 	self.receiveWindowByteCount.Store(uint64(ack.receiveWindowByteCount))
 	self.receiveWindowSet.Store(true)

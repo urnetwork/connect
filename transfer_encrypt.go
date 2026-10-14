@@ -1653,6 +1653,11 @@ func (self *peerEncryptionSession) outboxLoop(e *tlsHandshakeEpoch) {
 				self.logTag, batchIndex, len(b), firstByte,
 			)
 		}
+		if batchIndex == 0 && self.role == sequenceTlsRoleClient {
+			// a client-role epoch's first batch is its ClientHello: capability
+			// evidence that this client asked the peer for a session
+			self.client.peerCapabilityObservations.observeE2eAttempt(self.peerId)
+		}
 		batchIndex += 1
 		// In TLS-server role the first outbox batch is the server flight
 		// (containing the server's Finished). Mark the "awaiting client
@@ -1804,6 +1809,8 @@ func (self *peerEncryptionSession) adoptEpochId(e *tlsHandshakeEpoch, epochId Id
 // subsequent traffic flows in plaintext.
 func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err error) {
 	logFailure := false
+	// read under the lock for the capability evidence below
+	negotiatedCurveId := tls.CurveID(0)
 	done := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -1835,6 +1842,7 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 					// surfaced via PeerEncryptionStates.KeyExchange so callers
 					// can tell post-quantum from classical sessions
 					e.negotiatedCurveId = state.CurveID
+					negotiatedCurveId = state.CurveID
 				}
 			}
 		}
@@ -1852,6 +1860,12 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 	}()
 	if !done {
 		return
+	}
+	if err == nil {
+		// capability evidence: the peer completed a handshake with this
+		// group, whether or not a newer epoch has since replaced this one.
+		// Recorded before the identity proof below can seal the epoch.
+		self.client.peerCapabilityObservations.observeE2eHandshake(self.peerId, negotiatedCurveId)
 	}
 	self.notifyIdleStateChanged()
 	if err != nil {
@@ -2065,6 +2079,9 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 	}
 	ok := VerifyClientKeySignature(peerPub, exporter, payload)
 	logFailure := false
+	// set under the lock when e is promoted, for the capability evidence below
+	sealed := false
+	sealedCurveId := tls.CurveID(0)
 	identityFailed := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -2076,6 +2093,8 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 			// win; establishing a stale epoch would serve an outdated cipher.
 			if self.epoch == e {
 				self.markEstablishedWithLock(e)
+				sealed = true
+				sealedCurveId = e.negotiatedCurveId
 			}
 			if e.establishmentDone != nil && !isClosed(e.establishmentDone) {
 				close(e.establishmentDone)
@@ -2102,6 +2121,11 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 		// always-on: one line per established session, the on-device signal
 		// that the e2e identity chain completed for this peer
 		self.client.log.Infof("[tls]%s peer identity proof verified — cipher is now usable\n", self.logTag)
+		if sealed {
+			// capability evidence, recorded before the callbacks below so a
+			// Sealed event's consumer already reads it
+			self.client.peerCapabilityObservations.observeE2eSealed(self.peerId, sealedCurveId)
+		}
 		// the established + identity-verified peer set grew (or the
 		// established epoch swapped): the only promote path runs above
 		self.manager.peerIdentityChanged()

@@ -157,12 +157,14 @@ func TestOperatorClientSettingsCopiesExactlyTheNestedSettingsItOwns(t *testing.T
 		"WebRtcSettings":          true,
 	}
 	sharedFields := map[string]bool{
-		"MemoryOwnerLedger":     true,
-		"PayloadOwnerLedger":    true,
-		"StreamManagerSettings": true,
-		"PeerManagerSettings":   true,
-		"Log":                   true,
-		"ClientKeySeed":         true,
+		"MemoryOwnerLedger":  true,
+		"PayloadOwnerLedger": true,
+		// an owner's observer, shared by every client it creates
+		"PeerCapabilityObservations": true,
+		"StreamManagerSettings":      true,
+		"PeerManagerSettings":        true,
+		"Log":                        true,
+		"ClientKeySeed":              true,
 	}
 	isReference := func(kind reflect.Kind) bool {
 		switch kind {
