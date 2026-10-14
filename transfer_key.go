@@ -19,6 +19,12 @@ import (
 // unauthenticated public-key lookup API. The private half stays in
 // this process — it never leaves.
 //
+// `ClientSettings.SkipClientKeyPublication` keeps the public half local
+// too, for a client whose key nothing reads. The constructor refuses it
+// alongside any reader: a required registration, a close-report domain
+// whose signed originals reference the registration, or per-peer sessions
+// whose peers verify the cert signature and identity proof against it.
+//
 // Trust model. The platform is not trusted to honestly distribute
 // per-client public keys for new ClientIds. The expectation is that
 // the (ClientId, public key) binding is registered at account creation
@@ -66,6 +72,8 @@ type ClientKeyManager struct {
 	publicKey  ed25519.PublicKey
 	// The constructor owns this value alongside the original close-report domain.
 	historyDomainHash [32]byte
+	// Captured with the settings the constructor checked for a reader of the key.
+	skipPublication bool
 
 	controlSync         *ControlSync
 	registrationSync    *ControlSyncOob
@@ -87,6 +95,18 @@ type ClientKeyManager struct {
 // fresh seed is generated. Callers can read the running seed back via
 // `Seed()` to persist it across restarts.
 func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager, error) {
+	if client.settings.SkipClientKeyPublication {
+		// each of these reads the published key, so skipping it would break
+		// the reader rather than save a registration
+		switch {
+		case client.settings.ClientKeyRegistrationRequired:
+			return nil, errors.New("client key publication is skipped, but processed registration is required")
+		case client.settings.ContractManagerSettings != nil && client.settings.ContractManagerSettings.CloseReportDomainHash != ([32]byte{}):
+			return nil, errors.New("client key publication is skipped, but close reports are signed under a key history domain")
+		case client.settings.EncryptionSettings != nil && client.settings.EncryptionSettings.Mode != EncryptionModeOff:
+			return nil, errors.New("client key publication is skipped, but per-peer sessions need peers to verify the published key")
+		}
+	}
 	if client.settings.ClientKeyRegistrationRequired {
 		control, ok := client.ClientOob().(*ApiOutOfBandControl)
 		if !ok || control == nil || control.api == nil {
@@ -126,6 +146,8 @@ func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager
 		publicKey:   pub,
 		controlSync: NewControlSync(managerCtx, client, "client-key"),
 		workers:     newLifecycleAdmission(),
+
+		skipPublication: client.settings.SkipClientKeyPublication,
 	}
 	if client.settings.ContractManagerSettings != nil {
 		m.historyDomainHash = client.settings.ContractManagerSettings.CloseReportDomainHash
@@ -196,7 +218,8 @@ func (self *ClientKeyManager) Sign(data []byte) []byte {
 }
 
 // SetSeed replaces the local client's long-lived Ed25519 identity keypair
-// with the key derived from seed and republishes the public key.
+// with the key derived from seed and republishes the public key, unless
+// publication is skipped.
 func (self *ClientKeyManager) SetSeed(seed []byte) error {
 	if len(seed) != ed25519.SeedSize {
 		return fmt.Errorf("client key seed length %d (expected %d)", len(seed), ed25519.SeedSize)
@@ -343,6 +366,10 @@ func VerifyCertChainSignature(peerPub ed25519.PublicKey, chain [][]byte, sig []b
 // on the client's `ReadyNotify()` before its first send so the
 // `sendBuffer` is wired up; without this gate the send path races the
 // buffer wiring in `Client.initBuffers`.
+//
+// A skipped publication returns at the same point, so the constructor and
+// every `SetSeed` rotation leave the key local. Nothing waits for it: only a
+// required registration does, and the constructor refused that.
 func (self *ClientKeyManager) publishClientKey() {
 	if self.registrationSync != nil {
 		self.publishRegisteredClientKey()
@@ -358,6 +385,9 @@ func (self *ClientKeyManager) publishClientKey() {
 	}
 	if self.client.settings.beforeClientKeyPublishForTest != nil {
 		self.client.settings.beforeClientKeyPublishForTest()
+	}
+	if self.skipPublication {
+		return
 	}
 	frame, err := ToFrame(self.clientKeyMessage(self.PublicKey()), self.client.settings.ProtocolVersion)
 	if err != nil {

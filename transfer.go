@@ -1597,6 +1597,13 @@ type ClientSettings struct {
 	// custom delivery-only control implementations must leave this disabled.
 	ClientKeyRegistrationRequired bool
 
+	// Keep the identity key local: ClientKeyManager sends no `ClientKey`
+	// control, so the platform holds no registration and `/key/<client_id>`
+	// has no key for this client. Only for a client whose key nothing reads:
+	// no required registration, no close-report domain and encryption off.
+	// Construction refuses it alongside any of those. The zero value publishes.
+	SkipClientKeyPublication bool
+
 	ProtocolVersion int
 
 	DefaultTransferOpts TransferOptions
@@ -1607,7 +1614,8 @@ type ClientSettings struct {
 	// Nil test barrier pauses loopback cleanup after delivery but before its
 	// SendPack returns message-pool ownership.
 	beforeLoopbackReleaseForTest func()
-	// Nil test barrier pauses the actual client-key publisher after readiness.
+	// Nil test barrier pauses the actual client-key publisher after readiness,
+	// before it publishes or skips publication.
 	beforeClientKeyPublishForTest func()
 }
 
