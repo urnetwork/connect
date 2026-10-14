@@ -191,6 +191,15 @@ type TunSettings struct {
 	DialRace        int
 	DialRaceTimeout time.Duration
 	DialTimeout     time.Duration
+	// DialFirstIpFamily, 4 or 6, is the family a stream dial of a name this
+	// tun resolves tries first. The other family starts DefaultDialFallbackDelay
+	// later, or at once when the first fails or has no address; a ready answer
+	// of the other family waits at most that delay for the first family's
+	// answer. A narrowed network, an IPv4-only tun, an IP literal and
+	// DialResolvedContext's caller order keep their family. 0 is the shared
+	// race: the first DNS answer starts at once, and IPv6 leads when both are
+	// ready (IPV6.md C6, C7).
+	DialFirstIpFamily int
 
 	// DohRequestTimeout bounds a single DoH request through this tun's resolver (total connect +
 	// TLS + query). The IpMux sets it from DnsUpgradeSettings.ResolveTimeout so DNS resolution has
@@ -1557,8 +1566,9 @@ func raceTunDialContext(
 // dialContext is one attempt of the stream/datagram dial through this tun's
 // stack (raceTunDialContext may run several). A name resolves through the
 // tun's DoH cache for the families the network permits, A and AAAA
-// concurrently. A stream starts the first usable answer immediately and
-// staggers later addresses (net_dial_race.go). A datagram dial uses the first
+// concurrently. A stream starts the first usable answer immediately, or the
+// settings' DialFirstIpFamily first, and staggers later addresses
+// (net_dial_race.go). A datagram dial uses the first
 // usable answer and cancels/joins the pending family; its socket success is
 // not remote path proof. Family-specific networks and literals are honored: a v6 target on
 // an IPv4-only tun is EAFNOSUPPORT.
@@ -1611,7 +1621,7 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 			resolveNetwork = strings.TrimRight(network, "46") + "4"
 		}
 		if stream {
-			return dialDohAddrsRace(dialCtx, self.DohCache(), resolveNetwork, host, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+			return dialDohAddrsRace(dialCtx, self.DohCache(), resolveNetwork, host, self.settings.DialFirstIpFamily, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 				return self.dialTcpAddr(ctx, host, netip.AddrPortFrom(addr, uint16(port)))
 			})
 		}

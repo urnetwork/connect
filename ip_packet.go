@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -126,19 +127,30 @@ const (
 // into IP_RECVERR. (tcp teardown uses `ipOosRstSequence` instead.)
 //
 // provider dial failure (tcp, host unreachable / v6 no-route): a provider
-// whose upstream dial fails -- out of sockets, or its own upstream proxy
-// refusing -- previously said nothing, leaving the source in syn-retransmit
-// backoff: measured hangs of 3, 7, 15, 31 and 63 seconds, each landing on a
-// retransmit boundary. the provider now answers with this packet. it is
-// consumed by the client's channel intercept (`ipParseIcmpUnreachable`) and
-// deliberately carries a different code from teardown, because the two mean
-// opposite things: "your exit died, reconnect" versus "this provider could
-// not open the upstream, quietly race another".
+// whose upstream dial fails at once -- no route, out of sockets, or its own
+// upstream proxy refusing -- previously said nothing, leaving the source in
+// syn-retransmit backoff: measured hangs of 3, 7, 15, 31 and 63 seconds, each
+// landing on a retransmit boundary. the provider now answers with this
+// packet; a dial that times out still gets nothing (`classifyDialFailure`).
+// it is consumed by the client's channel intercept (`ipParseIcmpUnreachable`)
+// and deliberately carries a different code from teardown, because the two
+// mean opposite things: "your exit died, reconnect" versus "this provider
+// could not open the upstream, quietly race another". the provider's return
+// path passes it only as this exact packet for the flow that failed
+// (`providerDialFailureReturnPath`). releases v2026.8.5 and v2026.8.6 sent it
+// as well, built by this same code; from 63dd3d4e (first released in
+// v2026.8.15) until that check, the return path's inspection dropped it.
 //
 // the embedded datagram mirrors the original egress packet: the ip header
 // plus the 8 transport bytes rfc 792 requires. for tcp the embedded sequence
-// number is the source's own (`ipPath.SequenceNumber`, parsed from its syn),
-// so a stack that does validate the embed accepts it.
+// number is `ipPath.SequenceNumber`. a provider's flow path carries none, so
+// the provider's signal embeds 0. the multi client's intercept and gVisor
+// (behind the validator's single-destination client) accept that, but a
+// kernel stack drops an error whose embedded sequence is outside its send
+// window (linux tcp_v4_err / tcp_v6_err). so where the multi client hands an
+// unreachable to the source's own stack, it builds it over the SYN's
+// sequence: `replyIpv6NoRoute` from the SYN itself, and the forward with the
+// re-race off (`clientDialFailure`) from the flow's SYN generation.
 //
 // `ipPath` is the flow's own direction (source to destination). the returned
 // packet is addressed back the other way, as if from the destination.
@@ -248,6 +260,45 @@ func ipParseIcmpUnreachable(packet []byte) (*IpPath, bool) {
 		}
 	}
 	return ipParseIcmpEmbeddedPath(icmp[icmpUnreachableHeaderSize:])
+}
+
+// providerDialFailureReturnPath is the return direction of flowPath when
+// packet is exactly the dial-failure signal the provider builds for that flow
+// (ipOosUnreachable over the flow's own path, as a failed upstream dial
+// sends it). The return path's inspection cannot parse an icmp error, so the
+// provider inspects its own signal as the flow's return instead. Any other
+// packet, an unreachable naming another flow, a different code or a single
+// changed byte, returns false and stays dropped (IPV6.md C7).
+func providerDialFailureReturnPath(flowPath *IpPath, packet []byte) (*IpPath, bool) {
+	if flowPath == nil {
+		return nil, false
+	}
+	signal, ok := ipOosUnreachable(flowPath)
+	if !ok || !bytes.Equal(signal, packet) {
+		return nil, false
+	}
+	return flowPath.Reverse(), true
+}
+
+// providerDialFailureEgressPath is the failed flow a provider's dial-failure
+// signal names, accepted only as the exact packet a provider sends for it:
+// ipOosUnreachable rebuilt for the flow the embed names, compared byte for
+// byte. That fixes the type and the code for the flow's protocol (host
+// unreachable or no route for tcp, port unreachable for udp), outer
+// addresses running from the flow's destination back to its source, one
+// family throughout, lengths and checksums. The embed's own sequence number
+// is kept, so only its 5-tuple is the flow. Anything else is not the signal
+// and both client intercepts drop it (IPV6.md C7).
+func providerDialFailureEgressPath(packet []byte) (*IpPath, bool) {
+	egressIpPath, ok := ipParseIcmpUnreachable(packet)
+	if !ok {
+		return nil, false
+	}
+	signal, ok := ipOosUnreachable(egressIpPath)
+	if !ok || !bytes.Equal(signal, packet) {
+		return nil, false
+	}
+	return egressIpPath, true
 }
 
 // ipIcmpBody finds the icmp message of a packet whose transport is icmp (v4)

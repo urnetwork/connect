@@ -434,7 +434,20 @@ func isBackendDegraded() bool {
 	if consecutiveBackendFails.Load() < backendDegradedFailThreshold {
 		return false
 	}
-	return time.Now().UnixNano()-lastBackendFailNano.Load() < int64(backendDegradedWindow)
+	// the stamp before the clock: a failure stamped between the two reads
+	// would otherwise read as after now
+	last := lastBackendFailNano.Load()
+	return backendFailRecent(time.Now().UnixNano(), last)
+}
+
+// backendFailRecent reports whether a failure stamped lastNanos is within
+// backendDegradedWindow before nowNanos. A stamp after now is not recent: the
+// clock stepped back since it was taken (a synctest bubble's clock starts in
+// 2000), so its age is unknown, and an unknown age must not latch "degraded",
+// which only ever stops work.
+func backendFailRecent(nowNanos int64, lastNanos int64) bool {
+	age := nowNanos - lastNanos
+	return 0 <= age && age < int64(backendDegradedWindow)
 }
 
 // backendFailMu serializes the failure-state transition. Recording a failure is
@@ -446,21 +459,24 @@ var backendFailMu sync.Mutex
 
 // noteBackendFailure records a failed backend round-trip (auth or contract OOB).
 //
-// A streak older than backendDegradedWindow is discarded rather than extended.
-// Without that, an idle provider that saw a few failures long ago and simply
-// stopped retrying would carry the old count forward: the next single failure
-// would push the total past the threshold with a fresh timestamp, and the
-// backend would read as degraded on the strength of one recent failure. The
-// threshold means "consecutive failures within the window", so a gap that
-// invalidates the streak for isBackendDegraded must also reset it here.
+// A streak older than backendDegradedWindow, or stamped after now (see
+// backendFailRecent), is discarded rather than extended. Without that, an idle
+// provider that saw a few failures long ago and simply stopped retrying would
+// carry the old count forward: the next single failure would push the total
+// past the threshold with a fresh timestamp, and the backend would read as
+// degraded on the strength of one recent failure. The threshold means
+// "consecutive failures within the window", so a gap that invalidates the
+// streak for isBackendDegraded must also reset it here.
 func noteBackendFailure() {
-	now := time.Now().UnixNano()
-
 	backendFailMu.Lock()
 	defer backendFailMu.Unlock()
 
+	// the clock under the lock: concurrent failures then stamp in the order
+	// they record, so none finds the stamp before it after its now and
+	// restarts the streak
+	now := time.Now().UnixNano()
 	last := lastBackendFailNano.Load()
-	if last != 0 && int64(backendDegradedWindow) <= now-last {
+	if last != 0 && !backendFailRecent(now, last) {
 		consecutiveBackendFails.Store(1)
 	} else {
 		consecutiveBackendFails.Add(1)

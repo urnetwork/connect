@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -164,6 +165,56 @@ func TestBackendDegraded_StreakSurvivesGapInsideWindow(t *testing.T) {
 	}
 }
 
+// A failure stamped after now is not recent. The clock stepped back since it
+// was taken, so its age is unknown, and an unknown age must not latch
+// "degraded", which only ever stops work. A synctest bubble's clock starts in
+// 2000, so inside one every failure an earlier test stamped in real time is
+// after now; read as recent, it held the windows of whichever bubbled tests
+// ran after it.
+func TestBackendDegraded_FailuresStampedAfterNowAreNotDegraded(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	for i := 0; i < backendDegradedFailThreshold; i++ {
+		noteBackendFailure()
+	}
+	if !isBackendDegraded() {
+		t.Fatal("precondition: should be degraded")
+	}
+	synctest.Test(t, func(t *testing.T) {
+		if isBackendDegraded() {
+			t.Error("failures stamped in real time read as recent inside a synctest bubble")
+		}
+	})
+
+	lastBackendFailNano.Store(time.Now().Add(time.Minute).UnixNano())
+	if isBackendDegraded() {
+		t.Error("degraded on failures stamped a minute after now")
+	}
+}
+
+// A streak stamped after now is discarded by the next failure, not extended:
+// one failure after the clock stepped back is the first of a fresh streak,
+// not the fourth of one whose age is unknown.
+func TestBackendDegraded_StreakStampedAfterNowIsNotResumedByANewFailure(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	for i := 0; i < backendDegradedFailThreshold; i++ {
+		noteBackendFailure()
+	}
+	lastBackendFailNano.Store(time.Now().Add(time.Minute).UnixNano())
+
+	noteBackendFailure()
+
+	if got := consecutiveBackendFails.Load(); got != 1 {
+		t.Fatalf("consecutive failures = %d after a streak stamped after now plus one failure, want 1", got)
+	}
+	if isBackendDegraded() {
+		t.Fatal("degraded after a single failure; the streak stamped after now was resumed instead of reset")
+	}
+}
+
 // Failures and successes arrive concurrently in production: one client's auth
 // can succeed while another's contract OOB fails. The pair must never leave a
 // positive failure count with a zero timestamp, which isBackendDegraded would
@@ -208,24 +259,31 @@ func TestBackendDegraded_ConcurrentSuccessAndFailureNeverLeaveInvalidState(t *te
 }
 
 func TestBackendDegraded_ConcurrentFailuresReachThreshold(t *testing.T) {
-	resetBackendDegraded()
 	defer resetBackendDegraded()
 
-	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			noteBackendFailure()
-		}()
-	}
-	wg.Wait()
+	// rounds, because one round of a lost increment is a scheduling accident
+	// that a single pass can miss: a failure that read the clock before
+	// waiting for the lock found the stamp of the one that overtook it after
+	// its now, and restarted the streak
+	for round := 0; round < 50; round++ {
+		resetBackendDegraded()
 
-	if got := consecutiveBackendFails.Load(); got != 32 {
-		t.Fatalf("consecutive failures = %d after 32 concurrent failures, want 32", got)
-	}
-	if !isBackendDegraded() {
-		t.Fatal("not degraded after 32 concurrent failures")
+		var wg sync.WaitGroup
+		for i := 0; i < 32; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				noteBackendFailure()
+			}()
+		}
+		wg.Wait()
+
+		if got := consecutiveBackendFails.Load(); got != 32 {
+			t.Fatalf("round %d: consecutive failures = %d after 32 concurrent failures, want 32", round, got)
+		}
+		if !isBackendDegraded() {
+			t.Fatalf("round %d: not degraded after 32 concurrent failures", round)
+		}
 	}
 }
 

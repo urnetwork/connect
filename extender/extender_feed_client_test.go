@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -540,6 +541,13 @@ func (self *feedFixture) newNetworkClient(
 	t.Helper()
 	strategySettings := connect.DefaultClientStrategySettings()
 	strategySettings.ConnectSettings = *self.extender.connectSettings()
+	// the records beside the fixture's own carry documentation addresses,
+	// which the client samples and probes over every carrier: it dials
+	// loopback only, so none of them is sent to
+	strategySettings.ConnectSettings.DialContextSettings = &connect.DialContextSettings{
+		DialContext:       testLoopbackDial,
+		PacketConnFactory: testLoopbackPacketConn,
+	}
 	strategySettings.ExtenderDirectory = directory
 	clientStrategy := connect.NewClientStrategy(ctx, strategySettings)
 	t.Cleanup(clientStrategy.Close)
@@ -566,6 +574,38 @@ func (self *feedFixture) newNetworkClient(
 	networkClient := connect.NewExtenderNetworkClient(ctx, clientStrategy, directory, settings)
 	t.Cleanup(networkClient.Close)
 	return networkClient
+}
+
+// testLoopbackDial dials loopback and refuses every other destination.
+func testLoopbackDial(ctx context.Context, network string, address string) (net.Conn, error) {
+	addrPort, err := netip.ParseAddrPort(address)
+	if err != nil || !addrPort.Addr().IsLoopback() {
+		return nil, fmt.Errorf("the fixture dials nothing off the machine, refused %s %s", network, address)
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, address)
+}
+
+// testLoopbackPacketConn is the udp endpoint of a quic or dns carrier dial,
+// which sends to loopback only.
+func testLoopbackPacketConn(ctx context.Context) (net.PacketConn, error) {
+	packetConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	return &loopbackPacketConn{PacketConn: packetConn}, nil
+}
+
+// Only the net.PacketConn methods, so quic-go writes through WriteTo rather
+// than the udp socket's own message writes.
+type loopbackPacketConn struct {
+	net.PacketConn
+}
+
+func (self *loopbackPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if udpAddr, ok := addr.(*net.UDPAddr); !ok || !udpAddr.IP.IsLoopback() {
+		return 0, fmt.Errorf("the fixture sends nothing off the machine, refused %s", addr)
+	}
+	return self.PacketConn.WriteTo(b, addr)
 }
 
 // Waits for the directory to reach a state, driven by its change monitor so

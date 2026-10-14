@@ -10,7 +10,9 @@ package connect
 // resolves only its permitted family, and explicit net.Resolver callers keep
 // their configured lookup behavior. The first usable family starts at once;
 // later ready addresses alternate families with one delay between attempts.
-// A definitive failure launches
+// A caller that names a first family (4 or 6) has it attempted first: a ready
+// answer of the other family waits at most one delay for the first family's
+// answer (IPV6.md C7). A definitive failure launches
 // the next address at once; the first success cancels the rest and every
 // losing connection is closed. IP literals need no resolution.
 //
@@ -152,6 +154,8 @@ func resolveDialAddrs(ctx context.Context, resolver *net.Resolver, network strin
 type dohDialQueryResult struct {
 	addrs         []netip.Addr
 	authoritative bool
+	// An AAAA answer, so a race with a first family knows when it is in.
+	ipv6 bool
 }
 
 // resolveDohDialAddrs resolves a hostname through a DohCache for the families
@@ -258,11 +262,14 @@ func dohDialRecordTypes(network string) []string {
 // the existing address race. The first usable answer starts immediately;
 // only subsequent TCP attempts are staggered. A failed first path retains the pending
 // family. The caller's configured cache remains the only resolver authority.
+// A firstIpFamily of 4 or 6 is attempted first when the network permits both
+// families; 0 keeps the first-answer rule.
 func dialDohAddrsRace(
 	ctx context.Context,
 	cache *DohCache,
 	network string,
 	host string,
+	firstIpFamily int,
 	fallbackDelay time.Duration,
 	dial dialAddrFunction,
 ) (net.Conn, error) {
@@ -294,13 +301,19 @@ func dialDohAddrsRace(
 			results <- dohDialQueryResult{
 				addrs:         addrs,
 				authoritative: authoritative,
+				ipv6:          recordType == "AAAA",
 			}
 		}()
 	}
+	if len(recordTypes) != 2 {
+		// A network narrowed to one family has no other family to order.
+		firstIpFamily = 0
+	}
 	return dialAddrsRaceWithResolution(raceCtx, nil, fallbackDelay, dial, &dialAddrResolution{
-		results: results,
-		pending: len(recordTypes),
-		host:    host,
+		results:       results,
+		pending:       len(recordTypes),
+		host:          host,
+		firstIpFamily: firstIpFamily,
 	})
 }
 
@@ -309,6 +322,9 @@ type dialAddrResolution struct {
 	results <-chan dohDialQueryResult
 	pending int
 	host    string
+	// 4 or 6 is attempted first; anything else starts the first usable
+	// answer at once.
+	firstIpFamily int
 }
 
 // dialRaceResult is one attempt's outcome inside dialAddrsRace.
@@ -333,7 +349,8 @@ func dialAddrsRace(
 }
 
 // The same TCP race accepts late DNS-family answers without waiting for an
-// unrelated query. Static callers retain their supplied address order. A
+// unrelated query; only a named first family is waited for, at most one
+// fallback delay. Static callers retain their supplied address order. A
 // progressive caller cancels and joins every launched TCP worker before return.
 func dialAddrsRaceWithResolution(
 	ctx context.Context,
@@ -375,6 +392,15 @@ func dialAddrsRaceWithResolution(
 	errs := make([]error, 0, len(addrs))
 	preferIpv6 := true
 	launchReady := true
+	// A named first family leads. Until its answer is in, a ready answer of
+	// the other family waits at most one fallback delay.
+	firstIpv6 := false
+	firstPending := false
+	if resolution != nil && (resolution.firstIpFamily == 4 || resolution.firstIpFamily == 6) {
+		firstIpv6 = resolution.firstIpFamily == 6
+		preferIpv6 = firstIpv6
+		firstPending = 0 < fallbackDelay
+	}
 
 	var fallbackC <-chan time.Time
 	var fallbackTimer *time.Timer
@@ -425,6 +451,12 @@ func dialAddrsRaceWithResolution(
 
 	for {
 		for launchReady && 0 < len(pendingAddrs) {
+			if launched == 0 && firstPending {
+				if fallbackC == nil {
+					armFallback()
+				}
+				break
+			}
 			launch()
 		}
 		if queryPending == 0 && len(pendingAddrs) == 0 && completed == launched {
@@ -446,9 +478,13 @@ func dialAddrsRaceWithResolution(
 			return nil, ctx.Err()
 		case <-fallbackC:
 			stopFallback()
+			firstPending = false
 			launchReady = true
 		case result := <-queryResults:
 			queryPending--
+			if result.ipv6 == firstIpv6 {
+				firstPending = false
+			}
 			if result.authoritative {
 				authoritativeCount++
 			}

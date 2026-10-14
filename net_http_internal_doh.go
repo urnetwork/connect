@@ -52,9 +52,14 @@ func clientStrategySettingsWithInternalDoh(settings *ClientStrategySettings) (*C
 		cache:   NewDohCache(internalDohSettings(settings.DohSettings)),
 		domains: domains,
 	}
-	copied.ConnectSettings.DialContextSettings = &DialContextSettings{
-		DialContext: resolver.wrapDialContext(baseConnectSettings.DialContext),
+	// the wrapper replaces the stream dial only: an injected packet endpoint
+	// (PacketConnFactory) still opens every udp carrier's socket
+	dialContextSettings := DialContextSettings{}
+	if baseConnectSettings.DialContextSettings != nil {
+		dialContextSettings = *baseConnectSettings.DialContextSettings
 	}
+	dialContextSettings.DialContext = resolver.wrapDialContext(baseConnectSettings.DialContext)
+	copied.ConnectSettings.DialContextSettings = &dialContextSettings
 	return &copied, resolver
 }
 
@@ -193,7 +198,7 @@ func (self *internalDohResolver) wrapDialContext(dialContext DialContextFunction
 			return dialContext(ctx, network, address)
 		}
 		if isRaceableDialNetwork(network) {
-			return dialDohAddrsRace(ctx, self.getCache(), network, host, internalDohDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+			return dialDohAddrsRace(ctx, self.getCache(), network, host, 0, internalDohDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 				return dialContext(ctx, familyDialNetwork(network, addr), net.JoinHostPort(addr.String(), port))
 			})
 		}

@@ -487,8 +487,10 @@ func testBlockActionLoopbackSubnet(ipVersion int) string {
 
 // newBlockActionTestMultiClient is a multi client over an empty generator
 // whose security policy always drops, so every crafted packet reaches the
-// block-action decision.
-func newBlockActionTestMultiClient(ctx context.Context) (*RemoteUserNatMultiClient, *MultiClientSettings) {
+// block-action decision. What it routes locally is dialed in the process
+// (testRefusingLocalDialContextSettings), and the addresses come back on the
+// returned channel.
+func newBlockActionTestMultiClient(ctx context.Context) (*RemoteUserNatMultiClient, *MultiClientSettings, <-chan string) {
 	securityPolicy := &testingFixedSecurityPolicy{
 		stats:  DefaultSecurityPolicyStatsCollector(),
 		result: SecurityPolicyResultDrop,
@@ -499,6 +501,8 @@ func newBlockActionTestMultiClient(ctx context.Context) (*RemoteUserNatMultiClie
 	settings.SecurityPolicyGenerator = func(ctx context.Context, stats *SecurityPolicyStatsCollector) SecurityPolicy {
 		return securityPolicy
 	}
+	localDialContextSettings, localDials := testRefusingLocalDialContextSettings()
+	settings.LocalDialContextSettings = localDialContextSettings
 
 	multiClient := NewRemoteUserNatMultiClient(
 		ctx,
@@ -508,7 +512,34 @@ func newBlockActionTestMultiClient(ctx context.Context) (*RemoteUserNatMultiClie
 		protocol.ProvideMode_Network,
 		settings,
 	)
-	return multiClient, settings
+	return multiClient, settings, localDials
+}
+
+// testRefusingLocalDialContextSettings refuse every dial of a multi client's
+// local nat in the process and record its address, so a packet a test routes
+// locally -- to an un-blocked public address, or SMTP -- is sent nowhere.
+func testRefusingLocalDialContextSettings() (*DialContextSettings, <-chan string) {
+	localDials := make(chan string, 64)
+	return &DialContextSettings{
+		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+			select {
+			case localDials <- address:
+			default:
+			}
+			return nil, fmt.Errorf("the test dials nothing, refused %s %s", network, address)
+		},
+	}, localDials
+}
+
+// newTestRefusingLocalUserNat is a provider's exit nat whose TCP and UDP dials
+// are refused in the process: the exit traffic of the tests that use it goes
+// to documentation addresses, which are never sent to.
+func newTestRefusingLocalUserNat(ctx context.Context, clientTag string) *LocalUserNat {
+	settings := DefaultLocalUserNatSettings()
+	dialContextSettings, _ := testRefusingLocalDialContextSettings()
+	settings.UdpBufferSettings.DialContextSettings = dialContextSettings
+	settings.TcpBufferSettings.DialContextSettings = dialContextSettings
+	return NewLocalUserNat(ctx, clientTag, settings)
 }
 
 func TestMultiClientBlockActionOverrides(t *testing.T) {
@@ -516,7 +547,7 @@ func TestMultiClientBlockActionOverrides(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		multiClient, _ := newBlockActionTestMultiClient(ctx)
+		multiClient, _, _ := newBlockActionTestMultiClient(ctx)
 		defer multiClient.Close()
 
 		source := SourceId(NewId())
@@ -619,7 +650,7 @@ func TestMultiClientBlockActionIgnoreHosts(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		multiClient, settings := newBlockActionTestMultiClient(ctx)
+		multiClient, settings, _ := newBlockActionTestMultiClient(ctx)
 		defer multiClient.Close()
 
 		source := SourceId(NewId())
@@ -713,7 +744,7 @@ func TestMultiClientBlockActionDefaultRemoteDohIgnored(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		multiClient, settings := newBlockActionTestMultiClient(ctx)
+		multiClient, settings, localDials := newBlockActionTestMultiClient(ctx)
 		defer multiClient.Close()
 
 		source := SourceId(NewId())
@@ -759,6 +790,15 @@ func TestMultiClientBlockActionDefaultRemoteDohIgnored(t *testing.T) {
 			AssertEqual(t, true, blockActions[0].BlockOverrideId != nil)
 		case <-time.After(5 * time.Second):
 			t.Fatal("timeout waiting for the control ip block action")
+		}
+
+		// the un-blocked control ip egresses through the local nat, whose
+		// dial stays in the process (MultiClientSettings.LocalDialContextSettings)
+		select {
+		case address := <-localDials:
+			AssertEqual(t, net.JoinHostPort(controlIp, "9"), address)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the un-blocked control ip did not reach the local nat dial")
 		}
 	})
 }
@@ -815,7 +855,7 @@ func TestMultiClientBlockActionServerNames(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		multiClient, _ := newBlockActionTestMultiClient(ctx)
+		multiClient, _, _ := newBlockActionTestMultiClient(ctx)
 		defer multiClient.Close()
 
 		lookup := newTestingLearningServerNameLookup()

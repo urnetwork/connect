@@ -454,7 +454,7 @@ func runProviderPolicyPreferenceTunnel(t *testing.T, providerPolicy func(context
 
 	providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettingsWithBufferSize(32))
 	t.Cleanup(providerClient.Cancel)
-	providerLocalUserNat := NewLocalUserNatWithDefaults(ctx, "test-exit")
+	providerLocalUserNat := newTestRefusingLocalUserNat(ctx, "test-exit")
 	providerSettings := DefaultRemoteUserNatProviderSettings()
 	providerSettings.SecurityPolicyGenerator = providerPolicy
 	provider := NewRemoteUserNatProvider(providerClient, providerLocalUserNat, providerSettings)

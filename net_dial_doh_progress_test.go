@@ -93,7 +93,7 @@ func TestDohDialProgressRetainsPendingFamilyAfterTcpFailure(t *testing.T) {
 				writeDohWire(writer, request, []netip.Addr{secondAddr}, 60, false)
 			})
 			refused := errors.New("synthetic first-family refusal")
-			conn, err := dialDohAddrsRace(ctx, cache, "tcp", "fallback.example", DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+			conn, err := dialDohAddrsRace(ctx, cache, "tcp", "fallback.example", 0, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 				if addr == firstAddr {
 					firstDials.Add(1)
 					close(firstTcp)
@@ -164,7 +164,7 @@ func TestDohDialProgressCachedPairKeepsResolver(t *testing.T) {
 			t.Fatal("failed to populate resolver cache")
 		}
 	}
-	conn, err := dialDohAddrsRace(ctx, cache, "tcp", "cached.example", time.Hour, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+	conn, err := dialDohAddrsRace(ctx, cache, "tcp", "cached.example", 0, time.Hour, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 		dials.Add(1)
 		if addr != ipv4 && addr != ipv6 {
 			return nil, errors.New("cached dial did not use either configured answer")
@@ -210,7 +210,7 @@ func TestDohDialProgressCancellationJoinsPendingOwners(t *testing.T) {
 	})
 	result := make(chan error, 1)
 	go func() {
-		conn, err := dialDohAddrsRace(ctx, cache, "tcp", "cancel.example", time.Hour, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+		conn, err := dialDohAddrsRace(ctx, cache, "tcp", "cancel.example", 0, time.Hour, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 			once.Do(func() { close(tcpEntered) })
 			<-ctx.Done()
 			close(tcpExited)
@@ -272,7 +272,7 @@ func TestDohDialProgressClosesLateSuccessfulLoserBeforeReturn(t *testing.T) {
 	firstEntered := make(chan struct{})
 	loserPeer := make(chan net.Conn, 1)
 	var dials atomic.Int64
-	conn, err := dialDohAddrsRace(ctx, cache, "tcp", "loser.example", DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+	conn, err := dialDohAddrsRace(ctx, cache, "tcp", "loser.example", 0, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 		client, peer := net.Pipe()
 		if dials.Add(1) == 1 {
 			loserPeer <- peer
@@ -331,7 +331,7 @@ func TestDohDialProgressEmptyAnswersPreserveErrorMeaning(t *testing.T) {
 				}
 				writeDohWire(writer, request, nil, 60, false)
 			})
-			conn, err := dialDohAddrsRace(ctx, cache, "tcp", "empty.example", DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+			conn, err := dialDohAddrsRace(ctx, cache, "tcp", "empty.example", 0, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 				dials.Add(1)
 				return nil, errors.New("unexpected TCP attempt with no answer")
 			})
@@ -372,7 +372,7 @@ func TestDohDialProgressAlreadyCanceledDoesNotStartCachedLookup(t *testing.T) {
 	result := make(chan error, 1)
 	cache.stateLock.Lock()
 	go func() {
-		conn, err := dialDohAddrsRace(ctx, cache, "tcp", "canceled.example", DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+		conn, err := dialDohAddrsRace(ctx, cache, "tcp", "canceled.example", 0, DefaultDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 			dials.Add(1)
 			return nil, errors.New("already-canceled caller started TCP")
 		})
@@ -413,7 +413,7 @@ func TestDohDialProgressHonorsExplicitFamily(t *testing.T) {
 				}
 				writeDohWire(writer, request, []netip.Addr{netip.MustParseAddr("192.0.2.87"), netip.MustParseAddr("2001:db8::87")}, 60, false)
 			})
-			conn, err := dialDohAddrsRace(ctx, cache, network, "family.example", time.Hour, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+			conn, err := dialDohAddrsRace(ctx, cache, network, "family.example", 0, time.Hour, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 				dials.Add(1)
 				if (network == "tcp4") != addr.Is4() {
 					return nil, errors.New("dial crossed caller's explicit family")

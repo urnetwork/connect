@@ -60,7 +60,7 @@ func TestTunDialObservationHeldDnsDoesNotReportTargetTcp(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = dialDohAddrsRace(ctx, cache, "tcp4", "held-observation.example", time.Hour,
+		_, _ = dialDohAddrsRace(ctx, cache, "tcp4", "held-observation.example", 0, time.Hour,
 			func(context.Context, netip.Addr) (net.Conn, error) {
 				t.Error("target dial started before its DNS answer")
 				return nil, context.Canceled
@@ -91,7 +91,7 @@ func TestTunDialObservationAnswerThenHeldTcp(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = dialDohAddrsRace(ctx, cache, "tcp4", "tcp-observation.example", time.Hour,
+		_, _ = dialDohAddrsRace(ctx, cache, "tcp4", "tcp-observation.example", 0, time.Hour,
 			func(ctx context.Context, _ netip.Addr) (net.Conn, error) {
 				if tunDialObserver(ctx) != nil {
 					t.Error("target observer escaped into a nested transport context")
