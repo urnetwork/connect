@@ -237,6 +237,11 @@ func TestLanePositionM4ProfileHoldsAndPausesWriteTheHeadOnce(t *testing.T) {
 	sendFlightGateMessage(t, client, peerId, 8)
 	takeFlightGatePack(t, reliable, 5*time.Second)
 	takeFlightGatePack(t, reliable, 10*time.Second)
+	// the sender counts a recovery when its route write returns, so the
+	// rewritten head can be taken before it is counted
+	waitForCondition(5*time.Second, func() bool {
+		return client.SendRecoveryStats().TimeoutResendWriteCount != 0
+	})
 	afterFirst := client.SendRecoveryStats()
 	if afterFirst.TimeoutResendWriteCount != 1 {
 		t.Fatalf("a pause on the lane wrote %d retransmits, want exactly one: %+v",
