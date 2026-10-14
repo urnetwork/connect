@@ -51,24 +51,30 @@ type testExtenderScaleSettings struct {
 // Under -race every instruction costs several times what it does otherwise,
 // so the feed takes a quarter of the records, as many of them on the hinted
 // continent, and its cost per record is extrapolated to the million, the way
-// this package's other throughput tests scale under -race.
+// this package's other throughput tests scale under -race. The budgets scale
+// by the same cost: -race measured 5-10x the feed's cost per record and 4-5x
+// a selection's cpu, so both budgets are ten times theirs without it.
 func defaultTestExtenderScaleSettings() *testExtenderScaleSettings {
 	recordCount := 1000 * 1000
 	nearEvery := 1000
+	feedTimeout := 30 * time.Second
+	maxSelectDuration := time.Millisecond
 	if raceEnabled {
 		recordCount /= 4
 		nearEvery /= 4
+		feedTimeout *= 10
+		maxSelectDuration *= 10
 	}
 	return &testExtenderScaleSettings{
 		RecordCount:          recordCount,
 		NearEvery:            nearEvery,
 		TargetRecordCount:    1000 * 1000,
-		FeedTimeout:          30 * time.Second,
+		FeedTimeout:          feedTimeout,
 		MaxRetainedByteCount: 16 * 1024 * 1024,
 		PeerCount:            100 * 1000,
 		PeerNearEvery:        5000,
 		RefreshCount:         200,
-		MaxSelectDuration:    time.Millisecond,
+		MaxSelectDuration:    maxSelectDuration,
 	}
 }
 
@@ -136,7 +142,8 @@ func testHeapByteCount() int64 {
 // feed completes within its budget, the directory holds a bounded heap
 // whatever it was fed, and the records on the hinted continent are kept ahead
 // of every other, the last 512 of them fed being exactly what remains. Under
-// -race the feed is a quarter of that, judged by its extrapolation.
+// -race the feed is a quarter of that, its extrapolation judged against a
+// budget ten times larger.
 func TestExtenderDirectoryScaleAMillionGossipRecords(t *testing.T) {
 	scaleSettings := defaultTestExtenderScaleSettings()
 	directory, now := newTestScaleDirectory(t, nil)
@@ -207,7 +214,8 @@ func TestExtenderDirectoryScaleAMillionGossipRecords(t *testing.T) {
 // A pinger over a hundred thousand known peers pings exactly 64 per refresh,
 // the hinted continent's first, with the random slice drawn again on each
 // refresh; and the selection of one refresh's sample reads so little of the
-// directory that it takes under a millisecond, averaged over many refreshes.
+// directory that it takes under a millisecond of cpu (ten under -race),
+// averaged over many refreshes.
 func TestExtenderPeerPingerScaleAHundredThousandPeers(t *testing.T) {
 	if extenderScaleInFreshProcess(t) {
 		return
