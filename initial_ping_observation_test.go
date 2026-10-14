@@ -67,6 +67,16 @@ func TestInitialPingObservationCausalDependencies(t *testing.T) {
 							fixture.window.beforeExpandPingResultForTest = nil
 							fixture.window.afterExpandPingResultForTest = nil
 						}
+						// Both pings remain enabled and share one send sequence. Pin
+						// their order: the channel's periodic ping starts once the
+						// initial Pack is in flight, so a contract failure reaches the
+						// initial ping first. Queued first, the periodic ping takes that
+						// failure, cancels its channel and tears down the client while
+						// the terminal snapshot runs, which then reads unknown.
+						startPeriodic := make(chan func(), 1)
+						fixture.window.settings.startChannelPingForTest = func(start func()) {
+							startPeriodic <- start
+						}
 						generator := fixture.window.generator.(*multiClientExpandLifecycleGenerator).TestMultiClientGenerator
 						candidate := <-fixture.window.clientChannelArgs
 						fixture.window.clientChannelArgs <- candidate
@@ -136,6 +146,8 @@ func TestInitialPingObservationCausalDependencies(t *testing.T) {
 						if got := wireFrames.Load(); (got > 0) != (test.carrier && test.grant) {
 							t.Fatalf("carrier/authorization control failed: frames=%d", got)
 						}
+						(<-startPeriodic)()
+						synctest.Wait()
 						time.Sleep(test.elapsed)
 						if test.cancel {
 							if test.name == "canceled_window" {
