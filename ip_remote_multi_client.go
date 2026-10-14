@@ -2625,7 +2625,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.clientReceivePacket,
 		multiClient.clientReceivePackets,
 		provideMode == protocol.ProvideMode_Network,
-		multiClient.clientDialFailure,
+		multiClient.clientDialFailureSignal,
 		multiClient.securityPolicy,
 		multiClient.removeClient,
 		WindowTypeQuality,
@@ -2649,7 +2649,7 @@ func NewRemoteUserNatMultiClient(
 			multiClient.clientReceivePacket,
 			multiClient.clientReceivePackets,
 			provideMode == protocol.ProvideMode_Network,
-			multiClient.clientDialFailure,
+			multiClient.clientDialFailureSignal,
 			multiClient.securityPolicy,
 			multiClient.removeClient,
 			WindowTypeSpeed,
@@ -5191,6 +5191,16 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 				delete(self.demotionStates, key)
 			}
 		}
+		// likewise above the early return: drop the exit from every flow's
+		// record of the exits that failed it, whatever the flow is bound to,
+		// so a long-lived flow (a udp stream may never idle) does not keep
+		// the removed channel reachable
+		for _, update := range self.ip4PathUpdates {
+			update.forgetDialFailedClient(client)
+		}
+		for _, update := range self.ip6PathUpdates {
+			update.forgetDialFailedClient(client)
+		}
 
 		updates, ok := self.clientUpdates[client]
 		if !ok {
@@ -7094,6 +7104,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 		defer update.releaseCollapseClaims()
 		sentUpdate = update
 		enterTime := time.Now()
+		for packetIndex := range sendPacketGroup.packets {
+			update.noteConnectAttempt(sendPacketGroup.packets[packetIndex].ipPath)
+		}
 
 		// Client-side dial-failure inference. A connection attempt
 		// retransmitting on an exit that has answered nothing is the silent
@@ -7125,7 +7138,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			// unbound, this very retransmit races a fresh exit instead of
 			// following the old one into the same silence for another backoff
 			// round.
-			if self.clientDialFailure(currentClient, ipPath) {
+			if self.clientDialFailure(currentClient, ipPath, false) {
 				currentClient = nil
 			}
 		}
@@ -7279,6 +7292,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					}
 					if update.race == nil {
 						update.initRaceWithLock()
+						// the race commits on the send: a signal that beats
+						// the commit undoes it (withdrawRaceCandidateWithLock)
+						update.race.single = true
 					}
 					race = update.race
 					state := race.clientStates[client]
@@ -8655,11 +8671,24 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	}
 }
 
-// clientDialFailure handles a provider dial-failure signal intercepted on
-// sourceClient's channel: an icmp destination-unreachable whose embed named the
-// egress flow egressIpPath. The provider could not open the upstream for that
-// flow and answered instead of going silent, so the source is not left in
-// syn-retransmit backoff.
+// clientDialFailureSignal is the channel intercept's callback: a provider's
+// dial-failure signal for egressIpPath arrived on sourceClient's channel. See
+// clientDialFailure.
+func (self *RemoteUserNatMultiClient) clientDialFailureSignal(sourceClient *multiClientChannel, egressIpPath *IpPath) (reraced bool) {
+	return self.clientDialFailure(sourceClient, egressIpPath, true)
+}
+
+// clientDialFailure handles a failed connect of the egress flow egressIpPath
+// on sourceClient's exit. signaled is true when the provider's dial-failure
+// signal arrived on the channel (clientDialFailureSignal): an icmp
+// destination-unreachable whose embed named the flow, accepted by the channel
+// only as the exact packet a provider builds for that flow
+// (providerDialFailureEgressPath). The provider could not open the upstream
+// for that flow and answered at once instead of going silent, so the source is
+// not left in syn-retransmit backoff. Only providers whose return path passes
+// their own signal send it (IPV6.md C7), and current ones only for a dial that
+// failed at once. signaled is false for the send-path silence inference, where
+// nothing arrived: a flow retransmitting on an exit that has answered nothing.
 //
 // It acts only on a flow that is (a) still known, (b) still pinned to the very
 // client that reported the failure, and (c) has never received inbound data --
@@ -8667,16 +8696,24 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 // late or stale signal happens to name. When those hold and DialFailureRerace
 // is on, it unbinds the flow (the removeClient per-update idiom, minus teardown
 // and minus cancelling the update) so the application's own retransmit re-races
-// it onto another exit within ~1s. With the knob off it rebuilds the icmp and
-// forwards it to the app (removeClient's teardown convention) for a
-// visible-but-fast failure. Every intercepted signal, matched or not, is
-// counted; an unmatched one is dropped.
+// it onto another exit within ~1s. A signal can also land while the flow is
+// still racing, before a race commits it (the send has not even returned when
+// a provider fails the dial at once): with the re-race on, the exit is then
+// taken out of the race, with its strike and its service failure, so the
+// commit cannot bind the flow to the exit that failed it. The one candidate
+// of a race of one taken out this way counts as a re-race, as it would had
+// the commit come first; one candidate of several does not. With the knob off it rebuilds the icmp with
+// the flow's SYN sequence and forwards it to the app (removeClient's teardown
+// convention) for a visible-but-fast failure. Each exit strikes a flow once:
+// a failure the same exit already reported for the flow re-races or forwards
+// as before, but adds no strike and is not counted as a re-race again. Every
+// signal, matched or not, is counted; an unmatched one is dropped.
 // It reports whether the flow was actually unbound, so a caller holding its
 // own client snapshot knows whether to discard it. The guards here can decline
 // after a caller's own check passed -- a syn-ack can land in between -- and
 // treating a still-bound flow as unbound leaves that caller racing against a
 // commitment that never clears.
-func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClientChannel, egressIpPath *IpPath) (reraced bool) {
+func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClientChannel, egressIpPath *IpPath, signaled bool) (reraced bool) {
 	// The probe intercept comes first, ahead of every effect below including
 	// the counters and the uplink stamp. A dial failure naming a probe flow is
 	// the probe's answer -- "no" -- and a probe's failure must feed nothing:
@@ -8688,20 +8725,34 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 		return false
 	}
 
-	// counted for every intercepted signal, matched or not: the gap between
-	// this and flowsReraced is failures that named no live flow.
-	self.reliabilityMetrics.dialFailureIntercepted()
+	// Only a signal that arrived counts and stamps. The silence inference
+	// fires on the send path because nothing came back, so it is neither an
+	// intercepted signal nor evidence of ingress.
+	if signaled {
+		// counted for every intercepted signal, matched or not: the gap between
+		// this and flowsReraced is signals that named no live flow, and
+		// repeats of an exit's failure of a flow.
+		self.reliabilityMetrics.dialFailureIntercepted()
 
-	// an intercepted icmp is deliberately not a receive-ack -- it must not
-	// make a provider look like it is delivering data -- but it did arrive,
-	// which is proof the local uplink delivers. without this stamp a burst of
-	// dial failures during real provider trouble could read as uplink
-	// staleness and hold the very verdicts that should fire.
-	self.stampUplinkIngress()
+		// an intercepted icmp is deliberately not a receive-ack -- it must not
+		// make a provider look like it is delivering data -- but it did arrive,
+		// which is proof the local uplink delivers. without this stamp a burst
+		// of dial failures during real provider trouble could read as uplink
+		// staleness and hold the very verdicts that should fire. the inference
+		// must not stamp: while apps retransmit into a dead local uplink, a
+		// stamp would hold the gate open through the outage it exists for.
+		self.stampUplinkIngress()
+	}
 
 	rerace := self.reliabilitySettings().DialFailureRerace
 
-	matched := false
+	standing := dialFailureStale
+	// firstFromExit is whether this is the exit's first failure of the flow
+	firstFromExit := false
+	// the sequence of the flow's SYN, which the icmp forwarded with the knob
+	// off must embed
+	var synSequence uint32
+	synSeen := false
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -8716,16 +8767,24 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 			return
 		}
 
-		// act only on the flow this very client owns that has not yet received
-		// inbound data. a nil update (gone), a different client (already
-		// re-raced onto another exit), or an established flow (receivedInbound)
-		// all mean this signal is stale and must not disturb a working flow.
-		if update == nil || update.client.Load() != sourceClient || update.receivedInbound.Load() {
+		// act only on a flow that has not yet received inbound data, for the
+		// exit it is bound to or, with the re-race on, an exit still racing
+		// for it (dialFailureStanding). a nil update (gone), another exit's
+		// flow (already re-raced onto it), or an established flow
+		// (receivedInbound) all mean this signal is stale and must not
+		// disturb a working flow.
+		if update == nil || update.receivedInbound.Load() {
 			return
 		}
-
-		matched = true
+		standing, firstFromExit = update.dialFailureStanding(sourceClient, rerace)
+		if standing == dialFailureStale {
+			return
+		}
 		self.recordDestinationServiceFailureWithLock(sourceClient, egressIpPath)
+		if standing != dialFailureBound {
+			// taken out of the race: nothing was bound, so nothing to unbind
+			return
+		}
 
 		if rerace {
 			// unbind exactly like removeClient does per-update, minus teardown
@@ -8740,30 +8799,47 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 				}
 			}
 			update.client.Store(nil)
+		} else {
+			// the per-flow leaf lock under the parent lock, as removeClient
+			// takes it for sourceRstSequence
+			synSequence, synSeen = update.synSequence()
 		}
 	}()
 
-	if !matched {
+	if standing == dialFailureStale {
 		// no live flow for this signal: dropped here, already counted above.
 		return false
 	}
 
-	// strike accounting is per-channel and takes the channel's own stateLock;
-	// recorded outside the parent stateLock so the two never nest. The
-	// destination ip rides along so dialStarved can require strikes to span
-	// distinct destinations -- one polled-dead site retransmitting into this
-	// path must not starve-warn the exit by itself. net.IP.String() on a nil
-	// ip yields a stable "<nil>" key, so a pathological signal still records
-	// safely rather than panicking.
-	sourceClient.addDialFailure(egressIpPath.DestinationIp.String(), egressIpPath.Version)
-	// B5: v6 strikes with healthy v4 downgrade the exit to v4-only; the
-	// window republishes the category and fills the v6 shortfall it opened
-	if egressIpPath.Version == 6 && sourceClient.maybeDowngradeIpv6() {
-		self.noteIpFamilyDowngrade(sourceClient)
+	if firstFromExit {
+		// strike accounting is per-channel and takes the channel's own
+		// stateLock; recorded outside the parent stateLock so the two never
+		// nest. The destination ip rides along so dialStarved can require
+		// strikes to span distinct destinations -- one polled-dead site
+		// retransmitting into this path must not starve-warn the exit by
+		// itself. net.IP.String() on a nil ip yields a stable "<nil>" key, so a
+		// pathological signal still records safely rather than panicking.
+		sourceClient.addDialFailure(egressIpPath.DestinationIp.String(), egressIpPath.Version)
+		// B5: v6 strikes with healthy v4 downgrade the exit to v4-only; the
+		// window republishes the category and fills the v6 shortfall it opened
+		if egressIpPath.Version == 6 && sourceClient.maybeDowngradeIpv6() {
+			self.noteIpFamilyDowngrade(sourceClient)
+		}
 	}
 
+	if standing == dialFailureWithdrawn {
+		// the race goes on without the exit, or, left empty, ends so the
+		// flow's next packet races afresh. one candidate of several was never
+		// the flow's exit, so this is no counted re-race
+		return false
+	}
+
+	// bound, or the one candidate of a race withdrawn before its commit: the
+	// flow leaves the exit that failed it either way
 	if rerace {
-		self.reliabilityMetrics.flowReraced()
+		if firstFromExit {
+			self.reliabilityMetrics.flowReraced()
+		}
 		self.logSmtpProviderOutcome(egressIpPath, sourceClient, "reraced")
 		// swallowed: the icmp is never forwarded. the app's retransmit drives
 		// recovery. this is the whole point -- ~1s instead of 3-63s.
@@ -8771,10 +8847,17 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 	}
 
 	// rerace disabled: hand the icmp to the app so it fails fast instead of
-	// hanging. rebuilt from the egress path with the same builder the provider
-	// used, and delivered with the egress ipPath -- exactly the convention
-	// removeClient uses for its teardown packets.
-	if packet, ok := ipOosUnreachable(egressIpPath); ok {
+	// hanging. rebuilt with the same builder the provider used, but over the
+	// flow's own SYN sequence: the provider's flow path carries none, so its
+	// signal embeds 0, and a kernel stack (linux tcp_v4_err / tcp_v6_err)
+	// drops an error whose embedded sequence is outside its send window.
+	// Delivered with the egress ipPath -- exactly the convention removeClient
+	// uses for its teardown packets.
+	forwardPath := *egressIpPath
+	if synSeen {
+		forwardPath.SequenceNumber = synSequence
+	}
+	if packet, ok := ipOosUnreachable(&forwardPath); ok {
 		self.deliverReceivePacket(TransferPath{}, protocol.ProvideMode_Network, egressIpPath, packet)
 	}
 	return false
@@ -9381,6 +9464,17 @@ type multiClientChannelUpdate struct {
 	// stateLock alongside the clock it qualifies.
 	synWaitSendCount int
 
+	// dialFailedClients are the exits that have failed this flow's current
+	// connect attempt, by signal or by inference. Each strikes the flow once
+	// (clientDialFailure). The app's SYN with a new sequence starts the
+	// record afresh (noteConnectAttempt; dialFailedSyn is that attempt's
+	// sequence), and removeClient drops a removed exit from it, so it holds
+	// at most one entry per live exit. The pointers are only compared,
+	// never dereferenced. All guarded by stateLock.
+	dialFailedClients []*multiClientChannel
+	dialFailedSyn     uint32
+	dialFailedSynSeen bool
+
 	// stateLock guards the per-flow mutable state below: the active race and the
 	// tcp collapse-prevention sequence counters. it is a leaf — its holders
 	// never take the parent `RemoteUserNatMultiClient.stateLock` — so
@@ -9930,6 +10024,114 @@ func (self *multiClientChannelUpdate) releaseSequenceHold(maxHold time.Duration)
 	return true
 }
 
+// dialFailureStanding is what a failed connect means for one flow.
+type dialFailureStanding int
+
+const (
+	// the signal names a flow the exit neither carries nor races for
+	dialFailureStale dialFailureStanding = iota
+	// the flow is bound to the exit that failed it
+	dialFailureBound
+	// the exit was a candidate of the flow's race and is taken out of it;
+	// the race goes on without it, or, left empty, ends
+	dialFailureWithdrawn
+	// the exit was the one candidate of a race that commits on its send, and
+	// is taken out of it before the commit: the flow races afresh on its
+	// next packet, as when a bound flow is unbound
+	dialFailureWithdrawnBeforeCommit
+)
+
+// dialFailureStanding settles, under the flow's leaf lock, what a failed
+// connect reported by client means for the flow: the exit it is bound to, a
+// candidate of its race that withdraw takes out of the race, or neither. For
+// the first two it records client among the exits that failed the flow and
+// reports whether this was client's first failure of it.
+func (self *multiClientChannelUpdate) dialFailureStanding(client *multiClientChannel, withdraw bool) (standing dialFailureStanding, first bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	bound := self.client.Load()
+	switch {
+	case bound != nil && bound == client:
+		standing = dialFailureBound
+	case bound == nil && withdraw:
+		standing = self.withdrawRaceCandidateWithLock(client)
+		if standing == dialFailureStale {
+			return dialFailureStale, false
+		}
+	default:
+		return dialFailureStale, false
+	}
+	if !slices.Contains(self.dialFailedClients, client) {
+		self.dialFailedClients = append(self.dialFailedClients, client)
+		first = true
+	}
+	return standing, first
+}
+
+// withdrawRaceCandidateWithLock takes client out of the flow's race when it
+// is a candidate that has answered nothing, and ends a race it leaves empty,
+// so the flow's next packet starts a fresh one. It reports
+// dialFailureWithdrawnBeforeCommit for the candidate of a race of one,
+// dialFailureWithdrawn for one of several, and dialFailureStale when client
+// is no candidate. Must be called with stateLock.
+func (self *multiClientChannelUpdate) withdrawRaceCandidateWithLock(client *multiClientChannel) dialFailureStanding {
+	race := self.race
+	if race == nil {
+		return dialFailureStale
+	}
+	state, ok := race.clientStates[client]
+	if !ok || 0 < len(state.packets) {
+		return dialFailureStale
+	}
+	delete(race.clientStates, client)
+	if 0 < len(race.clientStates) {
+		return dialFailureWithdrawn
+	}
+	self.clearRaceWithLock()
+	if race.single {
+		return dialFailureWithdrawnBeforeCommit
+	}
+	return dialFailureWithdrawn
+}
+
+// noteConnectAttempt starts the record of the exits that failed the flow
+// afresh when ipPath is the app's SYN with a new sequence: a new connect
+// attempt on the same 5-tuple, which the exits that failed the last one may
+// serve, and strike, again. A retransmit, with the attempt's own sequence,
+// keeps the record. It runs before the SYN is sent, so the record belongs to
+// the attempt by the time an exit can answer it.
+func (self *multiClientChannelUpdate) noteConnectAttempt(ipPath *IpPath) {
+	if ipPath.Protocol != IpProtocolTcp || !ipPath.Syn || ipPath.Ack {
+		return
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.dialFailedSynSeen && self.dialFailedSyn == ipPath.SequenceNumber {
+		return
+	}
+	self.dialFailedSynSeen, self.dialFailedSyn = true, ipPath.SequenceNumber
+	self.dialFailedClients = nil
+}
+
+// forgetDialFailedClient drops a removed exit from the exits that failed the
+// flow, so the record does not keep the channel reachable.
+func (self *multiClientChannelUpdate) forgetDialFailedClient(client *multiClientChannel) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.dialFailedClients = slices.DeleteFunc(self.dialFailedClients, func(failed *multiClientChannel) bool {
+		return failed == client
+	})
+}
+
+// synSequence is the sequence number of the flow's current SYN, which a
+// kernel stack checks an icmp error's embed against, and whether a SYN was
+// seen at all.
+func (self *multiClientChannelUpdate) synSequence() (uint32, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.synGenerationNumber, self.synGenerationSeen
+}
+
 // sourceRstSequence is the sequence a reset toward the source must carry to be
 // accepted: the sequence the source expects next from the destination, which is
 // the ack number it has been sending. See `ipOosRstSequence`.
@@ -10105,9 +10307,12 @@ func (self *multiClientChannelUpdate) Close() {
 }
 
 type multiClientChannelUpdateRace struct {
-	ctx                    context.Context
-	cancel                 context.CancelFunc
-	clientStates           map[*multiClientChannel]*multiClientChannelRaceClientState
+	ctx          context.Context
+	cancel       context.CancelFunc
+	clientStates map[*multiClientChannel]*multiClientChannelRaceClientState
+	// single marks a race of one candidate, which commits as soon as its send
+	// is admitted rather than on a winner decision
+	single                 bool
 	sentPacketCount        int
 	packetCount            int
 	clientsWithPacketCount int
@@ -18239,11 +18444,15 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 							packet,
 						)
 					}
-				} else if egressIpPath, ok := ipParseIcmpUnreachable(packet); ok {
+				} else if egressIpPath, ok := providerDialFailureEgressPath(packet); ok {
 					// a provider dial-failure signal: an icmp
 					// destination-unreachable that ParseIpPath rejects ("No
 					// support for protocol 1"), carrying the failed flow's
 					// egress key in its embed. Hand it to the parent to re-race.
+					// Only the exact packet a provider builds for the flow it
+					// names is the signal: its code for the flow's protocol,
+					// outer addresses from the flow's destination back to its
+					// source, one family. Any other icmp is dropped here.
 					//
 					// Deliberately NOT counted as received data: the
 					// addReceiveAck / addReceiveSyn above are in the err == nil

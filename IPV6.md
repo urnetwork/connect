@@ -127,6 +127,18 @@ Regenerate certs and nginx via warpctl. `sdk.NetworkSpace` gains
 service label so `g2-connect` becomes `g2-connect-v4`; explicit override URLs
 and IP literals return no family URL and disable pinned transports.
 
+A10. Verification attribution per family (2026-10-13). A provider's pinned
+transports each feed their observed address to the server's verify egress
+index. While that index allowed one live egress per provider, a provider with
+both pinned transports connected was neither eligible for validator trails
+nor resolvable from either address. The index (server verify egress index
+v4, sn VALIDATOR.md §8.1, §8.2) now holds one live egress per family per
+provider: an IPv4 address, or an IPv6 /64. It indexes exact addresses in both
+families, and each IPv6 address also under its /64. A source resolves by its
+exact address first; an IPv6 source falls back to its /64 only when no client
+holds the address and exactly one client holds the /64. That change is a
+prerequisite for enabling pinned transports (A2 to A4).
+
 ### B. Discovery and routing
 
 B1. No new windows. Each window tracks the category of every exit
@@ -232,6 +244,101 @@ family-agnostic H3 path. In server, one shared dialer helper with the same
 semantics replaces the bare `net.Dialer` in `DefaultHttpClient`, redis, the
 exchange connection and the bare `http.Client` sites; `server/proxy` inherits
 the tun fix.
+
+C7. Validator hops alternate the first family (2026-10-13). The shared race
+starts the first DNS answer at once and prefers IPv6 only between answers
+that are ready together, so the validator's provider traffic landed on
+whichever family answered first, and on IPv4 wherever the provider has no
+IPv6. The validator gives IPv4 and IPv6 equal attempts instead. A hop is one
+position of a trail, its SEED or one of its EXTEND `/verify` posts, and each
+attempt goes over its own tun (sn `validator/transport.go`). The trail
+engine alternates the family each hop's tun tries first along a trail, and
+starts each trail on the family the trail before it did not, the first trail
+on IPv4 (sn `validator/trail.go` `hopFirstIpFamily`,
+`TunSettings.DialFirstIpFamily`). Over any two consecutive trails every
+depth tries each family first once, whatever the trail's depth. A retry
+keeps its hop's family, except after the server's retryable answer: until
+pinned per-family transports (A2 to A4), a dual-stack provider's one
+transport has only the family it landed on indexed, a hop that lands on the
+other family resolves to no provider, and the server answers it HTTP 421
+`source-egress-unresolved`, at most twice per step. A source that resolves
+to another provider than the pending one, a co-located provider's address
+behind one NAT or in one /64, gets the same capped answer before the step
+fails as a mismatch. A SEED gets it only under a registered validator key;
+any other SEED is poisoned whatever its source resolves to. The step then
+resends the identical body through the same hop pinned to the other family,
+never returning to one a 421 ruled out, within its deadline (sn VALIDATOR.md
+§8.2). The validator times the resend alone, and with the server setting
+`hop_latency_from_attributed_attempt` on the server does too: it records the
+step's last 421 as the confirmed hop's `assigned_ms`, never past its
+`confirmed_ms`, which sn's receipt census accepts while still counting the
+assignment at its own time. Alternating per request, as first built, tied
+the family to the depth: at an even depth every SEED was IPv4-first, and at
+a depth of 8 the recorded hops split 4:3. The first family's address starts
+first; a ready answer of the other family waits at most
+`DefaultDialFallbackDelay` for the first family's answer. The other family
+starts one fallback delay after the first, or at once when the first fails
+or has no address, all inside the dial's existing deadlines. A narrowed
+network, an IPv4-only tun and an IP literal keep their family. Every other
+tun keeps C6 unchanged (`DialFirstIpFamily` 0). The provider's egress is
+untouched: it dials the literal the validator chose.
+
+A provider whose TCP dial fails at once (no route, unreachable, out of
+sockets, its own upstream refusing) answers the SYN with an ICMP
+destination-unreachable (`ipOosUnreachable`), so a family the provider lacks
+fails at once instead of costing the fallback delay. A dial that times out
+gets nothing, and so does one that fails any other way only after
+`dialFailureSignalHorizon`, the multi client's 3 s silence-inference horizon
+(`classifyDialFailure`). A timed-out dial fails at the dialer's 15 s
+timeout, after the source's own retransmits, the multi client's silence
+inference and any happy-eyeballs fallback have acted, so its signal could
+speed nothing up. It would only strike the exit for a flow no one waits on,
+and three such strikes for a blackholed AAAA make a healthy dual-stack exit
+v4-only (B5). The provider's return path cannot parse an ICMP error, so it
+passes exactly the signal it builds for the flow that failed, inspected as
+that flow's return, and drops every other ICMP as before
+(`providerDialFailureReturnPath`). Providers from 63dd3d4e (first released
+in v2026.8.15) until that fix drop their own signal: through them a dead
+family still costs the fallback delay. Releases v2026.8.5 and v2026.8.6,
+from before that inspection, send it, built by byte-identical code, so both
+clients accept their signals; they also signal dials that timed out, which
+strike the exit until those providers upgrade. Both clients accept a
+dial-failure signal only as the exact packet a provider builds for the flow
+its embed names, rebuilt and compared byte for byte
+(`providerDialFailureEgressPath`): the code for the flow's protocol, outer
+addresses from the flow's destination back to its source, one family, and
+its lengths and checksums. The single-destination client that carries the
+hops (`RemoteUserNatClient`) delivers a TCP signal to the local stack only
+from the provider the SYN went to and only for an outstanding SYN of the
+client by 5-tuple (providers embed sequence zero). A reply on the flow,
+admission or the SYN's 30 s lifetime ends that eligibility, and at most 256
+SYNs are tracked. Unrelated, spoofed, malformed or late ICMP and every other
+ICMP type stay dropped (`ip_remote_user_nat_dial_failure.go`). The multi
+client's existing intercept re-races the failed flow (`clientDialFailure`);
+through older providers it keeps relying on its SYN silence inference. An
+exit strikes a flow's connect attempt once, however often it fails it: a udp
+flow fails on every datagram, and a flow re-raced back onto an exit that
+already failed it fails there again on each retransmit. The repeats still
+re-race, but neither strike nor count as re-races; the app's SYN with a new
+sequence starts a new attempt, and a removed exit leaves every flow's
+record. A signal that lands while the flow still races, before the race
+commits it, takes the exit out of the race, with its strike, so a race of
+one cannot commit the flow to the exit that failed it. Only a signal that
+arrived counts as `DialFailuresIntercepted` and stamps the uplink as
+delivering; the silence inference does neither, since nothing arrived. With
+`DialFailureRerace` off the multi client forwards the signal rebuilt over
+the flow's SYN sequence: the provider's signal embeds sequence zero, and a
+kernel drops an ICMP error whose embedded sequence is outside its send
+window. Rollout order: the server's API and taskworker first (they read both
+verify egress index versions), then its connect service (which writes the
+per-family index, A10), then validators, which handle the retryable answer,
+so an alternating validator's IPv6 hop through a dual-stack provider is
+attributed when it arrives. `hop_latency_from_attributed_attempt` goes on
+only after every validator, third-party ones included, runs the receipt
+check that accepts the moved `assigned_ms`. Rollback: that setting off
+first, then the connect service, so the writers return to the old index
+while the readers still read it, then the API and taskworker. Providers and
+clients gain the dial-failure signal as they upgrade, in any order.
 
 ### D. SDK, apps, tests
 

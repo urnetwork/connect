@@ -92,7 +92,7 @@ func TestDialFailureRecordsDestinationServiceForNextSmtpFlow(t *testing.T) {
 	parent, failedExit, _, _ := dialFailureTestParent(t, true, egress)
 	healthyExit := &multiClientChannel{ctx: context.Background(), settings: parent.settings}
 
-	parent.clientDialFailure(failedExit, egress)
+	parent.clientDialFailureSignal(failedExit, egress)
 	got := parent.filterDestinationServiceFailures(
 		[]*multiClientChannel{failedExit, healthyExit},
 		egress,

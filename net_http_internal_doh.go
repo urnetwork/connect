@@ -198,7 +198,7 @@ func (self *internalDohResolver) wrapDialContext(dialContext DialContextFunction
 			return dialContext(ctx, network, address)
 		}
 		if isRaceableDialNetwork(network) {
-			return dialDohAddrsRace(ctx, self.getCache(), network, host, internalDohDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
+			return dialDohAddrsRace(ctx, self.getCache(), network, host, 0, internalDohDialFallbackDelay, func(ctx context.Context, addr netip.Addr) (net.Conn, error) {
 				return dialContext(ctx, familyDialNetwork(network, addr), net.JoinHostPort(addr.String(), port))
 			})
 		}

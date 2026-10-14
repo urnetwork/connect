@@ -300,7 +300,7 @@ func TestTcpCollapseLifetimeSynRecovery(t *testing.T) {
 							// Model the legal interleaving where the real return lands
 							// after eligibility but before guarded unbind. It must not
 							// authorize a race or a duplicate old-owner admission.
-							if scenario == "stale-inference" && parent.clientDialFailure(original, path) {
+							if scenario == "stale-inference" && parent.clientDialFailure(original, path, false) {
 								t.Fatal("stale inferred failure unbound a now-established flow")
 							}
 						}
