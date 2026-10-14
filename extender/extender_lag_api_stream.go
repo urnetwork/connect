@@ -9,10 +9,12 @@ package extender
 // written from one 64 KiB buffer until the window or a cap runs out (M5). An
 // upload stream is a websocket of binary messages carrying AES-128-CTR
 // keystream under the session's upload key, which the extender regenerates and
-// compares message by message -- or, on hardware without AES instructions, on
-// a random 1 in 16 messages chosen after each arrives (M6). Each stream holds
-// one 64 KiB data buffer and one 64 KiB keystream buffer; nothing grows with
-// the stream, and nothing is written to disk (M7).
+// compares read by read as the bytes arrive -- or, on hardware without AES
+// instructions, on a random 1 in 16 messages chosen after each arrives (M6).
+// Each read of an upload counts as it arrives, spread over the time since the
+// stream's previous read (amendment 14). Each stream holds one 64 KiB data
+// buffer and one 64 KiB keystream buffer; nothing grows with the stream, and
+// nothing is written to disk (M7).
 
 import (
 	"bytes"
@@ -22,6 +24,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"io"
+	"math"
 	mathrand "math/rand/v2"
 	"net/http"
 	"runtime"
@@ -41,9 +44,10 @@ const lagApiBufferByteCount = 64 * 1024
 // direction.
 const lagApiMaxIntervalCount = 40
 
-// The most runs one upload message is split into by arrival: one per interval
-// of the series, and one each side of the window's end to spare (M6, M7).
-const lagApiMaxRunCount = lagApiMaxIntervalCount + 2
+// The furthest back an upload read is spread from its arrival (M6, amendment
+// 14), so the bytes that end a stall are not smeared far back into it. The
+// browser spreads its download reads with the same bound.
+const lagSpreadMax = time.Second
 
 // How long past a download window a write already under way may take to
 // finish, counted where it finishes. Nothing starts in it.
@@ -77,7 +81,7 @@ const (
 var lagApiZeroBytes [lagApiBufferByteCount]byte
 
 // Whether this cpu has the AES instructions crypto/aes uses, which decides
-// whether an upload is verified message by message or sampled (M6). It
+// whether an upload is verified read by read or sampled (M6). It
 // mirrors crypto/aes's own choice: AES-NI with SSE4.1 and SSSE3 on amd64, the
 // Armv8 AES instructions on arm64, POWER8 on ppc64, KM-AES with KMC on s390x,
 // and the generic tables everywhere else.
@@ -184,8 +188,12 @@ type lagApiPhase struct {
 	firstByteTimer *time.Timer
 	openStreams    []bool
 	openedStreams  []bool
-	end            lagApiPhaseEnd
-	endedTime      time.Time
+	// when each upload stream's previous counted read arrived, zero before its
+	// first, and the latest arrival of any counted read (M4, M6)
+	previousReadTimes []time.Time
+	lastCountedTime   time.Time
+	end               lagApiPhaseEnd
+	endedTime         time.Time
 }
 
 // Opens a phase now (M4). Its window waits for the first byte, for at most
@@ -204,17 +212,18 @@ func newLagApiPhase(
 	maxStreamCount = max(0, min(maxStreamCount, lagApiMaxStreamCount))
 	ctx, cancel := context.WithCancel(parentCtx)
 	phase := &lagApiPhase{
-		api:            api,
-		direction:      direction,
-		duration:       duration,
-		interval:       interval,
-		maxStreamCount: maxStreamCount,
-		notify:         notify,
-		ctx:            ctx,
-		cancel:         cancel,
-		maxByteCount:   maxByteCount,
-		openStreams:    make([]bool, maxStreamCount),
-		openedStreams:  make([]bool, maxStreamCount),
+		api:               api,
+		direction:         direction,
+		duration:          duration,
+		interval:          interval,
+		maxStreamCount:    maxStreamCount,
+		notify:            notify,
+		ctx:               ctx,
+		cancel:            cancel,
+		maxByteCount:      maxByteCount,
+		openStreams:       make([]bool, maxStreamCount),
+		openedStreams:     make([]bool, maxStreamCount),
+		previousReadTimes: make([]time.Time, maxStreamCount),
 	}
 	phase.capRemaining.Store(maxByteCount)
 	phase.stateLock.Lock()
@@ -410,99 +419,67 @@ func (self *lagApiPhase) count(now time.Time, byteCount int) {
 	}
 }
 
-// Takes bytes an upload message brought, all of them arriving at now, as one
-// run (see receiveRuns).
-func (self *lagApiPhase) receive(now time.Time, byteCount int) {
-	runs := &lagApiRuns{}
-	runs.reset()
-	runs.add(nil, time.Time{}, now, byteCount)
-	self.receiveRuns(now, runs, byteCount)
-}
-
-// Takes the bytes of a verified upload message from the ticket's cap and the
-// daily budget, and counts each run of them into the interval it arrived in,
-// when it arrived inside the window (M6, M8). So a message that spans
-// intervals is split across them by arrival, rather than counted whole in the
-// interval it ended in, which on a slow uplink read as steps of one message
-// per interval. Runs are counted only while the phase runs, under its lock, so
-// nothing is added once it has ended: the total the browser is then told is
-// the total the report holds. The bytes are already here, so they draw on the
-// cap and the budget either way; past either the phase ends as capped.
-func (self *lagApiPhase) receiveRuns(now time.Time, runs *lagApiRuns, byteCount int) {
-	func() {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-		if self.end != lagApiPhaseRunning {
-			return
-		}
-		series := self.series.Load()
-		if series == nil {
-			return
-		}
-		for _, run := range runs.runs[:runs.count] {
-			if run.time.Before(self.endTime) {
-				series.add(run.time, run.byteCount)
-			}
-		}
-	}()
-	if self.capRemaining.Add(-int64(byteCount)) <= 0 {
-		self.finish(lagApiPhaseEndCap)
-	}
-	if self.api.budget.take(now, int64(byteCount)) < int64(byteCount) {
-		self.finish(lagApiPhaseEndCap)
-	}
-}
-
-// One run of an upload message's bytes: those that arrived in one interval of
-// the window, on one side of its end, and when the first of them arrived.
-type lagApiRun struct {
-	time      time.Time
-	byteCount int
-}
-
-// The bytes of one upload message by when they arrived (M6, M8). Its size is
-// fixed, so a stream holds no more for a slow message than a fast one (M7); a
-// message that spans more intervals than it holds adds the rest to its last
-// run, which already lies past every interval a series counts.
-type lagApiRuns struct {
-	runs  [lagApiMaxRunCount]lagApiRun
-	count int
-}
-
-func (self *lagApiRuns) reset() {
-	self.count = 0
-}
-
-// Adds byteCount bytes that arrived at arrivedTime, joining the last run when
-// they arrived in the same interval of series and on the same side of
-// endTime. With no series every part joins one run.
-func (self *lagApiRuns) add(series *lagApiSeries, endTime time.Time, arrivedTime time.Time, byteCount int) {
+// Counts one read of upload stream k as it arrives, when the phase runs and the
+// read arrived inside its window (M6, M8). Its bytes count as having arrived
+// evenly since the stream's previous read -- the window's first byte for its
+// first -- but never from more than lagSpreadMax before it, split across the
+// intervals that span crosses (amendment 14). A stream that sends continuously
+// delivers a read's bytes over exactly that time. Counted whole where it
+// arrived, a read stepped its interval by one TLS record, 0.52 Mbps, which put
+// a slow uplink's p50 off by up to that step. Reads count under the phase's
+// lock and only while it runs, so nothing is added once it has ended: the
+// total the browser is then told is the total the report holds. A read at or
+// past the window's end counts nothing, and ends the phase. A counted read
+// draws on the ticket's cap and the daily budget as it arrives; past either
+// the phase ends as capped.
+func (self *lagApiPhase) receive(streamIndex int, arrivedTime time.Time, byteCount int) {
 	if byteCount <= 0 {
 		return
 	}
-	if 0 < self.count {
-		last := &self.runs[self.count-1]
-		sameRun := series == nil || (series.index(last.time) == series.index(arrivedTime) &&
-			last.time.Before(endTime) == arrivedTime.Before(endTime))
-		if sameRun || self.count == len(self.runs) {
-			last.byteCount += byteCount
-			return
+	counted, over := func() (bool, bool) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		series := self.series.Load()
+		if self.end != lagApiPhaseRunning || series == nil {
+			return false, false
 		}
+		if !arrivedTime.Before(self.endTime) {
+			return false, true
+		}
+		spreadTime := arrivedTime.Add(-lagSpreadMax)
+		if previousTime := self.previousReadTimes[streamIndex]; spreadTime.Before(previousTime) {
+			spreadTime = previousTime
+		}
+		if spreadTime.Before(self.firstByteTime) {
+			spreadTime = self.firstByteTime
+		}
+		series.addSpread(spreadTime, arrivedTime, byteCount)
+		self.previousReadTimes[streamIndex] = arrivedTime
+		if self.lastCountedTime.Before(arrivedTime) {
+			self.lastCountedTime = arrivedTime
+		}
+		return true, false
+	}()
+	if over {
+		self.finish(lagApiPhaseEndTime)
 	}
-	self.runs[self.count] = lagApiRun{
-		time:      arrivedTime,
-		byteCount: byteCount,
+	if !counted {
+		return
 	}
-	self.count += 1
+	if self.capRemaining.Add(-int64(byteCount)) <= 0 {
+		self.finish(lagApiPhaseEndCap)
+	}
+	if self.api.budget.take(arrivedTime, int64(byteCount)) < int64(byteCount) {
+		self.finish(lagApiPhaseEndCap)
+	}
 }
 
-// The bytes of all runs.
-func (self *lagApiRuns) byteCount() int {
-	byteCount := 0
-	for _, run := range self.runs[:self.count] {
-		byteCount += run.byteCount
-	}
-	return byteCount
+// The upload's bytes counted so far and when the latest counted read arrived,
+// zero before the first, read together (M4).
+func (self *lagApiPhase) progress() (uint64, time.Time) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.total(), self.lastCountedTime
 }
 
 // Bytes per interval from a window's first byte (M8). Sized once and bounded
@@ -539,6 +516,33 @@ func (self *lagApiSeries) add(now time.Time, byteCount int) {
 		return
 	}
 	self.counts[index].Add(uint64(byteCount))
+}
+
+// Adds bytes that arrived evenly over [startTime, endTime] (amendment 14): the
+// span is cut at the interval boundaries inside it, and each interval takes
+// its piece's share of the span's length. The pieces are whole bytes that sum
+// to byteCount: each cut rounds the share through it, so a piece is the
+// difference of two rounded shares. A span of no length adds them all at
+// endTime.
+func (self *lagApiSeries) addSpread(startTime time.Time, endTime time.Time, byteCount int) {
+	if byteCount <= 0 {
+		return
+	}
+	spanStart := max(0, startTime.Sub(self.startTime))
+	spanEnd := max(0, endTime.Sub(self.startTime))
+	if spanEnd <= spanStart {
+		self.add(endTime, byteCount)
+		return
+	}
+	added := 0
+	for index := int(spanStart / self.interval); index < len(self.counts) && added < byteCount; index += 1 {
+		through := byteCount
+		if cut := time.Duration(index+1) * self.interval; cut < spanEnd {
+			through = int(math.Round(float64(byteCount) * float64(cut-spanStart) / float64(spanEnd-spanStart)))
+		}
+		self.counts[index].Add(uint64(through - added))
+		added = through
+	}
 }
 
 // The counts, through the last interval that counted anything.
@@ -763,15 +767,9 @@ func (self *extenderLagApi) serveUp(w http.ResponseWriter, r *http.Request, orig
 	self.readUpload(conn, session.uploadKey, phase, streamIndex)
 }
 
-// Reads and verifies one upload stream (M6, M7). Messages are 65536 bytes, the
-// last possibly shorter, contiguous from offset 0. With AES instructions every
-// message is compared with the keystream regenerated at its offset; without, a
-// random 1 in 16, chosen after it arrives. A mismatch, a text message or a
-// message after a short one ends the phase as a mismatch, which ends the load.
-// The first message opens the window, and only bytes inside it are counted:
-// each part of a message in the interval it arrived in, once the whole message
-// has passed its check (M8). When the phase ends the stream is closed -- 1000,
-// or 4400 for a mismatch -- and drained until the browser's own close.
+// Reads and verifies one upload stream (M6, M7), message by message (see
+// lagApiUploadStream). When the phase ends the stream is closed -- 1000, or
+// 4400 for a mismatch -- and drained until the browser's own close.
 func (self *extenderLagApi) readUpload(
 	conn *websocket.Conn,
 	uploadKey [16]byte,
@@ -779,7 +777,7 @@ func (self *extenderLagApi) readUpload(
 	streamIndex int,
 ) {
 	conn.SetReadLimit(lagApiBufferByteCount)
-	block, err := aes.NewCipher(uploadKey[:])
+	stream, err := newLagApiUploadStream(phase, uploadKey, streamIndex, self.exactVerification, self.sampleMessage)
 	if err != nil {
 		self.server.reportError("lag upload", err)
 		lagApiCloseWebSocket(conn, lagApiCloseCodeInternal, "internal")
@@ -805,87 +803,122 @@ func (self *extenderLagApi) readUpload(
 		}
 	}()
 
-	// one data buffer, one keystream buffer and one message's runs for the
-	// stream's life (M7)
-	data := make([]byte, lagApiBufferByteCount)
-	keystream := make([]byte, lagApiBufferByteCount)
-	runs := &lagApiRuns{}
-	exact := self.exactVerification
-	var running cipher.Stream
-	if exact {
-		counterBlock := lagApiCounterBlock(uint64(streamIndex), 0)
-		running = cipher.NewCTR(block, counterBlock[:])
-	}
-	offset := uint64(0)
-	short := false
 	for {
 		messageType, reader, err := conn.NextReader()
 		if err != nil {
 			// the browser's close, the drain's deadline, or a broken connection
 			return
 		}
-		endTime, ok := phase.window(time.Now())
-		if !ok {
-			// past the window: drained, not counted
-			continue
-		}
-		if messageType != websocket.BinaryMessage || short {
-			phase.finish(lagApiPhaseEndMismatch)
-			continue
-		}
-		byteCount, err := lagApiReadMessage(reader, data, phase.series.Load(), endTime, time.Now, runs)
-		if err != nil {
+		if err := stream.readMessage(messageType, reader, time.Now); err != nil {
 			return
 		}
-		// only the last message may be shorter
-		short = byteCount < len(data)
-
-		if exact || self.sampleMessage() {
-			stream := running
-			if !exact {
-				counterBlock := lagApiCounterBlock(uint64(streamIndex), offset)
-				stream = cipher.NewCTR(block, counterBlock[:])
-			}
-			stream.XORKeyStream(keystream[:byteCount], lagApiZeroBytes[:byteCount])
-			if !bytes.Equal(data[:byteCount], keystream[:byteCount]) {
-				phase.finish(lagApiPhaseEndMismatch)
-				continue
-			}
-		}
-		offset += uint64(byteCount)
-		phase.receiveRuns(time.Now(), runs, byteCount)
 	}
 }
 
-// Reads one message into buffer (M6), noting into runs when each part arrived,
-// by the interval of series it arrived in and the side of endTime (M8). A
-// read returns what the connection has delivered, so a part's time is its
-// arrival, to within a TLS record. A full buffer is the whole message, since
-// the read limit refuses a longer one before its bytes arrive.
-func lagApiReadMessage(
-	reader io.Reader,
-	buffer []byte,
-	series *lagApiSeries,
-	endTime time.Time,
-	now func() time.Time,
-	runs *lagApiRuns,
-) (int, error) {
-	runs.reset()
+// One upload stream as the extender reads it (M6, M7): its keystream, its
+// offset, and one data buffer and one keystream buffer for its life. Messages
+// are 65536 bytes, the last possibly shorter, contiguous from offset 0. The
+// first message opens the phase's window. Each read counts as it arrives, by
+// the phase's receive (amendment 14): with AES instructions once its bytes have
+// been compared with the running keystream at their offset; without, at once,
+// and a random 1 in 16 messages, chosen after each has arrived, is compared
+// whole. A mismatch, a text message or a message after a short one ends the
+// phase as a mismatch, which ends the load; what was counted before it stays
+// counted, but the load is not complete, so no speed is derived from it (A5).
+type lagApiUploadStream struct {
+	phase         *lagApiPhase
+	streamIndex   int
+	block         cipher.Block
+	exact         bool
+	sampleMessage func() bool
+
+	data      []byte
+	keystream []byte
+	// the keystream from the next byte on, with exact verification
+	running cipher.Stream
+	offset  uint64
+	// the last message was short, so no other may follow it
+	short bool
+}
+
+func newLagApiUploadStream(
+	phase *lagApiPhase,
+	uploadKey [16]byte,
+	streamIndex int,
+	exact bool,
+	sampleMessage func() bool,
+) (*lagApiUploadStream, error) {
+	block, err := aes.NewCipher(uploadKey[:])
+	if err != nil {
+		return nil, err
+	}
+	stream := &lagApiUploadStream{
+		phase:         phase,
+		streamIndex:   streamIndex,
+		block:         block,
+		exact:         exact,
+		sampleMessage: sampleMessage,
+		data:          make([]byte, lagApiBufferByteCount),
+		keystream:     make([]byte, lagApiBufferByteCount),
+	}
+	if exact {
+		counterBlock := lagApiCounterBlock(uint64(streamIndex), 0)
+		stream.running = cipher.NewCTR(block, counterBlock[:])
+	}
+	return stream, nil
+}
+
+// Reads one message from reader, verifying and counting it read by read as
+// above, with each read's arrival from now: a read returns what the connection
+// has delivered, so its time is its arrival, to within a TLS record. A message
+// that starts past the window or once the phase has ended is left unread, to
+// be drained, not counted, as is the rest of one that failed its check. A full
+// buffer is the whole message, since the read limit refuses a longer one
+// before its bytes arrive. An error is the connection's.
+func (self *lagApiUploadStream) readMessage(messageType int, reader io.Reader, now func() time.Time) error {
+	phase := self.phase
+	if _, ok := phase.window(now()); !ok {
+		return nil
+	}
+	if messageType != websocket.BinaryMessage || self.short {
+		phase.finish(lagApiPhaseEndMismatch)
+		return nil
+	}
 	byteCount := 0
-	for byteCount < len(buffer) {
-		n, err := reader.Read(buffer[byteCount:])
+	for byteCount < len(self.data) {
+		n, err := reader.Read(self.data[byteCount:])
 		if 0 < n {
-			runs.add(series, endTime, now(), n)
+			arrivedTime := now()
+			if self.exact {
+				keystream := self.keystream[byteCount : byteCount+n]
+				self.running.XORKeyStream(keystream, lagApiZeroBytes[:n])
+				if !bytes.Equal(self.data[byteCount:byteCount+n], keystream) {
+					phase.finish(lagApiPhaseEndMismatch)
+					return nil
+				}
+			}
+			phase.receive(self.streamIndex, arrivedTime, n)
 			byteCount += n
 		}
 		if err == io.EOF {
-			return byteCount, nil
+			break
 		}
 		if err != nil {
-			return byteCount, err
+			return err
 		}
 	}
-	return byteCount, nil
+	// only the last message may be shorter
+	self.short = byteCount < len(self.data)
+	if !self.exact && self.sampleMessage() {
+		counterBlock := lagApiCounterBlock(uint64(self.streamIndex), self.offset)
+		cipher.NewCTR(self.block, counterBlock[:]).XORKeyStream(self.keystream[:byteCount], lagApiZeroBytes[:byteCount])
+		if !bytes.Equal(self.data[:byteCount], self.keystream[:byteCount]) {
+			phase.finish(lagApiPhaseEndMismatch)
+			return nil
+		}
+	}
+	self.offset += uint64(byteCount)
+	return nil
 }
 
 // Sends a close frame and bounds how long the reader may wait for the peer's

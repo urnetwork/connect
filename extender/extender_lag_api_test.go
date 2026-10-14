@@ -385,8 +385,10 @@ type testLagMessage struct {
 	Ms             *float64 `json:"ms"`
 	Lost           bool     `json:"lost"`
 	Bytes          uint64   `json:"bytes"`
+	At             *float64 `json:"at"`
 	UploadVerified bool     `json:"uploadVerified"`
 	EndReason      string   `json:"endReason"`
+	UploadBytes    []uint64 `json:"uploadBytes"`
 	Code           string   `json:"code"`
 	RetryAfterMs   *int64   `json:"retryAfterMs"`
 
@@ -616,12 +618,43 @@ type lagTestLoad struct {
 	resultTime       time.Time
 }
 
+// Checks the upload's progress and result against its report (M4, amendment
+// 14): each progress carries at, when the latest counted read arrived, never
+// past its ms and never going back; and the result carries the upload's
+// series exactly as the report signs it, whose sum is the last progress's
+// bytes.
+func (self *lagTestLoad) checkUpload(t *testing.T, body *protocol.LagReportBody) {
+	t.Helper()
+	previousAt := 0.0
+	for i, uploaded := range self.uploaded {
+		if uploaded.At == nil || *uploaded.At < previousAt || *uploaded.Ms < *uploaded.At {
+			t.Errorf("progress %d %+v, after at %f", i, uploaded.raw, previousAt)
+			continue
+		}
+		previousAt = *uploaded.At
+	}
+	if _, ok := self.result.raw["uploadBytes"]; !ok || !slices.Equal(self.result.UploadBytes, body.UploadBytes) {
+		t.Errorf("result's upload %v, reported %v", self.result.raw["uploadBytes"], body.UploadBytes)
+	}
+	if 0 < len(self.uploaded) {
+		byteCount := uint64(0)
+		for _, intervalByteCount := range body.UploadBytes {
+			byteCount += intervalByteCount
+		}
+		if last := self.uploaded[len(self.uploaded)-1]; byteCount != last.Bytes {
+			t.Errorf("reported %d, told the browser %d", byteCount, last.Bytes)
+		}
+	}
+}
+
 // Options of a simulated load: corrupt, when set, changes one upload message
 // of one stream before it is sent.
 type lagTestLoadOptions struct {
 	corrupt func(streamIndex int, messageIndex int, message []byte)
 	// the bytes each upload stream sends at most; 0 sends until closed
 	uploadByteCount int64
+	// the wait between one upload stream's messages; 0 sends them back to back
+	uploadInterval time.Duration
 	// never say done, as a browser that went away mid load
 	noDone bool
 	// say done at the first progress, with the upload's window still open
@@ -773,6 +806,13 @@ func (self *lagTestSession) runLoad(options lagTestLoadOptions) *lagTestLoad {
 				}
 				sentByteCount += int64(byteCount)
 				uploadedByteCount.Add(int64(byteCount))
+				if 0 < options.uploadInterval {
+					select {
+					case <-readDone:
+						return
+					case <-time.After(options.uploadInterval):
+					}
+				}
 			}
 			<-readDone
 		}()
@@ -1497,7 +1537,7 @@ func TestLagApiNoBudgetByDefault(t *testing.T) {
 	}
 	upload := fixture.directPhase(session, lagApiDirectionUpload, time.Minute, 1<<62)
 	upload.window(now)
-	upload.receive(now, lagApiBufferByteCount)
+	upload.receive(0, now, lagApiBufferByteCount)
 	for _, phase := range []*lagApiPhase{download, upload} {
 		if _, _, end := phase.state(); end != lagApiPhaseRunning {
 			t.Errorf("a phase was cut: %d", end)
@@ -1617,6 +1657,7 @@ func TestLagApiLoadAndReport(t *testing.T) {
 	if sum(body.UploadBytes) != lastUploaded.Bytes {
 		t.Errorf("reported %d, told the browser %d", sum(body.UploadBytes), lastUploaded.Bytes)
 	}
+	load.checkUpload(t, body)
 	if string(body.TicketId) == "" || body.TrackPosition != 3 || len(body.TrackId) != 16 {
 		t.Errorf("ticket fields %x %d %x", body.TicketId, body.TrackPosition, body.TrackId)
 	}
@@ -1716,6 +1757,43 @@ func TestLagApiUploadMismatchEndsLoad(t *testing.T) {
 	if body.EndReason != protocol.LagEndReason_LAG_END_UPLOAD_MISMATCH || body.UploadVerified {
 		t.Errorf("report %v %t", body.EndReason, body.UploadVerified)
 	}
+	// what was counted before the mismatch stays in the series, and the
+	// result carries it as the report does (amendment 14)
+	load.checkUpload(t, body)
+}
+
+// M4, amendment 14: an upload whose messages arrive across its window. Each
+// progress says, as at, when the latest counted read arrived: it moves on
+// with them, never past the progress's ms and never back. The result carries
+// the upload's series as the report signs it.
+func TestLagApiUploadedAt(t *testing.T) {
+	fixture := newLagApiDurationFixture(t, nil)
+	session := fixture.openHelloSession(fixture.ticket(func(body *protocol.LagTicketBody) {
+		body.MaxStreams = 2
+		body.DownloadMs = 250
+		body.UploadMs = 1000
+	}))
+	// each stream sends a message every 80 ms for the window's first 560 ms
+	load := session.runLoad(lagTestLoadOptions{
+		uploadByteCount: 8 * lagApiBufferByteCount,
+		uploadInterval:  80 * time.Millisecond,
+	})
+	if load.result.EndReason != "complete" || !load.result.UploadVerified || load.uploadStreamCount != 2 {
+		t.Fatalf("result %+v from %d streams", load.result.raw, load.uploadStreamCount)
+	}
+	session.close()
+	body := fixture.nextReport(5 * time.Second)
+	load.checkUpload(t, body)
+	// progress from 250 ms on, and the last at the window's 1000 ms, whose at
+	// is the last message's arrival rather than its own time
+	if len(load.uploaded) < 2 {
+		t.Fatalf("%d progress messages", len(load.uploaded))
+	}
+	first := load.uploaded[0]
+	last := load.uploaded[len(load.uploaded)-1]
+	if *last.Ms != 1000 || last.Bytes != 2*8*lagApiBufferByteCount || *last.At <= *first.At || 800 <= *last.At {
+		t.Errorf("first progress %+v, last %+v", first.raw, last.raw)
+	}
 }
 
 // M4: a load whose download never starts times out and frees its slot; the
@@ -1727,8 +1805,9 @@ func TestLagApiLoadTimeouts(t *testing.T) {
 	})
 	session := fixture.openHelloSession(fixture.ticket(nil))
 	session.load("download")
+	// with no upload, the result carries no upload series (amendment 14)
 	if message := session.nextResult(5 * time.Second); message.Type != "loadResult" ||
-		message.EndReason != "timeout" || message.UploadVerified {
+		message.EndReason != "timeout" || message.UploadVerified || message.raw["uploadBytes"] != nil {
 		t.Errorf("timeout %+v", message.raw)
 	}
 	if fixture.api.loadCountNow() != 0 {
@@ -1738,7 +1817,8 @@ func TestLagApiLoadTimeouts(t *testing.T) {
 	session = fixture.openHelloSession(fixture.ticket(nil))
 	session.load("download")
 	session.load("done")
-	if message := session.nextResult(5 * time.Second); message.EndReason != "client_closed" {
+	if message := session.nextResult(5 * time.Second); message.EndReason != "client_closed" ||
+		message.raw["uploadBytes"] != nil {
 		t.Errorf("done %+v", message.raw)
 	}
 }

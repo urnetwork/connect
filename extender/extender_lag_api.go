@@ -214,8 +214,8 @@ type extenderLagApi struct {
 
 	// the timings of sessions (M4, M8); tests shorten them
 	timings lagApiTimings
-	// whether an upload is verified message by message rather than sampled
-	// (M6), and the sample choice when it is not; tests fix both
+	// whether an upload is verified read by read rather than sampled (M6),
+	// and the sample choice when it is not; tests fix both
 	exactVerification bool
 	sampleMessage     func() bool
 
