@@ -159,6 +159,8 @@ type PreparationAdapter struct {
 	InspectRestore func(context.Context, *os.File, PreparationOwnerPlan, Inventory) ([]PreparedAttribute, error)
 	// RebindRestore is pure: it borrows original metadata bytes and reviewed
 	// target-member identities, returning only a bounded unsigned census.
+	// Members carry their staged names, or their published target names once
+	// the apply's recorded progress is complete; the reviewed inodes are equal.
 	RebindRestore func(context.Context, PreparationOwnerPlan, Inventory, []byte, []PreparationSource) ([]byte, error)
 }
 

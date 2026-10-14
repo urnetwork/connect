@@ -485,6 +485,27 @@ func (self *preparationApply) readControl() error {
 	return scanner.Err()
 }
 
+// Admission asks whether the retained journal already acknowledges the final
+// declaration. The held root lease excludes every publisher, and the leased
+// reopen authenticates this same journal again before any step is trusted.
+func (self *preparationApply) recordedComplete() (bool, error) {
+	request := self.admission.request
+	parent := self.admission.directories[filepath.Dir(request.ControlPath)]
+	fd, err := unix.Openat(int(parent.Fd()), filepath.Base(request.ControlPath), syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, syscall.ENOENT) {
+		return false, nil
+	}
+	if err != nil {
+		return false, namedObservation("preparation control could not be observed", err)
+	}
+	probe := &preparationApply{admission: self.admission, control: os.NewFile(uintptr(fd), request.ControlPath)}
+	if err := errors.Join(probe.readControl(), probe.control.Close()); err != nil {
+		return false, err
+	}
+	last := len(probe.completed) - 1
+	return probe.pending == nil && last >= 0 && probe.completed[last].Step.Path == request.DeclarationPath, nil
+}
+
 // Attribute publication and regular members share exactly the same retained
 // pending/completed lifecycle. No step may skip or reorder original intent.
 func (self *preparationApply) step(step preparationStep) error {
@@ -975,9 +996,6 @@ func openPreparationApplication(ctx context.Context, reference Reference, adapte
 			return nil, err
 		}
 	}
-	if err := validatePhysicalMetadataDerivations(ctx, request, plan, adapter, inventory); err != nil {
-		return nil, err
-	}
 	admission, err := openPreparationAdmissionWithParents(ctx, request, host, scope, plan.RootSource, sharedParents)
 	if err != nil {
 		return nil, err
@@ -994,6 +1012,17 @@ func openPreparationApplication(ctx context.Context, reference Reference, adapte
 		return nil, err
 	}
 	self := &preparationApply{admission: admission, plan: plan, reference: reference, retained: map[string]unix.Stat_t{}, attributes: map[string][]byte{}, moveSources: preparationMoveSources(plan), hooks: hooks, adapter: adapter, inventory: inventory}
+	// A completed apply consumed the staged members a derivation borrows; the
+	// published members are then the exact result to replay and step through.
+	complete := false
+	if len(plan.Derivations) != 0 {
+		if complete, err = self.recordedComplete(); err != nil {
+			return nil, err
+		}
+	}
+	if err := validatePhysicalMetadataDerivations(ctx, request, plan, adapter, inventory, complete); err != nil {
+		return nil, err
+	}
 	if request.Purpose == "restore" {
 		self.archive, err = openPreparationRestoreArchive(ctx, request, host)
 		if err != nil {
