@@ -720,12 +720,16 @@ Test-infrastructure lessons (reusable):
   | a client-role epoch's first outbox batch (its ClientHello) | `peerEncryptionSession.outboxLoop` | `E2eAttempted`; `E2eFirstAttemptTime` keeps the first |
   | a handshake completes, either role, current or superseded epoch | `completeHandshake` | `E2eNegotiated`; `KeyExchange` unless a seal supplied it |
   | the peer's identity proof verifies and its epoch is promoted | `maybeVerifyPendingPeerIdentityProof` | `E2eSealed`, `KeyExchange` (before the Sealed event fires) |
-  | a send sequence's first acknowledgement | `SendSequence.observeReceiveWindowAdvertisement` | `AckObserved` |
-  | a send sequence's first or larger window advertisement | same | `WindowAdvertised`, `MaxReceiveWindowByteCount` |
+  | a send sequence's first acknowledgement, when it carries no window | `SendSequence.observeReceiveWindowAdvertisement` | `AckObserved` |
+  | a send sequence's first or larger window advertisement | same | `AckObserved`, `WindowAdvertised`, `MaxReceiveWindowByteCount`, in one step |
 
   The ack edges ride the existing per-sequence atomics (`ackSeen`, the
   `receiveWindowSetAtNanos` step), so a steady ack stream records nothing and
   allocates nothing (`TestAcknowledgementEvidenceDoesNotAllocatePerAcknowledgement`).
+  An advertising first acknowledgement is one recording, not an acknowledgement
+  and then a window: between two, a reader would see `AckObserved` without
+  `WindowAdvertised`, the legacy reading, for a peer that advertises
+  (`TestAdvertisingFirstAcknowledgementIsOneRecording`).
 - **Reading the evidence:**
   - Flags are sticky for the recorder's life: each records something the peer
     did. A false flag is absence of evidence unless its precondition holds.

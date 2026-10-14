@@ -509,9 +509,9 @@ func TestAcknowledgementEvidenceDoesNotAllocatePerAcknowledgement(t *testing.T) 
 		observation.MaxReceiveWindowByteCount != 2*1024*1024 {
 		t.Fatalf("the first acknowledgement recorded %+v", observation)
 	}
-	// the first acknowledgement and the first advertisement, one call each
-	if recordingCount != 2 {
-		t.Fatalf("the first acknowledgement made %d recording calls, want 2", recordingCount)
+	// the advertising first acknowledgement, recorded with its window as one
+	if recordingCount != 1 {
+		t.Fatalf("the first acknowledgement made %d recording calls, want 1", recordingCount)
 	}
 	allocs := testing.AllocsPerRun(1000, func() {
 		sequence.detachResendItem(item.messageId)
@@ -521,8 +521,50 @@ func TestAcknowledgementEvidenceDoesNotAllocatePerAcknowledgement(t *testing.T) 
 	if allocs != 0 {
 		t.Fatalf("an acknowledgement with evidence recording allocated %g objects", allocs)
 	}
-	if recordingCount != 2 {
-		t.Fatalf("a steady acknowledgement stream made %d more recording calls, want none", recordingCount-2)
+	if recordingCount != 1 {
+		t.Fatalf("a steady acknowledgement stream made %d more recording calls, want none", recordingCount-1)
+	}
+	sequence.ackLifetimes.clear()
+	sequence.resendQueue.Clear()
+}
+
+// An advertising first acknowledgement is one recording. Recorded as two, a
+// reader between them sees AckObserved without WindowAdvertised, which is the
+// legacy reading, and a prober that stops at its first conclusive reading
+// persists it for a provider that advertises.
+func TestAdvertisingFirstAcknowledgementIsOneRecording(t *testing.T) {
+	recorder := NewPeerCapabilityRecorder(0)
+	peerId := NewId()
+	var readings []PeerCapabilityObservation
+	recorder.afterObserveForTest = func(Id) {
+		// a reader at each point between recordings, outside the lock
+		observation, _ := recorder.Get(peerId)
+		readings = append(readings, observation)
+	}
+	sequence := &SendSequence{
+		client:                 &Client{},
+		destination:            peerId,
+		resendQueue:            newResendQueue(nil, 0),
+		peerCapabilityRecorder: recorder,
+	}
+	item := &sendItem{
+		transferItem: transferItem{messageId: NewId(), sequenceNumber: 3},
+		expectsAck:   true, sendTime: time.Now(), ackTimeout: 30 * time.Second,
+	}
+	sequence.addResendItem(item)
+
+	sequence.coalesceReceivedAck(newSequenceAckWindow(), receiveAckMessage{
+		messageId:              item.messageId,
+		receiveWindowSet:       true,
+		receiveWindowByteCount: 2 * 1024 * 1024,
+	})
+	for _, reading := range readings {
+		if reading.AckObserved && !reading.WindowAdvertised {
+			t.Fatalf("a reader between recordings saw the legacy reading of an advertising peer: %+v", reading)
+		}
+	}
+	if len(readings) != 1 || !readings[0].WindowAdvertised || readings[0].MaxReceiveWindowByteCount != 2*1024*1024 {
+		t.Fatalf("an advertising first acknowledgement made %d recordings, want 1 with its window: %+v", len(readings), readings)
 	}
 	sequence.ackLifetimes.clear()
 	sequence.resendQueue.Clear()

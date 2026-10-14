@@ -11262,10 +11262,14 @@ func (self *SendSequence) observeReceiveWindowAdvertisement(ack receiveAckMessag
 	// without the field has a peer that does not advertise and takes its own
 	// constant. Those are different facts and the window is different for
 	// each (THROUGHPUTFIX §37.21).
-	if !self.ackSeen.Load() && !self.ackSeen.Swap(true) {
-		// the sequence's first acknowledgement, once: capability evidence
-		// that the peer answers, without which a missing advertisement below
-		// says nothing about it
+	firstAck := !self.ackSeen.Load() && !self.ackSeen.Swap(true)
+	if firstAck && !ack.receiveWindowSet {
+		// the sequence's first acknowledgement, once, carrying no window:
+		// capability evidence that the peer answers and does not advertise.
+		// An advertising first acknowledgement is recorded below together
+		// with its window, in one step, so that no reader can see the
+		// acknowledgement without the window and take the peer for legacy.
+		// It always steps: receiveWindowSet is set only after ackSeen.
 		self.peerCapabilityRecorder.observeAck(self.destination)
 	}
 	if ack.ackCompressTimeoutSet {
@@ -11277,7 +11281,8 @@ func (self *SendSequence) observeReceiveWindowAdvertisement(ack receiveAckMessag
 	if !self.receiveWindowSet.Load() || self.receiveWindowByteCount.Load() < uint64(ack.receiveWindowByteCount) {
 		self.receiveWindowSetAtNanos.Store(time.Now().UnixNano())
 		// the first advertisement or an increase, the only acknowledgements
-		// that can raise the peer's largest advertised value
+		// that can raise the peer's largest advertised value; the recorder
+		// marks the acknowledgement itself observed in the same step
 		self.peerCapabilityRecorder.observeReceiveWindow(self.destination, ByteCount(ack.receiveWindowByteCount))
 	}
 	self.receiveWindowByteCount.Store(uint64(ack.receiveWindowByteCount))
