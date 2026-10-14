@@ -1656,7 +1656,7 @@ func (self *peerEncryptionSession) outboxLoop(e *tlsHandshakeEpoch) {
 		if batchIndex == 0 && self.role == sequenceTlsRoleClient {
 			// a client-role epoch's first batch is its ClientHello: capability
 			// evidence that this client asked the peer for a session
-			self.client.peerCapabilityObservations.observeE2eAttempt(self.peerId)
+			self.client.peerCapabilityRecorder.observeE2eAttempt(self.peerId)
 		}
 		batchIndex += 1
 		// In TLS-server role the first outbox batch is the server flight
@@ -1865,7 +1865,7 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 		// capability evidence: the peer completed a handshake with this
 		// group, whether or not a newer epoch has since replaced this one.
 		// Recorded before the identity proof below can seal the epoch.
-		self.client.peerCapabilityObservations.observeE2eHandshake(self.peerId, negotiatedCurveId)
+		self.client.peerCapabilityRecorder.observeE2eHandshake(self.peerId, negotiatedCurveId)
 	}
 	self.notifyIdleStateChanged()
 	if err != nil {
@@ -2124,7 +2124,7 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 		if sealed {
 			// capability evidence, recorded before the callbacks below so a
 			// Sealed event's consumer already reads it
-			self.client.peerCapabilityObservations.observeE2eSealed(self.peerId, sealedCurveId)
+			self.client.peerCapabilityRecorder.observeE2eSealed(self.peerId, sealedCurveId)
 		}
 		// the established + identity-verified peer set grew (or the
 		// established epoch swapped): the only promote path runs above

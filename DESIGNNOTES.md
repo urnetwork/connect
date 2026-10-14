@@ -695,12 +695,12 @@ Test-infrastructure lessons (reusable):
 
 ### 3.13 Peer capability evidence — what a peer showed it negotiates
 
-- **Decision:** `PeerCapabilityObservations` is an optional, owner-held recorder
+- **Decision:** `PeerCapabilityRecorder` is an optional, owner-held recorder
   of per-peer wire evidence for two capabilities: the end-to-end session of this
   section (did a TLS 1.3 handshake complete, with which group, did it seal) and
   resizable windows (do the peer's acks carry `Ack.receive_window_byte_count`,
-  THROUGHPUTFIX §37.3). A caller sets `ClientSettings.PeerCapabilityObservations`
-  before `NewClient`; every client given the same observer records into it, so a
+  THROUGHPUTFIX §37.3). A caller sets `ClientSettings.PeerCapabilityRecorder`
+  before `NewClient`; every client given the same recorder records into it, so a
   multi-client that rotates window clients toward one provider keeps the evidence
   each of them saw. Reads: `Get(peerId)`, `Snapshot()` (ordered by peer id),
   `DroppedPeerCount()`.
@@ -708,7 +708,7 @@ Test-infrastructure lessons (reusable):
   build lineage can carry either capability or neither — so a prober measures
   instead of trusting the version.
 - **Invariant — read-only, no per-packet cost:** recording changes no behaviour,
-  and the observer never turns encryption on: sessions exist only when
+  and the recorder never turns encryption on: sessions exist only when
   `EncryptionSettings.Mode` is not `Off`, so under `Off` the e2e fields say
   nothing about the peer. Nil (the default) costs one nil check at each edge.
   Every edge is already rare. One small leaf lock guards the records, taken
@@ -727,7 +727,7 @@ Test-infrastructure lessons (reusable):
   `receiveWindowSetAtNanos` step), so a steady ack stream records nothing and
   allocates nothing (`TestAcknowledgementEvidenceDoesNotAllocatePerAcknowledgement`).
 - **Reading the evidence:**
-  - Flags are sticky for the observer's life: each records something the peer
+  - Flags are sticky for the recorder's life: each records something the peer
     did. A false flag is absence of evidence unless its precondition holds.
   - `E2eAttempted && !E2eNegotiated` is a ClientHello nobody answered — the
     shape a provider without the responder (or with its sessions off) leaves,
@@ -742,7 +742,11 @@ Test-infrastructure lessons (reusable):
     most recent completed handshake while none has sealed; `PostQuantum` is that
     group carrying an ML-KEM component, classified by IANA codepoint so it does
     not depend on which groups the toolchain names. So `E2eSealed && PostQuantum`
-    is an authenticated post-quantum key exchange.
+    is an authenticated post-quantum key exchange. `KeyExchange` is a string: the
+    `tls.CurveID.String()` name of the `tls.ConnectionState.CurveID` the
+    handshake reported (`PeerEncryptionState.KeyExchange` holds the same value
+    as a `tls.CurveID`); a group the toolchain does not name reads
+    `CurveID(<decimal codepoint>)`.
   - `WindowAdvertised == false` reads as a legacy peer only with `AckObserved`.
     `MaxReceiveWindowByteCount` is the largest value any sequence was offered,
     clamped at 2^32-1 as the sender keeps it; with `WindowAdvertised`, zero is a
@@ -755,7 +759,7 @@ Test-infrastructure lessons (reusable):
   The evidence is what this owner's clients observed of the peer, not a property
   of the address: a peer that restarts into another build while observed folds
   both builds' sticky evidence into its one record.
-- **Opting in a prober:** one observer per probe owner (never per process), set
+- **Opting in a prober:** one recorder per probe owner (never per process), set
   on every client settings value it generates, plus `EncryptionSettings.Mode =
   EncryptionModeOpportunistic` to attempt sessions. Opportunistic is not free:
   each attempt costs a handshake (a server flight of a few KiB, §2.5) and each
@@ -771,8 +775,8 @@ Test-infrastructure lessons (reusable):
   measure in a tunnel of its own, not in a URL measurement tunnel, until that
   is ruled out.
 - **Code:** `transfer_peer_capability_observation.go` (`PeerCapabilityObservation`,
-  `PeerCapabilityObservations`, `isPostQuantumKeyExchange`);
-  `transfer.go: ClientSettings.PeerCapabilityObservations,
+  `PeerCapabilityRecorder`, `isPostQuantumKeyExchange`);
+  `transfer.go: ClientSettings.PeerCapabilityRecorder,
   SendSequence.observeReceiveWindowAdvertisement`; `transfer_encrypt.go: outboxLoop,
   completeHandshake, maybeVerifyPendingPeerIdentityProof`. Tests:
   `transfer_peer_capability_observation_test.go`.

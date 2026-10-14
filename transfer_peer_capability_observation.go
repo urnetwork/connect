@@ -13,7 +13,7 @@ package connect
 // Recording happens only at edges that are already rare: a client-role epoch's
 // first outbox batch (its ClientHello), a completed handshake, a seal, a send
 // sequence's first acknowledgement, and a send sequence's first or larger
-// window advertisement. None is per packet. A nil observer, the default, costs
+// window advertisement. None is per packet. A nil recorder, the default, costs
 // one nil check at those edges and records nothing.
 
 import (
@@ -34,9 +34,9 @@ const (
 	tlsKeyExchangeMlKem1024          tls.CurveID = 0x0202
 )
 
-// The peer bound of a zero-value observer, or of one built with a non-positive
+// The peer bound of a zero-value recorder, or of one built with a non-positive
 // bound.
-const defaultPeerCapabilityObservationMaxPeerCount = 1024
+const defaultPeerCapabilityRecorderMaxPeerCount = 1024
 
 // Whether a negotiated group carries an ML-KEM component, hybrid or pure.
 func isPostQuantumKeyExchange(curveId tls.CurveID) bool {
@@ -63,7 +63,7 @@ func tlsKeyExchangeName(curveId tls.CurveID) string {
 
 // One peer's evidence as of the read.
 //
-// Every flag is sticky for the life of the owning PeerCapabilityObservations:
+// Every flag is sticky for the life of the owning PeerCapabilityRecorder:
 // each records something the peer did, not a current state. A false flag is
 // an absence of evidence, and it is evidence of absence only when the
 // precondition named on the field holds.
@@ -90,6 +90,13 @@ type PeerCapabilityObservation struct {
 	// The negotiated TLS group, e.g. "X25519MLKEM768" or "X25519": that of the
 	// most recent sealed session, or, while none has sealed, of the most
 	// recent completed handshake. Empty until E2eNegotiated.
+	//
+	// It is the `tls.CurveID.String()` name of the group that
+	// `tls.ConnectionState.CurveID` reported, the value
+	// `PeerEncryptionState.KeyExchange` holds as a `tls.CurveID`. A string, so
+	// a consumer can store it without depending on crypto/tls; a group the
+	// toolchain does not name renders as "CurveID(<decimal codepoint>)", and
+	// PostQuantum classifies by codepoint, so it never depends on the name.
 	KeyExchange string
 	// KeyExchange carries an ML-KEM component, hybrid or pure. With E2eSealed,
 	// a post-quantum key exchange the peer's identity proof authenticated.
@@ -112,24 +119,24 @@ type PeerCapabilityObservation struct {
 
 // Records, per peer, what the peer has shown it supports on the wire (see
 // PeerCapabilityObservation). A caller opts in by setting
-// `ClientSettings.PeerCapabilityObservations` before constructing the client;
-// every client given the same observer records into it, so an owner that
+// `ClientSettings.PeerCapabilityRecorder` before constructing the client;
+// every client given the same recorder records into it, so an owner that
 // rotates clients toward one peer (a multi-client window) keeps the evidence
 // each of them saw.
 //
 // Read-only for its owner: recording is internal and changes no behaviour, and
 // whether an end-to-end session is attempted is the client's
-// `EncryptionSettings.Mode`, never this observer.
+// `EncryptionSettings.Mode`, never this recorder.
 //
 // Safe for concurrent use. One small leaf lock guards the records: it is taken
 // at the rare recording edges and by reads, and nothing is acquired while it is
 // held. Retained memory is one record per distinct peer, at most the bound
-// given to `NewPeerCapabilityObservations`; a peer first seen past it is not
+// given to `NewPeerCapabilityRecorder`; a peer first seen past it is not
 // recorded and is counted by `DroppedPeerCount`. The zero value is ready to
 // use with the default bound of 1024 peers. Create one per owner, never one
 // per process: the bound and the records belong to that owner. Do not copy it
 // after first use.
-type PeerCapabilityObservations struct {
+type PeerCapabilityRecorder struct {
 	maxPeerCount int
 
 	stateLock          sync.Mutex
@@ -143,7 +150,7 @@ type PeerCapabilityObservations struct {
 	afterObserveForTest func(peerId Id)
 }
 
-// One peer's evidence. Guarded by the owning observer's stateLock.
+// One peer's evidence. Guarded by the owning recorder's stateLock.
 type peerCapability struct {
 	e2eAttempted        bool
 	e2eFirstAttemptTime time.Time
@@ -161,21 +168,21 @@ type peerCapability struct {
 	lastObservationTime time.Time
 }
 
-// An observer that records at most maxPeerCount distinct peers; a non-positive
-// count takes the default of 1024.
-func NewPeerCapabilityObservations(maxPeerCount int) *PeerCapabilityObservations {
+// A recorder of at most maxPeerCount distinct peers; a non-positive count takes
+// the default of 1024.
+func NewPeerCapabilityRecorder(maxPeerCount int) *PeerCapabilityRecorder {
 	if maxPeerCount <= 0 {
-		maxPeerCount = defaultPeerCapabilityObservationMaxPeerCount
+		maxPeerCount = defaultPeerCapabilityRecorderMaxPeerCount
 	}
-	return &PeerCapabilityObservations{
+	return &PeerCapabilityRecorder{
 		maxPeerCount:       maxPeerCount,
 		peerIdCapabilities: map[Id]*peerCapability{},
 	}
 }
 
 // The evidence recorded for one peer, and false when nothing has been recorded
-// for it (always, for a nil observer).
-func (self *PeerCapabilityObservations) Get(peerId Id) (PeerCapabilityObservation, bool) {
+// for it (always, for a nil recorder).
+func (self *PeerCapabilityRecorder) Get(peerId Id) (PeerCapabilityObservation, bool) {
 	if self == nil {
 		return PeerCapabilityObservation{}, false
 	}
@@ -195,8 +202,8 @@ func (self *PeerCapabilityObservations) Get(peerId Id) (PeerCapabilityObservatio
 }
 
 // A copy of every recorded peer's evidence, ordered by peer id. Nil for a nil
-// observer.
-func (self *PeerCapabilityObservations) Snapshot() []PeerCapabilityObservation {
+// recorder.
+func (self *PeerCapabilityRecorder) Snapshot() []PeerCapabilityObservation {
 	if self == nil {
 		return nil
 	}
@@ -225,7 +232,7 @@ func (self *PeerCapabilityObservations) Snapshot() []PeerCapabilityObservation {
 
 // How many observations were not recorded because they named a new peer after
 // the bound was reached.
-func (self *PeerCapabilityObservations) DroppedPeerCount() uint64 {
+func (self *PeerCapabilityRecorder) DroppedPeerCount() uint64 {
 	if self == nil {
 		return 0
 	}
@@ -236,7 +243,7 @@ func (self *PeerCapabilityObservations) DroppedPeerCount() uint64 {
 
 // Records that a client-role epoch handed the peer its ClientHello, keeping the
 // first attempt's time.
-func (self *PeerCapabilityObservations) observeE2eAttempt(peerId Id) {
+func (self *PeerCapabilityRecorder) observeE2eAttempt(peerId Id) {
 	if self == nil || peerId == (Id{}) {
 		return
 	}
@@ -260,7 +267,7 @@ func (self *PeerCapabilityObservations) observeE2eAttempt(peerId Id) {
 
 // Records a completed handshake with the peer and its negotiated group, unless
 // a sealed session already supplied the group.
-func (self *PeerCapabilityObservations) observeE2eHandshake(peerId Id, keyExchange tls.CurveID) {
+func (self *PeerCapabilityRecorder) observeE2eHandshake(peerId Id, keyExchange tls.CurveID) {
 	if self == nil || peerId == (Id{}) {
 		return
 	}
@@ -284,7 +291,7 @@ func (self *PeerCapabilityObservations) observeE2eHandshake(peerId Id, keyExchan
 
 // Records a session whose epoch, negotiated with the given group, verified the
 // peer's identity proof and became established.
-func (self *PeerCapabilityObservations) observeE2eSealed(peerId Id, keyExchange tls.CurveID) {
+func (self *PeerCapabilityRecorder) observeE2eSealed(peerId Id, keyExchange tls.CurveID) {
 	if self == nil || peerId == (Id{}) {
 		return
 	}
@@ -308,7 +315,7 @@ func (self *PeerCapabilityObservations) observeE2eSealed(peerId Id, keyExchange 
 }
 
 // Records a send sequence's first acknowledgement from the peer.
-func (self *PeerCapabilityObservations) observeAck(peerId Id) {
+func (self *PeerCapabilityRecorder) observeAck(peerId Id) {
 	if self == nil || peerId == (Id{}) {
 		return
 	}
@@ -329,7 +336,7 @@ func (self *PeerCapabilityObservations) observeAck(peerId Id) {
 
 // Records a send sequence's first or larger receive window advertisement from
 // the peer.
-func (self *PeerCapabilityObservations) observeReceiveWindow(peerId Id, receiveWindowByteCount ByteCount) {
+func (self *PeerCapabilityRecorder) observeReceiveWindow(peerId Id, receiveWindowByteCount ByteCount) {
 	if self == nil || peerId == (Id{}) {
 		return
 	}
@@ -355,13 +362,13 @@ func (self *PeerCapabilityObservations) observeReceiveWindow(peerId Id, receiveW
 
 // The peer's record, created within the bound, or nil when the bound refuses a
 // new peer. Caller holds stateLock.
-func (self *PeerCapabilityObservations) capabilityWithLock(peerId Id) *peerCapability {
+func (self *PeerCapabilityRecorder) capabilityWithLock(peerId Id) *peerCapability {
 	if capability, ok := self.peerIdCapabilities[peerId]; ok {
 		return capability
 	}
 	maxPeerCount := self.maxPeerCount
 	if maxPeerCount <= 0 {
-		maxPeerCount = defaultPeerCapabilityObservationMaxPeerCount
+		maxPeerCount = defaultPeerCapabilityRecorderMaxPeerCount
 	}
 	if maxPeerCount <= len(self.peerIdCapabilities) {
 		self.droppedPeerCount += 1
@@ -375,7 +382,7 @@ func (self *PeerCapabilityObservations) capabilityWithLock(peerId Id) *peerCapab
 	return capability
 }
 
-func (self *PeerCapabilityObservations) now() time.Time {
+func (self *PeerCapabilityRecorder) now() time.Time {
 	if self.nowForTest != nil {
 		return self.nowForTest()
 	}
@@ -384,7 +391,7 @@ func (self *PeerCapabilityObservations) now() time.Time {
 
 // Runs the test rendezvous, outside the state lock, after a recorded
 // observation.
-func (self *PeerCapabilityObservations) afterObserve(peerId Id, recorded bool) {
+func (self *PeerCapabilityRecorder) afterObserve(peerId Id, recorded bool) {
 	if recorded && self.afterObserveForTest != nil {
 		self.afterObserveForTest(peerId)
 	}

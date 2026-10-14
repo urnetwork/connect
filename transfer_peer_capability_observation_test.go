@@ -14,29 +14,29 @@ import (
 	"time"
 )
 
-// Returns an observer whose clock steps one second per observation from a
+// Returns a recorder whose clock steps one second per observation from a
 // fixed origin, and the time of the nth (0-based) observation, so every
 // recorded time is exact.
-func newSteppedPeerCapabilityObservationsForTest(maxPeerCount int) (*PeerCapabilityObservations, func(n int) time.Time) {
+func newSteppedPeerCapabilityRecorderForTest(maxPeerCount int) (*PeerCapabilityRecorder, func(n int) time.Time) {
 	origin := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
-	observations := NewPeerCapabilityObservations(maxPeerCount)
+	recorder := NewPeerCapabilityRecorder(maxPeerCount)
 	var stepLock sync.Mutex
 	step := 0
-	observations.nowForTest = func() time.Time {
+	recorder.nowForTest = func() time.Time {
 		stepLock.Lock()
 		defer stepLock.Unlock()
 		at := origin.Add(time.Duration(step) * time.Second)
 		step += 1
 		return at
 	}
-	return observations, func(n int) time.Time {
+	return recorder, func(n int) time.Time {
 		return origin.Add(time.Duration(n) * time.Second)
 	}
 }
 
-func requirePeerCapabilityObservation(t *testing.T, observations *PeerCapabilityObservations, want PeerCapabilityObservation) {
+func requirePeerCapabilityObservation(t *testing.T, recorder *PeerCapabilityRecorder, want PeerCapabilityObservation) {
 	t.Helper()
-	got, ok := observations.Get(want.PeerId)
+	got, ok := recorder.Get(want.PeerId)
 	if !ok {
 		t.Fatalf("no evidence was recorded for %s", want.PeerId)
 	}
@@ -47,16 +47,16 @@ func requirePeerCapabilityObservation(t *testing.T, observations *PeerCapability
 
 // The prober's positive case: a ClientHello, a handshake that negotiated the
 // hybrid group, and the peer's identity proof sealing that epoch.
-func TestPeerCapabilityObservationsRecordPostQuantumSession(t *testing.T) {
-	observations, at := newSteppedPeerCapabilityObservationsForTest(0)
+func TestPeerCapabilityRecorderRecordPostQuantumSession(t *testing.T) {
+	recorder, at := newSteppedPeerCapabilityRecorderForTest(0)
 	peerId := NewId()
-	if _, ok := observations.Get(peerId); ok {
+	if _, ok := recorder.Get(peerId); ok {
 		t.Fatal("a peer nothing was observed for has a record")
 	}
 
-	observations.observeE2eAttempt(peerId)
-	observations.observeE2eHandshake(peerId, tls.X25519MLKEM768)
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	recorder.observeE2eAttempt(peerId)
+	recorder.observeE2eHandshake(peerId, tls.X25519MLKEM768)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		E2eAttempted:        true,
 		E2eFirstAttemptTime: at(0),
@@ -66,8 +66,8 @@ func TestPeerCapabilityObservationsRecordPostQuantumSession(t *testing.T) {
 		LastObservationTime: at(1),
 	})
 
-	observations.observeE2eSealed(peerId, tls.X25519MLKEM768)
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	recorder.observeE2eSealed(peerId, tls.X25519MLKEM768)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		E2eAttempted:        true,
 		E2eFirstAttemptTime: at(0),
@@ -81,14 +81,14 @@ func TestPeerCapabilityObservationsRecordPostQuantumSession(t *testing.T) {
 
 // A peer that seals but negotiates only the classical group is e2e capable
 // and not post-quantum.
-func TestPeerCapabilityObservationsRecordClassicalSession(t *testing.T) {
-	observations, at := newSteppedPeerCapabilityObservationsForTest(0)
+func TestPeerCapabilityRecorderRecordClassicalSession(t *testing.T) {
+	recorder, at := newSteppedPeerCapabilityRecorderForTest(0)
 	peerId := NewId()
 
-	observations.observeE2eAttempt(peerId)
-	observations.observeE2eHandshake(peerId, tls.X25519)
-	observations.observeE2eSealed(peerId, tls.X25519)
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	recorder.observeE2eAttempt(peerId)
+	recorder.observeE2eHandshake(peerId, tls.X25519)
+	recorder.observeE2eSealed(peerId, tls.X25519)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		E2eAttempted:        true,
 		E2eFirstAttemptTime: at(0),
@@ -102,13 +102,13 @@ func TestPeerCapabilityObservationsRecordClassicalSession(t *testing.T) {
 
 // A peer that never answers the ClientHello: attempted, with the first
 // attempt's time kept across a retry, and no session evidence.
-func TestPeerCapabilityObservationsRecordUnansweredAttempt(t *testing.T) {
-	observations, at := newSteppedPeerCapabilityObservationsForTest(0)
+func TestPeerCapabilityRecorderRecordUnansweredAttempt(t *testing.T) {
+	recorder, at := newSteppedPeerCapabilityRecorderForTest(0)
 	peerId := NewId()
 
-	observations.observeE2eAttempt(peerId)
-	observations.observeE2eAttempt(peerId)
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	recorder.observeE2eAttempt(peerId)
+	recorder.observeE2eAttempt(peerId)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		E2eAttempted:        true,
 		E2eFirstAttemptTime: at(0),
@@ -118,12 +118,12 @@ func TestPeerCapabilityObservationsRecordUnansweredAttempt(t *testing.T) {
 
 // Acknowledgements alone (no session attempted, as under EncryptionModeOff)
 // say nothing about the end-to-end session.
-func TestPeerCapabilityObservationsRecordAcknowledgementsWithoutSession(t *testing.T) {
-	observations, at := newSteppedPeerCapabilityObservationsForTest(0)
+func TestPeerCapabilityRecorderRecordAcknowledgementsWithoutSession(t *testing.T) {
+	recorder, at := newSteppedPeerCapabilityRecorderForTest(0)
 	peerId := NewId()
 
-	observations.observeAck(peerId)
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	recorder.observeAck(peerId)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		AckObserved:         true,
 		LastObservationTime: at(0),
@@ -133,22 +133,22 @@ func TestPeerCapabilityObservationsRecordAcknowledgementsWithoutSession(t *testi
 // Before any seal the latest handshake's group is reported. A seal's group
 // replaces it and is not replaced by a later unauthenticated handshake; only a
 // later seal replaces it.
-func TestPeerCapabilityObservationsSealedKeyExchangeOutranksLaterHandshake(t *testing.T) {
-	observations, at := newSteppedPeerCapabilityObservationsForTest(0)
+func TestPeerCapabilityRecorderSealedKeyExchangeOutranksLaterHandshake(t *testing.T) {
+	recorder, at := newSteppedPeerCapabilityRecorderForTest(0)
 	peerId := NewId()
 
-	observations.observeE2eHandshake(peerId, tls.X25519MLKEM768)
-	observations.observeE2eHandshake(peerId, tls.X25519)
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	recorder.observeE2eHandshake(peerId, tls.X25519MLKEM768)
+	recorder.observeE2eHandshake(peerId, tls.X25519)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		E2eNegotiated:       true,
 		KeyExchange:         "X25519",
 		LastObservationTime: at(1),
 	})
 
-	observations.observeE2eSealed(peerId, tls.X25519MLKEM768)
-	observations.observeE2eHandshake(peerId, tls.X25519)
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	recorder.observeE2eSealed(peerId, tls.X25519MLKEM768)
+	recorder.observeE2eHandshake(peerId, tls.X25519)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		E2eNegotiated:       true,
 		E2eSealed:           true,
@@ -157,8 +157,8 @@ func TestPeerCapabilityObservationsSealedKeyExchangeOutranksLaterHandshake(t *te
 		LastObservationTime: at(3),
 	})
 
-	observations.observeE2eSealed(peerId, tls.X25519)
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	recorder.observeE2eSealed(peerId, tls.X25519)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		E2eNegotiated:       true,
 		E2eSealed:           true,
@@ -208,29 +208,29 @@ func TestPostQuantumKeyExchangeClassification(t *testing.T) {
 
 // An acknowledgement without the field is the legacy reading; zero is a real
 // advertisement; the record keeps the largest value any sequence advertised.
-func TestPeerCapabilityObservationsRecordReceiveWindow(t *testing.T) {
-	observations, at := newSteppedPeerCapabilityObservationsForTest(0)
+func TestPeerCapabilityRecorderRecordReceiveWindow(t *testing.T) {
+	recorder, at := newSteppedPeerCapabilityRecorderForTest(0)
 	peerId := NewId()
 
-	observations.observeAck(peerId)
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	recorder.observeAck(peerId)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		AckObserved:         true,
 		LastObservationTime: at(0),
 	})
 
-	observations.observeReceiveWindow(peerId, 0)
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	recorder.observeReceiveWindow(peerId, 0)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		AckObserved:         true,
 		WindowAdvertised:    true,
 		LastObservationTime: at(1),
 	})
 
-	observations.observeReceiveWindow(peerId, 8*1024*1024)
+	recorder.observeReceiveWindow(peerId, 8*1024*1024)
 	// a second sequence's first advertisement can be smaller
-	observations.observeReceiveWindow(peerId, 4*1024*1024)
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	recorder.observeReceiveWindow(peerId, 4*1024*1024)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:                    peerId,
 		AckObserved:               true,
 		WindowAdvertised:          true,
@@ -241,37 +241,37 @@ func TestPeerCapabilityObservationsRecordReceiveWindow(t *testing.T) {
 
 // The bound refuses a new peer, counts it, and keeps updating the peers it
 // holds. The control plane is never a peer. Reads are ordered copies.
-func TestPeerCapabilityObservationsBoundAndControlPlane(t *testing.T) {
-	observations := NewPeerCapabilityObservations(2)
+func TestPeerCapabilityRecorderBoundAndControlPlane(t *testing.T) {
+	recorder := NewPeerCapabilityRecorder(2)
 	peerIds := []Id{NewId(), NewId()}
 	pastBoundPeerId := NewId()
 
 	for _, peerId := range peerIds {
-		observations.observeAck(peerId)
+		recorder.observeAck(peerId)
 	}
-	observations.observeAck(pastBoundPeerId)
-	observations.observeReceiveWindow(ControlId, 1)
-	observations.observeE2eAttempt(ControlId)
+	recorder.observeAck(pastBoundPeerId)
+	recorder.observeReceiveWindow(ControlId, 1)
+	recorder.observeE2eAttempt(ControlId)
 
-	if _, ok := observations.Get(pastBoundPeerId); ok {
+	if _, ok := recorder.Get(pastBoundPeerId); ok {
 		t.Fatal("a peer past the bound was recorded")
 	}
-	if _, ok := observations.Get(ControlId); ok {
+	if _, ok := recorder.Get(ControlId); ok {
 		t.Fatal("the control plane was recorded as a peer")
 	}
-	if dropped := observations.DroppedPeerCount(); dropped != 1 {
+	if dropped := recorder.DroppedPeerCount(); dropped != 1 {
 		t.Fatalf("dropped peer count = %d, want 1 (the control plane is ignored, not dropped)", dropped)
 	}
 
-	observations.observeReceiveWindow(peerIds[0], 4096)
-	if observation, _ := observations.Get(peerIds[0]); !observation.WindowAdvertised || observation.MaxReceiveWindowByteCount != 4096 {
+	recorder.observeReceiveWindow(peerIds[0], 4096)
+	if observation, _ := recorder.Get(peerIds[0]); !observation.WindowAdvertised || observation.MaxReceiveWindowByteCount != 4096 {
 		t.Fatalf("a held peer stopped updating at the bound: %+v", observation)
 	}
 
 	slices.SortFunc(peerIds, func(a Id, b Id) int {
 		return a.Cmp(b)
 	})
-	snapshot := observations.Snapshot()
+	snapshot := recorder.Snapshot()
 	if len(snapshot) != len(peerIds) {
 		t.Fatalf("snapshot holds %d peers, want %d", len(snapshot), len(peerIds))
 	}
@@ -281,41 +281,41 @@ func TestPeerCapabilityObservationsBoundAndControlPlane(t *testing.T) {
 		}
 	}
 	snapshot[0].AckObserved = false
-	if observation, _ := observations.Get(snapshot[0].PeerId); !observation.AckObserved {
+	if observation, _ := recorder.Get(snapshot[0].PeerId); !observation.AckObserved {
 		t.Fatal("a snapshot aliases the recorded evidence")
 	}
 }
 
-// A nil observer is inert, and the zero value records with the default bound.
-func TestPeerCapabilityObservationsNilAndZeroValue(t *testing.T) {
-	var nilObservations *PeerCapabilityObservations
+// A nil recorder is inert, and the zero value records with the default bound.
+func TestPeerCapabilityRecorderNilAndZeroValue(t *testing.T) {
+	var nilRecorder *PeerCapabilityRecorder
 	peerId := NewId()
-	nilObservations.observeE2eAttempt(peerId)
-	nilObservations.observeE2eHandshake(peerId, tls.X25519MLKEM768)
-	nilObservations.observeE2eSealed(peerId, tls.X25519MLKEM768)
-	nilObservations.observeAck(peerId)
-	nilObservations.observeReceiveWindow(peerId, 4096)
-	if _, ok := nilObservations.Get(peerId); ok {
-		t.Fatal("a nil observer returned evidence")
+	nilRecorder.observeE2eAttempt(peerId)
+	nilRecorder.observeE2eHandshake(peerId, tls.X25519MLKEM768)
+	nilRecorder.observeE2eSealed(peerId, tls.X25519MLKEM768)
+	nilRecorder.observeAck(peerId)
+	nilRecorder.observeReceiveWindow(peerId, 4096)
+	if _, ok := nilRecorder.Get(peerId); ok {
+		t.Fatal("a nil recorder returned evidence")
 	}
-	if snapshot := nilObservations.Snapshot(); snapshot != nil {
-		t.Fatalf("a nil observer returned a snapshot: %+v", snapshot)
+	if snapshot := nilRecorder.Snapshot(); snapshot != nil {
+		t.Fatalf("a nil recorder returned a snapshot: %+v", snapshot)
 	}
-	if dropped := nilObservations.DroppedPeerCount(); dropped != 0 {
-		t.Fatalf("a nil observer dropped %d peers", dropped)
+	if dropped := nilRecorder.DroppedPeerCount(); dropped != 0 {
+		t.Fatalf("a nil recorder dropped %d peers", dropped)
 	}
 
-	var zero PeerCapabilityObservations
-	for range defaultPeerCapabilityObservationMaxPeerCount + 1 {
+	var zero PeerCapabilityRecorder
+	for range defaultPeerCapabilityRecorderMaxPeerCount + 1 {
 		zero.observeAck(NewId())
 	}
-	if n := len(zero.Snapshot()); n != defaultPeerCapabilityObservationMaxPeerCount {
-		t.Fatalf("the zero value holds %d peers, want the default bound %d", n, defaultPeerCapabilityObservationMaxPeerCount)
+	if n := len(zero.Snapshot()); n != defaultPeerCapabilityRecorderMaxPeerCount {
+		t.Fatalf("the zero value holds %d peers, want the default bound %d", n, defaultPeerCapabilityRecorderMaxPeerCount)
 	}
 	if dropped := zero.DroppedPeerCount(); dropped != 1 {
 		t.Fatalf("the zero value dropped %d peers, want 1", dropped)
 	}
-	if NewPeerCapabilityObservations(0).maxPeerCount != defaultPeerCapabilityObservationMaxPeerCount {
+	if NewPeerCapabilityRecorder(0).maxPeerCount != defaultPeerCapabilityRecorderMaxPeerCount {
 		t.Fatal("a non-positive bound did not take the default")
 	}
 }
@@ -323,8 +323,8 @@ func TestPeerCapabilityObservationsNilAndZeroValue(t *testing.T) {
 // Writers on every recording edge race readers of Get and Snapshot. Every read
 // is one consistent record, the largest window never moves backwards for a
 // reader, and because the writes commute the final state is exact.
-func TestPeerCapabilityObservationsConcurrentReadsAndWrites(t *testing.T) {
-	observations := NewPeerCapabilityObservations(0)
+func TestPeerCapabilityRecorderConcurrentReadsAndWrites(t *testing.T) {
+	recorder := NewPeerCapabilityRecorder(0)
 	peerIds := []Id{NewId(), NewId(), NewId()}
 	const writerCount = 4
 	const readerCount = 4
@@ -340,11 +340,11 @@ func TestPeerCapabilityObservationsConcurrentReadsAndWrites(t *testing.T) {
 			<-start
 			for round := range roundCount {
 				for _, peerId := range peerIds {
-					observations.observeE2eAttempt(peerId)
-					observations.observeE2eHandshake(peerId, tls.X25519)
-					observations.observeE2eSealed(peerId, tls.X25519MLKEM768)
-					observations.observeAck(peerId)
-					observations.observeReceiveWindow(peerId, ByteCount(writer*roundCount+round))
+					recorder.observeE2eAttempt(peerId)
+					recorder.observeE2eHandshake(peerId, tls.X25519)
+					recorder.observeE2eSealed(peerId, tls.X25519MLKEM768)
+					recorder.observeAck(peerId)
+					recorder.observeReceiveWindow(peerId, ByteCount(writer*roundCount+round))
 				}
 			}
 		}()
@@ -377,11 +377,11 @@ func TestPeerCapabilityObservationsConcurrentReadsAndWrites(t *testing.T) {
 				lastPeerIdMaxes[observation.PeerId] = observation.MaxReceiveWindowByteCount
 			}
 			for range roundCount {
-				for _, observation := range observations.Snapshot() {
+				for _, observation := range recorder.Snapshot() {
 					check(observation)
 				}
 				for _, peerId := range peerIds {
-					if observation, ok := observations.Get(peerId); ok {
+					if observation, ok := recorder.Get(peerId); ok {
 						check(observation)
 					}
 				}
@@ -397,7 +397,7 @@ func TestPeerCapabilityObservationsConcurrentReadsAndWrites(t *testing.T) {
 	}
 
 	for _, peerId := range peerIds {
-		observation, ok := observations.Get(peerId)
+		observation, ok := recorder.Get(peerId)
 		if !ok {
 			t.Fatalf("no evidence for %s", peerId)
 		}
@@ -420,7 +420,7 @@ func TestPeerCapabilityObservationsConcurrentReadsAndWrites(t *testing.T) {
 	}
 }
 
-// A real receiver's acknowledgement reaches the sender's observer through the
+// A real receiver's acknowledgement reaches the sender's recorder through the
 // production path, for a receiver that advertises its window and one that
 // does not (the legacy peer), on both ack wire encodings.
 func TestAcknowledgementsRecordReceiveWindowEvidence(t *testing.T) {
@@ -436,15 +436,15 @@ func TestAcknowledgementsRecordReceiveWindowEvidence(t *testing.T) {
 	}
 	for _, c := range cases {
 		synctest.Test(t, func(t *testing.T) {
-			observations := NewPeerCapabilityObservations(0)
+			recorder := NewPeerCapabilityRecorder(0)
 			fixture, _, _ := newAckRetirementFixture(t, TransportTypeH1, c.version, NewNoopLogger(), func(settings *ClientSettings) {
-				settings.PeerCapabilityObservations = observations
+				settings.PeerCapabilityRecorder = recorder
 				settings.ReceiveBufferSettings.AdvertiseReceiveWindow = c.advertise
 			})
 			receiverId := fixture.receiver.ClientId()
 
 			pack := fixture.write(64)
-			if _, ok := observations.Get(receiverId); ok {
+			if _, ok := recorder.Get(receiverId); ok {
 				t.Fatalf("v%d advertise=%t: evidence before the peer acknowledged anything", c.version, c.advertise)
 			}
 			ack := fixture.receive(pack)
@@ -453,7 +453,7 @@ func TestAcknowledgementsRecordReceiveWindowEvidence(t *testing.T) {
 			}
 			fixture.forward(ack, fixture.senderIn)
 
-			observation, ok := observations.Get(receiverId)
+			observation, ok := recorder.Get(receiverId)
 			if !ok {
 				t.Fatalf("v%d advertise=%t: the acknowledgement recorded no evidence", c.version, c.advertise)
 			}
@@ -480,17 +480,17 @@ func TestAcknowledgementsRecordReceiveWindowEvidence(t *testing.T) {
 // it: the edges that record have passed, so a steady acknowledgement stream with
 // an unchanged advertised window reaches no recording call at all.
 func TestAcknowledgementEvidenceDoesNotAllocatePerAcknowledgement(t *testing.T) {
-	observations := NewPeerCapabilityObservations(0)
+	recorder := NewPeerCapabilityRecorder(0)
 	recordingCount := 0
-	observations.afterObserveForTest = func(Id) {
+	recorder.afterObserveForTest = func(Id) {
 		recordingCount += 1
 	}
 	peerId := NewId()
 	sequence := &SendSequence{
-		client:                     &Client{},
-		destination:                peerId,
-		resendQueue:                newResendQueue(nil, 0),
-		peerCapabilityObservations: observations,
+		client:                 &Client{},
+		destination:            peerId,
+		resendQueue:            newResendQueue(nil, 0),
+		peerCapabilityRecorder: recorder,
 	}
 	item := &sendItem{
 		transferItem: transferItem{messageId: NewId(), sequenceNumber: 7},
@@ -505,7 +505,7 @@ func TestAcknowledgementEvidenceDoesNotAllocatePerAcknowledgement(t *testing.T) 
 	}
 
 	sequence.coalesceReceivedAck(window, ack)
-	if observation, _ := observations.Get(peerId); !observation.AckObserved || !observation.WindowAdvertised ||
+	if observation, _ := recorder.Get(peerId); !observation.AckObserved || !observation.WindowAdvertised ||
 		observation.MaxReceiveWindowByteCount != 2*1024*1024 {
 		t.Fatalf("the first acknowledgement recorded %+v", observation)
 	}
@@ -573,14 +573,14 @@ func completedSequenceTlsConnsForTest(t *testing.T, serverCurves []tls.CurveID) 
 
 // A client that opts in, with encryption sessions in the given mode and its
 // background key publication parked, closed and joined at cleanup.
-func newPeerCapabilityClientForTest(t *testing.T, mode EncryptionMode, observations *PeerCapabilityObservations) *Client {
+func newPeerCapabilityClientForTest(t *testing.T, mode EncryptionMode, recorder *PeerCapabilityRecorder) *Client {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	settings := DefaultClientSettings()
 	settings.Log = NewNoopLogger()
 	settings.ControlPingTimeout = 0
 	settings.EncryptionSettings.Mode = mode
-	settings.PeerCapabilityObservations = observations
+	settings.PeerCapabilityRecorder = recorder
 	settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 	settings.EncryptionSettings.beforeEncryptedKeyPublishForTest = func() { <-ctx.Done() }
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
@@ -611,8 +611,8 @@ func TestEndToEndHandshakeRecordsItsKeyExchange(t *testing.T) {
 		{role: sequenceTlsRoleServer, serverCurves: []tls.CurveID{tls.X25519}, keyExchange: "X25519", postQuantum: false},
 	}
 	for _, c := range cases {
-		observations := NewPeerCapabilityObservations(0)
-		client := newPeerCapabilityClientForTest(t, EncryptionModeOpportunistic, observations)
+		recorder := NewPeerCapabilityRecorder(0)
+		client := newPeerCapabilityClientForTest(t, EncryptionModeOpportunistic, recorder)
 		peerId := NewId()
 		clientConn, serverConn := completedSequenceTlsConnsForTest(t, c.serverCurves)
 		tlsConn := clientConn
@@ -643,7 +643,7 @@ func TestEndToEndHandshakeRecordsItsKeyExchange(t *testing.T) {
 		}()
 
 		session.completeHandshake(e, nil)
-		observation, ok := observations.Get(peerId)
+		observation, ok := recorder.Get(peerId)
 		if !ok || !observation.E2eNegotiated || observation.E2eSealed ||
 			observation.KeyExchange != c.keyExchange || observation.PostQuantum != c.postQuantum {
 			t.Fatalf("%s %s: after the handshake, evidence %+v (recorded=%t)", c.role, c.keyExchange, observation, ok)
@@ -661,7 +661,7 @@ func TestEndToEndHandshakeRecordsItsKeyExchange(t *testing.T) {
 		}()
 		session.SetPeerClientPublicKey(peerPublicKey)
 		session.receivePeerIdentityProof(ed25519.Sign(peerPrivateKey, exporter))
-		observation, _ = observations.Get(peerId)
+		observation, _ = recorder.Get(peerId)
 		if !observation.E2eNegotiated || !observation.E2eSealed ||
 			observation.KeyExchange != c.keyExchange || observation.PostQuantum != c.postQuantum {
 			t.Fatalf("%s %s: after the seal, evidence %+v", c.role, c.keyExchange, observation)
@@ -685,17 +685,17 @@ func TestEndToEndHandshakeRecordsItsKeyExchange(t *testing.T) {
 // recorded as an attempt. With no peer to answer it, that is all the evidence
 // says: the shape a provider without the responder leaves.
 func TestClientHelloRecordsEndToEndAttempt(t *testing.T) {
-	observations := NewPeerCapabilityObservations(0)
+	recorder := NewPeerCapabilityRecorder(0)
 	attemptedAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
-	observations.nowForTest = func() time.Time { return attemptedAt }
+	recorder.nowForTest = func() time.Time { return attemptedAt }
 	observedPeerIds := make(chan Id, 8)
-	observations.afterObserveForTest = func(peerId Id) {
+	recorder.afterObserveForTest = func(peerId Id) {
 		select {
 		case observedPeerIds <- peerId:
 		default:
 		}
 	}
-	client := newPeerCapabilityClientForTest(t, EncryptionModeOpportunistic, observations)
+	client := newPeerCapabilityClientForTest(t, EncryptionModeOpportunistic, recorder)
 	peerId := NewId()
 
 	session := client.EncryptionSessionManager().AcquireForSend(peerId, sequenceTlsRoleClient, false, false, false)
@@ -712,7 +712,7 @@ func TestClientHelloRecordsEndToEndAttempt(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the client-role epoch handed no ClientHello to the transfer path")
 	}
-	requirePeerCapabilityObservation(t, observations, PeerCapabilityObservation{
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		E2eAttempted:        true,
 		E2eFirstAttemptTime: attemptedAt,
@@ -720,17 +720,17 @@ func TestClientHelloRecordsEndToEndAttempt(t *testing.T) {
 	})
 }
 
-// Under EncryptionModeOff an observer starts no session and so records no
+// Under EncryptionModeOff a recorder starts no session and so records no
 // end-to-end evidence, while a send sequence still captures it from its client
 // and records acknowledgement evidence.
 func TestEncryptionOffRecordsOnlyAcknowledgementEvidence(t *testing.T) {
-	observations := NewPeerCapabilityObservations(0)
-	client := newPeerCapabilityClientForTest(t, EncryptionModeOff, observations)
+	recorder := NewPeerCapabilityRecorder(0)
+	client := newPeerCapabilityClientForTest(t, EncryptionModeOff, recorder)
 	peerId := NewId()
 
 	if session := client.EncryptionSessionManager().AcquireForSend(peerId, sequenceTlsRoleClient, false, false, false); session != nil {
 		session.Release()
-		t.Fatal("an observer turned on an end-to-end session under EncryptionModeOff")
+		t.Fatal("a recorder turned on an end-to-end session under EncryptionModeOff")
 	}
 	sequence := NewSendSequence(context.Background(), client, client.sendBuffer, peerId,
 		MultiHopId{}, false, false, false, sequenceTlsRoleClient, false, client.settings.SendBufferSettings)
@@ -738,10 +738,10 @@ func TestEncryptionOffRecordsOnlyAcknowledgementEvidence(t *testing.T) {
 	if sequence.session != nil {
 		t.Fatal("a send sequence holds a session under EncryptionModeOff")
 	}
-	if sequence.peerCapabilityObservations != observations {
-		t.Fatal("the send sequence did not capture its client's observer")
+	if sequence.peerCapabilityRecorder != recorder {
+		t.Fatal("the send sequence did not capture its client's recorder")
 	}
-	if _, ok := observations.Get(peerId); ok {
+	if _, ok := recorder.Get(peerId); ok {
 		t.Fatal("evidence was recorded before any acknowledgement")
 	}
 
@@ -749,7 +749,7 @@ func TestEncryptionOffRecordsOnlyAcknowledgementEvidence(t *testing.T) {
 		receiveWindowSet:       true,
 		receiveWindowByteCount: 64 * 1024,
 	})
-	observation, ok := observations.Get(peerId)
+	observation, ok := recorder.Get(peerId)
 	want := PeerCapabilityObservation{
 		PeerId:                    peerId,
 		AckObserved:               true,
