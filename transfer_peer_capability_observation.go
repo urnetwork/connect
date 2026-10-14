@@ -131,17 +131,18 @@ type PeerCapabilityObservation struct {
 // Safe for concurrent use. One small leaf lock guards the records: it is taken
 // at the rare recording edges and by reads, and nothing is acquired while it is
 // held. Retained memory is one record per distinct peer, at most the bound
-// given to `NewPeerCapabilityRecorder`; a peer first seen past it is not
-// recorded and is counted by `DroppedPeerCount`. The zero value is ready to
-// use with the default bound of 1024 peers. Create one per owner, never one
-// per process: the bound and the records belong to that owner. Do not copy it
-// after first use.
+// given to `NewPeerCapabilityRecorder`; an observation naming a peer first
+// seen past it is not recorded and is counted by `DroppedObservationCount`,
+// once per refused observation, since the bound keeps no memory of the peers
+// it refused. The zero value is ready to use with the default bound of 1024
+// peers. Create one per owner, never one per process: the bound and the
+// records belong to that owner. Do not copy it after first use.
 type PeerCapabilityRecorder struct {
 	maxPeerCount int
 
-	stateLock          sync.Mutex
-	peerIdCapabilities map[Id]*peerCapability
-	droppedPeerCount   uint64
+	stateLock               sync.Mutex
+	peerIdCapabilities      map[Id]*peerCapability
+	droppedObservationCount uint64
 
 	// Nil in production; tests pin the observation clock.
 	nowForTest func() time.Time
@@ -230,15 +231,16 @@ func (self *PeerCapabilityRecorder) Snapshot() []PeerCapabilityObservation {
 	return observations
 }
 
-// How many observations were not recorded because they named a new peer after
-// the bound was reached.
-func (self *PeerCapabilityRecorder) DroppedPeerCount() uint64 {
+// How many observations were not recorded because they named a peer not held
+// when the bound was full. It counts observations, not peers: one refused peer
+// observed three times counts three.
+func (self *PeerCapabilityRecorder) DroppedObservationCount() uint64 {
 	if self == nil {
 		return 0
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.droppedPeerCount
+	return self.droppedObservationCount
 }
 
 // Records that a client-role epoch handed the peer its ClientHello, keeping the
@@ -371,7 +373,7 @@ func (self *PeerCapabilityRecorder) capabilityWithLock(peerId Id) *peerCapabilit
 		maxPeerCount = defaultPeerCapabilityRecorderMaxPeerCount
 	}
 	if maxPeerCount <= len(self.peerIdCapabilities) {
-		self.droppedPeerCount += 1
+		self.droppedObservationCount += 1
 		return nil
 	}
 	if self.peerIdCapabilities == nil {

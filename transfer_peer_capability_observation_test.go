@@ -239,8 +239,10 @@ func TestPeerCapabilityRecorderRecordReceiveWindow(t *testing.T) {
 	})
 }
 
-// The bound refuses a new peer, counts it, and keeps updating the peers it
-// holds. The control plane is never a peer. Reads are ordered copies.
+// The bound refuses a new peer and counts each observation it refuses, so one
+// refused peer seen three times counts three: the bound keeps no memory of the
+// peers it refused, which is what lets it bound memory. It keeps updating the
+// peers it holds. The control plane is never a peer. Reads are ordered copies.
 func TestPeerCapabilityRecorderBoundAndControlPlane(t *testing.T) {
 	recorder := NewPeerCapabilityRecorder(2)
 	peerIds := []Id{NewId(), NewId()}
@@ -250,6 +252,8 @@ func TestPeerCapabilityRecorderBoundAndControlPlane(t *testing.T) {
 		recorder.observeAck(peerId)
 	}
 	recorder.observeAck(pastBoundPeerId)
+	recorder.observeReceiveWindow(pastBoundPeerId, 4096)
+	recorder.observeE2eAttempt(pastBoundPeerId)
 	recorder.observeReceiveWindow(ControlId, 1)
 	recorder.observeE2eAttempt(ControlId)
 
@@ -259,8 +263,8 @@ func TestPeerCapabilityRecorderBoundAndControlPlane(t *testing.T) {
 	if _, ok := recorder.Get(ControlId); ok {
 		t.Fatal("the control plane was recorded as a peer")
 	}
-	if dropped := recorder.DroppedPeerCount(); dropped != 1 {
-		t.Fatalf("dropped peer count = %d, want 1 (the control plane is ignored, not dropped)", dropped)
+	if dropped := recorder.DroppedObservationCount(); dropped != 3 {
+		t.Fatalf("dropped observation count = %d, want 3: one refused peer observed three times (the control plane is ignored, not dropped)", dropped)
 	}
 
 	recorder.observeReceiveWindow(peerIds[0], 4096)
@@ -301,8 +305,8 @@ func TestPeerCapabilityRecorderNilAndZeroValue(t *testing.T) {
 	if snapshot := nilRecorder.Snapshot(); snapshot != nil {
 		t.Fatalf("a nil recorder returned a snapshot: %+v", snapshot)
 	}
-	if dropped := nilRecorder.DroppedPeerCount(); dropped != 0 {
-		t.Fatalf("a nil recorder dropped %d peers", dropped)
+	if dropped := nilRecorder.DroppedObservationCount(); dropped != 0 {
+		t.Fatalf("a nil recorder dropped %d observations", dropped)
 	}
 
 	var zero PeerCapabilityRecorder
@@ -312,8 +316,8 @@ func TestPeerCapabilityRecorderNilAndZeroValue(t *testing.T) {
 	if n := len(zero.Snapshot()); n != defaultPeerCapabilityRecorderMaxPeerCount {
 		t.Fatalf("the zero value holds %d peers, want the default bound %d", n, defaultPeerCapabilityRecorderMaxPeerCount)
 	}
-	if dropped := zero.DroppedPeerCount(); dropped != 1 {
-		t.Fatalf("the zero value dropped %d peers, want 1", dropped)
+	if dropped := zero.DroppedObservationCount(); dropped != 1 {
+		t.Fatalf("the zero value dropped %d observations, want 1", dropped)
 	}
 	if NewPeerCapabilityRecorder(0).maxPeerCount != defaultPeerCapabilityRecorderMaxPeerCount {
 		t.Fatal("a non-positive bound did not take the default")

@@ -703,7 +703,7 @@ Test-infrastructure lessons (reusable):
   before `NewClient`; every client given the same recorder records into it, so a
   multi-client that rotates window clients toward one provider keeps the evidence
   each of them saw. Reads: `Get(peerId)`, `Snapshot()` (ordered by peer id),
-  `DroppedPeerCount()`.
+  `DroppedObservationCount()`.
 - **Why:** a peer's reported version does not say what it negotiates — a custom
   build lineage can carry either capability or neither — so a prober measures
   instead of trusting the version.
@@ -755,8 +755,10 @@ Test-infrastructure lessons (reusable):
     `MaxReceiveWindowByteCount` is the largest value any sequence was offered,
     clamped at 2^32-1 as the sender keeps it; with `WindowAdvertised`, zero is a
     real advertisement (no out-of-order capacity).
-  - The zero id (`ControlId`) is never a peer. A peer first seen past the bound
-    (default 1024) is not recorded and is counted by `DroppedPeerCount`.
+  - The zero id (`ControlId`) is never a peer. An observation naming a peer
+    first seen past the bound (default 1024) is not recorded and is counted by
+    `DroppedObservationCount` — once per refused observation, not once per
+    peer, since the bound keeps no memory of the peers it refused.
 - **Limits:** e2e evidence appears only after the first handshake completes
   (a ClientHello, a server flight and the client Finished — at least one round
   trip plus TLS work); window evidence only after the first ack of retained data.
