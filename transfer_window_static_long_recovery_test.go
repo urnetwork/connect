@@ -5,7 +5,6 @@ package connect
 
 import (
 	"testing"
-	"testing/synctest"
 	"time"
 )
 
@@ -30,27 +29,19 @@ func checkWindowStaticLongRecovery(t *testing.T, roundTrip time.Duration, lanes 
 	const physicalRate ByteCount = 4000000
 	const opening ByteCount = 512 * 1024
 	residence := roundTrip + 10*time.Millisecond
-	var reference, candidate windowPathReading
-	for _, arm := range []string{"ceiling", "delivery"} {
-		synctest.Test(t, func(t *testing.T) {
-			cell := windowPathCell{
-				Arm: arm, RoundTrip: roundTrip, Compression: 10 * time.Millisecond,
-				Flows: lanes, Lanes: lanes, RoundRobinOffer: true,
-				Payload: 1280, Budget: mib(48), Rate: physicalRate,
-				Warmup: 64 * residence,
-			}
-			if arm == "delivery" {
-				cell.BootstrapWindow, cell.Drop = opening, true
-			}
-			reading := measureWindowPathCell(t, cell, 8*residence)
-			logWindowServiceReading(t, reading)
-			if arm == "ceiling" {
-				reference = reading
-			} else {
-				candidate = reading
-			}
-		})
-	}
+	readings := measureWindowPathArms(t, 8*residence, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
+		cell := windowPathCell{
+			Arm: arm, RoundTrip: roundTrip, Compression: 10 * time.Millisecond,
+			Flows: lanes, Lanes: lanes, RoundRobinOffer: true,
+			Payload: 1280, Budget: mib(48), Rate: physicalRate,
+			Warmup: 64 * residence,
+		}
+		if arm == "delivery" {
+			cell.BootstrapWindow, cell.Drop = opening, true
+		}
+		return cell
+	})
+	reference, candidate := readings[0], readings[1]
 	if reference.Cell.RoundTripAfter != 0 || candidate.Cell.RoundTripAfter != 0 ||
 		reference.Cell.RateAfter != 0 || candidate.Cell.RateAfter != 0 ||
 		candidate.Cell.BootstrapWindow != opening || reference.Cell.BootstrapWindow != 0 {
