@@ -4364,3 +4364,21 @@ Canonical cleanup passed and all owners joined; correctness separately found a
 test-fixture pool-ownership error. Bounded readiness diagnostics and deterministic
 fixture regression tests are under review. The failed evidence remains preserved,
 with no baseline promotion. See the [matching measurement ledger](../tests/PERFVAR-MEASUREMENTS.md#2026-10-14--device-continuation-round-02--partial-quiet-passes-failed-cell).
+
+### 2026-10-15: fresh synced run — partial iOS32 observation, Android64 pending
+
+Pixel/Wi-Fi/control H1 retained 22 samples across five quiet minutes, with
+26.22 MiB maximum observed Go-runtime memory and no sampled 32 MiB breach.
+H3 then timed out on public-window readiness and terminated instrumentation;
+the cell is invalid despite its partial quiet pass. Android64 was not reached.
+Neither profile is qualified, and Android does not prove the native iOS
+extension's under-50-MiB footprint.
+
+The tunnel Fast.com display helper accepted stable but still-running values;
+its deterministic repair now requires the terminal indicator without changing
+the 90-second deadline or 40 Mbps gate. Preserve old failed measurements.
+Independent TUN RX intervals were also below 40 Mbps, so the display bug alone
+does not explain the slowdown. Sampled packet/Transfer budgets were not full
+and no forced GC was recorded; increasing memory is not justified by this run.
+Next: trace native read/batch-send admission, then rerun the complete iOS32 /
+Android64 device matrix. See the [measurement checkpoint](../tests/PERFVAR-MEASUREMENTS.md#2026-10-15--synced-runner-checkpoint-incomplete-physical-qualification).
