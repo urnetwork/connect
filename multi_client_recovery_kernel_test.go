@@ -191,6 +191,10 @@ func runRecoveryKernel(t *testing.T, ipVersion int) {
 
 	settings := DefaultMultiClientSettings()
 	settings.TcpCollapsePrevention = false
+	// The topology stays in process: the providers' nats dial from the host,
+	// so the prober's qualification probes (UDP/53 to public resolvers,
+	// TCP/443 to public addresses) would leave the machine.
+	settings.ProviderProbe = false
 	settings.AckTimeout = time.Duration(recoveryEnvInt("URNET_REC_ACK_MS", 30000)) * time.Millisecond
 	settings.StatsWindowDuration = time.Duration(recoveryEnvInt("URNET_REC_STATSWIN_MS", 30000)) * time.Millisecond
 	settings.StatsWindowBucketDuration = time.Duration(recoveryEnvInt("URNET_REC_BUCKET_MS", 1000)) * time.Millisecond

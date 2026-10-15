@@ -302,6 +302,10 @@ func TestUpgradeMuxDefaultDnsThroughTunnel(t *testing.T) {
 	multiSettings := DefaultMultiClientSettings()
 	multiSettings.TcpCollapsePrevention = false
 	multiSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
+	// The provider's nat dials from the host, so the prober's qualification
+	// probes (UDP/53 to public resolvers, TCP/443 to public addresses) would
+	// leave the machine whenever a scan ran before the exit's first reply.
+	multiSettings.ProviderProbe = false
 	multi := NewRemoteUserNatMultiClient(ctx, testMultiClientGenerator(providerClient), mux.Receive, protocol.ProvideMode_Network, multiSettings)
 	defer multi.Close()
 	mux.SetUpstream(multi.SendPacket)
