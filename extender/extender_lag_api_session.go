@@ -200,15 +200,18 @@ type lagApiRttMessage struct {
 }
 
 type lagApiUploadedMessage struct {
-	Type  string `json:"type"`
-	Bytes uint64 `json:"bytes"`
-	Ms    int64  `json:"ms"`
+	Type  string  `json:"type"`
+	Bytes uint64  `json:"bytes"`
+	Ms    int64   `json:"ms"`
+	At    float64 `json:"at"`
 }
 
 type lagApiLoadResultMessage struct {
 	Type           string `json:"type"`
 	UploadVerified bool   `json:"uploadVerified"`
 	EndReason      string `json:"endReason"`
+	// nil, and so left out, when the upload had no first byte
+	UploadBytes []uint64 `json:"uploadBytes,omitzero"`
 }
 
 type lagApiErrorMessage struct {
@@ -272,10 +275,12 @@ func (self *lagApiPingRing) between(startTime time.Time, endTime time.Time) []la
 
 // The download bytes per interval as the browser reported them (M4, M8). Each
 // report is cumulative from the browser's first byte; the growth since the one
-// before goes to the interval the report's time closes. It holds no more
-// intervals than the download's window has, a report from past the window and
-// half an interval is not counted, and nothing is ever past what the extender
-// wrote.
+// before goes to the interval the report's time closes. Every interval a
+// report closes is in the series, one that brought nothing new as a zero, as
+// the browser's own figures count it, so a quiet end of the window is not left
+// out of the signed p50 (amendment 14). It holds no more intervals than the
+// download's window has, a report from past the window and half an interval is
+// not counted, and nothing is ever past what the extender wrote.
 type lagApiReceivedSeries struct {
 	counts         [lagApiMaxIntervalCount]uint64
 	lastCumulative uint64
@@ -293,16 +298,17 @@ func (self *lagApiReceivedSeries) add(ms float64, cumulative float64, writtenByt
 	if downloadMs+intervalMs/2 < ms {
 		return
 	}
+	// never past the window's intervals, ceil(downloadMs / intervalMs)
+	intervalCount := min(len(self.counts), max(1, int(math.Ceil(downloadMs/intervalMs))))
+	index := min(intervalCount-1, max(0, int(math.Round(ms/intervalMs))-1))
+	// the interval is in the series whether or not it brought new bytes
+	self.lastIndex = max(self.lastIndex, index+1)
 	cumulativeByteCount := uint64(min(cumulative, float64(writtenByteCount)))
 	if cumulativeByteCount <= self.lastCumulative {
 		return
 	}
-	// never past the window's intervals, ceil(downloadMs / intervalMs)
-	intervalCount := min(len(self.counts), max(1, int(math.Ceil(downloadMs/intervalMs))))
-	index := min(intervalCount-1, max(0, int(math.Round(ms/intervalMs))-1))
 	self.counts[index] += cumulativeByteCount - self.lastCumulative
 	self.lastCumulative = cumulativeByteCount
-	self.lastIndex = max(self.lastIndex, index+1)
 }
 
 func (self *lagApiReceivedSeries) values() []uint64 {
@@ -958,18 +964,30 @@ func (self *lagApiSession) run() {
 	defer reportTimer.Stop()
 	var reportC <-chan time.Time
 
-	// the upload's progress (M4): what was verified in the window so far, and
-	// how far into the window that is -- its whole length once it has ended
+	// the upload's progress (M4): the bytes counted in the window so far; ms,
+	// how far into the window that is -- its whole length once it has ended;
+	// and at, when the latest counted read arrived, in ms to the microsecond,
+	// which the browser builds its series from (amendment 14). at is held to
+	// ms, and neither goes back from one progress to the next: now is read
+	// before the phase's state, so a phase that ends after this progress ends
+	// no earlier than its time.
 	writeUploaded := func(load *lagApiLoad) bool {
+		now := time.Now()
+		byteCount, countedTime := load.upload.progress()
 		firstByteTime, endedTime, _ := load.upload.state()
 		if endedTime.IsZero() {
-			endedTime = time.Now()
+			endedTime = now
 		}
-		elapsed := max(0, min(endedTime.Sub(firstByteTime), self.uploadDuration))
+		ms := max(0, min(endedTime.Sub(firstByteTime), self.uploadDuration)).Milliseconds()
+		at := 0.0
+		if !countedTime.IsZero() {
+			at = max(0, min(float64(ms), float64(countedTime.Sub(firstByteTime).Microseconds())/1000))
+		}
 		return self.write(&lagApiUploadedMessage{
 			Type:  "uploaded",
-			Bytes: load.upload.total(),
-			Ms:    elapsed.Milliseconds(),
+			Bytes: byteCount,
+			Ms:    ms,
+			At:    at,
 		})
 	}
 
@@ -1015,16 +1033,25 @@ func (self *lagApiSession) run() {
 		return true
 	}
 
-	// ends the load with its result to the browser (M4)
+	// ends the load with its result to the browser (M4), which, once the
+	// upload had its first byte, carries the upload's series exactly as the
+	// report will sign it: the load is settled, so its phases have ended and
+	// the series is final (amendment 14)
 	resultLoad := func(load *lagApiLoad) bool {
 		load.ended = true
 		doneTimer.Stop()
 		doneC = nil
-		return self.write(&lagApiLoadResultMessage{
+		result := &lagApiLoadResultMessage{
 			Type:           "loadResult",
 			UploadVerified: load.uploadVerified(),
 			EndReason:      lagApiEndReasonText(load.endReason),
-		})
+		}
+		if load.upload != nil {
+			if firstByteTime, _, _ := load.upload.state(); !firstByteTime.IsZero() {
+				result.UploadBytes = load.upload.windowValues()
+			}
+		}
+		return self.write(result)
 	}
 
 	// ends a load the extender cuts short -- a mismatch, a cap, a timeout --
@@ -1414,7 +1441,7 @@ func (self *lagApiSession) reportBody(now time.Time) *protocol.LagReportBody {
 		body.DownloadSentBytes = load.download.seriesValues()
 		body.DownloadStreams = uint32(load.download.streamCount())
 		if load.upload != nil {
-			body.UploadBytes = load.upload.seriesValues()
+			body.UploadBytes = load.upload.windowValues()
 			body.UploadStreams = uint32(load.upload.streamCount())
 		}
 		body.UploadVerified = load.uploadVerified()

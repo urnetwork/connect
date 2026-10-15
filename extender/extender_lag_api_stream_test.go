@@ -1,20 +1,27 @@
 package extender
 
 // Tests of the measurement streams (lag.dev/PLAN.md M5 to M7, T1): the
-// upload's keystream verification, exact and sampled, the stream refusals, the
+// upload's keystream verification, exact and sampled, its counting as each
+// read arrives and its accuracy (amendment 14), the stream refusals, the
 // window from the first byte, the daily budget, and flat memory over a 1 GiB
 // stream each way.
 
 import (
+	"cmp"
+	"context"
 	"crypto/aes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	mathrand "math/rand/v2"
 	"net/http"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -236,10 +243,12 @@ func TestLagApiCounterBlock(t *testing.T) {
 	}
 }
 
-// M6, M7: with AES instructions every message is checked; the exact stream is
-// counted whole, a short last message included; a changed byte, a text message
-// or a message after a short one each end the phase as a mismatch, close the
-// stream with 4400, and count nothing of what failed.
+// M6, M7: with AES instructions every read is checked as it arrives; the exact
+// stream is counted whole, a short last message included; a changed byte, a
+// text message or a message after a short one each end the phase as a
+// mismatch and close the stream with 4400. What arrived before the failure
+// stays counted -- for a changed byte, the reads of its message before the
+// one that holds it -- and nothing from the failure on is.
 func TestLagApiUploadExact(t *testing.T) {
 	fixture := newLagApiFixture(t, nil)
 	fixture.api.exactVerification = true
@@ -301,120 +310,390 @@ func TestLagApiUploadExact(t *testing.T) {
 		if _, _, end := phase.state(); end != lagApiPhaseEndMismatch {
 			t.Errorf("%s: ended %d", name, end)
 		}
-		expected := map[string]uint64{
-			"changed byte":      3 * 65536,
-			"text message":      3 * 65536,
-			"after a short one": 2*65536 + 512,
-			"wrong stream":      0,
+		// a read is at most one TLS record, 16 KiB, and never runs past its
+		// message, so the read that holds a message's last byte starts at
+		// least 48 KiB into it
+		expected := map[string][2]uint64{
+			"changed byte":      {3*65536 + 49152, 3*65536 + 65535},
+			"text message":      {3 * 65536, 3 * 65536},
+			"after a short one": {2*65536 + 512, 2*65536 + 512},
+			"wrong stream":      {0, 0},
 		}[name]
-		if phase.total() != expected {
-			t.Errorf("%s: counted %d, expected %d", name, phase.total(), expected)
+		if counted := phase.total(); counted < expected[0] || expected[1] < counted {
+			t.Errorf("%s: counted %d, expected %d to %d", name, counted, expected[0], expected[1])
 		}
 	}
 }
 
-// A message that arrives in parts of partSize bytes, then ends.
+// An upload phase outside any session whose 5 s window opened at startTime,
+// with the ticket's cap and the daily budget given (0 is none).
+func testLagUploadPhase(startTime time.Time, maxStreamCount int, maxByteCount int64, budgetByteCount int64) *lagApiPhase {
+	api := &extenderLagApi{budget: newLagApiBudget(budgetByteCount)}
+	phase := newLagApiPhase(api, context.Background(), lagApiDirectionUpload,
+		5*time.Second, lagApiInterval, maxStreamCount, maxByteCount, time.Minute, func() {})
+	phase.window(startTime)
+	return phase
+}
+
+// A clock for a stream's reads: each reading is step past the one before.
+func testLagStepClock(startTime time.Time, step time.Duration) func() time.Time {
+	now := startTime
+	return func() time.Time {
+		now = now.Add(step)
+		return now
+	}
+}
+
+// A message that arrives in reads of at most partSize bytes, then ends.
 type testLagPartReader struct {
-	partSize  int
-	remaining int
+	message  []byte
+	partSize int
 }
 
 func (self *testLagPartReader) Read(buffer []byte) (int, error) {
-	if self.remaining <= 0 {
+	if len(self.message) == 0 {
 		return 0, io.EOF
 	}
-	n := min(self.partSize, self.remaining, len(buffer))
-	self.remaining -= n
+	n := copy(buffer[:min(self.partSize, len(buffer))], self.message)
+	self.message = self.message[n:]
 	return n, nil
 }
 
-// M8: an upload message's parts count in the interval they arrived in. A
-// 64 KiB message that straddles an interval boundary is split across the two
-// intervals by its parts' arrival, rather than counted whole where it ends;
-// a part on the far side of the window's end is a run of its own, which the
-// phase does not count; and a message never holds more runs than its fixed
-// size (M7).
-func TestLagApiUploadRunsSplitByArrival(t *testing.T) {
+// Amendment 14, rule S: each read of an upload stream counts as having arrived
+// evenly since the stream's previous read -- the window's first byte for its
+// first -- but never from more than lagSpreadMax before it, split at the
+// interval boundaries into whole bytes that sum to the read. The window's
+// first read, and a read at its stream's previous read's time, count whole
+// where they arrived. A read at or past the window's end counts nothing and
+// ends the phase by its time, and nothing counts after. Only counted reads
+// draw on the cap and move the latest arrival progress reports (M4).
+func TestLagApiUploadSpread(t *testing.T) {
 	startTime := time.Unix(1_700_000_000, 0)
-	at := func(offsets ...time.Duration) func() time.Time {
-		i := 0
-		return func() time.Time {
-			now := startTime.Add(offsets[min(i, len(offsets)-1)])
-			i += 1
-			return now
+	at := func(ms int) time.Time {
+		return startTime.Add(time.Duration(ms) * time.Millisecond)
+	}
+	phase := testLagUploadPhase(startTime, 4, 1024*1024*1024, 0)
+	defer phase.finish(lagApiPhaseEndClosed)
+	expectSeries := func(step string, expected ...uint64) {
+		t.Helper()
+		if values := phase.seriesValues(); !slices.Equal(values, expected) {
+			t.Fatalf("%s: series %v, expected %v", step, values, expected)
 		}
 	}
-	buffer := make([]byte, lagApiBufferByteCount)
-	runs := &lagApiRuns{}
 
-	// four 16 KiB parts, two either side of the 250 ms boundary
-	series := newLagApiSeries(startTime, lagApiInterval, 5*time.Second)
-	endTime := startTime.Add(5 * time.Second)
-	byteCount, err := lagApiReadMessage(
-		&testLagPartReader{partSize: 16 * 1024, remaining: 65536},
-		buffer,
-		series,
-		endTime,
-		at(200*time.Millisecond, 240*time.Millisecond, 260*time.Millisecond, 300*time.Millisecond),
-		runs,
-	)
-	if err != nil || byteCount != 65536 {
-		t.Fatalf("read %d: %v", byteCount, err)
+	// the window's first read, at its first byte, counts whole there; the
+	// stream's next spreads back to it, within interval 0
+	phase.receive(0, startTime, 1000)
+	phase.receive(0, at(200), 2000)
+	expectSeries("within an interval", 3000)
+	// 50 ms either side of the 250 ms boundary
+	phase.receive(0, at(300), 16384)
+	expectSeries("across a boundary", 3000+8192, 8192)
+	// a stream's first read spreads back to the window's first byte, not to
+	// another stream's read: 1001 bytes over 750 ms, a third in each
+	// interval, rounded at each cut so the pieces sum to the read
+	phase.receive(1, at(750), 1001)
+	expectSeries("a stream's first read", 11192+334, 8192+333, 334)
+	// a read at its stream's previous read's time counts whole there: on a
+	// boundary, in the interval it starts
+	phase.receive(1, at(750), 500)
+	expectSeries("no time since the stream's previous read", 11526, 8525, 334, 500)
+	// 2 s after its stream's previous read, a read spreads over the last
+	// lagSpreadMax only, 1300 to 2300 ms
+	phase.receive(0, at(2300), 4000)
+	expectSeries("after a stall", 11526, 8525, 334, 500, 0, 800, 1000, 1000, 1000, 200)
+	// a read that arrived before the latest counted one counts as well, and
+	// progress keeps the latest arrival
+	phase.receive(2, at(2000), 100)
+	expectSeries("an earlier arrival", 11526, 8525, 334, 500, 25, 825, 1025, 1025, 1000, 200)
+	if byteCount, countedTime := phase.progress(); byteCount != 24985 || !countedTime.Equal(at(2300)) {
+		t.Errorf("progress %d at %s", byteCount, countedTime.Sub(startTime))
 	}
-	if runs.count != 2 || runs.runs[0].byteCount != 32768 || runs.runs[1].byteCount != 32768 {
-		t.Fatalf("runs %+v", runs.runs[:runs.count])
+	// the window's last interval takes its share of a read just before the
+	// end; a read at the end counts nothing and ends the phase by its time,
+	// after which a read that arrived inside the window counts nothing either
+	phase.receive(0, at(4900), 1000)
+	phase.receive(1, at(5000), 7777)
+	phase.receive(2, at(4950), 100)
+	expectSeries("the window's end",
+		11526, 8525, 334, 500, 25, 825, 1025, 1025, 1000, 200, 0, 0, 0, 0, 0, 100, 250, 250, 250, 150)
+	if _, endedTime, end := phase.state(); end != lagApiPhaseEndTime || !endedTime.Equal(at(5000)) {
+		t.Errorf("ended %d at %s", end, endedTime.Sub(startTime))
 	}
-	for _, run := range runs.runs[:runs.count] {
-		series.add(run.time, run.byteCount)
-	}
-	if values := series.values(); len(values) != 2 || values[0] != 32768 || values[1] != 32768 {
-		t.Errorf("series %v, expected the message split 32768 and 32768", values)
-	}
-
-	// a window ending mid-interval: the part after its end is a run of its own
-	endTime = startTime.Add(4900 * time.Millisecond)
-	byteCount, err = lagApiReadMessage(
-		&testLagPartReader{partSize: 32 * 1024, remaining: 65536},
-		buffer,
-		series,
-		endTime,
-		at(4850*time.Millisecond, 4950*time.Millisecond),
-		runs,
-	)
-	if err != nil || byteCount != 65536 {
-		t.Fatalf("read %d: %v", byteCount, err)
-	}
-	if runs.count != 2 || !runs.runs[0].time.Before(endTime) || runs.runs[1].time.Before(endTime) {
-		t.Errorf("runs %+v, expected one each side of the window's end", runs.runs[:runs.count])
-	}
-
-	// a message slow enough to span more intervals than a message holds runs:
-	// the rest join its last run, and nothing is lost
-	offsets := []time.Duration{}
-	for i := 0; i < 64; i += 1 {
-		offsets = append(offsets, time.Duration(i)*lagApiInterval)
-	}
-	byteCount, err = lagApiReadMessage(
-		&testLagPartReader{partSize: 1024, remaining: 65536},
-		buffer,
-		series,
-		startTime.Add(time.Hour),
-		at(offsets...),
-		runs,
-	)
-	if err != nil || byteCount != 65536 {
-		t.Fatalf("read %d: %v", byteCount, err)
-	}
-	if runs.count != lagApiMaxRunCount || runs.byteCount() != 65536 {
-		t.Errorf("%d runs of %d bytes", runs.count, runs.byteCount())
+	if byteCount, countedTime := phase.progress(); byteCount != 25985 || !countedTime.Equal(at(4900)) ||
+		phase.consumed() != 25985 {
+		t.Errorf("progress %d at %s, %d drawn on the cap", byteCount, countedTime.Sub(startTime), phase.consumed())
 	}
 }
 
-// M8, through a stream: one 64 KiB message sent slowly, in frames over about a
-// second, as a slow uplink delivers it, is counted across the intervals its
-// parts arrived in -- not whole in the one interval where it ended, which read
-// as steps of 64 KiB per interval, 2.1 Mbps -- and still in full once checked.
-// Exact and sampled checking count the same way.
+// Amendment 14: a spread read's pieces are whole bytes that sum to the read,
+// each within a byte of its interval's exact share of the span; a span of no
+// length puts the read whole in the interval where it ends.
+func TestLagApiSeriesAddSpread(t *testing.T) {
+	startTime := time.Unix(1_700_000_000, 0)
+	random := mathrand.New(mathrand.NewPCG(14, 0))
+	for i := 0; i < 10000; i += 1 {
+		series := newLagApiSeries(startTime, lagApiInterval, 7*time.Second)
+		spanStart := time.Duration(random.Int64N(int64(5 * time.Second)))
+		spanEnd := spanStart + time.Duration(random.Int64N(int64(lagSpreadMax)+1))
+		if i%10 == 0 {
+			spanEnd = spanStart
+		}
+		byteCount := 1 + random.IntN(64*1024)
+		series.addSpread(startTime.Add(spanStart), startTime.Add(spanEnd), byteCount)
+		total := uint64(0)
+		for index, value := range series.values(0) {
+			total += value
+			share := 0.0
+			if spanEnd == spanStart {
+				if index == int(spanEnd/lagApiInterval) {
+					share = float64(byteCount)
+				}
+			} else {
+				overlap := min(spanEnd, time.Duration(index+1)*lagApiInterval) - max(spanStart, time.Duration(index)*lagApiInterval)
+				share = float64(byteCount) * float64(max(0, overlap)) / float64(spanEnd-spanStart)
+			}
+			// two roundings of half a byte at most, and the float error
+			if 1+1e-6 < math.Abs(float64(value)-share) {
+				t.Fatalf("%d bytes over %s to %s: interval %d took %d of a %.2f share", byteCount, spanStart, spanEnd, index, value, share)
+			}
+		}
+		if total != uint64(byteCount) {
+			t.Fatalf("%d bytes over %s to %s: counted %d", byteCount, spanStart, spanEnd, total)
+		}
+	}
+}
+
+// M8, amendment 14: the upload's series as the report signs it runs from the
+// window's first byte through the phase's end, the intervals that counted
+// nothing as zeros: the whole of a window that ran out, and through its end
+// for a phase that ended early. Before its end it runs through its last
+// counted interval. A download's sent series stays trimmed.
+func TestLagApiUploadWindowValues(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		newPhase := func() (*lagApiPhase, time.Time) {
+			api := &extenderLagApi{budget: newLagApiBudget(0)}
+			phase := newLagApiPhase(api, context.Background(), lagApiDirectionUpload,
+				5*time.Second, lagApiInterval, 1, 1024*1024*1024, time.Minute, func() {})
+			startTime := time.Now()
+			phase.window(startTime)
+			return phase, startTime
+		}
+
+		// bytes for 600 ms, then nothing until the window runs out
+		phase, startTime := newPhase()
+		phase.receive(0, startTime, 1000)
+		phase.receive(0, startTime.Add(600*time.Millisecond), 6000)
+		if values := phase.windowValues(); !slices.Equal(values, []uint64{3500, 2500, 1000}) {
+			t.Errorf("before the end: %v", values)
+		}
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		expected := append([]uint64{3500, 2500, 1000}, make([]uint64, 17)...)
+		if _, _, end := phase.state(); end != lagApiPhaseEndTime || !slices.Equal(phase.windowValues(), expected) {
+			t.Errorf("ended %d with %v", end, phase.windowValues())
+		}
+		if values := phase.seriesValues(); !slices.Equal(values, []uint64{3500, 2500, 1000}) {
+			t.Errorf("trimmed %v", values)
+		}
+
+		// closed 1.1 s in: five intervals, through the one the end falls in
+		phase, startTime = newPhase()
+		phase.receive(0, startTime, 1000)
+		time.Sleep(1100 * time.Millisecond)
+		phase.finish(lagApiPhaseEndClosed)
+		if _, _, end := phase.state(); end != lagApiPhaseEndClosed || !slices.Equal(phase.windowValues(), []uint64{1000, 0, 0, 0, 0}) {
+			t.Errorf("ended %d with %v", end, phase.windowValues())
+		}
+	})
+}
+
+// M3, M6: an upload's reads draw on the ticket's cap and the daily budget one
+// by one as they arrive, so the read that reaches either ends the phase as
+// capped, partway through a message, counted with the reads before it; nothing
+// after it counts.
+func TestLagApiUploadCapsPerRead(t *testing.T) {
+	// the window opens now: a cap reached once the window has run out by the
+	// clock is its time instead (finish)
+	startTime := time.Now()
+	for _, c := range []struct {
+		name            string
+		maxByteCount    int64
+		budgetByteCount int64
+	}{
+		{name: "cap", maxByteCount: 65536 + 20000},
+		{name: "budget", maxByteCount: 1024 * 1024 * 1024, budgetByteCount: 65536 + 20000},
+	} {
+		phase := testLagUploadPhase(startTime, 1, c.maxByteCount, c.budgetByteCount)
+		uploadKey := [16]byte{}
+		copy(uploadKey[:], testLagRandomBytes(16))
+		stream, err := newLagApiUploadStream(phase, uploadKey, 0, true, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := testLagStepClock(startTime, 10*time.Millisecond)
+		for _, message := range testLagUploadMessages(t, uploadKey, 0, 65536, 65536) {
+			if err := stream.readMessage(websocket.BinaryMessage, &testLagPartReader{message: message, partSize: 16384}, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// the second message's second read reached it
+		if _, _, end := phase.state(); end != lagApiPhaseEndCap || phase.total() != 65536+2*16384 {
+			t.Errorf("%s: ended %d with %d counted", c.name, end, phase.total())
+		}
+		phase.finish(lagApiPhaseEndClosed)
+	}
+}
+
+// M6, amendment 14: with AES instructions a read counts once it is checked,
+// as it arrives, so a changed byte partway through a message ends the phase
+// with the message's reads before it counted, and nothing from the read that
+// holds it on. Without them every read counts on arrival, and the sample is
+// chosen once its message has arrived whole: a chosen message that fails ends
+// the phase with all of its reads counted. Either way nothing after it counts.
+func TestLagApiUploadMismatchMidMessage(t *testing.T) {
+	startTime := time.Unix(1_700_000_000, 0)
+	for _, exact := range []bool{true, false} {
+		phase := testLagUploadPhase(startTime, 1, 1024*1024*1024, 0)
+		uploadKey := [16]byte{}
+		copy(uploadKey[:], testLagRandomBytes(16))
+		var reader *testLagPartReader
+		stream, err := newLagApiUploadStream(phase, uploadKey, 0, exact, func() bool {
+			if len(reader.message) != 0 {
+				t.Errorf("exact %t: chosen with %d bytes of its message to come", exact, len(reader.message))
+			}
+			return true
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages := testLagUploadMessages(t, uploadKey, 0, testLagRepeat(65536, 5)...)
+		// in message 3's third read
+		messages[3][2*16384+100] ^= 1
+		now := testLagStepClock(startTime, 10*time.Millisecond)
+		for _, message := range messages {
+			reader = &testLagPartReader{message: message, partSize: 16384}
+			if err := stream.readMessage(websocket.BinaryMessage, reader, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+		expected := uint64(4 * 65536)
+		if exact {
+			expected = 3*65536 + 2*16384
+		}
+		if _, _, end := phase.state(); end != lagApiPhaseEndMismatch || phase.total() != expected {
+			t.Errorf("exact %t: ended %d with %d counted, expected %d", exact, end, phase.total(), expected)
+		}
+		phase.finish(lagApiPhaseEndClosed)
+	}
+}
+
+// One read of a synthetic upload.
+type testLagRead struct {
+	arrivedTime time.Duration
+	streamIndex int
+	byteCount   int
+}
+
+// The reads of a synthetic upload on four streams (amendment 14's acceptance):
+// 16 KiB each, at rates that sum to mbps with each stream up to 30% off an
+// equal share, each from a random point in its own gap, with up to 5 ms of
+// jitter; in order of arrival, from the first at 0, which opens the window,
+// to past its end.
+func testLagUploadReads(mbps float64, seed uint64) []testLagRead {
+	random := mathrand.New(mathrand.NewPCG(seed, 0))
+	weights := make([]float64, 4)
+	weightSum := 0.0
+	for k := range weights {
+		weights[k] = 1 + 0.3*(2*random.Float64()-1)
+		weightSum += weights[k]
+	}
+	reads := []testLagRead{}
+	for k, weight := range weights {
+		gapSeconds := 16384 / (mbps * 1e6 / 8 * weight / weightSum)
+		for seconds := random.Float64() * gapSeconds; seconds < 8; seconds += gapSeconds {
+			reads = append(reads, testLagRead{
+				arrivedTime: time.Duration((seconds + 0.005*random.Float64()) * float64(time.Second)),
+				streamIndex: k,
+				byteCount:   16384,
+			})
+		}
+	}
+	slices.SortFunc(reads, func(a testLagRead, b testLagRead) int {
+		return cmp.Compare(a.arrivedTime, b.arrivedTime)
+	})
+	firstTime := reads[0].arrivedTime
+	for i := range reads {
+		reads[i].arrivedTime -= firstTime
+	}
+	return reads
+}
+
+// The p-th percentile by nearest rank, as the server's lagNearestRank (A5).
+func testLagNearestRank(values []float64, p float64) float64 {
+	values = slices.Sorted(slices.Values(values))
+	rank := int(math.Ceil(p / 100 * float64(len(values))))
+	return values[min(max(rank-1, 0), len(values)-1)]
+}
+
+// The upload p50 in Mbps the server derives from a 5 s window's series (A5):
+// over the intervals inside the window, as lagLoadIntervals keeps them.
+func testLagUploadP50Mbps(byteCounts []uint64) float64 {
+	intervalCount := int((5*time.Second + lagApiInterval - 1) / lagApiInterval)
+	mbps := []float64{}
+	for _, byteCount := range byteCounts[:min(intervalCount, len(byteCounts))] {
+		mbps = append(mbps, float64(byteCount)*8/float64(lagApiInterval.Microseconds()))
+	}
+	if len(mbps) == 0 {
+		return 0
+	}
+	return testLagNearestRank(mbps, 50)
+}
+
+// Amendment 14's acceptance, through the real counting: four upload streams of
+// 16 KiB reads at slightly unequal rates with a few ms of jitter, counted as
+// they arrive into a 5 s window of 250 ms intervals, give the p50 the server
+// derives within 2% of the true rate from 1 to 50 Mbps, in each of 200 such
+// uploads. At 0.5 Mbps a stream's reads come about lagSpreadMax apart or more,
+// so one upload's p50 can be several percent off; the median of the 200 is
+// within 5%. Counted whole where they arrived, as before, the same reads put
+// 3 Mbps at 3.15, 4 at 4.19 and 5 at 4.72 -- steps of one read per interval.
+func TestLagApiUploadSpreadAccuracy(t *testing.T) {
+	const uploadCount = 200
+	startTime := time.Unix(1_700_000_000, 0)
+	t.Logf("p50 error over %d uploads: Mbps, median, p10, p90, min, max", uploadCount)
+	for _, mbps := range []float64{0.5, 1, 2, 3, 4, 5, 10, 20, 50} {
+		errorPercents := []float64{}
+		for seed := uint64(0); seed < uploadCount; seed += 1 {
+			phase := testLagUploadPhase(startTime, 4, 1024*1024*1024*1024, 0)
+			for _, read := range testLagUploadReads(mbps, seed) {
+				phase.receive(read.streamIndex, startTime.Add(read.arrivedTime), read.byteCount)
+			}
+			// the window runs out, if no read past it has ended it already, and
+			// the series is the one the report signs
+			phase.window(startTime.Add(5 * time.Second))
+			errorPercents = append(errorPercents, 100*(testLagUploadP50Mbps(phase.windowValues())-mbps)/mbps)
+		}
+		median := testLagNearestRank(errorPercents, 50)
+		minPercent := slices.Min(errorPercents)
+		maxPercent := slices.Max(errorPercents)
+		t.Logf("%5.1f %+6.2f%% %+6.2f%% %+6.2f%% %+6.2f%% %+6.2f%%", mbps, median,
+			testLagNearestRank(errorPercents, 10), testLagNearestRank(errorPercents, 90), minPercent, maxPercent)
+		if mbps < 1 {
+			if 5 < math.Abs(median) {
+				t.Errorf("%.1f Mbps: the median p50 is off by %+.2f%%", mbps, median)
+			}
+		} else if minPercent < -2 || 2 < maxPercent {
+			t.Errorf("%.1f Mbps: p50s off by %+.2f%% to %+.2f%%", mbps, minPercent, maxPercent)
+		}
+	}
+}
+
+// M6, amendment 14, through a stream: one 64 KiB message sent slowly, in
+// frames over about a second, as a slow uplink delivers it, is counted as its
+// reads arrive, each spread over the time since the one before -- not whole in
+// the one interval where it ended, which read as steps of 64 KiB per interval,
+// 2.1 Mbps -- and in full. Exact and sampled checking count the same way.
 func TestLagApiUploadCountsBytesWhereTheyArrive(t *testing.T) {
 	for _, exact := range []bool{true, false} {
 		fixture := newLagApiFixture(t, nil)
@@ -462,7 +741,9 @@ func TestLagApiUploadCountsBytesWhereTheyArrive(t *testing.T) {
 
 // M6: without AES instructions one message in 16 is checked, chosen after it
 // arrives, at its own offset; a change in a message that was not chosen is
-// not seen, and one in a chosen message ends the phase.
+// not seen, and one in a chosen message ends the phase. Every read counts as
+// it arrives (amendment 14), so the chosen message that failed was counted,
+// and nothing after it is.
 func TestLagApiUploadSampled(t *testing.T) {
 	fixture := newLagApiFixture(t, nil)
 	fixture.api.exactVerification = false
@@ -503,7 +784,7 @@ func TestLagApiUploadSampled(t *testing.T) {
 	if code := upload.waitClosed(5 * time.Second); code != lagApiCloseCodeMismatch {
 		t.Errorf("sampled change: closed %d", code)
 	}
-	if phase.total() != 4*65536 {
+	if phase.total() != 5*65536 {
 		t.Errorf("counted %d", phase.total())
 	}
 
