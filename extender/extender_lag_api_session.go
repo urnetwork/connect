@@ -79,6 +79,11 @@ const lagApiPingRingCount = 320
 // path's.
 const lagApiPingPayloadByteCount = 16
 
+// The most lost pings a session keeps for their late pongs (M4). Pings are
+// lost at most once per loss timeout, so a pong timeout holds at most 7 at the
+// default timings.
+const lagApiMaxLostPingCount = 16
+
 // The timings of a session (M4, M8). Tests shorten them.
 type lagApiTimings struct {
 	// a ping with no pong within this is lost (M4)
@@ -234,7 +239,8 @@ type lagApiPong struct {
 	arrivalTime time.Time
 }
 
-// The ping in flight (M4): its random payload and when it was sent.
+// The ping in flight, or one counted lost (M4): its random payload and when it
+// was sent.
 type lagApiInFlightPing struct {
 	payload  string
 	sendTime time.Time
@@ -406,6 +412,16 @@ type lagApiSession struct {
 	// the ping in flight, which the loop sets before it sends and the pong
 	// handler matches against; nil when none is (M4)
 	inFlight atomic.Pointer[lagApiInFlightPing]
+	// the pings counted lost that were sent within the pong timeout, oldest
+	// first, which the loop replaces at each loss: a late pong for one of
+	// them never counts as a round trip, but it shows the page is still
+	// there (M4)
+	lostPings atomic.Pointer[[]lagApiInFlightPing]
+	// when the last pong that answered a ping sent within the pong timeout
+	// arrived, as its time since startTime: set by the pong handler, and read
+	// by the loop, which ends the session when none has come for the pong
+	// timeout (M4)
+	lastPongSinceStart atomic.Int64
 
 	stateLock sync.Mutex
 	// the session's load, nil before it; streams read it here
@@ -779,14 +795,23 @@ func (self *extenderLagApi) endLoad(session *lagApiSession) {
 func (self *lagApiSession) serve() {
 	conn := self.conn
 	conn.SetReadLimit(lagApiMaxControlMessageByteCount)
+	timings := self.api.timings
 	// stamped as it is read, so the round trip does not wait on the loop
 	conn.SetPongHandler(func(appData string) error {
 		arrivalTime := time.Now()
-		// only a pong that echoes the ping in flight, arriving after it was
-		// sent, counts (M4): a stale, forged or early one is dropped here, so
-		// no flood of them can crowd out the one that answers
 		inFlight := self.inFlight.Load()
-		if inFlight == nil || appData != inFlight.payload || arrivalTime.Before(inFlight.sendTime) {
+		answersInFlight := inFlight != nil && appData == inFlight.payload && !arrivalTime.Before(inFlight.sendTime)
+		// any pong that echoes a ping sent within the pong timeout shows the
+		// page is still there, one that comes after its ping was counted
+		// lost included (M4)
+		if answersInFlight || self.answersLostPing(appData, arrivalTime, timings.pongTimeout) {
+			self.lastPongSinceStart.Store(int64(arrivalTime.Sub(self.startTime)))
+		}
+		// only a pong that echoes the ping in flight, arriving after it was
+		// sent and within the loss timeout, counts as a round trip (M4): a
+		// late, stale, forged or early one is dropped here, so no flood of
+		// them can crowd out the one that answers
+		if !answersInFlight || timings.pingLost <= arrivalTime.Sub(inFlight.sendTime) {
 			return nil
 		}
 		select {
@@ -857,6 +882,47 @@ func (self *lagApiSession) serve() {
 	self.cancel()
 	<-loopDone
 	self.finish()
+}
+
+// Whether a pong echoes a ping counted lost that was sent within the pong
+// timeout of the pong's arrival (M4).
+func (self *lagApiSession) answersLostPing(appData string, arrivalTime time.Time, pongTimeout time.Duration) bool {
+	lostPings := self.lostPings.Load()
+	if lostPings == nil {
+		return false
+	}
+	for _, lostPing := range *lostPings {
+		if appData == lostPing.payload && arrivalTime.Sub(lostPing.sendTime) <= pongTimeout {
+			return true
+		}
+	}
+	return false
+}
+
+// Keeps a ping counted lost for the pong timeout, so that its late pong still
+// shows the page is there (M4), and lets go of the lost pings sent before
+// that. Only the loop calls it; the pong handler reads what it keeps.
+func (self *lagApiSession) addLostPing(lostPing lagApiInFlightPing, pongTimeout time.Duration) {
+	now := time.Now()
+	lostPings := []lagApiInFlightPing{}
+	if previousLostPings := self.lostPings.Load(); previousLostPings != nil {
+		for _, previousLostPing := range *previousLostPings {
+			if now.Sub(previousLostPing.sendTime) <= pongTimeout {
+				lostPings = append(lostPings, previousLostPing)
+			}
+		}
+	}
+	lostPings = append(lostPings, lostPing)
+	if lagApiMaxLostPingCount < len(lostPings) {
+		lostPings = lostPings[len(lostPings)-lagApiMaxLostPingCount:]
+	}
+	self.lostPings.Store(&lostPings)
+}
+
+// When the last pong that answered a ping sent within the pong timeout
+// arrived, or the session's start until one has (M4).
+func (self *lagApiSession) lastPongTime() time.Time {
+	return self.startTime.Add(time.Duration(self.lastPongSinceStart.Load()))
 }
 
 // Ends the session from the extender's side with a close (M4), and a load
@@ -1004,7 +1070,6 @@ func (self *lagApiSession) run() {
 	var lossC <-chan time.Time
 	inFlightPayload := ""
 	var inFlightSendTime time.Time
-	lastPongTime := self.startTime
 
 	// the load: the wait for the upload after the download, the upload's
 	// progress, the wait for the browser's done, and the report's minute
@@ -1305,7 +1370,6 @@ func (self *lagApiSession) run() {
 				break
 			}
 			self.inFlight.Store(nil)
-			lastPongTime = pong.arrivalTime
 			lossTimer.Stop()
 			lossC = nil
 			rtt := pong.arrivalTime.Sub(inFlightSendTime)
@@ -1325,6 +1389,9 @@ func (self *lagApiSession) run() {
 
 		case <-lossC:
 			lossC = nil
+			// kept before it stops being in flight, so its late pong always
+			// finds it as one or the other
+			self.addLostPing(lagApiInFlightPing{payload: inFlightPayload, sendTime: inFlightSendTime}, timings.pongTimeout)
 			self.inFlight.Store(nil)
 			self.pings.add(lagApiPing{sendTime: inFlightSendTime, lost: true})
 			ok = self.write(&lagApiRttMessage{
@@ -1332,9 +1399,10 @@ func (self *lagApiSession) run() {
 				T:    inFlightSendTime.Sub(self.startTime).Milliseconds(),
 				Lost: true,
 			})
-			if timings.pongTimeout <= time.Since(lastPongTime) {
-				// the page is gone: no pong for pongTimeout ends the session
-				// with 4408 (lag.dev/PLAN.md M4)
+			if timings.pongTimeout <= time.Since(self.lastPongTime()) {
+				// the page is gone: no pong that answers a ping for
+				// pongTimeout ends the session with 4408, while late pongs
+				// keep a slow page's session open (lag.dev/PLAN.md M4)
 				self.end(lagApiCloseCodeTimeout, "timeout", protocol.LagEndReason_LAG_END_CLIENT_CLOSED)
 				return
 			}
