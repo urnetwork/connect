@@ -708,6 +708,118 @@ Test-infrastructure lessons (reusable):
   missing-route window, and that contrast was the clue; drive one failing test to
   two isolated passes, then resume the full suite.
 
+### 3.13 Peer capability evidence — what a peer showed it negotiates
+
+- **Decision:** `PeerCapabilityRecorder` is an optional, owner-held recorder
+  of per-peer wire evidence for two capabilities: the end-to-end session of this
+  section (did a TLS 1.3 handshake complete, with which group, did it seal) and
+  resizable windows (do the peer's acks carry `Ack.receive_window_byte_count`,
+  THROUGHPUTFIX §37.3). A caller sets `ClientSettings.PeerCapabilityRecorder`
+  before `NewClient`; every client given the same recorder records into it, so a
+  multi-client that rotates window clients toward one provider keeps the evidence
+  each of them saw. Reads: `Get(peerId)`, `Snapshot()` (ordered by peer id),
+  `DroppedObservationCount()`.
+- **Why:** a peer's reported version does not say what it negotiates — a custom
+  build lineage can carry either capability or neither — so a prober measures
+  instead of trusting the version.
+- **Invariant — read-only, no per-packet cost:** recording changes no behaviour,
+  and the recorder never turns encryption on: sessions exist only when
+  `EncryptionSettings.Mode` is not `Off`, so under `Off` the e2e fields say
+  nothing about the peer. Nil (the default) costs one nil check at each edge.
+  Every edge is already rare. One small leaf lock guards the records, taken
+  only at those edges and by reads; nothing is acquired under it, so it is safe
+  under the sequence's `ackMutex`, which the ack edges run beneath:
+
+  | Edge | Site | Records |
+  |---|---|---|
+  | the send path accepts a client-role epoch's first outbox batch (its ClientHello) | `outboxLoop`, through `sendEncryptedControl`'s `afterSent` | `E2eAttempted`; `E2eFirstAttemptTime` keeps the first |
+  | a client-role handshake completes (the peer answered this client's ClientHello), current or superseded epoch | `completeHandshake` | `E2eNegotiated` (and `E2eAttempted`); `KeyExchange` unless a seal supplied it |
+  | a client-role session verifies the peer's identity proof and its epoch is promoted | `maybeVerifyPendingPeerIdentityProof` | `E2eSealed`, `KeyExchange` (before the Sealed event fires) |
+  | a send sequence's first acknowledgement, when it carries no window | `SendSequence.observeReceiveWindowAdvertisement` | `AckObserved` |
+  | a send sequence's first or larger window advertisement | same | `AckObserved`, `WindowAdvertised`, `MaxReceiveWindowByteCount`, in one step |
+
+  The ack edges ride the existing per-sequence atomics (`ackSeen`, the
+  `receiveWindowSetAtNanos` step), so a steady ack stream records nothing and
+  allocates nothing (`TestAcknowledgementEvidenceDoesNotAllocatePerAcknowledgement`).
+  An advertising first acknowledgement is one recording, not an acknowledgement
+  and then a window: between two, a reader would see `AckObserved` without
+  `WindowAdvertised`, the legacy reading, for a peer that advertises
+  (`TestAdvertisingFirstAcknowledgementIsOneRecording`).
+- **Reading the evidence:**
+  - Flags are sticky for the recorder's life: each records something the peer
+    did. A false flag is absence of evidence unless its precondition holds.
+  - Times are read inside the recording's critical section, so recording order
+    is time order: `LastObservationTime` never moves backwards, and "most
+    recent" in the rules below means recorded last
+    (`TestPeerCapabilityRecorderTimesFollowRecordingOrder`).
+  - `E2eAttempted` means the send path accepted a ClientHello, not merely that
+    one was produced: one that never reaches the send path is not an attempt
+    (`TestClientHelloAttemptIsRecordedAfterTheSendPathAcceptsIt`,
+    `TestClientHelloTheSendPathNeverTakesRecordsNoAttempt`). It can still be
+    lost on the way. `E2eNegotiated` implies it: a sender descheduled between
+    the hand-over and its record cannot leave an answer without its attempt.
+  - `E2eAttempted && !E2eNegotiated` is a ClientHello nobody answered — the
+    shape a provider without the responder (or with its sessions off) leaves,
+    and also what any provider looks like before its answer arrives, or when
+    the answer was lost. `E2eFirstAttemptTime` says how long it has had;
+    `TlsTimeout` (60s) fails the attempt, and `TlsInitialRetryInterval` (60s,
+    exponential, staggered) paces the next one.
+  - Only sessions this client initiates (the TLS client role) are evidence. So
+    `E2eNegotiated` alone is unauthenticated: the peer's TLS server answered
+    this client's ClientHello. `E2eSealed` means the peer's identity proof
+    verified against its identity key (§3.7's trust root and caveats apply).
+    A handshake the peer initiates, with this client as the TLS server, records
+    nothing even when it seals: its group is this client's choice from the
+    peer's offer rather than the peer's from this client's, and recorded too,
+    `KeyExchange` would depend on which of the two sessions completed last
+    (`TestPeerInitiatedHandshakeRecordsNoEvidence`).
+  - `KeyExchange` is the group the peer's responder chose from this client's
+    offer (`[X25519MLKEM768, X25519]`): that of the most recent *sealed*
+    session, or of the most recent completed handshake while none has sealed;
+    `PostQuantum` is that group carrying an ML-KEM component, classified by IANA
+    codepoint so it does not depend on which groups the toolchain names. So
+    `E2eSealed && PostQuantum` is an authenticated post-quantum key exchange
+    the peer's responder chose. `KeyExchange` is a string: the
+    `tls.CurveID.String()` name of the `tls.ConnectionState.CurveID` the
+    handshake reported (`PeerEncryptionState.KeyExchange` holds the same value
+    as a `tls.CurveID`); a group the toolchain does not name reads
+    `CurveID(<decimal codepoint>)`.
+  - `WindowAdvertised == false` reads as a legacy peer only with `AckObserved`.
+    `MaxReceiveWindowByteCount` is the largest value any sequence was offered,
+    clamped at 2^32-1 as the sender keeps it; with `WindowAdvertised`, zero is a
+    real advertisement (no out-of-order capacity).
+  - The zero id (`ControlId`) is never a peer. An observation naming a peer
+    first seen past the bound (default 1024) is not recorded and is counted by
+    `DroppedObservationCount` — once per refused observation, not once per
+    peer, since the bound keeps no memory of the peers it refused.
+- **Limits:** e2e evidence appears only after the first handshake completes
+  (a ClientHello, a server flight and the client Finished — at least one round
+  trip plus TLS work); window evidence only after the first ack of retained data.
+  The evidence is what this owner's clients observed of the peer, not a property
+  of the address: a peer that restarts into another build while observed folds
+  both builds' sticky evidence into its one record.
+- **Opting in a prober:** one recorder per probe owner (never per process), set
+  on every client settings value it generates, plus `EncryptionSettings.Mode =
+  EncryptionModeOpportunistic` to attempt sessions. Opportunistic is not free:
+  each attempt costs a handshake (a server flight of a few KiB, §2.5) and each
+  client its `EncryptedKey` publication, and once this side verifies the peer,
+  the probe's own application traffic is sealed. The peer can read it only
+  after verifying this client's identity proof in turn, with the key its
+  contracts or its `/key/<client_id>` fetch resolve for the probe's client id.
+  Until then the sealed frames are undecryptable there, and recovery runs
+  through the unknown-wrap nack (`handleUnknownWrapNack`), which demotes this
+  side's epoch only once the peer reports no readable epoch at all — after the
+  peer's own establishment window (`TlsTimeout`) has expired. A probe client
+  whose key a provider cannot resolve can therefore stall for that window, so
+  measure in a tunnel of its own, not in a URL measurement tunnel, until that
+  is ruled out.
+- **Code:** `transfer_peer_capability_observation.go` (`PeerCapabilityObservation`,
+  `PeerCapabilityRecorder`, `isPostQuantumKeyExchange`);
+  `transfer.go: ClientSettings.PeerCapabilityRecorder,
+  SendSequence.observeReceiveWindowAdvertisement`; `transfer_encrypt.go: outboxLoop,
+  completeHandshake, maybeVerifyPendingPeerIdentityProof`. Tests:
+  `transfer_peer_capability_observation_test.go`.
+
 ---
 
 ## 4. Contracts & contract manager
@@ -1262,6 +1374,7 @@ recover well with packet loss`.
 |---|---|
 | `transfer.go` | Sequences, packs, acks, resend, send/receive buffers, `Client.run`, settings |
 | `transfer_encrypt.go` | Per-peer wrapped-TLS encryption, `EncryptionSessionManager`, epochs |
+| `transfer_peer_capability_observation.go` | Per-peer wire evidence: e2e key exchange/seal, receive window advertisement (§3.13) |
 | `transfer_key.go` | `ClientKeyManager` (Ed25519 identity), cert-chain signing |
 | `transfer_contract_manager.go` | Contracts, `ContractKey`, queues, expiry, secrets |
 | `transfer_control_oob.go`, `transfer_oob_control.go` | Out-of-band control sync |

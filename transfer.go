@@ -1554,6 +1554,13 @@ type ClientSettings struct {
 	// Optional payload lifetime charges; nil disables packet-path accounting.
 	// Captured at construction independently from the worker ledger above.
 	PayloadOwnerLedger *TransferPayloadOwnerLedger
+	// Optional per-peer evidence of what each peer negotiates on the wire: the
+	// end-to-end session's key exchange and seal, and receive window
+	// advertisement on its acknowledgements (see PeerCapabilityRecorder).
+	// Nil, the default, records nothing. Captured at construction; clients of
+	// one owner may share it. It never changes behaviour: whether an
+	// end-to-end session is attempted is `EncryptionSettings.Mode`.
+	PeerCapabilityRecorder *PeerCapabilityRecorder
 
 	SendBufferSize    int
 	ForwardBufferSize int
@@ -1908,6 +1915,8 @@ type Client struct {
 	settings           *ClientSettings
 	memoryOwnerLedger  *TransferMemoryOwnerLedger
 	payloadOwnerLedger *TransferPayloadOwnerLedger
+	// from settings at construction; nil records nothing
+	peerCapabilityRecorder *PeerCapabilityRecorder
 
 	receiveCallbacks *CallbackList[ReceiveFunction]
 	forwardCallbacks *CallbackList[ForwardFunction]
@@ -2149,6 +2158,7 @@ func NewClientWithTag(
 		settings:                     settings,
 		memoryOwnerLedger:            settings.MemoryOwnerLedger,
 		payloadOwnerLedger:           settings.PayloadOwnerLedger,
+		peerCapabilityRecorder:       settings.PeerCapabilityRecorder,
 		receiveCallbacks:             NewCallbackList[ReceiveFunction](),
 		forwardCallbacks:             NewCallbackList[ForwardFunction](),
 		subprotocols:                 newSubprotocolRegistry(),
@@ -6712,6 +6722,11 @@ type SendSequence struct {
 	// `EncryptionSessionManager` at construction; released when the sequence
 	// terminates. Nil when encryption is disabled on this client.
 	session *peerEncryptionSession
+	// The client's capability evidence, captured at construction and told the
+	// first acknowledgement and each window step (`ackSeen`,
+	// `receiveWindowSetAtNanos`). Nil records nothing. Beside the other
+	// pointer so it costs one word, with no alignment padding.
+	peerCapabilityRecorder *PeerCapabilityRecorder
 }
 
 func NewSendSequence(
@@ -6839,6 +6854,7 @@ func newSendSequenceWithLogicalLane(
 		rttWindow:                      rttWindow,
 		windowPacer:                    windowBurstPacer{afterWaitForTest: sendBufferSettings.afterWindowPacingWaitForTest},
 		contractSeqIndex:               0,
+		peerCapabilityRecorder:         client.peerCapabilityRecorder,
 	}
 	if sendBufferSettings.ResendQueueRetainedByteAccounting {
 		seq.resendQueue.setLifetimeBudget()
@@ -11257,7 +11273,16 @@ func (self *SendSequence) observeReceiveWindowAdvertisement(ack receiveAckMessag
 	// without the field has a peer that does not advertise and takes its own
 	// constant. Those are different facts and the window is different for
 	// each (THROUGHPUTFIX §37.21).
-	self.ackSeen.Store(true)
+	firstAck := !self.ackSeen.Load() && !self.ackSeen.Swap(true)
+	if firstAck && !ack.receiveWindowSet {
+		// the sequence's first acknowledgement, once, carrying no window:
+		// capability evidence that the peer answers and does not advertise.
+		// An advertising first acknowledgement is recorded below together
+		// with its window, in one step, so that no reader can see the
+		// acknowledgement without the window and take the peer for legacy.
+		// It always steps: receiveWindowSet is set only after ackSeen.
+		self.peerCapabilityRecorder.observeAck(self.destination)
+	}
 	if ack.ackCompressTimeoutSet {
 		self.receiveAckCompressMicros.Store(uint64(ack.ackCompressTimeoutMicros) + 1)
 	}
@@ -11266,6 +11291,10 @@ func (self *SendSequence) observeReceiveWindowAdvertisement(ack receiveAckMessag
 	}
 	if !self.receiveWindowSet.Load() || self.receiveWindowByteCount.Load() < uint64(ack.receiveWindowByteCount) {
 		self.receiveWindowSetAtNanos.Store(time.Now().UnixNano())
+		// the first advertisement or an increase, the only acknowledgements
+		// that can raise the peer's largest advertised value; the recorder
+		// marks the acknowledgement itself observed in the same step
+		self.peerCapabilityRecorder.observeReceiveWindow(self.destination, ByteCount(ack.receiveWindowByteCount))
 	}
 	self.receiveWindowByteCount.Store(uint64(ack.receiveWindowByteCount))
 	self.receiveWindowSet.Store(true)
