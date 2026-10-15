@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -278,28 +279,98 @@ func TestPlatformTransportH3StreamLanesBackpressureWithoutDropping(t *testing.T)
 	}
 }
 
+// The release gate pins this name. A control echo is refused only once its
+// generation has ended: the offer then returns without waiting, gives back the
+// echo's pooled ownership and counts no refusal. A full queue on a live
+// generation is backpressure instead
+// (TestPlatformTransportH1ControlQueueBackpressuresUntilRoomOrEnd).
 func TestPlatformTransportControlRefusalTerminatesGenerationWithoutWait(t *testing.T) {
-	stats := &PlatformTransportReceiveStats{}
-	transport := &PlatformTransport{receiveStats: stats}
-	controlSend := make(chan []byte, 1)
-	queued := MessagePoolGet(1)
-	controlSend <- queued
-	defer func() { MessagePoolReturn(<-controlSend) }()
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		stats := &PlatformTransportReceiveStats{}
+		transport := &PlatformTransport{receiveStats: stats}
+		controlSend := make(chan []byte, 1)
+		controlSend <- MessagePoolGet(1)
+		defer func() { MessagePoolReturn(<-controlSend) }()
 
-	accepted := true
-	requirePromptTransportOffer(t, func() {
-		accepted = transport.offerH1Control(
-			make(chan struct{}),
-			controlSend,
-			MessagePoolGet(16),
-		)
-	}, "platform H1 control")
-	if accepted {
-		t.Fatal("full H1 control queue was accepted")
-	}
-	snapshot := stats.Snapshot()
-	if snapshot.H1ControlRefusalCount != 1 || snapshot.H1ControlRefusalBytes != 16 {
-		t.Fatalf("H1 control-refusal stats = %+v, want one message / 16 bytes", snapshot)
+		ended := make(chan struct{})
+		close(ended)
+		pendingMessage := MessagePoolGet(16)
+		result := make(chan bool, 1)
+		go func() {
+			result <- transport.offerH1Control(ended, controlSend, pendingMessage)
+		}()
+		synctest.Wait()
+		select {
+		case accepted := <-result:
+			if accepted {
+				t.Fatal("an ended H1 generation accepted a control echo")
+			}
+		default:
+			t.Fatal("an ended H1 generation waited to hand off a control echo")
+		}
+		if pooled, _ := MessagePoolCheck(pendingMessage); pooled {
+			t.Fatal("refused H1 control echo retained pooled ownership")
+		}
+		snapshot := stats.Snapshot()
+		if snapshot.H1ControlRefusalCount != 0 || snapshot.H1ControlRefusalBytes != 0 {
+			t.Fatalf("H1 control-refusal stats = %+v, want zero", snapshot)
+		}
+	})
+}
+
+// During a speed test the reader echoes every frame through the H1 control
+// queue, so a full queue is an uplink slower than the downlink, not a dead
+// writer. The reader keeps its one already-read echo, unchanged, until the
+// writer makes room. If the generation ends first, the wait ends and the
+// echo's pooled ownership is returned.
+func TestPlatformTransportH1ControlQueueBackpressuresUntilRoomOrEnd(t *testing.T) {
+	MessagePoolReturn(MessagePoolGet(1))
+	for _, generationEnds := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			transport := &PlatformTransport{receiveStats: &PlatformTransportReceiveStats{}}
+			controlSend := make(chan []byte, 1)
+			controlSend <- MessagePoolGet(1)
+			done := make(chan struct{})
+			pendingMessage := MessagePoolGet(1024)
+			witness := MessagePoolShareReadOnly(pendingMessage)
+			result := make(chan bool, 1)
+			go func() {
+				result <- transport.offerH1Control(done, controlSend, pendingMessage)
+			}()
+			synctest.Wait()
+			select {
+			case accepted := <-result:
+				t.Fatalf("full H1 control queue (generation ends=%t) returned %t instead of waiting", generationEnds, accepted)
+			default:
+			}
+			if generationEnds {
+				close(done)
+				if <-result {
+					t.Fatal("an ended generation accepted the waiting echo")
+				}
+				MessagePoolReturn(<-controlSend)
+				if !MessagePoolReturn(witness) {
+					t.Fatal("the ended wait retained the echo's pooled ownership")
+				}
+			} else {
+				MessagePoolReturn(<-controlSend)
+				if !<-result {
+					t.Fatal("the echo was refused after the writer made room")
+				}
+				deliveredMessage := <-controlSend
+				if &deliveredMessage[0] != &pendingMessage[0] {
+					t.Fatal("the waiting echo changed while it was held")
+				}
+				MessagePoolReturn(deliveredMessage)
+				if !MessagePoolReturn(witness) {
+					t.Fatal("the delivered echo's pooled ownership was not handed on")
+				}
+			}
+			if refusalCount := transport.ReceiveStats().H1ControlRefusalCount; refusalCount != 0 {
+				t.Fatalf("H1 control refusals = %d, want 0", refusalCount)
+			}
+		})
 	}
 }
 
@@ -383,8 +454,9 @@ func TestP2pFastReceiveRefusesFullQueueWithoutWaiting(t *testing.T) {
 }
 
 // This inventory deliberately targets the carrier readers rather than relying
-// only on timing tests. Reliable stream/SCTP lanes own one cancellation-bounded
-// handoff; H3 DATAGRAM and native P2P retain bounded zero-wait admission.
+// only on timing tests. Reliable stream/SCTP lanes and the H1 control echo each
+// own one cancellation-bounded handoff; H3 DATAGRAM and native P2P retain
+// bounded zero-wait admission.
 func TestProductionCarrierReadersUseModeSpecificReceiveAdmission(t *testing.T) {
 	checks := []struct {
 		path              string
@@ -394,12 +466,12 @@ func TestProductionCarrierReadersUseModeSpecificReceiveAdmission(t *testing.T) {
 		{
 			path: "transport.go",
 			required: map[string]int{
-				"self.offerReceive(":       2,
-				"self.offerH1Control(":     4,
-				"case receive <- message:": 1,
+				"self.offerReceive(":           2,
+				"self.offerH1Control(":         4,
+				"case receive <- message:":     1,
+				"case controlSend <- message:": 1, // the bounded wait in offerH1Control
 			},
 			forbiddenSnippets: []string{
-				"case controlSend <- message:",
 				"resetOrCreateTimer(&receiveTimer",
 			},
 		},
@@ -448,6 +520,19 @@ func TestProductionCarrierReadersUseModeSpecificReceiveAdmission(t *testing.T) {
 			} {
 				if !strings.Contains(offerSource, required) {
 					t.Fatalf("platform receive admission is missing %q", required)
+				}
+			}
+			controlLength := strings.Index(source[offerEnd:], "\nfunc ")
+			if controlLength < 0 {
+				t.Fatal("could not isolate H1 control-admission source boundary")
+			}
+			controlSource := source[offerEnd : offerEnd+controlLength]
+			for _, required := range []string{
+				"case <-done:",
+				"case controlSend <- message:",
+			} {
+				if !strings.Contains(controlSource, required) {
+					t.Fatalf("H1 control admission is missing %q", required)
 				}
 			}
 		}

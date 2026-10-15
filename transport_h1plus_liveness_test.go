@@ -100,6 +100,7 @@ type h1LivenessFixture struct {
 	peerReadResume  chan struct{}
 	heartbeats      atomic.Int64
 	payloads        atomic.Int64
+	payloadBytes    atomic.Int64
 	registered      atomic.Int64
 	withdrawn       atomic.Int64
 	strategy        *ClientStrategy
@@ -163,6 +164,7 @@ func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTim
 				fixture.heartbeats.Add(1)
 			} else {
 				fixture.payloads.Add(1)
+				fixture.payloadBytes.Add(int64(len(message)))
 			}
 			messageCount++
 			if pausePeer && messageCount == 1 {

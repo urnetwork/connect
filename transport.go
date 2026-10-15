@@ -212,6 +212,10 @@ type PlatformTransportReceiveModeStatsSnapshot struct {
 // PlatformTransportReceiveStatsSnapshot keeps the carrier mode visible: DNS
 // translation and direct QUIC can behave very differently on a constrained
 // cellular path even though both ultimately use the H3 reader.
+// H1ControlRefusalCount and H1ControlRefusalBytes counted speed-test and
+// latency echoes refused by a full H1 control queue, each of which closed its
+// generation. A full queue now applies backpressure instead (offerH1Control),
+// so both stay zero; they remain for existing snapshot consumers.
 type PlatformTransportReceiveStatsSnapshot struct {
 	H1                    PlatformTransportReceiveModeStatsSnapshot
 	H3                    PlatformTransportReceiveModeStatsSnapshot
@@ -241,12 +245,10 @@ func (self *platformTransportReceiveModeStats) snapshot() PlatformTransportRecei
 // one PlatformTransport. All counters are monotonic and add no receive-path
 // lock or observer callback.
 type PlatformTransportReceiveStats struct {
-	h1                    platformTransportReceiveModeStats
-	h3                    platformTransportReceiveModeStats
-	h3Dns                 platformTransportReceiveModeStats
-	h3DnsPump             platformTransportReceiveModeStats
-	h1ControlRefusalCount atomic.Uint64
-	h1ControlRefusalBytes atomic.Uint64
+	h1        platformTransportReceiveModeStats
+	h3        platformTransportReceiveModeStats
+	h3Dns     platformTransportReceiveModeStats
+	h3DnsPump platformTransportReceiveModeStats
 }
 
 func (self *PlatformTransportReceiveStats) mode(mode TransportMode) *platformTransportReceiveModeStats {
@@ -284,25 +286,15 @@ func (self *PlatformTransportReceiveStats) recordQueueBackpressure(
 	}
 }
 
-func (self *PlatformTransportReceiveStats) recordH1ControlRefusal(byteCount int) {
-	if self == nil {
-		return
-	}
-	self.h1ControlRefusalCount.Add(1)
-	self.h1ControlRefusalBytes.Add(uint64(max(0, byteCount)))
-}
-
 func (self *PlatformTransportReceiveStats) Snapshot() PlatformTransportReceiveStatsSnapshot {
 	if self == nil {
 		return PlatformTransportReceiveStatsSnapshot{}
 	}
 	return PlatformTransportReceiveStatsSnapshot{
-		H1:                    self.h1.snapshot(),
-		H3:                    self.h3.snapshot(),
-		H3Dns:                 self.h3Dns.snapshot(),
-		H3DnsPump:             self.h3DnsPump.snapshot(),
-		H1ControlRefusalCount: self.h1ControlRefusalCount.Load(),
-		H1ControlRefusalBytes: self.h1ControlRefusalBytes.Load(),
+		H1:        self.h1.snapshot(),
+		H3:        self.h3.snapshot(),
+		H3Dns:     self.h3Dns.snapshot(),
+		H3DnsPump: self.h3DnsPump.snapshot(),
 	}
 }
 
@@ -1342,10 +1334,18 @@ func (self *PlatformTransport) offerReceive(
 	}
 }
 
-// offerH1Control refuses a saturated reliable control queue immediately. A
-// speed-test/latency control message has no Transfer acknowledgement above it,
-// so skipping it would desynchronize state; the caller closes this websocket
-// generation and reconnects instead.
+// Hands one speed-test or latency echo to the H1 writer. The H1 reader is the
+// dedicated reader of one reliable lane, so under the reliable-carrier
+// backpressure contract (CODESTYLE.md) it may retain this one already-read
+// message until the fixed queue has room or the generation ends; TCP then
+// holds the platform to the rate this client can echo. Refusal is not a
+// recoverable boundary here: an echo has no Transfer acknowledgement above it,
+// so skipping one desynchronizes the speed-test mode and the platform's exact
+// byte count, and closing the generation instead killed healthy connections
+// whenever a speed test met an uplink slower than the downlink. Every writer
+// path is deadline-bounded, so a stuck writer still ends the generation.
+// Takes the echo: false means the generation ended and the echo went back to
+// the pool.
 func (self *PlatformTransport) offerH1Control(
 	done <-chan struct{},
 	controlSend chan<- []byte,
@@ -1355,9 +1355,13 @@ func (self *PlatformTransport) offerH1Control(
 	case pooledReceiveOfferDelivered:
 		return true
 	case pooledReceiveOfferFull:
-		self.receiveStats.recordH1ControlRefusal(len(message))
-		MessagePoolReturn(message)
-		return false
+		select {
+		case <-done:
+			MessagePoolReturn(message)
+			return false
+		case controlSend <- message:
+			return true
+		}
 	default:
 		MessagePoolReturn(message)
 		return false
