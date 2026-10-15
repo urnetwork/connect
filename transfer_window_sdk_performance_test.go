@@ -248,7 +248,7 @@ func checkWindowSdkBidirectional(t *testing.T, roundTrip time.Duration) {
 				windowPathParallel(t)
 				checkWindowSdkCell(t, windowPathCell{SenderProfile: &profiles[1], ReceiverProfile: &profile,
 					ProfileFixtureSha256: digest, Bidirectional: true, RoundTrip: roundTrip,
-					Upload: flows == 8, Flows: flows, RoundRobinOffer: true, Payload: 1280, Rate: 125000000})
+					Upload: flows == 8, Flows: flows, Payload: 1280, Rate: 125000000})
 			})
 		}
 	}

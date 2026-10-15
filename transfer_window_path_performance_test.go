@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -291,6 +292,31 @@ func checkWindowDeterministicPerformanceCells(t *testing.T, boundaries bool) {
 	}
 }
 
+// Parallel arms that fill the machine leave each bubble about one processor,
+// and on one processor the runtime wakes goroutines in the same order every
+// time. While each flow had its own producer on a shared sequence, the same
+// producer won every admission slot and its siblings delivered nothing. One
+// producer per sequence offers its flows in turn, so every flow of an
+// eight-flow deterministic cell keeps its share on one processor.
+func TestWindowPathFlowsKeepShareOnOneProcessor(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	for _, cell := range windowDeterministicPerformanceCells([]time.Duration{300 * time.Microsecond}, true) {
+		if cell.Flows != 8 || cell.Compression != 0 {
+			continue
+		}
+		cell.Arm = "ceiling"
+		synctest.Test(t, func(t *testing.T) {
+			reading := measureWindowPathCell(t, cell, 100*time.Millisecond)
+			share := reading.Mbps / float64(cell.Flows)
+			t.Logf("one processor: goodput=%.1f min-flow=%.1f share=%.1f model Mb/s", reading.Mbps, reading.MinFlowMbps, share)
+			if reading.Mbps < 500 || reading.MinFlowMbps < .9*share {
+				t.Fatalf("a flow lost its share on one processor: goodput=%.1f min-flow=%.1f share=%.1f model Mb/s", reading.Mbps, reading.MinFlowMbps, share)
+			}
+		})
+	}
+}
+
 // A large configured opening creates pressure at the finite forwarding queue.
 // Both arms use that same opening and startup allowance; only pacing differs.
 // Carrier reliability cannot recover a Pack discarded after its first hop.
@@ -498,7 +524,6 @@ type windowPathCell struct {
 	QualityChanged           bool
 	Compression              time.Duration
 	Flows                    int
-	RoundRobinOffer          bool
 	Lanes                    int
 	Payload                  int
 	Budget                   ByteCount
@@ -782,10 +807,13 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 					}
 				}
 			})
-			producers := cell.Flows
-			if cell.RoundRobinOffer {
-				producers = max(1, min(lanes, cell.Flows))
-			}
+			// Each logical sequence has one producer, which offers that
+			// sequence's flows round-robin. Producers that share a sequence
+			// race for each admission slot that frees, and the runtime's wake
+			// order would set every flow's share: on one processor, which a
+			// bubble has whenever parallel arms fill the machine, one producer
+			// wins every slot and its siblings deliver nothing.
+			producers := max(1, min(lanes, cell.Flows))
 			for producer := range producers {
 				workers.Go(func() {
 					flow := producer
@@ -805,11 +833,9 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 							}
 							return
 						}
-						if cell.RoundRobinOffer {
-							flow += producers
-							if flow >= cell.Flows {
-								flow = producer
-							}
+						flow += producers
+						if flow >= cell.Flows {
+							flow = producer
 						}
 					}
 				})
@@ -1096,7 +1122,7 @@ func TestWindowPathTrialKeySeparatesInputs(t *testing.T) {
 	profiles, digest := windowSdkProfiles(t)
 	copies, _ := windowSdkProfiles(t)
 	cell := windowPathCell{SenderProfile: &profiles[1], ReceiverProfile: &profiles[6], ProfileFixtureSha256: digest,
-		Arm: "delivery", RoundTrip: 400 * time.Millisecond, Flows: 1, RoundRobinOffer: true, Payload: 1280, Rate: 125000000}
+		Arm: "delivery", RoundTrip: 400 * time.Millisecond, Flows: 1, Payload: 1280, Rate: 125000000}
 	key, shared := windowPathTrialKey(cell, time.Second)
 	same := cell
 	same.SenderProfile, same.ReceiverProfile = &copies[1], &copies[6]

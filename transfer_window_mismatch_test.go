@@ -117,7 +117,6 @@ func checkWindowMismatchCell(t *testing.T, cell windowPathCell, observe ...func(
 func checkWindowMismatchCellWithMinimumDuration(t *testing.T, cell windowPathCell, minimumDuration time.Duration, observe ...func(windowPathCell, *Client, *Client)) windowPathReading {
 	t.Helper()
 	cell.Budget, cell.Payload = mib(48), 1280
-	cell.RoundRobinOffer = true
 	finalReceive := cell.ReceiveWindow
 	if cell.ReceiveWindowAfter > 0 {
 		finalReceive = cell.ReceiveWindowAfter

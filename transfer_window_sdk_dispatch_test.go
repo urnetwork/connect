@@ -32,7 +32,7 @@ func TestWindowPathSdkDuplexShortDispatchPhases(t *testing.T) {
 				checkWindowSdkCell(t, windowPathCell{
 					SenderProfile: &profiles[1], ReceiverProfile: &profiles[profile.index], ProfileFixtureSha256: digest,
 					Bidirectional: true, Upload: profile.flows == 8, RoundTrip: 300 * time.Microsecond,
-					Flows: profile.flows, RoundRobinOffer: true, Payload: 1280, Rate: 125000000,
+					Flows: profile.flows, Payload: 1280, Rate: 125000000,
 					InitialLogicalAckRelease: release,
 				})
 			})

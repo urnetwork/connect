@@ -473,7 +473,7 @@ func TestWindowPathServiceDelayedPacingWake(t *testing.T) {
 			t.Run(fmt.Sprintf("rtt=%s/flows=%d", rtt, flows), func(t *testing.T) {
 				windowPathParallel(t)
 				reference := windowPathCell{Arm: "ceiling", RoundTrip: rtt, Compression: 10 * time.Millisecond,
-					Flows: flows, RoundRobinOffer: true, Payload: 16384, Budget: mib(48), Rate: 125000000,
+					Flows: flows, Payload: 16384, Budget: mib(48), Rate: 125000000,
 					Warmup: time.Second + 5*rtt, PacingWakeDelay: delays[len(delays)-1]}
 				arms, trials := []string{"ceiling"}, map[string]windowPathCell{"ceiling": reference}
 				for _, delay := range delays {

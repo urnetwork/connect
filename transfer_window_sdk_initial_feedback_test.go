@@ -19,7 +19,7 @@ func checkWindowSdkInitialFeedback(t *testing.T, release time.Duration) {
 			checkWindowSdkCell(t, windowPathCell{
 				SenderProfile: profile, ReceiverProfile: &profiles[1],
 				ProfileFixtureSha256: digest, RoundTrip: 400 * time.Millisecond,
-				Flows: 1, RoundRobinOffer: true, Payload: 1280, Rate: 125000000,
+				Flows: 1, Payload: 1280, Rate: 125000000,
 				InitialLogicalAckRelease: release,
 			})
 			return
