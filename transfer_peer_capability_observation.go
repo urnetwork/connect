@@ -3,18 +3,19 @@ package connect
 // Per-peer evidence of two transfer capabilities, measured on the wire rather
 // than inferred from the version a peer reports (DESIGNNOTES §3.13):
 //
-//   - an end-to-end session: a TLS 1.3 handshake carried in EncryptedControl
-//     (§3.5) completed with the peer, with the key-exchange group it
-//     negotiated, and whether the peer's identity proof verified so the
-//     session sealed application traffic.
+//   - an end-to-end session: the peer's responder answered this client's
+//     ClientHello, a TLS 1.3 handshake carried in EncryptedControl (§3.5),
+//     with the key-exchange group the peer chose from this client's offer,
+//     and the peer's identity proof verified so the session sealed
+//     application traffic. Only sessions this client initiates count.
 //   - resizable windows: the peer's acknowledgements carry
 //     `Ack.receive_window_byte_count` (THROUGHPUTFIX §37.3).
 //
 // Recording happens only at edges that are already rare: a client-role epoch's
-// first outbox batch (its ClientHello), a completed handshake, a seal, a send
-// sequence's first acknowledgement, and a send sequence's first or larger
-// window advertisement. None is per packet. A nil recorder, the default, costs
-// one nil check at those edges and records nothing.
+// first outbox batch (its ClientHello), a completed client-role handshake, its
+// seal, a send sequence's first acknowledgement, and a send sequence's first or
+// larger window advertisement. None is per packet. A nil recorder, the
+// default, costs one nil check at those edges and records nothing.
 
 import (
 	"crypto/tls"
@@ -78,18 +79,23 @@ type PeerCapabilityObservation struct {
 	// When the first attempt was made. With E2eNegotiated still false, the
 	// time the peer has had to answer.
 	E2eFirstAttemptTime time.Time
-	// An end-to-end TLS 1.3 handshake with the peer completed, in either TLS
-	// role. Not authenticated by itself: the peer's identity is verified only
-	// when E2eSealed is set.
+	// The peer's TLS server answered a ClientHello of an observing client and
+	// the TLS 1.3 handshake completed. Not authenticated by itself: the peer's
+	// identity is verified only when E2eSealed is set. Only sessions an
+	// observing client initiates count. A handshake the peer initiates, with
+	// the client as the TLS server, records nothing: its group is the
+	// client's choice from the peer's offer, not the peer's from the client's.
 	E2eNegotiated bool
-	// A session verified the peer's identity proof and became the established
-	// epoch, the state `PeerEncryptionState.Sealed` reports. From then its
-	// cipher seals application traffic with the peer, unless the Required
-	// mode's signed-identity gate withholds it (DESIGNNOTES3 §5.1).
+	// Such a session verified the peer's identity proof and became the
+	// established epoch, which `PeerEncryptionState.Sealed` reports for it.
+	// From then its cipher seals application traffic with the peer, unless the
+	// Required mode's signed-identity gate withholds it (DESIGNNOTES3 §5.1).
 	E2eSealed bool
-	// The negotiated TLS group, e.g. "X25519MLKEM768" or "X25519": that of the
-	// most recent sealed session, or, while none has sealed, of the most
-	// recent completed handshake. Empty until E2eNegotiated.
+	// The TLS group the peer's responder chose from the client's offer
+	// (`DefaultSequencePostQuantumCurves`: X25519MLKEM768, then X25519), e.g.
+	// "X25519MLKEM768" or "X25519": that of the most recent sealed session,
+	// or, while none has sealed, of the most recent completed handshake. Empty
+	// until E2eNegotiated.
 	//
 	// It is the `tls.CurveID.String()` name of the group that
 	// `tls.ConnectionState.CurveID` reported, the value
@@ -98,8 +104,9 @@ type PeerCapabilityObservation struct {
 	// toolchain does not name renders as "CurveID(<decimal codepoint>)", and
 	// PostQuantum classifies by codepoint, so it never depends on the name.
 	KeyExchange string
-	// KeyExchange carries an ML-KEM component, hybrid or pure. With E2eSealed,
-	// a post-quantum key exchange the peer's identity proof authenticated.
+	// KeyExchange carries an ML-KEM component, hybrid or pure: the peer's
+	// responder chose a post-quantum group. With E2eSealed, a post-quantum key
+	// exchange the peer's identity proof authenticated.
 	PostQuantum bool
 
 	// A send sequence to the peer processed an acknowledgement of its own
@@ -268,8 +275,9 @@ func (self *PeerCapabilityRecorder) observeE2eAttempt(peerId Id) {
 	self.afterObserve(peerId, recorded)
 }
 
-// Records a completed handshake with the peer and its negotiated group, unless
-// a sealed session already supplied the group.
+// Records a completed client-role handshake with the peer and the group its
+// responder chose, unless a sealed session already supplied the group. Called
+// only for sessions this client initiated.
 func (self *PeerCapabilityRecorder) observeE2eHandshake(peerId Id, keyExchange tls.CurveID) {
 	if self == nil || peerId == (Id{}) {
 		return
@@ -292,8 +300,9 @@ func (self *PeerCapabilityRecorder) observeE2eHandshake(peerId Id, keyExchange t
 	self.afterObserve(peerId, recorded)
 }
 
-// Records a session whose epoch, negotiated with the given group, verified the
-// peer's identity proof and became established.
+// Records a client-role session whose epoch, negotiated with the given group,
+// verified the peer's identity proof and became established. Called only for
+// sessions this client initiated.
 func (self *PeerCapabilityRecorder) observeE2eSealed(peerId Id, keyExchange tls.CurveID) {
 	if self == nil || peerId == (Id{}) {
 		return

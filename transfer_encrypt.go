@@ -1861,10 +1861,12 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 	if !done {
 		return
 	}
-	if err == nil {
-		// capability evidence: the peer completed a handshake with this
-		// group, whether or not a newer epoch has since replaced this one.
-		// Recorded before the identity proof below can seal the epoch.
+	if err == nil && self.role == sequenceTlsRoleClient {
+		// capability evidence: the peer's responder answered this client's
+		// ClientHello with this group, whether or not a newer epoch has since
+		// replaced this one. Recorded before the identity proof below can
+		// seal the epoch. A handshake the peer initiated is not evidence of
+		// its responder: its group is this client's choice, not the peer's.
 		self.client.peerCapabilityRecorder.observeE2eHandshake(self.peerId, negotiatedCurveId)
 	}
 	self.notifyIdleStateChanged()
@@ -2121,9 +2123,10 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 		// always-on: one line per established session, the on-device signal
 		// that the e2e identity chain completed for this peer
 		self.client.log.Infof("[tls]%s peer identity proof verified — cipher is now usable\n", self.logTag)
-		if sealed {
-			// capability evidence, recorded before the callbacks below so a
-			// Sealed event's consumer already reads it
+		if sealed && self.role == sequenceTlsRoleClient {
+			// capability evidence for a session this client initiated, as the
+			// handshake's is, recorded before the callbacks below so a Sealed
+			// event's consumer already reads it
 			self.client.peerCapabilityRecorder.observeE2eSealed(self.peerId, sealedCurveId)
 		}
 		// the established + identity-verified peer set grew (or the

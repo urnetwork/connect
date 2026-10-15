@@ -718,8 +718,8 @@ Test-infrastructure lessons (reusable):
   | Edge | Site | Records |
   |---|---|---|
   | a client-role epoch's first outbox batch (its ClientHello) | `peerEncryptionSession.outboxLoop` | `E2eAttempted`; `E2eFirstAttemptTime` keeps the first |
-  | a handshake completes, either role, current or superseded epoch | `completeHandshake` | `E2eNegotiated`; `KeyExchange` unless a seal supplied it |
-  | the peer's identity proof verifies and its epoch is promoted | `maybeVerifyPendingPeerIdentityProof` | `E2eSealed`, `KeyExchange` (before the Sealed event fires) |
+  | a client-role handshake completes (the peer answered this client's ClientHello), current or superseded epoch | `completeHandshake` | `E2eNegotiated`; `KeyExchange` unless a seal supplied it |
+  | a client-role session verifies the peer's identity proof and its epoch is promoted | `maybeVerifyPendingPeerIdentityProof` | `E2eSealed`, `KeyExchange` (before the Sealed event fires) |
   | a send sequence's first acknowledgement, when it carries no window | `SendSequence.observeReceiveWindowAdvertisement` | `AckObserved` |
   | a send sequence's first or larger window advertisement | same | `AckObserved`, `WindowAdvertised`, `MaxReceiveWindowByteCount`, in one step |
 
@@ -743,14 +743,22 @@ Test-infrastructure lessons (reusable):
     the answer was lost. `E2eFirstAttemptTime` says how long it has had;
     `TlsTimeout` (60s) fails the attempt, and `TlsInitialRetryInterval` (60s,
     exponential, staggered) paces the next one.
-  - `E2eNegotiated` alone is unauthenticated (a TLS server answered);
-    `E2eSealed` means the peer's identity proof verified against its identity
-    key (§3.7's trust root and caveats apply).
-  - `KeyExchange` is the group of the most recent *sealed* session, or of the
-    most recent completed handshake while none has sealed; `PostQuantum` is that
-    group carrying an ML-KEM component, classified by IANA codepoint so it does
-    not depend on which groups the toolchain names. So `E2eSealed && PostQuantum`
-    is an authenticated post-quantum key exchange. `KeyExchange` is a string: the
+  - Only sessions this client initiates (the TLS client role) are evidence. So
+    `E2eNegotiated` alone is unauthenticated: the peer's TLS server answered
+    this client's ClientHello. `E2eSealed` means the peer's identity proof
+    verified against its identity key (§3.7's trust root and caveats apply).
+    A handshake the peer initiates, with this client as the TLS server, records
+    nothing even when it seals: its group is this client's choice from the
+    peer's offer rather than the peer's from this client's, and recorded too,
+    `KeyExchange` would depend on which of the two sessions completed last
+    (`TestPeerInitiatedHandshakeRecordsNoEvidence`).
+  - `KeyExchange` is the group the peer's responder chose from this client's
+    offer (`[X25519MLKEM768, X25519]`): that of the most recent *sealed*
+    session, or of the most recent completed handshake while none has sealed;
+    `PostQuantum` is that group carrying an ML-KEM component, classified by IANA
+    codepoint so it does not depend on which groups the toolchain names. So
+    `E2eSealed && PostQuantum` is an authenticated post-quantum key exchange
+    the peer's responder chose. `KeyExchange` is a string: the
     `tls.CurveID.String()` name of the `tls.ConnectionState.CurveID` the
     handshake reported (`PeerEncryptionState.KeyExchange` holds the same value
     as a `tls.CurveID`); a group the toolchain does not name reads

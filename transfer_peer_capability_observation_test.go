@@ -699,76 +699,87 @@ func newPeerCapabilityClientForTest(t *testing.T, mode EncryptionMode, recorder 
 	return client
 }
 
-// completeHandshake and the identity-proof seal record the group a real TLS
-// handshake negotiated, in both TLS roles: the hybrid against a peer that
-// supports it, the classical group against one that does not.
+// Acquires the (peer, role) session, which starts no epoch, and installs a
+// completed handshake as its current epoch: the state runHandshake leaves just
+// before it calls completeHandshake.
+func acquireSessionWithCompletedHandshakeForTest(
+	t *testing.T,
+	client *Client,
+	peerId Id,
+	role sequenceTlsRole,
+	tlsConn *tls.Conn,
+) (*peerEncryptionSession, *tlsHandshakeEpoch) {
+	t.Helper()
+	session := client.EncryptionSessionManager().Acquire(peerId, role, false)
+	if session == nil {
+		t.Fatalf("%s: no session under Opportunistic", role)
+	}
+	t.Cleanup(session.Release)
+	// bound to the session, as buildAndStartEpochWithLock binds an epoch
+	epochCtx, epochCancel := context.WithCancel(session.ctx)
+	t.Cleanup(epochCancel)
+	e := &tlsHandshakeEpoch{
+		ctx:               epochCtx,
+		cancel:            epochCancel,
+		tlsConn:           tlsConn,
+		handshakeDone:     make(chan struct{}),
+		establishmentDone: make(chan struct{}),
+	}
+	func() {
+		session.stateLock.Lock()
+		defer session.stateLock.Unlock()
+		session.epoch = e
+	}()
+	return session, e
+}
+
+// Delivers the peer's identity proof over the epoch's exporter, which seals it.
+func sealEpochWithPeerIdentityProofForTest(t *testing.T, session *peerEncryptionSession, e *tlsHandshakeEpoch) {
+	t.Helper()
+	peerPublicKey, peerPrivateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exporter := func() []byte {
+		session.stateLock.Lock()
+		defer session.stateLock.Unlock()
+		return e.tlsExporter
+	}()
+	session.SetPeerClientPublicKey(peerPublicKey)
+	session.receivePeerIdentityProof(ed25519.Sign(peerPrivateKey, exporter))
+}
+
+// completeHandshake and the identity-proof seal record the group the peer's
+// responder chose from this client's offer in a real TLS handshake: the hybrid
+// when the peer supports it, the classical group when it does not.
 func TestEndToEndHandshakeRecordsItsKeyExchange(t *testing.T) {
 	cases := []struct {
-		role         sequenceTlsRole
 		serverCurves []tls.CurveID
 		keyExchange  string
 		postQuantum  bool
 	}{
-		{role: sequenceTlsRoleClient, serverCurves: nil, keyExchange: "X25519MLKEM768", postQuantum: true},
-		{role: sequenceTlsRoleServer, serverCurves: nil, keyExchange: "X25519MLKEM768", postQuantum: true},
-		{role: sequenceTlsRoleClient, serverCurves: []tls.CurveID{tls.X25519}, keyExchange: "X25519", postQuantum: false},
-		{role: sequenceTlsRoleServer, serverCurves: []tls.CurveID{tls.X25519}, keyExchange: "X25519", postQuantum: false},
+		{serverCurves: nil, keyExchange: "X25519MLKEM768", postQuantum: true},
+		{serverCurves: []tls.CurveID{tls.X25519}, keyExchange: "X25519", postQuantum: false},
 	}
 	for _, c := range cases {
 		recorder := NewPeerCapabilityRecorder(0)
 		client := newPeerCapabilityClientForTest(t, EncryptionModeOpportunistic, recorder)
 		peerId := NewId()
-		clientConn, serverConn := completedSequenceTlsConnsForTest(t, c.serverCurves)
-		tlsConn := clientConn
-		if c.role == sequenceTlsRoleServer {
-			tlsConn = serverConn
-		}
-
-		// Acquire starts no epoch; install the state runHandshake leaves just
-		// before it calls completeHandshake
-		session := client.EncryptionSessionManager().Acquire(peerId, c.role, false)
-		if session == nil {
-			t.Fatalf("%s: no session under Opportunistic", c.role)
-		}
-		// bound to the session, as buildAndStartEpochWithLock binds an epoch
-		epochCtx, epochCancel := context.WithCancel(session.ctx)
-		t.Cleanup(epochCancel)
-		e := &tlsHandshakeEpoch{
-			ctx:               epochCtx,
-			cancel:            epochCancel,
-			tlsConn:           tlsConn,
-			handshakeDone:     make(chan struct{}),
-			establishmentDone: make(chan struct{}),
-		}
-		func() {
-			session.stateLock.Lock()
-			defer session.stateLock.Unlock()
-			session.epoch = e
-		}()
+		clientConn, _ := completedSequenceTlsConnsForTest(t, c.serverCurves)
+		session, e := acquireSessionWithCompletedHandshakeForTest(t, client, peerId, sequenceTlsRoleClient, clientConn)
 
 		session.completeHandshake(e, nil)
 		observation, ok := recorder.Get(peerId)
 		if !ok || !observation.E2eNegotiated || observation.E2eSealed ||
 			observation.KeyExchange != c.keyExchange || observation.PostQuantum != c.postQuantum {
-			t.Fatalf("%s %s: after the handshake, evidence %+v (recorded=%t)", c.role, c.keyExchange, observation, ok)
+			t.Fatalf("%s: after the handshake, evidence %+v (recorded=%t)", c.keyExchange, observation, ok)
 		}
 
-		// the peer's identity proof over this epoch's exporter seals it
-		peerPublicKey, peerPrivateKey, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		exporter := func() []byte {
-			session.stateLock.Lock()
-			defer session.stateLock.Unlock()
-			return e.tlsExporter
-		}()
-		session.SetPeerClientPublicKey(peerPublicKey)
-		session.receivePeerIdentityProof(ed25519.Sign(peerPrivateKey, exporter))
+		sealEpochWithPeerIdentityProofForTest(t, session, e)
 		observation, _ = recorder.Get(peerId)
 		if !observation.E2eNegotiated || !observation.E2eSealed ||
 			observation.KeyExchange != c.keyExchange || observation.PostQuantum != c.postQuantum {
-			t.Fatalf("%s %s: after the seal, evidence %+v", c.role, c.keyExchange, observation)
+			t.Fatalf("%s: after the seal, evidence %+v", c.keyExchange, observation)
 		}
 
 		// the live per-session view agrees with the evidence
@@ -779,9 +790,39 @@ func TestEndToEndHandshakeRecordsItsKeyExchange(t *testing.T) {
 			}
 		}
 		if !agrees {
-			t.Fatalf("%s %s: PeerEncryptionStates disagrees with the evidence", c.role, c.keyExchange)
+			t.Fatalf("%s: PeerEncryptionStates disagrees with the evidence", c.keyExchange)
 		}
-		session.Release()
+	}
+}
+
+// A handshake the peer initiated, with this client as the TLS server, records
+// nothing, even once it seals. Its group is this client's choice from the
+// peer's offer, which says less about the peer's responder than the peer's
+// choice from this client's offer; recorded too, KeyExchange would depend on
+// which of the two completed last, and E2eNegotiated would claim an answer to
+// a ClientHello this client never sent.
+func TestPeerInitiatedHandshakeRecordsNoEvidence(t *testing.T) {
+	recorder := NewPeerCapabilityRecorder(0)
+	client := newPeerCapabilityClientForTest(t, EncryptionModeOpportunistic, recorder)
+	peerId := NewId()
+	_, serverConn := completedSequenceTlsConnsForTest(t, nil)
+	session, e := acquireSessionWithCompletedHandshakeForTest(t, client, peerId, sequenceTlsRoleServer, serverConn)
+
+	session.completeHandshake(e, nil)
+	sealEpochWithPeerIdentityProofForTest(t, session, e)
+
+	// the seal happened, so absent evidence is the role rule and not a failure
+	sealed := false
+	for _, state := range client.EncryptionSessionManager().PeerEncryptionStates() {
+		if state.PeerId == peerId {
+			sealed = state.Sealed
+		}
+	}
+	if !sealed {
+		t.Fatal("the peer-initiated session did not seal, so the test proves nothing")
+	}
+	if observation, ok := recorder.Get(peerId); ok {
+		t.Fatalf("a handshake the peer initiated recorded evidence: %+v", observation)
 	}
 }
 
