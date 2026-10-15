@@ -501,8 +501,9 @@ func TestTheHostedTunPermissionHasNoAggregateBehindIt(t *testing.T) {
 	// client cap, which is the only term bounding the product today
 	const proxyMaxClients = 65536
 	// `server/proxy/proxy_device.go`: the per-device target the proxy sets,
+	// the sdk's shared low profile (`sdk.LowMemoryDeviceTargetByteCount`),
 	// which sizes every DeviceLocal-owned row and does not reach the tun
-	const proxyDeviceTarget = ByteCount(24 * 1024 * 1024)
+	const proxyDeviceTarget = ByteCount(32 * 1024 * 1024)
 
 	for _, c := range []struct {
 		name          string
