@@ -143,8 +143,9 @@ tags:
     description: |
       Everything outside the groups above:
 
-      - discovery and status: `/hello`, `/status`, `/clock`, `/my-ip-info`
-        and the policy redirects (`/privacy.txt`, `/terms.txt`, `/vdp.txt`)
+      - discovery and status: `/hello`, `/status`, `/clock`, `/my-ip-info`,
+        `/robots.txt` and the policy redirects (`/privacy.txt`, `/terms.txt`,
+        `/vdp.txt`)
       - lag.dev (`/lag`): a guest session, the extenders it can measure and
         the tickets of a track
       - client public keys (`/key`) and client log upload (`/log`)
@@ -220,6 +221,25 @@ paths:
           description: Redirect to https://bringyour.com/vdp.txt
           headers:
             Location:
+              schema:
+                type: string
+
+  /robots.txt:
+    get:
+      tags: [Other]
+      summary: Robots Txt
+      description: |
+        The api's robots.txt, which disallows only `/lag/`. A crawler that
+        renders lag.dev runs its script, and each render would otherwise
+        create a lag.dev guest network and open measurement sessions. Every
+        other path stays open to crawlers.
+      operationId: robotsTxt
+      security: []
+      responses:
+        "200":
+          description: "`User-agent: *` and `Disallow: /lag/`, one per line."
+          content:
+            text/plain:
               schema:
                 type: string
 
