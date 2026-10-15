@@ -4,6 +4,7 @@ package connect
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -90,10 +91,13 @@ func TestWindowPathRetainedGrowthLongRoundTrip(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, compression := range []time.Duration{0, 10 * time.Millisecond} {
 		for _, flows := range []int{1, 8} {
-			checkWindowMismatchCell(t, windowPathCell{
-				SendWindow: 48 * 1024 * 1024, ReceiveWindow: 48 * 1024 * 1024,
-				RoundTrip: 400 * time.Millisecond, Compression: compression,
-				Flows: flows, Rate: 125000000,
+			t.Run(fmt.Sprintf("compression=%s/flows=%d", compression, flows), func(t *testing.T) {
+				windowPathParallel(t)
+				checkWindowMismatchCell(t, windowPathCell{
+					SendWindow: 48 * 1024 * 1024, ReceiveWindow: 48 * 1024 * 1024,
+					RoundTrip: 400 * time.Millisecond, Compression: compression,
+					Flows: flows, Rate: 125000000,
+				})
 			})
 		}
 	}

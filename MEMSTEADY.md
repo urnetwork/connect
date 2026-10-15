@@ -3725,7 +3725,7 @@ envelopes, hard-window eligibility boundaries, unchanged feedback-flight
 tolerance, preserved payment when a quantum shrinks, and indivisible frames.
 `TestWindowPathSdkDuplexShortDispatchPhases` keeps both the device and
 constrained-provider five-phase cohorts under the original gates. Run it
-alongside `TestWindowPacing*`, `TestWindowPathSdkBidirectional` and
+alongside `TestWindowPacing*`, `TestWindowPathSdkBidirectional*` and
 `TestWindowPathRetainedSdkCumulativePacingShort`, with `GOMAXPROCS=8`,
 `-count=1` and race separately; never select a lucky repeat or extend warmup.
 
