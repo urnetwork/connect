@@ -5792,7 +5792,8 @@ func TestWebRtcInvalidSdpAndEarlyCandidateDoNotPoisonRetransmit(t *testing.T) {
 	passive.signalLock.Unlock()
 	AssertEqual(t, bufferedCandidateCount, 1)
 
-	offerPeer, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	// the offer gathers, which must not join the mDNS groups
+	offerPeer, err := newTestPionPeerConnection()
 	AssertEqual(t, err, nil)
 	defer offerPeer.Close()
 	if _, err := offerPeer.CreateDataChannel("retransmit", nil); err != nil {

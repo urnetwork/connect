@@ -39,11 +39,12 @@ func waitForStreamLifecycleIdSignal(t *testing.T, signal <-chan Id, message stri
 }
 
 // streamLifecycleTestClient creates a quiet client with ordinary destination
-// stream policy, so focused lifecycle controls are admitted.
+// stream policy, so focused lifecycle controls are admitted. Its P2P setup is
+// refused (streamManagerTestSettings).
 func streamLifecycleTestClient(t *testing.T) (*Client, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	settings := DefaultClientSettings()
+	settings := streamManagerTestSettings()
 	settings.Log = NewNoopLogger()
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	return client, cancel

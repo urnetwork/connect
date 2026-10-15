@@ -10,6 +10,16 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// streamManagerTestSettings are the default client settings with P2P setup
+// refused by a zero-byte WebRTC budget. Otherwise a stream a test opens
+// toward a destination builds a Pion peer whose offer resolves and queries
+// the shipped STUN pool, which is public hosts, if the test is still running.
+func streamManagerTestSettings() *ClientSettings {
+	settings := DefaultClientSettings()
+	settings.WebRtcSettings.MemoryBudget = NewTransferMemoryBudget(0)
+	return settings
+}
+
 func TestStreamManagerStreamLifecycle(t *testing.T) {
 	// stream control frames from the platform drive the stream buffer:
 	// open with destination only (this client is the stream source),
@@ -23,7 +33,7 @@ func TestStreamManagerStreamLifecycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), streamManagerTestSettings())
 	defer client.Close()
 	// The lifecycle test exercises an inbound endpoint stream. Register Public
 	// provide explicitly; clients with no provider mode now reject such stale
@@ -174,7 +184,7 @@ func TestStreamManagerProvidePolicyRetiresStaleInboundStreams(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	settings := DefaultClientSettings()
+	settings := streamManagerTestSettings()
 	settings.ProviderStreamPolicy = true
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Close()
@@ -527,7 +537,7 @@ func TestStreamManagerOrdinaryClientKeepsTransportDirectionsWithoutProviderMode(
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), streamManagerTestSettings())
 	defer client.Close()
 	openTracker := newStreamOpenTestTracker(client.streamManager.streamBuffer)
 
@@ -571,7 +581,7 @@ func TestStreamManagerResetSkipsBadEntries(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	client := NewClient(ctx, NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), streamManagerTestSettings())
 	defer client.Close()
 
 	streamManager := client.streamManager

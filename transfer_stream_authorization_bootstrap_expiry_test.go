@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 // The original sequence frees an expired pending slot, reuses capacity, loses
@@ -73,9 +74,9 @@ func TestStreamAuthorizationBootstrapExpiredReservationRetirement(t *testing.T) 
 	revokeRetained := record != nil && record.retired && record.generation == generation
 	now = base.Add(2 * time.Second)
 	state.Unlock()
-	delayed := *expired
+	delayed := proto.Clone(expired).(*protocol.StreamOpen)
 	delayed.AuthorizationDeadlineUnixMillis = serverMillis + MaxStreamAuthorizationLease.Milliseconds()
-	replayAdmitted := admit(&delayed)
+	replayAdmitted := admit(delayed)
 	state.Lock()
 	record = state.records[streamId]
 	stillRetired := record != nil && record.retired && record.generation == generation
@@ -127,9 +128,9 @@ func TestStreamAuthorizationBootstrapFresherPendingBeforeReplay(t *testing.T) {
 		clear(frame.MessageBytes)
 		MessagePoolReturn(frame.MessageBytes)
 	}
-	straggler := *open
+	straggler := proto.Clone(open).(*protocol.StreamOpen)
 	straggler.AuthorizationDeadlineUnixMillis = serverMillis
-	receive(RequireToFrameWithDefaultProtocolVersion(&straggler))
+	receive(RequireToFrameWithDefaultProtocolVersion(straggler))
 	state.Lock()
 	pending := state.pending[streamId]
 	preserved := pending != nil && pending.AuthorizationDeadlineUnixMillis == open.AuthorizationDeadlineUnixMillis &&
@@ -201,11 +202,11 @@ func checkBootstrapClockActiveRefreshBeforeReplay(t *testing.T, oldOffset time.D
 	now := anchor.Add(time.Second)
 	state.now = func() time.Time { return now }
 	state.Unlock()
-	refreshed := *open
+	refreshed := proto.Clone(open).(*protocol.StreamOpen)
 	refreshed.AuthorizationDeadlineUnixMillis = serverMillis + MaxStreamAuthorizationLease.Milliseconds()
 	publication := tracker.expectPublication(streamId)
 	defer publication.resume()
-	frame := RequireToFrameWithDefaultProtocolVersion(&refreshed)
+	frame := RequireToFrameWithDefaultProtocolVersion(refreshed)
 	manager.Receive(SourceId(ControlId), []*protocol.Frame{frame}, Peer{})
 	clear(frame.MessageBytes)
 	MessagePoolReturn(frame.MessageBytes)

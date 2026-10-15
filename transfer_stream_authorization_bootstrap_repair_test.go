@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 // The duplicated clock budget must stay equal to the ordinary API default.
@@ -177,11 +178,11 @@ func checkBootstrapClockRetiredBeforeReplay(t *testing.T, revoke bool) {
 	releaseOnce.Do(func() { close(release) })
 	waitForStreamLifecycleSignal(t, done, "selected replay did not finish")
 	for _, nextGeneration := range []Id{generation, NewId()} {
-		replay := *open
+		replay := proto.Clone(open).(*protocol.StreamOpen)
 		replay.AuthorizationGeneration = nextGeneration.Bytes()
 		replay.AuthorizationDeadlineUnixMillis += MaxStreamAuthorizationLease.Milliseconds()
 		admitted := false
-		if err := manager.authorizeStreamOpen(&replay, func() error { admitted = true; return nil }); err != nil {
+		if err := manager.authorizeStreamOpen(replay, func() error { admitted = true; return nil }); err != nil {
 			t.Fatal(err)
 		}
 		if admitted {
@@ -213,15 +214,15 @@ func TestStreamAuthorizationBootstrapPendingGenerationFence(t *testing.T) {
 	streamId := RequireIdFromBytes(open.StreamId)
 	queueBootstrapClockOpen(t, manager, open)
 	for _, generation := range []Id{older, newer} {
-		other := *open
+		other := proto.Clone(open).(*protocol.StreamOpen)
 		other.AuthorizationGeneration = generation.Bytes()
 		other.AuthorizationDeadlineUnixMillis += MaxStreamAuthorizationLease.Milliseconds()
-		queueBootstrapClockOpen(t, manager, &other)
+		queueBootstrapClockOpen(t, manager, other)
 	}
-	legacy := *open
+	legacy := proto.Clone(open).(*protocol.StreamOpen)
 	legacy.AuthorizationGeneration = nil
 	legacyAdmitted := false
-	if err := manager.authorizeStreamOpen(&legacy, func() error { legacyAdmitted = true; return nil }); err != nil {
+	if err := manager.authorizeStreamOpen(legacy, func() error { legacyAdmitted = true; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	state := manager.authorization
@@ -283,9 +284,9 @@ func TestStreamAuthorizationBootstrapPendingCapacityRefresh(t *testing.T) {
 	}
 	overflow := newBootstrapClockOpen(serverMillis)
 	queueBootstrapClockOpen(t, manager, overflow)
-	refreshed := *first
+	refreshed := proto.Clone(first).(*protocol.StreamOpen)
 	refreshed.AuthorizationDeadlineUnixMillis += 1000
-	queueBootstrapClockOpen(t, manager, &refreshed)
+	queueBootstrapClockOpen(t, manager, refreshed)
 	queueBootstrapClockOpen(t, manager, first)
 	state := manager.authorization
 	state.Lock()

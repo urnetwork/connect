@@ -2,12 +2,13 @@ package connect
 
 import (
 	"github.com/urnetwork/connect/protocol"
+	"google.golang.org/protobuf/proto"
 	"testing"
 	"time"
 )
 
 func TestStreamAuthorizationExpiryCancelsLifecycleAndRejectsReplay(t *testing.T) {
-	client := NewClient(t.Context(), NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	client := NewClient(t.Context(), NewId(), NewNoContractClientOob(), streamManagerTestSettings())
 	defer client.Close()
 	manager := client.streamManager
 	tracker := newStreamOpenTestTracker(manager.streamBuffer)
@@ -88,9 +89,9 @@ func TestStreamAuthorizationClockDelayAndRetirementGc(t *testing.T) {
 	first := &protocol.StreamOpen{StreamId: NewId().Bytes(), AuthorizationGeneration: NewId().Bytes(), AuthorizationLeaseMillis: 90000, AuthorizationDeadlineUnixMillis: serverClock + 90000}
 	run := func() error { opens++; return nil }
 	for i := 0; i < maxStreamAuthorizationRecords; i++ {
-		open := *first
+		open := proto.Clone(first).(*protocol.StreamOpen)
 		open.StreamId = NewId().Bytes()
-		if err := manager.authorizeStreamOpen(&open, run); err != nil {
+		if err := manager.authorizeStreamOpen(open, run); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -111,10 +112,10 @@ func TestStreamAuthorizationClockDelayAndRetirementGc(t *testing.T) {
 	if opens != maxStreamAuthorizationRecords {
 		t.Fatal("expired delayed grant reopened after gc")
 	}
-	fresh := *first
+	fresh := proto.Clone(first).(*protocol.StreamOpen)
 	fresh.StreamId = NewId().Bytes()
 	fresh.AuthorizationDeadlineUnixMillis = serverClock + int64((8*time.Hour+5*time.Minute)/time.Millisecond)
-	_ = manager.authorizeStreamOpen(&fresh, run)
+	_ = manager.authorizeStreamOpen(fresh, run)
 	if opens != maxStreamAuthorizationRecords+1 {
 		t.Fatal("bounded gc permanently disabled future P2P")
 	}
