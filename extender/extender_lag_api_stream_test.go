@@ -10,6 +10,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/aes"
+	"crypto/cipher"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -917,6 +918,155 @@ func TestLagApiUploadMismatchPastTheEnd(t *testing.T) {
 		if _, _, end := phase.state(); end != lagApiPhaseEndMismatch || !phase.windowFinal() || phase.total() != 1000 {
 			t.Errorf("inside the window: ended %d, final %t, counted %d", end, phase.windowFinal(), phase.total())
 		}
+	})
+}
+
+// An upload phase in a bubble with two streams open, and a send that has
+// stream k's next message, of byteCount bytes of its keystream, arrive after
+// past now -- the first opens the window -- read by the stream in records of
+// 16 KiB, and changed in its last byte when corrupt.
+func testLagShortUpload(t *testing.T, exact bool, sampleMessage func() bool) (*lagApiPhase, time.Time, func(streamIndex int, after time.Duration, byteCount int, corrupt bool)) {
+	api := &extenderLagApi{budget: newLagApiBudget(0)}
+	phase := newLagApiPhase(api, context.Background(), lagApiDirectionUpload,
+		5*time.Second, lagApiInterval, 2, 1<<30, time.Minute, func() {})
+	uploadKey := [16]byte{}
+	copy(uploadKey[:], testLagRandomBytes(16))
+	streams := []*lagApiUploadStream{}
+	keystreams := []cipher.Stream{}
+	for k := 0; k < 2; k += 1 {
+		phase.openStream(k)
+		stream, err := newLagApiUploadStream(phase, uploadKey, k, exact, sampleMessage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		streams = append(streams, stream)
+		keystreams = append(keystreams, testLagUploadStream(t, uploadKey[:], uint64(k)))
+	}
+	startTime := time.Now()
+	send := func(streamIndex int, after time.Duration, byteCount int, corrupt bool) {
+		time.Sleep(time.Until(startTime.Add(after)))
+		message := make([]byte, byteCount)
+		keystreams[streamIndex].XORKeyStream(message, message)
+		if corrupt {
+			message[byteCount-1] ^= 1
+		}
+		reader := &testLagPartReader{message: message, partSize: 16384}
+		if err := streams[streamIndex].readMessage(websocket.BinaryMessage, reader, time.Now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return phase, startTime, send
+}
+
+// Amendment 15: a stream's last message may be short, as a browser sends it
+// near the window's end to fit the room its flow control has left; nothing
+// valid can follow one (M6). Once it has arrived whole, and been checked, its
+// stream is done, as one that closed is: it no longer holds the window open
+// past its end, though with no read past the end it would have held it
+// lagSpreadMax. One that straddles the end counts its part before it, as any
+// read does. A first group still held when its stream finishes counts by rule
+// S. Under sampled verification the stream finishes once the sample is
+// decided.
+func TestLagApiUploadShortMessageFinishesStream(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		seconds := func(count int) time.Duration {
+			return time.Duration(count) * time.Second
+		}
+		expectFinal := func(step string, phase *lagApiPhase, end lagApiPhaseEnd, final bool) {
+			t.Helper()
+			if _, _, phaseEnd := phase.state(); phaseEnd != end || phase.windowFinal() != final {
+				t.Fatalf("%s: ended %d, final %t; expected %d, %t", step, phaseEnd, phase.windowFinal(), end, final)
+			}
+		}
+
+		// stream 0's short last message comes before the end; stream 1 goes
+		// on past it, and is done 2 ms into its first group there: the
+		// window is final then, not lagSpreadMax past the end
+		phase, startTime, send := testLagShortUpload(t, true, nil)
+		for count := 0; count < 5; count += 1 {
+			send(0, seconds(count), lagApiBufferByteCount, false)
+			send(1, seconds(count), lagApiBufferByteCount, false)
+		}
+		send(0, testLagMs(4500), 16384, false)
+		expectFinal("a short message before the end", phase, lagApiPhaseRunning, false)
+		send(1, testLagMs(5100), lagApiBufferByteCount, false)
+		expectFinal("a stream past the end", phase, lagApiPhaseEndTime, false)
+		time.Sleep(time.Until(startTime.Add(testLagMs(5102))))
+		synctest.Wait()
+		expectFinal("2 ms into its first group past the end", phase, lagApiPhaseEndTime, false)
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		expectFinal("once stream 1 is done", phase, lagApiPhaseEndTime, true)
+		// every message counts from 0 but each stream's first, which took
+		// the time before the window opened; stream 1's past the end counts
+		// 4100 to 5000 ms of its 4100 to 5100 ms
+		if total := phase.total(); total != 4*65536+16384+4*65536+4*14746 {
+			t.Errorf("counted %d", total)
+		}
+
+		// both streams' short last messages come before the end: the window
+		// is final at the end itself
+		phase, startTime, send = testLagShortUpload(t, true, nil)
+		for count := 0; count < 5; count += 1 {
+			send(0, seconds(count), lagApiBufferByteCount, false)
+			if count < 4 {
+				send(1, seconds(count), lagApiBufferByteCount, false)
+			}
+		}
+		send(1, testLagMs(3500), 16384, false)
+		send(0, testLagMs(4500), 16384, false)
+		time.Sleep(time.Until(startTime.Add(5*time.Second - time.Nanosecond)))
+		synctest.Wait()
+		expectFinal("before the end", phase, lagApiPhaseRunning, false)
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		expectFinal("at the end", phase, lagApiPhaseEndTime, true)
+
+		// a short last message that straddles the end counts its part before
+		// it, 4050 to 5000 of 4050 to 5050 ms, and with the other stream
+		// finished the window is final as soon as it has arrived
+		phase, startTime, send = testLagShortUpload(t, true, nil)
+		for count := 0; count < 5; count += 1 {
+			send(0, seconds(count), lagApiBufferByteCount, false)
+			send(1, seconds(count), lagApiBufferByteCount, false)
+		}
+		send(1, testLagMs(4500), 16384, false)
+		send(0, testLagMs(5050), 16384, false)
+		expectFinal("a short message that straddles the end", phase, lagApiPhaseEndTime, true)
+		if total := phase.total(); total != 8*65536+16384+15565 {
+			t.Errorf("counted %d", total)
+		}
+
+		// a stream whose only message is short: its first group, held,
+		// counts by rule S once the message is whole, 1000 to 2000 ms
+		phase, _, send = testLagShortUpload(t, true, nil)
+		send(1, 0, lagApiBufferByteCount, false)
+		send(0, seconds(2), 16384, false)
+		testLagExpectSeries(t, phase, "a first group held", 0, 0, 0, 0, 4096, 4096, 4096, 4096)
+		phase.finish(lagApiPhaseEndClosed)
+
+		// under sampled verification, chosen or not, the stream finishes once
+		// the sample is decided; a chosen one that fails is a mismatch
+		for _, chosen := range []bool{true, false} {
+			phase, startTime, send = testLagShortUpload(t, false, func() bool {
+				return chosen
+			})
+			for count := 0; count < 4; count += 1 {
+				send(0, seconds(count), lagApiBufferByteCount, false)
+				send(1, seconds(count), lagApiBufferByteCount, false)
+			}
+			send(0, testLagMs(3500), 16384, false)
+			send(1, testLagMs(3500), 16384, false)
+			time.Sleep(time.Until(startTime.Add(5 * time.Second)))
+			synctest.Wait()
+			expectFinal(fmt.Sprintf("sampled, chosen %t", chosen), phase, lagApiPhaseEndTime, true)
+		}
+		phase, _, send = testLagShortUpload(t, false, func() bool {
+			return true
+		})
+		send(0, 0, lagApiBufferByteCount, false)
+		send(0, seconds(1), 16384, true)
+		expectFinal("a chosen short message that fails", phase, lagApiPhaseEndMismatch, true)
 	})
 }
 
