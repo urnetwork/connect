@@ -249,13 +249,30 @@ func TestWindowCompressionResidenceGrowsSmallOpening(t *testing.T) {
 	}
 }
 
+// The interior round trips run their parity cover; the two boundary round
+// trips keep full grids in TestWindowPathDeterministicPerformanceBoundaries.
+func TestWindowPathDeterministicPerformanceMatrix(t *testing.T) {
+	checkWindowDeterministicPerformanceCells(t, false)
+}
+
+// The 300 µs and deep-flight 400 ms boundaries meet both flow counts and both
+// compression states; this half of the matrix holds its deepest flights.
+func TestWindowPathDeterministicPerformanceBoundaries(t *testing.T) {
+	checkWindowDeterministicPerformanceCells(t, true)
+}
+
 // Every reported/design-point RTT is exercised with one/eight offered flows
 // and immediate/compressed ACKs. A constant window with the same memory and
 // receiver bounds calibrates the fixture's attainable payload rate per cell.
-func TestWindowPathDeterministicPerformanceMatrix(t *testing.T) {
+// Two tests split the cells at the boundary round trips, so each cell runs once.
+func checkWindowDeterministicPerformanceCells(t *testing.T, boundaries bool) {
+	t.Helper()
 	assertMessagePoolOwnership(t)
 	roundTrips := envDurations(t, "CONNECT_WINDOW_MODEL_RTT_US", time.Microsecond, windowDeterministicRoundTrips())
 	for _, cell := range windowDeterministicPerformanceCells(roundTrips, os.Getenv("CONNECT_WINDOW_MODEL_RTT_US") != "") {
+		if windowDeterministicBoundary(cell.RoundTrip) != boundaries {
+			continue
+		}
 		t.Run(fmt.Sprintf("rtt=%s/flows=%d/compression=%s", cell.RoundTrip, cell.Flows, cell.Compression), func(t *testing.T) {
 			t.Parallel()
 			readings := measureWindowPathArms(t, max(100*time.Millisecond, 2*cell.RoundTrip), []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
