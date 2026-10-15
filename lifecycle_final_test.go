@@ -1242,7 +1242,8 @@ func TestPeerConnPionStartupAndTeardownAreSerialized(t *testing.T) {
 		consumingLifecycleSignalSender{},
 		settings,
 		func() (*webrtc.PeerConnection, context.CancelFunc, error) {
-			pc, createErr := webrtc.NewPeerConnection(webrtc.Configuration{})
+			// the active Run gathers, which must not join the mDNS groups
+			pc, createErr := newTestPionPeerConnection()
 			return pc, func() {}, createErr
 		},
 	)

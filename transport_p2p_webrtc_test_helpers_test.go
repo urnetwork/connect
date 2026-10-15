@@ -14,6 +14,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pion/ice/v4"
+	"github.com/pion/webrtc/v4"
 )
 
 // Tests are external owners of every manager they create. Close only requests
@@ -52,6 +55,17 @@ func newTestWebRtcManager(
 		closeTestWebRtcManager(t, manager)
 	})
 	return manager
+}
+
+// newTestPionPeerConnection is a bare Pion PeerConnection with Pion's default
+// codecs and interceptors but multicast DNS off, as the shipped factory sets
+// it. With Pion's default (query only), gathering joins 224.0.0.251 and
+// ff02::fb on every up interface, and the host sends IGMP and MLD reports.
+func newTestPionPeerConnection() (*webrtc.PeerConnection, error) {
+	settingEngine := webrtc.SettingEngine{}
+	settingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
+	return api.NewPeerConnection(webrtc.Configuration{})
 }
 
 // A test manager offers no server of the shipped STUN pool: one that clears
