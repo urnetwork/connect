@@ -56,12 +56,15 @@ const lagApiMaxIntervalCount = 40
 const lagSpreadMax = time.Second
 
 // Reads of an upload stream that arrive within this of the first read of
-// their group are one group, back to back, and spread from where the group's
-// span starts (M6 R1, amendment 15): a burst released after a stall spreads, all
-// of it, over the stall. It is measured from the group's first read, not the
-// previous read, so a steady fast stream is cut into groups this long rather
-// than smeared over a long span. The browser groups its download reads the
-// same way.
+// their group, inclusive, are one group, back to back, and spread from where
+// the group's span starts (M6 R1, amendment 15): a burst released after a
+// stall spreads, all of it, over the stall. It is measured from the group's
+// first read, not the previous read, so a steady fast stream is cut into
+// groups this long rather than smeared over a long span. The browser groups
+// its download reads the same way. So a stream is done this long after the
+// first read of its first group that begins at or after the window's end:
+// only a read that joins that group can count before the end, and every
+// later group spans from the end on (M6 R3).
 const lagSpreadJoin = 2 * time.Millisecond
 
 // How long past a download window its streams may go on (M5, M7). Each keeps
@@ -225,11 +228,14 @@ type lagApiPhase struct {
 	lastCountedTime time.Time
 	end             lagApiPhaseEnd
 	endedTime       time.Time
-	// nothing more counts in the window, nor goes on past it (amendment 15),
-	// and the timer that makes an upload's window final lagSpreadMax after
-	// its end
-	final      bool
-	finalTimer *time.Timer
+	// nothing more counts in the window, nor goes on past it (amendment 15);
+	// the timer that makes an upload's window final lagSpreadMax after its
+	// end, and the one that makes it final when its last open stream is done,
+	// set for that time
+	final         bool
+	finalTimer    *time.Timer
+	doneTimer     *time.Timer
+	doneTimerTime time.Time
 }
 
 // How one upload stream's reads count (M6, amendment 15). Its size is fixed,
@@ -244,9 +250,18 @@ type lagApiStreamCount struct {
 	// the bytes of its first group, held uncounted until its second group
 	// begins; zero once they count
 	heldByteCount int
-	// a read of the stream spanned from the window's end or later, so nothing
-	// it reads after can count
-	done bool
+	// lagSpreadJoin after the first read of its first group that began at or
+	// after the window's end, zero before: nothing it reads after can count
+	doneTime time.Time
+	// a mismatch past the window's end stopped it, so nothing it reads counts
+	stopped bool
+}
+
+// Whether upload stream k is done at now, with the phase's lock held: nothing
+// it reads from now on can count (M6 R3, amendment 15).
+func (self *lagApiPhase) streamDoneWithLock(streamIndex int, now time.Time) bool {
+	count := &self.streamCounts[streamIndex]
+	return count.stopped || (!count.doneTime.IsZero() && now.After(count.doneTime))
 }
 
 // Opens a phase now (M4). Its window waits for the first byte, for at most
@@ -349,7 +364,7 @@ func (self *lagApiPhase) takes(streamIndex int, now time.Time) bool {
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.countingWithLock() && !self.streamCounts[streamIndex].done
+	return self.countingWithLock() && !self.streamDoneWithLock(streamIndex, now)
 }
 
 // Whether a stream may still move bytes in the phase: it has not ended, and
@@ -389,7 +404,7 @@ func (self *lagApiPhase) closeStream(streamIndex int) {
 			return false
 		}
 		self.placeHeldWithLock(streamIndex)
-		return self.finalIfDoneWithLock()
+		return self.finalIfDoneWithLock(time.Now())
 	}()
 	self.changed(false, finalized)
 }
@@ -456,7 +471,7 @@ func (self *lagApiPhase) finishWithLock(now time.Time, end lagApiPhaseEnd) (bool
 		// their spans before it, until every open stream is done or no read
 		// can reach back before the end
 		self.finalTimer = time.AfterFunc(self.endTime.Add(lagSpreadMax).Sub(now), self.finalize)
-		return true, self.finalIfDoneWithLock()
+		return true, self.finalIfDoneWithLock(now)
 	}
 	return true, false
 }
@@ -498,25 +513,61 @@ func (self *lagApiPhase) finalizeWithLock() {
 	if self.finalTimer != nil {
 		self.finalTimer.Stop()
 	}
+	if self.doneTimer != nil {
+		self.doneTimer.Stop()
+	}
 	for streamIndex := range self.streamCounts {
 		self.placeHeldWithLock(streamIndex)
 	}
 }
 
-// Makes an upload's window final once it has run out and every stream still
-// open is done (M6 R3, amendment 15), with the phase's lock held. Whether it
-// did.
-func (self *lagApiPhase) finalIfDoneWithLock() bool {
+// Makes an upload's window final at now once it has run out and every stream
+// still open is done (M6 R3, amendment 15), with the phase's lock held. When
+// every open stream has a time it is done by, though not all have passed,
+// sets the done timer for the latest, so the window is final then without
+// waiting for another read. Whether it is final now.
+func (self *lagApiPhase) finalIfDoneWithLock(now time.Time) bool {
 	if self.direction != lagApiDirectionUpload || self.end != lagApiPhaseEndTime || self.final {
 		return false
 	}
+	var doneTime time.Time
 	for streamIndex, open := range self.openStreams {
-		if open && !self.streamCounts[streamIndex].done {
+		count := &self.streamCounts[streamIndex]
+		if !open || count.stopped {
+			continue
+		}
+		if count.doneTime.IsZero() {
+			// it may still count, until lagSpreadMax past the end
 			return false
 		}
+		if doneTime.Before(count.doneTime) {
+			doneTime = count.doneTime
+		}
 	}
-	self.finalizeWithLock()
-	return true
+	if doneTime.IsZero() || now.After(doneTime) {
+		self.finalizeWithLock()
+		return true
+	}
+	if !self.doneTimerTime.Equal(doneTime) {
+		if self.doneTimer != nil {
+			self.doneTimer.Stop()
+		}
+		self.doneTimerTime = doneTime
+		self.doneTimer = time.AfterFunc(doneTime.Add(time.Nanosecond).Sub(now), self.finalizeIfDone)
+	}
+	return false
+}
+
+// The done timer's: makes the window final if every open stream is done by
+// now, and is set again if not (M6 R3, amendment 15).
+func (self *lagApiPhase) finalizeIfDone() {
+	finalized := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.doneTimerTime = time.Time{}
+		return self.finalIfDoneWithLock(time.Now())
+	}()
+	self.changed(false, finalized)
 }
 
 // Whether reads may still count (M6, amendment 15), with the phase's lock
@@ -656,10 +707,13 @@ func (self *lagApiPhase) count(now time.Time, byteCount int) {
 //     by rule S (placeHeldWithLock).
 //   - R3, the window's end: past it the phase has ended by its time, but a
 //     stream's reads still count for the part of their spans before the end,
-//     which the read that straddles the end carries. A stream whose read
-//     spans from the end on is done: its spans are contiguous, so nothing it
-//     reads after could count. The window is final once every stream still
-//     open is done, or lagSpreadMax past the end.
+//     which the read that straddles the end carries. A stream is done
+//     lagSpreadJoin after the first read of its first group that begins at
+//     or after the end: a read joins that group only within lagSpreadJoin,
+//     and every later group spans from its previous read, at or after the
+//     end, so nothing the stream reads after could count. So one read past
+//     the end will do, with no second to show it. The window is final once
+//     every stream still open is done, or lagSpreadMax past the end.
 //
 // Reads count under the phase's lock and only until the window is final, so
 // nothing is added after: the total the browser is then told is the total the
@@ -681,7 +735,7 @@ func (self *lagApiPhase) receive(streamIndex int, arrivedTime time.Time, byteCou
 		defer self.stateLock.Unlock()
 		series := self.series.Load()
 		count := &self.streamCounts[streamIndex]
-		if series == nil || !self.countingWithLock() || count.done {
+		if series == nil || !self.countingWithLock() {
 			return false, false, false
 		}
 		ended := false
@@ -689,7 +743,7 @@ func (self *lagApiPhase) receive(streamIndex int, arrivedTime time.Time, byteCou
 		if self.end == lagApiPhaseRunning && !arrivedTime.Before(self.endTime) {
 			ended, finalized = self.finishWithLock(arrivedTime, lagApiPhaseEndTime)
 		}
-		if !arrivedTime.Before(self.endTime.Add(lagSpreadMax)) {
+		if arrivedTime.After(self.endTime.Add(lagSpreadMax)) {
 			// no read this late reaches back before the end: the window is
 			// final lagSpreadMax past it, whatever the timer's delay, so this
 			// read arrived once it was, and is not taken in
@@ -698,6 +752,11 @@ func (self *lagApiPhase) receive(streamIndex int, arrivedTime time.Time, byteCou
 		}
 		if self.final {
 			return false, ended, finalized
+		}
+		if self.streamDoneWithLock(streamIndex, arrivedTime) {
+			// nothing it reads now can count; and by its time the last open
+			// stream may be done
+			return false, ended, self.finalIfDoneWithLock(arrivedTime) || finalized
 		}
 		if count.previousTime.IsZero() || arrivedTime.After(count.groupTime.Add(lagSpreadJoin)) {
 			// a new group, which spans from the stream's previous read
@@ -714,22 +773,27 @@ func (self *lagApiPhase) receive(streamIndex int, arrivedTime time.Time, byteCou
 			}
 			count.groupTime = arrivedTime
 			count.groupSpanStart = spanStart
+			if !arrivedTime.Before(self.endTime) && count.doneTime.IsZero() {
+				// its first group to begin at or after the end: only a read
+				// that joins it can still count before the end
+				count.doneTime = arrivedTime.Add(lagSpreadJoin)
+			}
 		}
 		if count.previousTime.IsZero() || 0 < count.heldByteCount {
 			// the stream's first group, held until its second begins
 			count.heldByteCount += byteCount
-			count.previousTime = arrivedTime
-			return true, ended, finalized
-		}
-		if !count.groupSpanStart.Before(self.endTime) {
-			// it spans from the end on, so neither it nor what follows counts,
+		} else {
+			// its part before the end: none, when it spans from the end on,
 			// though its bytes moved
-			count.done = true
-			return true, ended, self.finalIfDoneWithLock() || finalized
+			series.addSpread(count.groupSpanStart, arrivedTime, byteCount, self.endTime)
+			if count.groupSpanStart.Before(self.endTime) {
+				self.countedWithLock(arrivedTime)
+			}
 		}
-		series.addSpread(count.groupSpanStart, arrivedTime, byteCount, self.endTime)
 		count.previousTime = arrivedTime
-		self.countedWithLock(arrivedTime)
+		if self.end == lagApiPhaseEndTime {
+			finalized = self.finalIfDoneWithLock(arrivedTime) || finalized
+		}
 		return true, ended, finalized
 	}()
 	self.changed(ended, finalized)
@@ -816,8 +880,8 @@ func (self *lagApiPhase) mismatch(streamIndex int, now time.Time) {
 		if !self.countingWithLock() {
 			return ended, finalized
 		}
-		self.streamCounts[streamIndex].done = true
-		return ended, self.finalIfDoneWithLock() || finalized
+		self.streamCounts[streamIndex].stopped = true
+		return ended, self.finalIfDoneWithLock(now) || finalized
 	}()
 	self.changed(ended, finalized)
 }

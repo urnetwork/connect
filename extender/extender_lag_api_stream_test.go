@@ -608,9 +608,9 @@ func TestLagApiUploadFirstGroup(t *testing.T) {
 // An upload phase in a bubble with streamCount streams open and its window
 // open now, whose streams each count from 100 ms, 1000 bytes each in interval
 // 0: their first groups, at 0, took the time before the window opened. Each
-// call to its arrive sleeps until ms past the window's first byte, then
+// call to its arrive sleeps until after past the window's first byte, then
 // counts a read that arrives then, so its timers run as they would.
-func testLagFinalPhase(streamCount int) (*lagApiPhase, time.Time, *atomic.Int64, func(streamIndex int, ms int, byteCount int)) {
+func testLagFinalPhase(streamCount int) (*lagApiPhase, time.Time, *atomic.Int64, func(streamIndex int, after time.Duration, byteCount int)) {
 	api := &extenderLagApi{budget: newLagApiBudget(0)}
 	notifyCount := &atomic.Int64{}
 	phase := newLagApiPhase(api, context.Background(), lagApiDirectionUpload,
@@ -622,17 +622,22 @@ func testLagFinalPhase(streamCount int) (*lagApiPhase, time.Time, *atomic.Int64,
 	}
 	startTime := time.Now()
 	phase.window(startTime)
-	arrive := func(streamIndex int, ms int, byteCount int) {
-		time.Sleep(time.Until(startTime.Add(time.Duration(ms) * time.Millisecond)))
+	arrive := func(streamIndex int, after time.Duration, byteCount int) {
+		time.Sleep(time.Until(startTime.Add(after)))
 		phase.receive(streamIndex, time.Now(), byteCount)
 	}
 	for k := 0; k < streamCount; k += 1 {
 		arrive(k, 0, 1000)
 	}
 	for k := 0; k < streamCount; k += 1 {
-		arrive(k, 100, 1000)
+		arrive(k, 100*time.Millisecond, 1000)
 	}
 	return phase, startTime, notifyCount, arrive
+}
+
+// ms milliseconds.
+func testLagMs(ms float64) time.Duration {
+	return time.Duration(ms * float64(time.Millisecond))
 }
 
 // The 20 intervals of a 5 s window: first, then zeros, then the tail.
@@ -645,55 +650,69 @@ func testLagWindowSeries(first uint64, tail ...uint64) []uint64 {
 
 // Amendment 15: past the window's end the phase has ended by its time, at the
 // end, but its streams' reads still count for the part of their spans before
-// the end. A stream whose read spans from the end on is done, and nothing it
-// reads after counts. The window is final once every stream still open is
-// done -- a stream that closes is no longer open -- or lagSpreadMax past the
-// end, by the clock or by a read that arrives that late; then nothing more
-// counts, and the session is told. The series is still the window's 20
+// the end. A stream is done lagSpreadJoin after the first read of its first
+// group that begins at or after the end: a read that joins that group, up to
+// lagSpreadJoin after its first read, still counts its part before the end,
+// and nothing the stream reads after does. The window is final once every
+// stream still open is done -- when no read comes to show it, by the done
+// timer; a stream that closes is no longer open -- or lagSpreadMax past the
+// end, by the clock or by a read that arrives later than that. Then nothing
+// more counts, and the session is told. The series is still the window's 20
 // intervals.
 func TestLagApiUploadWindowFinal(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// every stream done, before lagSpreadMax past the end
+		// every stream done, with no read to show it
 		phase, startTime, notifyCount, arrive := testLagFinalPhase(3)
 		// 3900 to 4900 ms
-		arrive(0, 4900, 1000)
+		arrive(0, testLagMs(4900), 1000)
 		// past the end the phase has ended by its time, at the end, and a
-		// read counts for its span's part before it: 4900 to 5000 of 4900 to
-		// 5100
-		arrive(0, 5100, 1000)
+		// read counts for its span's part before it, 4900 to 5000 of 4900 to
+		// 5100. It begins stream 0's first group past the end.
+		arrive(0, testLagMs(5100), 1000)
 		if _, endedTime, end := phase.state(); end != lagApiPhaseEndTime || !endedTime.Equal(startTime.Add(5*time.Second)) || phase.windowFinal() {
 			t.Errorf("ended %d at %s, final %t", end, endedTime.Sub(startTime), phase.windowFinal())
 		}
 		testLagExpectSeries(t, phase, "a read that straddles the end", testLagWindowSeries(3000, 100, 250, 250, 250, 150+500)...)
+		// 2 ms later a read still joins that group, and counts its part
+		// before the end: 100 of the 202 ms from 4900
+		arrive(0, testLagMs(5102), 2020)
+		testLagExpectSeries(t, phase, "a read that joins the group", testLagWindowSeries(3000, 100, 250, 250, 250, 650+1000)...)
+		// after that, stream 0 is done: nothing more of it counts
+		arrive(0, testLagMs(5102.001), 50000)
+		testLagExpectSeries(t, phase, "a read once the stream is done", testLagWindowSeries(3000, 100, 250, 250, 250, 1650)...)
 		// 4200 to 5200 ms, of which 4200 to 5000 counts
-		arrive(1, 5200, 2000)
+		arrive(1, testLagMs(5200), 2000)
 		testLagExpectSeries(t, phase, "a stream quiet since before the end",
-			testLagWindowSeries(3000, 100, 250+100, 250+500, 250+500, 650+500)...)
-		// both span from the end on: streams 0 and 1 are done, and count
-		// nothing more
-		arrive(1, 5250, 500)
-		arrive(0, 5300, 1000)
-		arrive(0, 5310, 50000)
+			testLagWindowSeries(3000, 100, 250+100, 250+500, 250+500, 1650+500)...)
+		// stream 2 closes and is no longer open; stream 1 is not yet done
+		phase.closeStream(2)
 		if phase.windowFinal() {
 			t.Error("final with a stream open and not done")
 		}
-		// stream 2 closes: every stream still open is done
+		// stream 1 is done 2 ms after its group began, with no read to show
+		// it, and the window is final
 		notified := notifyCount.Load()
-		phase.closeStream(2)
-		if !phase.windowFinal() || notifyCount.Load() <= notified {
-			t.Errorf("final %t, notified %d then %d", phase.windowFinal(), notified, notifyCount.Load())
+		time.Sleep(time.Until(startTime.Add(testLagMs(5202))))
+		synctest.Wait()
+		if phase.windowFinal() {
+			t.Error("final with a read still able to join a group")
 		}
-		arrive(1, 5400, 1000)
-		testLagExpectSeries(t, phase, "final", testLagWindowSeries(3000, 100, 350, 750, 750, 1150)...)
-		if byteCount, countedTime := phase.progress(); byteCount != 3000+3100 || !countedTime.Equal(startTime.Add(5200*time.Millisecond)) {
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		if !phase.windowFinal() || notifyCount.Load() <= notified {
+			t.Errorf("final %t once every stream was done, notified %d then %d", phase.windowFinal(), notified, notifyCount.Load())
+		}
+		arrive(1, testLagMs(5400), 1000)
+		testLagExpectSeries(t, phase, "final", testLagWindowSeries(3000, 100, 350, 750, 750, 2150)...)
+		if byteCount, countedTime := phase.progress(); byteCount != 3000+4100 || !countedTime.Equal(startTime.Add(testLagMs(5200))) {
 			t.Errorf("counted %d to %s", byteCount, countedTime.Sub(startTime))
 		}
 
-		// a stream never done: final lagSpreadMax past the end, by the clock
+		// a stream with no read past the end is never done: final
+		// lagSpreadMax past the end, by the clock
 		phase, startTime, notifyCount, arrive = testLagFinalPhase(2)
-		arrive(0, 4900, 1000)
-		arrive(0, 5100, 1000)
-		arrive(0, 5300, 1000)
+		arrive(0, testLagMs(4900), 1000)
+		arrive(0, testLagMs(5100), 1000)
 		time.Sleep(time.Until(startTime.Add(6*time.Second - time.Nanosecond)))
 		synctest.Wait()
 		if phase.windowFinal() {
@@ -705,20 +724,24 @@ func TestLagApiUploadWindowFinal(t *testing.T) {
 		if !phase.windowFinal() || notifyCount.Load() <= notified {
 			t.Errorf("final %t lagSpreadMax past the end, notified %d then %d", phase.windowFinal(), notified, notifyCount.Load())
 		}
-		arrive(1, 6100, 1000)
+		arrive(1, testLagMs(6100), 1000)
 		testLagExpectSeries(t, phase, "final by the clock", testLagWindowSeries(2000, 100, 250, 250, 250, 650)...)
 
-		// final by a read that arrives lagSpreadMax past the end or later,
-		// with the clock still early: its span starts past the end, and so
-		// does any later one
+		// final by a read that arrives later than lagSpreadMax past the end,
+		// with the clock still early: no read that late can reach back before
+		// the end. One exactly lagSpreadMax past it spans from the end on.
 		phase, startTime, _, _ = testLagFinalPhase(2)
-		phase.receive(0, startTime.Add(5500*time.Millisecond), 1000)
+		phase.receive(0, startTime.Add(testLagMs(5500)), 1000)
 		if _, endedTime, end := phase.state(); end != lagApiPhaseEndTime || !endedTime.Equal(startTime.Add(5*time.Second)) || phase.windowFinal() {
 			t.Errorf("ended %d at %s by a read, final %t", end, endedTime.Sub(startTime), phase.windowFinal())
 		}
-		phase.receive(1, startTime.Add(6000*time.Millisecond), 1000)
+		phase.receive(1, startTime.Add(testLagMs(6000)), 1000)
+		if phase.windowFinal() {
+			t.Error("final on a read exactly lagSpreadMax past the end")
+		}
+		phase.receive(1, startTime.Add(testLagMs(6000.001)), 1000)
 		if !phase.windowFinal() {
-			t.Error("not final after a read lagSpreadMax past the end")
+			t.Error("not final after a read later than lagSpreadMax past the end")
 		}
 		testLagExpectSeries(t, phase, "final by a late read", testLagWindowSeries(2000, 0, 0, 0, 250, 250)...)
 	})
@@ -728,9 +751,9 @@ func TestLagApiUploadWindowFinal(t *testing.T) {
 // the ticket's cap and the daily budget for all its bytes, though only its
 // part before the end counts, or none of it for a read that spans from the
 // end on: they are bytes the extender moved, as a download's writes in its
-// grace are. Reads once the stream is done, or the window final, are drained
-// and draw on neither; a read lagSpreadMax past the end arrives once the
-// window is final.
+// grace are. Reads once the stream is done, lagSpreadJoin after its first
+// group past the end began, or once the window is final, are drained and draw
+// on neither.
 func TestLagApiUploadPastTheEndDrawsOnTheCap(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		api := &extenderLagApi{budget: newLagApiBudget(0)}
@@ -741,14 +764,13 @@ func TestLagApiUploadPastTheEndDrawsOnTheCap(t *testing.T) {
 		}
 		startTime := time.Now()
 		phase.window(startTime)
-		at := func(ms int) time.Time {
-			return startTime.Add(time.Duration(ms) * time.Millisecond)
+		at := func(ms float64) time.Time {
+			return startTime.Add(testLagMs(ms))
 		}
 		for k := 0; k < 2; k += 1 {
 			phase.receive(k, startTime, 1000)
 			phase.receive(k, at(100), 1000)
 		}
-		phase.receive(0, at(4900), 1000)
 		expectDrawn := func(step string, drawn uint64, counted uint64) {
 			t.Helper()
 			if phase.consumed() != drawn || uint64(lagTestDurationBudgetUsed(api.budget)) != drawn || phase.total() != counted {
@@ -757,23 +779,29 @@ func TestLagApiUploadPastTheEndDrawsOnTheCap(t *testing.T) {
 			}
 		}
 		// both streams' first groups drew, and counted nothing
-		expectDrawn("inside the window", 5000, 3000)
-		// 4900 to 5100 ms: half counts, all of it draws
+		expectDrawn("inside the window", 4000, 2000)
+		// stream 0: 3900 to 4900 ms, then 4900 to 5100 ms, its first group
+		// past the end: half of that counts, all of it draws
+		phase.receive(0, at(4900), 1000)
 		phase.receive(0, at(5100), 1000)
 		expectDrawn("a read that straddles the end", 6000, 3500)
-		// spans from the end on: none counts, all of it draws, and the stream
-		// is done
-		phase.receive(0, at(5300), 1000)
-		expectDrawn("a read that spans from the end on", 7000, 3500)
-		phase.receive(0, at(5400), 1000)
-		expectDrawn("once the stream is done", 7000, 3500)
-		// lagSpreadMax past the end: the window is final, and nothing more is
-		// taken in
-		phase.receive(1, at(6000), 1000)
-		phase.receive(1, at(6100), 1000)
-		expectDrawn("once the window is final", 7000, 3500)
+		// stream 1: a group that began before the end, joined 2 ms later past
+		// it: 999 of the joining read's 1000 bytes count, all of them draw
+		phase.receive(1, at(4999), 1000)
+		phase.receive(1, at(5001), 1000)
+		expectDrawn("a read that joins a group from before the end", 8000, 5499)
+		// then stream 1's first group past the end, which spans from 5001 ms:
+		// none of it counts, all of it draws, and so does a read that joins it
+		phase.receive(1, at(5004), 1000)
+		phase.receive(1, at(5006), 1000)
+		expectDrawn("reads that span from the end on", 10000, 5499)
+		// once each stream is done, nothing more of it is taken in: with both
+		// done, the window is final
+		phase.receive(1, at(5006.001), 1000)
+		phase.receive(0, at(5102.001), 1000)
+		expectDrawn("once the streams are done", 10000, 5499)
 		if !phase.windowFinal() {
-			t.Error("not final lagSpreadMax past the end")
+			t.Error("not final with every stream done")
 		}
 	})
 }
@@ -814,12 +842,11 @@ func TestLagApiUploadProgressReport(t *testing.T) {
 		if _, _, _, ok := phase.progressReport(true); ok {
 			t.Error("the last progress before the window ended")
 		}
-		// the window runs out, and a read straddles its end: ended by its
-		// time, not final while the stream may still count, so no progress
-		// goes out
-		time.Sleep(time.Until(startTime.Add(time.Second)))
-		synctest.Wait()
-		phase.receive(0, startTime.Add(1100*time.Millisecond), 1000)
+		// the window runs out, and a read straddles its end, beginning the
+		// stream's first group past it: ended by its time, and not final
+		// while a read can still join that group, so no progress goes out
+		time.Sleep(time.Until(startTime.Add(1100 * time.Millisecond)))
+		phase.receive(0, time.Now(), 1000)
 		if _, _, end := phase.state(); end != lagApiPhaseEndTime || phase.windowFinal() {
 			t.Fatalf("ended %d, final %t", end, phase.windowFinal())
 		}
@@ -828,12 +855,13 @@ func TestLagApiUploadProgressReport(t *testing.T) {
 				t.Errorf("last %t: a progress at %d ms before the window was final", last, ms)
 			}
 		}
-		// final lagSpreadMax past the end: the window's length and the final
-		// total, 900 bytes of the straddling read's 1000 among it
-		time.Sleep(time.Until(startTime.Add(time.Second + lagSpreadMax)))
+		// final once the stream is done, lagSpreadJoin after that group
+		// began: the window's length and the final total, 900 bytes of the
+		// straddling read's 1000 among it
+		time.Sleep(lagSpreadJoin + time.Nanosecond)
 		synctest.Wait()
-		if byteCount, ms, at, ok := phase.progressReport(true); !ok || byteCount != 1900 || ms != 1000 || at != 1000 {
-			t.Errorf("last progress of %d at %d ms, at %f, sent %t", byteCount, ms, at, ok)
+		if byteCount, ms, at, ok := phase.progressReport(true); !phase.windowFinal() || !ok || byteCount != 1900 || ms != 1000 || at != 1000 {
+			t.Errorf("last progress of %d at %d ms, at %f, sent %t, final %t", byteCount, ms, at, ok, phase.windowFinal())
 		}
 		if _, _, _, ok := phase.progressReport(false); ok {
 			t.Error("a progress after the window was final")
@@ -873,8 +901,8 @@ func TestLagApiUploadMismatchPastTheEnd(t *testing.T) {
 			t.Fatalf("ended %d at %s, final %t", end, endedTime.Sub(startTime), phase.windowFinal())
 		}
 		phase.receive(0, at(5100), 1000)
-		// stream 1's read that straddles the end still counts, and then it
-		// is done too
+		// stream 1's read that straddles the end still counts, and the
+		// stream is done 2 ms after it
 		phase.receive(1, at(5200), 2000)
 		phase.receive(1, at(5300), 1000)
 		if !phase.windowFinal() {
