@@ -77,6 +77,11 @@ actually use.
 - Every bug fix in every repository must include a deterministic regression test that exercises its root cause.
 - When a bug is found, look for adjacent and similar issues before considering the fix complete. A bug represents a flaw in the reasoning that produced it, and the same flaw may be applied elsewhere — check the surrounding code, sibling call sites, and other copies of the same pattern.
 
+## Commits
+
+- No AI attribution in commit messages, in any repository: no `Co-authored-by:` trailer for anyone, no "Generated with" footer or other trailer that names an AI tool, no AI tool's noreply address, and no AI session or task link. Commits that already have one stay as they are; history is not rewritten (owner decision, 2026-10-14).
+- `.githooks/commit-msg` rejects such a message. Install it once per clone, and its worktrees share it: `git config core.hooksPath .githooks`, or, in a clone that keeps git-lfs or gofmt hooks in `.git/hooks`, a copy at `.git/hooks/commit-msg`. Do not use `--no-verify` to get past it. `.githooks/commit-msg --scan <git log arguments>` lists commits that reached a branch without the check.
+
 ## Routing keys
 
 A routing key is a value that decides *which* instance of something a message belongs to: the sequence lane (`Pack.force_stream` / `Pack.companion_contract`), the session role and identity companion (`TransferFrame.session_role` / `session_companion`), the handshake generation (`EncryptedControl.epoch_id`). Adding one is never a single-site change.
