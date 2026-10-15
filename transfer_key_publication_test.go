@@ -1,12 +1,18 @@
-// The actual publisher writes to a captured route. Its private barrier is the
-// decision point after readiness that publishing and skipping managers both
-// reach; a joined close makes every send final before a negative is read.
+// The actual publisher writes to a captured route, or posts a processed
+// registration to a recording endpoint. Its private barrier is the decision
+// point after readiness that publishing and skipping managers both reach; a
+// joined close makes every send final before a negative is read.
 package connect
 
 import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -19,6 +25,7 @@ func newClientKeyPublicationFixture(
 	t *testing.T,
 	ctx context.Context,
 	settings *ClientSettings,
+	clientOob OutOfBandControl,
 ) (*Client, Route, <-chan struct{}, chan struct{}) {
 	t.Helper()
 	reached := make(chan struct{}, 4)
@@ -34,7 +41,7 @@ func newClientKeyPublicationFixture(
 		case <-ctx.Done():
 		}
 	}
-	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	client := NewClient(ctx, NewId(), clientOob, settings)
 	route := make(Route, 64)
 	client.RouteManager().UpdateTransport(NewSendGatewayTransport(), []Route{route})
 	t.Cleanup(func() {
@@ -88,6 +95,54 @@ func routedClientKey(t *testing.T, transferFrameBytes []byte) *protocol.ClientKe
 	return nil
 }
 
+// Answers every processed ClientKey registration at once and hands its key to
+// the test. Only the processed path posts here; native publication is routed.
+func newClientKeyPublicationRegistrationEndpoint(t *testing.T) (*httptest.Server, <-chan []byte) {
+	t.Helper()
+	keys := make(chan []byte, 8)
+	endpoint := newFamilyHttptestServer(t, 4, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/hello" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/connect/control" {
+			http.NotFound(w, r)
+			return
+		}
+		var args ConnectControlArgs
+		if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&args); err != nil {
+			http.Error(w, "invalid control", 400)
+			return
+		}
+		raw, err := base64.StdEncoding.DecodeString(args.Pack)
+		if err != nil {
+			http.Error(w, "invalid pack", 400)
+			return
+		}
+		var pack protocol.Pack
+		if err := ProtoUnmarshal(raw, &pack); err != nil {
+			http.Error(w, "invalid frames", 400)
+			return
+		}
+		for _, frame := range pack.Frames {
+			message, err := FromFrame(frame)
+			if err != nil {
+				continue
+			}
+			if clientKey, ok := message.(*protocol.ClientKey); ok {
+				select {
+				case keys <- bytes.Clone(clientKey.PublicKey):
+				default:
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"pack":""}`)
+	}))
+	t.Cleanup(endpoint.Close)
+	return endpoint, keys
+}
+
 // The zero value keeps today's behavior: the released publisher writes the
 // client's actual key on its control route.
 func TestClientKeyPublicationDefaultSendsClientKeyFrame(t *testing.T) {
@@ -97,7 +152,7 @@ func TestClientKeyPublicationDefaultSendsClientKeyFrame(t *testing.T) {
 	if settings.SkipClientKeyPublication {
 		t.Fatal("default client settings skip client key publication")
 	}
-	client, route, reached, release := newClientKeyPublicationFixture(t, ctx, settings)
+	client, route, reached, release := newClientKeyPublicationFixture(t, ctx, settings, NewNoContractClientOob())
 	waitCloseWaitBarrier(t, ctx, reached, "client key publisher")
 	close(release)
 	publicKey := client.ClientKeyManager().PublicKey()
@@ -125,7 +180,7 @@ func TestClientKeyPublicationSkippedSendsNoClientKeyFrame(t *testing.T) {
 	defer cancel()
 	settings := closeWaitClientSettings()
 	settings.SkipClientKeyPublication = true
-	client, route, reached, release := newClientKeyPublicationFixture(t, ctx, settings)
+	client, route, reached, release := newClientKeyPublicationFixture(t, ctx, settings, NewNoContractClientOob())
 	manager := client.ClientKeyManager()
 	if manager == nil {
 		t.Fatal("a client whose key nothing reads was refused its key manager")
@@ -165,21 +220,24 @@ func TestClientKeyPublicationSkippedSendsNoClientKeyFrame(t *testing.T) {
 	}
 }
 
-// A skipped key must have no reader. Every reader constructs without the skip
-// and is refused with it, so the refusal is the contradiction, not the reader.
-func TestClientKeyPublicationSkipRefusesEveryKeyReader(t *testing.T) {
+// A skip that meets a reader of the key is ignored, not refused: the client
+// keeps its key manager and publishes its actual key, natively or through
+// processed registration, as it would without the skip. A misapplied skip
+// costs one registration, never the reader's traffic or signatures.
+func TestClientKeyPublicationSkipYieldsToEveryKeyReader(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	strategy := NewClientStrategyWithDefaults(ctx)
-	defer strategy.Close()
+	t.Cleanup(strategy.Close)
+	endpoint, registeredKeys := newClientKeyPublicationRegistrationEndpoint(t)
 	cases := []struct {
-		reader    string
-		configure func(*ClientSettings)
+		reader       string
+		configure    func(*ClientSettings)
+		registration bool
 	}{
-		{reader: "", configure: func(*ClientSettings) {}},
 		{reader: "a required registration", configure: func(settings *ClientSettings) {
 			settings.ClientKeyRegistrationRequired = true
-		}},
+		}, registration: true},
 		{reader: "a close-report domain", configure: func(settings *ClientSettings) {
 			settings.ContractManagerSettings.CloseReportDomainHash = [32]byte{7}
 		}},
@@ -191,27 +249,52 @@ func TestClientKeyPublicationSkipRefusesEveryKeyReader(t *testing.T) {
 		}},
 	}
 	for _, c := range cases {
-		for _, skip := range []bool{false, true} {
-			clientCtx, clientCancel := context.WithCancel(ctx)
-			settings := closeWaitClientSettings()
-			settings.SkipClientKeyPublication = skip
-			c.configure(settings)
-			// every publisher parks before any send, so no request leaves
-			settings.beforeClientKeyPublishForTest = func() { <-clientCtx.Done() }
-			// the actual processed control, so a required registration
-			// constructs without the skip
-			control := NewApiOutOfBandControl(clientCtx, strategy, "synthetic-publication-token", "https://api.example")
-			client := NewClient(clientCtx, NewId(), control, settings)
-			refused := client.ClientKeyManager() == nil
-			if want := skip && c.reader != ""; refused != want {
-				t.Errorf("reader %q with skip %t: refused %t, want %t", c.reader, skip, refused, want)
+		settings := closeWaitClientSettings()
+		settings.SkipClientKeyPublication = true
+		c.configure(settings)
+		// the actual processed control, so a required registration completes
+		control := NewApiOutOfBandControl(ctx, strategy, "synthetic-publication-token", endpoint.URL)
+		t.Cleanup(func() {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer closeCancel()
+			if err := control.CloseAndWait(closeCtx); err != nil {
+				t.Errorf("close publication control: %v", err)
 			}
-			clientCancel()
-			if err := client.CloseAndWait(ctx); err != nil {
-				t.Error(err)
+		})
+		client, route, reached, release := newClientKeyPublicationFixture(t, ctx, settings, control)
+		manager := client.ClientKeyManager()
+		if manager == nil {
+			t.Errorf("a skip with %s left the client without a key manager", c.reader)
+			continue
+		}
+		waitCloseWaitBarrier(t, ctx, reached, "client key publisher")
+		close(release)
+		publicKey := manager.PublicKey()
+		if c.registration {
+			select {
+			case key := <-registeredKeys:
+				if !bytes.Equal(key, publicKey) {
+					t.Fatalf("a skip with %s registered another key", c.reader)
+				}
+			case <-ctx.Done():
+				t.Fatalf("a skip with %s registered no key", c.reader)
 			}
-			if err := control.CloseAndWait(ctx); err != nil {
-				t.Error(err)
+			if err := manager.WaitForRegistration(ctx); err != nil {
+				t.Fatalf("a skip with %s left registration unready: %v", c.reader, err)
+			}
+			continue
+		}
+		for published := false; !published; {
+			select {
+			case message := <-route:
+				if clientKey := routedClientKey(t, message); clientKey != nil {
+					if !bytes.Equal(clientKey.PublicKey, publicKey) {
+						t.Fatalf("a skip with %s published another key", c.reader)
+					}
+					published = true
+				}
+			case <-ctx.Done():
+				t.Fatalf("a skip with %s published no key", c.reader)
 			}
 		}
 	}

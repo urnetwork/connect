@@ -1601,7 +1601,8 @@ type ClientSettings struct {
 	// control, so the platform holds no registration and `/key/<client_id>`
 	// has no key for this client. Only for a client whose key nothing reads:
 	// no required registration, no close-report domain and encryption off.
-	// Construction refuses it alongside any of those. The zero value publishes.
+	// Any of those outranks it: construction logs an error and publishes
+	// anyway. The zero value publishes.
 	SkipClientKeyPublication bool
 
 	ProtocolVersion int

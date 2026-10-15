@@ -20,10 +20,12 @@ import (
 // this process — it never leaves.
 //
 // `ClientSettings.SkipClientKeyPublication` keeps the public half local
-// too, for a client whose key nothing reads. The constructor refuses it
-// alongside any reader: a required registration, a close-report domain
-// whose signed originals reference the registration, or per-peer sessions
-// whose peers verify the cert signature and identity proof against it.
+// too, for a client whose key nothing reads. Any reader outranks it: a
+// required registration, a close-report domain whose signed originals
+// reference the registration, or per-peer sessions whose peers verify the
+// cert signature and identity proof against it. The constructor then logs
+// an error and publishes anyway, so a misapplied skip costs one
+// registration rather than the reader's traffic or signatures.
 //
 // Trust model. The platform is not trusted to honestly distribute
 // per-client public keys for new ClientIds. The expectation is that
@@ -72,7 +74,7 @@ type ClientKeyManager struct {
 	publicKey  ed25519.PublicKey
 	// The constructor owns this value alongside the original close-report domain.
 	historyDomainHash [32]byte
-	// Captured with the settings the constructor checked for a reader of the key.
+	// The settings' skip, unless the constructor found a reader of the key.
 	skipPublication bool
 
 	controlSync         *ControlSync
@@ -95,16 +97,22 @@ type ClientKeyManager struct {
 // fresh seed is generated. Callers can read the running seed back via
 // `Seed()` to persist it across restarts.
 func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager, error) {
-	if client.settings.SkipClientKeyPublication {
+	skipPublication := client.settings.SkipClientKeyPublication
+	if skipPublication {
 		// each of these reads the published key, so skipping it would break
 		// the reader rather than save a registration
+		reader := ""
 		switch {
 		case client.settings.ClientKeyRegistrationRequired:
-			return nil, errors.New("client key publication is skipped, but processed registration is required")
+			reader = "processed registration is required"
 		case client.settings.ContractManagerSettings != nil && client.settings.ContractManagerSettings.CloseReportDomainHash != ([32]byte{}):
-			return nil, errors.New("client key publication is skipped, but close reports are signed under a key history domain")
+			reader = "close reports are signed under a key history domain"
 		case client.settings.EncryptionSettings != nil && client.settings.EncryptionSettings.Mode != EncryptionModeOff:
-			return nil, errors.New("client key publication is skipped, but per-peer sessions need peers to verify the published key")
+			reader = "per-peer sessions need peers to verify the published key"
+		}
+		if reader != "" {
+			client.log.Errorf("[key]%s client key publication skip ignored: %s\n", client.ClientTag(), reader)
+			skipPublication = false
 		}
 	}
 	if client.settings.ClientKeyRegistrationRequired {
@@ -147,7 +155,7 @@ func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager
 		controlSync: NewControlSync(managerCtx, client, "client-key"),
 		workers:     newLifecycleAdmission(),
 
-		skipPublication: client.settings.SkipClientKeyPublication,
+		skipPublication: skipPublication,
 	}
 	if client.settings.ContractManagerSettings != nil {
 		m.historyDomainHash = client.settings.ContractManagerSettings.CloseReportDomainHash
@@ -369,7 +377,7 @@ func VerifyCertChainSignature(peerPub ed25519.PublicKey, chain [][]byte, sig []b
 //
 // A skipped publication returns at the same point, so the constructor and
 // every `SetSeed` rotation leave the key local. Nothing waits for it: only a
-// required registration does, and the constructor refused that.
+// required registration does, and that publishes whatever the skip says.
 func (self *ClientKeyManager) publishClientKey() {
 	if self.registrationSync != nil {
 		self.publishRegisteredClientKey()
