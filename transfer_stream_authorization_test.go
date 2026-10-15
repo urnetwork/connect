@@ -8,7 +8,7 @@ import (
 )
 
 func TestStreamAuthorizationExpiryCancelsLifecycleAndRejectsReplay(t *testing.T) {
-	client := NewClient(t.Context(), NewId(), NewNoContractClientOob(), DefaultClientSettings())
+	client := NewClient(t.Context(), NewId(), NewNoContractClientOob(), streamManagerTestSettings())
 	defer client.Close()
 	manager := client.streamManager
 	tracker := newStreamOpenTestTracker(manager.streamBuffer)

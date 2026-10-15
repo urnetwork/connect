@@ -171,6 +171,9 @@ func TestClientCloseAndWaitJoinsIntermediaryStreamChildren(t *testing.T) {
 	defer cancel()
 
 	settings := closeWaitClientSettings()
+	// The associations' P2P setup is refused (streamManagerTestSettings), so
+	// the one toward the destination does not query the public STUN pool.
+	settings.WebRtcSettings.MemoryBudget = NewTransferMemoryBudget(0)
 	childEntered := make(chan string, 4)
 	releaseChildren := make(chan struct{})
 	childrenStarted := make(chan struct{})
