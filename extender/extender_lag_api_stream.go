@@ -255,13 +255,16 @@ type lagApiStreamCount struct {
 	doneTime time.Time
 	// a mismatch past the window's end stopped it, so nothing it reads counts
 	stopped bool
+	// its last message, a short one, has arrived whole: nothing valid can
+	// follow it (M6), so nothing it reads after counts
+	finished bool
 }
 
 // Whether upload stream k is done at now, with the phase's lock held: nothing
 // it reads from now on can count (M6 R3, amendment 15).
 func (self *lagApiPhase) streamDoneWithLock(streamIndex int, now time.Time) bool {
 	count := &self.streamCounts[streamIndex]
-	return count.stopped || (!count.doneTime.IsZero() && now.After(count.doneTime))
+	return count.stopped || count.finished || (!count.doneTime.IsZero() && now.After(count.doneTime))
 }
 
 // Opens a phase now (M4). Its window waits for the first byte, for at most
@@ -409,6 +412,29 @@ func (self *lagApiPhase) closeStream(streamIndex int) {
 	self.changed(false, finalized)
 }
 
+// Finishes upload stream k at now: its last message, a short one, has arrived
+// whole, checked as its verification checks it (M6). Nothing valid can follow
+// a short message, so the stream is done, as one that closed is: its first
+// group, if it is still held, counts by rule S, since no second group will
+// come to place it, and it no longer holds the window open past its end. A
+// browser near the window's end sends a stream's last message short, to fit
+// the room its flow control has left; with no read past the end, under the
+// rule that a stream is done lagSpreadJoin into its first group past the end
+// it would hold the window open lagSpreadMax (M6 R3, amendment 15).
+func (self *lagApiPhase) finishStream(streamIndex int, now time.Time) {
+	finalized := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if !self.countingWithLock() {
+			return false
+		}
+		self.streamCounts[streamIndex].finished = true
+		self.placeHeldWithLock(streamIndex)
+		return self.finalIfDoneWithLock(now)
+	}()
+	self.changed(false, finalized)
+}
+
 // The distinct streams the browser opened in the phase (M8).
 func (self *lagApiPhase) streamCount() int {
 	self.stateLock.Lock()
@@ -533,7 +559,7 @@ func (self *lagApiPhase) finalIfDoneWithLock(now time.Time) bool {
 	var doneTime time.Time
 	for streamIndex, open := range self.openStreams {
 		count := &self.streamCounts[streamIndex]
-		if !open || count.stopped {
+		if !open || count.stopped || count.finished {
 			continue
 		}
 		if count.doneTime.IsZero() {
@@ -712,8 +738,10 @@ func (self *lagApiPhase) count(now time.Time, byteCount int) {
 //     or after the end: a read joins that group only within lagSpreadJoin,
 //     and every later group spans from its previous read, at or after the
 //     end, so nothing the stream reads after could count. So one read past
-//     the end will do, with no second to show it. The window is final once
-//     every stream still open is done, or lagSpreadMax past the end.
+//     the end will do, with no second to show it. A stream whose last
+//     message, a short one, has arrived whole is done too (finishStream).
+//     The window is final once every stream still open is done, or
+//     lagSpreadMax past the end.
 //
 // Reads count under the phase's lock and only until the window is final, so
 // nothing is added after: the total the browser is then told is the total the
@@ -1312,7 +1340,10 @@ func (self *extenderLagApi) readUpload(
 // counted, but the load is not complete, so no speed is derived from it (A5).
 // Past the window's end, which the phase has ended by, the stream is read on
 // while its reads may still count (amendment 15), and a mismatch then ends
-// only its count.
+// only its count. A short message, the stream's last, finishes the stream once
+// it has arrived whole and been checked, under exact verification read by read
+// and under sampled once the sample was chosen and compared or not: nothing
+// valid can follow it, so the stream is done (amendment 15).
 type lagApiUploadStream struct {
 	phase         *lagApiPhase
 	streamIndex   int
@@ -1359,22 +1390,31 @@ func newLagApiUploadStream(
 // Reads one message from reader, verifying and counting it read by read as
 // above, with each read's arrival from now: a read returns what the connection
 // has delivered, so its time is its arrival, to within a TLS record. A message
-// that starts once none of its stream's reads can count -- the phase ended
-// early, or past the window's end the stream is done or the window final -- is
-// left unread, to be drained, not counted, as is the rest of one that failed
-// its check. A full buffer is the whole message, since the read limit refuses
-// a longer one before its bytes arrive. An error is the connection's.
+// after a short one is a mismatch, whenever it comes. Otherwise a message that
+// starts once none of its stream's reads can count -- the phase ended early,
+// or past the window's end the stream is done or the window final -- is left
+// unread, to be drained, not counted, as is the rest of one that failed its
+// check. A full buffer is the whole message, since the read limit refuses a
+// longer one before its bytes arrive. A short message, once it has arrived
+// whole and been checked, finishes its stream (finishStream). An error is the
+// connection's.
 func (self *lagApiUploadStream) readMessage(messageType int, reader io.Reader, now func() time.Time) error {
 	phase := self.phase
 	startTime := now()
+	if self.short {
+		// only the last message may be shorter
+		phase.mismatch(self.streamIndex, startTime)
+		return nil
+	}
 	if !phase.takes(self.streamIndex, startTime) {
 		return nil
 	}
-	if messageType != websocket.BinaryMessage || self.short {
+	if messageType != websocket.BinaryMessage {
 		phase.mismatch(self.streamIndex, startTime)
 		return nil
 	}
 	byteCount := 0
+	lastTime := startTime
 	for byteCount < len(self.data) {
 		n, err := reader.Read(self.data[byteCount:])
 		if 0 < n {
@@ -1389,6 +1429,7 @@ func (self *lagApiUploadStream) readMessage(messageType int, reader io.Reader, n
 			}
 			phase.receive(self.streamIndex, arrivedTime, n)
 			byteCount += n
+			lastTime = arrivedTime
 		}
 		if err == io.EOF {
 			break
@@ -1397,7 +1438,6 @@ func (self *lagApiUploadStream) readMessage(messageType int, reader io.Reader, n
 			return err
 		}
 	}
-	// only the last message may be shorter
 	self.short = byteCount < len(self.data)
 	if !self.exact && self.sampleMessage() {
 		counterBlock := lagApiCounterBlock(uint64(self.streamIndex), self.offset)
@@ -1408,6 +1448,10 @@ func (self *lagApiUploadStream) readMessage(messageType int, reader io.Reader, n
 		}
 	}
 	self.offset += uint64(byteCount)
+	if self.short {
+		// the stream's last message: it is done (amendment 15)
+		phase.finishStream(self.streamIndex, lastTime)
+	}
 	return nil
 }
 
