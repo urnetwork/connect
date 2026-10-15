@@ -662,6 +662,37 @@ func TestExtenderCommandMeasurementOff(t *testing.T) {
 	}
 }
 
+// With measurement on and a kept identity whose measurement key cannot be
+// used, the command keeps no certificate and serves no measurement name, so
+// every activation says measurement_disabled: a name the extender had is
+// withdrawn (C4, C9) rather than renewed and offered to lag.dev with nothing
+// answering it. The key file is left as it was.
+func TestExtenderCommandMeasurementKeyNotUsable(t *testing.T) {
+	operator := newTestMeasurementOperator(t)
+	keyPem := []byte("not a measurement key\n")
+	measurementKeyFile := ""
+	started := startTestMeasurementExtender(t, operator, true, func(options *extenderOptions) {
+		options.measurementEnabled = true
+		measurementKeyFile = extender.ExtenderMeasurementKeyPath(options.keyFile)
+		if err := os.WriteFile(measurementKeyFile, keyPem, 0600); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if started.run.measurementCert != nil {
+		t.Fatal("a measurement certificate with a key that is not usable")
+	}
+	args := operator.waitActivation()
+	if args.MeasurementCsr != "" || !args.MeasurementDisabled {
+		t.Fatalf("the activation carried %q, measurement_disabled %t", args.MeasurementCsr, args.MeasurementDisabled)
+	}
+	if count := operator.certPollCount(); count != 0 {
+		t.Fatalf("the certificate route was read %d times", count)
+	}
+	if b, err := os.ReadFile(measurementKeyFile); err != nil || !bytes.Equal(b, keyPem) {
+		t.Fatalf("measurement key file = %q %v, expected it untouched", b, err)
+	}
+}
+
 // A chain the operator issued for another key asks the activation for a pass
 // at once, which carries this key's request again (C4): the lifecycle's ask
 // reaches the command's activator.

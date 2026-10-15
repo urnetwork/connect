@@ -106,7 +106,9 @@ type ExtenderLagSettings struct {
 	// (extender_lag_api_dev.go).
 	AllowedOrigins []string
 	// Sessions open at once (M3). A session that only pings costs a few
-	// hundred bytes a second. <= 0 takes the default.
+	// hundred bytes a second. When it is full, the extender closes its oldest
+	// session whose load has ended and whose report has gone out, to admit a
+	// new one, and refuses only when none has. <= 0 takes the default.
 	MaxSessions int
 	// Loads running at once (M3); a load past it is refused as busy and its
 	// session goes on pinging. <= 0 takes the default.
@@ -223,6 +225,9 @@ type extenderLagApi struct {
 	closed    bool
 	serving   bool
 	sessions  map[lagApiSessionId]*lagApiSession
+	// the sessions admitted so far, which orders them by age for a full
+	// extender to reclaim the oldest first (M3)
+	sessionAdmitCount uint64
 	// the ids of admitted tickets, kept until their tickets expire (M3), in
 	// the order they were admitted
 	usedTickets     map[string]*list.Element

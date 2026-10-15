@@ -24,6 +24,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -117,7 +118,8 @@ func (self *extenderLagFeedHandler) ServeHTTP(w http.ResponseWriter, r *http.Req
 // reads as an error, which the feed server takes as the client leaving -- on a
 // carrier stream the client sends nothing after its request either. Reads and
 // writes may run concurrently with each other, as the feed server runs them;
-// each is serialized with itself.
+// each is serialized with itself. No error it returns names an address, since
+// the feed server may log it (amendment 9).
 type extenderLagFeedConn struct {
 	ws *websocket.Conn
 
@@ -144,6 +146,65 @@ func newExtenderLagFeedConn(ws *websocket.Conn) *extenderLagFeedConn {
 var errExtenderLagFeedRequestType = errors.New("the feed request must be a binary message")
 var errExtenderLagFeedAfterRequest = errors.New("the feed client sent a message after its request")
 
+// An error of the feed's websocket as this conn returns it: with no address in
+// its text (amendment 9). The feed server logs what a read of the request
+// returns, and a socket error's text names both ends of the connection, the
+// browser's address among them. A *net.OpError's text does, and so does the
+// copy gorilla makes of a temporary one. Any net.Error comes back as an
+// extenderLagFeedNetError, which keeps Timeout(), and errors.Is and errors.As
+// through it. io.EOF comes back unchanged. A close from the browser keeps
+// its code but not its reason, which is the page's own text. Every other
+// error, gorilla's protocol errors and this conn's own, names no address and
+// comes back unchanged.
+func extenderLagFeedConnError(err error) error {
+	if err == nil || err == io.EOF {
+		return err
+	}
+	closeErr := &websocket.CloseError{}
+	if errors.As(err, &closeErr) {
+		return &websocket.CloseError{Code: closeErr.Code}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return &extenderLagFeedNetError{err: err}
+	}
+	return err
+}
+
+// A socket error of the feed's websocket with the addresses left out of its
+// text (amendment 9). The text keeps a *net.OpError's operation, network and
+// cause, as in "read tcp: i/o timeout"; without one, it says only whether the
+// error is a timeout.
+type extenderLagFeedNetError struct {
+	err error
+}
+
+func (self *extenderLagFeedNetError) Error() string {
+	opErr := &net.OpError{}
+	if errors.As(self.err, &opErr) && opErr.Err != nil {
+		return (&net.OpError{Op: opErr.Op, Net: opErr.Net, Err: opErr.Err}).Error()
+	}
+	if self.Timeout() {
+		return "i/o timeout"
+	}
+	return "network error"
+}
+
+func (self *extenderLagFeedNetError) Timeout() bool {
+	var netErr net.Error
+	return errors.As(self.err, &netErr) && netErr.Timeout()
+}
+
+// The deprecated half of net.Error, kept as the error it wraps has it.
+func (self *extenderLagFeedNetError) Temporary() bool {
+	var netErr net.Error
+	return errors.As(self.err, &netErr) && netErr.Temporary()
+}
+
+func (self *extenderLagFeedNetError) Unwrap() error {
+	return self.err
+}
+
 func (self *extenderLagFeedConn) Read(b []byte) (int, error) {
 	self.readLock.Lock()
 	defer self.readLock.Unlock()
@@ -151,7 +212,7 @@ func (self *extenderLagFeedConn) Read(b []byte) (int, error) {
 	if len(self.readBytes) == 0 {
 		messageType, messageBytes, err := self.ws.ReadMessage()
 		if err != nil {
-			return 0, err
+			return 0, extenderLagFeedConnError(err)
 		}
 		if self.requestRead {
 			return 0, errExtenderLagFeedAfterRequest
@@ -194,7 +255,7 @@ func (self *extenderLagFeedConn) Write(b []byte) (int, error) {
 			break
 		}
 		if err := self.ws.WriteMessage(websocket.BinaryMessage, self.writeBytes[4:4+frameByteCount]); err != nil {
-			return 0, err
+			return 0, extenderLagFeedConnError(err)
 		}
 		self.writeBytes = self.writeBytes[4+frameByteCount:]
 	}
@@ -218,7 +279,7 @@ func (self *extenderLagFeedConn) closeNormally() {
 func (self *extenderLagFeedConn) Close() error {
 	var err error
 	self.closeOnce.Do(func() {
-		err = self.ws.Close()
+		err = extenderLagFeedConnError(self.ws.Close())
 	})
 	return err
 }
@@ -235,15 +296,15 @@ func (self *extenderLagFeedConn) RemoteAddr() net.Addr {
 
 func (self *extenderLagFeedConn) SetDeadline(t time.Time) error {
 	if err := self.ws.SetReadDeadline(t); err != nil {
-		return err
+		return extenderLagFeedConnError(err)
 	}
-	return self.ws.SetWriteDeadline(t)
+	return extenderLagFeedConnError(self.ws.SetWriteDeadline(t))
 }
 
 func (self *extenderLagFeedConn) SetReadDeadline(t time.Time) error {
-	return self.ws.SetReadDeadline(t)
+	return extenderLagFeedConnError(self.ws.SetReadDeadline(t))
 }
 
 func (self *extenderLagFeedConn) SetWriteDeadline(t time.Time) error {
-	return self.ws.SetWriteDeadline(t)
+	return extenderLagFeedConnError(self.ws.SetWriteDeadline(t))
 }

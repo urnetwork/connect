@@ -16,11 +16,13 @@ package extender
 // the extender whatever the loop is doing.
 //
 // A load ends the way the browser's client expects (M4, S5). When the upload's
-// window runs out the browser is told with the last progress, says done, and
-// gets the result; a load the extender cuts short -- an upload mismatch, a cap,
-// a phase that never starts -- gets its result at once. A stream that arrives
-// ahead of the message that opens its phase waits for it a moment rather than
-// being refused, which the client's retries would also cover.
+// window has run out and is final -- every stream's reads from before its end
+// have counted, at most lagSpreadMax after it (amendment 15) -- the browser is
+// told with the last progress, says done, and gets the result; a load the
+// extender cuts short -- an upload mismatch, a cap, a phase that never starts
+// -- gets its result at once. A stream that arrives ahead of the message that
+// opens its phase waits for it a moment rather than being refused, which the
+// client's retries would also cover.
 //
 // Each session yields one signed report: the minute around its load, or its
 // last minute when it had none (M8).
@@ -78,6 +80,11 @@ const lagApiPingRingCount = 320
 // a ping before it arrives and have the extender sign a round trip below the
 // path's.
 const lagApiPingPayloadByteCount = 16
+
+// The most lost pings a session keeps for their late pongs (M4). Pings are
+// lost at most once per loss timeout, so a pong timeout holds at most 7 at the
+// default timings.
+const lagApiMaxLostPingCount = 16
 
 // The timings of a session (M4, M8). Tests shorten them.
 type lagApiTimings struct {
@@ -234,7 +241,8 @@ type lagApiPong struct {
 	arrivalTime time.Time
 }
 
-// The ping in flight (M4): its random payload and when it was sent.
+// The ping in flight, or one counted lost (M4): its random payload and when it
+// was sent.
 type lagApiInFlightPing struct {
 	payload  string
 	sendTime time.Time
@@ -321,11 +329,11 @@ func (self *lagApiReceivedSeries) values() []uint64 {
 // The phases are set under the session's state lock, since streams look them
 // up; everything else is the loop's.
 //
-// A load settles when its transfer is over -- no more bytes move, its slot is
+// A load settles when its transfer is over -- no more bytes count, its slot is
 // free for the next load, and the minute its report covers is fixed -- and
-// ends when its result has gone to the browser. After an upload that ran out
-// its window the result follows the browser's done; a load the extender cuts
-// short ends at once.
+// ends when its result has gone to the browser. An upload that ran out its
+// window settles once the window is final (amendment 15), and its result
+// follows the browser's done; a load the extender cuts short ends at once.
 type lagApiLoad struct {
 	requestTime time.Time
 	download    *lagApiPhase
@@ -338,7 +346,8 @@ type lagApiLoad struct {
 	received        lagApiReceivedSeries
 	// a phase reached the ticket's cap or the daily budget
 	capped bool
-	// the browser said done while the upload's window was still open
+	// the browser said done once the upload had its first byte, before the
+	// load settled: its window still open, or run out but not yet final
 	doneReceived bool
 
 	settled   bool
@@ -380,6 +389,13 @@ type lagApiSession struct {
 	ipFamily      uint32
 	subnet        extenderSubnetHash
 	subnetLimited bool
+	// the order of its admission, so a full extender reclaims the oldest
+	// session first (M3); set under the api's state lock
+	admitIndex uint64
+	// set by the loop once the session's load has ended and its report has
+	// gone out, after which it only pings and has nothing left to measure: a
+	// full extender may then close it to admit a new session (M3)
+	reclaimable atomic.Bool
 
 	pingInterval     time.Duration
 	downloadDuration time.Duration
@@ -399,6 +415,16 @@ type lagApiSession struct {
 	// the ping in flight, which the loop sets before it sends and the pong
 	// handler matches against; nil when none is (M4)
 	inFlight atomic.Pointer[lagApiInFlightPing]
+	// the pings counted lost that were sent within the pong timeout, oldest
+	// first, which the loop replaces at each loss: a late pong for one of
+	// them never counts as a round trip, but it shows the page is still
+	// there (M4)
+	lostPings atomic.Pointer[[]lagApiInFlightPing]
+	// when the last pong that answered a ping sent within the pong timeout
+	// arrived, as its time since startTime: set by the pong handler, and read
+	// by the loop, which ends the session when none has come for the pong
+	// timeout (M4)
+	lastPongSinceStart atomic.Int64
 
 	stateLock sync.Mutex
 	// the session's load, nil before it; streams read it here
@@ -594,12 +620,39 @@ func (self *extenderLagApi) verifyTicket(ticketText string, now time.Time) (*pro
 	return body, nil
 }
 
-// Admits an open session (M3): its ticket unused, and room under max_sessions.
-// The ticket is marked used only when the session is admitted, and kept until
-// it expires. Returns the error that refuses the session, or "".
+// The close of a session that a full extender ended to admit a new one (M3,
+// M4): 4410, after HTTP's 410 Gone, since the session is over for good. Only
+// a session whose load has ended and whose report has gone out is closed this
+// way, the oldest first, so the dot's results are complete and signed. The
+// browser shows them as done, stops pinging the dot, and does not reconnect:
+// a new session would take a slot again, and one that never loads is never
+// reclaimed. It is not 4409, because the API answers a stream that comes
+// before its phase with 409, and the browser retries that (M4).
+const (
+	lagApiCloseCodeReclaimed = 4410
+	lagApiCloseTextReclaimed = "reclaimed"
+)
+
+// Admits an open session (M3): its ticket unused, room under its subnet's
+// limit, and room under max_sessions. A full extender makes room by closing
+// its oldest session that has nothing left to measure, its load ended and its
+// report gone out, and refuses the new session only when none has. The count
+// is the extender's, so the session closed may be any subnet's. The ticket is
+// marked used only when the session is admitted, and kept until it expires.
+// Returns the error that refuses the session, or "".
 func (self *extenderLagApi) admitSession(session *lagApiSession) string {
 	now := time.Now()
 	ticketId := string(session.ticketId)
+	// the session closed to make room ends once the state lock is released,
+	// as every session the api ends does: deferred before the lock is taken,
+	// this runs after the unlock
+	var reclaimed *lagApiSession
+	defer func() {
+		if reclaimed != nil {
+			// its load has ended, so the load end reason never applies (M8)
+			reclaimed.end(lagApiCloseCodeReclaimed, lagApiCloseTextReclaimed, protocol.LagEndReason_LAG_END_ERROR)
+		}
+	}()
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if self.closed {
@@ -620,17 +673,26 @@ func (self *extenderLagApi) admitSession(session *lagApiSession) string {
 	if _, ok := self.usedTickets[ticketId]; ok {
 		return lagApiErrorReused
 	}
-	if self.settings.MaxSessions <= len(self.sessions) {
-		return lagApiErrorSessions
-	}
+	// the subnet's limit comes before any room is made, so no session is
+	// closed for one that is then refused
 	if session.subnetLimited && 0 < self.maxSessionsPerSubnet &&
 		self.maxSessionsPerSubnet <= self.subnetSessionCounts[session.subnet] {
 		return lagApiErrorSessions
+	}
+	if self.settings.MaxSessions <= len(self.sessions) {
+		reclaimed = self.reclaimableSessionWithLock()
+		if reclaimed == nil {
+			return lagApiErrorSessions
+		}
+		// its slot and its subnet's count go to the new session at once
+		self.removeSessionWithLock(reclaimed)
 	}
 	self.usedTickets[ticketId] = self.usedTicketOrder.PushBack(&lagApiUsedTicket{
 		ticketId:   ticketId,
 		expireTime: session.ticketExpire,
 	})
+	self.sessionAdmitCount += 1
+	session.admitIndex = self.sessionAdmitCount
 	self.sessions[session.id] = session
 	if session.subnetLimited {
 		self.subnetSessionCounts[session.subnet] += 1
@@ -638,6 +700,18 @@ func (self *extenderLagApi) admitSession(session *lagApiSession) string {
 	close(self.sessionAdmitted)
 	self.sessionAdmitted = make(chan struct{})
 	return ""
+}
+
+// The oldest open session a full extender may close to make room (M3), or
+// nil when none may. Called with the state lock held.
+func (self *extenderLagApi) reclaimableSessionWithLock() *lagApiSession {
+	var oldest *lagApiSession
+	for _, session := range self.sessions {
+		if session.reclaimable.Load() && (oldest == nil || session.admitIndex < oldest.admitIndex) {
+			oldest = session
+		}
+	}
+	return oldest
 }
 
 // One used ticket id and when its ticket expires (M3).
@@ -649,6 +723,13 @@ type lagApiUsedTicket struct {
 func (self *extenderLagApi) removeSession(session *lagApiSession) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.removeSessionWithLock(session)
+}
+
+// Removes an open session and releases its subnet's count. A session already
+// removed, as one reclaimed for a new session is, releases nothing again.
+// Called with the state lock held.
+func (self *extenderLagApi) removeSessionWithLock(session *lagApiSession) {
 	if self.sessions[session.id] != session {
 		return
 	}
@@ -717,14 +798,23 @@ func (self *extenderLagApi) endLoad(session *lagApiSession) {
 func (self *lagApiSession) serve() {
 	conn := self.conn
 	conn.SetReadLimit(lagApiMaxControlMessageByteCount)
+	timings := self.api.timings
 	// stamped as it is read, so the round trip does not wait on the loop
 	conn.SetPongHandler(func(appData string) error {
 		arrivalTime := time.Now()
-		// only a pong that echoes the ping in flight, arriving after it was
-		// sent, counts (M4): a stale, forged or early one is dropped here, so
-		// no flood of them can crowd out the one that answers
 		inFlight := self.inFlight.Load()
-		if inFlight == nil || appData != inFlight.payload || arrivalTime.Before(inFlight.sendTime) {
+		answersInFlight := inFlight != nil && appData == inFlight.payload && !arrivalTime.Before(inFlight.sendTime)
+		// any pong that echoes a ping sent within the pong timeout shows the
+		// page is still there, one that comes after its ping was counted
+		// lost included (M4)
+		if answersInFlight || self.answersLostPing(appData, arrivalTime, timings.pongTimeout) {
+			self.lastPongSinceStart.Store(int64(arrivalTime.Sub(self.startTime)))
+		}
+		// only a pong that echoes the ping in flight, arriving after it was
+		// sent and within the loss timeout, counts as a round trip (M4): a
+		// late, stale, forged or early one is dropped here, so no flood of
+		// them can crowd out the one that answers
+		if !answersInFlight || timings.pingLost <= arrivalTime.Sub(inFlight.sendTime) {
 			return nil
 		}
 		select {
@@ -795,6 +885,47 @@ func (self *lagApiSession) serve() {
 	self.cancel()
 	<-loopDone
 	self.finish()
+}
+
+// Whether a pong echoes a ping counted lost that was sent within the pong
+// timeout of the pong's arrival (M4).
+func (self *lagApiSession) answersLostPing(appData string, arrivalTime time.Time, pongTimeout time.Duration) bool {
+	lostPings := self.lostPings.Load()
+	if lostPings == nil {
+		return false
+	}
+	for _, lostPing := range *lostPings {
+		if appData == lostPing.payload && arrivalTime.Sub(lostPing.sendTime) <= pongTimeout {
+			return true
+		}
+	}
+	return false
+}
+
+// Keeps a ping counted lost for the pong timeout, so that its late pong still
+// shows the page is there (M4), and lets go of the lost pings sent before
+// that. Only the loop calls it; the pong handler reads what it keeps.
+func (self *lagApiSession) addLostPing(lostPing lagApiInFlightPing, pongTimeout time.Duration) {
+	now := time.Now()
+	lostPings := []lagApiInFlightPing{}
+	if previousLostPings := self.lostPings.Load(); previousLostPings != nil {
+		for _, previousLostPing := range *previousLostPings {
+			if now.Sub(previousLostPing.sendTime) <= pongTimeout {
+				lostPings = append(lostPings, previousLostPing)
+			}
+		}
+	}
+	lostPings = append(lostPings, lostPing)
+	if lagApiMaxLostPingCount < len(lostPings) {
+		lostPings = lostPings[len(lostPings)-lagApiMaxLostPingCount:]
+	}
+	self.lostPings.Store(&lostPings)
+}
+
+// When the last pong that answered a ping sent within the pong timeout
+// arrived, or the session's start until one has (M4).
+func (self *lagApiSession) lastPongTime() time.Time {
+	return self.startTime.Add(time.Duration(self.lastPongSinceStart.Load()))
 }
 
 // Ends the session from the extender's side with a close (M4), and a load
@@ -942,7 +1073,6 @@ func (self *lagApiSession) run() {
 	var lossC <-chan time.Time
 	inFlightPayload := ""
 	var inFlightSendTime time.Time
-	lastPongTime := self.startTime
 
 	// the load: the wait for the upload after the download, the upload's
 	// progress, the wait for the browser's done, and the report's minute
@@ -965,23 +1095,18 @@ func (self *lagApiSession) run() {
 	var reportC <-chan time.Time
 
 	// the upload's progress (M4): the bytes counted in the window so far; ms,
-	// how far into the window that is -- its whole length once it has ended;
+	// how far into the window that is -- its whole length once it is over;
 	// and at, when the latest counted read arrived, in ms to the microsecond,
-	// which the browser builds its series from (amendment 14). at is held to
-	// ms, and neither goes back from one progress to the next: now is read
-	// before the phase's state, so a phase that ends after this progress ends
-	// no earlier than its time.
-	writeUploaded := func(load *lagApiLoad) bool {
-		now := time.Now()
-		byteCount, countedTime := load.upload.progress()
-		firstByteTime, endedTime, _ := load.upload.state()
-		if endedTime.IsZero() {
-			endedTime = now
-		}
-		ms := max(0, min(endedTime.Sub(firstByteTime), self.uploadDuration)).Milliseconds()
-		at := 0.0
-		if !countedTime.IsZero() {
-			at = max(0, min(float64(ms), float64(countedTime.Sub(firstByteTime).Microseconds())/1000))
+	// which the browser builds its series from (amendment 14). The phase reads
+	// them at one moment under its lock (progressReport), so a progress's ms
+	// and the phase's state agree. last is the progress that says the window
+	// is over, which goes out once the window is final, with the final total;
+	// before that no progress reads as over, and a tick too late to tell from
+	// it is not sent (amendment 15)
+	writeUploaded := func(load *lagApiLoad, last bool) bool {
+		byteCount, ms, at, ok := load.upload.progressReport(last)
+		if !ok {
+			return true
 		}
 		return self.write(&lagApiUploadedMessage{
 			Type:  "uploaded",
@@ -1007,9 +1132,10 @@ func (self *lagApiSession) run() {
 		progressC = progressTimer.C
 	}
 
-	// settles the load (M4, M8): its phases end, its slot is free for the next
-	// load, the browser gets the upload's last progress, and the report waits
-	// for the close of the load's minute
+	// settles the load (M4, M8): its phases end and their windows are final,
+	// its slot is free for the next load, the browser gets the upload's last
+	// progress, and the report waits for the close of the load's minute, which
+	// runs from the load's end
 	settleLoad := func(load *lagApiLoad, endReason protocol.LagEndReason, endTime time.Time) bool {
 		load.settled = true
 		load.endTime = endTime
@@ -1026,9 +1152,7 @@ func (self *lagApiSession) run() {
 		reportTimer.Reset(time.Until(self.reportEndTime(load)))
 		reportC = reportTimer.C
 		if load.upload != nil {
-			if firstByteTime, _, _ := load.upload.state(); !firstByteTime.IsZero() {
-				return writeUploaded(load)
-			}
+			return writeUploaded(load, true)
 		}
 		return true
 	}
@@ -1060,9 +1184,11 @@ func (self *lagApiSession) run() {
 		return settleLoad(load, endReason, endTime) && resultLoad(load)
 	}
 
-	// ends a load whose upload ran out its window (M4): the last progress
-	// tells the browser the window closed, the browser says done, and the
-	// result follows; a browser that says nothing gets it after the done wait
+	// ends a load whose upload ran out its window, once the window is final
+	// (M4, amendment 15): the last progress tells the browser the window
+	// closed, the browser says done, and the result follows; a browser that
+	// says nothing gets it after the done wait. endTime is the window's end,
+	// as everything but the last progress keys off it.
 	completeLoad := func(load *lagApiLoad, endReason protocol.LagEndReason, endTime time.Time) bool {
 		if !settleLoad(load, endReason, endTime) {
 			return false
@@ -1104,6 +1230,12 @@ func (self *lagApiSession) run() {
 				scheduleProgress(load)
 			}
 		case lagApiPhaseEndTime:
+			// reads that arrive past the end still count for what they carry
+			// from before it; the phase wakes the loop once its window is
+			// final, at most lagSpreadMax after the end (amendment 15)
+			if !load.upload.windowFinal() {
+				return true
+			}
 			endReason := protocol.LagEndReason_LAG_END_COMPLETE
 			if load.capped {
 				endReason = protocol.LagEndReason_LAG_END_CAP
@@ -1187,6 +1319,13 @@ func (self *lagApiSession) run() {
 			if load == nil || load.ended {
 				return true
 			}
+			if load.upload != nil {
+				if firstByteTime, _, _ := load.upload.state(); !firstByteTime.IsZero() {
+					// the upload moved bytes: the load settles on its own, if it
+					// has not, and the result follows done once it has
+					load.doneReceived = true
+				}
+			}
 			// whatever has already run out is settled before done is read
 			if !reconcile() {
 				return false
@@ -1197,14 +1336,11 @@ func (self *lagApiSession) run() {
 			case load.settled:
 				// the transfer is over and its last progress is out
 				return resultLoad(load)
-			}
-			if load.upload != nil {
-				if firstByteTime, _, end := load.upload.state(); !firstByteTime.IsZero() && end == lagApiPhaseRunning {
-					// the upload's window is still open; it runs out on its
-					// own, and the result follows at once
-					load.doneReceived = true
-					return true
-				}
+			case load.doneReceived:
+				// the upload's window is still open, or has run out and is
+				// not yet final (amendment 15): it settles on its own, and the
+				// result follows at once
+				return true
 			}
 			// done before the upload moved a byte: the browser gave the load up
 			return endLoad(load, protocol.LagEndReason_LAG_END_CLIENT_CLOSED, now)
@@ -1243,7 +1379,6 @@ func (self *lagApiSession) run() {
 				break
 			}
 			self.inFlight.Store(nil)
-			lastPongTime = pong.arrivalTime
 			lossTimer.Stop()
 			lossC = nil
 			rtt := pong.arrivalTime.Sub(inFlightSendTime)
@@ -1263,6 +1398,9 @@ func (self *lagApiSession) run() {
 
 		case <-lossC:
 			lossC = nil
+			// kept before it stops being in flight, so its late pong always
+			// finds it as one or the other
+			self.addLostPing(lagApiInFlightPing{payload: inFlightPayload, sendTime: inFlightSendTime}, timings.pongTimeout)
 			self.inFlight.Store(nil)
 			self.pings.add(lagApiPing{sendTime: inFlightSendTime, lost: true})
 			ok = self.write(&lagApiRttMessage{
@@ -1270,9 +1408,10 @@ func (self *lagApiSession) run() {
 				T:    inFlightSendTime.Sub(self.startTime).Milliseconds(),
 				Lost: true,
 			})
-			if timings.pongTimeout <= time.Since(lastPongTime) {
-				// the page is gone: no pong for pongTimeout ends the session
-				// with 4408 (lag.dev/PLAN.md M4)
+			if timings.pongTimeout <= time.Since(self.lastPongTime()) {
+				// the page is gone: no pong that answers a ping for
+				// pongTimeout ends the session with 4408, while late pongs
+				// keep a slow page's session open (lag.dev/PLAN.md M4)
 				self.end(lagApiCloseCodeTimeout, "timeout", protocol.LagEndReason_LAG_END_CLIENT_CLOSED)
 				return
 			}
@@ -1303,14 +1442,11 @@ func (self *lagApiSession) run() {
 		case <-progressC:
 			progressC = nil
 			if load := self.load; load != nil && !load.settled && load.upload != nil {
-				firstByteTime, _, end := load.upload.state()
 				// the browser's client takes a progress within half an
 				// interval of the window's length as the window closing (S5),
-				// which only the last one says: one that late is left to it
-				if end == lagApiPhaseRunning && time.Since(firstByteTime) < self.uploadDuration-lagApiInterval/2 {
-					ok = writeUploaded(load)
-					scheduleProgress(load)
-				}
+				// which only the last one says: a tick that late is not sent
+				ok = writeUploaded(load, false)
+				scheduleProgress(load)
 			}
 
 		case <-doneC:
@@ -1327,6 +1463,18 @@ func (self *lagApiSession) run() {
 			self.end(lagApiCloseCodeInternal, lagApiErrorInternal, protocol.LagEndReason_LAG_END_ERROR)
 			return
 		}
+		self.updateReclaimable()
+	}
+}
+
+// Marks the session reclaimable once its load has ended, its result with the
+// browser, and its report has gone out (M3, M8): from then on it only pings,
+// so a full extender may close it to admit a new session. A session with no
+// load reports only when it closes, so it never becomes reclaimable. Read
+// after each step of the loop, whose state this is.
+func (self *lagApiSession) updateReclaimable() {
+	if !self.reclaimable.Load() && self.reported && self.load != nil && self.load.ended {
+		self.reclaimable.Store(true)
 	}
 }
 
@@ -1355,17 +1503,30 @@ func (self *lagApiSession) reportStartTime(load *lagApiLoad) time.Time {
 
 // Ends the session after the read side is done and the loop has returned: a
 // load still running ends with the session -- as the browser closing it, or as
-// the extender ended it -- and the report goes out with what it has (M8).
+// the extender ended it -- and the report goes out with what it has (M8). An
+// upload whose window had run out when the session ended, final or not yet
+// (amendment 15), ended by its time, and the load as it would have at the
+// window's end: the session's end makes the window final, with what it has.
 func (self *lagApiSession) finish() {
 	now := time.Now()
 	if load := self.load; load != nil {
 		if !load.settled {
 			load.settled = true
-			load.endTime = now
-			load.endReason = self.loadEndReason()
 			load.download.finish(lagApiPhaseEndClosed)
 			if load.upload != nil {
 				load.upload.finish(lagApiPhaseEndClosed)
+			}
+			load.endTime = now
+			load.endReason = self.loadEndReason()
+			if load.upload != nil {
+				if _, uploadEndedTime, uploadEnd := load.upload.state(); uploadEnd == lagApiPhaseEndTime {
+					_, _, downloadEnd := load.download.state()
+					load.endTime = uploadEndedTime
+					load.endReason = protocol.LagEndReason_LAG_END_COMPLETE
+					if load.capped || downloadEnd == lagApiPhaseEndCap {
+						load.endReason = protocol.LagEndReason_LAG_END_CAP
+					}
+				}
 			}
 			self.api.endLoad(self)
 		}
