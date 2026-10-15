@@ -274,7 +274,7 @@ func checkWindowDeterministicPerformanceCells(t *testing.T, boundaries bool) {
 			continue
 		}
 		t.Run(fmt.Sprintf("rtt=%s/flows=%d/compression=%s", cell.RoundTrip, cell.Flows, cell.Compression), func(t *testing.T) {
-			t.Parallel()
+			windowPathParallel(t)
 			readings := measureWindowPathArms(t, max(100*time.Millisecond, 2*cell.RoundTrip), []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 				trial := cell
 				trial.Arm = arm
@@ -300,7 +300,7 @@ func TestWindowPathBoundsBurstsAtFiniteRelay(t *testing.T) {
 		for _, arm := range []string{"unpaced", "delivery"} {
 			// Each arm owns its gates, so the four bubbles are independent.
 			t.Run(fmt.Sprintf("flows=%d/%s", flows, arm), func(t *testing.T) {
-				t.Parallel()
+				windowPathParallel(t)
 				synctest.Test(t, func(t *testing.T) {
 					reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: flows, Payload: 1280, Budget: mib(48), BootstrapWindow: mib(48), Rate: 125000000, Drop: true}, time.Second)
 					if reading.Window.Initial != mib(48) {
@@ -999,9 +999,20 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	return reading
 }
 
+// Under -race, window cells and arms run as parallel subtests. That runtime
+// randomizes the order of woken goroutines, so producers competing for one
+// admission keep their share even when each arm has a single P. Without it a
+// run queue that orders them the same way every time starved one of eight
+// flows for a whole interval, so ordinary builds measure one arm at a time.
+func windowPathParallel(t *testing.T) {
+	if raceEnabled {
+		t.Parallel()
+	}
+}
+
 // Arms of one comparison share no state: each owns its bubble, clients,
 // budgets, FIFO links and producers, so its virtual-time reading does not
-// depend on another arm's progress. They run as parallel subtests and the
+// depend on another arm's progress. They may run as parallel subtests and the
 // caller compares readings only after the group joins; a failed arm stops it.
 // The process-wide pool assertion stays with the sequential top-level test.
 func measureWindowPathArms(t *testing.T, duration time.Duration, arms []string, trial func(arm string) windowPathCell) []windowPathReading {
@@ -1010,7 +1021,7 @@ func measureWindowPathArms(t *testing.T, duration time.Duration, arms []string, 
 	if !t.Run("arms", func(t *testing.T) {
 		for i, arm := range arms {
 			t.Run(arm, func(t *testing.T) {
-				t.Parallel()
+				windowPathParallel(t)
 				readings[i] = measureWindowPathTrial(t, trial(arm), duration)
 			})
 		}
