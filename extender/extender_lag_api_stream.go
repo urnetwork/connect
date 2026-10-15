@@ -6,15 +6,19 @@ package extender
 // window opens at its first byte, so connection setup does not count, and lasts
 // the ticket's downloadMs or uploadMs; the browser opens maxStreams streams
 // into it. A download stream is AES-128-CTR keystream under a fresh random key,
-// written from one 64 KiB buffer until the window or a cap runs out (M5). An
-// upload stream is a websocket of binary messages carrying AES-128-CTR
-// keystream under the session's upload key, which the extender regenerates and
-// compares read by read as the bytes arrive -- or, on hardware without AES
-// instructions, on a random 1 in 16 messages chosen after each arrives (M6).
-// Each read of an upload counts as it arrives, spread over the time since the
-// stream's previous read (amendment 14). Each stream holds one 64 KiB data
-// buffer and one 64 KiB keystream buffer; nothing grows with the stream, and
-// nothing is written to disk (M7).
+// written from one 64 KiB buffer through the window, and past it until the
+// browser closes the stream, within a grace, or until a cap runs out (M5,
+// amendment 15). An upload stream is a websocket of binary messages carrying
+// AES-128-CTR keystream under the session's upload key, which the extender
+// regenerates and compares read by read as the bytes arrive -- or, on hardware
+// without AES instructions, on a random 1 in 16 messages chosen after each
+// arrives (M6). Each read of an upload counts as it arrives, spread over the
+// time since the stream's previous read (amendment 14): reads that arrive back
+// to back spread together, a stream's first reads at the rate of the ones
+// after, and reads that arrive past the window's end for what they carry from
+// before it (amendment 15). Each stream holds one 64 KiB data buffer and one
+// 64 KiB keystream buffer; nothing grows with the stream, and nothing is
+// written to disk (M7).
 
 import (
 	"bytes"
@@ -46,11 +50,25 @@ const lagApiMaxIntervalCount = 40
 
 // The furthest back an upload read is spread from its arrival (M6, amendment
 // 14), so the bytes that end a stall are not smeared far back into it. The
-// browser spreads its download reads with the same bound.
+// browser spreads its download reads with the same bound. So it is also how
+// long past the window's end an upload's reads may still count: none that
+// arrives later reaches back before the end (amendment 15).
 const lagSpreadMax = time.Second
 
-// How long past a download window a write already under way may take to
-// finish, counted where it finishes. Nothing starts in it.
+// Reads of an upload stream that arrive within this of the first read of
+// their group are one group, back to back, and spread from where the group's
+// span starts (M6 R1, amendment 15): a burst released after a stall spreads, all
+// of it, over the stall. It is measured from the group's first read, not the
+// previous read, so a steady fast stream is cut into groups this long rather
+// than smeared over a long span. The browser groups its download reads the
+// same way.
+const lagSpreadJoin = 2 * time.Millisecond
+
+// How long past a download window its streams may go on (M5, M7). Each keeps
+// writing until the browser closes it, so the bytes still reaching the browser
+// cover its own window, which opened a one-way delay after the extender's
+// (amendment 15). A write still under way when the grace runs out is cut,
+// which ends the connection.
 const lagApiPhaseGrace = 2 * time.Second
 
 // The most streams per direction, whatever a ticket says (M5).
@@ -162,16 +180,29 @@ const (
 // browser opens into it, its window from the first byte, the bytes the streams
 // move per interval of the window, and the caps they draw on. Its series is
 // sized once, so a stream of any length adds to it without growing it (M7).
+//
+// The phase ends at its window's end, or sooner when a cap, a mismatch, the
+// load or the session ends it, and that end is the phase's end for the
+// session's every use of it (M4, M8). Ended by its time, a phase still has
+// work past the end until its window is final (amendment 15): an upload's
+// reads still count for what they carry from before the end, until every
+// stream still open is done or lagSpreadMax has passed (M6 R3); and a
+// download's streams write on until the browser closes them, within
+// lagApiPhaseGrace (M5). Closing the phase then -- the load moved on, or the
+// session ended -- makes its window final at once. Ended any other way, its
+// window is final at its end.
 type lagApiPhase struct {
 	api            *extenderLagApi
 	direction      lagApiDirection
 	duration       time.Duration
 	interval       time.Duration
 	maxStreamCount int
-	// wakes the session, at the first byte and at the end
+	// wakes the session, at the first byte, at the end, and when the window
+	// is final
 	notify func()
 
-	// done when the phase ends; a stream then stops
+	// done when the phase ends; an upload stream is then closed, though read
+	// on while its reads may still count (amendment 15)
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -188,12 +219,34 @@ type lagApiPhase struct {
 	firstByteTimer *time.Timer
 	openStreams    []bool
 	openedStreams  []bool
-	// when each upload stream's previous counted read arrived, zero before its
-	// first, and the latest arrival of any counted read (M4, M6)
-	previousReadTimes []time.Time
-	lastCountedTime   time.Time
-	end               lagApiPhaseEnd
-	endedTime         time.Time
+	// how each upload stream's reads count (M6), and the latest arrival of
+	// any counted read (M4)
+	streamCounts    []lagApiStreamCount
+	lastCountedTime time.Time
+	end             lagApiPhaseEnd
+	endedTime       time.Time
+	// nothing more counts in the window, nor goes on past it (amendment 15),
+	// and the timer that makes an upload's window final lagSpreadMax after
+	// its end
+	final      bool
+	finalTimer *time.Timer
+}
+
+// How one upload stream's reads count (M6, amendment 15). Its size is fixed,
+// however long the stream (M7).
+type lagApiStreamCount struct {
+	// when the stream's previous read arrived; zero before its first
+	previousTime time.Time
+	// when the first read of its current group arrived, and where the
+	// group's span starts
+	groupTime      time.Time
+	groupSpanStart time.Time
+	// the bytes of its first group, held uncounted until its second group
+	// begins; zero once they count
+	heldByteCount int
+	// a read of the stream spanned from the window's end or later, so nothing
+	// it reads after can count
+	done bool
 }
 
 // Opens a phase now (M4). Its window waits for the first byte, for at most
@@ -212,18 +265,18 @@ func newLagApiPhase(
 	maxStreamCount = max(0, min(maxStreamCount, lagApiMaxStreamCount))
 	ctx, cancel := context.WithCancel(parentCtx)
 	phase := &lagApiPhase{
-		api:               api,
-		direction:         direction,
-		duration:          duration,
-		interval:          interval,
-		maxStreamCount:    maxStreamCount,
-		notify:            notify,
-		ctx:               ctx,
-		cancel:            cancel,
-		maxByteCount:      maxByteCount,
-		openStreams:       make([]bool, maxStreamCount),
-		openedStreams:     make([]bool, maxStreamCount),
-		previousReadTimes: make([]time.Time, maxStreamCount),
+		api:            api,
+		direction:      direction,
+		duration:       duration,
+		interval:       interval,
+		maxStreamCount: maxStreamCount,
+		notify:         notify,
+		ctx:            ctx,
+		cancel:         cancel,
+		maxByteCount:   maxByteCount,
+		openStreams:    make([]bool, maxStreamCount),
+		openedStreams:  make([]bool, maxStreamCount),
+		streamCounts:   make([]lagApiStreamCount, maxStreamCount),
 	}
 	phase.capRemaining.Store(maxByteCount)
 	phase.stateLock.Lock()
@@ -234,17 +287,18 @@ func newLagApiPhase(
 	return phase
 }
 
-// The window of the phase at now, opening it when this is the first byte (M5,
-// M6), and whether bytes may still move in it. Whoever first sees the window
-// has run out ends the phase, so its end does not wait on a timer.
+// The window's end, opening the window at now when this is the phase's first
+// byte (M5, M6), and whether the window is still open. Whoever first sees the
+// window has run out ends the phase, so its end does not wait on a timer.
 func (self *lagApiPhase) window(now time.Time) (time.Time, bool) {
 	opened := false
-	over := false
+	ended := false
+	finalized := false
 	endTime, ok := func() (time.Time, bool) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		if self.end != lagApiPhaseRunning {
-			return time.Time{}, false
+			return self.endTime, false
 		}
 		if self.firstByteTime.IsZero() {
 			self.firstByteTime = now
@@ -256,16 +310,46 @@ func (self *lagApiPhase) window(now time.Time) (time.Time, bool) {
 			})
 			opened = true
 		}
-		over = !now.Before(self.endTime)
-		return self.endTime, !over
+		if !now.Before(self.endTime) {
+			ended, finalized = self.finishWithLock(now, lagApiPhaseEndTime)
+			return self.endTime, false
+		}
+		return self.endTime, true
 	}()
 	if opened {
 		self.notify()
 	}
-	if over {
-		self.finish(lagApiPhaseEndTime)
-	}
+	self.changed(ended, finalized)
 	return endTime, ok
+}
+
+// Whether a download stream may write at now, opening the window when this is
+// the phase's first byte (M5), and the window's end. A stream writes through
+// the window, and past it until the browser closes the stream, within
+// lagApiPhaseGrace: the browser's window opened a one-way delay after the
+// extender's, and the bytes that reach it cover its window only if the writes
+// go on past this one (amendment 15). Writes past the window stop sooner when
+// the load moves on or the session ends, which closes the phase.
+func (self *lagApiPhase) writable(now time.Time) (time.Time, bool) {
+	if endTime, ok := self.window(now); ok {
+		return endTime, true
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.endTime, self.end == lagApiPhaseEndTime && !self.final && now.Before(self.endTime.Add(lagApiPhaseGrace))
+}
+
+// Whether upload stream k's next message may still count, at now, opening the
+// window when this is the phase's first byte (M6): while the window is open,
+// and past its end until the stream is done or the window is final (amendment
+// 15).
+func (self *lagApiPhase) takes(streamIndex int, now time.Time) bool {
+	if _, ok := self.window(now); ok {
+		return true
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.countingWithLock() && !self.streamCounts[streamIndex].done
 }
 
 // Whether a stream may still move bytes in the phase: it has not ended, and
@@ -292,10 +376,22 @@ func (self *lagApiPhase) openStream(streamIndex int) bool {
 	return true
 }
 
+// Closes stream k (M5, M6). An upload stream that closes with its first group
+// still held counts the group by rule S, since no second group will come to
+// place it; and once the window has run out, it may have been the last open
+// stream not yet done, which makes the window final (amendment 15).
 func (self *lagApiPhase) closeStream(streamIndex int) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	self.openStreams[streamIndex] = false
+	finalized := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.openStreams[streamIndex] = false
+		if !self.countingWithLock() {
+			return false
+		}
+		self.placeHeldWithLock(streamIndex)
+		return self.finalIfDoneWithLock()
+	}()
+	self.changed(false, finalized)
 }
 
 // The distinct streams the browser opened in the phase (M8).
@@ -315,48 +411,143 @@ func (self *lagApiPhase) streamCount() int {
 // context is done, so whatever the context wakes reads it. A phase closed or
 // capped once its window had already run out ended by its time, whichever
 // came first to say so, so the outcome does not depend on a timer's delay.
+// Closing a phase that ended by its time ends what still goes on past its
+// window, which is then final (amendment 15).
 func (self *lagApiPhase) finish(end lagApiPhaseEnd) {
-	first := func() bool {
+	ended, finalized := func() (bool, bool) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		if self.end != lagApiPhaseRunning {
+		return self.finishWithLock(time.Now(), end)
+	}()
+	self.changed(ended, finalized)
+}
+
+// finish at now, with the phase's lock held: whether this ended the phase,
+// and whether it made the window final. The caller then calls changed.
+func (self *lagApiPhase) finishWithLock(now time.Time, end lagApiPhaseEnd) (bool, bool) {
+	if self.end != lagApiPhaseRunning {
+		if end == lagApiPhaseEndClosed && self.end == lagApiPhaseEndTime && !self.final {
+			self.finalizeWithLock()
+			return false, true
+		}
+		return false, false
+	}
+	closing := end == lagApiPhaseEndClosed
+	windowOver := !self.endTime.IsZero() && !now.Before(self.endTime)
+	if windowOver && (end == lagApiPhaseEndClosed || end == lagApiPhaseEndCap) {
+		end = lagApiPhaseEndTime
+	}
+	self.end = end
+	self.endedTime = now
+	if end == lagApiPhaseEndTime && !self.endTime.IsZero() {
+		// the window's own end, whatever the timer's delay
+		self.endedTime = self.endTime
+	}
+	self.firstByteTimer.Stop()
+	if self.windowTimer != nil {
+		self.windowTimer.Stop()
+	}
+	if end != lagApiPhaseEndTime || closing || self.endTime.IsZero() {
+		self.finalizeWithLock()
+		return true, true
+	}
+	if self.direction == lagApiDirectionUpload {
+		// the reads that arrive past the end still count for the part of
+		// their spans before it, until every open stream is done or no read
+		// can reach back before the end
+		self.finalTimer = time.AfterFunc(self.endTime.Add(lagSpreadMax).Sub(now), self.finalize)
+		return true, self.finalIfDoneWithLock()
+	}
+	return true, false
+}
+
+// After a change made with the lock held: once the phase has ended its
+// context is done, and the session wakes to read the change.
+func (self *lagApiPhase) changed(ended bool, finalized bool) {
+	if ended {
+		self.cancel()
+	}
+	if ended || finalized {
+		self.notify()
+	}
+}
+
+// Makes the window of a phase that ended final, if it is not yet: the timer's,
+// lagSpreadMax past an upload's end (M6 R3, amendment 15).
+func (self *lagApiPhase) finalize() {
+	finalized := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.end == lagApiPhaseRunning || self.final {
 			return false
 		}
-		now := time.Now()
-		windowOver := !self.endTime.IsZero() && !now.Before(self.endTime)
-		if windowOver && (end == lagApiPhaseEndClosed || end == lagApiPhaseEndCap) {
-			end = lagApiPhaseEndTime
-		}
-		self.end = end
-		self.endedTime = now
-		if end == lagApiPhaseEndTime && !self.endTime.IsZero() {
-			// the window's own end, whatever the timer's delay
-			self.endedTime = self.endTime
-		}
-		self.firstByteTimer.Stop()
-		if self.windowTimer != nil {
-			self.windowTimer.Stop()
-		}
+		self.finalizeWithLock()
 		return true
 	}()
-	if !first {
+	self.changed(false, finalized)
+}
+
+// Makes the window final, with the phase's lock held: nothing more counts in
+// it (amendment 15). A first group still held then counts by rule S, since no
+// second group will come to place it.
+func (self *lagApiPhase) finalizeWithLock() {
+	if self.final {
 		return
 	}
-	self.cancel()
-	self.notify()
+	self.final = true
+	if self.finalTimer != nil {
+		self.finalTimer.Stop()
+	}
+	for streamIndex := range self.streamCounts {
+		self.placeHeldWithLock(streamIndex)
+	}
+}
+
+// Makes an upload's window final once it has run out and every stream still
+// open is done (M6 R3, amendment 15), with the phase's lock held. Whether it
+// did.
+func (self *lagApiPhase) finalIfDoneWithLock() bool {
+	if self.direction != lagApiDirectionUpload || self.end != lagApiPhaseEndTime || self.final {
+		return false
+	}
+	for streamIndex, open := range self.openStreams {
+		if open && !self.streamCounts[streamIndex].done {
+			return false
+		}
+	}
+	self.finalizeWithLock()
+	return true
+}
+
+// Whether reads may still count (M6, amendment 15), with the phase's lock
+// held: while the phase runs, and once its window has run out, until the
+// window is final.
+func (self *lagApiPhase) countingWithLock() bool {
+	return self.end == lagApiPhaseRunning || (self.end == lagApiPhaseEndTime && !self.final)
 }
 
 // The phase as the session sees it: its first byte (zero when none), when it
-// ended (zero while running), and why.
+// ended (zero while running), and why. A phase that ended by its time ended
+// at its window's end, though its window may not be final yet.
 func (self *lagApiPhase) state() (firstByteTime time.Time, endedTime time.Time, end lagApiPhaseEnd) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.firstByteTime, self.endedTime, self.end
 }
 
+// Whether the phase's window is final (amendment 15): for an upload, nothing
+// more counts in it, so its total and series are the ones the report signs.
+func (self *lagApiPhase) windowFinal() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.final
+}
+
 // The bytes per interval of the window, through its last counted interval: a
-// download's sent series as the report signs it, since its writes may finish
-// in the grace past the window (M5, M8). And their sum.
+// download's sent series as the report signs it (M5, M8). Its streams write
+// on past the window until the browser closes them, within the grace
+// (amendment 15), so it holds those writes too, in the intervals past the
+// window.
 func (self *lagApiPhase) seriesValues() []uint64 {
 	if series := self.series.Load(); series != nil {
 		return series.values(0)
@@ -370,7 +561,7 @@ func (self *lagApiPhase) seriesValues() []uint64 {
 // zeros, as the browser's figures count them, so a quiet end of the window
 // stays in the signed p50. It never stops short of a counted byte, nor runs
 // past the series. Before the phase ends, it runs through its last counted
-// interval.
+// interval. Its values are final once the window is (amendment 15).
 func (self *lagApiPhase) windowValues() []uint64 {
 	firstByteTime, endedTime, _ := self.state()
 	series := self.series.Load()
@@ -440,51 +631,109 @@ func (self *lagApiPhase) count(now time.Time, byteCount int) {
 	}
 }
 
-// Counts one read of upload stream k as it arrives, when the phase runs and the
-// read arrived inside its window (M6, M8). Its bytes count as having arrived
-// evenly since the stream's previous read -- the window's first byte for its
-// first -- but never from more than lagSpreadMax before it, split across the
-// intervals that span crosses (amendment 14). A stream that sends continuously
-// delivers a read's bytes over exactly that time. Counted whole where it
-// arrived, a read stepped its interval by one TLS record, 0.52 Mbps, which put
-// a slow uplink's p50 off by up to that step. Reads count under the phase's
-// lock and only while it runs, so nothing is added once it has ended: the
-// total the browser is then told is the total the report holds. A read at or
-// past the window's end counts nothing, and ends the phase. A counted read
-// draws on the ticket's cap and the daily budget as it arrives; past either
-// the phase ends as capped.
+// Counts one read of upload stream k as it arrives (M6, M8). Its bytes count
+// as having arrived evenly over a span that ends at its arrival, split across
+// the intervals the span crosses (amendment 14): a stream that sends
+// continuously delivers a read's bytes over the time since its previous read.
+// Counted whole where it arrived, a read stepped its interval by one TLS
+// record, 0.52 Mbps, which put a slow uplink's p50 off by up to that step.
+// Amendment 15 settles the span at the window's edges and in bursts:
+//   - R1, groups: reads that arrive within lagSpreadJoin of the first read of
+//     their group are one group, and each spans from where the group's span
+//     starts. Any other read starts a group, which spans from the stream's
+//     previous read, at most lagSpreadMax back and never before the window's
+//     first byte, as rule S has it. So a burst that ends a stall spreads, all
+//     of it, over the stall, rather than its first read alone and the rest in
+//     one interval, a spike that read in the p95.
+//   - R2, a stream's first group: it is held, uncounted, until its second
+//     group begins, and then counts as having arrived at the rate of the
+//     second group's first read, back from its own last read, at most
+//     lagSpreadMax (placeFirstWithLock). Only the part from the window's first
+//     byte on counts: the streams start together, and when the first record
+//     to arrive opens the window the others are mostly on their way, so
+//     counted from the window's first byte their first records crowded into
+//     its first interval. A first group that no second group places counts
+//     by rule S (placeHeldWithLock).
+//   - R3, the window's end: past it the phase has ended by its time, but a
+//     stream's reads still count for the part of their spans before the end,
+//     which the read that straddles the end carries. A stream whose read
+//     spans from the end on is done: its spans are contiguous, so nothing it
+//     reads after could count. The window is final once every stream still
+//     open is done, or lagSpreadMax past the end.
+//
+// Reads count under the phase's lock and only until the window is final, so
+// nothing is added after: the total the browser is then told is the total the
+// report holds. Every read the phase takes in draws on the ticket's cap and
+// the daily budget for all its bytes as it arrives, whatever part of it
+// counts: a first group's while it is held and its part before the window's
+// first byte, and past the window's end a read's part after the end, all of
+// a read that spans from the end on included. They are bytes the extender
+// moved, as a download's writes in its grace are (M5). Inside the window,
+// past either the phase ends as capped; past the end it has ended by its time
+// already. Reads that arrive once their stream is done or the window is
+// final are drained, not taken in.
 func (self *lagApiPhase) receive(streamIndex int, arrivedTime time.Time, byteCount int) {
 	if byteCount <= 0 {
 		return
 	}
-	counted, over := func() (bool, bool) {
+	taken, ended, finalized := func() (bool, bool, bool) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		series := self.series.Load()
-		if self.end != lagApiPhaseRunning || series == nil {
-			return false, false
+		count := &self.streamCounts[streamIndex]
+		if series == nil || !self.countingWithLock() || count.done {
+			return false, false, false
 		}
-		if !arrivedTime.Before(self.endTime) {
-			return false, true
+		ended := false
+		finalized := false
+		if self.end == lagApiPhaseRunning && !arrivedTime.Before(self.endTime) {
+			ended, finalized = self.finishWithLock(arrivedTime, lagApiPhaseEndTime)
 		}
-		spreadTime := arrivedTime.Add(-lagSpreadMax)
-		if previousTime := self.previousReadTimes[streamIndex]; spreadTime.Before(previousTime) {
-			spreadTime = previousTime
+		if !arrivedTime.Before(self.endTime.Add(lagSpreadMax)) {
+			// no read this late reaches back before the end: the window is
+			// final lagSpreadMax past it, whatever the timer's delay, so this
+			// read arrived once it was, and is not taken in
+			self.finalizeWithLock()
+			return false, ended, true
 		}
-		if spreadTime.Before(self.firstByteTime) {
-			spreadTime = self.firstByteTime
+		if self.final {
+			return false, ended, finalized
 		}
-		series.addSpread(spreadTime, arrivedTime, byteCount)
-		self.previousReadTimes[streamIndex] = arrivedTime
-		if self.lastCountedTime.Before(arrivedTime) {
-			self.lastCountedTime = arrivedTime
+		if count.previousTime.IsZero() || arrivedTime.After(count.groupTime.Add(lagSpreadJoin)) {
+			// a new group, which spans from the stream's previous read
+			spanStart := arrivedTime.Add(-lagSpreadMax)
+			if spanStart.Before(count.previousTime) {
+				spanStart = count.previousTime
+			}
+			if spanStart.Before(self.firstByteTime) {
+				spanStart = self.firstByteTime
+			}
+			if 0 < count.heldByteCount {
+				// the stream's second group: it places the first
+				self.placeFirstWithLock(streamIndex, arrivedTime, byteCount)
+			}
+			count.groupTime = arrivedTime
+			count.groupSpanStart = spanStart
 		}
-		return true, false
+		if count.previousTime.IsZero() || 0 < count.heldByteCount {
+			// the stream's first group, held until its second begins
+			count.heldByteCount += byteCount
+			count.previousTime = arrivedTime
+			return true, ended, finalized
+		}
+		if !count.groupSpanStart.Before(self.endTime) {
+			// it spans from the end on, so neither it nor what follows counts,
+			// though its bytes moved
+			count.done = true
+			return true, ended, self.finalIfDoneWithLock() || finalized
+		}
+		series.addSpread(count.groupSpanStart, arrivedTime, byteCount, self.endTime)
+		count.previousTime = arrivedTime
+		self.countedWithLock(arrivedTime)
+		return true, ended, finalized
 	}()
-	if over {
-		self.finish(lagApiPhaseEndTime)
-	}
-	if !counted {
+	self.changed(ended, finalized)
+	if !taken {
 		return
 	}
 	if self.capRemaining.Add(-int64(byteCount)) <= 0 {
@@ -495,12 +744,138 @@ func (self *lagApiPhase) receive(streamIndex int, arrivedTime time.Time, byteCou
 	}
 }
 
+// Counts stream k's held first group once its second group begins with a read
+// of byteCount bytes at arrivedTime, with the phase's lock held (M6 R2,
+// amendment 15): as having arrived evenly at that read's rate, over the time
+// its bytes would take at that rate back from the group's last read, at most
+// lagSpreadMax. Only the part from the window's first byte on counts; the rest
+// arrived before the window opened and is not counted at all. Most of the read
+// that opened the window is such a part. With no time between the two groups
+// there is no rate, and rule S places it.
+func (self *lagApiPhase) placeFirstWithLock(streamIndex int, arrivedTime time.Time, byteCount int) {
+	count := &self.streamCounts[streamIndex]
+	lastTime := count.previousTime
+	gap := arrivedTime.Sub(lastTime)
+	if gap <= 0 {
+		self.placeHeldWithLock(streamIndex)
+		return
+	}
+	spanStart := lastTime.Add(-lagSpreadMax)
+	if span := float64(count.heldByteCount) * float64(gap) / float64(byteCount); span < float64(lagSpreadMax) {
+		spanStart = lastTime.Add(-time.Duration(span))
+	}
+	self.series.Load().addSpread(spanStart, lastTime, count.heldByteCount, self.endTime)
+	count.heldByteCount = 0
+	self.countedWithLock(lastTime)
+}
+
+// Counts stream k's first group, if it is still held, by rule S, with the
+// phase's lock held (M6 R2, amendment 15): over the time back from its last
+// read, at most lagSpreadMax and never before the window's first byte. For a
+// first group no second group placed: its stream ended, or its window became
+// final, first.
+func (self *lagApiPhase) placeHeldWithLock(streamIndex int) {
+	count := &self.streamCounts[streamIndex]
+	if count.heldByteCount == 0 {
+		return
+	}
+	lastTime := count.previousTime
+	spanStart := lastTime.Add(-lagSpreadMax)
+	if spanStart.Before(self.firstByteTime) {
+		spanStart = self.firstByteTime
+	}
+	self.series.Load().addSpread(spanStart, lastTime, count.heldByteCount, self.endTime)
+	count.heldByteCount = 0
+	self.countedWithLock(lastTime)
+}
+
+// Keeps the latest arrival of a counted read (M4), with the phase's lock held.
+func (self *lagApiPhase) countedWithLock(arrivedTime time.Time) {
+	if self.lastCountedTime.Before(arrivedTime) {
+		self.lastCountedTime = arrivedTime
+	}
+}
+
+// Ends the phase as a mismatch at now (M6): the stream's bytes were not the
+// expected keystream. Once the window has run out, the phase ended by its time
+// (amendment 15), and a mismatch then ends only its stream's counting. What
+// counted before stays, and the load's outcome is its window's: every read
+// that counted was checked, under exact verification, before it counted.
+func (self *lagApiPhase) mismatch(streamIndex int, now time.Time) {
+	ended, finalized := func() (bool, bool) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		ended := false
+		finalized := false
+		if self.end == lagApiPhaseRunning && !self.endTime.IsZero() && !now.Before(self.endTime) {
+			ended, finalized = self.finishWithLock(now, lagApiPhaseEndTime)
+		}
+		if self.end == lagApiPhaseRunning {
+			return self.finishWithLock(now, lagApiPhaseEndMismatch)
+		}
+		if !self.countingWithLock() {
+			return ended, finalized
+		}
+		self.streamCounts[streamIndex].done = true
+		return ended, self.finalIfDoneWithLock() || finalized
+	}()
+	self.changed(ended, finalized)
+}
+
 // The upload's bytes counted so far and when the latest counted read arrived,
 // zero before the first, read together (M4).
 func (self *lagApiPhase) progress() (uint64, time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.total(), self.lastCountedTime
+}
+
+// The ms of a progress report that the browser takes as the upload's window
+// being over (M4, S5): the window's length less half an interval, as it
+// compares it, `ms ≥ uploadMs − intervalMs/2`.
+func lagApiWindowOverMs(duration time.Duration, interval time.Duration) float64 {
+	return float64(duration.Milliseconds()) - float64(interval.Milliseconds())/2
+}
+
+// An upload progress report (M4) and whether it goes out, read at one moment
+// under the phase's lock, so its ms and the phase's state cannot disagree:
+// the bytes counted so far, the ms into the window, and at, when the latest
+// counted read arrived, in ms to the microsecond, held to ms. last is the
+// report that says the window is over, sent once it is final, with the final
+// total: its ms is the window's whole length, or the phase's for one that
+// ended sooner. Any other report goes out only while the phase runs, and only
+// with ms short of the length less half an interval, which the browser takes
+// as the window's end: it would close its streams and say done before the
+// reads that straddle the end arrive, so no report before the window is
+// final may read as over (amendment 15). One that would is not sent. Neither
+// ms nor at goes back from one report to the next.
+func (self *lagApiPhase) progressReport(last bool) (uint64, int64, float64, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	now := time.Now()
+	if self.firstByteTime.IsZero() {
+		return 0, 0, 0, false
+	}
+	ms := int64(0)
+	if last {
+		if !self.final {
+			return 0, 0, 0, false
+		}
+		ms = max(0, min(self.endedTime.Sub(self.firstByteTime), self.duration)).Milliseconds()
+	} else {
+		if self.end != lagApiPhaseRunning {
+			return 0, 0, 0, false
+		}
+		ms = max(0, now.Sub(self.firstByteTime)).Milliseconds()
+		if lagApiWindowOverMs(self.duration, self.interval) <= float64(ms) {
+			return 0, 0, 0, false
+		}
+	}
+	at := 0.0
+	if !self.lastCountedTime.IsZero() {
+		at = max(0, min(float64(ms), float64(self.lastCountedTime.Sub(self.firstByteTime).Microseconds())/1000))
+	}
+	return self.total(), ms, at, true
 }
 
 // Bytes per interval from a window's first byte (M8). Sized once and bounded
@@ -539,30 +914,47 @@ func (self *lagApiSeries) add(now time.Time, byteCount int) {
 	self.counts[index].Add(uint64(byteCount))
 }
 
-// Adds bytes that arrived evenly over [startTime, endTime] (amendment 14): the
-// span is cut at the interval boundaries inside it, and each interval takes
-// its piece's share of the span's length. The pieces are whole bytes that sum
-// to byteCount: each cut rounds the share through it, so a piece is the
-// difference of two rounded shares. A span of no length adds them all at
-// endTime.
-func (self *lagApiSeries) addSpread(startTime time.Time, endTime time.Time, byteCount int) {
+// Adds bytes that arrived evenly over [startTime, endTime] (amendment 14), of
+// which only the part from the series' start to untilTime counts (amendment
+// 15): a stream's first group can reach back before the window's first byte,
+// and a read that straddles the window's end carries bytes from after it. The
+// span is cut at the interval boundaries inside it and at those two bounds,
+// and each interval takes its piece's share of the span's length. The pieces
+// are whole bytes: each cut rounds the share through it, so a piece is the
+// difference of two rounded shares, and the pieces of a span wholly inside the
+// bounds sum to byteCount. A span of no length adds them all at endTime, if
+// that is inside the bounds.
+func (self *lagApiSeries) addSpread(startTime time.Time, endTime time.Time, byteCount int, untilTime time.Time) {
 	if byteCount <= 0 {
 		return
 	}
-	spanStart := max(0, startTime.Sub(self.startTime))
-	spanEnd := max(0, endTime.Sub(self.startTime))
+	spanStart := startTime.Sub(self.startTime)
+	spanEnd := endTime.Sub(self.startTime)
+	until := untilTime.Sub(self.startTime)
 	if spanEnd <= spanStart {
-		self.add(endTime, byteCount)
+		if 0 <= spanEnd && spanEnd < until {
+			self.add(endTime, byteCount)
+		}
 		return
 	}
-	added := 0
-	for index := int(spanStart / self.interval); index < len(self.counts) && added < byteCount; index += 1 {
-		through := byteCount
-		if cut := time.Duration(index+1) * self.interval; cut < spanEnd {
-			through = int(math.Round(float64(byteCount) * float64(cut-spanStart) / float64(spanEnd-spanStart)))
+	// the span's bytes through x, rounded
+	through := func(x time.Duration) int {
+		if spanEnd <= x {
+			return byteCount
 		}
-		self.counts[index].Add(uint64(through - added))
-		added = through
+		return int(math.Round(float64(byteCount) * float64(x-spanStart) / float64(spanEnd-spanStart)))
+	}
+	from := max(0, spanStart)
+	to := min(spanEnd, until)
+	for index := int(from / self.interval); index < len(self.counts); index += 1 {
+		cutStart := max(from, time.Duration(index)*self.interval)
+		cutEnd := min(to, time.Duration(index+1)*self.interval)
+		if cutEnd <= cutStart {
+			break
+		}
+		if piece := through(cutEnd) - through(cutStart); 0 < piece {
+			self.counts[index].Add(uint64(piece))
+		}
 	}
 }
 
@@ -681,9 +1073,10 @@ func (self *extenderLagApi) streamSession(r *http.Request) (*lagApiSession, int,
 
 // GET /lag/v1/down?session=<id>&stream=<k> (M5): 200 with keystream under a
 // fresh random key, chunked with no content length and no content encoding,
-// during the session's download phase only, until downloadMs after the phase's
-// first byte or a cap runs out. Outside the phase, or for a stream already open
-// or past maxStreams, 409.
+// during the session's download phase only: through downloadMs after the
+// phase's first byte, and past it until the browser closes the stream, within
+// the grace (amendment 15), or until a cap runs out. Outside the phase, or for
+// a stream already open or past maxStreams, 409.
 func (self *extenderLagApi) serveDown(w http.ResponseWriter, r *http.Request, originAllowed bool) {
 	if !originAllowed {
 		w.WriteHeader(http.StatusForbidden)
@@ -712,9 +1105,12 @@ func (self *extenderLagApi) serveDown(w http.ResponseWriter, r *http.Request, or
 	self.writeDownload(r.Context(), w, phase, keystream)
 }
 
-// Writes one download stream from one buffer (M5, M7). A write still under way
-// when the window runs out may finish within the grace; one past it is cut,
-// which ends the connection.
+// Writes one download stream from one buffer (M5, M7): through the window, and
+// past it until the browser closes the stream -- the request's context is
+// then done, or a write fails -- within the grace (amendment 15). Each write
+// draws on the ticket's cap and the daily budget, past the window as in it. A
+// write still under way when the grace runs out is cut, which ends the
+// connection.
 func (self *extenderLagApi) writeDownload(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -732,7 +1128,7 @@ func (self *extenderLagApi) writeDownload(
 	deadlineSet := false
 	for ctx.Err() == nil {
 		now := time.Now()
-		endTime, ok := phase.window(now)
+		endTime, ok := phase.writable(now)
 		if !ok {
 			return
 		}
@@ -791,7 +1187,10 @@ func (self *extenderLagApi) serveUp(w http.ResponseWriter, r *http.Request, orig
 
 // Reads and verifies one upload stream (M6, M7), message by message (see
 // lagApiUploadStream). When the phase ends the stream is closed -- 1000, or
-// 4400 for a mismatch -- and drained until the browser's own close.
+// 4400 for a mismatch -- and read on until the browser's own close: what the
+// browser sent before the close reached it still arrives, and past the
+// window's end its reads count for the part of their spans before the end
+// until the window is final (amendment 15). What arrives after is drained.
 func (self *extenderLagApi) readUpload(
 	conn *websocket.Conn,
 	uploadKey [16]byte,
@@ -847,6 +1246,9 @@ func (self *extenderLagApi) readUpload(
 // whole. A mismatch, a text message or a message after a short one ends the
 // phase as a mismatch, which ends the load; what was counted before it stays
 // counted, but the load is not complete, so no speed is derived from it (A5).
+// Past the window's end, which the phase has ended by, the stream is read on
+// while its reads may still count (amendment 15), and a mismatch then ends
+// only its count.
 type lagApiUploadStream struct {
 	phase         *lagApiPhase
 	streamIndex   int
@@ -893,17 +1295,19 @@ func newLagApiUploadStream(
 // Reads one message from reader, verifying and counting it read by read as
 // above, with each read's arrival from now: a read returns what the connection
 // has delivered, so its time is its arrival, to within a TLS record. A message
-// that starts past the window or once the phase has ended is left unread, to
-// be drained, not counted, as is the rest of one that failed its check. A full
-// buffer is the whole message, since the read limit refuses a longer one
-// before its bytes arrive. An error is the connection's.
+// that starts once none of its stream's reads can count -- the phase ended
+// early, or past the window's end the stream is done or the window final -- is
+// left unread, to be drained, not counted, as is the rest of one that failed
+// its check. A full buffer is the whole message, since the read limit refuses
+// a longer one before its bytes arrive. An error is the connection's.
 func (self *lagApiUploadStream) readMessage(messageType int, reader io.Reader, now func() time.Time) error {
 	phase := self.phase
-	if _, ok := phase.window(now()); !ok {
+	startTime := now()
+	if !phase.takes(self.streamIndex, startTime) {
 		return nil
 	}
 	if messageType != websocket.BinaryMessage || self.short {
-		phase.finish(lagApiPhaseEndMismatch)
+		phase.mismatch(self.streamIndex, startTime)
 		return nil
 	}
 	byteCount := 0
@@ -915,7 +1319,7 @@ func (self *lagApiUploadStream) readMessage(messageType int, reader io.Reader, n
 				keystream := self.keystream[byteCount : byteCount+n]
 				self.running.XORKeyStream(keystream, lagApiZeroBytes[:n])
 				if !bytes.Equal(self.data[byteCount:byteCount+n], keystream) {
-					phase.finish(lagApiPhaseEndMismatch)
+					phase.mismatch(self.streamIndex, arrivedTime)
 					return nil
 				}
 			}
@@ -935,7 +1339,7 @@ func (self *lagApiUploadStream) readMessage(messageType int, reader io.Reader, n
 		counterBlock := lagApiCounterBlock(uint64(self.streamIndex), self.offset)
 		cipher.NewCTR(self.block, counterBlock[:]).XORKeyStream(self.keystream[:byteCount], lagApiZeroBytes[:byteCount])
 		if !bytes.Equal(self.data[:byteCount], self.keystream[:byteCount]) {
-			phase.finish(lagApiPhaseEndMismatch)
+			phase.mismatch(self.streamIndex, now())
 			return nil
 		}
 	}
