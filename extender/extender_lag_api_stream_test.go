@@ -1431,8 +1431,9 @@ func TestLagApiStreamRefusals(t *testing.T) {
 // M5: the window opens at the phase's first byte, so connection setup does not
 // count, and lasts downloadMs from it, the phase's end. The stream writes on
 // past it until the browser closes the stream, whose own window opened later
-// (amendment 15), and stops once it has: every byte it wrote, past the window
-// too, is in the sent series and drew on the cap.
+// (amendment 15), and stops for the close, before the grace runs out: every
+// byte it wrote, past the window too, is in the sent series and drew on the
+// cap.
 func TestLagApiDownloadWindow(t *testing.T) {
 	fixture := newLagApiFixture(t, nil)
 	session := fixture.directSession(4)
@@ -1443,39 +1444,40 @@ func TestLagApiDownloadWindow(t *testing.T) {
 	}
 	startTime := time.Now()
 	response := fixture.get(fmt.Sprintf("/lag/v1/down?session=%s&stream=0", session.id), testLagOrigin)
-	// the browser reads through its window and a little past it, then closes
+	// the browser reads through its window and on past the extender's, then
+	// closes; what the extender had written when its window ended
 	buffer := make([]byte, 64*1024)
 	n := int64(0)
-	pastWindow := int64(0)
-	for time.Since(startTime) < 900*time.Millisecond {
+	endedConsumed := int64(-1)
+	for time.Since(startTime) < 1200*time.Millisecond {
 		read, err := response.Body.Read(buffer)
 		n += int64(read)
-		if _, _, end := phase.state(); end != lagApiPhaseRunning {
-			pastWindow += int64(read)
+		if _, _, end := phase.state(); end != lagApiPhaseRunning && endedConsumed < 0 {
+			endedConsumed = int64(phase.consumed())
 		}
 		if err != nil {
 			t.Fatalf("the stream ended %s in: %v", time.Since(startTime), err)
 		}
 	}
 	response.Body.Close()
-	closedTime := time.Now()
 	waitFor(t, func() bool {
 		return !testLagStreamOpen(phase, 0)
 	})
-	if stopped := time.Since(closedTime); lagApiPhaseGrace <= stopped {
-		t.Errorf("the stream went on %s after the browser closed it", stopped)
-	}
+	stoppedTime := time.Now()
 	firstByteTime, endedTime, end := phase.state()
 	if end != lagApiPhaseEndTime || endedTime.Sub(firstByteTime) != 600*time.Millisecond || firstByteTime.Before(startTime) {
 		t.Errorf("ended %d after %s", end, endedTime.Sub(firstByteTime))
 	}
-	if pastWindow == 0 {
-		t.Errorf("of %d bytes, none came past the window", n)
+	if !stoppedTime.Before(endedTime.Add(lagApiPhaseGrace)) {
+		t.Errorf("the stream stopped %s past the window, not for the close", stoppedTime.Sub(endedTime))
 	}
-	// three intervals of window, and some of the grace past it, never past
-	// the grace
+	if endedConsumed < 0 || phase.consumed() <= uint64(endedConsumed) {
+		t.Errorf("wrote %d by the window's end and %d in all", endedConsumed, phase.consumed())
+	}
+	// the window's three intervals, and the grace's past it, never past the
+	// grace
 	values := phase.seriesValues()
-	if len(values) < 4 || 11 < len(values) {
+	if len(values) < 3 || 11 < len(values) {
 		t.Errorf("series %v", values)
 	}
 	total := uint64(0)
