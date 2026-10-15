@@ -12,6 +12,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // Returns a recorder whose clock steps one second per observation from a
@@ -116,6 +118,40 @@ func TestPeerCapabilityRecorderRecordUnansweredAttempt(t *testing.T) {
 	})
 }
 
+// A completed client-role handshake implies its ClientHello was handed over.
+// The attempt is recorded by the sender after the send path accepts it, so a
+// descheduled sender can record it after the answer: the record is attempted
+// from the answer on, and the late record keeps the earlier time. A seal implies
+// both.
+func TestPeerCapabilityRecorderHandshakeImpliesAttempt(t *testing.T) {
+	recorder, at := newSteppedPeerCapabilityRecorderForTest(0)
+	answeredPeerId := NewId()
+	sealedPeerId := NewId()
+
+	recorder.observeE2eHandshake(answeredPeerId, tls.X25519MLKEM768)
+	recorder.observeE2eAttempt(answeredPeerId)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
+		PeerId:              answeredPeerId,
+		E2eAttempted:        true,
+		E2eFirstAttemptTime: at(0),
+		E2eNegotiated:       true,
+		KeyExchange:         "X25519MLKEM768",
+		PostQuantum:         true,
+		LastObservationTime: at(1),
+	})
+
+	recorder.observeE2eSealed(sealedPeerId, tls.X25519)
+	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
+		PeerId:              sealedPeerId,
+		E2eAttempted:        true,
+		E2eFirstAttemptTime: at(2),
+		E2eNegotiated:       true,
+		E2eSealed:           true,
+		KeyExchange:         "X25519",
+		LastObservationTime: at(2),
+	})
+}
+
 // Acknowledgements alone (no session attempted, as under EncryptionModeOff)
 // say nothing about the end-to-end session.
 func TestPeerCapabilityRecorderRecordAcknowledgementsWithoutSession(t *testing.T) {
@@ -141,6 +177,8 @@ func TestPeerCapabilityRecorderSealedKeyExchangeOutranksLaterHandshake(t *testin
 	recorder.observeE2eHandshake(peerId, tls.X25519)
 	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
+		E2eAttempted:        true,
+		E2eFirstAttemptTime: at(0),
 		E2eNegotiated:       true,
 		KeyExchange:         "X25519",
 		LastObservationTime: at(1),
@@ -150,6 +188,8 @@ func TestPeerCapabilityRecorderSealedKeyExchangeOutranksLaterHandshake(t *testin
 	recorder.observeE2eHandshake(peerId, tls.X25519)
 	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
+		E2eAttempted:        true,
+		E2eFirstAttemptTime: at(0),
 		E2eNegotiated:       true,
 		E2eSealed:           true,
 		KeyExchange:         "X25519MLKEM768",
@@ -160,6 +200,8 @@ func TestPeerCapabilityRecorderSealedKeyExchangeOutranksLaterHandshake(t *testin
 	recorder.observeE2eSealed(peerId, tls.X25519)
 	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
+		E2eAttempted:        true,
+		E2eFirstAttemptTime: at(0),
 		E2eNegotiated:       true,
 		E2eSealed:           true,
 		KeyExchange:         "X25519",
@@ -676,8 +718,14 @@ func completedSequenceTlsConnsForTest(t *testing.T, serverCurves []tls.CurveID) 
 }
 
 // A client that opts in, with encryption sessions in the given mode and its
-// background key publication parked, closed and joined at cleanup.
-func newPeerCapabilityClientForTest(t *testing.T, mode EncryptionMode, recorder *PeerCapabilityRecorder) *Client {
+// background key publication parked, closed and joined at cleanup. configure,
+// when given, adjusts the settings before construction.
+func newPeerCapabilityClientForTest(
+	t *testing.T,
+	mode EncryptionMode,
+	recorder *PeerCapabilityRecorder,
+	configure ...func(*ClientSettings),
+) *Client {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	settings := DefaultClientSettings()
@@ -687,6 +735,9 @@ func newPeerCapabilityClientForTest(t *testing.T, mode EncryptionMode, recorder 
 	settings.PeerCapabilityRecorder = recorder
 	settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 	settings.EncryptionSettings.beforeEncryptedKeyPublishForTest = func() { <-ctx.Done() }
+	for _, apply := range configure {
+		apply(settings)
+	}
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	t.Cleanup(func() {
 		cancel()
@@ -863,6 +914,92 @@ func TestClientHelloRecordsEndToEndAttempt(t *testing.T) {
 		E2eFirstAttemptTime: attemptedAt,
 		LastObservationTime: attemptedAt,
 	})
+}
+
+// The attempt is recorded once the send path has accepted the ClientHello,
+// never while it is still on its way: when the send path takes it, nothing is
+// recorded yet, and after it accepts it, the attempt is.
+func TestClientHelloAttemptIsRecordedAfterTheSendPathAcceptsIt(t *testing.T) {
+	recorder := NewPeerCapabilityRecorder(0)
+	peerId := NewId()
+	attempted := make(chan struct{})
+	var attemptedOnce sync.Once
+	recorder.afterObserveForTest = func(observedPeerId Id) {
+		if observedPeerId == peerId {
+			attemptedOnce.Do(func() { close(attempted) })
+		}
+	}
+	handedOver := make(chan struct{})
+	var handOverOnce sync.Once
+	recordedAtHandOver := false
+	client := newPeerCapabilityClientForTest(t, EncryptionModeOpportunistic, recorder, func(settings *ClientSettings) {
+		settings.SendBufferSettings.beforeEncryptedControlPackForTest = func(message []byte) {
+			var control protocol.EncryptedControl
+			if err := ProtoUnmarshal(message, &control); err != nil ||
+				control.ControlType != protocol.EncryptedControlType_EncryptedControlHandshake {
+				return
+			}
+			handOverOnce.Do(func() {
+				_, recordedAtHandOver = recorder.Get(peerId)
+				close(handedOver)
+			})
+		}
+	})
+
+	session := client.EncryptionSessionManager().AcquireForSend(peerId, sequenceTlsRoleClient, false, false, false)
+	if session == nil {
+		t.Fatal("no client-role session under Opportunistic")
+	}
+	defer session.Release()
+	// liveness bounds only; the two barriers are the proof
+	select {
+	case <-handedOver:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the ClientHello never reached the send path")
+	}
+	select {
+	case <-attempted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the ClientHello the send path took was never recorded")
+	}
+	if recordedAtHandOver {
+		t.Fatal("the attempt was recorded before the send path accepted the ClientHello")
+	}
+}
+
+// A ClientHello the send path never takes is not an attempt: here the client
+// has no send path at all, so the first outbox batch goes nowhere.
+func TestClientHelloTheSendPathNeverTakesRecordsNoAttempt(t *testing.T) {
+	recorder := NewPeerCapabilityRecorder(0)
+	client := &Client{log: NewNoopLogger(), peerCapabilityRecorder: recorder}
+	peerId := NewId()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session := newPeerEncryptionSession(ctx, nil, client, peerId, sequenceTlsRoleClient,
+		DefaultEncryptionSettings(), DefaultSequenceClientTlsConfig(), false)
+	epochCtx, epochCancel := context.WithCancel(session.ctx)
+	defer epochCancel()
+	e := &tlsHandshakeEpoch{
+		ctx:               epochCtx,
+		cancel:            epochCancel,
+		transport:         newSequenceTlsTransport(epochCtx),
+		handshakeDone:     make(chan struct{}),
+		establishmentDone: make(chan struct{}),
+	}
+	func() {
+		session.stateLock.Lock()
+		defer session.stateLock.Unlock()
+		session.epoch = e
+	}()
+	// one ClientHello-shaped batch, then the transport ends, so the outbox
+	// loop takes exactly that batch and returns
+	e.transport.Write([]byte{22, 3, 1, 0, 1, 1})
+	e.transport.Close()
+	session.outboxLoop(e)
+
+	if observation, ok := recorder.Get(peerId); ok {
+		t.Fatalf("a ClientHello the send path never took was recorded as an attempt: %+v", observation)
+	}
 }
 
 // Under EncryptionModeOff a recorder starts no session and so records no

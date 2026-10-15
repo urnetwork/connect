@@ -717,8 +717,8 @@ Test-infrastructure lessons (reusable):
 
   | Edge | Site | Records |
   |---|---|---|
-  | a client-role epoch's first outbox batch (its ClientHello) | `peerEncryptionSession.outboxLoop` | `E2eAttempted`; `E2eFirstAttemptTime` keeps the first |
-  | a client-role handshake completes (the peer answered this client's ClientHello), current or superseded epoch | `completeHandshake` | `E2eNegotiated`; `KeyExchange` unless a seal supplied it |
+  | the send path accepts a client-role epoch's first outbox batch (its ClientHello) | `outboxLoop`, through `sendEncryptedControl`'s `afterSent` | `E2eAttempted`; `E2eFirstAttemptTime` keeps the first |
+  | a client-role handshake completes (the peer answered this client's ClientHello), current or superseded epoch | `completeHandshake` | `E2eNegotiated` (and `E2eAttempted`); `KeyExchange` unless a seal supplied it |
   | a client-role session verifies the peer's identity proof and its epoch is promoted | `maybeVerifyPendingPeerIdentityProof` | `E2eSealed`, `KeyExchange` (before the Sealed event fires) |
   | a send sequence's first acknowledgement, when it carries no window | `SendSequence.observeReceiveWindowAdvertisement` | `AckObserved` |
   | a send sequence's first or larger window advertisement | same | `AckObserved`, `WindowAdvertised`, `MaxReceiveWindowByteCount`, in one step |
@@ -737,6 +737,12 @@ Test-infrastructure lessons (reusable):
     is time order: `LastObservationTime` never moves backwards, and "most
     recent" in the rules below means recorded last
     (`TestPeerCapabilityRecorderTimesFollowRecordingOrder`).
+  - `E2eAttempted` means the send path accepted a ClientHello, not merely that
+    one was produced: one that never reaches the send path is not an attempt
+    (`TestClientHelloAttemptIsRecordedAfterTheSendPathAcceptsIt`,
+    `TestClientHelloTheSendPathNeverTakesRecordsNoAttempt`). It can still be
+    lost on the way. `E2eNegotiated` implies it: a sender descheduled between
+    the hand-over and its record cannot leave an answer without its attempt.
   - `E2eAttempted && !E2eNegotiated` is a ClientHello nobody answered — the
     shape a provider without the responder (or with its sessions off) leaves,
     and also what any provider looks like before its answer arrives, or when

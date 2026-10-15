@@ -72,12 +72,15 @@ type PeerCapabilityObservation struct {
 	PeerId Id
 
 	// A client-role session of an observing client began a handshake with the
-	// peer, handing its ClientHello to the transfer path. Sessions exist only
-	// when that client's `EncryptionSettings.Mode` is not `EncryptionModeOff`;
-	// under Off the e2e fields say nothing about the peer.
+	// peer and the send path accepted its ClientHello (which can still be lost
+	// on the way). Implied by E2eNegotiated. Sessions exist only when that
+	// client's `EncryptionSettings.Mode` is not `EncryptionModeOff`; under Off
+	// the e2e fields say nothing about the peer.
 	E2eAttempted bool
-	// When the first attempt was made. With E2eNegotiated still false, the
-	// time the peer has had to answer.
+	// When the send path first accepted a ClientHello. With E2eNegotiated still
+	// false, the time the peer has had to answer. The sender records the
+	// attempt after the hand-over, so an answer recorded first, by a sender
+	// descheduled in between, sets this to the answer's time instead.
 	E2eFirstAttemptTime time.Time
 	// The peer's TLS server answered a ClientHello of an observing client and
 	// the TLS 1.3 handshake completed. Not authenticated by itself: the peer's
@@ -251,8 +254,8 @@ func (self *PeerCapabilityRecorder) DroppedObservationCount() uint64 {
 	return self.droppedObservationCount
 }
 
-// Records that a client-role epoch handed the peer its ClientHello, keeping the
-// first attempt's time.
+// Records that the send path accepted a client-role epoch's ClientHello to the
+// peer, keeping the first attempt's time.
 func (self *PeerCapabilityRecorder) observeE2eAttempt(peerId Id) {
 	if self == nil || peerId == (Id{}) {
 		return
@@ -265,10 +268,7 @@ func (self *PeerCapabilityRecorder) observeE2eAttempt(peerId Id) {
 			return false
 		}
 		now := self.now()
-		if !capability.e2eAttempted {
-			capability.e2eAttempted = true
-			capability.e2eFirstAttemptTime = now
-		}
+		capability.markAttemptedWithLock(now)
 		capability.lastObservationTime = now
 		return true
 	}()
@@ -290,6 +290,9 @@ func (self *PeerCapabilityRecorder) observeE2eHandshake(peerId Id, keyExchange t
 			return false
 		}
 		now := self.now()
+		// an answer implies the ClientHello it answered was handed over, even
+		// when its sender has not recorded that yet
+		capability.markAttemptedWithLock(now)
 		capability.e2eNegotiated = true
 		if !capability.keyExchangeSealed {
 			capability.keyExchange = keyExchange
@@ -315,7 +318,8 @@ func (self *PeerCapabilityRecorder) observeE2eSealed(peerId Id, keyExchange tls.
 			return false
 		}
 		now := self.now()
-		// a seal implies the handshake it verified
+		// a seal implies the handshake it verified, and the attempt
+		capability.markAttemptedWithLock(now)
 		capability.e2eNegotiated = true
 		capability.e2eSealed = true
 		capability.keyExchange = keyExchange
@@ -411,6 +415,15 @@ func (self *PeerCapabilityRecorder) now() time.Time {
 func (self *PeerCapabilityRecorder) afterObserve(peerId Id, recorded bool) {
 	if recorded && self.afterObserveForTest != nil {
 		self.afterObserveForTest(peerId)
+	}
+}
+
+// Marks the record attempted, keeping the first attempt's time. Caller holds
+// the owning recorder's stateLock.
+func (self *peerCapability) markAttemptedWithLock(now time.Time) {
+	if !self.e2eAttempted {
+		self.e2eAttempted = true
+		self.e2eFirstAttemptTime = now
 	}
 }
 

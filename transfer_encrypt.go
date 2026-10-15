@@ -1653,10 +1653,15 @@ func (self *peerEncryptionSession) outboxLoop(e *tlsHandshakeEpoch) {
 				self.logTag, batchIndex, len(b), firstByte,
 			)
 		}
-		if batchIndex == 0 && self.role == sequenceTlsRoleClient {
+		var afterSent func()
+		if batchIndex == 0 && self.role == sequenceTlsRoleClient &&
+			self.client.peerCapabilityRecorder != nil {
 			// a client-role epoch's first batch is its ClientHello: capability
-			// evidence that this client asked the peer for a session
-			self.client.peerCapabilityRecorder.observeE2eAttempt(self.peerId)
+			// evidence that this client asked the peer for a session, recorded
+			// once the send path has accepted it rather than when produced
+			afterSent = func() {
+				self.client.peerCapabilityRecorder.observeE2eAttempt(self.peerId)
+			}
 		}
 		batchIndex += 1
 		// In TLS-server role the first outbox batch is the server flight
@@ -1671,7 +1676,7 @@ func (self *peerEncryptionSession) outboxLoop(e *tlsHandshakeEpoch) {
 			Payload:     b,
 			SessionRole: self.role.toProtobuf(),
 			Companion:   self.companion,
-		})
+		}, afterSent)
 	}
 }
 
@@ -1736,9 +1741,12 @@ func (self *peerEncryptionSession) peerCertificatesOfEpoch(e *tlsHandshakeEpoch)
 // intentional send backpressure and must not inject stale TLS bytes into the
 // replacement epoch. If a current live epoch cannot enqueue because all send
 // sequences closed, the session is closed so the next Acquire starts fresh.
+// afterSent, when not nil, runs on the send worker once the send path has
+// accepted the control, and never when it did not.
 func (self *peerEncryptionSession) sendEncryptedControl(
 	e *tlsHandshakeEpoch,
 	ec *protocol.EncryptedControl,
+	afterSent func(),
 ) {
 	if e == nil || self.client == nil || self.client.sendBuffer == nil {
 		return
@@ -1759,7 +1767,7 @@ func (self *peerEncryptionSession) sendEncryptedControl(
 		// identity `companion` that keys the session and tags the EC.
 		// `carrierForceStream` keeps the carrier on the same send sequence as
 		// the acquiring data path (see the field doc).
-		if !self.client.sendBuffer.SendEncryptedControl(
+		sent := self.client.sendBuffer.SendEncryptedControl(
 			e.ctx,
 			self.peerId,
 			self.role,
@@ -1768,8 +1776,12 @@ func (self *peerEncryptionSession) sendEncryptedControl(
 			self.carrierCompanion,
 			self.carrierForceStream.Load(),
 			self.carrierNetworkPeer.Load(),
-		) &&
-			e.ctx.Err() == nil && self.isCurrentEpoch(e) {
+		)
+		if sent {
+			if afterSent != nil {
+				afterSent()
+			}
+		} else if e.ctx.Err() == nil && self.isCurrentEpoch(e) {
 			self.close()
 		}
 	}, self.cancel)
@@ -1965,7 +1977,7 @@ func (self *peerEncryptionSession) sendIdentityProofOnce(e *tlsHandshakeEpoch) {
 		Payload:     payload,
 		SessionRole: self.role.toProtobuf(),
 		Companion:   self.companion,
-	})
+	}, nil)
 }
 
 // resendIdentityProofForEstablishment re-sends the local identity proof on
@@ -2029,7 +2041,7 @@ func (self *peerEncryptionSession) resendIdentityProofForEstablishment(e *tlsHan
 			Payload:     payload,
 			SessionRole: self.role.toProtobuf(),
 			Companion:   self.companion,
-		})
+		}, nil)
 	}
 }
 
