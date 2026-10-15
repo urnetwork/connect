@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
@@ -1041,5 +1042,31 @@ func TestEncryptionOffRecordsOnlyAcknowledgementEvidence(t *testing.T) {
 	}
 	if !ok || observation != want {
 		t.Fatalf("evidence\n got %+v\nwant %+v", observation, want)
+	}
+}
+
+// The recorder pointer costs every send sequence exactly one word: no
+// alignment padding sits on either side of it.
+func TestSendSequenceRecorderPointerAddsOneWord(t *testing.T) {
+	sequenceType := reflect.TypeFor[SendSequence]()
+	field, ok := sequenceType.FieldByName("peerCapabilityRecorder")
+	if !ok {
+		t.Fatal("the send sequence has no recorder field")
+	}
+	index := field.Index[0]
+	if 0 < index {
+		previous := sequenceType.Field(index - 1)
+		if gap := field.Offset - (previous.Offset + previous.Type.Size()); gap != 0 {
+			t.Fatalf("%d bytes of padding precede the recorder pointer, after %s", gap, previous.Name)
+		}
+	}
+	end := field.Offset + field.Type.Size()
+	if index+1 < sequenceType.NumField() {
+		next := sequenceType.Field(index + 1)
+		if gap := next.Offset - end; gap != 0 {
+			t.Fatalf("%d bytes of padding follow the recorder pointer, before %s", gap, next.Name)
+		}
+	} else if gap := sequenceType.Size() - end; gap != 0 {
+		t.Fatalf("%d bytes of tail padding follow the recorder pointer", gap)
 	}
 }

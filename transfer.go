@@ -6667,9 +6667,6 @@ type SendSequence struct {
 	// whether any acknowledgement has arrived at all, which is what separates
 	// a sender that is still blind from one whose peer does not advertise
 	ackSeen atomic.Bool
-	// The client's capability evidence, captured at construction and told the
-	// first acknowledgement and each window step above. Nil records nothing.
-	peerCapabilityRecorder *PeerCapabilityRecorder
 	// Whether the peer advertised that it registers a contract announced ahead
 	// of its data (THROUGHPUTFIX §39.1). Written from the acknowledgement
 	// worker on every delivery acknowledgement and read by the sequence
@@ -6716,6 +6713,11 @@ type SendSequence struct {
 	// `EncryptionSessionManager` at construction; released when the sequence
 	// terminates. Nil when encryption is disabled on this client.
 	session *peerEncryptionSession
+	// The client's capability evidence, captured at construction and told the
+	// first acknowledgement and each window step (`ackSeen`,
+	// `receiveWindowSetAtNanos`). Nil records nothing. Beside the other
+	// pointer so it costs one word, with no alignment padding.
+	peerCapabilityRecorder *PeerCapabilityRecorder
 }
 
 func NewSendSequence(
