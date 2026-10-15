@@ -664,10 +664,12 @@ type lagTestLoadOptions struct {
 }
 
 // Runs the session's load as the browser's client does (S5): the download on
-// every stream with received progress each interval; then the upload on every
-// stream; then done, once the extender's progress says the upload's window
-// closed; then the loadResult. An extender that ends the load first sends the
-// result with no done.
+// every stream with received progress each interval, each stream closed once
+// the download's own window, from its first byte, is over (the extender writes
+// on until then, amendment 15); then the upload on every stream; then done,
+// once the extender's progress says the upload's window closed; then the
+// loadResult. An extender that ends the load first sends the result with no
+// done.
 func (self *lagTestSession) runLoad(options lagTestLoadOptions) *lagTestLoad {
 	self.t.Helper()
 	fixture := self.fixture
@@ -726,6 +728,7 @@ func (self *lagTestSession) runLoad(options lagTestLoadOptions) *lagTestLoad {
 			}
 			downloadStreamCount.Add(1)
 			buffer := make([]byte, 32*1024)
+			downloadDuration := time.Duration(self.hello.DownloadMs) * time.Millisecond
 			for {
 				n, err := response.Body.Read(buffer)
 				if 0 < n {
@@ -734,6 +737,9 @@ func (self *lagTestSession) runLoad(options lagTestLoadOptions) *lagTestLoad {
 					downloadedByteCount.Add(int64(n))
 				}
 				if err != nil {
+					return
+				}
+				if startTime := firstByteTime.Load(); startTime != nil && downloadDuration <= time.Since(*startTime) {
 					return
 				}
 			}
@@ -1765,7 +1771,9 @@ func TestLagApiUploadMismatchEndsLoad(t *testing.T) {
 // M4, amendment 14: an upload whose messages arrive across its window. Each
 // progress says, as at, when the latest counted read arrived: it moves on
 // with them, never past the progress's ms and never back. The result carries
-// the upload's series as the report signs it.
+// the upload's series as the report signs it. It holds every message but
+// most of each stream's first: at the rate of the stream's second, that took
+// the time before the window opened (amendment 15).
 func TestLagApiUploadedAt(t *testing.T) {
 	fixture := newLagApiDurationFixture(t, nil)
 	session := fixture.openHelloSession(fixture.ticket(func(body *protocol.LagTicketBody) {
@@ -1791,7 +1799,8 @@ func TestLagApiUploadedAt(t *testing.T) {
 	}
 	first := load.uploaded[0]
 	last := load.uploaded[len(load.uploaded)-1]
-	if *last.Ms != 1000 || last.Bytes != 2*8*lagApiBufferByteCount || *last.At <= *first.At || 800 <= *last.At {
+	if *last.Ms != 1000 || last.Bytes < 2*6*lagApiBufferByteCount || 2*8*lagApiBufferByteCount < last.Bytes ||
+		*last.At <= *first.At || 800 <= *last.At {
 		t.Errorf("first progress %+v, last %+v", first.raw, last.raw)
 	}
 }
@@ -1968,6 +1977,172 @@ func TestLagApiLoadResultFollowsDone(t *testing.T) {
 	if body := fixture.nextReport(5 * time.Second); body.UploadMs != 750 || body.EndReason != protocol.LagEndReason_LAG_END_COMPLETE {
 		t.Errorf("upload ran %d ms, ended %v", body.UploadMs, body.EndReason)
 	}
+}
+
+// Runs a session's download on one stream and opens its upload on one stream,
+// which sends two messages and is then never read: the extender's close at
+// the window's end goes unanswered, so the stream stays open, with no read
+// past the end, and the window is final lagSpreadMax past its end (amendment
+// 15). Returns when the stream began to send, no later than the window's first
+// byte.
+func (self *lagTestSession) openSilentUpload() time.Time {
+	self.t.Helper()
+	fixture := self.fixture
+	self.load("download")
+	waitFor(self.t, func() bool {
+		return fixture.api.loadCountNow() == 1
+	})
+	response := fixture.get(fmt.Sprintf("/lag/v1/down?session=%s&stream=0", self.hello.Session), testLagOrigin)
+	io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	self.load("upload")
+	conn, _, err := fixture.dialWebSocket(fmt.Sprintf("/lag/v1/up?session=%s&stream=0", self.hello.Session), testLagOrigin)
+	if err != nil {
+		self.t.Fatal(err)
+	}
+	self.t.Cleanup(func() {
+		conn.Close()
+	})
+	uploadKey := [16]byte{}
+	copy(uploadKey[:], self.uploadKey())
+	sendTime := time.Now()
+	for _, message := range testLagUploadMessages(self.t, uploadKey, 0, lagApiBufferByteCount, lagApiBufferByteCount) {
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if err := conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
+			self.t.Fatal(err)
+		}
+	}
+	return sendTime
+}
+
+// Waits for the session's upload to have ended by its time, at its window's
+// end, and returns the phase.
+func (self *lagTestSession) waitUploadEnded() *lagApiPhase {
+	self.t.Helper()
+	sessionId, ok := parseLagApiSessionId(self.hello.Session)
+	if !ok {
+		self.t.Fatalf("bad session %q", self.hello.Session)
+	}
+	var upload *lagApiPhase
+	waitFor(self.t, func() bool {
+		session := self.fixture.api.session(sessionId)
+		if session == nil {
+			return false
+		}
+		session.stateLock.Lock()
+		if session.load != nil {
+			upload = session.load.upload
+		}
+		session.stateLock.Unlock()
+		if upload == nil {
+			return false
+		}
+		_, _, end := upload.state()
+		return end == lagApiPhaseEndTime
+	})
+	return upload
+}
+
+// M4, amendment 15: the progress that says the upload's window is over goes
+// out once the window is final, with the final total, which the result's
+// series and the report's sum to. Here a stream stays open with no read past
+// the end, so that is lagSpreadMax past the end. A done between the end and
+// then waits for it, rather than ending the load as given up, and the result
+// follows the last progress at once, complete. The window's end is still the
+// phase's end for everything else: the last progress's ms, the report's
+// UploadMs and the series' intervals.
+func TestLagApiUploadWindowOverWhenFinal(t *testing.T) {
+	fixture := newLagApiDurationFixture(t, nil)
+	session := fixture.openHelloSession(fixture.ticket(func(body *protocol.LagTicketBody) {
+		body.MaxStreams = 1
+		body.DownloadMs = 250
+		body.UploadMs = 500
+	}))
+	sendTime := session.openSilentUpload()
+	// done once the window has run out, before it is final
+	if upload := session.waitUploadEnded(); upload.windowFinal() {
+		t.Fatal("final at the window's end")
+	}
+	session.load("done")
+	doneTime := time.Now()
+
+	uploaded := []testLagMessage{}
+	var windowOverTime time.Time
+	var result testLagMessage
+	var resultTime time.Time
+	deadline := time.After(10 * time.Second)
+	for result.Type == "" {
+		select {
+		case message := <-session.messages:
+			switch message.Type {
+			case "uploaded":
+				uploaded = append(uploaded, message)
+				if 500-125 <= *message.Ms && windowOverTime.IsZero() {
+					windowOverTime = time.Now()
+				}
+			case "loadResult":
+				result = message
+				resultTime = time.Now()
+			default:
+				t.Fatalf("unexpected %s %+v", message.Type, message.raw)
+			}
+		case <-deadline:
+			t.Fatal("no loadResult")
+		}
+	}
+	if windowOverTime.IsZero() || *uploaded[len(uploaded)-1].Ms != 500 {
+		t.Fatalf("progress %v", uploaded)
+	}
+	// only the last progress reads as over
+	for i, message := range uploaded[:len(uploaded)-1] {
+		if 500-125 <= *message.Ms {
+			t.Errorf("progress %d %+v read as over before the window was final", i, message.raw)
+		}
+	}
+	// the window opened no sooner than the stream began to send, and was
+	// final lagSpreadMax past its end
+	if wait := windowOverTime.Sub(sendTime); wait < 500*time.Millisecond+lagSpreadMax {
+		t.Errorf("the window was over %s after the upload began to send", wait)
+	}
+	if !doneTime.Before(windowOverTime) {
+		t.Errorf("done went %s after the window was over", doneTime.Sub(windowOverTime))
+	}
+	if result.EndReason != "complete" || !result.UploadVerified || resultTime.Sub(windowOverTime) > 500*time.Millisecond {
+		t.Errorf("result %+v, %s after the window was over", result.raw, resultTime.Sub(windowOverTime))
+	}
+	session.close()
+	body := fixture.nextReport(5 * time.Second)
+	load := &lagTestLoad{uploaded: uploaded, result: result}
+	load.checkUpload(t, body)
+	if body.EndReason != protocol.LagEndReason_LAG_END_COMPLETE || body.UploadMs != 500 || len(body.UploadBytes) != 2 {
+		t.Errorf("report %v, upload for %d ms: %v", body.EndReason, body.UploadMs, body.UploadBytes)
+	}
+}
+
+// M8, amendment 15: a session that closes after its upload's window ran out,
+// but before the window is final, ends a load that is complete, as it would
+// have been at the end: the session's end makes the window final, with what
+// it has, and the report is the window's.
+func TestLagApiSessionEndsBeforeTheWindowIsFinal(t *testing.T) {
+	fixture := newLagApiDurationFixture(t, nil)
+	session := fixture.openHelloSession(fixture.ticket(func(body *protocol.LagTicketBody) {
+		body.MaxStreams = 1
+		body.DownloadMs = 250
+		body.UploadMs = 500
+	}))
+	session.openSilentUpload()
+	if upload := session.waitUploadEnded(); upload.windowFinal() {
+		t.Fatal("final at the window's end")
+	}
+	session.close()
+	body := fixture.nextReport(5 * time.Second)
+	if body.EndReason != protocol.LagEndReason_LAG_END_COMPLETE || !body.UploadVerified || body.UploadMs != 500 ||
+		len(body.UploadBytes) != 2 || body.UploadBytes[0] == 0 {
+		t.Errorf("report %v verified %t, upload for %d ms: %v", body.EndReason, body.UploadVerified, body.UploadMs, body.UploadBytes)
+	}
+	waitFor(t, func() bool {
+		return fixture.api.loadCountNow() == 0
+	})
 }
 
 // M5, M6, S5: a stream can overtake the control message that opens its phase;

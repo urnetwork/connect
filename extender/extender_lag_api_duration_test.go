@@ -294,11 +294,16 @@ func TestLagApiDurationFixtureLoadJoinsFiniteStreams(t *testing.T) {
 		}
 		return count
 	}
+	// the upload counts what arrived from the window's first byte on: its
+	// first group's part from before it, at the rate of its second, does not
+	// count (amendment 15), so the series holds at most what was sent
 	if report.EndReason != protocol.LagEndReason_LAG_END_COMPLETE || !report.UploadVerified ||
 		report.DownloadMs != 500 || report.UploadMs != 500 ||
-		sum(report.DownloadSentBytes) != testLagDurationByteCount || sum(report.UploadBytes) != testLagDurationByteCount {
+		sum(report.DownloadSentBytes) != testLagDurationByteCount ||
+		sum(report.UploadBytes) == 0 || testLagDurationByteCount < sum(report.UploadBytes) {
 		t.Errorf("finite stream report: reason=%v verified=%t duration=%d/%d bytes=%d/%d",
 			report.EndReason, report.UploadVerified, report.DownloadMs, report.UploadMs,
 			sum(report.DownloadSentBytes), sum(report.UploadBytes))
 	}
+	load.checkUpload(t, report)
 }
