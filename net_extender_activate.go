@@ -72,9 +72,10 @@ type ExtenderActivateArgs struct {
 	// field ignores it.
 	MeasurementCsr string `json:"measurement_csr,omitempty"`
 	// the owner opted out of lag.dev measurement (lag.dev/PLAN.md C4, decision
-	// 18), so the operator withdraws the measurement name (C9). Set on every
-	// activation while the opt-out stands, and only by an extender that keeps
-	// its identity, which is all that can have a name to withdraw.
+	// 18), or the extender cannot use its measurement key, so the operator
+	// withdraws the measurement name (C9). Set on every activation while
+	// either stands, and only by an extender that keeps its identity, which
+	// is all that can have a name to withdraw.
 	MeasurementDisabled bool `json:"measurement_disabled,omitempty"`
 }
 
@@ -216,8 +217,9 @@ type ExtenderActivatorSettings struct {
 	// block.
 	MeasurementCsr func(extenderId Id) string
 	// MeasurementDisabled, when set, reports whether the owner has opted out of
-	// measurement (lag.dev/PLAN.md C4): every post made while it reports true
-	// carries measurement_disabled and no request, so the operator withdraws the
+	// measurement, or the extender cannot measure for want of a usable key
+	// (lag.dev/PLAN.md C4): every post made while it reports true carries
+	// measurement_disabled and no request, so the operator withdraws the
 	// measurement name (C9). It runs on the loop goroutine and must not block.
 	MeasurementDisabled func() bool
 

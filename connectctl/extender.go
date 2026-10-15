@@ -668,10 +668,13 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 		// the activation carries the measurement certificate request, named by
 		// the id its answers report (lag.dev/PLAN.md C4, N4)
 		activatorSettings.MeasurementCsr = run.measurementCert.ActivationCsr
-	} else if !options.measurementEnabled && run.identityKeyFile() != "" {
-		// the owner opted out: every activation says so, so an extender that
-		// measured before has its name withdrawn (C4, C9). An ephemeral
-		// identity has no name to withdraw.
+	} else if run.identityKeyFile() != "" {
+		// a kept identity with no measurement certificate: the owner opted
+		// out, or the measurement key cannot be used. Either way this
+		// extender answers no measurement name, so every activation says so,
+		// and a name it had is withdrawn (C4, C9) rather than renewed and
+		// offered to lag.dev with nothing answering it. An ephemeral identity
+		// has no name to withdraw.
 		activatorSettings.MeasurementDisabled = func() bool {
 			return true
 		}
@@ -912,7 +915,8 @@ func (self *extenderRun) identityKeyFile() string {
 // per identity key, so an identity that is new at every start would ask for a
 // new certificate each time; and the measurement key is kept beside the
 // identity's file, which an ephemeral identity has none of. A key that cannot
-// be read leaves measurement off rather than the extender down.
+// be read leaves measurement off rather than the extender down, and the
+// activation then asks the operator to withdraw the name, as for an opt-out.
 func (self *extenderRun) newMeasurementCert() *extender.ExtenderMeasurementCert {
 	if !self.options.measurementEnabled {
 		Out.Printf("extender measurement: off")
@@ -923,12 +927,14 @@ func (self *extenderRun) newMeasurementCert() *extender.ExtenderMeasurementCert 
 		Err.Printf("extender measurement: off, the identity is ephemeral; pass --extender_key_file or --state_dir to keep it")
 		return nil
 	}
-	measurementCert, err := extender.NewExtenderMeasurementCert(
-		extender.ExtenderMeasurementKeyPath(keyFile),
-		self.options.measurementZone,
-	)
+	measurementKeyFile := extender.ExtenderMeasurementKeyPath(keyFile)
+	measurementCert, err := extender.NewExtenderMeasurementCert(measurementKeyFile, self.options.measurementZone)
 	if err != nil {
-		Err.Printf("extender measurement: off, the measurement key is not usable: %s", err)
+		Err.Printf(
+			"extender measurement: off, the measurement key %s is not usable, so every activation asks the operator to withdraw this extender's measurement name: %s",
+			measurementKeyFile,
+			err,
+		)
 		return nil
 	}
 	return measurementCert

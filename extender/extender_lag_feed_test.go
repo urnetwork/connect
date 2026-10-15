@@ -13,15 +13,19 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -462,5 +466,188 @@ func TestLagFeedOverWebsocketRefuses(t *testing.T) {
 	}
 	if response.Header.Get("Retry-After") == "" {
 		t.Fatal("the refusal names no retry")
+	}
+}
+
+// Fails when an error's text names either end of a test connection, by its
+// address or by its host.
+func expectTestLagFeedErrorNamesNoAddress(t *testing.T, name string, err error, addrs ...net.Addr) {
+	t.Helper()
+	text := err.Error()
+	for _, addr := range addrs {
+		host, _, splitErr := net.SplitHostPort(addr.String())
+		if splitErr != nil {
+			t.Fatal(splitErr)
+		}
+		if strings.Contains(text, host) {
+			t.Errorf("%s err = %q names %s", name, text, addr)
+		}
+	}
+}
+
+// Amendment 9: the feed server logs the error of a request read that fails,
+// and that error names no address. A client that never sends its request is a
+// timeout under the read deadline, and the error still reads as a timeout.
+func TestLagFeedRequestErrorNamesNoAddress(t *testing.T) {
+	requestErrs := make(chan error, 1)
+	feed := newTestLagFeed(t, 1, func(settings *ExtenderSettings) {
+		settings.FeedConnHandler = func(conn net.Conn) {
+			conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+			_, err := connect.ReadExtenderFeedRequest(conn)
+			requestErrs <- err
+		}
+	})
+	ws, _, err := feed.dial("203.0.113.9:40000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	select {
+	case err := <-requestErrs:
+		if err == nil {
+			t.Fatal("a request was read")
+		}
+		expectTestLagFeedErrorNamesNoAddress(t, "request", err, ws.LocalAddr(), ws.RemoteAddr())
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Errorf("request err = %v, expected a timeout", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request read did not end")
+	}
+}
+
+// Amendment 9: a client that resets its connection leaves the feed server a
+// read error and a write error, and neither names an address.
+func TestLagFeedSocketErrorsNameNoAddress(t *testing.T) {
+	reset := make(chan struct{})
+	readErrs := make(chan error, 1)
+	writeErrs := make(chan error, 1)
+	feed := newTestLagFeed(t, 1, func(settings *ExtenderSettings) {
+		settings.FeedConnHandler = func(conn net.Conn) {
+			<-reset
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_, err := connect.ReadExtenderFeedRequest(conn)
+			readErrs <- err
+			// the first writes after a reset may still be taken by the socket
+			err = nil
+			for deadline := time.Now().Add(5 * time.Second); err == nil && time.Now().Before(deadline); {
+				conn.SetWriteDeadline(time.Now().Add(time.Second))
+				err = connect.WriteExtenderFeedFrame(conn, &protocol.ExtenderFeedFrame{
+					Frame: &protocol.ExtenderFeedFrame_Keepalive{Keepalive: true},
+				})
+				time.Sleep(10 * time.Millisecond)
+			}
+			writeErrs <- err
+		}
+	})
+	ws, _, err := feed.dial("203.0.113.9:40000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	localAddr := ws.LocalAddr()
+	remoteAddr := ws.RemoteAddr()
+	tcpConn, ok := ws.NetConn().(*tls.Conn).NetConn().(*net.TCPConn)
+	if !ok {
+		t.Fatalf("the feed's connection is a %T", ws.NetConn().(*tls.Conn).NetConn())
+	}
+	// a reset rather than a close
+	tcpConn.SetLinger(0)
+	tcpConn.Close()
+	close(reset)
+	for name, errs := range map[string]chan error{"read": readErrs, "write": writeErrs} {
+		select {
+		case err := <-errs:
+			if err == nil {
+				t.Fatalf("no %s err after the reset", name)
+			}
+			expectTestLagFeedErrorNamesNoAddress(t, name, err, localAddr, remoteAddr)
+		case <-time.After(15 * time.Second):
+			t.Fatalf("the %s did not end", name)
+		}
+	}
+}
+
+// A net.Error that keeps only the text of another, as gorilla's copy of a
+// temporary socket error does.
+type testLagFeedCopiedError struct {
+	text    string
+	timeout bool
+}
+
+func (self testLagFeedCopiedError) Error() string   { return self.text }
+func (self testLagFeedCopiedError) Timeout() bool   { return self.timeout }
+func (self testLagFeedCopiedError) Temporary() bool { return true }
+
+// Amendment 9: the feed conn's errors keep what callers read from them,
+// Timeout(), errors.Is through them, io.EOF itself and a close's code, and
+// their text names no address.
+func TestLagFeedConnErrorNamesNoAddress(t *testing.T) {
+	localAddr := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}
+	remoteAddr := &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 40000}
+	opErr := func(op string, err error) *net.OpError {
+		return &net.OpError{Op: op, Net: "tcp", Source: localAddr, Addr: remoteAddr, Err: err}
+	}
+	for name, c := range map[string]struct {
+		err      error
+		timeout  bool
+		is       error
+		expected string
+	}{
+		"timeout": {
+			err:      opErr("read", os.ErrDeadlineExceeded),
+			timeout:  true,
+			is:       os.ErrDeadlineExceeded,
+			expected: "read tcp: i/o timeout",
+		},
+		"reset": {
+			err:      opErr("read", &os.SyscallError{Syscall: "read", Err: syscall.ECONNRESET}),
+			is:       syscall.ECONNRESET,
+			expected: "read tcp: read: " + syscall.ECONNRESET.Error(),
+		},
+		"wrapped": {
+			err:      fmt.Errorf("tls: %w", opErr("write", net.ErrClosed)),
+			is:       net.ErrClosed,
+			expected: "write tcp: " + net.ErrClosed.Error(),
+		},
+		"copied timeout": {
+			err:      testLagFeedCopiedError{text: opErr("read", os.ErrDeadlineExceeded).Error(), timeout: true},
+			timeout:  true,
+			expected: "i/o timeout",
+		},
+		"copied": {
+			err:      testLagFeedCopiedError{text: opErr("write", net.ErrClosed).Error()},
+			expected: "network error",
+		},
+		"close": {
+			err:      &websocket.CloseError{Code: websocket.CloseGoingAway, Text: "from " + remoteAddr.String()},
+			expected: (&websocket.CloseError{Code: websocket.CloseGoingAway}).Error(),
+		},
+	} {
+		if !strings.Contains(c.err.Error(), remoteAddr.IP.String()) {
+			t.Fatalf("%s: the case names no address: %q", name, c.err)
+		}
+		err := extenderLagFeedConnError(c.err)
+		if text := err.Error(); text != c.expected {
+			t.Errorf("%s: err = %q, expected %q", name, text, c.expected)
+		}
+		expectTestLagFeedErrorNamesNoAddress(t, name, err, localAddr, remoteAddr)
+		var netErr net.Error
+		if timeout := errors.As(err, &netErr) && netErr.Timeout(); timeout != c.timeout {
+			t.Errorf("%s: timeout = %t, expected %t", name, timeout, c.timeout)
+		}
+		if c.is != nil && !errors.Is(err, c.is) {
+			t.Errorf("%s: err = %v, expected it to be %v", name, err, c.is)
+		}
+	}
+	closeErr := &websocket.CloseError{}
+	if err := extenderLagFeedConnError(&websocket.CloseError{Code: websocket.CloseNormalClosure, Text: "bye"}); !errors.As(err, &closeErr) ||
+		closeErr.Code != websocket.CloseNormalClosure || closeErr.Text != "" {
+		t.Errorf("close err = %#v, expected the code alone", err)
+	}
+	for _, err := range []error{nil, io.EOF, errExtenderLagFeedAfterRequest, websocket.ErrCloseSent} {
+		if mapped := extenderLagFeedConnError(err); mapped != err {
+			t.Errorf("err %v = %v, expected it unchanged", err, mapped)
+		}
 	}
 }
