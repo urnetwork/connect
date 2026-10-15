@@ -456,6 +456,19 @@ platform never holds.
   silently fork a new identity). The public key is published and distributed by
   the platform as an opaque identifier.
 
+- **Publication opt-out (`ClientSettings.SkipClientKeyPublication`):** a
+  client whose key nothing reads can keep it local. No `ClientKey` control is
+  sent, so the platform holds no registration and `/key/<clientId>` returns no
+  key. It is valid only with encryption off, no close-report domain and no
+  required registration, because each of those reads the key. Any of them
+  outranks the skip: construction logs an error and publishes anyway. The
+  opt-out is an optimisation, so a misapplied one costs one registration, not
+  the reader's traffic. That covers a setting raised after the caller chose
+  the skip, such as a post-quantum profile turning sessions to Required. The
+  zero value publishes. The server's URL-probe tunnels use it: each probe
+  mints a derived client with a fresh key, and each published key had become
+  a permanent signed registration row plus evidence blobs.
+
 - **Defense 1 — signed cert binding:** the client signs its ephemeral TLS cert
   chain with its Ed25519 key and publishes `(cert, signature)` via
   `EncryptedKey.client_key_signed_tls_certificate`. The contract carries both plus
@@ -643,6 +656,8 @@ platform never holds.
   permissive defaults above.
 - `ClientSettings.ClientKeySeed []byte` — persist `Client.ClientKeyManager().Seed()`
   and reload to keep a stable identity.
+- `ClientSettings.SkipClientKeyPublication bool` — **default `false`**
+  (publish); keeps an unread key local (§3.7).
 
 ### 3.12 Root causes & invariants from the debugging marathon
 
