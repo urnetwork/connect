@@ -275,10 +275,12 @@ func (self *lagApiPingRing) between(startTime time.Time, endTime time.Time) []la
 
 // The download bytes per interval as the browser reported them (M4, M8). Each
 // report is cumulative from the browser's first byte; the growth since the one
-// before goes to the interval the report's time closes. It holds no more
-// intervals than the download's window has, a report from past the window and
-// half an interval is not counted, and nothing is ever past what the extender
-// wrote.
+// before goes to the interval the report's time closes. Every interval a
+// report closes is in the series, one that brought nothing new as a zero, as
+// the browser's own figures count it, so a quiet end of the window is not left
+// out of the signed p50 (amendment 14). It holds no more intervals than the
+// download's window has, a report from past the window and half an interval is
+// not counted, and nothing is ever past what the extender wrote.
 type lagApiReceivedSeries struct {
 	counts         [lagApiMaxIntervalCount]uint64
 	lastCumulative uint64
@@ -296,16 +298,17 @@ func (self *lagApiReceivedSeries) add(ms float64, cumulative float64, writtenByt
 	if downloadMs+intervalMs/2 < ms {
 		return
 	}
+	// never past the window's intervals, ceil(downloadMs / intervalMs)
+	intervalCount := min(len(self.counts), max(1, int(math.Ceil(downloadMs/intervalMs))))
+	index := min(intervalCount-1, max(0, int(math.Round(ms/intervalMs))-1))
+	// the interval is in the series whether or not it brought new bytes
+	self.lastIndex = max(self.lastIndex, index+1)
 	cumulativeByteCount := uint64(min(cumulative, float64(writtenByteCount)))
 	if cumulativeByteCount <= self.lastCumulative {
 		return
 	}
-	// never past the window's intervals, ceil(downloadMs / intervalMs)
-	intervalCount := min(len(self.counts), max(1, int(math.Ceil(downloadMs/intervalMs))))
-	index := min(intervalCount-1, max(0, int(math.Round(ms/intervalMs))-1))
 	self.counts[index] += cumulativeByteCount - self.lastCumulative
 	self.lastCumulative = cumulativeByteCount
-	self.lastIndex = max(self.lastIndex, index+1)
 }
 
 func (self *lagApiReceivedSeries) values() []uint64 {
@@ -1045,7 +1048,7 @@ func (self *lagApiSession) run() {
 		}
 		if load.upload != nil {
 			if firstByteTime, _, _ := load.upload.state(); !firstByteTime.IsZero() {
-				result.UploadBytes = load.upload.seriesValues()
+				result.UploadBytes = load.upload.windowValues()
 			}
 		}
 		return self.write(result)
@@ -1438,7 +1441,7 @@ func (self *lagApiSession) reportBody(now time.Time) *protocol.LagReportBody {
 		body.DownloadSentBytes = load.download.seriesValues()
 		body.DownloadStreams = uint32(load.download.streamCount())
 		if load.upload != nil {
-			body.UploadBytes = load.upload.seriesValues()
+			body.UploadBytes = load.upload.windowValues()
 			body.UploadStreams = uint32(load.upload.streamCount())
 		}
 		body.UploadVerified = load.uploadVerified()

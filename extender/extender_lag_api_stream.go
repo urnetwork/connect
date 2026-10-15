@@ -354,13 +354,34 @@ func (self *lagApiPhase) state() (firstByteTime time.Time, endedTime time.Time, 
 	return self.firstByteTime, self.endedTime, self.end
 }
 
-// The bytes per interval of the window, through its last counted interval, and
-// their sum.
+// The bytes per interval of the window, through its last counted interval: a
+// download's sent series as the report signs it, since its writes may finish
+// in the grace past the window (M5, M8). And their sum.
 func (self *lagApiPhase) seriesValues() []uint64 {
 	if series := self.series.Load(); series != nil {
-		return series.values()
+		return series.values(0)
 	}
 	return []uint64{}
+}
+
+// The upload's series as the report signs it (M8, amendment 14): every
+// interval from the window's first byte through the phase's end,
+// ceil((end - first byte) / interval) of them, those that counted nothing as
+// zeros, as the browser's figures count them, so a quiet end of the window
+// stays in the signed p50. It never stops short of a counted byte, nor runs
+// past the series. Before the phase ends, it runs through its last counted
+// interval.
+func (self *lagApiPhase) windowValues() []uint64 {
+	firstByteTime, endedTime, _ := self.state()
+	series := self.series.Load()
+	if series == nil {
+		return []uint64{}
+	}
+	intervalCount := 0
+	if !endedTime.IsZero() {
+		intervalCount = int((endedTime.Sub(firstByteTime) + series.interval - 1) / series.interval)
+	}
+	return series.values(intervalCount)
 }
 
 func (self *lagApiPhase) total() uint64 {
@@ -545,17 +566,18 @@ func (self *lagApiSeries) addSpread(startTime time.Time, endTime time.Time, byte
 	}
 }
 
-// The counts, through the last interval that counted anything.
-func (self *lagApiSeries) values() []uint64 {
+// The counts, through the last interval that counted anything and at least
+// the first intervalCount, empty ones as zeros, and never past the series.
+func (self *lagApiSeries) values(intervalCount int) []uint64 {
 	values := make([]uint64, len(self.counts))
-	lastIndex := -1
+	lastIndex := min(intervalCount, len(self.counts)) - 1
 	for i := range self.counts {
 		values[i] = self.counts[i].Load()
 		if values[i] != 0 {
-			lastIndex = i
+			lastIndex = max(lastIndex, i)
 		}
 	}
-	return values[:lastIndex+1]
+	return values[:max(0, lastIndex+1)]
 }
 
 func (self *lagApiSeries) total() uint64 {

@@ -21,6 +21,7 @@ import (
 	"slices"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -441,7 +442,7 @@ func TestLagApiSeriesAddSpread(t *testing.T) {
 		byteCount := 1 + random.IntN(64*1024)
 		series.addSpread(startTime.Add(spanStart), startTime.Add(spanEnd), byteCount)
 		total := uint64(0)
-		for index, value := range series.values() {
+		for index, value := range series.values(0) {
 			total += value
 			share := 0.0
 			if spanEnd == spanStart {
@@ -461,6 +462,50 @@ func TestLagApiSeriesAddSpread(t *testing.T) {
 			t.Fatalf("%d bytes over %s to %s: counted %d", byteCount, spanStart, spanEnd, total)
 		}
 	}
+}
+
+// M8, amendment 14: the upload's series as the report signs it runs from the
+// window's first byte through the phase's end, the intervals that counted
+// nothing as zeros: the whole of a window that ran out, and through its end
+// for a phase that ended early. Before its end it runs through its last
+// counted interval. A download's sent series stays trimmed.
+func TestLagApiUploadWindowValues(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		newPhase := func() (*lagApiPhase, time.Time) {
+			api := &extenderLagApi{budget: newLagApiBudget(0)}
+			phase := newLagApiPhase(api, context.Background(), lagApiDirectionUpload,
+				5*time.Second, lagApiInterval, 1, 1024*1024*1024, time.Minute, func() {})
+			startTime := time.Now()
+			phase.window(startTime)
+			return phase, startTime
+		}
+
+		// bytes for 600 ms, then nothing until the window runs out
+		phase, startTime := newPhase()
+		phase.receive(0, startTime, 1000)
+		phase.receive(0, startTime.Add(600*time.Millisecond), 6000)
+		if values := phase.windowValues(); !slices.Equal(values, []uint64{3500, 2500, 1000}) {
+			t.Errorf("before the end: %v", values)
+		}
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		expected := append([]uint64{3500, 2500, 1000}, make([]uint64, 17)...)
+		if _, _, end := phase.state(); end != lagApiPhaseEndTime || !slices.Equal(phase.windowValues(), expected) {
+			t.Errorf("ended %d with %v", end, phase.windowValues())
+		}
+		if values := phase.seriesValues(); !slices.Equal(values, []uint64{3500, 2500, 1000}) {
+			t.Errorf("trimmed %v", values)
+		}
+
+		// closed 1.1 s in: five intervals, through the one the end falls in
+		phase, startTime = newPhase()
+		phase.receive(0, startTime, 1000)
+		time.Sleep(1100 * time.Millisecond)
+		phase.finish(lagApiPhaseEndClosed)
+		if _, _, end := phase.state(); end != lagApiPhaseEndClosed || !slices.Equal(phase.windowValues(), []uint64{1000, 0, 0, 0, 0}) {
+			t.Errorf("ended %d with %v", end, phase.windowValues())
+		}
+	})
 }
 
 // M3, M6: an upload's reads draw on the ticket's cap and the daily budget one
@@ -624,8 +669,10 @@ func TestLagApiUploadSpreadAccuracy(t *testing.T) {
 			for _, read := range testLagUploadReads(mbps, seed) {
 				phase.receive(read.streamIndex, startTime.Add(read.arrivedTime), read.byteCount)
 			}
-			errorPercents = append(errorPercents, 100*(testLagUploadP50Mbps(phase.seriesValues())-mbps)/mbps)
-			phase.finish(lagApiPhaseEndClosed)
+			// the window runs out, if no read past it has ended it already, and
+			// the series is the one the report signs
+			phase.window(startTime.Add(5 * time.Second))
+			errorPercents = append(errorPercents, 100*(testLagUploadP50Mbps(phase.windowValues())-mbps)/mbps)
 		}
 		median := testLagNearestRank(errorPercents, 50)
 		minPercent := slices.Min(errorPercents)

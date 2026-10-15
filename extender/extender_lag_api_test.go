@@ -1796,6 +1796,73 @@ func TestLagApiUploadedAt(t *testing.T) {
 	}
 }
 
+// M8, amendment 14: an upload that goes quiet before its window runs out
+// keeps the quiet intervals as zeros, ceil(uploadMs / intervalMs) of them in
+// all, in the report and the loadResult alike, as the browser's figures count
+// them; trimmed, they would leave the signed p50 high.
+func TestLagApiUploadKeepsQuietIntervals(t *testing.T) {
+	fixture := newLagApiDurationFixture(t, nil)
+	session := fixture.openHelloSession(fixture.ticket(func(body *protocol.LagTicketBody) {
+		body.MaxStreams = 1
+		body.DownloadMs = 250
+		body.UploadMs = 1000
+	}))
+	// two messages at once, then nothing for the rest of the window
+	load := session.runLoad(lagTestLoadOptions{uploadByteCount: 2 * lagApiBufferByteCount})
+	if load.result.EndReason != "complete" || !load.result.UploadVerified {
+		t.Fatalf("result %+v", load.result.raw)
+	}
+	session.close()
+	body := fixture.nextReport(5 * time.Second)
+	load.checkUpload(t, body)
+	if body.UploadMs != 1000 || len(body.UploadBytes) != 4 || body.UploadBytes[3] != 0 {
+		t.Errorf("upload for %d ms: %v", body.UploadMs, body.UploadBytes)
+	}
+}
+
+// M4, M8, amendment 14: every interval the browser reports is in the signed
+// download series, one that brought no new bytes as a zero, so a download
+// whose last intervals were quiet keeps them, as the browser's figures count
+// them; trimmed, they would leave the signed p50 high.
+func TestLagApiReceivedKeepsQuietIntervals(t *testing.T) {
+	fixture := newLagApiDurationFixture(t, nil)
+	session := fixture.openHelloSession(fixture.ticket(func(body *protocol.LagTicketBody) {
+		body.MaxStreams = 1
+		body.DownloadMs = 1000
+		body.UploadMs = 500
+	}))
+	session.load("download")
+	waitFor(t, func() bool {
+		return fixture.api.loadCountNow() == 1
+	})
+	response := fixture.get(fmt.Sprintf("/lag/v1/down?session=%s&stream=0", session.hello.Session), testLagOrigin)
+	downloadedByteCount, _ := io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if downloadedByteCount != testLagDurationByteCount {
+		t.Fatalf("downloaded %d", downloadedByteCount)
+	}
+	step := uint64(downloadedByteCount / 4)
+	for _, report := range []struct {
+		ms    int64
+		bytes uint64
+	}{
+		{ms: 250, bytes: step},
+		{ms: 500, bytes: 2 * step},
+		// the last two intervals brought nothing new
+		{ms: 750, bytes: 2 * step},
+		{ms: 1000, bytes: 2 * step},
+	} {
+		session.send(map[string]any{"type": "received", "bytes": report.bytes, "ms": report.ms})
+	}
+	// the messages are read in order, so the close comes after them
+	time.Sleep(200 * time.Millisecond)
+	session.close()
+	body := fixture.nextReport(5 * time.Second)
+	if !slices.Equal(body.DownloadReceivedBytes, []uint64{step, step, 0, 0}) {
+		t.Errorf("received %v, steps of %d", body.DownloadReceivedBytes, step)
+	}
+}
+
 // M4: a load whose download never starts times out and frees its slot; the
 // browser's done ends a load whose upload never started.
 func TestLagApiLoadTimeouts(t *testing.T) {
