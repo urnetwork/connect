@@ -71,11 +71,14 @@ func newSmtpIntegrationMulti(
 	)
 }
 
+// newSmtpIntegrationBasicClient is a basic client whose local nat dials in the
+// process: what it routes locally (TCP/25) is refused there, and the dialed
+// addresses come back on the returned channel.
 func newSmtpIntegrationBasicClient(
 	t *testing.T,
 	policy *smtpCountingSecurityPolicy,
 	receive ReceivePacketFunction,
-) *RemoteUserNatClient {
+) (*RemoteUserNatClient, <-chan string) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	clientSettings := DefaultClientSettings()
@@ -91,12 +94,23 @@ func newSmtpIntegrationBasicClient(
 		protocol.ProvideMode_Network,
 	)
 	remote.securityPolicy = policy
+	// The client builds its own local nat, which has no dial setting and
+	// would send TCP/25 to the documentation address from the host. Replace
+	// it, before any packet, with the same nat dialing in the process.
+	remote.localUserNatUnsub()
+	remote.localUserNat.Close()
+	localDialContextSettings, localDials := testRefusingLocalDialContextSettings()
+	localUserNatSettings := DefaultLocalUserNatSettings()
+	localUserNatSettings.UdpBufferSettings.DialContextSettings = localDialContextSettings
+	localUserNatSettings.TcpBufferSettings.DialContextSettings = localDialContextSettings
+	remote.localUserNat = NewLocalUserNat(client.Ctx(), "remote local", localUserNatSettings)
+	remote.localUserNatUnsub = remote.localUserNat.AddReceivePacketCallback(receive)
 	t.Cleanup(func() {
 		remote.Close()
 		client.Cancel()
 		cancel()
 	})
-	return remote
+	return remote, localDials
 }
 
 func nextSmtpBlockActions(t *testing.T, actions <-chan []*BlockAction) []*BlockAction {
@@ -278,7 +292,7 @@ func TestBasicRemoteClientPreservesSmtpPolicyEntryPoint(t *testing.T) {
 			stats:  DefaultSecurityPolicyStatsCollector(),
 			result: SecurityPolicyResultIncident,
 		}
-		remote := newSmtpIntegrationBasicClient(t, policy, func(
+		remote, localDials := newSmtpIntegrationBasicClient(t, policy, func(
 			_ TransferPath,
 			_ protocol.ProvideMode,
 			_ *IpPath,
@@ -301,6 +315,13 @@ func TestBasicRemoteClientPreservesSmtpPolicyEntryPoint(t *testing.T) {
 		if calls := policy.egressCalls.Load(); calls != 0 {
 			t.Fatalf("basic client TCP/25 reached CFAA %d times", calls)
 		}
+		// the SYN reached the client's local nat, whose dial stays in the process
+		select {
+		case address := <-localDials:
+			AssertEqual(t, net.JoinHostPort("203.0.113.10", fmt.Sprint(smtpLocalPort)), address)
+		case <-time.After(5 * time.Second):
+			t.Fatal("basic client TCP/25 did not reach the local nat dial")
+		}
 	})
 
 	t.Run("plaintext 465 is reset before CFAA", func(t *testing.T) {
@@ -309,7 +330,7 @@ func TestBasicRemoteClientPreservesSmtpPolicyEntryPoint(t *testing.T) {
 			result: SecurityPolicyResultAllow,
 		}
 		var resetCount atomic.Int64
-		remote := newSmtpIntegrationBasicClient(t, policy, func(
+		remote, _ := newSmtpIntegrationBasicClient(t, policy, func(
 			_ TransferPath,
 			_ protocol.ProvideMode,
 			_ *IpPath,
@@ -342,7 +363,7 @@ func TestBasicRemoteClientPreservesSmtpPolicyEntryPoint(t *testing.T) {
 			result: SecurityPolicyResultAllow,
 		}
 		var resetCount atomic.Int64
-		remote := newSmtpIntegrationBasicClient(t, policy, func(
+		remote, _ := newSmtpIntegrationBasicClient(t, policy, func(
 			_ TransferPath,
 			_ protocol.ProvideMode,
 			_ *IpPath,
