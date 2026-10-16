@@ -185,15 +185,17 @@ const (
 // sized once, so a stream of any length adds to it without growing it (M7).
 //
 // The phase ends at its window's end, or sooner when a cap, a mismatch, the
-// load or the session ends it, and that end is the phase's end for the
-// session's every use of it (M4, M8). Ended by its time, a phase still has
-// work past the end until its window is final (amendment 15): an upload's
+// load or the session ends it (M4, M8). A sampled upload failure can invalidate
+// a time end until its admitted bytes finish verification. Ended by its time,
+// a phase still has work until its window is final (amendment 15): an upload's
 // reads still count for what they carry from before the end, until every
 // stream still open is done or lagSpreadMax has passed (M6 R3); and a
 // download's streams write on until the browser closes them, within
 // lagApiPhaseGrace (M5). Closing the phase then -- the load moved on, or the
 // session ended -- makes its window final at once. Ended any other way, its
-// window is final at its end.
+// counting is final at its end. Upload settlement also waits for any sampled
+// message with admitted bytes to finish; closing abandons that credit as
+// unverified, without waiting for the reader.
 type lagApiPhase struct {
 	api            *extenderLagApi
 	direction      lagApiDirection
@@ -201,7 +203,7 @@ type lagApiPhase struct {
 	interval       time.Duration
 	maxStreamCount int
 	// wakes the session, at the first byte, at the end, and when the window
-	// is final
+	// is final and its sampled verification has settled
 	notify func()
 
 	// done when the phase ends; an upload stream is then closed, though read
@@ -228,7 +230,10 @@ type lagApiPhase struct {
 	lastCountedTime time.Time
 	end             lagApiPhaseEnd
 	endedTime       time.Time
-	// nothing more counts in the window, nor goes on past it (amendment 15);
+	// a sampled message failed, or its admitted bytes could not be checked
+	verificationFailed bool
+	// nothing more counts in the window, nor is sent past it (amendment 15);
+	// sampled verification may still hold settlement after counting ends
 	// the timer that makes an upload's window final lagSpreadMax after its
 	// end, and the one that makes it final when its last open stream is done,
 	// set for that time
@@ -258,6 +263,10 @@ type lagApiStreamCount struct {
 	// its last message, a short one, has arrived whole: nothing valid can
 	// follow it (M6), so nothing it reads after counts
 	finished bool
+	// a sampled message is being read; its admitted bytes remain unverified
+	// until the whole message's sample decision and comparison finish
+	sampling   bool
+	unverified bool
 }
 
 // Whether upload stream k is done at now, with the phase's lock held: nothing
@@ -458,7 +467,22 @@ func (self *lagApiPhase) finish(end lagApiPhaseEnd) {
 	ended, finalized := func() (bool, bool) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		return self.finishWithLock(time.Now(), end)
+		abandoned := false
+		if end == lagApiPhaseEndClosed {
+			// Closing cannot wait for a socket reader. Any unresolved credit
+			// stays unverified, including if its comparison later succeeds.
+			for streamIndex := range self.streamCounts {
+				count := &self.streamCounts[streamIndex]
+				if count.unverified {
+					self.verificationFailed = true
+					abandoned = true
+				}
+				count.sampling = false
+				count.unverified = false
+			}
+		}
+		ended, finalized := self.finishWithLock(time.Now(), end)
+		return ended, finalized || abandoned
 	}()
 	self.changed(ended, finalized)
 }
@@ -612,12 +636,83 @@ func (self *lagApiPhase) state() (firstByteTime time.Time, endedTime time.Time, 
 	return self.firstByteTime, self.endedTime, self.end
 }
 
-// Whether the phase's window is final (amendment 15): for an upload, nothing
-// more counts in it, so its total and series are the ones the report signs.
+// The phase's end and settlement together: a late sampled failure may change
+// a time end to a mismatch, so reconciliation must not read them separately.
+func (self *lagApiPhase) settlementState() (firstByteTime time.Time, endedTime time.Time, end lagApiPhaseEnd, final bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.firstByteTime, self.endedTime, self.end, self.final && !self.pendingVerificationWithLock()
+}
+
+// Whether the phase's window is final (amendment 15): no more bytes count,
+// and every sampled message with admitted bytes has settled its verification.
 func (self *lagApiPhase) windowFinal() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.final
+	return self.final && !self.pendingVerificationWithLock()
+}
+
+// Whether any admitted upload bytes still belong to a sampled message whose
+// sample decision or comparison has not finished, with the phase's lock held.
+func (self *lagApiPhase) pendingVerificationWithLock() bool {
+	for streamIndex := range self.streamCounts {
+		if self.streamCounts[streamIndex].unverified {
+			return true
+		}
+	}
+	return false
+}
+
+// Whether the upload started and its verification is settled without a
+// mismatch or abandoned sampled bytes. Safe to read beside upload readers.
+func (self *lagApiPhase) verified() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return !self.firstByteTime.IsZero() && self.end != lagApiPhaseEndMismatch &&
+		!self.verificationFailed && !self.pendingVerificationWithLock()
+}
+
+// Starts ownership of one sampled message. Only bytes admitted by receive
+// keep settlement pending; a message drained after counting ends cannot do so.
+func (self *lagApiPhase) beginSample(streamIndex int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.streamCounts[streamIndex].sampling = true
+}
+
+// Settles a sampled message's admitted bytes after its sample decision and
+// comparison, or abandons them on a read error. Unlike an exact read rejected
+// before counting, a failed sample invalidates its already admitted bytes
+// even after the window's end or counting's final timer.
+func (self *lagApiPhase) finishSample(streamIndex int, now time.Time, complete bool, mismatch bool) {
+	ended, finalized := func() (bool, bool) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		count := &self.streamCounts[streamIndex]
+		count.sampling = false
+		if !count.unverified {
+			return false, false
+		}
+		count.unverified = false
+		if !complete {
+			self.verificationFailed = true
+		}
+		if mismatch {
+			if self.end == lagApiPhaseRunning {
+				if self.endTime.Before(now) {
+					now = self.endTime
+				}
+				return self.finishWithLock(now, lagApiPhaseEndMismatch)
+			}
+			if self.end == lagApiPhaseEndTime {
+				self.end = lagApiPhaseEndMismatch
+				self.finalizeWithLock()
+				return true, true
+			}
+		}
+		return false, self.final && !self.pendingVerificationWithLock()
+	}()
+	self.changed(ended, finalized)
 }
 
 // The bytes per interval of the window, through its last counted interval: a
@@ -786,6 +881,9 @@ func (self *lagApiPhase) receive(streamIndex int, arrivedTime time.Time, byteCou
 			// stream may be done
 			return false, ended, self.finalIfDoneWithLock(arrivedTime) || finalized
 		}
+		if count.sampling {
+			count.unverified = true
+		}
 		if count.previousTime.IsZero() || arrivedTime.After(count.groupTime.Add(lagSpreadJoin)) {
 			// a new group, which spans from the stream's previous read
 			spanStart := arrivedTime.Add(-lagSpreadMax)
@@ -950,7 +1048,7 @@ func (self *lagApiPhase) progressReport(last bool) (uint64, int64, float64, bool
 	}
 	ms := int64(0)
 	if last {
-		if !self.final {
+		if !self.final || self.pendingVerificationWithLock() {
 			return 0, 0, 0, false
 		}
 		ms = max(0, min(self.endedTime.Sub(self.firstByteTime), self.duration)).Milliseconds()
@@ -1338,9 +1436,10 @@ func (self *extenderLagApi) readUpload(
 // whole. A mismatch, a text message or a message after a short one ends the
 // phase as a mismatch, which ends the load; what was counted before it stays
 // counted, but the load is not complete, so no speed is derived from it (A5).
-// Past the window's end, which the phase has ended by, the stream is read on
-// while its reads may still count (amendment 15), and a mismatch then ends
-// only its count. A short message, the stream's last, finishes the stream once
+// Past the window's end, the stream is read on while its reads may still
+// count (amendment 15). An exact mismatch then ends only its count; a failed
+// sample still invalidates the bytes it already admitted, and settlement
+// waits for that sample decision and comparison. A short message finishes once
 // it has arrived whole and been checked, under exact verification read by read
 // and under sampled once the sample was chosen and compared or not: nothing
 // valid can follow it, so the stream is done (amendment 15).
@@ -1413,6 +1512,14 @@ func (self *lagApiUploadStream) readMessage(messageType int, reader io.Reader, n
 		phase.mismatch(self.streamIndex, startTime)
 		return nil
 	}
+	sampleComplete := false
+	sampleMismatch := false
+	if !self.exact {
+		phase.beginSample(self.streamIndex)
+		defer func() {
+			phase.finishSample(self.streamIndex, now(), sampleComplete, sampleMismatch)
+		}()
+	}
 	byteCount := 0
 	lastTime := startTime
 	for byteCount < len(self.data) {
@@ -1443,10 +1550,11 @@ func (self *lagApiUploadStream) readMessage(messageType int, reader io.Reader, n
 		counterBlock := lagApiCounterBlock(uint64(self.streamIndex), self.offset)
 		cipher.NewCTR(self.block, counterBlock[:]).XORKeyStream(self.keystream[:byteCount], lagApiZeroBytes[:byteCount])
 		if !bytes.Equal(self.data[:byteCount], self.keystream[:byteCount]) {
-			phase.mismatch(self.streamIndex, now())
+			sampleMismatch = true
 			return nil
 		}
 	}
+	sampleComplete = true
 	self.offset += uint64(byteCount)
 	if self.short {
 		// the stream's last message: it is done (amendment 15)
