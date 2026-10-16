@@ -1,0 +1,242 @@
+// Send sequences of one client share its exact lifetime resend budget. The
+// retained bytes an acknowledgement frees belong to the oldest sequence
+// waiting for them, so neither the sequence whose acknowledgement freed them
+// nor the runtime's wake order decides whose Packs reach the wire.
+package connect
+
+import (
+	"runtime"
+	"testing"
+	"testing/synctest"
+
+	"github.com/urnetwork/connect/protocol"
+)
+
+// Real send loops of one client sharing one lifetime budget that retains two
+// items. Used only inside a synctest bubble; the test stands in for the
+// receiver, so written Packs stay outstanding until it acknowledges them.
+type lifetimeBudgetSendFixture struct {
+	t         *testing.T
+	round     *windowRoundFixture
+	budget    *TransferMemoryBudget
+	sequences []*SendSequence
+	dones     []chan struct{}
+	indexes   map[Id]int
+	// Written and not yet acknowledged, in write order.
+	outstanding []*windowRoundFrame
+	writers     []int
+}
+
+// Starts the sequences in index order behind a quiescence barrier, so they
+// first wait for retained bytes in that order. Each queues backlogCount
+// reliable Packs, two of which exceed one wire Pack, so every item holds one
+// Pack. The budget is sized for two items once the first backlog is queued,
+// and the first sequence then writes both.
+func newLifetimeBudgetSendFixture(
+	t *testing.T,
+	sequenceCount int,
+	backlogCount int,
+	configure func(index int, settings *SendBufferSettings),
+) *lifetimeBudgetSendFixture {
+	t.Helper()
+	fixture := &lifetimeBudgetSendFixture{
+		t:       t,
+		round:   newWindowRoundFixture(t, nil, nil),
+		budget:  NewTransferMemoryBudget(0),
+		indexes: map[Id]int{},
+	}
+	newPack := func() *SendPack {
+		frame := budgetTestFrame(800)
+		return &SendPack{
+			TransferOptions:  TransferOptions{Ack: true},
+			Frame:            frame,
+			Ctx:              fixture.round.ctx,
+			Destination:      fixture.round.receiver.ClientId(),
+			MessageByteCount: ByteCount(len(frame.MessageBytes)),
+		}
+	}
+	for index := range sequenceCount {
+		settings := DefaultSendBufferSettings()
+		settings.SequenceBufferSize = backlogCount
+		settings.ResendQueueBudget = fixture.budget
+		settings.ResendQueueRetainedByteAccounting = true
+		if configure != nil {
+			configure(index, settings)
+		}
+		sequence := NewSendSequence(fixture.round.ctx, fixture.round.sender, fixture.round.sender.sendBuffer,
+			fixture.round.receiver.ClientId(), MultiHopId{}, false, false, false,
+			sequenceTlsRoleClient, false, settings)
+		for range backlogCount {
+			pack := newPack()
+			if admitted, err := sequence.Pack(pack, 0); !admitted || err != nil {
+				pack.returnFrames()
+				t.Fatalf("sequence %d backlog admission = %t, %v", index, admitted, err)
+			}
+		}
+		if index == 0 {
+			pack := newPack()
+			fixture.budget.SetTotalByteCount(2 * sequence.retainedSendPackByteCount(pack))
+			pack.returnFrames()
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			sequence.Run()
+		}()
+		fixture.sequences = append(fixture.sequences, sequence)
+		fixture.dones = append(fixture.dones, done)
+		fixture.indexes[sequence.sequenceId] = index
+		synctest.Wait()
+	}
+	if writers := fixture.take(); len(writers) != 2 || writers[0] != 0 || writers[1] != 0 {
+		t.Fatalf("sequences that wrote before any acknowledgement = %v, want the first sequence's two items", writers)
+	}
+	return fixture
+}
+
+// Captures every Pack written since the last call, by writer index.
+func (self *lifetimeBudgetSendFixture) take() []int {
+	self.t.Helper()
+	var writers []int
+	for len(self.round.senderOut) != 0 {
+		frame := self.round.take(self.round.senderOut)
+		if frame.pack == nil {
+			self.t.Fatal("a sequence wrote something other than a Pack")
+		}
+		sequenceId, err := IdFromBytes(frame.pack.SequenceId)
+		if err != nil {
+			self.t.Fatalf("written Pack has no sequence id: %v", err)
+		}
+		index, ok := self.indexes[sequenceId]
+		if !ok {
+			self.t.Fatal("a Pack was written by a sequence the test did not start")
+		}
+		self.outstanding = append(self.outstanding, frame)
+		writers = append(writers, index)
+	}
+	self.writers = append(self.writers, writers...)
+	return writers
+}
+
+// Acknowledges the oldest outstanding item of sequence index, or of any
+// sequence for a negative index, waits for every loop to settle, and returns
+// the writers of the Packs that the freed bytes let through.
+func (self *lifetimeBudgetSendFixture) acknowledge(index int) []int {
+	self.t.Helper()
+	for position, frame := range self.outstanding {
+		sequenceId, _ := IdFromBytes(frame.pack.SequenceId)
+		if 0 <= index && self.indexes[sequenceId] != index {
+			continue
+		}
+		self.outstanding = append(self.outstanding[:position:position], self.outstanding[position+1:]...)
+		ack := &protocol.Ack{MessageId: frame.pack.MessageId, SequenceId: frame.pack.SequenceId}
+		if accepted, err := self.sequences[self.indexes[sequenceId]].Ack(ack, 0); !accepted || err != nil {
+			self.t.Fatalf("acknowledgement of a written item = %t, %v", accepted, err)
+		}
+		synctest.Wait()
+		return self.take()
+	}
+	self.t.Fatalf("sequence %d has no outstanding item to acknowledge", index)
+	return nil
+}
+
+// Closes every sequence and checks that their items, places in line and
+// reserved turns all returned to the budget.
+func (self *lifetimeBudgetSendFixture) close() {
+	self.t.Helper()
+	for _, sequence := range self.sequences {
+		sequence.Close()
+	}
+	for _, done := range self.dones {
+		<-done
+	}
+	assertRetainedBudgetBalance(self.t, self.budget)
+}
+
+// The root cause of one lane taking every byte of a shared lifetime budget.
+// Three sequences of one client each hold a backlog of reliable Packs and
+// share a budget that retains two items. The test acknowledges the oldest
+// written item one at a time, and each sequence must get an equal share of
+// the items the acknowledgements free. A sequence applies its own
+// acknowledgement in its send loop, and the loop used to release the item's
+// bytes, wake every blocked sibling and, in the same pass, take the bytes back
+// for its next Pack before any sibling ran: the first sequence wrote every
+// freed item and the other two none.
+func TestSendSequencesSharingALifetimeBudgetTakeTurnsAtItsReleases(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	// Keep the process-global pool statistics worker outside the bubble.
+	MessagePoolReturn(MessagePoolGet(1))
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	synctest.Test(t, func(t *testing.T) {
+		const sequenceCount = 3
+		const ackCount = 12
+		fixture := newLifetimeBudgetSendFixture(t, sequenceCount, 16, nil)
+		writeCounts := make([]int, sequenceCount)
+		for range ackCount {
+			// One freed item lets exactly one Pack through.
+			writers := fixture.acknowledge(-1)
+			if len(writers) != 1 {
+				t.Fatalf("one freed item let %d Packs reach the wire, want exactly 1: %v", len(writers), writers)
+			}
+			writeCounts[writers[0]] += 1
+		}
+		fixture.close()
+
+		t.Logf("writers in order: %v", fixture.writers)
+		for index, count := range writeCounts {
+			if count != ackCount/sequenceCount {
+				t.Errorf("sequence %d wrote %d of the %d items acknowledgements freed, want %d each: %v", index, count, ackCount, ackCount/sequenceCount, writeCounts)
+			}
+		}
+	})
+}
+
+// A sequence that closes while it waits leaves the line, so the next release
+// serves the sequence behind it rather than a place nobody will take.
+func TestSendSequenceThatClosesWhileWaitingLeavesTheLifetimeBudgetLine(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	MessagePoolReturn(MessagePoolGet(1))
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newLifetimeBudgetSendFixture(t, 3, 4, nil)
+		// The first sequence waited first, so the first release is its own.
+		if writers := fixture.acknowledge(0); len(writers) != 1 || writers[0] != 0 {
+			t.Fatalf("Packs written after the first release = %v, want the first sequence's", writers)
+		}
+		fixture.sequences[1].Close()
+		<-fixture.dones[1]
+		if writers := fixture.acknowledge(0); len(writers) != 1 || writers[0] != 2 {
+			t.Fatalf("Packs written after the release behind a closed waiter = %v, want the third sequence's", writers)
+		}
+		fixture.close()
+	})
+}
+
+// A sequence that its own send window holds when its turn comes cannot use
+// the bytes reserved for it. It passes them on at once, so the turn does not
+// idle while the next sequence in line could write.
+func TestSendSequenceHeldByItsWindowPassesItsLifetimeBudgetTurnOn(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	MessagePoolReturn(MessagePoolGet(1))
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	synctest.Test(t, func(t *testing.T) {
+		// The second sequence's window takes one item at a time.
+		fixture := newLifetimeBudgetSendFixture(t, 3, 8, func(index int, settings *SendBufferSettings) {
+			if index == 1 {
+				settings.ResendQueueMaxByteCount = 1
+			}
+		})
+		// Turns in arrival order fill the window of the second sequence.
+		for _, want := range []int{0, 1, 2, 0} {
+			if writers := fixture.acknowledge(-1); len(writers) != 1 || writers[0] != want {
+				t.Fatalf("Packs written in turn = %v, want sequence %d's", writers, want)
+			}
+		}
+		// The second sequence's turn comes while its only item is still
+		// outstanding. The bytes must reach the third sequence at once.
+		if writers := fixture.acknowledge(0); len(writers) != 1 || writers[0] != 2 {
+			t.Fatalf("Packs written after a window-held turn = %v, want the third sequence's", writers)
+		}
+		fixture.close()
+	})
+}

@@ -151,5 +151,5 @@ func (self *SendSequence) retainedSendPackFits(pack *SendPack) bool {
 	if credit := pack.ackRecord().preparedMemory(); credit != nil {
 		credit.require(required)
 	}
-	return required <= self.resendQueue.budget.Available()+pack.preparedMemoryBytes(self.resendQueue.budget)
+	return required <= self.resendQueue.budget.Available()+self.resendMemoryGrant+pack.preparedMemoryBytes(self.resendQueue.budget)
 }
