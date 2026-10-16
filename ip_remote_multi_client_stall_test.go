@@ -893,9 +893,11 @@ func TestMultiClientCancelledFlowTableRejectsNewGeneration(t *testing.T) {
 // every flow association is mandatory, but reset retention must be bounded by
 // queue capacity even for a large flow table, with every reset past it counted
 // as a drop rather than waited for. The removal runs in a synctest bubble with
-// nothing draining the queue: a removal that waited on the full queue would
-// leave the bubble deadlocked, which fails the test at once, so the bound is
-// the counted work below rather than a wall-clock deadline.
+// nothing draining the queue, so the bound is the counted work below rather
+// than a wall-clock deadline: a removal that waited on the full queue forever
+// would leave the bubble deadlocked, and one that waited any bounded time per
+// reset would let fake time pass across removeClient, which no wait-free
+// removal does.
 func TestMultiClientRemovalClearsAllFlowsWithBoundedResetWork(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -927,7 +929,11 @@ func TestMultiClientRemovalClearsAllFlowsWithBoundedResetWork(t *testing.T) {
 		}
 		multi.clientUpdates[client] = updates
 
+		start := time.Now()
 		multi.removeClient(client)
+		if waited := time.Since(start); waited != 0 {
+			t.Fatalf("the removal let %s of fake time pass, want none: it waited for the reset queue", waited)
+		}
 
 		if _, ok := multi.clientUpdates[client]; ok {
 			t.Fatal("removed client retained its flow set")
