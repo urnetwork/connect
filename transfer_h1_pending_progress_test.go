@@ -1,5 +1,6 @@
 // The real receiver produces the SACK and cumulative ACK; the fixture only
-// controls bounded route handoffs and drops two originals at the endpoint.
+// controls bounded route handoffs, drops two originals at the endpoint, and
+// lets the receiver's ACK worker run at the hole fill's first update edge.
 package connect
 
 import (
@@ -44,6 +45,10 @@ func runH1DueLowerPrefix(t *testing.T, pendingFeedback string, retainTail bool) 
 		tailInspected := make(chan struct{})
 		var tailInspectedOnce sync.Once
 		releaseTailInspection := func() { tailInspectedOnce.Do(func() { close(tailInspected) }) }
+		holeFillUpdated, holeFillResume := make(chan struct{}), make(chan struct{})
+		var holeFillResumeOnce sync.Once
+		resumeHoleFill := func() { holeFillResumeOnce.Do(func() { close(holeFillResume) }) }
+		var holeFillArmed atomic.Bool
 		var intercepted, prefixApplied atomic.Bool
 		var tailAttemptsBeforePrefix atomic.Uint64
 		var sender *Client
@@ -133,7 +138,17 @@ func runH1DueLowerPrefix(t *testing.T, pendingFeedback string, retainTail bool) 
 			<-releaseDue
 		}
 		sender = NewClient(ctx, senderID, NewNoContractClientOob(), senderSettings)
-		receiver := NewClient(ctx, receiverID, NewNoContractClientOob(), newSettings())
+		receiverSettings := newSettings()
+		// The receiver's ACK worker drains concurrently and may run at any
+		// update edge. Park the hole fill's first edge until every other
+		// goroutine is durably blocked, so it writes what that edge exposes.
+		receiverSettings.ReceiveBufferSettings.afterAckWindowUpdateForTest = func(receiveSequenceId) {
+			if holeFillArmed.CompareAndSwap(true, false) {
+				close(holeFillUpdated)
+				<-holeFillResume
+			}
+		}
+		receiver := NewClient(ctx, receiverID, NewNoContractClientOob(), receiverSettings)
 		sender.ContractManager().AddNoContractPeer(receiverID)
 		receiver.ContractManager().AddNoContractPeer(senderID)
 		sender.RouteManager().UpdateTransport(NewSendGatewayTransportWithType(TransportTypeH1), []Route{senderOut})
@@ -143,6 +158,7 @@ func runH1DueLowerPrefix(t *testing.T, pendingFeedback string, retainTail bool) 
 		defer func() {
 			release()
 			releaseTailInspection()
+			resumeHoleFill()
 			cancel()
 			for _, client := range []*Client{sender, receiver} {
 				if err := client.CloseAndWait(context.Background()); err != nil {
@@ -249,7 +265,17 @@ func runH1DueLowerPrefix(t *testing.T, pendingFeedback string, retainTail bool) 
 			MessagePoolReturn(gapRetry)
 			t.Fatal("first natural recovery was not the missing lower head")
 		}
+		// G and the stored P drain in one callback. Let the ACK worker run at
+		// the delivery's first update edge: its ACK must already name P.
+		holeFillArmed.Store(true)
 		receiverIn <- gapRetry
+		select {
+		case <-holeFillUpdated:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the hole fill never reached the receiver's ACK window")
+		}
+		synctest.Wait()
+		resumeHoleFill()
 		prefixAck := takeAck(prefix, false)
 		defer func() {
 			if prefixAck != nil {

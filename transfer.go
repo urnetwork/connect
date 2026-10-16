@@ -1561,6 +1561,10 @@ type ClientSettings struct {
 	// one owner may share it. It never changes behaviour: whether an
 	// end-to-end session is attempted is `EncryptionSettings.Mode`.
 	PeerCapabilityRecorder *PeerCapabilityRecorder
+	// Opt-in diagnostic counters only; no packet policy depends on this flag.
+	EnableAckRouteWriteDiagnostics bool
+	// Set by a multi-client window before construction, never by packet callbacks.
+	ackRouteWriteFailureOwner *ackRouteWriteFailureCounters
 
 	SendBufferSize    int
 	ForwardBufferSize int
@@ -1738,6 +1742,92 @@ type ClientReceiveStatsSnapshot struct {
 	AckRouteWriteCountByTransport   map[TransportType]uint64
 	AckRouteWriteWaitByTransport    map[TransportType]time.Duration
 	AckRouteWriteTimeoutByTransport map[TransportType]uint64
+	// Opt-in failure-only totals; the legacy carrier maps retain their meaning.
+	// A failed attempt's carrier is a preference, not proof of a carrier write.
+	AckRouteWriteFailures *AckRouteWriteFailureStatsSnapshot `json:",omitempty"`
+}
+
+// Fixed cause and wait evidence; independently read atomics are not a transaction.
+type AckRouteWriteFailureStatsSnapshot struct {
+	ErrorCount          uint64
+	RouteTimeoutCount   uint64
+	CallerCanceledCount uint64
+	CallerDeadlineCount uint64
+	SelectorClosedCount uint64
+	OtherCount          uint64
+	BlockedCount        uint64
+	WaitDuration        time.Duration
+	MaxWait             time.Duration
+}
+
+// Bounded per-owner storage. Recording is allocation-free and safe concurrently.
+type ackRouteWriteFailureCounters struct {
+	byKind             [transferWriteFailureOther]atomic.Uint64
+	blockedCount       atomic.Uint64
+	waitNanoseconds    atomic.Uint64
+	maxWaitNanoseconds atomic.Uint64
+}
+
+// Records one error in exactly one cause bucket, including failures after retirement.
+func (self *ackRouteWriteFailureCounters) record(kind transferWriteFailureKind, disposition transferWriteDisposition) {
+	if self == nil {
+		return
+	}
+	if kind <= transferWriteFailureNone || transferWriteFailureOther < kind {
+		kind = transferWriteFailureOther
+	}
+	self.byKind[kind-1].Add(1)
+	if disposition.failureInitiallyBlocked {
+		self.blockedCount.Add(1)
+		if 0 < disposition.failureWaitDuration {
+			wait := uint64(disposition.failureWaitDuration)
+			self.waitNanoseconds.Add(wait)
+			updateAtomicMaximum(&self.maxWaitNanoseconds, wait)
+		}
+	}
+}
+
+// Allocates one fixed diagnostic snapshot only after an actual failed write.
+func (self *ackRouteWriteFailureCounters) snapshot() *AckRouteWriteFailureStatsSnapshot {
+	if self == nil {
+		return nil
+	}
+	routeTimeout := self.byKind[transferWriteFailureRouteTimeout-1].Load()
+	callerCanceled := self.byKind[transferWriteFailureCallerCanceled-1].Load()
+	callerDeadline := self.byKind[transferWriteFailureCallerDeadline-1].Load()
+	selectorClosed := self.byKind[transferWriteFailureSelectorClosed-1].Load()
+	other := self.byKind[transferWriteFailureOther-1].Load()
+	errorCount := routeTimeout + callerCanceled + callerDeadline + selectorClosed + other
+	if errorCount == 0 {
+		return nil
+	}
+	return &AckRouteWriteFailureStatsSnapshot{
+		ErrorCount:          errorCount,
+		RouteTimeoutCount:   routeTimeout,
+		CallerCanceledCount: callerCanceled,
+		CallerDeadlineCount: callerDeadline,
+		SelectorClosedCount: selectorClosed,
+		OtherCount:          other,
+		BlockedCount:        self.blockedCount.Load(),
+		WaitDuration:        time.Duration(self.waitNanoseconds.Load()),
+		MaxWait:             time.Duration(self.maxWaitNanoseconds.Load()),
+	}
+}
+
+// Custom writers retain their error identity; untyped errors remain explicitly unknown.
+func transferWriteFailureFromError(err error) transferWriteFailureKind {
+	switch {
+	case err == nil:
+		return transferWriteFailureNone
+	case errors.Is(err, errTransferRouteWriteTimeout):
+		return transferWriteFailureRouteTimeout
+	case errors.Is(err, context.Canceled):
+		return transferWriteFailureCallerCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return transferWriteFailureCallerDeadline
+	default:
+		return transferWriteFailureOther
+	}
 }
 
 // ackTransportSlot maps a carrier type to a fixed counter slot so the ack hot
@@ -1988,6 +2078,8 @@ type Client struct {
 	receiveAckRouteWriteErrorCount      atomic.Uint64
 	receiveAckRouteWriteWaitNanoseconds atomic.Uint64
 	receiveAckRouteWriteMaxWaitNanos    atomic.Uint64
+	receiveAckRouteWriteFailures        *ackRouteWriteFailureCounters
+	ackRouteWriteFailureOwner           *ackRouteWriteFailureCounters
 	initialSendWriteCount               atomic.Uint64
 	initialSendFrameCount               atomic.Uint64
 	initialSendMessageByteCount         atomic.Uint64
@@ -2168,6 +2260,10 @@ func NewClientWithTag(
 		runDone:                      make(chan struct{}),
 		beforeRunDoneWaitForTest:     settings.beforeRunDoneWaitForTest,
 		beforeLoopbackReleaseForTest: settings.beforeLoopbackReleaseForTest,
+	}
+	if settings.EnableAckRouteWriteDiagnostics {
+		client.receiveAckRouteWriteFailures = &ackRouteWriteFailureCounters{}
+		client.ackRouteWriteFailureOwner = settings.ackRouteWriteFailureOwner
 	}
 	client.receiveCallback = client.receive
 
@@ -2372,6 +2468,7 @@ func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 		AckRouteWriteMaxWait: time.Duration(
 			self.receiveAckRouteWriteMaxWaitNanos.Load(),
 		),
+		AckRouteWriteFailures: self.receiveAckRouteWriteFailures.snapshot(),
 	}
 	// The per-carrier maps exist only when a carrier has written: a client
 	// that has not acked stays allocation-free, which the multi-client memory
@@ -4130,6 +4227,18 @@ func (self *Client) recordReceiveAckRouteWrite(
 	priority bool,
 	err error,
 ) {
+	self.recordReceiveAckRouteWriteDisposition(transportType, waitDuration, blocked, priority, err, transferWriteDisposition{})
+}
+
+// Adds failure-only evidence without changing the legacy success/wait accounting.
+func (self *Client) recordReceiveAckRouteWriteDisposition(
+	transportType TransportType,
+	waitDuration time.Duration,
+	blocked bool,
+	priority bool,
+	err error,
+	disposition transferWriteDisposition,
+) {
 	slot := ackTransportSlot(transportType)
 	self.receiveAckRouteWriteCount.Add(1)
 	self.receiveAckRouteWriteCountByTransport[slot].Add(1)
@@ -4138,7 +4247,15 @@ func (self *Client) recordReceiveAckRouteWrite(
 	}
 	if err != nil {
 		self.receiveAckRouteWriteErrorCount.Add(1)
-		self.receiveAckRouteWriteTimeoutByTransport[slot].Add(1)
+		kind := disposition.failureKind
+		if kind == transferWriteFailureNone {
+			kind = transferWriteFailureFromError(err)
+		}
+		if kind == transferWriteFailureRouteTimeout {
+			self.receiveAckRouteWriteTimeoutByTransport[slot].Add(1)
+		}
+		self.receiveAckRouteWriteFailures.record(kind, disposition)
+		self.ackRouteWriteFailureOwner.record(kind, disposition)
 	}
 	if !blocked || waitDuration <= 0 {
 		return
@@ -6985,15 +7102,14 @@ func (self *SendSequence) ResendQueueSizeAndMessageTypes() (int, ByteCount, Id, 
 	return count, byteSize, self.sequenceId, messageTypes
 }
 
-// acquirePackAdmission spends the same caller timeout as channel admission.
-// The returned timeout is the remaining budget for the channel handoff.
 // awaitResendCapacity holds a reliable pack outside admission until the send
 // loop reports that the resend queue could take it, or the caller's timeout
 // runs out. Returns the remaining timeout.
 //
-// A capacity publication wakes blocked producers immediately. The common
-// available case stays a single atomic read; a blocked producer subscribes
-// before reading again so an ACK cannot fall between its check and wait.
+// A capacity publication gives the first blocked producer its turn at once.
+// The common open case stays two atomic reads. Producers that wait pass in
+// arrival order (see resendCapacityGate), so one that has just passed cannot
+// pass again ahead of one that was already waiting.
 func (self *SendSequence) awaitResendCapacity(
 	sendPack *SendPack,
 	timeout time.Duration,
@@ -7002,43 +7118,52 @@ func (self *SendSequence) awaitResendCapacity(
 	if self.preparedPackFits(sendPack) {
 		gate = &self.preparedFlightUnavailable
 	}
-	if !gate.Load() {
+	if gate.open(timeout != 0) {
 		return true, nil, timeout
 	}
 	if timeout == 0 {
 		return false, nil, timeout
 	}
 	startTime := time.Now()
-	var timeoutChannel <-chan time.Time
-	if 0 < timeout {
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-		timeoutChannel = timer.C
-	}
-	for {
-		changed := gate.Notify()
-		if !gate.Load() {
-			if 0 < timeout {
-				timeout = max(time.Duration(0), timeout-time.Since(startTime))
+	if waiter := gate.queue(); waiter != nil {
+		var timeoutChannel <-chan time.Time
+		if 0 < timeout {
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			timeoutChannel = timer.C
+		}
+		for passed := false; !passed; {
+			select {
+			case <-sendPack.Ctx.Done():
+				gate.abandon(waiter)
+				return false, errors.New("Done."), timeout
+			case <-self.ctx.Done():
+				gate.abandon(waiter)
+				return false, errors.New("Done."), timeout
+			case <-timeoutChannel:
+				gate.abandon(waiter)
+				return false, nil, 0
+			case <-waiter.ready:
+				passed = gate.pass(waiter)
 			}
-			return true, nil, timeout
-		}
-		select {
-		case <-sendPack.Ctx.Done():
-			return false, errors.New("Done."), timeout
-		case <-self.ctx.Done():
-			return false, errors.New("Done."), timeout
-		case <-timeoutChannel:
-			return false, nil, 0
-		case <-changed:
 		}
 	}
+	if 0 < timeout {
+		timeout = max(time.Duration(0), timeout-time.Since(startTime))
+	}
+	return true, nil, timeout
 }
 
 // Compatibility cadence for external zero-timeout retry callers. The internal
 // reliable admission gate uses capacity notifications rather than this timer.
 const resendCapacityPollInterval = 2 * time.Millisecond
 
+// Spends the same caller timeout as channel admission. The returned timeout is
+// the remaining budget for the channel handoff.
+//
+// A sender that finds no slot waits in arrival order, and the slot a release
+// frees is already this sender's when its ready channel closes. A sender that
+// gives up abandons its place, passing on any slot granted meanwhile.
 func (self *SendSequence) acquirePackAdmission(
 	sendPack *SendPack,
 	timeout time.Duration,
@@ -7047,45 +7172,46 @@ func (self *SendSequence) acquirePackAdmission(
 		return true, nil, timeout
 	}
 	startTime := time.Now()
-	var timer *time.Timer
-	var timeoutChannel <-chan time.Time
-	if 0 < timeout {
-		timer = time.NewTimer(timeout)
-		timeoutChannel = timer.C
-		defer timer.Stop()
+	admissionKey := sendPack.schedulingKey
+	if !self.flowIsolation.Load() {
+		// A carrier without explicit flow isolation gets the complete legacy
+		// admission capacity; only H3 reserves one slot for another flow.
+		admissionKey = sendSchedulingKey{}
 	}
-	for {
-		admissionKey := sendPack.schedulingKey
-		if !self.flowIsolation.Load() {
-			// A carrier without explicit flow isolation gets the complete legacy
-			// admission capacity; only H3 reserves one slot for another flow.
-			admissionKey = sendSchedulingKey{}
-		}
-		acquired, closed, notify := self.packAdmission.tryAcquire(admissionKey)
-		if acquired {
-			sendPack.admission = self.packAdmission
-			sendPack.admissionKey = admissionKey
-			if 0 < timeout {
-				timeout = max(time.Duration(0), timeout-time.Since(startTime))
-			}
-			return true, nil, timeout
-		}
-		if closed {
-			return false, errors.New("Done."), timeout
-		}
-		if timeout == 0 {
-			return false, nil, timeout
+	acquired, closed, waiter := self.packAdmission.tryAcquire(admissionKey, timeout != 0)
+	if waiter != nil {
+		var timeoutChannel <-chan time.Time
+		if 0 < timeout {
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			timeoutChannel = timer.C
 		}
 		select {
+		case <-waiter.ready:
+			acquired, closed = waiter.granted, !waiter.granted
 		case <-sendPack.Ctx.Done():
+			self.packAdmission.abandon(waiter)
 			return false, errors.New("Done."), timeout
 		case <-self.ctx.Done():
+			self.packAdmission.abandon(waiter)
 			return false, errors.New("Done."), timeout
-		case <-notify:
 		case <-timeoutChannel:
+			self.packAdmission.abandon(waiter)
 			return false, nil, timeout
 		}
 	}
+	if closed {
+		return false, errors.New("Done."), timeout
+	}
+	if !acquired {
+		return false, nil, timeout
+	}
+	sendPack.admission = self.packAdmission
+	sendPack.admissionKey = admissionKey
+	if 0 < timeout {
+		timeout = max(time.Duration(0), timeout-time.Since(startTime))
+	}
+	return true, nil, timeout
 }
 
 // success, error
@@ -13584,6 +13710,10 @@ type ReceiveBufferSettings struct {
 	afterIdleCloseForTest func(receiveSequenceId, bool)
 	// Nil by default. Exposes the fixed handoff census without changing admission.
 	afterGapHandoffSnapshotForTest func(receiveSequenceId, int)
+	// Nil by default. Runs on the updating goroutine after each ACK window
+	// Update or UpdateDeliveredPrefix, the edges where the ACK worker may
+	// drain the window.
+	afterAckWindowUpdateForTest func(receiveSequenceId)
 }
 
 func (self *ReceiveBufferSettings) packHandoffTimeout(
@@ -14481,6 +14611,10 @@ func newReceiveSequenceWithLogicalLaneBudget(
 	if receiveBufferSettings.ReceiveQueueRetainedByteAccounting {
 		seq.receiveQueue.setLifetimeBudget()
 	}
+	if afterUpdate := receiveBufferSettings.afterAckWindowUpdateForTest; afterUpdate != nil {
+		id := seq.id()
+		seq.ackWindow.afterUpdateForTest = func() { afterUpdate(id) }
+	}
 	// Never encrypt control-plane traffic. A ReceiveSequence's data source is
 	// the peer (source.SourceId) and its destination is always this client
 	// (client.ClientId()); when `ReceiveNoSession` holds for either endpoint,
@@ -15019,6 +15153,7 @@ func (self *ReceiveSequence) Run() {
 				messagePoolMarkSmallUnordered(frameBytes)
 				shared := MessagePoolShareReadOnly(frameBytes)
 				var writeErr error
+				var disposition transferWriteDisposition
 				blocked := false
 				priority := false
 				var waitDuration time.Duration
@@ -15033,29 +15168,28 @@ func (self *ReceiveSequence) Run() {
 					); success {
 						priority = true
 						writtenTransportType = TransportTypeH1
-					} else if sendAck.transportType != TransportTypeUnknown {
+					} else {
 						var success bool
-						var disposition transferWriteDisposition
-						success, disposition, writeErr = selector.writeDetailedReplyWithCarrierPreference(
-							ackWriteCtx,
-							shared,
-							self.receiveBufferSettings.WriteTimeout,
-							sendAck.transportType,
-						)
-						blocked = disposition.initiallyBlocked
-						waitDuration = disposition.initialWaitDuration
-						if disposition.transportType != "" {
-							writtenTransportType = disposition.transportType
+						if sendAck.transportType == TransportTypeUnknown {
+							// The same generic policy as Write, retaining its disposition.
+							success, disposition, writeErr = selector.writeDetailedWithCarrier(
+								ackWriteCtx, shared, self.receiveBufferSettings.WriteTimeout,
+							)
+						} else {
+							success, disposition, writeErr = selector.writeDetailedReplyWithCarrierPreference(
+								ackWriteCtx, shared, self.receiveBufferSettings.WriteTimeout, sendAck.transportType,
+							)
+						}
+						if sendAck.transportType != TransportTypeUnknown {
+							blocked = disposition.initiallyBlocked
+							waitDuration = disposition.initialWaitDuration
+							if disposition.transportType != "" {
+								writtenTransportType = disposition.transportType
+							}
 						}
 						if writeErr == nil && !success {
 							writeErr = errTransferRouteWriteTimeout
 						}
-					} else {
-						writeErr = ackMultiRouteWriter.Write(
-							ackWriteCtx,
-							shared,
-							self.receiveBufferSettings.WriteTimeout,
-						)
 					}
 				} else {
 					writeErr = ackMultiRouteWriter.Write(
@@ -15064,12 +15198,13 @@ func (self *ReceiveSequence) Run() {
 						self.receiveBufferSettings.WriteTimeout,
 					)
 				}
-				self.client.recordReceiveAckRouteWrite(
+				self.client.recordReceiveAckRouteWriteDisposition(
 					writtenTransportType,
 					waitDuration,
 					blocked,
 					priority,
 					writeErr,
+					disposition,
 				)
 				progress.TransportType = writtenTransportType
 				endTransferProgress(progressObserver, progress, "ack_write_end", writeErr == nil, writeErr)
@@ -16202,8 +16337,9 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 }
 
 // flushDeliver dispatches the buffered head items' app frames in one receive
-// callback, then sends their acks (deliver-before-ack, as the per-item path
-// did) and returns their pool buffers. The batch is taken out of the sequence
+// callback, then publishes their acks in one compressor update
+// (deliver-before-ack, as the per-item path did) and returns their pool
+// buffers. The batch is taken out of the sequence
 // fields BEFORE the callback runs. Client.receive isolates each registered
 // application callback panic; this guard covers a failure in that internal
 // dispatcher itself. Such a failure loses the un-acked batch so the sender can
@@ -16252,8 +16388,8 @@ func (self *ReceiveSequence) flushDeliver() {
 		)
 	}
 	endTransferProgress(progressObserver, progress, "deliver_end", true, nil)
-	for _, item := range items {
-		if ackLineageTraceEnabled && progressObserver != nil {
+	if ackLineageTraceEnabled && progressObserver != nil {
+		for _, item := range items {
 			// Batch events name only the first item. Preserve each identity
 			// after callback return, before cumulative ACK compression.
 			beginTransferProgress(progressObserver, TransferProgressEvent{
@@ -16262,18 +16398,28 @@ func (self *ReceiveSequence) flushDeliver() {
 				NoAck: !item.ack, TransportType: item.transportType, ByteCount: int(item.messageByteCount), Success: true,
 			}, nil)
 		}
-		if item.ack {
-			self.ackWindow.UpdateDelivered(sequenceAck{
-				receivedAtNanos:                  item.receivedAtNanos,
-				sequenceNumber:                   item.sequenceNumber,
-				messageId:                        item.messageId,
-				tag:                              item.tag,
-				compactContractRecoverySupported: true,
-				unwrapped:                        item.unwrapped,
-				transportType:                    item.transportType,
-			}, item.messageByteCount)
-		}
 	}
+	if !slices.ContainsFunc(items, func(item *receiveItem) bool { return item.ack }) {
+		return
+	}
+	// The callback delivered the whole batch. The ACK worker drains
+	// concurrently, so publish it at once: a hole filled by this batch is
+	// acknowledged at its last item, never by a stale intermediate head.
+	self.ackWindow.UpdateDeliveredPrefix(func() {
+		for _, item := range items {
+			if item.ack {
+				self.ackWindow.updateDeliveredWithLock(sequenceAck{
+					receivedAtNanos:                  item.receivedAtNanos,
+					sequenceNumber:                   item.sequenceNumber,
+					messageId:                        item.messageId,
+					tag:                              item.tag,
+					compactContractRecoverySupported: true,
+					unwrapped:                        item.unwrapped,
+					transportType:                    item.transportType,
+				}, item.messageByteCount)
+			}
+		}
+	})
 }
 
 // deliverEncryptedControlFrames splits an incoming Pack's frames: any

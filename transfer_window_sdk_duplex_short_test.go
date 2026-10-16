@@ -19,11 +19,15 @@ func TestWindowPathSdkRetainedDeviceDuplexShort(t *testing.T) {
 			continue
 		}
 		selected++
-		checkWindowSdkCell(t, windowPathCell{
+		cell := windowPathCell{
 			SenderProfile: &profiles[1], ReceiverProfile: profile,
 			ProfileFixtureSha256: digest, Bidirectional: true,
 			RoundTrip: 300 * time.Microsecond, Flows: 1, RoundRobinOffer: true,
 			Payload: 1280, Rate: 125000000,
+		}
+		t.Run(windowSdkCellName(profiles, cell), func(t *testing.T) {
+			windowPathParallel(t)
+			checkWindowSdkCell(t, cell)
 		})
 	}
 	if selected != 2 {

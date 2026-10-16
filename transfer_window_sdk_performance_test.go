@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
-	"testing/synctest"
 	"time"
 )
 
@@ -149,34 +148,108 @@ func TestWindowSdkProfilesMatchConstructorMessageLimit(t *testing.T) {
 	}
 }
 
+// The process profile sends forward rows at a 300 µs feedback delay.
+func TestWindowPathSdkProfilesForwardShort(t *testing.T) {
+	checkWindowSdkProfileRows(t, false, 300*time.Microsecond)
+}
+
+// The process profile sends forward rows at a 100 ms feedback delay.
+func TestWindowPathSdkProfilesForwardMedium(t *testing.T) {
+	checkWindowSdkProfileRows(t, false, 100*time.Millisecond)
+}
+
+// The process profile sends forward rows at a 400 ms feedback delay.
+func TestWindowPathSdkProfilesForwardLong(t *testing.T) {
+	checkWindowSdkProfileRows(t, false, 400*time.Millisecond)
+}
+
+// Each constructor sends reverse rows at a 300 µs feedback delay.
+func TestWindowPathSdkProfilesReverseShort(t *testing.T) {
+	checkWindowSdkProfileRows(t, true, 300*time.Microsecond)
+}
+
+// Each constructor sends reverse rows at a 100 ms feedback delay.
+func TestWindowPathSdkProfilesReverseMedium(t *testing.T) {
+	checkWindowSdkProfileRows(t, true, 100*time.Millisecond)
+}
+
+// Each constructor sends reverse rows at a 400 ms feedback delay.
+func TestWindowPathSdkProfilesReverseLong(t *testing.T) {
+	checkWindowSdkProfileRows(t, true, 400*time.Millisecond)
+}
+
 // Cover every three-way interaction of constructor, direction, feedback delay
 // and sharing, plus all explicit h1 senders and constrained startup boundaries.
 // Each row runs its full constrained ceiling and delivery-paced worker arms.
-func TestWindowPathSdkProfiles(t *testing.T) {
+// The six tests above split the rows by direction and feedback delay so no
+// test carries the whole sweep; TestWindowPathSdkMatrixCoverage proves they
+// run every row exactly once. The server-to-itself row is a forward row.
+func checkWindowSdkProfileRows(t *testing.T, reverse bool, roundTrip time.Duration) {
+	t.Helper()
 	assertMessagePoolOwnership(t)
 	profiles, digest := windowSdkProfiles(t)
+	rows := 0
 	for _, cell := range windowSdkProfileCells(profiles, digest) {
-		checkWindowSdkCell(t, cell)
+		if (cell.SenderProfile != &profiles[1]) != reverse || cell.RoundTrip != roundTrip {
+			continue
+		}
+		rows++
+		t.Run(windowSdkCellName(profiles, cell), func(t *testing.T) {
+			windowPathParallel(t)
+			checkWindowSdkCell(t, cell)
+		})
 	}
+	if rows == 0 {
+		t.Fatalf("no SDK profile rows for reverse=%t rtt=%s", reverse, roundTrip)
+	}
+}
+
+// Constructor names repeat across policies and roles; fixture indices do not.
+func windowSdkCellName(profiles []windowPathEndpointProfile, cell windowPathCell) string {
+	index := func(profile *windowPathEndpointProfile) int {
+		for i := range profiles {
+			if &profiles[i] == profile {
+				return i
+			}
+		}
+		return -1
+	}
+	return fmt.Sprintf("sender=%d/receiver=%d/rtt=%s/flows=%d", index(cell.SenderProfile), index(cell.ReceiverProfile), cell.RoundTrip, cell.Flows)
+}
+
+// Explicit h1 constructors receive and send at once at a 300 µs feedback delay.
+func TestWindowPathSdkBidirectionalShort(t *testing.T) {
+	checkWindowSdkBidirectional(t, 300*time.Microsecond)
+}
+
+// Explicit h1 constructors receive and send at once at a 100 ms feedback delay.
+func TestWindowPathSdkBidirectionalMedium(t *testing.T) {
+	checkWindowSdkBidirectional(t, 100*time.Millisecond)
+}
+
+// Explicit h1 constructors receive and send at once at a 400 ms feedback delay.
+func TestWindowPathSdkBidirectionalLong(t *testing.T) {
+	checkWindowSdkBidirectional(t, 400*time.Millisecond)
 }
 
 // Both serialized directions carry data and their peer's compressed ACKs.
 // The same constrained endpoint must keep both directions moving at once.
-func TestWindowPathSdkBidirectional(t *testing.T) {
+// The three tests above split every explicit h1 row by feedback delay.
+func checkWindowSdkBidirectional(t *testing.T, roundTrip time.Duration) {
+	t.Helper()
 	assertMessagePoolOwnership(t)
 	profiles, digest := windowSdkProfiles(t)
 	for _, profile := range profiles {
 		if !profile.ExplicitH1 {
 			continue
 		}
-		for _, roundTrip := range []time.Duration{300 * time.Microsecond, 100 * time.Millisecond, 400 * time.Millisecond} {
-			for _, flows := range []int{1, 8} {
-				t.Run(fmt.Sprintf("%s/providing=%t/rtt=%s/flows=%d", profile.Name, profile.Providing, roundTrip, flows), func(t *testing.T) {
-					checkWindowSdkCell(t, windowPathCell{SenderProfile: &profiles[1], ReceiverProfile: &profile,
-						ProfileFixtureSha256: digest, Bidirectional: true, RoundTrip: roundTrip,
-						Upload: flows == 8, Flows: flows, RoundRobinOffer: true, Payload: 1280, Rate: 125000000})
-				})
-			}
+		for _, flows := range []int{1, 8} {
+			t.Run(fmt.Sprintf("%s/providing=%t/rtt=%s/flows=%d", profile.Name, profile.Providing, roundTrip, flows), func(t *testing.T) {
+				windowPathParallel(t)
+				checkWindowSdkCell(t, windowPathCell{SenderProfile: &profiles[1], ReceiverProfile: &profile,
+					ProfileFixtureSha256: digest, Bidirectional: true, RoundTrip: roundTrip,
+					Upload: flows == 8, Flows: flows, RoundRobinOffer: true, Payload: 1280, Rate: 125000000})
+			})
 		}
 	}
 }
@@ -200,20 +273,12 @@ func checkWindowSdkCell(t *testing.T, cell windowPathCell) {
 	if float64(limit)/residence.Seconds() < float64(cell.Rate)/2 {
 		duration = max(duration, 20*residence)
 	}
-	var reference, candidate windowPathReading
-	for _, arm := range []string{"ceiling", "delivery"} {
-		synctest.Test(t, func(t *testing.T) {
-			trial := cell
-			trial.Arm, trial.Drop = arm, arm == "delivery"
-			reading := measureWindowPathCell(t, trial, duration)
-			logWindowServiceReading(t, reading)
-			if arm == "ceiling" {
-				reference = reading
-			} else {
-				candidate = reading
-			}
-		})
-	}
+	readings := measureWindowPathArms(t, duration, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
+		trial := cell
+		trial.Arm, trial.Drop = arm, arm == "delivery"
+		return trial
+	})
+	reference, candidate := readings[0], readings[1]
 	t.Logf("SDK sender=%s/%d/%t/%t receiver=%s/%d/%t/%t rtt=%s flows=%d both=%t reference=%.6f candidate=%.6f direction=%v/%v",
 		cell.SenderProfile.Name, cell.SenderProfile.ProcessBudget, cell.SenderProfile.MobilePolicy, cell.SenderProfile.Providing,
 		cell.ReceiverProfile.Name, cell.ReceiverProfile.ProcessBudget, cell.ReceiverProfile.MobilePolicy, cell.ReceiverProfile.Providing,

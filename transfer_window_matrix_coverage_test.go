@@ -3,6 +3,7 @@
 package connect
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -122,6 +123,13 @@ func TestWindowPathSdkMatrixCoverage(t *testing.T) {
 	}
 	roundTrips := []int{int(300 * time.Microsecond), int(100 * time.Millisecond), int(400 * time.Millisecond)}
 	assertWindowMatrixCoverage(t, rows, [][]int{profileDomain, {0, 1}, roundTrips, {1, 8}}, 3)
+	// The six SDK profile tests select rows by sender and these feedback
+	// delays; a row at any other delay would run in none of them.
+	for row := range physicalRows {
+		if !slices.Contains(roundTrips, row[2]) {
+			t.Fatalf("SDK row outside every profile test: sender=%d receiver=%d rtt=%s", row[0], row[1], time.Duration(row[2]))
+		}
+	}
 	for index, profile := range profiles {
 		startup := profile.MobilePolicy && (profile.Name == "sdk-provider-default" || !profile.Providing)
 		for _, roundTrip := range roundTrips {

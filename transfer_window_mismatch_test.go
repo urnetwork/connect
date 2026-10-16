@@ -55,8 +55,10 @@ func TestWindowMismatchRespectsBothEndpoints(t *testing.T) {
 func TestWindowPathWindowMismatchMatrix(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, cell := range windowMismatchMatrixCells() {
-		t.Logf("case: send=%d/receive=%d/rtt=%s/compression=%s/flows=%d", cell.SendWindow, cell.ReceiveWindow, cell.RoundTrip, cell.Compression, cell.Flows)
-		checkWindowMismatchCellWithMinimumDuration(t, cell, 100*time.Millisecond)
+		t.Run(fmt.Sprintf("send=%d/receive=%d/rtt=%s/compression=%s/flows=%d", cell.SendWindow, cell.ReceiveWindow, cell.RoundTrip, cell.Compression, cell.Flows), func(t *testing.T) {
+			windowPathParallel(t)
+			checkWindowMismatchCellWithMinimumDuration(t, cell, 100*time.Millisecond)
+		})
 	}
 }
 
@@ -94,8 +96,10 @@ func TestWindowPathWindowMismatchChanges(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, windows := range [][2]ByteCount{{kib(64), mib(2)}, {mib(2), kib(64)}} {
 		for _, compression := range []time.Duration{0, 10 * time.Millisecond, 50 * time.Millisecond} {
-			t.Logf("case: %s", fmt.Sprintf("receive=%d-to-%d/compression=%s", windows[0], windows[1], compression))
-			checkWindowMismatchCell(t, windowPathCell{SendWindow: mib(48), ReceiveWindow: windows[0], ReceiveWindowAfter: windows[1], WindowChangeAfter: 2 * time.Second, Warmup: 4 * time.Second, RoundTrip: 100 * time.Millisecond, Compression: compression, Flows: 8, Rate: 12500000})
+			t.Run(fmt.Sprintf("receive=%d-to-%d/compression=%s", windows[0], windows[1], compression), func(t *testing.T) {
+				windowPathParallel(t)
+				checkWindowMismatchCell(t, windowPathCell{SendWindow: mib(48), ReceiveWindow: windows[0], ReceiveWindowAfter: windows[1], WindowChangeAfter: 2 * time.Second, Warmup: 4 * time.Second, RoundTrip: 100 * time.Millisecond, Compression: compression, Flows: 8, Rate: 12500000})
+			})
 		}
 	}
 }
@@ -118,7 +122,6 @@ func checkWindowMismatchCellWithMinimumDuration(t *testing.T, cell windowPathCel
 	if cell.ReceiveWindowAfter > 0 {
 		finalReceive = cell.ReceiveWindowAfter
 	}
-	var ceiling, fixed windowPathReading
 	duration := max(minimumDuration, 2*cell.RoundTrip)
 	residence := cell.RoundTrip + cell.Compression
 	windowRate := float64(min(cell.SendWindow, finalReceive)) / residence.Seconds()
@@ -127,25 +130,32 @@ func checkWindowMismatchCellWithMinimumDuration(t *testing.T, cell windowPathCel
 		// flight's phase at the measurement edge below five percent.
 		duration = max(duration, 20*residence)
 	}
-	for _, arm := range []string{"ceiling", "delivery"} {
-		started := time.Now()
-		synctest.Test(t, func(t *testing.T) {
-			trial := cell
-			trial.Arm, trial.Drop = arm, arm == "delivery"
-			if arm == "ceiling" {
-				trial.CalibrationWindow = min(cell.SendWindow, finalReceive)
-				trial.ReceiveWindow, trial.ReceiveWindowAfter = finalReceive, 0
-			}
-			reading := measureWindowPathCell(t, trial, duration, observe...)
-			logWindowServiceReading(t, reading)
-			if arm == "ceiling" {
-				ceiling = reading
-			} else {
-				fixed = reading
-			}
-		})
-		t.Logf("mismatch arm=%s wall-elapsed=%s", arm, time.Since(started))
+	trial := func(arm string) windowPathCell {
+		trial := cell
+		trial.Arm, trial.Drop = arm, arm == "delivery"
+		if arm == "ceiling" {
+			trial.CalibrationWindow = min(cell.SendWindow, finalReceive)
+			trial.ReceiveWindow, trial.ReceiveWindowAfter = finalReceive, 0
+		}
+		return trial
 	}
+	arms := []string{"ceiling", "delivery"}
+	var readings []windowPathReading
+	if len(observe) == 0 {
+		readings = measureWindowPathArms(t, duration, arms, trial)
+	} else {
+		// An observer follows both arms through one set of hooks, in order.
+		readings = make([]windowPathReading, len(arms))
+		for i, arm := range arms {
+			started := time.Now()
+			synctest.Test(t, func(t *testing.T) {
+				readings[i] = measureWindowPathCell(t, trial(arm), duration, observe...)
+				logWindowServiceReading(t, readings[i])
+			})
+			t.Logf("mismatch arm=%s wall-elapsed=%s", arm, time.Since(started))
+		}
+	}
+	ceiling, fixed := readings[0], readings[1]
 	t.Logf("mismatch send=%d receive=%d final-receive=%d rtt=%s compression=%s flows=%d ceiling=%.3f fixed=%.3f min-flow=%.3f model Mb/s window=%d pace=%d drops=%d/%d", cell.SendWindow, cell.ReceiveWindow, finalReceive, cell.RoundTrip, cell.Compression, cell.Flows, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.Window.Window, fixed.Window.PacingByteRate, fixed.RelayDrops, fixed.MeasurementRelayDrops)
 	if ceiling.Mbps < .85*min(float64(cell.Rate), windowRate)*8/1e6 || fixed.Mbps < .90*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.Window.Window > min(cell.SendWindow, finalReceive) || fixed.MeasurementRelayDrops != 0 || fixed.Receiver.ReceiveQueueDropCount != 0 || fixed.Receiver.ReceiveQueueEvictionCount != 0 {
 		t.Error("mismatched windows lost attainable capacity, violated a limit, dropped data or stalled a flow")

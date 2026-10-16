@@ -4,6 +4,7 @@ package connect
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 	"testing"
@@ -462,30 +463,38 @@ func TestWindowPacingDelayedWakeKeepsService(t *testing.T) {
 
 // The end-to-end virtual link continues serializing while only the sender's
 // pacing timer dispatch is delayed. Keep finite queue and per-flow checks.
+// The constant-window ceiling never paces, so no wake delay can reach it: one
+// ceiling per path runs at the largest delay and proves no delayed wake.
 func TestWindowPathServiceDelayedPacingWake(t *testing.T) {
 	assertMessagePoolOwnership(t)
-	for _, delay := range []time.Duration{time.Millisecond, 3 * time.Millisecond} {
-		for _, rtt := range []time.Duration{300 * time.Microsecond, 100 * time.Millisecond} {
-			for _, flows := range []int{1, 8} {
-				var ceiling, candidate windowPathReading
-				for _, arm := range []string{"ceiling", "delivery"} {
-					synctest.Test(t, func(t *testing.T) {
-						reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: rtt, Compression: 10 * time.Millisecond,
-							Flows: flows, RoundRobinOffer: true, Payload: 16384, Budget: mib(48), Rate: 125000000,
-							Drop: arm == "delivery", Warmup: time.Second + 5*rtt, PacingWakeDelay: delay}, 2*time.Second)
-						logWindowServiceReading(t, reading)
-						if arm == "ceiling" {
-							ceiling = reading
-						} else {
-							candidate = reading
-						}
-					})
+	delays := []time.Duration{time.Millisecond, 3 * time.Millisecond}
+	for _, rtt := range []time.Duration{300 * time.Microsecond, 100 * time.Millisecond} {
+		for _, flows := range []int{1, 8} {
+			t.Run(fmt.Sprintf("rtt=%s/flows=%d", rtt, flows), func(t *testing.T) {
+				windowPathParallel(t)
+				reference := windowPathCell{Arm: "ceiling", RoundTrip: rtt, Compression: 10 * time.Millisecond,
+					Flows: flows, RoundRobinOffer: true, Payload: 16384, Budget: mib(48), Rate: 125000000,
+					Warmup: time.Second + 5*rtt, PacingWakeDelay: delays[len(delays)-1]}
+				arms, trials := []string{"ceiling"}, map[string]windowPathCell{"ceiling": reference}
+				for _, delay := range delays {
+					arm, trial := fmt.Sprintf("delivery/wake=%s", delay), reference
+					trial.Arm, trial.PacingWakeDelay, trial.Drop = "delivery", delay, true
+					arms, trials[arm] = append(arms, arm), trial
 				}
-				if candidate.Mbps < .9*ceiling.Mbps || candidate.MinFlowMbps == 0 || candidate.MeasurementRelayDrops != 0 {
-					t.Errorf("pacing wake delay=%s RTT=%s flows=%d: reference=%.3f candidate=%.3f minimum=%.3f measured-drops=%d",
-						delay, rtt, flows, ceiling.Mbps, candidate.Mbps, candidate.MinFlowMbps, candidate.MeasurementRelayDrops)
+				readings := measureWindowPathArms(t, 2*time.Second, arms, func(arm string) windowPathCell { return trials[arm] })
+				ceiling := readings[0]
+				if ceiling.DelayedPacingWakes != 0 {
+					t.Fatalf("RTT=%s flows=%d: a wake delay reached the constant-window ceiling %d times", rtt, flows, ceiling.DelayedPacingWakes)
 				}
-			}
+				for i, delay := range delays {
+					candidate := readings[i+1]
+					if candidate.Mbps < .9*ceiling.Mbps || candidate.MinFlowMbps == 0 || candidate.MeasurementRelayDrops != 0 ||
+						candidate.DelayedPacingWakes == 0 {
+						t.Errorf("pacing wake delay=%s RTT=%s flows=%d: reference=%.3f candidate=%.3f minimum=%.3f measured-drops=%d delayed-wakes=%d",
+							delay, rtt, flows, ceiling.Mbps, candidate.Mbps, candidate.MinFlowMbps, candidate.MeasurementRelayDrops, candidate.DelayedPacingWakes)
+					}
+				}
+			})
 		}
 	}
 }

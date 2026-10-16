@@ -359,6 +359,42 @@ type transferWriteDisposition struct {
 	// Reuse the selector's existing deadline clock for the uncommon blocked
 	// case instead of surrounding every ACK write with another pair of reads.
 	initialWaitDuration time.Duration
+	// Failure-only evidence leaves the existing successful-write fields alone.
+	failureKind             transferWriteFailureKind
+	failureInitiallyBlocked bool
+	failureWaitDuration     time.Duration
+}
+
+// The selected failure branch, not a later context check, owns this classification.
+type transferWriteFailureKind uint8
+
+const (
+	transferWriteFailureNone transferWriteFailureKind = iota
+	transferWriteFailureRouteTimeout
+	transferWriteFailureCallerCanceled
+	transferWriteFailureCallerDeadline
+	transferWriteFailureSelectorClosed
+	transferWriteFailureOther
+)
+
+// Preserves the failed attempt's wait without changing error or payload ownership.
+func failedTransferWriteDisposition(kind transferWriteFailureKind, enterTime time.Time, blocked bool) transferWriteDisposition {
+	disposition := transferWriteDisposition{
+		failureKind:             kind,
+		failureInitiallyBlocked: blocked,
+	}
+	if blocked {
+		disposition.failureWaitDuration = time.Since(enterTime)
+	}
+	return disposition
+}
+
+// Called only after selecting the caller's done branch; selector closure is separate.
+func transferWriteCallerFailure(ctx context.Context) transferWriteFailureKind {
+	if ctx.Err() == context.DeadlineExceeded {
+		return transferWriteFailureCallerDeadline
+	}
+	return transferWriteFailureCallerCanceled
 }
 
 // A policy mismatch consumes no share and performs no dispatch observation.
@@ -3006,7 +3042,7 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicyGeneration(
 	initialSnapshot := self.acquireWriterSnapshot()
 	if checkGeneration && initialSnapshot.generation != generation {
 		initialSnapshot.releaseWriter()
-		return false, transferWriteDisposition{}, errTransferRoutePolicyChanged
+		return false, failedTransferWriteDisposition(transferWriteFailureOther, enterTime, false), errTransferRoutePolicyChanged
 	}
 	if beforeWrite != nil {
 		beforeWrite()
@@ -3037,7 +3073,11 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicyGeneration(
 	// Refuse before their timer lock so a congested destination cannot park
 	// a shared provider UDP worker behind a blocking reliable write.
 	if timeout == 0 {
-		return false, transferWriteDisposition{}, nil
+		// Refusal is not a queue wait; do not add a clock read on this hot path.
+		return false, transferWriteDisposition{
+			failureKind:             transferWriteFailureRouteTimeout,
+			failureInitiallyBlocked: true,
+		}, nil
 	}
 
 	self.writeMutex.Lock()
@@ -3069,7 +3109,7 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicyGeneration(
 		snapshot := self.acquireWriterSnapshot()
 		if checkGeneration && snapshot.generation != generation {
 			snapshot.releaseWriter()
-			return false, transferWriteDisposition{}, errTransferRoutePolicyChanged
+			return false, failedTransferWriteDisposition(transferWriteFailureOther, enterTime, true), errTransferRoutePolicyChanged
 		}
 		if beforeWrite != nil {
 			beforeWrite()
@@ -3121,16 +3161,16 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicyGeneration(
 			var expired bool
 			if timeoutChan, expired = timeoutChannel(); expired {
 				snapshot.releaseWriter()
-				return false, transferWriteDisposition{}, nil
+				return false, failedTransferWriteDisposition(transferWriteFailureRouteTimeout, enterTime, true), nil
 			}
 			var selectedRoute Route
 			select {
 			case <-ctx.Done():
 				snapshot.releaseWriter()
-				return false, transferWriteDisposition{}, errors.New("Context done")
+				return false, failedTransferWriteDisposition(transferWriteCallerFailure(ctx), enterTime, true), errors.New("Context done")
 			case <-self.ctx.Done():
 				snapshot.releaseWriter()
-				return false, transferWriteDisposition{}, errors.New("Done")
+				return false, failedTransferWriteDisposition(transferWriteFailureSelectorClosed, enterTime, true), errors.New("Done")
 			case <-notify:
 				// new routes, try again
 				snapshot.releaseWriter()
@@ -3141,7 +3181,7 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicyGeneration(
 				selectedRoute = route1
 			case <-timeoutChan:
 				snapshot.releaseWriter()
-				return false, transferWriteDisposition{}, nil
+				return false, failedTransferWriteDisposition(transferWriteFailureRouteTimeout, enterTime, true), nil
 			}
 			self.updateSendStats(selectedRoute, 1, ByteCount(len(transferFrameBytes)), time.Since(enterTime))
 			snapshot.observeDirectAffinityWrite(selectedRoute)
@@ -3217,18 +3257,18 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicyGeneration(
 			case contextDoneIndex:
 				snapshot.releaseWriter()
 				// MessagePoolReturn(transferFrameBytes)
-				return false, transferWriteDisposition{}, errors.New("Context done")
+				return false, failedTransferWriteDisposition(transferWriteCallerFailure(ctx), enterTime, true), errors.New("Context done")
 			case doneIndex:
 				snapshot.releaseWriter()
 				// MessagePoolReturn(transferFrameBytes)
-				return false, transferWriteDisposition{}, errors.New("Done")
+				return false, failedTransferWriteDisposition(transferWriteFailureSelectorClosed, enterTime, true), errors.New("Done")
 			case transportUpdateIndex:
 				snapshot.releaseWriter()
 				// new routes, try again
 			case timeoutIndex:
 				snapshot.releaseWriter()
 				// MessagePoolReturn(transferFrameBytes)
-				return false, transferWriteDisposition{}, nil
+				return false, failedTransferWriteDisposition(transferWriteFailureRouteTimeout, enterTime, true), nil
 			default:
 				// a route
 				routeIndex := chosenIndex - routeStartIndex

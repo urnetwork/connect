@@ -31,6 +31,15 @@ func newAckGapTestSequence(
 	t *testing.T,
 	configure func(settings *ReceiveBufferSettings),
 ) *ackGapTestSequence {
+	return newAckGapTestSequenceWithClientSettings(t, configure, nil)
+}
+
+// Applies opt-in construction settings before the real client starts its workers.
+func newAckGapTestSequenceWithClientSettings(
+	t *testing.T,
+	configure func(settings *ReceiveBufferSettings),
+	configureClient func(settings *ClientSettings),
+) *ackGapTestSequence {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -38,6 +47,9 @@ func newAckGapTestSequence(
 	clientSettings.Log = NewNoopLogger()
 	clientSettings.EncryptionSettings.Mode = EncryptionModeOff
 	clientSettings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+	if configureClient != nil {
+		configureClient(clientSettings)
+	}
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), clientSettings)
 	t.Cleanup(func() {
 		cancel()

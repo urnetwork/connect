@@ -28,6 +28,7 @@ func TestWindowPathSdkDuplexShortDispatchPhases(t *testing.T) {
 				release = profile.first + offset
 			}
 			t.Run(fmt.Sprintf("%s/flows=%d/initial-ack=%s", profiles[profile.index].Name, profile.flows, release), func(t *testing.T) {
+				windowPathParallel(t)
 				checkWindowSdkCell(t, windowPathCell{
 					SenderProfile: &profiles[1], ReceiverProfile: &profiles[profile.index], ProfileFixtureSha256: digest,
 					Bidirectional: true, Upload: profile.flows == 8, RoundTrip: 300 * time.Microsecond,

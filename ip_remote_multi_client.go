@@ -1971,6 +1971,41 @@ func (self *RemoteUserNatMultiClient) MemorySnapshot() MultiClientMemorySnapshot
 	return snapshot
 }
 
+// Owner-lifetime diagnostic evidence, distinct from MemorySnapshot's live clients.
+// A retired client's final callbacks retain the same bounded window counters.
+func (self *RemoteUserNatMultiClient) AckRouteWriteLifetimeFailures() (quality, speed *AckRouteWriteFailureStatsSnapshot) {
+	if self == nil {
+		return nil, nil
+	}
+	if window := self.windows[WindowTypeQuality]; window != nil {
+		quality = window.ackRouteWriteFailures.load(false).snapshot()
+	}
+	if window := self.windows[WindowTypeSpeed]; window != nil {
+		speed = window.ackRouteWriteFailures.load(false).snapshot()
+	}
+	return quality, speed
+}
+
+// Lazily owns one fixed counter set only for opted-in clients. The mutex is
+// construction/snapshot-only; packet callbacks retain the immutable pointer.
+type ackRouteWriteFailureOwner struct {
+	stateLock sync.Mutex
+	counters  *ackRouteWriteFailureCounters
+}
+
+// Concurrent constructors share one counter set; disabled callers never create it.
+func (self *ackRouteWriteFailureOwner) load(create bool) *ackRouteWriteFailureCounters {
+	if self == nil {
+		return nil
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if create && self.counters == nil {
+		self.counters = &ackRouteWriteFailureCounters{}
+	}
+	return self.counters
+}
+
 // ServerNameLookup resolves a destination IP to the server name(s) previously observed
 // for it — e.g. a DNS upgrade mux that recorded which hostnames resolved to the IP. The
 // multi-client uses it for ServerName-based path affinity, so flows to the same site
@@ -10747,10 +10782,11 @@ func degradedWindowTarget(targetWindowSize int, clientCount int, degraded bool) 
 }
 
 type multiClientWindow struct {
-	ctx                context.Context
-	cancel             context.CancelFunc
-	log                Logger
-	providerEvaluation providerEvaluationState
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	log                   Logger
+	providerEvaluation    providerEvaluationState
+	ackRouteWriteFailures ackRouteWriteFailureOwner
 
 	// Consecutive platform rate limits across ALL expanders in this window.
 	// Shared deliberately: the herd is the problem, so the backoff has to be a
@@ -12968,6 +13004,7 @@ requestCandidates:
 			// the batch delivery seam rides the args so the channel
 			// constructor signature stays put (nil falls back per-packet)
 			args.ReceivePackets = self.clientReceivePacketsCallback
+			args.ackRouteWriteFailureOwner = &self.ackRouteWriteFailures
 			args.NetworkPeerDestination = self.networkPeerDestination
 			args.contractStatus = self.contractStatusFromClient
 			args.providerPolicyPreference = self.providerPolicyPreference
@@ -14013,6 +14050,7 @@ func (self *multiClientWindow) removeClients(removedClients ...*multiClientChann
 
 type multiClientChannelArgs struct {
 	MultiClientGeneratorClientArgs
+	ackRouteWriteFailureOwner *ackRouteWriteFailureOwner
 	// A fixed destination offer owns no identity until expand accepts it.
 	// Only the receiving expansion mutates this after the unbuffered handoff.
 	deferredClientArgs bool
@@ -14619,6 +14657,9 @@ func newMultiClientChannel(
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	clientSettings := generator.NewClientSettings()
+	if clientSettings.EnableAckRouteWriteDiagnostics {
+		clientSettings.ackRouteWriteFailureOwner = args.ackRouteWriteFailureOwner.load(true)
+	}
 	clientSettings.SendBufferSettings.AckTimeout = settings.AckTimeout
 	clientSettings.SendBufferSettings.providerEvaluation = args.providerEvaluation
 	// This client is dedicated to the selected destination. Stamp every send

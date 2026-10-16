@@ -20,10 +20,14 @@ func TestWindowPathRetainedSdkCumulativePacingShort(t *testing.T) {
 		}
 		selected++
 		for _, flows := range []int{1, 8} {
-			checkWindowSdkCell(t, windowPathCell{
+			cell := windowPathCell{
 				SenderProfile: profile, ReceiverProfile: &profiles[1],
 				ProfileFixtureSha256: digest, RoundTrip: 300 * time.Microsecond,
 				Flows: flows, RoundRobinOffer: true, Payload: 1280, Rate: 125000000,
+			}
+			t.Run(windowSdkCellName(profiles, cell), func(t *testing.T) {
+				windowPathParallel(t)
+				checkWindowSdkCell(t, cell)
 			})
 		}
 	}
@@ -43,10 +47,14 @@ func TestWindowPathRetainedSdkCumulativePacingLong(t *testing.T) {
 			continue
 		}
 		for _, roundTrip := range []time.Duration{100 * time.Millisecond, 400 * time.Millisecond} {
-			checkWindowSdkCell(t, windowPathCell{
+			cell := windowPathCell{
 				SenderProfile: profile, ReceiverProfile: &profiles[1],
 				ProfileFixtureSha256: digest, RoundTrip: roundTrip,
 				Flows: 1, RoundRobinOffer: true, Payload: 1280, Rate: 125000000,
+			}
+			t.Run(windowSdkCellName(profiles, cell), func(t *testing.T) {
+				windowPathParallel(t)
+				checkWindowSdkCell(t, cell)
 			})
 		}
 		return

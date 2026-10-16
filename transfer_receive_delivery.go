@@ -266,19 +266,31 @@ func (q *receiveDeliveryQueue) advanceLocked(changed *receiveDeliveryReceipt) []
 		q.items[len(q.items)-1] = nil
 		q.items = q.items[:len(q.items)-1]
 	}
+	// One completion can secure a run of receipts at once, when an earlier
+	// owner finishes after later ones. The ACK worker drains concurrently, so
+	// publish the run at once, as flushDeliver publishes a delivered batch.
+	run := q.items
+	secured := 0
 	for len(q.items) > 0 && q.items[0].secured {
 		r := q.items[0]
-		q.items[0] = nil
 		q.items = q.items[1:]
+		secured++
 		q.removeChargeLocked(r)
 		if ackLineageTraceEnabled {
 			q.traceReceiptLocked(r, "delivery_receipt_prefix", true)
 		}
-		q.sequence.ackWindow.UpdateDelivered(r.ack, r.messageBytes)
 		if r.item != nil {
 			returns = append(returns, r.item)
 			r.item = nil
 		}
+	}
+	if 0 < secured {
+		q.sequence.ackWindow.UpdateDeliveredPrefix(func() {
+			for _, r := range run[:secured] {
+				q.sequence.ackWindow.updateDeliveredWithLock(r.ack, r.messageBytes)
+			}
+		})
+		clear(run[:secured])
 	}
 	return returns
 }

@@ -91,7 +91,7 @@ func checkTunDuplexOwnedAdmission(t *testing.T, batch, userOwned, payload bool) 
 		t.Fatal("one-slot outbound fixture failed to fill")
 	}
 	admission := newSendPackAdmission(1)
-	if acquired, _, _ := admission.tryAcquire(sendSchedulingKey{}); !acquired {
+	if acquired, _, _ := admission.tryAcquire(sendSchedulingKey{}, false); !acquired {
 		t.Fatal("admission fixture failed to fill")
 	}
 	sequence := &SendSequence{ctx: ctx, packAdmission: admission}

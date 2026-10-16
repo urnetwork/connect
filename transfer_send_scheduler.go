@@ -1,6 +1,9 @@
 package connect
 
-import "sync"
+import (
+	"slices"
+	"sync"
+)
 
 // sendSchedulingKey keeps the exact five-tuple local. The scheduler consumes
 // it before assigning sequence numbers; after logical-lane negotiation, only
@@ -27,13 +30,32 @@ func scheduleIpFlow(ipPath *IpPath) sendSchedulingKeyOption {
 // while SendSequence drains its channel into per-flow queues. One valid IP
 // flow may occupy at most capacity-1 slots, leaving one admission for a newly
 // active flow. A capacity of one retains the ordinary one-item behavior.
+//
+// Blocked senders wait in arrival order, and a release grants its slot to the
+// oldest waiter it fits before any woken goroutine runs. Waking every waiter
+// to race for the slot let the runtime pick the winner: with no idle
+// processor it runs a woken group's oldest waiter first, which took the slot
+// and waited again ahead of the siblings it beat, so one of many senders won
+// every slot. A waiter whose flow is at its limit keeps its place while a
+// later waiter of another flow takes the slot. No queued waiter fits a free
+// slot, so a sender that fits one takes it at once without passing anyone.
+//
+// Safe for concurrent use.
 type sendPackAdmission struct {
 	mutex    sync.Mutex
 	capacity int
 	count    int
 	byKey    map[sendSchedulingKey]int
-	notify   chan struct{}
+	waiters  []*sendPackAdmissionWaiter
 	closed   bool
+}
+
+// One blocked acquire. A grant sets granted under the admission mutex before
+// ready closes; close closes ready without a grant.
+type sendPackAdmissionWaiter struct {
+	key     sendSchedulingKey
+	ready   chan struct{}
+	granted bool
 }
 
 func newSendPackAdmission(capacity int) *sendPackAdmission {
@@ -43,30 +65,43 @@ func newSendPackAdmission(capacity int) *sendPackAdmission {
 	return &sendPackAdmission{
 		capacity: capacity,
 		byKey:    map[sendSchedulingKey]int{},
-		notify:   make(chan struct{}),
 	}
 }
 
-// tryAcquire returns a level snapshot and the generation notification a
-// blocked caller should wait on before retrying.
-func (self *sendPackAdmission) tryAcquire(
-	key sendSchedulingKey,
-) (acquired bool, closed bool, notify <-chan struct{}) {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	if self.closed {
-		return false, true, self.notify
-	}
+// Takes a slot for key when one fits it.
+func (self *sendPackAdmission) tryTakeWithLock(key sendSchedulingKey) bool {
 	keyLimit := self.capacity
 	if key.valid && 1 < keyLimit {
 		keyLimit -= 1
 	}
-	if self.count < self.capacity && self.byKey[key] < keyLimit {
-		self.count += 1
-		self.byKey[key] += 1
-		return true, false, self.notify
+	if self.capacity <= self.count || keyLimit <= self.byKey[key] {
+		return false
 	}
-	return false, false, self.notify
+	self.count += 1
+	self.byKey[key] += 1
+	return true
+}
+
+// Takes a slot that fits key. Otherwise, when wait is set and admission is
+// open, queues a waiter behind every earlier one, and the caller must either
+// receive from its ready channel or abandon it.
+func (self *sendPackAdmission) tryAcquire(
+	key sendSchedulingKey,
+	wait bool,
+) (acquired bool, closed bool, waiter *sendPackAdmissionWaiter) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.closed {
+		return false, true, nil
+	}
+	if self.tryTakeWithLock(key) {
+		return true, false, nil
+	}
+	if wait {
+		waiter = &sendPackAdmissionWaiter{key: key, ready: make(chan struct{})}
+		self.waiters = append(self.waiters, waiter)
+	}
+	return false, false, waiter
 }
 
 // An immediate whole-group write cannot overtake an earlier admitted Pack.
@@ -82,14 +117,15 @@ func (self *sendPackAdmission) tryAcquireEmpty(key sendSchedulingKey) bool {
 	return true
 }
 
-func (self *sendPackAdmission) broadcastWithLock() {
-	close(self.notify)
-	self.notify = make(chan struct{})
-}
-
 func (self *sendPackAdmission) release(key sendSchedulingKey) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
+	self.releaseWithLock(key)
+}
+
+// Frees one slot of key and grants it to the oldest waiter it fits. A freed
+// slot fits at most one waiter, because none fit before it was freed.
+func (self *sendPackAdmission) releaseWithLock(key sendSchedulingKey) {
 	if self.byKey[key] <= 0 || self.count <= 0 {
 		return
 	}
@@ -98,7 +134,28 @@ func (self *sendPackAdmission) release(key sendSchedulingKey) {
 	if self.byKey[key] == 0 {
 		delete(self.byKey, key)
 	}
-	self.broadcastWithLock()
+	for index, waiter := range self.waiters {
+		if self.tryTakeWithLock(waiter.key) {
+			waiter.granted = true
+			close(waiter.ready)
+			self.waiters = slices.Delete(self.waiters, index, index+1)
+			return
+		}
+	}
+}
+
+// Withdraws a waiter whose caller stopped waiting. A slot granted to it in the
+// meantime passes on as its release would, so no grant is lost.
+func (self *sendPackAdmission) abandon(waiter *sendPackAdmissionWaiter) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if waiter.granted {
+		self.releaseWithLock(waiter.key)
+		return
+	}
+	if index := slices.Index(self.waiters, waiter); 0 <= index {
+		self.waiters = slices.Delete(self.waiters, index, index+1)
+	}
 }
 
 func (self *sendPackAdmission) close() {
@@ -108,7 +165,10 @@ func (self *sendPackAdmission) close() {
 		return
 	}
 	self.closed = true
-	self.broadcastWithLock()
+	for _, waiter := range self.waiters {
+		close(waiter.ready)
+	}
+	self.waiters = nil
 }
 
 type sendPackFlowQueue struct {

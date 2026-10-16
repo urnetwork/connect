@@ -12,6 +12,11 @@ func windowDeterministicRoundTrips() []time.Duration {
 	return []time.Duration{300 * time.Microsecond, time.Millisecond, 2 * time.Millisecond, 5 * time.Millisecond, 10 * time.Millisecond, 25 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
 }
 
+// The short and deep-flight round trips keep full grids in every sweep.
+func windowDeterministicBoundary(roundTrip time.Duration) bool {
+	return roundTrip == 300*time.Microsecond || roundTrip == 400*time.Millisecond
+}
+
 // A parity cover pairs each interior round trip with both flow counts and
 // compression states. Both boundaries and explicit diagnostics keep full grids.
 func windowDeterministicPerformanceCells(roundTrips []time.Duration, exhaustive bool) []windowPathCell {
@@ -19,8 +24,7 @@ func windowDeterministicPerformanceCells(roundTrips []time.Duration, exhaustive 
 	for roundTripIndex, roundTrip := range roundTrips {
 		for flowIndex, flows := range []int{1, 8} {
 			for compressionIndex, compression := range []time.Duration{0, 10 * time.Millisecond} {
-				boundary := roundTrip == 300*time.Microsecond || roundTrip == 400*time.Millisecond
-				if !exhaustive && !boundary && compressionIndex != (roundTripIndex+flowIndex)%2 {
+				if !exhaustive && !windowDeterministicBoundary(roundTrip) && compressionIndex != (roundTripIndex+flowIndex)%2 {
 					continue
 				}
 				cells = append(cells, windowPathCell{RoundTrip: roundTrip, Compression: compression,

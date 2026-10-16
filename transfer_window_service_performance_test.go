@@ -160,25 +160,19 @@ func TestWindowPathFifoServiceChange(t *testing.T) {
 func TestWindowPathServicePerformanceMatrix(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, cell := range windowServicePerformanceCells() {
-		t.Logf("case: rate=%d/rtt=%s/flows=%d/compression=%s", cell.Rate, cell.RoundTrip, cell.Flows, cell.Compression)
-		var ceiling, fixed windowPathReading
-		for _, arm := range []string{"ceiling", "delivery"} {
-			synctest.Test(t, func(t *testing.T) {
+		t.Run(fmt.Sprintf("rate=%d/rtt=%s/flows=%d/compression=%s", cell.Rate, cell.RoundTrip, cell.Flows, cell.Compression), func(t *testing.T) {
+			windowPathParallel(t)
+			readings := measureWindowPathArms(t, max(time.Second, 2*cell.RoundTrip+4*cell.Compression), []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 				trial := cell
 				trial.Arm, trial.Drop = arm, arm == "delivery"
-				reading := measureWindowPathCell(t, trial, max(time.Second, 2*cell.RoundTrip+4*cell.Compression))
-				logWindowServiceReading(t, reading)
-				if arm == "ceiling" {
-					ceiling = reading
-				} else {
-					fixed = reading
-				}
+				return trial
 			})
-		}
-		t.Logf("service=%d rtt=%s flows=%d compression=%s ceiling=%.3f fixed=%.3f min-flow=%.3f model Mb/s drops=%d queue=%d/%d", cell.Rate, cell.RoundTrip, cell.Flows, cell.Compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops, fixed.MaxRelayQueued, fixed.MaxRelayQueuedBytes)
-		if ceiling.Mbps < .90*float64(cell.Rate)*8/1e6 || fixed.Mbps < .90*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 || fixed.MaxRelayQueued > 4096 || fixed.MaxRelayQueuedBytes > int64(mib(8)) {
-			t.Errorf("service pacing underfilled, stalled or exceeded a finite queue: %+v", fixed)
-		}
+			ceiling, fixed := readings[0], readings[1]
+			t.Logf("service=%d rtt=%s flows=%d compression=%s ceiling=%.3f fixed=%.3f min-flow=%.3f model Mb/s drops=%d queue=%d/%d", cell.Rate, cell.RoundTrip, cell.Flows, cell.Compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops, fixed.MaxRelayQueued, fixed.MaxRelayQueuedBytes)
+			if ceiling.Mbps < .90*float64(cell.Rate)*8/1e6 || fixed.Mbps < .90*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 || fixed.MaxRelayQueued > 4096 || fixed.MaxRelayQueuedBytes > int64(mib(8)) {
+				t.Errorf("service pacing underfilled, stalled or exceeded a finite queue: %+v", fixed)
+			}
+		})
 	}
 }
 
@@ -189,27 +183,21 @@ func TestWindowPathServiceCapacityChanges(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, rates := range [][2]ByteCount{{1250000, 12500000}, {12500000, 1250000}} {
 		for _, compression := range []time.Duration{0, 10 * time.Millisecond, 50 * time.Millisecond} {
-			t.Logf("case: %s", fmt.Sprintf("rate=%d-to-%d/compression=%s", rates[0], rates[1], compression))
-			var ceiling, fixed windowPathReading
-			for _, arm := range []string{"ceiling", "delivery"} {
-				synctest.Test(t, func(t *testing.T) {
+			t.Run(fmt.Sprintf("rate=%d-to-%d/compression=%s", rates[0], rates[1], compression), func(t *testing.T) {
+				windowPathParallel(t)
+				readings := measureWindowPathArms(t, time.Second, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 					cell := windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: compression, Flows: 8, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: rates[1], Warmup: 8 * time.Second}
 					if arm == "delivery" {
 						cell.Rate, cell.RateAfter, cell.RateChangeAfter, cell.Drop = rates[0], rates[1], 4*time.Second, true
 					}
-					reading := measureWindowPathCell(t, cell, time.Second)
-					logWindowServiceReading(t, reading)
-					if arm == "ceiling" {
-						ceiling = reading
-					} else {
-						fixed = reading
-					}
+					return cell
 				})
-			}
-			t.Logf("capacity %d->%d compression=%s ceiling=%.3f fixed=%.3f min-flow=%.3f model Mb/s drops=%d queue=%d/%d", rates[0], rates[1], compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops, fixed.MaxRelayQueued, fixed.MaxRelayQueuedBytes)
-			if fixed.Mbps < .90*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 || fixed.MaxRelayQueued > 4096 || fixed.MaxRelayQueuedBytes > int64(mib(8)) {
-				t.Errorf("service change did not converge within four seconds: %+v", fixed)
-			}
+				ceiling, fixed := readings[0], readings[1]
+				t.Logf("capacity %d->%d compression=%s ceiling=%.3f fixed=%.3f min-flow=%.3f model Mb/s drops=%d queue=%d/%d", rates[0], rates[1], compression, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops, fixed.MaxRelayQueued, fixed.MaxRelayQueuedBytes)
+				if fixed.Mbps < .90*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 || fixed.MaxRelayQueued > 4096 || fixed.MaxRelayQueuedBytes > int64(mib(8)) {
+					t.Errorf("service change did not converge within four seconds: %+v", fixed)
+				}
+			})
 		}
 	}
 }
@@ -223,25 +211,20 @@ func TestWindowPathServiceLargeMessages(t *testing.T) {
 		for _, rtt := range []time.Duration{300 * time.Microsecond, 100 * time.Millisecond} {
 			for _, flows := range []int{1, 8} {
 				for _, payload := range []int{16 * 1024, 64 * 1024} {
-					var ceiling, fixed windowPathReading
-					warmup := max(300*time.Millisecond+5*rtt, time.Duration(2*int64(mib(2))*int64(time.Second)/int64(rate))+5*rtt)
-					measurement := max(2*time.Second, time.Duration(64*int64(payload)*int64(time.Second)/int64(rate)))
-					for _, arm := range []string{"ceiling", "delivery"} {
-						synctest.Test(t, func(t *testing.T) {
-							reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: rtt, Compression: 10 * time.Millisecond,
-								Flows: flows, RoundRobinOffer: true, Payload: payload, Budget: mib(48), Rate: rate, Drop: arm == "delivery", Warmup: warmup}, measurement)
-							logWindowServiceReading(t, reading)
-							if arm == "ceiling" {
-								ceiling = reading
-							} else {
-								fixed = reading
-							}
+					t.Run(fmt.Sprintf("rate=%d/rtt=%s/flows=%d/payload=%d", rate, rtt, flows, payload), func(t *testing.T) {
+						windowPathParallel(t)
+						warmup := max(300*time.Millisecond+5*rtt, time.Duration(2*int64(mib(2))*int64(time.Second)/int64(rate))+5*rtt)
+						measurement := max(2*time.Second, time.Duration(64*int64(payload)*int64(time.Second)/int64(rate)))
+						readings := measureWindowPathArms(t, measurement, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
+							return windowPathCell{Arm: arm, RoundTrip: rtt, Compression: 10 * time.Millisecond,
+								Flows: flows, RoundRobinOffer: true, Payload: payload, Budget: mib(48), Rate: rate, Drop: arm == "delivery", Warmup: warmup}
 						})
-					}
-					if ceiling.Mbps < .9*float64(rate)*8/1e6 || fixed.Mbps < .9*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 {
-						t.Errorf("large-message service rate=%d RTT=%s flows=%d payload=%d: ceiling=%.3f candidate=%.3f minimum=%.3f measured-drops=%d",
-							rate, rtt, flows, payload, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.MeasurementRelayDrops)
-					}
+						ceiling, fixed := readings[0], readings[1]
+						if ceiling.Mbps < .9*float64(rate)*8/1e6 || fixed.Mbps < .9*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 {
+							t.Errorf("large-message service rate=%d RTT=%s flows=%d payload=%d: ceiling=%.3f candidate=%.3f minimum=%.3f measured-drops=%d",
+								rate, rtt, flows, payload, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.MeasurementRelayDrops)
+						}
+					})
 				}
 			}
 		}
@@ -253,27 +236,21 @@ func TestWindowPathServiceLargeMessages(t *testing.T) {
 func TestWindowPathServicesShareFiniteRelay(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, rate := range []ByteCount{125000, 12500000, 125000000} {
-		t.Logf("case: %s", fmt.Sprintf("rate=%d", rate))
-		var ceiling, fixed windowPathReading
-		for _, arm := range []string{"ceiling", "delivery"} {
-			synctest.Test(t, func(t *testing.T) {
+		t.Run(fmt.Sprintf("rate=%d", rate), func(t *testing.T) {
+			windowPathParallel(t)
+			readings := measureWindowPathArms(t, 2*time.Second, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 				warmup := max(2*time.Second, time.Duration(2*4*int64(mib(2))*int64(time.Second)/int64(rate))+500*time.Millisecond)
 				// Two BDPs per sequence calibrate shared service without
 				// putting minutes of slow-link traffic into the control.
 				calibration := max(kib(256), ByteCount(float64(rate)*.110*2/4))
-				reading := measureWindowPathCell(t, windowPathCell{Arm: arm, CalibrationWindow: calibration, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 8, RoundRobinOffer: true, Lanes: 4, Payload: 1280, Budget: mib(48), Rate: rate, Drop: arm == "delivery", Warmup: warmup}, 2*time.Second)
-				logWindowServiceReading(t, reading)
-				if arm == "ceiling" {
-					ceiling = reading
-				} else {
-					fixed = reading
-				}
+				return windowPathCell{Arm: arm, CalibrationWindow: calibration, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 8, RoundRobinOffer: true, Lanes: 4, Payload: 1280, Budget: mib(48), Rate: rate, Drop: arm == "delivery", Warmup: warmup}
 			})
-		}
-		t.Logf("shared service=%d ceiling=%.3f fixed=%.3f min-flow=%.3f model Mb/s drops=%d queue=%d/%d", rate, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops, fixed.MaxRelayQueued, fixed.MaxRelayQueuedBytes)
-		if fixed.Mbps < .9*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 || fixed.MaxRelayQueued > 4096 || fixed.MaxRelayQueuedBytes > int64(mib(8)) {
-			t.Errorf("shared service underfilled, starved or exceeded a finite queue: %+v", fixed)
-		}
+			ceiling, fixed := readings[0], readings[1]
+			t.Logf("shared service=%d ceiling=%.3f fixed=%.3f min-flow=%.3f model Mb/s drops=%d queue=%d/%d", rate, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops, fixed.MaxRelayQueued, fixed.MaxRelayQueuedBytes)
+			if fixed.Mbps < .9*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 || fixed.MaxRelayQueued > 4096 || fixed.MaxRelayQueuedBytes > int64(mib(8)) {
+				t.Errorf("shared service underfilled, starved or exceeded a finite queue: %+v", fixed)
+			}
+		})
 	}
 }
 
@@ -287,31 +264,32 @@ func TestWindowPathServiceRoundTripChanges(t *testing.T) {
 			{300 * time.Microsecond, 100 * time.Millisecond},
 			{100 * time.Millisecond, 300 * time.Microsecond},
 		} {
-			var ceiling, fixed windowPathReading
-			for _, arm := range []string{"ceiling", "delivery"} {
-				synctest.Test(t, func(t *testing.T) {
-					cell := windowPathCell{Arm: arm, RoundTrip: roundTrips[1], Compression: 10 * time.Millisecond,
-						Flows: 8, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: rate, Warmup: 8 * time.Second}
-					if arm == "delivery" {
-						cell.RoundTrip, cell.RoundTripAfter, cell.RoundTripChangeAfter, cell.Drop = roundTrips[0], roundTrips[1], 4*time.Second, true
-						cell.QualityChanged = true
-					}
-					reading := measureWindowPathCell(t, cell, time.Second)
-					logWindowServiceReading(t, reading)
-					if arm == "ceiling" {
-						ceiling = reading
-					} else {
-						fixed = reading
-					}
+			t.Run(fmt.Sprintf("rate=%d/rtt=%s-to-%s", rate, roundTrips[0], roundTrips[1]), func(t *testing.T) {
+				windowPathParallel(t)
+				readings := measureWindowPathArms(t, time.Second, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
+					return windowServiceRoundTripChangeCell(arm, rate, roundTrips)
 				})
-			}
-			if ceiling.Mbps < .9*float64(rate)*8/1e6 || fixed.Mbps < .9*ceiling.Mbps ||
-				fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 {
-				t.Errorf("rate=%d RTT=%s->%s: ceiling=%.3f candidate=%.3f min-flow=%.3f drops=%d window=%+v",
-					rate, roundTrips[0], roundTrips[1], ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.MeasurementRelayDrops, fixed.Window)
-			}
+				ceiling, fixed := readings[0], readings[1]
+				if ceiling.Mbps < .9*float64(rate)*8/1e6 || fixed.Mbps < .9*ceiling.Mbps ||
+					fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 {
+					t.Errorf("rate=%d RTT=%s->%s: ceiling=%.3f candidate=%.3f min-flow=%.3f drops=%d window=%+v",
+						rate, roundTrips[0], roundTrips[1], ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.MeasurementRelayDrops, fixed.Window)
+				}
+			})
 		}
 	}
+}
+
+// The ceiling holds the final path from the start; the candidate changes to it
+// after four settled seconds and has four more before the common interval.
+func windowServiceRoundTripChangeCell(arm string, rate ByteCount, roundTrips [2]time.Duration) windowPathCell {
+	cell := windowPathCell{Arm: arm, RoundTrip: roundTrips[1], Compression: 10 * time.Millisecond,
+		Flows: 8, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: rate, Warmup: 8 * time.Second}
+	if arm == "delivery" {
+		cell.RoundTrip, cell.RoundTripAfter, cell.RoundTripChangeAfter, cell.Drop = roundTrips[0], roundTrips[1], 4*time.Second, true
+		cell.QualityChanged = true
+	}
+	return cell
 }
 
 // Previously propagating frames keep their deadlines while new frames use

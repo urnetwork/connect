@@ -4,11 +4,13 @@
 #
 #   ./check-routes.sh /path/to/urnetwork/server
 #
-# Extracts every router.NewRoute("METHOD", "/path", ...) registration the api
+# Extracts every router.NewRoute("METHOD", "/path", ...) and
+# router.NewStreamingRoute("METHOD", "/path", ...) registration the api
 # service serves (api/api.go plus the oauth authorization server routes it
 # appends) and every method+path the spec documents, normalizes the two into
 # the same shape, and exits non-zero if either side has something the other
-# does not.
+# does not. A streaming route (one whose request body the server reads at the
+# client's pace) is a route like any other here.
 #
 # The /competition/* routes are the one exception. This api process serves
 # them, but they are a separate security domain with their own document,
@@ -27,9 +29,7 @@
 #
 # That second rule matters for the three /.well-known/ discovery documents,
 # which are the only routes registered with escaped dots. The server's own
-# api/spec_conformance_test.go normalizePath() does NOT unescape them, so it
-# reads those three spec paths as unimplemented; one `strings.ReplaceAll(p,
-# "\\.", ".")` there lines the two checks up.
+# api/spec_conformance_test.go normalizePath() unescapes them the same way.
 #
 # Test files are excluded: they register routes that are not served.
 
@@ -82,14 +82,15 @@ spec_paths() {
 }
 
 # --- the route table -------------------------------------------------------
-# Every NewRoute( occurrence, not every line: some source lines hold two.
+# Every NewRoute( and NewStreamingRoute( occurrence, not every line: some
+# source lines hold two.
 route_files=()
 for f in $server_dir/api/api.go $server_dir/oauth/handlers.go; do
     [[ -f $f ]] && route_files+=$f
 done
 
-grep -oh 'NewRoute("[A-Z*]*", "[^"]*"' $route_files \
-    | sed -e 's/.*NewRoute("//' -e 's/", "/ /' -e 's/"$//' \
+grep -ohE 'New(Streaming)?Route\("[A-Z*]*", "[^"]*"' $route_files \
+    | sed -e 's/.*Route("//' -e 's/", "/ /' -e 's/"$//' \
     | sed -e 's/\\\\\./\./g' -e 's/(\[^\/\]+)/*/g' \
     | sort -u > $work/routes.all
 
