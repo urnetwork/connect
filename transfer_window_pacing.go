@@ -513,6 +513,16 @@ func (self *windowBurstPacer) waitUntilChangedForWrite(ctx context.Context, dead
 		if err != nil {
 			return err
 		}
+		if start != nil && !start.recovery && start.owner != nil && start.owner.pendingRecovery != nil && self.service != nil {
+			// This worker cannot repair its older tail until the current
+			// original returns. That dependency makes a drain impossible;
+			// abandon only the measurement, keeping its cooldown and debt.
+			self.service.stateLock.Lock()
+			if self.service.writes[start.sequenceId].pending && !self.service.drainUntil.IsZero() {
+				self.service.abortDrainWithLock()
+			}
+			self.service.stateLock.Unlock()
+		}
 		routeUpdate, err := start.pacingRoute()
 		if err != nil {
 			return err

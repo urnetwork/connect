@@ -297,7 +297,9 @@ func runWindowOwnerProgressFixture(t *testing.T, prefix, writer bool, serviceWai
 				t.Fatal("younger write did not reach the real full selector")
 			}
 		} else if len(fixture.route) != 0 || reservations != 1 || reserved != fixture.younger.pacingByteCount ||
-			!queued || !fixture.youngerDeadline.After(fixture.due) {
+			!queued || !fixture.youngerDeadline.After(time.Now()) ||
+			serviceWait >= 0 && !fixture.youngerDeadline.After(fixture.due) ||
+			serviceWait < 0 && !fixture.youngerDeadline.Before(fixture.due) {
 			t.Fatal("younger write did not retain exactly one charged FIFO entry across recovery")
 		}
 		check(t, fixture)
