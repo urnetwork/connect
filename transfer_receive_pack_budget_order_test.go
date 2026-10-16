@@ -230,7 +230,8 @@ func TestReceiveSequenceRetiredCarrierLeavesTheBudgetLine(t *testing.T) {
 		retired := newReceiveSequence(ctx, &Client{}, SourceId(NewId()), NewId(), TransferKey{}, settings)
 		live := newReceiveSequence(ctx, &Client{}, SourceId(NewId()), NewId(), TransferKey{}, settings)
 		defer retired.Close()
-		defer live.Close()
+		var closeLive sync.Once
+		defer closeLive.Do(live.Close)
 		type packResult struct {
 			accepted bool
 			err      error
@@ -280,7 +281,7 @@ func TestReceiveSequenceRetiredCarrierLeavesTheBudgetLine(t *testing.T) {
 		}
 		cancel()
 		synctest.Wait()
-		live.Close()
+		closeLive.Do(live.Close)
 		if used := budget.UsedByteCount(); used != 0 {
 			t.Errorf("retired carrier left %d budget bytes after all callers joined", used)
 		}

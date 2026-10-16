@@ -15141,6 +15141,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 		select {
 		case <-receivePack.carrierDone:
 			stopTimer()
+			abandonBudgetWait()
 			return false, errors.New("receive carrier closed")
 		case <-self.ctx.Done():
 			stopTimer()
