@@ -10711,10 +10711,12 @@ type multiClientWindow struct {
 	performanceProfile *PerformanceProfile
 	windowSizeLimit    int
 	// Nil test seams expose one initial-evaluation callback across the exact
-	// expand-pass phase and terminal boundaries. Production leaves all five
-	// unset.
+	// expand-pass phase and terminal boundaries, and hold the ping's
+	// evaluation-cancellation branch before it takes the pass mutex.
+	// Production leaves all six unset.
 	beforeExpandPingResultForTest func()
 	afterExpandPingResultForTest  func()
+	beforeExpandPingCancelForTest func()
 	finishExpandRequestsForTest   <-chan struct{}
 	expireExpandPingForTest       <-chan struct{}
 	expireExpandPassForTest       <-chan struct{}
@@ -12966,6 +12968,25 @@ requestCandidates:
 					effectiveBudget: self.settings.PingTimeout,
 				})
 
+				// The candidate's client lives under the evaluation context, so
+				// ending the context tears the client down and fails a ping still
+				// in flight with the teardown's own error ("Done", "Send sequence
+				// closed.") rather than the context's. Read as the client hands
+				// the error over, before it waits for the pass mutex: an error
+				// delivered after the client ended carries the end's context
+				// outcome, so the cancellation it caused is not provider evidence,
+				// while a provider error delivered before and observed after it
+				// still is.
+				deliveredPingError := func(err error) error {
+					if err == nil {
+						return nil
+					}
+					if endErr := client.ctx.Err(); endErr != nil && !errors.Is(err, endErr) {
+						return fmt.Errorf("%w (%w)", err, endErr)
+					}
+					return err
+				}
+
 				// PingTimeout starts after processed control registration, but
 				// includes transport/contract work during SendDetailedMessage.
 				// Start it here, not after the send returns. The pass
@@ -12982,6 +13003,9 @@ requestCandidates:
 					case <-pingDone.Done():
 						return
 					case <-evaluationCtx.Done():
+						if self.beforeExpandPingCancelForTest != nil {
+							self.beforeExpandPingCancelForTest()
+						}
 						func() {
 							mutex.Lock()
 							defer mutex.Unlock()
@@ -13081,6 +13105,7 @@ requestCandidates:
 						self.settings.PingWriteTimeout,
 						func(err error) {
 							pingPath.observeAckCallback(err)
+							err = deliveredPingError(err)
 							if self.beforeExpandPingResultForTest != nil {
 								self.beforeExpandPingResultForTest()
 							}
@@ -13128,6 +13153,7 @@ requestCandidates:
 						},
 						pingOptions...,
 					)
+					err = deliveredPingError(err)
 					if err != nil {
 						if pingDone.Err() == nil {
 							providerFailure := self.recordEvaluationPingFailure(evaluationCtx, args, err)
