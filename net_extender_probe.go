@@ -170,7 +170,8 @@ func ProbeExtenderForward(
 		Ip:        ip,
 		PublicKey: expectPublicKey,
 	})
-	defer client.CloseIdleConnections()
+	release := ownOneRequestHttpClient(client)
+	defer release()
 
 	request, err := HelloRequestFromUrl(probeCtx, apiUrl, "")
 	if err != nil {

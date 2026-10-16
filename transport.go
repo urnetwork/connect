@@ -213,12 +213,22 @@ type PlatformTransportReceiveModeStatsSnapshot struct {
 // translation and direct QUIC can behave very differently on a constrained
 // cellular path even though both ultimately use the H3 reader.
 type PlatformTransportReceiveStatsSnapshot struct {
-	H1                    PlatformTransportReceiveModeStatsSnapshot
-	H3                    PlatformTransportReceiveModeStatsSnapshot
-	H3Dns                 PlatformTransportReceiveModeStatsSnapshot
-	H3DnsPump             PlatformTransportReceiveModeStatsSnapshot
+	H1        PlatformTransportReceiveModeStatsSnapshot
+	H3        PlatformTransportReceiveModeStatsSnapshot
+	H3Dns     PlatformTransportReceiveModeStatsSnapshot
+	H3DnsPump PlatformTransportReceiveModeStatsSnapshot
+	// Deprecated: counted speed-test and latency echoes refused by a full H1
+	// control queue, each of which closed its generation. A full queue now
+	// applies backpressure (H1ControlBackpressureMessageCount), so this stays
+	// zero.
 	H1ControlRefusalCount uint64
+	// Deprecated: the bytes of the refused echoes; stays zero.
 	H1ControlRefusalBytes uint64
+	// Speed-test and latency echoes the H1 reader held, and their complete
+	// message bytes, while the writer made room in its full control queue.
+	// This is reliable-carrier backpressure, not loss.
+	H1ControlBackpressureMessageCount uint64
+	H1ControlBackpressureByteCount    uint64
 }
 
 type platformTransportReceiveModeStats struct {
@@ -241,12 +251,12 @@ func (self *platformTransportReceiveModeStats) snapshot() PlatformTransportRecei
 // one PlatformTransport. All counters are monotonic and add no receive-path
 // lock or observer callback.
 type PlatformTransportReceiveStats struct {
-	h1                    platformTransportReceiveModeStats
-	h3                    platformTransportReceiveModeStats
-	h3Dns                 platformTransportReceiveModeStats
-	h3DnsPump             platformTransportReceiveModeStats
-	h1ControlRefusalCount atomic.Uint64
-	h1ControlRefusalBytes atomic.Uint64
+	h1                                platformTransportReceiveModeStats
+	h3                                platformTransportReceiveModeStats
+	h3Dns                             platformTransportReceiveModeStats
+	h3DnsPump                         platformTransportReceiveModeStats
+	h1ControlBackpressureMessageCount atomic.Uint64
+	h1ControlBackpressureByteCount    atomic.Uint64
 }
 
 func (self *PlatformTransportReceiveStats) mode(mode TransportMode) *platformTransportReceiveModeStats {
@@ -284,12 +294,12 @@ func (self *PlatformTransportReceiveStats) recordQueueBackpressure(
 	}
 }
 
-func (self *PlatformTransportReceiveStats) recordH1ControlRefusal(byteCount int) {
+func (self *PlatformTransportReceiveStats) recordH1ControlBackpressure(byteCount int) {
 	if self == nil {
 		return
 	}
-	self.h1ControlRefusalCount.Add(1)
-	self.h1ControlRefusalBytes.Add(uint64(max(0, byteCount)))
+	self.h1ControlBackpressureMessageCount.Add(1)
+	self.h1ControlBackpressureByteCount.Add(uint64(max(0, byteCount)))
 }
 
 func (self *PlatformTransportReceiveStats) Snapshot() PlatformTransportReceiveStatsSnapshot {
@@ -297,12 +307,12 @@ func (self *PlatformTransportReceiveStats) Snapshot() PlatformTransportReceiveSt
 		return PlatformTransportReceiveStatsSnapshot{}
 	}
 	return PlatformTransportReceiveStatsSnapshot{
-		H1:                    self.h1.snapshot(),
-		H3:                    self.h3.snapshot(),
-		H3Dns:                 self.h3Dns.snapshot(),
-		H3DnsPump:             self.h3DnsPump.snapshot(),
-		H1ControlRefusalCount: self.h1ControlRefusalCount.Load(),
-		H1ControlRefusalBytes: self.h1ControlRefusalBytes.Load(),
+		H1:                                self.h1.snapshot(),
+		H3:                                self.h3.snapshot(),
+		H3Dns:                             self.h3Dns.snapshot(),
+		H3DnsPump:                         self.h3DnsPump.snapshot(),
+		H1ControlBackpressureMessageCount: self.h1ControlBackpressureMessageCount.Load(),
+		H1ControlBackpressureByteCount:    self.h1ControlBackpressureByteCount.Load(),
 	}
 }
 
@@ -1342,10 +1352,18 @@ func (self *PlatformTransport) offerReceive(
 	}
 }
 
-// offerH1Control refuses a saturated reliable control queue immediately. A
-// speed-test/latency control message has no Transfer acknowledgement above it,
-// so skipping it would desynchronize state; the caller closes this websocket
-// generation and reconnects instead.
+// Hands one speed-test or latency echo to the H1 writer. The H1 reader is the
+// dedicated reader of one reliable lane, so under the reliable-carrier
+// backpressure contract (CODESTYLE.md) it may retain this one already-read
+// message until the fixed queue has room or the generation ends; TCP then
+// holds the platform to the rate this client can echo. Refusal is not a
+// recoverable boundary here: an echo has no Transfer acknowledgement above it,
+// so skipping one desynchronizes the speed-test mode and the platform's exact
+// byte count, and closing the generation instead killed healthy connections
+// whenever a speed test met an uplink slower than the downlink. Every writer
+// path is deadline-bounded, so a stuck writer still ends the generation. Each
+// wait counts as H1 control backpressure. Takes the echo: false means the
+// generation ended and the echo went back to the pool.
 func (self *PlatformTransport) offerH1Control(
 	done <-chan struct{},
 	controlSend chan<- []byte,
@@ -1355,9 +1373,14 @@ func (self *PlatformTransport) offerH1Control(
 	case pooledReceiveOfferDelivered:
 		return true
 	case pooledReceiveOfferFull:
-		self.receiveStats.recordH1ControlRefusal(len(message))
-		MessagePoolReturn(message)
-		return false
+		self.receiveStats.recordH1ControlBackpressure(len(message))
+		select {
+		case <-done:
+			MessagePoolReturn(message)
+			return false
+		case controlSend <- message:
+			return true
+		}
 	default:
 		MessagePoolReturn(message)
 		return false
@@ -2518,6 +2541,23 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					writeCounter.Add(1)
 					return nil
 				}
+				// Writing the start or stop echo moves the writer into or out of
+				// speed-test mode, in step with the reader that queued it.
+				writeControl := func(message []byte) error {
+					if len(message) == 5 {
+						switch message[0] {
+						case TransportControlSpeedStart:
+							speedTest = true
+						case TransportControlSpeedStop:
+							speedTest = false
+						}
+					}
+					if err := write(message); err != nil {
+						return err
+					}
+					resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+					return nil
+				}
 				writeSendMessage := func(message []byte) error {
 					if len(message) <= 16 {
 						self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
@@ -2621,6 +2661,21 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					// selects below also include the lane so a newly arriving ACK
 					// wakes an otherwise idle writer.
 					if ackPrioritySend != nil && !speedTest {
+						// A pending control echo goes first. The pass below takes
+						// the next ACK and comes round again, so a lane that is
+						// ready every time, as on a slow uplink, kept the selects
+						// below, which drain controlSend, from ever running, and
+						// the reader waits on a full control queue. Control echoes
+						// are a handful of small messages outside a speed test, so
+						// serving them first cannot starve the lane.
+						select {
+						case message, ok := <-controlSend:
+							if !ok || writeControl(message) != nil {
+								return
+							}
+							continue
+						default:
+						}
 						select {
 						case message := <-ackPrioritySend:
 							if speedTest {
@@ -2659,19 +2714,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
-							if !ok {
+							if !ok || writeControl(message) != nil {
 								return
 							}
-							if len(message) == 5 {
-								switch message[0] {
-								case TransportControlSpeedStop:
-									speedTest = false
-								}
-							}
-							if write(message) != nil {
-								return
-							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-send:
 							if !ok {
 								return
@@ -2725,19 +2770,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
-							if !ok {
+							if !ok || writeControl(message) != nil {
 								return
 							}
-							if len(message) == 5 {
-								switch message[0] {
-								case TransportControlSpeedStart:
-									speedTest = true
-								}
-							}
-							if write(message) != nil {
-								return
-							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						}
 					}
 				}

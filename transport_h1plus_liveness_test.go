@@ -87,23 +87,34 @@ func (self *h1LivenessConn) Close() error {
 }
 
 // Each fixture owns its strategy, transport budget, peer, and both pipe ends.
+// stateLock guards payloadMessages, which the peer reader appends to.
 type h1LivenessFixture struct {
-	transport       *PlatformTransport
-	routes          *RouteManager
-	send            Route
-	stats           *H1PlusStats
-	connectionStats *H1ConnectionStats
-	client          *h1LivenessConn
-	peer            *FramedMessageConn
-	peerDone        chan struct{}
-	peerReadBlocked chan struct{}
-	peerReadResume  chan struct{}
-	heartbeats      atomic.Int64
-	payloads        atomic.Int64
-	registered      atomic.Int64
-	withdrawn       atomic.Int64
-	strategy        *ClientStrategy
-	cancel          context.CancelFunc
+	transport        *PlatformTransport
+	routes           *RouteManager
+	send             Route
+	stats            *H1PlusStats
+	connectionStats  *H1ConnectionStats
+	client           *h1LivenessConn
+	peer             *FramedMessageConn
+	peerDone         chan struct{}
+	peerReadBlocked  chan struct{}
+	peerReadResume   chan struct{}
+	heartbeats       atomic.Int64
+	payloads         atomic.Int64
+	payloadByteCount atomic.Int64
+	registered       atomic.Int64
+	withdrawn        atomic.Int64
+	strategy         *ClientStrategy
+	cancel           context.CancelFunc
+	stateLock        sync.Mutex
+	payloadMessages  [][]byte
+}
+
+// The non-empty messages the peer has read, in the order it read them.
+func (self *h1LivenessFixture) payloadMessagesSnapshot() [][]byte {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return append([][]byte(nil), self.payloadMessages...)
 }
 
 // Call inside a synctest bubble after priming the package's lazy pool outside.
@@ -163,6 +174,10 @@ func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTim
 				fixture.heartbeats.Add(1)
 			} else {
 				fixture.payloads.Add(1)
+				fixture.payloadByteCount.Add(int64(len(message)))
+				fixture.stateLock.Lock()
+				fixture.payloadMessages = append(fixture.payloadMessages, append([]byte(nil), message...))
+				fixture.stateLock.Unlock()
 			}
 			messageCount++
 			if pausePeer && messageCount == 1 {

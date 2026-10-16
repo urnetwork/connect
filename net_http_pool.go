@@ -2,7 +2,8 @@ package connect
 
 // A cached HTTP client owns its live native streams until every admitted
 // evaluation has consumed or canceled its response. Retirement drains that
-// owner, not a snapshot of whichever connections happen to be idle.
+// owner, not a snapshot of whichever connections happen to be idle. A client
+// built for one request is the same owner, retired when its call returns.
 
 import (
 	"context"
@@ -97,6 +98,23 @@ func (self *clientHttpPool) closeRetired(conns map[*clientHttpPoolConn]bool, dra
 			transport.Close()
 		}
 	}
+}
+
+// Installs a one-request owner on a client whose native transport has not
+// dialed yet, and returns the end of that request. HTTP/2 forgets a canceled
+// or finished stream on its own goroutine, possibly after the call returned,
+// and an idle sweep skips a connection that still lists a stream, so the end
+// closes every socket the transport dialed, cancels a dial still in flight
+// and refuses a later one. A TLS dialer's socket is owned when it registers
+// below its TLS layer, as the native and extender dialers do.
+func ownOneRequestHttpClient(client *http.Client) func() {
+	pool := newClientHttpPool()
+	pool.httpClient = client
+	if transport, ok := client.Transport.(*http.Transport); ok {
+		transport.DialContext = pool.dialContext(transport.DialContext, false)
+		transport.DialTLSContext = pool.dialContext(transport.DialTLSContext, true)
+	}
+	return pool.retire
 }
 
 // A value is installed only while dialing, never on the hot request path.
