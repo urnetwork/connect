@@ -7835,6 +7835,7 @@ func (self *SendSequence) coalesceReceivedAck(
 			at = time.Unix(0, ack.receivedAtNanos)
 		}
 		service.acknowledgeWrite(self.sequenceId, ack.messageId, sequenceNumber, ack.selective, self.ackCompressionResidence(), at)
+		self.observeReceiverHold(ack, at)
 		self.publishAckServiceCreditWithTiming(ack.messageId, ack.selective, at, receiverTiming)
 	}
 	ackWindow.Update(sequenceAck)
