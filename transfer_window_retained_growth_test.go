@@ -92,7 +92,7 @@ func TestWindowPathRetainedGrowthLongRoundTrip(t *testing.T) {
 	for _, compression := range []time.Duration{0, 10 * time.Millisecond} {
 		for _, flows := range []int{1, 8} {
 			t.Run(fmt.Sprintf("compression=%s/flows=%d", compression, flows), func(t *testing.T) {
-				windowPathParallel(t)
+				t.Parallel()
 				checkWindowMismatchCell(t, windowPathCell{
 					SendWindow: 48 * 1024 * 1024, ReceiveWindow: 48 * 1024 * 1024,
 					RoundTrip: 400 * time.Millisecond, Compression: compression,

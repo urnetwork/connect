@@ -26,7 +26,7 @@ func TestWindowPathSdkRetainedDeviceDuplexShort(t *testing.T) {
 			Payload: 1280, Rate: 125000000,
 		}
 		t.Run(windowSdkCellName(profiles, cell), func(t *testing.T) {
-			windowPathParallel(t)
+			t.Parallel()
 			checkWindowSdkCell(t, cell)
 		})
 	}

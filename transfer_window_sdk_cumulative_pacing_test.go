@@ -26,7 +26,7 @@ func TestWindowPathRetainedSdkCumulativePacingShort(t *testing.T) {
 				Flows: flows, Payload: 1280, Rate: 125000000,
 			}
 			t.Run(windowSdkCellName(profiles, cell), func(t *testing.T) {
-				windowPathParallel(t)
+				t.Parallel()
 				checkWindowSdkCell(t, cell)
 			})
 		}
@@ -53,7 +53,7 @@ func TestWindowPathRetainedSdkCumulativePacingLong(t *testing.T) {
 				Flows: 1, Payload: 1280, Rate: 125000000,
 			}
 			t.Run(windowSdkCellName(profiles, cell), func(t *testing.T) {
-				windowPathParallel(t)
+				t.Parallel()
 				checkWindowSdkCell(t, cell)
 			})
 		}
