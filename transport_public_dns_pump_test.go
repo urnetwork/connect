@@ -1,8 +1,11 @@
-// No connect test may contact the public DNS pump host. The production
-// default names it for H3DnsPump, and an Auto transport whose H1 is down
-// reaches the pump tier on its own, so any test that keeps the defaults would
-// resolve and dial it. The package's tests switch it off once, here, for every
-// test in this binary.
+// No connect test may contact the public DNS pump host, the operator's live
+// host that the production default names for H3DnsPump. An Auto transport
+// whose H1 is down reaches the pump tier on its own, so any test that keeps
+// the defaults would resolve and dial it. The package's tests switch it off
+// once, here, for every test in this binary. Test binaries of the other
+// packages (extender, connectctl and the rest) do not run this init, so a test
+// there that builds an Auto or pump transport names its own pump host, as the
+// extender pump tests do.
 package connect
 
 import (

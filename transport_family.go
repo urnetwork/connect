@@ -1482,9 +1482,9 @@ func (self *PlatformTransport) resolveSingleControlUDPAddr(ctx context.Context, 
 type h3PacketConnWrapper func(ctx context.Context, packetConn net.PacketConn) (net.PacketConn, error)
 
 // False only in this package's tests (transport_public_dns_pump_test.go).
-// DefaultDnsPumpHost, the production default pump host, is a real third-party
-// name, and no connect test may resolve or dial it. Production binaries never
-// change this.
+// DefaultDnsPumpHost, the production default pump host, is the operator's live
+// public host, and no connect test may resolve or dial it. Production binaries
+// never change this.
 var dialPublicDnsPumpHost = true
 
 // h3CarrierDestination is the unresolved host and ports one H3 carrier sends
