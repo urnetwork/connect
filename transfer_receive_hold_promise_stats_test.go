@@ -44,21 +44,7 @@ func TestReceiveHoldCountsAShortfallForAPredecessorLargerThanItsReservation(t *t
 	synctest.Test(t, func(t *testing.T) {
 		budget := NewTransferMemoryBudget(ByteCount(math.MaxInt32))
 		fixture := newReceiveHoldPromiseFixture(t, budget)
-		for range 4 {
-			fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
-		}
-		next := fixture.write(receiveHoldPromisePayloadByteCount)
-		large := fixture.write(8 * receiveHoldPromisePayloadByteCount)
-		receiveSequence := fixture.receiveSequence()
-		fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
-		budget.SetTotalByteCount(12 * receiveSequence.receiveQueue.PeekLast().QueueByteCount())
-		dropBase := fixture.receiver.ReceiveStats().ReceiveQueueDropCount
-		for range 48 {
-			if fixture.receiver.ReceiveStats().ReceiveQueueDropCount != dropBase {
-				break
-			}
-			fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
-		}
+		_, next, large, _ := fillReceiveHoldPromiseBehindALargePredecessor(t, fixture, budget, 4)
 		before := fixture.receiver.ReceiveStats()
 		fixture.forward(large, fixture.receiverIn)
 		after := fixture.receiver.ReceiveStats()

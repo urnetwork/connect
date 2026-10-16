@@ -19,6 +19,11 @@ const receiveHoldPromisePayloadByteCount = 2000
 // budget charged at the packet's backing size, and a per-sequence window far
 // larger than that budget can fund.
 func newReceiveHoldPromiseFixture(t *testing.T, budget *TransferMemoryBudget) *windowRoundFixture {
+	return newReceiveHoldPromiseFixtureWithEvictionNotice(t, budget, true)
+}
+
+// The same, with eviction notices on, as shipped, or off, the measurement arm.
+func newReceiveHoldPromiseFixtureWithEvictionNotice(t *testing.T, budget *TransferMemoryBudget, evictionNotice bool) *windowRoundFixture {
 	return newWindowRoundFixture(t, func(settings *SendBufferSettings) {
 		settings.ResendQueueMaxByteCount = mib(4)
 	}, func(settings *ReceiveBufferSettings) {
@@ -26,7 +31,7 @@ func newReceiveHoldPromiseFixture(t *testing.T, budget *TransferMemoryBudget) *w
 		settings.ReceiveQueueBudget = budget
 		settings.ReceiveQueueRetainedByteAccounting = true
 		settings.ReceiveHoldPolicy = ReceiveHoldCommittedPrefix
-		settings.EvictionNotice = true
+		settings.EvictionNotice = evictionNotice
 	})
 }
 
@@ -100,6 +105,48 @@ func fillReceiveHoldPromise(
 		t.Fatalf("the shared budget still has %d of %d free; a predecessor would be admitted without any promise", budget.Available(), charge)
 	}
 	return receiveSequence, gap
+}
+
+// Delivers `deliveredCount` Packs and withholds the next two: the delivery
+// point, and one eight times the size of anything the hold will take. Later
+// Packs are then forwarded until the shared budget refuses one. Returns the two
+// withheld Packs and the numbers the hold acknowledged.
+func fillReceiveHoldPromiseBehindALargePredecessor(
+	t *testing.T,
+	fixture *windowRoundFixture,
+	budget *TransferMemoryBudget,
+	deliveredCount int,
+) (receiveSequence *ReceiveSequence, next *windowRoundFrame, large *windowRoundFrame, committed map[uint64]bool) {
+	t.Helper()
+	for range deliveredCount {
+		fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
+	}
+	next = fixture.write(receiveHoldPromisePayloadByteCount)
+	large = fixture.write(8 * receiveHoldPromisePayloadByteCount)
+	receiveSequence = fixture.receiveSequence()
+	fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
+	first := receiveSequence.receiveQueue.PeekLast()
+	budget.SetTotalByteCount(12 * first.QueueByteCount())
+	dropBase := fixture.receiver.ReceiveStats().ReceiveQueueDropCount
+	for range 48 {
+		if fixture.receiver.ReceiveStats().ReceiveQueueDropCount != dropBase {
+			break
+		}
+		fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
+	}
+	if fixture.receiver.ReceiveStats().ReceiveQueueDropCount == dropBase {
+		t.Fatal("the shared budget never refused a later Pack")
+	}
+	committed = map[uint64]bool{}
+	for _, held := range receiveSequence.receiveQueue.AscendingItems(nil) {
+		if held.committed {
+			committed[held.sequenceNumber] = true
+		}
+	}
+	if len(committed) == 0 {
+		t.Fatal("the hold acknowledged nothing, so the gap carries no promise")
+	}
+	return receiveSequence, next, large, committed
 }
 
 // Root cause. A hold whose shared budget is spent had acknowledged Packs whose
@@ -240,36 +287,7 @@ func TestReceiveHoldWithdrawsAnAcknowledgementForAPredecessorLargerThanItsReserv
 	synctest.Test(t, func(t *testing.T) {
 		budget := NewTransferMemoryBudget(ByteCount(math.MaxInt32))
 		fixture := newReceiveHoldPromiseFixture(t, budget)
-		for range deliveredCount {
-			fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
-		}
-		// two lost Packs: the delivery point, and one larger than anything
-		// the hold will take
-		next := fixture.write(receiveHoldPromisePayloadByteCount)
-		large := fixture.write(8 * receiveHoldPromisePayloadByteCount)
-		receiveSequence := fixture.receiveSequence()
-		fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
-		first := receiveSequence.receiveQueue.PeekLast()
-		budget.SetTotalByteCount(12 * first.QueueByteCount())
-		dropBase := fixture.receiver.ReceiveStats().ReceiveQueueDropCount
-		for range 48 {
-			if fixture.receiver.ReceiveStats().ReceiveQueueDropCount != dropBase {
-				break
-			}
-			fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
-		}
-		if fixture.receiver.ReceiveStats().ReceiveQueueDropCount == dropBase {
-			t.Fatal("the shared budget never refused a later Pack")
-		}
-		committed := map[uint64]bool{}
-		for _, held := range receiveSequence.receiveQueue.AscendingItems(nil) {
-			if held.committed {
-				committed[held.sequenceNumber] = true
-			}
-		}
-		if len(committed) == 0 {
-			t.Fatal("the hold acknowledged nothing, so there is nothing to withdraw")
-		}
+		receiveSequence, next, large, committed := fillReceiveHoldPromiseBehindALargePredecessor(t, fixture, budget, deliveredCount)
 		heldCount, _ := receiveSequence.receiveQueue.QueueSize()
 		// Settle the acknowledgements published so far; what follows on the
 		// wire is the receiver's answer to the large predecessor.
@@ -315,6 +333,58 @@ func TestReceiveHoldWithdrawsAnAcknowledgementForAPredecessorLargerThanItsReserv
 		fixture.forward(next, fixture.receiverIn)
 		if want := deliveredCount + 2 + heldCount - withdrawnCount; fixture.deliveredCount != want {
 			t.Errorf("delivered %d, want %d once the gap's two Packs had arrived", fixture.deliveredCount, want)
+		}
+	})
+}
+
+// With eviction notices off a withdrawal could not reach the sender, which
+// would lease the withdrawn Pack until its selective acknowledgement timeout:
+// the sixty second wait on one Pack that a hold must never cause. The hold
+// keeps every acknowledgement and turns the larger predecessor away instead.
+// The gap still closes, because that predecessor becomes the delivery point's
+// next Pack once the gap below it fills, and its resend takes the direct path.
+func TestReceiveHoldWithoutEvictionNoticesKeepsEveryAcknowledgementForALargerPredecessor(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	const deliveredCount = 4
+	synctest.Test(t, func(t *testing.T) {
+		budget := NewTransferMemoryBudget(ByteCount(math.MaxInt32))
+		fixture := newReceiveHoldPromiseFixtureWithEvictionNotice(t, budget, false)
+		receiveSequence, next, large, committed := fillReceiveHoldPromiseBehindALargePredecessor(t, fixture, budget, deliveredCount)
+		heldCount, _ := receiveSequence.receiveQueue.QueueSize()
+		fixture.acknowledge()
+
+		before := fixture.receiver.ReceiveStats()
+		fixture.forward(large, fixture.receiverIn)
+		after := fixture.receiver.ReceiveStats()
+		if discarded := after.ReceiveQueueEvictionCount - before.ReceiveQueueEvictionCount; discarded != 0 {
+			t.Errorf("the hold discarded %d acknowledged Packs it could not announce; the sender leases each until its selective acknowledgement timeout", discarded)
+		}
+		for _, held := range receiveSequence.receiveQueue.AscendingItems(nil) {
+			if held.committed {
+				delete(committed, held.sequenceNumber)
+			}
+		}
+		if len(committed) != 0 {
+			gone := []uint64{}
+			for number := range committed {
+				gone = append(gone, number)
+			}
+			slices.Sort(gone)
+			t.Errorf("acknowledged Packs %v left the hold with no notice", gone)
+		}
+		if refused := after.ReceiveQueueDropCount - before.ReceiveQueueDropCount; refused != 1 {
+			t.Errorf("%d arrivals refused, want the one larger predecessor", refused)
+		}
+		if shortfalls := after.ReceiveQueueCommitShortfallCount - before.ReceiveQueueCommitShortfallCount; shortfalls != 1 {
+			t.Errorf("%d shortfalls counted, want the one refusal", shortfalls)
+		}
+
+		// The delivery point arrives, and the larger predecessor is next.
+		fixture.forward(next, fixture.receiverIn)
+		fixture.acknowledge()
+		fixture.forward(fixture.recovery(large), fixture.receiverIn)
+		if want := deliveredCount + 2 + heldCount; fixture.deliveredCount != want {
+			t.Errorf("delivered %d, want %d once the larger predecessor's resend landed", fixture.deliveredCount, want)
 		}
 	})
 }

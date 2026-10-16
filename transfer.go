@@ -1706,6 +1706,8 @@ type ClientReceiveStatsSnapshot struct {
 	// commitment sized its reservation from. Each is also an eviction above.
 	// The reservation makes this zero unless a lost Pack is the largest of
 	// its gap; it is the one way an acknowledged item still leaves the hold.
+	// With EvictionNotice off a withdrawal could not be announced, so none is
+	// made: the predecessor is refused, which counts once here and as a drop.
 	ReceiveQueueCommitShortfallCount uint64
 	// acknowledged held items a closing sequence withdrew by eviction notice
 	// before discarding them, so the sender resends instead of leasing them
@@ -16029,6 +16031,15 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 					// acknowledgement instead, with its eviction notice, so the
 					// sender resends it rather than leasing it.
 					self.client.receiveQueueCommitShortfallCount.Add(1)
+					if !self.receiveBufferSettings.EvictionNotice {
+						// Without notices the withdrawal could not reach the
+						// sender, which would lease a Pack that is gone until
+						// its selective acknowledgement timeout. Keep the
+						// acknowledgement and turn the arrival away: it is
+						// the delivery point's next Pack once the gap below
+						// it fills, and then lands on the direct path.
+						break
+					}
 				}
 				self.receiveQueue.RemoveByMessageId(lastItem.messageId)
 				if lastItem.committed {
