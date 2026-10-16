@@ -327,6 +327,10 @@ func TestPlatformTransportControlRefusalTerminatesGenerationWithoutWait(t *testi
 		if snapshot.H1ControlRefusalCount != 0 || snapshot.H1ControlRefusalBytes != 0 {
 			t.Fatalf("H1 control-refusal stats = %+v, want zero", snapshot)
 		}
+		if snapshot.H1ControlBackpressureMessageCount != 1 || snapshot.H1ControlBackpressureByteCount != 16 {
+			t.Fatalf("H1 control backpressure = %d messages / %d bytes, want the one 16-byte wait",
+				snapshot.H1ControlBackpressureMessageCount, snapshot.H1ControlBackpressureByteCount)
+		}
 	})
 }
 
@@ -365,8 +369,13 @@ func TestPlatformTransportH1ControlQueueBackpressuresUntilRoom(t *testing.T) {
 		if !MessagePoolReturn(witness) {
 			t.Fatal("the delivered echo's pooled ownership was not handed on")
 		}
-		if refusalCount := transport.ReceiveStats().H1ControlRefusalCount; refusalCount != 0 {
-			t.Fatalf("H1 control refusals = %d, want 0", refusalCount)
+		snapshot := transport.ReceiveStats()
+		if snapshot.H1ControlRefusalCount != 0 {
+			t.Fatalf("H1 control refusals = %d, want 0", snapshot.H1ControlRefusalCount)
+		}
+		if snapshot.H1ControlBackpressureMessageCount != 1 || snapshot.H1ControlBackpressureByteCount != 1024 {
+			t.Fatalf("H1 control backpressure = %d messages / %d bytes, want the one 1024-byte wait",
+				snapshot.H1ControlBackpressureMessageCount, snapshot.H1ControlBackpressureByteCount)
 		}
 	})
 }
@@ -525,6 +534,7 @@ func TestProductionCarrierReadersUseModeSpecificReceiveAdmission(t *testing.T) {
 			}
 			controlSource := source[offerEnd : offerEnd+controlLength]
 			for _, required := range []string{
+				"recordH1ControlBackpressure(len(message))",
 				"case <-done:",
 				"case controlSend <- message:",
 			} {

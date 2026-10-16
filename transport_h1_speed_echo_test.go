@@ -99,6 +99,9 @@ func TestH1SpeedTestEchoBackpressureKeepsGenerationAndFrames(t *testing.T) {
 				t.Fatalf("the reader took all %d probes without filling the echo queue; the test applied no backpressure", writtenCount)
 			default:
 			}
+			if fixture.transport.ReceiveStats().H1ControlBackpressureMessageCount == 0 {
+				t.Fatal("the stalled reader held no echo as H1 control backpressure")
+			}
 		}
 
 		close(fixture.peerReadResume)
@@ -155,6 +158,9 @@ func TestH1SpeedTestEchoStalledWriterEndsGenerationAtWriteDeadline(t *testing.T)
 		}
 		if fixture.client.writesInProgress.Load() != 1 {
 			t.Fatal("the echo writer did not block on the stalled uplink")
+		}
+		if fixture.transport.ReceiveStats().H1ControlBackpressureMessageCount == 0 {
+			t.Fatal("the stalled reader held no echo as H1 control backpressure")
 		}
 
 		time.Sleep(writeTimeout - time.Nanosecond)
