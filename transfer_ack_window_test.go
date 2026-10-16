@@ -314,7 +314,7 @@ func TestReceiveAckRouteWriteStatsSeparateBlockedWaitsAndErrors(t *testing.T) {
 		stats.AckRouteWriteWaitByTransport[TransportTypeH1] != 0 ||
 		stats.AckRouteWriteWaitByTransport[TransportTypeP2p] != 12*time.Millisecond ||
 		stats.AckRouteWriteTimeoutByTransport[TransportTypeH1] != 0 ||
-		stats.AckRouteWriteTimeoutByTransport[TransportTypeP2p] != 1 {
+		stats.AckRouteWriteTimeoutByTransport[TransportTypeP2p] != 0 {
 		t.Fatalf("ACK route-write stats by transport = %+v", stats)
 	}
 	if _, ok := stats.AckRouteWriteCountByTransport[TransportTypeH3]; ok {

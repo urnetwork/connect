@@ -1561,6 +1561,10 @@ type ClientSettings struct {
 	// one owner may share it. It never changes behaviour: whether an
 	// end-to-end session is attempted is `EncryptionSettings.Mode`.
 	PeerCapabilityRecorder *PeerCapabilityRecorder
+	// Opt-in diagnostic counters only; no packet policy depends on this flag.
+	EnableAckRouteWriteDiagnostics bool
+	// Set by a multi-client window before construction, never by packet callbacks.
+	ackRouteWriteFailureOwner *ackRouteWriteFailureCounters
 
 	SendBufferSize    int
 	ForwardBufferSize int
@@ -1738,6 +1742,92 @@ type ClientReceiveStatsSnapshot struct {
 	AckRouteWriteCountByTransport   map[TransportType]uint64
 	AckRouteWriteWaitByTransport    map[TransportType]time.Duration
 	AckRouteWriteTimeoutByTransport map[TransportType]uint64
+	// Opt-in failure-only totals; the legacy carrier maps retain their meaning.
+	// A failed attempt's carrier is a preference, not proof of a carrier write.
+	AckRouteWriteFailures *AckRouteWriteFailureStatsSnapshot `json:",omitempty"`
+}
+
+// Fixed cause and wait evidence; independently read atomics are not a transaction.
+type AckRouteWriteFailureStatsSnapshot struct {
+	ErrorCount          uint64
+	RouteTimeoutCount   uint64
+	CallerCanceledCount uint64
+	CallerDeadlineCount uint64
+	SelectorClosedCount uint64
+	OtherCount          uint64
+	BlockedCount        uint64
+	WaitDuration        time.Duration
+	MaxWait             time.Duration
+}
+
+// Bounded per-owner storage. Recording is allocation-free and safe concurrently.
+type ackRouteWriteFailureCounters struct {
+	byKind             [transferWriteFailureOther]atomic.Uint64
+	blockedCount       atomic.Uint64
+	waitNanoseconds    atomic.Uint64
+	maxWaitNanoseconds atomic.Uint64
+}
+
+// Records one error in exactly one cause bucket, including failures after retirement.
+func (self *ackRouteWriteFailureCounters) record(kind transferWriteFailureKind, disposition transferWriteDisposition) {
+	if self == nil {
+		return
+	}
+	if kind <= transferWriteFailureNone || transferWriteFailureOther < kind {
+		kind = transferWriteFailureOther
+	}
+	self.byKind[kind-1].Add(1)
+	if disposition.failureInitiallyBlocked {
+		self.blockedCount.Add(1)
+		if 0 < disposition.failureWaitDuration {
+			wait := uint64(disposition.failureWaitDuration)
+			self.waitNanoseconds.Add(wait)
+			updateAtomicMaximum(&self.maxWaitNanoseconds, wait)
+		}
+	}
+}
+
+// Allocates one fixed diagnostic snapshot only after an actual failed write.
+func (self *ackRouteWriteFailureCounters) snapshot() *AckRouteWriteFailureStatsSnapshot {
+	if self == nil {
+		return nil
+	}
+	routeTimeout := self.byKind[transferWriteFailureRouteTimeout-1].Load()
+	callerCanceled := self.byKind[transferWriteFailureCallerCanceled-1].Load()
+	callerDeadline := self.byKind[transferWriteFailureCallerDeadline-1].Load()
+	selectorClosed := self.byKind[transferWriteFailureSelectorClosed-1].Load()
+	other := self.byKind[transferWriteFailureOther-1].Load()
+	errorCount := routeTimeout + callerCanceled + callerDeadline + selectorClosed + other
+	if errorCount == 0 {
+		return nil
+	}
+	return &AckRouteWriteFailureStatsSnapshot{
+		ErrorCount:          errorCount,
+		RouteTimeoutCount:   routeTimeout,
+		CallerCanceledCount: callerCanceled,
+		CallerDeadlineCount: callerDeadline,
+		SelectorClosedCount: selectorClosed,
+		OtherCount:          other,
+		BlockedCount:        self.blockedCount.Load(),
+		WaitDuration:        time.Duration(self.waitNanoseconds.Load()),
+		MaxWait:             time.Duration(self.maxWaitNanoseconds.Load()),
+	}
+}
+
+// Custom writers retain their error identity; untyped errors remain explicitly unknown.
+func transferWriteFailureFromError(err error) transferWriteFailureKind {
+	switch {
+	case err == nil:
+		return transferWriteFailureNone
+	case errors.Is(err, errTransferRouteWriteTimeout):
+		return transferWriteFailureRouteTimeout
+	case errors.Is(err, context.Canceled):
+		return transferWriteFailureCallerCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return transferWriteFailureCallerDeadline
+	default:
+		return transferWriteFailureOther
+	}
 }
 
 // ackTransportSlot maps a carrier type to a fixed counter slot so the ack hot
@@ -1988,6 +2078,8 @@ type Client struct {
 	receiveAckRouteWriteErrorCount      atomic.Uint64
 	receiveAckRouteWriteWaitNanoseconds atomic.Uint64
 	receiveAckRouteWriteMaxWaitNanos    atomic.Uint64
+	receiveAckRouteWriteFailures        *ackRouteWriteFailureCounters
+	ackRouteWriteFailureOwner           *ackRouteWriteFailureCounters
 	initialSendWriteCount               atomic.Uint64
 	initialSendFrameCount               atomic.Uint64
 	initialSendMessageByteCount         atomic.Uint64
@@ -2168,6 +2260,10 @@ func NewClientWithTag(
 		runDone:                      make(chan struct{}),
 		beforeRunDoneWaitForTest:     settings.beforeRunDoneWaitForTest,
 		beforeLoopbackReleaseForTest: settings.beforeLoopbackReleaseForTest,
+	}
+	if settings.EnableAckRouteWriteDiagnostics {
+		client.receiveAckRouteWriteFailures = &ackRouteWriteFailureCounters{}
+		client.ackRouteWriteFailureOwner = settings.ackRouteWriteFailureOwner
 	}
 	client.receiveCallback = client.receive
 
@@ -2372,6 +2468,7 @@ func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 		AckRouteWriteMaxWait: time.Duration(
 			self.receiveAckRouteWriteMaxWaitNanos.Load(),
 		),
+		AckRouteWriteFailures: self.receiveAckRouteWriteFailures.snapshot(),
 	}
 	// The per-carrier maps exist only when a carrier has written: a client
 	// that has not acked stays allocation-free, which the multi-client memory
@@ -4130,6 +4227,18 @@ func (self *Client) recordReceiveAckRouteWrite(
 	priority bool,
 	err error,
 ) {
+	self.recordReceiveAckRouteWriteDisposition(transportType, waitDuration, blocked, priority, err, transferWriteDisposition{})
+}
+
+// Adds failure-only evidence without changing the legacy success/wait accounting.
+func (self *Client) recordReceiveAckRouteWriteDisposition(
+	transportType TransportType,
+	waitDuration time.Duration,
+	blocked bool,
+	priority bool,
+	err error,
+	disposition transferWriteDisposition,
+) {
 	slot := ackTransportSlot(transportType)
 	self.receiveAckRouteWriteCount.Add(1)
 	self.receiveAckRouteWriteCountByTransport[slot].Add(1)
@@ -4138,7 +4247,15 @@ func (self *Client) recordReceiveAckRouteWrite(
 	}
 	if err != nil {
 		self.receiveAckRouteWriteErrorCount.Add(1)
-		self.receiveAckRouteWriteTimeoutByTransport[slot].Add(1)
+		kind := disposition.failureKind
+		if kind == transferWriteFailureNone {
+			kind = transferWriteFailureFromError(err)
+		}
+		if kind == transferWriteFailureRouteTimeout {
+			self.receiveAckRouteWriteTimeoutByTransport[slot].Add(1)
+		}
+		self.receiveAckRouteWriteFailures.record(kind, disposition)
+		self.ackRouteWriteFailureOwner.record(kind, disposition)
 	}
 	if !blocked || waitDuration <= 0 {
 		return
@@ -15019,6 +15136,7 @@ func (self *ReceiveSequence) Run() {
 				messagePoolMarkSmallUnordered(frameBytes)
 				shared := MessagePoolShareReadOnly(frameBytes)
 				var writeErr error
+				var disposition transferWriteDisposition
 				blocked := false
 				priority := false
 				var waitDuration time.Duration
@@ -15033,29 +15151,28 @@ func (self *ReceiveSequence) Run() {
 					); success {
 						priority = true
 						writtenTransportType = TransportTypeH1
-					} else if sendAck.transportType != TransportTypeUnknown {
+					} else {
 						var success bool
-						var disposition transferWriteDisposition
-						success, disposition, writeErr = selector.writeDetailedReplyWithCarrierPreference(
-							ackWriteCtx,
-							shared,
-							self.receiveBufferSettings.WriteTimeout,
-							sendAck.transportType,
-						)
-						blocked = disposition.initiallyBlocked
-						waitDuration = disposition.initialWaitDuration
-						if disposition.transportType != "" {
-							writtenTransportType = disposition.transportType
+						if sendAck.transportType == TransportTypeUnknown {
+							// The same generic policy as Write, retaining its disposition.
+							success, disposition, writeErr = selector.writeDetailedWithCarrier(
+								ackWriteCtx, shared, self.receiveBufferSettings.WriteTimeout,
+							)
+						} else {
+							success, disposition, writeErr = selector.writeDetailedReplyWithCarrierPreference(
+								ackWriteCtx, shared, self.receiveBufferSettings.WriteTimeout, sendAck.transportType,
+							)
+						}
+						if sendAck.transportType != TransportTypeUnknown {
+							blocked = disposition.initiallyBlocked
+							waitDuration = disposition.initialWaitDuration
+							if disposition.transportType != "" {
+								writtenTransportType = disposition.transportType
+							}
 						}
 						if writeErr == nil && !success {
 							writeErr = errTransferRouteWriteTimeout
 						}
-					} else {
-						writeErr = ackMultiRouteWriter.Write(
-							ackWriteCtx,
-							shared,
-							self.receiveBufferSettings.WriteTimeout,
-						)
 					}
 				} else {
 					writeErr = ackMultiRouteWriter.Write(
@@ -15064,12 +15181,13 @@ func (self *ReceiveSequence) Run() {
 						self.receiveBufferSettings.WriteTimeout,
 					)
 				}
-				self.client.recordReceiveAckRouteWrite(
+				self.client.recordReceiveAckRouteWriteDisposition(
 					writtenTransportType,
 					waitDuration,
 					blocked,
 					priority,
 					writeErr,
+					disposition,
 				)
 				progress.TransportType = writtenTransportType
 				endTransferProgress(progressObserver, progress, "ack_write_end", writeErr == nil, writeErr)
