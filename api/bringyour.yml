@@ -5076,7 +5076,8 @@ paths:
         Verify that a wallet holds a Seeker or Saga Genesis token by
         validating a signed message. Either holding succeeds; a wallet with
         neither is refused with `error.message` and `error.code`
-        `seeker_token_not_found`.
+        `seeker_token_not_found`, and a token lookup that fails is answered
+        the same way with `seeker_lookup_failed`.
       operationId: accountVerifySeekerToken
       security:
         - BearerAuth: []
