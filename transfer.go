@@ -6985,8 +6985,6 @@ func (self *SendSequence) ResendQueueSizeAndMessageTypes() (int, ByteCount, Id, 
 	return count, byteSize, self.sequenceId, messageTypes
 }
 
-// acquirePackAdmission spends the same caller timeout as channel admission.
-// The returned timeout is the remaining budget for the channel handoff.
 // awaitResendCapacity holds a reliable pack outside admission until the send
 // loop reports that the resend queue could take it, or the caller's timeout
 // runs out. Returns the remaining timeout.
@@ -7039,6 +7037,12 @@ func (self *SendSequence) awaitResendCapacity(
 // reliable admission gate uses capacity notifications rather than this timer.
 const resendCapacityPollInterval = 2 * time.Millisecond
 
+// Spends the same caller timeout as channel admission. The returned timeout is
+// the remaining budget for the channel handoff.
+//
+// A sender that finds no slot waits in arrival order, and the slot a release
+// frees is already this sender's when its ready channel closes. A sender that
+// gives up abandons its place, passing on any slot granted meanwhile.
 func (self *SendSequence) acquirePackAdmission(
 	sendPack *SendPack,
 	timeout time.Duration,
@@ -7047,45 +7051,46 @@ func (self *SendSequence) acquirePackAdmission(
 		return true, nil, timeout
 	}
 	startTime := time.Now()
-	var timer *time.Timer
-	var timeoutChannel <-chan time.Time
-	if 0 < timeout {
-		timer = time.NewTimer(timeout)
-		timeoutChannel = timer.C
-		defer timer.Stop()
+	admissionKey := sendPack.schedulingKey
+	if !self.flowIsolation.Load() {
+		// A carrier without explicit flow isolation gets the complete legacy
+		// admission capacity; only H3 reserves one slot for another flow.
+		admissionKey = sendSchedulingKey{}
 	}
-	for {
-		admissionKey := sendPack.schedulingKey
-		if !self.flowIsolation.Load() {
-			// A carrier without explicit flow isolation gets the complete legacy
-			// admission capacity; only H3 reserves one slot for another flow.
-			admissionKey = sendSchedulingKey{}
-		}
-		acquired, closed, notify := self.packAdmission.tryAcquire(admissionKey)
-		if acquired {
-			sendPack.admission = self.packAdmission
-			sendPack.admissionKey = admissionKey
-			if 0 < timeout {
-				timeout = max(time.Duration(0), timeout-time.Since(startTime))
-			}
-			return true, nil, timeout
-		}
-		if closed {
-			return false, errors.New("Done."), timeout
-		}
-		if timeout == 0 {
-			return false, nil, timeout
+	acquired, closed, waiter := self.packAdmission.tryAcquire(admissionKey, timeout != 0)
+	if waiter != nil {
+		var timeoutChannel <-chan time.Time
+		if 0 < timeout {
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			timeoutChannel = timer.C
 		}
 		select {
+		case <-waiter.ready:
+			acquired, closed = waiter.granted, !waiter.granted
 		case <-sendPack.Ctx.Done():
+			self.packAdmission.abandon(waiter)
 			return false, errors.New("Done."), timeout
 		case <-self.ctx.Done():
+			self.packAdmission.abandon(waiter)
 			return false, errors.New("Done."), timeout
-		case <-notify:
 		case <-timeoutChannel:
+			self.packAdmission.abandon(waiter)
 			return false, nil, timeout
 		}
 	}
+	if closed {
+		return false, errors.New("Done."), timeout
+	}
+	if !acquired {
+		return false, nil, timeout
+	}
+	sendPack.admission = self.packAdmission
+	sendPack.admissionKey = admissionKey
+	if 0 < timeout {
+		timeout = max(time.Duration(0), timeout-time.Since(startTime))
+	}
+	return true, nil, timeout
 }
 
 // success, error

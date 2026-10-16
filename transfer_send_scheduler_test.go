@@ -128,24 +128,69 @@ func TestSendPackAdmissionReservesSlotForNewFlow(t *testing.T) {
 	interactiveKey := testSendSchedulingKey(2000)
 	admission := newSendPackAdmission(4)
 	for count := range 3 {
-		acquired, closed, _ := admission.tryAcquire(bulkKey)
+		acquired, closed, _ := admission.tryAcquire(bulkKey, false)
 		if !acquired || closed {
 			t.Fatalf("bulk admission %d = acquired %t closed %t", count, acquired, closed)
 		}
 	}
-	if acquired, closed, _ := admission.tryAcquire(bulkKey); acquired || closed {
+	if acquired, closed, _ := admission.tryAcquire(bulkKey, false); acquired || closed {
 		t.Fatalf("fourth bulk admission = acquired %t closed %t, want reserved", acquired, closed)
 	}
-	if acquired, closed, _ := admission.tryAcquire(interactiveKey); !acquired || closed {
+	if acquired, closed, _ := admission.tryAcquire(interactiveKey, false); !acquired || closed {
 		t.Fatalf("interactive reserve = acquired %t closed %t", acquired, closed)
 	}
-	if acquired, closed, _ := admission.tryAcquire(testSendSchedulingKey(3000)); acquired || closed {
+	if acquired, closed, _ := admission.tryAcquire(testSendSchedulingKey(3000), false); acquired || closed {
 		t.Fatalf("admission beyond total cap = acquired %t closed %t", acquired, closed)
 	}
 
 	admission.release(bulkKey)
-	if acquired, closed, _ := admission.tryAcquire(bulkKey); !acquired || closed {
+	if acquired, closed, _ := admission.tryAcquire(bulkKey, false); !acquired || closed {
 		t.Fatalf("bulk admission after release = acquired %t closed %t", acquired, closed)
+	}
+}
+
+// A waiter can be granted a slot just as its caller gives up. Abandoning it
+// passes the slot to the next waiter rather than losing it; abandoning a
+// waiter not yet granted only takes it out of the queue.
+func TestSendPackAdmissionAbandonedGrantPassesToNextWaiter(t *testing.T) {
+	key := sendSchedulingKey{}
+	admission := newSendPackAdmission(1)
+	if acquired, closed, _ := admission.tryAcquire(key, false); !acquired || closed {
+		t.Fatalf("holder admission = acquired %t closed %t", acquired, closed)
+	}
+	if acquired, closed, waiter := admission.tryAcquire(key, false); acquired || closed || waiter != nil {
+		t.Fatalf("full admission without waiting = acquired %t closed %t waiter %p", acquired, closed, waiter)
+	}
+	_, _, first := admission.tryAcquire(key, true)
+	_, _, second := admission.tryAcquire(key, true)
+	_, _, third := admission.tryAcquire(key, true)
+	if first == nil || second == nil || third == nil {
+		t.Fatal("full admission did not queue its waiters")
+	}
+	granted := func(waiter *sendPackAdmissionWaiter) bool {
+		select {
+		case <-waiter.ready:
+			return waiter.granted
+		default:
+			return false
+		}
+	}
+
+	admission.abandon(second)
+	admission.release(key)
+	if !granted(first) || granted(second) || granted(third) {
+		t.Fatal("release did not grant the oldest waiter alone")
+	}
+	admission.abandon(first)
+	if granted(second) || !granted(third) {
+		t.Fatal("abandoned grant did not pass to the next waiter in the queue")
+	}
+	if admission.count != 1 || len(admission.waiters) != 0 {
+		t.Fatalf("admission after the hand-off holds %d slots and %d waiters, want 1 and 0", admission.count, len(admission.waiters))
+	}
+	admission.release(key)
+	if admission.count != 0 {
+		t.Fatalf("admission holds %d slots after every slot released", admission.count)
 	}
 }
 
@@ -205,7 +250,7 @@ func TestSendSequencePackAdmissionReservesFlowSlotWhenIsolated(t *testing.T) {
 func TestRawSendPackRecycleReleasesAdmission(t *testing.T) {
 	key := testSendSchedulingKey(1000)
 	admission := newSendPackAdmission(1)
-	acquired, closed, _ := admission.tryAcquire(key)
+	acquired, closed, _ := admission.tryAcquire(key, false)
 	if !acquired || closed {
 		t.Fatalf("initial admission = acquired %t closed %t", acquired, closed)
 	}
@@ -220,7 +265,7 @@ func TestRawSendPackRecycleReleasesAdmission(t *testing.T) {
 	if recycled := <-pool; recycled != sendPack {
 		t.Fatalf("recycled pack = %p, want %p", recycled, sendPack)
 	}
-	if acquired, closed, _ := admission.tryAcquire(key); !acquired || closed {
+	if acquired, closed, _ := admission.tryAcquire(key, false); !acquired || closed {
 		t.Fatalf("admission after raw recycle = acquired %t closed %t", acquired, closed)
 	}
 }
