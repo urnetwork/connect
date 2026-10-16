@@ -28,15 +28,42 @@ func newH1SpeedTestFixture(t *testing.T) (*h1LivenessFixture, int) {
 	return fixture, queueSize
 }
 
+// Probe chunks that differ from each other, so the order of their echoes is
+// visible. Each is filled with its index, so the count must stay below 256.
+func h1SpeedTestProbeMessages(t *testing.T, probeCount int) [][]byte {
+	t.Helper()
+	if 256 <= probeCount {
+		t.Fatalf("%d probes cannot each have their own fill byte", probeCount)
+	}
+	probeMessages := make([][]byte, probeCount)
+	for index := range probeMessages {
+		probeMessages[index] = bytes.Repeat([]byte{byte(index)}, h1SpeedTestProbeByteCount)
+	}
+	return probeMessages
+}
+
+// The index of the first message that differs between the two runs, or -1
+// when they are equal.
+func firstMessageMismatch(gotMessages [][]byte, wantMessages [][]byte) int {
+	for index := range min(len(gotMessages), len(wantMessages)) {
+		if !bytes.Equal(gotMessages[index], wantMessages[index]) {
+			return index
+		}
+	}
+	if len(gotMessages) != len(wantMessages) {
+		return min(len(gotMessages), len(wantMessages))
+	}
+	return -1
+}
+
 // Starts a speed test, waits until its start echo is the peer's last read, and
-// writes probeCount probes from a separate peer writer. The returned channel
-// yields how many probes the client reader took.
+// writes the probes from a separate peer writer. The returned channel yields
+// how many probes the client reader took.
 func startH1SpeedTestOnStalledUplink(
 	t *testing.T,
 	fixture *h1LivenessFixture,
 	startMessage []byte,
-	probeMessage []byte,
-	probeCount int,
+	probeMessages [][]byte,
 ) <-chan int {
 	t.Helper()
 	if err := fixture.peer.WriteMessage(websocket.BinaryMessage, startMessage); err != nil {
@@ -51,7 +78,7 @@ func startH1SpeedTestOnStalledUplink(
 	probesWritten := make(chan int, 1)
 	go func() {
 		writtenCount := 0
-		for range probeCount {
+		for _, probeMessage := range probeMessages {
 			if fixture.peer.WriteMessage(websocket.BinaryMessage, probeMessage) != nil {
 				break
 			}
@@ -81,10 +108,10 @@ func TestH1SpeedTestEchoBackpressureKeepsGenerationAndFrames(t *testing.T) {
 
 		startMessage := []byte{TransportControlSpeedStart, 0, 0, 0, 7}
 		stopMessage := []byte{TransportControlSpeedStop, 0, 0, 0, 7}
-		probeMessage := bytes.Repeat([]byte{0xa5}, h1SpeedTestProbeByteCount)
 		// more probes than the blocked writer, its queue and the reader hold
 		probeCount := 2*queueSize + 16
-		probesWritten := startH1SpeedTestOnStalledUplink(t, fixture, startMessage, probeMessage, probeCount)
+		probeMessages := h1SpeedTestProbeMessages(t, probeCount)
+		probesWritten := startH1SpeedTestOnStalledUplink(t, fixture, startMessage, probeMessages)
 		// the uplink stays stalled for less than the writer's deadline
 		time.Sleep(fixture.transport.settings.WriteTimeout / 2)
 		synctest.Wait()
@@ -119,15 +146,22 @@ func TestH1SpeedTestEchoBackpressureKeepsGenerationAndFrames(t *testing.T) {
 			MessagePoolReturn(receivedMessage)
 		}
 		echoCount := fixture.payloads.Load()
-		echoByteCount := fixture.payloadBytes.Load()
+		echoByteCount := fixture.payloadByteCount.Load()
 		wantEchoCount := int64(1 + probeCount + 1)
-		wantEchoByteCount := int64(len(startMessage) + probeCount*len(probeMessage) + len(stopMessage))
+		wantEchoByteCount := int64(len(startMessage) + probeCount*h1SpeedTestProbeByteCount + len(stopMessage))
 		if writtenCount != probeCount || stopErr != nil || frameErr != nil ||
 			echoCount != wantEchoCount || echoByteCount != wantEchoByteCount || !delivered {
 			t.Fatalf(
 				"speed test lost frames: probes written %d/%d, stop error %v, echoes %d/%d messages and %d/%d bytes, later frame error %v delivered %t",
 				writtenCount, probeCount, stopErr, echoCount, wantEchoCount, echoByteCount, wantEchoByteCount, frameErr, delivered,
 			)
+		}
+		// the platform times exactly the messages it sent, in the order it
+		// sent them, ending with the stop echo
+		wantMessages := append(append([][]byte{startMessage}, probeMessages...), stopMessage)
+		echoMessages := fixture.payloadMessagesSnapshot()
+		if index := firstMessageMismatch(echoMessages, wantMessages); 0 <= index {
+			t.Fatalf("echo %d of %d is not what the platform sent there (%d echoes)", index, len(wantMessages), len(echoMessages))
 		}
 		fixture.assertConnected(t)
 		if refusalCount := fixture.transport.ReceiveStats().H1ControlRefusalCount; refusalCount != 0 {
@@ -150,8 +184,7 @@ func TestH1SpeedTestEchoStalledWriterEndsGenerationAtWriteDeadline(t *testing.T)
 			t,
 			fixture,
 			[]byte{TransportControlSpeedStart, 0, 0, 0, 9},
-			bytes.Repeat([]byte{0xa5}, h1SpeedTestProbeByteCount),
-			probeCount,
+			h1SpeedTestProbeMessages(t, probeCount),
 		)
 		if !fixture.transport.IsConnected() {
 			t.Fatal("a full speed-test echo queue closed the generation before the writer's deadline")
