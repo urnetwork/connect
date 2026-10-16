@@ -15581,6 +15581,12 @@ func (self *ReceiveSequence) Run() {
 				}
 				// item.sequenceNumber <= self.nextSequenceNumber
 
+				if self.nextSequenceNumber == item.sequenceNumber && self.holdHead(item) {
+					// The delivery ledger is full. The ready head stays held,
+					// owns no gap deadline, and a ledger drain wakes this loop.
+					break
+				}
+
 				self.receiveQueue.RemoveByMessageId(item.messageId)
 
 				if self.nextSequenceNumber == item.sequenceNumber {
@@ -15739,6 +15745,8 @@ func (self *ReceiveSequence) Run() {
 			if !processPack(receivePack, ok) {
 				return
 			}
+		case <-self.deliveryWake():
+			// The ledger drained after it refused a held head.
 		case <-idleTimer.C:
 			if 0 == self.receiveQueue.Len() {
 				// An open Pack can be waiting for this worker to receive; its idle
@@ -15908,8 +15916,10 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 	// A duplicate must not surrender a committed owner's exact reservation:
 	// another flow could take it before re-admission. Keep the original and
 	// repeat its selective ACK. An arriving ordered/head item still takes the
-	// direct-delivery path below and can drain a completely full hold.
-	if self.receiveQueue.lifetimeBudget && sequenceNumber > self.nextSequenceNumber {
+	// direct-delivery path below and can drain a completely full hold, unless
+	// the head itself is held for delivery capacity: then it is a duplicate.
+	if self.receiveQueue.lifetimeBudget && sequenceNumber > self.nextSequenceNumber ||
+		sequenceNumber == self.nextSequenceNumber && self.receiveQueue.GetBySequenceNumber(sequenceNumber) != nil {
 		held := self.receiveQueue.GetByMessageId(messageId)
 		if held == nil {
 			held = self.receiveQueue.GetBySequenceNumber(sequenceNumber)
@@ -15939,7 +15949,10 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		removedItem.messagePoolReturn()
 	}
 
-	if sequenceNumber <= self.nextSequenceNumber {
+	// A head the delivery ledger cannot take yet is held like a later
+	// arrival, and the hold drain delivers it once the ledger has room.
+	if sequenceNumber < self.nextSequenceNumber ||
+		sequenceNumber == self.nextSequenceNumber && !self.holdHead(item) {
 		if self.nextSequenceNumber == sequenceNumber {
 			// this item is the head of sequence
 			if self.log.V(2).Enabled() {

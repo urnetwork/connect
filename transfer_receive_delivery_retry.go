@@ -59,6 +59,26 @@ func (r *receiveDeliveryReceipt) operation(flow ipPacketFlowKey, control bool,
 	return op
 }
 
+// Reports a deferred data decode still outstanding. A deferred decode carries
+// the zero flow, which no parsed packet has, so pump keeps deferred data in
+// arrival order without ordering any flow; a deferred control is unordered.
+func (q *receiveDeliveryQueue) decodeDeferred() bool {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	for _, op := range q.operations {
+		if op.flow != (ipPacketFlowKey{}) || op.control {
+			continue
+		}
+		op.mutex.Lock()
+		terminal := op.terminal
+		op.mutex.Unlock()
+		if !terminal {
+			return true
+		}
+	}
+	return false
+}
+
 func (q *receiveDeliveryQueue) notify() {
 	select {
 	case q.wake <- struct{}{}:
