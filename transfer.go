@@ -1132,9 +1132,15 @@ type SendPack struct {
 	// logicalGroup marks Frames as one admission/completion unit. The owning
 	// SendSequence may split it into ordered wire Packs at the transport-safe
 	// frame/byte bounds without returning to Client routing or admission.
-	logicalGroup    bool
+	logicalGroup bool
+	// The first frame serialization has not taken. Serialization takes a
+	// chunk when it is called, so the cursor passes the chunk before the call.
 	groupFrameIndex int
 	groupCompletion *sendGroupCompletion
+	// Set before serialization is called with this Pack's last frames: it
+	// takes them and the Pack's records at the call. The Pack then owns only
+	// itself, its admission slot and its prepared handoff.
+	serialized bool
 	// Logical-group chunk limits are pinned when the first chunk enters its
 	// SendSequence. H1 can safely carry a larger WebSocket message; pinning
 	// keeps completion accounting stable if carrier availability changes while
@@ -3495,7 +3501,13 @@ func sendPackReadyDrainLimits(policy transferFlightPolicySnapshot) (int, ByteCou
 // disposeUnsentGroup completes and releases only chunks that have not reached
 // serialization. Already materialized chunks retain their independent send
 // item ownership and converge on the same group completion during teardown.
+// A Pack serialization has taken whole releases only itself: its frames and
+// records belong to that call even if its write unwinds.
 func (self *SendPack) disposeUnsentGroup(err error) {
+	if self.serialized {
+		self.releaseRaw()
+		return
+	}
 	self.dispositionRange(self.groupFrameIndex, len(self.frameList())).complete(false)
 	if !self.logicalGroup || self.groupCompletion == nil {
 		self.completeLifecycleFirstRouteWrite(err)
@@ -7853,6 +7865,8 @@ func (self *SendSequence) coalesceReceivedAck(
 // processLogicalGroupChunk materializes at most one transport-safe wire Pack.
 // Returning one chunk per Run iteration preserves resend-budget backpressure;
 // the retained SendPack cursor remains the sole owner of every later frame.
+// Serialization takes a chunk at its call, so the cursor passes the chunk
+// first: a write that unwinds leaves the Pack only the frames after it.
 func (self *SendSequence) processLogicalGroupChunk(
 	sendPack *SendPack,
 	withoutAckPromotion bool,
@@ -7903,6 +7917,8 @@ func (self *SendSequence) processLogicalGroupChunk(
 		self.client.unreliableNoAckAdmissionBypassCount.Add(1)
 	}
 	if sendPack.groupCompletion == nil && end == len(sendPack.Frames) {
+		sendPack.groupFrameIndex = end
+		sendPack.serialized = true
 		self.sendGroupRecord(
 			sendPack.dispositionRange(start, end),
 			frames,
@@ -7912,7 +7928,6 @@ func (self *SendSequence) processLogicalGroupChunk(
 			sendPack.ForceUnwrapped,
 			sendPack.schedulingKey,
 		)
-		sendPack.groupFrameIndex = end
 		sendPack.releaseRaw()
 		return true, true, false
 	}
@@ -7928,6 +7943,8 @@ func (self *SendSequence) processLogicalGroupChunk(
 			self.sendBuffer.afterCreateSendGroupCompletionForTest(self.id(), chunkCount)
 		}
 	}
+	sendPack.groupFrameIndex = end
+	sendPack.serialized = end == len(sendPack.Frames)
 	materialized := self.sendGroupRecord(
 		sendPack.dispositionRange(start, end),
 		frames,
@@ -7937,7 +7954,6 @@ func (self *SendSequence) processLogicalGroupChunk(
 		sendPack.ForceUnwrapped,
 		sendPack.schedulingKey,
 	)
-	sendPack.groupFrameIndex = end
 	if !materialized && end < len(sendPack.Frames) {
 		sendPack.disposeUnsentGroup(sendPack.dispositionRange(end, len(sendPack.Frames)).capacityError(ErrSendPackNotAdmitted))
 		return true, true, false
@@ -8914,6 +8930,9 @@ func (self *SendSequence) Run() {
 		sendPack.disposeUnsentGroup(err)
 	}
 	defer scheduler.Drain(disposeScheduledPack)
+	// The teardown owner of each Pack taken from the scheduler for this pass.
+	// While serialization runs, a slot owns only the Pack itself: serialization
+	// takes the frames and records at its call (see SendPack.serialized).
 	var processingPacks [sendPackH1GroupMaxFrames]*SendPack
 	defer func() {
 		for packIndex, sendPack := range processingPacks {
@@ -9443,7 +9462,11 @@ sendSequenceLoop:
 					if bypassedRecoveryAdmission {
 						self.client.unreliableNoAckAdmissionBypassCount.Add(1)
 					}
+					// Serialization takes every frame and record at the call,
+					// on its refusal and an unwinding write too, so the slots
+					// keep only the Packs until their release below.
 					if sendPackCount == 1 {
+						sendPack.serialized = true
 						self.sendRecordForSchedulingKey(
 							sendPack.frameList(),
 							sendPack.ackRecord(),
@@ -9461,6 +9484,9 @@ sendSequenceLoop:
 							frames = append(frames, sendPacks[packIndex].frameList()...)
 							acks.add(sendPacks[packIndex].ackRecord())
 							noAckSends.add(sendPacks[packIndex].noAckRecord())
+						}
+						for packIndex := range sendPackCount {
+							sendPacks[packIndex].serialized = true
 						}
 						self.sendRecordsForSchedulingKey(
 							frames,
@@ -10560,8 +10586,17 @@ func (self *SendSequence) sendWithSetContractRecords(
 		setContract, forceUnwrapped, schedulingKey, aheadContract, sendGroupDisposition{})
 }
 
+// What an unwinding initial write still owned reports this. The sequence is
+// closing, like the one whose retained items report the same text.
+var errSendSequenceUnwound = errors.New("Send sequence closed.")
+
 // Reports original member ownership at the actual serialization boundary,
 // without retaining another descriptor in the resulting resend item.
+//
+// Takes every frame and record it is given, at the call: it disposes each of
+// them once on every exit, its refusal, success, or a writer, observer or hook
+// that unwinds the sequence. Each claim below is cleared as its part is handed
+// on; the deferred release disposes only what an unwind left here.
 func (self *SendSequence) sendWithSetContractDisposition(
 	sendFrames []*protocol.Frame,
 	acks sendAckSet,
@@ -10603,6 +10638,29 @@ func (self *SendSequence) sendWithSetContractDisposition(
 	}
 	item := takeSendItem()
 	*item = sendItem{acks: acks}
+	ownDisposition, ownFrames, ownRouteWrite, ownNoAck, ownItem := true, true, true, true, true
+	defer func() {
+		if ownDisposition {
+			disposition.complete(false)
+		}
+		if ownFrames {
+			for _, frame := range sendFrames {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+		}
+		// Route-write phases precede the terminal one: a group's terminal
+		// waits until every chunk has reported its first route write.
+		if ownRouteWrite {
+			item.acks.firstRouteWrite(errSendSequenceUnwound)
+		}
+		if ownNoAck {
+			noAckSends.complete(errSendSequenceUnwound)
+		}
+		if ownItem {
+			item.acks.invoke(errSendSequenceUnwound)
+			self.returnSendItem(item)
+		}
+	}()
 	groupMemoryBytes := disposition.memoryByteCount()
 	if disposition.target != nil && self.sendBufferSettings.beforeGroupRetainForTest != nil {
 		self.sendBufferSettings.beforeGroupRetainForTest()
@@ -10630,6 +10688,8 @@ func (self *SendSequence) sendWithSetContractDisposition(
 		return nil
 	})
 	if admissionErr != nil {
+		// The refusal disposes every part itself.
+		ownDisposition, ownFrames, ownRouteWrite, ownNoAck, ownItem = false, false, false, false, false
 		disposition.complete(false)
 		// No frame has been allocated or published. A cross-flow loser
 		// returns every input and cannot leave a sequence/contract gap.
@@ -10841,12 +10901,16 @@ func (self *SendSequence) sendWithSetContractDisposition(
 		if acks.retainPastAckTimeout() {
 			self.protectRetainedAdmission()
 		}
+		// The sequence's retained item owners release it from here.
+		ownItem = false
 		self.sendItems = append(self.sendItems, item)
 		self.addResendItem(item)
 	}
+	ownDisposition = false
 	disposition.complete(ack)
 	// Report source ownership before pool return, still synchronously and
 	// before any observer or writer. No deferred frame slice is retained.
+	ownFrames = false
 	for _, frame := range sendFrames {
 		MessagePoolReturn(frame.MessageBytes)
 	}
@@ -10886,6 +10950,7 @@ func (self *SendSequence) sendWithSetContractDisposition(
 	}
 	// The first physical writer attempt is distinct from terminal reliable
 	// acknowledgement. Coalesced records retain one phase per original Pack.
+	ownRouteWrite = false
 	acks.firstRouteWrite(err)
 	// Requested NoAck completion is an initial route-write disposition, not a
 	// wire-ack disposition. Invoke it once here even when an unacknowledged
@@ -10899,6 +10964,7 @@ func (self *SendSequence) sendWithSetContractDisposition(
 	if err != nil && 0 < noAckSends.count {
 		self.client.sendNoAckDiscardCount.Add(uint64(noAckSends.count))
 	}
+	ownNoAck = false
 	noAckSends.complete(err)
 
 	if ack {
@@ -10918,6 +10984,7 @@ func (self *SendSequence) sendWithSetContractDisposition(
 		// ignore the write error since the item will be resent
 	} else {
 		// immediately ack
+		ownItem = false
 		if err == nil {
 			self.ackItem(item)
 		} else {
