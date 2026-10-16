@@ -415,6 +415,117 @@ func TestDialFailureSignalAfterTheInferenceBarsItsExitsLateAnswer(t *testing.T) 
 	})
 }
 
+// Opens a flow on exit a, the only exit of the best tier, and lets the silence
+// inference unbind it at the app's 3s retransmit, which re-races onto exits b
+// and c. Every exit takes its SYN and none answers, so the flow is left
+// racing b and c, which a race never commits on for a SYN.
+func reracedOntoSilentExits(t *testing.T, harness *reraceHarness, path *IpPath) *multiClientChannelUpdate {
+	t.Helper()
+	a := harness.channel("a")
+	start := time.Now()
+	harness.syn(path)
+	if harness.boundTo(path) != a {
+		t.Fatal("setup: the first SYN did not bind the flow to exit a")
+	}
+	harness.sleep(reraceSynSchedule[1])
+	harness.syn(path)
+	harness.sleep(start.Add(reraceSynSchedule[2]).Sub(time.Now()))
+	harness.syn(path)
+	update := harness.update(path)
+	racing := func() bool {
+		update.stateLock.Lock()
+		defer update.stateLock.Unlock()
+		return update.client.Load() == nil && update.race != nil &&
+			update.race.clientStates[harness.channel("b")] != nil &&
+			update.race.clientStates[harness.channel("c")] != nil
+	}()
+	if !racing {
+		t.Fatal("setup: the inference did not re-race the flow onto exits b and c")
+	}
+	for _, name := range []string{"b", "c"} {
+		if got := len(harness.exit(name).syns(path)); got != 1 {
+			t.Fatalf("setup: exit %s received %d SYNs, want the re-raced retransmit", name, got)
+		}
+	}
+	return update
+}
+
+// Exit a's SYN-ACK for the attempt arrives while the flow races the silent
+// exits b and c. a carried the attempt, so its answer joins the race as a
+// candidate's would and wins it: the app gets the SYN-ACK at once, the flow is
+// established on a, and b and c are reset as any race commit resets its
+// other candidates. Dropped as coming from no candidate of the race, a's
+// answers would leave the app retransmitting into the silent race until its
+// connect timed out.
+func TestCarryingExitsAnswerWinsAReraceOfSilentExits(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
+			{name: "b", tier: 1, answer: reraceAlways(reraceSilent)},
+			{name: "c", tier: 1, answer: reraceAlways(reraceSilent)},
+		}, nil)
+		path := unboundFlowTcpPath(50330)
+		update := reracedOntoSilentExits(t, harness, path)
+
+		harness.inject("a", reraceSynAck(path))
+		if _, ok := harness.synAck(path); !ok {
+			t.Fatal("exit a's SYN-ACK did not reach the app")
+		}
+		if got := len(harness.log.linesWith("receive client not part of race")); got != 0 {
+			t.Errorf("%d not-part-of-race drops, want none", got)
+		}
+		if update.client.Load() != harness.channel("a") || !update.receivedInbound.Load() {
+			t.Error("the flow is not established on exit a")
+		}
+		for _, name := range []string{"b", "c"} {
+			resets := 0
+			for _, packet := range harness.exit(name).received(path) {
+				if packet.path.Rst {
+					resets += 1
+				}
+			}
+			if resets != 1 {
+				t.Errorf("exit %s received %d resets, want the abandoned candidate's one", name, resets)
+			}
+		}
+	})
+}
+
+// An exit that signaled a dial failure for the attempt does not win the race
+// of silent exits with a later answer: its late signal still marks it
+// (TestDialFailureSignalAfterTheInferenceBarsItsExitsLateAnswer), and its
+// SYN-ACK is dropped as coming from no candidate of the race, which goes on.
+func TestSignaledExitsAnswerDoesNotWinAReraceOfSilentExits(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
+			{name: "b", tier: 1, answer: reraceAlways(reraceSilent)},
+			{name: "c", tier: 1, answer: reraceAlways(reraceSilent)},
+		}, nil)
+		path := unboundFlowTcpPath(50335)
+		update := reracedOntoSilentExits(t, harness, path)
+
+		harness.inject("a", reraceProviderSignal(t, path))
+		harness.inject("a", reraceSynAck(path))
+		if got := len(harness.delivered(path)); got != 0 {
+			t.Fatalf("the app received %d packets after exit a signaled a dial failure, want none", got)
+		}
+		if got := len(harness.log.linesWith("receive client not part of race")); got != 1 {
+			t.Errorf("%d not-part-of-race drops, want the SYN-ACK's", got)
+		}
+		stillRacing := func() bool {
+			update.stateLock.Lock()
+			defer update.stateLock.Unlock()
+			return update.client.Load() == nil && update.race != nil
+		}()
+		if !stillRacing {
+			t.Error("a signaled exit's answer ended the race")
+		}
+	})
+}
+
 // When every candidate of the retransmit's re-race refuses it, the race ends,
 // as a race of one does, rather than lingering empty until the flow's next
 // send. The exit that carried the attempt then adopts its late SYN-ACK, which
