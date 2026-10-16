@@ -379,8 +379,7 @@ func (self *lagApiLoad) uploadVerified() bool {
 	if self.upload == nil {
 		return false
 	}
-	firstByteTime, _, end := self.upload.state()
-	return !firstByteTime.IsZero() && end != lagApiPhaseEndMismatch
+	return self.upload.verified()
 }
 
 // One measurement session (M4).
@@ -1307,7 +1306,7 @@ func (self *lagApiSession) run() {
 			}
 			return true
 		}
-		uploadFirstByteTime, uploadEndedTime, uploadEnd := load.upload.state()
+		uploadFirstByteTime, uploadEndedTime, uploadEnd, uploadFinal := load.upload.settlementState()
 		switch uploadEnd {
 		case lagApiPhaseRunning:
 			if !uploadFirstByteTime.IsZero() && !load.progressStarted {
@@ -1316,9 +1315,9 @@ func (self *lagApiSession) run() {
 			}
 		case lagApiPhaseEndTime:
 			// reads that arrive past the end still count for what they carry
-			// from before it; the phase wakes the loop once its window is
-			// final, at most lagSpreadMax after the end (amendment 15)
-			if !load.upload.windowFinal() {
+			// from before it, at most lagSpreadMax after the end (amendment
+			// 15). Settlement also waits for those bytes' sampled verification.
+			if !uploadFinal {
 				return true
 			}
 			endReason := protocol.LagEndReason_LAG_END_COMPLETE
