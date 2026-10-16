@@ -7,6 +7,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -458,20 +459,32 @@ func TestRemoteUserNatProviderUdpReturnQueueIsBoundedAndOrdered(t *testing.T) {
 	started := make(chan struct{}, 3)
 	releaseFirst := make(chan struct{})
 	var releaseFirstOnce sync.Once
+	// The worker's second send waits until the test has taken the first pack
+	// from the one-slot handoff below. A datagram return is zero-wait, so a
+	// successor attempted while its predecessor still fills the slot is
+	// refused, which is correct and would leave no second pack to check.
+	releaseSecond := make(chan struct{})
+	var releaseSecondOnce sync.Once
 	t.Cleanup(func() {
 		releaseFirstOnce.Do(func() {
 			close(releaseFirst)
 		})
+		releaseSecondOnce.Do(func() {
+			close(releaseSecond)
+		})
 	})
-	var blockFirst sync.Once
+	var startCount atomic.Int32
 	provider.returnSendStarted = func() {
 		select {
 		case started <- struct{}{}:
 		default:
 		}
-		blockFirst.Do(func() {
+		switch startCount.Add(1) {
+		case 1:
 			<-releaseFirst
-		})
+		case 2:
+			<-releaseSecond
+		}
 	}
 
 	packets := make([][]byte, 3)
@@ -533,6 +546,9 @@ func TestRemoteUserNatProviderUdpReturnQueueIsBoundedAndOrdered(t *testing.T) {
 		close(releaseFirst)
 	})
 	first := waitProviderReturnTestPack(t, sequence)
+	releaseSecondOnce.Do(func() {
+		close(releaseSecond)
+	})
 	if !bytes.Equal(providerCallbackQueuePacketBytes(t, first), expectedPackets[0]) {
 		t.Fatal("provider changed the first queued packet")
 	}
@@ -584,6 +600,97 @@ func TestRemoteUserNatProviderUdpReturnQueueIsBoundedAndOrdered(t *testing.T) {
 	stats = provider.PacketStats()
 	if stats.BlockIngressPacketCount != 0 || stats.BlockEgressPacketCount != 0 {
 		t.Fatalf("provider return congestion changed security block stats: %+v", stats)
+	}
+}
+
+// The ordering the test above holds explicitly: a datagram return the worker
+// attempts while its predecessor still fills the one-slot handoff is refused
+// at once rather than waited for, counted as a return send drop with its
+// buffer released, and the worker goes on to the next return.
+func TestRemoteUserNatProviderUdpReturnRefusedWhileHandoffHoldsPredecessor(t *testing.T) {
+	settings := DefaultRemoteUserNatProviderSettings()
+	settings.WriteTimeout = time.Hour
+	settings.ReturnSendWorkerCount = 1
+	settings.ReturnSendQueueSize = 1
+	provider, client, _ := newProviderTransferKeyTestFixtureWithSettings(t, settings)
+	peerId := NewId()
+	source := SourceId(peerId)
+	transferKey := TransferKey{
+		ForceStream:    true,
+		EncryptionRole: protocol.SequenceRole_SequenceRoleServer,
+	}
+	// one handoff slot, which nothing drains until the test takes from it
+	sequence := installProviderReturnTestSequence(t, provider, client, sendSequenceId{
+		Destination:       peerId,
+		CompanionContract: true,
+		ForceStream:       true,
+		EncryptionRole:    sequenceTlsRoleServer,
+	})
+	sendResults := make(chan providerReturnSendResult, 3)
+	provider.afterReturnSendForTest = func(result providerReturnSendResult) {
+		sendResults <- result
+	}
+
+	packets := make([][]byte, 3)
+	expectedPackets := make([][]byte, len(packets))
+	for packetIndex := range packets {
+		packets[packetIndex] = MessagePoolCopy(craftSecurityPacket(
+			IpProtocolUdp,
+			net.ParseIP("203.0.113.7"),
+			8080,
+			net.ParseIP("10.0.0.9"),
+			42001,
+			false,
+			[]byte{byte(packetIndex + 1)},
+		))
+		expectedPackets[packetIndex] = append([]byte(nil), packets[packetIndex]...)
+	}
+	ipPath, err := ParseIpPath(packets[0])
+	if err != nil {
+		t.Fatalf("parse provider return packet: %v", err)
+	}
+	receive := func(packet []byte) {
+		waitProviderCallbackReturn(t, func() {
+			provider.receiveTransfer(source, transferKey, protocol.ProvideMode_Public, ipPath, packet)
+		})
+	}
+
+	// the predecessor takes the slot and stays there
+	receive(packets[0])
+	waitProviderReturnSendResult(t, sendResults, true, 1, ByteCount(len(expectedPackets[0])))
+	// its successor finds the slot full
+	receive(packets[1])
+	waitProviderReturnSendResult(t, sendResults, false, 1, ByteCount(len(expectedPackets[1])))
+	if !MessagePoolReturn(packets[1]) {
+		t.Fatal("the refused return retained its sender reference")
+	}
+	drops := provider.CongestionDropStats()
+	if drops.ReturnSendPacketCount != 1 || drops.ReturnSendByteCount != ByteCount(len(expectedPackets[1])) {
+		t.Fatalf("provider return send drops = %+v, want the refused successor", drops)
+	}
+	if drops.ReturnQueuePacketCount != 0 {
+		t.Fatalf("the refused send was counted as a queue overflow: %+v", drops)
+	}
+
+	first := waitProviderReturnTestPack(t, sequence)
+	if !bytes.Equal(providerCallbackQueuePacketBytes(t, first), expectedPackets[0]) {
+		t.Fatal("the slot holds another packet than the predecessor")
+	}
+	first.returnFrames()
+	if !MessagePoolReturn(packets[0]) {
+		t.Fatal("the predecessor retained its sender reference")
+	}
+
+	// the worker goes on with the next return
+	receive(packets[2])
+	waitProviderReturnSendResult(t, sendResults, true, 1, ByteCount(len(expectedPackets[2])))
+	next := waitProviderReturnTestPack(t, sequence)
+	if !bytes.Equal(providerCallbackQueuePacketBytes(t, next), expectedPackets[2]) {
+		t.Fatal("the worker did not send the return after the refusal")
+	}
+	next.returnFrames()
+	if !MessagePoolReturn(packets[2]) {
+		t.Fatal("the next return retained its sender reference")
 	}
 }
 
