@@ -303,6 +303,8 @@ func TestRetainedSendFullBudgetStillPermitsNoAckControl(t *testing.T) {
 }
 
 func TestRetainedColdReliableBacklogDoesNotHideNoAck(t *testing.T) {
+	// The process-wide pool worker must start outside the fixture's bubble.
+	MessagePoolReturn(MessagePoolGet(1))
 	synctest.Test(t, func(t *testing.T) {
 		assertMessagePoolOwnership(t)
 		budget := NewTransferMemoryBudget(kib(64))

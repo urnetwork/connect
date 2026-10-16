@@ -271,8 +271,15 @@ func TestSendSequenceHeldByItsWindowPassesItsLifetimeBudgetTurnOn(t *testing.T) 
 			}
 		})
 		// Turns in arrival order fill the window of the second sequence.
-		for _, want := range []int{0, 1, 2, 0} {
-			if writers := fixture.acknowledge(-1); len(writers) != 1 || writers[0] != want {
+		for index, want := range []int{0, 1, 2, 0} {
+			acknowledged := -1
+			if index == 3 {
+				// Leave the second sequence's item outstanding. It is now
+				// the oldest item, so acknowledging any item would free its
+				// window and erase the condition this test needs to exercise.
+				acknowledged = 2
+			}
+			if writers := fixture.acknowledge(acknowledged); len(writers) != 1 || writers[0] != want {
 				t.Fatalf("Packs written in turn = %v, want sequence %d's", writers, want)
 			}
 		}
