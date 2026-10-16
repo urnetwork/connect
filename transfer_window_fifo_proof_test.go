@@ -17,7 +17,8 @@ import (
 // ownership even below the three-SACK threshold and with lane recovery off.
 func TestWindowPacingFifoProofDefeatsProgressDeferral(t *testing.T) {
 	for _, proof := range []bool{false, true} {
-		t.Run(fmt.Sprintf("later_ack=%t", proof), func(t *testing.T) {
+		t.Logf("later_ack=%t", proof)
+		func() {
 			assertMessagePoolOwnership(t)
 			synctest.Test(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
@@ -152,7 +153,7 @@ func TestWindowPacingFifoProofDefeatsProgressDeferral(t *testing.T) {
 					t.Fatalf("same-FIFO later ACK=%t, head recovered=%t by original due + %s; timeout deferrals=%d", proof, recovered, nextInterval/2, client.timeoutResendDeferCount.Load())
 				}
 			})
-		})
+		}()
 	}
 }
 
@@ -197,7 +198,8 @@ func TestWindowPacingFifoProofRequiresStableSameRoute(t *testing.T) {
 			item.unreliableCarrierObserved = true
 		}, want: false},
 	} {
-		t.Run(test.name, func(t *testing.T) {
+		t.Logf("case: %s", test.name)
+		func() {
 			settings := DefaultSendBufferSettings()
 			settings.DeliverySizedWindowScale = 2
 			writer := &windowPacingPolicyWriter{policy: transferFlightPolicySnapshot{h1Only: true}}
@@ -213,6 +215,6 @@ func TestWindowPacingFifoProofRequiresStableSameRoute(t *testing.T) {
 			if got := sequence.shouldDeferTimeoutResend(item, time.Second); got != test.want {
 				t.Fatalf("progress deferral=%t, want=%t", got, test.want)
 			}
-		})
+		}()
 	}
 }

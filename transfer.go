@@ -3085,6 +3085,22 @@ func gapHoleCarrierOf(item *sendItem) gapHoleCarrier {
 	return gapHoleCarrierReliable
 }
 
+// Queue residence applies only to an unchanged reliable item on paced H1.
+func (self *SendSequence) stablePacedFifo(item *sendItem) bool {
+	return item != nil && self.sendBufferSettings.DeliverySizedWindowScale > 0 &&
+		item.reliableCarrierObserved && !item.unreliableCarrierObserved && !item.carrierChanged &&
+		self.transferFlightPolicy().h1Only
+}
+
+// A strictly later acknowledgment must belong to this item's exact route.
+func (self *SendSequence) laneAcknowledgedPast(item *sendItem) bool {
+	if item == nil {
+		return false
+	}
+	highest, acked := self.laneHighestAcked(item.carrierRoute)
+	return acked && item.sequenceNumber < highest
+}
+
 // shouldDeferTimeoutResend reports whether a due timeout is the spurious
 // cascade of §13.5 (F12) rather than a stalled lane: the cumulative ack
 // advanced within one scaled round trip of this item's send, so the
@@ -3106,14 +3122,12 @@ func (self *SendSequence) shouldDeferTimeoutResend(
 	// a lost head stops that progress and gets its ordinary timeout.
 	// Mixed reliable lanes retain their bounded deferral policy. Unreliable
 	// flights use the cumulative-silence deadline in the send loop instead.
-	pacedFifo := self.sendBufferSettings.DeliverySizedWindowScale > 0 &&
-		item.reliableCarrierObserved && !item.carrierChanged &&
-		self.transferFlightPolicy().h1Only
+	pacedFifo := self.stablePacedFifo(item)
 	if pacedFifo {
 		// This same FIFO already passed the item. A lower cumulative ACK
 		// cannot make an endpoint drop into queued bytes, even when fewer
 		// than three later selective ACKs leave recovery with this timer.
-		if highest, acked := self.laneHighestAcked(item.carrierRoute); acked && item.sequenceNumber < highest {
+		if self.laneAcknowledgedPast(item) {
 			return false
 		}
 	}
@@ -8085,6 +8099,16 @@ func (self *SendSequence) scheduleSelectiveAckRecovery(currentTime time.Time) bo
 		}
 		if gapItem == nil {
 			gapItem = item
+		}
+		// The ordinary timer was already due before this queue-residence
+		// deferral. Later proof on the same stable FIFO invalidates only
+		// that classification, even below the selective-gap threshold.
+		// Restore ordinary eligibility without forgiving its backoff or
+		// granting a selective recovery's separate attempt.
+		if item.deferralOutstanding && item.recoveryKind == sendRecoveryNone &&
+			currentTime.Before(item.resendTime) && self.stablePacedFifo(item) && self.laneAcknowledgedPast(item) &&
+			self.setResendTimeIfRetained(item, currentTime) {
+			item.deferralOutstanding = false
 		}
 		// Mixed lanes: an item carried by the reliable route is routinely
 		// acknowledged after later items that rode a direct datagram lane
