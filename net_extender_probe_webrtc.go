@@ -111,7 +111,8 @@ func ProbeExtenderWebRtcForward(
 		probeSettings.TlsConfig = tlsConfig
 	}
 	client := NewExtenderHttpClient(&probeSettings, webRtcProbeExtenderConfig(expectPublicKey))
-	defer client.CloseIdleConnections()
+	release := ownOneRequestHttpClient(client)
+	defer release()
 
 	request, err := HelloRequestFromUrl(probeCtx, apiUrl, "")
 	if err != nil {

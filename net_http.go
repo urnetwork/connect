@@ -3369,7 +3369,23 @@ func HttpPostStreamWithStrategyRaw(
 	body io.Reader,
 	byJwt string,
 ) ([]byte, error) {
+	// NOT http.DefaultClient: on the machine that provides a tunnel, the
+	// default transport's unbound sockets and OS name resolution both follow
+	// the tun default route into this process's own tunnel (R1). Dial through
+	// the connect settings so the socket is egress-bound and the hostname
+	// resolves in-process. See egress.go / egress_dial.go; identical behavior
+	// everywhere else.
+	return httpPostStreamRaw(ctx, DefaultConnectSettings(), requestUrl, body, byJwt)
+}
 
+// One streaming POST over its own native transport on the given settings.
+func httpPostStreamRaw(
+	ctx context.Context,
+	settings *ConnectSettings,
+	requestUrl string,
+	body io.Reader,
+	byJwt string,
+) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", requestUrl, body)
 	if err != nil {
 		return nil, err
@@ -3380,20 +3396,14 @@ func HttpPostStreamWithStrategyRaw(
 		setClientInfoHeader(ctx, req.Header)
 	}
 
-	// NOT http.DefaultClient: on the machine that provides a tunnel, the
-	// default transport's unbound sockets and OS name resolution both follow
-	// the tun default route into this process's own tunnel (R1). Dial through
-	// the connect settings so the socket is egress-bound and the hostname
-	// resolves in-process. See egress.go / egress_dial.go; identical behavior
-	// everywhere else.
-	settings := DefaultConnectSettings()
 	var transport http.RoundTripper = newHttpPostStreamTransport(settings)
 	if direct := platformDirectHttpTransport(); direct != nil {
 		// js/wasm: the browser's fetch, which no custom dialer can reach
 		transport = direct
 	}
 	client := &http.Client{Transport: transport}
-	defer client.CloseIdleConnections()
+	release := ownOneRequestHttpClient(client)
+	defer release()
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
