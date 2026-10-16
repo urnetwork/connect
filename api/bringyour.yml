@@ -5623,6 +5623,16 @@ paths:
                 oneOf:
                   - $ref: "#/components/schemas/VerifyAssignResult"
                   - $ref: "#/components/schemas/VerifyFinalResult"
+        "400":
+          description: |
+            The step is malformed or does not verify: a field has the wrong
+            size or range, `client_id` is zero, a signature does not verify,
+            or the trail is unknown or has failed.
+        "409":
+          description: |
+            The request's owner closed it (`POST /verify/original/close`), so
+            it never runs, or another step of the same trail is in flight;
+            retry a busy trail.
         "503":
           description: |
             The verification subsystem is not enabled on this deployment
@@ -5779,10 +5789,13 @@ paths:
                 $ref: "#/components/schemas/VerifyOriginalRequestResult"
         "400":
           description: The locator is invalid or its signature does not verify.
+        "409":
+          description: The request's owner closed it (`POST /verify/original/close`); it has no original and never will.
         "503":
           description: |
-            The verification subsystem is not enabled on this deployment.
-            `Retry-After: 3600`. The body is plain text, not JSON.
+            The verification subsystem is not enabled on this deployment
+            (`Retry-After: 3600`), or storage is unavailable. Retry. The body
+            is plain text, not JSON, and never carries the failure's cause.
 
   /verify/original/close:
     post:
@@ -6754,6 +6767,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnPoolClaimResult"
+        "400":
+          description: "`legacy_coldkey` is not an ss58 address."
+        "503":
+          description: |
+            The epoch's retained payout artifact cannot back a claim: its store
+            is unavailable, its bytes fail their integrity check, it names
+            another claim scope, or the stored leaves differ from its root.
+            The body is plain text naming only that class, never the cause.
 
   /sn/epoch:
     get:
@@ -7105,7 +7126,10 @@ paths:
         "502":
           description: The immutable write or its readback failed.
         "503":
-          description: The attempt store is unavailable.
+          description: |
+            The attempt store or its upload quota is unavailable, or the upload
+            could not take ownership of its body. Retry. Every refusal's body is
+            a fixed message that never carries the failure's cause.
 
   /sn/evidence:
     get:
@@ -7274,11 +7298,20 @@ paths:
               schema:
                 $ref: "#/components/schemas/ClientKeyHistoryResponse"
         "400":
-          description: The framing is invalid, or the body is non-canonical or carries trailing JSON.
+          description: |
+            The framing is invalid, the body is not the canonical arguments or
+            carries trailing JSON, or the observation request is malformed,
+            incomplete, non-canonical or names another client.
         "401":
           description: Missing or invalid client bearer token.
         "429":
           description: Every observation slot is busy, or the account byte budget is exhausted.
+        "503":
+          description: |
+            The observation could not be made now: the operator's chain read,
+            signing or storage failed, or the client has no complete history at
+            the decision. Retry. The body is a fixed message that never carries
+            the failure's cause, such as an RPC url.
 
   /sn/client-key/observations:
     post:
@@ -7322,6 +7355,11 @@ paths:
           description: The batch's chain work was refused; see `X-Ur-Client-Key-Batch-Admission`.
         "429":
           description: Every observation slot is busy, or the account byte budget is exhausted.
+        "503":
+          description: |
+            The observations could not be made now, as for
+            `/sn/client-key/observation`. Retry. The body is a fixed message
+            that never carries the failure's cause.
 
   # ----- onboarding program (mmm/onboarding/PLAN.md) -----
 
