@@ -301,6 +301,9 @@ func TestAffinityPerformanceRecordsOnlyActiveHealthyRoute(t *testing.T) {
 }
 
 func TestAffinityPerformanceColdFreshRaceAllocatesNothing(t *testing.T) {
+	if allocationsInFreshProcess(t) {
+		return
+	}
 	parent := reputationTestParent("www.bloomberg.com")
 	// Production clients install this immutable projection at construction;
 	// bare fixtures intentionally synthesize one per read for mutability.
@@ -323,6 +326,9 @@ func TestAffinityPerformanceColdFreshRaceAllocatesNothing(t *testing.T) {
 }
 
 func TestAffinityPerformanceMeasuredFreshRaceAllocatesNothing(t *testing.T) {
+	if allocationsInFreshProcess(t) {
+		return
+	}
 	parent := reputationTestParent("www.bloomberg.com")
 	parent.defaultReliabilitySettings = ReliabilitySettingsFrom(parent.settings)
 	low := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
@@ -391,6 +397,9 @@ func TestAffinityPerformanceEqualStillOpenOutcomesKeepFullRace(t *testing.T) {
 }
 
 func TestAffinityPerformanceLiveFreshRaceAllocatesNothing(t *testing.T) {
+	if allocationsInFreshProcess(t) {
+		return
+	}
 	parent := reputationTestParent("www.bloomberg.com")
 	parent.defaultReliabilitySettings = ReliabilitySettingsFrom(parent.settings)
 	low := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
