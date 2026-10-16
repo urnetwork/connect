@@ -14750,16 +14750,47 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 
 	h1SaturationRecorded := false
 	packQueueBudget := self.receiveBufferSettings.PackQueueBudget
-	reserve := func() bool {
-		byteCount := ByteCount(len(receivePack.TransferFrameBytes))
-		if byteCount <= 0 {
-			byteCount = max(1, receivePack.MessageByteCount)
+	byteCount := ByteCount(len(receivePack.TransferFrameBytes))
+	if byteCount <= 0 {
+		byteCount = max(1, receivePack.MessageByteCount)
+	}
+	budgetByteCount := byteCount
+	if packQueueBudget != nil &&
+		self.receiveBufferSettings.PackQueueRetainedByteAccounting {
+		budgetByteCount = receivePack.receiveQueueByteCount()
+	}
+	// The Pack budget is shared by every sequence using these settings, and a
+	// device shares it across all its clients, whose one receive loop each
+	// waits here. A Pack that may wait and holds its count and byte slots
+	// waits in line for its budget bytes, keeping the slots, and whatever
+	// frees budget bytes reserves them for the oldest waiting Pack before any
+	// receive loop runs. Waking every waiting loop let the oldest woken loop
+	// reserve first, come straight back with its next Pack and wait again
+	// ahead of the loops it beat, so one client took every freed byte.
+	var budgetWaiter *transferMemoryReserveWaiter
+	var budgetWaitCount int64
+	var budgetWaitQueueByteCount ByteCount
+	admit := func(count int64, queueByteCount ByteCount) {
+		receivePack.sequenceQueueByteCount = byteCount
+		if packQueueBudget != nil {
+			receivePack.sequenceQueueBudgetByteCount = budgetByteCount
+			receivePack.sequenceQueueBudget = packQueueBudget
 		}
-		budgetByteCount := byteCount
-		if packQueueBudget != nil &&
-			self.receiveBufferSettings.PackQueueRetainedByteAccounting {
-			budgetByteCount = receivePack.receiveQueueByteCount()
+		updateAtomicMaximum(&self.client.receivePackHandoffMaxCount, uint64(count))
+		updateAtomicMaximum(
+			&self.client.receivePackHandoffMaxByteCount,
+			uint64(queueByteCount),
+		)
+	}
+	unreserve := func() {
+		if remaining := self.packQueueByteCount.Add(-byteCount); remaining < 0 {
+			panic("negative receive sequence handoff byte count")
 		}
+		if remaining := self.packQueueCount.Add(-1); remaining < 0 {
+			panic("negative receive sequence handoff count")
+		}
+	}
+	reserve := func(wait bool) bool {
 		countLimit := self.packQueueBaseLimit
 		if receivePack.TransportType == TransportTypeH1 {
 			countLimit = self.packQueueH1Limit
@@ -14812,27 +14843,32 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 				return false
 			}
 			if self.packQueueByteCount.CompareAndSwap(current, current+byteCount) {
-				if packQueueBudget != nil && !packQueueBudget.TryReserve(budgetByteCount) {
-					if remaining := self.packQueueByteCount.Add(-byteCount); remaining < 0 {
-						panic("negative receive sequence handoff byte count")
-					}
-					if remaining := self.packQueueCount.Add(-1); remaining < 0 {
-						panic("negative receive sequence handoff count")
-					}
-					return false
-				}
-				receivePack.sequenceQueueByteCount = byteCount
 				if packQueueBudget != nil {
-					receivePack.sequenceQueueBudgetByteCount = budgetByteCount
-					receivePack.sequenceQueueBudget = packQueueBudget
+					reserved := false
+					if wait {
+						reserved, budgetWaiter = packQueueBudget.tryReserveOrQueue(budgetByteCount)
+					} else {
+						reserved = packQueueBudget.TryReserve(budgetByteCount)
+					}
+					if budgetWaiter != nil {
+						budgetWaitCount, budgetWaitQueueByteCount = count, current+byteCount
+						return false
+					}
+					if !reserved {
+						unreserve()
+						return false
+					}
 				}
-				updateAtomicMaximum(&self.client.receivePackHandoffMaxCount, uint64(count))
-				updateAtomicMaximum(
-					&self.client.receivePackHandoffMaxByteCount,
-					uint64(current+byteCount),
-				)
+				admit(count, current+byteCount)
 				return true
 			}
+		}
+	}
+	abandonBudgetWait := func() {
+		if budgetWaiter != nil {
+			budgetWaiter.abandon()
+			budgetWaiter = nil
+			unreserve()
 		}
 	}
 	release := func() {
@@ -14841,7 +14877,8 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 
 	// Fast path without arming a timer. A failed reservation and a full channel
 	// are both ordinary nonblocking loss when the caller selected timeout zero.
-	if reserve() {
+	// It holds no place in line: no waiting Pack fits the free budget bytes.
+	if reserve(false) {
 		select {
 		case self.packs <- receivePack:
 			return true, nil
@@ -14868,23 +14905,29 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 	// retry the count/byte reservation until the one total timeout expires,
 	// then reserve while waiting for the channel send. This turns a short
 	// scheduler mismatch into transport backpressure rather than a synthetic
-	// Transfer loss/retransmission cycle.
-	for {
-		var budgetNotify <-chan struct{}
-		if budget := self.receiveBufferSettings.PackQueueBudget; budget != nil {
-			// Subscribe before admission so a concurrent release cannot be lost.
-			budgetNotify = budget.CapacityNotify()
-		}
-		if reserve() {
+	// Transfer loss/retransmission cycle. Once the slots are held, only the
+	// budget grant can admit the Pack.
+	for admitted := false; !admitted; {
+		if budgetWaiter == nil && reserve(true) {
 			break
+		}
+		packQueueSpace := self.packQueueSpace
+		var budgetReady <-chan struct{}
+		if budgetWaiter != nil {
+			packQueueSpace, budgetReady = nil, budgetWaiter.ready
 		}
 		select {
 		case <-self.ctx.Done():
 			stopTimer()
+			abandonBudgetWait()
 			return false, errors.New("Done.")
-		case <-self.packQueueSpace:
-		case <-budgetNotify:
+		case <-packQueueSpace:
+		case <-budgetReady:
+			budgetWaiter = nil
+			admit(budgetWaitCount, budgetWaitQueueByteCount)
+			admitted = true
 		case <-timeoutChan:
+			abandonBudgetWait()
 			return false, nil
 		}
 	}
