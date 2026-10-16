@@ -16,10 +16,19 @@ import (
 // No public ReceiveFunction contract is changed. A provider takes explicit
 // claims during its inline dispatch and completes them after final admission.
 // The ledger itself starts no workers and never waits for downstream I/O.
+//
+// A head is admitted before the sequence delivers it, never after: the
+// sender's window is measured in bytes from the cumulative ACK, so a healthy
+// flow whose downstream is slower than its arrivals reaches the receipt count
+// long before the window is spent. A head the full ledger cannot take stays in
+// the receive hold, and the withheld cumulative ACK is the backpressure.
 type receiveDeliveryQueue struct {
-	mutex        sync.Mutex
-	sequence     *ReceiveSequence
-	items        []*receiveDeliveryReceipt
+	mutex    sync.Mutex
+	sequence *ReceiveSequence
+	items    []*receiveDeliveryReceipt
+	// Receipts admitted with their heads, in delivery order, whose batch
+	// callback has not yet run. The flush takes each with its own item.
+	admitted     []*receiveDeliveryReceipt
 	maxCount     int
 	maxBytes     ByteCount
 	bytes        ByteCount
@@ -67,6 +76,41 @@ func newReceiveDeliveryQueue(sequence *ReceiveSequence, maxCount int, maxBytes B
 func (q *receiveDeliveryQueue) append(item *receiveItem, required bool) (*receiveDeliveryReceipt, bool) {
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
+	return q.appendLocked(item, required, false)
+}
+
+// Admits the receipt of a head before the head is delivered. A refusal
+// leaves nothing to undo: the caller keeps the head in the receive hold, and
+// a drain of this ledger wakes the sequence to try again. An empty ledger
+// takes any one owner its memory budget admits, as the hold does, so no
+// head can wait for a drain that can never come.
+func (q *receiveDeliveryQueue) admit(item *receiveItem) bool {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	r, ok := q.appendLocked(item, false, true)
+	if ok {
+		q.admitted = append(q.admitted, r)
+	}
+	return ok
+}
+
+// The receipt admitted with item's head. A head dispatched without that
+// admission (a direct dispatch, or reliable ingress enabled while its batch
+// was pending) is appended now and can still be refused.
+func (q *receiveDeliveryQueue) receipt(item *receiveItem, required bool) (*receiveDeliveryReceipt, bool) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	if 0 < len(q.admitted) && q.admitted[0].item == item {
+		r := q.admitted[0]
+		q.admitted[0] = nil
+		q.admitted = q.admitted[1:]
+		r.required = required
+		return r, true
+	}
+	return q.appendLocked(item, required, false)
+}
+
+func (q *receiveDeliveryQueue) appendLocked(item *receiveItem, required bool, admitOne bool) (*receiveDeliveryReceipt, bool) {
 	if q.sequence.receiveQueue != nil {
 		q.sequence.prepareReceiveDeliveryCredit(item)
 	}
@@ -83,7 +127,8 @@ func (q *receiveDeliveryQueue) append(item *receiveItem, required bool) (*receiv
 	// a cap of two ordinary ACKs per decoded batch. Healthy controls use the
 	// same bounded regular ledger as data; only actual count/byte/admission
 	// pressure selects the independently prepaid control fallback.
-	regular := len(q.items)-q.controlCount < q.maxCount && bytes <= q.maxBytes-(q.bytes-q.controlBytes)
+	regular := len(q.items)-q.controlCount < q.maxCount &&
+		(bytes <= q.maxBytes-(q.bytes-q.controlBytes) || admitOne && len(q.items) == 0)
 	if regular && q.sequence.receiveQueue != nil && q.sequence.receiveQueue.lifetimeBudget && item.memoryBudget == nil {
 		regular = item.reserveMemory(q.sequence.receiveQueue.budget, item.QueueByteCount())
 	}
