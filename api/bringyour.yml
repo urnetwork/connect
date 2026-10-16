@@ -5625,8 +5625,9 @@ paths:
                   - $ref: "#/components/schemas/VerifyFinalResult"
         "503":
           description: |
-            The verification subsystem is not enabled on this deployment.
-            `Retry-After: 3600`. The body is plain text, not JSON.
+            The verification subsystem is not enabled on this deployment
+            (`Retry-After: 3600`), or storage is unavailable. Retry. The body
+            is plain text, not JSON, and never carries the failure's cause.
 
   /verify/keys:
     get:
@@ -5740,7 +5741,10 @@ paths:
         "400":
           description: A query parameter is not a valid RFC 3339 time or integer.
         "503":
-          description: The verification subsystem is not enabled.
+          description: |
+            The verification subsystem is not enabled, or a stored proof cannot
+            be read. The body is plain text and never carries the failure's
+            cause.
 
   /verify/original:
     post:
@@ -5845,8 +5849,10 @@ paths:
         "503":
           description: |
             The verification subsystem is not enabled on this deployment
-            (`Retry-After: 3600`), its verification scope is not configured, or
-            the body did not arrive in time.
+            (`Retry-After: 3600`), its verification scope is not configured, the
+            body did not arrive in time, or storage or signing failed. Retry. A
+            storage or signing failure is answered with a fixed message, never
+            with its cause.
 
   /provider-work/v1/owners:
     get:
