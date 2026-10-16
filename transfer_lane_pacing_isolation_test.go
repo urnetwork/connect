@@ -1,9 +1,10 @@
 // Logical data lanes exist so that one IP flow its receiver cannot drain does
 // not hold up the flows beside it (transfer_logical_lane.go). Every lane to a
 // destination shares one window pacing service (SendBuffer windowPacingServices,
-// keyed by the lane-zero base). That service counts the bytes a stalled lane
-// leaves unacknowledged as queueing on the shared carrier
-// (windowPacingService.backloggedWithLock), and then paces every sibling lane
+// keyed by the lane-zero base), which owns their aggregate serialization clock,
+// opening probe and carrier flight. A lane whose receiver holds its delivered
+// bytes must not have that window read as queueing on the shared carrier
+// (windowPacingService.outstandingWithLock), or every sibling lane is paced
 // down to the rate the stalled lane is served.
 package connect
 
@@ -55,7 +56,6 @@ const (
 // reliable ingress. Returns, per second, the deliveries of flows 1-5 together.
 func exerciseLanePacingIsolation(t *testing.T, windowSizing WindowSizingPolicyKind, laneFloor ByteCount) []int {
 	siblingPerSecond := make([]int, int(lanePacingDuration/time.Second))
-	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
@@ -202,11 +202,7 @@ func exerciseLanePacingIsolation(t *testing.T, windowSizing WindowSizingPolicyKi
 
 		for flow := range lanePacingFlowCount {
 			content := string(rune('a'+flow)) + strings.Repeat("x", 1999)
-			path := &IpPath{
-				Version: 4, Protocol: IpProtocolTcp,
-				SourceIp: net.IPv4(10, 0, 0, 1), SourcePort: 40000 + flow,
-				DestinationIp: net.IPv4(10, 0, 0, 2), DestinationPort: 443,
-			}
+			path := lanePacingFlowPath(flow)
 			workers.Add(1)
 			go func() {
 				defer workers.Done()
@@ -232,6 +228,15 @@ func exerciseLanePacingIsolation(t *testing.T, windowSizing WindowSizingPolicyKi
 	return siblingPerSecond
 }
 
+// One synthetic TCP flow per index between two documentation addresses.
+func lanePacingFlowPath(flow int) *IpPath {
+	return &IpPath{
+		Version: 4, Protocol: IpProtocolTcp,
+		SourceIp: net.IPv4(192, 0, 2, 1), SourcePort: 40000 + flow,
+		DestinationIp: net.IPv4(192, 0, 2, 2), DestinationPort: 443,
+	}
+}
+
 // While one flow's receiver drains a single delivery per second, the other
 // five flows keep at least half of what they offer in every three-second
 // window. The constant window keeps them at their full offered rate; the
@@ -240,27 +245,36 @@ func TestLogicalLanesIsolateAFlowItsReceiverCannotDrain(t *testing.T) {
 	if testing.Short() {
 		t.Skip("45s of virtual time over the full Transfer stack")
 	}
+	// The premise: no unstalled flow shares the stalled flow's lane.
+	laneFlows := map[uint32]int{}
+	for flow := range lanePacingFlowCount {
+		lane := ipSendSchedulingKey(lanePacingFlowPath(flow)).logicalLaneForCount(8)
+		if other, ok := laneFlows[lane]; ok {
+			t.Fatalf("flows %d and %d share lane %d; the fixture needs one lane per flow", other, flow, lane)
+		}
+		laneFlows[lane] = flow
+	}
+	assertMessagePoolOwnership(t)
 	offered := float64((lanePacingFlowCount - 1) * int(time.Second/lanePacingSendInterval))
 	for _, row := range []struct {
 		name      string
 		sizing    WindowSizingPolicyKind
 		laneFloor ByteCount
 	}{
-		{"constant window", WindowSizingConstant, kib(64)},
-		{"from-delivery window", WindowSizingFromDelivery, kib(64)},
+		{name: "constant window", sizing: WindowSizingConstant, laneFloor: kib(64)},
+		{name: "from-delivery window", sizing: WindowSizingFromDelivery, laneFloor: kib(64)},
 		// the sdk's mobile H1 profile sets the lanes without a floor
-		{"from-delivery window without a lane floor", WindowSizingFromDelivery, 0},
+		{name: "from-delivery window without a lane floor", sizing: WindowSizingFromDelivery, laneFloor: 0},
 	} {
-		t.Run(row.name, func(t *testing.T) {
-			perSecond := exerciseLanePacingIsolation(t, row.sizing, row.laneFloor)
-			t.Logf("sibling deliveries per second: %v", perSecond)
-			// from five seconds after the stall begins to the end of the run
-			for second := int((lanePacingStallStart + 5*time.Second) / time.Second); second+3 < len(perSecond); second++ {
-				window := perSecond[second] + perSecond[second+1] + perSecond[second+2]
-				if float64(window) < 0.5*3*offered {
-					t.Fatalf("seconds %d-%d: the unstalled flows delivered %d messages, under half the %.0f they offered", second, second+3, window, 3*offered)
-				}
+		perSecond := exerciseLanePacingIsolation(t, row.sizing, row.laneFloor)
+		t.Logf("%s: sibling deliveries per second: %v", row.name, perSecond)
+		// from five seconds after the stall begins to the end of the run
+		for second := int((lanePacingStallStart + 5*time.Second) / time.Second); second+3 < len(perSecond); second++ {
+			window := perSecond[second] + perSecond[second+1] + perSecond[second+2]
+			if float64(window) < 0.5*3*offered {
+				t.Errorf("%s: seconds %d-%d: the unstalled flows delivered %d messages, under half the %.0f they offered", row.name, second, second+3, window, 3*offered)
+				break
 			}
-		})
+		}
 	}
 }
