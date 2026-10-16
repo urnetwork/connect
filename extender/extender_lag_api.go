@@ -84,6 +84,19 @@ const (
 	lagApiMaxLoadsPerSubnet    = 1
 )
 
+// A source's block: the /24 of a v4 source and the /48 of a v6 one, the
+// prefixes the api's own limits on guests and tracks key on (A1, A6), and
+// never narrower than the admission subnet. A block spans many subnets -- a
+// /48 holds 256 /56s -- so the subnet's limit alone would let one block hold
+// every session an extender has. A block holds at most a share of
+// max_sessions, an eighth, and never less than one subnet's limit: 64 of the
+// default 512 (M3).
+const (
+	lagApiBlockIpv4PrefixBitCount = 24
+	lagApiBlockIpv6PrefixBitCount = 48
+	lagApiBlockSessionsShare      = 8
+)
+
 // The most measurement connections one source subnet holds at once: its 16
 // sessions (M3), one load's streams each way, and a few left idle or opened
 // again after a refusal. It keeps one subnet from pinning the connection slots
@@ -107,8 +120,10 @@ type ExtenderLagSettings struct {
 	AllowedOrigins []string
 	// Sessions open at once (M3). A session that only pings costs a few
 	// hundred bytes a second. When it is full, the extender closes its oldest
-	// session whose load has ended and whose report has gone out, to admit a
-	// new one, and refuses only when none has. <= 0 takes the default.
+	// session whose load has ended and whose report has gone out, else its
+	// oldest that has been open 15 minutes without starting a load, to admit
+	// a new one, and refuses only when it has neither. One source block, a
+	// /24 or a /48, holds at most an eighth of it. <= 0 takes the default.
 	MaxSessions int
 	// Loads running at once (M3); a load past it is refused as busy and its
 	// session goes on pinging. <= 0 takes the default.
@@ -247,6 +262,9 @@ type extenderLagApi struct {
 	subnetLoadCounts     map[extenderSubnetHash]int
 	maxSessionsPerSubnet int
 	maxLoadsPerSubnet    int
+	// the sessions each source block holds now (M3), and the most it may
+	blockSessionCounts  map[extenderSubnetHash]int
+	maxSessionsPerBlock int
 }
 
 // Builds the measurement API of a server (M10), the API side's one wiring
@@ -311,11 +329,13 @@ func newExtenderLagApi(
 		subnetLoadCounts:        map[extenderSubnetHash]int{},
 		maxSessionsPerSubnet:    lagApiMaxSessionsPerSubnet,
 		maxLoadsPerSubnet:       lagApiMaxLoadsPerSubnet,
+		blockSessionCounts:      map[extenderSubnetHash]int{},
 	}
 	defaultSettings := DefaultExtenderLagSettings()
 	if self.settings.MaxSessions <= 0 {
 		self.settings.MaxSessions = defaultSettings.MaxSessions
 	}
+	self.maxSessionsPerBlock = max(lagApiMaxSessionsPerSubnet, self.settings.MaxSessions/lagApiBlockSessionsShare)
 	if self.settings.ConcurrentLoads <= 0 {
 		self.settings.ConcurrentLoads = defaultSettings.ConcurrentLoads
 	}
@@ -541,6 +561,20 @@ func (self *extenderLagApi) subnetOf(remoteAddress string) (extenderSubnetHash, 
 		return extenderSubnetHash{}, false
 	}
 	return admission.subnetHashOf(remoteAddress)
+}
+
+// The block of a source (M3): its /24 or /48, or its admission subnet when an
+// operator set that wider. False for the sources subnetOf is false for.
+func (self *extenderLagApi) blockOf(remoteAddress string) (extenderSubnetHash, bool) {
+	admission := self.server.admission
+	if admission.unlimitedSource(remoteAddress) {
+		return extenderSubnetHash{}, false
+	}
+	return extenderPrefixHashOf(
+		remoteAddress,
+		min(lagApiBlockIpv4PrefixBitCount, admission.ipv4PrefixBitCount),
+		min(lagApiBlockIpv6PrefixBitCount, admission.ipv6PrefixBitCount),
+	)
 }
 
 // Starts the measurement server on first use, as a worker the extender joins

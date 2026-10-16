@@ -114,7 +114,23 @@ type lagApiTimings struct {
 	busyRetryAfter time.Duration
 	// a text message that cannot be written within this ends the session
 	writeTimeout time.Duration
+	// a session that has started no load in this long since its admission
+	// may be closed by a full extender to admit a new one, once no session
+	// has finished (M3); see lagApiIdleReclaim
+	idleReclaim time.Duration
 }
+
+// The idle reclaim wait (M3). A track in view asks its dots for their loads in
+// turn, the first at 5 s and each next 15 s after the one before, so its last
+// dot loads at about 110 s (L4). A load refused as busy is asked once more
+// after the next dot's, a dot that reconnects loads first, and a slow setup
+// pushes the line back, which together add a minute or two: no dot of a page
+// in view waits more than about 5 minutes. 15 is well clear of that, and of a
+// page put away for a few minutes. A holder that only pings then keeps only
+// the sessions it opened in the last 15 minutes: at the api's 60 tracks an
+// hour per /24 (/48) and one reissue each (A6), 15 to 30 a block, where
+// before it could keep every session the extender has.
+const lagApiIdleReclaim = 15 * time.Minute
 
 func defaultLagApiTimings() lagApiTimings {
 	return lagApiTimings{
@@ -129,6 +145,7 @@ func defaultLagApiTimings() lagApiTimings {
 		doneWait:         5 * time.Second,
 		busyRetryAfter:   5 * time.Second,
 		writeTimeout:     10 * time.Second,
+		idleReclaim:      lagApiIdleReclaim,
 	}
 }
 
@@ -381,21 +398,27 @@ type lagApiSession struct {
 	ticketExpire  time.Time
 	trackId       []byte
 	trackPosition uint32
-	// the control connection's address and its admission subnet when the
-	// per-subnet limits apply to it (M3). Both are held in memory for
+	// the control connection's address, and its admission subnet and block
+	// when the per-subnet limits apply to it (M3). All are held in memory for
 	// admission only: no report or log carries them (M8, amendment 9). The
 	// report names only the address family, 4 or 6.
 	remoteAddress string
 	ipFamily      uint32
 	subnet        extenderSubnetHash
+	block         extenderSubnetHash
 	subnetLimited bool
-	// the order of its admission, so a full extender reclaims the oldest
-	// session first (M3); set under the api's state lock
-	admitIndex uint64
+	// the order and time of its admission, and whether a load of its has
+	// been admitted: so a full extender reclaims the oldest session first,
+	// and one that has started no load only once it has been open the idle
+	// reclaim wait (M3). Guarded by the api's state lock.
+	admitIndex  uint64
+	admitTime   time.Time
+	loadStarted bool
 	// set by the loop once the session's load has ended and its report has
 	// gone out, after which it only pings and has nothing left to measure: a
-	// full extender may then close it to admit a new session (M3)
-	reclaimable atomic.Bool
+	// full extender may then close it to admit a new session, before any
+	// session that has started no load (M3)
+	finished atomic.Bool
 
 	pingInterval     time.Duration
 	downloadDuration time.Duration
@@ -540,9 +563,7 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	session.serverName = r.TLS.ServerName
-	session.remoteAddress = r.RemoteAddr
-	session.ipFamily = lagApiIpFamily(r.RemoteAddr)
-	session.subnet, session.subnetLimited = self.subnetOf(r.RemoteAddr)
+	session.setSource(r.RemoteAddr)
 	if code := self.admitSession(session); code != "" {
 		// a refused admission releases what it built, the session's context
 		// above all, so refusals cannot accumulate (M3)
@@ -551,6 +572,19 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	session.serve()
+}
+
+// Sets where the session's control connection comes from, before admission
+// (M3): its address, its family for the report (M8), and the admission subnet
+// and block its limits count it under, when they apply to it.
+func (self *lagApiSession) setSource(remoteAddress string) {
+	self.remoteAddress = remoteAddress
+	self.ipFamily = lagApiIpFamily(remoteAddress)
+	self.subnet, self.subnetLimited = self.api.subnetOf(remoteAddress)
+	if self.subnetLimited {
+		// the same address at a width no narrower, so it has one too
+		self.block, _ = self.api.blockOf(remoteAddress)
+	}
 }
 
 // Whether a ticket's id is one an admitted session used (M3).
@@ -621,23 +655,27 @@ func (self *extenderLagApi) verifyTicket(ticketText string, now time.Time) (*pro
 }
 
 // The close of a session that a full extender ended to admit a new one (M3,
-// M4): 4410, after HTTP's 410 Gone, since the session is over for good. Only
-// a session whose load has ended and whose report has gone out is closed this
-// way, the oldest first, so the dot's results are complete and signed. The
-// browser shows them as done, stops pinging the dot, and does not reconnect:
-// a new session would take a slot again, and one that never loads is never
-// reclaimed. It is not 4409, because the API answers a stream that comes
-// before its phase with 409, and the browser retries that (M4).
+// M4): 4410, after HTTP's 410 Gone, since the session is over for good. A
+// session whose load has ended and whose report has gone out is closed this
+// way first, the oldest first, so the dot's results are complete and signed.
+// Only when no session has got that far is one closed that has started no
+// load in the idle reclaim wait, the oldest first: no load of it is running,
+// and none can start once it is chosen. Its one report, its last minute with
+// no load, goes out as it ends. The browser keeps what the dot has, stops
+// pinging it, and does not reconnect: a new session would only take a slot
+// again. It is not 4409, because the API answers a stream that comes before
+// its phase with 409, and the browser retries that (M4).
 const (
 	lagApiCloseCodeReclaimed = 4410
 	lagApiCloseTextReclaimed = "reclaimed"
 )
 
 // Admits an open session (M3): its ticket unused, room under its subnet's
-// limit, and room under max_sessions. A full extender makes room by closing
-// its oldest session that has nothing left to measure, its load ended and its
-// report gone out, and refuses the new session only when none has. The count
-// is the extender's, so the session closed may be any subnet's. The ticket is
+// limit and its block's, and room under max_sessions. A full extender makes
+// room by closing a session (reclaimableSessionWithLock), and refuses the new
+// session only when none may be closed. The count is the extender's, so the
+// session closed may be any subnet's; the subnet's and the block's limits come
+// first, so no session is closed for one that is then refused. The ticket is
 // marked used only when the session is admitted, and kept until it expires.
 // Returns the error that refuses the session, or "".
 func (self *extenderLagApi) admitSession(session *lagApiSession) string {
@@ -649,7 +687,8 @@ func (self *extenderLagApi) admitSession(session *lagApiSession) string {
 	var reclaimed *lagApiSession
 	defer func() {
 		if reclaimed != nil {
-			// its load has ended, so the load end reason never applies (M8)
+			// no load of it runs -- its load has ended, or it started none and
+			// can start none now -- so the load end reason never applies (M8)
 			reclaimed.end(lagApiCloseCodeReclaimed, lagApiCloseTextReclaimed, protocol.LagEndReason_LAG_END_ERROR)
 		}
 	}()
@@ -673,18 +712,23 @@ func (self *extenderLagApi) admitSession(session *lagApiSession) string {
 	if _, ok := self.usedTickets[ticketId]; ok {
 		return lagApiErrorReused
 	}
-	// the subnet's limit comes before any room is made, so no session is
-	// closed for one that is then refused
+	// the subnet's limit and the block's come before any room is made, so no
+	// session is closed for one that is then refused
 	if session.subnetLimited && 0 < self.maxSessionsPerSubnet &&
 		self.maxSessionsPerSubnet <= self.subnetSessionCounts[session.subnet] {
 		return lagApiErrorSessions
 	}
+	if session.subnetLimited && 0 < self.maxSessionsPerBlock &&
+		self.maxSessionsPerBlock <= self.blockSessionCounts[session.block] {
+		return lagApiErrorSessions
+	}
 	if self.settings.MaxSessions <= len(self.sessions) {
-		reclaimed = self.reclaimableSessionWithLock()
+		reclaimed = self.reclaimableSessionWithLock(now)
 		if reclaimed == nil {
 			return lagApiErrorSessions
 		}
-		// its slot and its subnet's count go to the new session at once
+		// its slot and its subnet's and block's counts go to the new session
+		// at once, and it can start no load from here (beginLoad)
 		self.removeSessionWithLock(reclaimed)
 	}
 	self.usedTickets[ticketId] = self.usedTicketOrder.PushBack(&lagApiUsedTicket{
@@ -693,25 +737,52 @@ func (self *extenderLagApi) admitSession(session *lagApiSession) string {
 	})
 	self.sessionAdmitCount += 1
 	session.admitIndex = self.sessionAdmitCount
+	session.admitTime = now
 	self.sessions[session.id] = session
 	if session.subnetLimited {
 		self.subnetSessionCounts[session.subnet] += 1
+		self.blockSessionCounts[session.block] += 1
 	}
 	close(self.sessionAdmitted)
 	self.sessionAdmitted = make(chan struct{})
 	return ""
 }
 
-// The oldest open session a full extender may close to make room (M3), or
-// nil when none may. Called with the state lock held.
-func (self *extenderLagApi) reclaimableSessionWithLock() *lagApiSession {
-	var oldest *lagApiSession
+// The open session a full extender closes to make room at now (M3), or nil
+// when none may be closed. Called with the state lock held.
+//   - First, the oldest that has finished: its load has ended, its result is
+//     with the browser and its report has gone out, so it has nothing left
+//     to measure.
+//   - Else the oldest that has started no load and has been open the idle
+//     reclaim wait: a holder that only pings, a load refused, a dot's session
+//     opened again after its load, or a page put away. Any of them may still
+//     ask for a load, which is why one that has finished goes first, and why
+//     a young one is never closed: a track in view leaves no dot waiting that
+//     long.
+//
+// A session whose load is running, or whose report's minute is still open,
+// is never closed. Neither lasts, and few are at once: a load ends within a
+// minute, at most concurrent_loads at a time, and its minute closes
+// reportAfter later.
+func (self *extenderLagApi) reclaimableSessionWithLock(now time.Time) *lagApiSession {
+	var finished *lagApiSession
+	var idle *lagApiSession
 	for _, session := range self.sessions {
-		if session.reclaimable.Load() && (oldest == nil || session.admitIndex < oldest.admitIndex) {
-			oldest = session
+		switch {
+		case session.finished.Load():
+			if finished == nil || session.admitIndex < finished.admitIndex {
+				finished = session
+			}
+		case !session.loadStarted && self.timings.idleReclaim <= now.Sub(session.admitTime):
+			if idle == nil || session.admitIndex < idle.admitIndex {
+				idle = session
+			}
 		}
 	}
-	return oldest
+	if finished != nil {
+		return finished
+	}
+	return idle
 }
 
 // One used ticket id and when its ticket expires (M3).
@@ -726,9 +797,9 @@ func (self *extenderLagApi) removeSession(session *lagApiSession) {
 	self.removeSessionWithLock(session)
 }
 
-// Removes an open session and releases its subnet's count. A session already
-// removed, as one reclaimed for a new session is, releases nothing again.
-// Called with the state lock held.
+// Removes an open session and releases its subnet's and block's counts. A
+// session already removed, as one reclaimed for a new session is, releases
+// nothing again. Called with the state lock held.
 func (self *extenderLagApi) removeSessionWithLock(session *lagApiSession) {
 	if self.sessions[session.id] != session {
 		return
@@ -736,10 +807,11 @@ func (self *extenderLagApi) removeSessionWithLock(session *lagApiSession) {
 	delete(self.sessions, session.id)
 	if session.subnetLimited {
 		lagApiReleaseSubnetCount(self.subnetSessionCounts, session.subnet)
+		lagApiReleaseSubnetCount(self.blockSessionCounts, session.block)
 	}
 }
 
-// Releases one of a subnet's counted sessions or loads.
+// Releases one of a subnet's or block's counted sessions or loads.
 func lagApiReleaseSubnetCount(counts map[extenderSubnetHash]int, subnet extenderSubnetHash) {
 	if count := counts[subnet] - 1; 0 < count {
 		counts[subnet] = count
@@ -755,10 +827,19 @@ func (self *extenderLagApi) session(sessionId lagApiSessionId) *lagApiSession {
 	return self.sessions[sessionId]
 }
 
+// What beginLoad answers a session a full extender has closed to make room
+// (M3): it starts no load, and there is nothing to tell the browser, whose
+// close is on its way. Never sent.
+const lagApiLoadReclaimed = "reclaimed"
+
 // Admits a session's load (M3): refused as budget when today's budget is
 // spent, and as busy when the session's subnet is over its admission limit,
 // already runs its load, or concurrent_loads are running, each with how long
-// to wait. A load is one action of its subnet (EXTENDER.md A12). Returns ""
+// to wait. A load is one action of its subnet (EXTENDER.md A12). A session no
+// longer open, which only a reclaimed one is while its loop runs, is answered
+// lagApiLoadReclaimed: the reclaim and the load are each decided under the
+// state lock, so a session chosen for having started no load never starts
+// one, and one whose load is admitted is never chosen as idle. Returns ""
 // when admitted; the caller then ends it with endLoad.
 func (self *extenderLagApi) beginLoad(now time.Time, session *lagApiSession) (string, time.Duration) {
 	if self.budget.exhausted(now) {
@@ -769,6 +850,9 @@ func (self *extenderLagApi) beginLoad(now time.Time, session *lagApiSession) (st
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if self.sessions[session.id] != session {
+		return lagApiLoadReclaimed, 0
+	}
 	if self.settings.ConcurrentLoads <= self.loadCount {
 		return lagApiErrorBusy, self.timings.busyRetryAfter
 	}
@@ -780,6 +864,7 @@ func (self *extenderLagApi) beginLoad(now time.Time, session *lagApiSession) (st
 	if session.subnetLimited {
 		self.subnetLoadCounts[session.subnet] += 1
 	}
+	session.loadStarted = true
 	return "", 0
 }
 
@@ -1268,7 +1353,13 @@ func (self *lagApiSession) run() {
 				retryAfterMs := int64(0)
 				return self.write(&lagApiErrorMessage{Type: "error", Code: lagApiErrorBusy, RetryAfterMs: &retryAfterMs})
 			}
-			if code, retryAfter := self.api.beginLoad(now, self); code != "" {
+			switch code, retryAfter := self.api.beginLoad(now, self); code {
+			case "":
+			case lagApiLoadReclaimed:
+				// closed to make room as it asked: its close is on its way,
+				// and its report says it had no load (M3, M8)
+				return true
+			default:
 				self.refused = true
 				retryAfterMs := retryAfter.Milliseconds()
 				return self.write(&lagApiErrorMessage{Type: "error", Code: code, RetryAfterMs: &retryAfterMs})
@@ -1463,18 +1554,20 @@ func (self *lagApiSession) run() {
 			self.end(lagApiCloseCodeInternal, lagApiErrorInternal, protocol.LagEndReason_LAG_END_ERROR)
 			return
 		}
-		self.updateReclaimable()
+		self.updateFinished()
 	}
 }
 
-// Marks the session reclaimable once its load has ended, its result with the
+// Marks the session finished once its load has ended, its result with the
 // browser, and its report has gone out (M3, M8): from then on it only pings,
-// so a full extender may close it to admit a new session. A session with no
-// load reports only when it closes, so it never becomes reclaimable. Read
-// after each step of the loop, whose state this is.
-func (self *lagApiSession) updateReclaimable() {
-	if !self.reclaimable.Load() && self.reported && self.load != nil && self.load.ended {
-		self.reclaimable.Store(true)
+// so a full extender may close it, first of all, to admit a new session. A
+// session with no load reports only when it closes, so it never finishes;
+// a full extender may close it once it has been open the idle reclaim wait
+// (reclaimableSessionWithLock). Read after each step of the loop, whose state
+// this is.
+func (self *lagApiSession) updateFinished() {
+	if !self.finished.Load() && self.reported && self.load != nil && self.load.ended {
+		self.finished.Store(true)
 	}
 }
 
