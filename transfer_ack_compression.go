@@ -163,6 +163,16 @@ func (self *sequenceAckWindow) updateContractMissingWithLock(ack sequenceAck) {
 	}
 }
 
+// Wake asks the ACK worker to look again without adding feedback. Receiver
+// state such as an eviction notice needs an acknowledgement to carry it, and
+// the arrival that caused it may publish none of its own.
+func (self *sequenceAckWindow) Wake() {
+	select {
+	case self.ackNotify <- struct{}{}:
+	default:
+	}
+}
+
 // Adds feedback without delivery credit, including retransmitted heads and SACKs.
 func (self *sequenceAckWindow) Update(ack sequenceAck) {
 	func() {

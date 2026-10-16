@@ -1701,6 +1701,17 @@ type ClientReceiveStatsSnapshot struct {
 	ReceiveQueueTentativeEvictionByteCount uint64
 	// held items that crossed the boundary and were acknowledged
 	ReceiveQueueCommitCount uint64
+	// Acknowledgements withdrawn, with an eviction notice, because a missing
+	// predecessor of an acknowledged item arrived larger than every Pack the
+	// commitment sized its reservation from. Each is also an eviction above.
+	// The reservation makes this zero unless a lost Pack is the largest of
+	// its gap; it is the one way an acknowledged item still leaves the hold.
+	// With EvictionNotice off a withdrawal could not be announced, so none is
+	// made: the predecessor is refused, which counts once here and as a drop.
+	ReceiveQueueCommitShortfallCount uint64
+	// acknowledged held items a closing sequence withdrew by eviction notice
+	// before discarding them, so the sender resends instead of leasing them
+	ReceiveQueueExitWithdrawCount uint64
 	// no-acknowledgement Packs offered by a caller, handed to the write path,
 	// and turned away by admission. Offered above written is the mode being
 	// dropped under back pressure.
@@ -2050,6 +2061,8 @@ type Client struct {
 	receiveQueueTentativeEvictionCount     atomic.Uint64
 	receiveQueueTentativeEvictionByteCount atomic.Uint64
 	receiveQueueCommitCount                atomic.Uint64
+	receiveQueueCommitShortfallCount       atomic.Uint64
+	receiveQueueExitWithdrawCount          atomic.Uint64
 	// A no-acknowledgement Pack asks for delivery out of sequence with no ack
 	// and no retry, so it should never be queued behind a retransmit buffer it
 	// will never occupy, and never dropped because one is full. Offered counts
@@ -2443,6 +2456,8 @@ func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 		ReceiveQueueTentativeEvictionCount:     self.receiveQueueTentativeEvictionCount.Load(),
 		ReceiveQueueTentativeEvictionByteCount: self.receiveQueueTentativeEvictionByteCount.Load(),
 		ReceiveQueueCommitCount:                self.receiveQueueCommitCount.Load(),
+		ReceiveQueueCommitShortfallCount:       self.receiveQueueCommitShortfallCount.Load(),
+		ReceiveQueueExitWithdrawCount:          self.receiveQueueExitWithdrawCount.Load(),
 		SendNoAckOfferedCount:                  self.sendNoAckOfferedCount.Load(),
 		SendNoAckWriteCount:                    self.sendNoAckWriteCount.Load(),
 		SendNoAckRefusedCount:                  self.sendNoAckRefusedCount.Load(),
@@ -11506,15 +11521,21 @@ func (self *SendSequence) receivedWindowAdvertisement() (ByteCount, bool) {
 	return ByteCount(self.receiveWindowByteCount.Load()), true
 }
 
-// Records an eviction for the next acknowledgement to carry.
+// Records an eviction for the next acknowledgement to carry, and wakes the ACK
+// worker so that acknowledgement is not left to the next unrelated arrival.
 func (self *ReceiveSequence) noteEviction(sequenceNumber uint64) {
-	self.evictedMutex.Lock()
-	defer self.evictedMutex.Unlock()
-	if evictionNoticeMaxCount <= len(self.evictedSequenceNumbers) {
-		self.client.receiveQueueEvictionNoticeOverflow.Add(1)
-		return
+	func() {
+		self.evictedMutex.Lock()
+		defer self.evictedMutex.Unlock()
+		if evictionNoticeMaxCount <= len(self.evictedSequenceNumbers) {
+			self.client.receiveQueueEvictionNoticeOverflow.Add(1)
+			return
+		}
+		self.evictedSequenceNumbers = append(self.evictedSequenceNumbers, sequenceNumber)
+	}()
+	if self.ackWindow != nil {
+		self.ackWindow.Wake()
 	}
-	self.evictedSequenceNumbers = append(self.evictedSequenceNumbers, sequenceNumber)
 }
 
 // Takes the pending evictions for one acknowledgement to carry.
@@ -14345,6 +14366,12 @@ type ReceiveSequence struct {
 	// the largest message the hold has taken, the conservative estimate of
 	// what a missing item below the boundary would cost
 	maxHeldByteCount ByteCount
+	// the largest retained charge the hold has taken, the same estimate for
+	// the shared budget an exact-admission hold charges
+	maxHeldQueueByteCount ByteCount
+	// what the committed prefix promised its missing predecessors (see
+	// transfer_receive_hold_promise.go)
+	holdPromise receiveHoldPromise
 	// reused by commitHeldPrefix so walking the hold in order allocates
 	// nothing per arrival
 	heldScratch []*receiveItem
@@ -14969,6 +14996,9 @@ func (self *ReceiveSequence) Run() {
 		if self.deliveryQueue != nil {
 			self.deliveryQueue.cancel()
 		}
+		// The hold is discarded below. Withdraw what it acknowledged first, so
+		// the stopping ACK worker carries the notices to the sender.
+		self.withdrawHeldCommitments()
 		// The ACK worker owns its route writer. Its stop path snapshots the final
 		// ACK window before closing. Cancel route waits before joining: Write
 		// still tries every immediately writable route before consulting the
@@ -15022,6 +15052,8 @@ func (self *ReceiveSequence) Run() {
 			// MessagePoolReturn(item.transferFrameBytes)
 			item.messagePoolReturn()
 		}
+		// and what the hold reserved for the predecessors it promised
+		self.releaseHoldPromise()
 
 		self.peerAudit.Complete()
 
@@ -15945,11 +15977,15 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 	} else {
 		// store only up to a max size in the receive queue.
 		// an empty queue always admits at least one item (see CanAdd).
+		// A predecessor of an acknowledged item was promised admission when
+		// that item committed, and draws on the reservation made for it then.
+		promised := self.holdPromised(sequenceNumber)
 		canQueue := func(item *receiveItem) bool {
-			return self.receiveQueue.CanAddWithQueueByteCount(
+			return self.receiveQueue.CanAddWithQueueByteCountAndCredit(
 				item.MessageByteCount(),
 				item.QueueByteCount(),
 				self.receiveBufferSettings.ReceiveQueueMaxByteCount,
+				self.holdPromiseCredit(promised),
 			)
 		}
 
@@ -15994,10 +16030,24 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 					break
 				}
 				if policy == ReceiveHoldCommittedPrefix && lastItem.committed {
-					// an acknowledged item is never discarded; the boundary is
-					// supposed to make this unreachable, and if it is reached
-					// the gap estimate under-counted
-					break
+					// Only a promised predecessor reaches an acknowledged
+					// item here, and its commitment reserved what the largest
+					// held Pack would need. Arriving larger than that is the one
+					// way in; refusing it would leave the delivery point behind
+					// a gap only one exact-next retransmission at a time could
+					// close, past the gap timeout. Withdraw the newest
+					// acknowledgement instead, with its eviction notice, so the
+					// sender resends it rather than leasing it.
+					self.client.receiveQueueCommitShortfallCount.Add(1)
+					if !self.receiveBufferSettings.EvictionNotice {
+						// Without notices the withdrawal could not reach the
+						// sender, which would lease a Pack that is gone until
+						// its selective acknowledgement timeout. Keep the
+						// acknowledgement and turn the arrival away: it is
+						// the delivery point's next Pack once the gap below
+						// it fills, and then lands on the direct path.
+						break
+					}
 				}
 				self.receiveQueue.RemoveByMessageId(lastItem.messageId)
 				if lastItem.committed {
@@ -16016,12 +16066,13 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			}
 		}
 
-		if canQueue(item) && self.reserveHeldItem(item) {
+		if canQueue(item) && self.reserveHeldItem(item, promised) {
 			// the largest frame seen is the conservative gap estimate:
 			// over-counting commits fewer items and costs churn at the
 			// boundary, under-counting commits an item that is later evicted,
 			// which is the lie the policy exists to remove
 			self.maxHeldByteCount = max(self.maxHeldByteCount, item.MessageByteCount())
+			self.maxHeldQueueByteCount = max(self.maxHeldQueueByteCount, item.QueueByteCount())
 			self.receiveQueue.Add(item)
 			if self.receiveBufferSettings.ReceiveHoldPolicy == ReceiveHoldCommittedPrefix {
 				self.commitHeldPrefix()
@@ -16049,16 +16100,21 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 	}
 }
 
-// commitHeldPrefix acknowledges every held item that can no longer be evicted,
-// and only those (THROUGHPUTFIX §37.20).
+// commitHeldPrefix acknowledges every held item whose missing predecessors the
+// hold can still admit, and only those (THROUGHPUTFIX §37.20).
 //
 // An item is evicted only by an earlier arrival at a full hold, so it is safe
-// once every item missing below it could arrive and it would still fit.
-// Sequence numbers are dense, one per Pack, so with the delivery point D and
-// the held items in ascending order the number missing below the i-th is
-// (seq_i - D) - i, and the item is committed when
+// once every item missing below it could arrive and would be admitted. With
+// the delivery point D and the held items in ascending order, the number
+// missing below the i-th is (seq_i - D) - i, and the item is committed when
+// the last of those predecessors, at the largest message held, passes the
+// window test every arrival passes,
 //
-//	missing_below(i) x maxFrameBytes + sum of held sizes through i <= capacity
+//	held bytes through i + missing_below(i) x maxMessageBytes < capacity
+//
+// and, on an exact shared budget, when missing_below(i) x maxRetainedBytes can
+// be reserved now. The prefix property follows: a later item's test covers
+// every earlier one's predecessors.
 //
 // The boundary only rises as the head drains, and an item's acknowledgement is
 // sent as it crosses. One second-order cost: a tentative item gives the sender
@@ -16073,8 +16129,8 @@ func (self *ReceiveSequence) commitHeldPrefix() {
 		clear(self.heldScratch)
 		self.heldScratch = self.heldScratch[:0]
 	}()
-	capacity := self.receiveBufferSettings.ReceiveQueueMaxByteCount
 	frameByteCount := max(self.maxHeldByteCount, 1)
+	retainedByteCount := max(self.maxHeldQueueByteCount, 1)
 
 	// The whole hold commits together whenever the newest held item would
 	// survive every gap below it filling, which is the ordinary case: a sender
@@ -16085,42 +16141,48 @@ func (self *ReceiveSequence) commitHeldPrefix() {
 	// it skips the sort the general case pays on every out-of-order arrival.
 	heldCount, heldTotal := self.receiveQueue.QueueSize()
 	if heldCount == 0 {
+		self.settleHoldPromise(false, 0, 0)
 		return
 	}
 	if newest := self.receiveQueue.PeekLast(); newest != nil {
-		missing := int64(newest.sequenceNumber) -
-			int64(self.nextSequenceNumber) - int64(heldCount-1)
-		if missing < 0 {
-			missing = 0
-		}
-		if ByteCount(missing)*frameByteCount+heldTotal <= capacity {
+		missing := heldMissingBelow(newest.sequenceNumber, self.nextSequenceNumber, heldCount-1)
+		required := ByteCount(missing) * retainedByteCount
+		if self.holdPromiseFits(heldTotal, missing, frameByteCount) && self.reserveHoldPromise(required) {
 			self.heldScratch = self.receiveQueue.UnorderedItems(self.heldScratch)
 			for _, held := range self.heldScratch {
-				if held.committed {
-					continue
+				if !held.committed {
+					self.commitHeldItem(held)
 				}
-				self.commitHeldItem(held)
 			}
+			self.settleHoldPromise(true, newest.sequenceNumber, required)
 			return
 		}
 	}
 
+	// Walk the whole hold: an item committed on an earlier pass stays
+	// committed, and the newest of them is the boundary the reservation serves.
 	self.heldScratch = self.receiveQueue.AscendingItems(self.heldScratch)
 	heldByteCount := ByteCount(0)
+	committing := true
+	boundarySet := false
+	boundary := uint64(0)
+	boundaryMissing := int64(0)
 	for i, held := range self.heldScratch {
 		heldByteCount += held.MessageByteCount()
-		missing := int64(held.sequenceNumber) - int64(self.nextSequenceNumber) - int64(i)
-		if missing < 0 {
-			missing = 0
-		}
-		if capacity < ByteCount(missing)*frameByteCount+heldByteCount {
-			break
+		missing := heldMissingBelow(held.sequenceNumber, self.nextSequenceNumber, i)
+		if committing && !held.committed {
+			if self.holdPromiseFits(heldByteCount, missing, frameByteCount) &&
+				self.reserveHoldPromise(ByteCount(missing)*retainedByteCount) {
+				self.commitHeldItem(held)
+			} else {
+				committing = false
+			}
 		}
 		if held.committed {
-			continue
+			boundarySet, boundary, boundaryMissing = true, held.sequenceNumber, missing
 		}
-		self.commitHeldItem(held)
 	}
+	self.settleHoldPromise(boundarySet, boundary, ByteCount(boundaryMissing)*retainedByteCount)
 }
 
 // Acknowledges one held item as it crosses the boundary.
