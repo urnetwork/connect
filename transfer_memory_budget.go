@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -23,6 +24,16 @@ import (
 // for the whole tree. Child ceilings may overlap (idle shares can be lent),
 // but their live owners can never collectively overdraw the root.
 //
+// An owner that waits for bytes reserves through tryReserveOrQueue, and
+// waiters are served in arrival order: whatever frees capacity reserves it
+// for the oldest waiters it fits before any woken goroutine runs. Waking every
+// waiter to race for the bytes let the runtime pick the winner: with no idle
+// processor a releaser coming straight back, or the oldest woken waiter,
+// reserved first and waited again ahead of the siblings it beat, so one of
+// many producers won every release. No queued waiter fits the free capacity,
+// so a request that fits it takes it at once without passing anyone it could
+// serve. CapacityNotify keeps its wake-all for owners that retry other state.
+//
 // All methods are safe for concurrent use. Parent relationships are immutable.
 type TransferMemoryBudget struct {
 	// Exact admission and role-driven resize share one linearization boundary.
@@ -43,6 +54,10 @@ type TransferMemoryBudget struct {
 	releasedByteCount atomic.Int64
 
 	notify atomic.Pointer[transferMemoryBudgetNotify]
+
+	// Queued tryReserveOrQueue waiters of the whole tree in arrival order.
+	// Only the admission root keeps them, under its admissionLock.
+	reserveWaiters []*transferMemoryReserveWaiter
 
 	// Admission waiters are intrusive and own reusable one-item channels.
 	// Releasing one receive-window reservation wakes only the number of
@@ -65,6 +80,15 @@ type TransferMemoryBudget struct {
 // while subscribers either join this generation or publish the next one.
 type transferMemoryBudgetNotify struct {
 	channel chan struct{}
+}
+
+// One queued exact reservation. A grant reserves byteCount from budget under
+// the root's admission lock before ready closes, so a closed ready channel
+// means the caller owns the reservation.
+type transferMemoryReserveWaiter struct {
+	budget    *TransferMemoryBudget
+	byteCount ByteCount
+	ready     chan struct{}
 }
 
 // transferMemoryBudgetWaiter is one reusable admission subscription. The
@@ -165,6 +189,7 @@ func (self *TransferMemoryBudget) SetTotalByteCount(totalByteCount ByteCount) {
 	root := self.admissionRoot()
 	root.admissionLock.Lock()
 	self.totalByteCount.Store(totalByteCount)
+	root.grantReserveWaitersWithLock()
 	root.admissionLock.Unlock()
 	self.notifyCapacityChanged()
 }
@@ -265,8 +290,61 @@ func (self *TransferMemoryBudget) Release(byteCount ByteCount) {
 			DefaultLogger().Errorf("[tmb]release below zero (%d)", used)
 		}
 	}
+	root.grantReserveWaitersWithLock()
 	root.admissionLock.Unlock()
 	self.notifyCapacityChanged()
+}
+
+// Reserves byteCount at once when it fits, as TryReserve does. Otherwise
+// queues a waiter behind every earlier one, and the caller must either receive
+// from the waiter's ready channel, which closes once byteCount is reserved on
+// its behalf, or abandon it. A negative byteCount is refused with no waiter.
+// A caller that cannot wait uses TryReserve, which holds no place in line.
+func (self *TransferMemoryBudget) tryReserveOrQueue(byteCount ByteCount) (bool, *transferMemoryReserveWaiter) {
+	root := self.admissionRoot()
+	root.admissionLock.Lock()
+	defer root.admissionLock.Unlock()
+	if self.tryReserveWithLock(byteCount) {
+		return true, nil
+	}
+	if byteCount < 0 {
+		return false, nil
+	}
+	waiter := &transferMemoryReserveWaiter{budget: self, byteCount: byteCount, ready: make(chan struct{})}
+	root.reserveWaiters = append(root.reserveWaiters, waiter)
+	return false, waiter
+}
+
+// Withdraws a waiter whose caller stopped waiting. Bytes already reserved for
+// it pass on as their release would, so no grant is lost.
+func (self *transferMemoryReserveWaiter) abandon() {
+	root := self.budget.admissionRoot()
+	root.admissionLock.Lock()
+	if index := slices.Index(root.reserveWaiters, self); 0 <= index {
+		root.reserveWaiters = slices.Delete(root.reserveWaiters, index, index+1)
+		root.admissionLock.Unlock()
+		return
+	}
+	root.admissionLock.Unlock()
+	self.budget.Release(self.byteCount)
+}
+
+// Reserves for queued waiters, oldest first, each one that fits. Called on the
+// admission root, with its admissionLock held, after capacity grew.
+func (self *TransferMemoryBudget) grantReserveWaitersWithLock() {
+	if len(self.reserveWaiters) == 0 {
+		return
+	}
+	waiters := self.reserveWaiters[:0]
+	for _, waiter := range self.reserveWaiters {
+		if waiter.budget.tryReserveWithLock(waiter.byteCount) {
+			close(waiter.ready)
+		} else {
+			waiters = append(waiters, waiter)
+		}
+	}
+	clear(self.reserveWaiters[len(waiters):])
+	self.reserveWaiters = waiters
 }
 
 // tryMoveReservation transfers an already-owned claim inside one immutable
@@ -316,6 +394,7 @@ func (self *TransferMemoryBudget) tryMoveReservation(target *TransferMemoryBudge
 			budget.reservedByteCount.Add(byteCount)
 		}
 	}
+	root.grantReserveWaitersWithLock()
 	root.admissionLock.Unlock()
 	if self != target && byteCount != 0 {
 		self.notifyCapacityChanged()

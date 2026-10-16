@@ -21,7 +21,7 @@ func TestWindowPathServiceLargeMessageCapacityChanges(t *testing.T) {
 			for _, arm := range []string{"ceiling", "delivery"} {
 				synctest.Test(t, func(t *testing.T) {
 					cell := windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond,
-						Flows: 8, RoundRobinOffer: true, Payload: payload, Budget: mib(48), Rate: rates[1], Warmup: warmup}
+						Flows: 8, Payload: payload, Budget: mib(48), Rate: rates[1], Warmup: warmup}
 					if arm == "delivery" {
 						cell.Rate, cell.RateAfter, cell.RateChangeAfter, cell.Drop = rates[0], rates[1], 4*time.Second, true
 					}

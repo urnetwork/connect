@@ -102,6 +102,9 @@ func TestFreshBloombergRaceExcludesExternallyRejectedExit(t *testing.T) {
 }
 
 func TestFreshBloombergReputationFilterAllocatesNothing(t *testing.T) {
+	if allocationsInFreshProcess(t) {
+		return
+	}
 	parent := reputationTestParent("www.bloomberg.com")
 	bad := reputationTestClient(DestinationStats{ReputationFailures: []string{"bloomberg"}})
 	clean := reputationTestClient(DestinationStats{})
@@ -188,6 +191,9 @@ func TestFreshQualityMediaPrefersMeasuredFastSameNetworkExit(t *testing.T) {
 }
 
 func TestFreshQualitySameNetworkPreferenceAllocatesNothing(t *testing.T) {
+	if allocationsInFreshProcess(t) {
+		return
+	}
 	parent := reputationTestParent("www.bloomberg.com")
 	public := reputationTestClient(DestinationStats{EstimatedBytesPerSecond: 20_000_000, Tier: 0})
 	peer := reputationTestClient(DestinationStats{

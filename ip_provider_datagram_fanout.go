@@ -27,6 +27,7 @@ func (nat *LocalUserNat) prepareUdpReturnRead(sequence *UdpSequence, readBytes i
 		return nil, true
 	}
 	senders := nat.providerDatagramSenders.Get()
+	sequence.releaseUnservedReturnReadCredit(senders)
 	if len(senders) == 0 {
 		return nil, true
 	}

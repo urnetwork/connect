@@ -56,7 +56,7 @@ func TestWindowPathWindowMismatchMatrix(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, cell := range windowMismatchMatrixCells() {
 		t.Run(fmt.Sprintf("send=%d/receive=%d/rtt=%s/compression=%s/flows=%d", cell.SendWindow, cell.ReceiveWindow, cell.RoundTrip, cell.Compression, cell.Flows), func(t *testing.T) {
-			windowPathParallel(t)
+			t.Parallel()
 			checkWindowMismatchCellWithMinimumDuration(t, cell, 100*time.Millisecond)
 		})
 	}
@@ -97,7 +97,7 @@ func TestWindowPathWindowMismatchChanges(t *testing.T) {
 	for _, windows := range [][2]ByteCount{{kib(64), mib(2)}, {mib(2), kib(64)}} {
 		for _, compression := range []time.Duration{0, 10 * time.Millisecond, 50 * time.Millisecond} {
 			t.Run(fmt.Sprintf("receive=%d-to-%d/compression=%s", windows[0], windows[1], compression), func(t *testing.T) {
-				windowPathParallel(t)
+				t.Parallel()
 				checkWindowMismatchCell(t, windowPathCell{SendWindow: mib(48), ReceiveWindow: windows[0], ReceiveWindowAfter: windows[1], WindowChangeAfter: 2 * time.Second, Warmup: 4 * time.Second, RoundTrip: 100 * time.Millisecond, Compression: compression, Flows: 8, Rate: 12500000})
 			})
 		}
@@ -117,7 +117,6 @@ func checkWindowMismatchCell(t *testing.T, cell windowPathCell, observe ...func(
 func checkWindowMismatchCellWithMinimumDuration(t *testing.T, cell windowPathCell, minimumDuration time.Duration, observe ...func(windowPathCell, *Client, *Client)) windowPathReading {
 	t.Helper()
 	cell.Budget, cell.Payload = mib(48), 1280
-	cell.RoundRobinOffer = true
 	finalReceive := cell.ReceiveWindow
 	if cell.ReceiveWindowAfter > 0 {
 		finalReceive = cell.ReceiveWindowAfter

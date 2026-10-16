@@ -140,7 +140,7 @@ func (self *SendSequence) unfundedRawGroup(pack *SendPack) bool {
 		return false
 	}
 	required := self.retainedSendPackByteCountWithContractBytes(pack, self.preparedContractByteCount.Load())
-	return required > self.resendQueue.budget.Available()
+	return required > self.resendQueue.budget.Available()+self.resendMemoryGrant
 }
 
 // Preserves ordinary completion accounting and reports whether serialization

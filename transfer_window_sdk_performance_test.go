@@ -195,7 +195,7 @@ func checkWindowSdkProfileRows(t *testing.T, reverse bool, roundTrip time.Durati
 		}
 		rows++
 		t.Run(windowSdkCellName(profiles, cell), func(t *testing.T) {
-			windowPathParallel(t)
+			t.Parallel()
 			checkWindowSdkCell(t, cell)
 		})
 	}
@@ -245,10 +245,10 @@ func checkWindowSdkBidirectional(t *testing.T, roundTrip time.Duration) {
 		}
 		for _, flows := range []int{1, 8} {
 			t.Run(fmt.Sprintf("%s/providing=%t/rtt=%s/flows=%d", profile.Name, profile.Providing, roundTrip, flows), func(t *testing.T) {
-				windowPathParallel(t)
+				t.Parallel()
 				checkWindowSdkCell(t, windowPathCell{SenderProfile: &profiles[1], ReceiverProfile: &profile,
 					ProfileFixtureSha256: digest, Bidirectional: true, RoundTrip: roundTrip,
-					Upload: flows == 8, Flows: flows, RoundRobinOffer: true, Payload: 1280, Rate: 125000000})
+					Upload: flows == 8, Flows: flows, Payload: 1280, Rate: 125000000})
 			})
 		}
 	}

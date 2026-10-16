@@ -38,6 +38,15 @@ func (s *receiveCapacitySignal) notify() {
 // Reliable TCP takes the same security/parser path under bounded callback
 // workspace, but each frame must either secure an owner or fail its receipt.
 // A denied security policy is an intentional consume/reset, not congestion.
+//
+// Decode workspace is transient and shared by every source: the data budget,
+// then one prepaid fallback slot per kind. No workspace now is not a failure
+// of this frame, whose receipt would cancel this source's whole sequence
+// because another source was decoding. The frame is deferred on its receipt
+// instead, and this sequence's worker retries it on either workspace's
+// capacity edge. Later data of the sequence queues behind deferred data, so
+// each flow reaches the NAT in arrival order. A small control never queues:
+// as at final admission it may pass pending data, which it can release.
 func (self *RemoteUserNatProvider) receiveReliableFrames(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	for _, frame := range frames {
 		if !receiveDeliveryHasTcp([]*protocol.Frame{frame}) {
@@ -46,39 +55,92 @@ func (self *RemoteUserNatProvider) receiveReliableFrames(source TransferPath, fr
 			self.ClientReceive(source, []*protocol.Frame{frame}, ordinary)
 			continue
 		}
-		claim := peer.deliveryReceipt().hold()
+		receipt := peer.deliveryReceipt()
+		claim := receipt.hold()
 		if claim == nil {
 			return
 		}
-		func() {
-			secured := false
-			defer func() { claim.complete(secured) }()
-			memory, admitted := self.startMemoryOperation(providerFrameOperationBytes([]*protocol.Frame{frame}))
-			if !admitted {
-				// These slots are prepaid in the provider envelope. A full
-				// data budget must not block ACK/window control inspection.
-				packet, err := ipPacketToProviderBytes(frame)
-				if err != nil || len(packet) > packetPoolSize || self.memoryOperations == nil || !self.memoryOperations.start() {
-					return
-				}
-				budget, bytes := self.ingressMemory, natProviderIngressBytes
-				if smallNatControlPacket(packet) {
-					budget, bytes = self.ingressControlMemory, natProviderControlBytes
-				}
-				if budget == nil {
-					self.memoryOperations.finish()
-					return
-				}
-				memory, admitted = reserveNatMemory(budget, bytes)
-				if !admitted {
-					self.memoryOperations.finish()
-					return
-				}
+		control := reliableFrameControl(frame)
+		if control || !receipt.queue.decodeDeferred() {
+			if result := self.receiveReliableFrame(source, frame, peer); result != receiveDeliveryWaiting {
+				claim.complete(result == receiveDeliverySecured)
+				continue
 			}
-			defer self.finishMemoryOperation(&memory)
-			secured = self.clientReceiveAdmitted(source, []*protocol.Frame{frame}, peer)
-		}()
+		}
+		// The deferred operation holds its own claim on the receipt.
+		claim.complete(self.deferReliableFrame(source, frame, peer, control))
 	}
+}
+
+func reliableFrameControl(frame *protocol.Frame) bool {
+	packet, err := ipPacketToProviderBytes(frame)
+	return err == nil && smallNatControlPacket(packet)
+}
+
+// Decodes one frame under transient workspace. Waiting means no workspace
+// can be had now but some can later; the frame is untouched.
+func (self *RemoteUserNatProvider) receiveReliableFrame(source TransferPath, frame *protocol.Frame, peer Peer) receiveDeliveryAttempt {
+	bytes := providerFrameOperationBytes([]*protocol.Frame{frame})
+	memory, admitted := self.startMemoryOperation(bytes)
+	if !admitted {
+		// These slots are prepaid in the provider envelope. A full
+		// data budget must not block ACK/window control inspection.
+		packet, err := ipPacketToProviderBytes(frame)
+		if err != nil || self.memoryOperations == nil || !self.memoryOperations.start() {
+			return receiveDeliveryRejected
+		}
+		fallback, fallbackBytes := self.ingressMemory, natProviderIngressBytes
+		if smallNatControlPacket(packet) {
+			fallback, fallbackBytes = self.ingressControlMemory, natProviderControlBytes
+		}
+		if fallback == nil || len(packet) > packetPoolSize {
+			self.memoryOperations.finish()
+			// Only the data budget can hold this frame, once it can ever fit.
+			if data := self.memoryBudget(); data == nil || data.TotalByteCount() < bytes {
+				return receiveDeliveryRejected
+			}
+			return receiveDeliveryWaiting
+		}
+		memory, admitted = reserveNatMemory(fallback, fallbackBytes)
+		if !admitted {
+			self.memoryOperations.finish()
+			return receiveDeliveryWaiting
+		}
+	}
+	defer self.finishMemoryOperation(&memory)
+	if self.clientReceiveAdmitted(source, []*protocol.Frame{frame}, peer) {
+		return receiveDeliverySecured
+	}
+	return receiveDeliveryRejected
+}
+
+// Defers a frame refused workspace to an operation on its receipt, which owns
+// a read-only share of the borrowed frame bytes. The NAT owner its decode
+// creates takes a successor claim before the deferred claim completes.
+func (self *RemoteUserNatProvider) deferReliableFrame(source TransferPath, frame *protocol.Frame, peer Peer, control bool) bool {
+	deferred := &protocol.Frame{MessageType: frame.MessageType, Raw: frame.Raw,
+		MessageBytes: MessagePoolShareReadOnly(frame.MessageBytes)}
+	fallback := self.ingressMemory
+	if control {
+		fallback = self.ingressControlMemory
+	}
+	var subscribe func() <-chan struct{}
+	if fallback != nil {
+		subscribe = fallback.CapacityNotify
+	}
+	op := peer.deliveryReceipt().operation(ipPacketFlowKey{}, control, subscribe, func() receiveDeliveryAttempt {
+		return self.receiveReliableFrame(source, deferred, peer)
+	}, func() {
+		MessagePoolReturn(deferred.MessageBytes)
+	})
+	if op == nil {
+		MessagePoolReturn(deferred.MessageBytes)
+		return false
+	}
+	// All sources are subscribed by the sequence worker before attempting.
+	op.contexts = []<-chan struct{}{self.ctx.Done()}
+	op.budget = self.memoryBudget()
+	return true
 }
 
 // One packet/claim survives NAT and final TCP queue pressure. No retry

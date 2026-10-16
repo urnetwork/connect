@@ -19,7 +19,7 @@ const windowSettledLargeReferenceConfiguration = "settled-large-reference-v3-cal
 func windowSettledLargeMessageCell(arm string, rates [2]ByteCount, payload int) windowPathCell {
 	cell := windowPathCell{
 		Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond,
-		Flows: 8, RoundRobinOffer: true, Payload: payload, Budget: mib(48), Rate: rates[1],
+		Flows: 8, Payload: payload, Budget: mib(48), Rate: rates[1],
 		Warmup: 40500*time.Millisecond + time.Duration(2*int64(mib(2))*int64(time.Second)/int64(min(rates[0], rates[1]))),
 	}
 	if arm == "ceiling" {
@@ -73,7 +73,7 @@ func TestWindowPathServiceCapacityIncreaseRecovery(t *testing.T) {
 	for _, arm := range []string{"ceiling", "delivery"} {
 		synctest.Test(t, func(t *testing.T) {
 			cell := windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond,
-				Flows: 8, RoundRobinOffer: true, Payload: 64 * 1024, Budget: mib(48), Rate: 1250000, Warmup: 40 * time.Second}
+				Flows: 8, Payload: 64 * 1024, Budget: mib(48), Rate: 1250000, Warmup: 40 * time.Second}
 			if arm == "delivery" {
 				cell.Rate, cell.RateAfter, cell.RateChangeAfter, cell.Drop = 125000, 1250000, 40*time.Second, true
 			}

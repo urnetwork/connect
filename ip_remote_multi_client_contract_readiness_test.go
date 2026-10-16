@@ -19,6 +19,9 @@ type evaluationContractOob struct {
 	ready    bool
 	grant    *contractErrorOob
 	requests atomic.Int64
+	// closed at the first contract request
+	requested     chan struct{}
+	requestedOnce sync.Once
 }
 
 // Takes the frames and either supplies a real contract or an empty result.
@@ -26,6 +29,7 @@ func (self *evaluationContractOob) SendControl(frames []*protocol.Frame, callbac
 	for _, frame := range frames {
 		if frame.MessageType == protocol.MessageType_TransferCreateContract {
 			self.requests.Add(1)
+			self.requestedOnce.Do(func() { close(self.requested) })
 		}
 	}
 	if self.ready {
@@ -49,6 +53,14 @@ type evaluationContractCase struct {
 	observePendingAt time.Duration
 	expirePass       bool
 	cancelOwner      bool
+	// holds the pass's cancellation branch until everything the owner's
+	// cancellation set off has landed, so the canceled ping's own error
+	// reaches the pass first
+	pingErrorFirst bool
+	// a pack ahead of the candidate's pings holds their send sequence in its
+	// contract wait, so the pings stay queued: the cancellation then closes
+	// the sequence on them instead of failing them in the wait
+	pingQueued bool
 }
 
 // Exercises the production timer/error callback without replacing its contract
@@ -63,6 +75,17 @@ func checkEvaluationContractBoundary(t *testing.T, test evaluationContractCase) 
 		fixture.window.settings.WindowClientSetupTimeout = 3 * time.Second
 		fixture.window.beforeExpandPingResultForTest = nil
 		fixture.window.afterExpandPingResultForTest = nil
+		releaseCancelBranch := make(chan struct{})
+		pingErrorLanded := make(chan struct{})
+		if test.pingErrorFirst {
+			fixture.window.beforeExpandPingCancelForTest = func() {
+				<-releaseCancelBranch
+			}
+			var landedOnce sync.Once
+			fixture.window.afterExpandPingResultForTest = func() {
+				landedOnce.Do(func() { close(pingErrorLanded) })
+			}
+		}
 		expirePass := make(chan struct{})
 		fixture.window.expireExpandPassForTest = expirePass
 		generator := fixture.window.generator.(*multiClientExpandLifecycleGenerator).TestMultiClientGenerator
@@ -70,7 +93,7 @@ func checkEvaluationContractBoundary(t *testing.T, test evaluationContractCase) 
 		destination := candidate.Destination.Tail()
 		fixture.window.clientChannelArgs <- candidate
 		created := make(chan *Client, 1)
-		oob := &evaluationContractOob{ready: test.grant}
+		oob := &evaluationContractOob{ready: test.grant, requested: make(chan struct{})}
 		var wireFrames atomic.Int64
 		generator.newClient = func(ctx context.Context, args *MultiClientGeneratorClientArgs, settings *ClientSettings) (*Client, error) {
 			// Virtual setup time places the probe cutoff before the later ping
@@ -85,6 +108,11 @@ func checkEvaluationContractBoundary(t *testing.T, test evaluationContractCase) 
 			settings.SendBufferSettings.CreateContractTimeout = test.contractBudget
 			settings.SendBufferSettings.CreateContractRetryInterval = 100 * time.Millisecond
 			settings.SendBufferSettings.CreateContractRetryMaxInterval = 100 * time.Millisecond
+			if test.pingQueued {
+				// without the opening contract's prewarm, the sequence's first
+				// contract request is its wait for the pack ahead
+				settings.SendBufferSettings.PrewarmOpeningContract = false
+			}
 			oob.grant = &contractErrorOob{clientId: args.ClientId}
 			client := NewClient(ctx, args.ClientId, oob, settings)
 			packets := make(chan []byte, 128)
@@ -100,6 +128,10 @@ func checkEvaluationContractBoundary(t *testing.T, test evaluationContractCase) 
 					}
 				}
 			}()
+			if test.pingQueued {
+				client.SendWithTimeout(RequireToFrameWithDefaultProtocolVersion(&protocol.IpPing{}), destination, func(error) {}, -1)
+				<-oob.requested
+			}
 			created <- client
 			return client, nil
 		}
@@ -149,6 +181,15 @@ func checkEvaluationContractBoundary(t *testing.T, test evaluationContractCase) 
 			fixture.cancelEvaluation()
 		}
 		synctest.Wait()
+		if test.pingErrorFirst {
+			select {
+			case <-pingErrorLanded:
+			default:
+				t.Fatal("the canceled ping's own error did not reach the pass ahead of its cancellation branch")
+			}
+			close(releaseCancelBranch)
+			synctest.Wait()
+		}
 		if got := fixture.result(t, done); got != 0 {
 			t.Fatalf("admitted without provider acknowledgement=%d", got)
 		}
@@ -156,10 +197,10 @@ func checkEvaluationContractBoundary(t *testing.T, test evaluationContractCase) 
 			t.Fatalf("elapsed=%s want=%s", got, test.setupDelay+test.elapsed)
 		}
 		wantProvider, wantPlatform := 0, 1
-		if test.grant {
-			wantProvider, wantPlatform = 1, 0
-		} else if test.cancelOwner {
+		if test.cancelOwner {
 			wantPlatform = 0
+		} else if test.grant {
+			wantProvider, wantPlatform = 1, 0
 		}
 		counts := fixture.window.failures.counts(time.Now())
 		if got := counts[windowFailureProvider]; got != wantProvider {
@@ -222,6 +263,70 @@ func TestEvaluationContractPassDeadlineIsLocal(t *testing.T) {
 // Epoch replacement is neither a provider nor a local-control failure.
 func TestEvaluationContractOwnerCancellationIsNotFailure(t *testing.T) {
 	checkEvaluationContractBoundary(t, evaluationContractCase{contractBudget: 4 * time.Second, elapsed: time.Second, cancelOwner: true})
+}
+
+// The cancellation tears the candidate's client down. A ping queued in its
+// send sequence behind a pack in the contract wait -- the channel's own cping
+// when it gets there first, here a pack the test sends first -- then fails
+// with the sequence's closure, not the context's error. Whether the pass's
+// cancellation branch or that failure reaches the pass first, the epoch
+// replacement is neither a provider nor a local-control failure. The held
+// branch puts the ping's own error first.
+func TestEvaluationContractOwnerCancellationClosingThePingIsNotFailure(t *testing.T) {
+	checkEvaluationContractBoundary(t, evaluationContractCase{
+		contractBudget: 4 * time.Second, elapsed: time.Second,
+		cancelOwner: true, pingErrorFirst: true, pingQueued: true,
+	})
+}
+
+// A granted ping already written to the provider and awaiting its ack is
+// closed by the cancellation the same way, and the closure is no more provider
+// evidence after contact than before it.
+func TestEvaluationContractOwnerCancellationClosingAGrantedPingIsNotFailure(t *testing.T) {
+	checkEvaluationContractBoundary(t, evaluationContractCase{grant: true, contractBudget: 4 * time.Second, elapsed: time.Second, cancelOwner: true, pingErrorFirst: true})
+}
+
+// The cancellation can land while the candidate is being built, before its
+// ping is sent: the client is already torn down, and the send fails at once
+// with the client's own error rather than the context's. That is the
+// cancellation too, not provider evidence. The pass's cancellation branch is
+// held until the failed send has ended the pass.
+func TestEvaluationPingSentAfterOwnerCancellationIsNotFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newMultiClientExpandLifecycleFixture(t)
+		generator := fixture.window.generator.(*multiClientExpandLifecycleGenerator).TestMultiClientGenerator
+		newClient := generator.newClient
+		generator.newClient = func(ctx context.Context, args *MultiClientGeneratorClientArgs, settings *ClientSettings) (*Client, error) {
+			client, err := newClient(ctx, args, settings)
+			// the owner replaces the epoch while the candidate is being built
+			fixture.cancelEvaluation()
+			return client, err
+		}
+		releaseCancelBranch := make(chan struct{})
+		fixture.window.beforeExpandPingCancelForTest = func() {
+			<-releaseCancelBranch
+		}
+
+		done := fixture.start()
+		synctest.Wait()
+		select {
+		case got := <-done:
+			if got != 0 {
+				t.Errorf("admitted a candidate of the canceled epoch=%d", got)
+			}
+		default:
+			t.Fatal("the failed ping send did not end the pass ahead of its cancellation branch")
+		}
+		close(releaseCancelBranch)
+		synctest.Wait()
+
+		if got := fixture.window.failures.counts(time.Now()); got != [windowFailureClassCount]int{} {
+			t.Errorf("failures after the canceled epoch's ping=%v, want none", got)
+		}
+		if lines := fixture.log.linesWith("[multi]evaluation ping error"); len(lines) != 0 {
+			t.Errorf("the canceled epoch's ping was reported as a provider error: %v", lines)
+		}
+	})
 }
 
 // Owner-scoped proof cannot forget a previous candidate's attempted provider
