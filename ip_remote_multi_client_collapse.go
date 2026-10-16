@@ -92,6 +92,9 @@ func (update *multiClientChannelUpdate) markReceivedInbound(client *multiClientC
 	if !control.syn && update.receivedInbound.Load() {
 		return false
 	}
+	if client != nil && client.beforeFirstAnswerMarkForTest != nil {
+		client.beforeFirstAnswerMarkForTest(update)
+	}
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
 	return update.markReceivedInboundWithLock(client, control)

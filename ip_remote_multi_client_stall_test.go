@@ -3,10 +3,12 @@ package connect
 import (
 	"context"
 	"errors"
+	"net"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -888,56 +890,66 @@ func TestMultiClientCancelledFlowTableRejectsNewGeneration(t *testing.T) {
 }
 
 // Exercise the real teardown path, not only its queue primitive. Clearing
-// every flow association is mandatory, but reset construction and retention
-// must be bounded by queue capacity even for a large flow table.
+// every flow association is mandatory, but reset retention must be bounded by
+// queue capacity even for a large flow table, with every reset past it counted
+// as a drop rather than waited for. The removal runs in a synctest bubble with
+// nothing draining the queue, so the bound is the counted work below rather
+// than a wall-clock deadline: a removal that waited on the full queue forever
+// would leave the bubble deadlocked, and one that waited any bounded time per
+// reset would let fake time pass across removeClient, which no wait-free
+// removal does.
 func TestMultiClientRemovalClearsAllFlowsWithBoundedResetWork(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	clientCtx, cancelClient := context.WithCancel(ctx)
-	cancelClient()
-	client := &multiClientChannel{ctx: clientCtx}
-	multi := &RemoteUserNatMultiClient{
-		ctx:                 ctx,
-		log:                 NewNoopLogger(),
-		removalReceiveQueue: make(chan receivePacket, 2),
-		clientUpdates:       map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
-	}
-	updates := make(map[*multiClientChannelUpdate]bool, 4096)
-	for i := range 4096 {
-		update := &multiClientChannelUpdate{
-			ipPath: &IpPath{
-				Version:         4,
-				Protocol:        IpProtocolTcp,
-				SourceIp:        []byte{10, 0, byte(i >> 8), byte(i)},
-				SourcePort:      10_000 + i,
-				DestinationIp:   []byte{192, 0, 2, 1},
-				DestinationPort: 443,
-			},
+		clientCtx, cancelClient := context.WithCancel(ctx)
+		cancelClient()
+		client := &multiClientChannel{ctx: clientCtx}
+		multi := &RemoteUserNatMultiClient{
+			ctx:                 ctx,
+			log:                 NewNoopLogger(),
+			removalReceiveQueue: make(chan receivePacket, 2),
+			clientUpdates:       map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
 		}
-		update.client.Store(client)
-		updates[update] = true
-	}
-	multi.clientUpdates[client] = updates
+		updates := make(map[*multiClientChannelUpdate]bool, 4096)
+		for i := range 4096 {
+			update := &multiClientChannelUpdate{
+				ipPath: &IpPath{
+					Version:         4,
+					Protocol:        IpProtocolTcp,
+					SourceIp:        net.IPv4(198, 51, 100, 1).To4(),
+					SourcePort:      10_000 + i,
+					DestinationIp:   net.IPv4(192, 0, 2, 1).To4(),
+					DestinationPort: 443,
+				},
+			}
+			update.client.Store(client)
+			updates[update] = true
+		}
+		multi.clientUpdates[client] = updates
 
-	assertReturnsWithin(t, 250*time.Millisecond, func() {
+		start := time.Now()
 		multi.removeClient(client)
-	}, "large client teardown stalled maintenance")
-
-	if _, ok := multi.clientUpdates[client]; ok {
-		t.Fatal("removed client retained its flow set")
-	}
-	for update := range updates {
-		if update.client.Load() != nil {
-			t.Fatal("client teardown did not clear every flow association")
+		if waited := time.Since(start); waited != 0 {
+			t.Fatalf("the removal let %s of fake time pass, want none: it waited for the reset queue", waited)
 		}
-	}
-	if got := len(multi.removalReceiveQueue); got != 2 {
-		t.Fatalf("retained reset count = %d, want queue capacity 2", got)
-	}
-	if got := multi.removalReceiveDropCount.Load(); got != uint64(len(updates)-2) {
-		t.Fatalf("accounted reset drops = %d, want %d", got, len(updates)-2)
-	}
+
+		if _, ok := multi.clientUpdates[client]; ok {
+			t.Fatal("removed client retained its flow set")
+		}
+		for update := range updates {
+			if update.client.Load() != nil {
+				t.Fatal("client teardown did not clear every flow association")
+			}
+		}
+		if got := len(multi.removalReceiveQueue); got != 2 {
+			t.Fatalf("retained reset count = %d, want queue capacity 2", got)
+		}
+		if got := multi.removalReceiveDropCount.Load(); got != uint64(len(updates)-2) {
+			t.Fatalf("accounted reset drops = %d, want %d", got, len(updates)-2)
+		}
+	})
 }
 
 // Contract status is observer state, not transfer callback backpressure. A
