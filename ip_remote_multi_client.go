@@ -8740,9 +8740,12 @@ func (self *RemoteUserNatMultiClient) clientDialFailureSignal(sourceClient *mult
 // taken out of the race, with its strike and its service failure, so the
 // commit cannot bind the flow to the exit that failed it. The one candidate
 // of a race of one taken out this way counts as a re-race, as it would had
-// the commit come first; one candidate of several does not. With the knob off it rebuilds the icmp with
-// the flow's SYN sequence and forwards it to the app (removeClient's teardown
-// convention) for a visible-but-fast failure. Each exit strikes a flow once:
+// the commit come first; one candidate of several does not. With the knob off
+// the flow keeps its exit, and the one candidate of a race of one is that exit
+// before the commit lands, so its signal stands as the bound exit's whichever
+// lands first. The icmp is then rebuilt with the connect attempt's SYN
+// sequence and forwarded to the app (removeClient's teardown convention) for
+// a visible-but-fast failure. Each exit strikes a flow once:
 // a failure the same exit already reported for the flow re-races or forwards
 // as before, but adds no strike and is not counted as a re-race again. Every
 // signal, matched or not, is counted; an unmatched one is dropped.
@@ -10096,6 +10099,12 @@ func (self *multiClientChannelUpdate) dialFailureStanding(client *multiClientCha
 		if standing == dialFailureStale {
 			return dialFailureStale, false
 		}
+	case bound == nil && self.race != nil && self.race.single &&
+		self.race.clientStates[client] != nil && len(self.race.clientStates[client].packets) == 0:
+		// with the re-race off the one candidate of a race that commits on
+		// its send is kept, so it is the flow's exit before the commit lands:
+		// its failure stands as a bound exit's, whichever lands first
+		standing = dialFailureBound
 	default:
 		return dialFailureStale, false
 	}
@@ -10163,10 +10172,16 @@ func (self *multiClientChannelUpdate) forgetDialFailedClient(client *multiClient
 
 // synSequence is the sequence number of the flow's current SYN, which a
 // kernel stack checks an icmp error's embed against, and whether a SYN was
-// seen at all.
+// seen at all. It is the connect attempt's SYN, which the send path records
+// before the SYN leaves (noteConnectAttempt), so a failure that lands before
+// the send commits the SYN's generation embeds it too. The committed
+// generation stands in only where no attempt was recorded.
 func (self *multiClientChannelUpdate) synSequence() (uint32, bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if self.dialFailedSynSeen {
+		return self.dialFailedSyn, true
+	}
 	return self.synGenerationNumber, self.synGenerationSeen
 }
 
