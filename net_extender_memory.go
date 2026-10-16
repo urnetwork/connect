@@ -48,11 +48,11 @@ func acquireExtenderTcpMemory(ctx context.Context) (*platformTransportBudgetRese
 	if nested, _ := ctx.Value(platformTransportNestedBudgetContextKey{}).(*PlatformTransportBudget); nested != nil {
 		budget = nested
 	}
-	byteCount := transport.h1BudgetByteCount()
+	byteCount := transport.h1BaseBudgetByteCount()
 	if !owned {
 		// A standalone HTTPS API call also owns the inner TLS graph. Device
 		// callers already acquired that graph against their child budget.
-		byteCount += transport.h1BudgetByteCount()
+		byteCount += transport.h1BaseBudgetByteCount()
 	}
 	return (extenderQuicMemoryPolicy{budget: budget, byteCount: byteCount, usesSlot: !owned}).acquire(ctx)
 }
@@ -148,7 +148,7 @@ func newExtenderQuicMemoryPolicy(ctx context.Context, connectSettings *ConnectSe
 	byteCount := ByteCount(config.MaxConnectionReceiveWindow) + kib(512) + extenderQuicSendMemoryByteCount +
 		readBufferByteCount + writeBufferByteCount
 	if !owned {
-		byteCount += transport.h1BudgetByteCount()
+		byteCount += transport.h1BaseBudgetByteCount()
 	}
 	return extenderQuicMemoryPolicy{
 		budget:    budget,

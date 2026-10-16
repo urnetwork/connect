@@ -31,7 +31,7 @@ func TestPlatformH1CanceledClaimJoinsWithoutOpeningGraph(t *testing.T) {
 		settings.PlatformTransportBudget = budget
 		if MemoryBudget() != mib(32) || debug.SetMemoryLimit(-1) != 32*1024*1024 ||
 			budget.Stats().TotalByteCount != mib(8) || root.Stats().TotalByteCount != mib(8) ||
-			settings.H1BudgetByteCount != kib(256) {
+			settings.H1BudgetByteCount != kib(256) || settings.H1MemoryReservationByteCount() <= settings.H1BudgetByteCount {
 			t.Fatal("canceled H1 constructor did not select the exact current profile")
 		}
 

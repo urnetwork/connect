@@ -2,9 +2,66 @@ package connect
 
 import (
 	"context"
+	"math"
+	"math/bits"
 	"slices"
 	"sync"
 )
+
+// platformTransportBudgetBytes keeps live claim sums exact even when they
+// exceed the public signed byte range. Each claim is at most MaxInt64 and
+// there are at most MaxInt distinct reservations, so two words also cover
+// pending demand. Saturation is only for statistics, never admission or
+// subtraction: releasing one huge claim must retain every other live claim.
+type platformTransportBudgetBytes struct {
+	low  uint64
+	high uint64
+}
+
+// add combines exact, nonnegative capacity sums without signed wraparound.
+func (self platformTransportBudgetBytes) add(other platformTransportBudgetBytes) platformTransportBudgetBytes {
+	low, carry := bits.Add64(self.low, other.low, 0)
+	return platformTransportBudgetBytes{low: low, high: self.high + other.high + carry}
+}
+
+// addByteCount adds a registered claim, whose byte count is nonnegative.
+func (self platformTransportBudgetBytes) addByteCount(byteCount ByteCount) platformTransportBudgetBytes {
+	return self.add(platformTransportBudgetBytes{low: uint64(byteCount)})
+}
+
+// subtractByteCount removes an included claim exactly. An underflow is an
+// accounting invariant violation, not permission to discard surviving claims.
+// It must never be applied to the saturated statistics projection.
+func (self platformTransportBudgetBytes) subtractByteCount(byteCount ByteCount) platformTransportBudgetBytes {
+	if byteCount < 0 || (self.high == 0 && self.low < uint64(byteCount)) {
+		panic("platform transport budget byte accounting underflow")
+	}
+	low, borrow := bits.Sub64(self.low, uint64(byteCount), 0)
+	return platformTransportBudgetBytes{low: low, high: self.high - borrow}
+}
+
+// subtractDeficit floors only a satisfied demand deficit at zero. Live and
+// pending claims use exact subtraction so release conservation is checked.
+func (self platformTransportBudgetBytes) subtractDeficit(byteCount ByteCount) platformTransportBudgetBytes {
+	if self.fits(byteCount) {
+		return platformTransportBudgetBytes{}
+	}
+	return self.subtractByteCount(byteCount)
+}
+
+// fits compares exact demand with a finite signed limit, including MaxInt64.
+func (self platformTransportBudgetBytes) fits(byteCount ByteCount) bool {
+	return 0 <= byteCount && self.high == 0 && self.low <= uint64(byteCount)
+}
+
+// statsByteCount preserves the public statistics type without a negative
+// wrap. Admission and release continue to use the exact internal value.
+func (self platformTransportBudgetBytes) statsByteCount() ByteCount {
+	if !self.fits(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return ByteCount(self.low)
+}
 
 // PlatformTransportBudget bounds the aggregate retained capacity of platform
 // carriers and their logical carrier-graph slots. A slot can own multiple
@@ -26,10 +83,10 @@ type PlatformTransportBudget struct {
 	root   *PlatformTransportBudget
 
 	totalByteCount     ByteCount
-	usedByteCount      ByteCount
+	usedByteCount      platformTransportBudgetBytes
 	maxTransportCount  int
 	usedTransportCount int
-	pendingH1ByteCount ByteCount
+	pendingH1ByteCount platformTransportBudgetBytes
 	pendingH1SlotCount int
 	notify             chan struct{}
 	reservedByteCount  ByteCount
@@ -92,6 +149,9 @@ type platformTransportBudgetReservation struct {
 	handoffTo   *platformTransportBudgetReservation
 }
 
+// PlatformTransportBudgetStats projects byte sums into the public signed
+// range. Byte counters saturate at MaxInt64; live/pending accounting remains
+// exact internally, so saturated cumulative counters are not a balance proof.
 type PlatformTransportBudgetStats struct {
 	TotalByteCount              ByteCount
 	UsedByteCount               ByteCount
@@ -278,10 +338,10 @@ func (self *platformTransportBudgetReservation) handoffStatsLocked(
 func (self *PlatformTransportBudget) statsLocked() PlatformTransportBudgetStats {
 	stats := PlatformTransportBudgetStats{
 		TotalByteCount:          self.totalByteCount,
-		UsedByteCount:           self.usedByteCount,
+		UsedByteCount:           self.usedByteCount.statsByteCount(),
 		MaxTransportCount:       self.maxTransportCount,
 		UsedTransportCount:      self.usedTransportCount,
-		PendingH1ByteCount:      self.pendingH1ByteCount,
+		PendingH1ByteCount:      self.pendingH1ByteCount.statsByteCount(),
 		PendingH1Count:          self.pendingH1SlotCount,
 		ReservedByteCount:       self.reservedByteCount,
 		ReleasedByteCount:       self.releasedByteCount,
@@ -380,7 +440,7 @@ func (self *PlatformTransportBudget) registerLocked(
 	}
 	self.reservations[reservation] = true
 	if class == platformTransportBudgetH1 {
-		self.pendingH1ByteCount += reservation.byteCount
+		self.pendingH1ByteCount = self.pendingH1ByteCount.addByteCount(reservation.byteCount)
 		if usesSlot {
 			self.pendingH1SlotCount += 1
 		}
@@ -424,7 +484,7 @@ func (self *platformTransportBudgetReservation) higherPriorityPendingH3Locked() 
 // conservative regardless of which Acquire goroutine wins the wake-up race.
 func (self *platformTransportBudgetReservation) pendingH1CapacityLocked(
 	baseTransportCount int,
-) (byteCount ByteCount, transportCount int) {
+) (byteCount platformTransportBudgetBytes, transportCount int) {
 	budget := self.budget
 	if budget.maxTransportCount <= 0 {
 		return budget.pendingH1ByteCount, budget.pendingH1SlotCount
@@ -438,7 +498,7 @@ func (self *platformTransportBudgetReservation) pendingH1CapacityLocked(
 			continue
 		}
 		if !candidate.usesSlot {
-			byteCount += candidate.byteCount
+			byteCount = byteCount.addByteCount(candidate.byteCount)
 			continue
 		}
 		slotByteCounts = append(slotByteCounts, candidate.byteCount)
@@ -454,17 +514,17 @@ func (self *platformTransportBudgetReservation) pendingH1CapacityLocked(
 	})
 	transportCount = min(availableSlots, len(slotByteCounts))
 	for _, pendingByteCount := range slotByteCounts[:transportCount] {
-		byteCount += pendingByteCount
+		byteCount = byteCount.addByteCount(pendingByteCount)
 	}
 	return
 }
 
 func (self *platformTransportBudgetReservation) requiredCapacityLocked() (
-	byteCount ByteCount,
+	byteCount platformTransportBudgetBytes,
 	transportCount int,
 ) {
 	budget := self.budget
-	byteCount = budget.usedByteCount + self.byteCount
+	byteCount = budget.usedByteCount.addByteCount(self.byteCount)
 	transportCount = budget.usedTransportCount
 	if self.usesSlot {
 		transportCount += 1
@@ -476,14 +536,14 @@ func (self *platformTransportBudgetReservation) requiredCapacityLocked() (
 		// letting claims beyond the carrier-slot cap deadlock a slotless H3 migration.
 		pendingH1ByteCount, pendingH1TransportCount :=
 			self.pendingH1CapacityLocked(transportCount)
-		byteCount += pendingH1ByteCount
+		byteCount = byteCount.add(pendingH1ByteCount)
 		transportCount += pendingH1TransportCount
 	}
 	// Preserve one higher-priority H3 claimant. Reserving one, rather than the
 	// sum of every window's identical claim, guarantees progress without
 	// deadlocking the budget when only one H3 carrier can fit.
 	if higher := self.higherPriorityPendingH3Locked(); higher != nil {
-		byteCount += higher.byteCount
+		byteCount = byteCount.addByteCount(higher.byteCount)
 		if higher.usesSlot {
 			transportCount += 1
 		}
@@ -492,11 +552,11 @@ func (self *platformTransportBudgetReservation) requiredCapacityLocked() (
 }
 
 func (self *platformTransportBudgetReservation) capacityFitsLocked(
-	byteCount ByteCount,
+	byteCount platformTransportBudgetBytes,
 	transportCount int,
 ) bool {
 	budget := self.budget
-	if budget.totalByteCount < byteCount {
+	if !byteCount.fits(budget.totalByteCount) || transportCount < 0 {
 		return false
 	}
 	if 0 < budget.maxTransportCount && budget.maxTransportCount < transportCount {
@@ -511,7 +571,7 @@ func (self *platformTransportBudgetReservation) capacityFitsLocked(
 // admission decision discounts it, and activeHandoff ensures no second claim
 // can do the same at the same time.
 func (self *platformTransportBudgetReservation) handoffCapacityLocked() (
-	byteCount ByteCount,
+	byteCount platformTransportBudgetBytes,
 	transportCount int,
 	ok bool,
 ) {
@@ -523,11 +583,11 @@ func (self *platformTransportBudgetReservation) handoffCapacityLocked() (
 		(self.class != platformTransportBudgetH1 &&
 			previous.class != platformTransportBudgetH1) ||
 		(budget.activeHandoff != nil && budget.activeHandoff != self) {
-		return 0, 0, false
+		return platformTransportBudgetBytes{}, 0, false
 	}
 
 	byteCount, transportCount = self.requiredCapacityLocked()
-	byteCount -= previous.byteCount
+	byteCount = byteCount.subtractByteCount(previous.byteCount)
 	if previous.usesSlot {
 		transportCount -= 1
 	}
@@ -686,31 +746,38 @@ func (self *platformTransportBudgetReservation) preemptionPlanLocked(
 ) ([]*platformTransportBudgetReservation, bool) {
 	budget := self.budget
 	requiredBytes, requiredTransports := self.requiredCapacityLocked()
+	var discounted *platformTransportBudgetReservation
 	if handoffBytes, handoffTransports, ok := self.handoffCapacityLocked(); ok {
 		// Reclaim only the optional leases still needed after the paired previous
 		// reservation is discounted. The previous carrier stays acquired until
 		// the replacement connects.
 		requiredBytes = handoffBytes
 		requiredTransports = handoffTransports
+		discounted = self.handoffFrom
 	}
-	byteDeficit := max(ByteCount(0), requiredBytes-budget.totalByteCount)
+	byteDeficit := requiredBytes.subtractDeficit(budget.totalByteCount)
 	transportDeficit := 0
 	if 0 < budget.maxTransportCount {
 		transportDeficit = max(0, requiredTransports-budget.maxTransportCount)
 	}
-	if byteDeficit == 0 && transportDeficit == 0 {
+	if byteDeficit.fits(0) && transportDeficit == 0 {
 		return nil, true
 	}
 
 	victims := []*platformTransportBudgetReservation{}
 	for candidate := range budget.reservations {
+		// The paired old carrier has already been credited above. Counting its
+		// teardown again could make an impossible H1 preemption plan look sufficient.
+		if candidate == discounted {
+			continue
+		}
 		if candidate.acquired && (candidate.preemptRequested || planned[candidate.owner]) {
 			// A lower level or another waiter already requested this carrier's
 			// teardown. Its still-live bytes remain charged, but the same
 			// deficit must not revoke a second carrier while it drains.
-			byteDeficit -= candidate.byteCount
+			byteDeficit = byteDeficit.subtractDeficit(candidate.byteCount)
 			if candidate.usesSlot {
-				transportDeficit -= 1
+				transportDeficit = max(0, transportDeficit-1)
 			}
 			continue
 		}
@@ -721,8 +788,11 @@ func (self *platformTransportBudgetReservation) preemptionPlanLocked(
 	slices.SortFunc(victims, func(a, b *platformTransportBudgetReservation) int {
 		// Reclaim background Auto H3 before foreground Auto H3. For equal
 		// priorities, reclaim the oldest lease first so the result is stable.
-		if a.priority != b.priority {
-			return b.priority - a.priority
+		if b.priority < a.priority {
+			return -1
+		}
+		if a.priority < b.priority {
+			return 1
 		}
 		if a.sequence < b.sequence {
 			return -1
@@ -734,23 +804,23 @@ func (self *platformTransportBudgetReservation) preemptionPlanLocked(
 	})
 	selectedVictims := []*platformTransportBudgetReservation{}
 	for _, victim := range victims {
-		if byteDeficit <= 0 && transportDeficit <= 0 {
+		if byteDeficit.fits(0) && transportDeficit == 0 {
 			break
 		}
 		// A slotless Auto-H3 lease cannot solve a slot-only deficit.
-		if byteDeficit <= 0 && (transportDeficit <= 0 || !victim.usesSlot) {
+		if byteDeficit.fits(0) && (transportDeficit == 0 || !victim.usesSlot) {
 			continue
 		}
 		selectedVictims = append(selectedVictims, victim)
-		byteDeficit -= victim.byteCount
+		byteDeficit = byteDeficit.subtractDeficit(victim.byteCount)
 		if victim.usesSlot {
-			transportDeficit -= 1
+			transportDeficit = max(0, transportDeficit-1)
 		}
 	}
 	// H1 requires a sufficient plan at every level. H3 policy replacements
 	// retain their existing ability to drain an optional H3 carrier while
 	// waiting for a nonpreemptible H1 carrier slot to close.
-	return selectedVictims, byteDeficit <= 0 && transportDeficit <= 0
+	return selectedVictims, byteDeficit.fits(0) && transportDeficit == 0
 }
 
 func (self *platformTransportBudgetReservation) Acquire(ctx context.Context) bool {
@@ -828,7 +898,7 @@ func (self *platformTransportBudgetReservation) TryAcquire() bool {
 func (self *platformTransportBudgetReservation) acquireLocked(usesHandoff bool) {
 	budget := self.budget
 	if self.class == platformTransportBudgetH1 && self.pending {
-		budget.pendingH1ByteCount -= self.byteCount
+		budget.pendingH1ByteCount = budget.pendingH1ByteCount.subtractByteCount(self.byteCount)
 		if self.usesSlot {
 			budget.pendingH1SlotCount -= 1
 		}
@@ -841,8 +911,8 @@ func (self *platformTransportBudgetReservation) acquireLocked(usesHandoff bool) 
 	} else {
 		self.clearHandoffLocked()
 	}
-	budget.usedByteCount += self.byteCount
-	budget.reservedByteCount += self.byteCount
+	budget.usedByteCount = budget.usedByteCount.addByteCount(self.byteCount)
+	budget.reservedByteCount += min(self.byteCount, math.MaxInt64-budget.reservedByteCount)
 	if self.usesSlot {
 		budget.usedTransportCount += 1
 	}
@@ -897,8 +967,8 @@ func (self *platformTransportBudgetReservation) Yield() bool {
 	for claim := self; claim != nil; claim = claim.parent {
 		claim.clearHandoffToLocked()
 		claim.clearHandoffLocked()
-		claim.budget.usedByteCount -= claim.byteCount
-		claim.budget.releasedByteCount += claim.byteCount
+		claim.budget.usedByteCount = claim.budget.usedByteCount.subtractByteCount(claim.byteCount)
+		claim.budget.releasedByteCount += min(claim.byteCount, math.MaxInt64-claim.budget.releasedByteCount)
 		if claim.usesSlot {
 			claim.budget.usedTransportCount -= 1
 		}
@@ -943,14 +1013,14 @@ func (self *platformTransportBudgetReservation) releaseLocked() {
 	self.clearHandoffToLocked()
 	self.clearHandoffLocked()
 	if self.class == platformTransportBudgetH1 && self.pending {
-		budget.pendingH1ByteCount -= self.byteCount
+		budget.pendingH1ByteCount = budget.pendingH1ByteCount.subtractByteCount(self.byteCount)
 		if self.usesSlot {
 			budget.pendingH1SlotCount -= 1
 		}
 	}
 	if self.acquired {
-		budget.usedByteCount -= self.byteCount
-		budget.releasedByteCount += self.byteCount
+		budget.usedByteCount = budget.usedByteCount.subtractByteCount(self.byteCount)
+		budget.releasedByteCount += min(self.byteCount, math.MaxInt64-budget.releasedByteCount)
 		if self.usesSlot {
 			budget.usedTransportCount -= 1
 		}

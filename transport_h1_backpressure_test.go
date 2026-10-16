@@ -15,7 +15,7 @@ import (
 // progress until the explicit gate opens. Its independent writer stays live.
 func stopH1BackpressurePeerReads(t *testing.T, fixture *h1LivenessFixture) {
 	t.Helper()
-	fixture.send <- MessagePoolGet(64)
+	fixture.sendMessage(t, MessagePoolGet(64))
 	synctest.Wait()
 	select {
 	case <-fixture.peerReadBlocked:
@@ -32,7 +32,7 @@ func blockH1BackpressurePayload(t *testing.T, fixture *h1LivenessFixture) []byte
 	t.Helper()
 	message := MessagePoolGet(64)
 	witness := MessagePoolShareReadOnly(message)
-	fixture.send <- message
+	fixture.sendMessage(t, message)
 	synctest.Wait()
 	if fixture.client.writesInProgress.Load() != 1 || fixture.payloads.Load() != 1 {
 		t.Fatal("actual carrier writer did not block on the paused peer")

@@ -92,6 +92,7 @@ type h1LivenessFixture struct {
 	transport        *PlatformTransport
 	routes           *RouteManager
 	send             Route
+	writer           MultiRouteWriter
 	stats            *H1PlusStats
 	connectionStats  *H1ConnectionStats
 	client           *h1LivenessConn
@@ -117,6 +118,16 @@ func (self *h1LivenessFixture) payloadMessagesSnapshot() [][]byte {
 	return append([][]byte(nil), self.payloadMessages...)
 }
 
+// Takes the message on admission through the same selector as real clients.
+// The observer's raw route is retained only for topology assertions.
+func (self *h1LivenessFixture) sendMessage(t *testing.T, message []byte) {
+	t.Helper()
+	if accepted, err := self.writer.WriteDetailed(self.transport.ctx, message, 0); !accepted || err != nil {
+		MessagePoolReturn(message)
+		t.Fatalf("synthetic h1 selector admission: accepted=%t err=%v", accepted, err)
+	}
+}
+
 // Call inside a synctest bubble after priming the package's lazy pool outside.
 // No DNS, TLS, listening socket, host configuration or production identity is used.
 func newH1LivenessFixture(t *testing.T, configure ...func(*PlatformTransportSettings)) *h1LivenessFixture {
@@ -127,6 +138,13 @@ func newH1LivenessFixture(t *testing.T, configure ...func(*PlatformTransportSett
 // A gate after one complete peer read applies actual pipe backpressure while
 // keeping that peer's sole writer available for independent heartbeats.
 func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTimeout time.Duration, configure ...func(*PlatformTransportSettings)) *h1LivenessFixture {
+	t.Helper()
+	return newH1LivenessFixtureWithRoutes(t, pausePeer, writeTimeout, nil, configure...)
+}
+
+// A real Client may supply its owned route manager while the physical owner
+// keeps its independent cancellation lifetime, as in provider migration.
+func newH1LivenessFixtureWithRoutes(t *testing.T, pausePeer bool, writeTimeout time.Duration, routes *RouteManager, configure ...func(*PlatformTransportSettings)) *h1LivenessFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	client, peer := net.Pipe()
@@ -237,11 +255,16 @@ func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTim
 	for _, apply := range configure {
 		apply(settings)
 	}
-	fixture.routes = NewRouteManagerWithLogger(ctx, "synthetic-h1-liveness", NewNoopLogger())
+	fixture.routes = routes
+	if fixture.routes == nil {
+		fixture.routes = NewRouteManagerWithLogger(ctx, "synthetic-h1-liveness", NewNoopLogger())
+	}
+	fixture.writer = fixture.routes.OpenMultiRouteWriter(DestinationId(NewId()))
 	fixture.transport = NewPlatformTransportWithTargetMode(ctx, fixture.strategy, fixture.routes,
 		"ws://liveness.example/endpoint", &ClientAuth{ByJwt: "synthetic-test-token", InstanceId: NewId()},
 		TransportModeH1, settings)
 	t.Cleanup(func() {
+		fixture.routes.CloseMultiRouteWriter(fixture.writer)
 		fixture.cancel()
 		fixture.client.Close()
 		peer.Close()
@@ -528,7 +551,7 @@ func TestH1PlusLivenessSpeedPayloadDeadlineReturnsOwner(t *testing.T) {
 		fixture.client.failWriteDeadline.Store(true)
 		message := MessagePoolGet(64)
 		witness := MessagePoolShareReadOnly(message)
-		fixture.send <- message
+		fixture.sendMessage(t, message)
 		synctest.Wait()
 		fixture.assertWithdrawn(t)
 		if !MessagePoolReturn(witness) {
@@ -550,7 +573,7 @@ func TestH1PlusLivenessReadyBatchDeadlineAlreadyFailsClosed(t *testing.T) {
 		fixture.client.failWriteDeadline.Store(true)
 		message := MessagePoolGet(64)
 		witness := MessagePoolShareReadOnly(message)
-		fixture.send <- message
+		fixture.sendMessage(t, message)
 		synctest.Wait()
 		fixture.assertWithdrawn(t)
 		if !MessagePoolReturn(witness) {

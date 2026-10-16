@@ -533,8 +533,9 @@ type PlatformTransportSettings struct {
 	WriteTimeout         time.Duration
 	ReadTimeout          time.Duration
 	TransportGenerator   func() (sendTransport Transport, receiveTransport Transport)
-	// SendRouteObserver exposes route ownership to deterministic integration
-	// harnesses. It must not block. Nil retains normal production behavior.
+	// SendRouteObserver borrows route identity for deterministic topology
+	// observation. It must not block or send directly: writes use the route
+	// selector so carrier admission cannot be bypassed. Nil is the default.
 	SendRouteObserver func(transport Transport, route Route, connected bool)
 	// ProgressObserver is opt-in bounded, nonblocking H1 physical-I/O metadata.
 	// Nil performs no hashing, clock reads, or diagnostic allocation.
@@ -576,6 +577,9 @@ type PlatformTransportSettings struct {
 	// Non-positive carrier/socket values resolve to the memory-scaled defaults.
 	// H3BudgetByteCount covers the inner carrier; admission also reserves any
 	// required DNS translation and selected outer extender as one complete graph.
+	// H1BudgetByteCount is the connection/reader/scratch base. Mobile
+	// application graphs add their retained queue rows; use
+	// H1MemoryReservationByteCount when composing their actual admission.
 	H1BudgetByteCount                         ByteCount
 	H3BudgetByteCount                         ByteCount
 	H3SocketReadBufferByteCount               ByteCount
@@ -723,6 +727,7 @@ type PlatformTransportSettings struct {
 	// The constrained mobile policy composes receive, send, socket, and queue
 	// ownership inside one carrier claim. H1 keeps its independent queue depth.
 	h3RetainedByteAccounting bool
+	h1RetainedByteAccounting bool
 }
 
 // Shared with MultiClient's fallback no-send-ACK liveness bound. Retry/RTO and
@@ -1001,6 +1006,7 @@ type PlatformTransport struct {
 	// Claims register synchronously in the constructor, before carrier
 	// goroutines start, so pending H1 demand is visible to every H3 admission.
 	h1BudgetReservation *platformTransportBudgetReservation
+	h1RetainedBudget    *platformH1RetainedBudget
 	h3BudgetReservation *platformTransportBudgetReservation
 	// DNS translation and a selected outer extender draw from this bounded
 	// subdivision of h3BudgetReservation, never from unreserved process space.
@@ -1332,7 +1338,12 @@ func (self *PlatformTransport) offerReceive(
 	reliability CarrierReliability,
 	receive chan<- []byte,
 	message []byte,
+	retained ...*platformH1RetainedLane,
 ) (open bool, delivered bool) {
+	if len(retained) != 0 && retained[0] != nil {
+		delivered = self.offerH1Retained(done, receive, message, retained[0], false)
+		return delivered, delivered
+	}
 	switch tryOfferPooledReceive(done, receive, message) {
 	case pooledReceiveOfferDelivered:
 		return true, true
@@ -1373,6 +1384,9 @@ func (self *PlatformTransport) offerH1Control(
 	controlSend chan<- []byte,
 	message []byte,
 ) bool {
+	if self.h1RetainedBudget != nil {
+		return self.offerH1Retained(done, controlSend, message, &self.h1RetainedBudget.control, true)
+	}
 	switch tryOfferPooledReceive(done, controlSend, message) {
 	case pooledReceiveOfferDelivered:
 		return true
@@ -1544,6 +1558,9 @@ func NewPlatformTransportWithTargetMode(
 	h1Enabled := targetMode == TransportModeH1 ||
 		(targetMode == TransportModeAuto &&
 			transport.modePreference(TransportModeH1) != modePreferenceNone)
+	if h1Enabled {
+		transport.h1RetainedBudget = newPlatformH1RetainedBudget(settings)
+	}
 	h3Enabled := targetMode == TransportModeH3 || targetMode == TransportModeH3Dns ||
 		targetMode == TransportModeH3DnsPump ||
 		(targetMode == TransportModeAuto &&
@@ -1909,6 +1926,9 @@ func (self *PlatformTransport) run() {
 	defer func() {
 		self.cancel()
 		self.runWaitGroup.Wait()
+		if retained := self.h1RetainedBudget; retained != nil {
+			retained.receive.waitReleased()
+		}
 		// Keep H1 admission until every mode has closed its native graph.
 		// A separate later defer would release it before this join.
 		self.h1BudgetReservation.Release()
@@ -1997,6 +2017,11 @@ func (self *PlatformTransport) h1MaxMessageByteCount() int64 {
 }
 
 func (self *PlatformTransport) h1BudgetByteCount() ByteCount {
+	return self.settings.H1MemoryReservationByteCount()
+}
+
+// Raw outer tcp/tls has no application routes and retains the base row only.
+func (self *PlatformTransport) h1BaseBudgetByteCount() ByteCount {
 	if 0 < self.settings.H1BudgetByteCount {
 		return self.settings.H1BudgetByteCount
 	}
@@ -2363,6 +2388,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
 			controlSend := make(chan []byte, self.settings.TransportBufferSize)
+			var sendLane, receiveLane, controlLane, priorityLane *platformH1RetainedLane
+			if retained := self.h1RetainedBudget; retained != nil {
+				sendLane, receiveLane, controlLane, priorityLane = &retained.send, &retained.receive, &retained.control, &retained.priority
+			}
+			var receiveDone <-chan struct{}
+			if receiveLane != nil {
+				receiveDone = handleCtx.Done()
+			}
 			var ackPrioritySend chan []byte
 			ackPriorityBufferSize := min(
 				max(0, self.settings.H1AckPriorityBufferSize),
@@ -2372,14 +2405,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				ackPrioritySend = make(chan []byte, ackPriorityBufferSize)
 			}
 
-			drain := func(c chan []byte) {
+			drain := func(c chan []byte, lane *platformH1RetainedLane) {
 				for {
 					select {
 					case message, ok := <-c:
 						if !ok {
 							return
 						}
-						MessagePoolReturn(message)
+						returnH1RetainedMessage(message, lane)
 					default:
 						return
 					}
@@ -2397,7 +2430,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					defer func() {
 						handleCancel()
 						close(send)
-						drain(send)
+						drain(send, sendLane)
 					}()
 					for {
 						select {
@@ -2409,7 +2442,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							select {
 							case <-handleCtx.Done():
-								MessagePoolReturn(message)
+								returnH1RetainedMessage(message, sendLane)
 								return
 							case send <- message:
 							}
@@ -2418,7 +2451,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}, func() {
 					handleCancel()
 					close(send)
-					drain(send)
+					drain(send, sendLane)
 				})
 			} else {
 				exportedSend = send
@@ -2438,7 +2471,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				receiveTransport = NewReceiveGatewayTransportWithType(TransportTypeH1)
 			}
 
-			self.routeManager.UpdateTransport(sendTransport, []Route{exportedSend})
+			self.routeManager.UpdateTransportWithProperties(sendTransport, []Route{exportedSend}, TransferCarrierProperties{
+				h1SendRetained: sendLane, h1PriorityRetained: priorityLane,
+			})
 			if self.settings.SendRouteObserver != nil {
 				self.settings.SendRouteObserver(sendTransport, exportedSend, true)
 			}
@@ -2447,6 +2482,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				[]Route{receive},
 				TransferCarrierProperties{
 					ReceiveReliability: CarrierReliabilityReliable,
+					h1ReceiveRetained:  receiveLane,
+					h1ReceiveDone:      receiveDone,
 				},
 			)
 			// the extender carrying this connection is published for exactly
@@ -2488,8 +2525,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				h1Progress.event("h1_closed", nil, true, nil)
 				// No producer can enqueue after the join, so one deterministic
 				// drain releases every pooled message still sitting in either lane.
-				drain(send)
-				drain(ackPrioritySend)
+				drain(send, sendLane)
+				drain(ackPrioritySend, priorityLane)
 			}()
 			startConnectionWorker(func() {
 				self.runInactiveDrain(
@@ -2510,13 +2547,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				defer pingTimer.Stop()
 				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 
-				writeMessage := func(message []byte) error {
+				writeMessage := func(message []byte, lane *platformH1RetainedLane) error {
 					standaloneProgress := h1Progress.prepareWebSocketWrite(message)
 					err := ws.WriteMessage(websocket.BinaryMessage, message)
 					if standaloneProgress {
 						h1Progress.endWrite(err)
 					}
-					MessagePoolReturn(message)
+					returnH1RetainedMessage(message, lane)
 					if err != nil {
 						// note that for websocket a dealine timeout cannot be recovered
 						if ok, suppressed := shouldLogWriteErr(); ok {
@@ -2535,15 +2572,15 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					}
 					return nil
 				}
-				write := func(message []byte) error {
+				write := func(message []byte, lane *platformH1RetainedLane) error {
 					if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
-						MessagePoolReturn(message)
+						returnH1RetainedMessage(message, lane)
 						return err
 					}
-					return writeMessage(message)
+					return writeMessage(message, lane)
 				}
-				writePayload := func(message []byte) error {
-					if err := write(message); err != nil {
+				writePayload := func(message []byte, lane *platformH1RetainedLane) error {
+					if err := write(message, lane); err != nil {
 						return err
 					}
 					writeCounter.Add(1)
@@ -2560,19 +2597,23 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							speedTest = false
 						}
 					}
-					if err := write(message); err != nil {
+					if err := write(message, controlLane); err != nil {
 						return err
 					}
 					resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 					return nil
 				}
-				writeSendMessage := func(message []byte) error {
+				writeSendMessage := func(message []byte, priority bool) error {
+					lane := sendLane
+					if priority {
+						lane = priorityLane
+					}
 					if len(message) <= 16 {
 						self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
-						MessagePoolReturn(message)
+						returnH1RetainedMessage(message, lane)
 						return nil
 					}
-					if err := writeMessage(message); err != nil {
+					if err := writeMessage(message, lane); err != nil {
 						return err
 					}
 					writeCounter.Add(1)
@@ -2585,25 +2626,29 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					firstMessage []byte,
 					firstPriority bool,
 				) (sendOpen bool, err error) {
+					firstLane := sendLane
+					if firstPriority {
+						firstLane = priorityLane
+					}
 					if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
-						return writeH1FramedReadyBatch(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, self.settings.WriteTimeout, func() { writeCounter.Add(1) })
+						return writeH1FramedReadyBatch(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, self.settings.WriteTimeout, func() { writeCounter.Add(1) }, self.h1RetainedBudget)
 					}
 					if writeBatchConn == nil {
 						if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
-							MessagePoolReturn(firstMessage)
+							returnH1RetainedMessage(firstMessage, firstLane)
 							return true, err
 						}
-						return true, writeSendMessage(firstMessage)
+						return true, writeSendMessage(firstMessage, firstPriority)
 					}
 
 					if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
-						MessagePoolReturn(firstMessage)
+						returnH1RetainedMessage(firstMessage, firstLane)
 						return true, err
 					}
 					writeBatchConn.BeginWriteBatch()
 					h1Progress.beginWebSocketBatch()
 					defer h1Progress.finishWebSocketBatch()
-					if err = writeSendMessage(firstMessage); err != nil {
+					if err = writeSendMessage(firstMessage, firstPriority); err != nil {
 						writeBatchConn.AbortWriteBatch()
 						return true, err
 					}
@@ -2639,7 +2684,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							sendOpen = false
 							break drainReady
 						}
-						if err = writeSendMessage(message); err != nil {
+						if err = writeSendMessage(message, priority); err != nil {
 							writeBatchConn.AbortWriteBatch()
 							return true, err
 						}
@@ -2689,8 +2734,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							if speedTest {
 								if len(message) <= 16 {
 									self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
-									MessagePoolReturn(message)
-								} else if writePayload(message) != nil {
+									returnH1RetainedMessage(message, priorityLane)
+								} else if writePayload(message, priorityLane) != nil {
 									return
 								}
 							} else {
@@ -2731,16 +2776,16 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							if len(message) <= 16 {
 								self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
-								MessagePoolReturn(message)
-							} else if writePayload(message) != nil {
+								returnH1RetainedMessage(message, sendLane)
+							} else if writePayload(message, sendLane) != nil {
 								return
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message := <-ackPrioritySend:
 							if len(message) <= 16 {
 								self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
-								MessagePoolReturn(message)
-							} else if writePayload(message) != nil {
+								returnH1RetainedMessage(message, priorityLane)
+							} else if writePayload(message, priorityLane) != nil {
 								return
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
@@ -2795,8 +2840,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					close(receive)
 					close(controlSend)
 
-					drain(receive)
-					drain(controlSend)
+					drain(receive, receiveLane)
+					drain(controlSend, controlLane)
 				}()
 				speedTest := false
 
@@ -2889,6 +2934,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							CarrierReliabilityReliable,
 							receive,
 							message,
+							receiveLane,
 						)
 						if h1Progress != nil {
 							endTransferProgress(h1Progress.observer, readProgress, "h1_receive_end", delivered, nil)
@@ -2920,8 +2966,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				close(receive)
 				close(controlSend)
 
-				drain(receive)
-				drain(controlSend)
+				drain(receive, receiveLane)
+				drain(controlSend, controlLane)
 			})
 
 			select {

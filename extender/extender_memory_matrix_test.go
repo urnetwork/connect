@@ -71,6 +71,8 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 				routeManager := connect.NewRouteManager(ctx, "extender-memory-matrix")
 				reader := routeManager.OpenMultiRouteReader(connect.DestinationId(connect.NewId()))
 				defer routeManager.CloseMultiRouteReader(reader)
+				writer := routeManager.OpenMultiRouteWriter(connect.DestinationId(connect.NewId()))
+				defer routeManager.CloseMultiRouteWriter(writer)
 				transport := connect.NewPlatformTransportWithTargetMode(ctx, strategy, routeManager, "wss://127.0.0.1/ws",
 					&connect.ClientAuth{ByJwt: "memory", InstanceId: connect.NewId(), AppVersion: "test"}, inner, settings)
 				defer func() {
@@ -80,16 +82,15 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 						t.Error(err)
 					}
 				}()
-				var route connect.Route
 				select {
-				case route = <-routes:
+				case <-routes:
 				case <-ctx.Done():
 					if err, ok := fixture.nextError(); ok {
 						t.Fatalf("carrier did not connect: %v; extender: %v", ctx.Err(), err)
 					}
 					t.Fatal(ctx.Err())
 				}
-				want := settings.H1BudgetByteCount
+				want := settings.H1MemoryReservationByteCount()
 				if inner != connect.TransportModeH1 {
 					want = settings.H3BudgetByteCount
 					if inner != connect.TransportModeH3 {
@@ -127,11 +128,9 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 						t.Fatal(err)
 					}
 					expected := bytes.Clone(message)
-					select {
-					case route <- message:
-					case <-ctx.Done():
+					if accepted, err := writer.WriteDetailed(ctx, message, -1); !accepted || err != nil {
 						connect.MessagePoolReturn(message)
-						t.Fatal(ctx.Err())
+						t.Fatalf("composed carrier selector: accepted=%t err=%v", accepted, err)
 					}
 					response, err := reader.Read(ctx, 5*time.Second)
 					if err != nil {

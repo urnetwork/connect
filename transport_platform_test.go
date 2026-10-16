@@ -530,7 +530,12 @@ func TestPlatformTransportOptionalH1AckPriorityLaneWritesAndUnregisters(t *testi
 			t.Fatalf("priority route = (%v, %t), want capacity %d", priorityRoute, ok, settings.H1AckPriorityBufferSize)
 		}
 		message := MessagePoolGet(64)
-		priorityRoute <- message
+		writer := transport.routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
+		defer transport.routeManager.CloseMultiRouteWriter(writer)
+		if accepted, _ := writer.(*MultiRouteSelector).tryWriteH1AckPriorityWithCarrierPreference(message, TransportTypeH1); !accepted {
+			MessagePoolReturn(message)
+			t.Fatal("ready priority lane refused actual selector admission")
+		}
 		if !waitForCondition(time.Second, func() bool {
 			return 0 < platform.dataMessages.Load()
 		}) {
