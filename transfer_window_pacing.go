@@ -34,7 +34,10 @@ type windowBurstPacer struct {
 	serviceReserved ByteCount
 	// The receiver held this lane's last cumulative head longer than the
 	// service residence, so its unacknowledged bytes wait there.
-	receiverHeld          bool
+	receiverHeld bool
+	// The receiver acknowledged this lane out of order since its last
+	// cumulative head, so the next head may be repairing a hole.
+	receiverReordered     bool
 	serviceClosed         bool
 	afterWaitForTest      func()
 	afterAdmissionForTest func()
@@ -2386,12 +2389,18 @@ func (self *windowPacingService) outstandingWithLock() float64 {
 // is the path minimum plus the smallest receiver wait; a longer wait leaves
 // more of the lane's flight at its receiver than on the path. Without a path
 // measurement there is no residence to compare, so the hold stays as it was.
+//
+// A head after selective replies may be releasing a suffix held behind a
+// lost item. That wait is carrier loss, so it cannot hold the lane: the
+// lane's flight stays carrier flight and its retries congestion evidence.
 func (self *windowPacingService) observeReceiverHoldWithLock(lane *windowBurstPacer, receiverDelay time.Duration, at time.Time) {
+	reordered := lane.receiverReordered
+	lane.receiverReordered = false
 	residence := self.roundTripEvidenceWithLock(at).residence
 	if residence <= 0 {
 		return
 	}
-	held := receiverDelay > residence
+	held := !reordered && receiverDelay > residence
 	if held == lane.receiverHeld {
 		return
 	}

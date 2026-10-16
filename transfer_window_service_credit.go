@@ -193,16 +193,22 @@ func (self *SendSequence) observePacingServiceCredit(credit windowServiceAckCred
 // The receiver reports how long it held each head it acknowledges, and that
 // wait needs no pairing with an exact first write: a stalled receiver also
 // holds the heads its sender has retried. Only an in-order head says whether
-// the receiver drains this lane; a selective reply is prompt even while
-// delivery waits behind a hole.
+// the receiver drains this lane. A selective reply is prompt even while
+// delivery waits behind a hole; it only records that a hole may exist. A
+// receiver blocked in delivery takes its queued items in order and sends none.
 func (self *SendSequence) observeReceiverHold(ack receiveAckMessage, at time.Time) {
 	service := self.windowPacer.service
-	if service == nil || ack.selective || !ack.receiverAckDelaySet {
+	if service == nil || !ack.selective && !ack.receiverAckDelaySet {
 		return
 	}
 	service.stateLock.Lock()
 	defer service.stateLock.Unlock()
-	if !self.windowPacer.serviceClosed {
-		service.observeReceiverHoldWithLock(&self.windowPacer, time.Duration(ack.receiverAckDelayMicros)*time.Microsecond, at)
+	if self.windowPacer.serviceClosed {
+		return
 	}
+	if ack.selective {
+		self.windowPacer.receiverReordered = true
+		return
+	}
+	service.observeReceiverHoldWithLock(&self.windowPacer, time.Duration(ack.receiverAckDelayMicros)*time.Microsecond, at)
 }
