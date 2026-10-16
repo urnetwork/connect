@@ -58,6 +58,22 @@ type TransferMemoryBudget struct {
 	// reclaim an obsolete owner across manager generations. A pointer keeps the
 	// common queue-only budget at one machine word of overhead.
 	peerConnectionAdmissionState atomic.Pointer[peerConnectionAdmissionState]
+
+	// One owner may protect its existing ingress windows from all sibling
+	// borrowers. The immutable pair is installed before publishing the tree.
+	ingressProtection atomic.Pointer[transferMemoryBudgetProtection]
+}
+
+// A fixed pair of disjoint ingress windows, not additional byte capacity.
+// Unused permission remains available only to these descendants.
+type transferMemoryBudgetProtection struct {
+	budgets [2]*TransferMemoryBudget
+}
+
+// One member of an atomic role-driven resize within an immutable budget tree.
+type TransferMemoryBudgetTotal struct {
+	Budget         *TransferMemoryBudget
+	TotalByteCount ByteCount
 }
 
 // transferMemoryBudgetNotify is one capacity-notification generation. An
@@ -162,11 +178,75 @@ func (self *TransferMemoryBudget) TotalByteCount() ByteCount {
 // not evict reserved bytes; the pool admits nothing new above the new total
 // until enough releases drain it.
 func (self *TransferMemoryBudget) SetTotalByteCount(totalByteCount ByteCount) {
+	self.SetTotalByteCounts(TransferMemoryBudgetTotal{Budget: self, TotalByteCount: totalByteCount})
+}
+
+// Resizes related ceilings at one admission boundary. Existing owners are not
+// evicted on shrink; new admission waits until the new permissions fit again.
+func (self *TransferMemoryBudget) SetTotalByteCounts(totals ...TransferMemoryBudgetTotal) {
 	root := self.admissionRoot()
 	root.admissionLock.Lock()
-	self.totalByteCount.Store(totalByteCount)
+	for _, total := range totals {
+		if total.Budget == nil || total.Budget.admissionRoot() != root {
+			root.admissionLock.Unlock()
+			panic("TransferMemoryBudget.SetTotalByteCounts: unrelated budget")
+		}
+	}
+	for _, total := range totals {
+		total.Budget.totalByteCount.Store(total.TotalByteCount)
+	}
 	root.admissionLock.Unlock()
 	self.notifyCapacityChanged()
+}
+
+// Protects the existing Pack and reorder ceilings before this tree is exposed
+// to packet owners. Protection reaches every common ancestor, so a provider,
+// NAT, or other sibling cannot consume the capacity needed to receive an ACK.
+func (self *TransferMemoryBudget) ProtectIngressBudgets(pack, reorder *TransferMemoryBudget) {
+	root := self.admissionRoot()
+	root.admissionLock.Lock()
+	defer root.admissionLock.Unlock()
+	if pack == nil || reorder == nil || pack.admissionRoot() != root || reorder.admissionRoot() != root ||
+		transferBudgetContains(pack, reorder) || transferBudgetContains(reorder, pack) ||
+		!transferBudgetContains(pack, self) || !transferBudgetContains(reorder, self) ||
+		root.ingressProtection.Load() != nil {
+		panic("TransferMemoryBudget.ProtectIngressBudgets: invalid ingress pair")
+	}
+	root.ingressProtection.Store(&transferMemoryBudgetProtection{budgets: [2]*TransferMemoryBudget{pack, reorder}})
+}
+
+// Reports immutable ancestry without taking an additional hierarchy lock.
+func transferBudgetContains(descendant, ancestor *TransferMemoryBudget) bool {
+	for budget := descendant; budget != nil; budget = budget.parent {
+		if budget == ancestor {
+			return true
+		}
+	}
+	return false
+}
+
+// Computes the protected unused permission after an optional same-tree move.
+// The caller holds the root admission lock, except Available's advisory read.
+func (self *TransferMemoryBudget) protectedUnusedByteCount(from, to *TransferMemoryBudget, bytes ByteCount) ByteCount {
+	protection := self.admissionRoot().ingressProtection.Load()
+	if protection == nil {
+		return 0
+	}
+	unused := ByteCount(0)
+	for _, protected := range protection.budgets {
+		if !transferBudgetContains(protected, self) {
+			continue
+		}
+		used := protected.usedByteCount.Load()
+		if transferBudgetContains(from, protected) {
+			used -= bytes
+		}
+		if transferBudgetContains(to, protected) {
+			used += bytes
+		}
+		unused = addReceiveQueueByteCount(unused, max(0, protected.totalByteCount.Load()-used))
+	}
+	return unused
 }
 
 // addFloor and removeFloor track the guaranteed floors of attached queues, so
@@ -195,9 +275,18 @@ func (self *TransferMemoryBudget) LendableByteCount(ownFloorByteCount ByteCount)
 
 // Available is the unreserved remainder of the budget
 func (self *TransferMemoryBudget) Available() ByteCount {
-	available := max(0, self.totalByteCount.Load()-self.usedByteCount.Load())
-	for parent := self.parent; parent != nil; parent = parent.parent {
-		available = min(available, max(0, parent.totalByteCount.Load()-parent.usedByteCount.Load()))
+	available := ByteCount(^uint64(0) >> 1)
+	protection := self.admissionRoot().ingressProtection.Load()
+	for budget := self; budget != nil; budget = budget.parent {
+		unused := ByteCount(0)
+		if protection != nil {
+			for _, protected := range protection.budgets {
+				if transferBudgetContains(protected, budget) && !transferBudgetContains(self, protected) {
+					unused = addReceiveQueueByteCount(unused, max(0, protected.totalByteCount.Load()-protected.usedByteCount.Load()))
+				}
+			}
+		}
+		available = min(available, max(0, budget.totalByteCount.Load()-budget.usedByteCount.Load()-unused))
 	}
 	return available
 }
@@ -242,7 +331,8 @@ func (self *TransferMemoryBudget) tryReserveWithLock(byteCount ByteCount) bool {
 	for budget := self; budget != nil; budget = budget.parent {
 		total := budget.totalByteCount.Load()
 		used := budget.usedByteCount.Load()
-		if total < byteCount || total-byteCount < used {
+		unused := budget.protectedUnusedByteCount(nil, self, byteCount)
+		if total < byteCount || total-byteCount < used || total-byteCount-used < unused {
 			return false
 		}
 	}
@@ -282,14 +372,6 @@ func (self *TransferMemoryBudget) tryMoveReservation(target *TransferMemoryBudge
 	}
 	root := self.admissionRoot()
 	root.admissionLock.Lock()
-	contains := func(chain, member *TransferMemoryBudget) bool {
-		for budget := chain; budget != nil; budget = budget.parent {
-			if budget == member {
-				return true
-			}
-		}
-		return false
-	}
 	// Validate the complete move before changing any counter. A shrunken
 	// common ancestor can retain its existing owner without admitting growth.
 	for budget := self; budget != nil; budget = budget.parent {
@@ -299,19 +381,26 @@ func (self *TransferMemoryBudget) tryMoveReservation(target *TransferMemoryBudge
 		}
 	}
 	for budget := target; budget != nil; budget = budget.parent {
-		if !contains(self, budget) && budget.totalByteCount.Load()-budget.usedByteCount.Load() < byteCount {
+		growth := ByteCount(0)
+		if !transferBudgetContains(self, budget) {
+			growth = byteCount
+		}
+		before := addReceiveQueueByteCount(budget.usedByteCount.Load(), budget.protectedUnusedByteCount(nil, nil, 0))
+		after := addReceiveQueueByteCount(budget.usedByteCount.Load(), growth)
+		after = addReceiveQueueByteCount(after, budget.protectedUnusedByteCount(self, target, byteCount))
+		if (growth > 0 || after > before) && budget.totalByteCount.Load() < after {
 			root.admissionLock.Unlock()
 			return false
 		}
 	}
 	for budget := self; budget != nil; budget = budget.parent {
-		if !contains(target, budget) {
+		if !transferBudgetContains(target, budget) {
 			budget.usedByteCount.Add(-byteCount)
 			budget.releasedByteCount.Add(byteCount)
 		}
 	}
 	for budget := target; budget != nil; budget = budget.parent {
-		if !contains(self, budget) {
+		if !transferBudgetContains(self, budget) {
 			budget.usedByteCount.Add(byteCount)
 			budget.reservedByteCount.Add(byteCount)
 		}
