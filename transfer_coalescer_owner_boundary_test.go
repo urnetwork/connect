@@ -36,6 +36,9 @@ func newCoalescerOwnerFixture(t *testing.T, budget *TransferMemoryBudget) *coale
 	f.source = newGroupDispositionQueueFixture(t, budget, func(settings *ClientSettings) {
 		settings.SendBufferSettings.WindowSizing = WindowSizingConstant
 		settings.SendBufferSettings.ApplyWindowSizing()
+		// Constant-window calibration clears the attached budget. Restore this
+		// fixture's exact owner after that policy step, before construction.
+		settings.SendBufferSettings.ResendQueueBudget = budget
 		settings.SendBufferSettings.SequenceBufferSize = 8
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -233,8 +236,8 @@ func TestTransferCoalescerOrdinaryReadyBatch(t *testing.T) {
 	})
 }
 
-// Spare capacity used to let the ready drain form an unfundable multi-owner
-// item. Full-root rows also prove two prepaid owners and ordinary no-ACK
+// Spare capacity exercises the ready drain's multi-owner exclusion. Full-root
+// rows also prove two prepaid owners and ordinary no-ACK
 // traffic progress without borrowing or releasing either recovery envelope.
 func TestTransferCoalescerRecyclableOwnersProgress(t *testing.T) {
 	assertMessagePoolOwnership(t)
@@ -279,7 +282,41 @@ func TestTransferCoalescerRecyclableOwnersProgress(t *testing.T) {
 					f.sendOrdinary(80, ordinaryOptions...)
 				}
 				f.source.requireParked()
+				var sequence *SendSequence
+				sequenceCount := 0
+				func() {
+					buffer := f.source.client.sendBuffer
+					buffer.mutex.Lock()
+					defer buffer.mutex.Unlock()
+					for id, candidate := range buffer.sendSequences {
+						if id.Destination == f.source.peer {
+							sequence = candidate
+							sequenceCount++
+						}
+					}
+				}()
+				if sequenceCount != 1 || sequence == nil || sequence.resendQueue == nil ||
+					!sequence.resendQueue.lifetimeBudget || sequence.resendQueue.Budget() != budget {
+					t.Fatalf("constructed sequence lost the exact retained budget: full=%t ordinaryFirst=%t sequences=%d", full, ordinaryFirst, sequenceCount)
+				}
 				f.source.unpark()
+				// No wire has reached the receiving Client, so these are live
+				// physical owners, not untouched credits that merely look recycled.
+				synctest.Wait()
+				for index, owner := range owners {
+					if owner.acks != 0 || owner.err != nil {
+						t.Fatalf("recyclable owner completed before peer ACK: full=%t ordinaryFirst=%t owner=%d callbacks=%d err=%v", full, ordinaryFirst, index, owner.acks, owner.err)
+					}
+					var available, inFlight ByteCount
+					func() {
+						root.admissionLock.Lock()
+						defer root.admissionLock.Unlock()
+						available, inFlight = owner.credit.bytes, owner.credit.inFlight
+					}()
+					if inFlight <= 0 || available < kib(1) || available+inFlight != kib(16) {
+						t.Fatalf("physical write did not borrow its prepaid credit before peer ACK: full=%t ordinaryFirst=%t owner=%d reusable=%d inFlight=%d", full, ordinaryFirst, index, available, inFlight)
+					}
+				}
 				f.deliver()
 				for index, owner := range owners {
 					if owner.acks != 1 || owner.err != nil || !owner.recycledAtAck {
