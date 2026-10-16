@@ -64,7 +64,7 @@ func TestRetainedReceiveFanoutHasNoEmptyFlowOrFloorOverdraft(t *testing.T) {
 			item := &receiveItem{transferItem: transferItem{
 				messageId: NewId(), sequenceNumber: 1, messageByteCount: 1, queueByteCount: charge,
 			}}
-			if seq.reserveHeldItem(item) {
+			if seq.reserveHeldItem(item, false) {
 				seq.receiveQueue.Add(item)
 				items[i] = item
 				admitted.Add(1)
