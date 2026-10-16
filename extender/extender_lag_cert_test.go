@@ -108,6 +108,17 @@ func (self *testLagClock) waitFor(t *testing.T, expected time.Duration) {
 	}
 }
 
+// Passes over every wait the lifecycle has started so far.
+func (self *testLagClock) skipWaits() {
+	for {
+		select {
+		case <-self.waits:
+		default:
+			return
+		}
+	}
+}
+
 // Waits for the lifecycle to start a wait, and returns how long it is.
 func (self *testLagClock) nextWait(t *testing.T) time.Duration {
 	t.Helper()
@@ -230,6 +241,8 @@ type testLagApi struct {
 	certPublicKeyHexValue string
 	reportStatus          int
 	reportResult          *extenderLagReportResult
+	// called as each post of the report route comes, before it is answered
+	beforeReportAnswer func()
 }
 
 func newTestLagApi(t *testing.T) *testLagApi {
@@ -308,7 +321,11 @@ func (self *testLagApi) serve(w http.ResponseWriter, r *http.Request) {
 		self.stateLock.Lock()
 		reportStatus := self.reportStatus
 		reportResult := self.reportResult
+		beforeReportAnswer := self.beforeReportAnswer
 		self.stateLock.Unlock()
+		if beforeReportAnswer != nil {
+			beforeReportAnswer()
+		}
 		if reportStatus != 0 && reportStatus != http.StatusOK {
 			w.WriteHeader(reportStatus)
 			w.Write([]byte("the operator is unavailable"))
@@ -341,6 +358,14 @@ func (self *testLagApi) setReportAnswer(reportStatus int, reportResult *extender
 	defer self.stateLock.Unlock()
 	self.reportStatus = reportStatus
 	self.reportResult = reportResult
+}
+
+// Runs `beforeReportAnswer` as each post of the report route comes, before
+// the post is answered and so before the lifecycle goes on; nil runs nothing.
+func (self *testLagApi) setBeforeReportAnswer(beforeReportAnswer func()) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.beforeReportAnswer = beforeReportAnswer
 }
 
 // Waits for one read of the certificate route.
