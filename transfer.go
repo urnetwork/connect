@@ -7106,9 +7106,10 @@ func (self *SendSequence) ResendQueueSizeAndMessageTypes() (int, ByteCount, Id, 
 // loop reports that the resend queue could take it, or the caller's timeout
 // runs out. Returns the remaining timeout.
 //
-// A capacity publication wakes blocked producers immediately. The common
-// available case stays a single atomic read; a blocked producer subscribes
-// before reading again so an ACK cannot fall between its check and wait.
+// A capacity publication gives the first blocked producer its turn at once.
+// The common open case stays two atomic reads. Producers that wait pass in
+// arrival order (see resendCapacityGate), so one that has just passed cannot
+// pass again ahead of one that was already waiting.
 func (self *SendSequence) awaitResendCapacity(
 	sendPack *SendPack,
 	timeout time.Duration,
@@ -7117,37 +7118,40 @@ func (self *SendSequence) awaitResendCapacity(
 	if self.preparedPackFits(sendPack) {
 		gate = &self.preparedFlightUnavailable
 	}
-	if !gate.Load() {
+	if gate.open(timeout != 0) {
 		return true, nil, timeout
 	}
 	if timeout == 0 {
 		return false, nil, timeout
 	}
 	startTime := time.Now()
-	var timeoutChannel <-chan time.Time
-	if 0 < timeout {
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-		timeoutChannel = timer.C
-	}
-	for {
-		changed := gate.Notify()
-		if !gate.Load() {
-			if 0 < timeout {
-				timeout = max(time.Duration(0), timeout-time.Since(startTime))
+	if waiter := gate.queue(); waiter != nil {
+		var timeoutChannel <-chan time.Time
+		if 0 < timeout {
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			timeoutChannel = timer.C
+		}
+		for passed := false; !passed; {
+			select {
+			case <-sendPack.Ctx.Done():
+				gate.abandon(waiter)
+				return false, errors.New("Done."), timeout
+			case <-self.ctx.Done():
+				gate.abandon(waiter)
+				return false, errors.New("Done."), timeout
+			case <-timeoutChannel:
+				gate.abandon(waiter)
+				return false, nil, 0
+			case <-waiter.ready:
+				passed = gate.pass(waiter)
 			}
-			return true, nil, timeout
-		}
-		select {
-		case <-sendPack.Ctx.Done():
-			return false, errors.New("Done."), timeout
-		case <-self.ctx.Done():
-			return false, errors.New("Done."), timeout
-		case <-timeoutChannel:
-			return false, nil, 0
-		case <-changed:
 		}
 	}
+	if 0 < timeout {
+		timeout = max(time.Duration(0), timeout-time.Since(startTime))
+	}
+	return true, nil, timeout
 }
 
 // Compatibility cadence for external zero-timeout retry callers. The internal
