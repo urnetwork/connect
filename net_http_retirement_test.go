@@ -354,7 +354,11 @@ func (self *retirementTestObservedBody) Read(buffer []byte) (int, error) {
 
 // Real native HTTP/1 and HTTP/2 sockets must leave a removed owner once the
 // selected response completes or cancels. The handler and reader barriers
-// force retirement while the connection is active, not already idle.
+// force retirement while the connection is active, not already idle. The
+// dialer builds its native transport as in production, so the pool owns each
+// socket it dials. HTTP/2 forgets a finished stream only after closing its
+// upload; holding that close keeps the stream live through the final idle
+// sweep, so only the pool's ownership can close the socket.
 func TestClientStrategyRetirementClosesNativeHttpSockets(t *testing.T) {
 	for _, c := range []struct {
 		http2  bool
@@ -386,7 +390,10 @@ func TestClientStrategyRetirementClosesNativeHttpSockets(t *testing.T) {
 		}
 		server.StartTLS()
 		t.Cleanup(server.Close)
-		nativeTransport := server.Client().Transport.(*http.Transport)
+		strategy.settings.TlsConfig = server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+		dialer.httpDialTlsContext = newNormalDialTlsContext(strategy.settings, clientHttpNextProtos)
+		client := dialer.HttpClient()
+		nativeTransport := client.Transport.(*http.Transport)
 		var protocol atomic.Int32
 		transport := &retirementTestTransport{
 			roundTrip: func(request *http.Request) (*http.Response, error) {
@@ -399,10 +406,26 @@ func TestClientStrategyRetirementClosesNativeHttpSockets(t *testing.T) {
 			},
 			onClose: nativeTransport.CloseIdleConnections,
 		}
-		dialer.httpClientFactory = func() *http.Client { return retirementTestClient(transport) }
+		// observes the pooled client without replacing the transport that dials
+		client.Transport = transport
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		request := newClientStrategyLifecycleRequest(t, ctx, server.URL)
+		releaseUpload := make(chan struct{})
+		var releaseUploadOnce sync.Once
+		unblockUpload := func() { releaseUploadOnce.Do(func() { close(releaseUpload) }) }
+		defer unblockUpload()
+		// a canceled HTTP/2 read fails only after its upload closes, so only a
+		// completed stream can hold the upload past the final sweep
+		if !c.http2 || c.cancel {
+			unblockUpload()
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL, strings.NewReader("input"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.GetBody = func() (io.ReadCloser, error) {
+			return &reviewRetirementUploadBody{ReadCloser: io.NopCloser(strings.NewReader("input")), entered: make(chan struct{}), release: releaseUpload}, nil
+		}
 		done := make(chan error, 1)
 		go func() { _, err := strategy.HttpParallel(request); done <- err }()
 		select {
@@ -435,6 +458,7 @@ func TestClientStrategyRetirementClosesNativeHttpSockets(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("%+v: retired owner retained its native connection", c)
 		}
+		unblockUpload()
 		unblock()
 		strategy.Close()
 		server.Close()
