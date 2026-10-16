@@ -44,10 +44,12 @@ info:
     Operations marked `x-internal: true` are not part of the public API:
     the server-to-server webhooks (payment processors, app stores and the
     email provider), the operator's provider probe control plane, the admin
-    reports, the operator's own evidence publishing, the acceptance-test
-    routes and the extender directory calls the SDK makes on its own. They
-    stay in this document so the server's route and conformance checks
-    cover them; the public API reference leaves them out.
+    reports, the operator's own evidence publishing, the provider work
+    intake (the signed originals the SDK and the independent work
+    authorities post), the acceptance-test routes and the extender
+    directory calls the SDK makes on its own. They stay in this document so
+    the server's route and conformance checks cover them; the public API
+    reference leaves them out.
 
   termsOfService: https://ur.io/terms
   contact:
@@ -5778,6 +5780,74 @@ paths:
             The verification subsystem is not enabled on this deployment.
             `Retry-After: 3600`. The body is plain text, not JSON.
 
+  /verify/original/close:
+    post:
+      tags: [Other]
+      summary: Close Verify Original Request
+      description: |
+        Close one verification request for good, or recover its signed answer
+        when it already ran. The body is the request owner's signed closure:
+        the original request `message` and `request_signature`, its
+        `client_id`, the epoch request cut that holds the request (`cut_hash`,
+        `epoch` and `end_block`), the deployment `scope`, and the owner's
+        closure `signature`. No JWT: the request signature and the closure
+        signature must both verify under the key in the request message, and
+        `scope` must be this deployment's. The caller's source address and the
+        request key count against the `POST /verify` seed rate limits.
+
+        When the request already ran, the answer is its retained signed
+        original (`original`). Otherwise the server retains the closure and
+        its signed `closed_unreceived` receipt in one commit, and the request
+        can no longer run. Exactly one of the two is present. An exact retry
+        returns the first receipt, signed by the server key of that time; a
+        different closure for a closed request is refused.
+
+        The framing is strict: exactly one `Content-Type: application/json`
+        (no parameters), a positive `Content-Length` of at most 8192 bytes, no
+        query, and no content encoding, transfer encoding or trailers. The
+        body must be exactly the canonical encoding of the closure; any
+        re-encoding is refused.
+
+        The body is streamed: the server reads it at the client's pace, and it
+        must be complete within 60 seconds; the whole operation, upload
+        included, has 300 seconds. The server runs at most four closures at
+        once per API instance. A refusal decided before the body is read (not
+        enabled, busy, too large, misframed) is answered at once, and the
+        server then reads and discards at most 1 MiB more of the body, for up
+        to 5 seconds, before it stops reading, so a client should stop sending
+        when a response arrives. Refusals are plain text, not JSON.
+      operationId: closeVerifyOriginalRequest
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyOriginalRequestClosure"
+      responses:
+        "200":
+          description: The retained original, or the closed-unreceived receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyOriginalRequestClosureResult"
+        "400":
+          description: |
+            The framing is invalid, the body is not the canonical encoding of a
+            closure, a signature or the scope does not verify, or the caller's
+            source address is unusable.
+        "409":
+          description: A different closure is already retained for the request.
+        "413":
+          description: "`Content-Length` is over 8192 bytes."
+        "429":
+          description: Four closures are already in flight, or a seed rate limit is exceeded.
+        "503":
+          description: |
+            The verification subsystem is not enabled on this deployment
+            (`Retry-After: 3600`), its verification scope is not configured, or
+            the body did not arrive in time.
+
   /provider-work/v1/owners:
     get:
       tags: [Other]
@@ -5829,6 +5899,75 @@ paths:
           description: The provider work transport is busy.
         "503":
           description: Provider work is unavailable on this deployment.
+    post:
+      tags: [Other]
+      x-internal: true
+      summary: Submit Provider Work Owner
+      description: |
+        Enroll one SDK generation in the subnet provider work protocol. The
+        SDK posts its signed owner statement on its own at startup, before it
+        polls `/provider-work/v1/requests`. The statement binds this
+        deployment's work domain, the client id, the SDK generation and the
+        client's public key, and that key signs it. No JWT: the statement is
+        self-authenticating.
+
+        A first statement is admitted only while the client is active and its
+        current client-key registration, signed by the operator's configured
+        client-key root signer, names the same key; until then the answer is
+        `503`, so the SDK retries. A retired or different key is refused. A
+        client keeps at most 1024 statements over its lifetime, across
+        domains. An exact retry of a retained statement returns the same
+        receipt, also after key rotation or client removal.
+
+        The framing is strict: exactly one `Content-Type: application/json`
+        (no parameters), a positive `Content-Length` of at most 4096 bytes, no
+        query, and no content encoding, transfer encoding or trailers. The
+        body must be the exact canonical bytes the key signed.
+
+        The body is streamed: the server reads it at the client's pace, and it
+        must be complete within 60 seconds; the whole operation, upload
+        included, has 300 seconds. The server runs at most four provider work
+        operations at once per API instance, the reads included. A refusal
+        decided before the body is read (busy, too large, misframed,
+        unavailable) is answered at once, and the server then reads and
+        discards at most 1 MiB more of the body, for up to 5 seconds, before
+        it stops reading, so a client should stop sending when a response
+        arrives. Every answer carries `Cache-Control: no-store`; refusals are
+        plain text, not JSON.
+      operationId: submitProviderWorkOwner
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderWorkOwnerStatement"
+      responses:
+        "200":
+          description: Retained. The receipt names the SHA-256 of the exact body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWorkOwnerReceipt"
+        "400":
+          description: |
+            The framing is invalid, or the statement is not canonical, its
+            signature does not verify, its domain is not this deployment's, or
+            its key is retired or is not the client's registered key.
+        "409":
+          description: |
+            Different bytes are retained for the domain, client and
+            generation, or the client's key registration contradicts the
+            statement.
+        "413":
+          description: "`Content-Length` is over 4096 bytes."
+        "429":
+          description: The provider work transport is busy, or the client's 1024 statements are used.
+        "503":
+          description: |
+            Provider work is unavailable on this deployment, the client is not
+            active or its key registration is not admitted yet, or the body did
+            not arrive in time. Retry.
 
   /provider-work/v1/requests:
     get:
@@ -5864,6 +6003,74 @@ paths:
           description: The provider work transport is busy.
         "503":
           description: Provider work is unavailable on this deployment.
+    post:
+      tags: [Other]
+      x-internal: true
+      summary: Submit Provider Work Request
+      description: |
+        Retain one original work request, which asks one SDK generation for
+        its start or end boundary cut of an epoch. The independent request
+        authority signs it with the operator's configured request key
+        (`signer`); the SDK polls for it with `GET /provider-work/v1/requests`
+        and answers it with `POST /provider-work/v1/cuts`. No JWT: the request
+        is self-authenticating, and its domain must be this deployment's.
+
+        A new request is admitted only between its `issued_at_unix` and its
+        `expires_at_unix`, and only while its SDK identity has fewer than eight
+        outstanding requests (not yet cut and not expired). Only the same
+        bytes may enter again: another request with the same id, or for the
+        same domain, client, generation, epoch and kind, is refused. An exact
+        retry returns the same hash, also after the request expired.
+
+        The framing is strict: exactly one `Content-Type: application/json`
+        (no parameters), a positive `Content-Length` of at most 8 KiB, no
+        query, and no content encoding, transfer encoding or trailers. The
+        body must be the exact canonical bytes the key signed.
+
+        The body is streamed: the server reads it at the client's pace, and it
+        must be complete within 60 seconds; the whole operation, upload
+        included, has 300 seconds. The server runs at most four provider work
+        operations at once per API instance, the reads included. A refusal
+        decided before the body is read (busy, too large, misframed,
+        unavailable) is answered at once, and the server then reads and
+        discards at most 1 MiB more of the body, for up to 5 seconds, before
+        it stops reading, so a client should stop sending when a response
+        arrives. Every answer carries `Cache-Control: no-store`; refusals are
+        plain text, not JSON.
+      operationId: submitProviderWorkRequest
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderWorkRequest"
+      responses:
+        "200":
+          description: |
+            Retained. `request_hash` is the SHA-256 of the exact body, the hash
+            `GET /provider-work/v1/requests/{requestHash}` reads it by.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWorkRequestReceipt"
+        "400":
+          description: |
+            The framing is invalid, or the request is not canonical, is not
+            signed by the configured request key, names another domain, or is
+            new and outside its validity interval.
+        "409":
+          description: |
+            A different request is retained with the same id, or for the same
+            domain, client, generation, epoch and kind.
+        "413":
+          description: "`Content-Length` is over 8 KiB."
+        "429":
+          description: The provider work transport is busy, or the SDK identity has eight outstanding requests.
+        "503":
+          description: |
+            Provider work is unavailable on this deployment, or the body did
+            not arrive in time, or storage is unavailable. Retry.
 
   /provider-work/v1/requests/{requestHash}:
     get:
@@ -5894,6 +6101,72 @@ paths:
         "404":
           description: No original is retained under the hash.
 
+  /provider-work/v1/cuts:
+    post:
+      tags: [Other]
+      x-internal: true
+      summary: Submit Provider Work Cut
+      description: |
+        Retain an SDK generation's signed boundary cut together with the
+        original request it answers. The SDK posts it on its own from its
+        outbox, and keeps it until the matching receipt comes back. `request`
+        is the exact original request and `cut` the exact signed cut, both
+        base64. The request's signature and domain must verify, the cut must
+        match the request's identity and boundary block, and the request must
+        already be retained here. The first cut retained for a request is
+        permanent: a different cut is refused, and an exact retry returns the
+        same receipt, also after the request expired. No JWT: both originals
+        are self-authenticating.
+
+        The framing is strict: exactly one `Content-Type: application/json`
+        (no parameters), a positive `Content-Length` of at most 12 MiB, no
+        query, and no content encoding, transfer encoding or trailers. The
+        body must be exactly the canonical encoding of the submission: unknown
+        fields, trailing JSON and any re-encoding are refused.
+
+        The body is streamed: the server reads it at the client's pace, and it
+        must be complete within 60 seconds; the whole operation, upload
+        included, has 300 seconds. The server runs at most four provider work
+        operations at once per API instance, the reads included. A refusal
+        decided before the body is read (busy, too large, misframed,
+        unavailable) is answered at once, and the server then reads and
+        discards at most 1 MiB more of the body, for up to 5 seconds, before
+        it stops reading, so a client should stop sending when a response
+        arrives. Every answer carries `Cache-Control: no-store`; refusals are
+        plain text, not JSON.
+      operationId: submitProviderWorkCut
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderWorkCutSubmission"
+      responses:
+        "200":
+          description: Retained. The receipt names the SHA-256 of each original.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWorkCutReceipt"
+        "400":
+          description: |
+            The framing is invalid, the body is not the canonical encoding of a
+            submission, the request or the cut does not verify, the cut does
+            not match the request, or the request names another domain.
+        "404":
+          description: The request is not retained here.
+        "409":
+          description: A different cut is already retained for the request.
+        "413":
+          description: "`Content-Length` is over 12 MiB."
+        "429":
+          description: The provider work transport is busy.
+        "503":
+          description: |
+            Provider work is unavailable on this deployment, or the body did
+            not arrive in time, or storage is unavailable. Retry.
+
   /provider-work/v1/cuts/{cutHash}:
     get:
       tags: [Other]
@@ -5922,6 +6195,70 @@ paths:
           description: The hash is malformed, or a query was given.
         "404":
           description: No original is retained under the hash.
+
+  /provider-work/v1/authorities:
+    post:
+      tags: [Other]
+      x-internal: true
+      summary: Submit Provider Work Authority
+      description: |
+        Retain the signed whole-work authority of one epoch: the complete
+        roster of SDK owners and expected providers that payout production
+        joins with the retained cuts. The independent roster producer posts
+        it; the operator never builds one from its own database. It must be
+        signed by the operator's configured roster authority signer, name this
+        deployment's work domain and the configured request key, and be its
+        exact canonical encoding. One authority is retained for each domain
+        and epoch: a different one is refused, and an exact retry returns the
+        same hash. No JWT: the authority is self-authenticating.
+
+        The framing is strict: exactly one `Content-Type: application/json`
+        (no parameters), a positive `Content-Length` of at most 2 MiB, no
+        query, and no content encoding, transfer encoding or trailers.
+
+        The body is streamed: the server reads it at the client's pace, and it
+        must be complete within 60 seconds; the whole operation, upload
+        included, has 300 seconds. The server runs at most four provider work
+        operations at once per API instance, the reads included. A refusal
+        decided before the body is read (busy, too large, misframed,
+        unavailable) is answered at once, and the server then reads and
+        discards at most 1 MiB more of the body, for up to 5 seconds, before
+        it stops reading, so a client should stop sending when a response
+        arrives. Every answer carries `Cache-Control: no-store`; refusals are
+        plain text, not JSON.
+      operationId: submitProviderWorkAuthority
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderWorkAuthority"
+      responses:
+        "200":
+          description: |
+            Retained. `authority_hash` is the SHA-256 of the exact body, the
+            `authority` selector of `GET /provider-work/v1/windows`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWorkAuthorityReceipt"
+        "400":
+          description: |
+            The framing is invalid, or the authority is not canonical, is not
+            signed by the configured roster signer, or names another domain or
+            request key.
+        "409":
+          description: A different authority is already retained for the domain and epoch.
+        "413":
+          description: "`Content-Length` is over 2 MiB."
+        "429":
+          description: The provider work transport is busy.
+        "503":
+          description: |
+            Provider work or its roster signers are not configured on this
+            deployment, or the body did not arrive in time, or storage is
+            unavailable. Retry.
 
   /provider-work/v1/windows:
     get:
@@ -9766,6 +10103,136 @@ components:
               description: The transition signature, base64.
               type: string
 
+    VerifyOriginalRequestClosure:
+      type: object
+      description: |
+        A request owner's signed closure of one verification request
+        (`protocol.ProviderAttemptRequestClosure`). The canonical encoding is
+        Go's `encoding/json` output: the properties in the order listed,
+        without whitespace. Fixed-size byte fields are JSON arrays of integers
+        (Go byte arrays); `message`, `request_signature` and `signature` are
+        base64. `signature` is the Ed25519 signature, by the public key in the
+        request `message`, over `urnetwork-provider-attempt-request-close-v1`,
+        a NUL byte and the canonical encoding with `signature` null.
+      required:
+        - schema
+        - scope
+        - client_id
+        - message
+        - request_signature
+        - cut_hash
+        - epoch
+        - end_block
+        - signature
+      properties:
+        schema:
+          description: |
+            `urnetwork-provider-attempt-request-close-v1` followed by one NUL
+            character, `\u0000` in the JSON.
+          type: string
+        scope:
+          description: The deployment scope the request was signed under; it must be this deployment's.
+          type: object
+          required:
+            - profile
+            - genesis_hash
+            - deployment_id
+            - deployment_key
+            - policy_hash
+            - netuid
+            - no_id
+          properties:
+            profile:
+              type: string
+            genesis_hash:
+              description: The 32-byte chain genesis hash, a JSON array of 32 integers.
+              type: array
+              items:
+                type: integer
+              minItems: 32
+              maxItems: 32
+            deployment_id:
+              type: string
+            deployment_key:
+              type: string
+            policy_hash:
+              description: The 32-byte policy hash, a JSON array of 32 integers.
+              type: array
+              items:
+                type: integer
+              minItems: 32
+              maxItems: 32
+            netuid:
+              type: integer
+            no_id:
+              type: integer
+        client_id:
+          description: The request's client id.
+          type: string
+          format: uuid
+        message:
+          description: The exact original SEED or EXTEND request message, base64.
+          type: string
+        request_signature:
+          description: The request's 64-byte Ed25519 signature, base64.
+          type: string
+        cut_hash:
+          description: The 32-byte hash of the epoch request cut that holds the request, a JSON array of 32 integers.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        epoch:
+          description: The epoch of that cut.
+          type: integer
+        end_block:
+          description: The end block of that cut.
+          type: integer
+        signature:
+          description: The owner's 64-byte Ed25519 closure signature, base64.
+          type: string
+
+    VerifyOriginalRequestClosureResult:
+      type: object
+      description: Exactly one of `original` and `closed_unreceived` is present.
+      properties:
+        original:
+          description: The request already ran. Its retained signed transition, as `POST /verify/original` returns it.
+          type: object
+          required:
+            - body
+            - signature
+          properties:
+            body:
+              description: The exact signed body, base64.
+              type: string
+            signature:
+              description: The transition signature, base64.
+              type: string
+        closed_unreceived:
+          description: |
+            The request is closed: the server's signed receipt that it holds no
+            original for the request and will not run it. It asserts this
+            execution fence only, not coverage, eligibility or traffic. `body`
+            is the canonical JSON of `schema`
+            (`urnetwork-provider-attempt-closed-unreceived-v1` followed by one
+            NUL character), `closure_hash` (the SHA-256 of the exact closure, a
+            JSON array of 32 integers) and `server_key_id`, the `/verify/keys`
+            key whose Ed25519 `signature` covers that schema string followed by
+            `body`.
+          type: object
+          required:
+            - body
+            - signature
+          properties:
+            body:
+              description: The exact receipt body, base64.
+              type: string
+            signature:
+              description: The server key's Ed25519 signature, base64.
+              type: string
+
     ProviderWorkOwnerIndex:
       type: object
       required:
@@ -9794,6 +10261,600 @@ components:
           type: array
           items:
             type: string
+
+    ProviderWorkOwnerStatement:
+      type: object
+      description: |
+        An SDK generation's signed owner statement
+        (`protocol.OriginalWorkOwnerEnrollment`). The canonical encoding is
+        Go's `encoding/json` output: the properties in the order listed,
+        without whitespace. Byte fields are JSON arrays of integers (Go byte
+        arrays), not base64. `signature` is the Ed25519 signature, by
+        `public_key`, over the canonical encoding with `signature` all zeros.
+      required:
+        - schema
+        - domain_hash
+        - client_id
+        - generation
+        - public_key
+        - signature
+      properties:
+        schema:
+          type: string
+          enum: [urnetwork-sdk-whole-work-owner-v1]
+        domain_hash:
+          description: The 32-byte work domain; it must be this deployment's.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        client_id:
+          description: The 16-byte client id.
+          type: array
+          items:
+            type: integer
+          minItems: 16
+          maxItems: 16
+        generation:
+          description: The 16-byte SDK generation.
+          type: array
+          items:
+            type: integer
+          minItems: 16
+          maxItems: 16
+        public_key:
+          description: The client's 32-byte Ed25519 public key.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        signature:
+          description: The 64-byte Ed25519 signature.
+          type: array
+          items:
+            type: integer
+          minItems: 64
+          maxItems: 64
+
+    ProviderWorkOwnerReceipt:
+      type: object
+      required:
+        - schema
+        - owner_hash
+      properties:
+        schema:
+          type: string
+          enum: [urnetwork-sdk-whole-work-owner-receipt-v1]
+        owner_hash:
+          description: The SHA-256 of the exact statement bytes, a JSON array of 32 integers.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+
+    ProviderWorkRequest:
+      type: object
+      description: |
+        One original work request (`protocol.OriginalWorkRequest`), which asks
+        one SDK generation for its start or end boundary cut of an epoch. The
+        canonical encoding is Go's `encoding/json` output: the properties in
+        the order listed, without whitespace. Byte fields are JSON arrays of
+        integers (Go byte arrays), not base64. `signature` is the Ed25519
+        signature, by `signer`, over the canonical encoding with `signature`
+        all zeros.
+      required:
+        - schema
+        - request_id
+        - domain_hash
+        - client_id
+        - generation
+        - public_key
+        - epoch
+        - kind
+        - block
+        - block_hash
+        - issued_at_unix
+        - expires_at_unix
+        - signer
+        - signature
+      properties:
+        schema:
+          type: string
+          enum: [urnetwork-sdk-whole-work-request-v1]
+        request_id:
+          description: The 16-byte request id.
+          type: array
+          items:
+            type: integer
+          minItems: 16
+          maxItems: 16
+        domain_hash:
+          description: The 32-byte work domain; it must be this deployment's.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        client_id:
+          description: The 16-byte client id of the SDK generation.
+          type: array
+          items:
+            type: integer
+          minItems: 16
+          maxItems: 16
+        generation:
+          description: The 16-byte SDK generation.
+          type: array
+          items:
+            type: integer
+          minItems: 16
+          maxItems: 16
+        public_key:
+          description: The SDK generation's 32-byte Ed25519 public key.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        epoch:
+          type: integer
+        kind:
+          description: Which boundary of the epoch to cut.
+          type: string
+          enum: [start, end]
+        block:
+          description: The boundary block number.
+          type: integer
+        block_hash:
+          description: The 32-byte boundary block hash.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        issued_at_unix:
+          description: Unix seconds; capture permission begins.
+          type: integer
+        expires_at_unix:
+          description: Unix seconds; capture permission ends, after `issued_at_unix` and at most 3600 seconds later.
+          type: integer
+        signer:
+          description: The 32-byte Ed25519 public key that signs; it must be the operator's configured request key.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        signature:
+          description: The 64-byte Ed25519 signature.
+          type: array
+          items:
+            type: integer
+          minItems: 64
+          maxItems: 64
+
+    ProviderWorkRequestReceipt:
+      type: object
+      required:
+        - request_hash
+      properties:
+        request_hash:
+          description: The SHA-256 of the exact request bytes, a JSON array of 32 integers.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+
+    ProviderWorkCutSubmission:
+      type: object
+      description: |
+        A signed boundary cut and the request it answers
+        (`protocol.OriginalWorkCutSubmission`). The canonical encoding is
+        Go's `encoding/json` output: `request`, then `cut`, without
+        whitespace.
+      required:
+        - request
+        - cut
+      properties:
+        request:
+          description: The exact original request bytes (a `ProviderWorkRequest`), base64.
+          type: string
+        cut:
+          description: The exact signed cut bytes (`protocol.OriginalWorkCut`), base64.
+          type: string
+
+    ProviderWorkCutReceipt:
+      type: object
+      required:
+        - schema
+        - request_hash
+        - cut_hash
+      properties:
+        schema:
+          type: string
+          enum: [urnetwork-sdk-whole-work-receipt-v1]
+        request_hash:
+          description: The SHA-256 of the exact request bytes, a JSON array of 32 integers.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        cut_hash:
+          description: |
+            The SHA-256 of the exact cut bytes, a JSON array of 32 integers;
+            `GET /provider-work/v1/cuts/{cutHash}` reads the cut by it.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+
+    ProviderWorkAuthority:
+      type: object
+      description: |
+        The signed whole-work authority of one epoch
+        (`payoutartifact.WholeWorkAuthority`): the complete roster of SDK
+        owners and expected providers. `schema` follows the chains it pins:
+        v1 pins neither `network_wallets` nor `hotkey_delegations`, v2 pins
+        network wallet chains only, and v3 pins hotkey delegation chains,
+        with or without network wallet chains. The canonical encoding is Go's
+        `encoding/json` output: the properties in the order listed, without
+        whitespace, and the optional lists only when they are not empty.
+        Fixed-size byte fields are JSON arrays of integers (Go byte arrays).
+        `signature` is `signer`'s low-s secp256k1 signature over the SHA-256
+        of the canonical encoding with `signature` all zeros.
+      required:
+        - schema
+        - domain
+        - epoch
+        - start
+        - end
+        - request_public_key
+        - clock_profile
+        - prior_contracts
+        - owners
+        - expected_providers
+        - signer
+        - signature
+      properties:
+        schema:
+          type: string
+          enum:
+            - urnetwork-whole-work-authority-v1
+            - urnetwork-whole-work-authority-v2
+            - urnetwork-whole-work-authority-v3
+        domain:
+          description: The client-key history domain; its digest must be this deployment's work domain.
+          type: object
+          required:
+            - chain_id
+            - genesis_hash
+            - netuid
+            - coordinator
+            - settlement_vault
+            - deployment_id_hash
+            - policy_hash
+            - no_id
+          properties:
+            chain_id:
+              type: integer
+            genesis_hash:
+              description: A JSON array of 32 integers.
+              type: array
+              items:
+                type: integer
+              minItems: 32
+              maxItems: 32
+            netuid:
+              type: integer
+            coordinator:
+              description: An EVM address, `0x` and 40 lowercase hex digits.
+              type: string
+            settlement_vault:
+              description: An EVM address, `0x` and 40 lowercase hex digits.
+              type: string
+            deployment_id_hash:
+              description: A JSON array of 32 integers.
+              type: array
+              items:
+                type: integer
+              minItems: 32
+              maxItems: 32
+            policy_hash:
+              description: A JSON array of 32 integers.
+              type: array
+              items:
+                type: integer
+              minItems: 32
+              maxItems: 32
+            no_id:
+              type: integer
+        epoch:
+          type: integer
+        start:
+          description: The epoch's start boundary block.
+          type: object
+          required:
+            - number
+            - hash
+          properties:
+            number:
+              type: integer
+            hash:
+              description: The block hash, `0x` and 64 hex digits.
+              type: string
+        end:
+          description: The epoch's end boundary block, after `start`.
+          type: object
+          required:
+            - number
+            - hash
+          properties:
+            number:
+              type: integer
+            hash:
+              description: The block hash, `0x` and 64 hex digits.
+              type: string
+        request_public_key:
+          description: The 32-byte Ed25519 request key; it must be the operator's configured request key.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
+        clock_profile:
+          description: Empty, or `frontier-legacy-rlp15-milliseconds`.
+          type: string
+        prior_contracts:
+          description: |
+            The independently reconciled prior-work checkpoints, ascending by
+            `contract_id`: an empty list, not null, when there are none.
+          type: array
+          items:
+            type: object
+            required:
+              - contract_id
+              - reconciled_epoch
+              - inventory_hash
+              - stored_contract_hash
+              - source_inventory_hash
+              - destination_inventory_hash
+            properties:
+              contract_id:
+                description: A JSON array of 16 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 16
+                maxItems: 16
+              reconciled_epoch:
+                description: An epoch before `epoch`.
+                type: integer
+              inventory_hash:
+                description: "`sha256:` and 64 lowercase hex digits."
+                type: string
+              stored_contract_hash:
+                description: A JSON array of 32 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 32
+                maxItems: 32
+              source_inventory_hash:
+                description: A JSON array of 32 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 32
+                maxItems: 32
+              destination_inventory_hash:
+                description: A JSON array of 32 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 32
+                maxItems: 32
+        owners:
+          description: Every SDK owner, ascending by client id and then generation; at most 8192.
+          type: array
+          items:
+            type: object
+            required:
+              - client_id
+              - network_id
+              - generation
+              - public_key
+            properties:
+              client_id:
+                description: A JSON array of 16 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 16
+                maxItems: 16
+              network_id:
+                description: A JSON array of 16 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 16
+                maxItems: 16
+              generation:
+                description: A JSON array of 16 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 16
+                maxItems: 16
+              public_key:
+                description: A JSON array of 32 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 32
+                maxItems: 32
+        expected_providers:
+          description: |
+            Every expected provider, ascending by client id, each an owner's
+            client under that owner's network; at most 8192.
+          type: array
+          items:
+            type: object
+            required:
+              - client_id
+              - network_id
+              - wallet_head_hash
+              - wallet_generation
+            properties:
+              client_id:
+                description: A JSON array of 16 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 16
+                maxItems: 16
+              network_id:
+                description: A JSON array of 16 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 16
+                maxItems: 16
+              wallet_head_hash:
+                description: The provider's wallet consent chain head, 64 lowercase hex digits, or empty when it has none.
+                type: string
+              wallet_generation:
+                description: The head's generation, 1 to 4096; 0 when `wallet_head_hash` is empty.
+                type: integer
+        network_wallets:
+          description: |
+            v2 and v3: the network wallet consent chain heads, ascending by
+            network id, each for a network with an expected provider.
+          type: array
+          items:
+            type: object
+            required:
+              - network_id
+              - wallet_head_hash
+              - wallet_generation
+            properties:
+              network_id:
+                description: A JSON array of 16 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 16
+                maxItems: 16
+              wallet_head_hash:
+                description: 64 lowercase hex digits.
+                type: string
+              wallet_generation:
+                description: 1 to 4096.
+                type: integer
+        hotkey_delegations:
+          description: |
+            v3 only: the hotkey delegation chain heads, ascending by network id,
+            each for a network with an expected provider.
+          type: array
+          items:
+            type: object
+            required:
+              - network_id
+              - delegation_head_hash
+              - delegation_generation
+            properties:
+              network_id:
+                description: A JSON array of 16 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 16
+                maxItems: 16
+              delegation_head_hash:
+                description: 64 lowercase hex digits.
+                type: string
+              delegation_generation:
+                description: 1 to 4096.
+                type: integer
+        work_sources:
+          description: The approved provider work admission sources, ascending by `source_id` and then `generation`; at most 64.
+          type: array
+          items:
+            type: object
+            required:
+              - domain_hash
+              - source_id
+              - generation
+              - public_key
+              - from_unix_micro
+              - through_unix_micro
+              - max_endpoint_events
+              - max_cohort_members
+              - directory_public_keys
+            properties:
+              domain_hash:
+                description: The 32-byte work domain, a JSON array of 32 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 32
+                maxItems: 32
+              source_id:
+                type: string
+              generation:
+                type: string
+              public_key:
+                description: A JSON array of 32 integers.
+                type: array
+                items:
+                  type: integer
+                minItems: 32
+                maxItems: 32
+              from_unix_micro:
+                type: integer
+              through_unix_micro:
+                type: integer
+              max_endpoint_events:
+                type: integer
+              max_cohort_members:
+                type: integer
+              directory_public_keys:
+                description: At most 8 keys, ascending, each a JSON array of 32 integers.
+                type: array
+                items:
+                  type: array
+                  items:
+                    type: integer
+                  minItems: 32
+                  maxItems: 32
+        signer:
+          description: The roster signer's EVM address, `0x` and 40 lowercase hex digits; it must be the operator's configured roster signer.
+          type: string
+        signature:
+          description: The 65-byte secp256k1 signature (r, s, v), a JSON array of 65 integers.
+          type: array
+          items:
+            type: integer
+          minItems: 65
+          maxItems: 65
+
+    ProviderWorkAuthorityReceipt:
+      type: object
+      required:
+        - authority_hash
+      properties:
+        authority_hash:
+          description: The SHA-256 of the exact authority bytes, a JSON array of 32 integers.
+          type: array
+          items:
+            type: integer
+          minItems: 32
+          maxItems: 32
 
     RemoveNetworkClientArgs:
       type: object
