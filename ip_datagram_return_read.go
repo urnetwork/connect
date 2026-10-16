@@ -101,6 +101,77 @@ func (lease *udpReturnReadLease) finish(notify bool) {
 	}
 }
 
+// Takes prepared Transfer credit for this flow's next return read. Every flow
+// of a provider reads on credit from one budget, and a read refused it keeps
+// its place in line: a release reserves the credit for the oldest waiting
+// flow before any woken reader runs, and that flow's next read takes it.
+// Waking every paused reader to race for a freed credit let the runtime pick
+// the flow it carried, and on one processor one flow took every one. A place
+// held in another live provider's budget stays; this one reserves without.
+func (self *UdpSequence) takeReturnReadCredit(budget *TransferMemoryBudget, bytes ByteCount) (*preparedSendMemory, bool) {
+	if budget == nil {
+		return nil, true
+	}
+	if waiter := self.returnReadCredit.Load(); waiter != nil {
+		if waiter.budget != budget {
+			return prepareSendMemory(budget, bytes)
+		}
+		select {
+		case <-waiter.ready:
+		default:
+			return nil, false
+		}
+		self.returnReadCredit.Store(nil)
+		if bytes <= waiter.byteCount {
+			// Commit trims the credit to the packets actually read.
+			return &preparedSendMemory{budget: budget, bytes: waiter.byteCount}, true
+		}
+		// A larger read than the one that queued gives its grant back.
+		waiter.abandon()
+	}
+	if bytes <= 0 {
+		return nil, false
+	}
+	reserved, waiter := budget.tryReserveOrQueue(bytes)
+	if !reserved {
+		self.returnReadCredit.Store(waiter)
+		return nil, false
+	}
+	return &preparedSendMemory{budget: budget, bytes: bytes}, true
+}
+
+// Gives up a place in line, or the credit already reserved for it, that no
+// live provider can serve.
+func (self *UdpSequence) releaseUnservedReturnReadCredit(senders []*providerDatagramSender) {
+	waiter := self.returnReadCredit.Load()
+	if waiter == nil {
+		return
+	}
+	for _, sender := range senders {
+		if sender.readCreditBudget() == waiter.budget {
+			return
+		}
+	}
+	self.returnReadCredit.Store(nil)
+	waiter.abandon()
+}
+
+// Once retirement's last operation finishes no read can take this flow's
+// place in line again, so it is given up, with any credit reserved for it.
+func (self *UdpSequence) releaseReturnReadCreditIfRetired() {
+	if self.retirementOperations == nil {
+		return
+	}
+	select {
+	case <-self.retirementOperations.Done():
+	default:
+		return
+	}
+	if waiter := self.returnReadCredit.Swap(nil); waiter != nil {
+		waiter.abandon()
+	}
+}
+
 func (self *UdpSequence) returnReadPollShard() *udpSocketReadPollShard {
 	if self.socketReadPoller == nil || self.socketReadPollShard < 0 ||
 		len(self.socketReadPoller.shards) <= self.socketReadPollShard {
