@@ -8575,9 +8575,11 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	// parent stateLock, and this closure runs under the per-flow leaf lock.
 	var boundUpdate *multiClientChannelUpdate
 	var resolvedUpdate *multiClientChannelUpdate
-	// A flow with no client and no race whose sender may adopt it; the commit
-	// runs after receiveClientPath returns (see below).
+	// A flow with no client whose sender may adopt it, with no race or from
+	// outside its race (adoptRaced); the commit runs after receiveClientPath
+	// returns (see below).
 	var adoptUpdate *multiClientChannelUpdate
+	adoptRaced := false
 	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		defer update.releaseCollapseClaims()
 		resolvedUpdate = update
@@ -8641,8 +8643,15 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 				self.log.Infof("[multi]receive no race and no client")
 			}
 		} else if state, ok := race.clientStates[sourceClient]; !ok {
-			// this client is not part of the race, drop
-			self.log.Infof("[multi]receive client not part of race")
+			// this client is not part of the race: the exit that carried the
+			// attempt before the inference re-raced it joins the race below
+			// and wins it when that is safe (adoptableInboundWithLock),
+			// otherwise dropped
+			if update.adoptableInboundWithLock(sourceClient, tcpControl) {
+				adoptUpdate, adoptRaced = update, true
+			} else {
+				self.log.Infof("[multi]receive client not part of race")
+			}
 		} else if race.responseWindowElapsed {
 			// The comparison deadline does not expire the application's flow.
 			// With no earlier answer, the first live candidate still wins.
@@ -8721,14 +8730,18 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			}
 		}
 	})
-	// The sender of inbound for a flow with no client and no race adopts it,
-	// binding it as a race commit would, when it passes the placement filters
-	// a race candidate passes: not quarantined, able to carry the flow's ip
-	// version, and under the flow cap. Those take the channel and parent
-	// locks, which never nest under the flow lock, so they are read here and
-	// the commit re-validates the flow under its lock.
+	// The sender of inbound for a flow with no client adopts it, binding it as
+	// a race commit would, when it passes the placement filters a race
+	// candidate passes: not quarantined, able to carry the flow's ip version,
+	// and under the flow cap. Those take the channel and parent locks, which
+	// never nest under the flow lock, so they are read here and the commit
+	// re-validates the flow under its lock. A flow that is racing, re-raced
+	// onto other exits by the inference, takes the answer into its race as
+	// that of a candidate and commits it, which resets the candidates as any
+	// race commit does.
 	if adoptUpdate != nil {
-		adopted, connected := false, false
+		adopted, joined, connected := false, false, false
+		var adoptedPackets []*receivePacket
 		placeable := !sourceClient.isQuarantined() &&
 			sourceClient.supportsIpVersion(adoptUpdate.ipPath.Version) &&
 			!func() bool {
@@ -8743,30 +8756,48 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 				if !adoptUpdate.adoptableInboundWithLock(sourceClient, tcpControl) {
 					return
 				}
+				adopted = true
+				p := &receivePacket{
+					Source:      source,
+					ProvideMode: provideMode,
+					IpPath:      ipPath,
+					Packet:      packet,
+					tcpControl:  tcpControl,
+				}
+				if race := adoptUpdate.race; race != nil {
+					joined = true
+					race.clientStates[sourceClient] = &multiClientChannelRaceClientState{
+						packets: []*receivePacket{p},
+					}
+					adoptedPackets, abandonedClients, returnPackets, connected =
+						adoptUpdate.commitRaceClientWithLock(sourceClient)
+					return
+				}
 				adoptUpdate.client.Store(sourceClient)
 				adoptUpdate.commitCollapseClaimsWithLock(sourceClient)
-				adopted = true
 				connected = adoptUpdate.markReceivedInboundWithLock(sourceClient, tcpControl)
+				adoptedPackets = []*receivePacket{p}
 			}()
 			// the commit can release collapse claims after the resolve's own drain
 			adoptUpdate.releaseCollapseClaims()
 		}
-		if adopted {
+		switch {
+		case joined:
+			self.log.Infof("[multi]receive adopted a flow from outside its race")
+		case adopted:
 			self.log.Infof("[multi]receive adopted a flow with no race and no client")
+		case adoptRaced:
+			self.log.Infof("[multi]receive client not part of race")
+		default:
+			self.log.Infof("[multi]receive no race and no client")
+		}
+		if adopted {
 			boundUpdate = adoptUpdate
 			if connected {
 				connectSucceeded = true
 				connectPath = adoptUpdate.ipPath
 			}
-			receivePackets = []*receivePacket{{
-				Source:      source,
-				ProvideMode: provideMode,
-				IpPath:      ipPath,
-				Packet:      packet,
-				tcpControl:  tcpControl,
-			}}
-		} else {
-			self.log.Infof("[multi]receive no race and no client")
+			receivePackets = adoptedPackets
 		}
 	}
 	// a flow's first inbound packet is a proven upstream connect on this
@@ -10247,11 +10278,14 @@ func (self *multiClientChannelUpdate) dialFailureStanding(client *multiClientCha
 	return standing, first
 }
 
-// Reports whether inbound from client may commit a flow left with no client
-// and no race. The silence inference, or a re-race its exit could not take,
-// unbinds a flow whose exit is in fact working; that exit's late answer is
-// the first proof of it and belongs to the app now, not after the app's next
-// retransmit.
+// Reports whether inbound from client may commit a flow left with no client.
+// The silence inference unbinds a flow whose exit is in fact working; that
+// exit's late answer is the first proof of it and belongs to the app now, not
+// after the app's next retransmit. The flow can be left with no race, when
+// the re-race was refused, or racing exits that have not answered, which a
+// race never commits on for a SYN. Racing, the answer joins the race as a
+// candidate's would and wins it; a candidate of the race answers through the
+// race itself.
 //
 // Only an exit that carried the current connect attempt and was unbound from
 // it by the inference adopts it: one of dialFailedClients that did not signal
@@ -10270,7 +10304,8 @@ func (self *multiClientChannelUpdate) dialFailureStanding(client *multiClientCha
 // with stateLock.
 func (self *multiClientChannelUpdate) adoptableInboundWithLock(client *multiClientChannel, control tcpControlObservation) bool {
 	if client == nil || self.IsDone() || client.IsDone() || self.sourceReset.Load() ||
-		self.receivedInbound.Load() || self.client.Load() != nil || self.race != nil ||
+		self.receivedInbound.Load() || self.client.Load() != nil ||
+		self.race != nil && self.race.clientStates[client] != nil ||
 		!slices.Contains(self.dialFailedClients, client) ||
 		slices.Contains(self.dialFailureSignaledClients, client) {
 		return false
