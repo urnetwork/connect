@@ -36,6 +36,10 @@ info:
     Responses may include additional fields beyond those documented here.
     Clients should ignore unknown fields (be liberal in what you accept).
 
+    Unless a route documents otherwise, an error response has a plain text
+    body. A refusal's body says why. Any other failure is internal: a 500
+    with a fixed body, whose cause stays in the server's log.
+
     This api process also serves the sim-latency competition under
     `/competition`. Those routes are a separate, fail-closed security domain
     with their own opaque role-scoped tokens, and they are documented in
@@ -793,6 +797,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthVerifySendResult"
+        "400":
+          description: The email or phone number is malformed, or no account has it. Plain text body.
         "429":
           description: Too many attempts (requests without `result_errors`). Plain text body.
           headers:
@@ -831,6 +837,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthPasswordResetResult"
+        "400":
+          description: The email or phone number is malformed, or no account has it. Plain text body.
         "429":
           description: Too many attempts (requests without `result_errors`). Plain text body.
           headers:
@@ -862,6 +870,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthPasswordSetResult"
+        "400":
+          description: The reset code is unknown, used or expired. Plain text body.
 
   /auth/network-check:
     post:
@@ -943,6 +953,9 @@ paths:
       summary: Auth Network Delete
       description: |
         Delete network
+
+        A caller that is not the network's admin is also refused with a 403,
+        with the plain text body `Could not remove network`.
       operationId: authNetworkDelete
       security:
         - BearerAuth: []
@@ -955,6 +968,8 @@ paths:
                 $ref: "#/components/schemas/NetworkDeleteResult"
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
+        "409":
+          description: A Stripe renewal was still active when the network was to be removed; retry. Plain text body.
 
   /auth/code-create:
     post:
@@ -1733,8 +1748,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RemoveNetworkClientsResult"
+        "400":
+          description: More than 1,000,000 distinct client ids. Plain text body.
         "403":
           $ref: "#/components/responses/ClientJwtRefused"
+        "429":
+          description: The deployment's bulk removal budget for the next 24 hours is spent; retry later. Plain text body.
 
   /network/extender-activate:
     post:
@@ -3462,8 +3481,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WalletCircleTransferOutResult"
+        "400":
+          description: |
+            No `request_id`, terms not accepted, a destination that is empty,
+            padded or over 256 characters, or an amount that is not a positive
+            whole number of USDC micro-units. Plain text body.
         "403":
           $ref: "#/components/responses/ClientJwtRefused"
+        "409":
+          description: |
+            The `request_id` is retained with other terms, or the customer has
+            no wallet to transfer from. Plain text body.
+        "500":
+          description: |
+            The challenge's outcome is unknown: the request is retained, and the
+            body says to retry only with the same `request_id`. Any other
+            internal failure has a fixed body.
 
   /subscription/balance:
     get:
@@ -4938,6 +4971,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetPayoutWalletResult"
+        "400":
+          description: The wallet is a Bittensor wallet, or not an active wallet of the network. Plain text body.
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
     get:
@@ -5017,6 +5052,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateAccountWalletResult"
+        "400":
+          description: |
+            An unsupported blockchain, an invalid wallet address or default
+            token type, or a wallet the payout cannot go to. Plain text body.
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
 
@@ -5076,7 +5115,8 @@ paths:
         Verify that a wallet holds a Seeker or Saga Genesis token by
         validating a signed message. Either holding succeeds; a wallet with
         neither is refused with `error.message` and `error.code`
-        `seeker_token_not_found`.
+        `seeker_token_not_found`, and a token lookup that fails is answered
+        the same way with `seeker_lookup_failed`.
       operationId: accountVerifySeekerToken
       security:
         - BearerAuth: []
@@ -5471,6 +5511,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PayDataNetworkLookupResult"
+        "429":
+          description: Too many requests from this address this minute. Plain text body.
 
   /pay/data/solana-intent:
     post:
@@ -5547,6 +5589,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PayDataSolanaStatusResult"
+        "429":
+          description: Too many requests from this address this minute. Plain text body.
 
   /stripe/create-checkout-session:
     post:
@@ -5623,10 +5667,21 @@ paths:
                 oneOf:
                   - $ref: "#/components/schemas/VerifyAssignResult"
                   - $ref: "#/components/schemas/VerifyFinalResult"
+        "400":
+          description: |
+            The step is malformed or does not verify: a field has the wrong
+            size or range, `client_id` is zero, a signature does not verify,
+            or the trail is unknown or has failed.
+        "409":
+          description: |
+            The request's owner closed it (`POST /verify/original/close`), so
+            it never runs, or another step of the same trail is in flight;
+            retry a busy trail.
         "503":
           description: |
-            The verification subsystem is not enabled on this deployment.
-            `Retry-After: 3600`. The body is plain text, not JSON.
+            The verification subsystem is not enabled on this deployment
+            (`Retry-After: 3600`), or storage is unavailable. Retry. The body
+            is plain text, not JSON, and never carries the failure's cause.
 
   /verify/keys:
     get:
@@ -5740,7 +5795,10 @@ paths:
         "400":
           description: A query parameter is not a valid RFC 3339 time or integer.
         "503":
-          description: The verification subsystem is not enabled.
+          description: |
+            The verification subsystem is not enabled, or a stored proof cannot
+            be read. The body is plain text and never carries the failure's
+            cause.
 
   /verify/original:
     post:
@@ -5775,10 +5833,13 @@ paths:
                 $ref: "#/components/schemas/VerifyOriginalRequestResult"
         "400":
           description: The locator is invalid or its signature does not verify.
+        "409":
+          description: The request's owner closed it (`POST /verify/original/close`); it has no original and never will.
         "503":
           description: |
-            The verification subsystem is not enabled on this deployment.
-            `Retry-After: 3600`. The body is plain text, not JSON.
+            The verification subsystem is not enabled on this deployment
+            (`Retry-After: 3600`), or storage is unavailable. Retry. The body
+            is plain text, not JSON, and never carries the failure's cause.
 
   /verify/original/close:
     post:
@@ -5845,8 +5906,10 @@ paths:
         "503":
           description: |
             The verification subsystem is not enabled on this deployment
-            (`Retry-After: 3600`), its verification scope is not configured, or
-            the body did not arrive in time.
+            (`Retry-After: 3600`), its verification scope is not configured, the
+            body did not arrive in time, or storage or signing failed. Retry. A
+            storage or signing failure is answered with a fixed message, never
+            with its cause.
 
   /provider-work/v1/owners:
     get:
@@ -6748,6 +6811,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnPoolClaimResult"
+        "400":
+          description: "`legacy_coldkey` is not an ss58 address."
+        "503":
+          description: |
+            The epoch's retained payout artifact cannot back a claim: its store
+            is unavailable, its bytes fail their integrity check, it names
+            another claim scope, or the stored leaves differ from its root.
+            The body is plain text naming only that class, never the cause.
 
   /sn/epoch:
     get:
@@ -7099,7 +7170,10 @@ paths:
         "502":
           description: The immutable write or its readback failed.
         "503":
-          description: The attempt store is unavailable.
+          description: |
+            The attempt store or its upload quota is unavailable, or the upload
+            could not take ownership of its body. Retry. Every refusal's body is
+            a fixed message that never carries the failure's cause.
 
   /sn/evidence:
     get:
@@ -7268,11 +7342,20 @@ paths:
               schema:
                 $ref: "#/components/schemas/ClientKeyHistoryResponse"
         "400":
-          description: The framing is invalid, or the body is non-canonical or carries trailing JSON.
+          description: |
+            The framing is invalid, the body is not the canonical arguments or
+            carries trailing JSON, or the observation request is malformed,
+            incomplete, non-canonical or names another client.
         "401":
           description: Missing or invalid client bearer token.
         "429":
           description: Every observation slot is busy, or the account byte budget is exhausted.
+        "503":
+          description: |
+            The observation could not be made now: the operator's chain read,
+            signing or storage failed, or the client has no complete history at
+            the decision. Retry. The body is a fixed message that never carries
+            the failure's cause, such as an RPC url.
 
   /sn/client-key/observations:
     post:
@@ -7316,6 +7399,11 @@ paths:
           description: The batch's chain work was refused; see `X-Ur-Client-Key-Batch-Admission`.
         "429":
           description: Every observation slot is busy, or the account byte budget is exhausted.
+        "503":
+          description: |
+            The observations could not be made now, as for
+            `/sn/client-key/observation`. Retry. The body is a fixed message
+            that never carries the failure's cause.
 
   # ----- onboarding program (mmm/onboarding/PLAN.md) -----
 
