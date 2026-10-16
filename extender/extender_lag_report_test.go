@@ -54,14 +54,30 @@ func TestLagReportBatches(t *testing.T) {
 	api := newTestLagApi(t)
 	lifecycle := newTestLagLifecycle(t, api, clock, nil, nil)
 
+	// The queue can wake for any of the reports and start a flush wait each
+	// time, so how many waits it starts before the full batch goes depends on
+	// how its loop and the submits interleave. The batch's post is answered
+	// once every report is in, passing over those waits: the next wait is the
+	// one the rest wait on. The clock moves only once the queue has started
+	// it, or the wait would count from the moved clock and never come due.
+	submitted := make(chan struct{})
+	api.setBeforeReportAnswer(func() {
+		<-submitted
+		clock.skipWaits()
+	})
 	reports := []*protocol.LagReport{}
 	for i := range 40 {
 		report := testLagReport(i)
 		reports = append(reports, report)
 		lifecycle.Submit(report)
 	}
+	close(submitted)
 	expectTestLagReports(t, api.waitPost(), reports[0:32])
+	api.setBeforeReportAnswer(nil)
 	// the clock has not moved, so the rest waits for its flush
+	if wait := clock.nextWait(t); wait != 10*time.Second {
+		t.Fatalf("flush wait = %s, expected the flush timeout", wait)
+	}
 	api.expectQuiet()
 	clock.advance(10 * time.Second)
 	expectTestLagReports(t, api.waitPost(), reports[32:40])
