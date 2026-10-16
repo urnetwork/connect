@@ -6716,6 +6716,10 @@ type SendSequence struct {
 	// channel with no send loop to publish anything, refused every retry. A
 	// gate that nothing has published must fail open.
 	resendCapacityUnavailable resendCapacityGate
+	// A producer waiting outside Pack admission is still a real retention
+	// owner. Its arrival or departure wakes the loop to join or leave the
+	// shared budget's line without giving idle sequences a speculative turn.
+	retainedAdmissionWake chan struct{}
 	// Prepared provider returns have already paid memory admission. They must
 	// still wait for the same protocol window / reliable-flight capacity.
 	preparedFlightUnavailable resendCapacityGate
@@ -7016,6 +7020,7 @@ func newSendSequenceWithLogicalLane(
 	}
 	if sendBufferSettings.ResendQueueRetainedByteAccounting {
 		seq.resendQueue.setLifetimeBudget()
+		seq.retainedAdmissionWake = make(chan struct{}, 1)
 	}
 	// Never encrypt control-plane traffic. A SendSequence's data source is
 	// always this client (sourceId == client.ClientId()) and its destination
@@ -7167,6 +7172,10 @@ func (self *SendSequence) awaitResendCapacity(
 	}
 	startTime := time.Now()
 	if waiter := gate.queue(); waiter != nil {
+		if gate == &self.resendCapacityUnavailable {
+			self.notifyRetainedAdmissionDemand()
+			defer self.notifyRetainedAdmissionDemand()
+		}
 		var timeoutChannel <-chan time.Time
 		if 0 < timeout {
 			timer := time.NewTimer(timeout)
@@ -7193,6 +7202,13 @@ func (self *SendSequence) awaitResendCapacity(
 		timeout = max(time.Duration(0), timeout-time.Since(startTime))
 	}
 	return true, nil, timeout
+}
+
+func (self *SendSequence) notifyRetainedAdmissionDemand() {
+	select {
+	case self.retainedAdmissionWake <- struct{}{}:
+	default:
+	}
 }
 
 // Compatibility cadence for external zero-timeout retry callers. The internal
@@ -9616,31 +9632,40 @@ sendSequenceLoop:
 		}
 		if budget := self.resendQueue.budget; self.resendQueue.lifetimeBudget && budget != nil {
 			blocked := !resendCapacity || scheduler.Len() > 0
-			memoryShort := false
-			if head := scheduler.FifoHead(); blocked && head != nil && !self.noAckPackCanBypassRecoveryAdmission(head) {
+			producerWaiting := self.resendCapacityUnavailable.waiterCount.Load() != 0
+			head := scheduler.FifoHead()
+			need := ByteCount(0)
+			if blocked && head != nil && !self.noAckPackCanBypassRecoveryAdmission(head) {
 				// Only an actual retention owner takes a place in the line.
 				// Idle loops still watch capacity below to reopen producer
 				// admission, but must not reserve bytes ahead of live writers.
-				need := max(minimumRetainedByteCount,
+				need = max(minimumRetainedByteCount,
 					self.retainedSendPackByteCount(head)-head.preparedMemoryBytes(budget))
-				memoryShort = budget.Available()+self.resendMemoryGrant < need
-				if memoryShort && memoryWaiter == nil {
-					// Retained bytes hold this loop: wait in the budget's line,
-					// where a release reserves them for the oldest waiter it fits
-					// before its releaser or anyone woken can take them back.
-					if 0 < self.resendMemoryGrant {
-						budget.Release(self.resendMemoryGrant)
-						self.resendMemoryGrant = 0
-					}
-					reserved, waiter := budget.tryReserveOrQueue(need)
-					if reserved {
-						self.resendMemoryGrant = need
-						continue sendSequenceLoop
-					}
-					memoryWaiter = waiter
-				}
+			} else if producerWaiting && preparedFlightAvailable {
+				// Reliable producers wait before scheduler admission. Let their
+				// first real Pack reopen that gate in FIFO budget order; watching
+				// only the scheduler strands a newly active sequence behind
+				// siblings whose backlogs recirculate every released byte.
+				need = minimumRetainedByteCount
 			}
-			if !memoryShort {
+			memoryShort := 0 < need && budget.Available()+self.resendMemoryGrant < need
+			if memoryShort && memoryWaiter == nil {
+				// Retained bytes hold this loop: wait in the budget's line,
+				// where a release reserves them for the oldest waiter it fits
+				// before its releaser or anyone woken can take them back.
+				if 0 < self.resendMemoryGrant {
+					budget.Release(self.resendMemoryGrant)
+					self.resendMemoryGrant = 0
+				}
+				reserved, waiter := budget.tryReserveOrQueue(need)
+				if reserved {
+					self.resendMemoryGrant = need
+					continue sendSequenceLoop
+				}
+				memoryWaiter = waiter
+			}
+			keepProducerTurn := producerWaiting && head == nil && preparedFlightAvailable && !flightBlocked
+			if !memoryShort && !keepProducerTurn {
 				// Something else holds this loop, or nothing does. A turn it
 				// cannot use passes on now instead of idling here.
 				if memoryWaiter != nil {
@@ -9711,6 +9736,7 @@ sendSequenceLoop:
 		case <-self.noAckFastPathSettled:
 		case <-self.preparedHandoffWake:
 			drainPreparedCancellation = true
+		case <-self.retainedAdmissionWake:
 		case <-memoryCapacityNotify:
 		case <-memoryWaiterReady:
 		case <-flightPolicy.notify:

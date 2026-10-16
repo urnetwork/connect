@@ -5,6 +5,7 @@
 package connect
 
 import (
+	"context"
 	"runtime"
 	"testing"
 	"testing/synctest"
@@ -290,4 +291,135 @@ func TestSendSequenceHeldByItsWindowPassesItsLifetimeBudgetTurnOn(t *testing.T) 
 		}
 		fixture.close()
 	})
+}
+
+// A reliable producer arriving after the shared budget fills waits before
+// scheduler admission. It must join the same FIFO line as already queued Packs;
+// otherwise its siblings recirculate every release and it never gets admitted.
+func TestLateReliableProducerJoinsLifetimeBudgetLine(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	MessagePoolReturn(MessagePoolGet(1))
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newLifetimeBudgetSendFixture(t, 2, 16, nil)
+		settings := DefaultSendBufferSettings()
+		settings.ResendQueueBudget = fixture.budget
+		settings.ResendQueueRetainedByteAccounting = true
+		sequence := NewSendSequence(fixture.round.ctx, fixture.round.sender, fixture.round.sender.sendBuffer,
+			fixture.round.receiver.ClientId(), MultiHopId{}, false, false, false,
+			sequenceTlsRoleClient, false, settings)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			sequence.Run()
+		}()
+		fixture.sequences = append(fixture.sequences, sequence)
+		fixture.dones = append(fixture.dones, done)
+		fixture.indexes[sequence.sequenceId] = 2
+		synctest.Wait()
+
+		frame := budgetTestFrame(800)
+		pack := &SendPack{
+			TransferOptions: TransferOptions{Ack: true},
+			Frame:           frame, Ctx: fixture.round.ctx,
+			Destination:      fixture.round.receiver.ClientId(),
+			MessageByteCount: ByteCount(len(frame.MessageBytes)),
+		}
+		producerDone := make(chan struct{})
+		go func() {
+			defer close(producerDone)
+			if admitted, _ := sequence.Pack(pack, -1); !admitted {
+				pack.returnFrames()
+			}
+		}()
+		synctest.Wait()
+		if sequence.resendCapacityUnavailable.waiterCount.Load() != 1 {
+			t.Error("late producer did not reach the closed reliable admission gate")
+		}
+		wrote := false
+		for range 6 {
+			for _, writer := range fixture.acknowledge(-1) {
+				wrote = wrote || writer == 2
+			}
+		}
+		fixture.close()
+		<-producerDone
+		if !wrote {
+			t.Errorf("late reliable producer never joined the shared budget line: writers %v", fixture.writers)
+		}
+	})
+}
+
+// A producer's cancellation removes its real demand, including a turn already
+// awarded by the shared budget but not yet used for scheduler admission.
+func TestCanceledReliableProducerReturnsItsLifetimeBudgetTurn(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	MessagePoolReturn(MessagePoolGet(1))
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	for _, awarded := range []bool{false, true} {
+		name := "waiting"
+		if awarded {
+			name = "awarded"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				fixture := newWindowRoundFixture(t, nil, nil)
+				budget := NewTransferMemoryBudget(kib(64))
+				if !budget.TryReserve(budget.TotalByteCount()) {
+					t.Fatal("fixture could not fill the shared budget")
+				}
+				settings := DefaultSendBufferSettings()
+				settings.ResendQueueBudget = budget
+				settings.ResendQueueRetainedByteAccounting = true
+				sequence := NewSendSequence(fixture.ctx, fixture.sender, fixture.sender.sendBuffer,
+					fixture.receiver.ClientId(), MultiHopId{}, false, false, false,
+					sequenceTlsRoleClient, false, settings)
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					sequence.Run()
+				}()
+				synctest.Wait()
+
+				ctx, cancel := context.WithCancel(fixture.ctx)
+				frame := budgetTestFrame(800)
+				pack := &SendPack{
+					TransferOptions: TransferOptions{Ack: true},
+					Frame:           frame, Ctx: ctx,
+					Destination:      fixture.receiver.ClientId(),
+					MessageByteCount: ByteCount(len(frame.MessageBytes)),
+				}
+				producerDone := make(chan struct{})
+				go func() {
+					defer close(producerDone)
+					if admitted, _ := sequence.Pack(pack, -1); !admitted {
+						pack.returnFrames()
+					}
+				}()
+				synctest.Wait()
+				if count := len(budget.reserveWaiters); count != 1 {
+					t.Errorf("blocked producer owns %d budget waiters, want 1", count)
+				}
+				if awarded {
+					budget.Release(budget.TotalByteCount())
+				}
+				cancel()
+				<-producerDone
+				synctest.Wait()
+				if !awarded {
+					budget.Release(budget.TotalByteCount())
+					synctest.Wait()
+				}
+				if available := budget.Available(); available != budget.TotalByteCount() {
+					t.Errorf("canceled producer left %d bytes unavailable", budget.TotalByteCount()-available)
+				}
+				if count := len(budget.reserveWaiters); count != 0 {
+					t.Errorf("canceled producer left %d budget waiters", count)
+				}
+				sequence.Close()
+				<-done
+				assertRetainedBudgetBalance(t, budget)
+			})
+		})
+	}
 }
