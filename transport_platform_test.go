@@ -31,6 +31,8 @@ type closeInterruptWriteConn struct {
 
 	writeStarted chan struct{}
 	closed       chan struct{}
+	// reads in progress, so a test can wait until the reader is parked in one
+	readingCount *MonitorValue[int]
 }
 
 func newCloseInterruptWriteConn(conn net.Conn) *closeInterruptWriteConn {
@@ -38,7 +40,14 @@ func newCloseInterruptWriteConn(conn net.Conn) *closeInterruptWriteConn {
 		Conn:         conn,
 		writeStarted: make(chan struct{}),
 		closed:       make(chan struct{}),
+		readingCount: NewMonitorValue(0),
 	}
+}
+
+func (self *closeInterruptWriteConn) Read(buffer []byte) (int, error) {
+	self.readingCount.Update(func(readingCount int) int { return readingCount + 1 })
+	defer self.readingCount.Update(func(readingCount int) int { return readingCount - 1 })
+	return self.Conn.Read(buffer)
 }
 
 func (self *closeInterruptWriteConn) Write(buffer []byte) (int, error) {
@@ -100,25 +109,74 @@ func newTestingPlatformServer(t *testing.T) *testingPlatformServer {
 // family under test, so the transport dials it over that family.
 func newTestingPlatformServerIpVersion(t *testing.T, ipVersion int) *testingPlatformServer {
 	t.Helper()
+	return newTestingPlatformServerWithUpgradeHold(t, ipVersion, nil)
+}
+
+// One upgrade request that a holding platform parked before upgrading it.
+// Closing release lets it upgrade; counted closes once the platform has
+// counted the upgrade, or has failed to upgrade.
+type testingPlatformUpgrade struct {
+	release chan struct{}
+	counted chan struct{}
+}
+
+// A testing platform that parks every upgrade request on the returned channel
+// until the test releases it, so a test can order the upgrades of the dialers
+// a fresh dial races. Cleanup releases whatever is still parked.
+func newTestingPlatformServerHoldingUpgrades(t *testing.T, ipVersion int) (*testingPlatformServer, <-chan *testingPlatformUpgrade) {
+	t.Helper()
+	held := make(chan *testingPlatformUpgrade, 16)
+	return newTestingPlatformServerWithUpgradeHold(t, ipVersion, held), held
+}
+
+// A nil held upgrades every request at once.
+func newTestingPlatformServerWithUpgradeHold(t *testing.T, ipVersion int, held chan *testingPlatformUpgrade) *testingPlatformServer {
+	t.Helper()
 	platform := &testingPlatformServer{}
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
+	closing := make(chan struct{})
 	platform.server = newTestingLoopbackHttpServer(t, ipVersion, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if platform.rejecting.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
+		var counted chan struct{}
+		if held != nil {
+			upgrade := &testingPlatformUpgrade{
+				release: make(chan struct{}),
+				counted: make(chan struct{}),
+			}
+			counted = upgrade.counted
+			select {
+			case held <- upgrade:
+			case <-closing:
+				close(counted)
+				return
+			}
+			select {
+			case <-upgrade.release:
+			case <-closing:
+				close(counted)
+				return
+			}
+		}
 		ws, err := upgrader.Upgrade(w, r, nil)
+		if err == nil {
+			platform.connectCount.Add(1)
+			func() {
+				platform.stateLock.Lock()
+				defer platform.stateLock.Unlock()
+				platform.conns = append(platform.conns, ws)
+			}()
+		}
+		if counted != nil {
+			close(counted)
+		}
 		if err != nil {
 			return
 		}
-		platform.connectCount.Add(1)
-		func() {
-			platform.stateLock.Lock()
-			defer platform.stateLock.Unlock()
-			platform.conns = append(platform.conns, ws)
-		}()
 		// hold the connection open, discarding whatever the client sends
 		// (including its keepalive pings, which the client writes directly and
 		// never counts). send nothing back
@@ -137,8 +195,10 @@ func newTestingPlatformServerIpVersion(t *testing.T, ipVersion int) *testingPlat
 	}), false)
 	platform.url = "ws" + strings.TrimPrefix(platform.server.URL, "http")
 	t.Cleanup(func() {
-		// close the live connections first so the handlers return; httptest
-		// Close blocks until every outstanding request completes
+		// release parked upgrades and close the live connections first so the
+		// handlers return; httptest Close blocks until every outstanding
+		// request completes
+		close(closing)
 		platform.closeConns()
 		platform.server.Close()
 	})
@@ -216,6 +276,58 @@ func testingWaitForActiveMode(transport *PlatformTransport, want TransportMode, 
 		mode, _ := transport.activeMode()
 		return mode == want
 	})
+}
+
+// How many connections a transport has registered and removed, by the
+// lifecycle of its send route.
+type testingTransportConnectionCounts struct {
+	connected    int
+	disconnected int
+}
+
+// Counts a transport's own connections. It must wrap settings before the
+// transport is constructed. The platform's upgrade count is not this count: a
+// fresh dial races one upgrade per parallel strategy dialer and the transport
+// keeps only the winner, so a discarded racer can reach the platform after the
+// transport is connected.
+func observeTestingTransportConnections(settings *PlatformTransportSettings) *MonitorValue[testingTransportConnectionCounts] {
+	connections := NewMonitorValue(testingTransportConnectionCounts{})
+	observer := settings.SendRouteObserver
+	settings.SendRouteObserver = func(transport Transport, route Route, connected bool) {
+		if observer != nil {
+			observer(transport, route, connected)
+		}
+		connections.Update(func(counts testingTransportConnectionCounts) testingTransportConnectionCounts {
+			if connected {
+				counts.connected += 1
+			} else {
+				counts.disconnected += 1
+			}
+			return counts
+		})
+	}
+	return connections
+}
+
+// Waits until done holds for the counts, or the timeout passes, and returns
+// the last counts it read.
+func waitTestingTransportConnections(
+	connections *MonitorValue[testingTransportConnectionCounts],
+	timeout time.Duration,
+	done func(testingTransportConnectionCounts) bool,
+) (testingTransportConnectionCounts, bool) {
+	deadline := time.After(timeout)
+	for {
+		counts, notify := connections.Get()
+		if done(counts) {
+			return counts, true
+		}
+		select {
+		case <-notify:
+		case <-deadline:
+			return counts, false
+		}
+	}
 }
 
 // TestPlatformTransportConnectsAndElects drives the real transport against a real
@@ -475,15 +587,15 @@ func TestPlatformTransportH1RejectsOversizedWebSocketMessage(t *testing.T) {
 		platform := newTestingPlatformServerIpVersion(t, ipVersion)
 		settings := testingPlatformTransportSettings()
 		settings.H1MaxMessageByteCount = 64
+		connections := observeTestingTransportConnections(settings)
 		transport := testingPlatformTransport(t, ctx, platform.url, settings)
 		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
 			t.Fatal("the H1 transport was never elected")
 		}
-		connectCount := platform.connectCount.Load()
 		platform.sendBinary(make([]byte, settings.H1MaxMessageByteCount+1))
-		if !waitForCondition(15*time.Second, func() bool {
-			return connectCount < platform.connectCount.Load()
-		}) {
+		if _, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
+			return 1 <= counts.disconnected && 2 <= counts.connected
+		}); !ok {
 			t.Fatal("oversized WebSocket message did not close and replace the H1 connection")
 		}
 	})
@@ -503,11 +615,11 @@ func TestPlatformTransportInactiveDrainIgnoresH1ControlTraffic(t *testing.T) {
 		settings.InactiveDrainTimeout = 80 * time.Millisecond
 		settings.InactiveDrainMaxTimeout = 2 * time.Second
 		settings.PingTimeout = 10 * time.Millisecond
+		connections := observeTestingTransportConnections(settings)
 		transport := testingPlatformTransport(t, ctx, platform.url, settings)
 		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
 			t.Fatal("the H1 transport was never elected")
 		}
-		connectCount := platform.connectCount.Load()
 
 		// Empty inbound messages and the transport's frequent outbound keepalives
 		// are control traffic. Neither may extend the payload-only quiet drain once
@@ -532,9 +644,9 @@ func TestPlatformTransportInactiveDrainIgnoresH1ControlTraffic(t *testing.T) {
 			}
 		}()
 		transport.setActiveMode(TransportModeH3)
-		if !waitForCondition(750*time.Millisecond, func() bool {
-			return connectCount < platform.connectCount.Load()
-		}) {
+		if _, ok := waitTestingTransportConnections(connections, 750*time.Millisecond, func(counts testingTransportConnectionCounts) bool {
+			return 1 <= counts.disconnected
+		}); !ok {
 			t.Fatal("H1 control traffic prevented the superseded carrier from draining")
 		}
 	})
@@ -558,40 +670,102 @@ func TestPlatformTransportInactiveDrainIgnoresH1ControlTraffic(t *testing.T) {
 // inactive at all — so it could never shed a transport superseded by a better
 // mode, which is its actual purpose and which matters the moment h3 is re-enabled.
 //
-// This test shortens InactiveDrainTimeout well below ReadTimeout precisely to
-// isolate the watchdog from the read deadline, so it observes the drain decision
-// on its own rather than whichever timer happens to fire first.
+// The evidence is the watchdog's decision, not idle time: the test waits until
+// the kept connection's watchdog reads the elected mode and parks on its benign
+// branch, which only a mode change wakes. Connections are counted from the
+// transport's own send route, not from platform upgrades: a fresh dial races
+// one upgrade per parallel strategy dialer and keeps only the winner, so a
+// discarded racer can reach the platform while the kept connection idles,
+// which an upgrade count reads as a reconnect. The platform parks every racer
+// and releases the losers after the decision, so each run includes that
+// ordering.
 func TestPlatformTransportActiveModeIsNotDrained(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		platform, upgrades := newTestingPlatformServerHoldingUpgrades(t, ipVersion)
 		settings := testingPlatformTransportSettings()
+		connections := observeTestingTransportConnections(settings)
+		type drainDecision struct {
+			activeMode TransportMode
+			superseded bool
+		}
+		decisions := make(chan drainDecision, 64)
+		settings.inactiveDrainDecisionForTest = func(mode TransportMode, activeMode TransportMode, superseded bool) {
+			select {
+			case decisions <- drainDecision{activeMode: activeMode, superseded: superseded}:
+			default:
+			}
+		}
 		transport := testingPlatformTransport(t, ctx, platform.url, settings)
 
-		// wait for the connection, deliberately NOT for the election: the drain is a
-		// property of the live socket, so this measures the production symptom (a
-		// transport tearing its own connection down while idle) rather than depending
-		// on how the elected mode is published
-		if !waitForCondition(15*time.Second, func() bool {
-			return 0 < platform.connectCount.Load()
-		}) {
-			t.Fatal("the transport never connected to the platform")
-		}
-		connectCount := platform.connectCount.Load()
-
-		// idle well past the drain timeout. a transport that believes it is inactive
-		// cancels its own connection here, and reconnects, over and over
-		select {
-		case <-time.After(5 * settings.InactiveDrainTimeout):
+		// none of the racers can win while every upgrade is parked, so all of
+		// them reach the platform
+		webSocketDialerWeights, _, _ := transport.clientStrategy.dialerWeightsSnapshot(true)
+		racerCount := min(len(webSocketDialerWeights), transport.clientStrategy.settings.ParallelBlockSize)
+		racers := []*testingPlatformUpgrade{}
+		for len(racers) < racerCount {
+			select {
+			case upgrade := <-upgrades:
+				racers = append(racers, upgrade)
+			case <-time.After(15 * time.Second):
+				t.Fatalf("%d of the %d racing upgrades of a fresh dial reached the platform", len(racers), racerCount)
+			}
 		}
 
-		if reconnects := platform.connectCount.Load() - connectCount; 0 < reconnects {
-			t.Fatalf(
-				"the transport reconnected %d times while idle: it drained itself, believing it was not the active mode",
-				reconnects,
-			)
+		// one racer wins, and the transport keeps its connection
+		close(racers[0].release)
+		if counts, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
+			return 1 <= counts.connected
+		}); !ok {
+			t.Fatalf("the transport never kept a connection: %+v", counts)
+		}
+
+		// the kept connection's watchdog reads the elected mode and parks
+		for elected := false; !elected; {
+			select {
+			case decision := <-decisions:
+				if decision.superseded {
+					t.Fatalf("the watchdog armed its drain against the active h1 carrier, reading active mode %q", decision.activeMode)
+				}
+				elected = decision.activeMode == TransportModeH1
+			case <-time.After(15 * time.Second):
+				t.Fatal("the watchdog never read the elected mode")
+			}
+		}
+
+		// the discarded racers upgrade only now, while the connection idles: the
+		// platform counts them and the transport must not
+		for _, racer := range racers[1:] {
+			close(racer.release)
+		}
+		// the winner too: the platform counts an upgrade after writing its
+		// response, so the transport can connect first
+		for _, racer := range racers {
+			select {
+			case <-racer.counted:
+			case <-time.After(15 * time.Second):
+				t.Fatal("a released racer never finished its upgrade")
+			}
+		}
+		if upgradeCount := platform.connectCount.Load(); upgradeCount != int64(racerCount) {
+			t.Fatalf("platform upgrades = %d, want the %d racers of one dial", upgradeCount, racerCount)
+		}
+		for pending := true; pending; {
+			select {
+			case decision := <-decisions:
+				if decision.superseded {
+					t.Fatalf("the watchdog armed its drain against the active h1 carrier, reading active mode %q", decision.activeMode)
+				}
+			default:
+				pending = false
+			}
+		}
+		// the watchdog never armed, so any other count means something else
+		// closed or replaced the connection
+		if counts := connections.Value(); counts.connected != 1 || counts.disconnected != 0 {
+			t.Fatalf("transport connections = %+v while idle, want its one connection kept", counts)
 		}
 		// it stayed up because it knows it is the active transport, so the watchdog
 		// sits on its benign branch instead of arming the kill timer
@@ -663,19 +837,26 @@ func TestNetworkChangeKicksPlatformTransport(t *testing.T) {
 		defer cancel()
 
 		platform := newTestingPlatformServerIpVersion(t, ipVersion)
-		transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
+		settings := testingPlatformTransportSettings()
+		connections := observeTestingTransportConnections(settings)
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
 
 		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
 			t.Fatal("the transport was never elected")
 		}
-		connectCount := platform.connectCount.Load()
+		// the connection watches for a kick before it registers its route
+		if _, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
+			return 1 <= counts.connected
+		}); !ok {
+			t.Fatal("the elected transport never registered its connection")
+		}
 
 		// the host reports a network path change
 		NetworkChanged()
 
-		if !waitForCondition(15*time.Second, func() bool {
-			return connectCount < platform.connectCount.Load()
-		}) {
+		if _, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
+			return 1 <= counts.disconnected && 2 <= counts.connected
+		}); !ok {
 			t.Fatal("the transport did not re-dial after a network change")
 		}
 		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
@@ -702,6 +883,7 @@ func TestKickSkipsDialFailureBackoff(t *testing.T) {
 		settings := testingPlatformTransportSettings()
 		// make the backoff long enough that only a kick can plausibly beat it
 		settings.ReconnectTimeout = 60 * time.Second
+		connections := observeTestingTransportConnections(settings)
 		transport := testingPlatformTransport(t, ctx, platform.url, settings)
 		defer transport.Close()
 
@@ -722,7 +904,7 @@ func TestKickSkipsDialFailureBackoff(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 
 		platform.rejecting.Store(false)
-		connectCount := platform.connectCount.Load()
+		connectedCount := connections.Value().connected
 		// kick periodically rather than once: a kick that lands while the failing
 		// dial is still in flight is deliberately dropped (the backoff select arms
 		// a fresh notify channel), and re-kicking is exactly what a host emitting
@@ -731,9 +913,9 @@ func TestKickSkipsDialFailureBackoff(t *testing.T) {
 		kicked := false
 		for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
 			transport.Kick()
-			if waitForCondition(250*time.Millisecond, func() bool {
-				return connectCount < platform.connectCount.Load()
-			}) {
+			if _, ok := waitTestingTransportConnections(connections, 250*time.Millisecond, func(counts testingTransportConnectionCounts) bool {
+				return connectedCount < counts.connected
+			}); ok {
 				kicked = true
 				break
 			}
@@ -760,19 +942,26 @@ func TestPlatformTransportNetworkChangeKick(t *testing.T) {
 		defer cancel()
 
 		platform := newTestingPlatformServerIpVersion(t, ipVersion)
-		transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
+		settings := testingPlatformTransportSettings()
+		connections := observeTestingTransportConnections(settings)
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
 
 		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
 			t.Fatal("the transport was never elected")
 		}
-		connectCount := platform.connectCount.Load()
+		// the connection watches for a kick before it registers its route
+		if _, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
+			return 1 <= counts.connected
+		}); !ok {
+			t.Fatal("the elected transport never registered its connection")
+		}
 
 		// the host reports a network path change
 		NetworkChanged()
 
-		if !waitForCondition(15*time.Second, func() bool {
-			return connectCount < platform.connectCount.Load()
-		}) {
+		if _, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
+			return 1 <= counts.disconnected && 2 <= counts.connected
+		}); !ok {
 			t.Fatal("the transport did not re-dial after a network change")
 		}
 		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
@@ -793,19 +982,20 @@ func TestPlatformTransportReconnects(t *testing.T) {
 		defer cancel()
 
 		platform := newTestingPlatformServerIpVersion(t, ipVersion)
-		transport := testingPlatformTransport(t, ctx, platform.url, testingPlatformTransportSettings())
+		settings := testingPlatformTransportSettings()
+		connections := observeTestingTransportConnections(settings)
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
 
 		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
 			t.Fatal("the transport was never elected")
 		}
-		connectCount := platform.connectCount.Load()
 
 		// drop the live connection, leaving the platform accepting
 		platform.closeConns()
 
-		if !waitForCondition(15*time.Second, func() bool {
-			return connectCount < platform.connectCount.Load()
-		}) {
+		if _, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
+			return 1 <= counts.disconnected && 2 <= counts.connected
+		}); !ok {
 			t.Fatal("the transport did not reconnect after the platform dropped it")
 		}
 		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
@@ -1026,6 +1216,21 @@ func TestPlatformTransportCloseAndWaitJoinsRouteWriterAndReceiveCleanup(t *testi
 		case <-testCtx.Done():
 			t.Fatalf("wait for blocked close-and-wait writer: %v", testCtx.Err())
 		case <-blocking.writeStarted:
+		}
+		// the receive worker must be parked in its socket read, which only the
+		// socket close wakes. The transport is connected before the worker
+		// first reads, and a worker that has not parked sees the canceled
+		// transport at its loop top and cleans up with no socket close
+		for {
+			readingCount, notify := blocking.readingCount.Get()
+			if 0 < readingCount {
+				break
+			}
+			select {
+			case <-testCtx.Done():
+				t.Fatalf("wait for the receive worker to park in its read: %v", testCtx.Err())
+			case <-notify:
+			}
 		}
 
 		teardownArmed.Store(true)
