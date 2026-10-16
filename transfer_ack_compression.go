@@ -21,6 +21,8 @@ type sequenceAckWindowSnapshot struct {
 // takeResponse emits at most one head followed by a bounded oldest-first SACK
 // prefix strictly above it; overflow remains available for the next response.
 // All methods are safe for concurrent use; there is one draining consumer.
+// That consumer can drain between any two updates, so progress that became
+// delivered at one instant is published by one UpdateDeliveredPrefix.
 type sequenceAckWindow struct {
 	// There is exactly one draining consumer per sequence. A
 	// capacity-one signal coalesces any number of updates while that consumer
@@ -49,6 +51,9 @@ type sequenceAckWindow struct {
 	// selective acks outstanding above it, whether or not they were already
 	// written, so the next head advance is a hole filling
 	gapSelectiveMax uint64
+	// Nil by default. Runs after Update and UpdateDeliveredPrefix leave
+	// ackLock, the edges where the draining consumer may take a response.
+	afterUpdateForTest func()
 }
 
 func newSequenceAckWindow() *sequenceAckWindow {
@@ -160,22 +165,39 @@ func (self *sequenceAckWindow) updateContractMissingWithLock(ack sequenceAck) {
 
 // Adds feedback without delivery credit, including retransmitted heads and SACKs.
 func (self *sequenceAckWindow) Update(ack sequenceAck) {
-	self.update(ack, 0)
+	func() {
+		self.ackLock.Lock()
+		defer self.ackLock.Unlock()
+		self.updateWithLock(ack, 0)
+	}()
+	if self.afterUpdateForTest != nil {
+		self.afterUpdateForTest()
+	}
+}
+
+// Publishes first deliveries that became cumulative progress at one instant:
+// one callback's batch, or a receipt run secured by one completion. apply runs
+// with ackLock held and may only call updateDeliveredWithLock, once per
+// delivery in sequence order. The draining consumer takes none or all of the
+// prefix. Between separate updates it could write a stale intermediate head,
+// and that write would start the compression interval the last head waits out.
+func (self *sequenceAckWindow) UpdateDeliveredPrefix(apply func()) {
+	func() {
+		self.ackLock.Lock()
+		defer self.ackLock.Unlock()
+		apply()
+	}()
+	if self.afterUpdateForTest != nil {
+		self.afterUpdateForTest()
+	}
 }
 
 // First delivery can earn bounded early-head credit on H1. The count is
 // consumed here rather than retained in every ACK record or selective entry.
-func (self *sequenceAckWindow) UpdateDelivered(ack sequenceAck, deliveredByteCount ByteCount) {
+func (self *sequenceAckWindow) updateDeliveredWithLock(ack sequenceAck, deliveredByteCount ByteCount) {
 	if ack.transportType != TransportTypeH1 {
 		deliveredByteCount = 0
 	}
-	self.update(ack, deliveredByteCount)
-}
-
-// Serializes feedback and first-delivery credit under the compressor's lock.
-func (self *sequenceAckWindow) update(ack sequenceAck, deliveredByteCount ByteCount) {
-	self.ackLock.Lock()
-	defer self.ackLock.Unlock()
 	self.updateWithLock(ack, deliveredByteCount)
 }
 

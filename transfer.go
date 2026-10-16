@@ -13710,6 +13710,10 @@ type ReceiveBufferSettings struct {
 	afterIdleCloseForTest func(receiveSequenceId, bool)
 	// Nil by default. Exposes the fixed handoff census without changing admission.
 	afterGapHandoffSnapshotForTest func(receiveSequenceId, int)
+	// Nil by default. Runs on the updating goroutine after each ACK window
+	// Update or UpdateDeliveredPrefix, the edges where the ACK worker may
+	// drain the window.
+	afterAckWindowUpdateForTest func(receiveSequenceId)
 }
 
 func (self *ReceiveBufferSettings) packHandoffTimeout(
@@ -14606,6 +14610,10 @@ func newReceiveSequenceWithLogicalLaneBudget(
 	}
 	if receiveBufferSettings.ReceiveQueueRetainedByteAccounting {
 		seq.receiveQueue.setLifetimeBudget()
+	}
+	if afterUpdate := receiveBufferSettings.afterAckWindowUpdateForTest; afterUpdate != nil {
+		id := seq.id()
+		seq.ackWindow.afterUpdateForTest = func() { afterUpdate(id) }
 	}
 	// Never encrypt control-plane traffic. A ReceiveSequence's data source is
 	// the peer (source.SourceId) and its destination is always this client
@@ -16329,8 +16337,9 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 }
 
 // flushDeliver dispatches the buffered head items' app frames in one receive
-// callback, then sends their acks (deliver-before-ack, as the per-item path
-// did) and returns their pool buffers. The batch is taken out of the sequence
+// callback, then publishes their acks in one compressor update
+// (deliver-before-ack, as the per-item path did) and returns their pool
+// buffers. The batch is taken out of the sequence
 // fields BEFORE the callback runs. Client.receive isolates each registered
 // application callback panic; this guard covers a failure in that internal
 // dispatcher itself. Such a failure loses the un-acked batch so the sender can
@@ -16379,8 +16388,8 @@ func (self *ReceiveSequence) flushDeliver() {
 		)
 	}
 	endTransferProgress(progressObserver, progress, "deliver_end", true, nil)
-	for _, item := range items {
-		if ackLineageTraceEnabled && progressObserver != nil {
+	if ackLineageTraceEnabled && progressObserver != nil {
+		for _, item := range items {
 			// Batch events name only the first item. Preserve each identity
 			// after callback return, before cumulative ACK compression.
 			beginTransferProgress(progressObserver, TransferProgressEvent{
@@ -16389,18 +16398,28 @@ func (self *ReceiveSequence) flushDeliver() {
 				NoAck: !item.ack, TransportType: item.transportType, ByteCount: int(item.messageByteCount), Success: true,
 			}, nil)
 		}
-		if item.ack {
-			self.ackWindow.UpdateDelivered(sequenceAck{
-				receivedAtNanos:                  item.receivedAtNanos,
-				sequenceNumber:                   item.sequenceNumber,
-				messageId:                        item.messageId,
-				tag:                              item.tag,
-				compactContractRecoverySupported: true,
-				unwrapped:                        item.unwrapped,
-				transportType:                    item.transportType,
-			}, item.messageByteCount)
-		}
 	}
+	if !slices.ContainsFunc(items, func(item *receiveItem) bool { return item.ack }) {
+		return
+	}
+	// The callback delivered the whole batch. The ACK worker drains
+	// concurrently, so publish it at once: a hole filled by this batch is
+	// acknowledged at its last item, never by a stale intermediate head.
+	self.ackWindow.UpdateDeliveredPrefix(func() {
+		for _, item := range items {
+			if item.ack {
+				self.ackWindow.updateDeliveredWithLock(sequenceAck{
+					receivedAtNanos:                  item.receivedAtNanos,
+					sequenceNumber:                   item.sequenceNumber,
+					messageId:                        item.messageId,
+					tag:                              item.tag,
+					compactContractRecoverySupported: true,
+					unwrapped:                        item.unwrapped,
+					transportType:                    item.transportType,
+				}, item.messageByteCount)
+			}
+		}
+	})
 }
 
 // deliverEncryptedControlFrames splits an incoming Pack's frames: any
