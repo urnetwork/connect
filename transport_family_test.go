@@ -104,6 +104,10 @@ type testingFamilyPlatformServer struct {
 
 	stateLock sync.Mutex
 	conns     []*websocket.Conn
+	// upgrades by the instance id header of the dialing transport. A fresh
+	// dial races several upgrades, so connectCount moves for discarded racers
+	// too, possibly after the transport has connected.
+	instanceIdConnectCounts map[string]int
 }
 
 func newTestingFamilyPlatformServer(t *testing.T, ipVersion int, echoAuth bool) *testingFamilyPlatformServer {
@@ -114,8 +118,9 @@ func newTestingFamilyPlatformServer(t *testing.T, ipVersion int, echoAuth bool) 
 func newTestingFamilyPlatformServerOnPort(t *testing.T, ipVersion int, port int, echoAuth bool) *testingFamilyPlatformServer {
 	t.Helper()
 	platform := &testingFamilyPlatformServer{
-		connections: make(chan testingFamilyConnection, 16),
-		echoAuth:    echoAuth,
+		connections:             make(chan testingFamilyConnection, 16),
+		echoAuth:                echoAuth,
+		instanceIdConnectCounts: map[string]int{},
 	}
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
@@ -135,6 +140,7 @@ func newTestingFamilyPlatformServerOnPort(t *testing.T, ipVersion int, port int,
 			platform.stateLock.Lock()
 			defer platform.stateLock.Unlock()
 			platform.conns = append(platform.conns, ws)
+			platform.instanceIdConnectCounts[r.Header.Get("X-UR-InstanceId")] += 1
 		}()
 		remoteFamily := 0
 		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
@@ -182,6 +188,14 @@ func (self *testingFamilyPlatformServer) closeConns() {
 		ws.Close()
 	}
 	self.conns = nil
+}
+
+// How many upgrades reached the platform from the transport with this
+// instance id, racers included.
+func (self *testingFamilyPlatformServer) instanceConnectCount(instanceId Id) int {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.instanceIdConnectCounts[instanceId.String()]
 }
 
 // url is the ws url by NAME, so the transport's pin decides the family.
@@ -276,10 +290,12 @@ func TestFamilyPinnedTransportDialsOnlyItsFamilyAndDeclaresIt(t *testing.T) {
 		if ipVersion == 4 {
 			other = 6
 		}
-		otherPlatformCount := platform.connectCount.Load()
+		// counted by instance id: this pin's dial raced several upgrades, and a
+		// discarded racer can still reach the platform from here on
 		otherTransport := newTestingPinnedTransport(t, ctx, clientSettings, platform.dualStackURL(), other, testingFamilyTransportSettings())
+		otherInstanceId := otherTransport.authSnapshot().InstanceId
 		if waitForCondition(1500*time.Millisecond, func() bool {
-			return otherTransport.IsConnected() || otherPlatformCount < platform.connectCount.Load()
+			return otherTransport.IsConnected() || 0 < platform.instanceConnectCount(otherInstanceId)
 		}) {
 			t.Fatalf("an ipv%d pin reached an ipv%d-only platform", other, ipVersion)
 		}
@@ -471,6 +487,9 @@ func TestPlatformTransportSetEnabledParksAndResumes(t *testing.T) {
 	platform := newTestingFamilyPlatformServer(t, 4, false)
 	settings := testingFamilyTransportSettings()
 	settings.StartDisabled = true
+	// the transport's own connections: the first dial races several upgrades,
+	// and a discarded racer can reach the platform after the transport parks
+	connections := observeTestingTransportConnections(settings)
 	transport := testingPlatformTransport(t, ctx, platform.url(), settings)
 	if transport.State() != PlatformTransportStateDisabled {
 		t.Fatalf("state = %s, want disabled", transport.State())
@@ -481,23 +500,32 @@ func TestPlatformTransportSetEnabledParksAndResumes(t *testing.T) {
 	}
 
 	transport.SetEnabled(true)
-	receiveFamilyConnection(t, platform, 15*time.Second)
+	if counts, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
+		return 1 <= counts.connected
+	}); !ok {
+		t.Fatalf("an enabled transport never connected: %+v", counts)
+	}
 	if !waitForTransportState(transport, PlatformTransportStateConnected, 15*time.Second) {
 		t.Fatalf("state = %s, want connected", transport.State())
 	}
 
 	transport.SetEnabled(false)
-	if !waitForCondition(5*time.Second, func() bool { return !transport.IsConnected() }) {
-		t.Fatal("a disabled transport kept its connection")
+	if counts, ok := waitTestingTransportConnections(connections, 5*time.Second, func(counts testingTransportConnectionCounts) bool {
+		return 1 <= counts.disconnected
+	}); !ok || transport.IsConnected() {
+		t.Fatalf("a disabled transport kept its connection: %+v", counts)
 	}
-	connectCount := platform.connectCount.Load()
 	time.Sleep(300 * time.Millisecond)
-	if platform.connectCount.Load() != connectCount {
-		t.Fatal("a disabled transport re-dialed")
+	if counts := connections.Value(); counts.connected != 1 {
+		t.Fatalf("a disabled transport re-dialed: %+v", counts)
 	}
 
 	transport.SetEnabled(true)
-	receiveFamilyConnection(t, platform, 15*time.Second)
+	if counts, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
+		return 2 <= counts.connected
+	}); !ok {
+		t.Fatalf("a re-enabled transport never reconnected: %+v", counts)
+	}
 	if !waitForTransportState(transport, PlatformTransportStateConnected, 15*time.Second) {
 		t.Fatalf("state = %s after re-enable, want connected", transport.State())
 	}

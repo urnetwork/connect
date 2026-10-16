@@ -716,6 +716,10 @@ type PlatformTransportSettings struct {
 	// credential refusal hold, right before it waits, so a test can hold the
 	// exact point after which no dial with the refused credential can happen.
 	credentialRefusalHoldForTest func()
+	// Nil outside package tests. Called each time an inactive-drain watchdog
+	// reads the active mode, with whether that mode supersedes its carrier,
+	// before it waits. It runs on the watchdog and must not block.
+	inactiveDrainDecisionForTest func(mode TransportMode, activeMode TransportMode, superseded bool)
 	// The constrained mobile policy composes receive, send, socket, and queue
 	// ownership inside one carrier claim. H1 keeps its independent queue depth.
 	h3RetainedByteAccounting bool
@@ -2046,7 +2050,11 @@ func (self *PlatformTransport) runInactiveDrain(
 	var startWriteCount uint64
 	for {
 		activeMode, notify := self.activeMode()
-		if !self.isBetterMode(activeMode, mode) {
+		superseded := self.isBetterMode(activeMode, mode)
+		if self.settings.inactiveDrainDecisionForTest != nil {
+			self.settings.inactiveDrainDecisionForTest(mode, activeMode, superseded)
+		}
+		if !superseded {
 			supersededSince = time.Time{}
 			select {
 			case <-ctx.Done():
