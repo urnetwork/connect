@@ -31,6 +31,8 @@ type closeInterruptWriteConn struct {
 
 	writeStarted chan struct{}
 	closed       chan struct{}
+	// reads in progress, so a test can wait until the reader is parked in one
+	readingCount *MonitorValue[int]
 }
 
 func newCloseInterruptWriteConn(conn net.Conn) *closeInterruptWriteConn {
@@ -38,7 +40,14 @@ func newCloseInterruptWriteConn(conn net.Conn) *closeInterruptWriteConn {
 		Conn:         conn,
 		writeStarted: make(chan struct{}),
 		closed:       make(chan struct{}),
+		readingCount: NewMonitorValue(0),
 	}
+}
+
+func (self *closeInterruptWriteConn) Read(buffer []byte) (int, error) {
+	self.readingCount.Update(func(readingCount int) int { return readingCount + 1 })
+	defer self.readingCount.Update(func(readingCount int) int { return readingCount - 1 })
+	return self.Conn.Read(buffer)
 }
 
 func (self *closeInterruptWriteConn) Write(buffer []byte) (int, error) {
@@ -1207,6 +1216,21 @@ func TestPlatformTransportCloseAndWaitJoinsRouteWriterAndReceiveCleanup(t *testi
 		case <-testCtx.Done():
 			t.Fatalf("wait for blocked close-and-wait writer: %v", testCtx.Err())
 		case <-blocking.writeStarted:
+		}
+		// the receive worker must be parked in its socket read, which only the
+		// socket close wakes. The transport is connected before the worker
+		// first reads, and a worker that has not parked sees the canceled
+		// transport at its loop top and cleans up with no socket close
+		for {
+			readingCount, notify := blocking.readingCount.Get()
+			if 0 < readingCount {
+				break
+			}
+			select {
+			case <-testCtx.Done():
+				t.Fatalf("wait for the receive worker to park in its read: %v", testCtx.Err())
+			case <-notify:
+			}
 		}
 
 		teardownArmed.Store(true)
