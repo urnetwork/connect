@@ -1481,6 +1481,12 @@ func (self *PlatformTransport) resolveSingleControlUDPAddr(ctx context.Context, 
 // plain mode uses the socket as is.
 type h3PacketConnWrapper func(ctx context.Context, packetConn net.PacketConn) (net.PacketConn, error)
 
+// False only in this package's tests (transport_public_dns_pump_test.go).
+// DefaultDnsPumpHost, the production default pump host, is a real third-party
+// name, and no connect test may resolve or dial it. Production binaries never
+// change this.
+var dialPublicDnsPumpHost = true
+
 // h3CarrierDestination is the unresolved host and ports one H3 carrier sends
 // to, before any name resolution.
 //
@@ -1517,6 +1523,9 @@ func (self *PlatformTransport) h3CarrierDestination(
 		}
 		if pumpServerName == "" {
 			return "", nil, fmt.Errorf("H3 DNS pump host is empty")
+		}
+		if pumpServerName == DefaultDnsPumpHost && !dialPublicDnsPumpHost {
+			return "", nil, fmt.Errorf("package tests never dial the public H3 DNS pump host")
 		}
 		return pumpServerName, dnsPorts, nil
 	default:
