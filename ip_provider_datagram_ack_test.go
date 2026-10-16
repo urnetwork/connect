@@ -28,7 +28,7 @@ func TestProviderDatagramAckFirstWriteDoesNotReleaseFlightOrCapsule(t *testing.T
 	ack := &providerDatagramAck{credit: credit, wake: make(chan struct{}, 1)}
 	item := &sendItem{}
 	item.acks.add(sendAckRecord{target: ack})
-	if !item.reservePreparedMemory(budget, kib(12)) {
+	if !item.reservePreparedMemory(budget, kib(12), nil) {
 		t.Fatal("prepaid transfer")
 	}
 	ack.admitted()

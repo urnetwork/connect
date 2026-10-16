@@ -212,7 +212,10 @@ func (self *SendPack) preparedMemoryBytes(budget *TransferMemoryBudget) ByteCoun
 // Serialization is the sole consumer of this ACK set. Other sequences may
 // reserve or release from the same parent, so the entire move (including any
 // necessary growth) shares the budget's exact admission linearization point.
-func (self *sendItem) reservePreparedMemory(budget *TransferMemoryBudget, bytes ByteCount) bool {
+// The bytes the budget's line reserved for the sending loop's turn, grant
+// (nil for none), pay after the prepared credits and before any growth. The
+// item takes them as they are, never by a release the line would hand on.
+func (self *sendItem) reservePreparedMemory(budget *TransferMemoryBudget, bytes ByteCount, grant *ByteCount) bool {
 	if budget == nil {
 		return true
 	}
@@ -224,7 +227,7 @@ func (self *sendItem) reservePreparedMemory(budget *TransferMemoryBudget, bytes 
 	}
 	var credits [sendPackH1GroupMaxFrames]*preparedSendMemory
 	count := self.acks.preparedMemories(budget, &credits)
-	if count == 0 {
+	if count == 0 && (grant == nil || *grant <= 0) {
 		return self.reserveMemory(budget, bytes)
 	}
 	root := budget.admissionRoot()
@@ -234,17 +237,26 @@ func (self *sendItem) reservePreparedMemory(budget *TransferMemoryBudget, bytes 
 	for _, credit := range credits[:count] {
 		available = addReceiveQueueByteCount(available, credit.availableLocked())
 	}
-	growth := max(0, bytes-available)
+	granted := ByteCount(0)
+	if grant != nil {
+		granted = min(max(0, *grant), max(0, bytes-available))
+	}
+	growth := max(0, bytes-available-granted)
 	if growth > 0 && !budget.tryReserveWithLock(growth) {
-		credits[0].required = max(credits[0].required, credits[0].bytes+growth)
+		if 0 < count {
+			credits[0].required = max(credits[0].required, credits[0].bytes+growth)
+		}
 		return false
 	}
-	remaining := bytes - growth
+	remaining := bytes - growth - granted
 	for _, credit := range credits[:count] {
 		moved := min(remaining, credit.availableLocked())
 		credit.bytes -= moved
 		remaining -= moved
 		credit.flightMoved = true
+	}
+	if grant != nil {
+		*grant -= granted
 	}
 	self.memoryBudget = budget
 	self.queueByteCount = bytes

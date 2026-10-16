@@ -6684,6 +6684,10 @@ type SendSequence struct {
 	preparedFlightUnavailable resendCapacityGate
 	preparedHandoffWake       chan struct{}
 	currentPreparedHandoff    *preparedSendHandoff // sequence owner only, during contract acquisition
+	// Lifetime-budget bytes reserved for this sequence when its turn in the
+	// budget's line came, until its next item reservation takes them. Owned by
+	// Run (see its retained-memory wait).
+	resendMemoryGrant ByteCount
 	// Only the sequence worker reads the mutable contract. Caller-side
 	// prepared admission uses its atomically published serialized size.
 	preparedContractByteCount atomic.Int64
@@ -8909,6 +8913,21 @@ func (self *SendSequence) Run() {
 	// change is counted beside the carrier-change writes it produces.
 	lastRouteGeneration := uint64(0)
 	var memoryCapacityNotify <-chan struct{}
+	// This loop's place in the shared lifetime budget's line while retained
+	// bytes are what hold it. Sequences of one client share that budget, and a
+	// sequence applies its own acknowledgements here: woken by a wake-all, the
+	// one whose acknowledgement freed the bytes took them back in the same
+	// pass, ahead of every sibling it woke, and so won every release.
+	var memoryWaiter *transferMemoryReserveWaiter
+	defer func() {
+		if memoryWaiter != nil {
+			memoryWaiter.abandon()
+		}
+		if 0 < self.resendMemoryGrant {
+			self.resendQueue.budget.Release(self.resendMemoryGrant)
+			self.resendMemoryGrant = 0
+		}
+	}()
 	disposeScheduledPack := func(sendPack *SendPack) {
 		err := errors.New("Send sequence closed.")
 		sendPack.disposeUnsentGroup(err)
@@ -9185,6 +9204,14 @@ sendSequenceLoop:
 			default:
 			}
 		}
+		if memoryWaiter != nil {
+			select {
+			case <-memoryWaiter.ready:
+				self.resendMemoryGrant += memoryWaiter.byteCount
+				memoryWaiter = nil
+			default:
+			}
+		}
 		minimumRetainedByteCount := ByteCount(0)
 		if self.resendQueue.lifetimeBudget {
 			minimumRetainedByteCount = (&sendItem{}).retainedMemoryByteCount(
@@ -9195,6 +9222,11 @@ sendSequenceLoop:
 			minimumRetainedByteCount,
 			self.sendWindowEstimate(sendTime).Window,
 		)
+		if !resendCapacity && 0 < self.resendMemoryGrant &&
+			minimumRetainedByteCount <= self.resendQueue.budget.Available()+self.resendMemoryGrant {
+			// The bytes reserved for this loop's turn are headroom only it can use.
+			resendCapacity = self.resendQueue.preparedWindowAvailable(self.sendWindowEstimate(sendTime).Window)
+		}
 		self.observeRouteStall(sendTime)
 		// FLIGHTGATEFIX §22: a reliable lane may hold what it has shown it
 		// can carry. Beyond that the queue only adds delay, the scaled timer
@@ -9403,7 +9435,7 @@ sendSequenceLoop:
 						}
 						compatible = probe.retainedMemoryByteCount(self.retainedSendFrameByteCount(
 							nextMessageByteCount, frameCount+nextFrameCount), frameCount+nextFrameCount,
-							self.sendBufferSettings.ProtocolVersion < 2) <= self.resendQueue.budget.Available()
+							self.sendBufferSettings.ProtocolVersion < 2) <= self.resendQueue.budget.Available()+self.resendMemoryGrant
 					}
 					if compatible {
 						sendPacks[sendPackCount] = nextSendPack
@@ -9530,12 +9562,56 @@ sendSequenceLoop:
 		if flightBlocked {
 			flightWaitStart = time.Now()
 		}
-		if self.resendQueue.lifetimeBudget && self.resendQueue.budget != nil &&
-			(!resendCapacity || scheduler.Len() > 0) && memoryCapacityNotify == nil {
-			// Arm only a blocked loop, then repeat eligibility after arming.
-			// This closes the sibling-release race without per-packet channels.
-			memoryCapacityNotify = self.resendQueue.budget.CapacityNotify()
-			continue sendSequenceLoop
+		if budget := self.resendQueue.budget; self.resendQueue.lifetimeBudget && budget != nil {
+			blocked := !resendCapacity || scheduler.Len() > 0
+			memoryShort := false
+			if blocked {
+				// What the next reliable Pack would reserve beyond its own
+				// prepared credit, and at least what the producers' gate asks.
+				need := minimumRetainedByteCount
+				if head := scheduler.FifoHead(); head != nil && !self.noAckPackCanBypassRecoveryAdmission(head) {
+					need = max(need, self.retainedSendPackByteCount(head)-head.preparedMemoryBytes(budget))
+				}
+				memoryShort = budget.Available()+self.resendMemoryGrant < need
+				if memoryShort && memoryWaiter == nil {
+					// Retained bytes hold this loop: wait in the budget's line,
+					// where a release reserves them for the oldest waiter it fits
+					// before its releaser or anyone woken can take them back.
+					if 0 < self.resendMemoryGrant {
+						budget.Release(self.resendMemoryGrant)
+						self.resendMemoryGrant = 0
+					}
+					reserved, waiter := budget.tryReserveOrQueue(need)
+					if reserved {
+						self.resendMemoryGrant = need
+						continue sendSequenceLoop
+					}
+					memoryWaiter = waiter
+				}
+			}
+			if !memoryShort {
+				// Something else holds this loop, or nothing does. A turn it
+				// cannot use passes on now instead of idling here.
+				if memoryWaiter != nil {
+					memoryWaiter.abandon()
+					memoryWaiter = nil
+				}
+				if 0 < self.resendMemoryGrant {
+					budget.Release(self.resendMemoryGrant)
+					self.resendMemoryGrant = 0
+				}
+			}
+			if blocked && memoryCapacityNotify == nil {
+				// Arm only a blocked loop, then repeat eligibility after arming.
+				// This closes the sibling-release race without per-packet
+				// channels, and a prepared credit's growth still wakes it here.
+				memoryCapacityNotify = budget.CapacityNotify()
+				continue sendSequenceLoop
+			}
+		}
+		var memoryWaiterReady <-chan struct{}
+		if memoryWaiter != nil {
+			memoryWaiterReady = memoryWaiter.ready
 		}
 		packIngress := (<-chan *SendPack)(self.packs)
 		// Inspect one bounded ingress owner even when reliable retention is
@@ -9585,6 +9661,7 @@ sendSequenceLoop:
 		case <-self.preparedHandoffWake:
 			drainPreparedCancellation = true
 		case <-memoryCapacityNotify:
+		case <-memoryWaiterReady:
 		case <-flightPolicy.notify:
 		case nextSendPack, ok := <-packIngress:
 			if !ok {
@@ -10620,7 +10697,8 @@ func (self *SendSequence) sendWithSetContractDisposition(
 		}
 		if !item.reservePreparedMemory(self.resendQueue.budget,
 			addReceiveQueueByteCount(groupMemoryBytes,
-				item.retainedMemoryByteCount(frameByteCount, len(sendFrames), self.sendBufferSettings.ProtocolVersion < 2))) {
+				item.retainedMemoryByteCount(frameByteCount, len(sendFrames), self.sendBufferSettings.ProtocolVersion < 2)),
+			&self.resendMemoryGrant) {
 			var credits [sendPackH1GroupMaxFrames]*preparedSendMemory
 			if item.acks.preparedMemories(self.resendQueue.budget, &credits) > 0 {
 				return errPreparedSendMemoryUnavailable
