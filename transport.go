@@ -2541,6 +2541,23 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					writeCounter.Add(1)
 					return nil
 				}
+				// Writing the start or stop echo moves the writer into or out of
+				// speed-test mode, in step with the reader that queued it.
+				writeControl := func(message []byte) error {
+					if len(message) == 5 {
+						switch message[0] {
+						case TransportControlSpeedStart:
+							speedTest = true
+						case TransportControlSpeedStop:
+							speedTest = false
+						}
+					}
+					if err := write(message); err != nil {
+						return err
+					}
+					resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+					return nil
+				}
 				writeSendMessage := func(message []byte) error {
 					if len(message) <= 16 {
 						self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
@@ -2644,6 +2661,21 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					// selects below also include the lane so a newly arriving ACK
 					// wakes an otherwise idle writer.
 					if ackPrioritySend != nil && !speedTest {
+						// A pending control echo goes first. The pass below takes
+						// the next ACK and comes round again, so a lane that is
+						// ready every time, as on a slow uplink, kept the selects
+						// below, which drain controlSend, from ever running, and
+						// the reader waits on a full control queue. Control echoes
+						// are a handful of small messages outside a speed test, so
+						// serving them first cannot starve the lane.
+						select {
+						case message, ok := <-controlSend:
+							if !ok || writeControl(message) != nil {
+								return
+							}
+							continue
+						default:
+						}
 						select {
 						case message := <-ackPrioritySend:
 							if speedTest {
@@ -2682,19 +2714,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
-							if !ok {
+							if !ok || writeControl(message) != nil {
 								return
 							}
-							if len(message) == 5 {
-								switch message[0] {
-								case TransportControlSpeedStop:
-									speedTest = false
-								}
-							}
-							if write(message) != nil {
-								return
-							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-send:
 							if !ok {
 								return
@@ -2748,19 +2770,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
-							if !ok {
+							if !ok || writeControl(message) != nil {
 								return
 							}
-							if len(message) == 5 {
-								switch message[0] {
-								case TransportControlSpeedStart:
-									speedTest = true
-								}
-							}
-							if write(message) != nil {
-								return
-							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						}
 					}
 				}
