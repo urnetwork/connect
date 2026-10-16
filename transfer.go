@@ -3109,6 +3109,14 @@ func (self *SendSequence) shouldDeferTimeoutResend(
 	pacedFifo := self.sendBufferSettings.DeliverySizedWindowScale > 0 &&
 		item.reliableCarrierObserved && !item.carrierChanged &&
 		self.transferFlightPolicy().h1Only
+	if pacedFifo {
+		// This same FIFO already passed the item. A lower cumulative ACK
+		// cannot make an endpoint drop into queued bytes, even when fewer
+		// than three later selective ACKs leave recovery with this timer.
+		if highest, acked := self.laneHighestAcked(item.carrierRoute); acked && item.sequenceNumber < highest {
+			return false
+		}
+	}
 	return self.sendBufferSettings.DeferTimeoutResendWhileCumulativeProgress &&
 		!item.unreliableCarrierObserved &&
 		(pacedFifo || item.timeoutDeferCount < self.sendBufferSettings.TimeoutResendDeferLimit) &&
