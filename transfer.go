@@ -9617,13 +9617,12 @@ sendSequenceLoop:
 		if budget := self.resendQueue.budget; self.resendQueue.lifetimeBudget && budget != nil {
 			blocked := !resendCapacity || scheduler.Len() > 0
 			memoryShort := false
-			if blocked {
-				// What the next reliable Pack would reserve beyond its own
-				// prepared credit, and at least what the producers' gate asks.
-				need := minimumRetainedByteCount
-				if head := scheduler.FifoHead(); head != nil && !self.noAckPackCanBypassRecoveryAdmission(head) {
-					need = max(need, self.retainedSendPackByteCount(head)-head.preparedMemoryBytes(budget))
-				}
+			if head := scheduler.FifoHead(); blocked && head != nil && !self.noAckPackCanBypassRecoveryAdmission(head) {
+				// Only an actual retention owner takes a place in the line.
+				// Idle loops still watch capacity below to reopen producer
+				// admission, but must not reserve bytes ahead of live writers.
+				need := max(minimumRetainedByteCount,
+					self.retainedSendPackByteCount(head)-head.preparedMemoryBytes(budget))
 				memoryShort = budget.Available()+self.resendMemoryGrant < need
 				if memoryShort && memoryWaiter == nil {
 					// Retained bytes hold this loop: wait in the budget's line,

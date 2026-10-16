@@ -203,12 +203,56 @@ func TestSendSequenceThatClosesWhileWaitingLeavesTheLifetimeBudgetLine(t *testin
 		if writers := fixture.acknowledge(0); len(writers) != 1 || writers[0] != 0 {
 			t.Fatalf("Packs written after the first release = %v, want the first sequence's", writers)
 		}
-		fixture.sequences[1].Close()
+		fixture.sequences[1].Cancel()
 		<-fixture.dones[1]
 		if writers := fixture.acknowledge(0); len(writers) != 1 || writers[0] != 2 {
 			t.Fatalf("Packs written after the release behind a closed waiter = %v, want the third sequence's", writers)
 		}
 		fixture.close()
+	})
+}
+
+// An idle sequence only watches capacity for producer admission. Without a
+// reliable Pack to retain it must not take a release ahead of an actual waiter.
+func TestIdleSendSequenceDoesNotReserveAReleasedLifetimeBudgetTurn(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newWindowRoundFixture(t, nil, nil)
+		budget := NewTransferMemoryBudget(kib(64))
+		if !budget.TryReserve(budget.TotalByteCount()) {
+			t.Fatal("fixture could not fill the shared budget")
+		}
+		settings := DefaultSendBufferSettings()
+		settings.ResendQueueBudget = budget
+		settings.ResendQueueRetainedByteAccounting = true
+		sequence := NewSendSequence(fixture.ctx, fixture.sender, fixture.sender.sendBuffer,
+			fixture.receiver.ClientId(), MultiHopId{}, false, false, false,
+			sequenceTlsRoleClient, false, settings)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			sequence.Run()
+		}()
+		synctest.Wait()
+
+		reserved, waiter := budget.tryReserveOrQueue(budget.TotalByteCount())
+		if reserved || waiter == nil {
+			t.Fatal("fixture's live writer did not wait behind the full budget")
+		}
+		budget.Release(budget.TotalByteCount())
+		// A release assigns its turn synchronously, before any waiter runs.
+		// The idle sender used to consume its minimum retained-item grant here,
+		// leaving too few bytes for this real writer until it ran again.
+		select {
+		case <-waiter.ready:
+		default:
+			t.Error("an idle sequence took a released lifetime-budget turn from a live writer")
+		}
+		waiter.abandon()
+		sequence.Close()
+		<-done
+		assertRetainedBudgetBalance(t, budget)
 	})
 }
 
