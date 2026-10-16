@@ -365,10 +365,9 @@ func exerciseRolloverRelayLoss(t *testing.T, loss rolloverRelayLoss, messageCoun
 	return result
 }
 
-// TestContractRolloverRecoversAfterRelayGenerationLoss is the connect half of
-// the M2 churn stall (server TestProxyContractChurnLoadFreePayerCap): at the
-// first contract rollover the platform retired the sender's resident and
-// silently dropped what it held. Whatever that loss contains, the sequence
+// The connect half of the M2 churn stall (server
+// TestProxyContractChurnLoadFreePayerCap): at the first contract rollover the
+// platform retired the sender's resident and silently dropped what it held. Whatever that loss contains, the sequence
 // must deliver everything exactly once, without an acknowledgement failure,
 // and within a few retransmit backoffs rather than an ack lifetime.
 func TestContractRolloverRecoversAfterRelayGenerationLoss(t *testing.T) {
@@ -382,34 +381,35 @@ func TestContractRolloverRecoversAfterRelayGenerationLoss(t *testing.T) {
 		{name: "receiver loses its held items", forwardDuration: 20 * time.Millisecond, cancelReceiverAfter: 100 * time.Millisecond},
 		{name: "retained returns lost at the switch", bothDuration: 500 * time.Millisecond, retained: true},
 	} {
-		t.Run(loss.name, func(t *testing.T) {
-			messageCount := 1200
-			if loss.burst {
-				messageCount = 3000
-			}
-			result := exerciseRolloverRelayLoss(t, loss, messageCount)
-			if !result.switchSeen {
-				t.Fatal("no Pack carried the successor contract, so the loss was never applied")
-			}
-			if result.droppedCount == 0 {
-				t.Fatal("the relay dropped nothing, so this row proves nothing")
-			}
-			if !result.complete {
-				t.Fatalf("the sequence did not recover from the relay loss: %d of %d acknowledged, errors %v", result.delivered, messageCount, result.errors)
-			}
-			if recovery := result.completeAt - result.switchAt; recoveryBound < recovery {
-				t.Errorf("recovery took %s after the switch, more than %s", recovery, recoveryBound)
-			}
-			if result.ackErrors != 0 {
-				t.Errorf("%d sends failed their acknowledgement", result.ackErrors)
-			}
-			if result.delivered != messageCount {
-				t.Errorf("delivered %d of %d messages", result.delivered, messageCount)
-			}
-			if len(result.errors) != 0 {
-				t.Errorf("transfer logged errors: %v", result.errors)
-			}
-			t.Logf("switch at %s, %d frames dropped, recovered at %s", result.switchAt, result.droppedCount, result.completeAt)
-		})
+		messageCount := 1200
+		if loss.burst {
+			messageCount = 3000
+		}
+		result := exerciseRolloverRelayLoss(t, loss, messageCount)
+		if !result.switchSeen {
+			t.Errorf("%s: no Pack carried the successor contract, so the loss was never applied", loss.name)
+			continue
+		}
+		if result.droppedCount == 0 {
+			t.Errorf("%s: the relay dropped nothing, so this row proves nothing", loss.name)
+			continue
+		}
+		if !result.complete {
+			t.Errorf("%s: the sequence did not recover from the relay loss: %d of %d acknowledged, errors %v", loss.name, result.delivered, messageCount, result.errors)
+			continue
+		}
+		if recovery := result.completeAt - result.switchAt; recoveryBound < recovery {
+			t.Errorf("%s: recovery took %s after the switch, more than %s", loss.name, recovery, recoveryBound)
+		}
+		if result.ackErrors != 0 {
+			t.Errorf("%s: %d sends failed their acknowledgement", loss.name, result.ackErrors)
+		}
+		if result.delivered != messageCount {
+			t.Errorf("%s: delivered %d of %d messages", loss.name, result.delivered, messageCount)
+		}
+		if len(result.errors) != 0 {
+			t.Errorf("%s: transfer logged errors: %v", loss.name, result.errors)
+		}
+		t.Logf("%s: switch at %s, %d frames dropped, recovered at %s", loss.name, result.switchAt, result.droppedCount, result.completeAt)
 	}
 }
