@@ -187,11 +187,13 @@ func (q *receiveDeliveryQueue) removeChargeLocked(r *receiveDeliveryReceipt) {
 	}
 }
 
+// After the callback returns, only an owner that still holds a claim can
+// claim again: a deferred decode hands its frame to the NAT owner it creates.
 func (r *receiveDeliveryReceipt) hold() *receiveDeliveryClaim {
 	q := r.queue
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
-	if q.closed || r.sealed {
+	if q.closed || r.sealed && r.pending == 0 {
 		return nil
 	}
 	r.claimed = true
