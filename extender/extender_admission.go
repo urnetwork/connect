@@ -55,15 +55,22 @@ type extenderSubnetHash [16]byte
 // source with no address, such as an in-memory pipe, has none and is admitted
 // without limits. Reads only what construction set.
 func (self *extenderAdmission) subnetHashOf(address string) (extenderSubnetHash, bool) {
+	return extenderPrefixHashOf(address, self.ipv4PrefixBitCount, self.ipv6PrefixBitCount)
+}
+
+// The hash of a source address's prefix at a width for each family, under the
+// subnet pepper, and whether the address has one. The admission subnet is one
+// such prefix; the lag.dev API also counts a wider one (lag.dev/PLAN.md M3).
+func extenderPrefixHashOf(address string, ipv4PrefixBitCount int, ipv6PrefixBitCount int) (extenderSubnetHash, bool) {
 	addr, err := netip.ParseAddr(connectionSourceAddress(address))
 	if err != nil {
 		return extenderSubnetHash{}, false
 	}
 	addr = addr.Unmap().WithZone("")
-	prefixBitCount := self.ipv6PrefixBitCount
+	prefixBitCount := ipv6PrefixBitCount
 	family := byte(6)
 	if addr.Is4() {
-		prefixBitCount = self.ipv4PrefixBitCount
+		prefixBitCount = ipv4PrefixBitCount
 		family = 4
 	}
 	prefix, err := addr.Prefix(prefixBitCount)

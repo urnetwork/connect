@@ -324,12 +324,37 @@ func waitForPeerPingerStatus(
 	}
 }
 
-// Waits for at least count pings.
+// Waits for at least count pings, and then for every ping in flight to end.
+// A ping is counted when its record lands, before it frees its slot and
+// reschedules its peer from a fresh clock read, so a test that moved the
+// clock or looked for pings in flight on the count alone would race that end.
 func waitForPingCount(t *testing.T, pinger *ExtenderPeerPinger, count int) ExtenderPeerPingerStatus {
 	t.Helper()
-	return waitForPeerPingerStatus(t, pinger, fmt.Sprintf("%d pings", count), func(status ExtenderPeerPingerStatus) bool {
+	status := waitForPeerPingerStatus(t, pinger, fmt.Sprintf("%d pings", count), func(status ExtenderPeerPingerStatus) bool {
 		return count <= status.PingCount
 	})
+	deadline := time.After(10 * time.Second)
+	for {
+		pingEnd := pinger.pingEndMonitor.NotifyChannel()
+		pinging := []string{}
+		func() {
+			pinger.stateLock.Lock()
+			defer pinger.stateLock.Unlock()
+			for keyHex, peer := range pinger.peers {
+				if peer.pinging {
+					pinging = append(pinging, keyHex)
+				}
+			}
+		}()
+		if len(pinging) == 0 {
+			return status
+		}
+		select {
+		case <-pingEnd:
+		case <-deadline:
+			t.Fatalf("pings still in flight after %d pings: %v", count, pinging)
+		}
+	}
 }
 
 // No ping is in flight and none was made past the given count, established
